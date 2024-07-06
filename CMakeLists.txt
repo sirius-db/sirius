@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.5)
 
 # Set extension name here
-set(TARGET_NAME quack)
+set(TARGET_NAME komodo)
 
 # DuckDB's extension distribution supports vcpkg. As such, dependencies can be added in ./vcpkg.json and then
 # used in cmake with find_package. Feel free to remove or replace with other dependencies.
@@ -13,8 +13,11 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
 project(${TARGET_NAME})
 include_directories(src/include)
+include_directories(duckdb/extension_external/substrait/src/include)
+include_directories(${TARGET_NAME} duckdb/extension_external/substrait/third_party/substrait)
+include_directories(${TARGET_NAME} duckdb/extension_external/substrait/third_party/)
 
-set(EXTENSION_SOURCES src/quack_extension.cpp)
+set(EXTENSION_SOURCES src/komodo_extension.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
@@ -22,6 +25,8 @@ build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 # Link OpenSSL in both the static library as the loadable extension
 target_link_libraries(${EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto)
 target_link_libraries(${LOADABLE_EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto)
+target_link_libraries(${EXTENSION_NAME} substrait_extension)
+target_link_libraries(${LOADABLE_EXTENSION_NAME} substrait_extension)
 
 install(
   TARGETS ${EXTENSION_NAME}
