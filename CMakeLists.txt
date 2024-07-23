@@ -50,8 +50,8 @@ set_target_properties(${LOADABLE_EXTENSION_NAME} PROPERTIES CUDA_SEPARABLE_COMPI
 
 target_link_libraries(${EXTENSION_NAME} substrait_extension)
 target_link_libraries(${LOADABLE_EXTENSION_NAME} substrait_extension)
-target_link_libraries(${EXTENSION_NAME} ${CUDA_LIBRARIES} ${CUDA_cudart_LIBRARY} ${CUDA_cudadevrt_LIBRARY})
-target_link_libraries(${LOADABLE_EXTENSION_NAME} ${CUDA_LIBRARIES} ${CUDA_cudart_LIBRARY} ${CUDA_cudadevrt_LIBRARY})
+target_link_libraries(${EXTENSION_NAME} ${CUDA_CUDA_LIBRARY} ${CUDA_CUDART_LIBRARY} ${CUDA_cudadevrt_LIBRARY})
+target_link_libraries(${LOADABLE_EXTENSION_NAME} ${CUDA_CUDA_LIBRARY} ${CUDA_CUDART_LIBRARY} ${CUDA_cudadevrt_LIBRARY})
 
 install(
   TARGETS ${EXTENSION_NAME}
