@@ -9,3 +9,5 @@ test/python/__pycache__/
 tpch-data/dbgen
 .vscode/
 my_database.duckdb
+CMakeFiles/
+CMakeCache.txt
