@@ -3,7 +3,7 @@
 #include "duckdb/common/atomic.hpp"
 #include "duckdb/common/unordered_set.hpp"
 #include "duckdb/common/set.hpp"
-#include "duckdb/execution/physical_operator.hpp"
+#include "gpu_physical_operator.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/common/reference_map.hpp"
@@ -14,6 +14,7 @@ namespace duckdb {
 
 class GPUExecutor;
 class GPUPipeline;
+class GPUMetaPipeline;
 
 class GPUPipelineBuildState{
 public:
@@ -22,20 +23,20 @@ public:
 
 public:
 	//! Duplicate eliminated join scan dependencies
-	reference_map_t<const PhysicalOperator, reference<GPUPipeline>> delim_join_dependencies;
+	reference_map_t<const GPUPhysicalOperator, reference<GPUPipeline>> delim_join_dependencies;
 	//! Materialized CTE scan dependencies
-	reference_map_t<const PhysicalOperator, reference<GPUPipeline>> cte_dependencies;
+	reference_map_t<const GPUPhysicalOperator, reference<GPUPipeline>> cte_dependencies;
 
 public:
-	void SetPipelineSource(GPUPipeline &pipeline, PhysicalOperator &op);
-	void SetPipelineSink(GPUPipeline &pipeline, optional_ptr<PhysicalOperator> op, idx_t sink_pipeline_count);
-	void SetPipelineOperators(GPUPipeline &pipeline, vector<reference<PhysicalOperator>> operators);
-	void AddPipelineOperator(GPUPipeline &pipeline, PhysicalOperator &op);
-	shared_ptr<GPUPipeline> CreateChildPipeline(GPUExecutor &executor, GPUPipeline &pipeline, PhysicalOperator &op);
+	void SetPipelineSource(GPUPipeline &pipeline, GPUPhysicalOperator &op);
+	void SetPipelineSink(GPUPipeline &pipeline, optional_ptr<GPUPhysicalOperator> op, idx_t sink_pipeline_count);
+	void SetPipelineOperators(GPUPipeline &pipeline, vector<reference<GPUPhysicalOperator>> operators);
+	void AddPipelineOperator(GPUPipeline &pipeline, GPUPhysicalOperator &op);
+	shared_ptr<GPUPipeline> CreateChildPipeline(GPUExecutor &executor, GPUPipeline &pipeline, GPUPhysicalOperator &op);
 
-	optional_ptr<PhysicalOperator> GetPipelineSource(GPUPipeline &pipeline);
-	optional_ptr<PhysicalOperator> GetPipelineSink(GPUPipeline &pipeline);
-	vector<reference<PhysicalOperator>> GetPipelineOperators(GPUPipeline &pipeline);
+	optional_ptr<GPUPhysicalOperator> GetPipelineSource(GPUPipeline &pipeline);
+	optional_ptr<GPUPhysicalOperator> GetPipelineSink(GPUPipeline &pipeline);
+	vector<reference<GPUPhysicalOperator>> GetPipelineOperators(GPUPipeline &pipeline);
 };
 
 //! The Pipeline class represents an execution pipeline starting at a
@@ -70,14 +71,14 @@ public:
 	bool GetProgress(double &current_percentage, idx_t &estimated_cardinality);
 
 	//! Returns a list of all operators (including source and sink) involved in this pipeline
-	vector<reference<PhysicalOperator>> GetOperators();
-	vector<const_reference<PhysicalOperator>> GetOperators() const;
+	vector<reference<GPUPhysicalOperator>> GetOperators();
+	vector<const_reference<GPUPhysicalOperator>> GetOperators() const;
 
-	optional_ptr<PhysicalOperator> GetSink() {
+	optional_ptr<GPUPhysicalOperator> GetSink() {
 		return sink;
 	}
 
-	optional_ptr<PhysicalOperator> GetSource() {
+	optional_ptr<GPUPhysicalOperator> GetSource() {
 		return source;
 	}
 
@@ -96,11 +97,11 @@ private:
 	//! Whether or not the pipeline has been initialized
 	atomic<bool> initialized;
 	//! The source of this pipeline
-	optional_ptr<PhysicalOperator> source;
+	optional_ptr<GPUPhysicalOperator> source;
 	//! The chain of intermediate operators
-	vector<reference<PhysicalOperator>> operators;
+	vector<reference<GPUPhysicalOperator>> operators;
 	//! The sink (i.e. destination) for data; this is e.g. a hash table to-be-built
-	optional_ptr<PhysicalOperator> sink;
+	optional_ptr<GPUPhysicalOperator> sink;
 
 	//! The global source state
 	unique_ptr<GlobalSourceState> source_state;

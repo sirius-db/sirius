@@ -1,8 +1,6 @@
 #pragma once
 
 #include "duckdb.hpp"
-#include "gpu_meta_pipeline.hpp"
-#include "gpu_executor.hpp"
 #include "communication.hpp"
 
 namespace duckdb {

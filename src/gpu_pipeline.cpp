@@ -1,6 +1,7 @@
 
 #include "gpu_pipeline.hpp"
 #include "gpu_executor.hpp"
+#include "gpu_meta_pipeline.hpp"
 
 #include "duckdb/common/algorithm.hpp"
 #include "duckdb/common/printer.hpp"
@@ -15,10 +16,6 @@
 #include "duckdb/parallel/task_scheduler.hpp"
 
 namespace duckdb {
-
-//===--------------------------------------------------------------------===//
-// GPU Pipeline
-//===--------------------------------------------------------------------===//
 
 GPUPipeline::GPUPipeline(GPUExecutor &executor_p)
     : executor(executor_p), ready(false), initialized(false), source(nullptr), sink(nullptr) {
@@ -201,8 +198,8 @@ void GPUPipeline::AddDependency(shared_ptr<GPUPipeline> &pipeline) {
 // 	}
 // }
 
-vector<reference<PhysicalOperator>> GPUPipeline::GetOperators() {
-	vector<reference<PhysicalOperator>> result;
+vector<reference<GPUPhysicalOperator>> GPUPipeline::GetOperators() {
+	vector<reference<GPUPhysicalOperator>> result;
 	D_ASSERT(source);
 	result.push_back(*source);
 	for (auto &op : operators) {
@@ -214,8 +211,8 @@ vector<reference<PhysicalOperator>> GPUPipeline::GetOperators() {
 	return result;
 }
 
-vector<const_reference<PhysicalOperator>> GPUPipeline::GetOperators() const {
-	vector<const_reference<PhysicalOperator>> result;
+vector<const_reference<GPUPhysicalOperator>> GPUPipeline::GetOperators() const {
+	vector<const_reference<GPUPhysicalOperator>> result;
 	D_ASSERT(source);
 	result.push_back(*source);
 	for (auto &op : operators) {
@@ -257,39 +254,39 @@ idx_t GPUPipeline::UpdateBatchIndex(idx_t old_index, idx_t new_index) {
 //===--------------------------------------------------------------------===//
 // GPU Pipeline Build State
 //===--------------------------------------------------------------------===//
-void GPUPipelineBuildState::SetPipelineSource(GPUPipeline &pipeline, PhysicalOperator &op) {
+void GPUPipelineBuildState::SetPipelineSource(GPUPipeline &pipeline, GPUPhysicalOperator &op) {
 	pipeline.source = &op;
 }
 
-void GPUPipelineBuildState::SetPipelineSink(GPUPipeline &pipeline, optional_ptr<PhysicalOperator> op,
+void GPUPipelineBuildState::SetPipelineSink(GPUPipeline &pipeline, optional_ptr<GPUPhysicalOperator> op,
                                          idx_t sink_pipeline_count) {
 	pipeline.sink = op;
 	// set the base batch index of this pipeline based on how many other pipelines have this node as their sink
 	pipeline.base_batch_index = BATCH_INCREMENT * sink_pipeline_count;
 }
 
-void GPUPipelineBuildState::AddPipelineOperator(GPUPipeline &pipeline, PhysicalOperator &op) {
+void GPUPipelineBuildState::AddPipelineOperator(GPUPipeline &pipeline, GPUPhysicalOperator &op) {
 	pipeline.operators.push_back(op);
 }
 
-optional_ptr<PhysicalOperator> GPUPipelineBuildState::GetPipelineSource(GPUPipeline &pipeline) {
+optional_ptr<GPUPhysicalOperator> GPUPipelineBuildState::GetPipelineSource(GPUPipeline &pipeline) {
 	return pipeline.source;
 }
 
-optional_ptr<PhysicalOperator> GPUPipelineBuildState::GetPipelineSink(GPUPipeline &pipeline) {
+optional_ptr<GPUPhysicalOperator> GPUPipelineBuildState::GetPipelineSink(GPUPipeline &pipeline) {
 	return pipeline.sink;
 }
 
-void GPUPipelineBuildState::SetPipelineOperators(GPUPipeline &pipeline, vector<reference<PhysicalOperator>> operators) {
+void GPUPipelineBuildState::SetPipelineOperators(GPUPipeline &pipeline, vector<reference<GPUPhysicalOperator>> operators) {
 	pipeline.operators = std::move(operators);
 }
 
 shared_ptr<GPUPipeline> GPUPipelineBuildState::CreateChildPipeline(GPUExecutor &executor, GPUPipeline &pipeline,
-                                                             PhysicalOperator &op) {
+                                                             GPUPhysicalOperator &op) {
 	return executor.CreateChildPipeline(pipeline, op);
 }
 
-vector<reference<PhysicalOperator>> GPUPipelineBuildState::GetPipelineOperators(GPUPipeline &pipeline) {
+vector<reference<GPUPhysicalOperator>> GPUPipelineBuildState::GetPipelineOperators(GPUPipeline &pipeline) {
 	return pipeline.operators;
 }
 

@@ -1,9 +1,8 @@
 #pragma once
 
 #include "duckdb/common/reference_map.hpp"
-#include "duckdb/execution/physical_operator.hpp"
+#include "gpu_physical_operator.hpp"
 #include "gpu_pipeline.hpp"
-#include "gpu_executor.hpp"
 
 namespace duckdb {
 
@@ -21,7 +20,7 @@ class GPUMetaPipeline : public enable_shared_from_this<GPUMetaPipeline>{
 	//!         * And all pipelines that were added to the GPUMetaPipeline after 'current'
 public:
 	//! Create a GPUMetaPipeline with the given sink
-	GPUMetaPipeline(GPUExecutor &gpu_executor, GPUPipelineBuildState &state, optional_ptr<PhysicalOperator> sink);
+	GPUMetaPipeline(GPUExecutor &gpu_executor, GPUPipelineBuildState &state, optional_ptr<GPUPhysicalOperator> sink);
 
 public:
 	//! Get the GPUExecutor for this GPUMetaPipeline
@@ -29,7 +28,7 @@ public:
 	//! Get the PipelineBuildState for this GPUMetaPipeline
 	GPUPipelineBuildState &GetState() const;
 	//! Get the sink operator for this GPUMetaPipeline
-	optional_ptr<PhysicalOperator> GetSink() const;
+	optional_ptr<GPUPhysicalOperator> GetSink() const;
 
 	//! Get the initial pipeline of this GPUMetaPipeline
 	shared_ptr<GPUPipeline> &GetBasePipeline();
@@ -55,11 +54,11 @@ public:
 	//! Whether this pipeline is part of a PipelineFinishEvent
 	optional_ptr<GPUPipeline> GetFinishGroup(GPUPipeline &pipeline) const;
 
-	void BuildGPUPipelines(PhysicalOperator &node, GPUPipeline &current);
+	void BuildGPUPipelines(GPUPhysicalOperator &node, GPUPipeline &current);
 
 public:
 	//! Build the GPUMetaPipeline with 'op' as the first operator (excl. the shared sink)
-	void Build(PhysicalOperator &op);
+	void Build(GPUPhysicalOperator &op);
 	//! Ready all the pipelines (recursively)
 	void Ready();
 
@@ -69,9 +68,9 @@ public:
 	GPUPipeline &CreateUnionPipeline(GPUPipeline &current, bool order_matters);
 	//! Create a child pipeline op 'current' starting at 'op',
 	//! where 'last_pipeline' is the last pipeline added before building out 'current'
-	void CreateChildPipeline(GPUPipeline &current, PhysicalOperator &op, GPUPipeline &last_pipeline);
+	void CreateChildPipeline(GPUPipeline &current, GPUPhysicalOperator &op, GPUPipeline &last_pipeline);
 	//! Create a GPUMetaPipeline child that 'current' depends on
-	GPUMetaPipeline &CreateChildMetaPipeline(GPUPipeline &current, PhysicalOperator &op);
+	GPUMetaPipeline &CreateChildMetaPipeline(GPUPipeline &current, GPUPhysicalOperator &op);
 
 private:
 	//! The executor for all MetaPipelines in the query plan
@@ -79,7 +78,7 @@ private:
 	//! The PipelineBuildState for all MetaPipelines in the query plan
 	GPUPipelineBuildState &state;
 	//! The sink of all pipelines within this GPUMetaPipeline
-	optional_ptr<PhysicalOperator> sink;
+	optional_ptr<GPUPhysicalOperator> sink;
 	//! Whether this GPUMetaPipeline is a the recursive pipeline of a recursive CTE
 	bool recursive_cte;
 	//! All pipelines with a different source, but the same sink

@@ -3,7 +3,7 @@
 
 namespace duckdb {
 
-GPUMetaPipeline::GPUMetaPipeline(GPUExecutor &executor_p, GPUPipelineBuildState &state_p, optional_ptr<PhysicalOperator> sink_p)
+GPUMetaPipeline::GPUMetaPipeline(GPUExecutor &executor_p, GPUPipelineBuildState &state_p, optional_ptr<GPUPhysicalOperator> sink_p)
     : executor(executor_p), state(state_p), sink(sink_p), recursive_cte(false), next_batch_index(0) {
 	CreatePipeline();
 }
@@ -16,7 +16,7 @@ GPUPipelineBuildState &GPUMetaPipeline::GetState() const {
 	return state;
 }
 
-optional_ptr<PhysicalOperator> GPUMetaPipeline::GetSink() const {
+optional_ptr<GPUPhysicalOperator> GPUMetaPipeline::GetSink() const {
 	return sink;
 }
 
@@ -65,7 +65,7 @@ void GPUMetaPipeline::AssignNextBatchIndex(GPUPipeline &pipeline) {
 	pipeline.base_batch_index = next_batch_index++ * GPUPipelineBuildState::BATCH_INCREMENT;
 }
 
-void GPUMetaPipeline::BuildGPUPipelines(PhysicalOperator &node, GPUPipeline &current) {
+void GPUMetaPipeline::BuildGPUPipelines(GPUPhysicalOperator &node, GPUPipeline &current) {
 	node.op_state.reset();
 
 	auto &state = GetState();
@@ -96,7 +96,7 @@ void GPUMetaPipeline::BuildGPUPipelines(PhysicalOperator &node, GPUPipeline &cur
 	}
 }
 
-void GPUMetaPipeline::Build(PhysicalOperator &op) {
+void GPUMetaPipeline::Build(GPUPhysicalOperator &op) {
 	D_ASSERT(pipelines.size() == 1);
 	D_ASSERT(children.empty());
 	BuildGPUPipelines(op, *pipelines.back());
@@ -111,7 +111,7 @@ void GPUMetaPipeline::Ready() {
 	}
 }
 
-GPUMetaPipeline &GPUMetaPipeline::CreateChildMetaPipeline(GPUPipeline &current, PhysicalOperator &op) {
+GPUMetaPipeline &GPUMetaPipeline::CreateChildMetaPipeline(GPUPipeline &current, GPUPhysicalOperator &op) {
 	children.push_back(make_shared_ptr<GPUMetaPipeline>(executor, state, &op));
 	auto child_meta_pipeline = children.back().get();
 	// child GPUMetaPipeline must finish completely before this GPUMetaPipeline can start
@@ -196,7 +196,7 @@ GPUPipeline &GPUMetaPipeline::CreateUnionPipeline(GPUPipeline &current, bool ord
 	return union_pipeline;
 }
 
-void GPUMetaPipeline::CreateChildPipeline(GPUPipeline &current, PhysicalOperator &op, GPUPipeline &last_pipeline) {
+void GPUMetaPipeline::CreateChildPipeline(GPUPipeline &current, GPUPhysicalOperator &op, GPUPipeline &last_pipeline) {
 	// rule 2: 'current' must be fully built (down to the source) before creating the child pipeline
 	D_ASSERT(current.source);
 
