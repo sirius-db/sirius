@@ -15,12 +15,24 @@ set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -lcuda -lcudart -lcupti -lcurand -lcud
 set(EXTENSION_NAME ${TARGET_NAME}_extension)
 set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
-include_directories(src/include)
+include_directories(
+    src/include
+    src/include/operator
+)
 include_directories(duckdb/extension_external/substrait/src/include)
 include_directories(${TARGET_NAME} duckdb/extension_external/substrait/third_party/substrait)
 include_directories(${TARGET_NAME} duckdb/extension_external/substrait/third_party)
 
-set(EXTENSION_SOURCES src/komodo_extension.cpp)
+set(EXTENSION_SOURCES 
+  src/komodo_extension.cpp
+  src/gpu_context.cpp
+  src/gpu_executor.cpp
+  src/gpu_physical_operator.cpp
+  src/gpu_pipeline.cpp
+  src/gpu_meta_pipeline.cpp
+)
+add_subdirectory(src/operator)
+
 set(CUDA_SOURCES src/cuda/komodo_extension_cuda.cu src/cuda/communication.cu)
 
 set(CMAKE_CUDA_STANDARD 17)

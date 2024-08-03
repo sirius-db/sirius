@@ -2,8 +2,6 @@
 
 #include "komodo_extension.hpp"
 #include "duckdb.hpp"
-#include "duckdb/common/exception.hpp"
-#include "duckdb/main/extension_util.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -13,65 +11,40 @@
 #include "duckdb/planner/planner.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/parser/statement/relation_statement.hpp"
-#include "duckdb/main/pending_query_result.hpp"
-#include "duckdb/execution/column_binding_resolver.hpp"
 #include "duckdb/main/query_result.hpp"
-#include "duckdb/main/error_manager.hpp"
-#include "duckdb/main/materialized_query_result.hpp"
+#include "duckdb/main/prepared_statement_data.hpp"
+#include "duckdb/common/assert.hpp"
 
 #include "substrait_extension.hpp"
 #include "to_substrait.hpp"
 #include "from_substrait.hpp"
 
+#include "gpu_context.hpp"
 // OpenSSL linked through vcpkg
 // #include <openssl/opensslv.h>
-// #include <cuda.h>
-// #include <cuda_runtime.h>
 
 namespace duckdb {
 
-struct KomodoTableFunctionData : public TableFunctionData {
-	KomodoTableFunctionData() = default;
+struct GPUTableFunctionData : public TableFunctionData {
+	GPUTableFunctionData() = default;
+	// unique_ptr<LogicalOperator> logical_plan;
 	shared_ptr<Relation> plan;
+	shared_ptr<PreparedStatementData> prepared;
 	unique_ptr<QueryResult> res;
 	unique_ptr<Connection> conn;
+	unique_ptr<GPUContext> gpu_context;
 	string query;
 	bool enable_optimizer;
 	bool finished = false;
 };
 
-shared_ptr<Relation> KomodoSubstraitPlanToDuckDBRel(Connection &conn, const string &serialized, bool json = false) {
+shared_ptr<Relation> GPUSubstraitPlanToDuckDBRel(Connection &conn, const string &serialized, bool json = false) {
 	SubstraitToDuckDB transformer_s2d(conn, serialized, json);
 	return transformer_s2d.TransformPlan();
 };
 
-
-unique_ptr<LogicalOperator> ExtractPlanFromRelation(ClientContext &context, shared_ptr<Relation> relation) {
-	auto relation_stmt = make_uniq<RelationStatement>(relation);
-	unique_ptr<SQLStatement> statements = std::move(relation_stmt);
-
-	unique_ptr<LogicalOperator> plan;
-	Planner planner(context);
-	planner.CreatePlan(std::move(statements));
-	D_ASSERT(planner.plan);
-
-	plan = std::move(planner.plan);
-
-	Optimizer optimizer(*planner.binder, context);
-	plan = optimizer.Optimize(std::move(plan));
-
-	ColumnBindingResolver resolver;
-	resolver.Verify(*plan);
-	resolver.VisitOperator(*plan);
-
-	plan->ResolveOperatorTypes();
-
-	return plan;
-}
-
 //This function is used to extract the query plan from the SQL query
-static DuckDBToSubstrait KomodoInitPlanExtractor(ClientContext &context, KomodoTableFunctionData &data, Connection &new_conn,
-                                           unique_ptr<LogicalOperator> &query_plan) {
+unique_ptr<LogicalOperator> KomodoInitPlanExtractor(ClientContext& context, GPUTableFunctionData &data, Connection &new_conn) {
 	// The user might want to disable the optimizer of the new connection
 	new_conn.context->config.enable_optimizer = data.enable_optimizer;
 	new_conn.context->config.use_replacement_scans = false;
@@ -87,35 +60,72 @@ static DuckDBToSubstrait KomodoInitPlanExtractor(ClientContext &context, KomodoT
 	disabled_optimizers.insert(OptimizerType::IN_CLAUSE);
 	disabled_optimizers.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
 	DBConfig::GetConfig(*new_conn.context).options.disabled_optimizers = disabled_optimizers;
+	
+	return new_conn.context->ExtractPlan(data.query);
+}
 
-	query_plan = new_conn.context->ExtractPlan(data.query);
-	return DuckDBToSubstrait(context, *query_plan, false);
+unique_ptr<PhysicalOperator> GPUGeneratePhysicalPlan(ClientContext& context, unique_ptr<LogicalOperator> &logical_plan, Connection &new_conn) {
+	PhysicalPlanGenerator physical_planner(context);
+	auto physical_plan = physical_planner.CreatePlan(std::move(logical_plan));
+	return physical_plan;
 }
 
 //The result of the GPUProcessingBind function is a unique pointer to a FunctionData object.
-//This object is used as an argument to the GPUProcessingFunction function (data_p argument), which is called to execute the table function.
+//This result of this function is used as an argument to the GPUProcessingFunction function (data_p argument), which is called to execute the table function.
 static unique_ptr<FunctionData> GPUProcessingBind(ClientContext &context, TableFunctionBindInput &input,
                                                 vector<LogicalType> &return_types, vector<string> &names) {
-	auto result = make_uniq<KomodoTableFunctionData>();
+	auto result = make_uniq<GPUTableFunctionData>();
 	result->conn = make_uniq<Connection>(*context.db);
 	result->query = input.inputs[0].ToString();
 	result->enable_optimizer = true;
+	result->gpu_context = make_uniq<GPUContext>(context);
+	if (input.inputs[0].IsNull()) {
+		throw BinderException("gpu_processing cannot be called with a NULL parameter");
+	}
+
+	//Parse the query just to get the result type information and to create preparedstatmement data
+	auto statements = result->conn->context->ParseStatements(result->query);
+	Planner planner(context);
+	auto statement_type = statements[0]->type;
+	planner.CreatePlan(std::move(statements[0]));
+	D_ASSERT(planner.plan);
+	auto prepared = make_shared_ptr<PreparedStatementData>(statement_type);
+	prepared->names = planner.names;
+	prepared->types = planner.types;
+	prepared->value_map = std::move(planner.value_map);
+	// prepared->catalog_version = MetaTransaction::Get(context).catalog_version;
+
+	//generate physical plan from the logical plan
+	unique_ptr<LogicalOperator> query_plan = KomodoInitPlanExtractor(context, *result, *result->conn);
+	query_plan->Print();
+	auto physical_plan = GPUGeneratePhysicalPlan(context, query_plan, *result->conn);
+	prepared->plan = std::move(physical_plan);
+	throw BinderException("GPUProcessingBind not implemented yet");
+	
+	result->prepared = prepared;
+
+	for (auto &column : planner.names) {
+		names.emplace_back(column);
+	}
+	for (auto &type : planner.types) {
+		return_types.emplace_back(type);
+	}
+
+	return std::move(result);
+}
+
+static unique_ptr<FunctionData> GPUProcessingSubstraitBind(ClientContext &context, TableFunctionBindInput &input,
+                                                vector<LogicalType> &return_types, vector<string> &names) {
+	auto result = make_uniq<GPUTableFunctionData>();
+	result->conn = make_uniq<Connection>(*context.db);
+	result->query = input.inputs[0].ToString();
+	result->enable_optimizer = true;
+	result->gpu_context = make_uniq<GPUContext>(context);
 	if (input.inputs[0].IsNull()) {
 		throw BinderException("gpu_processing cannot be called with a NULL parameter");
 	}
 	string serialized = input.inputs[0].GetValueUnsafe<string>();
-
-	printf("im in GPUProcessingBind\n");
-
-	//If serialized is a SQL statement, convert to substrait
-	//This is not an ideal solution. Ideally, the SQL statement does not have to be converted to substrait, and should be converted directly to logical operators to be executed.
-	if (serialized.find("SELECT") != string::npos) {
-		unique_ptr<LogicalOperator> query_plan;
-		auto transformer_d2s = KomodoInitPlanExtractor(context, *result, *result->conn, query_plan);
-		serialized = transformer_d2s.SerializeToString();
-	}
-
-	result->plan = KomodoSubstraitPlanToDuckDBRel(*result->conn, serialized, false);
+	result->plan = GPUSubstraitPlanToDuckDBRel(*result->conn, serialized, false);
 
 	for (auto &column : result->plan->Columns()) {
 		return_types.emplace_back(column.Type());
@@ -125,94 +135,22 @@ static unique_ptr<FunctionData> GPUProcessingBind(ClientContext &context, TableF
 	return std::move(result);
 }
 
-void GPUProcessError(ClientContext &context, ErrorData &error, const string &query) {
-	if (context.config.errors_as_json) {
-		error.ConvertErrorToJSON();
-	} else if (!query.empty()) {
-		error.AddErrorLocation(query);
-	}
-}
-
-template <class T>
-unique_ptr<T> GPUErrorResult(ClientContext &context, ErrorData error, const string &query = string()) {
-	GPUProcessError(context, error, query);
-	return make_uniq<T>(std::move(error));
-}
-
-unique_ptr<QueryResult> GPUExecuteRelation(ClientContext &context, shared_ptr<Relation> relation, Connection &new_conn) {
-
-	printf("Executing relation\n");
-	auto logical_plan = ExtractPlanFromRelation(context, relation);
-	printf("Printing logical plan\n");
-	// logical_plan->Print();
-	printf("Done printing logical plan\n");
-	// now convert logical query plan into a physical query plan
-	PhysicalPlanGenerator physical_planner(context);
-	auto physical_plan = physical_planner.CreatePlan(std::move(logical_plan));
-	printf("Print physical plan\n");
-	// physical_plan->Print();
-	printf("Done printing physical plan\n");
-
-// 	// auto lock = LockContext();
-// 	auto &expected_columns = relation->Columns();
-// 	auto pending = new_conn.context->PendingQuery(relation, false);
-// 	if (!pending->HasError()) {
-// 		return GPUErrorResult<MaterializedQueryResult>(context, pending->GetErrorObject());
-// 	}
-
-	unique_ptr<QueryResult> result;
-// 	auto result = pending->Execute();
-// 	if (result->HasError()) {
-		// return result;
-// 	}
-// 	// verify that the result types and result names of the query match the expected result types/names
-// 	if (result->types.size() == expected_columns.size()) {
-// 		bool mismatch = false;
-// 		for (idx_t i = 0; i < result->types.size(); i++) {
-// 			if (result->types[i] != expected_columns[i].Type() || result->names[i] != expected_columns[i].Name()) {
-// 				mismatch = true;
-// 				break;
-// 			}
-// 		}
-// 		if (!mismatch) {
-// 			// all is as expected: return the result
-			return result;
-// 		}
-// 	}
-// 	// result mismatch
-// 	string err_str = "Result mismatch in query!\nExpected the following columns: [";
-// 	for (idx_t i = 0; i < expected_columns.size(); i++) {
-// 		if (i > 0) {
-// 			err_str += ", ";
-// 		}
-// 		err_str += expected_columns[i].Name() + " " + expected_columns[i].Type().ToString();
-// 	}
-// 	err_str += "]\nBut result contained the following: ";
-// 	for (idx_t i = 0; i < result->types.size(); i++) {
-// 		err_str += i == 0 ? "[" : ", ";
-// 		err_str += result->names[i] + " " + result->types[i].ToString();
-// 	}
-// 	err_str += "]";
-// 	return GPUErrorResult<MaterializedQueryResult>(context, ErrorData(err_str));
-
-}
-
 static void GPUProcessingFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
-	auto &data = (KomodoTableFunctionData &)*data_p.bind_data;
+	auto &data = (GPUTableFunctionData &)*data_p.bind_data;
 	if (data.finished) {
 		return;
 	}
-	auto new_conn = Connection(*context.db);
 
 	if (!data.res) {
-		data.res = data.plan->Execute();
+		// data.res = data.plan->Execute();
 		std::cout << "Calling CUDA kernel from C++..." << std::endl;
 		myKernel();  // Call the CUDA kernel defined in komodo_extension_cuda.cu
 		int size = 10;
 		int* temp = new int[size];
 		int* ptr = sendDataToGPU(temp, size);  // Send data to GPU
 		std::cout << "CUDA kernel call finished." << std::endl;
-		// GPUExecuteRelation(context, data.plan, new_conn);
+		data.gpu_context->GPUExecuteQuery(context, data.query, data.prepared, {});
+		data.res = data.conn->Query(data.query);
 	}
 
 	// data.finished = true;
@@ -224,16 +162,44 @@ static void GPUProcessingFunction(ClientContext &context, TableFunctionInput &da
 	}
 	// output.Move(*result_chunk);
 	while (result_chunk) {
-		printf("Fetching chunk %d\n", result_chunk->size());
+		// printf("Fetching chunk %d\n", result_chunk->size());
 		output.Move(*result_chunk);
 		result_chunk = data.res->Fetch();
 	}
 	printf("Finished Fetching chunk\n");
 	return;
-	// auto result = new_conn.Query(data.query);
 }
 
-void InitializeKomodo(Connection &con) {
+static void GPUProcessingSubstraitFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &data = (GPUTableFunctionData &)*data_p.bind_data;
+	if (data.finished) {
+		return;
+	}
+
+	if (!data.res) {
+		// data.res = data.plan->Execute();
+		std::cout << "Calling CUDA kernel from C++..." << std::endl;
+		myKernel();  // Call the CUDA kernel defined in komodo_extension_cuda.cu
+		int size = 10;
+		int* temp = new int[size];
+		int* ptr = sendDataToGPU(temp, size);  // Send data to GPU
+		std::cout << "CUDA kernel call finished." << std::endl;
+		auto temp2 = data.gpu_context->GPUExecuteRelation(context, data.plan);
+		data.res = data.plan->Execute();
+	}
+
+	auto result_chunk = data.res->Fetch();
+	if (!result_chunk) {
+		return;
+	}
+	while (result_chunk) {
+		output.Move(*result_chunk);
+		result_chunk = data.res->Fetch();
+	}
+	return;
+}
+
+void InitializeGPUExtension(Connection &con) {
 	auto &catalog = Catalog::GetSystemCatalog(*con.context);
 
 	// create the get_substrait table function that allows us to get a substrait
@@ -245,7 +211,7 @@ void InitializeKomodo(Connection &con) {
 
 	// create the get_substrait table function that allows us to get a substrait
 	// JSON from a valid SQL Query
-	TableFunction gpu_processing_substrait("gpu_processing_substrait", {LogicalType::BLOB}, GPUProcessingFunction, GPUProcessingBind);
+	TableFunction gpu_processing_substrait("gpu_processing_substrait", {LogicalType::BLOB}, GPUProcessingSubstraitFunction, GPUProcessingSubstraitBind);
 	// gpu_processing.named_parameters["enable_optimizer"] = LogicalType::BOOLEAN;
 	CreateTableFunctionInfo gpu_processing_substrait_info(gpu_processing_substrait);
 	catalog.CreateTableFunction(*con.context, gpu_processing_substrait_info);
@@ -255,12 +221,13 @@ void KomodoExtension::Load(DuckDB &db) {
 	Connection con(db);
 	con.BeginTransaction();
 
-	InitializeKomodo(con);
+	InitializeGPUExtension(con);
 
 	con.Commit();
 }
+
 std::string KomodoExtension::Name() {
-	return "Komodo";
+	return "GPU	Extension";
 }
 
 } // namespace duckdb
