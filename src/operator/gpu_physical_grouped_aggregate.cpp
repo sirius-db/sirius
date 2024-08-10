@@ -2,7 +2,7 @@
 
 namespace duckdb {
 
-GPUPhysicalGroupedAggregate::GPUPhysicalGroupedAggregate(PhysicalOperator op) {
-};
+// GPUPhysicalGroupedAggregate::GPUPhysicalGroupedAggregate(PhysicalOperator op) {
+// };
 
 } // namespace duckdb

@@ -2,7 +2,7 @@
 
 namespace duckdb {
 
-GPUPhysicalTableScan::GPUPhysicalTableScan(PhysicalOperator op) {
-};
+// GPUPhysicalTableScan::GPUPhysicalTableScan(PhysicalOperator op) {
+// };
 
 } // namespace duckdb

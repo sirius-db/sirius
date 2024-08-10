@@ -1,0 +1,17 @@
+set(EXTENSION_SOURCES
+        ${EXTENSION_SOURCES}
+        ${CMAKE_CURRENT_SOURCE_DIR}/gpu_plan_aggregate.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/gpu_plan_column_data_get.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/gpu_plan_comparison_join.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/gpu_plan_delim_get.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/gpu_plan_delim_join.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/gpu_plan_distinct.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/gpu_plan_dummy_scan.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/gpu_plan_empty_result.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/gpu_plan_filter.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/gpu_plan_get.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/gpu_plan_limit.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/gpu_plan_order.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/gpu_plan_projection.cpp
+        PARENT_SCOPE
+)

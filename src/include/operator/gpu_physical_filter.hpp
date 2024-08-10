@@ -14,7 +14,7 @@ class GPUPhysicalFilter : public GPUPhysicalOperator {
 public:
 	// GPUPhysicalFilter(vector<LogicalType> types, vector<unique_ptr<Expression>> select_list, idx_t estimated_cardinality);
 
-    GPUPhysicalFilter(PhysicalOperator op);
+    GPUPhysicalFilter(vector<LogicalType> types, vector<unique_ptr<Expression>> select_list, idx_t estimated_cardinality);
 
 // 	//! The filter expression
 // 	unique_ptr<Expression> expression;

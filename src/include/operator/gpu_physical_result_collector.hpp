@@ -6,7 +6,7 @@ namespace duckdb {
 
 class GPUPhysicalResultCollector : public GPUPhysicalOperator {
 public:
-    GPUPhysicalResultCollector(PhysicalOperator op);
+    GPUPhysicalResultCollector(vector<LogicalType> types, vector<unique_ptr<Expression>> select_list, idx_t estimated_cardinality);
 
 };
 } // namespace duckdb

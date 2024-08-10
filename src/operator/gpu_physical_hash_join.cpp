@@ -2,7 +2,7 @@
 
 namespace duckdb {
 
-GPUPhysicalHashJoin::GPUPhysicalHashJoin(PhysicalOperator op) {
-};
+// GPUPhysicalHashJoin::GPUPhysicalHashJoin(PhysicalOperator op) {
+// };
 
 } // namespace duckdb

@@ -30,8 +30,10 @@ set(EXTENSION_SOURCES
   src/gpu_physical_operator.cpp
   src/gpu_pipeline.cpp
   src/gpu_meta_pipeline.cpp
+  src/gpu_physical_plan_generator.cpp
 )
 add_subdirectory(src/operator)
+add_subdirectory(src/plan)
 
 set(CUDA_SOURCES src/cuda/komodo_extension_cuda.cu src/cuda/communication.cu)
 

@@ -14,12 +14,14 @@
 #include "duckdb/main/query_result.hpp"
 #include "duckdb/main/prepared_statement_data.hpp"
 #include "duckdb/common/assert.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 
 #include "substrait_extension.hpp"
 #include "to_substrait.hpp"
 #include "from_substrait.hpp"
 
 #include "gpu_context.hpp"
+#include "gpu_physical_plan_generator.hpp"
 // OpenSSL linked through vcpkg
 // #include <openssl/opensslv.h>
 
@@ -29,7 +31,7 @@ struct GPUTableFunctionData : public TableFunctionData {
 	GPUTableFunctionData() = default;
 	// unique_ptr<LogicalOperator> logical_plan;
 	shared_ptr<Relation> plan;
-	shared_ptr<PreparedStatementData> prepared;
+	shared_ptr<GPUPreparedStatementData> gpu_prepared;
 	unique_ptr<QueryResult> res;
 	unique_ptr<Connection> conn;
 	unique_ptr<GPUContext> gpu_context;
@@ -64,8 +66,8 @@ unique_ptr<LogicalOperator> KomodoInitPlanExtractor(ClientContext& context, GPUT
 	return new_conn.context->ExtractPlan(data.query);
 }
 
-unique_ptr<PhysicalOperator> GPUGeneratePhysicalPlan(ClientContext& context, unique_ptr<LogicalOperator> &logical_plan, Connection &new_conn) {
-	PhysicalPlanGenerator physical_planner(context);
+unique_ptr<GPUPhysicalOperator> GPUGeneratePhysicalPlan(ClientContext& context, GPUContext& gpu_context, unique_ptr<LogicalOperator> &logical_plan, Connection &new_conn) {
+	GPUPhysicalPlanGenerator physical_planner = GPUPhysicalPlanGenerator(context, gpu_context);
 	auto physical_plan = physical_planner.CreatePlan(std::move(logical_plan));
 	return physical_plan;
 }
@@ -89,20 +91,23 @@ static unique_ptr<FunctionData> GPUProcessingBind(ClientContext &context, TableF
 	auto statement_type = statements[0]->type;
 	planner.CreatePlan(std::move(statements[0]));
 	D_ASSERT(planner.plan);
+
 	auto prepared = make_shared_ptr<PreparedStatementData>(statement_type);
 	prepared->names = planner.names;
 	prepared->types = planner.types;
 	prepared->value_map = std::move(planner.value_map);
+	prepared->plan = make_uniq<PhysicalOperator>(PhysicalOperatorType::DUMMY_SCAN, vector<LogicalType>{LogicalType::BOOLEAN}, 0);
 	// prepared->catalog_version = MetaTransaction::Get(context).catalog_version;
 
 	//generate physical plan from the logical plan
 	unique_ptr<LogicalOperator> query_plan = KomodoInitPlanExtractor(context, *result, *result->conn);
 	query_plan->Print();
-	auto physical_plan = GPUGeneratePhysicalPlan(context, query_plan, *result->conn);
-	prepared->plan = std::move(physical_plan);
+	auto gpu_physical_plan = GPUGeneratePhysicalPlan(context, *result->gpu_context, query_plan, *result->conn);
+	auto gpu_prepared = make_shared_ptr<GPUPreparedStatementData>(std::move(prepared), std::move(gpu_physical_plan));
+	
 	throw BinderException("GPUProcessingBind not implemented yet");
 	
-	result->prepared = prepared;
+	result->gpu_prepared = gpu_prepared;
 
 	for (auto &column : planner.names) {
 		names.emplace_back(column);
@@ -149,7 +154,7 @@ static void GPUProcessingFunction(ClientContext &context, TableFunctionInput &da
 		int* temp = new int[size];
 		int* ptr = sendDataToGPU(temp, size);  // Send data to GPU
 		std::cout << "CUDA kernel call finished." << std::endl;
-		data.gpu_context->GPUExecuteQuery(context, data.query, data.prepared, {});
+		data.gpu_context->GPUExecuteQuery(context, data.query, data.gpu_prepared, {});
 		data.res = data.conn->Query(data.query);
 	}
 
@@ -201,6 +206,30 @@ static void GPUProcessingSubstraitFunction(ClientContext &context, TableFunction
 
 void InitializeGPUExtension(Connection &con) {
 	auto &catalog = Catalog::GetSystemCatalog(*con.context);
+	// string name = catalog.GetName();
+	// printf("catalog name %s\n", catalog.GetName().c_str());
+
+	// auto &schema = catalog.GetSchema(*con.context, DEFAULT_SCHEMA);
+	// string s_name = schema.name;
+	// printf("schema name %s\n", schema.name.c_str());
+
+	// auto &table = catalog.GetEntry(*con.context, CatalogType::TABLE_ENTRY, s_name, "lineitem");
+	// printf("%s\n", table.name.c_str());
+
+	auto &catalog2 = Catalog::GetCatalog(*con.context, INVALID_CATALOG);
+	string name = catalog2.GetName();
+	printf("catalog name %s\n", catalog2.GetName().c_str());
+
+	auto &schema = catalog2.GetSchema(*con.context, DEFAULT_SCHEMA);
+	string s_name = schema.name;
+	printf("schema name %s\n", schema.name.c_str());
+
+	TableCatalogEntry &table = catalog2.GetEntry(*con.context, CatalogType::TABLE_ENTRY, s_name, "lineitem").Cast<TableCatalogEntry>();
+	printf("%s\n", table.name.c_str());
+
+	for (auto &column_name : table.GetColumns().GetColumnNames()) {
+		printf("column name %s\n", column_name.c_str());
+	}
 
 	// create the get_substrait table function that allows us to get a substrait
 	// JSON from a valid SQL Query

@@ -1,4 +1,4 @@
-#include "operator/gpu_physical_ungrouped_aggregate.hpp"
+#include "operator/gpu_physical_column_data_scan.hpp"
 
 namespace duckdb {
 
