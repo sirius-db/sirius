@@ -2,7 +2,7 @@
 
 namespace duckdb {
 
-GPUPhysicalResultCollector::GPUPhysicalResultCollector(PhysicalOperator op) {
-};
+// GPUPhysicalResultCollector::GPUPhysicalResultCollector(PhysicalOperator op) {
+// };
 
 } // namespace duckdb

@@ -2,7 +2,7 @@
 
 namespace duckdb {
 
-GPUPhysicalFilter::GPUPhysicalFilter(PhysicalOperator op) {
-};
+// GPUPhysicalFilter::GPUPhysicalFilter(PhysicalOperator op) {
+// };
 
 } // namespace duckdb

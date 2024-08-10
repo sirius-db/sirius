@@ -6,7 +6,7 @@ namespace duckdb {
 
 class GPUPhysicalUngroupedAggregate : public GPUPhysicalOperator {
 public:
-    GPUPhysicalUngroupedAggregate(PhysicalOperator op);
+    GPUPhysicalUngroupedAggregate(vector<LogicalType> types, vector<unique_ptr<Expression>> select_list, idx_t estimated_cardinality);
     
 };
 } // namespace duckdb

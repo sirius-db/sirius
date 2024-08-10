@@ -5,12 +5,21 @@
 
 namespace duckdb {
 
+class GPUPreparedStatementData {
+public:
+	GPUPreparedStatementData(shared_ptr<PreparedStatementData> _prepared, unique_ptr<GPUPhysicalOperator> _gpu_physical_plan) 
+	: prepared(_prepared), gpu_physical_plan(move(_gpu_physical_plan)) {
+	}
+	unique_ptr<GPUPhysicalOperator> gpu_physical_plan;
+	shared_ptr<PreparedStatementData> prepared;
+};
+
 struct GPUActiveQueryContext {
 public:
 	//! The query that is currently being executed
 	string query;
 	//! Prepared statement data
-	shared_ptr<PreparedStatementData> prepared;
+	shared_ptr<GPUPreparedStatementData> gpu_prepared;
 	//! The query executor
 	unique_ptr<GPUExecutor> gpu_executor;
 	//! The progress bar
@@ -47,10 +56,10 @@ public:
 
     GPUExecutor &GetGPUExecutor();
 
-	unique_ptr<PendingQueryResult> GPUPendingQuery(ClientContext &context, shared_ptr<PreparedStatementData> &statement_p,
+	unique_ptr<PendingQueryResult> GPUPendingQuery(ClientContext &context, shared_ptr<GPUPreparedStatementData> &statement_p,
 												  const PendingQueryParameters &parameters);
 
-    unique_ptr<QueryResult> GPUExecuteQuery(ClientContext &context, const string &query, shared_ptr<PreparedStatementData> &statement_p,
+    unique_ptr<QueryResult> GPUExecuteQuery(ClientContext &context, const string &query, shared_ptr<GPUPreparedStatementData> &statement_p,
 												  const PendingQueryParameters &parameters);
 
     unique_ptr<QueryResult> GPUExecuteRelation(ClientContext &context, shared_ptr<Relation> relation);

@@ -2,7 +2,7 @@
 
 namespace duckdb {
 
-GPUPhysicalOrder::GPUPhysicalOrder(PhysicalOperator op) {
-};
+// GPUPhysicalOrder::GPUPhysicalOrder(PhysicalOperator op) {
+// };
 
 } // namespace duckdb

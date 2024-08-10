@@ -15,6 +15,8 @@
 #include "duckdb/execution/operator/helper/physical_result_collector.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
 
+#include "duckdb/execution/operator/scan/physical_dummy_scan.hpp"
+
 namespace duckdb {
 
 void GPUProcessError(ClientContext &context, ErrorData &error, const string &query) {
@@ -70,10 +72,10 @@ GPUContext::GPUContext(ClientContext& client_context) : client_context(client_co
 };
 
 unique_ptr<PendingQueryResult> 
-GPUContext::GPUPendingQuery(ClientContext &context, shared_ptr<PreparedStatementData> &statement_p,
+GPUContext::GPUPendingQuery(ClientContext &context, shared_ptr<GPUPreparedStatementData> &statement_p,
 												  const PendingQueryParameters &parameters) {
 	D_ASSERT(gpu_active_query);
-	auto &statement = *statement_p;
+	auto &statement = *(statement_p->prepared);
 
 	GPUBindPreparedStatementParameters(statement, parameters);
 
@@ -98,8 +100,8 @@ GPUContext::GPUPendingQuery(ClientContext &context, shared_ptr<PreparedStatement
 	D_ASSERT(!gpu_active_query->HasOpenResult());
 
 	auto pending_result =
-	    make_uniq<PendingQueryResult>(context.shared_from_this(), *statement_p, std::move(types), stream_result);
-	gpu_active_query->prepared = std::move(statement_p);
+	    make_uniq<PendingQueryResult>(context.shared_from_this(), *(statement_p->prepared), std::move(types), stream_result);
+	gpu_active_query->gpu_prepared = std::move(statement_p);
 	gpu_active_query->SetOpenResult(*pending_result);
 	return pending_result;
 };
@@ -136,7 +138,7 @@ GPUContext::CheckExecutableInternal(PendingQueryResult &result) {
 }
 
 unique_ptr<QueryResult> 
-GPUContext::GPUExecuteQuery(ClientContext &context, const string &query, shared_ptr<PreparedStatementData> &statement_p,
+GPUContext::GPUExecuteQuery(ClientContext &context, const string &query, shared_ptr<GPUPreparedStatementData> &statement_p,
 												  const PendingQueryParameters &parameters) {
 
 	BeginQueryInternal(query);
@@ -205,9 +207,9 @@ unique_ptr<QueryResult>
 GPUContext::FetchResultInternal(PendingQueryResult &pending) {
 	D_ASSERT(gpu_active_query);
 	D_ASSERT(gpu_active_query->IsOpenResult(pending));
-	D_ASSERT(gpu_active_query->prepared);
+	D_ASSERT(gpu_active_query->gpu_prepared->prepared);
 	auto &gpu_executor = GetGPUExecutor();
-	auto &prepared = *gpu_active_query->prepared;
+	auto &prepared = *gpu_active_query->gpu_prepared->prepared;
 	// bool create_stream_result = prepared.properties.allow_stream_result && pending->allow_stream_result;
 	unique_ptr<QueryResult> result;
 	D_ASSERT(gpu_executor.HasResultCollector());

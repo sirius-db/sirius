@@ -27,7 +27,7 @@ public:
 
 public:
 	
-	GPUPhysicalOperator(PhysicalOperator op, PhysicalOperatorType type, vector<LogicalType> types, idx_t estimated_cardinality);
+	GPUPhysicalOperator(PhysicalOperatorType type, vector<LogicalType> types, idx_t estimated_cardinality);
 
 	GPUPhysicalOperator();
 	virtual ~GPUPhysicalOperator();
@@ -47,8 +47,6 @@ public:
 	unique_ptr<GlobalOperatorState> op_state;
 	//! Lock for (re)setting any of the operator states
 	mutex lock;
-	//! The original physical operator (From DuckDB)
-    unique_ptr<PhysicalOperator> original_op;
 
 public:
 	virtual string GetName() const;
@@ -142,22 +140,22 @@ public:
 
 	virtual void BuildPipelines(GPUPipeline &current, GPUMetaPipeline &meta_pipeline);
 
-public:
-	template <class TARGET>
-	TARGET &Cast() {
-		if (TARGET::TYPE != PhysicalOperatorType::INVALID && type != TARGET::TYPE) {
-			throw InternalException("Failed to cast physical operator to type - physical operator type mismatch");
-		}
-		return reinterpret_cast<TARGET &>(*this);
-	}
+// public:
+// 	template <class TARGET>
+// 	TARGET &Cast() {
+// 		if (TARGET::TYPE != PhysicalOperatorType::INVALID && type != TARGET::TYPE) {
+// 			throw InternalException("Failed to cast physical operator to type - physical operator type mismatch");
+// 		}
+// 		return reinterpret_cast<TARGET &>(*this);
+// 	}
 
-	template <class TARGET>
-	const TARGET &Cast() const {
-		if (TARGET::TYPE != PhysicalOperatorType::INVALID && type != TARGET::TYPE) {
-			throw InternalException("Failed to cast physical operator to type - physical operator type mismatch");
-		}
-		return reinterpret_cast<const TARGET &>(*this);
-	}
+// 	template <class TARGET>
+// 	const TARGET &Cast() const {
+// 		if (TARGET::TYPE != PhysicalOperatorType::INVALID && type != TARGET::TYPE) {
+// 			throw InternalException("Failed to cast physical operator to type - physical operator type mismatch");
+// 		}
+// 		return reinterpret_cast<const TARGET &>(*this);
+// 	}
 };
 
 } // namespace duckdb
