@@ -10,11 +10,22 @@
 
 namespace duckdb {
 
+class ClientContext;
+
 class GPUPhysicalGroupedAggregate : public GPUPhysicalOperator {
 public:
+
+	GPUPhysicalGroupedAggregate(ClientContext &context, vector<LogicalType> types,
+                                             vector<unique_ptr<Expression>> expressions, idx_t estimated_cardinality);
+
+	GPUPhysicalGroupedAggregate(ClientContext &context, vector<LogicalType> types, vector<unique_ptr<Expression>> expressions,
+	                      vector<unique_ptr<Expression>> groups, idx_t estimated_cardinality);
+
     GPUPhysicalGroupedAggregate(ClientContext &context, vector<LogicalType> types, vector<unique_ptr<Expression>> expressions,
 	                      vector<unique_ptr<Expression>> groups, vector<GroupingSet> grouping_sets,
 	                      vector<unsafe_vector<idx_t>> grouping_functions, idx_t estimated_cardinality);
+
+	vector<GroupingSet> grouping_sets;
 
 };
 } // namespace duckdb

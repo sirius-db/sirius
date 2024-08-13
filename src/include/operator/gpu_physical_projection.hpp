@@ -1,7 +1,7 @@
 #pragma once
 
 #include "gpu_physical_operator.hpp"
-#include "duckdb/execution/physical_operator.hpp"
+// #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/planner/expression.hpp"
 
 namespace duckdb {

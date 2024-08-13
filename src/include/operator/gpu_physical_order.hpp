@@ -12,5 +12,9 @@ public:
     GPUPhysicalOrder(vector<LogicalType> types, vector<BoundOrderByNode> orders, vector<idx_t> projections,
 	              idx_t estimated_cardinality);
 
+	//! Input data
+	vector<BoundOrderByNode> orders;
+	vector<idx_t> projections;
+
 };
 } // namespace duckdb

@@ -3,7 +3,7 @@
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "gpu_physical_plan_generator.hpp"
-#include "operator/gpu_physical_projection.hpp"
+#include "gpu_physical_projection.hpp"
 
 namespace duckdb {
 

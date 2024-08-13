@@ -7,7 +7,8 @@
 #include "duckdb/execution/task_error_manager.hpp"
 #include "gpu_pipeline.hpp"
 #include "gpu_meta_pipeline.hpp"
-#include "duckdb/execution/operator/helper/physical_result_collector.hpp"
+// #include "duckdb/execution/operator/helper/physical_result_collector.hpp"
+#include "operator/gpu_physical_result_collector.hpp"
 
 namespace duckdb {
 
@@ -50,8 +51,8 @@ public:
 	unique_ptr<QueryResult> GetResult();
 	void CancelTasks();
 
-	void Initialize(unique_ptr<PhysicalResultCollector> physical_plan);
-	void InitializeInternal(PhysicalResultCollector &plan);
+	void Initialize(unique_ptr<GPUPhysicalResultCollector> physical_plan);
+	void InitializeInternal(GPUPhysicalResultCollector &physical_result_collector);
 	void Reset();
 	shared_ptr<GPUPipeline> CreateChildPipeline(GPUPipeline &current, GPUPhysicalOperator &op);
 
