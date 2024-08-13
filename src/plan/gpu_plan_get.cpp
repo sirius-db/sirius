@@ -1,7 +1,7 @@
-#include "duckdb/execution/operator/projection/physical_projection.hpp"
-#include "duckdb/execution/operator/projection/physical_tableinout_function.hpp"
-#include "duckdb/execution/operator/scan/physical_table_scan.hpp"
-#include "duckdb/execution/physical_plan_generator.hpp"
+// #include "duckdb/execution/operator/projection/physical_projection.hpp"
+// #include "duckdb/execution/operator/projection/physical_tableinout_function.hpp"
+// #include "duckdb/execution/operator/scan/physical_table_scan.hpp"
+// #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/function/table/table_scan.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
@@ -10,10 +10,11 @@
 #include "gpu_physical_table_scan.hpp"
 #include "gpu_physical_projection.hpp"
 #include "gpu_physical_plan_generator.hpp"
+// #include "duckdb/common/types.hpp"
 
 namespace duckdb {
 
-unique_ptr<TableFilterSet> CreateTableFilterSet(TableFilterSet &table_filters, vector<column_t> &column_ids) {
+unique_ptr<TableFilterSet> GPUCreateTableFilterSet(TableFilterSet &table_filters, vector<column_t> &column_ids) {
 	// create the table filter map
 	auto table_filter_set = make_uniq<TableFilterSet>();
 	for (auto &table_filter : table_filters.filters) {
@@ -49,7 +50,7 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::CreatePlan(LogicalGet 
 
 	unique_ptr<TableFilterSet> table_filters;
 	if (!op.table_filters.filters.empty()) {
-		table_filters = CreateTableFilterSet(op.table_filters, op.column_ids);
+		table_filters = GPUCreateTableFilterSet(op.table_filters, op.column_ids);
 	}
 
 	if (op.function.dependency) {
@@ -82,7 +83,7 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::CreatePlan(LogicalGet 
 		vector<unique_ptr<Expression>> expressions;
 		for (auto &column_id : op.column_ids) {
 			if (column_id == COLUMN_IDENTIFIER_ROW_ID) {
-				types.emplace_back(LogicalType::BIGINT);
+				types.emplace_back(LogicalType(LogicalTypeId::BIGINT));
 				expressions.push_back(make_uniq<BoundConstantExpression>(Value::BIGINT(0)));
 			} else {
 				auto type = op.returned_types[column_id];

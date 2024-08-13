@@ -21,108 +21,108 @@
 
 namespace duckdb {
 
-bool ExtractNumericValue(Value val, int64_t &result) {
-	if (!val.type().IsIntegral()) {
-		switch (val.type().InternalType()) {
-		case PhysicalType::INT16:
-			result = val.GetValueUnsafe<int16_t>();
-			break;
-		case PhysicalType::INT32:
-			result = val.GetValueUnsafe<int32_t>();
-			break;
-		case PhysicalType::INT64:
-			result = val.GetValueUnsafe<int64_t>();
-			break;
-		default:
-			return false;
-		}
-	} else {
-		if (!val.DefaultTryCastAs(LogicalType::BIGINT)) {
-			return false;
-		}
-		result = val.GetValue<int64_t>();
-	}
-	return true;
-}
+// bool GPUExtractNumericValue(Value val, int64_t &result) {
+// 	if (!val.type().IsIntegral()) {
+// 		switch (val.type().InternalType()) {
+// 		case PhysicalType::INT16:
+// 			result = val.GetValueUnsafe<int16_t>();
+// 			break;
+// 		case PhysicalType::INT32:
+// 			result = val.GetValueUnsafe<int32_t>();
+// 			break;
+// 		case PhysicalType::INT64:
+// 			result = val.GetValueUnsafe<int64_t>();
+// 			break;
+// 		default:
+// 			return false;
+// 		}
+// 	} else {
+// 		if (!val.DefaultTryCastAs(LogicalType::BIGINT)) {
+// 			return false;
+// 		}
+// 		result = val.GetValue<int64_t>();
+// 	}
+// 	return true;
+// }
 
-void CheckForPerfectJoinOpt(LogicalComparisonJoin &op, PerfectHashJoinStats &join_state) {
-	// we only do this optimization for inner joins
-	if (op.join_type != JoinType::INNER) {
-		return;
-	}
-	// with one condition
-	if (op.conditions.size() != 1) {
-		return;
-	}
-	// with propagated statistics
-	if (op.join_stats.empty()) {
-		return;
-	}
-	for (auto &type : op.children[1]->types) {
-		switch (type.InternalType()) {
-		case PhysicalType::STRUCT:
-		case PhysicalType::LIST:
-		case PhysicalType::ARRAY:
-			return;
-		default:
-			break;
-		}
-	}
-	// with equality condition and null values not equal
-	for (auto &&condition : op.conditions) {
-		if (condition.comparison != ExpressionType::COMPARE_EQUAL) {
-			return;
-		}
-	}
-	// with integral internal types
-	for (auto &&join_stat : op.join_stats) {
-		if (!TypeIsInteger(join_stat->GetType().InternalType()) ||
-		    join_stat->GetType().InternalType() == PhysicalType::INT128 ||
-		    join_stat->GetType().InternalType() == PhysicalType::UINT128) {
-			// perfect join not possible for non-integral types or hugeint
-			return;
-		}
-	}
+// void CheckForPerfectJoinOpt(LogicalComparisonJoin &op, PerfectHashJoinStats &join_state) {
+// 	// we only do this optimization for inner joins
+// 	if (op.join_type != JoinType::INNER) {
+// 		return;
+// 	}
+// 	// with one condition
+// 	if (op.conditions.size() != 1) {
+// 		return;
+// 	}
+// 	// with propagated statistics
+// 	if (op.join_stats.empty()) {
+// 		return;
+// 	}
+// 	for (auto &type : op.children[1]->types) {
+// 		switch (type.InternalType()) {
+// 		case PhysicalType::STRUCT:
+// 		case PhysicalType::LIST:
+// 		case PhysicalType::ARRAY:
+// 			return;
+// 		default:
+// 			break;
+// 		}
+// 	}
+// 	// with equality condition and null values not equal
+// 	for (auto &&condition : op.conditions) {
+// 		if (condition.comparison != ExpressionType::COMPARE_EQUAL) {
+// 			return;
+// 		}
+// 	}
+// 	// with integral internal types
+// 	for (auto &&join_stat : op.join_stats) {
+// 		if (!TypeIsInteger(join_stat->GetType().InternalType()) ||
+// 		    join_stat->GetType().InternalType() == PhysicalType::INT128 ||
+// 		    join_stat->GetType().InternalType() == PhysicalType::UINT128) {
+// 			// perfect join not possible for non-integral types or hugeint
+// 			return;
+// 		}
+// 	}
 
-	// and when the build range is smaller than the threshold
-	auto &stats_build = *op.join_stats[1].get(); // rhs stats
-	if (!NumericStats::HasMinMax(stats_build)) {
-		return;
-	}
-	int64_t min_value, max_value;
-	if (!ExtractNumericValue(NumericStats::Min(stats_build), min_value) ||
-	    !ExtractNumericValue(NumericStats::Max(stats_build), max_value)) {
-		return;
-	}
-	int64_t build_range;
-	if (!TrySubtractOperator::Operation(max_value, min_value, build_range)) {
-		return;
-	}
+// 	// and when the build range is smaller than the threshold
+// 	auto &stats_build = *op.join_stats[1].get(); // rhs stats
+// 	if (!NumericStats::HasMinMax(stats_build)) {
+// 		return;
+// 	}
+// 	int64_t min_value, max_value;
+// 	if (!ExtractNumericValue(NumericStats::Min(stats_build), min_value) ||
+// 	    !ExtractNumericValue(NumericStats::Max(stats_build), max_value)) {
+// 		return;
+// 	}
+// 	int64_t build_range;
+// 	if (!TrySubtractOperator::Operation(max_value, min_value, build_range)) {
+// 		return;
+// 	}
 
-	// Fill join_stats for invisible join
-	auto &stats_probe = *op.join_stats[0].get(); // lhs stats
-	if (!NumericStats::HasMinMax(stats_probe)) {
-		return;
-	}
+// 	// Fill join_stats for invisible join
+// 	auto &stats_probe = *op.join_stats[0].get(); // lhs stats
+// 	if (!NumericStats::HasMinMax(stats_probe)) {
+// 		return;
+// 	}
 
-	// The max size our build must have to run the perfect HJ
-	const idx_t MAX_BUILD_SIZE = 1000000;
-	join_state.probe_min = NumericStats::Min(stats_probe);
-	join_state.probe_max = NumericStats::Max(stats_probe);
-	join_state.build_min = NumericStats::Min(stats_build);
-	join_state.build_max = NumericStats::Max(stats_build);
-	join_state.estimated_cardinality = op.estimated_cardinality;
-	join_state.build_range = NumericCast<idx_t>(build_range);
-	if (join_state.build_range > MAX_BUILD_SIZE) {
-		return;
-	}
-	if (NumericStats::Min(stats_build) <= NumericStats::Min(stats_probe) &&
-	    NumericStats::Max(stats_probe) <= NumericStats::Max(stats_build)) {
-		join_state.is_probe_in_domain = true;
-	}
-	join_state.is_build_small = true;
-	return;
-}
+// 	// The max size our build must have to run the perfect HJ
+// 	const idx_t MAX_BUILD_SIZE = 1000000;
+// 	join_state.probe_min = NumericStats::Min(stats_probe);
+// 	join_state.probe_max = NumericStats::Max(stats_probe);
+// 	join_state.build_min = NumericStats::Min(stats_build);
+// 	join_state.build_max = NumericStats::Max(stats_build);
+// 	join_state.estimated_cardinality = op.estimated_cardinality;
+// 	join_state.build_range = NumericCast<idx_t>(build_range);
+// 	if (join_state.build_range > MAX_BUILD_SIZE) {
+// 		return;
+// 	}
+// 	if (NumericStats::Min(stats_build) <= NumericStats::Min(stats_probe) &&
+// 	    NumericStats::Max(stats_probe) <= NumericStats::Max(stats_build)) {
+// 		join_state.is_probe_in_domain = true;
+// 	}
+// 	join_state.is_build_small = true;
+// 	return;
+// }
 
 static void RewriteJoinCondition(Expression &expr, idx_t offset) {
 	if (expr.type == ExpressionType::BOUND_REF) {
@@ -239,7 +239,7 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::PlanComparisonJoin(Log
 	return plan;
 }
 
-unique_ptr<PhysicalOperator> PhysicalPlanGenerator::CreatePlan(LogicalComparisonJoin &op) {
+unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::CreatePlan(LogicalComparisonJoin &op) {
 	switch (op.type) {
 	case LogicalOperatorType::LOGICAL_ASOF_JOIN:
 		// return PlanAsOfJoin(op);

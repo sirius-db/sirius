@@ -27,10 +27,14 @@ public:
 
 public:
 	
-	GPUPhysicalOperator(PhysicalOperatorType type, vector<LogicalType> types, idx_t estimated_cardinality);
+	GPUPhysicalOperator(PhysicalOperatorType type, vector<LogicalType> types, idx_t estimated_cardinality)
+	    : type(type), types(std::move(types)), estimated_cardinality(estimated_cardinality) {
+	}
+	GPUPhysicalOperator() = default;
 
-	GPUPhysicalOperator();
-	virtual ~GPUPhysicalOperator();
+	virtual ~GPUPhysicalOperator() {
+	}
+	// ~GPUPhysicalOperator() = default;
 
 	//! The physical operator type
 	PhysicalOperatorType type;
@@ -50,11 +54,11 @@ public:
 
 public:
 	virtual string GetName() const;
-	virtual string ParamsToString() const {
-		return "";
-	}
-	virtual string ToString() const;
-	void Print() const;
+	// virtual string ParamsToString() const {
+	// 	return "";
+	// }
+	// virtual string ToString() const;
+	// void Print() const;
 	virtual vector<const_reference<GPUPhysicalOperator>> GetChildren() const;
 
 	//! Return a vector of the types that will be returned by this operator

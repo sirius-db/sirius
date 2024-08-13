@@ -19,7 +19,7 @@ public:
 	vector<const_reference<GPUPhysicalOperator>> delim_scans;
 
 public:
-	vector<const_reference<GPUPhysicalOperator>> GetChildren() const override;
+	// vector<const_reference<GPUPhysicalOperator>> GetChildren() const override;
 
 	bool IsSink() const override {
 		return true;
@@ -34,7 +34,7 @@ public:
 		return false;
 	}
 
-	string ParamsToString() const override;
+	// string ParamsToString() const override;
 };
 
 
@@ -48,16 +48,16 @@ public:
 	GPUPhysicalRightDelimJoin(vector<LogicalType> types, unique_ptr<GPUPhysicalOperator> original_join,
 	                       vector<const_reference<GPUPhysicalOperator>> delim_scans, idx_t estimated_cardinality);
 
-public:
-	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
-	unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const override;
+// public:
+	// unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
+	// unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const override;
 	// SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override;
 	// SinkCombineResultType Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const override;
 	// SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
 	//                           OperatorSinkFinalizeInput &input) const override;
 
-public:
-	void BuildPipelines(GPUPipeline &current, GPUMetaPipeline &meta_pipeline) override;
+// public:
+// 	void BuildPipelines(GPUPipeline &current, GPUMetaPipeline &meta_pipeline) override;
 };
 
 
@@ -69,16 +69,16 @@ public:
 	GPUPhysicalLeftDelimJoin(vector<LogicalType> types, unique_ptr<GPUPhysicalOperator> original_join,
 	                      vector<const_reference<GPUPhysicalOperator>> delim_scans, idx_t estimated_cardinality);
 
-public:
-	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
-	unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const override;
+// public:
+// 	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
+// 	unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const override;
 	// SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override;
 	// SinkCombineResultType Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const override;
 	// SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
 	//                           OperatorSinkFinalizeInput &input) const override;
 
-public:
-	void BuildPipelines(GPUPipeline &current, GPUMetaPipeline &meta_pipeline) override;
+// public:
+// 	void BuildPipelines(GPUPipeline &current, GPUMetaPipeline &meta_pipeline) override;
 };
 
 } // namespace duckdb

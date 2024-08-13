@@ -1,6 +1,7 @@
 #include "gpu_context.hpp"
 #include "gpu_operator_converter.hpp"
 #include "duckdb/execution/operator/set/physical_recursive_cte.hpp"
+#include "duckdb/execution/operator/helper/physical_result_collector.hpp"
 
 namespace duckdb {
 
@@ -22,35 +23,11 @@ GPUExecutor::Reset() {
 	// execution_result = PendingExecutionResult::RESULT_NOT_READY;
 }
 
-void ConvertDuckDBPlantoGPU(PhysicalOperator& physical_plan) {
-	//converting from PhysicalOperator to GPUPhysicalOperator recursively
-		// unique_ptr<GPUPhysicalOperator> gpu_operator = make_unique<GPUPhysicalOperator>(*physical_plan);
-
-		// Recursively convert child operators
-		// for (auto &child : physical_plan->children) {
-		// 	ConvertDuckDBPlantoGPU(std::move(child), gpu_operator);
-		// }
-
-		// Add the converted operator to the GPU plan
-		// gpu_physical_plan = std::move(gpu_operator);
-
-		// physical_plan->Print();
-		printf("Node: %s\n", physical_plan.GetName().c_str());
-		// ConvertOperator(physical_plan);
-		
-		// Recursively convert child operators
-		for (auto &child : physical_plan.children) {
-			printf("Going to child\n");
-			ConvertDuckDBPlantoGPU(*child);
-		}
-}
-
-void GPUExecutor::Initialize(unique_ptr<PhysicalResultCollector> physical_result_collector) {
+void GPUExecutor::Initialize(unique_ptr<GPUPhysicalResultCollector> physical_result_collector) {
 	Reset();
 
 	// unique_ptr<GPUPhysicalOperator> gpu_physical_plan = nullptr;
 	//convert cpu plan to gpu plan 
-	ConvertDuckDBPlantoGPU(physical_result_collector->plan);
 	// physical_plan->Print();
 
 	throw NotImplementedException("GPUExecutor::Initialize");
@@ -58,12 +35,12 @@ void GPUExecutor::Initialize(unique_ptr<PhysicalResultCollector> physical_result
 	InitializeInternal(*physical_result_collector);
 }
 
-void GPUExecutor::InitializeInternal(PhysicalResultCollector &physical_result_collector) {
+void GPUExecutor::InitializeInternal(GPUPhysicalResultCollector &physical_result_collector) {
 
 	// auto &scheduler = TaskScheduler::GetScheduler(context);
 	{
 		// lock_guard<mutex> elock(executor_lock);
-		physical_plan = &physical_result_collector;
+		gpu_physical_plan = &physical_result_collector;
 
 
 		// this->profiler = ClientData::Get(context).profiler;

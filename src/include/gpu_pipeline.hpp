@@ -25,7 +25,7 @@ public:
 	//! Duplicate eliminated join scan dependencies
 	reference_map_t<const GPUPhysicalOperator, reference<GPUPipeline>> delim_join_dependencies;
 	//! Materialized CTE scan dependencies
-	reference_map_t<const GPUPhysicalOperator, reference<GPUPipeline>> cte_dependencies;
+	// reference_map_t<const GPUPhysicalOperator, reference<GPUPipeline>> cte_dependencies;
 
 public:
 	void SetPipelineSource(GPUPipeline &pipeline, GPUPhysicalOperator &op);
@@ -40,7 +40,6 @@ public:
 };
 
 //! The Pipeline class represents an execution pipeline starting at a
-// class GPUPipeline : public enable_shared_from_this<GPUPipeline> {
 class GPUPipeline : public enable_shared_from_this<GPUPipeline>{
 	friend class GPUExecutor;
 	friend class GPUPipelineBuildState;
@@ -63,12 +62,12 @@ public:
 	void ClearSource();
 	void Schedule(shared_ptr<Event> &event);
 
-	string ToString() const;
-	void Print() const;
-	void PrintDependencies() const;
+	// string ToString() const;
+	// void Print() const;
+	// void PrintDependencies() const;
 
 	//! Returns query progress
-	bool GetProgress(double &current_percentage, idx_t &estimated_cardinality);
+	// bool GetProgress(double &current_percentage, idx_t &estimated_cardinality);
 
 	//! Returns a list of all operators (including source and sink) involved in this pipeline
 	vector<reference<GPUPhysicalOperator>> GetOperators();

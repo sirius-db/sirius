@@ -1,11 +1,3 @@
-//===----------------------------------------------------------------------===//
-//                         DuckDB
-//
-// duckdb/execution/operator/scan/physical_column_data_scan.hpp
-//
-//
-//===----------------------------------------------------------------------===//
-
 #pragma once
 
 #include "duckdb/common/types/column/column_data_collection.hpp"
@@ -43,8 +35,8 @@ public:
 
 	// string ParamsToString() const override;
 
-public:
-	void BuildPipelines(GPUPipeline &current, GPUMetaPipeline &meta_pipeline) override;
+// public:
+// 	void BuildPipelines(GPUPipeline &current, GPUMetaPipeline &meta_pipeline) override;
 };
 
 } // namespace duckdb

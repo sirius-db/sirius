@@ -37,15 +37,15 @@ public:
 	ExtraOperatorInfo extra_info;
 
 public:
-	string GetName() const override;
-	string ParamsToString() const override;
+	// string GetName() const override;
+	// string ParamsToString() const override;
 
-	bool Equals(const GPUPhysicalOperator &other) const override;
+	// bool Equals(const GPUPhysicalOperator &other) const override;
 
 public:
-	unique_ptr<LocalSourceState> GetLocalSourceState(ExecutionContext &context,
-	                                                 GlobalSourceState &gstate) const override;
-	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;
+	// unique_ptr<LocalSourceState> GetLocalSourceState(ExecutionContext &context,
+	//                                                  GlobalSourceState &gstate) const override;
+	// unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;
 	// SourceResultType GetData(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &input) const override;
 	// idx_t GetBatchIndex(ExecutionContext &context, DataChunk &chunk, GlobalSourceState &gstate,
 	//                     LocalSourceState &lstate) const override;
