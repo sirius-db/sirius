@@ -17,22 +17,10 @@
 
 #include "duckdb/execution/operator/scan/physical_dummy_scan.hpp"
 
+#include <stdio.h>
+#include <iostream>
+
 namespace duckdb {
-
-void GPUProcessError(ClientContext &context, ErrorData &error, const string &query) {
-    if (context.config.errors_as_json) {
-        error.ConvertErrorToJSON();
-    } else if (!query.empty()) {
-        error.AddErrorLocation(query);
-    }
-}
-
-template <class T>
-unique_ptr<T> GPUErrorResult(ClientContext &context, ErrorData error, const string &query = string()) {
-	GPUProcessError(context, error, query);
-	return make_uniq<T>(std::move(error));
-}
-
 
 unique_ptr<LogicalOperator> ExtractPlanFromRelation(ClientContext &context, shared_ptr<Relation> relation) {
 	auto relation_stmt = make_uniq<RelationStatement>(relation);
@@ -71,8 +59,29 @@ void GPUBindPreparedStatementParameters(PreparedStatementData &statement, const 
 GPUContext::GPUContext(ClientContext& client_context) : client_context(client_context) {
 };
 
+//This function is based on ClientContext::PendingStatementOrPreparedStatement
 unique_ptr<PendingQueryResult> 
-GPUContext::GPUPendingQuery(ClientContext &context, shared_ptr<GPUPreparedStatementData> &statement_p,
+GPUContext::GPUPendingStatementOrPreparedStatement(ClientContext &context, const string &query, shared_ptr<GPUPreparedStatementData> &statement_p,
+												  const PendingQueryParameters &parameters) {
+
+	BeginQueryInternal(query);
+
+	bool invalidate_query = true;
+	unique_ptr<PendingQueryResult> pending = GPUPendingStatementInternal(context, statement_p, parameters);
+
+	if (pending->HasError()) {
+		// query failed: abort now
+		throw InvalidInputException("Error in GPUPendingStatementOrPreparedStatement");
+		EndQueryInternal(false, invalidate_query);
+		return pending;
+	}
+	D_ASSERT(gpu_active_query->IsOpenResult(*pending));
+	return pending;
+};
+
+//This function is based on ClientContext::PendingPreparedStatementInternal
+unique_ptr<PendingQueryResult> 
+GPUContext::GPUPendingStatementInternal(ClientContext &context, shared_ptr<GPUPreparedStatementData> &statement_p,
 												  const PendingQueryParameters &parameters) {
 	D_ASSERT(gpu_active_query);
 	auto &statement = *(statement_p->prepared);
@@ -80,22 +89,27 @@ GPUContext::GPUPendingQuery(ClientContext &context, shared_ptr<GPUPreparedStatem
 	GPUBindPreparedStatementParameters(statement, parameters);
 
 	unique_ptr<GPUExecutor> temp = make_uniq<GPUExecutor>(context, *this);
+	auto prop = temp->context.GetClientProperties();
+	std::cout << "Properties: " << prop.time_zone << std::endl;
 	gpu_active_query->gpu_executor = std::move(temp);
 	auto &gpu_executor = GetGPUExecutor();
 	// auto stream_result = parameters.allow_stream_result && statement.properties.allow_stream_result;
 	bool stream_result = false;
 
-	get_result_collector_t get_method = PhysicalResultCollector::GetResultCollector;
-	auto &client_config = ClientConfig::GetConfig(context);
-	if (!stream_result && client_config.result_collector) {
-		get_method = client_config.result_collector;
-	}
-	statement.is_streaming = stream_result;
-	unique_ptr<PhysicalResultCollector> collector = get_method(context, statement);
-	D_ASSERT(collector->type == PhysicalOperatorType::RESULT_COLLECTOR);
-	auto types = collector->GetTypes();
+	// get_result_collector_t get_method = PhysicalResultCollector::GetResultCollector;
+	// auto &client_config = ClientConfig::GetConfig(context);
+	// if (!stream_result && client_config.result_collector) {
+	// 	get_method = client_config.result_collector;
+	// }
+	// statement.is_streaming = stream_result;
+	// unique_ptr<PhysicalResultCollector> collector = get_method(context, statement);
+
+	unique_ptr<GPUPhysicalResultCollector> gpu_collector = make_uniq_base<GPUPhysicalResultCollector, GPUPhysicalMaterializedCollector>(*statement_p);
+	D_ASSERT(gpu_collector->type == PhysicalOperatorType::RESULT_COLLECTOR);
+	auto types = gpu_collector->GetTypes();
 	D_ASSERT(types == statement.types);
-	gpu_executor.Initialize(std::move(collector));
+	gpu_executor.Initialize(std::move(gpu_collector));
+	printf("type %d\n", gpu_executor.gpu_physical_plan.get()->type);
 
 	D_ASSERT(!gpu_active_query->HasOpenResult());
 
@@ -112,73 +126,56 @@ GPUExecutor& GPUContext::GetGPUExecutor() {
 	return *gpu_active_query->gpu_executor;
 }
 
-bool 
-GPUContext::HasError() const {
-	D_ASSERT(error.HasError() == !success);
-	return !success;
-}
-
 void 
-GPUContext::CheckExecutableInternal(PendingQueryResult &result) {
+GPUContext::CheckExecutableInternal(PendingQueryResult &pending) {
 	// bool invalidated = HasError() || !(client_context);
-	bool invalidated = HasError();
+	D_ASSERT(gpu_active_query->IsOpenResult(pending));
+	bool invalidated = pending.HasError();
 	if (!invalidated) {
-		if (!gpu_active_query) {
-			invalidated = false;
-		}
-		invalidated = gpu_active_query->IsOpenResult(result);
+		D_ASSERT(gpu_active_query);
+		invalidated = !gpu_active_query->IsOpenResult(pending);
 	}
 	if (invalidated) {
-		if (HasError()) {
+		if (pending.HasError()) {
 			throw InvalidInputException(
-			    "Attempting to execute an unsuccessful or closed pending query result\n");
+			    "Attempting to execute an unsuccessful pending query result\n");
 		}
-		throw InvalidInputException("Attempting to execute an unsuccessful or closed pending query result");
+		throw InvalidInputException("Attempting to execute a closed pending query result");
 	}
 }
 
+//This function is based on PendingQueryResult::ExecuteInternal
+unique_ptr<QueryResult> 
+GPUContext::GPUExecutePendingQueryResult(PendingQueryResult &pending) {
+	// auto lock = pending.LockContext();
+	D_ASSERT(gpu_active_query->IsOpenResult(pending));
+	CheckExecutableInternal(pending);
+	auto &gpu_executor = GetGPUExecutor();
+	gpu_executor.Execute();
+	if (pending.HasError()) {
+		throw InvalidInputException("Error in GPUExecutePendingQueryResult");
+		// return make_uniq<MaterializedQueryResult>(error);
+	}
+	auto result = FetchResultInternal(pending);
+	// context.reset();
+	return result;
+}
+
+//This function is based on ClientContext::Query
 unique_ptr<QueryResult> 
 GPUContext::GPUExecuteQuery(ClientContext &context, const string &query, shared_ptr<GPUPreparedStatementData> &statement_p,
 												  const PendingQueryParameters &parameters) {
 
-	BeginQueryInternal(query);
-	auto pending = GPUPendingQuery(context, statement_p, parameters);
-
-	unique_ptr<QueryResult> result;
-// 	auto result = pending->Execute();
-// 	if (result->HasError()) {
-		// return result;
-// 	}
-// 	// verify that the result types and result names of the query match the expected result types/names
-// 	if (result->types.size() == expected_columns.size()) {
-// 		bool mismatch = false;
-// 		for (idx_t i = 0; i < result->types.size(); i++) {
-// 			if (result->types[i] != expected_columns[i].Type() || result->names[i] != expected_columns[i].Name()) {
-// 				mismatch = true;
-// 				break;
-// 			}
-// 		}
-// 		if (!mismatch) {
-// 			// all is as expected: return the result
-			return std::move(result);
-
-	CheckExecutableInternal(*pending);
-	// Busy wait while execution is not finished
-	// Execution happen here
-	// if (allow_stream_result) {
-	// 	while (!IsFinishedOrBlocked(ExecuteTaskInternal(lock))) {
-	// 	}
-	// } else {
-	// 	while (!IsFinished(ExecuteTaskInternal(lock))) {
-	// 	}
-	// }
-	if (HasError()) {
-		return make_uniq<MaterializedQueryResult>(error);
+	auto pending_query = GPUPendingStatementOrPreparedStatement(context, query, statement_p, parameters);
+	D_ASSERT(gpu_active_query->IsOpenResult(*pending_query));
+	unique_ptr<QueryResult> current_result;
+	if (pending_query->HasError()) {
+		throw InvalidInputException("Error in GPUExecuteQuery");
+		// current_result = ErrorResult<MaterializedQueryResult>(pending_query->GetErrorObject());
+	} else {
+		current_result = GPUExecutePendingQueryResult(*pending_query);
 	}
-	result = FetchResultInternal(*pending);
-	// context.reset();
-	return result;
-
+	return current_result;
 };
 
 void GPUContext::BeginQueryInternal(const string &query) {
@@ -215,6 +212,7 @@ GPUContext::FetchResultInternal(PendingQueryResult &pending) {
 	D_ASSERT(gpu_executor.HasResultCollector());
 	// we have a result collector - fetch the result directly from the result collector
 	result = gpu_executor.GetResult();
+	printf("Fetching result\n");
 	// if (!create_stream_result) {
 		CleanupInternal(result.get(), false);
 	// } else {
@@ -229,18 +227,14 @@ GPUContext::CleanupInternal(BaseQueryResult *result, bool invalidate_transaction
 		// no query currently active
 		return;
 	}
+	printf("Cleaning up\n");
 	if (gpu_active_query->gpu_executor) {
 		gpu_active_query->gpu_executor->CancelTasks();
 	}
 	gpu_active_query->progress_bar.reset();
 
-	// Relaunch the threads if a SET THREADS command was issued
-	// auto &scheduler = TaskScheduler::GetScheduler(*this);
-	// scheduler.RelaunchThreads();
-
 	auto error = EndQueryInternal(result ? !result->HasError() : false, invalidate_transaction);
 	if (result && !result->HasError()) {
-		// if an error occurred while committing report it in the result
 		result->SetError(error);
 	}
 	D_ASSERT(!gpu_active_query);
@@ -257,12 +251,13 @@ GPUContext::EndQueryInternal(bool success, bool invalidate_transaction) {
 	// for (auto const &s : registered_state) {
 	// 	s.second->QueryEnd(*this);
 	// }
-	// active_query->progress_bar.reset();
+	gpu_active_query->progress_bar.reset();
 
 	D_ASSERT(gpu_active_query.get());
 	gpu_active_query.reset();
 	// query_progress.Initialize();
 	ErrorData error;
+	printf("Ending query\n");
 	// try {
 	// 	if (transaction.HasActiveTransaction()) {
 	// 		transaction.ResetActiveQuery();

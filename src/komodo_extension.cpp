@@ -15,6 +15,8 @@
 #include "duckdb/main/prepared_statement_data.hpp"
 #include "duckdb/common/assert.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/catalog/catalog_entry/duck_schema_entry.hpp"
+#include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 
 #include "substrait_extension.hpp"
 #include "to_substrait.hpp"
@@ -22,6 +24,7 @@
 
 #include "gpu_context.hpp"
 #include "gpu_physical_plan_generator.hpp"
+#include "gpu_buffer_manager.hpp"
 // OpenSSL linked through vcpkg
 // #include <openssl/opensslv.h>
 
@@ -37,6 +40,17 @@ struct GPUTableFunctionData : public TableFunctionData {
 	unique_ptr<GPUContext> gpu_context;
 	string query;
 	bool enable_optimizer;
+	bool finished = false;
+};
+
+struct GPUCachingFunctionData : public TableFunctionData {
+	GPUCachingFunctionData() = default;
+	unique_ptr<Connection> conn;
+	GPUBufferManager *gpuBufferManager;
+	ColumnType type;
+	uint8_t *data;
+	string column;
+	string table;
 	bool finished = false;
 };
 
@@ -74,7 +88,81 @@ unique_ptr<GPUPhysicalOperator> GPUGeneratePhysicalPlan(ClientContext& context, 
 
 //The result of the GPUProcessingBind function is a unique pointer to a FunctionData object.
 //This result of this function is used as an argument to the GPUProcessingFunction function (data_p argument), which is called to execute the table function.
-static unique_ptr<FunctionData> GPUProcessingBind(ClientContext &context, TableFunctionBindInput &input,
+unique_ptr<FunctionData> 
+KomodoExtension::GPUCachingBind(ClientContext &context, TableFunctionBindInput &input,
+                                                vector<LogicalType> &return_types, vector<string> &names) {
+	auto result = make_uniq<GPUCachingFunctionData>();
+	result->conn = make_uniq<Connection>(*context.db);
+	if (input.inputs[0].IsNull()) {
+		throw BinderException("gpu_caching cannot be called with a NULL parameter");
+	}
+
+	size_t cache_size_per_gpu = 8UL * 1024 * 1024 * 1024;
+	size_t processing_size_per_gpu = 4UL * 1024 * 1024 * 1024;
+	size_t processing_size_per_cpu = 4UL * 1024 * 1024 * 1024;
+	result->gpuBufferManager = &(GPUBufferManager::GetInstance(cache_size_per_gpu, processing_size_per_gpu, processing_size_per_cpu));
+	// result->gpuBufferManager->Print();
+	//check if the table exists in the gpu_buffer
+	//check if the column exists in the gpu buffer
+	//if it does, allocate region in the gpu caching buffer
+
+	string input_string = input.inputs[0].ToString();
+    size_t pos = input_string.find('.');  // Find the position of the period
+
+    if (pos != string::npos) {
+        string table_name = input_string.substr(0, pos);  // Extract the first word
+        string column_name = input_string.substr(pos + 1); // Extract the second word
+		result->table = table_name;
+		result->column = column_name;
+    } else {
+        throw InvalidInputException("Incorrect input format, use table.column");
+    }
+
+	return_types.emplace_back(LogicalType(LogicalTypeId::VARCHAR));
+	names.emplace_back("GPU Caching");
+
+	return std::move(result);
+}
+
+void KomodoExtension::GPUCachingFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &data = (GPUCachingFunctionData &)*data_p.bind_data;
+	if (data.finished) {
+		return;
+	}
+
+	//get data in CPU buffer
+	string query = "SELECT " + data.column + " FROM " + data.table + ";";
+	cout << "Query: " << query << endl;
+	// string query = "SELECT l_orderkey FROM lineitem;";
+	auto cpu_res = data.conn->Query(query);
+	
+	//check if table exist in the catalog
+	//check if table already exist in the gpu buffer
+	//check if column exist in the catalog
+	//check if column already exist in the gpu buffer
+	auto &catalog_table = Catalog::GetCatalog(context, INVALID_CATALOG);
+	printf("creating table and column in GPU\n");
+	data.gpuBufferManager->createTableAndColumnInGPU(catalog_table, context, data.table, data.column);
+
+	printf("allocating column buffer in CPU\n");
+	DataWrapper buffered_data = data.gpuBufferManager->allocateColumnBufferInCPU(move(cpu_res));
+	// update the catalog in GPU buffer manager (adding tables/columns)
+
+	printf("caching data in GPU\n");
+	data.gpuBufferManager->cacheDataInGPU(buffered_data, data.table, data.column, 0);  // Send data to GPU
+	data.gpuBufferManager->Print();
+
+	output.SetCardinality(1);
+	output.SetValue(0, 0, "Successful");
+	data.finished = true;
+
+	return;
+}
+
+//The result of the GPUProcessingBind function is a unique pointer to a FunctionData object.
+//This result of this function is used as an argument to the GPUProcessingFunction function (data_p argument), which is called to execute the table function.
+unique_ptr<FunctionData> 
+KomodoExtension::GPUProcessingBind(ClientContext &context, TableFunctionBindInput &input,
                                                 vector<LogicalType> &return_types, vector<string> &names) {
 	auto result = make_uniq<GPUTableFunctionData>();
 	result->conn = make_uniq<Connection>(*context.db);
@@ -104,9 +192,7 @@ static unique_ptr<FunctionData> GPUProcessingBind(ClientContext &context, TableF
 	query_plan->Print();
 	auto gpu_physical_plan = GPUGeneratePhysicalPlan(context, *result->gpu_context, query_plan, *result->conn);
 	auto gpu_prepared = make_shared_ptr<GPUPreparedStatementData>(std::move(prepared), std::move(gpu_physical_plan));
-	
-	throw BinderException("GPUProcessingBind not implemented yet");
-	
+		
 	result->gpu_prepared = gpu_prepared;
 
 	for (auto &column : planner.names) {
@@ -119,28 +205,7 @@ static unique_ptr<FunctionData> GPUProcessingBind(ClientContext &context, TableF
 	return std::move(result);
 }
 
-static unique_ptr<FunctionData> GPUProcessingSubstraitBind(ClientContext &context, TableFunctionBindInput &input,
-                                                vector<LogicalType> &return_types, vector<string> &names) {
-	auto result = make_uniq<GPUTableFunctionData>();
-	result->conn = make_uniq<Connection>(*context.db);
-	result->query = input.inputs[0].ToString();
-	result->enable_optimizer = true;
-	result->gpu_context = make_uniq<GPUContext>(context);
-	if (input.inputs[0].IsNull()) {
-		throw BinderException("gpu_processing cannot be called with a NULL parameter");
-	}
-	string serialized = input.inputs[0].GetValueUnsafe<string>();
-	result->plan = GPUSubstraitPlanToDuckDBRel(*result->conn, serialized, false);
-
-	for (auto &column : result->plan->Columns()) {
-		return_types.emplace_back(column.Type());
-		names.emplace_back(column.Name());
-	}
-
-	return std::move(result);
-}
-
-static void GPUProcessingFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+void KomodoExtension::GPUProcessingFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
 	auto &data = (GPUTableFunctionData &)*data_p.bind_data;
 	if (data.finished) {
 		return;
@@ -175,7 +240,29 @@ static void GPUProcessingFunction(ClientContext &context, TableFunctionInput &da
 	return;
 }
 
-static void GPUProcessingSubstraitFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+unique_ptr<FunctionData> 
+KomodoExtension::GPUProcessingSubstraitBind(ClientContext &context, TableFunctionBindInput &input,
+                                                vector<LogicalType> &return_types, vector<string> &names) {
+	auto result = make_uniq<GPUTableFunctionData>();
+	result->conn = make_uniq<Connection>(*context.db);
+	result->query = input.inputs[0].ToString();
+	result->enable_optimizer = true;
+	result->gpu_context = make_uniq<GPUContext>(context);
+	if (input.inputs[0].IsNull()) {
+		throw BinderException("gpu_processing cannot be called with a NULL parameter");
+	}
+	string serialized = input.inputs[0].GetValueUnsafe<string>();
+	result->plan = GPUSubstraitPlanToDuckDBRel(*result->conn, serialized, false);
+
+	for (auto &column : result->plan->Columns()) {
+		return_types.emplace_back(column.Type());
+		names.emplace_back(column.Name());
+	}
+
+	return std::move(result);
+}
+
+void KomodoExtension::GPUProcessingSubstraitFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
 	auto &data = (GPUTableFunctionData &)*data_p.bind_data;
 	if (data.finished) {
 		return;
@@ -204,42 +291,39 @@ static void GPUProcessingSubstraitFunction(ClientContext &context, TableFunction
 	return;
 }
 
-void InitializeGPUExtension(Connection &con) {
+void KomodoExtension::InitializeGPUExtension(Connection &con) {
 	auto &catalog = Catalog::GetSystemCatalog(*con.context);
-	// string name = catalog.GetName();
-	// printf("catalog name %s\n", catalog.GetName().c_str());
+	// auto &catalog_table = Catalog::GetCatalog(*con.context, INVALID_CATALOG);
+	// string name = catalog_table.GetName();
+	// printf("catalog name %s\n", catalog_table.GetName().c_str());
 
-	// auto &schema = catalog.GetSchema(*con.context, DEFAULT_SCHEMA);
-	// string s_name = schema.name;
+	// auto &schema = catalog_table.GetSchema(*con.context, DEFAULT_SCHEMA);
+	// string schema_name = schema.name;
 	// printf("schema name %s\n", schema.name.c_str());
 
-	// auto &table = catalog.GetEntry(*con.context, CatalogType::TABLE_ENTRY, s_name, "lineitem");
+	// auto duck_schema = schema.Cast<DuckSchemaEntry>();
+
+	// TableCatalogEntry &table = catalog_table.GetEntry(*con.context, CatalogType::TABLE_ENTRY, schema_name, "lineitem").Cast<TableCatalogEntry>();
 	// printf("%s\n", table.name.c_str());
 
-	auto &catalog2 = Catalog::GetCatalog(*con.context, INVALID_CATALOG);
-	string name = catalog2.GetName();
-	printf("catalog name %s\n", catalog2.GetName().c_str());
+	// for (auto &column_name : table.GetColumns().GetColumnNames()) {
+	// 	printf("column name %s\n", column_name.c_str());
+	// }
 
-	auto &schema = catalog2.GetSchema(*con.context, DEFAULT_SCHEMA);
-	string s_name = schema.name;
-	printf("schema name %s\n", schema.name.c_str());
+	// size_t cache_size_per_gpu = 8UL * 1024 * 1024 * 1024;
+	// size_t processing_size_per_gpu = 4UL * 1024 * 1024 * 1024;
+	// size_t processing_size_per_cpu = 4UL * 1024 * 1024 * 1024;
+	// gpuBufferManager = new GPUBufferManager(cache_size_per_gpu, processing_size_per_gpu, processing_size_per_cpu);
 
-	TableCatalogEntry &table = catalog2.GetEntry(*con.context, CatalogType::TABLE_ENTRY, s_name, "lineitem").Cast<TableCatalogEntry>();
-	printf("%s\n", table.name.c_str());
+	TableFunction gpu_caching("gpu_caching", {LogicalType::VARCHAR}, GPUCachingFunction, GPUCachingBind);
+	CreateTableFunctionInfo gpu_caching_info(gpu_caching);
+	catalog.CreateTableFunction(*con.context, gpu_caching_info);
 
-	for (auto &column_name : table.GetColumns().GetColumnNames()) {
-		printf("column name %s\n", column_name.c_str());
-	}
-
-	// create the get_substrait table function that allows us to get a substrait
-	// JSON from a valid SQL Query
 	TableFunction gpu_processing("gpu_processing", {LogicalType::VARCHAR}, GPUProcessingFunction, GPUProcessingBind);
 	gpu_processing.named_parameters["enable_optimizer"] = LogicalType::BOOLEAN;
 	CreateTableFunctionInfo gpu_processing_info(gpu_processing);
 	catalog.CreateTableFunction(*con.context, gpu_processing_info);
 
-	// create the get_substrait table function that allows us to get a substrait
-	// JSON from a valid SQL Query
 	TableFunction gpu_processing_substrait("gpu_processing_substrait", {LogicalType::BLOB}, GPUProcessingSubstraitFunction, GPUProcessingSubstraitBind);
 	// gpu_processing.named_parameters["enable_optimizer"] = LogicalType::BOOLEAN;
 	CreateTableFunctionInfo gpu_processing_substrait_info(gpu_processing_substrait);

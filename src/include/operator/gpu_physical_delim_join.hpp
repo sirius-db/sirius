@@ -24,9 +24,10 @@ public:
 	bool IsSink() const override {
 		return true;
 	}
-	bool ParallelSink() const override {
-		return true;
-	}
+	// bool ParallelSink() const override {
+	// 	return true;
+	// }
+
 	OrderPreservationType SourceOrder() const override {
 		return OrderPreservationType::NO_ORDER;
 	}

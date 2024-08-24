@@ -32,5 +32,6 @@ public:
 	//                      const vector<LogicalType> &rhs_types, const vector<idx_t> &left_projection_map,
 	//                      const vector<idx_t> &right_projection_map, const idx_t estimated_cardinality);
 
+
 };
 } // namespace duckdb

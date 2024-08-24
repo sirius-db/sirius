@@ -31,11 +31,13 @@ set(EXTENSION_SOURCES
   src/gpu_pipeline.cpp
   src/gpu_meta_pipeline.cpp
   src/gpu_physical_plan_generator.cpp
+  src/gpu_buffer_manager.cpp
+  src/gpu_columns.cpp
 )
 add_subdirectory(src/operator)
 add_subdirectory(src/plan)
 
-set(CUDA_SOURCES src/cuda/komodo_extension_cuda.cu src/cuda/communication.cu)
+set(CUDA_SOURCES src/cuda/komodo_extension_cuda.cu src/cuda/communication.cu src/cuda/allocator.cu)
 
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CXX_STANDARD 17)

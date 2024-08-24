@@ -1,0 +1,257 @@
+#include "gpu_buffer_manager.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/common/types.hpp"
+
+#define NUM_GPUS 1
+
+namespace duckdb {
+
+template int*
+GPUBufferManager::customCudaMalloc<int>(size_t size, int gpu, bool caching);
+
+template uint64_t*
+GPUBufferManager::customCudaMalloc<uint64_t>(size_t size, int gpu, bool caching);
+
+template uint8_t*
+GPUBufferManager::customCudaMalloc<uint8_t>(size_t size, int gpu, bool caching);
+
+template float*
+GPUBufferManager::customCudaMalloc<float>(size_t size, int gpu, bool caching);
+
+template double*
+GPUBufferManager::customCudaMalloc<double>(size_t size, int gpu, bool caching);
+
+template int*
+GPUBufferManager::customCudaHostAlloc<int>(size_t size);
+
+template uint64_t*
+GPUBufferManager::customCudaHostAlloc<uint64_t>(size_t size);
+
+template uint8_t*
+GPUBufferManager::customCudaHostAlloc<uint8_t>(size_t size);
+
+template float*
+GPUBufferManager::customCudaHostAlloc<float>(size_t size);
+
+template double*
+GPUBufferManager::customCudaHostAlloc<double>(size_t size);
+
+GPUBufferManager::GPUBufferManager(size_t cache_size_per_gpu, size_t processing_size_per_gpu, size_t processing_size_per_cpu) : 
+    cache_size_per_gpu(cache_size_per_gpu), processing_size_per_gpu(processing_size_per_gpu), processing_size_per_cpu(processing_size_per_cpu) {
+    gpuCache = new uint8_t*[NUM_GPUS];
+    gpuProcessing = new uint8_t*[NUM_GPUS];
+    cpuProcessing = new uint8_t[processing_size_per_cpu];
+    gpuProcessingPointer = new size_t[NUM_GPUS];
+    gpuCachingPointer = new size_t[NUM_GPUS];
+    cpuProcessingPointer = 0;
+
+    for (int gpu = 0; gpu < NUM_GPUS; gpu++) {
+        gpuCache[gpu] = callCudaMalloc<uint8_t>(cache_size_per_gpu, gpu);
+        gpuProcessing[gpu] = callCudaMalloc<uint8_t>(processing_size_per_gpu, gpu);
+        gpuProcessingPointer[gpu] = 0;
+        gpuCachingPointer[gpu] = 0;
+    }
+}
+
+GPUBufferManager::~GPUBufferManager() {
+    for (int gpu = 0; gpu < NUM_GPUS; gpu++) {
+        callCudaFree<uint8_t>(gpuCache[gpu], gpu);
+        callCudaFree<uint8_t>(gpuProcessing[gpu], gpu);
+    }
+    delete[] cpuProcessing;
+    delete[] gpuProcessingPointer;
+    delete[] gpuCachingPointer;
+}
+
+void GPUBufferManager::ResetBuffer() {
+    for (int gpu = 0; gpu < NUM_GPUS; gpu++) {
+        gpuProcessingPointer[gpu] = 0;
+    }
+    cpuProcessingPointer = 0;
+}
+
+template <typename T>
+T*
+GPUBufferManager::customCudaMalloc(size_t size, int gpu, bool caching) {
+	size_t alloc = (size * sizeof(T));
+    if (caching) {
+        size_t start = __atomic_fetch_add(&gpuCachingPointer[gpu], alloc, __ATOMIC_RELAXED);
+        assert((start + alloc) < cache_size_per_gpu);
+        return reinterpret_cast<T*>(gpuCache[gpu] + start);
+    } else {
+        size_t start = __atomic_fetch_add(&gpuProcessingPointer[gpu], alloc, __ATOMIC_RELAXED);
+        assert((start + alloc) < processing_size_per_gpu);
+        return reinterpret_cast<T*>(gpuProcessing[gpu] + start);
+    }
+};
+
+template <typename T>
+T*
+GPUBufferManager::customCudaHostAlloc(size_t size) {
+	size_t alloc = (size * sizeof(T));
+	size_t start = __atomic_fetch_add(&cpuProcessingPointer, alloc, __ATOMIC_RELAXED);
+	assert((start + alloc) < processing_size_per_cpu);
+	return reinterpret_cast<T*>(cpuProcessing + start);
+};
+
+void 
+GPUBufferManager::Print() {
+    printf("I am inside GPU buffer manager\n");
+}
+
+DataWrapper
+GPUBufferManager::allocateChunk(DataChunk &input){
+	size_t chunk_size = input.size();
+	LogicalType vector_type = input.data[0].GetType();
+    uint8_t* ptr = nullptr;
+    ColumnType column_type;
+
+    switch (vector_type.id()) {
+        case LogicalTypeId::INTEGER: {
+            int* ptr_int = customCudaHostAlloc<int>(chunk_size);
+            ptr = reinterpret_cast<uint8_t*>(ptr_int);
+            memcpy(ptr, input.data[0].GetData(), input.size() * sizeof(int));
+            column_type = ColumnType::INT32;
+            break;
+        }
+        case LogicalTypeId::BIGINT: {
+            uint64_t* ptr_int64 = customCudaHostAlloc<uint64_t>(chunk_size);
+            ptr = reinterpret_cast<uint8_t*>(ptr_int64);
+            memcpy(ptr, input.data[0].GetData(), input.size() * sizeof(uint64_t));
+            column_type = ColumnType::INT64;
+            break;
+        }
+        case LogicalTypeId::FLOAT: {
+            float* ptr_float = customCudaHostAlloc<float>(chunk_size);
+            ptr = reinterpret_cast<uint8_t*>(ptr_float);
+            memcpy(ptr, input.data[0].GetData(), input.size() * sizeof(float));
+            column_type = ColumnType::FLOAT32;
+            break;
+        }
+        case LogicalTypeId::DOUBLE: {
+            double* ptr_double = customCudaHostAlloc<double>(chunk_size);
+            ptr = reinterpret_cast<uint8_t*>(ptr_double);
+            memcpy(ptr, input.data[0].GetData(), input.size() * sizeof(double));
+            column_type = ColumnType::FLOAT64;
+            break;
+        }
+        default:
+            throw InvalidInputException("Unsupported type");
+    }
+
+    return DataWrapper(column_type, ptr, chunk_size);
+}
+
+//TODO: We have to lock the CPU buffer before calling bufferChunkInCPU to ensure contiguous memory allocation
+DataWrapper
+GPUBufferManager::allocateColumnBufferInCPU(unique_ptr<MaterializedQueryResult> input) {
+	auto input_chunk = input->Fetch();
+	if (!input_chunk) {
+		throw InvalidInputException("No data in input chunk");
+	}
+    DataWrapper result_wrapper = allocateChunk(*input_chunk);
+    input_chunk = input->Fetch();
+	while (input_chunk) {
+		auto wrapper = allocateChunk(*input_chunk);
+        result_wrapper.size += wrapper.size;
+		input_chunk = input->Fetch();
+	}
+    // for (int i = 0; i < 1000000; i++) {
+    //     printf("Data: %d\n", reinterpret_cast<int*>(result_wrapper.data)[i]);
+    // }
+    return result_wrapper;
+}
+
+DataWrapper
+GPUBufferManager::allocateColumnBufferInGPU(DataWrapper cpu_data, int gpu) {
+    uint8_t* ptr = nullptr;
+    ColumnType column_type;
+
+	switch (cpu_data.type) {
+		case ColumnType::INT32: {
+            int* ptr_int = customCudaMalloc<int>(cpu_data.size, 0, true);
+            ptr = reinterpret_cast<uint8_t*>(ptr_int);
+            column_type = ColumnType::INT32;
+			break;
+        }
+		case ColumnType::INT64: {
+            uint64_t* ptr_int64 = customCudaMalloc<uint64_t>(cpu_data.size, 0, true);
+            ptr = reinterpret_cast<uint8_t*>(ptr_int64);
+            column_type = ColumnType::INT64;
+			break;
+        }
+		case ColumnType::FLOAT32: {
+            float* ptr_float = customCudaMalloc<float>(cpu_data.size, 0, true);
+            ptr = reinterpret_cast<uint8_t*>(ptr_float);
+            column_type = ColumnType::INT64;
+			break;
+        }
+		case ColumnType::FLOAT64: {
+            double* ptr_double = customCudaMalloc<double>(cpu_data.size, 0, true);
+            ptr = reinterpret_cast<uint8_t*>(ptr_double);
+            column_type = ColumnType::FLOAT64;
+			break;
+        }
+        default:
+            throw InvalidInputException("Unsupported type");
+	}
+    return DataWrapper(column_type, ptr, cpu_data.size);
+}
+
+void
+GPUBufferManager::cacheDataInGPU(DataWrapper cpu_data, string table_name, string column_name, int gpu) {
+    string up_column_name = column_name;
+    string up_table_name = table_name;
+    transform(up_table_name.begin(), up_table_name.end(), up_table_name.begin(), ::toupper);
+    transform(up_column_name.begin(), up_column_name.end(), up_column_name.begin(), ::toupper);
+    auto column_it = find(tables[up_table_name]->column_names.begin(), tables[up_table_name]->column_names.end(), up_column_name);
+    // for (int i = 0; i < tables[table_name]->column_names.size(); i++) {
+    //     printf("Column name: %s\n", tables[table_name]->column_names[i].c_str());
+    // }
+    if (column_it == tables[up_table_name]->column_names.end()) {
+        throw InvalidInputException("Column not found");
+    }
+    DataWrapper gpu_allocated_buffer = allocateColumnBufferInGPU(cpu_data, gpu);
+    callCudaMemcpyHostToDevice<uint8_t>(gpu_allocated_buffer.data, cpu_data.data, cpu_data.size * cpu_data.getColumnTypeSize(), 0);
+    int column_idx = column_it - tables[up_table_name]->column_names.begin(); 
+    tables[up_table_name]->columns[column_idx]->data_wrapper = gpu_allocated_buffer;
+}
+
+void
+GPUBufferManager::createTableAndColumnInGPU(Catalog& catalog, ClientContext& context, string table_name, string column_name) {
+	TableCatalogEntry &table = catalog.GetEntry(context, CatalogType::TABLE_ENTRY, DEFAULT_SCHEMA, table_name).Cast<TableCatalogEntry>();
+    auto column_names = table.GetColumns().GetColumnNames();
+    //finding column_name in column_names
+    if (find(column_names.begin(), column_names.end(), column_name) == column_names.end()) {
+        // convert table_name to uppercase 
+        string up_table_name = table_name;
+        transform(up_table_name.begin(), up_table_name.end(), up_table_name.begin(), ::toupper);
+        createTable(up_table_name, table.GetTypes().size());
+        ColumnType column_type = convertLogicalTypetoColumnType(table.GetColumn(column_name).GetType());
+        size_t column_id = table.GetColumnIndex(column_name, false).index;
+        // convert table_name to uppercase 
+        string up_column_name = column_name;
+        transform(up_column_name.begin(), up_column_name.end(), up_column_name.begin(), ::toupper);
+        createColumn(up_table_name, up_column_name, column_type, column_id);
+    } else {
+        throw InvalidInputException("Column already exists");
+    }
+}
+
+void
+GPUBufferManager::createTable(string up_table_name, size_t column_count) {
+    //we will update the length later
+    GPUIntermediateRelation* table = new GPUIntermediateRelation(0, column_count);
+    table->names = up_table_name;
+    tables[up_table_name] = table;
+}
+
+void
+GPUBufferManager::createColumn(string up_table_name, string up_column_name, ColumnType column_type, size_t column_id) {
+    GPUIntermediateRelation* table = tables[up_table_name];
+    table->column_names[column_id] = up_column_name;
+    //we will update the length and data later
+    table->columns[column_id] = new GPUColumn(up_column_name, 0, column_type, nullptr);
+}
+
+}; // namespace duckdb

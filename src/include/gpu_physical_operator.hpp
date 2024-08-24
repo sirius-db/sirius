@@ -11,6 +11,7 @@
 #include "duckdb/common/optional_idx.hpp"
 #include "duckdb/execution/physical_operator_states.hpp"
 #include "duckdb/common/enums/order_preservation_type.hpp"
+#include "gpu_columns.hpp"
 
 namespace duckdb {
 class GPUExecutor;
@@ -76,10 +77,11 @@ public:
 	// Operator interface
 	virtual unique_ptr<OperatorState> GetOperatorState(ExecutionContext &context) const;
 	virtual unique_ptr<GlobalOperatorState> GetGlobalOperatorState(ClientContext &context) const;
-	virtual OperatorResultType Execute(ExecutionContext &context, DataChunk &input, DataChunk &chunk,
-	                                   GlobalOperatorState &gstate, OperatorState &state) const;
-	virtual OperatorFinalizeResultType FinalExecute(ExecutionContext &context, DataChunk &chunk,
-	                                                GlobalOperatorState &gstate, OperatorState &state) const;
+	// virtual OperatorResultType Execute(ExecutionContext &context, DataChunk &input, DataChunk &chunk,
+	//                                    GlobalOperatorState &gstate, OperatorState &state) const;
+	virtual OperatorResultType Execute(GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation) const;
+	// virtual OperatorFinalizeResultType FinalExecute(ExecutionContext &context, DataChunk &chunk,
+	//                                                 GlobalOperatorState &gstate, OperatorState &state) const;
 
 	virtual bool ParallelOperator() const {
 		return false;
@@ -115,7 +117,8 @@ public:
 
 public:
 	//Sink interface
-
+	// virtual SinkResultType Sink(ExecutionContext &context, GPUIntermediateRelation &input, OperatorSinkInput &input) const;
+	virtual SinkResultType Sink(GPUIntermediateRelation &input_relation) const;
 	virtual unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const;
 	virtual unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const;
 	
@@ -144,22 +147,22 @@ public:
 
 	virtual void BuildPipelines(GPUPipeline &current, GPUMetaPipeline &meta_pipeline);
 
-// public:
-// 	template <class TARGET>
-// 	TARGET &Cast() {
-// 		if (TARGET::TYPE != PhysicalOperatorType::INVALID && type != TARGET::TYPE) {
-// 			throw InternalException("Failed to cast physical operator to type - physical operator type mismatch");
-// 		}
-// 		return reinterpret_cast<TARGET &>(*this);
-// 	}
+public:
+	template <class TARGET>
+	TARGET &Cast() {
+		if (TARGET::TYPE != PhysicalOperatorType::INVALID && type != TARGET::TYPE) {
+			throw InternalException("Failed to cast physical operator to type - physical operator type mismatch");
+		}
+		return reinterpret_cast<TARGET &>(*this);
+	}
 
-// 	template <class TARGET>
-// 	const TARGET &Cast() const {
-// 		if (TARGET::TYPE != PhysicalOperatorType::INVALID && type != TARGET::TYPE) {
-// 			throw InternalException("Failed to cast physical operator to type - physical operator type mismatch");
-// 		}
-// 		return reinterpret_cast<const TARGET &>(*this);
-// 	}
+	template <class TARGET>
+	const TARGET &Cast() const {
+		if (TARGET::TYPE != PhysicalOperatorType::INVALID && type != TARGET::TYPE) {
+			throw InternalException("Failed to cast physical operator to type - physical operator type mismatch");
+		}
+		return reinterpret_cast<const TARGET &>(*this);
+	}
 };
 
 } // namespace duckdb

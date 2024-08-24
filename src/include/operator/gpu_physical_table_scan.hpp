@@ -62,6 +62,6 @@ public:
 	// }
 
 	// double GetProgress(ClientContext &context, GlobalSourceState &gstate) const override;
-
 };
+
 } // namespace duckdb

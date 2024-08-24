@@ -25,7 +25,90 @@ public:
 	                      vector<unique_ptr<Expression>> groups, vector<GroupingSet> grouping_sets,
 	                      vector<unsafe_vector<idx_t>> grouping_functions, idx_t estimated_cardinality);
 
-	vector<GroupingSet> grouping_sets;
+	//! The grouping sets
+	GroupedAggregateData grouped_aggregate_data;
 
+	vector<GroupingSet> grouping_sets;
+	// //! The radix partitioned hash tables (one per grouping set)
+	// vector<HashAggregateGroupingData> groupings;
+	// unique_ptr<DistinctAggregateCollectionInfo> distinct_collection_info;
+	// //! A recreation of the input chunk, with nulls for everything that isnt a group
+	// vector<LogicalType> input_group_types;
+
+	// // Filters given to Sink and friends
+	// unsafe_vector<idx_t> non_distinct_filter;
+	// unsafe_vector<idx_t> distinct_filter;
+
+	// unordered_map<Expression *, size_t> filter_indexes;
+
+public:
+	// // Source interface
+	// unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;
+	// unique_ptr<LocalSourceState> GetLocalSourceState(ExecutionContext &context,
+	//                                                  GlobalSourceState &gstate) const override;
+	// SourceResultType GetData(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &input) const override;
+
+	// double GetProgress(ClientContext &context, GlobalSourceState &gstate) const override;
+
+	//Source interface
+	bool IsSource() const override {
+		return true;
+	}
+	bool ParallelSource() const override {
+		return true;
+	}
+
+	OrderPreservationType SourceOrder() const override {
+		return OrderPreservationType::NO_ORDER;
+	}
+
+public:
+	// Sink interface
+	// SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override;
+	// SinkCombineResultType Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const override;
+	// SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
+	//                           OperatorSinkFinalizeInput &input) const override;
+	// SinkFinalizeType FinalizeInternal(Pipeline &pipeline, Event &event, ClientContext &context, GlobalSinkState &gstate,
+	//                                   bool check_distinct) const;
+
+	// unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const override;
+	// unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
+
+	// Sink interface
+	bool IsSink() const override {
+		return true;
+	}
+
+	bool ParallelSink() const override {
+		return true;
+	}
+
+	bool SinkOrderDependent() const override {
+		return false;
+	}
+
+// public:
+// 	string ParamsToString() const override;
+// 	//! Toggle multi-scan capability on a hash table, which prevents the scan of the aggregate from being destructive
+// 	//! If this is not toggled the GetData method will destroy the hash table as it is scanning it
+// 	static void SetMultiScan(GlobalSinkState &state);
+
+// private:
+// 	//! When we only have distinct aggregates, we can delay adding groups to the main ht
+// 	bool CanSkipRegularSink() const;
+
+// 	//! Finalize the distinct aggregates
+// 	SinkFinalizeType FinalizeDistinct(Pipeline &pipeline, Event &event, ClientContext &context,
+// 	                                  GlobalSinkState &gstate) const;
+// 	//! Combine the distinct aggregates
+// 	void CombineDistinct(ExecutionContext &context, OperatorSinkCombineInput &input) const;
+// 	//! Sink the distinct aggregates for a single grouping
+// 	void SinkDistinctGrouping(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input,
+// 	                          idx_t grouping_idx) const;
+// 	//! Sink the distinct aggregates
+// 	void SinkDistinct(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const;
+// 	//! Create groups in the main ht for groups that would otherwise get filtered out completely
+// 	SinkResultType SinkGroupsOnly(ExecutionContext &context, GlobalSinkState &state, LocalSinkState &lstate,
+// 	                              DataChunk &input) const;
 };
 } // namespace duckdb

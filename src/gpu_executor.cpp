@@ -2,15 +2,19 @@
 #include "gpu_operator_converter.hpp"
 #include "duckdb/execution/operator/set/physical_recursive_cte.hpp"
 #include "duckdb/execution/operator/helper/physical_result_collector.hpp"
+#include "gpu_physical_operator.hpp"
+#include "operator/gpu_physical_result_collector.hpp"
+#include <iostream>
+#include <stdio.h>
 
 namespace duckdb {
 
 void 
 GPUExecutor::Reset() {
 	// lock_guard<mutex> elock(executor_lock);
-	physical_plan = nullptr;
+	gpu_physical_plan = nullptr;
 	// cancelled = false;
-	owned_plan.reset();
+	gpu_owned_plan.reset();
 	// root_executor.reset();
 	root_pipelines.clear();
 	root_pipeline_idx = 0;
@@ -23,25 +27,40 @@ GPUExecutor::Reset() {
 	// execution_result = PendingExecutionResult::RESULT_NOT_READY;
 }
 
-void GPUExecutor::Initialize(unique_ptr<GPUPhysicalResultCollector> physical_result_collector) {
+void GPUExecutor::Initialize(unique_ptr<GPUPhysicalOperator> plan) {
 	Reset();
-
-	// unique_ptr<GPUPhysicalOperator> gpu_physical_plan = nullptr;
-	//convert cpu plan to gpu plan 
-	// physical_plan->Print();
-
-	throw NotImplementedException("GPUExecutor::Initialize");
-
-	InitializeInternal(*physical_result_collector);
+	gpu_owned_plan = std::move(plan);
+	InitializeInternal(*gpu_owned_plan);
 }
 
-void GPUExecutor::InitializeInternal(GPUPhysicalResultCollector &physical_result_collector) {
+void GPUExecutor::Execute() {
+	for (auto &pipeline : pipelines) {
+		pipeline->Reset();
+		// auto prop = pipeline->executor.context.GetClientProperties();
+		// std::cout << "Properties: " << prop.time_zone << std::endl;
+		auto source_type = pipeline->source.get()->type;
+		std::cout << "pipeline source type " << PhysicalOperatorToString(source_type) << std::endl;
+		std::cout << pipeline->source.get()->GetName() << std::endl;
+		for (int i = 0; i < pipeline->operators.size(); i++) {
+			auto op = pipeline->operators[i];
+			auto op_type = op.get().type;
+			std::cout << "pipeline operator type " << PhysicalOperatorToString(op_type) << std::endl;
+			std::cout << op.get().GetName() << std::endl;
+		}
+		if (pipeline->sink) {
+			auto sink_type = pipeline->sink.get()->type;
+			std::cout << "pipeline sink type " << PhysicalOperatorToString(sink_type) << std::endl;
+			std::cout << pipeline->sink.get()->GetName() << std::endl;
+		}
+	}
+}
+
+void GPUExecutor::InitializeInternal(GPUPhysicalOperator &plan) {
 
 	// auto &scheduler = TaskScheduler::GetScheduler(context);
 	{
 		// lock_guard<mutex> elock(executor_lock);
-		gpu_physical_plan = &physical_result_collector;
-
+		gpu_physical_plan = &plan;
 
 		// this->profiler = ClientData::Get(context).profiler;
 		// profiler->Initialize(plan);
@@ -63,6 +82,11 @@ void GPUExecutor::InitializeInternal(GPUPhysicalResultCollector &physical_result
 		// set root pipelines, i.e., all pipelines that end in the final sink
 		root_pipeline->GetPipelines(root_pipelines, false);
 		root_pipeline_idx = 0;
+		// for (auto &pipeline : root_pipelines) {
+		// 	auto type = pipeline->source.get()->type;
+		// 	printf("root pipeline operators size = %d\n", pipeline->operators.size());
+		// 	std::cout << "root pipeline source type " << PhysicalOperatorToString(type) << std::endl;
+		// }
 
 		// collect all meta-pipelines from the root pipeline
 		vector<shared_ptr<GPUMetaPipeline>> to_schedule;
@@ -73,6 +97,7 @@ void GPUExecutor::InitializeInternal(GPUPhysicalResultCollector &physical_result
 
 		// collect all pipelines from the root pipelines (recursively) for the progress bar and verify them
 		root_pipeline->GetPipelines(pipelines, true);
+		// printf("total_pipelines = %d\n", pipelines.size());
 
 		// finally, verify and schedule
 		// VerifyPipelines();
@@ -128,15 +153,19 @@ GPUExecutor::CreateChildPipeline(GPUPipeline &current, GPUPhysicalOperator &op) 
 
 bool 
 GPUExecutor::HasResultCollector() {
-	return physical_plan->type == PhysicalOperatorType::RESULT_COLLECTOR;
+	return gpu_physical_plan->type == PhysicalOperatorType::RESULT_COLLECTOR;
 }
 
 unique_ptr<QueryResult> 
 GPUExecutor::GetResult() {
 	D_ASSERT(HasResultCollector());
-	auto &result_collector = physical_plan->Cast<PhysicalResultCollector>();
+	if (!gpu_physical_plan) throw InvalidInputException("gpu_physical_plan is NULL");
+	if (gpu_physical_plan.get() == NULL) throw InvalidInputException("gpu_physical_plan is NULL");
+	auto &result_collector = gpu_physical_plan.get()->Cast<GPUPhysicalResultCollector>();
 	D_ASSERT(result_collector.sink_state);
-	return result_collector.GetResult(*result_collector.sink_state);
+	unique_ptr<QueryResult> res = result_collector.GetResult(*(result_collector.sink_state));
+	printf("we can get result\n");
+	return res;
 }
 
 }; // namespace duckdb
