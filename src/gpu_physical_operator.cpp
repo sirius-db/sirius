@@ -29,15 +29,19 @@ unique_ptr<GlobalOperatorState> GPUPhysicalOperator::GetGlobalOperatorState(Clie
 	return make_uniq<GlobalOperatorState>();
 }
 
-OperatorResultType GPUPhysicalOperator::Execute(ExecutionContext &context, DataChunk &input, DataChunk &chunk,
-                                             GlobalOperatorState &gstate, OperatorState &state) const {
+// OperatorResultType GPUPhysicalOperator::Execute(ExecutionContext &context, DataChunk &input, DataChunk &chunk,
+//                                              GlobalOperatorState &gstate, OperatorState &state) const {
+// 	throw InternalException("Calling Execute on a node that is not an operator!");
+// }
+
+OperatorResultType GPUPhysicalOperator::Execute(GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation) const {
 	throw InternalException("Calling Execute on a node that is not an operator!");
 }
 
-OperatorFinalizeResultType GPUPhysicalOperator::FinalExecute(ExecutionContext &context, DataChunk &chunk,
-                                                          GlobalOperatorState &gstate, OperatorState &state) const {
-	throw InternalException("Calling FinalExecute on a node that is not an operator!");
-}
+// OperatorFinalizeResultType GPUPhysicalOperator::FinalExecute(ExecutionContext &context, DataChunk &chunk,
+//                                                           GlobalOperatorState &gstate, OperatorState &state) const {
+// 	throw InternalException("Calling FinalExecute on a node that is not an operator!");
+// }
 // LCOV_EXCL_STOP
 
 //===--------------------------------------------------------------------===//

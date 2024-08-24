@@ -56,11 +56,16 @@ public:
 
     GPUExecutor &GetGPUExecutor();
 
-	unique_ptr<PendingQueryResult> GPUPendingQuery(ClientContext &context, shared_ptr<GPUPreparedStatementData> &statement_p,
+	unique_ptr<PendingQueryResult> GPUPendingStatementInternal(ClientContext &context, shared_ptr<GPUPreparedStatementData> &statement_p,
 												  const PendingQueryParameters &parameters);
+
+	unique_ptr<PendingQueryResult> GPUPendingStatementOrPreparedStatement(ClientContext &context, const string &query, shared_ptr<GPUPreparedStatementData> &statement_p,
+																		  const PendingQueryParameters &parameters);
 
     unique_ptr<QueryResult> GPUExecuteQuery(ClientContext &context, const string &query, shared_ptr<GPUPreparedStatementData> &statement_p,
 												  const PendingQueryParameters &parameters);
+
+	unique_ptr<QueryResult> GPUExecutePendingQueryResult(PendingQueryResult &pending);
 
     unique_ptr<QueryResult> GPUExecuteRelation(ClientContext &context, shared_ptr<Relation> relation);
 
@@ -73,13 +78,13 @@ public:
 	void BeginQueryInternal(const string &query);
 	ErrorData EndQueryInternal(bool success, bool invalidate_transaction);
 
-protected:
-	//! Whether or not execution was successful
-	bool success;
-	//! The error (in case execution was not successful)
-	ErrorData error;
+// protected:
+// 	//! Whether or not execution was successful
+// 	bool success;
+// 	//! The error (in case execution was not successful)
+// 	ErrorData error;
 
-	bool HasError() const;
+// 	bool HasError() const;
 };
 
 } // namespace duckdb

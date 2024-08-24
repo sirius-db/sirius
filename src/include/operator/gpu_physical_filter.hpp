@@ -8,8 +8,8 @@ namespace duckdb {
 //! from the result. Note that it does not physically change the data, it only
 //! adds a selection vector to the chunk.
 class GPUPhysicalFilter : public GPUPhysicalOperator {
-// public:
-	// static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::FILTER;
+public:
+	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::FILTER;
 
 public:
 	// GPUPhysicalFilter(vector<LogicalType> types, vector<unique_ptr<Expression>> select_list, idx_t estimated_cardinality);
@@ -27,6 +27,5 @@ public:
 // 	}
 
 // 	string ParamsToString() const override;
-
 };
 } // namespace duckdb

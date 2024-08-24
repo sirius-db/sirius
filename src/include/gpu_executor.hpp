@@ -27,8 +27,6 @@ public:
 
 	ClientContext &context;
 	GPUContext &gpu_context;
-	optional_ptr<PhysicalOperator> physical_plan;
-	unique_ptr<PhysicalOperator> owned_plan;
 	optional_ptr<GPUPhysicalOperator> gpu_physical_plan;
 	unique_ptr<GPUPhysicalOperator> gpu_owned_plan;
 
@@ -51,8 +49,9 @@ public:
 	unique_ptr<QueryResult> GetResult();
 	void CancelTasks();
 
-	void Initialize(unique_ptr<GPUPhysicalResultCollector> physical_plan);
-	void InitializeInternal(GPUPhysicalResultCollector &physical_result_collector);
+	void Initialize(unique_ptr<GPUPhysicalOperator> physical_plan);
+	void InitializeInternal(GPUPhysicalOperator &physical_result_collector);
+	void Execute();
 	void Reset();
 	shared_ptr<GPUPipeline> CreateChildPipeline(GPUPipeline &current, GPUPhysicalOperator &op);
 
