@@ -1,6 +1,7 @@
 #pragma once
 
 #include "gpu_physical_operator.hpp"
+#include "gpu_expression_executor.hpp"
 
 namespace duckdb {
 
@@ -17,7 +18,8 @@ public:
     GPUPhysicalFilter(vector<LogicalType> types, vector<unique_ptr<Expression>> select_list, idx_t estimated_cardinality);
 
 // 	//! The filter expression
-// 	unique_ptr<Expression> expression;
+	unique_ptr<Expression> expression;
+	GPUExpressionExecutor* gpu_expression_executor;
 
 // public:
 // 	unique_ptr<OperatorState> GetOperatorState(ExecutionContext &context) const override;
@@ -27,5 +29,8 @@ public:
 // 	}
 
 // 	string ParamsToString() const override;
+
+	OperatorResultType Execute(ExecutionContext &context, GPUIntermediateRelation &input, GPUIntermediateRelation &chunk,
+	                                   GlobalOperatorState &gstate, OperatorState &state) const override;
 };
 } // namespace duckdb

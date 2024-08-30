@@ -7,6 +7,7 @@
 #include "duckdb/execution/radix_partitioned_hashtable.hpp"
 #include "duckdb/parser/group_by_node.hpp"
 #include "duckdb/storage/data_table.hpp"
+#include "duckdb/execution/operator/aggregate/physical_hash_aggregate.hpp"
 
 namespace duckdb {
 
@@ -29,24 +30,26 @@ public:
 	GroupedAggregateData grouped_aggregate_data;
 
 	vector<GroupingSet> grouping_sets;
-	// //! The radix partitioned hash tables (one per grouping set)
-	// vector<HashAggregateGroupingData> groupings;
-	// unique_ptr<DistinctAggregateCollectionInfo> distinct_collection_info;
-	// //! A recreation of the input chunk, with nulls for everything that isnt a group
-	// vector<LogicalType> input_group_types;
+	//! The radix partitioned hash tables (one per grouping set)
+	vector<HashAggregateGroupingData> groupings;
+	unique_ptr<DistinctAggregateCollectionInfo> distinct_collection_info;
+	//! A recreation of the input chunk, with nulls for everything that isnt a group
+	vector<LogicalType> input_group_types;
 
-	// // Filters given to Sink and friends
-	// unsafe_vector<idx_t> non_distinct_filter;
-	// unsafe_vector<idx_t> distinct_filter;
+	// Filters given to Sink and friends
+	unsafe_vector<idx_t> non_distinct_filter;
+	unsafe_vector<idx_t> distinct_filter;
 
-	// unordered_map<Expression *, size_t> filter_indexes;
+	unordered_map<Expression *, size_t> filter_indexes;
+
+	GPUIntermediateRelation* group_by_result;
 
 public:
 	// // Source interface
 	// unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;
 	// unique_ptr<LocalSourceState> GetLocalSourceState(ExecutionContext &context,
 	//                                                  GlobalSourceState &gstate) const override;
-	// SourceResultType GetData(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &input) const override;
+	SourceResultType GetData(ExecutionContext &context, GPUIntermediateRelation &output_relation, OperatorSourceInput &input) const override;
 
 	// double GetProgress(ClientContext &context, GlobalSourceState &gstate) const override;
 
@@ -64,7 +67,7 @@ public:
 
 public:
 	// Sink interface
-	// SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override;
+	SinkResultType Sink(ExecutionContext &context, GPUIntermediateRelation& input_relation, OperatorSinkInput &input) const override;
 	// SinkCombineResultType Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const override;
 	// SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
 	//                           OperatorSinkFinalizeInput &input) const override;
@@ -103,10 +106,10 @@ public:
 // 	//! Combine the distinct aggregates
 // 	void CombineDistinct(ExecutionContext &context, OperatorSinkCombineInput &input) const;
 // 	//! Sink the distinct aggregates for a single grouping
-// 	void SinkDistinctGrouping(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input,
-// 	                          idx_t grouping_idx) const;
+	void SinkDistinctGrouping(ExecutionContext &context, GPUIntermediateRelation &input_relation, OperatorSinkInput &input,
+	                          idx_t grouping_idx) const;
 // 	//! Sink the distinct aggregates
-// 	void SinkDistinct(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const;
+	void SinkDistinct(ExecutionContext &context, GPUIntermediateRelation& input_relation, OperatorSinkInput &input) const;
 // 	//! Create groups in the main ht for groups that would otherwise get filtered out completely
 // 	SinkResultType SinkGroupsOnly(ExecutionContext &context, GlobalSinkState &state, LocalSinkState &lstate,
 // 	                              DataChunk &input) const;

@@ -34,7 +34,8 @@ unique_ptr<GlobalOperatorState> GPUPhysicalOperator::GetGlobalOperatorState(Clie
 // 	throw InternalException("Calling Execute on a node that is not an operator!");
 // }
 
-OperatorResultType GPUPhysicalOperator::Execute(GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation) const {
+OperatorResultType GPUPhysicalOperator::Execute(ExecutionContext &context, GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation,
+										GlobalOperatorState &gstate, OperatorState &state) const {
 	throw InternalException("Calling Execute on a node that is not an operator!");
 }
 
@@ -56,6 +57,12 @@ unique_ptr<GlobalSourceState> GPUPhysicalOperator::GetGlobalSourceState(ClientCo
 	return make_uniq<GlobalSourceState>();
 }
 
+SourceResultType GPUPhysicalOperator::GetData(ExecutionContext &context, GPUIntermediateRelation& output_relation,
+                                           OperatorSourceInput &input) const {
+	throw InternalException("Calling GetData on a node that is not a source!");
+}
+
+
 
 //===--------------------------------------------------------------------===//
 // Sink
@@ -66,6 +73,10 @@ unique_ptr<LocalSinkState> GPUPhysicalOperator::GetLocalSinkState(ExecutionConte
 
 unique_ptr<GlobalSinkState> GPUPhysicalOperator::GetGlobalSinkState(ClientContext &context) const {
 	return make_uniq<GlobalSinkState>();
+}
+
+SinkResultType GPUPhysicalOperator::Sink(ExecutionContext &context, GPUIntermediateRelation& input_relation, OperatorSinkInput &input) const {
+	throw InternalException("Calling Sink on a node that is not a sink!");
 }
 
 //===--------------------------------------------------------------------===//
