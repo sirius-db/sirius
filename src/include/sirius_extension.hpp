@@ -9,7 +9,7 @@ namespace duckdb {
 extern void myKernel();
 
 class GPUBufferManager;
-class KomodoExtension : public Extension {
+class SiriusExtension : public Extension {
 public:
 	void Load(DuckDB &db) override;
 	std::string Name() override;

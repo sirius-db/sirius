@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 # Set extension name here
-set(TARGET_NAME komodo)
+set(TARGET_NAME sirius)
 
 project(${TARGET_NAME} LANGUAGES CXX CUDA)
 find_package(CUDA REQUIRED)
@@ -24,7 +24,7 @@ include_directories(${TARGET_NAME} duckdb/extension_external/substrait/third_par
 include_directories(${TARGET_NAME} duckdb/extension_external/substrait/third_party)
 
 set(EXTENSION_SOURCES 
-  src/komodo_extension.cpp
+  src/sirius_extension.cpp
   src/gpu_context.cpp
   src/gpu_executor.cpp
   src/gpu_physical_operator.cpp
@@ -38,7 +38,7 @@ set(EXTENSION_SOURCES
 add_subdirectory(src/operator)
 add_subdirectory(src/plan)
 
-set(CUDA_SOURCES src/cuda/komodo_extension_cuda.cu src/cuda/communication.cu src/cuda/allocator.cu)
+set(CUDA_SOURCES src/cuda/sirius_extension_cuda.cu src/cuda/communication.cu src/cuda/allocator.cu)
 
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CXX_STANDARD 17)

@@ -1,7 +1,7 @@
 #include <iostream>
 #include <cuda_runtime.h>
 #include <cuda.h>
-#include "../include/komodo_extension.hpp"
+#include "../include/sirius_extension.hpp"
 
 namespace duckdb {
 
