@@ -33,6 +33,7 @@ set(EXTENSION_SOURCES
   src/gpu_physical_plan_generator.cpp
   src/gpu_buffer_manager.cpp
   src/gpu_columns.cpp
+  src/gpu_expression_executor.cpp
 )
 add_subdirectory(src/operator)
 add_subdirectory(src/plan)

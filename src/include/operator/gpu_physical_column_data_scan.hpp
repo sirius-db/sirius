@@ -36,7 +36,7 @@ public:
 	// string ParamsToString() const override;
 
 // public:
-// 	void BuildPipelines(GPUPipeline &current, GPUMetaPipeline &meta_pipeline) override;
+	void BuildPipelines(GPUPipeline &current, GPUMetaPipeline &meta_pipeline) override;
 };
 
 } // namespace duckdb

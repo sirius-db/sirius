@@ -9,6 +9,7 @@
 #include "duckdb/execution/operator/join/physical_comparison_join.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/planner/operator/logical_join.hpp"
+#include "gpu_columns.hpp"
 
 namespace duckdb {
 
@@ -31,9 +32,6 @@ public:
 	//! The type of the join
 	JoinType join_type;
 
-	//! The types of the join keys
-	vector<LogicalType> condition_types;
-
 	//! The indices for getting the payload columns
 	vector<idx_t> payload_column_idxs;
 	//! The types of the payload columns
@@ -47,9 +45,10 @@ public:
 	//! Duplicate eliminated types; only used for delim_joins (i.e. correlated subqueries)
 	vector<LogicalType> delim_types;
 
-	OperatorResultType Execute(GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation) const override;
+	OperatorResultType Execute(ExecutionContext &context, GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation,
+										GlobalOperatorState &gstate, OperatorState &state) const override;
 
-	void BuildJoinPipelines(GPUPipeline &current, GPUMetaPipeline &meta_pipeline, GPUPhysicalOperator &op, bool build_rhs = true);
+	static void BuildJoinPipelines(GPUPipeline &current, GPUMetaPipeline &meta_pipeline, GPUPhysicalOperator &op, bool build_rhs = true);
 	void BuildPipelines(GPUPipeline &current, GPUMetaPipeline &meta_pipeline);
 
 protected:
@@ -61,7 +60,7 @@ protected:
 	// unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;
 	// unique_ptr<LocalSourceState> GetLocalSourceState(ExecutionContext &context,
 	//                                                  GlobalSourceState &gstate) const override;
-	// SourceResultType GetData(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &input) const override;
+	SourceResultType GetData(ExecutionContext &context, GPUIntermediateRelation &output_relation, OperatorSourceInput &input) const override;
 
 	// double GetProgress(ClientContext &context, GlobalSourceState &gstate) const override;
 
@@ -79,7 +78,7 @@ public:
 	// unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
 
 	// unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const override;
-	SinkResultType Sink(GPUIntermediateRelation &input_relation) const override;
+	SinkResultType Sink(ExecutionContext &context, GPUIntermediateRelation &input_relation, OperatorSinkInput &input) const override;
 	// SinkCombineResultType Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const override;
 	// SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
 	//                           OperatorSinkFinalizeInput &input) const override;
@@ -92,6 +91,8 @@ public:
 	}
 
 	uint8_t* gpu_hash_table;
+
+	GPUIntermediateRelation* hash_table_result;
 
 };
 } // namespace duckdb

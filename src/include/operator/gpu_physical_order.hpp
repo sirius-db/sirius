@@ -10,21 +10,20 @@ public:
 	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::ORDER_BY;
 	
 public:
-    // GPUPhysicalOrder(vector<LogicalType> types, vector<unique_ptr<Expression>> select_list, idx_t estimated_cardinality);
-
     GPUPhysicalOrder(vector<LogicalType> types, vector<BoundOrderByNode> orders, vector<idx_t> projections,
 	              idx_t estimated_cardinality);
 
 	//! Input data
 	vector<BoundOrderByNode> orders;
 	vector<idx_t> projections;
+	GPUIntermediateRelation* sort_result;
 
 public:
 	// Source interface
 	// unique_ptr<LocalSourceState> GetLocalSourceState(ExecutionContext &context,
 	//                                                  GlobalSourceState &gstate) const override;
 	// unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;
-	// SourceResultType GetData(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &input) const override;
+	SourceResultType GetData(ExecutionContext &context, GPUIntermediateRelation &output_relation, OperatorSourceInput &input) const override;
 	// idx_t GetBatchIndex(ExecutionContext &context, DataChunk &chunk, GlobalSourceState &gstate,
 	//                     LocalSourceState &lstate) const override;
 
@@ -48,7 +47,7 @@ public:
 	// Sink interface
 	// unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const override;
 	// unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
-	// SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override;
+	SinkResultType Sink(ExecutionContext &context, GPUIntermediateRelation &chunk, OperatorSinkInput &input) const override;
 	// SinkCombineResultType Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const override;
 	// SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
 	//                           OperatorSinkFinalizeInput &input) const override;

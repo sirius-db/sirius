@@ -13,4 +13,18 @@ GPUPhysicalTableScan::GPUPhysicalTableScan(vector<LogicalType> types, TableFunct
       table_filters(std::move(table_filters_p)), extra_info(extra_info) {
 }
 
+SourceResultType
+GPUPhysicalTableScan::GetData(ExecutionContext &context, GPUIntermediateRelation &output_relation, OperatorSourceInput &input) const {
+  if (output_relation.columns.size() != GetTypes().size()) throw InvalidInputException("Mismatched column count");
+
+  auto table_name = function.to_string(bind_data.get()); //we get it from ParamsToString();
+
+  printf("Table Scanning\n");
+  //Find table name in the buffer manager
+  //If there is a filter: apply filter, and write to output_relation (late materialized)
+  //If there is no filter: write to output_relation (late materialized)
+    
+  return SourceResultType::FINISHED;
+}
+
 } // namespace duckdb
