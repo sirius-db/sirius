@@ -30,7 +30,8 @@ public:
 
 // 	string ParamsToString() const override;
 
-	OperatorResultType Execute(ExecutionContext &context, GPUIntermediateRelation &input, GPUIntermediateRelation &chunk,
-	                                   GlobalOperatorState &gstate, OperatorState &state) const override;
+	// OperatorResultType Execute(ExecutionContext &context, GPUIntermediateRelation &input, GPUIntermediateRelation &chunk,
+	//                                    GlobalOperatorState &gstate, OperatorState &state) const override;
+	OperatorResultType Execute(GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation) const override;
 };
 } // namespace duckdb

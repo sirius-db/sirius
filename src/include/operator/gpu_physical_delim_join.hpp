@@ -52,7 +52,8 @@ public:
 // public:
 	// unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
 	// unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const override;
-	SinkResultType Sink(ExecutionContext &context, GPUIntermediateRelation &input_relation, OperatorSinkInput &input) const override;
+	// SinkResultType Sink(ExecutionContext &context, GPUIntermediateRelation &input_relation, OperatorSinkInput &input) const override;
+	SinkResultType Sink(GPUIntermediateRelation &input_relation) const override;
 	// SinkCombineResultType Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const override;
 	// SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
 	//                           OperatorSinkFinalizeInput &input) const override;
@@ -73,7 +74,8 @@ public:
 // public:
 // 	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
 // 	unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const override;
-	SinkResultType Sink(ExecutionContext &context, GPUIntermediateRelation &input_relation, OperatorSinkInput &input) const override;
+	// SinkResultType Sink(ExecutionContext &context, GPUIntermediateRelation &input_relation, OperatorSinkInput &input) const override;
+	SinkResultType Sink(GPUIntermediateRelation &input_relation) const override;
 	// SinkCombineResultType Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const override;
 	// SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
 	//                           OperatorSinkFinalizeInput &input) const override;

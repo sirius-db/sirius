@@ -3,7 +3,6 @@
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/common/optionally_owned_ptr.hpp"
 #include "duckdb/execution/physical_operator.hpp"
-
 #include "gpu_physical_operator.hpp"
 
 namespace duckdb {
@@ -25,9 +24,13 @@ public:
 
 	idx_t cte_index;
 
+	GPUIntermediateRelation* intermediate_relation;
+
 public:
 	// unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;
-	// SourceResultType GetData(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &input) const override;
+	// SourceResultType GetData(ExecutionContext &context, GPUIntermediateRelation& output_relation, OperatorSourceInput &input) const override;
+	SourceResultType GetData(GPUIntermediateRelation& output_relation) const override;
+
 
 	bool IsSource() const override {
 		return true;

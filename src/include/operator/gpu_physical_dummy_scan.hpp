@@ -15,7 +15,8 @@ public:
 	}
 
 public:
-	// SourceResultType GetData(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &input) const override;
+	// SourceResultType GetData(ExecutionContext &context, GPUIntermediateRelation &output_relation, OperatorSourceInput &input) const override;
+	SourceResultType GetData(GPUIntermediateRelation& output_relation) const override;
 
 	bool IsSource() const override {
 		return true;

@@ -10,9 +10,11 @@ GPUPhysicalProjection::GPUPhysicalProjection(vector<LogicalType> types, vector<u
     gpu_expression_executor = new GPUExpressionExecutor();
 }
 
+// OperatorResultType
+// GPUPhysicalProjection::Execute(ExecutionContext &context, GPUIntermediateRelation &input_relation, 
+// 	GPUIntermediateRelation &output_relation, GlobalOperatorState &gstate, OperatorState &state) const {
 OperatorResultType
-GPUPhysicalProjection::Execute(ExecutionContext &context, GPUIntermediateRelation &input_relation, 
-	GPUIntermediateRelation &output_relation, GlobalOperatorState &gstate, OperatorState &state) const {
+GPUPhysicalProjection::Execute(GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation) const {
     printf("Executing projection\n");
     for (int i = 0; i < select_list.size(); i++) {
         printf("Executing expression ");

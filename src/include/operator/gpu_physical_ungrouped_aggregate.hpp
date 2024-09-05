@@ -1,6 +1,10 @@
 #pragma once
 
 #include "gpu_physical_operator.hpp"
+#include "duckdb/execution/operator/aggregate/grouped_aggregate_data.hpp"
+#include "duckdb/execution/operator/aggregate/distinct_aggregate_data.hpp"
+#include "duckdb/parser/group_by_node.hpp"
+#include "duckdb/common/unordered_map.hpp"
 
 namespace duckdb {
 
@@ -13,12 +17,14 @@ public:
 
 	//! The aggregates that have to be computed
 	vector<unique_ptr<Expression>> aggregates;
-// 	unique_ptr<DistinctAggregateData> distinct_data;
-// 	unique_ptr<DistinctAggregateCollectionInfo> distinct_collection_info;
+	unique_ptr<DistinctAggregateData> distinct_data;
+	unique_ptr<DistinctAggregateCollectionInfo> distinct_collection_info;
+	GPUIntermediateRelation* aggregation_result;
 
 // public:
 // 	// Source interface
-// 	SourceResultType GetData(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &input) const override;
+	// SourceResultType GetData(ExecutionContext &context, GPUIntermediateRelation &output_relation, OperatorSourceInput &input) const override;
+	SourceResultType GetData(GPUIntermediateRelation& output_relation) const override;
 
 	bool IsSource() const override {
 		return true;
@@ -26,7 +32,8 @@ public:
 
 public:
 	// Sink interface
-	// SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override;
+	// SinkResultType Sink(ExecutionContext &context, GPUIntermediateRelation &input_relation, OperatorSinkInput &input) const override;
+	SinkResultType Sink(GPUIntermediateRelation &input_relation) const override;
 	// SinkCombineResultType Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const override;
 	// SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
 	//                           OperatorSinkFinalizeInput &input) const override;
@@ -53,7 +60,8 @@ public:
 	// //! Combine the distinct aggregates
 	// void CombineDistinct(ExecutionContext &context, OperatorSinkCombineInput &input) const;
 	// //! Sink the distinct aggregates
-	// void SinkDistinct(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const;
+	// void SinkDistinct(ExecutionContext &context, GPUIntermediateRelation &input_relation, OperatorSinkInput &input) const;
+	void SinkDistinct(GPUIntermediateRelation &input_relation) const;
     
 };
 } // namespace duckdb

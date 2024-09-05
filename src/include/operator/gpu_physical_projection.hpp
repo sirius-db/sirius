@@ -17,8 +17,10 @@ public:
 
 	vector<unique_ptr<Expression>> select_list;
 
-	OperatorResultType Execute(ExecutionContext &context, GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation,
-										GlobalOperatorState &gstate, OperatorState &state) const override;
+	// OperatorResultType Execute(ExecutionContext &context, GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation,
+	// 									GlobalOperatorState &gstate, OperatorState &state) const override;
+
+	OperatorResultType Execute(GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation) const override;
 
 	GPUExpressionExecutor* gpu_expression_executor;
 

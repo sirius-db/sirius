@@ -23,7 +23,8 @@ public:
 	// unique_ptr<LocalSourceState> GetLocalSourceState(ExecutionContext &context,
 	//                                                  GlobalSourceState &gstate) const override;
 	// unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;
-	SourceResultType GetData(ExecutionContext &context, GPUIntermediateRelation &output_relation, OperatorSourceInput &input) const override;
+	// SourceResultType GetData(ExecutionContext &context, GPUIntermediateRelation &output_relation, OperatorSourceInput &input) const override;
+	SourceResultType GetData(GPUIntermediateRelation& output_relation) const override;
 	// idx_t GetBatchIndex(ExecutionContext &context, DataChunk &chunk, GlobalSourceState &gstate,
 	//                     LocalSourceState &lstate) const override;
 
@@ -47,7 +48,8 @@ public:
 	// Sink interface
 	// unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const override;
 	// unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
-	SinkResultType Sink(ExecutionContext &context, GPUIntermediateRelation &chunk, OperatorSinkInput &input) const override;
+	// SinkResultType Sink(ExecutionContext &context, GPUIntermediateRelation &chunk, OperatorSinkInput &input) const override;
+	SinkResultType Sink(GPUIntermediateRelation &input_relation) const override;
 	// SinkCombineResultType Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const override;
 	// SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
 	//                           OperatorSinkFinalizeInput &input) const override;

@@ -30,9 +30,11 @@ GPUPhysicalFilter::GPUPhysicalFilter(vector<LogicalType> types, vector<unique_pt
 
 }
 
+// OperatorResultType 
+// GPUPhysicalFilter::Execute(ExecutionContext &context, GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation,
+// 	                                   GlobalOperatorState &gstate, OperatorState &state) const {
 OperatorResultType 
-GPUPhysicalFilter::Execute(ExecutionContext &context, GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation,
-	                                   GlobalOperatorState &gstate, OperatorState &state) const {
+GPUPhysicalFilter::Execute(GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation) const {
 	printf("Executing expression ");
     expression->Print();
     gpu_expression_executor->FilterRecursiveExpression(input_relation, output_relation, *expression, 0);
