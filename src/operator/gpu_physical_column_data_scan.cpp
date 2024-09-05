@@ -16,6 +16,31 @@ GPUPhysicalColumnDataScan::GPUPhysicalColumnDataScan(vector<LogicalType> types, 
     : GPUPhysicalOperator(op_type, std::move(types), estimated_cardinality), collection(nullptr), cte_index(cte_index) {
 }
 
+// SourceResultType 
+// GPUPhysicalColumnDataScan::GetData(ExecutionContext &context, GPUIntermediateRelation &output_relation,
+//                                                  OperatorSourceInput &input) const {
+SourceResultType 
+GPUPhysicalColumnDataScan::GetData(GPUIntermediateRelation &output_relation) const {
+	// auto &state = input.global_state.Cast<PhysicalColumnDataScanState>();
+	// if (collection->Count() == 0) {
+	// 	return SourceResultType::FINISHED;
+	// }
+	// if (!state.initialized) {
+	// 	collection->InitializeScan(state.scan_state);
+	// 	state.initialized = true;
+	// }
+	// collection->Scan(state.scan_state, chunk);
+
+	// return chunk.size() == 0 ? SourceResultType::FINISHED : SourceResultType::HAVE_MORE_OUTPUT;
+
+	printf("Reading data from column data collection\n");
+	for (int col_idx = 0; col_idx < output_relation.columns.size(); col_idx++) {
+		output_relation.columns[col_idx] = intermediate_relation->columns[col_idx];
+	}
+
+	return SourceResultType::FINISHED;
+}
+
 //===--------------------------------------------------------------------===//
 // Pipeline Construction
 //===--------------------------------------------------------------------===//

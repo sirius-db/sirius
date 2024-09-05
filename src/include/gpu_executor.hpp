@@ -7,7 +7,6 @@
 #include "duckdb/execution/task_error_manager.hpp"
 #include "gpu_pipeline.hpp"
 #include "gpu_meta_pipeline.hpp"
-// #include "duckdb/execution/operator/helper/physical_result_collector.hpp"
 #include "operator/gpu_physical_result_collector.hpp"
 
 namespace duckdb {
@@ -57,6 +56,20 @@ public:
 
 	//! Convert the DuckDB physical plan to a GPU physical plan
 
+};
+
+class GPUExecutionContext {
+public:
+	GPUExecutionContext(ClientContext &client_p, ThreadContext &thread_p, optional_ptr<GPUPipeline> pipeline_p)
+	    : client(client_p), thread(thread_p), pipeline(pipeline_p) {
+	}
+
+	//! The client-global context; caution needs to be taken when used in parallel situations
+	ClientContext &client;
+	//! The thread-local context for this execution
+	ThreadContext &thread;
+	//! Reference to the pipeline for this execution, can be used for example by operators determine caching strategy
+	optional_ptr<GPUPipeline> pipeline;
 };
 
 } // namespace duckdb

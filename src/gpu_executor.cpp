@@ -1,9 +1,10 @@
 #include "gpu_context.hpp"
-#include "gpu_operator_converter.hpp"
 #include "duckdb/execution/operator/set/physical_recursive_cte.hpp"
 #include "duckdb/execution/operator/helper/physical_result_collector.hpp"
 #include "gpu_physical_operator.hpp"
 #include "operator/gpu_physical_result_collector.hpp"
+#include "duckdb/parallel/thread_context.hpp"
+#include "duckdb/execution/execution_context.hpp"
 #include <iostream>
 #include <stdio.h>
 
@@ -34,23 +35,101 @@ void GPUExecutor::Initialize(unique_ptr<GPUPhysicalOperator> plan) {
 }
 
 void GPUExecutor::Execute() {
+
+
+	int initial_idx = 0;
+
 	for (auto &pipeline : pipelines) {
-		pipeline->Reset();
+
+		vector<GPUIntermediateRelation*> intermediate_relations;
+		GPUIntermediateRelation* final_relation;
+		// vector<unique_ptr<OperatorState>> intermediate_states;
+		intermediate_relations.reserve(pipeline->operators.size());
+		// intermediate_states.reserve(pipeline->operators.size());
+
+		for (idx_t i = 0; i < pipeline->operators.size(); i++) {
+			auto &prev_operator = i == 0 ? *(pipeline->source) : pipeline->operators[i - 1].get();
+			auto &current_operator = pipeline->operators[i].get();
+
+			// auto chunk = make_uniq<DataChunk>();
+			// chunk->Initialize(Allocator::Get(context.client), prev_operator.GetTypes());
+			GPUIntermediateRelation* inter_rel = new GPUIntermediateRelation(0, prev_operator.GetTypes().size());
+			intermediate_relations.push_back(std::move(inter_rel));
+
+			// auto op_state = current_operator.GetOperatorState(context);
+			// intermediate_states.push_back(std::move(op_state));
+
+			// if (current_operator.IsSink() && current_operator.sink_state->state == SinkFinalizeType::NO_OUTPUT_POSSIBLE) {
+			// 	// one of the operators has already figured out no output is possible
+			// 	// we can skip executing the pipeline
+			// 	FinishProcessing();
+			// }
+		}
+		// InitializeChunk(final_chunk);
+		auto &last_op = pipeline->operators.empty() ? *pipeline->source : pipeline->operators.back().get();
+		final_relation = new GPUIntermediateRelation(0, last_op.GetTypes().size());
+
+		// auto thread_context = ThreadContext(context);
+		// auto exec_context = GPUExecutionContext(context, thread_context, pipeline.get());
+
+		// pipeline->Reset();
 		// auto prop = pipeline->executor.context.GetClientProperties();
 		// std::cout << "Properties: " << prop.time_zone << std::endl;
+		auto is_empty = pipeline->operators.empty();
+		auto &source_relation = is_empty ? final_relation : intermediate_relations[0];
+		// auto source_result = FetchFromSource(source_chunk);
+
+		// StartOperator(*pipeline.source);
+		// auto interrupt_state = InterruptState();
+		// auto local_source_state = pipeline.source->GetLocalSourceState(exec_context, *pipeline.source_state);
+		// OperatorSourceInput source_input = {*pipeline.source_state, *local_source_state, interrupt_state};
+		// pipeline->source->GetData(exec_context, source_relation, source_input);
+		pipeline->source->GetData(*source_relation);
+		// EndOperator(*pipeline.source, &result);
+
 		auto source_type = pipeline->source.get()->type;
 		std::cout << "pipeline source type " << PhysicalOperatorToString(source_type) << std::endl;
-		std::cout << pipeline->source.get()->GetName() << std::endl;
-		for (int i = 0; i < pipeline->operators.size(); i++) {
-			auto op = pipeline->operators[i];
+
+		//call source
+		// std::cout << pipeline->source.get()->GetName() << std::endl;
+		for (int current_idx = 1; current_idx < pipeline->operators.size(); current_idx++) {
+			auto op = pipeline->operators[current_idx-1];
 			auto op_type = op.get().type;
 			std::cout << "pipeline operator type " << PhysicalOperatorToString(op_type) << std::endl;
-			std::cout << op.get().GetName() << std::endl;
+			// std::cout << op.get().GetName() << std::endl;
+			//call operator
+
+			auto current_intermediate = current_idx;
+			auto &current_relation =
+				current_intermediate >= intermediate_relations.size() ? final_relation : intermediate_relations[current_intermediate];
+			// current_chunk.Reset();
+
+			auto &prev_relation =
+			    current_intermediate == initial_idx + 1 ? source_relation : intermediate_relations[current_intermediate - 1];
+			auto operator_idx = current_idx - 1;
+			auto &current_operator = pipeline->operators[operator_idx];
+
+			// auto op_state = current_operator.GetOperatorState(context);
+			// intermediate_states.push_back(std::move(op_state));
+			
+			// StartOperator(current_operator);
+			// auto result = current_operator.get().Execute(exec_context, prev_relation, current_relation, *current_operator.op_state,
+			//                                        *intermediate_states[current_intermediate - 1]);
+
+			auto result = current_operator.get().Execute(*prev_relation, *current_relation);
+			// EndOperator(current_operator, &current_chunk);
 		}
 		if (pipeline->sink) {
 			auto sink_type = pipeline->sink.get()->type;
 			std::cout << "pipeline sink type " << PhysicalOperatorToString(sink_type) << std::endl;
-			std::cout << pipeline->sink.get()->GetName() << std::endl;
+			// std::cout << pipeline->sink.get()->GetName() << std::endl;
+			//call sink
+			auto &sink_relation = final_relation;
+			// auto interrupt_state = InterruptState();
+			// auto local_sink_state = pipeline->sink->GetLocalSinkState(exec_context);
+			// OperatorSinkInput sink_input {*pipeline->sink->sink_state, *local_sink_state, interrupt_state};
+			// pipeline->sink->Sink(exec_context, *sink_relation, sink_input);
+			pipeline->sink->Sink(*sink_relation);
 		}
 	}
 }

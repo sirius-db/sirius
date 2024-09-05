@@ -25,11 +25,11 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
 		break;
     } case ExpressionClass::BOUND_REF: {
         auto &bound_ref = expr.Cast<BoundReferenceExpression>();
-        printf("Reading column index %d\n", bound_ref.index);
+        printf("Reading column index %ld\n", bound_ref.index);
 		input_relation.checkLateMaterialization(bound_ref.index);
         output_relation.columns[bound_ref.index]->row_ids = new uint64_t[1];
         output_relation.columns[bound_ref.index] = input_relation.columns[bound_ref.index];
-        printf("Overwrite row ids with column %d\n", bound_ref.index);
+        printf("Overwrite row ids with column %ld\n", bound_ref.index);
 		break;
 	} case ExpressionClass::BOUND_CASE: {
         auto &bound_case = expr.Cast<BoundCaseExpression>();
@@ -95,7 +95,7 @@ GPUExpressionExecutor::ProjectionRecursiveExpression(GPUIntermediateRelation& in
 		break;
 	} case ExpressionClass::BOUND_REF: {
         auto &bound_ref = expr.Cast<BoundReferenceExpression>();
-        printf("Reading column index %d\n", bound_ref.index);
+        printf("Reading column index %ld\n", bound_ref.index);
 		input_relation.checkLateMaterialization(bound_ref.index);
 		break;
 	} case ExpressionClass::BOUND_CASE: {
@@ -144,7 +144,7 @@ GPUExpressionExecutor::ProjectionRecursiveExpression(GPUIntermediateRelation& in
 		throw InternalException("Attempting to execute expression of unknown type!");
 	}
     }
-    printf("Writing projection result to idx %d\n", output_idx);
+    printf("Writing projection result to idx %ld\n", output_idx);
     if (depth == 0) {
         if (expr.expression_class == ExpressionClass::BOUND_REF) {
             output_relation.columns[output_idx] = input_relation.columns[expr.Cast<BoundReferenceExpression>().index];

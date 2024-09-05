@@ -78,8 +78,10 @@ GPUPhysicalHashJoin::GPUPhysicalHashJoin(LogicalOperator &op, unique_ptr<GPUPhys
 
 };
 
+// SourceResultType
+// GPUPhysicalHashJoin::GetData(ExecutionContext &context, GPUIntermediateRelation &output_relation, OperatorSourceInput &input) const {
 SourceResultType
-GPUPhysicalHashJoin::GetData(ExecutionContext &context, GPUIntermediateRelation &output_relation, OperatorSourceInput &input) const {
+GPUPhysicalHashJoin::GetData(GPUIntermediateRelation &output_relation) const {
 	idx_t left_column_count = output_relation.columns.size() - hash_table_result->columns.size();
 	if (join_type == JoinType::RIGHT_SEMI || join_type == JoinType::RIGHT_ANTI) {
 		left_column_count = 0;
@@ -90,7 +92,7 @@ GPUPhysicalHashJoin::GetData(ExecutionContext &context, GPUIntermediateRelation 
 	}
 
 	for (int col = 0; col < hash_table_result->columns.size(); col++) {
-		printf("Writing hash_table column %d to column %d\n", col, col);
+		printf("Writing hash_table column %ld to column %ld\n", col, col);
 		output_relation.columns[col] = hash_table_result->columns[col];
 	}
 
@@ -98,9 +100,11 @@ GPUPhysicalHashJoin::GetData(ExecutionContext &context, GPUIntermediateRelation 
 }
 
 //probing hash table
+// OperatorResultType
+// GPUPhysicalHashJoin::Execute(ExecutionContext &context, GPUIntermediateRelation &input_relation, 
+// 	GPUIntermediateRelation &output_relation, GlobalOperatorState &gstate, OperatorState &state) const {
 OperatorResultType
-GPUPhysicalHashJoin::Execute(ExecutionContext &context, GPUIntermediateRelation &input_relation, 
-	GPUIntermediateRelation &output_relation, GlobalOperatorState &gstate, OperatorState &state) const {
+GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation) const {
     //Read the key from input relation
     //Check if late materialization is needed
     //Probe the hash table
@@ -112,14 +116,14 @@ GPUPhysicalHashJoin::Execute(ExecutionContext &context, GPUIntermediateRelation 
 	for (idx_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
 		auto &condition = conditions[cond_idx];
         auto join_key_index = condition.left->Cast<BoundReferenceExpression>().index;
-        printf("Reading join key for probing hash table from index %d\n", join_key_index);
+        printf("Reading join key for probing hash table from index %ld\n", join_key_index);
         input_relation.checkLateMaterialization(join_key_index);
 	}
     printf("Probing hash table\n");
 	printf("Writing row IDs from LHS to output relation\n");
 	uint64_t* left_row_ids = new uint64_t[1];
     for (idx_t i = 0; i < input_relation.column_count; i++) {
-        printf("Passing column idx %d from LHS (late materialized) to idx %d in output relation\n", i, i);
+        printf("Passing column idx %ld from LHS (late materialized) to idx %ld in output relation\n", i, i);
         output_relation.columns[i] = input_relation.columns[i];
         output_relation.columns[i]->row_ids = left_row_ids;
     }
@@ -128,7 +132,7 @@ GPUPhysicalHashJoin::Execute(ExecutionContext &context, GPUIntermediateRelation 
 	uint64_t* right_row_ids = new uint64_t[1];
     for (idx_t i = 0; i < rhs_output_columns.size(); i++) {
         const auto output_col_idx = rhs_output_columns[i];
-		printf("Passing column idx %d from RHS (late materialized) to idx %d in output relation\n", output_col_idx, input_relation.column_count + output_col_idx);
+		printf("Passing column idx %ld from RHS (late materialized) to idx %ld in output relation\n", output_col_idx, input_relation.column_count + output_col_idx);
         output_relation.columns[input_relation.column_count + output_col_idx] = hash_table_result->columns[output_col_idx];
 		output_relation.columns[i]->row_ids = right_row_ids;
     }
@@ -137,8 +141,10 @@ GPUPhysicalHashJoin::Execute(ExecutionContext &context, GPUIntermediateRelation 
 };
 
 //building hash table
+// SinkResultType 
+// GPUPhysicalHashJoin::Sink(ExecutionContext &context, GPUIntermediateRelation &input_relation, OperatorSinkInput &input) const {
 SinkResultType 
-GPUPhysicalHashJoin::Sink(ExecutionContext &context, GPUIntermediateRelation &input_relation, OperatorSinkInput &input) const {
+GPUPhysicalHashJoin::Sink(GPUIntermediateRelation &input_relation) const {
     //Read the key and payload from input relation
     //Check if late materialization is needed
     //Build the hash table
@@ -146,7 +152,7 @@ GPUPhysicalHashJoin::Sink(ExecutionContext &context, GPUIntermediateRelation &in
 	for (idx_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
 		auto &condition = conditions[cond_idx];
         auto join_key_index = condition.right->Cast<BoundReferenceExpression>().index;
-        printf("Reading join key for building hash table from index %d\n", join_key_index);
+        printf("Reading join key for building hash table from index %ld\n", join_key_index);
         input_relation.checkLateMaterialization(join_key_index);
 	}
 
@@ -154,7 +160,7 @@ GPUPhysicalHashJoin::Sink(ExecutionContext &context, GPUIntermediateRelation &in
     for (idx_t i = 0; i < rhs_output_columns.size(); i++) {
         const auto rhs_col = rhs_output_columns[i];
         // D_ASSERT(vector.GetType() == ht.layout.GetTypes()[output_col_idx]);
-		printf("Passing column idx %d from RHS hash table\n", rhs_col);
+		printf("Passing column idx %ld from RHS hash table\n", rhs_col);
         hash_table_result->columns[rhs_col] = input_relation.columns[i];
     }
 

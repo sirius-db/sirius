@@ -38,6 +38,7 @@ GPUBufferManager::customCudaHostAlloc<double>(size_t size);
 
 GPUBufferManager::GPUBufferManager(size_t cache_size_per_gpu, size_t processing_size_per_gpu, size_t processing_size_per_cpu) : 
     cache_size_per_gpu(cache_size_per_gpu), processing_size_per_gpu(processing_size_per_gpu), processing_size_per_cpu(processing_size_per_cpu) {
+    printf("Initializing GPU buffer manager\n");
     gpuCache = new uint8_t*[NUM_GPUS];
     gpuProcessing = new uint8_t*[NUM_GPUS];
     cpuProcessing = new uint8_t[processing_size_per_cpu];

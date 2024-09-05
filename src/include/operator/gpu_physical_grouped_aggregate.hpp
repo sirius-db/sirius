@@ -49,7 +49,8 @@ public:
 	// unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;
 	// unique_ptr<LocalSourceState> GetLocalSourceState(ExecutionContext &context,
 	//                                                  GlobalSourceState &gstate) const override;
-	SourceResultType GetData(ExecutionContext &context, GPUIntermediateRelation &output_relation, OperatorSourceInput &input) const override;
+	// SourceResultType GetData(ExecutionContext &context, GPUIntermediateRelation &output_relation, OperatorSourceInput &input) const override;
+	SourceResultType GetData(GPUIntermediateRelation& output_relation) const override;
 
 	// double GetProgress(ClientContext &context, GlobalSourceState &gstate) const override;
 
@@ -67,7 +68,8 @@ public:
 
 public:
 	// Sink interface
-	SinkResultType Sink(ExecutionContext &context, GPUIntermediateRelation& input_relation, OperatorSinkInput &input) const override;
+	// SinkResultType Sink(ExecutionContext &context, GPUIntermediateRelation& input_relation, OperatorSinkInput &input) const override;
+	SinkResultType Sink(GPUIntermediateRelation &input_relation) const override;
 	// SinkCombineResultType Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const override;
 	// SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
 	//                           OperatorSinkFinalizeInput &input) const override;
@@ -106,10 +108,12 @@ public:
 // 	//! Combine the distinct aggregates
 // 	void CombineDistinct(ExecutionContext &context, OperatorSinkCombineInput &input) const;
 // 	//! Sink the distinct aggregates for a single grouping
-	void SinkDistinctGrouping(ExecutionContext &context, GPUIntermediateRelation &input_relation, OperatorSinkInput &input,
-	                          idx_t grouping_idx) const;
+	// void SinkDistinctGrouping(ExecutionContext &context, GPUIntermediateRelation &input_relation, OperatorSinkInput &input,
+	//                           idx_t grouping_idx) const;
+	void SinkDistinctGrouping(GPUIntermediateRelation &input_relation, idx_t grouping_idx) const;
 // 	//! Sink the distinct aggregates
-	void SinkDistinct(ExecutionContext &context, GPUIntermediateRelation& input_relation, OperatorSinkInput &input) const;
+	// void SinkDistinct(ExecutionContext &context, GPUIntermediateRelation& input_relation, OperatorSinkInput &input) const;
+	void SinkDistinct(GPUIntermediateRelation &input_relation) const;
 // 	//! Create groups in the main ht for groups that would otherwise get filtered out completely
 // 	SinkResultType SinkGroupsOnly(ExecutionContext &context, GlobalSinkState &state, LocalSinkState &lstate,
 // 	                              DataChunk &input) const;

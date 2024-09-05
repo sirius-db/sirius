@@ -26,6 +26,7 @@ public:
 	// unique_ptr<GlobalOperatorState> GetGlobalOperatorState(ClientContext &context) const override;
 	// OperatorResultType Execute(ExecutionContext &context, DataChunk &input, DataChunk &chunk,
 	//                            GlobalOperatorState &gstate, OperatorState &state) const override;
+	OperatorResultType Execute(GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation) const override;
 
 	// OrderPreservationType OperatorOrder() const override;
 	// bool ParallelOperator() const override;
