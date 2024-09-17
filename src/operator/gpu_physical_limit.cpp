@@ -8,4 +8,14 @@ GPUPhysicalStreamingLimit::GPUPhysicalStreamingLimit(vector<LogicalType> types, 
       limit_val(std::move(limit_val_p)), offset_val(std::move(offset_val_p)), parallel(parallel) {
 }
 
+OperatorResultType 
+GPUPhysicalStreamingLimit::Execute(GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation) const {
+
+	printf("Executing streaming limit\n");
+	for (int col_idx = 0; col_idx < output_relation.columns.size(); col_idx++) {
+		output_relation.columns[col_idx] = input_relation.columns[col_idx];
+	}
+
+  return OperatorResultType::FINISHED;
+}
 } // namespace duckdb
