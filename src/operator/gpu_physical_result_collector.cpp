@@ -89,12 +89,11 @@ public:
 	ColumnDataAppendState append_state;
 };
 
-// SinkResultType PhysicalMaterializedCollector::Sink(ExecutionContext &context, DataChunk &chunk,
-//                                                    OperatorSinkInput &input) const {
-// 	auto &lstate = input.local_state.Cast<MaterializedCollectorLocalState>();
-// 	lstate.collection->Append(lstate.append_state, chunk);
-// 	return SinkResultType::NEED_MORE_INPUT;
-// }
+SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &input_relation) const {
+	// auto &lstate = input.local_state.Cast<MaterializedCollectorLocalState>();
+	// lstate.collection->Append(lstate.append_state, chunk);
+	return SinkResultType::FINISHED;
+}
 
 // SinkCombineResultType PhysicalMaterializedCollector::Combine(ExecutionContext &context,
 //                                                              OperatorSinkCombineInput &input) const {
@@ -133,14 +132,14 @@ unique_ptr<QueryResult> GPUPhysicalMaterializedCollector::GetResult(GlobalSinkSt
 	if (!gstate.collection) {
 		gstate.collection = make_uniq<ColumnDataCollection>(Allocator::DefaultAllocator(), types);
 	}
-	printf("I am here\n");
+	// printf("I am here\n");
 	if (!gstate.context) throw InvalidInputException("No context set in GPUMaterializedCollectorState");
 	if (!gstate.collection) throw InvalidInputException("No context set in GPUMaterializedCollectorState");
 	auto prop = gstate.context->GetClientProperties();
-	printf("I am here\n");
+	// printf("I am here\n");
 	auto result = make_uniq<MaterializedQueryResult>(statement_type, properties, names, std::move(gstate.collection),
 	                                                 prop);
-	printf("I am here\n");
+	// printf("I am here\n");
 	return std::move(result);
 }
 

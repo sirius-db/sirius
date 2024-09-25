@@ -7,4 +7,4 @@ duckdb_extension_load(sirius
 )
 
 # Any extra extensions that should be built
-# e.g.: duckdb_extension_load(json)
+duckdb_extension_load(substrait)

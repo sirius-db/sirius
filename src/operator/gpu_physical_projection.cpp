@@ -16,11 +16,15 @@ GPUPhysicalProjection::GPUPhysicalProjection(vector<LogicalType> types, vector<u
 OperatorResultType
 GPUPhysicalProjection::Execute(GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation) const {
     printf("Executing projection\n");
-    for (int i = 0; i < select_list.size(); i++) {
-        printf("Executing expression ");
-        select_list[i]->Print();
-        gpu_expression_executor->ProjectionRecursiveExpression(input_relation, output_relation, *select_list[i], i, 0);
+    printf("number of expressions %d\n", select_list.size());
+    for (int expr = 0; expr < select_list.size(); expr++) {
+        printf("Executing expression %d\n", expr);
+        select_list[expr]->Print();
+        gpu_expression_executor->ProjectionRecursiveExpression(input_relation, output_relation, *select_list[expr], expr, 0);
+        // printf("Done executing expression\n");
+        // printf("number of expressions %d %d\n", expr, select_list.size());
     }
+    return OperatorResultType::FINISHED;
 }
 
 } // namespace duckdb

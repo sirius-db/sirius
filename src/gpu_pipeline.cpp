@@ -255,17 +255,20 @@ idx_t GPUPipeline::UpdateBatchIndex(idx_t old_index, idx_t new_index) {
 // GPU Pipeline Build State
 //===--------------------------------------------------------------------===//
 void GPUPipelineBuildState::SetPipelineSource(GPUPipeline &pipeline, GPUPhysicalOperator &op) {
+	printf("Setting pipeline source %s\n", PhysicalOperatorToString(op.type).c_str());
 	pipeline.source = &op;
 }
 
 void GPUPipelineBuildState::SetPipelineSink(GPUPipeline &pipeline, optional_ptr<GPUPhysicalOperator> op,
                                          idx_t sink_pipeline_count) {
 	pipeline.sink = op;
+	// printf("Setting pipeline sink %s\n", PhysicalOperatorToString((*pipeline.sink).type).c_str());
 	// set the base batch index of this pipeline based on how many other pipelines have this node as their sink
 	pipeline.base_batch_index = BATCH_INCREMENT * sink_pipeline_count;
 }
 
 void GPUPipelineBuildState::AddPipelineOperator(GPUPipeline &pipeline, GPUPhysicalOperator &op) {
+	printf("Adding operator to pipeline %s\n", PhysicalOperatorToString(op.type).c_str());
 	pipeline.operators.push_back(op);
 }
 

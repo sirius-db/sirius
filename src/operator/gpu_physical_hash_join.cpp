@@ -2,6 +2,7 @@
 #include "gpu_pipeline.hpp"
 #include "gpu_meta_pipeline.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/common/enums/physical_operator_type.hpp"
 
 namespace duckdb {
 
@@ -9,7 +10,11 @@ GPUPhysicalHashJoin::GPUPhysicalHashJoin(LogicalOperator &op, unique_ptr<GPUPhys
                                    unique_ptr<GPUPhysicalOperator> right, vector<JoinCondition> cond, JoinType join_type,
                                    const vector<idx_t> &left_projection_map, const vector<idx_t> &right_projection_map,
                                    vector<LogicalType> delim_types, idx_t estimated_cardinality)
-    : GPUPhysicalOperator(type, op.types, estimated_cardinality), join_type(join_type) {
+    // : PhysicalComparisonJoin(op, PhysicalOperatorType::HASH_JOIN, std::move(cond), join_type, estimated_cardinality),
+    //   delim_types(std::move(delim_types)), perfect_join_statistics(std::move(perfect_join_stats))
+	// : PhysicalJoin(op, type, join_type, estimated_cardinality)
+	// : CachingPhysicalOperator(type, op.types, estimated_cardinality), join_type(join_type)
+    : GPUPhysicalOperator(PhysicalOperatorType::HASH_JOIN, op.types, estimated_cardinality), join_type(join_type) {
 
 	conditions.resize(cond.size());
 	// we reorder conditions so the ones with COMPARE_EQUAL occur first

@@ -105,6 +105,9 @@ GPUContext::GPUPendingStatementInternal(ClientContext &context, shared_ptr<GPUPr
 	// unique_ptr<PhysicalResultCollector> collector = get_method(context, statement);
 
 	unique_ptr<GPUPhysicalResultCollector> gpu_collector = make_uniq_base<GPUPhysicalResultCollector, GPUPhysicalMaterializedCollector>(*statement_p);
+	if (gpu_collector->type != PhysicalOperatorType::RESULT_COLLECTOR) {
+		throw InvalidInputException("Error in GPUPendingStatementInternal");
+	}
 	D_ASSERT(gpu_collector->type == PhysicalOperatorType::RESULT_COLLECTOR);
 	auto types = gpu_collector->GetTypes();
 	D_ASSERT(types == statement.types);
@@ -156,6 +159,7 @@ GPUContext::GPUExecutePendingQueryResult(PendingQueryResult &pending) {
 		throw InvalidInputException("Error in GPUExecutePendingQueryResult");
 		// return make_uniq<MaterializedQueryResult>(error);
 	}
+	printf("Done executing\n");
 	auto result = FetchResultInternal(pending);
 	// context.reset();
 	return result;
@@ -175,6 +179,7 @@ GPUContext::GPUExecuteQuery(ClientContext &context, const string &query, shared_
 	} else {
 		current_result = GPUExecutePendingQueryResult(*pending_query);
 	}
+	printf("Done executing query\n");
 	return current_result;
 };
 
@@ -211,6 +216,7 @@ GPUContext::FetchResultInternal(PendingQueryResult &pending) {
 	unique_ptr<QueryResult> result;
 	D_ASSERT(gpu_executor.HasResultCollector());
 	// we have a result collector - fetch the result directly from the result collector
+	printf("Getting result\n");
 	result = gpu_executor.GetResult();
 	printf("Fetching result\n");
 	// if (!create_stream_result) {

@@ -36,10 +36,18 @@ void GPUExecutor::Initialize(unique_ptr<GPUPhysicalOperator> plan) {
 
 void GPUExecutor::Execute() {
 
-
 	int initial_idx = 0;
 
-	for (auto &pipeline : pipelines) {
+	printf("Total pipelines %d\n", pipelines.size());
+
+	for (int i = pipelines.size()-1; i >= 0; i--) {
+
+		auto pipeline = pipelines[i];
+
+		// TODO: This is temporary solution
+		if (pipeline->source->type == PhysicalOperatorType::HASH_JOIN || pipeline->source->type == PhysicalOperatorType::RESULT_COLLECTOR) {
+			continue;
+		}
 
 		vector<GPUIntermediateRelation*> intermediate_relations;
 		GPUIntermediateRelation* final_relation;
@@ -47,6 +55,7 @@ void GPUExecutor::Execute() {
 		intermediate_relations.reserve(pipeline->operators.size());
 		// intermediate_states.reserve(pipeline->operators.size());
 
+		printf("Executing pipeline op size %d\n", pipeline->operators.size());
 		for (idx_t i = 0; i < pipeline->operators.size(); i++) {
 			auto &prev_operator = i == 0 ? *(pipeline->source) : pipeline->operators[i - 1].get();
 			auto &current_operator = pipeline->operators[i].get();
@@ -92,7 +101,7 @@ void GPUExecutor::Execute() {
 
 		//call source
 		// std::cout << pipeline->source.get()->GetName() << std::endl;
-		for (int current_idx = 1; current_idx < pipeline->operators.size(); current_idx++) {
+		for (int current_idx = 1; current_idx <= pipeline->operators.size(); current_idx++) {
 			auto op = pipeline->operators[current_idx-1];
 			auto op_type = op.get().type;
 			std::cout << "pipeline operator type " << PhysicalOperatorToString(op_type) << std::endl;
@@ -117,6 +126,7 @@ void GPUExecutor::Execute() {
 			//                                        *intermediate_states[current_intermediate - 1]);
 
 			auto result = current_operator.get().Execute(*prev_relation, *current_relation);
+			printf("Done executing operator\n");
 			// EndOperator(current_operator, &current_chunk);
 		}
 		if (pipeline->sink) {
@@ -148,8 +158,11 @@ void GPUExecutor::InitializeInternal(GPUPhysicalOperator &plan) {
 		// build and ready the pipelines
 		GPUPipelineBuildState state;
 		auto root_pipeline = make_shared_ptr<GPUMetaPipeline>(*this, state, nullptr);
+		printf("Building pipelines\n");
 		root_pipeline->Build(*gpu_physical_plan);
+		printf("Done Building pipelines\n");
 		root_pipeline->Ready();
+		printf("Pipelines ready\n");
 
 		// ready recursive cte pipelines too
 		// TODO: SUPPORT RECURSIVE CTE FOR GPU
@@ -160,6 +173,7 @@ void GPUExecutor::InitializeInternal(GPUPhysicalOperator &plan) {
 
 		// set root pipelines, i.e., all pipelines that end in the final sink
 		root_pipeline->GetPipelines(root_pipelines, false);
+		printf("Pipelines got\n");
 		root_pipeline_idx = 0;
 		// for (auto &pipeline : root_pipelines) {
 		// 	auto type = pipeline->source.get()->type;
@@ -170,6 +184,7 @@ void GPUExecutor::InitializeInternal(GPUPhysicalOperator &plan) {
 		// collect all meta-pipelines from the root pipeline
 		vector<shared_ptr<GPUMetaPipeline>> to_schedule;
 		root_pipeline->GetMetaPipelines(to_schedule, true, true);
+		printf("MetaPipelines got\n");
 
 		// number of 'PipelineCompleteEvent's is equal to the number of meta pipelines, so we have to set it here
 		total_pipelines = to_schedule.size();
@@ -240,8 +255,11 @@ GPUExecutor::GetResult() {
 	D_ASSERT(HasResultCollector());
 	if (!gpu_physical_plan) throw InvalidInputException("gpu_physical_plan is NULL");
 	if (gpu_physical_plan.get() == NULL) throw InvalidInputException("gpu_physical_plan is NULL");
-	auto &result_collector = gpu_physical_plan.get()->Cast<GPUPhysicalResultCollector>();
+	// auto &result_collector = gpu_physical_plan.get()->Cast<GPUPhysicalResultCollector>();
+	auto &result_collector = gpu_physical_plan.get()->Cast<GPUPhysicalMaterializedCollector>();
 	D_ASSERT(result_collector.sink_state);
+	printf("we are getting result\n");
+	result_collector.sink_state = result_collector.GetGlobalSinkState(context);
 	unique_ptr<QueryResult> res = result_collector.GetResult(*(result_collector.sink_state));
 	printf("we can get result\n");
 	return res;

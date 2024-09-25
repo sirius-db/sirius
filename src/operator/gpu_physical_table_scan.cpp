@@ -38,6 +38,7 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
                 throw InvalidInputException("Column not found");
             }
             auto column_name = table->column_names[column_ids[col]];
+            printf("column found %s\n", column_name.c_str());
             if (column_name != names[col]) {
                 throw InvalidInputException("Column name mismatch");
             }
@@ -47,13 +48,15 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
         throw InvalidInputException("Table not found");
     }
 
-		for (auto &f : table_filters->filters) {
-			auto &column_index = f.first;
-			auto &filter = f.second;
-			if (column_index < names.size()) {
-				printf("Reading filter column from index %ld\n", column_index);
-			}
-		}
+    if (table_filters) {
+      for (auto &f : table_filters->filters) {
+        auto &column_index = f.first;
+        auto &filter = f.second;
+        if (column_index < names.size()) {
+          printf("Reading filter column from index %ld\n", column_index);
+        }
+      }
+    }
 
     int index = 0;
     for (auto projection_id : projection_ids) {
