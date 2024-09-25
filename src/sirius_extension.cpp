@@ -223,7 +223,7 @@ void SiriusExtension::GPUProcessingFunction(ClientContext &context, TableFunctio
 		data.res = data.conn->Query(data.query);
 	}
 
-	// data.finished = true;
+	data.finished = true;
 	printf("Fetching chunk first\n");
 	auto result_chunk = data.res->Fetch();
 	if (!result_chunk) {

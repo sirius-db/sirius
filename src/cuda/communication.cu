@@ -45,12 +45,12 @@ void callCudaMemcpyHostToDevice(T* dest, T* src, size_t size, int gpu) {
 int* sendDataToGPU(int* data, int size) {
     printf("Send data to GPU\n");
     // use cudamemcpy
-    int** target = new int*[1];
-    cudaMalloc((void**) &target[0], size * sizeof(int));
+    int* target;
+    cudaMalloc((void**) &target, size * sizeof(int));
     cudaMemcpy(target, data, size * sizeof(int), cudaMemcpyHostToDevice);
     cudaDeviceSynchronize();
     printf("Done sending data to GPU\n");
-    return target[0];
+    return target;
 }
 
 } // namespace duckdb
