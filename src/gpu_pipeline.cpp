@@ -179,7 +179,8 @@ void GPUPipeline::Ready() {
 
 void GPUPipeline::AddDependency(shared_ptr<GPUPipeline> &pipeline) {
 	D_ASSERT(pipeline);
-	dependencies.push_back(weak_ptr<GPUPipeline>(pipeline));
+	// dependencies.push_back(weak_ptr<GPUPipeline>(pipeline));
+	dependencies.push_back(pipeline);
 	pipeline->parents.push_back(weak_ptr<GPUPipeline>(shared_from_this()));
 }
 
@@ -262,7 +263,7 @@ void GPUPipelineBuildState::SetPipelineSource(GPUPipeline &pipeline, GPUPhysical
 void GPUPipelineBuildState::SetPipelineSink(GPUPipeline &pipeline, optional_ptr<GPUPhysicalOperator> op,
                                          idx_t sink_pipeline_count) {
 	pipeline.sink = op;
-	// printf("Setting pipeline sink %s\n", PhysicalOperatorToString((*pipeline.sink).type).c_str());
+	if (pipeline.sink) printf("Setting pipeline sink %s\n", PhysicalOperatorToString((*pipeline.sink).type).c_str());
 	// set the base batch index of this pipeline based on how many other pipelines have this node as their sink
 	pipeline.base_batch_index = BATCH_INCREMENT * sink_pipeline_count;
 }

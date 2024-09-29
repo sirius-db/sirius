@@ -12,9 +12,7 @@ namespace duckdb {
 
 void 
 GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_relation, GPUIntermediateRelation& output_relation, Expression& expr, int depth) {
-    for (int i = 1; i < depth; i++) {
-        printf("  ");
-    }
+    // printf("Expression class %d\n", expr.expression_class);
 	switch (expr.expression_class) {
 	case ExpressionClass::BOUND_BETWEEN: {
         auto &bound_between = expr.Cast<BoundBetweenExpression>();
@@ -25,10 +23,14 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
 		break;
     } case ExpressionClass::BOUND_REF: {
         auto &bound_ref = expr.Cast<BoundReferenceExpression>();
+        printf("Executing bound reference expression\n");
         printf("Reading column index %ld\n", bound_ref.index);
 		input_relation.checkLateMaterialization(bound_ref.index);
-        output_relation.columns[bound_ref.index]->row_ids = new uint64_t[1];
+        // printf("output_relation.columns.size() %ld\n", output_relation.columns.size());
+        // printf("input_relation.columns.size() %ld\n", input_relation.columns.size());
+        // printf("bound_ref.index %ld\n", bound_ref.index);
         output_relation.columns[bound_ref.index] = input_relation.columns[bound_ref.index];
+        output_relation.columns[bound_ref.index]->row_ids = new uint64_t[1];
         printf("Overwrite row ids with column %ld\n", bound_ref.index);
 		break;
 	} case ExpressionClass::BOUND_CASE: {
@@ -62,8 +64,9 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
         printf("Reading value %s\n", expr.Cast<BoundConstantExpression>().value.ToString().c_str());
 		break;
 	} case ExpressionClass::BOUND_FUNCTION: {
-        auto &bound_conjunction = expr.Cast<BoundConjunctionExpression>();
-        for (auto &child : bound_conjunction.children) {
+        printf("Executing function expression\n");
+        auto &bound_function = expr.Cast<BoundFunctionExpression>();
+        for (auto &child : bound_function.children) {
             FilterRecursiveExpression(input_relation, output_relation, *child, depth + 1);
         }
 		break;
@@ -77,14 +80,20 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
 		throw InternalException("Attempting to execute expression of unknown type!");
 	}
     }
+
+    if (depth == 0) {
+        printf("Writing filter result\n");
+        for (int i = 0; i < input_relation.columns.size(); i++) {
+            output_relation.columns[i] = input_relation.columns[i];
+            output_relation.columns[i]->row_ids = new uint64_t[1];
+        }
+    }
 }
 
 
 void 
 GPUExpressionExecutor::ProjectionRecursiveExpression(GPUIntermediateRelation& input_relation, GPUIntermediateRelation& output_relation, Expression& expr, int output_idx, int depth) {
-    for (int i = 1; i < depth; i++) {
-        printf("  ");
-    }
+    printf("Expression class %d\n", expr.expression_class);
 	switch (expr.expression_class) {
 	case ExpressionClass::BOUND_BETWEEN: {
         auto &bound_between = expr.Cast<BoundBetweenExpression>();
@@ -95,6 +104,7 @@ GPUExpressionExecutor::ProjectionRecursiveExpression(GPUIntermediateRelation& in
 		break;
 	} case ExpressionClass::BOUND_REF: {
         auto &bound_ref = expr.Cast<BoundReferenceExpression>();
+        printf("Executing bound reference expression\n");
         printf("Reading column index %ld\n", bound_ref.index);
 		input_relation.checkLateMaterialization(bound_ref.index);
 		break;
@@ -129,8 +139,9 @@ GPUExpressionExecutor::ProjectionRecursiveExpression(GPUIntermediateRelation& in
         printf("Reading value %s\n", expr.Cast<BoundConstantExpression>().value.ToString().c_str());
 		break;
 	} case ExpressionClass::BOUND_FUNCTION: {
-        auto &bound_conjunction = expr.Cast<BoundConjunctionExpression>();
-        for (auto &child : bound_conjunction.children) {
+        printf("Executing function expression\n");
+        auto &bound_function = expr.Cast<BoundFunctionExpression>();
+        for (auto &child : bound_function.children) {
             ProjectionRecursiveExpression(input_relation, output_relation, *child, output_idx, depth + 1);
         }
 		break;

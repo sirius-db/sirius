@@ -150,7 +150,7 @@ void SiriusExtension::GPUCachingFunction(ClientContext &context, TableFunctionIn
 
 	printf("caching data in GPU\n");
 	data.gpuBufferManager->cacheDataInGPU(buffered_data, data.table, data.column, 0);  // Send data to GPU
-	data.gpuBufferManager->Print();
+	// data.gpuBufferManager->Print();
 
 	output.SetCardinality(1);
 	output.SetValue(0, 0, "Successful");
@@ -223,20 +223,20 @@ void SiriusExtension::GPUProcessingFunction(ClientContext &context, TableFunctio
 		data.res = data.conn->Query(data.query);
 	}
 
-	data.finished = true;
-	printf("Fetching chunk first\n");
+	// data.finished = true;
+	// printf("Fetching chunk first\n");
 	auto result_chunk = data.res->Fetch();
 	if (!result_chunk) {
-		printf("Not doing anything\n");
+		// printf("Not doing anything\n");
 		return;
 	}
 	// output.Move(*result_chunk);
-	while (result_chunk) {
+	// while (result_chunk) {
 		// printf("Fetching chunk %d\n", result_chunk->size());
 		output.Move(*result_chunk);
-		result_chunk = data.res->Fetch();
-	}
-	printf("Finished Fetching chunk\n");
+		// result_chunk = data.res->Fetch();
+	// }
+	// printf("Finished Fetching chunk\n");
 	return;
 }
 

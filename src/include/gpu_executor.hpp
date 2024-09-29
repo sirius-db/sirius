@@ -33,6 +33,7 @@ public:
 	vector<shared_ptr<GPUPipeline>> pipelines;
 	//! The root pipelines of the query
 	vector<shared_ptr<GPUPipeline>> root_pipelines;
+	vector<shared_ptr<GPUPipeline>> scheduled;
 	//! The recursive CTE's in this query plan
 	vector<reference<GPUPhysicalOperator>> recursive_ctes;
 	//! The current root pipeline index

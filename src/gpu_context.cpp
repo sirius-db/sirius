@@ -90,7 +90,7 @@ GPUContext::GPUPendingStatementInternal(ClientContext &context, shared_ptr<GPUPr
 
 	unique_ptr<GPUExecutor> temp = make_uniq<GPUExecutor>(context, *this);
 	auto prop = temp->context.GetClientProperties();
-	std::cout << "Properties: " << prop.time_zone << std::endl;
+	// std::cout << "Properties: " << prop.time_zone << std::endl;
 	gpu_active_query->gpu_executor = std::move(temp);
 	auto &gpu_executor = GetGPUExecutor();
 	// auto stream_result = parameters.allow_stream_result && statement.properties.allow_stream_result;
@@ -112,7 +112,7 @@ GPUContext::GPUPendingStatementInternal(ClientContext &context, shared_ptr<GPUPr
 	auto types = gpu_collector->GetTypes();
 	D_ASSERT(types == statement.types);
 	gpu_executor.Initialize(std::move(gpu_collector));
-	printf("type %d\n", gpu_executor.gpu_physical_plan.get()->type);
+	// printf("type %d\n", gpu_executor.gpu_physical_plan.get()->type);
 
 	D_ASSERT(!gpu_active_query->HasOpenResult());
 
@@ -216,9 +216,9 @@ GPUContext::FetchResultInternal(PendingQueryResult &pending) {
 	unique_ptr<QueryResult> result;
 	D_ASSERT(gpu_executor.HasResultCollector());
 	// we have a result collector - fetch the result directly from the result collector
-	printf("Getting result\n");
+	// printf("Getting result\n");
 	result = gpu_executor.GetResult();
-	printf("Fetching result\n");
+	// printf("Fetching result\n");
 	// if (!create_stream_result) {
 		CleanupInternal(result.get(), false);
 	// } else {
@@ -233,7 +233,7 @@ GPUContext::CleanupInternal(BaseQueryResult *result, bool invalidate_transaction
 		// no query currently active
 		return;
 	}
-	printf("Cleaning up\n");
+	// printf("Cleaning up\n");
 	if (gpu_active_query->gpu_executor) {
 		gpu_active_query->gpu_executor->CancelTasks();
 	}
@@ -263,7 +263,7 @@ GPUContext::EndQueryInternal(bool success, bool invalidate_transaction) {
 	gpu_active_query.reset();
 	// query_progress.Initialize();
 	ErrorData error;
-	printf("Ending query\n");
+	// printf("Ending query\n");
 	// try {
 	// 	if (transaction.HasActiveTransaction()) {
 	// 		transaction.ResetActiveQuery();

@@ -108,13 +108,11 @@ GPUPhysicalGroupedAggregate::GPUPhysicalGroupedAggregate(ClientContext &context,
   //See RadixHTLocalSourceState::Scan for more details
   idx_t total_output_columns = 0;
   for (auto &aggregate : aggregates) {
-		auto &aggr = aggregate->Cast<BoundAggregateExpression>();
-		for (auto &child_expr : aggr.children) {
-      total_output_columns++;
-    }
+	auto &aggr = aggregate->Cast<BoundAggregateExpression>();
+    total_output_columns++;
   }
   total_output_columns += grouped_aggregate_data.GroupCount();
-  group_by_result = new GPUIntermediateRelation(0, grouped_aggregate_data.GroupCount() + total_output_columns);
+  group_by_result = new GPUIntermediateRelation(0, total_output_columns);
 }
 
 // SinkResultType
@@ -155,6 +153,10 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 			input_relation.checkLateMaterialization(bound_ref_expr.index);
 			group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] = input_relation.columns[bound_ref_expr.index];
 		}
+		if (aggr.children.size() == 0) {
+			printf("Passing * aggregate to index %d in groupby result\n", grouped_aggregate_data.groups.size() + aggr_idx);
+			group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] = new GPUColumn(0, ColumnType::INT64, nullptr);
+		}
 		aggr_idx++;
 	}
 	for (auto &aggregate : aggregates) {
@@ -174,6 +176,7 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 // GPUPhysicalGroupedAggregate::GetData(ExecutionContext &context, GPUIntermediateRelation &output_relation, OperatorSourceInput &input) const {
 SourceResultType
 GPUPhysicalGroupedAggregate::GetData(GPUIntermediateRelation &output_relation) const {
+//   printf("group by result size %d\n", group_by_result->columns.size());
   for (int col = 0; col < group_by_result->columns.size(); col++) {
     printf("Writing group by result to column %d\n", col);
     output_relation.columns[col] = group_by_result->columns[col];

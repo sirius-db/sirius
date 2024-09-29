@@ -1,0 +1,62 @@
+call gpu_caching("lineitem.l_orderkey");
+call gpu_caching("lineitem.l_partkey");
+call gpu_caching("lineitem.l_suppkey");
+call gpu_caching("lineitem.l_quantity");
+call gpu_caching("lineitem.l_extendedprice");
+call gpu_caching("lineitem.l_discount");
+call gpu_caching("lineitem.l_tax");
+call gpu_caching("lineitem.l_returnflag");
+call gpu_caching("lineitem.l_linestatus");
+call gpu_caching("lineitem.l_shipdate");
+call gpu_caching("lineitem.l_commitdate");
+call gpu_caching("lineitem.l_receiptdate");
+call gpu_caching("lineitem.l_shipinstruct");
+call gpu_caching("lineitem.l_shipmode");
+
+call gpu_caching("orders.o_orderkey");
+call gpu_caching("orders.o_custkey");
+call gpu_caching("orders.o_orderstatus");
+call gpu_caching("orders.o_totalprice");
+call gpu_caching("orders.o_orderdate");
+call gpu_caching("orders.o_orderpriority");
+call gpu_caching("orders.o_clerk");
+call gpu_caching("orders.o_shippriority");
+call gpu_caching("orders.o_comment");
+
+call gpu_caching("part.p_partkey");
+call gpu_caching("part.p_name");
+call gpu_caching("part.p_mfgr");
+call gpu_caching("part.p_brand");
+call gpu_caching("part.p_type");
+call gpu_caching("part.p_size");
+call gpu_caching("part.p_container");
+
+call gpu_caching("supplier.s_suppkey");
+call gpu_caching("supplier.s_name");
+call gpu_caching("supplier.s_address");
+call gpu_caching("supplier.s_nationkey");
+call gpu_caching("supplier.s_phone");
+call gpu_caching("supplier.s_acctbal");
+call gpu_caching("supplier.s_comment");
+
+call gpu_caching("partsupp.ps_partkey");
+call gpu_caching("partsupp.ps_suppkey");
+call gpu_caching("partsupp.ps_availqty");
+call gpu_caching("partsupp.ps_supplycost");
+call gpu_caching("partsupp.ps_comment");
+
+call gpu_caching("customer.c_custkey");
+call gpu_caching("customer.c_name");
+call gpu_caching("customer.c_address");
+call gpu_caching("customer.c_nationkey");
+call gpu_caching("customer.c_phone");
+call gpu_caching("customer.c_acctbal");
+call gpu_caching("customer.c_mktsegment");
+call gpu_caching("customer.c_comment");
+
+call gpu_caching("nation.n_nationkey");
+call gpu_caching("nation.n_name");
+call gpu_caching("nation.n_regionkey");
+
+call gpu_caching("region.r_regionkey");
+call gpu_caching("region.r_name");

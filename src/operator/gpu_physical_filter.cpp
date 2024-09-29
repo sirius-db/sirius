@@ -35,8 +35,7 @@ GPUPhysicalFilter::GPUPhysicalFilter(vector<LogicalType> types, vector<unique_pt
 // 	                                   GlobalOperatorState &gstate, OperatorState &state) const {
 OperatorResultType 
 GPUPhysicalFilter::Execute(GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation) const {
-	printf("Executing expression ");
-    expression->Print();
+	printf("Executing expression %s\n", expression->ToString().c_str());
     gpu_expression_executor->FilterRecursiveExpression(input_relation, output_relation, *expression, 0);
 	return OperatorResultType::FINISHED;
 }
