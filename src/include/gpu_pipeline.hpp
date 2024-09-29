@@ -90,6 +90,10 @@ public:
 	//! Updates the batch index of a pipeline (and returns the new minimum batch index)
 	idx_t UpdateBatchIndex(idx_t old_index, idx_t new_index);
 
+	//! The dependencies of this pipeline
+	// vector<weak_ptr<GPUPipeline>> dependencies;
+	vector<shared_ptr<GPUPipeline>> dependencies;
+
 private:
 	//! Whether or not the pipeline has been readied
 	bool ready;
@@ -107,8 +111,6 @@ private:
 
 	//! The parent pipelines (i.e. pipelines that are dependent on this pipeline to finish)
 	vector<weak_ptr<GPUPipeline>> parents;
-	//! The dependencies of this pipeline
-	vector<weak_ptr<GPUPipeline>> dependencies;
 
 	//! The base batch index of this pipeline
 	idx_t base_batch_index = 0;

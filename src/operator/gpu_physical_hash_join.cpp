@@ -115,9 +115,29 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
     //Probe the hash table
 	//Create output relation
     //Write the result to output relation
-	if (output_relation.columns.size() != input_relation.columns.size() + rhs_output_columns.size()) {
-		throw InvalidInputException("Wrong input size");
+	if (join_type == JoinType::RIGHT_SEMI || join_type == JoinType::RIGHT_ANTI) {
+		// for RIGHT SEMI and RIGHT ANTI joins, the output is the RHS
+		// we only need to output the RHS columns
+		// the LHS columns are NULL
+		if (output_relation.columns.size() != rhs_output_columns.size()) {
+			throw InvalidInputException("Wrong input size");
+		}
+	} else if (join_type == JoinType::SEMI || join_type == JoinType::ANTI || join_type == JoinType::MARK) {
+		// for SEMI and ANTI join, the output is the LHS
+		// we only need to output the LHS columns
+		// the RHS columns are NULL
+		if (output_relation.columns.size() != input_relation.columns.size()) {
+			throw InvalidInputException("Wrong input size");
+		}
+	} else if (join_type == JoinType::RIGHT || join_type == JoinType::LEFT || join_type == JoinType::INNER || join_type == JoinType::OUTER) {
+		// for INNER and OUTER join, we output all columns
+		if (output_relation.columns.size() != input_relation.columns.size() + rhs_output_columns.size()) {
+			throw InvalidInputException("Wrong input size");
+		}
+	} else {
+		throw InvalidInputException("Unsupported join type");
 	}
+
 	for (idx_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
 		auto &condition = conditions[cond_idx];
         auto join_key_index = condition.left->Cast<BoundReferenceExpression>().index;
@@ -125,22 +145,37 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
         input_relation.checkLateMaterialization(join_key_index);
 	}
     printf("Probing hash table\n");
-	printf("Writing row IDs from LHS to output relation\n");
-	uint64_t* left_row_ids = new uint64_t[1];
-    for (idx_t i = 0; i < input_relation.column_count; i++) {
-        printf("Passing column idx %ld from LHS (late materialized) to idx %ld in output relation\n", i, i);
-        output_relation.columns[i] = input_relation.columns[i];
-        output_relation.columns[i]->row_ids = left_row_ids;
-    }
-	printf("Writing row IDs from RHS to output relation\n");
-    // on the RHS, we need to fetch the data from the hash table
-	uint64_t* right_row_ids = new uint64_t[1];
-    for (idx_t i = 0; i < rhs_output_columns.size(); i++) {
-        const auto output_col_idx = rhs_output_columns[i];
-		printf("Passing column idx %ld from RHS (late materialized) to idx %ld in output relation\n", output_col_idx, input_relation.column_count + output_col_idx);
-        output_relation.columns[input_relation.column_count + output_col_idx] = hash_table_result->columns[output_col_idx];
-		output_relation.columns[i]->row_ids = right_row_ids;
-    }
+	if (join_type == JoinType::SEMI || join_type == JoinType::ANTI || join_type == JoinType::MARK || join_type == JoinType::INNER || join_type == JoinType::OUTER || join_type == JoinType::RIGHT || join_type == JoinType::LEFT) {
+		printf("Writing row IDs from LHS to output relation\n");
+		uint64_t* left_row_ids = new uint64_t[1];
+		for (idx_t i = 0; i < input_relation.column_count; i++) {
+			printf("Passing column idx %ld from LHS (late materialized) to idx %ld in output relation\n", i, i);
+			output_relation.columns[i] = input_relation.columns[i];
+			output_relation.columns[i]->row_ids = left_row_ids;
+		}
+	}
+
+	if (join_type == JoinType::INNER || join_type == JoinType::OUTER || join_type == JoinType::RIGHT || join_type == JoinType::LEFT) {
+		printf("Writing row IDs from RHS to output relation\n");
+		// on the RHS, we need to fetch the data from the hash table
+		uint64_t* right_row_ids = new uint64_t[1];
+		for (idx_t i = 0; i < rhs_output_columns.size(); i++) {
+			const auto output_col_idx = rhs_output_columns[i];
+			printf("Passing column idx %ld from RHS (late materialized) to idx %ld in output relation\n", output_col_idx, input_relation.column_count + output_col_idx);
+			output_relation.columns[input_relation.column_count + output_col_idx] = hash_table_result->columns[output_col_idx];
+			output_relation.columns[input_relation.column_count + output_col_idx]->row_ids = right_row_ids;
+		}
+	} else if (join_type == JoinType::RIGHT_SEMI || join_type == JoinType::RIGHT_ANTI) {
+		printf("Writing row IDs from RHS to output relation\n");
+		// on the RHS, we need to fetch the data from the hash table
+		uint64_t* right_row_ids = new uint64_t[1];
+		for (idx_t i = 0; i < rhs_output_columns.size(); i++) {
+			const auto output_col_idx = rhs_output_columns[i];
+			printf("Passing column idx %ld from RHS (late materialized) to idx %ld in output relation\n", output_col_idx, output_col_idx);
+			output_relation.columns[output_col_idx] = hash_table_result->columns[output_col_idx];
+			output_relation.columns[output_col_idx]->row_ids = right_row_ids;
+		}
+	}
 
     return OperatorResultType::FINISHED;
 };
@@ -154,6 +189,10 @@ GPUPhysicalHashJoin::Sink(GPUIntermediateRelation &input_relation) const {
     //Check if late materialization is needed
     //Build the hash table
 
+	printf("input relation size %d\n", input_relation.columns.size());
+	for (auto col : input_relation.columns) {
+		printf("input relation column size %d\n", col->column_length);
+	}
 	for (idx_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
 		auto &condition = conditions[cond_idx];
         auto join_key_index = condition.right->Cast<BoundReferenceExpression>().index;

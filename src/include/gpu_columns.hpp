@@ -11,7 +11,8 @@ enum class ColumnType {
     INT32,
     INT64,
     FLOAT32,
-    FLOAT64
+    FLOAT64,
+    VARCHAR
 };
 
 ColumnType convertLogicalTypetoColumnType(LogicalType type);
@@ -35,6 +36,7 @@ public:
     uint64_t* GetDataUInt64();
     float* GetDataFloat32();
     double* GetDataFloat64();
+    char* GetDataVarChar();
     uint64_t* GetRowIds();
     uint8_t* GetData();
 

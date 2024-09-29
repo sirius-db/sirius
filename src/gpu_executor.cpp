@@ -38,16 +38,17 @@ void GPUExecutor::Execute() {
 
 	int initial_idx = 0;
 
-	printf("Total pipelines %d\n", pipelines.size());
+	printf("Total meta pipelines %d\n", scheduled.size());
 
-	for (int i = pipelines.size()-1; i >= 0; i--) {
+	for (int i = 0; i < scheduled.size(); i++) {
+		printf("\n\n\n");
 
-		auto pipeline = pipelines[i];
+		auto pipeline = scheduled[i];
 
 		// TODO: This is temporary solution
-		if (pipeline->source->type == PhysicalOperatorType::HASH_JOIN || pipeline->source->type == PhysicalOperatorType::RESULT_COLLECTOR) {
-			continue;
-		}
+		// if (pipeline->source->type == PhysicalOperatorType::HASH_JOIN || pipeline->source->type == PhysicalOperatorType::RESULT_COLLECTOR) {
+		// 	continue;
+		// }
 
 		vector<GPUIntermediateRelation*> intermediate_relations;
 		GPUIntermediateRelation* final_relation;
@@ -55,7 +56,7 @@ void GPUExecutor::Execute() {
 		intermediate_relations.reserve(pipeline->operators.size());
 		// intermediate_states.reserve(pipeline->operators.size());
 
-		printf("Executing pipeline op size %d\n", pipeline->operators.size());
+		// printf("Executing pipeline op size %d\n", pipeline->operators.size());
 		for (idx_t i = 0; i < pipeline->operators.size(); i++) {
 			auto &prev_operator = i == 0 ? *(pipeline->source) : pipeline->operators[i - 1].get();
 			auto &current_operator = pipeline->operators[i].get();
@@ -93,11 +94,15 @@ void GPUExecutor::Execute() {
 		// auto local_source_state = pipeline.source->GetLocalSourceState(exec_context, *pipeline.source_state);
 		// OperatorSourceInput source_input = {*pipeline.source_state, *local_source_state, interrupt_state};
 		// pipeline->source->GetData(exec_context, source_relation, source_input);
-		pipeline->source->GetData(*source_relation);
-		// EndOperator(*pipeline.source, &result);
-
 		auto source_type = pipeline->source.get()->type;
 		std::cout << "pipeline source type " << PhysicalOperatorToString(source_type) << std::endl;
+		pipeline->source->GetData(*source_relation);
+		// printf("source relation size %d\n", source_relation->columns.size());
+		// for (auto col : source_relation->columns) {
+		// 	printf("source relation column size %d column name %s\n", col->column_length, col->name.c_str());
+		// }
+		// printf("\n");
+		// EndOperator(*pipeline.source, &result);
 
 		//call source
 		// std::cout << pipeline->source.get()->GetName() << std::endl;
@@ -126,7 +131,6 @@ void GPUExecutor::Execute() {
 			//                                        *intermediate_states[current_intermediate - 1]);
 
 			auto result = current_operator.get().Execute(*prev_relation, *current_relation);
-			printf("Done executing operator\n");
 			// EndOperator(current_operator, &current_chunk);
 		}
 		if (pipeline->sink) {
@@ -135,11 +139,19 @@ void GPUExecutor::Execute() {
 			// std::cout << pipeline->sink.get()->GetName() << std::endl;
 			//call sink
 			auto &sink_relation = final_relation;
+			// printf("sink relation size %d\n", final_relation->columns.size());
+			// int i = 0;
+			// for (auto col : final_relation->columns) {
+			// 	if (col == nullptr) printf("%d\n", i);
+			// 	i++;
+			// 	// printf("sink relation column size %d\n", col->column_length);
+			// }
 			// auto interrupt_state = InterruptState();
 			// auto local_sink_state = pipeline->sink->GetLocalSinkState(exec_context);
 			// OperatorSinkInput sink_input {*pipeline->sink->sink_state, *local_sink_state, interrupt_state};
 			// pipeline->sink->Sink(exec_context, *sink_relation, sink_input);
 			pipeline->sink->Sink(*sink_relation);
+			printf("\n");
 		}
 	}
 }
@@ -158,11 +170,8 @@ void GPUExecutor::InitializeInternal(GPUPhysicalOperator &plan) {
 		// build and ready the pipelines
 		GPUPipelineBuildState state;
 		auto root_pipeline = make_shared_ptr<GPUMetaPipeline>(*this, state, nullptr);
-		printf("Building pipelines\n");
 		root_pipeline->Build(*gpu_physical_plan);
-		printf("Done Building pipelines\n");
 		root_pipeline->Ready();
-		printf("Pipelines ready\n");
 
 		// ready recursive cte pipelines too
 		// TODO: SUPPORT RECURSIVE CTE FOR GPU
@@ -172,8 +181,7 @@ void GPUExecutor::InitializeInternal(GPUPhysicalOperator &plan) {
 		// }
 
 		// set root pipelines, i.e., all pipelines that end in the final sink
-		root_pipeline->GetPipelines(root_pipelines, false);
-		printf("Pipelines got\n");
+		root_pipeline->GetPipelines(root_pipelines, false);		
 		root_pipeline_idx = 0;
 		// for (auto &pipeline : root_pipelines) {
 		// 	auto type = pipeline->source.get()->type;
@@ -184,14 +192,47 @@ void GPUExecutor::InitializeInternal(GPUPhysicalOperator &plan) {
 		// collect all meta-pipelines from the root pipeline
 		vector<shared_ptr<GPUMetaPipeline>> to_schedule;
 		root_pipeline->GetMetaPipelines(to_schedule, true, true);
-		printf("MetaPipelines got\n");
 
 		// number of 'PipelineCompleteEvent's is equal to the number of meta pipelines, so we have to set it here
 		total_pipelines = to_schedule.size();
+		
+		printf("Total meta pipelines %d\n", to_schedule.size());
+		int schedule_count = 0;
+		int meta = 0;
+		while (schedule_count < to_schedule.size()) {
+			vector<shared_ptr<GPUMetaPipeline>> children;
+			to_schedule[to_schedule.size() - 1 - meta]->GetMetaPipelines(children, false, true);
+			auto base_pipeline = to_schedule[to_schedule.size() - 1 - meta]->GetBasePipeline();
+			bool should_schedule = true;
+			//already scheduled
+			if (find(scheduled.begin(), scheduled.end(), base_pipeline) != scheduled.end()) {
+				should_schedule = false;
+			} else {
+				//check if all children are scheduled
+				for (auto &child : children) {
+					if (find(scheduled.begin(), scheduled.end(), child->GetBasePipeline()) == scheduled.end()) {
+						should_schedule = false;
+						break;
+					}
+				}
+				//check if all dependencies are scheduled
+				for (int dep = 0; dep < base_pipeline->dependencies.size(); dep++) {
+					if (find(scheduled.begin(), scheduled.end(), base_pipeline->dependencies[dep]) == scheduled.end()) {
+						should_schedule = false;
+						break;
+					}
+				}
+			}
+			if (should_schedule) {
+				scheduled.push_back(base_pipeline);
+				schedule_count++;
+			}
+			meta = (meta + 1) % to_schedule.size();
+		}
 
 		// collect all pipelines from the root pipelines (recursively) for the progress bar and verify them
 		root_pipeline->GetPipelines(pipelines, true);
-		// printf("total_pipelines = %d\n", pipelines.size());
+		printf("total_pipelines = %d\n", pipelines.size());
 
 		// finally, verify and schedule
 		// VerifyPipelines();
@@ -258,10 +299,10 @@ GPUExecutor::GetResult() {
 	// auto &result_collector = gpu_physical_plan.get()->Cast<GPUPhysicalResultCollector>();
 	auto &result_collector = gpu_physical_plan.get()->Cast<GPUPhysicalMaterializedCollector>();
 	D_ASSERT(result_collector.sink_state);
-	printf("we are getting result\n");
+	// printf("we are getting result\n");
 	result_collector.sink_state = result_collector.GetGlobalSinkState(context);
 	unique_ptr<QueryResult> res = result_collector.GetResult(*(result_collector.sink_state));
-	printf("we can get result\n");
+	// printf("we can get result\n");
 	return res;
 }
 

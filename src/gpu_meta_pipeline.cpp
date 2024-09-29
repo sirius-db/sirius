@@ -100,7 +100,7 @@ void GPUMetaPipeline::AssignNextBatchIndex(GPUPipeline &pipeline) {
 void GPUMetaPipeline::Build(GPUPhysicalOperator &op) {
 	D_ASSERT(pipelines.size() == 1);
 	D_ASSERT(children.empty());
-	printf("op.type = %s\n", PhysicalOperatorToString(op.type).c_str());
+	// printf("op.type = %s\n", PhysicalOperatorToString(op.type).c_str());
 	op.BuildPipelines(*pipelines.back(), *this);
 }
 
