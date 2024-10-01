@@ -139,15 +139,15 @@ bool GPUPhysicalPlanGenerator::HasEquality(vector<JoinCondition> &conds, idx_t &
 		case ExpressionType::COMPARE_EQUAL:
 		case ExpressionType::COMPARE_NOT_DISTINCT_FROM:
 			return true;
-		// case ExpressionType::COMPARE_LESSTHAN:
-		// case ExpressionType::COMPARE_GREATERTHAN:
-		// case ExpressionType::COMPARE_LESSTHANOREQUALTO:
-		// case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
-		// 	++range_count;
-		// 	break;
-		// case ExpressionType::COMPARE_NOTEQUAL:
+		case ExpressionType::COMPARE_LESSTHAN:
+		case ExpressionType::COMPARE_GREATERTHAN:
+		case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+		case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+			++range_count;
+			break;
+		case ExpressionType::COMPARE_NOTEQUAL:
 		// case ExpressionType::COMPARE_DISTINCT_FROM:
-		// 	break;
+			break;
 		default:
 			throw NotImplementedException("Unimplemented comparison join");
 		}
@@ -204,7 +204,7 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::PlanComparisonJoin(Log
 		                                   std::move(op.mark_types), op.estimated_cardinality);
 
 	} else {
-		throw NotImplementedException("Non-equality join not supported in GPU");
+		// throw NotImplementedException("Non-equality join not supported in GPU");
 		static constexpr const idx_t NESTED_LOOP_JOIN_THRESHOLD = 5;
 		if (left->estimated_cardinality <= NESTED_LOOP_JOIN_THRESHOLD ||
 		    right->estimated_cardinality <= NESTED_LOOP_JOIN_THRESHOLD) {

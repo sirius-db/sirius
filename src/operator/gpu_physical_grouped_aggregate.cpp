@@ -130,9 +130,12 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 	auto &aggregates = grouped_aggregate_data.aggregates;
 	idx_t aggregate_input_idx = 0;
 
+	if (groupings.size() > 1) throw NotImplementedException("Multiple groupings not supported yet");
+
 	// Reading groupby columns based on the grouping set
 	for (idx_t i = 0; i < groupings.size(); i++) {
 		auto &grouping = groupings[i];
+		int idx = 0;
 		for (auto &group_idx : grouping_sets[i]) {
 			// Retrieve the expression containing the index in the input chunk
 			auto &group = grouped_aggregate_data.groups[group_idx];
@@ -140,7 +143,9 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 			auto &bound_ref_expr = group->Cast<BoundReferenceExpression>();
 			printf("Reading groupby columns from index %d and passing it to index %d in groupby result\n", bound_ref_expr.index, bound_ref_expr.index);
 			input_relation.checkLateMaterialization(bound_ref_expr.index);
-			group_by_result->columns[bound_ref_expr.index] = input_relation.columns[bound_ref_expr.index];
+			// printf("group by result size %d %d\n", group_by_result->columns.size(), grouped_aggregate_data.GroupCount());
+			group_by_result->columns[idx] = input_relation.columns[bound_ref_expr.index];
+			idx++;
 		}
 	}
 	int aggr_idx = 0;
@@ -213,9 +218,9 @@ GPUPhysicalGroupedAggregate::SinkDistinctGrouping(GPUIntermediateRelation& input
 			for (idx_t group_idx = 0; group_idx < grouped_aggregate_data.groups.size(); group_idx++) {
 				auto &group = grouped_aggregate_data.groups[group_idx];
 				auto &bound_ref = group->Cast<BoundReferenceExpression>();
-				printf("Reading groupby columns from index %d and passing it to index %d in groupby result\n", bound_ref.index, bound_ref.index);
+				printf("Reading groupby columns from index %d and passing it to index %d in groupby result\n", bound_ref.index, group_idx);
 				input_relation.checkLateMaterialization(bound_ref.index);
-				group_by_result->columns[bound_ref.index] = input_relation.columns[bound_ref.index];
+				group_by_result->columns[group_idx] = input_relation.columns[bound_ref.index];
 			}
 			for (idx_t child_idx = 0; child_idx < aggregate.children.size(); child_idx++) {
 				auto &child = aggregate.children[child_idx];
@@ -228,9 +233,9 @@ GPUPhysicalGroupedAggregate::SinkDistinctGrouping(GPUIntermediateRelation& input
 			for (idx_t group_idx = 0; group_idx < grouped_aggregate_data.groups.size(); group_idx++) {
 				auto &group = grouped_aggregate_data.groups[group_idx];
 				auto &bound_ref = group->Cast<BoundReferenceExpression>();
-				printf("Reading groupby columns from index %d and passing it to index %d in groupby result\n", bound_ref.index, bound_ref.index);
+				printf("Reading groupby columns from index %d and passing it to index %d in groupby result\n", bound_ref.index, group_idx);
 				input_relation.checkLateMaterialization(bound_ref.index);
-				group_by_result->columns[bound_ref.index] = input_relation.columns[bound_ref.index];
+				group_by_result->columns[group_idx] = input_relation.columns[bound_ref.index];
 			}
 			for (idx_t child_idx = 0; child_idx < aggregate.children.size(); child_idx++) {
 				auto &child = aggregate.children[child_idx];

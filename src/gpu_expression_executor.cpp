@@ -7,12 +7,13 @@
 #include "duckdb/planner/expression/bound_between_expression.hpp"
 #include "duckdb/planner/expression/bound_case_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/planner/expression/bound_operator_expression.hpp"
 
 namespace duckdb {
 
 void 
 GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_relation, GPUIntermediateRelation& output_relation, Expression& expr, int depth) {
-    // printf("Expression class %d\n", expr.expression_class);
+    printf("Expression class %d\n", expr.expression_class);
 	switch (expr.expression_class) {
 	case ExpressionClass::BOUND_BETWEEN: {
         auto &bound_between = expr.Cast<BoundBetweenExpression>();
@@ -71,7 +72,11 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
         }
 		break;
 	} case ExpressionClass::BOUND_OPERATOR: {
-		throw NotImplementedException("Operator expression is not supported");
+        printf("Executing IN expression\n");
+        auto &bound_operator = expr.Cast<BoundOperatorExpression>();
+        for (auto &child : bound_operator.children) {
+            FilterRecursiveExpression(input_relation, output_relation, *child, depth + 1);
+        }
 		break;
 	} case ExpressionClass::BOUND_PARAMETER: {
 		throw NotImplementedException("Parameter expression is not supported");

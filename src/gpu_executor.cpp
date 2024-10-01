@@ -3,6 +3,7 @@
 #include "duckdb/execution/operator/helper/physical_result_collector.hpp"
 #include "gpu_physical_operator.hpp"
 #include "operator/gpu_physical_result_collector.hpp"
+#include "operator/gpu_physical_hash_join.hpp"
 #include "duckdb/parallel/thread_context.hpp"
 #include "duckdb/execution/execution_context.hpp"
 #include <iostream>
@@ -204,6 +205,7 @@ void GPUExecutor::InitializeInternal(GPUPhysicalOperator &plan) {
 			to_schedule[to_schedule.size() - 1 - meta]->GetMetaPipelines(children, false, true);
 			auto base_pipeline = to_schedule[to_schedule.size() - 1 - meta]->GetBasePipeline();
 			bool should_schedule = true;
+
 			//already scheduled
 			if (find(scheduled.begin(), scheduled.end(), base_pipeline) != scheduled.end()) {
 				should_schedule = false;
@@ -224,7 +226,20 @@ void GPUExecutor::InitializeInternal(GPUPhysicalOperator &plan) {
 				}
 			}
 			if (should_schedule) {
-				scheduled.push_back(base_pipeline);
+				vector<shared_ptr<GPUPipeline>> pipeline_inside;
+				to_schedule[to_schedule.size() - 1 - meta]->GetPipelines(pipeline_inside, false);
+				for (int pipeline_idx = 0; pipeline_idx < pipeline_inside.size(); pipeline_idx++) {
+					auto &pipeline = pipeline_inside[pipeline_idx];
+					if (pipeline_inside[pipeline_idx]->source->type == PhysicalOperatorType::HASH_JOIN) {
+						auto& temp = pipeline_inside[pipeline_idx]->source.get()->Cast<GPUPhysicalHashJoin>();
+						if (temp.join_type == JoinType::RIGHT || temp.join_type == JoinType::RIGHT_SEMI || temp.join_type == JoinType::RIGHT_ANTI) {
+							scheduled.push_back(pipeline);
+						}
+					} else {
+						scheduled.push_back(pipeline);
+					}
+				}
+				// scheduled.push_back(base_pipeline);
 				schedule_count++;
 			}
 			meta = (meta + 1) % to_schedule.size();
