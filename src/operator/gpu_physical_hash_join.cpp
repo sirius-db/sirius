@@ -48,6 +48,7 @@ GPUPhysicalHashJoin::GPUPhysicalHashJoin(LogicalOperator &op, unique_ptr<GPUPhys
 
 	// For ANTI, SEMI and MARK join, we only need to store the keys, so for these the payload/RHS types are empty
 	if (join_type == JoinType::ANTI || join_type == JoinType::SEMI || join_type == JoinType::MARK) {
+		hash_table_result = new GPUIntermediateRelation(0, build_columns_in_conditions.size());
 		return;
 	}
 
@@ -90,16 +91,25 @@ GPUPhysicalHashJoin::GetData(GPUIntermediateRelation &output_relation) const {
 	idx_t left_column_count = output_relation.columns.size() - hash_table_result->columns.size();
 	if (join_type == JoinType::RIGHT_SEMI || join_type == JoinType::RIGHT_ANTI) {
 		left_column_count = 0;
+	} else if (join_type == JoinType::RIGHT) {
+		for (idx_t col = 0; col < left_column_count; col++) {
+			//pretend this to be NUll column from the left table (it should be NULL for the RIGHT join)
+			output_relation.columns[col] = new GPUColumn(0, ColumnType::INT64, nullptr);
+		}
+	} else {
+		throw InvalidInputException("Get data not supported for this join type");
 	}
 
-	for (idx_t col = 0; col < left_column_count; col++) {
-		output_relation.columns[col] = NULL;
+	for (idx_t i = 0; i < rhs_output_columns.size(); i++) {
+		const auto rhs_col = rhs_output_columns[i];
+		printf("Writing hash_table column %ld to column %ld\n", i, rhs_col);
+		output_relation.columns[left_column_count + rhs_col] = hash_table_result->columns[i];
 	}
 
-	for (int col = 0; col < hash_table_result->columns.size(); col++) {
-		printf("Writing hash_table column %ld to column %ld\n", col, col);
-		output_relation.columns[col] = hash_table_result->columns[col];
-	}
+	// for (int col = 0; col < hash_table_result->columns.size(); col++) {
+	// 	printf("Writing hash_table column %ld to column %ld\n", col, col);
+	// 	output_relation.columns[col] = hash_table_result->columns[col];
+	// }
 
 	return SourceResultType::FINISHED;
 }
@@ -189,10 +199,10 @@ GPUPhysicalHashJoin::Sink(GPUIntermediateRelation &input_relation) const {
     //Check if late materialization is needed
     //Build the hash table
 
-	printf("input relation size %d\n", input_relation.columns.size());
-	for (auto col : input_relation.columns) {
-		printf("input relation column size %d\n", col->column_length);
-	}
+	// printf("input relation size %d\n", input_relation.columns.size());
+	// for (auto col : input_relation.columns) {
+	// 	printf("input relation column size %d\n", col->column_length);
+	// }
 	for (idx_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
 		auto &condition = conditions[cond_idx];
         auto join_key_index = condition.right->Cast<BoundReferenceExpression>().index;
@@ -200,12 +210,24 @@ GPUPhysicalHashJoin::Sink(GPUIntermediateRelation &input_relation) const {
         input_relation.checkLateMaterialization(join_key_index);
 	}
 
-    // on the RHS, we need to fetch the data from the hash table
-    for (idx_t i = 0; i < rhs_output_columns.size(); i++) {
-        const auto rhs_col = rhs_output_columns[i];
+	int right_idx = 0;
+	for (idx_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
+		auto &condition = conditions[cond_idx];
+		if (condition.right->GetExpressionClass() != ExpressionClass::BOUND_REF) {
+			throw InvalidInputException("Unsupported join condition");
+		}
+        auto join_key_index = condition.right->Cast<BoundReferenceExpression>().index;
+		hash_table_result->columns[cond_idx] = input_relation.columns[join_key_index];
+		right_idx++;
+	}
+
+	printf("Building hash table\n");
+    for (idx_t i = 0; i < payload_column_idxs.size(); i++) {
+        auto payload_idx = payload_column_idxs[i];
         // D_ASSERT(vector.GetType() == ht.layout.GetTypes()[output_col_idx]);
-		printf("Passing column idx %ld from RHS hash table\n", rhs_col);
-        hash_table_result->columns[rhs_col] = input_relation.columns[i];
+		printf("Passing column idx %d from input relation to index %ld in RHS hash table\n", payload_idx, right_idx + i);
+        // hash_table_result->columns[rhs_col] = input_relation.columns[i];
+		hash_table_result->columns[right_idx + i] = input_relation.columns[payload_idx];
     }
 
     return SinkResultType::FINISHED;

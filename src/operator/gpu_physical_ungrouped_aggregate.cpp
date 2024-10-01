@@ -10,12 +10,11 @@ GPUPhysicalUngroupedAggregate::GPUPhysicalUngroupedAggregate(vector<LogicalType>
       aggregates(std::move(expressions)) {
 
 	distinct_collection_info = DistinctAggregateCollectionInfo::Create(aggregates);
+	aggregation_result = new GPUIntermediateRelation(0, aggregates.size());
 	if (!distinct_collection_info) {
 		return;
 	}
 	distinct_data = make_uniq<DistinctAggregateData>(*distinct_collection_info);
-
-	aggregation_result = new GPUIntermediateRelation(0, aggregates.size());
 
 }
 
@@ -56,6 +55,8 @@ GPUPhysicalUngroupedAggregate::Sink(GPUIntermediateRelation &input_relation) con
 				D_ASSERT(child_expr->type == ExpressionType::BOUND_REF);
 				printf("Reading aggregation column from index %ld and passing it to index %ld in aggregation result\n", payload_idx + payload_cnt, aggr_idx);
 				input_relation.checkLateMaterialization(payload_idx + payload_cnt);
+				// printf("aggregation_result.columns.size() %ld\n", aggregation_result->columns.size());
+				// printf("input_relation.columns.size() %ld\n", input_relation.columns.size());
 				aggregation_result->columns[aggr_idx] = input_relation.columns[payload_idx + payload_cnt];
 				payload_cnt++;
 			}
