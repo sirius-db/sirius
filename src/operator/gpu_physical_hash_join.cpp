@@ -106,11 +106,6 @@ GPUPhysicalHashJoin::GetData(GPUIntermediateRelation &output_relation) const {
 		output_relation.columns[left_column_count + rhs_col] = hash_table_result->columns[i];
 	}
 
-	// for (int col = 0; col < hash_table_result->columns.size(); col++) {
-	// 	printf("Writing hash_table column %ld to column %ld\n", col, col);
-	// 	output_relation.columns[col] = hash_table_result->columns[col];
-	// }
-
 	return SourceResultType::FINISHED;
 }
 
@@ -132,7 +127,7 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 		if (output_relation.columns.size() != rhs_output_columns.size()) {
 			throw InvalidInputException("Wrong input size");
 		}
-	} else if (join_type == JoinType::SEMI || join_type == JoinType::ANTI || join_type == JoinType::MARK) {
+	} else if (join_type == JoinType::SEMI || join_type == JoinType::ANTI) {
 		// for SEMI and ANTI join, the output is the LHS
 		// we only need to output the LHS columns
 		// the RHS columns are NULL
@@ -142,6 +137,11 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 	} else if (join_type == JoinType::RIGHT || join_type == JoinType::LEFT || join_type == JoinType::INNER || join_type == JoinType::OUTER) {
 		// for INNER and OUTER join, we output all columns
 		if (output_relation.columns.size() != input_relation.columns.size() + rhs_output_columns.size()) {
+			throw InvalidInputException("Wrong input size");
+		}
+	} else if (join_type == JoinType::MARK) {
+		// for MARK join, we output all columns from the LHS and one extra boolean column
+		if (output_relation.columns.size() != input_relation.columns.size() + 1) {
 			throw InvalidInputException("Wrong input size");
 		}
 	} else {
@@ -163,6 +163,12 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 			output_relation.columns[i] = input_relation.columns[i];
 			output_relation.columns[i]->row_ids = left_row_ids;
 		}
+	}
+
+	if (join_type == JoinType::MARK) {
+		printf("Writing boolean column to output relation\n");
+		uint8_t* mark_row_ids = new uint8_t[1];
+		output_relation.columns[input_relation.column_count] = new GPUColumn(0, ColumnType::INT32, mark_row_ids);
 	}
 
 	if (join_type == JoinType::INNER || join_type == JoinType::OUTER || join_type == JoinType::RIGHT || join_type == JoinType::LEFT) {

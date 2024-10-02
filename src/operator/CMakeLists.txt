@@ -13,5 +13,6 @@ set(EXTENSION_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/gpu_physical_ungrouped_aggregate.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/gpu_physical_result_collector.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/gpu_physical_table_scan.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/gpu_physical_nested_loop_join.cpp
         PARENT_SCOPE
 )
