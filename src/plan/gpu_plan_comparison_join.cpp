@@ -17,6 +17,7 @@
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 
 #include "gpu_physical_hash_join.hpp"
+#include "gpu_physical_nested_loop_join.hpp"
 #include "gpu_physical_plan_generator.hpp"
 
 namespace duckdb {
@@ -222,10 +223,10 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::PlanComparisonJoin(Log
 			//     make_uniq<PhysicalPiecewiseMergeJoin>(op, std::move(left), std::move(right), std::move(op.conditions),
 			//                                           op.join_type, op.estimated_cardinality);
 		} else if (PhysicalNestedLoopJoin::IsSupported(op.conditions, op.join_type)) {
-			throw NotImplementedException("Nested loop join not supported in GPU");
+			// throw NotImplementedException("Nested loop join not supported in GPU");
 			// inequality join: use nested loop
-			// plan = make_uniq<PhysicalNestedLoopJoin>(op, std::move(left), std::move(right), std::move(op.conditions),
-			//                                          op.join_type, op.estimated_cardinality);
+			plan = make_uniq<GPUPhysicalNestedLoopJoin>(op, std::move(left), std::move(right), std::move(op.conditions),
+			                                         op.join_type, op.estimated_cardinality);
 		} else {
 			throw NotImplementedException("Blockwise nested loop join not supported in GPU");
 			// for (auto &cond : op.conditions) {
