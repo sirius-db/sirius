@@ -12,6 +12,7 @@ namespace duckdb {
 template <typename T> T* callCudaMalloc(size_t size, int gpu);
 template <typename T> void callCudaFree(T* ptr, int gpu);
 template <typename T> void callCudaMemcpyHostToDevice(T* dest, T* src, size_t size, int gpu);
+template <typename T> void callCudaMemcpyDeviceToHost(T* dest, T* src, size_t size, int gpu);
 
 // Currently a singleton class, would not work for multiple GPUs
 class GPUBufferManager {

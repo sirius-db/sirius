@@ -15,6 +15,7 @@
 #include "gpu_context.hpp"
 #include "gpu_physical_plan_generator.hpp"
 #include "duckdb/main/prepared_statement_data.hpp"
+#include "gpu_buffer_manager.hpp"
 
 namespace duckdb {
 
@@ -22,6 +23,7 @@ GPUPhysicalResultCollector::GPUPhysicalResultCollector(GPUPreparedStatementData 
     : GPUPhysicalOperator(PhysicalOperatorType::RESULT_COLLECTOR, {LogicalType::BOOLEAN}, 0),
       statement_type(data.prepared->statement_type), properties(data.prepared->properties), plan(*data.gpu_physical_plan), names(data.prepared->names) {
 	this->types = data.prepared->types;
+	gpuBufferManager = &(GPUBufferManager::GetInstance());
 }
 
 // unique_ptr<GPUPhysicalResultCollector> GPUPhysicalResultCollector::GetResultCollector(ClientContext &context,
@@ -70,7 +72,7 @@ GPUPhysicalResultCollector::BuildPipelines(GPUPipeline &current, GPUMetaPipeline
 }
 
 GPUPhysicalMaterializedCollector::GPUPhysicalMaterializedCollector(GPUPreparedStatementData &data)
-    : GPUPhysicalResultCollector(data) {
+	: GPUPhysicalResultCollector(data), collection(make_uniq<ColumnDataCollection>(Allocator::DefaultAllocator(), types)) {
 }
 
 //===--------------------------------------------------------------------===//
@@ -90,8 +92,56 @@ public:
 };
 
 SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &input_relation) const {
-	// auto &lstate = input.local_state.Cast<MaterializedCollectorLocalState>();
+	// auto &lstate = input.local_state.Cast<GPUMaterializedCollectorLocalState>();
 	// lstate.collection->Append(lstate.append_state, chunk);
+	printf("I am sinking in PhysicalMaterializedCollector\n");
+	if (types.size() != input_relation.columns.size()) {
+		throw InvalidInputException("Column count mismatch");
+	}
+	// auto &gstate = GetGlobalSinkState(input_relation.context);
+
+	size_t size = input_relation.length * sizeof(double);
+	Allocator& allocator = Allocator::DefaultAllocator();
+	uint8_t** host_data = new uint8_t*[input_relation.columns.size()];
+	printf("size %d\n", size);
+	for (int col = 0; col < input_relation.columns.size(); col++) {
+		if (input_relation.columns[col]->column_length != input_relation.length) {
+			throw InvalidInputException("Column length mismatch");
+		}
+		host_data[col] = allocator.AllocateData(size);
+		// host_data[col] = new uint8_t[size];
+		callCudaMemcpyDeviceToHost<uint8_t>(host_data[col], input_relation.columns[col]->data_wrapper.data, size, 0);
+	}
+
+	// collection = make_uniq<ColumnDataCollection>(Allocator::DefaultAllocator(), types);
+	// collection = make_uniq<ColumnDataCollection>(Allocator::DefaultAllocator(), types);
+	ColumnDataAppendState append_state;
+	collection->InitializeAppend(append_state);
+	size_t total_vector = (input_relation.length + STANDARD_VECTOR_SIZE - 1) / STANDARD_VECTOR_SIZE;
+	// printf("Total vector %d\n", total_vector);
+	size_t remaining = input_relation.length;
+	for (int vec = 0; vec < total_vector; vec++) {
+		DataChunk chunk;
+		chunk.InitializeEmpty(types);
+		// printf("Types size %d\n", types.size());
+		for (int col = 0; col < input_relation.columns.size(); col++) {
+			uint8_t* data = host_data[col] + vec * STANDARD_VECTOR_SIZE * sizeof(double);
+			double* ptr = reinterpret_cast<double*>(host_data[0]);
+			Vector vector(LogicalType::DOUBLE, data);
+			chunk.data[col].Reference(vector);
+		}
+		// printf("Chunk size %d\n", chunk.size());
+		// printf("Chunk column count %d\n", chunk.ColumnCount());
+		// chunk.Print();
+		// printf("Remaining %d\n", remaining);
+		if (remaining < STANDARD_VECTOR_SIZE) {
+			chunk.SetCardinality(remaining);
+		} else {
+			chunk.SetCardinality(STANDARD_VECTOR_SIZE);
+		}
+		collection->Append(append_state, chunk);
+		remaining -= STANDARD_VECTOR_SIZE;
+	}
 	return SinkResultType::FINISHED;
 }
 
@@ -132,14 +182,13 @@ unique_ptr<QueryResult> GPUPhysicalMaterializedCollector::GetResult(GlobalSinkSt
 	if (!gstate.collection) {
 		gstate.collection = make_uniq<ColumnDataCollection>(Allocator::DefaultAllocator(), types);
 	}
-	// printf("I am here\n");
 	if (!gstate.context) throw InvalidInputException("No context set in GPUMaterializedCollectorState");
 	if (!gstate.collection) throw InvalidInputException("No context set in GPUMaterializedCollectorState");
 	auto prop = gstate.context->GetClientProperties();
-	// printf("I am here\n");
-	auto result = make_uniq<MaterializedQueryResult>(statement_type, properties, names, std::move(gstate.collection),
+	// auto result = make_uniq<MaterializedQueryResult>(statement_type, properties, names, std::move(gstate.collection),
+	//                                                  prop);
+	auto result = make_uniq<MaterializedQueryResult>(statement_type, properties, names, std::move(collection),
 	                                                 prop);
-	// printf("I am here\n");
 	return std::move(result);
 }
 

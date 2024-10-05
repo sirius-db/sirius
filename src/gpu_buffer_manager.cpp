@@ -55,6 +55,13 @@ GPUBufferManager::GPUBufferManager(size_t cache_size_per_gpu, size_t processing_
     for (int gpu = 0; gpu < NUM_GPUS; gpu++) {
         gpuCache[gpu] = callCudaMalloc<uint8_t>(cache_size_per_gpu, gpu);
         gpuProcessing[gpu] = callCudaMalloc<uint8_t>(processing_size_per_gpu, gpu);
+        // if (reinterpret_cast<uintptr_t>(gpuCache[gpu]) % alignof(double) == 0) {
+        //     printf("Memory is not properly aligned 1\n");
+        // } else if (reinterpret_cast<uintptr_t>(gpuCache[gpu]) % alignof(int) == 0) {
+        //     printf("Memory is not properly aligned 2\n");
+        // } else if (reinterpret_cast<uintptr_t>(gpuCache[gpu]) % alignof(char) == 0) {
+        //     printf("Memory is not properly aligned 3\n");
+        // }
         gpuProcessingPointer[gpu] = 0;
         gpuCachingPointer[gpu] = 0;
     }
@@ -81,14 +88,27 @@ template <typename T>
 T*
 GPUBufferManager::customCudaMalloc(size_t size, int gpu, bool caching) {
 	size_t alloc = (size * sizeof(T));
+    //always ensure that it aligns with 8B
+    alloc = alloc + (alignof(double) - alloc % alignof(double));
     if (caching) {
         size_t start = __atomic_fetch_add(&gpuCachingPointer[gpu], alloc, __ATOMIC_RELAXED);
         assert((start + alloc) < cache_size_per_gpu);
-        return reinterpret_cast<T*>(gpuCache[gpu] + start);
+        T* ptr = reinterpret_cast<T*>(gpuCache[gpu] + start);
+        if (reinterpret_cast<uintptr_t>(ptr) % alignof(double) != 0) {
+            throw InvalidInputException("Memory is not properly aligned");
+        } 
+        return ptr;
     } else {
+        // printf("Current pointer %d\n", gpuProcessingPointer[gpu]);
         size_t start = __atomic_fetch_add(&gpuProcessingPointer[gpu], alloc, __ATOMIC_RELAXED);
         assert((start + alloc) < processing_size_per_gpu);
-        return reinterpret_cast<T*>(gpuProcessing[gpu] + start);
+        // printf("Allocating %d bytes at %d\n", alloc, start);
+        // printf("Current pointer %d\n", gpuProcessingPointer[gpu]);
+        T* ptr = reinterpret_cast<T*>(gpuProcessing[gpu] + start);
+        if (reinterpret_cast<uintptr_t>(ptr) % alignof(double) != 0) {
+            throw InvalidInputException("Memory is not properly aligned");
+        } 
+        return ptr;
     }
 };
 
@@ -236,6 +256,8 @@ GPUBufferManager::cacheDataInGPU(DataWrapper cpu_data, string table_name, string
     callCudaMemcpyHostToDevice<uint8_t>(gpu_allocated_buffer.data, cpu_data.data, cpu_data.size * cpu_data.getColumnTypeSize(), 0);
     int column_idx = column_it - tables[up_table_name]->column_names.begin(); 
     tables[up_table_name]->columns[column_idx]->data_wrapper = gpu_allocated_buffer;
+    tables[up_table_name]->columns[column_idx]->column_length = gpu_allocated_buffer.size;
+    tables[up_table_name]->length = gpu_allocated_buffer.size;
 }
 
 void

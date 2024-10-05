@@ -8,6 +8,7 @@
 #include "gpu_pipeline.hpp"
 #include "gpu_meta_pipeline.hpp"
 #include "operator/gpu_physical_result_collector.hpp"
+#include "gpu_buffer_manager.hpp"
 
 namespace duckdb {
 
@@ -21,9 +22,11 @@ class GPUExecutor {
 public:
 	explicit GPUExecutor(ClientContext &context, GPUContext &gpu_context)
 	    : context(context), gpu_context(gpu_context) {
+		gpuBufferManager = &(GPUBufferManager::GetInstance());
 	};
 	// ~GPUExecutor();
 
+	GPUBufferManager* gpuBufferManager;
 	ClientContext &context;
 	GPUContext &gpu_context;
 	optional_ptr<GPUPhysicalOperator> gpu_physical_plan;

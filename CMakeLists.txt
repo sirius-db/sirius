@@ -38,7 +38,12 @@ set(EXTENSION_SOURCES
 add_subdirectory(src/operator)
 add_subdirectory(src/plan)
 
-set(CUDA_SOURCES src/cuda/sirius_extension_cuda.cu src/cuda/communication.cu src/cuda/allocator.cu)
+set(CUDA_SOURCES 
+  src/cuda/sirius_extension_cuda.cu 
+  src/cuda/communication.cu 
+  src/cuda/allocator.cu
+)
+add_subdirectory(src/cuda/operator)
 
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CXX_STANDARD 17)

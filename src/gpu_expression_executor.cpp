@@ -99,6 +99,8 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
 void 
 GPUExpressionExecutor::ProjectionRecursiveExpression(GPUIntermediateRelation& input_relation, GPUIntermediateRelation& output_relation, Expression& expr, int output_idx, int depth) {
     printf("Expression class %d\n", expr.expression_class);
+    GPUColumn* result;
+
 	switch (expr.expression_class) {
 	case ExpressionClass::BOUND_BETWEEN: {
         auto &bound_between = expr.Cast<BoundBetweenExpression>();
@@ -146,9 +148,42 @@ GPUExpressionExecutor::ProjectionRecursiveExpression(GPUIntermediateRelation& in
 	} case ExpressionClass::BOUND_FUNCTION: {
         printf("Executing function expression\n");
         auto &bound_function = expr.Cast<BoundFunctionExpression>();
-        for (auto &child : bound_function.children) {
-            ProjectionRecursiveExpression(input_relation, output_relation, *child, output_idx, depth + 1);
-        }
+        // for (auto &child : bound_function.children) {
+        //     ProjectionRecursiveExpression(input_relation, output_relation, *child, output_idx, depth + 1);
+        // }
+
+        auto &bound_ref1 = bound_function.children[0]->Cast<BoundReferenceExpression>();
+        auto &bound_ref2 = bound_function.children[1]->Cast<BoundReferenceExpression>();
+        printf("Testing launching GPU kernel\n");
+        size_t size = input_relation.columns[bound_ref1.index]->column_length;
+        double* ptr_double = gpuBufferManager->customCudaMalloc<double>(size, 0, 0);
+        double* a = reinterpret_cast<double*> (input_relation.columns[bound_ref1.index]->data_wrapper.data);
+        double* b = reinterpret_cast<double*> (input_relation.columns[bound_ref2.index]->data_wrapper.data);
+        // uint8_t* host_data_a = new uint8_t[size * sizeof(double)];
+        // callCudaMemcpyDeviceToHost<uint8_t>(host_data_a, reinterpret_cast<uint8_t*>(a), size * sizeof(double), 0);
+        // for (int i = 0; i < 10; i++) {
+        //     printf("%f ", reinterpret_cast<double*>(host_data_a)[i]);
+        // }
+        // printf("\n");
+        // uint8_t* host_data_b = new uint8_t[size * sizeof(double)];
+        // callCudaMemcpyDeviceToHost<uint8_t>(host_data_b, reinterpret_cast<uint8_t*>(b), size * sizeof(double), 0);
+        // for (int i = 0; i < 10; i++) {
+        //     printf("%f ", reinterpret_cast<double*>(host_data_b)[i]);
+        // }
+        // printf("\n");
+        // size = 10;
+        binaryExpression<double>(a, b, ptr_double, (uint64_t) size, 0);
+        result = new GPUColumn(size, ColumnType::FLOAT64, reinterpret_cast<uint8_t*>(ptr_double));
+        // uint8_t* host_data_a = new uint8_t[size * sizeof(double)];
+        // callCudaMemcpyDeviceToHost<uint8_t>(host_data_a, reinterpret_cast<uint8_t*>(a), size * sizeof(double), 0);
+        // for (int i = 0; i < 10; i++) {
+        //     printf("%f ", reinterpret_cast<double*>(host_data_a)[i]);
+        // }
+        // uint8_t* host_data_b = new uint8_t[size * sizeof(double)];
+        // callCudaMemcpyDeviceToHost<uint8_t>(host_data_b, reinterpret_cast<uint8_t*>(a), size * sizeof(double), 0);
+        // for (int i = 0; i < 10; i++) {
+        //     printf("%f ", reinterpret_cast<double*>(host_data_b)[i]);
+        // }
 		break;
 	} case ExpressionClass::BOUND_OPERATOR: {
 		throw NotImplementedException("Operator expression is not supported");
@@ -166,7 +201,14 @@ GPUExpressionExecutor::ProjectionRecursiveExpression(GPUIntermediateRelation& in
             output_relation.columns[output_idx] = input_relation.columns[expr.Cast<BoundReferenceExpression>().index];
         } else {
             uint8_t* fake_data = new uint8_t[1];
-            output_relation.columns[output_idx] = new GPUColumn(1, ColumnType::INT32, fake_data);
+            if (result) {
+                output_relation.columns[output_idx] = result;
+                output_relation.length = result->column_length;
+                uint8_t* host_data = new uint8_t[output_relation.length * 8];
+                callCudaMemcpyDeviceToHost<uint8_t>(host_data, output_relation.columns[output_idx]->data_wrapper.data, output_relation.length * 8, 0);
+            } else {
+                output_relation.columns[output_idx] = new GPUColumn(1, ColumnType::INT32, fake_data);
+            }
         }
     }
 }
