@@ -68,7 +68,8 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
         printf("Writing row IDs to output relation in index %ld\n", index);
         output_relation.columns[index] = table->columns[column_ids[projection_id]];
         output_relation.columns[index]->row_ids = new uint64_t[1];
-        printf("%s\n", output_relation.columns[index]->name.c_str());
+        output_relation.length = table->length;
+        // printf("%s %d %d\n", output_relation.columns[index]->name.c_str(), output_relation.columns[index]->column_length, output_relation.length);
         index++;
     }
     // for (auto col : table->columns) {

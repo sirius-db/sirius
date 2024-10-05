@@ -2,6 +2,8 @@
 
 #include "gpu_physical_operator.hpp"
 #include "duckdb/common/enums/statement_type.hpp"
+#include "gpu_buffer_manager.hpp"
+#include "duckdb/common/types/column/column_data_collection.hpp"
 
 namespace duckdb {
 
@@ -19,6 +21,7 @@ public:
 	StatementProperties properties;
 	GPUPhysicalOperator &plan;
 	vector<string> names;
+	GPUBufferManager *gpuBufferManager;
 
 // public:
 // 	static unique_ptr<PhysicalResultCollector> GetResultCollector(ClientContext &context, PreparedStatementData &data);
@@ -44,7 +47,8 @@ public:
 class GPUPhysicalMaterializedCollector : public GPUPhysicalResultCollector {
 public:
 	GPUPhysicalMaterializedCollector(GPUPreparedStatementData &data);
-
+	unique_ptr<ColumnDataCollection> collection;
+	// ColumnDataAppendState append_state;
 	// bool parallel;
 
 public:

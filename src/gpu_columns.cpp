@@ -59,6 +59,15 @@ GPUColumn::GPUColumn(string _name, size_t _column_length, ColumnType type, uint8
     row_ids = nullptr;
 }
 
+// DataChunk
+// GPUColumn::ConvertToChunk() {
+//     name = _name;
+//     column_length = _column_length;
+//     data_wrapper = DataWrapper(type, data, _column_length);
+//     row_ids = nullptr;
+// }
+
+
 GPUIntermediateRelation::GPUIntermediateRelation(size_t length, size_t column_count) :
      length(length), column_count(column_count) {
     column_names.resize(column_count);

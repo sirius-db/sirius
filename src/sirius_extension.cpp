@@ -219,8 +219,8 @@ void SiriusExtension::GPUProcessingFunction(ClientContext &context, TableFunctio
 		int* temp = new int[size];
 		int* ptr = sendDataToGPU(temp, size);  // Send data to GPU
 		std::cout << "CUDA kernel call finished." << std::endl;
-		data.gpu_context->GPUExecuteQuery(context, data.query, data.gpu_prepared, {});
-		data.res = data.conn->Query(data.query);
+		data.res = data.gpu_context->GPUExecuteQuery(context, data.query, data.gpu_prepared, {});
+		// data.res = data.conn->Query(data.query);
 	}
 
 	// data.finished = true;

@@ -2,6 +2,7 @@
 
 #include "duckdb/main/client_context.hpp"
 #include "gpu_executor.hpp"
+#include "gpu_buffer_manager.hpp"
 
 namespace duckdb {
 
