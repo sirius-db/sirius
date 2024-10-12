@@ -91,7 +91,7 @@ GPUIntermediateRelation::checkLateMaterialization(size_t idx) {
     } else {
         printf("Column idx %d needs to be materialized\n", idx);
     }
-    return columns[idx]->row_ids == nullptr;
+    return columns[idx]->row_ids != nullptr;
 }
 
 int*

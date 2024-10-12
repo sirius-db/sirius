@@ -80,9 +80,9 @@ CREATE TABLE LINEITEM (
     L_SUPPKEY     BIGINT NOT NULL,
     L_LINENUMBER  INTEGER NOT NULL,
     L_QUANTITY    INTEGER NOT NULL,
-    L_EXTENDEDPRICE  FLOAT NOT NULL,
-    L_DISCOUNT    FLOAT NOT NULL,
-    L_TAX         FLOAT NOT NULL,
+    L_EXTENDEDPRICE  DOUBLE NOT NULL,
+    L_DISCOUNT    DOUBLE NOT NULL,
+    L_TAX         DOUBLE NOT NULL,
     L_RETURNFLAG  INTEGER NOT NULL,
     L_LINESTATUS  INTEGER NOT NULL,
     L_SHIPDATE    INTEGER NOT NULL,
@@ -93,11 +93,21 @@ CREATE TABLE LINEITEM (
     L_COMMENT      VARCHAR(44) NOT NULL,
 );
 
-COPY lineitem FROM '/home/ubuntu/new-crystal/tpch_dataset_creator/dbgen/s1/lineitem.tbl' WITH (HEADER false, DELIMITER '|');
-COPY orders FROM '/home/ubuntu/new-crystal/tpch_dataset_creator/dbgen/s1/orders.tbl' WITH (HEADER false, DELIMITER '|');
-COPY supplier FROM '/home/ubuntu/new-crystal/tpch_dataset_creator/dbgen/s1/supplier.tbl' WITH (HEADER false, DELIMITER '|');
-COPY part FROM '/home/ubuntu/new-crystal/tpch_dataset_creator/dbgen/s1/part.tbl' WITH (HEADER false, DELIMITER '|');
-COPY customer FROM '/home/ubuntu/new-crystal/tpch_dataset_creator/dbgen/s1/customer.tbl' WITH (HEADER false, DELIMITER '|');
-COPY partsupp FROM '/home/ubuntu/new-crystal/tpch_dataset_creator/dbgen/s1/partsupp.tbl' WITH (HEADER false, DELIMITER '|');
-COPY nation FROM '/home/ubuntu/new-crystal/tpch_dataset_creator/dbgen/s1/nation.tbl' WITH (HEADER false, DELIMITER '|');
-COPY region FROM '/home/ubuntu/new-crystal/tpch_dataset_creator/dbgen/s1/region.tbl' WITH (HEADER false, DELIMITER '|');
+-- COPY lineitem FROM '/home/ubuntu/new-crystal/tpch_dataset_creator/dbgen/s10/lineitem.tbl' WITH (HEADER false, DELIMITER '|');
+-- COPY orders FROM '/home/ubuntu/new-crystal/tpch_dataset_creator/dbgen/s10/orders.tbl' WITH (HEADER false, DELIMITER '|');
+-- COPY supplier FROM '/home/ubuntu/new-crystal/tpch_dataset_creator/dbgen/s10/supplier.tbl' WITH (HEADER false, DELIMITER '|');
+-- COPY part FROM '/home/ubuntu/new-crystal/tpch_dataset_creator/dbgen/s10/part.tbl' WITH (HEADER false, DELIMITER '|');
+-- COPY customer FROM '/home/ubuntu/new-crystal/tpch_dataset_creator/dbgen/s10/customer.tbl' WITH (HEADER false, DELIMITER '|');
+-- COPY partsupp FROM '/home/ubuntu/new-crystal/tpch_dataset_creator/dbgen/s10/partsupp.tbl' WITH (HEADER false, DELIMITER '|');
+-- COPY nation FROM '/home/ubuntu/new-crystal/tpch_dataset_creator/dbgen/s10/nation.tbl' WITH (HEADER false, DELIMITER '|');
+-- COPY region FROM '/home/ubuntu/new-crystal/tpch_dataset_creator/dbgen/s10/region.tbl' WITH (HEADER false, DELIMITER '|');
+
+
+COPY lineitem FROM '/home/ubuntu/new-crystal/tpch_dataset_creator/dbgen/s10/lineitem.csv' WITH (HEADER false, DELIMITER '|');
+COPY orders FROM '/home/ubuntu/new-crystal/tpch_dataset_creator/dbgen/s10/orders.csv' WITH (HEADER false, DELIMITER '|');
+COPY supplier FROM '/home/ubuntu/new-crystal/tpch_dataset_creator/dbgen/s10/supplier.csv' WITH (HEADER false, DELIMITER '|');
+COPY part FROM '/home/ubuntu/new-crystal/tpch_dataset_creator/dbgen/s10/part.csv' WITH (HEADER false, DELIMITER '|');
+COPY customer FROM '/home/ubuntu/new-crystal/tpch_dataset_creator/dbgen/s10/customer.csv' WITH (HEADER false, DELIMITER '|');
+COPY partsupp FROM '/home/ubuntu/new-crystal/tpch_dataset_creator/dbgen/s10/partsupp.csv' WITH (HEADER false, DELIMITER '|');
+COPY nation FROM '/home/ubuntu/new-crystal/tpch_dataset_creator/dbgen/s10/nation.csv' WITH (HEADER false, DELIMITER '|');
+COPY region FROM '/home/ubuntu/new-crystal/tpch_dataset_creator/dbgen/s10/region.csv' WITH (HEADER false, DELIMITER '|');

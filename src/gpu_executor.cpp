@@ -24,6 +24,7 @@ GPUExecutor::Reset() {
 	total_pipelines = 0;
 	// error_manager.Reset();
 	pipelines.clear();
+	gpuBufferManager->ResetBuffer();
 	// events.clear();
 	// to_be_rescheduled_tasks.clear();
 	// execution_result = PendingExecutionResult::RESULT_NOT_READY;

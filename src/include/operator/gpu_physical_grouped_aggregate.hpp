@@ -11,6 +11,9 @@
 
 namespace duckdb {
 
+template <typename T, typename V>
+void groupedAggregate(T** keys, V* aggregate, uint64_t* count, uint64_t N, uint64_t num_keys);
+
 class ClientContext;
 
 class GPUPhysicalGroupedAggregate : public GPUPhysicalOperator {
