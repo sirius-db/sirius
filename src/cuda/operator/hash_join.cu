@@ -48,16 +48,19 @@ __global__ void probe(const uint64_t *keys, unsigned long long* ht, uint64_t ht_
     for (int ITEM = 0; ITEM < I; ITEM++) {
         if (threadIdx.x + (ITEM * B) < num_tile_items) {
             bool found = 0;
-            uint64_t slot = (uint64_t) items_key[ITEM] % ht_len;
-            while (ht[slot << 1] != 0xFFFFFFFF) {
+            uint64_t slot = items_key[ITEM] % ht_len;
+            // printf("items key : %ld %ld %ld\n", items_key[ITEM], slot, ht[slot << 1]);
+            while (ht[slot << 1] != 0xFFFFFFFFFFFFFFFF) {
                 if (ht[slot << 1] == items_key[ITEM]) {
                     items_off[ITEM] = ht[(slot << 1) + 1];
                     found = 1;
                     break;
                 }
-                slot = (slot + 10007) % ht_len;
+                slot = (slot + 100007) % ht_len;
             }
-            if (!found) selection_flags[ITEM] = 0;
+            if (found) {
+                selection_flags[ITEM] = 1;
+            }
         }
     }
 
@@ -67,6 +70,7 @@ __global__ void probe(const uint64_t *keys, unsigned long long* ht, uint64_t ht_
     BlockScanInt(temp_storage.scan).ExclusiveSum(t_count, c_t_count); //doing a prefix sum of all the previous threads in the block and store it to c_t_count
     if(threadIdx.x == blockDim.x - 1) { //if the last thread in the block, add the prefix sum of all the prev threads + sum of my threads to global variable total
         block_off = atomicAdd(count, (unsigned long long) t_count+c_t_count); //the previous value of total is gonna be assigned to block_off
+        // printf("Block Off: %ld\n", block_off);
     } //block_off does not need to be global (it's just need to be shared), because it will get the previous value from total which is global
 
     __syncthreads();
@@ -111,11 +115,20 @@ __global__ void build(const uint64_t *keys, unsigned long long* ht, uint64_t ht_
     for (int ITEM = 0; ITEM < I; ITEM++) {
         if (threadIdx.x + (ITEM * B) < num_tile_items) {
             uint64_t slot = items_key[ITEM] % ht_len;
-            while(atomicCAS(&ht[slot << 1], 0xFFFFFFFF, (unsigned long long) items_key[ITEM]) != 0xFFFFFFFF) {
-                slot = (slot + 10007) % ht_len;
+            while(atomicCAS(&ht[slot << 1], 0xFFFFFFFFFFFFFFFF, (unsigned long long) items_key[ITEM]) != 0xFFFFFFFFFFFFFFFF) {
+                slot = (slot + 100007) % ht_len;
             }
             ht[(slot << 1) + 1] = tile_offset + threadIdx.x + (ITEM * B);
         }
+    }
+}
+
+__global__ void test(uint64_t* a, uint64_t N) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        for (uint64_t i = 0; i < 1000; i++) {
+            printf("%ld ", a[i]);
+        }
+        printf("\n");
     }
 }
 
@@ -127,12 +140,16 @@ __global__ void build<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD>(const uint64_t 
 
 template <typename T>
 void probeHashTable(uint64_t *keys, unsigned long long* ht, uint64_t ht_len, uint64_t* &row_ids_left, uint64_t* &row_ids_right, uint64_t* &count, uint64_t N, int mode) {
+    printf("Launching Probe Kernel\n");
+    GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
     cudaMemset(count, 0, sizeof(uint64_t));
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
+    // printf("size: %lu %lu\n", N, ht_len);
+    // test<<<1, 1>>>((uint64_t*) ht, N);
+    CHECK_ERROR();
     probe<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(keys, ht, ht_len, row_ids_left, row_ids_right, (unsigned long long*) count, N, mode, 1);
     CHECK_ERROR();
     cudaDeviceSynchronize();
-    GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
     uint64_t* h_count = new uint64_t [1];
     cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
     row_ids_left = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
@@ -141,12 +158,14 @@ void probeHashTable(uint64_t *keys, unsigned long long* ht, uint64_t ht_len, uin
     probe<T, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(keys, ht, ht_len, row_ids_left, row_ids_right, (unsigned long long*) count, N, mode, 0);
     CHECK_ERROR();
     cudaDeviceSynchronize();
+    printf("Count: %lu\n", h_count[0]);
     count = h_count;
 }
 
 template <typename T>
 void buildHashTable(uint64_t *keys, unsigned long long* ht, uint64_t ht_len, uint64_t N, int mode) {
-    cudaMemset(ht, 0, ht_len * 2 * sizeof(unsigned long long));
+    printf("Launching Build Kernel\n");
+    cudaMemset(ht, 0xFF, ht_len * 2 * sizeof(unsigned long long));
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
     build<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(keys, ht, ht_len, N, mode);
     CHECK_ERROR();
