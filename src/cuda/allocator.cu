@@ -1,19 +1,8 @@
 #include <iostream>
-#include <cuda_runtime.h>
-#include <cuda.h>
+#include "operator/cuda_helper.cuh"
 #include "gpu_buffer_manager.hpp"
 
 namespace duckdb {
-
-#define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
-inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true)
-{
-   if (code != cudaSuccess) 
-   {
-      fprintf(stderr,"GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
-      if (abort) exit(code);
-   }
-}
 
 template int*
 callCudaMalloc<int>(size_t size, int gpu);

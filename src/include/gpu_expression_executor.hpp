@@ -8,6 +8,7 @@ namespace duckdb {
 
 // Declaration of the CUDA kernel
 template <typename T> void binaryExpression(T *a, T *b, T *result, uint64_t N, int op_mode);
+template <typename T> void comparisonConstantExpression(T *a, T b, uint64_t* &row_ids, uint64_t* &count, uint64_t N, int op_mode);
 
 class GPUExpressionExecutor {
 public:

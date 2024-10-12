@@ -13,6 +13,12 @@
 
 namespace duckdb {
 
+template <typename T>
+void probeHashTable(uint64_t *keys, unsigned long long* ht, uint64_t ht_len, uint64_t* &row_ids_left, uint64_t* &row_ids_right, uint64_t* &count, uint64_t N, int mode);
+
+template <typename T>
+void buildHashTable(uint64_t *keys, unsigned long long* ht, uint64_t ht_len, uint64_t N, int mode);
+
 class GPUPhysicalHashJoin : public GPUPhysicalOperator {
 public:
 	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::HASH_JOIN;
@@ -93,7 +99,8 @@ public:
 		return true;
 	}
 
-	uint8_t* gpu_hash_table;
+	mutable unsigned long long* gpu_hash_table;
+	mutable uint64_t ht_len;
 
 	GPUIntermediateRelation* hash_table_result;
 

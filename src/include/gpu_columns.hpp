@@ -43,6 +43,7 @@ public:
     string name;
     DataWrapper data_wrapper;
     uint64_t* row_ids;
+    size_t row_id_count;
     size_t column_length;
 };
 

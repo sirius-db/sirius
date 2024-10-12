@@ -4,7 +4,7 @@
 namespace duckdb {
 
 template <typename T, int B, int I>
-__global__ void comparison_expression(const T *a, const T *b, uint64_t *result, unsigned long long* count, uint64_t N, int compare_mode) {
+__global__ void comparison_expression(const T *a, const T *b, uint64_t *row_ids, unsigned long long* count, uint64_t N, int compare_mode, int is_count) {
 
     typedef cub::BlockScan<int, B> BlockScanInt;
 
@@ -65,19 +65,21 @@ __global__ void comparison_expression(const T *a, const T *b, uint64_t *result, 
 
     __syncthreads();
 
+    if (is_count) return;
+
     #pragma unroll
     for (int ITEM = 0; ITEM < I; ++ITEM) {
         if (threadIdx.x + ITEM * B < num_tile_items) {
             if(selection_flags[ITEM]) {
                 uint64_t offset = block_off + c_t_count++;
-                result[offset] = blockIdx.x * tile_size + threadIdx.x + ITEM * B;
+                row_ids[offset] = tile_offset + threadIdx.x + ITEM * B;
             }
         }
     }
 }
 
 template <typename T, int B, int I>
-__global__ void comparison_constant_expression(const T *a, const T b, uint64_t *result, unsigned long long* count, uint64_t N, int compare_mode) {
+__global__ void comparison_constant_expression(const T *a, const T b, uint64_t *row_ids, unsigned long long* count, uint64_t N, int compare_mode, int is_count) {
 
     typedef cub::BlockScan<int, B> BlockScanInt;
 
@@ -121,7 +123,9 @@ __global__ void comparison_constant_expression(const T *a, const T b, uint64_t *
             } else {
                 cudaAssert(0);
             }
-            if(selection_flags[ITEM]) t_count++;
+            if(selection_flags[ITEM]) {
+                t_count++;
+            }
         }
     }
 
@@ -135,37 +139,70 @@ __global__ void comparison_constant_expression(const T *a, const T b, uint64_t *
 
     __syncthreads();
 
+    if (is_count) return;
+
     #pragma unroll
     for (int ITEM = 0; ITEM < I; ++ITEM) {
         if (threadIdx.x + ITEM * B < num_tile_items) {
             if(selection_flags[ITEM]) {
                 uint64_t offset = block_off + c_t_count++;
-                result[offset] = blockIdx.x * tile_size + threadIdx.x + ITEM * B;
+                row_ids[offset] = tile_offset + threadIdx.x + ITEM * B;
             }
         }
     }
 }
 
 template
-__global__ void comparison_expression<int, BLOCK_THREADS, ITEMS_PER_THREAD>(const int *a, const int *b, uint64_t *result, unsigned long long* count, uint64_t N, int compare_mode);
+__global__ void comparison_expression<int, BLOCK_THREADS, ITEMS_PER_THREAD>(const int *a, const int *b, uint64_t *row_ids, unsigned long long* count, uint64_t N, int compare_mode, int is_count);
 template
-__global__ void comparison_expression<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD>(const uint64_t *a, const uint64_t *b, uint64_t *result, unsigned long long* count, uint64_t N, int compare_mode);
+__global__ void comparison_expression<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD>(const uint64_t *a, const uint64_t *b, uint64_t *row_ids, unsigned long long* count, uint64_t N, int compare_mode, int is_count);
 template
-__global__ void comparison_expression<float, BLOCK_THREADS, ITEMS_PER_THREAD>(const float *a, const float *b, uint64_t *result, unsigned long long* count, uint64_t N, int compare_mode);
+__global__ void comparison_expression<float, BLOCK_THREADS, ITEMS_PER_THREAD>(const float *a, const float *b, uint64_t *row_ids, unsigned long long* count, uint64_t N, int compare_mode, int is_count);
 template
-__global__ void comparison_expression<double, BLOCK_THREADS, ITEMS_PER_THREAD>(const double *a, const double *b, uint64_t *result, unsigned long long* count, uint64_t N, int compare_mode);
+__global__ void comparison_expression<double, BLOCK_THREADS, ITEMS_PER_THREAD>(const double *a, const double *b, uint64_t *row_ids, unsigned long long* count, uint64_t N, int compare_mode, int is_count);
 template
-__global__ void comparison_expression<uint8_t, BLOCK_THREADS, ITEMS_PER_THREAD>(const uint8_t *a, const uint8_t *b, uint64_t *result, unsigned long long* count, uint64_t N, int compare_mode);
+__global__ void comparison_expression<uint8_t, BLOCK_THREADS, ITEMS_PER_THREAD>(const uint8_t *a, const uint8_t *b, uint64_t *row_ids, unsigned long long* count, uint64_t N, int compare_mode, int is_count);
 
 template
-__global__ void comparison_constant_expression<int, BLOCK_THREADS, ITEMS_PER_THREAD>(const int *a, const int b, uint64_t *result, unsigned long long* count, uint64_t N, int compare_mode);
+__global__ void comparison_constant_expression<int, BLOCK_THREADS, ITEMS_PER_THREAD>(const int *a, const int b, uint64_t *row_ids, unsigned long long* count, uint64_t N, int compare_mode, int is_count);
+// template
+// __global__ void comparison_constant_expression<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD>(const uint64_t *a, const uint64_t b, uint64_t *row_ids, unsigned long long* count, uint64_t N, int compare_mode, int is_count);
+// template
+// __global__ void comparison_constant_expression<float, BLOCK_THREADS, ITEMS_PER_THREAD>(const float *a, const float b, uint64_t *row_ids, unsigned long long* count, uint64_t N, int compare_mode, int is_count);
+// template
+// __global__ void comparison_constant_expression<double, BLOCK_THREADS, ITEMS_PER_THREAD>(const double *a, const double b, uint64_t *row_ids, unsigned long long* count, uint64_t N, int compare_mode, int is_count);
+// template
+// __global__ void comparison_constant_expression<uint8_t, BLOCK_THREADS, ITEMS_PER_THREAD>(const uint8_t *a, const uint8_t b, uint64_t *row_ids, unsigned long long* count, uint64_t N, int compare_mode, int is_count);
+
+
+template <typename T>
+void comparisonConstantExpression(T *a, T b, uint64_t* &row_ids, uint64_t* &count, uint64_t N, int op_mode) {
+    // printf("Launching Binary Expression Kernel\n");
+    cudaMemset(count, 0, sizeof(uint64_t));
+    int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
+    comparison_constant_expression<T, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(a, b, row_ids, (unsigned long long*) count, N, op_mode, 1);
+    CHECK_ERROR();
+    GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+    uint64_t* h_count = new uint64_t[1];
+    cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+    row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
+    cudaMemset(count, 0, sizeof(uint64_t));
+    comparison_constant_expression<T, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(a, b, row_ids, (unsigned long long*) count, N, op_mode, 0);
+    CHECK_ERROR();
+    cudaDeviceSynchronize();
+    count = h_count;
+    printf("Count: %lu\n", h_count[0]);
+}
+
 template
-__global__ void comparison_constant_expression<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD>(const uint64_t *a, const uint64_t b, uint64_t *result, unsigned long long* count, uint64_t N, int compare_mode);
+void comparisonConstantExpression<int>(int *a, int b, uint64_t* &row_ids, uint64_t* &count, uint64_t N, int op_mode);
 template
-__global__ void comparison_constant_expression<float, BLOCK_THREADS, ITEMS_PER_THREAD>(const float *a, const float b, uint64_t *result, unsigned long long* count, uint64_t N, int compare_mode);
-template
-__global__ void comparison_constant_expression<double, BLOCK_THREADS, ITEMS_PER_THREAD>(const double *a, const double b, uint64_t *result, unsigned long long* count, uint64_t N, int compare_mode);
-template
-__global__ void comparison_constant_expression<uint8_t, BLOCK_THREADS, ITEMS_PER_THREAD>(const uint8_t *a, const uint8_t b, uint64_t *result, unsigned long long* count, uint64_t N, int compare_mode);
+void comparisonConstantExpression<uint64_t>(uint64_t *a, uint64_t b, uint64_t* &row_ids, uint64_t* &count, uint64_t N, int op_mode);
+// template
+// void comparisonConstantExpression<float>(float *a, float b, uint64_t* &row_ids, uint64_t* &count, uint64_t N, int op_mode);
+// template
+// void comparisonConstantExpression<double>(double *a, double b, uint64_t* &row_ids, uint64_t* &count, uint64_t N, int op_mode);
+// template
+// void comparisonConstantExpression<uint8_t>(uint8_t *a, uint8_t b, uint64_t* &row_ids, uint64_t* &count, uint64_t N, int op_mode);
 
 } // namespace duckdb

@@ -5,6 +5,7 @@
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/common/extra_operator_info.hpp"
+#include "gpu_expression_executor.hpp"
 
 namespace duckdb {
 

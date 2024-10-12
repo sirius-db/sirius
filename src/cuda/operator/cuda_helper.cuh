@@ -5,6 +5,9 @@
 #include <cuda.h>
 #include <curand.h>
 #include <cub/cub.cuh>
+#include <thrust/sort.h>
+#include <thrust/reduce.h>
+#include <thrust/device_vector.h>
 #include "gpu_buffer_manager.hpp"
 
 #define CUB_STDERR

@@ -1,8 +1,9 @@
-#include "gpu_physical_hash_join.hpp"
+#include "operator/gpu_physical_hash_join.hpp"
 #include "gpu_pipeline.hpp"
 #include "gpu_meta_pipeline.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/common/enums/physical_operator_type.hpp"
+#include "gpu_buffer_manager.hpp"
 
 namespace duckdb {
 
@@ -100,6 +101,7 @@ GPUPhysicalHashJoin::GetData(GPUIntermediateRelation &output_relation) const {
 		throw InvalidInputException("Get data not supported for this join type");
 	}
 
+	throw NotImplementedException("Not implemented yet");
 	for (idx_t i = 0; i < rhs_output_columns.size(); i++) {
 		const auto rhs_col = rhs_output_columns[i];
 		printf("Writing hash_table column %ld to column %ld\n", i, rhs_col);
@@ -148,20 +150,50 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 		throw InvalidInputException("Unsupported join type");
 	}
 
+	GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+	uint64_t* probe_key = nullptr;
+	uint64_t size;
+	uint64_t* count;
+	uint64_t* row_ids_left = nullptr;
+	uint64_t* row_ids_right = nullptr;
+	if (conditions.size() > 1) throw NotImplementedException("Multiple conditions not supported yet");
+
 	for (idx_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
 		auto &condition = conditions[cond_idx];
         auto join_key_index = condition.left->Cast<BoundReferenceExpression>().index;
         printf("Reading join key for probing hash table from index %ld\n", join_key_index);
         input_relation.checkLateMaterialization(join_key_index);
+		if (input_relation.checkLateMaterialization(join_key_index)) {
+			uint64_t* temp = reinterpret_cast<uint64_t*> (input_relation.columns[join_key_index]->data_wrapper.data);
+			uint64_t* row_ids_input = reinterpret_cast<uint64_t*> (input_relation.columns[join_key_index]->row_ids);
+			probe_key = gpuBufferManager->customCudaMalloc<uint64_t>(input_relation.columns[join_key_index]->row_id_count, 0, 0);
+			materializeExpression<uint64_t>(temp, probe_key, row_ids_input, input_relation.columns[join_key_index]->row_id_count);
+			size = input_relation.columns[join_key_index]->row_id_count;
+		} else {
+			probe_key = reinterpret_cast<uint64_t*> (input_relation.columns[join_key_index]->data_wrapper.data);
+			size = input_relation.columns[join_key_index]->column_length;
+		}
+		count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+		probeHashTable<uint64_t>(probe_key, gpu_hash_table, ht_len, row_ids_left, row_ids_right, count, size, 0);
 	}
     printf("Probing hash table\n");
 	if (join_type == JoinType::SEMI || join_type == JoinType::ANTI || join_type == JoinType::MARK || join_type == JoinType::INNER || join_type == JoinType::OUTER || join_type == JoinType::RIGHT || join_type == JoinType::LEFT) {
 		printf("Writing row IDs from LHS to output relation\n");
-		uint64_t* left_row_ids = new uint64_t[1];
+		// uint64_t* left_row_ids = new uint64_t[1];
 		for (idx_t i = 0; i < input_relation.column_count; i++) {
 			printf("Passing column idx %ld from LHS (late materialized) to idx %ld in output relation\n", i, i);
 			output_relation.columns[i] = input_relation.columns[i];
-			output_relation.columns[i]->row_ids = left_row_ids;
+			// output_relation.columns[i]->row_ids = left_row_ids;
+            if (row_ids_left) {
+                if (input_relation.columns[i]->row_ids == nullptr) {
+                    output_relation.columns[i]->row_ids = row_ids_left;
+                } else {
+                    uint64_t* row_ids_input = reinterpret_cast<uint64_t*> (input_relation.columns[i]->row_ids);
+                    uint64_t* new_row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(count[0], 0, 0);
+                    materializeExpression<uint64_t>(row_ids_input, new_row_ids, row_ids_left, count[0]);
+                    output_relation.columns[i]->row_ids = new_row_ids;
+                }
+            }
 		}
 	}
 
@@ -179,7 +211,17 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 			const auto output_col_idx = rhs_output_columns[i];
 			printf("Passing column idx %ld from RHS (late materialized) to idx %ld in output relation\n", output_col_idx, input_relation.column_count + output_col_idx);
 			output_relation.columns[input_relation.column_count + output_col_idx] = hash_table_result->columns[output_col_idx];
-			output_relation.columns[input_relation.column_count + output_col_idx]->row_ids = right_row_ids;
+			// output_relation.columns[input_relation.column_count + output_col_idx]->row_ids = right_row_ids;
+            if (row_ids_right) {
+                if (hash_table_result->columns[output_col_idx]->row_ids == nullptr) {
+                    output_relation.columns[input_relation.column_count + output_col_idx]->row_ids = row_ids_right;
+                } else {
+                    uint64_t* row_ids_input = reinterpret_cast<uint64_t*> (hash_table_result->columns[output_col_idx]->row_ids);
+                    uint64_t* new_row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(count[0], 0, 0);
+                    materializeExpression<uint64_t>(row_ids_input, new_row_ids, row_ids_right, count[0]);
+                    output_relation.columns[input_relation.column_count + output_col_idx]->row_ids = new_row_ids;
+                }
+            }
 		}
 	} else if (join_type == JoinType::RIGHT_SEMI || join_type == JoinType::RIGHT_ANTI) {
 		printf("Writing row IDs from RHS to output relation\n");
@@ -209,11 +251,32 @@ GPUPhysicalHashJoin::Sink(GPUIntermediateRelation &input_relation) const {
 	// for (auto col : input_relation.columns) {
 	// 	printf("input relation column size %d\n", col->column_length);
 	// }
+
+	GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+	uint64_t* build_key = nullptr;
+	uint64_t size;
+	if (conditions.size() > 1) throw NotImplementedException("Multiple conditions not supported yet");
+
 	for (idx_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
 		auto &condition = conditions[cond_idx];
         auto join_key_index = condition.right->Cast<BoundReferenceExpression>().index;
-        printf("Reading join key for building hash table from index %ld\n", join_key_index);
-        input_relation.checkLateMaterialization(join_key_index);
+        // printf("Reading join key for building hash table from index %ld\n", join_key_index);
+        // input_relation.checkLateMaterialization(join_key_index);
+
+		if (input_relation.checkLateMaterialization(join_key_index)) {
+			uint64_t* temp = reinterpret_cast<uint64_t*> (input_relation.columns[join_key_index]->data_wrapper.data);
+			uint64_t* row_ids_input = reinterpret_cast<uint64_t*> (input_relation.columns[join_key_index]->row_ids);
+			build_key = gpuBufferManager->customCudaMalloc<uint64_t>(input_relation.columns[join_key_index]->row_id_count, 0, 0);
+			materializeExpression<uint64_t>(temp, build_key, row_ids_input, input_relation.columns[join_key_index]->row_id_count);
+			size = input_relation.columns[join_key_index]->row_id_count;
+		} else {
+			build_key = reinterpret_cast<uint64_t*> (input_relation.columns[join_key_index]->data_wrapper.data);
+			size = input_relation.columns[join_key_index]->column_length;
+		}
+
+		unsigned long long* test = (unsigned long long*) gpuBufferManager->customCudaMalloc<uint64_t>(size * 2 * 2, 0, 0);
+		uint64_t ht_len = size * 2;
+		buildHashTable<uint64_t>(build_key, test, ht_len, size, 0);
 	}
 
 	int right_idx = 0;

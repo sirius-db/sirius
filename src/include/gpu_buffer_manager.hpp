@@ -13,6 +13,12 @@ template <typename T> T* callCudaMalloc(size_t size, int gpu);
 template <typename T> void callCudaFree(T* ptr, int gpu);
 template <typename T> void callCudaMemcpyHostToDevice(T* dest, T* src, size_t size, int gpu);
 template <typename T> void callCudaMemcpyDeviceToHost(T* dest, T* src, size_t size, int gpu);
+template <typename T> void materializeExpression(const T *a, T* result, uint64_t *row_ids, uint64_t N);
+
+struct pointer_and_key {
+	uint64_t* pointer;
+	uint64_t num_key;
+};
 
 // Currently a singleton class, would not work for multiple GPUs
 class GPUBufferManager {
