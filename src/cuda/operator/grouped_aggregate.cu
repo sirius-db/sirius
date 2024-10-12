@@ -148,6 +148,8 @@ void groupedAggregate(T **keys, V *aggregate, uint64_t* count, uint64_t N, uint6
     thrust::device_vector<V> aggregate_columns(aggregate, aggregate + N);
     thrust::sort(sorted_keys.begin(), sorted_keys.end());
 
+    //have to do sort_by_key instead of just sort
+
     // // test2<<<1, 1>>>(keys[0], N);
     // // test<<<1, 1>>>(raw_ptr, N);
 
@@ -155,14 +157,18 @@ void groupedAggregate(T **keys, V *aggregate, uint64_t* count, uint64_t N, uint6
     printf("Launching Grouped Aggregate Kernel\n");
     thrust::device_vector<sort_keys_type> group_by_rows(group_reduce, group_reduce + N);
     thrust::device_vector<V> agg_out(aggregate_output, aggregate_output + N);
+    thrust::equal_to<sort_keys_type> binary_pred;
+    thrust::plus<V> binary_op;
 
     CHECK_ERROR();
-    auto reduce_result = thrust::reduce_by_key( 
+    auto reduce_result = thrust::reduce_by_key(thrust::device, 
                                 sorted_keys.begin(), 
                                 sorted_keys.end(),
                                 aggregate_columns.begin(), 
                                 group_by_rows.begin(), 
-                                agg_out.begin());
+                                agg_out.begin(),
+                                binary_pred,
+                                binary_op);
 
     CHECK_ERROR();
 
@@ -172,11 +178,11 @@ void groupedAggregate(T **keys, V *aggregate, uint64_t* count, uint64_t N, uint6
 
     count[0] = reduce_result.second - agg_out.begin();
 
-    aggregate = aggregate_output;
+    aggregate = thrust::raw_pointer_cast(agg_out.data());
 
     CHECK_ERROR();
     cudaDeviceSynchronize();
-    auto raw_sorted_keys = thrust::raw_pointer_cast(sorted_keys.data());
+    auto raw_sorted_keys = thrust::raw_pointer_cast(group_by_rows.data());
     rows_to_columns<T, BLOCK_THREADS, ITEMS_PER_THREAD><<<(count[0] + tile_items - 1)/tile_items, BLOCK_THREADS>>>(raw_sorted_keys, keys_dev, count[0], num_keys);
 
     CHECK_ERROR();

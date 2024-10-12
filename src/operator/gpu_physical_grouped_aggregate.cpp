@@ -214,14 +214,14 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 	// Reading groupby columns based on the grouping set
 	for (idx_t i = 0; i < groupings.size(); i++) {
 		for (int idx = 0; idx < grouping_sets[i].size(); idx++) {
-			group_by_result->columns[idx] = new GPUColumn(size, ColumnType::INT64, reinterpret_cast<uint8_t*>(group_keys[idx]));
+			group_by_result->columns[idx] = new GPUColumn(count[0], ColumnType::INT64, reinterpret_cast<uint8_t*>(group_keys[idx]));
 			group_by_result->columns[idx]->row_ids = nullptr;
 			group_by_result->columns[idx]->row_id_count = 0;
 		}
 	}
 
 	for (int aggr_idx = 0; aggr_idx < aggregates.size(); aggr_idx++) {
-		group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] = new GPUColumn(size, ColumnType::FLOAT64, reinterpret_cast<uint8_t*>(aggregate_vals));
+		group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] = new GPUColumn(count[0], ColumnType::FLOAT64, reinterpret_cast<uint8_t*>(aggregate_vals));
 		group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx]->row_ids = nullptr;
 		group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx]->row_id_count = 0;
 	}

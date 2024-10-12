@@ -274,9 +274,9 @@ GPUPhysicalHashJoin::Sink(GPUIntermediateRelation &input_relation) const {
 			size = input_relation.columns[join_key_index]->column_length;
 		}
 
-		unsigned long long* test = (unsigned long long*) gpuBufferManager->customCudaMalloc<uint64_t>(size * 2 * 2, 0, 0);
-		uint64_t ht_len = size * 2;
-		buildHashTable<uint64_t>(build_key, test, ht_len, size, 0);
+		gpu_hash_table = (unsigned long long*) gpuBufferManager->customCudaMalloc<uint64_t>(size * 2 * 2, 0, 0);
+		ht_len = size * 2;
+		buildHashTable<uint64_t>(build_key, gpu_hash_table, ht_len, size, 0);
 	}
 
 	int right_idx = 0;
