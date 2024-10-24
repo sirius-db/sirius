@@ -49,7 +49,7 @@ GPUPhysicalHashJoin::GPUPhysicalHashJoin(LogicalOperator &op, unique_ptr<GPUPhys
 
 	// For ANTI, SEMI and MARK join, we only need to store the keys, so for these the payload/RHS types are empty
 	if (join_type == JoinType::ANTI || join_type == JoinType::SEMI || join_type == JoinType::MARK) {
-		hash_table_result = new GPUIntermediateRelation(0, build_columns_in_conditions.size());
+		hash_table_result = new GPUIntermediateRelation(build_columns_in_conditions.size());
 		return;
 	}
 
@@ -81,7 +81,7 @@ GPUPhysicalHashJoin::GPUPhysicalHashJoin(LogicalOperator &op, unique_ptr<GPUPhys
 		rhs_output_types.push_back(rhs_col_type);
 	}
 
-	hash_table_result = new GPUIntermediateRelation(0, rhs_output_columns.size());
+	hash_table_result = new GPUIntermediateRelation(rhs_output_columns.size());
 
 };
 
@@ -174,9 +174,11 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 			size = input_relation.columns[join_key_index]->column_length;
 		}
 		count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+		printf("Probing hash table\n");
 		probeHashTable<uint64_t>(probe_key, gpu_hash_table, ht_len, row_ids_left, row_ids_right, count, size, 0);
+		if (count[0] == 0) throw NotImplementedException("No match found");
 	}
-    printf("Probing hash table\n");
+    
 	if (join_type == JoinType::SEMI || join_type == JoinType::ANTI || join_type == JoinType::MARK || join_type == JoinType::INNER || join_type == JoinType::OUTER || join_type == JoinType::RIGHT || join_type == JoinType::LEFT) {
 		printf("Writing row IDs from LHS to output relation\n");
 		// uint64_t* left_row_ids = new uint64_t[1];
@@ -187,11 +189,13 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
             if (row_ids_left) {
                 if (input_relation.columns[i]->row_ids == nullptr) {
                     output_relation.columns[i]->row_ids = row_ids_left;
+					output_relation.columns[i]->row_id_count = count[0];
                 } else {
                     uint64_t* row_ids_input = reinterpret_cast<uint64_t*> (input_relation.columns[i]->row_ids);
                     uint64_t* new_row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(count[0], 0, 0);
                     materializeExpression<uint64_t>(row_ids_input, new_row_ids, row_ids_left, count[0]);
                     output_relation.columns[i]->row_ids = new_row_ids;
+					output_relation.columns[i]->row_id_count = count[0];
                 }
             }
 		}
@@ -215,11 +219,13 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
             if (row_ids_right) {
                 if (hash_table_result->columns[output_col_idx]->row_ids == nullptr) {
                     output_relation.columns[input_relation.column_count + output_col_idx]->row_ids = row_ids_right;
+					output_relation.columns[input_relation.column_count + output_col_idx]->row_id_count = count[0];
                 } else {
                     uint64_t* row_ids_input = reinterpret_cast<uint64_t*> (hash_table_result->columns[output_col_idx]->row_ids);
                     uint64_t* new_row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(count[0], 0, 0);
                     materializeExpression<uint64_t>(row_ids_input, new_row_ids, row_ids_right, count[0]);
                     output_relation.columns[input_relation.column_count + output_col_idx]->row_ids = new_row_ids;
+					output_relation.columns[input_relation.column_count + output_col_idx]->row_id_count = count[0];
                 }
             }
 		}
@@ -232,6 +238,7 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 			printf("Passing column idx %ld from RHS (late materialized) to idx %ld in output relation\n", output_col_idx, output_col_idx);
 			output_relation.columns[output_col_idx] = hash_table_result->columns[output_col_idx];
 			output_relation.columns[output_col_idx]->row_ids = right_row_ids;
+			output_relation.columns[output_col_idx]->row_id_count = count[0];
 		}
 	}
 

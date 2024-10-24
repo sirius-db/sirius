@@ -75,7 +75,8 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
                 uint64_t* a = reinterpret_cast<uint64_t*> (table->columns[column_ids[column_index]]->data_wrapper.data);
                 uint64_t b = filter_constant.constant.GetValue<uint64_t>();
                 //TODO: we have to handle the compare_mode here
-                comparisonConstantExpression<uint64_t>(a, b, row_ids, count, (uint64_t) size, 1);
+                comparisonConstantExpression<uint64_t>(a, b, row_ids, count, (uint64_t) size, 0);
+                if (count[0] == 0) throw NotImplementedException("No match found");
               } else if (filter_inside->filter_type == TableFilterType::IS_NOT_NULL) {
                 continue;
               } else {
@@ -97,12 +98,10 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
         // output_relation.columns[index]->row_ids = new uint64_t[1];
         output_relation.length = table->length;
         if (row_ids) {
-          printf("Row IDs are not null\n");
           output_relation.columns[index]->row_ids = row_ids; 
         }
         if (count) {
           output_relation.columns[index]->row_id_count = count[0];
-          printf("Count is %ld\n", count[0]);
         }
         // printf("%s %d %d\n", output_relation.columns[index]->name.c_str(), output_relation.columns[index]->column_length, output_relation.length);
         index++;

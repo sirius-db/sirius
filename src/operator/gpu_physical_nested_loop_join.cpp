@@ -44,7 +44,7 @@ GPUPhysicalNestedLoopJoin::GPUPhysicalNestedLoopJoin(LogicalOperator &op, unique
     //     }
     // }
 
-    right_temp_data = new GPUIntermediateRelation(0, children[1]->GetTypes().size());
+    right_temp_data = new GPUIntermediateRelation(children[1]->GetTypes().size());
 
 }
 

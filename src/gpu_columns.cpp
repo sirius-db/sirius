@@ -68,8 +68,17 @@ GPUColumn::GPUColumn(string _name, size_t _column_length, ColumnType type, uint8
 // }
 
 
-GPUIntermediateRelation::GPUIntermediateRelation(size_t length, size_t column_count) :
-     length(length), column_count(column_count) {
+// GPUIntermediateRelation::GPUIntermediateRelation(size_t length, size_t column_count) :
+//         length(length), column_count(column_count) {
+//     column_names.resize(column_count);
+//     columns.resize(column_count);
+//     for (int i = 0; i < column_count; i++) {
+//         columns[i] = nullptr;
+//     }
+// }
+
+GPUIntermediateRelation::GPUIntermediateRelation(size_t column_count) :
+        column_count(column_count) {
     column_names.resize(column_count);
     columns.resize(column_count);
     for (int i = 0; i < column_count; i++) {

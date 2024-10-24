@@ -10,7 +10,7 @@ GPUPhysicalUngroupedAggregate::GPUPhysicalUngroupedAggregate(vector<LogicalType>
       aggregates(std::move(expressions)) {
 
 	distinct_collection_info = DistinctAggregateCollectionInfo::Create(aggregates);
-	aggregation_result = new GPUIntermediateRelation(0, aggregates.size());
+	aggregation_result = new GPUIntermediateRelation(aggregates.size());
 	if (!distinct_collection_info) {
 		return;
 	}

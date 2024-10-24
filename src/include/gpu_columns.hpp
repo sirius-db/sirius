@@ -49,7 +49,8 @@ public:
 
 class GPUIntermediateRelation {
 public:
-    GPUIntermediateRelation(size_t length, size_t column_count);
+    // GPUIntermediateRelation(size_t length, size_t column_count);
+    GPUIntermediateRelation(size_t column_count);
     ~GPUIntermediateRelation(){};
     bool checkLateMaterialization(size_t idx);
 
