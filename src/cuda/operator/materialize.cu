@@ -64,11 +64,12 @@ template <typename T>
 void materializeExpression(T *a, T* result, uint64_t *row_ids, uint64_t N) {
     printf("Launching Materialize Kernel\n");
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
-    test<T><<<1, 1>>>(a, N);
-    test<uint64_t><<<1, 1>>>(row_ids, N);
+    // printf("N: %ld\n", N);
+    // test<T><<<1, 1>>>(a, N);
+    // test<uint64_t><<<1, 1>>>(row_ids, N);
     materialize_expression<T, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(a, result, row_ids, N);
     CHECK_ERROR();
-    test<T><<<1, 1>>>(result, N);
+    // test<T><<<1, 1>>>(result, N);
     cudaDeviceSynchronize();
 }
 

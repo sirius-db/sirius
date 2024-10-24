@@ -85,6 +85,15 @@ void GPUBufferManager::ResetBuffer() {
         gpuProcessingPointer[gpu] = 0;
     }
     cpuProcessingPointer = 0;
+    for (auto it = tables.begin(); it != tables.end(); it++) {
+        GPUIntermediateRelation* table = it->second;
+        for (int col = 0; col < table->columns.size(); col++) {
+            if (table->columns[col] != nullptr) {
+                table->columns[col]->row_ids = nullptr;
+                table->columns[col]->row_id_count = 0;
+            }
+        }
+    }
 }
 
 template <typename T>
@@ -293,7 +302,7 @@ GPUBufferManager::createTable(string up_table_name, size_t column_count) {
     //we will update the length later
     //check if table already exists
     if (tables.find(up_table_name) == tables.end()) {
-        GPUIntermediateRelation* table = new GPUIntermediateRelation(0, column_count);
+        GPUIntermediateRelation* table = new GPUIntermediateRelation(column_count);
         table->names = up_table_name;
         tables[up_table_name] = table;
     }

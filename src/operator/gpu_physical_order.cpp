@@ -8,7 +8,7 @@ GPUPhysicalOrder::GPUPhysicalOrder(vector<LogicalType> types, vector<BoundOrderB
     : GPUPhysicalOperator(PhysicalOperatorType::ORDER_BY, std::move(types), estimated_cardinality),
       orders(std::move(orders)), projections(std::move(projections)) {
 
-    sort_result = new GPUIntermediateRelation(0, projections.size());
+    sort_result = new GPUIntermediateRelation(projections.size());
 }
 
 // SourceResultType

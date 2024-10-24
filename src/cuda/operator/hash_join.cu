@@ -4,6 +4,7 @@
 
 namespace duckdb {
 
+//TODO: currently this probe does not support many to many join
 template <typename T, int B, int I>
 __global__ void probe(const uint64_t *keys, unsigned long long* ht, uint64_t ht_len, uint64_t *row_ids_left, uint64_t *row_ids_right, unsigned long long* count, uint64_t N, int mode, int is_count) {
 
@@ -60,6 +61,7 @@ __global__ void probe(const uint64_t *keys, unsigned long long* ht, uint64_t ht_
             }
             if (found) {
                 selection_flags[ITEM] = 1;
+                t_count++;
             }
         }
     }
@@ -70,7 +72,6 @@ __global__ void probe(const uint64_t *keys, unsigned long long* ht, uint64_t ht_
     BlockScanInt(temp_storage.scan).ExclusiveSum(t_count, c_t_count); //doing a prefix sum of all the previous threads in the block and store it to c_t_count
     if(threadIdx.x == blockDim.x - 1) { //if the last thread in the block, add the prefix sum of all the prev threads + sum of my threads to global variable total
         block_off = atomicAdd(count, (unsigned long long) t_count+c_t_count); //the previous value of total is gonna be assigned to block_off
-        // printf("Block Off: %ld\n", block_off);
     } //block_off does not need to be global (it's just need to be shared), because it will get the previous value from total which is global
 
     __syncthreads();
@@ -144,14 +145,13 @@ void probeHashTable(uint64_t *keys, unsigned long long* ht, uint64_t ht_len, uin
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
     cudaMemset(count, 0, sizeof(uint64_t));
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
-    // printf("size: %lu %lu\n", N, ht_len);
-    // test<<<1, 1>>>((uint64_t*) ht, N);
     CHECK_ERROR();
     probe<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(keys, ht, ht_len, row_ids_left, row_ids_right, (unsigned long long*) count, N, mode, 1);
     CHECK_ERROR();
     cudaDeviceSynchronize();
     uint64_t* h_count = new uint64_t [1];
     cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+    assert(h_count[0] > 0);
     row_ids_left = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
     row_ids_right = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
     cudaMemset(count, 0, sizeof(uint64_t));

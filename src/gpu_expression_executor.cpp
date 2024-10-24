@@ -76,6 +76,7 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
         count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
         uint64_t b = bound_ref2.value.GetValue<uint64_t>();
         comparisonConstantExpression<uint64_t>(a, b, comparison_idx, count, (uint64_t) size, 0);
+        if (count[0] == 0) throw NotImplementedException("No match found");
 		break;
 	} case ExpressionClass::BOUND_CONJUNCTION: {
         auto &bound_conjunction = expr.Cast<BoundConjunctionExpression>();
@@ -228,6 +229,8 @@ GPUExpressionExecutor::ProjectionRecursiveExpression(GPUIntermediateRelation& in
     if (depth == 0) {
         if (expr.expression_class == ExpressionClass::BOUND_REF) {
             output_relation.columns[output_idx] = input_relation.columns[expr.Cast<BoundReferenceExpression>().index];
+            printf("size = %ld\n", output_relation.columns[output_idx]->column_length);
+            printf("row ids count = %ld\n", output_relation.columns[output_idx]->row_id_count);
         } else {
             uint8_t* fake_data = new uint8_t[1];
             if (result) {

@@ -50,7 +50,6 @@ __global__ void comparison_expression(const T *a, const T *b, uint64_t *row_ids,
             } else {
                 cudaAssert(0);
             }
-            selection_flags[ITEM] = (items_a[ITEM] == items_b[ITEM]);
             if(selection_flags[ITEM]) t_count++;
         }
     }
@@ -109,6 +108,13 @@ __global__ void comparison_constant_expression(const T *a, const T b, uint64_t *
     for (int ITEM = 0; ITEM < I; ITEM++) {
         selection_flags[ITEM] = 0;
     }
+
+    // if (blockIdx.x == 0 && threadIdx.x == 0) {
+    //     for (uint64_t i = 0; i < 100; i++) {
+    //         printf("%ld ", a[i]);
+    //     }
+    //     printf("\n");
+    // }
 
     #pragma unroll
     for (int ITEM = 0; ITEM < I; ++ITEM) {

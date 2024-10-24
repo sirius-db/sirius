@@ -3,18 +3,9 @@
 #include <cuda.h>
 #include "communication.hpp"
 #include "gpu_buffer_manager.hpp"
+#include "operator/cuda_helper.cuh"
 
 namespace duckdb {
-
-#define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
-inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true)
-{
-   if (code != cudaSuccess) 
-   {
-      fprintf(stderr,"GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
-      if (abort) exit(code);
-   }
-}
 
 template void
 callCudaMemcpyHostToDevice<int>(int* dest, int* src, size_t size, int gpu);
@@ -61,6 +52,7 @@ void callCudaMemcpyDeviceToHost(T* dest, T* src, size_t size, int gpu) {
     printf("Send data to CPU\n");
     cudaSetDevice(gpu);
     gpuErrchk(cudaMemcpy(dest, src, size * sizeof(T), cudaMemcpyDeviceToHost));
+    CHECK_ERROR();
     gpuErrchk(cudaDeviceSynchronize());
     cudaSetDevice(0);
     printf("Done sending data to CPU\n");

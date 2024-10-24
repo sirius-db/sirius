@@ -65,7 +65,7 @@ void GPUExecutor::Execute() {
 
 			// auto chunk = make_uniq<DataChunk>();
 			// chunk->Initialize(Allocator::Get(context.client), prev_operator.GetTypes());
-			GPUIntermediateRelation* inter_rel = new GPUIntermediateRelation(0, prev_operator.GetTypes().size());
+			GPUIntermediateRelation* inter_rel = new GPUIntermediateRelation(prev_operator.GetTypes().size());
 			intermediate_relations.push_back(std::move(inter_rel));
 
 			// auto op_state = current_operator.GetOperatorState(context);
@@ -79,7 +79,7 @@ void GPUExecutor::Execute() {
 		}
 		// InitializeChunk(final_chunk);
 		auto &last_op = pipeline->operators.empty() ? *pipeline->source : pipeline->operators.back().get();
-		final_relation = new GPUIntermediateRelation(0, last_op.GetTypes().size());
+		final_relation = new GPUIntermediateRelation(last_op.GetTypes().size());
 
 		// auto thread_context = ThreadContext(context);
 		// auto exec_context = GPUExecutionContext(context, thread_context, pipeline.get());
