@@ -98,11 +98,13 @@ GPUPhysicalMaterializedCollector::FinalMaterializeInternal(GPUIntermediateRelati
 		T* data = reinterpret_cast<T*> (input_relation.columns[col]->data_wrapper.data);
 		uint64_t* row_ids = reinterpret_cast<uint64_t*> (input_relation.columns[col]->row_ids);
 		T* materialized = gpuBufferManager->customCudaMalloc<T>(input_relation.columns[col]->row_id_count, 0, 0);
-		printf("input_relation.columns[col]->row_id_count %d\n", input_relation.columns[col]->row_id_count);
+		// printf("input_relation.columns[col]->row_id_count %d\n", input_relation.columns[col]->row_id_count);
 		materializeExpression<T>(data, materialized, row_ids, input_relation.columns[col]->row_id_count);
 		output_relation.columns[col] = new GPUColumn(input_relation.columns[col]->row_id_count, input_relation.columns[col]->data_wrapper.type, reinterpret_cast<uint8_t*>(materialized));
 		output_relation.columns[col]->row_id_count = 0;
 		output_relation.columns[col]->row_ids = nullptr;
+	} else {
+		output_relation.columns[col] = input_relation.columns[col];
 	}
 }
 
@@ -112,25 +114,26 @@ GPUPhysicalMaterializedCollector::FinalMaterialize(GPUIntermediateRelation input
 	
 	switch (input_relation.columns[col]->data_wrapper.type) {
 	case ColumnType::INT64:
-		if (input_relation.checkLateMaterialization(col)) FinalMaterializeInternal<uint64_t>(input_relation, output_relation, col);
-		size_bytes = input_relation.columns[col]->column_length * sizeof(uint64_t);
+		FinalMaterializeInternal<uint64_t>(input_relation, output_relation, col);
+		size_bytes = output_relation.columns[col]->column_length * sizeof(uint64_t);
 		break;
 	case ColumnType::INT32:
-		if (input_relation.checkLateMaterialization(col)) FinalMaterializeInternal<int>(input_relation, output_relation, col);
-		size_bytes = input_relation.columns[col]->column_length * sizeof(int);
+		FinalMaterializeInternal<int>(input_relation, output_relation, col);
+		size_bytes = output_relation.columns[col]->column_length * sizeof(uint64_t);
 		break;
 	case ColumnType::FLOAT64:
-		if (input_relation.checkLateMaterialization(col)) FinalMaterializeInternal<double>(input_relation, output_relation, col);
-		size_bytes = input_relation.columns[col]->column_length * sizeof(double);
+		FinalMaterializeInternal<double>(input_relation, output_relation, col);
+		size_bytes = output_relation.columns[col]->column_length * sizeof(uint64_t);
 		break;
 	case ColumnType::FLOAT32:
-		if (input_relation.checkLateMaterialization(col)) FinalMaterializeInternal<float>(input_relation, output_relation, col);
-		size_bytes = input_relation.columns[col]->column_length * sizeof(float);
+		FinalMaterializeInternal<float>(input_relation, output_relation, col);
+		size_bytes = output_relation.columns[col]->column_length * sizeof(uint64_t);
 		break;
 	default:
 		throw NotImplementedException("Unsupported column type");
 	}
-	input_relation.length = input_relation.columns[col]->column_length;
+	// output_relation.length = output_relation.columns[col]->column_length;
+	printf("Final materialize size %d\n", size_bytes);
 	return size_bytes;
 }
 
@@ -179,41 +182,31 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 	size_t size_bytes = 0;
 	Allocator& allocator = Allocator::DefaultAllocator();
 	uint8_t** host_data = new uint8_t*[input_relation.columns.size()];
-	GPUIntermediateRelation output_relation(input_relation.columns.size());
-	// printf("size %d\n", size);
+	GPUIntermediateRelation materialized_relation(input_relation.columns.size());
 	for (int col = 0; col < input_relation.columns.size(); col++) {
-		// if (input_relation.columns[col]->column_length != input_relation.length) {
-		// 	throw InvalidInputException("Column length mismatch");
-		// }
-
 		// Final materialization
-		size_bytes = FinalMaterialize(input_relation, output_relation, col);
+		size_bytes = FinalMaterialize(input_relation, materialized_relation, col);
+		// printf("materialize row id count%ld\n", input_relation.columns[col]->row_id_count);
 		host_data[col] = allocator.AllocateData(size_bytes);
-		callCudaMemcpyDeviceToHost<uint8_t>(host_data[col], output_relation.columns[col]->data_wrapper.data, size_bytes, 0);
-		// for (int i = 2400; i < 2440; i++) {
-		// 	int* temp = reinterpret_cast<int*>(host_data[col]);
+		callCudaMemcpyDeviceToHost<uint8_t>(host_data[col], materialized_relation.columns[col]->data_wrapper.data, size_bytes, 0);
+		// for (int i = 0; i < 10; i++) {
+		// 	uint64_t* temp = reinterpret_cast<uint64_t*>(host_data[col]);
 		// 	printf("Data: %d\n", temp[i]);
 		// }
 	}
 
-	// collection = make_uniq<ColumnDataCollection>(Allocator::DefaultAllocator(), types);
 	ColumnDataAppendState append_state;
 	collection->InitializeAppend(append_state);
-	size_t total_vector = (output_relation.columns[0]->column_length + STANDARD_VECTOR_SIZE - 1) / STANDARD_VECTOR_SIZE;
+	size_t total_vector = (materialized_relation.columns[0]->column_length + STANDARD_VECTOR_SIZE - 1) / STANDARD_VECTOR_SIZE;
 	// printf("Total vector %d\n", total_vector);
-	size_t remaining = output_relation.columns[0]->column_length;
+	size_t remaining = materialized_relation.columns[0]->column_length;
 	for (int vec = 0; vec < total_vector; vec++) {
 		DataChunk chunk;
 		chunk.InitializeEmpty(types);
-		// printf("Types size %d\n", types.size());
-		for (int col = 0; col < output_relation.columns.size(); col++) {
-			// uint8_t* data = host_data[col] + vec * STANDARD_VECTOR_SIZE * sizeof(double);
-			// double* ptr = reinterpret_cast<double*>(host_data[0]);
-			// Vector vector(ColumnTypeToLogicalType(input_relation.columns[col]->data_wrapper.type), data);
-			Vector vector = rawDataToVector(host_data[col], vec, output_relation.columns[col]->data_wrapper.type);
+		for (int col = 0; col < materialized_relation.columns.size(); col++) {
+			Vector vector = rawDataToVector(host_data[col], vec, materialized_relation.columns[col]->data_wrapper.type);
 			chunk.data[col].Reference(vector);
 		}
-		// printf("Chunk size %d\n", chunk.size());
 		// printf("Chunk column count %d\n", chunk.ColumnCount());
 		// chunk.Print();
 		// printf("Remaining %d\n", remaining);
@@ -225,6 +218,7 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 		collection->Append(append_state, chunk);
 		remaining -= STANDARD_VECTOR_SIZE;
 	}
+	// printf("Finished\n");
 	return SinkResultType::FINISHED;
 }
 

@@ -19,6 +19,55 @@ GPUPhysicalTableScan::GPUPhysicalTableScan(vector<LogicalType> types, TableFunct
 // SourceResultType
 // GPUPhysicalTableScan::GetData(ExecutionContext &context, GPUIntermediateRelation &output_relation, OperatorSourceInput &input) const {
 
+template <typename T>
+void ResolveTypeComparisonConstantExpression (GPUColumn* column, uint64_t* &count, uint64_t* & row_ids, ConstantFilter filter_constant, ExpressionType expression_type) {
+    T* a = reinterpret_cast<T*> (column->data_wrapper.data);
+    T b = filter_constant.constant.GetValue<T>();
+    T c = 0;
+    size_t size = column->column_length;
+    switch (expression_type) {
+      case ExpressionType::COMPARE_EQUAL:
+        comparisonConstantExpression<T>(a, b, c, row_ids, count, size, 0);
+        break;
+      case ExpressionType::COMPARE_NOTEQUAL:
+        comparisonConstantExpression<T>(a, b, c, row_ids, count, size, 1);
+        break;
+      case ExpressionType::COMPARE_GREATERTHAN:
+        comparisonConstantExpression<T>(a, b, c, row_ids, count, size, 2);
+        break;
+      case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+        comparisonConstantExpression<T>(a, b, c, row_ids, count, size, 3);
+        break;
+      case ExpressionType::COMPARE_LESSTHAN:
+        comparisonConstantExpression<T>(a, b, c, row_ids, count, size, 4);
+        break;
+      case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+        comparisonConstantExpression<T>(a, b, c, row_ids, count, size, 5);
+        break;
+      default:
+        throw NotImplementedException("Comparison type not supported");
+    }
+}
+
+void HandleComparisonConstantExpression(GPUColumn* column, uint64_t* &count, uint64_t* &row_ids, ConstantFilter filter_constant, ExpressionType expression_type) {
+    switch(column->data_wrapper.type) {
+      case ColumnType::INT32:
+        ResolveTypeComparisonConstantExpression<int>(column, count, row_ids, filter_constant, expression_type);
+        break;
+      case ColumnType::INT64:
+        ResolveTypeComparisonConstantExpression<uint64_t>(column, count, row_ids, filter_constant, expression_type);
+        break;
+      case ColumnType::FLOAT32:
+        ResolveTypeComparisonConstantExpression<float>(column, count, row_ids, filter_constant, expression_type);
+        break;
+      case ColumnType::FLOAT64:
+        ResolveTypeComparisonConstantExpression<double>(column, count, row_ids, filter_constant, expression_type);
+        break;
+      default:
+        throw NotImplementedException("Unsupported column type");
+    }
+}
+
 SourceResultType
 GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
   if (output_relation.columns.size() != GetTypes().size()) throw InvalidInputException("Mismatched column count");
@@ -38,13 +87,13 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
             printf("Cached Column name: %s\n", table->column_names[i].c_str());
         }
         for (int col = 0; col < column_ids.size(); col++) {
-            printf("Finding column %s\n", names[column_ids[col]].c_str());
+            // printf("Finding column %s\n", names[column_ids[col]].c_str());
             auto column_it = find(table->column_names.begin(), table->column_names.end(), names[column_ids[col]]);
             if (column_it == table->column_names.end()) {
                 throw InvalidInputException("Column not found");
             } 
             auto column_name = table->column_names[column_ids[col]];
-            printf("column found %s\n", column_name.c_str());
+            printf("Column found %s\n", column_name.c_str());
             if (column_name != names[column_ids[col]]) {
                 throw InvalidInputException("Column name mismatch");
             }
@@ -61,21 +110,24 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
         auto &column_index = f.first;
         auto &filter = f.second;
         if (column_index < names.size()) {
-          printf("Reading filter column from index %ld\n", column_ids[column_index]);
-          printf("filter type %d\n", filter->filter_type);
+          // printf("Reading filter column from index %ld\n", column_ids[column_index]);
+          // printf("filter type %d\n", filter->filter_type);
           if (filter->filter_type == TableFilterType::CONJUNCTION_AND) {
             auto filter_pointer = filter.get();
             auto &filter_conjunction_and = filter_pointer->Cast<ConjunctionAndFilter>();
             for (auto &filter_inside : filter_conjunction_and.child_filters) {
               if (filter_inside->filter_type == TableFilterType::CONSTANT_COMPARISON) {
-                printf("Reading constant comparison filter\n");
+                // printf("Reading constant comparison filter\n");
                 auto filter_constant = filter_inside->Cast<ConstantFilter>();
+                ExpressionType expression_type = filter_constant.comparison_type;
                 size_t size = table->columns[column_ids[column_index]]->column_length;
                 count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
-                uint64_t* a = reinterpret_cast<uint64_t*> (table->columns[column_ids[column_index]]->data_wrapper.data);
-                uint64_t b = filter_constant.constant.GetValue<uint64_t>();
-                //TODO: we have to handle the compare_mode here
-                comparisonConstantExpression<uint64_t>(a, b, row_ids, count, (uint64_t) size, 0);
+                // uint64_t* a = reinterpret_cast<uint64_t*> (table->columns[column_ids[column_index]]->data_wrapper.data);
+                // uint64_t b = filter_constant.constant.GetValue<uint64_t>();
+                // //TODO: we have to handle the compare_mode here
+                // comparisonConstantExpression<uint64_t>(a, b, row_ids, count, (uint64_t) size, 0);
+                HandleComparisonConstantExpression(table->columns[column_ids[column_index]], count, row_ids, filter_constant, expression_type);
+                printf("Count %ld\n", count[0]);
                 if (count[0] == 0) throw NotImplementedException("No match found");
               } else if (filter_inside->filter_type == TableFilterType::IS_NOT_NULL) {
                 continue;
@@ -103,15 +155,8 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
         if (count) {
           output_relation.columns[index]->row_id_count = count[0];
         }
-        // printf("%s %d %d\n", output_relation.columns[index]->name.c_str(), output_relation.columns[index]->column_length, output_relation.length);
         index++;
     }
-    // for (auto col : table->columns) {
-    //   printf("hey table relation column size %d column name %s column type %d\n", col->column_length, col->name.c_str());
-    // }
-    // for (auto col : output_relation.columns) {
-    //   printf("hey source relation column size %d column name %s column type %d\n", col->column_length, col->name.c_str());
-    // }
     
     return SourceResultType::FINISHED;
 }

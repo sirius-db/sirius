@@ -44,9 +44,15 @@ __global__ void comparison_expression(const T *a, const T *b, uint64_t *row_ids,
             if (compare_mode == 0) {
                 selection_flags[ITEM] = (items_a[ITEM] == items_b[ITEM]);
             } else if (compare_mode == 1) {
-                selection_flags[ITEM] = (items_a[ITEM] > items_b[ITEM]);
+                selection_flags[ITEM] = (items_a[ITEM] != items_b[ITEM]);
             } else if (compare_mode == 2) {
+                selection_flags[ITEM] = (items_a[ITEM] > items_b[ITEM]);
+            } else if (compare_mode == 3) {
+                selection_flags[ITEM] = (items_a[ITEM] >= items_b[ITEM]);
+            } else if (compare_mode == 4) {
                 selection_flags[ITEM] = (items_a[ITEM] < items_b[ITEM]);
+            } else if (compare_mode == 5) {
+                selection_flags[ITEM] = (items_a[ITEM] <= items_b[ITEM]);
             } else {
                 cudaAssert(0);
             }
@@ -78,7 +84,7 @@ __global__ void comparison_expression(const T *a, const T *b, uint64_t *row_ids,
 }
 
 template <typename T, int B, int I>
-__global__ void comparison_constant_expression(const T *a, const T b, uint64_t *row_ids, unsigned long long* count, uint64_t N, int compare_mode, int is_count) {
+__global__ void comparison_constant_expression(const T *a, const T b, const T c, uint64_t *row_ids, unsigned long long* count, uint64_t N, int compare_mode, int is_count) {
 
     typedef cub::BlockScan<int, B> BlockScanInt;
 
@@ -123,9 +129,19 @@ __global__ void comparison_constant_expression(const T *a, const T b, uint64_t *
             if (compare_mode == 0) {
                 selection_flags[ITEM] = (items_a[ITEM] == b);
             } else if (compare_mode == 1) {
-                selection_flags[ITEM] = (items_a[ITEM] > b);
+                selection_flags[ITEM] = (items_a[ITEM] != b);
             } else if (compare_mode == 2) {
+                selection_flags[ITEM] = (items_a[ITEM] > b);
+            } else if (compare_mode == 3) {
+                selection_flags[ITEM] = (items_a[ITEM] >= b);
+            } else if (compare_mode == 4) {
                 selection_flags[ITEM] = (items_a[ITEM] < b);
+            } else if (compare_mode == 5) {
+                selection_flags[ITEM] = (items_a[ITEM] <= b);
+            } else if (compare_mode == 6) {
+                selection_flags[ITEM] = ((items_a[ITEM] >= b) && (items_a[ITEM] <= c));
+            } else if (compare_mode == 7) {
+                selection_flags[ITEM] = ((items_a[ITEM] < b) || (items_a[ITEM] > c));
             } else {
                 cudaAssert(0);
             }
@@ -170,30 +186,30 @@ template
 __global__ void comparison_expression<uint8_t, BLOCK_THREADS, ITEMS_PER_THREAD>(const uint8_t *a, const uint8_t *b, uint64_t *row_ids, unsigned long long* count, uint64_t N, int compare_mode, int is_count);
 
 template
-__global__ void comparison_constant_expression<int, BLOCK_THREADS, ITEMS_PER_THREAD>(const int *a, const int b, uint64_t *row_ids, unsigned long long* count, uint64_t N, int compare_mode, int is_count);
-// template
-// __global__ void comparison_constant_expression<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD>(const uint64_t *a, const uint64_t b, uint64_t *row_ids, unsigned long long* count, uint64_t N, int compare_mode, int is_count);
-// template
-// __global__ void comparison_constant_expression<float, BLOCK_THREADS, ITEMS_PER_THREAD>(const float *a, const float b, uint64_t *row_ids, unsigned long long* count, uint64_t N, int compare_mode, int is_count);
-// template
-// __global__ void comparison_constant_expression<double, BLOCK_THREADS, ITEMS_PER_THREAD>(const double *a, const double b, uint64_t *row_ids, unsigned long long* count, uint64_t N, int compare_mode, int is_count);
-// template
-// __global__ void comparison_constant_expression<uint8_t, BLOCK_THREADS, ITEMS_PER_THREAD>(const uint8_t *a, const uint8_t b, uint64_t *row_ids, unsigned long long* count, uint64_t N, int compare_mode, int is_count);
+__global__ void comparison_constant_expression<int, BLOCK_THREADS, ITEMS_PER_THREAD>(const int *a, const int b, const int c, uint64_t *row_ids, unsigned long long* count, uint64_t N, int compare_mode, int is_count);
+template
+__global__ void comparison_constant_expression<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD>(const uint64_t *a, const uint64_t b, const uint64_t c, uint64_t *row_ids, unsigned long long* count, uint64_t N, int compare_mode, int is_count);
+template
+__global__ void comparison_constant_expression<float, BLOCK_THREADS, ITEMS_PER_THREAD>(const float *a, const float b, const float c, uint64_t *row_ids, unsigned long long* count, uint64_t N, int compare_mode, int is_count);
+template
+__global__ void comparison_constant_expression<double, BLOCK_THREADS, ITEMS_PER_THREAD>(const double *a, const double b, const double c, uint64_t *row_ids, unsigned long long* count, uint64_t N, int compare_mode, int is_count);
+template
+__global__ void comparison_constant_expression<uint8_t, BLOCK_THREADS, ITEMS_PER_THREAD>(const uint8_t *a, const uint8_t b, const uint8_t c, uint64_t *row_ids, unsigned long long* count, uint64_t N, int compare_mode, int is_count);
 
 
 template <typename T>
-void comparisonConstantExpression(T *a, T b, uint64_t* &row_ids, uint64_t* &count, uint64_t N, int op_mode) {
-    // printf("Launching Binary Expression Kernel\n");
+void comparisonConstantExpression(T *a, T b, T c, uint64_t* &row_ids, uint64_t* &count, uint64_t N, int op_mode) {
+    printf("Launching Comparison Expression Kernel\n");
     cudaMemset(count, 0, sizeof(uint64_t));
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
-    comparison_constant_expression<T, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(a, b, row_ids, (unsigned long long*) count, N, op_mode, 1);
+    comparison_constant_expression<T, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(a, b, c, row_ids, (unsigned long long*) count, N, op_mode, 1);
     CHECK_ERROR();
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
     uint64_t* h_count = new uint64_t[1];
     cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
     row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
     cudaMemset(count, 0, sizeof(uint64_t));
-    comparison_constant_expression<T, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(a, b, row_ids, (unsigned long long*) count, N, op_mode, 0);
+    comparison_constant_expression<T, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(a, b, c, row_ids, (unsigned long long*) count, N, op_mode, 0);
     CHECK_ERROR();
     cudaDeviceSynchronize();
     count = h_count;
@@ -201,14 +217,14 @@ void comparisonConstantExpression(T *a, T b, uint64_t* &row_ids, uint64_t* &coun
 }
 
 template
-void comparisonConstantExpression<int>(int *a, int b, uint64_t* &row_ids, uint64_t* &count, uint64_t N, int op_mode);
+void comparisonConstantExpression<int>(int *a, int b, int c, uint64_t* &row_ids, uint64_t* &count, uint64_t N, int op_mode);
 template
-void comparisonConstantExpression<uint64_t>(uint64_t *a, uint64_t b, uint64_t* &row_ids, uint64_t* &count, uint64_t N, int op_mode);
-// template
-// void comparisonConstantExpression<float>(float *a, float b, uint64_t* &row_ids, uint64_t* &count, uint64_t N, int op_mode);
-// template
-// void comparisonConstantExpression<double>(double *a, double b, uint64_t* &row_ids, uint64_t* &count, uint64_t N, int op_mode);
-// template
-// void comparisonConstantExpression<uint8_t>(uint8_t *a, uint8_t b, uint64_t* &row_ids, uint64_t* &count, uint64_t N, int op_mode);
+void comparisonConstantExpression<uint64_t>(uint64_t *a, uint64_t b, uint64_t c, uint64_t* &row_ids, uint64_t* &count, uint64_t N, int op_mode);
+template
+void comparisonConstantExpression<float>(float *a, float b, float c, uint64_t* &row_ids, uint64_t* &count, uint64_t N, int op_mode);
+template
+void comparisonConstantExpression<double>(double *a, double b, double c, uint64_t* &row_ids, uint64_t* &count, uint64_t N, int op_mode);
+template
+void comparisonConstantExpression<uint8_t>(uint8_t *a, uint8_t b, uint8_t c, uint64_t* &row_ids, uint64_t* &count, uint64_t N, int op_mode);
 
 } // namespace duckdb
