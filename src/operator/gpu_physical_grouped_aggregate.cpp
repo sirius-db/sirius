@@ -210,7 +210,6 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 
 	uint64_t count[1];
 	groupedAggregate<uint64_t, double>(group_keys, aggregate_vals, count, size, num_group_keys);
-	printf("count %ld\n", count[0]);
 
 	// Reading groupby columns based on the grouping set
 	for (idx_t i = 0; i < groupings.size(); i++) {

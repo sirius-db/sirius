@@ -196,6 +196,7 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
                     materializeExpression<uint64_t>(row_ids_input, new_row_ids, row_ids_left, count[0]);
                     output_relation.columns[i]->row_ids = new_row_ids;
 					output_relation.columns[i]->row_id_count = count[0];
+					printf("row id count %ld\n", count[0]);
                 }
             }
 		}
@@ -226,6 +227,7 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
                     materializeExpression<uint64_t>(row_ids_input, new_row_ids, row_ids_right, count[0]);
                     output_relation.columns[input_relation.column_count + output_col_idx]->row_ids = new_row_ids;
 					output_relation.columns[input_relation.column_count + output_col_idx]->row_id_count = count[0];
+					printf("idx %d row id count %ld\n", input_relation.column_count + output_col_idx, count[0]);
                 }
             }
 		}

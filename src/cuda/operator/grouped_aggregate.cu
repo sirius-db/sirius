@@ -71,7 +71,6 @@ __global__ void rows_to_columns(sort_keys_type *row_keys, T** col_keys, uint64_t
         if (threadIdx.x + ITEM * B < num_tile_items) {
             uint64_t offset = tile_offset + threadIdx.x + ITEM * B;
             for (int i = 0; i < num_keys; i++) {
-                // col_keys[i][offset] = row_keys[offset * num_keys + i];
                 col_keys[i][offset] = row_keys[offset].keys[i];
             }
         }
@@ -199,7 +198,6 @@ template <typename T, typename V>
 void groupedAggregate(T **keys, V *&aggregate, uint64_t* count, uint64_t N, uint64_t num_keys) {
 
     printf("Launching Grouped Aggregate Kernel\n");
-    // test3<<<1, 1>>>(keys[0], N);
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 
     //allocate temp memory and copying keys
@@ -228,7 +226,6 @@ void groupedAggregate(T **keys, V *&aggregate, uint64_t* count, uint64_t N, uint
 
     //perform sort-based groupby
     thrust::device_vector<sort_keys_type> sorted_keys(materialized_temp, materialized_temp + N);
-    // thrust::device_vector<uint64_t> value_columns(row_sequence, row_sequence + N);
     thrust::sort(thrust::device, sorted_keys.begin(), sorted_keys.end());
     CHECK_ERROR();
 
@@ -250,11 +247,9 @@ void groupedAggregate(T **keys, V *&aggregate, uint64_t* count, uint64_t N, uint
     //perform reduce_by_key
     thrust::device_vector<sort_keys_type> group_by_rows(N);
     thrust::device_vector<V> agg_out(N);
-    // thrust::equal_to<sort_keys_type> binary_pred; thrust::plus<V> binary_op;
+    thrust::equal_to<sort_keys_type> binary_pred; thrust::plus<V> binary_op;
     V* raw_agg_out = thrust::raw_pointer_cast(agg_out.data());
     cudaMemset(raw_agg_out, 0, N * sizeof(V));
-    // sort_keys_type* raw_sorted_keys2 = thrust::raw_pointer_cast(sorted_keys.data());
-    // test<<<1, 1>>>(raw_agg_out, count[0]);
 
     CHECK_ERROR();
     auto reduce_result = thrust::reduce_by_key(thrust::device, 
@@ -262,7 +257,7 @@ void groupedAggregate(T **keys, V *&aggregate, uint64_t* count, uint64_t N, uint
                                 sorted_keys.end(),
                                 aggregate_columns.begin(), 
                                 group_by_rows.begin(), 
-                                agg_out.begin());
+                                agg_out.begin(), binary_pred, binary_op);
 
     count[0] = reduce_result.second - agg_out.begin();
 
@@ -274,6 +269,10 @@ void groupedAggregate(T **keys, V *&aggregate, uint64_t* count, uint64_t N, uint
 
     CHECK_ERROR();
     cudaDeviceSynchronize();
+
+    for (uint64_t i = 0; i < num_keys; i++) {
+        keys[i] = keys_temp + i * N;
+    }
 }
 
 template

@@ -111,6 +111,7 @@ GPUBufferManager::customCudaMalloc(size_t size, int gpu, bool caching) {
         } 
         return ptr;
     } else {
+        // printf("Allocating %d bytes\n", alloc);
         // printf("Current pointer %d\n", gpuProcessingPointer[gpu]);
         size_t start = __atomic_fetch_add(&gpuProcessingPointer[gpu], alloc, __ATOMIC_RELAXED);
         assert((start + alloc) < processing_size_per_gpu);

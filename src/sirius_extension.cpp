@@ -132,7 +132,7 @@ void SiriusExtension::GPUCachingFunction(ClientContext &context, TableFunctionIn
 
 	//get data in CPU buffer
 	string query = "SELECT " + data.column + " FROM " + data.table + ";";
-	cout << "Query: " << query << endl;
+	// cout << "Query: " << query << endl;
 	// string query = "SELECT l_orderkey FROM lineitem;";
 	auto cpu_res = data.conn->Query(query);
 	
@@ -141,14 +141,14 @@ void SiriusExtension::GPUCachingFunction(ClientContext &context, TableFunctionIn
 	//check if column exist in the catalog
 	//check if column already exist in the gpu buffer
 	auto &catalog_table = Catalog::GetCatalog(context, INVALID_CATALOG);
-	printf("creating table and column in GPU\n");
+	// printf("creating table and column in GPU\n");
 	data.gpuBufferManager->createTableAndColumnInGPU(catalog_table, context, data.table, data.column);
 
-	printf("allocating column buffer in CPU\n");
+	// printf("allocating column buffer in CPU\n");
 	DataWrapper buffered_data = data.gpuBufferManager->allocateColumnBufferInCPU(move(cpu_res));
 	// update the catalog in GPU buffer manager (adding tables/columns)
 
-	printf("caching data in GPU\n");
+	// printf("caching data in GPU\n");
 	data.gpuBufferManager->cacheDataInGPU(buffered_data, data.table, data.column, 0);  // Send data to GPU
 	// data.gpuBufferManager->Print();
 
@@ -214,11 +214,11 @@ void SiriusExtension::GPUProcessingFunction(ClientContext &context, TableFunctio
 	if (!data.res) {
 		// data.res = data.plan->Execute();
 		std::cout << "Calling CUDA kernel from C++..." << std::endl;
-		myKernel();  // Call the CUDA kernel defined in sirius_extension_cuda.cu
-		int size = 10;
-		int* temp = new int[size];
-		int* ptr = sendDataToGPU(temp, size);  // Send data to GPU
-		std::cout << "CUDA kernel call finished." << std::endl;
+		// myKernel();  // Call the CUDA kernel defined in sirius_extension_cuda.cu
+		// int size = 10;
+		// int* temp = new int[size];
+		// int* ptr = sendDataToGPU(temp, size);  // Send data to GPU
+		// std::cout << "CUDA kernel call finished." << std::endl;
 		data.res = data.gpu_context->GPUExecuteQuery(context, data.query, data.gpu_prepared, {});
 		// data.res = data.conn->Query(data.query);
 	}
