@@ -213,7 +213,7 @@ void SiriusExtension::GPUProcessingFunction(ClientContext &context, TableFunctio
 
 	if (!data.res) {
 		// data.res = data.plan->Execute();
-		std::cout << "Calling CUDA kernel from C++..." << std::endl;
+		// std::cout << "Calling CUDA kernel from C++..." << std::endl;
 		// myKernel();  // Call the CUDA kernel defined in sirius_extension_cuda.cu
 		// int size = 10;
 		// int* temp = new int[size];

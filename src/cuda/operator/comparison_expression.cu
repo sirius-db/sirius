@@ -3,6 +3,12 @@
 
 namespace duckdb {
 
+// string t = "((P_BRAND != 45) AND ((P_TYPE < 65) OR (P_TYPE >= 70)) AND (P_SIZE IN (49, 14, 23, 45, 19, 3, 36, 9)))";
+// string t = "((L_COMMITDATE < L_RECEIPTDATE) AND (L_SHIPDATE < L_COMMITDATE) AND (L_SHIPMODE IN (4, 6)))";
+// string t = "(((P_BRAND = 12) AND (L_QUANTITY <= 11) AND (P_SIZE <= 5) AND (P_CONTAINER IN (0, 1, 4, 5))) OR ((P_BRAND = 23) AND (L_QUANTITY >= 10) AND (L_QUANTITY <= 20) AND (P_SIZE <= 10) AND (P_CONTAINER IN (17, 18, 20, 21))) OR ((P_BRAND = 34) AND (L_QUANTITY >= 20) AND (L_QUANTITY <= 30) AND (P_SIZE <= 15) AND (P_CONTAINER IN (8, 9, 12, 13))))";
+// string t = "(((N_NATIONKEY = 6) AND (N_NATIONKEY = 7)) OR ((N_NATIONKEY = 7) AND (N_NATIONKEY = 6)))";
+// string t = "(((P_TYPE + 3) % 5) = 0)";
+
 template <typename T, int B, int I>
 __global__ void comparison_expression(const T *a, const T *b, uint64_t *row_ids, unsigned long long* count, uint64_t N, int compare_mode, int is_count) {
 
@@ -115,13 +121,6 @@ __global__ void comparison_constant_expression(const T *a, const T b, const T c,
         selection_flags[ITEM] = 0;
     }
 
-    // if (blockIdx.x == 0 && threadIdx.x == 0) {
-    //     for (uint64_t i = 0; i < 100; i++) {
-    //         printf("%ld ", a[i]);
-    //     }
-    //     printf("\n");
-    // }
-
     #pragma unroll
     for (int ITEM = 0; ITEM < I; ++ITEM) {
         if (threadIdx.x + ITEM * B < num_tile_items) {
@@ -196,7 +195,6 @@ __global__ void comparison_constant_expression<double, BLOCK_THREADS, ITEMS_PER_
 template
 __global__ void comparison_constant_expression<uint8_t, BLOCK_THREADS, ITEMS_PER_THREAD>(const uint8_t *a, const uint8_t b, const uint8_t c, uint64_t *row_ids, unsigned long long* count, uint64_t N, int compare_mode, int is_count);
 
-
 template <typename T>
 void comparisonConstantExpression(T *a, T b, T c, uint64_t* &row_ids, uint64_t* &count, uint64_t N, int op_mode) {
     printf("Launching Comparison Expression Kernel\n");
@@ -216,6 +214,25 @@ void comparisonConstantExpression(T *a, T b, T c, uint64_t* &row_ids, uint64_t* 
     printf("Count: %lu\n", h_count[0]);
 }
 
+template <typename T>
+void comparisonExpression(T *a, T *b, uint64_t* &row_ids, uint64_t* &count, uint64_t N, int op_mode) {
+    printf("Launching Comparison Expression Kernel\n");
+    cudaMemset(count, 0, sizeof(uint64_t));
+    int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
+    comparison_expression<T, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(a, b, row_ids, (unsigned long long*) count, N, op_mode, 1);
+    CHECK_ERROR();
+    GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+    uint64_t* h_count = new uint64_t[1];
+    cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+    row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
+    cudaMemset(count, 0, sizeof(uint64_t));
+    comparison_expression<T, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(a, b, row_ids, (unsigned long long*) count, N, op_mode, 0);
+    CHECK_ERROR();
+    cudaDeviceSynchronize();
+    count = h_count;
+    printf("Count: %lu\n", h_count[0]);
+}
+
 template
 void comparisonConstantExpression<int>(int *a, int b, int c, uint64_t* &row_ids, uint64_t* &count, uint64_t N, int op_mode);
 template
@@ -226,5 +243,17 @@ template
 void comparisonConstantExpression<double>(double *a, double b, double c, uint64_t* &row_ids, uint64_t* &count, uint64_t N, int op_mode);
 template
 void comparisonConstantExpression<uint8_t>(uint8_t *a, uint8_t b, uint8_t c, uint64_t* &row_ids, uint64_t* &count, uint64_t N, int op_mode);
+
+
+template
+void comparisonExpression<int>(int *a, int *b, uint64_t* &row_ids, uint64_t* &count, uint64_t N, int op_mode);
+template
+void comparisonExpression<uint64_t>(uint64_t *a, uint64_t *b, uint64_t* &row_ids, uint64_t* &count, uint64_t N, int op_mode);
+template
+void comparisonExpression<float>(float *a, float *b, uint64_t* &row_ids, uint64_t* &count, uint64_t N, int op_mode);
+template
+void comparisonExpression<double>(double *a, double *b, uint64_t* &row_ids, uint64_t* &count, uint64_t N, int op_mode);
+template
+void comparisonExpression<uint8_t>(uint8_t *a, uint8_t *b, uint64_t* &row_ids, uint64_t* &count, uint64_t N, int op_mode);
 
 } // namespace duckdb

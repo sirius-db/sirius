@@ -20,8 +20,6 @@ __global__ void binary_expression(T *a, T *b, T *result, uint64_t N, int op_mode
     for (int ITEM = 0; ITEM < I; ++ITEM) {
         if (threadIdx.x + ITEM * B < num_tile_items) {
             uint64_t offset = tile_offset + threadIdx.x + ITEM * B;
-            // printf("Thread %d: Processing element %ld\n", threadIdx.x, offset);
-            // printf("Addition: %.2f + %.2f\n", a[offset], b[offset]);
             if (op_mode == 0) {
                 result[offset] = a[offset] * (1 - b[offset]);
             } else {
@@ -45,24 +43,8 @@ __global__ void binary_expression<uint8_t, BLOCK_THREADS, ITEMS_PER_THREAD>(uint
 // Define the host function that launches the CUDA kernel
 template <typename T>
 void binaryExpression(T *a, T *b, T *result, uint64_t N, int op_mode) {
-    // printf("Launching Binary Expression Kernel\n");
+    printf("Launching Binary Expression Kernel\n");
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
-    // CHECK_ERROR();
-    // // printf("%d\n", (N  tile_items - 1)/tile_items);
-    // double* host_data_b = new double[N];
-    // cudaMemcpy(host_data_b, b, N * sizeof(double), cudaMemcpyDeviceToHost);
-    // // for (int i = 0; i < 10; i++) {
-    // //     printf("%f ", reinterpret_cast<double*>(host_data_b)[i]);
-    // // }
-    // // printf("\n");
-    // CHECK_ERROR();
-
-    // double* new_b;
-    // cudaMalloc((void**) &new_b, sizeof(double) * N);
-    // CHECK_ERROR();
-    // cudaMemcpy(new_b, host_data_b, N * sizeof(double), cudaMemcpyHostToDevice);
-    // printf("\n");
-    // CHECK_ERROR();
     binary_expression<T, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(a, b, result, N, op_mode);
     CHECK_ERROR();
     cudaDeviceSynchronize();
