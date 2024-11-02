@@ -1,0 +1,143 @@
+#include "cuda_helper.cuh"
+#include "gpu_expression_executor.hpp"
+
+// l_extendedprice * (1 - l_discount)
+// #4 * (1 + l_tax)
+// ((L_EXTENDEDPRICE * (1.0 - L_DISCOUNT)) - (PS_SUPPLYCOST * L_QUANTITY))
+// l_extendedprice * l_discount
+// sum(case when nation = 1 then volume else 0 end) / sum(volume)
+// (CAST(O_ORDERDATE AS DOUBLE) / 10000.0)
+// sum(ps_supplycost * ps_availqty) * 0.0001
+// sum(l_extendedprice) / 7.0
+
+namespace duckdb {
+
+template <typename T, int B, int I>
+__global__ void common_arithmetic_expression(T *a, T *b, T* c, T* d, T *result, uint64_t N, int op_mode) {
+    
+    uint64_t tile_size = B * I;
+    uint64_t tile_offset = blockIdx.x * tile_size;
+
+    uint64_t num_tiles = (N + tile_size - 1) / tile_size;
+    uint64_t num_tile_items = tile_size;
+
+    if (blockIdx.x == num_tiles - 1) {
+        num_tile_items = N - tile_offset;
+    }
+
+    #pragma unroll
+    for (int ITEM = 0; ITEM < I; ++ITEM) {
+        if (threadIdx.x + ITEM * B < num_tile_items) {
+            uint64_t offset = tile_offset + threadIdx.x + ITEM * B;
+            if (op_mode == 0) {
+                result[offset] = a[offset] * (1 - b[offset]);
+            } else if (op_mode == 1) {
+                result[offset] = a[offset] * (1 + b[offset]);
+            } else if (op_mode == 2) {
+                result[offset] = (a[offset] * (1 - b[offset])) - (c[offset] * d[offset]);
+            } else {
+                cudaAssert(0);
+            }
+        }
+    }
+}
+
+__global__ void common_case_expression(uint64_t *a, uint64_t *b, uint64_t *result, uint64_t N, int op_mode) {
+    
+    uint64_t tile_size = B * I;
+    uint64_t tile_offset = blockIdx.x * tile_size;
+
+    uint64_t num_tiles = (N + tile_size - 1) / tile_size;
+    uint64_t num_tile_items = tile_size;
+
+    if (blockIdx.x == num_tiles - 1) {
+        num_tile_items = N - tile_offset;
+    }
+
+    #pragma unroll
+    for (int ITEM = 0; ITEM < I; ++ITEM) {
+        if (threadIdx.x + ITEM * B < num_tile_items) {
+            uint64_t offset = tile_offset + threadIdx.x + ITEM * B;
+            if (op_mode == 0) {
+                if (a[offset] == 1) {
+                    result[offset] = b[offset];
+                } else {
+                    result[offset] = 0;
+                }
+            } else if (op_mode == 1) {
+                if ((a[offset] != 0) && a[offset] != 1) {
+                    result[offset] = 1;
+                } else {
+                    result[offset] = 0;
+                }                
+            }  else if (op_mode == 2) {
+                if ((a[offset] == 0) || a[offset] == 1) {
+                    result[offset] = 1;
+                } else {
+                    result[offset] = 0;
+                }  
+            } else {
+                cudaAssert(0);
+            }
+        }
+    }
+}
+
+__global__ void q14_case_expression(uint64_t *p_type, double *l_extendedprice, double *l_discount, uint64_t p_type_val1, uint64_t p_type_val2, double *result, uint64_t N) {
+    
+    uint64_t tile_size = B * I;
+    uint64_t tile_offset = blockIdx.x * tile_size;
+
+    uint64_t num_tiles = (N + tile_size - 1) / tile_size;
+    uint64_t num_tile_items = tile_size;
+
+    if (blockIdx.x == num_tiles - 1) {
+        num_tile_items = N - tile_offset;
+    }
+
+    #pragma unroll
+    for (int ITEM = 0; ITEM < I; ++ITEM) {
+        if (threadIdx.x + ITEM * B < num_tile_items) {
+            uint64_t offset = tile_offset + threadIdx.x + ITEM * B;
+            if ((p_type[offset] >= p_type_val1) && p_type[offset] < p_type_val2) {
+                result[offset] = l_extendedprice[offset] * (1 - l_discount[offset]);
+            } else {
+                result[offset] = 0;
+            }
+        }
+    }
+}
+
+template
+__global__ void common_arithmetic_expression<double, BLOCK_THREADS, ITEMS_PER_THREAD>(double *a, double *b, double* c, double* d, double *result, uint64_t N, int op_mode);
+template
+__global__ void common_case_expression(uint64_t *a, uint64_t *b, uint64_t *result, uint64_t N, int op_mode);
+
+// Define the host function that launches the CUDA kernel
+void commonArithmeticExpression(double *a, double *b, double* c, double* d, double *result, uint64_t N, int op_mode) {
+    printf("Launching Binary Expression Kernel\n");
+    int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
+    common_arithmetic_expression<double, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(a, b, c, d, result, N, op_mode);
+    CHECK_ERROR();
+    cudaDeviceSynchronize();
+}
+
+// Define the host function that launches the CUDA kernel
+void commonCaseExpression(uint64_t *a, uint64_t *b, uint64_t *result, uint64_t N, int op_mode) {
+    printf("Launching Binary Expression Kernel\n");
+    int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
+    common_case_expression<<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(a, b, result, N, op_mode);
+    CHECK_ERROR();
+    cudaDeviceSynchronize();
+}
+
+// Define the host function that launches the CUDA kernel
+void q14CaseExpression(uint64_t *p_type, double *l_extendedprice, double *l_discount, uint64_t p_type_val1, uint64_t p_type_val2, double *result, uint64_t N) {
+    printf("Launching Binary Expression Kernel\n");
+    int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
+    q14_case_expression<<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(p_type, l_extendedprice, l_discount, p_type_val1, p_type_val2, result, N);
+    CHECK_ERROR();
+    cudaDeviceSynchronize();
+}
+
+} // namespace duckdb
