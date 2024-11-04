@@ -1,4 +1,4 @@
-#include "cuda_helper.cuh"
+#include "../operator/cuda_helper.cuh"
 #include "gpu_expression_executor.hpp"
 
 // l_extendedprice * (1 - l_discount)
@@ -35,6 +35,8 @@ __global__ void common_arithmetic_expression(T *a, T *b, T* c, T* d, T *result, 
                 result[offset] = a[offset] * (1 + b[offset]);
             } else if (op_mode == 2) {
                 result[offset] = (a[offset] * (1 - b[offset])) - (c[offset] * d[offset]);
+            } else if (op_mode == 3) {
+                result[offset] = (a[offset] * 100 / b[offset]);
             } else {
                 cudaAssert(0);
             }
@@ -42,6 +44,29 @@ __global__ void common_arithmetic_expression(T *a, T *b, T* c, T* d, T *result, 
     }
 }
 
+template <int B, int I>
+__global__ void extract_year(uint64_t *date, uint64_t *year, uint64_t N) {
+    
+    uint64_t tile_size = B * I;
+    uint64_t tile_offset = blockIdx.x * tile_size;
+
+    uint64_t num_tiles = (N + tile_size - 1) / tile_size;
+    uint64_t num_tile_items = tile_size;
+
+    if (blockIdx.x == num_tiles - 1) {
+        num_tile_items = N - tile_offset;
+    }
+
+    #pragma unroll
+    for (int ITEM = 0; ITEM < I; ++ITEM) {
+        if (threadIdx.x + ITEM * B < num_tile_items) {
+            uint64_t offset = tile_offset + threadIdx.x + ITEM * B;
+            year[offset] = date[offset] / 10000;
+        }
+    }
+}
+
+template <int B, int I>
 __global__ void common_case_expression(uint64_t *a, uint64_t *b, uint64_t *result, uint64_t N, int op_mode) {
     
     uint64_t tile_size = B * I;
@@ -83,6 +108,7 @@ __global__ void common_case_expression(uint64_t *a, uint64_t *b, uint64_t *resul
     }
 }
 
+template <int B, int I>
 __global__ void q14_case_expression(uint64_t *p_type, double *l_extendedprice, double *l_discount, uint64_t p_type_val1, uint64_t p_type_val2, double *result, uint64_t N) {
     
     uint64_t tile_size = B * I;
@@ -111,7 +137,11 @@ __global__ void q14_case_expression(uint64_t *p_type, double *l_extendedprice, d
 template
 __global__ void common_arithmetic_expression<double, BLOCK_THREADS, ITEMS_PER_THREAD>(double *a, double *b, double* c, double* d, double *result, uint64_t N, int op_mode);
 template
-__global__ void common_case_expression(uint64_t *a, uint64_t *b, uint64_t *result, uint64_t N, int op_mode);
+__global__ void common_case_expression<BLOCK_THREADS, ITEMS_PER_THREAD>(uint64_t *a, uint64_t *b, uint64_t *result, uint64_t N, int op_mode);
+template
+__global__ void q14_case_expression<BLOCK_THREADS, ITEMS_PER_THREAD>(uint64_t *p_type, double *l_extendedprice, double *l_discount, uint64_t p_type_val1, uint64_t p_type_val2, double *result, uint64_t N);
+template
+__global__ void extract_year<BLOCK_THREADS, ITEMS_PER_THREAD>(uint64_t *date, uint64_t *year, uint64_t N);
 
 // Define the host function that launches the CUDA kernel
 void commonArithmeticExpression(double *a, double *b, double* c, double* d, double *result, uint64_t N, int op_mode) {
@@ -123,10 +153,19 @@ void commonArithmeticExpression(double *a, double *b, double* c, double* d, doub
 }
 
 // Define the host function that launches the CUDA kernel
+void extractYear(uint64_t* date, uint64_t *year, uint64_t N) {
+    printf("Launching Binary Expression Kernel\n");
+    int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
+    extract_year<BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(date, year, N);
+    CHECK_ERROR();
+    cudaDeviceSynchronize();
+}
+
+// Define the host function that launches the CUDA kernel
 void commonCaseExpression(uint64_t *a, uint64_t *b, uint64_t *result, uint64_t N, int op_mode) {
     printf("Launching Binary Expression Kernel\n");
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
-    common_case_expression<<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(a, b, result, N, op_mode);
+    common_case_expression<BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(a, b, result, N, op_mode);
     CHECK_ERROR();
     cudaDeviceSynchronize();
 }
@@ -135,7 +174,7 @@ void commonCaseExpression(uint64_t *a, uint64_t *b, uint64_t *result, uint64_t N
 void q14CaseExpression(uint64_t *p_type, double *l_extendedprice, double *l_discount, uint64_t p_type_val1, uint64_t p_type_val2, double *result, uint64_t N) {
     printf("Launching Binary Expression Kernel\n");
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
-    q14_case_expression<<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(p_type, l_extendedprice, l_discount, p_type_val1, p_type_val2, result, N);
+    q14_case_expression<BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(p_type, l_extendedprice, l_discount, p_type_val1, p_type_val2, result, N);
     CHECK_ERROR();
     cudaDeviceSynchronize();
 }

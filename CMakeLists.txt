@@ -37,6 +37,7 @@ set(EXTENSION_SOURCES
 )
 add_subdirectory(src/operator)
 add_subdirectory(src/plan)
+add_subdirectory(src/query_specific)
 
 set(CUDA_SOURCES 
   src/cuda/sirius_extension_cuda.cu 
@@ -44,6 +45,8 @@ set(CUDA_SOURCES
   src/cuda/allocator.cu
 )
 add_subdirectory(src/cuda/operator)
+add_subdirectory(src/cuda/query_specific)
+
 
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CXX_STANDARD 17)
