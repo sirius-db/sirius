@@ -11,3 +11,6 @@ tpch-data/dbgen
 my_database.duckdb
 CMakeFiles/
 CMakeCache.txt
+
+s1
+tpch_s1.duckdb

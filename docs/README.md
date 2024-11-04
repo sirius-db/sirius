@@ -50,8 +50,20 @@ where
 group by
   l_orderkey,
   o_orderdate,
-  o_shippriority;")
+  o_shippriority;");
 ```
 
 ## Generating TPC-H dataset
 Checkout to the `bobbi/tpch` branch in the `new-crystal` repo and generate the tpch dataset from the `tpch_dataset_generator` directory. To load the dataset to duckdb, use the SQL command in `{SIRIUS_HOME_PATH}\tpch_load_duckdb_simple.sql`.
+
+
+## Docker container
+We have provided a helper docker container that you can easily use to install all the depedencies:
+```
+$ export CURRENT_DIR=`pwd`
+$ docker build -t sirius:latest docker/.
+$ docker kill sirius
+$ docker rm sirius
+$ docker run --gpus all -d -v $CURRENT_DIR:/working_dir/ --name=sirius --cap-add=SYS_ADMIN sirius:latest sleep infinity
+$ docker exec -it sirius bash
+```
