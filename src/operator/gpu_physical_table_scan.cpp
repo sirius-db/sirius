@@ -16,8 +16,6 @@ GPUPhysicalTableScan::GPUPhysicalTableScan(vector<LogicalType> types, TableFunct
       table_filters(std::move(table_filters_p)), extra_info(extra_info) {
 }
 
-// SourceResultType
-// GPUPhysicalTableScan::GetData(ExecutionContext &context, GPUIntermediateRelation &output_relation, OperatorSourceInput &input) const {
 
 template <typename T>
 void ResolveTypeComparisonConstantExpression (GPUColumn* column, uint64_t* &count, uint64_t* & row_ids, ConstantFilter filter_constant, ExpressionType expression_type) {
@@ -62,6 +60,34 @@ void HandleComparisonConstantExpression(GPUColumn* column, uint64_t* &count, uin
         break;
       case ColumnType::FLOAT64:
         ResolveTypeComparisonConstantExpression<double>(column, count, row_ids, filter_constant, expression_type);
+        break;
+      default:
+        throw NotImplementedException("Unsupported column type");
+    }
+}
+
+template <typename T>
+void ResolveTypeBetweenExpression (GPUColumn* column, uint64_t* &count, uint64_t* & row_ids, ConstantFilter filter_constant1, ConstantFilter filter_constant2) {
+    T* a = reinterpret_cast<T*> (column->data_wrapper.data);
+    T b = filter_constant1.constant.GetValue<T>();
+    T c = filter_constant2.constant.GetValue<T>();
+    size_t size = column->column_length;
+    comparisonConstantExpression<T>(a, b, c, row_ids, count, size, 6);
+}
+
+void HandleBetweenExpression(GPUColumn* column, uint64_t* &count, uint64_t* &row_ids, ConstantFilter filter_constant1, ConstantFilter filter_constant2) {
+    switch(column->data_wrapper.type) {
+      case ColumnType::INT32:
+        ResolveTypeBetweenExpression<int>(column, count, row_ids, filter_constant1, filter_constant2);
+        break;
+      case ColumnType::INT64:
+        ResolveTypeBetweenExpression<uint64_t>(column, count, row_ids, filter_constant1, filter_constant2);
+        break;
+      case ColumnType::FLOAT32:
+        ResolveTypeBetweenExpression<float>(column, count, row_ids, filter_constant1, filter_constant2);
+        break;
+      case ColumnType::FLOAT64:
+        ResolveTypeBetweenExpression<double>(column, count, row_ids, filter_constant1, filter_constant2);
         break;
       default:
         throw NotImplementedException("Unsupported column type");
@@ -115,28 +141,38 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
           if (filter->filter_type == TableFilterType::CONJUNCTION_AND) {
             auto filter_pointer = filter.get();
             auto &filter_conjunction_and = filter_pointer->Cast<ConjunctionAndFilter>();
-            for (auto &filter_inside : filter_conjunction_and.child_filters) {
-              if (filter_inside->filter_type == TableFilterType::CONSTANT_COMPARISON) {
-                // printf("Reading constant comparison filter\n");
-                auto filter_constant = filter_inside->Cast<ConstantFilter>();
-                ExpressionType expression_type = filter_constant.comparison_type;
-                size_t size = table->columns[column_ids[column_index]]->column_length;
+            if (filter_conjunction_and.child_filters.size() == 3) {
+              if (filter_conjunction_and.child_filters[0]->filter_type == TableFilterType::CONSTANT_COMPARISON && filter_conjunction_and.child_filters[1]->filter_type == TableFilterType::CONSTANT_COMPARISON && filter_conjunction_and.child_filters[2]->filter_type == TableFilterType::IS_NOT_NULL) {
+                auto filter_constant1 = filter_conjunction_and.child_filters[0]->Cast<ConstantFilter>();
+                auto filter_constant2 = filter_conjunction_and.child_filters[1]->Cast<ConstantFilter>();
+                ExpressionType expression_type1 = filter_constant1.comparison_type;
+                ExpressionType expression_type2 = filter_constant2.comparison_type;
                 count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
-                // uint64_t* a = reinterpret_cast<uint64_t*> (table->columns[column_ids[column_index]]->data_wrapper.data);
-                // uint64_t b = filter_constant.constant.GetValue<uint64_t>();
-                // //TODO: we have to handle the compare_mode here
-                // comparisonConstantExpression<uint64_t>(a, b, row_ids, count, (uint64_t) size, 0);
-                HandleComparisonConstantExpression(table->columns[column_ids[column_index]], count, row_ids, filter_constant, expression_type);
+                if (filter_constant1.comparison_type == ExpressionType::COMPARE_GREATERTHANOREQUALTO && filter_constant2.comparison_type == ExpressionType::COMPARE_LESSTHANOREQUALTO) {
+                    HandleBetweenExpression(table->columns[column_ids[column_index]], count, row_ids, filter_constant1, filter_constant2);
+                } else {
+                    throw NotImplementedException("Between expression not supported");
+                }
                 printf("Count %ld\n", count[0]);
-                if (count[0] == 0) throw NotImplementedException("No match found");
-              } else if (filter_inside->filter_type == TableFilterType::IS_NOT_NULL) {
-                continue;
-              } else {
-                throw NotImplementedException("Filter type not supported");
+              }
+            } else {
+              for (auto &filter_inside : filter_conjunction_and.child_filters) {
+                if (filter_inside->filter_type == TableFilterType::CONSTANT_COMPARISON) {
+                  // printf("Reading constant comparison filter\n");
+                  auto filter_constant = filter_inside->Cast<ConstantFilter>();
+                  ExpressionType expression_type = filter_constant.comparison_type;
+                  size_t size = table->columns[column_ids[column_index]]->column_length;
+                  count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+                  HandleComparisonConstantExpression(table->columns[column_ids[column_index]], count, row_ids, filter_constant, expression_type);
+                  printf("Count %ld\n", count[0]);
+                  if (count[0] == 0) throw NotImplementedException("No match found");
+                } else if (filter_inside->filter_type == TableFilterType::IS_NOT_NULL) {
+                  continue;
+                } else {
+                  throw NotImplementedException("Filter type not supported");
+                }
               }
             }
-          } else {
-            throw NotImplementedException("Filter type not supported");
           }
         }
       }
