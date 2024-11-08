@@ -12,7 +12,10 @@
 namespace duckdb {
 
 template <typename T, typename V>
-void groupedAggregate(T** keys, V *&aggregate, uint64_t* count, uint64_t N, uint64_t num_keys);
+void groupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count, uint64_t N, uint64_t num_keys, uint64_t num_aggregates, int* agg_mode);
+
+template <typename T>
+void groupedWithoutAggregate(uint8_t **keys, uint64_t* count, uint64_t N, uint64_t num_keys);
 
 class ClientContext;
 

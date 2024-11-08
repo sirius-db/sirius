@@ -29,6 +29,7 @@ GPUPhysicalOrder::GetData(GPUIntermediateRelation &output_relation) const {
 
 SinkResultType 
 GPUPhysicalOrder::Sink(GPUIntermediateRelation &input_relation) const {
+  printf("Currently order by is not doing anything since it's always after group by\n");
   for (auto &order : orders) {
     // key_types.push_back(order.expression->return_type);
     // key_executor.AddExpression(*order.expression);
@@ -47,6 +48,7 @@ GPUPhysicalOrder::Sink(GPUIntermediateRelation &input_relation) const {
   for (auto &projection : projections) {
     printf("Sinking order by projections from index %ld\n", projection);
     input_relation.checkLateMaterialization(projection);
+    sort_result->columns[projection] = input_relation.columns[projection];
   }
 
   return SinkResultType::FINISHED;

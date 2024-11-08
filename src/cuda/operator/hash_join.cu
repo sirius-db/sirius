@@ -134,7 +134,8 @@ __global__ void test(uint64_t* a, uint64_t N) {
 }
 
 template
-__global__ void probe<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD>(const uint64_t *keys, unsigned long long* ht, uint64_t ht_len, uint64_t *row_ids_left, uint64_t *row_ids_right, unsigned long long* count, uint64_t N, int mode, int is_count);
+__global__ void probe<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD>(const uint64_t *keys, unsigned long long* ht, uint64_t ht_len, 
+            uint64_t *row_ids_left, uint64_t *row_ids_right, unsigned long long* count, uint64_t N, int mode, int is_count);
 
 template
 __global__ void build<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD>(const uint64_t *keys, unsigned long long* ht, uint64_t ht_len, uint64_t N, int mode);
@@ -177,11 +178,5 @@ void probeHashTable<uint64_t>(uint64_t *keys, unsigned long long* ht, uint64_t h
 
 template
 void buildHashTable<uint64_t>(uint64_t *keys, unsigned long long* ht, uint64_t ht_len, uint64_t N, int mode);
-
-// template <typename T>
-// void probeHashTable(const uint64_t *key, unsigned long long* ht, uint64_t ht_len, uint64_t *row_ids_left, uint64_t* row_ids_right, unsigned long long* count, uint64_t N, int mode);
-
-// template <typename T>
-// void buildHashTable(const uint64_t *keys, unsigned long long* ht, uint64_t ht_len, uint64_t N, int mode);
 
 }
