@@ -1,4 +1,5 @@
 #include "gpu_expression_executor.hpp"
+#include "operator/gpu_materialize.hpp"
 #include "duckdb/planner/expression/bound_case_expression.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
@@ -99,10 +100,9 @@ GPUExpressionExecutor::HandlingSpecificFilter(GPUIntermediateRelation& input_rel
             }
         } else if (expression.type == ExpressionType::CONJUNCTION_AND) {
             auto &expr = expression.Cast<BoundConjunctionExpression>();
-            printf("Filter expression of Q16\n");
             //Q16 HACK!!!
             if (expr.children.size() == 3 && expr.children[0]->type == ExpressionType::COMPARE_NOTEQUAL && expr.children[1]->type == ExpressionType::CONJUNCTION_OR && expr.children[2]->type == ExpressionType::COMPARE_IN) {
-                
+                printf("Filter expression of Q16\n");
                 string t = "((P_BRAND != 45) AND ((P_TYPE < 65) OR (P_TYPE >= 70)) AND (P_SIZE IN (49, 14, 23, 45, 19, 3, 36, 9)))";
                 if (!expression.ToString().compare(t)) {
                     BoundComparisonExpression& first = expr.children[0]->Cast<BoundComparisonExpression>();

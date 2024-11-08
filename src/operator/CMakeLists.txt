@@ -14,5 +14,6 @@ set(EXTENSION_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/gpu_physical_result_collector.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/gpu_physical_table_scan.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/gpu_physical_nested_loop_join.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/gpu_materialize.cpp
         PARENT_SCOPE
 )

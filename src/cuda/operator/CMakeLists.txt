@@ -5,5 +5,7 @@ set(CUDA_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/materialize.cu
         ${CMAKE_CURRENT_SOURCE_DIR}/grouped_aggregate.cu
         ${CMAKE_CURRENT_SOURCE_DIR}/hash_join.cu
+        ${CMAKE_CURRENT_SOURCE_DIR}/hash_join_multikey.cu
+        ${CMAKE_CURRENT_SOURCE_DIR}/hash_join_right.cu
         PARENT_SCOPE
 )

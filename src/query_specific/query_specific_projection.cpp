@@ -1,4 +1,5 @@
 #include "gpu_expression_executor.hpp"
+#include "operator/gpu_materialize.hpp"
 #include "duckdb/planner/expression/bound_case_expression.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
@@ -129,12 +130,12 @@ GPUExpressionExecutor::HandlingSpecificProjection(GPUIntermediateRelation& input
 					//l_extendedprice * (1 - l_discount)
 					auto &ref_expr = expr.children[0]->Cast<BoundReferenceExpression>();
 					auto l_extendedprice_or_4 = ref_expr.index;
+					auto &function_expr = expr.children[1]->Cast<BoundFunctionExpression>();
 
-					if (expr.function.name.compare("+") == 0) {
+					if (function_expr.function.name.compare("+") == 0) {
 						//Q1 HACK!!!
 						//#4 * (1 + l_tax)
 						printf("Projection expression of Q1\n");
-						auto &function_expr = expr.children[1]->Cast<BoundFunctionExpression>();
 						auto l_tax = function_expr.children[1]->Cast<BoundReferenceExpression>().index;
 
 						auto materialize_4 = HandleMaterializeExpression(input_relation.columns[l_extendedprice_or_4], ref_expr, gpuBufferManager);
@@ -148,9 +149,9 @@ GPUExpressionExecutor::HandlingSpecificProjection(GPUIntermediateRelation& input
 						result = new GPUColumn(size, ColumnType::FLOAT64, reinterpret_cast<uint8_t*>(out));
 
 
-					}  else if (expr.function.name.compare("-") == 0) {
+					}  else if (function_expr.function.name.compare("-") == 0) {
 						//l_extendedprice * (1 - l_discount)
-						auto &function_expr = expr.children[1]->Cast<BoundFunctionExpression>();
+						printf("Common projection expression l_extendedprice * (1 - l_discount)\n");
 						auto l_discount = function_expr.children[1]->Cast<BoundReferenceExpression>().index;
 
 						auto materialize_extendedprice = HandleMaterializeExpression(input_relation.columns[l_extendedprice_or_4], ref_expr, gpuBufferManager);
@@ -223,6 +224,7 @@ GPUExpressionExecutor::HandlingSpecificProjection(GPUIntermediateRelation& input
 
 
         if (result) {
+			printf("Writing projection result to idx %ld\n", output_idx);
             output_relation.columns[output_idx] = result;
             output_relation.columns[output_idx]->row_ids = nullptr;
             output_relation.columns[output_idx]->row_id_count = 0;

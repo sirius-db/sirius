@@ -1,4 +1,5 @@
 #include "gpu_expression_executor.hpp"
+#include "operator/gpu_materialize.hpp"
 
 namespace duckdb {
 
@@ -187,42 +188,41 @@ GPUExpressionExecutor::HandleComparisonExpression(GPUColumn* column1, GPUColumn*
     }
 }
 
-template <typename T>
-GPUColumn* 
-GPUExpressionExecutor::ResolveTypeMaterializeExpression(GPUColumn* column, BoundReferenceExpression& bound_ref, GPUBufferManager* gpuBufferManager) {
-    // GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
-    size_t size;
-    T* a;
-    if (column->row_ids != nullptr) {
-        T* temp = reinterpret_cast<T*> (column->data_wrapper.data);
-        uint64_t* row_ids_input = reinterpret_cast<uint64_t*> (column->row_ids);
-        a = gpuBufferManager->customCudaMalloc<T>(column->row_id_count, 0, 0);
-        materializeExpression<T>(temp, a, row_ids_input, column->row_id_count);
-        size = column->row_id_count;
-    } else {
-        a = reinterpret_cast<T*> (column->data_wrapper.data);
-        size = column->column_length;
-    }
-    GPUColumn* result = new GPUColumn(size, column->data_wrapper.type, reinterpret_cast<uint8_t*>(a));
-    // printf("size %ld\n", size);
-    return result;
-}
+// template <typename T>
+// GPUColumn* 
+// GPUExpressionExecutor::ResolveTypeMaterializeExpression(GPUColumn* column, BoundReferenceExpression& bound_ref, GPUBufferManager* gpuBufferManager) {
+//     // GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+//     size_t size;
+//     T* a;
+//     if (column->row_ids != nullptr) {
+//         T* temp = reinterpret_cast<T*> (column->data_wrapper.data);
+//         uint64_t* row_ids_input = reinterpret_cast<uint64_t*> (column->row_ids);
+//         a = gpuBufferManager->customCudaMalloc<T>(column->row_id_count, 0, 0);
+//         materializeExpression<T>(temp, a, row_ids_input, column->row_id_count);
+//         size = column->row_id_count;
+//     } else {
+//         a = reinterpret_cast<T*> (column->data_wrapper.data);
+//         size = column->column_length;
+//     }
+//     GPUColumn* result = new GPUColumn(size, column->data_wrapper.type, reinterpret_cast<uint8_t*>(a));
+//     return result;
+// }
 
-GPUColumn* 
-GPUExpressionExecutor::HandleMaterializeExpression(GPUColumn* column, BoundReferenceExpression& bound_ref, GPUBufferManager* gpuBufferManager) {
-    switch(column->data_wrapper.type) {
-        case ColumnType::INT32:
-            return ResolveTypeMaterializeExpression<int>(column, bound_ref, gpuBufferManager);
-        case ColumnType::INT64:
-            return ResolveTypeMaterializeExpression<uint64_t>(column, bound_ref, gpuBufferManager);
-        case ColumnType::FLOAT32:
-            return ResolveTypeMaterializeExpression<float>(column, bound_ref, gpuBufferManager);
-        case ColumnType::FLOAT64:
-            return ResolveTypeMaterializeExpression<double>(column, bound_ref, gpuBufferManager);
-        default:
-            throw NotImplementedException("Unsupported column type");
-    }
-}
+// GPUColumn* 
+// GPUExpressionExecutor::HandleMaterializeExpression(GPUColumn* column, BoundReferenceExpression& bound_ref, GPUBufferManager* gpuBufferManager) {
+//     switch(column->data_wrapper.type) {
+//         case ColumnType::INT32:
+//             return ResolveTypeMaterializeExpression<int>(column, bound_ref, gpuBufferManager);
+//         case ColumnType::INT64:
+//             return ResolveTypeMaterializeExpression<uint64_t>(column, bound_ref, gpuBufferManager);
+//         case ColumnType::FLOAT32:
+//             return ResolveTypeMaterializeExpression<float>(column, bound_ref, gpuBufferManager);
+//         case ColumnType::FLOAT64:
+//             return ResolveTypeMaterializeExpression<double>(column, bound_ref, gpuBufferManager);
+//         default:
+//             throw NotImplementedException("Unsupported column type");
+//     }
+// }
 
 void 
 GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_relation, GPUIntermediateRelation& output_relation, Expression& expr, int depth) {
@@ -467,7 +467,7 @@ GPUExpressionExecutor::ProjectionRecursiveExpression(GPUIntermediateRelation& in
 	} default: {
 		throw InternalException("Attempting to execute expression of unknown type!");
 	}
-    }
+  }
     printf("Writing projection result to idx %ld\n", output_idx);
     if (depth == 0) {
         if (expr.expression_class == ExpressionClass::BOUND_REF) {
