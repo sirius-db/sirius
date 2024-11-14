@@ -119,15 +119,19 @@ GPUPhysicalMaterializedCollector::FinalMaterialize(GPUIntermediateRelation input
 		break;
 	case ColumnType::INT32:
 		FinalMaterializeInternal<int>(input_relation, output_relation, col);
-		size_bytes = output_relation.columns[col]->column_length * sizeof(uint64_t);
+		size_bytes = output_relation.columns[col]->column_length * sizeof(int);
 		break;
 	case ColumnType::FLOAT64:
 		FinalMaterializeInternal<double>(input_relation, output_relation, col);
-		size_bytes = output_relation.columns[col]->column_length * sizeof(uint64_t);
+		size_bytes = output_relation.columns[col]->column_length * sizeof(double);
 		break;
 	case ColumnType::FLOAT32:
 		FinalMaterializeInternal<float>(input_relation, output_relation, col);
-		size_bytes = output_relation.columns[col]->column_length * sizeof(uint64_t);
+		size_bytes = output_relation.columns[col]->column_length * sizeof(float);
+		break;
+	case ColumnType::BOOLEAN:
+		FinalMaterializeInternal<uint8_t>(input_relation, output_relation, col);
+		size_bytes = output_relation.columns[col]->column_length * sizeof(uint8_t);
 		break;
 	default:
 		throw NotImplementedException("Unsupported column type");
@@ -147,6 +151,8 @@ LogicalType ColumnTypeToLogicalType(ColumnType type) {
 			return LogicalType::FLOAT;
 		case ColumnType::FLOAT64:
 			return LogicalType::DOUBLE;
+		case ColumnType::BOOLEAN:
+			return LogicalType::BOOLEAN;
 		case ColumnType::VARCHAR:
 			return LogicalType::VARCHAR;
 		default:
@@ -165,6 +171,8 @@ Vector rawDataToVector(uint8_t* host_data, size_t vector_offset, ColumnType type
 			sizeof_type = sizeof(float); break;
 		case ColumnType::FLOAT64:
 			sizeof_type = sizeof(double); break;
+		case ColumnType::BOOLEAN:
+			sizeof_type = sizeof(uint8_t); break;
 		default:
 			throw NotImplementedException("Unsupported column type");
 	}

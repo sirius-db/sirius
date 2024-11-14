@@ -12,6 +12,7 @@ enum class ColumnType {
     INT64,
     FLOAT32,
     FLOAT64,
+    BOOLEAN,
     VARCHAR
 };
 
@@ -37,6 +38,7 @@ public:
     float* GetDataFloat32();
     double* GetDataFloat64();
     char* GetDataVarChar();
+    uint8_t* GetDataBoolean();
     uint64_t* GetRowIds();
     uint8_t* GetData();
 

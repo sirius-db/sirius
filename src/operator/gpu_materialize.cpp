@@ -32,9 +32,30 @@ HandleMaterializeExpression(GPUColumn* column, BoundReferenceExpression& bound_r
             return ResolveTypeMaterializeExpression<float>(column, bound_ref, gpuBufferManager);
         case ColumnType::FLOAT64:
             return ResolveTypeMaterializeExpression<double>(column, bound_ref, gpuBufferManager);
+        case ColumnType::BOOLEAN:
+            return ResolveTypeMaterializeExpression<uint8_t>(column, bound_ref, gpuBufferManager);
         default:
             throw NotImplementedException("Unsupported column type");
     }
+}
+
+GPUColumn* 
+HandleMaterializeRowIDs(GPUColumn* in_column, uint64_t count, uint64_t* row_ids, GPUBufferManager* gpuBufferManager) {
+    GPUColumn* out_column = in_column;
+    if (row_ids) {
+        if (in_column->row_ids == nullptr) {
+            out_column->row_ids = row_ids;
+            out_column->row_id_count = count;
+        } else {
+            uint64_t* row_ids_input = reinterpret_cast<uint64_t*> (in_column->row_ids);
+            uint64_t* new_row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(count, 0, 0);
+            materializeExpression<uint64_t>(row_ids_input, new_row_ids, row_ids, count);
+            out_column->row_ids = new_row_ids;
+            out_column->row_id_count = count;
+            printf("row id count %ld\n", count);
+        }
+    }
+    return out_column;
 }
 
 } // namespace duckdb

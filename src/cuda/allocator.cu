@@ -38,6 +38,7 @@ template <typename T>
 T* callCudaMalloc(size_t size, int gpu) {
     T* ptr;
     cudaSetDevice(gpu);
+    printf("Allocating %lu bytes on GPU %d\n", size * sizeof(T), gpu);
     gpuErrchk(cudaMalloc((void**) &ptr, size * sizeof(T)));
     cudaDeviceSynchronize();
     cudaSetDevice(0);

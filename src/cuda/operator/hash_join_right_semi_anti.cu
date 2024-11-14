@@ -13,17 +13,9 @@ __device__ uint64_t hash64_right(uint64_t key1, uint64_t key2) {
     return h;
 }
 
-//TODO: currently this probe does not support many to many join
 template <int B, int I>
-__global__ void probe_right(uint64_t **keys, unsigned long long* ht, uint64_t ht_len,
+__global__ void probe_right_semi_anti(uint64_t **keys, unsigned long long* ht, uint64_t ht_len,
             uint64_t N, int* condition_mode, int num_keys) {
-
-    typedef cub::BlockScan<int, B> BlockScanInt;
-
-    __shared__ union TempStorage
-    {
-        typename BlockScanInt::TempStorage scan;
-    } temp_storage;
 
     uint64_t tile_size = B * I;
     uint64_t tile_offset = blockIdx.x * tile_size;
@@ -53,8 +45,7 @@ __global__ void probe_right(uint64_t **keys, unsigned long long* ht, uint64_t ht
                     else cudaAssert(0);
                 }
                 if (local_found) {
-                    ht[slot * (num_keys + 2) + num_keys + 1] = 1;
-                    break;
+                    ht[slot * (num_keys + 2) + num_keys + 1] = tile_offset + threadIdx.x + ITEM * B;
                 }
                 slot = (slot + 100007) % ht_len;
             }
@@ -62,39 +53,47 @@ __global__ void probe_right(uint64_t **keys, unsigned long long* ht, uint64_t ht
     }
 }
 
-template <int B, int I>
-__global__ void build_right(uint64_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t N, int num_keys) {
+// //TODO: currently this probe does not support many to many join
+// template <int B, int I>
+// __global__ void probe_right(uint64_t **keys, unsigned long long* ht, uint64_t ht_len,
+//             uint64_t N, int* condition_mode, int num_keys) {
 
-    uint64_t tile_size = B * I;
-    uint64_t tile_offset = blockIdx.x * tile_size;
+//     uint64_t tile_size = B * I;
+//     uint64_t tile_offset = blockIdx.x * tile_size;
 
-    uint64_t num_tiles = (N + tile_size - 1) / tile_size;
-    uint64_t num_tile_items = tile_size;
+//     uint64_t num_tiles = (N + tile_size - 1) / tile_size;
+//     uint64_t num_tile_items = tile_size;
 
-    if (blockIdx.x == num_tiles - 1) {
-        num_tile_items = N - tile_offset;
-    }
+//     if (blockIdx.x == num_tiles - 1) {
+//         num_tile_items = N - tile_offset;
+//     }
 
-    #pragma unroll
-    for (int ITEM = 0; ITEM < I; ITEM++) {
-        if (threadIdx.x + (ITEM * B) < num_tile_items) {
-            uint64_t slot;
-            if (num_keys == 1) slot = keys[0][tile_offset + threadIdx.x + ITEM * B] % ht_len;
-            else if (num_keys == 2) slot = hash64_right(keys[0][tile_offset + threadIdx.x + ITEM * B], keys[1][tile_offset + threadIdx.x + ITEM * B]) % ht_len;
-            else cudaAssert(0);
+//     #pragma unroll
+//     for (int ITEM = 0; ITEM < I; ITEM++) {
+//         if (threadIdx.x + (ITEM * B) < num_tile_items) {
             
-            uint64_t item = keys[0][tile_offset + threadIdx.x + ITEM * B];
-            while(atomicCAS(&ht[slot * (num_keys + 2)], 0xFFFFFFFFFFFFFFFF, (unsigned long long) item) != 0xFFFFFFFFFFFFFFFF) {                
-                slot = (slot + 100007) % ht_len;
-            }
-
-            for (int n = 1; n < num_keys; n++) {
-                ht[slot * (num_keys + 2) + n] = keys[n][tile_offset + threadIdx.x + ITEM * B];
-            }
-            ht[slot * (num_keys + 2) + num_keys] = tile_offset + threadIdx.x + (ITEM * B);
-        }
-    }
-}
+//             uint64_t slot;
+//             if (num_keys == 1) slot = keys[0][tile_offset + threadIdx.x + ITEM * B] % ht_len;
+//             else if (num_keys == 2) slot = hash64_right(keys[0][tile_offset + threadIdx.x + ITEM * B], keys[1][tile_offset + threadIdx.x + ITEM * B]) % ht_len;
+//             else cudaAssert(0);
+            
+//             while (ht[slot * (num_keys + 2)] != 0xFFFFFFFFFFFFFFFF) {
+//                 bool local_found = 1;
+//                 for (int n = 0; n < num_keys; n++) {
+//                     uint64_t item = keys[n][tile_offset + threadIdx.x + ITEM * B];
+//                     if (condition_mode[n] == 0 && ht[slot * (num_keys + 2) + n] != item) local_found = 0;
+//                     else if (condition_mode[n] == 1 && ht[slot * (num_keys + 2) + n] == item) local_found = 0;
+//                     else cudaAssert(0);
+//                 }
+//                 if (local_found) {
+//                     ht[slot * (num_keys + 2) + num_keys + 1] = tile_offset + threadIdx.x + ITEM * B;
+//                     break;
+//                 }
+//                 slot = (slot + 100007) % ht_len;
+//             }
+//         }
+//     }
+// }
 
 template <int B, int I>
 __global__ void scan_right(unsigned long long* ht, unsigned long long* count, uint64_t ht_len, 
@@ -133,14 +132,14 @@ __global__ void scan_right(unsigned long long* ht, unsigned long long* count, ui
     for (int ITEM = 0; ITEM < I; ITEM++) {
         if (threadIdx.x + (ITEM * B) < num_tile_items) {
             int slot = tile_offset + threadIdx.x + ITEM * B;  
-            if (join_mode == 0) { // regular join
-                if (ht[slot * (num_keys + 2) + num_keys + 1] == 1) {
+            if (join_mode == 0) { // semi join
+                if (ht[slot * (num_keys + 2) + num_keys + 1] != 0xFFFFFFFFFFFFFFFF) {
                     items_off[ITEM] = ht[slot * (num_keys + 2) + num_keys];
                     selection_flags[ITEM] = 1;
                     t_count++;
                 }
             } else if (join_mode == 1) { // anti join
-                if (ht[slot * (num_keys + 2) + num_keys + 1] == 0xFFFFFFFFFFFFFFFF) {
+                if (ht[slot * (num_keys + 2) + num_keys + 1] == 0xFFFFFFFFFFFFFFFF && ht[slot * (num_keys + 2) + num_keys] != 0xFFFFFFFFFFFFFFFF) {
                     items_off[ITEM] = ht[slot * (num_keys + 2) + num_keys];
                     selection_flags[ITEM] = 1;
                     t_count++;
@@ -176,52 +175,20 @@ __global__ void scan_right(unsigned long long* ht, unsigned long long* count, ui
 }
 
 template
-__global__ void probe_right<BLOCK_THREADS, ITEMS_PER_THREAD>(uint64_t **keys, unsigned long long* ht, uint64_t ht_len,
-            uint64_t N, int* condition_mode, int num_keys);
-
-template
-__global__ void build_right<BLOCK_THREADS, ITEMS_PER_THREAD>(uint64_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t N, int num_keys);
-
-template
 __global__ void scan_right<BLOCK_THREADS, ITEMS_PER_THREAD>(unsigned long long* ht, unsigned long long* count, uint64_t ht_len, 
                 uint64_t *row_ids, uint64_t num_keys, int join_mode, int is_count);
 
-void probeHashTableRight(uint64_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t N, int* condition_mode, int num_keys) {
-    printf("Launching Probe Kernel\n");
-    GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+template
+__global__ void probe_right_semi_anti<BLOCK_THREADS, ITEMS_PER_THREAD>(uint64_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t N, int* condition_mode, int num_keys);
 
-    uint64_t** keys_dev;
-    cudaMalloc((void**) &keys_dev, num_keys * sizeof(uint64_t*));
-    cudaMemcpy(keys_dev, keys, num_keys * sizeof(uint64_t*), cudaMemcpyHostToDevice);
-
-    int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
-    probe_right<BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(keys_dev, ht, ht_len, N, condition_mode, num_keys);
-    CHECK_ERROR();
-    cudaDeviceSynchronize();
-}
-
-void buildHashTableRight(uint64_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t N, int num_keys) {
-    printf("Launching Build Kernel\n");
-    GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
-    uint64_t** keys_dev;
-    cudaMalloc((void**) &keys_dev, num_keys * sizeof(uint64_t*));
-    cudaMemcpy(keys_dev, keys, num_keys * sizeof(uint64_t*), cudaMemcpyHostToDevice);
-    
-    cudaMemset(ht, 0xFF, ht_len * 2 * sizeof(unsigned long long));
-    int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
-    build_right<BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(keys_dev, ht, ht_len, N, num_keys);
-    CHECK_ERROR();
-    cudaDeviceSynchronize();
-}
-
-void scanHashTableRight(unsigned long long* ht, uint64_t ht_len, uint64_t* &row_ids, uint64_t* &count, uint64_t N, int join_mode, int num_keys) {
+void scanHashTableRight(unsigned long long* ht, uint64_t ht_len, uint64_t* &row_ids, uint64_t* &count, int join_mode, int num_keys) {
     printf("Launching Scan Kernel\n");
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
     cudaMemset(count, 0, sizeof(uint64_t));
 
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
     CHECK_ERROR();
-    scan_right<BLOCK_THREADS, ITEMS_PER_THREAD><<<(ht_len + tile_items - 1)/tile_items, BLOCK_THREADS>>>(ht, (unsigned long long*) count, ht_len, row_ids, num_keys, join_mode, 0);
+    scan_right<BLOCK_THREADS, ITEMS_PER_THREAD><<<(ht_len + tile_items - 1)/tile_items, BLOCK_THREADS>>>(ht, (unsigned long long*) count, ht_len, row_ids, num_keys, join_mode, 1);
     CHECK_ERROR();
     cudaDeviceSynchronize();
 
@@ -235,6 +202,23 @@ void scanHashTableRight(unsigned long long* ht, uint64_t ht_len, uint64_t* &row_
     cudaDeviceSynchronize();
     printf("Count: %lu\n", h_count[0]);
     count = h_count;
+}
+
+void probeHashTableRightSemiAnti(uint64_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t N, int* condition_mode, int num_keys) {
+    printf("Launching Probe Kernel\n");
+    GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+
+    uint64_t** keys_dev;
+    cudaMalloc((void**) &keys_dev, num_keys * sizeof(uint64_t*));
+    cudaMemcpy(keys_dev, keys, num_keys * sizeof(uint64_t*), cudaMemcpyHostToDevice);
+
+    int* condition_mode_dev = gpuBufferManager->customCudaMalloc<int>(num_keys, 0, 0);
+    cudaMemcpy(condition_mode_dev, condition_mode, num_keys * sizeof(int), cudaMemcpyHostToDevice);
+
+    int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
+    probe_right_semi_anti<BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(keys_dev, ht, ht_len, N, condition_mode_dev, num_keys);
+    CHECK_ERROR();
+    cudaDeviceSynchronize();
 }
 
 } // namespace duckdb

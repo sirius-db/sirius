@@ -176,6 +176,13 @@ GPUBufferManager::allocateChunk(DataChunk &input){
             column_type = ColumnType::FLOAT64;
             break;
         }
+        case LogicalTypeId::BOOLEAN: {
+            uint8_t* ptr_bool = customCudaHostAlloc<uint8_t>(chunk_size);
+            ptr = reinterpret_cast<uint8_t*>(ptr_bool);
+            memcpy(ptr, input.data[0].GetData(), input.size() * sizeof(uint8_t));
+            column_type = ColumnType::BOOLEAN;
+            break;
+        }
         case LogicalTypeId::VARCHAR: {
             char* ptr_varchar = customCudaHostAlloc<char>(chunk_size * 128);
             ptr = reinterpret_cast<uint8_t*>(ptr_varchar);
@@ -238,6 +245,12 @@ GPUBufferManager::allocateColumnBufferInGPU(DataWrapper cpu_data, int gpu) {
             double* ptr_double = customCudaMalloc<double>(cpu_data.size, 0, true);
             ptr = reinterpret_cast<uint8_t*>(ptr_double);
             column_type = ColumnType::FLOAT64;
+			break;
+        }
+		case ColumnType::BOOLEAN: {
+            uint8_t* ptr_bool = customCudaMalloc<uint8_t>(cpu_data.size, 0, true);
+            ptr = reinterpret_cast<uint8_t*>(ptr_bool);
+            column_type = ColumnType::BOOLEAN;
 			break;
         }
 		case ColumnType::VARCHAR: {
