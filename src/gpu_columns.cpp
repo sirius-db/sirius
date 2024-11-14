@@ -17,6 +17,9 @@ ColumnType convertLogicalTypetoColumnType(LogicalType type) {
         case LogicalTypeId::DOUBLE:
             column_type = ColumnType::FLOAT64;
             break;
+        case LogicalTypeId::BOOLEAN:
+            column_type = ColumnType::BOOLEAN;
+            break;
         case LogicalTypeId::VARCHAR:
             column_type = ColumnType::VARCHAR;
             break;
@@ -40,6 +43,8 @@ DataWrapper::getColumnTypeSize() {
             return sizeof(float);
         case ColumnType::FLOAT64:
             return sizeof(double);
+        case ColumnType::BOOLEAN:
+            return sizeof(uint8_t);
         case ColumnType::VARCHAR:
             return 128;
     }
@@ -123,6 +128,11 @@ GPUColumn::GetDataFloat64() {
     return reinterpret_cast<double*>(data_wrapper.data);
 }
 
+uint8_t*
+GPUColumn::GetDataBoolean() {
+    return reinterpret_cast<uint8_t*>(data_wrapper.data);
+}
+
 char*
 GPUColumn::GetDataVarChar() {
     return reinterpret_cast<char*>(data_wrapper.data);
@@ -139,6 +149,8 @@ GPUColumn::GetData() {
             return reinterpret_cast<uint8_t*>(GetDataFloat32());
         case ColumnType::FLOAT64:
             return reinterpret_cast<uint8_t*>(GetDataFloat64());
+        case ColumnType::BOOLEAN:
+            return reinterpret_cast<uint8_t*>(GetDataBoolean());
         case ColumnType::VARCHAR:
             return reinterpret_cast<uint8_t*>(GetDataVarChar());
         default:

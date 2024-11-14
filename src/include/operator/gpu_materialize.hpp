@@ -13,4 +13,7 @@ ResolveTypeMaterializeExpression(GPUColumn* column, BoundReferenceExpression& bo
 GPUColumn* 
 HandleMaterializeExpression(GPUColumn* column, BoundReferenceExpression& bound_ref, GPUBufferManager* gpuBufferManager);
 
+GPUColumn* 
+HandleMaterializeRowIDs(GPUColumn* in_column, uint64_t count, uint64_t* row_ids, GPUBufferManager* gpuBufferManager);
+
 } // namespace duckdb

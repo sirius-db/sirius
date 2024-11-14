@@ -13,21 +13,19 @@
 
 namespace duckdb {
 
-template <typename T>
-void probeHashTable(uint64_t *keys, unsigned long long* ht, uint64_t ht_len, uint64_t* &row_ids_left, uint64_t* &row_ids_right, uint64_t* &count, uint64_t N, int mode);
+void probeHashTable(uint64_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t* &row_ids_left, uint64_t* &row_ids_right, uint64_t* &count, 
+			uint64_t N, int* condition_mode, int num_keys, bool is_right);
 
-template <typename T>
-void buildHashTable(uint64_t *keys, unsigned long long* ht, uint64_t ht_len, uint64_t N, int mode);
+void probeHashTableRightSemiAnti(uint64_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t N, int* condition_mode, int num_keys);
 
-void probeHashTableMultiKey(uint64_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t* &row_ids_left, uint64_t* &row_ids_right, uint64_t* &count, uint64_t N, int* condition_mode, int num_keys);
+void probeHashTableSingleMatch(uint64_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t* &row_ids_left, uint64_t* &row_ids_right, 
+            uint64_t* &count, uint64_t N, int* condition_mode, int num_keys, int join_mode);
 
-void buildHashTableMultiKey(uint64_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t N, int num_keys);
+void probeHashTableMark(uint64_t **keys, unsigned long long* ht, uint64_t ht_len, uint8_t* &output, uint64_t N, int* condition_mode, int num_keys);
 
-void probeHashTableRight(uint64_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t N, int* condition_mode, int num_keys);
+void buildHashTable(uint64_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t N, int num_keys, bool is_right);
 
-void buildHashTableRight(uint64_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t N, int num_keys);
-
-void scanHashTableRight(unsigned long long* ht, uint64_t ht_len, uint64_t* &row_ids, uint64_t* &count, uint64_t N, int join_mode, int num_keys);
+void scanHashTableRight(unsigned long long* ht, uint64_t ht_len, uint64_t* &row_ids, uint64_t* &count, int join_mode, int num_keys);
 
 class GPUPhysicalHashJoin : public GPUPhysicalOperator {
 public:

@@ -125,6 +125,8 @@ HandleMaterializeExpression(GPUColumn* column, GPUBufferManager* gpuBufferManage
             return ResolveTypeMaterializeExpression<float>(column, gpuBufferManager);
         case ColumnType::FLOAT64:
             return ResolveTypeMaterializeExpression<double>(column, gpuBufferManager);
+        case ColumnType::BOOLEAN:
+            return ResolveTypeMaterializeExpression<uint8_t>(column, gpuBufferManager);
         default:
             throw NotImplementedException("Unsupported column type");
     }
