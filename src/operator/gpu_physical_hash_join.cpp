@@ -33,6 +33,7 @@ ResolveTypeProbeExpression(GPUColumn** &probe_keys, uint64_t* &count, uint64_t* 
 	//TODO: Need to handle special case for unique keys for better performance
 	if (join_type == JoinType::INNER) {
 		probeHashTable(probe_data, ht, ht_len, row_ids_left, row_ids_right, count, size, condition_mode, num_keys, 0);
+		// probeHashTableOri<uint64_t>(probe_data[0], ht, ht_len, row_ids_left, row_ids_right, count, size, 0);
 	} else if (join_type == JoinType::SEMI) {
 		probeHashTableSingleMatch(probe_data, ht, ht_len, row_ids_left, row_ids_right, count, size, condition_mode, num_keys, 1);
 	} else if (join_type == JoinType::ANTI) {
@@ -113,6 +114,7 @@ ResolveTypeBuildExpression(GPUColumn** &build_keys, unsigned long long* ht, uint
 
 	if (join_type == JoinType::INNER || join_type == JoinType::SEMI || join_type == JoinType::MARK) {
 		buildHashTable(build_data, ht, ht_len, size, num_keys, 0);
+		// buildHashTableOri<uint64_t>(build_data[0], ht, ht_len, size, 0);
 	} else if (join_type == JoinType::RIGHT || join_type == JoinType::RIGHT_SEMI || join_type == JoinType::RIGHT_ANTI) {
 		buildHashTable(build_data, ht, ht_len, size, num_keys, 1);
 	} else {
@@ -243,10 +245,11 @@ GPUPhysicalHashJoin::GetData(GPUIntermediateRelation &output_relation) const {
 	uint64_t* row_ids = nullptr;
 	uint64_t* count = nullptr;
 	GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+	count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
 	HandleScanHTExpression(gpu_hash_table, ht_len, row_ids, count, join_type, conditions);
 
 	//TODO: FIX THIS LATER!!
-	if (join_type == JoinType::RIGHT && count[0] > 0) throw NotImplementedException("Right join with scanHT count > 0 is not supported yet");
+	// if (join_type == JoinType::RIGHT && count[0] > 0) throw NotImplementedException("Right join with scanHT count > 0 is not supported yet");
 
 	for (idx_t i = 0; i < rhs_output_columns.size(); i++) {
 		const auto rhs_col = rhs_output_columns[i];
@@ -381,19 +384,23 @@ GPUPhysicalHashJoin::Sink(GPUIntermediateRelation &input_relation) const {
 
 	GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 	GPUColumn** build_keys = new GPUColumn*[conditions.size()];
-	uint64_t size;
-	if (conditions.size() > 1) throw NotImplementedException("Multiple conditions not supported yet");
+	// if (conditions.size() > 1) throw NotImplementedException("Multiple conditions not supported yet");
 
 	for (idx_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
 		auto &condition = conditions[cond_idx];
         auto join_key_index = condition.right->Cast<BoundReferenceExpression>().index;
+		// ht_len = input_relation.columns[join_key_index]->column_length * 2;
         printf("Reading join key for building hash table from index %ld\n", join_key_index);
 		build_keys[cond_idx] = HandleMaterializeExpression(input_relation.columns[join_key_index], condition.right->Cast<BoundReferenceExpression>(), gpuBufferManager);
 	}
 
 	printf("Building hash table\n");
-	gpu_hash_table = (unsigned long long*) gpuBufferManager->customCudaMalloc<uint64_t>(size * 2 * 2, 0, 0);
 	ht_len = build_keys[0]->column_length * 2;
+	if (join_type == JoinType::INNER || join_type == JoinType::SEMI || join_type == JoinType::MARK) {
+		gpu_hash_table = (unsigned long long*) gpuBufferManager->customCudaMalloc<uint64_t>(ht_len * (conditions.size() + 1), 0, 0);
+	} else if (join_type == JoinType::RIGHT || join_type == JoinType::RIGHT_SEMI || join_type == JoinType::RIGHT_ANTI) {
+		gpu_hash_table = (unsigned long long*) gpuBufferManager->customCudaMalloc<uint64_t>(ht_len * (conditions.size() + 2), 0, 0);
+	}
 	HandleBuildExpression(build_keys, gpu_hash_table, ht_len, conditions, join_type, gpuBufferManager);
 
 	int right_idx = 0;

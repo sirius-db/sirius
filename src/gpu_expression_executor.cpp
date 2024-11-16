@@ -188,42 +188,6 @@ GPUExpressionExecutor::HandleComparisonExpression(GPUColumn* column1, GPUColumn*
     }
 }
 
-// template <typename T>
-// GPUColumn* 
-// GPUExpressionExecutor::ResolveTypeMaterializeExpression(GPUColumn* column, BoundReferenceExpression& bound_ref, GPUBufferManager* gpuBufferManager) {
-//     // GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
-//     size_t size;
-//     T* a;
-//     if (column->row_ids != nullptr) {
-//         T* temp = reinterpret_cast<T*> (column->data_wrapper.data);
-//         uint64_t* row_ids_input = reinterpret_cast<uint64_t*> (column->row_ids);
-//         a = gpuBufferManager->customCudaMalloc<T>(column->row_id_count, 0, 0);
-//         materializeExpression<T>(temp, a, row_ids_input, column->row_id_count);
-//         size = column->row_id_count;
-//     } else {
-//         a = reinterpret_cast<T*> (column->data_wrapper.data);
-//         size = column->column_length;
-//     }
-//     GPUColumn* result = new GPUColumn(size, column->data_wrapper.type, reinterpret_cast<uint8_t*>(a));
-//     return result;
-// }
-
-// GPUColumn* 
-// GPUExpressionExecutor::HandleMaterializeExpression(GPUColumn* column, BoundReferenceExpression& bound_ref, GPUBufferManager* gpuBufferManager) {
-//     switch(column->data_wrapper.type) {
-//         case ColumnType::INT32:
-//             return ResolveTypeMaterializeExpression<int>(column, bound_ref, gpuBufferManager);
-//         case ColumnType::INT64:
-//             return ResolveTypeMaterializeExpression<uint64_t>(column, bound_ref, gpuBufferManager);
-//         case ColumnType::FLOAT32:
-//             return ResolveTypeMaterializeExpression<float>(column, bound_ref, gpuBufferManager);
-//         case ColumnType::FLOAT64:
-//             return ResolveTypeMaterializeExpression<double>(column, bound_ref, gpuBufferManager);
-//         default:
-//             throw NotImplementedException("Unsupported column type");
-//     }
-// }
-
 void 
 GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_relation, GPUIntermediateRelation& output_relation, Expression& expr, int depth) {
     bool is_specific_filter = HandlingSpecificFilter(input_relation, output_relation, expr);
@@ -235,105 +199,116 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
 
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 
-	switch (expr.expression_class) {
-	case ExpressionClass::BOUND_BETWEEN: {
-        auto &bound_between = expr.Cast<BoundBetweenExpression>();
-        printf("Executing between expression\n");
-        // FilterRecursiveExpression(input_relation, output_relation, *(bound_between.input), depth + 1);
-        // FilterRecursiveExpression(input_relation, output_relation, *(bound_between.lower), depth + 1);
-        // FilterRecursiveExpression(input_relation, output_relation, *(bound_between.upper), depth + 1);
-        auto &bound_ref = bound_between.input->Cast<BoundReferenceExpression>();
-        auto &bound_lower = bound_between.lower->Cast<BoundConstantExpression>();
-        auto &bound_upper = bound_between.upper->Cast<BoundConstantExpression>();
-        size_t size;
+	  switch (expr.expression_class) {
+          case ExpressionClass::BOUND_BETWEEN: {
+                auto &bound_between = expr.Cast<BoundBetweenExpression>();
+                printf("Executing between expression\n");
+                // FilterRecursiveExpression(input_relation, output_relation, *(bound_between.input), depth + 1);
+                // FilterRecursiveExpression(input_relation, output_relation, *(bound_between.lower), depth + 1);
+                // FilterRecursiveExpression(input_relation, output_relation, *(bound_between.upper), depth + 1);
+                auto &bound_ref = bound_between.input->Cast<BoundReferenceExpression>();
+                auto &bound_lower = bound_between.lower->Cast<BoundConstantExpression>();
+                auto &bound_upper = bound_between.upper->Cast<BoundConstantExpression>();
+                size_t size;
 
-        GPUColumn* materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref.index], bound_ref, gpuBufferManager);
-        count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
-        HandleComparisonConstantExpression(materialized_column, bound_lower, bound_upper, count, comparison_idx, bound_between.type);
-        if (count[0] == 0) throw NotImplementedException("No match found");
-		break;
-    } case ExpressionClass::BOUND_REF: {
-        auto &bound_ref = expr.Cast<BoundReferenceExpression>();
-        printf("Executing bound reference expression\n");
-        printf("Reading column index %ld\n", bound_ref.index);
-		    input_relation.checkLateMaterialization(bound_ref.index);
-        // printf("output_relation.columns.size() %ld\n", output_relation.columns.size());
-        // printf("input_relation.columns.size() %ld\n", input_relation.columns.size());
-        // printf("bound_ref.index %ld\n", bound_ref.index);
-        output_relation.columns[bound_ref.index] = input_relation.columns[bound_ref.index];
-        output_relation.columns[bound_ref.index]->row_ids = new uint64_t[1];
-        printf("Overwrite row ids with column %ld\n", bound_ref.index);
-		break;
-	} case ExpressionClass::BOUND_CASE: {
-        auto &bound_case = expr.Cast<BoundCaseExpression>();
-        printf("Executing case expression\n");
-        for (idx_t i = 0; i < bound_case.case_checks.size(); i++) {
-            FilterRecursiveExpression(input_relation, output_relation, *(bound_case.case_checks[i].when_expr), depth + 1);
-            FilterRecursiveExpression(input_relation, output_relation, *(bound_case.case_checks[i].then_expr), depth + 1);
-        }
-        FilterRecursiveExpression(input_relation, output_relation, *(bound_case.else_expr), depth + 1);
-		break;
-	} case ExpressionClass::BOUND_CAST: {
-        auto &bound_cast = expr.Cast<BoundCastExpression>();
-        printf("Executing cast expression\n");
-        FilterRecursiveExpression(input_relation, output_relation, *(bound_cast.child), depth + 1);
-		break;
-	} case ExpressionClass::BOUND_COMPARISON: {
-        auto &bound_comparison = expr.Cast<BoundComparisonExpression>();
-        printf("Executing comparison expression\n");
-        // FilterRecursiveExpression(input_relation, output_relation, *(bound_comparison.left), depth + 1);
-        // FilterRecursiveExpression(input_relation, output_relation, *(bound_comparison.right), depth + 1);
+                GPUColumn* materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref.index], bound_ref, gpuBufferManager);
+                count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+                HandleComparisonConstantExpression(materialized_column, bound_lower, bound_upper, count, comparison_idx, bound_between.type);
+                if (count[0] == 0) throw NotImplementedException("No match found");
+            break;
+            } case ExpressionClass::BOUND_REF: {
+                auto &bound_ref = expr.Cast<BoundReferenceExpression>();
+                printf("Executing bound reference expression\n");
+                printf("Reading column index %ld\n", bound_ref.index);
+                input_relation.checkLateMaterialization(bound_ref.index);
+                // printf("output_relation.columns.size() %ld\n", output_relation.columns.size());
+                // printf("input_relation.columns.size() %ld\n", input_relation.columns.size());
+                // printf("bound_ref.index %ld\n", bound_ref.index);
+                output_relation.columns[bound_ref.index] = input_relation.columns[bound_ref.index];
+                output_relation.columns[bound_ref.index]->row_ids = new uint64_t[1];
+                printf("Overwrite row ids with column %ld\n", bound_ref.index);
+            break;
+          } case ExpressionClass::BOUND_CASE: {
+                auto &bound_case = expr.Cast<BoundCaseExpression>();
+                printf("Executing case expression\n");
+                for (idx_t i = 0; i < bound_case.case_checks.size(); i++) {
+                    FilterRecursiveExpression(input_relation, output_relation, *(bound_case.case_checks[i].when_expr), depth + 1);
+                    FilterRecursiveExpression(input_relation, output_relation, *(bound_case.case_checks[i].then_expr), depth + 1);
+                }
+                FilterRecursiveExpression(input_relation, output_relation, *(bound_case.else_expr), depth + 1);
+            break;
+          } case ExpressionClass::BOUND_CAST: {
+                auto &bound_cast = expr.Cast<BoundCastExpression>();
+                printf("Executing cast expression\n");
+                FilterRecursiveExpression(input_relation, output_relation, *(bound_cast.child), depth + 1);
+            break;
+          } case ExpressionClass::BOUND_COMPARISON: {
+                auto &bound_comparison = expr.Cast<BoundComparisonExpression>();
+                printf("Executing comparison expression\n");
+                // FilterRecursiveExpression(input_relation, output_relation, *(bound_comparison.left), depth + 1);
+                // FilterRecursiveExpression(input_relation, output_relation, *(bound_comparison.right), depth + 1);
 
-        if (bound_comparison.right->expression_class == ExpressionClass::BOUND_CONSTANT) {
-            auto &bound_ref1 = bound_comparison.left->Cast<BoundReferenceExpression>();
-            auto &bound_ref2 = bound_comparison.right->Cast<BoundConstantExpression>();
-            size_t size;
+                if (bound_comparison.right->expression_class == ExpressionClass::BOUND_CONSTANT) {
+                    auto &bound_ref1 = bound_comparison.left->Cast<BoundReferenceExpression>();
+                    auto &bound_ref2 = bound_comparison.right->Cast<BoundConstantExpression>();
+                    size_t size;
 
-            GPUColumn* materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref1.index], bound_ref1, gpuBufferManager);
-            count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
-            HandleComparisonConstantExpression(materialized_column, bound_ref2, bound_ref2, count, comparison_idx, bound_comparison.type);
-        } else if (bound_comparison.right->expression_class == ExpressionClass::BOUND_REF) {
-            auto &bound_ref1 = bound_comparison.left->Cast<BoundReferenceExpression>();
-            auto &bound_ref2 = bound_comparison.right->Cast<BoundReferenceExpression>();
-            size_t size;
+                    if (input_relation.columns[bound_ref1.index]->data_wrapper.data == nullptr) {
+                        printf("Column is null\n");
+                        count[0] = 0;
+                    } else {
+                        GPUColumn* materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref1.index], bound_ref1, gpuBufferManager);
+                        count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+                        HandleComparisonConstantExpression(materialized_column, bound_ref2, bound_ref2, count, comparison_idx, bound_comparison.type);
+                        if (count[0] == 0) throw NotImplementedException("No match found");
+                    }
+                } else if (bound_comparison.right->expression_class == ExpressionClass::BOUND_REF) {
+                    auto &bound_ref1 = bound_comparison.left->Cast<BoundReferenceExpression>();
+                    auto &bound_ref2 = bound_comparison.right->Cast<BoundReferenceExpression>();
+                    size_t size;
 
-            GPUColumn* materialized_column1 = HandleMaterializeExpression(input_relation.columns[bound_ref1.index], bound_ref1, gpuBufferManager);
-            GPUColumn* materialized_column2 = HandleMaterializeExpression(input_relation.columns[bound_ref2.index], bound_ref2, gpuBufferManager);
-            count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
-            HandleComparisonExpression(materialized_column1, materialized_column2, count, comparison_idx, bound_comparison.type);            
-        }
-        if (count[0] == 0) throw NotImplementedException("No match found");
-		break;
-	} case ExpressionClass::BOUND_CONJUNCTION: {
-        auto &bound_conjunction = expr.Cast<BoundConjunctionExpression>();
-		printf("Executing conjunction expression\n");
-        for (auto &child : bound_conjunction.children) {
-            FilterRecursiveExpression(input_relation, output_relation, *child, depth + 1);
-        }
-		break;
-	} case ExpressionClass::BOUND_CONSTANT: {
-        printf("Reading value %s\n", expr.Cast<BoundConstantExpression>().value.ToString().c_str());
-		break;
-	} case ExpressionClass::BOUND_FUNCTION: {
-        printf("Executing function expression\n");
-        auto &bound_function = expr.Cast<BoundFunctionExpression>();
-        for (auto &child : bound_function.children) {
-            FilterRecursiveExpression(input_relation, output_relation, *child, depth + 1);
-        }
-		break;
-	} case ExpressionClass::BOUND_OPERATOR: {
-        printf("Executing IN expression\n");
-        auto &bound_operator = expr.Cast<BoundOperatorExpression>();
-        for (auto &child : bound_operator.children) {
-            FilterRecursiveExpression(input_relation, output_relation, *child, depth + 1);
-        }
-		break;
-	} case ExpressionClass::BOUND_PARAMETER: {
-		throw NotImplementedException("Parameter expression is not supported");
-		break;
-	} default: {
-		throw InternalException("Attempting to execute expression of unknown type!");
-	}
+                    if (input_relation.columns[bound_ref1.index]->data_wrapper.data == nullptr) {
+                        printf("Column is null\n");
+                        count[0] = 0;
+                    } else {
+                        GPUColumn* materialized_column1 = HandleMaterializeExpression(input_relation.columns[bound_ref1.index], bound_ref1, gpuBufferManager);
+                        GPUColumn* materialized_column2 = HandleMaterializeExpression(input_relation.columns[bound_ref2.index], bound_ref2, gpuBufferManager);
+                        count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+                        HandleComparisonExpression(materialized_column1, materialized_column2, count, comparison_idx, bound_comparison.type);  
+                        if (count[0] == 0) throw NotImplementedException("No match found");   
+                    }       
+                }
+            break;
+          } case ExpressionClass::BOUND_CONJUNCTION: {
+                auto &bound_conjunction = expr.Cast<BoundConjunctionExpression>();
+            printf("Executing conjunction expression\n");
+                for (auto &child : bound_conjunction.children) {
+                    FilterRecursiveExpression(input_relation, output_relation, *child, depth + 1);
+                }
+            break;
+          } case ExpressionClass::BOUND_CONSTANT: {
+                printf("Reading value %s\n", expr.Cast<BoundConstantExpression>().value.ToString().c_str());
+            break;
+          } case ExpressionClass::BOUND_FUNCTION: {
+                printf("Executing function expression\n");
+                auto &bound_function = expr.Cast<BoundFunctionExpression>();
+                for (auto &child : bound_function.children) {
+                    FilterRecursiveExpression(input_relation, output_relation, *child, depth + 1);
+                }
+            break;
+          } case ExpressionClass::BOUND_OPERATOR: {
+                printf("Executing IN expression\n");
+                auto &bound_operator = expr.Cast<BoundOperatorExpression>();
+                for (auto &child : bound_operator.children) {
+                    FilterRecursiveExpression(input_relation, output_relation, *child, depth + 1);
+                }
+            break;
+          } case ExpressionClass::BOUND_PARAMETER: {
+            throw NotImplementedException("Parameter expression is not supported");
+            break;
+          } default: {
+            throw InternalException("Attempting to execute expression of unknown type!");
+          }
     }
 
     if (depth == 0) {
@@ -366,108 +341,80 @@ GPUExpressionExecutor::ProjectionRecursiveExpression(GPUIntermediateRelation& in
 
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 
-	switch (expr.expression_class) {
-	case ExpressionClass::BOUND_BETWEEN: {
-        auto &bound_between = expr.Cast<BoundBetweenExpression>();
-        printf("Executing between expression\n");
-        ProjectionRecursiveExpression(input_relation, output_relation, *(bound_between.input), output_idx, depth + 1);
-        ProjectionRecursiveExpression(input_relation, output_relation, *(bound_between.lower), output_idx, depth + 1);
-        ProjectionRecursiveExpression(input_relation, output_relation, *(bound_between.upper), output_idx, depth + 1);
-		break;
-	} case ExpressionClass::BOUND_REF: {
-        auto &bound_ref = expr.Cast<BoundReferenceExpression>();
-        printf("Executing bound reference expression\n");
-        printf("Reading column index %ld\n", bound_ref.index);
-		input_relation.checkLateMaterialization(bound_ref.index);
-		break;
-	} case ExpressionClass::BOUND_CASE: {
-        auto &bound_case = expr.Cast<BoundCaseExpression>();
-        printf("Executing case expression\n");
-        for (idx_t i = 0; i < bound_case.case_checks.size(); i++) {
-            ProjectionRecursiveExpression(input_relation, output_relation, *(bound_case.case_checks[i].when_expr), output_idx, depth + 1);
-            ProjectionRecursiveExpression(input_relation, output_relation, *(bound_case.case_checks[i].then_expr), output_idx, depth + 1);
+    switch (expr.expression_class) {
+        case ExpressionClass::BOUND_BETWEEN: {
+              auto &bound_between = expr.Cast<BoundBetweenExpression>();
+              printf("Executing between expression\n");
+              ProjectionRecursiveExpression(input_relation, output_relation, *(bound_between.input), output_idx, depth + 1);
+              ProjectionRecursiveExpression(input_relation, output_relation, *(bound_between.lower), output_idx, depth + 1);
+              ProjectionRecursiveExpression(input_relation, output_relation, *(bound_between.upper), output_idx, depth + 1);
+              break;
+        } case ExpressionClass::BOUND_REF: {
+              auto &bound_ref = expr.Cast<BoundReferenceExpression>();
+              printf("Executing bound reference expression\n");
+              printf("Reading column index %ld\n", bound_ref.index);
+              input_relation.checkLateMaterialization(bound_ref.index);
+              break;
+        } case ExpressionClass::BOUND_CASE: {
+              auto &bound_case = expr.Cast<BoundCaseExpression>();
+              printf("Executing case expression\n");
+              for (idx_t i = 0; i < bound_case.case_checks.size(); i++) {
+                  ProjectionRecursiveExpression(input_relation, output_relation, *(bound_case.case_checks[i].when_expr), output_idx, depth + 1);
+                  ProjectionRecursiveExpression(input_relation, output_relation, *(bound_case.case_checks[i].then_expr), output_idx, depth + 1);
+              }
+              ProjectionRecursiveExpression(input_relation, output_relation, *(bound_case.else_expr), output_idx, depth + 1);
+              break;
+        } case ExpressionClass::BOUND_CAST: {
+              auto &bound_cast = expr.Cast<BoundCastExpression>();
+              printf("Executing cast expression\n");
+              ProjectionRecursiveExpression(input_relation, output_relation, *(bound_cast.child), output_idx, depth + 1);
+              break;
+        } case ExpressionClass::BOUND_COMPARISON: {
+              auto &bound_comparison = expr.Cast<BoundComparisonExpression>();
+              printf("Executing comparison expression\n");
+              ProjectionRecursiveExpression(input_relation, output_relation, *(bound_comparison.left), output_idx, depth + 1);
+              ProjectionRecursiveExpression(input_relation, output_relation, *(bound_comparison.right), output_idx, depth + 1);
+              break;
+        } case ExpressionClass::BOUND_CONJUNCTION: {
+              auto &bound_conjunction = expr.Cast<BoundConjunctionExpression>();
+              printf("Executing conjunction expression\n");
+              for (auto &child : bound_conjunction.children) {
+                  ProjectionRecursiveExpression(input_relation, output_relation, *child, output_idx, depth + 1);
+              }
+              break;
+        } case ExpressionClass::BOUND_CONSTANT: {
+              printf("Reading value %s\n", expr.Cast<BoundConstantExpression>().value.ToString().c_str());
+              break;
+        } case ExpressionClass::BOUND_FUNCTION: {
+              printf("Executing function expression\n");
+              auto &bound_function = expr.Cast<BoundFunctionExpression>();
+              // for (auto &child : bound_function.children) {
+              //     ProjectionRecursiveExpression(input_relation, output_relation, *child, output_idx, depth + 1);
+              // }
+
+              if (bound_function.children[1]->expression_class == ExpressionClass::BOUND_CONSTANT) {
+                  auto &bound_ref1 = bound_function.children[0]->Cast<BoundReferenceExpression>();
+                  auto &bound_ref2 = bound_function.children[1]->Cast<BoundConstantExpression>();
+                  GPUColumn* materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref1.index], bound_ref1, gpuBufferManager);
+                  result = HandleBinaryConstantExpression(materialized_column, bound_ref2, gpuBufferManager, bound_function.function.name);
+              } else if (bound_function.children[1]->expression_class == ExpressionClass::BOUND_REF) {
+                  auto &bound_ref1 = bound_function.children[0]->Cast<BoundReferenceExpression>();
+                  auto &bound_ref2 = bound_function.children[1]->Cast<BoundReferenceExpression>();
+                  GPUColumn* materialized_column1 = HandleMaterializeExpression(input_relation.columns[bound_ref1.index], bound_ref1, gpuBufferManager);
+                  GPUColumn* materialized_column2 = HandleMaterializeExpression(input_relation.columns[bound_ref2.index], bound_ref2, gpuBufferManager);
+                  result = HandleBinaryExpression(materialized_column1, materialized_column2, gpuBufferManager, bound_function.function.name);            
+              }
+              break;
+        } case ExpressionClass::BOUND_OPERATOR: {
+              throw NotImplementedException("Operator expression is not supported");
+              break;
+        } case ExpressionClass::BOUND_PARAMETER: {
+              throw NotImplementedException("Parameter expression is not supported");
+              break;
+        } default: {
+              throw InternalException("Attempting to execute expression of unknown type!");
         }
-        ProjectionRecursiveExpression(input_relation, output_relation, *(bound_case.else_expr), output_idx, depth + 1);
-		break;
-	} case ExpressionClass::BOUND_CAST: {
-        auto &bound_cast = expr.Cast<BoundCastExpression>();
-        printf("Executing cast expression\n");
-        ProjectionRecursiveExpression(input_relation, output_relation, *(bound_cast.child), output_idx, depth + 1);
-		break;
-	} case ExpressionClass::BOUND_COMPARISON: {
-        auto &bound_comparison = expr.Cast<BoundComparisonExpression>();
-        printf("Executing comparison expression\n");
-        ProjectionRecursiveExpression(input_relation, output_relation, *(bound_comparison.left), output_idx, depth + 1);
-        ProjectionRecursiveExpression(input_relation, output_relation, *(bound_comparison.right), output_idx, depth + 1);
-		break;
-	} case ExpressionClass::BOUND_CONJUNCTION: {
-        auto &bound_conjunction = expr.Cast<BoundConjunctionExpression>();
-		printf("Executing conjunction expression\n");
-        for (auto &child : bound_conjunction.children) {
-            ProjectionRecursiveExpression(input_relation, output_relation, *child, output_idx, depth + 1);
-        }
-		break;
-	} case ExpressionClass::BOUND_CONSTANT: {
-        printf("Reading value %s\n", expr.Cast<BoundConstantExpression>().value.ToString().c_str());
-		break;
-	} case ExpressionClass::BOUND_FUNCTION: {
-        printf("Executing function expression\n");
-        auto &bound_function = expr.Cast<BoundFunctionExpression>();
-        // for (auto &child : bound_function.children) {
-        //     ProjectionRecursiveExpression(input_relation, output_relation, *child, output_idx, depth + 1);
-        // }
-
-        if (bound_function.children[1]->expression_class == ExpressionClass::BOUND_CONSTANT) {
-            auto &bound_ref1 = bound_function.children[0]->Cast<BoundReferenceExpression>();
-            auto &bound_ref2 = bound_function.children[1]->Cast<BoundConstantExpression>();
-            GPUColumn* materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref1.index], bound_ref1, gpuBufferManager);
-            result = HandleBinaryConstantExpression(materialized_column, bound_ref2, gpuBufferManager, bound_function.function.name);
-        } else if (bound_function.children[1]->expression_class == ExpressionClass::BOUND_REF) {
-            auto &bound_ref1 = bound_function.children[0]->Cast<BoundReferenceExpression>();
-            auto &bound_ref2 = bound_function.children[1]->Cast<BoundReferenceExpression>();
-            GPUColumn* materialized_column1 = HandleMaterializeExpression(input_relation.columns[bound_ref1.index], bound_ref1, gpuBufferManager);
-            GPUColumn* materialized_column2 = HandleMaterializeExpression(input_relation.columns[bound_ref2.index], bound_ref2, gpuBufferManager);
-            result = HandleBinaryExpression(materialized_column1, materialized_column2, gpuBufferManager, bound_function.function.name);            
-        }
-
-        // auto &bound_ref1 = bound_function.children[0]->Cast<BoundReferenceExpression>();
-        // auto &bound_ref2 = bound_function.children[1]->Cast<BoundReferenceExpression>();
-        // size_t size = input_relation.columns[bound_ref1.index]->column_length;
-        // double* ptr_double = gpuBufferManager->customCudaMalloc<double>(size, 0, 0);
-
-        // double* a, *b;
-        // if (input_relation.checkLateMaterialization(bound_ref1.index)) {
-        //     double* temp = reinterpret_cast<double*> (input_relation.columns[bound_ref1.index]->data_wrapper.data);
-        //     uint64_t* row_ids_input = reinterpret_cast<uint64_t*> (input_relation.columns[bound_ref1.index]->row_ids);
-        //     a = gpuBufferManager->customCudaMalloc<double>(input_relation.columns[bound_ref1.index]->row_id_count, 0, 0);
-        //     materializeExpression<double>(temp, a, row_ids_input, input_relation.columns[bound_ref1.index]->row_id_count);
-        // } else {
-        //     a = reinterpret_cast<double*> (input_relation.columns[bound_ref1.index]->data_wrapper.data);
-        // }
-
-        // if (input_relation.checkLateMaterialization(bound_ref2.index)) {
-        //     double* temp = reinterpret_cast<double*> (input_relation.columns[bound_ref2.index]->data_wrapper.data);
-        //     uint64_t* row_ids_input = reinterpret_cast<uint64_t*> (input_relation.columns[bound_ref2.index]->row_ids);
-        //     b = gpuBufferManager->customCudaMalloc<double>(input_relation.columns[bound_ref2.index]->row_id_count, 0, 0);
-        //     materializeExpression<double>(temp, b, row_ids_input, input_relation.columns[bound_ref2.index]->row_id_count);
-        //     size = input_relation.columns[bound_ref2.index]->row_id_count;
-        // } else {
-        //     b = reinterpret_cast<double*> (input_relation.columns[bound_ref2.index]->data_wrapper.data);
-        //     size = input_relation.columns[bound_ref2.index]->column_length;
-        // }
-        // binaryExpression<double>(a, b, ptr_double, (uint64_t) size, 0);
-        // result = new GPUColumn(size, ColumnType::FLOAT64, reinterpret_cast<uint8_t*>(ptr_double));
-		break;
-	} case ExpressionClass::BOUND_OPERATOR: {
-		throw NotImplementedException("Operator expression is not supported");
-		break;
-	} case ExpressionClass::BOUND_PARAMETER: {
-		throw NotImplementedException("Parameter expression is not supported");
-		break;
-	} default: {
-		throw InternalException("Attempting to execute expression of unknown type!");
-	}
-  }
+    }
     printf("Writing projection result to idx %ld\n", output_idx);
     if (depth == 0) {
         if (expr.expression_class == ExpressionClass::BOUND_REF) {

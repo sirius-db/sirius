@@ -149,7 +149,6 @@ __global__ void probe_mark(uint64_t **keys, unsigned long long* ht, uint64_t ht_
                     uint64_t item = keys[n][tile_offset + threadIdx.x + ITEM * B];
                     if (condition_mode[n] == 0 && ht[slot * n_ht_column + n] != item) local_found = 0;
                     else if (condition_mode[n] == 1 && ht[slot * n_ht_column + n] == item) local_found = 0;
-                    else cudaAssert(0);
                 }
                 if (local_found) {
                     found = 1;

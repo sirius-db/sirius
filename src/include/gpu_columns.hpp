@@ -47,6 +47,8 @@ public:
     uint64_t* row_ids;
     size_t row_id_count;
     size_t column_length;
+    // bool isNull;
+    bool isUnique;
 };
 
 class GPUIntermediateRelation {

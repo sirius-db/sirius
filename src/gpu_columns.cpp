@@ -55,6 +55,8 @@ GPUColumn::GPUColumn(size_t _column_length, ColumnType type, uint8_t* data) {
     column_length = _column_length;
     data_wrapper = DataWrapper(type, data, _column_length);
     row_ids = nullptr;
+    // if (data == nullptr) isNull = 1;
+    // else isNull = 0;
 }
 
 GPUColumn::GPUColumn(string _name, size_t _column_length, ColumnType type, uint8_t* data) {
@@ -62,25 +64,9 @@ GPUColumn::GPUColumn(string _name, size_t _column_length, ColumnType type, uint8
     column_length = _column_length;
     data_wrapper = DataWrapper(type, data, _column_length);
     row_ids = nullptr;
+    // if (data == nullptr) isNull = 1;
+    // else isNull = 0;
 }
-
-// DataChunk
-// GPUColumn::ConvertToChunk() {
-//     name = _name;
-//     column_length = _column_length;
-//     data_wrapper = DataWrapper(type, data, _column_length);
-//     row_ids = nullptr;
-// }
-
-
-// GPUIntermediateRelation::GPUIntermediateRelation(size_t length, size_t column_count) :
-//         length(length), column_count(column_count) {
-//     column_names.resize(column_count);
-//     columns.resize(column_count);
-//     for (int i = 0; i < column_count; i++) {
-//         columns[i] = nullptr;
-//     }
-// }
 
 GPUIntermediateRelation::GPUIntermediateRelation(size_t column_count) :
         column_count(column_count) {
@@ -94,12 +80,11 @@ GPUIntermediateRelation::GPUIntermediateRelation(size_t column_count) :
 bool
 GPUIntermediateRelation::checkLateMaterialization(size_t idx) {
     printf("Checking if column idx %ld needs to be materialized from column size %d\n", idx, columns.size());
-    // if (columns[idx]) {
-    //     printf("Im here\n");
-    //     if (columns[idx]->row_ids != nullptr) {
-    //         printf("Im even more here\n");
-    //     }
-    // }
+    if (columns[idx] == nullptr) {
+        printf("Column idx %ld is null\n", idx);
+        return false;
+    }
+
     if (columns[idx]->row_ids == nullptr) {
         printf("Column idx %d already materialized\n", idx);
     } else {

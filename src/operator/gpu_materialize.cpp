@@ -7,6 +7,9 @@ GPUColumn*
 ResolveTypeMaterializeExpression(GPUColumn* column, BoundReferenceExpression& bound_ref, GPUBufferManager* gpuBufferManager) {
     size_t size;
     T* a;
+    if (column->data_wrapper.data == nullptr) {
+        return new GPUColumn(column->column_length, column->data_wrapper.type, nullptr);
+    }
     if (column->row_ids != nullptr) {
         T* temp = reinterpret_cast<T*> (column->data_wrapper.data);
         uint64_t* row_ids_input = reinterpret_cast<uint64_t*> (column->row_ids);

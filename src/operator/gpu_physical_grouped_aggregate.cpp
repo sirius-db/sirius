@@ -6,6 +6,30 @@
 
 namespace duckdb {
 
+template <typename T>
+GPUColumn*
+ResolveTypeCombineColumns(GPUColumn* column1, GPUColumn* column2, GPUBufferManager* gpuBufferManager) {
+	T* combine = gpuBufferManager->customCudaMalloc<T>(column1->column_length + column2->column_length, 0, 0);
+	T* a = reinterpret_cast<T*> (column1->data_wrapper.data);
+	T* b = reinterpret_cast<T*> (column2->data_wrapper.data);
+	combineColumns<T>(a, b, combine, column1->column_length, column2->column_length);
+	return new GPUColumn(column1->column_length + column2->column_length, column1->data_wrapper.type, reinterpret_cast<uint8_t*>(combine));
+}
+
+GPUColumn*
+CombineColumns(GPUColumn* column1, GPUColumn* column2, GPUBufferManager* gpuBufferManager) {
+    switch(column1->data_wrapper.type) {
+      case ColumnType::INT64:
+		return ResolveTypeCombineColumns<uint64_t>(column1, column2, gpuBufferManager);
+		break;
+      case ColumnType::FLOAT64:
+		return ResolveTypeCombineColumns<double>(column1, column2, gpuBufferManager);
+		break;
+      default:
+        throw NotImplementedException("Unsupported column type");
+    }
+}
+
 template <typename T, typename V>
 void
 ResolveTypeGroupByAggregateExpression(GPUColumn** &group_by_keys, GPUColumn** &aggregate_keys, GPUBufferManager* gpuBufferManager, const vector<unique_ptr<Expression>> &aggregates, int num_group_keys) {
@@ -38,6 +62,12 @@ ResolveTypeGroupByAggregateExpression(GPUColumn** &group_by_keys, GPUColumn** &a
 		} else if (expr.function.name.compare("count_star") == 0) {
 			agg_mode[agg_idx] = 4;
 			aggregate_data[agg_idx] = nullptr;
+		} else if (expr.function.name.compare("count") == 0 && aggregate_keys[agg_idx]->data_wrapper.data != nullptr) {
+			agg_mode[agg_idx] = 4;
+			aggregate_data[agg_idx] = nullptr;
+		} else if (expr.function.name.compare("count") == 0 && aggregate_keys[agg_idx]->data_wrapper.data == nullptr) {
+			agg_mode[agg_idx] = 5;
+			aggregate_data[agg_idx] = nullptr;
 		} else {
 			throw NotImplementedException("Aggregate function not supported");
 		}
@@ -52,7 +82,7 @@ ResolveTypeGroupByAggregateExpression(GPUColumn** &group_by_keys, GPUColumn** &a
 
 	for (int agg_idx = 0; agg_idx < aggregates.size(); agg_idx++) {
 		auto& expr = aggregates[agg_idx]->Cast<BoundAggregateExpression>();
-		if (expr.function.name.compare("count_star") == 0) {
+		if (expr.function.name.compare("count_star") == 0 || expr.function.name.compare("count") == 0) {
 			aggregate_keys[agg_idx] = new GPUColumn(count[0], ColumnType::INT64, reinterpret_cast<uint8_t*>(aggregate_data[agg_idx]));
 		} else {
 			aggregate_keys[agg_idx] = new GPUColumn(count[0], aggregate_keys[agg_idx]->data_wrapper.type, reinterpret_cast<uint8_t*>(aggregate_data[agg_idx]));
@@ -69,6 +99,36 @@ HandleGroupByAggregateExpression(GPUColumn** &group_by_keys, GPUColumn** &aggreg
 		} else if (aggregate_keys[0]->data_wrapper.type == ColumnType::FLOAT64) {
 			ResolveTypeGroupByAggregateExpression<uint64_t, double>(group_by_keys, aggregate_keys, gpuBufferManager, aggregates, num_group_keys);
 		} else throw NotImplementedException("Unsupported column type");
+		break;
+      case ColumnType::FLOAT64:
+	  	throw NotImplementedException("Unsupported column type");
+      default:
+        throw NotImplementedException("Unsupported column type");
+    }
+}
+
+template <typename T>
+void ResolveTypeDuplicateElimination(GPUColumn** &group_by_keys, GPUBufferManager* gpuBufferManager, int num_group_keys) {
+	uint64_t count[1];
+	uint8_t** group_by_data = new uint8_t*[num_group_keys];
+
+	for (int group = 0; group < num_group_keys; group++) {
+		group_by_data[group] = (group_by_keys[group]->data_wrapper.data);
+	}
+	size_t size = group_by_keys[0]->column_length;
+
+	groupedWithoutAggregate<T>(group_by_data, count, size, num_group_keys);
+
+	// Reading groupby columns based on the grouping set
+	for (idx_t group = 0; group < num_group_keys; group++) {
+		group_by_keys[group] = new GPUColumn(count[0], group_by_keys[group]->data_wrapper.type, reinterpret_cast<uint8_t*>(group_by_data[group]));
+	}
+}
+
+void HandleDuplicateElimination(GPUColumn** &group_by_keys, GPUBufferManager* gpuBufferManager, int num_group_keys) {
+    switch(group_by_keys[0]->data_wrapper.type) {
+      case ColumnType::INT64:
+	  	ResolveTypeDuplicateElimination<uint64_t>(group_by_keys, gpuBufferManager, num_group_keys);
 		break;
       case ColumnType::FLOAT64:
 	  	throw NotImplementedException("Unsupported column type");
@@ -251,27 +311,12 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 			D_ASSERT(child_expr->type == ExpressionType::BOUND_REF);
 			auto &bound_ref_expr = child_expr->Cast<BoundReferenceExpression>();
 			printf("Reading aggregation column from index %d and passing it to index %d in groupby result\n", bound_ref_expr.index, grouped_aggregate_data.groups.size() + aggr_idx);
-			// input_relation.checkLateMaterialization(bound_ref_expr.index);
-			// group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] = input_relation.columns[bound_ref_expr.index];
-
-			// if (input_relation.checkLateMaterialization(bound_ref_expr.index)) {
-			// 	double* temp = reinterpret_cast<double*> (input_relation.columns[bound_ref_expr.index]->data_wrapper.data);
-			// 	uint64_t* row_ids_input = reinterpret_cast<uint64_t*> (input_relation.columns[bound_ref_expr.index]->row_ids);
-			// 	aggregate_vals[aggr_idx] = gpuBufferManager->customCudaMalloc<double>(input_relation.columns[bound_ref_expr.index]->row_id_count, 0, 0);
-			// 	materializeExpression<double>(temp, aggregate_vals[aggr_idx], row_ids_input, input_relation.columns[bound_ref_expr.index]->row_id_count);
-			// 	size = input_relation.columns[bound_ref_expr.index]->row_id_count;
-			// } else {
-			// 	aggregate_vals[aggr_idx] = reinterpret_cast<double*> (input_relation.columns[bound_ref_expr.index]->data_wrapper.data);
-			// 	size = input_relation.columns[bound_ref_expr.index]->column_length;
-			// }
 			aggregate_column[aggr_idx] = HandleMaterializeExpression(input_relation.columns[bound_ref_expr.index], bound_ref_expr, gpuBufferManager);
 		}
 		//here we probably have count(*) or sum(*) or something like that
 		if (aggr.children.size() == 0) {
 			// throw NotImplementedException("Aggregate without children not supported yet");
 			printf("Passing * aggregate to index %d in groupby result\n", grouped_aggregate_data.groups.size() + aggr_idx);
-			// group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] = new GPUColumn(0, ColumnType::INT64, nullptr);
-			// uint64_t* ones = gpuBufferManager->customCudaMalloc<uint64_t>(size, 0, 0);
 			aggregate_column[aggr_idx] = new GPUColumn(size, ColumnType::INT64, nullptr);
 		}
 		aggr_idx++;
@@ -288,23 +333,38 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 	}
 
 	uint64_t count[1];
-	HandleGroupByAggregateExpression(group_by_column, aggregate_column, gpuBufferManager, aggregates, num_group_keys);
-
+	if (aggregates.size() == 0) {
+		HandleDuplicateElimination(group_by_column, gpuBufferManager, num_group_keys);
+	} else {
+		HandleGroupByAggregateExpression(group_by_column, aggregate_column, gpuBufferManager, aggregates, num_group_keys);
+	}
+	
 	// Reading groupby columns based on the grouping set
 	for (idx_t i = 0; i < groupings.size(); i++) {
 		for (int idx = 0; idx < grouping_sets[i].size(); idx++) {
 			// group_by_result->columns[idx] = new GPUColumn(count[0], ColumnType::INT64, reinterpret_cast<uint8_t*>(group_keys[idx]));
-			group_by_result->columns[idx] = group_by_column[idx];
-			group_by_result->columns[idx]->row_ids = nullptr;
-			group_by_result->columns[idx]->row_id_count = 0;
+			// if (group_by_result->columns[idx] == nullptr) {
+				group_by_result->columns[idx] = group_by_column[idx];
+				group_by_result->columns[idx]->row_ids = nullptr;
+				group_by_result->columns[idx]->row_id_count = 0;
+			// } else {
+				// have to combine groupby from different meta pipelines
+				// group_by_result->columns[idx] = CombineColumns(group_by_result->columns[idx], group_by_column[idx], gpuBufferManager);
+			// }
+
 		}
 	}
 
 	for (int aggr_idx = 0; aggr_idx < aggregates.size(); aggr_idx++) {
 		// group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] = new GPUColumn(count[0], ColumnType::FLOAT64, reinterpret_cast<uint8_t*>(aggregate_vals[aggr_idx]));
-		group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] = aggregate_column[aggr_idx];
-		group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx]->row_ids = nullptr;
-		group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx]->row_id_count = 0;
+		// if (group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] == nullptr) {
+			group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] = aggregate_column[aggr_idx];
+			group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx]->row_ids = nullptr;
+			group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx]->row_id_count = 0;
+		// } else {
+			// have to combine groupby from different meta pipelines
+			// group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] = CombineColumns(group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx], aggregate_column[aggr_idx], gpuBufferManager);
+		// }
 	}
 
   	return SinkResultType::FINISHED;
