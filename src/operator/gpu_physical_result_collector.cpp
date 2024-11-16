@@ -192,15 +192,12 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 	uint8_t** host_data = new uint8_t*[input_relation.columns.size()];
 	GPUIntermediateRelation materialized_relation(input_relation.columns.size());
 	for (int col = 0; col < input_relation.columns.size(); col++) {
+		// TODO: Need to fix this for the future, but for now, we will just return when there is null column
+		if (input_relation.columns[col]->data_wrapper.data == nullptr) return SinkResultType::FINISHED;
 		// Final materialization
 		size_bytes = FinalMaterialize(input_relation, materialized_relation, col);
-		// printf("materialize row id count%ld\n", input_relation.columns[col]->row_id_count);
 		host_data[col] = allocator.AllocateData(size_bytes);
 		callCudaMemcpyDeviceToHost<uint8_t>(host_data[col], materialized_relation.columns[col]->data_wrapper.data, size_bytes, 0);
-		// for (int i = 0; i < 10; i++) {
-		// 	uint64_t* temp = reinterpret_cast<uint64_t*>(host_data[col]);
-		// 	printf("Data: %d\n", temp[i]);
-		// }
 	}
 
 	ColumnDataAppendState append_state;

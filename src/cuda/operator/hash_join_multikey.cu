@@ -47,7 +47,7 @@ __global__ void probe_multikey_count(uint64_t **keys, unsigned long long* ht, ui
 
     int n_ht_column;
     if (is_right) n_ht_column = num_keys + 2;
-    else  n_ht_column = num_keys + 1;
+    else n_ht_column = num_keys + 1;
 
     #pragma unroll
     for (int ITEM = 0; ITEM < I; ITEM++) {
@@ -64,7 +64,6 @@ __global__ void probe_multikey_count(uint64_t **keys, unsigned long long* ht, ui
                     uint64_t item = keys[n][tile_offset + threadIdx.x + ITEM * B];
                     if (condition_mode[n] == 0 && ht[slot * n_ht_column + n] != item) local_found = 0;
                     else if (condition_mode[n] == 1 && ht[slot * n_ht_column + n] == item) local_found = 0;
-                    else cudaAssert(0);
                 }
                 if (local_found) {
                     items_count[ITEM]++;
@@ -85,7 +84,7 @@ __global__ void probe_multikey_count(uint64_t **keys, unsigned long long* ht, ui
 
     __syncthreads();
 
-    if (blockIdx.x * B + threadIdx.x < (N + ITEMS_PER_THREAD - 1) / ITEMS_PER_THREAD) {
+     if (blockIdx.x * tile_size + threadIdx.x < N) {
         offset_each_thread[blockIdx.x * B + threadIdx.x] = block_off + c_t_count;
     }
 
@@ -107,9 +106,12 @@ __global__ void probe_multikey(uint64_t **keys, unsigned long long* ht, uint64_t
 
     int n_ht_column;
     if (is_right) n_ht_column = num_keys + 2;
-    else  n_ht_column = num_keys + 1;
+    else n_ht_column = num_keys + 1;
 
-    uint64_t output_offset = offset_each_thread[blockIdx.x * B + threadIdx.x];
+    uint64_t output_offset = 0;
+    if (blockIdx.x * tile_size + threadIdx.x < N) {
+        output_offset = offset_each_thread[blockIdx.x * B + threadIdx.x];
+    }
     #pragma unroll
     for (int ITEM = 0; ITEM < I; ITEM++) {
         if (threadIdx.x + (ITEM * B) < num_tile_items) {
@@ -118,13 +120,13 @@ __global__ void probe_multikey(uint64_t **keys, unsigned long long* ht, uint64_t
             else if (num_keys == 2) slot = hash64_multikey(keys[0][tile_offset + threadIdx.x + ITEM * B], keys[1][tile_offset + threadIdx.x + ITEM * B]) % ht_len;
             else cudaAssert(0);
             
+            bool found = 0;
             while (ht[slot * n_ht_column] != 0xFFFFFFFFFFFFFFFF) {
                 bool local_found = 1;
                 for (int n = 0; n < num_keys; n++) {
                     uint64_t item = keys[n][tile_offset + threadIdx.x + ITEM * B];
                     if (condition_mode[n] == 0 && ht[slot * n_ht_column + n] != item) local_found = 0;
                     else if (condition_mode[n] == 1 && ht[slot * n_ht_column + n] == item) local_found = 0;
-                    else cudaAssert(0);
                 }
                 if (local_found) {
                     row_ids_right[output_offset] = ht[slot * n_ht_column + num_keys];
@@ -137,97 +139,6 @@ __global__ void probe_multikey(uint64_t **keys, unsigned long long* ht, uint64_t
         }
     }
 }
-
-// //TODO: currently this probe does not support many to many join, for many to many join, we use cuCollections
-// template <int B, int I>
-// __global__ void probe_multikey(uint64_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t *row_ids_left, uint64_t *row_ids_right, 
-//             unsigned long long* count, uint64_t N, int* condition_mode, int num_keys, int is_count) {
-
-//     typedef cub::BlockScan<int, B> BlockScanInt;
-
-//     __shared__ union TempStorage
-//     {
-//         typename BlockScanInt::TempStorage scan;
-//     } temp_storage;
-
-//     // uint64_t items_key[I];
-//     uint64_t items_off[I];
-//     int selection_flags[I];
-
-//     uint64_t tile_size = B * I;
-//     uint64_t tile_offset = blockIdx.x * tile_size;
-
-//     uint64_t num_tiles = (N + tile_size - 1) / tile_size;
-//     uint64_t num_tile_items = tile_size;
-
-//     int t_count = 0; // Number of items selected per thread
-//     int c_t_count = 0; //Prefix sum of t_count
-//     __shared__ uint64_t block_off;
-
-//     if (blockIdx.x == num_tiles - 1) {
-//         num_tile_items = N - tile_offset;
-//     }
-
-//     #pragma unroll
-//     for (int ITEM = 0; ITEM < I; ITEM++) {
-//         selection_flags[ITEM] = 0;
-//     }
-
-//     #pragma unroll
-//     for (int ITEM = 0; ITEM < I; ITEM++) {
-//         if (threadIdx.x + (ITEM * B) < num_tile_items) {
-            
-//             uint64_t slot;
-//             if (num_keys == 1) slot = keys[0][tile_offset + threadIdx.x + ITEM * B] % ht_len;
-//             else if (num_keys == 2) slot = hash64_multikey(keys[0][tile_offset + threadIdx.x + ITEM * B], keys[1][tile_offset + threadIdx.x + ITEM * B]) % ht_len;
-//             else cudaAssert(0);
-            
-//             bool found = 0;
-//             while (ht[slot * (num_keys + 1)] != 0xFFFFFFFFFFFFFFFF) {
-//                 bool local_found = 1;
-//                 for (int n = 0; n < num_keys; n++) {
-//                     uint64_t item = keys[n][tile_offset + threadIdx.x + ITEM * B];
-//                     if (condition_mode[n] == 0 && ht[slot * (num_keys + 1) + n] != item) local_found = 0;
-//                     else if (condition_mode[n] == 1 && ht[slot * (num_keys + 1) + n] == item) local_found = 0;
-//                     else cudaAssert(0);
-//                 }
-//                 if (local_found) {
-//                     items_off[ITEM] = ht[slot * (num_keys + 1) + num_keys];
-//                     found = 1;
-//                     break;
-//                 }
-//                 slot = (slot + 100007) % ht_len;
-//             }
-//             if (found) {
-//                 selection_flags[ITEM] = 1;
-//                 t_count++;
-//             }
-//         }
-//     }
-
-//     //Barrier
-//     __syncthreads();
-
-//     BlockScanInt(temp_storage.scan).ExclusiveSum(t_count, c_t_count); //doing a prefix sum of all the previous threads in the block and store it to c_t_count
-//     if(threadIdx.x == blockDim.x - 1) { //if the last thread in the block, add the prefix sum of all the prev threads + sum of my threads to global variable total
-//         block_off = atomicAdd(count, (unsigned long long) t_count+c_t_count); //the previous value of total is gonna be assigned to block_off
-//     } //block_off does not need to be global (it's just need to be shared), because it will get the previous value from total which is global
-
-//     __syncthreads();
-
-//     if (is_count) return;
-
-//     #pragma unroll
-//     for (int ITEM = 0; ITEM < I; ++ITEM) {
-//         if (threadIdx.x + ITEM * B < num_tile_items) {
-//             if(selection_flags[ITEM]) {
-//                 uint64_t offset = block_off + c_t_count++;
-//                 row_ids_right[offset] = items_off[ITEM];
-//                 row_ids_left[offset] = tile_offset + threadIdx.x + ITEM * B;
-//             }
-//         }
-//     }
-// }
 
 template <int B, int I>
 __global__ void build_multikey(uint64_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t N, int num_keys, bool is_right) {
@@ -252,7 +163,6 @@ __global__ void build_multikey(uint64_t **keys, unsigned long long* ht, uint64_t
             uint64_t slot;
             if (num_keys == 1) slot = keys[0][tile_offset + threadIdx.x + ITEM * B] % ht_len;
             else if (num_keys == 2) slot = hash64_multikey(keys[0][tile_offset + threadIdx.x + ITEM * B], keys[1][tile_offset + threadIdx.x + ITEM * B]) % ht_len;
-            else cudaAssert(0);
             
             uint64_t item = keys[0][tile_offset + threadIdx.x + ITEM * B];
             while(atomicCAS(&ht[slot * n_ht_column], 0xFFFFFFFFFFFFFFFF, (unsigned long long) item) != 0xFFFFFFFFFFFFFFFF) {                
@@ -285,7 +195,8 @@ void buildHashTable(uint64_t **keys, unsigned long long* ht, uint64_t ht_len, ui
     cudaMalloc((void**) &keys_dev, num_keys * sizeof(uint64_t*));
     cudaMemcpy(keys_dev, keys, num_keys * sizeof(uint64_t*), cudaMemcpyHostToDevice);
     
-    cudaMemset(ht, 0xFF, ht_len * 2 * sizeof(unsigned long long));
+    if (is_right) cudaMemset(ht, 0xFF, ht_len * (num_keys + 2) * sizeof(unsigned long long));
+    else cudaMemset(ht, 0xFF, ht_len * (num_keys + 1) * sizeof(unsigned long long));
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
     build_multikey<BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(keys_dev, ht, ht_len, N, num_keys, is_right);
     CHECK_ERROR();
@@ -294,9 +205,11 @@ void buildHashTable(uint64_t **keys, unsigned long long* ht, uint64_t ht_len, ui
 
 void probeHashTable(uint64_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t* &row_ids_left, uint64_t* &row_ids_right, uint64_t* &count, uint64_t N, int* condition_mode, int num_keys, bool is_right) {
     printf("Launching Probe Kernel\n");
+    printf("N: %lu\n", N);
+    int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
     cudaMemset(count, 0, sizeof(uint64_t));
-    uint64_t* offset_each_thread = gpuBufferManager->customCudaMalloc<uint64_t>((N + ITEMS_PER_THREAD - 1)/ ITEMS_PER_THREAD, 0, 0);
+    uint64_t* offset_each_thread = gpuBufferManager->customCudaMalloc<uint64_t>(((N + tile_items - 1)/tile_items) * BLOCK_THREADS, 0, 0);
 
     uint64_t** keys_dev;
     cudaMalloc((void**) &keys_dev, num_keys * sizeof(uint64_t*));
@@ -304,22 +217,21 @@ void probeHashTable(uint64_t **keys, unsigned long long* ht, uint64_t ht_len, ui
 
     int* condition_mode_dev = gpuBufferManager->customCudaMalloc<int>(num_keys, 0, 0);
     cudaMemcpy(condition_mode_dev, condition_mode, num_keys * sizeof(int), cudaMemcpyHostToDevice);
-
-    int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
+    
     CHECK_ERROR();
     probe_multikey_count<BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(keys_dev, ht, ht_len, offset_each_thread, (unsigned long long*) count, N, condition_mode_dev, num_keys, is_right);
     CHECK_ERROR();
     cudaDeviceSynchronize();
 
-    uint64_t* h_count = new uint64_t [1];
+    uint64_t* h_count = new uint64_t[1];
     cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
     assert(h_count[0] > 0);
+    printf("Count: %lu\n", h_count[0]);
     row_ids_left = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
     row_ids_right = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
     probe_multikey<BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(keys_dev, ht, ht_len, offset_each_thread, row_ids_left, row_ids_right, N, condition_mode_dev, num_keys, is_right);
     CHECK_ERROR();
     cudaDeviceSynchronize();
-    printf("Count: %lu\n", h_count[0]);
     count = h_count;
 }
 

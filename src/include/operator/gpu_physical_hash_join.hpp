@@ -13,6 +13,12 @@
 
 namespace duckdb {
 
+template <typename T>
+void buildHashTableOri(uint64_t *keys, unsigned long long* ht, uint64_t ht_len, uint64_t N, int mode);
+
+template <typename T>
+void probeHashTableOri(uint64_t *keys, unsigned long long* ht, uint64_t ht_len, uint64_t* &row_ids_left, uint64_t* &row_ids_right, uint64_t* &count, uint64_t N, int mode);
+
 void probeHashTable(uint64_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t* &row_ids_left, uint64_t* &row_ids_right, uint64_t* &count, 
 			uint64_t N, int* condition_mode, int num_keys, bool is_right);
 
