@@ -179,9 +179,10 @@ __global__ void test(sort_keys_type* a, uint64_t N) {
     }
 }
 
-__global__ void test4(double* a, uint64_t N) {
+template <typename T>
+__global__ void testprint(T* a, uint64_t N) {
     if (blockIdx.x == 0 && threadIdx.x == 0) {
-        for (uint64_t i = 0; i < 15; i++) {
+        for (uint64_t i = 0; i < 100; i++) {
             printf("%.2f ", a[i]);
         }
         printf("\n");
@@ -219,7 +220,11 @@ __global__ void rows_to_columns<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD>(sort_
 
 template <typename T, typename V>
 void groupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count, uint64_t N, uint64_t num_keys, uint64_t num_aggregates, int* agg_mode) {
-
+    CHECK_ERROR();
+    if (N == 0) {
+        printf("N is 0\n");
+        return;
+    }
     printf("Launching Grouped Aggregate Kernel\n");
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 
@@ -261,7 +266,7 @@ void groupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count,
 
     for (int agg = 0; agg < num_aggregates; agg++) {
         // printf("Aggregating %d\n", agg);
-        if (agg_mode[agg] == 4 || agg_mode[agg] == 5) { //count_star or count
+        if (agg_mode[agg] == 4 || agg_mode[agg] == 5) { //count_star or count(null) or sum(null)
             thrust::device_vector<uint64_t> aggregate_star_column(N);
             if (agg_mode[agg] == 4) thrust::fill_n(aggregate_star_column.begin(), aggregate_star_column.size(), 1);
             else if (agg_mode[agg] == 5) thrust::fill_n(aggregate_star_column.begin(), aggregate_star_column.size(), 0);
@@ -398,7 +403,11 @@ void groupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count,
 
 template <typename T>
 void groupedWithoutAggregate(uint8_t **keys, uint64_t* count, uint64_t N, uint64_t num_keys) {
-
+    CHECK_ERROR();
+    if (N == 0) {
+        printf("N is 0\n");
+        return;
+    }
     printf("Launching Grouped Aggregate Kernel\n");
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 
@@ -461,6 +470,11 @@ void groupedWithoutAggregate(uint8_t **keys, uint64_t* count, uint64_t N, uint64
 
 template<typename T>
 void combineColumns(T* a, T* b, T* c, uint64_t N_a, uint64_t N_b) {
+    CHECK_ERROR();
+    if (N_a == 0 || N_b == 0) {
+        printf("N is 0\n");
+        return;
+    }
     cudaMemcpy(c, a, N_a * sizeof(T), cudaMemcpyDeviceToDevice);
     cudaMemcpy(c + N_a, b, N_b * sizeof(T), cudaMemcpyDeviceToDevice);
     CHECK_ERROR();

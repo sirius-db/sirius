@@ -8,6 +8,9 @@
 
 namespace duckdb {
 
+template <typename T>
+void ungroupedAggregate(uint8_t **a, uint8_t **result, uint64_t N, int* agg_mode, int num_aggregates);
+
 class GPUPhysicalUngroupedAggregate : public GPUPhysicalOperator {
 public:
 	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::UNGROUPED_AGGREGATE;

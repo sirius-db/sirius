@@ -35,7 +35,8 @@ GPUPhysicalColumnDataScan::GetData(GPUIntermediateRelation &output_relation) con
 
 	printf("Reading data from column data collection\n");
 	for (int col_idx = 0; col_idx < output_relation.columns.size(); col_idx++) {
-		output_relation.columns[col_idx] = intermediate_relation->columns[col_idx];
+		// output_relation.columns[col_idx] = intermediate_relation->columns[col_idx];
+		output_relation.columns[col_idx] = new GPUColumn(intermediate_relation->columns[col_idx]->column_length, intermediate_relation->columns[col_idx]->data_wrapper.type, intermediate_relation->columns[col_idx]->data_wrapper.data);
 	}
 
 	return SourceResultType::FINISHED;

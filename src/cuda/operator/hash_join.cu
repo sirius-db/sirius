@@ -142,6 +142,11 @@ __global__ void build<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD>(const uint64_t 
 
 template <typename T>
 void probeHashTableOri(uint64_t *keys, unsigned long long* ht, uint64_t ht_len, uint64_t* &row_ids_left, uint64_t* &row_ids_right, uint64_t* &count, uint64_t N, int mode) {
+    CHECK_ERROR();
+    if (N == 0) {
+        printf("N is 0\n");
+        return;
+    }
     printf("Launching Probe Kernel\n");
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
     cudaMemset(count, 0, sizeof(uint64_t));
@@ -165,6 +170,11 @@ void probeHashTableOri(uint64_t *keys, unsigned long long* ht, uint64_t ht_len, 
 
 template <typename T>
 void buildHashTableOri(uint64_t *keys, unsigned long long* ht, uint64_t ht_len, uint64_t N, int mode) {
+    CHECK_ERROR();
+    if (N == 0) {
+        printf("N is 0\n");
+        return;
+    }
     printf("Launching Build Kernel\n");
     cudaMemset(ht, 0xFF, ht_len * 2 * sizeof(unsigned long long));
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;

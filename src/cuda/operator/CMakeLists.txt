@@ -4,6 +4,7 @@ set(CUDA_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/arithmetic_expression.cu
         ${CMAKE_CURRENT_SOURCE_DIR}/materialize.cu
         ${CMAKE_CURRENT_SOURCE_DIR}/grouped_aggregate.cu
+        ${CMAKE_CURRENT_SOURCE_DIR}/ungrouped_aggregate.cu
         ${CMAKE_CURRENT_SOURCE_DIR}/hash_join.cu
         ${CMAKE_CURRENT_SOURCE_DIR}/hash_join_multikey.cu
         ${CMAKE_CURRENT_SOURCE_DIR}/hash_join_right_semi_anti.cu

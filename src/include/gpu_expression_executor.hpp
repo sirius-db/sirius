@@ -51,7 +51,7 @@ public:
     // template <typename T> GPUColumn* ResolveTypeMaterializeExpression(GPUColumn* column, BoundReferenceExpression& bound_ref, GPUBufferManager* gpuBufferManager);
     // GPUColumn* HandleMaterializeExpression(GPUColumn* column, BoundReferenceExpression& bound_ref, GPUBufferManager* gpuBufferManager);
 
-    template <typename T> GPUColumn* ResolveTypeBinaryConstantExpression (GPUColumn* column, BoundConstantExpression& expr, GPUBufferManager* gpuBufferManager, string function_name);
+    template <typename T> GPUColumn* ResolveTypeBinaryConstantExpression (GPUColumn* column, T constant, GPUBufferManager* gpuBufferManager, string function_name);
     GPUColumn* HandleBinaryConstantExpression(GPUColumn* column, BoundConstantExpression& expr, GPUBufferManager* gpuBufferManager, string function_name);
 
     template <typename T> GPUColumn* ResolveTypeBinaryExpression (GPUColumn* column1, GPUColumn* column2, GPUBufferManager* gpuBufferManager, string function_name);

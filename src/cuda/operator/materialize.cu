@@ -62,14 +62,20 @@ __global__ void test<uint8_t>(uint8_t* a, uint64_t N);
 
 template <typename T>
 void materializeExpression(T *a, T* result, uint64_t *row_ids, uint64_t N) {
+    CHECK_ERROR();
+    if (N == 0) {
+        printf("N is 0\n");
+        return;
+    }
     printf("Launching Materialize Kernel\n");
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
-    // printf("N: %ld\n", N);
-    // test<T><<<1, 1>>>(a, N);
-    // test<uint64_t><<<1, 1>>>(row_ids, N);
     materialize_expression<T, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(a, result, row_ids, N);
     CHECK_ERROR();
-    test<T><<<1, 1>>>(result, N);
+    // thrust::device_vector<T> sorted(result, result + N);
+    // thrust::sort(thrust::device, sorted.begin(), sorted.end());
+    // T* raw_sorted = thrust::raw_pointer_cast(sorted.data());
+    // cudaMemcpy(result, raw_sorted, N * sizeof(T), cudaMemcpyDeviceToDevice);
+    // test<T><<<1, 1>>>(a, N);
     cudaDeviceSynchronize();
 }
 

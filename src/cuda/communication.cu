@@ -39,6 +39,10 @@ callCudaMemcpyDeviceToHost<uint8_t>(uint8_t* dest, uint8_t* src, size_t size, in
 
 template <typename T> 
 void callCudaMemcpyHostToDevice(T* dest, T* src, size_t size, int gpu) {
+    if (size == 0) {
+        printf("N is 0\n");
+        return;
+    }
     printf("Send data to GPU\n");
     cudaSetDevice(gpu);
     gpuErrchk(cudaMemcpy(dest, src, size * sizeof(T), cudaMemcpyHostToDevice));
@@ -49,6 +53,10 @@ void callCudaMemcpyHostToDevice(T* dest, T* src, size_t size, int gpu) {
 
 template <typename T> 
 void callCudaMemcpyDeviceToHost(T* dest, T* src, size_t size, int gpu) {
+    if (size == 0) {
+        printf("N is 0\n");
+        return;
+    }
     printf("Send data to CPU\n");
     cudaSetDevice(gpu);
     gpuErrchk(cudaMemcpy(dest, src, size * sizeof(T), cudaMemcpyDeviceToHost));

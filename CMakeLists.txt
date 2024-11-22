@@ -43,6 +43,7 @@ set(CUDA_SOURCES
   src/cuda/sirius_extension_cuda.cu 
   src/cuda/communication.cu 
   src/cuda/allocator.cu
+  src/cuda/print_column.cu
 )
 add_subdirectory(src/cuda/operator)
 add_subdirectory(src/cuda/query_specific)

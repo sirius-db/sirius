@@ -385,7 +385,12 @@ __global__ void q2_filter<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD>(uint64_t *p
 
 
 void q19FilterExpression(uint64_t *p_brand, double *l_quantity, uint64_t *p_size, uint64_t* p_container, uint64_t *p_brand_val, double *l_quantity_val, uint64_t *p_size_val, uint64_t* p_container_val, uint64_t* &row_ids, uint64_t* &count, uint64_t N) {
-    printf("Launching Comparison Expression Kernel\n");
+    CHECK_ERROR();
+    if (N == 0) {
+        printf("N is 0\n");
+        return;
+    }
+    printf("Launching Q19 Filter Kernel\n");
 
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
     uint64_t* d_p_brand_val = gpuBufferManager->customCudaMalloc<uint64_t>(3, 0, 0);
@@ -413,7 +418,12 @@ void q19FilterExpression(uint64_t *p_brand, double *l_quantity, uint64_t *p_size
 }
 
 void q16FilterExpression(uint64_t *p_brand, uint64_t *p_type, uint64_t *p_size, uint64_t p_brand_val, uint64_t p_type_val1, uint64_t p_type_val2, uint64_t *p_size_val, uint64_t* &row_ids, uint64_t* &count, uint64_t N) {
-    printf("Launching Comparison Expression Kernel\n");
+    CHECK_ERROR();
+    if (N == 0) {
+        printf("N is 0\n");
+        return;
+    }
+    printf("Launching Q16 Filter Kernel\n");
 
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
     uint64_t* d_p_size_val = gpuBufferManager->customCudaMalloc<uint64_t>(8, 0, 0);
@@ -435,7 +445,12 @@ void q16FilterExpression(uint64_t *p_brand, uint64_t *p_type, uint64_t *p_size, 
 }
 
 void q12FilterExpression(uint64_t *l_commitdate, uint64_t *l_receiptdate, uint64_t *l_shipdate, uint64_t *l_shipmode, uint64_t l_shipmode_val1, uint64_t l_shipmode_val2, uint64_t* &row_ids, uint64_t* &count, uint64_t N) {
-    printf("Launching Comparison Expression Kernel\n");
+    CHECK_ERROR();
+    if (N == 0) {
+        printf("N is 0\n");
+        return;
+    }
+    printf("Launching Q12 Filter Kernel\n");
     cudaMemset(count, 0, sizeof(uint64_t));
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
     q12_filter<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(l_commitdate, l_receiptdate, l_shipdate, l_shipmode, l_shipmode_val1, l_shipmode_val2, row_ids, (unsigned long long*) count, N, 1);
@@ -453,7 +468,12 @@ void q12FilterExpression(uint64_t *l_commitdate, uint64_t *l_receiptdate, uint64
 }
 
 void q2FilterExpression(uint64_t *p_type, uint64_t p_type_val, uint64_t* &row_ids, uint64_t* &count, uint64_t N) {
-    printf("Launching Comparison Expression Kernel\n");
+    CHECK_ERROR();
+    if (N == 0) {
+        printf("N is 0\n");
+        return;
+    }
+    printf("Launching Q2 Filter Kernel\n");
     cudaMemset(count, 0, sizeof(uint64_t));
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
     q2_filter<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(p_type, p_type_val, row_ids, (unsigned long long*) count, N, 1);
@@ -472,7 +492,12 @@ void q2FilterExpression(uint64_t *p_type, uint64_t p_type_val, uint64_t* &row_id
 
 void q7FilterExpression(uint64_t *n1_nationkey, uint64_t *n2_nationkey, uint64_t val1, uint64_t val2, uint64_t val3, uint64_t val4, 
                                 uint64_t* &row_ids, uint64_t* &count, uint64_t N) {
-    printf("Launching Comparison Expression Kernel\n");
+    CHECK_ERROR();
+    if (N == 0) {
+        printf("N is 0\n");
+        return;
+    }
+    printf("Launching Q7 Filter Kernel\n");
     cudaMemset(count, 0, sizeof(uint64_t));
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
     q7_filter<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(n1_nationkey, n2_nationkey, val1, val2, val3, val4, row_ids, (unsigned long long*) count, N, 1);
