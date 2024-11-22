@@ -46,7 +46,13 @@ ResolveTypeGroupByAggregateExpression(GPUColumn** &group_by_keys, GPUColumn** &a
 
 	for (int agg_idx = 0; agg_idx < aggregates.size(); agg_idx++) {
 		auto& expr = aggregates[agg_idx]->Cast<BoundAggregateExpression>();
-		if (expr.function.name.compare("sum") == 0) {
+		if (expr.function.name.compare("count") == 0 && aggregate_keys[agg_idx]->data_wrapper.data == nullptr) {
+			agg_mode[agg_idx] = 5;
+			aggregate_data[agg_idx] = nullptr;
+		} else if (expr.function.name.compare("sum") == 0 && aggregate_keys[agg_idx]->data_wrapper.data == nullptr) {
+			agg_mode[agg_idx] = 5;
+			aggregate_data[agg_idx] = nullptr;
+		} else if (expr.function.name.compare("sum") == 0) {
 			agg_mode[agg_idx] = 0;
 			aggregate_data[agg_idx] = (aggregate_keys[agg_idx]->data_wrapper.data);
 		} else if (expr.function.name.compare("avg") == 0) {
@@ -64,9 +70,6 @@ ResolveTypeGroupByAggregateExpression(GPUColumn** &group_by_keys, GPUColumn** &a
 			aggregate_data[agg_idx] = nullptr;
 		} else if (expr.function.name.compare("count") == 0 && aggregate_keys[agg_idx]->data_wrapper.data != nullptr) {
 			agg_mode[agg_idx] = 4;
-			aggregate_data[agg_idx] = nullptr;
-		} else if (expr.function.name.compare("count") == 0 && aggregate_keys[agg_idx]->data_wrapper.data == nullptr) {
-			agg_mode[agg_idx] = 5;
 			aggregate_data[agg_idx] = nullptr;
 		} else {
 			throw NotImplementedException("Aggregate function not supported");
@@ -317,7 +320,7 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 		if (aggr.children.size() == 0) {
 			// throw NotImplementedException("Aggregate without children not supported yet");
 			printf("Passing * aggregate to index %d in groupby result\n", grouped_aggregate_data.groups.size() + aggr_idx);
-			aggregate_column[aggr_idx] = new GPUColumn(size, ColumnType::INT64, nullptr);
+			aggregate_column[aggr_idx] = new GPUColumn(0, ColumnType::INT64, nullptr);
 		}
 		aggr_idx++;
 	}
@@ -343,28 +346,29 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 	for (idx_t i = 0; i < groupings.size(); i++) {
 		for (int idx = 0; idx < grouping_sets[i].size(); idx++) {
 			// group_by_result->columns[idx] = new GPUColumn(count[0], ColumnType::INT64, reinterpret_cast<uint8_t*>(group_keys[idx]));
-			// if (group_by_result->columns[idx] == nullptr) {
+			if (group_by_result->columns[idx] == nullptr && group_by_column[idx]->column_length > 0 && group_by_column[idx]->data_wrapper.data != nullptr) {
 				group_by_result->columns[idx] = group_by_column[idx];
 				group_by_result->columns[idx]->row_ids = nullptr;
 				group_by_result->columns[idx]->row_id_count = 0;
-			// } else {
+			} else if (group_by_result->columns[idx] != nullptr && group_by_column[idx]->column_length > 0 && group_by_column[idx]->data_wrapper.data != nullptr) {
 				// have to combine groupby from different meta pipelines
-				// group_by_result->columns[idx] = CombineColumns(group_by_result->columns[idx], group_by_column[idx], gpuBufferManager);
-			// }
+				group_by_result->columns[idx] = CombineColumns(group_by_result->columns[idx], group_by_column[idx], gpuBufferManager);
+			}
 
 		}
 	}
 
 	for (int aggr_idx = 0; aggr_idx < aggregates.size(); aggr_idx++) {
 		// group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] = new GPUColumn(count[0], ColumnType::FLOAT64, reinterpret_cast<uint8_t*>(aggregate_vals[aggr_idx]));
-		// if (group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] == nullptr) {
+		//TODO: has to fix this for columns with partially NULL values
+		if (group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] == nullptr && aggregate_column[aggr_idx]->column_length > 0 && aggregate_column[aggr_idx]->data_wrapper.data != nullptr) {
 			group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] = aggregate_column[aggr_idx];
 			group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx]->row_ids = nullptr;
 			group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx]->row_id_count = 0;
-		// } else {
+		} else if (group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] != nullptr && aggregate_column[aggr_idx]->column_length > 0 && aggregate_column[aggr_idx]->data_wrapper.data != nullptr) {
 			// have to combine groupby from different meta pipelines
-			// group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] = CombineColumns(group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx], aggregate_column[aggr_idx], gpuBufferManager);
-		// }
+			group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] = CombineColumns(group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx], aggregate_column[aggr_idx], gpuBufferManager);
+		}
 	}
 
   	return SinkResultType::FINISHED;
@@ -377,7 +381,8 @@ GPUPhysicalGroupedAggregate::GetData(GPUIntermediateRelation &output_relation) c
 //   printf("group by result size %d\n", group_by_result->columns.size());
   for (int col = 0; col < group_by_result->columns.size(); col++) {
     printf("Writing group by result to column %d\n", col);
-    output_relation.columns[col] = group_by_result->columns[col];
+    // output_relation.columns[col] = group_by_result->columns[col];
+	output_relation.columns[col] = new GPUColumn(group_by_result->columns[col]->column_length, group_by_result->columns[col]->data_wrapper.type, group_by_result->columns[col]->data_wrapper.data);
   }
 
   return SourceResultType::FINISHED;

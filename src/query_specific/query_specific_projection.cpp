@@ -41,11 +41,12 @@ GPUExpressionExecutor::HandlingSpecificProjection(GPUIntermediateRelation& input
 
 			} else if (expr.case_checks[0].then_expr->type == ExpressionType::BOUND_FUNCTION) {
 				// Q14 HACK!!!
-				//case when (p_type >= 125 and p_type < 150) then l_extendedprice * (1 - l_discount) else 0.0
 				printf("Case expression of Q14\n");
-				auto &when_expr = expr.case_checks[0].when_expr->Cast<BoundConjunctionExpression>();
-				auto &compare_expr = when_expr.children[0]->Cast<BoundComparisonExpression>();
-				auto p_type = compare_expr.left->Cast<BoundReferenceExpression>().index;
+				//CASE  WHEN ((P_TYPE >= 125)) THEN ((L_EXTENDEDPRICE * (1.0 - L_DISCOUNT))) ELSE 0.0 END
+				auto &when_expr = expr.case_checks[0].when_expr->Cast<BoundComparisonExpression>();
+				// printf("%s\n", ExpressionTypeToString(when_expr.type).c_str());
+				// auto &compare_expr = when_expr.children[0]->Cast<BoundComparisonExpression>();
+				auto p_type = when_expr.left->Cast<BoundReferenceExpression>().index;
 
 				auto &then_expr = expr.case_checks[0].then_expr->Cast<BoundFunctionExpression>();
 				auto l_extendedprice = then_expr.children[0]->Cast<BoundReferenceExpression>().index;
@@ -55,7 +56,7 @@ GPUExpressionExecutor::HandlingSpecificProjection(GPUIntermediateRelation& input
                 uint64_t p_type_value1 = 125;
                 uint64_t p_type_value2 = 150;
 
-                auto materialized_type = HandleMaterializeExpression(input_relation.columns[p_type], compare_expr.left->Cast<BoundReferenceExpression>(), gpuBufferManager);
+                auto materialized_type = HandleMaterializeExpression(input_relation.columns[p_type], when_expr.left->Cast<BoundReferenceExpression>(), gpuBufferManager);
                 auto materialized_extendedprice = HandleMaterializeExpression(input_relation.columns[l_extendedprice], then_expr.children[0]->Cast<BoundReferenceExpression>(), gpuBufferManager);
                 auto materialized_discount = HandleMaterializeExpression(input_relation.columns[l_discount], substract_expr.children[1]->Cast<BoundReferenceExpression>(), gpuBufferManager);
 
@@ -213,7 +214,7 @@ GPUExpressionExecutor::HandlingSpecificProjection(GPUIntermediateRelation& input
 
 					size_t size = materialize_a->column_length;
 					double* out = gpuBufferManager->customCudaMalloc<double>(size, 0, 0);
-					commonArithmeticExpression(a, b, a, a, out, size, 4);
+					commonArithmeticExpression(a, b, a, a, out, size, 3);
 
 					result = new GPUColumn(size, ColumnType::FLOAT64, reinterpret_cast<uint8_t*>(out));
 

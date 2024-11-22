@@ -173,6 +173,11 @@ __global__ void probe_mark<BLOCK_THREADS, ITEMS_PER_THREAD>(uint64_t **keys, uns
 
 void probeHashTableSingleMatch(uint64_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t* &row_ids_left, uint64_t* &row_ids_right, 
             uint64_t* &count, uint64_t N, int* condition_mode, int num_keys, int join_mode) {
+    CHECK_ERROR();
+    if (N == 0) {
+        printf("N is 0\n");
+        return;
+    }
     printf("Launching Probe Kernel\n");
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
     cudaMemset(count, 0, sizeof(uint64_t));
@@ -205,6 +210,11 @@ void probeHashTableSingleMatch(uint64_t **keys, unsigned long long* ht, uint64_t
 }
 
 void probeHashTableMark(uint64_t **keys, unsigned long long* ht, uint64_t ht_len, uint8_t* &output, uint64_t N, int* condition_mode, int num_keys) {
+    CHECK_ERROR();
+    if (N == 0) {
+        printf("N is 0\n");
+        return;
+    }
     printf("Launching Probe Kernel\n");
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 

@@ -173,6 +173,16 @@ __global__ void comparison_constant_expression(const T *a, const T b, const T c,
     }
 }
 
+template<typename T>
+__global__ void test(T* a, uint64_t N) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        for (uint64_t i = 0; i < 100; i++) {
+            printf("%.2f ", a[i]);
+        }
+        printf("\n");
+    }
+}
+
 template
 __global__ void comparison_expression<int, BLOCK_THREADS, ITEMS_PER_THREAD>(const int *a, const int *b, uint64_t *row_ids, unsigned long long* count, uint64_t N, int compare_mode, int is_count);
 template
@@ -197,6 +207,11 @@ __global__ void comparison_constant_expression<uint8_t, BLOCK_THREADS, ITEMS_PER
 
 template <typename T>
 void comparisonConstantExpression(T *a, T b, T c, uint64_t* &row_ids, uint64_t* &count, uint64_t N, int op_mode) {
+    CHECK_ERROR();
+    if (N == 0) {
+        printf("N is 0\n");
+        return;
+    }
     printf("Launching Comparison Expression Kernel\n");
     cudaMemset(count, 0, sizeof(uint64_t));
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
@@ -216,6 +231,11 @@ void comparisonConstantExpression(T *a, T b, T c, uint64_t* &row_ids, uint64_t* 
 
 template <typename T>
 void comparisonExpression(T *a, T *b, uint64_t* &row_ids, uint64_t* &count, uint64_t N, int op_mode) {
+    CHECK_ERROR();
+    if (N == 0) {
+        printf("N is 0\n");
+        return;
+    }
     printf("Launching Comparison Expression Kernel\n");
     cudaMemset(count, 0, sizeof(uint64_t));
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;

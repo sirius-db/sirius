@@ -196,6 +196,8 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
                   table->columns[column_ids[column_index]]->row_id_count = prev_row_ids_count;
                 }
                 GPUColumn* materialized_column = HandleMaterializeExpression(table->columns[column_ids[column_index]], gpuBufferManager);
+                table->columns[column_ids[column_index]]->row_ids = nullptr;
+                table->columns[column_ids[column_index]]->row_id_count = 0;
                 if (filter_constant1.comparison_type == ExpressionType::COMPARE_GREATERTHANOREQUALTO && filter_constant2.comparison_type == ExpressionType::COMPARE_LESSTHANOREQUALTO) {
                     HandleBetweenExpression(materialized_column, count, row_ids, filter_constant1, filter_constant2);
                 } else {
@@ -219,6 +221,8 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
                     table->columns[column_ids[column_index]]->row_id_count = prev_row_ids_count;
                   }
                   GPUColumn* materialized_column = HandleMaterializeExpression(table->columns[column_ids[column_index]], gpuBufferManager);
+                  table->columns[column_ids[column_index]]->row_ids = nullptr;
+                  table->columns[column_ids[column_index]]->row_id_count = 0;
                   HandleComparisonConstantExpression(materialized_column, count, row_ids, filter_constant, expression_type);
                   printf("Count %ld\n", count[0]);
                   if (count[0] == 0) throw NotImplementedException("No match found");
@@ -248,8 +252,9 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
     for (auto projection_id : projection_ids) {
         printf("Reading column index (late materialized) %ld and passing it to index in output relation %ld\n", column_ids[projection_id], projection_id);
         printf("Writing row IDs to output relation in index %ld\n", index);
-        output_relation.columns[index] = table->columns[column_ids[projection_id]];
-        output_relation.length = table->length;
+        output_relation.columns[index] = new GPUColumn(table->columns[column_ids[projection_id]]->column_length, table->columns[column_ids[projection_id]]->data_wrapper.type, table->columns[column_ids[projection_id]]->data_wrapper.data);
+        // output_relation.columns[index] = table->columns[column_ids[projection_id]];
+        // output_relation.length = table->length;
         if (row_ids) {
           output_relation.columns[index]->row_ids = prev_row_ids; 
         }

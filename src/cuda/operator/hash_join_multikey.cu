@@ -189,6 +189,11 @@ __global__ void probe_multikey<BLOCK_THREADS, ITEMS_PER_THREAD>(uint64_t **keys,
         uint64_t *row_ids_left, uint64_t *row_ids_right, uint64_t N, int* condition_mode, int num_keys, bool is_right);
 
 void buildHashTable(uint64_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t N, int num_keys, bool is_right) {
+    CHECK_ERROR();
+    if (N == 0) {
+        printf("N is 0\n");
+        return;
+    }
     printf("Launching Build Kernel\n");
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
     uint64_t** keys_dev;
@@ -204,6 +209,11 @@ void buildHashTable(uint64_t **keys, unsigned long long* ht, uint64_t ht_len, ui
 }
 
 void probeHashTable(uint64_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t* &row_ids_left, uint64_t* &row_ids_right, uint64_t* &count, uint64_t N, int* condition_mode, int num_keys, bool is_right) {
+    CHECK_ERROR();
+    if (N == 0) {
+        printf("N is 0\n");
+        return;
+    }
     printf("Launching Probe Kernel\n");
     printf("N: %lu\n", N);
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;

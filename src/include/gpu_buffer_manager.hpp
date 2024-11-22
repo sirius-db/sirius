@@ -14,6 +14,7 @@ template <typename T> void callCudaFree(T* ptr, int gpu);
 template <typename T> void callCudaMemcpyHostToDevice(T* dest, T* src, size_t size, int gpu);
 template <typename T> void callCudaMemcpyDeviceToHost(T* dest, T* src, size_t size, int gpu);
 template <typename T> void materializeExpression(T *a, T* result, uint64_t *row_ids, uint64_t N);
+template <typename T> void printGPUColumn(T* a, size_t N, int gpu);
 
 struct pointer_and_key {
 	uint64_t* pointer;

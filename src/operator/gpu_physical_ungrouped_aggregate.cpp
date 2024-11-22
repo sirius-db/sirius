@@ -1,7 +1,78 @@
 #include "operator/gpu_physical_ungrouped_aggregate.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "gpu_materialize.hpp"
 
 namespace duckdb {
+
+template <typename T>
+void
+ResolveTypeAggregateExpression(GPUColumn** &aggregate_keys, GPUBufferManager* gpuBufferManager, const vector<unique_ptr<Expression>> &aggregates) {
+	uint8_t** aggregate_data = new uint8_t*[aggregates.size()];
+	uint8_t** result = new uint8_t*[aggregates.size()];
+
+	size_t size = aggregate_keys[0]->column_length;
+
+	int* agg_mode = new int[aggregates.size()];
+
+	for (int agg_idx = 0; agg_idx < aggregates.size(); agg_idx++) {
+		auto& expr = aggregates[agg_idx]->Cast<BoundAggregateExpression>();
+		if (expr.function.name.compare("count") == 0 && aggregate_keys[agg_idx]->data_wrapper.data == nullptr) {
+			agg_mode[agg_idx] = 5;
+			aggregate_data[agg_idx] = nullptr;
+		} else if (expr.function.name.compare("sum") == 0 && aggregate_keys[agg_idx]->data_wrapper.data == nullptr) {
+			agg_mode[agg_idx] = 5;
+			aggregate_data[agg_idx] = nullptr;
+		} else if (expr.function.name.compare("sum") == 0) {
+			agg_mode[agg_idx] = 0;
+			aggregate_data[agg_idx] = (aggregate_keys[agg_idx]->data_wrapper.data);
+		} else if (expr.function.name.compare("avg") == 0) {
+			if (aggregate_keys[agg_idx]->data_wrapper.type != ColumnType::FLOAT64) throw NotImplementedException("Column type is supposed to be double");
+			agg_mode[agg_idx] = 1;
+			aggregate_data[agg_idx] = (aggregate_keys[agg_idx]->data_wrapper.data);
+		} else if (expr.function.name.compare("max") == 0) {
+			agg_mode[agg_idx] = 2;
+			aggregate_data[agg_idx] = (aggregate_keys[agg_idx]->data_wrapper.data);
+		} else if (expr.function.name.compare("min") == 0) {
+			agg_mode[agg_idx] = 3;
+			aggregate_data[agg_idx] = (aggregate_keys[agg_idx]->data_wrapper.data);
+		} else if (expr.function.name.compare("count_star") == 0) {
+			agg_mode[agg_idx] = 4;
+			aggregate_data[agg_idx] = nullptr;
+		} else if (expr.function.name.compare("count") == 0 && aggregate_keys[agg_idx]->data_wrapper.data != nullptr) {
+			agg_mode[agg_idx] = 4;
+			aggregate_data[agg_idx] = nullptr;
+		} else {
+			throw NotImplementedException("Aggregate function not supported");
+		}
+	}
+
+	ungroupedAggregate<T>(aggregate_data, result, size, agg_mode, aggregates.size());
+
+	for (int agg_idx = 0; agg_idx < aggregates.size(); agg_idx++) {
+		auto& expr = aggregates[agg_idx]->Cast<BoundAggregateExpression>();
+		if (expr.function.name.compare("count_star") == 0 || expr.function.name.compare("count") == 0) {
+			aggregate_keys[agg_idx] = new GPUColumn(1, ColumnType::INT64, reinterpret_cast<uint8_t*>(result[agg_idx]));
+		} else if (size == 0){
+			aggregate_keys[agg_idx] = new GPUColumn(0, ColumnType::INT64, reinterpret_cast<uint8_t*>(result[agg_idx]));
+		} else { 
+			aggregate_keys[agg_idx] = new GPUColumn(1, aggregate_keys[agg_idx]->data_wrapper.type, reinterpret_cast<uint8_t*>(result[agg_idx]));
+		}
+	}
+}
+
+void
+HandleAggregateExpression(GPUColumn** &aggregate_keys, GPUBufferManager* gpuBufferManager, const vector<unique_ptr<Expression>> &aggregates) {
+    switch(aggregate_keys[0]->data_wrapper.type) {
+      case ColumnType::INT64:
+		ResolveTypeAggregateExpression<uint64_t>(aggregate_keys, gpuBufferManager, aggregates);
+		break;
+      case ColumnType::FLOAT64:
+	  	ResolveTypeAggregateExpression<double>(aggregate_keys, gpuBufferManager, aggregates);
+		break;
+      default:
+        throw NotImplementedException("Unsupported column type");
+    }
+}
 
 GPUPhysicalUngroupedAggregate::GPUPhysicalUngroupedAggregate(vector<LogicalType> types,
                                                        vector<unique_ptr<Expression>> expressions,
@@ -31,6 +102,9 @@ GPUPhysicalUngroupedAggregate::Sink(GPUIntermediateRelation &input_relation) con
 
 	idx_t payload_idx = 0;
 	idx_t next_payload_idx = 0;
+	GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+	GPUColumn** aggregate_column = new GPUColumn*[aggregates.size()];
+	int size = 0;
 
 	for (idx_t aggr_idx = 0; aggr_idx < aggregates.size(); aggr_idx++) {
 		D_ASSERT(aggregates[aggr_idx]->GetExpressionClass() == ExpressionClass::BOUND_AGGREGATE);
@@ -50,20 +124,53 @@ GPUPhysicalUngroupedAggregate::Sink(GPUIntermediateRelation &input_relation) con
 
 		idx_t payload_cnt = 0;
 
+		printf("Aggregate type: %s\n", aggregate.function.name.c_str());
+		if (aggregate.children.size() > 1) throw NotImplementedException("Aggregates with multiple children not supported yet");
 		for (idx_t i = 0; i < aggregate.children.size(); ++i) {
 			for (auto &child_expr : aggregate.children) {
 				D_ASSERT(child_expr->type == ExpressionType::BOUND_REF);
 				printf("Reading aggregation column from index %ld and passing it to index %ld in aggregation result\n", payload_idx + payload_cnt, aggr_idx);
-				input_relation.checkLateMaterialization(payload_idx + payload_cnt);
-				// printf("aggregation_result.columns.size() %ld\n", aggregation_result->columns.size());
-				// printf("input_relation.columns.size() %ld\n", input_relation.columns.size());
-				aggregation_result->columns[aggr_idx] = input_relation.columns[payload_idx + payload_cnt];
+				// input_relation.checkLateMaterialization(payload_idx + payload_cnt);
+				auto &bound_ref_expr = child_expr->Cast<BoundReferenceExpression>();
+				aggregate_column[aggr_idx] = HandleMaterializeExpression(input_relation.columns[payload_idx + payload_cnt], bound_ref_expr, gpuBufferManager);
+				// aggregation_result->columns[aggr_idx] = input_relation.columns[payload_idx + payload_cnt];
+				size = aggregate_column[aggr_idx]->column_length;
 				payload_cnt++;
 			}
 		}
+		//here we probably have count(*) or sum(*) or something like that
+		if (aggregate.children.size() == 0) {
+			// throw NotImplementedException("Aggregate without children not supported yet");
+			printf("Passing * aggregate to index %d in aggregation result\n", aggr_idx);
+			if (size == 0) {
+				if (input_relation.columns[0]->row_ids) {
+					size = input_relation.columns[0]->row_id_count;
+				} else {
+					size = input_relation.columns[0]->column_length;
+				}
+			}
+			aggregate_column[aggr_idx] = new GPUColumn(size, ColumnType::INT64, input_relation.columns[0]->data_wrapper.data);
+		}
 	}
 
-  return SinkResultType::FINISHED;
+	HandleAggregateExpression(aggregate_column, gpuBufferManager, aggregates);
+
+	for (int aggr_idx = 0; aggr_idx < aggregates.size(); aggr_idx++) {
+		// group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] = new GPUColumn(count[0], ColumnType::FLOAT64, reinterpret_cast<uint8_t*>(aggregate_vals[aggr_idx]));
+		//TODO: has to fix this for columns with partially NULL values
+		if (aggregation_result->columns[aggr_idx] == nullptr) {
+			aggregation_result->columns[aggr_idx] = aggregate_column[aggr_idx];
+			aggregation_result->columns[aggr_idx]->row_ids = nullptr;
+			aggregation_result->columns[aggr_idx]->row_id_count = 0;
+		}
+		// printf("%ld\n", aggregation_result->columns[aggr_idx]->column_length);
+		// printf("%d\n", aggregation_result->columns[aggr_idx]->data_wrapper.type);
+		// printf("%p\n", aggregation_result->columns[aggr_idx]->data_wrapper.data);
+		// double* data = reinterpret_cast<double*>(aggregation_result->columns[aggr_idx]->data_wrapper.data);
+		// printGPUColumn<double>(data, aggregation_result->columns[aggr_idx]->column_length, 0);
+	}
+
+  	return SinkResultType::FINISHED;
 }
 
 // SourceResultType
@@ -73,7 +180,9 @@ SourceResultType
 GPUPhysicalUngroupedAggregate::GetData(GPUIntermediateRelation &output_relation) const {
   for (int col = 0; col < aggregation_result->columns.size(); col++) {
     printf("Writing aggregation result to column %ld\n", col);
-    output_relation.columns[col] = aggregation_result->columns[col];
+    // output_relation.columns[col] = aggregation_result->columns[col];
+	output_relation.columns[col] = new GPUColumn(aggregation_result->columns[col]->column_length, aggregation_result->columns[col]->data_wrapper.type, aggregation_result->columns[col]->data_wrapper.data);
+	// printGPUColumn<double>(reinterpret_cast<double*>(aggregation_result->columns[col]->data_wrapper.data), aggregation_result->columns[col]->column_length, 0);
   }
 
   return SourceResultType::FINISHED;

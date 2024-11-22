@@ -251,12 +251,13 @@ GPUPhysicalHashJoin::GetData(GPUIntermediateRelation &output_relation) const {
 	//TODO: FIX THIS LATER!!
 	// if (join_type == JoinType::RIGHT && count[0] > 0) throw NotImplementedException("Right join with scanHT count > 0 is not supported yet");
 
-	for (idx_t i = 0; i < rhs_output_columns.size(); i++) {
-		const auto rhs_col = rhs_output_columns[i];
-		printf("Writing hash_table column %ld to column %ld\n", i, rhs_col);
-		// output_relation.columns[left_column_count + rhs_col] = hash_table_result->columns[i];
-		output_relation.columns[left_column_count + rhs_col] = HandleMaterializeRowIDs(hash_table_result->columns[i], count[0], row_ids, gpuBufferManager);
-	}
+	// for (idx_t i = 0; i < rhs_output_columns.size(); i++) {
+	// 	const auto rhs_col = rhs_output_columns[i];
+	// 	printf("Writing hash_table column %ld to column %ld\n", i, rhs_col);
+	// 	// output_relation.columns[left_column_count + rhs_col] = hash_table_result->columns[i];
+	// 	output_relation.columns[left_column_count + rhs_col] = HandleMaterializeRowIDs(hash_table_result->columns[i], count[0], row_ids, gpuBufferManager);
+	// }
+	HandleMaterializeRowIDsRHS(*hash_table_result, output_relation, rhs_output_columns, left_column_count, count[0], row_ids, gpuBufferManager);
 
 	return SourceResultType::FINISHED;
 }
@@ -332,36 +333,46 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 	//materialize columns from the left table
 	if (join_type == JoinType::SEMI || join_type == JoinType::ANTI || join_type == JoinType::INNER || join_type == JoinType::OUTER || join_type == JoinType::RIGHT || join_type == JoinType::LEFT) {
 		printf("Writing row IDs from LHS to output relation\n");
-		for (idx_t i = 0; i < input_relation.column_count; i++) {
-			printf("Passing column idx %ld from LHS (late materialized) to idx %ld in output relation\n", i, i);
-			output_relation.columns[i] = HandleMaterializeRowIDs(input_relation.columns[i], count[0], row_ids_left, gpuBufferManager);
-		}
+		// for (idx_t i = 0; i < input_relation.column_count; i++) {
+		// 	printf("Passing column idx %ld from LHS (late materialized) to idx %ld in output relation\n", i, i);
+		// 	output_relation.columns[i] = HandleMaterializeRowIDs(input_relation.columns[i], count[0], row_ids_left, gpuBufferManager);
+		// }
+		HandleMaterializeRowIDs(input_relation, output_relation, count[0], row_ids_left, gpuBufferManager);
 	} else if (join_type == JoinType::MARK) {
 		printf("Writing row IDs from LHS to output relation\n");
-		for (idx_t i = 0; i < input_relation.column_count; i++) {
-			printf("Passing column idx %ld from LHS (late materialized) to idx %ld in output relation\n", i, i);
-			output_relation.columns[i] = HandleMaterializeRowIDs(input_relation.columns[i], count[0], row_ids_left, gpuBufferManager);
-		}
+		// for (idx_t i = 0; i < input_relation.column_count; i++) {
+		// 	printf("Passing column idx %ld from LHS (late materialized) to idx %ld in output relation\n", i, i);
+		// 	output_relation.columns[i] = HandleMaterializeRowIDs(input_relation.columns[i], count[0], row_ids_left, gpuBufferManager);
+		// }
+		HandleMaterializeRowIDs(input_relation, output_relation, count[0], row_ids_left, gpuBufferManager);
 		output_relation.columns[input_relation.column_count] = new GPUColumn(probe_key[0]->column_length, ColumnType::BOOLEAN, output);
+	} else if (join_type == JoinType::RIGHT_SEMI || join_type == JoinType::RIGHT_ANTI) {
+		for (idx_t i = 0; i < input_relation.column_count; i++) {
+			output_relation.columns[i] = new GPUColumn(0, input_relation.columns[i]->data_wrapper.type, nullptr);
+		}
 	}
 
-	//materialize columns from the right table
+	//materialize columns from the right tables
 	if (join_type == JoinType::INNER || join_type == JoinType::OUTER || join_type == JoinType::RIGHT || join_type == JoinType::LEFT) {
 		printf("Writing row IDs from RHS to output relation\n");
 		// on the RHS, we need to fetch the data from the hash table
-		for (idx_t i = 0; i < rhs_output_columns.size(); i++) {
-			const auto output_col_idx = rhs_output_columns[i];
-			printf("Passing column idx %ld from RHS (late materialized) to idx %ld in output relation\n", output_col_idx, input_relation.column_count + output_col_idx);
-			output_relation.columns[input_relation.column_count + output_col_idx] = HandleMaterializeRowIDs(hash_table_result->columns[output_col_idx], count[0], row_ids_right, gpuBufferManager);
-		}
+		// for (idx_t i = 0; i < rhs_output_columns.size(); i++) {
+		// 	const auto output_col_idx = rhs_output_columns[i];
+		// 	printf("Passing column idx %ld from RHS (late materialized) to idx %ld in output relation\n", output_col_idx, input_relation.column_count + output_col_idx);
+		// 	//TODO: DOUBLE CHECK IF IT SHOULD BE hash_table_result->columns[i] or hash_table_result->columns[output_col_idx]
+		// 	// output_relation.columns[input_relation.column_count + output_col_idx] = HandleMaterializeRowIDs(hash_table_result->columns[output_col_idx], count[0], row_ids_right, gpuBufferManager);
+		// 	output_relation.columns[input_relation.column_count + output_col_idx] = HandleMaterializeRowIDs(hash_table_result->columns[i], count[0], row_ids_right, gpuBufferManager);
+		// }
+		HandleMaterializeRowIDsRHS(*hash_table_result, output_relation, rhs_output_columns, input_relation.column_count, count[0], row_ids_right, gpuBufferManager);
 	} else if (join_type == JoinType::RIGHT_SEMI || join_type == JoinType::RIGHT_ANTI) {
 		// WE SHOULD NOT NEED TO DO ANYTHING HERE
 		printf("Writing row IDs from RHS to output relation\n");
 		// on the RHS, we need to fetch the data from the hash table
 		for (idx_t i = 0; i < rhs_output_columns.size(); i++) {
 			const auto output_col_idx = rhs_output_columns[i];
-			printf("Passing column idx %ld from RHS (late materialized) to idx %ld in output relation\n", output_col_idx, output_col_idx);
+			printf("Passing column idx %ld from RHS (late materialized) to idx %ld in output relation\n", i, output_col_idx);
 			// output_relation.columns[output_col_idx] = HandleMaterializeRowIDs(hash_table_result->columns[output_col_idx], count[0], row_ids_right, gpuBufferManager);
+			output_relation.columns[output_col_idx] = new GPUColumn(0, hash_table_result->columns[output_col_idx]->data_wrapper.type, nullptr);
 		}
 	}
 

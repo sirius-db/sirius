@@ -132,7 +132,7 @@ void SiriusExtension::GPUCachingFunction(ClientContext &context, TableFunctionIn
 
 	//get data in CPU buffer
 	string query = "SELECT " + data.column + " FROM " + data.table + ";";
-	// cout << "Query: " << query << endl;
+	cout << "Query: " << query << endl;
 	// string query = "SELECT l_orderkey FROM lineitem;";
 	auto cpu_res = data.conn->Query(query);
 	

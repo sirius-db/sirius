@@ -104,7 +104,8 @@ GPUPhysicalMaterializedCollector::FinalMaterializeInternal(GPUIntermediateRelati
 		output_relation.columns[col]->row_id_count = 0;
 		output_relation.columns[col]->row_ids = nullptr;
 	} else {
-		output_relation.columns[col] = input_relation.columns[col];
+		// output_relation.columns[col] = input_relation.columns[col];
+		output_relation.columns[col] = new GPUColumn(input_relation.columns[col]->column_length, input_relation.columns[col]->data_wrapper.type, input_relation.columns[col]->data_wrapper.data);
 	}
 }
 
@@ -137,7 +138,7 @@ GPUPhysicalMaterializedCollector::FinalMaterialize(GPUIntermediateRelation input
 		throw NotImplementedException("Unsupported column type");
 	}
 	// output_relation.length = output_relation.columns[col]->column_length;
-	printf("Final materialize size %d\n", size_bytes);
+	// printf("Final materialize size %d bytes\n", size_bytes);
 	return size_bytes;
 }
 
@@ -212,9 +213,6 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 			Vector vector = rawDataToVector(host_data[col], vec, materialized_relation.columns[col]->data_wrapper.type);
 			chunk.data[col].Reference(vector);
 		}
-		// printf("Chunk column count %d\n", chunk.ColumnCount());
-		// chunk.Print();
-		// printf("Remaining %d\n", remaining);
 		if (remaining < STANDARD_VECTOR_SIZE) {
 			chunk.SetCardinality(remaining);
 		} else {
@@ -223,7 +221,6 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 		collection->Append(append_state, chunk);
 		remaining -= STANDARD_VECTOR_SIZE;
 	}
-	// printf("Finished\n");
 	return SinkResultType::FINISHED;
 }
 

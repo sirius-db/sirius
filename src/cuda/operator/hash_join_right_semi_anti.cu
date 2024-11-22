@@ -131,7 +131,7 @@ __global__ void scan_right(unsigned long long* ht, unsigned long long* count, ui
 }
 
 __global__ void testprint(uint64_t* a) {
-    for (int i = 0; i < 100; i++) {
+    for (int i = 0; i < 1000; i++) {
         printf("%lu ", a[i]);
     }
     printf("\n");
@@ -145,6 +145,11 @@ template
 __global__ void probe_right_semi_anti<BLOCK_THREADS, ITEMS_PER_THREAD>(uint64_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t N, int* condition_mode, int num_keys);
 
 void scanHashTableRight(unsigned long long* ht, uint64_t ht_len, uint64_t* &row_ids, uint64_t* &count, int join_mode, int num_keys) {
+    CHECK_ERROR();
+    if (ht_len == 0) {
+        printf("N is 0\n");
+        return;
+    }
     printf("Launching Scan Kernel\n");
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
     cudaMemset(count, 0, sizeof(uint64_t));
@@ -169,12 +174,19 @@ void scanHashTableRight(unsigned long long* ht, uint64_t ht_len, uint64_t* &row_
     thrust::device_vector<uint64_t> sorted_keys(row_ids, row_ids + h_count[0]);
     thrust::sort(thrust::device, sorted_keys.begin(), sorted_keys.end());
     uint64_t* raw_row_ids = thrust::raw_pointer_cast(sorted_keys.data());
-    testprint<<<1, 1>>>(raw_row_ids);
+    // testprint<<<1, 1>>>(raw_row_ids);
     row_ids = raw_row_ids;
 
+    CHECK_ERROR();
+    cudaDeviceSynchronize();
 }
 
 void probeHashTableRightSemiAnti(uint64_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t N, int* condition_mode, int num_keys) {
+    CHECK_ERROR();
+    if (N == 0) {
+        printf("N is 0\n");
+        return;
+    }
     printf("Launching Probe Kernel\n");
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 
