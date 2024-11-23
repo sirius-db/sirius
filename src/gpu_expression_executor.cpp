@@ -17,6 +17,8 @@ GPUExpressionExecutor::ResolveTypeBinaryConstantExpression(GPUColumn* column, T 
         binaryConstantExpression<T>(a, constant, c, size, 2);
     } else if (function_name.compare("/") == 0) {
         binaryConstantExpression<T>(a, constant, c, size, 3);
+    } else if (function_name.compare("//") == 0) {
+        binaryConstantExpression<T>(a, constant, c, size, 3);
     } else {
         throw NotImplementedException("Function name not supported");
     }
