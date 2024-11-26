@@ -9,6 +9,9 @@ void
 ResolveTypeAggregateExpression(GPUColumn** &aggregate_keys, GPUBufferManager* gpuBufferManager, const vector<unique_ptr<Expression>> &aggregates) {
 	uint8_t** aggregate_data = new uint8_t*[aggregates.size()];
 	uint8_t** result = new uint8_t*[aggregates.size()];
+	for (int agg_idx = 0; agg_idx < aggregates.size(); agg_idx++) {
+		result[agg_idx] = nullptr;
+	}
 
 	size_t size = aggregate_keys[0]->column_length;
 
@@ -52,6 +55,7 @@ ResolveTypeAggregateExpression(GPUColumn** &aggregate_keys, GPUBufferManager* gp
 		auto& expr = aggregates[agg_idx]->Cast<BoundAggregateExpression>();
 		if (expr.function.name.compare("count_star") == 0 || expr.function.name.compare("count") == 0) {
 			aggregate_keys[agg_idx] = new GPUColumn(1, ColumnType::INT64, reinterpret_cast<uint8_t*>(result[agg_idx]));
+			// if (result[agg_idx] != nullptr) printGPUColumn<uint64_t>(reinterpret_cast<uint64_t*>(aggregate_keys[agg_idx]->data_wrapper.data), aggregate_keys[agg_idx]->column_length, 0);
 		} else if (size == 0){
 			aggregate_keys[agg_idx] = new GPUColumn(0, ColumnType::INT64, reinterpret_cast<uint8_t*>(result[agg_idx]));
 		} else { 
@@ -104,6 +108,9 @@ GPUPhysicalUngroupedAggregate::Sink(GPUIntermediateRelation &input_relation) con
 	idx_t next_payload_idx = 0;
 	GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 	GPUColumn** aggregate_column = new GPUColumn*[aggregates.size()];
+	for (int aggr_idx = 0; aggr_idx < aggregates.size(); aggr_idx++) {
+		aggregate_column[aggr_idx] = nullptr;
+	}
 	int size = 0;
 
 	for (idx_t aggr_idx = 0; aggr_idx < aggregates.size(); aggr_idx++) {
@@ -158,7 +165,7 @@ GPUPhysicalUngroupedAggregate::Sink(GPUIntermediateRelation &input_relation) con
 	for (int aggr_idx = 0; aggr_idx < aggregates.size(); aggr_idx++) {
 		// group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] = new GPUColumn(count[0], ColumnType::FLOAT64, reinterpret_cast<uint8_t*>(aggregate_vals[aggr_idx]));
 		//TODO: has to fix this for columns with partially NULL values
-		if (aggregation_result->columns[aggr_idx] == nullptr) {
+		if (aggregation_result->columns[aggr_idx] == nullptr && aggregate_column[aggr_idx]->column_length > 0 && aggregate_column[aggr_idx]->data_wrapper.data != nullptr) {
 			aggregation_result->columns[aggr_idx] = aggregate_column[aggr_idx];
 			aggregation_result->columns[aggr_idx]->row_ids = nullptr;
 			aggregation_result->columns[aggr_idx]->row_id_count = 0;
@@ -182,7 +189,8 @@ GPUPhysicalUngroupedAggregate::GetData(GPUIntermediateRelation &output_relation)
     printf("Writing aggregation result to column %ld\n", col);
     // output_relation.columns[col] = aggregation_result->columns[col];
 	output_relation.columns[col] = new GPUColumn(aggregation_result->columns[col]->column_length, aggregation_result->columns[col]->data_wrapper.type, aggregation_result->columns[col]->data_wrapper.data);
-	// printGPUColumn<double>(reinterpret_cast<double*>(aggregation_result->columns[col]->data_wrapper.data), aggregation_result->columns[col]->column_length, 0);
+	// printf("Column length: %ld\n", aggregation_result->columns[col]->column_length);
+	// printGPUColumn<uint64_t>(reinterpret_cast<uint64_t*>(aggregation_result->columns[col]->data_wrapper.data), aggregation_result->columns[col]->column_length, 0);
   }
 
   return SourceResultType::FINISHED;

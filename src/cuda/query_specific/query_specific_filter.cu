@@ -387,6 +387,9 @@ __global__ void q2_filter<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD>(uint64_t *p
 void q19FilterExpression(uint64_t *p_brand, double *l_quantity, uint64_t *p_size, uint64_t* p_container, uint64_t *p_brand_val, double *l_quantity_val, uint64_t *p_size_val, uint64_t* p_container_val, uint64_t* &row_ids, uint64_t* &count, uint64_t N) {
     CHECK_ERROR();
     if (N == 0) {
+        uint64_t* h_count = new uint64_t[1];
+        h_count[0] = 0;
+        count = h_count;
         printf("N is 0\n");
         return;
     }
@@ -420,6 +423,9 @@ void q19FilterExpression(uint64_t *p_brand, double *l_quantity, uint64_t *p_size
 void q16FilterExpression(uint64_t *p_brand, uint64_t *p_type, uint64_t *p_size, uint64_t p_brand_val, uint64_t p_type_val1, uint64_t p_type_val2, uint64_t *p_size_val, uint64_t* &row_ids, uint64_t* &count, uint64_t N) {
     CHECK_ERROR();
     if (N == 0) {
+        uint64_t* h_count = new uint64_t[1];
+        h_count[0] = 0;
+        count = h_count;
         printf("N is 0\n");
         return;
     }
@@ -447,6 +453,9 @@ void q16FilterExpression(uint64_t *p_brand, uint64_t *p_type, uint64_t *p_size, 
 void q12FilterExpression(uint64_t *l_commitdate, uint64_t *l_receiptdate, uint64_t *l_shipdate, uint64_t *l_shipmode, uint64_t l_shipmode_val1, uint64_t l_shipmode_val2, uint64_t* &row_ids, uint64_t* &count, uint64_t N) {
     CHECK_ERROR();
     if (N == 0) {
+        uint64_t* h_count = new uint64_t[1];
+        h_count[0] = 0;
+        count = h_count;
         printf("N is 0\n");
         return;
     }
@@ -470,6 +479,9 @@ void q12FilterExpression(uint64_t *l_commitdate, uint64_t *l_receiptdate, uint64
 void q2FilterExpression(uint64_t *p_type, uint64_t p_type_val, uint64_t* &row_ids, uint64_t* &count, uint64_t N) {
     CHECK_ERROR();
     if (N == 0) {
+        uint64_t* h_count = new uint64_t[1];
+        h_count[0] = 0;
+        count = h_count;
         printf("N is 0\n");
         return;
     }
@@ -494,6 +506,9 @@ void q7FilterExpression(uint64_t *n1_nationkey, uint64_t *n2_nationkey, uint64_t
                                 uint64_t* &row_ids, uint64_t* &count, uint64_t N) {
     CHECK_ERROR();
     if (N == 0) {
+        uint64_t* h_count = new uint64_t[1];
+        h_count[0] = 0;
+        count = h_count;
         printf("N is 0\n");
         return;
     }

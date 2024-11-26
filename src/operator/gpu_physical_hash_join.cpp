@@ -78,6 +78,8 @@ ResolveTypeMarkExpression(GPUColumn** &probe_keys, uint8_t* &output,
 		if (conditions[key].comparison == ExpressionType::COMPARE_EQUAL || conditions[key].comparison == ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
 			condition_mode[key] = 0;
 		} else if (conditions[key].comparison == ExpressionType::COMPARE_NOTEQUAL || conditions[key].comparison == ExpressionType::COMPARE_DISTINCT_FROM) {
+			// TODO: Currently only support TPC-H Q21: l2.l_orderkey = l1.l_orderkey and l2.l_suppkey != l1.l_suppkey
+			if (key != 1 || num_keys != 2) throw NotImplementedException("Unsupported comparison type");
 			condition_mode[key] = 1;
 		} else {
 			throw NotImplementedException("Unsupported comparison type");
@@ -112,11 +114,24 @@ ResolveTypeBuildExpression(GPUColumn** &build_keys, unsigned long long* ht, uint
 	}
 	size_t size = build_keys[0]->column_length;
 
+	int* condition_mode = new int[num_keys];
+	for (int key = 0; key < num_keys; key++) {
+		if (conditions[key].comparison == ExpressionType::COMPARE_EQUAL || conditions[key].comparison == ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+			condition_mode[key] = 0;
+		} else if (conditions[key].comparison == ExpressionType::COMPARE_NOTEQUAL || conditions[key].comparison == ExpressionType::COMPARE_DISTINCT_FROM) {
+			// TODO: Currently only support TPC-H Q21: l2.l_orderkey = l1.l_orderkey and l2.l_suppkey != l1.l_suppkey
+			if (key != 1 || num_keys != 2) throw NotImplementedException("Unsupported comparison type");
+			condition_mode[key] = 1;
+		} else {
+			throw NotImplementedException("Unsupported comparison type");
+		}
+	}
+
 	if (join_type == JoinType::INNER || join_type == JoinType::SEMI || join_type == JoinType::MARK) {
-		buildHashTable(build_data, ht, ht_len, size, num_keys, 0);
+		buildHashTable(build_data, ht, ht_len, size, condition_mode, num_keys, 0);
 		// buildHashTableOri<uint64_t>(build_data[0], ht, ht_len, size, 0);
 	} else if (join_type == JoinType::RIGHT || join_type == JoinType::RIGHT_SEMI || join_type == JoinType::RIGHT_ANTI) {
-		buildHashTable(build_data, ht, ht_len, size, num_keys, 1);
+		buildHashTable(build_data, ht, ht_len, size, condition_mode, num_keys, 1);
 	} else {
 		throw NotImplementedException("Unsupported join type");
 	}
@@ -251,12 +266,12 @@ GPUPhysicalHashJoin::GetData(GPUIntermediateRelation &output_relation) const {
 	//TODO: FIX THIS LATER!!
 	// if (join_type == JoinType::RIGHT && count[0] > 0) throw NotImplementedException("Right join with scanHT count > 0 is not supported yet");
 
-	// for (idx_t i = 0; i < rhs_output_columns.size(); i++) {
-	// 	const auto rhs_col = rhs_output_columns[i];
-	// 	printf("Writing hash_table column %ld to column %ld\n", i, rhs_col);
+	for (idx_t i = 0; i < rhs_output_columns.size(); i++) {
+		const auto rhs_col = rhs_output_columns[i];
+		printf("Writing hash_table column %ld to column %ld\n", i, rhs_col);
 	// 	// output_relation.columns[left_column_count + rhs_col] = hash_table_result->columns[i];
 	// 	output_relation.columns[left_column_count + rhs_col] = HandleMaterializeRowIDs(hash_table_result->columns[i], count[0], row_ids, gpuBufferManager);
-	// }
+	}
 	HandleMaterializeRowIDsRHS(*hash_table_result, output_relation, rhs_output_columns, left_column_count, count[0], row_ids, gpuBufferManager);
 
 	return SourceResultType::FINISHED;
@@ -303,6 +318,9 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 
 	GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 	GPUColumn** probe_key = new GPUColumn*[conditions.size()];
+	for (int i = 0; i < conditions.size(); i++) {
+		probe_key[i] = nullptr;
+	}
 	uint64_t* count;
 	uint64_t* row_ids_left = nullptr;
 	uint64_t* row_ids_right = nullptr;
@@ -388,14 +406,11 @@ GPUPhysicalHashJoin::Sink(GPUIntermediateRelation &input_relation) const {
     //Check if late materialization is needed
     //Build the hash table
 
-	// printf("input relation size %d\n", input_relation.columns.size());
-	// for (auto col : input_relation.columns) {
-	// 	printf("input relation column size %d\n", col->column_length);
-	// }
-
 	GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 	GPUColumn** build_keys = new GPUColumn*[conditions.size()];
-	// if (conditions.size() > 1) throw NotImplementedException("Multiple conditions not supported yet");
+	for (idx_t i = 0; i < conditions.size(); i++) {
+		build_keys[i] = nullptr;
+	}
 
 	for (idx_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
 		auto &condition = conditions[cond_idx];

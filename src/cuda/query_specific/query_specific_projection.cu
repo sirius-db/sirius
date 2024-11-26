@@ -134,6 +134,32 @@ __global__ void q14_case_expression(uint64_t *p_type, double *l_extendedprice, d
     }
 }
 
+template <int B, int I>
+__global__ void q8_case_expression(uint64_t *nation, double *volume, uint64_t nation_val, double else_val, double *result, uint64_t N) {
+    
+    uint64_t tile_size = B * I;
+    uint64_t tile_offset = blockIdx.x * tile_size;
+
+    uint64_t num_tiles = (N + tile_size - 1) / tile_size;
+    uint64_t num_tile_items = tile_size;
+
+    if (blockIdx.x == num_tiles - 1) {
+        num_tile_items = N - tile_offset;
+    }
+
+    #pragma unroll
+    for (int ITEM = 0; ITEM < I; ++ITEM) {
+        if (threadIdx.x + ITEM * B < num_tile_items) {
+            uint64_t offset = tile_offset + threadIdx.x + ITEM * B;
+            if (nation[offset] == nation_val) {
+                result[offset] = volume[offset];
+            } else {
+                result[offset] = else_val;
+            }
+        }
+    }
+}
+
 template
 __global__ void common_arithmetic_expression<double, BLOCK_THREADS, ITEMS_PER_THREAD>(double *a, double *b, double* c, double* d, double *result, uint64_t N, int op_mode);
 template
@@ -141,7 +167,10 @@ __global__ void common_case_expression<BLOCK_THREADS, ITEMS_PER_THREAD>(uint64_t
 template
 __global__ void q14_case_expression<BLOCK_THREADS, ITEMS_PER_THREAD>(uint64_t *p_type, double *l_extendedprice, double *l_discount, uint64_t p_type_val1, uint64_t p_type_val2, double *result, uint64_t N);
 template
+__global__ void q8_case_expression<BLOCK_THREADS, ITEMS_PER_THREAD>(uint64_t *nation, double *volume, uint64_t nation_val, double else_val, double *result, uint64_t N);
+template
 __global__ void extract_year<BLOCK_THREADS, ITEMS_PER_THREAD>(uint64_t *date, uint64_t *year, uint64_t N);
+
 
 // Define the host function that launches the CUDA kernel
 void commonArithmeticExpression(double *a, double *b, double* c, double* d, double *result, uint64_t N, int op_mode) {
@@ -195,6 +224,19 @@ void q14CaseExpression(uint64_t *p_type, double *l_extendedprice, double *l_disc
     printf("Launching Q14 Case Expression Kernel\n");
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
     q14_case_expression<BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(p_type, l_extendedprice, l_discount, p_type_val1, p_type_val2, result, N);
+    CHECK_ERROR();
+    cudaDeviceSynchronize();
+}
+
+void q8CaseExpression(uint64_t *nation, double *volume, uint64_t nation_val, double else_val, double *result, uint64_t N) {
+    CHECK_ERROR();
+    if (N == 0) {
+        printf("N is 0\n");
+        return;
+    }
+    printf("Launching Q14 Case Expression Kernel\n");
+    int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
+    q8_case_expression<BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(nation, volume, nation_val, else_val, result, N);
     CHECK_ERROR();
     cudaDeviceSynchronize();
 }

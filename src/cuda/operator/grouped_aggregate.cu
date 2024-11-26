@@ -222,6 +222,7 @@ template <typename T, typename V>
 void groupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count, uint64_t N, uint64_t num_keys, uint64_t num_aggregates, int* agg_mode) {
     CHECK_ERROR();
     if (N == 0) {
+        count[0] = 0;
         printf("N is 0\n");
         return;
     }
@@ -393,6 +394,7 @@ void groupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count,
 
     CHECK_ERROR();
     cudaDeviceSynchronize();
+    printf("Count: %lu\n", count[0]);
 
     for (uint64_t i = 0; i < num_keys; i++) {
         T* temp = (keys_temp + i * N);
@@ -405,6 +407,7 @@ template <typename T>
 void groupedWithoutAggregate(uint8_t **keys, uint64_t* count, uint64_t N, uint64_t num_keys) {
     CHECK_ERROR();
     if (N == 0) {
+        count[0] = 0;
         printf("N is 0\n");
         return;
     }
@@ -461,6 +464,7 @@ void groupedWithoutAggregate(uint8_t **keys, uint64_t* count, uint64_t N, uint64
 
     CHECK_ERROR();
     cudaDeviceSynchronize();
+    printf("Count: %lu\n", count[0]);
 
     for (uint64_t i = 0; i < num_keys; i++) {
         T* temp = (keys_temp + i * N);

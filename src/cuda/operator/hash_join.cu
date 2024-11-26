@@ -144,6 +144,9 @@ template <typename T>
 void probeHashTableOri(uint64_t *keys, unsigned long long* ht, uint64_t ht_len, uint64_t* &row_ids_left, uint64_t* &row_ids_right, uint64_t* &count, uint64_t N, int mode) {
     CHECK_ERROR();
     if (N == 0) {
+        uint64_t* h_count = new uint64_t[1];
+        h_count[0] = 0;
+        count = h_count;
         printf("N is 0\n");
         return;
     }
