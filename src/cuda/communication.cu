@@ -39,6 +39,7 @@ callCudaMemcpyDeviceToHost<uint8_t>(uint8_t* dest, uint8_t* src, size_t size, in
 
 template <typename T> 
 void callCudaMemcpyHostToDevice(T* dest, T* src, size_t size, int gpu) {
+    CHECK_ERROR();
     if (size == 0) {
         printf("N is 0\n");
         return;
@@ -53,6 +54,7 @@ void callCudaMemcpyHostToDevice(T* dest, T* src, size_t size, int gpu) {
 
 template <typename T> 
 void callCudaMemcpyDeviceToHost(T* dest, T* src, size_t size, int gpu) {
+    CHECK_ERROR();
     if (size == 0) {
         printf("N is 0\n");
         return;

@@ -15,7 +15,7 @@ __device__ uint64_t hash64_right(uint64_t key1, uint64_t key2) {
 
 template <int B, int I>
 __global__ void probe_right_semi_anti(uint64_t **keys, unsigned long long* ht, uint64_t ht_len,
-            uint64_t N, int* condition_mode, int num_keys) {
+            uint64_t N, int* condition_mode, int num_keys, int equal_keys) {
 
     uint64_t tile_size = B * I;
     uint64_t tile_offset = blockIdx.x * tile_size;
@@ -32,8 +32,8 @@ __global__ void probe_right_semi_anti(uint64_t **keys, unsigned long long* ht, u
         if (threadIdx.x + (ITEM * B) < num_tile_items) {
             
             uint64_t slot;
-            if (num_keys == 1) slot = keys[0][tile_offset + threadIdx.x + ITEM * B] % ht_len;
-            else if (num_keys == 2) slot = hash64_right(keys[0][tile_offset + threadIdx.x + ITEM * B], keys[1][tile_offset + threadIdx.x + ITEM * B]) % ht_len;
+            if (equal_keys == 1) slot = keys[0][tile_offset + threadIdx.x + ITEM * B] % ht_len;
+            else if (equal_keys == 2) slot = hash64_right(keys[0][tile_offset + threadIdx.x + ITEM * B], keys[1][tile_offset + threadIdx.x + ITEM * B]) % ht_len;
             else cudaAssert(0);
             
             while (ht[slot * (num_keys + 2)] != 0xFFFFFFFFFFFFFFFF) {
@@ -130,8 +130,8 @@ __global__ void scan_right(unsigned long long* ht, unsigned long long* count, ui
 
 }
 
-__global__ void testprint(uint64_t* a) {
-    for (int i = 0; i < 1000; i++) {
+__global__ void testprint(uint64_t* a, uint64_t N) {
+    for (int i = N-1000; i < N; i++) {
         printf("%lu ", a[i]);
     }
     printf("\n");
@@ -142,11 +142,14 @@ __global__ void scan_right<BLOCK_THREADS, ITEMS_PER_THREAD>(unsigned long long* 
                 uint64_t *row_ids, uint64_t num_keys, int join_mode, int is_count);
 
 template
-__global__ void probe_right_semi_anti<BLOCK_THREADS, ITEMS_PER_THREAD>(uint64_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t N, int* condition_mode, int num_keys);
+__global__ void probe_right_semi_anti<BLOCK_THREADS, ITEMS_PER_THREAD>(uint64_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t N, int* condition_mode, int num_keys, int equal_keys);
 
 void scanHashTableRight(unsigned long long* ht, uint64_t ht_len, uint64_t* &row_ids, uint64_t* &count, int join_mode, int num_keys) {
     CHECK_ERROR();
     if (ht_len == 0) {
+        uint64_t* h_count = new uint64_t[1];
+        h_count[0] = 0;
+        count = h_count;
         printf("N is 0\n");
         return;
     }
@@ -171,11 +174,10 @@ void scanHashTableRight(unsigned long long* ht, uint64_t ht_len, uint64_t* &row_
     printf("Scan Count: %lu\n", h_count[0]);
     count = h_count;
 
-    thrust::device_vector<uint64_t> sorted_keys(row_ids, row_ids + h_count[0]);
-    thrust::sort(thrust::device, sorted_keys.begin(), sorted_keys.end());
-    uint64_t* raw_row_ids = thrust::raw_pointer_cast(sorted_keys.data());
-    // testprint<<<1, 1>>>(raw_row_ids);
-    row_ids = raw_row_ids;
+    // thrust::device_vector<uint64_t> sorted_keys(row_ids, row_ids + h_count[0]);
+    // thrust::sort(thrust::device, sorted_keys.begin(), sorted_keys.end());
+    // uint64_t* raw_row_ids = thrust::raw_pointer_cast(sorted_keys.data());
+    // testprint<<<1, 1>>>(raw_row_ids, h_count[0]);
 
     CHECK_ERROR();
     cudaDeviceSynchronize();
@@ -194,11 +196,16 @@ void probeHashTableRightSemiAnti(uint64_t **keys, unsigned long long* ht, uint64
     cudaMalloc((void**) &keys_dev, num_keys * sizeof(uint64_t*));
     cudaMemcpy(keys_dev, keys, num_keys * sizeof(uint64_t*), cudaMemcpyHostToDevice);
 
+    int equal_keys = 0;
+    for (int idx = 0; idx < num_keys; idx++) {
+        if (condition_mode[idx] == 0) equal_keys++;
+    }
+
     int* condition_mode_dev = gpuBufferManager->customCudaMalloc<int>(num_keys, 0, 0);
     cudaMemcpy(condition_mode_dev, condition_mode, num_keys * sizeof(int), cudaMemcpyHostToDevice);
 
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
-    probe_right_semi_anti<BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(keys_dev, ht, ht_len, N, condition_mode_dev, num_keys);
+    probe_right_semi_anti<BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(keys_dev, ht, ht_len, N, condition_mode_dev, num_keys, equal_keys);
     CHECK_ERROR();
     cudaDeviceSynchronize();
 }

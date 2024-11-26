@@ -34,6 +34,7 @@ template <typename T, typename V>
 void
 ResolveTypeGroupByAggregateExpression(GPUColumn** &group_by_keys, GPUColumn** &aggregate_keys, GPUBufferManager* gpuBufferManager, const vector<unique_ptr<Expression>> &aggregates, int num_group_keys) {
 	uint64_t count[1];
+	count[0] = 0;
 	uint8_t** group_by_data = new uint8_t*[num_group_keys];
 	uint8_t** aggregate_data = new uint8_t*[aggregates.size()];
 
@@ -113,6 +114,7 @@ HandleGroupByAggregateExpression(GPUColumn** &group_by_keys, GPUColumn** &aggreg
 template <typename T>
 void ResolveTypeDuplicateElimination(GPUColumn** &group_by_keys, GPUBufferManager* gpuBufferManager, int num_group_keys) {
 	uint64_t count[1];
+	count[0] = 0;
 	uint8_t** group_by_data = new uint8_t*[num_group_keys];
 
 	for (int group = 0; group < num_group_keys; group++) {
@@ -274,6 +276,12 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 	// double** aggregate_vals = new double*[aggregates.size()];
 	GPUColumn** group_by_column = new GPUColumn*[grouped_aggregate_data.groups.size()];
 	GPUColumn** aggregate_column = new GPUColumn*[aggregates.size()];
+	for (int i = 0; i < grouped_aggregate_data.groups.size(); i++) {
+		group_by_column[i] = nullptr;
+	}
+	for (int i = 0; i < aggregates.size(); i++) {
+		aggregate_column[i] = nullptr;
+	}
 	int aggr_idx = 0;
 	int size;
 
@@ -352,6 +360,7 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 				group_by_result->columns[idx]->row_id_count = 0;
 			} else if (group_by_result->columns[idx] != nullptr && group_by_column[idx]->column_length > 0 && group_by_column[idx]->data_wrapper.data != nullptr) {
 				// have to combine groupby from different meta pipelines
+				// printf("%ld\n", group_by_column[idx]->column_length);
 				group_by_result->columns[idx] = CombineColumns(group_by_result->columns[idx], group_by_column[idx], gpuBufferManager);
 			}
 
@@ -367,6 +376,7 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 			group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx]->row_id_count = 0;
 		} else if (group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] != nullptr && aggregate_column[aggr_idx]->column_length > 0 && aggregate_column[aggr_idx]->data_wrapper.data != nullptr) {
 			// have to combine groupby from different meta pipelines
+			// printf("%ld\n", aggregate_column[aggr_idx]->column_length);
 			group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] = CombineColumns(group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx], aggregate_column[aggr_idx], gpuBufferManager);
 		}
 	}

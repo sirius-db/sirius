@@ -209,6 +209,9 @@ template <typename T>
 void comparisonConstantExpression(T *a, T b, T c, uint64_t* &row_ids, uint64_t* &count, uint64_t N, int op_mode) {
     CHECK_ERROR();
     if (N == 0) {
+        uint64_t* h_count = new uint64_t[1];
+        h_count[0] = 0;
+        count = h_count;
         printf("N is 0\n");
         return;
     }
@@ -233,6 +236,9 @@ template <typename T>
 void comparisonExpression(T *a, T *b, uint64_t* &row_ids, uint64_t* &count, uint64_t N, int op_mode) {
     CHECK_ERROR();
     if (N == 0) {
+        uint64_t* h_count = new uint64_t[1];
+        h_count[0] = 0;
+        count = h_count;
         printf("N is 0\n");
         return;
     }

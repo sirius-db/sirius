@@ -34,6 +34,11 @@ void printGPUColumn(T* a, size_t N, int gpu) {
         printf("N is 0\n");
         return;
     }
+    T* result_host_temp = new T[1];
+    cudaMemcpy(result_host_temp, a, sizeof(T), cudaMemcpyDeviceToHost);
+    CHECK_ERROR();
+    cudaDeviceSynchronize();
+    printf("Result: %ld and N: %d\n", result_host_temp[0], N);
     printf("N: %ld\n", N);
     test<T><<<1, 1>>>(a, N);
     CHECK_ERROR();

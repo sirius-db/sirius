@@ -29,7 +29,7 @@ void probeHashTableSingleMatch(uint64_t **keys, unsigned long long* ht, uint64_t
 
 void probeHashTableMark(uint64_t **keys, unsigned long long* ht, uint64_t ht_len, uint8_t* &output, uint64_t N, int* condition_mode, int num_keys);
 
-void buildHashTable(uint64_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t N, int num_keys, bool is_right);
+void buildHashTable(uint64_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t N, int* condition_mode, int num_keys, bool is_right);
 
 void scanHashTableRight(unsigned long long* ht, uint64_t ht_len, uint64_t* &row_ids, uint64_t* &count, int join_mode, int num_keys);
 

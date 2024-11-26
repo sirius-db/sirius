@@ -32,12 +32,15 @@ GPUExpressionExecutor::HandlingSpecificProjection(GPUIntermediateRelation& input
                 auto materialized_volume = HandleMaterializeExpression(input_relation.columns[volume], then_expr, gpuBufferManager);
 
                 uint64_t* a = reinterpret_cast<uint64_t*> (materialized_nation->data_wrapper.data);
-                uint64_t* b = reinterpret_cast<uint64_t*> (materialized_volume->data_wrapper.data);
+                double* b = reinterpret_cast<double*> (materialized_volume->data_wrapper.data);
                 size_t size = materialized_nation->column_length;
-                uint64_t* out = gpuBufferManager->customCudaMalloc<uint64_t>(size, 0, 0);
-                commonCaseExpression(a, b, out, size, 0);
+                double* out = gpuBufferManager->customCudaMalloc<double>(size, 0, 0);
 
-                result = new GPUColumn(size, ColumnType::INT64, reinterpret_cast<uint8_t*>(out));
+				uint64_t nation_val = 1;
+				double else_val = 0;
+                q8CaseExpression(a, b, nation_val, else_val, out, size);
+
+                result = new GPUColumn(size, ColumnType::FLOAT64, reinterpret_cast<uint8_t*>(out));
 
 			} else if (expr.case_checks[0].then_expr->type == ExpressionType::BOUND_FUNCTION) {
 				// Q14 HACK!!!
