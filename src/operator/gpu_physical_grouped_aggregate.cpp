@@ -402,6 +402,7 @@ GPUPhysicalGroupedAggregate::GetData(GPUIntermediateRelation &output_relation) c
 // GPUPhysicalGroupedAggregate::SinkDistinct(ExecutionContext &context, GPUIntermediateRelation& input_relation, OperatorSinkInput &input) const {
 void
 GPUPhysicalGroupedAggregate::SinkDistinct(GPUIntermediateRelation& input_relation) const {
+	// throw NotImplementedException("Distinct not supported yet");
 	for (idx_t i = 0; i < groupings.size(); i++) {
 		SinkDistinctGrouping(input_relation, i);
 	}
@@ -416,6 +417,8 @@ GPUPhysicalGroupedAggregate::SinkDistinctGrouping(GPUIntermediateRelation& input
 
 	for (idx_t &idx : distinct_info.indices) {
 		auto &aggregate = grouped_aggregate_data.aggregates[idx]->Cast<BoundAggregateExpression>();
+		printf("Processing distinct aggregate %s\n", aggregate.function.name.c_str());
+		throw NotImplementedException("Distinct not supported yet");
 
 		D_ASSERT(distinct_info.table_map.count(idx));
 

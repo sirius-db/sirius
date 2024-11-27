@@ -13,6 +13,9 @@
 
 namespace duckdb {
 
+template <typename T>
+void nestedLoopJoin(T** left_data, T** right_data, uint64_t* &row_ids_left, uint64_t* &row_ids_right, uint64_t* &count, uint64_t left_size, uint64_t right_size, int* condition_mode, int num_keys);
+
 //! PhysicalNestedLoopJoin represents a nested loop join between two tables
 class GPUPhysicalNestedLoopJoin : public GPUPhysicalOperator {
 public:

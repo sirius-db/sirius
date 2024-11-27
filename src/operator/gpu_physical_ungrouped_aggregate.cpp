@@ -44,6 +44,9 @@ ResolveTypeAggregateExpression(GPUColumn** &aggregate_keys, GPUBufferManager* gp
 		} else if (expr.function.name.compare("count") == 0 && aggregate_keys[agg_idx]->data_wrapper.data != nullptr) {
 			agg_mode[agg_idx] = 4;
 			aggregate_data[agg_idx] = nullptr;
+		} else if (expr.function.name.compare("first") == 0) {
+			agg_mode[agg_idx] = 6;
+			aggregate_data[agg_idx] = (aggregate_keys[agg_idx]->data_wrapper.data);;
 		} else {
 			throw NotImplementedException("Aggregate function not supported");
 		}

@@ -72,7 +72,7 @@ GPUExpressionExecutor::HandlingSpecificProjection(GPUIntermediateRelation& input
 
 				result = new GPUColumn(size, ColumnType::FLOAT64, reinterpret_cast<uint8_t*>(out));
 
-			} else if (expr.case_checks[0].then_expr->expression_class == ExpressionClass::CONSTANT) {
+			} else if (expr.case_checks[0].then_expr->expression_class == ExpressionClass::BOUND_CONSTANT) {
 				auto &when_expr = expr.case_checks[0].when_expr->Cast<BoundConjunctionExpression>();
 				if (when_expr.type == ExpressionType::CONJUNCTION_AND) {
 					// Q12 HACK!!!
@@ -84,10 +84,10 @@ GPUExpressionExecutor::HandlingSpecificProjection(GPUIntermediateRelation& input
                     auto materialized_orderpriority = HandleMaterializeExpression(input_relation.columns[o_orderpriority], compare_expr.left->Cast<BoundReferenceExpression>(), gpuBufferManager);
                     uint64_t* a = reinterpret_cast<uint64_t*> (materialized_orderpriority->data_wrapper.data);
                     size_t size = materialized_orderpriority->column_length;
-                    uint64_t* out = gpuBufferManager->customCudaMalloc<uint64_t>(size, 0, 0);
+                    double* out = gpuBufferManager->customCudaMalloc<double>(size, 0, 0);
                     commonCaseExpression(a, a, out, size, 1);
 
-					result = new GPUColumn(size, ColumnType::INT64, reinterpret_cast<uint8_t*>(out));
+					result = new GPUColumn(size, ColumnType::FLOAT64, reinterpret_cast<uint8_t*>(out));
 
 				} else if (when_expr.type == ExpressionType::CONJUNCTION_OR) {
 					// Q12 HACK!!!
@@ -99,10 +99,10 @@ GPUExpressionExecutor::HandlingSpecificProjection(GPUIntermediateRelation& input
                     auto materialized_orderpriority = HandleMaterializeExpression(input_relation.columns[o_orderpriority], compare_expr.left->Cast<BoundReferenceExpression>(), gpuBufferManager);
                     uint64_t* a = reinterpret_cast<uint64_t*> (materialized_orderpriority->data_wrapper.data);
                     size_t size = materialized_orderpriority->column_length;
-                    uint64_t* out = gpuBufferManager->customCudaMalloc<uint64_t>(size, 0, 0);
+                    double* out = gpuBufferManager->customCudaMalloc<double>(size, 0, 0);
 					commonCaseExpression(a, a, out, size, 2);
 
-					result = new GPUColumn(size, ColumnType::INT64, reinterpret_cast<uint8_t*>(out));
+					result = new GPUColumn(size, ColumnType::FLOAT64, reinterpret_cast<uint8_t*>(out));
 
 				}
 			}

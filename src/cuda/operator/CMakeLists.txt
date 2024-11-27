@@ -9,5 +9,6 @@ set(CUDA_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/hash_join_multikey.cu
         ${CMAKE_CURRENT_SOURCE_DIR}/hash_join_right_semi_anti.cu
         ${CMAKE_CURRENT_SOURCE_DIR}/hash_join_semi_anti_mark.cu
+        ${CMAKE_CURRENT_SOURCE_DIR}/nested_loop_join.cu
         PARENT_SCOPE
 )

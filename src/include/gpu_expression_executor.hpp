@@ -24,7 +24,7 @@ template <typename T> void comparisonExpression(T *a, T* b, uint64_t* &row_ids, 
 //query specific projection
 void commonArithmeticExpression(double *a, double *b, double* c, double* d, double *result, uint64_t N, int op_mode);
 void extractYear(uint64_t *date, uint64_t *year, uint64_t N);
-void commonCaseExpression(uint64_t *a, uint64_t *b, uint64_t *result, uint64_t N, int op_mode);
+void commonCaseExpression(uint64_t *a, uint64_t *b, double *result, uint64_t N, int op_mode);
 void q14CaseExpression(uint64_t *p_type, double *l_extendedprice, double *l_discount, uint64_t p_type_val1, uint64_t p_type_val2, double *result, uint64_t N);
 void q8CaseExpression(uint64_t *nation, double *volume, uint64_t nation_val, double else_val, double *result, uint64_t N);
 
