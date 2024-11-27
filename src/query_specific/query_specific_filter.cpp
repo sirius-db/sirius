@@ -25,21 +25,21 @@ GPUExpressionExecutor::HandlingSpecificFilter(GPUIntermediateRelation& input_rel
             //Q19 HACK!!!
             if (expr.children.size() == 3 && expr.children[2]->type == ExpressionType::CONJUNCTION_AND) {
                 auto &expr2 = expr.children[2]->Cast<BoundConjunctionExpression>();
-                if (expr2.children.size() == 5 && expr2.children[0]->type == ExpressionType::COMPARE_EQUAL && expr2.children[1]->type == ExpressionType::COMPARE_GREATERTHANOREQUALTO && \
-                            expr2.children[2]->type == ExpressionType::COMPARE_LESSTHANOREQUALTO && expr2.children[3]->type == ExpressionType::COMPARE_LESSTHANOREQUALTO && expr2.children[4]->type == ExpressionType::COMPARE_IN) {
-
+                if (expr2.children.size() == 5 && expr2.children[0]->type == ExpressionType::COMPARE_EQUAL && expr2.children[1]->type == ExpressionType::COMPARE_LESSTHANOREQUALTO && \
+                            expr2.children[2]->type == ExpressionType::COMPARE_GREATERTHANOREQUALTO && expr2.children[3]->type == ExpressionType::COMPARE_LESSTHANOREQUALTO && expr2.children[4]->type == ExpressionType::COMPARE_IN) {
                     auto &expr3 = expr2.children[4]->Cast<BoundOperatorExpression>();
                     if (expr3.children.size() == 5) {
                             printf("Filter expression of Q19\n");
-                            string t = "(((P_BRAND = 12) AND (L_QUANTITY <= 11) AND (P_SIZE <= 5) AND (P_CONTAINER IN (0, 1, 4, 5))) OR ((P_BRAND = 23) AND (L_QUANTITY >= 10) AND (L_QUANTITY <= 20) AND (P_SIZE <= 10) AND (P_CONTAINER IN (17, 18, 20, 21))) OR ((P_BRAND = 34) AND (L_QUANTITY >= 20) AND (L_QUANTITY <= 30) AND (P_SIZE <= 15) AND (P_CONTAINER IN (8, 9, 12, 13))))";
+                            // string t = "(((P_BRAND = 12) AND (L_QUANTITY <= 11) AND (P_SIZE <= 5) AND (P_CONTAINER IN (0, 1, 4, 5))) OR ((P_BRAND = 23) AND (L_QUANTITY >= 10) AND (L_QUANTITY <= 20) AND (P_SIZE <= 10) AND (P_CONTAINER IN (17, 18, 20, 21))) OR ((P_BRAND = 34) AND (L_QUANTITY >= 20) AND (L_QUANTITY <= 30) AND (P_SIZE <= 15) AND (P_CONTAINER IN (8, 9, 12, 13))))";
+                            string t = "(((P_BRAND = 12) AND (P_SIZE <= 5) AND (L_QUANTITY <= 11.0) AND (P_CONTAINER IN (0, 1, 4, 5))) OR ((P_BRAND = 23) AND (P_SIZE <= 10) AND (L_QUANTITY >= 10.0) AND (L_QUANTITY <= 20.0) AND (P_CONTAINER IN (17, 18, 20, 21))) OR ((P_BRAND = 34) AND (P_SIZE <= 15) AND (L_QUANTITY >= 20.0) AND (L_QUANTITY <= 30.0) AND (P_CONTAINER IN (8, 9, 12, 13))))";
                             if (!expression.ToString().compare(t)) {
 
                                     BoundComparisonExpression& first = expr2.children[0]->Cast<BoundComparisonExpression>();
                                     auto p_brand = first.left->Cast<BoundReferenceExpression>().index;
                                     BoundComparisonExpression& second = expr2.children[1]->Cast<BoundComparisonExpression>();
-                                    auto l_quantity = second.left->Cast<BoundReferenceExpression>().index;
-                                    BoundComparisonExpression& third = expr2.children[3]->Cast<BoundComparisonExpression>();
-                                    auto p_size = third.left->Cast<BoundReferenceExpression>().index;
+                                    auto p_size = second.left->Cast<BoundReferenceExpression>().index;
+                                    BoundComparisonExpression& third = expr2.children[2]->Cast<BoundComparisonExpression>();
+                                    auto l_quantity = third.left->Cast<BoundReferenceExpression>().index;
                                     BoundOperatorExpression& fourth = expr2.children[4]->Cast<BoundOperatorExpression>();
                                     auto p_container = fourth.children[0]->Cast<BoundReferenceExpression>().index;
 
@@ -49,8 +49,8 @@ GPUExpressionExecutor::HandlingSpecificFilter(GPUIntermediateRelation& input_rel
                                     uint64_t p_container_val[12] = {0, 1, 4, 5, 17, 18, 20, 21, 8, 9, 12, 13};
 
                                     GPUColumn* materialized_brand = HandleMaterializeExpression(input_relation.columns[p_brand], first.left->Cast<BoundReferenceExpression>(), gpuBufferManager);
-                                    GPUColumn* materialized_quantity = HandleMaterializeExpression(input_relation.columns[l_quantity], second.left->Cast<BoundReferenceExpression>(), gpuBufferManager);
-                                    GPUColumn* materialized_size = HandleMaterializeExpression(input_relation.columns[p_size], third.left->Cast<BoundReferenceExpression>(), gpuBufferManager);
+                                    GPUColumn* materialized_size = HandleMaterializeExpression(input_relation.columns[p_size], second.left->Cast<BoundReferenceExpression>(), gpuBufferManager);
+                                    GPUColumn* materialized_quantity = HandleMaterializeExpression(input_relation.columns[l_quantity], third.left->Cast<BoundReferenceExpression>(), gpuBufferManager);
                                     GPUColumn* materialized_container = HandleMaterializeExpression(input_relation.columns[p_container], fourth.children[0]->Cast<BoundReferenceExpression>(), gpuBufferManager);
 
                                     count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);

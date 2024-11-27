@@ -169,6 +169,12 @@ void ungroupedAggregate(uint8_t **a, uint8_t **result, uint64_t N, int* agg_mode
             CHECK_ERROR();
             cudaDeviceSynchronize();
             result[agg] = reinterpret_cast<uint8_t*> (result_temp);
+        } else if (agg_mode[agg] == 6) {
+            T* result_temp = gpuBufferManager->customCudaMalloc<T>(1, 0, 0);
+            cudaMemcpy(result_temp, reinterpret_cast<T*>(a[agg]), sizeof(T), cudaMemcpyDeviceToDevice);
+            CHECK_ERROR();
+            cudaDeviceSynchronize();
+            result[agg] = reinterpret_cast<uint8_t*> (result_temp);
         } else if (agg_mode[agg] >= 0 && agg_mode[agg] <= 3) {
             T* a_temp = reinterpret_cast<T*> (a[agg]);
             T* result_temp = gpuBufferManager->customCudaMalloc<T>(1, 0, 0);

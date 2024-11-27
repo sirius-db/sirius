@@ -12,8 +12,11 @@ OperatorResultType
 GPUPhysicalStreamingLimit::Execute(GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation) const {
 
 	printf("Executing streaming limit\n");
+  printf("Limit value %ld\n", limit_val.GetConstantValue());
+  auto limit_const = limit_val.GetConstantValue();
 	for (int col_idx = 0; col_idx < output_relation.columns.size(); col_idx++) {
-		output_relation.columns[col_idx] = input_relation.columns[col_idx];
+		// output_relation.columns[col_idx] = input_relation.columns[col_idx];
+    output_relation.columns[col_idx] = new GPUColumn(limit_const, input_relation.columns[col_idx]->data_wrapper.type, input_relation.columns[col_idx]->data_wrapper.data);
 	}
 
   return OperatorResultType::FINISHED;

@@ -299,8 +299,6 @@ void probeHashTable(uint64_t **keys, unsigned long long* ht, uint64_t ht_len, ui
     CHECK_ERROR();
     cudaDeviceSynchronize();
     count = h_count;
-
-    assert(0);
 }
 
 

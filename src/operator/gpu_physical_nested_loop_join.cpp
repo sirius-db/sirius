@@ -11,8 +11,65 @@
 #include "gpu_meta_pipeline.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/common/enums/physical_operator_type.hpp"
+#include "gpu_buffer_manager.hpp"
+#include "gpu_materialize.hpp"
 
 namespace duckdb {
+
+template <typename T>
+void ResolveTypeNestedLoopJoin(GPUColumn** &left_keys, GPUColumn** &right_keys, uint64_t* &count, uint64_t* &row_ids_left, uint64_t* &row_ids_right, 
+		const vector<JoinCondition> &conditions, JoinType join_type, GPUBufferManager* gpuBufferManager) {
+	int num_keys = conditions.size();
+	T** left_data = new T*[num_keys];
+	T** right_data = new T*[num_keys];
+
+	for (int key = 0; key < num_keys; key++) {
+		left_data[key] = reinterpret_cast<T*>(left_keys[key]->data_wrapper.data);
+		right_data[key] = reinterpret_cast<T*>(right_keys[key]->data_wrapper.data);
+	}
+	size_t left_size = left_keys[0]->column_length;
+	size_t right_size = right_keys[0]->column_length;
+
+
+	int* condition_mode = new int[num_keys];
+	for (int key = 0; key < num_keys; key++) {
+		if (conditions[key].comparison == ExpressionType::COMPARE_EQUAL || conditions[key].comparison == ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+			condition_mode[key] = 0;
+		} else if (conditions[key].comparison == ExpressionType::COMPARE_NOTEQUAL || conditions[key].comparison == ExpressionType::COMPARE_DISTINCT_FROM) {
+			condition_mode[key] = 1;
+		} else if (conditions[key].comparison == ExpressionType::COMPARE_LESSTHAN) { 
+			condition_mode[key] = 2;
+		} else if (conditions[key].comparison == ExpressionType::COMPARE_GREATERTHAN) { 
+			condition_mode[key] = 3;
+		} else {
+			throw NotImplementedException("Unsupported comparison type");
+		}
+	}
+
+	printf("im here\n");
+
+	//TODO: Need to handle special case for unique keys for better performance
+	if (join_type == JoinType::INNER) {
+		nestedLoopJoin<T>(left_data, right_data, row_ids_left, row_ids_right, count, left_size, right_size, condition_mode, num_keys);
+	} else {
+		throw NotImplementedException("Unsupported join type");
+	}
+}
+
+void
+HandleNestedLoopJoin(GPUColumn** &left_keys, GPUColumn** &right_keys, uint64_t* &count, uint64_t* &row_ids_left, uint64_t* &row_ids_right, 
+		const vector<JoinCondition> &conditions, JoinType join_type, GPUBufferManager* gpuBufferManager) {
+    switch(left_keys[0]->data_wrapper.type) {
+      case ColumnType::INT64:
+		ResolveTypeNestedLoopJoin<uint64_t>(left_keys, right_keys, count, row_ids_left, row_ids_right, conditions, join_type, gpuBufferManager);
+		break;
+      case ColumnType::FLOAT64:
+	  	ResolveTypeNestedLoopJoin<double>(left_keys, right_keys, count, row_ids_left, row_ids_right, conditions, join_type, gpuBufferManager);
+		break;
+      default:
+        throw NotImplementedException("Unsupported column type");
+    }
+}
 
 GPUPhysicalNestedLoopJoin::GPUPhysicalNestedLoopJoin(LogicalOperator &op, unique_ptr<GPUPhysicalOperator> left,
                                                unique_ptr<GPUPhysicalOperator> right, vector<JoinCondition> cond,
@@ -228,17 +285,23 @@ GPUPhysicalNestedLoopJoin::Sink(GPUIntermediateRelation &input_relation) const {
 	// gstate.right_payload_data.Append(chunk);
 	// gstate.right_condition_data.Append(nlj_state.right_condition);
 
+	GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+
 	for (idx_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
 		auto &condition = conditions[cond_idx];
         auto join_key_index = condition.right->Cast<BoundReferenceExpression>().index;
         printf("Reading join key from right side from idx %ld\n", join_key_index);
-        input_relation.checkLateMaterialization(join_key_index);
+        // input_relation.checkLateMaterialization(join_key_index);
+		// right_key[cond_idx] = HandleMaterializeExpression(input_relation.columns[join_key_index], condition.left->Cast<BoundReferenceExpression>(), gpuBufferManager);
 	}
 
     for (int i = 0; i < input_relation.columns.size(); i++) {
         printf("Passing column idx %d from right side to idx %d in right temp relation\n", i, i);
-        right_temp_data->columns[i] = input_relation.columns[i];
-        right_temp_data->columns[i]->row_ids = new uint64_t[1];
+        // right_temp_data->columns[i] = input_relation.columns[i];
+        // right_temp_data->columns[i]->row_ids = new uint64_t[1];
+		right_temp_data->columns[i] = new GPUColumn(input_relation.columns[i]->column_length, input_relation.columns[i]->data_wrapper.type, input_relation.columns[i]->data_wrapper.data);
+		right_temp_data->columns[i]->row_ids = input_relation.columns[i]->row_ids;
+		right_temp_data->columns[i]->row_id_count = input_relation.columns[i]->row_id_count;
     }
 
 	return SinkResultType::FINISHED;
@@ -344,12 +407,15 @@ GPUPhysicalNestedLoopJoin::Execute(GPUIntermediateRelation &input_relation, GPUI
 	case JoinType::ANTI:
 	case JoinType::MARK:
 		// simple joins can have max STANDARD_VECTOR_SIZE matches per chunk
+		throw NotImplementedException("Unimplemented type " + JoinTypeToString(join_type) + " for nested loop join!");
 		ResolveSimpleJoin(input_relation, output_relation);
-		return OperatorResultType::NEED_MORE_INPUT;
+		return OperatorResultType::FINISHED;
 	case JoinType::LEFT:
-	case JoinType::INNER:
 	case JoinType::OUTER:
 	case JoinType::RIGHT:
+		throw NotImplementedException("Unimplemented type " + JoinTypeToString(join_type) + " for nested loop join!");
+		return OperatorResultType::FINISHED;
+	case JoinType::INNER:
 		return ResolveComplexJoin(input_relation, output_relation);
 	default:
 		throw NotImplementedException("Unimplemented type " + JoinTypeToString(join_type) + " for nested loop join!");
@@ -486,35 +552,63 @@ GPUPhysicalNestedLoopJoin::ResolveComplexJoin(GPUIntermediateRelation &input_rel
 // 	} while (match_count == 0);
 // 	return OperatorResultType::HAVE_MORE_OUTPUT;
 
+	GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+	GPUColumn** left_keys = new GPUColumn*[conditions.size()];
+	GPUColumn** right_keys = new GPUColumn*[conditions.size()];
+	for (int i = 0; i < conditions.size(); i++) {
+		left_keys[i] = nullptr;
+		right_keys[i] = nullptr;
+	}
+	uint64_t* count;
+	uint64_t* row_ids_left = nullptr;
+	uint64_t* row_ids_right = nullptr;
+
 	for (idx_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
 		auto &condition = conditions[cond_idx];
         auto join_key_index = condition.left->Cast<BoundReferenceExpression>().index;
         printf("Reading join key from left side from index %ld\n", join_key_index);
-        input_relation.checkLateMaterialization(join_key_index);
+        // input_relation.checkLateMaterialization(join_key_index);
+		left_keys[cond_idx] = HandleMaterializeExpression(input_relation.columns[join_key_index], condition.left->Cast<BoundReferenceExpression>(), gpuBufferManager);
 	}
 
 	for (idx_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
 		auto &condition = conditions[cond_idx];
         auto join_key_index = condition.right->Cast<BoundReferenceExpression>().index;
-        printf("Reading join key from right side from idx %ld\n", join_key_index);
-        right_temp_data->checkLateMaterialization(join_key_index);
+        printf("Reading join key from right side from index %ld\n", join_key_index);
+        // right_temp_data->checkLateMaterialization(join_key_index);
+		right_keys[cond_idx] = HandleMaterializeExpression(right_temp_data->columns[join_key_index], condition.right->Cast<BoundReferenceExpression>(), gpuBufferManager);
 	}
 
-	if (join_type == JoinType::LEFT || join_type == JoinType::INNER || join_type == JoinType::OUTER || join_type == JoinType::RIGHT) {
-		printf("Writing row IDs from left side to output relation\n");
-		uint64_t* left_row_ids = new uint64_t[1];
-		for (idx_t i = 0; i < input_relation.column_count; i++) {
-			printf("Passing column idx %ld from LHS (late materialized) to idx %ld in output relation\n", i, i);
-			output_relation.columns[i] = input_relation.columns[i];
-			output_relation.columns[i]->row_ids = left_row_ids;
-		}
-        printf("Writing row IDs from right side to output relation\n");
-		uint64_t* right_row_ids = new uint64_t[1];
-		for (idx_t i = 0; i < right_temp_data->columns.size(); i++) {
-			printf("Passing column idx %ld from right_temp_data to idx %ld in output relation\n", i, input_relation.column_count + i);
-			output_relation.columns[input_relation.column_count + i] = right_temp_data->columns[i];
-			output_relation.columns[input_relation.column_count + i]->row_ids = right_row_ids;
-		}
+	if (join_type == JoinType::INNER) {
+	// if (join_type == JoinType::LEFT || join_type == JoinType::INNER || join_type == JoinType::OUTER || join_type == JoinType::RIGHT) {
+		// printf("Writing row IDs from left side to output relation\n");
+		// uint64_t* left_row_ids = new uint64_t[1];
+		// for (idx_t i = 0; i < input_relation.column_count; i++) {
+		// 	printf("Passing column idx %ld from LHS (late materialized) to idx %ld in output relation\n", i, i);
+		// 	output_relation.columns[i] = input_relation.columns[i];
+		// 	output_relation.columns[i]->row_ids = left_row_ids;
+		// }
+        // printf("Writing row IDs from right side to output relation\n");
+		// uint64_t* right_row_ids = new uint64_t[1];
+		// for (idx_t i = 0; i < right_temp_data->columns.size(); i++) {
+		// 	printf("Passing column idx %ld from right_temp_data to idx %ld in output relation\n", i, input_relation.column_count + i);
+		// 	output_relation.columns[input_relation.column_count + i] = right_temp_data->columns[i];
+		// 	output_relation.columns[input_relation.column_count + i]->row_ids = right_row_ids;
+		// }
+
+		printf("Nested loop join\n");
+		count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+		HandleNestedLoopJoin(left_keys, right_keys, count, row_ids_left, row_ids_right, conditions, join_type, gpuBufferManager);
+
+		vector<idx_t> rhs_output_columns;
+		for (idx_t i = 0; i < right_temp_data->columns.size(); i++) rhs_output_columns.push_back(i);
+
+		if (count[0] == 0) throw NotImplementedException("No match found in nested loop join");
+		printf("Writing row IDs from LHS to output relation\n");
+		HandleMaterializeRowIDs(input_relation, output_relation, count[0], row_ids_left, gpuBufferManager);
+		printf("Writing row IDs from RHS to output relation\n");
+		HandleMaterializeRowIDsRHS(*right_temp_data, output_relation, rhs_output_columns, input_relation.column_count, count[0], row_ids_right, gpuBufferManager);
+
 	} else {
         throw NotImplementedException("Unimplemented type for complex nested loop join!");
     }
