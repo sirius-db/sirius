@@ -20,17 +20,23 @@ ColumnType convertLogicalTypetoColumnType(LogicalType type);
 class DataWrapper {
 public:
     DataWrapper() = default; // Add default constructor
+    virtual ~DataWrapper() { };
     DataWrapper(ColumnType type, uint8_t* data, size_t size);
 	ColumnType type;
 	uint8_t* data;
     size_t size;
+    int* offsets;
+    int num_strings;
     size_t getColumnTypeSize();
+    bool is_string_data{false};
 };
 
 class GPUColumn {
 public:
     GPUColumn(string name, size_t column_length, ColumnType type, uint8_t* data);
     GPUColumn(size_t column_length, ColumnType type, uint8_t* data);
+    GPUColumn(const GPUColumn& other);
+    
     ~GPUColumn(){};
     int* GetDataInt32();
     uint64_t* GetDataUInt64();

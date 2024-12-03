@@ -91,6 +91,43 @@ public:
 	ColumnDataAppendState append_state;
 };
 
+void GPUPhysicalMaterializedCollector::FinalizeMaterializeString(GPUIntermediateRelation input_relation, GPUIntermediateRelation& output_relation, size_t col) const {
+	bool need_to_late_materalize = input_relation.checkLateMaterialization(col);
+	output_relation.columns[col] = new GPUColumn(*input_relation.columns[col]);
+
+	if (need_to_late_materalize) {
+		// Late materalize the input relationship
+		size_t num_rows = output_relation.columns[col]->row_id_count;
+		uint64_t* row_ids = output_relation.columns[col]->row_ids;
+		DataWrapper input_data_wrapper = output_relation.columns[col]->data_wrapper;
+		std::cout << "Running string late materalization with " << num_rows << " rows" << std::endl;
+
+		// First create the new offsets
+		int* materalized_offsets = gpuBufferManager->customCudaMalloc<int>(num_rows + 1, 0, 0);
+		int new_chars_len = strMateralizeOffsets(materalized_offsets, input_data_wrapper.offsets, row_ids, num_rows);
+
+		// Copy over the chars
+		uint8_t* materalized_chars = gpuBufferManager->customCudaMalloc<uint8_t>(new_chars_len, 0, 0);
+		strMateralizeChars(materalized_chars, input_data_wrapper.data, materalized_offsets, input_data_wrapper.offsets, row_ids, num_rows);
+		
+		// Update the data wrapper
+		input_data_wrapper.offsets = materalized_offsets;
+		input_data_wrapper.num_strings = static_cast<int>(num_rows);
+		input_data_wrapper.data = materalized_chars;
+		input_data_wrapper.size = static_cast<size_t>(new_chars_len);
+		
+		// Mark that record has been late materalized
+		output_relation.columns[col]->data_wrapper = input_data_wrapper;
+		output_relation.columns[col]->column_length = num_rows;
+		output_relation.columns[col]->row_id_count = 0;
+		output_relation.columns[col]->row_ids = nullptr;
+
+		// Also reset the input marking it as materalized for future queries
+		input_relation.columns[col]->row_id_count = 0;
+		input_relation.columns[col]->row_ids = nullptr;
+	} 
+}
+
 template <typename T>
 void 
 GPUPhysicalMaterializedCollector::FinalMaterializeInternal(GPUIntermediateRelation input_relation, GPUIntermediateRelation &output_relation, size_t col) const {
@@ -98,7 +135,7 @@ GPUPhysicalMaterializedCollector::FinalMaterializeInternal(GPUIntermediateRelati
 		T* data = reinterpret_cast<T*> (input_relation.columns[col]->data_wrapper.data);
 		uint64_t* row_ids = reinterpret_cast<uint64_t*> (input_relation.columns[col]->row_ids);
 		T* materialized = gpuBufferManager->customCudaMalloc<T>(input_relation.columns[col]->row_id_count, 0, 0);
-		// printf("input_relation.columns[col]->row_id_count %d\n", input_relation.columns[col]->row_id_count);
+		printf("input_relation.columns[col]->row_id_count %zu\n", input_relation.columns[col]->row_id_count);
 		materializeExpression<T>(data, materialized, row_ids, input_relation.columns[col]->row_id_count);
 		output_relation.columns[col] = new GPUColumn(input_relation.columns[col]->row_id_count, input_relation.columns[col]->data_wrapper.type, reinterpret_cast<uint8_t*>(materialized));
 		output_relation.columns[col]->row_id_count = 0;
@@ -119,7 +156,7 @@ GPUPhysicalMaterializedCollector::FinalMaterialize(GPUIntermediateRelation input
 		break;
 	case ColumnType::INT32:
 		FinalMaterializeInternal<int>(input_relation, output_relation, col);
-		size_bytes = output_relation.columns[col]->column_length * sizeof(uint64_t);
+		size_bytes = output_relation.columns[col]->column_length * sizeof(int);
 		break;
 	case ColumnType::FLOAT64:
 		FinalMaterializeInternal<double>(input_relation, output_relation, col);
@@ -129,11 +166,15 @@ GPUPhysicalMaterializedCollector::FinalMaterialize(GPUIntermediateRelation input
 		FinalMaterializeInternal<float>(input_relation, output_relation, col);
 		size_bytes = output_relation.columns[col]->column_length * sizeof(uint64_t);
 		break;
+	case ColumnType::VARCHAR:
+		FinalizeMaterializeString(input_relation, output_relation, col);
+		size_bytes = output_relation.columns[col]->data_wrapper.size * sizeof(uint8_t);
+		break;
 	default:
-		throw NotImplementedException("Unsupported column type");
+		throw NotImplementedException("FinalMaterialize Unsupported column type");
 	}
-	// output_relation.length = output_relation.columns[col]->column_length;
-	printf("Final materialize size %d\n", size_bytes);
+
+	printf("Final materialize size %d and output col length %d\n", size_bytes, output_relation.columns[col]->column_length);
 	return size_bytes;
 }
 
@@ -150,7 +191,7 @@ LogicalType ColumnTypeToLogicalType(ColumnType type) {
 		case ColumnType::VARCHAR:
 			return LogicalType::VARCHAR;
 		default:
-			throw NotImplementedException("Unsupported column type");
+			throw NotImplementedException("ColumnTypeToLogicalType Unsupported column type");
 	}
 }
 
@@ -165,10 +206,15 @@ Vector rawDataToVector(uint8_t* host_data, size_t vector_offset, ColumnType type
 			sizeof_type = sizeof(float); break;
 		case ColumnType::FLOAT64:
 			sizeof_type = sizeof(double); break;
+		case ColumnType::VARCHAR:
+			sizeof_type = sizeof(uint8_t); break;
 		default:
-			throw NotImplementedException("Unsupported column type");
+			throw NotImplementedException("rawDataToVector Unsupported column type");
 	}
-	uint8_t* data = host_data + vector_offset * STANDARD_VECTOR_SIZE * sizeof_type;
+
+	int initial_offset = vector_offset * STANDARD_VECTOR_SIZE * sizeof_type;
+	uint8_t* data = host_data + initial_offset;
+	printf("rawDataToVector got offset of %d\n", initial_offset);
 	return Vector(ColumnTypeToLogicalType(type), data);
 }
 
@@ -179,46 +225,108 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 	}
 	// auto &gstate = GetGlobalSinkState(input_relation.context);
 
-	size_t size_bytes = 0;
-	Allocator& allocator = Allocator::DefaultAllocator();
-	uint8_t** host_data = new uint8_t*[input_relation.columns.size()];
-	GPUIntermediateRelation materialized_relation(input_relation.columns.size());
-	for (int col = 0; col < input_relation.columns.size(); col++) {
-		// Final materialization
-		size_bytes = FinalMaterialize(input_relation, materialized_relation, col);
-		// printf("materialize row id count%ld\n", input_relation.columns[col]->row_id_count);
-		host_data[col] = allocator.AllocateData(size_bytes);
-		callCudaMemcpyDeviceToHost<uint8_t>(host_data[col], materialized_relation.columns[col]->data_wrapper.data, size_bytes, 0);
-		// for (int i = 0; i < 10; i++) {
-		// 	uint64_t* temp = reinterpret_cast<uint64_t*>(host_data[col]);
-		// 	printf("Data: %d\n", temp[i]);
-		// }
+	for(int i = 0; i < types.size(); i++) {
+		std::cout << "GPUPhysicalMaterializedCollector Sink Col " << i << " has types " << types[i].ToString() << std::endl;
 	}
 
+	size_t size_bytes = 0;
+	int num_columns = input_relation.columns.size();
+	Allocator& allocator = Allocator::DefaultAllocator();
+	uint8_t** host_data = new uint8_t*[num_columns];
+	GPUIntermediateRelation materialized_relation(num_columns);
+	std::cout << "Initialized the materialized_relation with " << num_columns << " columns" << std::endl;
+
+	for (int col = 0; col < num_columns; col++) {
+		// Log the current column
+		GPUColumn* curr_col = input_relation.columns[col];
+		if(curr_col == nullptr) {
+			throw InvalidInputException("Got null column in the input relationship");
+		}
+
+		// Final materialization for all non string columns
+		std::cout << "Calling finalized materalized for column " << col << std::endl;
+		size_bytes = FinalMaterialize(input_relation, materialized_relation, col);
+
+		if(input_relation.columns[col]->data_wrapper.type != ColumnType::VARCHAR) {
+			host_data[col] = allocator.AllocateData(size_bytes);
+			callCudaMemcpyDeviceToHost<uint8_t>(host_data[col], materialized_relation.columns[col]->data_wrapper.data, size_bytes, 0);
+			std::cout << "Allocated " << size_bytes << " bytes on CPU for col " << col << std::endl;
+			std::cout << "Got data count of " << reinterpret_cast<uint64_t*>(host_data[col])[0] << std::endl;
+		} else {
+			DataWrapper materialized_col_data = materialized_relation.columns[col]->data_wrapper;
+			std::cout << "Got materalized col data with " << materialized_col_data.num_strings << " and " << materialized_col_data.size << " chars" << std::endl;
+			
+			// Copy over the pointers from the gpu to the cpu
+			size_t offset_bytes = (materialized_col_data.num_strings + 1) * sizeof(int);
+			int* cpu_offsets = reinterpret_cast<int*>(allocator.AllocateData(offset_bytes));
+			callCudaMemcpyDeviceToHost<int>(cpu_offsets, materialized_col_data.offsets, materialized_col_data.num_strings + 1, 0);
+			std::cout << "Got cpu offsets of " << cpu_offsets[0] << "," << cpu_offsets[1] << std::endl;
+			materialized_col_data.offsets = cpu_offsets;
+			
+			// Do the same for the chars
+			size_t data_bytes = materialized_col_data.size * sizeof(uint8_t);
+			uint8_t* cpu_chars = reinterpret_cast<uint8_t*>(allocator.AllocateData(data_bytes));
+			callCudaMemcpyDeviceToHost<uint8_t>(cpu_chars, materialized_col_data.data, data_bytes, 0);
+			materialized_col_data.data = cpu_chars;
+
+			// Copy over the data wrapper
+			materialized_relation.columns[col]->data_wrapper = materialized_col_data;
+			std::cout << "Copied over strings to the CPU with offset " << materialized_relation.columns[col]->data_wrapper.offsets[0];
+			std::cout << " and chars " << materialized_relation.columns[col]->data_wrapper.data[0] << std::endl;
+		}
+	}
+	
 	ColumnDataAppendState append_state;
 	collection->InitializeAppend(append_state);
-	size_t total_vector = (materialized_relation.columns[0]->column_length + STANDARD_VECTOR_SIZE - 1) / STANDARD_VECTOR_SIZE;
-	// printf("Total vector %d\n", total_vector);
+	size_t total_chunks = (materialized_relation.columns[0]->column_length + STANDARD_VECTOR_SIZE - 1) / STANDARD_VECTOR_SIZE;
 	size_t remaining = materialized_relation.columns[0]->column_length;
-	for (int vec = 0; vec < total_vector; vec++) {
+	printf("Total vectors of %zu with standard vector size of %zu and remaining of %zu\n", total_chunks, STANDARD_VECTOR_SIZE, remaining);
+	for (int vec = 0; vec < total_chunks; vec++) {
 		DataChunk chunk;
 		chunk.InitializeEmpty(types);
+		chunk.SetCapacity(STANDARD_VECTOR_SIZE);
 		for (int col = 0; col < materialized_relation.columns.size(); col++) {
-			Vector vector = rawDataToVector(host_data[col], vec, materialized_relation.columns[col]->data_wrapper.type);
-			chunk.data[col].Reference(vector);
+			if(materialized_relation.columns[col]->data_wrapper.type != ColumnType::VARCHAR) {
+				std::cout << "Converting non string col " << col << " into vector " << std::endl;
+				Vector vector = rawDataToVector(host_data[col], vec, materialized_relation.columns[col]->data_wrapper.type);
+				chunk.data[col].Reference(vector);
+			} else {
+				DataWrapper str_col_data = materialized_relation.columns[col]->data_wrapper;
+				int num_output_records = std::min((int) STANDARD_VECTOR_SIZE, (int) remaining);
+				Vector str_vector(LogicalType::VARCHAR, num_output_records);
+				std::cout << "Creating string vector with " << num_output_records << " records" << std::endl;
+
+				// Add the strings to the vector
+				for(int i = 0; i < num_output_records; i++) {
+					std::string output_str(str_col_data.data + str_col_data.offsets[i], str_col_data.data + str_col_data.offsets[i + 1]);
+					Value output_value(output_str);
+					std::cout << "Recording value " << output_value.ToString() << " for idx " << i << std::endl;
+					str_vector.SetValue(i, output_value);
+				}
+				chunk.data[col].Reference(str_vector);
+			}
 		}
-		// printf("Chunk column count %d\n", chunk.ColumnCount());
-		// chunk.Print();
-		// printf("Remaining %d\n", remaining);
+
+		// Set the cardinality of the chunk
 		if (remaining < STANDARD_VECTOR_SIZE) {
 			chunk.SetCardinality(remaining);
+			remaining = 0;
 		} else {
 			chunk.SetCardinality(STANDARD_VECTOR_SIZE);
+			remaining -= STANDARD_VECTOR_SIZE;
 		}
+		std::cout << "Created chunk with size " << chunk.size() << " and " << chunk.ColumnCount() << " cols" << std::endl;
+		
+		printf("Chunk column count %d\n", chunk.ColumnCount());
+		chunk.Print();
+		printf("Remaining %d\n", remaining);
+
+		printf("Adding chunk to collection\n");
 		collection->Append(append_state, chunk);
-		remaining -= STANDARD_VECTOR_SIZE;
+		printf("Finished appending chunk to collection\n");
 	}
-	// printf("Finished\n");
+
+	printf("Returning finished\n");
 	return SinkResultType::FINISHED;
 }
 

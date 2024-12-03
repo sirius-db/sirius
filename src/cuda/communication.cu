@@ -23,6 +23,12 @@ template void
 callCudaMemcpyHostToDevice<uint8_t>(uint8_t* dest, uint8_t* src, size_t size, int gpu);
 
 template void
+callCudaMemcpyHostToDevice<char>(char* dest, char* src, size_t size, int gpu);
+
+template void
+callCudaMemcpyHostToDevice<bool>(bool* dest, bool* src, size_t size, int gpu);
+
+template void
 callCudaMemcpyDeviceToHost<int>(int* dest, int* src, size_t size, int gpu);
 
 template void
@@ -39,12 +45,12 @@ callCudaMemcpyDeviceToHost<uint8_t>(uint8_t* dest, uint8_t* src, size_t size, in
 
 template <typename T> 
 void callCudaMemcpyHostToDevice(T* dest, T* src, size_t size, int gpu) {
-    printf("Send data to GPU\n");
+    printf("callCudaMemcpyHostToDevice Send data to GPU\n");
     cudaSetDevice(gpu);
     gpuErrchk(cudaMemcpy(dest, src, size * sizeof(T), cudaMemcpyHostToDevice));
     gpuErrchk(cudaDeviceSynchronize());
     cudaSetDevice(0);
-    printf("Done sending data to GPU\n");
+    printf("callCudaMemcpyHostToDevice Done sending data to GPU\n");
 }
 
 template <typename T> 
@@ -60,13 +66,13 @@ void callCudaMemcpyDeviceToHost(T* dest, T* src, size_t size, int gpu) {
 
 // Define the host function that launches the CUDA kernel
 int* sendDataToGPU(int* data, int size) {
-    printf("Send data to GPU\n");
+    printf("sendDataToGPU Send data to GPU\n");
     // use cudamemcpy
     int* target;
     cudaMalloc((void**) &target, size * sizeof(int));
     cudaMemcpy(target, data, size * sizeof(int), cudaMemcpyHostToDevice);
     cudaDeviceSynchronize();
-    printf("Done sending data to GPU\n");
+    printf("sendDataToGPU Done sending data to GPU\n");
     return target;
 }
 

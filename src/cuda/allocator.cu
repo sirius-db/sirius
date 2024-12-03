@@ -19,6 +19,9 @@ callCudaMalloc<float>(size_t size, int gpu);
 template double*
 callCudaMalloc<double>(size_t size, int gpu);
 
+template bool*
+callCudaMalloc<bool>(size_t size, int gpu);
+
 template void
 callCudaFree<int>(int* ptr, int gpu);
 
@@ -33,6 +36,9 @@ callCudaFree<float>(float* ptr, int gpu);
 
 template void
 callCudaFree<double>(double* ptr, int gpu);
+
+template void
+callCudaFree<bool>(bool* ptr, int gpu);
 
 template <typename T>
 T* callCudaMalloc(size_t size, int gpu) {

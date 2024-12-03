@@ -14,6 +14,9 @@ template <typename T> void callCudaFree(T* ptr, int gpu);
 template <typename T> void callCudaMemcpyHostToDevice(T* dest, T* src, size_t size, int gpu);
 template <typename T> void callCudaMemcpyDeviceToHost(T* dest, T* src, size_t size, int gpu);
 template <typename T> void materializeExpression(T *a, T* result, uint64_t *row_ids, uint64_t N);
+int strMateralizeOffsets(int* materalized_offsets, int* input_offsets, uint64_t* row_ids, size_t num_rows);
+void strMateralizeChars(uint8_t* materalized_chars, uint8_t* input_chars, int* materalized_offsets, 
+	int* input_offsets, uint64_t* row_ids, size_t num_rows);
 
 struct pointer_and_key {
 	uint64_t* pointer;
@@ -54,9 +57,12 @@ public:
 
     map<string, GPUIntermediateRelation*> tables;
 
+	DataWrapper allocateStringChunk(Vector &input,	size_t chunk_size);
 	DataWrapper allocateChunk(DataChunk &input);
+	DataWrapper mergeWrappers(DataWrapper first, DataWrapper second);
 	DataWrapper allocateColumnBufferInCPU(unique_ptr<MaterializedQueryResult> input);
 	void cacheDataInGPU(DataWrapper cpu_data, string table_name, string column_name, int gpu);
+	DataWrapper allocateStrColumnInGPU(DataWrapper cpu_data, int gpu);
 	DataWrapper allocateColumnBufferInGPU(DataWrapper cpu_data, int gpu);
 	void createTableAndColumnInGPU(Catalog& catalog, ClientContext& context, string table_name, string column_name);
 	void createTable(string table_name, size_t column_count);

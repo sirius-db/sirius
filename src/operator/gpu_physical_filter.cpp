@@ -1,4 +1,5 @@
 #include "operator/gpu_physical_filter.hpp"
+#include "operator/gpu_physical_string_matching.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
@@ -8,6 +9,10 @@
 #include "duckdb/planner/expression/bound_case_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
+
+#include <cuda_runtime.h>
+#include <cuda.h>
+#include <curand.h>
 
 namespace duckdb {
 
@@ -36,8 +41,7 @@ GPUPhysicalFilter::GPUPhysicalFilter(vector<LogicalType> types, vector<unique_pt
 // 	                                   GlobalOperatorState &gstate, OperatorState &state) const {
 OperatorResultType 
 GPUPhysicalFilter::Execute(GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation) const {
-	printf("Executing expression %s\n", expression->ToString().c_str());
-
+	std::cout << "Executing GPUPhysicalFilter for expression " << expression->ToString() << std::endl;
     gpu_expression_executor->FilterRecursiveExpression(input_relation, output_relation, *expression, 0);
 	return OperatorResultType::FINISHED;
 }

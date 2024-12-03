@@ -8,6 +8,7 @@ set(EXTENSION_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/gpu_physical_filter.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/gpu_physical_hash_join.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/gpu_physical_grouped_aggregate.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/gpu_physical_string_matching.cu
         ${CMAKE_CURRENT_SOURCE_DIR}/gpu_physical_order.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/gpu_physical_projection.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/gpu_physical_ungrouped_aggregate.cpp

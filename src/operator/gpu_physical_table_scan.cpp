@@ -3,6 +3,9 @@
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 
+#include <algorithm>
+#include <string>
+
 namespace duckdb {
 
 GPUPhysicalTableScan::GPUPhysicalTableScan(vector<LogicalType> types, TableFunction function_p,
@@ -62,7 +65,7 @@ void HandleComparisonConstantExpression(GPUColumn* column, uint64_t* &count, uin
         ResolveTypeComparisonConstantExpression<double>(column, count, row_ids, filter_constant, expression_type);
         break;
       default:
-        throw NotImplementedException("Unsupported column type");
+        throw NotImplementedException("HandleComparisonConstantExpression Unsupported column type");
     }
 }
 
@@ -90,7 +93,7 @@ void HandleBetweenExpression(GPUColumn* column, uint64_t* &count, uint64_t* &row
         ResolveTypeBetweenExpression<double>(column, count, row_ids, filter_constant1, filter_constant2);
         break;
       default:
-        throw NotImplementedException("Unsupported column type");
+        throw NotImplementedException("HandleBetweenExpression Unsupported column type");
     }
 }
 
@@ -99,12 +102,23 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
   if (output_relation.columns.size() != GetTypes().size()) throw InvalidInputException("Mismatched column count");
 
   auto table_name = function.to_string(bind_data.get()); //we get it from ParamsToString();
+  auto gpuBufferManager = &(GPUBufferManager::GetInstance());
 
   printf("Table Scanning %s\n", table_name.c_str());
+  std::cout << "Existing buffer manager tables searching for table " << table_name << ": ";
+  for (const auto& pair : gpuBufferManager->tables) {
+    std::cout << pair.first << " ";
+  }
+  std::cout << std::endl;
+
   //Find table name in the buffer manager
-  auto gpuBufferManager = &(GPUBufferManager::GetInstance());
-  auto it = gpuBufferManager->tables.find(table_name);
+  std::string upper_table_name = table_name;
+  std::transform(upper_table_name.begin(), upper_table_name.end(), upper_table_name.begin(), ::toupper);
+  std::cout << "Searching for table " << upper_table_name << std::endl;
+
+  auto it = gpuBufferManager->tables.find(upper_table_name);
   GPUIntermediateRelation* table;
+
   //If there is a filter: apply filter, and write to output_relation (late materialized)
     if (it != gpuBufferManager->tables.end()) {
         // Key found, print the value
@@ -113,14 +127,19 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
             printf("Cached Column name: %s\n", table->column_names[i].c_str());
         }
         for (int col = 0; col < column_ids.size(); col++) {
-            // printf("Finding column %s\n", names[column_ids[col]].c_str());
-            auto column_it = find(table->column_names.begin(), table->column_names.end(), names[column_ids[col]]);
+            std::string search_col = names[column_ids[col]];
+            std::string upper_col_name = search_col;
+            std::transform(upper_col_name.begin(), upper_col_name.end(), upper_col_name.begin(), ::toupper);
+            printf("Finding column %s\n", upper_col_name.c_str());
+
+            auto column_it = find(table->column_names.begin(), table->column_names.end(), upper_col_name);
             if (column_it == table->column_names.end()) {
                 throw InvalidInputException("Column not found");
             } 
+
             auto column_name = table->column_names[column_ids[col]];
             printf("Column found %s\n", column_name.c_str());
-            if (column_name != names[column_ids[col]]) {
+            if (column_name != upper_col_name) {
                 throw InvalidInputException("Column name mismatch");
             }
         }

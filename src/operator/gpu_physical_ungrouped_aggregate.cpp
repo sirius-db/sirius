@@ -1,6 +1,10 @@
 #include "operator/gpu_physical_ungrouped_aggregate.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 
+#include <cuda_runtime.h>
+#include <cuda.h>
+#include <curand.h>
+
 namespace duckdb {
 
 GPUPhysicalUngroupedAggregate::GPUPhysicalUngroupedAggregate(vector<LogicalType> types,
@@ -26,6 +30,7 @@ GPUPhysicalUngroupedAggregate::Sink(GPUIntermediateRelation &input_relation) con
 	printf("Performing ungrouped aggregation\n");
 
 	if (distinct_data) {
+		std::cout << "Running SinkDistinct" << std::endl;
 		SinkDistinct(input_relation);
 	}
 
@@ -38,8 +43,10 @@ GPUPhysicalUngroupedAggregate::Sink(GPUIntermediateRelation &input_relation) con
 
 		payload_idx = next_payload_idx;
 		next_payload_idx = payload_idx + aggregate.children.size();
+		std::cout << "Got payload indicies (" << payload_idx << "," << next_payload_idx << ")" << std::endl;
 
 		if (aggregate.IsDistinct()) {
+			std::cout << "Skipping due to aggregate being a filter" << std::endl;
 			continue;
 		}
 
@@ -48,17 +55,38 @@ GPUPhysicalUngroupedAggregate::Sink(GPUIntermediateRelation &input_relation) con
 			printf("Reading filter column from index %ld\n", bound_ref_expr.index);
 		}
 
-		idx_t payload_cnt = 0;
+		int num_children = aggregate.children.size();
+		std::cout << "Got aggregate children of size " << num_children << std::endl;
+		if(aggregate.function.ToString().find("count_star") != std::string::npos) {
+			// Update the aggregate function to store the number of records
+			aggregation_result->columns[aggr_idx] = input_relation.columns[aggr_idx];
+			aggregation_result->columns[aggr_idx]->data_wrapper.type = ColumnType::INT64;
+			aggregation_result->columns[aggr_idx]->data_wrapper.is_string_data = false;
+		
+			int64_t num_records = (int64_t) aggregation_result->columns[aggr_idx]->row_id_count;
+			aggregation_result->columns[aggr_idx]->data_wrapper.size = sizeof(int64_t);
+			int64_t* gpu_data_col = reinterpret_cast<int64_t*>(aggregation_result->columns[aggr_idx]->data_wrapper.data);
+			cudaMemcpy(gpu_data_col, &num_records, sizeof(int64_t), cudaMemcpyHostToDevice);
 
-		for (idx_t i = 0; i < aggregate.children.size(); ++i) {
-			for (auto &child_expr : aggregate.children) {
-				D_ASSERT(child_expr->type == ExpressionType::BOUND_REF);
-				printf("Reading aggregation column from index %ld and passing it to index %ld in aggregation result\n", payload_idx + payload_cnt, aggr_idx);
-				input_relation.checkLateMaterialization(payload_idx + payload_cnt);
-				// printf("aggregation_result.columns.size() %ld\n", aggregation_result->columns.size());
-				// printf("input_relation.columns.size() %ld\n", input_relation.columns.size());
-				aggregation_result->columns[aggr_idx] = input_relation.columns[payload_idx + payload_cnt];
-				payload_cnt++;
+			next_payload_idx = payload_idx + 1;
+			std::cout << "Set the column " << aggr_idx << " to value " << num_records << std::endl;
+
+			// Set it to be materalized
+			aggregation_result->columns[aggr_idx]->row_id_count = 0;
+			aggregation_result->columns[aggr_idx]->row_ids = nullptr;
+			aggregation_result->columns[aggr_idx]->column_length = 1;
+		} else {
+			idx_t payload_cnt = 0;
+			for (idx_t i = 0; i < aggregate.children.size(); ++i) {
+				for (auto &child_expr : aggregate.children) {
+					D_ASSERT(child_expr->type == ExpressionType::BOUND_REF);
+					printf("Reading aggregation column from index %ld and passing it to index %ld in aggregation result\n", payload_idx + payload_cnt, aggr_idx);
+					input_relation.checkLateMaterialization(payload_idx + payload_cnt);
+					// printf("aggregation_result.columns.size() %ld\n", aggregation_result->columns.size());
+					// printf("input_relation.columns.size() %ld\n", input_relation.columns.size());
+					aggregation_result->columns[aggr_idx] = input_relation.columns[payload_idx + payload_cnt];
+					payload_cnt++;
+				}
 			}
 		}
 	}

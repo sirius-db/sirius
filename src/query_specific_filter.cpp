@@ -41,7 +41,7 @@ GPUColumn* HandleMaterializeExpression(GPUColumn* column, BoundReferenceExpressi
         case ColumnType::FLOAT64:
             return ResolveTypeMaterializeExpression<double>(column, bound_ref, gpuBufferManager);
         default:
-            throw NotImplementedException("Unsupported column type");
+            throw NotImplementedException("query_specific_filter HandleMaterializeExpression Unsupported column type");
     }
 }
 

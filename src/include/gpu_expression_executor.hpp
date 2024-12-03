@@ -3,6 +3,7 @@
 #include "gpu_columns.hpp"
 #include "duckdb/planner/expression.hpp"
 #include "gpu_buffer_manager.hpp"
+#include "operator/gpu_physical_string_matching.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"

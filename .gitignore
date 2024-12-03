@@ -13,4 +13,4 @@ CMakeFiles/
 CMakeCache.txt
 
 s1
-tpch_s1.duckdb
+*.duckdb

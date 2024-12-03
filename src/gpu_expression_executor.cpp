@@ -36,7 +36,7 @@ GPUExpressionExecutor::HandleBinaryConstantExpression(GPUColumn* column, BoundCo
       case ColumnType::FLOAT64:
         return ResolveTypeBinaryConstantExpression<double>(column, expr, gpuBufferManager, function_name);
       default:
-        throw NotImplementedException("Unsupported column type");
+        throw NotImplementedException("HandleBinaryConstantExpression Unsupported column type");
     }
 }
 
@@ -74,7 +74,7 @@ GPUExpressionExecutor::HandleBinaryExpression(GPUColumn* column1, GPUColumn* col
       case ColumnType::FLOAT64:
         return ResolveTypeBinaryExpression<double>(column1, column2, gpuBufferManager, function_name);
       default:
-        throw NotImplementedException("Unsupported column type");
+        throw NotImplementedException("HandleBinaryExpression Unsupported column type");
     }
 }
 
@@ -133,7 +133,7 @@ GPUExpressionExecutor::HandleComparisonConstantExpression(GPUColumn* column, Bou
         ResolveTypeComparisonConstantExpression<double>(column, expr1, expr2, count, row_ids, expression_type);
         break;
       default:
-        throw NotImplementedException("Unsupported column type");
+        throw NotImplementedException("HandleComparisonConstantExpression Unsupported column type");
     }
 }
 
@@ -183,7 +183,7 @@ GPUExpressionExecutor::HandleComparisonExpression(GPUColumn* column1, GPUColumn*
         ResolveTypeComparisonExpression<double>(column1, column2, count, row_ids, expression_type);
         break;
       default:
-        throw NotImplementedException("Unsupported column type");
+        throw NotImplementedException("HandleComparisonExpression Unsupported column type");
     }
 }
 
@@ -220,8 +220,28 @@ GPUExpressionExecutor::HandleMaterializeExpression(GPUColumn* column, BoundRefer
         case ColumnType::FLOAT64:
             return ResolveTypeMaterializeExpression<double>(column, bound_ref, gpuBufferManager);
         default:
-            throw NotImplementedException("Unsupported column type");
+            throw NotImplementedException("HandleMaterializeExpression Unsupported column type");
     }
+}
+
+// Code from https://stackoverflow.com/questions/14265581/parse-split-a-string-in-c-using-string-delimiter-standard-c
+std::vector<std::string> string_split(std::string s, std::string delimiter) {
+    std::vector<std::string> tokens;
+    size_t pos = 0;
+    std::string token;
+    while ((pos = s.find(delimiter)) != std::string::npos) {
+      token = s.substr(0, pos);
+      if(token.length() > 0) {
+        tokens.push_back(token);
+      }
+      s.erase(0, pos + delimiter.length());
+    }
+
+    if(s.length() > 0) {
+      tokens.push_back(s);
+    }
+
+    return tokens;
 }
 
 void 
@@ -229,11 +249,10 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
     bool is_specific_filter = HandlingSpecificFilter(input_relation, output_relation, expr);
     if (is_specific_filter) return;
     
-    printf("Expression class %d\n", expr.expression_class);
-    uint64_t* comparison_idx = nullptr;
-    uint64_t* count = nullptr;
-
+    printf("FilterRecursiveExpression Expression class %d at depth %d\n", expr.expression_class);
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+    uint64_t* comparison_idx = nullptr;
+    uint64_t* count = gpuBufferManager->customCudaHostAlloc<uint64_t>(sizeof(uint64_t));
 
 	switch (expr.expression_class) {
 	case ExpressionClass::BOUND_BETWEEN: {
@@ -248,18 +267,18 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
         size_t size;
 
         GPUColumn* materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref.index], bound_ref, gpuBufferManager);
-        count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
         HandleComparisonConstantExpression(materialized_column, bound_lower, bound_upper, count, comparison_idx, bound_between.type);
         if (count[0] == 0) throw NotImplementedException("No match found");
 		break;
     } case ExpressionClass::BOUND_REF: {
         auto &bound_ref = expr.Cast<BoundReferenceExpression>();
         printf("Executing bound reference expression\n");
-        printf("Reading column index %ld\n", bound_ref.index);
+        GPUColumn* src_column = input_relation.columns[bound_ref.index];
+        printf("Reading column index %ld with column name %s\n", bound_ref.index, src_column->name.c_str());
 		    input_relation.checkLateMaterialization(bound_ref.index);
-        // printf("output_relation.columns.size() %ld\n", output_relation.columns.size());
-        // printf("input_relation.columns.size() %ld\n", input_relation.columns.size());
-        // printf("bound_ref.index %ld\n", bound_ref.index);
+        printf("output_relation.columns.size() %ld\n", output_relation.columns.size());
+        printf("input_relation.columns.size() %ld\n", input_relation.columns.size());
+        printf("bound_ref.index %ld\n", bound_ref.index);
         output_relation.columns[bound_ref.index] = input_relation.columns[bound_ref.index];
         output_relation.columns[bound_ref.index]->row_ids = new uint64_t[1];
         printf("Overwrite row ids with column %ld\n", bound_ref.index);
@@ -290,7 +309,6 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
             size_t size;
 
             GPUColumn* materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref1.index], bound_ref1, gpuBufferManager);
-            count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
             HandleComparisonConstantExpression(materialized_column, bound_ref2, bound_ref2, count, comparison_idx, bound_comparison.type);
         } else if (bound_comparison.right->expression_class == ExpressionClass::BOUND_REF) {
             auto &bound_ref1 = bound_comparison.left->Cast<BoundReferenceExpression>();
@@ -299,7 +317,6 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
 
             GPUColumn* materialized_column1 = HandleMaterializeExpression(input_relation.columns[bound_ref1.index], bound_ref1, gpuBufferManager);
             GPUColumn* materialized_column2 = HandleMaterializeExpression(input_relation.columns[bound_ref2.index], bound_ref2, gpuBufferManager);
-            count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
             HandleComparisonExpression(materialized_column1, materialized_column2, count, comparison_idx, bound_comparison.type);            
         }
         if (count[0] == 0) throw NotImplementedException("No match found");
@@ -312,13 +329,51 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
         }
 		break;
 	} case ExpressionClass::BOUND_CONSTANT: {
-        printf("Reading value %s\n", expr.Cast<BoundConstantExpression>().value.ToString().c_str());
-		break;
+      std::string search_string = expr.Cast<BoundConstantExpression>().value.ToString();
+      printf("Calling string matching at depth of %d for str %s\n", depth, search_string.c_str());
+		  break;
 	} case ExpressionClass::BOUND_FUNCTION: {
-        printf("Executing function expression\n");
         auto &bound_function = expr.Cast<BoundFunctionExpression>();
-        for (auto &child : bound_function.children) {
+        std::string bound_function_name = bound_function.ToString();
+        std::cout << "Got bound function " << bound_function_name << std::endl;
+        if(bound_function_name.find("contains") != std::string::npos) {
+          // Get the column
+          GPUColumn* curr_column = input_relation.columns[0];
+          std::cout << "Running single term contains function with is row ids null of " << (curr_column->row_ids == nullptr) << std::endl;
+
+          // Get the match string from the other child
+          auto& bound_const = (*bound_function.children[1]).Cast<BoundConstantExpression>();
+          std::string match_str = bound_const.value.ToString();
+          std::cout << "Got match str of " << match_str << " at depth " << depth << std::endl;
+          
+          // Get the input column
+          if(curr_column->row_id_count == 0) {
+            curr_column->row_id_count = curr_column->data_wrapper.num_strings;
+          }
+          comparison_idx = StringMatching(curr_column, match_str, count);
+        } else if(bound_function_name.find("~~") != std::string::npos) {
+          // Get the column
+          GPUColumn* curr_column = input_relation.columns[0];
+          std::cout << "Running multi term match function with is row ids null of " << (curr_column->row_ids == nullptr) << std::endl;
+
+          // Get the match string from the other child
+          auto& bound_const = (*bound_function.children[1]).Cast<BoundConstantExpression>();
+          std::string match_str = bound_const.value.ToString();
+          std::vector<std::string> match_terms = string_split(match_str, "%");
+          std::cout << "Got match str of " << match_str << " at depth " << depth << std::endl;
+          
+          // Get the input column
+          if(curr_column->row_id_count == 0) {
+            curr_column->row_id_count = curr_column->data_wrapper.num_strings;
+          }      
+
+          comparison_idx = MultiStringMatching(curr_column, match_terms, count);
+        } else {
+          std::cout << "Running non contains bound function" << std::endl;
+          for (auto &child : bound_function.children) {
+            printf("Executing function expression child\n");
             FilterRecursiveExpression(input_relation, output_relation, *child, depth + 1);
+          }
         }
 		break;
 	} case ExpressionClass::BOUND_OPERATOR: {
@@ -339,19 +394,23 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
     if (depth == 0) {
         printf("Writing filter result\n");
         for (int i = 0; i < input_relation.columns.size(); i++) {
-            output_relation.columns[i] = input_relation.columns[i];
-            // output_relation.columns[i]->row_ids = new uint64_t[1];
+            output_relation.columns[i] = new GPUColumn(*input_relation.columns[i]);
             if (comparison_idx) {
                 if (input_relation.columns[i]->row_ids == nullptr) {
-                    output_relation.columns[i]->row_ids = comparison_idx;
+                  std::cout << "Doing a direct copy of the row ids" << std::endl;  
+                  output_relation.columns[i]->row_ids = comparison_idx;
                 } else {
-                    uint64_t* row_ids_input = reinterpret_cast<uint64_t*> (input_relation.columns[i]->row_ids);
-                    uint64_t* new_row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(count[0], 0, 0);
-                    materializeExpression<uint64_t>(row_ids_input, new_row_ids, comparison_idx, count[0]);
-                    output_relation.columns[i]->row_ids = new_row_ids;
+                  std::cout << "Calling materializeExpression with " << count[0] << " records and existing count of " << input_relation.columns[i]->row_id_count << std::endl;
+                  uint64_t* row_ids_input = reinterpret_cast<uint64_t*> (input_relation.columns[i]->row_ids);
+                  uint64_t* new_row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(count[0], 0, 0);
+                  materializeExpression<uint64_t>(row_ids_input, new_row_ids, comparison_idx, count[0]);
+                  output_relation.columns[i]->row_ids = new_row_ids;
                 }
             }
-            if (count) output_relation.columns[i]->row_id_count = count[0];
+            if(count) output_relation.columns[i]->row_id_count = count[0];
+
+            std::cout << "Wrote output relation with " << output_relation.columns[i]->row_id_count << " rows and not null of ";
+            std::cout << (output_relation.columns[i]->row_ids != nullptr) << std::endl;
         }
     }
 }

@@ -25,7 +25,7 @@ GPUPhysicalProjection::Execute(GPUIntermediateRelation &input_relation, GPUInter
     printf("Executing projection\n");
 
     for (int idx = 0; idx < select_list.size(); idx++) {
-        printf("Executing expression: %s\n", select_list[idx]->ToString().c_str());
+        printf("GPUPhysicalProjection Executing expression: %s\n", select_list[idx]->ToString().c_str());
         gpu_expression_executor->ProjectionRecursiveExpression(input_relation, output_relation, *select_list[idx], idx, 0);
     }
     return OperatorResultType::FINISHED;

@@ -139,48 +139,77 @@ GPUBufferManager::Print() {
     printf("I am inside GPU buffer manager\n");
 }
 
-DataWrapper
-GPUBufferManager::allocateChunk(DataChunk &input){
-	size_t chunk_size = input.size();
-	LogicalType vector_type = input.data[0].GetType();
+DataWrapper GPUBufferManager::allocateStringChunk(Vector &input, size_t chunk_size) {
+    DataWrapper result;
+    result.type = ColumnType::VARCHAR;
+    result.num_strings = chunk_size;
+
+    // First iterate through and set the offsets
+    result.offsets = customCudaHostAlloc<int>(result.num_strings + 1);
+    int curr_offset = 0;
+    for(int i = 0; i < result.num_strings; i++) {
+        std::string curr_string = input.GetValue(i).ToString();
+        result.offsets[i] = curr_offset;
+        curr_offset += curr_string.length();
+    }
+    result.offsets[result.num_strings] = curr_offset;
+
+    // Now do the same for the chars
+    result.size = (size_t) curr_offset;
+    int copy_offset = 0;
+    result.data = customCudaHostAlloc<uint8_t>(curr_offset);
+    for(int i = 0; i < result.num_strings; i++) {
+        std::string curr_string = input.GetValue(i).ToString();
+        int str_length = curr_string.length();
+        memcpy(result.data + copy_offset, reinterpret_cast<uint8_t*>(curr_string.data()), str_length * sizeof(uint8_t));
+        copy_offset += str_length;
+    }
+    
+    result.is_string_data = true;
+    return result;
+}
+
+DataWrapper GPUBufferManager::allocateChunk(DataChunk &input) {
+    // Get the input vector
+    size_t chunk_size = input.size();
+	auto input_vector = input.data[0];
+    input_vector.Flatten(chunk_size);
+
+	LogicalType vector_type = input_vector.GetType();
     uint8_t* ptr = nullptr;
     ColumnType column_type;
 
-    // printf("vector type %d\n", vector_type.id());
+    if(vector_type.id() == LogicalTypeId::VARCHAR) {
+        return allocateStringChunk(input_vector, chunk_size);
+    }
+    
     switch (vector_type.id()) {
         case LogicalTypeId::INTEGER: {
             int* ptr_int = customCudaHostAlloc<int>(chunk_size);
             ptr = reinterpret_cast<uint8_t*>(ptr_int);
-            memcpy(ptr, input.data[0].GetData(), input.size() * sizeof(int));
+            memcpy(ptr, input_vector.GetData(), chunk_size * sizeof(int));
             column_type = ColumnType::INT32;
             break;
         }
         case LogicalTypeId::BIGINT: {
             uint64_t* ptr_int64 = customCudaHostAlloc<uint64_t>(chunk_size);
             ptr = reinterpret_cast<uint8_t*>(ptr_int64);
-            memcpy(ptr, input.data[0].GetData(), input.size() * sizeof(uint64_t));
+            memcpy(ptr, input_vector.GetData(), chunk_size * sizeof(uint64_t));
             column_type = ColumnType::INT64;
             break;
         }
         case LogicalTypeId::FLOAT: {
             float* ptr_float = customCudaHostAlloc<float>(chunk_size);
             ptr = reinterpret_cast<uint8_t*>(ptr_float);
-            memcpy(ptr, input.data[0].GetData(), input.size() * sizeof(float));
+            memcpy(ptr, input_vector.GetData(), chunk_size * sizeof(float));
             column_type = ColumnType::FLOAT32;
             break;
         }
         case LogicalTypeId::DOUBLE: {
             double* ptr_double = customCudaHostAlloc<double>(chunk_size);
             ptr = reinterpret_cast<uint8_t*>(ptr_double);
-            memcpy(ptr, input.data[0].GetData(), input.size() * sizeof(double));
+            memcpy(ptr, input_vector.GetData(), chunk_size * sizeof(double));
             column_type = ColumnType::FLOAT64;
-            break;
-        }
-        case LogicalTypeId::VARCHAR: {
-            char* ptr_varchar = customCudaHostAlloc<char>(chunk_size * 128);
-            ptr = reinterpret_cast<uint8_t*>(ptr_varchar);
-            memcpy(ptr, input.data[0].GetData(), input.size() * sizeof(double));
-            column_type = ColumnType::VARCHAR;
             break;
         }
         default:
@@ -190,6 +219,49 @@ GPUBufferManager::allocateChunk(DataChunk &input){
     return DataWrapper(column_type, ptr, chunk_size);
 }
 
+DataWrapper GPUBufferManager::mergeWrappers(DataWrapper first, DataWrapper second) {
+    DataWrapper result;
+
+    // If one of them has null data then just use the other
+    if(first.data == nullptr) {
+        result = second;
+    } else if(second.data == nullptr) {
+        result = first;
+    } else {
+        // First copy over the metatada
+        assert(first.type == second.type && "Can only merge columns of the same size");
+        assert(first.is_string_data == second.is_string_data && "Need both columns to be of type string");
+        result.type = first.type; 
+        result.is_string_data = first.is_string_data;
+
+        // Now combine the data
+        result.size = first.size + second.size;
+        result.data = customCudaHostAlloc<uint8_t>(result.size * sizeof(uint8_t));
+        memcpy(result.data, first.data, first.size * sizeof(uint8_t));
+        memcpy(result.data + first.size, second.data, second.size * sizeof(uint8_t));
+        free(first.data); free(second.data);
+
+        // For string columns also need to combine offsets
+        if(result.is_string_data) {
+            // First increment the second offset
+            int second_offset_increment = first.size;
+            for(int i = 0; i < second.num_strings; i++) {
+                second.offsets[i] += second_offset_increment;
+            }
+
+            // Now combine the offsets
+            result.num_strings = first.num_strings + second.num_strings;
+            result.offsets = customCudaHostAlloc<int>((result.num_strings + 1) * sizeof(int));
+            memcpy(result.offsets, first.offsets, first.num_strings * sizeof(int));
+            memcpy(result.offsets + first.num_strings, second.offsets, second.num_strings * sizeof(int));
+            result.offsets[result.num_strings] = result.size;
+            free(first.offsets); free(second.offsets);
+        }
+    }
+
+    return result;
+}
+
 //TODO: We have to lock the CPU buffer before calling bufferChunkInCPU to ensure contiguous memory allocation
 DataWrapper
 GPUBufferManager::allocateColumnBufferInCPU(unique_ptr<MaterializedQueryResult> input) {
@@ -197,21 +269,50 @@ GPUBufferManager::allocateColumnBufferInCPU(unique_ptr<MaterializedQueryResult> 
 	if (!input_chunk) {
 		throw InvalidInputException("No data in input chunk");
 	}
+
     DataWrapper result_wrapper = allocateChunk(*input_chunk);
     input_chunk = input->Fetch();
 	while (input_chunk) {
+        // Get the wrapper for this chunk and merge it
 		auto wrapper = allocateChunk(*input_chunk);
-        result_wrapper.size += wrapper.size;
+        result_wrapper = mergeWrappers(result_wrapper, wrapper);        
 		input_chunk = input->Fetch();
 	}
-    // for (int i = 0; i < 1000000; i++) {
-    //     printf("Data: %d\n", reinterpret_cast<int*>(result_wrapper.data)[i]);
-    // }
+
+    std::cout << "Returning result wrapper with " << result_wrapper.num_strings << " strings and " << result_wrapper.size << " chars" << std::endl;
     return result_wrapper;
 }
 
-DataWrapper
-GPUBufferManager::allocateColumnBufferInGPU(DataWrapper cpu_data, int gpu) {
+DataWrapper GPUBufferManager::allocateStrColumnInGPU(DataWrapper cpu_data, int gpu) {
+    // First copy the data
+    std::cout << "CPU data called with " << cpu_data.size << " chars and " << cpu_data.num_strings << " strings" << std::endl;
+
+    DataWrapper result;
+    result.is_string_data = cpu_data.is_string_data;
+    result.type = ColumnType::VARCHAR;
+
+    // First allocate and copy the offsets buffer
+    result.num_strings = cpu_data.num_strings;
+    result.offsets = customCudaMalloc<int>(cpu_data.num_strings + 1, 0, true);
+    std::cout << "Copying offsets with " << result.num_strings << " strings" << std::endl;
+    callCudaMemcpyHostToDevice<int>(result.offsets, cpu_data.offsets, cpu_data.num_strings * sizeof(int), 0);
+
+    // Do the same for the characeters
+    result.size = cpu_data.size;
+    result.data = customCudaMalloc<uint8_t>(cpu_data.size, 0, true);
+    std::cout << "Copying sizes with " << result.size << " chars" << std::endl;
+    callCudaMemcpyHostToDevice<uint8_t>(result.data, cpu_data.data, cpu_data.size * sizeof(uint8_t), 0);
+
+    std::cout << "Returning wrapper of size " << result.num_strings << " and " << result.size << std::endl;
+    return result;
+}
+
+DataWrapper GPUBufferManager::allocateColumnBufferInGPU(DataWrapper cpu_data, int gpu) {
+    if(cpu_data.is_string_data) {
+        std::cout << "Calling allocateStrColumnInGPU" << std::endl;
+        return allocateStrColumnInGPU(cpu_data, gpu);
+    }
+
     uint8_t* ptr = nullptr;
     ColumnType column_type;
 
@@ -240,12 +341,6 @@ GPUBufferManager::allocateColumnBufferInGPU(DataWrapper cpu_data, int gpu) {
             column_type = ColumnType::FLOAT64;
 			break;
         }
-		case ColumnType::VARCHAR: {
-            char* ptr_char = customCudaMalloc<char>(cpu_data.size, 0, true);
-            ptr = reinterpret_cast<uint8_t*>(ptr_char);
-            column_type = ColumnType::VARCHAR;
-			break;
-        }
         default:
             throw InvalidInputException("Unsupported type");
 	}
@@ -259,42 +354,56 @@ GPUBufferManager::cacheDataInGPU(DataWrapper cpu_data, string table_name, string
     transform(up_table_name.begin(), up_table_name.end(), up_table_name.begin(), ::toupper);
     transform(up_column_name.begin(), up_column_name.end(), up_column_name.begin(), ::toupper);
     auto column_it = find(tables[up_table_name]->column_names.begin(), tables[up_table_name]->column_names.end(), up_column_name);
-    // for (int i = 0; i < tables[table_name]->column_names.size(); i++) {
-    //     printf("Column name: %s\n", tables[table_name]->column_names[i].c_str());
-    // }
     if (column_it == tables[up_table_name]->column_names.end()) {
         throw InvalidInputException("Column not found");
     }
+
     DataWrapper gpu_allocated_buffer = allocateColumnBufferInGPU(cpu_data, gpu);
-    callCudaMemcpyHostToDevice<uint8_t>(gpu_allocated_buffer.data, cpu_data.data, cpu_data.size * cpu_data.getColumnTypeSize(), 0);
+    if(!gpu_allocated_buffer.is_string_data) {
+        callCudaMemcpyHostToDevice<uint8_t>(gpu_allocated_buffer.data, cpu_data.data, cpu_data.size * cpu_data.getColumnTypeSize(), 0);
+    }
     int column_idx = column_it - tables[up_table_name]->column_names.begin(); 
     tables[up_table_name]->columns[column_idx]->data_wrapper = gpu_allocated_buffer;
-    tables[up_table_name]->columns[column_idx]->column_length = gpu_allocated_buffer.size;
+    if(!gpu_allocated_buffer.is_string_data) {
+        tables[up_table_name]->columns[column_idx]->column_length = gpu_allocated_buffer.size;
+    } else {
+        tables[up_table_name]->columns[column_idx]->column_length = gpu_allocated_buffer.num_strings;
+    }
+    std::cout << "cacheDataInGPU set column length of " << tables[up_table_name]->columns[column_idx]->column_length << std::endl;
+    
     tables[up_table_name]->length = gpu_allocated_buffer.size;
+
+    char* curr_data = reinterpret_cast<char*>(cpu_data.data);
+    
 }
 
 void
 GPUBufferManager::createTableAndColumnInGPU(Catalog& catalog, ClientContext& context, string table_name, string column_name) {
+    std::cout << "Create Table created with table " << table_name << " and col name " << column_name << std::endl;
+
 	TableCatalogEntry &table = catalog.GetEntry(context, CatalogType::TABLE_ENTRY, DEFAULT_SCHEMA, table_name).Cast<TableCatalogEntry>();
     auto column_names = table.GetColumns().GetColumnNames();
-    // for (int i = 0; i < column_names.size(); i++) {
-    //     printf("Column name: %s\n", column_names[i].c_str());
-    // }
+    for (int i = 0; i < column_names.size(); i++) {
+        printf("GPU Caching Existing Column names: %s\n", column_names[i].c_str());
+    }
+    std::string upper_col_name = column_name;
+    transform(upper_col_name.begin(), upper_col_name.end(), upper_col_name.begin(), ::toupper);
+
     //finding column_name in column_names
-    if (find(column_names.begin(), column_names.end(), column_name) == column_names.end()) {
+    if (find(column_names.begin(), column_names.end(), upper_col_name) != column_names.end()) {
         // convert table_name to uppercase
-        size_t column_id = table.GetColumnIndex(column_name, false).index;
+        size_t column_id = table.GetColumnIndex(upper_col_name, false).index;
         string up_table_name = table_name;
         transform(up_table_name.begin(), up_table_name.end(), up_table_name.begin(), ::toupper);
         createTable(up_table_name, table.GetTypes().size());
+
         // printf("logical type %d %d %s\n", column_id, table.GetTypes()[column_id].id(), table.GetColumn(column_name).GetName().c_str());
         ColumnType column_type = convertLogicalTypetoColumnType(table.GetColumn(column_name).GetType());
+
         // convert table_name to uppercase
-        string up_column_name = column_name;
-        transform(up_column_name.begin(), up_column_name.end(), up_column_name.begin(), ::toupper);
-        createColumn(up_table_name, up_column_name, column_type, column_id);
+        createColumn(up_table_name, upper_col_name, column_type, column_id);
     } else {
-        throw InvalidInputException("Column already exists");
+        throw InvalidInputException("createTableAndColumnInGPU Couldn't find column " + column_name);
     }
 }
 
@@ -306,6 +415,7 @@ GPUBufferManager::createTable(string up_table_name, size_t column_count) {
         GPUIntermediateRelation* table = new GPUIntermediateRelation(column_count);
         table->names = up_table_name;
         tables[up_table_name] = table;
+        std::cout << "Inserted table " << up_table_name << " into buffer manager " << std::endl;
     }
 }
 
@@ -313,11 +423,8 @@ void
 GPUBufferManager::createColumn(string up_table_name, string up_column_name, ColumnType column_type, size_t column_id) {
     GPUIntermediateRelation* table = tables[up_table_name];
     table->column_names[column_id] = up_column_name;
-    //we will update the length and data later
     table->columns[column_id] = new GPUColumn(up_column_name, 0, column_type, nullptr);
-    // for (int i = 0; i < table->columns.size(); i++) {
-    //   if (table->columns[i] != nullptr) printf("create column size %d column name %s\n", table->columns[i]->column_length, table->columns[i]->name.c_str());
-    // }
+    std::cout << "Added column " << up_column_name << " to table " << up_table_name << std::endl;
 }
 
 }; // namespace duckdb
