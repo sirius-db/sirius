@@ -145,7 +145,7 @@ DataWrapper GPUBufferManager::allocateStringChunk(Vector &input, size_t chunk_si
     result.num_strings = chunk_size;
 
     // First iterate through and set the offsets
-    result.offsets = customCudaHostAlloc<int>(result.num_strings + 1);
+    result.offsets = reinterpret_cast<int*>(malloc((result.num_strings + 1) * sizeof(int)));
     int curr_offset = 0;
     for(int i = 0; i < result.num_strings; i++) {
         std::string curr_string = input.GetValue(i).ToString();
@@ -157,7 +157,7 @@ DataWrapper GPUBufferManager::allocateStringChunk(Vector &input, size_t chunk_si
     // Now do the same for the chars
     result.size = (size_t) curr_offset;
     int copy_offset = 0;
-    result.data = customCudaHostAlloc<uint8_t>(curr_offset);
+    result.data = reinterpret_cast<uint8_t*>(malloc(curr_offset * sizeof(char)));
     for(int i = 0; i < result.num_strings; i++) {
         std::string curr_string = input.GetValue(i).ToString();
         int str_length = curr_string.length();
@@ -236,7 +236,7 @@ DataWrapper GPUBufferManager::mergeWrappers(DataWrapper first, DataWrapper secon
 
         // Now combine the data
         result.size = first.size + second.size;
-        result.data = customCudaHostAlloc<uint8_t>(result.size * sizeof(uint8_t));
+        result.data = reinterpret_cast<uint8_t*>(malloc(result.size * sizeof(char)));
         memcpy(result.data, first.data, first.size * sizeof(uint8_t));
         memcpy(result.data + first.size, second.data, second.size * sizeof(uint8_t));
         free(first.data); free(second.data);
@@ -251,7 +251,7 @@ DataWrapper GPUBufferManager::mergeWrappers(DataWrapper first, DataWrapper secon
 
             // Now combine the offsets
             result.num_strings = first.num_strings + second.num_strings;
-            result.offsets = customCudaHostAlloc<int>((result.num_strings + 1) * sizeof(int));
+            result.offsets = reinterpret_cast<int*>(malloc((result.num_strings + 1) * sizeof(int)));
             memcpy(result.offsets, first.offsets, first.num_strings * sizeof(int));
             memcpy(result.offsets + first.num_strings, second.offsets, second.num_strings * sizeof(int));
             result.offsets[result.num_strings] = result.size;
@@ -270,6 +270,7 @@ GPUBufferManager::allocateColumnBufferInCPU(unique_ptr<MaterializedQueryResult> 
 		throw InvalidInputException("No data in input chunk");
 	}
 
+    std::cout << "allocateColumnBufferInCPU called" << std::endl;
     DataWrapper result_wrapper = allocateChunk(*input_chunk);
     input_chunk = input->Fetch();
 	while (input_chunk) {
@@ -295,13 +296,13 @@ DataWrapper GPUBufferManager::allocateStrColumnInGPU(DataWrapper cpu_data, int g
     result.num_strings = cpu_data.num_strings;
     result.offsets = customCudaMalloc<int>(cpu_data.num_strings + 1, 0, true);
     std::cout << "Copying offsets with " << result.num_strings << " strings" << std::endl;
-    callCudaMemcpyHostToDevice<int>(result.offsets, cpu_data.offsets, cpu_data.num_strings * sizeof(int), 0);
+    callCudaMemcpyHostToDevice<int>(result.offsets, cpu_data.offsets, cpu_data.num_strings, 0);
 
     // Do the same for the characeters
     result.size = cpu_data.size;
     result.data = customCudaMalloc<uint8_t>(cpu_data.size, 0, true);
     std::cout << "Copying sizes with " << result.size << " chars" << std::endl;
-    callCudaMemcpyHostToDevice<uint8_t>(result.data, cpu_data.data, cpu_data.size * sizeof(uint8_t), 0);
+    callCudaMemcpyHostToDevice<uint8_t>(result.data, cpu_data.data, cpu_data.size, 0);
 
     std::cout << "Returning wrapper of size " << result.num_strings << " and " << result.size << std::endl;
     return result;
@@ -349,6 +350,7 @@ DataWrapper GPUBufferManager::allocateColumnBufferInGPU(DataWrapper cpu_data, in
 
 void
 GPUBufferManager::cacheDataInGPU(DataWrapper cpu_data, string table_name, string column_name, int gpu) {
+    std::cout << "cacheDataInGPU called for table " << table_name << " and column name " << column_name << std::endl;
     string up_column_name = column_name;
     string up_table_name = table_name;
     transform(up_table_name.begin(), up_table_name.end(), up_table_name.begin(), ::toupper);
@@ -396,12 +398,14 @@ GPUBufferManager::createTableAndColumnInGPU(Catalog& catalog, ClientContext& con
         string up_table_name = table_name;
         transform(up_table_name.begin(), up_table_name.end(), up_table_name.begin(), ::toupper);
         createTable(up_table_name, table.GetTypes().size());
+        std::cout << "Called create table for table " << up_table_name << std::endl;
 
         // printf("logical type %d %d %s\n", column_id, table.GetTypes()[column_id].id(), table.GetColumn(column_name).GetName().c_str());
         ColumnType column_type = convertLogicalTypetoColumnType(table.GetColumn(column_name).GetType());
 
         // convert table_name to uppercase
         createColumn(up_table_name, upper_col_name, column_type, column_id);
+        std::cout << "Called created column " << upper_col_name << "  for table " << up_table_name << std::endl;
     } else {
         throw InvalidInputException("createTableAndColumnInGPU Couldn't find column " + column_name);
     }

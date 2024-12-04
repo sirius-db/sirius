@@ -470,20 +470,23 @@ GPUExpressionExecutor::ProjectionRecursiveExpression(GPUIntermediateRelation& in
         printf("Reading value %s\n", expr.Cast<BoundConstantExpression>().value.ToString().c_str());
 		break;
 	} case ExpressionClass::BOUND_FUNCTION: {
-        printf("Executing function expression\n");
         auto &bound_function = expr.Cast<BoundFunctionExpression>();
-        // for (auto &child : bound_function.children) {
-        //     ProjectionRecursiveExpression(input_relation, output_relation, *child, output_idx, depth + 1);
-        // }
-
-        if (bound_function.children[1]->expression_class == ExpressionClass::BOUND_CONSTANT) {
+        if(bound_function.ToString().find("substring") != std::string::npos) {
+          auto &bound_ref1 = bound_function.children[0]->Cast<BoundReferenceExpression>();
+          auto &bound_ref2 = bound_function.children[1]->Cast<BoundConstantExpression>();
+          auto &bound_ref3 = bound_function.children[2]->Cast<BoundConstantExpression>();
+          GPUColumn* input_column = input_relation.columns[bound_ref1.index];
+          PerformSubstring(input_column, std::stoi(bound_ref2.ToString()), std::stoi(bound_ref3.ToString()));
+        } else if (bound_function.children[1]->expression_class == ExpressionClass::BOUND_CONSTANT) {
             auto &bound_ref1 = bound_function.children[0]->Cast<BoundReferenceExpression>();
             auto &bound_ref2 = bound_function.children[1]->Cast<BoundConstantExpression>();
+            std::cout << "Have a constant function expression with values " << bound_ref1.ToString() << " and " << bound_ref2.ToString() << std::endl;
             GPUColumn* materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref1.index], bound_ref1, gpuBufferManager);
             result = HandleBinaryConstantExpression(materialized_column, bound_ref2, gpuBufferManager, bound_function.function.name);
         } else if (bound_function.children[1]->expression_class == ExpressionClass::BOUND_REF) {
             auto &bound_ref1 = bound_function.children[0]->Cast<BoundReferenceExpression>();
             auto &bound_ref2 = bound_function.children[1]->Cast<BoundReferenceExpression>();
+            std::cout << "Have a reference function expression with indicies of " << bound_ref1.index << " and " << bound_ref2.index << std::endl;
             GPUColumn* materialized_column1 = HandleMaterializeExpression(input_relation.columns[bound_ref1.index], bound_ref1, gpuBufferManager);
             GPUColumn* materialized_column2 = HandleMaterializeExpression(input_relation.columns[bound_ref2.index], bound_ref2, gpuBufferManager);
             result = HandleBinaryExpression(materialized_column1, materialized_column2, gpuBufferManager, bound_function.function.name);            
@@ -529,7 +532,12 @@ GPUExpressionExecutor::ProjectionRecursiveExpression(GPUIntermediateRelation& in
     }
     printf("Writing projection result to idx %ld\n", output_idx);
     if (depth == 0) {
-        if (expr.expression_class == ExpressionClass::BOUND_REF) {
+        if(expr.expression_class == ExpressionClass::BOUND_FUNCTION) {
+          std::cout << "Copying the BOUND_FUNCTION column" << std::endl;
+          auto &bound_function = expr.Cast<BoundFunctionExpression>();
+          auto &bound_ref1 = bound_function.children[0]->Cast<BoundReferenceExpression>();
+          output_relation.columns[output_idx] = input_relation.columns[bound_ref1.index];
+        } else if (expr.expression_class == ExpressionClass::BOUND_REF) {
             output_relation.columns[output_idx] = input_relation.columns[expr.Cast<BoundReferenceExpression>().index];
             // printf("size = %ld\n", output_relation.columns[output_idx]->column_length);
             // printf("row ids count = %ld\n", output_relation.columns[output_idx]->row_id_count);

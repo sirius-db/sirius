@@ -100,7 +100,6 @@ void GPUPhysicalMaterializedCollector::FinalizeMaterializeString(GPUIntermediate
 		size_t num_rows = output_relation.columns[col]->row_id_count;
 		uint64_t* row_ids = output_relation.columns[col]->row_ids;
 		DataWrapper input_data_wrapper = output_relation.columns[col]->data_wrapper;
-		std::cout << "Running string late materalization with " << num_rows << " rows" << std::endl;
 
 		// First create the new offsets
 		int* materalized_offsets = gpuBufferManager->customCudaMalloc<int>(num_rows + 1, 0, 0);
@@ -148,6 +147,7 @@ GPUPhysicalMaterializedCollector::FinalMaterializeInternal(GPUIntermediateRelati
 size_t
 GPUPhysicalMaterializedCollector::FinalMaterialize(GPUIntermediateRelation input_relation, GPUIntermediateRelation &output_relation, size_t col) const {
 	size_t size_bytes;
+	bool is_str_col = input_relation.columns[col]->data_wrapper.is_string_data;
 	
 	switch (input_relation.columns[col]->data_wrapper.type) {
 	case ColumnType::INT64:
@@ -300,7 +300,6 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 				for(int i = 0; i < num_output_records; i++) {
 					std::string output_str(str_col_data.data + str_col_data.offsets[i], str_col_data.data + str_col_data.offsets[i + 1]);
 					Value output_value(output_str);
-					std::cout << "Recording value " << output_value.ToString() << " for idx " << i << std::endl;
 					str_vector.SetValue(i, output_value);
 				}
 				chunk.data[col].Reference(str_vector);
@@ -315,15 +314,8 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 			chunk.SetCardinality(STANDARD_VECTOR_SIZE);
 			remaining -= STANDARD_VECTOR_SIZE;
 		}
-		std::cout << "Created chunk with size " << chunk.size() << " and " << chunk.ColumnCount() << " cols" << std::endl;
 		
-		printf("Chunk column count %d\n", chunk.ColumnCount());
-		chunk.Print();
-		printf("Remaining %d\n", remaining);
-
-		printf("Adding chunk to collection\n");
 		collection->Append(append_state, chunk);
-		printf("Finished appending chunk to collection\n");
 	}
 
 	printf("Returning finished\n");

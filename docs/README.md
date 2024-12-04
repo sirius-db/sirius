@@ -98,4 +98,5 @@ Substring Queries:
 ```
 $ call gpu_caching("part.p_comment");
 $ call gpu_processing("SELECT COUNT(*) FROM part WHERE p_comment LIKE '%wake%';");
+$ call gpu_processing("SELECT substring(p_comment, 1, 4) FROM part;");
 ```

@@ -7,6 +7,8 @@
 #include <thrust/sort.h>
 #include <thrust/reduce.h>
 #include <thrust/device_vector.h>
+#include <thrust/scan.h>
+#include <thrust/execution_policy.h>
 
 #include <iostream> 
 #include <string> 
@@ -381,6 +383,68 @@ uint64_t* MultiStringMatching(GPUColumn* string_column, std::vector<std::string>
   // Set the return values
   std::cout << "Finished multi term string matching" << std::endl;
   return d_matching_rows;
+}
+
+__global__ void perform_substring(int* prev_offsets, int* new_offsets, int num_strings, int start_idx, int length) {
+  // Get which string this thread workers on
+  int tid = threadIdx.x + blockIdx.x * blockDim.x;
+  if(tid >= num_strings) return; 
+
+  // Determine the length of this substring
+  int curr_str_start_idx = prev_offsets[tid]; int curr_str_end_idx = prev_offsets[tid + 1];
+  int substring_start_idx = min(curr_str_start_idx + start_idx, curr_str_end_idx);
+  int substring_end_idx = min(substring_start_idx + length, curr_str_end_idx);
+  int substring_length = substring_end_idx - substring_start_idx;
+  new_offsets[tid] = substring_length;
+}
+
+__global__ void substring_copy_chars(char* prev_chars, char* new_chars, int* prev_offsets, int* new_offsets, int num_strings, int start_idx, int length) {
+  // Get which string this thread workers on
+  int tid = threadIdx.x + blockIdx.x * blockDim.x;
+  if(tid >= num_strings) return; 
+
+  // Determine the range for this substring
+  int curr_str_start_idx = prev_offsets[tid]; int curr_str_end_idx = prev_offsets[tid + 1];
+  int substring_start_idx = min(curr_str_start_idx + start_idx, curr_str_end_idx);
+  int substring_end_idx = min(substring_start_idx + length, curr_str_end_idx);
+  int substring_length = substring_end_idx - substring_start_idx;
+
+  // Copy over the chars
+  int string_new_offset = new_offsets[tid];
+  memcpy(new_chars + string_new_offset, prev_chars + substring_start_idx, substring_length * sizeof(char));
+}
+
+void PerformSubstring(GPUColumn* string_column, int start_idx, int length) {
+  // Get the data from the metadata
+  DataWrapper str_data_wrapper = string_column->data_wrapper;
+  int num_chars = str_data_wrapper.size;
+  char* d_char_data = reinterpret_cast<char*>(str_data_wrapper.data);
+  int num_strings = str_data_wrapper.num_strings;
+  int* d_str_indicies = reinterpret_cast<int*>(str_data_wrapper.offsets);
+  int blocks_needed = (num_strings + THREADS_PER_BLOCK - 1)/THREADS_PER_BLOCK;
+  std::cout << "PerformSubstring got values: " << start_idx << "," << length << "," << num_chars << "," << num_strings << "," << blocks_needed << std::endl;
+
+  // Get the write offsets
+  int* d_updated_offsets = reinterpret_cast<int*>(callCudaMalloc<int>((num_strings + 1) * sizeof(int), 0));
+  perform_substring<<<blocks_needed, THREADS_PER_BLOCK>>>(d_str_indicies, d_updated_offsets, num_strings, start_idx, length);
+  cudaDeviceSynchronize();
+  cudaCheckErrors("Initial substring calculation");
+  std::cout << "perform_substring finished execution" << std::endl;
+
+  // Perform the prefix sum and get the total number of chars
+  thrust::device_ptr<int> offsets_device_ptr(d_updated_offsets);
+  int total_chars = thrust::reduce(offsets_device_ptr, offsets_device_ptr + num_strings, 0, thrust::plus<int>());
+  thrust::exclusive_scan(offsets_device_ptr, offsets_device_ptr + num_strings, offsets_device_ptr);
+  
+  // Create the chears buffer
+  char* d_updated_chars = reinterpret_cast<char*>(callCudaMalloc<uint8_t>(total_chars * sizeof(char), 0));
+  substring_copy_chars<<<blocks_needed, THREADS_PER_BLOCK>>>(d_char_data, d_updated_chars, d_str_indicies, d_updated_offsets, num_strings, start_idx, length);
+
+  // Write the updated metadata to the column
+  string_column->data_wrapper.data = reinterpret_cast<uint8_t*>(d_updated_chars);
+  string_column->data_wrapper.size = total_chars;
+  string_column->data_wrapper.offsets = d_updated_offsets;
+  std::cout << "After substring got a total chars of " << total_chars << std::endl;
 }
 
 }
