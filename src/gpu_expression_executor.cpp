@@ -138,6 +138,9 @@ GPUExpressionExecutor::HandleComparisonConstantExpression(GPUColumn* column, Bou
       case ColumnType::FLOAT64:
         ResolveTypeComparisonConstantExpression<double>(column, expr1, expr2, count, row_ids, expression_type);
         break;
+      case ColumnType::BOOLEAN:
+        ResolveTypeComparisonConstantExpression<uint8_t>(column, expr1, expr2, count, row_ids, expression_type);
+        break;
       default:
         throw NotImplementedException("Unsupported column type");
     }
@@ -288,7 +291,7 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
             break;
           } case ExpressionClass::BOUND_CONJUNCTION: {
                 auto &bound_conjunction = expr.Cast<BoundConjunctionExpression>();
-            printf("Executing conjunction expression\n");
+                printf("Executing conjunction expression\n");
                 for (auto &child : bound_conjunction.children) {
                     FilterRecursiveExpression(input_relation, output_relation, *child, depth + 1);
                 }
@@ -304,10 +307,28 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
                 }
             break;
           } case ExpressionClass::BOUND_OPERATOR: {
-                printf("Executing IN expression\n");
+                printf("Executing IN or NOT expression\n");
                 auto &bound_operator = expr.Cast<BoundOperatorExpression>();
-                for (auto &child : bound_operator.children) {
-                    FilterRecursiveExpression(input_relation, output_relation, *child, depth + 1);
+                // for (auto &child : bound_operator.children) {
+                //     FilterRecursiveExpression(input_relation, output_relation, *child, depth + 1);
+                // }
+                if (bound_operator.type == ExpressionType::OPERATOR_NOT) {
+                    printf("Executing NOT expression\n");
+                    auto &bound_ref = bound_operator.children[0]->Cast<BoundReferenceExpression>();
+                    if (input_relation.columns[bound_ref.index]->data_wrapper.data == nullptr || input_relation.columns[bound_ref.index]->data_wrapper.data == nullptr) {
+                        printf("Column is null\n");
+                        count = new uint64_t[1];
+                        count[0] = 0;
+                    } else {
+                      GPUColumn* materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref.index], bound_ref, gpuBufferManager);
+                      Value one = Value::BOOLEAN(1);
+                      BoundConstantExpression bound_constant_expr = BoundConstantExpression(one);
+                      count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+                      HandleComparisonConstantExpression(materialized_column, bound_constant_expr, bound_constant_expr, count, comparison_idx, ExpressionType::COMPARE_NOTEQUAL);
+                      if (count[0] == 0) throw NotImplementedException("No match found"); 
+                    }
+                } else {
+                  throw NotImplementedException("Other BOUND_OPERATOR expression not supported");
                 }
             break;
           } case ExpressionClass::BOUND_PARAMETER: {

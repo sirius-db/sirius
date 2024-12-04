@@ -65,6 +65,8 @@ void
 HandleMaterializeRowIDs(GPUIntermediateRelation& input_relation, GPUIntermediateRelation& output_relation, uint64_t count, uint64_t* row_ids, GPUBufferManager* gpuBufferManager) {
     vector<uint64_t*> new_row_ids;
     vector<uint64_t*> prev_row_ids;
+    // printf("input relation size %ld\n", input_relation.columns.size());
+    // printf("output relation size %ld\n", output_relation.columns.size());
     for (int i = 0; i < input_relation.columns.size(); i++) {
         printf("Passing column idx %d in input relation to idx %d in output relation\n", i, i);
         if (count == 0) {
@@ -72,6 +74,8 @@ HandleMaterializeRowIDs(GPUIntermediateRelation& input_relation, GPUIntermediate
             output_relation.columns[i]->row_id_count = 0;
             continue;
         }
+        // printf("input relation column length %ld\n", input_relation.columns[i]->column_length);
+        // printf("input relation type %d\n", input_relation.columns[i]->data_wrapper.type);
         output_relation.columns[i] = new GPUColumn(input_relation.columns[i]->column_length, input_relation.columns[i]->data_wrapper.type, input_relation.columns[i]->data_wrapper.data);
         if (row_ids) {
             if (input_relation.columns[i]->row_ids == nullptr) {

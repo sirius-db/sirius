@@ -183,7 +183,7 @@ void scanHashTableRight(unsigned long long* ht, uint64_t ht_len, uint64_t* &row_
     cudaDeviceSynchronize();
 }
 
-void probeHashTableRightSemiAnti(uint64_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t N, int* condition_mode, int num_keys) {
+void probeHashTableRightSemiAnti(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t N, int* condition_mode, int num_keys) {
     CHECK_ERROR();
     if (N == 0) {
         printf("N is 0\n");
@@ -192,9 +192,15 @@ void probeHashTableRightSemiAnti(uint64_t **keys, unsigned long long* ht, uint64
     printf("Launching Probe Kernel\n");
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 
+    //reinterpret cast the keys to uint64_t
+    uint64_t** keys_data = new uint64_t*[num_keys];
+    for (int idx = 0; idx < num_keys; idx++) {
+        keys_data[idx] = reinterpret_cast<uint64_t*>(keys[idx]);
+    }
+
     uint64_t** keys_dev;
     cudaMalloc((void**) &keys_dev, num_keys * sizeof(uint64_t*));
-    cudaMemcpy(keys_dev, keys, num_keys * sizeof(uint64_t*), cudaMemcpyHostToDevice);
+    cudaMemcpy(keys_dev, keys_data, num_keys * sizeof(uint64_t*), cudaMemcpyHostToDevice);
 
     int equal_keys = 0;
     for (int idx = 0; idx < num_keys; idx++) {

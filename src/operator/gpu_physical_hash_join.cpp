@@ -8,14 +8,14 @@
 
 namespace duckdb {
 
-void
+void 
 ResolveTypeProbeExpression(GPUColumn** &probe_keys, uint64_t* &count, uint64_t* &row_ids_left, uint64_t* &row_ids_right, 
 		unsigned long long* ht, uint64_t ht_len, const vector<JoinCondition> &conditions, JoinType join_type, GPUBufferManager* gpuBufferManager) {
 	int num_keys = conditions.size();
-	uint64_t** probe_data = new uint64_t*[num_keys];
+	uint8_t** probe_data = new uint8_t*[num_keys];
 
 	for (int key = 0; key < num_keys; key++) {
-		probe_data[key] = reinterpret_cast<uint64_t*>(probe_keys[key]->data_wrapper.data);
+		probe_data[key] = probe_keys[key]->data_wrapper.data;
 	}
 	size_t size = probe_keys[0]->column_length;
 
@@ -36,12 +36,15 @@ ResolveTypeProbeExpression(GPUColumn** &probe_keys, uint64_t* &count, uint64_t* 
 		// probeHashTableOri<uint64_t>(probe_data[0], ht, ht_len, row_ids_left, row_ids_right, count, size, 0);
 	} else if (join_type == JoinType::SEMI) {
 		probeHashTableSingleMatch(probe_data, ht, ht_len, row_ids_left, row_ids_right, count, size, condition_mode, num_keys, 1);
+		// throw NotImplementedException("Semi join not supported yet");
 	} else if (join_type == JoinType::ANTI) {
 		probeHashTableSingleMatch(probe_data, ht, ht_len, row_ids_left, row_ids_right, count, size, condition_mode, num_keys, 2);
+		// throw NotImplementedException("Anti join not supported yet");
 	} else if (join_type == JoinType::RIGHT) {
 		probeHashTable(probe_data, ht, ht_len, row_ids_left, row_ids_right, count, size, condition_mode, num_keys, 1);
 	} else if (join_type == JoinType::RIGHT_SEMI || join_type == JoinType::RIGHT_ANTI) {
 		probeHashTableRightSemiAnti(probe_data, ht, ht_len, size, condition_mode, num_keys);
+		// throw NotImplementedException("Right semi/anti join not supported yet");
 	} else {
 		throw NotImplementedException("Unsupported join type");
 	}
@@ -55,7 +58,9 @@ HandleProbeExpression(GPUColumn** &probe_keys, uint64_t* &count, uint64_t* &row_
 		ResolveTypeProbeExpression(probe_keys, count, row_ids_left, row_ids_right, ht, ht_len, conditions, join_type, gpuBufferManager);
 		break;
       case ColumnType::FLOAT64:
-	  	throw NotImplementedException("Unsupported column type");
+	  	ResolveTypeProbeExpression(probe_keys, count, row_ids_left, row_ids_right, ht, ht_len, conditions, join_type, gpuBufferManager);
+		break;
+	  	// throw NotImplementedException("Unsupported column type");
       default:
         throw NotImplementedException("Unsupported column type");
     }
@@ -66,10 +71,10 @@ ResolveTypeMarkExpression(GPUColumn** &probe_keys, uint8_t* &output,
 		unsigned long long* ht, uint64_t ht_len, const vector<JoinCondition> &conditions, GPUBufferManager* gpuBufferManager) {
 
 	int num_keys = conditions.size();
-	uint64_t** probe_data = new uint64_t*[num_keys];
+	uint8_t** probe_data = new uint8_t*[num_keys];
 
 	for (int key = 0; key < num_keys; key++) {
-		probe_data[key] = reinterpret_cast<uint64_t*>(probe_keys[key]->data_wrapper.data);
+		probe_data[key] = probe_keys[key]->data_wrapper.data;
 	}
 	size_t size = probe_keys[0]->column_length;
 
@@ -103,14 +108,14 @@ HandleMarkExpression(GPUColumn** &probe_keys, uint8_t* &output,
     }
 }
 
-void
+void 
 ResolveTypeBuildExpression(GPUColumn** &build_keys, unsigned long long* ht, uint64_t ht_len, 
 	const vector<JoinCondition> &conditions, JoinType join_type, GPUBufferManager* gpuBufferManager) {
 	int num_keys = conditions.size();
-	uint64_t** build_data = new uint64_t*[num_keys];
+	uint8_t** build_data = new uint8_t*[num_keys];
 
 	for (int key = 0; key < num_keys; key++) {
-		build_data[key] = reinterpret_cast<uint64_t*>(build_keys[key]->data_wrapper.data);
+		build_data[key] = build_keys[key]->data_wrapper.data;
 	}
 	size_t size = build_keys[0]->column_length;
 
@@ -145,7 +150,8 @@ HandleBuildExpression(GPUColumn** &build_keys, unsigned long long* ht, uint64_t 
 		ResolveTypeBuildExpression(build_keys, ht, ht_len, conditions, join_type, gpuBufferManager);
 		break;
       case ColumnType::FLOAT64:
-	  	throw NotImplementedException("Unsupported column type");
+	  	ResolveTypeBuildExpression(build_keys, ht, ht_len, conditions, join_type, gpuBufferManager);
+		break;
       default:
         throw NotImplementedException("Unsupported column type");
     }
@@ -343,7 +349,6 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 	} else if (join_type == JoinType::MARK) {
 		printf("Writing boolean column to output relation\n");
 		HandleMarkExpression(probe_key, output, gpu_hash_table, ht_len, conditions, gpuBufferManager);
-		if (count[0] == 0) throw NotImplementedException("No match found");
 	} else if (join_type == JoinType::RIGHT_SEMI || join_type == JoinType::RIGHT_ANTI) {
 		HandleProbeExpression(probe_key, count, row_ids_left, row_ids_right, gpu_hash_table, ht_len, conditions, join_type, gpuBufferManager);
 	}
@@ -362,8 +367,15 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 		// 	printf("Passing column idx %ld from LHS (late materialized) to idx %ld in output relation\n", i, i);
 		// 	output_relation.columns[i] = HandleMaterializeRowIDs(input_relation.columns[i], count[0], row_ids_left, gpuBufferManager);
 		// }
-		HandleMaterializeRowIDs(input_relation, output_relation, count[0], row_ids_left, gpuBufferManager);
+		// HandleMaterializeRowIDs(input_relation, output_relation, count[0], row_ids_left, gpuBufferManager);
+		for (idx_t i = 0; i < input_relation.column_count; i++) {
+			output_relation.columns[i] = new GPUColumn(input_relation.columns[i]->column_length, input_relation.columns[i]->data_wrapper.type, input_relation.columns[i]->data_wrapper.data);
+			output_relation.columns[i]->row_ids = input_relation.columns[i]->row_ids;
+			output_relation.columns[i]->row_id_count = input_relation.columns[i]->row_id_count;
+		}
 		output_relation.columns[input_relation.column_count] = new GPUColumn(probe_key[0]->column_length, ColumnType::BOOLEAN, output);
+		output_relation.columns[input_relation.column_count]->row_ids = probe_key[0]->row_ids;
+		output_relation.columns[input_relation.column_count]->row_id_count = probe_key[0]->row_id_count;
 	} else if (join_type == JoinType::RIGHT_SEMI || join_type == JoinType::RIGHT_ANTI) {
 		for (idx_t i = 0; i < input_relation.column_count; i++) {
 			output_relation.columns[i] = new GPUColumn(0, input_relation.columns[i]->data_wrapper.type, nullptr);

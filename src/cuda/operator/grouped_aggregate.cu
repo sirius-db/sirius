@@ -233,7 +233,8 @@ void groupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count,
     T* row_keys = gpuBufferManager->customCudaMalloc<T>((num_keys + 1) * N, 0, 0);
     T* keys_temp = gpuBufferManager->customCudaMalloc<T>((num_keys + 1) * N, 0, 0);
     sort_keys_type* materialized_temp = reinterpret_cast<sort_keys_type*> (gpuBufferManager->customCudaMalloc<pointer_and_key>(N, 0, 0));
-    T* keys_row_id[num_keys + 1];
+    // T* keys_row_id[num_keys + 1];
+    T** keys_row_id = new T*[num_keys + num_aggregates];
     for (uint64_t i = 0; i < num_keys; i++) {
         cudaMemcpy(keys_temp + i * N, reinterpret_cast<T*> (keys[i]), N * sizeof(T), cudaMemcpyDeviceToDevice);
         keys_row_id[i] = keys_temp + i * N;

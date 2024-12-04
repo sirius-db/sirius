@@ -142,6 +142,65 @@ void HandleDuplicateElimination(GPUColumn** &group_by_keys, GPUBufferManager* gp
     }
 }
 
+template <typename T, typename V>
+void ResolveTypeDistinctGroupBy(GPUColumn** &group_by_keys, GPUColumn** &aggregate_keys, GPUBufferManager* gpuBufferManager, DistinctAggregateCollectionInfo &distinct_info, int num_group_keys) {
+	uint64_t count[1];
+	count[0] = 0;
+	uint8_t** group_by_data = new uint8_t*[num_group_keys];
+	uint8_t** distinct_aggregate_data = new uint8_t*[distinct_info.indices.size()];
+
+	for (int group = 0; group < num_group_keys; group++) {
+		group_by_data[group] = (group_by_keys[group]->data_wrapper.data);
+	}
+	size_t size = group_by_keys[0]->column_length;
+
+	int* distinct_mode = new int[distinct_info.indices.size()];
+
+	for (int idx = 0; idx < distinct_info.indices.size(); idx++) {
+		auto distinct_idx = distinct_info.indices[idx];
+		auto& expr = distinct_info.aggregates[distinct_idx]->Cast<BoundAggregateExpression>();
+		if (expr.function.name.compare("count") == 0 && aggregate_keys[idx]->data_wrapper.data != nullptr) {
+			distinct_mode[idx] = 0;
+			distinct_aggregate_data[idx] = aggregate_keys[idx]->data_wrapper.data;
+		} else if (aggregate_keys[idx]->data_wrapper.data == nullptr) {
+			throw NotImplementedException("Count distinct with null column not supported yet");		
+		} else {
+			throw NotImplementedException("Aggregate function not supported");
+		}
+	}
+
+	groupedDistinctAggregate<uint64_t, uint64_t>(group_by_data, distinct_aggregate_data, count, size, num_group_keys, distinct_info.indices.size(), distinct_mode);
+
+	// Reading groupby columns based on the grouping set
+	for (idx_t group = 0; group < num_group_keys; group++) {
+		group_by_keys[group] = new GPUColumn(count[0], group_by_keys[group]->data_wrapper.type, reinterpret_cast<uint8_t*>(group_by_data[group]));
+	}
+
+	for (int idx = 0; idx < distinct_info.indices.size(); idx++) {
+		auto distinct_idx = distinct_info.indices[idx];
+		auto& expr = distinct_info.aggregates[distinct_idx]->Cast<BoundAggregateExpression>();
+		if (expr.function.name.compare("count") == 0) {
+			aggregate_keys[idx] = new GPUColumn(count[0], ColumnType::INT64, reinterpret_cast<uint8_t*>(distinct_aggregate_data[idx]));
+		}
+	}
+
+}
+
+void HandleDistinctGroupBy(GPUColumn** &group_by_keys, GPUColumn** &aggregate_keys, GPUBufferManager* gpuBufferManager, DistinctAggregateCollectionInfo &distinct_info, int num_group_keys) {
+    switch(group_by_keys[0]->data_wrapper.type) {
+      case ColumnType::INT64: {
+	  	if (aggregate_keys[0]->data_wrapper.type == ColumnType::INT64) {
+			ResolveTypeDistinctGroupBy<uint64_t, uint64_t>(group_by_keys, aggregate_keys, gpuBufferManager, distinct_info, num_group_keys);
+		} else throw NotImplementedException("Unsupported column type");
+		break;
+	  } case ColumnType::FLOAT64:
+	  	throw NotImplementedException("Unsupported column type");
+      default:
+        throw NotImplementedException("Unsupported column type");
+    }
+}
+
+
 static vector<LogicalType> CreateGroupChunkTypes(vector<unique_ptr<Expression>> &groups) {
 	set<idx_t> group_indices;
 
@@ -262,6 +321,7 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 
 	if (distinct_collection_info) {
 		SinkDistinct(input_relation);
+		return SinkResultType::FINISHED;
 	}
 
 	// DataChunk &aggregate_input_chunk = local_state.aggregate_input_chunk;
@@ -353,6 +413,7 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 	// Reading groupby columns based on the grouping set
 	for (idx_t i = 0; i < groupings.size(); i++) {
 		for (int idx = 0; idx < grouping_sets[i].size(); idx++) {
+			//TODO: has to fix this for columns with partially NULL values
 			// group_by_result->columns[idx] = new GPUColumn(count[0], ColumnType::INT64, reinterpret_cast<uint8_t*>(group_keys[idx]));
 			if (group_by_result->columns[idx] == nullptr && group_by_column[idx]->column_length > 0 && group_by_column[idx]->data_wrapper.data != nullptr) {
 				group_by_result->columns[idx] = group_by_column[idx];
@@ -389,13 +450,15 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 SourceResultType
 GPUPhysicalGroupedAggregate::GetData(GPUIntermediateRelation &output_relation) const {
 //   printf("group by result size %d\n", group_by_result->columns.size());
-  for (int col = 0; col < group_by_result->columns.size(); col++) {
-    printf("Writing group by result to column %d\n", col);
-    // output_relation.columns[col] = group_by_result->columns[col];
-	output_relation.columns[col] = new GPUColumn(group_by_result->columns[col]->column_length, group_by_result->columns[col]->data_wrapper.type, group_by_result->columns[col]->data_wrapper.data);
-  }
+	if (groupings.size() > 1) throw NotImplementedException("Multiple groupings not supported yet");
 
-  return SourceResultType::FINISHED;
+	for (int col = 0; col < group_by_result->columns.size(); col++) {
+		printf("Writing group by result to column %d\n", col);
+		// output_relation.columns[col] = group_by_result->columns[col];
+		output_relation.columns[col] = new GPUColumn(group_by_result->columns[col]->column_length, group_by_result->columns[col]->data_wrapper.type, group_by_result->columns[col]->data_wrapper.data);
+	}
+
+  	return SourceResultType::FINISHED;
 }
 
 // void 
@@ -403,6 +466,7 @@ GPUPhysicalGroupedAggregate::GetData(GPUIntermediateRelation &output_relation) c
 void
 GPUPhysicalGroupedAggregate::SinkDistinct(GPUIntermediateRelation& input_relation) const {
 	// throw NotImplementedException("Distinct not supported yet");
+	if (groupings.size() > 1) throw NotImplementedException("Multiple groupings not supported yet");
 	for (idx_t i = 0; i < groupings.size(); i++) {
 		SinkDistinctGrouping(input_relation, i);
 	}
@@ -415,14 +479,37 @@ void
 GPUPhysicalGroupedAggregate::SinkDistinctGrouping(GPUIntermediateRelation& input_relation, idx_t grouping_idx) const {
 	auto &distinct_info = *distinct_collection_info;
 
+	GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+	uint64_t num_group_keys = grouped_aggregate_data.groups.size();
+	GPUColumn** group_by_column = new GPUColumn*[grouped_aggregate_data.groups.size()];
+	GPUColumn** distinct_aggregate_columns = new GPUColumn*[distinct_info.indices.size()];
+
+	for (int i = 0; i < grouped_aggregate_data.groups.size(); i++) {
+		group_by_column[i] = nullptr;
+	}
+	for (int i = 0; i < distinct_info.indices.size(); i++) {
+		distinct_aggregate_columns[i] = nullptr;
+	}
+
+	for (idx_t group_idx = 0; group_idx < grouped_aggregate_data.groups.size(); group_idx++) {
+		auto &group = grouped_aggregate_data.groups[group_idx];
+		auto &bound_ref = group->Cast<BoundReferenceExpression>();
+		printf("Reading groupby columns from index %d and passing it to index %d in groupby result\n", bound_ref.index, group_idx);
+		// input_relation.checkLateMaterialization(bound_ref.index);
+		// group_by_result->columns[group_idx] = input_relation.columns[bound_ref.index];
+		group_by_column[group_idx] = HandleMaterializeExpression(input_relation.columns[bound_ref.index], bound_ref, gpuBufferManager);
+	}
+
+	int aggr_idx = 0;
 	for (idx_t &idx : distinct_info.indices) {
 		auto &aggregate = grouped_aggregate_data.aggregates[idx]->Cast<BoundAggregateExpression>();
 		printf("Processing distinct aggregate %s\n", aggregate.function.name.c_str());
-		throw NotImplementedException("Distinct not supported yet");
+		// throw NotImplementedException("Distinct not supported yet");
 
 		D_ASSERT(distinct_info.table_map.count(idx));
 
 		if (aggregate.filter) {
+			throw NotImplementedException("Filter not supported yet");
 			auto it = filter_indexes.find(aggregate.filter.get());
       		printf("Reading filter columns from index %d\n", it->second);
 
@@ -441,20 +528,44 @@ GPUPhysicalGroupedAggregate::SinkDistinctGrouping(GPUIntermediateRelation& input
 				group_by_result->columns[grouped_aggregate_data.groups.size() + idx] = input_relation.columns[bound_ref.index];
 			}
 		} else {
-			for (idx_t group_idx = 0; group_idx < grouped_aggregate_data.groups.size(); group_idx++) {
-				auto &group = grouped_aggregate_data.groups[group_idx];
-				auto &bound_ref = group->Cast<BoundReferenceExpression>();
-				printf("Reading groupby columns from index %d and passing it to index %d in groupby result\n", bound_ref.index, group_idx);
-				input_relation.checkLateMaterialization(bound_ref.index);
-				group_by_result->columns[group_idx] = input_relation.columns[bound_ref.index];
-			}
+
+			if (aggregate.children.size() > 1) throw NotImplementedException("Aggregates with multiple children not supported yet");
 			for (idx_t child_idx = 0; child_idx < aggregate.children.size(); child_idx++) {
 				auto &child = aggregate.children[child_idx];
 				auto &bound_ref = child->Cast<BoundReferenceExpression>();
 				printf("Reading aggregation column from index %d and passing it to index %d in groupby result\n", bound_ref.index, grouped_aggregate_data.groups.size() + idx);
-				input_relation.checkLateMaterialization(bound_ref.index);
-				group_by_result->columns[grouped_aggregate_data.groups.size() + idx] = input_relation.columns[bound_ref.index];
+				// input_relation.checkLateMaterialization(bound_ref.index);
+				// group_by_result->columns[grouped_aggregate_data.groups.size() + idx] = input_relation.columns[bound_ref.index];
+				distinct_aggregate_columns[aggr_idx] = HandleMaterializeExpression(input_relation.columns[bound_ref.index], bound_ref, gpuBufferManager);
 			}
+			aggr_idx++;
+		}
+	}
+
+	uint64_t count[1];
+	HandleDistinctGroupBy(group_by_column, distinct_aggregate_columns, gpuBufferManager, distinct_info, num_group_keys);
+
+	// Reading groupby columns based on the grouping set
+	for (int idx = 0; idx < grouped_aggregate_data.groups.size(); idx++) {
+		//TODO: has to fix this for columns with partially NULL values
+		if (group_by_result->columns[idx] == nullptr && group_by_column[idx]->column_length > 0 && group_by_column[idx]->data_wrapper.data != nullptr) {
+			group_by_result->columns[idx] = group_by_column[idx];
+			group_by_result->columns[idx]->row_ids = nullptr;
+			group_by_result->columns[idx]->row_id_count = 0;
+		} else if (group_by_result->columns[idx] != nullptr && group_by_column[idx]->column_length > 0 && group_by_column[idx]->data_wrapper.data != nullptr) {
+			group_by_result->columns[idx] = CombineColumns(group_by_result->columns[idx], group_by_column[idx], gpuBufferManager);
+		}
+	}
+
+	for (int aggr_idx = 0; aggr_idx < distinct_info.indices.size(); aggr_idx++) {
+		//TODO: has to fix this for columns with partially NULL values
+		//TODO: has to fix this for group by where there would be both distinct and non distinct aggregates at the same time
+		if (group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] == nullptr && distinct_aggregate_columns[aggr_idx]->column_length > 0 && distinct_aggregate_columns[aggr_idx]->data_wrapper.data != nullptr) {
+			group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] = distinct_aggregate_columns[aggr_idx];
+			group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx]->row_ids = nullptr;
+			group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx]->row_id_count = 0;
+		} else if (group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] != nullptr && distinct_aggregate_columns[aggr_idx]->column_length > 0 && distinct_aggregate_columns[aggr_idx]->data_wrapper.data != nullptr) {
+			group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] = CombineColumns(group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx], distinct_aggregate_columns[aggr_idx], gpuBufferManager);
 		}
 	}
 

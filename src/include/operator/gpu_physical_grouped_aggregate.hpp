@@ -17,6 +17,9 @@ void groupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count,
 template <typename T>
 void groupedWithoutAggregate(uint8_t **keys, uint64_t* count, uint64_t N, uint64_t num_keys);
 
+template <typename T, typename V>
+void groupedDistinctAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count, uint64_t N, uint64_t num_keys, uint64_t num_aggregates, int* distinct_mode);
+
 template<typename T>
 void combineColumns(T* a, T* b, T* c, uint64_t N_a, uint64_t N_b);
 

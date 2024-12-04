@@ -221,7 +221,7 @@ template
 __global__ void probe_multikey<BLOCK_THREADS, ITEMS_PER_THREAD>(uint64_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t *offset_each_thread, 
         uint64_t *row_ids_left, uint64_t *row_ids_right, uint64_t N, int* condition_mode, int num_keys, int equal_keys, bool is_right);
 
-void buildHashTable(uint64_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t N, int* condition_mode, int num_keys, bool is_right) {
+void buildHashTable(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t N, int* condition_mode, int num_keys, bool is_right) {
     CHECK_ERROR();
     if (N == 0) {
         printf("N is 0\n");
@@ -230,9 +230,16 @@ void buildHashTable(uint64_t **keys, unsigned long long* ht, uint64_t ht_len, ui
     printf("Launching Build Kernel\n");
     printf("N: %lu\n", N);
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+
+    //reinterpret cast the keys to uint64_t
+    uint64_t** keys_data = new uint64_t*[num_keys];
+    for (int idx = 0; idx < num_keys; idx++) {
+        keys_data[idx] = reinterpret_cast<uint64_t*>(keys[idx]);
+    }
+
     uint64_t** keys_dev;
     cudaMalloc((void**) &keys_dev, num_keys * sizeof(uint64_t*));
-    cudaMemcpy(keys_dev, keys, num_keys * sizeof(uint64_t*), cudaMemcpyHostToDevice);
+    cudaMemcpy(keys_dev, keys_data, num_keys * sizeof(uint64_t*), cudaMemcpyHostToDevice);
 
     int equal_keys = 0;
     for (int idx = 0; idx < num_keys; idx++) {
@@ -254,7 +261,7 @@ void buildHashTable(uint64_t **keys, unsigned long long* ht, uint64_t ht_len, ui
     cudaDeviceSynchronize();
 }
 
-void probeHashTable(uint64_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t* &row_ids_left, uint64_t* &row_ids_right, uint64_t* &count, uint64_t N, int* condition_mode, int num_keys, bool is_right) {
+void probeHashTable(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t* &row_ids_left, uint64_t* &row_ids_right, uint64_t* &count, uint64_t N, int* condition_mode, int num_keys, bool is_right) {
     CHECK_ERROR();
     if (N == 0) {
         uint64_t* h_count = new uint64_t[1];
@@ -270,9 +277,15 @@ void probeHashTable(uint64_t **keys, unsigned long long* ht, uint64_t ht_len, ui
     cudaMemset(count, 0, sizeof(uint64_t));
     uint64_t* offset_each_thread = gpuBufferManager->customCudaMalloc<uint64_t>(((N + tile_items - 1)/tile_items) * BLOCK_THREADS, 0, 0);
 
+    //reinterpret cast the keys to uint64_t
+    uint64_t** keys_data = new uint64_t*[num_keys];
+    for (int idx = 0; idx < num_keys; idx++) {
+        keys_data[idx] = reinterpret_cast<uint64_t*>(keys[idx]);
+    }
+
     uint64_t** keys_dev;
     cudaMalloc((void**) &keys_dev, num_keys * sizeof(uint64_t*));
-    cudaMemcpy(keys_dev, keys, num_keys * sizeof(uint64_t*), cudaMemcpyHostToDevice);
+    cudaMemcpy(keys_dev, keys_data, num_keys * sizeof(uint64_t*), cudaMemcpyHostToDevice);
 
     int equal_keys = 0;
     for (int idx = 0; idx < num_keys; idx++) {
