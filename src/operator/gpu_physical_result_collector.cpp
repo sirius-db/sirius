@@ -8,6 +8,7 @@
 // #include "duckdb/main/prepared_statement_data.hpp"
 // #include "duckdb/parallel/meta_pipeline.hpp"
 // #include "duckdb/parallel/pipeline.hpp"
+#include "duckdb/common/types/string_type.hpp"
 
 #include "operator/gpu_physical_result_collector.hpp"
 #include "gpu_pipeline.hpp"
@@ -291,17 +292,19 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 				Vector vector = rawDataToVector(host_data[col], vec, materialized_relation.columns[col]->data_wrapper.type);
 				chunk.data[col].Reference(vector);
 			} else {
-				DataWrapper str_col_data = materialized_relation.columns[col]->data_wrapper;
-				int num_output_records = std::min((int) STANDARD_VECTOR_SIZE, (int) remaining);
-				Vector str_vector(LogicalType::VARCHAR, num_output_records);
-				std::cout << "Creating string vector with " << num_output_records << " records" << std::endl;
-
-				// Add the strings to the vector
-				for(int i = 0; i < num_output_records; i++) {
-					std::string output_str(str_col_data.data + str_col_data.offsets[i], str_col_data.data + str_col_data.offsets[i + 1]);
-					Value output_value(output_str);
-					str_vector.SetValue(i, output_value);
+				// Create the array of duckdb strings
+				DataWrapper strings_data_wrapper = materialized_relation.columns[col]->data_wrapper;
+				char* str_all_chars = reinterpret_cast<char*>(strings_data_wrapper.data);
+				int num_strings = strings_data_wrapper.num_strings;
+				string_t* duckdb_strings = new string_t[num_strings];
+				for(int i = 0; i < num_strings; i++) {
+					int str_start_offset = strings_data_wrapper.offsets[i];
+					int curr_str_length = strings_data_wrapper.offsets[i + 1] - str_start_offset;
+					duckdb_strings[i] = string_t(str_all_chars + str_start_offset, curr_str_length);
 				}
+
+				// Create the strings vector
+				Vector str_vector(LogicalType::VARCHAR, reinterpret_cast<data_ptr_t>(duckdb_strings));
 				chunk.data[col].Reference(str_vector);
 			}
 		}
