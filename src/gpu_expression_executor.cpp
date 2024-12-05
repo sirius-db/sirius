@@ -1,5 +1,6 @@
 #include "gpu_expression_executor.hpp"
 #include "operator/gpu_materialize.hpp"
+#include "operator/gpu_physical_strings_matching.hpp"
 
 namespace duckdb {
 
@@ -302,8 +303,44 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
           } case ExpressionClass::BOUND_FUNCTION: {
                 printf("Executing function expression\n");
                 auto &bound_function = expr.Cast<BoundFunctionExpression>();
-                for (auto &child : bound_function.children) {
-                    FilterRecursiveExpression(input_relation, output_relation, *child, depth + 1);
+                // for (auto &child : bound_function.children) {
+                //     FilterRecursiveExpression(input_relation, output_relation, *child, depth + 1);
+                // }
+                std::string bound_function_name = bound_function.ToString();
+                std::cout << "Got bound function " << bound_function_name << std::endl;
+                if (bound_function.children[0]->type != ExpressionType::BOUND_REF) {
+                  throw NotImplementedException("Contains function not supported");
+                }
+                if(bound_function_name.find("contains") != std::string::npos || bound_function_name.find("prefix") != std::string::npos) {
+                  // Get the column
+                  auto& bound_ref = bound_function.children[0]->Cast<BoundReferenceExpression>();
+                  // GPUColumn* curr_column = input_relation.columns[0];
+                  // std::cout << "Running single term contains function with is row ids null of " << (curr_column->row_ids == nullptr) << std::endl;
+
+                  // Get the match string from the other child
+                  auto& bound_const = (*bound_function.children[1]).Cast<BoundConstantExpression>();
+                  std::string match_str = bound_const.value.ToString();
+                  std::cout << "Got match str of " << match_str << " at depth " << depth << std::endl;
+                  
+                  count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+                  HandleStringMatching(input_relation.columns[bound_ref.index], match_str, comparison_idx, count);
+                  if (count[0] == 0) throw NotImplementedException("No match found");
+
+                } else if(bound_function_name.find("~~") != std::string::npos) {
+                  // Get the column
+                  auto& bound_ref = bound_function.children[0]->Cast<BoundReferenceExpression>();
+                  // std::cout << "Running multi term match function with is row ids null of " << (curr_column->row_ids == nullptr) << std::endl;
+
+                  // Get the match string from the other child
+                  auto& bound_const = (*bound_function.children[1]).Cast<BoundConstantExpression>();
+                  std::string match_str = bound_const.value.ToString();
+                  std::cout << "Got match str of " << match_str << " at depth " << depth << std::endl;
+                     
+                  count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+                  HandleMultiStringMatching(input_relation.columns[bound_ref.index], match_str, comparison_idx, count);
+                  if (count[0] == 0) throw NotImplementedException("No match found");
+                } else {
+                  throw NotImplementedException("Function not supported");
                 }
             break;
           } case ExpressionClass::BOUND_OPERATOR: {

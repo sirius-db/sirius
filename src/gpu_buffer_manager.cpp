@@ -139,6 +139,70 @@ GPUBufferManager::Print() {
     printf("I am inside GPU buffer manager\n");
 }
 
+DataWrapper GPUBufferManager::allocateStringChunk(DataChunk &input_chunk, size_t row_count, DataWrapper &prev_data) {
+	Vector input = input_chunk.data[0];
+    size_t chunk_size = input_chunk.size();
+    input.Flatten(chunk_size);
+    LogicalType vector_type = input.GetType();
+    if(vector_type.id() != LogicalTypeId::VARCHAR) {
+        throw InvalidInputException("Wrong type");
+    }
+
+    DataWrapper result;
+    result.type = ColumnType::VARCHAR;
+    // printf("chunk size %ld\n", chunk_size);
+    result.size = prev_data.size + chunk_size;
+
+    // First iteration, allocate the offset array
+    if (prev_data.size == 0) {
+        result.offset = customCudaHostAlloc<uint64_t>(row_count + 1);
+    } else {
+        result.offset = prev_data.offset;
+    }
+
+    uint64_t curr_offset = 0;
+    for(uint64_t i = 0; i < chunk_size; i++) {
+        std::string curr_string = input.GetValue(i).ToString();
+        result.offset[prev_data.size + i] = curr_offset + prev_data.num_bytes;
+        curr_offset += curr_string.length();
+    }
+
+    result.offset[prev_data.size + chunk_size] = curr_offset + prev_data.num_bytes;
+
+    // Now do the same for the chars
+    result.num_bytes = (size_t) (curr_offset + prev_data.num_bytes);
+    // printf("Num bytes %d\n", result.num_bytes);
+    uint64_t copy_offset = 0;
+
+    //assuming its contiguous with prev_data
+    uint8_t* ptr = customCudaHostAlloc<uint8_t>(curr_offset);
+
+    //TODO: Need to optimize this part
+    for(uint64_t i = 0; i < chunk_size; i++) {
+        std::string curr_string = input.GetValue(i).ToString();
+        uint64_t str_length = curr_string.length();
+        memcpy(ptr + copy_offset, reinterpret_cast<uint8_t*>(curr_string.data()), str_length * sizeof(uint8_t));
+        copy_offset += str_length;
+    }
+
+    if (prev_data.size == 0) {
+        result.data = ptr;
+    } else {
+        result.data = prev_data.data;
+    }
+
+    // for (uint64_t i = 0; i < result.size; i++) {
+    //     std::string output_str(result.data + result.offset[i], result.data + result.offset[i + 1]);
+    //     Value output_value(output_str);
+    //     // printf("result size %ld\n", result.size);
+    //     // printf("offset from %ld to %ld\n", result.offset[i], result.offset[i + 1]);
+    //     std::cout << "Recording value " << output_value.ToString() << " for idx " << i << std::endl;
+    // }
+    
+    result.is_string_data = true;
+    return result;
+}
+
 DataWrapper
 GPUBufferManager::allocateChunk(DataChunk &input){
 	size_t chunk_size = input.size();
@@ -147,6 +211,7 @@ GPUBufferManager::allocateChunk(DataChunk &input){
     ColumnType column_type;
 
     // printf("vector type %d\n", vector_type.id());
+    //the allocation below is assuming its contiguous with prev_data
     switch (vector_type.id()) {
         case LogicalTypeId::INTEGER: {
             int* ptr_int = customCudaHostAlloc<int>(chunk_size);
@@ -200,15 +265,30 @@ GPUBufferManager::allocateChunk(DataChunk &input){
 //TODO: We have to lock the CPU buffer before calling bufferChunkInCPU to ensure contiguous memory allocation
 DataWrapper
 GPUBufferManager::allocateColumnBufferInCPU(unique_ptr<MaterializedQueryResult> input) {
+    auto row_count = input->RowCount();
+    printf("Row count %d\n", row_count);
 	auto input_chunk = input->Fetch();
 	if (!input_chunk) {
 		throw InvalidInputException("No data in input chunk");
 	}
-    DataWrapper result_wrapper = allocateChunk(*input_chunk);
+
+    DataWrapper result_wrapper(ColumnType::INT32, nullptr, 0);
+    if (input_chunk->data[0].GetType().id() == LogicalTypeId::VARCHAR) {
+        result_wrapper = allocateStringChunk(*input_chunk, row_count, result_wrapper);
+    } else {
+        result_wrapper = allocateChunk(*input_chunk);
+    }
     input_chunk = input->Fetch();
+    //TODO: Need to handle merging data_wrapper in a better way, currently assuming contiguous memory allocation
+    //Better way to do this is to lock the buffer manager during this call
 	while (input_chunk) {
-		auto wrapper = allocateChunk(*input_chunk);
-        result_wrapper.size += wrapper.size;
+		// auto wrapper = allocateChunk(*input_chunk);
+        if (input_chunk->data[0].GetType().id() == LogicalTypeId::VARCHAR) {
+            result_wrapper = allocateStringChunk(*input_chunk, row_count, result_wrapper);
+        } else {
+            auto wrapper = allocateChunk(*input_chunk);
+            result_wrapper.size += wrapper.size;
+        }
 		input_chunk = input->Fetch();
 	}
     // for (int i = 0; i < 1000000; i++) {
@@ -217,8 +297,48 @@ GPUBufferManager::allocateColumnBufferInCPU(unique_ptr<MaterializedQueryResult> 
     return result_wrapper;
 }
 
+DataWrapper GPUBufferManager::allocateStrColumnInGPU(DataWrapper cpu_data, int gpu) {
+    // First copy the data
+    std::cout << "CPU data called with " << cpu_data.num_bytes << " chars and " << cpu_data.size << " strings" << std::endl;
+
+    DataWrapper result;
+    result.is_string_data = cpu_data.is_string_data;
+    result.type = ColumnType::VARCHAR;
+
+    // First allocate and copy the offset buffer
+    result.size = cpu_data.size;
+    result.offset = customCudaMalloc<uint64_t>((cpu_data.size + 1), 0, true);
+    std::cout << "Copying offset with " << result.size << " strings" << std::endl;
+    // printf("%ld %ld\n",cpu_data.offset[0], cpu_data.offset[cpu_data.size]);
+    // for (int i = 0; i < cpu_data.size + 1; i++) {
+    //     printf("printing cpu_data offset[%d], %ld\n", i, cpu_data.offset[i]);
+    // }
+    callCudaMemcpyHostToDevice<uint64_t>(result.offset, cpu_data.offset, (cpu_data.size + 1), 0);
+
+    // for (int i = 0; i < cpu_data.size; i++) {
+    //     std::string output_str(cpu_data.data + cpu_data.offset[i], cpu_data.data + cpu_data.offset[i + 1]);
+    //     Value output_value(output_str);
+    //     std::cout << "Recording value " << output_value.ToString() << " for idx " << i << std::endl;
+    // }
+
+    // Do the same for the characeters
+    result.num_bytes = cpu_data.num_bytes;
+    result.data = customCudaMalloc<uint8_t>(cpu_data.num_bytes, 0, true);
+    std::cout << "Copying sizes with " << result.num_bytes << " chars" << std::endl;
+    callCudaMemcpyHostToDevice<uint8_t>(result.data, cpu_data.data, cpu_data.num_bytes, 0);
+
+    std::cout << "Returning wrapper of size " << result.size << " and " << result.num_bytes << std::endl;
+    return result;
+}
+
+
 DataWrapper
 GPUBufferManager::allocateColumnBufferInGPU(DataWrapper cpu_data, int gpu) {
+    if(cpu_data.is_string_data) {
+        std::cout << "Calling allocateStrColumnInGPU" << std::endl;
+        return allocateStrColumnInGPU(cpu_data, gpu);
+    }
+    
     uint8_t* ptr = nullptr;
     ColumnType column_type;
 
@@ -279,7 +399,13 @@ GPUBufferManager::cacheDataInGPU(DataWrapper cpu_data, string table_name, string
         throw InvalidInputException("Column not found");
     }
     DataWrapper gpu_allocated_buffer = allocateColumnBufferInGPU(cpu_data, gpu);
-    callCudaMemcpyHostToDevice<uint8_t>(gpu_allocated_buffer.data, cpu_data.data, cpu_data.size * cpu_data.getColumnTypeSize(), 0);
+    // callCudaMemcpyHostToDevice<uint8_t>(gpu_allocated_buffer.data, cpu_data.data, cpu_data.size * cpu_data.getColumnTypeSize(), 0);
+    if(!gpu_allocated_buffer.is_string_data) {
+        callCudaMemcpyHostToDevice<uint8_t>(gpu_allocated_buffer.data, cpu_data.data, cpu_data.size * cpu_data.getColumnTypeSize(), 0);
+    } 
+    // else {
+    //     callCudaMemcpyHostToDevice<uint8_t>(gpu_allocated_buffer.data, cpu_data.data, cpu_data.num_bytes * sizeof(uint8_t), 0);
+    // }
     int column_idx = column_it - tables[up_table_name]->column_names.begin(); 
     tables[up_table_name]->columns[column_idx]->data_wrapper = gpu_allocated_buffer;
     tables[up_table_name]->columns[column_idx]->column_length = gpu_allocated_buffer.size;
