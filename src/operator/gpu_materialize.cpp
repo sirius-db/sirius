@@ -42,25 +42,6 @@ HandleMaterializeExpression(GPUColumn* column, BoundReferenceExpression& bound_r
     }
 }
 
-// GPUColumn* 
-// HandleMaterializeRowIDs(GPUColumn* in_column, uint64_t count, uint64_t* row_ids, GPUBufferManager* gpuBufferManager) {
-//     GPUColumn* out_column;
-//     if (row_ids == nullptr) throw NotImplementedException("Row ids cannot be null");
-//     if (in_column->row_ids == nullptr) {
-//         out_column = new GPUColumn(in_column->column_length, in_column->data_wrapper.type, in_column->data_wrapper.data);
-//         out_column->row_ids = row_ids;
-//         out_column->row_id_count = count;
-//     } else {
-//         out_column = new GPUColumn(in_column->column_length, in_column->data_wrapper.type, in_column->data_wrapper.data);
-//         uint64_t* row_ids_input = reinterpret_cast<uint64_t*> (in_column->row_ids);
-//         uint64_t* new_row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(count, 0, 0);
-//         materializeExpression<uint64_t>(row_ids_input, new_row_ids, row_ids, count);
-//         out_column->row_ids = new_row_ids;
-//         out_column->row_id_count = count;
-//     }
-//     return out_column;
-// }
-
 void
 HandleMaterializeRowIDs(GPUIntermediateRelation& input_relation, GPUIntermediateRelation& output_relation, uint64_t count, uint64_t* row_ids, GPUBufferManager* gpuBufferManager) {
     vector<uint64_t*> new_row_ids;
@@ -70,13 +51,17 @@ HandleMaterializeRowIDs(GPUIntermediateRelation& input_relation, GPUIntermediate
     for (int i = 0; i < input_relation.columns.size(); i++) {
         printf("Passing column idx %d in input relation to idx %d in output relation\n", i, i);
         if (count == 0) {
-            output_relation.columns[i] = new GPUColumn(0, input_relation.columns[i]->data_wrapper.type, input_relation.columns[i]->data_wrapper.data);
+            // output_relation.columns[i] = new GPUColumn(0, input_relation.columns[i]->data_wrapper.type, input_relation.columns[i]->data_wrapper.data);
+            output_relation.columns[i] = new GPUColumn(0, input_relation.columns[i]->data_wrapper.type, input_relation.columns[i]->data_wrapper.data,
+                        input_relation.columns[i]->data_wrapper.offset, 0, input_relation.columns[i]->data_wrapper.is_string_data);
             output_relation.columns[i]->row_id_count = 0;
             continue;
         }
         // printf("input relation column length %ld\n", input_relation.columns[i]->column_length);
         // printf("input relation type %d\n", input_relation.columns[i]->data_wrapper.type);
-        output_relation.columns[i] = new GPUColumn(input_relation.columns[i]->column_length, input_relation.columns[i]->data_wrapper.type, input_relation.columns[i]->data_wrapper.data);
+        // output_relation.columns[i] = new GPUColumn(input_relation.columns[i]->column_length, input_relation.columns[i]->data_wrapper.type, input_relation.columns[i]->data_wrapper.data);
+        output_relation.columns[i] = new GPUColumn(input_relation.columns[i]->column_length, input_relation.columns[i]->data_wrapper.type, input_relation.columns[i]->data_wrapper.data,
+                        input_relation.columns[i]->data_wrapper.offset, input_relation.columns[i]->data_wrapper.num_bytes, input_relation.columns[i]->data_wrapper.is_string_data);
         if (row_ids) {
             if (input_relation.columns[i]->row_ids == nullptr) {
                 output_relation.columns[i]->row_ids = row_ids;
@@ -107,11 +92,15 @@ HandleMaterializeRowIDsRHS(GPUIntermediateRelation& hash_table_result, GPUInterm
         const auto output_col_idx = rhs_output_columns[i];
         printf("Passing column idx %d from RHS (late materialized) to idx %d in output relation\n", i, offset + output_col_idx);
         if (count == 0) {
-            output_relation.columns[offset + output_col_idx] = new GPUColumn(0, hash_table_result.columns[i]->data_wrapper.type, hash_table_result.columns[i]->data_wrapper.data);
+            // output_relation.columns[offset + output_col_idx] = new GPUColumn(0, hash_table_result.columns[i]->data_wrapper.type, hash_table_result.columns[i]->data_wrapper.data);
+            output_relation.columns[offset + output_col_idx] = new GPUColumn(0, hash_table_result.columns[i]->data_wrapper.type, hash_table_result.columns[i]->data_wrapper.data,
+                        hash_table_result.columns[i]->data_wrapper.offset, 0, hash_table_result.columns[i]->data_wrapper.is_string_data);
             output_relation.columns[offset + output_col_idx]->row_id_count = 0;
             continue;
         }
-        output_relation.columns[offset + output_col_idx] = new GPUColumn(hash_table_result.columns[i]->column_length, hash_table_result.columns[i]->data_wrapper.type, hash_table_result.columns[i]->data_wrapper.data);
+        // output_relation.columns[offset + output_col_idx] = new GPUColumn(hash_table_result.columns[i]->column_length, hash_table_result.columns[i]->data_wrapper.type, hash_table_result.columns[i]->data_wrapper.data);
+        output_relation.columns[offset + output_col_idx] = new GPUColumn(hash_table_result.columns[i]->column_length, hash_table_result.columns[i]->data_wrapper.type, hash_table_result.columns[i]->data_wrapper.data,
+                        hash_table_result.columns[i]->data_wrapper.offset, hash_table_result.columns[i]->data_wrapper.num_bytes, hash_table_result.columns[i]->data_wrapper.is_string_data);
         if (row_ids) {
             if (hash_table_result.columns[i]->row_ids == nullptr) {
                 output_relation.columns[offset + output_col_idx]->row_ids = row_ids;

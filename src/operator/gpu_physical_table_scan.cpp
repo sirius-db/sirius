@@ -253,8 +253,10 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
         printf("Reading column index (late materialized) %ld and passing it to index in output relation %ld\n", column_ids[projection_id], projection_id);
         printf("Writing row IDs to output relation in index %ld\n", index);
         output_relation.columns[index] = new GPUColumn(table->columns[column_ids[projection_id]]->column_length, table->columns[column_ids[projection_id]]->data_wrapper.type, table->columns[column_ids[projection_id]]->data_wrapper.data);
-        // output_relation.columns[index] = table->columns[column_ids[projection_id]];
-        // output_relation.length = table->length;
+        output_relation.columns[index]->data_wrapper.offset = table->columns[column_ids[projection_id]]->data_wrapper.offset;
+        output_relation.columns[index]->data_wrapper.num_bytes = table->columns[column_ids[projection_id]]->data_wrapper.num_bytes;
+        // output_relation.columns[index] = new GPUColumn(table->columns[column_ids[projection_id]]->column_length, table->columns[column_ids[projection_id]]->data_wrapper.type, table->columns[column_ids[projection_id]]->data_wrapper.data,
+        //                 table->columns[column_ids[projection_id]]->data_wrapper.offset, table->columns[column_ids[projection_id]]->data_wrapper.num_bytes, table->columns[column_ids[projection_id]]->data_wrapper.is_string_data);
         if (row_ids) {
           output_relation.columns[index]->row_ids = prev_row_ids; 
         }

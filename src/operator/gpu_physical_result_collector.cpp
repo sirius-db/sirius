@@ -16,6 +16,7 @@
 #include "gpu_physical_plan_generator.hpp"
 #include "duckdb/main/prepared_statement_data.hpp"
 #include "gpu_buffer_manager.hpp"
+#include "gpu_materialize.hpp"
 
 namespace duckdb {
 
@@ -109,6 +110,29 @@ GPUPhysicalMaterializedCollector::FinalMaterializeInternal(GPUIntermediateRelati
 	}
 }
 
+void 
+GPUPhysicalMaterializedCollector::FinalMaterializeString(GPUIntermediateRelation input_relation, GPUIntermediateRelation& output_relation, size_t col) const {
+	// bool need_to_late_materalize = input_relation.checkLateMaterialization(col);
+	if (input_relation.checkLateMaterialization(col)) {
+		// Late materalize the input relationship
+		uint8_t* data = input_relation.columns[col]->data_wrapper.data;
+		uint64_t* offset = input_relation.columns[col]->data_wrapper.offset;
+		uint64_t* row_ids = input_relation.columns[col]->row_ids;
+		size_t num_rows = input_relation.columns[col]->row_id_count;
+		uint8_t* result; uint64_t* result_offset; uint64_t* new_num_bytes;
+
+		std::cout << "Running string late materalization with " << num_rows << " rows" << std::endl;
+
+		materializeString(data, offset, result, result_offset, row_ids, new_num_bytes, num_rows);
+
+		output_relation.columns[col] = new GPUColumn(num_rows, ColumnType::VARCHAR, reinterpret_cast<uint8_t*>(result), offset, new_num_bytes[0], true);
+		output_relation.columns[col]->row_id_count = 0;
+		output_relation.columns[col]->row_ids = nullptr;
+	} else {
+		output_relation.columns[col] = new GPUColumn(*input_relation.columns[col]);
+	}
+}
+
 size_t
 GPUPhysicalMaterializedCollector::FinalMaterialize(GPUIntermediateRelation input_relation, GPUIntermediateRelation &output_relation, size_t col) const {
 	size_t size_bytes;
@@ -133,6 +157,9 @@ GPUPhysicalMaterializedCollector::FinalMaterialize(GPUIntermediateRelation input
 	case ColumnType::BOOLEAN:
 		FinalMaterializeInternal<uint8_t>(input_relation, output_relation, col);
 		size_bytes = output_relation.columns[col]->column_length * sizeof(uint8_t);
+		break;
+	case ColumnType::VARCHAR:
+		FinalMaterializeString(input_relation, output_relation, col);
 		break;
 	default:
 		throw NotImplementedException("Unsupported column type");
@@ -197,8 +224,39 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 		if (input_relation.columns[col]->data_wrapper.data == nullptr) return SinkResultType::FINISHED;
 		// Final materialization
 		size_bytes = FinalMaterialize(input_relation, materialized_relation, col);
-		host_data[col] = allocator.AllocateData(size_bytes);
-		callCudaMemcpyDeviceToHost<uint8_t>(host_data[col], materialized_relation.columns[col]->data_wrapper.data, size_bytes, 0);
+
+		if(input_relation.columns[col]->data_wrapper.type != ColumnType::VARCHAR) {
+			host_data[col] = allocator.AllocateData(size_bytes);
+			callCudaMemcpyDeviceToHost<uint8_t>(host_data[col], materialized_relation.columns[col]->data_wrapper.data, size_bytes, 0);
+		} else {
+			DataWrapper materialized_col_data = materialized_relation.columns[col]->data_wrapper;
+			std::cout << "Got materalized col data with " << materialized_col_data.size << " and " << materialized_col_data.num_bytes << " chars" << std::endl;
+			
+			// Copy over the pointers from the gpu to the cpu
+			size_t offset_bytes = (materialized_col_data.size + 1) * sizeof(uint64_t);
+			uint64_t* cpu_offsets = reinterpret_cast<uint64_t*>(allocator.AllocateData(offset_bytes));
+			callCudaMemcpyDeviceToHost<uint64_t>(cpu_offsets, materialized_col_data.offset, materialized_col_data.size + 1, 0);
+			std::cout << "Got cpu offset of " << cpu_offsets[0] << "," << cpu_offsets[1] << std::endl;
+			materialized_col_data.offset = cpu_offsets;
+			
+			// Do the same for the chars
+			size_t data_bytes = materialized_col_data.num_bytes * sizeof(uint8_t);
+			uint8_t* cpu_chars = reinterpret_cast<uint8_t*>(allocator.AllocateData(data_bytes));
+			callCudaMemcpyDeviceToHost<uint8_t>(cpu_chars, materialized_col_data.data, data_bytes, 0);
+			materialized_col_data.data = cpu_chars;
+
+			// Copy over the data wrapper
+			materialized_relation.columns[col]->data_wrapper = materialized_col_data;
+			std::cout << "Copied over strings to the CPU with offset " << materialized_relation.columns[col]->data_wrapper.offset[0];
+			std::cout << " and chars " << materialized_relation.columns[col]->data_wrapper.data[0] << std::endl;
+
+			// for (int i = 0; i < materialized_col_data.size; i++) {
+			// 	std::string output_str(materialized_col_data.data + materialized_col_data.offset[i], materialized_col_data.data + materialized_col_data.offset[i + 1]);
+			// 	Value output_value(output_str);
+			// 	// printf("offset from %ld to %ld\n", cpu_offsets[i], cpu_offsets[i + 1]);
+			// 	std::cout << "Recording value " << output_value.ToString() << " for idx " << i << std::endl;
+			// }
+		}
 	}
 
 	ColumnDataAppendState append_state;
@@ -210,8 +268,27 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 		DataChunk chunk;
 		chunk.InitializeEmpty(types);
 		for (int col = 0; col < materialized_relation.columns.size(); col++) {
-			Vector vector = rawDataToVector(host_data[col], vec, materialized_relation.columns[col]->data_wrapper.type);
-			chunk.data[col].Reference(vector);
+			if(materialized_relation.columns[col]->data_wrapper.type != ColumnType::VARCHAR) {
+				Vector vector = rawDataToVector(host_data[col], vec, materialized_relation.columns[col]->data_wrapper.type);
+				chunk.data[col].Reference(vector);
+			} else {
+				//TODO: Need to optimize this part
+				DataWrapper str_col_data = materialized_relation.columns[col]->data_wrapper;
+				uint64_t num_output_records = std::min((size_t) STANDARD_VECTOR_SIZE, remaining);
+				Vector str_vector(LogicalType::VARCHAR, num_output_records);
+				std::cout << "Creating string vector with " << num_output_records << " records" << std::endl;
+
+				// Add the strings to the vector
+				uint64_t start_idx = materialized_relation.columns[0]->column_length - remaining;
+				for(int i = 0; i < num_output_records; i++) {
+					uint64_t offset_idx = start_idx + i;
+					std::string output_str(str_col_data.data + str_col_data.offset[offset_idx], str_col_data.data + str_col_data.offset[offset_idx + 1]);
+					Value output_value(output_str);
+					// std::cout << "Recording value " << output_value.ToString() << " for idx " << i << std::endl;
+					str_vector.SetValue(i, output_value);
+				}
+				chunk.data[col].Reference(str_vector);
+			}
 		}
 		if (remaining < STANDARD_VECTOR_SIZE) {
 			chunk.SetCardinality(remaining);
