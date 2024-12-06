@@ -1,0 +1,20 @@
+# name: test/sql/table_function/duckdb_extensions.test
+# description: Test duckdb_extensions function
+# group: [table_function]
+
+require no_extension_autoloading
+
+statement ok
+SELECT * FROM duckdb_extensions();
+
+query I
+SELECT aliases FROM duckdb_extensions() WHERE extension_name='postgres_scanner';
+----
+[postgres]
+
+require tpch
+
+query I
+SELECT extension_name FROM duckdb_extensions() WHERE loaded AND extension_name='tpch';
+----
+tpch

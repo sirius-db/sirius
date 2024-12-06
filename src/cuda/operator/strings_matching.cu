@@ -158,12 +158,16 @@ __global__ void multi_write_matching_rows(uint64_t* curr_term_answer, uint64_t n
   }
 }
 
-__global__ void testprintoffset(uint64_t* indices, uint64_t num_strings) {
-  if(threadIdx.x == 0 && blockIdx.x == 0) {
-    for(int i = 0; i < num_strings; i++) {
-      printf("Index %d: %ld\n", i, indices[i]);
-    }
-  }
+__global__ void test_print_strings(char* char_data, uint64_t* indices, uint64_t strings_to_print) {
+  uint64_t thread_id = threadIdx.x + blockIdx.x * blockDim.x;
+  if(thread_id >= strings_to_print) return; 
+
+  // Get the ptr and the length of the current string
+  uint64_t start_offset = indices[thread_id];
+  uint64_t end_offset = indices[thread_id + 1];
+  int string_length = (int) (end_offset - start_offset);
+  char* str_start = char_data + start_offset;
+  printf("GPU Idx %d has string of %.*s\n", (int) thread_id, string_length, str_start);
 }
 
 void StringMatching(char* char_data, uint64_t* str_indices, std::string match_string, uint64_t* &row_id, uint64_t* &count, uint64_t num_chars, uint64_t num_strings) {
@@ -174,6 +178,13 @@ void StringMatching(char* char_data, uint64_t* str_indices, std::string match_st
     count = h_count;
     return;
   }
+
+  // Print the metadata
+  uint64_t strings_to_print = 10;
+  uint64_t print_workers_needed = (strings_to_print + THREADS_PER_BLOCK_STRINGS - 1)/THREADS_PER_BLOCK_STRINGS;
+  test_print_strings<<<print_workers_needed, THREADS_PER_BLOCK_STRINGS>>>(char_data, str_indices, strings_to_print);
+  cudaDeviceSynchronize();
+  CHECK_ERROR();
 
   // Get the data from the metadata
   uint64_t workers_needed = (num_chars + CHUNK_SIZE - 1)/CHUNK_SIZE;

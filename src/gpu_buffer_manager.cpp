@@ -291,9 +291,17 @@ GPUBufferManager::allocateColumnBufferInCPU(unique_ptr<MaterializedQueryResult> 
         }
 		input_chunk = input->Fetch();
 	}
-    // for (int i = 0; i < 1000000; i++) {
-    //     printf("Data: %d\n", reinterpret_cast<int*>(result_wrapper.data)[i]);
-    // }
+    
+    char* string_chars = reinterpret_cast<char*>(result_wrapper.data);
+    for(uint64_t i = 0; i < 10; i++) {
+        // Get the current string 
+        uint64_t start_offset = result_wrapper.offset[i];
+        uint64_t end_offset = result_wrapper.offset[i + 1];
+        uint64_t string_length = end_offset - start_offset;
+        std::string curr_string(string_chars + start_offset, string_length);
+
+        std::cout << "allocateColumnBufferInCPU index " << i << " has string: " << curr_string << std::endl;
+    }
     return result_wrapper;
 }
 

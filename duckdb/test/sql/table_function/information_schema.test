@@ -1,0 +1,106 @@
+# name: test/sql/table_function/information_schema.test
+# description: Test information_schema functions
+# group: [table_function]
+
+require skip_reload
+
+
+statement ok
+SELECT * FROM INFORMATION_SCHEMA.SCHEMATA;
+
+statement ok
+SELECT * FROM information_schema.schemata;
+
+statement ok
+CREATE SCHEMA scheme;
+
+query I
+SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name='scheme'
+----
+1
+
+statement ok
+CREATE TABLE scheme.integers (i INTEGER);
+
+query T
+SELECT table_type FROM information_schema.tables WHERE table_schema='scheme' AND table_name='integers' AND table_catalog IS NOT NULL
+----
+BASE TABLE
+
+query ITT
+SELECT ordinal_position, column_name, data_type FROM information_schema.columns WHERE table_name='integers'
+----
+1	i	INTEGER
+
+query ITT
+SELECT ordinal_position, column_name, data_type FROM information_schema.columns WHERE table_name='integers'
+----
+1	i	INTEGER
+
+statement ok
+CREATE TEMPORARY TABLE reals (f FLOAT PRIMARY KEY, dec DECIMAL(16, 4), h HUGEINT, b BIGINT, t TINYINT, d DOUBLE NOT NULL)
+
+query T
+SELECT table_type FROM information_schema.tables WHERE table_catalog='temp' AND table_name='reals'
+----
+LOCAL TEMPORARY
+
+query IIT
+SELECT numeric_precision, numeric_scale, is_nullable FROM information_schema.columns WHERE table_name='reals' ORDER BY ordinal_position
+----
+24	0	NO
+16	4	YES
+128	0	YES
+64	0	YES
+8	0	YES
+53	0	NO
+
+statement ok
+CREATE VIEW scheme.vintegers AS SELECT * FROM scheme.integers;
+
+query T
+SELECT table_type FROM information_schema.tables WHERE table_schema='scheme' AND table_name='vintegers'
+----
+VIEW
+
+query T
+SELECT table_type FROM information_schema.tables WHERE table_schema='scheme' AND table_name='vintegers'
+----
+VIEW
+
+query ITT
+SELECT ordinal_position, column_name, data_type FROM information_schema.columns WHERE table_schema='scheme' AND table_name='vintegers' AND table_catalog IS NOT NULL
+----
+1	i	INTEGER
+
+statement ok
+DROP SCHEMA scheme CASCADE;
+
+query I
+SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name='scheme'
+----
+0
+
+query I
+SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='scheme'
+----
+0
+
+query I
+SELECT COUNT(*) FROM information_schema.columns WHERE table_schema='scheme'
+----
+0
+
+query IIII
+SELECT character_set_name, character_repertoire, form_of_use, default_collate_name FROM information_schema.character_sets
+----
+UTF8	UCS	UTF8	ucs_basic
+
+statement ok
+SELECT * FROM information_schema.referential_constraints
+
+statement ok
+SELECT * FROM information_schema.key_column_usage
+
+statement ok
+SELECT * FROM information_schema.table_constraints

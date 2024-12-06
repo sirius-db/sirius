@@ -55,3 +55,9 @@ group by
 
 ## Generating TPC-H dataset
 Checkout to the `bobbi/tpch` branch in the `new-crystal` repo and generate the tpch dataset from the `tpch_dataset_generator` directory. To load the dataset to duckdb, use the SQL command in `{SIRIUS_HOME_PATH}\tpch_load_duckdb_simple.sql`.
+
+Start using duckdb: `./build/release/duckdb tpch_s1.duckdb`. String Matching Query:
+```
+$ call gpu_caching("part.p_comment");
+$ call gpu_processing("SELECT p_comment FROM part WHERE p_comment LIKE '%wake%';");
+```

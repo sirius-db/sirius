@@ -219,6 +219,7 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 	Allocator& allocator = Allocator::DefaultAllocator();
 	uint8_t** host_data = new uint8_t*[input_relation.columns.size()];
 	GPUIntermediateRelation materialized_relation(input_relation.columns.size());
+	string_t* all_duckdb_strings;
 	for (int col = 0; col < input_relation.columns.size(); col++) {
 		// TODO: Need to fix this for the future, but for now, we will just return when there is null column
 		if (input_relation.columns[col]->data_wrapper.data == nullptr) return SinkResultType::FINISHED;
@@ -250,12 +251,16 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 			std::cout << "Copied over strings to the CPU with offset " << materialized_relation.columns[col]->data_wrapper.offset[0];
 			std::cout << " and chars " << materialized_relation.columns[col]->data_wrapper.data[0] << std::endl;
 
-			// for (int i = 0; i < materialized_col_data.size; i++) {
-			// 	std::string output_str(materialized_col_data.data + materialized_col_data.offset[i], materialized_col_data.data + materialized_col_data.offset[i + 1]);
-			// 	Value output_value(output_str);
-			// 	// printf("offset from %ld to %ld\n", cpu_offsets[i], cpu_offsets[i + 1]);
-			// 	std::cout << "Recording value " << output_value.ToString() << " for idx " << i << std::endl;
-			// }
+			// Create a vector of all the strings
+			DataWrapper strings_data_wrapper = materialized_relation.columns[col]->data_wrapper;
+			char* str_all_chars = reinterpret_cast<char*>(strings_data_wrapper.data);
+			size_t num_strings = strings_data_wrapper.size;
+			all_duckdb_strings = new string_t[num_strings];
+			for(size_t i = 0; i < num_strings; i++) {
+				int str_start_offset = strings_data_wrapper.offset[i];
+				int curr_str_length = strings_data_wrapper.offset[i + 1] - str_start_offset;
+				all_duckdb_strings[i] = string_t(str_all_chars + str_start_offset, curr_str_length);
+			}
 		}
 	}
 
@@ -272,21 +277,9 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 				Vector vector = rawDataToVector(host_data[col], vec, materialized_relation.columns[col]->data_wrapper.type);
 				chunk.data[col].Reference(vector);
 			} else {
-				//TODO: Need to optimize this part
-				DataWrapper str_col_data = materialized_relation.columns[col]->data_wrapper;
-				uint64_t num_output_records = std::min((size_t) STANDARD_VECTOR_SIZE, remaining);
-				Vector str_vector(LogicalType::VARCHAR, num_output_records);
-				std::cout << "Creating string vector with " << num_output_records << " records" << std::endl;
-
 				// Add the strings to the vector
 				uint64_t start_idx = materialized_relation.columns[0]->column_length - remaining;
-				for(int i = 0; i < num_output_records; i++) {
-					uint64_t offset_idx = start_idx + i;
-					std::string output_str(str_col_data.data + str_col_data.offset[offset_idx], str_col_data.data + str_col_data.offset[offset_idx + 1]);
-					Value output_value(output_str);
-					// std::cout << "Recording value " << output_value.ToString() << " for idx " << i << std::endl;
-					str_vector.SetValue(i, output_value);
-				}
+				Vector str_vector(LogicalType::VARCHAR, reinterpret_cast<data_ptr_t>(all_duckdb_strings + start_idx));
 				chunk.data[col].Reference(str_vector);
 			}
 		}

@@ -1,0 +1,24 @@
+# name: test/sql/catalog/did_you_mean.test
+# description: The error messages suggest possible alternative
+# group: [catalog]
+
+require skip_reload
+
+statement ok
+CREATE TABLE hello(i INTEGER);
+
+statement ok
+CREATE SCHEMA test;
+
+statement ok
+CREATE TABLE test.bye(i INTEGER);
+
+statement error
+SELECT * FROM helloo;
+----
+Did you mean "hello"
+
+statement error
+SELECT * FROM bye;
+----
+Did you mean "test.bye
