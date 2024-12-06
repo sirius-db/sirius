@@ -32,7 +32,7 @@ __global__ void materialize_expression(const T *a, T* result, uint64_t *row_ids,
 template <typename T>
 __global__ void testprintmat(T* a, uint64_t N) {
     if (blockIdx.x == 0 && threadIdx.x == 0) {
-        for (uint64_t i = N - 1000; i < N; i++) {
+        for (uint64_t i = 0; i < N; i++) {
             printf("%lu ", a[i]);
         }
         printf("\n");
@@ -45,6 +45,7 @@ __global__ void materialize_offset(uint64_t* offset, uint64_t* result_length, ui
         uint64_t copy_row_id = row_ids[tid];
         uint64_t new_length = offset[copy_row_id + 1] - offset[copy_row_id];
         result_length[tid] = new_length;
+        // printf("%ld %ld\n", tid, result_length[tid]);
         // printf("SET MATERALIZE: Copy Row Id - %d, New Len - %d, New Offset - %d\n", copy_row_id, new_length, materalized_offsets[tid]);
     }
 }
@@ -56,7 +57,7 @@ __global__ void materialize_string(uint8_t* data, uint8_t* result, uint64_t* inp
         uint64_t input_start_idx = input_offset[copy_row_id];
         uint64_t input_length = input_offset[copy_row_id + 1] - input_offset[copy_row_id];
         uint64_t output_start_idx = materialized_offset[tid];
-        // printf("CHARS COPY: Copy Row Id - %d, Src Start Idx - %d, Src Length - %d, Dst Write Idx - %d\n", copy_row_id, input_start_idx, input_length, output_start_idx);
+        // printf("CHARS COPY: Copy Row Id - %ld, Src Start Idx - %ld, Src Length - %ld, Dst Write Idx - %ld\n", copy_row_id, input_start_idx, input_length, output_start_idx);
         memcpy(result + output_start_idx, data + input_start_idx, input_length * sizeof(uint8_t));
     }
 }
@@ -135,9 +136,11 @@ void materializeString(uint8_t* data, uint64_t* offset, uint8_t* &result, uint64
     cub::DeviceScan::ExclusiveSum(d_temp_storage, temp_storage_bytes, temp_len, result_offset, N + 1);
     CHECK_ERROR();
 
+    // testprintmat<uint64_t><<<1, 1>>>(result_offset, N + 1);
+
     new_num_bytes = new uint64_t[1];
     cudaMemcpy(new_num_bytes, result_offset + N, sizeof(uint64_t), cudaMemcpyDeviceToHost);
-    std::cout << "Got new chars len of " << new_num_bytes[0] << std::endl;
+    // std::cout << "Got new chars len of " << new_num_bytes[0] << std::endl;
 
     CHECK_ERROR();
 

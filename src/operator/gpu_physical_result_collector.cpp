@@ -125,7 +125,7 @@ GPUPhysicalMaterializedCollector::FinalMaterializeString(GPUIntermediateRelation
 
 		materializeString(data, offset, result, result_offset, row_ids, new_num_bytes, num_rows);
 
-		output_relation.columns[col] = new GPUColumn(num_rows, ColumnType::VARCHAR, reinterpret_cast<uint8_t*>(result), offset, new_num_bytes[0], true);
+		output_relation.columns[col] = new GPUColumn(num_rows, ColumnType::VARCHAR, reinterpret_cast<uint8_t*>(result), result_offset, new_num_bytes[0], true);
 		output_relation.columns[col]->row_id_count = 0;
 		output_relation.columns[col]->row_ids = nullptr;
 	} else {

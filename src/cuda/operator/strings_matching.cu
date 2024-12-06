@@ -251,6 +251,8 @@ void StringMatching(char* char_data, uint64_t* str_indices, std::string match_st
   CHECK_ERROR();
   printf("Got num matching rows of %ld\n", h_count[0]);
 
+  // testprintoffset<<<1, 1>>>(d_matching_rows, h_count[0]);
+
   // Check there are no errors
   cudaDeviceSynchronize();
   row_id = d_matching_rows;
