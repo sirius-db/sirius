@@ -25,6 +25,31 @@ ResolveTypeMaterializeExpression(GPUColumn* column, BoundReferenceExpression& bo
 }
 
 GPUColumn* 
+ResolveTypeMaterializeString(GPUColumn* column, BoundReferenceExpression& bound_ref, GPUBufferManager* gpuBufferManager) {
+    size_t size;
+    uint8_t* a;
+    uint64_t* result_offset; 
+    uint64_t* new_num_bytes;
+    if (column->data_wrapper.data == nullptr) {
+        return new GPUColumn(column->column_length, column->data_wrapper.type, nullptr, nullptr, column->data_wrapper.num_bytes, column->data_wrapper.is_string_data);
+    }
+    if (column->row_ids != nullptr) {
+		// Late materalize the input relationship
+		uint8_t* data = column->data_wrapper.data;
+		uint64_t* offset = column->data_wrapper.offset;
+		uint64_t* row_ids = column->row_ids;
+		size = column->row_id_count;
+		materializeString(data, offset, a, result_offset, row_ids, new_num_bytes, size);
+    } else {
+        a = column->data_wrapper.data;
+        result_offset = column->data_wrapper.offset;
+        size = column->column_length;
+    }
+    GPUColumn* result = new GPUColumn(size, column->data_wrapper.type, reinterpret_cast<uint8_t*>(a), result_offset, new_num_bytes[0], column->data_wrapper.is_string_data);
+    return result;
+}
+
+GPUColumn* 
 HandleMaterializeExpression(GPUColumn* column, BoundReferenceExpression& bound_ref, GPUBufferManager* gpuBufferManager) {
     switch(column->data_wrapper.type) {
         case ColumnType::INT32:
@@ -37,6 +62,8 @@ HandleMaterializeExpression(GPUColumn* column, BoundReferenceExpression& bound_r
             return ResolveTypeMaterializeExpression<double>(column, bound_ref, gpuBufferManager);
         case ColumnType::BOOLEAN:
             return ResolveTypeMaterializeExpression<uint8_t>(column, bound_ref, gpuBufferManager);
+        case ColumnType::VARCHAR:
+            return ResolveTypeMaterializeString(column, bound_ref, gpuBufferManager);
         default:
             throw NotImplementedException("Unsupported column type");
     }

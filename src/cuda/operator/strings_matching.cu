@@ -86,9 +86,8 @@ __global__ void write_matching_rows(bool* results, uint64_t num_strings, uint64_
   uint64_t start_idx = threadIdx.x + blockIdx.x * blockDim.x;
   for(uint64_t i = start_idx; i < num_strings; i += tile_size) {
     if(results[i]) {
-      uint64_t write_offset = atomicAdd(reinterpret_cast<unsigned long long int*>(count), 
-        static_cast<unsigned long long int>(1));
-      matching_rows[write_offset] = static_cast<uint64_t>(i);
+      uint64_t write_offset = atomicAdd(reinterpret_cast<unsigned long long int*>(count), 1);
+      matching_rows[write_offset] = i;
     }
   }
 }
@@ -229,6 +228,18 @@ void StringMatching(char* char_data, uint64_t* str_indices, std::string match_st
     d_answers, match_length, workers_needed, CHUNK_SIZE, block_sub_chunk_size, last_char, num_strings);
   cudaDeviceSynchronize();
   CHECK_ERROR();
+
+  bool* h_answers = reinterpret_cast<bool*> (gpuBufferManager->customCudaHostAlloc<uint8_t>(num_strings));
+  cudaMemcpy(h_answers, d_answers, num_strings * sizeof(bool), cudaMemcpyDeviceToHost);
+  CHECK_ERROR();
+
+  uint64_t count_answer = 0;
+  for (int i = 0; i < num_strings; i++) {
+    if (h_answers[i]) {
+      count_answer++;
+    }
+  }
+  printf("Got num matching rows of %ld\n", count_answer);
 
   // Write the matching rows
   uint64_t num_match_blocks = max((uint64_t) 1, (num_strings + THREADS_PER_BLOCK_STRINGS - 1)/(THREADS_PER_BLOCK_STRINGS * TILE_ITEMS_PER_TILE));

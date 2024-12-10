@@ -84,7 +84,7 @@ GPUColumn::GPUColumn(string _name, size_t _column_length, ColumnType type, uint8
     column_length = _column_length;
     data_wrapper = DataWrapper(type, data, offset, _column_length, num_bytes, is_string_data);
     row_ids = nullptr;
-    isString = is_string_data;
+    // isString = is_string_data;
     if (is_string_data) {
         data_wrapper.num_bytes = num_bytes;
     } else {
@@ -96,7 +96,7 @@ GPUColumn::GPUColumn(size_t _column_length, ColumnType type, uint8_t* data, uint
     column_length = _column_length;
     data_wrapper = DataWrapper(type, data, offset, _column_length, num_bytes, is_string_data);
     row_ids = nullptr;
-    isString = is_string_data;
+    // isString = is_string_data;
     if (is_string_data) {
         data_wrapper.num_bytes = num_bytes;
     } else {
@@ -110,7 +110,7 @@ GPUColumn::GPUColumn(const GPUColumn& other) {
     row_ids = other.row_ids;
     row_id_count = other.row_id_count;
     column_length = other.column_length;
-    isString = other.isString;
+    // isString = other.isString;
 }
 
 GPUIntermediateRelation::GPUIntermediateRelation(size_t column_count) :
