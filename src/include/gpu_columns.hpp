@@ -56,7 +56,7 @@ public:
     size_t column_length;
     // bool isNull;
     bool isUnique;
-    bool isString{false};
+    // bool isString{false};
 };
 
 class GPUIntermediateRelation {
