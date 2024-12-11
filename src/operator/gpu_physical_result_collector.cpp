@@ -276,7 +276,7 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 				DataWrapper str_col_data = materialized_relation.columns[col]->data_wrapper;
 				uint64_t num_output_records = std::min((size_t) STANDARD_VECTOR_SIZE, remaining);
 				Vector str_vector(LogicalType::VARCHAR, num_output_records);
-				std::cout << "Creating string vector with " << num_output_records << " records" << std::endl;
+				// std::cout << "Creating string vector with " << num_output_records << " records" << std::endl;
 
 				// Add the strings to the vector
 				uint64_t start_idx = materialized_relation.columns[0]->column_length - remaining;
