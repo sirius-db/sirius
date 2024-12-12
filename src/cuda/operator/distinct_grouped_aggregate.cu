@@ -126,6 +126,7 @@ __global__ void rows_to_columns(sort_keys_type *row_keys, T** col_keys, uint64_t
         if (threadIdx.x + ITEM * B < num_tile_items) {
             uint64_t offset = tile_offset + threadIdx.x + ITEM * B;
             for (int i = 0; i < num_keys; i++) {
+                // printf("Offset: %lu, Key[%d]: %lu\n", offset, i, row_keys[offset].keys[i]);
                 col_keys[i][offset] = row_keys[offset].keys[i];
             }
         }
@@ -223,6 +224,7 @@ void groupedDistinctAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t
     CHECK_ERROR();
     sort_keys_type* group_by_rows = reinterpret_cast<sort_keys_type*> (gpuBufferManager->customCudaMalloc<pointer_and_key>(N, 0, 0));
     uint64_t* d_num_runs_out = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+    cudaMemset(d_num_runs_out, 0, sizeof(uint64_t));
     uint64_t* h_count = new uint64_t[1];
 
     for (int agg = 0; agg < num_aggregates; agg++) {

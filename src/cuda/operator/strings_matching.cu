@@ -98,9 +98,8 @@ __global__ void write_matching_rows(bool* results, uint64_t num_strings, uint64_
   uint64_t start_idx = threadIdx.x + blockIdx.x * blockDim.x;
   for(uint64_t i = start_idx; i < num_strings; i += tile_size) {
     if(results[i]) {
-      uint64_t write_offset = atomicAdd(reinterpret_cast<unsigned long long int*>(count), 
-        static_cast<unsigned long long int>(1));
-      matching_rows[write_offset] = static_cast<uint64_t>(i);
+      uint64_t write_offset = atomicAdd(reinterpret_cast<unsigned long long int*>(count), 1);
+      matching_rows[write_offset] = i;
     }
   }
 }
@@ -278,6 +277,112 @@ __global__ void multi_write_matching_rows(uint64_t* curr_term_answer, uint64_t n
   }
 }
 
+<<<<<<< HEAD
+=======
+__global__ void testprintoffset(uint64_t* indices, uint64_t num_strings) {
+  if(threadIdx.x == 0 && blockIdx.x == 0) {
+    for(int i = 0; i < num_strings; i++) {
+      printf("Index %d: %ld\n", i, indices[i]);
+    }
+  }
+}
+
+void StringMatching(char* char_data, uint64_t* str_indices, std::string match_string, uint64_t* &row_id, uint64_t* &count, uint64_t num_chars, uint64_t num_strings) {
+  GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+  if (num_strings == 0) {
+    uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
+    h_count[0] = 0;
+    count = h_count;
+    return;
+  }
+
+  // Get the data from the metadata
+  uint64_t workers_needed = (num_chars + CHUNK_SIZE - 1)/CHUNK_SIZE;
+  std::cout << "Running single term string matching for " << num_strings << " strings and " << num_chars << " chars using " << workers_needed << " workers" << std::endl;
+
+  // Compute the automato for this string
+  const int match_length = match_string.size();
+  const char* match_char = match_string.c_str();
+  int kmp_automato_size = match_length * CHARS_IN_BYTE;
+  int* kmp_automato = new int[kmp_automato_size];
+  std::memset(kmp_automato, 0, kmp_automato_size * sizeof(int));
+  int first_idx = (int) match_char[0] + CHAR_INCREMENT;
+  kmp_automato[first_idx] = 1;
+  for(int X = 0, j = 1; j < match_length; j++) {
+    int curr_idx = (int) match_char[j] + CHAR_INCREMENT;
+
+    // Copy over the chars from the previous automato
+    for(int c = 0; c < CHARS_IN_BYTE; c++) {
+        kmp_automato[j * CHARS_IN_BYTE + c] = kmp_automato[X * CHARS_IN_BYTE + c];
+    }
+    kmp_automato[j * CHARS_IN_BYTE + curr_idx] = j + 1;
+    X = kmp_automato[X * CHARS_IN_BYTE + curr_idx];
+  }
+
+  // Allocate the buffers we need
+  char* d_match_str = gpuBufferManager->customCudaMalloc<char>(match_string.length(), 0, 0);
+  int* d_kmp_automato = gpuBufferManager->customCudaMalloc<int>(kmp_automato_size, 0, 0);
+  uint64_t* d_worker_start_term = gpuBufferManager->customCudaMalloc<uint64_t>(workers_needed, 0, 0);
+  bool* d_answers = reinterpret_cast<bool*> (gpuBufferManager->customCudaMalloc<uint8_t>(num_strings, 0, 0));
+  // TODO: Do it twice for more accurate allocation
+  uint64_t* d_matching_rows = gpuBufferManager->customCudaMalloc<uint64_t>(num_strings, 0, 0);
+
+  // Copy over the data to the buffers
+  cudaMemcpy(d_kmp_automato, kmp_automato, kmp_automato_size * sizeof(int), cudaMemcpyHostToDevice);
+
+  // Also set the initial values
+  cudaMemset(d_matching_rows, 0, num_strings * sizeof(uint64_t));
+  cudaMemset(count, 0, sizeof(uint64_t));
+  CHECK_ERROR();
+  
+  // Set the start terms
+  uint64_t last_char = num_chars - 1;
+  uint64_t kernel_block_needed = (workers_needed + THREADS_PER_BLOCK_STRINGS - 1)/THREADS_PER_BLOCK_STRINGS;
+  uint64_t block_sub_chunk_size = (CHUNK_SIZE + THREADS_PER_BLOCK_STRINGS - 1)/THREADS_PER_BLOCK_STRINGS;
+
+  CHECK_ERROR();
+  std::cout << "Determined kernel blocks of " << kernel_block_needed << " and sub chunk size of " << block_sub_chunk_size << std::endl;
+  determine_start_kernel<<<kernel_block_needed, THREADS_PER_BLOCK_STRINGS>>>(str_indices, num_strings, d_worker_start_term, 
+            workers_needed, CHUNK_SIZE, last_char);
+  CHECK_ERROR();
+
+  single_term_kmp_kernel<<<workers_needed, THREADS_PER_BLOCK_STRINGS>>>(char_data, str_indices, d_kmp_automato, d_worker_start_term, 
+    d_answers, match_length, workers_needed, CHUNK_SIZE, block_sub_chunk_size, last_char, num_strings);
+  cudaDeviceSynchronize();
+  CHECK_ERROR();
+
+  bool* h_answers = reinterpret_cast<bool*> (gpuBufferManager->customCudaHostAlloc<uint8_t>(num_strings));
+  cudaMemcpy(h_answers, d_answers, num_strings * sizeof(bool), cudaMemcpyDeviceToHost);
+  CHECK_ERROR();
+
+  uint64_t count_answer = 0;
+  for (int i = 0; i < num_strings; i++) {
+    if (h_answers[i]) {
+      count_answer++;
+    }
+  }
+  printf("Got num matching rows of %ld\n", count_answer);
+
+  // Write the matching rows
+  uint64_t num_match_blocks = max((uint64_t) 1, (num_strings + THREADS_PER_BLOCK_STRINGS - 1)/(THREADS_PER_BLOCK_STRINGS * TILE_ITEMS_PER_TILE));
+  write_matching_rows<<<num_match_blocks, THREADS_PER_BLOCK_STRINGS>>>(d_answers, num_strings, d_matching_rows, count);
+  CHECK_ERROR();
+
+  uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
+  cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+  CHECK_ERROR();
+  printf("Got num matching rows of %ld\n", h_count[0]);
+
+  // testprintoffset<<<1, 1>>>(d_matching_rows, h_count[0]);
+
+  // Check there are no errors
+  cudaDeviceSynchronize();
+  row_id = d_matching_rows;
+  count = h_count;
+  printf("Finished single term string matching\n");
+}
+
+>>>>>>> 7b4e481207a7b670aa9b5af81811b6b4c14792ef
 void MultiStringMatching(char* char_data, uint64_t* str_indices, std::vector<std::string> all_terms,
        uint64_t* &row_id, uint64_t* &count, uint64_t num_chars, uint64_t num_strings) {
   GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
