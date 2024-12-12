@@ -1,6 +1,7 @@
 #include "gpu_buffer_manager.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/types.hpp"
+#include "utils.hpp"
 
 #define NUM_GPUS 1
 
@@ -68,6 +69,8 @@ GPUBufferManager::GPUBufferManager(size_t cache_size_per_gpu, size_t processing_
         gpuProcessingPointer[gpu] = 0;
         gpuCachingPointer[gpu] = 0;
     }
+
+    warmup_gpu();
 }
 
 GPUBufferManager::~GPUBufferManager() {
