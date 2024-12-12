@@ -32,6 +32,4 @@ from (
     and p_type = 103
   ) as all_nations
 group by
-  o_year
-order by
   o_year;
