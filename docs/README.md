@@ -56,8 +56,53 @@ group by
 ## Generating TPC-H dataset
 Checkout to the `bobbi/tpch` branch in the `new-crystal` repo and generate the tpch dataset from the `tpch_dataset_generator` directory. To load the dataset to duckdb, use the SQL command in `{SIRIUS_HOME_PATH}\tpch_load_duckdb_simple.sql`.
 
-Start using duckdb: `./build/release/duckdb tpch_s1.duckdb`. String Matching Query:
+
+## Devesh Notes
+We have provided a helper docker container that you can easily use to install all the depedencies:
+```
+$ cd ..
+$ export CURRENT_DIR=`pwd`
+$ cd sirius
+$ docker build -t sirius:latest docker/.
+$ docker kill sirius
+$ docker rm sirius
+$ docker run --gpus all -d -v $CURRENT_DIR:/working_dir/ --name=sirius --cap-add=SYS_ADMIN sirius:latest sleep infinity
+$ docker exec -it sirius bash
+$ cd sirius
+```
+
+Build the code:
+```
+$ make -j$(nproc)
+```
+
+Start duckdb using: `./build/release/duckdb tpch_s1.duckdb`. 
+
+Example table creator:
+```
+$ CREATE TABLE example_strs(record VARCHAR);
+$ INSERT INTO example_strs (record) VALUES ('hello world');
+$ INSERT INTO example_strs (record) VALUES ('lorem ipsum');
+$ INSERT INTO example_strs (record) VALUES ('running example values');
+```
+
+String Matching queries:
+```
+$ SELECT record FROM example_strs;
+$ call gpu_caching("example_strs.record");
+$ call gpu_processing("select record from example_strs;");
+$ call gpu_processing("select record FROM example_strs WHERE record LIKE '%hello%';");
+$ call gpu_processing("select record FROM example_strs WHERE record LIKE '%lorem%ipsum%';");
+```
+
+Substring Queries:
 ```
 $ call gpu_caching("part.p_comment");
 $ call gpu_processing("SELECT p_comment FROM part WHERE p_comment LIKE '%wake%';");
+$ call gpu_processing("SELECT substring(p_comment, 1, 4) FROM part;");
+```
+
+Duck DB query:
+```
+$ SELECT p_partkey, p_comment FROM part WHERE p_comment LIKE '%wake%' ORDER BY p_partkey DESC LIMIT 50;
 ```
