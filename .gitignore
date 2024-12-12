@@ -8,6 +8,7 @@ test/python/__pycache__/
 .Rhistory
 tpch-data/dbgen
 .vscode/
-my_database.duckdb
+*.duckdb
+duckdb/*
 CMakeFiles/
 CMakeCache.txt
