@@ -54,7 +54,13 @@ group by
 ```
 
 ## Generating TPC-H dataset
-Checkout to the `bobbi/tpch` branch in the `new-crystal` repo and generate the tpch dataset from the `tpch_dataset_generator` directory. To load the dataset to duckdb, use the SQL command in `{SIRIUS_HOME_PATH}\tpch_load_duckdb_simple.sql`.
+Unzip `dbgen.zip` and run `./dbgen -s {SF}`.
+To load the dataset to duckdb, use the SQL command in `{SIRIUS_HOME_PATH}\tpch_load_duckdb_simple.sql`.
+
+## Running the queries
+The TPC-H queries is in the `queries` folder.
+Queries in the `queries/working` folder should work in Sirius. These queries does not include string and order by operations
+Queries in the `queries/inprogress` folder is still under development.
 
 ## Devesh Notes
 We have provided a helper docker container that you can easily use to install all the depedencies:
@@ -105,4 +111,3 @@ Duck DB query:
 ```
 $ SELECT p_partkey, p_comment FROM part WHERE p_comment LIKE '%wake%' ORDER BY p_partkey DESC LIMIT 50;
 ```
->>>>>>> 61c945a (String matching is now correct and fast)
