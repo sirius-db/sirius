@@ -58,8 +58,8 @@ Unzip `dbgen.zip` and run `./dbgen -s {SF}`.
 To load the dataset to duckdb, use the SQL command in `{SIRIUS_HOME_PATH}\tpch_load_duckdb_simple.sql`.
 
 ## Running the queries
-The TPC-H queries is in the `queries` folder.
-Queries in the `queries/working` folder should work in Sirius. These queries does not include string and order by operations
+The TPC-H queries is in the `queries` folder. 
+Queries in the `queries/working` folder should work in Sirius (These queries does not include string and order by operations).
 Queries in the `queries/inprogress` folder is still under development.
 
 ## Devesh Notes
