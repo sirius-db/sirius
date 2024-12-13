@@ -1,6 +1,7 @@
 #include "gpu_expression_executor.hpp"
 #include "operator/gpu_materialize.hpp"
 #include "operator/gpu_physical_strings_matching.hpp"
+#include "operator/gpu_physical_substring.hpp"
 
 namespace duckdb {
 
@@ -463,11 +464,15 @@ GPUExpressionExecutor::ProjectionRecursiveExpression(GPUIntermediateRelation& in
         } case ExpressionClass::BOUND_FUNCTION: {
               printf("Executing function expression\n");
               auto &bound_function = expr.Cast<BoundFunctionExpression>();
-              // for (auto &child : bound_function.children) {
-              //     ProjectionRecursiveExpression(input_relation, output_relation, *child, output_idx, depth + 1);
-              // }
-
-              if (bound_function.children[1]->expression_class == ExpressionClass::BOUND_CONSTANT) {
+              if(bound_function.ToString().find("substring") != std::string::npos) {
+                auto &bound_ref1 = bound_function.children[0]->Cast<BoundReferenceExpression>();
+                auto &bound_ref2 = bound_function.children[1]->Cast<BoundConstantExpression>();
+                auto &bound_ref3 = bound_function.children[2]->Cast<BoundConstantExpression>();
+                GPUColumn* input_column = input_relation.columns[bound_ref1.index];
+                uint64_t start_idx = bound_ref2.value.GetValue<uint64_t>();
+                uint64_t length = bound_ref3.value.GetValue<uint64_t>();
+                HandleSubString(input_column, start_idx, length);
+              } else if (bound_function.children[1]->expression_class == ExpressionClass::BOUND_CONSTANT) {
                   auto &bound_ref1 = bound_function.children[0]->Cast<BoundReferenceExpression>();
                   auto &bound_ref2 = bound_function.children[1]->Cast<BoundConstantExpression>();
                   GPUColumn* materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref1.index], bound_ref1, gpuBufferManager);
@@ -492,7 +497,12 @@ GPUExpressionExecutor::ProjectionRecursiveExpression(GPUIntermediateRelation& in
     }
     printf("Writing projection result to idx %ld\n", output_idx);
     if (depth == 0) {
-        if (expr.expression_class == ExpressionClass::BOUND_REF) {
+        if(expr.expression_class == ExpressionClass::BOUND_FUNCTION) {
+          std::cout << "Copying the BOUND_FUNCTION column" << std::endl;
+          auto &bound_function = expr.Cast<BoundFunctionExpression>();
+          auto &bound_ref1 = bound_function.children[0]->Cast<BoundReferenceExpression>();
+          output_relation.columns[output_idx] = input_relation.columns[bound_ref1.index];
+        } else if (expr.expression_class == ExpressionClass::BOUND_REF) {
             output_relation.columns[output_idx] = input_relation.columns[expr.Cast<BoundReferenceExpression>().index];
             // printf("size = %ld\n", output_relation.columns[output_idx]->column_length);
             // printf("row ids count = %ld\n", output_relation.columns[output_idx]->row_id_count);
