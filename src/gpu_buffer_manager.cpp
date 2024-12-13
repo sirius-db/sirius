@@ -108,16 +108,22 @@ GPUBufferManager::customCudaMalloc(size_t size, int gpu, bool caching) {
     if (caching) {
         size_t start = __atomic_fetch_add(&gpuCachingPointer[gpu], alloc, __ATOMIC_RELAXED);
         assert((start + alloc) < cache_size_per_gpu);
+        if (start + alloc >= cache_size_per_gpu) {
+            throw InvalidInputException("Out of GPU caching memory");
+        }
         T* ptr = reinterpret_cast<T*>(gpuCache[gpu] + start);
         if (reinterpret_cast<uintptr_t>(ptr) % alignof(double) != 0) {
             throw InvalidInputException("Memory is not properly aligned");
         } 
         return ptr;
     } else {
-        // printf("Allocating %d bytes\n", alloc);
-        // printf("Current pointer %d\n", gpuProcessingPointer[gpu]);
+        printf("Allocating %ld bytes\n", alloc);
         size_t start = __atomic_fetch_add(&gpuProcessingPointer[gpu], alloc, __ATOMIC_RELAXED);
+        printf("Current pointer %ld\n", gpuProcessingPointer[gpu]);
         assert((start + alloc) < processing_size_per_gpu);
+        if (start + alloc >= processing_size_per_gpu) {
+            throw InvalidInputException("Out of GPU processing memory");
+        }
         // printf("Allocating %d bytes at %d\n", alloc, start);
         // printf("Current pointer %d\n", gpuProcessingPointer[gpu]);
         T* ptr = reinterpret_cast<T*>(gpuProcessing[gpu] + start);
@@ -134,6 +140,9 @@ GPUBufferManager::customCudaHostAlloc(size_t size) {
 	size_t alloc = (size * sizeof(T));
 	size_t start = __atomic_fetch_add(&cpuProcessingPointer, alloc, __ATOMIC_RELAXED);
 	assert((start + alloc) < processing_size_per_cpu);
+    if (start + alloc >= processing_size_per_cpu) {
+        throw InvalidInputException("Out of CPU memory");
+    }
 	return reinterpret_cast<T*>(cpuProcessing + start);
 };
 
@@ -297,6 +306,7 @@ GPUBufferManager::allocateColumnBufferInCPU(unique_ptr<MaterializedQueryResult> 
     // for (int i = 0; i < 1000000; i++) {
     //     printf("Data: %d\n", reinterpret_cast<int*>(result_wrapper.data)[i]);
     // }
+    printf("Done allocating column buffer in CPU\n");
     return result_wrapper;
 }
 
@@ -413,6 +423,7 @@ GPUBufferManager::cacheDataInGPU(DataWrapper cpu_data, string table_name, string
     tables[up_table_name]->columns[column_idx]->data_wrapper = gpu_allocated_buffer;
     tables[up_table_name]->columns[column_idx]->column_length = gpu_allocated_buffer.size;
     tables[up_table_name]->length = gpu_allocated_buffer.size;
+    printf("Data cached in GPU\n");
 }
 
 void
@@ -438,6 +449,7 @@ GPUBufferManager::createTableAndColumnInGPU(Catalog& catalog, ClientContext& con
     } else {
         throw InvalidInputException("Column already exists");
     }
+    printf("Table and column created in GPU\n");
 }
 
 void

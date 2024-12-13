@@ -425,16 +425,12 @@ void groupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count,
 
                 CHECK_ERROR();
 
-                printf("Reduce by key avg\n");
-
                 aggregate_star_temp[agg] = gpuBufferManager->customCudaMalloc<uint64_t>(N, 0, 0);
                 fill_n<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(aggregate_star_temp[agg], 1, N);
 
                 uint64_t* agg_star_out = gpuBufferManager->customCudaMalloc<uint64_t>(N, 0, 0);
                 cudaMemset(agg_star_out, 0, N * sizeof(uint64_t));
                 cudaMemset(d_num_runs_out, 0, sizeof(uint64_t));
-
-                printf("Reduce by key avg\n");
 
                 d_temp_storage = nullptr;
                 temp_storage_bytes = 0;
@@ -459,12 +455,8 @@ void groupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count,
                 cudaMemcpy(h_count, d_num_runs_out, sizeof(uint64_t), cudaMemcpyDeviceToHost);
                 count[0] = h_count[0];
 
-                printf("Reduce by key avg\n");
-
                 V* output = gpuBufferManager->customCudaMalloc<V>(count[0], 0, 0);
                 divide<V, BLOCK_THREADS, ITEMS_PER_THREAD><<<(count[0] + tile_items - 1)/tile_items, BLOCK_THREADS>>>(agg_out, agg_star_out, output, count[0]);
-
-                printf("Reduce by key avg\n");
 
                 CHECK_ERROR();
                 aggregate_keys[agg] = reinterpret_cast<uint8_t*> (output);
