@@ -115,6 +115,11 @@ __global__ void print_matching_rows(uint64_t* indices, uint64_t total_strings, u
 }
 
 void StringMatching(char* char_data, uint64_t* str_indices, std::string match_string, uint64_t* &row_id, uint64_t* &count, uint64_t num_chars, uint64_t num_strings) {
+  CHECK_ERROR();
+  if (num_strings == 0) {
+      printf("N is 0\n");
+      return;
+  }
   GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
   if (num_strings == 0) {
     uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
@@ -279,6 +284,11 @@ __global__ void multi_write_matching_rows(uint64_t* curr_term_answer, uint64_t n
 
 void MultiStringMatching(char* char_data, uint64_t* str_indices, std::vector<std::string> all_terms,
        uint64_t* &row_id, uint64_t* &count, uint64_t num_chars, uint64_t num_strings) {
+  CHECK_ERROR();
+  if (num_strings == 0) {
+      printf("N is 0\n");
+      return;
+  }
   GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
   if (num_strings == 0) {
     uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);

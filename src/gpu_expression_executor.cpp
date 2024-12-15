@@ -464,6 +464,7 @@ GPUExpressionExecutor::ProjectionRecursiveExpression(GPUIntermediateRelation& in
                 auto &bound_ref3 = bound_function.children[2]->Cast<BoundConstantExpression>();
                 GPUColumn* input_column = input_relation.columns[bound_ref1.index];
                 uint64_t start_idx = bound_ref2.value.GetValue<uint64_t>();
+                if (start_idx < 1) throw InvalidInputException("Start index should be greater than 0");
                 uint64_t length = bound_ref3.value.GetValue<uint64_t>();
                 GPUColumn* materialized_column = HandleMaterializeExpression(input_column, bound_ref1, gpuBufferManager);
                 result = HandleSubString(materialized_column, start_idx, length);
