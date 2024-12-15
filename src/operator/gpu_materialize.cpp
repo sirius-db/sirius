@@ -44,8 +44,10 @@ ResolveTypeMaterializeString(GPUColumn* column, BoundReferenceExpression& bound_
         a = column->data_wrapper.data;
         result_offset = column->data_wrapper.offset;
         size = column->column_length;
+        new_num_bytes = new uint64_t[1];
+        new_num_bytes[0] = column->data_wrapper.num_bytes;
     }
-    GPUColumn* result = new GPUColumn(size, column->data_wrapper.type, reinterpret_cast<uint8_t*>(a), result_offset, new_num_bytes[0], column->data_wrapper.is_string_data);
+    GPUColumn* result = new GPUColumn(size, column->data_wrapper.type, a, result_offset, new_num_bytes[0], column->data_wrapper.is_string_data);
     return result;
 }
 

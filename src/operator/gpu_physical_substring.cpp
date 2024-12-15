@@ -9,9 +9,11 @@ GPUColumn* HandleSubString(GPUColumn* string_column, uint64_t start_idx, uint64_
     char* d_char_data = reinterpret_cast<char*>(str_data_wrapper.data);
     uint64_t num_strings = string_column->column_length;
     uint64_t* d_str_indices = str_data_wrapper.offset;
+    if (start_idx < 1) throw InvalidInputException("Start index should be greater than 0");
+    uint64_t actual_start_idx = start_idx - 1;
 
     // Run the actual kernel
-    std::tuple<char*, uint64_t*, uint64_t> result = PerformSubstring(d_char_data, d_str_indices, num_chars, num_strings, start_idx, length);
+    std::tuple<char*, uint64_t*, uint64_t> result = PerformSubstring(d_char_data, d_str_indices, num_chars, num_strings, actual_start_idx, length);
 
     // Update the data wrapper
     uint8_t* result_data = reinterpret_cast<uint8_t*>(std::get<0>(result));
