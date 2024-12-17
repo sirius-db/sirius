@@ -117,9 +117,9 @@ GPUBufferManager::customCudaMalloc(size_t size, int gpu, bool caching) {
         } 
         return ptr;
     } else {
-        printf("Allocating %ld bytes\n", alloc);
+        // printf("Allocating %ld bytes\n", alloc);
         size_t start = __atomic_fetch_add(&gpuProcessingPointer[gpu], alloc, __ATOMIC_RELAXED);
-        printf("Current pointer %ld\n", gpuProcessingPointer[gpu]);
+        // printf("Current pointer %ld\n", gpuProcessingPointer[gpu]);
         assert((start + alloc) < processing_size_per_gpu);
         if (start + alloc >= processing_size_per_gpu) {
             throw InvalidInputException("Out of GPU processing memory");

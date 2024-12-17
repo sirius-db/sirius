@@ -116,18 +116,16 @@ __global__ void print_matching_rows(uint64_t* indices, uint64_t total_strings, u
 
 void StringMatching(char* char_data, uint64_t* str_indices, std::string match_string, uint64_t* &row_id, uint64_t* &count, uint64_t num_chars, uint64_t num_strings) {
   CHECK_ERROR();
-  if (num_strings == 0) {
-      printf("N is 0\n");
-      return;
-  }
   GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
   if (num_strings == 0) {
+    printf("N is 0\n");
     uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
     h_count[0] = 0;
     count = h_count;
     return;
   }
 
+  printf("Running single term string matching\n");
   // Get the data from the metadata
   uint64_t workers_needed = (num_chars + CHUNK_SIZE - 1)/CHUNK_SIZE;
 
@@ -169,7 +167,7 @@ void StringMatching(char* char_data, uint64_t* str_indices, std::string match_st
   // Set the start terms
   uint64_t last_char = num_chars - 1;
   uint64_t preprocess_blocks_needed = (workers_needed + THREADS_PER_BLOCK_STRINGS - 1)/THREADS_PER_BLOCK_STRINGS;
-  std::cout << "Sirius running preprocessing for " << workers_needed << " workers with " << num_strings << " strings and " << num_chars << " chars" << std::endl;
+  // std::cout << "Sirius running preprocessing for " << workers_needed << " workers with " << num_strings << " strings and " << num_chars << " chars" << std::endl;
 
   auto preprocessing_start = std::chrono::high_resolution_clock::now();
   determine_start_kernel<<<preprocess_blocks_needed, THREADS_PER_BLOCK_STRINGS>>>(str_indices, num_strings, d_worker_start_term, 
@@ -177,7 +175,7 @@ void StringMatching(char* char_data, uint64_t* str_indices, std::string match_st
   cudaDeviceSynchronize();
   auto preprocessing_end = std::chrono::high_resolution_clock::now();
   int preprocessing_time_us = std::chrono::duration_cast<std::chrono::microseconds>(preprocessing_end - preprocessing_start).count();
-  std::cout << "String matching preprocessing took " << preprocessing_time_us/1000.0 << " ms" << std::endl;
+  // std::cout << "String matching preprocessing took " << preprocessing_time_us/1000.0 << " ms" << std::endl;
 
   auto str_match_start = std::chrono::high_resolution_clock::now();
   uint64_t block_sub_chunk_size = (CHUNK_SIZE + THREADS_PER_BLOCK_STRINGS - 1)/THREADS_PER_BLOCK_STRINGS;
@@ -186,7 +184,8 @@ void StringMatching(char* char_data, uint64_t* str_indices, std::string match_st
   cudaDeviceSynchronize();
   auto str_match_end = std::chrono::high_resolution_clock::now();
   int str_match_time_us = std::chrono::duration_cast<std::chrono::microseconds>(str_match_end - str_match_start).count();
-  std::cout << "Actual String matching took " << str_match_time_us/1000.0 << " ms" << std::endl;
+  // std::cout << "Actual String matching took " << str_match_time_us/1000.0 << " ms" << std::endl;
+  CHECK_ERROR();
 
   // Create a buffer of the valid idxs
   auto valid_rows_start_time = std::chrono::high_resolution_clock::now();
@@ -202,11 +201,15 @@ void StringMatching(char* char_data, uint64_t* str_indices, std::string match_st
     d_valid_idxs_ptr,
     thrust::identity<bool>()
   );
+  CHECK_ERROR();
 
   // Record the number of valid strings
-  uint64_t num_valid_strings = end - d_valid_idxs_ptr;
+  // uint64_t num_valid_strings = end - d_valid_idxs_ptr;
+  // printf("Got num valid strings of %d\n", num_valid_strings);
   uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
-  cudaMemcpy(h_count, &num_valid_strings, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+  h_count[0] = end - d_valid_idxs_ptr;
+  // cudaMemcpy(h_count, &num_valid_strings, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+  printf("Got num valid strings of %ld\n", h_count[0]);
 
   // Check there are no errors
   cudaDeviceSynchronize();
@@ -285,17 +288,16 @@ __global__ void multi_write_matching_rows(uint64_t* curr_term_answer, uint64_t n
 void MultiStringMatching(char* char_data, uint64_t* str_indices, std::vector<std::string> all_terms,
        uint64_t* &row_id, uint64_t* &count, uint64_t num_chars, uint64_t num_strings) {
   CHECK_ERROR();
-  if (num_strings == 0) {
-      printf("N is 0\n");
-      return;
-  }
   GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
   if (num_strings == 0) {
+    printf("N is 0\n");
     uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
     h_count[0] = 0;
     count = h_count;
     return;
   }
+  
+  printf("Running multi term string matching\n");
   // Get the data from the metadata
   uint64_t workers_needed = (num_chars + CHUNK_SIZE - 1)/CHUNK_SIZE;
 
@@ -391,11 +393,11 @@ void MultiStringMatching(char* char_data, uint64_t* str_indices, std::vector<std
   // Write the matching rows
   uint64_t num_match_blocks = std::max((uint64_t) 1, (num_strings + THREADS_PER_BLOCK_STRINGS - 1)/(THREADS_PER_BLOCK_STRINGS * TILE_ITEMS_PER_TILE));
   multi_write_matching_rows<<<num_match_blocks, THREADS_PER_BLOCK_STRINGS>>>(d_answer_idxs, num_strings, num_chars, d_matching_rows, count);
-  std::cout << "MULTI RESULT: Got num matching rows of " << count[0] << std::endl;
   CHECK_ERROR();
 
   uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
   cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+  printf("Got num matching row of %ld\n", h_count[0]);
 
   // Check for errors
   cudaDeviceSynchronize();
