@@ -102,9 +102,10 @@ $ call gpu_processing("select record FROM example_strs WHERE record LIKE '%lorem
 
 Substring Queries:
 ```
-$ call gpu_caching("part.p_comment");
-$ call gpu_processing("SELECT p_comment FROM part WHERE p_comment LIKE '%wake%';");
-$ call gpu_processing("SELECT substring(p_comment, 1, 4) FROM part;");
+$ select o_orderkey, o_comment from orders where o_comment like '%special%requests%';
+$ call gpu_caching("orders.o_comment");
+$ call gpu_caching("orders.o_orderkey");
+$ call gpu_processing("select o_orderkey, o_comment from orders where o_comment like '%special%requests%';");
 ```
 
 Duck DB query:
