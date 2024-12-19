@@ -236,9 +236,10 @@ __global__ void multi_term_kmp_kernel(char* char_data, uint64_t* indices, int* k
     
     // See if have any work to do
     uint64_t chunk_id = blockIdx.x;
+    int worker_id = threadIdx.x + blockIdx.x * blockDim.x;
     if (chunk_id >= num_workers) return;
 
-    const uint64_t curr_chunk_start = min(chunk_id * chunk_size, last_char); 
+    const uint64_t curr_chunk_start = min(chunk_id * chunk_size, last_char);
     const uint64_t curr_chunk_end = min(curr_chunk_start + chunk_size + pattern_size, last_char);
     const uint64_t curr_sub_chunk_start = min(curr_chunk_start + threadIdx.x * sub_chunk_size, curr_chunk_end);
     const uint64_t curr_sub_chunk_end = min(curr_sub_chunk_start + sub_chunk_size + pattern_size, curr_chunk_end);
@@ -267,32 +268,28 @@ __global__ void multi_term_kmp_kernel(char* char_data, uint64_t* indices, int* k
       // Record that we have a hit
       if(j >= pattern_size) {
         // Only write the result if we current match index is > than the lowest match index for the previous term
-        if(i > prev_term_answer[curr_term]) {
+        int prev_found = found_term[curr_term];
+        if(i >= prev_term_answer[curr_term]) {
           found_term[curr_term] = true;
-          atomicMin(reinterpret_cast<unsigned long long int*> (curr_term_answer + curr_term), static_cast<unsigned long long int> (i));
+          atomicMin(reinterpret_cast<unsigned long long int*> (curr_term_answer + curr_term), static_cast<unsigned long long int> (i + pattern_size));
         }
+        int post_found = found_term[curr_term];
+
+        // Perform some logging
+        if(curr_term <= 150) {
+          printf("MULTI TERM MATCH IDX %d: GOT MATCH AT %d WITH PREV OF %d UPDATING FOUND FROM %d to %d\n", (int) curr_term, (int) i, (int) prev_term_answer[curr_term], prev_found, post_found);
+        }
+
         j = 0;
       }
     }
 }
 
-__global__ void update_term_answers(uint64_t* curr_term_answer, bool* found_term, uint64_t num_chars, uint64_t num_strings) {
+__global__ void initialize_term_answers(uint64_t* curr_term_answer, uint64_t num_chars, uint64_t num_strings) {
     uint64_t tid = threadIdx.x + blockIdx.x * blockDim.x;
-    if(tid < num_strings && !found_term[tid]) {
+    if(tid < num_strings) {
       curr_term_answer[tid] = num_chars;
-    }
-}
-
-__global__ void multi_write_matching_rows(uint64_t* curr_term_answer, uint64_t num_strings, uint64_t num_chars, uint64_t* matching_rows, uint64_t* count) {
-  uint64_t tile_size = gridDim.x * blockDim.x;
-  uint64_t start_idx = threadIdx.x + blockIdx.x * blockDim.x;
-  for(uint64_t i = start_idx; i < num_strings; i += tile_size) {
-    if(curr_term_answer[i] < num_chars) {
-      uint64_t write_offset = atomicAdd(reinterpret_cast<unsigned long long int*>(count), 
-        static_cast<unsigned long long int>(1));
-      matching_rows[write_offset] = static_cast<uint64_t>(i);
-    }
-  }
+    } 
 }
 
 void MultiStringMatching(char* char_data, uint64_t* str_indices, std::vector<std::string> all_terms,
@@ -375,14 +372,17 @@ void MultiStringMatching(char* char_data, uint64_t* str_indices, std::vector<std
   CHECK_ERROR();
   
   // Perform the string matching term by term
-  uint64_t post_process_num_blocks = (num_strings + THREADS_PER_BLOCK_STRINGS - 1)/THREADS_PER_BLOCK_STRINGS;
+  uint64_t preprocess_num_blocks = (num_strings + THREADS_PER_BLOCK_STRINGS - 1)/THREADS_PER_BLOCK_STRINGS;
   for(int i = 0; i < num_terms; i++) {
     // Determine the current terms variables
     int curr_term_length = all_terms[i].size();
     int* curr_term_automato = d_all_automatos[i]; 
+    std::cout << "MULTI TERM ITERATION " << i << " GOT MATCH TERM OF LEN " << curr_term_length << std::endl;
 
-    // Reset the hit buffer
+    // Perform pre processing
     cudaMemset(d_found_answer, 0, num_strings * sizeof(bool));
+    initialize_term_answers<<<preprocess_num_blocks, THREADS_PER_BLOCK_STRINGS>>>(d_answer_idxs, num_chars, num_strings);
+    CHECK_ERROR();
 
     // Run the search
     multi_term_kmp_kernel<<<workers_needed, THREADS_PER_BLOCK_STRINGS>>>(char_data, str_indices, curr_term_automato, d_worker_start_term, 
@@ -390,36 +390,43 @@ void MultiStringMatching(char* char_data, uint64_t* str_indices, std::vector<std
       last_char, num_strings);
     CHECK_ERROR();
 
-    // Perform post processing
-    update_term_answers<<<post_process_num_blocks, THREADS_PER_BLOCK_STRINGS>>>(d_answer_idxs, d_found_answer, num_chars, num_strings);
-    CHECK_ERROR();
-
     // If there are future terms, the make the current answer the prev term answers
     if(i < (num_terms - 1)) {
-        uint64_t* temp_ptr = d_answer_idxs;
-        d_answer_idxs = d_prev_term_answers;
-        d_prev_term_answers = temp_ptr;
+      std::cout << "PRE SWAP PTRS: Answer - " << (void*) d_answer_idxs << ", Prev - " << (void*) d_prev_term_answers << std::endl;
+      uint64_t* temp_ptr = d_answer_idxs;
+      d_answer_idxs = d_prev_term_answers;
+      d_prev_term_answers = temp_ptr;
+      std::cout << "POST SWAP PTRS: Answer - " << (void*) d_answer_idxs << ", Prev - " << (void*) d_prev_term_answers << std::endl;
     }
   }
 
-  // Write the matching rows
-  uint64_t num_match_blocks = std::max((uint64_t) 1, (num_strings + THREADS_PER_BLOCK_STRINGS - 1)/(THREADS_PER_BLOCK_STRINGS * TILE_ITEMS_PER_TILE));
-  multi_write_matching_rows<<<num_match_blocks, THREADS_PER_BLOCK_STRINGS>>>(d_answer_idxs, num_strings, num_chars, d_matching_rows, count);
+  // Create a buffer of the valid idxs
+  auto valid_rows_start_time = std::chrono::high_resolution_clock::now();
+  uint64_t* d_valid_idxs = gpuBufferManager->customCudaMalloc<uint64_t>(num_strings, 0, 0);
+
+  // First get the indices that have true
+  thrust::device_ptr<bool> d_answers_ptr(d_found_answer);
+  thrust::device_ptr<uint64_t> d_valid_idxs_ptr(d_valid_idxs);
+  auto end = thrust::copy_if(
+    thrust::counting_iterator<uint64_t>(0),
+    thrust::counting_iterator<uint64_t>(num_strings),
+    d_answers_ptr,
+    d_valid_idxs_ptr,
+    thrust::identity<bool>()
+  );
   CHECK_ERROR();
 
+  // Record the number of valid strings
   uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
-  cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
-  printf("Got num matching row of %ld\n", h_count[0]);
+  h_count[0] = end - d_valid_idxs_ptr;
+  print_matching_rows<<<1, 1>>>(d_valid_idxs, h_count[0], 25, true);
 
-  // Check for errors
+  // Check there are no errors
   cudaDeviceSynchronize();
   CHECK_ERROR();
 
-  // Set the return values
-  std::cout << "Finished multi term string matching" << std::endl;
-  row_id = d_matching_rows;
+  row_id = d_valid_idxs;
   count = h_count;
-  // return d_matching_rows;
 }
 
 } // namespace duckdb
