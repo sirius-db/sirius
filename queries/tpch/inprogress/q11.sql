@@ -18,7 +18,7 @@ from (
 where
   value > (
     select
-      sum(ps_supplycost * ps_availqty) * 0.0001
+      sum(ps_supplycost * ps_availqty) * 0.0000000333
     from
       partsupp,
       supplier,

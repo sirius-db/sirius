@@ -15,7 +15,6 @@ GPUColumn* HandleSubString(GPUColumn* string_column, uint64_t start_idx, uint64_
     // Run the actual kernel
     std::tuple<char*, uint64_t*, uint64_t> result = PerformSubstring(d_char_data, d_str_indices, num_chars, num_strings, actual_start_idx, length);
 
-    // Update the data wrapper
     uint8_t* result_data = reinterpret_cast<uint8_t*>(std::get<0>(result));
     uint64_t* result_offset = std::get<1>(result);
     uint64_t result_bytes = std::get<2>(result);

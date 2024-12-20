@@ -175,6 +175,14 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
       for (auto &f : table_filters->filters) {
         auto &column_index = f.first;
         auto &filter = f.second;
+        //TODO: We currently does not support string filter, so we will skip it for Q20.
+        string t = "P_NAME>='forest' AND P_NAME<'foresu' AND P_NAME IS NOT NULL";
+        printf("Filter string %s\n", filter->ToString(names[column_ids[column_index]]).c_str());
+        if (filter->ToString(names[column_ids[column_index]]).compare(t) == 0) {
+            printf("We do nothing for string filter\n");
+            continue;
+        }
+
         if (column_index < names.size()) {
           printf("Reading filter column from index %ld\n", column_ids[column_index]);
           // printf("filter type %d\n", filter->filter_type);
@@ -233,6 +241,8 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
                 }
               }
             }
+          } else {
+            throw NotImplementedException("Filter aside from conjunction and not supported");
           }
 
           if (prev_row_ids) {

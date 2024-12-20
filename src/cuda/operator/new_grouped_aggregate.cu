@@ -541,7 +541,7 @@ void groupedWithoutAggregate(uint8_t **keys, uint64_t* count, uint64_t N, uint64
         printf("N is 0\n");
         return;
     }
-    printf("Launching Grouped Aggregate Kernel\n");
+    printf("Launching Grouped Without Aggregate Kernel\n");
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 
     //allocate temp memory and copying keys
@@ -589,7 +589,7 @@ void groupedWithoutAggregate(uint8_t **keys, uint64_t* count, uint64_t N, uint64
     CHECK_ERROR();
 
     //gather the aggregates based on the row_sequence
-    printf("Gathering Aggregates\n");
+    // printf("Gathering Aggregates\n");
     sort_keys_type* group_by_rows = reinterpret_cast<sort_keys_type*> (gpuBufferManager->customCudaMalloc<pointer_and_key>(N, 0, 0));
     uint64_t* d_num_runs_out = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
     cudaMemset(d_num_runs_out, 0, sizeof(uint64_t));
@@ -602,7 +602,7 @@ void groupedWithoutAggregate(uint8_t **keys, uint64_t* count, uint64_t N, uint64
     uint64_t* agg_star_out = gpuBufferManager->customCudaMalloc<uint64_t>(N, 0, 0);
     cudaMemset(agg_star_out, 0, N * sizeof(uint64_t));
 
-    printf("Reduce by key count_star\n");
+    // printf("Reduce by key count_star\n");
     // Determine temporary device storage requirements
     d_temp_storage = nullptr;
     temp_storage_bytes = 0;
@@ -627,8 +627,6 @@ void groupedWithoutAggregate(uint8_t **keys, uint64_t* count, uint64_t N, uint64
 
     cudaMemcpy(h_count, d_num_runs_out, sizeof(uint64_t), cudaMemcpyDeviceToHost);
     count[0] = h_count[0];
-
-    printf("Count: %lu\n", count[0]);
 
     rows_to_columns<T, BLOCK_THREADS, ITEMS_PER_THREAD><<<(count[0] + tile_items - 1)/tile_items, BLOCK_THREADS>>>(group_by_rows, keys_dev, count[0], num_keys);
 

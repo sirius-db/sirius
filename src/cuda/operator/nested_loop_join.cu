@@ -49,6 +49,7 @@ __global__ void nested_loop_join_count(T *left_keys, T* right_keys, uint64_t *of
                 } else if (condition_mode == 2 && left_keys[tile_offset + threadIdx.x + ITEM * B] >= right_keys[i]) {
                     local_found = 0;
                 } else if (condition_mode == 3 && left_keys[tile_offset + threadIdx.x + ITEM * B] <= right_keys[i]) {
+                    // printf("left_keys: %.2f right_keys: %.2f\n", left_keys[tile_offset + threadIdx.x + ITEM * B], right_keys[i]);
                     local_found = 0;
                 }
 
@@ -136,6 +137,12 @@ template
 __global__ void nested_loop_join<uint64_t, BLOCK_THREADS, 1>(uint64_t *left_keys, uint64_t* right_keys, uint64_t *offset_each_thread, uint64_t *row_ids_left, uint64_t *row_ids_right,
             uint64_t left_size, uint64_t right_size, int condition_mode);
 
+__global__ void testprintcolumn(double* column, uint64_t size) {
+    for (int i = 0; i < 100; i++) {
+        printf("%.2f ", column[i]);
+    }
+    printf("\n");
+}
 
 template <typename T>
 void nestedLoopJoin(T** left_data, T** right_data, uint64_t* &row_ids_left, uint64_t* &row_ids_right, uint64_t* &count, uint64_t left_size, uint64_t right_size, int* condition_mode, int num_keys) {
@@ -148,12 +155,14 @@ void nestedLoopJoin(T** left_data, T** right_data, uint64_t* &row_ids_left, uint
         return;
     }
     printf("Launching Nested Loop Join Kernel\n");
-    printf("left size: %lu right size : %lu\n", left_size, right_size);
+    // printf("left size: %lu right size : %lu\n", left_size, right_size);
     int tile_items = BLOCK_THREADS * 1;
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
     cudaMemset(count, 0, sizeof(uint64_t));
     uint64_t* offset_each_thread = gpuBufferManager->customCudaMalloc<uint64_t>(((left_size + tile_items - 1)/tile_items) * BLOCK_THREADS, 0, 0);
     
+    testprintcolumn<<<1, 1>>>(reinterpret_cast<double*>(left_data[0]), left_size);
+    //TODO: Currently only support a single key
     CHECK_ERROR();
     nested_loop_join_count<T, BLOCK_THREADS, 1><<<(left_size + tile_items - 1)/tile_items, BLOCK_THREADS>>>(left_data[0], right_data[0], 
             offset_each_thread, (unsigned long long*) count, left_size, right_size, condition_mode[0]);

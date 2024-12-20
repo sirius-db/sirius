@@ -61,6 +61,13 @@ void callCudaMemcpyDeviceToHost(T* dest, T* src, size_t size, int gpu) {
     }
     printf("Send data to CPU\n");
     cudaSetDevice(gpu);
+    printf("size: %ld\n", size);
+    if (src == nullptr) {
+        printf("src is null\n");
+    }
+    if (dest == nullptr) {
+        printf("dest is null\n");
+    }
     gpuErrchk(cudaMemcpy(dest, src, size * sizeof(T), cudaMemcpyDeviceToHost));
     CHECK_ERROR();
     gpuErrchk(cudaDeviceSynchronize());

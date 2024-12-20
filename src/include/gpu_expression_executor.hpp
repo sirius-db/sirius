@@ -36,7 +36,7 @@ void q12FilterExpression(uint64_t *l_commitdate, uint64_t *l_receiptdate, uint64
 void q16FilterExpression(uint64_t *p_brand, uint64_t *p_type, uint64_t *p_size, uint64_t p_brand_val, uint64_t p_type_val1, uint64_t p_type_val2, uint64_t *p_size_val, uint64_t* &row_ids, uint64_t* &count, uint64_t N);
 void q19FilterExpression(uint64_t *p_brand, double *l_quantity, uint64_t *p_size, uint64_t* p_container, uint64_t *p_brand_val, double *l_quantity_val, uint64_t *p_size_val, uint64_t* p_container_val, 
             uint64_t* &row_ids, uint64_t* &count, uint64_t N);
-
+void q22FilterExpression(uint8_t *a, uint64_t* offset, uint64_t start_idx, uint64_t length, string c_phone_val, uint64_t* &row_ids, uint64_t* &count, uint64_t N, int num_predicates);
 
 class GPUExpressionExecutor {
 public:

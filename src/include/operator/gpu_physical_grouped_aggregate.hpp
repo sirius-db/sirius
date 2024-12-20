@@ -26,6 +26,10 @@ void groupedStringAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t**
 template<typename T>
 void combineColumns(T* a, T* b, T* c, uint64_t N_a, uint64_t N_b);
 
+void combineStrings(uint8_t* a, uint8_t* b, uint8_t* c, 
+        uint64_t* offset_a, uint64_t* offset_b, uint64_t* offset_c, 
+        uint64_t num_bytes_a, uint64_t num_bytes_b, uint64_t N_a, uint64_t N_b);
+
 class ClientContext;
 
 class GPUPhysicalGroupedAggregate : public GPUPhysicalOperator {

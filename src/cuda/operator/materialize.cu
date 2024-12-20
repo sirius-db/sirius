@@ -33,7 +33,7 @@ template <typename T>
 __global__ void testprintmat(T* a, uint64_t N) {
     if (blockIdx.x == 0 && threadIdx.x == 0) {
         for (uint64_t i = 0; i < N; i++) {
-            printf("%lu ", a[i]);
+            printf("%.2f ", a[i]);
         }
         printf("\n");
     }
@@ -104,7 +104,7 @@ void materializeExpression(T *a, T* result, uint64_t *row_ids, uint64_t N) {
     // thrust::sort(thrust::device, sorted.begin(), sorted.end());
     // T* raw_sorted = thrust::raw_pointer_cast(sorted.data());
     // cudaMemcpy(result, raw_sorted, N * sizeof(T), cudaMemcpyDeviceToDevice);
-    // test<T><<<1, 1>>>(a, N);
+    testprintmat<T><<<1, 1>>>(result, 100);
     cudaDeviceSynchronize();
 }
 
