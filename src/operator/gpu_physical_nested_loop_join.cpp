@@ -46,10 +46,9 @@ void ResolveTypeNestedLoopJoin(GPUColumn** &left_keys, GPUColumn** &right_keys, 
 		}
 	}
 
-	printf("im here\n");
-
 	//TODO: Need to handle special case for unique keys for better performance
 	if (join_type == JoinType::INNER) {
+		// printGPUColumn<T>(left_data, 100, 0);
 		nestedLoopJoin<T>(left_data, right_data, row_ids_left, row_ids_right, count, left_size, right_size, condition_mode, num_keys);
 	} else {
 		throw NotImplementedException("Unsupported join type");

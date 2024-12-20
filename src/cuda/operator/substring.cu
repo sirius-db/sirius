@@ -7,7 +7,7 @@
 
 namespace duckdb {
 
-__global__ void get_new_length(uint64_t* prev_offsets, uint64_t* new_offsets, uint64_t num_strings, uint64_t start_idx, uint64_t length) {
+__global__ void get_new_length(uint64_t* prev_offsets, uint64_t* new_len, uint64_t num_strings, uint64_t start_idx, uint64_t length) {
   // Get which string this thread workers on
   uint64_t tid = threadIdx.x + blockIdx.x * blockDim.x;
   if(tid >= num_strings) return; 
@@ -17,7 +17,7 @@ __global__ void get_new_length(uint64_t* prev_offsets, uint64_t* new_offsets, ui
   uint64_t substring_start_idx = min(curr_str_start_idx + start_idx, curr_str_end_idx);
   uint64_t substring_end_idx = min(substring_start_idx + length, curr_str_end_idx);
   uint64_t substring_length = substring_end_idx - substring_start_idx;
-  new_offsets[tid] = substring_length;
+  new_len[tid] = substring_length;
 }
 
 __global__ void substring_copy_chars(char* prev_chars, char* new_chars, uint64_t* prev_offsets, uint64_t* new_offsets, uint64_t num_strings, 
@@ -40,6 +40,14 @@ __global__ void substring_copy_chars(char* prev_chars, char* new_chars, uint64_t
 
 std::tuple<char*, uint64_t*, uint64_t> PerformSubstring(char* char_data, uint64_t* str_indices, uint64_t num_chars, uint64_t num_strings, 
   uint64_t start_idx, uint64_t length) {
+    CHECK_ERROR();
+    if (num_strings == 0) {
+        printf("N is 0\n");
+        char* empty = nullptr;
+        uint64_t* empty_offset = nullptr;
+        return std::make_tuple(empty, empty_offset, 0);
+    }
+    printf("Launching substring kernel\n");
 
     // Get the write offsets
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());

@@ -51,7 +51,7 @@ where
         from
           part
         where
-          p_size = 1
+          p_name like '%forest%'
         )
       and ps_availqty > (
         select

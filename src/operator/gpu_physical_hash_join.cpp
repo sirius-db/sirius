@@ -274,12 +274,14 @@ GPUPhysicalHashJoin::GetData(GPUIntermediateRelation &output_relation) const {
 
 	for (idx_t i = 0; i < rhs_output_columns.size(); i++) {
 		const auto rhs_col = rhs_output_columns[i];
-		printf("Writing hash_table column %ld to column %ld\n", i, rhs_col);
-	// 	// output_relation.columns[left_column_count + rhs_col] = hash_table_result->columns[i];
+		// const auto rhs_col = payload_column_idxs[i];
+		printf("Writing hash_table column %ld to column %ld\n", rhs_col, i);
+	// 	// output_relation.columns[left_column_count + i] = hash_table_result->columns[rhs_cols];
 	// 	output_relation.columns[left_column_count + rhs_col] = HandleMaterializeRowIDs(hash_table_result->columns[i], count[0], row_ids, gpuBufferManager);
 	}
 	HandleMaterializeRowIDsRHS(*hash_table_result, output_relation, rhs_output_columns, left_column_count, count[0], row_ids, gpuBufferManager);
-
+	// double* ptr = reinterpret_cast<double*>(output_relation.columns[left_column_count + 1]->data_wrapper.data);
+	// printGPUColumn<double>(ptr, 100, 0);
 	return SourceResultType::FINISHED;
 }
 
@@ -391,7 +393,7 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 		// 	printf("Passing column idx %ld from RHS (late materialized) to idx %ld in output relation\n", output_col_idx, input_relation.column_count + output_col_idx);
 		// 	//TODO: DOUBLE CHECK IF IT SHOULD BE hash_table_result->columns[i] or hash_table_result->columns[output_col_idx]
 		// 	// output_relation.columns[input_relation.column_count + output_col_idx] = HandleMaterializeRowIDs(hash_table_result->columns[output_col_idx], count[0], row_ids_right, gpuBufferManager);
-		// 	output_relation.columns[input_relation.column_count + output_col_idx] = HandleMaterializeRowIDs(hash_table_result->columns[i], count[0], row_ids_right, gpuBufferManager);
+		// 	output_relation.columns[input_relation.column_count + i] = HandleMaterializeRowIDs(hash_table_result->columns[output_col_idx], count[0], row_ids_right, gpuBufferManager);
 		// }
 		HandleMaterializeRowIDsRHS(*hash_table_result, output_relation, rhs_output_columns, input_relation.column_count, count[0], row_ids_right, gpuBufferManager);
 	} else if (join_type == JoinType::RIGHT_SEMI || join_type == JoinType::RIGHT_ANTI) {
@@ -399,10 +401,10 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 		printf("Writing row IDs from RHS to output relation\n");
 		// on the RHS, we need to fetch the data from the hash table
 		for (idx_t i = 0; i < rhs_output_columns.size(); i++) {
-			const auto output_col_idx = rhs_output_columns[i];
-			printf("Passing column idx %ld from RHS (late materialized) to idx %ld in output relation\n", i, output_col_idx);
+			const auto rhs_col = rhs_output_columns[i];
+			printf("Passing column idx %ld from RHS (late materialized) to idx %ld in output relation\n", rhs_col, i);
 			// output_relation.columns[output_col_idx] = HandleMaterializeRowIDs(hash_table_result->columns[output_col_idx], count[0], row_ids_right, gpuBufferManager);
-			output_relation.columns[output_col_idx] = new GPUColumn(0, hash_table_result->columns[output_col_idx]->data_wrapper.type, nullptr);
+			output_relation.columns[i] = new GPUColumn(0, hash_table_result->columns[rhs_col]->data_wrapper.type, nullptr);
 		}
 	}
 
@@ -448,6 +450,7 @@ GPUPhysicalHashJoin::Sink(GPUIntermediateRelation &input_relation) const {
 			throw InvalidInputException("Unsupported join condition");
 		}
         auto join_key_index = condition.right->Cast<BoundReferenceExpression>().index;
+		printf("Passing column idx %d from input relation to index %ld in RHS hash table\n", join_key_index, cond_idx);
 		hash_table_result->columns[cond_idx] = input_relation.columns[join_key_index];
 		right_idx++;
 	}
