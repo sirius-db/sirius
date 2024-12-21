@@ -199,11 +199,25 @@ HandleGroupByAggregateExpression(GPUColumn** &group_by_keys, GPUColumn** &aggreg
 		}
 	}
 
+	ColumnType aggregate_type;
+	if (aggregates.size() == 1) {
+		aggregate_type = aggregate_keys[0]->data_wrapper.type;
+	} else {
+		for (int i = 0; i < aggregates.size(); i++) {
+			if (aggregates[i]->Cast<BoundAggregateExpression>().function.name.compare("count") != 0 && 
+						aggregates[i]->Cast<BoundAggregateExpression>().function.name.compare("count_star") != 0) {
+				aggregate_type = aggregate_keys[i]->data_wrapper.type;
+			}
+		}
+	}
+
 	if (string_groupby) {
 		//THIS IS NOT WORKING YES
-		if (aggregate_keys[0]->data_wrapper.type == ColumnType::INT64) {
+		if (aggregate_type == ColumnType::INT64) {
+			printf("Group by string and aggregate int\n");
 			ResolveTypeGroupByString<uint64_t>(group_by_keys, aggregate_keys, gpuBufferManager, aggregates, num_group_keys);
-		} else if (aggregate_keys[0]->data_wrapper.type == ColumnType::FLOAT64) {
+		} else if (aggregate_type == ColumnType::FLOAT64) {
+			printf("Group by string and aggregate double\n");
 			ResolveTypeGroupByString<double>(group_by_keys, aggregate_keys, gpuBufferManager, aggregates, num_group_keys);
 		} else {
 			throw NotImplementedException("Unsupported column type");
@@ -211,9 +225,9 @@ HandleGroupByAggregateExpression(GPUColumn** &group_by_keys, GPUColumn** &aggreg
 	} else {
 		switch(group_by_keys[0]->data_wrapper.type) {
 		case ColumnType::INT64:
-			if (aggregate_keys[0]->data_wrapper.type == ColumnType::INT64) {
+			if (aggregate_type == ColumnType::INT64) {
 				ResolveTypeGroupByAggregateExpression<uint64_t, uint64_t>(group_by_keys, aggregate_keys, gpuBufferManager, aggregates, num_group_keys);
-			} else if (aggregate_keys[0]->data_wrapper.type == ColumnType::FLOAT64) {
+			} else if (aggregate_type == ColumnType::FLOAT64) {
 				ResolveTypeGroupByAggregateExpression<uint64_t, double>(group_by_keys, aggregate_keys, gpuBufferManager, aggregates, num_group_keys);
 			} else throw NotImplementedException("Unsupported column type");
 			break;
