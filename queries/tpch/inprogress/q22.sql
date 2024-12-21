@@ -92,6 +92,15 @@ group by
 
 select
   substr(c_phone, 1, 2) as cntrycode,
+  count(*) as numcust,
+  min(c_acctbal) as totacctbal
+from
+  customer
+group by
+  cntrycode;
+
+select
+  substr(c_phone, 1, 2) as cntrycode,
   sum(c_acctbal) as totacctbal,
   count(*) as numcust
 from

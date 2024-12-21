@@ -104,7 +104,7 @@ void materializeExpression(T *a, T* result, uint64_t *row_ids, uint64_t N) {
     // thrust::sort(thrust::device, sorted.begin(), sorted.end());
     // T* raw_sorted = thrust::raw_pointer_cast(sorted.data());
     // cudaMemcpy(result, raw_sorted, N * sizeof(T), cudaMemcpyDeviceToDevice);
-    testprintmat<T><<<1, 1>>>(result, 100);
+    // testprintmat<T><<<1, 1>>>(result, 100);
     cudaDeviceSynchronize();
 }
 
