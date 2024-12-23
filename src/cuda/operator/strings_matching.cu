@@ -258,18 +258,10 @@ __global__ void multi_term_kmp_kernel(char* char_data, uint64_t* indices, int* k
       // Record that we have a hit
       if(j >= pattern_size) {
         // Only write the result if we current match index is > than the lowest match index for the previous term
-        int prev_found = found_term[curr_term];
         if(i >= prev_term_answer[curr_term]) {
           found_term[curr_term] = true;
           atomicMin(reinterpret_cast<unsigned long long int*> (curr_term_answer + curr_term), static_cast<unsigned long long int> (i + pattern_size));
         }
-        int post_found = found_term[curr_term];
-
-        // Perform some logging
-        if(curr_term <= 150) {
-          printf("MULTI TERM MATCH IDX %d: GOT MATCH AT %d WITH PREV OF %d UPDATING FOUND FROM %d to %d\n", (int) curr_term, (int) i, (int) prev_term_answer[curr_term], prev_found, post_found);
-        }
-
         j = 0;
       }
     }
@@ -407,7 +399,6 @@ void MultiStringMatching(char* char_data, uint64_t* str_indices, std::vector<std
   // Record the number of valid strings
   uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
   h_count[0] = end - d_valid_idxs_ptr;
-  print_matching_rows<<<1, 1>>>(d_valid_idxs, h_count[0], 25, true);
 
   // Check there are no errors
   cudaDeviceSynchronize();
@@ -415,6 +406,72 @@ void MultiStringMatching(char* char_data, uint64_t* str_indices, std::vector<std
 
   row_id = d_valid_idxs;
   count = h_count;
+}
+
+__global__ void prefix_kernel(char* char_data, uint64_t num_chars, uint64_t* str_indices, uint64_t num_strings, char* prefix_chars, 
+  uint64_t num_prefix_chars, bool* results) {
+
+  const uint64_t start_idx = threadIdx.x + blockIdx.x * blockDim.x;
+  const uint64_t tile_size = gridDim.x * blockDim.x;
+  for(uint64_t i = start_idx; i < num_strings; i += tile_size) {
+    // First get the current strings details and check its length
+    uint64_t start_offset = str_indices[i]; 
+    uint64_t end_offset = str_indices[i + 1];
+    uint64_t curr_str_length = end_offset - start_offset;
+    if(curr_str_length < num_prefix_chars) {
+      results[i] = false;
+      continue;
+    }
+    char* curr_str_chars = char_data + start_offset;
+
+    // Now actually compare the initial chars
+    bool is_valid = true;
+    for(uint64_t j = 0; j < num_prefix_chars; j++) {
+      if(curr_str_chars[j] != prefix_chars[j]) {
+        is_valid = false;
+        break;
+      }
+    }
+    results[i] = is_valid;
+  }
+}
+
+void PrefixMatching(char* char_data, uint64_t* str_indices, std::string match_prefix, uint64_t* &row_id, uint64_t* &count, 
+  uint64_t num_chars, uint64_t num_strings) {
+
+  // Allocate the necesary buffers on the GPU
+  GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+  uint64_t num_prefix_chars = match_prefix.length();
+  char* d_prefix_chars = gpuBufferManager->customCudaMalloc<char>(num_prefix_chars, 0, 0);
+  cudaMemcpy(d_prefix_chars, match_prefix.c_str(), num_prefix_chars * sizeof(char), cudaMemcpyHostToDevice);
+  bool* d_results = gpuBufferManager->customCudaMalloc<bool>(num_strings, 0, 0);
+
+  // Run the kernel
+  int items_per_block = BLOCK_THREADS * ITEMS_PER_THREAD;
+  int num_blocks = (num_strings + items_per_block - 1)/items_per_block;
+  prefix_kernel<<<num_blocks, BLOCK_THREADS>>>(char_data, num_chars, str_indices, num_strings, d_prefix_chars, num_prefix_chars, d_results);
+  cudaDeviceSynchronize();
+  CHECK_ERROR();
+
+  // Create the valid idx buffer from the valid boolean array
+  uint64_t* d_valid_idxs = gpuBufferManager->customCudaMalloc<uint64_t>(num_strings, 0, 0);
+  thrust::device_ptr<bool> d_answers_ptr(d_results);
+  thrust::device_ptr<uint64_t> d_valid_idxs_ptr(d_valid_idxs);
+  auto end = thrust::copy_if(
+      thrust::counting_iterator<uint64_t>(0),
+      thrust::counting_iterator<uint64_t>(num_strings),
+      d_answers_ptr,
+      d_valid_idxs_ptr,
+      thrust::identity<bool>()
+  );
+  CHECK_ERROR();
+
+  // Record the number of valid strings
+  uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
+  h_count[0] = end - d_valid_idxs_ptr;
+  row_id = d_valid_idxs;
+  count = h_count;
+  std::cout << "PrefixMatching got count of " << h_count[0] << std::endl;
 }
 
 } // namespace duckdb

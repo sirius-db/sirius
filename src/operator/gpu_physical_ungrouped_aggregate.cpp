@@ -129,7 +129,7 @@ GPUPhysicalUngroupedAggregate::Sink(GPUIntermediateRelation &input_relation) con
 
 		if (aggregate.filter) {
 			auto &bound_ref_expr = aggregate.filter->Cast<BoundReferenceExpression>();
-			printf("Reading filter column from index %ld\n", bound_ref_expr.index);
+			printf("Ungropued aggregate sink Reading filter column from index %ld\n", bound_ref_expr.index);
 		}
 
 		idx_t payload_cnt = 0;
@@ -214,7 +214,7 @@ GPUPhysicalUngroupedAggregate::SinkDistinct(GPUIntermediateRelation &input_relat
 
 		if (aggregate.filter) {
 			auto &bound_ref_expr = aggregate.filter->Cast<BoundReferenceExpression>();
-			printf("Reading filter column from index %ld\n", bound_ref_expr.index);
+			printf("Sink Distinct Reading filter column from index %ld\n", bound_ref_expr.index);
 
 			for (idx_t child_idx = 0; child_idx < aggregate.children.size(); child_idx++) {
 				auto &child = aggregate.children[child_idx];

@@ -47,4 +47,14 @@ void HandleMultiStringMatching(GPUColumn* string_column, std::string match_strin
 
 }
 
+void HandlePrefixMatching(GPUColumn* string_column, std::string match_prefix, uint64_t* &row_id, uint64_t* &count) {
+    DataWrapper str_data_wrapper = string_column->data_wrapper;
+    uint64_t num_chars = str_data_wrapper.num_bytes;
+    char* d_char_data = reinterpret_cast<char*>(str_data_wrapper.data);
+    uint64_t num_strings = string_column->column_length;
+    uint64_t* d_str_indices = str_data_wrapper.offset;
+
+    PrefixMatching(d_char_data, d_str_indices, match_prefix, row_id, count, num_chars, num_strings);
+}
+
 } // namespace duckdb

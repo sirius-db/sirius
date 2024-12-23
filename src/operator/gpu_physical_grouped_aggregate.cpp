@@ -605,7 +605,7 @@ GPUPhysicalGroupedAggregate::SinkDistinctGrouping(GPUIntermediateRelation& input
 		if (aggregate.filter) {
 			throw NotImplementedException("Filter not supported yet");
 			auto it = filter_indexes.find(aggregate.filter.get());
-      		printf("Reading filter columns from index %d\n", it->second);
+      		printf("Sink Distinct Grouping Reading filter columns from index %d\n", it->second);
 
 			for (idx_t group_idx = 0; group_idx < grouped_aggregate_data.groups.size(); group_idx++) {
 				auto &group = grouped_aggregate_data.groups[group_idx];

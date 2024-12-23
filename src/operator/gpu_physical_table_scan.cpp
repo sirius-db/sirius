@@ -72,10 +72,42 @@ void ResolveTypeBetweenExpression (GPUColumn* column, uint64_t* &count, uint64_t
     T b = filter_constant1.constant.GetValue<T>();
     T c = filter_constant2.constant.GetValue<T>();
     size_t size = column->column_length;
+
+    // Determine operation tyoe
+    bool is_lower_inclusive = filter_constant1.comparison_type == ExpressionType::COMPARE_GREATERTHANOREQUALTO;
+    bool is_upper_inclusive = filter_constant1.comparison_type == ExpressionType::COMPARE_LESSTHANOREQUALTO;
+    int op_mode;
+    if(is_lower_inclusive && is_upper_inclusive) {
+      op_mode = 6;
+    } else if(is_lower_inclusive && !is_upper_inclusive) {
+      op_mode = 8;
+    } else if(!is_lower_inclusive && is_upper_inclusive) {
+      op_mode = 9;
+    } else {
+      op_mode = 10;
+    }
     comparisonConstantExpression<T>(a, b, c, row_ids, count, size, 6);
 }
 
+void ResolveStringBetweenExpression(GPUColumn* string_column, uint64_t* &count, uint64_t* & row_ids, ConstantFilter filter_constant1, ConstantFilter filter_constant2) {
+  // Read the in the string column
+  DataWrapper str_data_wrapper = string_column->data_wrapper;
+  uint64_t num_chars = str_data_wrapper.num_bytes;
+  char* d_char_data = reinterpret_cast<char*>(str_data_wrapper.data);
+  uint64_t num_strings = string_column->column_length;
+  uint64_t* d_str_indices = str_data_wrapper.offset;
+  std::cout << "Resolve String between got column with values: Num Chars - " << num_chars << ", Num Strings - " << num_strings << std::endl;
+
+  // Get the between values
+  std::string lower_string = filter_constant1.constant.ToString();
+  std::string upper_string = filter_constant2.constant.ToString();
+  bool is_lower_inclusive = filter_constant1.comparison_type == ExpressionType::COMPARE_GREATERTHANOREQUALTO;
+  bool is_upper_inclusive = filter_constant1.comparison_type == ExpressionType::COMPARE_LESSTHANOREQUALTO;
+  comparsionStringExpression(d_char_data, num_chars, d_str_indices, num_strings, lower_string, upper_string, is_lower_inclusive, is_upper_inclusive, row_ids, count);
+}
+
 void HandleBetweenExpression(GPUColumn* column, uint64_t* &count, uint64_t* &row_ids, ConstantFilter filter_constant1, ConstantFilter filter_constant2) {
+    std::cout << "HandleBetweenExpression got values of " << filter_constant1.constant.ToString() << " and " << filter_constant2.constant.ToString();
     switch(column->data_wrapper.type) {
       case ColumnType::INT32:
         ResolveTypeBetweenExpression<int>(column, count, row_ids, filter_constant1, filter_constant2);
@@ -89,8 +121,11 @@ void HandleBetweenExpression(GPUColumn* column, uint64_t* &count, uint64_t* &row
       case ColumnType::FLOAT64:
         ResolveTypeBetweenExpression<double>(column, count, row_ids, filter_constant1, filter_constant2);
         break;
+      case ColumnType::VARCHAR:
+        ResolveStringBetweenExpression(column, count, row_ids, filter_constant1, filter_constant2);
+        break;
       default:
-        throw NotImplementedException("Unsupported column type");
+        throw NotImplementedException("HandleBetweenExpression Unsupported column type");
     }
 }
 
@@ -114,6 +149,23 @@ ResolveTypeMaterializeExpression(GPUColumn* column, GPUBufferManager* gpuBufferM
     return result;
 }
 
+GPUColumn* ResolveStringMateralizeExpression(GPUColumn* column, GPUBufferManager* gpuBufferManager) {
+  // Column is already materalized so just return it
+  if(column->row_ids == nullptr) {
+    return column;
+  }
+
+  // Materalize the string column
+  uint8_t* data = column->data_wrapper.data;
+  uint64_t* offset = column->data_wrapper.offset;
+  uint64_t* row_ids = column->row_ids;
+  size_t num_rows = column->row_id_count;
+  uint8_t* result; uint64_t* result_offset; uint64_t* new_num_bytes;
+  materializeString(data, offset, result, result_offset, row_ids, new_num_bytes, num_rows);
+  GPUColumn* result_column = new GPUColumn(num_rows, ColumnType::VARCHAR, reinterpret_cast<uint8_t*>(result), result_offset, new_num_bytes[0], true);
+  return result_column;
+}
+
 GPUColumn* 
 HandleMaterializeExpression(GPUColumn* column, GPUBufferManager* gpuBufferManager) {
     switch(column->data_wrapper.type) {
@@ -127,8 +179,10 @@ HandleMaterializeExpression(GPUColumn* column, GPUBufferManager* gpuBufferManage
             return ResolveTypeMaterializeExpression<double>(column, gpuBufferManager);
         case ColumnType::BOOLEAN:
             return ResolveTypeMaterializeExpression<uint8_t>(column, gpuBufferManager);
+        case ColumnType::VARCHAR:
+            return ResolveStringMateralizeExpression(column, gpuBufferManager);
         default:
-            throw NotImplementedException("Unsupported column type");
+            throw NotImplementedException("HandleMaterializeExpression Unsupported column type");
     }
 }
 
@@ -176,14 +230,15 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
         auto &column_index = f.first;
         auto &filter = f.second;
         if (column_index < names.size()) {
-          printf("Reading filter column from index %ld\n", column_ids[column_index]);
+          printf("Physical Table Scan Reading filter column from index %ld\n", column_ids[column_index]);
           // printf("filter type %d\n", filter->filter_type);
           if (filter->filter_type == TableFilterType::CONJUNCTION_AND) {
             auto filter_pointer = filter.get();
             auto &filter_conjunction_and = filter_pointer->Cast<ConjunctionAndFilter>();
             if (filter_conjunction_and.child_filters.size() == 3) {
-              printf("This is between filter\n");
+              printf("Physical Table Scan Get Data This is between filter\n");
               if (filter_conjunction_and.child_filters[0]->filter_type == TableFilterType::CONSTANT_COMPARISON && filter_conjunction_and.child_filters[1]->filter_type == TableFilterType::CONSTANT_COMPARISON && filter_conjunction_and.child_filters[2]->filter_type == TableFilterType::IS_NOT_NULL) {
+                printf("Physical Table Scan running constant comparsion\n");
                 auto filter_constant1 = filter_conjunction_and.child_filters[0]->Cast<ConstantFilter>();
                 auto filter_constant2 = filter_conjunction_and.child_filters[1]->Cast<ConstantFilter>();
                 ExpressionType expression_type1 = filter_constant1.comparison_type;
@@ -195,18 +250,25 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
                   table->columns[column_ids[column_index]]->row_ids = prev_row_ids;
                   table->columns[column_ids[column_index]]->row_id_count = prev_row_ids_count;
                 }
+
+                std::cout << "START: Get Data calling HandleMaterializeExpression" << std::endl;
                 GPUColumn* materialized_column = HandleMaterializeExpression(table->columns[column_ids[column_index]], gpuBufferManager);
                 table->columns[column_ids[column_index]]->row_ids = nullptr;
                 table->columns[column_ids[column_index]]->row_id_count = 0;
-                if (filter_constant1.comparison_type == ExpressionType::COMPARE_GREATERTHANOREQUALTO && filter_constant2.comparison_type == ExpressionType::COMPARE_LESSTHANOREQUALTO) {
-                    HandleBetweenExpression(materialized_column, count, row_ids, filter_constant1, filter_constant2);
+                std::cout << "FINISH: Get Data calling HandleMaterializeExpression" << std::endl;
+
+                bool is_first_greater = filter_constant1.comparison_type == ExpressionType::COMPARE_GREATERTHANOREQUALTO || filter_constant1.comparison_type == ExpressionType::COMPARE_GREATERTHAN;
+                bool is_second_greater = filter_constant2.comparison_type == ExpressionType::COMPARE_LESSTHANOREQUALTO || filter_constant2.comparison_type == ExpressionType::COMPARE_LESSTHAN;
+                if (is_first_greater && is_second_greater) {
+                  HandleBetweenExpression(materialized_column, count, row_ids, filter_constant1, filter_constant2);
                 } else {
-                    throw NotImplementedException("Between expression not supported");
+                    throw NotImplementedException("Get Data Between expression not supported");
                 }
                 printf("Count %ld\n", count[0]);
                 if (count[0] == 0) throw NotImplementedException("No match found");
               }
             } else {
+              printf("Physical Table Scan Reading Child Filters\n");
               for (auto &filter_inside : filter_conjunction_and.child_filters) {
                 if (filter_inside->filter_type == TableFilterType::CONSTANT_COMPARISON) {
                   printf("Reading constant comparison filter\n");
