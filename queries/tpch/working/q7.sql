@@ -5,8 +5,8 @@ select
   sum(volume) as revenue
 from (
   select
-    n1.n_nationkey as supp_nation,
-    n2.n_nationkey as cust_nation,
+    n1.n_name as supp_nation,
+    n2.n_name as cust_nation,
     l_shipdate//10000 as l_year,
     l_extendedprice * (1 - l_discount) as volume
   from

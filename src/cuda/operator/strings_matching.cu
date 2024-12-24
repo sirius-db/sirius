@@ -114,6 +114,15 @@ __global__ void print_matching_rows(uint64_t* indices, uint64_t total_strings, u
   printf("\n");
 }
 
+__global__ void testprintidx(bool* a, uint64_t N) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    for (uint64_t i = 0; i < N; i++) {
+      printf("%d ", a[i]);
+    }
+    printf("\n");
+  }
+}
+
 void StringMatching(char* char_data, uint64_t* str_indices, std::string match_string, uint64_t* &row_id, uint64_t* &count, uint64_t num_chars, uint64_t num_strings) {
   CHECK_ERROR();
   GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
@@ -153,6 +162,7 @@ void StringMatching(char* char_data, uint64_t* str_indices, std::string match_st
   int* d_kmp_automato = gpuBufferManager->customCudaMalloc<int>(kmp_automato_size, 0, 0);
   uint64_t* d_worker_start_term = gpuBufferManager->customCudaMalloc<uint64_t>(workers_needed, 0, 0);
   bool* d_answers = reinterpret_cast<bool*> (gpuBufferManager->customCudaMalloc<uint8_t>(num_strings, 0, 0));
+  cudaMemset(d_answers, 0, num_strings * sizeof(bool));
   // TODO: Do it twice for more accurate allocation
   uint64_t* d_matching_rows = gpuBufferManager->customCudaMalloc<uint64_t>(num_strings, 0, 0);
 
@@ -167,7 +177,7 @@ void StringMatching(char* char_data, uint64_t* str_indices, std::string match_st
   // Set the start terms
   uint64_t last_char = num_chars - 1;
   uint64_t preprocess_blocks_needed = (workers_needed + THREADS_PER_BLOCK_STRINGS - 1)/THREADS_PER_BLOCK_STRINGS;
-  // std::cout << "Sirius running preprocessing for " << workers_needed << " workers with " << num_strings << " strings and " << num_chars << " chars" << std::endl;
+  std::cout << "Sirius running preprocessing for " << workers_needed << " workers with " << num_strings << " strings and " << num_chars << " chars" << std::endl;
 
   auto preprocessing_start = std::chrono::high_resolution_clock::now();
   determine_start_kernel<<<preprocess_blocks_needed, THREADS_PER_BLOCK_STRINGS>>>(str_indices, num_strings, d_worker_start_term, 
@@ -332,7 +342,9 @@ void MultiStringMatching(char* char_data, uint64_t* str_indices, std::vector<std
   uint64_t* d_worker_start_term = gpuBufferManager->customCudaMalloc<uint64_t>(workers_needed, 0, 0);
   uint64_t* d_prev_term_answers = gpuBufferManager->customCudaMalloc<uint64_t>(num_strings, 0, 0);
   uint64_t* d_answer_idxs = gpuBufferManager->customCudaMalloc<uint64_t>(num_strings, 0, 0);
+  cudaMemset(d_answer_idxs, 0, num_strings * sizeof(uint64_t));
   bool* d_found_answer = reinterpret_cast<bool*> (gpuBufferManager->customCudaMalloc<uint8_t>(num_strings, 0, 0));
+  cudaMemset(d_found_answer, 0, num_strings * sizeof(bool));
   uint64_t* d_matching_rows = gpuBufferManager->customCudaMalloc<uint64_t>(num_strings, 0, 0);
 
   // Create buffer for each automato

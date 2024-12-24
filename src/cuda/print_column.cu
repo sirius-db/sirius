@@ -10,7 +10,7 @@ template <typename T>
 __global__ void print_gpu_column(T* a, uint64_t N) {
     if (blockIdx.x == 0 && threadIdx.x == 0) {
         for (uint64_t i = 0; i < N; i++) {
-            printf("a: %.2f ", a[i]);
+            printf("a: %ld ", a[i]);
         }
         printf("\n");
     }
