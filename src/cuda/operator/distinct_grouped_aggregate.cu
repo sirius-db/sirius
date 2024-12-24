@@ -272,15 +272,23 @@ void groupedDistinctAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t
         }
     }
 
-    rows_to_columns<T, BLOCK_THREADS, ITEMS_PER_THREAD><<<(h_count[0] + tile_items - 1)/tile_items, BLOCK_THREADS>>>(group_by_rows, keys_dev, h_count[0], num_keys);
-
-    CHECK_ERROR();
     cudaDeviceSynchronize();
     printf("Count: %lu\n", h_count[0]);
     count[0] = h_count[0];
 
+    T** keys_dev_result;
+    T** keys_result = new T*[num_keys];
+    cudaMalloc((void**) &keys_dev_result, num_keys * sizeof(T*));
     for (uint64_t i = 0; i < num_keys; i++) {
-        keys[i] = reinterpret_cast<uint8_t*> (keys_row_id[i]);
+        keys_result[i] = gpuBufferManager->customCudaMalloc<T>(count[0], 0, 0);
+    }
+    cudaMemcpy(keys_dev_result, keys_result, num_keys * sizeof(T*), cudaMemcpyHostToDevice);
+
+    rows_to_columns<T, BLOCK_THREADS, ITEMS_PER_THREAD><<<(h_count[0] + tile_items - 1)/tile_items, BLOCK_THREADS>>>(group_by_rows, keys_dev_result, h_count[0], num_keys);
+    CHECK_ERROR();
+
+    for (uint64_t i = 0; i < num_keys; i++) {
+        keys[i] = reinterpret_cast<uint8_t*> (keys_result[i]);
     }
 }
 

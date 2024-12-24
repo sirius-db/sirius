@@ -1,9 +1,12 @@
 select
   s_acctbal,
-  n_nationkey,
+  s_name,
+  n_name,
   p_partkey,
   p_mfgr,
-  s_suppkey
+  s_address,
+  s_phone,
+  s_comment
 from
   part,
   supplier,
@@ -36,10 +39,13 @@ where
 
 select
   sum(s_acctbal),
-  n_nationkey,
+  s_name,
+  n_name,
   p_partkey,
   p_mfgr,
-  s_suppkey
+  s_address,
+  s_phone,
+  s_comment
 from
   part,
   supplier,
@@ -71,11 +77,17 @@ where
     )
 group by
   p_partkey,
+  s_name,
+  n_name,
   p_mfgr,
-  s_suppkey,
-  n_nationkey
+  s_address,
+  s_phone,
+  s_comment
 order by
   p_partkey,
+  s_name,
+  n_name,
   p_mfgr,
-  s_suppkey,
-  n_nationkey;
+  s_address,
+  s_phone,
+  s_comment
