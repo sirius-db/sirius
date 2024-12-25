@@ -311,8 +311,20 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
                 if (bound_function.children[0]->type != ExpressionType::BOUND_REF) {
                   throw NotImplementedException("Contains function not supported");
                 }
-                if(bound_function_name.find("contains") != std::string::npos || bound_function_name.find("prefix") != std::string::npos) {
-                  // Get the column
+                printf("Function name %s\n", bound_function_name.c_str());
+                if(bound_function_name.find("prefix") != std::string::npos) {
+                  // std::cout << "GOT PREFIX bound function" << std::endl;
+                  auto& bound_ref = bound_function.children[0]->Cast<BoundReferenceExpression>();
+                  auto& bound_const = (*bound_function.children[1]).Cast<BoundConstantExpression>();
+                  std::string match_str = bound_const.value.ToString();
+                  
+                  count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+                  GPUColumn* materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref.index], bound_ref, gpuBufferManager);
+                  HandlePrefixMatching(materialized_column, match_str, comparison_idx, count);
+                  if (count[0] == 0) throw NotImplementedException("No match found");
+
+                } else if(bound_function_name.find("contains") != std::string::npos) {
+                  // Get the column and match string
                   auto& bound_ref = bound_function.children[0]->Cast<BoundReferenceExpression>();
                   // Get the match string from the other child
                   auto& bound_const = (*bound_function.children[1]).Cast<BoundConstantExpression>();
@@ -464,7 +476,6 @@ GPUExpressionExecutor::ProjectionRecursiveExpression(GPUIntermediateRelation& in
                 auto &bound_ref2 = bound_function.children[1]->Cast<BoundConstantExpression>();
                 auto &bound_ref3 = bound_function.children[2]->Cast<BoundConstantExpression>();
                 GPUColumn* input_column = input_relation.columns[bound_ref1.index];
-                printf("index %ld\n", bound_ref1.index);
                 uint64_t start_idx = bound_ref2.value.GetValue<uint64_t>();
                 if (start_idx < 1) throw InvalidInputException("Start index should be greater than 0");
                 uint64_t length = bound_ref3.value.GetValue<uint64_t>();

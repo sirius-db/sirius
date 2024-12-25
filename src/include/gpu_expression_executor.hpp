@@ -20,6 +20,8 @@ template <typename T> void binaryExpression(T *a, T *b, T *result, uint64_t N, i
 template <typename T> void binaryConstantExpression(T *a, T b, T *result, uint64_t N, int op_mode);
 template <typename T> void comparisonConstantExpression(T *a, T b, T c, uint64_t* &row_ids, uint64_t* &count, uint64_t N, int op_mode);
 template <typename T> void comparisonExpression(T *a, T* b, uint64_t* &row_ids, uint64_t* &count, uint64_t N, int op_mode);
+void comparisonStringExpression(char* char_data, uint64_t num_chars, uint64_t* str_indices, uint64_t num_strings, std::string lower_string, std::string upper_string, 
+    bool is_lower_inclusive, bool is_upper_inclusive, uint64_t* &row_id, uint64_t* &count);
 
 //query specific projection
 void commonArithmeticExpression(double *a, double *b, double* c, double* d, double *result, uint64_t N, int op_mode);
@@ -48,9 +50,6 @@ public:
     
     template <typename T> void ResolveTypeComparisonExpression (GPUColumn* column1, GPUColumn* column2, uint64_t* &count, uint64_t* & row_ids, ExpressionType expression_type);
     void HandleComparisonExpression(GPUColumn* column1, GPUColumn* column2, uint64_t* &count, uint64_t* &row_ids, ExpressionType expression_type);
-
-    // template <typename T> GPUColumn* ResolveTypeMaterializeExpression(GPUColumn* column, BoundReferenceExpression& bound_ref, GPUBufferManager* gpuBufferManager);
-    // GPUColumn* HandleMaterializeExpression(GPUColumn* column, BoundReferenceExpression& bound_ref, GPUBufferManager* gpuBufferManager);
 
     template <typename T> GPUColumn* ResolveTypeBinaryConstantExpression (GPUColumn* column, T constant, GPUBufferManager* gpuBufferManager, string function_name);
     GPUColumn* HandleBinaryConstantExpression(GPUColumn* column, BoundConstantExpression& expr, GPUBufferManager* gpuBufferManager, string function_name);

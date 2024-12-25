@@ -17,12 +17,12 @@ where
     from
       supplier
     where
-      s_acctbal < 2000
+      s_comment like '%Customer%Complaints%'
   )
 group by
   p_brand,
   p_type,
-  p_size;
+  p_size
 
 
 select
@@ -44,7 +44,7 @@ where
     from
       supplier
     where
-      s_acctbal < 2000
+      s_comment like '%Customer%Complaints%'
   )
 group by
   p_brand,
