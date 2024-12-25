@@ -72,7 +72,37 @@ void ResolveTypeBetweenExpression (GPUColumn* column, uint64_t* &count, uint64_t
     T b = filter_constant1.constant.GetValue<T>();
     T c = filter_constant2.constant.GetValue<T>();
     size_t size = column->column_length;
-    comparisonConstantExpression<T>(a, b, c, row_ids, count, size, 6);
+    // Determine operation tyoe
+    bool is_lower_inclusive = filter_constant1.comparison_type == ExpressionType::COMPARE_GREATERTHANOREQUALTO;
+    bool is_upper_inclusive = filter_constant2.comparison_type == ExpressionType::COMPARE_LESSTHANOREQUALTO;
+    int op_mode;
+    if(is_lower_inclusive && is_upper_inclusive) {
+      op_mode = 6;
+    } else if(is_lower_inclusive && !is_upper_inclusive) {
+      op_mode = 8;
+    } else if(!is_lower_inclusive && is_upper_inclusive) {
+      op_mode = 9;
+    } else {
+      op_mode = 10;
+    }
+    // printf("Op mode %d\n", op_mode);
+    comparisonConstantExpression<T>(a, b, c, row_ids, count, size, op_mode);
+}
+
+void ResolveStringBetweenExpression(GPUColumn* string_column, uint64_t* &count, uint64_t* & row_ids, ConstantFilter filter_constant1, ConstantFilter filter_constant2) {
+  // Read the in the string column
+  DataWrapper str_data_wrapper = string_column->data_wrapper;
+  uint64_t num_chars = str_data_wrapper.num_bytes;
+  char* d_char_data = reinterpret_cast<char*>(str_data_wrapper.data);
+  uint64_t num_strings = string_column->column_length;
+  uint64_t* d_str_indices = str_data_wrapper.offset;
+  std::cout << "Resolve String between got column with values: Num Chars - " << num_chars << ", Num Strings - " << num_strings << std::endl;
+  // Get the between values
+  std::string lower_string = filter_constant1.constant.ToString();
+  std::string upper_string = filter_constant2.constant.ToString();
+  bool is_lower_inclusive = filter_constant1.comparison_type == ExpressionType::COMPARE_GREATERTHANOREQUALTO;
+  bool is_upper_inclusive = filter_constant1.comparison_type == ExpressionType::COMPARE_LESSTHANOREQUALTO;
+  comparisonStringExpression(d_char_data, num_chars, d_str_indices, num_strings, lower_string, upper_string, is_lower_inclusive, is_upper_inclusive, row_ids, count);
 }
 
 void HandleBetweenExpression(GPUColumn* column, uint64_t* &count, uint64_t* &row_ids, ConstantFilter filter_constant1, ConstantFilter filter_constant2) {
@@ -88,6 +118,9 @@ void HandleBetweenExpression(GPUColumn* column, uint64_t* &count, uint64_t* &row
         break;
       case ColumnType::FLOAT64:
         ResolveTypeBetweenExpression<double>(column, count, row_ids, filter_constant1, filter_constant2);
+        break;
+      case ColumnType::VARCHAR:
+        ResolveStringBetweenExpression(column, count, row_ids, filter_constant1, filter_constant2);
         break;
       default:
         throw NotImplementedException("Unsupported column type");
@@ -114,6 +147,22 @@ ResolveTypeMaterializeExpression(GPUColumn* column, GPUBufferManager* gpuBufferM
     return result;
 }
 
+GPUColumn* ResolveStringMateralizeExpression(GPUColumn* column, GPUBufferManager* gpuBufferManager) {
+  // Column is already materalized so just return it
+  if(column->row_ids == nullptr) {
+    return column;
+  }
+  // Materalize the string column
+  uint8_t* data = column->data_wrapper.data;
+  uint64_t* offset = column->data_wrapper.offset;
+  uint64_t* row_ids = column->row_ids;
+  size_t num_rows = column->row_id_count;
+  uint8_t* result; uint64_t* result_offset; uint64_t* new_num_bytes;
+  materializeString(data, offset, result, result_offset, row_ids, new_num_bytes, num_rows);
+  GPUColumn* result_column = new GPUColumn(num_rows, ColumnType::VARCHAR, reinterpret_cast<uint8_t*>(result), result_offset, new_num_bytes[0], true);
+  return result_column;
+}
+
 GPUColumn* 
 HandleMaterializeExpression(GPUColumn* column, GPUBufferManager* gpuBufferManager) {
     switch(column->data_wrapper.type) {
@@ -127,6 +176,8 @@ HandleMaterializeExpression(GPUColumn* column, GPUBufferManager* gpuBufferManage
             return ResolveTypeMaterializeExpression<double>(column, gpuBufferManager);
         case ColumnType::BOOLEAN:
             return ResolveTypeMaterializeExpression<uint8_t>(column, gpuBufferManager);
+        case ColumnType::VARCHAR:
+            return ResolveStringMateralizeExpression(column, gpuBufferManager);
         default:
             throw NotImplementedException("Unsupported column type");
     }
@@ -198,8 +249,12 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
                 GPUColumn* materialized_column = HandleMaterializeExpression(table->columns[column_ids[column_index]], gpuBufferManager);
                 table->columns[column_ids[column_index]]->row_ids = nullptr;
                 table->columns[column_ids[column_index]]->row_id_count = 0;
-                if (filter_constant1.comparison_type == ExpressionType::COMPARE_GREATERTHANOREQUALTO && filter_constant2.comparison_type == ExpressionType::COMPARE_LESSTHANOREQUALTO) {
-                    HandleBetweenExpression(materialized_column, count, row_ids, filter_constant1, filter_constant2);
+                bool is_first_greater = filter_constant1.comparison_type == ExpressionType::COMPARE_GREATERTHANOREQUALTO || filter_constant1.comparison_type == ExpressionType::COMPARE_GREATERTHAN;
+                bool is_second_greater = filter_constant2.comparison_type == ExpressionType::COMPARE_LESSTHANOREQUALTO || filter_constant2.comparison_type == ExpressionType::COMPARE_LESSTHAN;
+                if (is_first_greater && is_second_greater) {
+                  HandleBetweenExpression(materialized_column, count, row_ids, filter_constant1, filter_constant2);
+                // if (filter_constant1.comparison_type == ExpressionType::COMPARE_GREATERTHANOREQUALTO && filter_constant2.comparison_type == ExpressionType::COMPARE_LESSTHANOREQUALTO) {
+                    // HandleBetweenExpression(materialized_column, count, row_ids, filter_constant1, filter_constant2);
                 } else {
                     throw NotImplementedException("Between expression not supported");
                 }

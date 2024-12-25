@@ -8,7 +8,7 @@ from (
   from
     customer left outer join orders on (
       c_custkey = o_custkey
-      and o_orderdate < 19940101
+      and o_comment like '%special%requests%'
     )
   group by
     c_custkey

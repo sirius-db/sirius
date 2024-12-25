@@ -108,7 +108,9 @@ $ call gpu_caching("orders.o_orderkey");
 $ call gpu_processing("select o_orderkey, o_comment from orders where o_comment like '%special%requests%';");
 ```
 
-Duck DB query:
+Prefix query:
 ```
-$ SELECT p_partkey, p_comment FROM part WHERE p_comment LIKE '%wake%' ORDER BY p_partkey DESC LIMIT 50;
+$ call gpu_caching("part.p_name");
+$ select p_name from part where p_name like 'forest%';
+$ call gpu_processing("select p_name from part where p_name like 'forest%';");
 ```
