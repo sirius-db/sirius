@@ -312,42 +312,28 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
                   throw NotImplementedException("Contains function not supported");
                 }
                 printf("Function name %s\n", bound_function_name.c_str());
-                if(bound_function_name.find("prefix") != std::string::npos) {
-                  // std::cout << "GOT PREFIX bound function" << std::endl;
-                  auto& bound_ref = bound_function.children[0]->Cast<BoundReferenceExpression>();
-                  auto& bound_const = (*bound_function.children[1]).Cast<BoundConstantExpression>();
-                  std::string match_str = bound_const.value.ToString();
-                  
-                  count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
-                  GPUColumn* materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref.index], bound_ref, gpuBufferManager);
-                  HandlePrefixMatching(materialized_column, match_str, comparison_idx, count);
-                  if (count[0] == 0) throw NotImplementedException("No match found");
-
-                } else if(bound_function_name.find("contains") != std::string::npos) {
-                  // Get the column and match string
-                  auto& bound_ref = bound_function.children[0]->Cast<BoundReferenceExpression>();
-                  // Get the match string from the other child
-                  auto& bound_const = (*bound_function.children[1]).Cast<BoundConstantExpression>();
-                  std::string match_str = bound_const.value.ToString();
-                  
-                  count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
-                  GPUColumn* materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref.index], bound_ref, gpuBufferManager);
-                  HandleStringMatching(materialized_column, match_str, comparison_idx, count);
-                  if (count[0] == 0) throw NotImplementedException("No match found");
-
-                } else if(bound_function_name.find("~~") != std::string::npos) {
-                  // Get the column
-                  auto& bound_ref = bound_function.children[0]->Cast<BoundReferenceExpression>();
-                  // Get the match string from the other child
-                  auto& bound_const = (*bound_function.children[1]).Cast<BoundConstantExpression>();
-                  std::string match_str = bound_const.value.ToString();
-                  
-                  count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
-                  GPUColumn* materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref.index], bound_ref, gpuBufferManager);
-                  HandleMultiStringMatching(materialized_column, match_str, comparison_idx, count);
-                  if (count[0] == 0) throw NotImplementedException("No match found");
+                auto& bound_ref = bound_function.children[0]->Cast<BoundReferenceExpression>();
+                auto& bound_const = bound_function.children[1]->Cast<BoundConstantExpression>();
+                std::string match_str = bound_const.value.ToString();
+                if (input_relation.columns[bound_ref.index]->data_wrapper.data == nullptr) {
+                    printf("Column is null\n");
+                    count = new uint64_t[1];
+                    count[0] = 0;
                 } else {
-                  throw NotImplementedException("Function not supported");
+                  count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+                  GPUColumn* materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref.index], bound_ref, gpuBufferManager);
+                  if(bound_function_name.find("prefix") != std::string::npos) {
+                    HandlePrefixMatching(materialized_column, match_str, comparison_idx, count, 0);
+                  } else if(bound_function_name.find("contains") != std::string::npos) {
+                    HandleStringMatching(materialized_column, match_str, comparison_idx, count, 0);
+                  } else if(bound_function_name.find("!~~") != std::string::npos) {
+                    HandleMultiStringMatching(materialized_column, match_str, comparison_idx, count, 1);
+                  } else if(bound_function_name.find("~~") != std::string::npos) {
+                    HandleMultiStringMatching(materialized_column, match_str, comparison_idx, count, 0);
+                  } else {
+                    throw NotImplementedException("Function not supported");
+                  }
+                  if (count[0] == 0) throw NotImplementedException("No match found");
                 }
             break;
           } case ExpressionClass::BOUND_OPERATOR: {
@@ -358,18 +344,42 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
                 // }
                 if (bound_operator.type == ExpressionType::OPERATOR_NOT) {
                     printf("Executing NOT expression\n");
-                    auto &bound_ref = bound_operator.children[0]->Cast<BoundReferenceExpression>();
-                    if (input_relation.columns[bound_ref.index]->data_wrapper.data == nullptr || input_relation.columns[bound_ref.index]->data_wrapper.data == nullptr) {
-                        printf("Column is null\n");
-                        count = new uint64_t[1];
-                        count[0] = 0;
-                    } else {
-                      GPUColumn* materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref.index], bound_ref, gpuBufferManager);
-                      Value one = Value::BOOLEAN(1);
-                      BoundConstantExpression bound_constant_expr = BoundConstantExpression(one);
-                      count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
-                      HandleComparisonConstantExpression(materialized_column, bound_constant_expr, bound_constant_expr, count, comparison_idx, ExpressionType::COMPARE_NOTEQUAL);
-                      if (count[0] == 0) throw NotImplementedException("No match found"); 
+                    // if children is a bound reference
+                    if (bound_operator.children[0]->expression_class == ExpressionClass::BOUND_REF) {
+                      auto &bound_ref = bound_operator.children[0]->Cast<BoundReferenceExpression>();
+                      if (input_relation.columns[bound_ref.index]->data_wrapper.data == nullptr) {
+                          printf("Column is null\n");
+                          count = new uint64_t[1];
+                          count[0] = 0;
+                      } else {
+                        GPUColumn* materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref.index], bound_ref, gpuBufferManager);
+                        Value one = Value::BOOLEAN(1);
+                        BoundConstantExpression bound_constant_expr = BoundConstantExpression(one);
+                        count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+                        HandleComparisonConstantExpression(materialized_column, bound_constant_expr, bound_constant_expr, count, comparison_idx, ExpressionType::COMPARE_NOTEQUAL);
+                        if (count[0] == 0) throw NotImplementedException("No match found"); 
+                      }
+                    // if children is a bound function (contains or prefix)
+                    } else if (bound_operator.children[0]->expression_class == ExpressionClass::BOUND_FUNCTION) {
+                      auto& bound_function = bound_operator.children[0]->Cast<BoundFunctionExpression>();
+                      std::string bound_function_name = bound_function.ToString();
+                      auto& bound_ref = bound_function.children[0]->Cast<BoundReferenceExpression>();
+                      auto& bound_const = bound_function.children[1]->Cast<BoundConstantExpression>();
+                      std::string match_str = bound_const.value.ToString();
+                      if (input_relation.columns[bound_ref.index]->data_wrapper.data == nullptr) {
+                          printf("Column is null\n");
+                          count = new uint64_t[1];
+                          count[0] = 0;
+                      } else {
+                        count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+                        GPUColumn* materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref.index], bound_ref, gpuBufferManager);
+                        if(bound_function_name.find("prefix") != std::string::npos) {
+                            HandlePrefixMatching(materialized_column, match_str, comparison_idx, count, 1);
+                        } else if(bound_function_name.find("contains") != std::string::npos) {
+                            HandleStringMatching(materialized_column, match_str, comparison_idx, count, 1);
+                        } 
+                        if (count[0] == 0) throw NotImplementedException("No match found");
+                      }
                     }
                 } else {
                   throw NotImplementedException("Other BOUND_OPERATOR expression not supported");

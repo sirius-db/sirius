@@ -16,13 +16,6 @@
 
 namespace duckdb {
 
-__global__ void warm_up_gpu(){
-  unsigned int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  float ia, ib;
-  ia = ib = 0.0f;
-  ib += ia + tid; 
-}
-
 __global__ void determine_start_kernel(uint64_t* indices, uint64_t num_strings, uint64_t* worker_start_term, uint64_t num_workers, uint64_t chunk_size, uint64_t last_char) {  
   uint64_t tid = threadIdx.x + blockIdx.x * blockDim.x;
   if(tid >= num_workers) return; 
@@ -114,7 +107,16 @@ __global__ void print_matching_rows(uint64_t* indices, uint64_t total_strings, u
   printf("\n");
 }
 
-__global__ void testprintidx(bool* a, uint64_t N) {
+__global__ void testprintidx(uint64_t* a, uint64_t N) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    for (uint64_t i = 0; i < N; i++) {
+      printf("%ld ", a[i]);
+    }
+    printf("\n");
+  }
+}
+
+__global__ void testprintanswer(bool* a, uint64_t N) {
   if (blockIdx.x == 0 && threadIdx.x == 0) {
     for (uint64_t i = 0; i < N; i++) {
       printf("%d ", a[i]);
@@ -123,7 +125,7 @@ __global__ void testprintidx(bool* a, uint64_t N) {
   }
 }
 
-void StringMatching(char* char_data, uint64_t* str_indices, std::string match_string, uint64_t* &row_id, uint64_t* &count, uint64_t num_chars, uint64_t num_strings) {
+void StringMatching(char* char_data, uint64_t* str_indices, std::string match_string, uint64_t* &row_id, uint64_t* &count, uint64_t num_chars, uint64_t num_strings, int not_equal) {
   CHECK_ERROR();
   GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
   if (num_strings == 0) {
@@ -164,14 +166,13 @@ void StringMatching(char* char_data, uint64_t* str_indices, std::string match_st
   bool* d_answers = reinterpret_cast<bool*> (gpuBufferManager->customCudaMalloc<uint8_t>(num_strings, 0, 0));
   cudaMemset(d_answers, 0, num_strings * sizeof(bool));
   // TODO: Do it twice for more accurate allocation
-  uint64_t* d_matching_rows = gpuBufferManager->customCudaMalloc<uint64_t>(num_strings, 0, 0);
+  // uint64_t* d_matching_rows = gpuBufferManager->customCudaMalloc<uint64_t>(num_strings, 0, 0);
 
   // Copy over the data to the buffers
   cudaMemcpy(d_kmp_automato, kmp_automato, kmp_automato_size * sizeof(int), cudaMemcpyHostToDevice);
 
   // Also set the initial values
-  cudaMemset(d_matching_rows, 0, num_strings * sizeof(uint64_t));
-  cudaMemset(count, 0, sizeof(uint64_t));
+  // cudaMemset(d_matching_rows, 0, num_strings * sizeof(uint64_t));
   CHECK_ERROR();
   
   // Set the start terms
@@ -197,37 +198,24 @@ void StringMatching(char* char_data, uint64_t* str_indices, std::string match_st
   // std::cout << "Actual String matching took " << str_match_time_us/1000.0 << " ms" << std::endl;
   CHECK_ERROR();
 
-  // Create a buffer of the valid idxs
-  auto valid_rows_start_time = std::chrono::high_resolution_clock::now();
-  uint64_t* d_valid_idxs = gpuBufferManager->customCudaMalloc<uint64_t>(num_strings, 0, 0);
-
-  // First get the indices that have true
-  thrust::device_ptr<bool> d_answers_ptr(d_answers);
-  thrust::device_ptr<uint64_t> d_valid_idxs_ptr(d_valid_idxs);
-  auto end = thrust::copy_if(
-    thrust::counting_iterator<uint64_t>(0),
-    thrust::counting_iterator<uint64_t>(num_strings),
-    d_answers_ptr,
-    d_valid_idxs_ptr,
-    thrust::identity<bool>()
-  );
-  CHECK_ERROR();
+  cudaMemset(count, 0, sizeof(uint64_t));
+  compact_valid_rows<BLOCK_THREADS, ITEMS_PER_THREAD><<<((num_strings + BLOCK_THREADS * ITEMS_PER_THREAD - 1)/(BLOCK_THREADS * ITEMS_PER_THREAD)), BLOCK_THREADS>>>(d_answers, row_id, (unsigned long long*) count, num_strings, 1, not_equal);
 
   // Record the number of valid strings
-  // uint64_t num_valid_strings = end - d_valid_idxs_ptr;
-  // printf("Got num valid strings of %d\n", num_valid_strings);
   uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
-  h_count[0] = end - d_valid_idxs_ptr;
-  // cudaMemcpy(h_count, &num_valid_strings, sizeof(uint64_t), cudaMemcpyDeviceToHost);
-  printf("Got num valid strings of %ld\n", h_count[0]);
+  cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+  CHECK_ERROR();
+  row_id = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
+
+  cudaMemset(count, 0, sizeof(uint64_t));
+  compact_valid_rows<BLOCK_THREADS, ITEMS_PER_THREAD><<<((num_strings + BLOCK_THREADS * ITEMS_PER_THREAD - 1)/(BLOCK_THREADS * ITEMS_PER_THREAD)), BLOCK_THREADS>>>(d_answers, row_id, (unsigned long long*) count, num_strings, 0, not_equal);
 
   // Check there are no errors
-  cudaDeviceSynchronize();
   CHECK_ERROR();
 
-  row_id = d_valid_idxs;
   count = h_count;
-  printf("Finished single term string matching\n");
+  printf("Count = %ld\n", h_count[0]);
+  // printf("Finished single term string matching\n");
 }
 
 __global__ void multi_term_kmp_kernel(char* char_data, uint64_t* indices, int* kmp_automato, uint64_t* worker_start_term, 
@@ -286,7 +274,7 @@ __global__ void initialize_term_answers(uint64_t* curr_term_answer, uint64_t num
 }
 
 void MultiStringMatching(char* char_data, uint64_t* str_indices, std::vector<std::string> all_terms,
-       uint64_t* &row_id, uint64_t* &count, uint64_t num_chars, uint64_t num_strings) {
+       uint64_t* &row_id, uint64_t* &count, uint64_t num_chars, uint64_t num_strings, int not_equal) {
   CHECK_ERROR();
   GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
   if (num_strings == 0) {
@@ -335,7 +323,7 @@ void MultiStringMatching(char* char_data, uint64_t* str_indices, std::vector<std
   cudaMemset(d_answer_idxs, 0, num_strings * sizeof(uint64_t));
   bool* d_found_answer = reinterpret_cast<bool*> (gpuBufferManager->customCudaMalloc<uint8_t>(num_strings, 0, 0));
   cudaMemset(d_found_answer, 0, num_strings * sizeof(bool));
-  uint64_t* d_matching_rows = gpuBufferManager->customCudaMalloc<uint64_t>(num_strings, 0, 0);
+  // uint64_t* d_matching_rows = gpuBufferManager->customCudaMalloc<uint64_t>(num_strings, 0, 0);
 
   // Create buffer for each automato
   int** d_all_automatos = new int*[num_terms];
@@ -352,8 +340,7 @@ void MultiStringMatching(char* char_data, uint64_t* str_indices, std::vector<std
   }
 
   // Initialize the other buffers
-  cudaMemset(d_matching_rows, 0, num_strings * sizeof(uint64_t));
-  cudaMemset(count, 0, sizeof(uint64_t));
+  // cudaMemset(d_matching_rows, 0, num_strings * sizeof(uint64_t));
   CHECK_ERROR();
 
   // Determine the start offset for each kernel
@@ -393,31 +380,23 @@ void MultiStringMatching(char* char_data, uint64_t* str_indices, std::vector<std
     }
   }
 
-  // Create a buffer of the valid idxs
-  auto valid_rows_start_time = std::chrono::high_resolution_clock::now();
-  uint64_t* d_valid_idxs = gpuBufferManager->customCudaMalloc<uint64_t>(num_strings, 0, 0);
-
-  // First get the indices that have true
-  thrust::device_ptr<bool> d_answers_ptr(d_found_answer);
-  thrust::device_ptr<uint64_t> d_valid_idxs_ptr(d_valid_idxs);
-  auto end = thrust::copy_if(
-    thrust::counting_iterator<uint64_t>(0),
-    thrust::counting_iterator<uint64_t>(num_strings),
-    d_answers_ptr,
-    d_valid_idxs_ptr,
-    thrust::identity<bool>()
-  );
-  CHECK_ERROR();
+  cudaMemset(count, 0, sizeof(uint64_t));
+  compact_valid_rows<BLOCK_THREADS, ITEMS_PER_THREAD><<<((num_strings + BLOCK_THREADS * ITEMS_PER_THREAD - 1)/(BLOCK_THREADS * ITEMS_PER_THREAD)), BLOCK_THREADS>>>(d_found_answer, row_id, (unsigned long long*) count, num_strings, 1, not_equal);
 
   // Record the number of valid strings
   uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
-  h_count[0] = end - d_valid_idxs_ptr;
+  cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+  CHECK_ERROR();
+  row_id = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
+  cudaMemset(count, 0, sizeof(uint64_t));
+
+  compact_valid_rows<BLOCK_THREADS, ITEMS_PER_THREAD><<<((num_strings + BLOCK_THREADS * ITEMS_PER_THREAD - 1)/(BLOCK_THREADS * ITEMS_PER_THREAD)), BLOCK_THREADS>>>(d_found_answer, row_id, (unsigned long long*) count, num_strings, 0, not_equal);
 
   // Check there are no errors
-  cudaDeviceSynchronize();
   CHECK_ERROR();
 
-  row_id = d_valid_idxs;
+  printf("Count = %ld\n", h_count[0]);
+
   count = h_count;
 }
 
@@ -447,7 +426,7 @@ __global__ void prefix_kernel(char* char_data, uint64_t num_chars, uint64_t* str
   }
 }
 void PrefixMatching(char* char_data, uint64_t* str_indices, std::string match_prefix, uint64_t* &row_id, uint64_t* &count, 
-  uint64_t num_chars, uint64_t num_strings) {
+  uint64_t num_chars, uint64_t num_strings, int not_equal) {
 
   // Allocate the necesary buffers on the GPU
   GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
@@ -472,24 +451,22 @@ void PrefixMatching(char* char_data, uint64_t* str_indices, std::string match_pr
   cudaDeviceSynchronize();
   CHECK_ERROR();
 
-  // Create the valid idx buffer from the valid boolean array
-  uint64_t* d_valid_idxs = gpuBufferManager->customCudaMalloc<uint64_t>(num_strings, 0, 0);
-  thrust::device_ptr<bool> d_answers_ptr(d_results);
-  thrust::device_ptr<uint64_t> d_valid_idxs_ptr(d_valid_idxs);
-
-  auto end = thrust::copy_if(
-      thrust::counting_iterator<uint64_t>(0),
-      thrust::counting_iterator<uint64_t>(num_strings),
-      d_answers_ptr,
-      d_valid_idxs_ptr,
-      thrust::identity<bool>()
-  );
-  CHECK_ERROR();
+  cudaMemset(count, 0, sizeof(uint64_t));
+  compact_valid_rows<BLOCK_THREADS, ITEMS_PER_THREAD><<<((num_strings + BLOCK_THREADS * ITEMS_PER_THREAD - 1)/(BLOCK_THREADS * ITEMS_PER_THREAD)), BLOCK_THREADS>>>(d_results, row_id, (unsigned long long*) count, num_strings, 1, not_equal);
 
   // Record the number of valid strings
   uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
-  h_count[0] = end - d_valid_idxs_ptr;
-  row_id = d_valid_idxs;
+  cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+  CHECK_ERROR();
+  row_id = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
+  cudaMemset(count, 0, sizeof(uint64_t));
+
+  compact_valid_rows<BLOCK_THREADS, ITEMS_PER_THREAD><<<((num_strings + BLOCK_THREADS * ITEMS_PER_THREAD - 1)/(BLOCK_THREADS * ITEMS_PER_THREAD)), BLOCK_THREADS>>>(d_results, row_id, (unsigned long long*) count, num_strings, 0, not_equal);
+
+  // Check there are no errors
+  cudaDeviceSynchronize();
+  CHECK_ERROR();
+
   count = h_count;
   std::cout << "PrefixMatching got count of " << h_count[0] << std::endl;
 }

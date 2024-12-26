@@ -22,7 +22,7 @@ std::vector<std::string> string_split(std::string s, std::string delimiter) {
     return tokens;
 }
 
-void HandleStringMatching(GPUColumn* string_column, std::string match_string, uint64_t* &row_id, uint64_t* &count) {
+void HandleStringMatching(GPUColumn* string_column, std::string match_string, uint64_t* &row_id, uint64_t* &count, int not_equal) {
 
     DataWrapper str_data_wrapper = string_column->data_wrapper;
     uint64_t num_chars = str_data_wrapper.num_bytes;
@@ -30,11 +30,11 @@ void HandleStringMatching(GPUColumn* string_column, std::string match_string, ui
     uint64_t num_strings = string_column->column_length;
     uint64_t* d_str_indices = str_data_wrapper.offset;
 
-    StringMatching(d_char_data, d_str_indices, match_string, row_id, count, num_chars, num_strings);
+    StringMatching(d_char_data, d_str_indices, match_string, row_id, count, num_chars, num_strings, not_equal);
 
 }
 
-void HandleMultiStringMatching(GPUColumn* string_column, std::string match_string, uint64_t* &row_id, uint64_t* &count) {
+void HandleMultiStringMatching(GPUColumn* string_column, std::string match_string, uint64_t* &row_id, uint64_t* &count, int not_equal) {
 
     std::vector<std::string> match_terms = string_split(match_string, "%");
     DataWrapper str_data_wrapper = string_column->data_wrapper;
@@ -43,18 +43,18 @@ void HandleMultiStringMatching(GPUColumn* string_column, std::string match_strin
     uint64_t num_strings = string_column->column_length;
     uint64_t* d_str_indices = reinterpret_cast<uint64_t*>(str_data_wrapper.offset);
 
-    MultiStringMatching(d_char_data, d_str_indices, match_terms, row_id, count, num_chars, num_strings);
+    MultiStringMatching(d_char_data, d_str_indices, match_terms, row_id, count, num_chars, num_strings, not_equal);
 
 }
 
-void HandlePrefixMatching(GPUColumn* string_column, std::string match_prefix, uint64_t* &row_id, uint64_t* &count) {
+void HandlePrefixMatching(GPUColumn* string_column, std::string match_prefix, uint64_t* &row_id, uint64_t* &count, int not_equal) {
   
     DataWrapper str_data_wrapper = string_column->data_wrapper;
     uint64_t num_chars = str_data_wrapper.num_bytes;
     char* d_char_data = reinterpret_cast<char*>(str_data_wrapper.data);
     uint64_t num_strings = string_column->column_length;
     uint64_t* d_str_indices = str_data_wrapper.offset;
-    PrefixMatching(d_char_data, d_str_indices, match_prefix, row_id, count, num_chars, num_strings);
+    PrefixMatching(d_char_data, d_str_indices, match_prefix, row_id, count, num_chars, num_strings, not_equal);
 }
 
 } // namespace duckdb
