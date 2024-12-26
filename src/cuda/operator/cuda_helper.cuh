@@ -69,3 +69,70 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
 #define BLOCK_THREADS 128
 #define ITEMS_PER_THREAD 4 
 // #define TILE_SIZE (BLOCK_THREADS * ITEMS_PER_THREAD)
+
+template <int B, int I>
+__global__ void compact_valid_rows(bool* selection_flags, uint64_t* row_ids, unsigned long long* count, uint64_t N, int is_count, int not_equal) {
+
+    typedef cub::BlockScan<int, B> BlockScanInt;
+
+    __shared__ union TempStorage
+    {
+        typename BlockScanInt::TempStorage scan;
+    } temp_storage;
+
+    uint64_t tile_size = B * I;
+    uint64_t tile_offset = blockIdx.x * tile_size;
+
+    uint64_t num_tiles = (N + tile_size - 1) / tile_size;
+    uint64_t num_tile_items = tile_size;
+
+    int t_count = 0; // Number of items selected per thread
+    int c_t_count = 0; //Prefix sum of t_count
+    __shared__ uint64_t block_off;
+
+    if (blockIdx.x == num_tiles - 1) {
+        num_tile_items = N - tile_offset;
+    }
+
+    #pragma unroll
+    for (int ITEM = 0; ITEM < I; ++ITEM) {
+        if (threadIdx.x + ITEM * B < num_tile_items) {
+            bool is_selected = selection_flags[tile_offset + threadIdx.x + ITEM * B];
+            if (not_equal) {
+              if(!is_selected) t_count++;
+            } else {
+              if(is_selected) t_count++;
+            }
+        }
+    }
+
+    //Barrier
+    __syncthreads();
+
+    BlockScanInt(temp_storage.scan).ExclusiveSum(t_count, c_t_count); //doing a prefix sum of all the previous threads in the block and store it to c_t_count
+    if(threadIdx.x == blockDim.x - 1) { //if the last thread in the block, add the prefix sum of all the prev threads + sum of my threads to global variable total
+        block_off = atomicAdd(count, (unsigned long long) t_count+c_t_count); //the previous value of total is gonna be assigned to block_off
+    } //block_off does not need to be global (it's just need to be shared), because it will get the previous value from total which is global
+
+    __syncthreads();
+
+    if (is_count) return;
+
+    #pragma unroll
+    for (int ITEM = 0; ITEM < I; ++ITEM) {
+        if (threadIdx.x + ITEM * B < num_tile_items) {
+            bool is_selected = selection_flags[tile_offset + threadIdx.x + ITEM * B];
+            if (not_equal) {
+              if(!is_selected) {
+                uint64_t offset = block_off + c_t_count++;
+                row_ids[offset] = tile_offset + threadIdx.x + ITEM * B;
+              }
+            } else {
+              if(is_selected) {
+                uint64_t offset = block_off + c_t_count++;
+                row_ids[offset] = tile_offset + threadIdx.x + ITEM * B;
+              }
+            }
+        }
+    }
+}
