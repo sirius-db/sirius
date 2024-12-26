@@ -7,25 +7,25 @@
 namespace duckdb {
 
 template <typename T>
-__global__ void test(T* a, uint64_t N) {
+__global__ void print_gpu_column(T* a, uint64_t N) {
     if (blockIdx.x == 0 && threadIdx.x == 0) {
         for (uint64_t i = 0; i < N; i++) {
-            printf("a: %.2f ", a[i]);
+            printf("a: %ld ", a[i]);
         }
         printf("\n");
     }
 }
 
 template
-__global__ void test<uint64_t>(uint64_t* a, uint64_t N);
+__global__ void print_gpu_column<uint64_t>(uint64_t* a, uint64_t N);
 template
-__global__ void test<double>(double* a, uint64_t N);
+__global__ void print_gpu_column<double>(double* a, uint64_t N);
 template
-__global__ void test<int>(int* a, uint64_t N);
+__global__ void print_gpu_column<int>(int* a, uint64_t N);
 template
-__global__ void test<float>(float* a, uint64_t N);
+__global__ void print_gpu_column<float>(float* a, uint64_t N);
 template
-__global__ void test<uint8_t>(uint8_t* a, uint64_t N);
+__global__ void print_gpu_column<uint8_t>(uint8_t* a, uint64_t N);
 
 template <typename T> 
 void printGPUColumn(T* a, size_t N, int gpu) {
@@ -40,7 +40,7 @@ void printGPUColumn(T* a, size_t N, int gpu) {
     cudaDeviceSynchronize();
     printf("Result: %ld and N: %d\n", result_host_temp[0], N);
     printf("N: %ld\n", N);
-    test<T><<<1, 1>>>(a, N);
+    print_gpu_column<T><<<1, 1>>>(a, N);
     CHECK_ERROR();
     cudaDeviceSynchronize();
 }

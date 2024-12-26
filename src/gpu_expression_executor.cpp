@@ -1,5 +1,7 @@
 #include "gpu_expression_executor.hpp"
 #include "operator/gpu_materialize.hpp"
+#include "operator/gpu_physical_strings_matching.hpp"
+#include "operator/gpu_physical_substring.hpp"
 
 namespace duckdb {
 
@@ -302,8 +304,36 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
           } case ExpressionClass::BOUND_FUNCTION: {
                 printf("Executing function expression\n");
                 auto &bound_function = expr.Cast<BoundFunctionExpression>();
-                for (auto &child : bound_function.children) {
-                    FilterRecursiveExpression(input_relation, output_relation, *child, depth + 1);
+                // for (auto &child : bound_function.children) {
+                //     FilterRecursiveExpression(input_relation, output_relation, *child, depth + 1);
+                // }
+                std::string bound_function_name = bound_function.ToString();
+                if (bound_function.children[0]->type != ExpressionType::BOUND_REF) {
+                  throw NotImplementedException("Contains function not supported");
+                }
+                printf("Function name %s\n", bound_function_name.c_str());
+                auto& bound_ref = bound_function.children[0]->Cast<BoundReferenceExpression>();
+                auto& bound_const = bound_function.children[1]->Cast<BoundConstantExpression>();
+                std::string match_str = bound_const.value.ToString();
+                if (input_relation.columns[bound_ref.index]->data_wrapper.data == nullptr) {
+                    printf("Column is null\n");
+                    count = new uint64_t[1];
+                    count[0] = 0;
+                } else {
+                  count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+                  GPUColumn* materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref.index], bound_ref, gpuBufferManager);
+                  if(bound_function_name.find("prefix") != std::string::npos) {
+                    HandlePrefixMatching(materialized_column, match_str, comparison_idx, count, 0);
+                  } else if(bound_function_name.find("contains") != std::string::npos) {
+                    HandleStringMatching(materialized_column, match_str, comparison_idx, count, 0);
+                  } else if(bound_function_name.find("!~~") != std::string::npos) {
+                    HandleMultiStringMatching(materialized_column, match_str, comparison_idx, count, 1);
+                  } else if(bound_function_name.find("~~") != std::string::npos) {
+                    HandleMultiStringMatching(materialized_column, match_str, comparison_idx, count, 0);
+                  } else {
+                    throw NotImplementedException("Function not supported");
+                  }
+                  if (count[0] == 0) throw NotImplementedException("No match found");
                 }
             break;
           } case ExpressionClass::BOUND_OPERATOR: {
@@ -314,18 +344,42 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
                 // }
                 if (bound_operator.type == ExpressionType::OPERATOR_NOT) {
                     printf("Executing NOT expression\n");
-                    auto &bound_ref = bound_operator.children[0]->Cast<BoundReferenceExpression>();
-                    if (input_relation.columns[bound_ref.index]->data_wrapper.data == nullptr || input_relation.columns[bound_ref.index]->data_wrapper.data == nullptr) {
-                        printf("Column is null\n");
-                        count = new uint64_t[1];
-                        count[0] = 0;
-                    } else {
-                      GPUColumn* materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref.index], bound_ref, gpuBufferManager);
-                      Value one = Value::BOOLEAN(1);
-                      BoundConstantExpression bound_constant_expr = BoundConstantExpression(one);
-                      count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
-                      HandleComparisonConstantExpression(materialized_column, bound_constant_expr, bound_constant_expr, count, comparison_idx, ExpressionType::COMPARE_NOTEQUAL);
-                      if (count[0] == 0) throw NotImplementedException("No match found"); 
+                    // if children is a bound reference
+                    if (bound_operator.children[0]->expression_class == ExpressionClass::BOUND_REF) {
+                      auto &bound_ref = bound_operator.children[0]->Cast<BoundReferenceExpression>();
+                      if (input_relation.columns[bound_ref.index]->data_wrapper.data == nullptr) {
+                          printf("Column is null\n");
+                          count = new uint64_t[1];
+                          count[0] = 0;
+                      } else {
+                        GPUColumn* materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref.index], bound_ref, gpuBufferManager);
+                        Value one = Value::BOOLEAN(1);
+                        BoundConstantExpression bound_constant_expr = BoundConstantExpression(one);
+                        count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+                        HandleComparisonConstantExpression(materialized_column, bound_constant_expr, bound_constant_expr, count, comparison_idx, ExpressionType::COMPARE_NOTEQUAL);
+                        if (count[0] == 0) throw NotImplementedException("No match found"); 
+                      }
+                    // if children is a bound function (contains or prefix)
+                    } else if (bound_operator.children[0]->expression_class == ExpressionClass::BOUND_FUNCTION) {
+                      auto& bound_function = bound_operator.children[0]->Cast<BoundFunctionExpression>();
+                      std::string bound_function_name = bound_function.ToString();
+                      auto& bound_ref = bound_function.children[0]->Cast<BoundReferenceExpression>();
+                      auto& bound_const = bound_function.children[1]->Cast<BoundConstantExpression>();
+                      std::string match_str = bound_const.value.ToString();
+                      if (input_relation.columns[bound_ref.index]->data_wrapper.data == nullptr) {
+                          printf("Column is null\n");
+                          count = new uint64_t[1];
+                          count[0] = 0;
+                      } else {
+                        count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+                        GPUColumn* materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref.index], bound_ref, gpuBufferManager);
+                        if(bound_function_name.find("prefix") != std::string::npos) {
+                            HandlePrefixMatching(materialized_column, match_str, comparison_idx, count, 1);
+                        } else if(bound_function_name.find("contains") != std::string::npos) {
+                            HandleStringMatching(materialized_column, match_str, comparison_idx, count, 1);
+                        } 
+                        if (count[0] == 0) throw NotImplementedException("No match found");
+                      }
                     }
                 } else {
                   throw NotImplementedException("Other BOUND_OPERATOR expression not supported");
@@ -426,11 +480,18 @@ GPUExpressionExecutor::ProjectionRecursiveExpression(GPUIntermediateRelation& in
         } case ExpressionClass::BOUND_FUNCTION: {
               printf("Executing function expression\n");
               auto &bound_function = expr.Cast<BoundFunctionExpression>();
-              // for (auto &child : bound_function.children) {
-              //     ProjectionRecursiveExpression(input_relation, output_relation, *child, output_idx, depth + 1);
-              // }
-
-              if (bound_function.children[1]->expression_class == ExpressionClass::BOUND_CONSTANT) {
+              printf("Function name %s\n", bound_function.function.name.c_str());
+              if((bound_function.ToString().find("substr") != std::string::npos) || (bound_function.ToString().find("substring") != std::string::npos)) {
+                auto &bound_ref1 = bound_function.children[0]->Cast<BoundReferenceExpression>();
+                auto &bound_ref2 = bound_function.children[1]->Cast<BoundConstantExpression>();
+                auto &bound_ref3 = bound_function.children[2]->Cast<BoundConstantExpression>();
+                GPUColumn* input_column = input_relation.columns[bound_ref1.index];
+                uint64_t start_idx = bound_ref2.value.GetValue<uint64_t>();
+                if (start_idx < 1) throw InvalidInputException("Start index should be greater than 0");
+                uint64_t length = bound_ref3.value.GetValue<uint64_t>();
+                GPUColumn* materialized_column = HandleMaterializeExpression(input_column, bound_ref1, gpuBufferManager);
+                result = HandleSubString(materialized_column, start_idx, length);
+              } else if (bound_function.children[1]->expression_class == ExpressionClass::BOUND_CONSTANT) {
                   auto &bound_ref1 = bound_function.children[0]->Cast<BoundReferenceExpression>();
                   auto &bound_ref2 = bound_function.children[1]->Cast<BoundConstantExpression>();
                   GPUColumn* materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref1.index], bound_ref1, gpuBufferManager);

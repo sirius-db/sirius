@@ -198,9 +198,44 @@ GPUExpressionExecutor::HandlingSpecificFilter(GPUIntermediateRelation& input_rel
                     }
                 }
             }
-
-
-
+        }
+       
+        if (expression.type == ExpressionType::COMPARE_IN) {
+             BoundOperatorExpression& in_expr = expression.Cast<BoundOperatorExpression>();
+             if (in_expr.children.size() == 8 || in_expr.children.size() == 4) {
+                string t = "(substr(C_PHONE, 1, 2) IN ('13', '31', '23', '29', '30', '18', '17'))";
+                if (!expression.ToString().compare(t)) {
+                    auto &bound_function = in_expr.children[0]->Cast<BoundFunctionExpression>();
+                    auto &bound_ref = bound_function.children[0]->Cast<BoundReferenceExpression>();
+                    GPUColumn* input_column = input_relation.columns[bound_ref.index];
+                    uint64_t start_idx = 0;
+                    uint64_t length = 2;
+                    GPUColumn* materialized_column = HandleMaterializeExpression(input_column, bound_ref, gpuBufferManager);
+                    size_t size = materialized_column->column_length;
+                    uint8_t* a = materialized_column->data_wrapper.data;
+                    uint64_t* offset = materialized_column->data_wrapper.offset;
+                    string c_phone_val_str = "13312329301817";
+                    count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+                    q22FilterExpression(a, offset, start_idx, length, c_phone_val_str, comparison_idx, count, size, 8);
+                }
+                t = "(substr(C_PHONE, 1, 2) IN ('13', '31', '23'))";
+                if (!expression.ToString().compare(t)) {
+                    auto &bound_function = in_expr.children[0]->Cast<BoundFunctionExpression>();
+                    auto &bound_ref = bound_function.children[0]->Cast<BoundReferenceExpression>();
+                    GPUColumn* input_column = input_relation.columns[bound_ref.index];
+                    uint64_t start_idx = 0;
+                    uint64_t length = 2;
+                    GPUColumn* materialized_column = HandleMaterializeExpression(input_column, bound_ref, gpuBufferManager);
+                    size_t size = materialized_column->column_length;
+                    uint8_t* a = materialized_column->data_wrapper.data;
+                    uint64_t* offset = materialized_column->data_wrapper.offset;
+                    string c_phone_val_str = "133123";
+                    count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+                    q22FilterExpression(a, offset, start_idx, length, c_phone_val_str, comparison_idx, count, size, 8);
+                }
+             } else {
+                throw NotImplementedException("IN expression not supported");
+             }
         }
 
         if (count && comparison_idx) {

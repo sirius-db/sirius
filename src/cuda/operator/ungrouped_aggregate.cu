@@ -1,7 +1,6 @@
 #include "cuda_helper.cuh"
 #include "gpu_physical_ungrouped_aggregate.hpp"
 #include "gpu_buffer_manager.hpp"
-#include <cuda/atomic>
 
 namespace duckdb {
 
