@@ -63,6 +63,7 @@ public:
 	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
 
 	template <typename T> void FinalMaterializeInternal(GPUIntermediateRelation input_relation, GPUIntermediateRelation& output_relation, size_t col) const;
+	void FinalMaterializeString(GPUIntermediateRelation input_relation, GPUIntermediateRelation& output_relation, size_t col) const;
 	size_t FinalMaterialize(GPUIntermediateRelation input_relation, GPUIntermediateRelation& output_relation, size_t col) const;
 
 	// bool ParallelSink() const override;

@@ -529,4 +529,113 @@ void q7FilterExpression(uint64_t *n1_nationkey, uint64_t *n2_nationkey, uint64_t
     printf("Count: %lu\n", h_count[0]);
 }
 
+__global__ void q22_filter(char* a, uint64_t* offset, uint64_t start_idx, uint64_t length, uint8_t** d_c_phone_val, 
+            int num_predicates, uint64_t* row_ids, unsigned long long* count, uint64_t N, bool is_count) {
+
+    // Get which string this thread workers on
+    uint64_t tid = threadIdx.x + blockIdx.x * blockDim.x;
+    if(tid >= N) return; 
+
+    // Determine the range for this substring
+    uint64_t curr_str_start_idx = offset[tid]; uint64_t curr_str_end_idx = offset[tid + 1];
+    uint64_t substring_start_idx = min(curr_str_start_idx + start_idx, curr_str_end_idx);
+
+    int t_count = 0; // Number of items selected per thread
+    // int c_t_count = 0; //Prefix sum of t_count
+    bool match = false;
+
+    __syncthreads();
+
+    for (int i = 0; i < num_predicates; i++) {
+        bool local_match = true;
+        for (int j = 0; j < length; j++) {
+            if (a[substring_start_idx + j] != d_c_phone_val[i][j]) {
+                local_match = false;
+                break;
+            }
+        }
+        if (local_match) {
+            // printf("%c %c %c %c\n", a[substring_start_idx], a[substring_start_idx + 1], d_c_phone_val[i][0], d_c_phone_val[i][1]);
+            match = true;
+            t_count = 1;
+            break;
+        }
+    }
+
+    __shared__ unsigned long long buffer[1];
+    __shared__ uint64_t block_off;
+
+    if (threadIdx.x == 0) buffer[0] = 0;
+    __syncthreads();
+
+    unsigned long long local_idx = atomicAdd(buffer, (unsigned long long) t_count); //add the sum of t_count to global variable total
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        block_off = atomicAdd(count, buffer[0]);
+    }
+    __syncthreads();
+
+    if (is_count) return;
+
+    if (match) {
+        // if (block_off >= 41996) printf("Warning here %ld %d %ld %ld\n", block_off, c_t_count, tid, N);
+        // uint64_t idx = block_off + c_t_count;
+        row_ids[block_off + local_idx] = tid;
+    }
+}
+
+__global__ void printstring(uint8_t* a, uint64_t* offset, uint64_t N) {
+    for (int i = 0; i < 100; i++) {
+        printf("%c %c %c %c %c\n", a[offset[i]], a[offset[i] + 1], a[offset[i] + 2], a[offset[i] + 3], a[offset[i] + 4]);
+    }
+    printf("\n");
+}
+
+void q22FilterExpression(uint8_t *a, uint64_t* offset, uint64_t start_idx, uint64_t length, string c_phone_val, uint64_t* &row_ids, uint64_t* &count, uint64_t N, int num_predicates) {
+    CHECK_ERROR();
+    if (N == 0) {
+        uint64_t* h_count = new uint64_t[1];
+        h_count[0] = 0;
+        count = h_count;
+        printf("N is 0\n");
+        return;
+    }
+    printf("Launching Q22 Filter Kernel\n");
+
+    GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+
+    uint8_t* temp = gpuBufferManager->customCudaMalloc<uint8_t>(num_predicates * length, 0, 0);
+    cudaMemcpy(temp, c_phone_val.c_str(), num_predicates * length * sizeof(uint8_t), cudaMemcpyHostToDevice);
+    uint8_t** h_c_phone_val = new uint8_t*[num_predicates];
+    for (int i = 0; i < num_predicates; i++) {
+        h_c_phone_val[i] = temp + i * length;
+    }
+    uint8_t** d_c_phone_val;
+    cudaMalloc((void**) &d_c_phone_val, num_predicates * sizeof(uint8_t*));
+    cudaMemcpy(d_c_phone_val, h_c_phone_val, num_predicates * sizeof(uint8_t*), cudaMemcpyHostToDevice);
+    cudaMemset(count, 0, sizeof(uint64_t));
+
+    printf("N is %ld\n", N);
+    uint64_t num_blocks = (N + 128 - 1)/128;
+
+    // printstring<<<1, 1>>>(a, offset, N);
+
+    q22_filter<<<num_blocks, 128>>>(reinterpret_cast<char*>(a), offset, start_idx, length, d_c_phone_val, 
+            num_predicates, row_ids, (unsigned long long*) count, N, 1);
+    CHECK_ERROR();
+    
+    uint64_t* h_count = new uint64_t[1];
+    cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+    row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
+
+    cudaMemset(count, 0, sizeof(uint64_t));
+    q22_filter<<<num_blocks, 128>>>(reinterpret_cast<char*>(a), offset, start_idx, length, d_c_phone_val, 
+            num_predicates, row_ids, (unsigned long long*) count, N, 0);
+    CHECK_ERROR();
+    cudaDeviceSynchronize();
+    count = h_count;
+    printf("Count: %lu\n", h_count[0]);
+}
+
 } // namespace duckdb
