@@ -66,6 +66,7 @@ GPUColumn::GPUColumn(size_t _column_length, ColumnType type, uint8_t* data) {
     data_wrapper.num_bytes = column_length * data_wrapper.getColumnTypeSize();
     // if (data == nullptr) isNull = 1;
     // else isNull = 0;
+    is_unique = false;
 }
 
 GPUColumn::GPUColumn(string _name, size_t _column_length, ColumnType type, uint8_t* data) {
@@ -77,6 +78,7 @@ GPUColumn::GPUColumn(string _name, size_t _column_length, ColumnType type, uint8
     data_wrapper.num_bytes = column_length * data_wrapper.getColumnTypeSize();
     // if (data == nullptr) isNull = 1;
     // else isNull = 0;
+    is_unique = false;
 }
 
 GPUColumn::GPUColumn(string _name, size_t _column_length, ColumnType type, uint8_t* data, uint64_t* offset, size_t num_bytes, bool is_string_data) {
@@ -90,6 +92,7 @@ GPUColumn::GPUColumn(string _name, size_t _column_length, ColumnType type, uint8
     } else {
         data_wrapper.num_bytes = column_length * data_wrapper.getColumnTypeSize();
     }
+    is_unique = false;
 }
 
 GPUColumn::GPUColumn(size_t _column_length, ColumnType type, uint8_t* data, uint64_t* offset, size_t num_bytes, bool is_string_data) {
@@ -102,6 +105,7 @@ GPUColumn::GPUColumn(size_t _column_length, ColumnType type, uint8_t* data, uint
     } else {
         data_wrapper.num_bytes = column_length * data_wrapper.getColumnTypeSize();
     }
+    is_unique = false;
 }
 
 GPUColumn::GPUColumn(const GPUColumn& other) {
@@ -111,6 +115,7 @@ GPUColumn::GPUColumn(const GPUColumn& other) {
     row_id_count = other.row_id_count;
     column_length = other.column_length;
     // isString = other.isString;
+    is_unique = other.is_unique;
 }
 
 GPUIntermediateRelation::GPUIntermediateRelation(size_t column_count) :
