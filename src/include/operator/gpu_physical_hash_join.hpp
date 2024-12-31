@@ -13,12 +13,6 @@
 
 namespace duckdb {
 
-// template <typename T>
-// void buildHashTableOri(uint64_t *keys, unsigned long long* ht, uint64_t ht_len, uint64_t N, int mode);
-
-// template <typename T>
-// void probeHashTableOri(uint64_t *keys, unsigned long long* ht, uint64_t ht_len, uint64_t* &row_ids_left, uint64_t* &row_ids_right, uint64_t* &count, uint64_t N, int mode);
-
 void probeHashTable(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t* &row_ids_left, uint64_t* &row_ids_right, uint64_t* &count, 
 			uint64_t N, int* condition_mode, int num_keys, bool is_right);
 
@@ -26,6 +20,8 @@ void probeHashTableRightSemiAnti(uint8_t **keys, unsigned long long* ht, uint64_
 
 void probeHashTableSingleMatch(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t* &row_ids_left, uint64_t* &row_ids_right, 
             uint64_t* &count, uint64_t N, int* condition_mode, int num_keys, int join_mode);
+
+void probeHashTableRightSemiAntiSingleMatch(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t N, int* condition_mode, int num_keys);
 
 void probeHashTableMark(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uint8_t* &output, uint64_t N, int* condition_mode, int num_keys);
 
@@ -64,6 +60,10 @@ public:
 
 	//! Duplicate eliminated types; only used for delim_joins (i.e. correlated subqueries)
 	vector<LogicalType> delim_types;
+
+	mutable bool unique_build_keys = false;
+
+	mutable bool unique_probe_keys = false;
 
 	// OperatorResultType Execute(ExecutionContext &context, GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation,
 	// 									GlobalOperatorState &gstate, OperatorState &state) const override;

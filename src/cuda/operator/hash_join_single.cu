@@ -14,6 +14,46 @@ __device__ uint64_t hash64(uint64_t key1, uint64_t key2) {
 }
 
 template <int B, int I>
+__global__ void probe_right_semi_anti_single(uint64_t **keys, unsigned long long* ht, uint64_t ht_len,
+            uint64_t N, int* condition_mode, int num_keys, int equal_keys) {
+
+    uint64_t tile_size = B * I;
+    uint64_t tile_offset = blockIdx.x * tile_size;
+
+    uint64_t num_tiles = (N + tile_size - 1) / tile_size;
+    uint64_t num_tile_items = tile_size;
+
+    if (blockIdx.x == num_tiles - 1) {
+        num_tile_items = N - tile_offset;
+    }
+
+    #pragma unroll
+    for (int ITEM = 0; ITEM < I; ITEM++) {
+        if (threadIdx.x + (ITEM * B) < num_tile_items) {
+            
+            uint64_t slot;
+            if (equal_keys == 1) slot = keys[0][tile_offset + threadIdx.x + ITEM * B] % ht_len;
+            else if (equal_keys == 2) slot = hash64(keys[0][tile_offset + threadIdx.x + ITEM * B], keys[1][tile_offset + threadIdx.x + ITEM * B]) % ht_len;
+            else cudaAssert(0);
+            
+            while (ht[slot * (num_keys + 2)] != 0xFFFFFFFFFFFFFFFF) {
+                bool local_found = 1;
+                for (int n = 0; n < num_keys; n++) {
+                    uint64_t item = keys[n][tile_offset + threadIdx.x + ITEM * B];
+                    if (condition_mode[n] == 0 && ht[slot * (num_keys + 2) + n] != item) local_found = 0;
+                    else if (condition_mode[n] == 1 && ht[slot * (num_keys + 2) + n] == item) local_found = 0;
+                }
+                if (local_found) {
+                    ht[slot * (num_keys + 2) + num_keys + 1] = tile_offset + threadIdx.x + ITEM * B;
+                    break;
+                }
+                slot = (slot + 100007) % ht_len;
+            }
+        }
+    }
+}
+
+template <int B, int I>
 __global__ void probe_single_match(uint64_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t *row_ids_left, uint64_t *row_ids_right, unsigned long long* count, 
             uint64_t N, int* condition_mode, int num_keys, int equal_keys, int join_mode, bool is_count) {
 
@@ -46,7 +86,10 @@ __global__ void probe_single_match(uint64_t **keys, unsigned long long* ht, uint
         selection_flags[ITEM] = 0;
     }
 
-    int n_ht_column = num_keys + 1;
+    // int n_ht_column = num_keys + 1;
+    int n_ht_column;
+    if (join_mode == 3) n_ht_column = num_keys + 2;
+    else n_ht_column = num_keys + 1;
 
     #pragma unroll
     for (int ITEM = 0; ITEM < I; ITEM++) {
@@ -80,6 +123,7 @@ __global__ void probe_single_match(uint64_t **keys, unsigned long long* ht, uint
                 }
             } else {
                 if (found) {
+                    if (join_mode == 3) ht[slot * (num_keys + 2) + num_keys + 1] = tile_offset + threadIdx.x + ITEM * B;
                     t_count++;
                     selection_flags[ITEM] = 1;
                 }
@@ -104,12 +148,11 @@ __global__ void probe_single_match(uint64_t **keys, unsigned long long* ht, uint
         if (threadIdx.x + ITEM * B < num_tile_items) {
             if(selection_flags[ITEM]) {
                 uint64_t offset = block_off + c_t_count++;
-                if (join_mode == 0) { // inner join
+                if (join_mode == 0 || join_mode == 3) { // inner join and right join
                     row_ids_right[offset] = items_off[ITEM];
                     row_ids_left[offset] = tile_offset + threadIdx.x + ITEM * B;
                 } else if (join_mode == 1 || join_mode == 2) { // semi join and anti join
                     row_ids_left[offset] = tile_offset + threadIdx.x + ITEM * B;
-                    // printf("row_ids_left[%lu] = %lu\n", offset, row_ids_left[offset]);
                 } else {
                     cudaAssert(0);
                 }
@@ -164,17 +207,6 @@ __global__ void probe_mark(uint64_t **keys, unsigned long long* ht, uint64_t ht_
     }
 }
 
-__global__ void print_key2(uint64_t* a, uint64_t N) {
-    if (blockIdx.x == 0 && threadIdx.x == 0) {
-        int x = N;
-        if (N > 1000) x = 1000;
-        for (uint64_t i = 0; i < x; i++) {
-            printf("%ld ", a[i]);
-        }
-        printf("\n");
-    }
-}
-
 template
 __global__ void probe_single_match<BLOCK_THREADS, ITEMS_PER_THREAD>(uint64_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t *row_ids_left, uint64_t *row_ids_right, unsigned long long* count, 
             uint64_t N, int* condition_mode, int num_keys, int equal_keys, int join_mode, bool is_count);
@@ -183,6 +215,9 @@ template
 __global__ void probe_mark<BLOCK_THREADS, ITEMS_PER_THREAD>(uint64_t **keys, unsigned long long* ht, uint64_t ht_len, uint8_t* output,
             uint64_t N, int* condition_mode, int num_keys, int equal_keys);
 
+template
+__global__ void probe_right_semi_anti_single<BLOCK_THREADS, ITEMS_PER_THREAD>(uint64_t **keys, unsigned long long* ht, uint64_t ht_len,
+            uint64_t N, int* condition_mode, int num_keys, int equal_keys);
 
 void probeHashTableSingleMatch(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t* &row_ids_left, uint64_t* &row_ids_right, 
             uint64_t* &count, uint64_t N, int* condition_mode, int num_keys, int join_mode) {
@@ -227,16 +262,50 @@ void probeHashTableSingleMatch(uint8_t **keys, unsigned long long* ht, uint64_t 
     cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
     assert(h_count[0] > 0);
     row_ids_left = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
-    if (join_mode == 0) row_ids_right = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
+    if (join_mode == 0 || join_mode == 3) row_ids_right = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
     cudaMemset(count, 0, sizeof(uint64_t));
     probe_single_match<BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(keys_dev, ht, ht_len, row_ids_left, row_ids_right, (unsigned long long*) count, 
             N, condition_mode_dev, num_keys, equal_keys, join_mode, 0);
     CHECK_ERROR();
     cudaDeviceSynchronize();
 
-    // print_key2<<<1, 1>>>(row_ids_left, h_count[0]);
     printf("Count: %lu\n", h_count[0]);
     count = h_count;
+}
+
+void probeHashTableRightSemiAntiSingleMatch(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t N, int* condition_mode, int num_keys) {
+    CHECK_ERROR();
+    if (N == 0) {
+        printf("N is 0\n");
+        return;
+    }
+    printf("Launching Probe Kernel\n");
+    GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+
+    //reinterpret cast the keys to uint64_t
+    uint64_t** keys_data = new uint64_t*[num_keys];
+    for (int idx = 0; idx < num_keys; idx++) {
+        keys_data[idx] = reinterpret_cast<uint64_t*>(keys[idx]);
+    }
+
+    uint64_t** keys_dev;
+    cudaMalloc((void**) &keys_dev, num_keys * sizeof(uint64_t*));
+    cudaMemcpy(keys_dev, keys_data, num_keys * sizeof(uint64_t*), cudaMemcpyHostToDevice);
+
+    int equal_keys = 0;
+    for (int idx = 0; idx < num_keys; idx++) {
+        if (condition_mode[idx] == 0) equal_keys++;
+    }
+
+    int* condition_mode_dev = gpuBufferManager->customCudaMalloc<int>(num_keys, 0, 0);
+    cudaMemcpy(condition_mode_dev, condition_mode, num_keys * sizeof(int), cudaMemcpyHostToDevice);
+
+    int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
+    probe_right_semi_anti_single<BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(keys_dev, ht, ht_len, N, condition_mode_dev, num_keys, equal_keys);
+    CHECK_ERROR();
+    cudaDeviceSynchronize();
+
+    printf("Finished probe right\n");
 }
 
 void probeHashTableMark(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uint8_t* &output, uint64_t N, int* condition_mode, int num_keys) {
@@ -253,25 +322,21 @@ void probeHashTableMark(uint8_t **keys, unsigned long long* ht, uint64_t ht_len,
     for (int idx = 0; idx < num_keys; idx++) {
         keys_data[idx] = reinterpret_cast<uint64_t*>(keys[idx]);
     }
-    printf("Launching Probe Kernel\n");
 
     uint64_t** keys_dev;
     cudaMalloc((void**) &keys_dev, num_keys * sizeof(uint64_t*));
     cudaMemcpy(keys_dev, keys_data, num_keys * sizeof(uint64_t*), cudaMemcpyHostToDevice);
 
     CHECK_ERROR();
-    printf("Launching Probe Kernel\n");
 
     int equal_keys = 0;
     for (int idx = 0; idx < num_keys; idx++) {
         if (condition_mode[idx] == 0) equal_keys++;
     }
-    printf("Launching Probe Kernel\n");
 
     int* condition_mode_dev = gpuBufferManager->customCudaMalloc<int>(num_keys, 0, 0);
     cudaMemcpy(condition_mode_dev, condition_mode, num_keys * sizeof(int), cudaMemcpyHostToDevice);
     output = gpuBufferManager->customCudaMalloc<uint8_t>(N, 0, 0);
-    printf("Launching Probe Kernel\n");
 
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
     CHECK_ERROR();
@@ -279,7 +344,6 @@ void probeHashTableMark(uint8_t **keys, unsigned long long* ht, uint64_t ht_len,
             N, condition_mode_dev, num_keys, equal_keys);
     CHECK_ERROR();
     cudaDeviceSynchronize();
-    printf("Launching Probe Kernel\n");
 }
 
 }

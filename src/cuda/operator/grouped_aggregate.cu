@@ -306,7 +306,32 @@ void groupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count,
         N,
         custom_less);
 
-    CHECK_ERROR();
+    // sort_keys_type* materialized_temp2 = reinterpret_cast<sort_keys_type*> (gpuBufferManager->customCudaMalloc<pointer_and_key>(N, 0, 0));
+    // // Determine temporary device storage requirements
+    // CustomLess custom_op;
+    // void *d_temp_storage = nullptr;
+    // size_t temp_storage_bytes = 0;
+    // cub::DeviceRadixSort::SortKeys(
+    //     d_temp_storage,
+    //     temp_storage_bytes,
+    //     materialized_temp,
+    //     materialized_temp2,
+    //     N);
+
+    // CHECK_ERROR();
+
+    // // Allocate temporary storage
+    // d_temp_storage = reinterpret_cast<void*> (gpuBufferManager->customCudaMalloc<uint8_t>(temp_storage_bytes, 0, 0));
+
+    // // Run sorting operation
+    // cub::DeviceRadixSort::SortKeys(
+    //     d_temp_storage,
+    //     temp_storage_bytes,
+    //     materialized_temp,
+    //     materialized_temp2,
+    //     N);
+
+    // CHECK_ERROR();
 
     //gather the aggregates based on the row_sequence
     printf("Gathering Aggregates\n");
