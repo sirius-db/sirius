@@ -95,7 +95,7 @@ Build the code:
 $ make -j$(nproc)
 ```
 
-Start duckdb using: `./build/release/duckdb tpch_s1.duckdb`. 
+Start duckdb using: `./build/release/duckdb tpch_s10.duckdb`. 
 
 Example table creator:
 ```
@@ -128,4 +128,12 @@ Prefix query:
 $ call gpu_caching("part.p_name");
 $ select p_name from part where p_name like 'forest%';
 $ call gpu_processing("select p_name from part where p_name like 'forest%';");
+```
+
+Group By Query:
+```
+$ call gpu_caching("customer.c_name");
+$ call gpu_caching("customer.c_comment");
+$ call gpu_caching("customer.c_address");
+$ call gpu_caching("SELECT c_name, c_comment, c_address, COUNT(*) FROM customer GROUP BY c_name, c_comment, c_address;");
 ```

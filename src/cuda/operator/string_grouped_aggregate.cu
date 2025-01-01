@@ -2,7 +2,12 @@
 #include "gpu_physical_grouped_aggregate.hpp"
 #include "gpu_buffer_manager.hpp"
 
+#include <chrono>
+
 namespace duckdb {
+
+using std::chrono::high_resolution_clock;
+using std::chrono::duration;
 
 struct sort_keys_type_string {
   uint64_t* keys;
@@ -429,6 +434,7 @@ void groupedStringAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t**
     size_t   temp_storage_bytes = 0;
 
     //cubmax
+    auto preprocess_start_time = high_resolution_clock::now();
     // Get the maximum key length for each key
     uint64_t* key_length = gpuBufferManager->customCudaMalloc<uint64_t>(num_keys, 0, 0); // store the maximum length of each key
     uint64_t** len = new uint64_t*[num_keys];
@@ -504,7 +510,11 @@ void groupedStringAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t**
 
     columns_to_rows_string<BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(keys_dev, row_keys, offset_dev, key_length,
             materialized_temp, N, num_keys + 1);
+    cudaDeviceSynchronize();
     CHECK_ERROR();
+    auto preprocess_end_time = high_resolution_clock::now();
+    auto preprocess_time_ms = std::chrono::duration_cast<duration<double, std::milli>>(preprocess_end_time - preprocess_start_time).count();
+    std::cout << "String group by preprocessing took " << preprocess_time_ms << " ms" << std::endl;
 
     //perform sort-based groupby
     // Determine temporary device storage requirements
