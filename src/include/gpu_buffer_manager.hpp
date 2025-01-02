@@ -24,6 +24,13 @@ struct pointer_and_key {
 	uint64_t num_key;
 };
 
+template<typename T>
+struct GPUBufferPointer {
+  T* data_;
+
+  GPUBufferPointer(T* data) : data_(data) {}
+};
+
 // Currently a singleton class, would not work for multiple GPUs
 class GPUBufferManager {
 public:
@@ -49,7 +56,7 @@ public:
     size_t processing_size_per_cpu;
 
 	template <typename T>
-	T* customCudaMalloc(size_t size, int gpu, bool caching);
+	GPUBufferPointer<T> customCudaMalloc(size_t size, int gpu, bool caching);
 
 	template <typename T>
 	T* customCudaHostAlloc(size_t size);

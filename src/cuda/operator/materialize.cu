@@ -117,8 +117,8 @@ void materializeString(uint8_t* data, uint64_t* offset, uint8_t* &result, uint64
     printf("Launching Materialize String Kernel\n");
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
     //allocate temp memory and copying keys
-    uint64_t* temp_len = gpuBufferManager->customCudaMalloc<uint64_t>(N + 1, 0, 0);
-    result_offset = gpuBufferManager->customCudaMalloc<uint64_t>(N + 1, 0, 0);
+    uint64_t* temp_len = gpuBufferManager->customCudaMalloc<uint64_t>(N + 1, 0, 0).data_;
+    result_offset = gpuBufferManager->customCudaMalloc<uint64_t>(N + 1, 0, 0).data_;
 
     cudaMemset(temp_len + N, 0, sizeof(uint64_t));
     CHECK_ERROR();
@@ -135,7 +135,7 @@ void materializeString(uint8_t* data, uint64_t* offset, uint8_t* &result, uint64
     cub::DeviceScan::ExclusiveSum(d_temp_storage, temp_storage_bytes, temp_len, result_offset, N + 1);
 
     // Allocate temporary storage for exclusive prefix sum
-    d_temp_storage = reinterpret_cast<void*> (gpuBufferManager->customCudaMalloc<uint8_t>(temp_storage_bytes, 0, 0));
+    d_temp_storage = reinterpret_cast<void*> (gpuBufferManager->customCudaMalloc<uint8_t>(temp_storage_bytes, 0, 0).data_);
 
     // Run exclusive prefix sum
     cub::DeviceScan::ExclusiveSum(d_temp_storage, temp_storage_bytes, temp_len, result_offset, N + 1);
@@ -149,7 +149,7 @@ void materializeString(uint8_t* data, uint64_t* offset, uint8_t* &result, uint64
 
     CHECK_ERROR();
 
-    result = gpuBufferManager->customCudaMalloc<uint8_t>(new_num_bytes[0], 0, 0);
+    result = gpuBufferManager->customCudaMalloc<uint8_t>(new_num_bytes[0], 0, 0).data_;
 
     materialize_string<<<num_blocks, BLOCK_THREADS>>>(data, result, offset, result_offset, row_ids, N);
     cudaDeviceSynchronize();

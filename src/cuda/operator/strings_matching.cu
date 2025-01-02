@@ -160,10 +160,10 @@ void StringMatching(char* char_data, uint64_t* str_indices, std::string match_st
   }
 
   // Allocate the buffers we need
-  char* d_match_str = gpuBufferManager->customCudaMalloc<char>(match_string.length(), 0, 0);
-  int* d_kmp_automato = gpuBufferManager->customCudaMalloc<int>(kmp_automato_size, 0, 0);
-  uint64_t* d_worker_start_term = gpuBufferManager->customCudaMalloc<uint64_t>(workers_needed, 0, 0);
-  bool* d_answers = reinterpret_cast<bool*> (gpuBufferManager->customCudaMalloc<uint8_t>(num_strings, 0, 0));
+  char* d_match_str = gpuBufferManager->customCudaMalloc<char>(match_string.length(), 0, 0).data_;
+  int* d_kmp_automato = gpuBufferManager->customCudaMalloc<int>(kmp_automato_size, 0, 0).data_;
+  uint64_t* d_worker_start_term = gpuBufferManager->customCudaMalloc<uint64_t>(workers_needed, 0, 0).data_;
+  bool* d_answers = reinterpret_cast<bool*> (gpuBufferManager->customCudaMalloc<uint8_t>(num_strings, 0, 0).data_);
   cudaMemset(d_answers, 0, num_strings * sizeof(bool));
   // TODO: Do it twice for more accurate allocation
   // uint64_t* d_matching_rows = gpuBufferManager->customCudaMalloc<uint64_t>(num_strings, 0, 0);
@@ -317,19 +317,19 @@ void MultiStringMatching(char* char_data, uint64_t* str_indices, std::vector<std
   }
 
   // Allocate the buffers on the GPU 
-  uint64_t* d_worker_start_term = gpuBufferManager->customCudaMalloc<uint64_t>(workers_needed, 0, 0);
-  uint64_t* d_prev_term_answers = gpuBufferManager->customCudaMalloc<uint64_t>(num_strings, 0, 0);
-  uint64_t* d_answer_idxs = gpuBufferManager->customCudaMalloc<uint64_t>(num_strings, 0, 0);
+  uint64_t* d_worker_start_term = gpuBufferManager->customCudaMalloc<uint64_t>(workers_needed, 0, 0).data_;
+  uint64_t* d_prev_term_answers = gpuBufferManager->customCudaMalloc<uint64_t>(num_strings, 0, 0).data_;
+  uint64_t* d_answer_idxs = gpuBufferManager->customCudaMalloc<uint64_t>(num_strings, 0, 0).data_;
   cudaMemset(d_answer_idxs, 0, num_strings * sizeof(uint64_t));
-  bool* d_found_answer = reinterpret_cast<bool*> (gpuBufferManager->customCudaMalloc<uint8_t>(num_strings, 0, 0));
+  bool* d_found_answer = reinterpret_cast<bool*> (gpuBufferManager->customCudaMalloc<uint8_t>(num_strings, 0, 0).data_);
   cudaMemset(d_found_answer, 0, num_strings * sizeof(bool));
-  // uint64_t* d_matching_rows = gpuBufferManager->customCudaMalloc<uint64_t>(num_strings, 0, 0);
+  // uint64_t* d_matching_rows = gpuBufferManager->customCudaMalloc<uint64_t>(num_strings, 0, 0).data_;
 
   // Create buffer for each automato
   int** d_all_automatos = new int*[num_terms];
   for(int i = 0; i < num_terms; i++) {
     int kmp_automato_size = all_terms[i].size() * CHARS_IN_BYTE;
-    d_all_automatos[i] = gpuBufferManager->customCudaMalloc<int>(kmp_automato_size * sizeof(int), 0, 0);
+    d_all_automatos[i] = gpuBufferManager->customCudaMalloc<int>(kmp_automato_size * sizeof(int), 0, 0).data_;
   }
 
   // Copy over the necessary data 
@@ -439,9 +439,9 @@ void PrefixMatching(char* char_data, uint64_t* str_indices, std::string match_pr
   }
 
   uint64_t num_prefix_chars = match_prefix.length();
-  char* d_prefix_chars = gpuBufferManager->customCudaMalloc<char>(num_prefix_chars, 0, 0);
+  char* d_prefix_chars = gpuBufferManager->customCudaMalloc<char>(num_prefix_chars, 0, 0).data_;
   cudaMemcpy(d_prefix_chars, match_prefix.c_str(), num_prefix_chars * sizeof(char), cudaMemcpyHostToDevice);
-  bool* d_results = gpuBufferManager->customCudaMalloc<bool>(num_strings, 0, 0);
+  bool* d_results = gpuBufferManager->customCudaMalloc<bool>(num_strings, 0, 0).data_;
   cudaMemset(d_results, 0, num_strings * sizeof(bool));
 
   // Run the kernel

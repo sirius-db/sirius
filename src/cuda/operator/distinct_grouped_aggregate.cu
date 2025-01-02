@@ -176,8 +176,8 @@ void groupedDistinctAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 
     //allocate temp memory and copying keys
-    T* row_keys = gpuBufferManager->customCudaMalloc<T>((num_keys + num_aggregates) * N, 0, 0);
-    sort_keys_type* materialized_temp = reinterpret_cast<sort_keys_type*> (gpuBufferManager->customCudaMalloc<pointer_and_key>(N, 0, 0));
+    T* row_keys = gpuBufferManager->customCudaMalloc<T>((num_keys + num_aggregates) * N, 0, 0).data_;
+    sort_keys_type* materialized_temp = reinterpret_cast<sort_keys_type*> (gpuBufferManager->customCudaMalloc<pointer_and_key>(N, 0, 0).data_);
     T** keys_row_id = new T*[num_keys + num_aggregates];
     for (uint64_t i = 0; i < num_keys; i++) {
         keys_row_id[i] = reinterpret_cast<T*> (keys[i]);
@@ -210,7 +210,7 @@ void groupedDistinctAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t
     CHECK_ERROR();
 
     // Allocate temporary storage
-    d_temp_storage = reinterpret_cast<void*> (gpuBufferManager->customCudaMalloc<uint8_t>(temp_storage_bytes, 0, 0));
+    d_temp_storage = reinterpret_cast<void*> (gpuBufferManager->customCudaMalloc<uint8_t>(temp_storage_bytes, 0, 0).data_);
 
     // Run sorting operation
     cub::DeviceMergeSort::SortKeys(
@@ -222,8 +222,8 @@ void groupedDistinctAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t
 
     //perform sort-based groupby
     CHECK_ERROR();
-    sort_keys_type* group_by_rows = reinterpret_cast<sort_keys_type*> (gpuBufferManager->customCudaMalloc<pointer_and_key>(N, 0, 0));
-    uint64_t* d_num_runs_out = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+    sort_keys_type* group_by_rows = reinterpret_cast<sort_keys_type*> (gpuBufferManager->customCudaMalloc<pointer_and_key>(N, 0, 0).data_);
+    uint64_t* d_num_runs_out = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0).data_;
     cudaMemset(d_num_runs_out, 0, sizeof(uint64_t));
     uint64_t* h_count = new uint64_t[1];
 
@@ -231,8 +231,8 @@ void groupedDistinctAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t
         // printf("Aggregating %d\n", agg);
         if (distinct_mode[agg] == 0) { // count distinct
 
-            uint64_t* d_aggregates_out = gpuBufferManager->customCudaMalloc<uint64_t>(N, 0, 0);
-            uint64_t* distinct_boundary = gpuBufferManager->customCudaMalloc<uint64_t>(N, 0, 0);
+            uint64_t* d_aggregates_out = gpuBufferManager->customCudaMalloc<uint64_t>(N, 0, 0).data_;
+            uint64_t* distinct_boundary = gpuBufferManager->customCudaMalloc<uint64_t>(N, 0, 0).data_;
             distinct_bound<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(distinct_boundary, materialized_temp, N);
 
             CHECK_ERROR();
@@ -253,7 +253,7 @@ void groupedDistinctAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t
             CHECK_ERROR();
 
             // Allocate temporary storage
-            d_temp_storage = reinterpret_cast<void*> (gpuBufferManager->customCudaMalloc<uint8_t>(temp_storage_bytes, 0, 0));
+            d_temp_storage = reinterpret_cast<void*> (gpuBufferManager->customCudaMalloc<uint8_t>(temp_storage_bytes, 0, 0).data_);
 
             // Run reduce-by-key
             cub::DeviceReduce::ReduceByKey(

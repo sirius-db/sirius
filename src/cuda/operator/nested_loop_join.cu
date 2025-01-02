@@ -159,7 +159,7 @@ void nestedLoopJoin(T** left_data, T** right_data, uint64_t* &row_ids_left, uint
     int tile_items = BLOCK_THREADS * 1;
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
     cudaMemset(count, 0, sizeof(uint64_t));
-    uint64_t* offset_each_thread = gpuBufferManager->customCudaMalloc<uint64_t>(((left_size + tile_items - 1)/tile_items) * BLOCK_THREADS, 0, 0);
+    uint64_t* offset_each_thread = gpuBufferManager->customCudaMalloc<uint64_t>(((left_size + tile_items - 1)/tile_items) * BLOCK_THREADS, 0, 0).data_;
     
     testprintcolumn<<<1, 1>>>(reinterpret_cast<double*>(left_data[0]), left_size);
     //TODO: Currently only support a single key
@@ -174,8 +174,8 @@ void nestedLoopJoin(T** left_data, T** right_data, uint64_t* &row_ids_left, uint
     assert(h_count[0] > 0);
     printf("Count: %lu\n", h_count[0]);
 
-    row_ids_left = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
-    row_ids_right = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
+    row_ids_left = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0).data_;
+    row_ids_right = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0).data_;
     nested_loop_join<T, BLOCK_THREADS, 1><<<(left_size + tile_items - 1)/tile_items, BLOCK_THREADS>>>(left_data[0], right_data[0], 
             offset_each_thread, row_ids_left, row_ids_right, left_size, right_size, condition_mode[0]);
     CHECK_ERROR();

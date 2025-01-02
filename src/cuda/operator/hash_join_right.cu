@@ -166,7 +166,7 @@ void scanHashTableRight(unsigned long long* ht, uint64_t ht_len, uint64_t* &row_
     uint64_t* h_count = new uint64_t [1];
     cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
     assert(h_count[0] > 0);
-    row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
+    row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0).data_;
     cudaMemset(count, 0, sizeof(uint64_t));
     scan_right<BLOCK_THREADS, ITEMS_PER_THREAD><<<(ht_len + tile_items - 1)/tile_items, BLOCK_THREADS>>>(ht, (unsigned long long*) count, ht_len, row_ids, num_keys, join_mode, 0);
     CHECK_ERROR();
@@ -207,7 +207,7 @@ void probeHashTableRightSemiAnti(uint8_t **keys, unsigned long long* ht, uint64_
         if (condition_mode[idx] == 0) equal_keys++;
     }
 
-    int* condition_mode_dev = gpuBufferManager->customCudaMalloc<int>(num_keys, 0, 0);
+    int* condition_mode_dev = gpuBufferManager->customCudaMalloc<int>(num_keys, 0, 0).data_;
     cudaMemcpy(condition_mode_dev, condition_mode, num_keys * sizeof(int), cudaMemcpyHostToDevice);
 
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;

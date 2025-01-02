@@ -52,8 +52,8 @@ std::tuple<char*, uint64_t*, uint64_t> PerformSubstring(char* char_data, uint64_
     // Get the write offsets
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
     uint64_t blocks_needed = (num_strings + THREADS_PER_BLOCK - 1)/THREADS_PER_BLOCK;
-    uint64_t* new_len = gpuBufferManager->customCudaMalloc<uint64_t>(num_strings + 1, 0, 0);
-    uint64_t* result_offset = gpuBufferManager->customCudaMalloc<uint64_t>(num_strings + 1, 0, 0);
+    uint64_t* new_len = gpuBufferManager->customCudaMalloc<uint64_t>(num_strings + 1, 0, 0).data_;
+    uint64_t* result_offset = gpuBufferManager->customCudaMalloc<uint64_t>(num_strings + 1, 0, 0).data_;
     cudaMemset(new_len + num_strings, 0, sizeof(uint64_t));
     get_new_length<<<blocks_needed, THREADS_PER_BLOCK>>>(str_indices, new_len, num_strings, start_idx, length);
     cudaDeviceSynchronize();
@@ -69,7 +69,7 @@ std::tuple<char*, uint64_t*, uint64_t> PerformSubstring(char* char_data, uint64_
     cub::DeviceScan::ExclusiveSum(d_temp_storage, temp_storage_bytes, new_len, result_offset, num_strings + 1);
 
     // Allocate temporary storage for exclusive prefix sum
-    d_temp_storage = reinterpret_cast<void*> (gpuBufferManager->customCudaMalloc<uint8_t>(temp_storage_bytes, 0, 0));
+    d_temp_storage = reinterpret_cast<void*> (gpuBufferManager->customCudaMalloc<uint8_t>(temp_storage_bytes, 0, 0).data_);
 
     // Run exclusive prefix sum
     cub::DeviceScan::ExclusiveSum(d_temp_storage, temp_storage_bytes, new_len, result_offset, num_strings + 1);
@@ -84,7 +84,7 @@ std::tuple<char*, uint64_t*, uint64_t> PerformSubstring(char* char_data, uint64_
     CHECK_ERROR();
 
     // Create the chars buffer
-    char* updated_chars = gpuBufferManager->customCudaMalloc<char>(total_chars[0], 0, 0);
+    char* updated_chars = gpuBufferManager->customCudaMalloc<char>(total_chars[0], 0, 0).data_;
     substring_copy_chars<<<blocks_needed, THREADS_PER_BLOCK>>>(char_data, updated_chars, str_indices, result_offset, num_strings, start_idx, length);
 
     // Return the result

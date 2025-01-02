@@ -233,7 +233,7 @@ void comparisonConstantExpression(T *a, T b, T c, uint64_t* &row_ids, uint64_t* 
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
     uint64_t* h_count = new uint64_t[1];
     cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
-    row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
+    row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0).data_;
     cudaMemset(count, 0, sizeof(uint64_t));
     comparison_constant_expression<T, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(a, b, c, row_ids, (unsigned long long*) count, N, op_mode, 0);
     CHECK_ERROR();
@@ -260,7 +260,7 @@ void comparisonExpression(T *a, T *b, uint64_t* &row_ids, uint64_t* &count, uint
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
     uint64_t* h_count = new uint64_t[1];
     cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
-    row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
+    row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0).data_;
     cudaMemset(count, 0, sizeof(uint64_t));
     comparison_expression<T, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(a, b, row_ids, (unsigned long long*) count, N, op_mode, 0);
     CHECK_ERROR();
@@ -325,15 +325,15 @@ void comparisonStringExpression(char* char_data, uint64_t num_chars, uint64_t* s
     // Allocate the necesary buffers on the GPU
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
     uint64_t num_lower_chars = lower_string.length();
-    char* d_lower_chars = gpuBufferManager->customCudaMalloc<char>(num_lower_chars, 0, 0);
+    char* d_lower_chars = gpuBufferManager->customCudaMalloc<char>(num_lower_chars, 0, 0).data_;
     cudaMemcpy(d_lower_chars, lower_string.c_str(), num_lower_chars * sizeof(char), cudaMemcpyHostToDevice);
 
     uint64_t num_upper_chars = upper_string.length();
-    char* d_upper_chars = gpuBufferManager->customCudaMalloc<char>(num_upper_chars, 0, 0);
+    char* d_upper_chars = gpuBufferManager->customCudaMalloc<char>(num_upper_chars, 0, 0).data_;
     cudaMemcpy(d_upper_chars, upper_string.c_str(), num_lower_chars * sizeof(char), cudaMemcpyHostToDevice);
     CHECK_ERROR();
 
-    bool* d_is_valid = gpuBufferManager->customCudaMalloc<bool>(num_strings, 0, 0);
+    bool* d_is_valid = gpuBufferManager->customCudaMalloc<bool>(num_strings, 0, 0).data_;
     cudaMemset(d_is_valid, 1, num_strings * sizeof(bool));
 
     // Perform the lower string comparsions
@@ -349,7 +349,7 @@ void comparisonStringExpression(char* char_data, uint64_t num_chars, uint64_t* s
     CHECK_ERROR();
 
     // Create the valid idx buffer from the valid boolean array
-    uint64_t* d_valid_idxs = gpuBufferManager->customCudaMalloc<uint64_t>(num_strings, 0, 0);
+    uint64_t* d_valid_idxs = gpuBufferManager->customCudaMalloc<uint64_t>(num_strings, 0, 0).data_;
     thrust::device_ptr<bool> d_answers_ptr(d_is_valid);
     thrust::device_ptr<uint64_t> d_valid_idxs_ptr(d_valid_idxs);
     auto end = thrust::copy_if(

@@ -34,7 +34,7 @@ GPUExpressionExecutor::HandlingSpecificProjection(GPUIntermediateRelation& input
                 uint64_t* a = reinterpret_cast<uint64_t*> (materialized_nation->data_wrapper.data);
                 double* b = reinterpret_cast<double*> (materialized_volume->data_wrapper.data);
                 size_t size = materialized_nation->column_length;
-                double* out = gpuBufferManager->customCudaMalloc<double>(size, 0, 0);
+                double* out = gpuBufferManager->customCudaMalloc<double>(size, 0, 0).data_;
 
 				uint64_t nation_val = 1;
 				double else_val = 0;
@@ -67,7 +67,7 @@ GPUExpressionExecutor::HandlingSpecificProjection(GPUIntermediateRelation& input
                 double* b = reinterpret_cast<double*> (materialized_extendedprice->data_wrapper.data);
                 double* c = reinterpret_cast<double*> (materialized_discount->data_wrapper.data);
                 size_t size = materialized_type->column_length;
-                double* out = gpuBufferManager->customCudaMalloc<double>(size, 0, 0);
+                double* out = gpuBufferManager->customCudaMalloc<double>(size, 0, 0).data_;
                 q14CaseExpression(a, b, c, p_type_value1, p_type_value2, out, size);
 
 				result = new GPUColumn(size, ColumnType::FLOAT64, reinterpret_cast<uint8_t*>(out));
@@ -84,7 +84,7 @@ GPUExpressionExecutor::HandlingSpecificProjection(GPUIntermediateRelation& input
                     auto materialized_orderpriority = HandleMaterializeExpression(input_relation.columns[o_orderpriority], compare_expr.left->Cast<BoundReferenceExpression>(), gpuBufferManager);
                     uint64_t* a = reinterpret_cast<uint64_t*> (materialized_orderpriority->data_wrapper.data);
                     size_t size = materialized_orderpriority->column_length;
-                    double* out = gpuBufferManager->customCudaMalloc<double>(size, 0, 0);
+                    double* out = gpuBufferManager->customCudaMalloc<double>(size, 0, 0).data_;
                     commonCaseExpression(a, a, out, size, 1);
 
 					result = new GPUColumn(size, ColumnType::FLOAT64, reinterpret_cast<uint8_t*>(out));
@@ -99,7 +99,7 @@ GPUExpressionExecutor::HandlingSpecificProjection(GPUIntermediateRelation& input
                     auto materialized_orderpriority = HandleMaterializeExpression(input_relation.columns[o_orderpriority], compare_expr.left->Cast<BoundReferenceExpression>(), gpuBufferManager);
                     uint64_t* a = reinterpret_cast<uint64_t*> (materialized_orderpriority->data_wrapper.data);
                     size_t size = materialized_orderpriority->column_length;
-                    double* out = gpuBufferManager->customCudaMalloc<double>(size, 0, 0);
+                    double* out = gpuBufferManager->customCudaMalloc<double>(size, 0, 0).data_;
 					commonCaseExpression(a, a, out, size, 2);
 
 					result = new GPUColumn(size, ColumnType::FLOAT64, reinterpret_cast<uint8_t*>(out));
@@ -122,7 +122,7 @@ GPUExpressionExecutor::HandlingSpecificProjection(GPUIntermediateRelation& input
 				auto materialized_date = HandleMaterializeExpression(input_relation.columns[date], cast_expr.child->Cast<BoundReferenceExpression>(), gpuBufferManager);
 				uint64_t* a = reinterpret_cast<uint64_t*> (materialized_date->data_wrapper.data);
 				size_t size = materialized_date->column_length;
-				uint64_t* out = gpuBufferManager->customCudaMalloc<uint64_t>(size, 0, 0);
+				uint64_t* out = gpuBufferManager->customCudaMalloc<uint64_t>(size, 0, 0).data_;
 				extractYear(a, out, size);
 
 				result = new GPUColumn(size, ColumnType::INT64, reinterpret_cast<uint8_t*>(out));
@@ -147,7 +147,7 @@ GPUExpressionExecutor::HandlingSpecificProjection(GPUIntermediateRelation& input
 						double* a = reinterpret_cast<double*> (materialize_4->data_wrapper.data);
 						double* b = reinterpret_cast<double*> (materialize_tax->data_wrapper.data);
 						size_t size = materialize_4->column_length;
-						double* out = gpuBufferManager->customCudaMalloc<double>(size, 0, 0);
+						double* out = gpuBufferManager->customCudaMalloc<double>(size, 0, 0).data_;
 						commonArithmeticExpression(a, b, a, a, out, size, 1);
 
 						result = new GPUColumn(size, ColumnType::FLOAT64, reinterpret_cast<uint8_t*>(out));
@@ -163,7 +163,7 @@ GPUExpressionExecutor::HandlingSpecificProjection(GPUIntermediateRelation& input
 						double* a = reinterpret_cast<double*> (materialize_extendedprice->data_wrapper.data);
 						double* b = reinterpret_cast<double*> (materialize_discount->data_wrapper.data);
 						size_t size = materialize_extendedprice->column_length;
-						double* out = gpuBufferManager->customCudaMalloc<double>(size, 0, 0);
+						double* out = gpuBufferManager->customCudaMalloc<double>(size, 0, 0).data_;
 						commonArithmeticExpression(a, b, a, a, out, size, 0);
 
 						result = new GPUColumn(size, ColumnType::FLOAT64, reinterpret_cast<uint8_t*>(out));
@@ -193,7 +193,7 @@ GPUExpressionExecutor::HandlingSpecificProjection(GPUIntermediateRelation& input
 						double* d = reinterpret_cast<double*> (materialize_quantity->data_wrapper.data);
 
 						size_t size = materialize_extendedprice->column_length;
-						double* out = gpuBufferManager->customCudaMalloc<double>(size, 0, 0);
+						double* out = gpuBufferManager->customCudaMalloc<double>(size, 0, 0).data_;
 						commonArithmeticExpression(a, b, c, d, out, size, 2);
 
 						result = new GPUColumn(size, ColumnType::FLOAT64, reinterpret_cast<uint8_t*>(out));
@@ -216,7 +216,7 @@ GPUExpressionExecutor::HandlingSpecificProjection(GPUIntermediateRelation& input
 					double* b = reinterpret_cast<double*> (materialize_b->data_wrapper.data);
 
 					size_t size = materialize_a->column_length;
-					double* out = gpuBufferManager->customCudaMalloc<double>(size, 0, 0);
+					double* out = gpuBufferManager->customCudaMalloc<double>(size, 0, 0).data_;
 					commonArithmeticExpression(a, b, a, a, out, size, 3);
 
 					result = new GPUColumn(size, ColumnType::FLOAT64, reinterpret_cast<uint8_t*>(out));

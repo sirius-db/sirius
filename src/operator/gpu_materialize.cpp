@@ -13,7 +13,7 @@ ResolveTypeMaterializeExpression(GPUColumn* column, BoundReferenceExpression& bo
     if (column->row_ids != nullptr) {
         T* temp = reinterpret_cast<T*> (column->data_wrapper.data);
         uint64_t* row_ids_input = reinterpret_cast<uint64_t*> (column->row_ids);
-        a = gpuBufferManager->customCudaMalloc<T>(column->row_id_count, 0, 0);
+        a = gpuBufferManager->customCudaMalloc<T>(column->row_id_count, 0, 0).data_;
         materializeExpression<T>(temp, a, row_ids_input, column->row_id_count);
         size = column->row_id_count;
     } else {
@@ -103,7 +103,7 @@ HandleMaterializeRowIDs(GPUIntermediateRelation& input_relation, GPUIntermediate
                     output_relation.columns[i]->row_ids = new_row_ids[idx];
                 } else {
                     uint64_t* temp_prev_row_ids = reinterpret_cast<uint64_t*> (input_relation.columns[i]->row_ids);
-                    uint64_t* temp_new_row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(count, 0, 0);
+                    uint64_t* temp_new_row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(count, 0, 0).data_;
                     materializeExpression<uint64_t>(temp_prev_row_ids, temp_new_row_ids, row_ids, count);
                     output_relation.columns[i]->row_ids = temp_new_row_ids;
                     new_row_ids.push_back(temp_new_row_ids);
@@ -186,7 +186,7 @@ HandleMaterializeRowIDsRHS(GPUIntermediateRelation& hash_table_result, GPUInterm
                     // printf("new row id count %ld\n", count);
                     // printf("hash table row id count %ld\n", hash_table_result.columns[i]->row_id_count);
                     uint64_t* temp_prev_row_ids = reinterpret_cast<uint64_t*> (hash_table_result.columns[rhs_col]->row_ids);
-                    uint64_t* temp_new_row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(count, 0, 0);
+                    uint64_t* temp_new_row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(count, 0, 0).data_;
                     // printGPUColumn<uint64_t>(row_ids, count, 0);
                     materializeExpression<uint64_t>(temp_prev_row_ids, temp_new_row_ids, row_ids, count);
                     output_relation.columns[offset + i]->row_ids = temp_new_row_ids;

@@ -157,26 +157,26 @@ void ungroupedAggregate(uint8_t **a, uint8_t **result, uint64_t N, int* agg_mode
         if (agg_mode[agg] == 4) {
             uint64_t* res = new uint64_t[1];
             res[0] = N;
-            uint64_t* result_temp = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+            uint64_t* result_temp = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0).data_;
             cudaMemcpy(result_temp, res, sizeof(uint64_t), cudaMemcpyHostToDevice);
             CHECK_ERROR();
             cudaDeviceSynchronize();
             result[agg] = reinterpret_cast<uint8_t*> (result_temp);
         } else if (agg_mode[agg] == 5) {
-            uint64_t* result_temp = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+            uint64_t* result_temp = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0).data_;
             cudaMemset(result_temp, 0, sizeof(uint64_t));
             CHECK_ERROR();
             cudaDeviceSynchronize();
             result[agg] = reinterpret_cast<uint8_t*> (result_temp);
         } else if (agg_mode[agg] == 6) {
-            T* result_temp = gpuBufferManager->customCudaMalloc<T>(1, 0, 0);
+            T* result_temp = gpuBufferManager->customCudaMalloc<T>(1, 0, 0).data_;
             cudaMemcpy(result_temp, reinterpret_cast<T*>(a[agg]), sizeof(T), cudaMemcpyDeviceToDevice);
             CHECK_ERROR();
             cudaDeviceSynchronize();
             result[agg] = reinterpret_cast<uint8_t*> (result_temp);
         } else if (agg_mode[agg] >= 0 && agg_mode[agg] <= 3) {
             T* a_temp = reinterpret_cast<T*> (a[agg]);
-            T* result_temp = gpuBufferManager->customCudaMalloc<T>(1, 0, 0);
+            T* result_temp = gpuBufferManager->customCudaMalloc<T>(1, 0, 0).data_;
 
             printf("N: %ld\n", N);
 

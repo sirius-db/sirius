@@ -7,28 +7,28 @@
 
 namespace duckdb {
 
-template int*
+template GPUBufferPointer<int>
 GPUBufferManager::customCudaMalloc<int>(size_t size, int gpu, bool caching);
 
-template uint64_t*
+template GPUBufferPointer<uint64_t>
 GPUBufferManager::customCudaMalloc<uint64_t>(size_t size, int gpu, bool caching);
 
-template uint8_t*
+template GPUBufferPointer<uint8_t>
 GPUBufferManager::customCudaMalloc<uint8_t>(size_t size, int gpu, bool caching);
 
-template float*
+template GPUBufferPointer<float>
 GPUBufferManager::customCudaMalloc<float>(size_t size, int gpu, bool caching);
 
-template double*
+template GPUBufferPointer<double>
 GPUBufferManager::customCudaMalloc<double>(size_t size, int gpu, bool caching);
 
-template char*
+template GPUBufferPointer<char>
 GPUBufferManager::customCudaMalloc<char>(size_t size, int gpu, bool caching);
 
-template bool*
+template GPUBufferPointer<bool>
 GPUBufferManager::customCudaMalloc<bool>(size_t size, int gpu, bool caching);
 
-template pointer_and_key*
+template GPUBufferPointer<pointer_and_key>
 GPUBufferManager::customCudaMalloc<pointer_and_key>(size_t size, int gpu, bool caching);
 
 template int*
@@ -103,7 +103,7 @@ void GPUBufferManager::ResetBuffer() {
 }
 
 template <typename T>
-T*
+GPUBufferPointer<T>
 GPUBufferManager::customCudaMalloc(size_t size, int gpu, bool caching) {
 	size_t alloc = (size * sizeof(T));
     //always ensure that it aligns with 8B
@@ -118,7 +118,7 @@ GPUBufferManager::customCudaMalloc(size_t size, int gpu, bool caching) {
         if (reinterpret_cast<uintptr_t>(ptr) % alignof(double) != 0) {
             throw InvalidInputException("Memory is not properly aligned");
         } 
-        return ptr;
+        return GPUBufferPointer(ptr);
     } else {
         // printf("Allocating %ld bytes\n", alloc);
         size_t start = __atomic_fetch_add(&gpuProcessingPointer[gpu], alloc, __ATOMIC_RELAXED);
@@ -133,7 +133,7 @@ GPUBufferManager::customCudaMalloc(size_t size, int gpu, bool caching) {
         if (reinterpret_cast<uintptr_t>(ptr) % alignof(double) != 0) {
             throw InvalidInputException("Memory is not properly aligned");
         } 
-        return ptr;
+        return GPUBufferPointer(ptr);
     }
 };
 
@@ -323,7 +323,7 @@ DataWrapper GPUBufferManager::allocateStrColumnInGPU(DataWrapper cpu_data, int g
 
     // First allocate and copy the offset buffer
     result.size = cpu_data.size;
-    result.offset = customCudaMalloc<uint64_t>((cpu_data.size + 1), 0, true);
+    result.offset = customCudaMalloc<uint64_t>((cpu_data.size + 1), 0, true).data_;
     std::cout << "Copying offset with " << result.size << " strings" << std::endl;
     // printf("%ld %ld\n",cpu_data.offset[0], cpu_data.offset[cpu_data.size]);
     // for (int i = 0; i < cpu_data.size + 1; i++) {
@@ -339,7 +339,7 @@ DataWrapper GPUBufferManager::allocateStrColumnInGPU(DataWrapper cpu_data, int g
 
     // Do the same for the characeters
     result.num_bytes = cpu_data.num_bytes;
-    result.data = customCudaMalloc<uint8_t>(cpu_data.num_bytes, 0, true);
+    result.data = customCudaMalloc<uint8_t>(cpu_data.num_bytes, 0, true).data_;
     std::cout << "Copying sizes with " << result.num_bytes << " chars" << std::endl;
     callCudaMemcpyHostToDevice<uint8_t>(result.data, cpu_data.data, cpu_data.num_bytes, 0);
 
@@ -360,37 +360,37 @@ GPUBufferManager::allocateColumnBufferInGPU(DataWrapper cpu_data, int gpu) {
 
 	switch (cpu_data.type) {
 		case ColumnType::INT32: {
-            int* ptr_int = customCudaMalloc<int>(cpu_data.size, 0, true);
+            int* ptr_int = customCudaMalloc<int>(cpu_data.size, 0, true).data_;
             ptr = reinterpret_cast<uint8_t*>(ptr_int);
             column_type = ColumnType::INT32;
 			break;
         }
 		case ColumnType::INT64: {
-            uint64_t* ptr_int64 = customCudaMalloc<uint64_t>(cpu_data.size, 0, true);
+            uint64_t* ptr_int64 = customCudaMalloc<uint64_t>(cpu_data.size, 0, true).data_;
             ptr = reinterpret_cast<uint8_t*>(ptr_int64);
             column_type = ColumnType::INT64;
 			break;
         }
 		case ColumnType::FLOAT32: {
-            float* ptr_float = customCudaMalloc<float>(cpu_data.size, 0, true);
+            float* ptr_float = customCudaMalloc<float>(cpu_data.size, 0, true).data_;
             ptr = reinterpret_cast<uint8_t*>(ptr_float);
             column_type = ColumnType::INT64;
 			break;
         }
 		case ColumnType::FLOAT64: {
-            double* ptr_double = customCudaMalloc<double>(cpu_data.size, 0, true);
+            double* ptr_double = customCudaMalloc<double>(cpu_data.size, 0, true).data_;
             ptr = reinterpret_cast<uint8_t*>(ptr_double);
             column_type = ColumnType::FLOAT64;
 			break;
         }
 		case ColumnType::BOOLEAN: {
-            uint8_t* ptr_bool = customCudaMalloc<uint8_t>(cpu_data.size, 0, true);
+            uint8_t* ptr_bool = customCudaMalloc<uint8_t>(cpu_data.size, 0, true).data_;
             ptr = reinterpret_cast<uint8_t*>(ptr_bool);
             column_type = ColumnType::BOOLEAN;
 			break;
         }
 		case ColumnType::VARCHAR: {
-            char* ptr_char = customCudaMalloc<char>(cpu_data.size, 0, true);
+            char* ptr_char = customCudaMalloc<char>(cpu_data.size, 0, true).data_;
             ptr = reinterpret_cast<uint8_t*>(ptr_char);
             column_type = ColumnType::VARCHAR;
 			break;

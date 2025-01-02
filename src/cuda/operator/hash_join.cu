@@ -161,8 +161,8 @@ void probeHashTableOri(uint64_t *keys, unsigned long long* ht, uint64_t ht_len, 
     uint64_t* h_count = new uint64_t [1];
     cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
     assert(h_count[0] > 0);
-    row_ids_left = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
-    row_ids_right = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
+    row_ids_left = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0).data_;
+    row_ids_right = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0).data_;
     cudaMemset(count, 0, sizeof(uint64_t));
     probe<T, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(keys, ht, ht_len, row_ids_left, row_ids_right, (unsigned long long*) count, N, mode, 0);
     CHECK_ERROR();

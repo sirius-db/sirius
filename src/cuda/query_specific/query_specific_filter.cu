@@ -396,10 +396,10 @@ void q19FilterExpression(uint64_t *p_brand, double *l_quantity, uint64_t *p_size
     printf("Launching Q19 Filter Kernel\n");
 
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
-    uint64_t* d_p_brand_val = gpuBufferManager->customCudaMalloc<uint64_t>(3, 0, 0);
-    double* d_l_quantity_val = gpuBufferManager->customCudaMalloc<double>(6, 0, 0);
-    uint64_t* d_p_size_val = gpuBufferManager->customCudaMalloc<uint64_t>(3, 0, 0);
-    uint64_t* d_p_container_val = gpuBufferManager->customCudaMalloc<uint64_t>(12, 0, 0);
+    uint64_t* d_p_brand_val = gpuBufferManager->customCudaMalloc<uint64_t>(3, 0, 0).data_;
+    double* d_l_quantity_val = gpuBufferManager->customCudaMalloc<double>(6, 0, 0).data_;
+    uint64_t* d_p_size_val = gpuBufferManager->customCudaMalloc<uint64_t>(3, 0, 0).data_;
+    uint64_t* d_p_container_val = gpuBufferManager->customCudaMalloc<uint64_t>(12, 0, 0).data_;
     callCudaMemcpyHostToDevice<uint64_t>(d_p_brand_val, p_brand_val, 3, 0);
     callCudaMemcpyHostToDevice<double>(d_l_quantity_val, l_quantity_val, 6, 0);
     callCudaMemcpyHostToDevice<uint64_t>(d_p_size_val, p_size_val, 3, 0);
@@ -411,7 +411,7 @@ void q19FilterExpression(uint64_t *p_brand, double *l_quantity, uint64_t *p_size
     CHECK_ERROR();
     uint64_t* h_count = new uint64_t[1];
     cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
-    row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
+    row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0).data_;
     cudaMemset(count, 0, sizeof(uint64_t));
     q19_filter<uint64_t, double, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(p_brand, l_quantity, p_size, p_container, d_p_brand_val, d_l_quantity_val, d_p_size_val, d_p_container_val, row_ids, (unsigned long long*) count, N, 0);
     CHECK_ERROR();
@@ -432,7 +432,7 @@ void q16FilterExpression(uint64_t *p_brand, uint64_t *p_type, uint64_t *p_size, 
     printf("Launching Q16 Filter Kernel\n");
 
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
-    uint64_t* d_p_size_val = gpuBufferManager->customCudaMalloc<uint64_t>(8, 0, 0);
+    uint64_t* d_p_size_val = gpuBufferManager->customCudaMalloc<uint64_t>(8, 0, 0).data_;
     callCudaMemcpyHostToDevice<uint64_t>(d_p_size_val, p_size_val, 8, 0);
 
     cudaMemset(count, 0, sizeof(uint64_t));
@@ -441,7 +441,7 @@ void q16FilterExpression(uint64_t *p_brand, uint64_t *p_type, uint64_t *p_size, 
     CHECK_ERROR();
     uint64_t* h_count = new uint64_t[1];
     cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
-    row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
+    row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0).data_;
     cudaMemset(count, 0, sizeof(uint64_t));
     q16_filter<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(p_brand, p_type, p_size, p_brand_val, p_type_val1, p_type_val2, d_p_size_val, row_ids, (unsigned long long*) count, N, 0);
     CHECK_ERROR();
@@ -467,7 +467,7 @@ void q12FilterExpression(uint64_t *l_commitdate, uint64_t *l_receiptdate, uint64
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
     uint64_t* h_count = new uint64_t[1];
     cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
-    row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
+    row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0).data_;
     cudaMemset(count, 0, sizeof(uint64_t));
     q12_filter<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(l_commitdate, l_receiptdate, l_shipdate, l_shipmode, l_shipmode_val1, l_shipmode_val2, row_ids, (unsigned long long*) count, N, 0);
     CHECK_ERROR();
@@ -493,7 +493,7 @@ void q2FilterExpression(uint64_t *p_type, uint64_t p_type_val, uint64_t* &row_id
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
     uint64_t* h_count = new uint64_t[1];
     cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
-    row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
+    row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0).data_;
     cudaMemset(count, 0, sizeof(uint64_t));
     q2_filter<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(p_type, p_type_val, row_ids, (unsigned long long*) count, N, 0);
     CHECK_ERROR();
@@ -520,7 +520,7 @@ void q7FilterExpression(uint64_t *n1_nationkey, uint64_t *n2_nationkey, uint64_t
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
     uint64_t* h_count = new uint64_t[1];
     cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
-    row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
+    row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0).data_;
     cudaMemset(count, 0, sizeof(uint64_t));
     q7_filter<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(n1_nationkey, n2_nationkey, val1, val2, val3, val4, row_ids, (unsigned long long*) count, N, 0);
     CHECK_ERROR();

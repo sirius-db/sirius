@@ -266,7 +266,7 @@ GPUPhysicalHashJoin::GetData(GPUIntermediateRelation &output_relation) const {
 	uint64_t* row_ids = nullptr;
 	uint64_t* count = nullptr;
 	GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
-	count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+	count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0).data_;
 	HandleScanHTExpression(gpu_hash_table, ht_len, row_ids, count, join_type, conditions);
 
 	//TODO: FIX THIS LATER!!
@@ -345,7 +345,7 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 	//probing hash table
 	printf("Probing hash table\n");
 	if (join_type == JoinType::SEMI || join_type == JoinType::ANTI || join_type == JoinType::INNER || join_type == JoinType::OUTER || join_type == JoinType::RIGHT || join_type == JoinType::LEFT) {
-		count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+		count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0).data_;
 		HandleProbeExpression(probe_key, count, row_ids_left, row_ids_right, gpu_hash_table, ht_len, conditions, join_type, gpuBufferManager);
 		if (count[0] == 0) throw NotImplementedException("No match found");
 	} else if (join_type == JoinType::MARK) {
@@ -437,9 +437,9 @@ GPUPhysicalHashJoin::Sink(GPUIntermediateRelation &input_relation) const {
 	printf("Building hash table\n");
 	ht_len = build_keys[0]->column_length * 2;
 	if (join_type == JoinType::INNER || join_type == JoinType::SEMI || join_type == JoinType::MARK) {
-		gpu_hash_table = (unsigned long long*) gpuBufferManager->customCudaMalloc<uint64_t>(ht_len * (conditions.size() + 1), 0, 0);
+		gpu_hash_table = (unsigned long long*) gpuBufferManager->customCudaMalloc<uint64_t>(ht_len * (conditions.size() + 1), 0, 0).data_;
 	} else if (join_type == JoinType::RIGHT || join_type == JoinType::RIGHT_SEMI || join_type == JoinType::RIGHT_ANTI) {
-		gpu_hash_table = (unsigned long long*) gpuBufferManager->customCudaMalloc<uint64_t>(ht_len * (conditions.size() + 2), 0, 0);
+		gpu_hash_table = (unsigned long long*) gpuBufferManager->customCudaMalloc<uint64_t>(ht_len * (conditions.size() + 2), 0, 0).data_;
 	}
 	HandleBuildExpression(build_keys, gpu_hash_table, ht_len, conditions, join_type, gpuBufferManager);
 

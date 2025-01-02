@@ -10,7 +10,7 @@ GPUColumn*
 GPUExpressionExecutor::ResolveTypeBinaryConstantExpression(GPUColumn* column, T constant, GPUBufferManager* gpuBufferManager, string function_name) {
     T* a = reinterpret_cast<T*> (column->data_wrapper.data);
     size_t size = column->column_length;
-    T* c = gpuBufferManager->customCudaMalloc<T>(size, 0, 0);
+    T* c = gpuBufferManager->customCudaMalloc<T>(size, 0, 0).data_;
     if (function_name.compare("+") == 0) {
         binaryConstantExpression<T>(a, constant, c, size, 0);
     } else if (function_name.compare("-") == 0) {
@@ -54,7 +54,7 @@ GPUExpressionExecutor::ResolveTypeBinaryExpression(GPUColumn* column1, GPUColumn
     T* a = reinterpret_cast<T*> (column1->data_wrapper.data);
     T* b = reinterpret_cast<T*> (column2->data_wrapper.data);
     size_t size = column1->column_length;
-    T* c = gpuBufferManager->customCudaMalloc<T>(size, 0, 0);
+    T* c = gpuBufferManager->customCudaMalloc<T>(size, 0, 0).data_;
     if (function_name.compare("+") == 0) {
         binaryExpression<T>(a, b, c, size, 0);
     } else if (function_name.compare("-") == 0) {
@@ -222,7 +222,7 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
                 size_t size;
 
                 GPUColumn* materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref.index], bound_ref, gpuBufferManager);
-                count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+                count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0).data_;
                 HandleComparisonConstantExpression(materialized_column, bound_lower, bound_upper, count, comparison_idx, bound_between.type);
                 if (count[0] == 0) throw NotImplementedException("No match found");
             break;
@@ -269,7 +269,7 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
                         count[0] = 0;
                     } else {
                         GPUColumn* materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref1.index], bound_ref1, gpuBufferManager);
-                        count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+                        count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0).data_;
                         HandleComparisonConstantExpression(materialized_column, bound_ref2, bound_ref2, count, comparison_idx, bound_comparison.type);
                         if (count[0] == 0) throw NotImplementedException("No match found");
                     }
@@ -285,7 +285,7 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
                     } else {
                         GPUColumn* materialized_column1 = HandleMaterializeExpression(input_relation.columns[bound_ref1.index], bound_ref1, gpuBufferManager);
                         GPUColumn* materialized_column2 = HandleMaterializeExpression(input_relation.columns[bound_ref2.index], bound_ref2, gpuBufferManager);
-                        count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+                        count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0).data_;
                         HandleComparisonExpression(materialized_column1, materialized_column2, count, comparison_idx, bound_comparison.type);  
                         if (count[0] == 0) throw NotImplementedException("No match found");   
                     }       
@@ -320,7 +320,7 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
                     count = new uint64_t[1];
                     count[0] = 0;
                 } else {
-                  count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+                  count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0).data_;
                   GPUColumn* materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref.index], bound_ref, gpuBufferManager);
                   if(bound_function_name.find("prefix") != std::string::npos) {
                     HandlePrefixMatching(materialized_column, match_str, comparison_idx, count, 0);
@@ -355,7 +355,7 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
                         GPUColumn* materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref.index], bound_ref, gpuBufferManager);
                         Value one = Value::BOOLEAN(1);
                         BoundConstantExpression bound_constant_expr = BoundConstantExpression(one);
-                        count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+                        count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0).data_;
                         HandleComparisonConstantExpression(materialized_column, bound_constant_expr, bound_constant_expr, count, comparison_idx, ExpressionType::COMPARE_NOTEQUAL);
                         if (count[0] == 0) throw NotImplementedException("No match found"); 
                       }
@@ -371,7 +371,7 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
                           count = new uint64_t[1];
                           count[0] = 0;
                       } else {
-                        count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+                        count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0).data_;
                         GPUColumn* materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref.index], bound_ref, gpuBufferManager);
                         if(bound_function_name.find("prefix") != std::string::npos) {
                             HandlePrefixMatching(materialized_column, match_str, comparison_idx, count, 1);
@@ -410,7 +410,7 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
         //               output_relation.columns[i]->row_ids = new_row_ids[idx];
         //             } else {
         //               uint64_t* temp_prev_row_ids = reinterpret_cast<uint64_t*> (input_relation.columns[i]->row_ids);
-        //               uint64_t* temp_new_row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(count[0], 0, 0);
+        //               uint64_t* temp_new_row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(count[0], 0, 0).data_;
         //               materializeExpression<uint64_t>(temp_prev_row_ids, temp_new_row_ids, comparison_idx, count[0]);
         //               output_relation.columns[i]->row_ids = temp_new_row_ids;
         //               new_row_ids.push_back(temp_new_row_ids);

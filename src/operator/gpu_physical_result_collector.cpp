@@ -98,7 +98,7 @@ GPUPhysicalMaterializedCollector::FinalMaterializeInternal(GPUIntermediateRelati
 	if (input_relation.checkLateMaterialization(col)) {
 		T* data = reinterpret_cast<T*> (input_relation.columns[col]->data_wrapper.data);
 		uint64_t* row_ids = reinterpret_cast<uint64_t*> (input_relation.columns[col]->row_ids);
-		T* materialized = gpuBufferManager->customCudaMalloc<T>(input_relation.columns[col]->row_id_count, 0, 0);
+		T* materialized = gpuBufferManager->customCudaMalloc<T>(input_relation.columns[col]->row_id_count, 0, 0).data_;
 		// printf("input_relation.columns[col]->row_id_count %d\n", input_relation.columns[col]->row_id_count);
 		materializeExpression<T>(data, materialized, row_ids, input_relation.columns[col]->row_id_count);
 		output_relation.columns[col] = new GPUColumn(input_relation.columns[col]->row_id_count, input_relation.columns[col]->data_wrapper.type, reinterpret_cast<uint8_t*>(materialized));

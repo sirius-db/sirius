@@ -213,7 +213,7 @@ void probeHashTableSingleMatch(uint8_t **keys, unsigned long long* ht, uint64_t 
         if (condition_mode[idx] == 0) equal_keys++;
     }
 
-    int* condition_mode_dev = gpuBufferManager->customCudaMalloc<int>(num_keys, 0, 0);
+    int* condition_mode_dev = gpuBufferManager->customCudaMalloc<int>(num_keys, 0, 0).data_;
     cudaMemcpy(condition_mode_dev, condition_mode, num_keys * sizeof(int), cudaMemcpyHostToDevice);
 
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
@@ -226,8 +226,8 @@ void probeHashTableSingleMatch(uint8_t **keys, unsigned long long* ht, uint64_t 
     uint64_t* h_count = new uint64_t [1];
     cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
     assert(h_count[0] > 0);
-    row_ids_left = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
-    if (join_mode == 0) row_ids_right = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
+    row_ids_left = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0).data_;
+    if (join_mode == 0) row_ids_right = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0).data_;
     cudaMemset(count, 0, sizeof(uint64_t));
     probe_single_match<BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(keys_dev, ht, ht_len, row_ids_left, row_ids_right, (unsigned long long*) count, 
             N, condition_mode_dev, num_keys, equal_keys, join_mode, 0);
@@ -268,9 +268,9 @@ void probeHashTableMark(uint8_t **keys, unsigned long long* ht, uint64_t ht_len,
     }
     printf("Launching Probe Kernel\n");
 
-    int* condition_mode_dev = gpuBufferManager->customCudaMalloc<int>(num_keys, 0, 0);
+    int* condition_mode_dev = gpuBufferManager->customCudaMalloc<int>(num_keys, 0, 0).data_;
     cudaMemcpy(condition_mode_dev, condition_mode, num_keys * sizeof(int), cudaMemcpyHostToDevice);
-    output = gpuBufferManager->customCudaMalloc<uint8_t>(N, 0, 0);
+    output = gpuBufferManager->customCudaMalloc<uint8_t>(N, 0, 0).data_;
     printf("Launching Probe Kernel\n");
 
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;

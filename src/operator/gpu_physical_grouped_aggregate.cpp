@@ -9,7 +9,7 @@ namespace duckdb {
 template <typename T>
 GPUColumn*
 ResolveTypeCombineColumns(GPUColumn* column1, GPUColumn* column2, GPUBufferManager* gpuBufferManager) {
-	T* combine = gpuBufferManager->customCudaMalloc<T>(column1->column_length + column2->column_length, 0, 0);
+	T* combine = gpuBufferManager->customCudaMalloc<T>(column1->column_length + column2->column_length, 0, 0).data_;
 	T* a = reinterpret_cast<T*> (column1->data_wrapper.data);
 	T* b = reinterpret_cast<T*> (column2->data_wrapper.data);
 	combineColumns<T>(a, b, combine, column1->column_length, column2->column_length);
@@ -491,7 +491,7 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 			// if (input_relation.checkLateMaterialization(bound_ref_expr.index)) {
 			// 	uint64_t* temp = reinterpret_cast<uint64_t*> (input_relation.columns[bound_ref_expr.index]->data_wrapper.data);
 			// 	uint64_t* row_ids_input = reinterpret_cast<uint64_t*> (input_relation.columns[bound_ref_expr.index]->row_ids);
-			// 	group_keys[idx] = gpuBufferManager->customCudaMalloc<uint64_t>(input_relation.columns[bound_ref_expr.index]->row_id_count, 0, 0);
+			// 	group_keys[idx] = gpuBufferManager->customCudaMalloc<uint64_t>(input_relation.columns[bound_ref_expr.index]->row_id_count, 0, 0).data_;
 			// 	materializeExpression<uint64_t>(temp, group_keys[idx], row_ids_input, input_relation.columns[bound_ref_expr.index]->row_id_count);
 			// 	size = input_relation.columns[bound_ref_expr.index]->row_id_count;
 			// } else {

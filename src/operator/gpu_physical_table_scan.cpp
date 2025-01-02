@@ -136,7 +136,7 @@ ResolveTypeMaterializeExpression(GPUColumn* column, GPUBufferManager* gpuBufferM
     if (column->row_ids != nullptr) {
         T* temp = reinterpret_cast<T*> (column->data_wrapper.data);
         uint64_t* row_ids_input = reinterpret_cast<uint64_t*> (column->row_ids);
-        a = gpuBufferManager->customCudaMalloc<T>(column->row_id_count, 0, 0);
+        a = gpuBufferManager->customCudaMalloc<T>(column->row_id_count, 0, 0).data_;
         materializeExpression<T>(temp, a, row_ids_input, column->row_id_count);
         size = column->row_id_count;
     } else {
@@ -247,7 +247,7 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
                 auto filter_constant2 = filter_conjunction_and.child_filters[1]->Cast<ConstantFilter>();
                 ExpressionType expression_type1 = filter_constant1.comparison_type;
                 ExpressionType expression_type2 = filter_constant2.comparison_type;
-                count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+                count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0).data_;
 
                 if (prev_row_ids) {
                   printf("The previous row ids count is %ld\n", prev_row_ids_count);
@@ -276,7 +276,7 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
                   auto filter_constant = filter_inside->Cast<ConstantFilter>();
                   ExpressionType expression_type = filter_constant.comparison_type;
                   size_t size = table->columns[column_ids[column_index]]->column_length;
-                  count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+                  count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0).data_;
 
                   if (prev_row_ids) {
                     printf("The previous row ids count is %ld\n", prev_row_ids_count);
@@ -301,7 +301,7 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
           }
 
           if (prev_row_ids) {
-            uint64_t* new_row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(count[0], 0, 0);
+            uint64_t* new_row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(count[0], 0, 0).data_;
             materializeExpression<uint64_t>(prev_row_ids, new_row_ids, row_ids, count[0]);
             prev_row_ids = new_row_ids;
             prev_row_ids_count = count[0];

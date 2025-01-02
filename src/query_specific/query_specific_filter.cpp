@@ -53,7 +53,7 @@ GPUExpressionExecutor::HandlingSpecificFilter(GPUIntermediateRelation& input_rel
                                     GPUColumn* materialized_quantity = HandleMaterializeExpression(input_relation.columns[l_quantity], third.left->Cast<BoundReferenceExpression>(), gpuBufferManager);
                                     GPUColumn* materialized_container = HandleMaterializeExpression(input_relation.columns[p_container], fourth.children[0]->Cast<BoundReferenceExpression>(), gpuBufferManager);
 
-                                    count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+                                    count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0).data_;
                                     uint64_t* a = reinterpret_cast<uint64_t*> (materialized_brand->data_wrapper.data);
                                     double* b = reinterpret_cast<double*> (materialized_quantity->data_wrapper.data);
                                     uint64_t* c = reinterpret_cast<uint64_t*> (materialized_size->data_wrapper.data);
@@ -87,7 +87,7 @@ GPUExpressionExecutor::HandlingSpecificFilter(GPUIntermediateRelation& input_rel
                             GPUColumn* materialized_nkey1 = HandleMaterializeExpression(input_relation.columns[n_nationkey1], first.left->Cast<BoundReferenceExpression>(), gpuBufferManager);
                             GPUColumn* materialized_nkey2 = HandleMaterializeExpression(input_relation.columns[n_nationkey2], second.left->Cast<BoundReferenceExpression>(), gpuBufferManager);
 
-                            count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+                            count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0).data_;
                             uint64_t* a = reinterpret_cast<uint64_t*> (materialized_nkey1->data_wrapper.data);
                             uint64_t* b = reinterpret_cast<uint64_t*> (materialized_nkey2->data_wrapper.data);
 
@@ -121,7 +121,7 @@ GPUExpressionExecutor::HandlingSpecificFilter(GPUIntermediateRelation& input_rel
                     GPUColumn* materialized_type = HandleMaterializeExpression(input_relation.columns[p_type], second_temp.left->Cast<BoundReferenceExpression>(), gpuBufferManager);
                     GPUColumn* materialized_size = HandleMaterializeExpression(input_relation.columns[p_size], third.children[0]->Cast<BoundReferenceExpression>(), gpuBufferManager);
 
-                    count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+                    count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0).data_;
                     uint64_t* a = reinterpret_cast<uint64_t*> (materialized_brand->data_wrapper.data);
                     uint64_t* b = reinterpret_cast<uint64_t*> (materialized_type->data_wrapper.data);
                     uint64_t* c = reinterpret_cast<uint64_t*> (materialized_size->data_wrapper.data);
@@ -156,7 +156,7 @@ GPUExpressionExecutor::HandlingSpecificFilter(GPUIntermediateRelation& input_rel
                     GPUColumn* materialized_shipdate = HandleMaterializeExpression(input_relation.columns[l_shipdate], second.left->Cast<BoundReferenceExpression>(), gpuBufferManager);
                     GPUColumn* materialized_shipmode = HandleMaterializeExpression(input_relation.columns[l_shipmode], third.children[0]->Cast<BoundReferenceExpression>(), gpuBufferManager);
 
-                    count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+                    count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0).data_;
                     uint64_t* a = reinterpret_cast<uint64_t*> (materialized_commitdate->data_wrapper.data);
                     uint64_t* b = reinterpret_cast<uint64_t*> (materialized_receiptdate->data_wrapper.data);
                     uint64_t* c = reinterpret_cast<uint64_t*> (materialized_shipdate->data_wrapper.data);
@@ -187,7 +187,7 @@ GPUExpressionExecutor::HandlingSpecificFilter(GPUIntermediateRelation& input_rel
 
                                 GPUColumn* materialized_type = HandleMaterializeExpression(input_relation.columns[p_type], left_function_expr.children[0]->Cast<BoundReferenceExpression>(), gpuBufferManager);
 
-                                count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+                                count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0).data_;
                                 uint64_t* a = reinterpret_cast<uint64_t*> (materialized_type->data_wrapper.data);
 
                                 size_t size = materialized_type->column_length;
@@ -247,7 +247,7 @@ GPUExpressionExecutor::HandlingSpecificFilter(GPUIntermediateRelation& input_rel
             //         output_relation.columns[i]->row_ids = comparison_idx;
             //     } else {
             //         uint64_t* row_ids_input = reinterpret_cast<uint64_t*> (input_relation.columns[i]->row_ids);
-            //         uint64_t* new_row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(count[0], 0, 0);
+            //         uint64_t* new_row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(count[0], 0, 0).data_;
             //         materializeExpression<uint64_t>(row_ids_input, new_row_ids, comparison_idx, count[0]);
             //         output_relation.columns[i]->row_ids = new_row_ids;
             //     }
