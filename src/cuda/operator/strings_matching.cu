@@ -166,7 +166,7 @@ void StringMatching(char* char_data, uint64_t* str_indices, std::string match_st
   bool* d_answers = reinterpret_cast<bool*> (gpuBufferManager->customCudaMalloc<uint8_t>(num_strings, 0, 0).data_);
   cudaMemset(d_answers, 0, num_strings * sizeof(bool));
   // TODO: Do it twice for more accurate allocation
-  // uint64_t* d_matching_rows = gpuBufferManager->customCudaMalloc<uint64_t>(num_strings, 0, 0);
+  // uint64_t* d_matching_rows = gpuBufferManager->customCudaMalloc<uint64_t>(num_strings, 0, 0).data_;
 
   // Copy over the data to the buffers
   cudaMemcpy(d_kmp_automato, kmp_automato, kmp_automato_size * sizeof(int), cudaMemcpyHostToDevice);
@@ -205,7 +205,7 @@ void StringMatching(char* char_data, uint64_t* str_indices, std::string match_st
   uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
   cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
   CHECK_ERROR();
-  row_id = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
+  row_id = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0).data_;
 
   cudaMemset(count, 0, sizeof(uint64_t));
   compact_valid_rows<BLOCK_THREADS, ITEMS_PER_THREAD><<<((num_strings + BLOCK_THREADS * ITEMS_PER_THREAD - 1)/(BLOCK_THREADS * ITEMS_PER_THREAD)), BLOCK_THREADS>>>(d_answers, row_id, (unsigned long long*) count, num_strings, 0, not_equal);
@@ -387,7 +387,7 @@ void MultiStringMatching(char* char_data, uint64_t* str_indices, std::vector<std
   uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
   cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
   CHECK_ERROR();
-  row_id = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
+  row_id = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0).data_;
   cudaMemset(count, 0, sizeof(uint64_t));
 
   compact_valid_rows<BLOCK_THREADS, ITEMS_PER_THREAD><<<((num_strings + BLOCK_THREADS * ITEMS_PER_THREAD - 1)/(BLOCK_THREADS * ITEMS_PER_THREAD)), BLOCK_THREADS>>>(d_found_answer, row_id, (unsigned long long*) count, num_strings, 0, not_equal);
@@ -458,7 +458,7 @@ void PrefixMatching(char* char_data, uint64_t* str_indices, std::string match_pr
   uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
   cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
   CHECK_ERROR();
-  row_id = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
+  row_id = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0).data_;
   cudaMemset(count, 0, sizeof(uint64_t));
 
   compact_valid_rows<BLOCK_THREADS, ITEMS_PER_THREAD><<<((num_strings + BLOCK_THREADS * ITEMS_PER_THREAD - 1)/(BLOCK_THREADS * ITEMS_PER_THREAD)), BLOCK_THREADS>>>(d_results, row_id, (unsigned long long*) count, num_strings, 0, not_equal);

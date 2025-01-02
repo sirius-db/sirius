@@ -215,7 +215,7 @@ GPUExpressionExecutor::HandlingSpecificFilter(GPUIntermediateRelation& input_rel
                     uint8_t* a = materialized_column->data_wrapper.data;
                     uint64_t* offset = materialized_column->data_wrapper.offset;
                     string c_phone_val_str = "13312329301817";
-                    count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+                    count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0).data_;
                     q22FilterExpression(a, offset, start_idx, length, c_phone_val_str, comparison_idx, count, size, 8);
                 }
                 t = "(substr(C_PHONE, 1, 2) IN ('13', '31', '23'))";
@@ -230,7 +230,7 @@ GPUExpressionExecutor::HandlingSpecificFilter(GPUIntermediateRelation& input_rel
                     uint8_t* a = materialized_column->data_wrapper.data;
                     uint64_t* offset = materialized_column->data_wrapper.offset;
                     string c_phone_val_str = "133123";
-                    count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+                    count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0).data_;
                     q22FilterExpression(a, offset, start_idx, length, c_phone_val_str, comparison_idx, count, size, 8);
                 }
              } else {

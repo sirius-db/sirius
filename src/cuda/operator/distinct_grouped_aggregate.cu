@@ -280,7 +280,7 @@ void groupedDistinctAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t
     T** keys_result = new T*[num_keys];
     cudaMalloc((void**) &keys_dev_result, num_keys * sizeof(T*));
     for (uint64_t i = 0; i < num_keys; i++) {
-        keys_result[i] = gpuBufferManager->customCudaMalloc<T>(count[0], 0, 0);
+        keys_result[i] = gpuBufferManager->customCudaMalloc<T>(count[0], 0, 0).data_;
     }
     cudaMemcpy(keys_dev_result, keys_result, num_keys * sizeof(T*), cudaMemcpyHostToDevice);
 

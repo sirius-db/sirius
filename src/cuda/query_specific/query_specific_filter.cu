@@ -605,7 +605,7 @@ void q22FilterExpression(uint8_t *a, uint64_t* offset, uint64_t start_idx, uint6
 
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 
-    uint8_t* temp = gpuBufferManager->customCudaMalloc<uint8_t>(num_predicates * length, 0, 0);
+    uint8_t* temp = gpuBufferManager->customCudaMalloc<uint8_t>(num_predicates * length, 0, 0).data_;
     cudaMemcpy(temp, c_phone_val.c_str(), num_predicates * length * sizeof(uint8_t), cudaMemcpyHostToDevice);
     uint8_t** h_c_phone_val = new uint8_t*[num_predicates];
     for (int i = 0; i < num_predicates; i++) {
@@ -627,7 +627,7 @@ void q22FilterExpression(uint8_t *a, uint64_t* offset, uint64_t start_idx, uint6
     
     uint64_t* h_count = new uint64_t[1];
     cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
-    row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
+    row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0).data_;
 
     cudaMemset(count, 0, sizeof(uint64_t));
     q22_filter<<<num_blocks, 128>>>(reinterpret_cast<char*>(a), offset, start_idx, length, d_c_phone_val, 

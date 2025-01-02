@@ -144,7 +144,7 @@ HandleMaterializeRowIDs(GPUIntermediateRelation& input_relation, GPUIntermediate
 //                     // printf("new row id count %ld\n", count);
 //                     // printf("hash table row id count %ld\n", hash_table_result.columns[i]->row_id_count);
 //                     uint64_t* temp_prev_row_ids = reinterpret_cast<uint64_t*> (hash_table_result.columns[i]->row_ids);
-//                     uint64_t* temp_new_row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(count, 0, 0);
+//                     uint64_t* temp_new_row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(count, 0, 0).data_;
 //                     // printGPUColumn<uint64_t>(row_ids, count, 0);
 //                     materializeExpression<uint64_t>(temp_prev_row_ids, temp_new_row_ids, row_ids, count);
 //                     output_relation.columns[offset + rhs_col]->row_ids = temp_new_row_ids;
