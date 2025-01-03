@@ -154,6 +154,8 @@ void scanHashTableRight(unsigned long long* ht, uint64_t ht_len, uint64_t* &row_
         return;
     }
     printf("Launching Scan Kernel\n");
+    SETUP_TIMING();
+    START_TIMER();
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
     cudaMemset(count, 0, sizeof(uint64_t));
 
@@ -181,6 +183,7 @@ void scanHashTableRight(unsigned long long* ht, uint64_t ht_len, uint64_t* &row_
 
     CHECK_ERROR();
     cudaDeviceSynchronize();
+    STOP_TIMER();
 }
 
 void probeHashTableRightSemiAnti(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t N, int* condition_mode, int num_keys) {
@@ -190,6 +193,8 @@ void probeHashTableRightSemiAnti(uint8_t **keys, unsigned long long* ht, uint64_
         return;
     }
     printf("Launching Probe Kernel\n");
+    SETUP_TIMING();
+    START_TIMER();
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 
     //reinterpret cast the keys to uint64_t
@@ -216,6 +221,7 @@ void probeHashTableRightSemiAnti(uint8_t **keys, unsigned long long* ht, uint64_
     cudaDeviceSynchronize();
 
     printf("Finished probe right\n");
+    STOP_TIMER();
 }
 
 } // namespace duckdb

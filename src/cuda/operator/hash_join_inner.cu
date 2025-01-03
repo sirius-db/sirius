@@ -228,6 +228,8 @@ void buildHashTable(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uin
         return;
     }
     printf("Launching Build Kernel\n");
+    SETUP_TIMING();
+    START_TIMER();
     printf("N: %lu\n", N);
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 
@@ -259,6 +261,7 @@ void buildHashTable(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uin
     // print_hash_table<<<1, 1>>>(ht, ht_len);
     CHECK_ERROR();
     cudaDeviceSynchronize();
+    STOP_TIMER();
 }
 
 void probeHashTable(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t* &row_ids_left, uint64_t* &row_ids_right, uint64_t* &count, uint64_t N, int* condition_mode, int num_keys, bool is_right) {
@@ -271,6 +274,8 @@ void probeHashTable(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uin
         return;
     }
     printf("Launching Probe Kernel\n");
+    SETUP_TIMING();
+    START_TIMER();
     printf("N: %lu\n", N);
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
@@ -312,6 +317,7 @@ void probeHashTable(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uin
     CHECK_ERROR();
     cudaDeviceSynchronize();
     count = h_count;
+    STOP_TIMER();
 }
 
 

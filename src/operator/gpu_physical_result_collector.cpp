@@ -217,6 +217,9 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 	if (types.size() != input_relation.columns.size()) {
 		throw InvalidInputException("Column count mismatch");
 	}
+
+	//measure time
+	auto start = std::chrono::high_resolution_clock::now();
 	// auto &gstate = GetGlobalSinkState(input_relation.context);
 
 	size_t size_bytes = 0;
@@ -296,6 +299,11 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 		collection->Append(append_state, chunk);
 		remaining -= STANDARD_VECTOR_SIZE;
 	}
+
+	//measure time
+	auto end = std::chrono::high_resolution_clock::now();
+	auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+	printf("Result collector time: %ld ms\n", duration.count()/1000);
 	return SinkResultType::FINISHED;
 }
 
