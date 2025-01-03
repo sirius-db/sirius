@@ -395,7 +395,7 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
 
     if (depth == 0) {
         printf("Writing filter result\n");
-        HandleMaterializeRowIDs(input_relation, output_relation, count[0], comparison_idx, gpuBufferManager);
+        HandleMaterializeRowIDs(input_relation, output_relation, count[0], comparison_idx, gpuBufferManager, true);
         // vector<uint64_t*> new_row_ids;
         // vector<uint64_t*> prev_row_ids;
         // for (int i = 0; i < input_relation.columns.size(); i++) {
