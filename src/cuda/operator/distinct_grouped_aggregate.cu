@@ -173,6 +173,8 @@ void groupedDistinctAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t
         return;
     }
     printf("Launching Distinct Grouped Aggregate Kernel\n");
+    SETUP_TIMING();
+    START_TIMER();
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 
     //allocate temp memory and copying keys
@@ -290,6 +292,7 @@ void groupedDistinctAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t
     for (uint64_t i = 0; i < num_keys; i++) {
         keys[i] = reinterpret_cast<uint8_t*> (keys_result[i]);
     }
+    STOP_TIMER();
 }
 
 template

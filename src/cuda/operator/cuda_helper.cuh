@@ -66,6 +66,19 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
 
 #define ALLOCATE(vec,size) CubDebugExit(g_allocator.DeviceAllocate((void**)&vec, size))
 
+#define START_TIMER() { \
+    cudaEventRecord(start, 0); \
+    cudaEventSynchronize(start); \
+}
+
+#define STOP_TIMER() { \
+    cudaEventRecord(stop, 0); \
+    cudaEventSynchronize(stop); \
+    float elapsedTime; \
+    cudaEventElapsedTime(&elapsedTime, start, stop); \
+    printf("Elapsed time: %f\n", elapsedTime); \
+}
+
 #define BLOCK_THREADS 128
 #define ITEMS_PER_THREAD 4 
 // #define TILE_SIZE (BLOCK_THREADS * ITEMS_PER_THREAD)

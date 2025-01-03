@@ -56,7 +56,6 @@ ResolveTypeMaterializeString(GPUColumn* column, BoundReferenceExpression& bound_
 
 GPUColumn* 
 HandleMaterializeExpression(GPUColumn* column, BoundReferenceExpression& bound_ref, GPUBufferManager* gpuBufferManager) {
-    printf("%d\n", column->data_wrapper.type);
     switch(column->data_wrapper.type) {
         case ColumnType::INT32:
             return ResolveTypeMaterializeExpression<int>(column, bound_ref, gpuBufferManager);

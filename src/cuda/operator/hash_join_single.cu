@@ -230,6 +230,8 @@ void probeHashTableSingleMatch(uint8_t **keys, unsigned long long* ht, uint64_t 
         return;
     }
     printf("Launching Probe Kernel Unique Join\n");
+    SETUP_TIMING();
+    START_TIMER();
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
     cudaMemset(count, 0, sizeof(uint64_t));
 
@@ -271,6 +273,7 @@ void probeHashTableSingleMatch(uint8_t **keys, unsigned long long* ht, uint64_t 
 
     printf("Count: %lu\n", h_count[0]);
     count = h_count;
+    STOP_TIMER();
 }
 
 void probeHashTableRightSemiAntiSingleMatch(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t N, int* condition_mode, int num_keys) {
@@ -280,6 +283,8 @@ void probeHashTableRightSemiAntiSingleMatch(uint8_t **keys, unsigned long long* 
         return;
     }
     printf("Launching Probe Kernel Unique Join\n");
+    SETUP_TIMING();
+    START_TIMER();
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 
     //reinterpret cast the keys to uint64_t
@@ -306,6 +311,7 @@ void probeHashTableRightSemiAntiSingleMatch(uint8_t **keys, unsigned long long* 
     cudaDeviceSynchronize();
 
     printf("Finished probe right\n");
+    STOP_TIMER();
 }
 
 void probeHashTableMark(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uint8_t* &output, uint64_t N, int* condition_mode, int num_keys) {
@@ -315,6 +321,8 @@ void probeHashTableMark(uint8_t **keys, unsigned long long* ht, uint64_t ht_len,
         return;
     }
     printf("Launching Probe Kernel Mark\n");
+    SETUP_TIMING();
+    START_TIMER();
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 
     //reinterpret cast the keys to uint64_t
@@ -344,6 +352,7 @@ void probeHashTableMark(uint8_t **keys, unsigned long long* ht, uint64_t ht_len,
             N, condition_mode_dev, num_keys, equal_keys);
     CHECK_ERROR();
     cudaDeviceSynchronize();
+    STOP_TIMER();
 }
 
 }

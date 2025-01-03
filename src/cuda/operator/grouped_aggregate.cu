@@ -256,6 +256,10 @@ void groupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count,
     }
 
     printf("Launching Grouped Aggregate Kernel\n");
+
+    SETUP_TIMING();
+    cudaEventRecord(start, 0);
+    
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 
     //allocate temp memory and copying keys
@@ -564,6 +568,12 @@ void groupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count,
     for (uint64_t i = 0; i < num_keys; i++) {
         keys[i] = reinterpret_cast<uint8_t*> (keys_result[i]);
     }
+
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    float milliseconds = 0;
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    printf("Grouped aggregate time: %f\n", milliseconds);
 }
 
 
@@ -576,6 +586,8 @@ void groupedWithoutAggregate(uint8_t **keys, uint64_t* count, uint64_t N, uint64
         return;
     }
     printf("Launching Grouped Without Aggregate Kernel\n");
+    SETUP_TIMING();
+    START_TIMER();
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 
     //allocate temp memory and copying keys
@@ -679,6 +691,8 @@ void groupedWithoutAggregate(uint8_t **keys, uint64_t* count, uint64_t N, uint64
     for (uint64_t i = 0; i < num_keys; i++) {
         keys[i] = reinterpret_cast<uint8_t*> (keys_result[i]);
     }
+
+    STOP_TIMER();
 }
 
 template<typename T>
