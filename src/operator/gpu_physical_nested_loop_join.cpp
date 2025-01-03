@@ -604,9 +604,9 @@ GPUPhysicalNestedLoopJoin::ResolveComplexJoin(GPUIntermediateRelation &input_rel
 
 		if (count[0] == 0) throw NotImplementedException("No match found in nested loop join");
 		printf("Writing row IDs from LHS to output relation\n");
-		HandleMaterializeRowIDs(input_relation, output_relation, count[0], row_ids_left, gpuBufferManager);
+		HandleMaterializeRowIDs(input_relation, output_relation, count[0], row_ids_left, gpuBufferManager, false);
 		printf("Writing row IDs from RHS to output relation\n");
-		HandleMaterializeRowIDsRHS(*right_temp_data, output_relation, rhs_output_columns, input_relation.column_count, count[0], row_ids_right, gpuBufferManager);
+		HandleMaterializeRowIDsRHS(*right_temp_data, output_relation, rhs_output_columns, input_relation.column_count, count[0], row_ids_right, gpuBufferManager, false);
 
 	} else {
         throw NotImplementedException("Unimplemented type for complex nested loop join!");

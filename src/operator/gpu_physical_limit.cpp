@@ -17,6 +17,7 @@ GPUPhysicalStreamingLimit::Execute(GPUIntermediateRelation &input_relation, GPUI
 	for (int col_idx = 0; col_idx < output_relation.columns.size(); col_idx++) {
 		// output_relation.columns[col_idx] = input_relation.columns[col_idx];
     output_relation.columns[col_idx] = new GPUColumn(limit_const, input_relation.columns[col_idx]->data_wrapper.type, input_relation.columns[col_idx]->data_wrapper.data);
+    output_relation.columns[col_idx]->is_unique = input_relation.columns[col_idx]->is_unique;
 	}
 
   return OperatorResultType::FINISHED;

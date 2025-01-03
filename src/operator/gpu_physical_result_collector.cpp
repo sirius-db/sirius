@@ -104,9 +104,11 @@ GPUPhysicalMaterializedCollector::FinalMaterializeInternal(GPUIntermediateRelati
 		output_relation.columns[col] = new GPUColumn(input_relation.columns[col]->row_id_count, input_relation.columns[col]->data_wrapper.type, reinterpret_cast<uint8_t*>(materialized));
 		output_relation.columns[col]->row_id_count = 0;
 		output_relation.columns[col]->row_ids = nullptr;
+		output_relation.columns[col]->is_unique = input_relation.columns[col]->is_unique;
 	} else {
 		// output_relation.columns[col] = input_relation.columns[col];
 		output_relation.columns[col] = new GPUColumn(input_relation.columns[col]->column_length, input_relation.columns[col]->data_wrapper.type, input_relation.columns[col]->data_wrapper.data);
+		output_relation.columns[col]->is_unique = input_relation.columns[col]->is_unique;
 	}
 }
 
@@ -128,8 +130,10 @@ GPUPhysicalMaterializedCollector::FinalMaterializeString(GPUIntermediateRelation
 		output_relation.columns[col] = new GPUColumn(num_rows, ColumnType::VARCHAR, reinterpret_cast<uint8_t*>(result), result_offset, new_num_bytes[0], true);
 		output_relation.columns[col]->row_id_count = 0;
 		output_relation.columns[col]->row_ids = nullptr;
+		output_relation.columns[col]->is_unique = input_relation.columns[col]->is_unique;
 	} else {
 		output_relation.columns[col] = new GPUColumn(*input_relation.columns[col]);
+		output_relation.columns[col]->is_unique = input_relation.columns[col]->is_unique;
 	}
 }
 

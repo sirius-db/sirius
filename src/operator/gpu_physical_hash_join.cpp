@@ -289,7 +289,12 @@ GPUPhysicalHashJoin::GetData(GPUIntermediateRelation &output_relation) const {
 	// 	// output_relation.columns[left_column_count + i] = hash_table_result->columns[rhs_cols];
 	// 	output_relation.columns[left_column_count + rhs_col] = HandleMaterializeRowIDs(hash_table_result->columns[i], count[0], row_ids, gpuBufferManager);
 	}
-	HandleMaterializeRowIDsRHS(*hash_table_result, output_relation, rhs_output_columns, left_column_count, count[0], row_ids, gpuBufferManager, true);
+	//TODO: Check if we need to maintain unique for the RHS columns
+	if (unique_probe_keys) {
+		HandleMaterializeRowIDsRHS(*hash_table_result, output_relation, rhs_output_columns, left_column_count, count[0], row_ids, gpuBufferManager, true);
+	} else {
+		HandleMaterializeRowIDsRHS(*hash_table_result, output_relation, rhs_output_columns, left_column_count, count[0], row_ids, gpuBufferManager, false);
+	}
 	// double* ptr = reinterpret_cast<double*>(output_relation.columns[left_column_count + 1]->data_wrapper.data);
 	// printGPUColumn<double>(ptr, 100, 0);
 	return SourceResultType::FINISHED;
@@ -411,7 +416,7 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 	}
 
 	//materialize columns from the right tables
-	if (join_type == JoinType::INNER || join_type == JoinType::OUTER || join_type == JoinType::RIGHT) {
+	if (join_type == JoinType::INNER || join_type == JoinType::OUTER || join_type == JoinType::LEFT || join_type == JoinType::RIGHT) {
 		printf("Writing row IDs from RHS to output relation\n");
 		// on the RHS, we need to fetch the data from the hash table
 		// for (idx_t i = 0; i < rhs_output_columns.size(); i++) {
@@ -436,8 +441,6 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 			// output_relation.columns[output_col_idx] = HandleMaterializeRowIDs(hash_table_result->columns[output_col_idx], count[0], row_ids_right, gpuBufferManager);
 			output_relation.columns[i] = new GPUColumn(0, hash_table_result->columns[rhs_col]->data_wrapper.type, nullptr);
 		}
-	} else {
-		throw NotImplementedException("Unsupported join type");
 	}
 
     return OperatorResultType::FINISHED;

@@ -144,6 +144,7 @@ ResolveTypeMaterializeExpression(GPUColumn* column, GPUBufferManager* gpuBufferM
         size = column->column_length;
     }
     GPUColumn* result = new GPUColumn(size, column->data_wrapper.type, reinterpret_cast<uint8_t*>(a));
+    result->is_unique = column->is_unique;
     return result;
 }
 
@@ -168,6 +169,7 @@ GPUColumn* ResolveStringMateralizeExpression(GPUColumn* column, GPUBufferManager
     new_num_bytes[0] = column->data_wrapper.num_bytes;
   }
   GPUColumn* result_column = new GPUColumn(num_rows, ColumnType::VARCHAR, reinterpret_cast<uint8_t*>(result), result_offset, new_num_bytes[0], true);
+  result_column->is_unique = column->is_unique;
   return result_column;
 }
 
@@ -320,6 +322,7 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
           printf("Writing row IDs to output relation in index %ld\n", index);
           output_relation.columns[index] = new GPUColumn(table->columns[column_ids[projection_id]]->column_length, table->columns[column_ids[projection_id]]->data_wrapper.type, table->columns[column_ids[projection_id]]->data_wrapper.data,
                           table->columns[column_ids[projection_id]]->data_wrapper.offset, table->columns[column_ids[projection_id]]->data_wrapper.num_bytes, table->columns[column_ids[projection_id]]->data_wrapper.is_string_data);
+          output_relation.columns[index]->is_unique = table->columns[column_ids[projection_id]]->is_unique;
           if (row_ids) {
             output_relation.columns[index]->row_ids = prev_row_ids; 
           }
@@ -335,6 +338,7 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
           printf("Writing row IDs to output relation in index %ld\n", index);
           output_relation.columns[index] = new GPUColumn(table->columns[column_id]->column_length, table->columns[column_id]->data_wrapper.type, table->columns[column_id]->data_wrapper.data,
                           table->columns[column_id]->data_wrapper.offset, table->columns[column_id]->data_wrapper.num_bytes, table->columns[column_id]->data_wrapper.is_string_data);
+          output_relation.columns[index]->is_unique = table->columns[column_id]->is_unique;
           if (row_ids) {
             output_relation.columns[index]->row_ids = prev_row_ids; 
           }
