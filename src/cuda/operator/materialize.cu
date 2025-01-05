@@ -92,8 +92,8 @@ void materializeExpression(T *a, T* result, uint64_t *row_ids, uint64_t N) {
         return;
     }
     printf("Launching Materialize Kernel\n");
-    SETUP_TIMING();
-    START_TIMER();
+    // SETUP_TIMING();
+    // START_TIMER();
     printf("N: %lu\n", N);
     // testprintmat<T><<<1, 1>>>(a, N);
     // CHECK_ERROR();
@@ -108,7 +108,7 @@ void materializeExpression(T *a, T* result, uint64_t *row_ids, uint64_t N) {
     // cudaMemcpy(result, raw_sorted, N * sizeof(T), cudaMemcpyDeviceToDevice);
     // testprintmat<T><<<1, 1>>>(result, 100);
     cudaDeviceSynchronize();
-    STOP_TIMER();
+    // STOP_TIMER();
 }
 
 void materializeString(uint8_t* data, uint64_t* offset, uint8_t* &result, uint64_t* &result_offset, uint64_t* row_ids, uint64_t* &new_num_bytes, uint64_t N) {
@@ -118,8 +118,8 @@ void materializeString(uint8_t* data, uint64_t* offset, uint8_t* &result, uint64
         return;
     }
     printf("Launching Materialize String Kernel\n");
-    SETUP_TIMING();
-    START_TIMER();
+    // SETUP_TIMING();
+    // START_TIMER();
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
     //allocate temp memory and copying keys
     uint64_t* temp_len = gpuBufferManager->customCudaMalloc<uint64_t>(N + 1, 0, 0);
@@ -159,7 +159,7 @@ void materializeString(uint8_t* data, uint64_t* offset, uint8_t* &result, uint64
     materialize_string<<<num_blocks, BLOCK_THREADS>>>(data, result, offset, result_offset, row_ids, N);
     cudaDeviceSynchronize();
     CHECK_ERROR();
-    STOP_TIMER();
+    // STOP_TIMER();
 }
 
 template

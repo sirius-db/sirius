@@ -425,7 +425,8 @@ void groupedStringAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t**
     printf("Launching String Grouped Aggregate Kernel\n");
 
     SETUP_TIMING();
-    cudaEventRecord(start, 0);
+    START_TIMER();
+    
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 
     void     *d_temp_storage = nullptr;
@@ -839,11 +840,7 @@ void groupedStringAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t**
     cudaDeviceSynchronize();
     printf("Count: %lu\n", count[0]);
 
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-    float milliseconds = 0;
-    cudaEventElapsedTime(&milliseconds, start, stop);
-    printf("String grouped aggregate time: %f\n", milliseconds);
+    STOP_TIMER()
 }
 
 __global__ void add_offset(uint64_t* a, uint64_t* b, uint64_t offset, uint64_t N) {

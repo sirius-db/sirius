@@ -219,12 +219,17 @@ void SiriusExtension::GPUProcessingFunction(ClientContext &context, TableFunctio
 		// int* temp = new int[size];
 		// int* ptr = sendDataToGPU(temp, size);  // Send data to GPU
 		// std::cout << "CUDA kernel call finished." << std::endl;
+		auto start = std::chrono::high_resolution_clock::now();
 		data.res = data.gpu_context->GPUExecuteQuery(context, data.query, data.gpu_prepared, {});
 		// data.res = data.conn->Query(data.query);
+		auto end = std::chrono::high_resolution_clock::now();
+		auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+		printf("GPU Execute query time: %.2f ms\n", duration.count()/1000.0);
 	}
 
 	// data.finished = true;
 	// printf("Fetching chunk first\n");
+	// auto start = std::chrono::high_resolution_clock::now();
 	auto result_chunk = data.res->Fetch();
 	if (!result_chunk) {
 		// printf("Not doing anything\n");
@@ -237,6 +242,9 @@ void SiriusExtension::GPUProcessingFunction(ClientContext &context, TableFunctio
 		// result_chunk = data.res->Fetch();
 	// }
 	// printf("Finished Fetching chunk\n");
+	// auto end = std::chrono::high_resolution_clock::now();
+	// auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+	// printf("Fetching time: %.2f ms\n", duration.count()/1000.0);
 	return;
 }
 

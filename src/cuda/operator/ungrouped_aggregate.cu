@@ -150,6 +150,7 @@ void ungroupedAggregate(uint8_t **a, uint8_t **result, uint64_t N, int* agg_mode
         return;
     }
     printf("Launching Aggregation Kernel\n");
+    printf("N: %ld\n", N);
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 
@@ -178,8 +179,6 @@ void ungroupedAggregate(uint8_t **a, uint8_t **result, uint64_t N, int* agg_mode
             T* a_temp = reinterpret_cast<T*> (a[agg]);
             T* result_temp = gpuBufferManager->customCudaMalloc<T>(1, 0, 0);
 
-            printf("N: %ld\n", N);
-
             if (agg_mode[agg] == 0) cudaMemset(result_temp, 0, sizeof(T));
             else if (agg_mode[agg] == 1) cudaMemset(result_temp, 0, sizeof(T));
             else if (agg_mode[agg] == 2) cudaMemcpy(result_temp, a_temp, sizeof(T), cudaMemcpyDeviceToDevice);
@@ -199,13 +198,15 @@ void ungroupedAggregate(uint8_t **a, uint8_t **result, uint64_t N, int* agg_mode
                 cudaMemcpy(result_temp, &avg, sizeof(T), cudaMemcpyHostToDevice);
                 CHECK_ERROR();
                 cudaDeviceSynchronize();
-            } else {
-                T* result_host_temp = new T[1];
-                cudaMemcpy(result_host_temp, result_temp, sizeof(T), cudaMemcpyDeviceToHost);
-                CHECK_ERROR();
-                cudaDeviceSynchronize();
-                printf("Result: %.2f and N: %d\n", result_host_temp[0], N);
-            }
+            } 
+            // else {
+                // T* result_host_temp = new T[1];
+                // cudaMemcpy(result_host_temp, result_temp, sizeof(T), cudaMemcpyDeviceToHost);
+                // CHECK_ERROR();
+                // cudaDeviceSynchronize();
+                // printf("Result: %.2f and N: %d\n", result_host_temp[0], N);
+                // printf("Result: %ld and N: %d\n", reinterpret_cast<uint64_t*>(result_host_temp)[0], N);
+            // }
             result[agg] = reinterpret_cast<uint8_t*> (result_temp);
         } else {
             printf("Unsupported aggregation mode\n");

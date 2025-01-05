@@ -261,6 +261,8 @@ GPUPhysicalHashJoin::GPUPhysicalHashJoin(LogicalOperator &op, unique_ptr<GPUPhys
 // GPUPhysicalHashJoin::GetData(ExecutionContext &context, GPUIntermediateRelation &output_relation, OperatorSourceInput &input) const {
 SourceResultType
 GPUPhysicalHashJoin::GetData(GPUIntermediateRelation &output_relation) const {
+	auto start = std::chrono::high_resolution_clock::now();
+
 	idx_t left_column_count = output_relation.columns.size() - hash_table_result->columns.size();
 	if (join_type == JoinType::RIGHT_SEMI || join_type == JoinType::RIGHT_ANTI) {
 		left_column_count = 0;
@@ -297,6 +299,11 @@ GPUPhysicalHashJoin::GetData(GPUIntermediateRelation &output_relation) const {
 	}
 	// double* ptr = reinterpret_cast<double*>(output_relation.columns[left_column_count + 1]->data_wrapper.data);
 	// printGPUColumn<double>(ptr, 100, 0);
+
+	auto end = std::chrono::high_resolution_clock::now();
+	auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+	printf("Hash Join GetData time: %.2f ms\n", duration.count()/1000.0);
+
 	return SourceResultType::FINISHED;
 }
 
@@ -306,11 +313,9 @@ GPUPhysicalHashJoin::GetData(GPUIntermediateRelation &output_relation) const {
 // 	GPUIntermediateRelation &output_relation, GlobalOperatorState &gstate, OperatorState &state) const {
 OperatorResultType
 GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation) const {
-    //Read the key from input relation
-    //Check if late materialization is needed
-    //Probe the hash table
-	//Create output relation
-    //Write the result to output relation
+
+	auto start = std::chrono::high_resolution_clock::now();
+
 	if (join_type == JoinType::RIGHT_SEMI || join_type == JoinType::RIGHT_ANTI) {
 		// for RIGHT SEMI and RIGHT ANTI joins, the output is the RHS
 		// we only need to output the RHS columns
@@ -443,6 +448,10 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 		}
 	}
 
+	auto end = std::chrono::high_resolution_clock::now();
+	auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+	printf("Execute hash join time: %.2f ms\n", duration.count()/1000.0);
+
     return OperatorResultType::FINISHED;
 };
 
@@ -451,9 +460,8 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 // GPUPhysicalHashJoin::Sink(ExecutionContext &context, GPUIntermediateRelation &input_relation, OperatorSinkInput &input) const {
 SinkResultType 
 GPUPhysicalHashJoin::Sink(GPUIntermediateRelation &input_relation) const {
-    //Read the key and payload from input relation
-    //Check if late materialization is needed
-    //Build the hash table
+	
+	auto start = std::chrono::high_resolution_clock::now();
 
 	GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 	GPUColumn** build_keys = new GPUColumn*[conditions.size()];
@@ -501,6 +509,10 @@ GPUPhysicalHashJoin::Sink(GPUIntermediateRelation &input_relation) const {
         // hash_table_result->columns[rhs_col] = input_relation.columns[i];
 		hash_table_result->columns[right_idx + i] = input_relation.columns[payload_idx];
     }
+
+	auto end = std::chrono::high_resolution_clock::now();
+	auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+	printf("Hash Join Sink time: %.2f ms\n", duration.count()/1000.0);
 
     return SinkResultType::FINISHED;
 };

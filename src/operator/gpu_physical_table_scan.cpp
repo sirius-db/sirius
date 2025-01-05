@@ -195,6 +195,7 @@ HandleMaterializeExpression(GPUColumn* column, GPUBufferManager* gpuBufferManage
 
 SourceResultType
 GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
+  auto start = std::chrono::high_resolution_clock::now();
   if (output_relation.columns.size() != GetTypes().size()) throw InvalidInputException("Mismatched column count");
 
   auto table_name = function.to_string(bind_data.get()); //we get it from ParamsToString();
@@ -348,8 +349,12 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
           index++;
       }
     }
-    
-    return SourceResultType::FINISHED;
+  
+	//measure time
+	auto end = std::chrono::high_resolution_clock::now();
+	auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+	printf("Table Scan time: %.2f ms\n", duration.count()/1000.0);
+  return SourceResultType::FINISHED;
 }
 
 } // namespace duckdb
