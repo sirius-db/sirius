@@ -74,7 +74,7 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
 #define STOP_TIMER() { \
     cudaEventRecord(stop, 0); \
     cudaEventSynchronize(stop); \
-    float elapsedTime; \
+    float elapsedTime = 0; \
     cudaEventElapsedTime(&elapsedTime, start, stop); \
     printf("Elapsed time: %f\n", elapsedTime); \
 }

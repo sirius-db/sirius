@@ -463,6 +463,8 @@ SinkResultType
 GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const {
   	printf("Perform groupby and aggregation\n");
 
+	auto start = std::chrono::high_resolution_clock::now();
+
 	if (distinct_collection_info) {
 		SinkDistinct(input_relation);
 		return SinkResultType::FINISHED;
@@ -586,6 +588,10 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 		}
 	}
 
+	auto end = std::chrono::high_resolution_clock::now();
+	auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+	printf("Group Aggregate Sink time: %.2f ms\n", duration.count()/1000.0);
+	
   	return SinkResultType::FINISHED;
 }
 

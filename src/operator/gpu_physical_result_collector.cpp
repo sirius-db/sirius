@@ -238,14 +238,14 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 			callCudaMemcpyDeviceToHost<uint8_t>(host_data[col], materialized_relation.columns[col]->data_wrapper.data, size_bytes, 0);
 		} else {
 			DataWrapper materialized_col_data = materialized_relation.columns[col]->data_wrapper;
-			std::cout << "Got materalized col data with " << materialized_col_data.size << " and " << materialized_col_data.num_bytes << " chars" << std::endl;
+			// std::cout << "Got materalized col data with " << materialized_col_data.size << " and " << materialized_col_data.num_bytes << " chars" << std::endl;
 			// printGPUColumn<uint64_t>(materialized_col_data.offset, 100, 0);
 			
 			// Copy over the pointers from the gpu to the cpu
 			size_t offset_bytes = (materialized_col_data.size + 1) * sizeof(uint64_t);
 			uint64_t* cpu_offsets = reinterpret_cast<uint64_t*>(allocator.AllocateData(offset_bytes));
 			callCudaMemcpyDeviceToHost<uint64_t>(cpu_offsets, materialized_col_data.offset, materialized_col_data.size + 1, 0);
-			std::cout << "Got cpu offset of " << cpu_offsets[0] << "," << cpu_offsets[1] << std::endl;
+			// std::cout << "Got cpu offset of " << cpu_offsets[0] << "," << cpu_offsets[1] << std::endl;
 			materialized_col_data.offset = cpu_offsets;
 			
 			// Do the same for the chars
@@ -256,8 +256,8 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 
 			// Copy over the data wrapper
 			materialized_relation.columns[col]->data_wrapper = materialized_col_data;
-			std::cout << "Copied over strings to the CPU with offset " << materialized_relation.columns[col]->data_wrapper.offset[0];
-			std::cout << " and chars " << materialized_relation.columns[col]->data_wrapper.data[0] << std::endl;
+			// std::cout << "Copied over strings to the CPU with offset " << materialized_relation.columns[col]->data_wrapper.offset[0];
+			// std::cout << " and chars " << materialized_relation.columns[col]->data_wrapper.data[0] << std::endl;
 
 			// Create a vector of all the strings
 			DataWrapper strings_data_wrapper = materialized_relation.columns[col]->data_wrapper;
@@ -303,7 +303,7 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 	//measure time
 	auto end = std::chrono::high_resolution_clock::now();
 	auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-	printf("Result collector time: %ld ms\n", duration.count()/1000);
+	printf("Result collector time: %.2f ms\n", duration.count()/1000.0);
 	return SinkResultType::FINISHED;
 }
 

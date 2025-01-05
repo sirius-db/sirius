@@ -200,6 +200,8 @@ GPUExpressionExecutor::HandleComparisonExpression(GPUColumn* column1, GPUColumn*
 
 void 
 GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_relation, GPUIntermediateRelation& output_relation, Expression& expr, int depth) {
+    auto start = std::chrono::high_resolution_clock::now();
+    
     bool is_specific_filter = HandlingSpecificFilter(input_relation, output_relation, expr);
     if (is_specific_filter) return;
     
@@ -421,11 +423,17 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
         //     if (count) output_relation.columns[i]->row_id_count = count[0];
         // }
     }
+
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    printf("Filter Expression time: %.2f ms\n", duration.count()/1000.0);
 }
 
 
 void 
 GPUExpressionExecutor::ProjectionRecursiveExpression(GPUIntermediateRelation& input_relation, GPUIntermediateRelation& output_relation, Expression& expr, int output_idx, int depth) {
+    auto start = std::chrono::high_resolution_clock::now();
+    
     bool is_specific_projection = HandlingSpecificProjection(input_relation, output_relation, expr, output_idx);
     if (is_specific_projection) return;
 
@@ -534,6 +542,10 @@ GPUExpressionExecutor::ProjectionRecursiveExpression(GPUIntermediateRelation& in
             }
         }
     }
+
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    printf("Projection Expression time: %.2f ms\n", duration.count()/1000.0);
 }
 
 
