@@ -264,6 +264,9 @@ vector<LogicalType> GPUPhysicalNestedLoopJoin::GetJoinTypes() const {
 //                                             OperatorSinkInput &input) const {
 SinkResultType 
 GPUPhysicalNestedLoopJoin::Sink(GPUIntermediateRelation &input_relation) const {
+
+	auto start = std::chrono::high_resolution_clock::now();
+
 	// auto &gstate = input.global_state.Cast<NestedLoopJoinGlobalState>();
 	// auto &nlj_state = input.local_state.Cast<NestedLoopJoinLocalState>();
 
@@ -303,6 +306,11 @@ GPUPhysicalNestedLoopJoin::Sink(GPUIntermediateRelation &input_relation) const {
 		right_temp_data->columns[i]->row_id_count = input_relation.columns[i]->row_id_count;
     }
 
+	//measure time
+	auto end = std::chrono::high_resolution_clock::now();
+	auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+	printf("Result collector time: %.2f ms\n", duration.count()/1000.0);
+	
 	return SinkResultType::FINISHED;
 
 }

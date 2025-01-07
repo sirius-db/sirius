@@ -569,11 +569,7 @@ void groupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count,
         keys[i] = reinterpret_cast<uint8_t*> (keys_result[i]);
     }
 
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-    float milliseconds = 0;
-    cudaEventElapsedTime(&milliseconds, start, stop);
-    printf("Grouped aggregate time: %f\n", milliseconds);
+    STOP_TIMER();
 }
 
 

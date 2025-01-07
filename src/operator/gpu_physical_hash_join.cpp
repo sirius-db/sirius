@@ -450,7 +450,7 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 
 	auto end = std::chrono::high_resolution_clock::now();
 	auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-	printf("Execute hash join time: %.2f ms\n", duration.count()/1000.0);
+	printf("Hash Join Execute time: %.2f ms\n", duration.count()/1000.0);
 
     return OperatorResultType::FINISHED;
 };

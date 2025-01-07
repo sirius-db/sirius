@@ -220,8 +220,8 @@ void SiriusExtension::GPUProcessingFunction(ClientContext &context, TableFunctio
 		// int* ptr = sendDataToGPU(temp, size);  // Send data to GPU
 		// std::cout << "CUDA kernel call finished." << std::endl;
 		auto start = std::chrono::high_resolution_clock::now();
-		data.res = data.gpu_context->GPUExecuteQuery(context, data.query, data.gpu_prepared, {});
-		// data.res = data.conn->Query(data.query);
+		// data.res = data.gpu_context->GPUExecuteQuery(context, data.query, data.gpu_prepared, {});
+		data.res = data.conn->Query(data.query);
 		auto end = std::chrono::high_resolution_clock::now();
 		auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
 		printf("GPU Execute query time: %.2f ms\n", duration.count()/1000.0);

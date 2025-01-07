@@ -91,6 +91,8 @@ void materializeExpression(T *a, T* result, uint64_t *row_ids, uint64_t N) {
         printf("N is 0\n");
         return;
     }
+    SETUP_TIMING();
+    START_TIMER();
     printf("Launching Materialize Kernel\n");
     // SETUP_TIMING();
     // START_TIMER();
@@ -108,7 +110,7 @@ void materializeExpression(T *a, T* result, uint64_t *row_ids, uint64_t N) {
     // cudaMemcpy(result, raw_sorted, N * sizeof(T), cudaMemcpyDeviceToDevice);
     // testprintmat<T><<<1, 1>>>(result, 100);
     cudaDeviceSynchronize();
-    // STOP_TIMER();
+    STOP_TIMER();
 }
 
 void materializeString(uint8_t* data, uint64_t* offset, uint8_t* &result, uint64_t* &result_offset, uint64_t* row_ids, uint64_t* &new_num_bytes, uint64_t N) {
@@ -117,6 +119,8 @@ void materializeString(uint8_t* data, uint64_t* offset, uint8_t* &result, uint64
         printf("N is 0\n");
         return;
     }
+    SETUP_TIMING();
+    START_TIMER();
     printf("Launching Materialize String Kernel\n");
     // SETUP_TIMING();
     // START_TIMER();
@@ -159,7 +163,7 @@ void materializeString(uint8_t* data, uint64_t* offset, uint8_t* &result, uint64
     materialize_string<<<num_blocks, BLOCK_THREADS>>>(data, result, offset, result_offset, row_ids, N);
     cudaDeviceSynchronize();
     CHECK_ERROR();
-    // STOP_TIMER();
+    STOP_TIMER();
 }
 
 template
