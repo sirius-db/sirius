@@ -76,7 +76,7 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
     cudaEventSynchronize(stop); \
     float elapsedTime = 0; \
     cudaEventElapsedTime(&elapsedTime, start, stop); \
-    printf("Elapsed time: %f\n", elapsedTime); \
+    printf("Elapsed time op: %f\n", elapsedTime); \
 }
 
 #define BLOCK_THREADS 128

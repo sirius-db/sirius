@@ -840,7 +840,7 @@ void groupedStringAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t**
     cudaDeviceSynchronize();
     printf("Count: %lu\n", count[0]);
 
-    STOP_TIMER()
+    STOP_TIMER();
 }
 
 __global__ void add_offset(uint64_t* a, uint64_t* b, uint64_t offset, uint64_t N) {

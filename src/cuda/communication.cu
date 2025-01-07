@@ -59,6 +59,8 @@ void callCudaMemcpyDeviceToHost(T* dest, T* src, size_t size, int gpu) {
         printf("N is 0\n");
         return;
     }
+    SETUP_TIMING();
+    START_TIMER();
     printf("Send data to CPU\n");
     cudaSetDevice(gpu);
     printf("size: %ld\n", size);
@@ -73,6 +75,7 @@ void callCudaMemcpyDeviceToHost(T* dest, T* src, size_t size, int gpu) {
     gpuErrchk(cudaDeviceSynchronize());
     cudaSetDevice(0);
     printf("Done sending data to CPU\n");
+    STOP_TIMER();
 }
 
 // Define the host function that launches the CUDA kernel

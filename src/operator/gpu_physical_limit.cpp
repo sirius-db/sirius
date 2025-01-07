@@ -20,6 +20,13 @@ GPUPhysicalStreamingLimit::Execute(GPUIntermediateRelation &input_relation, GPUI
                           input_relation.columns[col_idx]->data_wrapper.offset, input_relation.columns[col_idx]->data_wrapper.num_bytes, input_relation.columns[col_idx]->data_wrapper.is_string_data);
     // output_relation.columns[col_idx] = new GPUColumn(limit_const, input_relation.columns[col_idx]->data_wrapper.type, input_relation.columns[col_idx]->data_wrapper.data);
     output_relation.columns[col_idx]->is_unique = input_relation.columns[col_idx]->is_unique;
+    if (output_relation.columns[col_idx]->data_wrapper.type == ColumnType::VARCHAR) {
+      Allocator& allocator = Allocator::DefaultAllocator();
+			uint64_t* new_num_bytes = reinterpret_cast<uint64_t*>(allocator.AllocateData(sizeof(uint64_t)));
+			callCudaMemcpyDeviceToHost<uint64_t>(new_num_bytes, input_relation.columns[col_idx]->data_wrapper.offset + limit_const, 1, 0);
+      output_relation.columns[col_idx]->data_wrapper.num_bytes = new_num_bytes[0];
+    }
+    printf("Column %d has %ld rows\n", col_idx, output_relation.columns[col_idx]->column_length);
 	}
 
   return OperatorResultType::FINISHED;
