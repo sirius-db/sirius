@@ -8,6 +8,7 @@
 #include <cuda/atomic>
 #include <thrust/sort.h>
 #include <thrust/reduce.h>
+#include <float.h>
 #include <thrust/device_vector.h>
 #include "gpu_buffer_manager.hpp"
 

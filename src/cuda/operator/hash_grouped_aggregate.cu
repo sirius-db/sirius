@@ -123,8 +123,10 @@ __global__ void hash_groupby_smem(T **group_key, V** aggregate, T* max, T* min, 
             local_ht[threadIdx.x * n_ht_column + n] = 0xFFFFFFFFFFFFFFFF;
         }
         for (int n = 0; n < num_aggregates; n++) {
-            if (agg_mode[n] == 2 || agg_mode[n] == 3) {
-                local_ht[threadIdx.x * n_ht_column + num_keys + n] = reinterpret_cast<unsigned long long*>(aggregate[n])[0];
+            if (agg_mode[n] == 2) {
+                local_ht[threadIdx.x * n_ht_column + num_keys + n] = DBL_MIN;
+            } else if (agg_mode[n] == 3) {
+                local_ht[threadIdx.x * n_ht_column + num_keys + n] = DBL_MAX;
             } else if (agg_mode[n] == 1) {
                 local_ht[threadIdx.x * n_ht_column + num_keys + n] = 0;
                 local_ht[threadIdx.x * n_ht_column + num_keys + num_aggregates] = 0;
@@ -328,8 +330,10 @@ __global__ void set_group_ht(unsigned long long* ht, V** aggregate, uint64_t num
             ht[tid * n_ht_column + n] = 0xFFFFFFFFFFFFFFFF;
         }
         for (int n = 0; n < num_aggregates; n++) {
-            if (agg_mode[n] == 2 || agg_mode[n] == 3) {
-                ht[tid * n_ht_column + num_keys + n] = reinterpret_cast<unsigned long long*>(aggregate[n])[0];
+            if (agg_mode[n] == 2) {
+                ht[tid * n_ht_column + num_keys + n] = DBL_MIN;
+            } else if (agg_mode[n] == 3) {
+                ht[tid * n_ht_column + num_keys + n] = DBL_MAX;
             } else if (agg_mode[n] == 1) {
                 ht[tid * n_ht_column+ num_keys + n] = 0;
                 ht[tid * n_ht_column + num_keys + num_aggregates] = 0;
@@ -388,11 +392,22 @@ __global__ void get_min_max(T *keys, T* res_max, T* res_min, uint64_t N) {
 __global__ void print_hash_table_group(unsigned long long* a, uint64_t N, uint64_t num_keys, uint64_t num_aggregates, bool need_count) {
     if (blockIdx.x == 0 && threadIdx.x == 0) {
         for (uint64_t i = 0; i < N; i++) {
-            for (uint64_t j = 0; j < num_keys + num_aggregates + need_count; j++) {
-                printf("%llu ", a[i * (num_keys + num_aggregates + need_count) + j]);
-            }
+            // for (uint64_t j = 0; j < num_keys + num_aggregates + need_count; j++) {
+            //     printf("%llu ", a[i * (num_keys + num_aggregates + need_count) + j]);
+            // }
+            printf("%llu %.2f", a[i * 2], reinterpret_cast<double*>(a + (i * 2 + 1))[0]);
             printf("\n");
         }
+    }
+}
+
+template <typename V>
+__global__ void print_column_agg(V* a, uint64_t N) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        for (uint64_t i = 0; i < N; i++) {
+            printf("%.2f ", a[i]);
+        }
+        printf("\n");
     }
 }
 
@@ -451,7 +466,15 @@ void hashGroupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* co
     }
 
     printf("N: %lu\n", N);
-    // printf("max %ld min %ld\n", max_key_host[0], min_key_host[0]);
+    printf("max %ld min %ld\n", max_key_host[0], min_key_host[0]);
+
+    if constexpr (std::is_same<V, double>::value) {
+        // Do something if T is int
+        std::cout << "V is double" << std::endl;
+    } else {
+        // Do something else if T is not int
+        std::cout << "V is not double" << std::endl;
+    }
     
     unsigned long long* ht;
     uint64_t ht_len;
@@ -466,9 +489,11 @@ void hashGroupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* co
             smem_size = ht_len * (num_keys + num_aggregates) * sizeof(unsigned long long);
         }
         set_group_ht<<<(ht_len + BLOCK_THREADS - 1)/BLOCK_THREADS, BLOCK_THREADS>>>(ht, aggregate_keys_dev, num_keys, num_aggregates, ht_len, agg_mode_dev, need_count);
+        CHECK_ERROR();
         hash_groupby_smem<T, V, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS, smem_size>>>(keys_dev, aggregate_keys_dev, 
                 max_key, min_key, ht, ht_len, N, num_keys, num_aggregates, agg_mode_dev, need_count);
-        // print_hash_table_group<<<1, 1>>>(ht, ht_len, num_keys, num_aggregates, need_count);
+        CHECK_ERROR();
+
     } else{
         ht_len = N * 2;
         if (need_count) {
@@ -477,8 +502,13 @@ void hashGroupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* co
             ht = (unsigned long long*) gpuBufferManager->customCudaMalloc<uint64_t>(ht_len * (num_keys + num_aggregates), 0, 0);
         }
         set_group_ht<<<(ht_len + BLOCK_THREADS - 1)/BLOCK_THREADS, BLOCK_THREADS>>>(ht, aggregate_keys_dev, num_keys, num_aggregates, ht_len, agg_mode_dev, need_count);
+        // print_hash_table_group<<<1, 1>>>(ht, ht_len, num_keys, num_aggregates, need_count);
+        CHECK_ERROR();
         hash_groupby_gmem<T, V, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(keys_dev, aggregate_keys_dev, 
             ht, ht_len, N, num_keys, num_aggregates, agg_mode_dev, need_count);
+        // CHECK_ERROR();
+        // print_hash_table_group<<<1, 1>>>(ht, ht_len/2, num_keys, num_aggregates, need_count);
+        CHECK_ERROR();
     }
     
     CHECK_ERROR();
@@ -521,6 +551,8 @@ void hashGroupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* co
             (unsigned long long*) d_count, ht_len, num_keys, num_aggregates, agg_mode_dev, false, need_count);
 
     CHECK_ERROR();
+
+    // CHECK_ERROR();
 
     printf("Count: %lu\n", h_count[0]);
 
