@@ -65,7 +65,7 @@ ResolveTypeGroupByAggregateExpression(GPUColumn** &group_by_keys, GPUColumn** &a
 	uint8_t** aggregate_data = new uint8_t*[aggregates.size()];
 
 	for (int group = 0; group < num_group_keys; group++) {
-		if (group_by_keys[group]->data_wrapper.data == nullptr) {
+		if (group_by_keys[group]->data_wrapper.data == nullptr && group_by_keys[group]->column_length != 0) {
 			throw NotImplementedException("Group by column is null");
 		}
 		group_by_data[group] = (group_by_keys[group]->data_wrapper.data);
@@ -138,7 +138,7 @@ ResolveTypeGroupByString(GPUColumn** &group_by_keys, GPUColumn** &aggregate_keys
 
 	for (int group = 0; group < num_group_keys; group++) {
 		group_by_data[group] = (group_by_keys[group]->data_wrapper.data);
-		if (group_by_keys[group]->data_wrapper.data == nullptr) {
+		if (group_by_keys[group]->data_wrapper.data == nullptr && group_by_keys[group]->column_length != 0) {
 			throw NotImplementedException("Group by column is null");
 		}
 		if (group_by_keys[group]->data_wrapper.type == ColumnType::VARCHAR) {
