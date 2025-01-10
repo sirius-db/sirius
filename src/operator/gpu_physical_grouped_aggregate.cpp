@@ -65,6 +65,9 @@ ResolveTypeGroupByAggregateExpression(GPUColumn** &group_by_keys, GPUColumn** &a
 	uint8_t** aggregate_data = new uint8_t*[aggregates.size()];
 
 	for (int group = 0; group < num_group_keys; group++) {
+		if (group_by_keys[group]->data_wrapper.data == nullptr) {
+			throw NotImplementedException("Group by column is null");
+		}
 		group_by_data[group] = (group_by_keys[group]->data_wrapper.data);
 	}
 	size_t size = group_by_keys[0]->column_length;
@@ -103,7 +106,8 @@ ResolveTypeGroupByAggregateExpression(GPUColumn** &group_by_keys, GPUColumn** &a
 		}
 	}
 
-	groupedAggregate<T, V>(group_by_data, aggregate_data, count, size, num_group_keys, aggregates.size(), agg_mode);
+	// groupedAggregate<T, V>(group_by_data, aggregate_data, count, size, num_group_keys, aggregates.size(), agg_mode);
+	hashGroupedAggregate<T, V>(group_by_data, aggregate_data, count, size, num_group_keys, aggregates.size(), agg_mode);
 
 	// Reading groupby columns based on the grouping set
 	for (idx_t group = 0; group < num_group_keys; group++) {
@@ -134,6 +138,9 @@ ResolveTypeGroupByString(GPUColumn** &group_by_keys, GPUColumn** &aggregate_keys
 
 	for (int group = 0; group < num_group_keys; group++) {
 		group_by_data[group] = (group_by_keys[group]->data_wrapper.data);
+		if (group_by_keys[group]->data_wrapper.data == nullptr) {
+			throw NotImplementedException("Group by column is null");
+		}
 		if (group_by_keys[group]->data_wrapper.type == ColumnType::VARCHAR) {
 			offset_data[group] = (group_by_keys[group]->data_wrapper.offset);
 		} else {
@@ -223,12 +230,9 @@ HandleGroupByAggregateExpression(GPUColumn** &group_by_keys, GPUColumn** &aggreg
 	}
 
 	if (string_groupby) {
-		//THIS IS NOT WORKING YES
 		if (aggregate_type == ColumnType::INT64) {
-			printf("Group by string and aggregate int\n");
 			ResolveTypeGroupByString<uint64_t>(group_by_keys, aggregate_keys, gpuBufferManager, aggregates, num_group_keys);
 		} else if (aggregate_type == ColumnType::FLOAT64) {
-			printf("Group by string and aggregate double\n");
 			ResolveTypeGroupByString<double>(group_by_keys, aggregate_keys, gpuBufferManager, aggregates, num_group_keys);
 		} else {
 			throw NotImplementedException("Unsupported column type");
@@ -614,7 +618,6 @@ GPUPhysicalGroupedAggregate::GetData(GPUIntermediateRelation &output_relation) c
 		}
 		output_relation.columns[col]->is_unique = old_unique;
 	}
-
   	return SourceResultType::FINISHED;
 }
 

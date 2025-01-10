@@ -149,3 +149,76 @@ __global__ void compact_valid_rows(bool* selection_flags, uint64_t* row_ids, uns
         }
     }
 }
+
+template<typename T, int B, int I>
+__device__ __forceinline__ T BlockReduce(
+    T  item,
+    T* shared,
+    int op_mode
+    ) {
+    __syncthreads();
+
+    T val = item;
+    const int warp_size = 32;
+    int lane = threadIdx.x % warp_size;
+    int wid = threadIdx.x / warp_size;
+
+    // Calculate sum across warp
+    for (int offset = 16; offset > 0; offset /= 2) {
+        if (op_mode == 0 || op_mode == 1) { //sum or avg
+            val += __shfl_down_sync(0xffffffff, val, offset);
+        } else if (op_mode == 2) { //max
+            val = max(val, __shfl_down_sync(0xffffffff, val, offset));
+        } else if (op_mode == 3) { //min
+            val = min(val, __shfl_down_sync(0xffffffff, val, offset));
+        }
+    }
+
+    // Store sum in buffer
+    if (lane == 0) {
+        shared[wid] = val;
+    }
+
+    __syncthreads();
+
+    // Load the sums into the first warp
+    if (op_mode == 0 || op_mode == 1) { //sum or avg
+        val = (threadIdx.x < blockDim.x / warp_size) ? shared[lane] : 0;
+    } else if (op_mode == 2) { //max
+        val = (threadIdx.x < blockDim.x / warp_size) ? shared[lane] : shared[0];
+    } else if (op_mode == 3) { //min
+        val = (threadIdx.x < blockDim.x / warp_size) ? shared[lane] : shared[0];
+    }
+
+    // Calculate sum of sums
+    if (wid == 0) {
+        for (int offset = 16; offset > 0; offset /= 2) {
+            if (op_mode == 0 || op_mode == 1) { //sum or avg
+                val += __shfl_down_sync(0xffffffff, val, offset);
+            } else if (op_mode == 2) { //max
+                val = max(val, __shfl_down_sync(0xffffffff, val, offset));
+            } else if (op_mode == 3) { //min
+                val = min(val, __shfl_down_sync(0xffffffff, val, offset));
+            }
+        }
+    }
+
+  return val;
+}
+
+// Simple hash function for integers
+inline __device__ __host__ uint64_t custom_hash_int(uint64_t key) {
+    key ^= (key >> 21);
+    key ^= (key << 37);
+    key ^= (key >> 4);
+    key *= 2685821657736338717ULL;
+    return key;
+}
+
+// Combine hashes for an array of keys
+inline __device__ uint64_t hash_combine(uint64_t old_key, uint64_t new_key) {
+    if (old_key == 0xFFFFFFFFFFFFFFFF) {
+        return custom_hash_int(new_key);
+    }
+    return old_key ^ (custom_hash_int(new_key) + 0x9e3779b9 + (old_key << 6) + (old_key >> 2));
+}
