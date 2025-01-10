@@ -698,6 +698,7 @@ void combineColumns(T* a, T* b, T* c, uint64_t N_a, uint64_t N_b) {
         printf("N is 0\n");
         return;
     }
+    printf("Launching Combine Columns Kernel\n");
     cudaMemcpy(c, a, N_a * sizeof(T), cudaMemcpyDeviceToDevice);
     cudaMemcpy(c + N_a, b, N_b * sizeof(T), cudaMemcpyDeviceToDevice);
     CHECK_ERROR();

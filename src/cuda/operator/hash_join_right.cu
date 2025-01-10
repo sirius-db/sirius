@@ -87,7 +87,7 @@ __global__ void scan_right(unsigned long long* ht, unsigned long long* count, ui
     #pragma unroll
     for (int ITEM = 0; ITEM < I; ITEM++) {
         if (threadIdx.x + (ITEM * B) < num_tile_items) {
-            int slot = tile_offset + threadIdx.x + ITEM * B;  
+            uint64_t slot = tile_offset + threadIdx.x + ITEM * B;  
             if (join_mode == 0) { // semi join
                 if (ht[slot * (num_keys + 2) + num_keys + 1] != 0xFFFFFFFFFFFFFFFF) {
                     items_off[ITEM] = ht[slot * (num_keys + 2) + num_keys];

@@ -5,181 +5,343 @@
 namespace duckdb {
 
 template <typename T, typename V, int B, int I>
-__global__ void hash_groupby_smem(T **group, V** aggregate, T** min, uint64_t N, uint64_t num_keys, uint64_t num_aggregates) {
+__global__ void hash_groupby_gmem(T **group_key, V** aggregate, unsigned long long* ht, uint64_t ht_len, uint64_t N, uint64_t num_keys, uint64_t num_aggregates, int* agg_mode, bool need_count) {
 
     uint64_t tile_size = B * I;
     uint64_t tile_offset = blockIdx.x * tile_size;
 
     uint64_t num_tiles = (N + tile_size - 1) / tile_size;
     uint64_t num_tile_items = tile_size;
-
-    T item_group[num_keys][I];
-    V aggregate[num_aggregates][I];
-
-    if (blockIdx.x == num_tiles - 1) {
-        num_tile_items = N - tile_offset;
-    }
-
-    #pragma unroll
-    for (int ITEM = 0; ITEM < I; ++ITEM) {
-        if (threadIdx.x + ITEM * B < num_tile_items) {
-            uint64_t offset = tile_offset + threadIdx.x + ITEM * B;
-            for (int i = 0; i < num_keys; i++) {
-                item_group = group[i][offset] - min[i][offset];
-            }
-        }
-    }
-}
-
-template <int B, int I>
-__global__ void build_multikey(uint64_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t N, int num_keys, int equal_keys, bool is_right) {
-
-    uint64_t tile_size = B * I;
-    uint64_t tile_offset = blockIdx.x * tile_size;
-
-    uint64_t num_tiles = (N + tile_size - 1) / tile_size;
-    uint64_t num_tile_items = tile_size;
+    uint64_t final_slot[I];
 
     if (blockIdx.x == num_tiles - 1) {
         num_tile_items = N - tile_offset;
     }
 
     int n_ht_column;
-    if (is_right) n_ht_column = num_keys + 2;
-    else  n_ht_column = num_keys + 1;
+    if (need_count) n_ht_column = num_keys + num_aggregates + 1;
+    else n_ht_column = num_keys + num_aggregates;
 
     #pragma unroll
-    for (int ITEM = 0; ITEM < I; ITEM++) {
-        if (threadIdx.x + (ITEM * B) < num_tile_items) {
-            uint64_t slot;
-            if (equal_keys == 1) slot = keys[0][tile_offset + threadIdx.x + ITEM * B] % ht_len;
-            else if (equal_keys == 2) slot = hash64_multikey(keys[0][tile_offset + threadIdx.x + ITEM * B], keys[1][tile_offset + threadIdx.x + ITEM * B]) % ht_len;
-            else cudaAssert(0);
-            
-            uint64_t item = keys[0][tile_offset + threadIdx.x + ITEM * B];
-            while(atomicCAS(&ht[slot * n_ht_column], 0xFFFFFFFFFFFFFFFF, (unsigned long long) item) != 0xFFFFFFFFFFFFFFFF) {                
-                slot = (slot + 100007) % ht_len;
+    for (int ITEM = 0; ITEM < I; ++ITEM) {
+        if (threadIdx.x + ITEM * B < num_tile_items) {
+            uint64_t offset = tile_offset + threadIdx.x + ITEM * B;
+            uint64_t hash_key = 0xFFFFFFFFFFFFFFFF;
+            for (int n = 0; n < num_keys; n++) {
+                hash_key = hash_combine(hash_key, group_key[n][offset]);
             }
 
-            for (int n = 1; n < num_keys; n++) {
-                ht[slot * n_ht_column + n] = keys[n][tile_offset + threadIdx.x + ITEM * B];
+            uint64_t slot = hash_key % ht_len;
+
+            int n = 0;
+            bool can_break = false;
+            bool atomic = true; // initially all thread do the atomic
+            while(!can_break) {
+                uint64_t item = group_key[n][offset];
+                unsigned long long old;
+                if (atomic) {
+                    old = atomicCAS(&ht[slot * n_ht_column + n], 0xFFFFFFFFFFFFFFFF, (unsigned long long) item); //compete for atomic
+                    if (old != 0xFFFFFFFFFFFFFFFF) atomic = false; // lose the atomic, no longer do the atomic for the next keys
+                    else atomic = true;
+                } else {
+                    old = ht[slot * n_ht_column + n];
+                }
+
+                if ((atomic && old == 0xFFFFFFFFFFFFFFFF)) { // atomic succeeds, try atomic on the next keys
+                    if (n == num_keys - 1) {
+                        can_break = true;
+                        final_slot[ITEM] = slot;
+                    } else n++;
+                } else if (!atomic && old == 0xFFFFFFFFFFFFFFFF) { // not the thread with the atomic and need to wait until the atomic is done
+                    continue;
+                } else if (old == item) { // already exist
+                    cudaAssert(atomic == false);
+                    if (n == num_keys - 1) {
+                        can_break = true;
+                        final_slot[ITEM] = slot;
+                    } else n++;
+                } else {
+                    n = 0;
+                    atomic = true;
+                    slot = (slot + 100007) % ht_len;
+                }
             }
-            ht[slot * n_ht_column + num_keys] = tile_offset + threadIdx.x + (ITEM * B);
+        }
+    }
+
+    #pragma unroll
+    for (int ITEM = 0; ITEM < I; ++ITEM) {
+        if (threadIdx.x + ITEM * B < num_tile_items) {
+            uint64_t offset = tile_offset + threadIdx.x + ITEM * B;
+            for (int n = 0 ; n < num_aggregates; n++) {
+                V* ptr = reinterpret_cast<V*>(ht + (final_slot[ITEM] * n_ht_column + num_keys + n));
+                cuda::atomic_ref<V, cuda::thread_scope_device> res_atomic(*ptr);
+                if (agg_mode[n] == 0) {
+                    res_atomic.fetch_add(aggregate[n][offset]);
+                } else if (agg_mode[n] == 1) { //avg (sum and count)
+                    res_atomic.fetch_add(aggregate[n][offset]);
+                } else if (agg_mode[n] == 2) {
+                    res_atomic.fetch_max(aggregate[n][offset]);
+                } else if (agg_mode[n] == 3) {
+                    res_atomic.fetch_min(aggregate[n][offset]);
+                } else if (agg_mode[n] == 4) {
+                    atomicAdd(&ht[final_slot[ITEM] * n_ht_column + num_keys + n], 1LLU); // count
+                } else if (agg_mode[n] == 5) {
+                    // should be zero, so do nothing
+                } else cudaAssert(false);
+            }
+            if (need_count) { // need count to count average
+                atomicAdd(&ht[final_slot[ITEM] * n_ht_column + num_keys + num_aggregates], 1LLU); // count
+            }
         }
     }
 }
 
 template <typename T, typename V, int B, int I>
-__global__ void hash_groupby_gmem(T **group, V** aggregate, T** max, T** min, uint64_t N, uint64_t num_keys, uint64_t num_aggregates) {
+__global__ void hash_groupby_smem(T **group_key, V** aggregate, T* max, T* min, unsigned long long* ht, 
+        uint64_t ht_len, uint64_t N, uint64_t num_keys, uint64_t num_aggregates, int* agg_mode, bool need_count) {
 
     uint64_t tile_size = B * I;
     uint64_t tile_offset = blockIdx.x * tile_size;
 
     uint64_t num_tiles = (N + tile_size - 1) / tile_size;
     uint64_t num_tile_items = tile_size;
+    uint64_t final_slot[I];
 
     if (blockIdx.x == num_tiles - 1) {
         num_tile_items = N - tile_offset;
     }
 
+    int n_ht_column;
+    if (need_count) n_ht_column = num_keys + num_aggregates + 1;
+    else n_ht_column = num_keys + num_aggregates;
+
+    extern __shared__ unsigned long long local_ht[];
+
+    if (threadIdx.x < ht_len) {
+        for (int n = 0; n < num_keys; n++) {
+            local_ht[threadIdx.x * n_ht_column + n] = 0xFFFFFFFFFFFFFFFF;
+        }
+        for (int n = 0; n < num_aggregates; n++) {
+            if (agg_mode[n] == 2 || agg_mode[n] == 3) {
+                local_ht[threadIdx.x * n_ht_column + num_keys + n] = reinterpret_cast<unsigned long long*>(aggregate[n])[0];
+            } else if (agg_mode[n] == 1) {
+                local_ht[threadIdx.x * n_ht_column + num_keys + n] = 0;
+                local_ht[threadIdx.x * n_ht_column + num_keys + num_aggregates] = 0;
+            } else {
+                local_ht[threadIdx.x * n_ht_column + num_keys + n] = 0;
+            }
+        }
+    }
+
+    __syncthreads();
+
     #pragma unroll
     for (int ITEM = 0; ITEM < I; ++ITEM) {
         if (threadIdx.x + ITEM * B < num_tile_items) {
-
-            uint64_t slot;
-            if (equal_keys == 1) slot = keys[0][tile_offset + threadIdx.x + ITEM * B] % ht_len;
-            else if (equal_keys == 2) slot = hash64_multikey(keys[0][tile_offset + threadIdx.x + ITEM * B], keys[1][tile_offset + threadIdx.x + ITEM * B]) % ht_len;
-            else cudaAssert(0);
+            uint64_t offset = tile_offset + threadIdx.x + ITEM * B;
+            uint64_t hash_key = 0;
+            uint64_t range = 1;
             
-            uint64_t item = keys[0][tile_offset + threadIdx.x + ITEM * B];
-            while(atomicCAS(&ht[slot * n_ht_column], 0xFFFFFFFFFFFFFFFF, (unsigned long long) item) != 0xFFFFFFFFFFFFFFFF) {                
-                slot = (slot + 100007) % ht_len;
+            for (int n = 0; n < num_keys; n++) {
+                hash_key += (group_key[n][offset] - min[n]) * range;
+                range *= (max[n] - min[n] + 1);
             }
 
-            for (int n = 1; n < num_keys; n++) {
-                ht[slot * n_ht_column + n] = keys[n][tile_offset + threadIdx.x + ITEM * B];
+            // final_slot[ITEM] = hash_key % ht_len;
+            // printf("hash_key: %llu %llu %llu\n", group_key[0][offset], hash_key, local_ht[final_slot[ITEM] * n_ht_column]);
+            cudaAssert(hash_key < ht_len);
+            final_slot[ITEM] = hash_key;
+
+            for (int n = 0; n < num_keys; n++) {
+                uint64_t item = group_key[n][offset];
+                atomicCAS(&local_ht[final_slot[ITEM] * n_ht_column + n], 0xFFFFFFFFFFFFFFFF, (unsigned long long) item);
             }
-            ht[slot * n_ht_column + num_keys] = tile_offset + threadIdx.x + (ITEM * B);
-            
         }
     }
-}
 
-template <typename T, int B, int I>
-__global__ void rows_to_columns(sort_keys_type *row_keys, T** col_keys, uint64_t N, uint64_t num_keys) {
-
-    uint64_t tile_size = B * I;
-    uint64_t tile_offset = blockIdx.x * tile_size;
-
-    uint64_t num_tiles = (N + tile_size - 1) / tile_size;
-    uint64_t num_tile_items = tile_size;
-
-    if (blockIdx.x == num_tiles - 1) {
-        num_tile_items = N - tile_offset;
-    }
+    __syncthreads();
 
     #pragma unroll
     for (int ITEM = 0; ITEM < I; ++ITEM) {
         if (threadIdx.x + ITEM * B < num_tile_items) {
             uint64_t offset = tile_offset + threadIdx.x + ITEM * B;
-            for (int i = 0; i < num_keys; i++) {
-                // printf("Offset: %lu, Key[%d]: %lu\n", offset, i, row_keys[offset].keys[i]);
-                col_keys[i][offset] = row_keys[offset].keys[i];
+            for (int n = 0 ; n < num_aggregates; n++) {
+                V* ptr = reinterpret_cast<V*>(local_ht + (final_slot[ITEM] * n_ht_column + num_keys + n));
+                cuda::atomic_ref<V, cuda::thread_scope_block> res_atomic(*ptr);
+                if (agg_mode[n] == 0) {
+                    res_atomic.fetch_add(aggregate[n][offset]);
+                } else if (agg_mode[n] == 1) {
+                    res_atomic.fetch_add(aggregate[n][offset]);
+                } else if (agg_mode[n] == 2) {
+                    res_atomic.fetch_max(aggregate[n][offset]);
+                } else if (agg_mode[n] == 3) {
+                    res_atomic.fetch_min(aggregate[n][offset]);
+                } else if (agg_mode[n] == 4) {
+                    atomicAdd(&local_ht[final_slot[ITEM] * n_ht_column + num_keys + n], 1LLU); // count
+                } else if (agg_mode[n] == 5) {
+                    // should be zero, so do nothing
+                } else cudaAssert(false);
+            }
+            if (need_count) { // need count to count average
+                atomicAdd(&local_ht[final_slot[ITEM] * n_ht_column + num_keys + num_aggregates], 1LLU); // count
+            }
+        }
+    }
+
+    __syncthreads();
+
+    if (threadIdx.x < ht_len) {
+        for (int n = 0; n < num_keys; n++) {
+            if (local_ht[threadIdx.x * n_ht_column + n] != 0xFFFFFFFFFFFFFFFF) {
+                ht[threadIdx.x * n_ht_column + n] = local_ht[threadIdx.x * n_ht_column + n];
+            }
+            // ht[threadIdx.x * n_ht_column + n] = local_ht[threadIdx.x * n_ht_column + n];
+            // printf("%llu %llu\n", ht[threadIdx.x * n_ht_column + n], local_ht[threadIdx.x * n_ht_column + n]);
+        }
+        for (int n = 0; n < num_aggregates; n++) {
+            V* ptr = reinterpret_cast<V*>(ht + (threadIdx.x * n_ht_column + num_keys + n));
+            V* ptr2 = reinterpret_cast<V*>(local_ht + (threadIdx.x * n_ht_column + num_keys + n));
+            cuda::atomic_ref<V, cuda::thread_scope_device> res_atomic(*ptr);
+            if (agg_mode[n] == 0) {
+                res_atomic.fetch_add(*ptr2);
+            } else if (agg_mode[n] == 1) {
+                res_atomic.fetch_add(*ptr2);
+            } else if (agg_mode[n] == 2) {
+                res_atomic.fetch_max(*ptr2);
+            } else if (agg_mode[n] == 3) {
+                res_atomic.fetch_min(*ptr2);
+            } else if (agg_mode[n] == 4) {
+                atomicAdd(&ht[threadIdx.x * n_ht_column + num_keys + n], local_ht[threadIdx.x * n_ht_column + num_keys + n]); // count
+            } else if (agg_mode[n] == 5) {
+                // should be zero, so do nothing
+            } else cudaAssert(false);
+        }
+        if (need_count) { // need count to count average
+            atomicAdd(&ht[threadIdx.x * n_ht_column + num_keys + num_aggregates], local_ht[threadIdx.x * n_ht_column + num_keys + num_aggregates]); // count
+        }
+    }
+}
+
+
+
+template <typename T, typename V, int B, int I>
+__global__ void scan_hash_group(unsigned long long* ht, uint8_t** group, uint8_t** aggregate, unsigned long long* count,
+        uint64_t ht_len, uint64_t num_keys, uint64_t num_aggregates, int* agg_mode, bool is_count, bool need_count) {
+
+    typedef cub::BlockScan<int, B> BlockScanInt;
+
+    __shared__ union TempStorage
+    {
+        typename BlockScanInt::TempStorage scan;
+    } temp_storage;
+
+    int selection_flags[I];
+    uint64_t tile_size = B * I;
+    uint64_t tile_offset = blockIdx.x * tile_size;
+
+    uint64_t num_tiles = (ht_len + tile_size - 1) / tile_size;
+    uint64_t num_tile_items = tile_size;
+
+    int t_count = 0; // Number of items selected per thread
+    int c_t_count = 0; //Prefix sum of t_count
+    __shared__ uint64_t block_off;
+
+    if (blockIdx.x == num_tiles - 1) {
+        num_tile_items = ht_len - tile_offset;
+    }
+
+    int n_ht_column;
+    if (need_count) n_ht_column = num_keys + num_aggregates + 1;
+    else n_ht_column = num_keys + num_aggregates;
+
+    #pragma unroll
+    for (int ITEM = 0; ITEM < I; ITEM++) {
+        selection_flags[ITEM] = 0;
+    }
+
+    #pragma unroll
+    for (int ITEM = 0; ITEM < I; ITEM++) {
+        if (threadIdx.x + (ITEM * B) < num_tile_items) {
+            uint64_t slot = tile_offset + threadIdx.x + ITEM * B; 
+            if (ht[slot * n_ht_column] != 0xFFFFFFFFFFFFFFFF) {
+                selection_flags[ITEM] = 1;
+                t_count++;
+            }
+        }
+    }
+
+    //Barrier
+    __syncthreads();
+
+    BlockScanInt(temp_storage.scan).ExclusiveSum(t_count, c_t_count); //doing a prefix sum of all the previous threads in the block and store it to c_t_count
+    if(threadIdx.x == blockDim.x - 1) { //if the last thread in the block, add the prefix sum of all the prev threads + sum of my threads to global variable total
+        block_off = atomicAdd(count, (unsigned long long) t_count+c_t_count); //the previous value of total is gonna be assigned to block_off
+    } //block_off does not need to be global (it's just need to be shared), because it will get the previous value from total which is global
+
+    __syncthreads();
+
+    if (is_count) return;
+
+    #pragma unroll
+    for (int ITEM = 0; ITEM < I; ITEM++) {
+        if (threadIdx.x + (ITEM * B) < num_tile_items) {
+            if(selection_flags[ITEM]) {
+                uint64_t offset = block_off + c_t_count++;
+                uint64_t slot = tile_offset + threadIdx.x + ITEM * B; 
+                for (int n = 0; n < num_keys; n++) {
+                    T* group_ptr = reinterpret_cast<T*>(group[n]);
+                    T* ptr = reinterpret_cast<T*>(ht + (slot * n_ht_column + n));
+                    group_ptr[offset] = ptr[0];
+                }
+                for (int n = 0; n < num_aggregates; n++) {
+                    V* aggregate_ptr = reinterpret_cast<V*>(aggregate[n]);
+                    V* ptr = reinterpret_cast<V*>(ht + (slot * n_ht_column + num_keys + n));
+                    if (agg_mode[n] == 0 || agg_mode[n] == 2 || agg_mode[n] == 3) {
+                        aggregate_ptr[offset] = ptr[0];
+                    } else if (agg_mode[n] == 1) {
+                        uint64_t* ptr_cnt = reinterpret_cast<uint64_t*>(ht + (slot * n_ht_column + num_keys + num_aggregates));
+                        aggregate_ptr[offset] = ptr[0] / ptr_cnt[0];
+                    } else if (agg_mode[n] == 4) {
+                        uint64_t* aggregate_cnt_ptr = reinterpret_cast<uint64_t*>(aggregate[n]);
+                        uint64_t* ptr_cnt = reinterpret_cast<uint64_t*>(ht + (slot * n_ht_column + num_keys + n));
+                        aggregate_cnt_ptr[offset] = ptr_cnt[0];
+                    } else if (agg_mode[n] == 5) {
+                        aggregate_ptr[offset] = 0;
+                    } else cudaAssert(false);
+                }
+            }
+        }
+    }
+}
+
+template <typename V>
+__global__ void set_group_ht(unsigned long long* ht, V** aggregate, uint64_t num_keys, uint64_t num_aggregates, uint64_t ht_len, int* agg_mode, bool need_count) {
+    uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid < ht_len) {
+
+        int n_ht_column;
+        if (need_count) n_ht_column = num_keys + num_aggregates + 1;
+        else n_ht_column = num_keys + num_aggregates;
+
+        for (int n = 0; n < num_keys; n++) {
+            ht[tid * n_ht_column + n] = 0xFFFFFFFFFFFFFFFF;
+        }
+        for (int n = 0; n < num_aggregates; n++) {
+            if (agg_mode[n] == 2 || agg_mode[n] == 3) {
+                ht[tid * n_ht_column + num_keys + n] = reinterpret_cast<unsigned long long*>(aggregate[n])[0];
+            } else if (agg_mode[n] == 1) {
+                ht[tid * n_ht_column+ num_keys + n] = 0;
+                ht[tid * n_ht_column + num_keys + num_aggregates] = 0;
+            } else {
+                ht[tid * n_ht_column + num_keys + n] = 0;
             }
         }
     }
 }
 
 template <typename T, int B, int I>
-__global__ void gather_and_modify(const T *a, T* result, sort_keys_type *sort_keys, uint64_t N, uint64_t num_keys) {
-
-    cudaAssert(num_keys > 1);
-    uint64_t tile_size = B * I;
-    uint64_t tile_offset = blockIdx.x * tile_size;
-
-    uint64_t num_tiles = (N + tile_size - 1) / tile_size;
-    uint64_t num_tile_items = tile_size;
-
-    if (blockIdx.x == num_tiles - 1) {
-        num_tile_items = N - tile_offset;
-    }
-
-    #pragma unroll
-    for (int ITEM = 0; ITEM < I; ++ITEM) {
-        if (threadIdx.x + ITEM * B < num_tile_items) {
-            uint64_t offset = tile_offset + threadIdx.x + ITEM * B;
-            uint64_t items_ids = sort_keys[offset].keys[num_keys - 1];
-            result[offset] = a[items_ids];
-            sort_keys[offset] = sort_keys_type(sort_keys[offset].keys, num_keys - 1);
-        }
-    }
-}
-
-template <int B, int I>
-__global__ void modify(sort_keys_type *sort_keys, uint64_t N, uint64_t num_keys) {
-
-    cudaAssert(num_keys > 1);
-    uint64_t tile_size = B * I;
-    uint64_t tile_offset = blockIdx.x * tile_size;
-
-    uint64_t num_tiles = (N + tile_size - 1) / tile_size;
-    uint64_t num_tile_items = tile_size;
-
-    if (blockIdx.x == num_tiles - 1) {
-        num_tile_items = N - tile_offset;
-    }
-
-    #pragma unroll
-    for (int ITEM = 0; ITEM < I; ++ITEM) {
-        if (threadIdx.x + ITEM * B < num_tile_items) {
-            uint64_t offset = tile_offset + threadIdx.x + ITEM * B;
-            sort_keys[offset] = sort_keys_type(sort_keys[offset].keys, num_keys - 1);
-        }
-    }
-}
-
-template <int B, int I>
-__global__ void sequence(uint64_t* result, uint64_t N) {
+__global__ void get_min_max(T *keys, T* res_max, T* res_min, uint64_t N) {
 
     uint64_t tile_size = B * I;
     uint64_t tile_offset = blockIdx.x * tile_size;
@@ -191,70 +353,51 @@ __global__ void sequence(uint64_t* result, uint64_t N) {
         num_tile_items = N - tile_offset;
     }
 
+    T local_max = keys[0];
+    T local_min = keys[0];
+
     #pragma unroll
-    for (int ITEM = 0; ITEM < I; ++ITEM) {
-        if (threadIdx.x + ITEM * B < num_tile_items) {
-            result[tile_offset + threadIdx.x + ITEM * B] = tile_offset + threadIdx.x + ITEM * B;
+    for (int ITEM = 0; ITEM < ITEMS_PER_THREAD; ++ITEM) {
+        if (threadIdx.x + ITEM * BLOCK_THREADS < num_tile_items) {
+            local_max = max(local_max, keys[tile_offset + threadIdx.x + ITEM * B]);
+            local_min = min(local_min, keys[tile_offset + threadIdx.x + ITEM * B]);
         }
+    }
+
+    __syncthreads();
+    static __shared__ T buffer[32];
+    cuda::atomic_ref<T, cuda::thread_scope_device> res_atomic_max(*res_max);
+    cuda::atomic_ref<T, cuda::thread_scope_device> res_atomic_min(*res_min);
+
+    T block_reduce_max = BlockReduce<T, BLOCK_THREADS, ITEMS_PER_THREAD>(local_max, (T*)buffer, 2);
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        res_atomic_max.fetch_max(block_reduce_max); 
+    }
+
+    __syncthreads();
+    T block_reduce_min = BlockReduce<T, BLOCK_THREADS, ITEMS_PER_THREAD>(local_min, (T*)buffer, 3);
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        res_atomic_min.fetch_min(block_reduce_min);  
     }
 }
 
-template <typename T, int B, int I>
-__global__ void divide(T* a, uint64_t* b, T* result, uint64_t N) {
-
-    uint64_t tile_size = B * I;
-    uint64_t tile_offset = blockIdx.x * tile_size;
-
-    uint64_t num_tiles = (N + tile_size - 1) / tile_size;
-    uint64_t num_tile_items = tile_size;
-
-    if (blockIdx.x == num_tiles - 1) {
-        num_tile_items = N - tile_offset;
-    }
-
-    #pragma unroll
-    for (int ITEM = 0; ITEM < I; ++ITEM) {
-        if (threadIdx.x + ITEM * B < num_tile_items) {
-            int offset = tile_offset + threadIdx.x + ITEM * B;
-            result[offset] = a[offset] / b[offset];
+__global__ void print_hash_table_group(unsigned long long* a, uint64_t N, uint64_t num_keys, uint64_t num_aggregates, bool need_count) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        for (uint64_t i = 0; i < N; i++) {
+            for (uint64_t j = 0; j < num_keys + num_aggregates + need_count; j++) {
+                printf("%llu ", a[i * (num_keys + num_aggregates + need_count) + j]);
+            }
+            printf("\n");
         }
     }
 }
-
-template <typename T, int B, int I>
-__global__ void fill_n(T* a, T b, uint64_t N) {
-    uint64_t tile_size = B * I;
-    uint64_t tile_offset = blockIdx.x * tile_size;
-
-    uint64_t num_tiles = (N + tile_size - 1) / tile_size;
-    uint64_t num_tile_items = tile_size;
-
-    if (blockIdx.x == num_tiles - 1) {
-        num_tile_items = N - tile_offset;
-    }
-
-    #pragma unroll
-    for (int ITEM = 0; ITEM < I; ++ITEM) {
-        if (threadIdx.x + ITEM * B < num_tile_items) {
-            a[tile_offset + threadIdx.x + ITEM * B] = b;
-        }
-    }
-}
-
-
-template
-__global__ void gather_and_modify<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD>(const uint64_t *a, uint64_t* result, sort_keys_type* sort_keys, uint64_t N, uint64_t num_keys);
-template
-__global__ void gather_and_modify<double, BLOCK_THREADS, ITEMS_PER_THREAD>(const double *a, double* result, sort_keys_type* sort_keys, uint64_t N, uint64_t num_keys);
-
-template
-__global__ void columns_to_rows<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD>(uint64_t **a, uint64_t* result, sort_keys_type* temp, uint64_t N, uint64_t num_keys);
-
-template
-__global__ void rows_to_columns<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD>(sort_keys_type *row_keys, uint64_t** col_keys, uint64_t N, uint64_t num_keys);
 
 template <typename T, typename V>
-void groupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count, uint64_t N, uint64_t num_keys, uint64_t num_aggregates, int* agg_mode) {
+void hashGroupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count, uint64_t N, uint64_t num_keys, uint64_t num_aggregates, int* agg_mode) {
     CHECK_ERROR();
     if (N == 0) {
         count[0] = 0;
@@ -262,337 +405,140 @@ void groupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count,
         return;
     }
 
-    printf("Launching Grouped Aggregate Kernel\n");
+    printf("Launching Hash Grouped Aggregate Kernel\n");
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 
-    //allocate temp memory and copying keys
-    T* row_keys = gpuBufferManager->customCudaMalloc<T>((num_keys + 1) * N, 0, 0);
-    sort_keys_type* materialized_temp = reinterpret_cast<sort_keys_type*> (gpuBufferManager->customCudaMalloc<pointer_and_key>(N, 0, 0));
-    // T* keys_row_id[num_keys + 1];
-    T** keys_row_id = new T*[num_keys + 1];
-    for (uint64_t i = 0; i < num_keys; i++) {
-        keys_row_id[i] = reinterpret_cast<T*> (keys[i]);
-    }
-
-    //generate sequence
-    int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
-    uint64_t* row_sequence = gpuBufferManager->customCudaMalloc<uint64_t>(N, 0, 0);
-    sequence<BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(row_sequence, N);
-    keys_row_id[num_keys] = row_sequence;
-
     T** keys_dev;
-    cudaMalloc((void**) &keys_dev, (num_keys + 1) * sizeof(T*));
-    cudaMemcpy(keys_dev, keys_row_id, (num_keys + 1) * sizeof(T*), cudaMemcpyHostToDevice);
+    cudaMalloc((void**) &keys_dev, num_keys * sizeof(T*));
+    cudaMemcpy(keys_dev, reinterpret_cast<T*>(keys), num_keys * sizeof(T*), cudaMemcpyHostToDevice);
 
-    columns_to_rows<T, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(keys_dev, row_keys, materialized_temp, N, num_keys + 1);
-    CHECK_ERROR();
-    cudaDeviceSynchronize();
+    V** aggregate_keys_dev;
+    cudaMalloc((void**) &aggregate_keys_dev, num_aggregates * sizeof(V*));
+    cudaMemcpy(aggregate_keys_dev, reinterpret_cast<V*>(aggregate_keys), num_aggregates * sizeof(V*), cudaMemcpyHostToDevice);
 
-    //perform sort-based groupby
-    // Determine temporary device storage requirements
-    CustomLess custom_less;
-    void *d_temp_storage = nullptr;
-    size_t temp_storage_bytes = 0;
-    cub::DeviceMergeSort::SortKeys(
-        d_temp_storage,
-        temp_storage_bytes,
-        materialized_temp,
-        N,
-        custom_less);
+    int* agg_mode_dev = gpuBufferManager->customCudaMalloc<int>(num_aggregates, 0, 0);
+    cudaMemcpy(agg_mode_dev, agg_mode, num_aggregates * sizeof(int), cudaMemcpyHostToDevice);
 
-    CHECK_ERROR();
-
-    // Allocate temporary storage
-    d_temp_storage = reinterpret_cast<void*> (gpuBufferManager->customCudaMalloc<uint8_t>(temp_storage_bytes, 0, 0));
-
-    // Run sorting operation
-    cub::DeviceMergeSort::SortKeys(
-        d_temp_storage,
-        temp_storage_bytes,
-        materialized_temp,
-        N,
-        custom_less);
-
-    // sort_keys_type* materialized_temp2 = reinterpret_cast<sort_keys_type*> (gpuBufferManager->customCudaMalloc<pointer_and_key>(N, 0, 0));
-    // // Determine temporary device storage requirements
-    // CustomLess custom_op;
-    // void *d_temp_storage = nullptr;
-    // size_t temp_storage_bytes = 0;
-    // cub::DeviceRadixSort::SortKeys(
-    //     d_temp_storage,
-    //     temp_storage_bytes,
-    //     materialized_temp,
-    //     materialized_temp2,
-    //     N);
-
-    // CHECK_ERROR();
-
-    // // Allocate temporary storage
-    // d_temp_storage = reinterpret_cast<void*> (gpuBufferManager->customCudaMalloc<uint8_t>(temp_storage_bytes, 0, 0));
-
-    // // Run sorting operation
-    // cub::DeviceRadixSort::SortKeys(
-    //     d_temp_storage,
-    //     temp_storage_bytes,
-    //     materialized_temp,
-    //     materialized_temp2,
-    //     N);
-
-    // CHECK_ERROR();
-
-    //gather the aggregates based on the row_sequence
-    printf("Gathering Aggregates\n");
-    V** aggregate_keys_temp = new V*[num_aggregates];
-    uint64_t** aggregate_star_temp = new uint64_t*[num_aggregates];
-    sort_keys_type* group_by_rows = reinterpret_cast<sort_keys_type*> (gpuBufferManager->customCudaMalloc<pointer_and_key>(N, 0, 0));
-    uint64_t* d_num_runs_out = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
-    cudaMemset(d_num_runs_out, 0, sizeof(uint64_t));
-    uint64_t* h_count = new uint64_t[1];
-
-    for (int agg = 0; agg < num_aggregates; agg++) {
-        // printf("Aggregating %d\n", agg);
-        if (agg_mode[agg] == 4 || agg_mode[agg] == 5) { //count_star or count(null) or sum(null)
-            aggregate_star_temp[agg] = gpuBufferManager->customCudaMalloc<uint64_t>(N, 0, 0);
-            if (agg_mode[agg] == 4) 
-                fill_n<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(aggregate_star_temp[agg], 1, N);
-            else if (agg_mode[agg] == 5)
-                cudaMemset(aggregate_star_temp[agg], 0, N * sizeof(uint64_t));
-
-            modify<BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(materialized_temp, N, num_keys + 1);
-
-            //perform reduce_by_key
-            uint64_t* agg_star_out = gpuBufferManager->customCudaMalloc<uint64_t>(N, 0, 0);
-            cudaMemset(agg_star_out, 0, N * sizeof(uint64_t));
-
-            printf("Reduce by key count_star\n");
-            // Determine temporary device storage requirements
-            d_temp_storage = nullptr;
-            temp_storage_bytes = 0;
-            CustomSum custom_sum;
-            cub::DeviceReduce::ReduceByKey(
-                d_temp_storage, temp_storage_bytes,
-                materialized_temp, group_by_rows, aggregate_star_temp[agg],
-                agg_star_out, d_num_runs_out, custom_sum, N);
-
-            CHECK_ERROR();
-
-            // Allocate temporary storage
-            d_temp_storage = reinterpret_cast<void*> (gpuBufferManager->customCudaMalloc<uint8_t>(temp_storage_bytes, 0, 0));
-
-            // Run reduce-by-key
-            cub::DeviceReduce::ReduceByKey(
-                d_temp_storage, temp_storage_bytes,
-                materialized_temp, group_by_rows, aggregate_star_temp[agg],
-                agg_star_out, d_num_runs_out, custom_sum, N);
-
-            CHECK_ERROR();
-
-            cudaMemcpy(h_count, d_num_runs_out, sizeof(uint64_t), cudaMemcpyDeviceToHost);
-            count[0] = h_count[0];
-
-            printf("Count: %lu\n", count[0]);
-
-            CHECK_ERROR();
-            aggregate_keys[agg] = reinterpret_cast<uint8_t*> (agg_star_out);
-        } else {
-            aggregate_keys_temp[agg] = gpuBufferManager->customCudaMalloc<V>(N, 0, 0);
-            V* temp = reinterpret_cast<V*> (aggregate_keys[agg]);
-            gather_and_modify<V, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(temp, aggregate_keys_temp[agg], materialized_temp, N, num_keys + 1);
-
-            V* agg_out = gpuBufferManager->customCudaMalloc<V>(N, 0, 0);
-            cudaMemset(agg_out, 0, N * sizeof(V));
-
-            CHECK_ERROR();
-            if (agg_mode[agg] == 0) {
-                printf("Reduce by key sum\n");
-                // Determine temporary device storage requirements
-                d_temp_storage = nullptr;
-                temp_storage_bytes = 0;
-                CustomSum custom_sum;
-                cub::DeviceReduce::ReduceByKey(
-                    d_temp_storage, temp_storage_bytes,
-                    materialized_temp, group_by_rows, aggregate_keys_temp[agg],
-                    agg_out, d_num_runs_out, custom_sum, N);
-
-                CHECK_ERROR();
-
-                // Allocate temporary storage
-                d_temp_storage = reinterpret_cast<void*> (gpuBufferManager->customCudaMalloc<uint8_t>(temp_storage_bytes, 0, 0));
-
-                // Run reduce-by-key
-                cub::DeviceReduce::ReduceByKey(
-                    d_temp_storage, temp_storage_bytes,
-                    materialized_temp, group_by_rows, aggregate_keys_temp[agg],
-                    agg_out, d_num_runs_out, custom_sum, N);
-
-                CHECK_ERROR();
-
-                cudaMemcpy(h_count, d_num_runs_out, sizeof(uint64_t), cudaMemcpyDeviceToHost);
-                count[0] = h_count[0];
-
-                CHECK_ERROR();
-                aggregate_keys[agg] = reinterpret_cast<uint8_t*> (agg_out);
-            } else if (agg_mode[agg] == 1) {
-                //Currently typename V has to be a double
-                printf("Reduce by key avg\n");
-                // Determine temporary device storage requirements
-                d_temp_storage = nullptr;
-                temp_storage_bytes = 0;
-                CustomSum custom_sum;
-                cub::DeviceReduce::ReduceByKey(
-                    d_temp_storage, temp_storage_bytes,
-                    materialized_temp, group_by_rows, aggregate_keys_temp[agg],
-                    agg_out, d_num_runs_out, custom_sum, N);
-
-                CHECK_ERROR();
-
-                // Allocate temporary storage
-                d_temp_storage = reinterpret_cast<void*> (gpuBufferManager->customCudaMalloc<uint8_t>(temp_storage_bytes, 0, 0));
-
-                // Run reduce-by-key
-                cub::DeviceReduce::ReduceByKey(
-                    d_temp_storage, temp_storage_bytes,
-                    materialized_temp, group_by_rows, aggregate_keys_temp[agg],
-                    agg_out, d_num_runs_out, custom_sum, N);
-
-                CHECK_ERROR();
-
-                aggregate_star_temp[agg] = gpuBufferManager->customCudaMalloc<uint64_t>(N, 0, 0);
-                fill_n<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(aggregate_star_temp[agg], 1, N);
-
-                uint64_t* agg_star_out = gpuBufferManager->customCudaMalloc<uint64_t>(N, 0, 0);
-                cudaMemset(agg_star_out, 0, N * sizeof(uint64_t));
-                cudaMemset(d_num_runs_out, 0, sizeof(uint64_t));
-
-                d_temp_storage = nullptr;
-                temp_storage_bytes = 0;
-                cub::DeviceReduce::ReduceByKey(
-                    d_temp_storage, temp_storage_bytes,
-                    materialized_temp, group_by_rows, aggregate_star_temp[agg],
-                    agg_star_out, d_num_runs_out, custom_sum, N);
-
-                CHECK_ERROR();
-
-                // Allocate temporary storage
-                d_temp_storage = reinterpret_cast<void*> (gpuBufferManager->customCudaMalloc<uint8_t>(temp_storage_bytes, 0, 0));
-
-                // Run reduce-by-key
-                cub::DeviceReduce::ReduceByKey(
-                    d_temp_storage, temp_storage_bytes,
-                    materialized_temp, group_by_rows, aggregate_star_temp[agg],
-                    agg_star_out, d_num_runs_out, custom_sum, N);
-
-                CHECK_ERROR();
-
-                cudaMemcpy(h_count, d_num_runs_out, sizeof(uint64_t), cudaMemcpyDeviceToHost);
-                count[0] = h_count[0];
-
-                V* output = gpuBufferManager->customCudaMalloc<V>(count[0], 0, 0);
-                divide<V, BLOCK_THREADS, ITEMS_PER_THREAD><<<(count[0] + tile_items - 1)/tile_items, BLOCK_THREADS>>>(agg_out, agg_star_out, output, count[0]);
-
-                CHECK_ERROR();
-                aggregate_keys[agg] = reinterpret_cast<uint8_t*> (output);
-            } else if (agg_mode[agg] == 2) {
-                printf("Reduce by key max\n");
-                // Determine temporary device storage requirements
-                d_temp_storage = nullptr;
-                temp_storage_bytes = 0;
-                CustomMax custom_max;
-                cub::DeviceReduce::ReduceByKey(
-                    d_temp_storage, temp_storage_bytes,
-                    materialized_temp, group_by_rows, aggregate_keys_temp[agg],
-                    agg_out, d_num_runs_out, custom_max, N);
-
-                CHECK_ERROR();
-
-                // Allocate temporary storage
-                d_temp_storage = reinterpret_cast<void*> (gpuBufferManager->customCudaMalloc<uint8_t>(temp_storage_bytes, 0, 0));
-
-                // Run reduce-by-key
-                cub::DeviceReduce::ReduceByKey(
-                    d_temp_storage, temp_storage_bytes,
-                    materialized_temp, group_by_rows, aggregate_keys_temp[agg],
-                    agg_out, d_num_runs_out, custom_max, N);
-
-                CHECK_ERROR();
-
-                cudaMemcpy(h_count, d_num_runs_out, sizeof(uint64_t), cudaMemcpyDeviceToHost);
-                count[0] = h_count[0];
-
-                CHECK_ERROR();
-                aggregate_keys[agg] = reinterpret_cast<uint8_t*> (agg_out);
-            } else if (agg_mode[agg] == 3) {
-                printf("Reduce by key min\n");
-                // Determine temporary device storage requirements
-                d_temp_storage = nullptr;
-                temp_storage_bytes = 0;
-                CustomMin custom_min;
-                cub::DeviceReduce::ReduceByKey(
-                    d_temp_storage, temp_storage_bytes,
-                    materialized_temp, group_by_rows, aggregate_keys_temp[agg],
-                    agg_out, d_num_runs_out, custom_min, N);
-
-                CHECK_ERROR();
-
-                // Allocate temporary storage
-                d_temp_storage = reinterpret_cast<void*> (gpuBufferManager->customCudaMalloc<uint8_t>(temp_storage_bytes, 0, 0));
-
-                // Run reduce-by-key
-                cub::DeviceReduce::ReduceByKey(
-                    d_temp_storage, temp_storage_bytes,
-                    materialized_temp, group_by_rows, aggregate_keys_temp[agg],
-                    agg_out, d_num_runs_out, custom_min, N);
-
-                CHECK_ERROR();
-
-                cudaMemcpy(h_count, d_num_runs_out, sizeof(uint64_t), cudaMemcpyDeviceToHost);
-                count[0] = h_count[0];
-
-                CHECK_ERROR();
-                aggregate_keys[agg] = reinterpret_cast<uint8_t*> (agg_out);
-            }
+    bool need_count = 0;
+    for (int mode = 0; mode < num_aggregates; mode++) {
+        if (agg_mode[mode] == 1) {
+            need_count = 1;
+            break;
         }
     }
 
-    T** keys_dev_result;
-    T** keys_result = new T*[num_keys];
-    cudaMalloc((void**) &keys_dev_result, num_keys * sizeof(T*));
-    for (uint64_t i = 0; i < num_keys; i++) {
-        keys_result[i] = gpuBufferManager->customCudaMalloc<T>(count[0], 0, 0);
+    int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
+    T* max_key = gpuBufferManager->customCudaMalloc<T>(num_keys, 0, 0);
+    T* min_key = gpuBufferManager->customCudaMalloc<T>(num_keys, 0, 0);
+    for (int i = 0; i < num_keys; i++) {
+        T* temp = reinterpret_cast<T*> (keys[i]);
+        T* max_key_ptr = max_key + i;
+        T* min_key_ptr = min_key + i;
+        cudaMemcpy(max_key_ptr, temp, sizeof(T), cudaMemcpyDeviceToDevice);
+        cudaMemcpy(min_key_ptr, temp, sizeof(T), cudaMemcpyDeviceToDevice);
+        get_min_max<T, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(reinterpret_cast<T*>(keys[i]), max_key_ptr, min_key_ptr, N);
+        CHECK_ERROR();
     }
-    cudaMemcpy(keys_dev_result, keys_result, num_keys * sizeof(T*), cudaMemcpyHostToDevice);
 
-    rows_to_columns<T, BLOCK_THREADS, ITEMS_PER_THREAD><<<(count[0] + tile_items - 1)/tile_items, BLOCK_THREADS>>>(group_by_rows, keys_dev_result, count[0], num_keys);
+    T* max_key_host = new T[num_keys];
+    T* min_key_host = new T[num_keys];
+    cudaMemcpy(max_key_host, max_key, num_keys * sizeof(T), cudaMemcpyDeviceToHost);
+    cudaMemcpy(min_key_host, min_key, num_keys * sizeof(T), cudaMemcpyDeviceToHost);
+
+    T C = 1;
+    for (int i = 0; i < num_keys; i++) {
+        C *= (max_key_host[i] - min_key_host[i] + 1);
+    }
+
+    printf("N: %lu\n", N);
+    // printf("max %ld min %ld\n", max_key_host[0], min_key_host[0]);
+    
+    unsigned long long* ht;
+    uint64_t ht_len;
+    if (C < BLOCK_THREADS) {
+        ht_len = C;
+        size_t smem_size;
+        if (need_count) {
+            ht = (unsigned long long*) gpuBufferManager->customCudaMalloc<uint64_t>(ht_len * (num_keys + num_aggregates + 1), 0, 0);
+            smem_size = ht_len * (num_keys + num_aggregates + 1) * sizeof(unsigned long long);
+        } else {
+            ht = (unsigned long long*) gpuBufferManager->customCudaMalloc<uint64_t>(ht_len * (num_keys + num_aggregates), 0, 0);
+            smem_size = ht_len * (num_keys + num_aggregates) * sizeof(unsigned long long);
+        }
+        set_group_ht<<<(ht_len + BLOCK_THREADS - 1)/BLOCK_THREADS, BLOCK_THREADS>>>(ht, aggregate_keys_dev, num_keys, num_aggregates, ht_len, agg_mode_dev, need_count);
+        hash_groupby_smem<T, V, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS, smem_size>>>(keys_dev, aggregate_keys_dev, 
+                max_key, min_key, ht, ht_len, N, num_keys, num_aggregates, agg_mode_dev, need_count);
+        // print_hash_table_group<<<1, 1>>>(ht, ht_len, num_keys, num_aggregates, need_count);
+    } else{
+        ht_len = N * 2;
+        if (need_count) {
+            ht = (unsigned long long*) gpuBufferManager->customCudaMalloc<uint64_t>(ht_len * (num_keys + num_aggregates + 1), 0, 0);         
+        } else {
+            ht = (unsigned long long*) gpuBufferManager->customCudaMalloc<uint64_t>(ht_len * (num_keys + num_aggregates), 0, 0);
+        }
+        set_group_ht<<<(ht_len + BLOCK_THREADS - 1)/BLOCK_THREADS, BLOCK_THREADS>>>(ht, aggregate_keys_dev, num_keys, num_aggregates, ht_len, agg_mode_dev, need_count);
+        hash_groupby_gmem<T, V, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(keys_dev, aggregate_keys_dev, 
+            ht, ht_len, N, num_keys, num_aggregates, agg_mode_dev, need_count);
+    }
+    
+    CHECK_ERROR();
+
+    uint8_t** keys_dev_result;
+    uint8_t** aggregate_keys_dev_result;
+    uint64_t* d_count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+    cudaMemset(d_count, 0, sizeof(uint64_t));
+    scan_hash_group<T, V, BLOCK_THREADS, ITEMS_PER_THREAD><<<(ht_len + tile_items - 1)/tile_items, BLOCK_THREADS>>>(ht, nullptr, nullptr, 
+            (unsigned long long*) d_count, ht_len, num_keys, num_aggregates, agg_mode_dev, true, need_count); 
 
     CHECK_ERROR();
-    cudaDeviceSynchronize();
-    printf("Count: %lu\n", count[0]);
+    uint64_t* h_count = new uint64_t [1];
+    cudaMemcpy(h_count, d_count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+    assert(h_count[0] > 0);
+
+    uint8_t** keys_result = new uint8_t*[num_keys];
+    uint8_t** aggregate_keys_result = new uint8_t*[num_aggregates];
+    for (int i = 0; i < num_keys; i++) {
+        keys_result[i] = gpuBufferManager->customCudaMalloc<uint8_t>(h_count[0] * sizeof(T), 0, 0);
+    }
+    for (int i = 0; i < num_aggregates; i++) {
+        if (agg_mode[i] == 0 || agg_mode[i] == 1 || agg_mode[i] == 2 || agg_mode[i] == 3) {
+            aggregate_keys_result[i] = gpuBufferManager->customCudaMalloc<uint8_t>(h_count[0] * sizeof(V), 0, 0);
+        } else if (agg_mode[i] == 4 || agg_mode[i] == 5) {
+            aggregate_keys_result[i] = gpuBufferManager->customCudaMalloc<uint8_t>(h_count[0] * sizeof(uint64_t), 0, 0);
+        } else {
+            assert(false);
+        }
+    }
+    
+    cudaMalloc((void**) &keys_dev_result, num_keys * sizeof(uint8_t*));
+    cudaMalloc((void**) &aggregate_keys_dev_result, num_aggregates * sizeof(uint8_t*));
+    cudaMemcpy(keys_dev_result, keys_result, num_keys * sizeof(uint8_t*), cudaMemcpyHostToDevice);
+    cudaMemcpy(aggregate_keys_dev_result, aggregate_keys_result, num_aggregates * sizeof(uint8_t*), cudaMemcpyHostToDevice);
+    cudaMemset(d_count, 0, sizeof(uint64_t));
+    CHECK_ERROR();
+
+    scan_hash_group<T, V, BLOCK_THREADS, ITEMS_PER_THREAD><<<(ht_len + tile_items - 1)/tile_items, BLOCK_THREADS>>>(ht, keys_dev_result, aggregate_keys_dev_result, 
+            (unsigned long long*) d_count, ht_len, num_keys, num_aggregates, agg_mode_dev, false, need_count);
+
+    CHECK_ERROR();
+
+    printf("Count: %lu\n", h_count[0]);
 
     for (uint64_t i = 0; i < num_keys; i++) {
-        keys[i] = reinterpret_cast<uint8_t*> (keys_result[i]);
+        keys[i] = keys_result[i];
     }
+
+    for (uint64_t i = 0; i < num_aggregates; i++) {
+        aggregate_keys[i] = aggregate_keys_result[i];
+    }
+
+    count[0] = h_count[0];
 }
 
-template<typename T>
-void combineColumns(T* a, T* b, T* c, uint64_t N_a, uint64_t N_b) {
-    CHECK_ERROR();
-    if (N_a == 0 || N_b == 0) {
-        printf("N is 0\n");
-        return;
-    }
-    cudaMemcpy(c, a, N_a * sizeof(T), cudaMemcpyDeviceToDevice);
-    cudaMemcpy(c + N_a, b, N_b * sizeof(T), cudaMemcpyDeviceToDevice);
-    CHECK_ERROR();
-    cudaDeviceSynchronize();
-}
+template
+void hashGroupedAggregate<uint64_t, uint64_t>(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count, uint64_t N, uint64_t num_keys, uint64_t num_aggregates, int* agg_mode);
 
 template
-void groupedAggregate<uint64_t, uint64_t>(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count, uint64_t N, uint64_t num_keys, uint64_t num_aggregates, int* agg_mode);
-
-template
-void groupedAggregate<uint64_t, double>(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count, uint64_t N, uint64_t num_keys, uint64_t num_aggregates, int* agg_mode);
-
-template
-void groupedWithoutAggregate<uint64_t>(uint8_t **keys, uint64_t* count, uint64_t N, uint64_t num_keys);
+void hashGroupedAggregate<uint64_t, double>(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count, uint64_t N, uint64_t num_keys, uint64_t num_aggregates, int* agg_mode);
 
 }

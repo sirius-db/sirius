@@ -4,62 +4,6 @@
 
 namespace duckdb {
 
-template<typename T, int B, int I>
-__device__ __forceinline__ T BlockReduce(
-    T  item,
-    T* shared,
-    int op_mode
-    ) {
-    __syncthreads();
-
-    T val = item;
-    const int warp_size = 32;
-    int lane = threadIdx.x % warp_size;
-    int wid = threadIdx.x / warp_size;
-
-    // Calculate sum across warp
-    for (int offset = 16; offset > 0; offset /= 2) {
-        if (op_mode == 0 || op_mode == 1) { //sum or avg
-            val += __shfl_down_sync(0xffffffff, val, offset);
-        } else if (op_mode == 2) { //max
-            val = max(val, __shfl_down_sync(0xffffffff, val, offset));
-        } else if (op_mode == 3) { //min
-            val = min(val, __shfl_down_sync(0xffffffff, val, offset));
-        }
-    }
-
-    // Store sum in buffer
-    if (lane == 0) {
-        shared[wid] = val;
-    }
-
-    __syncthreads();
-
-    // Load the sums into the first warp
-    if (op_mode == 0 || op_mode == 1) { //sum or avg
-        val = (threadIdx.x < blockDim.x / warp_size) ? shared[lane] : 0;
-    } else if (op_mode == 2) { //max
-        val = (threadIdx.x < blockDim.x / warp_size) ? shared[lane] : shared[0];
-    } else if (op_mode == 3) { //min
-        val = (threadIdx.x < blockDim.x / warp_size) ? shared[lane] : shared[0];
-    }
-
-    // Calculate sum of sums
-    if (wid == 0) {
-        for (int offset = 16; offset > 0; offset /= 2) {
-            if (op_mode == 0 || op_mode == 1) { //sum or avg
-                val += __shfl_down_sync(0xffffffff, val, offset);
-            } else if (op_mode == 2) { //max
-                val = max(val, __shfl_down_sync(0xffffffff, val, offset));
-            } else if (op_mode == 3) { //min
-                val = min(val, __shfl_down_sync(0xffffffff, val, offset));
-            }
-        }
-    }
-
-  return val;
-}
-
 template <typename T, int B, int I>
 __global__ void ungrouped_aggregate(T *a, T *result, uint64_t N, int op_mode) {
 
