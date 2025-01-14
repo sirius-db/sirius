@@ -11,6 +11,7 @@ namespace duckdb {
 
 // Declaration of the CUDA kernel
 template <typename T> T* callCudaMalloc(size_t size, int gpu);
+template <typename T> T* callCudaHostAlloc(size_t size, bool return_dev_ptr);
 template <typename T> void callCudaFree(T* ptr, int gpu);
 template <typename T> void callCudaMemcpyHostToDevice(T* dest, T* src, size_t size, int gpu);
 template <typename T> void callCudaMemcpyDeviceToHost(T* dest, T* src, size_t size, int gpu);
