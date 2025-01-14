@@ -19,6 +19,21 @@ callCudaMalloc<float>(size_t size, int gpu);
 template double*
 callCudaMalloc<double>(size_t size, int gpu);
 
+template int*
+callCudaHostAlloc<int>(size_t size, bool return_dev_ptr);
+
+template uint64_t*
+callCudaHostAlloc<uint64_t>(size_t size, bool return_dev_ptr);
+
+template uint8_t*
+callCudaHostAlloc<uint8_t>(size_t size, bool return_dev_ptr);
+
+template float*
+callCudaHostAlloc<float>(size_t size, bool return_dev_ptr);
+
+template double*
+callCudaHostAlloc<double>(size_t size, bool return_dev_ptr);
+
 template void
 callCudaFree<int>(int* ptr, int gpu);
 
@@ -42,6 +57,19 @@ T* callCudaMalloc(size_t size, int gpu) {
     gpuErrchk(cudaMalloc((void**) &ptr, size * sizeof(T)));
     cudaDeviceSynchronize();
     cudaSetDevice(0);
+    return ptr;
+}
+
+template <typename T>
+T* callCudaHostAlloc(size_t size, bool return_dev_ptr) {
+    T* ptr;
+    printf("Allocating %lu bytes on CPU\n", size * sizeof(T));
+    gpuErrchk(cudaHostAlloc((void**) &ptr, size * sizeof(T), cudaHostAllocMapped));
+    if (return_dev_ptr) {
+        T* return_ptr;
+        gpuErrchk(cudaHostGetDevicePointer((void **)&return_ptr, ptr, 0));
+        return return_ptr;
+    }
     return ptr;
 }
 

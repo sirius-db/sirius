@@ -61,8 +61,10 @@ GPUBufferManager::GPUBufferManager(size_t cache_size_per_gpu, size_t processing_
     cpuProcessingPointer = 0;
 
     for (int gpu = 0; gpu < NUM_GPUS; gpu++) {
-        gpuCache[gpu] = callCudaMalloc<uint8_t>(cache_size_per_gpu, gpu);
+        // gpuCache[gpu] = callCudaMalloc<uint8_t>(cache_size_per_gpu, gpu);
         gpuProcessing[gpu] = callCudaMalloc<uint8_t>(processing_size_per_gpu, gpu);
+        gpuCache[gpu] = callCudaHostAlloc<uint8_t>(cache_size_per_gpu, 1);
+        // gpuProcessing[gpu] = callCudaHostAlloc<uint8_t>(processing_size_per_gpu, 1);
         // if (reinterpret_cast<uintptr_t>(gpuCache[gpu]) % alignof(double) == 0) {
         //     printf("Memory is not properly aligned 1\n");
         // } else if (reinterpret_cast<uintptr_t>(gpuCache[gpu]) % alignof(int) == 0) {
