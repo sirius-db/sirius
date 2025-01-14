@@ -99,7 +99,8 @@ __global__ void hash_groupby_gmem(T **group_key, V** aggregate, unsigned long lo
 
 template <typename T, typename V, int B, int I>
 __global__ void hash_groupby_smem(T **group_key, V** aggregate, T* max, T* min, unsigned long long* ht, 
-        uint64_t ht_len, uint64_t N, uint64_t num_keys, uint64_t num_aggregates, int* agg_mode, bool need_count) {
+        uint64_t ht_len, uint64_t N, uint64_t num_keys, uint64_t num_aggregates, 
+        V init_min, V init_max, int* agg_mode, bool need_count) {
 
     uint64_t tile_size = B * I;
     uint64_t tile_offset = blockIdx.x * tile_size;
@@ -124,9 +125,9 @@ __global__ void hash_groupby_smem(T **group_key, V** aggregate, T* max, T* min, 
         }
         for (int n = 0; n < num_aggregates; n++) {
             if (agg_mode[n] == 2) {
-                local_ht[threadIdx.x * n_ht_column + num_keys + n] = DBL_MIN;
+                local_ht[threadIdx.x * n_ht_column + num_keys + n] = init_max;
             } else if (agg_mode[n] == 3) {
-                local_ht[threadIdx.x * n_ht_column + num_keys + n] = DBL_MAX;
+                local_ht[threadIdx.x * n_ht_column + num_keys + n] = init_min;
             } else if (agg_mode[n] == 1) {
                 local_ht[threadIdx.x * n_ht_column + num_keys + n] = 0;
                 local_ht[threadIdx.x * n_ht_column + num_keys + num_aggregates] = 0;
@@ -206,15 +207,16 @@ __global__ void hash_groupby_smem(T **group_key, V** aggregate, T* max, T* min, 
             V* ptr2 = reinterpret_cast<V*>(local_ht + (threadIdx.x * n_ht_column + num_keys + n));
             cuda::atomic_ref<V, cuda::thread_scope_device> res_atomic(*ptr);
             if (agg_mode[n] == 0) {
-                res_atomic.fetch_add(*ptr2);
+                if (*ptr2 != 0) res_atomic.fetch_add(*ptr2);
             } else if (agg_mode[n] == 1) {
-                res_atomic.fetch_add(*ptr2);
+                if (*ptr2 != 0) res_atomic.fetch_add(*ptr2);
             } else if (agg_mode[n] == 2) {
                 res_atomic.fetch_max(*ptr2);
             } else if (agg_mode[n] == 3) {
                 res_atomic.fetch_min(*ptr2);
             } else if (agg_mode[n] == 4) {
-                atomicAdd(&ht[threadIdx.x * n_ht_column + num_keys + n], local_ht[threadIdx.x * n_ht_column + num_keys + n]); // count
+                if (local_ht[threadIdx.x * n_ht_column + num_keys + n] != 0)
+                    atomicAdd(&ht[threadIdx.x * n_ht_column + num_keys + n], local_ht[threadIdx.x * n_ht_column + num_keys + n]); // count
             } else if (agg_mode[n] == 5) {
                 // should be zero, so do nothing
             } else cudaAssert(false);
@@ -318,7 +320,8 @@ __global__ void scan_hash_group(unsigned long long* ht, uint8_t** group, uint8_t
 }
 
 template <typename V>
-__global__ void set_group_ht(unsigned long long* ht, V** aggregate, uint64_t num_keys, uint64_t num_aggregates, uint64_t ht_len, int* agg_mode, bool need_count) {
+__global__ void set_group_ht(unsigned long long* ht, V** aggregate, uint64_t num_keys, uint64_t num_aggregates, uint64_t ht_len, 
+    V init_min, V init_max, int* agg_mode, bool need_count) {
     uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid < ht_len) {
 
@@ -331,9 +334,9 @@ __global__ void set_group_ht(unsigned long long* ht, V** aggregate, uint64_t num
         }
         for (int n = 0; n < num_aggregates; n++) {
             if (agg_mode[n] == 2) {
-                ht[tid * n_ht_column + num_keys + n] = DBL_MIN;
+                ht[tid * n_ht_column + num_keys + n] = init_max;
             } else if (agg_mode[n] == 3) {
-                ht[tid * n_ht_column + num_keys + n] = DBL_MAX;
+                ht[tid * n_ht_column + num_keys + n] = init_min;
             } else if (agg_mode[n] == 1) {
                 ht[tid * n_ht_column+ num_keys + n] = 0;
                 ht[tid * n_ht_column + num_keys + num_aggregates] = 0;
@@ -468,12 +471,17 @@ void hashGroupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* co
     printf("N: %lu\n", N);
     printf("max %ld min %ld\n", max_key_host[0], min_key_host[0]);
 
+    V init_max; V init_min;
     if constexpr (std::is_same<V, double>::value) {
         // Do something if T is int
         std::cout << "V is double" << std::endl;
-    } else {
+        init_max = -DBL_MAX; init_min = DBL_MAX;
+    } else if constexpr (std::is_same<V, uint64_t>::value) {
         // Do something else if T is not int
         std::cout << "V is not double" << std::endl;
+        init_max = -INT64_MIN; init_min = INT64_MAX;
+    } else {
+        assert(0);
     }
     
     unsigned long long* ht;
@@ -488,10 +496,12 @@ void hashGroupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* co
             ht = (unsigned long long*) gpuBufferManager->customCudaMalloc<uint64_t>(ht_len * (num_keys + num_aggregates), 0, 0);
             smem_size = ht_len * (num_keys + num_aggregates) * sizeof(unsigned long long);
         }
-        set_group_ht<<<(ht_len + BLOCK_THREADS - 1)/BLOCK_THREADS, BLOCK_THREADS>>>(ht, aggregate_keys_dev, num_keys, num_aggregates, ht_len, agg_mode_dev, need_count);
+        set_group_ht<<<(ht_len + BLOCK_THREADS - 1)/BLOCK_THREADS, BLOCK_THREADS>>>(ht, aggregate_keys_dev, num_keys, num_aggregates, ht_len, 
+                init_min, init_max, agg_mode_dev, need_count);
         CHECK_ERROR();
         hash_groupby_smem<T, V, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS, smem_size>>>(keys_dev, aggregate_keys_dev, 
-                max_key, min_key, ht, ht_len, N, num_keys, num_aggregates, agg_mode_dev, need_count);
+                max_key, min_key, ht, ht_len, N, num_keys, num_aggregates, 
+                init_min, init_max, agg_mode_dev, need_count);
         CHECK_ERROR();
 
     } else{
@@ -501,7 +511,8 @@ void hashGroupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* co
         } else {
             ht = (unsigned long long*) gpuBufferManager->customCudaMalloc<uint64_t>(ht_len * (num_keys + num_aggregates), 0, 0);
         }
-        set_group_ht<<<(ht_len + BLOCK_THREADS - 1)/BLOCK_THREADS, BLOCK_THREADS>>>(ht, aggregate_keys_dev, num_keys, num_aggregates, ht_len, agg_mode_dev, need_count);
+        set_group_ht<<<(ht_len + BLOCK_THREADS - 1)/BLOCK_THREADS, BLOCK_THREADS>>>(ht, aggregate_keys_dev, num_keys, num_aggregates, ht_len, 
+            init_min, init_max, agg_mode_dev, need_count);
         // print_hash_table_group<<<1, 1>>>(ht, ht_len, num_keys, num_aggregates, need_count);
         CHECK_ERROR();
         hash_groupby_gmem<T, V, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(keys_dev, aggregate_keys_dev, 
