@@ -35,7 +35,7 @@ where
       and s_nationkey = n_nationkey
       and n_regionkey = r_regionkey
       and r_regionkey = 3
-    );
+    ) limit 100;
 
 select
   sum(s_acctbal),

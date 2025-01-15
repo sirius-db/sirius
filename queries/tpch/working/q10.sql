@@ -26,7 +26,7 @@ group by
   c_phone,
   n_name,
   c_address,
-  c_comment;
+  c_comment limit 20;
 
 
 select
