@@ -27,4 +27,4 @@ where
       ps_suppkey = s_suppkey
       and s_nationkey = n_nationkey
       and n_nationkey = 7
-  );
+  ) limit 1;
