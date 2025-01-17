@@ -7,6 +7,9 @@
 
 namespace duckdb {
 
+#define HASH_POWER 31
+#define HASH_MOD_VALUE 1000000009
+
 using std::chrono::high_resolution_clock;
 using std::chrono::duration;
 
@@ -38,7 +41,7 @@ struct CustomLessStringV2
     }
 
     // Then if that is the same then compare all of the records in sequential order
-    // This also effectivelly compares the lengths as we store all of the lengths at the start of the buffer
+    // This effectivelly first compares things in this order: 1) signature, 2) string lengths, 3) strings chars
     #pragma unroll
     for (uint64_t i = 0; i < lhs.num_records; i++) {
         if (lhs.row_record[i] != rhs.row_record[i]) {
@@ -62,7 +65,7 @@ __global__ void outer_preprocess_determine_row_memory(uint64_t** column_length_o
     const uint64_t start_idx = threadIdx.x + blockIdx.x * blockDim.x;
     for(uint64_t i = start_idx; i < num_rows; i += tile_size) {
         // Get the ints necessary for this row
-        uint64_t curr_row_ints_required = num_keys;
+        uint64_t curr_row_ints_required = num_keys + 1;
         #pragma unroll
         for(uint64_t j = 0; j < num_keys; j++) {
             uint64_t* curr_column_offset = column_length_offsets[j];
@@ -73,19 +76,6 @@ __global__ void outer_preprocess_determine_row_memory(uint64_t** column_length_o
     }
 }
 
-__global__ void inner_preprocess_determine_row_memory(uint64_t** column_length_offsets, uint64_t* row_offsets, const uint64_t num_keys, const uint64_t num_rows) {
-    const uint64_t tile_size = gridDim.x * blockDim.x;
-    const uint64_t start_idx = threadIdx.x + blockIdx.x * blockDim.x;
-    for(uint64_t j = 0; j < num_keys; j++) {
-        uint64_t* curr_column_offset = column_length_offsets[j];
-        for(uint64_t i = start_idx; i < num_rows; i += tile_size) {
-            uint64_t curr_record_length = curr_column_offset[i + 1] - curr_column_offset[i];
-            uint64_t curr_record_ints_required = 1 + (curr_record_length + BYTES_IN_INTEGER - 1)/BYTES_IN_INTEGER;
-            row_offsets[i] += curr_record_ints_required;
-        }
-    }
-}
-
 __global__ void fill_preprocess_buffer(uint8_t** keys, uint64_t** column_length_offsets, uint64_t* write_offsets, uint64_t* preprocess_buffer, sort_keys_type_string_v2* row_records, const uint64_t num_keys, const uint64_t num_rows) {
     const uint64_t tile_size = gridDim.x * blockDim.x;
     const uint64_t start_idx = threadIdx.x + blockIdx.x * blockDim.x;
@@ -93,9 +83,12 @@ __global__ void fill_preprocess_buffer(uint8_t** keys, uint64_t** column_length_
         // Get the ptr to write this row
         uint64_t row_write_offset = i > 0 ? write_offsets[i - 1] : 0;
         uint64_t* curr_row_write_ptr = preprocess_buffer + row_write_offset;
-        uint64_t chars_write_offset = num_keys;
+        uint64_t chars_write_offset = num_keys + 1;
         
         // Now write each column for this row
+        uint64_t signature = 0;
+        uint64_t curr_power = 1;
+
         #pragma unroll
         for(uint64_t j = 0; j < num_keys; j++) {
             // Determine the offset in the src to start copying from
@@ -103,13 +96,26 @@ __global__ void fill_preprocess_buffer(uint8_t** keys, uint64_t** column_length_
             uint64_t* curr_column_offsets = column_length_offsets[j];
             uint64_t curr_row_start = curr_column_offsets[i];
             uint64_t curr_record_length = curr_column_offsets[i + 1] - curr_row_start;
-            curr_row_write_ptr[j] = curr_record_length;
-            memcpy(reinterpret_cast<uint8_t*>(curr_row_write_ptr + chars_write_offset), curr_column_chars + curr_row_start, curr_record_length * sizeof(uint8_t));
+            curr_row_write_ptr[j + 1] = curr_record_length;
+            
+            // Copy over the chars
+            uint8_t* column_hash_chars = curr_column_chars + curr_row_start;
+            memcpy(reinterpret_cast<uint8_t*>(curr_row_write_ptr + chars_write_offset), column_hash_chars, curr_record_length * sizeof(uint8_t));
+            
+            uint64_t curr_value;
+            #pragma unroll
+            for(uint64_t k = 0; k < curr_record_length; k++) {
+                curr_value = static_cast<uint64_t>(column_hash_chars[k]);
+                signature = (signature + curr_value * curr_power) % HASH_MOD_VALUE;
+                curr_power = (curr_power * HASH_POWER) % HASH_MOD_VALUE;
+            }
 
             // Update the write ptr
             uint64_t curr_record_int_required = (curr_record_length + BYTES_IN_INTEGER - 1)/BYTES_IN_INTEGER;
             chars_write_offset += curr_record_int_required;
         }
+
+        curr_row_write_ptr[0] = signature;
         row_records[i] = sort_keys_type_string_v2(curr_row_write_ptr, chars_write_offset);
     }
 }
