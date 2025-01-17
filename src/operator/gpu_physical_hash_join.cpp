@@ -54,7 +54,10 @@ void
 HandleProbeExpression(GPUColumn** &probe_keys, uint64_t* &count, uint64_t* &row_ids_left, uint64_t* &row_ids_right, 
 		unsigned long long* ht, uint64_t ht_len, const vector<JoinCondition> &conditions, JoinType join_type, GPUBufferManager* gpuBufferManager) {
     switch(probe_keys[0]->data_wrapper.type) {
-      case ColumnType::INT64:
+      case ColumnType::INT32:
+		ResolveTypeProbeExpression(probe_keys, count, row_ids_left, row_ids_right, ht, ht_len, conditions, join_type, gpuBufferManager);
+		break;
+	  case ColumnType::INT64:
 		ResolveTypeProbeExpression(probe_keys, count, row_ids_left, row_ids_right, ht, ht_len, conditions, join_type, gpuBufferManager);
 		break;
       case ColumnType::FLOAT64:
@@ -146,6 +149,9 @@ void
 HandleBuildExpression(GPUColumn** &build_keys, unsigned long long* ht, uint64_t ht_len, 
 	const vector<JoinCondition> &conditions, JoinType join_type, GPUBufferManager* gpuBufferManager) {
     switch(build_keys[0]->data_wrapper.type) {
+	  case ColumnType::INT32:
+		ResolveTypeBuildExpression(build_keys, ht, ht_len, conditions, join_type, gpuBufferManager);
+		break;
       case ColumnType::INT64:
 		ResolveTypeBuildExpression(build_keys, ht, ht_len, conditions, join_type, gpuBufferManager);
 		break;

@@ -23,6 +23,12 @@ void groupedDistinctAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t
 template <typename V>
 void groupedStringAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t** offset, uint64_t* num_bytes, uint64_t* count, uint64_t N, uint64_t num_keys, uint64_t num_aggregates, int* agg_mode);
 
+template <typename V>
+void groupedStringAggregateV2(uint8_t **keys, uint8_t **aggregate_keys, uint64_t** offset, uint64_t* num_bytes, uint64_t* count, uint64_t N, uint64_t num_keys, uint64_t num_aggregates, int* agg_mode);
+
+template <typename V>
+void groupedStringAggregateV3(uint8_t **keys, uint8_t **aggregate_keys, uint64_t** offset, uint64_t* num_bytes, uint64_t* count, uint64_t N, uint64_t num_keys, uint64_t num_aggregates, int* agg_mode);
+
 template<typename T>
 void combineColumns(T* a, T* b, T* c, uint64_t N_a, uint64_t N_b);
 

@@ -136,3 +136,5 @@ __global__ void compact_valid_rows(bool* selection_flags, uint64_t* row_ids, uns
         }
     }
 }
+
+#define BYTES_IN_INTEGER 8
