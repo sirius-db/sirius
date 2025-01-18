@@ -17,6 +17,7 @@ template <typename T> void callCudaMemcpyHostToDevice(T* dest, T* src, size_t si
 template <typename T> void callCudaMemcpyDeviceToHost(T* dest, T* src, size_t size, int gpu);
 template <typename T> void materializeExpression(T *a, T* result, uint64_t *row_ids, uint64_t N);
 void materializeString(uint8_t* data, uint64_t* offset, uint8_t* &result, uint64_t* &result_offset, uint64_t* row_ids, uint64_t* &new_num_bytes, uint64_t N);
+void cudaMemmove(uint8_t* destination, uint8_t* source, size_t num);
 template <typename T> void printGPUColumn(T* a, size_t N, int gpu);
 void warmup_gpu();
 

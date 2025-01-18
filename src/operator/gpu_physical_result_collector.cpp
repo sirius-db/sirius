@@ -227,6 +227,7 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 	uint8_t** host_data = new uint8_t*[input_relation.columns.size()];
 	GPUIntermediateRelation materialized_relation(input_relation.columns.size());
 	string_t** duckdb_strings = new string_t*[input_relation.columns.size()];
+	GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 	for (int col = 0; col < input_relation.columns.size(); col++) {
 		// TODO: Need to fix this for the future, but for now, we will just return when there is null column
 		if (input_relation.columns[col]->data_wrapper.data == nullptr) return SinkResultType::FINISHED;
@@ -234,7 +235,8 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 		size_bytes = FinalMaterialize(input_relation, materialized_relation, col);
 
 		if(input_relation.columns[col]->data_wrapper.type != ColumnType::VARCHAR) {
-			host_data[col] = allocator.AllocateData(size_bytes);
+			// host_data[col] = allocator.AllocateData(size_bytes);
+			host_data[col] = gpuBufferManager->customCudaHostAlloc<uint8_t>(size_bytes);
 			callCudaMemcpyDeviceToHost<uint8_t>(host_data[col], materialized_relation.columns[col]->data_wrapper.data, size_bytes, 0);
 		} else {
 			DataWrapper materialized_col_data = materialized_relation.columns[col]->data_wrapper;
@@ -243,14 +245,16 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 			
 			// Copy over the pointers from the gpu to the cpu
 			size_t offset_bytes = (materialized_col_data.size + 1) * sizeof(uint64_t);
-			uint64_t* cpu_offsets = reinterpret_cast<uint64_t*>(allocator.AllocateData(offset_bytes));
+			// uint64_t* cpu_offsets = reinterpret_cast<uint64_t*>(allocator.AllocateData(offset_bytes));
+			uint64_t* cpu_offsets = reinterpret_cast<uint64_t*>(gpuBufferManager->customCudaHostAlloc<uint8_t>(offset_bytes));
 			callCudaMemcpyDeviceToHost<uint64_t>(cpu_offsets, materialized_col_data.offset, materialized_col_data.size + 1, 0);
 			// std::cout << "Got cpu offset of " << cpu_offsets[0] << "," << cpu_offsets[1] << std::endl;
 			materialized_col_data.offset = cpu_offsets;
 			
 			// Do the same for the chars
 			size_t data_bytes = materialized_col_data.num_bytes * sizeof(uint8_t);
-			uint8_t* cpu_chars = reinterpret_cast<uint8_t*>(allocator.AllocateData(data_bytes));
+			// uint8_t* cpu_chars = reinterpret_cast<uint8_t*>(allocator.AllocateData(data_bytes));
+			uint8_t* cpu_chars = gpuBufferManager->customCudaHostAlloc<uint8_t>(data_bytes);
 			callCudaMemcpyDeviceToHost<uint8_t>(cpu_chars, materialized_col_data.data, data_bytes, 0);
 			materialized_col_data.data = cpu_chars;
 

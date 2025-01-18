@@ -315,6 +315,8 @@ void probeHashTable(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uin
             offset_each_thread, (unsigned long long*) count, N, condition_mode_dev, num_keys, equal_keys, is_right);
     CHECK_ERROR();
     cudaDeviceSynchronize();
+    STOP_TIMER();
+    START_TIMER();
 
     uint64_t* h_count = new uint64_t[1];
     cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
@@ -322,10 +324,24 @@ void probeHashTable(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uin
     printf("Count: %lu\n", h_count[0]);
     row_ids_left = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
     row_ids_right = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
+    cudaMemset(count, 0, sizeof(uint64_t));
+
+    // size_t openmalloc_half = (gpuBufferManager->processing_size_per_gpu - gpuBufferManager->gpuProcessingPointer[0]) / sizeof(uint64_t) / 2;
+    // row_ids_left = gpuBufferManager->customCudaMalloc<uint64_t>(openmalloc_half, 0, 0);
+    // row_ids_right = gpuBufferManager->customCudaMalloc<uint64_t>(openmalloc_half - 128, 0, 0);
+    // cudaMemset(count, 0, sizeof(uint64_t));
     probe_multikey<BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(keys_dev, ht, ht_len, 
             offset_each_thread, row_ids_left, row_ids_right, N, condition_mode_dev, num_keys, equal_keys, is_right);
     CHECK_ERROR();
     cudaDeviceSynchronize();
+
+    // uint64_t* h_count = new uint64_t [1];
+    // cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+    // assert(h_count[0] > 0);
+    // printf("Count: %lu\n", h_count[0]);
+    // cudaMemmove(reinterpret_cast<uint8_t*>(row_ids_left + h_count[0]), reinterpret_cast<uint8_t*>(row_ids_right), h_count[0] * sizeof(uint64_t));
+    // row_ids_right = row_ids_left + h_count[0];
+    // gpuBufferManager->gpuProcessingPointer[0] = (reinterpret_cast<uint8_t*>(row_ids_right + h_count[0]) - gpuBufferManager->gpuProcessing[0]);
     count = h_count;
     STOP_TIMER();
 }
