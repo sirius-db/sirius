@@ -14,5 +14,6 @@ set(CUDA_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/nested_loop_join.cu
         ${CMAKE_CURRENT_SOURCE_DIR}/strings_matching.cu
         ${CMAKE_CURRENT_SOURCE_DIR}/substring.cu
+        ${CMAKE_CURRENT_SOURCE_DIR}/memmove.cu
         PARENT_SCOPE
 )

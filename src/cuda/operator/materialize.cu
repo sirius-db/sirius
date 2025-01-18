@@ -70,24 +70,45 @@ void materializeExpression(T *a, T* result, uint64_t *row_ids, uint64_t N) {
         printf("N is 0\n");
         return;
     }
-    SETUP_TIMING();
-    START_TIMER();
     printf("Launching Materialize Kernel\n");
+    printf("N: %lu\n", N);
+
+    GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+
     // SETUP_TIMING();
     // START_TIMER();
-    printf("N: %lu\n", N);
-    // testprintmat<T><<<1, 1>>>(a, N);
+
+    // CustomLess custom_less;
+    // void *d_temp_storage = nullptr;
+    // size_t temp_storage_bytes = 0;
+    // cub::DeviceMergeSort::SortKeys(
+    //     d_temp_storage,
+    //     temp_storage_bytes,
+    //     row_ids,
+    //     N,
+    //     custom_less);
+
     // CHECK_ERROR();
-    // testprintmat<uint64_t><<<1, 1>>>(row_ids, N);
+
+    // // Allocate temporary storage
+    // d_temp_storage = reinterpret_cast<void*> (gpuBufferManager->customCudaMalloc<uint8_t>(temp_storage_bytes, 0, 0));
+
+    // // Run sorting operation
+    // cub::DeviceMergeSort::SortKeys(
+    //     d_temp_storage,
+    //     temp_storage_bytes,
+    //     row_ids,
+    //     N,
+    //     custom_less);
     // CHECK_ERROR();
+
+    // STOP_TIMER();
+
+    SETUP_TIMING();
+    START_TIMER();
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
     materialize_expression<T, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(a, result, row_ids, N);
     CHECK_ERROR();
-    // thrust::device_vector<T> sorted(result, result + N);
-    // thrust::sort(thrust::device, sorted.begin(), sorted.end());
-    // T* raw_sorted = thrust::raw_pointer_cast(sorted.data());
-    // cudaMemcpy(result, raw_sorted, N * sizeof(T), cudaMemcpyDeviceToDevice);
-    // testprintmat<T><<<1, 1>>>(result, 100);
     cudaDeviceSynchronize();
     STOP_TIMER();
 }
@@ -101,8 +122,6 @@ void materializeString(uint8_t* data, uint64_t* offset, uint8_t* &result, uint64
     SETUP_TIMING();
     START_TIMER();
     printf("Launching Materialize String Kernel\n");
-    // SETUP_TIMING();
-    // START_TIMER();
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
     //allocate temp memory and copying keys
     uint64_t* temp_len = gpuBufferManager->customCudaMalloc<uint64_t>(N + 1, 0, 0);

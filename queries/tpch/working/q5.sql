@@ -19,7 +19,7 @@ where
   and o_orderdate >= 19940101
   and o_orderdate <= 19941231
 group by
-  n_name
+  n_name;
 
 
 select
@@ -43,4 +43,4 @@ where
   and o_orderdate >= 19940101
   and o_orderdate <= 19941231
 group by
-  n_name
+  n_name;
