@@ -138,3 +138,5 @@ __global__ void compact_valid_rows(bool* selection_flags, uint64_t* row_ids, uns
 }
 
 #define BYTES_IN_INTEGER 8
+#define HASH_POWER 31
+#define HASH_MOD_VALUE 1000000009

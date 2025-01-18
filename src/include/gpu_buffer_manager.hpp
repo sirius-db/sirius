@@ -24,6 +24,11 @@ struct pointer_and_key {
 	uint64_t num_key;
 };
 
+struct key_and_signature {
+	uint64_t row_id;
+	uint64_t signature;
+};
+
 // Currently a singleton class, would not work for multiple GPUs
 class GPUBufferManager {
 public:

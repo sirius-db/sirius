@@ -7,9 +7,6 @@
 
 namespace duckdb {
 
-#define HASH_POWER 31
-#define HASH_MOD_VALUE 1000000009
-
 using std::chrono::high_resolution_clock;
 using std::chrono::duration;
 

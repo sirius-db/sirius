@@ -168,8 +168,8 @@ ResolveTypeGroupByString(GPUColumn** &group_by_keys, GPUColumn** &aggregate_keys
 	}
 
 	// groupedStringAggregate<V>(group_by_data, aggregate_data, offset_data, num_bytes, count, size, num_group_keys, aggregates.size(), agg_mode);
-	groupedStringAggregateV2<V>(group_by_data, aggregate_data, offset_data, num_bytes, count, size, num_group_keys, aggregates.size(), agg_mode);
-	// groupedStringAggregateV3<V>(group_by_data, aggregate_data, offset_data, num_bytes, count, size, num_group_keys, aggregates.size(), agg_mode);
+	// groupedStringAggregateV2<V>(group_by_data, aggregate_data, offset_data, num_bytes, count, size, num_group_keys, aggregates.size(), agg_mode);
+	groupedStringAggregateV3<V>(group_by_data, aggregate_data, offset_data, num_bytes, count, size, num_group_keys, aggregates.size(), agg_mode);
 
 	// Reading groupby columns based on the grouping set
 	for (idx_t group = 0; group < num_group_keys; group++) {
