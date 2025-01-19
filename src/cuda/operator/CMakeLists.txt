@@ -7,6 +7,7 @@ set(CUDA_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/string_grouped_aggregate.cu
         ${CMAKE_CURRENT_SOURCE_DIR}/string_grouped_aggregate_v2.cu
         ${CMAKE_CURRENT_SOURCE_DIR}/string_grouped_aggregate_v3.cu
+        ${CMAKE_CURRENT_SOURCE_DIR}/string_grouped_aggregate_v4.cu
         ${CMAKE_CURRENT_SOURCE_DIR}/distinct_grouped_aggregate.cu
         ${CMAKE_CURRENT_SOURCE_DIR}/ungrouped_aggregate.cu
         ${CMAKE_CURRENT_SOURCE_DIR}/hash_join.cu

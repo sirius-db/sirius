@@ -28,6 +28,9 @@ GPUBufferManager::customCudaMalloc<char>(size_t size, int gpu, bool caching);
 template bool*
 GPUBufferManager::customCudaMalloc<bool>(size_t size, int gpu, bool caching);
 
+template uint64_t**
+GPUBufferManager::customCudaMalloc<uint64_t*>(size_t size, int gpu, bool caching);
+
 template pointer_and_key*
 GPUBufferManager::customCudaMalloc<pointer_and_key>(size_t size, int gpu, bool caching);
 
