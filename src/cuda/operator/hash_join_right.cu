@@ -87,7 +87,7 @@ __global__ void scan_right(unsigned long long* ht, unsigned long long* count, ui
     #pragma unroll
     for (int ITEM = 0; ITEM < I; ITEM++) {
         if (threadIdx.x + (ITEM * B) < num_tile_items) {
-            int slot = tile_offset + threadIdx.x + ITEM * B;  
+            uint64_t slot = tile_offset + threadIdx.x + ITEM * B;  
             if (join_mode == 0) { // semi join
                 if (ht[slot * (num_keys + 2) + num_keys + 1] != 0xFFFFFFFFFFFFFFFF) {
                     items_off[ITEM] = ht[slot * (num_keys + 2) + num_keys];
@@ -154,6 +154,8 @@ void scanHashTableRight(unsigned long long* ht, uint64_t ht_len, uint64_t* &row_
         return;
     }
     printf("Launching Scan Kernel\n");
+    SETUP_TIMING();
+    START_TIMER();
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
     cudaMemset(count, 0, sizeof(uint64_t));
 
@@ -181,6 +183,7 @@ void scanHashTableRight(unsigned long long* ht, uint64_t ht_len, uint64_t* &row_
 
     CHECK_ERROR();
     cudaDeviceSynchronize();
+    STOP_TIMER();
 }
 
 void probeHashTableRightSemiAnti(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t N, int* condition_mode, int num_keys) {
@@ -190,6 +193,8 @@ void probeHashTableRightSemiAnti(uint8_t **keys, unsigned long long* ht, uint64_
         return;
     }
     printf("Launching Probe Kernel\n");
+    SETUP_TIMING();
+    START_TIMER();
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 
     //reinterpret cast the keys to uint64_t
@@ -214,6 +219,9 @@ void probeHashTableRightSemiAnti(uint8_t **keys, unsigned long long* ht, uint64_
     probe_right_semi_anti<BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(keys_dev, ht, ht_len, N, condition_mode_dev, num_keys, equal_keys);
     CHECK_ERROR();
     cudaDeviceSynchronize();
+
+    printf("Finished probe right\n");
+    STOP_TIMER();
 }
 
 } // namespace duckdb

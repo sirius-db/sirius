@@ -55,7 +55,7 @@ public:
     size_t row_id_count;
     size_t column_length;
     // bool isNull;
-    bool isUnique;
+    bool is_unique;
     // bool isString{false};
 };
 

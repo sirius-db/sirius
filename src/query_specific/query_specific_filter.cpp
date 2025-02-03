@@ -240,7 +240,7 @@ GPUExpressionExecutor::HandlingSpecificFilter(GPUIntermediateRelation& input_rel
 
         if (count && comparison_idx) {
             if (count[0] == 0) throw NotImplementedException("No match found");
-            HandleMaterializeRowIDs(input_relation, output_relation, count[0], comparison_idx, gpuBufferManager);
+            HandleMaterializeRowIDs(input_relation, output_relation, count[0], comparison_idx, gpuBufferManager, true);
             // for (int i = 0; i < input_relation.columns.size(); i++) {
             //     output_relation.columns[i] = input_relation.columns[i];
             //     if (input_relation.columns[i]->row_ids == nullptr) {

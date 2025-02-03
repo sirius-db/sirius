@@ -37,8 +37,11 @@ GPUPhysicalFilter::GPUPhysicalFilter(vector<LogicalType> types, vector<unique_pt
 OperatorResultType 
 GPUPhysicalFilter::Execute(GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation) const {
 	printf("Executing expression %s\n", expression->ToString().c_str());
-
+	auto start = std::chrono::high_resolution_clock::now();
     gpu_expression_executor->FilterRecursiveExpression(input_relation, output_relation, *expression, 0);
+	auto end = std::chrono::high_resolution_clock::now();
+	auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+	printf("Filter time: %.2f ms\n", duration.count()/1000.0);
 	return OperatorResultType::FINISHED;
 }
 

@@ -1,6 +1,7 @@
 #include "gpu_buffer_manager.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/types.hpp"
+#include "duckdb/parser/constraints/unique_constraint.hpp"
 #include "utils.hpp"
 
 #define NUM_GPUS 1
@@ -62,6 +63,8 @@ GPUBufferManager::GPUBufferManager(size_t cache_size_per_gpu, size_t processing_
     for (int gpu = 0; gpu < NUM_GPUS; gpu++) {
         gpuCache[gpu] = callCudaMalloc<uint8_t>(cache_size_per_gpu, gpu);
         gpuProcessing[gpu] = callCudaMalloc<uint8_t>(processing_size_per_gpu, gpu);
+        // gpuCache[gpu] = callCudaHostAlloc<uint8_t>(cache_size_per_gpu, 1);
+        // gpuProcessing[gpu] = callCudaHostAlloc<uint8_t>(processing_size_per_gpu, 1);
         // if (reinterpret_cast<uintptr_t>(gpuCache[gpu]) % alignof(double) == 0) {
         //     printf("Memory is not properly aligned 1\n");
         // } else if (reinterpret_cast<uintptr_t>(gpuCache[gpu]) % alignof(int) == 0) {
@@ -433,9 +436,60 @@ void
 GPUBufferManager::createTableAndColumnInGPU(Catalog& catalog, ClientContext& context, string table_name, string column_name) {
 	TableCatalogEntry &table = catalog.GetEntry(context, CatalogType::TABLE_ENTRY, DEFAULT_SCHEMA, table_name).Cast<TableCatalogEntry>();
     auto column_names = table.GetColumns().GetColumnNames();
-    // for (int i = 0; i < column_names.size(); i++) {
-    //     printf("Column name: %s\n", column_names[i].c_str());
-    // }
+    auto& constraints = table.GetConstraints();
+    vector<size_t> unique_columns;
+
+	// for (auto &constraint : constraints) {
+	// 	if (constraint->type == ConstraintType::NOT_NULL) {
+	// 		auto &not_null = constraint->Cast<NotNullConstraint>();
+	// 		not_null_columns.insert(not_null.index);
+	// 	} else if (constraint->type == ConstraintType::UNIQUE) {
+	// 		auto &pk = constraint->Cast<UniqueConstraint>();
+	// 		if (pk.HasIndex()) {
+	// 			// no columns specified: single column constraint
+	// 			if (pk.IsPrimaryKey()) {
+	// 				pk_columns.insert(pk.GetIndex());
+	// 			} else {
+	// 				unique_columns.insert(pk.GetIndex());
+	// 			}
+	// 		} else {
+	// 			// multi-column constraint, this constraint needs to go at the end after all columns
+	// 			if (pk.IsPrimaryKey()) {
+	// 				// multi key pk column: insert set of columns into multi_key_pks
+	// 				for (auto &col : pk.GetColumnNames()) {
+	// 					multi_key_pks.insert(col);
+	// 				}
+	// 			}
+	// 			extra_constraints.push_back(constraint->ToString());
+	// 		}
+	// 	} else if (constraint->type == ConstraintType::FOREIGN_KEY) {
+	// 		auto &fk = constraint->Cast<ForeignKeyConstraint>();
+	// 		if (fk.info.type == ForeignKeyType::FK_TYPE_FOREIGN_KEY_TABLE ||
+	// 		    fk.info.type == ForeignKeyType::FK_TYPE_SELF_REFERENCE_TABLE) {
+	// 			extra_constraints.push_back(constraint->ToString());
+	// 		}
+	// 	} else {
+	// 		extra_constraints.push_back(constraint->ToString());
+	// 	}
+	// }
+    
+	for (auto &constraint : constraints) {
+		if (constraint->type == ConstraintType::UNIQUE) {
+			auto &pk = constraint->Cast<UniqueConstraint>();
+			if (pk.HasIndex()) {
+                printf("Unique constraint on index %d\n", pk.GetIndex().index);
+                for (auto &col : pk.GetColumnNames()) {
+                    printf("Unique constraint on column %s\n", col.c_str());
+                }
+                unique_columns.push_back(pk.GetIndex().index);
+			} else {
+                for (auto &col : pk.GetColumnNames()) {
+                    printf("Unique constraint on column %s\n", col.c_str());
+                }
+            }
+		}
+	}
+    
     //finding column_name in column_names
     if (find(column_names.begin(), column_names.end(), column_name) == column_names.end()) {
         // convert table_name to uppercase
@@ -448,7 +502,7 @@ GPUBufferManager::createTableAndColumnInGPU(Catalog& catalog, ClientContext& con
         // convert table_name to uppercase
         string up_column_name = column_name;
         transform(up_column_name.begin(), up_column_name.end(), up_column_name.begin(), ::toupper);
-        createColumn(up_table_name, up_column_name, column_type, column_id);
+        createColumn(up_table_name, up_column_name, column_type, column_id, unique_columns);
     } else {
         throw InvalidInputException("Column already exists");
     }
@@ -467,11 +521,18 @@ GPUBufferManager::createTable(string up_table_name, size_t column_count) {
 }
 
 void
-GPUBufferManager::createColumn(string up_table_name, string up_column_name, ColumnType column_type, size_t column_id) {
+GPUBufferManager::createColumn(string up_table_name, string up_column_name, ColumnType column_type, size_t column_id, vector<size_t> unique_columns) {
     GPUIntermediateRelation* table = tables[up_table_name];
     table->column_names[column_id] = up_column_name;
+    if (find(unique_columns.begin(), unique_columns.end(), column_id) != unique_columns.end()) {
+        table->columns[column_id] = new GPUColumn(up_column_name, 0, column_type, nullptr);
+        table->columns[column_id]->is_unique = true;
+    } else {
+        table->columns[column_id] = new GPUColumn(up_column_name, 0, column_type, nullptr);
+        table->columns[column_id]->is_unique = false;
+    }
     //we will update the length and data later
-    table->columns[column_id] = new GPUColumn(up_column_name, 0, column_type, nullptr);
+    // table->columns[column_id] = new GPUColumn(up_column_name, 0, column_type, nullptr);
     // for (int i = 0; i < table->columns.size(); i++) {
     //   if (table->columns[i] != nullptr) printf("create column size %d column name %s\n", table->columns[i]->column_length, table->columns[i]->name.c_str());
     // }

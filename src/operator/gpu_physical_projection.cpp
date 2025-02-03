@@ -23,11 +23,14 @@ GPUPhysicalProjection::GPUPhysicalProjection(vector<LogicalType> types, vector<u
 OperatorResultType
 GPUPhysicalProjection::Execute(GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation) const {
     printf("Executing projection\n");
-
+    auto start = std::chrono::high_resolution_clock::now();
     for (int idx = 0; idx < select_list.size(); idx++) {
         printf("Executing expression: %s\n", select_list[idx]->ToString().c_str());
         gpu_expression_executor->ProjectionRecursiveExpression(input_relation, output_relation, *select_list[idx], idx, 0);
     }
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    printf("Projection time: %.2f ms\n", duration.count()/1000.0);
     return OperatorResultType::FINISHED;
 }
 
