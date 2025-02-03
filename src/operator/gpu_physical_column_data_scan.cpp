@@ -37,6 +37,7 @@ GPUPhysicalColumnDataScan::GetData(GPUIntermediateRelation &output_relation) con
 	for (int col_idx = 0; col_idx < output_relation.columns.size(); col_idx++) {
 		// output_relation.columns[col_idx] = intermediate_relation->columns[col_idx];
 		output_relation.columns[col_idx] = new GPUColumn(intermediate_relation->columns[col_idx]->column_length, intermediate_relation->columns[col_idx]->data_wrapper.type, intermediate_relation->columns[col_idx]->data_wrapper.data);
+		output_relation.columns[col_idx]->is_unique = intermediate_relation->columns[col_idx]->is_unique;
 	}
 
 	return SourceResultType::FINISHED;

@@ -104,9 +104,11 @@ GPUPhysicalMaterializedCollector::FinalMaterializeInternal(GPUIntermediateRelati
 		output_relation.columns[col] = new GPUColumn(input_relation.columns[col]->row_id_count, input_relation.columns[col]->data_wrapper.type, reinterpret_cast<uint8_t*>(materialized));
 		output_relation.columns[col]->row_id_count = 0;
 		output_relation.columns[col]->row_ids = nullptr;
+		output_relation.columns[col]->is_unique = input_relation.columns[col]->is_unique;
 	} else {
 		// output_relation.columns[col] = input_relation.columns[col];
 		output_relation.columns[col] = new GPUColumn(input_relation.columns[col]->column_length, input_relation.columns[col]->data_wrapper.type, input_relation.columns[col]->data_wrapper.data);
+		output_relation.columns[col]->is_unique = input_relation.columns[col]->is_unique;
 	}
 }
 
@@ -128,8 +130,10 @@ GPUPhysicalMaterializedCollector::FinalMaterializeString(GPUIntermediateRelation
 		output_relation.columns[col] = new GPUColumn(num_rows, ColumnType::VARCHAR, reinterpret_cast<uint8_t*>(result), result_offset, new_num_bytes[0], true);
 		output_relation.columns[col]->row_id_count = 0;
 		output_relation.columns[col]->row_ids = nullptr;
+		output_relation.columns[col]->is_unique = input_relation.columns[col]->is_unique;
 	} else {
 		output_relation.columns[col] = new GPUColumn(*input_relation.columns[col]);
+		output_relation.columns[col]->is_unique = input_relation.columns[col]->is_unique;
 	}
 }
 
@@ -213,6 +217,9 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 	if (types.size() != input_relation.columns.size()) {
 		throw InvalidInputException("Column count mismatch");
 	}
+
+	//measure time
+	auto start = std::chrono::high_resolution_clock::now();
 	// auto &gstate = GetGlobalSinkState(input_relation.context);
 
 	size_t size_bytes = 0;
@@ -231,14 +238,14 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 			callCudaMemcpyDeviceToHost<uint8_t>(host_data[col], materialized_relation.columns[col]->data_wrapper.data, size_bytes, 0);
 		} else {
 			DataWrapper materialized_col_data = materialized_relation.columns[col]->data_wrapper;
-			std::cout << "Got materalized col data with " << materialized_col_data.size << " and " << materialized_col_data.num_bytes << " chars" << std::endl;
+			// std::cout << "Got materalized col data with " << materialized_col_data.size << " and " << materialized_col_data.num_bytes << " chars" << std::endl;
 			// printGPUColumn<uint64_t>(materialized_col_data.offset, 100, 0);
 			
 			// Copy over the pointers from the gpu to the cpu
 			size_t offset_bytes = (materialized_col_data.size + 1) * sizeof(uint64_t);
 			uint64_t* cpu_offsets = reinterpret_cast<uint64_t*>(allocator.AllocateData(offset_bytes));
 			callCudaMemcpyDeviceToHost<uint64_t>(cpu_offsets, materialized_col_data.offset, materialized_col_data.size + 1, 0);
-			std::cout << "Got cpu offset of " << cpu_offsets[0] << "," << cpu_offsets[1] << std::endl;
+			// std::cout << "Got cpu offset of " << cpu_offsets[0] << "," << cpu_offsets[1] << std::endl;
 			materialized_col_data.offset = cpu_offsets;
 			
 			// Do the same for the chars
@@ -249,8 +256,8 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 
 			// Copy over the data wrapper
 			materialized_relation.columns[col]->data_wrapper = materialized_col_data;
-			std::cout << "Copied over strings to the CPU with offset " << materialized_relation.columns[col]->data_wrapper.offset[0];
-			std::cout << " and chars " << materialized_relation.columns[col]->data_wrapper.data[0] << std::endl;
+			// std::cout << "Copied over strings to the CPU with offset " << materialized_relation.columns[col]->data_wrapper.offset[0];
+			// std::cout << " and chars " << materialized_relation.columns[col]->data_wrapper.data[0] << std::endl;
 
 			// Create a vector of all the strings
 			DataWrapper strings_data_wrapper = materialized_relation.columns[col]->data_wrapper;
@@ -292,6 +299,11 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 		collection->Append(append_state, chunk);
 		remaining -= STANDARD_VECTOR_SIZE;
 	}
+
+	//measure time
+	auto end = std::chrono::high_resolution_clock::now();
+	auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+	printf("Result collector time: %.2f ms\n", duration.count()/1000.0);
 	return SinkResultType::FINISHED;
 }
 

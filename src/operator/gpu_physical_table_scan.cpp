@@ -144,6 +144,7 @@ ResolveTypeMaterializeExpression(GPUColumn* column, GPUBufferManager* gpuBufferM
         size = column->column_length;
     }
     GPUColumn* result = new GPUColumn(size, column->data_wrapper.type, reinterpret_cast<uint8_t*>(a));
+    result->is_unique = column->is_unique;
     return result;
 }
 
@@ -168,6 +169,7 @@ GPUColumn* ResolveStringMateralizeExpression(GPUColumn* column, GPUBufferManager
     new_num_bytes[0] = column->data_wrapper.num_bytes;
   }
   GPUColumn* result_column = new GPUColumn(num_rows, ColumnType::VARCHAR, reinterpret_cast<uint8_t*>(result), result_offset, new_num_bytes[0], true);
+  result_column->is_unique = column->is_unique;
   return result_column;
 }
 
@@ -193,6 +195,7 @@ HandleMaterializeExpression(GPUColumn* column, GPUBufferManager* gpuBufferManage
 
 SourceResultType
 GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
+  auto start = std::chrono::high_resolution_clock::now();
   if (output_relation.columns.size() != GetTypes().size()) throw InvalidInputException("Mismatched column count");
 
   auto table_name = function.to_string(bind_data.get()); //we get it from ParamsToString();
@@ -314,24 +317,44 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
     }
     int index = 0;
     // projection id means that from this set of column ids that are being scanned, which index of column ids are getting projected out
-    for (auto projection_id : projection_ids) {
-        printf("Reading column index (late materialized) %ld and passing it to index in output relation %ld\n", column_ids[projection_id], projection_id);
-        printf("Writing row IDs to output relation in index %ld\n", index);
-        // output_relation.columns[index] = new GPUColumn(table->columns[column_ids[projection_id]]->column_length, table->columns[column_ids[projection_id]]->data_wrapper.type, table->columns[column_ids[projection_id]]->data_wrapper.data);
-        // output_relation.columns[index]->data_wrapper.offset = table->columns[column_ids[projection_id]]->data_wrapper.offset;
-        // output_relation.columns[index]->data_wrapper.num_bytes = table->columns[column_ids[projection_id]]->data_wrapper.num_bytes;
-        output_relation.columns[index] = new GPUColumn(table->columns[column_ids[projection_id]]->column_length, table->columns[column_ids[projection_id]]->data_wrapper.type, table->columns[column_ids[projection_id]]->data_wrapper.data,
-                        table->columns[column_ids[projection_id]]->data_wrapper.offset, table->columns[column_ids[projection_id]]->data_wrapper.num_bytes, table->columns[column_ids[projection_id]]->data_wrapper.is_string_data);
-        if (row_ids) {
-          output_relation.columns[index]->row_ids = prev_row_ids; 
-        }
-        if (count) {
-          output_relation.columns[index]->row_id_count = prev_row_ids_count;
-        }
-        index++;
+    if (function.filter_prune) {
+      for (auto projection_id : projection_ids) {
+          printf("Reading column index (late materialized) %ld and passing it to index in output relation %ld\n", column_ids[projection_id], index);
+          printf("Writing row IDs to output relation in index %ld\n", index);
+          output_relation.columns[index] = new GPUColumn(table->columns[column_ids[projection_id]]->column_length, table->columns[column_ids[projection_id]]->data_wrapper.type, table->columns[column_ids[projection_id]]->data_wrapper.data,
+                          table->columns[column_ids[projection_id]]->data_wrapper.offset, table->columns[column_ids[projection_id]]->data_wrapper.num_bytes, table->columns[column_ids[projection_id]]->data_wrapper.is_string_data);
+          output_relation.columns[index]->is_unique = table->columns[column_ids[projection_id]]->is_unique;
+          if (row_ids) {
+            output_relation.columns[index]->row_ids = prev_row_ids; 
+          }
+          if (count) {
+            output_relation.columns[index]->row_id_count = prev_row_ids_count;
+          }
+          index++;
+      }
+    } else {
+      //THIS IS FOR INDEX_SCAN
+      for (auto column_id : column_ids) {
+          printf("Reading column index (late materialized) %ld and passing it to index in output relation %ld\n", column_id, index);
+          printf("Writing row IDs to output relation in index %ld\n", index);
+          output_relation.columns[index] = new GPUColumn(table->columns[column_id]->column_length, table->columns[column_id]->data_wrapper.type, table->columns[column_id]->data_wrapper.data,
+                          table->columns[column_id]->data_wrapper.offset, table->columns[column_id]->data_wrapper.num_bytes, table->columns[column_id]->data_wrapper.is_string_data);
+          output_relation.columns[index]->is_unique = table->columns[column_id]->is_unique;
+          if (row_ids) {
+            output_relation.columns[index]->row_ids = prev_row_ids; 
+          }
+          if (count) {
+            output_relation.columns[index]->row_id_count = prev_row_ids_count;
+          }
+          index++;
+      }
     }
-    
-    return SourceResultType::FINISHED;
+  
+	//measure time
+	auto end = std::chrono::high_resolution_clock::now();
+	auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+	printf("Table Scan time: %.2f ms\n", duration.count()/1000.0);
+  return SourceResultType::FINISHED;
 }
 
 } // namespace duckdb

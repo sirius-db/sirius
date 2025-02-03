@@ -200,6 +200,7 @@ GPUExpressionExecutor::HandleComparisonExpression(GPUColumn* column1, GPUColumn*
 
 void 
 GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_relation, GPUIntermediateRelation& output_relation, Expression& expr, int depth) {
+    
     bool is_specific_filter = HandlingSpecificFilter(input_relation, output_relation, expr);
     if (is_specific_filter) return;
     
@@ -395,7 +396,7 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
 
     if (depth == 0) {
         printf("Writing filter result\n");
-        HandleMaterializeRowIDs(input_relation, output_relation, count[0], comparison_idx, gpuBufferManager);
+        HandleMaterializeRowIDs(input_relation, output_relation, count[0], comparison_idx, gpuBufferManager, true);
         // vector<uint64_t*> new_row_ids;
         // vector<uint64_t*> prev_row_ids;
         // for (int i = 0; i < input_relation.columns.size(); i++) {
@@ -426,6 +427,7 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
 
 void 
 GPUExpressionExecutor::ProjectionRecursiveExpression(GPUIntermediateRelation& input_relation, GPUIntermediateRelation& output_relation, Expression& expr, int output_idx, int depth) {
+    
     bool is_specific_projection = HandlingSpecificProjection(input_relation, output_relation, expr, output_idx);
     if (is_specific_projection) return;
 
@@ -534,6 +536,7 @@ GPUExpressionExecutor::ProjectionRecursiveExpression(GPUIntermediateRelation& in
             }
         }
     }
+
 }
 
 

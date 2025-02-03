@@ -1,5 +1,5 @@
 select
-  n_nationkey,
+  n_name,
   sum(l_extendedprice * (1 - l_discount)) as revenue
 from
   customer,
@@ -19,4 +19,4 @@ where
   and o_orderdate >= 19940101
   and o_orderdate <= 19941231
 group by
-  n_nationkey;
+  n_name

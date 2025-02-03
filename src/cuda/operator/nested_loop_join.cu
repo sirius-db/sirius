@@ -161,7 +161,6 @@ void nestedLoopJoin(T** left_data, T** right_data, uint64_t* &row_ids_left, uint
     cudaMemset(count, 0, sizeof(uint64_t));
     uint64_t* offset_each_thread = gpuBufferManager->customCudaMalloc<uint64_t>(((left_size + tile_items - 1)/tile_items) * BLOCK_THREADS, 0, 0);
     
-    testprintcolumn<<<1, 1>>>(reinterpret_cast<double*>(left_data[0]), left_size);
     //TODO: Currently only support a single key
     CHECK_ERROR();
     nested_loop_join_count<T, BLOCK_THREADS, 1><<<(left_size + tile_items - 1)/tile_items, BLOCK_THREADS>>>(left_data[0], right_data[0], 

@@ -11,6 +11,7 @@ namespace duckdb {
 
 // Declaration of the CUDA kernel
 template <typename T> T* callCudaMalloc(size_t size, int gpu);
+template <typename T> T* callCudaHostAlloc(size_t size, bool return_dev_ptr);
 template <typename T> void callCudaFree(T* ptr, int gpu);
 template <typename T> void callCudaMemcpyHostToDevice(T* dest, T* src, size_t size, int gpu);
 template <typename T> void callCudaMemcpyDeviceToHost(T* dest, T* src, size_t size, int gpu);
@@ -67,7 +68,7 @@ public:
 
 	void createTableAndColumnInGPU(Catalog& catalog, ClientContext& context, string table_name, string column_name);
 	void createTable(string table_name, size_t column_count);
-	void createColumn(string table_name, string column_name, ColumnType column_type, size_t column_id);
+	void createColumn(string table_name, string column_name, ColumnType column_type, size_t column_id, vector<size_t> unique_columns);
 
 private:
     // Private constructor
