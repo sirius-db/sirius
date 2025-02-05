@@ -23,8 +23,8 @@ from (
     and s_nationkey = n1.n_nationkey
     and c_nationkey = n2.n_nationkey
     and (
-      (n1.n_nationkey = 6 and n2.n_nationkey = 7)
-      or (n1.n_nationkey = 7 and n2.n_nationkey = 6)
+      (n1.n_name = 'FRANCE' and n2.n_name = 'GERMANY')
+      or (n1.n_name = 'FRANCE' and n2.n_name = 'GERMANY')
     )
     and l_shipdate between 19950101 and 19961231
   ) as shipping

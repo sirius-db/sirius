@@ -17,9 +17,6 @@ GPUPhysicalProjection::GPUPhysicalProjection(vector<LogicalType> types, vector<u
     gpu_expression_executor = new GPUExpressionExecutor();
 }
 
-// OperatorResultType
-// GPUPhysicalProjection::Execute(ExecutionContext &context, GPUIntermediateRelation &input_relation, 
-// 	GPUIntermediateRelation &output_relation, GlobalOperatorState &gstate, OperatorState &state) const {
 OperatorResultType
 GPUPhysicalProjection::Execute(GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation) const {
     printf("Executing projection\n");

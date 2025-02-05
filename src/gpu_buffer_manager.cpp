@@ -65,13 +65,6 @@ GPUBufferManager::GPUBufferManager(size_t cache_size_per_gpu, size_t processing_
         gpuProcessing[gpu] = callCudaMalloc<uint8_t>(processing_size_per_gpu, gpu);
         // gpuCache[gpu] = callCudaHostAlloc<uint8_t>(cache_size_per_gpu, 1);
         // gpuProcessing[gpu] = callCudaHostAlloc<uint8_t>(processing_size_per_gpu, 1);
-        // if (reinterpret_cast<uintptr_t>(gpuCache[gpu]) % alignof(double) == 0) {
-        //     printf("Memory is not properly aligned 1\n");
-        // } else if (reinterpret_cast<uintptr_t>(gpuCache[gpu]) % alignof(int) == 0) {
-        //     printf("Memory is not properly aligned 2\n");
-        // } else if (reinterpret_cast<uintptr_t>(gpuCache[gpu]) % alignof(char) == 0) {
-        //     printf("Memory is not properly aligned 3\n");
-        // }
         gpuProcessingPointer[gpu] = 0;
         gpuCachingPointer[gpu] = 0;
     }
@@ -208,14 +201,6 @@ DataWrapper GPUBufferManager::allocateStringChunk(DataChunk &input_chunk, size_t
     } else {
         result.data = prev_data.data;
     }
-
-    // for (uint64_t i = 0; i < result.size; i++) {
-    //     std::string output_str(result.data + result.offset[i], result.data + result.offset[i + 1]);
-    //     Value output_value(output_str);
-    //     // printf("result size %ld\n", result.size);
-    //     // printf("offset from %ld to %ld\n", result.offset[i], result.offset[i + 1]);
-    //     std::cout << "Recording value " << output_value.ToString() << " for idx " << i << std::endl;
-    // }
     
     result.is_string_data = true;
     return result;
@@ -309,9 +294,6 @@ GPUBufferManager::allocateColumnBufferInCPU(unique_ptr<MaterializedQueryResult> 
         }
 		input_chunk = input->Fetch();
 	}
-    // for (int i = 0; i < 1000000; i++) {
-    //     printf("Data: %d\n", reinterpret_cast<int*>(result_wrapper.data)[i]);
-    // }
     printf("Done allocating column buffer in CPU\n");
     return result_wrapper;
 }
@@ -328,13 +310,7 @@ DataWrapper GPUBufferManager::allocateStrColumnInGPU(DataWrapper cpu_data, int g
     result.size = cpu_data.size;
     result.offset = customCudaMalloc<uint64_t>((cpu_data.size + 1), 0, true);
     std::cout << "Copying offset with " << result.size << " strings" << std::endl;
-    // printf("%ld %ld\n",cpu_data.offset[0], cpu_data.offset[cpu_data.size]);
-    // for (int i = 0; i < cpu_data.size + 1; i++) {
-    //     printf("printing cpu_data offset[%d], %ld\n", i, cpu_data.offset[i]);
-    // }
     callCudaMemcpyHostToDevice<uint64_t>(result.offset, cpu_data.offset, (cpu_data.size + 1), 0);
-
-    // for (int i = 0; i < cpu_data.size; i++) {
     //     std::string output_str(cpu_data.data + cpu_data.offset[i], cpu_data.data + cpu_data.offset[i + 1]);
     //     Value output_value(output_str);
     //     std::cout << "Recording value " << output_value.ToString() << " for idx " << i << std::endl;
@@ -531,11 +507,6 @@ GPUBufferManager::createColumn(string up_table_name, string up_column_name, Colu
         table->columns[column_id] = new GPUColumn(up_column_name, 0, column_type, nullptr);
         table->columns[column_id]->is_unique = false;
     }
-    //we will update the length and data later
-    // table->columns[column_id] = new GPUColumn(up_column_name, 0, column_type, nullptr);
-    // for (int i = 0; i < table->columns.size(); i++) {
-    //   if (table->columns[i] != nullptr) printf("create column size %d column name %s\n", table->columns[i]->column_length, table->columns[i]->name.c_str());
-    // }
 }
 
 }; // namespace duckdb

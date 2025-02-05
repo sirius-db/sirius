@@ -392,27 +392,27 @@ __global__ void get_min_max(T *keys, T* res_max, T* res_min, uint64_t N) {
     }
 }
 
-__global__ void print_hash_table_group(unsigned long long* a, uint64_t N, uint64_t num_keys, uint64_t num_aggregates, bool need_count) {
-    if (blockIdx.x == 0 && threadIdx.x == 0) {
-        for (uint64_t i = 0; i < N; i++) {
-            // for (uint64_t j = 0; j < num_keys + num_aggregates + need_count; j++) {
-            //     printf("%llu ", a[i * (num_keys + num_aggregates + need_count) + j]);
-            // }
-            printf("%llu %.2f", a[i * 2], reinterpret_cast<double*>(a + (i * 2 + 1))[0]);
-            printf("\n");
-        }
-    }
-}
+// __global__ void print_hash_table_group(unsigned long long* a, uint64_t N, uint64_t num_keys, uint64_t num_aggregates, bool need_count) {
+//     if (blockIdx.x == 0 && threadIdx.x == 0) {
+//         for (uint64_t i = 0; i < N; i++) {
+//             // for (uint64_t j = 0; j < num_keys + num_aggregates + need_count; j++) {
+//             //     printf("%llu ", a[i * (num_keys + num_aggregates + need_count) + j]);
+//             // }
+//             printf("%llu %.2f", a[i * 2], reinterpret_cast<double*>(a + (i * 2 + 1))[0]);
+//             printf("\n");
+//         }
+//     }
+// }
 
-template <typename V>
-__global__ void print_column_agg(V* a, uint64_t N) {
-    if (blockIdx.x == 0 && threadIdx.x == 0) {
-        for (uint64_t i = 0; i < N; i++) {
-            printf("%.2f ", a[i]);
-        }
-        printf("\n");
-    }
-}
+// template <typename V>
+// __global__ void print_column_agg(V* a, uint64_t N) {
+//     if (blockIdx.x == 0 && threadIdx.x == 0) {
+//         for (uint64_t i = 0; i < N; i++) {
+//             printf("%.2f ", a[i]);
+//         }
+//         printf("\n");
+//     }
+// }
 
 template <typename T, typename V>
 void hashGroupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count, uint64_t N, uint64_t num_keys, uint64_t num_aggregates, int* agg_mode) {
@@ -479,7 +479,7 @@ void hashGroupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* co
     } else if constexpr (std::is_same<V, uint64_t>::value) {
         // Do something else if T is not int
         std::cout << "V is not double" << std::endl;
-        init_max = -INT64_MIN; init_min = INT64_MAX;
+        init_max = INT_MIN; init_min = INT64_MAX;
     } else {
         assert(0);
     }
@@ -513,12 +513,10 @@ void hashGroupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* co
         }
         set_group_ht<<<(ht_len + BLOCK_THREADS - 1)/BLOCK_THREADS, BLOCK_THREADS>>>(ht, aggregate_keys_dev, num_keys, num_aggregates, ht_len, 
             init_min, init_max, agg_mode_dev, need_count);
-        // print_hash_table_group<<<1, 1>>>(ht, ht_len, num_keys, num_aggregates, need_count);
         CHECK_ERROR();
         hash_groupby_gmem<T, V, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(keys_dev, aggregate_keys_dev, 
             ht, ht_len, N, num_keys, num_aggregates, agg_mode_dev, need_count);
         // CHECK_ERROR();
-        // print_hash_table_group<<<1, 1>>>(ht, ht_len/2, num_keys, num_aggregates, need_count);
         CHECK_ERROR();
     }
     

@@ -241,18 +241,6 @@ GPUExpressionExecutor::HandlingSpecificFilter(GPUIntermediateRelation& input_rel
         if (count && comparison_idx) {
             if (count[0] == 0) throw NotImplementedException("No match found");
             HandleMaterializeRowIDs(input_relation, output_relation, count[0], comparison_idx, gpuBufferManager, true);
-            // for (int i = 0; i < input_relation.columns.size(); i++) {
-            //     output_relation.columns[i] = input_relation.columns[i];
-            //     if (input_relation.columns[i]->row_ids == nullptr) {
-            //         output_relation.columns[i]->row_ids = comparison_idx;
-            //     } else {
-            //         uint64_t* row_ids_input = reinterpret_cast<uint64_t*> (input_relation.columns[i]->row_ids);
-            //         uint64_t* new_row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(count[0], 0, 0);
-            //         materializeExpression<uint64_t>(row_ids_input, new_row_ids, comparison_idx, count[0]);
-            //         output_relation.columns[i]->row_ids = new_row_ids;
-            //     }
-            //     output_relation.columns[i]->row_id_count = count[0];
-            // }
             return true;
         }
 

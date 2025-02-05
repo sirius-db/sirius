@@ -505,20 +505,6 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 			D_ASSERT(group->type == ExpressionType::BOUND_REF);
 			auto &bound_ref_expr = group->Cast<BoundReferenceExpression>();
 			printf("Reading groupby columns from index %d and passing it to index %d in groupby result\n", bound_ref_expr.index, bound_ref_expr.index);
-			// input_relation.checkLateMaterialization(bound_ref_expr.index);
-			// group_by_result->columns[idx] = input_relation.columns[bound_ref_expr.index];
-			// idx++;
-
-			// if (input_relation.checkLateMaterialization(bound_ref_expr.index)) {
-			// 	uint64_t* temp = reinterpret_cast<uint64_t*> (input_relation.columns[bound_ref_expr.index]->data_wrapper.data);
-			// 	uint64_t* row_ids_input = reinterpret_cast<uint64_t*> (input_relation.columns[bound_ref_expr.index]->row_ids);
-			// 	group_keys[idx] = gpuBufferManager->customCudaMalloc<uint64_t>(input_relation.columns[bound_ref_expr.index]->row_id_count, 0, 0);
-			// 	materializeExpression<uint64_t>(temp, group_keys[idx], row_ids_input, input_relation.columns[bound_ref_expr.index]->row_id_count);
-			// 	size = input_relation.columns[bound_ref_expr.index]->row_id_count;
-			// } else {
-			// 	group_keys[idx] = reinterpret_cast<uint64_t*> (input_relation.columns[bound_ref_expr.index]->data_wrapper.data);
-			// 	size = input_relation.columns[bound_ref_expr.index]->column_length;
-			// }
 			group_by_column[idx] = HandleMaterializeExpression(input_relation.columns[bound_ref_expr.index], bound_ref_expr, gpuBufferManager);
 			idx++;
 		}
@@ -621,8 +607,6 @@ GPUPhysicalGroupedAggregate::GetData(GPUIntermediateRelation &output_relation) c
   	return SourceResultType::FINISHED;
 }
 
-// void 
-// GPUPhysicalGroupedAggregate::SinkDistinct(ExecutionContext &context, GPUIntermediateRelation& input_relation, OperatorSinkInput &input) const {
 void
 GPUPhysicalGroupedAggregate::SinkDistinct(GPUIntermediateRelation& input_relation) const {
 	// throw NotImplementedException("Distinct not supported yet");
@@ -632,9 +616,6 @@ GPUPhysicalGroupedAggregate::SinkDistinct(GPUIntermediateRelation& input_relatio
 	}
 }
 
-// void
-// GPUPhysicalGroupedAggregate:: SinkDistinctGrouping(ExecutionContext &context, GPUIntermediateRelation &input_relation, OperatorSinkInput &input,
-	                        //   idx_t grouping_idx) const {
 void
 GPUPhysicalGroupedAggregate::SinkDistinctGrouping(GPUIntermediateRelation& input_relation, idx_t grouping_idx) const {
 	auto &distinct_info = *distinct_collection_info;

@@ -16,9 +16,6 @@ GPUPhysicalColumnDataScan::GPUPhysicalColumnDataScan(vector<LogicalType> types, 
     : GPUPhysicalOperator(op_type, std::move(types), estimated_cardinality), collection(nullptr), cte_index(cte_index) {
 }
 
-// SourceResultType 
-// GPUPhysicalColumnDataScan::GetData(ExecutionContext &context, GPUIntermediateRelation &output_relation,
-//                                                  OperatorSourceInput &input) const {
 SourceResultType 
 GPUPhysicalColumnDataScan::GetData(GPUIntermediateRelation &output_relation) const {
 	// auto &state = input.global_state.Cast<PhysicalColumnDataScanState>();

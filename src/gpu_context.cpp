@@ -96,14 +96,6 @@ GPUContext::GPUPendingStatementInternal(ClientContext &context, shared_ptr<GPUPr
 	// auto stream_result = parameters.allow_stream_result && statement.properties.allow_stream_result;
 	bool stream_result = false;
 
-	// get_result_collector_t get_method = PhysicalResultCollector::GetResultCollector;
-	// auto &client_config = ClientConfig::GetConfig(context);
-	// if (!stream_result && client_config.result_collector) {
-	// 	get_method = client_config.result_collector;
-	// }
-	// statement.is_streaming = stream_result;
-	// unique_ptr<PhysicalResultCollector> collector = get_method(context, statement);
-
 	unique_ptr<GPUPhysicalResultCollector> gpu_collector = make_uniq_base<GPUPhysicalResultCollector, GPUPhysicalMaterializedCollector>(*statement_p);
 	if (gpu_collector->type != PhysicalOperatorType::RESULT_COLLECTOR) {
 		throw InvalidInputException("Error in GPUPendingStatementInternal");

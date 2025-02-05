@@ -130,13 +130,6 @@ __global__ void scan_right(unsigned long long* ht, unsigned long long* count, ui
 
 }
 
-__global__ void testprint(uint64_t* a, uint64_t N) {
-    for (int i = N-1000; i < N; i++) {
-        printf("%lu ", a[i]);
-    }
-    printf("\n");
-}
-
 template
 __global__ void scan_right<BLOCK_THREADS, ITEMS_PER_THREAD>(unsigned long long* ht, unsigned long long* count, uint64_t ht_len, 
                 uint64_t *row_ids, uint64_t num_keys, int join_mode, int is_count);

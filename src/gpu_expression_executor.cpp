@@ -397,30 +397,6 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
     if (depth == 0) {
         printf("Writing filter result\n");
         HandleMaterializeRowIDs(input_relation, output_relation, count[0], comparison_idx, gpuBufferManager, true);
-        // vector<uint64_t*> new_row_ids;
-        // vector<uint64_t*> prev_row_ids;
-        // for (int i = 0; i < input_relation.columns.size(); i++) {
-        //     output_relation.columns[i] = input_relation.columns[i];
-        //     if (comparison_idx) {
-        //         if (input_relation.columns[i]->row_ids == nullptr) {
-        //             output_relation.columns[i]->row_ids = comparison_idx;
-        //         } else {
-        //             auto it = find(prev_row_ids.begin(), prev_row_ids.end(), input_relation.columns[i]->row_ids);
-        //             if (it == prev_row_ids.end()) {
-        //               auto idx = it - prev_row_ids.begin();
-        //               output_relation.columns[i]->row_ids = new_row_ids[idx];
-        //             } else {
-        //               uint64_t* temp_prev_row_ids = reinterpret_cast<uint64_t*> (input_relation.columns[i]->row_ids);
-        //               uint64_t* temp_new_row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(count[0], 0, 0);
-        //               materializeExpression<uint64_t>(temp_prev_row_ids, temp_new_row_ids, comparison_idx, count[0]);
-        //               output_relation.columns[i]->row_ids = temp_new_row_ids;
-        //               new_row_ids.push_back(temp_new_row_ids);
-        //               prev_row_ids.push_back(temp_prev_row_ids);
-        //             }
-        //         }
-        //     }
-        //     if (count) output_relation.columns[i]->row_id_count = count[0];
-        // }
     }
 }
 
@@ -520,17 +496,11 @@ GPUExpressionExecutor::ProjectionRecursiveExpression(GPUIntermediateRelation& in
     if (depth == 0) {
         if (expr.expression_class == ExpressionClass::BOUND_REF) {
             output_relation.columns[output_idx] = input_relation.columns[expr.Cast<BoundReferenceExpression>().index];
-            // printf("size = %ld\n", output_relation.columns[output_idx]->column_length);
-            // printf("row ids count = %ld\n", output_relation.columns[output_idx]->row_id_count);
         } else {
-            // uint8_t* fake_data = new uint8_t[1];
             if (result) {
                 output_relation.columns[output_idx] = result;
-                // output_relation.length = result->column_length;
                 output_relation.columns[output_idx]->row_ids = nullptr;
                 output_relation.columns[output_idx]->row_id_count = 0;
-                // uint8_t* host_data = new uint8_t[output_relation.length * 8];
-                // callCudaMemcpyDeviceToHost<uint8_t>(host_data, output_relation.columns[output_idx]->data_wrapper.data, output_relation.length * 8, 0);
             } else {
                 output_relation.columns[output_idx] = new GPUColumn(0, ColumnType::INT32, nullptr);
             }
