@@ -7,12 +7,6 @@
 
 namespace duckdb {
 
-// string t = "((P_BRAND != 45) AND ((P_TYPE < 65) OR (P_TYPE >= 70)) AND (P_SIZE IN (49, 14, 23, 45, 19, 3, 36, 9)))";
-// string t = "((L_COMMITDATE < L_RECEIPTDATE) AND (L_SHIPDATE < L_COMMITDATE) AND (L_SHIPMODE IN (4, 6)))";
-// string t = "(((P_BRAND = 12) AND (L_QUANTITY <= 11) AND (P_SIZE <= 5) AND (P_CONTAINER IN (0, 1, 4, 5))) OR ((P_BRAND = 23) AND (L_QUANTITY >= 10) AND (L_QUANTITY <= 20) AND (P_SIZE <= 10) AND (P_CONTAINER IN (17, 18, 20, 21))) OR ((P_BRAND = 34) AND (L_QUANTITY >= 20) AND (L_QUANTITY <= 30) AND (P_SIZE <= 15) AND (P_CONTAINER IN (8, 9, 12, 13))))";
-// string t = "(((N_NATIONKEY = 6) AND (N_NATIONKEY = 7)) OR ((N_NATIONKEY = 7) AND (N_NATIONKEY = 6)))";
-// string t = "(((P_TYPE + 3) % 5) = 0)";
-
 template <typename T, int B, int I>
 __global__ void comparison_expression(const T *a, const T *b, uint64_t *row_ids, unsigned long long* count, uint64_t N, int compare_mode, int is_count) {
 
@@ -180,16 +174,6 @@ __global__ void comparison_constant_expression(const T *a, const T b, const T c,
                 row_ids[offset] = tile_offset + threadIdx.x + ITEM * B;
             }
         }
-    }
-}
-
-template<typename T>
-__global__ void test(T* a, uint64_t N) {
-    if (blockIdx.x == 0 && threadIdx.x == 0) {
-        for (uint64_t i = 0; i < 100; i++) {
-            printf("%.2f ", a[i]);
-        }
-        printf("\n");
     }
 }
 

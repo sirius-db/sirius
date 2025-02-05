@@ -67,16 +67,6 @@ __global__ void binary_constant_expression(T *a, T b, T *result, uint64_t N, int
     }
 }
 
-template <typename T>
-__global__ void test(T* a, uint64_t N) {
-    if (blockIdx.x == 0 && threadIdx.x == 0) {
-        for (uint64_t i = 0; i < 100; i++) {
-            printf("%.2f ", a[i]);
-        }
-        printf("\n");
-    }
-}
-
 template
 __global__ void binary_expression<int, BLOCK_THREADS, ITEMS_PER_THREAD>(int *a, int *b, int *result, uint64_t N, int op_mode);
 template
@@ -98,17 +88,6 @@ template
 __global__ void binary_constant_expression<double, BLOCK_THREADS, ITEMS_PER_THREAD>(double *a, double b, double *result, uint64_t N, int op_mode);
 template
 __global__ void binary_constant_expression<uint8_t, BLOCK_THREADS, ITEMS_PER_THREAD>(uint8_t *a, uint8_t b, uint8_t *result, uint64_t N, int op_mode);
-
-template
-__global__ void test<uint64_t>(uint64_t* a, uint64_t N);
-template
-__global__ void test<double>(double* a, uint64_t N);
-template
-__global__ void test<int>(int* a, uint64_t N);
-template
-__global__ void test<float>(float* a, uint64_t N);
-template
-__global__ void test<uint8_t>(uint8_t* a, uint64_t N);
 
 // Define the host function that launches the CUDA kernel
 template <typename T>

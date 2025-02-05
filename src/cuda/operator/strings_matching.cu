@@ -97,34 +97,6 @@ __global__ void write_matching_rows(bool* results, uint64_t num_strings, uint64_
   }
 }
 
-__global__ void print_matching_rows(uint64_t* indices, uint64_t total_strings, uint64_t strings_to_print, bool is_ascending) {
-  // Get the ptr and the length of the current string
-  printf("STRING MATCHING ROWS: ");
-  for(int i = 0; i < strings_to_print; i++) {
-    uint64_t curr_idx = is_ascending ? i : (total_strings - 1 - i);
-    printf("%d ", (int) (indices[curr_idx] + 1));
-  }
-  printf("\n");
-}
-
-__global__ void testprintidx(uint64_t* a, uint64_t N) {
-  if (blockIdx.x == 0 && threadIdx.x == 0) {
-    for (uint64_t i = 0; i < N; i++) {
-      printf("%ld ", a[i]);
-    }
-    printf("\n");
-  }
-}
-
-__global__ void testprintanswer(bool* a, uint64_t N) {
-  if (blockIdx.x == 0 && threadIdx.x == 0) {
-    for (uint64_t i = 0; i < N; i++) {
-      printf("%d ", a[i]);
-    }
-    printf("\n");
-  }
-}
-
 void StringMatching(char* char_data, uint64_t* str_indices, std::string match_string, uint64_t* &row_id, uint64_t* &count, uint64_t num_chars, uint64_t num_strings, int not_equal) {
   CHECK_ERROR();
   GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
