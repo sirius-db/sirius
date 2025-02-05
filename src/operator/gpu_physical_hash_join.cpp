@@ -183,10 +183,6 @@ GPUPhysicalHashJoin::GPUPhysicalHashJoin(LogicalOperator &op, unique_ptr<GPUPhys
                                    unique_ptr<GPUPhysicalOperator> right, vector<JoinCondition> cond, JoinType join_type,
                                    const vector<idx_t> &left_projection_map, const vector<idx_t> &right_projection_map,
                                    vector<LogicalType> delim_types, idx_t estimated_cardinality)
-    // : PhysicalComparisonJoin(op, PhysicalOperatorType::HASH_JOIN, std::move(cond), join_type, estimated_cardinality),
-    //   delim_types(std::move(delim_types)), perfect_join_statistics(std::move(perfect_join_stats))
-	// : PhysicalJoin(op, type, join_type, estimated_cardinality)
-	// : CachingPhysicalOperator(type, op.types, estimated_cardinality), join_type(join_type)
     : GPUPhysicalOperator(PhysicalOperatorType::HASH_JOIN, op.types, estimated_cardinality), join_type(join_type) {
 
 	conditions.resize(cond.size());
@@ -288,8 +284,6 @@ GPUPhysicalHashJoin::GetData(GPUIntermediateRelation &output_relation) const {
 		const auto rhs_col = rhs_output_columns[i];
 		// const auto rhs_col = payload_column_idxs[i];
 		printf("Writing hash_table column %ld to column %ld\n", rhs_col, i);
-	// 	// output_relation.columns[left_column_count + i] = hash_table_result->columns[rhs_cols];
-	// 	output_relation.columns[left_column_count + rhs_col] = HandleMaterializeRowIDs(hash_table_result->columns[i], count[0], row_ids, gpuBufferManager);
 	}
 	//TODO: Check if we need to maintain unique for the RHS columns
 	if (unique_probe_keys) {
@@ -297,8 +291,6 @@ GPUPhysicalHashJoin::GetData(GPUIntermediateRelation &output_relation) const {
 	} else {
 		HandleMaterializeRowIDsRHS(*hash_table_result, output_relation, rhs_output_columns, left_column_count, count[0], row_ids, gpuBufferManager, false);
 	}
-	// double* ptr = reinterpret_cast<double*>(output_relation.columns[left_column_count + 1]->data_wrapper.data);
-	// printGPUColumn<double>(ptr, 100, 0);
 
 	auto end = std::chrono::high_resolution_clock::now();
 	auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
@@ -307,10 +299,6 @@ GPUPhysicalHashJoin::GetData(GPUIntermediateRelation &output_relation) const {
 	return SourceResultType::FINISHED;
 }
 
-//probing hash table
-// OperatorResultType
-// GPUPhysicalHashJoin::Execute(ExecutionContext &context, GPUIntermediateRelation &input_relation, 
-// 	GPUIntermediateRelation &output_relation, GlobalOperatorState &gstate, OperatorState &state) const {
 OperatorResultType
 GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation) const {
 
@@ -423,14 +411,6 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 	//materialize columns from the right tables
 	if (join_type == JoinType::INNER || join_type == JoinType::OUTER || join_type == JoinType::LEFT || join_type == JoinType::RIGHT) {
 		printf("Writing row IDs from RHS to output relation\n");
-		// on the RHS, we need to fetch the data from the hash table
-		// for (idx_t i = 0; i < rhs_output_columns.size(); i++) {
-		// 	const auto output_col_idx = rhs_output_columns[i];
-		// 	printf("Passing column idx %ld from RHS (late materialized) to idx %ld in output relation\n", output_col_idx, input_relation.column_count + output_col_idx);
-		// 	//TODO: DOUBLE CHECK IF IT SHOULD BE hash_table_result->columns[i] or hash_table_result->columns[output_col_idx]
-		// 	// output_relation.columns[input_relation.column_count + output_col_idx] = HandleMaterializeRowIDs(hash_table_result->columns[output_col_idx], count[0], row_ids_right, gpuBufferManager);
-		// 	output_relation.columns[input_relation.column_count + i] = HandleMaterializeRowIDs(hash_table_result->columns[output_col_idx], count[0], row_ids_right, gpuBufferManager);
-		// }
 		if (unique_probe_keys) {
 			HandleMaterializeRowIDsRHS(*hash_table_result, output_relation, rhs_output_columns, input_relation.column_count, count[0], row_ids_right, gpuBufferManager, true);
 		} else {

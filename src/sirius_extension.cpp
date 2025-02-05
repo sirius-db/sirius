@@ -25,14 +25,11 @@
 #include "gpu_context.hpp"
 #include "gpu_physical_plan_generator.hpp"
 #include "gpu_buffer_manager.hpp"
-// OpenSSL linked through vcpkg
-// #include <openssl/opensslv.h>
 
 namespace duckdb {
 
 struct GPUTableFunctionData : public TableFunctionData {
 	GPUTableFunctionData() = default;
-	// unique_ptr<LogicalOperator> logical_plan;
 	shared_ptr<Relation> plan;
 	shared_ptr<GPUPreparedStatementData> gpu_prepared;
 	unique_ptr<QueryResult> res;
@@ -144,16 +141,12 @@ void SiriusExtension::GPUCachingFunction(ClientContext &context, TableFunctionIn
 	//check if column exist in the catalog
 	//check if column already exist in the gpu buffer
 	auto &catalog_table = Catalog::GetCatalog(context, INVALID_CATALOG);
-	// printf("creating table and column in GPU\n");
 	data.gpuBufferManager->createTableAndColumnInGPU(catalog_table, context, data.table, data.column);
 
-	// printf("allocating column buffer in CPU\n");
 	DataWrapper buffered_data = data.gpuBufferManager->allocateColumnBufferInCPU(move(cpu_res));
 	// update the catalog in GPU buffer manager (adding tables/columns)
 
-	// printf("caching data in GPU\n");
 	data.gpuBufferManager->cacheDataInGPU(buffered_data, data.table, data.column, 0);  // Send data to GPU
-	// data.gpuBufferManager->Print();
 
 	output.SetCardinality(1);
 	output.SetValue(0, 0, "Successful");
@@ -188,7 +181,6 @@ SiriusExtension::GPUProcessingBind(ClientContext &context, TableFunctionBindInpu
 	prepared->types = planner.types;
 	prepared->value_map = std::move(planner.value_map);
 	prepared->plan = make_uniq<PhysicalOperator>(PhysicalOperatorType::DUMMY_SCAN, vector<LogicalType>{LogicalType::BOOLEAN}, 0);
-	// prepared->catalog_version = MetaTransaction::Get(context).catalog_version;
 
 	//generate physical plan from the logical plan
 	unique_ptr<LogicalOperator> query_plan = SiriusInitPlanExtractor(context, *result, *result->conn);
@@ -215,16 +207,8 @@ void SiriusExtension::GPUProcessingFunction(ClientContext &context, TableFunctio
 	}
 
 	if (!data.res) {
-		// data.res = data.plan->Execute();
-		// std::cout << "Calling CUDA kernel from C++..." << std::endl;
-		// myKernel();  // Call the CUDA kernel defined in sirius_extension_cuda.cu
-		// int size = 10;
-		// int* temp = new int[size];
-		// int* ptr = sendDataToGPU(temp, size);  // Send data to GPU
-		// std::cout << "CUDA kernel call finished." << std::endl;
 		auto start = std::chrono::high_resolution_clock::now();
 		data.res = data.gpu_context->GPUExecuteQuery(context, data.query, data.gpu_prepared, {});
-		// data.res = data.conn->Query(data.query);
 		auto end = std::chrono::high_resolution_clock::now();
 		auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
 		printf("GPU Execute query time: %.2f ms\n", duration.count()/1000.0);
@@ -320,11 +304,6 @@ void SiriusExtension::InitializeGPUExtension(Connection &con) {
 	// for (auto &column_name : table.GetColumns().GetColumnNames()) {
 	// 	printf("column name %s\n", column_name.c_str());
 	// }
-
-	// size_t cache_size_per_gpu = 8UL * 1024 * 1024 * 1024;
-	// size_t processing_size_per_gpu = 4UL * 1024 * 1024 * 1024;
-	// size_t processing_size_per_cpu = 4UL * 1024 * 1024 * 1024;
-	// gpuBufferManager = new GPUBufferManager(cache_size_per_gpu, processing_size_per_gpu, processing_size_per_cpu);
 
 	TableFunction gpu_caching("gpu_caching", {LogicalType::VARCHAR}, GPUCachingFunction, GPUCachingBind);
 	CreateTableFunctionInfo gpu_caching_info(gpu_caching);

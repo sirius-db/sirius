@@ -10,9 +10,6 @@ GPUPhysicalOrder::GPUPhysicalOrder(vector<LogicalType> types, vector<BoundOrderB
 
     sort_result = new GPUIntermediateRelation(projections.size());
 }
-
-// SourceResultType
-// GPUPhysicalOrder::GetData(ExecutionContext &context, GPUIntermediateRelation &output_relation, OperatorSourceInput &input) const {
   
 SourceResultType
 GPUPhysicalOrder::GetData(GPUIntermediateRelation &output_relation) const {
@@ -24,15 +21,10 @@ GPUPhysicalOrder::GetData(GPUIntermediateRelation &output_relation) const {
   return SourceResultType::FINISHED;
 }
 
-// SinkResultType 
-// GPUPhysicalOrder::Sink(ExecutionContext &context, GPUIntermediateRelation &input_relation, OperatorSinkInput &input) const {
-
 SinkResultType 
 GPUPhysicalOrder::Sink(GPUIntermediateRelation &input_relation) const {
   printf("Currently order by is not doing anything since it's always after group by\n");
   for (auto &order : orders) {
-    // key_types.push_back(order.expression->return_type);
-    // key_executor.AddExpression(*order.expression);
     auto& expr = *order.expression;
     expr.Print();
     if (expr.expression_class != ExpressionClass::BOUND_REF) {

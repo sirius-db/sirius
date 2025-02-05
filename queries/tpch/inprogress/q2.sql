@@ -34,7 +34,7 @@ where
       and s_suppkey = ps_suppkey
       and s_nationkey = n_nationkey
       and n_regionkey = r_regionkey
-      and r_regionkey = 3
+      and r_name = 'EUROPE'
     )
 order by
   s_acctbal desc,

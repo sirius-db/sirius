@@ -137,13 +137,6 @@ template
 __global__ void nested_loop_join<uint64_t, BLOCK_THREADS, 1>(uint64_t *left_keys, uint64_t* right_keys, uint64_t *offset_each_thread, uint64_t *row_ids_left, uint64_t *row_ids_right,
             uint64_t left_size, uint64_t right_size, int condition_mode);
 
-__global__ void testprintcolumn(double* column, uint64_t size) {
-    for (int i = 0; i < 100; i++) {
-        printf("%.2f ", column[i]);
-    }
-    printf("\n");
-}
-
 template <typename T>
 void nestedLoopJoin(T** left_data, T** right_data, uint64_t* &row_ids_left, uint64_t* &row_ids_right, uint64_t* &count, uint64_t left_size, uint64_t right_size, int* condition_mode, int num_keys) {
     CHECK_ERROR();
