@@ -4,7 +4,7 @@ This repository contains Sirius, a GPU-accelerated DuckDB extension
 ## Getting started
 Install duckdb dependencies
 ```
-$ sudo apt-get update && sudo apt-get install -y git g++ cmake ninja-build libssl-dev
+sudo apt-get update && sudo apt-get install -y git g++ cmake ninja-build libssl-dev
 ```
 
 If CUDA is not installed in your machine, install cuda from https://developer.nvidia.com/cuda-downloads. Note: Use the deb(local) installer.
@@ -12,27 +12,27 @@ After that, perform the post-installation from https://docs.nvidia.com/cuda/cuda
 
 Check if CUDA is available by running
 ```
-$ nvcc --version
-$ nvidia-smi
+nvcc --version
+nvidia-smi
 ```
 
 Clone the Sirius repository using 
 ```
-$ git clone --recurse-submodules https://github.com/bwyogatama/sirius.git
+git clone --recurse-submodules https://github.com/bwyogatama/sirius.git
 ```
 Note that `--recurse-submodules` will ensure DuckDB is pulled which is required to build the extension.
 
 ## Building
 ```
-$ cd duckdb
-$ git reset --hard 1f98600c2cf8722a6d2f2d805bb4af5e701319fc #go to the commit hash of duckdb v1.0.0
-$ mkdir -p extension_external
-$ cd extension_external
-$ git clone https://github.com/duckdb/substrait.git
-$ cd substrait 
-$ git reset --hard b6f56643cb11d52de0e32c24a01dfd5947df62be #go to the right commit hash for duckdb substrait extension
-$ cd {SIRIUS_HOME_PATH}
-$ make -j 8 #build extension
+cd duckdb
+git reset --hard 1f98600c2cf8722a6d2f2d805bb4af5e701319fc #go to the commit hash of duckdb v1.0.0
+mkdir -p extension_external
+cd extension_external
+git clone https://github.com/duckdb/substrait.git
+cd substrait 
+git reset --hard b6f56643cb11d52de0e32c24a01dfd5947df62be #go to the right commit hash for duckdb substrait extension
+cd {SIRIUS_HOME_PATH}
+make -j 8 #build extension
 ```
 Currently, we are using duckdb v1.0.0. Since we develop it as an extension and no modification is made to the duckdb source code, it should not be too difficult to bump it to the latest duckdb and substrait version.
 
@@ -70,6 +70,9 @@ group by
 ## Generating TPC-H dataset
 Unzip `dbgen.zip` and run `./dbgen -s {SF}`.
 To load the dataset to duckdb, use the SQL command in `{SIRIUS_HOME_PATH}\tpch_load_duckdb_simple.sql`.
+
+## Changing the caching and processing region (optional)
+The GPU caching region is a memory region where the raw data is stored in GPUs. The GPUs/CPUs processing region is a memory region where intermediate results are stored in GPUs/CPUs (hash tables, .etc). The default region sizes are 10GB, 11GB, and 16GB for the GPU caching size, the GPU processing size, and the CPU processing size, respectively. The users can also modify these parameters by setting it in [SiriusExtension::GPUCachingBind](https://github.com/sirius-db/sirius/blob/058ee7291c5321727f566a2a72dda267c294f624/src/sirius_extension.cpp#L89).
 
 ## Running the queries
 The TPC-H queries is in the `queries` folder. 
