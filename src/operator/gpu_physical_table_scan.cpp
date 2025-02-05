@@ -61,6 +61,9 @@ void HandleComparisonConstantExpression(GPUColumn* column, uint64_t* &count, uin
       case ColumnType::FLOAT64:
         ResolveTypeComparisonConstantExpression<double>(column, count, row_ids, filter_constant, expression_type);
         break;
+      // case ColumnType::VARCHAR:
+      //   ResolveStringConstantExpression(column, count, row_ids, filter_constant, expression_type);
+      //   break;
       default:
         throw NotImplementedException("Unsupported column type");
     }

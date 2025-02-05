@@ -225,16 +225,6 @@ __global__ void fill_n(T* a, T b, uint64_t N) {
     }
 }
 
-template <typename T>
-__global__ void testprint(T* a, uint64_t N) {
-    if (blockIdx.x == 0 && threadIdx.x == 0) {
-        for (uint64_t i = 0; i < 100; i++) {
-            printf("%.2f ", a[i]);
-        }
-        printf("\n");
-    }
-}
-
 template
 __global__ void gather_and_modify<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD>(const uint64_t *a, uint64_t* result, sort_keys_type* sort_keys, uint64_t N, uint64_t num_keys);
 template

@@ -198,26 +198,6 @@ __global__ void build_multikey(uint64_t **keys, unsigned long long* ht, uint64_t
     }
 }
 
-__global__ void print_hash_table(unsigned long long* a, uint64_t N) {
-    if (blockIdx.x == 0 && threadIdx.x == 0) {
-        for (uint64_t i = 0; i < N; i++) {
-            printf("%llu ", a[i]);
-        }
-        printf("\n");
-    }
-}
-
-__global__ void print_key(uint64_t* a, uint64_t N) {
-    if (blockIdx.x == 0 && threadIdx.x == 0) {
-        int x = N;
-        if (N > 100) x = 100;
-        for (uint64_t i = 0; i < x; i++) {
-            printf("%ld ", a[i]);
-        }
-        printf("\n");
-    }
-}
-
 template
 __global__ void build_multikey<BLOCK_THREADS, ITEMS_PER_THREAD>(uint64_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t N, int num_keys, int equal_keys, bool is_right);
 

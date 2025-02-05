@@ -29,16 +29,6 @@ __global__ void materialize_expression(const T *a, T* result, uint64_t *row_ids,
 
 }
 
-template <typename T>
-__global__ void testprintmat(T* a, uint64_t N) {
-    if (blockIdx.x == 0 && threadIdx.x == 0) {
-        for (uint64_t i = 0; i < N; i++) {
-            printf("%.2f ", a[i]);
-        }
-        printf("\n");
-    }
-}
-
 __global__ void materialize_offset(uint64_t* offset, uint64_t* result_length, uint64_t* row_ids, size_t N) {
     size_t tid = threadIdx.x + blockIdx.x * blockDim.x;
     if(tid < N) {
@@ -72,17 +62,6 @@ template
 __global__ void materialize_expression<double, BLOCK_THREADS, ITEMS_PER_THREAD>(const double *a, double* result, uint64_t *row_ids, uint64_t N);
 template
 __global__ void materialize_expression<uint8_t, BLOCK_THREADS, ITEMS_PER_THREAD>(const uint8_t *a, uint8_t* result, uint64_t *row_ids, uint64_t N);
-
-template
-__global__ void testprintmat<uint64_t>(uint64_t* a, uint64_t N);
-template
-__global__ void testprintmat<double>(double* a, uint64_t N);
-template
-__global__ void testprintmat<int>(int* a, uint64_t N);
-template
-__global__ void testprintmat<float>(float* a, uint64_t N);
-template
-__global__ void testprintmat<uint8_t>(uint8_t* a, uint64_t N);
 
 template <typename T>
 void materializeExpression(T *a, T* result, uint64_t *row_ids, uint64_t N) {

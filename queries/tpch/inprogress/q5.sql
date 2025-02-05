@@ -15,7 +15,7 @@ where
   and c_nationkey = s_nationkey
   and s_nationkey = n_nationkey
   and n_regionkey = r_regionkey
-  and r_regionkey = 2
+  and r_name = 'ASIA'
   and o_orderdate >= 19940101
   and o_orderdate <= 19941231
 group by

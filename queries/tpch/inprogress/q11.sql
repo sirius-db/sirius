@@ -11,7 +11,7 @@ from (
   where
     ps_suppkey = s_suppkey
     and s_nationkey = n_nationkey
-    and n_nationkey = 7
+    and n_name = 'GERMANY'
   group by
     ps_partkey
 ) as inner_query
@@ -26,7 +26,7 @@ where
     where
       ps_suppkey = s_suppkey
       and s_nationkey = n_nationkey
-      and n_nationkey = 7
+      and n_name = 'GERMANY'
   )
 order by
   value desc;
