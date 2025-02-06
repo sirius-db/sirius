@@ -253,8 +253,8 @@ void comparisonExpression(T *a, T *b, uint64_t* &row_ids, uint64_t* &count, uint
     printf("Count: %lu\n", h_count[0]);
 }
 
-__global__ void perform_string_comparison(char* char_data, uint64_t num_chars, uint64_t* str_indices, uint64_t num_strings, char* compare_chars, uint64_t compare_length, 
-    bool is_greater_check, bool is_inclusive, bool* d_results) {
+__global__ void string_comparison_expression(char* char_data, uint64_t num_chars, uint64_t* str_indices, uint64_t num_strings, char* compare_chars, uint64_t compare_length, 
+    int op_mode, bool* d_results) {
 
     const uint64_t start_idx = threadIdx.x + blockIdx.x * blockDim.x;
     const uint64_t tile_size = gridDim.x * blockDim.x;
@@ -274,27 +274,69 @@ __global__ void perform_string_comparison(char* char_data, uint64_t num_chars, u
         // First compare the chars
         bool is_valid = true;
         bool found_answer = false;
-        uint64_t num_compare_chars = min(compare_length, curr_str_length);
-        for(uint64_t j = 0; j < num_compare_chars; j++) {
-            char curr_str_char = curr_str_chars[j];
-            char compare_char = compare_chars[j];
-            if(curr_str_char != compare_char) {
-                is_valid = is_greater_check ? curr_str_char > compare_char : curr_str_char < compare_char;
-                found_answer = true;
-                break;
+        if (op_mode == 0 || op_mode == 1) {
+            if (op_mode == 0 && compare_length != curr_str_length) {
+                is_valid = false;
+            } else if (op_mode == 1 && compare_length != curr_str_length) {
+                is_valid = true;
+            } else {
+                for(uint64_t j = 0; j < compare_length; j++) {
+                    char curr_str_char = curr_str_chars[j];
+                    char compare_char = compare_chars[j];
+                    if (op_mode == 0) {
+                        if(curr_str_char != compare_char) {
+                            is_valid = false;
+                            break;
+                        }
+                    } else if (op_mode == 1) {
+                        if(curr_str_char == compare_char) {
+                            is_valid = false;
+                            break;
+                        }
+                    }
+                }
             }
-        }
+        } else {
+            uint64_t num_compare_chars = min(compare_length, curr_str_length);
+            bool is_greater_check;
+            bool is_inclusive;
+            if (op_mode == 2) {
+                is_greater_check = true;
+                is_inclusive = false;
+            } else if (op_mode == 3) {
+                is_greater_check = true;
+                is_inclusive = true;
+            } else if (op_mode == 4) {
+                is_greater_check = false;
+                is_inclusive = false;
+            } else if (op_mode == 5) {
+                is_greater_check = false;
+                is_inclusive = true;
+            }
+            else cudaAssert(0);
 
-        // If not compare the lengths
-        if(!found_answer) {
-            is_valid = (is_inclusive && curr_str_length == num_compare_chars) || (is_greater_check && curr_str_length > num_compare_chars) || (!is_greater_check && curr_str_length < num_compare_chars);
+            for(uint64_t j = 0; j < num_compare_chars; j++) {
+                char curr_str_char = curr_str_chars[j];
+                char compare_char = compare_chars[j];
+                if(curr_str_char != compare_char) {
+                    is_valid = is_greater_check ? curr_str_char > compare_char : curr_str_char < compare_char;
+                    found_answer = true;
+                    break;
+                }
+            }
+
+            // If not compare the lengths
+            if(!found_answer) {
+                is_valid = (is_inclusive && curr_str_length == num_compare_chars) || (is_greater_check && curr_str_length > num_compare_chars) || (!is_greater_check && curr_str_length < num_compare_chars);
+            }
+
         }
 
         d_results[i] = is_valid;
     }
 }
 
-void comparisonStringExpression(char* char_data, uint64_t num_chars, uint64_t* str_indices, uint64_t num_strings, std::string lower_string, std::string upper_string, 
+void comparisonStringBetweenExpression(char* char_data, uint64_t num_chars, uint64_t* str_indices, uint64_t num_strings, std::string lower_string, std::string upper_string, 
     bool is_lower_inclusive, bool is_upper_inclusive, uint64_t* &row_id, uint64_t* &count) {
 
     CHECK_ERROR();
@@ -323,32 +365,90 @@ void comparisonStringExpression(char* char_data, uint64_t num_chars, uint64_t* s
     // Perform the lower string comparsions
     int items_per_block = BLOCK_THREADS * ITEMS_PER_THREAD;
     int num_blocks = (num_strings + items_per_block - 1)/items_per_block;
-    perform_string_comparison<<<num_blocks, BLOCK_THREADS>>>(char_data, num_chars, str_indices, num_strings, d_lower_chars, num_lower_chars, true, is_lower_inclusive, d_is_valid);
+    int op_mode;
+    if (is_lower_inclusive) op_mode = 3;
+    else op_mode = 2;
+    string_comparison_expression<<<num_blocks, BLOCK_THREADS>>>(char_data, num_chars, str_indices, num_strings, d_lower_chars, num_lower_chars, op_mode, d_is_valid);
     cudaDeviceSynchronize();
     CHECK_ERROR();
 
     // Perform the upper string comparsion
-    perform_string_comparison<<<num_blocks, BLOCK_THREADS>>>(char_data, num_chars, str_indices, num_strings, d_upper_chars, num_upper_chars, false, is_upper_inclusive, d_is_valid);
+    if (is_upper_inclusive) op_mode = 5;
+    else op_mode = 4;
+    string_comparison_expression<<<num_blocks, BLOCK_THREADS>>>(char_data, num_chars, str_indices, num_strings, d_upper_chars, num_upper_chars, op_mode, d_is_valid);
     cudaDeviceSynchronize();
     CHECK_ERROR();
 
-    // Create the valid idx buffer from the valid boolean array
-    uint64_t* d_valid_idxs = gpuBufferManager->customCudaMalloc<uint64_t>(num_strings, 0, 0);
-    thrust::device_ptr<bool> d_answers_ptr(d_is_valid);
-    thrust::device_ptr<uint64_t> d_valid_idxs_ptr(d_valid_idxs);
-    auto end = thrust::copy_if(
-        thrust::counting_iterator<uint64_t>(0),
-        thrust::counting_iterator<uint64_t>(num_strings),
-        d_answers_ptr,
-        d_valid_idxs_ptr,
-        thrust::identity<bool>()
-    );
-    CHECK_ERROR();
+    // // Create the valid idx buffer from the valid boolean array
+    // uint64_t* d_valid_idxs = gpuBufferManager->customCudaMalloc<uint64_t>(num_strings, 0, 0);
+    // thrust::device_ptr<bool> d_answers_ptr(d_is_valid);
+    // thrust::device_ptr<uint64_t> d_valid_idxs_ptr(d_valid_idxs);
+    // auto end = thrust::copy_if(
+    //     thrust::counting_iterator<uint64_t>(0),
+    //     thrust::counting_iterator<uint64_t>(num_strings),
+    //     d_answers_ptr,
+    //     d_valid_idxs_ptr,
+    //     thrust::identity<bool>()
+    // );
+    // CHECK_ERROR();
+    cudaMemset(count, 0, sizeof(uint64_t));
+    compact_valid_rows<BLOCK_THREADS, ITEMS_PER_THREAD><<<((num_strings + BLOCK_THREADS * ITEMS_PER_THREAD - 1)/(BLOCK_THREADS * ITEMS_PER_THREAD)), BLOCK_THREADS>>>(d_is_valid, row_id, (unsigned long long*) count, num_strings, 1, 0);
 
     // Record the number of valid strings
     uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
-    h_count[0] = end - d_valid_idxs_ptr;
-    row_id = d_valid_idxs;
+    cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+    CHECK_ERROR();
+    row_id = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
+    cudaMemset(count, 0, sizeof(uint64_t));
+
+    compact_valid_rows<BLOCK_THREADS, ITEMS_PER_THREAD><<<((num_strings + BLOCK_THREADS * ITEMS_PER_THREAD - 1)/(BLOCK_THREADS * ITEMS_PER_THREAD)), BLOCK_THREADS>>>(d_is_valid, row_id, (unsigned long long*) count, num_strings, 0, 0);
+    CHECK_ERROR();
+    // Record the number of valid strings
+    // uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
+    // h_count[0] = end - d_valid_idxs_ptr;
+    // row_id = d_valid_idxs;
+    count = h_count;
+    std::cout << "comparisonStringBetweenExpression got count of " << h_count[0] << std::endl;
+}
+
+void comparisonStringExpression(char* char_data, uint64_t num_chars, uint64_t* str_indices, uint64_t num_strings, std::string comparison_string, int op_mode, uint64_t* &row_id, uint64_t* &count) {
+
+    CHECK_ERROR();
+    if (num_strings == 0) {
+        uint64_t* h_count = new uint64_t[1];
+        h_count[0] = 0;
+        count = h_count;
+        printf("N is 0\n");
+        return;
+    }
+
+    // Allocate the necesary buffers on the GPU
+    GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+    uint64_t num_compare_chars = comparison_string.length();
+    char* d_compare_chars = gpuBufferManager->customCudaMalloc<char>(num_compare_chars, 0, 0);
+    cudaMemcpy(d_compare_chars, comparison_string.c_str(), num_compare_chars * sizeof(char), cudaMemcpyHostToDevice);
+
+    bool* d_is_valid = gpuBufferManager->customCudaMalloc<bool>(num_strings, 0, 0);
+    cudaMemset(d_is_valid, 1, num_strings * sizeof(bool));
+
+    int items_per_block = BLOCK_THREADS * ITEMS_PER_THREAD;
+    int num_blocks = (num_strings + items_per_block - 1)/items_per_block;
+    string_comparison_expression<<<num_blocks, BLOCK_THREADS>>>(char_data, num_chars, str_indices, num_strings, d_compare_chars, num_compare_chars, op_mode, d_is_valid);
+    cudaDeviceSynchronize();
+    CHECK_ERROR();
+
+    cudaMemset(count, 0, sizeof(uint64_t));
+    compact_valid_rows<BLOCK_THREADS, ITEMS_PER_THREAD><<<((num_strings + BLOCK_THREADS * ITEMS_PER_THREAD - 1)/(BLOCK_THREADS * ITEMS_PER_THREAD)), BLOCK_THREADS>>>(d_is_valid, row_id, (unsigned long long*) count, num_strings, 1, 0);
+
+    // Record the number of valid strings
+    uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
+    cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+    CHECK_ERROR();
+    row_id = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
+    cudaMemset(count, 0, sizeof(uint64_t));
+
+    compact_valid_rows<BLOCK_THREADS, ITEMS_PER_THREAD><<<((num_strings + BLOCK_THREADS * ITEMS_PER_THREAD - 1)/(BLOCK_THREADS * ITEMS_PER_THREAD)), BLOCK_THREADS>>>(d_is_valid, row_id, (unsigned long long*) count, num_strings, 0, 0);
+    CHECK_ERROR();
     count = h_count;
     std::cout << "comparisonStringExpression got count of " << h_count[0] << std::endl;
 }
