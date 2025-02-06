@@ -44,6 +44,11 @@ To cache data in GPUs (e.g. caching l_orderkey from lineitem)
 D call gpu_caching("lineitem.l_orderkey")
 ```
 
+We also provided a script (load.txt) to cache all the TPC-H columns in GPUs.
+```
+D .read load.txt
+```
+
 To execute query on GPUs
 ```
 D call gpu_processing("select

@@ -47,6 +47,40 @@ void ResolveTypeComparisonConstantExpression (GPUColumn* column, uint64_t* &coun
     }
 }
 
+void ResolveStringExpression(GPUColumn* string_column, uint64_t* &count, uint64_t* & row_ids, ConstantFilter filter_constant, ExpressionType expression_type) {
+    // Read the in the string column
+    DataWrapper str_data_wrapper = string_column->data_wrapper;
+    uint64_t num_chars = str_data_wrapper.num_bytes;
+    char* d_char_data = reinterpret_cast<char*>(str_data_wrapper.data);
+    uint64_t num_strings = string_column->column_length;
+    uint64_t* d_str_indices = str_data_wrapper.offset;
+    // Get the between values
+    std::string compare_string = filter_constant.constant.ToString();
+
+    switch (expression_type) {
+      case ExpressionType::COMPARE_EQUAL:
+        comparisonStringExpression(d_char_data, num_chars, d_str_indices, num_strings, compare_string, 0, row_ids, count);
+        break;
+      case ExpressionType::COMPARE_NOTEQUAL:
+        comparisonStringExpression(d_char_data, num_chars, d_str_indices, num_strings, compare_string, 1, row_ids, count);
+        break;
+      case ExpressionType::COMPARE_GREATERTHAN:
+        comparisonStringExpression(d_char_data, num_chars, d_str_indices, num_strings, compare_string, 2, row_ids, count);
+        break;
+      case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+        comparisonStringExpression(d_char_data, num_chars, d_str_indices, num_strings, compare_string, 3, row_ids, count);
+        break;
+      case ExpressionType::COMPARE_LESSTHAN:
+        comparisonStringExpression(d_char_data, num_chars, d_str_indices, num_strings, compare_string, 4, row_ids, count);
+        break;
+      case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+        comparisonStringExpression(d_char_data, num_chars, d_str_indices, num_strings, compare_string, 5, row_ids, count);
+        break;
+      default:
+        throw NotImplementedException("Comparison type not supported");
+    }
+}
+
 void HandleComparisonConstantExpression(GPUColumn* column, uint64_t* &count, uint64_t* &row_ids, ConstantFilter filter_constant, ExpressionType expression_type) {
     switch(column->data_wrapper.type) {
       case ColumnType::INT32:
@@ -61,9 +95,9 @@ void HandleComparisonConstantExpression(GPUColumn* column, uint64_t* &count, uin
       case ColumnType::FLOAT64:
         ResolveTypeComparisonConstantExpression<double>(column, count, row_ids, filter_constant, expression_type);
         break;
-      // case ColumnType::VARCHAR:
-      //   ResolveStringConstantExpression(column, count, row_ids, filter_constant, expression_type);
-      //   break;
+      case ColumnType::VARCHAR:
+        ResolveStringExpression(column, count, row_ids, filter_constant, expression_type);
+        break;
       default:
         throw NotImplementedException("Unsupported column type");
     }
@@ -93,19 +127,18 @@ void ResolveTypeBetweenExpression (GPUColumn* column, uint64_t* &count, uint64_t
 }
 
 void ResolveStringBetweenExpression(GPUColumn* string_column, uint64_t* &count, uint64_t* & row_ids, ConstantFilter filter_constant1, ConstantFilter filter_constant2) {
-  // Read the in the string column
-  DataWrapper str_data_wrapper = string_column->data_wrapper;
-  uint64_t num_chars = str_data_wrapper.num_bytes;
-  char* d_char_data = reinterpret_cast<char*>(str_data_wrapper.data);
-  uint64_t num_strings = string_column->column_length;
-  uint64_t* d_str_indices = str_data_wrapper.offset;
-  std::cout << "Resolve String between got column with values: Num Chars - " << num_chars << ", Num Strings - " << num_strings << std::endl;
-  // Get the between values
-  std::string lower_string = filter_constant1.constant.ToString();
-  std::string upper_string = filter_constant2.constant.ToString();
-  bool is_lower_inclusive = filter_constant1.comparison_type == ExpressionType::COMPARE_GREATERTHANOREQUALTO;
-  bool is_upper_inclusive = filter_constant1.comparison_type == ExpressionType::COMPARE_LESSTHANOREQUALTO;
-  comparisonStringExpression(d_char_data, num_chars, d_str_indices, num_strings, lower_string, upper_string, is_lower_inclusive, is_upper_inclusive, row_ids, count);
+    // Read the in the string column
+    DataWrapper str_data_wrapper = string_column->data_wrapper;
+    uint64_t num_chars = str_data_wrapper.num_bytes;
+    char* d_char_data = reinterpret_cast<char*>(str_data_wrapper.data);
+    uint64_t num_strings = string_column->column_length;
+    uint64_t* d_str_indices = str_data_wrapper.offset;
+    // Get the between values
+    std::string lower_string = filter_constant1.constant.ToString();
+    std::string upper_string = filter_constant2.constant.ToString();
+    bool is_lower_inclusive = filter_constant1.comparison_type == ExpressionType::COMPARE_GREATERTHANOREQUALTO;
+    bool is_upper_inclusive = filter_constant1.comparison_type == ExpressionType::COMPARE_LESSTHANOREQUALTO;
+    comparisonStringBetweenExpression(d_char_data, num_chars, d_str_indices, num_strings, lower_string, upper_string, is_lower_inclusive, is_upper_inclusive, row_ids, count);
 }
 
 void HandleBetweenExpression(GPUColumn* column, uint64_t* &count, uint64_t* &row_ids, ConstantFilter filter_constant1, ConstantFilter filter_constant2) {
