@@ -10,6 +10,8 @@ call gpu_caching("part.p_brand");
 call gpu_caching("part.p_container");
 call gpu_caching("part.p_size");
 
+.timer on
+
 call gpu_processing("select
   sum(l_extendedprice * (1 - l_discount)) as revenue
 from

@@ -11,6 +11,7 @@ call gpu_caching("orders.o_shippriority");
 call gpu_caching("customer.c_custkey");
 call gpu_caching("customer.c_mktsegment");
 
+.timer on
 
 call gpu_processing("select
   l_orderkey,

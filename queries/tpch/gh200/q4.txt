@@ -6,6 +6,8 @@ call gpu_caching("orders.o_orderkey");
 call gpu_caching("orders.o_orderdate");
 call gpu_caching("orders.o_orderpriority");
 
+.timer on
+
 call gpu_processing("select
   o_orderpriority,
   count(*) as order_count

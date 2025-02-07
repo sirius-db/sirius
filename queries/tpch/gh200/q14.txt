@@ -6,6 +6,8 @@ call gpu_caching("lineitem.l_shipdate");
 call gpu_caching("part.p_partkey");
 call gpu_caching("part.p_type");
 
+.timer on
+
 call gpu_processing("select
     sum(case
     when (p_type >= 125 and p_type < 150)

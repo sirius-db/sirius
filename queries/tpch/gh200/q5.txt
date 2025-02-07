@@ -20,6 +20,8 @@ call gpu_caching("nation.n_regionkey");
 call gpu_caching("region.r_name");
 call gpu_caching("region.r_regionkey");
 
+.timer on
+
 call gpu_processing("select
   n_name,
   sum(l_extendedprice * (1 - l_discount)) as revenue

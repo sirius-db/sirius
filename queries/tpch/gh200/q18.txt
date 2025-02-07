@@ -9,6 +9,8 @@ call gpu_caching("orders.o_totalprice");
 call gpu_caching("customer.c_custkey");
 call gpu_caching("customer.c_name");
 
+.timer on
+
 call gpu_processing("select
   c_name,
   c_custkey,

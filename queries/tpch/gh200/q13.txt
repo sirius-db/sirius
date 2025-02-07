@@ -4,6 +4,8 @@ call gpu_caching("orders.o_comment");
 
 call gpu_caching("customer.c_custkey");
 
+.timer on
+
 call gpu_processing("select
   c_count,
   count(*) as custdist

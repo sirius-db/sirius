@@ -3,6 +3,8 @@ call gpu_caching("lineitem.l_discount");
 call gpu_caching("lineitem.l_extendedprice");
 call gpu_caching("lineitem.l_quantity");
 
+.timer on
+
 call gpu_processing("select
   sum(l_extendedprice * l_discount) as revenue
 from

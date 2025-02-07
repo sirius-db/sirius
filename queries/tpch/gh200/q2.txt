@@ -25,6 +25,7 @@ call gpu_caching("nation.n_regionkey");
 call gpu_caching("region.r_regionkey");
 call gpu_caching("region.r_name");
 
+.timer on
 
 call gpu_processing("select
   s_acctbal,

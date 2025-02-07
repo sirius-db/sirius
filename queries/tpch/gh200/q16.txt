@@ -13,6 +13,8 @@ call gpu_caching("supplier.s_comment");
 call gpu_caching("partsupp.ps_partkey");
 call gpu_caching("partsupp.ps_suppkey");
 
+.timer on
+
 call gpu_processing("select
   p_brand,
   p_type,

@@ -6,6 +6,7 @@ call gpu_caching("lineitem.l_returnflag");
 call gpu_caching("lineitem.l_linestatus");
 call gpu_caching("lineitem.l_shipdate");
 
+.timer on
 
 call gpu_processing("select
   l_returnflag,

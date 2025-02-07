@@ -20,6 +20,8 @@ call gpu_caching("nation.n_name");
 call gpu_caching("nation.n_nationkey");
 call gpu_caching("nation.n_regionkey");
 
+.timer on
+
 call gpu_processing("select
   c_custkey,
   c_name,

@@ -13,6 +13,8 @@ call gpu_caching("supplier.s_nationkey");
 call gpu_caching("nation.n_name");
 call gpu_caching("nation.n_nationkey");
 
+.timer on
+
 call gpu_processing("select
   s_name,
   count(*) as numwait

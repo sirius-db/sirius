@@ -482,7 +482,6 @@ void comparisonStringExpression(char* char_data, uint64_t num_chars, uint64_t* s
     CHECK_ERROR();
     count = h_count;
     printf("Count: %lu\n", h_count[0]);
-    STOP_TIMER();
 }
 
 template

@@ -18,6 +18,8 @@ call gpu_caching("partsupp.ps_partkey");
 call gpu_caching("partsupp.ps_suppkey");
 call gpu_caching("partsupp.ps_availqty");
 
+.timer on
+
 call gpu_processing("select
   s_name,
   s_address

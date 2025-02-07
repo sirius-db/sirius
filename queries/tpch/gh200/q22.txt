@@ -4,6 +4,8 @@ call gpu_caching("customer.c_custkey");
 call gpu_caching("customer.c_phone");
 call gpu_caching("customer.c_acctbal");
 
+.timer on
+
 call gpu_processing("select
   cntrycode,
   count(*) as numcust,

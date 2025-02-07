@@ -5,6 +5,8 @@ call gpu_caching("lineitem.l_shipdate");
 
 call gpu_caching("supplier.s_suppkey");
 
+.timer on
+
 call gpu_processing("with revenue_view as (
   select
     l_suppkey as supplier_no,
