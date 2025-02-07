@@ -1,0 +1,67 @@
+call gpu_caching("lineitem.l_orderkey");
+call gpu_caching("lineitem.l_suppkey");
+call gpu_caching("lineitem.l_extendedprice");
+call gpu_caching("lineitem.l_discount");
+
+call gpu_caching("orders.o_orderkey");
+call gpu_caching("orders.o_custkey");
+call gpu_caching("orders.o_orderdate");
+
+call gpu_caching("customer.c_custkey");
+call gpu_caching("customer.c_nationkey");
+
+call gpu_caching("supplier.s_suppkey");
+call gpu_caching("supplier.s_nationkey");
+
+call gpu_caching("nation.n_name");
+call gpu_caching("nation.n_nationkey");
+call gpu_caching("nation.n_regionkey");
+
+call gpu_caching("region.r_name");
+call gpu_caching("region.r_regionkey");
+
+call gpu_processing("select
+  n_name,
+  sum(l_extendedprice * (1 - l_discount)) as revenue
+from
+  customer,
+  orders,
+  lineitem,
+  supplier,
+  nation,
+  region
+where
+  c_custkey = o_custkey
+  and l_orderkey = o_orderkey
+  and l_suppkey = s_suppkey
+  and c_nationkey = s_nationkey
+  and s_nationkey = n_nationkey
+  and n_regionkey = r_regionkey
+  and r_name = 'ASIA'
+  and o_orderdate >= 19940101
+  and o_orderdate <= 19941231
+group by
+  n_name;");
+
+call gpu_processing("select
+  n_name,
+  sum(l_extendedprice * (1 - l_discount)) as revenue
+from
+  customer,
+  orders,
+  lineitem,
+  supplier,
+  nation,
+  region
+where
+  c_custkey = o_custkey
+  and l_orderkey = o_orderkey
+  and l_suppkey = s_suppkey
+  and c_nationkey = s_nationkey
+  and s_nationkey = n_nationkey
+  and n_regionkey = r_regionkey
+  and r_name = 'ASIA'
+  and o_orderdate >= 19940101
+  and o_orderdate <= 19941231
+group by
+  n_name;");

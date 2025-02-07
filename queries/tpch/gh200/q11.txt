@@ -1,0 +1,78 @@
+call gpu_caching("supplier.s_suppkey");
+call gpu_caching("supplier.s_name");
+call gpu_caching("supplier.s_address");
+call gpu_caching("supplier.s_nationkey");
+call gpu_caching("supplier.s_phone");
+call gpu_caching("supplier.s_acctbal");
+call gpu_caching("supplier.s_comment");
+
+call gpu_caching("partsupp.ps_partkey");
+call gpu_caching("partsupp.ps_suppkey");
+call gpu_caching("partsupp.ps_availqty");
+call gpu_caching("partsupp.ps_supplycost");
+
+call gpu_caching("nation.n_nationkey");
+call gpu_caching("nation.n_name");
+call gpu_caching("nation.n_regionkey");
+
+call gpu_processing("select
+  *
+from (
+  select
+    ps_partkey,
+    sum(ps_supplycost * ps_availqty) as value
+  from
+    partsupp,
+    supplier,
+    nation
+  where
+    ps_suppkey = s_suppkey
+    and s_nationkey = n_nationkey
+    and n_nationkey = 7
+  group by
+    ps_partkey
+) as inner_query
+where
+  value > (
+    select
+      sum(ps_supplycost * ps_availqty) * 0.0000000333
+    from
+      partsupp,
+      supplier,
+      nation
+    where
+      ps_suppkey = s_suppkey
+      and s_nationkey = n_nationkey
+      and n_nationkey = 7
+  ) limit 1;");
+
+call gpu_processing("select
+  *
+from (
+  select
+    ps_partkey,
+    sum(ps_supplycost * ps_availqty) as value
+  from
+    partsupp,
+    supplier,
+    nation
+  where
+    ps_suppkey = s_suppkey
+    and s_nationkey = n_nationkey
+    and n_nationkey = 7
+  group by
+    ps_partkey
+) as inner_query
+where
+  value > (
+    select
+      sum(ps_supplycost * ps_availqty) * 0.0000000333
+    from
+      partsupp,
+      supplier,
+      nation
+    where
+      ps_suppkey = s_suppkey
+      and s_nationkey = n_nationkey
+      and n_nationkey = 7
+  ) limit 1;");
