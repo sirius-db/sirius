@@ -1,0 +1,105 @@
+call gpu_caching("part.p_partkey");
+call gpu_caching("part.p_name");
+call gpu_caching("part.p_mfgr");
+call gpu_caching("part.p_brand");
+call gpu_caching("part.p_type");
+call gpu_caching("part.p_size");
+call gpu_caching("part.p_container");
+
+call gpu_caching("supplier.s_suppkey");
+call gpu_caching("supplier.s_name");
+call gpu_caching("supplier.s_address");
+call gpu_caching("supplier.s_nationkey");
+call gpu_caching("supplier.s_phone");
+call gpu_caching("supplier.s_acctbal");
+call gpu_caching("supplier.s_comment");
+
+call gpu_caching("partsupp.ps_partkey");
+call gpu_caching("partsupp.ps_suppkey");
+call gpu_caching("partsupp.ps_supplycost");
+
+call gpu_caching("nation.n_nationkey");
+call gpu_caching("nation.n_name");
+call gpu_caching("nation.n_regionkey");
+
+call gpu_caching("region.r_regionkey");
+call gpu_caching("region.r_name");
+
+
+call gpu_processing("select
+  s_acctbal,
+  s_name,
+  n_name,
+  p_partkey,
+  p_mfgr,
+  s_address,
+  s_phone,
+  s_comment
+from
+  part,
+  supplier,
+  partsupp,
+  nation,
+  region
+where
+  p_partkey = ps_partkey
+  and s_suppkey = ps_suppkey
+  and p_size = 15
+  and (p_type + 3) % 5 = 0
+  and s_nationkey = n_nationkey
+  and n_regionkey = r_regionkey
+  and r_name = 'EUROPE'
+  and ps_supplycost = (
+    select
+      min(ps_supplycost)
+    from
+      partsupp,
+      supplier,
+      nation,
+      region
+    where
+      p_partkey = ps_partkey
+      and s_suppkey = ps_suppkey
+      and s_nationkey = n_nationkey
+      and n_regionkey = r_regionkey
+      and r_name = 'EUROPE'
+    ) limit 100;");
+
+call gpu_processing("select
+  s_acctbal,
+  s_name,
+  n_name,
+  p_partkey,
+  p_mfgr,
+  s_address,
+  s_phone,
+  s_comment
+from
+  part,
+  supplier,
+  partsupp,
+  nation,
+  region
+where
+  p_partkey = ps_partkey
+  and s_suppkey = ps_suppkey
+  and p_size = 15
+  and (p_type + 3) % 5 = 0
+  and s_nationkey = n_nationkey
+  and n_regionkey = r_regionkey
+  and r_name = 'EUROPE'
+  and ps_supplycost = (
+    select
+      min(ps_supplycost)
+    from
+      partsupp,
+      supplier,
+      nation,
+      region
+    where
+      p_partkey = ps_partkey
+      and s_suppkey = ps_suppkey
+      and s_nationkey = n_nationkey
+      and n_regionkey = r_regionkey
+      and r_name = 'EUROPE'
+    ) limit 100;");

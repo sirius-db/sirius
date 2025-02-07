@@ -1,0 +1,62 @@
+call gpu_caching("lineitem.l_orderkey");
+call gpu_caching("lineitem.l_commitdate");
+call gpu_caching("lineitem.l_receiptdate");
+call gpu_caching("lineitem.l_shipdate");
+call gpu_caching("lineitem.l_shipmode");
+
+call gpu_caching("orders.o_orderkey");
+call gpu_caching("orders.o_orderpriority");
+
+call gpu_processing("select
+  l_shipmode,
+  sum(case
+    when o_orderpriority = 0
+      or o_orderpriority = 1
+    then CAST(1 AS DOUBLE)
+    else CAST(0 AS DOUBLE)
+  end) as high_line_count,
+  sum(case
+    when o_orderpriority <> 0
+      and o_orderpriority <> 1
+    then CAST(1 AS DOUBLE)
+    else CAST(0 AS DOUBLE)
+  end) as low_line_count
+from
+  orders,
+  lineitem
+where
+  o_orderkey = l_orderkey
+  and l_shipmode in (4, 6)
+  and l_commitdate < l_receiptdate
+  and l_shipdate < l_commitdate
+  and l_receiptdate >= 19940101
+  and l_receiptdate <= 19941231
+group by
+  l_shipmode;");
+
+call gpu_processing("select
+  l_shipmode,
+  sum(case
+    when o_orderpriority = 0
+      or o_orderpriority = 1
+    then CAST(1 AS DOUBLE)
+    else CAST(0 AS DOUBLE)
+  end) as high_line_count,
+  sum(case
+    when o_orderpriority <> 0
+      and o_orderpriority <> 1
+    then CAST(1 AS DOUBLE)
+    else CAST(0 AS DOUBLE)
+  end) as low_line_count
+from
+  orders,
+  lineitem
+where
+  o_orderkey = l_orderkey
+  and l_shipmode in (4, 6)
+  and l_commitdate < l_receiptdate
+  and l_shipdate < l_commitdate
+  and l_receiptdate >= 19940101
+  and l_receiptdate <= 19941231
+group by
+  l_shipmode;");

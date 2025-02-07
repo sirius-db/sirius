@@ -1,0 +1,89 @@
+call gpu_caching("lineitem.l_partkey");
+call gpu_caching("lineitem.l_suppkey");
+call gpu_caching("lineitem.l_shipdate");
+call gpu_caching("lineitem.l_quantity");
+
+call gpu_caching("supplier.s_suppkey");
+call gpu_caching("supplier.s_name");
+call gpu_caching("supplier.s_address");
+call gpu_caching("supplier.s_nationkey");
+
+call gpu_caching("nation.n_name");
+call gpu_caching("nation.n_nationkey");
+
+call gpu_caching("part.p_partkey");
+call gpu_caching("part.p_name");
+
+call gpu_caching("partsupp.ps_partkey");
+call gpu_caching("partsupp.ps_suppkey");
+call gpu_caching("partsupp.ps_availqty");
+
+call gpu_processing("select
+  s_name,
+  s_address
+from
+  supplier, nation
+where
+  s_suppkey in (
+    select
+      ps_suppkey
+    from
+      partsupp
+    where
+      ps_partkey in (
+        select
+          p_partkey
+        from
+          part
+        where
+          p_name like 'forest%'
+        )
+      and ps_availqty > (
+        select
+          sum(l_quantity) * 0.5
+        from
+          lineitem
+        where
+          l_partkey = ps_partkey
+          and l_suppkey = ps_suppkey
+          and l_shipdate >= 19940101
+          and l_shipdate <= 19941231
+        )
+    )
+  and s_nationkey = n_nationkey
+  and n_name = 'CANADA'");
+
+call gpu_processing("select
+  s_name,
+  s_address
+from
+  supplier, nation
+where
+  s_suppkey in (
+    select
+      ps_suppkey
+    from
+      partsupp
+    where
+      ps_partkey in (
+        select
+          p_partkey
+        from
+          part
+        where
+          p_name like 'forest%'
+        )
+      and ps_availqty > (
+        select
+          sum(l_quantity) * 0.5
+        from
+          lineitem
+        where
+          l_partkey = ps_partkey
+          and l_suppkey = ps_suppkey
+          and l_shipdate >= 19940101
+          and l_shipdate <= 19941231
+        )
+    )
+  and s_nationkey = n_nationkey
+  and n_name = 'CANADA'");

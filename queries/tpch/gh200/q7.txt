@@ -1,0 +1,87 @@
+call gpu_caching("lineitem.l_orderkey");
+call gpu_caching("lineitem.l_suppkey");
+call gpu_caching("lineitem.l_extendedprice");
+call gpu_caching("lineitem.l_discount");
+call gpu_caching("lineitem.l_shipdate");
+
+call gpu_caching("orders.o_orderkey");
+call gpu_caching("orders.o_custkey");
+
+call gpu_caching("customer.c_custkey");
+call gpu_caching("customer.c_nationkey");
+
+call gpu_caching("supplier.s_suppkey");
+call gpu_caching("supplier.s_nationkey");
+
+call gpu_caching("nation.n_name");
+call gpu_caching("nation.n_nationkey");
+
+call gpu_processing("select
+  supp_nation,
+  cust_nation,
+  l_year,
+  sum(volume) as revenue
+from (
+  select
+    n1.n_name as supp_nation,
+    n2.n_name as cust_nation,
+    l_shipdate//10000 as l_year,
+    l_extendedprice * (1 - l_discount) as volume
+  from
+    supplier,
+    lineitem,
+    orders,
+    customer,
+    nation n1,
+    nation n2
+  where
+    s_suppkey = l_suppkey
+    and o_orderkey = l_orderkey
+    and c_custkey = o_custkey
+    and s_nationkey = n1.n_nationkey
+    and c_nationkey = n2.n_nationkey
+    and (
+      (n1.n_name = 'FRANCE' and n2.n_name = 'GERMANY')
+      or (n1.n_name = 'FRANCE' and n2.n_name = 'GERMANY')
+    )
+    and l_shipdate between 19950101 and 19961231
+  ) as shipping
+group by
+  supp_nation,
+  cust_nation,
+  l_year;");
+
+call gpu_processing("select
+  supp_nation,
+  cust_nation,
+  l_year,
+  sum(volume) as revenue
+from (
+  select
+    n1.n_name as supp_nation,
+    n2.n_name as cust_nation,
+    l_shipdate//10000 as l_year,
+    l_extendedprice * (1 - l_discount) as volume
+  from
+    supplier,
+    lineitem,
+    orders,
+    customer,
+    nation n1,
+    nation n2
+  where
+    s_suppkey = l_suppkey
+    and o_orderkey = l_orderkey
+    and c_custkey = o_custkey
+    and s_nationkey = n1.n_nationkey
+    and c_nationkey = n2.n_nationkey
+    and (
+      (n1.n_name = 'FRANCE' and n2.n_name = 'GERMANY')
+      or (n1.n_name = 'FRANCE' and n2.n_name = 'GERMANY')
+    )
+    and l_shipdate between 19950101 and 19961231
+  ) as shipping
+group by
+  supp_nation,
+  cust_nation,
+  l_year;");
