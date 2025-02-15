@@ -20,13 +20,25 @@ template <typename T> void printGPUColumn(T* a, size_t N, int gpu);
 void warmup_gpu();
 
 struct pointer_and_key {
-	uint64_t* pointer;
+	void* pointer;
 	uint64_t num_key;
+};
+
+struct pointer_and_two_values {
+	void* pointer;
+	uint64_t value1;
+	uint64_t value2;
 };
 
 struct key_and_signature {
 	uint64_t row_id;
 	uint64_t signature;
+};
+
+struct string_group_by_metadata_type {
+    void* all_keys;
+    void* offsets;
+    uint64_t num_keys;
 };
 
 // Currently a singleton class, would not work for multiple GPUs

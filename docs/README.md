@@ -95,12 +95,22 @@ Build the code:
 $ make -j$(nproc)
 ```
 
-Start duckdb using: `./build/release/duckdb tpch_s10.duckdb`. 
+Start duckdb using: `compute-sanitizer --tool memcheck --print-limit 1 ./build/release/duckdb tpch_s10.duckdb`. 
 
 Group By Query:
 ```
 $ call gpu_caching("customer.c_nationkey");
+$ call gpu_caching("customer.c_comment");
 $ call gpu_caching("nation.n_nationkey");
 $ call gpu_caching("nation.n_comment");
+```
+
+Multi Column Group By:
+```
+$ call gpu_processing("SELECT n_comment, c_comment, COUNT(*) FROM customer, nation WHERE customer.c_nationkey = nation.n_nationkey GROUP BY n_comment, c_comment;");
+```
+
+Single Column Group By:
+```
 $ call gpu_processing("SELECT n_comment, COUNT(*) FROM customer, nation WHERE customer.c_nationkey = nation.n_nationkey GROUP BY n_comment;");
 ```
