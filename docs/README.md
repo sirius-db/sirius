@@ -95,7 +95,7 @@ Build the code:
 $ make -j$(nproc)
 ```
 
-Start duckdb using: `compute-sanitizer --tool memcheck --print-limit 1 ./build/release/duckdb tpch_s10.duckdb`. 
+Start duckdb using: `./build/release/duckdb tpch_s10.duckdb`. 
 
 Group By Query:
 ```

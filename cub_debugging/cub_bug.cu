@@ -38,19 +38,21 @@ struct custom_key_type {
 };
 
 struct CustomReductionOperator {
+    uint64_t* records_buffer;
     uint64_t num_records;
 
-    __host__ CustomReductionOperator(uint64_t _num_records) : num_records(_num_records) {}
+    __host__ CustomReductionOperator(uint64_t* _records_buffer, uint64_t _num_records) : 
+        records_buffer(_records_buffer), num_records(_num_records) {}
 
     __device__ __forceinline__ uint64_t operator()(const uint64_t& left, const uint64_t& right) const {
+        // Verify the records
         uint64_t lower_value = min(left, right);
         uint64_t upper_value = max(left, right);
+        assert(lower_value < num_records);
+        assert(upper_value < num_records);
 
-        if(lower_value >= num_records || upper_value >= num_records) {
-            printf("REDUCTION ERROR - Num Records: %lu, Left: %lu, Right: %lu, Lower: %lu, Upper: %lu\n", 
-                num_records, left, right, lower_value, upper_value);
-        }
-
+        // Combine the value at the upper index to the value at the lower index
+        records_buffer[lower_value] += records_buffer[upper_value];
         return lower_value;
     }
 };
@@ -107,11 +109,16 @@ int main() {
     cudaDeviceSynchronize();
     CHECK_ERROR();
 
+    // Create the records buffer
+    uint64_t* d_records_buffer;
+    cudaMalloc((void**) &d_records_buffer, num_records * sizeof(uint64_t));
+    cudaMemset(d_records_buffer, 0, num_records * sizeof(uint64_t));
+
     // Create the additional fields for the reduce by key
     custom_key_type* d_result_keys;
     uint64_t* d_result_values;
     uint64_t* d_num_runs;
-    CustomReductionOperator reduction_operator(num_records);
+    CustomReductionOperator reduction_operator(d_records_buffer, num_records);
 
     cudaMalloc((void**) &d_result_keys, num_records * sizeof(custom_key_type));
     cudaMalloc((void**) &d_result_values, num_records * sizeof(uint64_t));

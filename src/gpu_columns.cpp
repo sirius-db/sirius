@@ -2,6 +2,35 @@
 
 namespace duckdb {
 
+std::string getColumnTypeString(ColumnType column_type) {
+    std::string str_to_return = "";
+    switch (column_type) {
+        case ColumnType::INT32:
+            str_to_return = "int32";
+            break;
+        case ColumnType::INT64:
+            str_to_return = "int64";
+            break;
+        case ColumnType::FLOAT32:
+            str_to_return = "float32";
+            break;
+        case ColumnType::FLOAT64:
+            str_to_return = "float64";
+            break;  
+        case ColumnType::BOOLEAN:
+            str_to_return = "boolean";
+            break;    
+        case ColumnType::VARCHAR:
+            str_to_return = "varchar";
+            break;
+        default:
+            str_to_return = "unknown";
+            break;
+    }
+
+    return str_to_return;
+}
+
 ColumnType convertLogicalTypetoColumnType(LogicalType type) {
     ColumnType column_type;
     switch (type.id()) {

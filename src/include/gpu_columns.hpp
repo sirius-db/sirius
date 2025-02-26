@@ -2,6 +2,8 @@
 
 #include "helper/common.h"
 #include "duckdb/common/types.hpp"
+#include <cuda_runtime.h>
+#include <cuda.h>
 
 using namespace std;
 
@@ -16,6 +18,7 @@ enum class ColumnType {
     VARCHAR
 };
 
+std::string getColumnTypeString(ColumnType column_type);
 ColumnType convertLogicalTypetoColumnType(LogicalType type);
 
 class DataWrapper {
@@ -40,6 +43,7 @@ public:
     GPUColumn(size_t _column_length, ColumnType type, uint8_t* data, uint64_t* offset, size_t num_bytes, bool is_string_data);
     GPUColumn(const GPUColumn& other);
     ~GPUColumn(){};
+
     int* GetDataInt32();
     uint64_t* GetDataUInt64();
     float* GetDataFloat32();
