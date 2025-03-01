@@ -466,21 +466,21 @@ GPUBufferManager::createTableAndColumnInGPU(Catalog& catalog, ClientContext& con
 		}
 	}
     
-    //finding column_name in column_names
-    if (find(column_names.begin(), column_names.end(), column_name) == column_names.end()) {
-        // convert table_name to uppercase
-        size_t column_id = table.GetColumnIndex(column_name, false).index;
-        string up_table_name = table_name;
-        transform(up_table_name.begin(), up_table_name.end(), up_table_name.begin(), ::toupper);
+    // convert table_name to uppercase
+    string up_table_name = table_name;
+    transform(up_table_name.begin(), up_table_name.end(), up_table_name.begin(), ::toupper);
+    // convert column_name to uppercase
+    string up_column_name = column_name;
+    transform(up_column_name.begin(), up_column_name.end(), up_column_name.begin(), ::toupper);
+    // finding up_column_name in column_names
+    if (find(column_names.begin(), column_names.end(), up_column_name) != column_names.end()) {
+        size_t column_id = table.GetColumnIndex(up_column_name, false).index;
         createTable(up_table_name, table.GetTypes().size());
         // printf("logical type %d %d %s\n", column_id, table.GetTypes()[column_id].id(), table.GetColumn(column_name).GetName().c_str());
-        ColumnType column_type = convertLogicalTypetoColumnType(table.GetColumn(column_name).GetType());
-        // convert table_name to uppercase
-        string up_column_name = column_name;
-        transform(up_column_name.begin(), up_column_name.end(), up_column_name.begin(), ::toupper);
+        ColumnType column_type = convertLogicalTypetoColumnType(table.GetColumn(up_column_name).GetType());
         createColumn(up_table_name, up_column_name, column_type, column_id, unique_columns);
     } else {
-        throw InvalidInputException("Column already exists");
+        throw InvalidInputException("Column '" + up_column_name + "' does not exist in table '" + up_table_name + "'");
     }
     printf("Table and column created in GPU\n");
 }

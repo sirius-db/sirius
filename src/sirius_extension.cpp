@@ -124,13 +124,6 @@ SiriusExtension::GPUCachingBind(ClientContext &context, TableFunctionBindInput &
 	return std::move(result);
 }
 
-void SetErrorToOutputChunk(DataChunk &output, const std::string& error) {
-	// Need to make sure `output` has only one `VARCHAR` column
-	output.SetCardinality(2);
-	output.SetValue(0, 0, "Failed");
-	output.SetValue(0, 1, error);
-}
-
 void SiriusExtension::GPUCachingFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
 	auto &data = (GPUCachingFunctionData &)*data_p.bind_data;
 	if (data.finished) {
@@ -143,8 +136,7 @@ void SiriusExtension::GPUCachingFunction(ClientContext &context, TableFunctionIn
 	// string query = "SELECT l_orderkey FROM lineitem;";
 	auto cpu_res = data.conn->Query(query);
 	if (cpu_res->HasError()) {
-		SetErrorToOutputChunk(output, cpu_res->GetError());
-		return;
+		throw InternalException(cpu_res->GetError());
 	}
 	
 	//check if table exist in the catalog
