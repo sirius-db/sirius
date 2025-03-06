@@ -213,7 +213,6 @@ GPUBufferManager::allocateChunk(DataChunk &input){
     uint8_t* ptr = nullptr;
     ColumnType column_type;
 
-    // printf("vector type %d\n", vector_type.id());
     //the allocation below is assuming its contiguous with prev_data
     switch (vector_type.id()) {
         case LogicalTypeId::INTEGER: {
@@ -353,7 +352,7 @@ GPUBufferManager::allocateColumnBufferInGPU(DataWrapper cpu_data, int gpu) {
 		case ColumnType::FLOAT32: {
             float* ptr_float = customCudaMalloc<float>(cpu_data.size, 0, true);
             ptr = reinterpret_cast<uint8_t*>(ptr_float);
-            column_type = ColumnType::INT64;
+            column_type = ColumnType::FLOAT32;
 			break;
         }
 		case ColumnType::FLOAT64: {
@@ -467,20 +466,19 @@ GPUBufferManager::createTableAndColumnInGPU(Catalog& catalog, ClientContext& con
 	}
     
     //finding column_name in column_names
-    if (find(column_names.begin(), column_names.end(), column_name) == column_names.end()) {
+    //convert column_name to uppercase
+    string up_column_name = column_name;
+    transform(up_column_name.begin(), up_column_name.end(), up_column_name.begin(), ::toupper);
+    if (find(column_names.begin(), column_names.end(), up_column_name) != column_names.end()) {
         // convert table_name to uppercase
-        size_t column_id = table.GetColumnIndex(column_name, false).index;
+        size_t column_id = table.GetColumnIndex(up_column_name, false).index;
         string up_table_name = table_name;
         transform(up_table_name.begin(), up_table_name.end(), up_table_name.begin(), ::toupper);
         createTable(up_table_name, table.GetTypes().size());
-        // printf("logical type %d %d %s\n", column_id, table.GetTypes()[column_id].id(), table.GetColumn(column_name).GetName().c_str());
-        ColumnType column_type = convertLogicalTypetoColumnType(table.GetColumn(column_name).GetType());
-        // convert table_name to uppercase
-        string up_column_name = column_name;
-        transform(up_column_name.begin(), up_column_name.end(), up_column_name.begin(), ::toupper);
+        ColumnType column_type = convertLogicalTypetoColumnType(table.GetColumn(up_column_name).GetType());
         createColumn(up_table_name, up_column_name, column_type, column_id, unique_columns);
     } else {
-        throw InvalidInputException("Column already exists");
+        throw InvalidInputException("Column does not exists");
     }
     printf("Table and column created in GPU\n");
 }
