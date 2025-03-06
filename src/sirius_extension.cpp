@@ -17,6 +17,7 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/duck_schema_entry.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/execution/column_binding_resolver.hpp"
 
 #include "substrait_extension.hpp"
 #include "to_substrait.hpp"
@@ -94,9 +95,9 @@ SiriusExtension::GPUCachingBind(ClientContext &context, TableFunctionBindInput &
 		throw BinderException("gpu_caching cannot be called with a NULL parameter");
 	}
 
-	size_t cache_size_per_gpu = 10UL * 1024 * 1024 * 1024; // 10GB
-	size_t processing_size_per_gpu = 11UL * 1024 * 1024 * 1024; //11GB
-	size_t processing_size_per_cpu = 16UL * 1024 * 1024 * 1024; //16GB
+	size_t cache_size_per_gpu = 20UL * 1024 * 1024 * 1024; // 10GB
+	size_t processing_size_per_gpu = 18UL * 1024 * 1024 * 1024; //11GB
+	size_t processing_size_per_cpu = 32UL * 1024 * 1024 * 1024; //16GB
 	// size_t cache_size_per_gpu = 120UL * 1024 * 1024 * 1024;
 	// size_t processing_size_per_gpu = 80UL * 1024 * 1024 * 1024;
 	// size_t processing_size_per_cpu = 120UL * 1024 * 1024 * 1024;
@@ -235,6 +236,23 @@ void SiriusExtension::GPUProcessingFunction(ClientContext &context, TableFunctio
 	return;
 }
 
+unique_ptr<LogicalOperator> OptimizePlan(ClientContext &context, Planner &planner, Connection &new_conn) {
+	unique_ptr<LogicalOperator> plan;
+	plan = std::move(planner.plan);
+
+	Optimizer optimizer(*planner.binder, context);
+	plan = optimizer.Optimize(std::move(plan));
+	plan->Print();
+
+	ColumnBindingResolver resolver;
+	resolver.Verify(*plan);
+	resolver.VisitOperator(*plan);
+
+	plan->ResolveOperatorTypes();
+
+	return plan;
+}
+
 unique_ptr<FunctionData> 
 SiriusExtension::GPUProcessingSubstraitBind(ClientContext &context, TableFunctionBindInput &input,
                                                 vector<LogicalType> &return_types, vector<string> &names) {
@@ -249,10 +267,43 @@ SiriusExtension::GPUProcessingSubstraitBind(ClientContext &context, TableFunctio
 	string serialized = input.inputs[0].GetValueUnsafe<string>();
 	result->plan = GPUSubstraitPlanToDuckDBRel(*result->conn, serialized, false);
 
-	for (auto &column : result->plan->Columns()) {
-		return_types.emplace_back(column.Type());
-		names.emplace_back(column.Name());
+	auto relation_stmt = make_uniq<RelationStatement>(result->plan);
+	unique_ptr<SQLStatement> statements = std::move(relation_stmt);
+	auto statement_type = statements->type;
+	printf("%s\n", statements->query.c_str());
+
+	set<OptimizerType> disabled_optimizers = DBConfig::GetConfig(context).options.disabled_optimizers;
+	disabled_optimizers.insert(OptimizerType::IN_CLAUSE);
+	disabled_optimizers.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
+	DBConfig::GetConfig(context).options.disabled_optimizers = disabled_optimizers;
+
+	Planner planner(context);
+	planner.CreatePlan(std::move(statements));
+	D_ASSERT(planner.plan);
+
+	auto prepared = make_shared_ptr<PreparedStatementData>(statement_type);
+	prepared->names = planner.names;
+	prepared->types = planner.types;
+	prepared->value_map = std::move(planner.value_map);
+	prepared->plan = make_uniq<PhysicalOperator>(PhysicalOperatorType::DUMMY_SCAN, vector<LogicalType>{LogicalType::BOOLEAN}, 0);
+	
+	auto query_plan = OptimizePlan(context, planner, *result->conn);
+	auto gpu_physical_plan = GPUGeneratePhysicalPlan(context, *result->gpu_context, query_plan, *result->conn);
+	auto gpu_prepared = make_shared_ptr<GPUPreparedStatementData>(std::move(prepared), std::move(gpu_physical_plan));
+		
+	result->gpu_prepared = gpu_prepared;
+
+	for (auto &column : planner.names) {
+		names.emplace_back(column);
 	}
+	for (auto &type : planner.types) {
+		return_types.emplace_back(type);
+	}
+
+	// for (auto &column : result->plan->Columns()) {
+	// 	return_types.emplace_back(column.Type());
+	// 	names.emplace_back(column.Name());
+	// }
 
 	return std::move(result);
 }
@@ -264,25 +315,19 @@ void SiriusExtension::GPUProcessingSubstraitFunction(ClientContext &context, Tab
 	}
 
 	if (!data.res) {
+		auto start = std::chrono::high_resolution_clock::now();
+		data.res = data.gpu_context->GPUExecuteQuery(context, data.query, data.gpu_prepared, {});
 		// data.res = data.plan->Execute();
-		std::cout << "Calling CUDA kernel from C++..." << std::endl;
-		myKernel();  // Call the CUDA kernel defined in sirius_extension_cuda.cu
-		int size = 10;
-		int* temp = new int[size];
-		int* ptr = sendDataToGPU(temp, size);  // Send data to GPU
-		std::cout << "CUDA kernel call finished." << std::endl;
-		auto temp2 = data.gpu_context->GPUExecuteRelation(context, data.plan);
-		data.res = data.plan->Execute();
+		auto end = std::chrono::high_resolution_clock::now();
+		auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+		printf("GPU Execute query time: %.2f ms\n", duration.count()/1000.0);
 	}
 
 	auto result_chunk = data.res->Fetch();
 	if (!result_chunk) {
 		return;
 	}
-	while (result_chunk) {
-		output.Move(*result_chunk);
-		result_chunk = data.res->Fetch();
-	}
+	output.Move(*result_chunk);
 	return;
 }
 
