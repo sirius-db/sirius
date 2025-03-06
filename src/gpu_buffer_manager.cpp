@@ -213,7 +213,6 @@ GPUBufferManager::allocateChunk(DataChunk &input){
     uint8_t* ptr = nullptr;
     ColumnType column_type;
 
-    // printf("vector type %d\n", vector_type.id());
     //the allocation below is assuming its contiguous with prev_data
     switch (vector_type.id()) {
         case LogicalTypeId::INTEGER: {
@@ -353,7 +352,7 @@ GPUBufferManager::allocateColumnBufferInGPU(DataWrapper cpu_data, int gpu) {
 		case ColumnType::FLOAT32: {
             float* ptr_float = customCudaMalloc<float>(cpu_data.size, 0, true);
             ptr = reinterpret_cast<uint8_t*>(ptr_float);
-            column_type = ColumnType::INT64;
+            column_type = ColumnType::FLOAT32;
 			break;
         }
 		case ColumnType::FLOAT64: {

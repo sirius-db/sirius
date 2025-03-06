@@ -22,28 +22,28 @@
 
 namespace duckdb {
 
-unique_ptr<LogicalOperator> ExtractPlanFromRelation(ClientContext &context, shared_ptr<Relation> relation) {
-	auto relation_stmt = make_uniq<RelationStatement>(relation);
-	unique_ptr<SQLStatement> statements = std::move(relation_stmt);
+// unique_ptr<LogicalOperator> ExtractPlanFromRelation(ClientContext &context, shared_ptr<Relation> relation) {
+// 	auto relation_stmt = make_uniq<RelationStatement>(relation);
+// 	unique_ptr<SQLStatement> statements = std::move(relation_stmt);
 
-	unique_ptr<LogicalOperator> plan;
-	Planner planner(context);
-	planner.CreatePlan(std::move(statements));
-	D_ASSERT(planner.plan);
+// 	unique_ptr<LogicalOperator> plan;
+// 	Planner planner(context);
+// 	planner.CreatePlan(std::move(statements));
+// 	D_ASSERT(planner.plan);
 
-	plan = std::move(planner.plan);
+// 	plan = std::move(planner.plan);
 
-	Optimizer optimizer(*planner.binder, context);
-	plan = optimizer.Optimize(std::move(plan));
+// 	Optimizer optimizer(*planner.binder, context);
+// 	plan = optimizer.Optimize(std::move(plan));
 
-	ColumnBindingResolver resolver;
-	resolver.Verify(*plan);
-	resolver.VisitOperator(*plan);
+// 	ColumnBindingResolver resolver;
+// 	resolver.Verify(*plan);
+// 	resolver.VisitOperator(*plan);
 
-	plan->ResolveOperatorTypes();
+// 	plan->ResolveOperatorTypes();
 
-	return plan;
-}
+// 	return plan;
+// }
 
 void GPUBindPreparedStatementParameters(PreparedStatementData &statement, const PendingQueryParameters &parameters) {
 	case_insensitive_map_t<Value> owned_values;
@@ -282,54 +282,36 @@ GPUContext::EndQueryInternal(bool success, bool invalidate_transaction) {
 	return error;
 }
 
+
 unique_ptr<QueryResult> 
 GPUContext::GPUExecuteRelation(ClientContext &context, shared_ptr<Relation> relation) {
 
-	printf("Executing relation\n");
-	auto logical_plan = ExtractPlanFromRelation(context, relation);
-	// for (auto &column: logical_plan->ColumnBindingsToString()) {
-	// 	printf("Logical Column: %s\n", column.c_str());
+	// auto &expected_columns = relation->Columns();
+	// auto pending = GPUPendingQueryInternal(relation, false);
+	// if (!pending->success) {
+	// 	return ErrorResult<MaterializedQueryResult>(pending->GetErrorObject());
 	// }
-	// printf("Printing logical plan\n");
-	// logical_plan->Print();
-	// printf("Done printing logical plan\n");
-	// now convert logical query plan into a physical query plan
 
-	PhysicalPlanGenerator physical_planner(context);
-	auto physical_plan = physical_planner.CreatePlan(std::move(logical_plan));
-	// printf("Printing physical plan\n");
-	// physical_plan->Print();
-	// printf("Done printing physical plan\n");
+	// unique_ptr<QueryResult> result;
+	// result = GPUExecutePendingQueryResult(*pending);
 
-	// printf("Mapping DuckDB plan to GPU plan\n");
-	// GPUProcessingExecute(context, *physical_plan, {}, {});
-
-// 	// auto lock = LockContext();
-// 	auto &expected_columns = relation->Columns();
-// 	auto pending = new_conn.context->PendingQuery(relation, false);
-// 	if (!pending->HasError()) {
-// 		return GPUErrorResult<MaterializedQueryResult>(context, pending->GetErrorObject());
-// 	}
-
-	unique_ptr<QueryResult> result;
-// 	auto result = pending->Execute();
-// 	if (result->HasError()) {
-		// return result;
-// 	}
-// 	// verify that the result types and result names of the query match the expected result types/names
-// 	if (result->types.size() == expected_columns.size()) {
-// 		bool mismatch = false;
-// 		for (idx_t i = 0; i < result->types.size(); i++) {
-// 			if (result->types[i] != expected_columns[i].Type() || result->names[i] != expected_columns[i].Name()) {
-// 				mismatch = true;
-// 				break;
-// 			}
-// 		}
-// 		if (!mismatch) {
-// 			// all is as expected: return the result
-			return result;
-// 		}
-// 	}
+	// if (result->HasError()) {
+	// 	return result;
+	// }
+	// // verify that the result types and result names of the query match the expected result types/names
+	// if (result->types.size() == expected_columns.size()) {
+	// 	bool mismatch = false;
+	// 	for (idx_t i = 0; i < result->types.size(); i++) {
+	// 		if (result->types[i] != expected_columns[i].Type() || result->names[i] != expected_columns[i].Name()) {
+	// 			mismatch = true;
+	// 			break;
+	// 		}
+	// 	}
+	// 	if (!mismatch) {
+	// 		// all is as expected: return the result
+	// 		return result;
+	// 	}
+	// }
 // 	// result mismatch
 // 	string err_str = "Result mismatch in query!\nExpected the following columns: [";
 // 	for (idx_t i = 0; i < expected_columns.size(); i++) {
