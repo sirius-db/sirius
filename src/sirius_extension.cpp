@@ -268,7 +268,8 @@ SiriusExtension::GPUProcessingSubstraitBind(ClientContext &context, TableFunctio
 		throw BinderException("gpu_processing cannot be called with a NULL parameter");
 	}
 	string serialized = input.inputs[0].GetValueUnsafe<string>();
-	result->plan = GPUSubstraitPlanToDuckDBRel(*result->conn, serialized, false);
+	bool is_json = input.inputs[1].GetValueUnsafe<bool>();
+	result->plan = GPUSubstraitPlanToDuckDBRel(*result->conn, serialized, is_json);
 
 	auto relation_stmt = make_uniq<RelationStatement>(result->plan);
 	unique_ptr<SQLStatement> statements = std::move(relation_stmt);
