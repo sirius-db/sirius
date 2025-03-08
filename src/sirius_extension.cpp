@@ -271,37 +271,39 @@ SiriusExtension::GPUProcessingSubstraitBind(ClientContext &context, TableFunctio
 	bool is_json = input.inputs[1].GetValueUnsafe<bool>();
 	result->plan = GPUSubstraitPlanToDuckDBRel(*result->conn, serialized, is_json);
 
-	auto relation_stmt = make_uniq<RelationStatement>(result->plan);
-	unique_ptr<SQLStatement> statements = std::move(relation_stmt);
-	auto statement_type = statements->type;
-	printf("%s\n", statements->query.c_str());
+	if (USE_SIRIUS_FOR_SUBSTRAIT) {
+		auto relation_stmt = make_uniq<RelationStatement>(result->plan);
+		unique_ptr<SQLStatement> statements = std::move(relation_stmt);
+		auto statement_type = statements->type;
+		printf("%s\n", statements->query.c_str());
 
-	set<OptimizerType> disabled_optimizers = DBConfig::GetConfig(context).options.disabled_optimizers;
-	disabled_optimizers.insert(OptimizerType::IN_CLAUSE);
-	disabled_optimizers.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
-	DBConfig::GetConfig(context).options.disabled_optimizers = disabled_optimizers;
+		set<OptimizerType> disabled_optimizers = DBConfig::GetConfig(context).options.disabled_optimizers;
+		disabled_optimizers.insert(OptimizerType::IN_CLAUSE);
+		disabled_optimizers.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
+		DBConfig::GetConfig(context).options.disabled_optimizers = disabled_optimizers;
 
-	Planner planner(context);
-	planner.CreatePlan(std::move(statements));
-	D_ASSERT(planner.plan);
+		Planner planner(context);
+		planner.CreatePlan(std::move(statements));
+		D_ASSERT(planner.plan);
 
-	auto prepared = make_shared_ptr<PreparedStatementData>(statement_type);
-	prepared->names = planner.names;
-	prepared->types = planner.types;
-	prepared->value_map = std::move(planner.value_map);
-	prepared->plan = make_uniq<PhysicalOperator>(PhysicalOperatorType::DUMMY_SCAN, vector<LogicalType>{LogicalType::BOOLEAN}, 0);
-	
-	auto query_plan = OptimizePlan(context, planner, *result->conn);
-	auto gpu_physical_plan = GPUGeneratePhysicalPlan(context, *result->gpu_context, query_plan, *result->conn);
-	auto gpu_prepared = make_shared_ptr<GPUPreparedStatementData>(std::move(prepared), std::move(gpu_physical_plan));
+		auto prepared = make_shared_ptr<PreparedStatementData>(statement_type);
+		prepared->names = planner.names;
+		prepared->types = planner.types;
+		prepared->value_map = std::move(planner.value_map);
+		prepared->plan = make_uniq<PhysicalOperator>(PhysicalOperatorType::DUMMY_SCAN, vector<LogicalType>{LogicalType::BOOLEAN}, 0);
 		
-	result->gpu_prepared = gpu_prepared;
+		auto query_plan = OptimizePlan(context, planner, *result->conn);
+		auto gpu_physical_plan = GPUGeneratePhysicalPlan(context, *result->gpu_context, query_plan, *result->conn);
+		auto gpu_prepared = make_shared_ptr<GPUPreparedStatementData>(std::move(prepared), std::move(gpu_physical_plan));
+			
+		result->gpu_prepared = gpu_prepared;
 
-	for (auto &column : planner.names) {
-		names.emplace_back(column);
-	}
-	for (auto &type : planner.types) {
-		return_types.emplace_back(type);
+		for (auto &column : planner.names) {
+			names.emplace_back(column);
+		}
+		for (auto &type : planner.types) {
+			return_types.emplace_back(type);
+		}
 	}
 
 	// for (auto &column : result->plan->Columns()) {
@@ -320,8 +322,12 @@ void SiriusExtension::GPUProcessingSubstraitFunction(ClientContext &context, Tab
 
 	if (!data.res) {
 		auto start = std::chrono::high_resolution_clock::now();
-		data.res = data.gpu_context->GPUExecuteQuery(context, data.query, data.gpu_prepared, {});
-		// data.res = data.plan->Execute();
+		if (USE_SIRIUS_FOR_SUBSTRAIT) {
+			data.res = data.gpu_context->GPUExecuteQuery(context, data.query, data.gpu_prepared, {});
+		} else {
+			data.res = data.plan->Execute();
+		}
+		data.res->Print();
 		auto end = std::chrono::high_resolution_clock::now();
 		auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
 		printf("GPU Execute query time: %.2f ms\n", duration.count()/1000.0);

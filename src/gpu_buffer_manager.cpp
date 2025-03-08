@@ -411,6 +411,11 @@ void
 GPUBufferManager::createTableAndColumnInGPU(Catalog& catalog, ClientContext& context, string table_name, string column_name) {
 	TableCatalogEntry &table = catalog.GetEntry(context, CatalogType::TABLE_ENTRY, DEFAULT_SCHEMA, table_name).Cast<TableCatalogEntry>();
     auto column_names = table.GetColumns().GetColumnNames();
+    std::unordered_set<std::string> up_column_name_set;
+    for (auto name: column_names) {
+        transform(name.begin(), name.end(), name.begin(), ::toupper);
+        up_column_name_set.emplace(name);
+    }
     auto& constraints = table.GetConstraints();
     vector<size_t> unique_columns;
 
@@ -471,9 +476,11 @@ GPUBufferManager::createTableAndColumnInGPU(Catalog& catalog, ClientContext& con
     // convert column_name to uppercase
     string up_column_name = column_name;
     transform(up_column_name.begin(), up_column_name.end(), up_column_name.begin(), ::toupper);
-    // finding up_column_name in column_names
-    if (find(column_names.begin(), column_names.end(), up_column_name) != column_names.end()) {
-        size_t column_id = table.GetColumnIndex(up_column_name, false).index;
+    // finding up_column_name in up_column_name_set
+    if (up_column_name_set.find(up_column_name) != up_column_name_set.end()) {
+        // GetColumnIndex() will modify `up_column_name` so make a copy
+        auto up_column_name_copy = up_column_name;
+        size_t column_id = table.GetColumnIndex(up_column_name_copy, false).index;
         createTable(up_table_name, table.GetTypes().size());
         // printf("logical type %d %d %s\n", column_id, table.GetTypes()[column_id].id(), table.GetColumn(column_name).GetName().c_str());
         ColumnType column_type = convertLogicalTypetoColumnType(table.GetColumn(up_column_name).GetType());
