@@ -53,7 +53,7 @@ struct GPUCachingFunctionData : public TableFunctionData {
 };
 
 shared_ptr<Relation> GPUSubstraitPlanToDuckDBRel(Connection &conn, const string &serialized, bool json = false) {
-	SubstraitToDuckDB transformer_s2d(conn, serialized, json);
+	SubstraitToDuckDB transformer_s2d(conn.context, serialized, json);
 	return transformer_s2d.TransformPlan();
 };
 

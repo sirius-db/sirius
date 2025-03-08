@@ -234,7 +234,8 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
   auto start = std::chrono::high_resolution_clock::now();
   if (output_relation.columns.size() != GetTypes().size()) throw InvalidInputException("Mismatched column count");
 
-  auto table_name = function.to_string(bind_data.get()); //we get it from ParamsToString();
+  TableFunctionToStringInput input(function, bind_data.get());
+  auto table_name = function.to_string(input)["Table"];
 
   printf("Table Scanning %s\n", table_name.c_str());
   //Find table name in the buffer manager

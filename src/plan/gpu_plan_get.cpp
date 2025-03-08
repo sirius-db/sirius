@@ -48,9 +48,15 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::CreatePlan(LogicalGet 
 		throw InternalException("LogicalGet::project_input can only be set for table-in-out functions");
 	}
 
+	// FIXME: Upgrading to DuckDB v1.2.0
 	unique_ptr<TableFilterSet> table_filters;
+	const auto& column_ids = op.GetColumnIds();
+	vector<column_t> column_id_vals;
+	for (const auto& column_id: column_ids) {
+		column_id_vals.push_back(column_id.GetPrimaryIndex());
+	}
 	if (!op.table_filters.filters.empty()) {
-		table_filters = GPUCreateTableFilterSet(op.table_filters, op.column_ids);
+		table_filters = GPUCreateTableFilterSet(op.table_filters, column_id_vals);
 	}
 
 	if (op.function.dependency) {
@@ -60,13 +66,13 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::CreatePlan(LogicalGet 
 	if (!op.function.projection_pushdown) {
 		// function does not support projection pushdown
 		auto node = make_uniq<GPUPhysicalTableScan>(op.returned_types, op.function, std::move(op.bind_data),
-		                                         op.returned_types, op.column_ids, vector<column_t>(), op.names,
+		                                         op.returned_types, column_id_vals, vector<column_t>(), op.names,
 		                                         std::move(table_filters), op.estimated_cardinality, op.extra_info);
 		// first check if an additional projection is necessary
-		if (op.column_ids.size() == op.returned_types.size()) {
+		if (column_id_vals.size() == op.returned_types.size()) {
 			bool projection_necessary = false;
-			for (idx_t i = 0; i < op.column_ids.size(); i++) {
-				if (op.column_ids[i] != i) {
+			for (idx_t i = 0; i < column_id_vals.size(); i++) {
+				if (column_id_vals[i] != i) {
 					projection_necessary = true;
 					break;
 				}
@@ -81,7 +87,7 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::CreatePlan(LogicalGet 
 		// push a projection on top that does the projection
 		vector<LogicalType> types;
 		vector<unique_ptr<Expression>> expressions;
-		for (auto &column_id : op.column_ids) {
+		for (auto &column_id : column_id_vals) {
 			if (column_id == COLUMN_IDENTIFIER_ROW_ID) {
 				types.emplace_back(LogicalType(LogicalTypeId::BIGINT));
 				expressions.push_back(make_uniq<BoundConstantExpression>(Value::BIGINT(0)));
@@ -98,7 +104,7 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::CreatePlan(LogicalGet 
 		return std::move(projection);
 	} else {
 		return make_uniq<GPUPhysicalTableScan>(op.types, op.function, std::move(op.bind_data), op.returned_types,
-		                                    op.column_ids, op.projection_ids, op.names, std::move(table_filters),
+		                                    column_id_vals, op.projection_ids, op.names, std::move(table_filters),
 		                                    op.estimated_cardinality, op.extra_info);
 	}
 }
