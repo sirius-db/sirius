@@ -53,8 +53,23 @@ struct GPUCachingFunctionData : public TableFunctionData {
 };
 
 shared_ptr<Relation> GPUSubstraitPlanToDuckDBRel(Connection &conn, const string &serialized, bool json = false) {
-	SubstraitToDuckDB transformer_s2d(conn.context, serialized, json);
-	return transformer_s2d.TransformPlan();
+	if (conn.context->transaction.IsAutoCommit()) {
+    conn.context->transaction.BeginTransaction();
+  }
+	shared_ptr<Relation> plan;
+	try {
+		SubstraitToDuckDB transformer_s2d(conn.context, serialized, json);
+		plan = transformer_s2d.TransformPlan();
+	} catch (std::exception& e) {
+		if (conn.context->transaction.IsAutoCommit()) {
+			conn.context->transaction.Rollback(nullptr);
+		}
+		throw;
+	}
+	if (conn.context->transaction.IsAutoCommit()) {
+		conn.context->transaction.Commit();
+  }
+	return plan;
 };
 
 //This function is used to extract the query plan from the SQL query

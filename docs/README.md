@@ -28,7 +28,7 @@ cd duckdb
 git reset --hard 5f5512b827df6397afd31daedb4bbdee76520019 #go to the commit hash of duckdb v1.2.0
 mkdir -p extension_external
 cd extension_external
-git clone git@github.com:sirius-db/duckdb-substrait-extension.git
+git clone https://github.com/sirius-db/duckdb-substrait-extension.git
 mv duckdb-substrait-extension substrait
 cd substrait 
 git reset --hard 67a97f5a87c6c11541c4bc7eb8fd8cba9c3970b8 #go to the right commit hash for duckdb substrait extension
