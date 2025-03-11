@@ -5,6 +5,11 @@
 
 namespace duckdb {
 
+  extern "C" {
+    // Forward declaration for CUDA-based float->double cast function
+    GPUColumn *MaterializeCastFloatToDouble(GPUColumn *input_col);
+}
+
 template <typename T>
 GPUColumn*
 GPUExpressionExecutor::ResolveTypeBinaryConstantExpression(GPUColumn* column, T constant, GPUBufferManager* gpuBufferManager, string function_name) {
@@ -407,7 +412,7 @@ GPUExpressionExecutor::ProjectionRecursiveExpression(GPUIntermediateRelation& in
     bool is_specific_projection = HandlingSpecificProjection(input_relation, output_relation, expr, output_idx);
     if (is_specific_projection) return;
 
-    GPUColumn* result;
+    GPUColumn* result = nullptr;  
 
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 
@@ -435,10 +440,28 @@ GPUExpressionExecutor::ProjectionRecursiveExpression(GPUIntermediateRelation& in
               ProjectionRecursiveExpression(input_relation, output_relation, *(bound_case.else_expr), output_idx, depth + 1);
               break;
         } case ExpressionClass::BOUND_CAST: {
-              auto &bound_cast = expr.Cast<BoundCastExpression>();
-              printf("Executing cast expression\n");
-              ProjectionRecursiveExpression(input_relation, output_relation, *(bound_cast.child), output_idx, depth + 1);
-              break;
+          auto &bound_cast = expr.Cast<BoundCastExpression>();
+          printf("Executing cast expression in ProjectionRecursiveExpression\n");
+
+          ProjectionRecursiveExpression(input_relation, output_relation, *(bound_cast.child), output_idx, depth + 1);
+
+          if (bound_cast.child->expression_class == ExpressionClass::BOUND_REF) {
+              auto &child_ref = bound_cast.child->Cast<BoundReferenceExpression>();
+              GPUColumn* child_col = input_relation.columns[child_ref.index];
+
+              if (child_col->data_wrapper.type == ColumnType::FLOAT32) {
+                  printf("Casting float32 -> double for projection\n");
+                  result = MaterializeCastFloatToDouble(child_col);
+                  if (!result) {
+                      printf("ERROR: MaterializeCastFloatToDouble returned NULL!\n");
+                      throw std::runtime_error("Cast from float32 to double failed.");
+                  }
+              } else {
+                  printf("Skipping cast as type is already double or not applicable.\n");
+                  result = child_col;
+              }
+          }
+          break;
         } case ExpressionClass::BOUND_COMPARISON: {
               auto &bound_comparison = expr.Cast<BoundComparisonExpression>();
               printf("Executing comparison expression\n");
@@ -456,32 +479,32 @@ GPUExpressionExecutor::ProjectionRecursiveExpression(GPUIntermediateRelation& in
               printf("Reading value %s\n", expr.Cast<BoundConstantExpression>().value.ToString().c_str());
               break;
         } case ExpressionClass::BOUND_FUNCTION: {
-              printf("Executing function expression\n");
-              auto &bound_function = expr.Cast<BoundFunctionExpression>();
-              printf("Function name %s\n", bound_function.function.name.c_str());
-              if((bound_function.ToString().find("substr") != std::string::npos) || (bound_function.ToString().find("substring") != std::string::npos)) {
-                auto &bound_ref1 = bound_function.children[0]->Cast<BoundReferenceExpression>();
-                auto &bound_ref2 = bound_function.children[1]->Cast<BoundConstantExpression>();
-                auto &bound_ref3 = bound_function.children[2]->Cast<BoundConstantExpression>();
-                GPUColumn* input_column = input_relation.columns[bound_ref1.index];
-                uint64_t start_idx = bound_ref2.value.GetValue<uint64_t>();
-                if (start_idx < 1) throw InvalidInputException("Start index should be greater than 0");
-                uint64_t length = bound_ref3.value.GetValue<uint64_t>();
-                GPUColumn* materialized_column = HandleMaterializeExpression(input_column, bound_ref1, gpuBufferManager);
-                result = HandleSubString(materialized_column, start_idx, length);
-              } else if (bound_function.children[1]->expression_class == ExpressionClass::BOUND_CONSTANT) {
-                  auto &bound_ref1 = bound_function.children[0]->Cast<BoundReferenceExpression>();
-                  auto &bound_ref2 = bound_function.children[1]->Cast<BoundConstantExpression>();
-                  GPUColumn* materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref1.index], bound_ref1, gpuBufferManager);
-                  result = HandleBinaryConstantExpression(materialized_column, bound_ref2, gpuBufferManager, bound_function.function.name);
-              } else if (bound_function.children[1]->expression_class == ExpressionClass::BOUND_REF) {
-                  auto &bound_ref1 = bound_function.children[0]->Cast<BoundReferenceExpression>();
-                  auto &bound_ref2 = bound_function.children[1]->Cast<BoundReferenceExpression>();
-                  GPUColumn* materialized_column1 = HandleMaterializeExpression(input_relation.columns[bound_ref1.index], bound_ref1, gpuBufferManager);
-                  GPUColumn* materialized_column2 = HandleMaterializeExpression(input_relation.columns[bound_ref2.index], bound_ref2, gpuBufferManager);
-                  result = HandleBinaryExpression(materialized_column1, materialized_column2, gpuBufferManager, bound_function.function.name);            
-              }
-              break;
+          printf("IN BOUND FUNCTION Executing function expression\n");
+    auto &bound_function = expr.Cast<BoundFunctionExpression>();
+    printf("Function name %s\n", bound_function.function.name.c_str());
+
+    if (bound_function.function.name == "*") { // Multiplication case
+        auto &left_child = bound_function.children[0]->Cast<BoundReferenceExpression>();
+        auto &right_child = bound_function.children[1]->Cast<BoundReferenceExpression>();
+
+        GPUColumn* left_col = HandleMaterializeExpression(input_relation.columns[left_child.index], left_child, gpuBufferManager);
+        GPUColumn* right_col = HandleMaterializeExpression(input_relation.columns[right_child.index], right_child, gpuBufferManager);
+
+        if (left_col->data_wrapper.type == ColumnType::FLOAT32) {
+            left_col = MaterializeCastFloatToDouble(left_col);
+        }
+        if (right_col->data_wrapper.type == ColumnType::FLOAT32) {
+            right_col = MaterializeCastFloatToDouble(right_col);
+        }
+
+        result = HandleBinaryExpression(left_col, right_col, gpuBufferManager, "*");
+
+        if (result->data_wrapper.type == ColumnType::FLOAT32) {
+            printf("Forcing result to FLOAT64 before aggregation.\n");
+            result = MaterializeCastFloatToDouble(result);
+        }
+    } 
+    break;
         } case ExpressionClass::BOUND_OPERATOR: {
               throw NotImplementedException("Operator expression is not supported");
               break;
@@ -492,6 +515,7 @@ GPUExpressionExecutor::ProjectionRecursiveExpression(GPUIntermediateRelation& in
               throw InternalException("Attempting to execute expression of unknown type!");
         }
     }
+    
     printf("Writing projection result to idx %ld\n", output_idx);
     if (depth == 0) {
         if (expr.expression_class == ExpressionClass::BOUND_REF) {

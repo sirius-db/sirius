@@ -1,7 +1,44 @@
 #include "cuda_helper.cuh"
 #include "gpu_columns.hpp"
 
+
+
+
 namespace duckdb {
+
+
+    extern "C" {
+
+        __global__ void CastFloat32ToFloat64Kernel(const float *in_data, double *out_data, size_t count) {
+            size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+            if (idx < count) {
+                out_data[idx] = static_cast<double>(in_data[idx]);
+            }
+        }
+        
+        GPUColumn *MaterializeCastFloatToDouble(GPUColumn *input_col) {
+            if (!input_col || input_col->data_wrapper.type != ColumnType::FLOAT32) {
+                printf("MaterializeCastFloatToDouble: Not a float32 column!\n");
+                return input_col; 
+            }
+        
+            float *gpu_in_ptr  = reinterpret_cast<float*>(input_col->data_wrapper.data);
+            size_t count       = input_col->column_length;
+        
+            GPUBufferManager &mgr = GPUBufferManager::GetInstance();
+            double *gpu_out_ptr   = mgr.customCudaMalloc<double>(count, 0, 0);
+        
+            dim3 block(256);
+            dim3 grid((count + block.x - 1) / block.x);
+        
+            CastFloat32ToFloat64Kernel<<<grid, block>>>(gpu_in_ptr, gpu_out_ptr, count);
+            cudaDeviceSynchronize();
+        
+            return new GPUColumn(count, ColumnType::FLOAT64, reinterpret_cast<uint8_t*>(gpu_out_ptr));
+        }
+        
+        
+        } // extern "C"
 
 template <typename T, int B, int I>
 __global__ void materialize_expression(const T *a, T* result, uint64_t *row_ids, uint64_t N) {

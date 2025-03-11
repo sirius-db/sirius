@@ -131,6 +131,8 @@ GPUPhysicalMaterializedCollector::FinalMaterializeString(GPUIntermediateRelation
 size_t
 GPUPhysicalMaterializedCollector::FinalMaterialize(GPUIntermediateRelation input_relation, GPUIntermediateRelation &output_relation, size_t col) const {
 	size_t size_bytes;
+	size_t test_size = input_relation.columns[col]->column_length;
+	printf("Test size: %zu\n", test_size);
 	
 	switch (input_relation.columns[col]->data_wrapper.type) {
 	case ColumnType::INT64:

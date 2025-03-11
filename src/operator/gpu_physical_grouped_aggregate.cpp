@@ -12,7 +12,23 @@ ResolveTypeCombineColumns(GPUColumn* column1, GPUColumn* column2, GPUBufferManag
 	T* combine = gpuBufferManager->customCudaMalloc<T>(column1->column_length + column2->column_length, 0, 0);
 	T* a = reinterpret_cast<T*> (column1->data_wrapper.data);
 	T* b = reinterpret_cast<T*> (column2->data_wrapper.data);
-	combineColumns<T>(a, b, combine, column1->column_length, column2->column_length);
+	// Determine the key_type based on the type T
+    int key_type;
+    if (std::is_same<T, int32_t>::value) {
+        key_type = 0;
+    } else if (std::is_same<T, float>::value) {
+        key_type = 1;
+    } else if (std::is_same<T, uint64_t>::value) {
+        key_type = 2;
+    } else if (std::is_same<T, double>::value) {
+        key_type = 3;
+    } else {
+        throw std::runtime_error("Unsupported type for combineColumns");
+    }
+
+    // Call the non-template combineColumns function
+    combineColumns(reinterpret_cast<void*>(a), reinterpret_cast<void*>(b), reinterpret_cast<void*>(combine), column1->column_length, column2->column_length, key_type);
+
 	GPUColumn* result = new GPUColumn(column1->column_length + column2->column_length, column1->data_wrapper.type, reinterpret_cast<uint8_t*>(combine));
 	if (column1->is_unique && column2->is_unique) {
 		result->is_unique = true;
@@ -44,15 +60,16 @@ CombineColumns(GPUColumn* column1, GPUColumn* column2, GPUBufferManager* gpuBuff
     switch(column1->data_wrapper.type) {
       case ColumnType::INT64:
 		return ResolveTypeCombineColumns<uint64_t>(column1, column2, gpuBufferManager);
-		break;
-      case ColumnType::FLOAT64:
+	  case ColumnType::FLOAT64:
 		return ResolveTypeCombineColumns<double>(column1, column2, gpuBufferManager);
-		break;
-      case ColumnType::VARCHAR:
+	  case ColumnType::INT32:
+		return ResolveTypeCombineColumns<int32_t>(column1, column2, gpuBufferManager);
+	  case ColumnType::FLOAT32:
+		return ResolveTypeCombineColumns<float>(column1, column2, gpuBufferManager);
+	  case ColumnType::VARCHAR:
 		return ResolveTypeCombineStrings(column1, column2, gpuBufferManager);
-		break;
 	  default:
-        throw NotImplementedException("Unsupported column type");
+		throw NotImplementedException("Unsupported column type");
     }
 }
 
@@ -85,8 +102,17 @@ ResolveTypeGroupByAggregateExpression(GPUColumn** &group_by_keys, GPUColumn** &a
 		} else if (expr.function.name.compare("sum") == 0) {
 			agg_mode[agg_idx] = 0;
 			aggregate_data[agg_idx] = (aggregate_keys[agg_idx]->data_wrapper.data);
-		} else if (expr.function.name.compare("avg") == 0) {
-			if (aggregate_keys[agg_idx]->data_wrapper.type != ColumnType::FLOAT64) throw NotImplementedException("Column type is supposed to be double");
+		} else if (expr.function.name.compare("sum_no_overflow") == 0 && aggregate_keys[agg_idx]->data_wrapper.data == nullptr) {
+			agg_mode[agg_idx] = 5;
+			aggregate_data[agg_idx] = nullptr;
+		} else if (expr.function.name.compare("sum_no_overflow") == 0) {
+			agg_mode[agg_idx] = 0;
+			aggregate_data[agg_idx] = (aggregate_keys[agg_idx]->data_wrapper.data);
+		}else if (expr.function.name.compare("avg") == 0) {
+			if (aggregate_keys[agg_idx]->data_wrapper.type != ColumnType::FLOAT64 &&
+				aggregate_keys[agg_idx]->data_wrapper.type != ColumnType::FLOAT32) {
+				throw NotImplementedException("Column type must be FLOAT32 or FLOAT64 for avg");
+			}
 			agg_mode[agg_idx] = 1;
 			aggregate_data[agg_idx] = (aggregate_keys[agg_idx]->data_wrapper.data);
 		} else if (expr.function.name.compare("max") == 0) {
@@ -119,7 +145,7 @@ ResolveTypeGroupByAggregateExpression(GPUColumn** &group_by_keys, GPUColumn** &a
 	for (int agg_idx = 0; agg_idx < aggregates.size(); agg_idx++) {
 		auto& expr = aggregates[agg_idx]->Cast<BoundAggregateExpression>();
 		if (expr.function.name.compare("count_star") == 0 || expr.function.name.compare("count") == 0) {
-			aggregate_keys[agg_idx] = new GPUColumn(count[0], ColumnType::INT64, reinterpret_cast<uint8_t*>(aggregate_data[agg_idx]));
+			aggregate_keys[agg_idx] = new GPUColumn(count[0], ColumnType::INT32, reinterpret_cast<uint8_t*>(aggregate_data[agg_idx]));
 		} else {
 			aggregate_keys[agg_idx] = new GPUColumn(count[0], aggregate_keys[agg_idx]->data_wrapper.type, reinterpret_cast<uint8_t*>(aggregate_data[agg_idx]));
 		}
@@ -234,23 +260,70 @@ HandleGroupByAggregateExpression(GPUColumn** &group_by_keys, GPUColumn** &aggreg
 			ResolveTypeGroupByString<uint64_t>(group_by_keys, aggregate_keys, gpuBufferManager, aggregates, num_group_keys);
 		} else if (aggregate_type == ColumnType::FLOAT64) {
 			ResolveTypeGroupByString<double>(group_by_keys, aggregate_keys, gpuBufferManager, aggregates, num_group_keys);
+		} else if (aggregate_type == ColumnType::INT32) {
+			ResolveTypeGroupByString<int32_t>(group_by_keys, aggregate_keys, gpuBufferManager, aggregates, num_group_keys);
+		} else if (aggregate_type == ColumnType::FLOAT32) {
+			ResolveTypeGroupByString<float>(group_by_keys, aggregate_keys, gpuBufferManager, aggregates, num_group_keys);
 		} else {
 			throw NotImplementedException("Unsupported column type");
 		}
 	} else {
 		switch(group_by_keys[0]->data_wrapper.type) {
-		case ColumnType::INT64:
-			if (aggregate_type == ColumnType::INT64) {
-				ResolveTypeGroupByAggregateExpression<uint64_t, uint64_t>(group_by_keys, aggregate_keys, gpuBufferManager, aggregates, num_group_keys);
-			} else if (aggregate_type == ColumnType::FLOAT64) {
-				ResolveTypeGroupByAggregateExpression<uint64_t, double>(group_by_keys, aggregate_keys, gpuBufferManager, aggregates, num_group_keys);
-			} else throw NotImplementedException("Unsupported column type");
-			break;
-		case ColumnType::FLOAT64:
-			throw NotImplementedException("Unsupported column type");
-		default:
-			throw NotImplementedException("Unsupported column type");
-		}
+            case ColumnType::INT64:
+                if (aggregate_type == ColumnType::INT64) {
+                    ResolveTypeGroupByAggregateExpression<uint64_t, uint64_t>(group_by_keys, aggregate_keys, gpuBufferManager, aggregates, num_group_keys);
+                } else if (aggregate_type == ColumnType::FLOAT64) {
+                    ResolveTypeGroupByAggregateExpression<uint64_t, double>(group_by_keys, aggregate_keys, gpuBufferManager, aggregates, num_group_keys);
+                } else if (aggregate_type == ColumnType::INT32) {
+                    ResolveTypeGroupByAggregateExpression<uint64_t, int32_t>(group_by_keys, aggregate_keys, gpuBufferManager, aggregates, num_group_keys);
+                } else if (aggregate_type == ColumnType::FLOAT32) {
+                    ResolveTypeGroupByAggregateExpression<uint64_t, float>(group_by_keys, aggregate_keys, gpuBufferManager, aggregates, num_group_keys);
+                } else {
+                    throw NotImplementedException("Unsupported column type");
+                }
+                break;
+            case ColumnType::INT32:
+				if (aggregate_type == ColumnType::INT32) {
+                    ResolveTypeGroupByAggregateExpression<uint64_t, int32_t>(group_by_keys, aggregate_keys, gpuBufferManager, aggregates, num_group_keys);
+                } else if (aggregate_type == ColumnType::FLOAT32) {
+                    ResolveTypeGroupByAggregateExpression<uint64_t, float>(group_by_keys, aggregate_keys, gpuBufferManager, aggregates, num_group_keys);
+                } else if (aggregate_type == ColumnType::INT64) {
+                    ResolveTypeGroupByAggregateExpression<uint64_t, uint64_t>(group_by_keys, aggregate_keys, gpuBufferManager, aggregates, num_group_keys);
+                } else if (aggregate_type == ColumnType::FLOAT64) {
+                    ResolveTypeGroupByAggregateExpression<uint64_t, double>(group_by_keys, aggregate_keys, gpuBufferManager, aggregates, num_group_keys);
+                } else {
+                    throw NotImplementedException("Unsupported column type");
+                }
+                break;
+            case ColumnType::FLOAT64:
+                if (aggregate_type == ColumnType::FLOAT64) {
+                    ResolveTypeGroupByAggregateExpression<uint64_t, double>(group_by_keys, aggregate_keys, gpuBufferManager, aggregates, num_group_keys);
+                } else if (aggregate_type == ColumnType::INT32) {
+                    ResolveTypeGroupByAggregateExpression<uint64_t, int32_t>(group_by_keys, aggregate_keys, gpuBufferManager, aggregates, num_group_keys);
+                } else if (aggregate_type == ColumnType::INT64) {
+                    ResolveTypeGroupByAggregateExpression<uint64_t, uint64_t>(group_by_keys, aggregate_keys, gpuBufferManager, aggregates, num_group_keys);
+                } else if (aggregate_type == ColumnType::FLOAT32) {
+                    ResolveTypeGroupByAggregateExpression<uint64_t, float>(group_by_keys, aggregate_keys, gpuBufferManager, aggregates, num_group_keys);
+                } else {
+                    throw NotImplementedException("Unsupported column type");
+                }
+                break;
+            case ColumnType::FLOAT32:
+                if (aggregate_type == ColumnType::FLOAT32) {
+                    ResolveTypeGroupByAggregateExpression<uint64_t, float>(group_by_keys, aggregate_keys, gpuBufferManager, aggregates, num_group_keys);
+                } else if (aggregate_type == ColumnType::INT32) {
+                    ResolveTypeGroupByAggregateExpression<uint64_t, int32_t>(group_by_keys, aggregate_keys, gpuBufferManager, aggregates, num_group_keys);
+                } else if (aggregate_type == ColumnType::INT64) {
+                    ResolveTypeGroupByAggregateExpression<uint64_t, uint64_t>(group_by_keys, aggregate_keys, gpuBufferManager, aggregates, num_group_keys);
+                } else if (aggregate_type == ColumnType::FLOAT64) {
+                    ResolveTypeGroupByAggregateExpression<uint64_t, double>(group_by_keys, aggregate_keys, gpuBufferManager, aggregates, num_group_keys);
+                } else {
+                    throw NotImplementedException("Unsupported column type");
+                }
+                break;
+            default:
+                throw NotImplementedException("Unsupported column type");
+        }
 	}
 }
 
@@ -265,7 +338,23 @@ void ResolveTypeDuplicateElimination(GPUColumn** &group_by_keys, GPUBufferManage
 	}
 	size_t size = group_by_keys[0]->column_length;
 
-	groupedWithoutAggregate<T>(group_by_data, count, size, num_group_keys);
+	// Determine the key_type based on the type T
+    int key_type;
+    if (std::is_same<T, int32_t>::value) {
+        key_type = 0;
+    } else if (std::is_same<T, float>::value) {
+        key_type = 1;
+    } else if (std::is_same<T, uint64_t>::value) {
+        key_type = 2;
+    } else if (std::is_same<T, double>::value) {
+        key_type = 3;
+    } else {
+        throw std::runtime_error("Unsupported type for groupedWithoutAggregate");
+    }
+
+    // Call groupedWithoutAggregate with the key_type
+    groupedWithoutAggregate<T>(group_by_data, count, size, num_group_keys, key_type);
+
 
 	// Reading groupby columns based on the grouping set
 	for (idx_t group = 0; group < num_group_keys; group++) {
@@ -278,10 +367,16 @@ void ResolveTypeDuplicateElimination(GPUColumn** &group_by_keys, GPUBufferManage
 void HandleDuplicateElimination(GPUColumn** &group_by_keys, GPUBufferManager* gpuBufferManager, int num_group_keys) {
     switch(group_by_keys[0]->data_wrapper.type) {
       case ColumnType::INT64:
-	  	ResolveTypeDuplicateElimination<uint64_t>(group_by_keys, gpuBufferManager, num_group_keys);
-		break;
+        ResolveTypeDuplicateElimination<uint64_t>(group_by_keys, gpuBufferManager, num_group_keys);
+        break;
+      case ColumnType::INT32:
+        ResolveTypeDuplicateElimination<int32_t>(group_by_keys, gpuBufferManager, num_group_keys);
+        break;
       case ColumnType::FLOAT64:
-	  	throw NotImplementedException("Unsupported column type");
+        throw NotImplementedException("Unsupported column type");
+      case ColumnType::FLOAT32:
+        ResolveTypeDuplicateElimination<float>(group_by_keys, gpuBufferManager, num_group_keys);
+        break;
       default:
         throw NotImplementedException("Unsupported column type");
     }
@@ -337,16 +432,38 @@ void ResolveTypeDistinctGroupBy(GPUColumn** &group_by_keys, GPUColumn** &aggrega
 void HandleDistinctGroupBy(GPUColumn** &group_by_keys, GPUColumn** &aggregate_keys, GPUBufferManager* gpuBufferManager, DistinctAggregateCollectionInfo &distinct_info, int num_group_keys) {
     switch(group_by_keys[0]->data_wrapper.type) {
       case ColumnType::INT64: {
-	  	if (aggregate_keys[0]->data_wrapper.type == ColumnType::INT64) {
-			ResolveTypeDistinctGroupBy<uint64_t, uint64_t>(group_by_keys, aggregate_keys, gpuBufferManager, distinct_info, num_group_keys);
+        if (aggregate_keys[0]->data_wrapper.type == ColumnType::INT64) {
+            ResolveTypeDistinctGroupBy<uint64_t, uint64_t>(group_by_keys, aggregate_keys, gpuBufferManager, distinct_info, num_group_keys);
+        } else if (aggregate_keys[0]->data_wrapper.type == ColumnType::FLOAT64) {
+            ResolveTypeDistinctGroupBy<uint64_t, double>(group_by_keys, aggregate_keys, gpuBufferManager, distinct_info, num_group_keys);
+        } else throw NotImplementedException("Unsupported column type");
+        break;
+      }
+      case ColumnType::INT32: {
+        if (aggregate_keys[0]->data_wrapper.type == ColumnType::INT32) {
+            ResolveTypeDistinctGroupBy<int32_t, int32_t>(group_by_keys, aggregate_keys, gpuBufferManager, distinct_info, num_group_keys);
+        } else if (aggregate_keys[0]->data_wrapper.type == ColumnType::FLOAT32) {
+            ResolveTypeDistinctGroupBy<int32_t, float>(group_by_keys, aggregate_keys, gpuBufferManager, distinct_info, num_group_keys);
+        } else throw NotImplementedException("Unsupported column type");
+        break;
+      }
+      case ColumnType::FLOAT64: {
+		if (aggregate_keys[0]->data_wrapper.type == ColumnType::FLOAT64) {
+			ResolveTypeDistinctGroupBy<double, double>(group_by_keys, aggregate_keys, gpuBufferManager, distinct_info, num_group_keys);
 		} else throw NotImplementedException("Unsupported column type");
 		break;
-	  } case ColumnType::FLOAT64:
-	  	throw NotImplementedException("Unsupported column type");
+	  }
+      case ColumnType::FLOAT32: {
+        if (aggregate_keys[0]->data_wrapper.type == ColumnType::FLOAT32) {
+            ResolveTypeDistinctGroupBy<float, float>(group_by_keys, aggregate_keys, gpuBufferManager, distinct_info, num_group_keys);
+        } else throw NotImplementedException("Unsupported column type");
+        break;
+      }
       default:
         throw NotImplementedException("Unsupported column type");
     }
 }
+
 
 
 static vector<LogicalType> CreateGroupChunkTypes(vector<unique_ptr<Expression>> &groups) {
@@ -711,5 +828,6 @@ GPUPhysicalGroupedAggregate::SinkDistinctGrouping(GPUIntermediateRelation& input
 	}
 
 }
+
 
 } // namespace duckdb

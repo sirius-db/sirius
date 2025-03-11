@@ -10,6 +10,7 @@ call gpu_caching("lineitem.l_linestatus");
 call gpu_caching("lineitem.l_shipdate");
 call gpu_caching("lineitem.l_commitdate");
 call gpu_caching("lineitem.l_receiptdate");
+call gpu_caching("lineitem.l_linenumber");
 call gpu_caching("lineitem.l_shipinstruct");
 call gpu_caching("lineitem.l_shipmode");
 

@@ -175,8 +175,9 @@ __global__ void extract_year<BLOCK_THREADS, ITEMS_PER_THREAD>(uint64_t *date, ui
 // Define the host function that launches the CUDA kernel
 void commonArithmeticExpression(double *a, double *b, double* c, double* d, double *result, uint64_t N, int op_mode) {
     CHECK_ERROR();
+    printf("commonArithmeticExpression called with N: %lu, op_mode: %d\n", N, op_mode);
     if (N == 0) {
-        printf("N is 0\n");
+        printf("N is 0 - Skipping kernel execution\n");
         return;
     }
     printf("Launching Binary Expression Kernel\n");

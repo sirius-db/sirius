@@ -10,6 +10,11 @@
 
 namespace duckdb {
 
+	extern "C" {
+		// Forward declaration for CUDA-based float->double cast function
+		GPUColumn *MaterializeCastFloatToDouble(GPUColumn *input_col);
+	}
+
 bool
 GPUExpressionExecutor::HandlingSpecificProjection(GPUIntermediateRelation& input_relation, GPUIntermediateRelation& output_relation, Expression& expression, int output_idx) {
 
@@ -160,8 +165,20 @@ GPUExpressionExecutor::HandlingSpecificProjection(GPUIntermediateRelation& input
 
 						auto materialize_extendedprice = HandleMaterializeExpression(input_relation.columns[l_extendedprice_or_4], ref_expr, gpuBufferManager);
 						auto materialize_discount = HandleMaterializeExpression(input_relation.columns[l_discount], function_expr.children[1]->Cast<BoundReferenceExpression>(), gpuBufferManager);
-						double* a = reinterpret_cast<double*> (materialize_extendedprice->data_wrapper.data);
-						double* b = reinterpret_cast<double*> (materialize_discount->data_wrapper.data);
+						
+						GPUColumn* extprice_col = materialize_extendedprice;
+						if (extprice_col->data_wrapper.type == ColumnType::FLOAT32) {
+							// Real float->double cast on GPU
+							extprice_col = MaterializeCastFloatToDouble(extprice_col);
+						}
+						GPUColumn* discount_col = materialize_discount;
+						if (discount_col->data_wrapper.type == ColumnType::FLOAT32) {
+							discount_col = MaterializeCastFloatToDouble(discount_col);
+						}
+
+						// Now the pointers are truly double*
+						double* a = reinterpret_cast<double*>(extprice_col->data_wrapper.data);
+						double* b = reinterpret_cast<double*>(discount_col->data_wrapper.data);
 						size_t size = materialize_extendedprice->column_length;
 						double* out = gpuBufferManager->customCudaMalloc<double>(size, 0, 0);
 						commonArithmeticExpression(a, b, a, a, out, size, 0);
@@ -229,6 +246,9 @@ GPUExpressionExecutor::HandlingSpecificProjection(GPUIntermediateRelation& input
 
         if (result) {
 			printf("Writing projection result to idx %ld\n", output_idx);
+			output_relation.columns[output_idx] = new GPUColumn(
+				result->column_length, ColumnType::FLOAT64, result->data_wrapper.data
+			);
             output_relation.columns[output_idx] = result;
             output_relation.columns[output_idx]->row_ids = nullptr;
             output_relation.columns[output_idx]->row_id_count = 0;

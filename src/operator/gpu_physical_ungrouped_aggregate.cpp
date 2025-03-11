@@ -4,9 +4,16 @@
 
 namespace duckdb {
 
+	extern "C" {
+		// Forward declaration for CUDA-based float->double cast function
+		GPUColumn *MaterializeCastFloatToDouble(GPUColumn *input_col);
+	}
+	
+
 template <typename T>
 void
 ResolveTypeAggregateExpression(GPUColumn** &aggregate_keys, GPUBufferManager* gpuBufferManager, const vector<unique_ptr<Expression>> &aggregates) {
+	printf("ResolveTypeAggregateExpression - First column type: %d\n", aggregate_keys[0]->data_wrapper.type);
 	uint8_t** aggregate_data = new uint8_t*[aggregates.size()];
 	uint8_t** result = new uint8_t*[aggregates.size()];
 	for (int agg_idx = 0; agg_idx < aggregates.size(); agg_idx++) {
@@ -19,20 +26,29 @@ ResolveTypeAggregateExpression(GPUColumn** &aggregate_keys, GPUBufferManager* gp
 
 	for (int agg_idx = 0; agg_idx < aggregates.size(); agg_idx++) {
 		auto& expr = aggregates[agg_idx]->Cast<BoundAggregateExpression>();
+		printf("Aggregation input type for %s: %d (expected FLOAT64 for SUM)\n", expr.function.name.c_str(), aggregate_keys[agg_idx]->data_wrapper.type);
+
 		if (expr.function.name.compare("count") == 0 && aggregate_keys[agg_idx]->data_wrapper.data == nullptr) {
 			agg_mode[agg_idx] = 5;
 			aggregate_data[agg_idx] = nullptr;
-		} else if (expr.function.name.compare("sum") == 0 && aggregate_keys[agg_idx]->data_wrapper.data == nullptr) {
+		} else if ((expr.function.name.compare("sum") == 0 )&& aggregate_keys[agg_idx]->data_wrapper.data == nullptr) {
 			agg_mode[agg_idx] = 5;
 			aggregate_data[agg_idx] = nullptr;
 		} else if (expr.function.name.compare("sum") == 0) {
 			agg_mode[agg_idx] = 0;
 			aggregate_data[agg_idx] = (aggregate_keys[agg_idx]->data_wrapper.data);
-		} else if (expr.function.name.compare("avg") == 0) {
-			if (aggregate_keys[agg_idx]->data_wrapper.type != ColumnType::FLOAT64) throw NotImplementedException("Column type is supposed to be double");
-			agg_mode[agg_idx] = 1;
+			printf("Assigned SUM input type: %d\n", aggregate_keys[agg_idx]->data_wrapper.type);
+		} else if ((expr.function.name.compare("sum_no_overflow") == 0 )&& aggregate_keys[agg_idx]->data_wrapper.data == nullptr) {
+			agg_mode[agg_idx] = 5;
+			aggregate_data[agg_idx] = nullptr;
+		} else if (expr.function.name.compare("sum_no_overflow") == 0) {
+			agg_mode[agg_idx] = 7;
 			aggregate_data[agg_idx] = (aggregate_keys[agg_idx]->data_wrapper.data);
-		} else if (expr.function.name.compare("max") == 0) {
+		}else if (expr.function.name.compare("avg") == 0) {
+            //printf("Column type: %d\n", aggregate_keys[agg_idx]->data_wrapper.type); 
+            agg_mode[agg_idx] = 1;
+            aggregate_data[agg_idx] = (aggregate_keys[agg_idx]->data_wrapper.data);
+        } else if (expr.function.name.compare("max") == 0) {
 			agg_mode[agg_idx] = 2;
 			aggregate_data[agg_idx] = (aggregate_keys[agg_idx]->data_wrapper.data);
 		} else if (expr.function.name.compare("min") == 0) {
@@ -54,32 +70,89 @@ ResolveTypeAggregateExpression(GPUColumn** &aggregate_keys, GPUBufferManager* gp
 
 	ungroupedAggregate<T>(aggregate_data, result, size, agg_mode, aggregates.size());
 
-	for (int agg_idx = 0; agg_idx < aggregates.size(); agg_idx++) {
-		auto& expr = aggregates[agg_idx]->Cast<BoundAggregateExpression>();
-		if (expr.function.name.compare("count_star") == 0 || expr.function.name.compare("count") == 0) {
+	for (int agg_idx = 0; agg_idx < (int)aggregates.size(); agg_idx++) {
+		auto &expr = aggregates[agg_idx]->Cast<BoundAggregateExpression>();
+		if (expr.function.name == "count_star" || expr.function.name == "count") {
 			aggregate_keys[agg_idx] = new GPUColumn(1, ColumnType::INT64, reinterpret_cast<uint8_t*>(result[agg_idx]));
-			// if (result[agg_idx] != nullptr) printGPUColumn<uint64_t>(reinterpret_cast<uint64_t*>(aggregate_keys[agg_idx]->data_wrapper.data), aggregate_keys[agg_idx]->column_length, 0);
-		} else if (size == 0){
+		} else if (size == 0) {
 			aggregate_keys[agg_idx] = new GPUColumn(0, ColumnType::INT64, reinterpret_cast<uint8_t*>(result[agg_idx]));
-		} else { 
-			aggregate_keys[agg_idx] = new GPUColumn(1, aggregate_keys[agg_idx]->data_wrapper.type, reinterpret_cast<uint8_t*>(result[agg_idx]));
+		} else {
+			if (expr.function.name == "sum" || expr.function.name == "sum_no_overflow" || expr.function.name == "avg") {
+				printf("Setting aggregation output type to FLOAT64 for SUM\n");
+				aggregate_keys[agg_idx] = new GPUColumn(1, ColumnType::FLOAT64, reinterpret_cast<uint8_t*>(result[agg_idx]));
+			} else {
+				aggregate_keys[agg_idx] = new GPUColumn(1, aggregate_keys[agg_idx]->data_wrapper.type, reinterpret_cast<uint8_t*>(result[agg_idx]));
+			}
 		}
 	}
 }
 
-void
-HandleAggregateExpression(GPUColumn** &aggregate_keys, GPUBufferManager* gpuBufferManager, const vector<unique_ptr<Expression>> &aggregates) {
-    switch(aggregate_keys[0]->data_wrapper.type) {
-      case ColumnType::INT64:
-		ResolveTypeAggregateExpression<uint64_t>(aggregate_keys, gpuBufferManager, aggregates);
-		break;
-      case ColumnType::FLOAT64:
-	  	ResolveTypeAggregateExpression<double>(aggregate_keys, gpuBufferManager, aggregates);
-		break;
-      default:
-        throw NotImplementedException("Unsupported column type");
+static bool AggregateNeedsDouble(const BoundAggregateExpression &agg) {
+	auto &fname = agg.function.name;
+	if (fname == "sum" || fname == "sum_no_overflow" || fname == "avg") {
+		return true;
+	}
+	return false;
+}
+
+void HandleAggregateExpression(
+    GPUColumn** &aggregate_keys,
+    GPUBufferManager* gpuBufferManager,
+    const vector<unique_ptr<Expression>> &aggregates
+) {
+    bool any_double_agg = false;
+    for (auto &expr_ptr : aggregates) {
+        auto &agg_expr = expr_ptr->Cast<BoundAggregateExpression>();
+        if (AggregateNeedsDouble(agg_expr)) {
+            any_double_agg = true;
+            break;
+        }
+    }
+
+    printf("HandleAggregateExpression - First column type: %d\n", aggregate_keys[0]->data_wrapper.type);
+
+    // If we require double agg but see type=0, forcibly label it as FLOAT64
+    if (any_double_agg && static_cast<int>(aggregate_keys[0]->data_wrapper.type) == 0) {
+        printf("HACK: aggregator sees type=0 => forcibly set to FLOAT64\n");
+        // We trust the memory is actually double; skip trying to cast from float32
+        aggregate_keys[0]->data_wrapper.type = ColumnType::FLOAT64;
+    }
+
+    // If we still see type FLOAT32, attempt the cast
+    if (any_double_agg && aggregate_keys[0]->data_wrapper.type == ColumnType::FLOAT32) {
+        printf("Forcing SUM input to FLOAT64 (cast from float32)\n");
+        aggregate_keys[0] = MaterializeCastFloatToDouble(aggregate_keys[0]);
+    }
+
+    if (any_double_agg) {
+        printf("Using double precision for aggregation\n");
+        ResolveTypeAggregateExpression<double>(aggregate_keys, gpuBufferManager, aggregates);
+    } else {
+        switch (aggregate_keys[0]->data_wrapper.type) {
+        case ColumnType::INT64:
+            printf("Aggregating as INT64\n");
+            ResolveTypeAggregateExpression<uint64_t>(aggregate_keys, gpuBufferManager, aggregates);
+            break;
+        case ColumnType::FLOAT64:
+            printf("Aggregating as FLOAT64\n");
+            ResolveTypeAggregateExpression<double>(aggregate_keys, gpuBufferManager, aggregates);
+            break;
+        case ColumnType::INT32:
+            printf("Aggregating as INT32\n");
+            ResolveTypeAggregateExpression<int>(aggregate_keys, gpuBufferManager, aggregates);
+            break;
+        case ColumnType::FLOAT32:
+            printf("Aggregating as FLOAT32\n");
+            ResolveTypeAggregateExpression<float>(aggregate_keys, gpuBufferManager, aggregates);
+            break;
+        default:
+            printf("ERROR: Unsupported column type for aggregation! Type: %d\n", aggregate_keys[0]->data_wrapper.type);
+            throw NotImplementedException("Unsupported column type");
+        }
     }
 }
+
+
 
 GPUPhysicalUngroupedAggregate::GPUPhysicalUngroupedAggregate(vector<LogicalType> types,
                                                        vector<unique_ptr<Expression>> expressions,
@@ -183,12 +256,14 @@ GPUPhysicalUngroupedAggregate::Sink(GPUIntermediateRelation &input_relation) con
   	return SinkResultType::FINISHED;
 }
 
+
 // SourceResultType
 // GPUPhysicalUngroupedAggregate::GetData(ExecutionContext &context, GPUIntermediateRelation &output_relation, OperatorSourceInput &input) const {
   
 SourceResultType
 GPUPhysicalUngroupedAggregate::GetData(GPUIntermediateRelation &output_relation) const {
   for (int col = 0; col < aggregation_result->columns.size(); col++) {
+	printf("Final aggregation output type: %d (expected FLOAT64 for SUM)\n", aggregation_result->columns[col]->data_wrapper.type);
     printf("Writing aggregation result to column %ld\n", col);
     // output_relation.columns[col] = aggregation_result->columns[col];
 	output_relation.columns[col] = new GPUColumn(aggregation_result->columns[col]->column_length, aggregation_result->columns[col]->data_wrapper.type, aggregation_result->columns[col]->data_wrapper.data);
@@ -198,6 +273,7 @@ GPUPhysicalUngroupedAggregate::GetData(GPUIntermediateRelation &output_relation)
 
   return SourceResultType::FINISHED;
 }
+
 
 // void
 // GPUPhysicalUngroupedAggregate::SinkDistinct(ExecutionContext &context, GPUIntermediateRelation &input_relation, OperatorSinkInput &input) const {

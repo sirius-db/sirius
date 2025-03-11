@@ -473,13 +473,17 @@ void hashGroupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* co
 
     V init_max; V init_min;
     if constexpr (std::is_same<V, double>::value) {
-        // Do something if T is int
-        std::cout << "V is double" << std::endl;
-        init_max = -DBL_MAX; init_min = DBL_MAX;
+        init_max = -DBL_MAX;
+        init_min = DBL_MAX;
+    } else if constexpr (std::is_same<V, float>::value) {
+        init_max = -FLT_MAX;
+        init_min = FLT_MAX;
+    } else if constexpr (std::is_same<V, int32_t>::value) {
+        init_max = INT32_MIN;
+        init_min = INT32_MAX;
     } else if constexpr (std::is_same<V, uint64_t>::value) {
-        // Do something else if T is not int
-        std::cout << "V is not double" << std::endl;
-        init_max = INT_MIN; init_min = INT64_MAX;
+        init_max = 0;
+        init_min = UINT64_MAX;
     } else {
         assert(0);
     }
@@ -577,9 +581,39 @@ void hashGroupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* co
 }
 
 template
-void hashGroupedAggregate<uint64_t, uint64_t>(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count, uint64_t N, uint64_t num_keys, uint64_t num_aggregates, int* agg_mode);
+void hashGroupedAggregate<uint64_t, uint64_t>(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count, 
+                                              uint64_t N, uint64_t num_keys, uint64_t num_aggregates, int* agg_mode);
 
 template
-void hashGroupedAggregate<uint64_t, double>(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count, uint64_t N, uint64_t num_keys, uint64_t num_aggregates, int* agg_mode);
+void hashGroupedAggregate<uint64_t, double>(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count, 
+                                              uint64_t N, uint64_t num_keys, uint64_t num_aggregates, int* agg_mode);
 
+template
+void hashGroupedAggregate<int32_t, int32_t>(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count, 
+                                              uint64_t N, uint64_t num_keys, uint64_t num_aggregates, int* agg_mode);
+
+template
+void hashGroupedAggregate<int32_t, float>(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count, 
+                                              uint64_t N, uint64_t num_keys, uint64_t num_aggregates, int* agg_mode);
+template
+void hashGroupedAggregate<float, float>(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count, 
+                                              uint64_t N, uint64_t num_keys, uint64_t num_aggregates, int* agg_mode);
+template
+void hashGroupedAggregate<unsigned long, float>(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count, 
+                                              uint64_t N, uint64_t num_keys, uint64_t num_aggregates, int* agg_mode);
+template
+void hashGroupedAggregate<unsigned long, int>(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count, 
+                                              uint64_t N, uint64_t num_keys, uint64_t num_aggregates, int* agg_mode);
+
+template __global__ void hash_groupby_gmem<float, uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD>(
+    float**, uint64_t**, unsigned long long*, uint64_t, uint64_t, uint64_t,  uint64_t, int*, bool);
+
+template __global__ void hash_groupby_gmem<double, double, BLOCK_THREADS, ITEMS_PER_THREAD>(
+    double**, double**, unsigned long long*, uint64_t, uint64_t, uint64_t, uint64_t, int*, bool);
+
+template __global__ void hash_groupby_gmem<uint64_t, float, BLOCK_THREADS, ITEMS_PER_THREAD>(
+    uint64_t**, float**, unsigned long long*, uint64_t, uint64_t, uint64_t, uint64_t, int*, bool);
+
+template __global__ void hash_groupby_gmem<unsigned long, int, BLOCK_THREADS, ITEMS_PER_THREAD>(
+    unsigned long**, int**, unsigned long long*, uint64_t, uint64_t, uint64_t, uint64_t, int*, bool);
 }

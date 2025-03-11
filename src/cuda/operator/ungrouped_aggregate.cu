@@ -76,13 +76,16 @@ __global__ void ungrouped_aggregate(T *a, T *result, uint64_t N, int op_mode) {
 }
 
 template
-__global__ void ungrouped_aggregate<int, BLOCK_THREADS, ITEMS_PER_THREAD>(int *a, int *result, uint64_t N, int op_mode);
+__global__ void ungrouped_aggregate<int32_t, BLOCK_THREADS, ITEMS_PER_THREAD>(int32_t *a, int32_t *result, uint64_t N, int op_mode);
 template
 __global__ void ungrouped_aggregate<unsigned long long, BLOCK_THREADS, ITEMS_PER_THREAD>(unsigned long long *a, unsigned long long *result, uint64_t N, int op_mode);
 template
 __global__ void ungrouped_aggregate<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD>(uint64_t *a, uint64_t *result, uint64_t N, int op_mode);
 template
 __global__ void ungrouped_aggregate<double, BLOCK_THREADS, ITEMS_PER_THREAD>(double *a, double *result, uint64_t N, int op_mode);
+template
+__global__ void ungrouped_aggregate<float, BLOCK_THREADS, ITEMS_PER_THREAD>(float *a, float *result, uint64_t N, int op_mode);
+
 
 
 // Define the host function that launches the CUDA kernel
@@ -119,11 +122,32 @@ void ungroupedAggregate(uint8_t **a, uint8_t **result, uint64_t N, int* agg_mode
             CHECK_ERROR();
             cudaDeviceSynchronize();
             result[agg] = reinterpret_cast<uint8_t*> (result_temp);
+        } else if (agg_mode[agg] == 7) {
+ 
+            float *host_data = new float[N];
+            cudaMemcpy(host_data, a[agg], N * sizeof(float), cudaMemcpyDeviceToHost);
+            CHECK_ERROR();
+            cudaDeviceSynchronize();
+        
+            double partial_sum = 0.0;
+            for (uint64_t row = 0; row < N; row++) {
+                partial_sum += (double)host_data[row];
+            }
+            delete[] host_data;
+        
+            double *gpu_result = GPUBufferManager::GetInstance().customCudaMalloc<double>(1, 0, 0);
+        
+            cudaMemcpy(gpu_result, &partial_sum, sizeof(double), cudaMemcpyHostToDevice);
+            CHECK_ERROR();
+            cudaDeviceSynchronize();
+        
+            result[agg] = reinterpret_cast<uint8_t*>(gpu_result);
         } else if (agg_mode[agg] >= 0 && agg_mode[agg] <= 3) {
             T* a_temp = reinterpret_cast<T*> (a[agg]);
             T* result_temp = gpuBufferManager->customCudaMalloc<T>(1, 0, 0);
 
             if (agg_mode[agg] == 0) cudaMemset(result_temp, 0, sizeof(T));
+
             else if (agg_mode[agg] == 1) cudaMemset(result_temp, 0, sizeof(T));
             else if (agg_mode[agg] == 2) cudaMemcpy(result_temp, a_temp, sizeof(T), cudaMemcpyDeviceToDevice);
             else if (agg_mode[agg] == 3) cudaMemcpy(result_temp, a_temp, sizeof(T), cudaMemcpyDeviceToDevice);
@@ -160,10 +184,11 @@ void ungroupedAggregate(uint8_t **a, uint8_t **result, uint64_t N, int* agg_mode
 }
 
 template
-void ungroupedAggregate<int>(uint8_t **a, uint8_t **result, uint64_t N, int* agg_mode, int num_aggregates);
+void ungroupedAggregate<int32_t>(uint8_t **a, uint8_t **result, uint64_t N, int* agg_mode, int num_aggregates);
 template
 void ungroupedAggregate<uint64_t>(uint8_t **a, uint8_t **result, uint64_t N, int* agg_mode, int num_aggregates);
 template
 void ungroupedAggregate<double>(uint8_t **a, uint8_t **result, uint64_t N, int* agg_mode, int num_aggregates);
-
+template
+void ungroupedAggregate<float>(uint8_t **a, uint8_t **result, uint64_t N, int* agg_mode, int num_aggregates);
 } // namespace duckdb

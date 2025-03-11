@@ -11,11 +11,11 @@
 
 namespace duckdb {
 
-template <typename T, typename V>
-void groupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count, uint64_t N, uint64_t num_keys, uint64_t num_aggregates, int* agg_mode);
+template <typename V>
+void groupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count, uint64_t N, uint64_t num_keys, uint64_t num_aggregates, int* agg_mode, int key_type);
 
 template <typename T>
-void groupedWithoutAggregate(uint8_t **keys, uint64_t* count, uint64_t N, uint64_t num_keys);
+void groupedWithoutAggregate(uint8_t **keys, uint64_t* count, uint64_t N, uint64_t num_keys, int key_type);
 
 template <typename T, typename V>
 void groupedDistinctAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count, uint64_t N, uint64_t num_keys, uint64_t num_aggregates, int* distinct_mode);
@@ -26,8 +26,7 @@ void groupedStringAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t**
 template <typename T, typename V>
 void hashGroupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count, uint64_t N, uint64_t num_keys, uint64_t num_aggregates, int* agg_mode);
 
-template<typename T>
-void combineColumns(T* a, T* b, T* c, uint64_t N_a, uint64_t N_b);
+void combineColumns(void* a, void* b, void* c, uint64_t N_a, uint64_t N_b, int key_type);
 
 void combineStrings(uint8_t* a, uint8_t* b, uint8_t* c, 
         uint64_t* offset_a, uint64_t* offset_b, uint64_t* offset_c, 
