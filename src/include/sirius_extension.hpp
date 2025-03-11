@@ -2,6 +2,7 @@
 
 #include "duckdb.hpp"
 #include "communication.hpp"
+#include "gpu_context.hpp"
 
 namespace duckdb {
 
@@ -11,6 +12,29 @@ extern void myKernel();
 class GPUBufferManager;
 class SiriusExtension : public Extension {
 public:
+	struct GPUTableFunctionData : public TableFunctionData {
+		GPUTableFunctionData() = default;
+		shared_ptr<Relation> plan;
+		shared_ptr<GPUPreparedStatementData> gpu_prepared;
+		unique_ptr<QueryResult> res;
+		unique_ptr<Connection> conn;
+		unique_ptr<GPUContext> gpu_context;
+		string query;
+		bool enable_optimizer;
+		bool finished = false;
+	};
+
+	struct GPUCachingFunctionData : public TableFunctionData {
+		GPUCachingFunctionData() = default;
+		unique_ptr<Connection> conn;
+		GPUBufferManager *gpuBufferManager;
+		ColumnType type;
+		uint8_t *data;
+		string column;
+		string table;
+		bool finished = false;
+	};
+
 	void Load(DuckDB &db) override;
 	std::string Name() override;
 	void InitializeGPUExtension(Connection &con);

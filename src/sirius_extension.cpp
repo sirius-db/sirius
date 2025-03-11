@@ -23,34 +23,10 @@
 #include "to_substrait.hpp"
 #include "from_substrait.hpp"
 
-#include "gpu_context.hpp"
 #include "gpu_physical_plan_generator.hpp"
 #include "gpu_buffer_manager.hpp"
 
 namespace duckdb {
-
-struct GPUTableFunctionData : public TableFunctionData {
-	GPUTableFunctionData() = default;
-	shared_ptr<Relation> plan;
-	shared_ptr<GPUPreparedStatementData> gpu_prepared;
-	unique_ptr<QueryResult> res;
-	unique_ptr<Connection> conn;
-	unique_ptr<GPUContext> gpu_context;
-	string query;
-	bool enable_optimizer;
-	bool finished = false;
-};
-
-struct GPUCachingFunctionData : public TableFunctionData {
-	GPUCachingFunctionData() = default;
-	unique_ptr<Connection> conn;
-	GPUBufferManager *gpuBufferManager;
-	ColumnType type;
-	uint8_t *data;
-	string column;
-	string table;
-	bool finished = false;
-};
 
 shared_ptr<Relation> GPUSubstraitPlanToDuckDBRel(Connection &conn, const string &serialized, bool json = false) {
 	if (conn.context->transaction.IsAutoCommit()) {
@@ -73,7 +49,8 @@ shared_ptr<Relation> GPUSubstraitPlanToDuckDBRel(Connection &conn, const string 
 };
 
 //This function is used to extract the query plan from the SQL query
-unique_ptr<LogicalOperator> SiriusInitPlanExtractor(ClientContext& context, GPUTableFunctionData &data, Connection &new_conn) {
+unique_ptr<LogicalOperator> SiriusInitPlanExtractor(
+	ClientContext& context, SiriusExtension::GPUTableFunctionData &data, Connection &new_conn) {
 	// The user might want to disable the optimizer of the new connection
 	new_conn.context->config.enable_optimizer = data.enable_optimizer;
 	new_conn.context->config.use_replacement_scans = false;
@@ -348,11 +325,6 @@ void SiriusExtension::GPUProcessingSubstraitFunction(ClientContext &context, Tab
 		printf("GPU Execute query time: %.2f ms\n", duration.count()/1000.0);
 	}
 
-	auto result_chunk = data.res->Fetch();
-	if (!result_chunk) {
-		return;
-	}
-	output.Move(*result_chunk);
 	return;
 }
 
