@@ -13,23 +13,23 @@
 
 namespace duckdb {
 
-class DependencyExtractor : public LogicalOperatorVisitor {
-public:
-	explicit DependencyExtractor(LogicalDependencyList &dependencies) : dependencies(dependencies) {
-	}
+// class DependencyExtractor : public LogicalOperatorVisitor {
+// public:
+// 	explicit DependencyExtractor(LogicalDependencyList &dependencies) : dependencies(dependencies) {
+// 	}
 
-protected:
-	unique_ptr<Expression> VisitReplace(BoundFunctionExpression &expr, unique_ptr<Expression> *expr_ptr) override {
-		// extract dependencies from the bound function expression
-		if (expr.function.dependency) {
-			expr.function.dependency(expr, dependencies);
-		}
-		return nullptr;
-	}
+// protected:
+// 	unique_ptr<Expression> VisitReplace(BoundFunctionExpression &expr, unique_ptr<Expression> *expr_ptr) override {
+// 		// extract dependencies from the bound function expression
+// 		if (expr.function.dependency) {
+// 			expr.function.dependency(expr, dependencies);
+// 		}
+// 		return nullptr;
+// 	}
 
-private:
-	LogicalDependencyList &dependencies;
-};
+// private:
+// 	LogicalDependencyList &dependencies;
+// };
 
 GPUPhysicalPlanGenerator::GPUPhysicalPlanGenerator(ClientContext &context, GPUContext& gpu_context) : 
 	context(context), gpu_context(gpu_context) {
@@ -42,22 +42,22 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::CreatePlan(unique_ptr<
 	auto &profiler = QueryProfiler::Get(context);
 
 	// first resolve column references
-	profiler.StartPhase("column_binding");
+	profiler.StartPhase(MetricsType::PHYSICAL_PLANNER_COLUMN_BINDING);
 	ColumnBindingResolver resolver;
 	resolver.VisitOperator(*op);
 	profiler.EndPhase();
 
 	// now resolve types of all the operators
-	profiler.StartPhase("resolve_types");
+	profiler.StartPhase(MetricsType::PHYSICAL_PLANNER_RESOLVE_TYPES);
 	op->ResolveOperatorTypes();
 	profiler.EndPhase();
 
 	// extract dependencies from the logical plan
-	DependencyExtractor extractor(dependencies);
-	extractor.VisitOperator(*op);
+	// DependencyExtractor extractor(dependencies);
+	// extractor.VisitOperator(*op);
 
 	// then create the main physical plan
-	profiler.StartPhase("create_plan");
+	profiler.StartPhase(MetricsType::PHYSICAL_PLANNER_CREATE_PLAN);
 	auto plan = CreatePlan(*op);
 	profiler.EndPhase();
 

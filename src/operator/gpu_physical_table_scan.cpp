@@ -4,16 +4,18 @@
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 
 namespace duckdb {
-
+  
 GPUPhysicalTableScan::GPUPhysicalTableScan(vector<LogicalType> types, TableFunction function_p,
-                                     unique_ptr<FunctionData> bind_data_p, vector<LogicalType> returned_types_p,
-                                     vector<column_t> column_ids_p, vector<idx_t> projection_ids_p,
-                                     vector<string> names_p, unique_ptr<TableFilterSet> table_filters_p,
-                                     idx_t estimated_cardinality, ExtraOperatorInfo extra_info)
-    : GPUPhysicalOperator(PhysicalOperatorType::TABLE_SCAN, std::move(types), estimated_cardinality),
-      function(std::move(function_p)), bind_data(std::move(bind_data_p)), returned_types(std::move(returned_types_p)),
-      column_ids(std::move(column_ids_p)), projection_ids(std::move(projection_ids_p)), names(std::move(names_p)),
-      table_filters(std::move(table_filters_p)), extra_info(extra_info) {
+    unique_ptr<FunctionData> bind_data_p, vector<LogicalType> returned_types_p,
+    vector<ColumnIndex> column_ids_p, vector<idx_t> projection_ids_p,
+    vector<string> names_p, unique_ptr<TableFilterSet> table_filters_p,
+    idx_t estimated_cardinality, ExtraOperatorInfo extra_info,
+    vector<Value> parameters_p, virtual_column_map_t virtual_columns_p)
+        : GPUPhysicalOperator(PhysicalOperatorType::TABLE_SCAN, std::move(types), estimated_cardinality),
+        function(std::move(function_p)), bind_data(std::move(bind_data_p)), returned_types(std::move(returned_types_p)),
+        column_ids(std::move(column_ids_p)), projection_ids(std::move(projection_ids_p)), names(std::move(names_p)),
+        table_filters(std::move(table_filters_p)), extra_info(extra_info), parameters(std::move(parameters_p)),
+        virtual_columns(std::move(virtual_columns_p)) {
 }
 
 
@@ -348,7 +350,17 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
   auto start = std::chrono::high_resolution_clock::now();
   if (output_relation.columns.size() != GetTypes().size()) throw InvalidInputException("Mismatched column count");
 
-  auto table_name = function.to_string(bind_data.get()); //we get it from ParamsToString();
+  // auto table_name = function.to_string(bind_data.get()); //we get it from ParamsToString();
+
+  TableFunctionToStringInput input(function, bind_data.get());
+  auto to_string_result = function.to_string(input);
+  string table_name;
+  for (const auto &it : to_string_result) {
+    if (it.first.compare("Table") == 0) {
+      table_name = it.second;
+      break;
+    }
+  }
 
   printf("Table Scanning %s\n", table_name.c_str());
   //Find table name in the buffer manager
@@ -363,14 +375,14 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
             printf("Cached Column name: %s\n", table->column_names[i].c_str());
         }
         for (int col = 0; col < column_ids.size(); col++) {
-            printf("Finding column %s\n", names[column_ids[col]].c_str());
-            auto column_it = find(table->column_names.begin(), table->column_names.end(), names[column_ids[col]]);
+            printf("Finding column %s\n", names[column_ids[col].GetPrimaryIndex()].c_str());
+            auto column_it = find(table->column_names.begin(), table->column_names.end(), names[column_ids[col].GetPrimaryIndex()]);
             if (column_it == table->column_names.end()) {
                 throw InvalidInputException("Column not found");
             } 
-            auto column_name = table->column_names[column_ids[col]];
+            auto column_name = table->column_names[column_ids[col].GetPrimaryIndex()];
             printf("Column found %s\n", column_name.c_str());
-            if (column_name != names[column_ids[col]]) {
+            if (column_name != names[column_ids[col].GetPrimaryIndex()]) {
                 throw InvalidInputException("Column name mismatch");
             }
         }
@@ -387,8 +399,8 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
       for (auto &f : table_filters->filters) {
         auto &column_index = f.first;
         auto &filter = f.second;
-        table->columns[column_ids[column_index]]->row_ids = nullptr;
-        table->columns[column_ids[column_index]]->row_id_count = 0;
+        table->columns[column_ids[column_index].GetPrimaryIndex()]->row_ids = nullptr;
+        table->columns[column_ids[column_index].GetPrimaryIndex()]->row_id_count = 0;
 
         if (column_index < names.size()) {
 
@@ -433,7 +445,7 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
                   printf("Reading constant comparison filter\n");
                   filter_constants[expr_idx] = &(filter_inside->Cast<ConstantFilter>());
                   // printf("%d\n", filter_constants[expr_idx]->comparison_type);
-                  expression_columns[expr_idx] = table->columns[column_ids[column_index]];
+                  expression_columns[expr_idx] = table->columns[column_ids[column_index].GetPrimaryIndex()];
                   expr_idx++;
                 } else if (filter_inside->filter_type == TableFilterType::IS_NOT_NULL) {
                   continue;
@@ -460,9 +472,9 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
       for (auto projection_id : projection_ids) {
           printf("Reading column index (late materialized) %ld and passing it to index in output relation %ld\n", column_ids[projection_id], index);
           printf("Writing row IDs to output relation in index %ld\n", index);
-          output_relation.columns[index] = new GPUColumn(table->columns[column_ids[projection_id]]->column_length, table->columns[column_ids[projection_id]]->data_wrapper.type, table->columns[column_ids[projection_id]]->data_wrapper.data,
-                          table->columns[column_ids[projection_id]]->data_wrapper.offset, table->columns[column_ids[projection_id]]->data_wrapper.num_bytes, table->columns[column_ids[projection_id]]->data_wrapper.is_string_data);
-          output_relation.columns[index]->is_unique = table->columns[column_ids[projection_id]]->is_unique;
+          output_relation.columns[index] = new GPUColumn(table->columns[column_ids[projection_id].GetPrimaryIndex()]->column_length, table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.type, table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.data,
+                          table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.offset, table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.num_bytes, table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.is_string_data);
+          output_relation.columns[index]->is_unique = table->columns[column_ids[projection_id].GetPrimaryIndex()]->is_unique;
           if (row_ids) {
             output_relation.columns[index]->row_ids = row_ids; 
           }
@@ -476,9 +488,9 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
       for (auto column_id : column_ids) {
           printf("Reading column index (late materialized) %ld and passing it to index in output relation %ld\n", column_id, index);
           printf("Writing row IDs to output relation in index %ld\n", index);
-          output_relation.columns[index] = new GPUColumn(table->columns[column_id]->column_length, table->columns[column_id]->data_wrapper.type, table->columns[column_id]->data_wrapper.data,
-                          table->columns[column_id]->data_wrapper.offset, table->columns[column_id]->data_wrapper.num_bytes, table->columns[column_id]->data_wrapper.is_string_data);
-          output_relation.columns[index]->is_unique = table->columns[column_id]->is_unique;
+          output_relation.columns[index] = new GPUColumn(table->columns[column_id.GetPrimaryIndex()]->column_length, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.type, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.data,
+                          table->columns[column_id.GetPrimaryIndex()]->data_wrapper.offset, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.num_bytes, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.is_string_data);
+          output_relation.columns[index]->is_unique = table->columns[column_id.GetPrimaryIndex()]->is_unique;
           if (row_ids) {
             output_relation.columns[index]->row_ids = row_ids; 
           }
