@@ -123,8 +123,8 @@ GPUBufferManager::customCudaMalloc(size_t size, int gpu, bool caching) {
         if (start + alloc >= processing_size_per_gpu) {
             throw InvalidInputException("Out of GPU processing memory");
         }
-        // printf("Allocating %d bytes at %d\n", alloc, start);
-        // printf("Current pointer %d\n", gpuProcessingPointer[gpu]);
+        // printf("Allocating %ld bytes at %d\n", alloc, start);
+        // printf("Current pointer %ld\n", gpuProcessingPointer[gpu]);
         T* ptr = reinterpret_cast<T*>(gpuProcessing[gpu] + start);
         if (reinterpret_cast<uintptr_t>(ptr) % alignof(double) != 0) {
             throw InvalidInputException("Memory is not properly aligned");

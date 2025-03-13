@@ -9,6 +9,27 @@
 
 namespace duckdb {
 
+enum ScanDataType {
+	INT32,
+	INT64,
+	FLOAT32,
+	FLOAT64,
+	BOOLEAN,
+	VARCHAR
+};
+
+enum CompareType {
+	EQUAL,
+	NOTEQUAL,
+	GREATERTHAN,
+	GREATERTHANOREQUALTO,
+	LESSTHAN,
+	LESSTHANOREQUALTO
+};
+
+void tableScanExpression(uint8_t **col, uint64_t** offset, uint8_t *constant_compare, uint64_t *constant_offset, 
+	ScanDataType* data_type, uint64_t *&row_ids, uint64_t* &count, uint64_t N, CompareType* compare_mode, int num_expr);
+
 class GPUPhysicalTableScan : public GPUPhysicalOperator {
 public:
 	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::TABLE_SCAN;
