@@ -52,10 +52,10 @@ struct GPUCachingFunctionData : public TableFunctionData {
 	bool finished = false;
 };
 
-shared_ptr<Relation> GPUSubstraitPlanToDuckDBRel(Connection &conn, const string &serialized, bool json = false) {
-	SubstraitToDuckDB transformer_s2d(conn, serialized, json);
-	return transformer_s2d.TransformPlan();
-};
+// shared_ptr<Relation> GPUSubstraitPlanToDuckDBRel(Connection &conn, const string &serialized, bool json = false) {
+// 	SubstraitToDuckDB transformer_s2d(conn, serialized, json);
+// 	return transformer_s2d.TransformPlan();
+// };
 
 //This function is used to extract the query plan from the SQL query
 unique_ptr<LogicalOperator> SiriusInitPlanExtractor(ClientContext& context, GPUTableFunctionData &data, Connection &new_conn) {
@@ -265,7 +265,9 @@ SiriusExtension::GPUProcessingSubstraitBind(ClientContext &context, TableFunctio
 		throw BinderException("gpu_processing cannot be called with a NULL parameter");
 	}
 	string serialized = input.inputs[0].GetValueUnsafe<string>();
-	result->plan = GPUSubstraitPlanToDuckDBRel(*result->conn, serialized, false);
+	// result->plan = GPUSubstraitPlanToDuckDBRel(*result->conn, serialized, false);
+	SubstraitToDuckDB transformer_s2d(result->conn->context, serialized, false);
+	result->plan = transformer_s2d.TransformPlan();
 
 	auto relation_stmt = make_uniq<RelationStatement>(result->plan);
 	unique_ptr<SQLStatement> statements = std::move(relation_stmt);

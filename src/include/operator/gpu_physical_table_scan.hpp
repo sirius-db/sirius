@@ -37,9 +37,9 @@ public:
 public:
 	//! Table scan that immediately projects out filter columns that are unused in the remainder of the query plan
 	GPUPhysicalTableScan(vector<LogicalType> types, TableFunction function, unique_ptr<FunctionData> bind_data,
-	                  vector<LogicalType> returned_types, vector<column_t> column_ids, vector<idx_t> projection_ids,
-	                  vector<string> names, unique_ptr<TableFilterSet> table_filters, idx_t estimated_cardinality,
-	                  ExtraOperatorInfo extra_info);
+		vector<LogicalType> returned_types, vector<ColumnIndex> column_ids, vector<idx_t> projection_ids,
+		vector<string> names, unique_ptr<TableFilterSet> table_filters, idx_t estimated_cardinality,
+		ExtraOperatorInfo extra_info, vector<Value> parameters, virtual_column_map_t virtual_columns);
 
 	//! The table function
 	TableFunction function;
@@ -48,15 +48,22 @@ public:
 	//! The types of ALL columns that can be returned by the table function
 	vector<LogicalType> returned_types;
 	//! The column ids used within the table function
-	vector<column_t> column_ids;
+	vector<ColumnIndex> column_ids;
 	//! The projected-out column ids
 	vector<idx_t> projection_ids;
 	//! The names of the columns
 	vector<string> names;
 	//! The table filters
 	unique_ptr<TableFilterSet> table_filters;
-	//! Currently stores any filters applied to file names (as strings)
+	//! Currently stores info related to filters pushed down into MultiFileLists and sample rate pushed down into the
+	//! table scan
 	ExtraOperatorInfo extra_info;
+	//! Parameters
+	vector<Value> parameters;
+	//! Contains a reference to dynamically generated table filters (through e.g. a join up in the tree)
+	shared_ptr<DynamicTableFilterSet> dynamic_filters;
+	//! Virtual columns
+	virtual_column_map_t virtual_columns;
 
 public:
 	// string GetName() const override;
@@ -65,13 +72,7 @@ public:
 	// bool Equals(const GPUPhysicalOperator &other) const override;
 
 public:
-	// unique_ptr<LocalSourceState> GetLocalSourceState(ExecutionContext &context,
-	//                                                  GlobalSourceState &gstate) const override;
-	// unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;
-	// SourceResultType GetData(ExecutionContext &context, GPUIntermediateRelation &output_relation, OperatorSourceInput &input) const override;
 	SourceResultType GetData(GPUIntermediateRelation& output_relation) const override;
-	// idx_t GetBatchIndex(ExecutionContext &context, DataChunk &chunk, GlobalSourceState &gstate,
-	//                     LocalSourceState &lstate) const override;
 
 	bool IsSource() const override {
 		return true;
@@ -80,11 +81,17 @@ public:
 		return true;
 	}
 
-	// bool SupportsBatchIndex() const override {
-	// 	return function.get_batch_index != nullptr;
-	// }
+	// unique_ptr<LocalSourceState> GetLocalSourceState(ExecutionContext &context,
+	// 	GlobalSourceState &gstate) const override;
+	// unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;
+	// // SourceResultType GetData(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &input) const override;
+	// OperatorPartitionData GetPartitionData(ExecutionContext &context, DataChunk &chunk, GlobalSourceState &gstate,
+	// LocalSourceState &lstate,
+	// const OperatorPartitionInfo &partition_info) const override;
 
-	// double GetProgress(ClientContext &context, GlobalSourceState &gstate) const override;
+	// bool SupportsPartitioning(const OperatorPartitionInfo &partition_info) const override;
+
+	// ProgressData GetProgress(ClientContext &context, GlobalSourceState &gstate) const override;
 };
 
 } // namespace duckdb
