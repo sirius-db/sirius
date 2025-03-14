@@ -122,7 +122,7 @@ HandleMaterializeRowIDs(GPUIntermediateRelation& input_relation, GPUIntermediate
 
 void
 HandleMaterializeRowIDsRHS(GPUIntermediateRelation& hash_table_result, GPUIntermediateRelation& output_relation, 
-    vector<idx_t> rhs_output_columns, size_t offset, uint64_t count, uint64_t* row_ids, GPUBufferManager* gpuBufferManager, bool maintain_unique) {
+    vector<column_t> rhs_output_columns, size_t offset, uint64_t count, uint64_t* row_ids, GPUBufferManager* gpuBufferManager, bool maintain_unique) {
     vector<uint64_t*> new_row_ids;
     vector<uint64_t*> prev_row_ids;
     for (idx_t i = 0; i < rhs_output_columns.size(); i++) {
@@ -165,6 +165,54 @@ HandleMaterializeRowIDsRHS(GPUIntermediateRelation& hash_table_result, GPUInterm
             }
         }
         output_relation.columns[offset + i]->row_id_count = count;
+    }
+}
+
+void
+HandleMaterializeRowIDsLHS(GPUIntermediateRelation& input_relation, GPUIntermediateRelation& output_relation, 
+    vector<column_t> lhs_output_columns, uint64_t count, uint64_t* row_ids, GPUBufferManager* gpuBufferManager, bool maintain_unique) {
+    vector<uint64_t*> new_row_ids;
+    vector<uint64_t*> prev_row_ids;
+    for (idx_t i = 0; i < lhs_output_columns.size(); i++) {
+        const auto lhs_col = lhs_output_columns[i];
+        printf("Passing column idx %d from input relation to idx %d in output relation\n", lhs_col, i);
+        if (count == 0) {
+            output_relation.columns[i] = new GPUColumn(0, input_relation.columns[lhs_col]->data_wrapper.type, input_relation.columns[lhs_col]->data_wrapper.data,
+                input_relation.columns[lhs_col]->data_wrapper.offset, 0, input_relation.columns[lhs_col]->data_wrapper.is_string_data);
+            output_relation.columns[i]->row_id_count = 0;
+            if (maintain_unique) {
+                output_relation.columns[i]->is_unique = input_relation.columns[lhs_col]->is_unique;
+            } else {
+                output_relation.columns[i]->is_unique = false;
+            }
+            continue;
+        }
+        output_relation.columns[i] = new GPUColumn(input_relation.columns[lhs_col]->column_length, input_relation.columns[lhs_col]->data_wrapper.type, input_relation.columns[lhs_col]->data_wrapper.data,
+                input_relation.columns[lhs_col]->data_wrapper.offset, input_relation.columns[lhs_col]->data_wrapper.num_bytes, input_relation.columns[lhs_col]->data_wrapper.is_string_data);
+        if (maintain_unique) {
+            output_relation.columns[i]->is_unique = input_relation.columns[lhs_col]->is_unique;
+        } else {
+            output_relation.columns[i]->is_unique = false;
+        }
+        if (row_ids) {
+            if (input_relation.columns[lhs_col]->row_ids == nullptr) {
+                output_relation.columns[i]->row_ids = row_ids;
+            } else {
+                auto it = find(prev_row_ids.begin(), prev_row_ids.end(), input_relation.columns[lhs_col]->row_ids);
+                if (it != prev_row_ids.end()) {
+                    auto idx = it - prev_row_ids.begin();
+                    output_relation.columns[i]->row_ids = new_row_ids[idx];
+                } else {
+                    uint64_t* temp_prev_row_ids = reinterpret_cast<uint64_t*> (input_relation.columns[lhs_col]->row_ids);
+                    uint64_t* temp_new_row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(count, 0, 0);
+                    materializeExpression<uint64_t>(temp_prev_row_ids, temp_new_row_ids, row_ids, count);
+                    output_relation.columns[i]->row_ids = temp_new_row_ids;
+                    new_row_ids.push_back(temp_new_row_ids);
+                    prev_row_ids.push_back(temp_prev_row_ids);
+                }
+            }
+        }
+        output_relation.columns[i]->row_id_count = count;
     }
 }
 

@@ -38,13 +38,14 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::CreatePlan(LogicalLimi
 	auto plan = CreatePlan(*op.children[0]);
 
 	unique_ptr<GPUPhysicalOperator> limit;
-	// switch (op.limit_val.Type()) {
-	// case LimitNodeType::EXPRESSION_PERCENTAGE:
-	// case LimitNodeType::CONSTANT_PERCENTAGE:
-	// 	limit = make_uniq<PhysicalLimitPercent>(op.types, std::move(op.limit_val), std::move(op.offset_val),
-	// 	                                        op.estimated_cardinality);
-	// 	break;
-	// default:
+	switch (op.limit_val.Type()) {
+	case LimitNodeType::EXPRESSION_PERCENTAGE:
+	case LimitNodeType::CONSTANT_PERCENTAGE:
+		throw NotImplementedException("Percentage limit not supported in GPU");
+		// limit = make_uniq<PhysicalLimitPercent>(op.types, std::move(op.limit_val), std::move(op.offset_val),
+		//                                         op.estimated_cardinality);
+		break;
+	default:
 		// if (!PreserveInsertionOrder(*plan)) {
 			// use parallel streaming limit if insertion order is not important
 			limit = make_uniq<GPUPhysicalStreamingLimit>(op.types, std::move(op.limit_val), std::move(op.offset_val),
@@ -53,16 +54,17 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::CreatePlan(LogicalLimi
 		// 	// maintaining insertion order is important
 		// 	if (UseBatchIndex(*plan) && UseBatchLimit(op.limit_val, op.offset_val)) {
 		// 		// source supports batch index: use parallel batch limit
-		// 		limit = make_uniq<PhysicalLimit>(op.types, std::move(op.limit_val), std::move(op.offset_val),
-		// 		                                 op.estimated_cardinality);
+		// 		throw NotImplementedException("Batch limit not supported in GPU");
+		// 		// limit = make_uniq<PhysicalLimit>(op.types, std::move(op.limit_val), std::move(op.offset_val),
+		// 		//                                  op.estimated_cardinality);
 		// 	} else {
 		// 		// source does not support batch index: use a non-parallel streaming limit
-		// 		limit = make_uniq<PhysicalStreamingLimit>(op.types, std::move(op.limit_val), std::move(op.offset_val),
+		// 		limit = make_uniq<GPUPhysicalStreamingLimit>(op.types, std::move(op.limit_val), std::move(op.offset_val),
 		// 		                                          op.estimated_cardinality, false);
 		// 	}
 		// }
-		// break;
-	// }
+		break;
+	}
 
 	limit->children.push_back(std::move(plan));
 	return limit;

@@ -70,6 +70,35 @@ GPUExpressionExecutor::HandlingSpecificFilter(GPUIntermediateRelation& input_rel
             }
 
             //Q7 HACK!!!
+            if (expr.children.size() == 2 && expr.children[0]->type == ExpressionType::COMPARE_EQUAL && expr.children[1]->type == ExpressionType::COMPARE_EQUAL) {
+                printf("Filter expression of Q7\n");
+                string t = "((N_NATIONKEY = X) OR (N_NATIONKEY = Y))";
+                if (!expression.ToString().compare(t)) {
+                    
+                        BoundComparisonExpression& first = expr.children[0]->Cast<BoundComparisonExpression>();
+                        auto n_nationkey1 = first.left->Cast<BoundReferenceExpression>().index;
+                        auto constant1 = first.right->Cast<BoundConstantExpression>().value.GetValue<uint64_t>();
+                        BoundComparisonExpression& second = expr.children[1]->Cast<BoundComparisonExpression>();
+                        auto n_nationkey2 = second.left->Cast<BoundReferenceExpression>().index;
+                        auto constant2 = second.right->Cast<BoundConstantExpression>().value.GetValue<uint64_t>();
+
+                        uint64_t val[2];
+                        val[0] = constant1;
+                        val[1] = constant2;
+                        GPUColumn* materialized_nkey1 = HandleMaterializeExpression(input_relation.columns[n_nationkey1], first.left->Cast<BoundReferenceExpression>(), gpuBufferManager);
+                        GPUColumn* materialized_nkey2 = HandleMaterializeExpression(input_relation.columns[n_nationkey2], second.left->Cast<BoundReferenceExpression>(), gpuBufferManager);
+
+                        count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+                        uint64_t* a = reinterpret_cast<uint64_t*> (materialized_nkey1->data_wrapper.data);
+                        uint64_t* b = reinterpret_cast<uint64_t*> (materialized_nkey2->data_wrapper.data);
+
+                        size_t size = materialized_nkey1->column_length;
+                        q7FilterExpression2(a, b, val[0], val[1], comparison_idx, count, size);
+
+                }
+            }
+
+            //Q7 HACK!!!
             if (expr.children.size() == 2 && expr.children[0]->type == ExpressionType::CONJUNCTION_AND && expr.children[1]->type == ExpressionType::CONJUNCTION_AND) {
                 auto &expr2 = expr.children[0]->Cast<BoundConjunctionExpression>();
                 if (expr2.children.size() == 2 && expr2.children[0]->type == ExpressionType::COMPARE_EQUAL && expr2.children[1]->type == ExpressionType::COMPARE_EQUAL) {
