@@ -126,7 +126,7 @@ namespace duckdb {
 // }
 
 static void RewriteJoinCondition(Expression &expr, idx_t offset) {
-	if (expr.type == ExpressionType::BOUND_REF) {
+	if (expr.GetExpressionType() == ExpressionType::BOUND_REF) {
 		auto &ref = expr.Cast<BoundReferenceExpression>();
 		ref.index += offset;
 	}
@@ -174,7 +174,8 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::PlanComparisonJoin(Log
 	}
 
 	idx_t has_range = 0;
-	bool has_equality = HasEquality(op.conditions, has_range);
+	// bool has_equality = HasEquality(op.conditions, has_range);
+	bool has_equality = op.HasEquality(has_range);
 	bool can_merge = has_range > 0;
 	// bool can_iejoin = has_range >= 2 && recursive_cte_tables.empty();
 	bool can_iejoin = false;
@@ -191,8 +192,10 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::PlanComparisonJoin(Log
 		break;
 	}
 
+	auto &client_config = ClientConfig::GetConfig(context);
+
 	//	TODO: Extend PWMJ to handle all comparisons and projection maps
-	const auto prefer_range_joins = (ClientConfig::GetConfig(context).prefer_range_joins && can_iejoin);
+	const auto prefer_range_joins = client_config.prefer_range_joins && can_iejoin;
 
 	unique_ptr<GPUPhysicalOperator> plan;
 	if (has_equality && !prefer_range_joins) {
@@ -202,15 +205,28 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::PlanComparisonJoin(Log
 
 		plan = make_uniq<GPUPhysicalHashJoin>(op, std::move(left), std::move(right), std::move(op.conditions),
 		                                   op.join_type, op.left_projection_map, op.right_projection_map,
-		                                   std::move(op.mark_types), op.estimated_cardinality);
+		                                   std::move(op.mark_types), op.estimated_cardinality, std::move(op.filter_pushdown));
+		plan->Cast<GPUPhysicalHashJoin>().join_stats = std::move(op.join_stats);
 
 	} else {
 		// throw NotImplementedException("Non-equality join not supported in GPU");
-		static constexpr const idx_t NESTED_LOOP_JOIN_THRESHOLD = 5;
-		if (left->estimated_cardinality <= NESTED_LOOP_JOIN_THRESHOLD ||
-		    right->estimated_cardinality <= NESTED_LOOP_JOIN_THRESHOLD) {
+		// static constexpr const idx_t NESTED_LOOP_JOIN_THRESHOLD = 5;
+		// if (left->estimated_cardinality <= NESTED_LOOP_JOIN_THRESHOLD ||
+		//     right->estimated_cardinality <= NESTED_LOOP_JOIN_THRESHOLD) {
+		// 	can_iejoin = false;
+		// 	can_merge = false;
+		// }
+		D_ASSERT(op.left_projection_map.empty());
+		if (left->estimated_cardinality <= client_config.nested_loop_join_threshold ||
+		    right->estimated_cardinality <= client_config.nested_loop_join_threshold) {
 			can_iejoin = false;
 			can_merge = false;
+		}
+		if (can_merge && can_iejoin) {
+			if (left->estimated_cardinality <= client_config.merge_join_threshold ||
+			    right->estimated_cardinality <= client_config.merge_join_threshold) {
+				can_iejoin = false;
+			}
 		}
 		if (can_iejoin) {
 			throw NotImplementedException("InequalityJoin not supported in GPU");

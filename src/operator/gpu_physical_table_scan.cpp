@@ -418,7 +418,12 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
                 }
             }
           } else {
-            throw NotImplementedException("Filter aside from conjunction and not supported");
+            // count how many filters in table_filters->filters
+            if (table_filters->filters.size() == 1) {
+              num_expr++;
+            } else {
+              throw NotImplementedException("Filter aside from conjunction and not supported");
+            }
           }
 
         }
@@ -455,7 +460,14 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
             }
 
           } else {
-            throw NotImplementedException("Filter aside from conjunction and not supported");
+            // count how many filters in table_filters->filters
+            if (table_filters->filters.size() == 1) {
+              filter_constants[expr_idx] = &(filter->Cast<ConstantFilter>());
+              expression_columns[expr_idx] = table->columns[column_ids[column_index].GetPrimaryIndex()];
+              expr_idx++;
+            } else {
+              throw NotImplementedException("Filter aside from conjunction and not supported");
+            }
           }
 
         }
@@ -470,7 +482,7 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
     // projection id means that from this set of column ids that are being scanned, which index of column ids are getting projected out
     if (function.filter_prune) {
       for (auto projection_id : projection_ids) {
-          printf("Reading column index (late materialized) %ld and passing it to index in output relation %ld\n", column_ids[projection_id], index);
+          printf("Reading column index (late materialized) %ld and passing it to index in output relation %ld\n", column_ids[projection_id].GetPrimaryIndex(), index);
           printf("Writing row IDs to output relation in index %ld\n", index);
           output_relation.columns[index] = new GPUColumn(table->columns[column_ids[projection_id].GetPrimaryIndex()]->column_length, table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.type, table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.data,
                           table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.offset, table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.num_bytes, table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.is_string_data);
@@ -486,7 +498,7 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
     } else {
       //THIS IS FOR INDEX_SCAN
       for (auto column_id : column_ids) {
-          printf("Reading column index (late materialized) %ld and passing it to index in output relation %ld\n", column_id, index);
+          printf("Reading column index (late materialized) %ld and passing it to index in output relation %ld\n", column_id.GetPrimaryIndex(), index);
           printf("Writing row IDs to output relation in index %ld\n", index);
           output_relation.columns[index] = new GPUColumn(table->columns[column_id.GetPrimaryIndex()]->column_length, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.type, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.data,
                           table->columns[column_id.GetPrimaryIndex()]->data_wrapper.offset, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.num_bytes, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.is_string_data);

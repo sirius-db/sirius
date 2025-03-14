@@ -304,6 +304,73 @@ __global__ void q7_filter(T *n1_nationkey, T *n2_nationkey, T val1, T val2, T va
 }
 
 template <typename T, int B, int I>
+__global__ void q7_filter2(T *n1_nationkey, T *n2_nationkey, T val1, T val2,
+    uint64_t *row_ids, unsigned long long* count, uint64_t N, int is_count) {
+
+    typedef cub::BlockScan<int, B> BlockScanInt;
+
+    __shared__ union TempStorage
+    {
+        typename BlockScanInt::TempStorage scan;
+    } temp_storage;
+
+    T item_n1_nationkey[I];
+    T item_n2_nationkey[I];
+    int selection_flags[I];
+
+    uint64_t tile_size = B * I;
+    uint64_t tile_offset = blockIdx.x * tile_size;
+
+    uint64_t num_tiles = (N + tile_size - 1) / tile_size;
+    uint64_t num_tile_items = tile_size;
+
+    int t_count = 0; // Number of items selected per thread
+    int c_t_count = 0; //Prefix sum of t_count
+    __shared__ uint64_t block_off;
+
+    if (blockIdx.x == num_tiles - 1) {
+        num_tile_items = N - tile_offset;
+    }
+
+    #pragma unroll
+    for (int ITEM = 0; ITEM < I; ITEM++) {
+        selection_flags[ITEM] = 0;
+    }
+
+    #pragma unroll
+    for (int ITEM = 0; ITEM < I; ++ITEM) {
+        if (threadIdx.x + ITEM * B < num_tile_items) {
+            item_n1_nationkey[ITEM] = n1_nationkey[tile_offset + threadIdx.x + ITEM * B];
+            item_n2_nationkey[ITEM] = n2_nationkey[tile_offset + threadIdx.x + ITEM * B];
+            selection_flags[ITEM] = ((item_n1_nationkey[ITEM] == val1) || (item_n2_nationkey[ITEM] == val2));
+            if(selection_flags[ITEM]) t_count++;
+        }
+    }
+
+    //Barrier
+    __syncthreads();
+
+    BlockScanInt(temp_storage.scan).ExclusiveSum(t_count, c_t_count); //doing a prefix sum of all the previous threads in the block and store it to c_t_count
+    if(threadIdx.x == blockDim.x - 1) { //if the last thread in the block, add the prefix sum of all the prev threads + sum of my threads to global variable total
+        block_off = atomicAdd(count, (unsigned long long) t_count+c_t_count); //the previous value of total is gonna be assigned to block_off
+    } //block_off does not need to be global (it's just need to be shared), because it will get the previous value from total which is global
+
+    __syncthreads();
+
+    if (is_count) return;
+
+    #pragma unroll
+    for (int ITEM = 0; ITEM < I; ++ITEM) {
+        if (threadIdx.x + ITEM * B < num_tile_items) {
+            if(selection_flags[ITEM]) {
+                uint64_t offset = block_off + c_t_count++;
+                row_ids[offset] = tile_offset + threadIdx.x + ITEM * B;
+            }
+        }
+    }
+}
+
+template <typename T, int B, int I>
 __global__ void q2_filter(T *p_type, T p_type_val,
     uint64_t *row_ids, unsigned long long* count, uint64_t N, int is_count) {
 
@@ -523,6 +590,33 @@ void q7FilterExpression(uint64_t *n1_nationkey, uint64_t *n2_nationkey, uint64_t
     row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
     cudaMemset(count, 0, sizeof(uint64_t));
     q7_filter<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(n1_nationkey, n2_nationkey, val1, val2, val3, val4, row_ids, (unsigned long long*) count, N, 0);
+    CHECK_ERROR();
+    cudaDeviceSynchronize();
+    count = h_count;
+    printf("Count: %lu\n", h_count[0]);
+}
+
+void q7FilterExpression2(uint64_t *n1_nationkey, uint64_t *n2_nationkey, uint64_t val1, uint64_t val2, 
+    uint64_t* &row_ids, uint64_t* &count, uint64_t N) {
+    CHECK_ERROR();
+    if (N == 0) {
+    uint64_t* h_count = new uint64_t[1];
+    h_count[0] = 0;
+    count = h_count;
+    printf("N is 0\n");
+    return;
+    }
+    printf("Launching Q7 Filter Kernel\n");
+    cudaMemset(count, 0, sizeof(uint64_t));
+    int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
+    q7_filter2<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(n1_nationkey, n2_nationkey, val1, val2, row_ids, (unsigned long long*) count, N, 1);
+    CHECK_ERROR();
+    GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+    uint64_t* h_count = new uint64_t[1];
+    cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+    row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
+    cudaMemset(count, 0, sizeof(uint64_t));
+    q7_filter2<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(n1_nationkey, n2_nationkey, val1, val2, row_ids, (unsigned long long*) count, N, 0);
     CHECK_ERROR();
     cudaDeviceSynchronize();
     count = h_count;

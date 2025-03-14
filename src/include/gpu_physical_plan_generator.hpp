@@ -35,9 +35,9 @@ public:
 	unique_ptr<GPUPhysicalOperator> CreatePlan(unique_ptr<LogicalOperator> logical);
 
 	//! Whether or not we can (or should) use a batch-index based operator for executing the given sink
-	// static bool UseBatchIndex(ClientContext &context, GPUPhysicalOperator &plan);
+	static bool UseBatchIndex(ClientContext &context, GPUPhysicalOperator &plan);
 	//! Whether or not we should preserve insertion order for executing the given sink
-	// static bool PreserveInsertionOrder(ClientContext &context, GPUPhysicalOperator &plan);
+	static bool PreserveInsertionOrder(ClientContext &context, GPUPhysicalOperator &plan);
 
 	static bool HasEquality(vector<JoinCondition> &conds, idx_t &range_count);
 
@@ -98,6 +98,8 @@ protected:
 // private:
 	// bool PreserveInsertionOrder(GPUPhysicalOperator &plan);
 	// bool UseBatchIndex(GPUPhysicalOperator &plan);
+public:
+	idx_t delim_index = 0;
 
 public:
 	ClientContext &context;

@@ -179,28 +179,72 @@ HandleScanHTExpression(unsigned long long* ht, uint64_t ht_len, uint64_t* &row_i
 	}
 }
 
+void ReorderConditions(vector<JoinCondition> &conditions) {
+	// we reorder conditions so the ones with COMPARE_EQUAL occur first
+	// check if this is already the case
+	bool is_ordered = true;
+	bool seen_non_equal = false;
+	for (auto &cond : conditions) {
+		if (cond.comparison == ExpressionType::COMPARE_EQUAL ||
+		    cond.comparison == ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+			if (seen_non_equal) {
+				is_ordered = false;
+				break;
+			}
+		} else {
+			seen_non_equal = true;
+		}
+	}
+	if (is_ordered) {
+		// no need to re-order
+		return;
+	}
+	// gather lists of equal/other conditions
+	vector<JoinCondition> equal_conditions;
+	vector<JoinCondition> other_conditions;
+	for (auto &cond : conditions) {
+		if (cond.comparison == ExpressionType::COMPARE_EQUAL ||
+		    cond.comparison == ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+			equal_conditions.push_back(std::move(cond));
+		} else {
+			other_conditions.push_back(std::move(cond));
+		}
+	}
+	conditions.clear();
+	// reconstruct the sorted conditions
+	for (auto &cond : equal_conditions) {
+		conditions.push_back(std::move(cond));
+	}
+	for (auto &cond : other_conditions) {
+		conditions.push_back(std::move(cond));
+	}
+}
+
 GPUPhysicalHashJoin::GPUPhysicalHashJoin(LogicalOperator &op, unique_ptr<GPUPhysicalOperator> left,
                                    unique_ptr<GPUPhysicalOperator> right, vector<JoinCondition> cond, JoinType join_type,
                                    const vector<idx_t> &left_projection_map, const vector<idx_t> &right_projection_map,
-                                   vector<LogicalType> delim_types, idx_t estimated_cardinality)
-    : GPUPhysicalOperator(PhysicalOperatorType::HASH_JOIN, op.types, estimated_cardinality), join_type(join_type) {
+                                   vector<LogicalType> delim_types, idx_t estimated_cardinality,
+                                   unique_ptr<JoinFilterPushdownInfo> pushdown_info_p)
+    : GPUPhysicalOperator(PhysicalOperatorType::HASH_JOIN, op.types, estimated_cardinality), join_type(join_type), conditions(std::move(cond)) {
 
-	conditions.resize(cond.size());
-	// we reorder conditions so the ones with COMPARE_EQUAL occur first
-	idx_t equal_position = 0;
-	idx_t other_position = cond.size() - 1;
-	for (idx_t i = 0; i < cond.size(); i++) {
-		if (cond[i].comparison == ExpressionType::COMPARE_EQUAL ||
-		    cond[i].comparison == ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
-			// COMPARE_EQUAL and COMPARE_NOT_DISTINCT_FROM, move to the start
-			conditions[equal_position++] = std::move(cond[i]);
-		} else {
-			// other expression, move to the end
-			conditions[other_position--] = std::move(cond[i]);
-		}
-	}
+	// conditions.resize(cond.size());
+	// // we reorder conditions so the ones with COMPARE_EQUAL occur first
+	// idx_t equal_position = 0;
+	// idx_t other_position = cond.size() - 1;
+	// for (idx_t i = 0; i < cond.size(); i++) {
+	// 	if (cond[i].comparison == ExpressionType::COMPARE_EQUAL ||
+	// 	    cond[i].comparison == ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+	// 		// COMPARE_EQUAL and COMPARE_NOT_DISTINCT_FROM, move to the start
+	// 		conditions[equal_position++] = std::move(cond[i]);
+	// 	} else {
+	// 		// other expression, move to the end
+	// 		conditions[other_position--] = std::move(cond[i]);
+	// 	}
+	// }
 
-	D_ASSERT(left_projection_map.empty());
+	ReorderConditions(conditions);
+
+	filter_pushdown = std::move(pushdown_info_p);
 
 	children.push_back(std::move(left));
 	children.push_back(std::move(right));
@@ -213,6 +257,23 @@ GPUPhysicalHashJoin::GPUPhysicalHashJoin(LogicalOperator &op, unique_ptr<GPUPhys
 		if (condition.right->GetExpressionClass() == ExpressionClass::BOUND_REF) {
 			build_columns_in_conditions.emplace(condition.right->Cast<BoundReferenceExpression>().index, cond_idx);
 		}
+	}
+
+	auto &lhs_input_types = children[0]->GetTypes();
+
+	// Create a projection map for the LHS (if it was empty), for convenience
+	lhs_output_columns.col_idxs = left_projection_map;
+	if (lhs_output_columns.col_idxs.empty()) {
+		// printf("it's empty\n");
+		lhs_output_columns.col_idxs.reserve(lhs_input_types.size());
+		for (idx_t i = 0; i < lhs_input_types.size(); i++) {
+			lhs_output_columns.col_idxs.emplace_back(i);
+		}
+	}
+
+	for (auto &lhs_col : lhs_output_columns.col_idxs) {
+		auto &lhs_col_type = lhs_input_types[lhs_col];
+		lhs_output_columns.col_types.push_back(lhs_col_type);
 	}
 
 	// For ANTI, SEMI and MARK join, we only need to store the keys, so for these the payload/RHS types are empty
@@ -239,17 +300,19 @@ GPUPhysicalHashJoin::GPUPhysicalHashJoin(LogicalOperator &op, unique_ptr<GPUPhys
 		auto it = build_columns_in_conditions.find(rhs_col);
 		if (it == build_columns_in_conditions.end()) {
 			// This rhs column is not a join key
-			payload_column_idxs.push_back(rhs_col);
-			payload_types.push_back(rhs_col_type);
-			rhs_output_columns.push_back(condition_types.size() + payload_types.size() - 1);
+			payload_columns.col_idxs.push_back(rhs_col);
+			payload_columns.col_types.push_back(rhs_col_type);
+			rhs_output_columns.col_idxs.push_back(condition_types.size() + payload_columns.col_types.size() - 1);
 		} else {
 			// This rhs column is a join key
-			rhs_output_columns.push_back(it->second);
+			rhs_output_columns.col_idxs.push_back(it->second);
 		}
-		rhs_output_types.push_back(rhs_col_type);
+		rhs_output_columns.col_types.push_back(rhs_col_type);
 	}
 
-	hash_table_result = new GPUIntermediateRelation(rhs_output_columns.size());
+	printf("rhs_output_columns.size() = %ld\n", rhs_output_columns.col_idxs.size());
+	printf("lhs_output_columns.size() = %ld\n", lhs_output_columns.col_idxs.size());
+	hash_table_result = new GPUIntermediateRelation(build_columns_in_conditions.size() + payload_columns.col_idxs.size());
 
 };
 
@@ -259,7 +322,7 @@ SourceResultType
 GPUPhysicalHashJoin::GetData(GPUIntermediateRelation &output_relation) const {
 	auto start = std::chrono::high_resolution_clock::now();
 
-	idx_t left_column_count = output_relation.columns.size() - hash_table_result->columns.size();
+	idx_t left_column_count = output_relation.columns.size() - rhs_output_columns.col_idxs.size();
 	if (join_type == JoinType::RIGHT_SEMI || join_type == JoinType::RIGHT_ANTI) {
 		left_column_count = 0;
 	} else if (join_type == JoinType::RIGHT) {
@@ -277,19 +340,16 @@ GPUPhysicalHashJoin::GetData(GPUIntermediateRelation &output_relation) const {
 	count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
 	HandleScanHTExpression(gpu_hash_table, ht_len, row_ids, count, join_type, conditions);
 
-	//TODO: FIX THIS LATER!!
-	// if (join_type == JoinType::RIGHT && count[0] > 0) throw NotImplementedException("Right join with scanHT count > 0 is not supported yet");
-
-	for (idx_t i = 0; i < rhs_output_columns.size(); i++) {
-		const auto rhs_col = rhs_output_columns[i];
+	for (idx_t i = 0; i < rhs_output_columns.col_idxs.size(); i++) {
+		const auto rhs_col = rhs_output_columns.col_idxs[i];
 		// const auto rhs_col = payload_column_idxs[i];
 		printf("Writing hash_table column %ld to column %ld\n", rhs_col, i);
 	}
 	//TODO: Check if we need to maintain unique for the RHS columns
 	if (unique_probe_keys) {
-		HandleMaterializeRowIDsRHS(*hash_table_result, output_relation, rhs_output_columns, left_column_count, count[0], row_ids, gpuBufferManager, true);
+		HandleMaterializeRowIDsRHS(*hash_table_result, output_relation, rhs_output_columns.col_idxs, left_column_count, count[0], row_ids, gpuBufferManager, true);
 	} else {
-		HandleMaterializeRowIDsRHS(*hash_table_result, output_relation, rhs_output_columns, left_column_count, count[0], row_ids, gpuBufferManager, false);
+		HandleMaterializeRowIDsRHS(*hash_table_result, output_relation, rhs_output_columns.col_idxs, left_column_count, count[0], row_ids, gpuBufferManager, false);
 	}
 
 	auto end = std::chrono::high_resolution_clock::now();
@@ -308,24 +368,27 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 		// for RIGHT SEMI and RIGHT ANTI joins, the output is the RHS
 		// we only need to output the RHS columns
 		// the LHS columns are NULL
-		if (output_relation.columns.size() != rhs_output_columns.size()) {
+		if (output_relation.columns.size() != rhs_output_columns.col_idxs.size()) {
 			throw InvalidInputException("Wrong input size");
 		}
 	} else if (join_type == JoinType::SEMI || join_type == JoinType::ANTI) {
 		// for SEMI and ANTI join, the output is the LHS
 		// we only need to output the LHS columns
 		// the RHS columns are NULL
-		if (output_relation.columns.size() != input_relation.columns.size()) {
+		if (output_relation.columns.size() != lhs_output_columns.col_idxs.size()) {
 			throw InvalidInputException("Wrong input size");
 		}
 	} else if (join_type == JoinType::RIGHT || join_type == JoinType::LEFT || join_type == JoinType::INNER || join_type == JoinType::OUTER) {
 		// for INNER and OUTER join, we output all columns
-		if (output_relation.columns.size() != input_relation.columns.size() + rhs_output_columns.size()) {
+		// printf("output_relation.columns.size() = %ld\n", output_relation.columns.size());
+		// printf("input_relation.columns.size() = %ld\n", input_relation.columns.size());
+		// printf("rhs_output_columns.size() = %ld\n", rhs_output_columns.col_idxs.size());
+		if (output_relation.columns.size() != lhs_output_columns.col_idxs.size() + rhs_output_columns.col_idxs.size()) {
 			throw InvalidInputException("Wrong input size");
 		}
 	} else if (join_type == JoinType::MARK) {
 		// for MARK join, we output all columns from the LHS and one extra boolean column
-		if (output_relation.columns.size() != input_relation.columns.size() + 1) {
+		if (output_relation.columns.size() != lhs_output_columns.col_idxs.size() + 1) {
 			throw InvalidInputException("Wrong input size");
 		}
 	} else {
@@ -371,38 +434,38 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 	//materialize columns from the left table
 	if (join_type == JoinType::SEMI || join_type == JoinType::ANTI || join_type == JoinType::INNER || join_type == JoinType::OUTER || join_type == JoinType::RIGHT) {
 		printf("Writing row IDs from LHS to output relation\n");
-		// for (idx_t i = 0; i < input_relation.column_count; i++) {
-		// 	printf("Passing column idx %ld from LHS (late materialized) to idx %ld in output relation\n", i, i);
-		// 	output_relation.columns[i] = HandleMaterializeRowIDs(input_relation.columns[i], count[0], row_ids_left, gpuBufferManager);
+		// if (join_type == JoinType::SEMI || join_type == JoinType::ANTI || unique_build_keys) {
+		// 	HandleMaterializeRowIDs(input_relation, output_relation, count[0], row_ids_left, gpuBufferManager, true);
+		// } else {
+		// 	HandleMaterializeRowIDs(input_relation, output_relation, count[0], row_ids_left, gpuBufferManager, false);
 		// }
+
 		if (join_type == JoinType::SEMI || join_type == JoinType::ANTI || unique_build_keys) {
-			HandleMaterializeRowIDs(input_relation, output_relation, count[0], row_ids_left, gpuBufferManager, true);
+			HandleMaterializeRowIDsLHS(input_relation, output_relation, lhs_output_columns.col_idxs, count[0], row_ids_left, gpuBufferManager, true);
 		} else {
-			HandleMaterializeRowIDs(input_relation, output_relation, count[0], row_ids_left, gpuBufferManager, false);
+			HandleMaterializeRowIDsLHS(input_relation, output_relation, lhs_output_columns.col_idxs, count[0], row_ids_left, gpuBufferManager, false);
 		}
 	} else if (join_type == JoinType::MARK) {
 		printf("Writing row IDs from LHS to output relation\n");
-		// for (idx_t i = 0; i < input_relation.column_count; i++) {
-		// 	printf("Passing column idx %ld from LHS (late materialized) to idx %ld in output relation\n", i, i);
-		// 	output_relation.columns[i] = HandleMaterializeRowIDs(input_relation.columns[i], count[0], row_ids_left, gpuBufferManager);
-		// }
-		// HandleMaterializeRowIDs(input_relation, output_relation, count[0], row_ids_left, gpuBufferManager);
-		for (idx_t i = 0; i < input_relation.column_count; i++) {
-			output_relation.columns[i] = new GPUColumn(input_relation.columns[i]->column_length, input_relation.columns[i]->data_wrapper.type, input_relation.columns[i]->data_wrapper.data);
-			output_relation.columns[i]->row_ids = input_relation.columns[i]->row_ids;
-			output_relation.columns[i]->row_id_count = input_relation.columns[i]->row_id_count;
+		for (idx_t i = 0; i < lhs_output_columns.col_idxs.size(); i++) {
+			auto lhs_col = lhs_output_columns.col_idxs[i];
+			printf("Passing column idx %ld from LHS to idx %ld in output relation\n", lhs_col, i);
+			output_relation.columns[i] = new GPUColumn(input_relation.columns[lhs_col]->column_length, input_relation.columns[lhs_col]->data_wrapper.type, input_relation.columns[lhs_col]->data_wrapper.data);
+			output_relation.columns[i]->row_ids = input_relation.columns[lhs_col]->row_ids;
+			output_relation.columns[i]->row_id_count = input_relation.columns[lhs_col]->row_id_count;
 			if (unique_build_keys) {
-				output_relation.columns[i]->is_unique = input_relation.columns[i]->is_unique;
+				output_relation.columns[i]->is_unique = input_relation.columns[lhs_col]->is_unique;
 			} else {
 				output_relation.columns[i]->is_unique = false;
 			}
 		}
-		output_relation.columns[input_relation.column_count] = new GPUColumn(probe_key[0]->column_length, ColumnType::BOOLEAN, output);
-		output_relation.columns[input_relation.column_count]->row_ids = probe_key[0]->row_ids;
-		output_relation.columns[input_relation.column_count]->row_id_count = probe_key[0]->row_id_count;
+		output_relation.columns[lhs_output_columns.col_idxs.size()] = new GPUColumn(probe_key[0]->column_length, ColumnType::BOOLEAN, output);
+		output_relation.columns[lhs_output_columns.col_idxs.size()]->row_ids = probe_key[0]->row_ids;
+		output_relation.columns[lhs_output_columns.col_idxs.size()]->row_id_count = probe_key[0]->row_id_count;
 	} else if (join_type == JoinType::RIGHT_SEMI || join_type == JoinType::RIGHT_ANTI) {
-		for (idx_t i = 0; i < input_relation.column_count; i++) {
-			output_relation.columns[i] = new GPUColumn(0, input_relation.columns[i]->data_wrapper.type, nullptr);
+		for (idx_t i = 0; i < lhs_output_columns.col_idxs.size(); i++) {
+			auto lhs_col = lhs_output_columns.col_idxs[i];
+			output_relation.columns[i] = new GPUColumn(0, input_relation.columns[lhs_col]->data_wrapper.type, nullptr);
 		}
 	} else {
 		throw NotImplementedException("Unsupported join type");
@@ -412,16 +475,16 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 	if (join_type == JoinType::INNER || join_type == JoinType::OUTER || join_type == JoinType::LEFT || join_type == JoinType::RIGHT) {
 		printf("Writing row IDs from RHS to output relation\n");
 		if (unique_probe_keys) {
-			HandleMaterializeRowIDsRHS(*hash_table_result, output_relation, rhs_output_columns, input_relation.column_count, count[0], row_ids_right, gpuBufferManager, true);
+			HandleMaterializeRowIDsRHS(*hash_table_result, output_relation, rhs_output_columns.col_idxs, lhs_output_columns.col_idxs.size(), count[0], row_ids_right, gpuBufferManager, true);
 		} else {
-			HandleMaterializeRowIDsRHS(*hash_table_result, output_relation, rhs_output_columns, input_relation.column_count, count[0], row_ids_right, gpuBufferManager, false);
+			HandleMaterializeRowIDsRHS(*hash_table_result, output_relation, rhs_output_columns.col_idxs, lhs_output_columns.col_idxs.size(), count[0], row_ids_right, gpuBufferManager, false);
 		}
 	} else if (join_type == JoinType::RIGHT_SEMI || join_type == JoinType::RIGHT_ANTI) {
 		// WE SHOULD NOT NEED TO DO ANYTHING HERE
 		printf("Writing row IDs from RHS to output relation\n");
 		// on the RHS, we need to fetch the data from the hash table
-		for (idx_t i = 0; i < rhs_output_columns.size(); i++) {
-			const auto rhs_col = rhs_output_columns[i];
+		for (idx_t i = 0; i < rhs_output_columns.col_idxs.size(); i++) {
+			const auto rhs_col = rhs_output_columns.col_idxs[i];
 			printf("Passing column idx %ld from RHS (late materialized) to idx %ld in output relation\n", rhs_col, i);
 			// output_relation.columns[output_col_idx] = HandleMaterializeRowIDs(hash_table_result->columns[output_col_idx], count[0], row_ids_right, gpuBufferManager);
 			output_relation.columns[i] = new GPUColumn(0, hash_table_result->columns[rhs_col]->data_wrapper.type, nullptr);
@@ -442,6 +505,11 @@ SinkResultType
 GPUPhysicalHashJoin::Sink(GPUIntermediateRelation &input_relation) const {
 	
 	auto start = std::chrono::high_resolution_clock::now();
+
+	if (!delim_types.empty() && join_type == JoinType::MARK) {
+		// correlated MARK join
+		throw NotImplementedException("Correlated MARK join not supported yet");
+	}
 
 	GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 	GPUColumn** build_keys = new GPUColumn*[conditions.size()];
@@ -482,8 +550,8 @@ GPUPhysicalHashJoin::Sink(GPUIntermediateRelation &input_relation) const {
 	}
 
 	
-    for (idx_t i = 0; i < payload_column_idxs.size(); i++) {
-        auto payload_idx = payload_column_idxs[i];
+    for (idx_t i = 0; i < payload_columns.col_idxs.size(); i++) {
+        auto payload_idx = payload_columns.col_idxs[i];
         // D_ASSERT(vector.GetType() == ht.layout.GetTypes()[output_col_idx]);
 		printf("Passing column idx %d from input relation to index %ld in RHS hash table\n", payload_idx, right_idx + i);
         // hash_table_result->columns[rhs_col] = input_relation.columns[i];
