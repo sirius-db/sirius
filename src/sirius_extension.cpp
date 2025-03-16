@@ -319,7 +319,7 @@ void SiriusExtension::GPUProcessingSubstraitFunction(ClientContext &context, Tab
 		} else {
 			data.res = data.plan->Execute();
 		}
-		data.res->Print();
+		// data.res->Print();
 		auto end = std::chrono::high_resolution_clock::now();
 		auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
 		printf("GPU Execute query time: %.2f ms\n", duration.count()/1000.0);
