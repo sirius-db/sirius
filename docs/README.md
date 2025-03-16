@@ -95,12 +95,11 @@ Build the code:
 $ make -j$(nproc)
 ```
 
-Start duckdb using: `./build/release/duckdb tpch_s10.duckdb`. 
+Start duckdb using: `./build/release/duckdb tpch_s50.duckdb`. 
 
 Group By Query:
 ```
 $ call gpu_caching("customer.c_nationkey");
-$ call gpu_caching("customer.c_comment");
 $ call gpu_caching("nation.n_nationkey");
 $ call gpu_caching("nation.n_comment");
 ```
