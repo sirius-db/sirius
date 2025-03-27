@@ -70,10 +70,10 @@ GPUExpressionExecutor::HandlingSpecificFilter(GPUIntermediateRelation& input_rel
             }
 
             //Q7 HACK!!!
-            if (expr.children.size() == 2 && expr.children[0]->type == ExpressionType::COMPARE_EQUAL && expr.children[1]->type == ExpressionType::COMPARE_EQUAL) {
+            if (expr.children.size() == 2 && expr.type == ExpressionType::CONJUNCTION_OR && expr.children[0]->type == ExpressionType::COMPARE_EQUAL && expr.children[1]->type == ExpressionType::COMPARE_EQUAL) {
                 printf("Filter expression of Q7\n");
-                string t = "((N_NATIONKEY = X) OR (N_NATIONKEY = Y))";
-                if (!expression.ToString().compare(t)) {
+                // string t = "((N_NATIONKEY = X) OR (N_NATIONKEY = Y))";
+                // if (!expression.ToString().compare(t)) {
                     
                         BoundComparisonExpression& first = expr.children[0]->Cast<BoundComparisonExpression>();
                         auto n_nationkey1 = first.left->Cast<BoundReferenceExpression>().index;
@@ -95,7 +95,7 @@ GPUExpressionExecutor::HandlingSpecificFilter(GPUIntermediateRelation& input_rel
                         size_t size = materialized_nkey1->column_length;
                         q7FilterExpression2(a, b, val[0], val[1], comparison_idx, count, size);
 
-                }
+                // }
             }
 
             //Q7 HACK!!!
@@ -202,27 +202,30 @@ GPUExpressionExecutor::HandlingSpecificFilter(GPUIntermediateRelation& input_rel
 
         //Q2 HACK!!!
         if (expression.type == ExpressionType::COMPARE_EQUAL) {
-            printf("Filter expression of Q2\n");
-            string t = "(((P_TYPE + 3) % 5) = 0)";
-            if (!expression.ToString().compare(t)) {
-                auto &expr = expression.Cast<BoundComparisonExpression>();	
-                if (expr.left->type == ExpressionType::BOUND_FUNCTION) {
-                    auto& function_expr = expr.left->Cast<BoundFunctionExpression>();
-                    if (function_expr.function.name.compare("%") == 0) {
-                        auto& left_function_expr = function_expr.children[0]->Cast<BoundFunctionExpression>();
-                        if (left_function_expr.function.name.compare("+") == 0) {
-                                auto p_type = left_function_expr.children[0]->Cast<BoundReferenceExpression>().index;
-                                uint64_t p_type_val = 0;
+            auto &expr = expression.Cast<BoundComparisonExpression>();
+            if (expr.left->type == ExpressionType::BOUND_FUNCTION && expr.right->type == ExpressionType::VALUE_CONSTANT) {
+                printf("Filter expression of Q2\n");
+                string t = "(((P_TYPE + 3) % 5) = 0)";
+                if (!expression.ToString().compare(t)) {
+                    auto &expr = expression.Cast<BoundComparisonExpression>();	
+                    if (expr.left->type == ExpressionType::BOUND_FUNCTION) {
+                        auto& function_expr = expr.left->Cast<BoundFunctionExpression>();
+                        if (function_expr.function.name.compare("%") == 0) {
+                            auto& left_function_expr = function_expr.children[0]->Cast<BoundFunctionExpression>();
+                            if (left_function_expr.function.name.compare("+") == 0) {
+                                    auto p_type = left_function_expr.children[0]->Cast<BoundReferenceExpression>().index;
+                                    uint64_t p_type_val = 0;
 
-                                GPUColumn* materialized_type = HandleMaterializeExpression(input_relation.columns[p_type], left_function_expr.children[0]->Cast<BoundReferenceExpression>(), gpuBufferManager);
+                                    GPUColumn* materialized_type = HandleMaterializeExpression(input_relation.columns[p_type], left_function_expr.children[0]->Cast<BoundReferenceExpression>(), gpuBufferManager);
 
-                                count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
-                                uint64_t* a = reinterpret_cast<uint64_t*> (materialized_type->data_wrapper.data);
+                                    count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+                                    uint64_t* a = reinterpret_cast<uint64_t*> (materialized_type->data_wrapper.data);
 
-                                size_t size = materialized_type->column_length;
+                                    size_t size = materialized_type->column_length;
 
-                                q2FilterExpression(a, p_type_val, comparison_idx, count, size);
+                                    q2FilterExpression(a, p_type_val, comparison_idx, count, size);
 
+                            }
                         }
                     }
                 }

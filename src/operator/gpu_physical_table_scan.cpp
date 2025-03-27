@@ -402,6 +402,10 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
         table->columns[column_ids[column_index].GetPrimaryIndex()]->row_ids = nullptr;
         table->columns[column_ids[column_index].GetPrimaryIndex()]->row_id_count = 0;
 
+        if (filter->filter_type == TableFilterType::OPTIONAL_FILTER) {
+          continue;
+        }
+
         if (column_index < names.size()) {
 
           if (filter->filter_type == TableFilterType::CONJUNCTION_AND) {
@@ -418,11 +422,11 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
                 }
             }
           } else {
-            // count how many filters in table_filters->filters
-            if (table_filters->filters.size() == 1) {
+            // count how many filters in table_filters->filters that are not optional filters
+            if (filter->filter_type == TableFilterType::CONSTANT_COMPARISON) {
               num_expr++;
             } else {
-              throw NotImplementedException("Filter aside from conjunction and not supported");
+              throw NotImplementedException("Filter aside from constant comparison not supported");
             }
           }
 
@@ -436,6 +440,10 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
       for (auto &f : table_filters->filters) {
         auto &column_index = f.first;
         auto &filter = f.second;
+
+        if (filter->filter_type == TableFilterType::OPTIONAL_FILTER) {
+          continue;
+        }
 
         if (column_index < names.size()) {
           printf("Reading filter column from index %ld\n", column_ids[column_index]);
@@ -461,7 +469,7 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
 
           } else {
             // count how many filters in table_filters->filters
-            if (table_filters->filters.size() == 1) {
+            if (filter->filter_type == TableFilterType::CONSTANT_COMPARISON) {
               filter_constants[expr_idx] = &(filter->Cast<ConstantFilter>());
               expression_columns[expr_idx] = table->columns[column_ids[column_index].GetPrimaryIndex()];
               expr_idx++;
@@ -474,9 +482,11 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
       }
 
       printf("Num expr %d\n", num_expr);
-      count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
-      HandleArbitraryConstantExpression(expression_columns, count, row_ids, filter_constants, num_expr);
-      if (count[0] == 0) throw NotImplementedException("No match found");
+      if (num_expr > 0) {
+        count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+        HandleArbitraryConstantExpression(expression_columns, count, row_ids, filter_constants, num_expr);
+        if (count[0] == 0) throw NotImplementedException("No match found");
+      }
     }
     int index = 0;
     // projection id means that from this set of column ids that are being scanned, which index of column ids are getting projected out
