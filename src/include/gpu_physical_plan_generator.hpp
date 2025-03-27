@@ -13,7 +13,7 @@
 namespace duckdb {
 class ClientContext;
 class GPUContext;
-// class ColumnDataCollection;
+class ColumnDataCollection;
 
 //! The physical plan generator generates a physical execution plan from a
 //! logical query plan
@@ -25,9 +25,9 @@ public:
 	LogicalDependencyList dependencies;
 	//! Recursive CTEs require at least one ChunkScan, referencing the working_table.
 	//! This data structure is used to establish it.
-	// unordered_map<idx_t, shared_ptr<ColumnDataCollection>> recursive_cte_tables;
+	unordered_map<idx_t, shared_ptr<ColumnDataCollection>> recursive_cte_tables;
 	//! Materialized CTE ids must be collected.
-	// unordered_map<idx_t, vector<const_reference<GPUPhysicalOperator>>> materialized_ctes;
+	unordered_map<idx_t, vector<const_reference<GPUPhysicalOperator>>> materialized_ctes;
 
 public:
 	//! Creates a plan from the logical operator. This involves resolving column bindings and generating physical
@@ -84,7 +84,7 @@ protected:
 	// unique_ptr<GPUPhysicalOperator> CreatePlan(LogicalVacuum &op);
 	// unique_ptr<GPUPhysicalOperator> CreatePlan(LogicalUnnest &op);
 	// unique_ptr<GPUPhysicalOperator> CreatePlan(LogicalRecursiveCTE &op);
-	// unique_ptr<GPUPhysicalOperator> CreatePlan(LogicalMaterializedCTE &op);
+	unique_ptr<GPUPhysicalOperator> CreatePlan(LogicalMaterializedCTE &op);
 	// unique_ptr<GPUPhysicalOperator> CreatePlan(LogicalCTERef &op);
 	// unique_ptr<GPUPhysicalOperator> CreatePlan(LogicalPivot &op);
 

@@ -13,5 +13,6 @@ set(EXTENSION_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/gpu_plan_limit.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/gpu_plan_order.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/gpu_plan_projection.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/gpu_plan_cte.cpp
         PARENT_SCOPE
 )

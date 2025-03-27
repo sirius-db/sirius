@@ -43,34 +43,53 @@ GPUExpressionExecutor::HandlingSpecificProjection(GPUIntermediateRelation& input
                 result = new GPUColumn(size, ColumnType::FLOAT64, reinterpret_cast<uint8_t*>(out));
 
 			} else if (expr.case_checks[0].then_expr->type == ExpressionType::BOUND_FUNCTION) {
-				// Q14 HACK!!!
-				printf("Case expression of Q14\n");
-				//CASE  WHEN ((P_TYPE >= 125)) THEN ((L_EXTENDEDPRICE * (1.0 - L_DISCOUNT))) ELSE 0.0 END
-				auto &when_expr = expr.case_checks[0].when_expr->Cast<BoundComparisonExpression>();
-				// printf("%s\n", ExpressionTypeToString(when_expr.type).c_str());
-				// auto &compare_expr = when_expr.children[0]->Cast<BoundComparisonExpression>();
-				auto p_type = when_expr.left->Cast<BoundReferenceExpression>().index;
 
 				auto &then_expr = expr.case_checks[0].then_expr->Cast<BoundFunctionExpression>();
-				auto l_extendedprice = then_expr.children[0]->Cast<BoundReferenceExpression>().index;
-				auto &substract_expr = then_expr.children[1]->Cast<BoundFunctionExpression>();
-				auto l_discount = substract_expr.children[1]->Cast<BoundReferenceExpression>().index;
+				printf("function name %s\n", then_expr.function.name.c_str());
 
-                uint64_t p_type_value1 = 125;
-                uint64_t p_type_value2 = 150;
+				if (then_expr.function.name.compare("error") == 0) {
+					// Q11 & Q22 HACK!!!
+					// CASE  WHEN ((#1 > 1)) THEN (error('More than one row returned by a subquery used as an expression - scalar subqueries can only return a single row.
+					// Use "SET scalar_subquery_error_on_multiple_rows=false" to revert to previous behavior of returning a random row.')) ELSE #0 END
+					printf("Case expression of Q11 & Q22\n");
+					auto &when_expr = expr.case_checks[0].when_expr->Cast<BoundComparisonExpression>();
+					auto left_ref = when_expr.left->Cast<BoundReferenceExpression>().index;
+					auto else_expr = expr.else_expr->Cast<BoundReferenceExpression>().index;
 
-                auto materialized_type = HandleMaterializeExpression(input_relation.columns[p_type], when_expr.left->Cast<BoundReferenceExpression>(), gpuBufferManager);
-                auto materialized_extendedprice = HandleMaterializeExpression(input_relation.columns[l_extendedprice], then_expr.children[0]->Cast<BoundReferenceExpression>(), gpuBufferManager);
-                auto materialized_discount = HandleMaterializeExpression(input_relation.columns[l_discount], substract_expr.children[1]->Cast<BoundReferenceExpression>(), gpuBufferManager);
+					if (input_relation.columns[else_expr]->column_length != 1) {
+						throw ("Error: More than one row returned by a subquery used as an expression - scalar subqueries can only return a single row.\n");
+					}
+					result = new GPUColumn(input_relation.columns[else_expr]->column_length, input_relation.columns[else_expr]->data_wrapper.type, input_relation.columns[else_expr]->data_wrapper.data);
 
-                uint64_t* a = reinterpret_cast<uint64_t*> (materialized_type->data_wrapper.data);
-                double* b = reinterpret_cast<double*> (materialized_extendedprice->data_wrapper.data);
-                double* c = reinterpret_cast<double*> (materialized_discount->data_wrapper.data);
-                size_t size = materialized_type->column_length;
-                double* out = gpuBufferManager->customCudaMalloc<double>(size, 0, 0);
-                q14CaseExpression(a, b, c, p_type_value1, p_type_value2, out, size);
+				} else if (then_expr.function.name.compare("*") == 0) {
+					// Q14 HACK!!!
+					printf("Case expression of Q14\n");
+					//CASE  WHEN ((P_TYPE >= 125)) THEN ((L_EXTENDEDPRICE * (1.0 - L_DISCOUNT))) ELSE 0.0 END
+					auto &when_expr = expr.case_checks[0].when_expr->Cast<BoundComparisonExpression>();
+					// printf("%s\n", ExpressionTypeToString(when_expr.type).c_str());
+					// auto &compare_expr = when_expr.children[0]->Cast<BoundComparisonExpression>();
+					auto p_type = when_expr.left->Cast<BoundReferenceExpression>().index;
 
-				result = new GPUColumn(size, ColumnType::FLOAT64, reinterpret_cast<uint8_t*>(out));
+					auto l_extendedprice = then_expr.children[0]->Cast<BoundReferenceExpression>().index;
+					auto &substract_expr = then_expr.children[1]->Cast<BoundFunctionExpression>();
+					auto l_discount = substract_expr.children[1]->Cast<BoundReferenceExpression>().index;
+
+					uint64_t p_type_value1 = 125;
+					uint64_t p_type_value2 = 150;
+
+					auto materialized_type = HandleMaterializeExpression(input_relation.columns[p_type], when_expr.left->Cast<BoundReferenceExpression>(), gpuBufferManager);
+					auto materialized_extendedprice = HandleMaterializeExpression(input_relation.columns[l_extendedprice], then_expr.children[0]->Cast<BoundReferenceExpression>(), gpuBufferManager);
+					auto materialized_discount = HandleMaterializeExpression(input_relation.columns[l_discount], substract_expr.children[1]->Cast<BoundReferenceExpression>(), gpuBufferManager);
+
+					uint64_t* a = reinterpret_cast<uint64_t*> (materialized_type->data_wrapper.data);
+					double* b = reinterpret_cast<double*> (materialized_extendedprice->data_wrapper.data);
+					double* c = reinterpret_cast<double*> (materialized_discount->data_wrapper.data);
+					size_t size = materialized_type->column_length;
+					double* out = gpuBufferManager->customCudaMalloc<double>(size, 0, 0);
+					q14CaseExpression(a, b, c, p_type_value1, p_type_value2, out, size);
+
+					result = new GPUColumn(size, ColumnType::FLOAT64, reinterpret_cast<uint8_t*>(out));
+				}
 
 			} else if (expr.case_checks[0].then_expr->expression_class == ExpressionClass::BOUND_CONSTANT) {
 				auto &when_expr = expr.case_checks[0].when_expr->Cast<BoundConjunctionExpression>();
