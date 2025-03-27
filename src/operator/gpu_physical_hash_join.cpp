@@ -433,7 +433,7 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 
 	//materialize columns from the left table
 	if (join_type == JoinType::SEMI || join_type == JoinType::ANTI || join_type == JoinType::INNER || join_type == JoinType::OUTER || join_type == JoinType::RIGHT) {
-		printf("Writing row IDs from LHS to output relation\n");
+		printf("Writing LHS columns to output relation\n");
 		// if (join_type == JoinType::SEMI || join_type == JoinType::ANTI || unique_build_keys) {
 		// 	HandleMaterializeRowIDs(input_relation, output_relation, count[0], row_ids_left, gpuBufferManager, true);
 		// } else {
@@ -446,7 +446,7 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 			HandleMaterializeRowIDsLHS(input_relation, output_relation, lhs_output_columns.col_idxs, count[0], row_ids_left, gpuBufferManager, false);
 		}
 	} else if (join_type == JoinType::MARK) {
-		printf("Writing row IDs from LHS to output relation\n");
+		printf("Writing LHS columns to output relation\n");
 		for (idx_t i = 0; i < lhs_output_columns.col_idxs.size(); i++) {
 			auto lhs_col = lhs_output_columns.col_idxs[i];
 			printf("Passing column idx %ld from LHS to idx %ld in output relation\n", lhs_col, i);
@@ -463,10 +463,15 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 		output_relation.columns[lhs_output_columns.col_idxs.size()]->row_ids = probe_key[0]->row_ids;
 		output_relation.columns[lhs_output_columns.col_idxs.size()]->row_id_count = probe_key[0]->row_id_count;
 	} else if (join_type == JoinType::RIGHT_SEMI || join_type == JoinType::RIGHT_ANTI) {
-		for (idx_t i = 0; i < lhs_output_columns.col_idxs.size(); i++) {
-			auto lhs_col = lhs_output_columns.col_idxs[i];
-			output_relation.columns[i] = new GPUColumn(0, input_relation.columns[lhs_col]->data_wrapper.type, nullptr);
-		}
+		// WE SHOULD NOT NEED TO DO ANYTHING HERE
+		// printf("Writing LHS columns to output relation\n");
+		// for (idx_t i = 0; i < lhs_output_columns.col_idxs.size(); i++) {
+		// 	auto lhs_col = lhs_output_columns.col_idxs[i];
+		// 	printf("lhs_col = %ld %ld\n", lhs_col, i);
+		// 	printf("input_relation.columns.size() = %ld\n", input_relation.columns.size());
+		// 	printf("output_relation.columns.size() = %ld\n", output_relation.columns.size());
+		// 	output_relation.columns[i] = new GPUColumn(0, input_relation.columns[lhs_col]->data_wrapper.type, nullptr);
+		// }
 	} else {
 		throw NotImplementedException("Unsupported join type");
 	}
@@ -480,7 +485,6 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 			HandleMaterializeRowIDsRHS(*hash_table_result, output_relation, rhs_output_columns.col_idxs, lhs_output_columns.col_idxs.size(), count[0], row_ids_right, gpuBufferManager, false);
 		}
 	} else if (join_type == JoinType::RIGHT_SEMI || join_type == JoinType::RIGHT_ANTI) {
-		// WE SHOULD NOT NEED TO DO ANYTHING HERE
 		printf("Writing row IDs from RHS to output relation\n");
 		// on the RHS, we need to fetch the data from the hash table
 		for (idx_t i = 0; i < rhs_output_columns.col_idxs.size(); i++) {
