@@ -410,9 +410,11 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 		auto &condition = conditions[cond_idx];
         auto join_key_index = condition.left->Cast<BoundReferenceExpression>().index;
         printf("Reading join key for probing hash table from index %d\n", join_key_index);
+		printf("input_relation.columns.size() = %ld\n", input_relation.columns.size());
 		if (input_relation.columns[join_key_index]->is_unique) {
 			unique_probe_keys = true;
 		}
+		printf("Materializing join key for probing hash table from index %d\n", join_key_index);
 		probe_key[cond_idx] = HandleMaterializeExpression(input_relation.columns[join_key_index], condition.left->Cast<BoundReferenceExpression>(), gpuBufferManager);
 	}
 

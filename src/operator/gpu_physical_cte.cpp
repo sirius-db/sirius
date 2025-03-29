@@ -72,6 +72,11 @@ SinkResultType GPUPhysicalCTE::Sink(GPUIntermediateRelation &input_relation) con
 	// lstate.lhs_data.Append(lstate.append_state, chunk);
 
 	// return SinkResultType::NEED_MORE_INPUT;
+	printf("Sinking data into CTE\n");
+	for (int col_idx = 0; col_idx < input_relation.columns.size(); col_idx++) {
+		working_table_gpu->columns[col_idx] = new GPUColumn(input_relation.columns[col_idx]->column_length, input_relation.columns[col_idx]->data_wrapper.type, input_relation.columns[col_idx]->data_wrapper.data);
+		working_table_gpu->columns[col_idx]->is_unique = input_relation.columns[col_idx]->is_unique;
+	}
     return SinkResultType::FINISHED;
 }
 

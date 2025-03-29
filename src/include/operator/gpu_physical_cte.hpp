@@ -29,6 +29,8 @@ public:
 
 	shared_ptr<ColumnDataCollection> working_table;
 
+	GPUIntermediateRelation* working_table_gpu;
+
 	idx_t table_index;
 	string ctename;
 
