@@ -16,9 +16,11 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::CreatePlan(LogicalMate
 
 	// Create the working_table that the PhysicalCTE will use for evaluation.
 	auto working_table = make_shared_ptr<ColumnDataCollection>(context, op.children[0]->types);
+	auto working_table_gpu = new GPUIntermediateRelation(op.children[0]->types.size());
 
 	// Add the ColumnDataCollection to the context of this PhysicalPlanGenerator
 	recursive_cte_tables[op.table_index] = working_table;
+	gpu_recursive_cte_tables[op.table_index] = working_table_gpu;
 	materialized_ctes[op.table_index] = vector<const_reference<GPUPhysicalOperator>>();
 
 	// Create the plan for the left side. This is the materialization.
@@ -30,6 +32,7 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::CreatePlan(LogicalMate
 	cte = make_uniq<GPUPhysicalCTE>(op.ctename, op.table_index, right->types, std::move(left), std::move(right),
 	                             op.estimated_cardinality);
 	cte->working_table = working_table;
+	cte->working_table_gpu = working_table_gpu;
 	cte->cte_scans = materialized_ctes[op.table_index];
 
 	return std::move(cte);

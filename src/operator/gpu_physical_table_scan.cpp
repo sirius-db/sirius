@@ -505,6 +505,24 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
           }
           index++;
       }
+
+      if (projection_ids.size() == 0) {
+        printf("Projection ids size is 0 so we are projecting all columns\n");
+        for (auto column_id : column_ids) {
+            printf("Reading column index (late materialized) %ld and passing it to index in output relation %ld\n", column_id.GetPrimaryIndex(), index);
+            printf("Writing row IDs to output relation in index %ld\n", index);
+            output_relation.columns[index] = new GPUColumn(table->columns[column_id.GetPrimaryIndex()]->column_length, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.type, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.data,
+                            table->columns[column_id.GetPrimaryIndex()]->data_wrapper.offset, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.num_bytes, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.is_string_data);
+            output_relation.columns[index]->is_unique = table->columns[column_id.GetPrimaryIndex()]->is_unique;
+            if (row_ids) {
+              output_relation.columns[index]->row_ids = row_ids; 
+            }
+            if (count) {
+              output_relation.columns[index]->row_id_count = count[0];
+            }
+            index++;
+        }
+      }
     } else {
       //THIS IS FOR INDEX_SCAN
       for (auto column_id : column_ids) {

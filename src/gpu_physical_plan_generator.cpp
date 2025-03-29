@@ -191,12 +191,12 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::CreatePlan(LogicalOper
 	// case LogicalOperatorType::LOGICAL_RECURSIVE_CTE:
 	// 	plan = CreatePlan(op.Cast<LogicalRecursiveCTE>());
 	// 	break;
-	// case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
-	// 	plan = CreatePlan(op.Cast<LogicalMaterializedCTE>());
-	// 	break;
-	// case LogicalOperatorType::LOGICAL_CTE_REF:
-	// 	plan = CreatePlan(op.Cast<LogicalCTERef>());
-	// 	break;
+	case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
+		plan = CreatePlan(op.Cast<LogicalMaterializedCTE>());
+		break;
+	case LogicalOperatorType::LOGICAL_CTE_REF:
+		plan = CreatePlan(op.Cast<LogicalCTERef>());
+		break;
 	// case LogicalOperatorType::LOGICAL_EXPORT:
 	// 	plan = CreatePlan(op.Cast<LogicalExport>());
 	// 	break;
