@@ -109,7 +109,9 @@ Multi Column Group By:
 $ call gpu_processing("SELECT n_comment, c_comment, COUNT(*) FROM customer, nation WHERE customer.c_nationkey = nation.n_nationkey GROUP BY n_comment, c_comment;");
 ```
 
-Single Column Group By:
+Single Column Group By and Order by:
 ```
 $ call gpu_processing("SELECT n_comment, COUNT(*) FROM customer, nation WHERE customer.c_nationkey = nation.n_nationkey GROUP BY n_comment;");
+$ call gpu_processing("SELECT n_comment, COUNT(*) FROM customer, nation WHERE customer.c_nationkey = nation.n_nationkey GROUP BY n_comment ORDER BY n_comment ASC;");
+$ call gpu_processing("SELECT n_comment, COUNT(*) FROM customer, nation WHERE customer.c_nationkey = nation.n_nationkey GROUP BY n_comment ORDER BY n_comment DESC;");
 ```

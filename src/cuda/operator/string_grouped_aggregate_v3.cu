@@ -107,7 +107,7 @@ namespace duckdb
         }
 
         __device__ __forceinline__ bool operator<(const sort_keys_type_string_v3 &other) const
-        {
+        {   
             // First compare the signature
             if (row_signature != other.row_signature)
             {
@@ -130,7 +130,7 @@ namespace duckdb
                     return left_length < right_length;
                 }
             }
-
+            
             // If the signature and lengths match then compare the actual values
             for (uint64_t i = 0; i < num_keys; i++)
             {
@@ -176,7 +176,7 @@ namespace duckdb
                 }
             }
 
-            return false;
+            return row_id < other.row_id;
         }
     };
 
@@ -237,17 +237,15 @@ namespace duckdb
             // Get the signature for this row
             uint64_t signature = 0;
             uint64_t curr_power = 1;
-#pragma unroll
             for (uint64_t j = 0; j < num_keys; j++)
             {
                 // Get the chars for this row in this column
-                uint64_t *curr_column_offsets = group_by_metadata->offsets[j];
+                uint64_t* curr_column_offsets = group_by_metadata->offsets[j];
                 uint64_t curr_row_start = curr_column_offsets[i];
                 uint64_t curr_record_length = curr_column_offsets[i + 1] - curr_row_start;
-                uint8_t *column_hash_chars = group_by_metadata->all_keys[j] + curr_row_start;
+                uint8_t* column_hash_chars = group_by_metadata->all_keys[j] + curr_row_start;
 
 // Update the signature using this record
-#pragma unroll
                 for (uint64_t k = 0; k < curr_record_length; k++)
                 {
                     curr_value = static_cast<uint64_t>(column_hash_chars[k]);
@@ -255,7 +253,7 @@ namespace duckdb
                     curr_power = (curr_power * HASH_POWER) % HASH_MOD_VALUE;
                 }
             }
-
+            
             row_records[i] = sort_keys_type_string_v3(group_by_metadata, i, signature);
         }
     }
@@ -307,6 +305,34 @@ namespace duckdb
         }
     }
 
+    __global__ void populate_original_row_ids(sort_keys_type_string_v3* grouped_row_records, uint64_t* original_row_ids, uint64_t num_groups) {
+        const uint64_t curr_idx = threadIdx.x + blockIdx.x * blockDim.x;
+        if(curr_idx < num_groups) {
+            original_row_ids[curr_idx] = grouped_row_records[curr_idx].row_id;
+        }
+    }
+
+    __global__ void print_row_records(sort_keys_type_string_v3* row_records, uint64_t num_rows) {
+        printf("\n------------ START PRINTING RECORD SUMMARY ------------\n");
+        for(uint64_t i = 0; i < num_rows; i++) {
+            // Get the details for this record
+            sort_keys_type_string_v3 curr_row_record = row_records[i];
+            uint64_t row_id = curr_row_record.row_id;
+            uint64_t* col_offsets = curr_row_record.group_by_metadata->offsets[0];
+            uint64_t record_offset = col_offsets[row_id];
+            uint64_t record_length = col_offsets[row_id + 1] - record_offset;
+            char* record_chars = reinterpret_cast<char*>(curr_row_record.group_by_metadata->all_keys[0] + record_offset);
+            
+            // Now print the details
+            printf("RECORD DETAILS: Row Id - %lld, Row Signature - %lld, Record Len - %lld, Record Chars - ", curr_row_record.row_id, curr_row_record.row_signature, record_length);
+            for(uint64_t i = 0; i < record_length; ++i) {
+                printf("%c", record_chars[i]);
+            }
+            printf("\n");
+        }
+        printf("\n------------ FINISH PRINTING RECORD SUMMARY ------------\n");
+    }
+
     template <typename V>
     void groupedStringAggregateV3(uint8_t **keys, uint8_t **aggregate_keys, uint64_t** offset, uint64_t* num_bytes, uint64_t* count, uint64_t N, uint64_t num_keys, uint64_t num_aggregates, int* agg_mode)
     {
@@ -316,13 +342,6 @@ namespace duckdb
             count[0] = 0;
             printf("N is 0\n");
             return;
-        }
-
-        uint64_t max_value = std::numeric_limits<int>::max();
-        if (N > max_value)
-        {
-            printf("String Group By currently only supported for at most %lu rows but got %lu rows\n", (uint64_t)max_value, (uint64_t)N);
-            throw std::runtime_error("");
         }
 
         printf("Launching String Grouped Aggregate Kernel V3\n");
@@ -365,7 +384,6 @@ namespace duckdb
             N,
             custom_less_comparator);
 
-        cudaDeviceSynchronize();
         CHECK_ERROR();
 
         // Allocate temporary storage
@@ -381,6 +399,7 @@ namespace duckdb
 
         cudaDeviceSynchronize();
         CHECK_ERROR();
+
         auto sort_end_time = high_resolution_clock::now();
         auto sort_time_ms = std::chrono::duration_cast<duration<double, std::milli>>(sort_end_time - sort_start_time).count();
         std::cout << "STRING GROUP BY V3: Sorting required " << sort_temp_storage_bytes << " bytes and took " << sort_time_ms << " ms" << std::endl;
@@ -390,20 +409,20 @@ namespace duckdb
         auto group_by_start_time = high_resolution_clock::now();
         uint64_t num_aggregate_values = N * num_aggregates;
         V* d_aggregate_buffer = gpuBufferManager->customCudaMalloc<V>(num_aggregate_values, 0, 0);
-        uint64_t* d_aggregate_records = gpuBufferManager->customCudaMalloc<uint64_t>(N, 0, 0);
+        uint64_t* d_aggregate_idxs = gpuBufferManager->customCudaMalloc<uint64_t>(N, 0, 0);
         total_aggregation_bytes += num_aggregate_values * sizeof(V) + N * sizeof(uint64_t);
         uint8_t** d_aggregate_keys = reinterpret_cast<uint8_t**>(gpuBufferManager->customCudaMalloc<uint64_t*>(num_aggregates, 0, 0));
         cudaMemcpy(d_aggregate_keys, aggregate_keys, num_aggregates * sizeof(uint8_t*), cudaMemcpyHostToDevice);
 
         int *d_agg_mode = gpuBufferManager->customCudaMalloc<int>(num_aggregates, 0, 0);
         cudaMemcpy(d_agg_mode, agg_mode, num_aggregates * sizeof(int), cudaMemcpyHostToDevice);
-        fill_aggregate_buffer<V><<<num_blocks, BLOCK_THREADS>>>(d_aggregate_keys, d_aggregate_buffer, d_aggregate_records, d_row_records,
+        fill_aggregate_buffer<V><<<num_blocks, BLOCK_THREADS>>>(d_aggregate_keys, d_aggregate_buffer, d_aggregate_idxs, d_row_records,
                                                                 d_agg_mode, N, num_aggregates);
         total_aggregation_bytes += num_aggregates * sizeof(int);
 
         // Create the additional fields we need to perform the group by
         sort_keys_type_string_v3* d_result_row_records = reinterpret_cast<sort_keys_type_string_v3 *>(gpuBufferManager->customCudaMalloc<pointer_and_two_values>(N, 0, 0));
-        uint64_t* d_group_row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(N + 1, 0, 0);
+        uint64_t* d_result_aggregate_idxs = gpuBufferManager->customCudaMalloc<uint64_t>(N + 1, 0, 0);
         uint64_t* d_num_runs_out = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
         cudaMemset(d_num_runs_out, 0, sizeof(uint64_t));
         CustomMinOperator reduction_operation;
@@ -416,8 +435,8 @@ namespace duckdb
             group_by_temp_storage_bytes,
             d_row_records,
             d_result_row_records,
-            d_aggregate_records,
-            d_group_row_ids,
+            d_aggregate_idxs,
+            d_result_aggregate_idxs,
             d_num_runs_out,
             reduction_operation,
             N);
@@ -431,21 +450,23 @@ namespace duckdb
             group_by_temp_storage_bytes,
             d_row_records,
             d_result_row_records,
-            d_aggregate_records,
-            d_group_row_ids,
+            d_aggregate_idxs,
+            d_result_aggregate_idxs,
             d_num_runs_out,
             reduction_operation,
             N);
+
         cudaDeviceSynchronize();
         CHECK_ERROR();
 
         // Get the number of groups
         cudaMemcpy(count, d_num_runs_out, sizeof(uint64_t), cudaMemcpyDeviceToHost);
         uint64_t num_groups = count[0];
-        cudaMemcpy(d_group_row_ids + num_groups, &N, sizeof(uint64_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_result_aggregate_idxs + num_groups, &N, sizeof(uint64_t), cudaMemcpyHostToDevice);
 
-        // The top of the previous ReduceByKey is a buffer like 0 100 300 325 450 representing the group boundaries
-        // Now we can run DeviceSegmentedReduce for each aggregate column without having to redo the string comparsion
+        // The resulting values of the previous ReduceByKey is a buffer like 0 100 300 325 450 representing the starting index for each group
+        // Now we can run DeviceSegmentedReduce for each aggregate column without having to redo the string comparsion. The DeviceSegmentReduce
+        // will write the result to the aggregate column directly and thus we don't need to any sort of materialization later
         for(int i = 0; i < num_aggregates; i++) {
             V* buffer_aggregate_col_values = d_aggregate_buffer + i * N;
             V* aggreate_col_keys = reinterpret_cast<V*>(aggregate_keys[i]);
@@ -464,8 +485,8 @@ namespace duckdb
                     buffer_aggregate_col_values,
                     aggreate_col_keys,
                     num_groups,
-                    d_group_row_ids,
-                    d_group_row_ids + 1,
+                    d_result_aggregate_idxs,
+                    d_result_aggregate_idxs + 1,
                     aggregate_max_operator,
                     aggregate_max_initial_value
                 );
@@ -480,8 +501,8 @@ namespace duckdb
                     buffer_aggregate_col_values,
                     aggreate_col_keys,
                     num_groups,
-                    d_group_row_ids,
-                    d_group_row_ids + 1,
+                    d_result_aggregate_idxs,
+                    d_result_aggregate_idxs + 1,
                     aggregate_max_operator,
                     aggregate_max_initial_value
                 );
@@ -498,8 +519,8 @@ namespace duckdb
                     buffer_aggregate_col_values,
                     aggreate_col_keys,
                     num_groups,
-                    d_group_row_ids,
-                    d_group_row_ids + 1,
+                    d_result_aggregate_idxs,
+                    d_result_aggregate_idxs + 1,
                     aggregate_min_operator,
                     aggregate_min_initial_value
                 );
@@ -514,8 +535,8 @@ namespace duckdb
                     buffer_aggregate_col_values,
                     aggreate_col_keys,
                     num_groups,
-                    d_group_row_ids,
-                    d_group_row_ids + 1,
+                    d_result_aggregate_idxs,
+                    d_result_aggregate_idxs + 1,
                     aggregate_min_operator,
                     aggregate_min_initial_value
                 );
@@ -531,8 +552,8 @@ namespace duckdb
                     buffer_aggregate_col_values,
                     aggreate_col_keys,
                     num_groups,
-                    d_group_row_ids,
-                    d_group_row_ids + 1,
+                    d_result_aggregate_idxs,
+                    d_result_aggregate_idxs + 1,
                     aggregate_sum_operator,
                     aggregate_sum_initial_value
                 );
@@ -547,8 +568,8 @@ namespace duckdb
                     buffer_aggregate_col_values,
                     aggreate_col_keys,
                     num_groups,
-                    d_group_row_ids,
-                    d_group_row_ids + 1,
+                    d_result_aggregate_idxs,
+                    d_result_aggregate_idxs + 1,
                     aggregate_sum_operator,
                     aggregate_sum_initial_value
                 );
@@ -556,10 +577,13 @@ namespace duckdb
                 if(agg_mode[i] == 1) {
                     // Since this is an average reduction then divide the result by the number of records in the group
                     uint64_t num_group_blocks = (num_groups + BLOCK_THREADS - 1)/BLOCK_THREADS;
-                    perform_average_reduction<<<num_group_blocks , BLOCK_THREADS>>>(aggreate_col_keys, d_group_row_ids, num_groups);
+                    perform_average_reduction<<<num_group_blocks , BLOCK_THREADS>>>(aggreate_col_keys, d_result_aggregate_idxs, num_groups);
                 }
             }
         }
+        
+        cudaDeviceSynchronize();
+        CHECK_ERROR();
 
         auto group_by_end_time = high_resolution_clock::now();
         auto group_by_time_ms = std::chrono::duration_cast<duration<double, std::milli>>(group_by_end_time - group_by_start_time).count();
@@ -567,8 +591,13 @@ namespace duckdb
         std::cout << "STRING GROUP BY V3: Group By required " << total_aggregation_bytes << " bytes and took " << group_by_time_ms << " ms" << std::endl;
 
         auto post_processing_start_time = high_resolution_clock::now();
+
+        // We need to get the row ids of the records in the original column as the sort and reduce shuffled around the rows in the column
+        uint64_t* d_original_row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(num_groups, 0, 0);
+        uint64_t populate_num_blocks = (num_groups + BLOCK_THREADS - 1)/BLOCK_THREADS;
+        populate_original_row_ids<<<populate_num_blocks, BLOCK_THREADS>>>(d_result_row_records, d_original_row_ids, num_groups);
         
-        // Materialize the string columns based on the row ids
+        // Materialize the string columns based on the original row ids
         for(uint64_t i = 0; i < num_keys; i++) {
             // Get the original column
             uint8_t* group_key_chars = keys[i];
@@ -576,15 +605,13 @@ namespace duckdb
             
             // Materailize the string column
             uint8_t* result; uint64_t* result_offset; uint64_t* new_num_bytes;
-            materializeString(group_key_chars, group_key_offsets, result, result_offset, d_group_row_ids, new_num_bytes, num_groups);
+            materializeString(group_key_chars, group_key_offsets, result, result_offset, d_original_row_ids, new_num_bytes, num_groups);
 
             // Write back the result
             keys[i] = result;
             offset[i] = result_offset;
             num_bytes[i] = new_num_bytes[0];
         }
-
-        // Also materialize the aggregate columns
         
         auto post_processing_end_time = high_resolution_clock::now();
         auto post_processing_time_ms = std::chrono::duration_cast<duration<double, std::milli>>(post_processing_end_time - post_processing_start_time).count();

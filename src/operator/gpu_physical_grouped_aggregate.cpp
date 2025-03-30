@@ -133,7 +133,6 @@ ResolveTypeGroupByString(GPUColumn** &group_by_keys, GPUColumn** &aggregate_keys
 	size_t size = group_by_keys[0]->column_length;
 
 	int* agg_mode = new int[aggregates.size()];
-
 	for (int agg_idx = 0; agg_idx < aggregates.size(); agg_idx++) {
 		auto& expr = aggregates[agg_idx]->Cast<BoundAggregateExpression>();
 		if (expr.function.name.compare("count") == 0 && aggregate_keys[agg_idx]->data_wrapper.data == nullptr) {
@@ -171,10 +170,8 @@ ResolveTypeGroupByString(GPUColumn** &group_by_keys, GPUColumn** &aggregate_keys
 		printf("Aggregate function name %s got agg_mode of %d\n", expr.function.name.c_str(), agg_mode[agg_idx]);
 	}
 
-	// groupedStringAggregate<V>(group_by_data, aggregate_data, offset_data, num_bytes, count, size, num_group_keys, aggregates.size(), agg_mode);
-	// groupedStringAggregateV2<V>(group_by_data, aggregate_data, offset_data, num_bytes, count, size, num_group_keys, aggregates.size(), agg_mode);
-	groupedStringAggregateV3<V>(group_by_data, aggregate_data, offset_data, num_bytes, count, size, num_group_keys, aggregates.size(), agg_mode);
-	// groupedStringAggregateV4<V>(group_by_data, aggregate_data, offset_data, num_bytes, count, size, num_group_keys, aggregates.size(), agg_mode);
+	uint64_t num_rows = static_cast<uint64_t>(size);
+	groupedStringAggregateV3<V>(group_by_data, aggregate_data, offset_data, num_bytes, count, num_rows, num_group_keys, aggregates.size(), agg_mode);
 
 	// Reading groupby columns based on the grouping set
 	for (idx_t group = 0; group < num_group_keys; group++) {
@@ -219,7 +216,6 @@ HandleGroupByAggregateExpression(GPUColumn** &group_by_keys, GPUColumn** &aggreg
 	}
 
 	if (string_groupby) {
-		//THIS IS NOT WORKING YES
 		if (aggregate_type == ColumnType::INT64) {
 			printf("Group by string and aggregate int\n");
 			ResolveTypeGroupByString<uint64_t>(group_by_keys, aggregate_keys, gpuBufferManager, aggregates, num_group_keys);
