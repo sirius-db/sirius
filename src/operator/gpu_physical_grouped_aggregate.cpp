@@ -182,9 +182,16 @@ ResolveTypeGroupByString(GPUColumn** &group_by_keys, GPUColumn** &aggregate_keys
 		} else {
 			throw NotImplementedException("Aggregate function not supported");
 		}
+
+		// Create a buffer for this column if its not already specified
+		if(aggregate_data[agg_idx] == nullptr) {
+			aggregate_data[agg_idx] = reinterpret_cast<uint8_t*>(gpuBufferManager->customCudaMalloc<V>(size, 0, 0));
+		}
+		printf("Aggregate function name %s got agg_mode of %d\n", expr.function.name.c_str(), agg_mode[agg_idx]);
 	}
 
-	groupedStringAggregate<V>(group_by_data, aggregate_data, offset_data, num_bytes, count, size, num_group_keys, aggregates.size(), agg_mode);
+	uint64_t num_rows = static_cast<uint64_t>(size);
+	groupedStringAggregate<V>(group_by_data, aggregate_data, offset_data, num_bytes, count, num_rows, num_group_keys, aggregates.size(), agg_mode);
 
 	// Reading groupby columns based on the grouping set
 	for (idx_t group = 0; group < num_group_keys; group++) {

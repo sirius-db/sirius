@@ -32,6 +32,15 @@ GPUBufferManager::customCudaMalloc<bool>(size_t size, int gpu, bool caching);
 template pointer_and_key*
 GPUBufferManager::customCudaMalloc<pointer_and_key>(size_t size, int gpu, bool caching);
 
+template string_group_by_metadata_type*
+GPUBufferManager::customCudaMalloc<string_group_by_metadata_type>(size_t size, int gpu, bool caching);
+
+template void**
+GPUBufferManager::customCudaMalloc<void*>(size_t size, int gpu, bool caching);
+
+template string_group_by_record_type*
+GPUBufferManager::customCudaMalloc<string_group_by_record_type>(size_t size, int gpu, bool caching);
+
 template int*
 GPUBufferManager::customCudaHostAlloc<int>(size_t size);
 
