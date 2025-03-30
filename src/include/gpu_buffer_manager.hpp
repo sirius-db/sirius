@@ -26,6 +26,18 @@ struct pointer_and_key {
 	uint64_t num_key;
 };
 
+struct string_group_by_metadata_type {
+    void* all_keys;
+    void* offsets;
+    uint64_t num_keys;
+};
+
+struct string_group_by_record_type {
+	string_group_by_metadata_type* group_by_metadata;
+	uint64_t row_id;
+	uint64_t row_signature;
+};
+
 // Currently a singleton class, would not work for multiple GPUs
 class GPUBufferManager {
 public:
