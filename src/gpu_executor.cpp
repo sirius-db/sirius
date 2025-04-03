@@ -6,6 +6,7 @@
 #include "operator/gpu_physical_hash_join.hpp"
 #include "duckdb/parallel/thread_context.hpp"
 #include "duckdb/execution/execution_context.hpp"
+#include "operator/gpu_physical_table_scan.hpp"
 #include <iostream>
 #include <stdio.h>
 
@@ -98,6 +99,14 @@ void GPUExecutor::Execute() {
 		// pipeline->source->GetData(exec_context, source_relation, source_input);
 		auto source_type = pipeline->source.get()->type;
 		std::cout << "pipeline source type " << PhysicalOperatorToString(source_type) << std::endl;
+		if (source_type == PhysicalOperatorType::TABLE_SCAN) {
+			// initialize pipeline
+			Pipeline duckdb_pipeline(*executor);
+			ThreadContext thread_context(context);
+			ExecutionContext exec_context(context, thread_context, &duckdb_pipeline);
+			auto &table_scan = pipeline->source->Cast<GPUPhysicalTableScan>();
+			table_scan.GetDataDuckDB(exec_context);
+		}
 		pipeline->source->GetData(*source_relation);
 		// printf("source relation size %d\n", source_relation->columns.size());
 		// for (auto col : source_relation->columns) {

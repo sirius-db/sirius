@@ -9,7 +9,7 @@
 #include "gpu_meta_pipeline.hpp"
 #include "operator/gpu_physical_result_collector.hpp"
 #include "gpu_buffer_manager.hpp"
-
+#include "duckdb/execution/executor.hpp"
 namespace duckdb {
 
 class ClientContext;
@@ -23,6 +23,7 @@ public:
 	explicit GPUExecutor(ClientContext &context, GPUContext &gpu_context)
 	    : context(context), gpu_context(gpu_context) {
 		gpuBufferManager = &(GPUBufferManager::GetInstance());
+		executor = new Executor(context);
 	};
 	// ~GPUExecutor();
 
@@ -57,6 +58,8 @@ public:
 	void Execute();
 	void Reset();
 	shared_ptr<GPUPipeline> CreateChildPipeline(GPUPipeline &current, GPUPhysicalOperator &op);
+
+	Executor* executor;
 
 	//! Convert the DuckDB physical plan to a GPU physical plan
 

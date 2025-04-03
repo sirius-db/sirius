@@ -69,7 +69,7 @@ public:
 	void createTableAndColumnInGPU(Catalog& catalog, ClientContext& context, string table_name, string column_name);
 	void createTable(string table_name, size_t column_count);
 	void createColumn(string table_name, string column_name, ColumnType column_type, size_t column_id, vector<size_t> unique_columns);
-
+	bool checkIfColumnCached(string table_name, string column_name);
 private:
     // Private constructor
    	GPUBufferManager(size_t cache_size_per_gpu, size_t processing_size_per_gpu, size_t processing_size_per_cpu);

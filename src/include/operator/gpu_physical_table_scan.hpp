@@ -6,6 +6,7 @@
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/common/extra_operator_info.hpp"
 #include "gpu_expression_executor.hpp"
+#include "duckdb/execution/operator/scan/physical_table_scan.hpp"
 
 namespace duckdb {
 
@@ -65,6 +66,19 @@ public:
 	//! Virtual columns
 	virtual_column_map_t virtual_columns;
 
+	PhysicalTableScan* physical_table_scan;
+
+	unique_ptr<ColumnDataCollection> collection;
+
+	uint64_t* column_size;
+
+	bool* already_cached;
+
+	vector<LogicalType> scanned_types;
+
+	vector<idx_t> scanned_ids;
+
+	unique_ptr<TableFilterSet> fake_table_filters;
 public:
 	// string GetName() const override;
 	// string ParamsToString() const override;
@@ -74,6 +88,10 @@ public:
 public:
 	SourceResultType GetData(GPUIntermediateRelation& output_relation) const override;
 
+	void ScanDataDuckDB(GPUBufferManager* gpuBufferManager, string up_table_name, string up_column_name) const;
+
+	SourceResultType GetDataDuckDB(ExecutionContext &exec_context);
+
 	bool IsSource() const override {
 		return true;
 	}
@@ -81,10 +99,10 @@ public:
 		return true;
 	}
 
-	// unique_ptr<LocalSourceState> GetLocalSourceState(ExecutionContext &context,
-	// 	GlobalSourceState &gstate) const override;
-	// unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;
-	// // SourceResultType GetData(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &input) const override;
+	unique_ptr<LocalSourceState> GetLocalSourceState(ExecutionContext &context,
+		GlobalSourceState &gstate) const override;
+	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;
+	// SourceResultType GetData(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &input) const override;
 	// OperatorPartitionData GetPartitionData(ExecutionContext &context, DataChunk &chunk, GlobalSourceState &gstate,
 	// LocalSourceState &lstate,
 	// const OperatorPartitionInfo &partition_info) const override;
