@@ -95,17 +95,14 @@ SiriusExtension::GPUCachingBind(ClientContext &context, TableFunctionBindInput &
 		throw BinderException("gpu_caching cannot be called with a NULL parameter");
 	}
 
-	size_t cache_size_per_gpu = 20UL * 1024 * 1024 * 1024; // 10GB
-	size_t processing_size_per_gpu = 18UL * 1024 * 1024 * 1024; //11GB
-	size_t processing_size_per_cpu = 32UL * 1024 * 1024 * 1024; //16GB
+	// size_t cache_size_per_gpu = 2UL * 1024 * 1024 * 1024; // 10GB
+	// size_t processing_size_per_gpu = 2UL * 1024 * 1024 * 1024; //11GB
+	// size_t processing_size_per_cpu = 4UL * 1024 * 1024 * 1024; //16GB
 	// size_t cache_size_per_gpu = 120UL * 1024 * 1024 * 1024;
 	// size_t processing_size_per_gpu = 80UL * 1024 * 1024 * 1024;
 	// size_t processing_size_per_cpu = 120UL * 1024 * 1024 * 1024;
-	result->gpuBufferManager = &(GPUBufferManager::GetInstance(cache_size_per_gpu, processing_size_per_gpu, processing_size_per_cpu));
-	// result->gpuBufferManager->Print();
-	//check if the table exists in the gpu_buffer
-	//check if the column exists in the gpu buffer
-	//if it does, allocate region in the gpu caching buffer
+	// result->gpuBufferManager = &(GPUBufferManager::GetInstance(cache_size_per_gpu, processing_size_per_gpu, processing_size_per_cpu));
+	result->gpuBufferManager = &(GPUBufferManager::GetInstance());
 
 	string input_string = input.inputs[0].ToString();
     size_t pos = input_string.find('.');  // Find the position of the period
@@ -365,6 +362,11 @@ void SiriusExtension::InitializeGPUExtension(Connection &con) {
 	// gpu_processing.named_parameters["enable_optimizer"] = LogicalType::BOOLEAN;
 	CreateTableFunctionInfo gpu_processing_substrait_info(gpu_processing_substrait);
 	catalog.CreateTableFunction(*con.context, gpu_processing_substrait_info);
+
+	size_t cache_size_per_gpu = 2UL * 1024 * 1024 * 1024; // 10GB
+	size_t processing_size_per_gpu = 2UL * 1024 * 1024 * 1024; //11GB
+	size_t processing_size_per_cpu = 4UL * 1024 * 1024 * 1024; //16GB
+	GPUBufferManager *gpuBufferManager = &(GPUBufferManager::GetInstance(cache_size_per_gpu, processing_size_per_gpu, processing_size_per_cpu));	
 }
 
 void SiriusExtension::Load(DuckDB &db) {

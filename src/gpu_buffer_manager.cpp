@@ -475,7 +475,7 @@ GPUBufferManager::createTableAndColumnInGPU(Catalog& catalog, ClientContext& con
         string up_table_name = table_name;
         transform(up_table_name.begin(), up_table_name.end(), up_table_name.begin(), ::toupper);
         createTable(up_table_name, table.GetTypes().size());
-        ColumnType column_type = convertLogicalTypetoColumnType(table.GetColumn(up_column_name).GetType());
+        ColumnType column_type = convertLogicalTypeToColumnType(table.GetColumn(up_column_name).GetType());
         createColumn(up_table_name, up_column_name, column_type, column_id, unique_columns);
     } else {
         throw InvalidInputException("Column does not exists");
@@ -492,6 +492,23 @@ GPUBufferManager::createTable(string up_table_name, size_t column_count) {
         table->names = up_table_name;
         tables[up_table_name] = table;
     }
+}
+
+bool
+GPUBufferManager::checkIfColumnCached(string table_name, string column_name) {
+    string up_column_name = column_name;
+    string up_table_name = table_name;
+    transform(up_table_name.begin(), up_table_name.end(), up_table_name.begin(), ::toupper);
+    transform(up_column_name.begin(), up_column_name.end(), up_column_name.begin(), ::toupper);
+    auto table_it = tables.find(up_table_name);
+    if (table_it == tables.end()) {
+        return false;
+    }
+    auto column_it = find(tables[table_name]->column_names.begin(), tables[table_name]->column_names.end(), up_column_name);
+    if (column_it == tables[up_table_name]->column_names.end()) {
+        return false;
+    }
+    return true;
 }
 
 void
