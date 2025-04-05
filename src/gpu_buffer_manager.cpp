@@ -251,6 +251,8 @@ GPUBufferManager::allocateChunk(DataChunk &input){
             break;
         }
         case LogicalTypeId::VARCHAR: {
+            throw InvalidInputException("String type not supported");
+            //FIX TODO: Need to handle the case where the string is larger than 128 characters
             char* ptr_varchar = customCudaHostAlloc<char>(chunk_size * 128);
             ptr = reinterpret_cast<uint8_t*>(ptr_varchar);
             memcpy(ptr, input.data[0].GetData(), input.size() * sizeof(double));

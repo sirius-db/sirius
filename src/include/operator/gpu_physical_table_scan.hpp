@@ -88,7 +88,7 @@ public:
 public:
 	SourceResultType GetData(GPUIntermediateRelation& output_relation) const override;
 
-	void ScanDataDuckDB(GPUBufferManager* gpuBufferManager, string up_table_name, string up_column_name) const;
+	void ScanDataDuckDB(GPUBufferManager* gpuBufferManager, string up_table_name) const;
 
 	SourceResultType GetDataDuckDB(ExecutionContext &exec_context);
 
