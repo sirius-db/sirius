@@ -228,6 +228,14 @@ __global__ void table_scan_expression(uint8_t **col, uint64_t** offset, uint8_t 
     }
 }
 
+__global__ void print_columns(uint8_t **col, uint64_t** offset, uint64_t N) {
+    if (threadIdx.x == 0) {
+        for (int i = 0; i < 100; i++) {
+            printf("%ld\n", (reinterpret_cast<uint64_t*>(col[0]))[i]);
+        }
+    }
+}
+
 void 
 tableScanExpression(uint8_t **col, uint64_t** offset, uint8_t *constant_compare, uint64_t *constant_offset, 
         ScanDataType* data_type, uint64_t *&row_ids, uint64_t* &count, uint64_t N, CompareType* compare_mode, int num_expr) {
@@ -244,7 +252,6 @@ tableScanExpression(uint8_t **col, uint64_t** offset, uint8_t *constant_compare,
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 
     uint64_t constant_size = constant_offset[num_expr];
-    printf("%d\n", constant_size);
     uint8_t* d_constant_compare = gpuBufferManager->customCudaMalloc<uint8_t>(constant_size, 0, 0);
     uint64_t* d_constant_offset = gpuBufferManager->customCudaMalloc<uint64_t>(num_expr + 1, 0, 0);
     cudaMemcpy(d_constant_compare, constant_compare, constant_size * sizeof(uint8_t), cudaMemcpyHostToDevice);
@@ -264,12 +271,14 @@ tableScanExpression(uint8_t **col, uint64_t** offset, uint8_t *constant_compare,
     cudaMemcpy(d_col, col, num_expr * sizeof(uint8_t*), cudaMemcpyHostToDevice);
     cudaMemcpy(d_offset, offset, num_expr * sizeof(uint64_t*), cudaMemcpyHostToDevice);
 
+    // print_columns<<<1, 1>>>(d_col, d_offset, N);
+    // cudaDeviceSynchronize();
+
     cudaMemset(count, 0, sizeof(uint64_t));
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
     table_scan_expression<BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(
             d_col, d_offset, d_constant_compare, d_constant_offset, d_data_type, row_ids, (unsigned long long*) count, N, d_compare_mode, 1, num_expr);
     CHECK_ERROR();
-    printf("Launching Arbitrary Table Scan Kernel\n");
     
     uint64_t* h_count = new uint64_t[1];
     cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
