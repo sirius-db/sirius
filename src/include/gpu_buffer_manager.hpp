@@ -39,7 +39,7 @@ public:
     GPUBufferManager& operator=(const GPUBufferManager&) = delete;
 
     void ResetBuffer();
-
+    void ResetCache();
 	uint8_t** gpuCache; //each gpu has one
 	uint8_t** gpuProcessing, *cpuProcessing;
 	size_t* gpuProcessingPointer, *gpuCachingPointer; //each gpu has one

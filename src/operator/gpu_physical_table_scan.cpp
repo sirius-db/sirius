@@ -469,21 +469,36 @@ GPUPhysicalTableScan::GetDataDuckDB(ExecutionContext &exec_context) {
         has_more_output = chunk->size() > 0;
         // get the size of each column in the chunk
         for (int col = 0; col < column_ids.size(); col++) {
-          if (chunk->data[col].GetType() == LogicalType::VARCHAR) {
-            Vector string_vector = chunk->data[col];
-            string_vector.Flatten(chunk->size());
-            for (int row = 0; row < chunk->size(); row++) {
-              std::string curr_string = string_vector.GetValue(row).ToString();
-              column_size[col] += curr_string.length();
+          if (!already_cached[col]) {
+            if (chunk->data[col].GetType() == LogicalType::VARCHAR) {
+              Vector string_vector = chunk->data[col];
+              string_vector.Flatten(chunk->size());
+              for (int row = 0; row < chunk->size(); row++) {
+                std::string curr_string = string_vector.GetValue(row).ToString();
+                column_size[col] += curr_string.length();
+              }
+            } else {
+              column_size[col] += chunk->data[col].GetAllocationSize(chunk->size());
             }
-          } else {
-            column_size[col] += chunk->data[col].GetAllocationSize(chunk->size());
           }
         }
         collection->Append(*chunk);
       } while (has_more_output);
 
       printf("Collection size %d\n", collection->Count());
+
+      uint64_t total_size = 0;
+      for (int col = 0; col < column_ids.size(); col++) {
+        if (!already_cached[col]) {
+          total_size += column_size[col];
+        }
+      }
+      if (gpuBufferManager->gpuCachingPointer[0] + total_size > gpuBufferManager->cache_size_per_gpu) {
+        if (total_size > gpuBufferManager->cache_size_per_gpu) {
+          throw InvalidInputException("Total size of columns to be cached is greater than the cache size");
+        }
+        gpuBufferManager->ResetCache();
+      }
 
       ScanDataDuckDB(gpuBufferManager, table_name);
       return SourceResultType::FINISHED;
@@ -504,14 +519,16 @@ GPUPhysicalTableScan::ScanDataDuckDB(GPUBufferManager* gpuBufferManager, string 
       uint64_t** d_offset_ptr = new uint64_t*[scanned_types.size()];
 
       for (int col = 0; col < scanned_types.size(); col++) {
-        ptr[col] = gpuBufferManager->customCudaHostAlloc<uint8_t>(column_size[col]);
-        d_ptr[col] = gpuBufferManager->customCudaMalloc<uint8_t>(column_size[col], 0, 1);
-        if (scanned_types[col] == LogicalType::VARCHAR) {
-          offset_ptr[col] = gpuBufferManager->customCudaHostAlloc<uint64_t>(collection->Count() + 1);
-          d_offset_ptr[col] = gpuBufferManager->customCudaMalloc<uint64_t>(collection->Count() + 1, 0, 1);
-          offset_ptr[col][0] = 0;
+        if (!already_cached[col]) {
+          ptr[col] = gpuBufferManager->customCudaHostAlloc<uint8_t>(column_size[col]);
+          d_ptr[col] = gpuBufferManager->customCudaMalloc<uint8_t>(column_size[col], 0, 1);
+          if (scanned_types[col] == LogicalType::VARCHAR) {
+            offset_ptr[col] = gpuBufferManager->customCudaHostAlloc<uint64_t>(collection->Count() + 1);
+            d_offset_ptr[col] = gpuBufferManager->customCudaMalloc<uint64_t>(collection->Count() + 1, 0, 1);
+            offset_ptr[col][0] = 0;
+          }
+          tmp_ptr[col] = ptr[col];
         }
-        tmp_ptr[col] = ptr[col];
       } 
       bool scan_initialized = false;
       ColumnDataScanState scan_state;
@@ -526,18 +543,20 @@ GPUPhysicalTableScan::ScanDataDuckDB(GPUBufferManager* gpuBufferManager, string 
         }
         collection->Scan(scan_state, *result);
         for (int col = 0; col < result->ColumnCount(); col++) {
-          if (result->data[col].GetType() == LogicalType::VARCHAR) {
-            Vector string_vector = result->data[col];
-            string_vector.Flatten(result->size());
-            for (int row = 0; row < result->size(); row++) {
-              std::string curr_string = string_vector.GetValue(row).ToString();
-              memcpy(tmp_ptr[col], curr_string.data(), curr_string.length());
-              offset_ptr[col][start_idx + row + 1] = offset_ptr[col][start_idx + row] + curr_string.length();
-              tmp_ptr[col] += curr_string.length();
+          if (!already_cached[col]) {
+            if (result->data[col].GetType() == LogicalType::VARCHAR) {
+              Vector string_vector = result->data[col];
+              string_vector.Flatten(result->size());
+              for (int row = 0; row < result->size(); row++) {
+                std::string curr_string = string_vector.GetValue(row).ToString();
+                memcpy(tmp_ptr[col], curr_string.data(), curr_string.length());
+                offset_ptr[col][start_idx + row + 1] = offset_ptr[col][start_idx + row] + curr_string.length();
+                tmp_ptr[col] += curr_string.length();
+              }
+            } else {
+              memcpy(tmp_ptr[col], result->data[col].GetData(), result->data[col].GetAllocationSize(result->size()));
+              tmp_ptr[col] += result->data[col].GetAllocationSize(result->size());
             }
-          } else {
-            memcpy(tmp_ptr[col], result->data[col].GetData(), result->data[col].GetAllocationSize(result->size()));
-            tmp_ptr[col] += result->data[col].GetAllocationSize(result->size());
           }
         }
         start_idx += result->size();
@@ -546,36 +565,40 @@ GPUPhysicalTableScan::ScanDataDuckDB(GPUBufferManager* gpuBufferManager, string 
 
 
       for (int col = 0; col < column_ids.size(); col++) {
-        if (scanned_types[col] == LogicalType::VARCHAR) {
-          if (column_size[col] != offset_ptr[col][collection->Count()]) {
-            throw InvalidInputException("Column size mismatch");
-          }
-          callCudaMemcpyHostToDevice<uint8_t>(d_ptr[col], ptr[col], column_size[col], 0);
-          callCudaMemcpyHostToDevice<uint64_t>(d_offset_ptr[col], offset_ptr[col], collection->Count() + 1, 0);
-        } else {
-          callCudaMemcpyHostToDevice<uint8_t>(d_ptr[col], ptr[col], column_size[col], 0);
+        if (!already_cached[col]) {
+            if (scanned_types[col] == LogicalType::VARCHAR) {
+              if (column_size[col] != offset_ptr[col][collection->Count()]) {
+                throw InvalidInputException("Column size mismatch");
+            }
+            callCudaMemcpyHostToDevice<uint8_t>(d_ptr[col], ptr[col], column_size[col], 0);
+            callCudaMemcpyHostToDevice<uint64_t>(d_offset_ptr[col], offset_ptr[col], collection->Count() + 1, 0);
+            } else {
+              callCudaMemcpyHostToDevice<uint8_t>(d_ptr[col], ptr[col], column_size[col], 0);
+            }
         }
       }
 
       for (int col = 0; col < column_ids.size(); col++) {
-        auto up_column_name = names[column_ids[col].GetPrimaryIndex()];
-        auto up_table_name = table_name;
-        transform(up_table_name.begin(), up_table_name.end(), up_table_name.begin(), ::toupper);
-        transform(up_column_name.begin(), up_column_name.end(), up_column_name.begin(), ::toupper);
-        auto column_it = find(gpuBufferManager->tables[up_table_name]->column_names.begin(), gpuBufferManager->tables[up_table_name]->column_names.end(), up_column_name);
-        if (column_it == gpuBufferManager->tables[up_table_name]->column_names.end()) {
-            throw InvalidInputException("Column not found");
+        if (!already_cached[col]) {
+            auto up_column_name = names[column_ids[col].GetPrimaryIndex()];
+            auto up_table_name = table_name;
+            transform(up_table_name.begin(), up_table_name.end(), up_table_name.begin(), ::toupper);
+            transform(up_column_name.begin(), up_column_name.end(), up_column_name.begin(), ::toupper);
+            auto column_it = find(gpuBufferManager->tables[up_table_name]->column_names.begin(), gpuBufferManager->tables[up_table_name]->column_names.end(), up_column_name);
+            if (column_it == gpuBufferManager->tables[up_table_name]->column_names.end()) {
+                throw InvalidInputException("Column not found");
+            }
+            int column_idx = column_it - gpuBufferManager->tables[up_table_name]->column_names.begin();
+            ColumnType column_type = convertLogicalTypeToColumnType(scanned_types[col]);
+            gpuBufferManager->tables[up_table_name]->columns[column_idx]->column_length = collection->Count();
+            gpuBufferManager->tables[up_table_name]->length = collection->Count();
+            if (scanned_types[col] == LogicalType::VARCHAR) {
+              gpuBufferManager->tables[up_table_name]->columns[column_idx]->data_wrapper = DataWrapper(column_type, d_ptr[col], d_offset_ptr[col], collection->Count(), column_size[col], true);
+            } else {
+              gpuBufferManager->tables[up_table_name]->columns[column_idx]->data_wrapper = DataWrapper(column_type, d_ptr[col], collection->Count());
+            }
+            printf("Column %s cached in GPU at index %d\n", up_column_name.c_str(), column_idx);
         }
-        int column_idx = column_it - gpuBufferManager->tables[up_table_name]->column_names.begin();
-        ColumnType column_type = convertLogicalTypeToColumnType(scanned_types[col]);
-        gpuBufferManager->tables[up_table_name]->columns[column_idx]->column_length = collection->Count();
-        gpuBufferManager->tables[up_table_name]->length = collection->Count();
-        if (scanned_types[col] == LogicalType::VARCHAR) {
-          gpuBufferManager->tables[up_table_name]->columns[column_idx]->data_wrapper = DataWrapper(column_type, d_ptr[col], d_offset_ptr[col], collection->Count(), column_size[col], true);
-        } else {
-          gpuBufferManager->tables[up_table_name]->columns[column_idx]->data_wrapper = DataWrapper(column_type, d_ptr[col], collection->Count());
-        }
-        printf("Column %s cached in GPU at index %d\n", up_column_name.c_str(), column_idx);
       }
     } else {
       throw NotImplementedException("Table in-out function not supported");
