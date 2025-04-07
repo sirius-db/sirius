@@ -27,6 +27,9 @@ ColumnType convertLogicalTypetoColumnType(LogicalType type) {
             column_type = ColumnType::INT32;
             break;
     }
+
+    printf("Column Type (gpu_columns): %d\n", column_type);
+    printf("Type ID (gpu_columns): %d\n", type.id());
     return column_type;
 }
 
