@@ -99,6 +99,7 @@ void GPUBufferManager::ResetBuffer() {
 }
 
 void GPUBufferManager::ResetCache() {
+    printf("Resetting cache\n");
     for (int gpu = 0; gpu < NUM_GPUS; gpu++) {
         gpuCachingPointer[gpu] = 0;
     }
@@ -108,6 +109,8 @@ void GPUBufferManager::ResetCache() {
         for (int col = 0; col < table->columns.size(); col++) {
             table->columns[col] = nullptr;
         }
+        table->column_names.clear();
+        table->column_names.resize(table->column_count);
     }
 }
 
@@ -491,6 +494,7 @@ GPUBufferManager::createTableAndColumnInGPU(Catalog& catalog, ClientContext& con
         transform(up_table_name.begin(), up_table_name.end(), up_table_name.begin(), ::toupper);
         createTable(up_table_name, table.GetTypes().size());
         ColumnType column_type = convertLogicalTypeToColumnType(table.GetColumn(up_column_name).GetType());
+        printf("Creating column %s\n", up_column_name.c_str());
         createColumn(up_table_name, up_column_name, column_type, column_id, unique_columns);
     } else {
         throw InvalidInputException("Column does not exists");
