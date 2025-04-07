@@ -32,31 +32,38 @@ void scanHashTableRight(unsigned long long* ht, uint64_t ht_len, uint64_t* &row_
 class GPUPhysicalHashJoin : public GPUPhysicalOperator {
 public:
 	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::HASH_JOIN;
-	
+
+	struct JoinProjectionColumns {
+		vector<idx_t> col_idxs;
+		vector<LogicalType> col_types;
+	};
 public:
 						   
 	GPUPhysicalHashJoin(LogicalOperator &op, unique_ptr<GPUPhysicalOperator> left, unique_ptr<GPUPhysicalOperator> right,
 	                 vector<JoinCondition> cond, JoinType join_type, const vector<idx_t> &left_projection_map,
 	                 const vector<idx_t> &right_projection_map, vector<LogicalType> delim_types,
-	                 idx_t estimated_cardinality);
+	                 idx_t estimated_cardinality, unique_ptr<JoinFilterPushdownInfo> pushdown_info);
 	GPUPhysicalHashJoin(LogicalOperator &op, unique_ptr<GPUPhysicalOperator> left, unique_ptr<GPUPhysicalOperator> right,
 	                 vector<JoinCondition> cond, JoinType join_type, idx_t estimated_cardinality);
 
 	vector<JoinCondition> conditions;
+	//! Scans where we should push generated filters into (if any)
+	unique_ptr<JoinFilterPushdownInfo> filter_pushdown;
+
+	//! Initialize HT for this operator
+	void InitializeHashTable(ClientContext &context) const;
+
 	//! The types of the join keys
 	vector<LogicalType> condition_types;
 	//! The type of the join
 	JoinType join_type;
 
-	//! The indices for getting the payload columns
-	vector<idx_t> payload_column_idxs;
-	//! The types of the payload columns
-	vector<LogicalType> payload_types;
-
-	//! Positions of the RHS columns that need to output
-	vector<idx_t> rhs_output_columns;
-	//! The types of the output
-	vector<LogicalType> rhs_output_types;
+	//! The indices/types of the payload columns
+	JoinProjectionColumns payload_columns;
+	//! The indices/types of the lhs columns that need to be output
+	JoinProjectionColumns lhs_output_columns;
+	//! The indices/types of the rhs columns that need to be output
+	JoinProjectionColumns rhs_output_columns;
 
 	//! Duplicate eliminated types; only used for delim_joins (i.e. correlated subqueries)
 	vector<LogicalType> delim_types;
@@ -72,6 +79,8 @@ public:
 	static void BuildJoinPipelines(GPUPipeline &current, GPUMetaPipeline &meta_pipeline, GPUPhysicalOperator &op, bool build_rhs = true);
 	void BuildPipelines(GPUPipeline &current, GPUMetaPipeline &meta_pipeline);
 
+	//! Join Keys statistics (optional)
+	vector<unique_ptr<BaseStatistics>> join_stats;
 protected:
 	// CachingOperator Interface
 	// OperatorResultType ExecuteInternal(ExecutionContext &context, DataChunk &input, DataChunk &chunk,

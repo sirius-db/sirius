@@ -56,7 +56,7 @@ public:
 
 GPUPhysicalDelimJoin::GPUPhysicalDelimJoin(PhysicalOperatorType type, vector<LogicalType> types,
                                      unique_ptr<GPUPhysicalOperator> original_join,
-                                     vector<const_reference<GPUPhysicalOperator>> delim_scans, idx_t estimated_cardinality)
+                                     vector<const_reference<GPUPhysicalOperator>> delim_scans, idx_t estimated_cardinality, optional_idx delim_idx)
     : GPUPhysicalOperator(type, std::move(types), estimated_cardinality), join(std::move(original_join)),
       delim_scans(std::move(delim_scans)) {
 	D_ASSERT(type == PhysicalOperatorType::LEFT_DELIM_JOIN || type == PhysicalOperatorType::RIGHT_DELIM_JOIN);
@@ -64,9 +64,9 @@ GPUPhysicalDelimJoin::GPUPhysicalDelimJoin(PhysicalOperatorType type, vector<Log
 
 GPUPhysicalRightDelimJoin::GPUPhysicalRightDelimJoin(vector<LogicalType> types, unique_ptr<GPUPhysicalOperator> original_join,
                                                vector<const_reference<GPUPhysicalOperator>> delim_scans,
-                                               idx_t estimated_cardinality)
+                                               idx_t estimated_cardinality, optional_idx delim_idx)
     : GPUPhysicalDelimJoin(PhysicalOperatorType::RIGHT_DELIM_JOIN, std::move(types), std::move(original_join),
-                        std::move(delim_scans), estimated_cardinality) {
+                        std::move(delim_scans), estimated_cardinality, delim_idx) {
 
 	D_ASSERT(join->children.size() == 2);
 	children.push_back(std::move(join->children[1]));
@@ -77,9 +77,9 @@ GPUPhysicalRightDelimJoin::GPUPhysicalRightDelimJoin(vector<LogicalType> types, 
 
 GPUPhysicalLeftDelimJoin::GPUPhysicalLeftDelimJoin(vector<LogicalType> types, unique_ptr<GPUPhysicalOperator> original_join,
                                              vector<const_reference<GPUPhysicalOperator>> delim_scans,
-                                             idx_t estimated_cardinality)
+                                             idx_t estimated_cardinality, optional_idx delim_idx)
     : GPUPhysicalDelimJoin(PhysicalOperatorType::LEFT_DELIM_JOIN, std::move(types), std::move(original_join),
-                        std::move(delim_scans), estimated_cardinality) {
+                        std::move(delim_scans), estimated_cardinality, delim_idx) {
 
 	D_ASSERT(join->children.size() == 2);
 	// now for the original join
@@ -90,6 +90,9 @@ GPUPhysicalLeftDelimJoin::GPUPhysicalLeftDelimJoin(vector<LogicalType> types, un
 	// the actual chunk collection to scan will be created in the LeftDelimJoinGlobalState
 	auto cached_chunk_scan = make_uniq<GPUPhysicalColumnDataScan>(
 	    children[0]->GetTypes(), PhysicalOperatorType::COLUMN_DATA_SCAN, estimated_cardinality, nullptr);
+	if (delim_idx.IsValid()) {
+		cached_chunk_scan->cte_index = delim_idx.GetIndex();
+	}
 	join->children[0] = std::move(cached_chunk_scan);
 }
 

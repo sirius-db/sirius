@@ -12,11 +12,13 @@ class GPUPhysicalGroupedAggregate;
 class GPUPhysicalDelimJoin : public GPUPhysicalOperator {
 public:
 	GPUPhysicalDelimJoin(PhysicalOperatorType type, vector<LogicalType> types, unique_ptr<GPUPhysicalOperator> original_join,
-	                  vector<const_reference<GPUPhysicalOperator>> delim_scans, idx_t estimated_cardinality);
+	                  vector<const_reference<GPUPhysicalOperator>> delim_scans, idx_t estimated_cardinality, optional_idx delim_idx);
 
 	unique_ptr<GPUPhysicalOperator> join;
 	unique_ptr<GPUPhysicalGroupedAggregate> distinct;
 	vector<const_reference<GPUPhysicalOperator>> delim_scans;
+
+	optional_idx delim_idx;
 
 public:
 	// vector<const_reference<GPUPhysicalOperator>> GetChildren() const override;
@@ -35,7 +37,7 @@ public:
 		return false;
 	}
 
-	// string ParamsToString() const override;
+	// InsertionOrderPreservingMap<string> ParamsToString() const override;
 };
 
 
@@ -47,7 +49,8 @@ public:
 
 public:
 	GPUPhysicalRightDelimJoin(vector<LogicalType> types, unique_ptr<GPUPhysicalOperator> original_join,
-	                       vector<const_reference<GPUPhysicalOperator>> delim_scans, idx_t estimated_cardinality);
+	                       vector<const_reference<GPUPhysicalOperator>> delim_scans, idx_t estimated_cardinality,
+						   optional_idx delim_idx);
 
 // public:
 	// unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
@@ -55,6 +58,7 @@ public:
 	// SinkResultType Sink(ExecutionContext &context, GPUIntermediateRelation &input_relation, OperatorSinkInput &input) const override;
 	SinkResultType Sink(GPUIntermediateRelation &input_relation) const override;
 	// SinkCombineResultType Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const override;
+	// void PrepareFinalize(ClientContext &context, GlobalSinkState &sink_state) const override;
 	// SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
 	//                           OperatorSinkFinalizeInput &input) const override;
 
@@ -69,7 +73,8 @@ public:
 
 public:
 	GPUPhysicalLeftDelimJoin(vector<LogicalType> types, unique_ptr<GPUPhysicalOperator> original_join,
-	                      vector<const_reference<GPUPhysicalOperator>> delim_scans, idx_t estimated_cardinality);
+	                      vector<const_reference<GPUPhysicalOperator>> delim_scans, idx_t estimated_cardinality,
+						  optional_idx delim_idx);
 
 // public:
 // 	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
@@ -77,6 +82,7 @@ public:
 	// SinkResultType Sink(ExecutionContext &context, GPUIntermediateRelation &input_relation, OperatorSinkInput &input) const override;
 	SinkResultType Sink(GPUIntermediateRelation &input_relation) const override;
 	// SinkCombineResultType Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const override;
+	// void PrepareFinalize(ClientContext &context, GlobalSinkState &sink_state) const override;
 	// SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
 	//                           OperatorSinkFinalizeInput &input) const override;
 

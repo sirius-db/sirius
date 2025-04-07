@@ -52,10 +52,10 @@ struct GPUCachingFunctionData : public TableFunctionData {
 	bool finished = false;
 };
 
-shared_ptr<Relation> GPUSubstraitPlanToDuckDBRel(Connection &conn, const string &serialized, bool json = false) {
-	SubstraitToDuckDB transformer_s2d(conn, serialized, json);
-	return transformer_s2d.TransformPlan();
-};
+// shared_ptr<Relation> GPUSubstraitPlanToDuckDBRel(Connection &conn, const string &serialized, bool json = false) {
+// 	SubstraitToDuckDB transformer_s2d(conn, serialized, json);
+// 	return transformer_s2d.TransformPlan();
+// };
 
 //This function is used to extract the query plan from the SQL query
 unique_ptr<LogicalOperator> SiriusInitPlanExtractor(ClientContext& context, GPUTableFunctionData &data, Connection &new_conn) {
@@ -95,17 +95,14 @@ SiriusExtension::GPUCachingBind(ClientContext &context, TableFunctionBindInput &
 		throw BinderException("gpu_caching cannot be called with a NULL parameter");
 	}
 
-	size_t cache_size_per_gpu = 20UL * 1024 * 1024 * 1024; // 10GB
-	size_t processing_size_per_gpu = 18UL * 1024 * 1024 * 1024; //11GB
-	size_t processing_size_per_cpu = 32UL * 1024 * 1024 * 1024; //16GB
+	// size_t cache_size_per_gpu = 2UL * 1024 * 1024 * 1024; // 10GB
+	// size_t processing_size_per_gpu = 2UL * 1024 * 1024 * 1024; //11GB
+	// size_t processing_size_per_cpu = 4UL * 1024 * 1024 * 1024; //16GB
 	// size_t cache_size_per_gpu = 120UL * 1024 * 1024 * 1024;
 	// size_t processing_size_per_gpu = 80UL * 1024 * 1024 * 1024;
 	// size_t processing_size_per_cpu = 120UL * 1024 * 1024 * 1024;
-	result->gpuBufferManager = &(GPUBufferManager::GetInstance(cache_size_per_gpu, processing_size_per_gpu, processing_size_per_cpu));
-	// result->gpuBufferManager->Print();
-	//check if the table exists in the gpu_buffer
-	//check if the column exists in the gpu buffer
-	//if it does, allocate region in the gpu caching buffer
+	// result->gpuBufferManager = &(GPUBufferManager::GetInstance(cache_size_per_gpu, processing_size_per_gpu, processing_size_per_cpu));
+	result->gpuBufferManager = &(GPUBufferManager::GetInstance());
 
 	string input_string = input.inputs[0].ToString();
     size_t pos = input_string.find('.');  // Find the position of the period
@@ -265,7 +262,9 @@ SiriusExtension::GPUProcessingSubstraitBind(ClientContext &context, TableFunctio
 		throw BinderException("gpu_processing cannot be called with a NULL parameter");
 	}
 	string serialized = input.inputs[0].GetValueUnsafe<string>();
-	result->plan = GPUSubstraitPlanToDuckDBRel(*result->conn, serialized, false);
+	// result->plan = GPUSubstraitPlanToDuckDBRel(*result->conn, serialized, false);
+	SubstraitToDuckDB transformer_s2d(result->conn->context, serialized, false);
+	result->plan = transformer_s2d.TransformPlan();
 
 	auto relation_stmt = make_uniq<RelationStatement>(result->plan);
 	unique_ptr<SQLStatement> statements = std::move(relation_stmt);
@@ -363,6 +362,11 @@ void SiriusExtension::InitializeGPUExtension(Connection &con) {
 	// gpu_processing.named_parameters["enable_optimizer"] = LogicalType::BOOLEAN;
 	CreateTableFunctionInfo gpu_processing_substrait_info(gpu_processing_substrait);
 	catalog.CreateTableFunction(*con.context, gpu_processing_substrait_info);
+
+	size_t cache_size_per_gpu = 32UL * 1024 * 1024 * 1024; // 10GB
+	size_t processing_size_per_gpu = 40UL * 1024 * 1024 * 1024; //11GB
+	size_t processing_size_per_cpu = 64UL * 1024 * 1024 * 1024; //16GB
+	GPUBufferManager *gpuBufferManager = &(GPUBufferManager::GetInstance(cache_size_per_gpu, processing_size_per_gpu, processing_size_per_cpu));	
 }
 
 void SiriusExtension::Load(DuckDB &db) {

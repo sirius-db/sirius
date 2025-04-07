@@ -7,7 +7,7 @@
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/common/reference_map.hpp"
-#include "duckdb/parallel/executor_task.hpp"
+// #include "duckdb/parallel/executor_task.hpp"
 #include "duckdb/parallel/pipeline.hpp"
 
 namespace duckdb {
@@ -25,7 +25,7 @@ public:
 	//! Duplicate eliminated join scan dependencies
 	reference_map_t<const GPUPhysicalOperator, reference<GPUPipeline>> delim_join_dependencies;
 	//! Materialized CTE scan dependencies
-	// reference_map_t<const GPUPhysicalOperator, reference<GPUPipeline>> cte_dependencies;
+	reference_map_t<const GPUPhysicalOperator, reference<GPUPipeline>> cte_dependencies;
 
 public:
 	void SetPipelineSource(GPUPipeline &pipeline, GPUPhysicalOperator &op);

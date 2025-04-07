@@ -2,7 +2,7 @@
 
 #include "duckdb/common/reference_map.hpp"
 #include "gpu_physical_operator.hpp"
-#include "gpu_pipeline.hpp"
+// #include "gpu_pipeline.hpp"
 
 namespace duckdb {
 

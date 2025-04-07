@@ -2,18 +2,35 @@
 #include "gpu_buffer_manager.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
+#include "duckdb/execution/execution_context.hpp"
+#include "duckdb/parallel/thread_context.hpp"
+#include "duckdb/common/types/column/column_data_collection.hpp"
+#include "gpu_columns.hpp"
 
 namespace duckdb {
-
+  
 GPUPhysicalTableScan::GPUPhysicalTableScan(vector<LogicalType> types, TableFunction function_p,
-                                     unique_ptr<FunctionData> bind_data_p, vector<LogicalType> returned_types_p,
-                                     vector<column_t> column_ids_p, vector<idx_t> projection_ids_p,
-                                     vector<string> names_p, unique_ptr<TableFilterSet> table_filters_p,
-                                     idx_t estimated_cardinality, ExtraOperatorInfo extra_info)
-    : GPUPhysicalOperator(PhysicalOperatorType::TABLE_SCAN, std::move(types), estimated_cardinality),
-      function(std::move(function_p)), bind_data(std::move(bind_data_p)), returned_types(std::move(returned_types_p)),
-      column_ids(std::move(column_ids_p)), projection_ids(std::move(projection_ids_p)), names(std::move(names_p)),
-      table_filters(std::move(table_filters_p)), extra_info(extra_info) {
+    unique_ptr<FunctionData> bind_data_p, vector<LogicalType> returned_types_p,
+    vector<ColumnIndex> column_ids_p, vector<idx_t> projection_ids_p,
+    vector<string> names_p, unique_ptr<TableFilterSet> table_filters_p,
+    idx_t estimated_cardinality, ExtraOperatorInfo extra_info,
+    vector<Value> parameters_p, virtual_column_map_t virtual_columns_p)
+        : GPUPhysicalOperator(PhysicalOperatorType::TABLE_SCAN, std::move(types), estimated_cardinality),
+        function(std::move(function_p)), bind_data(std::move(bind_data_p)), returned_types(std::move(returned_types_p)),
+        column_ids(std::move(column_ids_p)), projection_ids(std::move(projection_ids_p)), names(std::move(names_p)),
+        table_filters(std::move(table_filters_p)), extra_info(extra_info), parameters(std::move(parameters_p)),
+        virtual_columns(std::move(virtual_columns_p)) {
+
+    column_size = new uint64_t[column_ids.size()];
+    for (int col = 0; col < column_ids.size(); col++) {
+      column_size[col] = 0;
+      // printf("column_ids %d\n", column_ids[col].GetPrimaryIndex());
+      // printf("names %s\n", names[column_ids[col].GetPrimaryIndex()].c_str());
+      scanned_types.push_back(returned_types[column_ids[col].GetPrimaryIndex()]);
+      scanned_ids.push_back(col);
+    }
+    fake_table_filters = make_uniq<TableFilterSet>();
+    already_cached = new bool[column_ids.size()];
 }
 
 
@@ -343,12 +360,282 @@ void HandleArbitraryConstantExpression(GPUColumn** column, uint64_t* &count, uin
   tableScanExpression(col, offset, constant_compare, constant_offset, data_type, row_ids, count, N, compare_mode, num_expr);
 }
 
+class TableScanGlobalSourceState : public GlobalSourceState {
+public:
+	TableScanGlobalSourceState(ClientContext &context, const GPUPhysicalTableScan &op) {
+    if (op.function.init_global) {
+			auto filters = table_filters ? *table_filters : GetTableFilters(op);
+			TableFunctionInitInput input(op.bind_data.get(), op.column_ids, op.scanned_ids, filters,
+			                             op.extra_info.sample_options);
+
+			global_state = op.function.init_global(context, input);
+			if (global_state) {
+				max_threads = global_state->MaxThreads();
+			}
+		} else {
+			max_threads = 1;
+		}
+		if (op.function.in_out_function) {
+      throw NotImplementedException("In-out function not supported");
+		}
+	}
+
+	idx_t max_threads = 0;
+	unique_ptr<GlobalTableFunctionState> global_state;
+	bool in_out_final = false;
+	DataChunk input_chunk;
+	unique_ptr<TableFilterSet> table_filters;
+
+	optional_ptr<TableFilterSet> GetTableFilters(const GPUPhysicalTableScan &op) const {
+		return table_filters ? table_filters.get() : op.fake_table_filters.get();
+	}
+	idx_t MaxThreads() override {
+		return max_threads;
+	}
+};
+
+class TableScanLocalSourceState : public LocalSourceState {
+public:
+	TableScanLocalSourceState(ExecutionContext &context, TableScanGlobalSourceState &gstate,
+	                          const GPUPhysicalTableScan &op) {
+		if (op.function.init_local) {
+			TableFunctionInitInput input(op.bind_data.get(), op.column_ids, op.scanned_ids,
+			                             gstate.GetTableFilters(op), op.extra_info.sample_options);
+			local_state = op.function.init_local(context, input, gstate.global_state.get());
+		}
+	}
+
+	unique_ptr<LocalTableFunctionState> local_state;
+};
+
+unique_ptr<LocalSourceState> GPUPhysicalTableScan::GetLocalSourceState(ExecutionContext &context,
+                                                                    GlobalSourceState &gstate) const {
+	return make_uniq<TableScanLocalSourceState>(context, gstate.Cast<TableScanGlobalSourceState>(), *this);
+}
+
+unique_ptr<GlobalSourceState> GPUPhysicalTableScan::GetGlobalSourceState(ClientContext &context) const {
+	return make_uniq<TableScanGlobalSourceState>(context, *this);
+}
+
+SourceResultType
+GPUPhysicalTableScan::GetDataDuckDB(ExecutionContext &exec_context) {
+    D_ASSERT(!column_ids.empty());
+    auto gpuBufferManager = &(GPUBufferManager::GetInstance());
+
+    TableFunctionToStringInput input(function, bind_data.get());
+    auto to_string_result = function.to_string(input);
+    string table_name;
+    for (const auto &it : to_string_result) {
+      if (it.first.compare("Table") == 0) {
+        table_name = it.second;
+        break;
+      }
+    }
+
+    GPUIntermediateRelation* table;
+    auto &catalog_table = Catalog::GetCatalog(exec_context.client, INVALID_CATALOG);
+
+    bool all_cached = true;
+    for (int col = 0; col < column_ids.size(); col++) {
+        already_cached[col] = gpuBufferManager->checkIfColumnCached(table_name, names[column_ids[col].GetPrimaryIndex()]);
+        if (!already_cached[col]) {
+          all_cached = false;
+          // gpuBufferManager->createTableAndColumnInGPU(catalog_table, exec_context.client, table_name, names[column_ids[col].GetPrimaryIndex()]);
+        } 
+    }
+
+    if (all_cached) {
+      return SourceResultType::FINISHED;
+    }
+
+    collection = make_uniq<ColumnDataCollection>(Allocator::Get(exec_context.client), scanned_types);
+
+    // initialize execution context with pipeline = nullptr
+    auto g_state = GetGlobalSourceState(exec_context.client);
+    auto l_state = GetLocalSourceState(exec_context, *g_state);
+
+    auto &l_state_scan = l_state->Cast<TableScanLocalSourceState>();
+    auto &g_state_scan = g_state->Cast<TableScanGlobalSourceState>();
+
+    TableFunctionInput data(bind_data.get(), l_state_scan.local_state.get(), g_state_scan.global_state.get());
+
+    if (function.function) {
+      bool has_more_output = true;
+
+      do {
+        auto chunk = make_uniq<DataChunk>();
+        chunk->Initialize(Allocator::Get(exec_context.client), scanned_types);
+        function.function(exec_context.client, data, *chunk);
+        has_more_output = chunk->size() > 0;
+        // get the size of each column in the chunk
+        for (int col = 0; col < column_ids.size(); col++) {
+          // if (!already_cached[col]) {
+            if (chunk->data[col].GetType() == LogicalType::VARCHAR) {
+              Vector string_vector = chunk->data[col];
+              string_vector.Flatten(chunk->size());
+              for (int row = 0; row < chunk->size(); row++) {
+                std::string curr_string = string_vector.GetValue(row).ToString();
+                column_size[col] += curr_string.length();
+              }
+            } else {
+              column_size[col] += chunk->data[col].GetAllocationSize(chunk->size());
+            }
+          // }
+        }
+        collection->Append(*chunk);
+      } while (has_more_output);
+
+      printf("Collection size %d\n", collection->Count());
+
+      uint64_t total_size = 0;
+      for (int col = 0; col < column_ids.size(); col++) {
+        if (!already_cached[col]) {
+          total_size += column_size[col];
+        }
+      }
+
+      if (gpuBufferManager->gpuCachingPointer[0] + total_size >= gpuBufferManager->cache_size_per_gpu) {
+        if (total_size > gpuBufferManager->cache_size_per_gpu) {
+          throw InvalidInputException("Total size of columns to be cached is greater than the cache size");
+        }
+        gpuBufferManager->ResetCache();
+        for (int col = 0; col < column_ids.size(); col++) {
+          already_cached[col] = false;
+          gpuBufferManager->createTableAndColumnInGPU(catalog_table, exec_context.client, table_name, names[column_ids[col].GetPrimaryIndex()]);
+        }
+      } else {
+          for (int col = 0; col < column_ids.size(); col++) {
+              if (!already_cached[col]) {
+                gpuBufferManager->createTableAndColumnInGPU(catalog_table, exec_context.client, table_name, names[column_ids[col].GetPrimaryIndex()]);
+              } 
+          }
+      }
+
+      ScanDataDuckDB(gpuBufferManager, table_name);
+      return SourceResultType::FINISHED;
+    } else {
+      throw NotImplementedException("Table in-out function not supported");
+    }
+}
+
+void
+GPUPhysicalTableScan::ScanDataDuckDB(GPUBufferManager* gpuBufferManager, string table_name) const{
+    if (function.function) {
+      bool has_more_output = true;
+      // allocate size in gpu buffer manager cpu processing region
+      uint8_t** ptr = new uint8_t*[scanned_types.size()];
+      uint8_t** d_ptr = new uint8_t*[scanned_types.size()];
+      uint8_t** tmp_ptr = new uint8_t*[scanned_types.size()];
+      uint64_t** offset_ptr = new uint64_t*[scanned_types.size()];
+      uint64_t** d_offset_ptr = new uint64_t*[scanned_types.size()];
+
+      for (int col = 0; col < scanned_types.size(); col++) {
+        if (!already_cached[col]) {
+          ptr[col] = gpuBufferManager->customCudaHostAlloc<uint8_t>(column_size[col]);
+          d_ptr[col] = gpuBufferManager->customCudaMalloc<uint8_t>(column_size[col], 0, 1);
+          if (scanned_types[col] == LogicalType::VARCHAR) {
+            offset_ptr[col] = gpuBufferManager->customCudaHostAlloc<uint64_t>(collection->Count() + 1);
+            d_offset_ptr[col] = gpuBufferManager->customCudaMalloc<uint64_t>(collection->Count() + 1, 0, 1);
+            offset_ptr[col][0] = 0;
+          }
+          tmp_ptr[col] = ptr[col];
+        }
+      } 
+      bool scan_initialized = false;
+      ColumnDataScanState scan_state;
+      uint64_t start_idx = 0;
+
+      do {
+        auto result = make_uniq<DataChunk>();
+        collection->InitializeScanChunk(*result);
+        if (!scan_initialized) {
+          collection->InitializeScan(scan_state, ColumnDataScanProperties::DISALLOW_ZERO_COPY);
+          scan_initialized = true;
+        }
+        collection->Scan(scan_state, *result);
+        for (int col = 0; col < result->ColumnCount(); col++) {
+          if (!already_cached[col]) {
+            if (result->data[col].GetType() == LogicalType::VARCHAR) {
+              Vector string_vector = result->data[col];
+              string_vector.Flatten(result->size());
+              for (int row = 0; row < result->size(); row++) {
+                std::string curr_string = string_vector.GetValue(row).ToString();
+                memcpy(tmp_ptr[col], curr_string.data(), curr_string.length());
+                offset_ptr[col][start_idx + row + 1] = offset_ptr[col][start_idx + row] + curr_string.length();
+                tmp_ptr[col] += curr_string.length();
+              }
+            } else {
+              memcpy(tmp_ptr[col], result->data[col].GetData(), result->data[col].GetAllocationSize(result->size()));
+              tmp_ptr[col] += result->data[col].GetAllocationSize(result->size());
+            }
+          }
+        }
+        start_idx += result->size();
+        has_more_output = result->size() > 0;
+      } while (has_more_output);
+
+
+      for (int col = 0; col < column_ids.size(); col++) {
+        if (!already_cached[col]) {
+            if (scanned_types[col] == LogicalType::VARCHAR) {
+              if (column_size[col] != offset_ptr[col][collection->Count()]) {
+                throw InvalidInputException("Column size mismatch");
+              }
+              callCudaMemcpyHostToDevice<uint8_t>(d_ptr[col], ptr[col], column_size[col], 0);
+              callCudaMemcpyHostToDevice<uint64_t>(d_offset_ptr[col], offset_ptr[col], collection->Count() + 1, 0);
+            } else {
+              callCudaMemcpyHostToDevice<uint8_t>(d_ptr[col], ptr[col], column_size[col], 0);
+            }
+        }
+      }
+
+      for (int col = 0; col < column_ids.size(); col++) {
+        if (!already_cached[col]) {
+            auto up_column_name = names[column_ids[col].GetPrimaryIndex()];
+            auto up_table_name = table_name;
+            printf("column name %s\n", up_column_name.c_str());
+            transform(up_table_name.begin(), up_table_name.end(), up_table_name.begin(), ::toupper);
+            transform(up_column_name.begin(), up_column_name.end(), up_column_name.begin(), ::toupper);
+            auto column_it = find(gpuBufferManager->tables[up_table_name]->column_names.begin(), gpuBufferManager->tables[up_table_name]->column_names.end(), up_column_name);
+            if (column_it == gpuBufferManager->tables[up_table_name]->column_names.end()) {
+                throw InvalidInputException("Column not found");
+            }
+            printf("column name %s\n", up_column_name.c_str());
+            int column_idx = column_it - gpuBufferManager->tables[up_table_name]->column_names.begin();
+            ColumnType column_type = convertLogicalTypeToColumnType(scanned_types[col]);
+            printf("column name %s\n", up_column_name.c_str());
+            gpuBufferManager->tables[up_table_name]->columns[column_idx]->column_length = collection->Count();
+            printf("column name %s\n", up_column_name.c_str());
+            gpuBufferManager->tables[up_table_name]->length = collection->Count();
+            printf("column name %s\n", up_column_name.c_str());
+            if (scanned_types[col] == LogicalType::VARCHAR) {
+              gpuBufferManager->tables[up_table_name]->columns[column_idx]->data_wrapper = DataWrapper(column_type, d_ptr[col], d_offset_ptr[col], collection->Count(), column_size[col], true);
+            } else {
+              gpuBufferManager->tables[up_table_name]->columns[column_idx]->data_wrapper = DataWrapper(column_type, d_ptr[col], collection->Count());
+            }
+            printf("Column %s cached in GPU at index %d\n", up_column_name.c_str(), column_idx);
+        }
+      }
+    } else {
+      throw NotImplementedException("Table in-out function not supported");
+    }
+}
+
 SourceResultType
 GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
   auto start = std::chrono::high_resolution_clock::now();
   if (output_relation.columns.size() != GetTypes().size()) throw InvalidInputException("Mismatched column count");
 
-  auto table_name = function.to_string(bind_data.get()); //we get it from ParamsToString();
+  printf("Getting data\n");
+  TableFunctionToStringInput input(function, bind_data.get());
+  auto to_string_result = function.to_string(input);
+  string table_name;
+  for (const auto &it : to_string_result) {
+    if (it.first.compare("Table") == 0) {
+      table_name = it.second;
+      break;
+    }
+  }
 
   printf("Table Scanning %s\n", table_name.c_str());
   //Find table name in the buffer manager
@@ -363,14 +650,14 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
             printf("Cached Column name: %s\n", table->column_names[i].c_str());
         }
         for (int col = 0; col < column_ids.size(); col++) {
-            printf("Finding column %s\n", names[column_ids[col]].c_str());
-            auto column_it = find(table->column_names.begin(), table->column_names.end(), names[column_ids[col]]);
+            printf("Finding column %s\n", names[column_ids[col].GetPrimaryIndex()].c_str());
+            auto column_it = find(table->column_names.begin(), table->column_names.end(), names[column_ids[col].GetPrimaryIndex()]);
             if (column_it == table->column_names.end()) {
                 throw InvalidInputException("Column not found");
-            } 
-            auto column_name = table->column_names[column_ids[col]];
+            }
+            auto column_name = table->column_names[column_ids[col].GetPrimaryIndex()];
             printf("Column found %s\n", column_name.c_str());
-            if (column_name != names[column_ids[col]]) {
+            if (column_name != names[column_ids[col].GetPrimaryIndex()]) {
                 throw InvalidInputException("Column name mismatch");
             }
         }
@@ -387,8 +674,12 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
       for (auto &f : table_filters->filters) {
         auto &column_index = f.first;
         auto &filter = f.second;
-        table->columns[column_ids[column_index]]->row_ids = nullptr;
-        table->columns[column_ids[column_index]]->row_id_count = 0;
+        table->columns[column_ids[column_index].GetPrimaryIndex()]->row_ids = nullptr;
+        table->columns[column_ids[column_index].GetPrimaryIndex()]->row_id_count = 0;
+
+        if (filter->filter_type == TableFilterType::OPTIONAL_FILTER) {
+          continue;
+        }
 
         if (column_index < names.size()) {
 
@@ -406,7 +697,12 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
                 }
             }
           } else {
-            throw NotImplementedException("Filter aside from conjunction and not supported");
+            // count how many filters in table_filters->filters that are not optional filters
+            if (filter->filter_type == TableFilterType::CONSTANT_COMPARISON) {
+              num_expr++;
+            } else {
+              throw NotImplementedException("Filter aside from constant comparison not supported");
+            }
           }
 
         }
@@ -420,8 +716,12 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
         auto &column_index = f.first;
         auto &filter = f.second;
 
+        if (filter->filter_type == TableFilterType::OPTIONAL_FILTER) {
+          continue;
+        }
+
         if (column_index < names.size()) {
-          printf("Reading filter column from index %ld\n", column_ids[column_index]);
+          printf("Reading filter column from index %ld\n", column_ids[column_index].GetPrimaryIndex());
 
           if (filter->filter_type == TableFilterType::CONJUNCTION_AND) {
             auto filter_pointer = filter.get();
@@ -433,7 +733,7 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
                   printf("Reading constant comparison filter\n");
                   filter_constants[expr_idx] = &(filter_inside->Cast<ConstantFilter>());
                   // printf("%d\n", filter_constants[expr_idx]->comparison_type);
-                  expression_columns[expr_idx] = table->columns[column_ids[column_index]];
+                  expression_columns[expr_idx] = table->columns[column_ids[column_index].GetPrimaryIndex()];
                   expr_idx++;
                 } else if (filter_inside->filter_type == TableFilterType::IS_NOT_NULL) {
                   continue;
@@ -443,26 +743,35 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
             }
 
           } else {
-            throw NotImplementedException("Filter aside from conjunction and not supported");
+            // count how many filters in table_filters->filters
+            if (filter->filter_type == TableFilterType::CONSTANT_COMPARISON) {
+              filter_constants[expr_idx] = &(filter->Cast<ConstantFilter>());
+              expression_columns[expr_idx] = table->columns[column_ids[column_index].GetPrimaryIndex()];
+              expr_idx++;
+            } else {
+              throw NotImplementedException("Filter aside from conjunction and not supported");
+            }
           }
 
         }
       }
 
       printf("Num expr %d\n", num_expr);
-      count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
-      HandleArbitraryConstantExpression(expression_columns, count, row_ids, filter_constants, num_expr);
-      if (count[0] == 0) throw NotImplementedException("No match found");
+      if (num_expr > 0) {
+        count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+        HandleArbitraryConstantExpression(expression_columns, count, row_ids, filter_constants, num_expr);
+        if (count[0] == 0) throw NotImplementedException("No match found");
+      }
     }
     int index = 0;
     // projection id means that from this set of column ids that are being scanned, which index of column ids are getting projected out
     if (function.filter_prune) {
       for (auto projection_id : projection_ids) {
-          printf("Reading column index (late materialized) %ld and passing it to index in output relation %ld\n", column_ids[projection_id], index);
+          printf("Reading column index (late materialized) %ld and passing it to index in output relation %ld\n", column_ids[projection_id].GetPrimaryIndex(), index);
           printf("Writing row IDs to output relation in index %ld\n", index);
-          output_relation.columns[index] = new GPUColumn(table->columns[column_ids[projection_id]]->column_length, table->columns[column_ids[projection_id]]->data_wrapper.type, table->columns[column_ids[projection_id]]->data_wrapper.data,
-                          table->columns[column_ids[projection_id]]->data_wrapper.offset, table->columns[column_ids[projection_id]]->data_wrapper.num_bytes, table->columns[column_ids[projection_id]]->data_wrapper.is_string_data);
-          output_relation.columns[index]->is_unique = table->columns[column_ids[projection_id]]->is_unique;
+          output_relation.columns[index] = new GPUColumn(table->columns[column_ids[projection_id].GetPrimaryIndex()]->column_length, table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.type, table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.data,
+                          table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.offset, table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.num_bytes, table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.is_string_data);
+          output_relation.columns[index]->is_unique = table->columns[column_ids[projection_id].GetPrimaryIndex()]->is_unique;
           if (row_ids) {
             output_relation.columns[index]->row_ids = row_ids; 
           }
@@ -471,14 +780,32 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
           }
           index++;
       }
+
+      if (projection_ids.size() == 0) {
+        printf("Projection ids size is 0 so we are projecting all columns\n");
+        for (auto column_id : column_ids) {
+            printf("Reading column index (late materialized) %ld and passing it to index in output relation %ld\n", column_id.GetPrimaryIndex(), index);
+            printf("Writing row IDs to output relation in index %ld\n", index);
+            output_relation.columns[index] = new GPUColumn(table->columns[column_id.GetPrimaryIndex()]->column_length, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.type, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.data,
+                            table->columns[column_id.GetPrimaryIndex()]->data_wrapper.offset, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.num_bytes, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.is_string_data);
+            output_relation.columns[index]->is_unique = table->columns[column_id.GetPrimaryIndex()]->is_unique;
+            if (row_ids) {
+              output_relation.columns[index]->row_ids = row_ids; 
+            }
+            if (count) {
+              output_relation.columns[index]->row_id_count = count[0];
+            }
+            index++;
+        }
+      }
     } else {
       //THIS IS FOR INDEX_SCAN
       for (auto column_id : column_ids) {
-          printf("Reading column index (late materialized) %ld and passing it to index in output relation %ld\n", column_id, index);
+          printf("Reading column index (late materialized) %ld and passing it to index in output relation %ld\n", column_id.GetPrimaryIndex(), index);
           printf("Writing row IDs to output relation in index %ld\n", index);
-          output_relation.columns[index] = new GPUColumn(table->columns[column_id]->column_length, table->columns[column_id]->data_wrapper.type, table->columns[column_id]->data_wrapper.data,
-                          table->columns[column_id]->data_wrapper.offset, table->columns[column_id]->data_wrapper.num_bytes, table->columns[column_id]->data_wrapper.is_string_data);
-          output_relation.columns[index]->is_unique = table->columns[column_id]->is_unique;
+          output_relation.columns[index] = new GPUColumn(table->columns[column_id.GetPrimaryIndex()]->column_length, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.type, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.data,
+                          table->columns[column_id.GetPrimaryIndex()]->data_wrapper.offset, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.num_bytes, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.is_string_data);
+          output_relation.columns[index]->is_unique = table->columns[column_id.GetPrimaryIndex()]->is_unique;
           if (row_ids) {
             output_relation.columns[index]->row_ids = row_ids; 
           }
@@ -495,169 +822,5 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
     printf("Table Scan time: %.2f ms\n", duration.count()/1000.0);
     return SourceResultType::FINISHED;
 }
-
-// SourceResultType
-// GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
-//   auto start = std::chrono::high_resolution_clock::now();
-//   if (output_relation.columns.size() != GetTypes().size()) throw InvalidInputException("Mismatched column count");
-
-//   auto table_name = function.to_string(bind_data.get()); //we get it from ParamsToString();
-
-//   printf("Table Scanning %s\n", table_name.c_str());
-//   //Find table name in the buffer manager
-//   auto gpuBufferManager = &(GPUBufferManager::GetInstance());
-//   auto it = gpuBufferManager->tables.find(table_name);
-//   GPUIntermediateRelation* table;
-//   //If there is a filter: apply filter, and write to output_relation (late materialized)
-//     if (it != gpuBufferManager->tables.end()) {
-//         // Key found, print the value
-//         table = it->second;
-//         for (int i = 0; i < table->column_names.size(); i++) {
-//             printf("Cached Column name: %s\n", table->column_names[i].c_str());
-//         }
-//         for (int col = 0; col < column_ids.size(); col++) {
-//             printf("Finding column %s\n", names[column_ids[col]].c_str());
-//             auto column_it = find(table->column_names.begin(), table->column_names.end(), names[column_ids[col]]);
-//             if (column_it == table->column_names.end()) {
-//                 throw InvalidInputException("Column not found");
-//             } 
-//             auto column_name = table->column_names[column_ids[col]];
-//             printf("Column found %s\n", column_name.c_str());
-//             if (column_name != names[column_ids[col]]) {
-//                 throw InvalidInputException("Column name mismatch");
-//             }
-//         }
-//     } else {
-//         // table not found
-//         throw InvalidInputException("Table not found");
-//     }
-
-//     uint64_t* row_ids = nullptr;
-//     uint64_t* prev_row_ids = nullptr;
-//     uint64_t* count = nullptr;
-//     uint64_t prev_row_ids_count = 0;
-//     if (table_filters) {
-//       for (auto &f : table_filters->filters) {
-//         auto &column_index = f.first;
-//         auto &filter = f.second;
-//         if (column_index < names.size()) {
-//           printf("Reading filter column from index %ld\n", column_ids[column_index]);
-//           // printf("filter type %d\n", filter->filter_type);
-//           if (filter->filter_type == TableFilterType::CONJUNCTION_AND) {
-//             auto filter_pointer = filter.get();
-//             auto &filter_conjunction_and = filter_pointer->Cast<ConjunctionAndFilter>();
-//             if (filter_conjunction_and.child_filters.size() == 3) {
-//               printf("This is between filter\n");
-//               if (filter_conjunction_and.child_filters[0]->filter_type == TableFilterType::CONSTANT_COMPARISON && filter_conjunction_and.child_filters[1]->filter_type == TableFilterType::CONSTANT_COMPARISON && filter_conjunction_and.child_filters[2]->filter_type == TableFilterType::IS_NOT_NULL) {
-//                 auto filter_constant1 = filter_conjunction_and.child_filters[0]->Cast<ConstantFilter>();
-//                 auto filter_constant2 = filter_conjunction_and.child_filters[1]->Cast<ConstantFilter>();
-//                 ExpressionType expression_type1 = filter_constant1.comparison_type;
-//                 ExpressionType expression_type2 = filter_constant2.comparison_type;
-//                 count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
-
-//                 if (prev_row_ids) {
-//                   printf("The previous row ids count is %ld\n", prev_row_ids_count);
-//                   table->columns[column_ids[column_index]]->row_ids = prev_row_ids;
-//                   table->columns[column_ids[column_index]]->row_id_count = prev_row_ids_count;
-//                 }
-//                 GPUColumn* materialized_column = HandleMaterializeExpression(table->columns[column_ids[column_index]], gpuBufferManager);
-//                 table->columns[column_ids[column_index]]->row_ids = nullptr;
-//                 table->columns[column_ids[column_index]]->row_id_count = 0;
-//                 bool is_first_greater = filter_constant1.comparison_type == ExpressionType::COMPARE_GREATERTHANOREQUALTO || filter_constant1.comparison_type == ExpressionType::COMPARE_GREATERTHAN;
-//                 bool is_second_greater = filter_constant2.comparison_type == ExpressionType::COMPARE_LESSTHANOREQUALTO || filter_constant2.comparison_type == ExpressionType::COMPARE_LESSTHAN;
-//                 if (is_first_greater && is_second_greater) {
-//                   HandleBetweenExpression(materialized_column, count, row_ids, filter_constant1, filter_constant2);
-//                 // if (filter_constant1.comparison_type == ExpressionType::COMPARE_GREATERTHANOREQUALTO && filter_constant2.comparison_type == ExpressionType::COMPARE_LESSTHANOREQUALTO) {
-//                     // HandleBetweenExpression(materialized_column, count, row_ids, filter_constant1, filter_constant2);
-//                 } else {
-//                     throw NotImplementedException("Between expression not supported");
-//                 }
-//                 printf("Count %ld\n", count[0]);
-//                 if (count[0] == 0) throw NotImplementedException("No match found");
-//               }
-//             } else {
-//               for (auto &filter_inside : filter_conjunction_and.child_filters) {
-//                 if (filter_inside->filter_type == TableFilterType::CONSTANT_COMPARISON) {
-//                   printf("Reading constant comparison filter\n");
-//                   auto filter_constant = filter_inside->Cast<ConstantFilter>();
-//                   ExpressionType expression_type = filter_constant.comparison_type;
-//                   size_t size = table->columns[column_ids[column_index]]->column_length;
-//                   count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
-
-//                   if (prev_row_ids) {
-//                     printf("The previous row ids count is %ld\n", prev_row_ids_count);
-//                     table->columns[column_ids[column_index]]->row_ids = prev_row_ids;
-//                     table->columns[column_ids[column_index]]->row_id_count = prev_row_ids_count;
-//                   }
-//                   GPUColumn* materialized_column = HandleMaterializeExpression(table->columns[column_ids[column_index]], gpuBufferManager);
-//                   table->columns[column_ids[column_index]]->row_ids = nullptr;
-//                   table->columns[column_ids[column_index]]->row_id_count = 0;
-//                   HandleComparisonConstantExpression(materialized_column, count, row_ids, filter_constant, expression_type);
-//                   printf("Count %ld\n", count[0]);
-//                   if (count[0] == 0) throw NotImplementedException("No match found");
-//                 } else if (filter_inside->filter_type == TableFilterType::IS_NOT_NULL) {
-//                   continue;
-//                 } else {
-//                   throw NotImplementedException("Filter type not supported");
-//                 }
-//               }
-//             }
-//           } else {
-//             throw NotImplementedException("Filter aside from conjunction and not supported");
-//           }
-
-//           if (prev_row_ids) {
-//             uint64_t* new_row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(count[0], 0, 0);
-//             materializeExpression<uint64_t>(prev_row_ids, new_row_ids, row_ids, count[0]);
-//             prev_row_ids = new_row_ids;
-//             prev_row_ids_count = count[0];
-//           } else {
-//             prev_row_ids = row_ids;
-//             prev_row_ids_count = count[0];
-//           }
-//         }
-//       }
-//     }
-//     int index = 0;
-//     // projection id means that from this set of column ids that are being scanned, which index of column ids are getting projected out
-//     if (function.filter_prune) {
-//       for (auto projection_id : projection_ids) {
-//           printf("Reading column index (late materialized) %ld and passing it to index in output relation %ld\n", column_ids[projection_id], index);
-//           printf("Writing row IDs to output relation in index %ld\n", index);
-//           output_relation.columns[index] = new GPUColumn(table->columns[column_ids[projection_id]]->column_length, table->columns[column_ids[projection_id]]->data_wrapper.type, table->columns[column_ids[projection_id]]->data_wrapper.data,
-//                           table->columns[column_ids[projection_id]]->data_wrapper.offset, table->columns[column_ids[projection_id]]->data_wrapper.num_bytes, table->columns[column_ids[projection_id]]->data_wrapper.is_string_data);
-//           output_relation.columns[index]->is_unique = table->columns[column_ids[projection_id]]->is_unique;
-//           if (row_ids) {
-//             output_relation.columns[index]->row_ids = prev_row_ids; 
-//           }
-//           if (count) {
-//             output_relation.columns[index]->row_id_count = prev_row_ids_count;
-//           }
-//           index++;
-//       }
-//     } else {
-//       //THIS IS FOR INDEX_SCAN
-//       for (auto column_id : column_ids) {
-//           printf("Reading column index (late materialized) %ld and passing it to index in output relation %ld\n", column_id, index);
-//           printf("Writing row IDs to output relation in index %ld\n", index);
-//           output_relation.columns[index] = new GPUColumn(table->columns[column_id]->column_length, table->columns[column_id]->data_wrapper.type, table->columns[column_id]->data_wrapper.data,
-//                           table->columns[column_id]->data_wrapper.offset, table->columns[column_id]->data_wrapper.num_bytes, table->columns[column_id]->data_wrapper.is_string_data);
-//           output_relation.columns[index]->is_unique = table->columns[column_id]->is_unique;
-//           if (row_ids) {
-//             output_relation.columns[index]->row_ids = prev_row_ids; 
-//           }
-//           if (count) {
-//             output_relation.columns[index]->row_id_count = prev_row_ids_count;
-//           }
-//           index++;
-//       }
-//     }
-  
-//     //measure time
-//     auto end = std::chrono::high_resolution_clock::now();
-//     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-//     printf("Table Scan time: %.2f ms\n", duration.count()/1000.0);
-//     return SourceResultType::FINISHED;
-// }
 
 } // namespace duckdb
