@@ -46,7 +46,7 @@ namespace duckdb {
 // }
 
 void GPUBindPreparedStatementParameters(PreparedStatementData &statement, const PendingQueryParameters &parameters) {
-	case_insensitive_map_t<Value> owned_values;
+	case_insensitive_map_t<BoundParameterData> owned_values;
 	// if (parameters.parameters) {
 	// 	auto &params = *parameters.parameters;
 	// 	for (auto &val : params) {

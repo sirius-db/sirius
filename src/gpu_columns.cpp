@@ -2,34 +2,6 @@
 
 namespace duckdb {
 
-ColumnType convertLogicalTypetoColumnType(LogicalType type) {
-    ColumnType column_type;
-    switch (type.id()) {
-        case LogicalTypeId::INTEGER:
-            column_type = ColumnType::INT32;
-            break;
-        case LogicalTypeId::BIGINT:
-            column_type = ColumnType::INT64;
-            break;
-        case LogicalTypeId::FLOAT:
-            column_type = ColumnType::FLOAT32;
-            break;
-        case LogicalTypeId::DOUBLE:
-            column_type = ColumnType::FLOAT64;
-            break;
-        case LogicalTypeId::BOOLEAN:
-            column_type = ColumnType::BOOLEAN;
-            break;
-        case LogicalTypeId::VARCHAR:
-            column_type = ColumnType::VARCHAR;
-            break;
-        default:
-            column_type = ColumnType::INT32;
-            break;
-    }
-    return column_type;
-}
-
 DataWrapper::DataWrapper(ColumnType _type, uint8_t* _data, size_t _size) : data(_data), size(_size) {
     type = _type;
     num_bytes = size * getColumnTypeSize();

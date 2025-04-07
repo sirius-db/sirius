@@ -25,12 +25,11 @@ Note that `--recurse-submodules` will ensure DuckDB is pulled which is required 
 ## Building
 ```
 cd duckdb
-git reset --hard 1f98600c2cf8722a6d2f2d805bb4af5e701319fc #go to the commit hash of duckdb v1.0.0
 mkdir -p extension_external
 cd extension_external
 git clone https://github.com/duckdb/substrait.git
-cd substrait 
-git reset --hard b6f56643cb11d52de0e32c24a01dfd5947df62be #go to the right commit hash for duckdb substrait extension
+cd substrait
+git reset --hard 611d92b9980c3b673ba3755bc10dfdb6f94e7384 #go to the right commit hash for duckdb substrait extension
 cd {SIRIUS_HOME_PATH}
 make -j 8 #build extension
 ```

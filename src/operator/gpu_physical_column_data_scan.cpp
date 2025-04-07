@@ -8,7 +8,8 @@ namespace duckdb {
 
 GPUPhysicalColumnDataScan::GPUPhysicalColumnDataScan(vector<LogicalType> types, PhysicalOperatorType op_type,
                                                idx_t estimated_cardinality, optionally_owned_ptr<ColumnDataCollection> collection_p)
-    : GPUPhysicalOperator(op_type, std::move(types), estimated_cardinality), collection(std::move(collection_p)) {
+    : GPUPhysicalOperator(op_type, std::move(types), estimated_cardinality), collection(std::move(collection_p)),
+	  cte_index(DConstants::INVALID_INDEX) {
 }
 
 GPUPhysicalColumnDataScan::GPUPhysicalColumnDataScan(vector<LogicalType> types, PhysicalOperatorType op_type,
@@ -64,19 +65,19 @@ GPUPhysicalColumnDataScan::BuildPipelines(GPUPipeline &current, GPUMetaPipeline 
 		return;
 	}
 	case PhysicalOperatorType::CTE_SCAN: {
-        throw NotImplementedException("CTE scan not implemented for GPU");
-		// auto entry = state.cte_dependencies.find(*this);
-		// D_ASSERT(entry != state.cte_dependencies.end());
-		// // this chunk scan introduces a dependency to the current pipeline
-		// // namely a dependency on the CTE pipeline to finish
-		// auto cte_dependency = entry->second.get().shared_from_this();
-		// auto cte_sink = state.GetPipelineSink(*cte_dependency);
-		// (void)cte_sink;
-		// D_ASSERT(cte_sink);
-		// D_ASSERT(cte_sink->type == PhysicalOperatorType::CTE);
-		// current.AddDependency(cte_dependency);
-		// state.SetPipelineSource(current, *this);
-		// return;
+        // throw NotImplementedException("CTE scan not implemented for GPU");
+		auto entry = state.cte_dependencies.find(*this);
+		D_ASSERT(entry != state.cte_dependencies.end());
+		// this chunk scan introduces a dependency to the current pipeline
+		// namely a dependency on the CTE pipeline to finish
+		auto cte_dependency = entry->second.get().shared_from_this();
+		auto cte_sink = state.GetPipelineSink(*cte_dependency);
+		(void)cte_sink;
+		D_ASSERT(cte_sink);
+		D_ASSERT(cte_sink->type == PhysicalOperatorType::CTE);
+		current.AddDependency(cte_dependency);
+		state.SetPipelineSource(current, *this);
+		return;
 	}
 	case PhysicalOperatorType::RECURSIVE_CTE_SCAN:
         throw NotImplementedException("Recursive CTE scan not implemented for GPU");

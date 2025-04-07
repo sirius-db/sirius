@@ -13,7 +13,7 @@
 namespace duckdb {
 class ClientContext;
 class GPUContext;
-// class ColumnDataCollection;
+class ColumnDataCollection;
 
 //! The physical plan generator generates a physical execution plan from a
 //! logical query plan
@@ -25,19 +25,19 @@ public:
 	LogicalDependencyList dependencies;
 	//! Recursive CTEs require at least one ChunkScan, referencing the working_table.
 	//! This data structure is used to establish it.
-	// unordered_map<idx_t, shared_ptr<ColumnDataCollection>> recursive_cte_tables;
+	unordered_map<idx_t, shared_ptr<ColumnDataCollection>> recursive_cte_tables;
 	//! Materialized CTE ids must be collected.
-	// unordered_map<idx_t, vector<const_reference<GPUPhysicalOperator>>> materialized_ctes;
-
+	unordered_map<idx_t, vector<const_reference<GPUPhysicalOperator>>> materialized_ctes;
+	unordered_map<idx_t, GPUIntermediateRelation*> gpu_recursive_cte_tables;
 public:
 	//! Creates a plan from the logical operator. This involves resolving column bindings and generating physical
 	//! operator nodes.
 	unique_ptr<GPUPhysicalOperator> CreatePlan(unique_ptr<LogicalOperator> logical);
 
 	//! Whether or not we can (or should) use a batch-index based operator for executing the given sink
-	// static bool UseBatchIndex(ClientContext &context, GPUPhysicalOperator &plan);
+	static bool UseBatchIndex(ClientContext &context, GPUPhysicalOperator &plan);
 	//! Whether or not we should preserve insertion order for executing the given sink
-	// static bool PreserveInsertionOrder(ClientContext &context, GPUPhysicalOperator &plan);
+	static bool PreserveInsertionOrder(ClientContext &context, GPUPhysicalOperator &plan);
 
 	static bool HasEquality(vector<JoinCondition> &conds, idx_t &range_count);
 
@@ -84,8 +84,8 @@ protected:
 	// unique_ptr<GPUPhysicalOperator> CreatePlan(LogicalVacuum &op);
 	// unique_ptr<GPUPhysicalOperator> CreatePlan(LogicalUnnest &op);
 	// unique_ptr<GPUPhysicalOperator> CreatePlan(LogicalRecursiveCTE &op);
-	// unique_ptr<GPUPhysicalOperator> CreatePlan(LogicalMaterializedCTE &op);
-	// unique_ptr<GPUPhysicalOperator> CreatePlan(LogicalCTERef &op);
+	unique_ptr<GPUPhysicalOperator> CreatePlan(LogicalMaterializedCTE &op);
+	unique_ptr<GPUPhysicalOperator> CreatePlan(LogicalCTERef &op);
 	// unique_ptr<GPUPhysicalOperator> CreatePlan(LogicalPivot &op);
 
 	// unique_ptr<GPUPhysicalOperator> PlanAsOfJoin(LogicalComparisonJoin &op);
@@ -98,6 +98,8 @@ protected:
 // private:
 	// bool PreserveInsertionOrder(GPUPhysicalOperator &plan);
 	// bool UseBatchIndex(GPUPhysicalOperator &plan);
+public:
+	idx_t delim_index = 0;
 
 public:
 	ClientContext &context;
