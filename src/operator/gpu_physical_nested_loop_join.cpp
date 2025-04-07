@@ -41,6 +41,10 @@ void ResolveTypeNestedLoopJoin(GPUColumn** &left_keys, GPUColumn** &right_keys, 
 			condition_mode[key] = 2;
 		} else if (conditions[key].comparison == ExpressionType::COMPARE_GREATERTHAN) { 
 			condition_mode[key] = 3;
+		} else if (conditions[key].comparison == ExpressionType::COMPARE_LESSTHANOREQUALTO) {
+			condition_mode[key] = 4;
+		} else if (conditions[key].comparison == ExpressionType::COMPARE_GREATERTHANOREQUALTO) {
+			condition_mode[key] = 5;
 		} else {
 			throw NotImplementedException("Unsupported comparison type");
 		}
@@ -59,12 +63,21 @@ void
 HandleNestedLoopJoin(GPUColumn** &left_keys, GPUColumn** &right_keys, uint64_t* &count, uint64_t* &row_ids_left, uint64_t* &row_ids_right, 
 		const vector<JoinCondition> &conditions, JoinType join_type, GPUBufferManager* gpuBufferManager) {
     switch(left_keys[0]->data_wrapper.type) {
-      case ColumnType::INT64:
-		ResolveTypeNestedLoopJoin<uint64_t>(left_keys, right_keys, count, row_ids_left, row_ids_right, conditions, join_type, gpuBufferManager);
-		break;
+	  case ColumnType::INT64:
+        ResolveTypeNestedLoopJoin<uint64_t>(left_keys, right_keys, count, row_ids_left, row_ids_right, conditions, join_type, gpuBufferManager);
+        break;
+      case ColumnType::INT32:
+        ResolveTypeNestedLoopJoin<int32_t>(left_keys, right_keys, count, row_ids_left, row_ids_right, conditions, join_type, gpuBufferManager);
+        break;
       case ColumnType::FLOAT64:
-	  	ResolveTypeNestedLoopJoin<double>(left_keys, right_keys, count, row_ids_left, row_ids_right, conditions, join_type, gpuBufferManager);
-		break;
+      	ResolveTypeNestedLoopJoin<double>(left_keys, right_keys, count, row_ids_left, row_ids_right, conditions, join_type, gpuBufferManager);
+        break;
+	case ColumnType::FLOAT32:
+        ResolveTypeNestedLoopJoin<float>(left_keys, right_keys, count, row_ids_left, row_ids_right, conditions, join_type, gpuBufferManager);
+        break;
+	case ColumnType::VARCHAR:
+        ResolveTypeNestedLoopJoin<uint8_t>(left_keys, right_keys, count, row_ids_left, row_ids_right, conditions, join_type, gpuBufferManager);
+        break;
       default:
         throw NotImplementedException("Unsupported column type");
     }
@@ -77,6 +90,7 @@ GPUPhysicalNestedLoopJoin::GPUPhysicalNestedLoopJoin(LogicalOperator &op, unique
     //                          estimated_cardinality) {
     : GPUPhysicalOperator(PhysicalOperatorType::NESTED_LOOP_JOIN, op.types, estimated_cardinality), join_type(join_type) {
 	conditions.resize(cond.size());
+	
 	// we reorder conditions so the ones with COMPARE_EQUAL occur first
 	idx_t equal_position = 0;
 	idx_t other_position = cond.size() - 1;
@@ -105,6 +119,16 @@ GPUPhysicalNestedLoopJoin::GPUPhysicalNestedLoopJoin(LogicalOperator &op, unique
 }
 
 bool GPUPhysicalNestedLoopJoin::IsSupported(const vector<JoinCondition> &conditions, JoinType join_type) {
+	for (auto &cond : conditions) {
+        if (cond.comparison == ExpressionType::COMPARE_GREATERTHAN || 
+            cond.comparison == ExpressionType::COMPARE_LESSTHAN ||
+            cond.comparison == ExpressionType::COMPARE_NOTEQUAL ||
+            cond.comparison == ExpressionType::COMPARE_GREATERTHANOREQUALTO ||
+            cond.comparison == ExpressionType::COMPARE_LESSTHANOREQUALTO) {
+            return true;
+        }
+    }
+	
 	if (join_type == JoinType::MARK) {
 		return true;
 	}

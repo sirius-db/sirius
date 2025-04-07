@@ -49,7 +49,10 @@ __global__ void nested_loop_join_count(T *left_keys, T* right_keys, uint64_t *of
                 } else if (condition_mode == 2 && left_keys[tile_offset + threadIdx.x + ITEM * B] >= right_keys[i]) {
                     local_found = 0;
                 } else if (condition_mode == 3 && left_keys[tile_offset + threadIdx.x + ITEM * B] <= right_keys[i]) {
-                    // printf("left_keys: %.2f right_keys: %.2f\n", left_keys[tile_offset + threadIdx.x + ITEM * B], right_keys[i]);
+                    local_found = 0;
+                } else if (condition_mode == 4 && left_keys[tile_offset + threadIdx.x + ITEM * B] >= right_keys[i]) {
+                    local_found = 0;
+                } else if (condition_mode == 5 && left_keys[tile_offset + threadIdx.x + ITEM * B] <= right_keys[i]) {
                     local_found = 0;
                 }
 
@@ -71,10 +74,9 @@ __global__ void nested_loop_join_count(T *left_keys, T* right_keys, uint64_t *of
 
     __syncthreads();
 
-     if (blockIdx.x * tile_size + threadIdx.x < left_size) {
+    if (blockIdx.x * tile_size + threadIdx.x < left_size) {
         offset_each_thread[blockIdx.x * B + threadIdx.x] = block_off + c_t_count;
     }
-
 }
 
 template <typename T, int B, int I>
@@ -109,6 +111,10 @@ __global__ void nested_loop_join(T *left_keys, T* right_keys, uint64_t *offset_e
                     local_found = 0;
                 } else if (condition_mode == 3 && left_keys[tile_offset + threadIdx.x + ITEM * B] <= right_keys[i]) {
                     local_found = 0;
+                } else if (condition_mode == 4 && left_keys[tile_offset + threadIdx.x + ITEM * B] >= right_keys[i]) {
+                    local_found = 0;
+                } else if (condition_mode == 5 && left_keys[tile_offset + threadIdx.x + ITEM * B] <= right_keys[i]) {
+                    local_found = 0;
                 }
 
                 if (local_found) {
@@ -120,22 +126,6 @@ __global__ void nested_loop_join(T *left_keys, T* right_keys, uint64_t *offset_e
         }
     }
 }
-
-template
-__global__ void nested_loop_join_count<double, BLOCK_THREADS, 1>(double *left_keys, double* right_keys, uint64_t *offset_each_thread, 
-            unsigned long long* total_count, uint64_t left_size, uint64_t right_size, int condition_mode);
-
-template
-__global__ void nested_loop_join_count<uint64_t, BLOCK_THREADS, 1>(uint64_t *left_keys, uint64_t* right_keys, uint64_t *offset_each_thread, 
-            unsigned long long* total_count, uint64_t left_size, uint64_t right_size, int condition_mode);
-
-template
-__global__ void nested_loop_join<double, BLOCK_THREADS, 1>(double *left_keys, double* right_keys, uint64_t *offset_each_thread, uint64_t *row_ids_left, uint64_t *row_ids_right,
-            uint64_t left_size, uint64_t right_size, int condition_mode);
-
-template
-__global__ void nested_loop_join<uint64_t, BLOCK_THREADS, 1>(uint64_t *left_keys, uint64_t* right_keys, uint64_t *offset_each_thread, uint64_t *row_ids_left, uint64_t *row_ids_right,
-            uint64_t left_size, uint64_t right_size, int condition_mode);
 
 template <typename T>
 void nestedLoopJoin(T** left_data, T** right_data, uint64_t* &row_ids_left, uint64_t* &row_ids_right, uint64_t* &count, uint64_t left_size, uint64_t right_size, int* condition_mode, int num_keys) {
@@ -175,10 +165,93 @@ void nestedLoopJoin(T** left_data, T** right_data, uint64_t* &row_ids_left, uint
     count = h_count;
 }
 
+// Special case for uint8_t - we don't need to add the string specializations yet
+// as they would need more work to integrate with the rest of the code
+template <>
+void nestedLoopJoin<uint8_t>(uint8_t** left_data, uint8_t** right_data, uint64_t* &row_ids_left, uint64_t* &row_ids_right, uint64_t* &count, uint64_t left_size, uint64_t right_size, int* condition_mode, int num_keys) {
+    CHECK_ERROR();
+    if (left_size == 0 || right_size == 0) {
+        uint64_t* h_count = new uint64_t[1];
+        h_count[0] = 0;
+        count = h_count;
+        printf("N is 0\n");
+        return;
+    }
+    printf("Launching Nested Loop Join Kernel for uint8_t\n");
+    int tile_items = BLOCK_THREADS * 1;
+    GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+    cudaMemset(count, 0, sizeof(uint64_t));
+    uint64_t* offset_each_thread = gpuBufferManager->customCudaMalloc<uint64_t>(((left_size + tile_items - 1)/tile_items) * BLOCK_THREADS, 0, 0);
+    
+    CHECK_ERROR();
+    // For now, use the regular version until we add full string support
+    nested_loop_join_count<uint8_t, BLOCK_THREADS, 1><<<(left_size + tile_items - 1)/tile_items, BLOCK_THREADS>>>(left_data[0], right_data[0], 
+            offset_each_thread, (unsigned long long*) count, left_size, right_size, condition_mode[0]);
+    CHECK_ERROR();
+    cudaDeviceSynchronize();
+
+    uint64_t* h_count = new uint64_t[1];
+    cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+    
+    if (h_count[0] == 0) {
+        printf("Warning: No matches found in join\n");
+        count = h_count;
+        return;
+    }
+    
+    printf("Count: %lu\n", h_count[0]);
+
+    row_ids_left = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
+    row_ids_right = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
+    nested_loop_join<uint8_t, BLOCK_THREADS, 1><<<(left_size + tile_items - 1)/tile_items, BLOCK_THREADS>>>(left_data[0], right_data[0], 
+            offset_each_thread, row_ids_left, row_ids_right, left_size, right_size, condition_mode[0]);
+    CHECK_ERROR();
+    cudaDeviceSynchronize();
+    count = h_count;
+}
+
+template
+__global__ void nested_loop_join_count<double, BLOCK_THREADS, 1>(double *left_keys, double* right_keys, uint64_t *offset_each_thread, 
+            unsigned long long* total_count, uint64_t left_size, uint64_t right_size, int condition_mode);
+
+template
+__global__ void nested_loop_join_count<uint64_t, BLOCK_THREADS, 1>(uint64_t *left_keys, uint64_t* right_keys, uint64_t *offset_each_thread, 
+            unsigned long long* total_count, uint64_t left_size, uint64_t right_size, int condition_mode);
+
+template
+__global__ void nested_loop_join_count<int32_t, BLOCK_THREADS, 1>(int32_t *left_keys, int32_t* right_keys, uint64_t *offset_each_thread, 
+            unsigned long long* total_count, uint64_t left_size, uint64_t right_size, int condition_mode);
+
+template
+__global__ void nested_loop_join_count<float, BLOCK_THREADS, 1>(float *left_keys, float* right_keys, uint64_t *offset_each_thread, 
+            unsigned long long* total_count, uint64_t left_size, uint64_t right_size, int condition_mode);
+
+template
+__global__ void nested_loop_join<double, BLOCK_THREADS, 1>(double *left_keys, double* right_keys, uint64_t *offset_each_thread, uint64_t *row_ids_left, uint64_t *row_ids_right,
+            uint64_t left_size, uint64_t right_size, int condition_mode);
+
+template
+__global__ void nested_loop_join<uint64_t, BLOCK_THREADS, 1>(uint64_t *left_keys, uint64_t* right_keys, uint64_t *offset_each_thread, uint64_t *row_ids_left, uint64_t *row_ids_right,
+            uint64_t left_size, uint64_t right_size, int condition_mode);
+
+template
+__global__ void nested_loop_join<int32_t, BLOCK_THREADS, 1>(int32_t *left_keys, int32_t* right_keys, uint64_t *offset_each_thread, uint64_t *row_ids_left, uint64_t *row_ids_right,
+            uint64_t left_size, uint64_t right_size, int condition_mode);
+
+template
+__global__ void nested_loop_join<float, BLOCK_THREADS, 1>(float *left_keys, float* right_keys, uint64_t *offset_each_thread, uint64_t *row_ids_left, uint64_t *row_ids_right,
+            uint64_t left_size, uint64_t right_size, int condition_mode);
+
 template
 void nestedLoopJoin<double>(double** left_data, double** right_data, uint64_t* &row_ids_left, uint64_t* &row_ids_right, uint64_t* &count, uint64_t left_size, uint64_t right_size, int* condition_mode, int num_keys);
 
 template
 void nestedLoopJoin<uint64_t>(uint64_t** left_data, uint64_t** right_data, uint64_t* &row_ids_left, uint64_t* &row_ids_right, uint64_t* &count, uint64_t left_size, uint64_t right_size, int* condition_mode, int num_keys);
+
+template
+void nestedLoopJoin<float>(float** left_data, float** right_data, uint64_t* &row_ids_left, uint64_t* &row_ids_right, uint64_t* &count, uint64_t left_size, uint64_t right_size, int* condition_mode, int num_keys);
+
+template
+void nestedLoopJoin<int32_t>(int32_t** left_data, int32_t** right_data, uint64_t* &row_ids_left, uint64_t* &row_ids_right, uint64_t* &count, uint64_t left_size, uint64_t right_size, int* condition_mode, int num_keys);
 
 } // namespace duckdb
