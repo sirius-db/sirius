@@ -98,6 +98,19 @@ void GPUBufferManager::ResetBuffer() {
     }
 }
 
+void GPUBufferManager::ResetCache() {
+    for (int gpu = 0; gpu < NUM_GPUS; gpu++) {
+        gpuCachingPointer[gpu] = 0;
+    }
+    cpuProcessingPointer = 0;
+    for (auto it = tables.begin(); it != tables.end(); it++) {
+        GPUIntermediateRelation* table = it->second;
+        for (int col = 0; col < table->columns.size(); col++) {
+            table->columns[col] = nullptr;
+        }
+    }
+}
+
 template <typename T>
 T*
 GPUBufferManager::customCudaMalloc(size_t size, int gpu, bool caching) {
