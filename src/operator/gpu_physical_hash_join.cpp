@@ -12,6 +12,7 @@ void
 ResolveTypeProbeExpression(GPUColumn** &probe_keys, uint64_t* &count, uint64_t* &row_ids_left, uint64_t* &row_ids_right, 
 		unsigned long long* ht, uint64_t ht_len, const vector<JoinCondition> &conditions, JoinType join_type,
 		bool unique_build_keys, GPUBufferManager* gpuBufferManager) {
+
 	int num_keys = conditions.size();
 	uint8_t** probe_data = new uint8_t*[num_keys];
 
@@ -32,27 +33,58 @@ ResolveTypeProbeExpression(GPUColumn** &probe_keys, uint64_t* &count, uint64_t* 
 	}
 
 	//TODO: Need to handle special case for unique keys for better performance
+
+	// determine if 32 bit
+	auto col_type = probe_keys[0]->data_wrapper.type;
+	bool is_32_bit = false;
+	if (col_type == ColumnType::INT32 || col_type == ColumnType::FLOAT32) {
+	    is_32_bit = true;
+	}
+
+	printf("%d", unique_build_keys);
 	if (join_type == JoinType::INNER) {
 		if (unique_build_keys) {
-			probeHashTableSingleMatch(probe_data, ht, ht_len, row_ids_left, row_ids_right, count, size, condition_mode, num_keys, 0);
+			probeHashTableSingleMatch(probe_data, ht, ht_len,
+			                          row_ids_left, row_ids_right,
+			                          count, size, condition_mode, num_keys,
+			                          0, is_32_bit);
 		} else {
-			probeHashTable(probe_data, ht, ht_len, row_ids_left, row_ids_right, count, size, condition_mode, num_keys, false);
+			probeHashTable(probe_data, ht, ht_len,
+			               row_ids_left, row_ids_right, count,
+			               size, condition_mode, num_keys,
+			               false, is_32_bit);
 		}
 	} else if (join_type == JoinType::SEMI) {
-		probeHashTableSingleMatch(probe_data, ht, ht_len, row_ids_left, row_ids_right, count, size, condition_mode, num_keys, 1);
+		probeHashTableSingleMatch(probe_data, ht, ht_len,
+		                          row_ids_left, row_ids_right,
+		                          count, size, condition_mode, num_keys,
+		                          1, is_32_bit);
 	} else if (join_type == JoinType::ANTI) {
-		probeHashTableSingleMatch(probe_data, ht, ht_len, row_ids_left, row_ids_right, count, size, condition_mode, num_keys, 2);
+		probeHashTableSingleMatch(probe_data, ht, ht_len,
+		                          row_ids_left, row_ids_right,
+		                          count, size, condition_mode, num_keys,
+		                          2, is_32_bit);
 	} else if (join_type == JoinType::RIGHT) {
 		if (unique_build_keys) {
-			probeHashTableSingleMatch(probe_data, ht, ht_len, row_ids_left, row_ids_right, count, size, condition_mode, num_keys, 3);
+			probeHashTableSingleMatch(probe_data, ht, ht_len,
+			                          row_ids_left, row_ids_right,
+			                          count, size, condition_mode, num_keys,
+			                          3, is_32_bit);
 		} else {
-			probeHashTable(probe_data, ht, ht_len, row_ids_left, row_ids_right, count, size, condition_mode, num_keys, true);
+			probeHashTable(probe_data, ht, ht_len,
+			               row_ids_left, row_ids_right, count,
+			               size, condition_mode, num_keys,
+			               true, is_32_bit);
 		}
 	} else if (join_type == JoinType::RIGHT_SEMI || join_type == JoinType::RIGHT_ANTI) {
 		if (unique_build_keys) {
-			probeHashTableRightSemiAntiSingleMatch(probe_data, ht, ht_len, size, condition_mode, num_keys);
+			probeHashTableRightSemiAntiSingleMatch(probe_data, ht, ht_len,
+			                                       size, condition_mode,
+			                                       num_keys, is_32_bit);
 		} else {
-			probeHashTableRightSemiAnti(probe_data, ht, ht_len, size, condition_mode, num_keys);
+			probeHashTableRightSemiAnti(probe_data, ht, ht_len,
+			                            size, condition_mode,
+			                            num_keys, is_32_bit);
 		}
 	} else {
 		throw NotImplementedException("Unsupported join type");
@@ -64,13 +96,15 @@ HandleProbeExpression(GPUColumn** &probe_keys, uint64_t* &count, uint64_t* &row_
 		unsigned long long* ht, uint64_t ht_len, const vector<JoinCondition> &conditions, JoinType join_type, 
 		bool unique_build_keys, GPUBufferManager* gpuBufferManager) {
     switch(probe_keys[0]->data_wrapper.type) {
-      case ColumnType::INT64:
-		ResolveTypeProbeExpression(probe_keys, count, row_ids_left, row_ids_right, ht, ht_len, conditions, join_type, unique_build_keys, gpuBufferManager);
-		break;
-      case ColumnType::FLOAT64:
-	  	ResolveTypeProbeExpression(probe_keys, count, row_ids_left, row_ids_right, ht, ht_len, conditions, join_type, unique_build_keys, gpuBufferManager);
-		break;
-	  	// throw NotImplementedException("Unsupported column type");
+    	case ColumnType::INT64:
+    	case ColumnType::FLOAT64:
+			ResolveTypeProbeExpression(probe_keys, count, row_ids_left, row_ids_right, ht, ht_len, conditions, join_type, unique_build_keys, gpuBufferManager);
+        	break;
+
+    	case ColumnType::INT32:
+    	case ColumnType::FLOAT32:
+			ResolveTypeProbeExpression(probe_keys, count, row_ids_left, row_ids_right, ht, ht_len, conditions, join_type, unique_build_keys, gpuBufferManager);
+        	break;
       default:
         throw NotImplementedException("Unsupported column type");
     }
@@ -88,6 +122,13 @@ ResolveTypeMarkExpression(GPUColumn** &probe_keys, uint8_t* &output,
 	}
 	size_t size = probe_keys[0]->column_length;
 
+	// is 32 bit
+	auto col_type = probe_keys[0]->data_wrapper.type;
+	bool is_32_bit = false;
+	if (col_type == ColumnType::INT32 || col_type == ColumnType::FLOAT32) {
+	    is_32_bit = true;
+	}
+
 	int* condition_mode = new int[num_keys];
 	for (int key = 0; key < num_keys; key++) {
 		if (conditions[key].comparison == ExpressionType::COMPARE_EQUAL || conditions[key].comparison == ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
@@ -101,7 +142,7 @@ ResolveTypeMarkExpression(GPUColumn** &probe_keys, uint8_t* &output,
 		}
 	}
 
-	probeHashTableMark(probe_data, ht, ht_len, output, size, condition_mode, num_keys);
+	probeHashTableMark(probe_data, ht, ht_len, output, size, condition_mode, num_keys, is_32_bit);
 }
 
 void
@@ -111,7 +152,12 @@ HandleMarkExpression(GPUColumn** &probe_keys, uint8_t* &output,
       case ColumnType::INT64:
 		ResolveTypeMarkExpression(probe_keys, output, ht, ht_len, conditions, gpuBufferManager);
 		break;
+	  case ColumnType::INT32:
+		ResolveTypeMarkExpression(probe_keys, output, ht, ht_len, conditions, gpuBufferManager);
+		break;
       case ColumnType::FLOAT64:
+	  	throw NotImplementedException("Unsupported column type");
+	  case ColumnType::FLOAT32:
 	  	throw NotImplementedException("Unsupported column type");
       default:
         throw NotImplementedException("Unsupported column type");
@@ -142,11 +188,18 @@ ResolveTypeBuildExpression(GPUColumn** &build_keys, unsigned long long* ht, uint
 		}
 	}
 
+	//is 32 bit?
+	auto col_type = build_keys[0]->data_wrapper.type;
+	bool is_32_bit = false;
+	if (col_type == ColumnType::INT32 || col_type == ColumnType::FLOAT32) {
+	    is_32_bit = true;
+	}
+
 	if (join_type == JoinType::INNER || join_type == JoinType::SEMI || join_type == JoinType::MARK) {
-		buildHashTable(build_data, ht, ht_len, size, condition_mode, num_keys, 0);
+		buildHashTable(build_data, ht, ht_len, size, condition_mode, num_keys, 0, is_32_bit);
 		// buildHashTableOri<uint64_t>(build_data[0], ht, ht_len, size, 0);
 	} else if (join_type == JoinType::RIGHT || join_type == JoinType::RIGHT_SEMI || join_type == JoinType::RIGHT_ANTI) {
-		buildHashTable(build_data, ht, ht_len, size, condition_mode, num_keys, 1);
+		buildHashTable(build_data, ht, ht_len, size, condition_mode, num_keys, 1, is_32_bit);
 	} else {
 		throw NotImplementedException("Unsupported join type");
 	}
@@ -157,11 +210,13 @@ HandleBuildExpression(GPUColumn** &build_keys, unsigned long long* ht, uint64_t 
 	const vector<JoinCondition> &conditions, JoinType join_type, GPUBufferManager* gpuBufferManager) {
     switch(build_keys[0]->data_wrapper.type) {
       case ColumnType::INT64:
-		ResolveTypeBuildExpression(build_keys, ht, ht_len, conditions, join_type, gpuBufferManager);
-		break;
       case ColumnType::FLOAT64:
-	  	ResolveTypeBuildExpression(build_keys, ht, ht_len, conditions, join_type, gpuBufferManager);
-		break;
+        ResolveTypeBuildExpression(build_keys, ht, ht_len, conditions, join_type, gpuBufferManager);
+        break;
+      case ColumnType::INT32:
+      case ColumnType::FLOAT32:
+        ResolveTypeBuildExpression(build_keys, ht, ht_len, conditions, join_type, gpuBufferManager);
+        break;
       default:
         throw NotImplementedException("Unsupported column type");
     }
@@ -356,6 +411,7 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 	//probing hash table
 	printf("Probing hash table\n");
 	if (join_type == JoinType::SEMI || join_type == JoinType::ANTI || join_type == JoinType::INNER || join_type == JoinType::OUTER || join_type == JoinType::RIGHT) {
+		printf("In Semi Anti inner Outer ");
 		count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
 		HandleProbeExpression(probe_key, count, row_ids_left, row_ids_right, gpu_hash_table, ht_len, conditions, join_type, unique_build_keys, gpuBufferManager);
 		if (count[0] == 0) throw NotImplementedException("No match found");
@@ -454,7 +510,7 @@ GPUPhysicalHashJoin::Sink(GPUIntermediateRelation &input_relation) const {
         auto join_key_index = condition.right->Cast<BoundReferenceExpression>().index;
 		// ht_len = input_relation.columns[join_key_index]->column_length * 2;
         printf("Reading join key for building hash table from index %ld\n", join_key_index);
-		if (input_relation.columns[join_key_index]->is_unique) {
+		if (input_relation.columns[join_key_index]->is_unique) { 
 			unique_build_keys = true;
 		}
 		build_keys[cond_idx] = HandleMaterializeExpression(input_relation.columns[join_key_index], condition.right->Cast<BoundReferenceExpression>(), gpuBufferManager);
