@@ -92,8 +92,8 @@ __global__ void q19_filter(T *p_brand, V *l_quantity, T *p_size, T* p_container,
 }
 
 template <typename T, int B, int I>
-__global__ void q16_filter(T *p_brand, T *p_type, T *p_size,
-    T p_brand_val, T p_type_val1, T p_type_val2, T *p_size_val,
+__global__ void q16_filter(T *p_type, T *p_size,
+    T p_type_val1, T p_type_val2, T *p_size_val,
     uint64_t *row_ids, unsigned long long* count, uint64_t N, int is_count) {
 
     typedef cub::BlockScan<int, B> BlockScanInt;
@@ -103,7 +103,7 @@ __global__ void q16_filter(T *p_brand, T *p_type, T *p_size,
         typename BlockScanInt::TempStorage scan;
     } temp_storage;
 
-    T item_p_brand[I];
+    // T item_p_brand[I];
     T item_p_type[I];
     T item_p_size[I];
     int selection_flags[I];
@@ -130,10 +130,13 @@ __global__ void q16_filter(T *p_brand, T *p_type, T *p_size,
     #pragma unroll
     for (int ITEM = 0; ITEM < I; ++ITEM) {
         if (threadIdx.x + ITEM * B < num_tile_items) {
-            item_p_brand[ITEM] = p_brand[tile_offset + threadIdx.x + ITEM * B];
+            // item_p_brand[ITEM] = p_brand[tile_offset + threadIdx.x + ITEM * B];
             item_p_type[ITEM] = p_type[tile_offset + threadIdx.x + ITEM * B];
             item_p_size[ITEM] = p_size[tile_offset + threadIdx.x + ITEM * B];
-            selection_flags[ITEM] = (item_p_brand[ITEM] != p_brand_val) && ((item_p_type[ITEM] < p_type_val1) || (item_p_type[ITEM] >= p_type_val2)) && \
+            // selection_flags[ITEM] = (item_p_brand[ITEM] != p_brand_val) && ((item_p_type[ITEM] < p_type_val1) || (item_p_type[ITEM] >= p_type_val2)) && \
+            //                 ((item_p_size[ITEM] == p_size_val[0] || item_p_size[ITEM] == p_size_val[1] || item_p_size[ITEM] == p_size_val[2] || item_p_size[ITEM] == p_size_val[3]) || \
+            //                 (item_p_size[ITEM] == p_size_val[4] || item_p_size[ITEM] == p_size_val[5] || item_p_size[ITEM] == p_size_val[6] || item_p_size[ITEM] == p_size_val[7]));
+            selection_flags[ITEM] = ((item_p_type[ITEM] < p_type_val1) || (item_p_type[ITEM] >= p_type_val2)) && \
                             ((item_p_size[ITEM] == p_size_val[0] || item_p_size[ITEM] == p_size_val[1] || item_p_size[ITEM] == p_size_val[2] || item_p_size[ITEM] == p_size_val[3]) || \
                             (item_p_size[ITEM] == p_size_val[4] || item_p_size[ITEM] == p_size_val[5] || item_p_size[ITEM] == p_size_val[6] || item_p_size[ITEM] == p_size_val[7]));
             if(selection_flags[ITEM]) t_count++;
@@ -438,9 +441,14 @@ __global__ void q2_filter(T *p_type, T p_type_val,
 template
 __global__ void q19_filter<uint64_t, double, BLOCK_THREADS, ITEMS_PER_THREAD>(uint64_t *p_brand, double *l_quantity, uint64_t *p_size, uint64_t* p_container, uint64_t *p_brand_val, double *l_quantity_val, uint64_t *p_size_val, uint64_t* p_container_val, 
                                 uint64_t *row_ids, unsigned long long* count, uint64_t N, int is_count);
+// template
+// __global__ void q16_filter<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD>(uint64_t *p_brand, uint64_t *p_type, uint64_t *p_size, uint64_t p_brand_val, uint64_t p_type_val1, uint64_t p_type_val2, uint64_t *p_size_val, 
+//                                 uint64_t *row_ids, unsigned long long* count, uint64_t N, int is_count);
+
 template
-__global__ void q16_filter<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD>(uint64_t *p_brand, uint64_t *p_type, uint64_t *p_size, uint64_t p_brand_val, uint64_t p_type_val1, uint64_t p_type_val2, uint64_t *p_size_val, 
+__global__ void q16_filter<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD>(uint64_t *p_type, uint64_t *p_size, uint64_t p_type_val1, uint64_t p_type_val2, uint64_t *p_size_val, 
                                 uint64_t *row_ids, unsigned long long* count, uint64_t N, int is_count);
+
 template
 __global__ void q12_filter<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD>(uint64_t *l_commitdate, uint64_t *l_receiptdate, uint64_t *l_shipdate, uint64_t *l_shipmode, uint64_t l_shipmode_val1, uint64_t l_shipmode_val2,
                                 uint64_t *row_ids, unsigned long long* count, uint64_t N, int is_count);
@@ -487,7 +495,37 @@ void q19FilterExpression(uint64_t *p_brand, double *l_quantity, uint64_t *p_size
     printf("Count: %lu\n", h_count[0]);
 }
 
-void q16FilterExpression(uint64_t *p_brand, uint64_t *p_type, uint64_t *p_size, uint64_t p_brand_val, uint64_t p_type_val1, uint64_t p_type_val2, uint64_t *p_size_val, uint64_t* &row_ids, uint64_t* &count, uint64_t N) {
+// void q16FilterExpression(uint64_t *p_brand, uint64_t *p_type, uint64_t *p_size, uint64_t p_brand_val, uint64_t p_type_val1, uint64_t p_type_val2, uint64_t *p_size_val, uint64_t* &row_ids, uint64_t* &count, uint64_t N) {
+//     CHECK_ERROR();
+//     if (N == 0) {
+//         uint64_t* h_count = new uint64_t[1];
+//         h_count[0] = 0;
+//         count = h_count;
+//         printf("N is 0\n");
+//         return;
+//     }
+//     printf("Launching Q16 Filter Kernel\n");
+
+//     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+//     uint64_t* d_p_size_val = gpuBufferManager->customCudaMalloc<uint64_t>(8, 0, 0);
+//     callCudaMemcpyHostToDevice<uint64_t>(d_p_size_val, p_size_val, 8, 0);
+
+//     cudaMemset(count, 0, sizeof(uint64_t));
+//     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
+//     q16_filter<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(p_brand, p_type, p_size, p_brand_val, p_type_val1, p_type_val2, d_p_size_val, row_ids, (unsigned long long*) count, N, 1);
+//     CHECK_ERROR();
+//     uint64_t* h_count = new uint64_t[1];
+//     cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+//     row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
+//     cudaMemset(count, 0, sizeof(uint64_t));
+//     q16_filter<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(p_brand, p_type, p_size, p_brand_val, p_type_val1, p_type_val2, d_p_size_val, row_ids, (unsigned long long*) count, N, 0);
+//     CHECK_ERROR();
+//     cudaDeviceSynchronize();
+//     count = h_count;
+//     printf("Count: %lu\n", h_count[0]);
+// }
+
+void q16FilterExpression(uint64_t *p_type, uint64_t *p_size,  uint64_t p_type_val1, uint64_t p_type_val2, uint64_t *p_size_val, uint64_t* &row_ids, uint64_t* &count, uint64_t N) {
     CHECK_ERROR();
     if (N == 0) {
         uint64_t* h_count = new uint64_t[1];
@@ -504,13 +542,13 @@ void q16FilterExpression(uint64_t *p_brand, uint64_t *p_type, uint64_t *p_size, 
 
     cudaMemset(count, 0, sizeof(uint64_t));
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
-    q16_filter<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(p_brand, p_type, p_size, p_brand_val, p_type_val1, p_type_val2, d_p_size_val, row_ids, (unsigned long long*) count, N, 1);
+    q16_filter<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(p_type, p_size, p_type_val1, p_type_val2, d_p_size_val, row_ids, (unsigned long long*) count, N, 1);
     CHECK_ERROR();
     uint64_t* h_count = new uint64_t[1];
     cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
     row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
     cudaMemset(count, 0, sizeof(uint64_t));
-    q16_filter<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(p_brand, p_type, p_size, p_brand_val, p_type_val1, p_type_val2, d_p_size_val, row_ids, (unsigned long long*) count, N, 0);
+    q16_filter<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(p_type, p_size, p_type_val1, p_type_val2, d_p_size_val, row_ids, (unsigned long long*) count, N, 0);
     CHECK_ERROR();
     cudaDeviceSynchronize();
     count = h_count;

@@ -130,37 +130,63 @@ GPUExpressionExecutor::HandlingSpecificFilter(GPUIntermediateRelation& input_rel
         } else if (expression.type == ExpressionType::CONJUNCTION_AND) {
             auto &expr = expression.Cast<BoundConjunctionExpression>();
             //Q16 HACK!!!
-            if (expr.children.size() == 3 && expr.children[0]->type == ExpressionType::COMPARE_NOTEQUAL && expr.children[1]->type == ExpressionType::CONJUNCTION_OR && expr.children[2]->type == ExpressionType::COMPARE_IN) {
+            // if (expr.children.size() == 3 && expr.children[0]->type == ExpressionType::COMPARE_NOTEQUAL && expr.children[1]->type == ExpressionType::CONJUNCTION_OR && expr.children[2]->type == ExpressionType::COMPARE_IN) {
+            //     printf("Filter expression of Q16\n");
+            //     string t = "((P_BRAND != 45) AND ((P_TYPE < 65) OR (P_TYPE >= 70)) AND (P_SIZE IN (49, 14, 23, 45, 19, 3, 36, 9)))";
+            //     if (!expression.ToString().compare(t)) {
+            //         BoundComparisonExpression& first = expr.children[0]->Cast<BoundComparisonExpression>();
+            //         auto p_brand = first.left->Cast<BoundReferenceExpression>().index;
+            //         BoundConjunctionExpression& second = expr.children[1]->Cast<BoundConjunctionExpression>();
+            //         BoundComparisonExpression& second_temp = second.children[0]->Cast<BoundComparisonExpression>();
+            //         auto p_type = second_temp.left->Cast<BoundReferenceExpression>().index;
+            //         BoundOperatorExpression& third = expr.children[2]->Cast<BoundOperatorExpression>();
+            //         auto p_size = third.children[0]->Cast<BoundReferenceExpression>().index;
+
+            //         uint64_t p_brand_val = 45;
+            //         uint64_t p_type_val[2] = {65, 70};
+            //         uint64_t p_size_val[8] = {49, 14, 23, 45, 19, 3, 36, 9};
+
+            //         GPUColumn* materialized_brand = HandleMaterializeExpression(input_relation.columns[p_brand], first.left->Cast<BoundReferenceExpression>(), gpuBufferManager);
+            //         GPUColumn* materialized_type = HandleMaterializeExpression(input_relation.columns[p_type], second_temp.left->Cast<BoundReferenceExpression>(), gpuBufferManager);
+            //         GPUColumn* materialized_size = HandleMaterializeExpression(input_relation.columns[p_size], third.children[0]->Cast<BoundReferenceExpression>(), gpuBufferManager);
+
+            //         count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+            //         uint64_t* a = reinterpret_cast<uint64_t*> (materialized_brand->data_wrapper.data);
+            //         uint64_t* b = reinterpret_cast<uint64_t*> (materialized_type->data_wrapper.data);
+            //         uint64_t* c = reinterpret_cast<uint64_t*> (materialized_size->data_wrapper.data);
+
+            //         size_t size = materialized_brand->column_length;
+            //         q16FilterExpression(a, b, c, p_brand_val, p_type_val[0], p_type_val[1], p_size_val, comparison_idx, count, size);
+            //     }
+
+            // }
+
+            //Q16 HACK!!!
+            if (expr.children.size() == 2 && expr.children[0]->type == ExpressionType::CONJUNCTION_OR && expr.children[1]->type == ExpressionType::COMPARE_IN) {
                 printf("Filter expression of Q16\n");
-                string t = "((P_BRAND != 45) AND ((P_TYPE < 65) OR (P_TYPE >= 70)) AND (P_SIZE IN (49, 14, 23, 45, 19, 3, 36, 9)))";
+                string t = "(((P_TYPE < 65) OR (P_TYPE >= 70)) AND (P_SIZE IN (49, 14, 23, 45, 19, 3, 36, 9)))";
                 if (!expression.ToString().compare(t)) {
-                    BoundComparisonExpression& first = expr.children[0]->Cast<BoundComparisonExpression>();
-                    auto p_brand = first.left->Cast<BoundReferenceExpression>().index;
-                    BoundConjunctionExpression& second = expr.children[1]->Cast<BoundConjunctionExpression>();
+                    BoundConjunctionExpression& second = expr.children[0]->Cast<BoundConjunctionExpression>();
                     BoundComparisonExpression& second_temp = second.children[0]->Cast<BoundComparisonExpression>();
                     auto p_type = second_temp.left->Cast<BoundReferenceExpression>().index;
-                    BoundOperatorExpression& third = expr.children[2]->Cast<BoundOperatorExpression>();
+                    BoundOperatorExpression& third = expr.children[1]->Cast<BoundOperatorExpression>();
                     auto p_size = third.children[0]->Cast<BoundReferenceExpression>().index;
 
-                    uint64_t p_brand_val = 45;
                     uint64_t p_type_val[2] = {65, 70};
                     uint64_t p_size_val[8] = {49, 14, 23, 45, 19, 3, 36, 9};
 
-                    GPUColumn* materialized_brand = HandleMaterializeExpression(input_relation.columns[p_brand], first.left->Cast<BoundReferenceExpression>(), gpuBufferManager);
                     GPUColumn* materialized_type = HandleMaterializeExpression(input_relation.columns[p_type], second_temp.left->Cast<BoundReferenceExpression>(), gpuBufferManager);
                     GPUColumn* materialized_size = HandleMaterializeExpression(input_relation.columns[p_size], third.children[0]->Cast<BoundReferenceExpression>(), gpuBufferManager);
 
                     count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
-                    uint64_t* a = reinterpret_cast<uint64_t*> (materialized_brand->data_wrapper.data);
-                    uint64_t* b = reinterpret_cast<uint64_t*> (materialized_type->data_wrapper.data);
-                    uint64_t* c = reinterpret_cast<uint64_t*> (materialized_size->data_wrapper.data);
+                    uint64_t* a = reinterpret_cast<uint64_t*> (materialized_type->data_wrapper.data);
+                    uint64_t* b = reinterpret_cast<uint64_t*> (materialized_size->data_wrapper.data);
 
-                    size_t size = materialized_brand->column_length;
-                    q16FilterExpression(a, b, c, p_brand_val, p_type_val[0], p_type_val[1], p_size_val, comparison_idx, count, size);
+                    size_t size = materialized_type->column_length;
+                    q16FilterExpression(a, b, p_type_val[0], p_type_val[1], p_size_val, comparison_idx, count, size);
                 }
 
             }
-
 
             //Q12 HACK!!!
             if (expr.children.size() == 3 && expr.children[0]->type == ExpressionType::COMPARE_LESSTHAN && expr.children[1]->type == ExpressionType::COMPARE_LESSTHAN && expr.children[2]->type == ExpressionType::COMPARE_IN) {
