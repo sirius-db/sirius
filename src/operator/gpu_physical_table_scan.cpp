@@ -440,7 +440,7 @@ GPUPhysicalTableScan::GetDataDuckDB(ExecutionContext &exec_context) {
         already_cached[col] = gpuBufferManager->checkIfColumnCached(table_name, names[column_ids[col].GetPrimaryIndex()]);
         if (!already_cached[col]) {
           all_cached = false;
-          gpuBufferManager->createTableAndColumnInGPU(catalog_table, exec_context.client, table_name, names[column_ids[col].GetPrimaryIndex()]);
+          // gpuBufferManager->createTableAndColumnInGPU(catalog_table, exec_context.client, table_name, names[column_ids[col].GetPrimaryIndex()]);
         } 
     }
 
@@ -469,7 +469,7 @@ GPUPhysicalTableScan::GetDataDuckDB(ExecutionContext &exec_context) {
         has_more_output = chunk->size() > 0;
         // get the size of each column in the chunk
         for (int col = 0; col < column_ids.size(); col++) {
-          if (!already_cached[col]) {
+          // if (!already_cached[col]) {
             if (chunk->data[col].GetType() == LogicalType::VARCHAR) {
               Vector string_vector = chunk->data[col];
               string_vector.Flatten(chunk->size());
@@ -480,7 +480,7 @@ GPUPhysicalTableScan::GetDataDuckDB(ExecutionContext &exec_context) {
             } else {
               column_size[col] += chunk->data[col].GetAllocationSize(chunk->size());
             }
-          }
+          // }
         }
         collection->Append(*chunk);
       } while (has_more_output);
@@ -493,11 +493,22 @@ GPUPhysicalTableScan::GetDataDuckDB(ExecutionContext &exec_context) {
           total_size += column_size[col];
         }
       }
-      if (gpuBufferManager->gpuCachingPointer[0] + total_size > gpuBufferManager->cache_size_per_gpu) {
+
+      if (gpuBufferManager->gpuCachingPointer[0] + total_size >= gpuBufferManager->cache_size_per_gpu) {
         if (total_size > gpuBufferManager->cache_size_per_gpu) {
           throw InvalidInputException("Total size of columns to be cached is greater than the cache size");
         }
         gpuBufferManager->ResetCache();
+        for (int col = 0; col < column_ids.size(); col++) {
+          already_cached[col] = false;
+          gpuBufferManager->createTableAndColumnInGPU(catalog_table, exec_context.client, table_name, names[column_ids[col].GetPrimaryIndex()]);
+        }
+      } else {
+          for (int col = 0; col < column_ids.size(); col++) {
+              if (!already_cached[col]) {
+                gpuBufferManager->createTableAndColumnInGPU(catalog_table, exec_context.client, table_name, names[column_ids[col].GetPrimaryIndex()]);
+              } 
+          }
       }
 
       ScanDataDuckDB(gpuBufferManager, table_name);
@@ -569,9 +580,9 @@ GPUPhysicalTableScan::ScanDataDuckDB(GPUBufferManager* gpuBufferManager, string 
             if (scanned_types[col] == LogicalType::VARCHAR) {
               if (column_size[col] != offset_ptr[col][collection->Count()]) {
                 throw InvalidInputException("Column size mismatch");
-            }
-            callCudaMemcpyHostToDevice<uint8_t>(d_ptr[col], ptr[col], column_size[col], 0);
-            callCudaMemcpyHostToDevice<uint64_t>(d_offset_ptr[col], offset_ptr[col], collection->Count() + 1, 0);
+              }
+              callCudaMemcpyHostToDevice<uint8_t>(d_ptr[col], ptr[col], column_size[col], 0);
+              callCudaMemcpyHostToDevice<uint64_t>(d_offset_ptr[col], offset_ptr[col], collection->Count() + 1, 0);
             } else {
               callCudaMemcpyHostToDevice<uint8_t>(d_ptr[col], ptr[col], column_size[col], 0);
             }
@@ -582,16 +593,21 @@ GPUPhysicalTableScan::ScanDataDuckDB(GPUBufferManager* gpuBufferManager, string 
         if (!already_cached[col]) {
             auto up_column_name = names[column_ids[col].GetPrimaryIndex()];
             auto up_table_name = table_name;
+            printf("column name %s\n", up_column_name.c_str());
             transform(up_table_name.begin(), up_table_name.end(), up_table_name.begin(), ::toupper);
             transform(up_column_name.begin(), up_column_name.end(), up_column_name.begin(), ::toupper);
             auto column_it = find(gpuBufferManager->tables[up_table_name]->column_names.begin(), gpuBufferManager->tables[up_table_name]->column_names.end(), up_column_name);
             if (column_it == gpuBufferManager->tables[up_table_name]->column_names.end()) {
                 throw InvalidInputException("Column not found");
             }
+            printf("column name %s\n", up_column_name.c_str());
             int column_idx = column_it - gpuBufferManager->tables[up_table_name]->column_names.begin();
             ColumnType column_type = convertLogicalTypeToColumnType(scanned_types[col]);
+            printf("column name %s\n", up_column_name.c_str());
             gpuBufferManager->tables[up_table_name]->columns[column_idx]->column_length = collection->Count();
+            printf("column name %s\n", up_column_name.c_str());
             gpuBufferManager->tables[up_table_name]->length = collection->Count();
+            printf("column name %s\n", up_column_name.c_str());
             if (scanned_types[col] == LogicalType::VARCHAR) {
               gpuBufferManager->tables[up_table_name]->columns[column_idx]->data_wrapper = DataWrapper(column_type, d_ptr[col], d_offset_ptr[col], collection->Count(), column_size[col], true);
             } else {
