@@ -243,8 +243,22 @@ SiriusExtension::GPUProcessingSubstraitBind(ClientContext &context, TableFunctio
 	}
 	string serialized = input.inputs[0].GetValueUnsafe<string>();
 	bool is_json = input.inputs[1].GetValueUnsafe<bool>();
-	SubstraitToDuckDB transformer_s2d(result->conn->context, serialized, is_json);
-	result->plan = transformer_s2d.TransformPlan();
+
+	if (result->conn->context->transaction.IsAutoCommit()) {
+    result->conn->context->transaction.BeginTransaction();
+  }
+	try {
+		SubstraitToDuckDB transformer_s2d(result->conn->context, serialized, is_json);
+		result->plan = transformer_s2d.TransformPlan();
+	} catch (std::exception& e) {
+		if (result->conn->context->transaction.IsAutoCommit()) {
+			result->conn->context->transaction.Rollback(nullptr);
+		}
+		throw;
+	}
+	if (result->conn->context->transaction.IsAutoCommit()) {
+		result->conn->context->transaction.Commit();
+  }
 
 	if (USE_SIRIUS_FOR_SUBSTRAIT) {
 		auto relation_stmt = make_uniq<RelationStatement>(result->plan);
