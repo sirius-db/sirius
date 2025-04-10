@@ -98,6 +98,22 @@ void GPUBufferManager::ResetBuffer() {
     }
 }
 
+void GPUBufferManager::ResetCache() {
+    printf("Resetting cache\n");
+    for (int gpu = 0; gpu < NUM_GPUS; gpu++) {
+        gpuCachingPointer[gpu] = 0;
+    }
+    cpuProcessingPointer = 0;
+    for (auto it = tables.begin(); it != tables.end(); it++) {
+        GPUIntermediateRelation* table = it->second;
+        for (int col = 0; col < table->columns.size(); col++) {
+            table->columns[col] = nullptr;
+        }
+        table->column_names.clear();
+        table->column_names.resize(table->column_count);
+    }
+}
+
 template <typename T>
 T*
 GPUBufferManager::customCudaMalloc(size_t size, int gpu, bool caching) {
@@ -123,8 +139,8 @@ GPUBufferManager::customCudaMalloc(size_t size, int gpu, bool caching) {
         if (start + alloc >= processing_size_per_gpu) {
             throw InvalidInputException("Out of GPU processing memory");
         }
-        // printf("Allocating %d bytes at %d\n", alloc, start);
-        // printf("Current pointer %d\n", gpuProcessingPointer[gpu]);
+        // printf("Allocating %ld bytes at %d\n", alloc, start);
+        // printf("Current pointer %ld\n", gpuProcessingPointer[gpu]);
         T* ptr = reinterpret_cast<T*>(gpuProcessing[gpu] + start);
         if (reinterpret_cast<uintptr_t>(ptr) % alignof(double) != 0) {
             throw InvalidInputException("Memory is not properly aligned");
@@ -251,6 +267,8 @@ GPUBufferManager::allocateChunk(DataChunk &input){
             break;
         }
         case LogicalTypeId::VARCHAR: {
+            throw InvalidInputException("String type not supported");
+            //FIX TODO: Need to handle the case where the string is larger than 128 characters
             char* ptr_varchar = customCudaHostAlloc<char>(chunk_size * 128);
             ptr = reinterpret_cast<uint8_t*>(ptr_varchar);
             memcpy(ptr, input.data[0].GetData(), input.size() * sizeof(double));
@@ -482,8 +500,8 @@ GPUBufferManager::createTableAndColumnInGPU(Catalog& catalog, ClientContext& con
         auto up_column_name_copy = up_column_name;
         size_t column_id = table.GetColumnIndex(up_column_name_copy, false).index;
         createTable(up_table_name, table.GetTypes().size());
-        // printf("logical type %d %d %s\n", column_id, table.GetTypes()[column_id].id(), table.GetColumn(column_name).GetName().c_str());
-        ColumnType column_type = convertLogicalTypetoColumnType(table.GetColumn(up_column_name).GetType());
+        ColumnType column_type = convertLogicalTypeToColumnType(table.GetColumn(up_column_name).GetType());
+        printf("Creating column %s\n", up_column_name.c_str());
         createColumn(up_table_name, up_column_name, column_type, column_id, unique_columns);
     } else {
         throw InvalidInputException("Column '" + up_column_name + "' does not exist in table '" + up_table_name + "'");
@@ -500,6 +518,23 @@ GPUBufferManager::createTable(string up_table_name, size_t column_count) {
         table->names = up_table_name;
         tables[up_table_name] = table;
     }
+}
+
+bool
+GPUBufferManager::checkIfColumnCached(string table_name, string column_name) {
+    string up_column_name = column_name;
+    string up_table_name = table_name;
+    transform(up_table_name.begin(), up_table_name.end(), up_table_name.begin(), ::toupper);
+    transform(up_column_name.begin(), up_column_name.end(), up_column_name.begin(), ::toupper);
+    auto table_it = tables.find(up_table_name);
+    if (table_it == tables.end()) {
+        return false;
+    }
+    auto column_it = find(tables[table_name]->column_names.begin(), tables[table_name]->column_names.end(), up_column_name);
+    if (column_it == tables[up_table_name]->column_names.end()) {
+        return false;
+    }
+    return true;
 }
 
 void

@@ -23,7 +23,7 @@ public:
 	//! Duplicate eliminated join scan dependencies
 	reference_map_t<const GPUPhysicalOperator, reference<GPUPipeline>> delim_join_dependencies;
 	//! Materialized CTE scan dependencies
-	// reference_map_t<const GPUPhysicalOperator, reference<GPUPipeline>> cte_dependencies;
+	reference_map_t<const GPUPhysicalOperator, reference<GPUPipeline>> cte_dependencies;
 
 public:
 	void SetPipelineSource(GPUPipeline &pipeline, GPUPhysicalOperator &op);

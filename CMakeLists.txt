@@ -11,6 +11,7 @@ endif()
 set(CMAKE_CUDA_ARCHITECTURES 75)
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -lcuda -lcudart -lcupti -lcurand -lcudadevrt --expt-extended-lambda --expt-relaxed-constexpr -rdc=true")
 # SET(CMAKE_CXX_FLAGS  "${CMAKE_CXX_FLAGS} -lcudart -lcupti -lcuda")
+set(ENV{SKIP_SUBSTRAIT_C_TESTS} ON)
 
 set(EXTENSION_NAME ${TARGET_NAME}_extension)
 set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)

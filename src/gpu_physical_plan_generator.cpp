@@ -13,24 +13,23 @@
 
 namespace duckdb {
 
-class DependencyExtractor : public LogicalOperatorVisitor {
-public:
-	explicit DependencyExtractor(LogicalDependencyList &dependencies) : dependencies(dependencies) {
-	}
+// class DependencyExtractor : public LogicalOperatorVisitor {
+// public:
+// 	explicit DependencyExtractor(LogicalDependencyList &dependencies) : dependencies(dependencies) {
+// 	}
 
-protected:
-	unique_ptr<Expression> VisitReplace(BoundFunctionExpression &expr, unique_ptr<Expression> *expr_ptr) override {
-		// extract dependencies from the bound function expression
-		// FIXME: Upgrading to DuckDB v1.2.0
-		// if (expr.function.dependency) {
-		// 	expr.function.dependency(expr, dependencies);
-		// }
-		return nullptr;
-	}
+// protected:
+// 	unique_ptr<Expression> VisitReplace(BoundFunctionExpression &expr, unique_ptr<Expression> *expr_ptr) override {
+// 		// extract dependencies from the bound function expression
+// 		if (expr.function.dependency) {
+// 			expr.function.dependency(expr, dependencies);
+// 		}
+// 		return nullptr;
+// 	}
 
-private:
-	LogicalDependencyList &dependencies;
-};
+// private:
+// 	LogicalDependencyList &dependencies;
+// };
 
 GPUPhysicalPlanGenerator::GPUPhysicalPlanGenerator(ClientContext &context, GPUContext& gpu_context) : 
 	context(context), gpu_context(gpu_context) {
@@ -54,8 +53,8 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::CreatePlan(unique_ptr<
 	profiler.EndPhase();
 
 	// extract dependencies from the logical plan
-	DependencyExtractor extractor(dependencies);
-	extractor.VisitOperator(*op);
+	// DependencyExtractor extractor(dependencies);
+	// extractor.VisitOperator(*op);
 
 	// then create the main physical plan
 	profiler.StartPhase(MetricsType::PHYSICAL_PLANNER_CREATE_PLAN);
@@ -192,12 +191,12 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::CreatePlan(LogicalOper
 	// case LogicalOperatorType::LOGICAL_RECURSIVE_CTE:
 	// 	plan = CreatePlan(op.Cast<LogicalRecursiveCTE>());
 	// 	break;
-	// case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
-	// 	plan = CreatePlan(op.Cast<LogicalMaterializedCTE>());
-	// 	break;
-	// case LogicalOperatorType::LOGICAL_CTE_REF:
-	// 	plan = CreatePlan(op.Cast<LogicalCTERef>());
-	// 	break;
+	case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
+		plan = CreatePlan(op.Cast<LogicalMaterializedCTE>());
+		break;
+	case LogicalOperatorType::LOGICAL_CTE_REF:
+		plan = CreatePlan(op.Cast<LogicalCTERef>());
+		break;
 	// case LogicalOperatorType::LOGICAL_EXPORT:
 	// 	plan = CreatePlan(op.Cast<LogicalExport>());
 	// 	break;

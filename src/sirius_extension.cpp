@@ -28,6 +28,7 @@
 
 namespace duckdb {
 
+<<<<<<< HEAD
 shared_ptr<Relation> GPUSubstraitPlanToDuckDBRel(Connection &conn, const string &serialized, bool json = false) {
 	if (conn.context->transaction.IsAutoCommit()) {
     conn.context->transaction.BeginTransaction();
@@ -47,6 +48,34 @@ shared_ptr<Relation> GPUSubstraitPlanToDuckDBRel(Connection &conn, const string 
   }
 	return plan;
 };
+=======
+struct GPUTableFunctionData : public TableFunctionData {
+	GPUTableFunctionData() = default;
+	shared_ptr<Relation> plan;
+	shared_ptr<GPUPreparedStatementData> gpu_prepared;
+	unique_ptr<QueryResult> res;
+	unique_ptr<Connection> conn;
+	unique_ptr<GPUContext> gpu_context;
+	string query;
+	bool enable_optimizer;
+	bool finished = false;
+};
+
+struct GPUCachingFunctionData : public TableFunctionData {
+	GPUCachingFunctionData() = default;
+	unique_ptr<Connection> conn;
+	GPUBufferManager *gpuBufferManager;
+	ColumnType type;
+	uint8_t *data;
+	string column;
+	string table;
+	bool finished = false;
+};
+
+// shared_ptr<Relation> GPUSubstraitPlanToDuckDBRel(Connection &conn, const string &serialized, bool json = false) {
+// 	SubstraitToDuckDB transformer_s2d(conn, serialized, json);
+// 	return transformer_s2d.TransformPlan();
+// };
 
 //This function is used to extract the query plan from the SQL query
 unique_ptr<LogicalOperator> SiriusInitPlanExtractor(
@@ -87,17 +116,14 @@ SiriusExtension::GPUCachingBind(ClientContext &context, TableFunctionBindInput &
 		throw BinderException("gpu_caching cannot be called with a NULL parameter");
 	}
 
-	size_t cache_size_per_gpu = 100UL * 1024 * 1024; //100MB
-	size_t processing_size_per_gpu = 100UL * 1024 * 1024; //100MB
-	size_t processing_size_per_cpu = 32UL * 1024 * 1024 * 1024; //16GB
+	// size_t cache_size_per_gpu = 2UL * 1024 * 1024 * 1024; // 10GB
+	// size_t processing_size_per_gpu = 2UL * 1024 * 1024 * 1024; //11GB
+	// size_t processing_size_per_cpu = 4UL * 1024 * 1024 * 1024; //16GB
 	// size_t cache_size_per_gpu = 120UL * 1024 * 1024 * 1024;
 	// size_t processing_size_per_gpu = 80UL * 1024 * 1024 * 1024;
 	// size_t processing_size_per_cpu = 120UL * 1024 * 1024 * 1024;
-	result->gpuBufferManager = &(GPUBufferManager::GetInstance(cache_size_per_gpu, processing_size_per_gpu, processing_size_per_cpu));
-	// result->gpuBufferManager->Print();
-	//check if the table exists in the gpu_buffer
-	//check if the column exists in the gpu buffer
-	//if it does, allocate region in the gpu caching buffer
+	// result->gpuBufferManager = &(GPUBufferManager::GetInstance(cache_size_per_gpu, processing_size_per_gpu, processing_size_per_cpu));
+	result->gpuBufferManager = &(GPUBufferManager::GetInstance());
 
 	string input_string = input.inputs[0].ToString();
     size_t pos = input_string.find('.');  // Find the position of the period
@@ -261,7 +287,8 @@ SiriusExtension::GPUProcessingSubstraitBind(ClientContext &context, TableFunctio
 	}
 	string serialized = input.inputs[0].GetValueUnsafe<string>();
 	bool is_json = input.inputs[1].GetValueUnsafe<bool>();
-	result->plan = GPUSubstraitPlanToDuckDBRel(*result->conn, serialized, is_json);
+	SubstraitToDuckDB transformer_s2d(result->conn->context, serialized, is_json);
+	result->plan = transformer_s2d.TransformPlan();
 
 	if (USE_SIRIUS_FOR_SUBSTRAIT) {
 		auto relation_stmt = make_uniq<RelationStatement>(result->plan);
@@ -360,6 +387,11 @@ void SiriusExtension::InitializeGPUExtension(Connection &con) {
 	// gpu_processing.named_parameters["enable_optimizer"] = LogicalType::BOOLEAN;
 	CreateTableFunctionInfo gpu_processing_substrait_info(gpu_processing_substrait);
 	catalog.CreateTableFunction(*con.context, gpu_processing_substrait_info);
+
+	size_t cache_size_per_gpu = 32UL * 1024 * 1024 * 1024; // 10GB
+	size_t processing_size_per_gpu = 40UL * 1024 * 1024 * 1024; //11GB
+	size_t processing_size_per_cpu = 64UL * 1024 * 1024 * 1024; //16GB
+	GPUBufferManager *gpuBufferManager = &(GPUBufferManager::GetInstance(cache_size_per_gpu, processing_size_per_gpu, processing_size_per_cpu));	
 }
 
 void SiriusExtension::Load(DuckDB &db) {

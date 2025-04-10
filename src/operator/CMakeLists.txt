@@ -17,5 +17,6 @@ set(EXTENSION_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/gpu_materialize.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/gpu_physical_strings_matching.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/gpu_physical_substring.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/gpu_physical_cte.cpp
         PARENT_SCOPE
 )

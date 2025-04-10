@@ -16,7 +16,33 @@ enum class ColumnType {
     VARCHAR
 };
 
-ColumnType convertLogicalTypetoColumnType(LogicalType type);
+inline ColumnType convertLogicalTypeToColumnType(LogicalType type) {
+    ColumnType column_type;
+    switch (type.id()) {
+        case LogicalTypeId::INTEGER:
+            column_type = ColumnType::INT32;
+            break;
+        case LogicalTypeId::BIGINT:
+            column_type = ColumnType::INT64;
+            break;
+        case LogicalTypeId::FLOAT:
+            column_type = ColumnType::FLOAT32;
+            break;
+        case LogicalTypeId::DOUBLE:
+            column_type = ColumnType::FLOAT64;
+            break;
+        case LogicalTypeId::BOOLEAN:
+            column_type = ColumnType::BOOLEAN;
+            break;
+        case LogicalTypeId::VARCHAR:
+            column_type = ColumnType::VARCHAR;
+            break;
+        default:
+            column_type = ColumnType::INT32;
+            break;
+    }
+    return column_type;
+}
 
 class DataWrapper {
 public:

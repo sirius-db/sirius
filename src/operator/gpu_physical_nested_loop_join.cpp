@@ -241,7 +241,7 @@ GPUPhysicalNestedLoopJoin::ResolveComplexJoin(GPUIntermediateRelation &input_rel
 		count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
 		HandleNestedLoopJoin(left_keys, right_keys, count, row_ids_left, row_ids_right, conditions, join_type, gpuBufferManager);
 
-		vector<idx_t> rhs_output_columns;
+		vector<column_t> rhs_output_columns;
 		for (idx_t i = 0; i < right_temp_data->columns.size(); i++) rhs_output_columns.push_back(i);
 
 		if (count[0] == 0) throw NotImplementedException("No match found in nested loop join");
