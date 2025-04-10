@@ -53,6 +53,9 @@ struct GPUCachingFunctionData : public TableFunctionData {
 	bool finished = false;
 };
 
+void do_nothing_context(ClientContext *) {
+}
+
 // shared_ptr<Relation> GPUSubstraitPlanToDuckDBRel(Connection &conn, const string &serialized, bool json = false) {
 // 	SubstraitToDuckDB transformer_s2d(conn, serialized, json);
 // 	return transformer_s2d.TransformPlan();
@@ -275,7 +278,9 @@ SiriusExtension::GPUProcessingSubstraitBind(ClientContext &context, TableFunctio
 	}
 	string serialized = input.inputs[0].GetValueUnsafe<string>();
 	// result->plan = GPUSubstraitPlanToDuckDBRel(*result->conn, serialized, false);
-	SubstraitToDuckDB transformer_s2d(result->conn->context, serialized, false);
+	bool is_json = false;
+	shared_ptr<ClientContext> c_ptr(&context, do_nothing_context);
+	SubstraitToDuckDB transformer_s2d(c_ptr, serialized, is_json, false);
 	result->plan = transformer_s2d.TransformPlan();
 
 	auto relation_stmt = make_uniq<RelationStatement>(result->plan);
@@ -299,10 +304,14 @@ SiriusExtension::GPUProcessingSubstraitBind(ClientContext &context, TableFunctio
 	prepared->plan = make_uniq<PhysicalOperator>(PhysicalOperatorType::DUMMY_SCAN, vector<LogicalType>{LogicalType::BOOLEAN}, 0);
 	
 	auto query_plan = OptimizePlan(context, planner, *result->conn);
-	auto gpu_physical_plan = GPUGeneratePhysicalPlan(context, *result->gpu_context, query_plan, *result->conn);
-	auto gpu_prepared = make_shared_ptr<GPUPreparedStatementData>(std::move(prepared), std::move(gpu_physical_plan));
-		
-	result->gpu_prepared = gpu_prepared;
+	try {
+		auto gpu_physical_plan = GPUGeneratePhysicalPlan(context, *result->gpu_context, query_plan, *result->conn);
+		auto gpu_prepared = make_shared_ptr<GPUPreparedStatementData>(std::move(prepared), std::move(gpu_physical_plan));
+		result->gpu_prepared = gpu_prepared;
+	} catch (std::exception &e) {
+		result->plan_error = true;
+	}
+
 
 	for (auto &column : planner.names) {
 		names.emplace_back(column);
@@ -310,11 +319,6 @@ SiriusExtension::GPUProcessingSubstraitBind(ClientContext &context, TableFunctio
 	for (auto &type : planner.types) {
 		return_types.emplace_back(type);
 	}
-
-	// for (auto &column : result->plan->Columns()) {
-	// 	return_types.emplace_back(column.Type());
-	// 	names.emplace_back(column.Name());
-	// }
 
 	return std::move(result);
 }
@@ -327,8 +331,19 @@ void SiriusExtension::GPUProcessingSubstraitFunction(ClientContext &context, Tab
 
 	if (!data.res) {
 		auto start = std::chrono::high_resolution_clock::now();
-		data.res = data.gpu_context->GPUExecuteQuery(context, data.query, data.gpu_prepared, {});
-		// data.res = data.plan->Execute();
+		if (data.plan_error) {
+			auto con = Connection(*context.db);
+			data.plan->context = make_shared_ptr<ClientContextWrapper>(con.context);
+			data.res = data.plan->Execute();
+		} else {
+			data.res = data.gpu_context->GPUExecuteQuery(context, data.query, data.gpu_prepared, {});
+			if (data.res->HasError()) {
+				printf("Error in GPUExecuteQuery, fallback to DuckDB\n");
+				auto con = Connection(*context.db);
+				data.plan->context = make_shared_ptr<ClientContextWrapper>(con.context);
+				data.res = data.plan->Execute();
+			}
+		}
 		auto end = std::chrono::high_resolution_clock::now();
 		auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
 		printf("GPU Execute query time: %.2f ms\n", duration.count()/1000.0);
