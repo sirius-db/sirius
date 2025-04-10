@@ -30,7 +30,7 @@ cd extension_external
 git clone https://github.com/sirius-db/duckdb-substrait-extension.git
 mv duckdb-substrait-extension substrait
 cd substrait 
-git reset --hard 67a97f5a87c6c11541c4bc7eb8fd8cba9c3970b8 #go to the right commit hash for duckdb substrait extension
+git reset --hard 406e5b65d334a9b75d6eafa8a12d7c58e1a5aedd #go to the right commit hash for duckdb substrait extension
 cd {SIRIUS_HOME_PATH}
 make -j 8 #build extension
 ```
