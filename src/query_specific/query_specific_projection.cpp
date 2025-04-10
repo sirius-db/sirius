@@ -125,8 +125,6 @@ GPUExpressionExecutor::HandlingSpecificProjection(GPUIntermediateRelation& input
 
 				}
 			}
-		} else {
-			throw InvalidInputException("Unsupported case expression type");
 		}
 
 		if (expression.expression_class == ExpressionClass::BOUND_FUNCTION) {
@@ -245,8 +243,6 @@ GPUExpressionExecutor::HandlingSpecificProjection(GPUIntermediateRelation& input
 					
 				}
 			}
-		} else {
-			throw InvalidInputException("Unsupported projection function expression type");
 		}
 
 

@@ -292,6 +292,8 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
                         HandleComparisonExpression(materialized_column1, materialized_column2, count, comparison_idx, bound_comparison.type);  
                         if (count[0] == 0) throw NotImplementedException("No match found");   
                     }       
+                } else {
+                  throw NotImplementedException("Comparison expression not supported");
                 }
             break;
           } case ExpressionClass::BOUND_CONJUNCTION: {
