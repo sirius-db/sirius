@@ -79,6 +79,11 @@ public:
 	void BeginQueryInternal(const string &query);
 	ErrorData EndQueryInternal(bool success, bool invalidate_transaction);
 
+	void GPUProcessError(ErrorData &error, const string &query) const;
+
+	template <class T>
+	unique_ptr<T> GPUErrorResult(ErrorData error, const string &query = string());
+
 // protected:
 // 	//! Whether or not execution was successful
 // 	bool success;

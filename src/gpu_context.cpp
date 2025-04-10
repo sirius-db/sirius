@@ -71,13 +71,28 @@ GPUContext::GPUPendingStatementOrPreparedStatement(ClientContext &context, const
 
 	if (pending->HasError()) {
 		// query failed: abort now
-		throw InvalidInputException("Error in GPUPendingStatementOrPreparedStatement");
-		EndQueryInternal(false, invalidate_query);
+		// throw InvalidInputException("Error in GPUPendingStatementOrPreparedStatement");
+		// EndQueryInternal(false, invalidate_query);
 		return pending;
 	}
 	D_ASSERT(gpu_active_query->IsOpenResult(*pending));
 	return pending;
 };
+
+void GPUContext::GPUProcessError(ErrorData &error, const string &query) const {
+	error.FinalizeError();
+	if (client_context.config.errors_as_json) {
+		error.ConvertErrorToJSON();
+	} else {
+		error.AddErrorLocation(query);
+	}
+}
+
+template <class T>
+unique_ptr<T> GPUContext::GPUErrorResult(ErrorData error, const string &query) {
+	GPUProcessError(error, query);
+	return make_uniq<T>(std::move(error));
+}
 
 //This function is based on ClientContext::PendingPreparedStatementInternal
 unique_ptr<PendingQueryResult> 
@@ -98,7 +113,8 @@ GPUContext::GPUPendingStatementInternal(ClientContext &context, shared_ptr<GPUPr
 
 	unique_ptr<GPUPhysicalResultCollector> gpu_collector = make_uniq_base<GPUPhysicalResultCollector, GPUPhysicalMaterializedCollector>(*statement_p);
 	if (gpu_collector->type != PhysicalOperatorType::RESULT_COLLECTOR) {
-		throw InvalidInputException("Error in GPUPendingStatementInternal");
+		// throw InvalidInputException("Error in GPUPendingStatementInternal");
+		return GPUErrorResult<PendingQueryResult>(ErrorData("Error in GPUPendingStatementInternal"));
 	}
 	D_ASSERT(gpu_collector->type == PhysicalOperatorType::RESULT_COLLECTOR);
 	auto types = gpu_collector->GetTypes();
@@ -146,10 +162,16 @@ GPUContext::GPUExecutePendingQueryResult(PendingQueryResult &pending) {
 	D_ASSERT(gpu_active_query->IsOpenResult(pending));
 	CheckExecutableInternal(pending);
 	auto &gpu_executor = GetGPUExecutor();
-	gpu_executor.Execute();
+	try {
+		gpu_executor.Execute();
+	} catch (std::exception &e) {
+		ErrorData error(e);
+		return GPUErrorResult<MaterializedQueryResult>(error);
+	}
 	if (pending.HasError()) {
-		throw InvalidInputException("Error in GPUExecutePendingQueryResult");
-		// return make_uniq<MaterializedQueryResult>(error);
+		// throw InvalidInputException("Error in GPUExecutePendingQueryResult");
+		ErrorData error = pending.GetErrorObject();
+		return make_uniq<MaterializedQueryResult>(error);
 	}
 	printf("Done executing\n");
 	auto result = FetchResultInternal(pending);
@@ -166,8 +188,8 @@ GPUContext::GPUExecuteQuery(ClientContext &context, const string &query, shared_
 	D_ASSERT(gpu_active_query->IsOpenResult(*pending_query));
 	unique_ptr<QueryResult> current_result;
 	if (pending_query->HasError()) {
-		throw InvalidInputException("Error in GPUExecuteQuery");
-		// current_result = ErrorResult<MaterializedQueryResult>(pending_query->GetErrorObject());
+		// throw InvalidInputException("Error in GPUExecuteQuery");
+		current_result = GPUErrorResult<MaterializedQueryResult>(pending_query->GetErrorObject());
 	} else {
 		current_result = GPUExecutePendingQueryResult(*pending_query);
 	}

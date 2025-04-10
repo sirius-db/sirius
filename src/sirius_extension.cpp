@@ -39,6 +39,7 @@ struct GPUTableFunctionData : public TableFunctionData {
 	string query;
 	bool enable_optimizer;
 	bool finished = false;
+	bool plan_error = false;
 };
 
 struct GPUCachingFunctionData : public TableFunctionData {
@@ -183,10 +184,13 @@ SiriusExtension::GPUProcessingBind(ClientContext &context, TableFunctionBindInpu
 	//generate physical plan from the logical plan
 	unique_ptr<LogicalOperator> query_plan = SiriusInitPlanExtractor(context, *result, *result->conn);
 	query_plan->Print();
-	auto gpu_physical_plan = GPUGeneratePhysicalPlan(context, *result->gpu_context, query_plan, *result->conn);
-	auto gpu_prepared = make_shared_ptr<GPUPreparedStatementData>(std::move(prepared), std::move(gpu_physical_plan));
-		
-	result->gpu_prepared = gpu_prepared;
+	try {
+		auto gpu_physical_plan = GPUGeneratePhysicalPlan(context, *result->gpu_context, query_plan, *result->conn);
+		auto gpu_prepared = make_shared_ptr<GPUPreparedStatementData>(std::move(prepared), std::move(gpu_physical_plan));
+		result->gpu_prepared = gpu_prepared;
+	} catch (std::exception &e) {
+		result->plan_error = true;
+	}
 
 	for (auto &column : planner.names) {
 		names.emplace_back(column);
@@ -206,7 +210,15 @@ void SiriusExtension::GPUProcessingFunction(ClientContext &context, TableFunctio
 
 	if (!data.res) {
 		auto start = std::chrono::high_resolution_clock::now();
-		data.res = data.gpu_context->GPUExecuteQuery(context, data.query, data.gpu_prepared, {});
+		if (data.plan_error) {
+			data.res = data.conn->Query(data.query);
+		} else {
+			data.res = data.gpu_context->GPUExecuteQuery(context, data.query, data.gpu_prepared, {});
+			if (data.res->HasError()) {
+				printf("Error in GPUExecuteQuery, fallback to DuckDB\n");
+				data.res = data.conn->Query(data.query);
+			}
+		}
 		auto end = std::chrono::high_resolution_clock::now();
 		auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
 		printf("GPU Execute query time: %.2f ms\n", duration.count()/1000.0);
@@ -363,9 +375,9 @@ void SiriusExtension::InitializeGPUExtension(Connection &con) {
 	CreateTableFunctionInfo gpu_processing_substrait_info(gpu_processing_substrait);
 	catalog.CreateTableFunction(*con.context, gpu_processing_substrait_info);
 
-	size_t cache_size_per_gpu = 32UL * 1024 * 1024 * 1024; // 10GB
-	size_t processing_size_per_gpu = 40UL * 1024 * 1024 * 1024; //11GB
-	size_t processing_size_per_cpu = 64UL * 1024 * 1024 * 1024; //16GB
+	size_t cache_size_per_gpu = 15UL * 1024 * 1024 * 1024; // 10GB
+	size_t processing_size_per_gpu = 20UL * 1024 * 1024 * 1024; //11GB
+	size_t processing_size_per_cpu = 40UL * 1024 * 1024 * 1024; //16GB
 	GPUBufferManager *gpuBufferManager = &(GPUBufferManager::GetInstance(cache_size_per_gpu, processing_size_per_gpu, processing_size_per_cpu));	
 }
 
