@@ -28,50 +28,6 @@
 
 namespace duckdb {
 
-<<<<<<< HEAD
-shared_ptr<Relation> GPUSubstraitPlanToDuckDBRel(Connection &conn, const string &serialized, bool json = false) {
-	if (conn.context->transaction.IsAutoCommit()) {
-    conn.context->transaction.BeginTransaction();
-  }
-	shared_ptr<Relation> plan;
-	try {
-		SubstraitToDuckDB transformer_s2d(conn.context, serialized, json);
-		plan = transformer_s2d.TransformPlan();
-	} catch (std::exception& e) {
-		if (conn.context->transaction.IsAutoCommit()) {
-			conn.context->transaction.Rollback(nullptr);
-		}
-		throw;
-	}
-	if (conn.context->transaction.IsAutoCommit()) {
-		conn.context->transaction.Commit();
-  }
-	return plan;
-};
-=======
-struct GPUTableFunctionData : public TableFunctionData {
-	GPUTableFunctionData() = default;
-	shared_ptr<Relation> plan;
-	shared_ptr<GPUPreparedStatementData> gpu_prepared;
-	unique_ptr<QueryResult> res;
-	unique_ptr<Connection> conn;
-	unique_ptr<GPUContext> gpu_context;
-	string query;
-	bool enable_optimizer;
-	bool finished = false;
-};
-
-struct GPUCachingFunctionData : public TableFunctionData {
-	GPUCachingFunctionData() = default;
-	unique_ptr<Connection> conn;
-	GPUBufferManager *gpuBufferManager;
-	ColumnType type;
-	uint8_t *data;
-	string column;
-	string table;
-	bool finished = false;
-};
-
 // shared_ptr<Relation> GPUSubstraitPlanToDuckDBRel(Connection &conn, const string &serialized, bool json = false) {
 // 	SubstraitToDuckDB transformer_s2d(conn, serialized, json);
 // 	return transformer_s2d.TransformPlan();
@@ -388,8 +344,8 @@ void SiriusExtension::InitializeGPUExtension(Connection &con) {
 	CreateTableFunctionInfo gpu_processing_substrait_info(gpu_processing_substrait);
 	catalog.CreateTableFunction(*con.context, gpu_processing_substrait_info);
 
-	size_t cache_size_per_gpu = 32UL * 1024 * 1024 * 1024; // 10GB
-	size_t processing_size_per_gpu = 40UL * 1024 * 1024 * 1024; //11GB
+	size_t cache_size_per_gpu = 1UL * 1024 * 1024 * 1024; // 1GB
+	size_t processing_size_per_gpu = 1UL * 1024 * 1024 * 1024; //1GB
 	size_t processing_size_per_cpu = 64UL * 1024 * 1024 * 1024; //16GB
 	GPUBufferManager *gpuBufferManager = &(GPUBufferManager::GetInstance(cache_size_per_gpu, processing_size_per_gpu, processing_size_per_cpu));	
 }

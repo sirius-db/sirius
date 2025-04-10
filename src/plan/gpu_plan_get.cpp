@@ -168,13 +168,7 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::CreatePlan(LogicalGet 
 		throw InternalException("LogicalGet::project_input can only be set for table-in-out functions");
 	}
 
-	// FIXME: Upgrading to DuckDB v1.2.0
 	unique_ptr<TableFilterSet> table_filters;
-	const auto& column_ids = op.GetColumnIds();
-	vector<column_t> column_id_vals;
-	for (const auto& column_id: column_ids) {
-		column_id_vals.push_back(column_id.GetPrimaryIndex());
-	}
 	if (!op.table_filters.filters.empty()) {
 		table_filters = GPUCreateTableFilterSet(op.table_filters, column_ids);
 	}
