@@ -8,6 +8,7 @@ GPUPhysicalOrder::GPUPhysicalOrder(vector<LogicalType> types, vector<BoundOrderB
     : GPUPhysicalOperator(PhysicalOperatorType::ORDER_BY, std::move(types), estimated_cardinality),
       orders(std::move(orders)), projections(std::move(projections)) {
 
+    throw NotImplementedException("Order by is not implemented");
     sort_result = new GPUIntermediateRelation(projections.size());
 }
   

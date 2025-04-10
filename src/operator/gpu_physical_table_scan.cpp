@@ -24,8 +24,6 @@ GPUPhysicalTableScan::GPUPhysicalTableScan(vector<LogicalType> types, TableFunct
     column_size = new uint64_t[column_ids.size()];
     for (int col = 0; col < column_ids.size(); col++) {
       column_size[col] = 0;
-      // printf("column_ids %d\n", column_ids[col].GetPrimaryIndex());
-      // printf("names %s\n", names[column_ids[col].GetPrimaryIndex()].c_str());
       scanned_types.push_back(returned_types[column_ids[col].GetPrimaryIndex()]);
       scanned_ids.push_back(col);
     }
@@ -316,7 +314,6 @@ void HandleArbitraryConstantExpression(GPUColumn** column, uint64_t* &count, uin
   for (int expr = 0; expr < num_expr; expr++) {
     col[expr] = column[expr]->data_wrapper.data;
     offset[expr] = column[expr]->data_wrapper.offset;
-    // printf("Horo\n");
 
     switch(column[expr]->data_wrapper.type) {
       case ColumnType::INT32: {
@@ -440,7 +437,6 @@ GPUPhysicalTableScan::GetDataDuckDB(ExecutionContext &exec_context) {
         already_cached[col] = gpuBufferManager->checkIfColumnCached(table_name, names[column_ids[col].GetPrimaryIndex()]);
         if (!already_cached[col]) {
           all_cached = false;
-          // gpuBufferManager->createTableAndColumnInGPU(catalog_table, exec_context.client, table_name, names[column_ids[col].GetPrimaryIndex()]);
         } 
     }
 
@@ -593,21 +589,16 @@ GPUPhysicalTableScan::ScanDataDuckDB(GPUBufferManager* gpuBufferManager, string 
         if (!already_cached[col]) {
             auto up_column_name = names[column_ids[col].GetPrimaryIndex()];
             auto up_table_name = table_name;
-            printf("column name %s\n", up_column_name.c_str());
             transform(up_table_name.begin(), up_table_name.end(), up_table_name.begin(), ::toupper);
             transform(up_column_name.begin(), up_column_name.end(), up_column_name.begin(), ::toupper);
             auto column_it = find(gpuBufferManager->tables[up_table_name]->column_names.begin(), gpuBufferManager->tables[up_table_name]->column_names.end(), up_column_name);
             if (column_it == gpuBufferManager->tables[up_table_name]->column_names.end()) {
                 throw InvalidInputException("Column not found");
             }
-            printf("column name %s\n", up_column_name.c_str());
             int column_idx = column_it - gpuBufferManager->tables[up_table_name]->column_names.begin();
             ColumnType column_type = convertLogicalTypeToColumnType(scanned_types[col]);
-            printf("column name %s\n", up_column_name.c_str());
             gpuBufferManager->tables[up_table_name]->columns[column_idx]->column_length = collection->Count();
-            printf("column name %s\n", up_column_name.c_str());
             gpuBufferManager->tables[up_table_name]->length = collection->Count();
-            printf("column name %s\n", up_column_name.c_str());
             if (scanned_types[col] == LogicalType::VARCHAR) {
               gpuBufferManager->tables[up_table_name]->columns[column_idx]->data_wrapper = DataWrapper(column_type, d_ptr[col], d_offset_ptr[col], collection->Count(), column_size[col], true);
             } else {
@@ -732,7 +723,6 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
                 if (filter_inside->filter_type == TableFilterType::CONSTANT_COMPARISON) {
                   printf("Reading constant comparison filter\n");
                   filter_constants[expr_idx] = &(filter_inside->Cast<ConstantFilter>());
-                  // printf("%d\n", filter_constants[expr_idx]->comparison_type);
                   expression_columns[expr_idx] = table->columns[column_ids[column_index].GetPrimaryIndex()];
                   expr_idx++;
                 } else if (filter_inside->filter_type == TableFilterType::IS_NOT_NULL) {

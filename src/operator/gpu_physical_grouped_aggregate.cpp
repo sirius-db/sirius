@@ -221,11 +221,21 @@ HandleGroupByAggregateExpression(GPUColumn** &group_by_keys, GPUColumn** &aggreg
 	if (aggregates.size() == 1) {
 		aggregate_type = aggregate_keys[0]->data_wrapper.type;
 	} else {
+		//check if all the aggregate functions are of the same type
+		bool same_type = true;
+		ColumnType prev_type = aggregate_keys[0]->data_wrapper.type;
 		for (int i = 0; i < aggregates.size(); i++) {
 			if (aggregates[i]->Cast<BoundAggregateExpression>().function.name.compare("count") != 0 && 
 						aggregates[i]->Cast<BoundAggregateExpression>().function.name.compare("count_star") != 0) {
 				aggregate_type = aggregate_keys[i]->data_wrapper.type;
+				if (aggregate_type != prev_type) {
+					same_type = false;
+				}
+				prev_type = aggregate_type;
 			}
+		}
+		if (!same_type) {
+			throw NotImplementedException("All aggregate functions must be of the same type");
 		}
 	}
 
@@ -238,6 +248,12 @@ HandleGroupByAggregateExpression(GPUColumn** &group_by_keys, GPUColumn** &aggreg
 			throw NotImplementedException("Unsupported column type");
 		}
 	} else {
+		//check if all the group by keys are all integers
+		for (int i = 0; i < num_group_keys; i++) {
+			if (group_by_keys[i]->data_wrapper.type != ColumnType::INT64) {
+				throw NotImplementedException("Group by column is not an integer");
+			}
+		}
 		switch(group_by_keys[0]->data_wrapper.type) {
 		case ColumnType::INT64:
 			if (aggregate_type == ColumnType::INT64) {
@@ -276,6 +292,12 @@ void ResolveTypeDuplicateElimination(GPUColumn** &group_by_keys, GPUBufferManage
 }
 
 void HandleDuplicateElimination(GPUColumn** &group_by_keys, GPUBufferManager* gpuBufferManager, int num_group_keys) {
+	//check if all the group by keys are all integers
+	for (int i = 0; i < num_group_keys; i++) {
+		if (group_by_keys[i]->data_wrapper.type != ColumnType::INT64) {
+			throw NotImplementedException("Group by column is not an integer");
+		}
+	}
     switch(group_by_keys[0]->data_wrapper.type) {
       case ColumnType::INT64:
 	  	ResolveTypeDuplicateElimination<uint64_t>(group_by_keys, gpuBufferManager, num_group_keys);
@@ -335,6 +357,12 @@ void ResolveTypeDistinctGroupBy(GPUColumn** &group_by_keys, GPUColumn** &aggrega
 
 //TODO: Distinct Aggregate currently does not support string type
 void HandleDistinctGroupBy(GPUColumn** &group_by_keys, GPUColumn** &aggregate_keys, GPUBufferManager* gpuBufferManager, DistinctAggregateCollectionInfo &distinct_info, int num_group_keys) {
+	//check if all the group by keys are all integers
+	for (int i = 0; i < num_group_keys; i++) {
+		if (group_by_keys[i]->data_wrapper.type != ColumnType::INT64) {
+			throw NotImplementedException("Group by column is not an integer");
+		}
+	}
     switch(group_by_keys[0]->data_wrapper.type) {
       case ColumnType::INT64: {
 	  	if (aggregate_keys[0]->data_wrapper.type == ColumnType::INT64) {
@@ -481,9 +509,7 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 	if (groupings.size() > 1) throw NotImplementedException("Multiple groupings not supported yet");
 
 	GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
-	// uint64_t** group_keys = new uint64_t*[grouped_aggregate_data.groups.size()];
 	uint64_t num_group_keys = grouped_aggregate_data.groups.size();
-	// double** aggregate_vals = new double*[aggregates.size()];
 	GPUColumn** group_by_column = new GPUColumn*[grouped_aggregate_data.groups.size()];
 	GPUColumn** aggregate_column = new GPUColumn*[aggregates.size()];
 	for (int i = 0; i < grouped_aggregate_data.groups.size(); i++) {
@@ -522,7 +548,6 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 		}
 		//here we probably have count(*) or sum(*) or something like that
 		if (aggr.children.size() == 0) {
-			// throw NotImplementedException("Aggregate without children not supported yet");
 			printf("Passing * aggregate to index %d in groupby result\n", grouped_aggregate_data.groups.size() + aggr_idx);
 			aggregate_column[aggr_idx] = new GPUColumn(0, ColumnType::INT64, nullptr);
 		}

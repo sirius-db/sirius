@@ -236,6 +236,21 @@ GPUPhysicalNestedLoopJoin::ResolveComplexJoin(GPUIntermediateRelation &input_rel
 		right_keys[cond_idx] = HandleMaterializeExpression(right_temp_data->columns[join_key_index], condition.right->Cast<BoundReferenceExpression>(), gpuBufferManager);
 	}
 
+	//check if all probe keys are int64 or all the probe keys are float64
+	bool all_int64 = true;
+	bool all_float64 = true;
+	for (idx_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
+		if (left_keys[cond_idx]->data_wrapper.type != ColumnType::INT64) {
+			all_int64 = false;
+		}
+		if (left_keys[cond_idx]->data_wrapper.type != ColumnType::FLOAT64) {
+			all_float64 = false;
+		}
+	}
+	if (!all_int64 && !all_float64) {
+		throw NotImplementedException("Hash join only supports integer or float64 keys");
+	}
+
 	if (join_type == JoinType::INNER) {
 		printf("Nested loop join\n");
 		count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
@@ -321,8 +336,6 @@ void GPUPhysicalNestedLoopJoin::BuildJoinPipelines(GPUPipeline &current, GPUMeta
 
 	// Join can become a source operator if it's RIGHT/OUTER, or if the hash join goes out-of-core
 	bool add_child_pipeline = false;
-	printf("I'm casting here\n");
-	printf("op type: %s\n", PhysicalOperatorToString(op.type).c_str());
 	auto &join_op = op.Cast<GPUPhysicalNestedLoopJoin>();
 	if (join_op.IsSource()) {
 		add_child_pipeline = true;
