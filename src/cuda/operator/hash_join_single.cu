@@ -254,22 +254,46 @@ void probeHashTableSingleMatch(uint8_t **keys, unsigned long long* ht, uint64_t 
     cudaMemcpy(condition_mode_dev, condition_mode, num_keys * sizeof(int), cudaMemcpyHostToDevice);
 
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
-    CHECK_ERROR();
+    // CHECK_ERROR();
+    // probe_single_match<BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(keys_dev, ht, ht_len, row_ids_left, row_ids_right, (unsigned long long*) count, 
+    //         N, condition_mode_dev, num_keys, equal_keys, join_mode, 1);
+    // CHECK_ERROR();
+    // cudaDeviceSynchronize();
+
+    // uint64_t* h_count = new uint64_t [1];
+    // cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+    // assert(h_count[0] > 0);
+    // row_ids_left = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
+    // if (join_mode == 0 || join_mode == 3) row_ids_right = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
+    // cudaMemset(count, 0, sizeof(uint64_t));
+    // probe_single_match<BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(keys_dev, ht, ht_len, row_ids_left, row_ids_right, (unsigned long long*) count, 
+    //         N, condition_mode_dev, num_keys, equal_keys, join_mode, 0);
+    // CHECK_ERROR();
+    // cudaDeviceSynchronize();
+
+    size_t openmalloc_full = (gpuBufferManager->processing_size_per_gpu - gpuBufferManager->gpuProcessingPointer[0] - 1024) / sizeof(uint64_t);
+    size_t openmalloc_half = openmalloc_full / 2;
+    row_ids_left = gpuBufferManager->customCudaMalloc<uint64_t>(openmalloc_half, 0, 0);
+    if (join_mode == 0 || join_mode == 3) row_ids_right = gpuBufferManager->customCudaMalloc<uint64_t>(openmalloc_half, 0, 0);
+    cudaMemset(count, 0, sizeof(uint64_t));
     probe_single_match<BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(keys_dev, ht, ht_len, row_ids_left, row_ids_right, (unsigned long long*) count, 
-            N, condition_mode_dev, num_keys, equal_keys, join_mode, 1);
+            N, condition_mode_dev, num_keys, equal_keys, join_mode, 0);
     CHECK_ERROR();
     cudaDeviceSynchronize();
 
     uint64_t* h_count = new uint64_t [1];
     cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
     assert(h_count[0] > 0);
-    row_ids_left = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
-    if (join_mode == 0 || join_mode == 3) row_ids_right = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
-    cudaMemset(count, 0, sizeof(uint64_t));
-    probe_single_match<BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(keys_dev, ht, ht_len, row_ids_left, row_ids_right, (unsigned long long*) count, 
-            N, condition_mode_dev, num_keys, equal_keys, join_mode, 0);
-    CHECK_ERROR();
-    cudaDeviceSynchronize();
+    printf("Count: %lu\n", h_count[0]);
+    if (join_mode == 0 || join_mode == 3) {
+        gpuBufferManager->gpuProcessingPointer[0] = (reinterpret_cast<uint8_t*>(row_ids_left + h_count[0]) - gpuBufferManager->gpuProcessing[0]);
+        cudaMemmove(reinterpret_cast<uint8_t*>(row_ids_left + h_count[0]), reinterpret_cast<uint8_t*>(row_ids_right), h_count[0] * sizeof(uint64_t));
+        CHECK_ERROR();
+        row_ids_right = row_ids_left + h_count[0];
+        gpuBufferManager->gpuProcessingPointer[0] = (reinterpret_cast<uint8_t*>(row_ids_right + h_count[0]) - gpuBufferManager->gpuProcessing[0]);
+    } else {
+        gpuBufferManager->gpuProcessingPointer[0] = (reinterpret_cast<uint8_t*>(row_ids_left + h_count[0]) - gpuBufferManager->gpuProcessing[0]);
+    }
 
     printf("Count: %lu\n", h_count[0]);
     count = h_count;
