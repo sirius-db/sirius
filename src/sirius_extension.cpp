@@ -218,7 +218,7 @@ void SiriusExtension::GPUProcessingFunction(ClientContext &context, TableFunctio
 		} else {
 			data.res = data.gpu_context->GPUExecuteQuery(context, data.query, data.gpu_prepared, {});
 			if (data.res->HasError()) {
-				printf("Error in GPUExecuteQuery, fallback to DuckDB\n");
+				printf("=============================================\nError in GPUExecuteQuery, fallback to DuckDB\n=============================================\n");
 				data.res = data.conn->Query(data.query);
 			}
 		}
@@ -338,7 +338,7 @@ void SiriusExtension::GPUProcessingSubstraitFunction(ClientContext &context, Tab
 		} else {
 			data.res = data.gpu_context->GPUExecuteQuery(context, data.query, data.gpu_prepared, {});
 			if (data.res->HasError()) {
-				printf("Error in GPUExecuteQuery, fallback to DuckDB\n");
+				printf("=============================================\nError in GPUExecuteQuery, fallback to DuckDB\n=============================================\n");
 				auto con = Connection(*context.db);
 				data.plan->context = make_shared_ptr<ClientContextWrapper>(con.context);
 				data.res = data.plan->Execute();
@@ -390,9 +390,12 @@ void SiriusExtension::InitializeGPUExtension(Connection &con) {
 	CreateTableFunctionInfo gpu_processing_substrait_info(gpu_processing_substrait);
 	catalog.CreateTableFunction(*con.context, gpu_processing_substrait_info);
 
-	size_t cache_size_per_gpu = 15UL * 1024 * 1024 * 1024; // 10GB
-	size_t processing_size_per_gpu = 20UL * 1024 * 1024 * 1024; //11GB
-	size_t processing_size_per_cpu = 40UL * 1024 * 1024 * 1024; //16GB
+	// size_t cache_size_per_gpu = 100UL * 1024 * 1024 * 1024; // 10GB
+	// size_t processing_size_per_gpu = 80UL * 1024 * 1024 * 1024; //11GB
+	// size_t processing_size_per_cpu = 100UL * 1024 * 1024 * 1024; //16GB
+	size_t cache_size_per_gpu = 10UL * 1024 * 1024 * 1024; // 10GB
+	size_t processing_size_per_gpu = 11UL * 1024 * 1024 * 1024; //11GB
+	size_t processing_size_per_cpu = 16UL * 1024 * 1024 * 1024; //16GB
 	GPUBufferManager *gpuBufferManager = &(GPUBufferManager::GetInstance(cache_size_per_gpu, processing_size_per_gpu, processing_size_per_cpu));	
 }
 

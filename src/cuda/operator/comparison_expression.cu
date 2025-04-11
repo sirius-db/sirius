@@ -212,16 +212,22 @@ void comparisonConstantExpression(T *a, T b, T c, uint64_t* &row_ids, uint64_t* 
     printf("Launching Comparison Expression Kernel\n");
     cudaMemset(count, 0, sizeof(uint64_t));
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
-    comparison_constant_expression<T, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(a, b, c, row_ids, (unsigned long long*) count, N, op_mode, 1);
-    CHECK_ERROR();
+    // comparison_constant_expression<T, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(a, b, c, row_ids, (unsigned long long*) count, N, op_mode, 1);
+    // CHECK_ERROR();
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
-    uint64_t* h_count = new uint64_t[1];
-    cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
-    row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
-    cudaMemset(count, 0, sizeof(uint64_t));
+    // uint64_t* h_count = new uint64_t[1];
+    // cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+    // row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
+    // cudaMemset(count, 0, sizeof(uint64_t));
+    size_t openmalloc_full = (gpuBufferManager->processing_size_per_gpu - gpuBufferManager->gpuProcessingPointer[0] - 1024) / sizeof(uint64_t);
+    row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(openmalloc_full, 0, 0);
     comparison_constant_expression<T, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(a, b, c, row_ids, (unsigned long long*) count, N, op_mode, 0);
     CHECK_ERROR();
     cudaDeviceSynchronize();
+    uint64_t* h_count = new uint64_t[1];
+    cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+    CHECK_ERROR();
+    gpuBufferManager->gpuProcessingPointer[0] = (reinterpret_cast<uint8_t*>(row_ids + h_count[0]) - gpuBufferManager->gpuProcessing[0]);
     count = h_count;
     printf("Count: %lu\n", h_count[0]);
 }
@@ -239,16 +245,22 @@ void comparisonExpression(T *a, T *b, uint64_t* &row_ids, uint64_t* &count, uint
     printf("Launching Comparison Expression Kernel\n");
     cudaMemset(count, 0, sizeof(uint64_t));
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
-    comparison_expression<T, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(a, b, row_ids, (unsigned long long*) count, N, op_mode, 1);
-    CHECK_ERROR();
+    // comparison_expression<T, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(a, b, row_ids, (unsigned long long*) count, N, op_mode, 1);
+    // CHECK_ERROR();
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
-    uint64_t* h_count = new uint64_t[1];
-    cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
-    row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
-    cudaMemset(count, 0, sizeof(uint64_t));
+    // uint64_t* h_count = new uint64_t[1];
+    // cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+    // row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
+    // cudaMemset(count, 0, sizeof(uint64_t));
+    size_t openmalloc_full = (gpuBufferManager->processing_size_per_gpu - gpuBufferManager->gpuProcessingPointer[0] - 1024) / sizeof(uint64_t);
+    row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(openmalloc_full, 0, 0);
     comparison_expression<T, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(a, b, row_ids, (unsigned long long*) count, N, op_mode, 0);
     CHECK_ERROR();
     cudaDeviceSynchronize();
+    uint64_t* h_count = new uint64_t[1];
+    cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+    CHECK_ERROR();
+    gpuBufferManager->gpuProcessingPointer[0] = (reinterpret_cast<uint8_t*>(row_ids + h_count[0]) - gpuBufferManager->gpuProcessing[0]);
     count = h_count;
     printf("Count: %lu\n", h_count[0]);
 }
@@ -379,34 +391,24 @@ void comparisonStringBetweenExpression(char* char_data, uint64_t num_chars, uint
     cudaDeviceSynchronize();
     CHECK_ERROR();
 
-    // // Create the valid idx buffer from the valid boolean array
-    // uint64_t* d_valid_idxs = gpuBufferManager->customCudaMalloc<uint64_t>(num_strings, 0, 0);
-    // thrust::device_ptr<bool> d_answers_ptr(d_is_valid);
-    // thrust::device_ptr<uint64_t> d_valid_idxs_ptr(d_valid_idxs);
-    // auto end = thrust::copy_if(
-    //     thrust::counting_iterator<uint64_t>(0),
-    //     thrust::counting_iterator<uint64_t>(num_strings),
-    //     d_answers_ptr,
-    //     d_valid_idxs_ptr,
-    //     thrust::identity<bool>()
-    // );
-    // CHECK_ERROR();
     cudaMemset(count, 0, sizeof(uint64_t));
-    compact_valid_rows<BLOCK_THREADS, ITEMS_PER_THREAD><<<((num_strings + BLOCK_THREADS * ITEMS_PER_THREAD - 1)/(BLOCK_THREADS * ITEMS_PER_THREAD)), BLOCK_THREADS>>>(d_is_valid, row_id, (unsigned long long*) count, num_strings, 1, 0);
+    // compact_valid_rows<BLOCK_THREADS, ITEMS_PER_THREAD><<<((num_strings + BLOCK_THREADS * ITEMS_PER_THREAD - 1)/(BLOCK_THREADS * ITEMS_PER_THREAD)), BLOCK_THREADS>>>(d_is_valid, row_id, (unsigned long long*) count, num_strings, 1, 0);
 
-    // Record the number of valid strings
-    uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
-    cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
-    CHECK_ERROR();
-    row_id = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
-    cudaMemset(count, 0, sizeof(uint64_t));
-
-    compact_valid_rows<BLOCK_THREADS, ITEMS_PER_THREAD><<<((num_strings + BLOCK_THREADS * ITEMS_PER_THREAD - 1)/(BLOCK_THREADS * ITEMS_PER_THREAD)), BLOCK_THREADS>>>(d_is_valid, row_id, (unsigned long long*) count, num_strings, 0, 0);
-    CHECK_ERROR();
     // Record the number of valid strings
     // uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
-    // h_count[0] = end - d_valid_idxs_ptr;
-    // row_id = d_valid_idxs;
+    // cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+    // CHECK_ERROR();
+    // row_id = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
+    // cudaMemset(count, 0, sizeof(uint64_t));
+
+    size_t openmalloc_full = (gpuBufferManager->processing_size_per_gpu - gpuBufferManager->gpuProcessingPointer[0] - 1024) / sizeof(uint64_t);
+    row_id = gpuBufferManager->customCudaMalloc<uint64_t>(openmalloc_full, 0, 0);
+    compact_valid_rows<BLOCK_THREADS, ITEMS_PER_THREAD><<<((num_strings + BLOCK_THREADS * ITEMS_PER_THREAD - 1)/(BLOCK_THREADS * ITEMS_PER_THREAD)), BLOCK_THREADS>>>(d_is_valid, row_id, (unsigned long long*) count, num_strings, 0, 0);
+    CHECK_ERROR();
+    uint64_t* h_count = new uint64_t[1];
+    cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+    CHECK_ERROR();
+    gpuBufferManager->gpuProcessingPointer[0] = (reinterpret_cast<uint8_t*>(row_id + h_count[0]) - gpuBufferManager->gpuProcessing[0]);
     count = h_count;
     std::cout << "comparisonStringBetweenExpression got count of " << h_count[0] << std::endl;
 }
@@ -437,18 +439,25 @@ void comparisonStringExpression(char* char_data, uint64_t num_chars, uint64_t* s
     cudaDeviceSynchronize();
     CHECK_ERROR();
 
-    cudaMemset(count, 0, sizeof(uint64_t));
-    compact_valid_rows<BLOCK_THREADS, ITEMS_PER_THREAD><<<((num_strings + BLOCK_THREADS * ITEMS_PER_THREAD - 1)/(BLOCK_THREADS * ITEMS_PER_THREAD)), BLOCK_THREADS>>>(d_is_valid, row_id, (unsigned long long*) count, num_strings, 1, 0);
+    // cudaMemset(count, 0, sizeof(uint64_t));
+    // compact_valid_rows<BLOCK_THREADS, ITEMS_PER_THREAD><<<((num_strings + BLOCK_THREADS * ITEMS_PER_THREAD - 1)/(BLOCK_THREADS * ITEMS_PER_THREAD)), BLOCK_THREADS>>>(d_is_valid, row_id, (unsigned long long*) count, num_strings, 1, 0);
 
     // Record the number of valid strings
-    uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
-    cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
-    CHECK_ERROR();
-    row_id = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
+    // uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
+    // cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+    // CHECK_ERROR();
+    // row_id = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
     cudaMemset(count, 0, sizeof(uint64_t));
+    size_t openmalloc_full = (gpuBufferManager->processing_size_per_gpu - gpuBufferManager->gpuProcessingPointer[0] - 1024) / sizeof(uint64_t);
+    row_id = gpuBufferManager->customCudaMalloc<uint64_t>(openmalloc_full, 0, 0);
 
     compact_valid_rows<BLOCK_THREADS, ITEMS_PER_THREAD><<<((num_strings + BLOCK_THREADS * ITEMS_PER_THREAD - 1)/(BLOCK_THREADS * ITEMS_PER_THREAD)), BLOCK_THREADS>>>(d_is_valid, row_id, (unsigned long long*) count, num_strings, 0, 0);
     CHECK_ERROR();
+
+    uint64_t* h_count = new uint64_t[1];
+    cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+    CHECK_ERROR();
+    gpuBufferManager->gpuProcessingPointer[0] = (reinterpret_cast<uint8_t*>(row_id + h_count[0]) - gpuBufferManager->gpuProcessing[0]);
     count = h_count;
     std::cout << "comparisonStringExpression got count of " << h_count[0] << std::endl;
 }
