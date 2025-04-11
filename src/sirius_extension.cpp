@@ -256,15 +256,19 @@ SiriusExtension::GPUProcessingSubstraitBind(ClientContext &context, TableFunctio
 		throw BinderException("gpu_processing cannot be called with a NULL parameter");
 	}
 	string serialized = input.inputs[0].GetValueUnsafe<string>();
-	bool is_json = input.inputs[1].GetValueUnsafe<bool>();
+	bool is_json = input.inputs.size() < 2 ? false : input.inputs[1].GetValueUnsafe<bool>();
 
 	shared_ptr<ClientContext> c_ptr(&context, do_nothing_context);
 	SubstraitToDuckDB transformer_s2d(c_ptr, serialized, is_json, false);
 	result->plan = transformer_s2d.TransformPlan();
 
+	auto relation_stmt = make_uniq<RelationStatement>(result->plan);
+	unique_ptr<SQLStatement> statements = std::move(relation_stmt);
+	Planner planner(context);
+	planner.CreatePlan(std::move(statements));
+	D_ASSERT(planner.plan);
+
 	if (USE_SIRIUS_FOR_SUBSTRAIT) {
-		auto relation_stmt = make_uniq<RelationStatement>(result->plan);
-		unique_ptr<SQLStatement> statements = std::move(relation_stmt);
 		auto statement_type = statements->type;
 		printf("%s\n", statements->query.c_str());
 
@@ -272,10 +276,6 @@ SiriusExtension::GPUProcessingSubstraitBind(ClientContext &context, TableFunctio
 		disabled_optimizers.insert(OptimizerType::IN_CLAUSE);
 		disabled_optimizers.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
 		DBConfig::GetConfig(context).options.disabled_optimizers = disabled_optimizers;
-
-		Planner planner(context);
-		planner.CreatePlan(std::move(statements));
-		D_ASSERT(planner.plan);
 
 		auto prepared = make_shared_ptr<PreparedStatementData>(statement_type);
 		prepared->names = planner.names;
@@ -291,13 +291,13 @@ SiriusExtension::GPUProcessingSubstraitBind(ClientContext &context, TableFunctio
 		} catch (std::exception &e) {
 			result->plan_error = true;
 		}
+	}
 
-		for (auto &column : planner.names) {
-			names.emplace_back(column);
-		}
-		for (auto &type : planner.types) {
-			return_types.emplace_back(type);
-		}
+	for (auto &column : planner.names) {
+		names.emplace_back(column);
+	}
+	for (auto &type : planner.types) {
+		return_types.emplace_back(type);
 	}
 
 	return std::move(result);
@@ -328,6 +328,13 @@ void SiriusExtension::GPUProcessingSubstraitFunction(ClientContext &context, Tab
 		auto end = std::chrono::high_resolution_clock::now();
 		auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
 		printf("GPU Execute query time: %.2f ms\n", duration.count()/1000.0);
+	}
+
+	// Should not consume result if the call is from Sirius server
+	if (!data.is_sirius_server) {
+		if (auto result_chunk = data.res->Fetch()) {
+			output.Move(*result_chunk);
+		}
 	}
 
 	return;

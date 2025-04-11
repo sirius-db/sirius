@@ -23,6 +23,7 @@ public:
 		bool enable_optimizer;
 		bool finished = false;
 		bool plan_error = false;
+		bool is_sirius_server = false;		// should not consume result if called by sirius server
 	};
 
 	struct GPUCachingFunctionData : public TableFunctionData {
