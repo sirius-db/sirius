@@ -38,7 +38,7 @@ inline ColumnType convertLogicalTypeToColumnType(LogicalType type) {
             column_type = ColumnType::VARCHAR;
             break;
         default:
-            column_type = ColumnType::INT32;
+            throw InvalidInputException("Unsupported column type");
             break;
     }
     return column_type;

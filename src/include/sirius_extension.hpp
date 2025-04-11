@@ -22,6 +22,7 @@ public:
 		string query;
 		bool enable_optimizer;
 		bool finished = false;
+		bool plan_error = false;
 	};
 
 	struct GPUCachingFunctionData : public TableFunctionData {

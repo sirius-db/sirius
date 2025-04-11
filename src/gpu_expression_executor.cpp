@@ -240,6 +240,7 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
                 printf("Overwrite row ids with column %ld\n", bound_ref.index);
             break;
           } case ExpressionClass::BOUND_CASE: {
+                throw NotImplementedException("Case expression not supported");
                 auto &bound_case = expr.Cast<BoundCaseExpression>();
                 printf("Executing case expression\n");
                 for (idx_t i = 0; i < bound_case.case_checks.size(); i++) {
@@ -249,6 +250,7 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
                 FilterRecursiveExpression(input_relation, output_relation, *(bound_case.else_expr), depth + 1);
             break;
           } case ExpressionClass::BOUND_CAST: {
+                throw NotImplementedException("Cast expression not supported");
                 auto &bound_cast = expr.Cast<BoundCastExpression>();
                 printf("Executing cast expression\n");
                 FilterRecursiveExpression(input_relation, output_relation, *(bound_cast.child), depth + 1);
@@ -290,9 +292,12 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
                         HandleComparisonExpression(materialized_column1, materialized_column2, count, comparison_idx, bound_comparison.type);  
                         if (count[0] == 0) throw NotImplementedException("No match found");   
                     }       
+                } else {
+                  throw NotImplementedException("Comparison expression not supported");
                 }
             break;
           } case ExpressionClass::BOUND_CONJUNCTION: {
+                throw NotImplementedException("Conjunction expression not supported");
                 auto &bound_conjunction = expr.Cast<BoundConjunctionExpression>();
                 printf("Executing conjunction expression\n");
                 for (auto &child : bound_conjunction.children) {
@@ -413,6 +418,7 @@ GPUExpressionExecutor::ProjectionRecursiveExpression(GPUIntermediateRelation& in
 
     switch (expr.expression_class) {
         case ExpressionClass::BOUND_BETWEEN: {
+              throw NotImplementedException("Between expression not supported");
               auto &bound_between = expr.Cast<BoundBetweenExpression>();
               printf("Executing between expression\n");
               ProjectionRecursiveExpression(input_relation, output_relation, *(bound_between.input), output_idx, depth + 1);
@@ -426,6 +432,7 @@ GPUExpressionExecutor::ProjectionRecursiveExpression(GPUIntermediateRelation& in
               input_relation.checkLateMaterialization(bound_ref.index);
               break;
         } case ExpressionClass::BOUND_CASE: {
+              throw NotImplementedException("Case expression not supported");
               auto &bound_case = expr.Cast<BoundCaseExpression>();
               printf("Executing case expression\n");
               for (idx_t i = 0; i < bound_case.case_checks.size(); i++) {
@@ -435,17 +442,20 @@ GPUExpressionExecutor::ProjectionRecursiveExpression(GPUIntermediateRelation& in
               ProjectionRecursiveExpression(input_relation, output_relation, *(bound_case.else_expr), output_idx, depth + 1);
               break;
         } case ExpressionClass::BOUND_CAST: {
+              throw NotImplementedException("Cast expression not supported");
               auto &bound_cast = expr.Cast<BoundCastExpression>();
               printf("Executing cast expression\n");
               ProjectionRecursiveExpression(input_relation, output_relation, *(bound_cast.child), output_idx, depth + 1);
               break;
         } case ExpressionClass::BOUND_COMPARISON: {
+              throw NotImplementedException("Comparison expression not supported");
               auto &bound_comparison = expr.Cast<BoundComparisonExpression>();
               printf("Executing comparison expression\n");
               ProjectionRecursiveExpression(input_relation, output_relation, *(bound_comparison.left), output_idx, depth + 1);
               ProjectionRecursiveExpression(input_relation, output_relation, *(bound_comparison.right), output_idx, depth + 1);
               break;
         } case ExpressionClass::BOUND_CONJUNCTION: {
+              throw NotImplementedException("Conjunction expression not supported");
               auto &bound_conjunction = expr.Cast<BoundConjunctionExpression>();
               printf("Executing conjunction expression\n");
               for (auto &child : bound_conjunction.children) {
@@ -460,15 +470,15 @@ GPUExpressionExecutor::ProjectionRecursiveExpression(GPUIntermediateRelation& in
               auto &bound_function = expr.Cast<BoundFunctionExpression>();
               printf("Function name %s\n", bound_function.function.name.c_str());
               if((bound_function.ToString().find("substr") != std::string::npos) || (bound_function.ToString().find("substring") != std::string::npos)) {
-                auto &bound_ref1 = bound_function.children[0]->Cast<BoundReferenceExpression>();
-                auto &bound_ref2 = bound_function.children[1]->Cast<BoundConstantExpression>();
-                auto &bound_ref3 = bound_function.children[2]->Cast<BoundConstantExpression>();
-                GPUColumn* input_column = input_relation.columns[bound_ref1.index];
-                uint64_t start_idx = bound_ref2.value.GetValue<uint64_t>();
-                if (start_idx < 1) throw InvalidInputException("Start index should be greater than 0");
-                uint64_t length = bound_ref3.value.GetValue<uint64_t>();
-                GPUColumn* materialized_column = HandleMaterializeExpression(input_column, bound_ref1, gpuBufferManager);
-                result = HandleSubString(materialized_column, start_idx, length);
+                  auto &bound_ref1 = bound_function.children[0]->Cast<BoundReferenceExpression>();
+                  auto &bound_ref2 = bound_function.children[1]->Cast<BoundConstantExpression>();
+                  auto &bound_ref3 = bound_function.children[2]->Cast<BoundConstantExpression>();
+                  GPUColumn* input_column = input_relation.columns[bound_ref1.index];
+                  uint64_t start_idx = bound_ref2.value.GetValue<uint64_t>();
+                  if (start_idx < 1) throw InvalidInputException("Start index should be greater than 0");
+                  uint64_t length = bound_ref3.value.GetValue<uint64_t>();
+                  GPUColumn* materialized_column = HandleMaterializeExpression(input_column, bound_ref1, gpuBufferManager);
+                  result = HandleSubString(materialized_column, start_idx, length);
               } else if (bound_function.children[1]->expression_class == ExpressionClass::BOUND_CONSTANT) {
                   auto &bound_ref1 = bound_function.children[0]->Cast<BoundReferenceExpression>();
                   auto &bound_ref2 = bound_function.children[1]->Cast<BoundConstantExpression>();
@@ -480,6 +490,8 @@ GPUExpressionExecutor::ProjectionRecursiveExpression(GPUIntermediateRelation& in
                   GPUColumn* materialized_column1 = HandleMaterializeExpression(input_relation.columns[bound_ref1.index], bound_ref1, gpuBufferManager);
                   GPUColumn* materialized_column2 = HandleMaterializeExpression(input_relation.columns[bound_ref2.index], bound_ref2, gpuBufferManager);
                   result = HandleBinaryExpression(materialized_column1, materialized_column2, gpuBufferManager, bound_function.function.name);            
+              } else {
+                throw NotImplementedException("Function expression not supported");
               }
               break;
         } case ExpressionClass::BOUND_OPERATOR: {
