@@ -262,8 +262,6 @@ tableScanExpression(uint8_t **col, uint64_t** offset, uint8_t *constant_compare,
     ScanDataType* d_data_type = (ScanDataType*) gpuBufferManager->customCudaMalloc<int>(num_expr, 0, 0);
     cudaMemcpy(d_data_type, data_type, num_expr * sizeof(int), cudaMemcpyHostToDevice);
 
-    // uint8_t** d_col = gpuBufferManager->customCudaMalloc<uint8_t*>(num_expr, 0, 0);
-    // uint64_t** d_offset = gpuBufferManager->customCudaMalloc<uint64_t*>(num_expr, 0, 0);
     uint8_t** d_col;
     uint64_t** d_offset;
     cudaMalloc((void**) &d_col, num_expr * sizeof(uint8_t*));
@@ -271,23 +269,28 @@ tableScanExpression(uint8_t **col, uint64_t** offset, uint8_t *constant_compare,
     cudaMemcpy(d_col, col, num_expr * sizeof(uint8_t*), cudaMemcpyHostToDevice);
     cudaMemcpy(d_offset, offset, num_expr * sizeof(uint64_t*), cudaMemcpyHostToDevice);
 
-    // print_columns<<<1, 1>>>(d_col, d_offset, N);
-    // cudaDeviceSynchronize();
-
     cudaMemset(count, 0, sizeof(uint64_t));
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
-    table_scan_expression<BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(
-            d_col, d_offset, d_constant_compare, d_constant_offset, d_data_type, row_ids, (unsigned long long*) count, N, d_compare_mode, 1, num_expr);
-    CHECK_ERROR();
-    
-    uint64_t* h_count = new uint64_t[1];
-    cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
-    row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
-    cudaMemset(count, 0, sizeof(uint64_t));
+    // table_scan_expression<BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(
+    //         d_col, d_offset, d_constant_compare, d_constant_offset, d_data_type, row_ids, (unsigned long long*) count, N, d_compare_mode, 1, num_expr);
+    // CHECK_ERROR();
+    size_t openmalloc_full = (gpuBufferManager->processing_size_per_gpu - gpuBufferManager->gpuProcessingPointer[0] - 1024) / sizeof(uint64_t);
+    // printf("openmalloc_full: %zu\n", openmalloc_full);
+    // printf("gpuBufferManager->gpuProcessingPointer[0]: %zu\n", gpuBufferManager->gpuProcessingPointer[0]);
+    row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(openmalloc_full, 0, 0);
+
+    // uint64_t* h_count = new uint64_t[1];
+    // cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+    // row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
+    // cudaMemset(count, 0, sizeof(uint64_t));
     table_scan_expression<BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(
             d_col, d_offset, d_constant_compare, d_constant_offset, d_data_type, row_ids, (unsigned long long*) count, N, d_compare_mode, 0, num_expr);
     CHECK_ERROR();
-    cudaDeviceSynchronize();
+
+    uint64_t* h_count = new uint64_t[1];
+    cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+    CHECK_ERROR();
+    gpuBufferManager->gpuProcessingPointer[0] = (reinterpret_cast<uint8_t*>(row_ids + h_count[0]) - gpuBufferManager->gpuProcessing[0]);
     count = h_count;
     printf("Count: %lu\n", h_count[0]); 
 }
