@@ -524,7 +524,7 @@ where
   and s_nationkey = n_nationkey
   and n_name = 'CANADA';");
 
-  call gpu_processing("select
+call gpu_processing("select
   s_name,
   count(*) as numwait
 from

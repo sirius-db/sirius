@@ -99,7 +99,7 @@ __global__ void probe_multikey_count(uint64_t **keys, unsigned long long* ht, ui
 
     __syncthreads();
 
-     if (blockIdx.x * tile_size + threadIdx.x < N) {
+    if (blockIdx.x * tile_size + threadIdx.x < N) {
         offset_each_thread[blockIdx.x * B + threadIdx.x] = block_off + c_t_count;
     }
 
@@ -296,6 +296,10 @@ void probeHashTable(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uin
     CHECK_ERROR();
     cudaDeviceSynchronize();
 
+    // size_t openmalloc_full = (gpuBufferManager->processing_size_per_gpu - gpuBufferManager->gpuProcessingPointer[0] - 1024) / sizeof(uint64_t);
+    // size_t openmalloc_half = openmalloc_full / 2;
+    // row_ids_left = gpuBufferManager->customCudaMalloc<uint64_t>(openmalloc_half, 0, 0);
+    // row_ids_right = gpuBufferManager->customCudaMalloc<uint64_t>(openmalloc_half, 0, 0);
     uint64_t* h_count = new uint64_t[1];
     cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
     assert(h_count[0] > 0);
@@ -306,6 +310,15 @@ void probeHashTable(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uin
             offset_each_thread, row_ids_left, row_ids_right, N, condition_mode_dev, num_keys, equal_keys, is_right);
     CHECK_ERROR();
     cudaDeviceSynchronize();
+    // uint64_t* h_count = new uint64_t [1];
+    // cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+    // assert(h_count[0] > 0);
+    // printf("Count: %lu\n", h_count[0]);
+    // gpuBufferManager->gpuProcessingPointer[0] = (reinterpret_cast<uint8_t*>(row_ids_left + h_count[0]) - gpuBufferManager->gpuProcessing[0]);
+    // cudaMemmove(reinterpret_cast<uint8_t*>(row_ids_left + h_count[0]), reinterpret_cast<uint8_t*>(row_ids_right), h_count[0] * sizeof(uint64_t));
+    // CHECK_ERROR();
+    // row_ids_right = row_ids_left + h_count[0];
+    // gpuBufferManager->gpuProcessingPointer[0] = (reinterpret_cast<uint8_t*>(row_ids_right + h_count[0]) - gpuBufferManager->gpuProcessing[0]);
     count = h_count;
     STOP_TIMER();
 }

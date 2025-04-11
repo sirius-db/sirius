@@ -71,18 +71,23 @@ void
 HandleAggregateExpression(GPUColumn** &aggregate_keys, GPUBufferManager* gpuBufferManager, const vector<unique_ptr<Expression>> &aggregates) {
 	//check if all the aggregate functions are of the same type
 	bool same_type = true;
-	ColumnType prev_type = aggregate_keys[0]->data_wrapper.type;
+	ColumnType prev_type;
 	for (int i = 0; i < aggregates.size(); i++) {
 		if (aggregates[i]->Cast<BoundAggregateExpression>().function.name.compare("count") != 0 && 
 					aggregates[i]->Cast<BoundAggregateExpression>().function.name.compare("count_star") != 0) {
-			if (aggregate_keys[i]->data_wrapper.type != prev_type) {
-				same_type = false;
-			}
 			prev_type = aggregate_keys[i]->data_wrapper.type;
+			break;
 		}
 	}
-	if (!same_type) {
-		throw NotImplementedException("All aggregate functions must be of the same type");
+	for (int i = 0; i < aggregates.size(); i++) {
+		if (aggregates[i]->Cast<BoundAggregateExpression>().function.name.compare("count") != 0 && 
+					aggregates[i]->Cast<BoundAggregateExpression>().function.name.compare("count_star") != 0) {
+			ColumnType aggregate_type = aggregate_keys[i]->data_wrapper.type;
+			if (aggregate_type != prev_type) {
+				throw NotImplementedException("All aggregate functions must be of the same type");
+			}
+			prev_type = aggregate_type;
+		}
 	}
 
     switch(aggregate_keys[0]->data_wrapper.type) {
