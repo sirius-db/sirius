@@ -312,11 +312,15 @@ void SiriusExtension::GPUProcessingSubstraitFunction(ClientContext &context, Tab
 	if (!data.res) {
 		auto start = std::chrono::high_resolution_clock::now();
 		if (data.plan_error || !USE_SIRIUS_FOR_SUBSTRAIT) {
+			auto con = Connection(*context.db);
+			data.plan->context = make_shared_ptr<ClientContextWrapper>(con.context);
 			data.res = data.plan->Execute();
 		} else {
 			data.res = data.gpu_context->GPUExecuteQuery(context, data.query, data.gpu_prepared, {});
 			if (data.res->HasError()) {
 				printf("Error in GPUExecuteQuery, fallback to DuckDB\n");
+				auto con = Connection(*context.db);
+				data.plan->context = make_shared_ptr<ClientContextWrapper>(con.context);
 				data.res = data.plan->Execute();
 			}
 		}
