@@ -264,14 +264,13 @@ SiriusExtension::GPUProcessingSubstraitBind(ClientContext &context, TableFunctio
 
 	auto relation_stmt = make_uniq<RelationStatement>(result->plan);
 	unique_ptr<SQLStatement> statements = std::move(relation_stmt);
+	auto statement_type = statements->type;
+
 	Planner planner(context);
 	planner.CreatePlan(std::move(statements));
 	D_ASSERT(planner.plan);
 
 	if (USE_SIRIUS_FOR_SUBSTRAIT) {
-		auto statement_type = statements->type;
-		printf("%s\n", statements->query.c_str());
-
 		set<OptimizerType> disabled_optimizers = DBConfig::GetConfig(context).options.disabled_optimizers;
 		disabled_optimizers.insert(OptimizerType::IN_CLAUSE);
 		disabled_optimizers.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
