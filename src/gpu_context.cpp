@@ -166,6 +166,7 @@ GPUContext::GPUExecutePendingQueryResult(PendingQueryResult &pending) {
 		gpu_executor.Execute();
 	} catch (std::exception &e) {
 		ErrorData error(e);
+		printf("\033[1;31m"); printf("Error in GPUExecutePendingQueryResult: %s\n", error.RawMessage().c_str()); printf("\033[0m");
 		return GPUErrorResult<MaterializedQueryResult>(error);
 	}
 	if (pending.HasError()) {

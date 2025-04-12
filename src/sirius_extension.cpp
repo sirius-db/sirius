@@ -224,7 +224,7 @@ void SiriusExtension::GPUProcessingFunction(ClientContext &context, TableFunctio
 		}
 		auto end = std::chrono::high_resolution_clock::now();
 		auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-		printf("GPU Execute query time: %.2f ms\n", duration.count()/1000.0);
+		printf("Execute query time: %.2f ms\n", duration.count()/1000.0);
 	}
 
 	// data.finished = true;
