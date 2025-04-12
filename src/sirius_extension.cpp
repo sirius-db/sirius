@@ -214,6 +214,7 @@ void SiriusExtension::GPUProcessingFunction(ClientContext &context, TableFunctio
 	if (!data.res) {
 		auto start = std::chrono::high_resolution_clock::now();
 		if (data.plan_error) {
+			printf("=============================================\nError in GPUExecuteQuery, fallback to DuckDB\n=============================================\n");
 			data.res = data.conn->Query(data.query);
 		} else {
 			data.res = data.gpu_context->GPUExecuteQuery(context, data.query, data.gpu_prepared, {});
@@ -332,6 +333,7 @@ void SiriusExtension::GPUProcessingSubstraitFunction(ClientContext &context, Tab
 	if (!data.res) {
 		auto start = std::chrono::high_resolution_clock::now();
 		if (data.plan_error) {
+			printf("=============================================\nError in GPUExecuteQuery, fallback to DuckDB\n=============================================\n");
 			auto con = Connection(*context.db);
 			data.plan->context = make_shared_ptr<ClientContextWrapper>(con.context);
 			data.res = data.plan->Execute();
@@ -396,7 +398,10 @@ void SiriusExtension::InitializeGPUExtension(Connection &con) {
 	size_t cache_size_per_gpu = 10UL * 1024 * 1024 * 1024; // 10GB
 	size_t processing_size_per_gpu = 11UL * 1024 * 1024 * 1024; //11GB
 	size_t processing_size_per_cpu = 16UL * 1024 * 1024 * 1024; //16GB
-	GPUBufferManager *gpuBufferManager = &(GPUBufferManager::GetInstance(cache_size_per_gpu, processing_size_per_gpu, processing_size_per_cpu));	
+	GPUBufferManager *gpuBufferManager = &(GPUBufferManager::GetInstance(cache_size_per_gpu, processing_size_per_gpu, processing_size_per_cpu));
+
+	//test if cudf is working
+	test_cudf();
 }
 
 void SiriusExtension::Load(DuckDB &db) {

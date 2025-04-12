@@ -8,16 +8,15 @@ find_package(CUDA REQUIRED)
 if(CUDA_FOUND)
     enable_language(CUDA)
 endif()
+find_package(cudf REQUIRED CONFIG)
 
 # Set CONDA environment paths
-# set(CONDA_PREFIX "/mnt/nvme/miniconda3/envs/libcudf-env")
+set(CONDA_PREFIX "/mnt/nvme/miniconda3/envs/libcudf-env2")
 
 # Set CUDA architecture and flags
 set(CMAKE_CUDA_ARCHITECTURES 75)
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-extended-lambda --expt-relaxed-constexpr -rdc=true")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++17")
-
-# link_directories(${CONDA_PREFIX}/lib)
 
 # SET(CMAKE_CXX_FLAGS  "${CMAKE_CXX_FLAGS} -lcudart -lcupti -lcuda")
 set(ENV{SKIP_SUBSTRAIT_C_TESTS} ON)
@@ -32,13 +31,6 @@ include_directories(
 include_directories(duckdb/extension_external/substrait/src/include)
 include_directories(${TARGET_NAME} duckdb/extension_external/substrait/third_party/substrait)
 include_directories(${TARGET_NAME} duckdb/extension_external/substrait/third_party)
-
-# find_library(CUDF_LIBRARY cudf HINTS "${CONDA_PREFIX}/lib" NO_DEFAULT_PATH)
-# find_package(rmm REQUIRED)
-
-# if(NOT CUDF_LIBRARY)
-#     message(FATAL_ERROR "Could not find cudf in Conda environment at ${CONDA_PREFIX}")
-# endif()
 
 set(EXTENSION_SOURCES 
   src/sirius_extension.cpp
@@ -76,9 +68,9 @@ set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
 # Manually specify CUDA include and library directories
 # Include directories
 include_directories(${CUDA_INCLUDE_DIRS})
-# include_directories(${CONDA_PREFIX}/include)
-# include_directories(${CONDA_PREFIX}/include/cudf)
-# include_directories(${CONDA_PREFIX}/include/rmm)
+include_directories(${CONDA_PREFIX}/include)
+include_directories(${CONDA_PREFIX}/include/cudf)
+include_directories(${CONDA_PREFIX}/include/rmm)
 
 # add_library(${EXTENSION_NAME} STATIC ${EXTENSION_SOURCES} ${CUDA_SOURCES})
 
@@ -95,12 +87,32 @@ set_target_properties(${EXTENSION_NAME} PROPERTIES CUDA_SEPARABLE_COMPILATION ON
 set_target_properties(${LOADABLE_EXTENSION_NAME} PROPERTIES LINKER_LANGUAGE CUDA)
 set_target_properties(${LOADABLE_EXTENSION_NAME} PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
-target_link_libraries(${EXTENSION_NAME} substrait_extension)
-target_link_libraries(${LOADABLE_EXTENSION_NAME} substrait_extension)
-# target_link_libraries(${EXTENSION_NAME} ${CUDA_CUDA_LIBRARY} ${CUDA_CUDART_LIBRARY} ${CUDA_cudadevrt_LIBRARY} cuda cudart cupti cudf curand cudadevrt rmm)
-# target_link_libraries(${LOADABLE_EXTENSION_NAME} ${CUDA_CUDA_LIBRARY} ${CUDA_CUDART_LIBRARY} ${CUDA_cudadevrt_LIBRARY} cuda cudart cupti cudf curand cudadevrt rmm)
-target_link_libraries(${EXTENSION_NAME} ${CUDA_CUDA_LIBRARY} ${CUDA_CUDART_LIBRARY} ${CUDA_cudadevrt_LIBRARY} cuda cudart cupti curand cudadevrt)
-target_link_libraries(${LOADABLE_EXTENSION_NAME} ${CUDA_CUDA_LIBRARY} ${CUDA_CUDART_LIBRARY} ${CUDA_cudadevrt_LIBRARY} cuda cudart cupti curand cudadevrt)
+target_link_libraries(${EXTENSION_NAME} 
+      substrait_extension
+      ${CUDA_CUDA_LIBRARY} 
+      ${CUDA_CUDART_LIBRARY} 
+      ${CUDA_cudadevrt_LIBRARY} 
+      cuda 
+      cudart 
+      cupti 
+      curand 
+      cudadevrt
+      cudf::cudf
+      rmm::rmm
+      )
+target_link_libraries(${LOADABLE_EXTENSION_NAME} 
+      substrait_extension
+      ${CUDA_CUDA_LIBRARY} 
+      ${CUDA_CUDART_LIBRARY} 
+      ${CUDA_cudadevrt_LIBRARY} 
+      cuda 
+      cudart 
+      cupti 
+      curand 
+      cudadevrt
+      cudf::cudf
+      rmm::rmm
+      )
 
 install(
   TARGETS ${EXTENSION_NAME}
