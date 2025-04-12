@@ -3,34 +3,38 @@
 #include <cudf/io/csv.hpp>
 #include <cudf/table/table.hpp>
 
-// #include <rmm>
-// #include <rmm/cuda_device.hpp>
-// #include <rmm/mr/device/cuda_memory_resource.hpp>
-// #include <rmm/mr/device/device_memory_resource.hpp>
-// #include <rmm/mr/device/pool_memory_resource.hpp>
+#include <rmm/cuda_device.hpp>
+#include <rmm/mr/device/cuda_memory_resource.hpp>
+#include <rmm/mr/device/device_memory_resource.hpp>
+#include <rmm/mr/device/pool_memory_resource.hpp>
 
 #include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "sirius_extension.hpp"
+
 namespace duckdb {
 
-// cudf::io::table_with_metadata read_csv(std::string const& file_path)
-// {
-//   auto source_info = cudf::io::source_info(file_path);
-//   auto builder     = cudf::io::csv_reader_options::builder(source_info);
-//   auto options     = builder.build();
-//   return cudf::io::read_csv(options);
-// }
+cudf::io::table_with_metadata read_csv(std::string const& file_path)
+{
+  printf("Reading CSV file: %s\n", file_path.c_str());
+  auto source_info = cudf::io::source_info(file_path);
+  auto builder     = cudf::io::csv_reader_options::builder(source_info);
+  // auto options = cudf::io::csv_reader_options::builder(source_info);
+  auto options     = builder.build();
+  // printf("%s\n", options)
+  return cudf::io::read_csv(options);
+}
 
-// void write_csv(cudf::table_view const& tbl_view, std::string const& file_path)
-// {
-//   auto sink_info = cudf::io::sink_info(file_path);
-//   auto builder   = cudf::io::csv_writer_options::builder(sink_info, tbl_view);
-//   auto options   = builder.build();
-//   cudf::io::write_csv(options);
-// }
+void write_csv(cudf::table_view const& tbl_view, std::string const& file_path)
+{
+  auto sink_info = cudf::io::sink_info(file_path);
+  auto builder   = cudf::io::csv_writer_options::builder(sink_info, tbl_view);
+  auto options   = builder.build();
+  cudf::io::write_csv(options);
+}
 
 std::vector<cudf::groupby::aggregation_request> make_single_aggregation_request(
   std::unique_ptr<cudf::groupby_aggregation>&& agg, cudf::column_view value)
@@ -62,31 +66,30 @@ std::unique_ptr<cudf::table> average_closing_price(cudf::table_view stock_info_t
   return std::make_unique<cudf::table>(cudf::table_view(columns));
 }
 
-// void test_cudf()
-// {
-//   // Construct a CUDA memory resource using RAPIDS Memory Manager (RMM)
-//   // This is the default memory resource for libcudf for allocating device memory.
-//   rmm::mr::cuda_memory_resource cuda_mr{};
-//   // Construct a memory pool using the CUDA memory resource
-//   // Using a memory pool for device memory allocations is important for good performance in libcudf.
-//   // The pool defaults to allocating half of the available GPU memory.
-//   rmm::mr::pool_memory_resource mr{&cuda_mr, rmm::percent_of_free_device_memory(10)};
+void test_cudf()
+{
+  // Construct a CUDA memory resource using RAPIDS Memory Manager (RMM)
+  // This is the default memory resource for libcudf for allocating device memory.
+  rmm::mr::cuda_memory_resource cuda_mr{};
+  // Construct a memory pool using the CUDA memory resource
+  // Using a memory pool for device memory allocations is important for good performance in libcudf.
+  // The pool defaults to allocating half of the available GPU memory.
+  rmm::mr::pool_memory_resource mr{&cuda_mr, rmm::percent_of_free_device_memory(10)};
 
-//   // Set the pool resource to be used by default for all device memory allocations
-//   // Note: It is the user's responsibility to ensure the `mr` object stays alive for the duration of
-//   // it being set as the default
-//   // Also, call this before the first libcudf API call to ensure all data is allocated by the same
-//   // memory resource.
-//   cudf::set_current_device_resource(&mr);
+  // Set the pool resource to be used by default for all device memory allocations
+  // Note: It is the user's responsibility to ensure the `mr` object stays alive for the duration of
+  // it being set as the default
+  // Also, call this before the first libcudf API call to ensure all data is allocated by the same
+  // memory resource.
+  cudf::set_current_device_resource(&mr);
 
-//   // Read data
-// //   auto stock_table_with_metadata = read_csv("4stock_5day.csv");
+  // Read data
+  auto stock_table_with_metadata = read_csv("/mnt/ordered/4stock_5day.csv");
+  // Process
+  auto result = average_closing_price(*stock_table_with_metadata.tbl);
 
-//   // Process
-// //   auto result = average_closing_price(*stock_table_with_metadata.tbl);
-
-//   // Write out result
-// //   write_csv(*result, "4stock_5day_avg_close.csv");
-// }
+  // Write out result
+  write_csv(*result, "/mnt/ordered/4stock_5day_avg_close.csv");
+}
 
 } //namespace duckdb
