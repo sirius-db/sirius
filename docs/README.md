@@ -31,7 +31,7 @@ git clone https://github.com/duckdb/substrait.git
 cd substrait
 git reset --hard 611d92b9980c3b673ba3755bc10dfdb6f94e7384 #go to the right commit hash for duckdb substrait extension
 cd {SIRIUS_HOME_PATH}
-make -j 8 #build extension
+make -j {nproc} #build extension
 ```
 Currently, we are using duckdb v1.0.0. Since we develop it as an extension and no modification is made to the duckdb source code, it should not be too difficult to bump it to the latest duckdb and substrait version.
 
@@ -82,6 +82,24 @@ The GPU caching region is a memory region where the raw data is stored in GPUs. 
 The TPC-H queries is in the `queries` folder. 
 Queries in the `queries/working` folder should work in Sirius (These queries does not include string and order by operations).
 Queries in the `queries/inprogress` folder is still under development.
+
+## Using libcudf with Sirius (optional)
+If users want to integrate with libcudf, it is recommended to install libcudf via conda/miniconda. Miniconda can be downloaded [here](https://www.anaconda.com/docs/getting-started/miniconda/install). After downloading miniconda, user can install libcudf via these commands:
+```
+conda create --name libcudf-env
+conda activate libcudf-env
+conda install -c rapidsai -c conda-forge -c nvidia rapidsai::libcudf
+```
+After the installation is done, make sure that the [CONDA_PREFIX] point to the right path.
+
+libcudf might requires a later cmake version, as of April 2025, it would require cmake between version 3.30.4 and 3.5. User can follow the instruction in this [link](https://medium.com/@yulin_li/how-to-update-cmake-on-ubuntu-9602521deecb) to download the specific cmake version.
+
+To use libcudf, set the environment variable USE_CUDF, and rebuild sirius.
+```
+export USE_CUDF=1
+rm -r build/*
+make -j {nproc}
+```
 
 ## Devesh Notes
 We have provided a helper docker container that you can easily use to install all the depedencies:
