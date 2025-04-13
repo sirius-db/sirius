@@ -1,23 +1,31 @@
 cmake_minimum_required(VERSION 3.20)
 
+# Check for USE_CUDF environment variable
+if(DEFINED ENV{USE_CUDF})
+    message(STATUS "USE_CUDF environment variable is set")
+    set(USE_CUDF ON)
+    add_compile_definitions(ENABLE_CUDF)
+else()
+    message(STATUS "USE_CUDF environment variable is not set")
+    set(USE_CUDF OFF)
+endif()
+
 # Set extension name here
 set(TARGET_NAME sirius)
 
 project(${TARGET_NAME} LANGUAGES CXX CUDA)
-find_package(CUDA REQUIRED)
-if(CUDA_FOUND)
-    enable_language(CUDA)
+if (USE_CUDF)
+  find_package(cudf REQUIRED CONFIG)
+  set(CONDA_PREFIX "/mnt/nvme/miniconda3/envs/libcudf-env")
+else()
+  find_package(CUDA REQUIRED)
+  enable_language(CUDA)
 endif()
-
-# Set CONDA environment paths
-# set(CONDA_PREFIX "/mnt/nvme/miniconda3/envs/libcudf-env")
 
 # Set CUDA architecture and flags
 set(CMAKE_CUDA_ARCHITECTURES 75)
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-extended-lambda --expt-relaxed-constexpr -rdc=true")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++17")
-
-# link_directories(${CONDA_PREFIX}/lib)
 
 # SET(CMAKE_CXX_FLAGS  "${CMAKE_CXX_FLAGS} -lcudart -lcupti -lcuda")
 set(ENV{SKIP_SUBSTRAIT_C_TESTS} ON)
@@ -32,13 +40,6 @@ include_directories(
 include_directories(duckdb/extension_external/substrait/src/include)
 include_directories(${TARGET_NAME} duckdb/extension_external/substrait/third_party/substrait)
 include_directories(${TARGET_NAME} duckdb/extension_external/substrait/third_party)
-
-# find_library(CUDF_LIBRARY cudf HINTS "${CONDA_PREFIX}/lib" NO_DEFAULT_PATH)
-# find_package(rmm REQUIRED)
-
-# if(NOT CUDF_LIBRARY)
-#     message(FATAL_ERROR "Could not find cudf in Conda environment at ${CONDA_PREFIX}")
-# endif()
 
 set(EXTENSION_SOURCES 
   src/sirius_extension.cpp
@@ -65,7 +66,9 @@ set(CUDA_SOURCES
 )
 add_subdirectory(src/cuda/operator)
 add_subdirectory(src/cuda/query_specific)
-
+if (USE_CUDF)
+  add_subdirectory(src/cuda/cudf)
+endif()
 
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CXX_STANDARD 17)
@@ -76,9 +79,11 @@ set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
 # Manually specify CUDA include and library directories
 # Include directories
 include_directories(${CUDA_INCLUDE_DIRS})
-# include_directories(${CONDA_PREFIX}/include)
-# include_directories(${CONDA_PREFIX}/include/cudf)
-# include_directories(${CONDA_PREFIX}/include/rmm)
+if (USE_CUDF)
+  include_directories(${CONDA_PREFIX}/include)
+  include_directories(${CONDA_PREFIX}/include/cudf)
+  include_directories(${CONDA_PREFIX}/include/rmm)
+endif()
 
 # add_library(${EXTENSION_NAME} STATIC ${EXTENSION_SOURCES} ${CUDA_SOURCES})
 
@@ -95,12 +100,33 @@ set_target_properties(${EXTENSION_NAME} PROPERTIES CUDA_SEPARABLE_COMPILATION ON
 set_target_properties(${LOADABLE_EXTENSION_NAME} PROPERTIES LINKER_LANGUAGE CUDA)
 set_target_properties(${LOADABLE_EXTENSION_NAME} PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
-target_link_libraries(${EXTENSION_NAME} substrait_extension)
-target_link_libraries(${LOADABLE_EXTENSION_NAME} substrait_extension)
-# target_link_libraries(${EXTENSION_NAME} ${CUDA_CUDA_LIBRARY} ${CUDA_CUDART_LIBRARY} ${CUDA_cudadevrt_LIBRARY} cuda cudart cupti cudf curand cudadevrt rmm)
-# target_link_libraries(${LOADABLE_EXTENSION_NAME} ${CUDA_CUDA_LIBRARY} ${CUDA_CUDART_LIBRARY} ${CUDA_cudadevrt_LIBRARY} cuda cudart cupti cudf curand cudadevrt rmm)
-target_link_libraries(${EXTENSION_NAME} ${CUDA_CUDA_LIBRARY} ${CUDA_CUDART_LIBRARY} ${CUDA_cudadevrt_LIBRARY} cuda cudart cupti curand cudadevrt)
-target_link_libraries(${LOADABLE_EXTENSION_NAME} ${CUDA_CUDA_LIBRARY} ${CUDA_CUDART_LIBRARY} ${CUDA_cudadevrt_LIBRARY} cuda cudart cupti curand cudadevrt)
+target_link_libraries(${EXTENSION_NAME} 
+      substrait_extension
+      ${CUDA_CUDA_LIBRARY} 
+      ${CUDA_CUDART_LIBRARY} 
+      ${CUDA_cudadevrt_LIBRARY} 
+      cuda 
+      cudart 
+      cupti 
+      curand 
+      cudadevrt
+      )
+target_link_libraries(${LOADABLE_EXTENSION_NAME} 
+      substrait_extension
+      ${CUDA_CUDA_LIBRARY} 
+      ${CUDA_CUDART_LIBRARY} 
+      ${CUDA_cudadevrt_LIBRARY} 
+      cuda 
+      cudart 
+      cupti 
+      curand 
+      cudadevrt
+      )
+
+if (USE_CUDF)
+  target_link_libraries(${EXTENSION_NAME} cudf::cudf rmm::rmm)
+  target_link_libraries(${LOADABLE_EXTENSION_NAME} cudf::cudf rmm::rmm)
+endif()
 
 install(
   TARGETS ${EXTENSION_NAME}

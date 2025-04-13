@@ -13,3 +13,5 @@ duckdb/*
 CMakeFiles/
 CMakeCache.txt
 dbgen/
+cufile.log
+4stock_5day_avg_close.csv
