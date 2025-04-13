@@ -38,15 +38,15 @@ Currently, we are using duckdb v1.0.0. Since we develop it as an extension and n
 ## Running the extension
 To run the extension code, simply start the shell with `./build/release/duckdb`. This shell will have the extension pre-loaded. 
 
-To cache data in GPUs (e.g. caching l_orderkey from lineitem)
+<!-- To cache data in GPUs (e.g. caching l_orderkey from lineitem)
 ```
 D call gpu_caching("lineitem.l_orderkey")
-```
+``` -->
 
-We also provided a script (load.txt) to cache all the TPC-H columns in GPUs.
+<!-- We also provided a script (load.txt) to cache all the TPC-H columns in GPUs.
 ```
 D .read load.txt
-```
+``` -->
 
 To execute query on GPUs
 ```
@@ -70,6 +70,8 @@ group by
   o_orderdate,
   o_shippriority;")
 ```
+
+The cold run would be slow as Sirius would need to read the data from storage via DuckDB and does a data format conversion from the DuckDB format to Sirius native format. The hot run of the queries would be significantly faster as the data would alreadby be cached on the device memory.
 
 ## Generating TPC-H dataset
 Unzip `dbgen.zip` and run `./dbgen -s {SF}`.
@@ -101,7 +103,7 @@ rm -r build/*
 make -j {nproc}
 ```
 
-## Devesh Notes
+<!-- ## Devesh Notes
 We have provided a helper docker container that you can easily use to install all the depedencies:
 ```
 $ cd ..
@@ -153,4 +155,4 @@ Prefix query:
 $ call gpu_caching("part.p_name");
 $ select p_name from part where p_name like 'forest%';
 $ call gpu_processing("select p_name from part where p_name like 'forest%';");
-```
+``` -->
