@@ -1,0 +1,5 @@
+set(CUDA_SOURCES
+        ${CUDA_SOURCES}
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_cudf.cu
+        PARENT_SCOPE
+)

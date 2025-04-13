@@ -17,6 +17,29 @@
 
 namespace duckdb {
 
+// cudf::io::table_with_metadata read_csv(std::string const& file_path)
+// {
+//   auto source_info = cudf::io::source_info(file_path);
+//   std::map<std::string, cudf::data_type> dtypes;
+//   dtypes["Company"] = cudf::data_type(cudf::type_id::STRING);
+//   dtypes["Date"] = cudf::data_type(cudf::type_id::STRING);
+//   dtypes["Open"] = cudf::data_type(cudf::type_id::FLOAT64);
+//   dtypes["High"] = cudf::data_type(cudf::type_id::FLOAT64);
+//   dtypes["Low"] = cudf::data_type(cudf::type_id::FLOAT64);
+//   dtypes["Close"] = cudf::data_type(cudf::type_id::FLOAT64);
+//   dtypes["Volume"] = cudf::data_type(cudf::type_id::FLOAT64);
+//   // auto builder     = cudf::io::csv_reader_options::builder(source_info);
+//   auto options = cudf::io::csv_reader_options::builder(source_info);
+//   options.header(0);
+//   options.dtypes(dtypes);
+//   options.delimiter(',');
+//   // auto options     = builder.build();
+//   // printf("%s\n", options)
+//   printf("here\n");
+//   return cudf::io::read_csv(options);
+// }
+
+
 cudf::io::table_with_metadata read_csv(std::string const& file_path)
 {
   printf("Reading CSV file: %s\n", file_path.c_str());
