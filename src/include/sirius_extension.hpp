@@ -7,6 +7,7 @@ namespace duckdb {
 
 // Declaration of the CUDA kernel
 extern void myKernel();
+extern void test_cudf();
 
 class GPUBufferManager;
 class SiriusExtension : public Extension {

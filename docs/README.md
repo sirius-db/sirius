@@ -31,22 +31,22 @@ git clone https://github.com/duckdb/substrait.git
 cd substrait
 git reset --hard 611d92b9980c3b673ba3755bc10dfdb6f94e7384 #go to the right commit hash for duckdb substrait extension
 cd {SIRIUS_HOME_PATH}
-make -j 8 #build extension
+make -j {nproc} #build extension
 ```
 Currently, we are using duckdb v1.0.0. Since we develop it as an extension and no modification is made to the duckdb source code, it should not be too difficult to bump it to the latest duckdb and substrait version.
 
 ## Running the extension
 To run the extension code, simply start the shell with `./build/release/duckdb`. This shell will have the extension pre-loaded. 
 
-To cache data in GPUs (e.g. caching l_orderkey from lineitem)
+<!-- To cache data in GPUs (e.g. caching l_orderkey from lineitem)
 ```
 D call gpu_caching("lineitem.l_orderkey")
-```
+``` -->
 
-We also provided a script (load.txt) to cache all the TPC-H columns in GPUs.
+<!-- We also provided a script (load.txt) to cache all the TPC-H columns in GPUs.
 ```
 D .read load.txt
-```
+``` -->
 
 To execute query on GPUs
 ```
@@ -71,6 +71,8 @@ group by
   o_shippriority;")
 ```
 
+The cold run would be slow as Sirius would need to read the data from storage via DuckDB and does a data format conversion from the DuckDB format to Sirius native format. The hot run of the queries would be significantly faster as the data would alreadby be cached on the device memory.
+
 ## Generating TPC-H dataset
 Unzip `dbgen.zip` and run `./dbgen -s {SF}`.
 To load the dataset to duckdb, use the SQL command in `{SIRIUS_HOME_PATH}\tpch_load_duckdb_simple.sql`.
@@ -83,7 +85,25 @@ The TPC-H queries is in the `queries` folder.
 Queries in the `queries/working` folder should work in Sirius (These queries does not include string and order by operations).
 Queries in the `queries/inprogress` folder is still under development.
 
-## Devesh Notes
+## Using libcudf with Sirius (optional)
+If users want to integrate with libcudf, it is recommended to install libcudf via conda/miniconda. Miniconda can be downloaded [here](https://www.anaconda.com/docs/getting-started/miniconda/install). After downloading miniconda, user can install libcudf via these commands:
+```
+conda create --name libcudf-env
+conda activate libcudf-env
+conda install -c rapidsai -c conda-forge -c nvidia rapidsai::libcudf
+```
+User would also need to make sure that the [CONDA_PREFIX](https://github.com/sirius-db/sirius/blob/eaeb793188a15760c2e41fed307b7ffcfb9c1454/CMakeLists.txt#L19) point to the right location.
+
+libcudf might requires a later cmake version, as of April 2025, it would require cmake between version 3.30.4 and 3.5. User can follow the instruction in this [link](https://medium.com/@yulin_li/how-to-update-cmake-on-ubuntu-9602521deecb) to download the specific cmake version.
+
+To use libcudf, set the environment variable USE_CUDF, and rebuild sirius.
+```
+export USE_CUDF=1
+rm -r build/*
+make -j {nproc}
+```
+
+<!-- ## Devesh Notes
 We have provided a helper docker container that you can easily use to install all the depedencies:
 ```
 $ cd ..
@@ -135,4 +155,4 @@ Prefix query:
 $ call gpu_caching("part.p_name");
 $ select p_name from part where p_name like 'forest%';
 $ call gpu_processing("select p_name from part where p_name like 'forest%';");
-```
+``` -->
