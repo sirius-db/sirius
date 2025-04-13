@@ -1,13 +1,26 @@
 cmake_minimum_required(VERSION 3.20)
 
+# Check for USE_CUDF environment variable
+if(DEFINED ENV{USE_CUDF})
+    message(STATUS "USE_CUDF environment variable is set")
+    set(USE_CUDF ON)
+    add_compile_definitions(ENABLE_CUDF)
+else()
+    message(STATUS "USE_CUDF environment variable is not set")
+    set(USE_CUDF OFF)
+endif()
+
 # Set extension name here
 set(TARGET_NAME sirius)
 
 project(${TARGET_NAME} LANGUAGES CXX CUDA)
-find_package(cudf REQUIRED CONFIG)
-
-# Set CONDA environment paths
-set(CONDA_PREFIX "/mnt/nvme/miniconda3/envs/libcudf-env2")
+if (USE_CUDF)
+  find_package(cudf REQUIRED CONFIG)
+  set(CONDA_PREFIX "/mnt/nvme/miniconda3/envs/libcudf-env2")
+else()
+  find_package(CUDA REQUIRED)
+  enable_language(CUDA)
+endif()
 
 # Set CUDA architecture and flags
 set(CMAKE_CUDA_ARCHITECTURES 75)
@@ -53,7 +66,9 @@ set(CUDA_SOURCES
 )
 add_subdirectory(src/cuda/operator)
 add_subdirectory(src/cuda/query_specific)
-
+if (USE_CUDF)
+  add_subdirectory(src/cuda/cudf)
+endif()
 
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CXX_STANDARD 17)
@@ -64,9 +79,11 @@ set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
 # Manually specify CUDA include and library directories
 # Include directories
 include_directories(${CUDA_INCLUDE_DIRS})
-include_directories(${CONDA_PREFIX}/include)
-include_directories(${CONDA_PREFIX}/include/cudf)
-include_directories(${CONDA_PREFIX}/include/rmm)
+if (USE_CUDF)
+  include_directories(${CONDA_PREFIX}/include)
+  include_directories(${CONDA_PREFIX}/include/cudf)
+  include_directories(${CONDA_PREFIX}/include/rmm)
+endif()
 
 # add_library(${EXTENSION_NAME} STATIC ${EXTENSION_SOURCES} ${CUDA_SOURCES})
 
@@ -93,8 +110,6 @@ target_link_libraries(${EXTENSION_NAME}
       cupti 
       curand 
       cudadevrt
-      cudf::cudf
-      rmm::rmm
       )
 target_link_libraries(${LOADABLE_EXTENSION_NAME} 
       substrait_extension
@@ -106,9 +121,12 @@ target_link_libraries(${LOADABLE_EXTENSION_NAME}
       cupti 
       curand 
       cudadevrt
-      cudf::cudf
-      rmm::rmm
       )
+
+if (USE_CUDF)
+  target_link_libraries(${EXTENSION_NAME} cudf::cudf rmm::rmm)
+  target_link_libraries(${LOADABLE_EXTENSION_NAME} cudf::cudf rmm::rmm)
+endif()
 
 install(
   TARGETS ${EXTENSION_NAME}

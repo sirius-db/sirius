@@ -27,6 +27,8 @@
 #include "gpu_physical_plan_generator.hpp"
 #include "gpu_buffer_manager.hpp"
 
+#include <cstdlib>
+
 namespace duckdb {
 
 struct GPUTableFunctionData : public TableFunctionData {
@@ -401,7 +403,9 @@ void SiriusExtension::InitializeGPUExtension(Connection &con) {
 	GPUBufferManager *gpuBufferManager = &(GPUBufferManager::GetInstance(cache_size_per_gpu, processing_size_per_gpu, processing_size_per_cpu));
 
 	//test if cudf is working
+#ifdef ENABLE_CUDF
 	test_cudf();
+#endif
 }
 
 void SiriusExtension::Load(DuckDB &db) {
