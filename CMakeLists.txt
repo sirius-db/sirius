@@ -4,10 +4,6 @@ cmake_minimum_required(VERSION 3.20)
 set(TARGET_NAME sirius)
 
 project(${TARGET_NAME} LANGUAGES CXX CUDA)
-find_package(CUDA REQUIRED)
-if(CUDA_FOUND)
-    enable_language(CUDA)
-endif()
 find_package(cudf REQUIRED CONFIG)
 
 # Set CONDA environment paths

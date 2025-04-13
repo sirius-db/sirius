@@ -84,12 +84,12 @@ void test_cudf()
   cudf::set_current_device_resource(&mr);
 
   // Read data
-  auto stock_table_with_metadata = read_csv("/mnt/ordered/4stock_5day.csv");
+  auto stock_table_with_metadata = read_csv("/mnt/nvme/sirius/4stock_5day.csv");
   // Process
   auto result = average_closing_price(*stock_table_with_metadata.tbl);
 
   // Write out result
-  write_csv(*result, "/mnt/ordered/4stock_5day_avg_close.csv");
+  write_csv(*result, "/mnt/nvme/sirius/4stock_5day_avg_close.csv");
 }
 
 } //namespace duckdb
