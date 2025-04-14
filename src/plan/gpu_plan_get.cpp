@@ -127,6 +127,7 @@ unique_ptr<TableFilterSet> GPUCreateTableFilterSet(TableFilterSet &table_filters
 unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::CreatePlan(LogicalGet &op) {
 	auto column_ids = op.GetColumnIds();
 	if (!op.children.empty()) {
+		throw NotImplementedException("Table Input Output functions are not supported yet");
 		// auto child_node = CreatePlan(std::move(op.children[0]));
 		// // this is for table producing functions that consume subquery results
 		// // push a projection node with casts if required
@@ -226,7 +227,7 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::CreatePlan(LogicalGet 
 		auto node = make_uniq<GPUPhysicalTableScan>(op.returned_types, op.function, std::move(op.bind_data),
 		                                         op.returned_types, column_ids, vector<column_t>(), op.names,
 		                                         std::move(table_filters), op.estimated_cardinality, op.extra_info,
-		                                         std::move(op.parameters), std::move(op.virtual_columns));
+		                                         std::move(op.parameters));
 		// first check if an additional projection is necessary
 		if (column_ids.size() == op.returned_types.size()) {
 			bool projection_necessary = false;
@@ -250,8 +251,10 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::CreatePlan(LogicalGet 
 		vector<LogicalType> types;
 		vector<unique_ptr<Expression>> expressions;
 		for (auto &column_id : column_ids) {
-			if (column_id.IsVirtualColumn()) {
-				throw NotImplementedException("Virtual columns require projection pushdown");
+			if (column_id.IsRowIdColumn()) {
+				types.emplace_back(op.GetRowIdType());
+				// Now how to make that a constant expression.
+				expressions.push_back(make_uniq<BoundConstantExpression>(Value(op.GetRowIdType())));
 			} else {
 				auto col_id = column_id.GetPrimaryIndex();
 				auto type = op.returned_types[col_id];
@@ -271,8 +274,7 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::CreatePlan(LogicalGet 
 	} else {
 		auto node = make_uniq<GPUPhysicalTableScan>(op.types, op.function, std::move(op.bind_data), op.returned_types,
 		                                         column_ids, op.projection_ids, op.names, std::move(table_filters),
-		                                         op.estimated_cardinality, op.extra_info, std::move(op.parameters),
-		                                         std::move(op.virtual_columns));
+		                                         op.estimated_cardinality, op.extra_info, std::move(op.parameters));
 		node->dynamic_filters = op.dynamic_filters;
 		if (filter) {
 			filter->children.push_back(std::move(node));
