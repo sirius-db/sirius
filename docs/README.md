@@ -94,7 +94,7 @@ conda install -c rapidsai -c conda-forge -c nvidia rapidsai::libcudf
 ```
 User would also need to make sure that the [CONDA_PREFIX](https://github.com/sirius-db/sirius/blob/eaeb793188a15760c2e41fed307b7ffcfb9c1454/CMakeLists.txt#L19) point to the right location.
 
-libcudf might requires a later cmake version, as of April 2025, it would require cmake between version 3.30.4 and 3.5. User can follow the instruction in this [link](https://medium.com/@yulin_li/how-to-update-cmake-on-ubuntu-9602521deecb) to download the specific cmake version.
+libcudf might requires a later cmake version, as of April 2025, it would require cmake version > 3.30.4. User can follow the instruction in this [link](https://medium.com/@yulin_li/how-to-update-cmake-on-ubuntu-9602521deecb) to download the specific cmake version.
 
 To use libcudf, set the environment variable USE_CUDF, and rebuild sirius.
 ```

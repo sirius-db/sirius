@@ -146,19 +146,8 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::CreatePlan(LogicalCTER
 		throw InvalidInputException("Referenced recursive CTE does not exist.");
 	}
 
-	// If we found a recursive CTE and we want to scan the recurring table, we search for it,
-	if (op.is_recurring) {
-        throw NotImplementedException("RECURRING is not implemented");
-		// cte = recurring_cte_tables.find(op.cte_index);
-		// if (cte == recurring_cte_tables.end()) {
-		// 	throw InvalidInputException("RECURRING can only be used with USING KEY in recursive CTE.");
-		// }
-	}
-
 	auto chunk_scan = make_uniq<GPUPhysicalColumnDataScan>(
-	    cte->second.get()->Types(),
-	    op.is_recurring ? PhysicalOperatorType::RECURSIVE_RECURRING_CTE_SCAN : PhysicalOperatorType::RECURSIVE_CTE_SCAN,
-	    op.estimated_cardinality, op.cte_index);
+	    cte->second.get()->Types(), PhysicalOperatorType::RECURSIVE_CTE_SCAN, op.estimated_cardinality, op.cte_index);
 
 	chunk_scan->collection = cte->second.get();
 
