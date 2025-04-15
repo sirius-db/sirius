@@ -256,7 +256,7 @@ SiriusExtension::GPUProcessingSubstraitBind(ClientContext &context, TableFunctio
 		throw BinderException("gpu_processing cannot be called with a NULL parameter");
 	}
 	string serialized = input.inputs[0].GetValueUnsafe<string>();
-	bool is_json = input.inputs.size() < 2 ? false : input.inputs[1].GetValueUnsafe<bool>();
+	bool is_json = input.inputs.size() < 2 ? true : input.inputs[1].GetValueUnsafe<bool>();
 
 	shared_ptr<ClientContext> c_ptr(&context, do_nothing_context);
 	SubstraitToDuckDB transformer_s2d(c_ptr, serialized, is_json, false);
@@ -311,13 +311,16 @@ void SiriusExtension::GPUProcessingSubstraitFunction(ClientContext &context, Tab
 	if (!data.res) {
 		auto start = std::chrono::high_resolution_clock::now();
 		if (data.plan_error || !USE_SIRIUS_FOR_SUBSTRAIT) {
+			if (USE_SIRIUS_FOR_SUBSTRAIT) {
+				printf("Plan Error in GPUProcessingSubstraitBind, fallback to DuckDB\n");
+			}
 			auto con = Connection(*context.db);
 			data.plan->context = make_shared_ptr<ClientContextWrapper>(con.context);
 			data.res = data.plan->Execute();
 		} else {
 			data.res = data.gpu_context->GPUExecuteQuery(context, data.query, data.gpu_prepared, {});
 			if (data.res->HasError()) {
-				printf("Error in GPUExecuteQuery, fallback to DuckDB\n");
+				printf("Error in GPUExecuteQuery, fallback to DuckDB. Error: %s\n", data.res->GetError().c_str());
 				auto con = Connection(*context.db);
 				data.plan->context = make_shared_ptr<ClientContextWrapper>(con.context);
 				data.res = data.plan->Execute();
@@ -367,7 +370,7 @@ void SiriusExtension::InitializeGPUExtension(Connection &con) {
 	CreateTableFunctionInfo gpu_processing_info(gpu_processing);
 	catalog.CreateTableFunction(*con.context, gpu_processing_info);
 
-	TableFunction gpu_processing_substrait("gpu_processing_substrait", {LogicalType::BLOB}, GPUProcessingSubstraitFunction, GPUProcessingSubstraitBind);
+	TableFunction gpu_processing_substrait("gpu_processing_substrait", {LogicalType::VARCHAR}, GPUProcessingSubstraitFunction, GPUProcessingSubstraitBind);
 	// gpu_processing.named_parameters["enable_optimizer"] = LogicalType::BOOLEAN;
 	CreateTableFunctionInfo gpu_processing_substrait_info(gpu_processing_substrait);
 	catalog.CreateTableFunction(*con.context, gpu_processing_substrait_info);

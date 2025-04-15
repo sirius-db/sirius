@@ -48,7 +48,7 @@ public:
 	static unique_ptr<FunctionData> GPUCachingBind(ClientContext &context, TableFunctionBindInput &input, vector<LogicalType> &return_types, vector<string> &names);
 
 	// If false, then use duckdb to process substrait.
-	static constexpr bool USE_SIRIUS_FOR_SUBSTRAIT = false;
+	static constexpr bool USE_SIRIUS_FOR_SUBSTRAIT = true;
 };
 
 } // namespace duckdb
