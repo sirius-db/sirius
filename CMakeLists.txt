@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.30.4)
+cmake_minimum_required(VERSION 3.20)
 
 # Check for USE_CUDF environment variable
 if(DEFINED ENV{USE_CUDF})
