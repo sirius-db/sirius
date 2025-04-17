@@ -55,6 +55,8 @@ public:
 	//! The current query progress
 	QueryProgress query_progress;
 
+	string* result_intermediate_table_name = nullptr;
+
     GPUExecutor &GetGPUExecutor();
 
 	unique_ptr<PendingQueryResult> GPUPendingStatementInternal(ClientContext &context, shared_ptr<GPUPreparedStatementData> &statement_p,

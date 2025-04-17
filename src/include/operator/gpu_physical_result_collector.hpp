@@ -22,6 +22,7 @@ public:
 	GPUPhysicalOperator &plan;
 	vector<string> names;
 	GPUBufferManager *gpuBufferManager;
+	string* result_intermediate_table_name = nullptr;
 
 // public:
 // 	static unique_ptr<PhysicalResultCollector> GetResultCollector(ClientContext &context, PreparedStatementData &data);

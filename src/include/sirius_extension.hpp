@@ -23,7 +23,10 @@ public:
 		bool enable_optimizer;
 		bool finished = false;
 		bool plan_error = false;
+
+		// Set when used by sirius server
 		bool is_sirius_server = false;		// should not consume result if called by sirius server
+		string* result_intermediate_table_name = nullptr;
 	};
 
 	struct GPUCachingFunctionData : public TableFunctionData {
@@ -46,6 +49,12 @@ public:
 	static unique_ptr<FunctionData> GPUProcessingSubstraitBind(ClientContext &context, TableFunctionBindInput &input, vector<LogicalType> &return_types, vector<string> &names);
 	static unique_ptr<FunctionData> GPUProcessingBind(ClientContext &context, TableFunctionBindInput &input, vector<LogicalType> &return_types, vector<string> &names);
 	static unique_ptr<FunctionData> GPUCachingBind(ClientContext &context, TableFunctionBindInput &input, vector<LogicalType> &return_types, vector<string> &names);
+
+	// Make and extract additional inputs used by sirius server
+	static const string KEY_PLAN_IN_JSON;
+	static const string KEY_SOURCE_EXCHANGE_TABLES;
+	static Value MakeSiriusServerAdditionalInputsStruct(bool plan_in_json, const std::vector<string>& source_exchange_tables);
+	static void ExtractSiriusServerAdditionalInputs(const Value& additional_input_struct, bool* plan_in_json, std::vector<string>& source_exchange_tables);
 
 	// If false, then use duckdb to process substrait.
 	static constexpr bool USE_SIRIUS_FOR_SUBSTRAIT = true;

@@ -256,7 +256,20 @@ SiriusExtension::GPUProcessingSubstraitBind(ClientContext &context, TableFunctio
 		throw BinderException("gpu_processing cannot be called with a NULL parameter");
 	}
 	string serialized = input.inputs[0].GetValueUnsafe<string>();
-	bool is_json = input.inputs.size() < 2 ? true : input.inputs[1].GetValueUnsafe<bool>();
+	bool is_json;
+
+	// Additional inputs if used by sirius server
+	if (input.inputs.size() > 1) {
+		std::vector<string> source_exchange_tables;
+		ExtractSiriusServerAdditionalInputs(input.inputs[1], &is_json, source_exchange_tables);
+		printf("[source_exchange_tables]");
+		for (const auto& t: source_exchange_tables) {
+			printf(" %s", t.c_str());
+		}
+		printf("\n");
+	} else {
+		is_json = true;
+	}
 
 	shared_ptr<ClientContext> c_ptr(&context, do_nothing_context);
 	SubstraitToDuckDB transformer_s2d(c_ptr, serialized, is_json, false);
@@ -310,23 +323,47 @@ void SiriusExtension::GPUProcessingSubstraitFunction(ClientContext &context, Tab
 
 	if (!data.res) {
 		auto start = std::chrono::high_resolution_clock::now();
-		if (data.plan_error || !USE_SIRIUS_FOR_SUBSTRAIT) {
-			if (USE_SIRIUS_FOR_SUBSTRAIT) {
-				printf("Plan Error in GPUProcessingSubstraitBind, fallback to DuckDB\n");
+		bool use_duckdb = !USE_SIRIUS_FOR_SUBSTRAIT;
+
+		// Check plan error
+		if (!use_duckdb) {
+			if (data.plan_error) {
+				if (data.is_sirius_server) {
+					// Fallback should not be used by sirius server
+					throw InternalException("Plan Error in GPUProcessingSubstraitBind");
+				} else {
+					// Fallback is used in standalone sirius
+					printf("Plan Error in GPUProcessingSubstraitBind, fallback to DuckDB\n");
+					use_duckdb = true;
+				}
 			}
+		}
+
+		// Try sirius execution
+		if (!use_duckdb) {
+			if (data.is_sirius_server) {
+				data.gpu_context->result_intermediate_table_name = data.result_intermediate_table_name;
+			}
+			data.res = data.gpu_context->GPUExecuteQuery(context, data.query, data.gpu_prepared, {});
+			if (data.res != nullptr && data.res->HasError()) {
+				if (data.is_sirius_server) {
+					// Fallback should not be used by sirius server
+					throw InternalException("Error in GPUExecuteQuery: " + data.res->GetError());
+				} else {
+					// Fallback is used in standalone sirius
+					printf("Error in GPUExecuteQuery, fallback to DuckDB. Error: %s\n", data.res->GetError().c_str());
+					use_duckdb = true;
+				}
+			}
+		}
+
+		// Fallback to duckdb execution if needed
+		if (use_duckdb) {
 			auto con = Connection(*context.db);
 			data.plan->context = make_shared_ptr<ClientContextWrapper>(con.context);
 			data.res = data.plan->Execute();
-		} else {
-			data.res = data.gpu_context->GPUExecuteQuery(context, data.query, data.gpu_prepared, {});
-			if (data.res->HasError()) {
-				printf("Error in GPUExecuteQuery, fallback to DuckDB. Error: %s\n", data.res->GetError().c_str());
-				auto con = Connection(*context.db);
-				data.plan->context = make_shared_ptr<ClientContextWrapper>(con.context);
-				data.res = data.plan->Execute();
-			}
 		}
-		// data.res->Print();
+
 		auto end = std::chrono::high_resolution_clock::now();
 		auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
 		printf("GPU Execute query time: %.2f ms\n", duration.count()/1000.0);
@@ -392,6 +429,41 @@ void SiriusExtension::Load(DuckDB &db) {
 
 std::string SiriusExtension::Name() {
 	return "GPU	Extension";
+}
+
+const string SiriusExtension::KEY_PLAN_IN_JSON = "plan_in_json";
+const string SiriusExtension::KEY_SOURCE_EXCHANGE_TABLES = "source_exchange_tables";
+
+Value SiriusExtension::MakeSiriusServerAdditionalInputsStruct(
+	bool plan_in_json, const std::vector<string>& source_exchange_tables) {
+	vector<Value> source_exchange_table_values;
+	for (const auto& source_exchange_table: source_exchange_tables) {
+		source_exchange_table_values.push_back(Value(source_exchange_table));
+	}
+	return Value::STRUCT({
+		{KEY_PLAN_IN_JSON, Value::BOOLEAN(plan_in_json)},
+		{KEY_SOURCE_EXCHANGE_TABLES, Value::LIST(LogicalType::VARCHAR, source_exchange_table_values)}
+	});
+}
+
+void SiriusExtension::ExtractSiriusServerAdditionalInputs(
+	const Value& additional_input_struct, bool* plan_in_json, std::vector<string>& source_exchange_tables) {
+	const auto& struct_type = additional_input_struct.type();
+	const auto& struct_children = StructValue::GetChildren(additional_input_struct);
+	for (idx_t i = 0; i < struct_children.size(); ++i) {
+		const auto& key = StructType::GetChildName(struct_type, i);
+		if (key == KEY_PLAN_IN_JSON) {
+			*plan_in_json = BooleanValue::Get(struct_children[i]);
+		} else if (key == KEY_SOURCE_EXCHANGE_TABLES) {
+			const auto& list_type = struct_children[i].type();
+			const auto& list_children = ListValue::GetChildren(struct_children[i]);
+			for (idx_t j = 0; j < list_children.size(); ++j) {
+				source_exchange_tables.push_back(StringValue::Get(list_children[j]));
+			}
+		} else {
+			throw InternalException("Invalid key in sirius server additional inputs: " + key);
+		}
+	}
 }
 
 } // namespace duckdb

@@ -58,6 +58,7 @@ public:
 	void Print();
 
     map<string, GPUIntermediateRelation*> tables;
+		map<string, GPUIntermediateRelation*> tables_intermediate;	// for intermediate results used in distributed execution
 
 	DataWrapper allocateChunk(DataChunk &input);
 	DataWrapper allocateColumnBufferInCPU(unique_ptr<MaterializedQueryResult> input);

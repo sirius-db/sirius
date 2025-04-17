@@ -112,6 +112,7 @@ GPUContext::GPUPendingStatementInternal(ClientContext &context, shared_ptr<GPUPr
 	bool stream_result = false;
 
 	unique_ptr<GPUPhysicalResultCollector> gpu_collector = make_uniq_base<GPUPhysicalResultCollector, GPUPhysicalMaterializedCollector>(*statement_p);
+	gpu_collector->result_intermediate_table_name = result_intermediate_table_name;
 	if (gpu_collector->type != PhysicalOperatorType::RESULT_COLLECTOR) {
 		// throw InvalidInputException("Error in GPUPendingStatementInternal");
 		return GPUErrorResult<PendingQueryResult>(ErrorData("Error in GPUPendingStatementInternal"));
@@ -174,6 +175,9 @@ GPUContext::GPUExecutePendingQueryResult(PendingQueryResult &pending) {
 		return make_uniq<MaterializedQueryResult>(error);
 	}
 	printf("Done executing\n");
+	if (result_intermediate_table_name != nullptr) {
+		return nullptr;
+	}
 	auto result = FetchResultInternal(pending);
 	// context.reset();
 	return result;

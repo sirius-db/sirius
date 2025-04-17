@@ -224,6 +224,11 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 		// Final materialization
 		size_bytes = FinalMaterialize(input_relation, materialized_relation, col);
 
+		// Skip to materialize to CPU if `result_intermediate_table_name` is set
+		if (result_intermediate_table_name != nullptr) {
+			continue;
+		}
+
 		if(input_relation.columns[col]->data_wrapper.type != ColumnType::VARCHAR) {
 			host_data[col] = allocator.AllocateData(size_bytes);
 			callCudaMemcpyDeviceToHost<uint8_t>(host_data[col], materialized_relation.columns[col]->data_wrapper.data, size_bytes, 0);
@@ -263,32 +268,42 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 		}
 	}
 
-	ColumnDataAppendState append_state;
-	collection->InitializeAppend(append_state);
-	size_t total_vector = (materialized_relation.columns[0]->column_length + STANDARD_VECTOR_SIZE - 1) / STANDARD_VECTOR_SIZE;
-	// printf("Total vector %d\n", total_vector);
-	size_t remaining = materialized_relation.columns[0]->column_length;
-	for (uint64_t vec = 0; vec < total_vector; vec++) {
-		DataChunk chunk;
-		chunk.InitializeEmpty(types);
-		for (int col = 0; col < materialized_relation.columns.size(); col++) {
-			if(materialized_relation.columns[col]->data_wrapper.type != ColumnType::VARCHAR) {
-				Vector vector = rawDataToVector(host_data[col], vec, materialized_relation.columns[col]->data_wrapper.type);
-				chunk.data[col].Reference(vector);
-			} else {
-				// Add the strings to the vector
-				uint64_t start_idx = materialized_relation.columns[0]->column_length - remaining;
-				Vector str_vector(LogicalType::VARCHAR, reinterpret_cast<data_ptr_t>(duckdb_strings[col] + start_idx));
-				chunk.data[col].Reference(str_vector);
+	if (result_intermediate_table_name != nullptr) {
+		// Save GPU relation to gpu buffer manager
+		auto& tables_intermediate = gpuBufferManager->tables_intermediate;
+		if (tables_intermediate.find(*result_intermediate_table_name) != tables_intermediate.end()) {
+			throw InvalidInputException("Intermediate table '" + *result_intermediate_table_name + "' already exists");
+		}
+		tables_intermediate[*result_intermediate_table_name] = new GPUIntermediateRelation(materialized_relation);
+	} else {
+		// Materialize to duckdb `collection`
+		ColumnDataAppendState append_state;
+		collection->InitializeAppend(append_state);
+		size_t total_vector = (materialized_relation.columns[0]->column_length + STANDARD_VECTOR_SIZE - 1) / STANDARD_VECTOR_SIZE;
+		// printf("Total vector %d\n", total_vector);
+		size_t remaining = materialized_relation.columns[0]->column_length;
+		for (uint64_t vec = 0; vec < total_vector; vec++) {
+			DataChunk chunk;
+			chunk.InitializeEmpty(types);
+			for (int col = 0; col < materialized_relation.columns.size(); col++) {
+				if(materialized_relation.columns[col]->data_wrapper.type != ColumnType::VARCHAR) {
+					Vector vector = rawDataToVector(host_data[col], vec, materialized_relation.columns[col]->data_wrapper.type);
+					chunk.data[col].Reference(vector);
+				} else {
+					// Add the strings to the vector
+					uint64_t start_idx = materialized_relation.columns[0]->column_length - remaining;
+					Vector str_vector(LogicalType::VARCHAR, reinterpret_cast<data_ptr_t>(duckdb_strings[col] + start_idx));
+					chunk.data[col].Reference(str_vector);
+				}
 			}
+			if (remaining < STANDARD_VECTOR_SIZE) {
+				chunk.SetCardinality(remaining);
+			} else {
+				chunk.SetCardinality(STANDARD_VECTOR_SIZE);
+			}
+			collection->Append(append_state, chunk);
+			remaining -= STANDARD_VECTOR_SIZE;
 		}
-		if (remaining < STANDARD_VECTOR_SIZE) {
-			chunk.SetCardinality(remaining);
-		} else {
-			chunk.SetCardinality(STANDARD_VECTOR_SIZE);
-		}
-		collection->Append(append_state, chunk);
-		remaining -= STANDARD_VECTOR_SIZE;
 	}
 
 	//measure time
