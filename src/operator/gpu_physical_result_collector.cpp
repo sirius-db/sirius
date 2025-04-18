@@ -224,8 +224,8 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 		// Final materialization
 		size_bytes = FinalMaterialize(input_relation, materialized_relation, col);
 
-		// Skip to materialize to CPU if `result_intermediate_table_name` is set
-		if (result_intermediate_table_name != nullptr) {
+		// Skip to materialize to CPU if `result_exchange_table_info` is set
+		if (result_exchange_table_info != nullptr) {
 			continue;
 		}
 
@@ -268,13 +268,18 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 		}
 	}
 
-	if (result_intermediate_table_name != nullptr) {
-		// Save GPU relation to gpu buffer manager
-		auto& tables_intermediate = gpuBufferManager->tables_intermediate;
-		if (tables_intermediate.find(*result_intermediate_table_name) != tables_intermediate.end()) {
-			throw InvalidInputException("Intermediate table '" + *result_intermediate_table_name + "' already exists");
+	if (result_exchange_table_info != nullptr) {
+		// Assign random column names for `materialized_relation` since they are all empty now
+		if (result_exchange_table_info->column_names.size() != materialized_relation.column_count) {
+			throw InternalException("Column count mismatch between `result_exchange_table_info` and `materialized_relation`: %zu vs %zu",
+															result_exchange_table_info->column_names.size(), materialized_relation.column_count);
 		}
-		tables_intermediate[*result_intermediate_table_name] = new GPUIntermediateRelation(materialized_relation);
+		auto result_exchange_table = new GPUIntermediateRelation(materialized_relation);
+		for (size_t i = 0; i < materialized_relation.column_count; ++i) {
+			result_exchange_table->column_names[i] = result_exchange_table_info->column_names[i];
+		}
+		// Save GPU relation to gpu buffer manager
+		gpuBufferManager->addExchangeTable(result_exchange_table_info->table_name, result_exchange_table);
 	} else {
 		// Materialize to duckdb `collection`
 		ColumnDataAppendState append_state;

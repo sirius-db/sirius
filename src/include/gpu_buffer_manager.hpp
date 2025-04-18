@@ -57,8 +57,8 @@ public:
 
 	void Print();
 
-    map<string, GPUIntermediateRelation*> tables;
-		map<string, GPUIntermediateRelation*> tables_intermediate;	// for intermediate results used in distributed execution
+	map<string, GPUIntermediateRelation*> tables;
+	unordered_set<string> exchange_table_names;		// for intermediate results exchanged in distributed execution
 
 	DataWrapper allocateChunk(DataChunk &input);
 	DataWrapper allocateColumnBufferInCPU(unique_ptr<MaterializedQueryResult> input);
@@ -71,6 +71,10 @@ public:
 	void createTable(string table_name, size_t column_count);
 	void createColumn(string table_name, string column_name, ColumnType column_type, size_t column_id, vector<size_t> unique_columns);
 	bool checkIfColumnCached(string table_name, string column_name);
+
+	void addExchangeTable(const string& table_name, GPUIntermediateRelation* table);
+	GPUIntermediateRelation* getExchangeTable(const string& table_name) const;
+	void deleteExchangeTable(const string& table_name);
 private:
     // Private constructor
    	GPUBufferManager(size_t cache_size_per_gpu, size_t processing_size_per_gpu, size_t processing_size_per_cpu);

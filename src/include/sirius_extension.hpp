@@ -26,7 +26,8 @@ public:
 
 		// Set when used by sirius server
 		bool is_sirius_server = false;		// should not consume result if called by sirius server
-		string* result_intermediate_table_name = nullptr;
+		bool has_result_exchange_table_info = false;
+		GPUExchangeTableInfo result_exchange_table_info;
 	};
 
 	struct GPUCachingFunctionData : public TableFunctionData {
@@ -52,9 +53,8 @@ public:
 
 	// Make and extract additional inputs used by sirius server
 	static const string KEY_PLAN_IN_JSON;
-	static const string KEY_SOURCE_EXCHANGE_TABLES;
-	static Value MakeSiriusServerAdditionalInputsStruct(bool plan_in_json, const std::vector<string>& source_exchange_tables);
-	static void ExtractSiriusServerAdditionalInputs(const Value& additional_input_struct, bool* plan_in_json, std::vector<string>& source_exchange_tables);
+	static Value MakeSiriusServerAdditionalInputsStruct(bool plan_in_json);
+	static void ExtractSiriusServerAdditionalInputs(const Value& additional_input_struct, bool* plan_in_json);
 
 	// If false, then use duckdb to process substrait.
 	static constexpr bool USE_SIRIUS_FOR_SUBSTRAIT = true;

@@ -55,7 +55,7 @@ public:
 	//! The current query progress
 	QueryProgress query_progress;
 
-	string* result_intermediate_table_name = nullptr;
+	GPUExchangeTableInfo* result_exchange_table_info = nullptr;
 
     GPUExecutor &GetGPUExecutor();
 

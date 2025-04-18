@@ -550,4 +550,40 @@ GPUBufferManager::createColumn(string up_table_name, string up_column_name, Colu
     }
 }
 
+void GPUBufferManager::addExchangeTable(const string& table_name, GPUIntermediateRelation* table) {
+    if (exchange_table_names.find(table_name) != exchange_table_names.end()) {
+        throw InternalException("`addExchangeTable` failed, table '%s' already exists in `exchange_table_names`", table_name);
+    }
+    if (tables.find(table_name) != tables.end()) {
+        throw InternalException("`addExchangeTable` failed, table '%s' already exists in `tables`", table_name);
+    }
+    exchange_table_names.emplace(table_name);
+    tables[table_name] = table;
+}
+
+GPUIntermediateRelation* GPUBufferManager::getExchangeTable(const string& table_name) const {
+    if (exchange_table_names.find(table_name) == exchange_table_names.end()) {
+        throw InternalException("`getExchangeTable` failed, table '%s' not found in `exchange_table_names`", table_name);
+    }
+    const auto& table_it = tables.find(table_name);
+    if (table_it == tables.end()) {
+        throw InternalException("`getExchangeTable` failed, table '%s' not found in `tables`", table_name);
+    }
+    return table_it->second;
+}
+
+void GPUBufferManager::deleteExchangeTable(const string& table_name) {
+    const auto& table_name_it = exchange_table_names.find(table_name);
+    if (table_name_it == exchange_table_names.end()) {
+        throw InternalException("`deleteExchangeTable` failed, table '%s' not found in `exchange_table_names`", table_name);
+    }
+    exchange_table_names.erase(table_name_it);
+    const auto& table_it = tables.find(table_name);
+    if (table_it == tables.end()) {
+        throw InternalException("`deleteExchangeTable` failed, table '%s' not found in `tables`", table_name);
+    }
+    delete table_it->second;
+    tables.erase(table_it);
+}
+
 }; // namespace duckdb

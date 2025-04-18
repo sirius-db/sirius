@@ -260,13 +260,7 @@ SiriusExtension::GPUProcessingSubstraitBind(ClientContext &context, TableFunctio
 
 	// Additional inputs if used by sirius server
 	if (input.inputs.size() > 1) {
-		std::vector<string> source_exchange_tables;
-		ExtractSiriusServerAdditionalInputs(input.inputs[1], &is_json, source_exchange_tables);
-		printf("[source_exchange_tables]");
-		for (const auto& t: source_exchange_tables) {
-			printf(" %s", t.c_str());
-		}
-		printf("\n");
+		ExtractSiriusServerAdditionalInputs(input.inputs[1], &is_json);
 	} else {
 		is_json = true;
 	}
@@ -284,6 +278,12 @@ SiriusExtension::GPUProcessingSubstraitBind(ClientContext &context, TableFunctio
 	D_ASSERT(planner.plan);
 
 	if (USE_SIRIUS_FOR_SUBSTRAIT) {
+		// Get output column names of this plan, only used by sirius server in distributed execution
+		auto substrait_plan = transformer_s2d.get_substrait_plan();
+		for (const auto& column_name: substrait_plan->relations(0).root().names()) {
+			result->result_exchange_table_info.column_names.push_back(column_name);
+		}
+
 		set<OptimizerType> disabled_optimizers = DBConfig::GetConfig(context).options.disabled_optimizers;
 		disabled_optimizers.insert(OptimizerType::IN_CLAUSE);
 		disabled_optimizers.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
@@ -341,8 +341,8 @@ void SiriusExtension::GPUProcessingSubstraitFunction(ClientContext &context, Tab
 
 		// Try sirius execution
 		if (!use_duckdb) {
-			if (data.is_sirius_server) {
-				data.gpu_context->result_intermediate_table_name = data.result_intermediate_table_name;
+			if (data.is_sirius_server && data.has_result_exchange_table_info) {
+				data.gpu_context->result_exchange_table_info = &data.result_exchange_table_info;
 			}
 			data.res = data.gpu_context->GPUExecuteQuery(context, data.query, data.gpu_prepared, {});
 			if (data.res != nullptr && data.res->HasError()) {
@@ -432,34 +432,20 @@ std::string SiriusExtension::Name() {
 }
 
 const string SiriusExtension::KEY_PLAN_IN_JSON = "plan_in_json";
-const string SiriusExtension::KEY_SOURCE_EXCHANGE_TABLES = "source_exchange_tables";
 
-Value SiriusExtension::MakeSiriusServerAdditionalInputsStruct(
-	bool plan_in_json, const std::vector<string>& source_exchange_tables) {
-	vector<Value> source_exchange_table_values;
-	for (const auto& source_exchange_table: source_exchange_tables) {
-		source_exchange_table_values.push_back(Value(source_exchange_table));
-	}
+Value SiriusExtension::MakeSiriusServerAdditionalInputsStruct(bool plan_in_json) {
 	return Value::STRUCT({
-		{KEY_PLAN_IN_JSON, Value::BOOLEAN(plan_in_json)},
-		{KEY_SOURCE_EXCHANGE_TABLES, Value::LIST(LogicalType::VARCHAR, source_exchange_table_values)}
+		{KEY_PLAN_IN_JSON, Value::BOOLEAN(plan_in_json)}
 	});
 }
 
-void SiriusExtension::ExtractSiriusServerAdditionalInputs(
-	const Value& additional_input_struct, bool* plan_in_json, std::vector<string>& source_exchange_tables) {
+void SiriusExtension::ExtractSiriusServerAdditionalInputs(const Value& additional_input_struct, bool* plan_in_json) {
 	const auto& struct_type = additional_input_struct.type();
 	const auto& struct_children = StructValue::GetChildren(additional_input_struct);
 	for (idx_t i = 0; i < struct_children.size(); ++i) {
 		const auto& key = StructType::GetChildName(struct_type, i);
 		if (key == KEY_PLAN_IN_JSON) {
 			*plan_in_json = BooleanValue::Get(struct_children[i]);
-		} else if (key == KEY_SOURCE_EXCHANGE_TABLES) {
-			const auto& list_type = struct_children[i].type();
-			const auto& list_children = ListValue::GetChildren(struct_children[i]);
-			for (idx_t j = 0; j < list_children.size(); ++j) {
-				source_exchange_tables.push_back(StringValue::Get(list_children[j]));
-			}
 		} else {
 			throw InternalException("Invalid key in sirius server additional inputs: " + key);
 		}
