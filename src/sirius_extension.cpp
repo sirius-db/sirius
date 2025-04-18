@@ -244,6 +244,39 @@ unique_ptr<LogicalOperator> OptimizePlan(ClientContext &context, Planner &planne
 	return plan;
 }
 
+set<OptimizerType> GetDisabledOptimizers(ClientContext &context) {
+	// Disable all except `FILTER_PUSHDOWN`
+	set<OptimizerType> disabled_optimizers = DBConfig::GetConfig(context).options.disabled_optimizers;
+	disabled_optimizers.insert(OptimizerType::IN_CLAUSE);
+	disabled_optimizers.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
+	disabled_optimizers.insert(OptimizerType::EXPRESSION_REWRITER);
+	disabled_optimizers.insert(OptimizerType::FILTER_PULLUP);
+	// disabled_optimizers.insert(OptimizerType::FILTER_PUSHDOWN);
+	disabled_optimizers.insert(OptimizerType::EMPTY_RESULT_PULLUP);
+	disabled_optimizers.insert(OptimizerType::CTE_FILTER_PUSHER);
+	disabled_optimizers.insert(OptimizerType::REGEX_RANGE);
+	disabled_optimizers.insert(OptimizerType::JOIN_ORDER);
+	disabled_optimizers.insert(OptimizerType::DELIMINATOR);
+	disabled_optimizers.insert(OptimizerType::UNNEST_REWRITER);
+	disabled_optimizers.insert(OptimizerType::UNUSED_COLUMNS);
+	disabled_optimizers.insert(OptimizerType::STATISTICS_PROPAGATION);
+	disabled_optimizers.insert(OptimizerType::COMMON_SUBEXPRESSIONS);
+	disabled_optimizers.insert(OptimizerType::COMMON_AGGREGATE);
+	disabled_optimizers.insert(OptimizerType::COLUMN_LIFETIME);
+	disabled_optimizers.insert(OptimizerType::BUILD_SIDE_PROBE_SIDE);
+	disabled_optimizers.insert(OptimizerType::LIMIT_PUSHDOWN);
+	disabled_optimizers.insert(OptimizerType::TOP_N);
+	disabled_optimizers.insert(OptimizerType::DUPLICATE_GROUPS);
+	disabled_optimizers.insert(OptimizerType::REORDER_FILTER);
+	disabled_optimizers.insert(OptimizerType::SAMPLING_PUSHDOWN);
+	disabled_optimizers.insert(OptimizerType::JOIN_FILTER_PUSHDOWN);
+	disabled_optimizers.insert(OptimizerType::EXTENSION);
+	disabled_optimizers.insert(OptimizerType::MATERIALIZED_CTE);
+	disabled_optimizers.insert(OptimizerType::SUM_REWRITER);
+	disabled_optimizers.insert(OptimizerType::LATE_MATERIALIZATION);
+	return disabled_optimizers;
+}
+
 unique_ptr<FunctionData> 
 SiriusExtension::GPUProcessingSubstraitBind(ClientContext &context, TableFunctionBindInput &input,
                                                 vector<LogicalType> &return_types, vector<string> &names) {
@@ -284,24 +317,23 @@ SiriusExtension::GPUProcessingSubstraitBind(ClientContext &context, TableFunctio
 			result->result_exchange_table_info.column_names.push_back(column_name);
 		}
 
-		set<OptimizerType> disabled_optimizers = DBConfig::GetConfig(context).options.disabled_optimizers;
-		disabled_optimizers.insert(OptimizerType::IN_CLAUSE);
-		disabled_optimizers.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
-		DBConfig::GetConfig(context).options.disabled_optimizers = disabled_optimizers;
-
+		// Currently sirius requires some optimization rules to adjust the plan
+		DBConfig::GetConfig(context).options.disabled_optimizers = GetDisabledOptimizers(context);
 		auto prepared = make_shared_ptr<PreparedStatementData>(statement_type);
 		prepared->names = planner.names;
 		prepared->types = planner.types;
 		prepared->value_map = std::move(planner.value_map);
 		prepared->plan = make_uniq<PhysicalOperator>(PhysicalOperatorType::DUMMY_SCAN, vector<LogicalType>{LogicalType::BOOLEAN}, 0);
-		
 		auto query_plan = OptimizePlan(context, planner, *result->conn);
+
+		// Get gpu physical plan
 		try {
 			auto gpu_physical_plan = GPUGeneratePhysicalPlan(context, *result->gpu_context, query_plan, *result->conn);
 			auto gpu_prepared = make_shared_ptr<GPUPreparedStatementData>(std::move(prepared), std::move(gpu_physical_plan));
 			result->gpu_prepared = gpu_prepared;
 		} catch (std::exception &e) {
 			result->plan_error = true;
+			result->plan_error_msg = string(e.what());
 		}
 	}
 
@@ -330,10 +362,10 @@ void SiriusExtension::GPUProcessingSubstraitFunction(ClientContext &context, Tab
 			if (data.plan_error) {
 				if (data.is_sirius_server) {
 					// Fallback should not be used by sirius server
-					throw InternalException("Plan Error in GPUProcessingSubstraitBind");
+					throw InternalException("Plan Error in GPUProcessingSubstraitBind: " + data.plan_error_msg);
 				} else {
 					// Fallback is used in standalone sirius
-					printf("Plan Error in GPUProcessingSubstraitBind, fallback to DuckDB\n");
+					printf("Plan Error in GPUProcessingSubstraitBind, fallback to DuckDB. Error: %s\n", data.plan_error_msg.c_str());
 					use_duckdb = true;
 				}
 			}
@@ -341,9 +373,6 @@ void SiriusExtension::GPUProcessingSubstraitFunction(ClientContext &context, Tab
 
 		// Try sirius execution
 		if (!use_duckdb) {
-			if (data.is_sirius_server && data.has_result_exchange_table_info) {
-				data.gpu_context->result_exchange_table_info = &data.result_exchange_table_info;
-			}
 			data.res = data.gpu_context->GPUExecuteQuery(context, data.query, data.gpu_prepared, {});
 			if (data.res != nullptr && data.res->HasError()) {
 				if (data.is_sirius_server) {

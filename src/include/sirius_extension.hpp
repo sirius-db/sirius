@@ -23,10 +23,10 @@ public:
 		bool enable_optimizer;
 		bool finished = false;
 		bool plan_error = false;
+		string plan_error_msg;
 
 		// Set when used by sirius server
 		bool is_sirius_server = false;		// should not consume result if called by sirius server
-		bool has_result_exchange_table_info = false;
 		GPUExchangeTableInfo result_exchange_table_info;
 	};
 

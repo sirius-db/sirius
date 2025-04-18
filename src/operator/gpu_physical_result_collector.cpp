@@ -269,7 +269,7 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 	}
 
 	if (result_exchange_table_info != nullptr) {
-		// Assign random column names for `materialized_relation` since they are all empty now
+		// Assign output column names for `materialized_relation` since the names are all empty now
 		if (result_exchange_table_info->column_names.size() != materialized_relation.column_count) {
 			throw InternalException("Column count mismatch between `result_exchange_table_info` and `materialized_relation`: %zu vs %zu",
 															result_exchange_table_info->column_names.size(), materialized_relation.column_count);

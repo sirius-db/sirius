@@ -57,6 +57,10 @@ public:
 
 	GPUExchangeTableInfo* result_exchange_table_info = nullptr;
 
+	//! Whether this query is actually a next plan fragment of one that is previously executed,
+	//! if ture, for example, the processing buffer region should not be reset
+	bool is_continued_fragment = false;
+
     GPUExecutor &GetGPUExecutor();
 
 	unique_ptr<PendingQueryResult> GPUPendingStatementInternal(ClientContext &context, shared_ptr<GPUPreparedStatementData> &statement_p,
