@@ -151,6 +151,7 @@ void nestedLoopJoin(T** left_data, T** right_data, uint64_t* &row_ids_left, uint
     // printf("left size: %lu right size : %lu\n", left_size, right_size);
     int tile_items = BLOCK_THREADS * 1;
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+    count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
     cudaMemset(count, 0, sizeof(uint64_t));
     uint64_t* offset_each_thread = gpuBufferManager->customCudaMalloc<uint64_t>(((left_size + tile_items - 1)/tile_items) * BLOCK_THREADS, 0, 0);
     
@@ -172,6 +173,8 @@ void nestedLoopJoin(T** left_data, T** right_data, uint64_t* &row_ids_left, uint
             offset_each_thread, row_ids_left, row_ids_right, left_size, right_size, condition_mode[0]);
     CHECK_ERROR();
     cudaDeviceSynchronize();
+    gpuBufferManager->customCudaFree<uint64_t>(offset_each_thread, ((left_size + tile_items - 1)/tile_items) * BLOCK_THREADS, 0);
+    gpuBufferManager->customCudaFree<uint64_t>(count, 1, 0);
     count = h_count;
 }
 

@@ -32,6 +32,30 @@ GPUBufferManager::customCudaMalloc<bool>(size_t size, int gpu, bool caching);
 template pointer_and_key*
 GPUBufferManager::customCudaMalloc<pointer_and_key>(size_t size, int gpu, bool caching);
 
+template void
+GPUBufferManager::customCudaFree<int>(int* ptr, size_t size, int gpu);
+
+template void
+GPUBufferManager::customCudaFree<uint64_t>(uint64_t* ptr, size_t size, int gpu);
+
+template void
+GPUBufferManager::customCudaFree<uint8_t>(uint8_t* ptr, size_t size, int gpu);
+
+template void
+GPUBufferManager::customCudaFree<float>(float* ptr, size_t size, int gpu);
+
+template void
+GPUBufferManager::customCudaFree<double>(double* ptr, size_t size, int gpu);
+
+template void
+GPUBufferManager::customCudaFree<char>(char* ptr, size_t size, int gpu);
+
+template void
+GPUBufferManager::customCudaFree<bool>(bool* ptr, size_t size, int gpu);
+
+template void
+GPUBufferManager::customCudaFree<pointer_and_key>(pointer_and_key* ptr, size_t size, int gpu);
+
 template int*
 GPUBufferManager::customCudaHostAlloc<int>(size_t size);
 
@@ -60,9 +84,13 @@ GPUBufferManager::GPUBufferManager(size_t cache_size_per_gpu, size_t processing_
     gpuCachingPointer = new size_t[NUM_GPUS];
     cpuProcessingPointer = 0;
 
+    cuda_mr = new rmm::mr::cuda_memory_resource();
+    mr = new rmm::mr::pool_memory_resource(cuda_mr, rmm::percent_of_free_device_memory(20));
+    cudf::set_current_device_resource(mr);
+
     for (int gpu = 0; gpu < NUM_GPUS; gpu++) {
         gpuCache[gpu] = callCudaMalloc<uint8_t>(cache_size_per_gpu, gpu);
-        gpuProcessing[gpu] = callCudaMalloc<uint8_t>(processing_size_per_gpu, gpu);
+        // gpuProcessing[gpu] = callCudaMalloc<uint8_t>(processing_size_per_gpu, gpu);
         // gpuCache[gpu] = callCudaHostAlloc<uint8_t>(cache_size_per_gpu, 1);
         // gpuProcessing[gpu] = callCudaHostAlloc<uint8_t>(processing_size_per_gpu, 1);
         gpuProcessingPointer[gpu] = 0;
@@ -75,7 +103,8 @@ GPUBufferManager::GPUBufferManager(size_t cache_size_per_gpu, size_t processing_
 GPUBufferManager::~GPUBufferManager() {
     for (int gpu = 0; gpu < NUM_GPUS; gpu++) {
         callCudaFree<uint8_t>(gpuCache[gpu], gpu);
-        callCudaFree<uint8_t>(gpuProcessing[gpu], gpu);
+        // callCudaFree<uint8_t>(gpuProcessing[gpu], gpu);
+        mr->deallocate((void*) gpuProcessing[gpu], processing_size_per_gpu);
     }
     delete[] cpuProcessing;
     delete[] gpuProcessingPointer;
@@ -132,22 +161,34 @@ GPUBufferManager::customCudaMalloc(size_t size, int gpu, bool caching) {
         } 
         return ptr;
     } else {
+        T* ptr = reinterpret_cast<T*>(mr->allocate(size * sizeof(T)));
         // printf("Allocating %ld bytes\n", alloc);
-        size_t start = __atomic_fetch_add(&gpuProcessingPointer[gpu], alloc, __ATOMIC_RELAXED);
-        // printf("Current pointer %ld\n", gpuProcessingPointer[gpu]);
-        assert((start + alloc) < processing_size_per_gpu);
-        if (start + alloc >= processing_size_per_gpu) {
-            throw InvalidInputException("Out of GPU processing memory");
-        }
-        // printf("Allocating %ld bytes at %d\n", alloc, start);
-        // printf("Current pointer %ld\n", gpuProcessingPointer[gpu]);
-        T* ptr = reinterpret_cast<T*>(gpuProcessing[gpu] + start);
-        if (reinterpret_cast<uintptr_t>(ptr) % alignof(double) != 0) {
-            throw InvalidInputException("Memory is not properly aligned");
-        } 
+        // size_t start = __atomic_fetch_add(&gpuProcessingPointer[gpu], alloc, __ATOMIC_RELAXED);
+        // // printf("Current pointer %ld\n", gpuProcessingPointer[gpu]);
+        // assert((start + alloc) < processing_size_per_gpu);
+        // if (start + alloc >= processing_size_per_gpu) {
+        //     throw InvalidInputException("Out of GPU processing memory");
+        // }
+        // // printf("Allocating %ld bytes at %d\n", alloc, start);
+        // // printf("Current pointer %ld\n", gpuProcessingPointer[gpu]);
+        // T* ptr = reinterpret_cast<T*>(gpuProcessing[gpu] + start);
+        // if (reinterpret_cast<uintptr_t>(ptr) % alignof(double) != 0) {
+        //     throw InvalidInputException("Memory is not properly aligned");
+        // } 
         return ptr;
     }
 };
+
+template <typename T>
+void
+GPUBufferManager::customCudaFree(T* ptr, size_t size, int gpu) {
+    //check if ptr is not in gpuCaching
+    uint8_t* ptr_uint8 = reinterpret_cast<uint8_t*>(ptr);
+    if (ptr_uint8 < gpuCache[gpu] && ptr_uint8 >= gpuCache[gpu] + cache_size_per_gpu) {
+        mr->deallocate(ptr, size * sizeof(T));
+    }
+};
+
 
 template <typename T>
 T*

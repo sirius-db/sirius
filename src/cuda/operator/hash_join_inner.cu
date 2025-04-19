@@ -250,6 +250,7 @@ void buildHashTable(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uin
     cudaDeviceSynchronize();
     STOP_TIMER();
 
+    cudaFree(keys_dev);
     // print_hash_table<<<1, 1>>>(ht, ht_len * 2);
     // cudaDeviceSynchronize();
 }
@@ -269,6 +270,7 @@ void probeHashTable(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uin
     printf("N: %lu\n", N);
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+    count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
     cudaMemset(count, 0, sizeof(uint64_t));
     uint64_t* offset_each_thread = gpuBufferManager->customCudaMalloc<uint64_t>(((N + tile_items - 1)/tile_items) * BLOCK_THREADS, 0, 0);
 
@@ -319,6 +321,10 @@ void probeHashTable(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uin
     // CHECK_ERROR();
     // row_ids_right = row_ids_left + h_count[0];
     // gpuBufferManager->gpuProcessingPointer[0] = (reinterpret_cast<uint8_t*>(row_ids_right + h_count[0]) - gpuBufferManager->gpuProcessing[0]);
+    gpuBufferManager->customCudaFree<uint64_t>(offset_each_thread, ((N + tile_items - 1)/tile_items) * BLOCK_THREADS, 0);
+    gpuBufferManager->customCudaFree<int>(condition_mode_dev, num_keys, 0);
+    gpuBufferManager->customCudaFree<uint64_t>(count, 1, 0);
+    cudaFree(keys_dev);
     count = h_count;
     STOP_TIMER();
 }

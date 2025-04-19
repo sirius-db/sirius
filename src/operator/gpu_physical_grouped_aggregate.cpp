@@ -9,7 +9,7 @@ namespace duckdb {
 template <typename T>
 GPUColumn*
 ResolveTypeCombineColumns(GPUColumn* column1, GPUColumn* column2, GPUBufferManager* gpuBufferManager) {
-	T* combine = gpuBufferManager->customCudaMalloc<T>(column1->column_length + column2->column_length, 0, 0);
+	T* combine;
 	T* a = reinterpret_cast<T*> (column1->data_wrapper.data);
 	T* b = reinterpret_cast<T*> (column2->data_wrapper.data);
 	combineColumns<T>(a, b, combine, column1->column_length, column2->column_length);
@@ -22,8 +22,8 @@ ResolveTypeCombineColumns(GPUColumn* column1, GPUColumn* column2, GPUBufferManag
 
 GPUColumn*
 ResolveTypeCombineStrings(GPUColumn* column1, GPUColumn* column2, GPUBufferManager* gpuBufferManager) {
-	uint8_t* combine = gpuBufferManager->customCudaMalloc<uint8_t>(column1->data_wrapper.num_bytes + column2->data_wrapper.num_bytes, 0, 0);
-	uint64_t* offset_combine = gpuBufferManager->customCudaMalloc<uint64_t>(column1->column_length + column2->column_length, 0, 0);
+	uint8_t* combine;
+	uint64_t* offset_combine;
 	uint8_t* a = column1->data_wrapper.data;
 	uint8_t* b = column2->data_wrapper.data;
 	uint64_t* offset_a = column1->data_wrapper.offset;

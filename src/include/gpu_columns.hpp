@@ -82,6 +82,8 @@ public:
     size_t column_length;
     // bool isNull;
     bool is_unique;
+
+    // cudf::column_view convertToCudfColumn();
     // bool isString{false};
 };
 
@@ -98,7 +100,9 @@ public:
     // map<string, GPUColumn*> columns;
     size_t length;
     size_t column_count;
+    // cudf::table_view convertToCudfTable();
 };
+
 
 
 } // namespace duckdb   

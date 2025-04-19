@@ -403,9 +403,9 @@ void SiriusExtension::InitializeGPUExtension(Connection &con) {
 	GPUBufferManager *gpuBufferManager = &(GPUBufferManager::GetInstance(cache_size_per_gpu, processing_size_per_gpu, processing_size_per_cpu));
 
 	//test if cudf is working
-#ifdef ENABLE_CUDF
-	test_cudf();
-#endif
+// #ifdef ENABLE_CUDF
+// 	test_cudf();
+// #endif
 }
 
 void SiriusExtension::Load(DuckDB &db) {

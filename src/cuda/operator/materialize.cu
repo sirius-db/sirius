@@ -64,10 +64,10 @@ template
 __global__ void materialize_expression<uint8_t, BLOCK_THREADS, ITEMS_PER_THREAD>(const uint8_t *a, uint8_t* result, uint64_t *row_ids, uint64_t N);
 
 template <typename T>
-void materializeExpression(T *a, T* result, uint64_t *row_ids, uint64_t N) {
+void materializeExpression(T *a, T*& result, uint64_t *row_ids, uint64_t result_len, uint64_t input_len) {
     CHECK_ERROR();
-    if (N == 0) {
-        printf("N is 0\n");
+    if (result_len == 0) {
+        printf("result_len is 0\n");
         return;
     }
     SETUP_TIMING();
@@ -75,13 +75,15 @@ void materializeExpression(T *a, T* result, uint64_t *row_ids, uint64_t N) {
     printf("Launching Materialize Kernel\n");
     // SETUP_TIMING();
     // START_TIMER();
-    printf("N: %lu\n", N);
+    // printf("result_len: %lu\n", N);
     // testprintmat<T><<<1, 1>>>(a, N);
     // CHECK_ERROR();
     // testprintmat<uint64_t><<<1, 1>>>(row_ids, N);
     // CHECK_ERROR();
+    GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+    result = gpuBufferManager->customCudaMalloc<T>(result_len, 0, 0);
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
-    materialize_expression<T, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(a, result, row_ids, N);
+    materialize_expression<T, BLOCK_THREADS, ITEMS_PER_THREAD><<<(result_len + tile_items - 1)/tile_items, BLOCK_THREADS>>>(a, result, row_ids, result_len);
     CHECK_ERROR();
     // thrust::device_vector<T> sorted(result, result + N);
     // thrust::sort(thrust::device, sorted.begin(), sorted.end());
@@ -90,12 +92,13 @@ void materializeExpression(T *a, T* result, uint64_t *row_ids, uint64_t N) {
     // testprintmat<T><<<1, 1>>>(result, 100);
     cudaDeviceSynchronize();
     STOP_TIMER();
+    gpuBufferManager->customCudaFree<T>(a, input_len, 0);
 }
 
-void materializeString(uint8_t* data, uint64_t* offset, uint8_t* &result, uint64_t* &result_offset, uint64_t* row_ids, uint64_t* &new_num_bytes, uint64_t N) {
+void materializeString(uint8_t* data, uint64_t* offset, uint8_t* &result, uint64_t* &result_offset, uint64_t* row_ids, uint64_t* &result_bytes, uint64_t result_len, uint64_t input_size, uint64_t input_bytes) {
     CHECK_ERROR();
-    if (N == 0) {
-        printf("N is 0\n");
+    if (result_len == 0) {
+        printf("result_len is 0\n");
         return;
     }
     SETUP_TIMING();
@@ -105,55 +108,60 @@ void materializeString(uint8_t* data, uint64_t* offset, uint8_t* &result, uint64
     // START_TIMER();
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
     //allocate temp memory and copying keys
-    uint64_t* temp_len = gpuBufferManager->customCudaMalloc<uint64_t>(N + 1, 0, 0);
-    result_offset = gpuBufferManager->customCudaMalloc<uint64_t>(N + 1, 0, 0);
+    uint64_t* temp_len = gpuBufferManager->customCudaMalloc<uint64_t>(result_len + 1, 0, 0);
+    result_offset = gpuBufferManager->customCudaMalloc<uint64_t>(result_len + 1, 0, 0);
 
-    cudaMemset(temp_len + N, 0, sizeof(uint64_t));
+    cudaMemset(temp_len + result_len, 0, sizeof(uint64_t));
     CHECK_ERROR();
 
     // Copy over the offsets
-    uint64_t num_blocks = std::max((uint64_t) 1, (uint64_t) (N + BLOCK_THREADS - 1)/BLOCK_THREADS);
-    materialize_offset<<<num_blocks, BLOCK_THREADS>>>(offset, temp_len, row_ids, N);
+    uint64_t num_blocks = std::max((uint64_t) 1, (uint64_t) (result_len + BLOCK_THREADS - 1)/BLOCK_THREADS);
+    materialize_offset<<<num_blocks, BLOCK_THREADS>>>(offset, temp_len, row_ids, result_len);
     cudaDeviceSynchronize();
     CHECK_ERROR();
 
     //cub scan
     void* d_temp_storage = nullptr;
     size_t temp_storage_bytes = 0;
-    cub::DeviceScan::ExclusiveSum(d_temp_storage, temp_storage_bytes, temp_len, result_offset, N + 1);
+    cub::DeviceScan::ExclusiveSum(d_temp_storage, temp_storage_bytes, temp_len, result_offset, result_len + 1);
 
     // Allocate temporary storage for exclusive prefix sum
     d_temp_storage = reinterpret_cast<void*> (gpuBufferManager->customCudaMalloc<uint8_t>(temp_storage_bytes, 0, 0));
 
     // Run exclusive prefix sum
-    cub::DeviceScan::ExclusiveSum(d_temp_storage, temp_storage_bytes, temp_len, result_offset, N + 1);
+    cub::DeviceScan::ExclusiveSum(d_temp_storage, temp_storage_bytes, temp_len, result_offset, result_len + 1);
     CHECK_ERROR();
 
     // testprintmat<uint64_t><<<1, 1>>>(result_offset, N + 1);
 
-    new_num_bytes = new uint64_t[1];
-    cudaMemcpy(new_num_bytes, result_offset + N, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+    result_bytes = new uint64_t[1];
+    cudaMemcpy(result_bytes, result_offset + result_len, sizeof(uint64_t), cudaMemcpyDeviceToHost);
     // std::cout << "Got new chars len of " << new_num_bytes[0] << std::endl;
 
     CHECK_ERROR();
 
-    result = gpuBufferManager->customCudaMalloc<uint8_t>(new_num_bytes[0], 0, 0);
+    result = gpuBufferManager->customCudaMalloc<uint8_t>(result_bytes[0], 0, 0);
 
-    materialize_string<<<num_blocks, BLOCK_THREADS>>>(data, result, offset, result_offset, row_ids, N);
+    materialize_string<<<num_blocks, BLOCK_THREADS>>>(data, result, offset, result_offset, row_ids, result_len);
     cudaDeviceSynchronize();
+
+    gpuBufferManager->customCudaFree<uint64_t>(temp_len, (result_len + 1), 0);
+    gpuBufferManager->customCudaFree<uint8_t>(reinterpret_cast<uint8_t*>(d_temp_storage), temp_storage_bytes, 0);
+    gpuBufferManager->customCudaFree<uint8_t>(data, input_bytes, 0);
+    gpuBufferManager->customCudaFree<uint64_t>(offset, (input_size + 1), 0);
     CHECK_ERROR();
     STOP_TIMER();
 }
 
 template
-void materializeExpression<int>(int *a, int* result, uint64_t *row_ids, uint64_t N);
+void materializeExpression<int>(int *a, int*& result, uint64_t *row_ids, uint64_t result_len, uint64_t input_size);
 template
-void materializeExpression<uint64_t>(uint64_t *a, uint64_t* result, uint64_t *row_ids, uint64_t N);
+void materializeExpression<uint64_t>(uint64_t *a, uint64_t*& result, uint64_t *row_ids, uint64_t result_len, uint64_t input_size);
 template
-void materializeExpression<float>(float *a, float* result, uint64_t *row_ids, uint64_t N);
+void materializeExpression<float>(float *a, float*& result, uint64_t *row_ids, uint64_t result_len, uint64_t input_size);
 template
-void materializeExpression<double>(double *a, double* result, uint64_t *row_ids, uint64_t N);
+void materializeExpression<double>(double *a, double*& result, uint64_t *row_ids, uint64_t result_len, uint64_t input_size);
 template
-void materializeExpression<uint8_t>(uint8_t *a, uint8_t* result, uint64_t *row_ids, uint64_t N);
+void materializeExpression<uint8_t>(uint8_t *a, uint8_t*& result, uint64_t *row_ids, uint64_t result_len, uint64_t input_size);
 
 } // namespace duckdb
