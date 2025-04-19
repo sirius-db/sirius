@@ -277,6 +277,7 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 		auto result_exchange_table = new GPUIntermediateRelation(materialized_relation);
 		for (size_t i = 0; i < materialized_relation.column_count; ++i) {
 			result_exchange_table->column_names[i] = result_exchange_table_info->column_names[i];
+			result_exchange_table->columns[i]->name = result_exchange_table_info->column_names[i];
 		}
 		// Save GPU relation to gpu buffer manager
 		gpuBufferManager->addExchangeTable(result_exchange_table_info->table_name, result_exchange_table);
