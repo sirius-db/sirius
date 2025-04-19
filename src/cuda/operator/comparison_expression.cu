@@ -368,7 +368,7 @@ void comparisonStringBetweenExpression(char* char_data, uint64_t num_chars, uint
 
     uint64_t num_upper_chars = upper_string.length();
     char* d_upper_chars = gpuBufferManager->customCudaMalloc<char>(num_upper_chars, 0, 0);
-    cudaMemcpy(d_upper_chars, upper_string.c_str(), num_lower_chars * sizeof(char), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_upper_chars, upper_string.c_str(), num_upper_chars * sizeof(char), cudaMemcpyHostToDevice);
     CHECK_ERROR();
 
     bool* d_is_valid = gpuBufferManager->customCudaMalloc<bool>(num_strings, 0, 0);
