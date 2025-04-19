@@ -27,10 +27,10 @@ template <typename T, typename V>
 void hashGroupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count, uint64_t N, uint64_t num_keys, uint64_t num_aggregates, int* agg_mode);
 
 template<typename T>
-void combineColumns(T* a, T* b, T* c, uint64_t N_a, uint64_t N_b);
+void combineColumns(T* a, T* b, T*& c, uint64_t N_a, uint64_t N_b);
 
-void combineStrings(uint8_t* a, uint8_t* b, uint8_t* c, 
-        uint64_t* offset_a, uint64_t* offset_b, uint64_t* offset_c, 
+void combineStrings(uint8_t* a, uint8_t* b, uint8_t*& c, 
+        uint64_t* offset_a, uint64_t* offset_b, uint64_t*& offset_c, 
         uint64_t num_bytes_a, uint64_t num_bytes_b, uint64_t N_a, uint64_t N_b);
 
 class ClientContext;

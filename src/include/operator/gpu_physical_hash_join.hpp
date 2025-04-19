@@ -9,9 +9,16 @@
 #include "duckdb/execution/operator/join/physical_comparison_join.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/planner/operator/logical_join.hpp"
+#include "utils.hpp"
+#include "cudf_utils.hpp"
 #include "gpu_columns.hpp"
 
 namespace duckdb {
+
+std::pair<std::unique_ptr<rmm::device_uvector<cudf::size_type>>, std::unique_ptr<rmm::device_uvector<cudf::size_type>>> 
+    cudf_probe(void **probe_keys, cudf::hash_join* hash_table, uint64_t N, int num_keys);
+
+void cudf_build(void **build_keys, cudf::hash_join*& hash_table, uint64_t N, int num_keys);
 
 void probeHashTable(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t* &row_ids_left, uint64_t* &row_ids_right, uint64_t* &count, 
 			uint64_t N, int* condition_mode, int num_keys, bool is_right);
@@ -71,6 +78,8 @@ public:
 	mutable bool unique_build_keys = false;
 
 	mutable bool unique_probe_keys = false;
+
+	mutable cudf::hash_join* cudf_hash_table;
 
 	// OperatorResultType Execute(ExecutionContext &context, GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation,
 	// 									GlobalOperatorState &gstate, OperatorState &state) const override;

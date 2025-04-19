@@ -186,8 +186,8 @@ ResolveTypeMaterializeExpression(GPUColumn* column, GPUBufferManager* gpuBufferM
     if (column->row_ids != nullptr) {
         T* temp = reinterpret_cast<T*> (column->data_wrapper.data);
         uint64_t* row_ids_input = reinterpret_cast<uint64_t*> (column->row_ids);
-        a = gpuBufferManager->customCudaMalloc<T>(column->row_id_count, 0, 0);
-        materializeExpression<T>(temp, a, row_ids_input, column->row_id_count);
+        T* a;
+        materializeExpression<T>(temp, a, row_ids_input, column->row_id_count, column->column_length);
         size = column->row_id_count;
     } else {
         a = reinterpret_cast<T*> (column->data_wrapper.data);
@@ -210,7 +210,7 @@ GPUColumn* ResolveStringMateralizeExpression(GPUColumn* column, GPUBufferManager
     uint64_t* offset = column->data_wrapper.offset;
     uint64_t* row_ids = column->row_ids;
     num_rows = column->row_id_count;
-    materializeString(data, offset, result, result_offset, row_ids, new_num_bytes, num_rows);
+    materializeString(data, offset, result, result_offset, row_ids, new_num_bytes, num_rows, column->column_length, column->data_wrapper.num_bytes);
   } else {
     result = column->data_wrapper.data;
     result_offset = column->data_wrapper.offset;
@@ -747,7 +747,7 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
 
       printf("Num expr %d\n", num_expr);
       if (num_expr > 0) {
-        count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+        // count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
         HandleArbitraryConstantExpression(expression_columns, count, row_ids, filter_constants, num_expr);
         if (count[0] == 0) throw NotImplementedException("No match found");
       }
