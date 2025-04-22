@@ -441,9 +441,14 @@ void SiriusExtension::InitializeGPUExtension(Connection &con) {
 	CreateTableFunctionInfo gpu_processing_substrait_info(gpu_processing_substrait);
 	catalog.CreateTableFunction(*con.context, gpu_processing_substrait_info);
 
+	// Use this if developing
 	size_t cache_size_per_gpu = 1UL * 1024 * 1024 * 1024; // 1GB
-	size_t processing_size_per_gpu = 1UL * 1024 * 1024 * 1024; //1GB
-	size_t processing_size_per_cpu = 64UL * 1024 * 1024 * 1024; //16GB
+	size_t processing_size_per_gpu = 1UL * 1024 * 1024 * 1024; // 1GB
+	size_t processing_size_per_cpu = 64UL * 1024 * 1024 * 1024; // 64GB
+	// Use this if testing on A100-40GB
+	// size_t cache_size_per_gpu = 24UL * 1024 * 1024 * 1024; // 24GB
+	// size_t processing_size_per_gpu = 14UL * 1024 * 1024 * 1024; // 14GB
+	// size_t processing_size_per_cpu = 64UL * 1024 * 1024 * 1024; // 64GB
 	GPUBufferManager *gpuBufferManager = &(GPUBufferManager::GetInstance(cache_size_per_gpu, processing_size_per_gpu, processing_size_per_cpu));	
 }
 
