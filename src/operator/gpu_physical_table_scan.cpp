@@ -28,6 +28,7 @@ GPUPhysicalTableScan::GPUPhysicalTableScan(vector<LogicalType> types, TableFunct
     }
     fake_table_filters = make_uniq<TableFilterSet>();
     already_cached = new bool[column_ids.size()];
+    printf("Table scan column ids: %ld\n", column_ids.size());
 }
 
 
@@ -597,7 +598,7 @@ GPUPhysicalTableScan::ScanDataDuckDB(GPUBufferManager* gpuBufferManager, string 
             int column_idx = column_it - gpuBufferManager->tables[up_table_name]->column_names.begin();
             ColumnType column_type = convertLogicalTypeToColumnType(scanned_types[col]);
             gpuBufferManager->tables[up_table_name]->columns[column_idx]->column_length = collection->Count();
-            gpuBufferManager->tables[up_table_name]->length = collection->Count();
+            // gpuBufferManager->tables[up_table_name]->length = collection->Count();
             if (scanned_types[col] == LogicalType::VARCHAR) {
               gpuBufferManager->tables[up_table_name]->columns[column_idx]->data_wrapper = DataWrapper(column_type, d_ptr[col], d_offset_ptr[col], collection->Count(), column_size[col], true);
             } else {

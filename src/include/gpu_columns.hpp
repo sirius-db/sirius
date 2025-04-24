@@ -2,10 +2,13 @@
 
 #include "helper/common.h"
 #include "duckdb/common/types.hpp"
-
+#include "cudf_utils.hpp"
 using namespace std;
 
 namespace duckdb {
+
+int32_t* convertUInt64ToInt32(uint64_t* data, size_t N);
+uint64_t* convertInt32ToUInt64(int32_t* data, size_t N);
 
 enum class ColumnType {
     INT32,
@@ -83,7 +86,11 @@ public:
     // bool isNull;
     bool is_unique;
 
-    // cudf::column_view convertToCudfColumn();
+    cudf::column_view convertToCudfColumn();
+    int32_t* convertSiriusOffsetToCudfOffset();
+    int32_t* convertSiriusRowIdsToCudfRowIds();
+    void convertCudfRowIdsToSiriusRowIds(int32_t* cudf_row_ids);
+    void convertCudfOffsetToSiriusOffset(int32_t* cudf_offset);
     // bool isString{false};
 };
 

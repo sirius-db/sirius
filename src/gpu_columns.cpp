@@ -90,6 +90,73 @@ GPUColumn::GPUColumn(const GPUColumn& other) {
     is_unique = other.is_unique;
 }
 
+cudf::column_view
+GPUColumn::convertToCudfColumn() {
+    if (data_wrapper.type == ColumnType::INT64) {
+        auto column = cudf::column_view(cudf::data_type(cudf::type_id::UINT64), column_length, data_wrapper.data, nullptr, 0);
+        return column;
+    } else if (data_wrapper.type == ColumnType::INT32) {
+        auto column = cudf::column_view(cudf::data_type(cudf::type_id::INT32), column_length, data_wrapper.data, nullptr, 0);
+        return column;
+    } else if (data_wrapper.type == ColumnType::FLOAT32) {
+        auto column = cudf::column_view(cudf::data_type(cudf::type_id::FLOAT32), column_length, data_wrapper.data, nullptr, 0);
+        return column;
+    } else if (data_wrapper.type == ColumnType::FLOAT64) {
+        auto column = cudf::column_view(cudf::data_type(cudf::type_id::FLOAT64), column_length, data_wrapper.data, nullptr, 0);
+        return column;
+    } else if (data_wrapper.type == ColumnType::BOOLEAN) {
+        auto column = cudf::column_view(cudf::data_type(cudf::type_id::BOOL8), column_length, data_wrapper.data, nullptr, 0);
+        return column;
+    } else if (data_wrapper.type == ColumnType::VARCHAR) {
+
+        //convert offset to int32
+        int32_t* new_offset = convertSiriusOffsetToCudfOffset();
+
+        auto offsets_col = cudf::column_view(
+            cudf::data_type{cudf::type_id::INT32},
+            column_length + 1,
+            new_offset,
+            nullptr,
+            0
+        );
+
+        std::vector<cudf::column_view> children;
+        children.push_back(offsets_col);
+
+        // Build string column
+        auto str_col = cudf::column_view(
+            cudf::data_type{cudf::type_id::STRING},
+            column_length,
+            (void*) data_wrapper.data,    // No top-level data buffer
+            nullptr,    // Optional null mask
+            0,                       // Null count
+            0,                       // Offset
+            std::move(children)
+        );
+        return str_col;
+    }
+}
+
+int32_t*
+GPUColumn::convertSiriusOffsetToCudfOffset() {
+    return convertUInt64ToInt32(data_wrapper.offset, column_length + 1);
+}
+
+int32_t*
+GPUColumn::convertSiriusRowIdsToCudfRowIds() {
+    return convertUInt64ToInt32(row_ids, row_id_count);
+}
+
+void
+GPUColumn::convertCudfRowIdsToSiriusRowIds(int32_t* cudf_row_ids) {
+    row_ids = convertInt32ToUInt64(cudf_row_ids, row_id_count);
+}
+
+void
+GPUColumn::convertCudfOffsetToSiriusOffset(int32_t* cudf_offset) {
+    data_wrapper.offset = convertInt32ToUInt64(cudf_offset, column_length + 1);
+}
+
 GPUIntermediateRelation::GPUIntermediateRelation(size_t column_count) :
         column_count(column_count) {
     column_names.resize(column_count);

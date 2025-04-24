@@ -21,9 +21,15 @@ OperatorResultType
 GPUPhysicalProjection::Execute(GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation) const {
     printf("Executing projection\n");
     auto start = std::chrono::high_resolution_clock::now();
+    GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
     for (int idx = 0; idx < select_list.size(); idx++) {
         printf("Executing expression: %s\n", select_list[idx]->ToString().c_str());
         gpu_expression_executor->ProjectionRecursiveExpression(input_relation, output_relation, *select_list[idx], idx, 0);
+    }
+    for (int idx = 0; idx < input_relation.columns.size(); idx++) {
+        if (find(gpu_expression_executor->projected_columns.begin(), gpu_expression_executor->projected_columns.end(), idx) == gpu_expression_executor->projected_columns.end()) {
+            gpuBufferManager->customCudaFree<uint8_t>(input_relation.columns[idx]->data_wrapper.data, input_relation.columns[idx]->data_wrapper.num_bytes, 0);
+        }
     }
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);

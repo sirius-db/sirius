@@ -62,6 +62,8 @@ public:
 	template <typename T>
 	void customCudaFree(T* ptr, size_t size, int gpu);
 
+	void customCudaFree(uint8_t* ptr, int gpu);
+
 	void Print();
 
     map<string, GPUIntermediateRelation*> tables;
@@ -81,6 +83,9 @@ private:
     // Private constructor
    	GPUBufferManager(size_t cache_size_per_gpu, size_t processing_size_per_gpu, size_t processing_size_per_cpu);
     ~GPUBufferManager();
+	//create an allocation table that keep tracks of the allocation of the memory, it stores the pointer, size, and the gpu id
+	vector<map<uintptr_t, uint64_t>> allocation_table;
+	
 };
 
 

@@ -87,6 +87,7 @@ GPUBufferManager::GPUBufferManager(size_t cache_size_per_gpu, size_t processing_
     cuda_mr = new rmm::mr::cuda_memory_resource();
     mr = new rmm::mr::pool_memory_resource(cuda_mr, rmm::percent_of_free_device_memory(20));
     cudf::set_current_device_resource(mr);
+    allocation_table.resize(NUM_GPUS);
 
     for (int gpu = 0; gpu < NUM_GPUS; gpu++) {
         gpuCache[gpu] = callCudaMalloc<uint8_t>(cache_size_per_gpu, gpu);
@@ -114,6 +115,12 @@ GPUBufferManager::~GPUBufferManager() {
 void GPUBufferManager::ResetBuffer() {
     for (int gpu = 0; gpu < NUM_GPUS; gpu++) {
         gpuProcessingPointer[gpu] = 0;
+        //write a program to free all allocation in the allocation table
+        for (auto it = allocation_table[gpu].begin(); it != allocation_table[gpu].end(); ++it) {
+            auto ptr = it->first;
+            auto size = it->second;
+            customCudaFree<uint8_t>(reinterpret_cast<uint8_t*>(ptr), size, 0);
+        }
     }
     cpuProcessingPointer = 0;
     for (auto it = tables.begin(); it != tables.end(); it++) {
@@ -174,7 +181,8 @@ GPUBufferManager::customCudaMalloc(size_t size, int gpu, bool caching) {
         // T* ptr = reinterpret_cast<T*>(gpuProcessing[gpu] + start);
         // if (reinterpret_cast<uintptr_t>(ptr) % alignof(double) != 0) {
         //     throw InvalidInputException("Memory is not properly aligned");
-        // } 
+        // }
+        allocation_table[gpu][reinterpret_cast<uintptr_t>(ptr)] = alloc;
         return ptr;
     }
 };
@@ -189,6 +197,15 @@ GPUBufferManager::customCudaFree(T* ptr, size_t size, int gpu) {
     }
 };
 
+void
+GPUBufferManager::customCudaFree(uint8_t* ptr, int gpu) {
+    //check if ptr is not in gpuCaching
+    auto it = allocation_table[gpu].find(reinterpret_cast<uintptr_t>(ptr));
+    if (it != allocation_table[gpu].end()) {
+        mr->deallocate(ptr, it->second);
+        allocation_table[gpu].erase(it);
+    }
+}
 
 template <typename T>
 T*
