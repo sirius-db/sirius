@@ -347,15 +347,15 @@ tableScanExpression(uint8_t **col, uint64_t** offset, uint8_t *constant_compare,
     CHECK_ERROR();
     // gpuBufferManager->gpuProcessingPointer[0] = (reinterpret_cast<uint8_t*>(row_ids + h_count[0]) - gpuBufferManager->gpuProcessing[0]);
     
-    gpuBufferManager->customCudaFree<uint64_t>(count, 1, 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(count), 0);
     count = h_count;
 
-    // cudaFree(d_col);
-    // cudaFree(d_offset);
-    // gpuBufferManager->customCudaFree<uint8_t>(d_constant_compare, constant_size, 0);
-    // gpuBufferManager->customCudaFree<uint64_t>(d_constant_offset, num_expr + 1, 0);
-    // gpuBufferManager->customCudaFree<int>((int*) d_compare_mode, num_expr, 0);
-    // gpuBufferManager->customCudaFree<int>((int*) d_data_type, num_expr, 0);
+    cudaFree(d_col);
+    cudaFree(d_offset);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_constant_compare), 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_constant_offset), 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_compare_mode), 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_data_type), 0);
     printf("Count: %lu\n", h_count[0]); 
 }
 

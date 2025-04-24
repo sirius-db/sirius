@@ -267,6 +267,11 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 		}
 	}
 
+	// free all input relation columns
+	for (int col = 0; col < input_relation.columns.size(); col++) {
+		gpuBufferManager->customCudaFree<uint8_t>(input_relation.columns[col]->data_wrapper.data, input_relation.columns[col]->data_wrapper.num_bytes, 0);
+	}
+
 	ColumnDataAppendState append_state;
 	collection->InitializeAppend(append_state);
 	size_t total_vector = (materialized_relation.columns[0]->column_length + STANDARD_VECTOR_SIZE - 1) / STANDARD_VECTOR_SIZE;

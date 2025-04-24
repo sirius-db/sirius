@@ -15,8 +15,7 @@
 
 namespace duckdb {
 
-std::pair<std::unique_ptr<rmm::device_uvector<cudf::size_type>>, std::unique_ptr<rmm::device_uvector<cudf::size_type>>> 
-    cudf_probe(void **probe_keys, cudf::hash_join* hash_table, uint64_t N, int num_keys);
+void cudf_probe(void **probe_keys, cudf::hash_join* hash_table, uint64_t N, int num_keys, int32_t*& row_ids_left, int32_t*& row_ids_right, uint64_t*& count);
 
 void cudf_build(void **build_keys, cudf::hash_join*& hash_table, uint64_t N, int num_keys);
 

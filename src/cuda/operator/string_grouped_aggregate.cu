@@ -868,7 +868,7 @@ void groupedStringAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t**
     cudaFree(keys_dev_result);
     cudaFree(offset_dev_result);
     cudaFree(group_byte_offset_dev);
-    gpuBufferManager->customCudaFree<uint8_t>(row_keys, total_length_bytes, 0);
+    gpuBufferManager->customCudaFree<uint8_t>(row_keys, total_length_bytes * N, 0);
     gpuBufferManager->customCudaFree<uint64_t>(row_sequence, N, 0);
     gpuBufferManager->customCudaFree<pointer_and_key>((pointer_and_key*) materialized_temp, N, 0);
     gpuBufferManager->customCudaFree<pointer_and_key>((pointer_and_key*) group_by_rows, N, 0);

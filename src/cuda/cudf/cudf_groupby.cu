@@ -66,11 +66,11 @@ void cudf_groupby(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count, uin
 {
   // Construct a CUDA memory resource using RAPIDS Memory Manager (RMM)
   // This is the default memory resource for libcudf for allocating device memory.
-  rmm::mr::cuda_memory_resource cuda_mr{};
+  // rmm::mr::cuda_memory_resource cuda_mr{};
   // Construct a memory pool using the CUDA memory resource
   // Using a memory pool for device memory allocations is important for good performance in libcudf.
   // The pool defaults to allocating half of the available GPU memory.
-  rmm::mr::pool_memory_resource mr{&cuda_mr, rmm::percent_of_free_device_memory(10)};
+  // rmm::mr::pool_memory_resource mr{&cuda_mr, rmm::percent_of_free_device_memory(10)};
 
   // Set the pool resource to be used by default for all device memory allocations
   // Note: It is the user's responsibility to ensure the `mr` object stays alive for the duration of
@@ -82,10 +82,12 @@ void cudf_groupby(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count, uin
   // Read data
   // auto stock_table_with_metadata = read_csv("/mnt/nvme/sirius/4stock_5day.csv");
   // Process
-  auto result = average_closing_price(*stock_table_with_metadata.tbl);
+  // auto result = average_closing_price(*stock_table_with_metadata.tbl);
+
+  
 
   // Write out result
-  write_csv(*result, "/mnt/nvme/sirius/4stock_5day_avg_close.csv");
+  // write_csv(*result, "/mnt/nvme/sirius/4stock_5day_avg_close.csv");
 }
 
 } //namespace duckdb
