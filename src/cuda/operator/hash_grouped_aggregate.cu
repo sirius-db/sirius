@@ -566,12 +566,12 @@ void hashGroupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* co
     printf("Count: %lu\n", h_count[0]);
 
     for (uint64_t i = 0; i < num_keys; i++) {
-        gpuBufferManager->customCudaFree<T>(reinterpret_cast<T*>(keys[i]), N, 0);
+        gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(keys[i]), 0);
         keys[i] = keys_result[i];
     }
 
     for (uint64_t i = 0; i < num_aggregates; i++) {
-        gpuBufferManager->customCudaFree<V>(reinterpret_cast<V*>(aggregate_keys[i]), N, 0);
+        gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(aggregate_keys[i]), 0);
         aggregate_keys[i] = aggregate_keys_result[i];
     }
 
@@ -581,25 +581,25 @@ void hashGroupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* co
     cudaFree(aggregate_keys_dev);
     cudaFree(keys_dev_result);
     cudaFree(aggregate_keys_dev_result);
-    gpuBufferManager->customCudaFree<uint64_t>(d_count, 1, 0);
-    gpuBufferManager->customCudaFree<int>(agg_mode_dev, num_aggregates, 0);
-    gpuBufferManager->customCudaFree<T>(max_key, num_keys, 0);
-    gpuBufferManager->customCudaFree<T>(min_key, num_keys, 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_count), 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(agg_mode_dev), 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(max_key), 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(min_key), 0);
 
     if (C < BLOCK_THREADS) {
         ht_len = C;
         if (need_count) {
-            gpuBufferManager->customCudaFree<uint64_t>((uint64_t*) ht, ht_len * (num_keys + num_aggregates + 1), 0);
+            gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(ht), 0);
         } else {
-            gpuBufferManager->customCudaFree<uint64_t>((uint64_t*) ht, ht_len * (num_keys + num_aggregates), 0);    
+            gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(ht), 0);    
         }
 
     } else{
         ht_len = N * 2;
         if (need_count) {
-            gpuBufferManager->customCudaFree<uint64_t>((uint64_t*) ht, ht_len * (num_keys + num_aggregates + 1), 0);
+            gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(ht), 0);
         } else {
-            gpuBufferManager->customCudaFree<uint64_t>((uint64_t*) ht, ht_len * (num_keys + num_aggregates), 0);
+            gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(ht), 0);
         }
     }
 

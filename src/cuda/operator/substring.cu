@@ -88,8 +88,8 @@ std::tuple<char*, uint64_t*, uint64_t> PerformSubstring(char* char_data, uint64_
     substring_copy_chars<<<blocks_needed, THREADS_PER_BLOCK>>>(char_data, updated_chars, str_indices, result_offset, num_strings, start_idx, length);
 
     // Return the result
-    gpuBufferManager->customCudaFree<uint64_t>(new_len, num_strings + 1, 0);
-    gpuBufferManager->customCudaFree<uint8_t>(reinterpret_cast<uint8_t*>(d_temp_storage), temp_storage_bytes, 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(new_len), 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_temp_storage), 0);
     return std::make_tuple(updated_chars, result_offset, total_chars[0]);
 }
 

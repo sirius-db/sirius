@@ -321,9 +321,9 @@ void probeHashTable(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uin
     // CHECK_ERROR();
     // row_ids_right = row_ids_left + h_count[0];
     // gpuBufferManager->gpuProcessingPointer[0] = (reinterpret_cast<uint8_t*>(row_ids_right + h_count[0]) - gpuBufferManager->gpuProcessing[0]);
-    gpuBufferManager->customCudaFree<uint64_t>(offset_each_thread, ((N + tile_items - 1)/tile_items) * BLOCK_THREADS, 0);
-    gpuBufferManager->customCudaFree<int>(condition_mode_dev, num_keys, 0);
-    gpuBufferManager->customCudaFree<uint64_t>(count, 1, 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(offset_each_thread), 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(condition_mode_dev), 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(count), 0);
     cudaFree(keys_dev);
     count = h_count;
     STOP_TIMER();

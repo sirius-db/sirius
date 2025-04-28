@@ -454,7 +454,7 @@ void groupedStringAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t**
             // Run min-reduction
             cub::DeviceReduce::Max(
             d_temp_storage, temp_storage_bytes, len[key], key_length + key, N);
-            gpuBufferManager->customCudaFree<uint8_t>(reinterpret_cast<uint8_t*>(d_temp_storage), temp_storage_bytes, 0);
+            gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_temp_storage), 0);
         }
     }
 
@@ -530,7 +530,7 @@ void groupedStringAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t**
 
     CHECK_ERROR();
 
-    gpuBufferManager->customCudaFree<uint8_t>(reinterpret_cast<uint8_t*>(d_temp_storage), temp_storage_bytes, 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_temp_storage), 0);
 
     printf("Gathering offset\n");
     uint64_t** group_byte_offset = new uint64_t*[num_keys];
@@ -558,10 +558,10 @@ void groupedStringAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t**
         // Run exclusive prefix sum
         cub::DeviceScan::ExclusiveSum(d_temp_storage, temp_storage_bytes, temp, group_byte_offset[key], N + 1);
         CHECK_ERROR();
-        gpuBufferManager->customCudaFree<uint8_t>(reinterpret_cast<uint8_t*>(d_temp_storage), temp_storage_bytes, 0);
+        gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_temp_storage), 0);
 
         cudaMemcpy(d_num_bytes + key, group_byte_offset[key] + N, sizeof(uint64_t), cudaMemcpyDeviceToDevice);
-        gpuBufferManager->customCudaFree<uint64_t>(temp, N, 0);
+        gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(temp), 0);
         CHECK_ERROR();
     }
 
@@ -582,7 +582,7 @@ void groupedStringAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t**
     // Run exclusive prefix sum
     cub::DeviceScan::ExclusiveSum(d_temp_storage, temp_storage_bytes, distinct_bound, group_idx, N + 1);
     CHECK_ERROR();
-    gpuBufferManager->customCudaFree<uint8_t>(reinterpret_cast<uint8_t*>(d_temp_storage), temp_storage_bytes, 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_temp_storage), 0);
 
     //gather the aggregates based on the row_sequence
     printf("Gathering Aggregates\n");
@@ -590,6 +590,7 @@ void groupedStringAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t**
     uint64_t** aggregate_star_temp = new uint64_t*[num_aggregates];
     sort_keys_type_string* group_by_rows = reinterpret_cast<sort_keys_type_string*> (gpuBufferManager->customCudaMalloc<pointer_and_key>(N, 0, 0));
     uint64_t* d_num_runs_out = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+    uint8_t** output_agg = new uint8_t*[num_aggregates];
     uint64_t* h_count = new uint64_t[1];
 
     for (int agg = 0; agg < num_aggregates; agg++) {
@@ -634,14 +635,14 @@ void groupedStringAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t**
             CHECK_ERROR();
 
             cudaMemcpy(h_count, d_num_runs_out, sizeof(uint64_t), cudaMemcpyDeviceToHost);
-            gpuBufferManager->customCudaFree<uint64_t>(aggregate_star_temp[agg], N, 0);
-            gpuBufferManager->customCudaFree<uint8_t>(reinterpret_cast<uint8_t*>(d_temp_storage), temp_storage_bytes, 0);
+            gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(aggregate_star_temp[agg]), 0);
+            gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_temp_storage), 0);
             count[0] = h_count[0];
 
             printf("Count: %lu\n", count[0]);
 
             CHECK_ERROR();
-            aggregate_keys[agg] = reinterpret_cast<uint8_t*> (agg_star_out);
+            output_agg[agg] = reinterpret_cast<uint8_t*> (agg_star_out);
         } else {
             aggregate_keys_temp[agg] = gpuBufferManager->customCudaMalloc<V>(N, 0, 0);
             V* temp = reinterpret_cast<V*> (aggregate_keys[agg]);
@@ -680,9 +681,9 @@ void groupedStringAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t**
                 count[0] = h_count[0];
 
                 CHECK_ERROR();
-                gpuBufferManager->customCudaFree<uint8_t>(reinterpret_cast<uint8_t*>(d_temp_storage), temp_storage_bytes, 0);
-                gpuBufferManager->customCudaFree<V>(aggregate_keys_temp[agg], N, 0);
-                aggregate_keys[agg] = reinterpret_cast<uint8_t*> (agg_out);
+                gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_temp_storage), 0);
+                gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(aggregate_keys_temp[agg]), 0);
+                output_agg[agg] = reinterpret_cast<uint8_t*> (agg_out);
                 printf("Count: %lu\n", count[0]);
             } else if (agg_mode[agg] == 1) {
                 //Currently typename V has to be a double
@@ -708,7 +709,7 @@ void groupedStringAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t**
                     agg_out, d_num_runs_out, custom_sum, N);
 
                 CHECK_ERROR();
-                gpuBufferManager->customCudaFree<uint8_t>(reinterpret_cast<uint8_t*>(d_temp_storage), temp_storage_bytes, 0);
+                gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_temp_storage), 0);
 
                 aggregate_star_temp[agg] = gpuBufferManager->customCudaMalloc<uint64_t>(N, 0, 0);
                 fill_n<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(aggregate_star_temp[agg], 1, N);
@@ -744,12 +745,12 @@ void groupedStringAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t**
                 divide<V, BLOCK_THREADS, ITEMS_PER_THREAD><<<(count[0] + tile_items - 1)/tile_items, BLOCK_THREADS>>>(agg_out, agg_star_out, output, count[0]);
 
                 CHECK_ERROR();
-                gpuBufferManager->customCudaFree<uint8_t>(reinterpret_cast<uint8_t*>(d_temp_storage), temp_storage_bytes, 0);
-                gpuBufferManager->customCudaFree<V>(aggregate_keys_temp[agg], N, 0);
-                gpuBufferManager->customCudaFree<uint64_t>(aggregate_star_temp[agg], N, 0);
-                gpuBufferManager->customCudaFree<uint64_t>(agg_star_out, N, 0);
-                gpuBufferManager->customCudaFree<V>(agg_out, N, 0);
-                aggregate_keys[agg] = reinterpret_cast<uint8_t*> (output);
+                gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_temp_storage), 0);
+                gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(aggregate_keys_temp[agg]), 0);
+                gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(aggregate_star_temp[agg]), 0);
+                gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(agg_star_out), 0);
+                gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(agg_out), 0);
+                output_agg[agg] = reinterpret_cast<uint8_t*> (output);
             } else if (agg_mode[agg] == 2) {
                 printf("Reduce by key max\n");
                 // Determine temporary device storage requirements
@@ -778,9 +779,9 @@ void groupedStringAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t**
                 count[0] = h_count[0];
 
                 CHECK_ERROR();
-                gpuBufferManager->customCudaFree<uint8_t>(reinterpret_cast<uint8_t*>(d_temp_storage), temp_storage_bytes, 0);
-                gpuBufferManager->customCudaFree<V>(aggregate_keys_temp[agg], N, 0);
-                aggregate_keys[agg] = reinterpret_cast<uint8_t*> (agg_out);
+                gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_temp_storage), 0);
+                gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(aggregate_keys_temp[agg]), 0);
+                output_agg[agg] = reinterpret_cast<uint8_t*> (agg_out);
             } else if (agg_mode[agg] == 3) {
                 printf("Reduce by key min\n");
                 // Determine temporary device storage requirements
@@ -809,9 +810,9 @@ void groupedStringAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t**
                 count[0] = h_count[0];
 
                 CHECK_ERROR();
-                gpuBufferManager->customCudaFree<uint8_t>(reinterpret_cast<uint8_t*>(d_temp_storage), temp_storage_bytes, 0);
-                gpuBufferManager->customCudaFree<V>(aggregate_keys_temp[agg], N, 0);
-                aggregate_keys[agg] = reinterpret_cast<uint8_t*> (agg_out);
+                gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_temp_storage), 0);
+                gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(aggregate_keys_temp[agg]), 0);
+                output_agg[agg] = reinterpret_cast<uint8_t*> (agg_out);
             }
         }
     }
@@ -819,7 +820,7 @@ void groupedStringAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t**
     uint64_t** offset_dev_result;
     cudaMalloc((void**) &offset_dev_result, num_keys * sizeof(uint64_t*));
     for (uint64_t i = 0; i < num_keys; i++) {
-        gpuBufferManager->customCudaFree<uint64_t>(offset[i], N, 0);
+        gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(offset[i]), 0);
         offset[i] = gpuBufferManager->customCudaMalloc<uint64_t>(count[0], 0, 0);
     }
     cudaMemcpy(offset_dev_result, offset, num_keys * sizeof(uint8_t*), cudaMemcpyHostToDevice);
@@ -835,7 +836,7 @@ void groupedStringAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t**
     for (uint64_t i = 0; i < num_keys; i++) {
         uint64_t* temp_num_bytes = new uint64_t[1];
         cudaMemcpy(temp_num_bytes, offset[i] + count[0], sizeof(uint64_t), cudaMemcpyDeviceToHost);
-        gpuBufferManager->customCudaFree<uint8_t>(keys[i], original_bytes[i], 0);
+        gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(keys[i]), 0);
         keys[i] = gpuBufferManager->customCudaMalloc<uint8_t>(temp_num_bytes[0], 0, 0);
     }
     cudaMemcpy(keys_dev_result, keys, num_keys * sizeof(uint8_t*), cudaMemcpyHostToDevice);
@@ -853,13 +854,16 @@ void groupedStringAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t**
 
     for (int agg = 0; agg < num_aggregates; agg++) {
         if (agg_mode[agg] >= 0 && agg_mode[agg] <= 3) {
-            gpuBufferManager->customCudaFree<V>(reinterpret_cast<V*>(aggregate_keys[agg]), N, 0);
+            gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(aggregate_keys[agg]), 0);
+            aggregate_keys[agg] = output_agg[agg];
+        } else {
+            aggregate_keys[agg] = output_agg[agg];
         }
     }
 
     for (uint64_t i = 0; i < num_keys; i++) {
-        gpuBufferManager->customCudaFree<uint64_t>(len[i], N, 0);
-        gpuBufferManager->customCudaFree<uint64_t>(group_byte_offset[i], N + 1, 0);
+        gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(len[i]), 0);
+        gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(group_byte_offset[i]), 0);
     }
 
     //free row_keys, row_sequence, materialized_temp
@@ -868,15 +872,15 @@ void groupedStringAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t**
     cudaFree(keys_dev_result);
     cudaFree(offset_dev_result);
     cudaFree(group_byte_offset_dev);
-    gpuBufferManager->customCudaFree<uint8_t>(row_keys, total_length_bytes * N, 0);
-    gpuBufferManager->customCudaFree<uint64_t>(row_sequence, N, 0);
-    gpuBufferManager->customCudaFree<pointer_and_key>((pointer_and_key*) materialized_temp, N, 0);
-    gpuBufferManager->customCudaFree<pointer_and_key>((pointer_and_key*) group_by_rows, N, 0);
-    gpuBufferManager->customCudaFree<uint64_t>(d_num_runs_out, 1, 0); 
-    gpuBufferManager->customCudaFree<uint64_t>(key_length, num_keys, 0);
-    gpuBufferManager->customCudaFree<uint64_t>(distinct_bound, N, 0);
-    gpuBufferManager->customCudaFree<uint64_t>(group_idx, N + 1, 0);
-    gpuBufferManager->customCudaFree<uint64_t>(d_num_bytes, num_keys, 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(row_keys), 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(row_sequence), 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(materialized_temp), 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(group_by_rows), 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_num_runs_out), 0); 
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(key_length), 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(distinct_bound), 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(group_idx), 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_num_bytes), 0);
     cudaDeviceSynchronize();
     printf("Count: %lu\n", count[0]);
 

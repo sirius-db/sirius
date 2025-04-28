@@ -335,11 +335,14 @@ GPUPhysicalHashJoin::GetData(GPUIntermediateRelation &output_relation) const {
 	} else {
 		HandleMaterializeRowIDsRHS(*hash_table_result, output_relation, rhs_output_columns.col_idxs, left_column_count, count[0], row_ids, gpuBufferManager, false);
 	}
-	for (idx_t i = 0; i < hash_table_result->columns.size(); i++) {
-		if (find(rhs_output_columns.col_idxs.begin(), rhs_output_columns.col_idxs.end(), i) == rhs_output_columns.col_idxs.end()) {
-			gpuBufferManager->customCudaFree<uint8_t>(hash_table_result->columns[i]->data_wrapper.data, hash_table_result->columns[i]->data_wrapper.num_bytes, 0);
-		}
-	}
+	// for (idx_t i = 0; i < hash_table_result->columns.size(); i++) {
+	// 	if (find(rhs_output_columns.col_idxs.begin(), rhs_output_columns.col_idxs.end(), i) == rhs_output_columns.col_idxs.end()) {
+	// 		gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(hash_table_result->columns[i]->data_wrapper.data), 0);
+	// 		if (hash_table_result->columns[i]->data_wrapper.type == ColumnType::VARCHAR) {
+	// 			gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(hash_table_result->columns[i]->data_wrapper.offset), 0);
+	// 		}
+	// 	}
+	// }
 
 	auto end = std::chrono::high_resolution_clock::now();
 	auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
@@ -468,11 +471,14 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 			HandleMaterializeRowIDsLHS(input_relation, output_relation, lhs_output_columns.col_idxs, count[0], row_ids_left, gpuBufferManager, false);
 		}
 		// free all the columns in the input relation that are not in the lhs_output_columns
-		for (idx_t i = 0; i < input_relation.columns.size(); i++) {
-			if (find(lhs_output_columns.col_idxs.begin(), lhs_output_columns.col_idxs.end(), i) == lhs_output_columns.col_idxs.end()) {
-				gpuBufferManager->customCudaFree<uint8_t>(input_relation.columns[i]->data_wrapper.data, input_relation.columns[i]->data_wrapper.num_bytes, 0);
-			}
-		}
+		// for (idx_t i = 0; i < input_relation.columns.size(); i++) {
+		// 	if (find(lhs_output_columns.col_idxs.begin(), lhs_output_columns.col_idxs.end(), i) == lhs_output_columns.col_idxs.end()) {
+		// 		gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(input_relation.columns[i]->data_wrapper.data), 0);
+		// 		if (input_relation.columns[i]->data_wrapper.type == ColumnType::VARCHAR) {
+		// 			gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(input_relation.columns[i]->data_wrapper.offset), 0);
+		// 		}
+		// 	}
+		// }
 	} else if (join_type == JoinType::MARK) {
 		printf("Writing LHS columns to output relation\n");
 		for (idx_t i = 0; i < lhs_output_columns.col_idxs.size(); i++) {
@@ -491,11 +497,14 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 		output_relation.columns[lhs_output_columns.col_idxs.size()]->row_ids = probe_key[0]->row_ids;
 		output_relation.columns[lhs_output_columns.col_idxs.size()]->row_id_count = probe_key[0]->row_id_count;
 		// free all the columns in the input relation that are not in the lhs_output_columns
-		for (idx_t i = 0; i < input_relation.columns.size(); i++) {
-			if (find(lhs_output_columns.col_idxs.begin(), lhs_output_columns.col_idxs.end(), i) == lhs_output_columns.col_idxs.end()) {
-				gpuBufferManager->customCudaFree<uint8_t>(input_relation.columns[i]->data_wrapper.data, input_relation.columns[i]->data_wrapper.num_bytes, 0);
-			}
-		}
+		// for (idx_t i = 0; i < input_relation.columns.size(); i++) {
+		// 	if (find(lhs_output_columns.col_idxs.begin(), lhs_output_columns.col_idxs.end(), i) == lhs_output_columns.col_idxs.end()) {
+		// 		gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(input_relation.columns[i]->data_wrapper.data), 0);
+		// 		if (input_relation.columns[i]->data_wrapper.type == ColumnType::VARCHAR) {
+		// 			gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(input_relation.columns[i]->data_wrapper.offset), 0);
+		// 		}
+		// 	}
+		// }
 	} else if (join_type == JoinType::RIGHT_SEMI || join_type == JoinType::RIGHT_ANTI) {
 		// WE SHOULD NOT NEED TO DO ANYTHING HERE
 		// printf("Writing LHS columns to output relation\n");
@@ -520,11 +529,14 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 		}
 		if (join_type == JoinType::INNER || join_type == JoinType::LEFT) {
 			// free all the columns in the hash table result that are not in the rhs_output_columns
-			for (idx_t i = 0; i < hash_table_result->columns.size(); i++) {
-				if (find(rhs_output_columns.col_idxs.begin(), rhs_output_columns.col_idxs.end(), i) == rhs_output_columns.col_idxs.end()) {
-					gpuBufferManager->customCudaFree<uint8_t>(hash_table_result->columns[i]->data_wrapper.data, hash_table_result->columns[i]->data_wrapper.num_bytes, 0);
-				}
-			}
+			// for (idx_t i = 0; i < hash_table_result->columns.size(); i++) {
+			// 	if (find(rhs_output_columns.col_idxs.begin(), rhs_output_columns.col_idxs.end(), i) == rhs_output_columns.col_idxs.end()) {
+			// 		gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(hash_table_result->columns[i]->data_wrapper.data), 0);
+			// 		if (hash_table_result->columns[i]->data_wrapper.type == ColumnType::VARCHAR) {
+            // 			gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(hash_table_result->columns[i]->data_wrapper.offset), 0);
+        	// 		}
+			// 	}
+			// }
 		}
 	} else if (join_type == JoinType::RIGHT_SEMI || join_type == JoinType::RIGHT_ANTI) {
 		printf("Writing row IDs from RHS to output relation\n");
@@ -538,7 +550,7 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 	}
 
 	if (join_type == JoinType::INNER || join_type == JoinType::SEMI || join_type == JoinType::MARK) {
-		gpuBufferManager->customCudaFree<uint64_t>((uint64_t*) gpu_hash_table, ht_len * (conditions.size() + 1), 0);
+		gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(gpu_hash_table), 0);
 	}
 	auto end = std::chrono::high_resolution_clock::now();
 	auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);

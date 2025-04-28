@@ -224,7 +224,7 @@ void comparisonConstantExpression(T *a, T b, T c, uint64_t* &row_ids, uint64_t* 
     cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
     CHECK_ERROR();
     // gpuBufferManager->gpuProcessingPointer[0] = (reinterpret_cast<uint8_t*>(row_ids + h_count[0]) - gpuBufferManager->gpuProcessing[0]);
-    gpuBufferManager->customCudaFree<uint64_t>(count, 1, 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(count), 0);
     count = h_count;
     printf("Count: %lu\n", h_count[0]);
 }
@@ -254,7 +254,7 @@ void comparisonExpression(T *a, T *b, uint64_t* &row_ids, uint64_t* &count, uint
     cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
     CHECK_ERROR();
     // gpuBufferManager->gpuProcessingPointer[0] = (reinterpret_cast<uint8_t*>(row_ids + h_count[0]) - gpuBufferManager->gpuProcessing[0]);
-    gpuBufferManager->customCudaFree<uint64_t>(count, 1, 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(count), 0);
     count = h_count;
     printf("Count: %lu\n", h_count[0]);
 }
@@ -397,13 +397,13 @@ void comparisonStringBetweenExpression(char* char_data, uint64_t num_chars, uint
     cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
     CHECK_ERROR();
     // gpuBufferManager->gpuProcessingPointer[0] = (reinterpret_cast<uint8_t*>(row_id + h_count[0]) - gpuBufferManager->gpuProcessing[0]);
-    gpuBufferManager->customCudaFree<uint64_t>(count, 1, 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(count), 0);
     count = h_count;
     std::cout << "comparisonStringBetweenExpression got count of " << h_count[0] << std::endl;
 
-    gpuBufferManager->customCudaFree<char>(d_lower_chars, num_lower_chars, 0);
-    gpuBufferManager->customCudaFree<char>(d_upper_chars, num_upper_chars, 0);
-    gpuBufferManager->customCudaFree<bool>(d_is_valid, num_strings, 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_lower_chars), 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_upper_chars), 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_is_valid), 0);
 }
 
 void comparisonStringExpression(char* char_data, uint64_t num_chars, uint64_t* str_indices, uint64_t num_strings, std::string comparison_string, int op_mode, uint64_t* &row_id, uint64_t* &count) {
@@ -444,12 +444,12 @@ void comparisonStringExpression(char* char_data, uint64_t num_chars, uint64_t* s
     cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
     CHECK_ERROR();
     // gpuBufferManager->gpuProcessingPointer[0] = (reinterpret_cast<uint8_t*>(row_id + h_count[0]) - gpuBufferManager->gpuProcessing[0]);
-    gpuBufferManager->customCudaFree<uint64_t>(count, 1, 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(count), 0);
     count = h_count;
     std::cout << "comparisonStringExpression got count of " << h_count[0] << std::endl;
 
-    gpuBufferManager->customCudaFree<char>(d_compare_chars, num_compare_chars, 0);
-    gpuBufferManager->customCudaFree<bool>(d_is_valid, num_strings, 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_compare_chars), 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_is_valid), 0);
 }
 
 template

@@ -74,6 +74,7 @@ public:
 	void cacheDataInGPU(DataWrapper cpu_data, string table_name, string column_name, int gpu);
 	DataWrapper allocateColumnBufferInGPU(DataWrapper cpu_data, int gpu);
 	DataWrapper allocateStrColumnInGPU(DataWrapper cpu_data, int gpu);
+	void lockAllocation(void* ptr, int gpu);
 
 	void createTableAndColumnInGPU(Catalog& catalog, ClientContext& context, string table_name, string column_name);
 	void createTable(string table_name, size_t column_count);
@@ -84,8 +85,8 @@ private:
    	GPUBufferManager(size_t cache_size_per_gpu, size_t processing_size_per_gpu, size_t processing_size_per_cpu);
     ~GPUBufferManager();
 	//create an allocation table that keep tracks of the allocation of the memory, it stores the pointer, size, and the gpu id
-	vector<map<uintptr_t, uint64_t>> allocation_table;
-	
+	vector<map<void*, uint64_t>> allocation_table;
+	vector<map<void*, uint64_t>> locked_allocation_table;
 };
 
 
