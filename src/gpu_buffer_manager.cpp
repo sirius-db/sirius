@@ -85,9 +85,10 @@ GPUBufferManager::GPUBufferManager(size_t cache_size_per_gpu, size_t processing_
     cpuProcessingPointer = 0;
 
     cuda_mr = new rmm::mr::cuda_memory_resource();
-    mr = new rmm::mr::pool_memory_resource(cuda_mr, rmm::percent_of_free_device_memory(20));
+    mr = new rmm::mr::pool_memory_resource(cuda_mr, rmm::percent_of_free_device_memory(50));
     cudf::set_current_device_resource(mr);
     allocation_table.resize(NUM_GPUS);
+    locked_allocation_table.resize(NUM_GPUS);
 
     for (int gpu = 0; gpu < NUM_GPUS; gpu++) {
         gpuCache[gpu] = callCudaMalloc<uint8_t>(cache_size_per_gpu, gpu);
@@ -113,13 +114,36 @@ GPUBufferManager::~GPUBufferManager() {
 }
 
 void GPUBufferManager::ResetBuffer() {
+    cudf::set_current_device_resource(mr);
     for (int gpu = 0; gpu < NUM_GPUS; gpu++) {
         gpuProcessingPointer[gpu] = 0;
         //write a program to free all allocation in the allocation table
+        printf("Allocation table size %ld\n", allocation_table[gpu].size());
         for (auto it = allocation_table[gpu].begin(); it != allocation_table[gpu].end(); ++it) {
             auto ptr = it->first;
             auto size = it->second;
-            customCudaFree<uint8_t>(reinterpret_cast<uint8_t*>(ptr), size, 0);
+            if (ptr != nullptr) {
+                // customCudaFree<uint8_t>(reinterpret_cast<uint8_t*>(ptr), size, 0);
+                mr->deallocate((void*) ptr, size);
+                // printf("Deallocating Pointer %p size %ld\n", ptr, size);
+                // allocation_table[gpu].erase(it);
+            }
+        }
+        allocation_table[gpu].clear();
+        if (!allocation_table[gpu].empty()) {
+            throw InvalidInputException("Allocation table is not empty");
+        }
+        // printf("Locked allocation table size %ld\n", locked_allocation_table[gpu].size());
+        for (auto it = locked_allocation_table[gpu].begin(); it != locked_allocation_table[gpu].end(); ++it) {
+            auto ptr = it->first;
+            auto size = it->second;
+            if (ptr != nullptr) {
+                mr->deallocate((void*) ptr, size);
+            }
+        }
+        locked_allocation_table[gpu].clear();
+        if (!locked_allocation_table[gpu].empty()) {
+            throw InvalidInputException("Locked allocation table is not empty");
         }
     }
     cpuProcessingPointer = 0;
@@ -155,7 +179,9 @@ T*
 GPUBufferManager::customCudaMalloc(size_t size, int gpu, bool caching) {
 	size_t alloc = (size * sizeof(T));
     //always ensure that it aligns with 8B
-    alloc = alloc + (alignof(double) - alloc % alignof(double));
+    // int alignment = alignof(double);
+    int alignment = 256;
+    alloc = alloc + (alignment - alloc % alignment);
     if (caching) {
         size_t start = __atomic_fetch_add(&gpuCachingPointer[gpu], alloc, __ATOMIC_RELAXED);
         assert((start + alloc) < cache_size_per_gpu);
@@ -168,8 +194,8 @@ GPUBufferManager::customCudaMalloc(size_t size, int gpu, bool caching) {
         } 
         return ptr;
     } else {
-        T* ptr = reinterpret_cast<T*>(mr->allocate(size * sizeof(T)));
-        // printf("Allocating %ld bytes\n", alloc);
+        cudf::set_current_device_resource(mr);
+        void* ptr = mr->allocate(alloc);
         // size_t start = __atomic_fetch_add(&gpuProcessingPointer[gpu], alloc, __ATOMIC_RELAXED);
         // // printf("Current pointer %ld\n", gpuProcessingPointer[gpu]);
         // assert((start + alloc) < processing_size_per_gpu);
@@ -182,28 +208,53 @@ GPUBufferManager::customCudaMalloc(size_t size, int gpu, bool caching) {
         // if (reinterpret_cast<uintptr_t>(ptr) % alignof(double) != 0) {
         //     throw InvalidInputException("Memory is not properly aligned");
         // }
-        allocation_table[gpu][reinterpret_cast<uintptr_t>(ptr)] = alloc;
-        return ptr;
+        printf("Allocating Pointer %p size %ld\n", ptr, alloc);
+        if (ptr == nullptr) throw InvalidInputException("Pointer is nullptr");
+        if (allocation_table[gpu].find(ptr) != allocation_table[gpu].end()) {
+            throw InvalidInputException("Pointer already exists in allocation table");
+        }
+        allocation_table[gpu][ptr] = alloc;
+        return reinterpret_cast<T*>(ptr);
     }
 };
+
+void
+GPUBufferManager::lockAllocation(void* ptr, int gpu) {
+    //move entries from the allocation table to the locked table
+    auto it = allocation_table[gpu].find(ptr);
+    if (it != allocation_table[gpu].end()) {
+        locked_allocation_table[gpu][ptr] = it->second;
+        allocation_table[gpu].erase(it);
+    }
+}
 
 template <typename T>
 void
 GPUBufferManager::customCudaFree(T* ptr, size_t size, int gpu) {
     //check if ptr is not in gpuCaching
     uint8_t* ptr_uint8 = reinterpret_cast<uint8_t*>(ptr);
-    if (ptr_uint8 < gpuCache[gpu] && ptr_uint8 >= gpuCache[gpu] + cache_size_per_gpu) {
-        mr->deallocate(ptr, size * sizeof(T));
+    if (ptr_uint8 != nullptr && (ptr_uint8 < gpuCache[gpu] && ptr_uint8 >= gpuCache[gpu] + cache_size_per_gpu)) {
+        mr->deallocate((void*) ptr, size * sizeof(T));
     }
 };
 
 void
 GPUBufferManager::customCudaFree(uint8_t* ptr, int gpu) {
     //check if ptr is not in gpuCaching
-    auto it = allocation_table[gpu].find(reinterpret_cast<uintptr_t>(ptr));
-    if (it != allocation_table[gpu].end()) {
-        mr->deallocate(ptr, it->second);
-        allocation_table[gpu].erase(it);
+    cudf::set_current_device_resource(mr);
+    if (ptr != nullptr && (ptr < gpuCache[gpu] || ptr >= gpuCache[gpu] + cache_size_per_gpu)) {
+        auto it = allocation_table[gpu].find(reinterpret_cast<void*>(ptr));
+        if (it != allocation_table[gpu].end()) {
+            printf("Deallocating Pointer %p size %ld\n", ptr, it->second);
+            mr->deallocate((void*) ptr, it->second);
+            allocation_table[gpu].erase(it);
+        } else {
+            auto locked_it = locked_allocation_table[gpu].find(reinterpret_cast<void*>(ptr));
+            if (locked_it == locked_allocation_table[gpu].end()) {
+                printf("Invalid Pointer %p\n", ptr);
+                throw InvalidInputException("Pointer not found in allocation table");
+            }
+        }
     }
 }
 

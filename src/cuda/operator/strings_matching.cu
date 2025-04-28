@@ -186,11 +186,11 @@ void StringMatching(char* char_data, uint64_t* str_indices, std::string match_st
   // Check there are no errors
   CHECK_ERROR();
 
-  gpuBufferManager->customCudaFree<char>(d_match_str, match_string.length(), 0);
-  gpuBufferManager->customCudaFree<int>(d_kmp_automato, kmp_automato_size, 0);
-  gpuBufferManager->customCudaFree<uint64_t>(d_worker_start_term, workers_needed, 0);
-  gpuBufferManager->customCudaFree<bool>(d_answers, num_strings, 0);
-  gpuBufferManager->customCudaFree<uint64_t>(count, 1, 0);
+  gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_match_str), 0);
+  gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_kmp_automato), 0);
+  gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_worker_start_term), 0);
+  gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_answers), 0);
+  gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(count), 0);
   count = h_count;
   printf("Count = %ld\n", h_count[0]);
   // printf("Finished single term string matching\n");
@@ -375,12 +375,12 @@ void MultiStringMatching(char* char_data, uint64_t* str_indices, std::vector<std
   CHECK_ERROR();
 
   //free the memory
-  gpuBufferManager->customCudaFree<uint64_t>(d_worker_start_term, workers_needed, 0);
-  gpuBufferManager->customCudaFree<uint64_t>(d_prev_term_answers, num_strings, 0);
-  gpuBufferManager->customCudaFree<uint64_t>(d_answer_idxs, num_strings, 0);
-  gpuBufferManager->customCudaFree<bool>(d_found_answer, num_strings, 0);
+  gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_worker_start_term), 0);
+  gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_prev_term_answers), 0);
+  gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>( d_answer_idxs), 0);
+  gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_found_answer), 0);
   for(int i = 0; i < num_terms; i++) {
-    gpuBufferManager->customCudaFree<int>(d_all_automatos[i], all_terms[i].size() * CHARS_IN_BYTE * sizeof(int), 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_all_automatos[i]), 0);
   }
   printf("Count = %ld\n", h_count[0]);
 
@@ -455,9 +455,9 @@ void PrefixMatching(char* char_data, uint64_t* str_indices, std::string match_pr
   cudaDeviceSynchronize();
   CHECK_ERROR();
 
-  gpuBufferManager->customCudaFree<char>(d_prefix_chars, num_prefix_chars, 0);
-  gpuBufferManager->customCudaFree<bool>(d_results, num_strings, 0);
-  gpuBufferManager->customCudaFree<uint64_t>(count, 1, 0);
+  gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_prefix_chars), 0);
+  gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_results), 0);
+  gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(count), 0);
 
   count = h_count;
   std::cout << "PrefixMatching got count of " << h_count[0] << std::endl;

@@ -228,6 +228,7 @@ void groupedDistinctAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t
     uint64_t* d_num_runs_out = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
     cudaMemset(d_num_runs_out, 0, sizeof(uint64_t));
     uint64_t* h_count = new uint64_t[1];
+    uint8_t** output_agg = new uint8_t*[num_aggregates];
 
     for (int agg = 0; agg < num_aggregates; agg++) {
         // printf("Aggregating %d\n", agg);
@@ -270,8 +271,8 @@ void groupedDistinctAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t
             CHECK_ERROR();
 
             printf("Count: %lu\n", h_count[0]);
-            gpuBufferManager->customCudaFree<uint64_t>(distinct_boundary, N, 0);
-            aggregate_keys[agg] = reinterpret_cast<uint8_t*> (d_aggregates_out);
+            gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(distinct_boundary), 0);
+            output_agg[agg] = reinterpret_cast<uint8_t*> (d_aggregates_out);
         }
     }
 
@@ -291,21 +292,24 @@ void groupedDistinctAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t
     CHECK_ERROR();
 
     for (uint64_t i = 0; i < num_keys; i++) {
-        gpuBufferManager->customCudaFree<T>(reinterpret_cast<T*>(keys[i]), N, 0);
+        gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(keys[i]), 0);
         keys[i] = reinterpret_cast<uint8_t*> (keys_result[i]);
     }
 
     for (int agg = 0; agg < num_aggregates; agg++) {
-        gpuBufferManager->customCudaFree<V>(reinterpret_cast<V*>(aggregate_keys[agg]), N, 0);
+        if (distinct_mode[agg] == 0) {
+            gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(aggregate_keys[agg]), 0);
+            aggregate_keys[agg] = output_agg[agg];
+        }
     }
 
     cudaFree(keys_dev_result);
     cudaFree(keys_dev);
-    gpuBufferManager->customCudaFree<T>(row_keys, (num_keys + num_aggregates) * N, 0);
-    gpuBufferManager->customCudaFree<pointer_and_key>((pointer_and_key*) materialized_temp, N, 0);
-    gpuBufferManager->customCudaFree<uint8_t>(reinterpret_cast<uint8_t*>(d_temp_storage), temp_storage_bytes, 0);
-    gpuBufferManager->customCudaFree<pointer_and_key>((pointer_and_key*) group_by_rows, N, 0);
-    gpuBufferManager->customCudaFree<uint64_t>(d_num_runs_out, sizeof(uint64_t), 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(row_keys), 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(materialized_temp), 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_temp_storage), 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(group_by_rows), 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_num_runs_out), 0);
 
     STOP_TIMER();
 }

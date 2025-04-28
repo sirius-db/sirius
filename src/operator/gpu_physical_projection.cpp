@@ -26,11 +26,15 @@ GPUPhysicalProjection::Execute(GPUIntermediateRelation &input_relation, GPUInter
         printf("Executing expression: %s\n", select_list[idx]->ToString().c_str());
         gpu_expression_executor->ProjectionRecursiveExpression(input_relation, output_relation, *select_list[idx], idx, 0);
     }
-    for (int idx = 0; idx < input_relation.columns.size(); idx++) {
-        if (find(gpu_expression_executor->projected_columns.begin(), gpu_expression_executor->projected_columns.end(), idx) == gpu_expression_executor->projected_columns.end()) {
-            gpuBufferManager->customCudaFree<uint8_t>(input_relation.columns[idx]->data_wrapper.data, input_relation.columns[idx]->data_wrapper.num_bytes, 0);
-        }
-    }
+    printf("input column %ld\n", input_relation.columns.size());
+    // for (int idx = 0; idx < input_relation.columns.size(); idx++) {
+    //     if (find(gpu_expression_executor->projected_columns.begin(), gpu_expression_executor->projected_columns.end(), idx) == gpu_expression_executor->projected_columns.end()) {
+    //         gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(input_relation.columns[idx]->data_wrapper.data), 0);
+    //         if (input_relation.columns[idx]->data_wrapper.type == ColumnType::VARCHAR) {
+    //             gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(input_relation.columns[idx]->data_wrapper.offset), 0);
+    //         }
+    //     }
+    // }
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
     printf("Projection time: %.2f ms\n", duration.count()/1000.0);

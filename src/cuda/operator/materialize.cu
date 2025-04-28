@@ -92,7 +92,7 @@ void materializeExpression(T *a, T*& result, uint64_t *row_ids, uint64_t result_
     // testprintmat<T><<<1, 1>>>(result, 100);
     cudaDeviceSynchronize();
     STOP_TIMER();
-    gpuBufferManager->customCudaFree<T>(a, input_len, 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(a), 0);
 }
 
 void materializeString(uint8_t* data, uint64_t* offset, uint8_t* &result, uint64_t* &result_offset, uint64_t* row_ids, uint64_t* &result_bytes, uint64_t result_len, uint64_t input_size, uint64_t input_bytes) {
@@ -145,10 +145,10 @@ void materializeString(uint8_t* data, uint64_t* offset, uint8_t* &result, uint64
     materialize_string<<<num_blocks, BLOCK_THREADS>>>(data, result, offset, result_offset, row_ids, result_len);
     cudaDeviceSynchronize();
 
-    gpuBufferManager->customCudaFree<uint64_t>(temp_len, (result_len + 1), 0);
-    gpuBufferManager->customCudaFree<uint8_t>(reinterpret_cast<uint8_t*>(d_temp_storage), temp_storage_bytes, 0);
-    gpuBufferManager->customCudaFree<uint8_t>(data, input_bytes, 0);
-    gpuBufferManager->customCudaFree<uint64_t>(offset, (input_size + 1), 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(temp_len), 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_temp_storage), 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(data), 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(offset), 0);
     CHECK_ERROR();
     STOP_TIMER();
 }

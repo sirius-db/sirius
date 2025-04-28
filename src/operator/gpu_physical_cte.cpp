@@ -7,6 +7,7 @@
 // #include "duckdb/parallel/meta_pipeline.hpp"
 // #include "duckdb/parallel/pipeline.hpp"
 
+#include "gpu_buffer_manager.hpp"
 #include "gpu_pipeline.hpp"
 #include "gpu_meta_pipeline.hpp"
 #include "gpu_physical_cte.hpp"
@@ -73,9 +74,16 @@ SinkResultType GPUPhysicalCTE::Sink(GPUIntermediateRelation &input_relation) con
 
 	// return SinkResultType::NEED_MORE_INPUT;
 	printf("Sinking data into CTE\n");
+	GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 	for (int col_idx = 0; col_idx < input_relation.columns.size(); col_idx++) {
 		working_table_gpu->columns[col_idx] = new GPUColumn(input_relation.columns[col_idx]->column_length, input_relation.columns[col_idx]->data_wrapper.type, input_relation.columns[col_idx]->data_wrapper.data);
 		working_table_gpu->columns[col_idx]->is_unique = input_relation.columns[col_idx]->is_unique;
+		gpuBufferManager->lockAllocation(working_table_gpu->columns[col_idx]->data_wrapper.data, 0);
+		gpuBufferManager->lockAllocation(working_table_gpu->columns[col_idx]->row_ids, 0);
+		// If the column type is VARCHAR, also lock the offset allocation
+		if (working_table_gpu->columns[col_idx]->data_wrapper.type == ColumnType::VARCHAR) {
+			gpuBufferManager->lockAllocation(working_table_gpu->columns[col_idx]->data_wrapper.offset, 0);
+		}
 	}
     return SinkResultType::FINISHED;
 }

@@ -283,8 +283,8 @@ void probeHashTableSingleMatch(uint8_t **keys, unsigned long long* ht, uint64_t 
     // }
 
     cudaFree(keys_dev);
-    gpuBufferManager->customCudaFree<uint64_t>(count, 1, 0);
-    gpuBufferManager->customCudaFree<int>(condition_mode_dev, num_keys, 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(count), 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(condition_mode_dev), 0);
 
     printf("Count: %lu\n", h_count[0]);
     count = h_count;
@@ -326,7 +326,7 @@ void probeHashTableRightSemiAntiSingleMatch(uint8_t **keys, unsigned long long* 
     cudaDeviceSynchronize();
 
     cudaFree(keys_dev);
-    gpuBufferManager->customCudaFree<int>(condition_mode_dev, num_keys, 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(condition_mode_dev), 0);
 
     printf("Finished probe right\n");
     STOP_TIMER();
@@ -373,7 +373,7 @@ void probeHashTableMark(uint8_t **keys, unsigned long long* ht, uint64_t ht_len,
     STOP_TIMER();
 
     cudaFree(keys_dev);
-    gpuBufferManager->customCudaFree<int>(condition_mode_dev, num_keys, 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(condition_mode_dev), 0);
 }
 
 }
