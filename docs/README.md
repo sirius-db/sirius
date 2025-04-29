@@ -92,7 +92,7 @@ conda create --name libcudf-env
 conda activate libcudf-env
 conda install -c rapidsai -c conda-forge -c nvidia rapidsai::libcudf
 ```
-User would also need to make sure that the [CONDA_PREFIX](https://github.com/sirius-db/sirius/blob/eaeb793188a15760c2e41fed307b7ffcfb9c1454/CMakeLists.txt#L19) point to the right location.
+User would also need to make sure that the environment variable `LIBCUDF_ENV_PREFIX` is set to the path to the conda environment's directory. For example, if you installed miniconda to the path `~/miniconda3` and you installed libcudf in the conda environment `libcudf-env` then you would set the `LIBCUDF_ENV_PREFIX` to `~/miniconda3/envs/libcudf-env`
 
 libcudf might requires a later cmake version, as of April 2025, it would require cmake version > 3.30.4. User can follow the instruction in this [link](https://medium.com/@yulin_li/how-to-update-cmake-on-ubuntu-9602521deecb) to download the specific cmake version.
 
@@ -101,23 +101,4 @@ To use libcudf, set the environment variable USE_CUDF, and rebuild sirius.
 export USE_CUDF=1
 rm -r build/*
 make -j {nproc}
-```
-
-<!-- ## Devesh Notes
-We have provided a helper docker container that you can easily use to install all the depedencies:
-```
-$ cd ..
-$ export CURRENT_DIR=`pwd`
-$ cd sirius
-$ docker build -t sirius:latest docker/.
-$ docker kill sirius
-$ docker rm sirius
-$ docker run --gpus all -d -v $CURRENT_DIR:/working_dir/ --name=sirius --cap-add=SYS_ADMIN sirius:latest sleep infinity
-$ docker exec -it sirius bash
-$ cd sirius
-```
-
-Build the code:
-```
-$ make -j$(nproc)
 ```
