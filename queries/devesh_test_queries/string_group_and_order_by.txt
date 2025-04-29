@@ -1,0 +1,15 @@
+Columns to Cache:
+```
+call gpu_caching("customer.c_nationkey");
+call gpu_caching("nation.n_nationkey");
+call gpu_caching("nation.n_comment");
+```
+
+Queries to Run:
+```
+call gpu_processing("SELECT n_comment, COUNT(*) FROM customer, nation WHERE customer.c_nationkey = nation.n_nationkey GROUP BY n_comment;");
+
+call gpu_processing("SELECT n_comment, COUNT(*) FROM customer, nation WHERE customer.c_nationkey = nation.n_nationkey GROUP BY n_comment ORDER BY n_comment ASC;");
+
+call gpu_processing("SELECT n_comment, COUNT(*) FROM customer, nation WHERE customer.c_nationkey = nation.n_nationkey GROUP BY n_comment ORDER BY n_comment DESC;");
+```

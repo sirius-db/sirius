@@ -10,9 +10,6 @@
 
 namespace duckdb {
 
-#define STRING_HASH_POWER 31
-#define STRING_HASH_MOD_VALUE 1000000009
-
 using std::chrono::duration;
 using std::chrono::high_resolution_clock;
 
@@ -35,9 +32,60 @@ struct string_group_by_record {
 
     __device__ __forceinline__ bool operator==(const string_group_by_record &other) const {
         // First compare the signature
-        if (row_signature != other.row_signature)
-        {
+        if (row_signature != other.row_signature) {
             return false;
+        }
+
+        // If the signatures match then compare the lengths
+        for (uint64_t i = 0; i < group_by_metadata->num_keys; i++) {
+            uint64_t* curr_column_offsets = group_by_metadata->offsets[i];
+            uint64_t left_length = curr_column_offsets[row_id + 1] - curr_column_offsets[row_id];
+            uint64_t right_length = curr_column_offsets[other.row_id + 1] - curr_column_offsets[other.row_id];
+            if (left_length != right_length) {
+                return false;
+            }
+        }
+
+        // If the signature and lengths match then compare the actual chars
+        for (uint64_t i = 0; i < group_by_metadata->num_keys; i++) {
+            // Read in the left and right offsets
+            uint64_t *curr_column_offsets = group_by_metadata->offsets[i];
+            uint64_t left_read_offset = curr_column_offsets[row_id];
+            uint64_t right_read_offset = curr_column_offsets[other.row_id];
+            const uint64_t curr_length = curr_column_offsets[row_id + 1] - left_read_offset;
+
+            // Initialize state for comparing the current key
+            uint8_t* curr_column_chars = group_by_metadata->all_keys[i];
+            uint64_t* curr_column_keys = reinterpret_cast<uint64_t*>(curr_column_chars);
+            uint64_t bytes_remaining = curr_length;
+            while (bytes_remaining > 0) {
+                // Read in the left and right value
+                uint64_t left_int_idx = left_read_offset / BYTES_IN_INTEGER;
+                uint64_t left_read_idx = left_read_offset % BYTES_IN_INTEGER;
+                uint64_t curr_left_int = curr_column_keys[left_int_idx];
+
+                uint64_t right_int_idx = right_read_offset / BYTES_IN_INTEGER;
+                uint64_t right_read_idx = right_read_offset % BYTES_IN_INTEGER;
+                uint64_t curr_right_int = curr_column_keys[right_int_idx];
+
+                // Extract the bytes we care about from these integers
+                uint64_t batch_size = min(BYTES_IN_INTEGER - max(left_read_idx, right_read_idx), bytes_remaining);
+                uint64_t keep_mask = (1ULL << (BITS_IN_BYTE * batch_size)) - 1;
+                uint64_t left_shifted_val = curr_left_int >> (BYTES_IN_INTEGER * left_read_idx);
+                uint64_t left_val = left_shifted_val & keep_mask;
+                uint64_t right_shifted_val = curr_right_int >> (BYTES_IN_INTEGER * right_read_idx);
+                uint64_t right_val = right_shifted_val & keep_mask;
+
+                // Now actually compare the values
+                if (left_val != right_val) {
+                    return false;
+                }
+
+                // Update the trackers
+                bytes_remaining -= batch_size;
+                left_read_offset += batch_size;
+                right_read_offset += batch_size;
+            }
         }
 
         return true;
@@ -45,9 +93,60 @@ struct string_group_by_record {
 
     __device__ __forceinline__ bool operator<(const string_group_by_record &other) const {
         // First compare the signature
-        if (row_signature != other.row_signature)
-        {
+        if (row_signature != other.row_signature) {
             return row_signature < other.row_signature;
+        }
+
+        // If the signatures match then compare the lengths
+        for (uint64_t i = 0; i < group_by_metadata->num_keys; i++) {
+            uint64_t* curr_column_offsets = group_by_metadata->offsets[i];
+            uint64_t left_length = curr_column_offsets[row_id + 1] - curr_column_offsets[row_id];
+            uint64_t right_length = curr_column_offsets[other.row_id + 1] - curr_column_offsets[other.row_id];
+            if (left_length != right_length) {
+                return left_length < right_length;
+            }
+        }
+
+        // If the signature and lengths match then compare the actual chars
+        for (uint64_t i = 0; i < group_by_metadata->num_keys; i++) {
+            // Read in the left and right offsets
+            uint64_t *curr_column_offsets = group_by_metadata->offsets[i];
+            uint64_t left_read_offset = curr_column_offsets[row_id];
+            uint64_t right_read_offset = curr_column_offsets[other.row_id];
+            const uint64_t curr_length = curr_column_offsets[row_id + 1] - left_read_offset;
+
+            // Initialize state for comparing the current key
+            uint8_t* curr_column_chars = group_by_metadata->all_keys[i];
+            uint64_t* curr_column_keys = reinterpret_cast<uint64_t*>(curr_column_chars);
+            uint64_t bytes_remaining = curr_length;
+            while (bytes_remaining > 0) {
+                // Read in the left and right value
+                uint64_t left_int_idx = left_read_offset / BYTES_IN_INTEGER;
+                uint64_t left_read_idx = left_read_offset % BYTES_IN_INTEGER;
+                uint64_t curr_left_int = curr_column_keys[left_int_idx];
+
+                uint64_t right_int_idx = right_read_offset / BYTES_IN_INTEGER;
+                uint64_t right_read_idx = right_read_offset % BYTES_IN_INTEGER;
+                uint64_t curr_right_int = curr_column_keys[right_int_idx];
+
+                // Extract the bytes we care about from these integers
+                uint64_t batch_size = min(BYTES_IN_INTEGER - max(left_read_idx, right_read_idx), bytes_remaining);
+                uint64_t keep_mask = (1ULL << (BITS_IN_BYTE * batch_size)) - 1;
+                uint64_t left_shifted_val = curr_left_int >> (BYTES_IN_INTEGER * left_read_idx);
+                uint64_t left_val = left_shifted_val & keep_mask;
+                uint64_t right_shifted_val = curr_right_int >> (BYTES_IN_INTEGER * right_read_idx);
+                uint64_t right_val = right_shifted_val & keep_mask;
+
+                // Now actually compare the values
+                if (left_val != right_val) {
+                    return left_val < right_val;
+                }
+
+                // Update the trackers
+                bytes_remaining -= batch_size;
+                left_read_offset += batch_size;
+                right_read_offset += batch_size;
+            }
         }
 
         return row_id < other.row_id;

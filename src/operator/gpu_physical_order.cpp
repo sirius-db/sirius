@@ -1,7 +1,37 @@
 #include "operator/gpu_physical_order.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "gpu_buffer_manager.hpp"
+#include "gpu_materialize.hpp"
 
 namespace duckdb {
+
+void ResolveOrderByString(GPUColumn** sort_columns, int* sort_orders, int num_cols) {
+  uint8_t** col_keys = new uint8_t*[num_cols];
+  uint64_t** col_offsets = new uint64_t*[num_cols];
+  uint64_t* col_num_bytes = new uint64_t[num_cols];
+
+  for(int i = 0; i < num_cols; i++) {
+    GPUColumn* curr_column = sort_columns[i];
+    col_keys[i] = curr_column->data_wrapper.data;
+    col_offsets[i] = curr_column->data_wrapper.offset;
+    
+    std::cout << "ResolveOrderByString: For idx " << i << " got num bytes of " << curr_column->data_wrapper.num_bytes << std::endl;
+  }
+  uint64_t num_rows = static_cast<uint64_t>(sort_columns[0]->column_length);
+
+  // Sort the results
+  orderByString(col_keys, col_offsets, sort_orders, col_num_bytes, num_rows, num_cols);
+
+  // Write the results back
+  for(int i = 0; i < num_cols; i++) {
+    GPUColumn* curr_column = sort_columns[i];
+    curr_column->data_wrapper.data = col_keys[i];
+    curr_column->data_wrapper.offset = col_offsets[i];
+    curr_column->data_wrapper.num_bytes = col_num_bytes[i];
+
+    std::cout << "ResolveOrderByString: Wrote num bytes of " << col_num_bytes[i] << " for idx " << i << std::endl;
+  }
+}
 
 GPUPhysicalOrder::GPUPhysicalOrder(vector<LogicalType> types, vector<BoundOrderByNode> orders, vector<idx_t> projections,
                              idx_t estimated_cardinality)
@@ -24,23 +54,68 @@ GPUPhysicalOrder::GetData(GPUIntermediateRelation &output_relation) const {
 
 SinkResultType 
 GPUPhysicalOrder::Sink(GPUIntermediateRelation &input_relation) const {
-  printf("Currently order by is not doing anything since it's always after group by\n");
+  GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+  GPUColumn** sort_columns = new GPUColumn*[orders.size()];
+  int* sort_orders = new int[orders.size()];
+  int idx = 0;
+  bool string_sort = false;
   for (auto &order : orders) {
+    // key_types.push_back(order.expression->return_type);
+    // key_executor.AddExpression(*order.expression);
     auto& expr = *order.expression;
     expr.Print();
     if (expr.expression_class != ExpressionClass::BOUND_REF) {
       throw NotImplementedException("Order by expression not supported");
     }
-    auto input_idx = expr.Cast<BoundReferenceExpression>().index;
+
+    // Record the column to sort on
+    auto &bound_ref_expr = expr.Cast<BoundReferenceExpression>();
+    auto input_idx = bound_ref_expr.index;
     printf("Reading order by keys from index %ld\n", input_idx);
-    input_relation.checkLateMaterialization(input_idx);
+    sort_columns[idx] = HandleMaterializeExpression(
+      input_relation.columns[input_idx], bound_ref_expr, gpuBufferManager
+    );
+    if (sort_columns[idx]->data_wrapper.type == ColumnType::VARCHAR) {
+      string_sort = true;
+    }
+
+    // Record the sort method
+    auto sort_method = order.type;
+    int sort_type = 0;
+    if(sort_method == OrderType::DESCENDING) {
+      sort_type = 1;
+    }
+    sort_orders[idx] = sort_type;
+    printf(
+      "Order By got sort column: Col Length - %d, Size - %d, Bytes - %d, Sort Order - %d\n", 
+      (int) sort_columns[idx]->column_length, (int) sort_columns[idx]->data_wrapper.size,  
+      (int) sort_columns[idx]->data_wrapper.num_bytes, sort_orders[idx]
+    );
+
+    idx++;
   }
 
-  printf("Sorting the keys\n");
+  // Now actually perform the order by
+  if(string_sort) {
+    ResolveOrderByString(sort_columns, sort_orders, orders.size());
+  } else {
+    throw NotImplementedException("Non String Order By not yet supported");
+  }
 
+  // Copy the sorted columns back into the input relationship
+  int sort_cols_idx = 0;
+  for (auto &order : orders) {
+    auto& expr = *order.expression;
+    auto &bound_ref_expr = expr.Cast<BoundReferenceExpression>();
+    auto input_idx = bound_ref_expr.index;
+    input_relation.columns[input_idx] = sort_columns[sort_cols_idx];
+
+    sort_cols_idx += 1;
+  }
+
+  // Project the desired column into the sort result
+  sort_result->columns.resize(projections.size());
   for (auto &projection : projections) {
-    printf("Sinking order by projections from index %ld\n", projection);
-    input_relation.checkLateMaterialization(projection);
     sort_result->columns[projection] = input_relation.columns[projection];
   }
 

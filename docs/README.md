@@ -121,38 +121,3 @@ Build the code:
 ```
 $ make -j$(nproc)
 ```
-
-Start duckdb using: `./build/release/duckdb tpch_s1.duckdb`. 
-
-Example table creator:
-```
-$ CREATE TABLE example_strs(record VARCHAR);
-$ INSERT INTO example_strs (record) VALUES ('hello world');
-$ INSERT INTO example_strs (record) VALUES ('lorem ipsum');
-$ INSERT INTO example_strs (record) VALUES ('running example values');
-```
-
-String Matching queries:
-```
-$ SELECT record FROM example_strs;
-$ call gpu_caching("example_strs.record");
-$ call gpu_processing("select record from example_strs;");
-$ call gpu_processing("select record FROM example_strs WHERE record LIKE '%hello%';");
-$ call gpu_processing("select record FROM example_strs WHERE record LIKE '%lorem%ipsum%';");
-$ call gpu_caching("orders.o_comment");
-$ call gpu_caching("orders.o_orderkey");
-$ call gpu_processing("select o_orderkey, o_comment from orders where o_comment like '%special%requests%';");
-```
-
-Substring Queries:
-```
-$ call gpu_caching("customer.c_phone");
-$ call gpu_processing("select substr(c_phone, 1, 2) as countrycode from customer where substr(c_phone, 1, 2) in ('13', '31', '23', '29', '30', '18', '17')")
-```
-
-Prefix query:
-```
-$ call gpu_caching("part.p_name");
-$ select p_name from part where p_name like 'forest%';
-$ call gpu_processing("select p_name from part where p_name like 'forest%';");
-``` -->
