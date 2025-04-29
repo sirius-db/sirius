@@ -19,6 +19,8 @@ nvidia-smi
 Clone the Sirius repository using 
 ```
 git clone --recurse-submodules https://github.com/bwyogatama/sirius.git
+cd sirius
+export SIRIUS_HOME_PATH=`pwd`
 ```
 Note that `--recurse-submodules` will ensure DuckDB is pulled which is required to build the extension.
 
@@ -30,7 +32,7 @@ cd extension_external
 git clone https://github.com/duckdb/substrait.git
 cd substrait
 git reset --hard ec9f8725df7aa22bae7217ece2f221ac37563da4 #go to the right commit hash for duckdb substrait extension
-cd {SIRIUS_HOME_PATH}
+cd $SIRIUS_HOME_PATH
 make -j {nproc} #build extension
 ```
 Currently, we are using duckdb v1.0.0. Since we develop it as an extension and no modification is made to the duckdb source code, it should not be too difficult to bump it to the latest duckdb and substrait version.
@@ -75,7 +77,7 @@ The cold run would be slow as Sirius would need to read the data from storage vi
 
 ## Generating TPC-H dataset
 Unzip `dbgen.zip` and run `./dbgen -s {SF}`.
-To load the dataset to duckdb, use the SQL command in `{SIRIUS_HOME_PATH}\tpch_load_duckdb_simple.sql`.
+To load the dataset to duckdb, use the SQL command in `$SIRIUS_HOME_PATH\tpch_load_duckdb_simple.sql`.
 
 ## Changing the caching and processing region (optional)
 The GPU caching region is a memory region where the raw data is stored in GPUs. The GPUs/CPUs processing region is a memory region where intermediate results are stored in GPUs/CPUs (hash tables, .etc). The default region sizes are 10GB, 11GB, and 16GB for the GPU caching size, the GPU processing size, and the CPU processing size, respectively. The users can also modify these parameters by setting it in [SiriusExtension::GPUCachingBind](https://github.com/sirius-db/sirius/blob/058ee7291c5321727f566a2a72dda267c294f624/src/sirius_extension.cpp#L89).
