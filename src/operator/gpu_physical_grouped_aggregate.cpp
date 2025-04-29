@@ -136,21 +136,23 @@ ResolveTypeGroupByString(GPUColumn** &group_by_keys, GPUColumn** &aggregate_keys
 	uint64_t* num_bytes = new uint64_t[num_group_keys];
 	uint8_t** aggregate_data = new uint8_t*[aggregates.size()];
 
+	size_t size = group_by_keys[0]->column_length;
+	uint64_t num_rows = static_cast<uint64_t>(size);
 	for (int group = 0; group < num_group_keys; group++) {
 		group_by_data[group] = (group_by_keys[group]->data_wrapper.data);
 		if (group_by_keys[group]->data_wrapper.data == nullptr && group_by_keys[group]->column_length != 0) {
 			throw NotImplementedException("Group by column is null");
 		}
+
 		if (group_by_keys[group]->data_wrapper.type == ColumnType::VARCHAR) {
 			offset_data[group] = (group_by_keys[group]->data_wrapper.offset);
 		} else {
-			offset_data[group] = nullptr;
+			size_t column_size = group_by_keys[group]->data_wrapper.getColumnTypeSize();
+			offset_data[group] = createFixedSizeOffsets(column_size, num_rows);
 		}
 	}
-	size_t size = group_by_keys[0]->column_length;
 
 	int* agg_mode = new int[aggregates.size()];
-
 	for (int agg_idx = 0; agg_idx < aggregates.size(); agg_idx++) {
 		auto& expr = aggregates[agg_idx]->Cast<BoundAggregateExpression>();
 		printf("Aggregate function name %s\n", expr.function.name.c_str());
@@ -190,7 +192,6 @@ ResolveTypeGroupByString(GPUColumn** &group_by_keys, GPUColumn** &aggregate_keys
 		printf("Aggregate function name %s got agg_mode of %d\n", expr.function.name.c_str(), agg_mode[agg_idx]);
 	}
 
-	uint64_t num_rows = static_cast<uint64_t>(size);
 	groupedStringAggregate<V>(group_by_data, aggregate_data, offset_data, num_bytes, count, num_rows, num_group_keys, aggregates.size(), agg_mode);
 
 	// Reading groupby columns based on the grouping set

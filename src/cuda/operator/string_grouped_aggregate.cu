@@ -570,4 +570,22 @@ void combineStrings(uint8_t* a, uint8_t* b, uint8_t* c,
     cudaDeviceSynchronize();
 }
 
+__global__ void populate_fixed_size_offsets(uint64_t* offsets, uint64_t record_size, uint64_t num_records) {
+    uint64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < num_records) {
+        offsets[idx] = idx * record_size;
+    }
+}
+
+uint64_t* createFixedSizeOffsets(size_t record_size, uint64_t num_rows) {
+    // Create and populate offsets array
+    uint64_t records_to_populate = num_rows + 1;
+    GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+    uint64_t* d_offsets = gpuBufferManager->customCudaMalloc<uint64_t>(records_to_populate, 0, 0);
+
+    uint64_t num_blocks = (records_to_populate + BLOCK_THREADS - 1)/BLOCK_THREADS;
+    populate_fixed_size_offsets<<<num_blocks, BLOCK_THREADS>>>(d_offsets, static_cast<uint64_t>(record_size), records_to_populate);
+    return d_offsets;
+}
+
 }
