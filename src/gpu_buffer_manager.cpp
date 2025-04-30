@@ -5,6 +5,7 @@
 #include "utils.hpp"
 
 #define NUM_GPUS 1
+#define TRACING true
 
 namespace duckdb {
 
@@ -83,6 +84,8 @@ GPUBufferManager::GPUBufferManager(size_t cache_size_per_gpu, size_t processing_
     gpuProcessingPointer = new size_t[NUM_GPUS];
     gpuCachingPointer = new size_t[NUM_GPUS];
     cpuProcessingPointer = 0;
+
+    out_file_ = std::ofstream("/home/abigale/sirius/build/malloc_trace.txt");
 
     cuda_mr = new rmm::mr::cuda_memory_resource();
     mr = new rmm::mr::pool_memory_resource(cuda_mr, rmm::percent_of_free_device_memory(50));
@@ -182,6 +185,7 @@ GPUBufferManager::customCudaMalloc(size_t size, int gpu, bool caching) {
     // int alignment = alignof(double);
     int alignment = 256;
     alloc = alloc + (alignment - alloc % alignment);
+
     if (caching) {
         size_t start = __atomic_fetch_add(&gpuCachingPointer[gpu], alloc, __ATOMIC_RELAXED);
         assert((start + alloc) < cache_size_per_gpu);
@@ -192,6 +196,11 @@ GPUBufferManager::customCudaMalloc(size_t size, int gpu, bool caching) {
         if (reinterpret_cast<uintptr_t>(ptr) % alignof(double) != 0) {
             throw InvalidInputException("Memory is not properly aligned");
         } 
+
+        if (TRACING) {
+          out_file_ << "m " << ptr << " " << alloc;
+        }
+
         return ptr;
     } else {
         cudf::set_current_device_resource(mr);
@@ -214,6 +223,11 @@ GPUBufferManager::customCudaMalloc(size_t size, int gpu, bool caching) {
             throw InvalidInputException("Pointer already exists in allocation table");
         }
         allocation_table[gpu][ptr] = alloc;
+
+        if (TRACING) {
+          out_file_ << "m " << ptr << " " << alloc;
+        }
+
         return reinterpret_cast<T*>(ptr);
     }
 };
@@ -279,6 +293,10 @@ GPUBufferManager::customCudaFree(T* ptr, size_t size, int gpu) {
     if (ptr_uint8 != nullptr && (ptr_uint8 < gpuCache[gpu] && ptr_uint8 >= gpuCache[gpu] + cache_size_per_gpu)) {
         mr->deallocate((void*) ptr, size * sizeof(T));
     }
+
+    if (TRACING) {
+      out_file_ << "f " << ptr << " " << size;
+    }
 };
 
 void
@@ -298,6 +316,11 @@ GPUBufferManager::customCudaFree(uint8_t* ptr, int gpu) {
                 throw InvalidInputException("Pointer not found in allocation table");
             }
         }
+    }
+
+    // is this right?
+    if (TRACING) {
+      out_file_ << "f " << ptr << " " << 256;
     }
 }
 
