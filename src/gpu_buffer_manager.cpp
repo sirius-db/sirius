@@ -208,7 +208,7 @@ GPUBufferManager::customCudaMalloc(size_t size, int gpu, bool caching) {
         // if (reinterpret_cast<uintptr_t>(ptr) % alignof(double) != 0) {
         //     throw InvalidInputException("Memory is not properly aligned");
         // }
-        printf("Allocating Pointer %p size %ld\n", ptr, alloc);
+        // printf("Allocating Pointer %p size %ld\n", ptr, alloc);
         if (ptr == nullptr) throw InvalidInputException("Pointer is nullptr");
         if (allocation_table[gpu].find(ptr) != allocation_table[gpu].end()) {
             throw InvalidInputException("Pointer already exists in allocation table");
@@ -217,6 +217,49 @@ GPUBufferManager::customCudaMalloc(size_t size, int gpu, bool caching) {
         return reinterpret_cast<T*>(ptr);
     }
 };
+
+GPUColumn* 
+GPUBufferManager::copyDataFromcuDFColumn(cudf::column_view& column, int gpu) {
+    //copy the data to the gpu
+    //create a column
+    //return the column
+    uint8_t* data = const_cast<uint8_t*>(column.data<uint8_t>());
+
+    if (column.type() == cudf::data_type(cudf::type_id::STRING)) {
+
+        int32_t* temp_num_bytes = new int32_t[1];
+        int32_t* temp_offset = const_cast<int32_t*>(column.child(0).data<int32_t>());
+        callCudaMemcpyDeviceToHost<int32_t>(temp_num_bytes, temp_offset + column.size(), 1, 0);
+        uint8_t* temp_column = customCudaMalloc<uint8_t>(temp_num_bytes[0], 0, false);
+        callCudaMemcpyDeviceToDevice<uint8_t>(temp_column, data, temp_num_bytes[0], 0);
+
+        GPUColumn* column_ptr = new GPUColumn(column.size(), ColumnType::VARCHAR, temp_column);
+        column_ptr->convertCudfOffsetToSiriusOffset(temp_offset);
+        column_ptr->data_wrapper.num_bytes = temp_num_bytes[0];
+        column_ptr->data_wrapper.is_string_data = true;
+        return column_ptr;
+    } else if (column.type() == cudf::data_type(cudf::type_id::UINT64)) {
+        uint8_t* temp_column = customCudaMalloc<uint8_t>(column.size() * sizeof(uint64_t), 0, false);
+        callCudaMemcpyDeviceToDevice<uint8_t>(temp_column, data, column.size() * sizeof(uint64_t), 0);
+        return new GPUColumn(column.size(), ColumnType::INT64, temp_column);
+    } else if (column.type() == cudf::data_type(cudf::type_id::INT32)) {
+        uint8_t* temp_column = customCudaMalloc<uint8_t>(column.size() * sizeof(int32_t), 0, false);
+        callCudaMemcpyDeviceToDevice<uint8_t>(temp_column, data, column.size() * sizeof(int32_t), 0);
+        return new GPUColumn(column.size(), ColumnType::INT32, temp_column);
+    } else if (column.type() == cudf::data_type(cudf::type_id::FLOAT32)) {
+        uint8_t* temp_column = customCudaMalloc<uint8_t>(column.size() * sizeof(float), 0, false);
+        callCudaMemcpyDeviceToDevice<uint8_t>(temp_column, data, column.size() * sizeof(float), 0);
+        return new GPUColumn(column.size(), ColumnType::FLOAT32, temp_column);
+    } else if (column.type() == cudf::data_type(cudf::type_id::FLOAT64)) {
+        uint8_t* temp_column = customCudaMalloc<uint8_t>(column.size() * sizeof(double), 0, false);
+        callCudaMemcpyDeviceToDevice<uint8_t>(temp_column, data, column.size() * sizeof(double), 0);
+        return new GPUColumn(column.size(), ColumnType::FLOAT64, temp_column);
+    } else if (column.type() == cudf::data_type(cudf::type_id::BOOL8)) {
+        uint8_t* temp_column = customCudaMalloc<uint8_t>(column.size() * sizeof(bool), 0, false);
+        callCudaMemcpyDeviceToDevice<uint8_t>(temp_column, data, column.size() * sizeof(bool), 0);
+        return new GPUColumn(column.size(), ColumnType::BOOLEAN, temp_column);
+    }
+}
 
 void
 GPUBufferManager::lockAllocation(void* ptr, int gpu) {
@@ -245,7 +288,7 @@ GPUBufferManager::customCudaFree(uint8_t* ptr, int gpu) {
     if (ptr != nullptr && (ptr < gpuCache[gpu] || ptr >= gpuCache[gpu] + cache_size_per_gpu)) {
         auto it = allocation_table[gpu].find(reinterpret_cast<void*>(ptr));
         if (it != allocation_table[gpu].end()) {
-            printf("Deallocating Pointer %p size %ld\n", ptr, it->second);
+            // printf("Deallocating Pointer %p size %ld\n", ptr, it->second);
             mr->deallocate((void*) ptr, it->second);
             allocation_table[gpu].erase(it);
         } else {

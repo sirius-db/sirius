@@ -13,8 +13,6 @@ namespace duckdb {
 template <typename T> T* callCudaMalloc(size_t size, int gpu);
 template <typename T> T* callCudaHostAlloc(size_t size, bool return_dev_ptr);
 template <typename T> void callCudaFree(T* ptr, int gpu);
-template <typename T> void callCudaMemcpyHostToDevice(T* dest, T* src, size_t size, int gpu);
-template <typename T> void callCudaMemcpyDeviceToHost(T* dest, T* src, size_t size, int gpu);
 template <typename T> void materializeExpression(T *a, T*& result, uint64_t *row_ids, uint64_t result_len, uint64_t input_len);
 void materializeString(uint8_t* data, uint64_t* offset, uint8_t* &result, uint64_t* &result_offset, uint64_t* row_ids, uint64_t* &result_bytes, uint64_t result_len, uint64_t input_size, uint64_t input_bytes);
 template <typename T> void printGPUColumn(T* a, size_t N, int gpu);
@@ -80,6 +78,9 @@ public:
 	void createTable(string table_name, size_t column_count);
 	void createColumn(string table_name, string column_name, ColumnType column_type, size_t column_id, vector<size_t> unique_columns);
 	bool checkIfColumnCached(string table_name, string column_name);
+	GPUColumn* copyDataFromcuDFColumn(cudf::column_view& column, int gpu);
+
+	std::vector<std::unique_ptr<rmm::device_buffer>> rmm_stored_buffers;
 private:
     // Private constructor
    	GPUBufferManager(size_t cache_size_per_gpu, size_t processing_size_per_gpu, size_t processing_size_per_cpu);

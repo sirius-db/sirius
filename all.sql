@@ -15,6 +15,9 @@ where
   l_shipdate <= 19940902
 group by
   l_returnflag,
+  l_linestatus
+order by
+  l_returnflag,
   l_linestatus;");
 
 call gpu_processing("select

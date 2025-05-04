@@ -2,7 +2,7 @@
 #include <cuda_runtime.h>
 #include <cuda.h>
 #include "communication.hpp"
-#include "gpu_buffer_manager.hpp"
+#include "gpu_columns.hpp"
 #include "operator/cuda_helper.cuh"
 
 namespace duckdb {
@@ -36,6 +36,21 @@ callCudaMemcpyDeviceToHost<double>(double* dest, double* src, size_t size, int g
 
 template void
 callCudaMemcpyDeviceToHost<uint8_t>(uint8_t* dest, uint8_t* src, size_t size, int gpu);
+
+template void
+callCudaMemcpyDeviceToDevice<uint8_t>(uint8_t* dest, uint8_t* src, size_t size, int gpu);
+
+template void
+callCudaMemcpyDeviceToDevice<int>(int* dest, int* src, size_t size, int gpu);
+
+template void
+callCudaMemcpyDeviceToDevice<uint64_t>(uint64_t* dest, uint64_t* src, size_t size, int gpu);
+
+template void
+callCudaMemcpyDeviceToDevice<float>(float* dest, float* src, size_t size, int gpu);
+
+template void
+callCudaMemcpyDeviceToDevice<double>(double* dest, double* src, size_t size, int gpu);
 
 template <typename T> 
 void callCudaMemcpyHostToDevice(T* dest, T* src, size_t size, int gpu) {
@@ -71,6 +86,32 @@ void callCudaMemcpyDeviceToHost(T* dest, T* src, size_t size, int gpu) {
         printf("dest is null\n");
     }
     gpuErrchk(cudaMemcpy(dest, src, size * sizeof(T), cudaMemcpyDeviceToHost));
+    CHECK_ERROR();
+    gpuErrchk(cudaDeviceSynchronize());
+    cudaSetDevice(0);
+    printf("Done sending data to CPU\n");
+    STOP_TIMER();
+}
+
+template <typename T> 
+void callCudaMemcpyDeviceToDevice(T* dest, T* src, size_t size, int gpu) {
+    CHECK_ERROR();
+    if (size == 0) {
+        printf("N is 0\n");
+        return;
+    }
+    SETUP_TIMING();
+    START_TIMER();
+    printf("Send data to CPU\n");
+    cudaSetDevice(gpu);
+    printf("size: %ld\n", size);
+    if (src == nullptr) {
+        printf("src is null\n");
+    }
+    if (dest == nullptr) {
+        printf("dest is null\n");
+    }
+    gpuErrchk(cudaMemcpy(dest, src, size * sizeof(T), cudaMemcpyDeviceToDevice));
     CHECK_ERROR();
     gpuErrchk(cudaDeviceSynchronize());
     cudaSetDevice(0);
