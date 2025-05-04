@@ -37,6 +37,12 @@ callCudaMemcpyDeviceToHost<double>(double* dest, double* src, size_t size, int g
 template void
 callCudaMemcpyDeviceToHost<uint8_t>(uint8_t* dest, uint8_t* src, size_t size, int gpu);
 
+template void
+callCudaMemcpyDeviceToHost<char>(char* dest, char* src, size_t size, int gpu);
+
+template void
+callCudaMemcpyDeviceToHost<string_t>(string_t* dest, string_t* src, size_t size, int gpu);
+
 template <typename T> 
 void callCudaMemcpyHostToDevice(T* dest, T* src, size_t size, int gpu) {
     CHECK_ERROR();
