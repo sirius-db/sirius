@@ -21,6 +21,7 @@ ResolveTypeMaterializeExpression(GPUColumn* column, BoundReferenceExpression& bo
     }
     GPUColumn* result = new GPUColumn(size, column->data_wrapper.type, reinterpret_cast<uint8_t*>(a));
     result->is_unique = column->is_unique;
+    // result->rmm_owned_buffer = std::move(column->rmm_owned_buffer);
     return result;
 }
 
@@ -50,6 +51,7 @@ ResolveTypeMaterializeString(GPUColumn* column, BoundReferenceExpression& bound_
     // printf("Materialized string column with size %ld\n", new_num_bytes[0]);
     GPUColumn* result = new GPUColumn(size, column->data_wrapper.type, a, result_offset, new_num_bytes[0], column->data_wrapper.is_string_data);
     result->is_unique = column->is_unique;
+    // result->rmm_owned_buffer = std::move(column->rmm_owned_buffer);
     return result;
 }
 

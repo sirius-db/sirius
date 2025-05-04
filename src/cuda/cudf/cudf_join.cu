@@ -1,25 +1,15 @@
-#include <cudf/table/table.hpp>
-#include <cudf/join.hpp>
-#include <cudf/table/table_view.hpp>
-#include <cudf/column/column_view.hpp>
-#include <cudf/types.hpp>
-
-#include <rmm/cuda_device.hpp>
-#include <rmm/mr/device/cuda_memory_resource.hpp>
-#include <rmm/mr/device/device_memory_resource.hpp>
-#include <rmm/mr/device/pool_memory_resource.hpp>
-
-#include <memory>
-#include <string>
-#include <utility>
-#include <vector>
-
+#include "cudf/cudf_utils.hpp"
 #include "gpu_physical_hash_join.hpp"
 #include "gpu_buffer_manager.hpp"
 namespace duckdb {
 
 void cudf_probe(void **probe_keys, cudf::hash_join* hash_table, uint64_t N, int num_keys, int32_t*& row_ids_left, int32_t*& row_ids_right, uint64_t*& count)
 {
+    if (N == 0) {
+        printf("N is 0\n");
+        return;
+    }
+
     GPUBufferManager *gpuBufferManager = &(GPUBufferManager::GetInstance());
     cudf::set_current_device_resource(gpuBufferManager->mr);
     printf("CUDF probe\n");
@@ -42,6 +32,11 @@ void cudf_probe(void **probe_keys, cudf::hash_join* hash_table, uint64_t N, int 
 
 void cudf_build(void **build_keys, cudf::hash_join*& hash_table, uint64_t N, int num_keys) {
 
+    if (N == 0) {
+        printf("N is 0\n");
+        return;
+    }
+
     GPUBufferManager *gpuBufferManager = &(GPUBufferManager::GetInstance());
     cudf::set_current_device_resource(gpuBufferManager->mr);
 
@@ -56,17 +51,37 @@ void cudf_build(void **build_keys, cudf::hash_join*& hash_table, uint64_t N, int
     hash_table = new cudf::hash_join(build_table, cudf::null_equality::EQUAL);
 }
 
-void cudf_join(GPUColumn** build_columns, GPUColumn** probe_columns, vector<JoinCondition> &conditions, JoinType join_type) {
+void cudf_conditional_join(GPUColumn** build_columns, GPUColumn** probe_columns, vector<JoinCondition> &conditions, JoinType join_type, int32_t*& row_ids_left, int32_t*& row_ids_right, uint64_t*& count) {
+    
+    if (build_columns[0]->column_length == 0 || probe_columns[0]->column_length == 0) {
+        printf("N is 0\n");
+        return;
+    }
+
     GPUBufferManager *gpuBufferManager = &(GPUBufferManager::GetInstance());
     cudf::set_current_device_resource(gpuBufferManager->mr);
 
-    // std::vector<cudf::column_view> build_keys_cudf;
-    // std::vector<cudf::column_view> probe_keys_cudf;
+    std::vector<cudf::column_view> build_keys_cudf;
+    std::vector<cudf::column_view> probe_keys_cudf;
 
-    for (int i = 0; i < conditions.size(); i++) {
-        
+    for (int cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
+        build_keys_cudf.push_back(build_columns[cond_idx]->convertToCudfColumn());
+        probe_keys_cudf.push_back(probe_columns[cond_idx]->convertToCudfColumn());
     }
-    
+
+    auto build_table = cudf::table_view(build_keys_cudf);
+    auto probe_table = cudf::table_view(probe_keys_cudf);
+
+    // for (int cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
+    //     if (conditions[cond_idx].comparison == ExpressionType::COMPARE_EQUAL || conditions[cond_idx].comparison == ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+
+
+    // auto result = cudf::conditional_inner_join(probe_table, build_table, conditions);
+
+    // row_ids_left = (int32_t*)result.first->data();
+    // row_ids_right = (int32_t*)result.second->data();
+    // count = new uint64_t[1];
+    // count[0] = result.first->size();
 }
 
 } //namespace duckdb

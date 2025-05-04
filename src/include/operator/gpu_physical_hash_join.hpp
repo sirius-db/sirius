@@ -19,6 +19,8 @@ void cudf_probe(void **probe_keys, cudf::hash_join* hash_table, uint64_t N, int 
 
 void cudf_build(void **build_keys, cudf::hash_join*& hash_table, uint64_t N, int num_keys);
 
+void cudf_conditional_join(GPUColumn** build_columns, GPUColumn** probe_columns, vector<JoinCondition> &conditions, JoinType join_type, int32_t*& row_ids_left, int32_t*& row_ids_right, uint64_t*& count);
+
 void probeHashTable(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t* &row_ids_left, uint64_t* &row_ids_right, uint64_t* &count, 
 			uint64_t N, int* condition_mode, int num_keys, bool is_right);
 
