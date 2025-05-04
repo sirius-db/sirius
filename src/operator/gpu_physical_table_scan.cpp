@@ -6,6 +6,7 @@
 #include "duckdb/parallel/thread_context.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "gpu_columns.hpp"
+#include "gpu_materialize.hpp"
 
 namespace duckdb {
   

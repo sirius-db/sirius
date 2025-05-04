@@ -54,12 +54,12 @@ T* callCudaMalloc(size_t size, int gpu) {
     T* ptr;
     cudaError_t err = cudaSetDevice(gpu);
     if (err != cudaSuccess) {
-        printf("CUDA initialization error: %s\n", cudaGetErrorString(err));
+        printf("CUDA initialization error for gpu %d: %s\n", gpu, cudaGetErrorString(err));
     }
     int nDevices;
     err = cudaGetDeviceCount(&nDevices);
     if (err != cudaSuccess) {
-        printf("CUDA error: %s\n", cudaGetErrorString(err));
+        printf("CUDA error for gpu %d: %s\n", gpu, cudaGetErrorString(err));
     }
 
     int driverVersion = 0;
@@ -107,6 +107,16 @@ T* callCudaHostAlloc(size_t size, bool return_dev_ptr) {
         return return_ptr;
     }
     return ptr;
+}
+
+uint8_t* allocatePinnedCPUMemory(size_t size) {
+    uint8_t* ptr;
+    gpuErrchk(cudaHostAlloc((void**) &ptr, size * sizeof(uint8_t), cudaHostAllocDefault));
+    return ptr;
+}
+
+void freePinnedCPUMemory(uint8_t* ptr) {
+    cudaFreeHost(ptr);
 }
 
 template <typename T>
