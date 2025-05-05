@@ -56,234 +56,234 @@ CombineColumns(GPUColumn* column1, GPUColumn* column2, GPUBufferManager* gpuBuff
     }
 }
 
-// template <typename T, typename V>
-// void
-// ResolveTypeGroupByAggregateExpression(GPUColumn** &group_by_keys, GPUColumn** &aggregate_keys, GPUBufferManager* gpuBufferManager, const vector<unique_ptr<Expression>> &aggregates, int num_group_keys) {
-// 	uint64_t count[1];
-// 	count[0] = 0;
-// 	uint8_t** group_by_data = new uint8_t*[num_group_keys];
-// 	uint8_t** aggregate_data = new uint8_t*[aggregates.size()];
+template <typename T, typename V>
+void
+ResolveTypeGroupByAggregateExpression(GPUColumn** &group_by_keys, GPUColumn** &aggregate_keys, GPUBufferManager* gpuBufferManager, const vector<unique_ptr<Expression>> &aggregates, int num_group_keys) {
+	uint64_t count[1];
+	count[0] = 0;
+	uint8_t** group_by_data = new uint8_t*[num_group_keys];
+	uint8_t** aggregate_data = new uint8_t*[aggregates.size()];
 
-// 	for (int group = 0; group < num_group_keys; group++) {
-// 		if (group_by_keys[group]->data_wrapper.data == nullptr && group_by_keys[group]->column_length != 0) {
-// 			throw NotImplementedException("Group by column is null");
-// 		}
-// 		group_by_data[group] = (group_by_keys[group]->data_wrapper.data);
-// 	}
-// 	size_t size = group_by_keys[0]->column_length;
+	for (int group = 0; group < num_group_keys; group++) {
+		if (group_by_keys[group]->data_wrapper.data == nullptr && group_by_keys[group]->column_length != 0) {
+			throw NotImplementedException("Group by column is null");
+		}
+		group_by_data[group] = (group_by_keys[group]->data_wrapper.data);
+	}
+	size_t size = group_by_keys[0]->column_length;
 
-// 	int* agg_mode = new int[aggregates.size()];
+	int* agg_mode = new int[aggregates.size()];
 
-// 	for (int agg_idx = 0; agg_idx < aggregates.size(); agg_idx++) {
-// 		auto& expr = aggregates[agg_idx]->Cast<BoundAggregateExpression>();
-// 		if (expr.function.name.compare("count") == 0 && aggregate_keys[agg_idx]->data_wrapper.data == nullptr) {
-// 			agg_mode[agg_idx] = 5;
-// 			aggregate_data[agg_idx] = nullptr;
-// 		} else if (expr.function.name.compare("sum") == 0 && aggregate_keys[agg_idx]->data_wrapper.data == nullptr) {
-// 			agg_mode[agg_idx] = 5;
-// 			aggregate_data[agg_idx] = nullptr;
-// 		} else if (expr.function.name.compare("sum") == 0) {
-// 			agg_mode[agg_idx] = 0;
-// 			aggregate_data[agg_idx] = (aggregate_keys[agg_idx]->data_wrapper.data);
-// 		} else if (expr.function.name.compare("avg") == 0) {
-// 			if (aggregate_keys[agg_idx]->data_wrapper.type != ColumnType::FLOAT64) throw NotImplementedException("Column type is supposed to be double");
-// 			agg_mode[agg_idx] = 1;
-// 			aggregate_data[agg_idx] = (aggregate_keys[agg_idx]->data_wrapper.data);
-// 		} else if (expr.function.name.compare("max") == 0) {
-// 			agg_mode[agg_idx] = 2;
-// 			aggregate_data[agg_idx] = (aggregate_keys[agg_idx]->data_wrapper.data);
-// 		} else if (expr.function.name.compare("min") == 0) {
-// 			agg_mode[agg_idx] = 3;
-// 			aggregate_data[agg_idx] = (aggregate_keys[agg_idx]->data_wrapper.data);
-// 		} else if (expr.function.name.compare("count_star") == 0) {
-// 			agg_mode[agg_idx] = 4;
-// 			aggregate_data[agg_idx] = nullptr;
-// 		} else if (expr.function.name.compare("count") == 0 && aggregate_keys[agg_idx]->data_wrapper.data != nullptr) {
-// 			agg_mode[agg_idx] = 4;
-// 			aggregate_data[agg_idx] = nullptr;
-// 		} else {
-// 			throw NotImplementedException("Aggregate function not supported");
-// 		}
-// 	}
+	for (int agg_idx = 0; agg_idx < aggregates.size(); agg_idx++) {
+		auto& expr = aggregates[agg_idx]->Cast<BoundAggregateExpression>();
+		if (expr.function.name.compare("count") == 0 && aggregate_keys[agg_idx]->data_wrapper.data == nullptr) {
+			agg_mode[agg_idx] = 5;
+			aggregate_data[agg_idx] = nullptr;
+		} else if (expr.function.name.compare("sum") == 0 && aggregate_keys[agg_idx]->data_wrapper.data == nullptr) {
+			agg_mode[agg_idx] = 5;
+			aggregate_data[agg_idx] = nullptr;
+		} else if (expr.function.name.compare("sum") == 0) {
+			agg_mode[agg_idx] = 0;
+			aggregate_data[agg_idx] = (aggregate_keys[agg_idx]->data_wrapper.data);
+		} else if (expr.function.name.compare("avg") == 0) {
+			if (aggregate_keys[agg_idx]->data_wrapper.type != ColumnType::FLOAT64) throw NotImplementedException("Column type is supposed to be double");
+			agg_mode[agg_idx] = 1;
+			aggregate_data[agg_idx] = (aggregate_keys[agg_idx]->data_wrapper.data);
+		} else if (expr.function.name.compare("max") == 0) {
+			agg_mode[agg_idx] = 2;
+			aggregate_data[agg_idx] = (aggregate_keys[agg_idx]->data_wrapper.data);
+		} else if (expr.function.name.compare("min") == 0) {
+			agg_mode[agg_idx] = 3;
+			aggregate_data[agg_idx] = (aggregate_keys[agg_idx]->data_wrapper.data);
+		} else if (expr.function.name.compare("count_star") == 0) {
+			agg_mode[agg_idx] = 4;
+			aggregate_data[agg_idx] = nullptr;
+		} else if (expr.function.name.compare("count") == 0 && aggregate_keys[agg_idx]->data_wrapper.data != nullptr) {
+			agg_mode[agg_idx] = 4;
+			aggregate_data[agg_idx] = nullptr;
+		} else {
+			throw NotImplementedException("Aggregate function not supported");
+		}
+	}
 
-// 	// groupedAggregate<T, V>(group_by_data, aggregate_data, count, size, num_group_keys, aggregates.size(), agg_mode);
-// 	hashGroupedAggregate<T, V>(group_by_data, aggregate_data, count, size, num_group_keys, aggregates.size(), agg_mode);
+	// groupedAggregate<T, V>(group_by_data, aggregate_data, count, size, num_group_keys, aggregates.size(), agg_mode);
+	hashGroupedAggregate<T, V>(group_by_data, aggregate_data, count, size, num_group_keys, aggregates.size(), agg_mode);
 
-// 	// Reading groupby columns based on the grouping set
-// 	for (idx_t group = 0; group < num_group_keys; group++) {
-// 		bool old_unique = group_by_keys[group]->is_unique;
-// 		group_by_keys[group] = new GPUColumn(count[0], group_by_keys[group]->data_wrapper.type, reinterpret_cast<uint8_t*>(group_by_data[group]));
-// 		group_by_keys[group]->is_unique = old_unique;
-// 	}
+	// Reading groupby columns based on the grouping set
+	for (idx_t group = 0; group < num_group_keys; group++) {
+		bool old_unique = group_by_keys[group]->is_unique;
+		group_by_keys[group] = new GPUColumn(count[0], group_by_keys[group]->data_wrapper.type, reinterpret_cast<uint8_t*>(group_by_data[group]));
+		group_by_keys[group]->is_unique = old_unique;
+	}
 
-// 	for (int agg_idx = 0; agg_idx < aggregates.size(); agg_idx++) {
-// 		auto& expr = aggregates[agg_idx]->Cast<BoundAggregateExpression>();
-// 		if (expr.function.name.compare("count_star") == 0 || expr.function.name.compare("count") == 0) {
-// 			aggregate_keys[agg_idx] = new GPUColumn(count[0], ColumnType::INT64, reinterpret_cast<uint8_t*>(aggregate_data[agg_idx]));
-// 		} else {
-// 			aggregate_keys[agg_idx] = new GPUColumn(count[0], aggregate_keys[agg_idx]->data_wrapper.type, reinterpret_cast<uint8_t*>(aggregate_data[agg_idx]));
-// 		}
-// 	}
-// }
+	for (int agg_idx = 0; agg_idx < aggregates.size(); agg_idx++) {
+		auto& expr = aggregates[agg_idx]->Cast<BoundAggregateExpression>();
+		if (expr.function.name.compare("count_star") == 0 || expr.function.name.compare("count") == 0) {
+			aggregate_keys[agg_idx] = new GPUColumn(count[0], ColumnType::INT64, reinterpret_cast<uint8_t*>(aggregate_data[agg_idx]));
+		} else {
+			aggregate_keys[agg_idx] = new GPUColumn(count[0], aggregate_keys[agg_idx]->data_wrapper.type, reinterpret_cast<uint8_t*>(aggregate_data[agg_idx]));
+		}
+	}
+}
 
-// template <typename V>
-// void
-// ResolveTypeGroupByString(GPUColumn** &group_by_keys, GPUColumn** &aggregate_keys, GPUBufferManager* gpuBufferManager, const vector<unique_ptr<Expression>> &aggregates, int num_group_keys) {
-// 	uint64_t count[1];
-// 	count[0] = 0;
-// 	uint8_t** group_by_data = new uint8_t*[num_group_keys];
-// 	uint64_t** offset_data = new uint64_t*[num_group_keys];
-// 	uint64_t* num_bytes = new uint64_t[num_group_keys];
-// 	uint8_t** aggregate_data = new uint8_t*[aggregates.size()];
+template <typename V>
+void
+ResolveTypeGroupByString(GPUColumn** &group_by_keys, GPUColumn** &aggregate_keys, GPUBufferManager* gpuBufferManager, const vector<unique_ptr<Expression>> &aggregates, int num_group_keys) {
+	uint64_t count[1];
+	count[0] = 0;
+	uint8_t** group_by_data = new uint8_t*[num_group_keys];
+	uint64_t** offset_data = new uint64_t*[num_group_keys];
+	uint64_t* num_bytes = new uint64_t[num_group_keys];
+	uint8_t** aggregate_data = new uint8_t*[aggregates.size()];
 
-// 	for (int group = 0; group < num_group_keys; group++) {
-// 		group_by_data[group] = (group_by_keys[group]->data_wrapper.data);
-// 		if (group_by_keys[group]->data_wrapper.data == nullptr && group_by_keys[group]->column_length != 0) {
-// 			throw NotImplementedException("Group by column is null");
-// 		}
-// 		if (group_by_keys[group]->data_wrapper.type == ColumnType::VARCHAR) {
-// 			offset_data[group] = (group_by_keys[group]->data_wrapper.offset);
-// 		} else {
-// 			offset_data[group] = nullptr;
-// 		}
-// 	}
-// 	size_t size = group_by_keys[0]->column_length;
+	for (int group = 0; group < num_group_keys; group++) {
+		group_by_data[group] = (group_by_keys[group]->data_wrapper.data);
+		if (group_by_keys[group]->data_wrapper.data == nullptr && group_by_keys[group]->column_length != 0) {
+			throw NotImplementedException("Group by column is null");
+		}
+		if (group_by_keys[group]->data_wrapper.type == ColumnType::VARCHAR) {
+			offset_data[group] = (group_by_keys[group]->data_wrapper.offset);
+		} else {
+			offset_data[group] = nullptr;
+		}
+	}
+	size_t size = group_by_keys[0]->column_length;
 
-// 	int* agg_mode = new int[aggregates.size()];
+	int* agg_mode = new int[aggregates.size()];
 
-// 	for (int agg_idx = 0; agg_idx < aggregates.size(); agg_idx++) {
-// 		auto& expr = aggregates[agg_idx]->Cast<BoundAggregateExpression>();
-// 		printf("Aggregate function name %s\n", expr.function.name.c_str());
-// 		if (expr.function.name.compare("count") == 0 && aggregate_keys[agg_idx]->data_wrapper.data == nullptr) {
-// 			agg_mode[agg_idx] = 5;
-// 			aggregate_data[agg_idx] = nullptr;
-// 		} else if (expr.function.name.compare("sum") == 0 && aggregate_keys[agg_idx]->data_wrapper.data == nullptr) {
-// 			agg_mode[agg_idx] = 5;
-// 			aggregate_data[agg_idx] = nullptr;
-// 		} else if (expr.function.name.compare("sum") == 0) {
-// 			agg_mode[agg_idx] = 0;
-// 			aggregate_data[agg_idx] = (aggregate_keys[agg_idx]->data_wrapper.data);
-// 		} else if (expr.function.name.compare("avg") == 0) {
-// 			if (aggregate_keys[agg_idx]->data_wrapper.type != ColumnType::FLOAT64) throw NotImplementedException("Column type is supposed to be double");
-// 			agg_mode[agg_idx] = 1;
-// 			aggregate_data[agg_idx] = (aggregate_keys[agg_idx]->data_wrapper.data);
-// 		} else if (expr.function.name.compare("max") == 0) {
-// 			agg_mode[agg_idx] = 2;
-// 			aggregate_data[agg_idx] = (aggregate_keys[agg_idx]->data_wrapper.data);
-// 		} else if (expr.function.name.compare("min") == 0) {
-// 			agg_mode[agg_idx] = 3;
-// 			aggregate_data[agg_idx] = (aggregate_keys[agg_idx]->data_wrapper.data);
-// 		} else if (expr.function.name.compare("count_star") == 0) {
-// 			agg_mode[agg_idx] = 4;
-// 			aggregate_data[agg_idx] = nullptr;
-// 		} else if (expr.function.name.compare("count") == 0 && aggregate_keys[agg_idx]->data_wrapper.data != nullptr) {
-// 			agg_mode[agg_idx] = 4;
-// 			aggregate_data[agg_idx] = nullptr;
-// 		} else {
-// 			throw NotImplementedException("Aggregate function not supported");
-// 		}
-// 	}
+	for (int agg_idx = 0; agg_idx < aggregates.size(); agg_idx++) {
+		auto& expr = aggregates[agg_idx]->Cast<BoundAggregateExpression>();
+		printf("Aggregate function name %s\n", expr.function.name.c_str());
+		if (expr.function.name.compare("count") == 0 && aggregate_keys[agg_idx]->data_wrapper.data == nullptr) {
+			agg_mode[agg_idx] = 5;
+			aggregate_data[agg_idx] = nullptr;
+		} else if (expr.function.name.compare("sum") == 0 && aggregate_keys[agg_idx]->data_wrapper.data == nullptr) {
+			agg_mode[agg_idx] = 5;
+			aggregate_data[agg_idx] = nullptr;
+		} else if (expr.function.name.compare("sum") == 0) {
+			agg_mode[agg_idx] = 0;
+			aggregate_data[agg_idx] = (aggregate_keys[agg_idx]->data_wrapper.data);
+		} else if (expr.function.name.compare("avg") == 0) {
+			if (aggregate_keys[agg_idx]->data_wrapper.type != ColumnType::FLOAT64) throw NotImplementedException("Column type is supposed to be double");
+			agg_mode[agg_idx] = 1;
+			aggregate_data[agg_idx] = (aggregate_keys[agg_idx]->data_wrapper.data);
+		} else if (expr.function.name.compare("max") == 0) {
+			agg_mode[agg_idx] = 2;
+			aggregate_data[agg_idx] = (aggregate_keys[agg_idx]->data_wrapper.data);
+		} else if (expr.function.name.compare("min") == 0) {
+			agg_mode[agg_idx] = 3;
+			aggregate_data[agg_idx] = (aggregate_keys[agg_idx]->data_wrapper.data);
+		} else if (expr.function.name.compare("count_star") == 0) {
+			agg_mode[agg_idx] = 4;
+			aggregate_data[agg_idx] = nullptr;
+		} else if (expr.function.name.compare("count") == 0 && aggregate_keys[agg_idx]->data_wrapper.data != nullptr) {
+			agg_mode[agg_idx] = 4;
+			aggregate_data[agg_idx] = nullptr;
+		} else {
+			throw NotImplementedException("Aggregate function not supported");
+		}
+	}
 
-// 	groupedStringAggregate<V>(group_by_data, aggregate_data, offset_data, num_bytes, count, size, num_group_keys, aggregates.size(), agg_mode);
+	groupedStringAggregate<V>(group_by_data, aggregate_data, offset_data, num_bytes, count, size, num_group_keys, aggregates.size(), agg_mode);
 
-// 	// Reading groupby columns based on the grouping set
-// 	for (idx_t group = 0; group < num_group_keys; group++) {
-// 		bool old_unique = group_by_keys[group]->is_unique;
-// 		if (group_by_keys[group]->data_wrapper.type == ColumnType::VARCHAR) {
-// 			if (offset_data[group] == nullptr && count[0] > 0) throw NotImplementedException("Offset data is null");
-// 			group_by_keys[group] = new GPUColumn(count[0], group_by_keys[group]->data_wrapper.type, reinterpret_cast<uint8_t*>(group_by_data[group]), reinterpret_cast<uint64_t*>(offset_data[group]), num_bytes[group], true);
-// 		} else {
-// 			group_by_keys[group] = new GPUColumn(count[0], group_by_keys[group]->data_wrapper.type, reinterpret_cast<uint8_t*>(group_by_data[group]));
-// 		}
-// 		group_by_keys[group]->is_unique = old_unique;
-// 	}
+	// Reading groupby columns based on the grouping set
+	for (idx_t group = 0; group < num_group_keys; group++) {
+		bool old_unique = group_by_keys[group]->is_unique;
+		if (group_by_keys[group]->data_wrapper.type == ColumnType::VARCHAR) {
+			if (offset_data[group] == nullptr && count[0] > 0) throw NotImplementedException("Offset data is null");
+			group_by_keys[group] = new GPUColumn(count[0], group_by_keys[group]->data_wrapper.type, reinterpret_cast<uint8_t*>(group_by_data[group]), reinterpret_cast<uint64_t*>(offset_data[group]), num_bytes[group], true);
+		} else {
+			group_by_keys[group] = new GPUColumn(count[0], group_by_keys[group]->data_wrapper.type, reinterpret_cast<uint8_t*>(group_by_data[group]));
+		}
+		group_by_keys[group]->is_unique = old_unique;
+	}
 
-// 	for (int agg_idx = 0; agg_idx < aggregates.size(); agg_idx++) {
-// 		auto& expr = aggregates[agg_idx]->Cast<BoundAggregateExpression>();
-// 		if (expr.function.name.compare("count_star") == 0 || expr.function.name.compare("count") == 0) {
-// 			aggregate_keys[agg_idx] = new GPUColumn(count[0], ColumnType::INT64, reinterpret_cast<uint8_t*>(aggregate_data[agg_idx]));
-// 		} else {
-// 			aggregate_keys[agg_idx] = new GPUColumn(count[0], aggregate_keys[agg_idx]->data_wrapper.type, reinterpret_cast<uint8_t*>(aggregate_data[agg_idx]));
-// 		}
-// 	}
-// }
-
-// void
-// HandleGroupByAggregateExpression(GPUColumn** &group_by_keys, GPUColumn** &aggregate_keys, GPUBufferManager* gpuBufferManager, const vector<unique_ptr<Expression>> &aggregates, int num_group_keys) {
-// 	bool string_groupby = false;
-// 	for (int i = 0; i < num_group_keys; i++) {
-// 		if (group_by_keys[i]->data_wrapper.type == ColumnType::VARCHAR) {
-// 			string_groupby = true;
-// 		}
-// 	}
-
-// 	ColumnType aggregate_type;
-// 	if (aggregates.size() == 1) {
-// 		aggregate_type = aggregate_keys[0]->data_wrapper.type;
-// 	} else {
-// 		//check if all the aggregate functions are of the same type
-// 		bool same_type = true;
-// 		ColumnType prev_type;
-// 		for (int i = 0; i < aggregates.size(); i++) {
-// 			if (aggregates[i]->Cast<BoundAggregateExpression>().function.name.compare("count") != 0 && 
-// 						aggregates[i]->Cast<BoundAggregateExpression>().function.name.compare("count_star") != 0) {
-// 				prev_type = aggregate_keys[i]->data_wrapper.type;
-// 				break;
-// 			}
-// 		}
-// 		for (int i = 0; i < aggregates.size(); i++) {
-// 			if (aggregates[i]->Cast<BoundAggregateExpression>().function.name.compare("count") != 0 && 
-// 						aggregates[i]->Cast<BoundAggregateExpression>().function.name.compare("count_star") != 0) {
-// 				aggregate_type = aggregate_keys[i]->data_wrapper.type;
-// 				if (aggregate_type != prev_type) {
-// 					throw NotImplementedException("All aggregate functions must be of the same type");
-// 				}
-// 				prev_type = aggregate_type;
-// 			}
-// 		}
-// 	}
-
-// 	if (string_groupby) {
-// 		if (aggregate_type == ColumnType::INT64) {
-// 			ResolveTypeGroupByString<uint64_t>(group_by_keys, aggregate_keys, gpuBufferManager, aggregates, num_group_keys);
-// 		} else if (aggregate_type == ColumnType::FLOAT64) {
-// 			ResolveTypeGroupByString<double>(group_by_keys, aggregate_keys, gpuBufferManager, aggregates, num_group_keys);
-// 		} else {
-// 			throw NotImplementedException("Unsupported column type");
-// 		}
-// 	} else {
-// 		//check if all the group by keys are all integers
-// 		for (int i = 0; i < num_group_keys; i++) {
-// 			if (group_by_keys[i]->data_wrapper.type != ColumnType::INT64) {
-// 				throw NotImplementedException("Group by column is not an integer");
-// 			}
-// 		}
-// 		switch(group_by_keys[0]->data_wrapper.type) {
-// 		case ColumnType::INT64:
-// 			if (aggregate_type == ColumnType::INT64) {
-// 				ResolveTypeGroupByAggregateExpression<uint64_t, uint64_t>(group_by_keys, aggregate_keys, gpuBufferManager, aggregates, num_group_keys);
-// 			} else if (aggregate_type == ColumnType::FLOAT64) {
-// 				ResolveTypeGroupByAggregateExpression<uint64_t, double>(group_by_keys, aggregate_keys, gpuBufferManager, aggregates, num_group_keys);
-// 			} else throw NotImplementedException("Unsupported column type");
-// 			break;
-// 		case ColumnType::FLOAT64:
-// 			throw NotImplementedException("Unsupported column type");
-// 		default:
-// 			throw NotImplementedException("Unsupported column type");
-// 		}
-// 	}
-// }
+	for (int agg_idx = 0; agg_idx < aggregates.size(); agg_idx++) {
+		auto& expr = aggregates[agg_idx]->Cast<BoundAggregateExpression>();
+		if (expr.function.name.compare("count_star") == 0 || expr.function.name.compare("count") == 0) {
+			aggregate_keys[agg_idx] = new GPUColumn(count[0], ColumnType::INT64, reinterpret_cast<uint8_t*>(aggregate_data[agg_idx]));
+		} else {
+			aggregate_keys[agg_idx] = new GPUColumn(count[0], aggregate_keys[agg_idx]->data_wrapper.type, reinterpret_cast<uint8_t*>(aggregate_data[agg_idx]));
+		}
+	}
+}
 
 void
 HandleGroupByAggregateExpression(GPUColumn** &group_by_keys, GPUColumn** &aggregate_keys, GPUBufferManager* gpuBufferManager, const vector<unique_ptr<Expression>> &aggregates, int num_group_keys) {
+	bool string_groupby = false;
+	for (int i = 0; i < num_group_keys; i++) {
+		if (group_by_keys[i]->data_wrapper.type == ColumnType::VARCHAR) {
+			string_groupby = true;
+		}
+	}
+
+	ColumnType aggregate_type;
+	if (aggregates.size() == 1) {
+		aggregate_type = aggregate_keys[0]->data_wrapper.type;
+	} else {
+		//check if all the aggregate functions are of the same type
+		bool same_type = true;
+		ColumnType prev_type;
+		for (int i = 0; i < aggregates.size(); i++) {
+			if (aggregates[i]->Cast<BoundAggregateExpression>().function.name.compare("count") != 0 && 
+						aggregates[i]->Cast<BoundAggregateExpression>().function.name.compare("count_star") != 0) {
+				prev_type = aggregate_keys[i]->data_wrapper.type;
+				break;
+			}
+		}
+		for (int i = 0; i < aggregates.size(); i++) {
+			if (aggregates[i]->Cast<BoundAggregateExpression>().function.name.compare("count") != 0 && 
+						aggregates[i]->Cast<BoundAggregateExpression>().function.name.compare("count_star") != 0) {
+				aggregate_type = aggregate_keys[i]->data_wrapper.type;
+				if (aggregate_type != prev_type) {
+					throw NotImplementedException("All aggregate functions must be of the same type");
+				}
+				prev_type = aggregate_type;
+			}
+		}
+	}
+
+	if (string_groupby) {
+		if (aggregate_type == ColumnType::INT64) {
+			ResolveTypeGroupByString<uint64_t>(group_by_keys, aggregate_keys, gpuBufferManager, aggregates, num_group_keys);
+		} else if (aggregate_type == ColumnType::FLOAT64) {
+			ResolveTypeGroupByString<double>(group_by_keys, aggregate_keys, gpuBufferManager, aggregates, num_group_keys);
+		} else {
+			throw NotImplementedException("Unsupported column type");
+		}
+	} else {
+		//check if all the group by keys are all integers
+		for (int i = 0; i < num_group_keys; i++) {
+			if (group_by_keys[i]->data_wrapper.type != ColumnType::INT64) {
+				throw NotImplementedException("Group by column is not an integer");
+			}
+		}
+		switch(group_by_keys[0]->data_wrapper.type) {
+		case ColumnType::INT64:
+			if (aggregate_type == ColumnType::INT64) {
+				ResolveTypeGroupByAggregateExpression<uint64_t, uint64_t>(group_by_keys, aggregate_keys, gpuBufferManager, aggregates, num_group_keys);
+			} else if (aggregate_type == ColumnType::FLOAT64) {
+				ResolveTypeGroupByAggregateExpression<uint64_t, double>(group_by_keys, aggregate_keys, gpuBufferManager, aggregates, num_group_keys);
+			} else throw NotImplementedException("Unsupported column type");
+			break;
+		case ColumnType::FLOAT64:
+			throw NotImplementedException("Unsupported column type");
+		default:
+			throw NotImplementedException("Unsupported column type");
+		}
+	}
+}
+
+void
+HandleGroupByAggregateCuDF(GPUColumn** &group_by_keys, GPUColumn** &aggregate_keys, GPUBufferManager* gpuBufferManager, const vector<unique_ptr<Expression>> &aggregates, int num_group_keys) {
 
 	AggregationType* agg_mode = new AggregationType[aggregates.size()];
 	printf("Handling group by aggregate expression\n");
 	for (int agg_idx = 0; agg_idx < aggregates.size(); agg_idx++) {
 		auto& expr = aggregates[agg_idx]->Cast<BoundAggregateExpression>();
-		if (expr.function.name.compare("count") == 0 && aggregate_keys[agg_idx]->data_wrapper.data == nullptr && aggregate_keys[agg_idx]->column_length != 0) {
+		if (expr.function.name.compare("count") == 0 && aggregate_keys[agg_idx]->data_wrapper.data == nullptr && aggregate_keys[agg_idx]->column_length == 0) {
 			agg_mode[agg_idx] = AggregationType::COUNT;
-		} else if (expr.function.name.compare("sum") == 0 && aggregate_keys[agg_idx]->data_wrapper.data == nullptr && aggregate_keys[agg_idx]->column_length != 0) {
+		} else if (expr.function.name.compare("sum") == 0 && aggregate_keys[agg_idx]->data_wrapper.data == nullptr && aggregate_keys[agg_idx]->column_length == 0) {
 			agg_mode[agg_idx] = AggregationType::SUM;
 		} else if (expr.function.name.compare("sum") == 0 && aggregate_keys[agg_idx]->data_wrapper.data != nullptr) {
 			agg_mode[agg_idx] = AggregationType::SUM;
@@ -298,6 +298,7 @@ HandleGroupByAggregateExpression(GPUColumn** &group_by_keys, GPUColumn** &aggreg
 		} else if (expr.function.name.compare("count") == 0 && aggregate_keys[agg_idx]->data_wrapper.data != nullptr) {
 			agg_mode[agg_idx] = AggregationType::COUNT;
 		} else {
+			printf("Aggregate function not supported: %s\n", expr.function.name.c_str());
 			throw NotImplementedException("Aggregate function not supported");
 		}
 	}
@@ -603,7 +604,7 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 	if (aggregates.size() == 0) {
 		HandleDuplicateElimination(group_by_column, gpuBufferManager, num_group_keys);
 	} else {
-		HandleGroupByAggregateExpression(group_by_column, aggregate_column, gpuBufferManager, aggregates, num_group_keys);
+		HandleGroupByAggregateCuDF(group_by_column, aggregate_column, gpuBufferManager, aggregates, num_group_keys);
 	}
 	
 	// Reading groupby columns based on the grouping set

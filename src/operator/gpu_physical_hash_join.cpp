@@ -427,29 +427,25 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 
 	//probing hash table
 	printf("Probing hash table\n");
-	// if (join_type == JoinType::INNER) {
-	// 	void** probe_key_ptr = new void*[conditions.size()];
-	// 	for (int cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
-	// 		probe_key_ptr[cond_idx] = probe_key[cond_idx]->data_wrapper.data;
-	// 	}
-	// 	int32_t* cudf_row_ids_left = nullptr;
-	// 	int32_t* cudf_row_ids_right = nullptr;
-	// 	cudf_probe(probe_key_ptr, cudf_hash_table, probe_key[0]->column_length, conditions.size(), cudf_row_ids_left, cudf_row_ids_right, count);
-	// 	// auto result_left = result.first->data();
-	// 	// auto result_right = result.second->data();
-	// 	// count = new uint64_t[1];
-	// 	// count[0] = result.first->size();
-	// 	printf("count[0] = %ld\n", count[0]);
-
-	// 	int32_t* row_ids_left_copy = new int32_t[count[0]];
-	// 	int32_t* row_ids_right_copy = new int32_t[count[0]];
-	// 	callCudaMemcpyDeviceToHost<int32_t>(row_ids_left_copy, cudf_row_ids_left, count[0], 0);
-	// 	callCudaMemcpyDeviceToHost<int32_t>(row_ids_right_copy, cudf_row_ids_right, count[0], 0);
-	// 	for (idx_t i = 0; i < count[0]; i++) {
-	// 		printf("row_ids_left[%ld] = %d, row_ids_right[%d] = %d\n", i, row_ids_left_copy[i], i, row_ids_right_copy[i]);
-	// 	}
-	// } else 	
-	if (join_type == JoinType::SEMI || join_type == JoinType::ANTI || join_type == JoinType::INNER || join_type == JoinType::OUTER || join_type == JoinType::RIGHT) {
+	if (join_type == JoinType::INNER) {
+		// check if there is a non-equality condition
+		bool has_non_equality_condition = false;
+		for (idx_t i = 0; i < conditions.size(); i++) {
+			if (conditions[i].comparison != ExpressionType::COMPARE_EQUAL && conditions[i].comparison != ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+				has_non_equality_condition = true;
+				break;
+			}
+		}
+		if (!has_non_equality_condition) {
+			cudf_probe(probe_key, cudf_hash_table, conditions.size(), row_ids_left, row_ids_right, count);
+		} else {
+			GPUColumn** build_key = new GPUColumn*[conditions.size()];
+			for (int cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
+				build_key[cond_idx] = hash_table_result->columns[cond_idx];
+			}
+			cudf_mixed_join(probe_key, build_key, conditions, join_type, row_ids_left, row_ids_right, count);
+		}
+	} else if (join_type == JoinType::SEMI || join_type == JoinType::ANTI || join_type == JoinType::OUTER || join_type == JoinType::RIGHT) {
 		HandleProbeExpression(probe_key, count, row_ids_left, row_ids_right, gpu_hash_table, ht_len, conditions, join_type, unique_build_keys, gpuBufferManager);
 		if (count[0] == 0) throw NotImplementedException("No match found");
 	} else if (join_type == JoinType::MARK) {
@@ -612,15 +608,21 @@ GPUPhysicalHashJoin::Sink(GPUIntermediateRelation &input_relation) const {
 		gpu_hash_table = (unsigned long long*) gpuBufferManager->customCudaMalloc<uint64_t>(ht_len * (conditions.size() + 2), 0, 0);
 	}
 
-	// if (join_type == JoinType::INNER) {
-	// 	void** build_keys_ptr = new void*[conditions.size()];
-	// 	for (int i = 0; i < conditions.size(); i++) {
-	// 		build_keys_ptr[i] = (void*) build_keys[i]->data_wrapper.data;
-	// 	}
-	// 	cudf_build(build_keys_ptr, cudf_hash_table, build_keys[0]->column_length, conditions.size());
-	// } else {
+	if (join_type == JoinType::INNER) {
+		// check if there is a non-equality condition
+		bool has_non_equality_condition = false;
+		for (idx_t i = 0; i < conditions.size(); i++) {
+			if (conditions[i].comparison != ExpressionType::COMPARE_EQUAL && conditions[i].comparison != ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+				has_non_equality_condition = true;
+				break;
+			}
+		}
+		if (!has_non_equality_condition) {
+			cudf_build(build_keys, cudf_hash_table, conditions.size());
+		}
+	} else {
 		HandleBuildExpression(build_keys, gpu_hash_table, ht_len, conditions, join_type, gpuBufferManager);
-	// }
+	}
 
 	int right_idx = 0;
 	for (idx_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {

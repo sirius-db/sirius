@@ -21,3 +21,4 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/round.hpp>
 #include <cudf/unary.hpp>
+#include <cudf/ast/expressions.hpp>
