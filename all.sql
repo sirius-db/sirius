@@ -86,8 +86,7 @@ group by
   o_shippriority
 order by
   revenue desc,
-  o_orderdate,
-  l_orderkey
+  o_orderdate
 limit 10");
 
 call gpu_processing("select
@@ -108,6 +107,8 @@ where
       and l_commitdate < l_receiptdate
     )
 group by
+  o_orderpriority
+order by
   o_orderpriority;");
 
 call gpu_processing("select
@@ -131,7 +132,9 @@ where
   and o_orderdate >= 19940101
   and o_orderdate <= 19941231
 group by
-  n_name");
+  n_name
+order by
+  revenue desc;");
 
 call gpu_processing("select
   sum(l_extendedprice * l_discount) as revenue
@@ -176,6 +179,10 @@ from (
 group by
   supp_nation,
   cust_nation,
+  l_year
+order by
+  supp_nation,
+  cust_nation,
   l_year;");
 
 call gpu_processing("select
@@ -212,6 +219,8 @@ from (
     and p_type = 103
   ) as all_nations
 group by
+  o_year
+order by
   o_year;");
 
 call gpu_processing("select
@@ -241,7 +250,10 @@ from(
   ) as profit
 group by
   nation,
-  o_year;");
+  o_year
+order by
+  nation,
+  o_year desc;");
 
 call gpu_processing("select
   c_custkey,
@@ -271,7 +283,9 @@ group by
   c_phone,
   n_name,
   c_address,
-  c_comment limit 20;");
+  c_comment 
+order by
+  revenue desc;");
 
 call gpu_processing("select
   *
@@ -302,7 +316,9 @@ where
       ps_suppkey = s_suppkey
       and s_nationkey = n_nationkey
       and n_name = 'GERMANY'
-  ) limit 1;");
+  )
+order by
+  value desc;");
 
 call gpu_processing("select
   l_shipmode,
@@ -329,6 +345,8 @@ where
   and l_receiptdate >= 19940101
   and l_receiptdate <= 19941231
 group by
+  l_shipmode
+order by
   l_shipmode;");
 
 call gpu_processing("select
@@ -347,7 +365,10 @@ from (
     c_custkey
   ) as c_orders
 group by
-  c_count;");
+  c_count
+order by
+  custdist desc,
+  c_count desc;");
 
 call gpu_processing("select
     sum(case
@@ -389,7 +410,9 @@ where
       max(total_revenue)
     from
       revenue_view
-    );");
+    )
+order by
+  s_suppkey;");
 
 call gpu_processing("select
   p_brand,
@@ -413,6 +436,11 @@ where
       s_comment like '%Customer%Complaints%'
   )
 group by
+  p_brand,
+  p_type,
+  p_size
+order by
+  supplier_cnt desc,
   p_brand,
   p_type,
   p_size;");
@@ -464,7 +492,11 @@ group by
   c_custkey,
   o_orderkey,
   o_orderdate,
-  o_totalprice;");
+  o_totalprice
+order by
+  o_totalprice desc,
+  o_orderdate,
+  o_orderkey;");
 
 call gpu_processing("select
   sum(l_extendedprice * (1 - l_discount)) as revenue
@@ -535,7 +567,9 @@ where
         )
     )
   and s_nationkey = n_nationkey
-  and n_name = 'CANADA';");
+  and n_name = 'CANADA'
+  order by
+    s_name;");
 
 call gpu_processing("select
   s_name,
@@ -572,6 +606,9 @@ where
   and s_nationkey = n_nationkey
   and n_name = 'SAUDI ARABIA'
 group by
+  s_name
+order by
+  numwait desc,
   s_name;");
 
 call gpu_processing("select
@@ -605,4 +642,6 @@ from (
     )
   ) as custsale
 group by
+  cntrycode
+order by
   cntrycode;");

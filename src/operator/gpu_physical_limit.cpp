@@ -14,12 +14,17 @@ OperatorResultType
 GPUPhysicalStreamingLimit::Execute(GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation) const {
 
 	printf("Executing streaming limit\n");
+  // printf("limit type: %d\n", limit_val.Type());
   printf("Limit value %ld\n", limit_val.GetConstantValue());
-  auto limit_const = limit_val.GetConstantValue();
-  auto offset_const = offset_val.GetConstantValue();
-  if (offset_const > 0) {
-    throw NotImplementedException("Streaming limit with offset not implemented");
+  if (limit_val.Type() != LimitNodeType::CONSTANT_VALUE) {
+    throw NotImplementedException("Streaming limit other than constant value not implemented");
   }
+  auto limit_const = limit_val.GetConstantValue();
+  // printf("Offset value %ld\n", offset_val.GetConstantValue());
+  // auto offset_const = offset_val.GetConstantValue();
+  // if (offset_const > 0) {
+  //   throw NotImplementedException("Streaming limit with offset not implemented");
+  // }
   GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 	for (int col_idx = 0; col_idx < output_relation.columns.size(); col_idx++) {
     BoundReferenceExpression& bound_ref = *new BoundReferenceExpression(LogicalType::INTEGER, col_idx);
