@@ -57,7 +57,13 @@ where
       and s_nationkey = n_nationkey
       and n_regionkey = r_regionkey
       and r_name = 'EUROPE'
-    ) limit 100;");
+    )
+order by
+  s_acctbal desc,
+  n_name,
+  s_name,
+  p_partkey 
+limit 100");
     
 call gpu_processing("select
   l_orderkey,
@@ -77,8 +83,12 @@ where
 group by
   l_orderkey,
   o_orderdate,
-  o_shippriority limit 10;
-");
+  o_shippriority
+order by
+  revenue desc,
+  o_orderdate,
+  l_orderkey
+limit 10");
 
 call gpu_processing("select
   o_orderpriority,

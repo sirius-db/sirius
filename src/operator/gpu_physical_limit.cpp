@@ -16,6 +16,10 @@ GPUPhysicalStreamingLimit::Execute(GPUIntermediateRelation &input_relation, GPUI
 	printf("Executing streaming limit\n");
   printf("Limit value %ld\n", limit_val.GetConstantValue());
   auto limit_const = limit_val.GetConstantValue();
+  auto offset_const = offset_val.GetConstantValue();
+  if (offset_const > 0) {
+    throw NotImplementedException("Streaming limit with offset not implemented");
+  }
   GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 	for (int col_idx = 0; col_idx < output_relation.columns.size(); col_idx++) {
     BoundReferenceExpression& bound_ref = *new BoundReferenceExpression(LogicalType::INTEGER, col_idx);

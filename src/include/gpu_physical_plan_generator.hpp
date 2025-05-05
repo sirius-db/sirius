@@ -65,7 +65,7 @@ protected:
 	unique_ptr<GPUPhysicalOperator> CreatePlan(LogicalGet &op);
 	unique_ptr<GPUPhysicalOperator> CreatePlan(LogicalLimit &op);
 	unique_ptr<GPUPhysicalOperator> CreatePlan(LogicalOrder &op);
-	// unique_ptr<GPUPhysicalOperator> CreatePlan(LogicalTopN &op);
+	unique_ptr<GPUPhysicalOperator> CreatePlan(LogicalTopN &op);
 	// unique_ptr<GPUPhysicalOperator> CreatePlan(LogicalPositionalJoin &op);
 	unique_ptr<GPUPhysicalOperator> CreatePlan(LogicalProjection &op);
 	// unique_ptr<GPUPhysicalOperator> CreatePlan(LogicalInsert &op);

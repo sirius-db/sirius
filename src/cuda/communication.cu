@@ -102,7 +102,7 @@ void callCudaMemcpyDeviceToDevice(T* dest, T* src, size_t size, int gpu) {
     }
     SETUP_TIMING();
     START_TIMER();
-    printf("Send data to CPU\n");
+    printf("Send data within GPU\n");
     cudaSetDevice(gpu);
     printf("size: %ld\n", size);
     if (src == nullptr) {
@@ -115,7 +115,7 @@ void callCudaMemcpyDeviceToDevice(T* dest, T* src, size_t size, int gpu) {
     CHECK_ERROR();
     gpuErrchk(cudaDeviceSynchronize());
     cudaSetDevice(0);
-    printf("Done sending data to CPU\n");
+    printf("Done sending data to GPU\n");
     STOP_TIMER();
 }
 

@@ -152,6 +152,8 @@ GPUColumn::setFromCudfColumn(cudf::column& cudf_column, bool _is_unique, int32_t
     data_wrapper.size = col_size;
     column_length = data_wrapper.size;
     is_unique = _is_unique;
+    //add data to allocation table in gpu buffer manager
+    gpuBufferManager->allocation_table[0][reinterpret_cast<void*>(data_wrapper.data)] = column_length;
 
     if (col_type == cudf::data_type(cudf::type_id::STRING)) {
         cudf::column::contents child_cont = cont.children[0]->release();

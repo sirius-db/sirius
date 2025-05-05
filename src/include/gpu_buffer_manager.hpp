@@ -81,13 +81,15 @@ public:
 	GPUColumn* copyDataFromcuDFColumn(cudf::column_view& column, int gpu);
 
 	std::vector<std::unique_ptr<rmm::device_buffer>> rmm_stored_buffers;
+
+	//create an allocation table that keep tracks of the allocation of the memory, it stores the pointer, size, and the gpu id
+	vector<map<void*, uint64_t>> allocation_table;
+	vector<map<void*, uint64_t>> locked_allocation_table;
 private:
     // Private constructor
    	GPUBufferManager(size_t cache_size_per_gpu, size_t processing_size_per_gpu, size_t processing_size_per_cpu);
     ~GPUBufferManager();
-	//create an allocation table that keep tracks of the allocation of the memory, it stores the pointer, size, and the gpu id
-	vector<map<void*, uint64_t>> allocation_table;
-	vector<map<void*, uint64_t>> locked_allocation_table;
+
 };
 
 
