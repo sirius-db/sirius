@@ -64,6 +64,8 @@ void cudf_orderby(GPUColumn **keys, GPUColumn **projection, uint64_t num_keys, u
         return;
     }
 
+    printf("N is: %ld\n", keys[0]->column_length);
+
     GPUBufferManager *gpuBufferManager = &(GPUBufferManager::GetInstance());
     cudf::set_current_device_resource(gpuBufferManager->mr);
 
@@ -127,10 +129,10 @@ void cudf_orderby(GPUColumn **keys, GPUColumn **projection, uint64_t num_keys, u
 
     auto keys_table = cudf::table_view(columns_cudf);
 
-    for (int col = 0; col < num_keys; col++) {
-        int size = keys[col]->column_length;
-        printGPUColumn<uint64_t>(reinterpret_cast<uint64_t*>(keys[col]->data_wrapper.data), size, 0);
-    }
+    // for (int col = 0; col < num_keys; col++) {
+    //     int size = keys[col]->column_length;
+    //     printGPUColumn<uint64_t>(reinterpret_cast<uint64_t*>(keys[col]->data_wrapper.data), size, 0);
+    // }
 
     // printGPUColumn<uint64_t>(a_gpu, 25, 0);
     // printGPUColumn<uint64_t>(b_gpu, 25, 0);
@@ -143,17 +145,17 @@ void cudf_orderby(GPUColumn **keys, GPUColumn **projection, uint64_t num_keys, u
     // auto sorted_table = cudf::stable_sort(keys_table, orders);
     // auto sorted_table_view = sorted_table->view();
 
-    for (int col = 0; col < num_keys; col++) {
-        int size = keys[col]->column_length;
-        printGPUColumn<uint64_t>(reinterpret_cast<uint64_t*>(keys[col]->data_wrapper.data), size, 0);
-    }
+    // for (int col = 0; col < num_keys; col++) {
+    //     int size = keys[col]->column_length;
+    //     printGPUColumn<uint64_t>(reinterpret_cast<uint64_t*>(keys[col]->data_wrapper.data), size, 0);
+    // }
 
     // printGPUColumn<uint64_t>(a_gpu, 25, 0);
     // printGPUColumn<uint64_t>(b_gpu, 25, 0);
 
-    int size = sorted_order_view.size();
-    int* data = const_cast<int*>(sorted_order_view.data<int>());
-    printGPUColumn<int>(data, size, 0);
+    // int size = sorted_order_view.size();
+    // int* data = const_cast<int*>(sorted_order_view.data<int>());
+    // printGPUColumn<int>(data, size, 0);
 
     std::vector<cudf::column_view> projection_cudf;
     for (int col = 0; col < num_projections; col++) {
@@ -169,6 +171,8 @@ void cudf_orderby(GPUColumn **keys, GPUColumn **projection, uint64_t num_keys, u
         projection[col]->setFromCudfColumn(sorted_column, projection[col]->is_unique, nullptr, 0, gpuBufferManager);
         // projection[col] = gpuBufferManager->copyDataFromcuDFColumn(sorted_column, 0);
     }
+
+    printf("Order by done\n");
 
     // throw NotImplementedException("Order by is not implemented");
 

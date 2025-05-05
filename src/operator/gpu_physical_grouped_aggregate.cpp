@@ -663,7 +663,7 @@ GPUPhysicalGroupedAggregate::GetData(GPUIntermediateRelation &output_relation) c
 			output_relation.columns[col] = new GPUColumn(group_by_result->columns[col]->column_length, group_by_result->columns[col]->data_wrapper.type, group_by_result->columns[col]->data_wrapper.data);
 		}
 		output_relation.columns[col]->is_unique = old_unique;
-		printGPUColumn<uint64_t>(reinterpret_cast<uint64_t*>(output_relation.columns[col]->data_wrapper.data), output_relation.columns[col]->column_length, 0);
+		// printGPUColumn<uint64_t>(reinterpret_cast<uint64_t*>(output_relation.columns[col]->data_wrapper.data), output_relation.columns[col]->column_length, 0);
 	}
   	return SourceResultType::FINISHED;
 }

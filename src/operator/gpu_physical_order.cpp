@@ -28,6 +28,9 @@ GPUPhysicalOrder::GPUPhysicalOrder(vector<LogicalType> types, vector<BoundOrderB
       orders(std::move(orders)), projections(std::move(projections_p)) {
 
     sort_result = new GPUIntermediateRelation(projections.size());
+    for (int col = 0; col < projections.size(); col++) {
+      sort_result->columns[col] = nullptr;
+    }
 }
   
 SourceResultType
@@ -96,7 +99,13 @@ GPUPhysicalOrder::Sink(GPUIntermediateRelation &input_relation) const {
   HandleOrderBy(order_by_keys, projection_columns, orders, projections.size());
 
   for (int col = 0; col < projections.size(); col++) {
-    sort_result->columns[col] = projection_columns[col];
+    if (sort_result->columns[col] == nullptr && projection_columns[col]->column_length > 0 && projection_columns[col]->data_wrapper.data != nullptr) {
+      sort_result->columns[col] = projection_columns[col];
+      sort_result->columns[col]->row_ids = nullptr;
+      sort_result->columns[col]->row_id_count = 0;
+    } else if (sort_result->columns[col] != nullptr && projection_columns[col]->column_length > 0 && projection_columns[col]->data_wrapper.data != nullptr) {
+      throw NotImplementedException("Order by with partially NULL values is not supported");
+    }
   }
 
   return SinkResultType::FINISHED;
