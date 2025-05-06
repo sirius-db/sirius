@@ -92,10 +92,6 @@ private:
     // Private constructor
    	GPUBufferManager(size_t cache_size_per_gpu, size_t processing_size_per_gpu, size_t processing_size_per_cpu);
     ~GPUBufferManager();
-	//create an allocation table that keep tracks of the allocation of the memory, it stores the pointer, size, and the gpu id
-	vector<map<void*, uint64_t>> allocation_table;
-	vector<map<void*, uint64_t>> locked_allocation_table;
-
   std::ofstream out_file_;
 };
 
