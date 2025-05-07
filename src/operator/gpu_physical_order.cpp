@@ -55,15 +55,6 @@ GPUPhysicalOrder::Sink(GPUIntermediateRelation &input_relation) const {
   GPUColumn** order_by_keys = new GPUColumn*[orders.size()];
   GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 
-  for (int order_idx = 0; order_idx < orders.size(); order_idx++) {
-    auto& expr = *orders[order_idx].expression;
-    if (expr.expression_class != ExpressionClass::BOUND_REF) {
-      throw NotImplementedException("Order by expression not supported");
-    }
-    auto input_idx = expr.Cast<BoundReferenceExpression>().index;
-    order_by_keys[order_idx] = HandleMaterializeExpression(input_relation.columns[input_idx], expr.Cast<BoundReferenceExpression>(), gpuBufferManager);
-  }
-
   GPUColumn** projection_columns = new GPUColumn*[projections.size()];
   
   for (int projection_idx = 0; projection_idx < projections.size(); projection_idx++) {
@@ -92,10 +83,32 @@ GPUPhysicalOrder::Sink(GPUIntermediateRelation &input_relation) const {
     // if (!found_projection) {
       auto expr = BoundReferenceExpression(LogicalType::ANY, input_idx);
       projection_columns[projection_idx] = HandleMaterializeExpression(input_relation.columns[input_idx], expr, gpuBufferManager);
+      input_relation.columns[input_idx] = projection_columns[projection_idx];
     // }
+  }
+  
+  for (int order_idx = 0; order_idx < orders.size(); order_idx++) {
+    auto& expr = *orders[order_idx].expression;
+    if (expr.expression_class != ExpressionClass::BOUND_REF) {
+      throw NotImplementedException("Order by expression not supported");
+    }
+    auto input_idx = expr.Cast<BoundReferenceExpression>().index;
+    order_by_keys[order_idx] = HandleMaterializeExpression(input_relation.columns[input_idx], expr.Cast<BoundReferenceExpression>(), gpuBufferManager);
   }
 
 
+	if (order_by_keys[0]->column_length > INT32_MAX ) {
+		throw NotImplementedException("Order by with column length greater than INT32_MAX is not supported");
+	}
+
+  for (int col = 0; col < projections.size(); col++) {
+    // if types is VARCHAR, check the number of bytes
+    if (projection_columns[col]->data_wrapper.type == ColumnType::VARCHAR) {
+      if (projection_columns[col]->data_wrapper.num_bytes > INT32_MAX) {
+        throw NotImplementedException("String column size greater than INT32_MAX is not supported");
+      }
+    }
+  }
   HandleOrderBy(order_by_keys, projection_columns, orders, projections.size());
 
   for (int col = 0; col < projections.size(); col++) {

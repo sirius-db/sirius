@@ -263,6 +263,7 @@ GPUPhysicalHashJoin::GPUPhysicalHashJoin(LogicalOperator &op, unique_ptr<GPUPhys
 
 	// For ANTI, SEMI and MARK join, we only need to store the keys, so for these the payload/RHS types are empty
 	if (join_type == JoinType::ANTI || join_type == JoinType::SEMI || join_type == JoinType::MARK) {
+		materialized_build_key = new GPUIntermediateRelation(build_columns_in_conditions.size());
 		hash_table_result = new GPUIntermediateRelation(build_columns_in_conditions.size());
 		return;
 	}
@@ -298,7 +299,7 @@ GPUPhysicalHashJoin::GPUPhysicalHashJoin(LogicalOperator &op, unique_ptr<GPUPhys
 	printf("rhs_output_columns.size() = %ld\n", rhs_output_columns.col_idxs.size());
 	printf("lhs_output_columns.size() = %ld\n", lhs_output_columns.col_idxs.size());
 	hash_table_result = new GPUIntermediateRelation(build_columns_in_conditions.size() + payload_columns.col_idxs.size());
-
+	materialized_build_key = new GPUIntermediateRelation(build_columns_in_conditions.size());
 };
 
 // SourceResultType
@@ -429,21 +430,40 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 	printf("Probing hash table\n");
 	if (join_type == JoinType::INNER) {
 		// check if there is a non-equality condition
-		bool has_non_equality_condition = false;
-		for (idx_t i = 0; i < conditions.size(); i++) {
-			if (conditions[i].comparison != ExpressionType::COMPARE_EQUAL && conditions[i].comparison != ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
-				has_non_equality_condition = true;
-				break;
+		GPUColumn** build_key = new GPUColumn*[conditions.size()];
+		for (int cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
+			build_key[cond_idx] = materialized_build_key->columns[cond_idx];
+		}
+		for (int col = 0; col < conditions.size(); col++) {
+			// if types is VARCHAR, check the number of bytes
+			if (build_key[col]->data_wrapper.type == ColumnType::VARCHAR) {
+				if (build_key[col]->data_wrapper.num_bytes > INT32_MAX) {
+					throw NotImplementedException("String column size greater than INT32_MAX is not supported");
+				}
+			}
+			if (probe_key[col]->data_wrapper.type == ColumnType::VARCHAR) {
+				if (probe_key[col]->data_wrapper.num_bytes > INT32_MAX) {
+					throw NotImplementedException("String column size greater than INT32_MAX is not supported");
+				}
 			}
 		}
-		if (!has_non_equality_condition) {
-			cudf_probe(probe_key, cudf_hash_table, conditions.size(), row_ids_left, row_ids_right, count);
+		if (build_key[0]->column_length > INT32_MAX || probe_key[0]->column_length > INT32_MAX) {
+			HandleBuildExpression(build_key, gpu_hash_table, ht_len, conditions, join_type, gpuBufferManager);
+			HandleProbeExpression(probe_key, count, row_ids_left, row_ids_right, gpu_hash_table, ht_len, conditions, join_type, unique_build_keys, gpuBufferManager);
 		} else {
-			GPUColumn** build_key = new GPUColumn*[conditions.size()];
-			for (int cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
-				build_key[cond_idx] = hash_table_result->columns[cond_idx];
+			bool has_non_equality_condition = false;
+			for (idx_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
+				if (conditions[cond_idx].comparison != ExpressionType::COMPARE_EQUAL && conditions[cond_idx].comparison != ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+					has_non_equality_condition = true;
+					break;
+				}
 			}
-			cudf_mixed_join(probe_key, build_key, conditions, join_type, row_ids_left, row_ids_right, count);
+			if (!has_non_equality_condition) {
+				cudf_build(build_key, cudf_hash_table, conditions.size());
+				cudf_probe(probe_key, cudf_hash_table, conditions.size(), row_ids_left, row_ids_right, count);
+			} else {
+				cudf_mixed_join(probe_key, build_key, conditions, join_type, row_ids_left, row_ids_right, count);
+			}
 		}
 	} else if (join_type == JoinType::SEMI || join_type == JoinType::ANTI || join_type == JoinType::OUTER || join_type == JoinType::RIGHT) {
 		HandleProbeExpression(probe_key, count, row_ids_left, row_ids_right, gpu_hash_table, ht_len, conditions, join_type, unique_build_keys, gpuBufferManager);
@@ -610,16 +630,16 @@ GPUPhysicalHashJoin::Sink(GPUIntermediateRelation &input_relation) const {
 
 	if (join_type == JoinType::INNER) {
 		// check if there is a non-equality condition
-		bool has_non_equality_condition = false;
-		for (idx_t i = 0; i < conditions.size(); i++) {
-			if (conditions[i].comparison != ExpressionType::COMPARE_EQUAL && conditions[i].comparison != ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
-				has_non_equality_condition = true;
-				break;
-			}
-		}
-		if (!has_non_equality_condition) {
-			cudf_build(build_keys, cudf_hash_table, conditions.size());
-		}
+		// bool has_non_equality_condition = false;
+		// for (idx_t i = 0; i < conditions.size(); i++) {
+		// 	if (conditions[i].comparison != ExpressionType::COMPARE_EQUAL && conditions[i].comparison != ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+		// 		has_non_equality_condition = true;
+		// 		break;
+		// 	}
+		// }
+		// if (!has_non_equality_condition) {
+		// 	cudf_build(build_keys, cudf_hash_table, conditions.size());
+		// }
 	} else {
 		HandleBuildExpression(build_keys, gpu_hash_table, ht_len, conditions, join_type, gpuBufferManager);
 	}
@@ -633,6 +653,7 @@ GPUPhysicalHashJoin::Sink(GPUIntermediateRelation &input_relation) const {
         auto join_key_index = condition.right->Cast<BoundReferenceExpression>().index;
 		printf("Passing column idx %d from input relation to index %ld in RHS hash table\n", join_key_index, cond_idx);
 		hash_table_result->columns[cond_idx] = input_relation.columns[join_key_index];
+		materialized_build_key->columns[cond_idx] = build_keys[cond_idx];
 		right_idx++;
 	}
 

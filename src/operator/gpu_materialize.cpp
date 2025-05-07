@@ -166,6 +166,14 @@ HandleMaterializeRowIDsRHS(GPUIntermediateRelation& hash_table_result, GPUInterm
             }
         }
         output_relation.columns[offset + i]->row_id_count = count;
+        //TODO: Quick hack to assign the materialized column back to the hash table result, since hash_table_result will be used in GetData(), otherwise the data will be invalid.
+        hash_table_result.columns[rhs_col] = output_relation.columns[offset + i];
+		gpuBufferManager->lockAllocation(reinterpret_cast<uint8_t*>(hash_table_result.columns[rhs_col]->data_wrapper.data), 0);
+		gpuBufferManager->lockAllocation(reinterpret_cast<uint8_t*>(hash_table_result.columns[rhs_col]->row_ids), 0);
+		// If the column type is VARCHAR, also lock the offset allocation
+		if (hash_table_result.columns[rhs_col]->data_wrapper.type == ColumnType::VARCHAR) {
+			gpuBufferManager->lockAllocation(reinterpret_cast<uint8_t*>(hash_table_result.columns[rhs_col]->data_wrapper.offset), 0);
+		}
     }
 }
 

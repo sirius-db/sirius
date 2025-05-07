@@ -70,6 +70,8 @@ void cudf_mixed_join(GPUColumn** probe_columns, GPUColumn** build_columns, const
         return;
     }
 
+    printf("CUDF mixed join\n");
+
     GPUBufferManager *gpuBufferManager = &(GPUBufferManager::GetInstance());
     cudf::set_current_device_resource(gpuBufferManager->mr);
 
@@ -77,6 +79,8 @@ void cudf_mixed_join(GPUColumn** probe_columns, GPUColumn** build_columns, const
     std::vector<cudf::column_view> build_equal_columns;
     std::vector<cudf::column_view> probe_conditional_columns;
     std::vector<cudf::column_view> build_conditional_columns;
+
+    printf("CUDF mixed join\n");
 
     std::vector<cudf::ast::operation> cudf_exprs;
     for (int cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
@@ -99,11 +103,15 @@ void cudf_mixed_join(GPUColumn** probe_columns, GPUColumn** build_columns, const
         }
     }
 
+    printf("CUDF mixed join\n");
+
     //merge cudf_exprs into a single expression
     cudf::ast::operation final_expr = cudf_exprs[0];
     for (int expr_idx = 1; expr_idx < cudf_exprs.size(); expr_idx++) {
         final_expr = cudf::ast::operation(cudf::ast::ast_operator::BITWISE_AND, final_expr, cudf_exprs[expr_idx]);
     }
+
+    printf("CUDF mixed join\n");
 
     auto probe_equal_table = cudf::table_view(probe_equal_columns);
     auto build_equal_table = cudf::table_view(build_equal_columns);
@@ -115,6 +123,8 @@ void cudf_mixed_join(GPUColumn** probe_columns, GPUColumn** build_columns, const
     auto result_count = result.first->size();
     rmm::device_buffer row_ids_left_buffer = result.first->release();
     rmm::device_buffer row_ids_right_buffer = result.second->release();
+
+    printf("CUDF mixed join\n");
 
     row_ids_left = convertInt32ToUInt64(reinterpret_cast<int32_t*>(row_ids_left_buffer.data()), result_count);
     row_ids_right = convertInt32ToUInt64(reinterpret_cast<int32_t*>(row_ids_right_buffer.data()), result_count);

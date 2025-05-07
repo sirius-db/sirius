@@ -535,6 +535,15 @@ SinkResultType GPUPhysicalTopN::Sink(GPUIntermediateRelation& input_relation) co
 	GPUColumn** order_by_keys = new GPUColumn*[orders.size()];
 	GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 
+  	GPUColumn** projection_columns = new GPUColumn*[types.size()];
+  
+	for (int projection_idx = 0; projection_idx < types.size(); projection_idx++) {
+		auto input_idx = projection_idx;
+		auto expr = BoundReferenceExpression(LogicalType::ANY, input_idx);
+		projection_columns[projection_idx] = HandleMaterializeExpression(input_relation.columns[input_idx], expr, gpuBufferManager);
+		input_relation.columns[input_idx] = projection_columns[projection_idx];
+	}
+
 	for (int order_idx = 0; order_idx < orders.size(); order_idx++) {
 		auto& expr = *orders[order_idx].expression;
 		if (expr.expression_class != ExpressionClass::BOUND_REF) {
@@ -544,14 +553,18 @@ SinkResultType GPUPhysicalTopN::Sink(GPUIntermediateRelation& input_relation) co
 		order_by_keys[order_idx] = HandleMaterializeExpression(input_relation.columns[input_idx], expr.Cast<BoundReferenceExpression>(), gpuBufferManager);
 	}
 
-  	GPUColumn** projection_columns = new GPUColumn*[types.size()];
-  
-	for (int projection_idx = 0; projection_idx < types.size(); projection_idx++) {
-		auto input_idx = projection_idx;
-		auto expr = BoundReferenceExpression(LogicalType::ANY, input_idx);
-		projection_columns[projection_idx] = HandleMaterializeExpression(input_relation.columns[input_idx], expr, gpuBufferManager);
+	if (order_by_keys[0]->column_length > INT32_MAX ) {
+		throw NotImplementedException("Order by with column length greater than INT32_MAX is not supported");
 	}
-
+  
+	for (int col = 0; col < types.size(); col++) {
+		// if types is VARCHAR, check the number of bytes
+		if (projection_columns[col]->data_wrapper.type == ColumnType::VARCHAR) {
+			if (projection_columns[col]->data_wrapper.num_bytes > INT32_MAX) {
+				throw NotImplementedException("String column size greater than INT32_MAX is not supported");
+			}
+		}
+	}
   	HandleTopN(order_by_keys, projection_columns, orders, types.size());
 
 	for (int col = 0; col < types.size(); col++) {
