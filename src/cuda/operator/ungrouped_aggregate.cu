@@ -157,6 +157,12 @@ void ungroupedAggregate(uint8_t **a, uint8_t **result, uint64_t N, int* agg_mode
             return;
         }
     }
+
+    for (int agg = 0; agg < num_aggregates; agg++) {
+        if (agg_mode[agg] >= 0 && agg_mode[agg] <= 3) {
+            gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(a[agg]), 0);
+        }
+    }
 }
 
 template

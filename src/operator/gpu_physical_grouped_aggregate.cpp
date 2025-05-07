@@ -9,7 +9,7 @@ namespace duckdb {
 template <typename T>
 GPUColumn*
 ResolveTypeCombineColumns(GPUColumn* column1, GPUColumn* column2, GPUBufferManager* gpuBufferManager) {
-	T* combine = gpuBufferManager->customCudaMalloc<T>(column1->column_length + column2->column_length, 0, 0);
+	T* combine;
 	T* a = reinterpret_cast<T*> (column1->data_wrapper.data);
 	T* b = reinterpret_cast<T*> (column2->data_wrapper.data);
 	combineColumns<T>(a, b, combine, column1->column_length, column2->column_length);
@@ -22,8 +22,8 @@ ResolveTypeCombineColumns(GPUColumn* column1, GPUColumn* column2, GPUBufferManag
 
 GPUColumn*
 ResolveTypeCombineStrings(GPUColumn* column1, GPUColumn* column2, GPUBufferManager* gpuBufferManager) {
-	uint8_t* combine = gpuBufferManager->customCudaMalloc<uint8_t>(column1->data_wrapper.num_bytes + column2->data_wrapper.num_bytes, 0, 0);
-	uint64_t* offset_combine = gpuBufferManager->customCudaMalloc<uint64_t>(column1->column_length + column2->column_length, 0, 0);
+	uint8_t* combine;
+	uint64_t* offset_combine;
 	uint8_t* a = column1->data_wrapper.data;
 	uint8_t* b = column2->data_wrapper.data;
 	uint64_t* offset_a = column1->data_wrapper.offset;
@@ -280,6 +280,38 @@ HandleGroupByAggregateExpression(GPUColumn** &group_by_keys, GPUColumn** &aggreg
 			throw NotImplementedException("Unsupported column type");
 		}
 	}
+}
+
+void
+HandleGroupByAggregateCuDF(GPUColumn** &group_by_keys, GPUColumn** &aggregate_keys, GPUBufferManager* gpuBufferManager, const vector<unique_ptr<Expression>> &aggregates, int num_group_keys) {
+
+	AggregationType* agg_mode = new AggregationType[aggregates.size()];
+	printf("Handling group by aggregate expression\n");
+	for (int agg_idx = 0; agg_idx < aggregates.size(); agg_idx++) {
+		auto& expr = aggregates[agg_idx]->Cast<BoundAggregateExpression>();
+		if (expr.function.name.compare("count") == 0 && aggregate_keys[agg_idx]->data_wrapper.data == nullptr && aggregate_keys[agg_idx]->column_length == 0) {
+			agg_mode[agg_idx] = AggregationType::COUNT;
+		} else if (expr.function.name.compare("sum") == 0 && aggregate_keys[agg_idx]->data_wrapper.data == nullptr && aggregate_keys[agg_idx]->column_length == 0) {
+			agg_mode[agg_idx] = AggregationType::SUM;
+		} else if (expr.function.name.compare("sum") == 0 && aggregate_keys[agg_idx]->data_wrapper.data != nullptr) {
+			agg_mode[agg_idx] = AggregationType::SUM;
+		} else if (expr.function.name.compare("avg") == 0 && aggregate_keys[agg_idx]->data_wrapper.data != nullptr) {
+			agg_mode[agg_idx] = AggregationType::AVERAGE;
+		} else if (expr.function.name.compare("max") == 0 && aggregate_keys[agg_idx]->data_wrapper.data != nullptr) {
+			agg_mode[agg_idx] = AggregationType::MAX;
+		} else if (expr.function.name.compare("min") == 0 && aggregate_keys[agg_idx]->data_wrapper.data != nullptr) {
+			agg_mode[agg_idx] = AggregationType::MIN;
+		} else if (expr.function.name.compare("count_star") == 0 && aggregate_keys[agg_idx]->data_wrapper.data == nullptr && aggregate_keys[agg_idx]->column_length != 0) {
+			agg_mode[agg_idx] = AggregationType::COUNT_STAR;
+		} else if (expr.function.name.compare("count") == 0 && aggregate_keys[agg_idx]->data_wrapper.data != nullptr) {
+			agg_mode[agg_idx] = AggregationType::COUNT;
+		} else {
+			printf("Aggregate function not supported: %s\n", expr.function.name.c_str());
+			throw NotImplementedException("Aggregate function not supported");
+		}
+	}
+	
+	cudf_groupby(group_by_keys, aggregate_keys, num_group_keys, aggregates.size(), agg_mode);
 }
 
 template <typename T>
@@ -561,7 +593,7 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 		//here we probably have count(*) or sum(*) or something like that
 		if (aggr.children.size() == 0) {
 			printf("Passing * aggregate to index %d in groupby result\n", grouped_aggregate_data.groups.size() + aggr_idx);
-			aggregate_column[aggr_idx] = new GPUColumn(0, ColumnType::INT64, nullptr);
+			aggregate_column[aggr_idx] = new GPUColumn(100, ColumnType::INT64, nullptr);
 		}
 		aggr_idx++;
 	}
@@ -580,7 +612,20 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 	if (aggregates.size() == 0) {
 		HandleDuplicateElimination(group_by_column, gpuBufferManager, num_group_keys);
 	} else {
-		HandleGroupByAggregateExpression(group_by_column, aggregate_column, gpuBufferManager, aggregates, num_group_keys);
+		bool string_cudf_supported = true;
+		for (int col = 0; col < num_group_keys; col++) {
+			// if types is VARCHAR, check the number of bytes
+			if (group_by_column[col]->data_wrapper.type == ColumnType::VARCHAR) {
+				if (group_by_column[col]->data_wrapper.num_bytes > INT32_MAX) {
+					string_cudf_supported = false;
+				}
+			}
+		}
+		if (group_by_column[0]->column_length > INT32_MAX || aggregate_column[0]->column_length > INT32_MAX || !string_cudf_supported) {
+			HandleGroupByAggregateExpression(group_by_column, aggregate_column, gpuBufferManager, aggregates, num_group_keys);
+		} else {
+			HandleGroupByAggregateCuDF(group_by_column, aggregate_column, gpuBufferManager, aggregates, num_group_keys);
+		}
 	}
 	
 	// Reading groupby columns based on the grouping set
@@ -640,6 +685,7 @@ GPUPhysicalGroupedAggregate::GetData(GPUIntermediateRelation &output_relation) c
 			output_relation.columns[col] = new GPUColumn(group_by_result->columns[col]->column_length, group_by_result->columns[col]->data_wrapper.type, group_by_result->columns[col]->data_wrapper.data);
 		}
 		output_relation.columns[col]->is_unique = old_unique;
+		// printGPUColumn<uint64_t>(reinterpret_cast<uint64_t*>(output_relation.columns[col]->data_wrapper.data), output_relation.columns[col]->column_length, 0);
 	}
   	return SourceResultType::FINISHED;
 }

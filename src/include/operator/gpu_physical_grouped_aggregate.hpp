@@ -8,10 +8,12 @@
 #include "duckdb/parser/group_by_node.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/execution/operator/aggregate/physical_hash_aggregate.hpp"
+#include "helper/types.hpp"
 
 namespace duckdb {
 
 uint64_t* createFixedSizeOffsets(size_t record_size, uint64_t num_rows);
+void cudf_groupby(GPUColumn **keys, GPUColumn **aggregate_keys, uint64_t num_keys, uint64_t num_aggregates, AggregationType* agg_mode);
 
 template <typename T, typename V>
 void groupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count, uint64_t N, uint64_t num_keys, uint64_t num_aggregates, int* agg_mode);
@@ -29,10 +31,10 @@ template <typename T, typename V>
 void hashGroupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count, uint64_t N, uint64_t num_keys, uint64_t num_aggregates, int* agg_mode);
 
 template<typename T>
-void combineColumns(T* a, T* b, T* c, uint64_t N_a, uint64_t N_b);
+void combineColumns(T* a, T* b, T*& c, uint64_t N_a, uint64_t N_b);
 
-void combineStrings(uint8_t* a, uint8_t* b, uint8_t* c, 
-        uint64_t* offset_a, uint64_t* offset_b, uint64_t* offset_c, 
+void combineStrings(uint8_t* a, uint8_t* b, uint8_t*& c, 
+        uint64_t* offset_a, uint64_t* offset_b, uint64_t*& offset_c, 
         uint64_t num_bytes_a, uint64_t num_bytes_b, uint64_t N_a, uint64_t N_b);
 
 class ClientContext;

@@ -150,6 +150,7 @@ void scanHashTableRight(unsigned long long* ht, uint64_t ht_len, uint64_t* &row_
     SETUP_TIMING();
     START_TIMER();
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+    count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
     cudaMemset(count, 0, sizeof(uint64_t));
 
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
@@ -167,12 +168,14 @@ void scanHashTableRight(unsigned long long* ht, uint64_t ht_len, uint64_t* &row_
     CHECK_ERROR();
     cudaDeviceSynchronize();
     printf("Scan Count: %lu\n", h_count[0]);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(count), 0);
     count = h_count;
 
     // thrust::device_vector<uint64_t> sorted_keys(row_ids, row_ids + h_count[0]);
     // thrust::sort(thrust::device, sorted_keys.begin(), sorted_keys.end());
     // uint64_t* raw_row_ids = thrust::raw_pointer_cast(sorted_keys.data());
     // testprint<<<1, 1>>>(raw_row_ids, h_count[0]);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(ht), 0);
 
     CHECK_ERROR();
     cudaDeviceSynchronize();
@@ -215,6 +218,8 @@ void probeHashTableRightSemiAnti(uint8_t **keys, unsigned long long* ht, uint64_
 
     printf("Finished probe right\n");
     STOP_TIMER();
+    cudaFree(keys_dev);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(condition_mode_dev), 0);
 }
 
 } // namespace duckdb

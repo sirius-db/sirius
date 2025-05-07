@@ -253,7 +253,6 @@ GPUPhysicalNestedLoopJoin::ResolveComplexJoin(GPUIntermediateRelation &input_rel
 
 	if (join_type == JoinType::INNER) {
 		printf("Nested loop join\n");
-		count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
 		HandleNestedLoopJoin(left_keys, right_keys, count, row_ids_left, row_ids_right, conditions, join_type, gpuBufferManager);
 
 		vector<column_t> rhs_output_columns;

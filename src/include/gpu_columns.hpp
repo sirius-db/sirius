@@ -2,10 +2,18 @@
 
 #include "helper/common.h"
 #include "duckdb/common/types.hpp"
-
+#include "cudf_utils.hpp"
 using namespace std;
 
 namespace duckdb {
+
+class GPUBufferManager;
+
+int32_t* convertUInt64ToInt32(uint64_t* data, size_t N);
+uint64_t* convertInt32ToUInt64(int32_t* data, size_t N);
+template <typename T> void callCudaMemcpyHostToDevice(T* dest, T* src, size_t size, int gpu);
+template <typename T> void callCudaMemcpyDeviceToHost(T* dest, T* src, size_t size, int gpu);
+template <typename T> void callCudaMemcpyDeviceToDevice(T* dest, T* src, size_t size, int gpu);
 
 enum class ColumnType {
     INT32 = 0,
@@ -64,7 +72,7 @@ public:
     GPUColumn(size_t column_length, ColumnType type, uint8_t* data);
     GPUColumn(string _name, size_t _column_length, ColumnType type, uint8_t* data, uint64_t* offset, size_t num_bytes, bool is_string_data);
     GPUColumn(size_t _column_length, ColumnType type, uint8_t* data, uint64_t* offset, size_t num_bytes, bool is_string_data);
-    GPUColumn(const GPUColumn& other);
+    GPUColumn(GPUColumn& other);
     ~GPUColumn(){};
     int* GetDataInt32();
     uint64_t* GetDataUInt64();
@@ -82,6 +90,14 @@ public:
     size_t column_length;
     // bool isNull;
     bool is_unique;
+    // std::unique_ptr<rmm::device_buffer> rmm_owned_buffer;
+
+    cudf::column_view convertToCudfColumn();
+    int32_t* convertSiriusOffsetToCudfOffset();
+    int32_t* convertSiriusRowIdsToCudfRowIds();
+    void convertCudfRowIdsToSiriusRowIds(int32_t* cudf_row_ids);
+    void convertCudfOffsetToSiriusOffset(int32_t* cudf_offset);
+    void setFromCudfColumn(cudf::column& cudf_column, bool _is_unique, int32_t* _row_ids, uint64_t _row_id_count, GPUBufferManager* gpuBufferManager);
     // bool isString{false};
 };
 
@@ -98,7 +114,9 @@ public:
     // map<string, GPUColumn*> columns;
     size_t length;
     size_t column_count;
+    // cudf::table_view convertToCudfTable();
 };
+
 
 
 } // namespace duckdb   

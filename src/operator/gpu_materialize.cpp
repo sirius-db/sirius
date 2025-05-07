@@ -13,8 +13,7 @@ ResolveTypeMaterializeExpression(GPUColumn* column, BoundReferenceExpression& bo
     if (column->row_ids != nullptr) {
         T* temp = reinterpret_cast<T*> (column->data_wrapper.data);
         uint64_t* row_ids_input = reinterpret_cast<uint64_t*> (column->row_ids);
-        a = gpuBufferManager->customCudaMalloc<T>(column->row_id_count, 0, 0);
-        materializeExpression<T>(temp, a, row_ids_input, column->row_id_count);
+        materializeExpression<T>(temp, a, row_ids_input, column->row_id_count, column->column_length);
         size = column->row_id_count;
     } else {
         a = reinterpret_cast<T*> (column->data_wrapper.data);
@@ -22,6 +21,7 @@ ResolveTypeMaterializeExpression(GPUColumn* column, BoundReferenceExpression& bo
     }
     GPUColumn* result = new GPUColumn(size, column->data_wrapper.type, reinterpret_cast<uint8_t*>(a));
     result->is_unique = column->is_unique;
+    // result->rmm_owned_buffer = std::move(column->rmm_owned_buffer);
     return result;
 }
 
@@ -40,7 +40,7 @@ ResolveTypeMaterializeString(GPUColumn* column, BoundReferenceExpression& bound_
 		uint64_t* offset = column->data_wrapper.offset;
 		uint64_t* row_ids = column->row_ids;
 		size = column->row_id_count;
-		materializeString(data, offset, a, result_offset, row_ids, new_num_bytes, size);
+		materializeString(data, offset, a, result_offset, row_ids, new_num_bytes, size, column->column_length, column->data_wrapper.num_bytes);
     } else {
         a = column->data_wrapper.data;
         result_offset = column->data_wrapper.offset;
@@ -51,6 +51,7 @@ ResolveTypeMaterializeString(GPUColumn* column, BoundReferenceExpression& bound_
     // printf("Materialized string column with size %ld\n", new_num_bytes[0]);
     GPUColumn* result = new GPUColumn(size, column->data_wrapper.type, a, result_offset, new_num_bytes[0], column->data_wrapper.is_string_data);
     result->is_unique = column->is_unique;
+    // result->rmm_owned_buffer = std::move(column->rmm_owned_buffer);
     return result;
 }
 
@@ -108,8 +109,8 @@ HandleMaterializeRowIDs(GPUIntermediateRelation& input_relation, GPUIntermediate
                     output_relation.columns[i]->row_ids = new_row_ids[idx];
                 } else {
                     uint64_t* temp_prev_row_ids = reinterpret_cast<uint64_t*> (input_relation.columns[i]->row_ids);
-                    uint64_t* temp_new_row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(count, 0, 0);
-                    materializeExpression<uint64_t>(temp_prev_row_ids, temp_new_row_ids, row_ids, count);
+                    uint64_t* temp_new_row_ids;
+                    materializeExpression<uint64_t>(temp_prev_row_ids, temp_new_row_ids, row_ids, count, input_relation.columns[i]->column_length);
                     output_relation.columns[i]->row_ids = temp_new_row_ids;
                     new_row_ids.push_back(temp_new_row_ids);
                     prev_row_ids.push_back(temp_prev_row_ids);
@@ -156,8 +157,8 @@ HandleMaterializeRowIDsRHS(GPUIntermediateRelation& hash_table_result, GPUInterm
                     output_relation.columns[offset + i]->row_ids = new_row_ids[idx];
                 } else {
                     uint64_t* temp_prev_row_ids = reinterpret_cast<uint64_t*> (hash_table_result.columns[rhs_col]->row_ids);
-                    uint64_t* temp_new_row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(count, 0, 0);
-                    materializeExpression<uint64_t>(temp_prev_row_ids, temp_new_row_ids, row_ids, count);
+                    uint64_t* temp_new_row_ids;
+                    materializeExpression<uint64_t>(temp_prev_row_ids, temp_new_row_ids, row_ids, count, hash_table_result.columns[rhs_col]->column_length);
                     output_relation.columns[offset + i]->row_ids = temp_new_row_ids;
                     new_row_ids.push_back(temp_new_row_ids);
                     prev_row_ids.push_back(temp_prev_row_ids);
@@ -165,6 +166,14 @@ HandleMaterializeRowIDsRHS(GPUIntermediateRelation& hash_table_result, GPUInterm
             }
         }
         output_relation.columns[offset + i]->row_id_count = count;
+        //TODO: Quick hack to assign the materialized column back to the hash table result, since hash_table_result will be used in GetData(), otherwise the data will be invalid.
+        hash_table_result.columns[rhs_col] = output_relation.columns[offset + i];
+		gpuBufferManager->lockAllocation(reinterpret_cast<uint8_t*>(hash_table_result.columns[rhs_col]->data_wrapper.data), 0);
+		gpuBufferManager->lockAllocation(reinterpret_cast<uint8_t*>(hash_table_result.columns[rhs_col]->row_ids), 0);
+		// If the column type is VARCHAR, also lock the offset allocation
+		if (hash_table_result.columns[rhs_col]->data_wrapper.type == ColumnType::VARCHAR) {
+			gpuBufferManager->lockAllocation(reinterpret_cast<uint8_t*>(hash_table_result.columns[rhs_col]->data_wrapper.offset), 0);
+		}
     }
 }
 
@@ -204,8 +213,8 @@ HandleMaterializeRowIDsLHS(GPUIntermediateRelation& input_relation, GPUIntermedi
                     output_relation.columns[i]->row_ids = new_row_ids[idx];
                 } else {
                     uint64_t* temp_prev_row_ids = reinterpret_cast<uint64_t*> (input_relation.columns[lhs_col]->row_ids);
-                    uint64_t* temp_new_row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(count, 0, 0);
-                    materializeExpression<uint64_t>(temp_prev_row_ids, temp_new_row_ids, row_ids, count);
+                    uint64_t* temp_new_row_ids;
+                    materializeExpression<uint64_t>(temp_prev_row_ids, temp_new_row_ids, row_ids, count, input_relation.columns[lhs_col]->column_length);
                     output_relation.columns[i]->row_ids = temp_new_row_ids;
                     new_row_ids.push_back(temp_new_row_ids);
                     prev_row_ids.push_back(temp_prev_row_ids);
