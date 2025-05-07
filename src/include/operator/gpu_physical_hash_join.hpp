@@ -137,5 +137,6 @@ public:
 
 	GPUIntermediateRelation* hash_table_result;
 
+	GPUIntermediateRelation* materialized_build_key;
 };
 } // namespace duckdb

@@ -208,7 +208,7 @@ GPUBufferManager::customCudaMalloc(size_t size, int gpu, bool caching) {
         // if (reinterpret_cast<uintptr_t>(ptr) % alignof(double) != 0) {
         //     throw InvalidInputException("Memory is not properly aligned");
         // }
-        // printf("Allocating Pointer %p size %ld\n", ptr, alloc);
+        printf("Allocating Pointer %p size %ld\n", ptr, alloc);
         if (ptr == nullptr) throw InvalidInputException("Pointer is nullptr");
         if (allocation_table[gpu].find(ptr) != allocation_table[gpu].end()) {
             throw InvalidInputException("Pointer already exists in allocation table");
@@ -288,7 +288,7 @@ GPUBufferManager::customCudaFree(uint8_t* ptr, int gpu) {
     if (ptr != nullptr && (ptr < gpuCache[gpu] || ptr >= gpuCache[gpu] + cache_size_per_gpu)) {
         auto it = allocation_table[gpu].find(reinterpret_cast<void*>(ptr));
         if (it != allocation_table[gpu].end()) {
-            // printf("Deallocating Pointer %p size %ld\n", ptr, it->second);
+            printf("Deallocating Pointer %p size %ld\n", ptr, it->second);
             mr->deallocate((void*) ptr, it->second);
             allocation_table[gpu].erase(it);
         } else {
