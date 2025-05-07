@@ -29,8 +29,20 @@ GPUBufferManager::customCudaMalloc<char>(size_t size, int gpu, bool caching);
 template bool*
 GPUBufferManager::customCudaMalloc<bool>(size_t size, int gpu, bool caching);
 
+template duckdb_string_type*
+GPUBufferManager::customCudaMalloc<duckdb_string_type>(size_t size, int gpu, bool caching);
+
 template pointer_and_key*
 GPUBufferManager::customCudaMalloc<pointer_and_key>(size_t size, int gpu, bool caching);
+
+template string_group_by_metadata_type*
+GPUBufferManager::customCudaMalloc<string_group_by_metadata_type>(size_t size, int gpu, bool caching);
+
+template void**
+GPUBufferManager::customCudaMalloc<void*>(size_t size, int gpu, bool caching);
+
+template string_group_by_record_type*
+GPUBufferManager::customCudaMalloc<string_group_by_record_type>(size_t size, int gpu, bool caching);
 
 template int*
 GPUBufferManager::customCudaHostAlloc<int>(size_t size);
@@ -50,15 +62,19 @@ GPUBufferManager::customCudaHostAlloc<double>(size_t size);
 template char*
 GPUBufferManager::customCudaHostAlloc<char>(size_t size);
 
+template string_t*
+GPUBufferManager::customCudaHostAlloc<string_t>(size_t size);
+
 GPUBufferManager::GPUBufferManager(size_t cache_size_per_gpu, size_t processing_size_per_gpu, size_t processing_size_per_cpu) : 
     cache_size_per_gpu(cache_size_per_gpu), processing_size_per_gpu(processing_size_per_gpu), processing_size_per_cpu(processing_size_per_cpu) {
     printf("Initializing GPU buffer manager\n");
     gpuCache = new uint8_t*[NUM_GPUS];
     gpuProcessing = new uint8_t*[NUM_GPUS];
-    cpuProcessing = new uint8_t[processing_size_per_cpu];
+    cpuProcessing = allocatePinnedCPUMemory(processing_size_per_cpu);
     gpuProcessingPointer = new size_t[NUM_GPUS];
     gpuCachingPointer = new size_t[NUM_GPUS];
     cpuProcessingPointer = 0;
+    std::cout << "Allocated CPU pinned memory of capacity " << processing_size_per_cpu << std::endl;
 
     for (int gpu = 0; gpu < NUM_GPUS; gpu++) {
         gpuCache[gpu] = callCudaMalloc<uint8_t>(cache_size_per_gpu, gpu);
@@ -77,7 +93,7 @@ GPUBufferManager::~GPUBufferManager() {
         callCudaFree<uint8_t>(gpuCache[gpu], gpu);
         callCudaFree<uint8_t>(gpuProcessing[gpu], gpu);
     }
-    delete[] cpuProcessing;
+    freePinnedCPUMemory(cpuProcessing);
     delete[] gpuProcessingPointer;
     delete[] gpuCachingPointer;
 }

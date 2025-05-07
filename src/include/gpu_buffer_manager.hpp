@@ -16,14 +16,41 @@ template <typename T> void callCudaFree(T* ptr, int gpu);
 template <typename T> void callCudaMemcpyHostToDevice(T* dest, T* src, size_t size, int gpu);
 template <typename T> void callCudaMemcpyDeviceToHost(T* dest, T* src, size_t size, int gpu);
 template <typename T> void materializeExpression(T *a, T* result, uint64_t *row_ids, uint64_t N);
-void materializeString(uint8_t* data, uint64_t* offset, uint8_t* &result, uint64_t* &result_offset, uint64_t* row_ids, uint64_t* &new_num_bytes, uint64_t N);
 template <typename T> void printGPUColumn(T* a, size_t N, int gpu);
 void cudaMemmove(uint8_t* destination, uint8_t* source, size_t num);
+uint8_t* allocatePinnedCPUMemory(size_t size);
+void freePinnedCPUMemory(uint8_t* ptr);
 void warmup_gpu();
 
 struct pointer_and_key {
 	uint64_t* pointer;
 	uint64_t num_key;
+};
+
+struct string_group_by_metadata_type {
+    void* all_keys;
+    void* offsets;
+    uint64_t num_keys;
+};
+
+struct string_group_by_record_type {
+	string_group_by_metadata_type* group_by_metadata;
+	uint64_t row_id;
+	uint64_t row_signature;
+};
+
+struct duckdb_string_type {
+	union {
+		struct {
+			uint32_t length;
+			char prefix[4];
+			char *ptr;
+		} pointer;
+		struct {
+			uint32_t length;
+			char inlined[12];
+		} inlined;
+	} value;
 };
 
 // Currently a singleton class, would not work for multiple GPUs

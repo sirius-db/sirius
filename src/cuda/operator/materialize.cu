@@ -1,6 +1,9 @@
 #include "cuda_helper.cuh"
 #include "gpu_columns.hpp"
 
+#include <chrono>
+#include <cmath>
+
 namespace duckdb {
 
 template <typename T, int B, int I>
@@ -143,6 +146,47 @@ void materializeString(uint8_t* data, uint64_t* offset, uint8_t* &result, uint64
     cudaDeviceSynchronize();
     CHECK_ERROR();
     STOP_TIMER();
+}
+
+__global__ void create_cpu_strings(duckdb_string_type* gpu_strings, char* cpu_chars_buffer, char* gpu_chars, uint64_t* string_offsets, size_t num_strings, size_t inline_threshold) { 
+    size_t idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if(idx < num_strings) {
+        uint64_t str_offset = string_offsets[idx];
+        uint64_t str_length = string_offsets[idx + 1] - str_offset;
+        
+        // Use the threshold to determine if we should inline the string or not
+        duckdb_string_type& curr_string = gpu_strings[idx];
+        if(str_length <= inline_threshold) {
+            curr_string.value.inlined.length = str_length;
+            char* gpu_data_ptr = gpu_chars + str_offset;
+            memcpy(curr_string.value.inlined.inlined, gpu_data_ptr, str_length);
+        } else {
+            curr_string.value.pointer.length = str_length;
+            curr_string.value.pointer.ptr = cpu_chars_buffer + str_offset;
+        }
+    }
+}
+
+void materializeStringColumnToDuckdbFormat(GPUColumn* column, char* column_char_write_buffer, string_t* column_string_write_buffer) {
+    // First copy the characters from the GPU to the CPU
+    GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+    DataWrapper column_data = column->data_wrapper;
+
+    size_t column_num_chars = column_data.num_bytes;
+    size_t column_chars_bytes = column_num_chars * sizeof(char);
+    char* gpu_chars = reinterpret_cast<char*>(column_data.data);
+    cudaMemcpy(column_char_write_buffer, gpu_chars, column_chars_bytes, cudaMemcpyDeviceToHost);
+    
+    // Now use the CPU buffer to create the strings on the GPU (using the CPU buffer to set the address)
+    size_t num_strings = column_data.size;
+    size_t num_blocks = (num_strings + BLOCK_THREADS - 1)/BLOCK_THREADS;
+    duckdb_string_type* d_column_strings = gpuBufferManager->customCudaMalloc<duckdb_string_type>(num_strings, 0, 0);
+    size_t cpu_str_bytes = num_strings * sizeof(string_t);
+    create_cpu_strings<<<num_blocks, BLOCK_THREADS>>>(d_column_strings, column_char_write_buffer, gpu_chars, column_data.offset, num_strings, static_cast<size_t>(string_t::INLINE_LENGTH));
+
+    // Copy over the strings to the CPU
+    column->data_wrapper.data = reinterpret_cast<uint8_t*>(column_char_write_buffer);
+    cudaMemcpy((uint8_t*) column_string_write_buffer, (uint8_t*) d_column_strings, cpu_str_bytes, cudaMemcpyDeviceToHost);
 }
 
 template

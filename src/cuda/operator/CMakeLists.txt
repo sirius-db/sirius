@@ -6,6 +6,7 @@ set(CUDA_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/materialize.cu
         ${CMAKE_CURRENT_SOURCE_DIR}/grouped_aggregate.cu
         ${CMAKE_CURRENT_SOURCE_DIR}/string_grouped_aggregate.cu
+        ${CMAKE_CURRENT_SOURCE_DIR}/string_order_by.cu
         ${CMAKE_CURRENT_SOURCE_DIR}/distinct_grouped_aggregate.cu
         ${CMAKE_CURRENT_SOURCE_DIR}/hash_grouped_aggregate.cu
         ${CMAKE_CURRENT_SOURCE_DIR}/ungrouped_aggregate.cu
