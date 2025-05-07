@@ -604,7 +604,8 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 	if (aggregates.size() == 0) {
 		HandleDuplicateElimination(group_by_column, gpuBufferManager, num_group_keys);
 	} else {
-		HandleGroupByAggregateCuDF(group_by_column, aggregate_column, gpuBufferManager, aggregates, num_group_keys);
+		// HandleGroupByAggregateCuDF(group_by_column, aggregate_column, gpuBufferManager, aggregates, num_group_keys);
+    HandleGroupByAggregateExpression(group_by_column, aggregate_column, gpuBufferManager, aggregates, num_group_keys);
 	}
 	
 	// Reading groupby columns based on the grouping set
