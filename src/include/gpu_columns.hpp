@@ -8,7 +8,7 @@ using namespace std;
 namespace duckdb {
 
 enum class ColumnType {
-    INT32,
+    INT32 = 0,
     INT64,
     FLOAT32,
     FLOAT64,

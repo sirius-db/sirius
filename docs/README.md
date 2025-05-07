@@ -19,6 +19,8 @@ nvidia-smi
 Clone the Sirius repository using 
 ```
 git clone --recurse-submodules https://github.com/bwyogatama/sirius.git
+cd sirius
+export SIRIUS_HOME_PATH=`pwd`
 ```
 Note that `--recurse-submodules` will ensure DuckDB is pulled which is required to build the extension.
 
@@ -30,7 +32,7 @@ cd extension_external
 git clone https://github.com/duckdb/substrait.git
 cd substrait
 git reset --hard ec9f8725df7aa22bae7217ece2f221ac37563da4 #go to the right commit hash for duckdb substrait extension
-cd {SIRIUS_HOME_PATH}
+cd $SIRIUS_HOME_PATH
 make -j {nproc} #build extension
 ```
 Currently, we are using duckdb v1.0.0. Since we develop it as an extension and no modification is made to the duckdb source code, it should not be too difficult to bump it to the latest duckdb and substrait version.
@@ -75,7 +77,7 @@ The cold run would be slow as Sirius would need to read the data from storage vi
 
 ## Generating TPC-H dataset
 Unzip `dbgen.zip` and run `./dbgen -s {SF}`.
-To load the dataset to duckdb, use the SQL command in `{SIRIUS_HOME_PATH}\tpch_load_duckdb_simple.sql`.
+To load the dataset to duckdb, use the SQL command in `$SIRIUS_HOME_PATH\tpch_load_duckdb_simple.sql`.
 
 ## Changing the caching and processing region (optional)
 The GPU caching region is a memory region where the raw data is stored in GPUs. The GPUs/CPUs processing region is a memory region where intermediate results are stored in GPUs/CPUs (hash tables, .etc). The default region sizes are 10GB, 11GB, and 16GB for the GPU caching size, the GPU processing size, and the CPU processing size, respectively. The users can also modify these parameters by setting it in [SiriusExtension::GPUCachingBind](https://github.com/sirius-db/sirius/blob/058ee7291c5321727f566a2a72dda267c294f624/src/sirius_extension.cpp#L89).
@@ -92,7 +94,7 @@ conda create --name libcudf-env
 conda activate libcudf-env
 conda install -c rapidsai -c conda-forge -c nvidia rapidsai::libcudf
 ```
-User would also need to make sure that the [CONDA_PREFIX](https://github.com/sirius-db/sirius/blob/eaeb793188a15760c2e41fed307b7ffcfb9c1454/CMakeLists.txt#L19) point to the right location.
+User would also need to make sure that the environment variable `LIBCUDF_ENV_PREFIX` is set to the path to the conda environment's directory. For example, if you installed miniconda to the path `~/miniconda3` and you installed libcudf in the conda environment `libcudf-env` then you would set the `LIBCUDF_ENV_PREFIX` to `~/miniconda3/envs/libcudf-env`
 
 libcudf might requires a later cmake version, as of April 2025, it would require cmake version > 3.30.4. User can follow the instruction in this [link](https://medium.com/@yulin_li/how-to-update-cmake-on-ubuntu-9602521deecb) to download the specific cmake version.
 
@@ -102,57 +104,3 @@ export USE_CUDF=1
 rm -r build/*
 make -j {nproc}
 ```
-
-<!-- ## Devesh Notes
-We have provided a helper docker container that you can easily use to install all the depedencies:
-```
-$ cd ..
-$ export CURRENT_DIR=`pwd`
-$ cd sirius
-$ docker build -t sirius:latest docker/.
-$ docker kill sirius
-$ docker rm sirius
-$ docker run --gpus all -d -v $CURRENT_DIR:/working_dir/ --name=sirius --cap-add=SYS_ADMIN sirius:latest sleep infinity
-$ docker exec -it sirius bash
-$ cd sirius
-```
-
-Build the code:
-```
-$ make -j$(nproc)
-```
-
-Start duckdb using: `./build/release/duckdb tpch_s1.duckdb`. 
-
-Example table creator:
-```
-$ CREATE TABLE example_strs(record VARCHAR);
-$ INSERT INTO example_strs (record) VALUES ('hello world');
-$ INSERT INTO example_strs (record) VALUES ('lorem ipsum');
-$ INSERT INTO example_strs (record) VALUES ('running example values');
-```
-
-String Matching queries:
-```
-$ SELECT record FROM example_strs;
-$ call gpu_caching("example_strs.record");
-$ call gpu_processing("select record from example_strs;");
-$ call gpu_processing("select record FROM example_strs WHERE record LIKE '%hello%';");
-$ call gpu_processing("select record FROM example_strs WHERE record LIKE '%lorem%ipsum%';");
-$ call gpu_caching("orders.o_comment");
-$ call gpu_caching("orders.o_orderkey");
-$ call gpu_processing("select o_orderkey, o_comment from orders where o_comment like '%special%requests%';");
-```
-
-Substring Queries:
-```
-$ call gpu_caching("customer.c_phone");
-$ call gpu_processing("select substr(c_phone, 1, 2) as countrycode from customer where substr(c_phone, 1, 2) in ('13', '31', '23', '29', '30', '18', '17')")
-```
-
-Prefix query:
-```
-$ call gpu_caching("part.p_name");
-$ select p_name from part where p_name like 'forest%';
-$ call gpu_processing("select p_name from part where p_name like 'forest%';");
-``` -->

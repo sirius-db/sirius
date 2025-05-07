@@ -12,6 +12,12 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <iostream>
+#include <stdlib.h>
+#include <cstdlib>
+#include <stdexcept>
+#include <string>
+#include <filesystem>
 
 #include "sirius_extension.hpp"
 
@@ -106,13 +112,22 @@ void test_cudf()
   // memory resource.
   cudf::set_current_device_resource(&mr);
 
-  // Read data
-  auto stock_table_with_metadata = read_csv("/mnt/nvme/sirius/4stock_5day.csv");
-  // Process
+  // Read the test data from the sirius directory
+  const char* sirius_directory_path = getenv("SIRIUS_HOME_PATH");
+  if (sirius_directory_path == nullptr) {
+    throw std::runtime_error("Environment variable SIRIUS_HOME_PATH not set");
+  }
+
+  // Determine the paths
+  std::filesystem::path sirius_dir(sirius_directory_path);
+  std::filesystem::path input_file = sirius_dir / "4stock_5day.csv";
+  std::filesystem::path output_file = sirius_dir / "4stock_5day_avg_close.csv";
+
+  auto stock_table_with_metadata = read_csv(input_file.string());
   auto result = average_closing_price(*stock_table_with_metadata.tbl);
 
   // Write out result
-  write_csv(*result, "/mnt/nvme/sirius/4stock_5day_avg_close.csv");
+  write_csv(*result, output_file.string());
 }
 
 } //namespace duckdb
