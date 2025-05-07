@@ -44,6 +44,30 @@ GPUBufferManager::customCudaMalloc<void*>(size_t size, int gpu, bool caching);
 template string_group_by_record_type*
 GPUBufferManager::customCudaMalloc<string_group_by_record_type>(size_t size, int gpu, bool caching);
 
+template void
+GPUBufferManager::customCudaFree<int>(int* ptr, size_t size, int gpu);
+
+template void
+GPUBufferManager::customCudaFree<uint64_t>(uint64_t* ptr, size_t size, int gpu);
+
+template void
+GPUBufferManager::customCudaFree<uint8_t>(uint8_t* ptr, size_t size, int gpu);
+
+template void
+GPUBufferManager::customCudaFree<float>(float* ptr, size_t size, int gpu);
+
+template void
+GPUBufferManager::customCudaFree<double>(double* ptr, size_t size, int gpu);
+
+template void
+GPUBufferManager::customCudaFree<char>(char* ptr, size_t size, int gpu);
+
+template void
+GPUBufferManager::customCudaFree<bool>(bool* ptr, size_t size, int gpu);
+
+template void
+GPUBufferManager::customCudaFree<pointer_and_key>(pointer_and_key* ptr, size_t size, int gpu);
+
 template int*
 GPUBufferManager::customCudaHostAlloc<int>(size_t size);
 
@@ -76,9 +100,15 @@ GPUBufferManager::GPUBufferManager(size_t cache_size_per_gpu, size_t processing_
     cpuProcessingPointer = 0;
     std::cout << "Allocated CPU pinned memory of capacity " << processing_size_per_cpu << std::endl;
 
+    cuda_mr = new rmm::mr::cuda_memory_resource();
+    mr = new rmm::mr::pool_memory_resource(cuda_mr, rmm::percent_of_free_device_memory(50));
+    cudf::set_current_device_resource(mr);
+    allocation_table.resize(NUM_GPUS);
+    locked_allocation_table.resize(NUM_GPUS);
+
     for (int gpu = 0; gpu < NUM_GPUS; gpu++) {
         gpuCache[gpu] = callCudaMalloc<uint8_t>(cache_size_per_gpu, gpu);
-        gpuProcessing[gpu] = callCudaMalloc<uint8_t>(processing_size_per_gpu, gpu);
+        // gpuProcessing[gpu] = callCudaMalloc<uint8_t>(processing_size_per_gpu, gpu);
         // gpuCache[gpu] = callCudaHostAlloc<uint8_t>(cache_size_per_gpu, 1);
         // gpuProcessing[gpu] = callCudaHostAlloc<uint8_t>(processing_size_per_gpu, 1);
         gpuProcessingPointer[gpu] = 0;
@@ -91,7 +121,8 @@ GPUBufferManager::GPUBufferManager(size_t cache_size_per_gpu, size_t processing_
 GPUBufferManager::~GPUBufferManager() {
     for (int gpu = 0; gpu < NUM_GPUS; gpu++) {
         callCudaFree<uint8_t>(gpuCache[gpu], gpu);
-        callCudaFree<uint8_t>(gpuProcessing[gpu], gpu);
+        // callCudaFree<uint8_t>(gpuProcessing[gpu], gpu);
+        mr->deallocate((void*) gpuProcessing[gpu], processing_size_per_gpu);
     }
     freePinnedCPUMemory(cpuProcessing);
     delete[] gpuProcessingPointer;
@@ -99,8 +130,37 @@ GPUBufferManager::~GPUBufferManager() {
 }
 
 void GPUBufferManager::ResetBuffer() {
+    cudf::set_current_device_resource(mr);
     for (int gpu = 0; gpu < NUM_GPUS; gpu++) {
         gpuProcessingPointer[gpu] = 0;
+        //write a program to free all allocation in the allocation table
+        printf("Allocation table size %ld\n", allocation_table[gpu].size());
+        for (auto it = allocation_table[gpu].begin(); it != allocation_table[gpu].end(); ++it) {
+            auto ptr = it->first;
+            auto size = it->second;
+            if (ptr != nullptr) {
+                // customCudaFree<uint8_t>(reinterpret_cast<uint8_t*>(ptr), size, 0);
+                mr->deallocate((void*) ptr, size);
+                // printf("Deallocating Pointer %p size %ld\n", ptr, size);
+                // allocation_table[gpu].erase(it);
+            }
+        }
+        allocation_table[gpu].clear();
+        if (!allocation_table[gpu].empty()) {
+            throw InvalidInputException("Allocation table is not empty");
+        }
+        // printf("Locked allocation table size %ld\n", locked_allocation_table[gpu].size());
+        for (auto it = locked_allocation_table[gpu].begin(); it != locked_allocation_table[gpu].end(); ++it) {
+            auto ptr = it->first;
+            auto size = it->second;
+            if (ptr != nullptr) {
+                mr->deallocate((void*) ptr, size);
+            }
+        }
+        locked_allocation_table[gpu].clear();
+        if (!locked_allocation_table[gpu].empty()) {
+            throw InvalidInputException("Locked allocation table is not empty");
+        }
     }
     cpuProcessingPointer = 0;
     for (auto it = tables.begin(); it != tables.end(); it++) {
@@ -135,7 +195,9 @@ T*
 GPUBufferManager::customCudaMalloc(size_t size, int gpu, bool caching) {
 	size_t alloc = (size * sizeof(T));
     //always ensure that it aligns with 8B
-    alloc = alloc + (alignof(double) - alloc % alignof(double));
+    // int alignment = alignof(double);
+    int alignment = 256;
+    alloc = alloc + (alignment - alloc % alignment);
     if (caching) {
         size_t start = __atomic_fetch_add(&gpuCachingPointer[gpu], alloc, __ATOMIC_RELAXED);
         assert((start + alloc) < cache_size_per_gpu);
@@ -148,22 +210,112 @@ GPUBufferManager::customCudaMalloc(size_t size, int gpu, bool caching) {
         } 
         return ptr;
     } else {
-        // printf("Allocating %ld bytes\n", alloc);
-        size_t start = __atomic_fetch_add(&gpuProcessingPointer[gpu], alloc, __ATOMIC_RELAXED);
-        // printf("Current pointer %ld\n", gpuProcessingPointer[gpu]);
-        assert((start + alloc) < processing_size_per_gpu);
-        if (start + alloc >= processing_size_per_gpu) {
-            throw InvalidInputException("Out of GPU processing memory");
+        cudf::set_current_device_resource(mr);
+        void* ptr = mr->allocate(alloc);
+        // size_t start = __atomic_fetch_add(&gpuProcessingPointer[gpu], alloc, __ATOMIC_RELAXED);
+        // // printf("Current pointer %ld\n", gpuProcessingPointer[gpu]);
+        // assert((start + alloc) < processing_size_per_gpu);
+        // if (start + alloc >= processing_size_per_gpu) {
+        //     throw InvalidInputException("Out of GPU processing memory");
+        // }
+        // // printf("Allocating %ld bytes at %d\n", alloc, start);
+        // // printf("Current pointer %ld\n", gpuProcessingPointer[gpu]);
+        // T* ptr = reinterpret_cast<T*>(gpuProcessing[gpu] + start);
+        // if (reinterpret_cast<uintptr_t>(ptr) % alignof(double) != 0) {
+        //     throw InvalidInputException("Memory is not properly aligned");
+        // }
+        // printf("Allocating Pointer %p size %ld\n", ptr, alloc);
+        if (ptr == nullptr) throw InvalidInputException("Pointer is nullptr");
+        if (allocation_table[gpu].find(ptr) != allocation_table[gpu].end()) {
+            throw InvalidInputException("Pointer already exists in allocation table");
         }
-        // printf("Allocating %ld bytes at %d\n", alloc, start);
-        // printf("Current pointer %ld\n", gpuProcessingPointer[gpu]);
-        T* ptr = reinterpret_cast<T*>(gpuProcessing[gpu] + start);
-        if (reinterpret_cast<uintptr_t>(ptr) % alignof(double) != 0) {
-            throw InvalidInputException("Memory is not properly aligned");
-        } 
-        return ptr;
+        allocation_table[gpu][ptr] = alloc;
+        return reinterpret_cast<T*>(ptr);
     }
 };
+
+GPUColumn* 
+GPUBufferManager::copyDataFromcuDFColumn(cudf::column_view& column, int gpu) {
+    //copy the data to the gpu
+    //create a column
+    //return the column
+    uint8_t* data = const_cast<uint8_t*>(column.data<uint8_t>());
+
+    if (column.type() == cudf::data_type(cudf::type_id::STRING)) {
+
+        int32_t* temp_num_bytes = new int32_t[1];
+        int32_t* temp_offset = const_cast<int32_t*>(column.child(0).data<int32_t>());
+        callCudaMemcpyDeviceToHost<int32_t>(temp_num_bytes, temp_offset + column.size(), 1, 0);
+        uint8_t* temp_column = customCudaMalloc<uint8_t>(temp_num_bytes[0], 0, false);
+        callCudaMemcpyDeviceToDevice<uint8_t>(temp_column, data, temp_num_bytes[0], 0);
+
+        GPUColumn* column_ptr = new GPUColumn(column.size(), ColumnType::VARCHAR, temp_column);
+        column_ptr->convertCudfOffsetToSiriusOffset(temp_offset);
+        column_ptr->data_wrapper.num_bytes = temp_num_bytes[0];
+        column_ptr->data_wrapper.is_string_data = true;
+        return column_ptr;
+    } else if (column.type() == cudf::data_type(cudf::type_id::UINT64)) {
+        uint8_t* temp_column = customCudaMalloc<uint8_t>(column.size() * sizeof(uint64_t), 0, false);
+        callCudaMemcpyDeviceToDevice<uint8_t>(temp_column, data, column.size() * sizeof(uint64_t), 0);
+        return new GPUColumn(column.size(), ColumnType::INT64, temp_column);
+    } else if (column.type() == cudf::data_type(cudf::type_id::INT32)) {
+        uint8_t* temp_column = customCudaMalloc<uint8_t>(column.size() * sizeof(int32_t), 0, false);
+        callCudaMemcpyDeviceToDevice<uint8_t>(temp_column, data, column.size() * sizeof(int32_t), 0);
+        return new GPUColumn(column.size(), ColumnType::INT32, temp_column);
+    } else if (column.type() == cudf::data_type(cudf::type_id::FLOAT32)) {
+        uint8_t* temp_column = customCudaMalloc<uint8_t>(column.size() * sizeof(float), 0, false);
+        callCudaMemcpyDeviceToDevice<uint8_t>(temp_column, data, column.size() * sizeof(float), 0);
+        return new GPUColumn(column.size(), ColumnType::FLOAT32, temp_column);
+    } else if (column.type() == cudf::data_type(cudf::type_id::FLOAT64)) {
+        uint8_t* temp_column = customCudaMalloc<uint8_t>(column.size() * sizeof(double), 0, false);
+        callCudaMemcpyDeviceToDevice<uint8_t>(temp_column, data, column.size() * sizeof(double), 0);
+        return new GPUColumn(column.size(), ColumnType::FLOAT64, temp_column);
+    } else if (column.type() == cudf::data_type(cudf::type_id::BOOL8)) {
+        uint8_t* temp_column = customCudaMalloc<uint8_t>(column.size() * sizeof(bool), 0, false);
+        callCudaMemcpyDeviceToDevice<uint8_t>(temp_column, data, column.size() * sizeof(bool), 0);
+        return new GPUColumn(column.size(), ColumnType::BOOLEAN, temp_column);
+    }
+}
+
+void
+GPUBufferManager::lockAllocation(void* ptr, int gpu) {
+    //move entries from the allocation table to the locked table
+    auto it = allocation_table[gpu].find(ptr);
+    if (it != allocation_table[gpu].end()) {
+        locked_allocation_table[gpu][ptr] = it->second;
+        allocation_table[gpu].erase(it);
+    }
+}
+
+template <typename T>
+void
+GPUBufferManager::customCudaFree(T* ptr, size_t size, int gpu) {
+    //check if ptr is not in gpuCaching
+    uint8_t* ptr_uint8 = reinterpret_cast<uint8_t*>(ptr);
+    if (ptr_uint8 != nullptr && (ptr_uint8 < gpuCache[gpu] && ptr_uint8 >= gpuCache[gpu] + cache_size_per_gpu)) {
+        mr->deallocate((void*) ptr, size * sizeof(T));
+    }
+};
+
+void
+GPUBufferManager::customCudaFree(uint8_t* ptr, int gpu) {
+    //check if ptr is not in gpuCaching
+    cudf::set_current_device_resource(mr);
+    if (ptr != nullptr && (ptr < gpuCache[gpu] || ptr >= gpuCache[gpu] + cache_size_per_gpu)) {
+        auto it = allocation_table[gpu].find(reinterpret_cast<void*>(ptr));
+        if (it != allocation_table[gpu].end()) {
+            // printf("Deallocating Pointer %p size %ld\n", ptr, it->second);
+            mr->deallocate((void*) ptr, it->second);
+            allocation_table[gpu].erase(it);
+        } else {
+            auto locked_it = locked_allocation_table[gpu].find(reinterpret_cast<void*>(ptr));
+            if (locked_it == locked_allocation_table[gpu].end()) {
+                printf("Invalid Pointer %p\n", ptr);
+                throw InvalidInputException("Pointer not found in allocation table");
+            }
+        }
+    }
+}
 
 template <typename T>
 T*

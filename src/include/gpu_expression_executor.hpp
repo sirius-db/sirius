@@ -46,6 +46,8 @@ void q22FilterExpression(uint8_t *a, uint64_t* offset, uint64_t start_idx, uint6
 
 class GPUExpressionExecutor {
 public:
+    vector<uint64_t> projected_columns;
+
     void FilterRecursiveExpression(GPUIntermediateRelation& input_relation, GPUIntermediateRelation& output_relation, Expression& expr, int depth = 0);
     void ProjectionRecursiveExpression(GPUIntermediateRelation& input_relation, GPUIntermediateRelation& output_relation, Expression& expr, int output_idx, int depth = 0);
     

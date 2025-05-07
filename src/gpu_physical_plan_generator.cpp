@@ -104,8 +104,8 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::CreatePlan(LogicalOper
 		plan = CreatePlan(op.Cast<LogicalOrder>());
 		break;
 	case LogicalOperatorType::LOGICAL_TOP_N:
-		throw NotImplementedException("Top N not supported");
-		// plan = CreatePlan(op.Cast<LogicalTopN>());
+		// throw NotImplementedException("Top N not supported");
+		plan = CreatePlan(op.Cast<LogicalTopN>());
 		break;
 	case LogicalOperatorType::LOGICAL_COPY_TO_FILE:
 		throw NotImplementedException("Copy to file not supported");

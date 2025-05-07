@@ -1,4 +1,5 @@
 #include "operator/gpu_physical_order.hpp"
+#include "operator/gpu_materialize.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "gpu_buffer_manager.hpp"
 #include "gpu_materialize.hpp"
@@ -32,20 +33,11 @@ void ResolveOrderByString(GPUColumn** sort_columns, int* sort_orders, int num_co
     std::cout << "ResolveOrderByString: Wrote num bytes of " << col_num_bytes[i] << " for idx " << i << std::endl;
   }
 }
-
-GPUPhysicalOrder::GPUPhysicalOrder(vector<LogicalType> types, vector<BoundOrderByNode> orders, vector<idx_t> projections,
-                             idx_t estimated_cardinality)
-    : GPUPhysicalOperator(PhysicalOperatorType::ORDER_BY, std::move(types), estimated_cardinality),
-      orders(std::move(orders)), projections(std::move(projections)) {
-
-    throw NotImplementedException("Order by is not implemented");
-    sort_result = new GPUIntermediateRelation(projections.size());
-}
   
 SourceResultType
 GPUPhysicalOrder::GetData(GPUIntermediateRelation &output_relation) const {
   for (int col = 0; col < sort_result->columns.size(); col++) {
-    printf("Writing order by result to column %ld\n", col);
+    printf("Writing order by result to column %d\n", col);
     output_relation.columns[col] = sort_result->columns[col];
   }
 
@@ -54,69 +46,108 @@ GPUPhysicalOrder::GetData(GPUIntermediateRelation &output_relation) const {
 
 SinkResultType 
 GPUPhysicalOrder::Sink(GPUIntermediateRelation &input_relation) const {
+
   GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
-  GPUColumn** sort_columns = new GPUColumn*[orders.size()];
-  int* sort_orders = new int[orders.size()];
-  int idx = 0;
-  bool string_sort = false;
-  for (auto &order : orders) {
-    // key_types.push_back(order.expression->return_type);
-    // key_executor.AddExpression(*order.expression);
-    auto& expr = *order.expression;
-    expr.Print();
+  // GPUColumn** sort_columns = new GPUColumn*[orders.size()];
+  // int* sort_orders = new int[orders.size()];
+  // int idx = 0;
+  // bool string_sort = false;
+  // for (auto &order : orders) {
+  //   // key_types.push_back(order.expression->return_type);
+  //   // key_executor.AddExpression(*order.expression);
+  //   auto& expr = *order.expression;
+  //   expr.Print();
+  //   if (expr.expression_class != ExpressionClass::BOUND_REF) {
+  //     throw NotImplementedException("Order by expression not supported");
+  //   }
+
+  //   // Record the column to sort on
+  //   auto &bound_ref_expr = expr.Cast<BoundReferenceExpression>();
+  //   auto input_idx = bound_ref_expr.index;
+  //   printf("Reading order by keys from index %ld\n", input_idx);
+  //   sort_columns[idx] = HandleMaterializeExpression(
+  //     input_relation.columns[input_idx], bound_ref_expr, gpuBufferManager
+  //   );
+  //   if (sort_columns[idx]->data_wrapper.type == ColumnType::VARCHAR) {
+  //     string_sort = true;
+  //   }
+
+  //   // Record the sort method
+  //   auto sort_method = order.type;
+  //   int sort_type = 0;
+  //   if(sort_method == OrderType::DESCENDING) {
+  //     sort_type = 1;
+  //   }
+  //   sort_orders[idx] = sort_type;
+  //   printf(
+  //     "Order By got sort column: Col Length - %d, Size - %d, Bytes - %d, Sort Order - %d\n", 
+  //     (int) sort_columns[idx]->column_length, (int) sort_columns[idx]->data_wrapper.size,  
+  //     (int) sort_columns[idx]->data_wrapper.num_bytes, sort_orders[idx]
+  //   );
+
+  //   idx++;
+  // }
+
+  // // Now actually perform the order by
+  // if(string_sort) {
+  //   ResolveOrderByString(sort_columns, sort_orders, orders.size());
+  // } else {
+  //   throw NotImplementedException("Non String Order By not yet supported");
+  // }
+
+  // // Copy the sorted columns back into the input relationship
+  // int sort_cols_idx = 0;
+  // for (auto &order : orders) {
+  //   auto& expr = *order.expression;
+  //   auto &bound_ref_expr = expr.Cast<BoundReferenceExpression>();
+  //   auto input_idx = bound_ref_expr.index;
+  //   input_relation.columns[input_idx] = sort_columns[sort_cols_idx];
+
+  //   sort_cols_idx += 1;
+  // }
+
+  GPUColumn** order_by_keys = new GPUColumn*[orders.size()];
+  GPUColumn** projection_columns = new GPUColumn*[projections.size()];
+  
+  for (int projection_idx = 0; projection_idx < projections.size(); projection_idx++) {
+      auto input_idx = projections[projection_idx];
+      auto expr = BoundReferenceExpression(LogicalType::ANY, input_idx);
+      projection_columns[projection_idx] = HandleMaterializeExpression(input_relation.columns[input_idx], expr, gpuBufferManager);
+      input_relation.columns[input_idx] = projection_columns[projection_idx];
+  }
+  
+  for (int order_idx = 0; order_idx < orders.size(); order_idx++) {
+    auto& expr = *orders[order_idx].expression;
     if (expr.expression_class != ExpressionClass::BOUND_REF) {
       throw NotImplementedException("Order by expression not supported");
     }
+    auto input_idx = expr.Cast<BoundReferenceExpression>().index;
+    order_by_keys[order_idx] = HandleMaterializeExpression(input_relation.columns[input_idx], expr.Cast<BoundReferenceExpression>(), gpuBufferManager);
+  }
 
-    // Record the column to sort on
-    auto &bound_ref_expr = expr.Cast<BoundReferenceExpression>();
-    auto input_idx = bound_ref_expr.index;
-    printf("Reading order by keys from index %ld\n", input_idx);
-    sort_columns[idx] = HandleMaterializeExpression(
-      input_relation.columns[input_idx], bound_ref_expr, gpuBufferManager
-    );
-    if (sort_columns[idx]->data_wrapper.type == ColumnType::VARCHAR) {
-      string_sort = true;
+
+	if (order_by_keys[0]->column_length > INT32_MAX ) {
+		throw NotImplementedException("Order by with column length greater than INT32_MAX is not supported");
+	}
+
+  for (int col = 0; col < projections.size(); col++) {
+    // if types is VARCHAR, check the number of bytes
+    if (projection_columns[col]->data_wrapper.type == ColumnType::VARCHAR) {
+      if (projection_columns[col]->data_wrapper.num_bytes > INT32_MAX) {
+        throw NotImplementedException("String column size greater than INT32_MAX is not supported");
+      }
     }
+  }
+  HandleOrderBy(order_by_keys, projection_columns, orders, projections.size());
 
-    // Record the sort method
-    auto sort_method = order.type;
-    int sort_type = 0;
-    if(sort_method == OrderType::DESCENDING) {
-      sort_type = 1;
+  for (int col = 0; col < projections.size(); col++) {
+    if (sort_result->columns[col] == nullptr && projection_columns[col]->column_length > 0 && projection_columns[col]->data_wrapper.data != nullptr) {
+      sort_result->columns[col] = projection_columns[col];
+      sort_result->columns[col]->row_ids = nullptr;
+      sort_result->columns[col]->row_id_count = 0;
+    } else if (sort_result->columns[col] != nullptr && projection_columns[col]->column_length > 0 && projection_columns[col]->data_wrapper.data != nullptr) {
+      throw NotImplementedException("Order by with partially NULL values is not supported");
     }
-    sort_orders[idx] = sort_type;
-    printf(
-      "Order By got sort column: Col Length - %d, Size - %d, Bytes - %d, Sort Order - %d\n", 
-      (int) sort_columns[idx]->column_length, (int) sort_columns[idx]->data_wrapper.size,  
-      (int) sort_columns[idx]->data_wrapper.num_bytes, sort_orders[idx]
-    );
-
-    idx++;
-  }
-
-  // Now actually perform the order by
-  if(string_sort) {
-    ResolveOrderByString(sort_columns, sort_orders, orders.size());
-  } else {
-    throw NotImplementedException("Non String Order By not yet supported");
-  }
-
-  // Copy the sorted columns back into the input relationship
-  int sort_cols_idx = 0;
-  for (auto &order : orders) {
-    auto& expr = *order.expression;
-    auto &bound_ref_expr = expr.Cast<BoundReferenceExpression>();
-    auto input_idx = bound_ref_expr.index;
-    input_relation.columns[input_idx] = sort_columns[sort_cols_idx];
-
-    sort_cols_idx += 1;
-  }
-
-  // Project the desired column into the sort result
-  sort_result->columns.resize(projections.size());
-  for (auto &projection : projections) {
-    sort_result->columns[projection] = input_relation.columns[projection];
   }
 
   return SinkResultType::FINISHED;

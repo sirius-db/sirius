@@ -91,9 +91,9 @@ GPUPhysicalMaterializedCollector::FinalMaterializeInternal(GPUIntermediateRelati
 	if (input_relation.checkLateMaterialization(col)) {
 		T* data = reinterpret_cast<T*> (input_relation.columns[col]->data_wrapper.data);
 		uint64_t* row_ids = reinterpret_cast<uint64_t*> (input_relation.columns[col]->row_ids);
-		T* materialized = gpuBufferManager->customCudaMalloc<T>(input_relation.columns[col]->row_id_count, 0, 0);
+		T* materialized;
 		// printf("input_relation.columns[col]->row_id_count %d\n", input_relation.columns[col]->row_id_count);
-		materializeExpression<T>(data, materialized, row_ids, input_relation.columns[col]->row_id_count);
+		materializeExpression<T>(data, materialized, row_ids, input_relation.columns[col]->row_id_count, input_relation.columns[col]->column_length);
 		output_relation.columns[col] = new GPUColumn(input_relation.columns[col]->row_id_count, input_relation.columns[col]->data_wrapper.type, reinterpret_cast<uint8_t*>(materialized));
 		output_relation.columns[col]->row_id_count = 0;
 		output_relation.columns[col]->row_ids = nullptr;
@@ -118,7 +118,7 @@ GPUPhysicalMaterializedCollector::FinalMaterializeString(GPUIntermediateRelation
 
 		std::cout << "Running string late materalization with " << num_rows << " rows" << std::endl;
 
-		materializeString(data, offset, result, result_offset, row_ids, new_num_bytes, num_rows);
+		materializeString(data, offset, result, result_offset, row_ids, new_num_bytes, num_rows, input_relation.columns[col]->column_length, input_relation.columns[col]->data_wrapper.num_bytes);
 
 		output_relation.columns[col] = new GPUColumn(num_rows, ColumnType::VARCHAR, reinterpret_cast<uint8_t*>(result), result_offset, new_num_bytes[0], true);
 		output_relation.columns[col]->row_id_count = 0;
@@ -278,6 +278,14 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 	std::cout << "Result Collector CPU Materialize Time: " << materialize_duration_ms << " ms" << std::endl; 
 
 	auto chunk_start_time = std::chrono::high_resolution_clock::now();
+	// // free all input relation columns
+	// for (int col = 0; col < input_relation.columns.size(); col++) {
+	// 	gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(input_relation.columns[col]->data_wrapper.data), 0);
+    //     if (input_relation.columns[col]->data_wrapper.type == ColumnType::VARCHAR) {
+    //         gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(input_relation.columns[col]->data_wrapper.offset), 0);
+    //     }
+	// }
+
 	ColumnDataAppendState append_state;
 	collection->InitializeAppend(append_state);
 	size_t total_vector = (materialized_relation.columns[0]->column_length + STANDARD_VECTOR_SIZE - 1) / STANDARD_VECTOR_SIZE;

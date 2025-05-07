@@ -22,7 +22,7 @@ if (USE_CUDF)
     message(FATAL_ERROR "LIBCUDF_ENV_PREFIX environment variable is not set.")
   endif()
 else()
-  find_package(CUDA REQUIRED)
+  # find_package(CUDA REQUIRED)
   enable_language(CUDA)
 endif()
 
@@ -82,11 +82,15 @@ set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
 
 # Manually specify CUDA include and library directories
 # Include directories
-include_directories(${CUDA_INCLUDE_DIRS})
+
 if (USE_CUDF)
+  include_directories(${CUDA_INCLUDE_DIRS})
+  include_directories(src/include/cudf)
   include_directories(${CONDA_PREFIX}/include)
   include_directories(${CONDA_PREFIX}/include/cudf)
   include_directories(${CONDA_PREFIX}/include/rmm)
+else()
+  include_directories(/usr/local/cuda/include)
 endif()
 
 # add_library(${EXTENSION_NAME} STATIC ${EXTENSION_SOURCES} ${CUDA_SOURCES})
@@ -104,32 +108,51 @@ set_target_properties(${EXTENSION_NAME} PROPERTIES CUDA_SEPARABLE_COMPILATION ON
 set_target_properties(${LOADABLE_EXTENSION_NAME} PROPERTIES LINKER_LANGUAGE CUDA)
 set_target_properties(${LOADABLE_EXTENSION_NAME} PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
-target_link_libraries(${EXTENSION_NAME} 
-      substrait_extension
-      ${CUDA_CUDA_LIBRARY} 
-      ${CUDA_CUDART_LIBRARY} 
-      ${CUDA_cudadevrt_LIBRARY} 
-      cuda 
-      cudart 
-      cupti 
-      curand 
-      cudadevrt
-      )
-target_link_libraries(${LOADABLE_EXTENSION_NAME} 
-      substrait_extension
-      ${CUDA_CUDA_LIBRARY} 
-      ${CUDA_CUDART_LIBRARY} 
-      ${CUDA_cudadevrt_LIBRARY} 
-      cuda 
-      cudart 
-      cupti 
-      curand 
-      cudadevrt
-      )
-
 if (USE_CUDF)
-  target_link_libraries(${EXTENSION_NAME} cudf::cudf rmm::rmm)
-  target_link_libraries(${LOADABLE_EXTENSION_NAME} cudf::cudf rmm::rmm)
+  target_link_libraries(${EXTENSION_NAME}
+    substrait_extension
+    cuda 
+    cudart 
+    cupti 
+    curand 
+    cudadevrt
+    cudf::cudf 
+    rmm::rmm
+  )
+  target_link_libraries(${LOADABLE_EXTENSION_NAME} 
+    substrait_extension
+    cuda 
+    cudart 
+    cupti 
+    curand 
+    cudadevrt
+    cudf::cudf 
+    rmm::rmm
+  )
+else()
+  find_library(CUDA_RUNTIME_LIBRARY cudart HINTS /usr/local/cuda/lib64)
+  find_library(CUDA_CUPTI_LIBRARY cupti HINTS /usr/local/cuda/lib64)
+  find_library(CUDA_CURAND_LIBRARY curand HINTS /usr/local/cuda/lib64)
+  find_library(CUDA_CUDA_LIBRARY cuda HINTS /usr/local/cuda/lib64)
+  find_library(CUDA_DEVRT_LIBRARY cudadevrt HINTS /usr/local/cuda/lib64)
+
+  target_link_libraries(${EXTENSION_NAME} 
+    substrait_extension
+    ${CUDA_RUNTIME_LIBRARY}
+    ${CUDA_CUPTI_LIBRARY}
+    ${CUDA_CURAND_LIBRARY}
+    ${CUDA_CUDA_LIBRARY}
+    ${CUDA_DEVRT_LIBRARY}
+  )
+
+  target_link_libraries(${LOADABLE_EXTENSION_NAME} 
+    substrait_extension
+    ${CUDA_RUNTIME_LIBRARY}
+    ${CUDA_CUPTI_LIBRARY}
+    ${CUDA_CURAND_LIBRARY}
+    ${CUDA_CUDA_LIBRARY}
+    ${CUDA_DEVRT_LIBRARY}
+  )
 endif()
 
 install(

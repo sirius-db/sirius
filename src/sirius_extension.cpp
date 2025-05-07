@@ -194,6 +194,8 @@ SiriusExtension::GPUProcessingBind(ClientContext &context, TableFunctionBindInpu
 		auto gpu_prepared = make_shared_ptr<GPUPreparedStatementData>(std::move(prepared), std::move(gpu_physical_plan));
 		result->gpu_prepared = gpu_prepared;
 	} catch (std::exception &e) {
+		ErrorData error(e);
+		printf("\033[1;31m"); printf("Error in GPUGeneratePhysicalPlan: %s\n", error.RawMessage().c_str()); printf("\033[0m");
 		result->plan_error = true;
 	}
 
@@ -312,6 +314,8 @@ SiriusExtension::GPUProcessingSubstraitBind(ClientContext &context, TableFunctio
 		auto gpu_prepared = make_shared_ptr<GPUPreparedStatementData>(std::move(prepared), std::move(gpu_physical_plan));
 		result->gpu_prepared = gpu_prepared;
 	} catch (std::exception &e) {
+		ErrorData error(e);
+		printf("\033[1;31m"); printf("Error in GPUGeneratePhysicalPlan: %s\n", error.RawMessage().c_str()); printf("\033[0m");
 		result->plan_error = true;
 	}
 
@@ -402,10 +406,6 @@ void SiriusExtension::InitializeGPUExtension(Connection &con) {
 	size_t processing_size_per_cpu = 16UL * 1024 * 1024 * 1024; //16GB
 	GPUBufferManager *gpuBufferManager = &(GPUBufferManager::GetInstance(cache_size_per_gpu, processing_size_per_gpu, processing_size_per_cpu));
 
-	//test if cudf is working
-#ifdef ENABLE_CUDF
-	test_cudf();
-#endif
 }
 
 void SiriusExtension::Load(DuckDB &db) {

@@ -223,7 +223,7 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
                 size_t size;
 
                 GPUColumn* materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref.index], bound_ref, gpuBufferManager);
-                count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+                // count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
                 HandleComparisonConstantExpression(materialized_column, bound_lower, bound_upper, count, comparison_idx, bound_between.type);
                 if (count[0] == 0) throw NotImplementedException("No match found");
             break;
@@ -272,7 +272,7 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
                         count[0] = 0;
                     } else {
                         GPUColumn* materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref1.index], bound_ref1, gpuBufferManager);
-                        count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+                        // count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
                         HandleComparisonConstantExpression(materialized_column, bound_ref2, bound_ref2, count, comparison_idx, bound_comparison.type);
                         if (count[0] == 0) throw NotImplementedException("No match found");
                     }
@@ -288,7 +288,7 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
                     } else {
                         GPUColumn* materialized_column1 = HandleMaterializeExpression(input_relation.columns[bound_ref1.index], bound_ref1, gpuBufferManager);
                         GPUColumn* materialized_column2 = HandleMaterializeExpression(input_relation.columns[bound_ref2.index], bound_ref2, gpuBufferManager);
-                        count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+                        // count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
                         HandleComparisonExpression(materialized_column1, materialized_column2, count, comparison_idx, bound_comparison.type);  
                         if (count[0] == 0) throw NotImplementedException("No match found");   
                     }       
@@ -326,7 +326,7 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
                     count = new uint64_t[1];
                     count[0] = 0;
                 } else {
-                  count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+                  // count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
                   GPUColumn* materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref.index], bound_ref, gpuBufferManager);
                   if(bound_function_name.find("prefix") != std::string::npos) {
                     HandlePrefixMatching(materialized_column, match_str, comparison_idx, count, 0);
@@ -361,7 +361,7 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
                         GPUColumn* materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref.index], bound_ref, gpuBufferManager);
                         Value one = Value::BOOLEAN(1);
                         BoundConstantExpression bound_constant_expr = BoundConstantExpression(one);
-                        count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+                        // count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
                         HandleComparisonConstantExpression(materialized_column, bound_constant_expr, bound_constant_expr, count, comparison_idx, ExpressionType::COMPARE_NOTEQUAL);
                         if (count[0] == 0) throw NotImplementedException("No match found"); 
                       }
@@ -377,7 +377,7 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
                           count = new uint64_t[1];
                           count[0] = 0;
                       } else {
-                        count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+                        // count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
                         GPUColumn* materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref.index], bound_ref, gpuBufferManager);
                         if(bound_function_name.find("prefix") != std::string::npos) {
                             HandlePrefixMatching(materialized_column, match_str, comparison_idx, count, 1);
@@ -430,6 +430,9 @@ GPUExpressionExecutor::ProjectionRecursiveExpression(GPUIntermediateRelation& in
               printf("Executing bound reference expression\n");
               printf("Reading column index %ld\n", bound_ref.index);
               input_relation.checkLateMaterialization(bound_ref.index);
+              if (depth == 0) {
+                projected_columns.push_back(bound_ref.index);
+              }
               break;
         } case ExpressionClass::BOUND_CASE: {
               throw NotImplementedException("Case expression not supported");

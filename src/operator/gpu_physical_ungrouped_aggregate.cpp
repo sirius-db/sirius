@@ -212,6 +212,7 @@ GPUPhysicalUngroupedAggregate::GetData(GPUIntermediateRelation &output_relation)
   for (int col = 0; col < aggregation_result->columns.size(); col++) {
     printf("Writing aggregation result to column %ld\n", col);
     // output_relation.columns[col] = aggregation_result->columns[col];
+	// HERE
 	output_relation.columns[col] = new GPUColumn(aggregation_result->columns[col]->column_length, aggregation_result->columns[col]->data_wrapper.type, aggregation_result->columns[col]->data_wrapper.data);
 	// printf("Column length: %ld\n", aggregation_result->columns[col]->column_length);
 	// printGPUColumn<uint64_t>(reinterpret_cast<uint64_t*>(aggregation_result->columns[col]->data_wrapper.data), aggregation_result->columns[col]->column_length, 0);
