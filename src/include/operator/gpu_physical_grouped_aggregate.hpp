@@ -13,6 +13,7 @@
 namespace duckdb {
 
 uint64_t* createFixedSizeOffsets(size_t record_size, uint64_t num_rows);
+
 void cudf_groupby(GPUColumn **keys, GPUColumn **aggregate_keys, uint64_t num_keys, uint64_t num_aggregates, AggregationType* agg_mode);
 
 template <typename T, typename V>
@@ -26,6 +27,9 @@ void groupedDistinctAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t
 
 template <typename V>
 void groupedStringAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t** offset, uint64_t* num_bytes, uint64_t* count, uint64_t N, uint64_t num_keys, uint64_t num_aggregates, int* agg_mode);
+
+template <typename V>
+void optimizedGroupedStringAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t** offset, uint64_t* num_bytes, uint64_t* count, uint64_t N, uint64_t num_keys, uint64_t num_aggregates, int* agg_mode);
 
 template <typename T, typename V>
 void hashGroupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count, uint64_t N, uint64_t num_keys, uint64_t num_aggregates, int* agg_mode);

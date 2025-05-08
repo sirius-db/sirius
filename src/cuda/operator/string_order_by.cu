@@ -157,13 +157,19 @@ void orderByString(uint8_t** col_keys, uint64_t** col_offsets, int* sort_orders,
         
         // Materialize the column in the new order
         uint8_t* sorted_chars; uint64_t* sorted_offsets; uint64_t* new_num_bytes;
-        materializeString(unsorted_col_chars, unsorted_col_offsets, sorted_chars, sorted_offsets, d_row_ids, new_num_bytes, num_rows);
+        materializeString(unsorted_col_chars, unsorted_col_offsets, sorted_chars, sorted_offsets, d_row_ids, new_num_bytes, num_rows, num_rows, col_num_bytes[i]);
 
         // Write back the result
         col_keys[i] = sorted_chars;
         col_offsets[i] = sorted_offsets;
         col_num_bytes[i] = new_num_bytes[0];
     }
+
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_col_keys), 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_col_offsets), 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_row_ids), 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_sort_orders), 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(sort_temp_storage), 0);
 }
 
 }

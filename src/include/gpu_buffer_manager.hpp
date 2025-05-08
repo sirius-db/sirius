@@ -87,9 +87,6 @@ public:
 	template <typename T>
 	T* customCudaHostAlloc(size_t size);
 
-	template <typename T>
-	void customCudaFree(T* ptr, size_t size, int gpu);
-
 	void customCudaFree(uint8_t* ptr, int gpu);
 
 	void Print();
