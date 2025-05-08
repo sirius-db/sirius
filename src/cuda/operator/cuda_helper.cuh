@@ -10,6 +10,10 @@
 #include <thrust/reduce.h>
 #include <float.h>
 #include <thrust/device_vector.h>
+#include <chrono>
+#include <stdexcept>
+#include <assert.h>
+#include <limits>
 #include "gpu_buffer_manager.hpp"
 
 #include <iostream> 

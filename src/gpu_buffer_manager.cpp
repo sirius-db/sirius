@@ -44,30 +44,6 @@ GPUBufferManager::customCudaMalloc<void*>(size_t size, int gpu, bool caching);
 template string_group_by_record_type*
 GPUBufferManager::customCudaMalloc<string_group_by_record_type>(size_t size, int gpu, bool caching);
 
-template void
-GPUBufferManager::customCudaFree<int>(int* ptr, size_t size, int gpu);
-
-template void
-GPUBufferManager::customCudaFree<uint64_t>(uint64_t* ptr, size_t size, int gpu);
-
-template void
-GPUBufferManager::customCudaFree<uint8_t>(uint8_t* ptr, size_t size, int gpu);
-
-template void
-GPUBufferManager::customCudaFree<float>(float* ptr, size_t size, int gpu);
-
-template void
-GPUBufferManager::customCudaFree<double>(double* ptr, size_t size, int gpu);
-
-template void
-GPUBufferManager::customCudaFree<char>(char* ptr, size_t size, int gpu);
-
-template void
-GPUBufferManager::customCudaFree<bool>(bool* ptr, size_t size, int gpu);
-
-template void
-GPUBufferManager::customCudaFree<pointer_and_key>(pointer_and_key* ptr, size_t size, int gpu);
-
 template int*
 GPUBufferManager::customCudaHostAlloc<int>(size_t size);
 
@@ -286,16 +262,6 @@ GPUBufferManager::lockAllocation(void* ptr, int gpu) {
         allocation_table[gpu].erase(it);
     }
 }
-
-template <typename T>
-void
-GPUBufferManager::customCudaFree(T* ptr, size_t size, int gpu) {
-    //check if ptr is not in gpuCaching
-    uint8_t* ptr_uint8 = reinterpret_cast<uint8_t*>(ptr);
-    if (ptr_uint8 != nullptr && (ptr_uint8 < gpuCache[gpu] && ptr_uint8 >= gpuCache[gpu] + cache_size_per_gpu)) {
-        mr->deallocate((void*) ptr, size * sizeof(T));
-    }
-};
 
 void
 GPUBufferManager::customCudaFree(uint8_t* ptr, int gpu) {

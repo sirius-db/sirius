@@ -192,7 +192,8 @@ ResolveTypeGroupByString(GPUColumn** &group_by_keys, GPUColumn** &aggregate_keys
 		printf("Aggregate function name %s got agg_mode of %d\n", expr.function.name.c_str(), agg_mode[agg_idx]);
 	}
 
-	groupedStringAggregate<V>(group_by_data, aggregate_data, offset_data, num_bytes, count, num_rows, num_group_keys, aggregates.size(), agg_mode);
+	// groupedStringAggregate<V>(group_by_data, aggregate_data, offset_data, num_bytes, count, num_rows, num_group_keys, aggregates.size(), agg_mode);
+	optimizedGroupedStringAggregate<V>(group_by_data, aggregate_data, offset_data, num_bytes, count, num_rows, num_group_keys, aggregates.size(), agg_mode);
 
 	// Reading groupby columns based on the grouping set
 	for (idx_t group = 0; group < num_group_keys; group++) {
@@ -621,11 +622,12 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 				}
 			}
 		}
-		if (group_by_column[0]->column_length > INT32_MAX || aggregate_column[0]->column_length > INT32_MAX || !string_cudf_supported) {
+		// if (group_by_column[0]->column_length > INT32_MAX || aggregate_column[0]->column_length > INT32_MAX || !string_cudf_supported) {
 			HandleGroupByAggregateExpression(group_by_column, aggregate_column, gpuBufferManager, aggregates, num_group_keys);
-		} else {
-			HandleGroupByAggregateCuDF(group_by_column, aggregate_column, gpuBufferManager, aggregates, num_group_keys);
-		}
+		// } else {
+		// 	HandleGroupByAggregateCuDF(group_by_column, aggregate_column, gpuBufferManager, aggregates, num_group_keys);
+		// 	// HandleGroupByAggregateExpression(group_by_column, aggregate_column, gpuBufferManager, aggregates, num_group_keys);
+		// }
 	}
 	
 	// Reading groupby columns based on the grouping set

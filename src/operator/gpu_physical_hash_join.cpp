@@ -538,6 +538,14 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 	//materialize columns from the right tables
 	if (join_type == JoinType::INNER || join_type == JoinType::OUTER || join_type == JoinType::LEFT || join_type == JoinType::RIGHT) {
 		printf("Writing row IDs from RHS to output relation\n");
+		for (int col = 0; col < hash_table_result->columns.size(); col++) {
+			gpuBufferManager->lockAllocation(reinterpret_cast<uint8_t*>(hash_table_result->columns[col]->data_wrapper.data), 0);
+			gpuBufferManager->lockAllocation(reinterpret_cast<uint8_t*>(hash_table_result->columns[col]->row_ids), 0);
+			// If the column type is VARCHAR, also lock the offset allocation
+			if (hash_table_result->columns[col]->data_wrapper.type == ColumnType::VARCHAR) {
+				gpuBufferManager->lockAllocation(reinterpret_cast<uint8_t*>(hash_table_result->columns[col]->data_wrapper.offset), 0);
+			}
+		}
 		if (unique_probe_keys) {
 			HandleMaterializeRowIDsRHS(*hash_table_result, output_relation, rhs_output_columns.col_idxs, lhs_output_columns.col_idxs.size(), count[0], row_ids_right, gpuBufferManager, true);
 		} else {

@@ -47,20 +47,33 @@ void cudf_groupby(GPUColumn **keys, GPUColumn **aggregate_keys, uint64_t num_key
   for (int agg = 0; agg < num_aggregates; agg++) {
     requests.emplace_back(cudf::groupby::aggregation_request());
     if (aggregate_keys[agg]->data_wrapper.data == nullptr && agg_mode[agg] == AggregationType::COUNT && aggregate_keys[agg]->column_length == 0) {
-      auto aggregate = cudf::make_count_aggregation<cudf::groupby_aggregation>(cudf::null_policy::EXCLUDE);
+      printf("Count aggregation\n");
+      auto aggregate = cudf::make_sum_aggregation<cudf::groupby_aggregation>();
       requests[agg].aggregations.push_back(std::move(aggregate));
-      auto const_scalar = cudf::make_fixed_width_scalar<uint64_t>(0);
-      requests[agg].values = cudf::make_column_from_scalar(*const_scalar, size)->view();
+      // auto const_scalar = cudf::make_fixed_width_scalar<uint64_t>(static_cast<uint64_t>(0));
+      // requests[agg].values = cudf::make_column_from_scalar(*const_scalar, size)->view();
+      uint64_t* temp = gpuBufferManager->customCudaMalloc<uint64_t>(size, 0, 0);
+      cudaMemset(temp, 0, size * sizeof(uint64_t));
+      GPUColumn* temp_column = new GPUColumn(size, ColumnType::INT64, reinterpret_cast<uint8_t*>(temp));
+      requests[agg].values = temp_column->convertToCudfColumn();
     } else if (aggregate_keys[agg]->data_wrapper.data == nullptr && agg_mode[agg] == AggregationType::SUM && aggregate_keys[agg]->column_length == 0) {
       auto aggregate = cudf::make_sum_aggregation<cudf::groupby_aggregation>();
       requests[agg].aggregations.push_back(std::move(aggregate));
-      auto const_scalar = cudf::make_fixed_width_scalar<uint64_t>(0);
-      requests[agg].values = cudf::make_column_from_scalar(*const_scalar, size)->view();
+      // auto const_scalar = cudf::make_fixed_width_scalar<uint64_t>(static_cast<uint64_t>(0));
+      // requests[agg].values = cudf::make_column_from_scalar(*const_scalar, size)->view();
+      uint64_t* temp = gpuBufferManager->customCudaMalloc<uint64_t>(size, 0, 0);
+      cudaMemset(temp, 0, size * sizeof(uint64_t));
+      GPUColumn* temp_column = new GPUColumn(size, ColumnType::INT64, reinterpret_cast<uint8_t*>(temp));
+      requests[agg].values = temp_column->convertToCudfColumn();
     } else if (aggregate_keys[agg]->data_wrapper.data == nullptr && agg_mode[agg] == AggregationType::COUNT_STAR && aggregate_keys[agg]->column_length != 0) {
       auto aggregate = cudf::make_count_aggregation<cudf::groupby_aggregation>(cudf::null_policy::EXCLUDE);
       requests[agg].aggregations.push_back(std::move(aggregate));
-      auto const_scalar = cudf::make_fixed_width_scalar<uint64_t>(1);
-      requests[agg].values = cudf::make_column_from_scalar(*const_scalar, size)->view();
+      // auto const_scalar = cudf::make_fixed_width_scalar<uint64_t>(static_cast<uint64_t>(1));
+      // requests[agg].values = cudf::make_column_from_scalar(*const_scalar, size)->view();
+      uint64_t* temp = gpuBufferManager->customCudaMalloc<uint64_t>(size, 0, 0);
+      cudaMemset(temp, 0, size * sizeof(uint64_t));
+      GPUColumn* temp_column = new GPUColumn(size, ColumnType::INT64, reinterpret_cast<uint8_t*>(temp));
+      requests[agg].values = temp_column->convertToCudfColumn();
     } else if (agg_mode[agg] == AggregationType::SUM) {
       auto aggregate = cudf::make_sum_aggregation<cudf::groupby_aggregation>();
       requests[agg].aggregations.push_back(std::move(aggregate));

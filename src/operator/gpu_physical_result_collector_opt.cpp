@@ -9,6 +9,8 @@
 #include "gpu_buffer_manager.hpp"
 #include "gpu_materialize.hpp"
 
+#include <unistd.h>
+
 namespace duckdb {
 
 GPUPhysicalResultCollector::GPUPhysicalResultCollector(GPUPreparedStatementData &data)
@@ -213,60 +215,69 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 	auto start = std::chrono::high_resolution_clock::now();
 	// auto &gstate = GetGlobalSinkState(input_relation.context);
 
+	// First figure out the details about the string columns
+	auto materialize_start_time = std::chrono::high_resolution_clock::now();
+
+	size_t all_columns_num_strings = 0;
+	size_t all_columns_total_chars = 0;
+	for (int col = 0; col < input_relation.columns.size(); col++) {
+		DataWrapper column_data_wrapper = input_relation.columns[col]->data_wrapper;
+		if(column_data_wrapper.type != ColumnType::VARCHAR) {
+			all_columns_num_strings += column_data_wrapper.size;
+			all_columns_total_chars += column_data_wrapper.num_bytes;
+		}
+	}
+
+	size_t all_columns_strings_buffer_size = all_columns_num_strings * sizeof(string_t);
+	size_t all_columns_chars_buffer_size = all_columns_total_chars * sizeof(char);
+
+	// Now allocate the buffers for the columns
+	size_t total_buffer_size = all_columns_strings_buffer_size + all_columns_chars_buffer_size;
+	uint8_t* combined_buffer = gpuBufferManager->customCudaHostAlloc<uint8_t>(total_buffer_size);
+	string_t* all_columns_string = reinterpret_cast<string_t*>(combined_buffer);
+	char* all_columns_chars = reinterpret_cast<char*>(combined_buffer + all_columns_strings_buffer_size);
+
 	size_t size_bytes = 0;
 	Allocator& allocator = Allocator::DefaultAllocator();
 	uint8_t** host_data = new uint8_t*[input_relation.columns.size()];
 	GPUIntermediateRelation materialized_relation(input_relation.columns.size());
 	string_t** duckdb_strings = new string_t*[input_relation.columns.size()];
+	string_t* curr_column_string_buffer = all_columns_string;
+	char* curr_column_chars_buffer = all_columns_chars;
 	GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 	for (int col = 0; col < input_relation.columns.size(); col++) {
+		auto col_materialize_start_time = std::chrono::high_resolution_clock::now();
+
 		// TODO: Need to fix this for the future, but for now, we will just return when there is null column
 		if (input_relation.columns[col]->data_wrapper.data == nullptr) return SinkResultType::FINISHED;
 		// Final materialization
 		size_bytes = FinalMaterialize(input_relation, materialized_relation, col);
 
-		if(input_relation.columns[col]->data_wrapper.type != ColumnType::VARCHAR) {
+		ColumnType col_type = input_relation.columns[col]->data_wrapper.type;
+		bool is_string = false;
+		if(col_type != ColumnType::VARCHAR) {
 			// host_data[col] = allocator.AllocateData(size_bytes);
 			host_data[col] = gpuBufferManager->customCudaHostAlloc<uint8_t>(size_bytes);
 			callCudaMemcpyDeviceToHost<uint8_t>(host_data[col], materialized_relation.columns[col]->data_wrapper.data, size_bytes, 0);
 		} else {
-			DataWrapper materialized_col_data = materialized_relation.columns[col]->data_wrapper;
-			// std::cout << "Got materalized col data with " << materialized_col_data.size << " and " << materialized_col_data.num_bytes << " chars" << std::endl;
-			// printGPUColumn<uint64_t>(materialized_col_data.offset, 100, 0);
-			
-			// Copy over the pointers from the gpu to the cpu
-			size_t offset_bytes = (materialized_col_data.size + 1) * sizeof(uint64_t);
-			// uint64_t* cpu_offsets = reinterpret_cast<uint64_t*>(allocator.AllocateData(offset_bytes));
-			uint64_t* cpu_offsets = reinterpret_cast<uint64_t*>(gpuBufferManager->customCudaHostAlloc<uint8_t>(offset_bytes));
-			callCudaMemcpyDeviceToHost<uint64_t>(cpu_offsets, materialized_col_data.offset, materialized_col_data.size + 1, 0);
-			// std::cout << "Got cpu offset of " << cpu_offsets[0] << "," << cpu_offsets[1] << std::endl;
-			materialized_col_data.offset = cpu_offsets;
-			
-			// Do the same for the chars
-			size_t data_bytes = materialized_col_data.num_bytes * sizeof(uint8_t);
-			// uint8_t* cpu_chars = reinterpret_cast<uint8_t*>(allocator.AllocateData(data_bytes));
-			uint8_t* cpu_chars = gpuBufferManager->customCudaHostAlloc<uint8_t>(data_bytes);
-			callCudaMemcpyDeviceToHost<uint8_t>(cpu_chars, materialized_col_data.data, data_bytes, 0);
-			materialized_col_data.data = cpu_chars;
+			// Use the helper method to materialize the string on the GPU
+			GPUColumn* str_column = materialized_relation.columns[col];
+			materializeStringColumnToDuckdbFormat(str_column, curr_column_chars_buffer, curr_column_string_buffer);
+			duckdb_strings[col] = curr_column_string_buffer;
+			materialized_relation.columns[col] = str_column;
+			is_string = true;
 
-			// Copy over the data wrapper
-			materialized_relation.columns[col]->data_wrapper = materialized_col_data;
-			// std::cout << "Copied over strings to the CPU with offset " << materialized_relation.columns[col]->data_wrapper.offset[0];
-			// std::cout << " and chars " << materialized_relation.columns[col]->data_wrapper.data[0] << std::endl;
-
-			// Create a vector of all the strings
-			DataWrapper strings_data_wrapper = materialized_relation.columns[col]->data_wrapper;
-			char* str_all_chars = reinterpret_cast<char*>(strings_data_wrapper.data);
-			size_t num_strings = strings_data_wrapper.size;
-			duckdb_strings[col] = new string_t[num_strings];
-			for(size_t i = 0; i < num_strings; i++) {
-				uint64_t str_start_offset = strings_data_wrapper.offset[i];
-				uint64_t curr_str_length = strings_data_wrapper.offset[i + 1] - str_start_offset;
-				duckdb_strings[col][i] = string_t(str_all_chars + str_start_offset, curr_str_length);
-			}
+			// Advance the buffer pointers based on this column's details
+			DataWrapper str_column_data = str_column->data_wrapper;
+			curr_column_chars_buffer += str_column_data.num_bytes * sizeof(char);
+			curr_column_string_buffer += str_column_data.size * sizeof(string_t);
 		}
 	}
+	auto materialize_end_time = std::chrono::high_resolution_clock::now();
+	auto materialize_duration_ms = std::chrono::duration_cast<std::chrono::microseconds>(materialize_end_time - materialize_start_time).count()/1000.0;
+	std::cout << "Result Collector CPU Materialize Time: " << materialize_duration_ms << " ms" << std::endl; 
 
+	auto chunk_start_time = std::chrono::high_resolution_clock::now();
 	// // free all input relation columns
 	// for (int col = 0; col < input_relation.columns.size(); col++) {
 	// 	gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(input_relation.columns[col]->data_wrapper.data), 0);
@@ -278,9 +289,10 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 	ColumnDataAppendState append_state;
 	collection->InitializeAppend(append_state);
 	size_t total_vector = (materialized_relation.columns[0]->column_length + STANDARD_VECTOR_SIZE - 1) / STANDARD_VECTOR_SIZE;
-	// printf("Total vector %d\n", total_vector);
+	printf("Total vector %d\n", total_vector);
 	size_t remaining = materialized_relation.columns[0]->column_length;
 	for (uint64_t vec = 0; vec < total_vector; vec++) {
+		size_t chunk_cardinality = std::min(remaining, (size_t) STANDARD_VECTOR_SIZE);
 		DataChunk chunk;
 		chunk.InitializeEmpty(types);
 		for (int col = 0; col < materialized_relation.columns.size(); col++) {
@@ -290,18 +302,19 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 			} else {
 				// Add the strings to the vector
 				uint64_t start_idx = materialized_relation.columns[0]->column_length - remaining;
-				Vector str_vector(LogicalType::VARCHAR, reinterpret_cast<data_ptr_t>(duckdb_strings[col] + start_idx));
+				string_t* chunk_strings = duckdb_strings[col] + start_idx;
+				Vector str_vector(LogicalType::VARCHAR, reinterpret_cast<data_ptr_t>(chunk_strings));
 				chunk.data[col].Reference(str_vector);
 			}
 		}
-		if (remaining < STANDARD_VECTOR_SIZE) {
-			chunk.SetCardinality(remaining);
-		} else {
-			chunk.SetCardinality(STANDARD_VECTOR_SIZE);
-		}
+
+		chunk.SetCardinality(chunk_cardinality);
 		collection->Append(append_state, chunk);
-		remaining -= STANDARD_VECTOR_SIZE;
+		remaining -= chunk_cardinality;
 	}
+	auto chunk_end_time = std::chrono::high_resolution_clock::now();
+	auto chunking_duration_ms = std::chrono::duration_cast<std::chrono::microseconds>(chunk_end_time - chunk_start_time).count()/1000.0;
+	std::cout << "Result Collector Chunking Time: " << chunking_duration_ms << " ms" << std::endl;
 
 	//measure time
 	auto end = std::chrono::high_resolution_clock::now();

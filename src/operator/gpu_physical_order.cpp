@@ -33,7 +33,32 @@ void ResolveOrderByString(GPUColumn** sort_columns, int* sort_orders, int num_co
     std::cout << "ResolveOrderByString: Wrote num bytes of " << col_num_bytes[i] << " for idx " << i << std::endl;
   }
 }
-  
+
+void
+HandleOrderBy(GPUColumn** &order_by_keys, GPUColumn** &projection_columns, const vector<BoundOrderByNode> &orders, uint64_t num_projections) {
+	OrderByType* order_by_type = new OrderByType[orders.size()];
+	for (int order_idx = 0; order_idx < orders.size(); order_idx++) {
+		if (orders[order_idx].type == OrderType::ASCENDING) {
+			order_by_type[order_idx] = OrderByType::ASCENDING;
+		} else {
+			order_by_type[order_idx] = OrderByType::DESCENDING;
+		}
+	}
+	
+	cudf_orderby(order_by_keys, projection_columns, orders.size(), num_projections, order_by_type);
+}
+
+GPUPhysicalOrder::GPUPhysicalOrder(vector<LogicalType> types, vector<BoundOrderByNode> orders, vector<idx_t> projections_p,
+                             idx_t estimated_cardinality)
+    : GPUPhysicalOperator(PhysicalOperatorType::ORDER_BY, std::move(types), estimated_cardinality),
+      orders(std::move(orders)), projections(std::move(projections_p)) {
+
+    sort_result = new GPUIntermediateRelation(projections.size());
+    for (int col = 0; col < projections.size(); col++) {
+      sort_result->columns[col] = nullptr;
+    }
+}
+
 SourceResultType
 GPUPhysicalOrder::GetData(GPUIntermediateRelation &output_relation) const {
   for (int col = 0; col < sort_result->columns.size(); col++) {
