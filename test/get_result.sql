@@ -1,4 +1,5 @@
-call gpu_processing("select
+COPY (
+select
   l_returnflag,
   l_linestatus,
   sum(l_quantity) as sum_qty,
@@ -18,9 +19,11 @@ group by
   l_linestatus
 order by
   l_returnflag,
-  l_linestatus;");
+  l_linestatus
+) TO 'test/answers/q1.csv' (HEADER, DELIMITER '|');
 
-call gpu_processing("select
+COPY (
+select
   s_acctbal,
   s_name,
   n_name,
@@ -62,9 +65,11 @@ order by
   s_acctbal desc,
   n_name,
   s_name,
-  p_partkey");
-    
-call gpu_processing("select
+  p_partkey
+) TO 'test/answers/q2.csv' (HEADER, DELIMITER '|');
+
+COPY (
+select
   l_orderkey,
   sum(l_extendedprice * (1 - l_discount)) as revenue,
   o_orderdate,
@@ -85,9 +90,11 @@ group by
   o_shippriority
 order by
   revenue desc,
-  o_orderdate");
+  o_orderdate
+) TO 'test/answers/q3.csv' (HEADER, DELIMITER '|');
 
-call gpu_processing("select
+COPY (
+select
   o_orderpriority,
   count(*) as order_count
 from
@@ -107,9 +114,11 @@ where
 group by
   o_orderpriority
 order by
-  o_orderpriority;");
+  o_orderpriority
+) TO 'test/answers/q4.csv' (HEADER, DELIMITER '|');
 
-call gpu_processing("select
+COPY (
+select
   n_name,
   sum(l_extendedprice * (1 - l_discount)) as revenue
 from
@@ -132,9 +141,11 @@ where
 group by
   n_name
 order by
-  revenue desc;");
+  revenue desc
+) TO 'test/answers/q5.csv' (HEADER, DELIMITER '|');
 
-call gpu_processing("select
+COPY (
+select
   sum(l_extendedprice * l_discount) as revenue
 from
   lineitem
@@ -142,9 +153,11 @@ where
   l_shipdate >= 19940101
   and l_shipdate <= 19941231
   and l_discount between 0.05 and 0.07
-  and l_quantity < 24;");
+  and l_quantity < 24
+) TO 'test/answers/q6.csv' (HEADER, DELIMITER '|');
 
-call gpu_processing("select
+COPY (
+select
   supp_nation,
   cust_nation,
   l_year,
@@ -181,9 +194,11 @@ group by
 order by
   supp_nation,
   cust_nation,
-  l_year;");
+  l_year
+) TO 'test/answers/q7.csv' (HEADER, DELIMITER '|');
 
-call gpu_processing("select
+COPY (
+select
   o_year,
   sum(case
     when nation = 1
@@ -219,9 +234,11 @@ from (
 group by
   o_year
 order by
-  o_year;");
+  o_year
+) TO 'test/answers/q8.csv' (HEADER, DELIMITER '|');
 
-call gpu_processing("select
+COPY (
+select
   nation,
   o_year,
   sum(amount) as sum_profit
@@ -251,9 +268,10 @@ group by
   o_year
 order by
   nation,
-  o_year desc;");
+  o_year desc
+) TO 'test/answers/q9.csv' (HEADER, DELIMITER '|');
 
-call gpu_processing("select
+COPY (select
   c_custkey,
   c_name,
   sum(l_extendedprice * (1 - l_discount)) as revenue,
@@ -283,9 +301,11 @@ group by
   c_address,
   c_comment 
 order by
-  revenue desc;");
+  revenue desc,
+  c_acctbal) TO 'test/answers/q10.csv' (HEADER, DELIMITER '|');
 
-call gpu_processing("select
+COPY (
+select
   *
 from (
   select
@@ -317,9 +337,11 @@ where
   )
 order by
   value desc,
-  ps_partkey;");
+  ps_partkey
+) TO 'test/answers/q11.csv' (HEADER, DELIMITER '|');
 
-call gpu_processing("select
+COPY (
+select
   l_shipmode,
   sum(case
     when o_orderpriority = 0
@@ -346,9 +368,11 @@ where
 group by
   l_shipmode
 order by
-  l_shipmode;");
+  l_shipmode
+) TO 'test/answers/q12.csv' (HEADER, DELIMITER '|');
 
-call gpu_processing("select
+COPY (
+select
   c_count,
   count(*) as custdist
 from (
@@ -367,9 +391,11 @@ group by
   c_count
 order by
   custdist desc,
-  c_count desc;");
+  c_count desc
+) TO 'test/answers/q13.csv' (HEADER, DELIMITER '|');
 
-call gpu_processing("select
+COPY (
+select
     sum(case
     when (p_type >= 125 and p_type < 150)
     then l_extendedprice * (1 - l_discount)
@@ -381,9 +407,11 @@ from
 where
   l_partkey = p_partkey
   and l_shipdate >= 19950901
-  and l_shipdate <= 19950931;");
+  and l_shipdate <= 19950931
+) TO 'test/answers/q14.csv' (HEADER, DELIMITER '|');
 
-call gpu_processing("with revenue_view as (
+COPY (
+with revenue_view as (
   select
     l_suppkey as supplier_no,
     sum(l_extendedprice * (1 - l_discount)) as total_revenue
@@ -411,9 +439,11 @@ where
       revenue_view
     )
 order by
-  s_suppkey;");
+  s_suppkey
+) TO 'test/answers/q15.csv' (HEADER, DELIMITER '|');
 
-call gpu_processing("select
+COPY (
+select
   p_brand,
   p_type,
   count(distinct ps_suppkey) as supplier_cnt,
@@ -442,9 +472,11 @@ order by
   supplier_cnt desc,
   p_brand,
   p_type,
-  p_size;");
+  p_size
+) TO 'test/answers/q16.csv' (HEADER, DELIMITER '|');
 
-call gpu_processing("select
+COPY (
+select
   sum(l_extendedprice) / 7.0 as avg_yearly
 from
   lineitem,
@@ -460,9 +492,11 @@ where
       lineitem
     where
       l_partkey = p_partkey
-  );");
+  )
+) TO 'test/answers/q17.csv' (HEADER, DELIMITER '|');
 
-call gpu_processing("select
+COPY (
+select
   c_name,
   c_custkey,
   o_orderkey,
@@ -495,9 +529,11 @@ group by
 order by
   o_totalprice desc,
   o_orderdate,
-  o_orderkey;");
+  o_orderkey
+) TO 'test/answers/q18.csv' (HEADER, DELIMITER '|');
 
-call gpu_processing("select
+COPY (
+select
   sum(l_extendedprice * (1 - l_discount)) as revenue
 from
   lineitem,
@@ -531,9 +567,11 @@ where
       and l_shipmode in (0, 1)
       and l_shipinstruct = 0
     )
-  );");
+  )
+) TO 'test/answers/q19.csv' (HEADER, DELIMITER '|');
 
-call gpu_processing("select
+COPY (
+select
   s_name,
   s_address
 from
@@ -568,9 +606,11 @@ where
   and s_nationkey = n_nationkey
   and n_name = 'CANADA'
   order by
-    s_name;");
+    s_name
+) TO 'test/answers/q20.csv' (HEADER, DELIMITER '|');
 
-call gpu_processing("select
+COPY (
+select
   s_name,
   count(*) as numwait
 from
@@ -608,9 +648,11 @@ group by
   s_name
 order by
   numwait desc,
-  s_name;");
+  s_name
+) TO 'test/answers/q21.csv' (HEADER, DELIMITER '|');
 
-call gpu_processing("select
+COPY (
+select
   cntrycode,
   count(*) as numcust,
   sum(c_acctbal) as totacctbal
@@ -643,4 +685,5 @@ from (
 group by
   cntrycode
 order by
-  cntrycode;");
+  cntrycode
+) TO 'test/answers/q22.csv' (HEADER, DELIMITER '|');

@@ -1,3 +1,134 @@
+# name: test/sql/sirius_queries.test
+# description: test TPC-H queries with GPU processing
+# group: [sirius]
+
+# Load required extensions
+require sirius
+
+require substrait
+
+# Load tpch data
+
+statement ok
+CREATE TABLE REGION  (
+    R_REGIONKEY  BIGINT NOT NULL UNIQUE PRIMARY KEY,
+    R_NAME       CHAR(25) NOT NULL,
+    R_COMMENT    VARCHAR(152),
+);
+
+statement ok
+CREATE TABLE NATION  (
+    N_NATIONKEY  BIGINT NOT NULL UNIQUE PRIMARY KEY,
+    N_NAME       CHAR(25) NOT NULL,
+    N_REGIONKEY  BIGINT NOT NULL,
+    N_COMMENT    VARCHAR(152),
+);
+
+statement ok
+CREATE TABLE PART  (
+    P_PARTKEY     BIGINT NOT NULL UNIQUE PRIMARY KEY,
+    P_NAME        VARCHAR(55) NOT NULL,
+    P_MFGR        BIGINT NOT NULL,
+    P_BRAND       BIGINT NOT NULL,
+    P_TYPE        BIGINT NOT NULL,
+    P_SIZE        BIGINT NOT NULL,
+    P_CONTAINER   BIGINT NOT NULL,
+    P_RETAILPRICE DOUBLE NOT NULL,
+    P_COMMENT     VARCHAR(23) NOT NULL,
+);
+
+statement ok
+CREATE TABLE SUPPLIER (
+    S_SUPPKEY     BIGINT NOT NULL UNIQUE PRIMARY KEY,
+    S_NAME        CHAR(25) NOT NULL,
+    S_ADDRESS     VARCHAR(40) NOT NULL,
+    S_NATIONKEY   BIGINT NOT NULL,
+    S_PHONE       CHAR(15) NOT NULL,
+    S_ACCTBAL     DOUBLE NOT NULL,
+    S_COMMENT     VARCHAR(101) NOT NULL,
+);
+
+statement ok
+CREATE TABLE PARTSUPP (
+    PS_PARTKEY     BIGINT NOT NULL,
+    PS_SUPPKEY     BIGINT NOT NULL,
+    PS_AVAILQTY    DOUBLE NOT NULL,
+    PS_SUPPLYCOST  DOUBLE  NOT NULL,
+    PS_COMMENT     VARCHAR(199) NOT NULL,
+    CONSTRAINT PS_PARTSUPPKEY UNIQUE(PS_PARTKEY, PS_SUPPKEY)
+);
+
+statement ok
+CREATE TABLE CUSTOMER (
+    C_CUSTKEY     BIGINT NOT NULL UNIQUE PRIMARY KEY,
+    C_NAME        VARCHAR(25) NOT NULL,
+    C_ADDRESS     VARCHAR(40) NOT NULL,
+    C_NATIONKEY   BIGINT NOT NULL,
+    C_PHONE       CHAR(15) NOT NULL,
+    C_ACCTBAL     DOUBLE NOT NULL,
+    C_MKTSEGMENT  BIGINT NOT NULL,
+    C_COMMENT     VARCHAR(117) NOT NULL,
+);
+
+statement ok
+CREATE TABLE ORDERS  (
+    O_ORDERKEY       BIGINT NOT NULL UNIQUE PRIMARY KEY,
+    O_CUSTKEY        BIGINT NOT NULL,
+    O_ORDERSTATUS    BIGINT NOT NULL,
+    O_TOTALPRICE     DOUBLE NOT NULL,
+    O_ORDERDATE      BIGINT NOT NULL,
+    O_ORDERPRIORITY  BIGINT NOT NULL,
+    O_CLERK          BIGINT NOT NULL,
+    O_SHIPPRIORITY   BIGINT NOT NULL,
+    O_COMMENT        VARCHAR(79) NOT NULL,
+);
+
+statement ok
+CREATE TABLE LINEITEM (
+    L_ORDERKEY    BIGINT NOT NULL,
+    L_PARTKEY     BIGINT NOT NULL,
+    L_SUPPKEY     BIGINT NOT NULL,
+    L_LINENUMBER  BIGINT NOT NULL,
+    L_QUANTITY    DOUBLE NOT NULL,
+    L_EXTENDEDPRICE  DOUBLE NOT NULL,
+    L_DISCOUNT    DOUBLE NOT NULL,
+    L_TAX         DOUBLE NOT NULL,
+    L_RETURNFLAG  BIGINT NOT NULL,
+    L_LINESTATUS  BIGINT NOT NULL,
+    L_SHIPDATE    BIGINT NOT NULL,
+    L_COMMITDATE  BIGINT NOT NULL,
+    L_RECEIPTDATE BIGINT NOT NULL,
+    L_SHIPINSTRUCT BIGINT NOT NULL,
+    L_SHIPMODE     BIGINT NOT NULL,
+    L_COMMENT      VARCHAR(44) NOT NULL,
+);
+
+statement ok
+COPY lineitem FROM 'dbgen/s1/lineitem.tbl' WITH (HEADER false, DELIMITER '|');
+
+statement ok
+COPY orders FROM 'dbgen/s1/orders.tbl' WITH (HEADER false, DELIMITER '|');
+
+statement ok
+COPY supplier FROM 'dbgen/s1/supplier.tbl' WITH (HEADER false, DELIMITER '|');
+
+statement ok
+COPY part FROM 'dbgen/s1/part.tbl' WITH (HEADER false, DELIMITER '|');
+
+statement ok
+COPY customer FROM 'dbgen/s1/customer.tbl' WITH (HEADER false, DELIMITER '|');
+
+statement ok
+COPY partsupp FROM 'dbgen/s1/partsupp.tbl' WITH (HEADER false, DELIMITER '|');
+
+statement ok
+COPY nation FROM 'dbgen/s1/nation.tbl' WITH (HEADER false, DELIMITER '|');
+
+statement ok
+COPY region FROM 'dbgen/s1/region.tbl' WITH (HEADER false, DELIMITER '|');
+
+# Q1
+query I
 call gpu_processing("select
   l_returnflag,
   l_linestatus,
@@ -19,7 +150,11 @@ group by
 order by
   l_returnflag,
   l_linestatus;");
+----
+<FILE>:test/answers/q1.csv
 
+#Q2
+query I
 call gpu_processing("select
   s_acctbal,
   s_name,
@@ -63,7 +198,11 @@ order by
   n_name,
   s_name,
   p_partkey");
-    
+----
+<FILE>:test/answers/q2.csv
+
+#Q3
+query I
 call gpu_processing("select
   l_orderkey,
   sum(l_extendedprice * (1 - l_discount)) as revenue,
@@ -86,7 +225,11 @@ group by
 order by
   revenue desc,
   o_orderdate");
+----
+<FILE>:test/answers/q3.csv
 
+#Q4
+query I
 call gpu_processing("select
   o_orderpriority,
   count(*) as order_count
@@ -108,7 +251,11 @@ group by
   o_orderpriority
 order by
   o_orderpriority;");
+----
+<FILE>:test/answers/q4.csv
 
+#Q5
+query I
 call gpu_processing("select
   n_name,
   sum(l_extendedprice * (1 - l_discount)) as revenue
@@ -133,7 +280,11 @@ group by
   n_name
 order by
   revenue desc;");
+----
+<FILE>:test/answers/q5.csv
 
+#Q6
+query I
 call gpu_processing("select
   sum(l_extendedprice * l_discount) as revenue
 from
@@ -143,7 +294,11 @@ where
   and l_shipdate <= 19941231
   and l_discount between 0.05 and 0.07
   and l_quantity < 24;");
+----
+<FILE>:test/answers/q6.csv
 
+#Q7
+query I
 call gpu_processing("select
   supp_nation,
   cust_nation,
@@ -182,7 +337,11 @@ order by
   supp_nation,
   cust_nation,
   l_year;");
+----
+<FILE>:test/answers/q7.csv
 
+#Q8
+query I
 call gpu_processing("select
   o_year,
   sum(case
@@ -220,7 +379,11 @@ group by
   o_year
 order by
   o_year;");
+----
+<FILE>:test/answers/q8.csv
 
+#Q9
+query I
 call gpu_processing("select
   nation,
   o_year,
@@ -252,7 +415,11 @@ group by
 order by
   nation,
   o_year desc;");
+----
+<FILE>:test/answers/q9.csv
 
+#Q10
+query I
 call gpu_processing("select
   c_custkey,
   c_name,
@@ -283,8 +450,13 @@ group by
   c_address,
   c_comment 
 order by
-  revenue desc;");
+  revenue desc,
+  c_acctbal;");
+----
+<FILE>:test/answers/q10.csv
 
+#Q11
+query I
 call gpu_processing("select
   *
 from (
@@ -318,7 +490,11 @@ where
 order by
   value desc,
   ps_partkey;");
+----
+<FILE>:test/answers/q11.csv
 
+#Q12
+query I
 call gpu_processing("select
   l_shipmode,
   sum(case
@@ -347,7 +523,11 @@ group by
   l_shipmode
 order by
   l_shipmode;");
+----
+<FILE>:test/answers/q12.csv
 
+#Q13
+query I
 call gpu_processing("select
   c_count,
   count(*) as custdist
@@ -368,7 +548,11 @@ group by
 order by
   custdist desc,
   c_count desc;");
+----
+<FILE>:test/answers/q13.csv
 
+#Q14
+query I
 call gpu_processing("select
     sum(case
     when (p_type >= 125 and p_type < 150)
@@ -382,7 +566,11 @@ where
   l_partkey = p_partkey
   and l_shipdate >= 19950901
   and l_shipdate <= 19950931;");
+----
+<FILE>:test/answers/q14.csv
 
+#Q15
+query I
 call gpu_processing("with revenue_view as (
   select
     l_suppkey as supplier_no,
@@ -395,7 +583,6 @@ call gpu_processing("with revenue_view as (
   group by
     l_suppkey
 )
-
 select
   s_suppkey,
   total_revenue
@@ -412,7 +599,11 @@ where
     )
 order by
   s_suppkey;");
+----
+<FILE>:test/answers/q15.csv
 
+#Q16
+query I
 call gpu_processing("select
   p_brand,
   p_type,
@@ -443,7 +634,11 @@ order by
   p_brand,
   p_type,
   p_size;");
+----
+<FILE>:test/answers/q16.csv
 
+#Q17
+query I
 call gpu_processing("select
   sum(l_extendedprice) / 7.0 as avg_yearly
 from
@@ -461,7 +656,11 @@ where
     where
       l_partkey = p_partkey
   );");
+----
+<FILE>:test/answers/q17.csv
 
+#Q18
+query I
 call gpu_processing("select
   c_name,
   c_custkey,
@@ -496,7 +695,11 @@ order by
   o_totalprice desc,
   o_orderdate,
   o_orderkey;");
+----
+<FILE>:test/answers/q18.csv
 
+#Q19
+query I
 call gpu_processing("select
   sum(l_extendedprice * (1 - l_discount)) as revenue
 from
@@ -532,7 +735,11 @@ where
       and l_shipinstruct = 0
     )
   );");
+----
+<FILE>:test/answers/q19.csv
 
+#Q20
+query I
 call gpu_processing("select
   s_name,
   s_address
@@ -569,7 +776,11 @@ where
   and n_name = 'CANADA'
   order by
     s_name;");
+----
+<FILE>:test/answers/q20.csv
 
+#Q21
+query I
 call gpu_processing("select
   s_name,
   count(*) as numwait
@@ -609,7 +820,11 @@ group by
 order by
   numwait desc,
   s_name;");
+----
+<FILE>:test/answers/q21.csv
 
+#Q22
+query I
 call gpu_processing("select
   cntrycode,
   count(*) as numcust,
@@ -644,3 +859,5 @@ group by
   cntrycode
 order by
   cntrycode;");
+----
+<FILE>:test/answers/q22.csv

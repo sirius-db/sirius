@@ -101,13 +101,6 @@ SiriusExtension::GPUCachingBind(ClientContext &context, TableFunctionBindInput &
 		throw BinderException("gpu_caching cannot be called with a NULL parameter");
 	}
 
-	// size_t cache_size_per_gpu = 2UL * 1024 * 1024 * 1024; // 10GB
-	// size_t processing_size_per_gpu = 2UL * 1024 * 1024 * 1024; //11GB
-	// size_t processing_size_per_cpu = 4UL * 1024 * 1024 * 1024; //16GB
-	// size_t cache_size_per_gpu = 120UL * 1024 * 1024 * 1024;
-	// size_t processing_size_per_gpu = 80UL * 1024 * 1024 * 1024;
-	// size_t processing_size_per_cpu = 120UL * 1024 * 1024 * 1024;
-	// result->gpuBufferManager = &(GPUBufferManager::GetInstance(cache_size_per_gpu, processing_size_per_gpu, processing_size_per_cpu));
 	result->gpuBufferManager = &(GPUBufferManager::GetInstance());
 
 	string input_string = input.inputs[0].ToString();
@@ -137,13 +130,8 @@ void SiriusExtension::GPUCachingFunction(ClientContext &context, TableFunctionIn
 	//get data in CPU buffer
 	string query = "SELECT " + data.column + " FROM " + data.table + ";";
 	cout << "Query: " << query << endl;
-	// string query = "SELECT l_orderkey FROM lineitem;";
 	auto cpu_res = data.conn->Query(query);
 	
-	//check if table exist in the catalog
-	//check if table already exist in the gpu buffer
-	//check if column exist in the catalog
-	//check if column already exist in the gpu buffer
 	auto &catalog_table = Catalog::GetCatalog(context, INVALID_CATALOG);
 	data.gpuBufferManager->createTableAndColumnInGPU(catalog_table, context, data.table, data.column);
 
