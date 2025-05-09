@@ -85,7 +85,7 @@ GPUBufferManager::GPUBufferManager(size_t cache_size_per_gpu, size_t processing_
     gpuCachingPointer = new size_t[NUM_GPUS];
     cpuProcessingPointer = 0;
 
-    out_file_ = std::ofstream("/home/abigale/sirius/build/malloc_trace.txt");
+    out_file_name_ = "/mnt/wiscdb/abigale/malloc_trace.txt";
 
     cuda_mr = new rmm::mr::cuda_memory_resource();
     mr = new rmm::mr::pool_memory_resource(cuda_mr, rmm::percent_of_free_device_memory(50));
@@ -185,8 +185,11 @@ GPUBufferManager::customCudaMalloc(size_t size, int gpu, bool caching) {
     // int alignment = alignof(double);
     int alignment = 256;
     alloc = alloc + (alignment - alloc % alignment);
+    std::cout << "Calling malloc\n";
 
     if (caching) {
+        std::cout << "hello\n";
+
         size_t start = __atomic_fetch_add(&gpuCachingPointer[gpu], alloc, __ATOMIC_RELAXED);
         assert((start + alloc) < cache_size_per_gpu);
         if (start + alloc >= cache_size_per_gpu) {
@@ -198,11 +201,15 @@ GPUBufferManager::customCudaMalloc(size_t size, int gpu, bool caching) {
         } 
 
         if (TRACING) {
-          out_file_ << "m " << ptr << " " << alloc << std::endl;
+          FILE *filePtr = fopen(out_file_name_.c_str(), "a");
+          void* addr = reinterpret_cast<void*>(ptr);
+          fprintf(filePtr, "mc %p %zu\n", addr, alloc);
+          fclose(filePtr);
         }
 
         return ptr;
     } else {
+        std::cout << "hello1\n";
         cudf::set_current_device_resource(mr);
         void* ptr = mr->allocate(alloc);
         // size_t start = __atomic_fetch_add(&gpuProcessingPointer[gpu], alloc, __ATOMIC_RELAXED);
@@ -225,7 +232,11 @@ GPUBufferManager::customCudaMalloc(size_t size, int gpu, bool caching) {
         allocation_table[gpu][ptr] = alloc;
 
         if (TRACING) {
-          out_file_ << "m " << ptr << " " << alloc << std::endl;
+          std::cout << "starting trace " << ptr << std::endl;
+          FILE *filePtr = fopen(out_file_name_.c_str(), "a");
+          void* addr = reinterpret_cast<void*>(ptr);
+          fprintf(filePtr, "m %p %zu\n", addr, alloc);
+          fclose(filePtr);
         }
 
         return reinterpret_cast<T*>(ptr);
@@ -289,21 +300,33 @@ template <typename T>
 void
 GPUBufferManager::customCudaFree(T* ptr, size_t size, int gpu) {
     //check if ptr is not in gpuCaching
+    bool caching = true;
     uint8_t* ptr_uint8 = reinterpret_cast<uint8_t*>(ptr);
     if (ptr_uint8 != nullptr && (ptr_uint8 < gpuCache[gpu] && ptr_uint8 >= gpuCache[gpu] + cache_size_per_gpu)) {
         mr->deallocate((void*) ptr, size * sizeof(T));
+        caching = false;
     }
 
+    std::cout << "Calling free\n";
     if (TRACING) {
-      out_file_ << "f " << ptr << " " << size << std::endl;
+      FILE *filePtr = fopen(out_file_name_.c_str(), "a");
+      void* addr = reinterpret_cast<void*>(ptr);
+      if (caching) {
+        fprintf(filePtr, "fc %p\n", addr);
+      } else {
+        fprintf(filePtr, "f %p\n", addr);
+      }
+      fclose(filePtr);
     }
 };
 
 void
 GPUBufferManager::customCudaFree(uint8_t* ptr, int gpu) {
     //check if ptr is not in gpuCaching
+    bool caching = true;
     cudf::set_current_device_resource(mr);
     if (ptr != nullptr && (ptr < gpuCache[gpu] || ptr >= gpuCache[gpu] + cache_size_per_gpu)) {
+        caching = false;
         auto it = allocation_table[gpu].find(reinterpret_cast<void*>(ptr));
         if (it != allocation_table[gpu].end()) {
             // printf("Deallocating Pointer %p size %ld\n", ptr, it->second);
@@ -318,9 +341,16 @@ GPUBufferManager::customCudaFree(uint8_t* ptr, int gpu) {
         }
     }
 
-    // is this right?
+    std::cout << "Calling free1\n";
     if (TRACING) {
-      out_file_ << "f " << ptr << " " << 256 << std::endl;
+      FILE *filePtr = fopen(out_file_name_.c_str(), "a");
+      void* addr = reinterpret_cast<void*>(ptr);
+      if (caching) {
+        fprintf(filePtr, "fc %p\n", addr);
+      } else {
+        fprintf(filePtr, "f %p\n", addr);
+      }
+      fclose(filePtr);
     }
 }
 

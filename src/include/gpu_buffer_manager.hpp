@@ -10,6 +10,9 @@
 #include <fstream>
 #include <iostream>
 
+#include <cinttypes>
+#include <cstdlib>
+
 namespace duckdb {
 
 // Declaration of the CUDA kernel
@@ -92,7 +95,7 @@ private:
     // Private constructor
    	GPUBufferManager(size_t cache_size_per_gpu, size_t processing_size_per_gpu, size_t processing_size_per_cpu);
     ~GPUBufferManager();
-  std::ofstream out_file_;
+    std::string out_file_name_;
 };
 
 
