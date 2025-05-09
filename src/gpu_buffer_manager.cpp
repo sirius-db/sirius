@@ -198,7 +198,7 @@ GPUBufferManager::customCudaMalloc(size_t size, int gpu, bool caching) {
         } 
 
         if (TRACING) {
-          out_file_ << "m " << ptr << " " << alloc;
+          out_file_ << "m " << ptr << " " << alloc << std::endl;
         }
 
         return ptr;
@@ -225,7 +225,7 @@ GPUBufferManager::customCudaMalloc(size_t size, int gpu, bool caching) {
         allocation_table[gpu][ptr] = alloc;
 
         if (TRACING) {
-          out_file_ << "m " << ptr << " " << alloc;
+          out_file_ << "m " << ptr << " " << alloc << std::endl;
         }
 
         return reinterpret_cast<T*>(ptr);
@@ -295,7 +295,7 @@ GPUBufferManager::customCudaFree(T* ptr, size_t size, int gpu) {
     }
 
     if (TRACING) {
-      out_file_ << "f " << ptr << " " << size;
+      out_file_ << "f " << ptr << " " << size << std::endl;
     }
 };
 
@@ -320,7 +320,7 @@ GPUBufferManager::customCudaFree(uint8_t* ptr, int gpu) {
 
     // is this right?
     if (TRACING) {
-      out_file_ << "f " << ptr << " " << 256;
+      out_file_ << "f " << ptr << " " << 256 << std::endl;
     }
 }
 
