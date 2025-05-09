@@ -16,6 +16,8 @@
 namespace duckdb {
 
 // Declaration of the CUDA kernel
+void doubleRoundExpression(double *a, double *result, int decimal_places, uint64_t N);
+void floatRoundExpression(float *a, float *result, int decimal_places, uint64_t N);
 template <typename T> void binaryExpression(T *a, T *b, T *result, uint64_t N, int op_mode);
 template <typename T> void binaryConstantExpression(T *a, T b, T *result, uint64_t N, int op_mode);
 template <typename T> void comparisonConstantExpression(T *a, T b, T c, uint64_t* &row_ids, uint64_t* &count, uint64_t N, int op_mode);
@@ -65,6 +67,8 @@ public:
 
     bool HandlingSpecificProjection(GPUIntermediateRelation& input_relation, GPUIntermediateRelation& output_relation, Expression& expression, int output_idx);
     bool HandlingSpecificFilter(GPUIntermediateRelation& input_relation, GPUIntermediateRelation& output_relation, Expression& expression);
+
+    GPUColumn* HandleRoundExpression(GPUColumn* column, int decimal_places);
 
 };
 

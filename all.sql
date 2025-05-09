@@ -62,8 +62,7 @@ order by
   s_acctbal desc,
   n_name,
   s_name,
-  p_partkey 
-limit 100");
+  p_partkey");
     
 call gpu_processing("select
   l_orderkey,
@@ -86,8 +85,7 @@ group by
   o_shippriority
 order by
   revenue desc,
-  o_orderdate
-limit 10");
+  o_orderdate");
 
 call gpu_processing("select
   o_orderpriority,
@@ -318,7 +316,8 @@ where
       and n_name = 'GERMANY'
   )
 order by
-  value desc;");
+  value desc,
+  ps_partkey;");
 
 call gpu_processing("select
   l_shipmode,

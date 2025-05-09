@@ -198,6 +198,29 @@ GPUExpressionExecutor::HandleComparisonExpression(GPUColumn* column1, GPUColumn*
     }
 }
 
+GPUColumn*
+GPUExpressionExecutor::HandleRoundExpression(GPUColumn* column, int decimal_places) {
+    GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+    switch(column->data_wrapper.type) {
+      case ColumnType::FLOAT32: {
+        float* a = reinterpret_cast<float*> (column->data_wrapper.data);
+        size_t size = column->column_length;
+        float* c = gpuBufferManager->customCudaMalloc<float>(size, 0, 0);
+        floatRoundExpression(a, c, decimal_places, size);
+        GPUColumn* result = new GPUColumn(size, column->data_wrapper.type, reinterpret_cast<uint8_t*>(c));
+        return result;
+      } case ColumnType::FLOAT64: {
+        double* a = reinterpret_cast<double*> (column->data_wrapper.data);
+        size_t size = column->column_length;
+        double* c = gpuBufferManager->customCudaMalloc<double>(size, 0, 0);
+        doubleRoundExpression(a, c, decimal_places, size);
+        GPUColumn* result = new GPUColumn(size, column->data_wrapper.type, reinterpret_cast<uint8_t*>(c));
+        return result;
+      } default:
+        throw NotImplementedException("Unsupported column type");
+    }
+}
+
 void 
 GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_relation, GPUIntermediateRelation& output_relation, Expression& expr, int depth) {
     
@@ -482,6 +505,12 @@ GPUExpressionExecutor::ProjectionRecursiveExpression(GPUIntermediateRelation& in
                   uint64_t length = bound_ref3.value.GetValue<uint64_t>();
                   GPUColumn* materialized_column = HandleMaterializeExpression(input_column, bound_ref1, gpuBufferManager);
                   result = HandleSubString(materialized_column, start_idx, length);
+              } else if (bound_function.ToString().find("round") != std::string::npos) {
+                  auto &bound_ref = bound_function.children[0]->Cast<BoundReferenceExpression>();
+                  auto &bound_const = bound_function.children[1]->Cast<BoundConstantExpression>();
+                  int decimal_places = bound_const.value.GetValue<int>();
+                  GPUColumn* materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref.index], bound_ref, gpuBufferManager);
+                  result = HandleRoundExpression(materialized_column, decimal_places);
               } else if (bound_function.children[1]->expression_class == ExpressionClass::BOUND_CONSTANT) {
                   auto &bound_ref1 = bound_function.children[0]->Cast<BoundReferenceExpression>();
                   auto &bound_ref2 = bound_function.children[1]->Cast<BoundConstantExpression>();
