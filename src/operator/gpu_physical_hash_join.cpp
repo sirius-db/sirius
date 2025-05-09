@@ -263,6 +263,7 @@ GPUPhysicalHashJoin::GPUPhysicalHashJoin(LogicalOperator &op, unique_ptr<GPUPhys
 
 	// For ANTI, SEMI and MARK join, we only need to store the keys, so for these the payload/RHS types are empty
 	if (join_type == JoinType::ANTI || join_type == JoinType::SEMI || join_type == JoinType::MARK) {
+		materialized_build_key = new GPUIntermediateRelation(build_columns_in_conditions.size());
 		hash_table_result = new GPUIntermediateRelation(build_columns_in_conditions.size());
 		return;
 	}
@@ -298,7 +299,7 @@ GPUPhysicalHashJoin::GPUPhysicalHashJoin(LogicalOperator &op, unique_ptr<GPUPhys
 	printf("rhs_output_columns.size() = %ld\n", rhs_output_columns.col_idxs.size());
 	printf("lhs_output_columns.size() = %ld\n", lhs_output_columns.col_idxs.size());
 	hash_table_result = new GPUIntermediateRelation(build_columns_in_conditions.size() + payload_columns.col_idxs.size());
-
+	materialized_build_key = new GPUIntermediateRelation(build_columns_in_conditions.size());
 };
 
 // SourceResultType
@@ -633,6 +634,7 @@ GPUPhysicalHashJoin::Sink(GPUIntermediateRelation &input_relation) const {
         auto join_key_index = condition.right->Cast<BoundReferenceExpression>().index;
 		printf("Passing column idx %d from input relation to index %ld in RHS hash table\n", join_key_index, cond_idx);
 		hash_table_result->columns[cond_idx] = input_relation.columns[join_key_index];
+		materialized_build_key->columns[cond_idx] = build_keys[cond_idx];
 		right_idx++;
 	}
 
