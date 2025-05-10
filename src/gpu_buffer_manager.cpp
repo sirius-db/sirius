@@ -582,7 +582,6 @@ void GPUBufferManager::deleteExchangeTable(const string& table_name) {
     if (table_it == tables.end()) {
         throw InternalException("`deleteExchangeTable` failed, table '%s' not found in `tables`", table_name);
     }
-    delete table_it->second;
     tables.erase(table_it);
 }
 
