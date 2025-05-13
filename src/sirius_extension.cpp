@@ -31,6 +31,8 @@
 
 namespace duckdb {
 
+bool SiriusExtension::buffer_is_initialized = false;
+
 struct GPUTableFunctionData : public TableFunctionData {
 	GPUTableFunctionData() = default;
 	shared_ptr<Relation> plan;
@@ -57,11 +59,6 @@ struct GPUCachingFunctionData : public TableFunctionData {
 
 void do_nothing_context(ClientContext *) {
 }
-
-// shared_ptr<Relation> GPUSubstraitPlanToDuckDBRel(Connection &conn, const string &serialized, bool json = false) {
-// 	SubstraitToDuckDB transformer_s2d(conn, serialized, json);
-// 	return transformer_s2d.TransformPlan();
-// };
 
 //This function is used to extract the query plan from the SQL query
 unique_ptr<LogicalOperator> SiriusInitPlanExtractor(ClientContext& context, GPUTableFunctionData &data, Connection &new_conn) {
@@ -124,6 +121,11 @@ SiriusExtension::GPUCachingBind(ClientContext &context, TableFunctionBindInput &
 void SiriusExtension::GPUCachingFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
 	auto &data = (GPUCachingFunctionData &)*data_p.bind_data;
 	if (data.finished) {
+		return;
+	}
+
+	if (!buffer_is_initialized) {
+		printf("GPUBufferManager not initialized, please call gpu_buffer_init first\n");
 		return;
 	}
 
@@ -208,6 +210,10 @@ void SiriusExtension::GPUProcessingFunction(ClientContext &context, TableFunctio
 		if (data.plan_error) {
 			printf("=============================================\nError in GPUExecuteQuery, fallback to DuckDB\n=============================================\n");
 			data.res = data.conn->Query(data.query);
+		} else if (!buffer_is_initialized) {
+			printf("\033[1;31m"); printf("GPUBufferManager not initialized, please call gpu_buffer_init first\n"); printf("\033[0m");
+			printf("=============================================\nError in GPUExecuteQuery, fallback to DuckDB\n=============================================\n");
+			data.res = data.conn->Query(data.query);
 		} else {
 			data.res = data.gpu_context->GPUExecuteQuery(context, data.query, data.gpu_prepared, {});
 			if (data.res->HasError()) {
@@ -220,24 +226,11 @@ void SiriusExtension::GPUProcessingFunction(ClientContext &context, TableFunctio
 		printf("Execute query time: %.2f ms\n", duration.count()/1000.0);
 	}
 
-	// data.finished = true;
-	// printf("Fetching chunk first\n");
-	// auto start = std::chrono::high_resolution_clock::now();
 	auto result_chunk = data.res->Fetch();
 	if (!result_chunk) {
-		// printf("Not doing anything\n");
 		return;
 	}
-	// output.Move(*result_chunk);
-	// while (result_chunk) {
-		// printf("Fetching chunk %d\n", result_chunk->size());
-		output.Move(*result_chunk);
-		// result_chunk = data.res->Fetch();
-	// }
-	// printf("Finished Fetching chunk\n");
-	// auto end = std::chrono::high_resolution_clock::now();
-	// auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-	// printf("Fetching time: %.2f ms\n", duration.count()/1000.0);
+	output.Move(*result_chunk);
 	return;
 }
 
@@ -323,10 +316,15 @@ void SiriusExtension::GPUProcessingSubstraitFunction(ClientContext &context, Tab
 	if (data.finished) {
 		return;
 	}
-
 	if (!data.res) {
 		auto start = std::chrono::high_resolution_clock::now();
 		if (data.plan_error) {
+			printf("=============================================\nError in GPUExecuteQuery, fallback to DuckDB\n=============================================\n");
+			auto con = Connection(*context.db);
+			data.plan->context = make_shared_ptr<ClientContextWrapper>(con.context);
+			data.res = data.plan->Execute();
+		} else if (!buffer_is_initialized) {
+			printf("\033[1;31m"); printf("GPUBufferManager not initialized, please call gpu_buffer_init first\n"); printf("\033[0m");
 			printf("=============================================\nError in GPUExecuteQuery, fallback to DuckDB\n=============================================\n");
 			auto con = Connection(*context.db);
 			data.plan->context = make_shared_ptr<ClientContextWrapper>(con.context);
@@ -353,24 +351,106 @@ void SiriusExtension::GPUProcessingSubstraitFunction(ClientContext &context, Tab
 	return;
 }
 
+struct GPUBufferInitFunctionData : public TableFunctionData {
+	GPUBufferInitFunctionData() {
+	}
+	bool finished = false;
+	size_t cache_size;
+	size_t processing_size;
+};
+
+unique_ptr<FunctionData> 
+SiriusExtension::GPUBufferInitBind(ClientContext &context, TableFunctionBindInput &input,
+                                                  vector<LogicalType> &return_types, vector<string> &names) {
+	auto result = make_uniq<GPUBufferInitFunctionData>();
+
+	string gpu_cache_size = input.inputs[0].ToString();
+	string gpu_processing_size = input.inputs[1].ToString();
+
+	//parsing 2GB or 2GiB to size_t
+	// Function to parse size strings like "2GB" or "2GiB" to size_t
+	auto parse_size = [](const string &size_str) -> size_t {
+		size_t result = 0;
+		size_t multiplier = 1;
+		string num_part;
+		string unit_part;
+
+		size_t i = 0;
+		// Skip any whitespace between number and unit
+		while (i < size_str.length() && isspace(size_str[i])) {
+			i++;
+		}
+
+		// Find where the number ends and unit begins
+		while (i < size_str.length() && (isdigit(size_str[i]) || size_str[i] == '.')) {
+			num_part += size_str[i];
+			i++;
+		}
+		
+		// Skip any whitespace between number and unit
+		while (i < size_str.length() && isspace(size_str[i])) {
+			i++;
+		}
+		
+		// Extract unit part
+		unit_part = size_str.substr(i);
+
+		// Convert number part to double
+		double num_value = stod(num_part);
+		
+		// Determine multiplier based on unit
+		if (unit_part == "B") {
+			multiplier = 1;
+		} else if (unit_part == "KB" || unit_part == "KiB") {
+			multiplier = 1024;
+		} else if (unit_part == "MB" || unit_part == "MiB") {
+			multiplier = 1024 * 1024;
+		} else if (unit_part == "GB" || unit_part == "GiB") {
+			multiplier = 1024 * 1024 * 1024;
+		} else if (unit_part == "TB" || unit_part == "TiB") {
+			multiplier = 1024ULL * 1024ULL * 1024ULL * 1024ULL;
+		} else {
+			throw InvalidInputException("Invalid format");
+		}
+		
+		result = (size_t)(num_value * multiplier);
+		return result;
+	};
+
+	// Parse the input sizes
+	result->cache_size = parse_size(gpu_cache_size);
+	result->processing_size = parse_size(gpu_processing_size);
+
+	auto type = LogicalType(LogicalTypeId::BOOLEAN);
+	return_types.emplace_back(type);
+	names.emplace_back("Success");
+	return std::move(result);
+}
+
+void 
+SiriusExtension::GPUBufferInitFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &data = data_p.bind_data->CastNoConst<GPUBufferInitFunctionData>();
+	if (data.finished) {
+		return;
+	}
+
+	size_t cache_size = data.cache_size;
+	size_t processing_size = data.processing_size;
+	if (!buffer_is_initialized) {
+		GPUBufferManager *gpuBufferManager = &(GPUBufferManager::GetInstance(cache_size, processing_size, processing_size));
+		buffer_is_initialized = true;
+	} else {
+		printf("GPUBufferManager already initialized\n");
+	}
+	data.finished = true;
+}
+
 void SiriusExtension::InitializeGPUExtension(Connection &con) {
 	auto &catalog = Catalog::GetSystemCatalog(*con.context);
-	// auto &catalog_table = Catalog::GetCatalog(*con.context, INVALID_CATALOG);
-	// string name = catalog_table.GetName();
-	// printf("catalog name %s\n", catalog_table.GetName().c_str());
 
-	// auto &schema = catalog_table.GetSchema(*con.context, DEFAULT_SCHEMA);
-	// string schema_name = schema.name;
-	// printf("schema name %s\n", schema.name.c_str());
-
-	// auto duck_schema = schema.Cast<DuckSchemaEntry>();
-
-	// TableCatalogEntry &table = catalog_table.GetEntry(*con.context, CatalogType::TABLE_ENTRY, schema_name, "lineitem").Cast<TableCatalogEntry>();
-	// printf("%s\n", table.name.c_str());
-
-	// for (auto &column_name : table.GetColumns().GetColumnNames()) {
-	// 	printf("column name %s\n", column_name.c_str());
-	// }
+	TableFunction gpu_buffer_init("gpu_buffer_init", {LogicalType::VARCHAR, LogicalType::VARCHAR}, GPUBufferInitFunction, GPUBufferInitBind);
+	CreateTableFunctionInfo gpu_buffer_init_info(gpu_buffer_init);
+	catalog.CreateTableFunction(*con.context, gpu_buffer_init_info);
 
 	TableFunction gpu_caching("gpu_caching", {LogicalType::VARCHAR}, GPUCachingFunction, GPUCachingBind);
 	CreateTableFunctionInfo gpu_caching_info(gpu_caching);
@@ -389,10 +469,10 @@ void SiriusExtension::InitializeGPUExtension(Connection &con) {
 	// size_t cache_size_per_gpu = 100UL * 1024 * 1024 * 1024; // 10GB
 	// size_t processing_size_per_gpu = 80UL * 1024 * 1024 * 1024; //11GB
 	// size_t processing_size_per_cpu = 100UL * 1024 * 1024 * 1024; //16GB
-	size_t cache_size_per_gpu = 10UL * 1024 * 1024 * 1024; // 10GB
-	size_t processing_size_per_gpu = 11UL * 1024 * 1024 * 1024; //11GB
-	size_t processing_size_per_cpu = 16UL * 1024 * 1024 * 1024; //16GB
-	GPUBufferManager *gpuBufferManager = &(GPUBufferManager::GetInstance(cache_size_per_gpu, processing_size_per_gpu, processing_size_per_cpu));
+	// size_t cache_size_per_gpu = 10UL * 1024 * 1024 * 1024; // 10GB
+	// size_t processing_size_per_gpu = 11UL * 1024 * 1024 * 1024; //11GB
+	// size_t processing_size_per_cpu = 16UL * 1024 * 1024 * 1024; //16GB
+	// GPUBufferManager *gpuBufferManager = &(GPUBufferManager::GetInstance(cache_size_per_gpu, processing_size_per_gpu, processing_size_per_cpu));
 
 }
 

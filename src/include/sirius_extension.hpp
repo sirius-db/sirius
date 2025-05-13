@@ -21,6 +21,10 @@ public:
 	static unique_ptr<FunctionData> GPUProcessingSubstraitBind(ClientContext &context, TableFunctionBindInput &input, vector<LogicalType> &return_types, vector<string> &names);
 	static unique_ptr<FunctionData> GPUProcessingBind(ClientContext &context, TableFunctionBindInput &input, vector<LogicalType> &return_types, vector<string> &names);
 	static unique_ptr<FunctionData> GPUCachingBind(ClientContext &context, TableFunctionBindInput &input, vector<LogicalType> &return_types, vector<string> &names);
+	static void GPUBufferInitFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output);
+	static unique_ptr<FunctionData> GPUBufferInitBind(ClientContext &context, TableFunctionBindInput &input, vector<LogicalType> &return_types, vector<string> &names);
+
+	static bool buffer_is_initialized;
 };
 
 } // namespace duckdb
