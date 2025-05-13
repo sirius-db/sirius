@@ -65,6 +65,12 @@ GPUBufferManager::customCudaHostAlloc<char>(size_t size);
 template string_t*
 GPUBufferManager::customCudaHostAlloc<string_t>(size_t size);
 
+template GPUColumn*
+GPUBufferManager::customCudaHostAlloc<GPUColumn>(size_t size);
+
+template GPUIntermediateRelation*
+GPUBufferManager::customCudaHostAlloc<GPUIntermediateRelation>(size_t size);
+
 GPUBufferManager::GPUBufferManager(size_t cache_size_per_gpu, size_t processing_size_per_gpu, size_t processing_size_per_cpu) : 
     cache_size_per_gpu(cache_size_per_gpu), processing_size_per_gpu(processing_size_per_gpu), processing_size_per_cpu(processing_size_per_cpu) {
     printf("Initializing GPU buffer manager\n");
@@ -74,10 +80,12 @@ GPUBufferManager::GPUBufferManager(size_t cache_size_per_gpu, size_t processing_
     gpuProcessingPointer = new size_t[NUM_GPUS];
     gpuCachingPointer = new size_t[NUM_GPUS];
     cpuProcessingPointer = 0;
-    std::cout << "Allocated CPU pinned memory of capacity " << processing_size_per_cpu << std::endl;
 
     cuda_mr = new rmm::mr::cuda_memory_resource();
-    mr = new rmm::mr::pool_memory_resource(cuda_mr, rmm::percent_of_free_device_memory(50));
+    // mr = new rmm::mr::pool_memory_resource(cuda_mr, rmm::percent_of_free_device_memory(50));
+    printf("Allocating cache size %zu in GPU 0\n", cache_size_per_gpu);
+    printf("Allocating processing size %zu in GPU 0\n", processing_size_per_gpu);
+    mr = new rmm::mr::pool_memory_resource(cuda_mr, processing_size_per_gpu, processing_size_per_cpu);
     cudf::set_current_device_resource(mr);
     allocation_table.resize(NUM_GPUS);
     locked_allocation_table.resize(NUM_GPUS);
@@ -103,6 +111,80 @@ GPUBufferManager::~GPUBufferManager() {
     freePinnedCPUMemory(cpuProcessing);
     delete[] gpuProcessingPointer;
     delete[] gpuCachingPointer;
+}
+
+GPUColumn*
+GPUBufferManager::newGPUColumn(string name, size_t column_length, ColumnType type, uint8_t* data, bool is_cached) {
+    if (is_cached) {
+        return new GPUColumn(name, column_length, type, data);
+    } else {
+        GPUColumn* column = customCudaHostAlloc<GPUColumn>(1);
+        column->name = name;
+        column->column_length = column_length;
+        column->data_wrapper = DataWrapper(type, data, column_length);
+        column->row_ids = nullptr;
+        column->data_wrapper.offset = nullptr;
+        column->data_wrapper.num_bytes = column_length * column->data_wrapper.getColumnTypeSize();
+        column->is_unique = false;
+        return column;
+    }
+}
+
+shared_ptr<GPUColumn>
+GPUBufferManager::newGPUColumn(string name, size_t column_length, ColumnType type, uint8_t* data, uint64_t* offset, size_t num_bytes, bool is_string_data, bool is_cached) {
+    if (is_cached) {
+        return new GPUColumn(name, column_length, type, data, offset, num_bytes, is_string_data);
+    } else {
+        GPUColumn* column = customCudaHostAlloc<GPUColumn>(1);
+        use shared pointer
+        shared_ptr<GPUColumn> column = make_shared<GPUColumn>(name, column_length, type, data, offset, num_bytes, is_string_data);
+        column->name = name;
+        column->column_length = column_length;
+        column->data_wrapper = DataWrapper(type, data, offset, column_length, num_bytes, is_string_data);
+        column->row_ids = nullptr;
+        if (is_string_data) {
+            column->data_wrapper.num_bytes = num_bytes;
+        } else {
+            column->data_wrapper.num_bytes = column_length * column->data_wrapper.getColumnTypeSize();
+        }
+        column->is_unique = false;
+        return column;
+    }
+}
+
+shared_ptr<GPUColumn>
+GPUBufferManager::newGPUColumn(size_t column_length, ColumnType type, uint8_t* data, bool is_cached) {
+    if (is_cached) {
+        return new GPUColumn(column_length, type, data);
+    } else {
+        GPUColumn* column = customCudaHostAlloc<GPUColumn>(1);
+        column->column_length = column_length;
+        column->data_wrapper = DataWrapper(type, data, column_length);
+        column->row_ids = nullptr;
+        column->data_wrapper.offset = nullptr;
+        column->data_wrapper.num_bytes = column_length * column->data_wrapper.getColumnTypeSize();
+        column->is_unique = false;
+        return column;
+    }
+}
+
+GPUColumn*
+GPUBufferManager::newGPUColumn(size_t column_length, ColumnType type, uint8_t* data, uint64_t* offset, size_t num_bytes, bool is_string_data, bool is_cached) {
+    if (is_cached) {
+        return new GPUColumn(column_length, type, data, offset, num_bytes, is_string_data);
+    } else {
+        GPUColumn* column = customCudaHostAlloc<GPUColumn>(1);
+        column->column_length = column_length;
+        column->data_wrapper = DataWrapper(type, data, offset, column_length, num_bytes, is_string_data);
+        column->row_ids = nullptr;
+        if (is_string_data) {
+            column->data_wrapper.num_bytes = num_bytes;
+        } else {
+            column->data_wrapper.num_bytes = column_length * column->data_wrapper.getColumnTypeSize();
+        }
+        column->is_unique = false;
+        return column;
+    }
 }
 
 void GPUBufferManager::ResetBuffer() {

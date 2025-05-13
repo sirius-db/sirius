@@ -127,6 +127,9 @@ COPY nation FROM 'dbgen/s1/nation.tbl' WITH (HEADER false, DELIMITER '|');
 statement ok
 COPY region FROM 'dbgen/s1/region.tbl' WITH (HEADER false, DELIMITER '|');
 
+statement ok
+call gpu_buffer_init("1 GB", "1 GB");
+
 # Q1
 query I
 call gpu_processing("select

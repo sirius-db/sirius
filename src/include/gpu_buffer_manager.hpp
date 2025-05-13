@@ -107,6 +107,11 @@ public:
 	bool checkIfColumnCached(string table_name, string column_name);
 	GPUColumn* copyDataFromcuDFColumn(cudf::column_view& column, int gpu);
 
+	GPUColumn* newGPUColumn(size_t column_length, ColumnType type, uint8_t* data, bool is_cached);
+	GPUColumn* newGPUColumn(size_t column_length, ColumnType type, uint8_t* data, uint64_t* offset, size_t num_bytes, bool is_string_data, bool is_cached);
+	GPUColumn* newGPUColumn(string name, size_t column_length, ColumnType type, uint8_t* data, bool is_cached);
+	GPUColumn* newGPUColumn(string name, size_t column_length, ColumnType type, uint8_t* data, uint64_t* offset, size_t num_bytes, bool is_string_data, bool is_cached);
+
 	std::vector<std::unique_ptr<rmm::device_buffer>> rmm_stored_buffers;
 
 	//create an allocation table that keep tracks of the allocation of the memory, it stores the pointer, size, and the gpu id

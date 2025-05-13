@@ -192,49 +192,6 @@ GPUColumn::setFromCudfColumn(cudf::column& cudf_column, bool _is_unique, int32_t
         data_wrapper.offset = nullptr;
     }
 
-
-    //TODO: UNSAFE const_cast
-    // data_wrapper.data = const_cast<uint8_t*>(cudf_owned_column->data<uint8_t>());
-    // data_wrapper.size = cudf_owned_column->size();
-    // column_length = data_wrapper.size;
-    // is_unique = _is_unique;
-
-    // if (cudf_owned_column->type() == cudf::data_type(cudf::type_id::STRING)) {
-    //     data_wrapper.is_string_data = true;
-    //     data_wrapper.type = ColumnType::VARCHAR;
-    //     auto temp_offset = const_cast<int32_t*>(cudf_owned_column->child(0).data<int32_t>());
-    //     convertCudfOffsetToSiriusOffset(temp_offset);
-    //     //copy data from offset to num_bytes
-    //     uint64_t* temp_num_bytes = new uint64_t[1];
-    //     callCudaMemcpyDeviceToHost<uint64_t>(temp_num_bytes, data_wrapper.offset + column_length, 1, 0);
-    //     data_wrapper.num_bytes = temp_num_bytes[0];
-    // } else if (cudf_owned_column->type() == cudf::data_type(cudf::type_id::UINT64)) {
-    //     data_wrapper.is_string_data = false;
-    //     data_wrapper.type = ColumnType::INT64;
-    //     data_wrapper.num_bytes = cudf_owned_column->size() * data_wrapper.getColumnTypeSize();
-    //     data_wrapper.offset = nullptr;
-    // } else if (cudf_owned_column->type() == cudf::data_type(cudf::type_id::INT32)) {
-    //     data_wrapper.is_string_data = false;
-    //     data_wrapper.type = ColumnType::INT32;
-    //     data_wrapper.num_bytes = cudf_owned_column->size() * data_wrapper.getColumnTypeSize();
-    //     data_wrapper.offset = nullptr;
-    // } else if (cudf_owned_column->type() == cudf::data_type(cudf::type_id::FLOAT32)) {
-    //     data_wrapper.is_string_data = false;
-    //     data_wrapper.type = ColumnType::FLOAT32;
-    //     data_wrapper.num_bytes = cudf_owned_column->size() * data_wrapper.getColumnTypeSize();
-    //     data_wrapper.offset = nullptr;
-    // } else if (cudf_owned_column->type() == cudf::data_type(cudf::type_id::FLOAT64)) {
-    //     data_wrapper.is_string_data = false;
-    //     data_wrapper.type = ColumnType::FLOAT64;
-    //     data_wrapper.num_bytes = cudf_owned_column->size() * data_wrapper.getColumnTypeSize();
-    //     data_wrapper.offset = nullptr;
-    // } else if (cudf_owned_column->type() == cudf::data_type(cudf::type_id::BOOL8)) {
-    //     data_wrapper.is_string_data = false;
-    //     data_wrapper.type = ColumnType::BOOLEAN;
-    //     data_wrapper.num_bytes = cudf_owned_column->size() * data_wrapper.getColumnTypeSize();
-    //     data_wrapper.offset = nullptr;
-    // }
-
     if (_row_ids != nullptr) {
         convertCudfRowIdsToSiriusRowIds(_row_ids);
         row_id_count = _row_id_count;
