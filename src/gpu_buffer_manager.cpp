@@ -4,10 +4,69 @@
 #include "duckdb/parser/constraints/unique_constraint.hpp"
 #include "utils.hpp"
 
+// for tracing
+#include <execinfo.h>
+#include <cxxabi.h>
+
 #define NUM_GPUS 1
 #define TRACING true
 
 namespace duckdb {
+
+void log_caller() {
+  // Does not print debugging info, just assembly addresses
+  void* buffer[10];
+  int nptrs = backtrace(buffer, 10);
+  char** symbols = backtrace_symbols(buffer, nptrs);
+
+  if (nptrs >= 2) {
+    printf("Called from: %s\n", symbols[2]);
+  }
+
+  free(symbols);
+}
+
+std::string get_caller_function_name(int stack_frames_to_skip = 1) {
+  const int max_frames = 10;
+  void* callstack[max_frames];
+  int frames = backtrace(callstack, max_frames);
+  
+  if (frames <= stack_frames_to_skip + 1) {
+      return "unknown";
+  }
+  
+  char** symbols = backtrace_symbols(callstack, frames);
+  if (!symbols) {
+      return "unknown";
+  }
+  
+  int caller_frame = 1 + stack_frames_to_skip;
+  if (caller_frame >= frames) {
+      free(symbols);
+      return "unknown";
+  }
+  
+  std::string caller = symbols[caller_frame];
+  free(symbols);
+  
+  size_t begin = caller.find('(');
+  size_t end = caller.find('+', begin);
+  
+  if (begin != std::string::npos && end != std::string::npos) {
+    std::string mangled = caller.substr(begin + 1, end - begin - 1);
+    int status;
+    std::unique_ptr<char, void(*)(void*)> demangled(
+        abi::__cxa_demangle(mangled.c_str(), nullptr, nullptr, &status),
+        free
+    );
+    
+    if (status == 0 && demangled) {
+      return std::string(demangled.get());
+    }
+  }
+  
+  return caller;
+}
 
 template int*
 GPUBufferManager::customCudaMalloc<int>(size_t size, int gpu, bool caching);
@@ -186,6 +245,9 @@ GPUBufferManager::customCudaMalloc(size_t size, int gpu, bool caching) {
     int alignment = 256;
     alloc = alloc + (alignment - alloc % alignment);
     std::cout << "Calling malloc\n";
+
+    std::string fn_name = get_caller_function_name();
+    std::cout << fn_name << std::endl;
 
     if (caching) {
         std::cout << "hello\n";
