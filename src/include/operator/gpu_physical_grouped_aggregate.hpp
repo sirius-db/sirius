@@ -14,7 +14,7 @@ namespace duckdb {
 
 uint64_t* createFixedSizeOffsets(size_t record_size, uint64_t num_rows);
 
-void cudf_groupby(GPUColumn **keys, GPUColumn **aggregate_keys, uint64_t num_keys, uint64_t num_aggregates, AggregationType* agg_mode);
+void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColumn>>& aggregate_keys, uint64_t num_keys, uint64_t num_aggregates, AggregationType* agg_mode);
 
 template <typename T, typename V>
 void groupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count, uint64_t N, uint64_t num_keys, uint64_t num_aggregates, int* agg_mode);
@@ -72,7 +72,7 @@ public:
 
 	unordered_map<Expression *, size_t> filter_indexes;
 
-	GPUIntermediateRelation* group_by_result;
+	shared_ptr<GPUIntermediateRelation> group_by_result;
 
 public:
 	// // Source interface

@@ -7,21 +7,21 @@
 namespace duckdb {
 
 template <typename T>
-GPUColumn*
-ResolveTypeCombineColumns(GPUColumn* column1, GPUColumn* column2, GPUBufferManager* gpuBufferManager) {
+shared_ptr<GPUColumn>
+ResolveTypeCombineColumns(shared_ptr<GPUColumn> column1, shared_ptr<GPUColumn> column2, GPUBufferManager* gpuBufferManager) {
 	T* combine;
 	T* a = reinterpret_cast<T*> (column1->data_wrapper.data);
 	T* b = reinterpret_cast<T*> (column2->data_wrapper.data);
 	combineColumns<T>(a, b, combine, column1->column_length, column2->column_length);
-	GPUColumn* result = new GPUColumn(column1->column_length + column2->column_length, column1->data_wrapper.type, reinterpret_cast<uint8_t*>(combine));
+	shared_ptr<GPUColumn> result = make_shared_ptr<GPUColumn>(column1->column_length + column2->column_length, column1->data_wrapper.type, reinterpret_cast<uint8_t*>(combine));
 	if (column1->is_unique && column2->is_unique) {
 		result->is_unique = true;
 	}
 	return result;
 }
 
-GPUColumn*
-ResolveTypeCombineStrings(GPUColumn* column1, GPUColumn* column2, GPUBufferManager* gpuBufferManager) {
+shared_ptr<GPUColumn>
+ResolveTypeCombineStrings(shared_ptr<GPUColumn> column1, shared_ptr<GPUColumn> column2, GPUBufferManager* gpuBufferManager) {
 	uint8_t* combine;
 	uint64_t* offset_combine;
 	uint8_t* a = column1->data_wrapper.data;
@@ -32,15 +32,15 @@ ResolveTypeCombineStrings(GPUColumn* column1, GPUColumn* column2, GPUBufferManag
 	uint64_t num_bytes_b = column2->data_wrapper.num_bytes;
 
 	combineStrings(a, b, combine, offset_a, offset_b, offset_combine, num_bytes_a, num_bytes_b, column1->column_length, column2->column_length);
-	GPUColumn* result = new GPUColumn(column1->column_length + column2->column_length, ColumnType::VARCHAR, combine, offset_combine, num_bytes_a + num_bytes_b, true);
+	shared_ptr<GPUColumn> result = make_shared_ptr<GPUColumn>(column1->column_length + column2->column_length, ColumnType::VARCHAR, combine, offset_combine, num_bytes_a + num_bytes_b, true);
 	if (column1->is_unique && column2->is_unique) {
 		result->is_unique = true;
 	}
 	return result;	
 }
 
-GPUColumn*
-CombineColumns(GPUColumn* column1, GPUColumn* column2, GPUBufferManager* gpuBufferManager) {
+shared_ptr<GPUColumn>
+CombineColumns(shared_ptr<GPUColumn> column1, shared_ptr<GPUColumn> column2, GPUBufferManager* gpuBufferManager) {
     switch(column1->data_wrapper.type) {
       case ColumnType::INT64:
 		return ResolveTypeCombineColumns<uint64_t>(column1, column2, gpuBufferManager);
@@ -58,7 +58,7 @@ CombineColumns(GPUColumn* column1, GPUColumn* column2, GPUBufferManager* gpuBuff
 
 template <typename T, typename V>
 void
-ResolveTypeGroupByAggregateExpression(GPUColumn** &group_by_keys, GPUColumn** &aggregate_keys, GPUBufferManager* gpuBufferManager, const vector<unique_ptr<Expression>> &aggregates, int num_group_keys) {
+ResolveTypeGroupByAggregateExpression(vector<shared_ptr<GPUColumn>> &group_by_keys, vector<shared_ptr<GPUColumn>> &aggregate_keys, GPUBufferManager* gpuBufferManager, const vector<unique_ptr<Expression>> &aggregates, int num_group_keys) {
 	uint64_t count[1];
 	count[0] = 0;
 	uint8_t** group_by_data = new uint8_t*[num_group_keys];
@@ -112,23 +112,23 @@ ResolveTypeGroupByAggregateExpression(GPUColumn** &group_by_keys, GPUColumn** &a
 	// Reading groupby columns based on the grouping set
 	for (idx_t group = 0; group < num_group_keys; group++) {
 		bool old_unique = group_by_keys[group]->is_unique;
-		group_by_keys[group] = new GPUColumn(count[0], group_by_keys[group]->data_wrapper.type, reinterpret_cast<uint8_t*>(group_by_data[group]));
+		group_by_keys[group] = make_shared_ptr<GPUColumn>(count[0], group_by_keys[group]->data_wrapper.type, reinterpret_cast<uint8_t*>(group_by_data[group]));
 		group_by_keys[group]->is_unique = old_unique;
 	}
 
 	for (int agg_idx = 0; agg_idx < aggregates.size(); agg_idx++) {
 		auto& expr = aggregates[agg_idx]->Cast<BoundAggregateExpression>();
 		if (expr.function.name.compare("count_star") == 0 || expr.function.name.compare("count") == 0) {
-			aggregate_keys[agg_idx] = new GPUColumn(count[0], ColumnType::INT64, reinterpret_cast<uint8_t*>(aggregate_data[agg_idx]));
+			aggregate_keys[agg_idx] = make_shared_ptr<GPUColumn>(count[0], ColumnType::INT64, reinterpret_cast<uint8_t*>(aggregate_data[agg_idx]));
 		} else {
-			aggregate_keys[agg_idx] = new GPUColumn(count[0], aggregate_keys[agg_idx]->data_wrapper.type, reinterpret_cast<uint8_t*>(aggregate_data[agg_idx]));
+			aggregate_keys[agg_idx] = make_shared_ptr<GPUColumn>(count[0], aggregate_keys[agg_idx]->data_wrapper.type, reinterpret_cast<uint8_t*>(aggregate_data[agg_idx]));
 		}
 	}
 }
 
 template <typename V>
 void
-ResolveTypeGroupByString(GPUColumn** &group_by_keys, GPUColumn** &aggregate_keys, GPUBufferManager* gpuBufferManager, const vector<unique_ptr<Expression>> &aggregates, int num_group_keys) {
+ResolveTypeGroupByString(vector<shared_ptr<GPUColumn>> &group_by_keys, vector<shared_ptr<GPUColumn>> &aggregate_keys, GPUBufferManager* gpuBufferManager, const vector<unique_ptr<Expression>> &aggregates, int num_group_keys) {
 	uint64_t count[1];
 	count[0] = 0;
 	uint8_t** group_by_data = new uint8_t*[num_group_keys];
@@ -200,9 +200,9 @@ ResolveTypeGroupByString(GPUColumn** &group_by_keys, GPUColumn** &aggregate_keys
 		bool old_unique = group_by_keys[group]->is_unique;
 		if (group_by_keys[group]->data_wrapper.type == ColumnType::VARCHAR) {
 			if (offset_data[group] == nullptr && count[0] > 0) throw NotImplementedException("Offset data is null");
-			group_by_keys[group] = new GPUColumn(count[0], group_by_keys[group]->data_wrapper.type, reinterpret_cast<uint8_t*>(group_by_data[group]), reinterpret_cast<uint64_t*>(offset_data[group]), num_bytes[group], true);
+			group_by_keys[group] = make_shared_ptr<GPUColumn>(count[0], group_by_keys[group]->data_wrapper.type, reinterpret_cast<uint8_t*>(group_by_data[group]), reinterpret_cast<uint64_t*>(offset_data[group]), num_bytes[group], true);
 		} else {
-			group_by_keys[group] = new GPUColumn(count[0], group_by_keys[group]->data_wrapper.type, reinterpret_cast<uint8_t*>(group_by_data[group]));
+			group_by_keys[group] = make_shared_ptr<GPUColumn>(count[0], group_by_keys[group]->data_wrapper.type, reinterpret_cast<uint8_t*>(group_by_data[group]));
 		}
 		group_by_keys[group]->is_unique = old_unique;
 	}
@@ -210,15 +210,15 @@ ResolveTypeGroupByString(GPUColumn** &group_by_keys, GPUColumn** &aggregate_keys
 	for (int agg_idx = 0; agg_idx < aggregates.size(); agg_idx++) {
 		auto& expr = aggregates[agg_idx]->Cast<BoundAggregateExpression>();
 		if (expr.function.name.compare("count_star") == 0 || expr.function.name.compare("count") == 0) {
-			aggregate_keys[agg_idx] = new GPUColumn(count[0], ColumnType::INT64, reinterpret_cast<uint8_t*>(aggregate_data[agg_idx]));
+			aggregate_keys[agg_idx] = make_shared_ptr<GPUColumn>(count[0], ColumnType::INT64, reinterpret_cast<uint8_t*>(aggregate_data[agg_idx]));
 		} else {
-			aggregate_keys[agg_idx] = new GPUColumn(count[0], aggregate_keys[agg_idx]->data_wrapper.type, reinterpret_cast<uint8_t*>(aggregate_data[agg_idx]));
+			aggregate_keys[agg_idx] = make_shared_ptr<GPUColumn>(count[0], aggregate_keys[agg_idx]->data_wrapper.type, reinterpret_cast<uint8_t*>(aggregate_data[agg_idx]));
 		}
 	}
 }
 
 void
-HandleGroupByAggregateExpression(GPUColumn** &group_by_keys, GPUColumn** &aggregate_keys, GPUBufferManager* gpuBufferManager, const vector<unique_ptr<Expression>> &aggregates, int num_group_keys) {
+HandleGroupByAggregateExpression(vector<shared_ptr<GPUColumn>> &group_by_keys, vector<shared_ptr<GPUColumn>> &aggregate_keys, GPUBufferManager* gpuBufferManager, const vector<unique_ptr<Expression>> &aggregates, int num_group_keys) {
 	bool string_groupby = false;
 	for (int i = 0; i < num_group_keys; i++) {
 		if (group_by_keys[i]->data_wrapper.type == ColumnType::VARCHAR) {
@@ -284,7 +284,7 @@ HandleGroupByAggregateExpression(GPUColumn** &group_by_keys, GPUColumn** &aggreg
 }
 
 void
-HandleGroupByAggregateCuDF(GPUColumn** &group_by_keys, GPUColumn** &aggregate_keys, GPUBufferManager* gpuBufferManager, const vector<unique_ptr<Expression>> &aggregates, int num_group_keys) {
+HandleGroupByAggregateCuDF(vector<shared_ptr<GPUColumn>> &group_by_keys, vector<shared_ptr<GPUColumn>> &aggregate_keys, GPUBufferManager* gpuBufferManager, const vector<unique_ptr<Expression>> &aggregates, int num_group_keys) {
 
 	AggregationType* agg_mode = new AggregationType[aggregates.size()];
 	printf("Handling group by aggregate expression\n");
@@ -316,7 +316,7 @@ HandleGroupByAggregateCuDF(GPUColumn** &group_by_keys, GPUColumn** &aggregate_ke
 }
 
 template <typename T>
-void ResolveTypeDuplicateElimination(GPUColumn** &group_by_keys, GPUBufferManager* gpuBufferManager, int num_group_keys) {
+void ResolveTypeDuplicateElimination(vector<shared_ptr<GPUColumn>> &group_by_keys, GPUBufferManager* gpuBufferManager, int num_group_keys) {
 	uint64_t count[1];
 	count[0] = 0;
 	uint8_t** group_by_data = new uint8_t*[num_group_keys];
@@ -331,12 +331,12 @@ void ResolveTypeDuplicateElimination(GPUColumn** &group_by_keys, GPUBufferManage
 	// Reading groupby columns based on the grouping set
 	for (idx_t group = 0; group < num_group_keys; group++) {
 		bool old_unique = group_by_keys[group]->is_unique;
-		group_by_keys[group] = new GPUColumn(count[0], group_by_keys[group]->data_wrapper.type, reinterpret_cast<uint8_t*>(group_by_data[group]));
+		group_by_keys[group] = make_shared_ptr<GPUColumn>(count[0], group_by_keys[group]->data_wrapper.type, reinterpret_cast<uint8_t*>(group_by_data[group]));
 		group_by_keys[group]->is_unique = old_unique;
 	}
 }
 
-void HandleDuplicateElimination(GPUColumn** &group_by_keys, GPUBufferManager* gpuBufferManager, int num_group_keys) {
+void HandleDuplicateElimination(vector<shared_ptr<GPUColumn>> &group_by_keys, GPUBufferManager* gpuBufferManager, int num_group_keys) {
 	//check if all the group by keys are all integers
 	for (int i = 0; i < num_group_keys; i++) {
 		if (group_by_keys[i]->data_wrapper.type != ColumnType::INT64) {
@@ -355,7 +355,7 @@ void HandleDuplicateElimination(GPUColumn** &group_by_keys, GPUBufferManager* gp
 }
 
 template <typename T, typename V>
-void ResolveTypeDistinctGroupBy(GPUColumn** &group_by_keys, GPUColumn** &aggregate_keys, GPUBufferManager* gpuBufferManager, DistinctAggregateCollectionInfo &distinct_info, int num_group_keys) {
+void ResolveTypeDistinctGroupBy(vector<shared_ptr<GPUColumn>> &group_by_keys, vector<shared_ptr<GPUColumn>> &aggregate_keys, GPUBufferManager* gpuBufferManager, DistinctAggregateCollectionInfo &distinct_info, int num_group_keys) {
 	uint64_t count[1];
 	count[0] = 0;
 	uint8_t** group_by_data = new uint8_t*[num_group_keys];
@@ -386,7 +386,7 @@ void ResolveTypeDistinctGroupBy(GPUColumn** &group_by_keys, GPUColumn** &aggrega
 	// Reading groupby columns based on the grouping set
 	for (idx_t group = 0; group < num_group_keys; group++) {
 		bool old_unique = group_by_keys[group]->is_unique;
-		group_by_keys[group] = new GPUColumn(count[0], group_by_keys[group]->data_wrapper.type, reinterpret_cast<uint8_t*>(group_by_data[group]));
+		group_by_keys[group] = make_shared_ptr<GPUColumn>(count[0], group_by_keys[group]->data_wrapper.type, reinterpret_cast<uint8_t*>(group_by_data[group]));
 		group_by_keys[group]->is_unique = old_unique;
 	}
 
@@ -394,14 +394,14 @@ void ResolveTypeDistinctGroupBy(GPUColumn** &group_by_keys, GPUColumn** &aggrega
 		auto distinct_idx = distinct_info.indices[idx];
 		auto& expr = distinct_info.aggregates[distinct_idx]->Cast<BoundAggregateExpression>();
 		if (expr.function.name.compare("count") == 0) {
-			aggregate_keys[idx] = new GPUColumn(count[0], ColumnType::INT64, reinterpret_cast<uint8_t*>(distinct_aggregate_data[idx]));
+			aggregate_keys[idx] = make_shared_ptr<GPUColumn>(count[0], ColumnType::INT64, reinterpret_cast<uint8_t*>(distinct_aggregate_data[idx]));
 		}
 	}
 
 }
 
 //TODO: Distinct Aggregate currently does not support string type
-void HandleDistinctGroupBy(GPUColumn** &group_by_keys, GPUColumn** &aggregate_keys, GPUBufferManager* gpuBufferManager, DistinctAggregateCollectionInfo &distinct_info, int num_group_keys) {
+void HandleDistinctGroupBy(vector<shared_ptr<GPUColumn>> &group_by_keys, vector<shared_ptr<GPUColumn>> &aggregate_keys, GPUBufferManager* gpuBufferManager, DistinctAggregateCollectionInfo &distinct_info, int num_group_keys) {
 	//check if all the group by keys are all integers
 	for (int i = 0; i < num_group_keys; i++) {
 		if (group_by_keys[i]->data_wrapper.type != ColumnType::INT64) {
@@ -530,7 +530,7 @@ GPUPhysicalGroupedAggregate::GPUPhysicalGroupedAggregate(ClientContext &context,
 		total_output_columns++;
 	}
 	total_output_columns += grouped_aggregate_data.GroupCount();
-	group_by_result = new GPUIntermediateRelation(total_output_columns);
+	group_by_result = make_shared_ptr<GPUIntermediateRelation>(total_output_columns);
 }
 
 // SinkResultType
@@ -555,8 +555,8 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 
 	GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 	uint64_t num_group_keys = grouped_aggregate_data.groups.size();
-	GPUColumn** group_by_column = new GPUColumn*[grouped_aggregate_data.groups.size()];
-	GPUColumn** aggregate_column = new GPUColumn*[aggregates.size()];
+	vector<shared_ptr<GPUColumn>> group_by_column(grouped_aggregate_data.groups.size());
+	vector<shared_ptr<GPUColumn>> aggregate_column(aggregates.size());
 	for (int i = 0; i < grouped_aggregate_data.groups.size(); i++) {
 		group_by_column[i] = nullptr;
 	}
@@ -594,7 +594,7 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 		//here we probably have count(*) or sum(*) or something like that
 		if (aggr.children.size() == 0) {
 			printf("Passing * aggregate to index %d in groupby result\n", grouped_aggregate_data.groups.size() + aggr_idx);
-			aggregate_column[aggr_idx] = new GPUColumn(100, ColumnType::INT64, nullptr);
+			aggregate_column[aggr_idx] = make_shared_ptr<GPUColumn>(100, ColumnType::INT64, nullptr);
 		}
 		aggr_idx++;
 	}
@@ -625,8 +625,8 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 		if (group_by_column[0]->column_length > INT32_MAX || aggregate_column[0]->column_length > INT32_MAX || !string_cudf_supported) {
 			HandleGroupByAggregateExpression(group_by_column, aggregate_column, gpuBufferManager, aggregates, num_group_keys);
 		} else {
-			HandleGroupByAggregateCuDF(group_by_column, aggregate_column, gpuBufferManager, aggregates, num_group_keys);
-			// HandleGroupByAggregateExpression(group_by_column, aggregate_column, gpuBufferManager, aggregates, num_group_keys);
+			// HandleGroupByAggregateCuDF(group_by_column, aggregate_column, gpuBufferManager, aggregates, num_group_keys);
+			HandleGroupByAggregateExpression(group_by_column, aggregate_column, gpuBufferManager, aggregates, num_group_keys);
 		}
 	}
 	
@@ -681,10 +681,10 @@ GPUPhysicalGroupedAggregate::GetData(GPUIntermediateRelation &output_relation) c
 		// output_relation.columns[col] = group_by_result->columns[col];
 		bool old_unique = group_by_result->columns[col]->is_unique;
 		if (group_by_result->columns[col]->data_wrapper.type == ColumnType::VARCHAR) {
-			output_relation.columns[col] = new GPUColumn(group_by_result->columns[col]->column_length, group_by_result->columns[col]->data_wrapper.type, group_by_result->columns[col]->data_wrapper.data,
+			output_relation.columns[col] = make_shared_ptr<GPUColumn>(group_by_result->columns[col]->column_length, group_by_result->columns[col]->data_wrapper.type, group_by_result->columns[col]->data_wrapper.data,
 					group_by_result->columns[col]->data_wrapper.offset, group_by_result->columns[col]->data_wrapper.num_bytes, true);
 		} else {
-			output_relation.columns[col] = new GPUColumn(group_by_result->columns[col]->column_length, group_by_result->columns[col]->data_wrapper.type, group_by_result->columns[col]->data_wrapper.data);
+			output_relation.columns[col] = make_shared_ptr<GPUColumn>(group_by_result->columns[col]->column_length, group_by_result->columns[col]->data_wrapper.type, group_by_result->columns[col]->data_wrapper.data);
 		}
 		output_relation.columns[col]->is_unique = old_unique;
 		// printGPUColumn<uint64_t>(reinterpret_cast<uint64_t*>(output_relation.columns[col]->data_wrapper.data), output_relation.columns[col]->column_length, 0);
@@ -707,8 +707,8 @@ GPUPhysicalGroupedAggregate::SinkDistinctGrouping(GPUIntermediateRelation& input
 
 	GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 	uint64_t num_group_keys = grouped_aggregate_data.groups.size();
-	GPUColumn** group_by_column = new GPUColumn*[grouped_aggregate_data.groups.size()];
-	GPUColumn** distinct_aggregate_columns = new GPUColumn*[distinct_info.indices.size()];
+	vector<shared_ptr<GPUColumn>> group_by_column(grouped_aggregate_data.groups.size());
+	vector<shared_ptr<GPUColumn>> distinct_aggregate_columns(distinct_info.indices.size());
 
 	for (int i = 0; i < grouped_aggregate_data.groups.size(); i++) {
 		group_by_column[i] = nullptr;

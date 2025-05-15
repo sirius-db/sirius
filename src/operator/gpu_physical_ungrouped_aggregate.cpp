@@ -6,7 +6,7 @@ namespace duckdb {
 
 template <typename T>
 void
-ResolveTypeAggregateExpression(GPUColumn** &aggregate_keys, GPUBufferManager* gpuBufferManager, const vector<unique_ptr<Expression>> &aggregates) {
+ResolveTypeAggregateExpression(vector<shared_ptr<GPUColumn>> &aggregate_keys, GPUBufferManager* gpuBufferManager, const vector<unique_ptr<Expression>> &aggregates) {
 	uint8_t** aggregate_data = new uint8_t*[aggregates.size()];
 	uint8_t** result = new uint8_t*[aggregates.size()];
 	for (int agg_idx = 0; agg_idx < aggregates.size(); agg_idx++) {
@@ -57,18 +57,18 @@ ResolveTypeAggregateExpression(GPUColumn** &aggregate_keys, GPUBufferManager* gp
 	for (int agg_idx = 0; agg_idx < aggregates.size(); agg_idx++) {
 		auto& expr = aggregates[agg_idx]->Cast<BoundAggregateExpression>();
 		if (expr.function.name.compare("count_star") == 0 || expr.function.name.compare("count") == 0) {
-			aggregate_keys[agg_idx] = new GPUColumn(1, ColumnType::INT64, reinterpret_cast<uint8_t*>(result[agg_idx]));
+			aggregate_keys[agg_idx] = make_shared_ptr<GPUColumn>(1, ColumnType::INT64, reinterpret_cast<uint8_t*>(result[agg_idx]));
 			// if (result[agg_idx] != nullptr) printGPUColumn<uint64_t>(reinterpret_cast<uint64_t*>(aggregate_keys[agg_idx]->data_wrapper.data), aggregate_keys[agg_idx]->column_length, 0);
 		} else if (size == 0){
-			aggregate_keys[agg_idx] = new GPUColumn(0, ColumnType::INT64, reinterpret_cast<uint8_t*>(result[agg_idx]));
+			aggregate_keys[agg_idx] = make_shared_ptr<GPUColumn>(0, ColumnType::INT64, reinterpret_cast<uint8_t*>(result[agg_idx]));
 		} else { 
-			aggregate_keys[agg_idx] = new GPUColumn(1, aggregate_keys[agg_idx]->data_wrapper.type, reinterpret_cast<uint8_t*>(result[agg_idx]));
+			aggregate_keys[agg_idx] = make_shared_ptr<GPUColumn>(1, aggregate_keys[agg_idx]->data_wrapper.type, reinterpret_cast<uint8_t*>(result[agg_idx]));
 		}
 	}
 }
 
 void
-HandleAggregateExpression(GPUColumn** &aggregate_keys, GPUBufferManager* gpuBufferManager, const vector<unique_ptr<Expression>> &aggregates) {
+HandleAggregateExpression(vector<shared_ptr<GPUColumn>> &aggregate_keys, GPUBufferManager* gpuBufferManager, const vector<unique_ptr<Expression>> &aggregates) {
 	//check if all the aggregate functions are of the same type
 	bool same_type = true;
 	ColumnType prev_type;
@@ -109,7 +109,7 @@ GPUPhysicalUngroupedAggregate::GPUPhysicalUngroupedAggregate(vector<LogicalType>
       aggregates(std::move(expressions)) {
 
 	distinct_collection_info = DistinctAggregateCollectionInfo::Create(aggregates);
-	aggregation_result = new GPUIntermediateRelation(aggregates.size());
+	aggregation_result = make_shared_ptr<GPUIntermediateRelation>(aggregates.size());
 	if (!distinct_collection_info) {
 		return;
 	}
@@ -131,7 +131,7 @@ GPUPhysicalUngroupedAggregate::Sink(GPUIntermediateRelation &input_relation) con
 	idx_t payload_idx = 0;
 	idx_t next_payload_idx = 0;
 	GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
-	GPUColumn** aggregate_column = new GPUColumn*[aggregates.size()];
+	vector<shared_ptr<GPUColumn>> aggregate_column(aggregates.size());
 	for (int aggr_idx = 0; aggr_idx < aggregates.size(); aggr_idx++) {
 		aggregate_column[aggr_idx] = nullptr;
 	}
@@ -180,7 +180,7 @@ GPUPhysicalUngroupedAggregate::Sink(GPUIntermediateRelation &input_relation) con
 					size = input_relation.columns[0]->column_length;
 				}
 			}
-			aggregate_column[aggr_idx] = new GPUColumn(size, ColumnType::INT64, input_relation.columns[0]->data_wrapper.data);
+			aggregate_column[aggr_idx] = make_shared_ptr<GPUColumn>(size, ColumnType::INT64, input_relation.columns[0]->data_wrapper.data);
 		}
 	}
 
@@ -213,7 +213,7 @@ GPUPhysicalUngroupedAggregate::GetData(GPUIntermediateRelation &output_relation)
     printf("Writing aggregation result to column %ld\n", col);
     // output_relation.columns[col] = aggregation_result->columns[col];
 	// HERE
-	output_relation.columns[col] = new GPUColumn(aggregation_result->columns[col]->column_length, aggregation_result->columns[col]->data_wrapper.type, aggregation_result->columns[col]->data_wrapper.data);
+	output_relation.columns[col] = make_shared_ptr<GPUColumn>(aggregation_result->columns[col]->column_length, aggregation_result->columns[col]->data_wrapper.type, aggregation_result->columns[col]->data_wrapper.data);
 	// printf("Column length: %ld\n", aggregation_result->columns[col]->column_length);
 	// printGPUColumn<uint64_t>(reinterpret_cast<uint64_t*>(aggregation_result->columns[col]->data_wrapper.data), aggregation_result->columns[col]->column_length, 0);
   }

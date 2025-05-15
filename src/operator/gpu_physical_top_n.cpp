@@ -15,7 +15,7 @@ GPUPhysicalTopN::GPUPhysicalTopN(vector<LogicalType> types_p, vector<BoundOrderB
                            shared_ptr<DynamicFilterData> dynamic_filter_p, idx_t estimated_cardinality)
     : GPUPhysicalOperator(PhysicalOperatorType::TOP_N, std::move(types_p), estimated_cardinality), orders(std::move(orders)),
       limit(limit), offset(offset), dynamic_filter(std::move(dynamic_filter_p)) {
-    sort_result = new GPUIntermediateRelation(types.size());
+    sort_result = make_shared_ptr<GPUIntermediateRelation>(types.size());
     for (int col = 0; col < types.size(); col++) {
     	sort_result->columns[col] = nullptr;
     }
@@ -26,7 +26,7 @@ GPUPhysicalTopN::~GPUPhysicalTopN() {
 
 
 void
-HandleTopN(GPUColumn** &order_by_keys, GPUColumn** &projection_columns, const vector<BoundOrderByNode> &orders, uint64_t num_projections) {
+HandleTopN(vector<shared_ptr<GPUColumn>> &order_by_keys, vector<shared_ptr<GPUColumn>> &projection_columns, const vector<BoundOrderByNode> &orders, uint64_t num_projections) {
 	OrderByType* order_by_type = new OrderByType[orders.size()];
 	for (int order_idx = 0; order_idx < orders.size(); order_idx++) {
 		if (orders[order_idx].type == OrderType::ASCENDING) {
@@ -53,10 +53,10 @@ SinkResultType GPUPhysicalTopN::Sink(GPUIntermediateRelation& input_relation) co
     }
 
 
-	GPUColumn** order_by_keys = new GPUColumn*[orders.size()];
+	vector<shared_ptr<GPUColumn>> order_by_keys(orders.size());
 	GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 
-  	GPUColumn** projection_columns = new GPUColumn*[types.size()];
+  	vector<shared_ptr<GPUColumn>> projection_columns(types.size());
   
 	for (int projection_idx = 0; projection_idx < types.size(); projection_idx++) {
 		auto input_idx = projection_idx;
@@ -154,7 +154,7 @@ SourceResultType GPUPhysicalTopN::GetData(GPUIntermediateRelation& output_relati
 	for (int col = 0; col < sort_result->columns.size(); col++) {
 		printf("Writing top n result to column %d\n", col);
     	auto limit_const = min(limit, sort_result->columns[col]->column_length);
-    	output_relation.columns[col] = new GPUColumn(limit_const, sort_result->columns[col]->data_wrapper.type, sort_result->columns[col]->data_wrapper.data,
+    	output_relation.columns[col] = make_shared_ptr<GPUColumn>(limit_const, sort_result->columns[col]->data_wrapper.type, sort_result->columns[col]->data_wrapper.data,
                           sort_result->columns[col]->data_wrapper.offset, sort_result->columns[col]->data_wrapper.num_bytes, sort_result->columns[col]->data_wrapper.is_string_data);
     	output_relation.columns[col]->is_unique = sort_result->columns[col]->is_unique;
 		if (limit_const > 0 && output_relation.columns[col]->data_wrapper.type == ColumnType::VARCHAR) {

@@ -53,22 +53,22 @@ public:
     void FilterRecursiveExpression(GPUIntermediateRelation& input_relation, GPUIntermediateRelation& output_relation, Expression& expr, int depth = 0);
     void ProjectionRecursiveExpression(GPUIntermediateRelation& input_relation, GPUIntermediateRelation& output_relation, Expression& expr, int output_idx, int depth = 0);
     
-    template <typename T> void ResolveTypeComparisonConstantExpression (GPUColumn* column, BoundConstantExpression& expr1, BoundConstantExpression& expr2, uint64_t* &count, uint64_t* & row_ids, ExpressionType expression_type);
-    void HandleComparisonConstantExpression(GPUColumn* column, BoundConstantExpression& expr1, BoundConstantExpression& expr2, uint64_t* &count, uint64_t* &row_ids, ExpressionType expression_type);
+    template <typename T> void ResolveTypeComparisonConstantExpression (shared_ptr<GPUColumn> column, BoundConstantExpression& expr1, BoundConstantExpression& expr2, uint64_t* &count, uint64_t* & row_ids, ExpressionType expression_type);
+    void HandleComparisonConstantExpression(shared_ptr<GPUColumn> column, BoundConstantExpression& expr1, BoundConstantExpression& expr2, uint64_t* &count, uint64_t* &row_ids, ExpressionType expression_type);
     
-    template <typename T> void ResolveTypeComparisonExpression (GPUColumn* column1, GPUColumn* column2, uint64_t* &count, uint64_t* & row_ids, ExpressionType expression_type);
-    void HandleComparisonExpression(GPUColumn* column1, GPUColumn* column2, uint64_t* &count, uint64_t* &row_ids, ExpressionType expression_type);
+    template <typename T> void ResolveTypeComparisonExpression (shared_ptr<GPUColumn> column1, shared_ptr<GPUColumn> column2, uint64_t* &count, uint64_t* & row_ids, ExpressionType expression_type);
+    void HandleComparisonExpression(shared_ptr<GPUColumn> column1, shared_ptr<GPUColumn> column2, uint64_t* &count, uint64_t* &row_ids, ExpressionType expression_type);
 
-    template <typename T> GPUColumn* ResolveTypeBinaryConstantExpression (GPUColumn* column, T constant, GPUBufferManager* gpuBufferManager, string function_name);
-    GPUColumn* HandleBinaryConstantExpression(GPUColumn* column, BoundConstantExpression& expr, GPUBufferManager* gpuBufferManager, string function_name);
+    template <typename T> shared_ptr<GPUColumn> ResolveTypeBinaryConstantExpression (shared_ptr<GPUColumn> column, T constant, GPUBufferManager* gpuBufferManager, string function_name);
+    shared_ptr<GPUColumn> HandleBinaryConstantExpression(shared_ptr<GPUColumn> column, BoundConstantExpression& expr, GPUBufferManager* gpuBufferManager, string function_name);
 
-    template <typename T> GPUColumn* ResolveTypeBinaryExpression (GPUColumn* column1, GPUColumn* column2, GPUBufferManager* gpuBufferManager, string function_name);
-    GPUColumn* HandleBinaryExpression(GPUColumn* column1, GPUColumn* column2, GPUBufferManager* gpuBufferManager, string function_name);
+    template <typename T> shared_ptr<GPUColumn> ResolveTypeBinaryExpression (shared_ptr<GPUColumn> column1, shared_ptr<GPUColumn> column2, GPUBufferManager* gpuBufferManager, string function_name);
+    shared_ptr<GPUColumn> HandleBinaryExpression(shared_ptr<GPUColumn> column1, shared_ptr<GPUColumn> column2, GPUBufferManager* gpuBufferManager, string function_name);
 
     bool HandlingSpecificProjection(GPUIntermediateRelation& input_relation, GPUIntermediateRelation& output_relation, Expression& expression, int output_idx);
     bool HandlingSpecificFilter(GPUIntermediateRelation& input_relation, GPUIntermediateRelation& output_relation, Expression& expression);
 
-    GPUColumn* HandleRoundExpression(GPUColumn* column, int decimal_places);
+    shared_ptr<GPUColumn> HandleRoundExpression(shared_ptr<GPUColumn> column, int decimal_places);
 
 };
 

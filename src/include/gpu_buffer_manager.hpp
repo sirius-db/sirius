@@ -91,7 +91,7 @@ public:
 
 	void Print();
 
-    map<string, GPUIntermediateRelation*> tables;
+    map<string, shared_ptr<GPUIntermediateRelation>> tables;
 
 	DataWrapper allocateChunk(DataChunk &input);
 	DataWrapper allocateColumnBufferInCPU(unique_ptr<MaterializedQueryResult> input);
@@ -105,12 +105,7 @@ public:
 	void createTable(string table_name, size_t column_count);
 	void createColumn(string table_name, string column_name, ColumnType column_type, size_t column_id, vector<size_t> unique_columns);
 	bool checkIfColumnCached(string table_name, string column_name);
-	GPUColumn* copyDataFromcuDFColumn(cudf::column_view& column, int gpu);
-
-	GPUColumn* newGPUColumn(size_t column_length, ColumnType type, uint8_t* data, bool is_cached);
-	GPUColumn* newGPUColumn(size_t column_length, ColumnType type, uint8_t* data, uint64_t* offset, size_t num_bytes, bool is_string_data, bool is_cached);
-	GPUColumn* newGPUColumn(string name, size_t column_length, ColumnType type, uint8_t* data, bool is_cached);
-	GPUColumn* newGPUColumn(string name, size_t column_length, ColumnType type, uint8_t* data, uint64_t* offset, size_t num_bytes, bool is_string_data, bool is_cached);
+	shared_ptr<GPUColumn> copyDataFromcuDFColumn(cudf::column_view& column, int gpu);
 
 	std::vector<std::unique_ptr<rmm::device_buffer>> rmm_stored_buffers;
 

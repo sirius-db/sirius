@@ -23,7 +23,7 @@ public:
 	idx_t offset;
 	//! Dynamic table filter (if any)
 	shared_ptr<DynamicFilterData> dynamic_filter;
-	GPUIntermediateRelation* sort_result;
+	shared_ptr<GPUIntermediateRelation> sort_result;
 public:
 	// Source interface
 	// unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;

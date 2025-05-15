@@ -65,12 +65,6 @@ GPUBufferManager::customCudaHostAlloc<char>(size_t size);
 template string_t*
 GPUBufferManager::customCudaHostAlloc<string_t>(size_t size);
 
-template GPUColumn*
-GPUBufferManager::customCudaHostAlloc<GPUColumn>(size_t size);
-
-template GPUIntermediateRelation*
-GPUBufferManager::customCudaHostAlloc<GPUIntermediateRelation>(size_t size);
-
 GPUBufferManager::GPUBufferManager(size_t cache_size_per_gpu, size_t processing_size_per_gpu, size_t processing_size_per_cpu) : 
     cache_size_per_gpu(cache_size_per_gpu), processing_size_per_gpu(processing_size_per_gpu), processing_size_per_cpu(processing_size_per_cpu) {
     printf("Initializing GPU buffer manager\n");
@@ -113,80 +107,6 @@ GPUBufferManager::~GPUBufferManager() {
     delete[] gpuCachingPointer;
 }
 
-GPUColumn*
-GPUBufferManager::newGPUColumn(string name, size_t column_length, ColumnType type, uint8_t* data, bool is_cached) {
-    if (is_cached) {
-        return new GPUColumn(name, column_length, type, data);
-    } else {
-        GPUColumn* column = customCudaHostAlloc<GPUColumn>(1);
-        column->name = name;
-        column->column_length = column_length;
-        column->data_wrapper = DataWrapper(type, data, column_length);
-        column->row_ids = nullptr;
-        column->data_wrapper.offset = nullptr;
-        column->data_wrapper.num_bytes = column_length * column->data_wrapper.getColumnTypeSize();
-        column->is_unique = false;
-        return column;
-    }
-}
-
-shared_ptr<GPUColumn>
-GPUBufferManager::newGPUColumn(string name, size_t column_length, ColumnType type, uint8_t* data, uint64_t* offset, size_t num_bytes, bool is_string_data, bool is_cached) {
-    if (is_cached) {
-        return new GPUColumn(name, column_length, type, data, offset, num_bytes, is_string_data);
-    } else {
-        GPUColumn* column = customCudaHostAlloc<GPUColumn>(1);
-        use shared pointer
-        shared_ptr<GPUColumn> column = make_shared<GPUColumn>(name, column_length, type, data, offset, num_bytes, is_string_data);
-        column->name = name;
-        column->column_length = column_length;
-        column->data_wrapper = DataWrapper(type, data, offset, column_length, num_bytes, is_string_data);
-        column->row_ids = nullptr;
-        if (is_string_data) {
-            column->data_wrapper.num_bytes = num_bytes;
-        } else {
-            column->data_wrapper.num_bytes = column_length * column->data_wrapper.getColumnTypeSize();
-        }
-        column->is_unique = false;
-        return column;
-    }
-}
-
-shared_ptr<GPUColumn>
-GPUBufferManager::newGPUColumn(size_t column_length, ColumnType type, uint8_t* data, bool is_cached) {
-    if (is_cached) {
-        return new GPUColumn(column_length, type, data);
-    } else {
-        GPUColumn* column = customCudaHostAlloc<GPUColumn>(1);
-        column->column_length = column_length;
-        column->data_wrapper = DataWrapper(type, data, column_length);
-        column->row_ids = nullptr;
-        column->data_wrapper.offset = nullptr;
-        column->data_wrapper.num_bytes = column_length * column->data_wrapper.getColumnTypeSize();
-        column->is_unique = false;
-        return column;
-    }
-}
-
-GPUColumn*
-GPUBufferManager::newGPUColumn(size_t column_length, ColumnType type, uint8_t* data, uint64_t* offset, size_t num_bytes, bool is_string_data, bool is_cached) {
-    if (is_cached) {
-        return new GPUColumn(column_length, type, data, offset, num_bytes, is_string_data);
-    } else {
-        GPUColumn* column = customCudaHostAlloc<GPUColumn>(1);
-        column->column_length = column_length;
-        column->data_wrapper = DataWrapper(type, data, offset, column_length, num_bytes, is_string_data);
-        column->row_ids = nullptr;
-        if (is_string_data) {
-            column->data_wrapper.num_bytes = num_bytes;
-        } else {
-            column->data_wrapper.num_bytes = column_length * column->data_wrapper.getColumnTypeSize();
-        }
-        column->is_unique = false;
-        return column;
-    }
-}
-
 void GPUBufferManager::ResetBuffer() {
     cudf::set_current_device_resource(mr);
     for (int gpu = 0; gpu < NUM_GPUS; gpu++) {
@@ -222,7 +142,7 @@ void GPUBufferManager::ResetBuffer() {
     }
     cpuProcessingPointer = 0;
     for (auto it = tables.begin(); it != tables.end(); it++) {
-        GPUIntermediateRelation* table = it->second;
+        shared_ptr<GPUIntermediateRelation> table = it->second;
         for (int col = 0; col < table->columns.size(); col++) {
             if (table->columns[col] != nullptr) {
                 table->columns[col]->row_ids = nullptr;
@@ -239,7 +159,7 @@ void GPUBufferManager::ResetCache() {
     }
     cpuProcessingPointer = 0;
     for (auto it = tables.begin(); it != tables.end(); it++) {
-        GPUIntermediateRelation* table = it->second;
+        shared_ptr<GPUIntermediateRelation> table = it->second;
         for (int col = 0; col < table->columns.size(); col++) {
             table->columns[col] = nullptr;
         }
@@ -292,7 +212,7 @@ GPUBufferManager::customCudaMalloc(size_t size, int gpu, bool caching) {
     }
 };
 
-GPUColumn* 
+shared_ptr<GPUColumn> 
 GPUBufferManager::copyDataFromcuDFColumn(cudf::column_view& column, int gpu) {
     //copy the data to the gpu
     //create a column
@@ -307,7 +227,7 @@ GPUBufferManager::copyDataFromcuDFColumn(cudf::column_view& column, int gpu) {
         uint8_t* temp_column = customCudaMalloc<uint8_t>(temp_num_bytes[0], 0, false);
         callCudaMemcpyDeviceToDevice<uint8_t>(temp_column, data, temp_num_bytes[0], 0);
 
-        GPUColumn* column_ptr = new GPUColumn(column.size(), ColumnType::VARCHAR, temp_column);
+        shared_ptr<GPUColumn> column_ptr = make_shared_ptr<GPUColumn>(column.size(), ColumnType::VARCHAR, temp_column);
         column_ptr->convertCudfOffsetToSiriusOffset(temp_offset);
         column_ptr->data_wrapper.num_bytes = temp_num_bytes[0];
         column_ptr->data_wrapper.is_string_data = true;
@@ -315,23 +235,23 @@ GPUBufferManager::copyDataFromcuDFColumn(cudf::column_view& column, int gpu) {
     } else if (column.type() == cudf::data_type(cudf::type_id::UINT64)) {
         uint8_t* temp_column = customCudaMalloc<uint8_t>(column.size() * sizeof(uint64_t), 0, false);
         callCudaMemcpyDeviceToDevice<uint8_t>(temp_column, data, column.size() * sizeof(uint64_t), 0);
-        return new GPUColumn(column.size(), ColumnType::INT64, temp_column);
+        return make_shared_ptr<GPUColumn>(column.size(), ColumnType::INT64, temp_column);
     } else if (column.type() == cudf::data_type(cudf::type_id::INT32)) {
         uint8_t* temp_column = customCudaMalloc<uint8_t>(column.size() * sizeof(int32_t), 0, false);
         callCudaMemcpyDeviceToDevice<uint8_t>(temp_column, data, column.size() * sizeof(int32_t), 0);
-        return new GPUColumn(column.size(), ColumnType::INT32, temp_column);
+        return make_shared_ptr<GPUColumn>(column.size(), ColumnType::INT32, temp_column);
     } else if (column.type() == cudf::data_type(cudf::type_id::FLOAT32)) {
         uint8_t* temp_column = customCudaMalloc<uint8_t>(column.size() * sizeof(float), 0, false);
         callCudaMemcpyDeviceToDevice<uint8_t>(temp_column, data, column.size() * sizeof(float), 0);
-        return new GPUColumn(column.size(), ColumnType::FLOAT32, temp_column);
+        return make_shared_ptr<GPUColumn>(column.size(), ColumnType::FLOAT32, temp_column);
     } else if (column.type() == cudf::data_type(cudf::type_id::FLOAT64)) {
         uint8_t* temp_column = customCudaMalloc<uint8_t>(column.size() * sizeof(double), 0, false);
         callCudaMemcpyDeviceToDevice<uint8_t>(temp_column, data, column.size() * sizeof(double), 0);
-        return new GPUColumn(column.size(), ColumnType::FLOAT64, temp_column);
+        return make_shared_ptr<GPUColumn>(column.size(), ColumnType::FLOAT64, temp_column);
     } else if (column.type() == cudf::data_type(cudf::type_id::BOOL8)) {
         uint8_t* temp_column = customCudaMalloc<uint8_t>(column.size() * sizeof(bool), 0, false);
         callCudaMemcpyDeviceToDevice<uint8_t>(temp_column, data, column.size() * sizeof(bool), 0);
-        return new GPUColumn(column.size(), ColumnType::BOOLEAN, temp_column);
+        return make_shared_ptr<GPUColumn>(column.size(), ColumnType::BOOLEAN, temp_column);
     }
 }
 
@@ -637,7 +557,6 @@ GPUBufferManager::cacheDataInGPU(DataWrapper cpu_data, string table_name, string
     int column_idx = column_it - tables[up_table_name]->column_names.begin(); 
     tables[up_table_name]->columns[column_idx]->data_wrapper = gpu_allocated_buffer;
     tables[up_table_name]->columns[column_idx]->column_length = gpu_allocated_buffer.size;
-    tables[up_table_name]->length = gpu_allocated_buffer.size;
     printf("Data cached in GPU\n");
 }
 
@@ -723,9 +642,8 @@ GPUBufferManager::createTable(string up_table_name, size_t column_count) {
     //we will update the length later
     //check if table already exists
     if (tables.find(up_table_name) == tables.end()) {
-        GPUIntermediateRelation* table = new GPUIntermediateRelation(column_count);
-        table->names = up_table_name;
-        tables[up_table_name] = table;
+        tables[up_table_name] = make_shared_ptr<GPUIntermediateRelation>(column_count);
+        tables[up_table_name]->names = up_table_name;
     }
 }
 
@@ -748,13 +666,13 @@ GPUBufferManager::checkIfColumnCached(string table_name, string column_name) {
 
 void
 GPUBufferManager::createColumn(string up_table_name, string up_column_name, ColumnType column_type, size_t column_id, vector<size_t> unique_columns) {
-    GPUIntermediateRelation* table = tables[up_table_name];
+    shared_ptr<GPUIntermediateRelation> table = tables[up_table_name];
     table->column_names[column_id] = up_column_name;
     if (find(unique_columns.begin(), unique_columns.end(), column_id) != unique_columns.end()) {
-        table->columns[column_id] = new GPUColumn(up_column_name, 0, column_type, nullptr);
+        table->columns[column_id] = make_shared_ptr<GPUColumn>(up_column_name, 0, column_type, nullptr);
         table->columns[column_id]->is_unique = true;
     } else {
-        table->columns[column_id] = new GPUColumn(up_column_name, 0, column_type, nullptr);
+        table->columns[column_id] = make_shared_ptr<GPUColumn>(up_column_name, 0, column_type, nullptr);
         table->columns[column_id]->is_unique = false;
     }
 }

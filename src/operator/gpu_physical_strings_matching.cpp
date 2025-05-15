@@ -22,7 +22,7 @@ std::vector<std::string> string_split(std::string s, std::string delimiter) {
     return tokens;
 }
 
-void HandleStringMatching(GPUColumn* string_column, std::string match_string, uint64_t* &row_id, uint64_t* &count, int not_equal) {
+void HandleStringMatching(shared_ptr<GPUColumn> string_column, std::string match_string, uint64_t* &row_id, uint64_t* &count, int not_equal) {
 
     DataWrapper str_data_wrapper = string_column->data_wrapper;
     uint64_t num_chars = str_data_wrapper.num_bytes;
@@ -34,7 +34,7 @@ void HandleStringMatching(GPUColumn* string_column, std::string match_string, ui
 
 }
 
-void HandleMultiStringMatching(GPUColumn* string_column, std::string match_string, uint64_t* &row_id, uint64_t* &count, int not_equal) {
+void HandleMultiStringMatching(shared_ptr<GPUColumn> string_column, std::string match_string, uint64_t* &row_id, uint64_t* &count, int not_equal) {
 
     std::vector<std::string> match_terms = string_split(match_string, "%");
     DataWrapper str_data_wrapper = string_column->data_wrapper;
@@ -47,7 +47,7 @@ void HandleMultiStringMatching(GPUColumn* string_column, std::string match_strin
 
 }
 
-void HandlePrefixMatching(GPUColumn* string_column, std::string match_prefix, uint64_t* &row_id, uint64_t* &count, int not_equal) {
+void HandlePrefixMatching(shared_ptr<GPUColumn> string_column, std::string match_prefix, uint64_t* &row_id, uint64_t* &count, int not_equal) {
   
     DataWrapper str_data_wrapper = string_column->data_wrapper;
     uint64_t num_chars = str_data_wrapper.num_bytes;

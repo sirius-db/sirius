@@ -48,16 +48,16 @@ template void printGPUColumn<double>(double* a, int32_t N, int gpu);
 template void printGPUColumn<int>(int* a, int32_t N, int gpu);
 template void printGPUColumn<float>(float* a, int32_t N, int gpu);
 
-void cudf_orderby(GPUColumn **keys, GPUColumn **projection, uint64_t num_keys, uint64_t num_projections, OrderByType* order_by_type) 
+void cudf_orderby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColumn>>& projection, uint64_t num_keys, uint64_t num_projections, OrderByType* order_by_type) 
 {
     if (keys[0]->column_length == 0) {
         printf("N is 0\n");
         for (idx_t col = 0; col < num_projections; col++) {
             bool old_unique = projection[col]->is_unique;
             if (projection[col]->data_wrapper.type == ColumnType::VARCHAR) {
-                projection[col] = new GPUColumn(0, projection[col]->data_wrapper.type, projection[col]->data_wrapper.data, projection[col]->data_wrapper.offset, 0, true);
+                projection[col] = make_shared_ptr<GPUColumn>(0, projection[col]->data_wrapper.type, projection[col]->data_wrapper.data, projection[col]->data_wrapper.offset, 0, true);
             } else {
-                projection[col] = new GPUColumn(0, projection[col]->data_wrapper.type, projection[col]->data_wrapper.data);
+                projection[col] = make_shared_ptr<GPUColumn>(0, projection[col]->data_wrapper.type, projection[col]->data_wrapper.data);
             }
             projection[col]->is_unique = old_unique;
         }

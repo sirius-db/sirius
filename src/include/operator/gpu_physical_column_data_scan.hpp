@@ -25,7 +25,7 @@ public:
 	idx_t cte_index;
 	optional_idx delim_index;
 
-	GPUIntermediateRelation* intermediate_relation;
+	shared_ptr<GPUIntermediateRelation> intermediate_relation;
 
 public:
 	// unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;

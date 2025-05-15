@@ -110,9 +110,8 @@ public:
 
     string names;
 	vector<string> column_names;
-    vector<GPUColumn*> columns;
+    vector<shared_ptr<GPUColumn>> columns;
     // map<string, GPUColumn*> columns;
-    size_t length;
     size_t column_count;
     // cudf::table_view convertToCudfTable();
 };

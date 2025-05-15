@@ -2,7 +2,7 @@
 
 namespace duckdb {
 
-GPUColumn* HandleSubString(GPUColumn* string_column, uint64_t start_idx, uint64_t length) {
+shared_ptr<GPUColumn> HandleSubString(shared_ptr<GPUColumn> string_column, uint64_t start_idx, uint64_t length) {
     // Get the current column data
     DataWrapper str_data_wrapper = string_column->data_wrapper;
     uint64_t num_chars = str_data_wrapper.num_bytes;
@@ -19,7 +19,7 @@ GPUColumn* HandleSubString(GPUColumn* string_column, uint64_t start_idx, uint64_
     uint64_t* result_offset = std::get<1>(result);
     uint64_t result_bytes = std::get<2>(result);
 
-    return new GPUColumn(string_column->column_length, ColumnType::VARCHAR, result_data, result_offset, result_bytes, true);
+    return make_shared_ptr<GPUColumn>(string_column->column_length, ColumnType::VARCHAR, result_data, result_offset, result_bytes, true);
 }
 
 }

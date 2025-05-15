@@ -6,14 +6,14 @@
 
 namespace duckdb {
 
-void materializeStringColumnToDuckdbFormat(GPUColumn* column, char* column_char_write_buffer, string_t* column_string_write_buffer);
+void materializeStringColumnToDuckdbFormat(shared_ptr<GPUColumn> column, char* column_char_write_buffer, string_t* column_string_write_buffer);
 
 template <typename T>
-GPUColumn* 
-ResolveTypeMaterializeExpression(GPUColumn* column, BoundReferenceExpression& bound_ref, GPUBufferManager* gpuBufferManager);
+shared_ptr<GPUColumn> 
+ResolveTypeMaterializeExpression(shared_ptr<GPUColumn> column, BoundReferenceExpression& bound_ref, GPUBufferManager* gpuBufferManager);
 
-GPUColumn* 
-HandleMaterializeExpression(GPUColumn* column, BoundReferenceExpression& bound_ref, GPUBufferManager* gpuBufferManager);
+shared_ptr<GPUColumn> 
+HandleMaterializeExpression(shared_ptr<GPUColumn> column, BoundReferenceExpression& bound_ref, GPUBufferManager* gpuBufferManager);
 
 void
 HandleMaterializeRowIDs(GPUIntermediateRelation& input_relation, GPUIntermediateRelation& output_relation, uint64_t count, uint64_t* row_ids, GPUBufferManager* gpuBufferManager, bool maintain_unique);

@@ -21,7 +21,7 @@ namespace duckdb {
 // 		cached_chunk_scan.intermediate_relation = lhs_data;
 // 	}
 
-// 	GPUIntermediateRelation* lhs_data;
+// 	shared_ptr<GPUIntermediateRelation> lhs_data;
 // 	mutex lhs_lock;
 
 // 	void Merge(ColumnDataCollection &input) {
@@ -38,7 +38,7 @@ public:
 	// }
 
 	unique_ptr<LocalSinkState> distinct_state;
-	GPUIntermediateRelation* lhs_data;
+	shared_ptr<GPUIntermediateRelation> lhs_data;
 	ColumnDataAppendState append_state;
 
 	// void Append(DataChunk &input) {
@@ -124,9 +124,15 @@ GPUPhysicalLeftDelimJoin::Sink(GPUIntermediateRelation &input_relation) const {
 	// auto &lstate = input.local_state.Cast<GPULeftDelimJoinLocalState>();
 	// lstate.lhs_data.Append(lstate.append_state, chunk);
 	auto &cached_chunk_scan = join->children[0]->Cast<GPUPhysicalColumnDataScan>();
-	cached_chunk_scan.intermediate_relation = &input_relation;
+	// cached_chunk_scan.intermediate_relation = &input_relation;
 	// OperatorSinkInput distinct_sink_input {*distinct->sink_state, *lstate.distinct_state, input.interrupt_state};
 	// distinct->Sink(context, input_relation, distinct_sink_input);
+	cached_chunk_scan.intermediate_relation = make_shared_ptr<GPUIntermediateRelation>(input_relation.columns.size());
+	for (int i = 0; i < input_relation.columns.size(); i++) {
+		cached_chunk_scan.intermediate_relation->columns[i] = input_relation.columns[i];
+		cached_chunk_scan.intermediate_relation->column_names[i] = input_relation.column_names[i];
+		cached_chunk_scan.intermediate_relation->names = input_relation.names;
+	}
 
 	distinct->Sink(input_relation);
 	return SinkResultType::FINISHED;

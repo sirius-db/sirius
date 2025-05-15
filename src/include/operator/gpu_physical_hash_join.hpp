@@ -15,11 +15,11 @@
 
 namespace duckdb {
 
-void cudf_probe(GPUColumn **probe_keys, cudf::hash_join* hash_table, int num_keys, uint64_t*& row_ids_left, uint64_t*& row_ids_right, uint64_t*& count);
+void cudf_probe(vector<shared_ptr<GPUColumn>>& probe_keys, cudf::hash_join* hash_table, int num_keys, uint64_t*& row_ids_left, uint64_t*& row_ids_right, uint64_t*& count);
 
-void cudf_build(GPUColumn **build_keys, cudf::hash_join*& hash_table, int num_keys);
+void cudf_build(vector<shared_ptr<GPUColumn>>& build_keys, cudf::hash_join*& hash_table, int num_keys);
 
-void cudf_mixed_join(GPUColumn** probe_columns, GPUColumn** build_columns, const vector<JoinCondition>& conditions, JoinType join_type, uint64_t*& row_ids_left, uint64_t*& row_ids_right, uint64_t*& count);
+void cudf_mixed_join(vector<shared_ptr<GPUColumn>>& probe_columns, vector<shared_ptr<GPUColumn>>& build_columns, const vector<JoinCondition>& conditions, JoinType join_type, uint64_t*& row_ids_left, uint64_t*& row_ids_right, uint64_t*& count);
 
 void probeHashTable(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t* &row_ids_left, uint64_t* &row_ids_right, uint64_t* &count, 
 			uint64_t N, int* condition_mode, int num_keys, bool is_right);
@@ -135,8 +135,8 @@ public:
 	mutable unsigned long long* gpu_hash_table;
 	mutable uint64_t ht_len;
 
-	GPUIntermediateRelation* hash_table_result;
+	shared_ptr<GPUIntermediateRelation> hash_table_result;
 
-	GPUIntermediateRelation* materialized_build_key;
+	shared_ptr<GPUIntermediateRelation> materialized_build_key;
 };
 } // namespace duckdb

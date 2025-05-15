@@ -9,7 +9,7 @@
 namespace duckdb {
 
 void 
-ResolveTypeProbeExpression(GPUColumn** &probe_keys, uint64_t* &count, uint64_t* &row_ids_left, uint64_t* &row_ids_right, 
+ResolveTypeProbeExpression(vector<shared_ptr<GPUColumn>> &probe_keys, uint64_t* &count, uint64_t* &row_ids_left, uint64_t* &row_ids_right, 
 		unsigned long long* ht, uint64_t ht_len, const vector<JoinCondition> &conditions, JoinType join_type,
 		bool unique_build_keys, GPUBufferManager* gpuBufferManager) {
 	int num_keys = conditions.size();
@@ -60,7 +60,7 @@ ResolveTypeProbeExpression(GPUColumn** &probe_keys, uint64_t* &count, uint64_t* 
 }
 
 void
-HandleProbeExpression(GPUColumn** &probe_keys, uint64_t* &count, uint64_t* &row_ids_left, uint64_t* &row_ids_right, 
+HandleProbeExpression(vector<shared_ptr<GPUColumn>> &probe_keys, uint64_t* &count, uint64_t* &row_ids_left, uint64_t* &row_ids_right, 
 		unsigned long long* ht, uint64_t ht_len, const vector<JoinCondition> &conditions, JoinType join_type, 
 		bool unique_build_keys, GPUBufferManager* gpuBufferManager) {
     switch(probe_keys[0]->data_wrapper.type) {
@@ -77,7 +77,7 @@ HandleProbeExpression(GPUColumn** &probe_keys, uint64_t* &count, uint64_t* &row_
 }
 
 void
-ResolveTypeMarkExpression(GPUColumn** &probe_keys, uint8_t* &output, 
+ResolveTypeMarkExpression(vector<shared_ptr<GPUColumn>> &probe_keys, uint8_t* &output, 
 		unsigned long long* ht, uint64_t ht_len, const vector<JoinCondition> &conditions, GPUBufferManager* gpuBufferManager) {
 
 	int num_keys = conditions.size();
@@ -105,7 +105,7 @@ ResolveTypeMarkExpression(GPUColumn** &probe_keys, uint8_t* &output,
 }
 
 void
-HandleMarkExpression(GPUColumn** &probe_keys, uint8_t* &output, 
+HandleMarkExpression(vector<shared_ptr<GPUColumn>> &probe_keys, uint8_t* &output, 
 		unsigned long long* ht, uint64_t ht_len, const vector<JoinCondition> &conditions, GPUBufferManager* gpuBufferManager) {
     switch(probe_keys[0]->data_wrapper.type) {
       case ColumnType::INT64:
@@ -119,7 +119,7 @@ HandleMarkExpression(GPUColumn** &probe_keys, uint8_t* &output,
 }
 
 void 
-ResolveTypeBuildExpression(GPUColumn** &build_keys, unsigned long long* ht, uint64_t ht_len, 
+ResolveTypeBuildExpression(vector<shared_ptr<GPUColumn>> &build_keys, unsigned long long* ht, uint64_t ht_len, 
 	const vector<JoinCondition> &conditions, JoinType join_type, GPUBufferManager* gpuBufferManager) {
 	int num_keys = conditions.size();
 	uint8_t** build_data = new uint8_t*[num_keys];
@@ -153,7 +153,7 @@ ResolveTypeBuildExpression(GPUColumn** &build_keys, unsigned long long* ht, uint
 }
 
 void
-HandleBuildExpression(GPUColumn** &build_keys, unsigned long long* ht, uint64_t ht_len, 
+HandleBuildExpression(vector<shared_ptr<GPUColumn>> &build_keys, unsigned long long* ht, uint64_t ht_len, 
 	const vector<JoinCondition> &conditions, JoinType join_type, GPUBufferManager* gpuBufferManager) {
     switch(build_keys[0]->data_wrapper.type) {
       case ColumnType::INT64:
@@ -263,8 +263,8 @@ GPUPhysicalHashJoin::GPUPhysicalHashJoin(LogicalOperator &op, unique_ptr<GPUPhys
 
 	// For ANTI, SEMI and MARK join, we only need to store the keys, so for these the payload/RHS types are empty
 	if (join_type == JoinType::ANTI || join_type == JoinType::SEMI || join_type == JoinType::MARK) {
-		materialized_build_key = new GPUIntermediateRelation(build_columns_in_conditions.size());
-		hash_table_result = new GPUIntermediateRelation(build_columns_in_conditions.size());
+		materialized_build_key = make_shared_ptr<GPUIntermediateRelation>(build_columns_in_conditions.size());
+		hash_table_result = make_shared_ptr<GPUIntermediateRelation>(build_columns_in_conditions.size());
 		return;
 	}
 
@@ -296,10 +296,8 @@ GPUPhysicalHashJoin::GPUPhysicalHashJoin(LogicalOperator &op, unique_ptr<GPUPhys
 		rhs_output_columns.col_types.push_back(rhs_col_type);
 	}
 
-	printf("rhs_output_columns.size() = %ld\n", rhs_output_columns.col_idxs.size());
-	printf("lhs_output_columns.size() = %ld\n", lhs_output_columns.col_idxs.size());
-	hash_table_result = new GPUIntermediateRelation(build_columns_in_conditions.size() + payload_columns.col_idxs.size());
-	materialized_build_key = new GPUIntermediateRelation(build_columns_in_conditions.size());
+	hash_table_result = make_shared_ptr<GPUIntermediateRelation>(build_columns_in_conditions.size() + payload_columns.col_idxs.size());
+	materialized_build_key = make_shared_ptr<GPUIntermediateRelation>(build_columns_in_conditions.size());
 };
 
 // SourceResultType
@@ -314,7 +312,7 @@ GPUPhysicalHashJoin::GetData(GPUIntermediateRelation &output_relation) const {
 	} else if (join_type == JoinType::RIGHT) {
 		for (idx_t col = 0; col < left_column_count; col++) {
 			//pretend this to be NUll column from the left table (it should be NULL for the RIGHT join)
-			output_relation.columns[col] = new GPUColumn(0, ColumnType::INT64, nullptr);
+			output_relation.columns[col] = make_shared_ptr<GPUColumn>(0, ColumnType::INT64, nullptr);
 		}
 	} else {
 		throw InvalidInputException("Get data not supported for this join type");
@@ -389,7 +387,7 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 	}
 
 	GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
-	GPUColumn** probe_key = new GPUColumn*[conditions.size()];
+	vector<shared_ptr<GPUColumn>> probe_key(conditions.size());
 	for (int i = 0; i < conditions.size(); i++) {
 		probe_key[i] = nullptr;
 	}
@@ -430,7 +428,7 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 	printf("Probing hash table\n");
 	if (join_type == JoinType::INNER) {
 		// check if there is a non-equality condition
-		GPUColumn** build_key = new GPUColumn*[conditions.size()];
+		vector<shared_ptr<GPUColumn>> build_key(conditions.size());
 		for (int cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
 			build_key[cond_idx] = materialized_build_key->columns[cond_idx];
 		}
@@ -500,7 +498,7 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 		for (idx_t i = 0; i < lhs_output_columns.col_idxs.size(); i++) {
 			auto lhs_col = lhs_output_columns.col_idxs[i];
 			printf("Passing column idx %ld from LHS to idx %ld in output relation\n", lhs_col, i);
-			output_relation.columns[i] = new GPUColumn(input_relation.columns[lhs_col]->column_length, input_relation.columns[lhs_col]->data_wrapper.type, input_relation.columns[lhs_col]->data_wrapper.data);
+			output_relation.columns[i] = make_shared_ptr<GPUColumn>(input_relation.columns[lhs_col]->column_length, input_relation.columns[lhs_col]->data_wrapper.type, input_relation.columns[lhs_col]->data_wrapper.data);
 			output_relation.columns[i]->row_ids = input_relation.columns[lhs_col]->row_ids;
 			output_relation.columns[i]->row_id_count = input_relation.columns[lhs_col]->row_id_count;
 			if (unique_build_keys) {
@@ -509,7 +507,7 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 				output_relation.columns[i]->is_unique = false;
 			}
 		}
-		output_relation.columns[lhs_output_columns.col_idxs.size()] = new GPUColumn(probe_key[0]->column_length, ColumnType::BOOLEAN, output);
+		output_relation.columns[lhs_output_columns.col_idxs.size()] = make_shared_ptr<GPUColumn>(probe_key[0]->column_length, ColumnType::BOOLEAN, output);
 		output_relation.columns[lhs_output_columns.col_idxs.size()]->row_ids = probe_key[0]->row_ids;
 		output_relation.columns[lhs_output_columns.col_idxs.size()]->row_id_count = probe_key[0]->row_id_count;
 		// free all the columns in the input relation that are not in the lhs_output_columns
@@ -569,7 +567,7 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 			const auto rhs_col = rhs_output_columns.col_idxs[i];
 			printf("Passing column idx %ld from RHS (late materialized) to idx %ld in output relation\n", rhs_col, i);
 			// output_relation.columns[output_col_idx] = HandleMaterializeRowIDs(hash_table_result->columns[output_col_idx], count[0], row_ids_right, gpuBufferManager);
-			output_relation.columns[i] = new GPUColumn(0, hash_table_result->columns[rhs_col]->data_wrapper.type, nullptr);
+			output_relation.columns[i] = make_shared_ptr<GPUColumn>(0, hash_table_result->columns[rhs_col]->data_wrapper.type, nullptr);
 		}
 	}
 
@@ -597,7 +595,7 @@ GPUPhysicalHashJoin::Sink(GPUIntermediateRelation &input_relation) const {
 	}
 
 	GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
-	GPUColumn** build_keys = new GPUColumn*[conditions.size()];
+	vector<shared_ptr<GPUColumn>> build_keys(conditions.size());
 	for (idx_t i = 0; i < conditions.size(); i++) {
 		build_keys[i] = nullptr;
 	}

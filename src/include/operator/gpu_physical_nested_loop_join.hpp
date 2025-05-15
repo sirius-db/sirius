@@ -44,7 +44,7 @@ public:
 	//! Duplicate eliminated types; only used for delim_joins (i.e. correlated subqueries)
 	vector<LogicalType> delim_types;
 
-    GPUIntermediateRelation *right_temp_data;
+    shared_ptr<GPUIntermediateRelation> right_temp_data;
 
 public:
 	// Operator Interface

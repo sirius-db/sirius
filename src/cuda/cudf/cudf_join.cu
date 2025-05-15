@@ -5,7 +5,7 @@
 
 namespace duckdb {
 
-void cudf_probe(GPUColumn **probe_keys, cudf::hash_join* hash_table, int num_keys, uint64_t*& row_ids_left, uint64_t*& row_ids_right, uint64_t*& count)
+void cudf_probe(vector<shared_ptr<GPUColumn>>& probe_keys, cudf::hash_join* hash_table, int num_keys, uint64_t*& row_ids_left, uint64_t*& row_ids_right, uint64_t*& count)
 {
     if (probe_keys[0]->column_length == 0) {
         printf("N is 0\n");
@@ -42,7 +42,7 @@ void cudf_probe(GPUColumn **probe_keys, cudf::hash_join* hash_table, int num_key
     count[0] = result_count;
 }
 
-void cudf_build(GPUColumn **build_columns, cudf::hash_join*& hash_table, int num_keys) {
+void cudf_build(vector<shared_ptr<GPUColumn>>& build_columns, cudf::hash_join*& hash_table, int num_keys) {
 
     if (build_columns[0]->column_length == 0) {
         printf("N is 0\n");
@@ -61,7 +61,7 @@ void cudf_build(GPUColumn **build_columns, cudf::hash_join*& hash_table, int num
     hash_table = new cudf::hash_join(build_table, cudf::null_equality::EQUAL);
 }
 
-void cudf_mixed_join(GPUColumn** probe_columns, GPUColumn** build_columns, const vector<JoinCondition>& conditions, JoinType join_type, uint64_t*& row_ids_left, uint64_t*& row_ids_right, uint64_t*& count) {
+void cudf_mixed_join(vector<shared_ptr<GPUColumn>>& probe_columns, vector<shared_ptr<GPUColumn>>& build_columns, const vector<JoinCondition>& conditions, JoinType join_type, uint64_t*& row_ids_left, uint64_t*& row_ids_right, uint64_t*& count) {
     
     if (build_columns[0]->column_length == 0 || probe_columns[0]->column_length == 0) {
         printf("N is 0\n");

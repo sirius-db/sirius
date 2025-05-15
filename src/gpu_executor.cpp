@@ -53,8 +53,8 @@ void GPUExecutor::Execute() {
 		// 	continue;
 		// }
 
-		vector<GPUIntermediateRelation*> intermediate_relations;
-		GPUIntermediateRelation* final_relation;
+		vector<shared_ptr<GPUIntermediateRelation>> intermediate_relations;
+		shared_ptr<GPUIntermediateRelation> final_relation;
 		// vector<unique_ptr<OperatorState>> intermediate_states;
 		intermediate_relations.reserve(pipeline->operators.size());
 		// intermediate_states.reserve(pipeline->operators.size());
@@ -66,7 +66,7 @@ void GPUExecutor::Execute() {
 
 			// auto chunk = make_uniq<DataChunk>();
 			// chunk->Initialize(Allocator::Get(context.client), prev_operator.GetTypes());
-			GPUIntermediateRelation* inter_rel = new GPUIntermediateRelation(prev_operator.GetTypes().size());
+			shared_ptr<GPUIntermediateRelation> inter_rel = make_shared_ptr<GPUIntermediateRelation>(prev_operator.GetTypes().size());
 			intermediate_relations.push_back(std::move(inter_rel));
 
 			// auto op_state = current_operator.GetOperatorState(context);
@@ -80,7 +80,7 @@ void GPUExecutor::Execute() {
 		}
 		// InitializeChunk(final_chunk);
 		auto &last_op = pipeline->operators.empty() ? *pipeline->source : pipeline->operators.back().get();
-		final_relation = new GPUIntermediateRelation(last_op.GetTypes().size());
+		final_relation = make_shared_ptr<GPUIntermediateRelation>(last_op.GetTypes().size());
 
 		// auto thread_context = ThreadContext(context);
 		// auto exec_context = GPUExecutionContext(context, thread_context, pipeline.get());

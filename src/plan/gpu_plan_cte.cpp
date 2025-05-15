@@ -16,7 +16,7 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::CreatePlan(LogicalMate
 
 	// Create the working_table that the PhysicalCTE will use for evaluation.
 	auto working_table = make_shared_ptr<ColumnDataCollection>(context, op.children[0]->types);
-	auto working_table_gpu = new GPUIntermediateRelation(op.children[0]->types.size());
+	auto working_table_gpu = make_shared_ptr<GPUIntermediateRelation>(op.children[0]->types.size());
 
 	// Add the ColumnDataCollection to the context of this PhysicalPlanGenerator
 	recursive_cte_tables[op.table_index] = working_table;
