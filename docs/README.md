@@ -30,7 +30,7 @@ conda create --name libcudf-env
 conda activate libcudf-env
 conda install -c rapidsai -c conda-forge -c nvidia rapidsai::libcudf
 ```
-User would need to set the environment variable `USE_CUDF = 1`. User also needs to make sure that the environment variable `LIBCUDF_ENV_PREFIX` is set to the path to the conda environment's directory. For example, if you installed miniconda to the path `~/miniconda3` and you installed libcudf in the conda environment `libcudf-env` then you would set the `LIBCUDF_ENV_PREFIX` to `~/miniconda3/envs/libcudf-env`.
+User would need to set the environment variable `USE_CUDF = 1`. User also needs to make sure that the environment variable `LIBCUDF_ENV_PREFIX` is set to the path to the conda environment's directory. For example, if user installed miniconda to the path `~/miniconda3` and installed libcudf in the conda environment `libcudf-env` then user would set the `LIBCUDF_ENV_PREFIX` to `~/miniconda3/envs/libcudf-env`.
 ```
 export USE_CUDF=1
 export LIBCUDF_ENV_PREFIX = {PATH to libcudf-env}
@@ -65,12 +65,12 @@ To load the TPC-H dataset to duckdb, run this command from the duckdb shell
 ```
 
 ## Running Sirius
-To run Sirius, simply start the shell with `./build/release/duckdb {DATABASE_NAME}.duckdb`. User first need to initialize the GPU buffer manager using `gpu_buffer_init` API. The `gpu_buffer_init` API accepts 2 parameters, the GPU caching region size and the GPU processing region size. The GPU caching region is a memory region where the raw data is stored in GPUs. The GPUs processing region is a memory region where intermediate results are stored in GPUs/CPUs (hash tables, .etc). Queries will not be able to execute on GPUs if these parameters are unset.
+To run Sirius, simply start the shell with `./build/release/duckdb {DATABASE_NAME}.duckdb`. User first need to initialize the GPU buffer manager using `gpu_buffer_init` API. The `gpu_buffer_init` API accepts 2 parameters, the GPU caching region size and the GPU processing region size. The GPU caching region is a memory region where the raw data is stored in GPUs. The GPUs processing region is a memory region where intermediate results are stored in GPUs/CPUs (hash tables, .etc). For example, to set the caching region as 1 GB and the processing region as 2 GB, user can run the following command:
 ```
 call gpu_buffer_init("1 GB", "1 GB")
 ```
 
-To execute query on GPUs
+After that, to execute a query on GPUs:
 ```
 call gpu_processing("select
   l_orderkey,
@@ -94,13 +94,13 @@ group by
 ```
 The cold run in Sirius would be significantly slower as Sirius would need to read the data from storage via DuckDB and perform conversion from the DuckDB format to Sirius native format. The hot run would be significantly faster as the data would be cached on the device memory.
 
-All 22 TPC-H queries are in tpch-queries.sql. To run all the TPC-H queries:
+All 22 TPC-H queries are saved in tpch-queries.sql. To run all the TPC-H queries:
 ```
 .read tpch-queries.sql
 ```
 
 ## Testing
-We have a unittest for Sirius to compare all the TPC-H query results with DuckDB. To run the unittest, the user first need to generate SF=1 TPC-H dataset using method described [here](https://github.com/sirius-db/sirius?tab=readme-ov-file#generating-tpc-h-dataset). After that, to run the unittest:
+We provide a unittest for Sirius to compare all the TPC-H query results with DuckDB. To run the unittest, the user first need to generate SF=1 TPC-H dataset using method described [here](https://github.com/sirius-db/sirius?tab=readme-ov-file#generating-tpc-h-dataset) and run the unittest using the following commands:
 ```
 make test
 ```
@@ -109,3 +109,10 @@ make test
 Running TPC-H on SF=100, Sirius achieves ~10x speedup over existing CPU query engines at the same hardware rental cost, making it well-suited for interactive analytics, financial workloads, and ETL jobs.
 
 ![Performance](sirius-performance.png)
+
+## Future Roadmap
+Sirius is still under development and we are working on adding more features to Sirius, such as [storage/disk support](https://github.com/sirius-db/sirius/issues/19), [multi-GPUs](https://github.com/sirius-db/sirius/issues/18), [multi-node](https://github.com/sirius-db/sirius/issues/18), unsupported [operators](https://github.com/sirius-db/sirius/issues/21), [data types](https://github.com/sirius-db/sirius/issues/20), and many more.
+
+Sirius still have a long way to go and we always welcome new contributors to Sirius. If you are interested, check our [website](https://www.sirius-db.com/), subscribe to our [mailing list](siriusdb@cs.wisc.edu) and join our [slack channel](https://join.slack.com/t/sirius-db/shared_invite/zt-33tuwt1sk-aa2dk0EU_dNjklSjIGW3vg).
+
+**Let's kickstart the GPU eras for Data Analytics!**
