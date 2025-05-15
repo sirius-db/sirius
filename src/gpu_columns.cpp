@@ -37,34 +37,6 @@ GPUColumn::GPUColumn(size_t _column_length, ColumnType type, uint8_t* data) {
     row_ids = nullptr;
     data_wrapper.offset = nullptr;
     data_wrapper.num_bytes = column_length * data_wrapper.getColumnTypeSize();
-    // if (data == nullptr) isNull = 1;
-    // else isNull = 0;
-    is_unique = false;
-}
-
-GPUColumn::GPUColumn(string _name, size_t _column_length, ColumnType type, uint8_t* data) {
-    name = _name;
-    column_length = _column_length;
-    data_wrapper = DataWrapper(type, data, _column_length);
-    row_ids = nullptr;
-    data_wrapper.offset = nullptr;
-    data_wrapper.num_bytes = column_length * data_wrapper.getColumnTypeSize();
-    // if (data == nullptr) isNull = 1;
-    // else isNull = 0;
-    is_unique = false;
-}
-
-GPUColumn::GPUColumn(string _name, size_t _column_length, ColumnType type, uint8_t* data, uint64_t* offset, size_t num_bytes, bool is_string_data) {
-    name = _name;
-    column_length = _column_length;
-    data_wrapper = DataWrapper(type, data, offset, _column_length, num_bytes, is_string_data);
-    row_ids = nullptr;
-    // isString = is_string_data;
-    if (is_string_data) {
-        data_wrapper.num_bytes = num_bytes;
-    } else {
-        data_wrapper.num_bytes = column_length * data_wrapper.getColumnTypeSize();
-    }
     is_unique = false;
 }
 
@@ -72,7 +44,6 @@ GPUColumn::GPUColumn(size_t _column_length, ColumnType type, uint8_t* data, uint
     column_length = _column_length;
     data_wrapper = DataWrapper(type, data, offset, _column_length, num_bytes, is_string_data);
     row_ids = nullptr;
-    // isString = is_string_data;
     if (is_string_data) {
         data_wrapper.num_bytes = num_bytes;
     } else {
@@ -82,14 +53,11 @@ GPUColumn::GPUColumn(size_t _column_length, ColumnType type, uint8_t* data, uint
 }
 
 GPUColumn::GPUColumn(GPUColumn& other) {
-    name = other.name;
     data_wrapper = other.data_wrapper;
     row_ids = other.row_ids;
     row_id_count = other.row_id_count;
     column_length = other.column_length;
-    // isString = other.isString;
     is_unique = other.is_unique;
-    // rmm_owned_buffer = std::move(other.rmm_owned_buffer);
 }
 
 cudf::column_view

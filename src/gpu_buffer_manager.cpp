@@ -669,10 +669,10 @@ GPUBufferManager::createColumn(string up_table_name, string up_column_name, Colu
     shared_ptr<GPUIntermediateRelation> table = tables[up_table_name];
     table->column_names[column_id] = up_column_name;
     if (find(unique_columns.begin(), unique_columns.end(), column_id) != unique_columns.end()) {
-        table->columns[column_id] = make_shared_ptr<GPUColumn>(up_column_name, 0, column_type, nullptr);
+        table->columns[column_id] = make_shared_ptr<GPUColumn>(0, column_type, nullptr);
         table->columns[column_id]->is_unique = true;
     } else {
-        table->columns[column_id] = make_shared_ptr<GPUColumn>(up_column_name, 0, column_type, nullptr);
+        table->columns[column_id] = make_shared_ptr<GPUColumn>(0, column_type, nullptr);
         table->columns[column_id]->is_unique = false;
     }
 }
