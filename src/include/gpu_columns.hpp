@@ -68,9 +68,7 @@ public:
 
 class GPUColumn {
 public:
-    GPUColumn(string name, size_t column_length, ColumnType type, uint8_t* data);
     GPUColumn(size_t column_length, ColumnType type, uint8_t* data);
-    GPUColumn(string _name, size_t _column_length, ColumnType type, uint8_t* data, uint64_t* offset, size_t num_bytes, bool is_string_data);
     GPUColumn(size_t _column_length, ColumnType type, uint8_t* data, uint64_t* offset, size_t num_bytes, bool is_string_data);
     GPUColumn(GPUColumn& other);
     ~GPUColumn(){};
@@ -83,14 +81,11 @@ public:
     uint64_t* GetRowIds();
     uint8_t* GetData();
 
-    string name;
     DataWrapper data_wrapper;
     uint64_t* row_ids;
     size_t row_id_count;
     size_t column_length;
-    // bool isNull;
     bool is_unique;
-    // std::unique_ptr<rmm::device_buffer> rmm_owned_buffer;
 
     cudf::column_view convertToCudfColumn();
     int32_t* convertSiriusOffsetToCudfOffset();
@@ -98,12 +93,10 @@ public:
     void convertCudfRowIdsToSiriusRowIds(int32_t* cudf_row_ids);
     void convertCudfOffsetToSiriusOffset(int32_t* cudf_offset);
     void setFromCudfColumn(cudf::column& cudf_column, bool _is_unique, int32_t* _row_ids, uint64_t _row_id_count, GPUBufferManager* gpuBufferManager);
-    // bool isString{false};
 };
 
 class GPUIntermediateRelation {
 public:
-    // GPUIntermediateRelation(size_t length, size_t column_count);
     GPUIntermediateRelation(size_t column_count);
     ~GPUIntermediateRelation(){};
     bool checkLateMaterialization(size_t idx);
@@ -111,9 +104,7 @@ public:
     string names;
 	vector<string> column_names;
     vector<shared_ptr<GPUColumn>> columns;
-    // map<string, GPUColumn*> columns;
     size_t column_count;
-    // cudf::table_view convertToCudfTable();
 };
 
 
