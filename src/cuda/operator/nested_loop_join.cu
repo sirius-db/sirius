@@ -140,8 +140,9 @@ __global__ void nested_loop_join<uint64_t, BLOCK_THREADS, 1>(uint64_t *left_keys
 template <typename T>
 void nestedLoopJoin(T** left_data, T** right_data, uint64_t* &row_ids_left, uint64_t* &row_ids_right, uint64_t* &count, uint64_t left_size, uint64_t right_size, int* condition_mode, int num_keys) {
     CHECK_ERROR();
+    GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
     if (left_size == 0 || right_size == 0) {
-        uint64_t* h_count = new uint64_t[1];
+        uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
         h_count[0] = 0;
         count = h_count;
         printf("N is 0\n");
@@ -150,7 +151,6 @@ void nestedLoopJoin(T** left_data, T** right_data, uint64_t* &row_ids_left, uint
     printf("Launching Nested Loop Join Kernel\n");
     // printf("left size: %lu right size : %lu\n", left_size, right_size);
     int tile_items = BLOCK_THREADS * 1;
-    GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
     count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
     cudaMemset(count, 0, sizeof(uint64_t));
     uint64_t* offset_each_thread = gpuBufferManager->customCudaMalloc<uint64_t>(((left_size + tile_items - 1)/tile_items) * BLOCK_THREADS, 0, 0);
@@ -162,7 +162,7 @@ void nestedLoopJoin(T** left_data, T** right_data, uint64_t* &row_ids_left, uint
     CHECK_ERROR();
     cudaDeviceSynchronize();
 
-    uint64_t* h_count = new uint64_t[1];
+    uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
     cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
     assert(h_count[0] > 0);
     printf("Count: %lu\n", h_count[0]);

@@ -217,7 +217,7 @@ shared_ptr<GPUColumn> ResolveStringMateralizeExpression(shared_ptr<GPUColumn> co
     result = column->data_wrapper.data;
     result_offset = column->data_wrapper.offset;
     num_rows = column->column_length;
-    new_num_bytes = new uint64_t[1];
+    new_num_bytes = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
     new_num_bytes[0] = column->data_wrapper.num_bytes;
   }
   //HERE

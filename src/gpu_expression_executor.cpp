@@ -259,7 +259,7 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
                 // printf("input_relation.columns.size() %ld\n", input_relation.columns.size());
                 // printf("bound_ref.index %ld\n", bound_ref.index);
                 output_relation.columns[bound_ref.index] = input_relation.columns[bound_ref.index];
-                output_relation.columns[bound_ref.index]->row_ids = new uint64_t[1];
+                output_relation.columns[bound_ref.index]->row_ids = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
                 printf("Overwrite row ids with column %ld\n", bound_ref.index);
             break;
           } case ExpressionClass::BOUND_CASE: {
@@ -291,7 +291,7 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
 
                     if (input_relation.columns[bound_ref1.index]->data_wrapper.data == nullptr) {
                         printf("Column is null\n");
-                        count = new uint64_t[1];
+                        count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
                         count[0] = 0;
                     } else {
                         shared_ptr<GPUColumn> materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref1.index], bound_ref1, gpuBufferManager);
@@ -306,7 +306,7 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
 
                     if (input_relation.columns[bound_ref1.index]->data_wrapper.data == nullptr || input_relation.columns[bound_ref2.index]->data_wrapper.data == nullptr) {
                         printf("Column is null\n");
-                        count = new uint64_t[1];
+                        count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
                         count[0] = 0;
                     } else {
                         shared_ptr<GPUColumn> materialized_column1 = HandleMaterializeExpression(input_relation.columns[bound_ref1.index], bound_ref1, gpuBufferManager);
@@ -346,7 +346,7 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
                 std::string match_str = bound_const.value.ToString();
                 if (input_relation.columns[bound_ref.index]->data_wrapper.data == nullptr) {
                     printf("Column is null\n");
-                    count = new uint64_t[1];
+                    count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
                     count[0] = 0;
                 } else {
                   // count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
@@ -378,7 +378,7 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
                       auto &bound_ref = bound_operator.children[0]->Cast<BoundReferenceExpression>();
                       if (input_relation.columns[bound_ref.index]->data_wrapper.data == nullptr) {
                           printf("Column is null\n");
-                          count = new uint64_t[1];
+                          count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
                           count[0] = 0;
                       } else {
                         shared_ptr<GPUColumn> materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref.index], bound_ref, gpuBufferManager);
@@ -397,7 +397,7 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
                       std::string match_str = bound_const.value.ToString();
                       if (input_relation.columns[bound_ref.index]->data_wrapper.data == nullptr) {
                           printf("Column is null\n");
-                          count = new uint64_t[1];
+                          count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
                           count[0] = 0;
                       } else {
                         // count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);

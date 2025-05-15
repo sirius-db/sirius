@@ -222,8 +222,9 @@ __global__ void probe_right_semi_anti_single<BLOCK_THREADS, ITEMS_PER_THREAD>(ui
 void probeHashTableSingleMatch(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t* &row_ids_left, uint64_t* &row_ids_right, 
             uint64_t* &count, uint64_t N, int* condition_mode, int num_keys, int join_mode) {
     CHECK_ERROR();
+    GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
     if (N == 0) {
-        uint64_t* h_count = new uint64_t[1];
+        uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
         h_count[0] = 0;
         count = h_count;
         printf("N is 0\n");
@@ -232,7 +233,6 @@ void probeHashTableSingleMatch(uint8_t **keys, unsigned long long* ht, uint64_t 
     printf("Launching Probe Kernel Unique Join\n");
     SETUP_TIMING();
     START_TIMER();
-    GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
     count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
     cudaMemset(count, 0, sizeof(uint64_t));
 
@@ -268,7 +268,7 @@ void probeHashTableSingleMatch(uint8_t **keys, unsigned long long* ht, uint64_t 
     CHECK_ERROR();
     cudaDeviceSynchronize();
 
-    uint64_t* h_count = new uint64_t [1];
+    uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
     cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
     assert(h_count[0] > 0);
     printf("Count: %lu\n", h_count[0]);

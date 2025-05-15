@@ -7,14 +7,14 @@ namespace duckdb {
 
 void cudf_probe(vector<shared_ptr<GPUColumn>>& probe_keys, cudf::hash_join* hash_table, int num_keys, uint64_t*& row_ids_left, uint64_t*& row_ids_right, uint64_t*& count)
 {
+    GPUBufferManager *gpuBufferManager = &(GPUBufferManager::GetInstance());
     if (probe_keys[0]->column_length == 0) {
         printf("N is 0\n");
-        count = new uint64_t[1];
+        count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
         count[0] = 0;
         return;
     }
 
-    GPUBufferManager *gpuBufferManager = &(GPUBufferManager::GetInstance());
     cudf::set_current_device_resource(gpuBufferManager->mr);
     printf("CUDF probe\n");
 
@@ -38,7 +38,7 @@ void cudf_probe(vector<shared_ptr<GPUColumn>>& probe_keys, cudf::hash_join* hash
     gpuBufferManager->rmm_stored_buffers.push_back(std::make_unique<rmm::device_buffer>(std::move(row_ids_left_buffer)));
     gpuBufferManager->rmm_stored_buffers.push_back(std::make_unique<rmm::device_buffer>(std::move(row_ids_right_buffer)));
 
-    count = new uint64_t[1];
+    count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
     count[0] = result_count;
 }
 
@@ -63,16 +63,16 @@ void cudf_build(vector<shared_ptr<GPUColumn>>& build_columns, cudf::hash_join*& 
 
 void cudf_mixed_join(vector<shared_ptr<GPUColumn>>& probe_columns, vector<shared_ptr<GPUColumn>>& build_columns, const vector<JoinCondition>& conditions, JoinType join_type, uint64_t*& row_ids_left, uint64_t*& row_ids_right, uint64_t*& count) {
     
+    GPUBufferManager *gpuBufferManager = &(GPUBufferManager::GetInstance());
     if (build_columns[0]->column_length == 0 || probe_columns[0]->column_length == 0) {
         printf("N is 0\n");
-        count = new uint64_t[1];
+        count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
         count[0] = 0;
         return;
     }
 
     printf("CUDF mixed join\n");
 
-    GPUBufferManager *gpuBufferManager = &(GPUBufferManager::GetInstance());
     cudf::set_current_device_resource(gpuBufferManager->mr);
 
     std::vector<cudf::column_view> probe_equal_columns;
@@ -132,7 +132,7 @@ void cudf_mixed_join(vector<shared_ptr<GPUColumn>>& probe_columns, vector<shared
     gpuBufferManager->rmm_stored_buffers.push_back(std::make_unique<rmm::device_buffer>(std::move(row_ids_left_buffer)));
     gpuBufferManager->rmm_stored_buffers.push_back(std::make_unique<rmm::device_buffer>(std::move(row_ids_right_buffer)));
 
-    count = new uint64_t[1];
+    count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
     count[0] = result_count;
 }
 

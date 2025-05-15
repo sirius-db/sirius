@@ -130,7 +130,7 @@ GPUColumn::setFromCudfColumn(cudf::column& cudf_column, bool _is_unique, int32_t
         int32_t* temp_offset = reinterpret_cast<int32_t*>(child_cont.data->data());
         convertCudfOffsetToSiriusOffset(temp_offset);
         //copy data from offset to num_bytes
-        uint64_t* temp_num_bytes = new uint64_t[1];
+        uint64_t* temp_num_bytes = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
         callCudaMemcpyDeviceToHost<uint64_t>(temp_num_bytes, data_wrapper.offset + column_length, 1, 0);
         data_wrapper.num_bytes = temp_num_bytes[0];
     } else if (col_type == cudf::data_type(cudf::type_id::UINT64)) {

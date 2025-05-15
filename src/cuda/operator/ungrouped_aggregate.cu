@@ -100,7 +100,7 @@ void ungroupedAggregate(uint8_t **a, uint8_t **result, uint64_t N, int* agg_mode
 
     for (int agg = 0; agg < num_aggregates; agg++) {
         if (agg_mode[agg] == 4) {
-            uint64_t* res = new uint64_t[1];
+            uint64_t* res = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
             res[0] = N;
             uint64_t* result_temp = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
             cudaMemcpy(result_temp, res, sizeof(uint64_t), cudaMemcpyHostToDevice);
