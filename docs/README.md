@@ -1,5 +1,7 @@
 <!-- ![Sirius](sirius-full.png) -->
-<img src="sirius-full.png" alt="Diagram" width="400"/>
+<p align="center">
+  <img src="sirius-full.png" alt="Diagram" width="600"/>
+</p>
 
 # Sirius
 Sirius is a GPU acceleration layer for SQL analytics. It plugs into existing engines such as DuckDB via the standard Substrait query format, requiring no query rewrites or major system changes. Currently supports DuckDB and Doris, other systems marked with * are on our roadmap.
@@ -104,5 +106,5 @@ make test
 ```
 
 ## Performance
-On SF=100, Sirius achieves over 10x speedup over existing CPU query engines at the same hardware rental cost, making it well-suited for interactive analytics, financial workloads, and ETL jobs.
-![Performance](sirius-performance.pdf)
+Running TPC-H on SF=100, Sirius achieves ~10x speedup over existing CPU query engines at the same hardware rental cost, making it well-suited for interactive analytics, financial workloads, and ETL jobs.
+![Performance](sirius-performance.png)
