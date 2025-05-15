@@ -107,4 +107,5 @@ make test
 
 ## Performance
 Running TPC-H on SF=100, Sirius achieves ~10x speedup over existing CPU query engines at the same hardware rental cost, making it well-suited for interactive analytics, financial workloads, and ETL jobs.
+
 ![Performance](sirius-performance.png)
