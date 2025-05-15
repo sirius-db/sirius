@@ -6,7 +6,10 @@
 # Sirius
 Sirius is a GPU acceleration layer for SQL analytics. It plugs into existing engines such as DuckDB via the standard Substrait query format, requiring no query rewrites or major system changes. Currently supports DuckDB and Doris (coming soon), other systems marked with * are on our roadmap.
 
-![Architecture](sirius-architecture.png)
+<!-- ![Architecture](sirius-architecture.png) -->
+<p align="center">
+  <img src="sirius-architecture.png" alt="Diagram" width="900"/>
+</p>
 
 ## Installing dependencies
 Install duckdb dependencies
