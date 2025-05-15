@@ -113,8 +113,8 @@ Running TPC-H on SF=100, Sirius achieves ~10x speedup over existing CPU query en
 ![Performance](sirius-performance.png)
 
 ## Future Roadmap
-Sirius is still under development and we are working on adding more features to Sirius, such as [storage/disk support](https://github.com/sirius-db/sirius/issues/19), [multi-GPUs](https://github.com/sirius-db/sirius/issues/18), [multi-node](https://github.com/sirius-db/sirius/issues/18), supporting more [operators](https://github.com/sirius-db/sirius/issues/21), [data types](https://github.com/sirius-db/sirius/issues/20), accelerating more engines, and many more.
+Sirius is still under major development and we are working on adding more features to Sirius, such as [storage/disk support](https://github.com/sirius-db/sirius/issues/19), [multi-GPUs](https://github.com/sirius-db/sirius/issues/18), [multi-node](https://github.com/sirius-db/sirius/issues/18), more [operators](https://github.com/sirius-db/sirius/issues/21), [data types](https://github.com/sirius-db/sirius/issues/20), accelerating more engines, and many more.
 
-Sirius is a young project with big goals - we welcome contributors! If you are interested, check our [website](https://www.sirius-db.com/), subscribe to our [mailing list](siriusdb@cs.wisc.edu) and join our [slack channel](https://join.slack.com/t/sirius-db/shared_invite/zt-33tuwt1sk-aa2dk0EU_dNjklSjIGW3vg).
+Sirius always welcomes new contributors! If you are interested, check our [website](https://www.sirius-db.com/), subscribe to our [mailing list](siriusdb@cs.wisc.edu) and join our [slack channel](https://join.slack.com/t/sirius-db/shared_invite/zt-33tuwt1sk-aa2dk0EU_dNjklSjIGW3vg).
 
 **Let's kickstart the GPU eras for Data Analytics!**
