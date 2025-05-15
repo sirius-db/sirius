@@ -12,11 +12,12 @@ Sirius is a GPU acceleration layer for SQL analytics. It plugs into existing eng
 </p>
 
 ## Installing dependencies
-Install duckdb dependencies
+**Install duckdb dependencies**
 ```
 sudo apt-get update && sudo apt-get install -y git g++ cmake ninja-build libssl-dev
 ```
 
+**Install CUDA**
 If CUDA is not installed, download it [here](https://developer.nvidia.com/cuda-downloads). Follow the instructions for the deb(local) installer and complete the [post-installation steps](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/#mandatory-actions).
 
 Verify installation:
@@ -25,36 +26,36 @@ nvcc --version
 nvidia-smi
 ```
 
-Install libcudf dependencies
-libcudf will be installed via conda/miniconda. Miniconda can be downloaded [here](https://www.anaconda.com/docs/getting-started/miniconda/install). After downloading miniconda, user can install libcudf by running these commands:
+**Install libcudf dependencies**
+libcudf will be installed via conda/miniconda. Miniconda can be downloaded [here](https://www.anaconda.com/docs/getting-started/miniconda/install). After downloading miniconda, install libcudf by running these commands:
 ```
 conda create --name libcudf-env
 conda activate libcudf-env
 conda install -c rapidsai -c conda-forge -c nvidia rapidsai::libcudf
 ```
-Set the environment variables `USE_CUDF` to 1 and `LIBCUDF_ENV_PREFIX` to the conda environment's path. For example, if user installed miniconda in `~/miniconda3` and installed libcudf in the conda environment `libcudf-env`, then user would set the `LIBCUDF_ENV_PREFIX` to `~/miniconda3/envs/libcudf-env`.
+Set the environment variables `USE_CUDF` to 1 and `LIBCUDF_ENV_PREFIX` to the conda environment's path. For example, if we installed miniconda in `~/miniconda3` and installed libcudf in the conda environment `libcudf-env`, then we would set the `LIBCUDF_ENV_PREFIX` to `~/miniconda3/envs/libcudf-env`.
 ```
 export USE_CUDF=1
 export LIBCUDF_ENV_PREFIX = {PATH to libcudf-env}
 ```
 
-Clone the Sirius repository using 
+**Clone the Sirius repository**
 ```
 git clone --recurse-submodules https://github.com/bwyogatama/sirius.git
 cd sirius
 export SIRIUS_HOME_PATH=`pwd`
-```
-The `--recurse-submodules` will ensure DuckDB is pulled which is required to build the extension.
-
-## Building
-To build Sirius:
-```
 cd duckdb
 mkdir -p extension_external && cd extension_external
 git clone https://github.com/duckdb/substrait.git
 cd substrait
 git reset --hard ec9f8725df7aa22bae7217ece2f221ac37563da4 #go to the right commit hash for duckdb substrait extension
 cd $SIRIUS_HOME_PATH
+```
+The `--recurse-submodules` will ensure DuckDB is pulled which is required to build the extension.
+
+## Building
+To build Sirius:
+```
 make -j {nproc}
 ```
 
@@ -68,14 +69,13 @@ To load the TPC-H dataset to duckdb:
 
 ## Running Sirius
 To run Sirius, simply start the shell with `./build/release/duckdb {DATABASE_NAME}.duckdb`. 
-From the duckdb shell, initialize Sirius buffer manager with `call gpu_buffer_init` API. This API accepts 2 parameters, the GPU caching region size and the GPU processing region size. The GPU caching region is a memory region where the raw data is stored in GPUs, whereas the GPU processing region is where intermediate results are stored in GPUs (hash tables, join results .etc). 
-
-For example, to set the caching region as 1 GB and the processing region as 2 GB, user can run the following command:
+From the duckdb shell, initialize the Sirius buffer manager with `call gpu_buffer_init`. This API accepts 2 parameters, the GPU caching region size and the GPU processing region size. The GPU caching region is a memory region where the raw data is stored in GPUs, whereas the GPU processing region is where intermediate results are stored in GPUs (hash tables, join results .etc).
+For example, to set the caching region as 1 GB and the processing region as 2 GB, we can run the following command:
 ```
 call gpu_buffer_init("1 GB", "2 GB")
 ```
 
-After setting up Sirius, user can execute SQL queries using the `call gpu_processing` API:
+After setting up Sirius, we can execute SQL queries using the `call gpu_processing`:
 ```
 call gpu_processing("select
   l_orderkey,
@@ -97,7 +97,7 @@ group by
   o_orderdate,
   o_shippriority;")
 ```
-The cold run in Sirius would be significantly slower due to data loading from storage and format converstion from the DuckDB format to Sirius native format. Subsequent runs would be faster since it benefits from caching on GPU memory
+The cold run in Sirius would be significantly slower due to data loading from storage and format converstion from the DuckDB format to Sirius native format. Subsequent runs would be faster since it benefits from caching on GPU memory.
 
 All 22 TPC-H queries are saved in tpch-queries.sql. To run all queries:
 ```
@@ -105,7 +105,7 @@ All 22 TPC-H queries are saved in tpch-queries.sql. To run all queries:
 ```
 
 ## Testing
-We provide a unit test that compares Sirius against DuckDB for correctness across all 22 TPC-H queries. To run the unittest, generate SF=1 TPC-H dataset using method described [here](https://github.com/sirius-db/sirius?tab=readme-ov-file#generating-tpc-h-dataset) and run the unittest using the following command:
+Sirius provides a unit test that compares Sirius against DuckDB for correctness across all 22 TPC-H queries. To run the unittest, generate SF=1 TPC-H dataset using method described [here](https://github.com/sirius-db/sirius?tab=readme-ov-file#generating-tpc-h-dataset) and run the unittest using the following command:
 ```
 make test
 ```
