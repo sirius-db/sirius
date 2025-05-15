@@ -1,6 +1,6 @@
 <!-- ![Sirius](sirius-full.png) -->
 <p align="center">
-  <img src="sirius-full.png" alt="Diagram" width="600"/>
+  <img src="sirius-full.png" alt="Diagram" width="500"/>
 </p>
 
 # Sirius
