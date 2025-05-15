@@ -78,7 +78,7 @@ std::tuple<char*, uint64_t*, uint64_t> PerformSubstring(char* char_data, uint64_
     cudaDeviceSynchronize();
     CHECK_ERROR();
 
-    uint64_t* total_chars = new uint64_t[1];
+    uint64_t* total_chars = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
     // Get the updated count
     cudaMemcpy(total_chars, result_offset + num_strings, sizeof(uint64_t), cudaMemcpyDeviceToHost);
     CHECK_ERROR();

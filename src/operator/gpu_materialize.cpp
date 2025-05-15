@@ -45,7 +45,7 @@ ResolveTypeMaterializeString(shared_ptr<GPUColumn> column, BoundReferenceExpress
         a = column->data_wrapper.data;
         result_offset = column->data_wrapper.offset;
         size = column->column_length;
-        new_num_bytes = new uint64_t[1];
+        new_num_bytes = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
         new_num_bytes[0] = column->data_wrapper.num_bytes;
     }
     // printf("Materialized string column with size %ld\n", new_num_bytes[0]);

@@ -137,7 +137,7 @@ void materializeString(uint8_t* data, uint64_t* offset, uint8_t* &result, uint64
 
     // testprintmat<uint64_t><<<1, 1>>>(result_offset, N + 1);
 
-    result_bytes = new uint64_t[1];
+    result_bytes = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
     cudaMemcpy(result_bytes, result_offset + result_len, sizeof(uint64_t), cudaMemcpyDeviceToHost);
     // std::cout << "Got new chars len of " << new_num_bytes[0] << std::endl;
 

@@ -530,7 +530,7 @@ void hashGroupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* co
             (unsigned long long*) d_count, ht_len, num_keys, num_aggregates, agg_mode_dev, true, need_count); 
 
     CHECK_ERROR();
-    uint64_t* h_count = new uint64_t [1];
+    uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
     cudaMemcpy(h_count, d_count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
     assert(h_count[0] > 0);
 

@@ -54,7 +54,7 @@ cd $SIRIUS_HOME_PATH
 ```
 The `--recurse-submodules` will ensure DuckDB is pulled which is required to build the extension.
 
-## Building
+## Building Sirius
 To build Sirius:
 ```
 make -j {nproc}

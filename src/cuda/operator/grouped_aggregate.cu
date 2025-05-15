@@ -308,7 +308,7 @@ void groupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count,
     sort_keys_type* group_by_rows = reinterpret_cast<sort_keys_type*> (gpuBufferManager->customCudaMalloc<pointer_and_key>(N, 0, 0));
     uint64_t* d_num_runs_out = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
     cudaMemset(d_num_runs_out, 0, sizeof(uint64_t));
-    uint64_t* h_count = new uint64_t[1];
+    uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
     uint8_t** output_agg = new uint8_t*[num_aggregates];
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_temp_storage), 0);
 
@@ -635,7 +635,7 @@ void groupedWithoutAggregate(uint8_t **keys, uint64_t* count, uint64_t N, uint64
     sort_keys_type* group_by_rows = reinterpret_cast<sort_keys_type*> (gpuBufferManager->customCudaMalloc<pointer_and_key>(N, 0, 0));
     uint64_t* d_num_runs_out = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
     cudaMemset(d_num_runs_out, 0, sizeof(uint64_t));
-    uint64_t* h_count = new uint64_t[1];
+    uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
 
     uint64_t* aggregate_star_temp = gpuBufferManager->customCudaMalloc<uint64_t>(N, 0, 0);
     cudaMemset(aggregate_star_temp, 0, N * sizeof(uint64_t));
