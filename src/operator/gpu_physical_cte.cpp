@@ -76,7 +76,7 @@ SinkResultType GPUPhysicalCTE::Sink(GPUIntermediateRelation &input_relation) con
 	printf("Sinking data into CTE\n");
 	GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 	for (int col_idx = 0; col_idx < input_relation.columns.size(); col_idx++) {
-		working_table_gpu->columns[col_idx] = new GPUColumn(input_relation.columns[col_idx]->column_length, input_relation.columns[col_idx]->data_wrapper.type, input_relation.columns[col_idx]->data_wrapper.data);
+		working_table_gpu->columns[col_idx] = make_shared_ptr<GPUColumn>(input_relation.columns[col_idx]->column_length, input_relation.columns[col_idx]->data_wrapper.type, input_relation.columns[col_idx]->data_wrapper.data);
 		working_table_gpu->columns[col_idx]->is_unique = input_relation.columns[col_idx]->is_unique;
 		gpuBufferManager->lockAllocation(working_table_gpu->columns[col_idx]->data_wrapper.data, 0);
 		gpuBufferManager->lockAllocation(working_table_gpu->columns[col_idx]->row_ids, 0);

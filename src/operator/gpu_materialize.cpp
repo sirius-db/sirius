@@ -3,12 +3,12 @@
 namespace duckdb {
 
 template <typename T>
-GPUColumn* 
-ResolveTypeMaterializeExpression(GPUColumn* column, BoundReferenceExpression& bound_ref, GPUBufferManager* gpuBufferManager) {
+shared_ptr<GPUColumn> 
+ResolveTypeMaterializeExpression(shared_ptr<GPUColumn> column, BoundReferenceExpression& bound_ref, GPUBufferManager* gpuBufferManager) {
     size_t size;
     T* a;
     if (column->data_wrapper.data == nullptr) {
-        return new GPUColumn(column->column_length, column->data_wrapper.type, nullptr);
+        return make_shared_ptr<GPUColumn>(column->column_length, column->data_wrapper.type, nullptr);
     }
     if (column->row_ids != nullptr) {
         T* temp = reinterpret_cast<T*> (column->data_wrapper.data);
@@ -19,20 +19,20 @@ ResolveTypeMaterializeExpression(GPUColumn* column, BoundReferenceExpression& bo
         a = reinterpret_cast<T*> (column->data_wrapper.data);
         size = column->column_length;
     }
-    GPUColumn* result = new GPUColumn(size, column->data_wrapper.type, reinterpret_cast<uint8_t*>(a));
+    shared_ptr<GPUColumn> result = make_shared_ptr<GPUColumn>(size, column->data_wrapper.type, reinterpret_cast<uint8_t*>(a));
     result->is_unique = column->is_unique;
     // result->rmm_owned_buffer = std::move(column->rmm_owned_buffer);
     return result;
 }
 
-GPUColumn* 
-ResolveTypeMaterializeString(GPUColumn* column, BoundReferenceExpression& bound_ref, GPUBufferManager* gpuBufferManager) {
+shared_ptr<GPUColumn> 
+ResolveTypeMaterializeString(shared_ptr<GPUColumn> column, BoundReferenceExpression& bound_ref, GPUBufferManager* gpuBufferManager) {
     size_t size;
     uint8_t* a;
     uint64_t* result_offset; 
     uint64_t* new_num_bytes;
     if (column->data_wrapper.data == nullptr) {
-        return new GPUColumn(column->column_length, column->data_wrapper.type, nullptr, nullptr, column->data_wrapper.num_bytes, column->data_wrapper.is_string_data);
+        return make_shared_ptr<GPUColumn>(column->column_length, column->data_wrapper.type, nullptr, nullptr, column->data_wrapper.num_bytes, column->data_wrapper.is_string_data);
     }
     if (column->row_ids != nullptr) {
 		// Late materalize the input relationship
@@ -49,14 +49,14 @@ ResolveTypeMaterializeString(GPUColumn* column, BoundReferenceExpression& bound_
         new_num_bytes[0] = column->data_wrapper.num_bytes;
     }
     // printf("Materialized string column with size %ld\n", new_num_bytes[0]);
-    GPUColumn* result = new GPUColumn(size, column->data_wrapper.type, a, result_offset, new_num_bytes[0], column->data_wrapper.is_string_data);
+    shared_ptr<GPUColumn> result = make_shared_ptr<GPUColumn>(size, column->data_wrapper.type, a, result_offset, new_num_bytes[0], column->data_wrapper.is_string_data);
     result->is_unique = column->is_unique;
     // result->rmm_owned_buffer = std::move(column->rmm_owned_buffer);
     return result;
 }
 
-GPUColumn* 
-HandleMaterializeExpression(GPUColumn* column, BoundReferenceExpression& bound_ref, GPUBufferManager* gpuBufferManager) {
+shared_ptr<GPUColumn> 
+HandleMaterializeExpression(shared_ptr<GPUColumn> column, BoundReferenceExpression& bound_ref, GPUBufferManager* gpuBufferManager) {
     switch(column->data_wrapper.type) {
         case ColumnType::INT32:
             return ResolveTypeMaterializeExpression<int>(column, bound_ref, gpuBufferManager);
@@ -82,7 +82,7 @@ HandleMaterializeRowIDs(GPUIntermediateRelation& input_relation, GPUIntermediate
     for (int i = 0; i < input_relation.columns.size(); i++) {
         printf("Passing column idx %d in input relation to idx %d in output relation\n", i, i);
         if (count == 0) {
-            output_relation.columns[i] = new GPUColumn(0, input_relation.columns[i]->data_wrapper.type, input_relation.columns[i]->data_wrapper.data,
+            output_relation.columns[i] = make_shared_ptr<GPUColumn>(0, input_relation.columns[i]->data_wrapper.type, input_relation.columns[i]->data_wrapper.data,
                         input_relation.columns[i]->data_wrapper.offset, 0, input_relation.columns[i]->data_wrapper.is_string_data);
             output_relation.columns[i]->row_id_count = 0;
             if (maintain_unique) {
@@ -92,7 +92,7 @@ HandleMaterializeRowIDs(GPUIntermediateRelation& input_relation, GPUIntermediate
             }
             continue;
         }
-        output_relation.columns[i] = new GPUColumn(input_relation.columns[i]->column_length, input_relation.columns[i]->data_wrapper.type, input_relation.columns[i]->data_wrapper.data,
+        output_relation.columns[i] = make_shared_ptr<GPUColumn>(input_relation.columns[i]->column_length, input_relation.columns[i]->data_wrapper.type, input_relation.columns[i]->data_wrapper.data,
                         input_relation.columns[i]->data_wrapper.offset, input_relation.columns[i]->data_wrapper.num_bytes, input_relation.columns[i]->data_wrapper.is_string_data);
         if (maintain_unique) {
             output_relation.columns[i]->is_unique = input_relation.columns[i]->is_unique;
@@ -130,7 +130,7 @@ HandleMaterializeRowIDsRHS(GPUIntermediateRelation& hash_table_result, GPUInterm
         const auto rhs_col = rhs_output_columns[i];
         printf("Passing column idx %d from hash table to idx %d in output relation\n", rhs_col, offset + i);
         if (count == 0) {
-            output_relation.columns[offset + i] = new GPUColumn(0, hash_table_result.columns[rhs_col]->data_wrapper.type, hash_table_result.columns[rhs_col]->data_wrapper.data,
+            output_relation.columns[offset + i] = make_shared_ptr<GPUColumn>(0, hash_table_result.columns[rhs_col]->data_wrapper.type, hash_table_result.columns[rhs_col]->data_wrapper.data,
                         hash_table_result.columns[rhs_col]->data_wrapper.offset, 0, hash_table_result.columns[rhs_col]->data_wrapper.is_string_data);
             output_relation.columns[offset + i]->row_id_count = 0;
             if (maintain_unique) {
@@ -140,7 +140,7 @@ HandleMaterializeRowIDsRHS(GPUIntermediateRelation& hash_table_result, GPUInterm
             }
             continue;
         }
-        output_relation.columns[offset + i] = new GPUColumn(hash_table_result.columns[rhs_col]->column_length, hash_table_result.columns[rhs_col]->data_wrapper.type, hash_table_result.columns[rhs_col]->data_wrapper.data,
+        output_relation.columns[offset + i] = make_shared_ptr<GPUColumn>(hash_table_result.columns[rhs_col]->column_length, hash_table_result.columns[rhs_col]->data_wrapper.type, hash_table_result.columns[rhs_col]->data_wrapper.data,
                         hash_table_result.columns[rhs_col]->data_wrapper.offset, hash_table_result.columns[rhs_col]->data_wrapper.num_bytes, hash_table_result.columns[rhs_col]->data_wrapper.is_string_data);
         if (maintain_unique) {
             output_relation.columns[offset + i]->is_unique = hash_table_result.columns[rhs_col]->is_unique;
@@ -178,7 +178,7 @@ HandleMaterializeRowIDsLHS(GPUIntermediateRelation& input_relation, GPUIntermedi
         const auto lhs_col = lhs_output_columns[i];
         printf("Passing column idx %d from input relation to idx %d in output relation\n", lhs_col, i);
         if (count == 0) {
-            output_relation.columns[i] = new GPUColumn(0, input_relation.columns[lhs_col]->data_wrapper.type, input_relation.columns[lhs_col]->data_wrapper.data,
+            output_relation.columns[i] = make_shared_ptr<GPUColumn>(0, input_relation.columns[lhs_col]->data_wrapper.type, input_relation.columns[lhs_col]->data_wrapper.data,
                 input_relation.columns[lhs_col]->data_wrapper.offset, 0, input_relation.columns[lhs_col]->data_wrapper.is_string_data);
             output_relation.columns[i]->row_id_count = 0;
             if (maintain_unique) {
@@ -188,7 +188,7 @@ HandleMaterializeRowIDsLHS(GPUIntermediateRelation& input_relation, GPUIntermedi
             }
             continue;
         }
-        output_relation.columns[i] = new GPUColumn(input_relation.columns[lhs_col]->column_length, input_relation.columns[lhs_col]->data_wrapper.type, input_relation.columns[lhs_col]->data_wrapper.data,
+        output_relation.columns[i] = make_shared_ptr<GPUColumn>(input_relation.columns[lhs_col]->column_length, input_relation.columns[lhs_col]->data_wrapper.type, input_relation.columns[lhs_col]->data_wrapper.data,
                 input_relation.columns[lhs_col]->data_wrapper.offset, input_relation.columns[lhs_col]->data_wrapper.num_bytes, input_relation.columns[lhs_col]->data_wrapper.is_string_data);
         if (maintain_unique) {
             output_relation.columns[i]->is_unique = input_relation.columns[lhs_col]->is_unique;

@@ -6,13 +6,13 @@
 
 namespace duckdb {
 
-void ResolveOrderByString(GPUColumn** sort_columns, int* sort_orders, int num_cols) {
+void ResolveOrderByString(vector<shared_ptr<GPUColumn>> &sort_columns, int* sort_orders, int num_cols) {
   uint8_t** col_keys = new uint8_t*[num_cols];
   uint64_t** col_offsets = new uint64_t*[num_cols];
   uint64_t* col_num_bytes = new uint64_t[num_cols];
 
   for(int i = 0; i < num_cols; i++) {
-    GPUColumn* curr_column = sort_columns[i];
+    shared_ptr<GPUColumn> curr_column = sort_columns[i];
     col_keys[i] = curr_column->data_wrapper.data;
     col_offsets[i] = curr_column->data_wrapper.offset;
     
@@ -25,7 +25,7 @@ void ResolveOrderByString(GPUColumn** sort_columns, int* sort_orders, int num_co
 
   // Write the results back
   for(int i = 0; i < num_cols; i++) {
-    GPUColumn* curr_column = sort_columns[i];
+    shared_ptr<GPUColumn> curr_column = sort_columns[i];
     curr_column->data_wrapper.data = col_keys[i];
     curr_column->data_wrapper.offset = col_offsets[i];
     curr_column->data_wrapper.num_bytes = col_num_bytes[i];
@@ -35,7 +35,7 @@ void ResolveOrderByString(GPUColumn** sort_columns, int* sort_orders, int num_co
 }
 
 void
-HandleOrderBy(GPUColumn** &order_by_keys, GPUColumn** &projection_columns, const vector<BoundOrderByNode> &orders, uint64_t num_projections) {
+HandleOrderBy(vector<shared_ptr<GPUColumn>> &order_by_keys, vector<shared_ptr<GPUColumn>> &projection_columns, const vector<BoundOrderByNode> &orders, uint64_t num_projections) {
 	OrderByType* order_by_type = new OrderByType[orders.size()];
 	for (int order_idx = 0; order_idx < orders.size(); order_idx++) {
 		if (orders[order_idx].type == OrderType::ASCENDING) {
@@ -53,7 +53,7 @@ GPUPhysicalOrder::GPUPhysicalOrder(vector<LogicalType> types, vector<BoundOrderB
     : GPUPhysicalOperator(PhysicalOperatorType::ORDER_BY, std::move(types), estimated_cardinality),
       orders(std::move(orders)), projections(std::move(projections_p)) {
 
-    sort_result = new GPUIntermediateRelation(projections.size());
+    sort_result = make_shared_ptr<GPUIntermediateRelation>(projections.size());
     for (int col = 0; col < projections.size(); col++) {
       sort_result->columns[col] = nullptr;
     }
@@ -73,7 +73,7 @@ SinkResultType
 GPUPhysicalOrder::Sink(GPUIntermediateRelation &input_relation) const {
 
   GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
-  // GPUColumn** sort_columns = new GPUColumn*[orders.size()];
+  // shared_ptr<GPUColumn>* sort_columns = new shared_ptr<GPUColumn>[orders.size()];
   // int* sort_orders = new int[orders.size()];
   // int idx = 0;
   // bool string_sort = false;
@@ -131,8 +131,8 @@ GPUPhysicalOrder::Sink(GPUIntermediateRelation &input_relation) const {
   //   sort_cols_idx += 1;
   // }
 
-  GPUColumn** order_by_keys = new GPUColumn*[orders.size()];
-  GPUColumn** projection_columns = new GPUColumn*[projections.size()];
+  vector<shared_ptr<GPUColumn>> order_by_keys(orders.size());
+  vector<shared_ptr<GPUColumn>> projection_columns(projections.size());
   
   for (int projection_idx = 0; projection_idx < projections.size(); projection_idx++) {
       auto input_idx = projections[projection_idx];

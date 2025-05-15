@@ -28,7 +28,7 @@ public:
 	unordered_map<idx_t, shared_ptr<ColumnDataCollection>> recursive_cte_tables;
 	//! Materialized CTE ids must be collected.
 	unordered_map<idx_t, vector<const_reference<GPUPhysicalOperator>>> materialized_ctes;
-	unordered_map<idx_t, GPUIntermediateRelation*> gpu_recursive_cte_tables;
+	unordered_map<idx_t, shared_ptr<GPUIntermediateRelation>> gpu_recursive_cte_tables;
 public:
 	//! Creates a plan from the logical operator. This involves resolving column bindings and generating physical
 	//! operator nodes.

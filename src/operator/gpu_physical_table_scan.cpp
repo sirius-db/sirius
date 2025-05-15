@@ -34,7 +34,7 @@ GPUPhysicalTableScan::GPUPhysicalTableScan(vector<LogicalType> types, TableFunct
 
 
 template <typename T>
-void ResolveTypeComparisonConstantExpression (GPUColumn* column, uint64_t* &count, uint64_t* & row_ids, ConstantFilter filter_constant, ExpressionType expression_type) {
+void ResolveTypeComparisonConstantExpression (shared_ptr<GPUColumn> column, uint64_t* &count, uint64_t* & row_ids, ConstantFilter filter_constant, ExpressionType expression_type) {
     T* a = reinterpret_cast<T*> (column->data_wrapper.data);
     T b = filter_constant.constant.GetValue<T>();
     T c = 0;
@@ -63,7 +63,7 @@ void ResolveTypeComparisonConstantExpression (GPUColumn* column, uint64_t* &coun
     }
 }
 
-void ResolveStringExpression(GPUColumn* string_column, uint64_t* &count, uint64_t* & row_ids, ConstantFilter filter_constant, ExpressionType expression_type) {
+void ResolveStringExpression(shared_ptr<GPUColumn> string_column, uint64_t* &count, uint64_t* & row_ids, ConstantFilter filter_constant, ExpressionType expression_type) {
     // Read the in the string column
     DataWrapper str_data_wrapper = string_column->data_wrapper;
     uint64_t num_chars = str_data_wrapper.num_bytes;
@@ -97,7 +97,7 @@ void ResolveStringExpression(GPUColumn* string_column, uint64_t* &count, uint64_
     }
 }
 
-void HandleComparisonConstantExpression(GPUColumn* column, uint64_t* &count, uint64_t* &row_ids, ConstantFilter filter_constant, ExpressionType expression_type) {
+void HandleComparisonConstantExpression(shared_ptr<GPUColumn> column, uint64_t* &count, uint64_t* &row_ids, ConstantFilter filter_constant, ExpressionType expression_type) {
     switch(column->data_wrapper.type) {
       case ColumnType::INT32:
         ResolveTypeComparisonConstantExpression<int>(column, count, row_ids, filter_constant, expression_type);
@@ -120,7 +120,7 @@ void HandleComparisonConstantExpression(GPUColumn* column, uint64_t* &count, uin
 }
 
 template <typename T>
-void ResolveTypeBetweenExpression (GPUColumn* column, uint64_t* &count, uint64_t* & row_ids, ConstantFilter filter_constant1, ConstantFilter filter_constant2) {
+void ResolveTypeBetweenExpression (shared_ptr<GPUColumn> column, uint64_t* &count, uint64_t* & row_ids, ConstantFilter filter_constant1, ConstantFilter filter_constant2) {
     T* a = reinterpret_cast<T*> (column->data_wrapper.data);
     T b = filter_constant1.constant.GetValue<T>();
     T c = filter_constant2.constant.GetValue<T>();
@@ -142,7 +142,7 @@ void ResolveTypeBetweenExpression (GPUColumn* column, uint64_t* &count, uint64_t
     comparisonConstantExpression<T>(a, b, c, row_ids, count, size, op_mode);
 }
 
-void ResolveStringBetweenExpression(GPUColumn* string_column, uint64_t* &count, uint64_t* & row_ids, ConstantFilter filter_constant1, ConstantFilter filter_constant2) {
+void ResolveStringBetweenExpression(shared_ptr<GPUColumn> string_column, uint64_t* &count, uint64_t* & row_ids, ConstantFilter filter_constant1, ConstantFilter filter_constant2) {
     // Read the in the string column
     DataWrapper str_data_wrapper = string_column->data_wrapper;
     uint64_t num_chars = str_data_wrapper.num_bytes;
@@ -157,7 +157,7 @@ void ResolveStringBetweenExpression(GPUColumn* string_column, uint64_t* &count, 
     comparisonStringBetweenExpression(d_char_data, num_chars, d_str_indices, num_strings, lower_string, upper_string, is_lower_inclusive, is_upper_inclusive, row_ids, count);
 }
 
-void HandleBetweenExpression(GPUColumn* column, uint64_t* &count, uint64_t* &row_ids, ConstantFilter filter_constant1, ConstantFilter filter_constant2) {
+void HandleBetweenExpression(shared_ptr<GPUColumn> column, uint64_t* &count, uint64_t* &row_ids, ConstantFilter filter_constant1, ConstantFilter filter_constant2) {
     switch(column->data_wrapper.type) {
       case ColumnType::INT32:
         ResolveTypeBetweenExpression<int>(column, count, row_ids, filter_constant1, filter_constant2);
@@ -180,8 +180,8 @@ void HandleBetweenExpression(GPUColumn* column, uint64_t* &count, uint64_t* &row
 }
 
 template <typename T>
-GPUColumn* 
-ResolveTypeMaterializeExpression(GPUColumn* column, GPUBufferManager* gpuBufferManager) {
+shared_ptr<GPUColumn> 
+ResolveTypeMaterializeExpression(shared_ptr<GPUColumn> column, GPUBufferManager* gpuBufferManager) {
     // GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
     size_t size;
     T* a = nullptr;
@@ -195,12 +195,12 @@ ResolveTypeMaterializeExpression(GPUColumn* column, GPUBufferManager* gpuBufferM
         a = reinterpret_cast<T*> (column->data_wrapper.data);
         size = column->column_length;
     }
-    GPUColumn* result = new GPUColumn(size, column->data_wrapper.type, reinterpret_cast<uint8_t*>(a));
+    shared_ptr<GPUColumn> result = make_shared_ptr<GPUColumn>(size, column->data_wrapper.type, reinterpret_cast<uint8_t*>(a));
     result->is_unique = column->is_unique;
     return result;
 }
 
-GPUColumn* ResolveStringMateralizeExpression(GPUColumn* column, GPUBufferManager* gpuBufferManager) {
+shared_ptr<GPUColumn> ResolveStringMateralizeExpression(shared_ptr<GPUColumn> column, GPUBufferManager* gpuBufferManager) {
   // Column is already materalized so just return it
   size_t num_rows;
   uint8_t* result = nullptr;
@@ -221,13 +221,13 @@ GPUColumn* ResolveStringMateralizeExpression(GPUColumn* column, GPUBufferManager
     new_num_bytes[0] = column->data_wrapper.num_bytes;
   }
   //HERE
-  GPUColumn* result_column = new GPUColumn(num_rows, ColumnType::VARCHAR, reinterpret_cast<uint8_t*>(result), result_offset, new_num_bytes[0], true);
+  shared_ptr<GPUColumn> result_column = make_shared_ptr<GPUColumn>(num_rows, ColumnType::VARCHAR, reinterpret_cast<uint8_t*>(result), result_offset, new_num_bytes[0], true);
   result_column->is_unique = column->is_unique;
   return result_column;
 }
 
-GPUColumn* 
-HandleMaterializeExpression(GPUColumn* column, GPUBufferManager* gpuBufferManager) {
+shared_ptr<GPUColumn> 
+HandleMaterializeExpression(shared_ptr<GPUColumn> column, GPUBufferManager* gpuBufferManager) {
     switch(column->data_wrapper.type) {
         case ColumnType::INT32:
             return ResolveTypeMaterializeExpression<int>(column, gpuBufferManager);
@@ -247,7 +247,7 @@ HandleMaterializeExpression(GPUColumn* column, GPUBufferManager* gpuBufferManage
 }
 
 
-void HandleArbitraryConstantExpression(GPUColumn** column, uint64_t* &count, uint64_t* &row_ids, ConstantFilter** filter_constant, int num_expr) {
+void HandleArbitraryConstantExpression(vector<shared_ptr<GPUColumn>> &column, uint64_t* &count, uint64_t* &row_ids, ConstantFilter** &filter_constant, int num_expr) {
   
   uint8_t** col = new uint8_t*[num_expr];
   uint64_t** offset = new uint64_t*[num_expr];
@@ -431,7 +431,7 @@ GPUPhysicalTableScan::GetDataDuckDB(ExecutionContext &exec_context) {
       }
     }
 
-    GPUIntermediateRelation* table;
+    shared_ptr<GPUIntermediateRelation> table;
     auto &catalog_table = Catalog::GetCatalog(exec_context.client, INVALID_CATALOG);
 
     bool all_cached = true;
@@ -634,7 +634,7 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
   //Find table name in the buffer manager
   auto gpuBufferManager = &(GPUBufferManager::GetInstance());
   auto it = gpuBufferManager->tables.find(table_name);
-  GPUIntermediateRelation* table;
+  shared_ptr<GPUIntermediateRelation> table;
   //If there is a filter: apply filter, and write to output_relation (late materialized)
     if (it != gpuBufferManager->tables.end()) {
         // Key found, print the value
@@ -702,7 +702,7 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
       }
 
       ConstantFilter** filter_constants = new ConstantFilter*[num_expr];
-      GPUColumn** expression_columns = new GPUColumn*[num_expr];
+      vector<shared_ptr<GPUColumn>> expression_columns(num_expr);
 
       int expr_idx = 0;
       for (auto &f : table_filters->filters) {
@@ -762,7 +762,7 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
           printf("Reading column index (late materialized) %ld and passing it to index in output relation %ld\n", column_ids[projection_id].GetPrimaryIndex(), index);
           printf("Writing row IDs to output relation in index %ld\n", index);
           //HERE
-          output_relation.columns[index] = new GPUColumn(table->columns[column_ids[projection_id].GetPrimaryIndex()]->column_length, table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.type, table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.data,
+          output_relation.columns[index] = make_shared_ptr<GPUColumn>(table->columns[column_ids[projection_id].GetPrimaryIndex()]->column_length, table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.type, table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.data,
                           table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.offset, table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.num_bytes, table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.is_string_data);
           output_relation.columns[index]->is_unique = table->columns[column_ids[projection_id].GetPrimaryIndex()]->is_unique;
           if (row_ids) {
@@ -780,7 +780,7 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
             printf("Reading column index (late materialized) %ld and passing it to index in output relation %ld\n", column_id.GetPrimaryIndex(), index);
             printf("Writing row IDs to output relation in index %ld\n", index);
             //HERE
-            output_relation.columns[index] = new GPUColumn(table->columns[column_id.GetPrimaryIndex()]->column_length, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.type, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.data,
+            output_relation.columns[index] = make_shared_ptr<GPUColumn>(table->columns[column_id.GetPrimaryIndex()]->column_length, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.type, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.data,
                             table->columns[column_id.GetPrimaryIndex()]->data_wrapper.offset, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.num_bytes, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.is_string_data);
             output_relation.columns[index]->is_unique = table->columns[column_id.GetPrimaryIndex()]->is_unique;
             if (row_ids) {
@@ -798,7 +798,7 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
           printf("Reading column index (late materialized) %ld and passing it to index in output relation %ld\n", column_id.GetPrimaryIndex(), index);
           printf("Writing row IDs to output relation in index %ld\n", index);
           //HERE
-          output_relation.columns[index] = new GPUColumn(table->columns[column_id.GetPrimaryIndex()]->column_length, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.type, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.data,
+          output_relation.columns[index] = make_shared_ptr<GPUColumn>(table->columns[column_id.GetPrimaryIndex()]->column_length, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.type, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.data,
                           table->columns[column_id.GetPrimaryIndex()]->data_wrapper.offset, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.num_bytes, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.is_string_data);
           output_relation.columns[index]->is_unique = table->columns[column_id.GetPrimaryIndex()]->is_unique;
           if (row_ids) {

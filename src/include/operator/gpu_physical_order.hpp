@@ -6,7 +6,7 @@
 #include "helper/types.hpp"
 
 namespace duckdb {
-void cudf_orderby(GPUColumn **keys, GPUColumn **projection, uint64_t num_keys, uint64_t num_projections, OrderByType* order_by_type); 
+void cudf_orderby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColumn>>& projection, uint64_t num_keys, uint64_t num_projections, OrderByType* order_by_type); 
 
 void orderByString(uint8_t** col_keys, uint64_t** col_offsets, int* sort_orders, uint64_t* col_num_bytes, uint64_t num_rows, uint64_t num_cols);
 
@@ -21,7 +21,7 @@ public:
 	//! Input data
 	vector<BoundOrderByNode> orders;
 	vector<idx_t> projections;
-	GPUIntermediateRelation* sort_result;
+	shared_ptr<GPUIntermediateRelation> sort_result;
 
 public:
 	// Source interface

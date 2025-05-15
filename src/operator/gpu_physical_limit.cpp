@@ -28,10 +28,10 @@ GPUPhysicalStreamingLimit::Execute(GPUIntermediateRelation &input_relation, GPUI
   GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 	for (int col_idx = 0; col_idx < output_relation.columns.size(); col_idx++) {
     BoundReferenceExpression& bound_ref = *new BoundReferenceExpression(LogicalType::INTEGER, col_idx);
-    GPUColumn* materialize_column = HandleMaterializeExpression(input_relation.columns[col_idx], bound_ref, gpuBufferManager);
+    shared_ptr<GPUColumn> materialize_column = HandleMaterializeExpression(input_relation.columns[col_idx], bound_ref, gpuBufferManager);
 
     limit_const = min(limit_const, materialize_column->column_length);
-    output_relation.columns[col_idx] = new GPUColumn(limit_const, materialize_column->data_wrapper.type, materialize_column->data_wrapper.data,
+    output_relation.columns[col_idx] = make_shared_ptr<GPUColumn>(limit_const, materialize_column->data_wrapper.type, materialize_column->data_wrapper.data,
                           materialize_column->data_wrapper.offset, materialize_column->data_wrapper.num_bytes, materialize_column->data_wrapper.is_string_data);
     output_relation.columns[col_idx]->is_unique = materialize_column->is_unique;
     if (limit_const > 0 && output_relation.columns[col_idx]->data_wrapper.type == ColumnType::VARCHAR) {

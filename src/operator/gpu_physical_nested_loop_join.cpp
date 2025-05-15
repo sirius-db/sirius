@@ -17,7 +17,7 @@
 namespace duckdb {
 
 template <typename T>
-void ResolveTypeNestedLoopJoin(GPUColumn** &left_keys, GPUColumn** &right_keys, uint64_t* &count, uint64_t* &row_ids_left, uint64_t* &row_ids_right, 
+void ResolveTypeNestedLoopJoin(vector<shared_ptr<GPUColumn>> &left_keys, vector<shared_ptr<GPUColumn>> &right_keys, uint64_t* &count, uint64_t* &row_ids_left, uint64_t* &row_ids_right, 
 		const vector<JoinCondition> &conditions, JoinType join_type, GPUBufferManager* gpuBufferManager) {
 	int num_keys = conditions.size();
 	T** left_data = new T*[num_keys];
@@ -56,7 +56,7 @@ void ResolveTypeNestedLoopJoin(GPUColumn** &left_keys, GPUColumn** &right_keys, 
 }
 
 void
-HandleNestedLoopJoin(GPUColumn** &left_keys, GPUColumn** &right_keys, uint64_t* &count, uint64_t* &row_ids_left, uint64_t* &row_ids_right, 
+HandleNestedLoopJoin(vector<shared_ptr<GPUColumn>> &left_keys, vector<shared_ptr<GPUColumn>> &right_keys, uint64_t* &count, uint64_t* &row_ids_left, uint64_t* &row_ids_right, 
 		const vector<JoinCondition> &conditions, JoinType join_type, GPUBufferManager* gpuBufferManager) {
     switch(left_keys[0]->data_wrapper.type) {
       case ColumnType::INT64:
@@ -100,7 +100,7 @@ GPUPhysicalNestedLoopJoin::GPUPhysicalNestedLoopJoin(LogicalOperator &op, unique
     //     }
     // }
 
-    right_temp_data = new GPUIntermediateRelation(children[1]->GetTypes().size());
+    right_temp_data = make_shared_ptr<GPUIntermediateRelation>(children[1]->GetTypes().size());
 
 }
 
@@ -147,7 +147,7 @@ GPUPhysicalNestedLoopJoin::Sink(GPUIntermediateRelation &input_relation) const {
 
     for (int i = 0; i < input_relation.columns.size(); i++) {
         printf("Passing column idx %d from right side to idx %d in right temp relation\n", i, i);
-		right_temp_data->columns[i] = new GPUColumn(input_relation.columns[i]->column_length, input_relation.columns[i]->data_wrapper.type, input_relation.columns[i]->data_wrapper.data);
+		right_temp_data->columns[i] = make_shared_ptr<GPUColumn>(input_relation.columns[i]->column_length, input_relation.columns[i]->data_wrapper.type, input_relation.columns[i]->data_wrapper.data);
 		right_temp_data->columns[i]->row_ids = input_relation.columns[i]->row_ids;
 		right_temp_data->columns[i]->row_id_count = input_relation.columns[i]->row_id_count;
     }
@@ -210,8 +210,8 @@ OperatorResultType
 GPUPhysicalNestedLoopJoin::ResolveComplexJoin(GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation) const {
 
 	GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
-	GPUColumn** left_keys = new GPUColumn*[conditions.size()];
-	GPUColumn** right_keys = new GPUColumn*[conditions.size()];
+	vector<shared_ptr<GPUColumn>> left_keys(conditions.size());
+	vector<shared_ptr<GPUColumn>> right_keys(conditions.size());
 	for (int i = 0; i < conditions.size(); i++) {
 		left_keys[i] = nullptr;
 		right_keys[i] = nullptr;
@@ -279,7 +279,7 @@ GPUPhysicalNestedLoopJoin::GetData(GPUIntermediateRelation& output_relation) con
 	if (join_type == JoinType::RIGHT || join_type == JoinType::OUTER) {
 		for (idx_t col = 0; col < left_column_count; col++) {
 			//pretend this to be NUll column from the left table (it should be NULL for the RIGHT join)
-			output_relation.columns[col] = new GPUColumn(0, ColumnType::INT64, nullptr);
+			output_relation.columns[col] = make_shared_ptr<GPUColumn>(0, ColumnType::INT64, nullptr);
 		}
 	} else {
 		throw InvalidInputException("Get data not supported for this join type");

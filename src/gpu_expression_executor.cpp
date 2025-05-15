@@ -6,8 +6,8 @@
 namespace duckdb {
 
 template <typename T>
-GPUColumn*
-GPUExpressionExecutor::ResolveTypeBinaryConstantExpression(GPUColumn* column, T constant, GPUBufferManager* gpuBufferManager, string function_name) {
+shared_ptr<GPUColumn>
+GPUExpressionExecutor::ResolveTypeBinaryConstantExpression(shared_ptr<GPUColumn> column, T constant, GPUBufferManager* gpuBufferManager, string function_name) {
     T* a = reinterpret_cast<T*> (column->data_wrapper.data);
     size_t size = column->column_length;
     T* c = gpuBufferManager->customCudaMalloc<T>(size, 0, 0);
@@ -24,12 +24,12 @@ GPUExpressionExecutor::ResolveTypeBinaryConstantExpression(GPUColumn* column, T 
     } else {
         throw NotImplementedException("Function name not supported");
     }
-    GPUColumn* result = new GPUColumn(size, column->data_wrapper.type, reinterpret_cast<uint8_t*>(c));
+    shared_ptr<GPUColumn> result = make_shared_ptr<GPUColumn>(size, column->data_wrapper.type, reinterpret_cast<uint8_t*>(c));
     return result;
 }
 
-GPUColumn*
-GPUExpressionExecutor::HandleBinaryConstantExpression(GPUColumn* column, BoundConstantExpression& expr, GPUBufferManager* gpuBufferManager, string function_name) {
+shared_ptr<GPUColumn>
+GPUExpressionExecutor::HandleBinaryConstantExpression(shared_ptr<GPUColumn> column, BoundConstantExpression& expr, GPUBufferManager* gpuBufferManager, string function_name) {
     switch(column->data_wrapper.type) {
       case ColumnType::INT32: {
         int constant = expr.value.GetValue<int>();
@@ -49,8 +49,8 @@ GPUExpressionExecutor::HandleBinaryConstantExpression(GPUColumn* column, BoundCo
 }
 
 template <typename T>
-GPUColumn*
-GPUExpressionExecutor::ResolveTypeBinaryExpression(GPUColumn* column1, GPUColumn* column2, GPUBufferManager* gpuBufferManager, string function_name) {
+shared_ptr<GPUColumn>
+GPUExpressionExecutor::ResolveTypeBinaryExpression(shared_ptr<GPUColumn> column1, shared_ptr<GPUColumn> column2, GPUBufferManager* gpuBufferManager, string function_name) {
     T* a = reinterpret_cast<T*> (column1->data_wrapper.data);
     T* b = reinterpret_cast<T*> (column2->data_wrapper.data);
     size_t size = column1->column_length;
@@ -66,12 +66,12 @@ GPUExpressionExecutor::ResolveTypeBinaryExpression(GPUColumn* column1, GPUColumn
     } else {
         throw NotImplementedException("Function name not supported");
     }
-    GPUColumn* result = new GPUColumn(size, column1->data_wrapper.type, reinterpret_cast<uint8_t*>(c));
+    shared_ptr<GPUColumn> result = make_shared_ptr<GPUColumn>(size, column1->data_wrapper.type, reinterpret_cast<uint8_t*>(c));
     return result;
 }
 
-GPUColumn*
-GPUExpressionExecutor::HandleBinaryExpression(GPUColumn* column1, GPUColumn* column2, GPUBufferManager* gpuBufferManager, string function_name) {
+shared_ptr<GPUColumn>
+GPUExpressionExecutor::HandleBinaryExpression(shared_ptr<GPUColumn> column1, shared_ptr<GPUColumn> column2, GPUBufferManager* gpuBufferManager, string function_name) {
     switch(column1->data_wrapper.type) {
       case ColumnType::INT32:
         return ResolveTypeBinaryExpression<int>(column1, column2, gpuBufferManager, function_name);
@@ -88,7 +88,7 @@ GPUExpressionExecutor::HandleBinaryExpression(GPUColumn* column1, GPUColumn* col
 
 template <typename T>
 void 
-GPUExpressionExecutor::ResolveTypeComparisonConstantExpression (GPUColumn* column, BoundConstantExpression& expr1, BoundConstantExpression& expr2, uint64_t* &count, uint64_t* & row_ids, ExpressionType expression_type) {
+GPUExpressionExecutor::ResolveTypeComparisonConstantExpression (shared_ptr<GPUColumn> column, BoundConstantExpression& expr1, BoundConstantExpression& expr2, uint64_t* &count, uint64_t* & row_ids, ExpressionType expression_type) {
     T* a = reinterpret_cast<T*> (column->data_wrapper.data);
     size_t size = column->column_length;
     T b = expr1.value.GetValue<T>();
@@ -126,7 +126,7 @@ GPUExpressionExecutor::ResolveTypeComparisonConstantExpression (GPUColumn* colum
 }
 
 void 
-GPUExpressionExecutor::HandleComparisonConstantExpression(GPUColumn* column, BoundConstantExpression& expr1, BoundConstantExpression& expr2, uint64_t* &count, uint64_t* &row_ids, ExpressionType expression_type) {
+GPUExpressionExecutor::HandleComparisonConstantExpression(shared_ptr<GPUColumn> column, BoundConstantExpression& expr1, BoundConstantExpression& expr2, uint64_t* &count, uint64_t* &row_ids, ExpressionType expression_type) {
     switch(column->data_wrapper.type) {
       case ColumnType::INT32:
         ResolveTypeComparisonConstantExpression<int>(column, expr1, expr2, count, row_ids, expression_type);
@@ -150,7 +150,7 @@ GPUExpressionExecutor::HandleComparisonConstantExpression(GPUColumn* column, Bou
 
 template <typename T>
 void 
-GPUExpressionExecutor::ResolveTypeComparisonExpression (GPUColumn* column1, GPUColumn* column2, uint64_t* &count, uint64_t* & row_ids, ExpressionType expression_type) {
+GPUExpressionExecutor::ResolveTypeComparisonExpression (shared_ptr<GPUColumn> column1, shared_ptr<GPUColumn> column2, uint64_t* &count, uint64_t* & row_ids, ExpressionType expression_type) {
     T* a = reinterpret_cast<T*> (column1->data_wrapper.data);
     T* b = reinterpret_cast<T*> (column2->data_wrapper.data);
     size_t size = column1->column_length;
@@ -179,7 +179,7 @@ GPUExpressionExecutor::ResolveTypeComparisonExpression (GPUColumn* column1, GPUC
 }
 
 void 
-GPUExpressionExecutor::HandleComparisonExpression(GPUColumn* column1, GPUColumn* column2, uint64_t* &count, uint64_t* &row_ids, ExpressionType expression_type) {
+GPUExpressionExecutor::HandleComparisonExpression(shared_ptr<GPUColumn> column1, shared_ptr<GPUColumn> column2, uint64_t* &count, uint64_t* &row_ids, ExpressionType expression_type) {
     switch(column1->data_wrapper.type) {
       case ColumnType::INT32:
         ResolveTypeComparisonExpression<int>(column1, column2, count, row_ids, expression_type);
@@ -198,8 +198,8 @@ GPUExpressionExecutor::HandleComparisonExpression(GPUColumn* column1, GPUColumn*
     }
 }
 
-GPUColumn*
-GPUExpressionExecutor::HandleRoundExpression(GPUColumn* column, int decimal_places) {
+shared_ptr<GPUColumn>
+GPUExpressionExecutor::HandleRoundExpression(shared_ptr<GPUColumn> column, int decimal_places) {
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
     switch(column->data_wrapper.type) {
       case ColumnType::FLOAT32: {
@@ -207,14 +207,14 @@ GPUExpressionExecutor::HandleRoundExpression(GPUColumn* column, int decimal_plac
         size_t size = column->column_length;
         float* c = gpuBufferManager->customCudaMalloc<float>(size, 0, 0);
         floatRoundExpression(a, c, decimal_places, size);
-        GPUColumn* result = new GPUColumn(size, column->data_wrapper.type, reinterpret_cast<uint8_t*>(c));
+        shared_ptr<GPUColumn> result = make_shared_ptr<GPUColumn>(size, column->data_wrapper.type, reinterpret_cast<uint8_t*>(c));
         return result;
       } case ColumnType::FLOAT64: {
         double* a = reinterpret_cast<double*> (column->data_wrapper.data);
         size_t size = column->column_length;
         double* c = gpuBufferManager->customCudaMalloc<double>(size, 0, 0);
         doubleRoundExpression(a, c, decimal_places, size);
-        GPUColumn* result = new GPUColumn(size, column->data_wrapper.type, reinterpret_cast<uint8_t*>(c));
+        shared_ptr<GPUColumn> result = make_shared_ptr<GPUColumn>(size, column->data_wrapper.type, reinterpret_cast<uint8_t*>(c));
         return result;
       } default:
         throw NotImplementedException("Unsupported column type");
@@ -245,7 +245,7 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
                 auto &bound_upper = bound_between.upper->Cast<BoundConstantExpression>();
                 size_t size;
 
-                GPUColumn* materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref.index], bound_ref, gpuBufferManager);
+                shared_ptr<GPUColumn> materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref.index], bound_ref, gpuBufferManager);
                 // count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
                 HandleComparisonConstantExpression(materialized_column, bound_lower, bound_upper, count, comparison_idx, bound_between.type);
                 if (count[0] == 0) throw NotImplementedException("No match found");
@@ -294,7 +294,7 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
                         count = new uint64_t[1];
                         count[0] = 0;
                     } else {
-                        GPUColumn* materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref1.index], bound_ref1, gpuBufferManager);
+                        shared_ptr<GPUColumn> materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref1.index], bound_ref1, gpuBufferManager);
                         // count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
                         HandleComparisonConstantExpression(materialized_column, bound_ref2, bound_ref2, count, comparison_idx, bound_comparison.type);
                         if (count[0] == 0) throw NotImplementedException("No match found");
@@ -309,8 +309,8 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
                         count = new uint64_t[1];
                         count[0] = 0;
                     } else {
-                        GPUColumn* materialized_column1 = HandleMaterializeExpression(input_relation.columns[bound_ref1.index], bound_ref1, gpuBufferManager);
-                        GPUColumn* materialized_column2 = HandleMaterializeExpression(input_relation.columns[bound_ref2.index], bound_ref2, gpuBufferManager);
+                        shared_ptr<GPUColumn> materialized_column1 = HandleMaterializeExpression(input_relation.columns[bound_ref1.index], bound_ref1, gpuBufferManager);
+                        shared_ptr<GPUColumn> materialized_column2 = HandleMaterializeExpression(input_relation.columns[bound_ref2.index], bound_ref2, gpuBufferManager);
                         // count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
                         HandleComparisonExpression(materialized_column1, materialized_column2, count, comparison_idx, bound_comparison.type);  
                         if (count[0] == 0) throw NotImplementedException("No match found");   
@@ -350,7 +350,7 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
                     count[0] = 0;
                 } else {
                   // count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
-                  GPUColumn* materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref.index], bound_ref, gpuBufferManager);
+                  shared_ptr<GPUColumn> materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref.index], bound_ref, gpuBufferManager);
                   if(bound_function_name.find("prefix") != std::string::npos) {
                     HandlePrefixMatching(materialized_column, match_str, comparison_idx, count, 0);
                   } else if(bound_function_name.find("contains") != std::string::npos) {
@@ -381,7 +381,7 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
                           count = new uint64_t[1];
                           count[0] = 0;
                       } else {
-                        GPUColumn* materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref.index], bound_ref, gpuBufferManager);
+                        shared_ptr<GPUColumn> materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref.index], bound_ref, gpuBufferManager);
                         Value one = Value::BOOLEAN(1);
                         BoundConstantExpression bound_constant_expr = BoundConstantExpression(one);
                         // count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
@@ -401,7 +401,7 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
                           count[0] = 0;
                       } else {
                         // count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
-                        GPUColumn* materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref.index], bound_ref, gpuBufferManager);
+                        shared_ptr<GPUColumn> materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref.index], bound_ref, gpuBufferManager);
                         if(bound_function_name.find("prefix") != std::string::npos) {
                             HandlePrefixMatching(materialized_column, match_str, comparison_idx, count, 1);
                         } else if(bound_function_name.find("contains") != std::string::npos) {
@@ -435,7 +435,7 @@ GPUExpressionExecutor::ProjectionRecursiveExpression(GPUIntermediateRelation& in
     bool is_specific_projection = HandlingSpecificProjection(input_relation, output_relation, expr, output_idx);
     if (is_specific_projection) return;
 
-    GPUColumn* result;
+    shared_ptr<GPUColumn> result;
 
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 
@@ -499,28 +499,28 @@ GPUExpressionExecutor::ProjectionRecursiveExpression(GPUIntermediateRelation& in
                   auto &bound_ref1 = bound_function.children[0]->Cast<BoundReferenceExpression>();
                   auto &bound_ref2 = bound_function.children[1]->Cast<BoundConstantExpression>();
                   auto &bound_ref3 = bound_function.children[2]->Cast<BoundConstantExpression>();
-                  GPUColumn* input_column = input_relation.columns[bound_ref1.index];
+                  shared_ptr<GPUColumn> input_column = input_relation.columns[bound_ref1.index];
                   uint64_t start_idx = bound_ref2.value.GetValue<uint64_t>();
                   if (start_idx < 1) throw InvalidInputException("Start index should be greater than 0");
                   uint64_t length = bound_ref3.value.GetValue<uint64_t>();
-                  GPUColumn* materialized_column = HandleMaterializeExpression(input_column, bound_ref1, gpuBufferManager);
+                  shared_ptr<GPUColumn> materialized_column = HandleMaterializeExpression(input_column, bound_ref1, gpuBufferManager);
                   result = HandleSubString(materialized_column, start_idx, length);
               } else if (bound_function.ToString().find("round") != std::string::npos) {
                   auto &bound_ref = bound_function.children[0]->Cast<BoundReferenceExpression>();
                   auto &bound_const = bound_function.children[1]->Cast<BoundConstantExpression>();
                   int decimal_places = bound_const.value.GetValue<int>();
-                  GPUColumn* materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref.index], bound_ref, gpuBufferManager);
+                  shared_ptr<GPUColumn> materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref.index], bound_ref, gpuBufferManager);
                   result = HandleRoundExpression(materialized_column, decimal_places);
               } else if (bound_function.children[1]->expression_class == ExpressionClass::BOUND_CONSTANT) {
                   auto &bound_ref1 = bound_function.children[0]->Cast<BoundReferenceExpression>();
                   auto &bound_ref2 = bound_function.children[1]->Cast<BoundConstantExpression>();
-                  GPUColumn* materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref1.index], bound_ref1, gpuBufferManager);
+                  shared_ptr<GPUColumn> materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref1.index], bound_ref1, gpuBufferManager);
                   result = HandleBinaryConstantExpression(materialized_column, bound_ref2, gpuBufferManager, bound_function.function.name);
               } else if (bound_function.children[1]->expression_class == ExpressionClass::BOUND_REF) {
                   auto &bound_ref1 = bound_function.children[0]->Cast<BoundReferenceExpression>();
                   auto &bound_ref2 = bound_function.children[1]->Cast<BoundReferenceExpression>();
-                  GPUColumn* materialized_column1 = HandleMaterializeExpression(input_relation.columns[bound_ref1.index], bound_ref1, gpuBufferManager);
-                  GPUColumn* materialized_column2 = HandleMaterializeExpression(input_relation.columns[bound_ref2.index], bound_ref2, gpuBufferManager);
+                  shared_ptr<GPUColumn> materialized_column1 = HandleMaterializeExpression(input_relation.columns[bound_ref1.index], bound_ref1, gpuBufferManager);
+                  shared_ptr<GPUColumn> materialized_column2 = HandleMaterializeExpression(input_relation.columns[bound_ref2.index], bound_ref2, gpuBufferManager);
                   result = HandleBinaryExpression(materialized_column1, materialized_column2, gpuBufferManager, bound_function.function.name);            
               } else {
                 throw NotImplementedException("Function expression not supported");
@@ -546,7 +546,7 @@ GPUExpressionExecutor::ProjectionRecursiveExpression(GPUIntermediateRelation& in
                 output_relation.columns[output_idx]->row_ids = nullptr;
                 output_relation.columns[output_idx]->row_id_count = 0;
             } else {
-                output_relation.columns[output_idx] = new GPUColumn(0, ColumnType::INT32, nullptr);
+                output_relation.columns[output_idx] = make_shared_ptr<GPUColumn>(0, ColumnType::INT32, nullptr);
             }
         }
     }

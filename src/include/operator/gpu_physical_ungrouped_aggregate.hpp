@@ -22,7 +22,7 @@ public:
 	vector<unique_ptr<Expression>> aggregates;
 	unique_ptr<DistinctAggregateData> distinct_data;
 	unique_ptr<DistinctAggregateCollectionInfo> distinct_collection_info;
-	GPUIntermediateRelation* aggregation_result;
+	shared_ptr<GPUIntermediateRelation> aggregation_result;
 
 // public:
 // 	// Source interface
