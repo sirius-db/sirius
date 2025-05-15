@@ -12,12 +12,13 @@ Sirius is a GPU acceleration layer for SQL analytics. It plugs into existing eng
 </p>
 
 ## Installing dependencies
-#Install duckdb dependencies
+
+### Install duckdb dependencies
 ```
 sudo apt-get update && sudo apt-get install -y git g++ cmake ninja-build libssl-dev
 ```
 
-#Install CUDA
+### Install CUDA
 If CUDA is not installed, download it [here](https://developer.nvidia.com/cuda-downloads). Follow the instructions for the deb(local) installer and complete the [post-installation steps](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/#mandatory-actions).
 
 Verify installation:
@@ -26,7 +27,7 @@ nvcc --version
 nvidia-smi
 ```
 
-#Install libcudf dependencies
+### Install libcudf dependencies
 libcudf will be installed via conda/miniconda. Miniconda can be downloaded [here](https://www.anaconda.com/docs/getting-started/miniconda/install). After downloading miniconda, install libcudf by running these commands:
 ```
 conda create --name libcudf-env
@@ -39,7 +40,7 @@ export USE_CUDF=1
 export LIBCUDF_ENV_PREFIX = {PATH to libcudf-env}
 ```
 
-#Clone the Sirius repository
+### Clone the Sirius repository
 ```
 git clone --recurse-submodules https://github.com/bwyogatama/sirius.git
 cd sirius
