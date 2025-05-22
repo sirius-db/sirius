@@ -258,7 +258,7 @@ GPUPhysicalNestedLoopJoin::ResolveComplexJoin(GPUIntermediateRelation &input_rel
 		vector<column_t> rhs_output_columns;
 		for (idx_t i = 0; i < right_temp_data->columns.size(); i++) rhs_output_columns.push_back(i);
 
-		if (count[0] == 0) throw NotImplementedException("No match found in nested loop join");
+		// if (count[0] == 0) throw NotImplementedException("No match found in nested loop join");
 		printf("Writing row IDs from LHS to output relation\n");
 		HandleMaterializeRowIDs(input_relation, output_relation, count[0], row_ids_left, gpuBufferManager, false);
 		printf("Writing row IDs from RHS to output relation\n");

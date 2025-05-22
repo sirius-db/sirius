@@ -154,8 +154,8 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::CreatePlan(LogicalOper
 		plan = CreatePlan(op.Cast<LogicalDelimGet>());
 		break;
 	case LogicalOperatorType::LOGICAL_EXPRESSION_GET:
-		throw NotImplementedException("Expression get not supported");
-		// plan = CreatePlan(op.Cast<LogicalExpressionGet>());
+		// throw NotImplementedException("Expression get not supported");
+		plan = CreatePlan(op.Cast<LogicalExpressionGet>());
 		break;
 	case LogicalOperatorType::LOGICAL_UPDATE:
 		throw NotImplementedException("Update not supported");

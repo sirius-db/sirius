@@ -752,7 +752,7 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
       if (num_expr > 0) {
         // count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
         HandleArbitraryConstantExpression(expression_columns, count, row_ids, filter_constants, num_expr);
-        if (count[0] == 0) throw NotImplementedException("No match found");
+        // if (count[0] == 0) throw NotImplementedException("No match found");
       }
     }
     int index = 0;

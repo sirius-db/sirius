@@ -297,7 +297,7 @@ GPUExpressionExecutor::HandlingSpecificFilter(GPUIntermediateRelation& input_rel
         }
 
         if (count && comparison_idx) {
-            if (count[0] == 0) throw NotImplementedException("No match found");
+            // if (count[0] == 0) throw NotImplementedException("No match found");
             HandleMaterializeRowIDs(input_relation, output_relation, count[0], comparison_idx, gpuBufferManager, true);
             return true;
         }
