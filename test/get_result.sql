@@ -301,8 +301,9 @@ group by
   c_address,
   c_comment 
 order by
-  revenue desc,
-  c_acctbal) TO 'test/answers/q10.csv' (HEADER, DELIMITER '|');
+  c_custkey,
+  revenue desc
+) TO 'test/answers/q10.csv' (HEADER, DELIMITER '|');
 
 COPY (
 select
