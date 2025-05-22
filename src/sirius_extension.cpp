@@ -207,11 +207,11 @@ void SiriusExtension::GPUProcessingFunction(ClientContext &context, TableFunctio
 
 	if (!data.res) {
 		auto start = std::chrono::high_resolution_clock::now();
-		if (data.plan_error) {
+		if (!buffer_is_initialized) {
+			printf("\033[1;31m"); printf("GPUBufferManager not initialized, please call gpu_buffer_init first\n"); printf("\033[0m");
 			printf("=============================================\nError in GPUExecuteQuery, fallback to DuckDB\n=============================================\n");
 			data.res = data.conn->Query(data.query);
-		} else if (!buffer_is_initialized) {
-			printf("\033[1;31m"); printf("GPUBufferManager not initialized, please call gpu_buffer_init first\n"); printf("\033[0m");
+		} else if (data.plan_error) {
 			printf("=============================================\nError in GPUExecuteQuery, fallback to DuckDB\n=============================================\n");
 			data.res = data.conn->Query(data.query);
 		} else {
@@ -318,13 +318,13 @@ void SiriusExtension::GPUProcessingSubstraitFunction(ClientContext &context, Tab
 	}
 	if (!data.res) {
 		auto start = std::chrono::high_resolution_clock::now();
-		if (data.plan_error) {
+		if (!buffer_is_initialized) {
+			printf("\033[1;31m"); printf("GPUBufferManager not initialized, please call gpu_buffer_init first\n"); printf("\033[0m");
 			printf("=============================================\nError in GPUExecuteQuery, fallback to DuckDB\n=============================================\n");
 			auto con = Connection(*context.db);
 			data.plan->context = make_shared_ptr<ClientContextWrapper>(con.context);
 			data.res = data.plan->Execute();
-		} else if (!buffer_is_initialized) {
-			printf("\033[1;31m"); printf("GPUBufferManager not initialized, please call gpu_buffer_init first\n"); printf("\033[0m");
+		} else if (data.plan_error) {
 			printf("=============================================\nError in GPUExecuteQuery, fallback to DuckDB\n=============================================\n");
 			auto con = Connection(*context.db);
 			data.plan->context = make_shared_ptr<ClientContextWrapper>(con.context);

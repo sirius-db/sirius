@@ -222,6 +222,11 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 	for (int col = 0; col < input_relation.columns.size(); col++) {
 		// TODO: Need to fix this for the future, but for now, we will just return when there is null column
 		if (input_relation.columns[col]->data_wrapper.data == nullptr) return SinkResultType::FINISHED;
+ 
+		if (input_relation.columns[col]->column_length == 0) {
+			continue;
+		}
+
 		// Final materialization
 		size_bytes = FinalMaterialize(input_relation, materialized_relation, col);
 
@@ -280,6 +285,15 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 	size_t total_vector = (materialized_relation.columns[0]->column_length + STANDARD_VECTOR_SIZE - 1) / STANDARD_VECTOR_SIZE;
 	// printf("Total vector %d\n", total_vector);
 	size_t remaining = materialized_relation.columns[0]->column_length;
+
+	// if input_relation is empty
+	if (input_relation.columns[0]->column_length == 0) {
+		DataChunk chunk;
+		chunk.InitializeEmpty(types);
+		collection->Append(append_state, chunk);
+		return SinkResultType::FINISHED;
+	}
+
 	for (uint64_t vec = 0; vec < total_vector; vec++) {
 		DataChunk chunk;
 		chunk.InitializeEmpty(types);

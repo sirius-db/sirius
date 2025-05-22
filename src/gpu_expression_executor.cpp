@@ -248,7 +248,7 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
                 shared_ptr<GPUColumn> materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref.index], bound_ref, gpuBufferManager);
                 // count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
                 HandleComparisonConstantExpression(materialized_column, bound_lower, bound_upper, count, comparison_idx, bound_between.type);
-                if (count[0] == 0) throw NotImplementedException("No match found");
+                // if (count[0] == 0) throw NotImplementedException("No match found");
             break;
             } case ExpressionClass::BOUND_REF: {
                 auto &bound_ref = expr.Cast<BoundReferenceExpression>();
@@ -297,7 +297,7 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
                         shared_ptr<GPUColumn> materialized_column = HandleMaterializeExpression(input_relation.columns[bound_ref1.index], bound_ref1, gpuBufferManager);
                         // count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
                         HandleComparisonConstantExpression(materialized_column, bound_ref2, bound_ref2, count, comparison_idx, bound_comparison.type);
-                        if (count[0] == 0) throw NotImplementedException("No match found");
+                        // if (count[0] == 0) throw NotImplementedException("No match found");
                     }
                 } else if (bound_comparison.right->expression_class == ExpressionClass::BOUND_REF) {
                     auto &bound_ref1 = bound_comparison.left->Cast<BoundReferenceExpression>();
@@ -313,7 +313,7 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
                         shared_ptr<GPUColumn> materialized_column2 = HandleMaterializeExpression(input_relation.columns[bound_ref2.index], bound_ref2, gpuBufferManager);
                         // count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
                         HandleComparisonExpression(materialized_column1, materialized_column2, count, comparison_idx, bound_comparison.type);  
-                        if (count[0] == 0) throw NotImplementedException("No match found");   
+                        // if (count[0] == 0) throw NotImplementedException("No match found");   
                     }       
                 } else {
                   throw NotImplementedException("Comparison expression not supported");
@@ -362,7 +362,7 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
                   } else {
                     throw NotImplementedException("Function not supported");
                   }
-                  if (count[0] == 0) throw NotImplementedException("No match found");
+                  // if (count[0] == 0) throw NotImplementedException("No match found");
                 }
             break;
           } case ExpressionClass::BOUND_OPERATOR: {
@@ -386,7 +386,7 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
                         BoundConstantExpression bound_constant_expr = BoundConstantExpression(one);
                         // count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
                         HandleComparisonConstantExpression(materialized_column, bound_constant_expr, bound_constant_expr, count, comparison_idx, ExpressionType::COMPARE_NOTEQUAL);
-                        if (count[0] == 0) throw NotImplementedException("No match found"); 
+                        // if (count[0] == 0) throw NotImplementedException("No match found"); 
                       }
                     // if children is a bound function (contains or prefix)
                     } else if (bound_operator.children[0]->expression_class == ExpressionClass::BOUND_FUNCTION) {
@@ -407,7 +407,7 @@ GPUExpressionExecutor::FilterRecursiveExpression(GPUIntermediateRelation& input_
                         } else if(bound_function_name.find("contains") != std::string::npos) {
                             HandleStringMatching(materialized_column, match_str, comparison_idx, count, 1);
                         } 
-                        if (count[0] == 0) throw NotImplementedException("No match found");
+                        // if (count[0] == 0) throw NotImplementedException("No match found");
                       }
                     }
                 } else {
