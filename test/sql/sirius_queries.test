@@ -13,7 +13,7 @@ statement ok
 CREATE TABLE REGION  (
     R_REGIONKEY  BIGINT NOT NULL UNIQUE PRIMARY KEY,
     R_NAME       CHAR(25) NOT NULL,
-    R_COMMENT    VARCHAR(152),
+    R_COMMENT    VARCHAR(152) NOT NULL,
 );
 
 statement ok
@@ -21,7 +21,7 @@ CREATE TABLE NATION  (
     N_NATIONKEY  BIGINT NOT NULL UNIQUE PRIMARY KEY,
     N_NAME       CHAR(25) NOT NULL,
     N_REGIONKEY  BIGINT NOT NULL,
-    N_COMMENT    VARCHAR(152),
+    N_COMMENT    VARCHAR(152) NOT NULL,
 );
 
 statement ok
@@ -453,8 +453,8 @@ group by
   c_address,
   c_comment 
 order by
-  revenue desc,
-  c_acctbal;");
+  c_custkey,
+  revenue desc;");
 ----
 <FILE>:test/answers/q10.csv
 
