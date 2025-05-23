@@ -1,5 +1,6 @@
 #include "gpu_columns.hpp"
 #include "gpu_buffer_manager.hpp"
+#include <cstddef>
 
 namespace duckdb {
 
@@ -81,7 +82,14 @@ GPUColumn::convertToCudfColumn() {
     } else if (data_wrapper.type == ColumnType::VARCHAR) {
 
         //convert offset to int32
+        if(data_wrapper.offset == nullptr) {
+          std::cout << "OFFSET IS NULL!\n";
+        }
+        if(data_wrapper.data == nullptr) {
+          std::cout << "DATA IS NULL!\n";
+        }
         int32_t* new_offset = convertSiriusOffsetToCudfOffset();
+        std::cout << "SUCCESSFULLY CONVERTED!\n";
 
         auto offsets_col = cudf::column_view(
             cudf::data_type{cudf::type_id::INT32},
@@ -113,10 +121,18 @@ GPUColumn::setFromCudfColumn(cudf::column& cudf_column, bool _is_unique, int32_t
     cudf::data_type col_type = cudf_column.type();
     cudf::size_type col_size = cudf_column.size();
     cudf::column::contents cont = cudf_column.release();
-    // rmm_owned_buffer = std::move(cont.data);
-    gpuBufferManager->rmm_stored_buffers.push_back(std::move(cont.data));
 
-    data_wrapper.data = reinterpret_cast<uint8_t*>(gpuBufferManager->rmm_stored_buffers.back()->data());
+    /// KEVIN CHANGE ///
+    // rmm_owned_buffer = std::move(cont.data);
+    // gpuBufferManager->rmm_stored_buffers.push_back(std::move(cont.data));
+
+    // data_wrapper.data = reinterpret_cast<uint8_t*>(gpuBufferManager->rmm_stored_buffers.back()->data());
+
+    gpuBufferManager->rmm_stored_buffers.emplace_back(std::move(cont.data));
+    auto& buffer_ref = gpuBufferManager->rmm_stored_buffers.back();
+    data_wrapper.data = reinterpret_cast<uint8_t*>(buffer_ref->data());
+    /// END KEVIN CHANGE ///
+
     data_wrapper.size = col_size;
     column_length = data_wrapper.size;
     is_unique = _is_unique;
@@ -124,6 +140,7 @@ GPUColumn::setFromCudfColumn(cudf::column& cudf_column, bool _is_unique, int32_t
     gpuBufferManager->allocation_table[0][reinterpret_cast<void*>(data_wrapper.data)] = column_length;
 
     if (col_type == cudf::data_type(cudf::type_id::STRING)) {
+      std::cout << "SETTING STRING FROM CUDF STRING COLUMN...\n";
         cudf::column::contents child_cont = cont.children[0]->release();
         data_wrapper.is_string_data = true;
         data_wrapper.type = ColumnType::VARCHAR;

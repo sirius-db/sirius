@@ -499,7 +499,11 @@ GPUExpressionExecutor::ProjectionRecursiveExpression(GPUIntermediateRelation& in
                   auto &bound_ref1 = bound_function.children[0]->Cast<BoundReferenceExpression>();
                   auto &bound_ref2 = bound_function.children[1]->Cast<BoundConstantExpression>();
                   auto &bound_ref3 = bound_function.children[2]->Cast<BoundConstantExpression>();
+                  std::cout << "\tIndex: " << bound_ref1.index << "\n";
                   shared_ptr<GPUColumn> input_column = input_relation.columns[bound_ref1.index];
+                  if(input_column->data_wrapper.data == nullptr) {
+                    std::cout << "\tDATA IS NULL\n";
+                  }
                   uint64_t start_idx = bound_ref2.value.GetValue<uint64_t>();
                   if (start_idx < 1) throw InvalidInputException("Start index should be greater than 0");
                   uint64_t length = bound_ref3.value.GetValue<uint64_t>();

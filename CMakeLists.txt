@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.30.4)
 
+# Enable compile_commands.json generation for clang lsp
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 # Check for USE_CUDF environment variable
 if(DEFINED ENV{USE_CUDF})
     message(STATUS "USE_CUDF environment variable is set")
@@ -27,7 +30,7 @@ else()
 endif()
 
 # Set CUDA architecture and flags
-set(CMAKE_CUDA_ARCHITECTURES 75)
+set(CMAKE_CUDA_ARCHITECTURES 89)
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-extended-lambda --expt-relaxed-constexpr -rdc=true")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++17")
 
@@ -60,6 +63,7 @@ set(EXTENSION_SOURCES
 add_subdirectory(src/operator)
 add_subdirectory(src/plan)
 add_subdirectory(src/query_specific)
+add_subdirectory(src/expression_executor)
 
 set(CUDA_SOURCES 
   src/cuda/sirius_extension_cuda.cu 
@@ -73,6 +77,7 @@ add_subdirectory(src/cuda/query_specific)
 if (USE_CUDF)
   add_subdirectory(src/cuda/cudf)
 endif()
+add_subdirectory(src/cuda/expression_executor)
 
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CXX_STANDARD 17)
@@ -111,21 +116,21 @@ set_target_properties(${LOADABLE_EXTENSION_NAME} PROPERTIES CUDA_SEPARABLE_COMPI
 if (USE_CUDF)
   target_link_libraries(${EXTENSION_NAME}
     substrait_extension
-    cuda 
-    cudart 
-    cupti 
-    curand 
-    cudadevrt
+    # cuda 
+    # cudart 
+    # cupti 
+    # curand 
+    # cudadevrt
     cudf::cudf 
     rmm::rmm
   )
   target_link_libraries(${LOADABLE_EXTENSION_NAME} 
     substrait_extension
-    cuda 
-    cudart 
-    cupti 
-    curand 
-    cudadevrt
+    # cuda 
+    # cudart 
+    # cupti 
+    # curand 
+    # cudadevrt
     cudf::cudf 
     rmm::rmm
   )

@@ -8,6 +8,7 @@
 #include "duckdb/planner/expression/bound_case_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
+#include "expression_executor/gpu_expression_executor.hpp"
 
 namespace duckdb {
 
@@ -23,6 +24,7 @@ GPUPhysicalFilter::GPUPhysicalFilter(vector<LogicalType> types, vector<unique_pt
 			conjunction->children.push_back(std::move(expr));
 		}
 		expression = std::move(conjunction);
+    std::cout << "\tACTUALLY NEEDED TO COMBINE FILTER EXPRESSIONS\n";
 	} else {
 		expression = std::move(select_list[0]);
 	}
@@ -34,8 +36,10 @@ GPUPhysicalFilter::GPUPhysicalFilter(vector<LogicalType> types, vector<unique_pt
 OperatorResultType 
 GPUPhysicalFilter::Execute(GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation) const {
 	printf("Executing expression %s\n", expression->ToString().c_str());
+  sirius::GpuExpressionExecutor my_executor(*expression);
 	auto start = std::chrono::high_resolution_clock::now();
-    gpu_expression_executor->FilterRecursiveExpression(input_relation, output_relation, *expression, 0);
+    //gpu_expression_executor->FilterRecursiveExpression(input_relation, output_relation, *expression, 0);
+  my_executor.Select(input_relation, output_relation);
 	auto end = std::chrono::high_resolution_clock::now();
 	auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
 	printf("Filter time: %.2f ms\n", duration.count()/1000.0);

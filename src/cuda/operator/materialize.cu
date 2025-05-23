@@ -94,8 +94,8 @@ void materializeExpression(T *a, T*& result, uint64_t *row_ids, uint64_t result_
     // cudaMemcpy(result, raw_sorted, N * sizeof(T), cudaMemcpyDeviceToDevice);
     // testprintmat<T><<<1, 1>>>(result, 100);
     cudaDeviceSynchronize();
-    STOP_TIMER();
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(a), 0);
+    STOP_TIMER();
 }
 
 void materializeString(uint8_t* data, uint64_t* offset, uint8_t* &result, uint64_t* &result_offset, uint64_t* row_ids, uint64_t* &result_bytes, uint64_t result_len, uint64_t input_size, uint64_t input_bytes) {

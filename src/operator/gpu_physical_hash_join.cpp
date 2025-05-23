@@ -568,6 +568,9 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 			printf("Passing column idx %ld from RHS (late materialized) to idx %ld in output relation\n", rhs_col, i);
 			// output_relation.columns[output_col_idx] = HandleMaterializeRowIDs(hash_table_result->columns[output_col_idx], count[0], row_ids_right, gpuBufferManager);
 			output_relation.columns[i] = make_shared_ptr<GPUColumn>(0, hash_table_result->columns[rhs_col]->data_wrapper.type, nullptr);
+      /// KEVIN DEBUG ///
+      std::cout << "\tNULL OUTPUT COLUMN\n";
+      /// KEVIN DEBUG ///
 		}
 	}
 
@@ -660,6 +663,9 @@ GPUPhysicalHashJoin::Sink(GPUIntermediateRelation &input_relation) const {
 		printf("Passing column idx %d from input relation to index %ld in RHS hash table\n", join_key_index, cond_idx);
 		hash_table_result->columns[cond_idx] = input_relation.columns[join_key_index];
 		materialized_build_key->columns[cond_idx] = build_keys[cond_idx];
+    /// KEVIN DEBUG ///
+
+    /// KEVIN DEBUG ///
 		right_idx++;
 	}
 

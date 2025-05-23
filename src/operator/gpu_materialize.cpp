@@ -27,6 +27,7 @@ ResolveTypeMaterializeExpression(shared_ptr<GPUColumn> column, BoundReferenceExp
 
 shared_ptr<GPUColumn> 
 ResolveTypeMaterializeString(shared_ptr<GPUColumn> column, BoundReferenceExpression& bound_ref, GPUBufferManager* gpuBufferManager) {
+  std::cout << "Materializing string\n";
     size_t size;
     uint8_t* a;
     uint64_t* result_offset; 

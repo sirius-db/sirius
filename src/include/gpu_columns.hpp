@@ -68,6 +68,7 @@ public:
 
 class GPUColumn {
 public:
+    // GPUColumn() = default;
     GPUColumn(size_t column_length, ColumnType type, uint8_t* data);
     GPUColumn(size_t _column_length, ColumnType type, uint8_t* data, uint64_t* offset, size_t num_bytes, bool is_string_data);
     GPUColumn(GPUColumn& other);
