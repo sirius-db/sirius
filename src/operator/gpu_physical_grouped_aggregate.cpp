@@ -302,7 +302,7 @@ HandleGroupByAggregateCuDF(vector<shared_ptr<GPUColumn>> &group_by_keys, vector<
 			agg_mode[agg_idx] = AggregationType::MAX;
 		} else if (expr.function.name.compare("min") == 0 && aggregate_keys[agg_idx]->data_wrapper.data != nullptr) {
 			agg_mode[agg_idx] = AggregationType::MIN;
-		} else if (expr.function.name.compare("count_star") == 0 && aggregate_keys[agg_idx]->data_wrapper.data == nullptr && aggregate_keys[agg_idx]->column_length != 0) {
+		} else if (expr.function.name.compare("count_star") == 0 && aggregate_keys[agg_idx]->data_wrapper.data == nullptr) {
 			agg_mode[agg_idx] = AggregationType::COUNT_STAR;
 		} else if (expr.function.name.compare("count") == 0 && aggregate_keys[agg_idx]->data_wrapper.data != nullptr) {
 			agg_mode[agg_idx] = AggregationType::COUNT;
@@ -563,8 +563,14 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 	for (int i = 0; i < aggregates.size(); i++) {
 		aggregate_column[i] = nullptr;
 	}
-	int aggr_idx = 0;
-	int size;
+
+	uint64_t column_size = 0;
+	for (int i = 0; i < input_relation.columns.size(); i++) {
+		if (input_relation.columns[i] != nullptr) {
+			column_size = input_relation.columns[i]->column_length;
+			break;
+		}
+	}
 
 	// Reading groupby columns based on the grouping set
 	for (idx_t i = 0; i < groupings.size(); i++) {
@@ -581,6 +587,7 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 		}
 	}
 
+	int aggr_idx = 0;
 	for (auto &aggregate : aggregates) {
 		auto &aggr = aggregate->Cast<BoundAggregateExpression>();
 		printf("Aggregate type: %s\n", aggr.function.name.c_str());
@@ -591,15 +598,16 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 			printf("Reading aggregation column from index %d and passing it to index %d in groupby result\n", bound_ref_expr.index, grouped_aggregate_data.groups.size() + aggr_idx);
 			aggregate_column[aggr_idx] = HandleMaterializeExpression(input_relation.columns[bound_ref_expr.index], bound_ref_expr, gpuBufferManager);
 		}
-		//here we probably have count(*) or sum(*) or something like that
-		if (aggr.children.size() == 0) {
-			printf("Passing * aggregate to index %d in groupby result\n", grouped_aggregate_data.groups.size() + aggr_idx);
-			aggregate_column[aggr_idx] = make_shared_ptr<GPUColumn>(100, ColumnType::INT64, nullptr);
-		}
 		aggr_idx++;
 	}
+
+	aggr_idx = 0;
 	for (auto &aggregate : aggregates) {
 		auto &aggr = aggregate->Cast<BoundAggregateExpression>();
+		if (aggr.children.size() == 0) {
+			printf("Passing * aggregate to index %d in groupby result\n", grouped_aggregate_data.groups.size() + aggr_idx);
+			aggregate_column[aggr_idx] = make_shared_ptr<GPUColumn>(column_size, ColumnType::INT64, nullptr);
+		}
 		if (aggr.filter) {
 			throw NotImplementedException("Filter not supported yet");
 			auto it = filter_indexes.find(aggr.filter.get());
@@ -607,6 +615,7 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 			printf("Reading aggregation filter from index %d\n", it->second);
 			input_relation.checkLateMaterialization(it->second);
 		}
+		aggr_idx++;
 	}
 
 	uint64_t count[1];
