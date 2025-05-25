@@ -59,9 +59,9 @@ public:
     DataWrapper(ColumnType type, uint8_t* data, uint64_t* offset, size_t size, size_t num_bytes, bool is_string_data);
 	ColumnType type;
 	uint8_t* data;
-    size_t size;
+    size_t size; // number of rows in the column (currently equals to column_length)
     uint64_t* offset{nullptr};
-    size_t num_bytes;
+    size_t num_bytes; // number of bytes in the column
     size_t getColumnTypeSize();
     bool is_string_data{false};
 };
@@ -83,16 +83,17 @@ public:
 
     DataWrapper data_wrapper;
     uint64_t* row_ids;
-    size_t row_id_count;
-    size_t column_length;
-    bool is_unique;
+    size_t row_id_count; // number of rows in the row_ids array
+    size_t column_length; // number of rows in the column (currently equals to column_length)
+    bool is_unique; // indicator whether the column has unique values
 
     cudf::column_view convertToCudfColumn();
-    int32_t* convertSiriusOffsetToCudfOffset();
-    int32_t* convertSiriusRowIdsToCudfRowIds();
-    void convertCudfRowIdsToSiriusRowIds(int32_t* cudf_row_ids);
-    void convertCudfOffsetToSiriusOffset(int32_t* cudf_offset);
+    int32_t* convertSiriusOffsetToCudfOffset(); // convert the offset of GPUColumn to the offset of the cudf column
+    int32_t* convertSiriusRowIdsToCudfRowIds(); // convert the row_ids of the GPUColumn to the row_ids of the cudf column
+    void convertCudfRowIdsToSiriusRowIds(int32_t* cudf_row_ids); // convert the row_ids of the cudf column to the row_ids of the GPUColumn
+    void convertCudfOffsetToSiriusOffset(int32_t* cudf_offset); // convert the offset of the cudf column to the offset of the GPUColumn
     void setFromCudfColumn(cudf::column& cudf_column, bool _is_unique, int32_t* _row_ids, uint64_t _row_id_count, GPUBufferManager* gpuBufferManager);
+    void setFromCudfScalar(cudf::scalar& cudf_scalar, GPUBufferManager* gpuBufferManager); // set the GPUColumn from the cudf scalar
 };
 
 class GPUIntermediateRelation {

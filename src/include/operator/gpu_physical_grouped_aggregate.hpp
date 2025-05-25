@@ -8,7 +8,6 @@
 #include "duckdb/parser/group_by_node.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/execution/operator/aggregate/physical_hash_aggregate.hpp"
-#include "helper/types.hpp"
 
 namespace duckdb {
 

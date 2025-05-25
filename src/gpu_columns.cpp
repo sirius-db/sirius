@@ -169,6 +169,50 @@ GPUColumn::setFromCudfColumn(cudf::column& cudf_column, bool _is_unique, int32_t
     }
 }
 
+void
+GPUColumn::setFromCudfScalar(cudf::scalar& cudf_scalar, GPUBufferManager* gpuBufferManager) {
+    cudf::data_type scalar_type = cudf_scalar.type();
+    if (scalar_type == cudf::data_type(cudf::type_id::UINT64)) {
+        auto& typed_scalar = static_cast<cudf::numeric_scalar<uint64_t>&>(cudf_scalar);
+        data_wrapper.data = gpuBufferManager->customCudaMalloc<uint8_t>(sizeof(uint64_t), 0, 0);
+        callCudaMemcpyDeviceToDevice<uint8_t>(data_wrapper.data, reinterpret_cast<uint8_t*>(typed_scalar.data()), sizeof(uint64_t), 0);
+        data_wrapper.type = ColumnType::INT64;
+        data_wrapper.num_bytes = sizeof(uint64_t);
+    } else if (scalar_type == cudf::data_type(cudf::type_id::INT32)) {
+        auto& typed_scalar = static_cast<cudf::numeric_scalar<int32_t>&>(cudf_scalar);
+        data_wrapper.data = gpuBufferManager->customCudaMalloc<uint8_t>(sizeof(int32_t), 0, 0);
+        callCudaMemcpyDeviceToDevice<uint8_t>(data_wrapper.data, reinterpret_cast<uint8_t*>(typed_scalar.data()), sizeof(int32_t), 0);
+        data_wrapper.type = ColumnType::INT32;
+        data_wrapper.num_bytes = sizeof(int32_t);
+    } else if (scalar_type == cudf::data_type(cudf::type_id::FLOAT32)) {
+        auto& typed_scalar = static_cast<cudf::numeric_scalar<float>&>(cudf_scalar);
+        data_wrapper.data = gpuBufferManager->customCudaMalloc<uint8_t>(sizeof(float), 0, 0);
+        callCudaMemcpyDeviceToDevice<uint8_t>(data_wrapper.data, reinterpret_cast<uint8_t*>(typed_scalar.data()), sizeof(float), 0);
+        data_wrapper.type = ColumnType::FLOAT32;
+        data_wrapper.num_bytes = sizeof(float);
+    } else if (scalar_type == cudf::data_type(cudf::type_id::FLOAT64)) {
+        auto& typed_scalar = static_cast<cudf::numeric_scalar<double>&>(cudf_scalar);
+        data_wrapper.data = gpuBufferManager->customCudaMalloc<uint8_t>(sizeof(double), 0, 0);
+        callCudaMemcpyDeviceToDevice<uint8_t>(data_wrapper.data, reinterpret_cast<uint8_t*>(typed_scalar.data()), sizeof(double), 0);
+        data_wrapper.type = ColumnType::FLOAT64;
+        data_wrapper.num_bytes = sizeof(double);
+    } else if (scalar_type == cudf::data_type(cudf::type_id::BOOL8)) {
+        auto& typed_scalar = static_cast<cudf::numeric_scalar<bool>&>(cudf_scalar);
+        data_wrapper.data = gpuBufferManager->customCudaMalloc<uint8_t>(sizeof(uint8_t), 0, 0);
+        callCudaMemcpyDeviceToDevice<uint8_t>(data_wrapper.data, reinterpret_cast<uint8_t*>(typed_scalar.data()), sizeof(uint8_t), 0);
+        data_wrapper.type = ColumnType::BOOLEAN;
+        data_wrapper.num_bytes = sizeof(uint8_t);
+    }
+
+    data_wrapper.size = 1;
+    column_length = 1;
+    data_wrapper.offset = nullptr;
+    data_wrapper.is_string_data = false;
+    row_ids = nullptr;
+    row_id_count = 0;
+
+}
+
 int32_t*
 GPUColumn::convertSiriusOffsetToCudfOffset() {
     return convertUInt64ToInt32(data_wrapper.offset, column_length + 1);
