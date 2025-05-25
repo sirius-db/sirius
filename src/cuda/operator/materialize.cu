@@ -175,7 +175,7 @@ __global__ void create_cpu_strings(duckdb_string_type* gpu_strings, char* cpu_ch
     }
 }
 
-void materializeStringColumnToDuckdbFormat(GPUColumn* column, char* column_char_write_buffer, string_t* column_string_write_buffer) {
+void materializeStringColumnToDuckdbFormat(shared_ptr<GPUColumn> column, char* column_char_write_buffer, string_t* column_string_write_buffer) {
     // First copy the characters from the GPU to the CPU
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
     DataWrapper column_data = column->data_wrapper;
