@@ -56,6 +56,7 @@ set(EXTENSION_SOURCES
   src/gpu_buffer_manager.cpp
   src/gpu_columns.cpp
   src/gpu_expression_executor.cpp
+  src/gpu_query_result.cpp
 )
 add_subdirectory(src/operator)
 add_subdirectory(src/plan)

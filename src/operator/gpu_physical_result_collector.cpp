@@ -64,7 +64,7 @@ GPUPhysicalResultCollector::BuildPipelines(GPUPipeline &current, GPUMetaPipeline
 }
 
 GPUPhysicalMaterializedCollector::GPUPhysicalMaterializedCollector(GPUPreparedStatementData &data)
-	: GPUPhysicalResultCollector(data), collection(make_uniq<ColumnDataCollection>(Allocator::DefaultAllocator(), types)) {
+	: GPUPhysicalResultCollector(data), result_collection(make_uniq<GPUResultCollection>()) {
 }
 
 //===--------------------------------------------------------------------===//
@@ -73,13 +73,11 @@ GPUPhysicalMaterializedCollector::GPUPhysicalMaterializedCollector(GPUPreparedSt
 class GPUMaterializedCollectorGlobalState : public GlobalSinkState {
 public:
 	mutex glock;
-	unique_ptr<ColumnDataCollection> collection;
 	shared_ptr<ClientContext> context;
 };
 
 class GPUMaterializedCollectorLocalState : public LocalSinkState {
 public:
-	unique_ptr<ColumnDataCollection> collection;
 	ColumnDataAppendState append_state;
 };
 
@@ -213,59 +211,72 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 	auto start = std::chrono::high_resolution_clock::now();
 	// auto &gstate = GetGlobalSinkState(input_relation.context);
 
+	auto materialize_start_time = std::chrono::high_resolution_clock::now();
+
+	// First figure out the total number of strings and chars in all of the columns
+	size_t all_columns_num_strings = 0;
+	size_t all_columns_total_chars = 0;
+	for (int col = 0; col < input_relation.columns.size(); col++) {
+		DataWrapper column_data_wrapper = input_relation.columns[col]->data_wrapper;
+		if(column_data_wrapper.type == ColumnType::VARCHAR) {
+			all_columns_num_strings += column_data_wrapper.size;
+			all_columns_total_chars += column_data_wrapper.num_bytes;
+		}
+	}
+
+	size_t all_columns_strings_buffer_size = all_columns_num_strings * sizeof(string_t);
+	size_t all_columns_chars_buffer_size = all_columns_total_chars * sizeof(char);
+	std::cout << "GPU RESULT COLLECTOR: Creating string buffer " << all_columns_num_strings << " strings with " << all_columns_total_chars << " chars" << std::endl;
+
+	// Now allocate the buffers for the columns
+	size_t total_buffer_size = all_columns_strings_buffer_size + all_columns_chars_buffer_size;
+	uint8_t* combined_buffer = gpuBufferManager->customCudaHostAlloc<uint8_t>(total_buffer_size);
+	string_t* all_columns_string = reinterpret_cast<string_t*>(combined_buffer);
+	char* all_columns_chars = reinterpret_cast<char*>(combined_buffer + all_columns_strings_buffer_size);
+	std::cout << "GPU RESULT COLLECTOR: Created string buffer of " << all_columns_strings_buffer_size << " bytes and chars buffer of " << all_columns_chars_buffer_size << " bytes" << std::endl;
+
 	size_t size_bytes = 0;
 	Allocator& allocator = Allocator::DefaultAllocator();
 	uint8_t** host_data = new uint8_t*[input_relation.columns.size()];
 	GPUIntermediateRelation materialized_relation(input_relation.columns.size());
 	string_t** duckdb_strings = new string_t*[input_relation.columns.size()];
 	GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+
+	string_t* curr_column_string_buffer = all_columns_string;
+	char* curr_column_chars_buffer = all_columns_chars;
 	for (int col = 0; col < input_relation.columns.size(); col++) {
 		// TODO: Need to fix this for the future, but for now, we will just return when there is null column
 		if (input_relation.columns[col]->data_wrapper.data == nullptr) return SinkResultType::FINISHED;
 		// Final materialization
+		auto col_materialize_start_time = std::chrono::high_resolution_clock::now();
 		size_bytes = FinalMaterialize(input_relation, materialized_relation, col);
 
+		bool is_string = false;
 		if(input_relation.columns[col]->data_wrapper.type != ColumnType::VARCHAR) {
 			// host_data[col] = allocator.AllocateData(size_bytes);
 			host_data[col] = gpuBufferManager->customCudaHostAlloc<uint8_t>(size_bytes);
 			callCudaMemcpyDeviceToHost<uint8_t>(host_data[col], materialized_relation.columns[col]->data_wrapper.data, size_bytes, 0);
 		} else {
-			DataWrapper materialized_col_data = materialized_relation.columns[col]->data_wrapper;
-			// std::cout << "Got materalized col data with " << materialized_col_data.size << " and " << materialized_col_data.num_bytes << " chars" << std::endl;
-			// printGPUColumn<uint64_t>(materialized_col_data.offset, 100, 0);
-			
-			// Copy over the pointers from the gpu to the cpu
-			size_t offset_bytes = (materialized_col_data.size + 1) * sizeof(uint64_t);
-			// uint64_t* cpu_offsets = reinterpret_cast<uint64_t*>(allocator.AllocateData(offset_bytes));
-			uint64_t* cpu_offsets = reinterpret_cast<uint64_t*>(gpuBufferManager->customCudaHostAlloc<uint8_t>(offset_bytes));
-			callCudaMemcpyDeviceToHost<uint64_t>(cpu_offsets, materialized_col_data.offset, materialized_col_data.size + 1, 0);
-			// std::cout << "Got cpu offset of " << cpu_offsets[0] << "," << cpu_offsets[1] << std::endl;
-			materialized_col_data.offset = cpu_offsets;
-			
-			// Do the same for the chars
-			size_t data_bytes = materialized_col_data.num_bytes * sizeof(uint8_t);
-			// uint8_t* cpu_chars = reinterpret_cast<uint8_t*>(allocator.AllocateData(data_bytes));
-			uint8_t* cpu_chars = gpuBufferManager->customCudaHostAlloc<uint8_t>(data_bytes);
-			callCudaMemcpyDeviceToHost<uint8_t>(cpu_chars, materialized_col_data.data, data_bytes, 0);
-			materialized_col_data.data = cpu_chars;
+			// Use the helper method to materialize the string on the GPU
+			shared_ptr<GPUColumn> str_column = materialized_relation.columns[col];
+			materializeStringColumnToDuckdbFormat(str_column, curr_column_chars_buffer, curr_column_string_buffer);
+			duckdb_strings[col] = curr_column_string_buffer;
+			materialized_relation.columns[col] = str_column;
+			is_string = true;
 
-			// Copy over the data wrapper
-			materialized_relation.columns[col]->data_wrapper = materialized_col_data;
-			// std::cout << "Copied over strings to the CPU with offset " << materialized_relation.columns[col]->data_wrapper.offset[0];
-			// std::cout << " and chars " << materialized_relation.columns[col]->data_wrapper.data[0] << std::endl;
-
-			// Create a vector of all the strings
-			DataWrapper strings_data_wrapper = materialized_relation.columns[col]->data_wrapper;
-			char* str_all_chars = reinterpret_cast<char*>(strings_data_wrapper.data);
-			size_t num_strings = strings_data_wrapper.size;
-			duckdb_strings[col] = new string_t[num_strings];
-			for(size_t i = 0; i < num_strings; i++) {
-				uint64_t str_start_offset = strings_data_wrapper.offset[i];
-				uint64_t curr_str_length = strings_data_wrapper.offset[i + 1] - str_start_offset;
-				duckdb_strings[col][i] = string_t(str_all_chars + str_start_offset, curr_str_length);
-			}
+			// Advance the buffer pointers based on this column's details
+			DataWrapper str_column_data = str_column->data_wrapper;
+			curr_column_chars_buffer += str_column_data.num_bytes * sizeof(char);
+			curr_column_string_buffer += str_column_data.size * sizeof(string_t);
 		}
+
+		auto col_materialize_end_time = std::chrono::high_resolution_clock::now();
+		auto col_materialize_duration_ms = std::chrono::duration_cast<std::chrono::microseconds>(col_materialize_end_time - col_materialize_start_time).count()/1000.0;
+		std::cout << "GPU RESULT COLLECTOR: Materializing column with is_string of " << is_string << " took " << col_materialize_duration_ms << " ms" << std::endl;
 	}
+	auto materialize_end_time = std::chrono::high_resolution_clock::now();
+	auto materialize_duration_ms = std::chrono::duration_cast<std::chrono::microseconds>(materialize_end_time - materialize_start_time).count()/1000.0;
+	std::cout << "GPU RESULT COLLECTOR: Materialize time of " << materialize_duration_ms << " ms" << std::endl; 
 
 	// // free all input relation columns
 	// for (int col = 0; col < input_relation.columns.size(); col++) {
@@ -275,10 +286,11 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
     //     }
 	// }
 
-	ColumnDataAppendState append_state;
-	collection->InitializeAppend(append_state);
+	auto chunk_start_time = std::chrono::high_resolution_clock::now();
 	size_t total_vector = (materialized_relation.columns[0]->column_length + STANDARD_VECTOR_SIZE - 1) / STANDARD_VECTOR_SIZE;
-	// printf("Total vector %d\n", total_vector);
+	result_collection->SetCapacity(total_vector);
+
+	uint64_t read_index = 0;
 	size_t remaining = materialized_relation.columns[0]->column_length;
 	for (uint64_t vec = 0; vec < total_vector; vec++) {
 		DataChunk chunk;
@@ -289,19 +301,20 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 				chunk.data[col].Reference(vector);
 			} else {
 				// Add the strings to the vector
-				uint64_t start_idx = materialized_relation.columns[0]->column_length - remaining;
-				Vector str_vector(LogicalType::VARCHAR, reinterpret_cast<data_ptr_t>(duckdb_strings[col] + start_idx));
+				Vector str_vector(LogicalType::VARCHAR, reinterpret_cast<data_ptr_t>(duckdb_strings[col] + read_index));
 				chunk.data[col].Reference(str_vector);
 			}
 		}
-		if (remaining < STANDARD_VECTOR_SIZE) {
-			chunk.SetCardinality(remaining);
-		} else {
-			chunk.SetCardinality(STANDARD_VECTOR_SIZE);
-		}
-		collection->Append(append_state, chunk);
-		remaining -= STANDARD_VECTOR_SIZE;
+
+		size_t cardinality = std::min(remaining, (size_t) STANDARD_VECTOR_SIZE);
+		chunk.SetCardinality(cardinality);
+		result_collection->AddChunk(chunk);
+		
+		remaining -= cardinality; read_index += cardinality;
 	}
+	auto chunk_end_time = std::chrono::high_resolution_clock::now();
+	auto chunking_duration_ms = std::chrono::duration_cast<std::chrono::microseconds>(chunk_end_time - chunk_start_time).count()/1000.0;
+	std::cout << "GPU RESULT COLLECTOR: Chunking Time of " << chunking_duration_ms << " ms" << std::endl;
 
 	//measure time
 	auto end = std::chrono::high_resolution_clock::now();
@@ -309,24 +322,6 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 	printf("Result collector time: %.2f ms\n", duration.count()/1000.0);
 	return SinkResultType::FINISHED;
 }
-
-// SinkCombineResultType PhysicalMaterializedCollector::Combine(ExecutionContext &context,
-//                                                              OperatorSinkCombineInput &input) const {
-// 	auto &gstate = input.global_state.Cast<MaterializedCollectorGlobalState>();
-// 	auto &lstate = input.local_state.Cast<MaterializedCollectorLocalState>();
-// 	if (lstate.collection->Count() == 0) {
-// 		return SinkCombineResultType::FINISHED;
-// 	}
-
-// 	lock_guard<mutex> l(gstate.glock);
-// 	if (!gstate.collection) {
-// 		gstate.collection = std::move(lstate.collection);
-// 	} else {
-// 		gstate.collection->Combine(*lstate.collection);
-// 	}
-
-// 	return SinkCombineResultType::FINISHED;
-// }
 
 unique_ptr<GlobalSinkState> GPUPhysicalMaterializedCollector::GetGlobalSinkState(ClientContext &context) const {
 	auto state = make_uniq<GPUMaterializedCollectorGlobalState>();
@@ -336,24 +331,16 @@ unique_ptr<GlobalSinkState> GPUPhysicalMaterializedCollector::GetGlobalSinkState
 
 unique_ptr<LocalSinkState> GPUPhysicalMaterializedCollector::GetLocalSinkState(ExecutionContext &context) const {
 	auto state = make_uniq<GPUMaterializedCollectorLocalState>();
-	state->collection = make_uniq<ColumnDataCollection>(Allocator::DefaultAllocator(), types);
-	state->collection->InitializeAppend(state->append_state);
 	return std::move(state);
 }
 
 unique_ptr<QueryResult> GPUPhysicalMaterializedCollector::GetResult(GlobalSinkState &state) {
 	auto &gstate = state.Cast<GPUMaterializedCollectorGlobalState>();
 	// Currently the result will be empty
-	if (!gstate.collection) {
-		gstate.collection = make_uniq<ColumnDataCollection>(Allocator::DefaultAllocator(), types);
-	}
 	if (!gstate.context) throw InvalidInputException("No context set in GPUMaterializedCollectorState");
-	if (!gstate.collection) throw InvalidInputException("No context set in GPUMaterializedCollectorState");
 	auto prop = gstate.context->GetClientProperties();
-	// auto result = make_uniq<MaterializedQueryResult>(statement_type, properties, names, std::move(gstate.collection),
-	//                                                  prop);
-	auto result = make_uniq<MaterializedQueryResult>(statement_type, properties, names, std::move(collection),
-	                                                 prop);
+	auto result = make_uniq<GPUQueryResult>(statement_type, properties, names, types, prop, std::move(result_collection));
+	std::cout << "Returning GPUQueryResult with value of " << result->ToString() << std::endl;
 	return std::move(result);
 }
 
