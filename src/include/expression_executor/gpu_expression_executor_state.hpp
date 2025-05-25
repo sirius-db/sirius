@@ -18,8 +18,6 @@ struct GpuExpressionState
 {
   //----------Constructor/Destructor(s)----------//
   GpuExpressionState(const Expression& expr, GpuExpressionExecutorState& root);
-  // virtual ~GpuExpressionState()
-  // {}
 
   //----------Fields----------//
   const Expression& expr;                                          // The expression for this state

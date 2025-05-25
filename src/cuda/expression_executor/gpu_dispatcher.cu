@@ -4,6 +4,7 @@
 #include "gpu_buffer_manager.hpp"
 #include "gpu_physical_strings_matching.hpp"
 #include "gpu_physical_substring.hpp"
+#include "utilities/default_stream.hpp"
 #include <cub/cub.cuh>
 #include <cudf/column/column.hpp>
 #include <cudf/strings/strings_column_view.hpp>
@@ -14,6 +15,7 @@
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/scatter.h>
 #include <tuple>
+#include <type_traits>
 
 namespace duckdb
 {
@@ -31,18 +33,13 @@ std::unique_ptr<cudf::column> GpuDispatcher::DispatchSubstring(const cudf::colum
   D_ASSERT(start_idx > 0);
 
   // Convert from cudf to sirius types
-  std::cout << "PREPARING STRING DATA...\n";
   auto [input_count, input_data, input_offsets, input_num_bytes] = PrepareStringData(input);
 
   // Execute the substring operation
-  std::cout << "PERFORMING SUBSTRING...\n";
   auto [result_data, result_offsets, result_num_bytes] =
     PerformSubstring(input_data, input_offsets, input_num_bytes, input.size(), start_idx, len);
 
-  std::cout << "Result num bytes: " << result_num_bytes << "\n";
-
-  // Construct a CuDF column (performing deep copies) and return
-  std::cout << "MAKING COLUMN...\n";
+  // Construct a CuDF column (performing deep copies :(...) and return
   return MakeColumnFromPtrs(result_data, result_offsets, input_count, mr);
 };
 
@@ -117,14 +114,14 @@ GpuDispatcher::DispatchStringMatching(const cudf::column_view& input,
   return MakeColumnFromRowIds(result_row_ids, result_count, input_count, mr);
 }
 
-// std::tuple<rmm::device_uvector<uint64_t>, uint64_t>
 std::tuple<uint64_t*, uint64_t> GpuDispatcher::DispatchSelect(const cudf::column_view& bitmap,
                                                               rmm::device_async_resource_ref mr)
 {
-  auto stream = cudf::get_default_stream();
-  // The row ids
-  uint64_t* row_ids =
-    GPUBufferManager::GetInstance().customCudaMalloc<uint64_t>(bitmap.size(), 0, false);
+  auto stream              = cudf::get_default_stream();
+  auto* gpu_buffer_manager = &GPUBufferManager::GetInstance();
+
+  // The row ids are owned by the query executor and so must be managed by the buffer manager
+  uint64_t* row_ids = gpu_buffer_manager->customCudaMalloc<uint64_t>(bitmap.size(), 0, false);
   rmm::device_scalar<uint64_t> d_num_selected(0, stream, mr);
 
   size_t temp_storage_bytes = 0;
@@ -148,7 +145,6 @@ std::tuple<uint64_t*, uint64_t> GpuDispatcher::DispatchSelect(const cudf::column
                              d_num_selected.data(),
                              bitmap.size(),
                              cudf::get_default_stream());
-  CubDebugExit(cudaDeviceSynchronize());
   num_selected = d_num_selected.value(stream);
   return std::make_tuple(row_ids, num_selected);
 }
@@ -188,9 +184,6 @@ std::unique_ptr<cudf::column> GpuDispatcher::MakeColumnFromPtrs(char* data,
                                 0,
                                 children);
 
-  // Wrap in strings_column_view for printing
-  cudf::strings_column_view str_view(string_view);
-
   // Manufacture the column (deep copies) and return
   return std::make_unique<cudf::column>(string_view, cudf::get_default_stream(), mr);
 }
@@ -224,42 +217,35 @@ std::unique_ptr<cudf::column> GpuDispatcher::MakeColumnFromRowIds(uint64_t* row_
 std::tuple<uint64_t, char*, uint64_t*, uint64_t>
 GpuDispatcher::PrepareStringData(const cudf::column_view& input)
 {
-  // We must convert offsets to uint64_t and cast away constness...
+  static_assert(std::is_same_v<int32_t, cudf::size_type>);
+
+  // We must convert offsets to uint64_t and get the total number of bytes
   uint64_t input_count   = input.size();
-  char* input_data       = const_cast<char*>(input.data<char>()); /// !!!CONST CAST!!!
   uint64_t offsets_count = input_count + 1;
-  uint64_t* input_offsets =
-    convertInt32ToUInt64(const_cast<int32_t*>(input.child(0).data<int32_t>()),
-                         offsets_count); /// !!!CONST CAST!!!
-  uint64_t input_num_bytes = 0;
-  CUDF_CUDA_TRY(cudaMemcpy(&input_num_bytes,
-                           input_offsets + input_count,
-                           sizeof(uint64_t),
-                           cudaMemcpyDeviceToHost));
-  std::cout << "Num bytes: " << input_num_bytes << "\n";
-  return std::make_tuple(input_count, input_data, input_offsets, input_num_bytes);
+  /// !!!CONST CAST!!!
+  auto* input_data           = const_cast<char*>(input.data<char>());
+  auto* input_offsets        = const_cast<int32_t*>(input.child(0).data<int32_t>());
+  uint64_t* input_offsets_64 = convertInt32ToUInt64(input_offsets, offsets_count);
+  uint64_t input_num_bytes   = 0;
+  CUDF_CUDA_TRY(cudaMemcpyAsync(&input_num_bytes,
+                                input_offsets_64 + input_count,
+                                sizeof(uint64_t),
+                                cudaMemcpyDeviceToHost,
+                                cudf::get_default_stream()));
+  return std::make_tuple(input_count, input_data, input_offsets_64, input_num_bytes);
 }
 
 //----------Instantiations----------//
-template std::unique_ptr<cudf::column>
-GpuDispatcher::DispatchStringMatching<StringMatchingType::CONTAINS>(
-  const cudf::column_view& input,
-  const std::string& match_str,
-  rmm::device_async_resource_ref mr);
-template std::unique_ptr<cudf::column>
-GpuDispatcher::DispatchStringMatching<StringMatchingType::LIKE>(const cudf::column_view& input,
-                                                                const std::string& match_str,
-                                                                rmm::device_async_resource_ref mr);
-template std::unique_ptr<cudf::column>
-GpuDispatcher::DispatchStringMatching<StringMatchingType::NOT_LIKE>(
-  const cudf::column_view& input,
-  const std::string& match_str,
-  rmm::device_async_resource_ref mr);
-template std::unique_ptr<cudf::column>
-GpuDispatcher::DispatchStringMatching<StringMatchingType::PREFIX>(
-  const cudf::column_view& input,
-  const std::string& match_str,
-  rmm::device_async_resource_ref mr);
+#define INSTANTIATE_STR_MATCHING(T)                                                                \
+  template std::unique_ptr<cudf::column>                                                           \
+  GpuDispatcher::DispatchStringMatching<StringMatchingType::T>(const cudf::column_view& input,     \
+                                                               const std::string& match_str,       \
+                                                               rmm::device_async_resource_ref mr);
+
+INSTANTIATE_STR_MATCHING(CONTAINS)
+INSTANTIATE_STR_MATCHING(LIKE)
+INSTANTIATE_STR_MATCHING(NOT_LIKE)
+INSTANTIATE_STR_MATCHING(PREFIX)
 
 #undef SPLIT_DELIMITER
 

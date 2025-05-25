@@ -20,6 +20,10 @@ namespace duckdb
 {
 namespace sirius
 {
+
+/// CONFIG ///
+#define USE_CUDF_EXPR false
+
 //----------GpuExpressionExecutor----------//
 struct GpuExpressionExecutor
 {
@@ -41,7 +45,7 @@ struct GpuExpressionExecutor
   // The input count for the current relation (needed for materializing constants)
   cudf::size_type input_count;
   // Static flag indicating whether to use cudf or sirius for string functions
-  static constexpr bool use_cudf = false; /// CONFIG ///
+  static constexpr bool use_cudf = USE_CUDF_EXPR;
 
   //----------Methods----------//
   void AddExpression(const Expression& expr);

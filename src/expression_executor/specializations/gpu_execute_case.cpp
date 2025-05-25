@@ -44,8 +44,6 @@ GpuExpressionExecutor::InitializeState(const BoundCaseExpression& expr,
 std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundCaseExpression& expr,
                                                              GpuExpressionState* state)
 {
-  D_ASSERT(count == state.sel.column_length);
-
   // First, execute the ELSE
   auto else_state     = state->child_states.back().get();
   auto current_output = Execute(*expr.else_expr, else_state);

@@ -23,14 +23,9 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundCastExpr
   auto* child_state = state->child_states[0].get();
   auto child        = Execute(*expr.child, child_state);
 
-  // Cast it to the type specified by the cast expression
-  // D_ASSERT(result.column_type == convertLogicalTypeToColumnType(expr.return_type));
-  // D_ASSERT(child.column_type == convertLogicalTypeToColumnType(child_state->expr.return_type));
-  // D_ASSERT(child.row_id_count == count);
-
   auto type_id = GpuExpressionState::GetCudfType(expr.return_type).id();
   return cudf::cast(child->view(),
-                    cudf::data_type(type_id),
+                    cudf::data_type{type_id},
                     cudf::get_default_stream(),
                     resource_ref);
 }

@@ -45,6 +45,7 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundConstant
 {
   D_ASSERT(expr.value.type() == expr.return_type);
 
+  // In many cases, this is pruned away
   switch (GpuExpressionState::GetCudfType(expr.return_type).id())
   {
     case cudf::type_id::INT32:

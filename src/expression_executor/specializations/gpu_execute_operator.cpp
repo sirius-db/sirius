@@ -68,7 +68,7 @@ struct ExecuteStringIn
     auto num_strings = static_cast<cudf::size_type>(expr.children.size() - 1);
     auto num_offsets = num_strings + 1;
 
-    // We need to convert to cudf format :(
+    // We need to convert to cudf/arrow format...
     std::vector<char> chars;
     std::vector<cudf::size_type> offsets;
     cudf::size_type offset = 0;
@@ -137,9 +137,7 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundOperator
     auto left_type = left->type();
 
     // Optimization: special handling for case where RHS are all constants
-    // TODO: in the future, for strings, we can use sirius MultiStringMatching API
-    if (left_type.id() != cudf::type_id::STRING &&
-        std::all_of(expr.children.begin() + 1, expr.children.end(), [](const auto& child) {
+    if (std::all_of(expr.children.begin() + 1, expr.children.end(), [](const auto& child) {
           return child->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT;
         }))
     {
@@ -159,7 +157,7 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundOperator
         case cudf::type_id::STRING:
           return ExecuteStringIn::Do(expr, left->view(), resource_ref);
         default:
-          std::cout << "Unknown type id: " << static_cast<int32_t>(left->type().id()) << "\n";
+          std::cout << "UNKNOWN TYPE: " << static_cast<int32_t>(left->type().id()) << "\n";
           throw NotImplementedException("Execute[IN_CONSTANTS]: Unimplemented type!");
       }
     }
@@ -170,7 +168,6 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundOperator
     {
       // Resolve the child
       auto comparator = Execute(*expr.children[child], state->child_states[child].get());
-      std::cout << "Executing comparison...\n";
       auto comparison_result = cudf::binary_operation(left->view(),
                                                       comparator->view(),
                                                       cudf::binary_operator::EQUAL,
@@ -193,13 +190,6 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundOperator
                                                      cudf::get_default_stream(),
                                                      resource_ref);
       }
-      auto d_count = cudf::reduce(intermediate_result->view(),
-                                  *cudf::make_sum_aggregation<cudf::reduce_aggregation>(),
-                                  cudf::data_type{cudf::type_id::INT32});
-      // Downcast to cudf::numeric_scalar<int32_t>
-      auto count_scalar   = static_cast<cudf::numeric_scalar<int32_t>*>(d_count.get());
-      int32_t count_value = count_scalar->value();
-      std::cout << "\n\tCURRENT COUNT: " << count_value << "\n";
     }
 
     // NOT IN?
@@ -243,6 +233,7 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundOperator
     }
   }
 
+  // If we've gotten this far, something ain't right
   throw NotImplementedException("Execute[OPERATOR]: Unimplemented operator type!");
 }
 

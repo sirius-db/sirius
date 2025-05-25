@@ -24,12 +24,10 @@ GpuExpressionExecutor::InitializeState(const BoundConjunctionExpression& expr,
 std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundConjunctionExpression& expr,
                                                              GpuExpressionState* state)
 {
-  D_ASSERT(output_column.data_wrapper.type == ColumnType::BOOLEAN);
   auto return_type = GpuExpressionState::GetCudfType(expr.return_type);
 
+  // Resolve the children incrementally into the output
   std::unique_ptr<cudf::column> output_column;
-
-  // Resolve the children
   for (idx_t i = 0; i < expr.children.size(); i++)
   {
     D_ASSERT(state->intermediate_columns[i].data_wrapper.type == ColumnType::BOOLEAN);
@@ -63,7 +61,7 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundConjunct
                                                  resource_ref);
           break;
         default:
-          std::cout << "EXPRESSION TYPE: " << static_cast<int64_t>(expr.GetExpressionType())
+          std::cerr << "UNKNOWN TYPE: " << static_cast<int64_t>(expr.GetExpressionType())
                     << "\n";
           throw InternalException("Execute[Conjunction]: Unknown conjunction type!");
       }

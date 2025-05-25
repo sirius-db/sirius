@@ -203,7 +203,6 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundFunction
 
     auto input = Execute(*expr.children[0], state->child_states[0].get());
 
-    std::cout << "Dispatching substring...\n";
     if constexpr (use_cudf)
     {
       cudf::strings_column_view input_view(input->view());
@@ -245,7 +244,7 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundFunction
   }
 
   // If we've gotten this far, we've encountered a unimplemented function type
-  std::cout << "FUNCTION STRING: " << func_str << "\n";
+  std::cerr << "UNKNOWN FUNCTION STRING: " << func_str << "\n";
   throw InternalException("Execute[Function]: Unknown function type!");
 }
 
