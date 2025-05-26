@@ -220,7 +220,7 @@ GPUBufferManager::copyDataFromcuDFColumn(cudf::column_view& column, int gpu) {
     uint8_t* data = const_cast<uint8_t*>(column.data<uint8_t>());
 
     if (column.type() == cudf::data_type(cudf::type_id::STRING)) {
-        std::cout << "\n\n\nCOPYING STRING DATA FROM CUDF COLUMN\n\n\n";
+
         int32_t* temp_num_bytes = new int32_t[1];
         int32_t* temp_offset = const_cast<int32_t*>(column.child(0).data<int32_t>());
         callCudaMemcpyDeviceToHost<int32_t>(temp_num_bytes, temp_offset + column.size(), 1, 0);

@@ -19,27 +19,27 @@ GPUPhysicalFilter::GPUPhysicalFilter(vector<LogicalType> types, vector<unique_pt
 	D_ASSERT(select_list.size() > 0);
 	if (select_list.size() > 1) {
 		// create a big AND out of the expressions
+    // KEVIN: I don't think this ever happens
 		auto conjunction = make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);
 		for (auto &expr : select_list) {
 			conjunction->children.push_back(std::move(expr));
 		}
 		expression = std::move(conjunction);
-    std::cout << "\tACTUALLY NEEDED TO COMBINE FILTER EXPRESSIONS\n";
 	} else {
 		expression = std::move(select_list[0]);
 	}
 
-	GPUExpressionExecutor* gpu_expression_executor = new GPUExpressionExecutor();
+	// GPUExpressionExecutor* gpu_expression_executor = new GPUExpressionExecutor();
 
 }
 
 OperatorResultType 
 GPUPhysicalFilter::Execute(GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation) const {
 	printf("Executing expression %s\n", expression->ToString().c_str());
-  sirius::GpuExpressionExecutor my_executor(*expression);
+  sirius::GpuExpressionExecutor gpu_expression_executor(*expression);
 	auto start = std::chrono::high_resolution_clock::now();
     //gpu_expression_executor->FilterRecursiveExpression(input_relation, output_relation, *expression, 0);
-  my_executor.Select(input_relation, output_relation);
+  gpu_expression_executor.Select(input_relation, output_relation);
 	auto end = std::chrono::high_resolution_clock::now();
 	auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
 	printf("Filter time: %.2f ms\n", duration.count()/1000.0);

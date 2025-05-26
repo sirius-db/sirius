@@ -19,7 +19,7 @@ public:
 
 // 	//! The filter expression
 	unique_ptr<Expression> expression;
-	GPUExpressionExecutor* gpu_expression_executor;
+	// GPUExpressionExecutor* gpu_expression_executor;
 
 // public:
 // 	unique_ptr<OperatorState> GetOperatorState(ExecutionContext &context) const override;

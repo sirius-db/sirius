@@ -19,13 +19,15 @@ GpuExpressionExecutor::InitializeState(const BoundCastExpression& expr,
 std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundCastExpression& expr,
                                                              GpuExpressionState* state)
 {
+  auto return_type_id = GpuExpressionState::GetCudfType(expr.return_type).id();
+
   // Resolve the child
   auto* child_state = state->child_states[0].get();
-  auto child        = Execute(*expr.child, child_state);
+  auto child = Execute(*expr.child, child_state);
 
-  auto type_id = GpuExpressionState::GetCudfType(expr.return_type).id();
+  // Execute the cast
   return cudf::cast(child->view(),
-                    cudf::data_type{type_id},
+                    cudf::data_type{return_type_id},
                     cudf::get_default_stream(),
                     resource_ref);
 }

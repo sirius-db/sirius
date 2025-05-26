@@ -771,16 +771,6 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
           if (count) {
             output_relation.columns[index]->row_id_count = count[0];
           }
-          /// KEVIN DEBUG ///
-          if(column_ids[projection_id].GetPrimaryIndex() == 4) {
-            std::cout << "\tKEVIN DEBUG\n";
-            if(output_relation.columns[index]->data_wrapper.data == nullptr) {
-              std::cout << "\tCOL IDX 4 has NULL DATA\n";
-            } else {
-              std::cout << "\tCOL IDX 4 has actual DATA\n";
-            }
-          }
-          /// KEVIN DEBUG ///
           index++;
       }
 

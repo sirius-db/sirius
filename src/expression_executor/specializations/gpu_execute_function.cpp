@@ -1,3 +1,4 @@
+#include "duckdb/common/assert.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
@@ -12,9 +13,6 @@
 #include <cudf/strings/slice.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/unary.hpp>
-#include <rmm/device_buffer.hpp>
-#include <rmm/device_uvector.hpp>
-#include <rmm/resource_ref.hpp>
 #include <string>
 
 namespace duckdb
@@ -53,16 +51,17 @@ GpuExpressionExecutor::InitializeState(const BoundFunctionExpression& expr,
   return std::move(result);
 }
 
-// Helper template functor to reduce bloat
+//----------StringMatchingDispatcher----------//
+// Helper template functor for string matching operations to reduce bloat in Execute()
 template <StringMatchingType MatchType, bool UseCudf>
 struct StringMatchingDispatcher
 {
   // The executor
-  GpuExpressionExecutor* gpu_expression_executor;
+  GpuExpressionExecutor& executor;
 
   // Constructor
-  explicit StringMatchingDispatcher(GpuExpressionExecutor* gpu_expression_executor)
-      : gpu_expression_executor(gpu_expression_executor)
+  explicit StringMatchingDispatcher(GpuExpressionExecutor& exec)
+      : executor(exec)
   {}
 
   // Dispatch operator
@@ -72,7 +71,7 @@ struct StringMatchingDispatcher
     D_ASSERT(expr.children.size() == 2);
     D_ASSERT(expr.children[1]->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT);
 
-    auto input = gpu_expression_executor->Execute(*expr.children[0], state->child_states[0].get());
+    auto input                 = executor.Execute(*expr.children[0], state->child_states[0].get());
     const auto& match_str_expr = expr.children[1]->Cast<BoundConstantExpression>();
     const auto& match_str      = match_str_expr.value.GetValue<std::string>();
 
@@ -89,7 +88,7 @@ struct StringMatchingDispatcher
                                         cudf::string_scalar(match_str),
                                         cudf::string_scalar(""),
                                         cudf::get_default_stream(),
-                                        gpu_expression_executor->resource_ref);
+                                        executor.resource_ref);
 
         // LIKE or NOT LIKE?
         if constexpr (MatchType == StringMatchingType::LIKE)
@@ -102,40 +101,150 @@ struct StringMatchingDispatcher
           return cudf::unary_operation(like->view(),
                                        cudf::unary_operator::NOT,
                                        cudf::get_default_stream(),
-                                       gpu_expression_executor->resource_ref);
+                                       executor.resource_ref);
         }
       }
       else if constexpr (MatchType == StringMatchingType::CONTAINS)
       {
-        const auto match_str_scalar = cudf::string_scalar(match_str,
-                                                          true,
-                                                          cudf::get_default_stream(),
-                                                          gpu_expression_executor->resource_ref);
+        const auto match_str_scalar =
+          cudf::string_scalar(match_str, true, cudf::get_default_stream(), executor.resource_ref);
         return cudf::strings::contains(input_view,
                                        match_str_scalar,
                                        cudf::get_default_stream(),
-                                       gpu_expression_executor->resource_ref);
+                                       executor.resource_ref);
       }
       else if constexpr (MatchType == StringMatchingType::PREFIX)
       {
-        const auto match_str_scalar = cudf::string_scalar(match_str,
-                                                          true,
-                                                          cudf::get_default_stream(),
-                                                          gpu_expression_executor->resource_ref);
+        const auto match_str_scalar =
+          cudf::string_scalar(match_str, true, cudf::get_default_stream(), executor.resource_ref);
         return cudf::strings::starts_with(input_view,
                                           match_str_scalar,
                                           cudf::get_default_stream(),
-                                          gpu_expression_executor->resource_ref);
+                                          executor.resource_ref);
       }
     }
     else
     {
       //----------Using Sirius----------//
-      return GpuDispatcher::DispatchStringMatching<MatchType>(
-        input->view(),
-        match_str,
-        gpu_expression_executor->resource_ref);
+      return GpuDispatcher::DispatchStringMatching<MatchType>(input->view(),
+                                                              match_str,
+                                                              executor.resource_ref);
     }
+  }
+};
+
+//----------NumericBinaryFunctionDispatcher----------//
+template <cudf::binary_operator BinOp>
+struct NumericBinaryFunctionDispatcher
+{
+  // The executor
+  GpuExpressionExecutor& executor;
+
+  // Constructor
+  explicit NumericBinaryFunctionDispatcher(GpuExpressionExecutor& exec)
+      : executor(exec)
+  {}
+
+  // Left scalar binary operator
+  template <typename T>
+  std::unique_ptr<cudf::column> DoLeftScalarBinaryOp(const T& left_value,
+                                                     const cudf::column_view& right,
+                                                     const cudf::data_type& return_type)
+  {
+    auto left_numeric_scalar =
+      cudf::numeric_scalar(left_value, true, cudf::get_default_stream(), executor.resource_ref);
+    return cudf::binary_operation(left_numeric_scalar,
+                                  right,
+                                  BinOp,
+                                  return_type,
+                                  cudf::get_default_stream(),
+                                  executor.resource_ref);
+  }
+
+  // Right scalar binary operator
+  template <typename T>
+  std::unique_ptr<cudf::column> DoRightScalarBinaryOp(const cudf::column_view& left,
+                                                      const T& right_value,
+                                                      const cudf::data_type& return_type)
+  {
+    auto right_numeric_scalar =
+      cudf::numeric_scalar(right_value, true, cudf::get_default_stream(), executor.resource_ref);
+    return cudf::binary_operation(left,
+                                  right_numeric_scalar,
+                                  BinOp,
+                                  return_type,
+                                  cudf::get_default_stream(),
+                                  executor.resource_ref);
+  }
+
+  // Dispatch operator
+  std::unique_ptr<cudf::column> operator()(const BoundFunctionExpression& expr,
+                                           GpuExpressionState* state)
+  {
+    D_ASSERT(expr.children.size() == 2);
+    const auto& return_type = GpuExpressionState::GetCudfType(expr.return_type);
+
+    // Resolve children
+    if (expr.children[0]->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT)
+    {
+      // LHS is a constant, so skip its column materialization
+      const auto& left_value = expr.children[0]->Cast<BoundConstantExpression>().value;
+      const auto& right      = executor.Execute(*expr.children[1], state->child_states[1].get());
+
+      switch (GpuExpressionState::GetCudfType(expr.children[0]->return_type).id())
+      {
+        case cudf::type_id::INT32:
+          return DoLeftScalarBinaryOp(left_value.GetValue<int32_t>(), right->view(), return_type);
+        case cudf::type_id::UINT64:
+          return DoLeftScalarBinaryOp(left_value.GetValue<uint64_t>(), right->view(), return_type);
+        case cudf::type_id::FLOAT32:
+          return DoLeftScalarBinaryOp(left_value.GetValue<float_t>(), right->view(), return_type);
+        case cudf::type_id::FLOAT64:
+          return DoLeftScalarBinaryOp(left_value.GetValue<double_t>(), right->view(), return_type);
+        case cudf::type_id::BOOL8:
+          throw NotImplementedException("Execute[Function]: Boolean types not supported for "
+                                        "numeric binary operations!");
+        default:
+          throw InternalException("Execute[Function]: Unknown constant type for binary "
+                                  "operation!");
+      }
+    }
+    else if (expr.children[1]->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT)
+    {
+      // RHS is a constant, so skip its column materialization
+      const auto& right_value = expr.children[1]->Cast<BoundConstantExpression>().value;
+      const auto& left        = executor.Execute(*expr.children[0], state->child_states[0].get());
+
+      switch (GpuExpressionState::GetCudfType(expr.children[1]->return_type).id())
+      {
+        case cudf::type_id::INT32:
+          return DoRightScalarBinaryOp(left->view(), right_value.GetValue<int32_t>(), return_type);
+        case cudf::type_id::UINT64:
+          return DoRightScalarBinaryOp(left->view(), right_value.GetValue<uint64_t>(), return_type);
+        case cudf::type_id::FLOAT32:
+          return DoRightScalarBinaryOp(left->view(), right_value.GetValue<float_t>(), return_type);
+        case cudf::type_id::FLOAT64:
+          return DoRightScalarBinaryOp(left->view(), right_value.GetValue<double_t>(), return_type);
+        case cudf::type_id::BOOL8:
+          throw NotImplementedException("Execute[Function]: Boolean types not supported for "
+                                        "numeric binary operations!");
+        default:
+          throw InternalException("Execute[Function]: Unknown constant type for binary "
+                                  "operation!");
+      }
+    }
+
+    // NEITHER side is a constant, so we need to execute both children
+    auto left  = executor.Execute(*expr.children[0], state->child_states[0].get());
+    auto right = executor.Execute(*expr.children[1], state->child_states[1].get());
+
+    // Execute the binary operation
+    return cudf::binary_operation(left->view(),
+                                  right->view(),
+                                  BinOp,
+                                  GpuExpressionState::GetCudfType(expr.return_type),
+                                  cudf::get_default_stream(),
+                                  executor.resource_ref);
   }
 };
 
@@ -144,46 +253,34 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundFunction
                                                              GpuExpressionState* state)
 {
   const auto& function_expression_state = state->Cast<GpuExpressionState>();
-  const auto& return_type               = GpuExpressionState::GetCudfType(expr.return_type);
   const auto& func_str                  = expr.function.name;
 
   //----------Numeric Binary Functions----------//
-  // Lambda for numeric binary operators
-  auto binary_function = [this, &expr, state, return_type](
-                           cudf::binary_operator bin_op) -> std::unique_ptr<cudf::column> {
-    // Resolve children
-    auto left  = Execute(*expr.children[0], state->child_states[0].get());
-    auto right = Execute(*expr.children[1], state->child_states[1].get());
-
-    return cudf::binary_operation(left->view(),
-                                  right->view(),
-                                  bin_op,
-                                  return_type,
-                                  cudf::get_default_stream(),
-                                  resource_ref);
-  };
-
-  // Execute this function
   if (func_str == ADD_FUNC_STR)
   {
-    return binary_function(cudf::binary_operator::ADD);
+    NumericBinaryFunctionDispatcher<cudf::binary_operator::ADD> binary_function(*this);
+    return binary_function(expr, state);
   }
   else if (func_str == SUB_FUNC_STR)
   {
-    return binary_function(cudf::binary_operator::SUB);
+    NumericBinaryFunctionDispatcher<cudf::binary_operator::SUB> binary_function(*this);
+    return binary_function(expr, state);
   }
   else if (func_str == MUL_FUNC_STR)
   {
-    return binary_function(cudf::binary_operator::MUL);
+    NumericBinaryFunctionDispatcher<cudf::binary_operator::MUL> binary_function(*this);
+    return binary_function(expr, state);
   }
   else if (func_str == DIV_FUNC_STR || func_str == INT_DIV_FUNC_STR)
   {
     // For non-integer division on integer types, DuckDB inserts a CAST
-    return binary_function(cudf::binary_operator::DIV);
+    NumericBinaryFunctionDispatcher<cudf::binary_operator::DIV> binary_function(*this);
+    return binary_function(expr, state);
   }
   else if (func_str == MOD_FUNC_STR)
   {
-    return binary_function(cudf::binary_operator::MOD);
+    NumericBinaryFunctionDispatcher<cudf::binary_operator::MOD> binary_function(*this);
+    return binary_function(expr, state);
   }
   else if (func_str == ERROR_FUNC_STR)
   {
@@ -224,22 +321,22 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundFunction
   }
   else if (func_str == LIKE_FUNC_STR)
   {
-    StringMatchingDispatcher<StringMatchingType::LIKE, use_cudf> dispatcher(this);
+    StringMatchingDispatcher<StringMatchingType::LIKE, use_cudf> dispatcher(*this);
     return dispatcher(expr, state);
   }
   else if (func_str == NOT_LIKE_FUNC_STR)
   {
-    StringMatchingDispatcher<StringMatchingType::NOT_LIKE, use_cudf> dispatcher(this);
+    StringMatchingDispatcher<StringMatchingType::NOT_LIKE, use_cudf> dispatcher(*this);
     return dispatcher(expr, state);
   }
   else if (func_str == CONTAINS_FUNC_STR)
   {
-    StringMatchingDispatcher<StringMatchingType::CONTAINS, use_cudf> dispatcher(this);
+    StringMatchingDispatcher<StringMatchingType::CONTAINS, use_cudf> dispatcher(*this);
     return dispatcher(expr, state);
   }
   else if (func_str == PREFIX_FUNC_STR)
   {
-    StringMatchingDispatcher<StringMatchingType::PREFIX, use_cudf> dispatcher(this);
+    StringMatchingDispatcher<StringMatchingType::PREFIX, use_cudf> dispatcher(*this);
     return dispatcher(expr, state);
   }
 
