@@ -39,12 +39,8 @@ void cudf_aggregate(vector<shared_ptr<GPUColumn>>& column, uint64_t num_aggregat
     GPUBufferManager *gpuBufferManager = &(GPUBufferManager::GetInstance());
     cudf::set_current_device_resource(gpuBufferManager->mr);
 
-    std::vector<cudf::column_view> aggregate_columns;
-
     uint64_t size = 0;
     for (int agg = 0; agg < num_aggregates; agg++) {
-        auto cudf_column = column[agg]->convertToCudfColumn();
-        aggregate_columns.push_back(cudf_column);
         if (column[agg]->data_wrapper.data != nullptr) {
             size = column[agg]->column_length;
             break;
@@ -68,19 +64,23 @@ void cudf_aggregate(vector<shared_ptr<GPUColumn>>& column, uint64_t num_aggregat
             column[agg] = make_shared_ptr<GPUColumn>(1, ColumnType::INT64, reinterpret_cast<uint8_t*>(result_temp));
         } else if (agg_mode[agg] == AggregationType::SUM) {
             auto aggregate = make_reduce_aggregation<cudf::reduce_aggregation::SUM>();
-            auto result = cudf::reduce(aggregate_columns[agg], *aggregate, aggregate_columns[agg].type());
+            auto cudf_column = column[agg]->convertToCudfColumn();
+            auto result = cudf::reduce(cudf_column, *aggregate, cudf_column.type());
             column[agg]->setFromCudfScalar(*result, gpuBufferManager);
         } else if (agg_mode[agg] == AggregationType::AVERAGE) {
             auto aggregate = make_reduce_aggregation<cudf::reduce_aggregation::MEAN>();
-            auto result = cudf::reduce(aggregate_columns[agg], *aggregate, aggregate_columns[agg].type());
+            auto cudf_column = column[agg]->convertToCudfColumn();
+            auto result = cudf::reduce(cudf_column, *aggregate, cudf_column.type());
             column[agg]->setFromCudfScalar(*result, gpuBufferManager);
         } else if (agg_mode[agg] == AggregationType::MIN) {
             auto aggregate = make_reduce_aggregation<cudf::reduce_aggregation::MIN>();
-            auto result = cudf::reduce(aggregate_columns[agg], *aggregate, aggregate_columns[agg].type());
+            auto cudf_column = column[agg]->convertToCudfColumn();
+            auto result = cudf::reduce(cudf_column, *aggregate, cudf_column.type());
             column[agg]->setFromCudfScalar(*result, gpuBufferManager);
         } else if (agg_mode[agg] == AggregationType::MAX) {
             auto aggregate = make_reduce_aggregation<cudf::reduce_aggregation::MAX>();
-            auto result = cudf::reduce(aggregate_columns[agg], *aggregate, aggregate_columns[agg].type());
+            auto cudf_column = column[agg]->convertToCudfColumn();
+            auto result = cudf::reduce(cudf_column, *aggregate, cudf_column.type());
             column[agg]->setFromCudfScalar(*result, gpuBufferManager);
         } else if (agg_mode[agg] == AggregationType::COUNT) {
             uint64_t* res = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);

@@ -33,11 +33,16 @@ void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColu
   std::vector<cudf::column_view> keys_cudf;
 
   //TODO: This is a hack to get the size of the keys
-  size_t size = keys[0]->column_length;
+  size_t size = 0;
 
   for (int key = 0; key < num_keys; key++) {
-    auto cudf_column = keys[key]->convertToCudfColumn();
-    keys_cudf.push_back(cudf_column);
+    if (keys[key]->data_wrapper.data != nullptr) {
+      auto cudf_column = keys[key]->convertToCudfColumn();
+      keys_cudf.push_back(cudf_column);
+      size = keys[key]->column_length;
+    } else {
+      throw NotImplementedException("Group by on non-nullable column not supported");
+    }
   }
 
   auto keys_table = cudf::table_view(keys_cudf);
