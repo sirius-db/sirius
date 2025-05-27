@@ -61,8 +61,6 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundConjunct
                                                  resource_ref);
           break;
         default:
-          std::cerr << "UNKNOWN TYPE: " << static_cast<int64_t>(expr.GetExpressionType())
-                    << "\n";
           throw InternalException("Execute[Conjunction]: Unknown conjunction type!");
       }
     }
