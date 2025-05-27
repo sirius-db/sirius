@@ -129,10 +129,6 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundComparis
 {
   auto return_type = GpuExpressionState::GetCudfType(expr.return_type);
 
-  // Resolve the children
-  auto left  = Execute(*expr.left, state->child_states[0].get());
-  auto right = Execute(*expr.right, state->child_states[1].get());
-
   // Execute the comparison
   switch (expr.GetExpressionType())
   {

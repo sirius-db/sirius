@@ -19,8 +19,7 @@ GpuExpressionExecutor::InitializeState(const BoundBetweenExpression& expr,
 }
 
 // KEVIN: potential optimization path: if lower and upper bounds are constants, skip Execute() for
-// them? It looks like that DuckDB pushes this case into the table scan, though, so not sure if this
-// does anything useful.
+// them
 std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundBetweenExpression& expr,
                                                              GpuExpressionState* state)
 {
