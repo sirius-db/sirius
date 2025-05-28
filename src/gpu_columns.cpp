@@ -115,19 +115,20 @@ GPUColumn::setFromCudfColumn(cudf::column& cudf_column, bool _is_unique, int32_t
     cudf::column::contents cont = cudf_column.release();
     // rmm_owned_buffer = std::move(cont.data);
     gpuBufferManager->rmm_stored_buffers.push_back(std::move(cont.data));
+    // printf("rmm_stored_buffers size %ld\n", gpuBufferManager->rmm_stored_buffers.back()->size());
 
     data_wrapper.data = reinterpret_cast<uint8_t*>(gpuBufferManager->rmm_stored_buffers.back()->data());
     data_wrapper.size = col_size;
     column_length = data_wrapper.size;
     is_unique = _is_unique;
     //add data to allocation table in gpu buffer manager
-    gpuBufferManager->allocation_table[0][reinterpret_cast<void*>(data_wrapper.data)] = column_length;
-
     if (col_type == cudf::data_type(cudf::type_id::STRING)) {
         cudf::column::contents child_cont = cont.children[0]->release();
+        gpuBufferManager->rmm_stored_buffers.push_back(std::move(child_cont.data));
+        // printf("rmm_stored_buffers size %ld\n", gpuBufferManager->rmm_stored_buffers.back()->size());
         data_wrapper.is_string_data = true;
         data_wrapper.type = ColumnType::VARCHAR;
-        int32_t* temp_offset = reinterpret_cast<int32_t*>(child_cont.data->data());
+        int32_t* temp_offset = reinterpret_cast<int32_t*>(gpuBufferManager->rmm_stored_buffers.back()->data());
         convertCudfOffsetToSiriusOffset(temp_offset);
         //copy data from offset to num_bytes
         uint64_t* temp_num_bytes = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
