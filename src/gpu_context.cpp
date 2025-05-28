@@ -267,6 +267,7 @@ GPUContext::EndQueryInternal(bool success, bool invalidate_transaction) {
 
 	if (gpu_active_query->gpu_executor) {
 		gpu_active_query->gpu_executor->CancelTasks();
+		gpu_active_query->gpu_executor->gpuBufferManager->ResetBuffer();
 	}
 	// Notify any registered state of query end
 	// for (auto const &s : registered_state) {
