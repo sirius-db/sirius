@@ -125,6 +125,7 @@ Sirius is under active development, and several features are still in progress. 
 - **Limited Data Type Support:** Sirius currently only supports `INTEGER`, `BIGINT`, `FLOAT`, `DOUBLE`, and `VARCHAR` data types. We are actively working on supporting additional data types—such as `DECIMAL`, `DATE/TIME`, and nested types. See issue [#20](https://github.com/sirius-db/sirius/issues/20) for more details.
 - **Operator Coverage:** At present, Sirius only supports a range of operators including `FILTER`, `PROJECTION`, `JOIN`, `GROUP-BY`, `ORDER-BY`, `AGGREGATION`, `TOP-N`, `LIMIT`, and `CTE`. We are working on adding more advanced operators such as `WINDOW` functions and `ASOF JOIN`, etc. See issue [#21](https://github.com/sirius-db/sirius/issues/21) for more details.
 - **No Support for Partially NULL Columns:** Sirius currently does not support columns where only some values are `NULL`. This limitation is being tracked and will be addressed in a future update. See issue [#27](https://github.com/sirius-db/sirius/issues/27) for more details.
+
 For a full list of current limitations and ongoing work, please refer to our [GitHub issues page](https://github.com/sirius-db/sirius/issues). If these issues are encountered when running Sirius, Sirius will gracefully fallback to DuckDB query execution on CPUs.
 
 ## Future Roadmap
