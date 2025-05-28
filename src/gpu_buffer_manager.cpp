@@ -287,8 +287,17 @@ GPUBufferManager::customCudaFree(uint8_t* ptr, int gpu) {
         } else {
             auto locked_it = locked_allocation_table[gpu].find(reinterpret_cast<void*>(ptr));
             if (locked_it == locked_allocation_table[gpu].end()) {
-                printf("Invalid Pointer %p\n", ptr);
-                throw InvalidInputException("Pointer not found in allocation table");
+                // check if in rmm_stored_buffer
+                bool found = 0;
+                for (int it = 0; it < rmm_stored_buffers.size(); it++) {
+                    if (ptr == reinterpret_cast<uint8_t*>(rmm_stored_buffers[it]->data())) {
+                        found = 1; break;
+                    }
+                }
+                if (!found) {
+                    printf("Invalid Pointer %p\n", ptr);
+                    throw InvalidInputException("Pointer not found in allocation table");
+                }
             }
         }
     }
