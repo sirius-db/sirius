@@ -26,6 +26,12 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundReferenc
                                                dummy_reference_expression /* Unused */,
                                                &GPUBufferManager::GetInstance());
   }
+  if (input_column->data_wrapper.type == ColumnType::VARCHAR && input_column->data_wrapper.num_bytes > INT32_MAX) {
+    throw NotImplementedException("string offsets larger than int32_t are not supported in libcudf");
+  }
+  if (input_column->column_length > INT32_MAX) {
+    throw NotImplementedException("input column length larger than int32_t are not supported in libcudf");
+  }
 
   // Perform a deep copy (necessary, since memory ownership cannot be transferred away from the gpu
   // buffer manager)
