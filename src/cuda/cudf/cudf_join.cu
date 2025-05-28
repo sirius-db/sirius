@@ -5,10 +5,9 @@
 
 namespace duckdb {
 
-void cudf_probe(vector<shared_ptr<GPUColumn>>& probe_keys, cudf::hash_join* hash_table, int num_keys, uint64_t*& row_ids_left, uint64_t*& row_ids_right, uint64_t*& count)
-{
+void cudf_inner_join(vector<shared_ptr<GPUColumn>>& probe_keys, vector<shared_ptr<GPUColumn>>& build_keys, int num_keys, uint64_t*& row_ids_left, uint64_t*& row_ids_right, uint64_t*& count) {
     GPUBufferManager *gpuBufferManager = &(GPUBufferManager::GetInstance());
-    if (probe_keys[0]->column_length == 0) {
+    if (build_keys[0]->column_length == 0 || probe_keys[0]->column_length == 0) {
         printf("N is 0\n");
         count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
         count[0] = 0;
@@ -16,17 +15,22 @@ void cudf_probe(vector<shared_ptr<GPUColumn>>& probe_keys, cudf::hash_join* hash
     }
 
     cudf::set_current_device_resource(gpuBufferManager->mr);
-    printf("CUDF probe\n");
+
+    std::vector<cudf::column_view> build_keys_cudf;
+    for (int key = 0; key < num_keys; key++) {
+        build_keys_cudf.push_back(build_keys[key]->convertToCudfColumn());
+    }
+
+    auto build_table = cudf::table_view(build_keys_cudf);
+    auto hash_table = cudf::hash_join(build_table, cudf::null_equality::EQUAL);
 
     std::vector<cudf::column_view> probe_keys_cudf;
-
     for (int key = 0; key < num_keys; key++) {
         probe_keys_cudf.push_back(probe_keys[key]->convertToCudfColumn());
     }
 
     auto probe_table = cudf::table_view(probe_keys_cudf);
-
-    auto result = hash_table->inner_join(probe_table);
+    auto result = hash_table.inner_join(probe_table);
     
     auto result_count = result.first->size();
     rmm::device_buffer row_ids_left_buffer = result.first->release();
@@ -37,30 +41,12 @@ void cudf_probe(vector<shared_ptr<GPUColumn>>& probe_keys, cudf::hash_join* hash
 
     gpuBufferManager->rmm_stored_buffers.push_back(std::make_unique<rmm::device_buffer>(std::move(row_ids_left_buffer)));
     gpuBufferManager->rmm_stored_buffers.push_back(std::make_unique<rmm::device_buffer>(std::move(row_ids_right_buffer)));
+    // printf("row_ids_left_buffer size %ld\n", result_count * sizeof(int32_t));
+    // printf("row_ids_right_buffer size %ld\n", result_count * sizeof(int32_t));
+    // gpuBufferManager->allocation_table[0][reinterpret_cast<void*>(gpuBufferManager->rmm_stored_buffers.back()->data())] = result_count;
 
     count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
     count[0] = result_count;
-}
-
-void cudf_build(vector<shared_ptr<GPUColumn>>& build_columns, cudf::hash_join*& hash_table, int num_keys) {
-
-    if (build_columns[0]->column_length == 0) {
-        printf("N is 0\n");
-        return;
-    }
-
-    printf("CUDF build\n");
-
-    GPUBufferManager *gpuBufferManager = &(GPUBufferManager::GetInstance());
-    cudf::set_current_device_resource(gpuBufferManager->mr);
-
-    std::vector<cudf::column_view> build_keys_cudf;
-    for (int key = 0; key < num_keys; key++) {
-        build_keys_cudf.push_back(build_columns[key]->convertToCudfColumn());
-    }
-
-    auto build_table = cudf::table_view(build_keys_cudf);
-    hash_table = new cudf::hash_join(build_table, cudf::null_equality::EQUAL);
 }
 
 void cudf_mixed_join(vector<shared_ptr<GPUColumn>>& probe_columns, vector<shared_ptr<GPUColumn>>& build_columns, const vector<JoinCondition>& conditions, JoinType join_type, uint64_t*& row_ids_left, uint64_t*& row_ids_right, uint64_t*& count) {

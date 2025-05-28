@@ -110,9 +110,9 @@ GPUBufferManager::~GPUBufferManager() {
 void GPUBufferManager::ResetBuffer() {
     cudf::set_current_device_resource(mr);
     for (int gpu = 0; gpu < NUM_GPUS; gpu++) {
+        printf("Resetting buffer for GPU %d\n", gpu);
         gpuProcessingPointer[gpu] = 0;
         //write a program to free all allocation in the allocation table
-        printf("Allocation table size %ld\n", allocation_table[gpu].size());
         for (auto it = allocation_table[gpu].begin(); it != allocation_table[gpu].end(); ++it) {
             auto ptr = it->first;
             auto size = it->second;
@@ -132,6 +132,7 @@ void GPUBufferManager::ResetBuffer() {
             auto ptr = it->first;
             auto size = it->second;
             if (ptr != nullptr) {
+                // printf("Deallocating Locked Pointer %p size %ld\n", ptr, size);
                 mr->deallocate((void*) ptr, size);
             }
         }
@@ -139,6 +140,13 @@ void GPUBufferManager::ResetBuffer() {
         if (!locked_allocation_table[gpu].empty()) {
             throw InvalidInputException("Locked allocation table is not empty");
         }
+        rmm_stored_buffers.clear();
+        // printf("pool size %ld\n", mr->pool_size());
+
+        // size_t allocated_size = mr->pool_size();
+        // printf("Allocating %ld bytes\n", allocated_size);
+        // void* ptr = mr->allocate(allocated_size);
+        // mr->deallocate(ptr, allocated_size);
     }
     cpuProcessingPointer = 0;
     for (auto it = tables.begin(); it != tables.end(); it++) {
@@ -260,6 +268,7 @@ GPUBufferManager::lockAllocation(void* ptr, int gpu) {
     //move entries from the allocation table to the locked table
     auto it = allocation_table[gpu].find(ptr);
     if (it != allocation_table[gpu].end()) {
+        // printf("Locking Pointer %p\n", ptr);
         locked_allocation_table[gpu][ptr] = it->second;
         allocation_table[gpu].erase(it);
     }
