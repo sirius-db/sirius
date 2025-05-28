@@ -13,16 +13,16 @@
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/daily_file_sink.h>
 
-#define LOG_TRACE(...) SPDLOG_LOGGER_TRACE(spdlog::default_logger_raw(), __VA_ARGS__)
-#define LOG_DEBUG(...) SPDLOG_LOGGER_DEBUG(spdlog::default_logger_raw(), __VA_ARGS__)
-#define LOG_INFO(...)  SPDLOG_LOGGER_INFO(spdlog::default_logger_raw(), __VA_ARGS__)
-#define LOG_WARN(...)  SPDLOG_LOGGER_WARN(spdlog::default_logger_raw(), __VA_ARGS__)
-#define LOG_ERROR(...) SPDLOG_LOGGER_ERROR(spdlog::default_logger_raw(), __VA_ARGS__)
-#define LOG_FATAL(...) SPDLOG_LOGGER_CRITICAL(spdlog::default_logger_raw(), __VA_ARGS__)
+#define SIRIUS_LOG_TRACE(...) SPDLOG_LOGGER_TRACE(spdlog::default_logger_raw(), __VA_ARGS__)
+#define SIRIUS_LOG_DEBUG(...) SPDLOG_LOGGER_DEBUG(spdlog::default_logger_raw(), __VA_ARGS__)
+#define SIRIUS_LOG_INFO(...)  SPDLOG_LOGGER_INFO(spdlog::default_logger_raw(), __VA_ARGS__)
+#define SIRIUS_LOG_WARN(...)  SPDLOG_LOGGER_WARN(spdlog::default_logger_raw(), __VA_ARGS__)
+#define SIRIUS_LOG_ERROR(...) SPDLOG_LOGGER_ERROR(spdlog::default_logger_raw(), __VA_ARGS__)
+#define SIRIUS_LOG_FATAL(...) SPDLOG_LOGGER_CRITICAL(spdlog::default_logger_raw(), __VA_ARGS__)
 
 namespace duckdb {
 
-inline constexpr int LOG_FLUSH_SEC = 3;
+inline constexpr int SIRIUS_LOG_FLUSH_SEC = 3;
 
 inline std::optional<std::string> GetEnvVar(const std::string& name) {
     const char* val = std::getenv(name.c_str());
@@ -66,7 +66,7 @@ inline void InitGlobalLogger() {
   auto logger = std::make_shared<spdlog::logger>("", spdlog::sinks_init_list{file_sink});
   auto log_level = GetLogLevel();
   logger->set_level(log_level);
-  spdlog::flush_every(std::chrono::seconds(LOG_FLUSH_SEC));
+  spdlog::flush_every(std::chrono::seconds(SIRIUS_LOG_FLUSH_SEC));
   spdlog::set_default_logger(logger);
 }
 
