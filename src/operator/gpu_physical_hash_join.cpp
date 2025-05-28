@@ -457,8 +457,7 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 				}
 			}
 			if (!has_non_equality_condition) {
-				cudf_build(build_key, cudf_hash_table, conditions.size());
-				cudf_probe(probe_key, cudf_hash_table, conditions.size(), row_ids_left, row_ids_right, count);
+				cudf_inner_join(probe_key, build_key, conditions.size(), row_ids_left, row_ids_right, count);
 			} else {
 				cudf_mixed_join(probe_key, build_key, conditions, join_type, row_ids_left, row_ids_right, count);
 			}
