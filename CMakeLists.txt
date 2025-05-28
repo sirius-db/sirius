@@ -155,6 +155,12 @@ else()
   )
 endif()
 
+# Third-party
+set(DEPS_PREFIX "_deps")
+include(third_party/spdlog.cmake)
+target_link_libraries(${EXTENSION_NAME} spdlog::spdlog)
+target_link_libraries(${LOADABLE_EXTENSION_NAME} spdlog::spdlog)
+
 install(
   TARGETS ${EXTENSION_NAME}
   EXPORT "${DUCKDB_EXPORT_SET}"
