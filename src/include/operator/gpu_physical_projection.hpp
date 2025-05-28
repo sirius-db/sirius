@@ -22,7 +22,7 @@ public:
 
 	OperatorResultType Execute(GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation) const override;
 
-	GPUExpressionExecutor* gpu_expression_executor;
+	// GPUExpressionExecutor* gpu_expression_executor;
 
 public:
 	// unique_ptr<OperatorState> GetOperatorState(ExecutionContext &context) const override;
