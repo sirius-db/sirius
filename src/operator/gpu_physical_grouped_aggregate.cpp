@@ -634,8 +634,8 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 		if (group_by_column[0]->column_length > INT32_MAX || aggregate_column[0]->column_length > INT32_MAX || !string_cudf_supported) {
 			HandleGroupByAggregateExpression(group_by_column, aggregate_column, gpuBufferManager, aggregates, num_group_keys);
 		} else {
-			// HandleGroupByAggregateCuDF(group_by_column, aggregate_column, gpuBufferManager, aggregates, num_group_keys);
-			HandleGroupByAggregateExpression(group_by_column, aggregate_column, gpuBufferManager, aggregates, num_group_keys);
+			HandleGroupByAggregateCuDF(group_by_column, aggregate_column, gpuBufferManager, aggregates, num_group_keys);
+			// HandleGroupByAggregateExpression(group_by_column, aggregate_column, gpuBufferManager, aggregates, num_group_keys);
 		}
 	}
 	
