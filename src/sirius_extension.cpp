@@ -23,6 +23,7 @@
 #include "to_substrait.hpp"
 #include "from_substrait.hpp"
 
+#include "log/logging.hpp"
 #include "gpu_context.hpp"
 #include "gpu_physical_plan_generator.hpp"
 #include "gpu_buffer_manager.hpp"
@@ -480,6 +481,7 @@ void SiriusExtension::Load(DuckDB &db) {
 	Connection con(db);
 	con.BeginTransaction();
 
+	InitGlobalLogger();
 	InitializeGPUExtension(con);
 
 	con.Commit();
