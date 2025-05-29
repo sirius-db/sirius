@@ -19,7 +19,7 @@ sudo apt-get update && sudo apt-get install -y git g++ cmake ninja-build libssl-
 ```
 
 ### Install CUDA
-If CUDA is not installed, download it [here](https://developer.nvidia.com/cuda-downloads). Follow the instructions for the deb(local) installer and complete the [post-installation steps](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/#mandatory-actions).
+If CUDA is not installed, download [here](https://developer.nvidia.com/cuda-downloads). Follow the instructions for the deb(local) installer and complete the [post-installation steps](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/#mandatory-actions).
 
 Verify installation:
 ```
@@ -82,7 +82,7 @@ After setting up Sirius, we can execute SQL queries using the `call gpu_processi
 ```
 call gpu_processing("select
   l_orderkey,
-  sum(l_extendedprice) as revenue,
+  sum(l_extendedprice * (1 - l_discount)) as revenue,
   o_orderdate,
   o_shippriority
 from
@@ -98,9 +98,12 @@ where
 group by
   l_orderkey,
   o_orderdate,
-  o_shippriority;")
+  o_shippriority
+order by
+  revenue desc,
+  o_orderdate");
 ```
-The cold run in Sirius would be significantly slower due to data loading from storage and format converstion from the DuckDB format to Sirius native format. Subsequent runs would be faster since it benefits from caching on GPU memory.
+The cold run in Sirius would be significantly slower due to data loading from storage and conversion from DuckDB format to Sirius native format. Subsequent runs would be faster since it benefits from caching on GPU memory.
 
 All 22 TPC-H queries are saved in tpch-queries.sql. To run all queries:
 ```
@@ -124,6 +127,15 @@ export SIRIUS_LOG_LEVEL=debug
 Running TPC-H on SF=100, Sirius achieves ~10x speedup over existing CPU query engines at the same hardware rental cost, making it well-suited for interactive analytics, financial workloads, and ETL jobs.
 
 ![Performance](sirius-performance.png)
+
+## Limitations
+Sirius is under active development, and several features are still in progress. Notable current limitations include:
+- **Working Set Size Limitations:** Sirius recently switches to libcudf to implement `FILTER`, `PROJECTION`, `JOIN`, `GROUP-BY`, `ORDER-BY`, `AGGREGATION`. However, since libcudf uses `int32_t` for row IDs and string offsets, this imposes limits on the maximum working set size that Sirius can currently handle. We are actively addressing this by adding support for partitioning and chunked pipeline execution. See issue [#12](https://github.com/sirius-db/sirius/issues/12) for more details.
+- **Limited Data Type Support:** Sirius currently only supports `INTEGER`, `BIGINT`, `FLOAT`, `DOUBLE`, and `VARCHAR` data types. We are actively working on supporting additional data types—such as `DECIMAL`, `DATE/TIME`, and nested types. See issue [#20](https://github.com/sirius-db/sirius/issues/20) for more details.
+- **Operator Coverage:** At present, Sirius only supports a range of operators including `FILTER`, `PROJECTION`, `JOIN`, `GROUP-BY`, `ORDER-BY`, `AGGREGATION`, `TOP-N`, `LIMIT`, and `CTE`. We are working on adding more advanced operators such as `WINDOW` functions and `ASOF JOIN`, etc. See issue [#21](https://github.com/sirius-db/sirius/issues/21) for more details.
+- **No Support for Partially NULL Columns:** Sirius currently does not support columns where only some values are `NULL`. This limitation is being tracked and will be addressed in a future update. See issue [#27](https://github.com/sirius-db/sirius/issues/27) for more details.
+
+For a full list of current limitations and ongoing work, please refer to our [GitHub issues page](https://github.com/sirius-db/sirius/issues). If these issues are encountered when running Sirius, Sirius will gracefully fallback to DuckDB query execution on CPUs.
 
 ## Future Roadmap
 Sirius is still under major development and we are working on adding more features to Sirius, such as [storage/disk support](https://github.com/sirius-db/sirius/issues/19), [multi-GPUs](https://github.com/sirius-db/sirius/issues/18), [multi-node](https://github.com/sirius-db/sirius/issues/18), more [operators](https://github.com/sirius-db/sirius/issues/21), [data types](https://github.com/sirius-db/sirius/issues/20), accelerating more engines, and many more.
