@@ -1,6 +1,7 @@
 #include "cuda_helper.cuh"
 #include "gpu_physical_grouped_aggregate.hpp"
 #include "gpu_buffer_manager.hpp"
+#include "log/logging.hpp"
 
 namespace duckdb {
 
@@ -54,7 +55,6 @@ distinct_bound(T* result, sort_keys_type *sort_keys, uint64_t N) {
             uint64_t offset = tile_offset + threadIdx.x + ITEM * B;
             if (offset == 0 || (offset > 0  && sort_keys[offset] != sort_keys[offset - 1])) {
                 result[offset] = 1;
-                // printf("Setting %lu to 1\n", offset);
             } else {
                 result[offset] = 0;
             }
@@ -126,7 +126,6 @@ __global__ void rows_to_columns(sort_keys_type *row_keys, T** col_keys, uint64_t
         if (threadIdx.x + ITEM * B < num_tile_items) {
             uint64_t offset = tile_offset + threadIdx.x + ITEM * B;
             for (int i = 0; i < num_keys; i++) {
-                // printf("Offset: %lu, Key[%d]: %lu\n", offset, i, row_keys[offset].keys[i]);
                 col_keys[i][offset] = row_keys[offset].keys[i];
             }
         }
@@ -169,10 +168,10 @@ void groupedDistinctAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t
     CHECK_ERROR();
     if (N == 0) {
         count[0] = 0;
-        printf("N is 0\n");
+        SIRIUS_LOG_DEBUG("N is 0");
         return;
     }
-    printf("Launching Distinct Grouped Aggregate Kernel\n");
+    SIRIUS_LOG_DEBUG("Launching Distinct Grouped Aggregate Kernel");
     SETUP_TIMING();
     START_TIMER();
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
@@ -231,7 +230,7 @@ void groupedDistinctAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t
     uint8_t** output_agg = new uint8_t*[num_aggregates];
 
     for (int agg = 0; agg < num_aggregates; agg++) {
-        // printf("Aggregating %d\n", agg);
+        // SIRIUS_LOG_DEBUG("Aggregating {}", agg);
         if (distinct_mode[agg] == 0) { // count distinct
 
             uint64_t* d_aggregates_out = gpuBufferManager->customCudaMalloc<uint64_t>(N, 0, 0);
@@ -270,14 +269,14 @@ void groupedDistinctAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t
 
             CHECK_ERROR();
 
-            printf("Count: %lu\n", h_count[0]);
+            SIRIUS_LOG_DEBUG("Count: {}", h_count[0]);
             gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(distinct_boundary), 0);
             output_agg[agg] = reinterpret_cast<uint8_t*> (d_aggregates_out);
         }
     }
 
     cudaDeviceSynchronize();
-    printf("Count: %lu\n", h_count[0]);
+    SIRIUS_LOG_DEBUG("Count: {}", h_count[0]);
     count[0] = h_count[0];
 
     T** keys_dev_result;

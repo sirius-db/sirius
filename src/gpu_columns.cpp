@@ -1,5 +1,6 @@
 #include "gpu_columns.hpp"
 #include "gpu_buffer_manager.hpp"
+#include "log/logging.hpp"
 
 namespace duckdb {
 
@@ -115,7 +116,7 @@ GPUColumn::setFromCudfColumn(cudf::column& cudf_column, bool _is_unique, int32_t
     cudf::column::contents cont = cudf_column.release();
     // rmm_owned_buffer = std::move(cont.data);
     gpuBufferManager->rmm_stored_buffers.push_back(std::move(cont.data));
-    // printf("rmm_stored_buffers size %ld\n", gpuBufferManager->rmm_stored_buffers.back()->size());
+    // SIRIUS_LOG_DEBUG("rmm_stored_buffers size {}", gpuBufferManager->rmm_stored_buffers.back()->size());
 
     data_wrapper.data = reinterpret_cast<uint8_t*>(gpuBufferManager->rmm_stored_buffers.back()->data());
     data_wrapper.size = col_size;
@@ -125,7 +126,7 @@ GPUColumn::setFromCudfColumn(cudf::column& cudf_column, bool _is_unique, int32_t
     if (col_type == cudf::data_type(cudf::type_id::STRING)) {
         cudf::column::contents child_cont = cont.children[0]->release();
         gpuBufferManager->rmm_stored_buffers.push_back(std::move(child_cont.data));
-        // printf("rmm_stored_buffers size %ld\n", gpuBufferManager->rmm_stored_buffers.back()->size());
+        // SIRIUS_LOG_DEBUG("rmm_stored_buffers size {}", gpuBufferManager->rmm_stored_buffers.back()->size());
         data_wrapper.is_string_data = true;
         data_wrapper.type = ColumnType::VARCHAR;
         int32_t* temp_offset = reinterpret_cast<int32_t*>(gpuBufferManager->rmm_stored_buffers.back()->data());
@@ -245,16 +246,16 @@ GPUIntermediateRelation::GPUIntermediateRelation(size_t column_count) :
 
 bool
 GPUIntermediateRelation::checkLateMaterialization(size_t idx) {
-    printf("Checking if column idx %ld needs to be materialized from column size %d\n", idx, columns.size());
+    SIRIUS_LOG_DEBUG("Checking if column idx {} needs to be materialized from column size {}", idx, columns.size());
     if (columns[idx] == nullptr) {
-        printf("Column idx %ld is null\n", idx);
+        SIRIUS_LOG_DEBUG("Column idx {} is null", idx);
         return false;
     }
 
     if (columns[idx]->row_ids == nullptr) {
-        printf("Column idx %d already materialized\n", idx);
+        SIRIUS_LOG_DEBUG("Column idx {} already materialized", idx);
     } else {
-        printf("Column idx %d needs to be materialized\n", idx);
+        SIRIUS_LOG_DEBUG("Column idx {} needs to be materialized", idx);
     }
     return columns[idx]->row_ids != nullptr;
 }

@@ -3,6 +3,7 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "gpu_buffer_manager.hpp"
 #include "gpu_materialize.hpp"
+#include "log/logging.hpp"
 
 namespace duckdb {
 
@@ -155,7 +156,7 @@ ResolveTypeGroupByString(vector<shared_ptr<GPUColumn>> &group_by_keys, vector<sh
 	int* agg_mode = new int[aggregates.size()];
 	for (int agg_idx = 0; agg_idx < aggregates.size(); agg_idx++) {
 		auto& expr = aggregates[agg_idx]->Cast<BoundAggregateExpression>();
-		printf("Aggregate function name %s\n", expr.function.name.c_str());
+		SIRIUS_LOG_DEBUG("Aggregate function name {}", expr.function.name);
 		if (expr.function.name.compare("count") == 0 && aggregate_keys[agg_idx]->data_wrapper.data == nullptr) {
 			agg_mode[agg_idx] = 5;
 			aggregate_data[agg_idx] = nullptr;
@@ -189,7 +190,7 @@ ResolveTypeGroupByString(vector<shared_ptr<GPUColumn>> &group_by_keys, vector<sh
 		if(aggregate_data[agg_idx] == nullptr) {
 			aggregate_data[agg_idx] = reinterpret_cast<uint8_t*>(gpuBufferManager->customCudaMalloc<V>(size, 0, 0));
 		}
-		printf("Aggregate function name %s got agg_mode of %d\n", expr.function.name.c_str(), agg_mode[agg_idx]);
+		SIRIUS_LOG_DEBUG("Aggregate function name {} got agg_mode of {}", expr.function.name, agg_mode[agg_idx]);
 	}
 
 	groupedStringAggregate<V>(group_by_data, aggregate_data, offset_data, num_bytes, count, num_rows, num_group_keys, aggregates.size(), agg_mode);
@@ -287,7 +288,7 @@ void
 HandleGroupByAggregateCuDF(vector<shared_ptr<GPUColumn>> &group_by_keys, vector<shared_ptr<GPUColumn>> &aggregate_keys, GPUBufferManager* gpuBufferManager, const vector<unique_ptr<Expression>> &aggregates, int num_group_keys) {
 
 	AggregationType* agg_mode = new AggregationType[aggregates.size()];
-	printf("Handling group by aggregate expression\n");
+	SIRIUS_LOG_DEBUG("Handling group by aggregate expression");
 	for (int agg_idx = 0; agg_idx < aggregates.size(); agg_idx++) {
 		auto& expr = aggregates[agg_idx]->Cast<BoundAggregateExpression>();
 		if (expr.function.name.compare("count") == 0 && aggregate_keys[agg_idx]->data_wrapper.data == nullptr && aggregate_keys[agg_idx]->column_length == 0) {
@@ -307,7 +308,7 @@ HandleGroupByAggregateCuDF(vector<shared_ptr<GPUColumn>> &group_by_keys, vector<
 		} else if (expr.function.name.compare("count") == 0 && aggregate_keys[agg_idx]->data_wrapper.data != nullptr) {
 			agg_mode[agg_idx] = AggregationType::COUNT;
 		} else {
-			printf("Aggregate function not supported: %s\n", expr.function.name.c_str());
+			SIRIUS_LOG_DEBUG("Aggregate function not supported: {}", expr.function.name);
 			throw NotImplementedException("Aggregate function not supported");
 		}
 	}
@@ -538,7 +539,7 @@ GPUPhysicalGroupedAggregate::GPUPhysicalGroupedAggregate(ClientContext &context,
 
 SinkResultType
 GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const {
-  	printf("Perform groupby and aggregation\n");
+  	SIRIUS_LOG_DEBUG("Perform groupby and aggregation");
 
 	auto start = std::chrono::high_resolution_clock::now();
 
@@ -581,7 +582,7 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 			auto &group = grouped_aggregate_data.groups[group_idx];
 			D_ASSERT(group->type == ExpressionType::BOUND_REF);
 			auto &bound_ref_expr = group->Cast<BoundReferenceExpression>();
-			printf("Reading groupby columns from index %d and passing it to index %d in groupby result\n", bound_ref_expr.index, bound_ref_expr.index);
+			SIRIUS_LOG_DEBUG("Reading groupby columns from index {} and passing it to index {} in groupby result", bound_ref_expr.index, bound_ref_expr.index);
 			group_by_column[idx] = HandleMaterializeExpression(input_relation.columns[bound_ref_expr.index], bound_ref_expr, gpuBufferManager);
 			idx++;
 		}
@@ -590,12 +591,12 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 	int aggr_idx = 0;
 	for (auto &aggregate : aggregates) {
 		auto &aggr = aggregate->Cast<BoundAggregateExpression>();
-		printf("Aggregate type: %s\n", aggr.function.name.c_str());
+		SIRIUS_LOG_DEBUG("Aggregate type: {}", aggr.function.name);
 		if (aggr.children.size() > 1) throw NotImplementedException("Aggregates with multiple children not supported yet");
 		for (auto &child_expr : aggr.children) {
 			D_ASSERT(child_expr->type == ExpressionType::BOUND_REF);
 			auto &bound_ref_expr = child_expr->Cast<BoundReferenceExpression>();
-			printf("Reading aggregation column from index %d and passing it to index %d in groupby result\n", bound_ref_expr.index, grouped_aggregate_data.groups.size() + aggr_idx);
+			SIRIUS_LOG_DEBUG("Reading aggregation column from index {} and passing it to index {} in groupby result", bound_ref_expr.index, grouped_aggregate_data.groups.size() + aggr_idx);
 			aggregate_column[aggr_idx] = HandleMaterializeExpression(input_relation.columns[bound_ref_expr.index], bound_ref_expr, gpuBufferManager);
 		}
 		aggr_idx++;
@@ -605,14 +606,14 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 	for (auto &aggregate : aggregates) {
 		auto &aggr = aggregate->Cast<BoundAggregateExpression>();
 		if (aggr.children.size() == 0) {
-			printf("Passing * aggregate to index %d in groupby result\n", grouped_aggregate_data.groups.size() + aggr_idx);
+			SIRIUS_LOG_DEBUG("Passing * aggregate to index {} in groupby result", grouped_aggregate_data.groups.size() + aggr_idx);
 			aggregate_column[aggr_idx] = make_shared_ptr<GPUColumn>(column_size, ColumnType::INT64, nullptr);
 		}
 		if (aggr.filter) {
 			throw NotImplementedException("Filter not supported yet");
 			auto it = filter_indexes.find(aggr.filter.get());
 			D_ASSERT(it != filter_indexes.end());
-			printf("Reading aggregation filter from index %d\n", it->second);
+			SIRIUS_LOG_DEBUG("Reading aggregation filter from index {}", it->second);
 			input_relation.checkLateMaterialization(it->second);
 		}
 		aggr_idx++;
@@ -650,7 +651,7 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 				group_by_result->columns[idx]->row_id_count = 0;
 			} else if (group_by_result->columns[idx] != nullptr && group_by_column[idx]->column_length > 0 && group_by_column[idx]->data_wrapper.data != nullptr) {
 				// have to combine groupby from different meta pipelines
-				// printf("%ld\n", group_by_column[idx]->column_length);
+				// SIRIUS_LOG_DEBUG("{}", group_by_column[idx]->column_length);
 				group_by_result->columns[idx] = CombineColumns(group_by_result->columns[idx], group_by_column[idx], gpuBufferManager);
 			}
 
@@ -666,14 +667,14 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 			group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx]->row_id_count = 0;
 		} else if (group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] != nullptr && aggregate_column[aggr_idx]->column_length > 0 && aggregate_column[aggr_idx]->data_wrapper.data != nullptr) {
 			// have to combine groupby from different meta pipelines
-			// printf("%ld\n", aggregate_column[aggr_idx]->column_length);
+			// SIRIUS_LOG_DEBUG("{}", aggregate_column[aggr_idx]->column_length);
 			group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] = CombineColumns(group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx], aggregate_column[aggr_idx], gpuBufferManager);
 		}
 	}
 
 	auto end = std::chrono::high_resolution_clock::now();
 	auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-	printf("Group Aggregate Sink time: %.2f ms\n", duration.count()/1000.0);
+	SIRIUS_LOG_DEBUG("Group Aggregate Sink time: {:.2f} ms", duration.count()/1000.0);
 	
   	return SinkResultType::FINISHED;
 }
@@ -682,11 +683,11 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 // GPUPhysicalGroupedAggregate::GetData(ExecutionContext &context, GPUIntermediateRelation &output_relation, OperatorSourceInput &input) const {
 SourceResultType
 GPUPhysicalGroupedAggregate::GetData(GPUIntermediateRelation &output_relation) const {
-//   printf("group by result size %d\n", group_by_result->columns.size());
+//   SIRIUS_LOG_DEBUG("group by result size {}", group_by_result->columns.size());
 	if (groupings.size() > 1) throw NotImplementedException("Multiple groupings not supported yet");
 
 	for (int col = 0; col < group_by_result->columns.size(); col++) {
-		printf("Writing group by result to column %d\n", col);
+		SIRIUS_LOG_DEBUG("Writing group by result to column {}", col);
 		// output_relation.columns[col] = group_by_result->columns[col];
 		bool old_unique = group_by_result->columns[col]->is_unique;
 		if (group_by_result->columns[col]->data_wrapper.type == ColumnType::VARCHAR) {
@@ -729,7 +730,7 @@ GPUPhysicalGroupedAggregate::SinkDistinctGrouping(GPUIntermediateRelation& input
 	for (idx_t group_idx = 0; group_idx < grouped_aggregate_data.groups.size(); group_idx++) {
 		auto &group = grouped_aggregate_data.groups[group_idx];
 		auto &bound_ref = group->Cast<BoundReferenceExpression>();
-		printf("Reading groupby columns from index %d and passing it to index %d in groupby result\n", bound_ref.index, group_idx);
+		SIRIUS_LOG_DEBUG("Reading groupby columns from index {} and passing it to index {} in groupby result", bound_ref.index, group_idx);
 		// input_relation.checkLateMaterialization(bound_ref.index);
 		// group_by_result->columns[group_idx] = input_relation.columns[bound_ref.index];
 		group_by_column[group_idx] = HandleMaterializeExpression(input_relation.columns[bound_ref.index], bound_ref, gpuBufferManager);
@@ -738,7 +739,7 @@ GPUPhysicalGroupedAggregate::SinkDistinctGrouping(GPUIntermediateRelation& input
 	int aggr_idx = 0;
 	for (idx_t &idx : distinct_info.indices) {
 		auto &aggregate = grouped_aggregate_data.aggregates[idx]->Cast<BoundAggregateExpression>();
-		printf("Processing distinct aggregate %s\n", aggregate.function.name.c_str());
+		SIRIUS_LOG_DEBUG("Processing distinct aggregate {}", aggregate.function.name);
 		// throw NotImplementedException("Distinct not supported yet");
 
 		D_ASSERT(distinct_info.table_map.count(idx));
@@ -746,19 +747,19 @@ GPUPhysicalGroupedAggregate::SinkDistinctGrouping(GPUIntermediateRelation& input
 		if (aggregate.filter) {
 			throw NotImplementedException("Filter not supported yet");
 			auto it = filter_indexes.find(aggregate.filter.get());
-      		printf("Reading filter columns from index %d\n", it->second);
+      		SIRIUS_LOG_DEBUG("Reading filter columns from index {}", it->second);
 
 			for (idx_t group_idx = 0; group_idx < grouped_aggregate_data.groups.size(); group_idx++) {
 				auto &group = grouped_aggregate_data.groups[group_idx];
 				auto &bound_ref = group->Cast<BoundReferenceExpression>();
-				printf("Reading groupby columns from index %d and passing it to index %d in groupby result\n", bound_ref.index, group_idx);
+				SIRIUS_LOG_DEBUG("Reading groupby columns from index {} and passing it to index {} in groupby result", bound_ref.index, group_idx);
 				input_relation.checkLateMaterialization(bound_ref.index);
 				group_by_result->columns[group_idx] = input_relation.columns[bound_ref.index];
 			}
 			for (idx_t child_idx = 0; child_idx < aggregate.children.size(); child_idx++) {
 				auto &child = aggregate.children[child_idx];
 				auto &bound_ref = child->Cast<BoundReferenceExpression>();
-				printf("Reading aggregation column from index %d and passing it to index %d in groupby result\n", bound_ref.index, grouped_aggregate_data.groups.size() + idx);
+				SIRIUS_LOG_DEBUG("Reading aggregation column from index {} and passing it to index {} in groupby result", bound_ref.index, grouped_aggregate_data.groups.size() + idx);
 				input_relation.checkLateMaterialization(bound_ref.index);
 				group_by_result->columns[grouped_aggregate_data.groups.size() + idx] = input_relation.columns[bound_ref.index];
 			}
@@ -768,7 +769,7 @@ GPUPhysicalGroupedAggregate::SinkDistinctGrouping(GPUIntermediateRelation& input
 			for (idx_t child_idx = 0; child_idx < aggregate.children.size(); child_idx++) {
 				auto &child = aggregate.children[child_idx];
 				auto &bound_ref = child->Cast<BoundReferenceExpression>();
-				printf("Reading aggregation column from index %d and passing it to index %d in groupby result\n", bound_ref.index, grouped_aggregate_data.groups.size() + idx);
+				SIRIUS_LOG_DEBUG("Reading aggregation column from index {} and passing it to index {} in groupby result", bound_ref.index, grouped_aggregate_data.groups.size() + idx);
 				// input_relation.checkLateMaterialization(bound_ref.index);
 				// group_by_result->columns[grouped_aggregate_data.groups.size() + idx] = input_relation.columns[bound_ref.index];
 				distinct_aggregate_columns[aggr_idx] = HandleMaterializeExpression(input_relation.columns[bound_ref.index], bound_ref, gpuBufferManager);

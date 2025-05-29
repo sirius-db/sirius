@@ -2,7 +2,7 @@
 #include "gpu_physical_grouped_aggregate.hpp"
 #include "gpu_buffer_manager.hpp"
 #include "gpu_materialize.hpp"
-
+#include "log/logging.hpp"
 
 namespace duckdb {
 
@@ -270,13 +270,13 @@ void optimizedGroupedStringAggregate(uint8_t **keys, uint8_t **aggregate_keys, u
     CHECK_ERROR();
     if (N == 0) {
         count[0] = 0;
-        printf("groupedStringAggregate called with 0 rows\n");
+        SIRIUS_LOG_DEBUG("groupedStringAggregate called with 0 rows");
         return;
     }
 
     // First perform preprocessing to convert the input group by columns into row level records
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
-    printf("Launching String Grouped Aggregate Kernel\n");
+    SIRIUS_LOG_DEBUG("Launching String Grouped Aggregate Kernel");
 
     uint64_t total_preprocessing_bytes = 2 * N * sizeof(uint64_t);
     auto preprocess_start_time = high_resolution_clock::now();
@@ -297,7 +297,7 @@ void optimizedGroupedStringAggregate(uint8_t **keys, uint8_t **aggregate_keys, u
 
     auto preprocess_end_time = high_resolution_clock::now();
     auto preprocess_time_ms = std::chrono::duration_cast<duration<double, std::milli>>(preprocess_end_time - preprocess_start_time).count();
-    std::cout << "STRING GROUP BY: Preprocessing required " << total_preprocessing_bytes << " bytes and took " << preprocess_time_ms << " ms" << std::endl;
+    SIRIUS_LOG_DEBUG("STRING GROUP BY: Preprocessing required {} bytes and took {} ms", total_preprocessing_bytes, preprocess_time_ms);
 
     // Now sort the row records
     auto sort_start_time = high_resolution_clock::now();
@@ -327,7 +327,7 @@ void optimizedGroupedStringAggregate(uint8_t **keys, uint8_t **aggregate_keys, u
 
     auto sort_end_time = high_resolution_clock::now();
     auto sort_time_ms = std::chrono::duration_cast<duration<double, std::milli>>(sort_end_time - sort_start_time).count();
-    std::cout << "STRING GROUP BY: Sorting required " << sort_temp_storage_bytes << " bytes and took " << sort_time_ms << " ms" << std::endl;
+    SIRIUS_LOG_DEBUG("STRING GROUP BY: Sorting required {} bytes and took {} ms", sort_temp_storage_bytes, sort_time_ms);
 
     // Create a seperate buffer storing the aggregate values for each sorted row record
     uint64_t total_aggregation_bytes = 0;
@@ -512,8 +512,8 @@ void optimizedGroupedStringAggregate(uint8_t **keys, uint8_t **aggregate_keys, u
 
     auto group_by_end_time = high_resolution_clock::now();
     auto group_by_time_ms = std::chrono::duration_cast<duration<double, std::milli>>(group_by_end_time - group_by_start_time).count();
-    std::cout << "STRING GROUP BY: Group By got " << num_groups << " unique groups" << std::endl;
-    std::cout << "STRING GROUP BY: Group By required " << total_aggregation_bytes << " bytes and took " << group_by_time_ms << " ms" << std::endl;
+    SIRIUS_LOG_DEBUG("STRING GROUP BY: Group By got {} unique groups", num_groups);
+    SIRIUS_LOG_DEBUG("STRING GROUP BY: Group By required {} bytes and took {} ms", total_aggregation_bytes, group_by_time_ms);
 
     auto post_processing_start_time = high_resolution_clock::now();
     uint64_t* d_original_row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(num_groups, 0, 0);
@@ -555,7 +555,7 @@ void optimizedGroupedStringAggregate(uint8_t **keys, uint8_t **aggregate_keys, u
 
     auto post_processing_end_time = high_resolution_clock::now();
     auto post_processing_time_ms = std::chrono::duration_cast<duration<double, std::milli>>(post_processing_end_time - post_processing_start_time).count();
-    std::cout << "STRING GROUP BY V3: Post Processing took " << post_processing_time_ms << " ms" << std::endl;
+    SIRIUS_LOG_DEBUG("STRING GROUP BY V3: Post Processing took {} ms", post_processing_time_ms);
 
     cudaDeviceSynchronize();
     CHECK_ERROR(); 
@@ -579,7 +579,7 @@ void combineStrings(uint8_t* a, uint8_t* b, uint8_t*& c,
         uint64_t num_bytes_a, uint64_t num_bytes_b, uint64_t N_a, uint64_t N_b) {
     CHECK_ERROR();
     if (N_a == 0 || N_b == 0) {
-        printf("N is 0\n");
+        SIRIUS_LOG_DEBUG("N is 0");
         return;
     }
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());

@@ -11,6 +11,7 @@
 #include "gpu_pipeline.hpp"
 #include "gpu_meta_pipeline.hpp"
 #include "gpu_physical_cte.hpp"
+#include "log/logging.hpp"
 
 namespace duckdb {
 
@@ -73,7 +74,7 @@ SinkResultType GPUPhysicalCTE::Sink(GPUIntermediateRelation &input_relation) con
 	// lstate.lhs_data.Append(lstate.append_state, chunk);
 
 	// return SinkResultType::NEED_MORE_INPUT;
-	printf("Sinking data into CTE\n");
+	SIRIUS_LOG_DEBUG("Sinking data into CTE");
 	GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 	for (int col_idx = 0; col_idx < input_relation.columns.size(); col_idx++) {
 		working_table_gpu->columns[col_idx] = make_shared_ptr<GPUColumn>(input_relation.columns[col_idx]->column_length, input_relation.columns[col_idx]->data_wrapper.type, input_relation.columns[col_idx]->data_wrapper.data);

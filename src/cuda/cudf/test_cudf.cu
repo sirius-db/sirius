@@ -20,6 +20,7 @@
 #include <filesystem>
 
 #include "sirius_extension.hpp"
+#include "log/logging.hpp"
 
 namespace duckdb {
 
@@ -40,20 +41,20 @@ namespace duckdb {
 //   options.dtypes(dtypes);
 //   options.delimiter(',');
 //   // auto options     = builder.build();
-//   // printf("%s\n", options)
-//   printf("here\n");
+//   // SIRIUS_LOG_DEBUG("{}", options)
+//   SIRIUS_LOG_DEBUG("here");
 //   return cudf::io::read_csv(options);
 // }
 
 
 cudf::io::table_with_metadata read_csv(std::string const& file_path)
 {
-  printf("Reading CSV file: %s\n", file_path.c_str());
+  SIRIUS_LOG_DEBUG("Reading CSV file: {}", file_path);
   auto source_info = cudf::io::source_info(file_path);
   auto builder     = cudf::io::csv_reader_options::builder(source_info);
   // auto options = cudf::io::csv_reader_options::builder(source_info);
   auto options     = builder.build();
-  // printf("%s\n", options)
+  // SIRIUS_LOG_DEBUG("{}", options)
   return cudf::io::read_csv(options);
 }
 

@@ -8,6 +8,7 @@
 #include "gpu_physical_top_n.hpp"
 #include "gpu_physical_order.hpp"
 #include "gpu_materialize.hpp"
+#include "log/logging.hpp"
 
 namespace duckdb {
 
@@ -152,7 +153,7 @@ SourceResultType GPUPhysicalTopN::GetData(GPUIntermediateRelation& output_relati
 	}
 
 	for (int col = 0; col < sort_result->columns.size(); col++) {
-		printf("Writing top n result to column %d\n", col);
+		SIRIUS_LOG_DEBUG("Writing top n result to column {}", col);
     	auto limit_const = min(limit, sort_result->columns[col]->column_length);
     	output_relation.columns[col] = make_shared_ptr<GPUColumn>(limit_const, sort_result->columns[col]->data_wrapper.type, sort_result->columns[col]->data_wrapper.data,
                           sort_result->columns[col]->data_wrapper.offset, sort_result->columns[col]->data_wrapper.num_bytes, sort_result->columns[col]->data_wrapper.is_string_data);

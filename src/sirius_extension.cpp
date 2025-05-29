@@ -126,13 +126,13 @@ void SiriusExtension::GPUCachingFunction(ClientContext &context, TableFunctionIn
 	}
 
 	if (!buffer_is_initialized) {
-		printf("GPUBufferManager not initialized, please call gpu_buffer_init first\n");
+		SIRIUS_LOG_ERROR("GPUBufferManager not initialized, please call gpu_buffer_init first");
 		return;
 	}
 
 	//get data in CPU buffer
 	string query = "SELECT " + data.column + " FROM " + data.table + ";";
-	cout << "Query: " << query << endl;
+	SIRIUS_LOG_DEBUG("Query: {}", query);
 	auto cpu_res = data.conn->Query(query);
 	
 	auto &catalog_table = Catalog::GetCatalog(context, INVALID_CATALOG);
@@ -179,14 +179,14 @@ SiriusExtension::GPUProcessingBind(ClientContext &context, TableFunctionBindInpu
 
 	//generate physical plan from the logical plan
 	unique_ptr<LogicalOperator> query_plan = SiriusInitPlanExtractor(context, *result, *result->conn);
-	query_plan->Print();
+	SIRIUS_LOG_DEBUG("Query plan:\n{}", query_plan->ToString());
 	try {
 		auto gpu_physical_plan = GPUGeneratePhysicalPlan(context, *result->gpu_context, query_plan, *result->conn);
 		auto gpu_prepared = make_shared_ptr<GPUPreparedStatementData>(std::move(prepared), std::move(gpu_physical_plan));
 		result->gpu_prepared = gpu_prepared;
 	} catch (std::exception &e) {
 		ErrorData error(e);
-		printf("\033[1;31m"); printf("Error in GPUGeneratePhysicalPlan: %s\n", error.RawMessage().c_str()); printf("\033[0m");
+		SIRIUS_LOG_ERROR("Error in GPUGeneratePhysicalPlan: {}", error.RawMessage());
 		result->plan_error = true;
 	}
 
@@ -209,22 +209,22 @@ void SiriusExtension::GPUProcessingFunction(ClientContext &context, TableFunctio
 	if (!data.res) {
 		auto start = std::chrono::high_resolution_clock::now();
 		if (!buffer_is_initialized) {
-			printf("\033[1;31m"); printf("GPUBufferManager not initialized, please call gpu_buffer_init first\n"); printf("\033[0m");
-			printf("=============================================\nError in GPUExecuteQuery, fallback to DuckDB\n=============================================\n");
+			SIRIUS_LOG_ERROR("GPUBufferManager not initialized, please call gpu_buffer_init first");
+			SIRIUS_LOG_ERROR("=============================================\nError in GPUExecuteQuery, fallback to DuckDB\n=============================================");
 			data.res = data.conn->Query(data.query);
 		} else if (data.plan_error) {
-			printf("=============================================\nError in GPUExecuteQuery, fallback to DuckDB\n=============================================\n");
+			SIRIUS_LOG_ERROR("=============================================\nError in GPUExecuteQuery, fallback to DuckDB\n=============================================");
 			data.res = data.conn->Query(data.query);
 		} else {
 			data.res = data.gpu_context->GPUExecuteQuery(context, data.query, data.gpu_prepared, {});
 			if (data.res->HasError()) {
-				printf("=============================================\nError in GPUExecuteQuery, fallback to DuckDB\n=============================================\n");
+				SIRIUS_LOG_ERROR("=============================================\nError in GPUExecuteQuery, fallback to DuckDB\n=============================================");
 				data.res = data.conn->Query(data.query);
 			}
 		}
 		auto end = std::chrono::high_resolution_clock::now();
 		auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-		printf("Execute query time: %.2f ms\n", duration.count()/1000.0);
+		SIRIUS_LOG_INFO("Execute query time: {:.2f} ms", duration.count()/1000.0);
 	}
 
 	auto result_chunk = data.res->Fetch();
@@ -241,7 +241,7 @@ unique_ptr<LogicalOperator> OptimizePlan(ClientContext &context, Planner &planne
 
 	Optimizer optimizer(*planner.binder, context);
 	plan = optimizer.Optimize(std::move(plan));
-	plan->Print();
+	SIRIUS_LOG_DEBUG("Query plan:\n{}", plan->ToString());
 
 	ColumnBindingResolver resolver;
 	resolver.Verify(*plan);
@@ -273,7 +273,7 @@ SiriusExtension::GPUProcessingSubstraitBind(ClientContext &context, TableFunctio
 	auto relation_stmt = make_uniq<RelationStatement>(result->plan);
 	unique_ptr<SQLStatement> statements = std::move(relation_stmt);
 	auto statement_type = statements->type;
-	printf("%s\n", statements->query.c_str());
+	SIRIUS_LOG_DEBUG("{}", statements->query);
 
 	set<OptimizerType> disabled_optimizers = DBConfig::GetConfig(context).options.disabled_optimizers;
 	disabled_optimizers.insert(OptimizerType::IN_CLAUSE);
@@ -297,7 +297,7 @@ SiriusExtension::GPUProcessingSubstraitBind(ClientContext &context, TableFunctio
 		result->gpu_prepared = gpu_prepared;
 	} catch (std::exception &e) {
 		ErrorData error(e);
-		printf("\033[1;31m"); printf("Error in GPUGeneratePhysicalPlan: %s\n", error.RawMessage().c_str()); printf("\033[0m");
+		SIRIUS_LOG_ERROR("Error in GPUGeneratePhysicalPlan: {}", error.RawMessage());
 		result->plan_error = true;
 	}
 
@@ -320,20 +320,20 @@ void SiriusExtension::GPUProcessingSubstraitFunction(ClientContext &context, Tab
 	if (!data.res) {
 		auto start = std::chrono::high_resolution_clock::now();
 		if (!buffer_is_initialized) {
-			printf("\033[1;31m"); printf("GPUBufferManager not initialized, please call gpu_buffer_init first\n"); printf("\033[0m");
-			printf("=============================================\nError in GPUExecuteQuery, fallback to DuckDB\n=============================================\n");
+			SIRIUS_LOG_ERROR("GPUBufferManager not initialized, please call gpu_buffer_init first");
+			SIRIUS_LOG_ERROR("=============================================\nError in GPUExecuteQuery, fallback to DuckDB\n=============================================");
 			auto con = Connection(*context.db);
 			data.plan->context = make_shared_ptr<ClientContextWrapper>(con.context);
 			data.res = data.plan->Execute();
 		} else if (data.plan_error) {
-			printf("=============================================\nError in GPUExecuteQuery, fallback to DuckDB\n=============================================\n");
+			SIRIUS_LOG_ERROR("=============================================\nError in GPUExecuteQuery, fallback to DuckDB\n=============================================");
 			auto con = Connection(*context.db);
 			data.plan->context = make_shared_ptr<ClientContextWrapper>(con.context);
 			data.res = data.plan->Execute();
 		} else {
 			data.res = data.gpu_context->GPUExecuteQuery(context, data.query, data.gpu_prepared, {});
 			if (data.res->HasError()) {
-				printf("=============================================\nError in GPUExecuteQuery, fallback to DuckDB\n=============================================\n");
+				SIRIUS_LOG_ERROR("=============================================\nError in GPUExecuteQuery, fallback to DuckDB\n=============================================");
 				auto con = Connection(*context.db);
 				data.plan->context = make_shared_ptr<ClientContextWrapper>(con.context);
 				data.res = data.plan->Execute();
@@ -341,7 +341,7 @@ void SiriusExtension::GPUProcessingSubstraitFunction(ClientContext &context, Tab
 		}
 		auto end = std::chrono::high_resolution_clock::now();
 		auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-		printf("GPU Execute query time: %.2f ms\n", duration.count()/1000.0);
+		SIRIUS_LOG_INFO("GPU Execute query time: {:.2f} ms", duration.count()/1000.0);
 	}
 
 	auto result_chunk = data.res->Fetch();
@@ -441,7 +441,7 @@ SiriusExtension::GPUBufferInitFunction(ClientContext &context, TableFunctionInpu
 		GPUBufferManager *gpuBufferManager = &(GPUBufferManager::GetInstance(cache_size, processing_size, processing_size));
 		buffer_is_initialized = true;
 	} else {
-		printf("GPUBufferManager already initialized\n");
+		SIRIUS_LOG_WARN("GPUBufferManager already initialized");
 	}
 	data.finished = true;
 }
