@@ -3,6 +3,7 @@
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "expression_executor/gpu_expression_executor.hpp"
 #include "expression_executor/gpu_expression_executor_state.hpp"
+#include "log/logging.hpp"
 #include <algorithm>
 #include <cudf/aggregation.hpp>
 #include <cudf/binaryop.hpp>
@@ -157,7 +158,7 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundOperator
         case cudf::type_id::STRING:
           return ExecuteStringIn::Do(expr, left->view(), resource_ref);
         default:
-          std::cout << "UNKNOWN TYPE: " << static_cast<int32_t>(left->type().id()) << "\n";
+          SIRIUS_LOG_ERROR("UNKNOWN TYPE: {}", static_cast<int32_t>(left->type().id()));
           throw NotImplementedException("Execute[IN_CONSTANTS]: Unimplemented type!");
       }
     }

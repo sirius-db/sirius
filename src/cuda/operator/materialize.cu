@@ -1,5 +1,6 @@
 #include "cuda_helper.cuh"
 #include "gpu_columns.hpp"
+#include "log/logging.hpp"
 
 #include <chrono>
 #include <cmath>
@@ -23,10 +24,8 @@ __global__ void materialize_expression(const T *a, T* result, uint64_t *row_ids,
     for (int ITEM = 0; ITEM < I; ++ITEM) {
         if (threadIdx.x + ITEM * B < num_tile_items) {
             int items_ids = row_ids[tile_offset + threadIdx.x + ITEM * B];
-            // if (N == 3793296 && (items_ids < 0 || items_ids >= 3793296)) printf("items_ids: %d\n", items_ids);
             result[tile_offset + threadIdx.x + ITEM * B] = a[items_ids];
             // cudaAssert(a[items_ids] == 19940101);
-            // printf("Result: %ld\n", result[tile_offset + threadIdx.x + ITEM * B]);
         }
     }
 
@@ -38,8 +37,6 @@ __global__ void materialize_offset(uint64_t* offset, uint64_t* result_length, ui
         uint64_t copy_row_id = row_ids[tid];
         uint64_t new_length = offset[copy_row_id + 1] - offset[copy_row_id];
         result_length[tid] = new_length;
-        // printf("%ld %ld\n", tid, result_length[tid]);
-        // printf("SET MATERALIZE: Copy Row Id - %d, New Len - %d, New Offset - %d\n", copy_row_id, new_length, materalized_offsets[tid]);
     }
 }
 
@@ -50,7 +47,6 @@ __global__ void materialize_string(uint8_t* data, uint8_t* result, uint64_t* inp
         uint64_t input_start_idx = input_offset[copy_row_id];
         uint64_t input_length = input_offset[copy_row_id + 1] - input_offset[copy_row_id];
         uint64_t output_start_idx = materialized_offset[tid];
-        // printf("CHARS COPY: Copy Row Id - %ld, Src Start Idx - %ld, Src Length - %ld, Dst Write Idx - %ld\n", copy_row_id, input_start_idx, input_length, output_start_idx);
         memcpy(result + output_start_idx, data + input_start_idx, input_length * sizeof(uint8_t));
     }
 }
@@ -70,15 +66,15 @@ template <typename T>
 void materializeExpression(T *a, T*& result, uint64_t *row_ids, uint64_t result_len, uint64_t input_len) {
     CHECK_ERROR();
     if (result_len == 0) {
-        printf("result_len is 0\n");
+        SIRIUS_LOG_DEBUG("result_len is 0");
         return;
     }
     SETUP_TIMING();
     START_TIMER();
-    printf("Launching Materialize Kernel\n");
+    SIRIUS_LOG_DEBUG("Launching Materialize Kernel");
     // SETUP_TIMING();
     // START_TIMER();
-    // printf("result_len: %lu\n", N);
+    // SIRIUS_LOG_DEBUG("result_len: {}", N);
     // testprintmat<T><<<1, 1>>>(a, N);
     // CHECK_ERROR();
     // testprintmat<uint64_t><<<1, 1>>>(row_ids, N);
@@ -101,12 +97,12 @@ void materializeExpression(T *a, T*& result, uint64_t *row_ids, uint64_t result_
 void materializeString(uint8_t* data, uint64_t* offset, uint8_t* &result, uint64_t* &result_offset, uint64_t* row_ids, uint64_t* &result_bytes, uint64_t result_len, uint64_t input_size, uint64_t input_bytes) {
     CHECK_ERROR();
     if (result_len == 0) {
-        printf("result_len is 0\n");
+        SIRIUS_LOG_DEBUG("result_len is 0");
         return;
     }
     SETUP_TIMING();
     START_TIMER();
-    printf("Launching Materialize String Kernel\n");
+    SIRIUS_LOG_DEBUG("Launching Materialize String Kernel");
     // SETUP_TIMING();
     // START_TIMER();
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
@@ -139,7 +135,7 @@ void materializeString(uint8_t* data, uint64_t* offset, uint8_t* &result, uint64
 
     result_bytes = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
     cudaMemcpy(result_bytes, result_offset + result_len, sizeof(uint64_t), cudaMemcpyDeviceToHost);
-    // std::cout << "Got new chars len of " << new_num_bytes[0] << std::endl;
+    // SIRIUS_LOG_DEBUG("Got new chars len of {}", new_num_bytes[0]);
 
     CHECK_ERROR();
 

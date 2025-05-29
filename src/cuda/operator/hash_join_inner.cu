@@ -1,6 +1,7 @@
 #include "cuda_helper.cuh"
 #include "gpu_physical_hash_join.hpp"
 #include "gpu_buffer_manager.hpp"
+#include "log/logging.hpp"
 
 namespace duckdb {
 
@@ -57,18 +58,9 @@ __global__ void probe_multikey_count(uint64_t **keys, unsigned long long* ht, ui
             if (equal_keys == 1) slot = keys[0][tile_offset + threadIdx.x + ITEM * B] % ht_len;
             else if (equal_keys == 2) slot = hash64_multikey(keys[0][tile_offset + threadIdx.x + ITEM * B], keys[1][tile_offset + threadIdx.x + ITEM * B]) % ht_len;
             else cudaAssert(0);
-
-            // if (keys[0][tile_offset + threadIdx.x + ITEM * B] == 4701966275692616012 || keys[0][tile_offset + threadIdx.x + ITEM * B] == 4701966275692616011) {
-            //     printf("key found %ld\n", tile_offset + threadIdx.x + ITEM * B);
-            // }
-
-            // if (tile_offset + threadIdx.x + ITEM * B == 69997) {
-            //     printf("key %ld\n", keys[0][tile_offset + threadIdx.x + ITEM * B]);
-            // }
             
             while (ht[slot * n_ht_column] != 0xFFFFFFFFFFFFFFFF) {
                 bool local_found = 1;
-                // printf("key1: %lu key2: %lu ht1: %lu ht2: %lu\n", keys[0][tile_offset + threadIdx.x + ITEM * B], keys[1][tile_offset + threadIdx.x + ITEM * B], ht[slot * n_ht_column], ht[slot * n_ht_column + 1]);
                 for (int n = 0; n < num_keys; n++) {
                     uint64_t item = keys[n][tile_offset + threadIdx.x + ITEM * B];
                     if (condition_mode[n] == 0 && ht[slot * n_ht_column + n] != item) {
@@ -76,7 +68,6 @@ __global__ void probe_multikey_count(uint64_t **keys, unsigned long long* ht, ui
                         // break;
                     } else if (condition_mode[n] == 1 && ht[slot * n_ht_column + n] == item) {
                         local_found = 0;
-                        // printf("key1: %lu key2: %lu ht1: %lu ht2: %lu\n", keys[0][tile_offset + threadIdx.x + ITEM * B], keys[1][tile_offset + threadIdx.x + ITEM * B], ht[slot * n_ht_column], ht[slot * n_ht_column + 1]);
                         // break;
                     }
                 }
@@ -212,13 +203,13 @@ __global__ void probe_multikey<BLOCK_THREADS, ITEMS_PER_THREAD>(uint64_t **keys,
 void buildHashTable(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t N, int* condition_mode, int num_keys, bool is_right) {
     CHECK_ERROR();
     if (N == 0) {
-        printf("N is 0\n");
+        SIRIUS_LOG_DEBUG("N is 0");
         return;
     }
-    printf("Launching Build Kernel\n");
+    SIRIUS_LOG_DEBUG("Launching Build Kernel");
     SETUP_TIMING();
     START_TIMER();
-    printf("N: %lu ht len: %ld\n", N, ht_len);
+    SIRIUS_LOG_DEBUG("N: {} ht len: {}", N, ht_len);
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 
     //reinterpret cast the keys to uint64_t
@@ -262,13 +253,13 @@ void probeHashTable(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uin
         uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
         h_count[0] = 0;
         count = h_count;
-        printf("N is 0\n");
+        SIRIUS_LOG_DEBUG("N is 0");
         return;
     }
-    printf("Launching Probe Kernel\n");
+    SIRIUS_LOG_DEBUG("Launching Probe Kernel");
     SETUP_TIMING();
     START_TIMER();
-    printf("N: %lu\n", N);
+    SIRIUS_LOG_DEBUG("N: {}", N);
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
     count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
     cudaMemset(count, 0, sizeof(uint64_t));
@@ -305,7 +296,7 @@ void probeHashTable(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uin
     uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
     cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
     assert(h_count[0] > 0);
-    printf("Count: %lu\n", h_count[0]);
+    SIRIUS_LOG_DEBUG("Count: {}", h_count[0]);
     row_ids_left = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
     row_ids_right = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
     probe_multikey<BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(keys_dev, ht, ht_len, 
@@ -315,7 +306,7 @@ void probeHashTable(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uin
     // uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
     // cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
     // assert(h_count[0] > 0);
-    // printf("Count: %lu\n", h_count[0]);
+    // SIRIUS_LOG_DEBUG("Count: {}", h_count[0]);
     // gpuBufferManager->gpuProcessingPointer[0] = (reinterpret_cast<uint8_t*>(row_ids_left + h_count[0]) - gpuBufferManager->gpuProcessing[0]);
     // cudaMemmove(reinterpret_cast<uint8_t*>(row_ids_left + h_count[0]), reinterpret_cast<uint8_t*>(row_ids_right), h_count[0] * sizeof(uint64_t));
     // CHECK_ERROR();

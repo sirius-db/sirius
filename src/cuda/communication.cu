@@ -4,6 +4,7 @@
 #include "communication.hpp"
 #include "gpu_columns.hpp"
 #include "operator/cuda_helper.cuh"
+#include "log/logging.hpp"
 
 namespace duckdb {
 
@@ -62,40 +63,40 @@ template <typename T>
 void callCudaMemcpyHostToDevice(T* dest, T* src, size_t size, int gpu) {
     CHECK_ERROR();
     if (size == 0) {
-        printf("N is 0\n");
+        SIRIUS_LOG_DEBUG("N is 0");
         return;
     }
-    printf("Send data to GPU\n");
+    SIRIUS_LOG_DEBUG("Send data to GPU");
     cudaSetDevice(gpu);
     gpuErrchk(cudaMemcpy(dest, src, size * sizeof(T), cudaMemcpyHostToDevice));
     gpuErrchk(cudaDeviceSynchronize());
     cudaSetDevice(0);
-    printf("Done sending data to GPU\n");
+    SIRIUS_LOG_DEBUG("Done sending data to GPU");
 }
 
 template <typename T> 
 void callCudaMemcpyDeviceToHost(T* dest, T* src, size_t size, int gpu) {
     CHECK_ERROR();
     if (size == 0) {
-        printf("N is 0\n");
+        SIRIUS_LOG_DEBUG("N is 0");
         return;
     }
     SETUP_TIMING();
     START_TIMER();
-    printf("Send data to CPU\n");
+    SIRIUS_LOG_DEBUG("Send data to CPU");
     cudaSetDevice(gpu);
-    printf("size: %ld\n", size);
+    SIRIUS_LOG_DEBUG("size: {}", size);
     if (src == nullptr) {
-        printf("src is null\n");
+        SIRIUS_LOG_DEBUG("src is null");
     }
     if (dest == nullptr) {
-        printf("dest is null\n");
+        SIRIUS_LOG_DEBUG("dest is null");
     }
     gpuErrchk(cudaMemcpy(dest, src, size * sizeof(T), cudaMemcpyDeviceToHost));
     CHECK_ERROR();
     gpuErrchk(cudaDeviceSynchronize());
     cudaSetDevice(0);
-    printf("Done sending data to CPU\n");
+    SIRIUS_LOG_DEBUG("Done sending data to CPU");
     STOP_TIMER();
 }
 
@@ -103,37 +104,37 @@ template <typename T>
 void callCudaMemcpyDeviceToDevice(T* dest, T* src, size_t size, int gpu) {
     CHECK_ERROR();
     if (size == 0) {
-        printf("N is 0\n");
+        SIRIUS_LOG_DEBUG("N is 0");
         return;
     }
     SETUP_TIMING();
     START_TIMER();
-    printf("Send data within GPU\n");
+    SIRIUS_LOG_DEBUG("Send data within GPU");
     cudaSetDevice(gpu);
-    printf("size: %ld\n", size);
+    SIRIUS_LOG_DEBUG("size: {}", size);
     if (src == nullptr) {
-        printf("src is null\n");
+        SIRIUS_LOG_DEBUG("src is null");
     }
     if (dest == nullptr) {
-        printf("dest is null\n");
+        SIRIUS_LOG_DEBUG("dest is null");
     }
     gpuErrchk(cudaMemcpy(dest, src, size * sizeof(T), cudaMemcpyDeviceToDevice));
     CHECK_ERROR();
     gpuErrchk(cudaDeviceSynchronize());
     cudaSetDevice(0);
-    printf("Done sending data to GPU\n");
+    SIRIUS_LOG_DEBUG("Done sending data to GPU");
     STOP_TIMER();
 }
 
 // Define the host function that launches the CUDA kernel
 int* sendDataToGPU(int* data, int size) {
-    printf("Send data to GPU\n");
+    SIRIUS_LOG_DEBUG("Send data to GPU");
     // use cudamemcpy
     int* target;
     cudaMalloc((void**) &target, size * sizeof(int));
     cudaMemcpy(target, data, size * sizeof(int), cudaMemcpyHostToDevice);
     cudaDeviceSynchronize();
-    printf("Done sending data to GPU\n");
+    SIRIUS_LOG_DEBUG("Done sending data to GPU");
     return target;
 }
 

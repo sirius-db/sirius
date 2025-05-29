@@ -3,6 +3,7 @@
 #include "duckdb/common/types.hpp"
 #include "duckdb/parser/constraints/unique_constraint.hpp"
 #include "utils.hpp"
+#include "log/logging.hpp"
 
 #define NUM_GPUS 1
 
@@ -67,7 +68,7 @@ GPUBufferManager::customCudaHostAlloc<string_t>(size_t size);
 
 GPUBufferManager::GPUBufferManager(size_t cache_size_per_gpu, size_t processing_size_per_gpu, size_t processing_size_per_cpu) : 
     cache_size_per_gpu(cache_size_per_gpu), processing_size_per_gpu(processing_size_per_gpu), processing_size_per_cpu(processing_size_per_cpu) {
-    printf("Initializing GPU buffer manager\n");
+    SIRIUS_LOG_INFO("Initializing GPU buffer manager");
     gpuCache = new uint8_t*[NUM_GPUS];
     gpuProcessing = new uint8_t*[NUM_GPUS];
     cpuProcessing = allocatePinnedCPUMemory(processing_size_per_cpu);
@@ -77,8 +78,8 @@ GPUBufferManager::GPUBufferManager(size_t cache_size_per_gpu, size_t processing_
 
     cuda_mr = new rmm::mr::cuda_memory_resource();
     // mr = new rmm::mr::pool_memory_resource(cuda_mr, rmm::percent_of_free_device_memory(50));
-    printf("Allocating cache size %zu in GPU 0\n", cache_size_per_gpu);
-    printf("Allocating processing size %zu in GPU 0\n", processing_size_per_gpu);
+    SIRIUS_LOG_INFO("Allocating cache size {} in GPU 0", cache_size_per_gpu);
+    SIRIUS_LOG_INFO("Allocating processing size {} in GPU 0", processing_size_per_gpu);
     mr = new rmm::mr::pool_memory_resource(cuda_mr, processing_size_per_gpu, processing_size_per_cpu);
     cudf::set_current_device_resource(mr);
     allocation_table.resize(NUM_GPUS);
@@ -110,7 +111,7 @@ GPUBufferManager::~GPUBufferManager() {
 void GPUBufferManager::ResetBuffer() {
     cudf::set_current_device_resource(mr);
     for (int gpu = 0; gpu < NUM_GPUS; gpu++) {
-        printf("Resetting buffer for GPU %d\n", gpu);
+        SIRIUS_LOG_DEBUG("Resetting buffer for GPU {}", gpu);
         gpuProcessingPointer[gpu] = 0;
         //write a program to free all allocation in the allocation table
         for (auto it = allocation_table[gpu].begin(); it != allocation_table[gpu].end(); ++it) {
@@ -119,7 +120,7 @@ void GPUBufferManager::ResetBuffer() {
             if (ptr != nullptr) {
                 // customCudaFree<uint8_t>(reinterpret_cast<uint8_t*>(ptr), size, 0);
                 mr->deallocate((void*) ptr, size);
-                // printf("Deallocating Pointer %p size %ld\n", ptr, size);
+                // SIRIUS_LOG_DEBUG("Deallocating Pointer {} size {}", static_cast<void*>(ptr), size);
                 // allocation_table[gpu].erase(it);
             }
         }
@@ -127,12 +128,12 @@ void GPUBufferManager::ResetBuffer() {
         if (!allocation_table[gpu].empty()) {
             throw InvalidInputException("Allocation table is not empty");
         }
-        // printf("Locked allocation table size %ld\n", locked_allocation_table[gpu].size());
+        // SIRIUS_LOG_DEBUG("Locked allocation table size {}", locked_allocation_table[gpu].size());
         for (auto it = locked_allocation_table[gpu].begin(); it != locked_allocation_table[gpu].end(); ++it) {
             auto ptr = it->first;
             auto size = it->second;
             if (ptr != nullptr) {
-                // printf("Deallocating Locked Pointer %p size %ld\n", ptr, size);
+                // SIRIUS_LOG_DEBUG("Deallocating Locked Pointer {} size {}", static_cast<void*>(ptr), size);
                 mr->deallocate((void*) ptr, size);
             }
         }
@@ -141,10 +142,10 @@ void GPUBufferManager::ResetBuffer() {
             throw InvalidInputException("Locked allocation table is not empty");
         }
         rmm_stored_buffers.clear();
-        // printf("pool size %ld\n", mr->pool_size());
+        // SIRIUS_LOG_DEBUG("pool size {}", mr->pool_size());
 
         // size_t allocated_size = mr->pool_size();
-        // printf("Allocating %ld bytes\n", allocated_size);
+        // SIRIUS_LOG_DEBUG("Allocating {} bytes", allocated_size);
         // void* ptr = mr->allocate(allocated_size);
         // mr->deallocate(ptr, allocated_size);
     }
@@ -161,7 +162,7 @@ void GPUBufferManager::ResetBuffer() {
 }
 
 void GPUBufferManager::ResetCache() {
-    printf("Resetting cache\n");
+    SIRIUS_LOG_DEBUG("Resetting cache");
     for (int gpu = 0; gpu < NUM_GPUS; gpu++) {
         gpuCachingPointer[gpu] = 0;
     }
@@ -199,18 +200,18 @@ GPUBufferManager::customCudaMalloc(size_t size, int gpu, bool caching) {
         cudf::set_current_device_resource(mr);
         void* ptr = mr->allocate(alloc);
         // size_t start = __atomic_fetch_add(&gpuProcessingPointer[gpu], alloc, __ATOMIC_RELAXED);
-        // // printf("Current pointer %ld\n", gpuProcessingPointer[gpu]);
+        // // SIRIUS_LOG_DEBUG("Current pointer {}", gpuProcessingPointer[gpu]);
         // assert((start + alloc) < processing_size_per_gpu);
         // if (start + alloc >= processing_size_per_gpu) {
         //     throw InvalidInputException("Out of GPU processing memory");
         // }
-        // // printf("Allocating %ld bytes at %d\n", alloc, start);
-        // // printf("Current pointer %ld\n", gpuProcessingPointer[gpu]);
+        // // SIRIUS_LOG_DEBUG("Allocating {} bytes at {}", alloc, start);
+        // // SIRIUS_LOG_DEBUG("Current pointer {}", gpuProcessingPointer[gpu]);
         // T* ptr = reinterpret_cast<T*>(gpuProcessing[gpu] + start);
         // if (reinterpret_cast<uintptr_t>(ptr) % alignof(double) != 0) {
         //     throw InvalidInputException("Memory is not properly aligned");
         // }
-        // printf("Allocating Pointer %p size %ld\n", ptr, alloc);
+        // SIRIUS_LOG_DEBUG("Allocating Pointer {} size {}", static_cast<void*>(ptr), alloc);
         if (ptr == nullptr) throw InvalidInputException("Pointer is nullptr");
         if (allocation_table[gpu].find(ptr) != allocation_table[gpu].end()) {
             throw InvalidInputException("Pointer already exists in allocation table");
@@ -261,6 +262,7 @@ GPUBufferManager::copyDataFromcuDFColumn(cudf::column_view& column, int gpu) {
         callCudaMemcpyDeviceToDevice<uint8_t>(temp_column, data, column.size() * sizeof(bool), 0);
         return make_shared_ptr<GPUColumn>(column.size(), ColumnType::BOOLEAN, temp_column);
     }
+    throw duckdb::InternalException("Unsupported cuDF column: {}", static_cast<int>(column.type().id()));
 }
 
 void
@@ -268,7 +270,7 @@ GPUBufferManager::lockAllocation(void* ptr, int gpu) {
     //move entries from the allocation table to the locked table
     auto it = allocation_table[gpu].find(ptr);
     if (it != allocation_table[gpu].end()) {
-        // printf("Locking Pointer %p\n", ptr);
+        // SIRIUS_LOG_DEBUG("Locking Pointer {}", static_cast<void*>(ptr));
         locked_allocation_table[gpu][ptr] = it->second;
         allocation_table[gpu].erase(it);
     }
@@ -281,7 +283,7 @@ GPUBufferManager::customCudaFree(uint8_t* ptr, int gpu) {
     if (ptr != nullptr && (ptr < gpuCache[gpu] || ptr >= gpuCache[gpu] + cache_size_per_gpu)) {
         auto it = allocation_table[gpu].find(reinterpret_cast<void*>(ptr));
         if (it != allocation_table[gpu].end()) {
-            // printf("Deallocating Pointer %p size %ld\n", ptr, it->second);
+            // SIRIUS_LOG_DEBUG("Deallocating Pointer {} size {}", static_cast<void*>(ptr), it->second);
             mr->deallocate((void*) ptr, it->second);
             allocation_table[gpu].erase(it);
         } else {
@@ -295,7 +297,7 @@ GPUBufferManager::customCudaFree(uint8_t* ptr, int gpu) {
                     }
                 }
                 if (!found) {
-                    printf("Invalid Pointer %p\n", ptr);
+                    SIRIUS_LOG_DEBUG("Invalid Pointer {}", static_cast<void*>(ptr));
                     throw InvalidInputException("Pointer not found in allocation table");
                 }
             }
@@ -317,7 +319,7 @@ GPUBufferManager::customCudaHostAlloc(size_t size) {
 
 void 
 GPUBufferManager::Print() {
-    printf("I am inside GPU buffer manager\n");
+    SIRIUS_LOG_DEBUG("I am inside GPU buffer manager");
 }
 
 DataWrapper GPUBufferManager::allocateStringChunk(DataChunk &input_chunk, size_t row_count, DataWrapper &prev_data) {
@@ -331,7 +333,7 @@ DataWrapper GPUBufferManager::allocateStringChunk(DataChunk &input_chunk, size_t
 
     DataWrapper result;
     result.type = ColumnType::VARCHAR;
-    // printf("chunk size %ld\n", chunk_size);
+    // SIRIUS_LOG_DEBUG("chunk size {}", chunk_size);
     result.size = prev_data.size + chunk_size;
 
     // First iteration, allocate the offset array
@@ -352,7 +354,7 @@ DataWrapper GPUBufferManager::allocateStringChunk(DataChunk &input_chunk, size_t
 
     // Now do the same for the chars
     result.num_bytes = (size_t) (curr_offset + prev_data.num_bytes);
-    // printf("Num bytes %d\n", result.num_bytes);
+    // SIRIUS_LOG_DEBUG("Num bytes {}", result.num_bytes);
     uint64_t copy_offset = 0;
 
     //assuming its contiguous with prev_data
@@ -440,7 +442,7 @@ GPUBufferManager::allocateChunk(DataChunk &input){
 DataWrapper
 GPUBufferManager::allocateColumnBufferInCPU(unique_ptr<MaterializedQueryResult> input) {
     auto row_count = input->RowCount();
-    printf("Row count %d\n", row_count);
+    SIRIUS_LOG_DEBUG("Row count {}", row_count);
 	auto input_chunk = input->Fetch();
 	if (!input_chunk) {
 		throw InvalidInputException("No data in input chunk");
@@ -465,13 +467,13 @@ GPUBufferManager::allocateColumnBufferInCPU(unique_ptr<MaterializedQueryResult> 
         }
 		input_chunk = input->Fetch();
 	}
-    printf("Done allocating column buffer in CPU\n");
+    SIRIUS_LOG_DEBUG("Done allocating column buffer in CPU");
     return result_wrapper;
 }
 
 DataWrapper GPUBufferManager::allocateStrColumnInGPU(DataWrapper cpu_data, int gpu) {
     // First copy the data
-    std::cout << "CPU data called with " << cpu_data.num_bytes << " chars and " << cpu_data.size << " strings" << std::endl;
+    SIRIUS_LOG_DEBUG("CPU data called with {} chars and {} strings", cpu_data.num_bytes, cpu_data.size);
 
     DataWrapper result;
     result.is_string_data = cpu_data.is_string_data;
@@ -480,20 +482,20 @@ DataWrapper GPUBufferManager::allocateStrColumnInGPU(DataWrapper cpu_data, int g
     // First allocate and copy the offset buffer
     result.size = cpu_data.size;
     result.offset = customCudaMalloc<uint64_t>((cpu_data.size + 1), 0, true);
-    std::cout << "Copying offset with " << result.size << " strings" << std::endl;
+    SIRIUS_LOG_DEBUG("Copying offset with {} strings", result.size);
     callCudaMemcpyHostToDevice<uint64_t>(result.offset, cpu_data.offset, (cpu_data.size + 1), 0);
     //     std::string output_str(cpu_data.data + cpu_data.offset[i], cpu_data.data + cpu_data.offset[i + 1]);
     //     Value output_value(output_str);
-    //     std::cout << "Recording value " << output_value.ToString() << " for idx " << i << std::endl;
+    //     SIRIUS_LOG_DEBUG("Recording value {} for idx {}", output_value.ToString(), i);
     // }
 
     // Do the same for the characeters
     result.num_bytes = cpu_data.num_bytes;
     result.data = customCudaMalloc<uint8_t>(cpu_data.num_bytes, 0, true);
-    std::cout << "Copying sizes with " << result.num_bytes << " chars" << std::endl;
+    SIRIUS_LOG_DEBUG("Copying sizes with {} chars", result.num_bytes);
     callCudaMemcpyHostToDevice<uint8_t>(result.data, cpu_data.data, cpu_data.num_bytes, 0);
 
-    std::cout << "Returning wrapper of size " << result.size << " and " << result.num_bytes << std::endl;
+    SIRIUS_LOG_DEBUG("Returning wrapper of size {} and {}", result.size, result.num_bytes);
     return result;
 }
 
@@ -501,7 +503,7 @@ DataWrapper GPUBufferManager::allocateStrColumnInGPU(DataWrapper cpu_data, int g
 DataWrapper
 GPUBufferManager::allocateColumnBufferInGPU(DataWrapper cpu_data, int gpu) {
     if(cpu_data.is_string_data) {
-        std::cout << "Calling allocateStrColumnInGPU" << std::endl;
+        SIRIUS_LOG_DEBUG("Calling allocateStrColumnInGPU");
         return allocateStrColumnInGPU(cpu_data, gpu);
     }
     
@@ -559,7 +561,7 @@ GPUBufferManager::cacheDataInGPU(DataWrapper cpu_data, string table_name, string
     transform(up_column_name.begin(), up_column_name.end(), up_column_name.begin(), ::toupper);
     auto column_it = find(tables[up_table_name]->column_names.begin(), tables[up_table_name]->column_names.end(), up_column_name);
     // for (int i = 0; i < tables[table_name]->column_names.size(); i++) {
-    //     printf("Column name: %s\n", tables[table_name]->column_names[i].c_str());
+    //     SIRIUS_LOG_DEBUG("Column name: {}", tables[table_name]->column_names[i]);
     // }
     if (column_it == tables[up_table_name]->column_names.end()) {
         throw InvalidInputException("Column not found");
@@ -575,7 +577,7 @@ GPUBufferManager::cacheDataInGPU(DataWrapper cpu_data, string table_name, string
     int column_idx = column_it - tables[up_table_name]->column_names.begin(); 
     tables[up_table_name]->columns[column_idx]->data_wrapper = gpu_allocated_buffer;
     tables[up_table_name]->columns[column_idx]->column_length = gpu_allocated_buffer.size;
-    printf("Data cached in GPU\n");
+    SIRIUS_LOG_DEBUG("Data cached in GPU");
 }
 
 void
@@ -623,14 +625,14 @@ GPUBufferManager::createTableAndColumnInGPU(Catalog& catalog, ClientContext& con
 		if (constraint->type == ConstraintType::UNIQUE) {
 			auto &pk = constraint->Cast<UniqueConstraint>();
 			if (pk.HasIndex()) {
-                printf("Unique constraint on index %d\n", pk.GetIndex().index);
+                SIRIUS_LOG_DEBUG("Unique constraint on index {}", pk.GetIndex().index);
                 for (auto &col : pk.GetColumnNames()) {
-                    printf("Unique constraint on column %s\n", col.c_str());
+                    SIRIUS_LOG_DEBUG("Unique constraint on column {}", col);
                 }
                 unique_columns.push_back(pk.GetIndex().index);
 			} else {
                 for (auto &col : pk.GetColumnNames()) {
-                    printf("Unique constraint on column %s\n", col.c_str());
+                    SIRIUS_LOG_DEBUG("Unique constraint on column {}", col);
                 }
             }
 		}
@@ -647,12 +649,12 @@ GPUBufferManager::createTableAndColumnInGPU(Catalog& catalog, ClientContext& con
         transform(up_table_name.begin(), up_table_name.end(), up_table_name.begin(), ::toupper);
         createTable(up_table_name, table.GetTypes().size());
         ColumnType column_type = convertLogicalTypeToColumnType(table.GetColumn(up_column_name).GetType());
-        printf("Creating column %s\n", up_column_name.c_str());
+        SIRIUS_LOG_DEBUG("Creating column {}", up_column_name);
         createColumn(up_table_name, up_column_name, column_type, column_id, unique_columns);
     } else {
         throw InvalidInputException("Column does not exists");
     }
-    printf("Table and column created in GPU\n");
+    SIRIUS_LOG_DEBUG("Table and column created in GPU");
 }
 
 void

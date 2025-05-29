@@ -8,6 +8,7 @@
 #include "duckdb/main/prepared_statement_data.hpp"
 #include "gpu_buffer_manager.hpp"
 #include "gpu_materialize.hpp"
+#include "log/logging.hpp"
 
 #include <unistd.h>
 
@@ -92,7 +93,7 @@ GPUPhysicalMaterializedCollector::FinalMaterializeInternal(GPUIntermediateRelati
 		T* data = reinterpret_cast<T*> (input_relation.columns[col]->data_wrapper.data);
 		uint64_t* row_ids = reinterpret_cast<uint64_t*> (input_relation.columns[col]->row_ids);
 		T* materialized;
-		// printf("input_relation.columns[col]->row_id_count %d\n", input_relation.columns[col]->row_id_count);
+		// SIRIUS_LOG_DEBUG("input_relation.columns[col]->row_id_count {}", input_relation.columns[col]->row_id_count);
 		materializeExpression<T>(data, materialized, row_ids, input_relation.columns[col]->row_id_count, input_relation.columns[col]->column_length);
 		output_relation.columns[col] = new GPUColumn(input_relation.columns[col]->row_id_count, input_relation.columns[col]->data_wrapper.type, reinterpret_cast<uint8_t*>(materialized));
 		output_relation.columns[col]->row_id_count = 0;
@@ -116,7 +117,7 @@ GPUPhysicalMaterializedCollector::FinalMaterializeString(GPUIntermediateRelation
 		size_t num_rows = input_relation.columns[col]->row_id_count;
 		uint8_t* result; uint64_t* result_offset; uint64_t* new_num_bytes;
 
-		std::cout << "Running string late materalization with " << num_rows << " rows" << std::endl;
+		SIRIUS_LOG_DEBUG("Running string late materalization with {} rows", num_rows);
 
 		materializeString(data, offset, result, result_offset, row_ids, new_num_bytes, num_rows, input_relation.columns[col]->column_length, input_relation.columns[col]->data_wrapper.num_bytes);
 
@@ -162,7 +163,7 @@ GPUPhysicalMaterializedCollector::FinalMaterialize(GPUIntermediateRelation input
 		throw NotImplementedException("Unsupported column type");
 	}
 	// output_relation.length = output_relation.columns[col]->column_length;
-	// printf("Final materialize size %d bytes\n", size_bytes);
+	// SIRIUS_LOG_DEBUG("Final materialize size {} bytes", size_bytes);
 	return size_bytes;
 }
 
@@ -275,7 +276,7 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 	}
 	auto materialize_end_time = std::chrono::high_resolution_clock::now();
 	auto materialize_duration_ms = std::chrono::duration_cast<std::chrono::microseconds>(materialize_end_time - materialize_start_time).count()/1000.0;
-	std::cout << "Result Collector CPU Materialize Time: " << materialize_duration_ms << " ms" << std::endl; 
+	SIRIUS_LOG_DEBUG("Result Collector CPU Materialize Time: {} ms", materialize_duration_ms); 
 
 	auto chunk_start_time = std::chrono::high_resolution_clock::now();
 	// // free all input relation columns
@@ -289,7 +290,7 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 	ColumnDataAppendState append_state;
 	collection->InitializeAppend(append_state);
 	size_t total_vector = (materialized_relation.columns[0]->column_length + STANDARD_VECTOR_SIZE - 1) / STANDARD_VECTOR_SIZE;
-	printf("Total vector %d\n", total_vector);
+	SIRIUS_LOG_DEBUG("Total vector {}", total_vector);
 	size_t remaining = materialized_relation.columns[0]->column_length;
 	for (uint64_t vec = 0; vec < total_vector; vec++) {
 		size_t chunk_cardinality = std::min(remaining, (size_t) STANDARD_VECTOR_SIZE);
@@ -314,12 +315,12 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 	}
 	auto chunk_end_time = std::chrono::high_resolution_clock::now();
 	auto chunking_duration_ms = std::chrono::duration_cast<std::chrono::microseconds>(chunk_end_time - chunk_start_time).count()/1000.0;
-	std::cout << "Result Collector Chunking Time: " << chunking_duration_ms << " ms" << std::endl;
+	SIRIUS_LOG_DEBUG("Result Collector Chunking Time: {} ms", chunking_duration_ms);
 
 	//measure time
 	auto end = std::chrono::high_resolution_clock::now();
 	auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-	printf("Result collector time: %.2f ms\n", duration.count()/1000.0);
+	SIRIUS_LOG_DEBUG("Result collector time: {:.2f} ms", duration.count()/1000.0);
 	return SinkResultType::FINISHED;
 }
 

@@ -7,6 +7,7 @@
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "expression_executor/gpu_expression_executor.hpp"
+#include "log/logging.hpp"
 
 namespace duckdb {
 
@@ -20,13 +21,13 @@ GPUPhysicalProjection::GPUPhysicalProjection(vector<LogicalType> types, vector<u
 
 OperatorResultType
 GPUPhysicalProjection::Execute(GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation) const {
-    printf("Executing projection\n");
+    SIRIUS_LOG_DEBUG("Executing projection");
     auto start = std::chrono::high_resolution_clock::now();
 
     // The old executor...
     // GPUExpressionExecutor old_gpu_expression_executor();
     // for (int idx = 0; idx < select_list.size(); idx++) {
-    //     printf("Executing expression: %s\n", select_list[idx]->ToString().c_str());
+    //     SIRIUS_LOG_DEBUG("Executing expression: {}", select_list[idx]->ToString());
     //     old_gpu_expression_executor->ProjectionRecursiveExpression(input_relation,
     //     output_relation, *select_list[idx], idx, 0);
     // }
@@ -37,7 +38,7 @@ GPUPhysicalProjection::Execute(GPUIntermediateRelation &input_relation, GPUInter
     
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-    printf("Projection time: %.2f ms\n", duration.count()/1000.0);
+    SIRIUS_LOG_DEBUG("Projection time: {:.2f} ms", duration.count()/1000.0);
     return OperatorResultType::FINISHED;
 }
 
