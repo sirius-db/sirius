@@ -138,7 +138,6 @@ void ResolveTypeBetweenExpression (shared_ptr<GPUColumn> column, uint64_t* &coun
     } else {
       op_mode = 10;
     }
-    // printf("Op mode %d\n", op_mode);
     comparisonConstantExpression<T>(a, b, c, row_ids, count, size, op_mode);
 }
 
@@ -182,7 +181,6 @@ void HandleBetweenExpression(shared_ptr<GPUColumn> column, uint64_t* &count, uin
 template <typename T>
 shared_ptr<GPUColumn> 
 ResolveTypeMaterializeExpression(shared_ptr<GPUColumn> column, GPUBufferManager* gpuBufferManager) {
-    // GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
     size_t size;
     T* a = nullptr;
     if (column->row_ids != nullptr) {
@@ -257,7 +255,6 @@ void HandleArbitraryConstantExpression(vector<shared_ptr<GPUColumn>> &column, ui
 
   int total_bytes = 0;
   for (int expr = 0; expr < num_expr; expr++) {
-    // printf("%d\n", filter_constant[expr]->comparison_type);
     switch(filter_constant[expr]->comparison_type) {
       case ExpressionType::COMPARE_EQUAL: {
         compare_mode[expr] = EQUAL;
@@ -600,7 +597,6 @@ GPUPhysicalTableScan::ScanDataDuckDB(GPUBufferManager* gpuBufferManager, string 
             int column_idx = column_it - gpuBufferManager->tables[up_table_name]->column_names.begin();
             ColumnType column_type = convertLogicalTypeToColumnType(scanned_types[col]);
             gpuBufferManager->tables[up_table_name]->columns[column_idx]->column_length = collection->Count();
-            // gpuBufferManager->tables[up_table_name]->length = collection->Count();
             if (scanned_types[col] == LogicalType::VARCHAR) {
               gpuBufferManager->tables[up_table_name]->columns[column_idx]->data_wrapper = DataWrapper(column_type, d_ptr[col], d_offset_ptr[col], collection->Count(), column_size[col], true);
             } else {
@@ -750,7 +746,6 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
 
       printf("Num expr %d\n", num_expr);
       if (num_expr > 0) {
-        // count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
         HandleArbitraryConstantExpression(expression_columns, count, row_ids, filter_constants, num_expr);
         // if (count[0] == 0) throw NotImplementedException("No match found");
       }
@@ -761,7 +756,6 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
       for (auto projection_id : projection_ids) {
           printf("Reading column index (late materialized) %ld and passing it to index in output relation %ld\n", column_ids[projection_id].GetPrimaryIndex(), index);
           printf("Writing row IDs to output relation in index %ld\n", index);
-          //HERE
           output_relation.columns[index] = make_shared_ptr<GPUColumn>(table->columns[column_ids[projection_id].GetPrimaryIndex()]->column_length, table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.type, table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.data,
                           table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.offset, table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.num_bytes, table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.is_string_data);
           output_relation.columns[index]->is_unique = table->columns[column_ids[projection_id].GetPrimaryIndex()]->is_unique;
@@ -779,7 +773,6 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
         for (auto column_id : column_ids) {
             printf("Reading column index (late materialized) %ld and passing it to index in output relation %ld\n", column_id.GetPrimaryIndex(), index);
             printf("Writing row IDs to output relation in index %ld\n", index);
-            //HERE
             output_relation.columns[index] = make_shared_ptr<GPUColumn>(table->columns[column_id.GetPrimaryIndex()]->column_length, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.type, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.data,
                             table->columns[column_id.GetPrimaryIndex()]->data_wrapper.offset, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.num_bytes, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.is_string_data);
             output_relation.columns[index]->is_unique = table->columns[column_id.GetPrimaryIndex()]->is_unique;
@@ -797,7 +790,6 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
       for (auto column_id : column_ids) {
           printf("Reading column index (late materialized) %ld and passing it to index in output relation %ld\n", column_id.GetPrimaryIndex(), index);
           printf("Writing row IDs to output relation in index %ld\n", index);
-          //HERE
           output_relation.columns[index] = make_shared_ptr<GPUColumn>(table->columns[column_id.GetPrimaryIndex()]->column_length, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.type, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.data,
                           table->columns[column_id.GetPrimaryIndex()]->data_wrapper.offset, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.num_bytes, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.is_string_data);
           output_relation.columns[index]->is_unique = table->columns[column_id.GetPrimaryIndex()]->is_unique;

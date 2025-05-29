@@ -57,27 +57,15 @@ __global__ void probe_multikey_count(uint64_t **keys, unsigned long long* ht, ui
             if (equal_keys == 1) slot = keys[0][tile_offset + threadIdx.x + ITEM * B] % ht_len;
             else if (equal_keys == 2) slot = hash64_multikey(keys[0][tile_offset + threadIdx.x + ITEM * B], keys[1][tile_offset + threadIdx.x + ITEM * B]) % ht_len;
             else cudaAssert(0);
-
-            // if (keys[0][tile_offset + threadIdx.x + ITEM * B] == 4701966275692616012 || keys[0][tile_offset + threadIdx.x + ITEM * B] == 4701966275692616011) {
-            //     printf("key found %ld\n", tile_offset + threadIdx.x + ITEM * B);
-            // }
-
-            // if (tile_offset + threadIdx.x + ITEM * B == 69997) {
-            //     printf("key %ld\n", keys[0][tile_offset + threadIdx.x + ITEM * B]);
-            // }
             
             while (ht[slot * n_ht_column] != 0xFFFFFFFFFFFFFFFF) {
                 bool local_found = 1;
-                // printf("key1: %lu key2: %lu ht1: %lu ht2: %lu\n", keys[0][tile_offset + threadIdx.x + ITEM * B], keys[1][tile_offset + threadIdx.x + ITEM * B], ht[slot * n_ht_column], ht[slot * n_ht_column + 1]);
                 for (int n = 0; n < num_keys; n++) {
                     uint64_t item = keys[n][tile_offset + threadIdx.x + ITEM * B];
                     if (condition_mode[n] == 0 && ht[slot * n_ht_column + n] != item) {
                         local_found = 0;
-                        // break;
                     } else if (condition_mode[n] == 1 && ht[slot * n_ht_column + n] == item) {
                         local_found = 0;
-                        // printf("key1: %lu key2: %lu ht1: %lu ht2: %lu\n", keys[0][tile_offset + threadIdx.x + ITEM * B], keys[1][tile_offset + threadIdx.x + ITEM * B], ht[slot * n_ht_column], ht[slot * n_ht_column + 1]);
-                        // break;
                     }
                 }
                 if (local_found) {
@@ -240,10 +228,6 @@ void buildHashTable(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uin
     if (is_right) cudaMemset(ht, 0xFF, ht_len * (num_keys + 2) * sizeof(unsigned long long));
     else cudaMemset(ht, 0xFF, ht_len * (num_keys + 1) * sizeof(unsigned long long));
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
-
-    // for (int idx = 0; idx < num_keys; idx++) {
-    //     print_key<<<1, 1>>>(keys_data[idx], N);
-    // }
     
     build_multikey<BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(keys_dev, ht, ht_len, N, num_keys, equal_keys, is_right);
     CHECK_ERROR();
@@ -251,8 +235,6 @@ void buildHashTable(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uin
     STOP_TIMER();
 
     cudaFree(keys_dev);
-    // print_hash_table<<<1, 1>>>(ht, ht_len * 2);
-    // cudaDeviceSynchronize();
 }
 
 void probeHashTable(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t* &row_ids_left, uint64_t* &row_ids_right, uint64_t* &count, uint64_t N, int* condition_mode, int num_keys, bool is_right) {

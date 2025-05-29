@@ -84,7 +84,7 @@ void callCudaMemcpyDeviceToHost(T* dest, T* src, size_t size, int gpu) {
     START_TIMER();
     printf("Send data to CPU\n");
     cudaSetDevice(gpu);
-    printf("size: %ld\n", size);
+    printf("Transferred bytes: %ld\n", size * sizeof(T));
     if (src == nullptr) {
         printf("src is null\n");
     }
@@ -110,7 +110,7 @@ void callCudaMemcpyDeviceToDevice(T* dest, T* src, size_t size, int gpu) {
     START_TIMER();
     printf("Send data within GPU\n");
     cudaSetDevice(gpu);
-    printf("size: %ld\n", size);
+    printf("Transferred bytes: %ld\n", size * sizeof(T));
     if (src == nullptr) {
         printf("src is null\n");
     }
