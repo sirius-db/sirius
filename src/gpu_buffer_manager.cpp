@@ -76,7 +76,6 @@ GPUBufferManager::GPUBufferManager(size_t cache_size_per_gpu, size_t processing_
     cpuProcessingPointer = 0;
 
     cuda_mr = new rmm::mr::cuda_memory_resource();
-    // mr = new rmm::mr::pool_memory_resource(cuda_mr, rmm::percent_of_free_device_memory(50));
     printf("Allocating cache size %zu in GPU 0\n", cache_size_per_gpu);
     printf("Allocating processing size %zu in GPU 0\n", processing_size_per_gpu);
     mr = new rmm::mr::pool_memory_resource(cuda_mr, processing_size_per_gpu, processing_size_per_cpu);
@@ -352,7 +351,6 @@ DataWrapper GPUBufferManager::allocateStringChunk(DataChunk &input_chunk, size_t
 
     // Now do the same for the chars
     result.num_bytes = (size_t) (curr_offset + prev_data.num_bytes);
-    // printf("Num bytes %d\n", result.num_bytes);
     uint64_t copy_offset = 0;
 
     //assuming its contiguous with prev_data
@@ -482,10 +480,6 @@ DataWrapper GPUBufferManager::allocateStrColumnInGPU(DataWrapper cpu_data, int g
     result.offset = customCudaMalloc<uint64_t>((cpu_data.size + 1), 0, true);
     std::cout << "Copying offset with " << result.size << " strings" << std::endl;
     callCudaMemcpyHostToDevice<uint64_t>(result.offset, cpu_data.offset, (cpu_data.size + 1), 0);
-    //     std::string output_str(cpu_data.data + cpu_data.offset[i], cpu_data.data + cpu_data.offset[i + 1]);
-    //     Value output_value(output_str);
-    //     std::cout << "Recording value " << output_value.ToString() << " for idx " << i << std::endl;
-    // }
 
     // Do the same for the characeters
     result.num_bytes = cpu_data.num_bytes;
@@ -558,20 +552,13 @@ GPUBufferManager::cacheDataInGPU(DataWrapper cpu_data, string table_name, string
     transform(up_table_name.begin(), up_table_name.end(), up_table_name.begin(), ::toupper);
     transform(up_column_name.begin(), up_column_name.end(), up_column_name.begin(), ::toupper);
     auto column_it = find(tables[up_table_name]->column_names.begin(), tables[up_table_name]->column_names.end(), up_column_name);
-    // for (int i = 0; i < tables[table_name]->column_names.size(); i++) {
-    //     printf("Column name: %s\n", tables[table_name]->column_names[i].c_str());
-    // }
     if (column_it == tables[up_table_name]->column_names.end()) {
         throw InvalidInputException("Column not found");
     }
     DataWrapper gpu_allocated_buffer = allocateColumnBufferInGPU(cpu_data, gpu);
-    // callCudaMemcpyHostToDevice<uint8_t>(gpu_allocated_buffer.data, cpu_data.data, cpu_data.size * cpu_data.getColumnTypeSize(), 0);
     if(!gpu_allocated_buffer.is_string_data) {
         callCudaMemcpyHostToDevice<uint8_t>(gpu_allocated_buffer.data, cpu_data.data, cpu_data.size * cpu_data.getColumnTypeSize(), 0);
     } 
-    // else {
-    //     callCudaMemcpyHostToDevice<uint8_t>(gpu_allocated_buffer.data, cpu_data.data, cpu_data.num_bytes * sizeof(uint8_t), 0);
-    // }
     int column_idx = column_it - tables[up_table_name]->column_names.begin(); 
     tables[up_table_name]->columns[column_idx]->data_wrapper = gpu_allocated_buffer;
     tables[up_table_name]->columns[column_idx]->column_length = gpu_allocated_buffer.size;

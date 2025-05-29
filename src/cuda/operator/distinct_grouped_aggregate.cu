@@ -270,7 +270,6 @@ void groupedDistinctAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t
 
             CHECK_ERROR();
 
-            printf("Count: %lu\n", h_count[0]);
             gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(distinct_boundary), 0);
             output_agg[agg] = reinterpret_cast<uint8_t*> (d_aggregates_out);
         }

@@ -41,9 +41,6 @@ void cudf_inner_join(vector<shared_ptr<GPUColumn>>& probe_keys, vector<shared_pt
 
     gpuBufferManager->rmm_stored_buffers.push_back(std::make_unique<rmm::device_buffer>(std::move(row_ids_left_buffer)));
     gpuBufferManager->rmm_stored_buffers.push_back(std::make_unique<rmm::device_buffer>(std::move(row_ids_right_buffer)));
-    // printf("row_ids_left_buffer size %ld\n", result_count * sizeof(int32_t));
-    // printf("row_ids_right_buffer size %ld\n", result_count * sizeof(int32_t));
-    // gpuBufferManager->allocation_table[0][reinterpret_cast<void*>(gpuBufferManager->rmm_stored_buffers.back()->data())] = result_count;
 
     count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
     count[0] = result_count;

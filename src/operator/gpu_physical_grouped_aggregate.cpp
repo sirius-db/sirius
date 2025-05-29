@@ -533,9 +533,6 @@ GPUPhysicalGroupedAggregate::GPUPhysicalGroupedAggregate(ClientContext &context,
 	group_by_result = make_shared_ptr<GPUIntermediateRelation>(total_output_columns);
 }
 
-// SinkResultType
-// GPUPhysicalGroupedAggregate::Sink(ExecutionContext &context, GPUIntermediateRelation& input_relation, OperatorSinkInput &input) const {
-
 SinkResultType
 GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const {
   	printf("Perform groupby and aggregation\n");
@@ -643,14 +640,11 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 	for (idx_t i = 0; i < groupings.size(); i++) {
 		for (int idx = 0; idx < grouping_sets[i].size(); idx++) {
 			//TODO: has to fix this for columns with partially NULL values
-			// group_by_result->columns[idx] = new GPUColumn(count[0], ColumnType::INT64, reinterpret_cast<uint8_t*>(group_keys[idx]));
 			if (group_by_result->columns[idx] == nullptr && group_by_column[idx]->column_length > 0 && group_by_column[idx]->data_wrapper.data != nullptr) {
 				group_by_result->columns[idx] = group_by_column[idx];
 				group_by_result->columns[idx]->row_ids = nullptr;
 				group_by_result->columns[idx]->row_id_count = 0;
 			} else if (group_by_result->columns[idx] != nullptr && group_by_column[idx]->column_length > 0 && group_by_column[idx]->data_wrapper.data != nullptr) {
-				// have to combine groupby from different meta pipelines
-				// printf("%ld\n", group_by_column[idx]->column_length);
 				group_by_result->columns[idx] = CombineColumns(group_by_result->columns[idx], group_by_column[idx], gpuBufferManager);
 			}
 
@@ -658,15 +652,12 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 	}
 
 	for (int aggr_idx = 0; aggr_idx < aggregates.size(); aggr_idx++) {
-		// group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] = new GPUColumn(count[0], ColumnType::FLOAT64, reinterpret_cast<uint8_t*>(aggregate_vals[aggr_idx]));
 		//TODO: has to fix this for columns with partially NULL values
 		if (group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] == nullptr && aggregate_column[aggr_idx]->column_length > 0 && aggregate_column[aggr_idx]->data_wrapper.data != nullptr) {
 			group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] = aggregate_column[aggr_idx];
 			group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx]->row_ids = nullptr;
 			group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx]->row_id_count = 0;
 		} else if (group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] != nullptr && aggregate_column[aggr_idx]->column_length > 0 && aggregate_column[aggr_idx]->data_wrapper.data != nullptr) {
-			// have to combine groupby from different meta pipelines
-			// printf("%ld\n", aggregate_column[aggr_idx]->column_length);
 			group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] = CombineColumns(group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx], aggregate_column[aggr_idx], gpuBufferManager);
 		}
 	}
@@ -678,16 +669,12 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
   	return SinkResultType::FINISHED;
 }
 
-// SourceResultType
-// GPUPhysicalGroupedAggregate::GetData(ExecutionContext &context, GPUIntermediateRelation &output_relation, OperatorSourceInput &input) const {
 SourceResultType
 GPUPhysicalGroupedAggregate::GetData(GPUIntermediateRelation &output_relation) const {
-//   printf("group by result size %d\n", group_by_result->columns.size());
 	if (groupings.size() > 1) throw NotImplementedException("Multiple groupings not supported yet");
 
 	for (int col = 0; col < group_by_result->columns.size(); col++) {
 		printf("Writing group by result to column %d\n", col);
-		// output_relation.columns[col] = group_by_result->columns[col];
 		bool old_unique = group_by_result->columns[col]->is_unique;
 		if (group_by_result->columns[col]->data_wrapper.type == ColumnType::VARCHAR) {
 			output_relation.columns[col] = make_shared_ptr<GPUColumn>(group_by_result->columns[col]->column_length, group_by_result->columns[col]->data_wrapper.type, group_by_result->columns[col]->data_wrapper.data,
@@ -696,14 +683,12 @@ GPUPhysicalGroupedAggregate::GetData(GPUIntermediateRelation &output_relation) c
 			output_relation.columns[col] = make_shared_ptr<GPUColumn>(group_by_result->columns[col]->column_length, group_by_result->columns[col]->data_wrapper.type, group_by_result->columns[col]->data_wrapper.data);
 		}
 		output_relation.columns[col]->is_unique = old_unique;
-		// printGPUColumn<uint64_t>(reinterpret_cast<uint64_t*>(output_relation.columns[col]->data_wrapper.data), output_relation.columns[col]->column_length, 0);
 	}
   	return SourceResultType::FINISHED;
 }
 
 void
 GPUPhysicalGroupedAggregate::SinkDistinct(GPUIntermediateRelation& input_relation) const {
-	// throw NotImplementedException("Distinct not supported yet");
 	if (groupings.size() > 1) throw NotImplementedException("Multiple groupings not supported yet");
 	for (idx_t i = 0; i < groupings.size(); i++) {
 		SinkDistinctGrouping(input_relation, i);
@@ -730,8 +715,6 @@ GPUPhysicalGroupedAggregate::SinkDistinctGrouping(GPUIntermediateRelation& input
 		auto &group = grouped_aggregate_data.groups[group_idx];
 		auto &bound_ref = group->Cast<BoundReferenceExpression>();
 		printf("Reading groupby columns from index %d and passing it to index %d in groupby result\n", bound_ref.index, group_idx);
-		// input_relation.checkLateMaterialization(bound_ref.index);
-		// group_by_result->columns[group_idx] = input_relation.columns[bound_ref.index];
 		group_by_column[group_idx] = HandleMaterializeExpression(input_relation.columns[bound_ref.index], bound_ref, gpuBufferManager);
 	}
 
@@ -739,7 +722,6 @@ GPUPhysicalGroupedAggregate::SinkDistinctGrouping(GPUIntermediateRelation& input
 	for (idx_t &idx : distinct_info.indices) {
 		auto &aggregate = grouped_aggregate_data.aggregates[idx]->Cast<BoundAggregateExpression>();
 		printf("Processing distinct aggregate %s\n", aggregate.function.name.c_str());
-		// throw NotImplementedException("Distinct not supported yet");
 
 		D_ASSERT(distinct_info.table_map.count(idx));
 
