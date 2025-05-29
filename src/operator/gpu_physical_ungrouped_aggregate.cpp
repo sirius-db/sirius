@@ -1,6 +1,7 @@
 #include "operator/gpu_physical_ungrouped_aggregate.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "gpu_materialize.hpp"
+#include "log/logging.hpp"
 
 namespace duckdb {
 
@@ -104,7 +105,7 @@ HandleAggregateExpression(vector<shared_ptr<GPUColumn>> &aggregate_keys, GPUBuff
 void
 HandleAggregateExpressionCuDF(vector<shared_ptr<GPUColumn>> &aggregate_keys, GPUBufferManager* gpuBufferManager, const vector<unique_ptr<Expression>> &aggregates) {
 	AggregationType* agg_mode = new AggregationType[aggregates.size()];
-	printf("Handling ungrouped aggregate expression\n");
+	SIRIUS_LOG_DEBUG("Handling ungrouped aggregate expression");
 	for (int agg_idx = 0; agg_idx < aggregates.size(); agg_idx++) {
 		auto& expr = aggregates[agg_idx]->Cast<BoundAggregateExpression>();
 		if (expr.function.name.compare("count") == 0 && aggregate_keys[agg_idx]->data_wrapper.data == nullptr && aggregate_keys[agg_idx]->column_length == 0) {
@@ -126,7 +127,7 @@ HandleAggregateExpressionCuDF(vector<shared_ptr<GPUColumn>> &aggregate_keys, GPU
 		} else if (expr.function.name.compare("first") == 0) {
 			agg_mode[agg_idx] = AggregationType::FIRST;
 		} else {
-			printf("Aggregate function not supported: %s\n", expr.function.name.c_str());
+			SIRIUS_LOG_DEBUG("Aggregate function not supported: {}", expr.function.name);
 			throw NotImplementedException("Aggregate function not supported");
 		}
 	}
@@ -151,7 +152,7 @@ GPUPhysicalUngroupedAggregate::GPUPhysicalUngroupedAggregate(vector<LogicalType>
 
 SinkResultType 
 GPUPhysicalUngroupedAggregate::Sink(GPUIntermediateRelation &input_relation) const {
-	printf("Performing ungrouped aggregation\n");
+	SIRIUS_LOG_DEBUG("Performing ungrouped aggregation");
 
 	if (distinct_data) {
 		SinkDistinct(input_relation);
@@ -186,17 +187,17 @@ GPUPhysicalUngroupedAggregate::Sink(GPUIntermediateRelation &input_relation) con
 
 		if (aggregate.filter) {
 			auto &bound_ref_expr = aggregate.filter->Cast<BoundReferenceExpression>();
-			printf("Reading filter column from index %ld\n", bound_ref_expr.index);
+			SIRIUS_LOG_DEBUG("Reading filter column from index {}", bound_ref_expr.index);
 		}
 
 		idx_t payload_cnt = 0;
 
-		printf("Aggregate type: %s\n", aggregate.function.name.c_str());
+		SIRIUS_LOG_DEBUG("Aggregate type: {}", aggregate.function.name);
 		if (aggregate.children.size() > 1) throw NotImplementedException("Aggregates with multiple children not supported yet");
 		for (idx_t i = 0; i < aggregate.children.size(); ++i) {
 			for (auto &child_expr : aggregate.children) {
 				D_ASSERT(child_expr->type == ExpressionType::BOUND_REF);
-				printf("Reading aggregation column from index %ld and passing it to index %ld in aggregation result\n", payload_idx + payload_cnt, aggr_idx);
+				SIRIUS_LOG_DEBUG("Reading aggregation column from index {} and passing it to index {} in aggregation result", payload_idx + payload_cnt, aggr_idx);
 				auto &bound_ref_expr = child_expr->Cast<BoundReferenceExpression>();
 				aggregate_column[aggr_idx] = HandleMaterializeExpression(input_relation.columns[payload_idx + payload_cnt], bound_ref_expr, gpuBufferManager);
 				payload_cnt++;
@@ -208,7 +209,7 @@ GPUPhysicalUngroupedAggregate::Sink(GPUIntermediateRelation &input_relation) con
 		auto &aggregate = aggregates[aggr_idx]->Cast<BoundAggregateExpression>();
 		//here we probably have count(*) or sum(*) or something like that
 		if (aggregate.children.size() == 0) {
-			printf("Passing * aggregate to index %d in aggregation result\n", aggr_idx);
+			SIRIUS_LOG_DEBUG("Passing * aggregate to index {} in aggregation result", aggr_idx);
 			aggregate_column[aggr_idx] = make_shared_ptr<GPUColumn>(column_size, ColumnType::INT64, nullptr);
 		}
 	}
@@ -241,7 +242,7 @@ GPUPhysicalUngroupedAggregate::Sink(GPUIntermediateRelation &input_relation) con
 SourceResultType
 GPUPhysicalUngroupedAggregate::GetData(GPUIntermediateRelation &output_relation) const {
   for (int col = 0; col < aggregation_result->columns.size(); col++) {
-    printf("Writing aggregation result to column %ld\n", col);
+    SIRIUS_LOG_DEBUG("Writing aggregation result to column {}", col);
 	output_relation.columns[col] = make_shared_ptr<GPUColumn>(aggregation_result->columns[col]->column_length, aggregation_result->columns[col]->data_wrapper.type, aggregation_result->columns[col]->data_wrapper.data);
   }
 
@@ -261,12 +262,12 @@ GPUPhysicalUngroupedAggregate::SinkDistinct(GPUIntermediateRelation &input_relat
 
 		if (aggregate.filter) {
 			auto &bound_ref_expr = aggregate.filter->Cast<BoundReferenceExpression>();
-			printf("Reading filter column from index %ld\n", bound_ref_expr.index);
+			SIRIUS_LOG_DEBUG("Reading filter column from index {}", bound_ref_expr.index);
 
 			for (idx_t child_idx = 0; child_idx < aggregate.children.size(); child_idx++) {
 				auto &child = aggregate.children[child_idx];
 				auto &bound_ref = child->Cast<BoundReferenceExpression>();
-				printf("Reading aggregation column from index %ld and passing it to index %ld in groupby result\n", bound_ref.index, bound_ref.index);
+				SIRIUS_LOG_DEBUG("Reading aggregation column from index {} and passing it to index {} in groupby result", bound_ref.index, bound_ref.index);
 				input_relation.checkLateMaterialization(bound_ref.index);
 				aggregation_result->columns[bound_ref.index] = input_relation.columns[bound_ref.index];
 			}
@@ -274,7 +275,7 @@ GPUPhysicalUngroupedAggregate::SinkDistinct(GPUIntermediateRelation &input_relat
 			for (idx_t child_idx = 0; child_idx < aggregate.children.size(); child_idx++) {
 				auto &child = aggregate.children[child_idx];
 				auto &bound_ref = child->Cast<BoundReferenceExpression>();
-				printf("Reading aggregation column from index %ld and passing it to index %ld in groupby result\n", bound_ref.index, bound_ref.index);
+				SIRIUS_LOG_DEBUG("Reading aggregation column from index {} and passing it to index {} in groupby result", bound_ref.index, bound_ref.index);
 				input_relation.checkLateMaterialization(bound_ref.index);
 				aggregation_result->columns[bound_ref.index] = input_relation.columns[bound_ref.index];
 			}

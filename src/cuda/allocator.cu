@@ -1,6 +1,7 @@
 #include <iostream>
 #include "operator/cuda_helper.cuh"
 #include "gpu_buffer_manager.hpp"
+#include "log/logging.hpp"
 
 namespace duckdb {
 
@@ -54,42 +55,42 @@ T* callCudaMalloc(size_t size, int gpu) {
     T* ptr;
     cudaError_t err = cudaSetDevice(gpu);
     if (err != cudaSuccess) {
-        printf("CUDA initialization error for gpu %d: %s\n", gpu, cudaGetErrorString(err));
+        SIRIUS_LOG_ERROR("CUDA initialization error for gpu {}: {}", gpu, cudaGetErrorString(err));
     }
     int nDevices;
     err = cudaGetDeviceCount(&nDevices);
     if (err != cudaSuccess) {
-        printf("CUDA error for gpu %d: %s\n", gpu, cudaGetErrorString(err));
+        SIRIUS_LOG_ERROR("CUDA error for gpu {}: {}", gpu, cudaGetErrorString(err));
     }
 
     int driverVersion = 0;
     err = cudaDriverGetVersion(&driverVersion);
     if (err != cudaSuccess) {
-        printf("CUDA driver error: %s\n", cudaGetErrorString(err));
+        SIRIUS_LOG_ERROR("CUDA driver error: {}", cudaGetErrorString(err));
     }
-    printf("Number of devices: %d\n", nDevices);
+    SIRIUS_LOG_DEBUG("Number of devices: {}", nDevices);
   
     // for (int i = 0; i < nDevices; i++) {
     //     cudaDeviceProp prop;
     //     cudaGetDeviceProperties(&prop, i);
-    //     printf("Device Number: %d\n", i);
-    //     printf("  Device name: %s\n", prop.name);
-    //     printf("  Memory Clock Rate (MHz): %d\n",
+    //     SIRIUS_LOG_DEBUG("Device Number: {}", i);
+    //     SIRIUS_LOG_DEBUG("  Device name: {}", prop.name);
+    //     SIRIUS_LOG_DEBUG("  Memory Clock Rate (MHz): {}",
     //             prop.memoryClockRate/1024);
-    //     printf("  Memory Bus Width (bits): %d\n",
+    //     SIRIUS_LOG_DEBUG("  Memory Bus Width (bits): {}",
     //             prop.memoryBusWidth);
-    //     printf("  Peak Memory Bandwidth (GB/s): %.1f\n",
+    //     SIRIUS_LOG_DEBUG("  Peak Memory Bandwidth (GB/s): {:.1f}",
     //             2.0*prop.memoryClockRate*(prop.memoryBusWidth/8)/1.0e6);
-    //     printf("  Total global memory (Gbytes) %.1f\n",(float)(prop.totalGlobalMem)/1024.0/1024.0/1024.0);
-    //     printf("  Shared memory per block (Kbytes) %.1f\n",(float)(prop.sharedMemPerBlock)/1024.0);
-    //     printf("  minor-major: %d-%d\n", prop.minor, prop.major);
-    //     printf("  Warp-size: %d\n", prop.warpSize);
-    //     printf("  Concurrent kernels: %s\n", prop.concurrentKernels ? "yes" : "no");
-    //     printf("  Concurrent computation/communication: %s\n\n",prop.deviceOverlap ? "yes" : "no");
+    //     SIRIUS_LOG_DEBUG("  Total global memory (Gbytes) {:.1f}",(float)(prop.totalGlobalMem)/1024.0/1024.0/1024.0);
+    //     SIRIUS_LOG_DEBUG("  Shared memory per block (Kbytes) {:.1f}",(float)(prop.sharedMemPerBlock)/1024.0);
+    //     SIRIUS_LOG_DEBUG("  minor-major: {}-{}\n", prop.minor, prop.major);
+    //     SIRIUS_LOG_DEBUG("  Warp-size: {}", prop.warpSize);
+    //     SIRIUS_LOG_DEBUG("  Concurrent kernels: {}", prop.concurrentKernels ? "yes" : "no");
+    //     SIRIUS_LOG_DEBUG("  Concurrent computation/communication: {}",prop.deviceOverlap ? "yes" : "no");
     // }
     CHECK_ERROR();
 
-    printf("Allocating %lu bytes on GPU %d\n", size * sizeof(T), gpu);
+    SIRIUS_LOG_DEBUG("Allocating {} bytes on GPU {}", size * sizeof(T), gpu);
     gpuErrchk(cudaMalloc((void**) &ptr, size * sizeof(T)));
     cudaDeviceSynchronize();
     cudaSetDevice(0);
@@ -99,7 +100,7 @@ T* callCudaMalloc(size_t size, int gpu) {
 template <typename T>
 T* callCudaHostAlloc(size_t size, bool return_dev_ptr) {
     T* ptr;
-    printf("Allocating %lu bytes on CPU\n", size * sizeof(T));
+    SIRIUS_LOG_DEBUG("Allocating {} bytes on CPU", size * sizeof(T));
     gpuErrchk(cudaHostAlloc((void**) &ptr, size * sizeof(T), cudaHostAllocMapped));
     if (return_dev_ptr) {
         T* return_ptr;

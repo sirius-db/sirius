@@ -2,13 +2,14 @@
 #include "gpu_physical_hash_join.hpp"
 #include "gpu_buffer_manager.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "log/logging.hpp"
 
 namespace duckdb {
 
 void cudf_inner_join(vector<shared_ptr<GPUColumn>>& probe_keys, vector<shared_ptr<GPUColumn>>& build_keys, int num_keys, uint64_t*& row_ids_left, uint64_t*& row_ids_right, uint64_t*& count) {
     GPUBufferManager *gpuBufferManager = &(GPUBufferManager::GetInstance());
     if (build_keys[0]->column_length == 0 || probe_keys[0]->column_length == 0) {
-        printf("N is 0\n");
+        SIRIUS_LOG_DEBUG("N is 0");
         count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
         count[0] = 0;
         return;
@@ -50,13 +51,13 @@ void cudf_mixed_join(vector<shared_ptr<GPUColumn>>& probe_columns, vector<shared
     
     GPUBufferManager *gpuBufferManager = &(GPUBufferManager::GetInstance());
     if (build_columns[0]->column_length == 0 || probe_columns[0]->column_length == 0) {
-        printf("N is 0\n");
+        SIRIUS_LOG_DEBUG("N is 0");
         count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
         count[0] = 0;
         return;
     }
 
-    printf("CUDF mixed join\n");
+    SIRIUS_LOG_DEBUG("CUDF mixed join");
 
     cudf::set_current_device_resource(gpuBufferManager->mr);
 

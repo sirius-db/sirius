@@ -1,12 +1,14 @@
 #include "cudf/cudf_utils.hpp"
 #include "gpu_physical_grouped_aggregate.hpp"
 #include "gpu_buffer_manager.hpp"
+#include "log/logging.hpp"
+
 namespace duckdb {
 
 void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColumn>>& aggregate_keys, uint64_t num_keys, uint64_t num_aggregates, AggregationType* agg_mode) 
 {
   if (keys[0]->column_length == 0) {
-    printf("N is 0\n");
+    SIRIUS_LOG_DEBUG("N is 0");
     for (idx_t group = 0; group < num_keys; group++) {
       bool old_unique = keys[group]->is_unique;
       if (keys[group]->data_wrapper.type == ColumnType::VARCHAR) {
@@ -52,7 +54,7 @@ void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColu
   for (int agg = 0; agg < num_aggregates; agg++) {
     requests.emplace_back(cudf::groupby::aggregation_request());
     if (aggregate_keys[agg]->data_wrapper.data == nullptr && agg_mode[agg] == AggregationType::COUNT && aggregate_keys[agg]->column_length == 0) {
-      printf("Count aggregation\n");
+      SIRIUS_LOG_DEBUG("Count aggregation");
       auto aggregate = cudf::make_sum_aggregation<cudf::groupby_aggregation>();
       requests[agg].aggregations.push_back(std::move(aggregate));
       // auto const_scalar = cudf::make_fixed_width_scalar<uint64_t>(static_cast<uint64_t>(0));

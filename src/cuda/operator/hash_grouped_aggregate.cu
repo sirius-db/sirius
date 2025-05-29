@@ -1,6 +1,7 @@
 #include "cuda_helper.cuh"
 #include "gpu_physical_grouped_aggregate.hpp"
 #include "gpu_buffer_manager.hpp"
+#include "log/logging.hpp"
 
 namespace duckdb {
 
@@ -152,7 +153,6 @@ __global__ void hash_groupby_smem(T **group_key, V** aggregate, T* max, T* min, 
             }
 
             // final_slot[ITEM] = hash_key % ht_len;
-            // printf("hash_key: %llu %llu %llu\n", group_key[0][offset], hash_key, local_ht[final_slot[ITEM] * n_ht_column]);
             cudaAssert(hash_key < ht_len);
             final_slot[ITEM] = hash_key;
 
@@ -200,7 +200,6 @@ __global__ void hash_groupby_smem(T **group_key, V** aggregate, T* max, T* min, 
                 ht[threadIdx.x * n_ht_column + n] = local_ht[threadIdx.x * n_ht_column + n];
             }
             // ht[threadIdx.x * n_ht_column + n] = local_ht[threadIdx.x * n_ht_column + n];
-            // printf("%llu %llu\n", ht[threadIdx.x * n_ht_column + n], local_ht[threadIdx.x * n_ht_column + n]);
         }
         for (int n = 0; n < num_aggregates; n++) {
             V* ptr = reinterpret_cast<V*>(ht + (threadIdx.x * n_ht_column + num_keys + n));
@@ -397,11 +396,11 @@ void hashGroupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* co
     CHECK_ERROR();
     if (N == 0) {
         count[0] = 0;
-        printf("N is 0\n");
+        SIRIUS_LOG_DEBUG("N is 0");
         return;
     }
 
-    printf("Launching Hash Grouped Aggregate Kernel\n");
+    SIRIUS_LOG_DEBUG("Launching Hash Grouped Aggregate Kernel");
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 
     T** keys_dev;
@@ -446,17 +445,17 @@ void hashGroupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* co
         C *= (max_key_host[i] - min_key_host[i] + 1);
     }
 
-    printf("N: %lu\n", N);
-    printf("max %ld min %ld\n", max_key_host[0], min_key_host[0]);
+    SIRIUS_LOG_DEBUG("N: {}", N);
+    SIRIUS_LOG_DEBUG("max {} min {}", max_key_host[0], min_key_host[0]);
 
     V init_max; V init_min;
     if constexpr (std::is_same<V, double>::value) {
         // Do something if T is int
-        std::cout << "V is double" << std::endl;
+        SIRIUS_LOG_DEBUG("V is double");
         init_max = -DBL_MAX; init_min = DBL_MAX;
     } else if constexpr (std::is_same<V, uint64_t>::value) {
         // Do something else if T is not int
-        std::cout << "V is not double" << std::endl;
+        SIRIUS_LOG_DEBUG("V is not double");
         init_max = INT_MIN; init_min = INT64_MAX;
     } else {
         assert(0);
@@ -541,7 +540,7 @@ void hashGroupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* co
 
     // CHECK_ERROR();
 
-    printf("Count: %lu\n", h_count[0]);
+    SIRIUS_LOG_DEBUG("Count: {}", h_count[0]);
 
     for (uint64_t i = 0; i < num_keys; i++) {
         gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(keys[i]), 0);

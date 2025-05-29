@@ -9,6 +9,7 @@
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "expression_executor/gpu_expression_executor.hpp"
+#include "log/logging.hpp"
 
 namespace duckdb {
 
@@ -32,7 +33,7 @@ GPUPhysicalFilter::GPUPhysicalFilter(vector<LogicalType> types, vector<unique_pt
 
 OperatorResultType 
 GPUPhysicalFilter::Execute(GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation) const {
-	printf("Executing expression %s\n", expression->ToString().c_str());
+	SIRIUS_LOG_DEBUG("Executing expression {}", expression->ToString());
   auto start = std::chrono::high_resolution_clock::now();
 
   // The new executor...
@@ -41,7 +42,7 @@ GPUPhysicalFilter::Execute(GPUIntermediateRelation &input_relation, GPUIntermedi
   
 	auto end = std::chrono::high_resolution_clock::now();
 	auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-	printf("Filter time: %.2f ms\n", duration.count()/1000.0);
+	SIRIUS_LOG_DEBUG("Filter time: {:.2f} ms", duration.count()/1000.0);
 	return OperatorResultType::FINISHED;
 }
 

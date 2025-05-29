@@ -3,6 +3,7 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "gpu_buffer_manager.hpp"
 #include "gpu_materialize.hpp"
+#include "log/logging.hpp"
 
 namespace duckdb {
 
@@ -16,7 +17,7 @@ void ResolveOrderByString(vector<shared_ptr<GPUColumn>> &sort_columns, int* sort
     col_keys[i] = curr_column->data_wrapper.data;
     col_offsets[i] = curr_column->data_wrapper.offset;
     
-    std::cout << "ResolveOrderByString: For idx " << i << " got num bytes of " << curr_column->data_wrapper.num_bytes << std::endl;
+    SIRIUS_LOG_DEBUG("ResolveOrderByString: For idx {} got num bytes of {}", i, curr_column->data_wrapper.num_bytes);
   }
   uint64_t num_rows = static_cast<uint64_t>(sort_columns[0]->column_length);
 
@@ -30,7 +31,7 @@ void ResolveOrderByString(vector<shared_ptr<GPUColumn>> &sort_columns, int* sort
     curr_column->data_wrapper.offset = col_offsets[i];
     curr_column->data_wrapper.num_bytes = col_num_bytes[i];
 
-    std::cout << "ResolveOrderByString: Wrote num bytes of " << col_num_bytes[i] << " for idx " << i << std::endl;
+    SIRIUS_LOG_DEBUG("ResolveOrderByString: Wrote num bytes of {} for idx {}", col_num_bytes[i], i);
   }
 }
 
@@ -62,7 +63,7 @@ GPUPhysicalOrder::GPUPhysicalOrder(vector<LogicalType> types, vector<BoundOrderB
 SourceResultType
 GPUPhysicalOrder::GetData(GPUIntermediateRelation &output_relation) const {
   for (int col = 0; col < sort_result->columns.size(); col++) {
-    printf("Writing order by result to column %d\n", col);
+    SIRIUS_LOG_DEBUG("Writing order by result to column {}", col);
     output_relation.columns[col] = sort_result->columns[col];
   }
 
@@ -89,7 +90,7 @@ GPUPhysicalOrder::Sink(GPUIntermediateRelation &input_relation) const {
   //   // Record the column to sort on
   //   auto &bound_ref_expr = expr.Cast<BoundReferenceExpression>();
   //   auto input_idx = bound_ref_expr.index;
-  //   printf("Reading order by keys from index %ld\n", input_idx);
+  //   SIRIUS_LOG_DEBUG("Reading order by keys from index {}", input_idx);
   //   sort_columns[idx] = HandleMaterializeExpression(
   //     input_relation.columns[input_idx], bound_ref_expr, gpuBufferManager
   //   );
@@ -104,8 +105,8 @@ GPUPhysicalOrder::Sink(GPUIntermediateRelation &input_relation) const {
   //     sort_type = 1;
   //   }
   //   sort_orders[idx] = sort_type;
-  //   printf(
-  //     "Order By got sort column: Col Length - %d, Size - %d, Bytes - %d, Sort Order - %d\n", 
+  //   SIRIUS_LOG_DEBUG(
+  //     "Order By got sort column: Col Length - {}, Size - {}, Bytes - {}, Sort Order - {}\n", 
   //     (int) sort_columns[idx]->column_length, (int) sort_columns[idx]->data_wrapper.size,  
   //     (int) sort_columns[idx]->data_wrapper.num_bytes, sort_orders[idx]
   //   );

@@ -1,6 +1,7 @@
 #include "cuda_helper.cuh"
 #include "gpu_physical_ungrouped_aggregate.hpp"
 #include "gpu_buffer_manager.hpp"
+#include "log/logging.hpp"
 
 namespace duckdb {
 
@@ -90,11 +91,11 @@ template <typename T>
 void ungroupedAggregate(uint8_t **a, uint8_t **result, uint64_t N, int* agg_mode, int num_aggregates) {
     CHECK_ERROR();
     if (N == 0) {
-        printf("N is 0\n");
+        SIRIUS_LOG_DEBUG("N is 0");
         return;
     }
-    printf("Launching Aggregation Kernel\n");
-    printf("N: %ld\n", N);
+    SIRIUS_LOG_DEBUG("Launching Aggregation Kernel");
+    SIRIUS_LOG_DEBUG("N: {}", N);
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 
@@ -138,14 +139,14 @@ void ungroupedAggregate(uint8_t **a, uint8_t **result, uint64_t N, int* agg_mode
                 T* result_host_temp = new T[1];
                 cudaMemcpy(result_host_temp, result_temp, sizeof(T), cudaMemcpyDeviceToHost);
                 T avg = result_host_temp[0] / N;
-                // printf("Result: %.2f and N: %d\n", result_host_temp[0], N);
+                // SIRIUS_LOG_DEBUG("Result: {:.2f} and N: {}", result_host_temp[0], N);
                 cudaMemcpy(result_temp, &avg, sizeof(T), cudaMemcpyHostToDevice);
                 CHECK_ERROR();
                 cudaDeviceSynchronize();
             } 
             result[agg] = reinterpret_cast<uint8_t*> (result_temp);
         } else {
-            printf("Unsupported aggregation mode\n");
+            SIRIUS_LOG_DEBUG("Unsupported aggregation mode");
             return;
         }
     }

@@ -1,6 +1,7 @@
 #include "cuda_helper.cuh"
 #include "gpu_physical_table_scan.hpp"
 #include "gpu_buffer_manager.hpp"
+#include "log/logging.hpp"
 
 #include <thrust/device_vector.h>
 #include <thrust/copy.h>
@@ -231,7 +232,7 @@ __global__ void table_scan_expression(uint8_t **col, uint64_t** offset, uint8_t 
 __global__ void print_columns(uint8_t **col, uint64_t** offset, uint64_t N) {
     if (threadIdx.x == 0) {
         for (int i = 0; i < 100; i++) {
-            printf("%ld\n", (reinterpret_cast<uint64_t*>(col[0]))[i]);
+            // FIXME: do this in cpu code using logging
         }
     }
 }
@@ -245,10 +246,10 @@ __global__ void print_columns(uint8_t **col, uint64_t** offset, uint64_t N) {
 //         uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
 //         h_count[0] = 0;
 //         count = h_count;
-//         printf("N is 0\n");
+//         SIRIUS_LOG_DEBUG("N is 0");
 //         return;
 //     }
-//     printf("Launching Arbitrary Table Scan Kernel\n");
+//     SIRIUS_LOG_DEBUG("Launching Arbitrary Table Scan Kernel");
 //     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 
 //     uint64_t constant_size = constant_offset[num_expr];
@@ -275,8 +276,8 @@ __global__ void print_columns(uint8_t **col, uint64_t** offset, uint64_t N) {
 //     //         d_col, d_offset, d_constant_compare, d_constant_offset, d_data_type, row_ids, (unsigned long long*) count, N, d_compare_mode, 1, num_expr);
 //     // CHECK_ERROR();
 //     size_t openmalloc_full = (gpuBufferManager->processing_size_per_gpu - gpuBufferManager->gpuProcessingPointer[0] - 1024) / sizeof(uint64_t);
-//     // printf("openmalloc_full: %zu\n", openmalloc_full);
-//     // printf("gpuBufferManager->gpuProcessingPointer[0]: %zu\n", gpuBufferManager->gpuProcessingPointer[0]);
+//     // SIRIUS_LOG_DEBUG("openmalloc_full: {}", openmalloc_full);
+//     // SIRIUS_LOG_DEBUG("gpuBufferManager->gpuProcessingPointer[0]: {}", gpuBufferManager->gpuProcessingPointer[0]);
 //     row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(openmalloc_full, 0, 0);
 
 //     // uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
@@ -292,7 +293,7 @@ __global__ void print_columns(uint8_t **col, uint64_t** offset, uint64_t N) {
 //     CHECK_ERROR();
 //     gpuBufferManager->gpuProcessingPointer[0] = (reinterpret_cast<uint8_t*>(row_ids + h_count[0]) - gpuBufferManager->gpuProcessing[0]);
 //     count = h_count;
-//     printf("Count: %lu\n", h_count[0]); 
+//     SIRIUS_LOG_DEBUG("Count: {}", h_count[0]); 
 // }
 
 void 
@@ -305,10 +306,10 @@ tableScanExpression(uint8_t **col, uint64_t** offset, uint8_t *constant_compare,
         uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
         h_count[0] = 0;
         count = h_count;
-        printf("N is 0\n");
+        SIRIUS_LOG_DEBUG("N is 0");
         return;
     }
-    printf("Launching Arbitrary Table Scan Kernel\n");
+    SIRIUS_LOG_DEBUG("Launching Arbitrary Table Scan Kernel");
 
     uint64_t constant_size = constant_offset[num_expr];
     uint8_t* d_constant_compare = gpuBufferManager->customCudaMalloc<uint8_t>(constant_size, 0, 0);
@@ -356,7 +357,7 @@ tableScanExpression(uint8_t **col, uint64_t** offset, uint8_t *constant_compare,
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_constant_offset), 0);
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_compare_mode), 0);
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_data_type), 0);
-    printf("Count: %lu\n", h_count[0]); 
+    SIRIUS_LOG_DEBUG("Count: {}", h_count[0]); 
 }
 
 } // namespace duckdb

@@ -117,7 +117,7 @@ void orderByString(uint8_t** col_keys, uint64_t** col_offsets, int* sort_orders,
     cudaMemcpy(d_sort_orders, sort_orders, num_cols * sizeof(int), cudaMemcpyHostToDevice);
     auto preprocess_end_time = high_resolution_clock::now();
     auto preprocess_time_ms = std::chrono::duration_cast<duration<double, std::milli>>(preprocess_end_time - preprocess_start_time).count();
-    std::cout << "STRING ORDER BY: Preprocessing took " << preprocess_time_ms << " ms" << std::endl;
+    SIRIUS_LOG_DEBUG("STRING ORDER BY: Preprocessing took {} ms", preprocess_time_ms);
 
     // Now sort those row ids using the custom comparator
     auto sort_start_time = high_resolution_clock::now();
@@ -148,7 +148,7 @@ void orderByString(uint8_t** col_keys, uint64_t** col_offsets, int* sort_orders,
 
     auto sort_end_time = high_resolution_clock::now();
     auto sort_time_ms = std::chrono::duration_cast<duration<double, std::milli>>(sort_end_time - sort_start_time).count();
-    std::cout << "STRING ORDER BY: Sorting required " << sort_temp_storage_bytes << " bytes and took " << sort_time_ms << " ms" << std::endl;
+    SIRIUS_LOG_DEBUG("STRING ORDER BY: Sorting required {} bytes and took {} ms", sort_temp_storage_bytes, sort_time_ms);
 
     for(uint64_t i = 0; i < num_cols; i++) {
         // Get the original column

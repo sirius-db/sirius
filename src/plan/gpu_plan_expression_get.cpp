@@ -8,6 +8,7 @@
 #include "gpu_physical_column_data_scan.hpp"
 #include "gpu_buffer_manager.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "log/logging.hpp"
 
 namespace duckdb {
 
@@ -41,7 +42,7 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::CreatePlan(LogicalExpr
     GPUBufferManager *gpuBufferManager = &(GPUBufferManager::GetInstance());
     cudf::set_current_device_resource(gpuBufferManager->mr);
     for (idx_t expression_idx = 0; expression_idx < op.expressions.size(); expression_idx++) {
-        printf("Expression idx: %d\n", expression_idx);
+        SIRIUS_LOG_DEBUG("Expression idx: {}", expression_idx);
         if (op.expressions[expression_idx].size() > 1) {
             throw NotImplementedException("Expression get not supported");
         }

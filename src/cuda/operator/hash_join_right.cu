@@ -1,6 +1,7 @@
 #include "cuda_helper.cuh"
 #include "gpu_physical_hash_join.hpp"
 #include "gpu_buffer_manager.hpp"
+#include "log/logging.hpp"
 
 namespace duckdb {
 
@@ -144,10 +145,10 @@ void scanHashTableRight(unsigned long long* ht, uint64_t ht_len, uint64_t* &row_
         uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
         h_count[0] = 0;
         count = h_count;
-        printf("N is 0\n");
+        SIRIUS_LOG_DEBUG("N is 0");
         return;
     }
-    printf("Launching Scan Kernel\n");
+    SIRIUS_LOG_DEBUG("Launching Scan Kernel");
     SETUP_TIMING();
     START_TIMER();
     count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
@@ -167,7 +168,7 @@ void scanHashTableRight(unsigned long long* ht, uint64_t ht_len, uint64_t* &row_
     scan_right<BLOCK_THREADS, ITEMS_PER_THREAD><<<(ht_len + tile_items - 1)/tile_items, BLOCK_THREADS>>>(ht, (unsigned long long*) count, ht_len, row_ids, num_keys, join_mode, 0);
     CHECK_ERROR();
     cudaDeviceSynchronize();
-    printf("Scan Count: %lu\n", h_count[0]);
+    SIRIUS_LOG_DEBUG("Scan Count: {}", h_count[0]);
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(count), 0);
     count = h_count;
 
@@ -181,10 +182,10 @@ void scanHashTableRight(unsigned long long* ht, uint64_t ht_len, uint64_t* &row_
 void probeHashTableRightSemiAnti(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t N, int* condition_mode, int num_keys) {
     CHECK_ERROR();
     if (N == 0) {
-        printf("N is 0\n");
+        SIRIUS_LOG_DEBUG("N is 0");
         return;
     }
-    printf("Launching Probe Kernel\n");
+    SIRIUS_LOG_DEBUG("Launching Probe Kernel");
     SETUP_TIMING();
     START_TIMER();
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
@@ -212,7 +213,7 @@ void probeHashTableRightSemiAnti(uint8_t **keys, unsigned long long* ht, uint64_
     CHECK_ERROR();
     cudaDeviceSynchronize();
 
-    printf("Finished probe right\n");
+    SIRIUS_LOG_DEBUG("Finished probe right");
     STOP_TIMER();
     cudaFree(keys_dev);
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(condition_mode_dev), 0);
