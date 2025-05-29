@@ -85,7 +85,7 @@ void callCudaMemcpyDeviceToHost(T* dest, T* src, size_t size, int gpu) {
     START_TIMER();
     SIRIUS_LOG_DEBUG("Send data to CPU");
     cudaSetDevice(gpu);
-    SIRIUS_LOG_DEBUG("size: {}", size);
+    SIRIUS_LOG_DEBUG("Transferred bytes: {}", size * sizeof(T));
     if (src == nullptr) {
         SIRIUS_LOG_DEBUG("src is null");
     }
@@ -111,7 +111,7 @@ void callCudaMemcpyDeviceToDevice(T* dest, T* src, size_t size, int gpu) {
     START_TIMER();
     SIRIUS_LOG_DEBUG("Send data within GPU");
     cudaSetDevice(gpu);
-    SIRIUS_LOG_DEBUG("size: {}", size);
+    SIRIUS_LOG_DEBUG("Transferred bytes: {}", size * sizeof(T));
     if (src == nullptr) {
         SIRIUS_LOG_DEBUG("src is null");
     }

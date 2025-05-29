@@ -22,7 +22,6 @@ ResolveTypeMaterializeExpression(shared_ptr<GPUColumn> column, BoundReferenceExp
     }
     shared_ptr<GPUColumn> result = make_shared_ptr<GPUColumn>(size, column->data_wrapper.type, reinterpret_cast<uint8_t*>(a));
     result->is_unique = column->is_unique;
-    // result->rmm_owned_buffer = std::move(column->rmm_owned_buffer);
     return result;
 }
 
@@ -49,10 +48,8 @@ ResolveTypeMaterializeString(shared_ptr<GPUColumn> column, BoundReferenceExpress
         new_num_bytes = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
         new_num_bytes[0] = column->data_wrapper.num_bytes;
     }
-    // SIRIUS_LOG_DEBUG("Materialized string column with size {}", new_num_bytes[0]);
     shared_ptr<GPUColumn> result = make_shared_ptr<GPUColumn>(size, column->data_wrapper.type, a, result_offset, new_num_bytes[0], column->data_wrapper.is_string_data);
     result->is_unique = column->is_unique;
-    // result->rmm_owned_buffer = std::move(column->rmm_owned_buffer);
     return result;
 }
 

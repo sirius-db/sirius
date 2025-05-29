@@ -201,10 +201,6 @@ __global__ void rows_to_columns_string(uint64_t* group_idx, sort_keys_type_strin
                     memcpy(col_keys[key] + out_offset, ptr + key_length_bytes, actual_key_length * sizeof(uint8_t));
                     key_length_bytes += key_length[key];
                 }
-                // char temp1[5];
-                // char temp2[18];
-                // memcpy(temp1, col_keys[0] + group_byte_offset[0][offset], 5);
-                // memcpy(temp2, col_keys[1] + group_byte_offset[1][offset], 18);
             }
         }
     }
@@ -468,8 +464,6 @@ void groupedStringAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t**
     total_length += row_id_size;
     uint64_t meta_num_keys = (total_length + sizeof(uint64_t) - 1) / sizeof(uint64_t);
     uint64_t total_length_bytes = meta_num_keys * sizeof(uint64_t);
-    // SIRIUS_LOG_DEBUG("Total Length: {}", total_length);
-    // SIRIUS_LOG_DEBUG("Total Length Bytes: {}", total_length_bytes);
 
     //allocate temp memory and copying keys
     uint8_t* row_keys = gpuBufferManager->customCudaMalloc<uint8_t>((total_length_bytes) * N, 0, 0);
@@ -843,11 +837,6 @@ void groupedStringAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t**
             group_idx, group_by_rows, keys_dev_result, group_byte_offset_dev, key_length, N, num_keys);
 
     CHECK_ERROR();
-
-    // testprint<uint64_t><<<1, 1>>>(group_idx, N);
-    // testprint<double><<<1, 1>>>(reinterpret_cast<double*> (aggregate_keys[0]), N);
-    // testprint<uint64_t><<<1, 1>>>(offset[1], N);
-    // CHECK_ERROR();
 
     for (int agg = 0; agg < num_aggregates; agg++) {
         if (agg_mode[agg] >= 0 && agg_mode[agg] <= 3) {

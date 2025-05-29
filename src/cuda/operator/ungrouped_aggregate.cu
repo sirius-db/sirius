@@ -144,14 +144,6 @@ void ungroupedAggregate(uint8_t **a, uint8_t **result, uint64_t N, int* agg_mode
                 CHECK_ERROR();
                 cudaDeviceSynchronize();
             } 
-            // else {
-                // T* result_host_temp = new T[1];
-                // cudaMemcpy(result_host_temp, result_temp, sizeof(T), cudaMemcpyDeviceToHost);
-                // CHECK_ERROR();
-                // cudaDeviceSynchronize();
-                // SIRIUS_LOG_DEBUG("Result: {:.2f} and N: {}", result_host_temp[0], N);
-                // SIRIUS_LOG_DEBUG("Result: {} and N: {}", reinterpret_cast<uint64_t*>(result_host_temp)[0], N);
-            // }
             result[agg] = reinterpret_cast<uint8_t*> (result_temp);
         } else {
             SIRIUS_LOG_DEBUG("Unsupported aggregation mode");

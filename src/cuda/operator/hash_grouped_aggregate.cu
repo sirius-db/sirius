@@ -391,25 +391,6 @@ __global__ void get_min_max(T *keys, T* res_max, T* res_min, uint64_t N) {
     }
 }
 
-// __global__ void print_hash_table_group(unsigned long long* a, uint64_t N, uint64_t num_keys, uint64_t num_aggregates, bool need_count) {
-//     if (blockIdx.x == 0 && threadIdx.x == 0) {
-//         for (uint64_t i = 0; i < N; i++) {
-//             // for (uint64_t j = 0; j < num_keys + num_aggregates + need_count; j++) {
-//             //     FIXME: do this in cpu code using logging
-//             // }
-//         }
-//     }
-// }
-
-// template <typename V>
-// __global__ void print_column_agg(V* a, uint64_t N) {
-//     if (blockIdx.x == 0 && threadIdx.x == 0) {
-//         for (uint64_t i = 0; i < N; i++) {
-//             //     FIXME: do this in cpu code using logging
-//         }
-//     }
-// }
-
 template <typename T, typename V>
 void hashGroupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count, uint64_t N, uint64_t num_keys, uint64_t num_aggregates, int* agg_mode) {
     CHECK_ERROR();

@@ -172,10 +172,6 @@ void scanHashTableRight(unsigned long long* ht, uint64_t ht_len, uint64_t* &row_
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(count), 0);
     count = h_count;
 
-    // thrust::device_vector<uint64_t> sorted_keys(row_ids, row_ids + h_count[0]);
-    // thrust::sort(thrust::device, sorted_keys.begin(), sorted_keys.end());
-    // uint64_t* raw_row_ids = thrust::raw_pointer_cast(sorted_keys.data());
-    // testprint<<<1, 1>>>(raw_row_ids, h_count[0]);
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(ht), 0);
 
     CHECK_ERROR();
