@@ -33,8 +33,6 @@ libcudf will be installed via conda/miniconda. Miniconda can be downloaded [here
 conda create --name libcudf-env
 conda activate libcudf-env
 conda install -c rapidsai -c conda-forge -c nvidia rapidsai::libcudf
-# The versions of spdlog and fmt from conda conflict with the versions used by Sirius
-conda remove spdlog fmt --force
 ```
 Set the environment variables `USE_CUDF` to 1 and `LIBCUDF_ENV_PREFIX` to the conda environment's path. For example, if we installed miniconda in `~/miniconda3` and installed libcudf in the conda environment `libcudf-env`, then we would set the `LIBCUDF_ENV_PREFIX` to `~/miniconda3/envs/libcudf-env`.
 ```
