@@ -59,11 +59,6 @@ std::tuple<char*, uint64_t*, uint64_t> PerformSubstring(char* char_data, uint64_
     get_new_length<<<blocks_needed, THREADS_PER_BLOCK>>>(str_indices, new_len, num_strings, start_idx, length);
     cudaDeviceSynchronize();
     CHECK_ERROR();
-
-    // Perform the prefix sum to get the updated offsets
-    // thrust::device_ptr<uint64_t> offsets_device_ptr(updated_offsets);
-    // uint64_t total_chars = thrust::reduce(offsets_device_ptr, offsets_device_ptr + num_strings, (uint64_t) 0, thrust::plus<uint64_t>());
-    // thrust::exclusive_scan(offsets_device_ptr, offsets_device_ptr + num_strings, offsets_device_ptr);
     //cub scan
     void* d_temp_storage = nullptr;
     size_t temp_storage_bytes = 0;

@@ -114,9 +114,7 @@ GPUColumn::setFromCudfColumn(cudf::column& cudf_column, bool _is_unique, int32_t
     cudf::data_type col_type = cudf_column.type();
     cudf::size_type col_size = cudf_column.size();
     cudf::column::contents cont = cudf_column.release();
-    // rmm_owned_buffer = std::move(cont.data);
     gpuBufferManager->rmm_stored_buffers.push_back(std::move(cont.data));
-    // SIRIUS_LOG_DEBUG("rmm_stored_buffers size {}", gpuBufferManager->rmm_stored_buffers.back()->size());
 
     data_wrapper.data = reinterpret_cast<uint8_t*>(gpuBufferManager->rmm_stored_buffers.back()->data());
     data_wrapper.size = col_size;
@@ -126,7 +124,6 @@ GPUColumn::setFromCudfColumn(cudf::column& cudf_column, bool _is_unique, int32_t
     if (col_type == cudf::data_type(cudf::type_id::STRING)) {
         cudf::column::contents child_cont = cont.children[0]->release();
         gpuBufferManager->rmm_stored_buffers.push_back(std::move(child_cont.data));
-        // SIRIUS_LOG_DEBUG("rmm_stored_buffers size {}", gpuBufferManager->rmm_stored_buffers.back()->size());
         data_wrapper.is_string_data = true;
         data_wrapper.type = ColumnType::VARCHAR;
         int32_t* temp_offset = reinterpret_cast<int32_t*>(gpuBufferManager->rmm_stored_buffers.back()->data());

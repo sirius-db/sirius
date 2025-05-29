@@ -36,10 +36,6 @@ GPUPhysicalFilter::Execute(GPUIntermediateRelation &input_relation, GPUIntermedi
 	SIRIUS_LOG_DEBUG("Executing expression {}", expression->ToString());
   auto start = std::chrono::high_resolution_clock::now();
 
-  // The old executor...
-  // GPUExpressionExecutor old_gpu_expression_executor();
-  // old_gpu_expression_executor->FilterRecursiveExpression(input_relation, output_relation, *expression, 0);
-
   // The new executor...
   sirius::GpuExpressionExecutor gpu_expression_executor(*expression.get());
   gpu_expression_executor.Select(input_relation, output_relation);

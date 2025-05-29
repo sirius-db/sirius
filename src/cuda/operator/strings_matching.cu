@@ -140,7 +140,6 @@ void StringMatching(char* char_data, uint64_t* str_indices, std::string match_st
   bool* d_answers = reinterpret_cast<bool*> (gpuBufferManager->customCudaMalloc<uint8_t>(num_strings, 0, 0));
   cudaMemset(d_answers, 0, num_strings * sizeof(bool));
   // TODO: Do it twice for more accurate allocation
-  // uint64_t* d_matching_rows = gpuBufferManager->customCudaMalloc<uint64_t>(num_strings, 0, 0);
 
   // Copy over the data to the buffers
   cudaMemcpy(d_kmp_automato, kmp_automato, kmp_automato_size * sizeof(int), cudaMemcpyHostToDevice);
@@ -160,7 +159,6 @@ void StringMatching(char* char_data, uint64_t* str_indices, std::string match_st
   cudaDeviceSynchronize();
   auto preprocessing_end = std::chrono::high_resolution_clock::now();
   int preprocessing_time_us = std::chrono::duration_cast<std::chrono::microseconds>(preprocessing_end - preprocessing_start).count();
-  // SIRIUS_LOG_DEBUG("String matching preprocessing took {} ms", preprocessing_time_us/1000.0);
 
   auto str_match_start = std::chrono::high_resolution_clock::now();
   uint64_t block_sub_chunk_size = (CHUNK_SIZE + THREADS_PER_BLOCK_STRINGS - 1)/THREADS_PER_BLOCK_STRINGS;
@@ -169,7 +167,6 @@ void StringMatching(char* char_data, uint64_t* str_indices, std::string match_st
   cudaDeviceSynchronize();
   auto str_match_end = std::chrono::high_resolution_clock::now();
   int str_match_time_us = std::chrono::duration_cast<std::chrono::microseconds>(str_match_end - str_match_start).count();
-  // SIRIUS_LOG_DEBUG("Actual String matching took {} ms", str_match_time_us/1000.0);
   CHECK_ERROR();
 
   cudaMemset(count, 0, sizeof(uint64_t));
@@ -194,7 +191,6 @@ void StringMatching(char* char_data, uint64_t* str_indices, std::string match_st
   gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(count), 0);
   count = h_count;
   SIRIUS_LOG_DEBUG("Count = {}", h_count[0]);
-  // SIRIUS_LOG_DEBUG("Finished single term string matching");
 }
 
 __global__ void multi_term_kmp_kernel(char* char_data, uint64_t* indices, int* kmp_automato, uint64_t* worker_start_term, 
@@ -336,8 +332,7 @@ void MultiStringMatching(char* char_data, uint64_t* str_indices, std::vector<std
   for(int i = 0; i < num_terms; i++) {
     // Determine the current terms variables
     int curr_term_length = all_terms[i].size();
-    int* curr_term_automato = d_all_automatos[i]; 
-    // SIRIUS_LOG_DEBUG("MULTI TERM ITERATION {} GOT MATCH TERM OF LEN {}", i, curr_term_length);
+    int* curr_term_automato = d_all_automatos[i];
 
     // Perform pre processing
     cudaMemset(d_found_answer, 0, num_strings * sizeof(bool));
@@ -352,11 +347,9 @@ void MultiStringMatching(char* char_data, uint64_t* str_indices, std::vector<std
 
     // If there are future terms, the make the current answer the prev term answers
     if(i < (num_terms - 1)) {
-      // SIRIUS_LOG_DEBUG("PRE SWAP PTRS: Answer - {}, Prev - {}", (void*) d_answer_idxs, (void*) d_prev_term_answers);
       uint64_t* temp_ptr = d_answer_idxs;
       d_answer_idxs = d_prev_term_answers;
       d_prev_term_answers = temp_ptr;
-      // SIRIUS_LOG_DEBUG("POST SWAP PTRS: Answer - {}, Prev - {}", (void*) d_answer_idxs, (void*) d_prev_term_answers);
     }
   }
 

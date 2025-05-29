@@ -25,7 +25,6 @@ __global__ void materialize_expression(const T *a, T* result, uint64_t *row_ids,
         if (threadIdx.x + ITEM * B < num_tile_items) {
             int items_ids = row_ids[tile_offset + threadIdx.x + ITEM * B];
             result[tile_offset + threadIdx.x + ITEM * B] = a[items_ids];
-            // cudaAssert(a[items_ids] == 19940101);
         }
     }
 
@@ -72,23 +71,11 @@ void materializeExpression(T *a, T*& result, uint64_t *row_ids, uint64_t result_
     SETUP_TIMING();
     START_TIMER();
     SIRIUS_LOG_DEBUG("Launching Materialize Kernel");
-    // SETUP_TIMING();
-    // START_TIMER();
-    // SIRIUS_LOG_DEBUG("result_len: {}", N);
-    // testprintmat<T><<<1, 1>>>(a, N);
-    // CHECK_ERROR();
-    // testprintmat<uint64_t><<<1, 1>>>(row_ids, N);
-    // CHECK_ERROR();
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
     result = gpuBufferManager->customCudaMalloc<T>(result_len, 0, 0);
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
     materialize_expression<T, BLOCK_THREADS, ITEMS_PER_THREAD><<<(result_len + tile_items - 1)/tile_items, BLOCK_THREADS>>>(a, result, row_ids, result_len);
     CHECK_ERROR();
-    // thrust::device_vector<T> sorted(result, result + N);
-    // thrust::sort(thrust::device, sorted.begin(), sorted.end());
-    // T* raw_sorted = thrust::raw_pointer_cast(sorted.data());
-    // cudaMemcpy(result, raw_sorted, N * sizeof(T), cudaMemcpyDeviceToDevice);
-    // testprintmat<T><<<1, 1>>>(result, 100);
     cudaDeviceSynchronize();
     STOP_TIMER();
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(a), 0);
@@ -103,8 +90,6 @@ void materializeString(uint8_t* data, uint64_t* offset, uint8_t* &result, uint64
     SETUP_TIMING();
     START_TIMER();
     SIRIUS_LOG_DEBUG("Launching Materialize String Kernel");
-    // SETUP_TIMING();
-    // START_TIMER();
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
     //allocate temp memory and copying keys
     uint64_t* temp_len = gpuBufferManager->customCudaMalloc<uint64_t>(result_len + 1, 0, 0);
@@ -131,11 +116,8 @@ void materializeString(uint8_t* data, uint64_t* offset, uint8_t* &result, uint64
     cub::DeviceScan::ExclusiveSum(d_temp_storage, temp_storage_bytes, temp_len, result_offset, result_len + 1);
     CHECK_ERROR();
 
-    // testprintmat<uint64_t><<<1, 1>>>(result_offset, N + 1);
-
     result_bytes = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
     cudaMemcpy(result_bytes, result_offset + result_len, sizeof(uint64_t), cudaMemcpyDeviceToHost);
-    // SIRIUS_LOG_DEBUG("Got new chars len of {}", new_num_bytes[0]);
 
     CHECK_ERROR();
 

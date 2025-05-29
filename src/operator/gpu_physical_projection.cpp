@@ -15,22 +15,12 @@ GPUPhysicalProjection::GPUPhysicalProjection(vector<LogicalType> types, vector<u
                                        idx_t estimated_cardinality)
     : GPUPhysicalOperator(PhysicalOperatorType::PROJECTION, std::move(types), estimated_cardinality),
       select_list(std::move(select_list)) {
-
-    //gpu_expression_executor = new GPUExpressionExecutor();
 }
 
 OperatorResultType
 GPUPhysicalProjection::Execute(GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation) const {
     SIRIUS_LOG_DEBUG("Executing projection");
     auto start = std::chrono::high_resolution_clock::now();
-
-    // The old executor...
-    // GPUExpressionExecutor old_gpu_expression_executor();
-    // for (int idx = 0; idx < select_list.size(); idx++) {
-    //     SIRIUS_LOG_DEBUG("Executing expression: {}", select_list[idx]->ToString());
-    //     old_gpu_expression_executor->ProjectionRecursiveExpression(input_relation,
-    //     output_relation, *select_list[idx], idx, 0);
-    // }
 
     // The new executor...
     sirius::GpuExpressionExecutor gpu_expression_executor(select_list);
