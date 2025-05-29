@@ -2,6 +2,7 @@
 #include "gpu_physical_substring.hpp"
 #include "gpu_buffer_manager.hpp"
 #include "gpu_columns.hpp"
+#include "log/logging.hpp"
 
 #define THREADS_PER_BLOCK 512
 
@@ -42,12 +43,12 @@ std::tuple<char*, uint64_t*, uint64_t> PerformSubstring(char* char_data, uint64_
   uint64_t start_idx, uint64_t length) {
     CHECK_ERROR();
     if (num_strings == 0) {
-        printf("N is 0\n");
+        SIRIUS_LOG_DEBUG("N is 0");
         char* empty = nullptr;
         uint64_t* empty_offset = nullptr;
         return std::make_tuple(empty, empty_offset, 0);
     }
-    printf("Launching substring kernel\n");
+    SIRIUS_LOG_DEBUG("Launching substring kernel");
 
     // Get the write offsets
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());

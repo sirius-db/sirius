@@ -1,5 +1,6 @@
 #include "../operator/cuda_helper.cuh"
 #include "gpu_expression_executor.hpp"
+#include "log/logging.hpp"
 
 // l_extendedprice * (1 - l_discount)
 // #4 * (1 + l_tax)
@@ -176,10 +177,10 @@ __global__ void extract_year<BLOCK_THREADS, ITEMS_PER_THREAD>(uint64_t *date, ui
 void commonArithmeticExpression(double *a, double *b, double* c, double* d, double *result, uint64_t N, int op_mode) {
     CHECK_ERROR();
     if (N == 0) {
-        printf("N is 0\n");
+        SIRIUS_LOG_DEBUG("N is 0");
         return;
     }
-    printf("Launching Binary Expression Kernel\n");
+    SIRIUS_LOG_DEBUG("Launching Binary Expression Kernel");
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
     common_arithmetic_expression<double, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(a, b, c, d, result, N, op_mode);
     CHECK_ERROR();
@@ -190,10 +191,10 @@ void commonArithmeticExpression(double *a, double *b, double* c, double* d, doub
 void extractYear(uint64_t* date, uint64_t *year, uint64_t N) {
     CHECK_ERROR();
     if (N == 0) {
-        printf("N is 0\n");
+        SIRIUS_LOG_DEBUG("N is 0");
         return;
     }
-    printf("Launching Extract Year Kernel\n");
+    SIRIUS_LOG_DEBUG("Launching Extract Year Kernel");
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
     extract_year<BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(date, year, N);
     CHECK_ERROR();
@@ -204,10 +205,10 @@ void extractYear(uint64_t* date, uint64_t *year, uint64_t N) {
 void commonCaseExpression(uint64_t *a, uint64_t *b, double *result, uint64_t N, int op_mode) {
     CHECK_ERROR();
     if (N == 0) {
-        printf("N is 0\n");
+        SIRIUS_LOG_DEBUG("N is 0");
         return;
     }
-    printf("Launching Common Case Expression Kernel\n");
+    SIRIUS_LOG_DEBUG("Launching Common Case Expression Kernel");
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
     common_case_expression<BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(a, b, result, N, op_mode);
     CHECK_ERROR();
@@ -218,10 +219,10 @@ void commonCaseExpression(uint64_t *a, uint64_t *b, double *result, uint64_t N, 
 void q14CaseExpression(uint64_t *p_type, double *l_extendedprice, double *l_discount, uint64_t p_type_val1, uint64_t p_type_val2, double *result, uint64_t N) {
     CHECK_ERROR();
     if (N == 0) {
-        printf("N is 0\n");
+        SIRIUS_LOG_DEBUG("N is 0");
         return;
     }
-    printf("Launching Q14 Case Expression Kernel\n");
+    SIRIUS_LOG_DEBUG("Launching Q14 Case Expression Kernel");
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
     q14_case_expression<BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(p_type, l_extendedprice, l_discount, p_type_val1, p_type_val2, result, N);
     CHECK_ERROR();
@@ -231,10 +232,10 @@ void q14CaseExpression(uint64_t *p_type, double *l_extendedprice, double *l_disc
 void q8CaseExpression(uint64_t *nation, double *volume, uint64_t nation_val, double else_val, double *result, uint64_t N) {
     CHECK_ERROR();
     if (N == 0) {
-        printf("N is 0\n");
+        SIRIUS_LOG_DEBUG("N is 0");
         return;
     }
-    printf("Launching Q14 Case Expression Kernel\n");
+    SIRIUS_LOG_DEBUG("Launching Q14 Case Expression Kernel");
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
     q8_case_expression<BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(nation, volume, nation_val, else_val, result, N);
     CHECK_ERROR();

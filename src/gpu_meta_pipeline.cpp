@@ -1,6 +1,7 @@
 #include "gpu_meta_pipeline.hpp"
 #include "gpu_executor.hpp"
 #include "duckdb/common/enums/physical_operator_type.hpp"
+#include "log/logging.hpp"
 
 namespace duckdb {
 
@@ -100,7 +101,7 @@ void GPUMetaPipeline::AssignNextBatchIndex(GPUPipeline &pipeline) {
 void GPUMetaPipeline::Build(GPUPhysicalOperator &op) {
 	D_ASSERT(pipelines.size() == 1);
 	D_ASSERT(children.empty());
-	// printf("op.type = %s\n", PhysicalOperatorToString(op.type).c_str());
+	// SIRIUS_LOG_DEBUG("op.type = {}", PhysicalOperatorToString(op.type));
 	op.BuildPipelines(*pipelines.back(), *this);
 }
 

@@ -1,4 +1,5 @@
 #include "operator/gpu_materialize.hpp"
+#include "log/logging.hpp"
 
 namespace duckdb {
 
@@ -77,7 +78,7 @@ HandleMaterializeRowIDs(GPUIntermediateRelation& input_relation, GPUIntermediate
     vector<uint64_t*> new_row_ids;
     vector<uint64_t*> prev_row_ids;
     for (int i = 0; i < input_relation.columns.size(); i++) {
-        printf("Passing column idx %d in input relation to idx %d in output relation\n", i, i);
+        SIRIUS_LOG_DEBUG("Passing column idx {} in input relation to idx {} in output relation", i, i);
         if (count == 0) {
             output_relation.columns[i] = make_shared_ptr<GPUColumn>(0, input_relation.columns[i]->data_wrapper.type, input_relation.columns[i]->data_wrapper.data,
                         input_relation.columns[i]->data_wrapper.offset, 0, input_relation.columns[i]->data_wrapper.is_string_data);
@@ -125,7 +126,7 @@ HandleMaterializeRowIDsRHS(GPUIntermediateRelation& hash_table_result, GPUInterm
     vector<uint64_t*> prev_row_ids;
     for (idx_t i = 0; i < rhs_output_columns.size(); i++) {
         const auto rhs_col = rhs_output_columns[i];
-        printf("Passing column idx %d from hash table to idx %d in output relation\n", rhs_col, offset + i);
+        SIRIUS_LOG_DEBUG("Passing column idx {} from hash table to idx {} in output relation", rhs_col, offset + i);
         if (count == 0) {
             output_relation.columns[offset + i] = make_shared_ptr<GPUColumn>(0, hash_table_result.columns[rhs_col]->data_wrapper.type, hash_table_result.columns[rhs_col]->data_wrapper.data,
                         hash_table_result.columns[rhs_col]->data_wrapper.offset, 0, hash_table_result.columns[rhs_col]->data_wrapper.is_string_data);
@@ -173,7 +174,7 @@ HandleMaterializeRowIDsLHS(GPUIntermediateRelation& input_relation, GPUIntermedi
     vector<uint64_t*> prev_row_ids;
     for (idx_t i = 0; i < lhs_output_columns.size(); i++) {
         const auto lhs_col = lhs_output_columns[i];
-        printf("Passing column idx %d from input relation to idx %d in output relation\n", lhs_col, i);
+        SIRIUS_LOG_DEBUG("Passing column idx {} from input relation to idx {} in output relation", lhs_col, i);
         if (count == 0) {
             output_relation.columns[i] = make_shared_ptr<GPUColumn>(0, input_relation.columns[lhs_col]->data_wrapper.type, input_relation.columns[lhs_col]->data_wrapper.data,
                 input_relation.columns[lhs_col]->data_wrapper.offset, 0, input_relation.columns[lhs_col]->data_wrapper.is_string_data);

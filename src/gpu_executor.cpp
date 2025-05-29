@@ -7,6 +7,7 @@
 #include "duckdb/parallel/thread_context.hpp"
 #include "duckdb/execution/execution_context.hpp"
 #include "operator/gpu_physical_table_scan.hpp"
+#include "log/logging.hpp"
 #include <iostream>
 #include <stdio.h>
 
@@ -32,7 +33,7 @@ GPUExecutor::Reset() {
 }
 
 void GPUExecutor::Initialize(unique_ptr<GPUPhysicalOperator> plan) {
-	printf("Initializing GPUExecutor\n");
+	SIRIUS_LOG_DEBUG("Initializing GPUExecutor");
 	Reset();
 	gpuBufferManager->ResetBuffer();
 	gpu_owned_plan = std::move(plan);
@@ -43,11 +44,9 @@ void GPUExecutor::Execute() {
 
 	int initial_idx = 0;
 
-	printf("Total meta pipelines %d\n", scheduled.size());
+	SIRIUS_LOG_DEBUG("Total meta pipelines {}", scheduled.size());
 
 	for (int i = 0; i < scheduled.size(); i++) {
-		printf("\n\n\n");
-
 		auto pipeline = scheduled[i];
 
 		// TODO: This is temporary solution
@@ -61,7 +60,7 @@ void GPUExecutor::Execute() {
 		intermediate_relations.reserve(pipeline->operators.size());
 		// intermediate_states.reserve(pipeline->operators.size());
 
-		// printf("Executing pipeline op size %d\n", pipeline->operators.size());
+		// SIRIUS_LOG_DEBUG("Executing pipeline op size {}", pipeline->operators.size());
 		for (idx_t i = 0; i < pipeline->operators.size(); i++) {
 			auto &prev_operator = i == 0 ? *(pipeline->source) : pipeline->operators[i - 1].get();
 			auto &current_operator = pipeline->operators[i].get();
@@ -89,7 +88,7 @@ void GPUExecutor::Execute() {
 
 		// pipeline->Reset();
 		// auto prop = pipeline->executor.context.GetClientProperties();
-		// std::cout << "Properties: " << prop.time_zone << std::endl;
+		// SIRIUS_LOG_DEBUG("Properties: {}", prop.time_zone);
 		auto is_empty = pipeline->operators.empty();
 		auto &source_relation = is_empty ? final_relation : intermediate_relations[0];
 		// auto source_result = FetchFromSource(source_chunk);
@@ -100,7 +99,7 @@ void GPUExecutor::Execute() {
 		// OperatorSourceInput source_input = {*pipeline.source_state, *local_source_state, interrupt_state};
 		// pipeline->source->GetData(exec_context, source_relation, source_input);
 		auto source_type = pipeline->source.get()->type;
-		std::cout << "pipeline source type " << PhysicalOperatorToString(source_type) << std::endl;
+		SIRIUS_LOG_DEBUG("pipeline source type {}", PhysicalOperatorToString(source_type));
 		if (source_type == PhysicalOperatorType::TABLE_SCAN) {
 			// initialize pipeline
 			Pipeline duckdb_pipeline(*executor);
@@ -110,20 +109,19 @@ void GPUExecutor::Execute() {
 			table_scan.GetDataDuckDB(exec_context);
 		}
 		pipeline->source->GetData(*source_relation);
-		// printf("source relation size %d\n", source_relation->columns.size());
+		// SIRIUS_LOG_DEBUG("source relation size {}", source_relation->columns.size());
 		// for (auto col : source_relation->columns) {
-		// 	printf("source relation column size %d column name %s\n", col->column_length, col->name.c_str());
+		// 	SIRIUS_LOG_DEBUG("source relation column size {} column name {}", col->column_length, col->name);
 		// }
-		// printf("\n");
 		// EndOperator(*pipeline.source, &result);
 
 		//call source
-		// std::cout << pipeline->source.get()->GetName() << std::endl;
+		// SIRIUS_LOG_DEBUG("{}", pipeline->source.get()->GetName());
 		for (int current_idx = 1; current_idx <= pipeline->operators.size(); current_idx++) {
 			auto op = pipeline->operators[current_idx-1];
 			auto op_type = op.get().type;
-			std::cout << "pipeline operator type " << PhysicalOperatorToString(op_type) << std::endl;
-			// std::cout << op.get().GetName() << std::endl;
+			SIRIUS_LOG_DEBUG("pipeline operator type {}", PhysicalOperatorToString(op_type));
+			// SIRIUS_LOG_DEBUG("{}", op.get().GetName());
 			//call operator
 
 			auto current_intermediate = current_idx;
@@ -148,23 +146,22 @@ void GPUExecutor::Execute() {
 		}
 		if (pipeline->sink) {
 			auto sink_type = pipeline->sink.get()->type;
-			std::cout << "pipeline sink type " << PhysicalOperatorToString(sink_type) << std::endl;
-			// std::cout << pipeline->sink.get()->GetName() << std::endl;
+			SIRIUS_LOG_DEBUG("pipeline sink type {}", PhysicalOperatorToString(sink_type));
+			// SIRIUS_LOG_DEBUG("{}", pipeline->sink.get()->GetName());
 			//call sink
 			auto &sink_relation = final_relation;
-			// printf("sink relation size %d\n", final_relation->columns.size());
+			// SIRIUS_LOG_DEBUG("sink relation size {}", final_relation->columns.size());
 			// int i = 0;
 			// for (auto col : final_relation->columns) {
-			// 	if (col == nullptr) printf("%d\n", i);
+			// 	if (col == nullptr) SIRIUS_LOG_DEBUG("{}", i);
 			// 	i++;
-			// 	// printf("sink relation column size %d\n", col->column_length);
+			// 	// SIRIUS_LOG_DEBUG("sink relation column size {}", col->column_length);
 			// }
 			// auto interrupt_state = InterruptState();
 			// auto local_sink_state = pipeline->sink->GetLocalSinkState(exec_context);
 			// OperatorSinkInput sink_input {*pipeline->sink->sink_state, *local_sink_state, interrupt_state};
 			// pipeline->sink->Sink(exec_context, *sink_relation, sink_input);
 			pipeline->sink->Sink(*sink_relation);
-			printf("\n");
 		}
 	}
 }
@@ -198,8 +195,8 @@ void GPUExecutor::InitializeInternal(GPUPhysicalOperator &plan) {
 		root_pipeline_idx = 0;
 		// for (auto &pipeline : root_pipelines) {
 		// 	auto type = pipeline->source.get()->type;
-		// 	printf("root pipeline operators size = %d\n", pipeline->operators.size());
-		// 	std::cout << "root pipeline source type " << PhysicalOperatorToString(type) << std::endl;
+		// 	SIRIUS_LOG_DEBUG("root pipeline operators size = {}", pipeline->operators.size());
+		//	SIRIUS_LOG_DEBUG("root pipeline source type {}", PhysicalOperatorToString(type));
 		// }
 
 		// collect all meta-pipelines from the root pipeline
@@ -209,7 +206,7 @@ void GPUExecutor::InitializeInternal(GPUPhysicalOperator &plan) {
 		// number of 'PipelineCompleteEvent's is equal to the number of meta pipelines, so we have to set it here
 		total_pipelines = to_schedule.size();
 		
-		printf("Total meta pipelines %d\n", to_schedule.size());
+		SIRIUS_LOG_DEBUG("Total meta pipelines {}", to_schedule.size());
 		int schedule_count = 0;
 		int meta = 0;
 		while (schedule_count < to_schedule.size()) {
@@ -259,7 +256,7 @@ void GPUExecutor::InitializeInternal(GPUPhysicalOperator &plan) {
 
 		// collect all pipelines from the root pipelines (recursively) for the progress bar and verify them
 		root_pipeline->GetPipelines(pipelines, true);
-		printf("total_pipelines = %d\n", pipelines.size());
+		SIRIUS_LOG_DEBUG("total_pipelines = {}", pipelines.size());
 
 		// finally, verify and schedule
 		// VerifyPipelines();
@@ -326,10 +323,10 @@ GPUExecutor::GetResult() {
 	// auto &result_collector = gpu_physical_plan.get()->Cast<GPUPhysicalResultCollector>();
 	auto &result_collector = gpu_physical_plan.get()->Cast<GPUPhysicalMaterializedCollector>();
 	D_ASSERT(result_collector.sink_state);
-	// printf("we are getting result\n");
+	// SIRIUS_LOG_DEBUG("we are getting result");
 	result_collector.sink_state = result_collector.GetGlobalSinkState(context);
 	unique_ptr<QueryResult> res = result_collector.GetResult(*(result_collector.sink_state));
-	// printf("we can get result\n");
+	// SIRIUS_LOG_DEBUG("we can get result");
 	return res;
 }
 

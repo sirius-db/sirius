@@ -3,6 +3,7 @@
 #include "operator/gpu_physical_grouped_aggregate.hpp"
 #include "gpu_pipeline.hpp"
 #include "gpu_meta_pipeline.hpp"
+#include "log/logging.hpp"
 
 namespace duckdb {
 
@@ -31,7 +32,7 @@ GPUPhysicalColumnDataScan::GetData(GPUIntermediateRelation &output_relation) con
 
 	// return chunk.size() == 0 ? SourceResultType::FINISHED : SourceResultType::HAVE_MORE_OUTPUT;
 
-	printf("Reading data from column data collection\n");
+	SIRIUS_LOG_DEBUG("Reading data from column data collection");
 	for (int col_idx = 0; col_idx < output_relation.columns.size(); col_idx++) {
 		// output_relation.columns[col_idx] = intermediate_relation->columns[col_idx];
 		output_relation.columns[col_idx] = make_shared_ptr<GPUColumn>(intermediate_relation->columns[col_idx]->column_length, intermediate_relation->columns[col_idx]->data_wrapper.type, intermediate_relation->columns[col_idx]->data_wrapper.data);

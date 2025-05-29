@@ -1,5 +1,6 @@
 #include "cuda_helper.cuh"
 #include "gpu_columns.hpp"
+#include "log/logging.hpp"
 
 #include <chrono>
 #include <cmath>
@@ -64,12 +65,12 @@ template <typename T>
 void materializeExpression(T *a, T*& result, uint64_t *row_ids, uint64_t result_len, uint64_t input_len) {
     CHECK_ERROR();
     if (result_len == 0) {
-        printf("result_len is 0\n");
+        SIRIUS_LOG_DEBUG("result_len is 0");
         return;
     }
     SETUP_TIMING();
     START_TIMER();
-    printf("Launching Materialize Kernel\n");
+    SIRIUS_LOG_DEBUG("Launching Materialize Kernel");
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
     result = gpuBufferManager->customCudaMalloc<T>(result_len, 0, 0);
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
@@ -83,12 +84,12 @@ void materializeExpression(T *a, T*& result, uint64_t *row_ids, uint64_t result_
 void materializeString(uint8_t* data, uint64_t* offset, uint8_t* &result, uint64_t* &result_offset, uint64_t* row_ids, uint64_t* &result_bytes, uint64_t result_len, uint64_t input_size, uint64_t input_bytes) {
     CHECK_ERROR();
     if (result_len == 0) {
-        printf("result_len is 0\n");
+        SIRIUS_LOG_DEBUG("result_len is 0");
         return;
     }
     SETUP_TIMING();
     START_TIMER();
-    printf("Launching Materialize String Kernel\n");
+    SIRIUS_LOG_DEBUG("Launching Materialize String Kernel");
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
     //allocate temp memory and copying keys
     uint64_t* temp_len = gpuBufferManager->customCudaMalloc<uint64_t>(result_len + 1, 0, 0);

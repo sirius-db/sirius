@@ -1,5 +1,6 @@
 #include "gpu_columns.hpp"
 #include "gpu_buffer_manager.hpp"
+#include "log/logging.hpp"
 
 namespace duckdb {
 
@@ -242,16 +243,16 @@ GPUIntermediateRelation::GPUIntermediateRelation(size_t column_count) :
 
 bool
 GPUIntermediateRelation::checkLateMaterialization(size_t idx) {
-    printf("Checking if column idx %ld needs to be materialized from column size %d\n", idx, columns.size());
+    SIRIUS_LOG_DEBUG("Checking if column idx {} needs to be materialized from column size {}", idx, columns.size());
     if (columns[idx] == nullptr) {
-        printf("Column idx %ld is null\n", idx);
+        SIRIUS_LOG_DEBUG("Column idx {} is null", idx);
         return false;
     }
 
     if (columns[idx]->row_ids == nullptr) {
-        printf("Column idx %d already materialized\n", idx);
+        SIRIUS_LOG_DEBUG("Column idx {} already materialized", idx);
     } else {
-        printf("Column idx %d needs to be materialized\n", idx);
+        SIRIUS_LOG_DEBUG("Column idx {} needs to be materialized", idx);
     }
     return columns[idx]->row_ids != nullptr;
 }

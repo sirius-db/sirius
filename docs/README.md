@@ -114,6 +114,13 @@ Sirius provides a unit test that compares Sirius against DuckDB for correctness 
 make test
 ```
 
+## Logging
+Sirius uses [spdlog](https://github.com/gabime/spdlog) for logging messages during query execution. Default log directory is `${CMAKE_BINARY_DIR}/log` and default log level is `info`, which can be configured by environment variables `SIRIUS_LOG_DIR` and `SIRIUS_LOG_LEVEL`. For example:
+```
+export SIRIUS_LOG_DIR={PATH for logging}
+export SIRIUS_LOG_LEVEL=debug
+```
+
 ## Performance
 Running TPC-H on SF=100, Sirius achieves ~10x speedup over existing CPU query engines at the same hardware rental cost, making it well-suited for interactive analytics, financial workloads, and ETL jobs.
 
