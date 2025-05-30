@@ -208,7 +208,7 @@ void comparisonConstantExpression(T *a, T b, T c, uint64_t* &row_ids, uint64_t* 
         uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
         h_count[0] = 0;
         count = h_count;
-        SIRIUS_LOG_DEBUG("N is 0");
+        SIRIUS_LOG_DEBUG("Input size is 0");
         return;
     }
     SIRIUS_LOG_DEBUG("Launching Comparison Expression Kernel");
@@ -227,7 +227,7 @@ void comparisonConstantExpression(T *a, T b, T c, uint64_t* &row_ids, uint64_t* 
     // gpuBufferManager->gpuProcessingPointer[0] = (reinterpret_cast<uint8_t*>(row_ids + h_count[0]) - gpuBufferManager->gpuProcessing[0]);
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(count), 0);
     count = h_count;
-    SIRIUS_LOG_DEBUG("Count: {}", h_count[0]);
+    SIRIUS_LOG_DEBUG("Comparison Constant Expression Result Count: {}", h_count[0]);
 }
 
 template <typename T>
@@ -238,7 +238,7 @@ void comparisonExpression(T *a, T *b, uint64_t* &row_ids, uint64_t* &count, uint
         uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
         h_count[0] = 0;
         count = h_count;
-        SIRIUS_LOG_DEBUG("N is 0");
+        SIRIUS_LOG_DEBUG("Input size is 0");
         return;
     }
     SIRIUS_LOG_DEBUG("Launching Comparison Expression Kernel");
@@ -257,7 +257,7 @@ void comparisonExpression(T *a, T *b, uint64_t* &row_ids, uint64_t* &count, uint
     // gpuBufferManager->gpuProcessingPointer[0] = (reinterpret_cast<uint8_t*>(row_ids + h_count[0]) - gpuBufferManager->gpuProcessing[0]);
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(count), 0);
     count = h_count;
-    SIRIUS_LOG_DEBUG("Count: {}", h_count[0]);
+    SIRIUS_LOG_DEBUG("Comparison Expression Result count: {}", h_count[0]);
 }
 
 __global__ void string_comparison_expression(char* char_data, uint64_t num_chars, uint64_t* str_indices, uint64_t num_strings, char* compare_chars, uint64_t compare_length, 
@@ -352,9 +352,11 @@ void comparisonStringBetweenExpression(char* char_data, uint64_t num_chars, uint
         uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
         h_count[0] = 0;
         count = h_count;
-        SIRIUS_LOG_DEBUG("N is 0");
+        SIRIUS_LOG_DEBUG("Input size is 0");
         return;
     }
+
+    SIRIUS_LOG_DEBUG("Launching comparisonStringBetweenExpression kernel");
 
     // Allocate the necesary buffers on the GPU
     count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
@@ -400,7 +402,7 @@ void comparisonStringBetweenExpression(char* char_data, uint64_t num_chars, uint
     // gpuBufferManager->gpuProcessingPointer[0] = (reinterpret_cast<uint8_t*>(row_id + h_count[0]) - gpuBufferManager->gpuProcessing[0]);
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(count), 0);
     count = h_count;
-    SIRIUS_LOG_DEBUG("comparisonStringBetweenExpression got count of {}", h_count[0]);
+    SIRIUS_LOG_DEBUG("comparisonStringBetweenExpression result count: {}", h_count[0]);
 
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_lower_chars), 0);
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_upper_chars), 0);
@@ -415,9 +417,11 @@ void comparisonStringExpression(char* char_data, uint64_t num_chars, uint64_t* s
         uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
         h_count[0] = 0;
         count = h_count;
-        SIRIUS_LOG_DEBUG("N is 0");
+        SIRIUS_LOG_DEBUG("Input size is 0");
         return;
     }
+
+    SIRIUS_LOG_DEBUG("Launching comparisonStringExpression");
 
     // Allocate the necesary buffers on the GPU
     count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
@@ -447,7 +451,7 @@ void comparisonStringExpression(char* char_data, uint64_t num_chars, uint64_t* s
     // gpuBufferManager->gpuProcessingPointer[0] = (reinterpret_cast<uint8_t*>(row_id + h_count[0]) - gpuBufferManager->gpuProcessing[0]);
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(count), 0);
     count = h_count;
-    SIRIUS_LOG_DEBUG("comparisonStringExpression got count of {}", h_count[0]);
+    SIRIUS_LOG_DEBUG("comparisonStringExpression result count: {}", h_count[0]);
 
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_compare_chars), 0);
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_is_valid), 0);

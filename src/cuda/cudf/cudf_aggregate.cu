@@ -1,4 +1,5 @@
 #include "cudf/cudf_utils.hpp"
+#include "../operator/cuda_helper.cuh"
 #include "gpu_physical_ungrouped_aggregate.hpp"
 #include "gpu_buffer_manager.hpp"
 #include "log/logging.hpp"
@@ -25,7 +26,7 @@ static std::unique_ptr<cudf::reduce_aggregation> make_reduce_aggregation()
 void cudf_aggregate(vector<shared_ptr<GPUColumn>>& column, uint64_t num_aggregates, AggregationType* agg_mode) 
 {
     if (column[0]->column_length == 0) {
-        SIRIUS_LOG_DEBUG("N is 0");
+        SIRIUS_LOG_DEBUG("Input size is 0");
         for (int agg_idx = 0; agg_idx < num_aggregates; agg_idx++) {
             if (agg_mode[agg_idx] == AggregationType::COUNT_STAR || agg_mode[agg_idx] == AggregationType::COUNT) {
                 column[agg_idx] = make_shared_ptr<GPUColumn>(0, ColumnType::INT64, column[agg_idx]->data_wrapper.data);
@@ -37,6 +38,9 @@ void cudf_aggregate(vector<shared_ptr<GPUColumn>>& column, uint64_t num_aggregat
     }
 
     SIRIUS_LOG_DEBUG("CUDF Aggregate");
+    SIRIUS_LOG_DEBUG("Input size: {}", column[0]->column_length);
+    SETUP_TIMING();
+    START_TIMER();
 
     GPUBufferManager *gpuBufferManager = &(GPUBufferManager::GetInstance());
     cudf::set_current_device_resource(gpuBufferManager->mr);
@@ -128,6 +132,8 @@ void cudf_aggregate(vector<shared_ptr<GPUColumn>>& column, uint64_t num_aggregat
             throw NotImplementedException("Aggregate function not supported");
         }
     }
+
+    STOP_TIMER();
 
 }
 

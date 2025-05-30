@@ -153,6 +153,7 @@ GPUPhysicalUngroupedAggregate::GPUPhysicalUngroupedAggregate(vector<LogicalType>
 SinkResultType 
 GPUPhysicalUngroupedAggregate::Sink(GPUIntermediateRelation &input_relation) const {
 	SIRIUS_LOG_DEBUG("Performing ungrouped aggregation");
+	auto start = std::chrono::high_resolution_clock::now();
 
 	if (distinct_data) {
 		SinkDistinct(input_relation);
@@ -236,17 +237,24 @@ GPUPhysicalUngroupedAggregate::Sink(GPUIntermediateRelation &input_relation) con
 		}
 	}
 
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+	SIRIUS_LOG_DEBUG("Ungrouped aggregate Sink time: {:.2f} ms", duration.count()/1000.0);
   	return SinkResultType::FINISHED;
 }
   
 SourceResultType
 GPUPhysicalUngroupedAggregate::GetData(GPUIntermediateRelation &output_relation) const {
-  for (int col = 0; col < aggregation_result->columns.size(); col++) {
-    SIRIUS_LOG_DEBUG("Writing aggregation result to column {}", col);
-	output_relation.columns[col] = make_shared_ptr<GPUColumn>(aggregation_result->columns[col]->column_length, aggregation_result->columns[col]->data_wrapper.type, aggregation_result->columns[col]->data_wrapper.data);
-  }
+	auto start = std::chrono::high_resolution_clock::now();
+	for (int col = 0; col < aggregation_result->columns.size(); col++) {
+		SIRIUS_LOG_DEBUG("Writing aggregation result to column {}", col);
+		output_relation.columns[col] = make_shared_ptr<GPUColumn>(aggregation_result->columns[col]->column_length, aggregation_result->columns[col]->data_wrapper.type, aggregation_result->columns[col]->data_wrapper.data);
+	}
 
-  return SourceResultType::FINISHED;
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+	SIRIUS_LOG_DEBUG("Ungrouped aggregate GetData time: {:.2f} ms", duration.count()/1000.0);
+	return SourceResultType::FINISHED;
 }
 
 void

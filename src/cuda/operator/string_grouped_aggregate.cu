@@ -401,7 +401,7 @@ void groupedStringAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t**
     CHECK_ERROR();
     if (N == 0) {
         count[0] = 0;
-        SIRIUS_LOG_DEBUG("N is 0");
+        SIRIUS_LOG_DEBUG("Input size is 0");
         return;
     }
 
@@ -868,7 +868,7 @@ void groupedStringAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t**
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(group_idx), 0);
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_num_bytes), 0);
     cudaDeviceSynchronize();
-    SIRIUS_LOG_DEBUG("Count: {}\n", count[0]);
+    SIRIUS_LOG_DEBUG("String Grouped Aggregate Count: {}\n", count[0]);
 
     STOP_TIMER();
 }
@@ -885,7 +885,7 @@ void groupedStringAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t**
 //         uint64_t num_bytes_a, uint64_t num_bytes_b, uint64_t N_a, uint64_t N_b) {
 //     CHECK_ERROR();
 //     if (N_a == 0 || N_b == 0) {
-//         SIRIUS_LOG_DEBUG("N is 0");
+//         SIRIUS_LOG_DEBUG("Input size is 0");
 //         return;
 //     }
 //     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());

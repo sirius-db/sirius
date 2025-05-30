@@ -63,6 +63,7 @@ GPUColumn::GPUColumn(GPUColumn& other) {
 
 cudf::column_view
 GPUColumn::convertToCudfColumn() {
+    SIRIUS_LOG_DEBUG("Converting GPUColumn to cuDF column");
     cudf::size_type size = column_length;
     if (data_wrapper.type == ColumnType::INT64) {
         auto column = cudf::column_view(cudf::data_type(cudf::type_id::UINT64), size, reinterpret_cast<void*>(data_wrapper.data), nullptr, 0);
@@ -80,7 +81,6 @@ GPUColumn::convertToCudfColumn() {
         auto column = cudf::column_view(cudf::data_type(cudf::type_id::BOOL8), size, reinterpret_cast<void*>(data_wrapper.data), nullptr, 0);
         return column;
     } else if (data_wrapper.type == ColumnType::VARCHAR) {
-
         //convert offset to int32
         int32_t* new_offset = convertSiriusOffsetToCudfOffset();
 
@@ -112,6 +112,7 @@ GPUColumn::convertToCudfColumn() {
 
 void
 GPUColumn::setFromCudfColumn(cudf::column& cudf_column, bool _is_unique, int32_t* _row_ids, uint64_t _row_id_count, GPUBufferManager* gpuBufferManager) {
+    SIRIUS_LOG_DEBUG("Set a GPUColumn from cudf::column");
     cudf::data_type col_type = cudf_column.type();
     cudf::size_type col_size = cudf_column.size();
     cudf::column::contents cont = cudf_column.release();
@@ -171,6 +172,7 @@ GPUColumn::setFromCudfColumn(cudf::column& cudf_column, bool _is_unique, int32_t
 
 void
 GPUColumn::setFromCudfScalar(cudf::scalar& cudf_scalar, GPUBufferManager* gpuBufferManager) {
+    SIRIUS_LOG_DEBUG("Set a GPUColumn from cudf::scalar");
     cudf::data_type scalar_type = cudf_scalar.type();
     if (scalar_type == cudf::data_type(cudf::type_id::UINT64)) {
         auto& typed_scalar = static_cast<cudf::numeric_scalar<uint64_t>&>(cudf_scalar);

@@ -246,7 +246,7 @@ __global__ void print_columns(uint8_t **col, uint64_t** offset, uint64_t N) {
 //         uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
 //         h_count[0] = 0;
 //         count = h_count;
-//         SIRIUS_LOG_DEBUG("N is 0");
+//         SIRIUS_LOG_DEBUG("Input size is 0");
 //         return;
 //     }
 //     SIRIUS_LOG_DEBUG("Launching Arbitrary Table Scan Kernel");
@@ -306,10 +306,11 @@ tableScanExpression(uint8_t **col, uint64_t** offset, uint8_t *constant_compare,
         uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
         h_count[0] = 0;
         count = h_count;
-        SIRIUS_LOG_DEBUG("N is 0");
+        SIRIUS_LOG_DEBUG("Input size is 0");
         return;
     }
     SIRIUS_LOG_DEBUG("Launching Arbitrary Table Scan Kernel");
+    SIRIUS_LOG_DEBUG("Input size is {}", N);
 
     uint64_t constant_size = constant_offset[num_expr];
     uint8_t* d_constant_compare = gpuBufferManager->customCudaMalloc<uint8_t>(constant_size, 0, 0);
@@ -357,7 +358,7 @@ tableScanExpression(uint8_t **col, uint64_t** offset, uint8_t *constant_compare,
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_constant_offset), 0);
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_compare_mode), 0);
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_data_type), 0);
-    SIRIUS_LOG_DEBUG("Count: {}", h_count[0]); 
+    SIRIUS_LOG_DEBUG("Table Scan Expression Result Count: {}", h_count[0]); 
 }
 
 } // namespace duckdb

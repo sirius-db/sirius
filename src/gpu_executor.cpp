@@ -48,6 +48,7 @@ void GPUExecutor::Execute() {
 
 	for (int i = 0; i < scheduled.size(); i++) {
 		auto pipeline = scheduled[i];
+		SIRIUS_LOG_DEBUG("Executing pipeline {}", i);
 
 		// TODO: This is temporary solution
 		// if (pipeline->source->type == PhysicalOperatorType::HASH_JOIN || pipeline->source->type == PhysicalOperatorType::RESULT_COLLECTOR) {

@@ -396,9 +396,11 @@ void hashGroupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* co
     CHECK_ERROR();
     if (N == 0) {
         count[0] = 0;
-        SIRIUS_LOG_DEBUG("N is 0");
+        SIRIUS_LOG_DEBUG("Input size is 0");
         return;
     }
+    SETUP_TIMING();
+    START_TIMER();
 
     SIRIUS_LOG_DEBUG("Launching Hash Grouped Aggregate Kernel");
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
@@ -445,17 +447,15 @@ void hashGroupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* co
         C *= (max_key_host[i] - min_key_host[i] + 1);
     }
 
-    SIRIUS_LOG_DEBUG("N: {}", N);
+    SIRIUS_LOG_DEBUG("Input size: {}", N);
     SIRIUS_LOG_DEBUG("max {} min {}", max_key_host[0], min_key_host[0]);
 
     V init_max; V init_min;
     if constexpr (std::is_same<V, double>::value) {
         // Do something if T is int
-        SIRIUS_LOG_DEBUG("V is double");
         init_max = -DBL_MAX; init_min = DBL_MAX;
     } else if constexpr (std::is_same<V, uint64_t>::value) {
         // Do something else if T is not int
-        SIRIUS_LOG_DEBUG("V is not double");
         init_max = INT_MIN; init_min = INT64_MAX;
     } else {
         assert(0);
@@ -464,6 +464,7 @@ void hashGroupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* co
     unsigned long long* ht;
     uint64_t ht_len;
     if (C < BLOCK_THREADS) {
+        SIRIUS_LOG_DEBUG("Hash grouped aggregate in shared memory");
         ht_len = C;
         size_t smem_size;
         if (need_count) {
@@ -482,6 +483,7 @@ void hashGroupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* co
         CHECK_ERROR();
 
     } else{
+        SIRIUS_LOG_DEBUG("Hash grouped aggregate in global memory");
         ht_len = N * 2;
         if (need_count) {
             ht = (unsigned long long*) gpuBufferManager->customCudaMalloc<uint64_t>(ht_len * (num_keys + num_aggregates + 1), 0, 0);         
@@ -540,7 +542,7 @@ void hashGroupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* co
 
     // CHECK_ERROR();
 
-    SIRIUS_LOG_DEBUG("Count: {}", h_count[0]);
+    SIRIUS_LOG_DEBUG("Hash Grouped Aggregate Count: {}", h_count[0]);
 
     for (uint64_t i = 0; i < num_keys; i++) {
         gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(keys[i]), 0);
@@ -579,6 +581,7 @@ void hashGroupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* co
             gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(ht), 0);
         }
     }
+    STOP_TIMER();
 
 }
 

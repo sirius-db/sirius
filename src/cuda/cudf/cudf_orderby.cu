@@ -1,57 +1,15 @@
 #include "cudf_utils.hpp"
+#include "../operator/cuda_helper.cuh"
 #include "gpu_physical_order.hpp"
 #include "gpu_buffer_manager.hpp"
 #include "log/logging.hpp"
 
 namespace duckdb {
 
-template <typename T>
-__global__ void print_gpu_column(T* a, int32_t N) {
-    if (blockIdx.x == 0 && threadIdx.x == 0) {
-        for (uint64_t i = 0; i < N; i++) {
-            // FIXME: do this in cpu code using logging
-        }
-    }
-}
-
-template
-__global__ void print_gpu_column<uint64_t>(uint64_t* a, int32_t N);
-template
-__global__ void print_gpu_column<double>(double* a, int32_t N);
-template
-__global__ void print_gpu_column<int>(int* a, int32_t N);
-template
-__global__ void print_gpu_column<float>(float* a, int32_t N);
-template
-__global__ void print_gpu_column<uint8_t>(uint8_t* a, int32_t N);
-
-template <typename T> 
-void printGPUColumn(T* a, int32_t N, int gpu) {
-    // CHECK_ERROR();
-    if (N == 0) {
-        SIRIUS_LOG_DEBUG("N is 0");
-        return;
-    }
-    T* result_host_temp = new T[1];
-    cudaMemcpy(result_host_temp, a, sizeof(T), cudaMemcpyDeviceToHost);
-    // CHECK_ERROR();
-    cudaDeviceSynchronize();
-    SIRIUS_LOG_DEBUG("Result: {} and N: {}", result_host_temp[0], N);
-    SIRIUS_LOG_DEBUG("N: {}", N);
-    print_gpu_column<T><<<1, 1>>>(a, N);
-    // CHECK_ERROR();
-    cudaDeviceSynchronize();
-}
-
-template void printGPUColumn<uint64_t>(uint64_t* a, int32_t N, int gpu);
-template void printGPUColumn<double>(double* a, int32_t N, int gpu);
-template void printGPUColumn<int>(int* a, int32_t N, int gpu);
-template void printGPUColumn<float>(float* a, int32_t N, int gpu);
-
 void cudf_orderby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColumn>>& projection, uint64_t num_keys, uint64_t num_projections, OrderByType* order_by_type) 
 {
     if (keys[0]->column_length == 0) {
-        SIRIUS_LOG_DEBUG("N is 0");
+        SIRIUS_LOG_DEBUG("Input size is 0");
         for (idx_t col = 0; col < num_projections; col++) {
             bool old_unique = projection[col]->is_unique;
             if (projection[col]->data_wrapper.type == ColumnType::VARCHAR) {
@@ -64,7 +22,10 @@ void cudf_orderby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColu
         return;
     }
 
-    SIRIUS_LOG_DEBUG("N is: {}", keys[0]->column_length);
+    SIRIUS_LOG_DEBUG("CUDF Order By");
+    SIRIUS_LOG_DEBUG("Input size: {}", keys[0]->column_length);
+    SETUP_TIMING();
+    START_TIMER();
 
     GPUBufferManager *gpuBufferManager = &(GPUBufferManager::GetInstance());
     cudf::set_current_device_resource(gpuBufferManager->mr);
@@ -174,6 +135,7 @@ void cudf_orderby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColu
 
     SIRIUS_LOG_DEBUG("Order by done");
 
+    STOP_TIMER();
     // throw NotImplementedException("Order by is not implemented");
 
 

@@ -174,7 +174,7 @@ GPUContext::GPUExecutePendingQueryResult(PendingQueryResult &pending) {
 		ErrorData error = pending.GetErrorObject();
 		return make_uniq<MaterializedQueryResult>(error);
 	}
-	SIRIUS_LOG_DEBUG("Done executing");
+	SIRIUS_LOG_DEBUG("Done ExecutePendingQueryResult");
 	auto result = FetchResultInternal(pending);
 	// context.reset();
 	return result;
@@ -194,7 +194,7 @@ GPUContext::GPUExecuteQuery(ClientContext &context, const string &query, shared_
 	} else {
 		current_result = GPUExecutePendingQueryResult(*pending_query);
 	}
-	SIRIUS_LOG_DEBUG("Done executing query");
+	SIRIUS_LOG_DEBUG("Done GPUExecuteQuery");
 	return current_result;
 };
 
