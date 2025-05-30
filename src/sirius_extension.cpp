@@ -126,7 +126,7 @@ void SiriusExtension::GPUCachingFunction(ClientContext &context, TableFunctionIn
 	}
 
 	if (!buffer_is_initialized) {
-		SIRIUS_LOG_ERROR("GPUBufferManager not initialized, please call gpu_buffer_init first");
+		printf("\033[1;31m"); printf("GPUBufferManager not initialized, please call gpu_buffer_init first\n"); printf("\033[0m");
 		return;
 	}
 
@@ -209,16 +209,16 @@ void SiriusExtension::GPUProcessingFunction(ClientContext &context, TableFunctio
 	if (!data.res) {
 		auto start = std::chrono::high_resolution_clock::now();
 		if (!buffer_is_initialized) {
-			SIRIUS_LOG_ERROR("GPUBufferManager not initialized, please call gpu_buffer_init first");
-			SIRIUS_LOG_ERROR("=============================================\nError in GPUExecuteQuery, fallback to DuckDB\n=============================================");
+			printf("\033[1;31m"); printf("GPUBufferManager not initialized, please call gpu_buffer_init first\n"); printf("\033[0m");
+			printf("=============================================\nError in GPUExecuteQuery, fallback to DuckDB\n=============================================\n");
 			data.res = data.conn->Query(data.query);
 		} else if (data.plan_error) {
-			SIRIUS_LOG_ERROR("=============================================\nError in GPUExecuteQuery, fallback to DuckDB\n=============================================");
+			printf("=============================================\nError in GPUExecuteQuery, fallback to DuckDB\n=============================================\n");
 			data.res = data.conn->Query(data.query);
 		} else {
 			data.res = data.gpu_context->GPUExecuteQuery(context, data.query, data.gpu_prepared, {});
 			if (data.res->HasError()) {
-				SIRIUS_LOG_ERROR("=============================================\nError in GPUExecuteQuery, fallback to DuckDB\n=============================================");
+				printf("=============================================\nError in GPUExecuteQuery, fallback to DuckDB\n=============================================\n");
 				data.res = data.conn->Query(data.query);
 			}
 		}
@@ -320,20 +320,20 @@ void SiriusExtension::GPUProcessingSubstraitFunction(ClientContext &context, Tab
 	if (!data.res) {
 		auto start = std::chrono::high_resolution_clock::now();
 		if (!buffer_is_initialized) {
-			SIRIUS_LOG_ERROR("GPUBufferManager not initialized, please call gpu_buffer_init first");
-			SIRIUS_LOG_ERROR("=============================================\nError in GPUExecuteQuery, fallback to DuckDB\n=============================================");
+			printf("\033[1;31m"); printf("GPUBufferManager not initialized, please call gpu_buffer_init first\n"); printf("\033[0m");
+			printf("=============================================\nError in GPUExecuteQuery, fallback to DuckDB\n=============================================\n");
 			auto con = Connection(*context.db);
 			data.plan->context = make_shared_ptr<ClientContextWrapper>(con.context);
 			data.res = data.plan->Execute();
 		} else if (data.plan_error) {
-			SIRIUS_LOG_ERROR("=============================================\nError in GPUExecuteQuery, fallback to DuckDB\n=============================================");
+			printf("=============================================\nError in GPUExecuteQuery, fallback to DuckDB\n=============================================\n");
 			auto con = Connection(*context.db);
 			data.plan->context = make_shared_ptr<ClientContextWrapper>(con.context);
 			data.res = data.plan->Execute();
 		} else {
 			data.res = data.gpu_context->GPUExecuteQuery(context, data.query, data.gpu_prepared, {});
 			if (data.res->HasError()) {
-				SIRIUS_LOG_ERROR("=============================================\nError in GPUExecuteQuery, fallback to DuckDB\n=============================================");
+				printf("=============================================\nError in GPUExecuteQuery, fallback to DuckDB\n=============================================\n");
 				auto con = Connection(*context.db);
 				data.plan->context = make_shared_ptr<ClientContextWrapper>(con.context);
 				data.res = data.plan->Execute();
@@ -438,6 +438,7 @@ SiriusExtension::GPUBufferInitFunction(ClientContext &context, TableFunctionInpu
 	size_t cache_size = data.cache_size;
 	size_t processing_size = data.processing_size;
 	if (!buffer_is_initialized) {
+		SIRIUS_LOG_DEBUG("GPU Buffer Manager initialized\n");
 		GPUBufferManager *gpuBufferManager = &(GPUBufferManager::GetInstance(cache_size, processing_size, processing_size));
 		buffer_is_initialized = true;
 	} else {

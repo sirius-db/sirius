@@ -101,14 +101,16 @@ void StringMatching(char* char_data, uint64_t* str_indices, std::string match_st
   CHECK_ERROR();
   GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
   if (num_strings == 0) {
-    SIRIUS_LOG_DEBUG("N is 0");
+    SIRIUS_LOG_DEBUG("Input size is 0");
     uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
     h_count[0] = 0;
     count = h_count;
     return;
   }
 
-  SIRIUS_LOG_DEBUG("Running single term string matching");
+    SETUP_TIMING();
+    START_TIMER();
+  SIRIUS_LOG_DEBUG("Launching single term string matching kernel");
   // Get the data from the metadata
   uint64_t workers_needed = (num_chars + CHUNK_SIZE - 1)/CHUNK_SIZE;
 
@@ -189,7 +191,9 @@ void StringMatching(char* char_data, uint64_t* str_indices, std::string match_st
   gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_answers), 0);
   gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(count), 0);
   count = h_count;
-  SIRIUS_LOG_DEBUG("Count = {}", h_count[0]);
+  SIRIUS_LOG_DEBUG("String Matching Result Count = {}", h_count[0]);
+
+  STOP_TIMER();
 }
 
 __global__ void multi_term_kmp_kernel(char* char_data, uint64_t* indices, int* kmp_automato, uint64_t* worker_start_term, 
@@ -251,14 +255,16 @@ void MultiStringMatching(char* char_data, uint64_t* str_indices, std::vector<std
   CHECK_ERROR();
   GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
   if (num_strings == 0) {
-    SIRIUS_LOG_DEBUG("N is 0");
+    SIRIUS_LOG_DEBUG("Input size is 0");
     uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
     h_count[0] = 0;
     count = h_count;
     return;
   }
   
-  SIRIUS_LOG_DEBUG("Running multi term string matching");
+    SETUP_TIMING();
+    START_TIMER();
+  SIRIUS_LOG_DEBUG("Launching multi term string matching kernel");
   // Get the data from the metadata
   uint64_t workers_needed = (num_chars + CHUNK_SIZE - 1)/CHUNK_SIZE;
 
@@ -374,7 +380,8 @@ void MultiStringMatching(char* char_data, uint64_t* str_indices, std::vector<std
   for(int i = 0; i < num_terms; i++) {
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_all_automatos[i]), 0);
   }
-  SIRIUS_LOG_DEBUG("Count = {}", h_count[0]);
+  SIRIUS_LOG_DEBUG("Multi String Matching Result Count = {}", h_count[0]);
+  STOP_TIMER();
 
   count = h_count;
 }
@@ -410,12 +417,16 @@ void PrefixMatching(char* char_data, uint64_t* str_indices, std::string match_pr
   // Allocate the necesary buffers on the GPU
   GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
   if (num_strings == 0) {
-    SIRIUS_LOG_DEBUG("N is 0");
+    SIRIUS_LOG_DEBUG("Input size is 0");
     uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
     h_count[0] = 0;
     count = h_count;
     return;
   }
+
+    SETUP_TIMING();
+    START_TIMER();
+    SIRIUS_LOG_DEBUG("Launching Prefix Matching kernel");
 
   count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
   uint64_t num_prefix_chars = match_prefix.length();
@@ -452,7 +463,8 @@ void PrefixMatching(char* char_data, uint64_t* str_indices, std::string match_pr
   gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(count), 0);
 
   count = h_count;
-  SIRIUS_LOG_DEBUG("PrefixMatching got count of {}", h_count[0]);
+  SIRIUS_LOG_DEBUG("PrefixMatching Result Count {}", h_count[0]);
+  STOP_TIMER();
 }
 
 } // namespace duckdb

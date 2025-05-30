@@ -97,8 +97,13 @@ __global__ void fill_row_ids_buffer(uint64_t* d_row_ids, uint64_t num_rows) {
 void orderByString(uint8_t** col_keys, uint64_t** col_offsets, int* sort_orders, uint64_t* col_num_bytes, uint64_t num_rows, uint64_t num_cols) {
     CHECK_ERROR();
     if(num_rows == 0) {
+        SIRIUS_LOG_DEBUG("Input size is 0");
         return;
     }
+
+    SIRIUS_LOG_DEBUG("Launching Order By String kernel");
+    SETUP_TIMING();
+    START_TIMER();
 
     // Copy over the ptrs onto the GPU
     auto preprocess_start_time = high_resolution_clock::now();
@@ -170,6 +175,8 @@ void orderByString(uint8_t** col_keys, uint64_t** col_offsets, int* sort_orders,
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_row_ids), 0);
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_sort_orders), 0);
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(sort_temp_storage), 0);
+
+    STOP_TIMER();
 }
 
 }

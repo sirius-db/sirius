@@ -1,4 +1,5 @@
 #include "cudf/cudf_utils.hpp"
+#include "../operator/cuda_helper.cuh"
 #include "gpu_physical_grouped_aggregate.hpp"
 #include "gpu_buffer_manager.hpp"
 #include "log/logging.hpp"
@@ -8,7 +9,7 @@ namespace duckdb {
 void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColumn>>& aggregate_keys, uint64_t num_keys, uint64_t num_aggregates, AggregationType* agg_mode) 
 {
   if (keys[0]->column_length == 0) {
-    SIRIUS_LOG_DEBUG("N is 0");
+    SIRIUS_LOG_DEBUG("Input size is 0");
     for (idx_t group = 0; group < num_keys; group++) {
       bool old_unique = keys[group]->is_unique;
       if (keys[group]->data_wrapper.type == ColumnType::VARCHAR) {
@@ -28,6 +29,11 @@ void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColu
     }
     return;
   }
+
+  SIRIUS_LOG_DEBUG("CUDF Group By");
+  SIRIUS_LOG_DEBUG("Input size: {}", keys[0]->column_length);
+  SETUP_TIMING();
+  START_TIMER();
 
   GPUBufferManager *gpuBufferManager = &(GPUBufferManager::GetInstance());
   cudf::set_current_device_resource(gpuBufferManager->mr);
@@ -120,14 +126,15 @@ void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColu
       if (agg_mode[agg] == AggregationType::COUNT || agg_mode[agg] == AggregationType::COUNT_STAR) {
         auto agg_val_view = agg_val->view();
         auto temp_data = convertInt32ToUInt64(const_cast<int32_t*>(agg_val_view.data<int32_t>()), agg_val_view.size());
-        size_t size = agg_val_view.size();
-        aggregate_keys[agg] = make_shared_ptr<GPUColumn>(size, ColumnType::INT64, reinterpret_cast<uint8_t*>(temp_data));
+        aggregate_keys[agg] = make_shared_ptr<GPUColumn>(agg_val_view.size(), ColumnType::INT64, reinterpret_cast<uint8_t*>(temp_data));
       } else {
         aggregate_keys[agg]->setFromCudfColumn(*agg_val, false, nullptr, 0, gpuBufferManager);
         // aggregate_keys[agg] = gpuBufferManager->copyDataFromcuDFColumn(agg_val_view, 0);
       }
   }
 
+  STOP_TIMER();
+  SIRIUS_LOG_DEBUG("CUDF Groupby result count: {}", keys[0]->column_length);
 }
 
 } //namespace duckdb
