@@ -124,7 +124,6 @@ __global__ void probe_multikey(uint64_t **keys, unsigned long long* ht, uint64_t
             else if (equal_keys == 2) slot = hash64_multikey(keys[0][tile_offset + threadIdx.x + ITEM * B], keys[1][tile_offset + threadIdx.x + ITEM * B]) % ht_len;
             else cudaAssert(0);
             
-            bool found = 0;
             while (ht[slot * n_ht_column] != 0xFFFFFFFFFFFFFFFF) {
                 bool local_found = 1;
                 for (int n = 0; n < num_keys; n++) {

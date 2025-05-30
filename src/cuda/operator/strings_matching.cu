@@ -50,7 +50,6 @@ uint64_t pattern_size, uint64_t num_workers, uint64_t chunk_size, uint64_t sub_c
     
     // See if have any work to do
     uint64_t chunk_id = blockIdx.x;
-    int worker_id = threadIdx.x + blockIdx.x * blockDim.x;
     if (chunk_id >= num_workers) return;
 
     const uint64_t curr_chunk_start = min(chunk_id * chunk_size, last_char);
@@ -199,7 +198,6 @@ __global__ void multi_term_kmp_kernel(char* char_data, uint64_t* indices, int* k
     
     // See if have any work to do
     uint64_t chunk_id = blockIdx.x;
-    int worker_id = threadIdx.x + blockIdx.x * blockDim.x;
     if (chunk_id >= num_workers) return;
 
     const uint64_t curr_chunk_start = min(chunk_id * chunk_size, last_char);
