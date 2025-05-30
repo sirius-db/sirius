@@ -63,7 +63,7 @@ template <typename T>
 void callCudaMemcpyHostToDevice(T* dest, T* src, size_t size, int gpu) {
     CHECK_ERROR();
     if (size == 0) {
-        SIRIUS_LOG_DEBUG("N is 0");
+        SIRIUS_LOG_DEBUG("Input size is 0");
         return;
     }
     SIRIUS_LOG_DEBUG("Send data to GPU");
@@ -78,7 +78,7 @@ template <typename T>
 void callCudaMemcpyDeviceToHost(T* dest, T* src, size_t size, int gpu) {
     CHECK_ERROR();
     if (size == 0) {
-        SIRIUS_LOG_DEBUG("N is 0");
+        SIRIUS_LOG_DEBUG("Input size is 0");
         return;
     }
     SETUP_TIMING();
@@ -104,7 +104,7 @@ template <typename T>
 void callCudaMemcpyDeviceToDevice(T* dest, T* src, size_t size, int gpu) {
     CHECK_ERROR();
     if (size == 0) {
-        SIRIUS_LOG_DEBUG("N is 0");
+        SIRIUS_LOG_DEBUG("Input size is 0");
         return;
     }
     SETUP_TIMING();

@@ -31,7 +31,7 @@ template <typename T>
 void printGPUColumn(T* a, size_t N, int gpu) {
     CHECK_ERROR();
     if (N == 0) {
-        SIRIUS_LOG_DEBUG("N is 0");
+        SIRIUS_LOG_DEBUG("Input size is 0");
         return;
     }
     T* result_host_temp = new T[1];
@@ -39,7 +39,7 @@ void printGPUColumn(T* a, size_t N, int gpu) {
     CHECK_ERROR();
     cudaDeviceSynchronize();
     SIRIUS_LOG_DEBUG("Result: {} and N: {}", result_host_temp[0], N);
-    SIRIUS_LOG_DEBUG("N: {}", N);
+    SIRIUS_LOG_DEBUG("Input size: {}", N);
     print_gpu_column<T><<<1, 1>>>(a, N);
     CHECK_ERROR();
     cudaDeviceSynchronize();

@@ -419,6 +419,8 @@ GPUPhysicalTableScan::GetDataDuckDB(ExecutionContext &exec_context) {
     D_ASSERT(!column_ids.empty());
     auto gpuBufferManager = &(GPUBufferManager::GetInstance());
 
+    SIRIUS_LOG_DEBUG("Reading data from duckdb storage");
+
     TableFunctionToStringInput input(function, bind_data.get());
     auto to_string_result = function.to_string(input);
     string table_name;
@@ -456,6 +458,7 @@ GPUPhysicalTableScan::GetDataDuckDB(ExecutionContext &exec_context) {
     TableFunctionInput data(bind_data.get(), l_state_scan.local_state.get(), g_state_scan.global_state.get());
 
     if (function.function) {
+      auto start = std::chrono::high_resolution_clock::now();
       bool has_more_output = true;
 
       do {
@@ -465,7 +468,6 @@ GPUPhysicalTableScan::GetDataDuckDB(ExecutionContext &exec_context) {
         has_more_output = chunk->size() > 0;
         // get the size of each column in the chunk
         for (int col = 0; col < column_ids.size(); col++) {
-          // if (!already_cached[col]) {
             if (chunk->data[col].GetType() == LogicalType::VARCHAR) {
               Vector string_vector = chunk->data[col];
               string_vector.Flatten(chunk->size());
@@ -476,12 +478,9 @@ GPUPhysicalTableScan::GetDataDuckDB(ExecutionContext &exec_context) {
             } else {
               column_size[col] += chunk->data[col].GetAllocationSize(chunk->size());
             }
-          // }
         }
         collection->Append(*chunk);
       } while (has_more_output);
-
-      SIRIUS_LOG_DEBUG("Collection size {}", collection->Count());
 
       uint64_t total_size = 0;
       for (int col = 0; col < column_ids.size(); col++) {
@@ -508,6 +507,9 @@ GPUPhysicalTableScan::GetDataDuckDB(ExecutionContext &exec_context) {
       }
 
       ScanDataDuckDB(gpuBufferManager, table_name);
+      auto end = std::chrono::high_resolution_clock::now();
+      auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+      SIRIUS_LOG_DEBUG("Reading data and converting data from duckdb time: {:.2f} ms", duration.count()/1000.0);
       return SourceResultType::FINISHED;
     } else {
       throw NotImplementedException("Table in-out function not supported");
@@ -541,6 +543,7 @@ GPUPhysicalTableScan::ScanDataDuckDB(GPUBufferManager* gpuBufferManager, string 
       ColumnDataScanState scan_state;
       uint64_t start_idx = 0;
 
+      SIRIUS_LOG_DEBUG("Converting duckdb format to Sirius format (this will take a while)");
       do {
         auto result = make_uniq<DataChunk>();
         collection->InitializeScanChunk(*result);
@@ -616,7 +619,6 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
   auto start = std::chrono::high_resolution_clock::now();
   if (output_relation.columns.size() != GetTypes().size()) throw InvalidInputException("Mismatched column count");
 
-  SIRIUS_LOG_DEBUG("Getting data");
   TableFunctionToStringInput input(function, bind_data.get());
   auto to_string_result = function.to_string(input);
   string table_name;
@@ -745,7 +747,6 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
         }
       }
 
-      SIRIUS_LOG_DEBUG("Num expr {}", num_expr);
       if (num_expr > 0) {
         HandleArbitraryConstantExpression(expression_columns, count, row_ids, filter_constants, num_expr);
         // if (count[0] == 0) throw NotImplementedException("No match found");

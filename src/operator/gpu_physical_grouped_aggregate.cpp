@@ -404,6 +404,7 @@ void ResolveTypeDistinctGroupBy(vector<shared_ptr<GPUColumn>> &group_by_keys, ve
 //TODO: Distinct Aggregate currently does not support string type
 void HandleDistinctGroupBy(vector<shared_ptr<GPUColumn>> &group_by_keys, vector<shared_ptr<GPUColumn>> &aggregate_keys, GPUBufferManager* gpuBufferManager, DistinctAggregateCollectionInfo &distinct_info, int num_group_keys) {
 	//check if all the group by keys are all integers
+	SIRIUS_LOG_DEBUG("Handling distinct group by");
 	for (int i = 0; i < num_group_keys; i++) {
 		if (group_by_keys[i]->data_wrapper.type != ColumnType::INT64) {
 			throw NotImplementedException("Group by column is not an integer");
@@ -579,7 +580,7 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 			auto &group = grouped_aggregate_data.groups[group_idx];
 			D_ASSERT(group->type == ExpressionType::BOUND_REF);
 			auto &bound_ref_expr = group->Cast<BoundReferenceExpression>();
-			SIRIUS_LOG_DEBUG("Reading groupby columns from index {} and passing it to index {} in groupby result", bound_ref_expr.index, bound_ref_expr.index);
+			SIRIUS_LOG_DEBUG("Passing input column index {} to group by column index {}", bound_ref_expr.index, idx);
 			group_by_column[idx] = HandleMaterializeExpression(input_relation.columns[bound_ref_expr.index], bound_ref_expr, gpuBufferManager);
 			idx++;
 		}
@@ -593,7 +594,7 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 		for (auto &child_expr : aggr.children) {
 			D_ASSERT(child_expr->type == ExpressionType::BOUND_REF);
 			auto &bound_ref_expr = child_expr->Cast<BoundReferenceExpression>();
-			SIRIUS_LOG_DEBUG("Reading aggregation column from index {} and passing it to index {} in groupby result", bound_ref_expr.index, grouped_aggregate_data.groups.size() + aggr_idx);
+			SIRIUS_LOG_DEBUG("Passing input column index {} to aggregate column index {}", bound_ref_expr.index, aggr_idx);
 			aggregate_column[aggr_idx] = HandleMaterializeExpression(input_relation.columns[bound_ref_expr.index], bound_ref_expr, gpuBufferManager);
 		}
 		aggr_idx++;
@@ -603,7 +604,6 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 	for (auto &aggregate : aggregates) {
 		auto &aggr = aggregate->Cast<BoundAggregateExpression>();
 		if (aggr.children.size() == 0) {
-			SIRIUS_LOG_DEBUG("Passing * aggregate to index {} in groupby result", grouped_aggregate_data.groups.size() + aggr_idx);
 			aggregate_column[aggr_idx] = make_shared_ptr<GPUColumn>(column_size, ColumnType::INT64, nullptr);
 		}
 		if (aggr.filter) {
@@ -642,10 +642,12 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 		for (int idx = 0; idx < grouping_sets[i].size(); idx++) {
 			//TODO: has to fix this for columns with partially NULL values
 			if (group_by_result->columns[idx] == nullptr && group_by_column[idx]->column_length > 0 && group_by_column[idx]->data_wrapper.data != nullptr) {
+				SIRIUS_LOG_DEBUG("Passing group by column {} to group by result column {}", idx, idx);
 				group_by_result->columns[idx] = group_by_column[idx];
 				group_by_result->columns[idx]->row_ids = nullptr;
 				group_by_result->columns[idx]->row_id_count = 0;
 			} else if (group_by_result->columns[idx] != nullptr && group_by_column[idx]->column_length > 0 && group_by_column[idx]->data_wrapper.data != nullptr) {
+				SIRIUS_LOG_DEBUG("Combining group by column {} with group by result column {}", idx, idx);
 				group_by_result->columns[idx] = CombineColumns(group_by_result->columns[idx], group_by_column[idx], gpuBufferManager);
 			}
 
@@ -655,10 +657,12 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 	for (int aggr_idx = 0; aggr_idx < aggregates.size(); aggr_idx++) {
 		//TODO: has to fix this for columns with partially NULL values
 		if (group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] == nullptr && aggregate_column[aggr_idx]->column_length > 0 && aggregate_column[aggr_idx]->data_wrapper.data != nullptr) {
+			SIRIUS_LOG_DEBUG("Passing aggregate column {} to group by result column {}", grouped_aggregate_data.groups.size() + aggr_idx, grouped_aggregate_data.groups.size() + aggr_idx);
 			group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] = aggregate_column[aggr_idx];
 			group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx]->row_ids = nullptr;
 			group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx]->row_id_count = 0;
 		} else if (group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] != nullptr && aggregate_column[aggr_idx]->column_length > 0 && aggregate_column[aggr_idx]->data_wrapper.data != nullptr) {
+			SIRIUS_LOG_DEBUG("Combining aggregate column {} with group by result column {}", grouped_aggregate_data.groups.size() + aggr_idx, grouped_aggregate_data.groups.size() + aggr_idx);
 			group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] = CombineColumns(group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx], aggregate_column[aggr_idx], gpuBufferManager);
 		}
 	}
@@ -701,6 +705,10 @@ void
 GPUPhysicalGroupedAggregate::SinkDistinctGrouping(GPUIntermediateRelation& input_relation, idx_t grouping_idx) const {
 	auto &distinct_info = *distinct_collection_info;
 
+	SIRIUS_LOG_DEBUG("Perform groupby and aggregation distinct");
+
+	auto start = std::chrono::high_resolution_clock::now();
+
 	GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 	uint64_t num_group_keys = grouped_aggregate_data.groups.size();
 	vector<shared_ptr<GPUColumn>> group_by_column(grouped_aggregate_data.groups.size());
@@ -716,7 +724,6 @@ GPUPhysicalGroupedAggregate::SinkDistinctGrouping(GPUIntermediateRelation& input
 	for (idx_t group_idx = 0; group_idx < grouped_aggregate_data.groups.size(); group_idx++) {
 		auto &group = grouped_aggregate_data.groups[group_idx];
 		auto &bound_ref = group->Cast<BoundReferenceExpression>();
-		SIRIUS_LOG_DEBUG("Reading groupby columns from index {} and passing it to index {} in groupby result", bound_ref.index, group_idx);
 		group_by_column[group_idx] = HandleMaterializeExpression(input_relation.columns[bound_ref.index], bound_ref, gpuBufferManager);
 	}
 
@@ -753,7 +760,7 @@ GPUPhysicalGroupedAggregate::SinkDistinctGrouping(GPUIntermediateRelation& input
 			for (idx_t child_idx = 0; child_idx < aggregate.children.size(); child_idx++) {
 				auto &child = aggregate.children[child_idx];
 				auto &bound_ref = child->Cast<BoundReferenceExpression>();
-				SIRIUS_LOG_DEBUG("Reading aggregation column from index {} and passing it to index {} in groupby result", bound_ref.index, grouped_aggregate_data.groups.size() + idx);
+				SIRIUS_LOG_DEBUG("Reading aggregation column from index {} and passing it to index {} in distinct aggregatec column", bound_ref.index, aggr_idx);
 				// input_relation.checkLateMaterialization(bound_ref.index);
 				// group_by_result->columns[grouped_aggregate_data.groups.size() + idx] = input_relation.columns[bound_ref.index];
 				distinct_aggregate_columns[aggr_idx] = HandleMaterializeExpression(input_relation.columns[bound_ref.index], bound_ref, gpuBufferManager);
@@ -769,10 +776,12 @@ GPUPhysicalGroupedAggregate::SinkDistinctGrouping(GPUIntermediateRelation& input
 	for (int idx = 0; idx < grouped_aggregate_data.groups.size(); idx++) {
 		//TODO: has to fix this for columns with partially NULL values
 		if (group_by_result->columns[idx] == nullptr && group_by_column[idx]->column_length > 0 && group_by_column[idx]->data_wrapper.data != nullptr) {
+			SIRIUS_LOG_DEBUG("Passing group by column {} to group by result column {}", idx, idx);
 			group_by_result->columns[idx] = group_by_column[idx];
 			group_by_result->columns[idx]->row_ids = nullptr;
 			group_by_result->columns[idx]->row_id_count = 0;
 		} else if (group_by_result->columns[idx] != nullptr && group_by_column[idx]->column_length > 0 && group_by_column[idx]->data_wrapper.data != nullptr) {
+			SIRIUS_LOG_DEBUG("Combining group by column {} with group by result column {}", idx, idx);
 			group_by_result->columns[idx] = CombineColumns(group_by_result->columns[idx], group_by_column[idx], gpuBufferManager);
 		}
 	}
@@ -781,14 +790,19 @@ GPUPhysicalGroupedAggregate::SinkDistinctGrouping(GPUIntermediateRelation& input
 		//TODO: has to fix this for columns with partially NULL values
 		//TODO: has to fix this for group by where there would be both distinct and non distinct aggregates at the same time
 		if (group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] == nullptr && distinct_aggregate_columns[aggr_idx]->column_length > 0 && distinct_aggregate_columns[aggr_idx]->data_wrapper.data != nullptr) {
+			SIRIUS_LOG_DEBUG("Passing aggregate column {} to group by result column {}", grouped_aggregate_data.groups.size() + aggr_idx, grouped_aggregate_data.groups.size() + aggr_idx);
 			group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] = distinct_aggregate_columns[aggr_idx];
 			group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx]->row_ids = nullptr;
 			group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx]->row_id_count = 0;
 		} else if (group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] != nullptr && distinct_aggregate_columns[aggr_idx]->column_length > 0 && distinct_aggregate_columns[aggr_idx]->data_wrapper.data != nullptr) {
+			SIRIUS_LOG_DEBUG("Combining aggregate column {} with group by result column {}", grouped_aggregate_data.groups.size() + aggr_idx, grouped_aggregate_data.groups.size() + aggr_idx);
 			group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] = CombineColumns(group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx], distinct_aggregate_columns[aggr_idx], gpuBufferManager);
 		}
 	}
 
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+	SIRIUS_LOG_DEBUG("Group Aggregate Distinct Sink time: {:.2f} ms", duration.count()/1000.0);
 }
 
 } // namespace duckdb

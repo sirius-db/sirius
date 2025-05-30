@@ -43,12 +43,14 @@ std::tuple<char*, uint64_t*, uint64_t> PerformSubstring(char* char_data, uint64_
   uint64_t start_idx, uint64_t length) {
     CHECK_ERROR();
     if (num_strings == 0) {
-        SIRIUS_LOG_DEBUG("N is 0");
+        SIRIUS_LOG_DEBUG("Input size is 0");
         char* empty = nullptr;
         uint64_t* empty_offset = nullptr;
         return std::make_tuple(empty, empty_offset, 0);
     }
     SIRIUS_LOG_DEBUG("Launching substring kernel");
+    SETUP_TIMING();
+    START_TIMER();
 
     // Get the write offsets
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
@@ -86,6 +88,7 @@ std::tuple<char*, uint64_t*, uint64_t> PerformSubstring(char* char_data, uint64_
     // Return the result
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(new_len), 0);
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_temp_storage), 0);
+    STOP_TIMER();
     return std::make_tuple(updated_chars, result_offset, total_chars[0]);
 }
 

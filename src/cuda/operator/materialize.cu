@@ -155,6 +155,9 @@ __global__ void create_cpu_strings(duckdb_string_type* gpu_strings, char* cpu_ch
 
 void materializeStringColumnToDuckdbFormat(GPUColumn* column, char* column_char_write_buffer, string_t* column_string_write_buffer) {
     // First copy the characters from the GPU to the CPU
+    SIRIUS_LOG_DEBUG("Materialize String Column to Duckdb format");
+    SETUP_TIMING();
+    START_TIMER();
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
     DataWrapper column_data = column->data_wrapper;
 
@@ -173,6 +176,7 @@ void materializeStringColumnToDuckdbFormat(GPUColumn* column, char* column_char_
     // Copy over the strings to the CPU
     column->data_wrapper.data = reinterpret_cast<uint8_t*>(column_char_write_buffer);
     cudaMemcpy((uint8_t*) column_string_write_buffer, (uint8_t*) d_column_strings, cpu_str_bytes, cudaMemcpyDeviceToHost);
+    STOP_TIMER();
 }
 
 template

@@ -91,11 +91,13 @@ template <typename T>
 void ungroupedAggregate(uint8_t **a, uint8_t **result, uint64_t N, int* agg_mode, int num_aggregates) {
     CHECK_ERROR();
     if (N == 0) {
-        SIRIUS_LOG_DEBUG("N is 0");
+        SIRIUS_LOG_DEBUG("Input size is 0");
         return;
     }
     SIRIUS_LOG_DEBUG("Launching Aggregation Kernel");
-    SIRIUS_LOG_DEBUG("N: {}", N);
+    SIRIUS_LOG_DEBUG("Input size: {}", N);
+    SETUP_TIMING();
+    START_TIMER();
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 
@@ -156,6 +158,7 @@ void ungroupedAggregate(uint8_t **a, uint8_t **result, uint64_t N, int* agg_mode
             gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(a[agg]), 0);
         }
     }
+    STOP_TIMER();
 }
 
 template
