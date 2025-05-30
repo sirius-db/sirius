@@ -23,21 +23,22 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundReferenc
   {
     if (input_column->row_id_count > INT32_MAX)
     {
-      throw NotImplementedException("row_id_count larger than int32_t are not supported in "
-                                    "libcudf");
+      throw NotImplementedException(
+        "Execute[Reference]: row_id_counts larger than int32_t are not supported in libcudf");
     }
+    // DispatchMaterialize will handle byte overflow from the materialized offsets
     return GpuDispatcher::DispatchMaterialize(input_column.get(), resource_ref);
   }
   if (input_column->data_wrapper.type == ColumnType::VARCHAR &&
       input_column->data_wrapper.num_bytes > INT32_MAX)
   {
-    throw NotImplementedException("string offsets larger than int32_t are not supported in "
-                                  "libcudf");
+    throw NotImplementedException(
+      "Execute[Reference]: string offsets larger than int32_t are not supported in libcudf");
   }
   if (input_column->column_length > INT32_MAX)
   {
-    throw NotImplementedException("input column length larger than int32_t are not supported in "
-                                  "libcudf");
+    throw NotImplementedException(
+      "Execute[Reference]: input column length larger than int32_t are not supported in libcudf");
   }
 
   // Perform a deep copy (necessary, since memory ownership cannot be transferred away from the gpu
