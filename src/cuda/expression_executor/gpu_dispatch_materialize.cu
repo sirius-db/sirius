@@ -135,8 +135,8 @@ struct MaterializeString
     // Check for overflow
     if (output_bytes < 0)
     {
-      throw InternalException("Dispatch[Materialize]: String data greater than INT32_MAX not "
-                              "supported by CuDF!");
+      throw InternalException("Dispatch[Materialize]: String data greater than INT32_MAX "
+                              "detedted!");
     }
 
     // Allocate output data buffer
