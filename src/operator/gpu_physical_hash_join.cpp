@@ -304,10 +304,12 @@ GPUPhysicalHashJoin::GetData(GPUIntermediateRelation &output_relation) const {
 
 	idx_t left_column_count = output_relation.columns.size() - rhs_output_columns.col_idxs.size();
 	if (join_type == JoinType::RIGHT_SEMI || join_type == JoinType::RIGHT_ANTI) {
+		SIRIUS_LOG_DEBUG("Right semi or right anti join so there will be no columns from LHS");
 		left_column_count = 0;
 	} else if (join_type == JoinType::RIGHT) {
 		for (idx_t col = 0; col < left_column_count; col++) {
 			//pretend this to be NUll column from the left table (it should be NULL for the RIGHT join)
+			SIRIUS_LOG_DEBUG("Right join so columns from LHS will be null");
 			output_relation.columns[col] = make_shared_ptr<GPUColumn>(0, ColumnType::INT64, nullptr);
 		}
 	} else {
@@ -392,8 +394,6 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 	for (idx_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
 		auto &condition = conditions[cond_idx];
         auto join_key_index = condition.left->Cast<BoundReferenceExpression>().index;
-        SIRIUS_LOG_DEBUG("Reading join key for probing hash table from index {}", join_key_index);
-		SIRIUS_LOG_DEBUG("input_relation.columns.size() = {}", input_relation.columns.size());
 		if (input_relation.columns[join_key_index]->is_unique) {
 			unique_probe_keys = true;
 		}
@@ -582,10 +582,10 @@ GPUPhysicalHashJoin::Sink(GPUIntermediateRelation &input_relation) const {
 	for (idx_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
 		auto &condition = conditions[cond_idx];
         auto join_key_index = condition.right->Cast<BoundReferenceExpression>().index;
-        SIRIUS_LOG_DEBUG("Reading join key for building hash table from index {}", join_key_index);
 		if (input_relation.columns[join_key_index]->is_unique) {
 			unique_build_keys = true;
 		}
+		SIRIUS_LOG_DEBUG("Materializing join key for building hash table from index {}", join_key_index);
 		build_keys[cond_idx] = HandleMaterializeExpression(input_relation.columns[join_key_index], condition.right->Cast<BoundReferenceExpression>(), gpuBufferManager);
 	}
 

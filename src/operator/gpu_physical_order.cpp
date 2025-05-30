@@ -62,121 +62,129 @@ GPUPhysicalOrder::GPUPhysicalOrder(vector<LogicalType> types, vector<BoundOrderB
 
 SourceResultType
 GPUPhysicalOrder::GetData(GPUIntermediateRelation &output_relation) const {
-  for (int col = 0; col < sort_result->columns.size(); col++) {
-    SIRIUS_LOG_DEBUG("Writing order by result to column {}", col);
-    output_relation.columns[col] = sort_result->columns[col];
-  }
+    auto start = std::chrono::high_resolution_clock::now();
+    for (int col = 0; col < sort_result->columns.size(); col++) {
+      SIRIUS_LOG_DEBUG("Writing order by result to column {}", col);
+      output_relation.columns[col] = sort_result->columns[col];
+    }
 
-  return SourceResultType::FINISHED;
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    SIRIUS_LOG_DEBUG("Order by GetData time: {:.2f} ms", duration.count()/1000.0);
+    return SourceResultType::FINISHED;
 }
 
 SinkResultType 
 GPUPhysicalOrder::Sink(GPUIntermediateRelation &input_relation) const {
 
-  GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
-  // shared_ptr<GPUColumn>* sort_columns = new shared_ptr<GPUColumn>[orders.size()];
-  // int* sort_orders = new int[orders.size()];
-  // int idx = 0;
-  // bool string_sort = false;
-  // for (auto &order : orders) {
-  //   // key_types.push_back(order.expression->return_type);
-  //   // key_executor.AddExpression(*order.expression);
-  //   auto& expr = *order.expression;
-  //   expr.Print();
-  //   if (expr.expression_class != ExpressionClass::BOUND_REF) {
-  //     throw NotImplementedException("Order by expression not supported");
-  //   }
+    auto start = std::chrono::high_resolution_clock::now();
+    GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+    // shared_ptr<GPUColumn>* sort_columns = new shared_ptr<GPUColumn>[orders.size()];
+    // int* sort_orders = new int[orders.size()];
+    // int idx = 0;
+    // bool string_sort = false;
+    // for (auto &order : orders) {
+    //   // key_types.push_back(order.expression->return_type);
+    //   // key_executor.AddExpression(*order.expression);
+    //   auto& expr = *order.expression;
+    //   expr.Print();
+    //   if (expr.expression_class != ExpressionClass::BOUND_REF) {
+    //     throw NotImplementedException("Order by expression not supported");
+    //   }
 
-  //   // Record the column to sort on
-  //   auto &bound_ref_expr = expr.Cast<BoundReferenceExpression>();
-  //   auto input_idx = bound_ref_expr.index;
-  //   SIRIUS_LOG_DEBUG("Reading order by keys from index {}", input_idx);
-  //   sort_columns[idx] = HandleMaterializeExpression(
-  //     input_relation.columns[input_idx], bound_ref_expr, gpuBufferManager
-  //   );
-  //   if (sort_columns[idx]->data_wrapper.type == ColumnType::VARCHAR) {
-  //     string_sort = true;
-  //   }
+    //   // Record the column to sort on
+    //   auto &bound_ref_expr = expr.Cast<BoundReferenceExpression>();
+    //   auto input_idx = bound_ref_expr.index;
+    //   SIRIUS_LOG_DEBUG("Reading order by keys from index {}", input_idx);
+    //   sort_columns[idx] = HandleMaterializeExpression(
+    //     input_relation.columns[input_idx], bound_ref_expr, gpuBufferManager
+    //   );
+    //   if (sort_columns[idx]->data_wrapper.type == ColumnType::VARCHAR) {
+    //     string_sort = true;
+    //   }
 
-  //   // Record the sort method
-  //   auto sort_method = order.type;
-  //   int sort_type = 0;
-  //   if(sort_method == OrderType::DESCENDING) {
-  //     sort_type = 1;
-  //   }
-  //   sort_orders[idx] = sort_type;
-  //   SIRIUS_LOG_DEBUG(
-  //     "Order By got sort column: Col Length - {}, Size - {}, Bytes - {}, Sort Order - {}\n", 
-  //     (int) sort_columns[idx]->column_length, (int) sort_columns[idx]->data_wrapper.size,  
-  //     (int) sort_columns[idx]->data_wrapper.num_bytes, sort_orders[idx]
-  //   );
+    //   // Record the sort method
+    //   auto sort_method = order.type;
+    //   int sort_type = 0;
+    //   if(sort_method == OrderType::DESCENDING) {
+    //     sort_type = 1;
+    //   }
+    //   sort_orders[idx] = sort_type;
+    //   SIRIUS_LOG_DEBUG(
+    //     "Order By got sort column: Col Length - {}, Size - {}, Bytes - {}, Sort Order - {}\n", 
+    //     (int) sort_columns[idx]->column_length, (int) sort_columns[idx]->data_wrapper.size,  
+    //     (int) sort_columns[idx]->data_wrapper.num_bytes, sort_orders[idx]
+    //   );
 
-  //   idx++;
-  // }
+    //   idx++;
+    // }
 
-  // // Now actually perform the order by
-  // if(string_sort) {
-  //   ResolveOrderByString(sort_columns, sort_orders, orders.size());
-  // } else {
-  //   throw NotImplementedException("Non String Order By not yet supported");
-  // }
+    // // Now actually perform the order by
+    // if(string_sort) {
+    //   ResolveOrderByString(sort_columns, sort_orders, orders.size());
+    // } else {
+    //   throw NotImplementedException("Non String Order By not yet supported");
+    // }
 
-  // // Copy the sorted columns back into the input relationship
-  // int sort_cols_idx = 0;
-  // for (auto &order : orders) {
-  //   auto& expr = *order.expression;
-  //   auto &bound_ref_expr = expr.Cast<BoundReferenceExpression>();
-  //   auto input_idx = bound_ref_expr.index;
-  //   input_relation.columns[input_idx] = sort_columns[sort_cols_idx];
+    // // Copy the sorted columns back into the input relationship
+    // int sort_cols_idx = 0;
+    // for (auto &order : orders) {
+    //   auto& expr = *order.expression;
+    //   auto &bound_ref_expr = expr.Cast<BoundReferenceExpression>();
+    //   auto input_idx = bound_ref_expr.index;
+    //   input_relation.columns[input_idx] = sort_columns[sort_cols_idx];
 
-  //   sort_cols_idx += 1;
-  // }
+    //   sort_cols_idx += 1;
+    // }
 
-  vector<shared_ptr<GPUColumn>> order_by_keys(orders.size());
-  vector<shared_ptr<GPUColumn>> projection_columns(projections.size());
-  
-  for (int projection_idx = 0; projection_idx < projections.size(); projection_idx++) {
-      auto input_idx = projections[projection_idx];
-      auto expr = BoundReferenceExpression(LogicalType::ANY, input_idx);
-      projection_columns[projection_idx] = HandleMaterializeExpression(input_relation.columns[input_idx], expr, gpuBufferManager);
-      input_relation.columns[input_idx] = projection_columns[projection_idx];
-  }
-  
-  for (int order_idx = 0; order_idx < orders.size(); order_idx++) {
-    auto& expr = *orders[order_idx].expression;
-    if (expr.expression_class != ExpressionClass::BOUND_REF) {
-      throw NotImplementedException("Order by expression not supported");
+    vector<shared_ptr<GPUColumn>> order_by_keys(orders.size());
+    vector<shared_ptr<GPUColumn>> projection_columns(projections.size());
+    
+    for (int projection_idx = 0; projection_idx < projections.size(); projection_idx++) {
+        auto input_idx = projections[projection_idx];
+        auto expr = BoundReferenceExpression(LogicalType::ANY, input_idx);
+        projection_columns[projection_idx] = HandleMaterializeExpression(input_relation.columns[input_idx], expr, gpuBufferManager);
+        input_relation.columns[input_idx] = projection_columns[projection_idx];
     }
-    auto input_idx = expr.Cast<BoundReferenceExpression>().index;
-    order_by_keys[order_idx] = HandleMaterializeExpression(input_relation.columns[input_idx], expr.Cast<BoundReferenceExpression>(), gpuBufferManager);
-  }
+    
+    for (int order_idx = 0; order_idx < orders.size(); order_idx++) {
+      auto& expr = *orders[order_idx].expression;
+      if (expr.expression_class != ExpressionClass::BOUND_REF) {
+        throw NotImplementedException("Order by expression not supported");
+      }
+      auto input_idx = expr.Cast<BoundReferenceExpression>().index;
+      order_by_keys[order_idx] = HandleMaterializeExpression(input_relation.columns[input_idx], expr.Cast<BoundReferenceExpression>(), gpuBufferManager);
+    }
 
 
-	if (order_by_keys[0]->column_length > INT32_MAX ) {
-		throw NotImplementedException("Order by with column length greater than INT32_MAX is not supported");
-	}
+    if (order_by_keys[0]->column_length > INT32_MAX ) {
+      throw NotImplementedException("Order by with column length greater than INT32_MAX is not supported");
+    }
 
-  for (int col = 0; col < projections.size(); col++) {
-    // if types is VARCHAR, check the number of bytes
-    if (projection_columns[col]->data_wrapper.type == ColumnType::VARCHAR) {
-      if (projection_columns[col]->data_wrapper.num_bytes > INT32_MAX) {
-        throw NotImplementedException("String column size greater than INT32_MAX is not supported");
+    for (int col = 0; col < projections.size(); col++) {
+      // if types is VARCHAR, check the number of bytes
+      if (projection_columns[col]->data_wrapper.type == ColumnType::VARCHAR) {
+        if (projection_columns[col]->data_wrapper.num_bytes > INT32_MAX) {
+          throw NotImplementedException("String column size greater than INT32_MAX is not supported");
+        }
       }
     }
-  }
-  HandleOrderBy(order_by_keys, projection_columns, orders, projections.size());
+    HandleOrderBy(order_by_keys, projection_columns, orders, projections.size());
 
-  for (int col = 0; col < projections.size(); col++) {
-    if (sort_result->columns[col] == nullptr && projection_columns[col]->column_length > 0 && projection_columns[col]->data_wrapper.data != nullptr) {
-      sort_result->columns[col] = projection_columns[col];
-      sort_result->columns[col]->row_ids = nullptr;
-      sort_result->columns[col]->row_id_count = 0;
-    } else if (sort_result->columns[col] != nullptr && projection_columns[col]->column_length > 0 && projection_columns[col]->data_wrapper.data != nullptr) {
-      throw NotImplementedException("Order by with partially NULL values is not supported");
+    for (int col = 0; col < projections.size(); col++) {
+      if (sort_result->columns[col] == nullptr && projection_columns[col]->column_length > 0 && projection_columns[col]->data_wrapper.data != nullptr) {
+        sort_result->columns[col] = projection_columns[col];
+        sort_result->columns[col]->row_ids = nullptr;
+        sort_result->columns[col]->row_id_count = 0;
+      } else if (sort_result->columns[col] != nullptr && projection_columns[col]->column_length > 0 && projection_columns[col]->data_wrapper.data != nullptr) {
+        throw NotImplementedException("Order by with partially NULL values is not supported");
+      }
     }
-  }
 
-  return SinkResultType::FINISHED;
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    SIRIUS_LOG_DEBUG("Order by Sink time: {:.2f} ms", duration.count()/1000.0);
+    return SinkResultType::FINISHED;
 }
 
 

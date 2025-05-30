@@ -579,7 +579,7 @@ void combineStrings(uint8_t* a, uint8_t* b, uint8_t*& c,
         uint64_t num_bytes_a, uint64_t num_bytes_b, uint64_t N_a, uint64_t N_b) {
     CHECK_ERROR();
     if (N_a == 0 || N_b == 0) {
-        SIRIUS_LOG_DEBUG("N is 0");
+        SIRIUS_LOG_DEBUG("Input size is 0");
         return;
     }
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());

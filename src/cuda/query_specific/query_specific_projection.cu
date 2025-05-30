@@ -177,7 +177,7 @@ __global__ void extract_year<BLOCK_THREADS, ITEMS_PER_THREAD>(uint64_t *date, ui
 void commonArithmeticExpression(double *a, double *b, double* c, double* d, double *result, uint64_t N, int op_mode) {
     CHECK_ERROR();
     if (N == 0) {
-        SIRIUS_LOG_DEBUG("N is 0");
+        SIRIUS_LOG_DEBUG("Input size is 0");
         return;
     }
     SIRIUS_LOG_DEBUG("Launching Binary Expression Kernel");
@@ -191,7 +191,7 @@ void commonArithmeticExpression(double *a, double *b, double* c, double* d, doub
 void extractYear(uint64_t* date, uint64_t *year, uint64_t N) {
     CHECK_ERROR();
     if (N == 0) {
-        SIRIUS_LOG_DEBUG("N is 0");
+        SIRIUS_LOG_DEBUG("Input size is 0");
         return;
     }
     SIRIUS_LOG_DEBUG("Launching Extract Year Kernel");
@@ -205,7 +205,7 @@ void extractYear(uint64_t* date, uint64_t *year, uint64_t N) {
 void commonCaseExpression(uint64_t *a, uint64_t *b, double *result, uint64_t N, int op_mode) {
     CHECK_ERROR();
     if (N == 0) {
-        SIRIUS_LOG_DEBUG("N is 0");
+        SIRIUS_LOG_DEBUG("Input size is 0");
         return;
     }
     SIRIUS_LOG_DEBUG("Launching Common Case Expression Kernel");
@@ -219,7 +219,7 @@ void commonCaseExpression(uint64_t *a, uint64_t *b, double *result, uint64_t N, 
 void q14CaseExpression(uint64_t *p_type, double *l_extendedprice, double *l_discount, uint64_t p_type_val1, uint64_t p_type_val2, double *result, uint64_t N) {
     CHECK_ERROR();
     if (N == 0) {
-        SIRIUS_LOG_DEBUG("N is 0");
+        SIRIUS_LOG_DEBUG("Input size is 0");
         return;
     }
     SIRIUS_LOG_DEBUG("Launching Q14 Case Expression Kernel");
@@ -232,7 +232,7 @@ void q14CaseExpression(uint64_t *p_type, double *l_extendedprice, double *l_disc
 void q8CaseExpression(uint64_t *nation, double *volume, uint64_t nation_val, double else_val, double *result, uint64_t N) {
     CHECK_ERROR();
     if (N == 0) {
-        SIRIUS_LOG_DEBUG("N is 0");
+        SIRIUS_LOG_DEBUG("Input size is 0");
         return;
     }
     SIRIUS_LOG_DEBUG("Launching Q14 Case Expression Kernel");

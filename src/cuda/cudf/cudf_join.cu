@@ -1,4 +1,5 @@
 #include "cudf/cudf_utils.hpp"
+#include "../operator/cuda_helper.cuh"
 #include "gpu_physical_hash_join.hpp"
 #include "gpu_buffer_manager.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
@@ -9,11 +10,17 @@ namespace duckdb {
 void cudf_inner_join(vector<shared_ptr<GPUColumn>>& probe_keys, vector<shared_ptr<GPUColumn>>& build_keys, int num_keys, uint64_t*& row_ids_left, uint64_t*& row_ids_right, uint64_t*& count) {
     GPUBufferManager *gpuBufferManager = &(GPUBufferManager::GetInstance());
     if (build_keys[0]->column_length == 0 || probe_keys[0]->column_length == 0) {
-        SIRIUS_LOG_DEBUG("N is 0");
+        SIRIUS_LOG_DEBUG("Input size is 0");
         count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
         count[0] = 0;
         return;
     }
+
+    SIRIUS_LOG_DEBUG("CUDF inner join");
+    SIRIUS_LOG_DEBUG("Build Input size: {}", build_keys[0]->column_length);
+    SIRIUS_LOG_DEBUG("Probe Input size: {}", probe_keys[0]->column_length);
+    SETUP_TIMING();
+    START_TIMER();
 
     cudf::set_current_device_resource(gpuBufferManager->mr);
 
@@ -45,19 +52,26 @@ void cudf_inner_join(vector<shared_ptr<GPUColumn>>& probe_keys, vector<shared_pt
 
     count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
     count[0] = result_count;
+
+    STOP_TIMER();
+    SIRIUS_LOG_DEBUG("CUDF Inner join result count: {}", count[0]);
 }
 
 void cudf_mixed_join(vector<shared_ptr<GPUColumn>>& probe_columns, vector<shared_ptr<GPUColumn>>& build_columns, const vector<JoinCondition>& conditions, JoinType join_type, uint64_t*& row_ids_left, uint64_t*& row_ids_right, uint64_t*& count) {
     
     GPUBufferManager *gpuBufferManager = &(GPUBufferManager::GetInstance());
     if (build_columns[0]->column_length == 0 || probe_columns[0]->column_length == 0) {
-        SIRIUS_LOG_DEBUG("N is 0");
+        SIRIUS_LOG_DEBUG("Input size is 0");
         count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
         count[0] = 0;
         return;
     }
 
     SIRIUS_LOG_DEBUG("CUDF mixed join");
+    SIRIUS_LOG_DEBUG("Build Input size: {}", build_columns[0]->column_length);
+    SIRIUS_LOG_DEBUG("Probe Input size: {}", probe_columns[0]->column_length);
+    SETUP_TIMING();
+    START_TIMER();
 
     cudf::set_current_device_resource(gpuBufferManager->mr);
 
@@ -112,6 +126,9 @@ void cudf_mixed_join(vector<shared_ptr<GPUColumn>>& probe_columns, vector<shared
 
     count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
     count[0] = result_count;
+
+    STOP_TIMER();
+    SIRIUS_LOG_DEBUG("CUDF Mixed join result count: {}", count[0]);
 }
 
 } //namespace duckdb

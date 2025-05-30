@@ -95,7 +95,7 @@ template <typename T>
 void binaryExpression(T *a, T *b, T *result, uint64_t N, int op_mode) {
     CHECK_ERROR();
     if (N == 0) {
-        SIRIUS_LOG_DEBUG("N is 0");
+        SIRIUS_LOG_DEBUG("Input size is 0");
         return;
     }
     SIRIUS_LOG_DEBUG("Launching Binary Expression Kernel");
@@ -109,11 +109,11 @@ template <typename T>
 void binaryConstantExpression(T *a, T b, T *result, uint64_t N, int op_mode) {
     CHECK_ERROR();
     if (N == 0) {
-        SIRIUS_LOG_DEBUG("N is 0");
+        SIRIUS_LOG_DEBUG("Input size is 0");
         return;
     }
     SIRIUS_LOG_DEBUG("Launching Binary Constant Expression Kernel");
-    SIRIUS_LOG_DEBUG("N: {}", N);
+    SIRIUS_LOG_DEBUG("Input size: {}", N);
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
     binary_constant_expression<T, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(a, b, result, N, op_mode);
     CHECK_ERROR();
@@ -169,11 +169,11 @@ __global__ void float_round_expression(float *a, float *result, int decimal_plac
 void doubleRoundExpression(double *a, double *result, int decimal_places, uint64_t N) {
     CHECK_ERROR();
     if (N == 0) {
-        SIRIUS_LOG_DEBUG("N is 0");
+        SIRIUS_LOG_DEBUG("Input size is 0");
         return;
     }
     SIRIUS_LOG_DEBUG("Launching Round Expression Kernel");
-    SIRIUS_LOG_DEBUG("N: {}", N);
+    SIRIUS_LOG_DEBUG("Input size: {}", N);
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
     double_round_expression<BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(a, result, decimal_places, N);
     CHECK_ERROR();
@@ -183,11 +183,11 @@ void doubleRoundExpression(double *a, double *result, int decimal_places, uint64
 void floatRoundExpression(float *a, float *result, int decimal_places, uint64_t N) {
     CHECK_ERROR();
     if (N == 0) {
-        SIRIUS_LOG_DEBUG("N is 0");
+        SIRIUS_LOG_DEBUG("Input size is 0");
         return;
     }
     SIRIUS_LOG_DEBUG("Launching Round Expression Kernel");
-    SIRIUS_LOG_DEBUG("N: {}", N);
+    SIRIUS_LOG_DEBUG("Input size: {}", N);
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
     float_round_expression<BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(a, result, decimal_places, N);
     CHECK_ERROR();

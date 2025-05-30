@@ -316,11 +316,6 @@ GPUBufferManager::customCudaHostAlloc(size_t size) {
 	return reinterpret_cast<T*>(cpuProcessing + start);
 };
 
-void 
-GPUBufferManager::Print() {
-    SIRIUS_LOG_DEBUG("I am inside GPU buffer manager");
-}
-
 DataWrapper GPUBufferManager::allocateStringChunk(DataChunk &input_chunk, size_t row_count, DataWrapper &prev_data) {
 	Vector input = input_chunk.data[0];
     size_t chunk_size = input_chunk.size();
@@ -470,8 +465,6 @@ GPUBufferManager::allocateColumnBufferInCPU(unique_ptr<MaterializedQueryResult> 
 }
 
 DataWrapper GPUBufferManager::allocateStrColumnInGPU(DataWrapper cpu_data, int gpu) {
-    // First copy the data
-    SIRIUS_LOG_DEBUG("CPU data called with {} chars and {} strings", cpu_data.num_bytes, cpu_data.size);
 
     DataWrapper result;
     result.is_string_data = cpu_data.is_string_data;

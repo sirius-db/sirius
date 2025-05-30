@@ -8,6 +8,7 @@
 #include "duckdb/execution/operator/join/physical_right_delim_join.hpp"
 #include "operator/gpu_physical_dummy_scan.hpp"
 #include "operator/gpu_physical_column_data_scan.hpp"
+#include "log/logging.hpp"
 
 namespace duckdb {
 
@@ -106,10 +107,12 @@ GPUPhysicalRightDelimJoin::Sink(GPUIntermediateRelation &input_relation) const {
 
 	// OperatorSinkInput join_sink_input {*join->sink_state, *lstate.join_state, input.interrupt_state};
 	// join->Sink(context, input_relation, join_sink_input);
+	SIRIUS_LOG_DEBUG("Sinking input relation to join");
 	join->Sink(input_relation);
 
 	// OperatorSinkInput distinct_sink_input {*distinct->sink_state, *lstate.distinct_state, input.interrupt_state};
 	// distinct->Sink(context, input_relation, distinct_sink_input);
+	SIRIUS_LOG_DEBUG("Sinking input relation to distinct group by");
 	distinct->Sink(input_relation);
 
 	return SinkResultType::FINISHED;
@@ -129,6 +132,7 @@ GPUPhysicalLeftDelimJoin::Sink(GPUIntermediateRelation &input_relation) const {
 	// distinct->Sink(context, input_relation, distinct_sink_input);
 	cached_chunk_scan.intermediate_relation = make_shared_ptr<GPUIntermediateRelation>(input_relation.columns.size());
 	for (int i = 0; i < input_relation.columns.size(); i++) {
+		SIRIUS_LOG_DEBUG("Passing input relation idx {} to column data scan idx {}", i, i);
 		cached_chunk_scan.intermediate_relation->columns[i] = input_relation.columns[i];
 		cached_chunk_scan.intermediate_relation->column_names[i] = input_relation.column_names[i];
 		cached_chunk_scan.intermediate_relation->names = input_relation.names;

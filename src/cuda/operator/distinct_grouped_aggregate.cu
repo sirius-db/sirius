@@ -168,7 +168,7 @@ void groupedDistinctAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t
     CHECK_ERROR();
     if (N == 0) {
         count[0] = 0;
-        SIRIUS_LOG_DEBUG("N is 0");
+        SIRIUS_LOG_DEBUG("Input size is 0");
         return;
     }
     SIRIUS_LOG_DEBUG("Launching Distinct Grouped Aggregate Kernel");
@@ -275,7 +275,7 @@ void groupedDistinctAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t
     }
 
     cudaDeviceSynchronize();
-    SIRIUS_LOG_DEBUG("Count: {}", h_count[0]);
+    SIRIUS_LOG_DEBUG("Grouped Distinct Aggregate Distinct Count: {}", h_count[0]);
     count[0] = h_count[0];
 
     T** keys_dev_result;

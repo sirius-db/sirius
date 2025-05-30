@@ -241,7 +241,7 @@ void groupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count,
     CHECK_ERROR();
     if (N == 0) {
         count[0] = 0;
-        SIRIUS_LOG_DEBUG("N is 0");
+        SIRIUS_LOG_DEBUG("Input size is 0");
         return;
     }
 
@@ -543,7 +543,7 @@ void groupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count,
 
     CHECK_ERROR();
     cudaDeviceSynchronize();
-    SIRIUS_LOG_DEBUG("Count: {}", count[0]);
+    SIRIUS_LOG_DEBUG("Grouped Aggregate Result Count: {}", count[0]);
 
     for (uint64_t i = 0; i < num_keys; i++) {
         gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(keys[i]), 0);
@@ -576,7 +576,7 @@ void groupedWithoutAggregate(uint8_t **keys, uint64_t* count, uint64_t N, uint64
     CHECK_ERROR();
     if (N == 0) {
         count[0] = 0;
-        SIRIUS_LOG_DEBUG("N is 0");
+        SIRIUS_LOG_DEBUG("Input size is 0");
         return;
     }
     SIRIUS_LOG_DEBUG("Launching Grouped Without Aggregate Kernel");
@@ -681,7 +681,7 @@ void groupedWithoutAggregate(uint8_t **keys, uint64_t* count, uint64_t N, uint64
 
     CHECK_ERROR();
     cudaDeviceSynchronize();
-    SIRIUS_LOG_DEBUG("Count: {}", count[0]);
+    SIRIUS_LOG_DEBUG("Grouped Without Aggregate Result Count: {}", count[0]);
 
     for (uint64_t i = 0; i < num_keys; i++) {
         gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(keys[i]), 0);
@@ -704,7 +704,7 @@ template<typename T>
 void combineColumns(T* a, T* b, T*& c, uint64_t N_a, uint64_t N_b) {
     CHECK_ERROR();
     if (N_a == 0 || N_b == 0) {
-        SIRIUS_LOG_DEBUG("N is 0");
+        SIRIUS_LOG_DEBUG("Input size is 0");
         return;
     }
     SIRIUS_LOG_DEBUG("Launching Combine Columns Kernel");

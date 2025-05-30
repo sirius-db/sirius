@@ -32,7 +32,7 @@ GPUPhysicalColumnDataScan::GetData(GPUIntermediateRelation &output_relation) con
 
 	// return chunk.size() == 0 ? SourceResultType::FINISHED : SourceResultType::HAVE_MORE_OUTPUT;
 
-	SIRIUS_LOG_DEBUG("Reading data from column data collection");
+	SIRIUS_LOG_DEBUG("Reading data from column data scan");
 	for (int col_idx = 0; col_idx < output_relation.columns.size(); col_idx++) {
 		// output_relation.columns[col_idx] = intermediate_relation->columns[col_idx];
 		output_relation.columns[col_idx] = make_shared_ptr<GPUColumn>(intermediate_relation->columns[col_idx]->column_length, intermediate_relation->columns[col_idx]->data_wrapper.type, intermediate_relation->columns[col_idx]->data_wrapper.data);

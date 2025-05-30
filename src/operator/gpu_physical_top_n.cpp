@@ -45,6 +45,7 @@ HandleTopN(vector<shared_ptr<GPUColumn>> &order_by_keys, vector<shared_ptr<GPUCo
 //===--------------------------------------------------------------------===//
 // SinkResultType PhysicalTopN::Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const {
 SinkResultType GPUPhysicalTopN::Sink(GPUIntermediateRelation& input_relation) const {
+	auto start = std::chrono::high_resolution_clock::now();
     // throw NotImplementedException("Top N Sink not implemented");
     if (dynamic_filter) {
         throw NotImplementedException("Top N Sink with dynamic filter not implemented");
@@ -105,6 +106,9 @@ SinkResultType GPUPhysicalTopN::Sink(GPUIntermediateRelation& input_relation) co
 	// sink.heap.Sink(chunk, &gstate.boundary_value);
 	// sink.heap.Reduce();
 	// return SinkResultType::NEED_MORE_INPUT;
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+	SIRIUS_LOG_DEBUG("Top N Sink time: {:.2f} ms", duration.count()/1000.0);
 	return SinkResultType::FINISHED;
 }
 
@@ -148,6 +152,7 @@ SinkResultType GPUPhysicalTopN::Sink(GPUIntermediateRelation& input_relation) co
 
 // SourceResultType PhysicalTopN::GetData(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &input) const {
 SourceResultType GPUPhysicalTopN::GetData(GPUIntermediateRelation& output_relation) const {
+	auto start = std::chrono::high_resolution_clock::now();
 	if (limit == 0) {
 		return SourceResultType::FINISHED;
 	}
@@ -177,6 +182,9 @@ SourceResultType GPUPhysicalTopN::GetData(GPUIntermediateRelation& output_relati
 	// gstate.heap.Scan(state.state, chunk);
 
 	// return chunk.size() == 0 ? SourceResultType::FINISHED : SourceResultType::HAVE_MORE_OUTPUT;
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+	SIRIUS_LOG_DEBUG("Top N GetData time: {:.2f} ms", duration.count()/1000.0);
     return SourceResultType::FINISHED;
 }
 
