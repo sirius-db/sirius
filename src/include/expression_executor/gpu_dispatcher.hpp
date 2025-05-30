@@ -1,5 +1,6 @@
 #pragma once
 
+#include "gpu_columns.hpp"
 #include <cudf/column/column.hpp>
 #include <memory>
 #include <rmm/resource_ref.hpp>
@@ -21,6 +22,9 @@ enum class StringMatchingType : uint8_t
 //----------Gpu Dispatcher----------//
 struct GpuDispatcher
 {
+    //----------Materialize----------//
+  static std::unique_ptr<cudf::column> DispatchMaterialize(const GPUColumn* input,
+                                                           rmm::device_async_resource_ref mr);
 
   //----------Substring----------//
   static std::unique_ptr<cudf::column> DispatchSubstring(const cudf::column_view& input,
