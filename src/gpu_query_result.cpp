@@ -12,23 +12,27 @@ void GPUResultCollection::SetCapacity(size_t capacity) {
 void GPUResultCollection::AddChunk(DataChunk& chunk) {
     num_rows += chunk.size();
     data_chunks[write_idx].Move(chunk);
-    std::cout << "AddChunk: After writing chunk to idx " << write_idx << " got num rows of " << num_rows << std::endl;
     write_idx += 1;
 }
 
 unique_ptr<DataChunk> GPUResultCollection::GetNext() {
     // We have returned all of the values then return the empty result
-    unique_ptr<DataChunk> result_value = make_uniq<DataChunk>();
     if(read_idx >= write_idx) {
         return nullptr;
     }
 
     // Create a result that references the value in the buffer
     DataChunk& return_chunk = data_chunks[read_idx];
-    result_value->Reference(return_chunk);
-    read_idx += 1;
+    unique_ptr<DataChunk> result_value = make_uniq<DataChunk>();
 
-    std::cout << "GPU Result Collection: Returning chunk with row count of " << result_value->size() << " for idx " << read_idx << std::endl;
+    result_value->InitializeEmpty(return_chunk.GetTypes());
+    result_value->SetCardinality(return_chunk.size());
+    for(int col = 0; col < return_chunk.data.size(); col++) {
+        result_value->data[col].Reference(return_chunk.data[col]);
+    }
+    read_idx += 1;
+    num_rows -= result_value->size();
+
     return result_value;
 }
 
@@ -51,7 +55,6 @@ string GPUQueryResult::ToBox(ClientContext &context, const BoxRendererConfig &co
 
 idx_t GPUQueryResult::RowCount() const {
     idx_t row_count = (idx_t) result_collection->size();
-    std::cout << "GPU Query Result: Returning row count of " << row_count << std::endl;
     return row_count;
 }
 
