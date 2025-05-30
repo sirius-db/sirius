@@ -1,4 +1,4 @@
-call gpu_buffer_init("1 GB", "1 GB");
+call gpu_buffer_init("15 GB", "15 GB");
 
 call gpu_processing("
 select

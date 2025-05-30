@@ -70,7 +70,7 @@ GPUBufferManager::GPUBufferManager(size_t cache_size_per_gpu, size_t processing_
     printf("Initializing GPU buffer manager\n");
     gpuCache = new uint8_t*[NUM_GPUS];
     gpuProcessing = new uint8_t*[NUM_GPUS];
-    cpuProcessing = allocatePinnedCPUMemory(5000 * 5000); // allocatePinnedCPUMemory(processing_size_per_cpu);
+    cpuProcessing = allocatePinnedCPUMemory(processing_size_per_cpu);
     gpuProcessingPointer = new size_t[NUM_GPUS];
     gpuCachingPointer = new size_t[NUM_GPUS];
     cpuProcessingPointer = 0;
