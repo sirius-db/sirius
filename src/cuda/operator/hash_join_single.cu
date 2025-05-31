@@ -243,8 +243,7 @@ void probeHashTableSingleMatch(uint8_t **keys, unsigned long long* ht, uint64_t 
         keys_data[idx] = reinterpret_cast<uint64_t*>(keys[idx]);
     }
 
-    uint64_t** keys_dev;
-    cudaMalloc((void**) &keys_dev, num_keys * sizeof(uint64_t*));
+    uint64_t** keys_dev = gpuBufferManager->customCudaMalloc<uint64_t*>(num_keys, 0, 0);
     cudaMemcpy(keys_dev, keys_data, num_keys * sizeof(uint64_t*), cudaMemcpyHostToDevice);
 
     int equal_keys = 0;
@@ -283,7 +282,7 @@ void probeHashTableSingleMatch(uint8_t **keys, unsigned long long* ht, uint64_t 
     //     gpuBufferManager->gpuProcessingPointer[0] = (reinterpret_cast<uint8_t*>(row_ids_left + h_count[0]) - gpuBufferManager->gpuProcessing[0]);
     // }
 
-    cudaFree(keys_dev);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(keys_dev), 0);
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(count), 0);
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(condition_mode_dev), 0);
 
@@ -308,8 +307,7 @@ void probeHashTableRightSemiAntiSingleMatch(uint8_t **keys, unsigned long long* 
         keys_data[idx] = reinterpret_cast<uint64_t*>(keys[idx]);
     }
 
-    uint64_t** keys_dev;
-    cudaMalloc((void**) &keys_dev, num_keys * sizeof(uint64_t*));
+    uint64_t** keys_dev = gpuBufferManager->customCudaMalloc<uint64_t*>(num_keys, 0, 0);
     cudaMemcpy(keys_dev, keys_data, num_keys * sizeof(uint64_t*), cudaMemcpyHostToDevice);
 
     int equal_keys = 0;
@@ -325,7 +323,7 @@ void probeHashTableRightSemiAntiSingleMatch(uint8_t **keys, unsigned long long* 
     CHECK_ERROR();
     cudaDeviceSynchronize();
 
-    cudaFree(keys_dev);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(keys_dev), 0);
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(condition_mode_dev), 0);
 
     SIRIUS_LOG_DEBUG("Finished probe right");
@@ -349,8 +347,7 @@ void probeHashTableMark(uint8_t **keys, unsigned long long* ht, uint64_t ht_len,
         keys_data[idx] = reinterpret_cast<uint64_t*>(keys[idx]);
     }
 
-    uint64_t** keys_dev;
-    cudaMalloc((void**) &keys_dev, num_keys * sizeof(uint64_t*));
+    uint64_t** keys_dev = gpuBufferManager->customCudaMalloc<uint64_t*>(num_keys, 0, 0);
     cudaMemcpy(keys_dev, keys_data, num_keys * sizeof(uint64_t*), cudaMemcpyHostToDevice);
 
     CHECK_ERROR();
@@ -372,7 +369,7 @@ void probeHashTableMark(uint8_t **keys, unsigned long long* ht, uint64_t ht_len,
     cudaDeviceSynchronize();
     STOP_TIMER();
 
-    cudaFree(keys_dev);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(keys_dev), 0);
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(condition_mode_dev), 0);
 }
 

@@ -480,13 +480,11 @@ void groupedStringAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t**
     sequence<BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(row_sequence, N);
     keys_row_id[num_keys] = reinterpret_cast<uint8_t*> (row_sequence);
 
-    uint8_t** keys_dev;
-    cudaMalloc((void**) &keys_dev, (num_keys + 1) * sizeof(uint8_t*));
+    uint8_t** keys_dev = gpuBufferManager->customCudaMalloc<uint8_t*>(num_keys + 1, 0, 0);
     cudaMemcpy(keys_dev, keys_row_id, (num_keys + 1) * sizeof(uint8_t*), cudaMemcpyHostToDevice);
     CHECK_ERROR();
 
-    uint64_t** offset_dev;
-    cudaMalloc((void**) &offset_dev, num_keys * sizeof(uint64_t*));
+    uint64_t** offset_dev = gpuBufferManager->customCudaMalloc<uint64_t*>(num_keys, 0, 0);
     cudaMemcpy(offset_dev, offset, num_keys * sizeof(uint64_t*), cudaMemcpyHostToDevice);
     CHECK_ERROR();
 
@@ -558,8 +556,7 @@ void groupedStringAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t**
 
     //copy num_bytes over
     cudaMemcpy(num_bytes, d_num_bytes, num_keys * sizeof(uint64_t), cudaMemcpyDeviceToHost);
-    uint64_t** group_byte_offset_dev;
-    cudaMalloc((void**) &group_byte_offset_dev, num_keys * sizeof(uint64_t*));
+    uint64_t** group_byte_offset_dev = gpuBufferManager->customCudaMalloc<uint64_t*>(num_keys, 0, 0);;
     cudaMemcpy(group_byte_offset_dev, group_byte_offset, num_keys * sizeof(uint64_t*), cudaMemcpyHostToDevice);
 
     //cub scan
@@ -808,8 +805,7 @@ void groupedStringAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t**
         }
     }
 
-    uint64_t** offset_dev_result;
-    cudaMalloc((void**) &offset_dev_result, num_keys * sizeof(uint64_t*));
+    uint64_t** offset_dev_result = gpuBufferManager->customCudaMalloc<uint64_t*>(num_keys, 0, 0);
     for (uint64_t i = 0; i < num_keys; i++) {
         gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(offset[i]), 0);
         offset[i] = gpuBufferManager->customCudaMalloc<uint64_t>(count[0], 0, 0);
@@ -822,8 +818,7 @@ void groupedStringAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t**
 
     CHECK_ERROR();
 
-    uint8_t** keys_dev_result;
-    cudaMalloc((void**) &keys_dev_result, num_keys * sizeof(uint8_t*));
+    uint8_t** keys_dev_result = gpuBufferManager->customCudaMalloc<uint8_t*>(num_keys, 0, 0);
     for (uint64_t i = 0; i < num_keys; i++) {
         uint64_t* temp_num_bytes = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
         cudaMemcpy(temp_num_bytes, offset[i] + count[0], sizeof(uint64_t), cudaMemcpyDeviceToHost);
@@ -853,11 +848,11 @@ void groupedStringAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t**
     }
 
     //free row_keys, row_sequence, materialized_temp
-    cudaFree(keys_dev);
-    cudaFree(offset_dev);
-    cudaFree(keys_dev_result);
-    cudaFree(offset_dev_result);
-    cudaFree(group_byte_offset_dev);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(keys_dev), 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(offset_dev), 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(group_byte_offset_dev), 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(offset_dev_result), 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(keys_dev_result), 0);
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(row_keys), 0);
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(row_sequence), 0);
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(materialized_temp), 0);
