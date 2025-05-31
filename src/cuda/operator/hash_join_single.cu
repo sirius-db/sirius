@@ -238,7 +238,7 @@ void probeHashTableSingleMatch(uint8_t **keys, unsigned long long* ht, uint64_t 
     cudaMemset(count, 0, sizeof(uint64_t));
 
     //reinterpret cast the keys to uint64_t
-    uint64_t** keys_data = new uint64_t*[num_keys];
+    uint64_t** keys_data = gpuBufferManager->customCudaHostAlloc<uint64_t*>(num_keys);
     for (int idx = 0; idx < num_keys; idx++) {
         keys_data[idx] = reinterpret_cast<uint64_t*>(keys[idx]);
     }
@@ -303,7 +303,7 @@ void probeHashTableRightSemiAntiSingleMatch(uint8_t **keys, unsigned long long* 
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 
     //reinterpret cast the keys to uint64_t
-    uint64_t** keys_data = new uint64_t*[num_keys];
+    uint64_t** keys_data = gpuBufferManager->customCudaHostAlloc<uint64_t*>(num_keys);
     for (int idx = 0; idx < num_keys; idx++) {
         keys_data[idx] = reinterpret_cast<uint64_t*>(keys[idx]);
     }
@@ -344,7 +344,7 @@ void probeHashTableMark(uint8_t **keys, unsigned long long* ht, uint64_t ht_len,
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 
     //reinterpret cast the keys to uint64_t
-    uint64_t** keys_data = new uint64_t*[num_keys];
+    uint64_t** keys_data = gpuBufferManager->customCudaHostAlloc<uint64_t*>(num_keys);
     for (int idx = 0; idx < num_keys; idx++) {
         keys_data[idx] = reinterpret_cast<uint64_t*>(keys[idx]);
     }

@@ -736,7 +736,7 @@ void q22FilterExpression(uint8_t *a, uint64_t* offset, uint64_t start_idx, uint6
 
     uint8_t* temp = gpuBufferManager->customCudaMalloc<uint8_t>(num_predicates * length, 0, 0);
     cudaMemcpy(temp, c_phone_val.c_str(), num_predicates * length * sizeof(uint8_t), cudaMemcpyHostToDevice);
-    uint8_t** h_c_phone_val = new uint8_t*[num_predicates];
+    uint8_t** h_c_phone_val = gpuBufferManager->customCudaHostAlloc<uint8_t*>(num_predicates);
     for (int i = 0; i < num_predicates; i++) {
         h_c_phone_val[i] = temp + i * length;
     }

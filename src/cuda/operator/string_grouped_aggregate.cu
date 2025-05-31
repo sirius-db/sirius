@@ -418,8 +418,8 @@ void groupedStringAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t**
     //cubmax
     // Get the maximum key length for each key
     uint64_t* key_length = gpuBufferManager->customCudaMalloc<uint64_t>(num_keys, 0, 0); // store the maximum length of each key
-    uint64_t** len = new uint64_t*[num_keys];
-    uint64_t* original_bytes = new uint64_t[num_keys];
+    uint64_t** len = gpuBufferManager->customCudaHostAlloc<uint64_t*>(num_keys);
+    uint64_t* original_bytes = gpuBufferManager->customCudaHostAlloc<uint64_t>(num_keys);
     for (int key = 0; key < num_keys; key++) {
         len[key] = gpuBufferManager->customCudaMalloc<uint64_t>(N, 0, 0);
 
@@ -451,7 +451,7 @@ void groupedStringAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t**
         }
     }
 
-    uint64_t* h_key_length = new uint64_t[num_keys];
+    uint64_t* h_key_length = gpuBufferManager->customCudaHostAlloc<uint64_t>(num_keys);
     cudaMemcpy(h_key_length, key_length, num_keys * sizeof(uint64_t), cudaMemcpyDeviceToHost);
     CHECK_ERROR();
 
@@ -469,7 +469,7 @@ void groupedStringAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t**
     uint8_t* row_keys = gpuBufferManager->customCudaMalloc<uint8_t>((total_length_bytes) * N, 0, 0);
     sort_keys_type_string* materialized_temp = reinterpret_cast<sort_keys_type_string*> (gpuBufferManager->customCudaMalloc<pointer_and_key>(N, 0, 0));
 
-    uint8_t** keys_row_id = new uint8_t*[num_keys + 1];
+    uint8_t** keys_row_id = gpuBufferManager->customCudaHostAlloc<uint8_t*>(num_keys + 1);
     for (uint64_t i = 0; i < num_keys; i++) {
         keys_row_id[i] = keys[i];
     }
@@ -524,7 +524,7 @@ void groupedStringAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t**
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_temp_storage), 0);
 
     SIRIUS_LOG_DEBUG("Gathering offset");
-    uint64_t** group_byte_offset = new uint64_t*[num_keys];
+    uint64_t** group_byte_offset = gpuBufferManager->customCudaHostAlloc<uint64_t*>(num_keys);
     uint64_t* distinct_bound = gpuBufferManager->customCudaMalloc<uint64_t>(N, 0, 0);
     uint64_t* group_idx = gpuBufferManager->customCudaMalloc<uint64_t>(N + 1, 0, 0);
     uint64_t* d_num_bytes = gpuBufferManager->customCudaMalloc<uint64_t>(num_keys, 0, 0);
@@ -577,11 +577,11 @@ void groupedStringAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t**
 
     //gather the aggregates based on the row_sequence
     SIRIUS_LOG_DEBUG("Gathering Aggregates");
-    V** aggregate_keys_temp = new V*[num_aggregates];
-    uint64_t** aggregate_star_temp = new uint64_t*[num_aggregates];
+    V** aggregate_keys_temp = gpuBufferManager->customCudaHostAlloc<V*>(num_aggregates);
+    uint64_t** aggregate_star_temp = gpuBufferManager->customCudaHostAlloc<uint64_t*>(num_aggregates);
     sort_keys_type_string* group_by_rows = reinterpret_cast<sort_keys_type_string*> (gpuBufferManager->customCudaMalloc<pointer_and_key>(N, 0, 0));
     uint64_t* d_num_runs_out = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
-    uint8_t** output_agg = new uint8_t*[num_aggregates];
+    uint8_t** output_agg = gpuBufferManager->customCudaHostAlloc<uint8_t*>(num_aggregates);
     uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
 
     for (int agg = 0; agg < num_aggregates; agg++) {

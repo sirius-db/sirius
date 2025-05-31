@@ -25,7 +25,9 @@ public:
 		gpuBufferManager = &(GPUBufferManager::GetInstance());
 		executor = new Executor(context);
 	};
-	// ~GPUExecutor();
+	~GPUExecutor() {
+		delete executor;
+	}
 
 	GPUBufferManager* gpuBufferManager;
 	ClientContext &context;

@@ -8,15 +8,15 @@ namespace duckdb {
 template <typename T>
 void
 ResolveTypeAggregateExpression(vector<shared_ptr<GPUColumn>> &aggregate_keys, GPUBufferManager* gpuBufferManager, const vector<unique_ptr<Expression>> &aggregates) {
-	uint8_t** aggregate_data = new uint8_t*[aggregates.size()];
-	uint8_t** result = new uint8_t*[aggregates.size()];
+	uint8_t** aggregate_data = gpuBufferManager->customCudaHostAlloc<uint8_t*>(aggregates.size());
+	uint8_t** result = gpuBufferManager->customCudaHostAlloc<uint8_t*>(aggregates.size());
 	for (int agg_idx = 0; agg_idx < aggregates.size(); agg_idx++) {
 		result[agg_idx] = nullptr;
 	}
 
 	size_t size = aggregate_keys[0]->column_length;
 
-	int* agg_mode = new int[aggregates.size()];
+	int* agg_mode = gpuBufferManager->customCudaHostAlloc<int>(aggregates.size());
 
 	for (int agg_idx = 0; agg_idx < aggregates.size(); agg_idx++) {
 		auto& expr = aggregates[agg_idx]->Cast<BoundAggregateExpression>();
@@ -104,7 +104,7 @@ HandleAggregateExpression(vector<shared_ptr<GPUColumn>> &aggregate_keys, GPUBuff
 
 void
 HandleAggregateExpressionCuDF(vector<shared_ptr<GPUColumn>> &aggregate_keys, GPUBufferManager* gpuBufferManager, const vector<unique_ptr<Expression>> &aggregates) {
-	AggregationType* agg_mode = new AggregationType[aggregates.size()];
+	AggregationType* agg_mode = gpuBufferManager->customCudaHostAlloc<AggregationType>(aggregates.size());
 	SIRIUS_LOG_DEBUG("Handling ungrouped aggregate expression");
 	for (int agg_idx = 0; agg_idx < aggregates.size(); agg_idx++) {
 		auto& expr = aggregates[agg_idx]->Cast<BoundAggregateExpression>();
