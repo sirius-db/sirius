@@ -326,10 +326,8 @@ tableScanExpression(uint8_t **col, uint64_t** offset, uint8_t *constant_compare,
     cudaMemcpy(d_data_type, data_type, num_expr * sizeof(int), cudaMemcpyHostToDevice);
     CHECK_ERROR();
 
-    uint8_t** d_col;
-    uint64_t** d_offset;
-    cudaMalloc((void**) &d_col, num_expr * sizeof(uint8_t*));
-    cudaMalloc((void**) &d_offset, num_expr * sizeof(uint64_t*));
+    uint8_t** d_col = gpuBufferManager->customCudaMalloc<uint8_t*>(num_expr, 0, 0);
+    uint64_t** d_offset = gpuBufferManager->customCudaMalloc<uint64_t*>(num_expr, 0, 0);
     cudaMemcpy(d_col, col, num_expr * sizeof(uint8_t*), cudaMemcpyHostToDevice);
     cudaMemcpy(d_offset, offset, num_expr * sizeof(uint64_t*), cudaMemcpyHostToDevice);
     CHECK_ERROR();
@@ -352,8 +350,8 @@ tableScanExpression(uint8_t **col, uint64_t** offset, uint8_t *constant_compare,
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(count), 0);
     count = h_count;
 
-    cudaFree(d_col);
-    cudaFree(d_offset);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_col), 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_offset), 0);
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_constant_compare), 0);
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_constant_offset), 0);
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_compare_mode), 0);

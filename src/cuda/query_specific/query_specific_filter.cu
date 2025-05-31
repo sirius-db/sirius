@@ -740,8 +740,7 @@ void q22FilterExpression(uint8_t *a, uint64_t* offset, uint64_t start_idx, uint6
     for (int i = 0; i < num_predicates; i++) {
         h_c_phone_val[i] = temp + i * length;
     }
-    uint8_t** d_c_phone_val;
-    cudaMalloc((void**) &d_c_phone_val, num_predicates * sizeof(uint8_t*));
+    uint8_t** d_c_phone_val = gpuBufferManager->customCudaMalloc<uint8_t*>(num_predicates, 0, 0);
     cudaMemcpy(d_c_phone_val, h_c_phone_val, num_predicates * sizeof(uint8_t*), cudaMemcpyHostToDevice);
     cudaMemset(count, 0, sizeof(uint64_t));
 
@@ -765,6 +764,8 @@ void q22FilterExpression(uint8_t *a, uint64_t* offset, uint64_t start_idx, uint6
     cudaDeviceSynchronize();
     count = h_count;
     SIRIUS_LOG_DEBUG("Count: {}", h_count[0]);
+
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_c_phone_val), 0);
 }
 
 } // namespace duckdb

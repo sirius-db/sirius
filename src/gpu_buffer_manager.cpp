@@ -48,6 +48,15 @@ GPUBufferManager::customCudaMalloc<void*>(size_t size, int gpu, bool caching);
 template string_group_by_record_type*
 GPUBufferManager::customCudaMalloc<string_group_by_record_type>(size_t size, int gpu, bool caching);
 
+template uint8_t**
+GPUBufferManager::customCudaMalloc<uint8_t*>(size_t size, int gpu, bool caching);
+
+template uint64_t**
+GPUBufferManager::customCudaMalloc<uint64_t*>(size_t size, int gpu, bool caching);
+
+template double**
+GPUBufferManager::customCudaMalloc<double*>(size_t size, int gpu, bool caching);
+
 template int*
 GPUBufferManager::customCudaHostAlloc<int>(size_t size);
 
