@@ -2,8 +2,11 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/parser/constraints/unique_constraint.hpp"
+#include "duckdb/planner/filter/constant_filter.hpp"
 #include "utils.hpp"
 #include "log/logging.hpp"
+#include "helper/types.hpp"
+#include "operator/gpu_physical_table_scan.hpp"
 
 #define NUM_GPUS 1
 
@@ -63,8 +66,47 @@ GPUBufferManager::customCudaHostAlloc<double>(size_t size);
 template char*
 GPUBufferManager::customCudaHostAlloc<char>(size_t size);
 
+template bool*
+GPUBufferManager::customCudaHostAlloc<bool>(size_t size);
+
 template string_t*
 GPUBufferManager::customCudaHostAlloc<string_t>(size_t size);
+
+template AggregationType*
+GPUBufferManager::customCudaHostAlloc<AggregationType>(size_t size);
+
+template OrderByType*
+GPUBufferManager::customCudaHostAlloc<OrderByType>(size_t size);
+
+template ScanDataType*
+GPUBufferManager::customCudaHostAlloc<ScanDataType>(size_t size);
+
+template CompareType*
+GPUBufferManager::customCudaHostAlloc<CompareType>(size_t size);
+
+template int**
+GPUBufferManager::customCudaHostAlloc<int*>(size_t size);
+
+template uint64_t**
+GPUBufferManager::customCudaHostAlloc<uint64_t*>(size_t size);
+
+template uint8_t**
+GPUBufferManager::customCudaHostAlloc<uint8_t*>(size_t size);
+
+template float**
+GPUBufferManager::customCudaHostAlloc<float*>(size_t size);
+
+template double**
+GPUBufferManager::customCudaHostAlloc<double*>(size_t size);
+
+template char**
+GPUBufferManager::customCudaHostAlloc<char*>(size_t size);
+
+template string_t**
+GPUBufferManager::customCudaHostAlloc<string_t*>(size_t size);
+
+template ConstantFilter**
+GPUBufferManager::customCudaHostAlloc<ConstantFilter*>(size_t size);
 
 GPUBufferManager::GPUBufferManager(size_t cache_size_per_gpu, size_t processing_size_per_gpu, size_t processing_size_per_cpu) : 
     cache_size_per_gpu(cache_size_per_gpu), processing_size_per_gpu(processing_size_per_gpu), processing_size_per_cpu(processing_size_per_cpu) {
@@ -103,8 +145,12 @@ GPUBufferManager::~GPUBufferManager() {
         mr->deallocate((void*) gpuProcessing[gpu], processing_size_per_gpu);
     }
     freePinnedCPUMemory(cpuProcessing);
+    delete[] gpuCache;
+    delete[] gpuProcessing;
     delete[] gpuProcessingPointer;
     delete[] gpuCachingPointer;
+    delete mr;
+    delete cuda_mr;
 }
 
 void GPUBufferManager::ResetBuffer() {
@@ -229,15 +275,15 @@ GPUBufferManager::copyDataFromcuDFColumn(cudf::column_view& column, int gpu) {
 
     if (column.type() == cudf::data_type(cudf::type_id::STRING)) {
 
-        int32_t* temp_num_bytes = new int32_t[1];
+        int32_t temp_num_bytes;
         int32_t* temp_offset = const_cast<int32_t*>(column.child(0).data<int32_t>());
-        callCudaMemcpyDeviceToHost<int32_t>(temp_num_bytes, temp_offset + column.size(), 1, 0);
-        uint8_t* temp_column = customCudaMalloc<uint8_t>(temp_num_bytes[0], 0, false);
-        callCudaMemcpyDeviceToDevice<uint8_t>(temp_column, data, temp_num_bytes[0], 0);
+        callCudaMemcpyDeviceToHost<int32_t>(&temp_num_bytes, temp_offset + column.size(), 1, 0);
+        uint8_t* temp_column = customCudaMalloc<uint8_t>(temp_num_bytes, 0, false);
+        callCudaMemcpyDeviceToDevice<uint8_t>(temp_column, data, temp_num_bytes, 0);
 
         shared_ptr<GPUColumn> column_ptr = make_shared_ptr<GPUColumn>(column.size(), ColumnType::VARCHAR, temp_column);
         column_ptr->convertCudfOffsetToSiriusOffset(temp_offset);
-        column_ptr->data_wrapper.num_bytes = temp_num_bytes[0];
+        column_ptr->data_wrapper.num_bytes = temp_num_bytes;
         column_ptr->data_wrapper.is_string_data = true;
         return column_ptr;
     } else if (column.type() == cudf::data_type(cudf::type_id::UINT64)) {

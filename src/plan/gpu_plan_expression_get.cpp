@@ -46,7 +46,7 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::CreatePlan(LogicalExpr
         if (op.expressions[expression_idx].size() > 1) {
             throw NotImplementedException("Expression get not supported");
         }
-        uint64_t* h_data = new uint64_t[1];
+        uint64_t* h_data = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
         uint64_t* d_data = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
         if (op.expressions[expression_idx][0]->type == ExpressionType::VALUE_CONSTANT) {
             auto &constant_expr = op.expressions[expression_idx][0]->Cast<BoundConstantExpression>();

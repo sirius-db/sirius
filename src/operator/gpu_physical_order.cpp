@@ -8,9 +8,10 @@
 namespace duckdb {
 
 void ResolveOrderByString(vector<shared_ptr<GPUColumn>> &sort_columns, int* sort_orders, int num_cols) {
-  uint8_t** col_keys = new uint8_t*[num_cols];
-  uint64_t** col_offsets = new uint64_t*[num_cols];
-  uint64_t* col_num_bytes = new uint64_t[num_cols];
+  GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+  uint8_t** col_keys = gpuBufferManager->customCudaHostAlloc<uint8_t*>(num_cols);
+  uint64_t** col_offsets = gpuBufferManager->customCudaHostAlloc<uint64_t*>(num_cols);
+  uint64_t* col_num_bytes = gpuBufferManager->customCudaHostAlloc<uint64_t>(num_cols);
 
   for(int i = 0; i < num_cols; i++) {
     shared_ptr<GPUColumn> curr_column = sort_columns[i];
@@ -37,7 +38,8 @@ void ResolveOrderByString(vector<shared_ptr<GPUColumn>> &sort_columns, int* sort
 
 void
 HandleOrderBy(vector<shared_ptr<GPUColumn>> &order_by_keys, vector<shared_ptr<GPUColumn>> &projection_columns, const vector<BoundOrderByNode> &orders, uint64_t num_projections) {
-	OrderByType* order_by_type = new OrderByType[orders.size()];
+  GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+	OrderByType* order_by_type = gpuBufferManager->customCudaHostAlloc<OrderByType>(orders.size());
 	for (int order_idx = 0; order_idx < orders.size(); order_idx++) {
 		if (orders[order_idx].type == OrderType::ASCENDING) {
 			order_by_type[order_idx] = OrderByType::ASCENDING;

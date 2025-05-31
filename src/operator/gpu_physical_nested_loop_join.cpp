@@ -21,8 +21,8 @@ template <typename T>
 void ResolveTypeNestedLoopJoin(vector<shared_ptr<GPUColumn>> &left_keys, vector<shared_ptr<GPUColumn>> &right_keys, uint64_t* &count, uint64_t* &row_ids_left, uint64_t* &row_ids_right, 
 		const vector<JoinCondition> &conditions, JoinType join_type, GPUBufferManager* gpuBufferManager) {
 	int num_keys = conditions.size();
-	T** left_data = new T*[num_keys];
-	T** right_data = new T*[num_keys];
+	T** left_data = gpuBufferManager->customCudaHostAlloc<T*>(num_keys);
+	T** right_data = gpuBufferManager->customCudaHostAlloc<T*>(num_keys);
 
 	for (int key = 0; key < num_keys; key++) {
 		left_data[key] = reinterpret_cast<T*>(left_keys[key]->data_wrapper.data);
@@ -32,7 +32,7 @@ void ResolveTypeNestedLoopJoin(vector<shared_ptr<GPUColumn>> &left_keys, vector<
 	size_t right_size = right_keys[0]->column_length;
 
 
-	int* condition_mode = new int[num_keys];
+	int* condition_mode = gpuBufferManager->customCudaHostAlloc<int>(num_keys);
 	for (int key = 0; key < num_keys; key++) {
 		if (conditions[key].comparison == ExpressionType::COMPARE_EQUAL || conditions[key].comparison == ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
 			condition_mode[key] = 0;
@@ -194,9 +194,10 @@ void GPUPhysicalNestedLoopJoin::ResolveSimpleJoin(GPUIntermediateRelation &input
         input_relation.checkLateMaterialization(join_key_index);
 	}
 
+	GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 	if (join_type == JoinType::SEMI || join_type == JoinType::ANTI || join_type == JoinType::MARK) {
 		SIRIUS_LOG_DEBUG("Writing row IDs from left side to output relation");
-		uint64_t* left_row_ids = new uint64_t[1];
+		uint64_t* left_row_ids = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
 		for (idx_t i = 0; i < input_relation.column_count; i++) {
 			SIRIUS_LOG_DEBUG("Passing column idx {} from LHS (late materialized) to idx {} in output relation", i, i);
 			output_relation.columns[i] = input_relation.columns[i];

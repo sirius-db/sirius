@@ -437,8 +437,8 @@ void hashGroupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* co
         CHECK_ERROR();
     }
 
-    T* max_key_host = new T[num_keys];
-    T* min_key_host = new T[num_keys];
+    T* max_key_host = gpuBufferManager->customCudaHostAlloc<T>(num_keys);
+    T* min_key_host = gpuBufferManager->customCudaHostAlloc<T>(num_keys);
     cudaMemcpy(max_key_host, max_key, num_keys * sizeof(T), cudaMemcpyDeviceToHost);
     cudaMemcpy(min_key_host, min_key, num_keys * sizeof(T), cudaMemcpyDeviceToHost);
 
@@ -513,8 +513,8 @@ void hashGroupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* co
     cudaMemcpy(h_count, d_count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
     assert(h_count[0] > 0);
 
-    uint8_t** keys_result = new uint8_t*[num_keys];
-    uint8_t** aggregate_keys_result = new uint8_t*[num_aggregates];
+    uint8_t** keys_result = gpuBufferManager->customCudaHostAlloc<uint8_t*>(num_keys);
+    uint8_t** aggregate_keys_result = gpuBufferManager->customCudaHostAlloc<uint8_t*>(num_aggregates);
     for (int i = 0; i < num_keys; i++) {
         keys_result[i] = gpuBufferManager->customCudaMalloc<uint8_t>(h_count[0] * sizeof(T), 0, 0);
     }

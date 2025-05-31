@@ -35,7 +35,6 @@ GPUExecutor::Reset() {
 void GPUExecutor::Initialize(unique_ptr<GPUPhysicalOperator> plan) {
 	SIRIUS_LOG_DEBUG("Initializing GPUExecutor");
 	Reset();
-	gpuBufferManager->ResetBuffer();
 	gpu_owned_plan = std::move(plan);
 	InitializeInternal(*gpu_owned_plan);
 }
