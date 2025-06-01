@@ -14,14 +14,14 @@ ResolveTypeProbeExpression(vector<shared_ptr<GPUColumn>> &probe_keys, uint64_t* 
 		unsigned long long* ht, uint64_t ht_len, const vector<JoinCondition> &conditions, JoinType join_type,
 		bool unique_build_keys, GPUBufferManager* gpuBufferManager) {
 	int num_keys = conditions.size();
-	uint8_t** probe_data = new uint8_t*[num_keys];
+	uint8_t** probe_data = gpuBufferManager->customCudaHostAlloc<uint8_t*>(num_keys);
 
 	for (int key = 0; key < num_keys; key++) {
 		probe_data[key] = probe_keys[key]->data_wrapper.data;
 	}
 	size_t size = probe_keys[0]->column_length;
 
-	int* condition_mode = new int[num_keys];
+	int* condition_mode = gpuBufferManager->customCudaHostAlloc<int>(num_keys);
 	for (int key = 0; key < num_keys; key++) {
 		if (conditions[key].comparison == ExpressionType::COMPARE_EQUAL || conditions[key].comparison == ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
 			condition_mode[key] = 0;
@@ -81,14 +81,14 @@ ResolveTypeMarkExpression(vector<shared_ptr<GPUColumn>> &probe_keys, uint8_t* &o
 		unsigned long long* ht, uint64_t ht_len, const vector<JoinCondition> &conditions, GPUBufferManager* gpuBufferManager) {
 
 	int num_keys = conditions.size();
-	uint8_t** probe_data = new uint8_t*[num_keys];
+	uint8_t** probe_data = gpuBufferManager->customCudaHostAlloc<uint8_t*>(num_keys);
 
 	for (int key = 0; key < num_keys; key++) {
 		probe_data[key] = probe_keys[key]->data_wrapper.data;
 	}
 	size_t size = probe_keys[0]->column_length;
 
-	int* condition_mode = new int[num_keys];
+	int* condition_mode = gpuBufferManager->customCudaHostAlloc<int>(num_keys);
 	for (int key = 0; key < num_keys; key++) {
 		if (conditions[key].comparison == ExpressionType::COMPARE_EQUAL || conditions[key].comparison == ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
 			condition_mode[key] = 0;
@@ -122,14 +122,14 @@ void
 ResolveTypeBuildExpression(vector<shared_ptr<GPUColumn>> &build_keys, unsigned long long* ht, uint64_t ht_len, 
 	const vector<JoinCondition> &conditions, JoinType join_type, GPUBufferManager* gpuBufferManager) {
 	int num_keys = conditions.size();
-	uint8_t** build_data = new uint8_t*[num_keys];
+	uint8_t** build_data = gpuBufferManager->customCudaHostAlloc<uint8_t*>(num_keys);
 
 	for (int key = 0; key < num_keys; key++) {
 		build_data[key] = build_keys[key]->data_wrapper.data;
 	}
 	size_t size = build_keys[0]->column_length;
 
-	int* condition_mode = new int[num_keys];
+	int* condition_mode = gpuBufferManager->customCudaHostAlloc<int>(num_keys);
 	for (int key = 0; key < num_keys; key++) {
 		if (conditions[key].comparison == ExpressionType::COMPARE_EQUAL || conditions[key].comparison == ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
 			condition_mode[key] = 0;

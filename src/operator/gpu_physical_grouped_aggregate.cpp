@@ -62,8 +62,8 @@ void
 ResolveTypeGroupByAggregateExpression(vector<shared_ptr<GPUColumn>> &group_by_keys, vector<shared_ptr<GPUColumn>> &aggregate_keys, GPUBufferManager* gpuBufferManager, const vector<unique_ptr<Expression>> &aggregates, int num_group_keys) {
 	uint64_t count[1];
 	count[0] = 0;
-	uint8_t** group_by_data = new uint8_t*[num_group_keys];
-	uint8_t** aggregate_data = new uint8_t*[aggregates.size()];
+	uint8_t** group_by_data = gpuBufferManager->customCudaHostAlloc<uint8_t*>(num_group_keys);
+	uint8_t** aggregate_data = gpuBufferManager->customCudaHostAlloc<uint8_t*>(aggregates.size());
 
 	for (int group = 0; group < num_group_keys; group++) {
 		if (group_by_keys[group]->data_wrapper.data == nullptr && group_by_keys[group]->column_length != 0) {
@@ -73,7 +73,7 @@ ResolveTypeGroupByAggregateExpression(vector<shared_ptr<GPUColumn>> &group_by_ke
 	}
 	size_t size = group_by_keys[0]->column_length;
 
-	int* agg_mode = new int[aggregates.size()];
+	int* agg_mode = gpuBufferManager->customCudaHostAlloc<int>(aggregates.size());
 
 	for (int agg_idx = 0; agg_idx < aggregates.size(); agg_idx++) {
 		auto& expr = aggregates[agg_idx]->Cast<BoundAggregateExpression>();
@@ -132,10 +132,10 @@ void
 ResolveTypeGroupByString(vector<shared_ptr<GPUColumn>> &group_by_keys, vector<shared_ptr<GPUColumn>> &aggregate_keys, GPUBufferManager* gpuBufferManager, const vector<unique_ptr<Expression>> &aggregates, int num_group_keys) {
 	uint64_t count[1];
 	count[0] = 0;
-	uint8_t** group_by_data = new uint8_t*[num_group_keys];
-	uint64_t** offset_data = new uint64_t*[num_group_keys];
-	uint64_t* num_bytes = new uint64_t[num_group_keys];
-	uint8_t** aggregate_data = new uint8_t*[aggregates.size()];
+	uint8_t** group_by_data = gpuBufferManager->customCudaHostAlloc<uint8_t*>(num_group_keys);
+	uint64_t** offset_data = gpuBufferManager->customCudaHostAlloc<uint64_t*>(num_group_keys);
+	uint64_t* num_bytes = gpuBufferManager->customCudaHostAlloc<uint64_t>(num_group_keys);
+	uint8_t** aggregate_data = gpuBufferManager->customCudaHostAlloc<uint8_t*>(aggregates.size());
 
 	size_t size = group_by_keys[0]->column_length;
 	uint64_t num_rows = static_cast<uint64_t>(size);
@@ -153,7 +153,7 @@ ResolveTypeGroupByString(vector<shared_ptr<GPUColumn>> &group_by_keys, vector<sh
 		}
 	}
 
-	int* agg_mode = new int[aggregates.size()];
+	int* agg_mode = gpuBufferManager->customCudaHostAlloc<int>(aggregates.size());
 	for (int agg_idx = 0; agg_idx < aggregates.size(); agg_idx++) {
 		auto& expr = aggregates[agg_idx]->Cast<BoundAggregateExpression>();
 		SIRIUS_LOG_DEBUG("Aggregate function name {}", expr.function.name);
@@ -287,7 +287,7 @@ HandleGroupByAggregateExpression(vector<shared_ptr<GPUColumn>> &group_by_keys, v
 void
 HandleGroupByAggregateCuDF(vector<shared_ptr<GPUColumn>> &group_by_keys, vector<shared_ptr<GPUColumn>> &aggregate_keys, GPUBufferManager* gpuBufferManager, const vector<unique_ptr<Expression>> &aggregates, int num_group_keys) {
 
-	AggregationType* agg_mode = new AggregationType[aggregates.size()];
+	AggregationType* agg_mode = gpuBufferManager->customCudaHostAlloc<AggregationType>(aggregates.size());
 	SIRIUS_LOG_DEBUG("Handling group by aggregate expression");
 	for (int agg_idx = 0; agg_idx < aggregates.size(); agg_idx++) {
 		auto& expr = aggregates[agg_idx]->Cast<BoundAggregateExpression>();
@@ -320,7 +320,7 @@ template <typename T>
 void ResolveTypeDuplicateElimination(vector<shared_ptr<GPUColumn>> &group_by_keys, GPUBufferManager* gpuBufferManager, int num_group_keys) {
 	uint64_t count[1];
 	count[0] = 0;
-	uint8_t** group_by_data = new uint8_t*[num_group_keys];
+	uint8_t** group_by_data = gpuBufferManager->customCudaHostAlloc<uint8_t*>(num_group_keys);
 
 	for (int group = 0; group < num_group_keys; group++) {
 		group_by_data[group] = (group_by_keys[group]->data_wrapper.data);
@@ -359,15 +359,15 @@ template <typename T, typename V>
 void ResolveTypeDistinctGroupBy(vector<shared_ptr<GPUColumn>> &group_by_keys, vector<shared_ptr<GPUColumn>> &aggregate_keys, GPUBufferManager* gpuBufferManager, DistinctAggregateCollectionInfo &distinct_info, int num_group_keys) {
 	uint64_t count[1];
 	count[0] = 0;
-	uint8_t** group_by_data = new uint8_t*[num_group_keys];
-	uint8_t** distinct_aggregate_data = new uint8_t*[distinct_info.indices.size()];
+	uint8_t** group_by_data = gpuBufferManager->customCudaHostAlloc<uint8_t*>(num_group_keys);
+	uint8_t** distinct_aggregate_data = gpuBufferManager->customCudaHostAlloc<uint8_t*>(distinct_info.indices.size());
 
 	for (int group = 0; group < num_group_keys; group++) {
 		group_by_data[group] = (group_by_keys[group]->data_wrapper.data);
 	}
 	size_t size = group_by_keys[0]->column_length;
 
-	int* distinct_mode = new int[distinct_info.indices.size()];
+	int* distinct_mode = gpuBufferManager->customCudaHostAlloc<int>(distinct_info.indices.size());
 
 	for (int idx = 0; idx < distinct_info.indices.size(); idx++) {
 		auto distinct_idx = distinct_info.indices[idx];

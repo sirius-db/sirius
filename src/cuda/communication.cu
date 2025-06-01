@@ -126,16 +126,4 @@ void callCudaMemcpyDeviceToDevice(T* dest, T* src, size_t size, int gpu) {
     STOP_TIMER();
 }
 
-// Define the host function that launches the CUDA kernel
-int* sendDataToGPU(int* data, int size) {
-    SIRIUS_LOG_DEBUG("Send data to GPU");
-    // use cudamemcpy
-    int* target;
-    cudaMalloc((void**) &target, size * sizeof(int));
-    cudaMemcpy(target, data, size * sizeof(int), cudaMemcpyHostToDevice);
-    cudaDeviceSynchronize();
-    SIRIUS_LOG_DEBUG("Done sending data to GPU");
-    return target;
-}
-
 } // namespace duckdb

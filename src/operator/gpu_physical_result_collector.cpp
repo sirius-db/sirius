@@ -211,12 +211,11 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 	auto start = std::chrono::high_resolution_clock::now();
 	// auto &gstate = GetGlobalSinkState(input_relation.context);
 
-	size_t size_bytes = 0;
-	Allocator& allocator = Allocator::DefaultAllocator();
-	uint8_t** host_data = new uint8_t*[input_relation.columns.size()];
-	GPUIntermediateRelation materialized_relation(input_relation.columns.size());
-	string_t** duckdb_strings = new string_t*[input_relation.columns.size()];
 	GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+	size_t size_bytes = 0;
+	uint8_t** host_data = gpuBufferManager->customCudaHostAlloc<uint8_t*>(input_relation.columns.size());
+	GPUIntermediateRelation materialized_relation(input_relation.columns.size());
+	string_t** duckdb_strings = gpuBufferManager->customCudaHostAlloc<string_t*>(input_relation.columns.size());
 	for (int col = 0; col < input_relation.columns.size(); col++) {
 		// TODO: Need to fix this for the future, but for now, we will just return when there is null column
 		if (input_relation.columns[col]->data_wrapper.data == nullptr) return SinkResultType::FINISHED;
@@ -253,7 +252,7 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 			DataWrapper strings_data_wrapper = materialized_relation.columns[col]->data_wrapper;
 			char* str_all_chars = reinterpret_cast<char*>(strings_data_wrapper.data);
 			size_t num_strings = strings_data_wrapper.size;
-			duckdb_strings[col] = new string_t[num_strings];
+			duckdb_strings[col] = gpuBufferManager->customCudaHostAlloc<string_t>(num_strings);
 			for(size_t i = 0; i < num_strings; i++) {
 				uint64_t str_start_offset = strings_data_wrapper.offset[i];
 				uint64_t curr_str_length = strings_data_wrapper.offset[i + 1] - str_start_offset;

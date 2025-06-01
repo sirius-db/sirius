@@ -22,14 +22,15 @@ GPUPhysicalTableScan::GPUPhysicalTableScan(vector<LogicalType> types, TableFunct
         column_ids(std::move(column_ids_p)), projection_ids(std::move(projection_ids_p)), names(std::move(names_p)),
         table_filters(std::move(table_filters_p)), extra_info(extra_info), parameters(std::move(parameters_p)) {
 
-    column_size = new uint64_t[column_ids.size()];
+    GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+    column_size = gpuBufferManager->customCudaHostAlloc<uint64_t>(column_ids.size());
     for (int col = 0; col < column_ids.size(); col++) {
       column_size[col] = 0;
       scanned_types.push_back(returned_types[column_ids[col].GetPrimaryIndex()]);
       scanned_ids.push_back(col);
     }
     fake_table_filters = make_uniq<TableFilterSet>();
-    already_cached = new bool[column_ids.size()];
+    already_cached = gpuBufferManager->customCudaHostAlloc<bool>(column_ids.size());
     SIRIUS_LOG_DEBUG("Table scan column ids: {}", column_ids.size());
 }
 
@@ -247,12 +248,12 @@ HandleMaterializeExpression(shared_ptr<GPUColumn> column, GPUBufferManager* gpuB
 
 
 void HandleArbitraryConstantExpression(vector<shared_ptr<GPUColumn>> &column, uint64_t* &count, uint64_t* &row_ids, ConstantFilter** &filter_constant, int num_expr) {
-  
-  uint8_t** col = new uint8_t*[num_expr];
-  uint64_t** offset = new uint64_t*[num_expr];
-  uint64_t* constant_offset = new uint64_t[num_expr + 1];
-  CompareType* compare_mode = new CompareType[num_expr];
-  ScanDataType* data_type = new ScanDataType[num_expr];
+  GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+  uint8_t** col = gpuBufferManager->customCudaHostAlloc<uint8_t*>(num_expr);
+  uint64_t** offset = gpuBufferManager->customCudaHostAlloc<uint64_t*>(num_expr);
+  uint64_t* constant_offset = gpuBufferManager->customCudaHostAlloc<uint64_t>(num_expr + 1);
+  CompareType* compare_mode = gpuBufferManager->customCudaHostAlloc<CompareType>(num_expr);
+  ScanDataType* data_type = gpuBufferManager->customCudaHostAlloc<ScanDataType>(num_expr);
 
   int total_bytes = 0;
   for (int expr = 0; expr < num_expr; expr++) {
@@ -308,7 +309,7 @@ void HandleArbitraryConstantExpression(vector<shared_ptr<GPUColumn>> &column, ui
     }
   }
 
-  uint8_t* constant_compare = new uint8_t[total_bytes];
+  uint8_t* constant_compare = gpuBufferManager->customCudaHostAlloc<uint8_t>(total_bytes);
 
   uint64_t init_offset = 0;
   for (int expr = 0; expr < num_expr; expr++) {
@@ -521,11 +522,11 @@ GPUPhysicalTableScan::ScanDataDuckDB(GPUBufferManager* gpuBufferManager, string 
     if (function.function) {
       bool has_more_output = true;
       // allocate size in gpu buffer manager cpu processing region
-      uint8_t** ptr = new uint8_t*[scanned_types.size()];
-      uint8_t** d_ptr = new uint8_t*[scanned_types.size()];
-      uint8_t** tmp_ptr = new uint8_t*[scanned_types.size()];
-      uint64_t** offset_ptr = new uint64_t*[scanned_types.size()];
-      uint64_t** d_offset_ptr = new uint64_t*[scanned_types.size()];
+      uint8_t** ptr = gpuBufferManager->customCudaHostAlloc<uint8_t*>(scanned_types.size());
+      uint8_t** d_ptr = gpuBufferManager->customCudaHostAlloc<uint8_t*>(scanned_types.size());
+      uint8_t** tmp_ptr = gpuBufferManager->customCudaHostAlloc<uint8_t*>(scanned_types.size());
+      uint64_t** offset_ptr = gpuBufferManager->customCudaHostAlloc<uint64_t*>(scanned_types.size());
+      uint64_t** d_offset_ptr = gpuBufferManager->customCudaHostAlloc<uint64_t*>(scanned_types.size());
 
       for (int col = 0; col < scanned_types.size(); col++) {
         if (!already_cached[col]) {
@@ -700,7 +701,7 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
         }
       }
 
-      ConstantFilter** filter_constants = new ConstantFilter*[num_expr];
+      ConstantFilter** filter_constants = gpuBufferManager->customCudaHostAlloc<ConstantFilter*>(num_expr);
       vector<shared_ptr<GPUColumn>> expression_columns(num_expr);
 
       int expr_idx = 0;

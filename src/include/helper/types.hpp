@@ -1,3 +1,5 @@
+#pragma once
+
 namespace duckdb {
 
 enum class OrderByType {
