@@ -405,12 +405,10 @@ void hashGroupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* co
     SIRIUS_LOG_DEBUG("Launching Hash Grouped Aggregate Kernel");
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 
-    T** keys_dev;
-    cudaMalloc((void**) &keys_dev, num_keys * sizeof(T*));
+    T** keys_dev = gpuBufferManager->customCudaMalloc<T*>(num_keys, 0, 0);
     cudaMemcpy(keys_dev, reinterpret_cast<T*>(keys), num_keys * sizeof(T*), cudaMemcpyHostToDevice);
 
-    V** aggregate_keys_dev;
-    cudaMalloc((void**) &aggregate_keys_dev, num_aggregates * sizeof(V*));
+    V** aggregate_keys_dev = gpuBufferManager->customCudaMalloc<V*>(num_aggregates, 0, 0);
     cudaMemcpy(aggregate_keys_dev, reinterpret_cast<V*>(aggregate_keys), num_aggregates * sizeof(V*), cudaMemcpyHostToDevice);
 
     int* agg_mode_dev = gpuBufferManager->customCudaMalloc<int>(num_aggregates, 0, 0);
@@ -437,8 +435,8 @@ void hashGroupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* co
         CHECK_ERROR();
     }
 
-    T* max_key_host = new T[num_keys];
-    T* min_key_host = new T[num_keys];
+    T* max_key_host = gpuBufferManager->customCudaHostAlloc<T>(num_keys);
+    T* min_key_host = gpuBufferManager->customCudaHostAlloc<T>(num_keys);
     cudaMemcpy(max_key_host, max_key, num_keys * sizeof(T), cudaMemcpyDeviceToHost);
     cudaMemcpy(min_key_host, min_key, num_keys * sizeof(T), cudaMemcpyDeviceToHost);
 
@@ -501,8 +499,8 @@ void hashGroupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* co
     
     CHECK_ERROR();
 
-    uint8_t** keys_dev_result;
-    uint8_t** aggregate_keys_dev_result;
+    uint8_t** keys_dev_result = gpuBufferManager->customCudaMalloc<uint8_t*>(num_keys, 0, 0);
+    uint8_t** aggregate_keys_dev_result = gpuBufferManager->customCudaMalloc<uint8_t*>(num_aggregates, 0, 0);
     uint64_t* d_count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
     cudaMemset(d_count, 0, sizeof(uint64_t));
     scan_hash_group<T, V, BLOCK_THREADS, ITEMS_PER_THREAD><<<(ht_len + tile_items - 1)/tile_items, BLOCK_THREADS>>>(ht, nullptr, nullptr, 
@@ -513,8 +511,8 @@ void hashGroupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* co
     cudaMemcpy(h_count, d_count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
     assert(h_count[0] > 0);
 
-    uint8_t** keys_result = new uint8_t*[num_keys];
-    uint8_t** aggregate_keys_result = new uint8_t*[num_aggregates];
+    uint8_t** keys_result = gpuBufferManager->customCudaHostAlloc<uint8_t*>(num_keys);
+    uint8_t** aggregate_keys_result = gpuBufferManager->customCudaHostAlloc<uint8_t*>(num_aggregates);
     for (int i = 0; i < num_keys; i++) {
         keys_result[i] = gpuBufferManager->customCudaMalloc<uint8_t>(h_count[0] * sizeof(T), 0, 0);
     }
@@ -528,8 +526,6 @@ void hashGroupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* co
         }
     }
     
-    cudaMalloc((void**) &keys_dev_result, num_keys * sizeof(uint8_t*));
-    cudaMalloc((void**) &aggregate_keys_dev_result, num_aggregates * sizeof(uint8_t*));
     cudaMemcpy(keys_dev_result, keys_result, num_keys * sizeof(uint8_t*), cudaMemcpyHostToDevice);
     cudaMemcpy(aggregate_keys_dev_result, aggregate_keys_result, num_aggregates * sizeof(uint8_t*), cudaMemcpyHostToDevice);
     cudaMemset(d_count, 0, sizeof(uint64_t));
@@ -556,10 +552,10 @@ void hashGroupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* co
 
     count[0] = h_count[0];
 
-    cudaFree(keys_dev);
-    cudaFree(aggregate_keys_dev);
-    cudaFree(keys_dev_result);
-    cudaFree(aggregate_keys_dev_result);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(keys_dev), 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(aggregate_keys_dev), 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(keys_dev_result), 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(aggregate_keys_dev_result), 0);
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_count), 0);
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(agg_mode_dev), 0);
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(max_key), 0);

@@ -107,6 +107,7 @@ GPUColumn::convertToCudfColumn() {
         );
         return str_col;
     }
+    throw duckdb::InternalException("Unsupported gpu column type in `convertToCudfColumn()`: %d", data_wrapper.type);
 }
 
 void

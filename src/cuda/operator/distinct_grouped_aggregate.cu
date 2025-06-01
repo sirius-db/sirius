@@ -179,7 +179,7 @@ void groupedDistinctAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t
     //allocate temp memory and copying keys
     T* row_keys = gpuBufferManager->customCudaMalloc<T>((num_keys + num_aggregates) * N, 0, 0);
     sort_keys_type* materialized_temp = reinterpret_cast<sort_keys_type*> (gpuBufferManager->customCudaMalloc<pointer_and_key>(N, 0, 0));
-    T** keys_row_id = new T*[num_keys + num_aggregates];
+    T** keys_row_id = gpuBufferManager->customCudaHostAlloc<T*>(num_keys + num_aggregates);
     for (uint64_t i = 0; i < num_keys; i++) {
         keys_row_id[i] = reinterpret_cast<T*> (keys[i]);
     }
@@ -188,8 +188,7 @@ void groupedDistinctAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t
         keys_row_id[num_keys + i] = reinterpret_cast<T*> (aggregate_keys[i]);
     }
 
-    T** keys_dev;
-    cudaMalloc((void**) &keys_dev, (num_keys + num_aggregates) * sizeof(T*));
+    T** keys_dev = gpuBufferManager->customCudaMalloc<T*>(num_keys + num_aggregates, 0, 0);
     cudaMemcpy(keys_dev, keys_row_id, (num_keys + num_aggregates) * sizeof(T*), cudaMemcpyHostToDevice);
 
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
@@ -227,7 +226,7 @@ void groupedDistinctAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t
     uint64_t* d_num_runs_out = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
     cudaMemset(d_num_runs_out, 0, sizeof(uint64_t));
     uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
-    uint8_t** output_agg = new uint8_t*[num_aggregates];
+    uint8_t** output_agg = gpuBufferManager->customCudaHostAlloc<uint8_t*>(num_aggregates);
 
     for (int agg = 0; agg < num_aggregates; agg++) {
         // SIRIUS_LOG_DEBUG("Aggregating {}", agg);
@@ -278,9 +277,8 @@ void groupedDistinctAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t
     SIRIUS_LOG_DEBUG("Grouped Distinct Aggregate Distinct Count: {}", h_count[0]);
     count[0] = h_count[0];
 
-    T** keys_dev_result;
-    T** keys_result = new T*[num_keys];
-    cudaMalloc((void**) &keys_dev_result, num_keys * sizeof(T*));
+    T** keys_dev_result = gpuBufferManager->customCudaMalloc<T*>(num_keys, 0, 0);
+    T** keys_result = gpuBufferManager->customCudaHostAlloc<T*>(num_keys);
     for (uint64_t i = 0; i < num_keys; i++) {
         keys_result[i] = gpuBufferManager->customCudaMalloc<T>(count[0], 0, 0);
     }
@@ -301,8 +299,8 @@ void groupedDistinctAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t
         }
     }
 
-    cudaFree(keys_dev_result);
-    cudaFree(keys_dev);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(keys_dev), 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(keys_dev_result), 0);
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(row_keys), 0);
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(materialized_temp), 0);
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_temp_storage), 0);

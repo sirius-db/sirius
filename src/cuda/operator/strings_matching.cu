@@ -69,7 +69,6 @@ IdxT pattern_size, IdxT num_workers, IdxT chunk_size, IdxT sub_chunk_size, IdxT 
     
     // See if have any work to do
     auto chunk_id = blockIdx.x;
-    auto worker_id = threadIdx.x + blockIdx.x * blockDim.x;
     if (chunk_id >= num_workers) return;
 
     const auto curr_chunk_start = min(chunk_id * chunk_size, last_char);
@@ -162,7 +161,7 @@ void StringMatching(char* char_data, uint64_t* str_indices, std::string match_st
   const int match_length = match_string.size();
   const char* match_char = match_string.c_str();
   int kmp_automato_size = match_length * CHARS_IN_BYTE;
-  int* kmp_automato = new int[kmp_automato_size];
+  int* kmp_automato = gpuBufferManager->customCudaHostAlloc<int>(kmp_automato_size);
   std::memset(kmp_automato, 0, kmp_automato_size * sizeof(int));
   int first_idx = (int) match_char[0] + CHAR_INCREMENT;
   kmp_automato[first_idx] = 1;
@@ -249,8 +248,7 @@ __global__ void multi_term_kmp_kernel(const char* char_data, const IdxT* indices
   IdxT last_char, IdxT num_strings) {
     
     // See if have any work to do
-    const auto chunk_id = blockIdx.x;
-    const auto worker_id = threadIdx.x + blockIdx.x * blockDim.x;
+    auto chunk_id = blockIdx.x;
     if (chunk_id >= num_workers) return;
 
     const auto curr_chunk_start = min(chunk_id * chunk_size, last_char);
@@ -357,13 +355,13 @@ void MultiStringMatching(char* char_data, uint64_t* str_indices, std::vector<std
 
   // Create the automato for each term
   int num_terms = all_terms.size();
-  int** all_terms_automato = new int*[num_terms];
+  int** all_terms_automato = gpuBufferManager->customCudaHostAlloc<int*>(num_terms);
   for(int i = 0; i < num_terms; i++) {
     std::string curr_term = all_terms[i];
     const int match_length = curr_term.size();
     const char* match_char = curr_term.c_str();
     int kmp_automato_size = match_length * CHARS_IN_BYTE;
-    int* kmp_automato = new int[kmp_automato_size];
+    int* kmp_automato = gpuBufferManager->customCudaHostAlloc<int>(kmp_automato_size);
     std::memset(kmp_automato, 0, kmp_automato_size * sizeof(int));
 
     // Create the automato for this term
@@ -393,7 +391,7 @@ void MultiStringMatching(char* char_data, uint64_t* str_indices, std::vector<std
   // uint64_t* d_matching_rows = gpuBufferManager->customCudaMalloc<uint64_t>(num_strings, 0, 0);
 
   // Create buffer for each automato
-  int** d_all_automatos = new int*[num_terms];
+  int** d_all_automatos = gpuBufferManager->customCudaHostAlloc<int*>(num_terms);
   for(int i = 0; i < num_terms; i++) {
     int kmp_automato_size = all_terms[i].size() * CHARS_IN_BYTE;
     d_all_automatos[i] = gpuBufferManager->customCudaMalloc<int>(kmp_automato_size * sizeof(int), 0, 0);

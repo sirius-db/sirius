@@ -8,6 +8,7 @@
 #include "gpu_physical_top_n.hpp"
 #include "gpu_physical_order.hpp"
 #include "gpu_materialize.hpp"
+#include "gpu_buffer_manager.hpp"
 #include "log/logging.hpp"
 
 namespace duckdb {
@@ -28,7 +29,8 @@ GPUPhysicalTopN::~GPUPhysicalTopN() {
 
 void
 HandleTopN(vector<shared_ptr<GPUColumn>> &order_by_keys, vector<shared_ptr<GPUColumn>> &projection_columns, const vector<BoundOrderByNode> &orders, uint64_t num_projections) {
-	OrderByType* order_by_type = new OrderByType[orders.size()];
+	GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+	OrderByType* order_by_type = gpuBufferManager->customCudaHostAlloc<OrderByType>(orders.size());
 	for (int order_idx = 0; order_idx < orders.size(); order_idx++) {
 		if (orders[order_idx].type == OrderType::ASCENDING) {
 			order_by_type[order_idx] = OrderByType::ASCENDING;

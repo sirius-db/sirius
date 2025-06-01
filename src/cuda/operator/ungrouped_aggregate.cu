@@ -138,9 +138,9 @@ void ungroupedAggregate(uint8_t **a, uint8_t **result, uint64_t N, int* agg_mode
 
             if (agg_mode[agg] == 1) {
                 //Currently typename T has to be a double to be here
-                T* result_host_temp = new T[1];
-                cudaMemcpy(result_host_temp, result_temp, sizeof(T), cudaMemcpyDeviceToHost);
-                T avg = result_host_temp[0] / N;
+                T result_host_temp;
+                cudaMemcpy(&result_host_temp, result_temp, sizeof(T), cudaMemcpyDeviceToHost);
+                T avg = result_host_temp / N;
                 // SIRIUS_LOG_DEBUG("Result: {:.2f} and N: {}", result_host_temp[0], N);
                 cudaMemcpy(result_temp, &avg, sizeof(T), cudaMemcpyHostToDevice);
                 CHECK_ERROR();

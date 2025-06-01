@@ -351,7 +351,7 @@ GPUContext::GPUExecuteRelation(ClientContext &context, shared_ptr<Relation> rela
 // 	}
 // 	err_str += "]";
 // 	return GPUErrorResult<MaterializedQueryResult>(context, ErrorData(err_str));
-
+	throw duckdb::InternalException("`GPUExecuteRelation` is unimplemented");
 }
 
 }; // namespace duckdb

@@ -34,11 +34,11 @@ void printGPUColumn(T* a, size_t N, int gpu) {
         SIRIUS_LOG_DEBUG("Input size is 0");
         return;
     }
-    T* result_host_temp = new T[1];
-    cudaMemcpy(result_host_temp, a, sizeof(T), cudaMemcpyDeviceToHost);
+    T result_host_temp;
+    cudaMemcpy(&result_host_temp, a, sizeof(T), cudaMemcpyDeviceToHost);
     CHECK_ERROR();
     cudaDeviceSynchronize();
-    SIRIUS_LOG_DEBUG("Result: {} and N: {}", result_host_temp[0], N);
+    SIRIUS_LOG_DEBUG("Result: {} and N: {}", result_host_temp, N);
     SIRIUS_LOG_DEBUG("Input size: {}", N);
     print_gpu_column<T><<<1, 1>>>(a, N);
     CHECK_ERROR();
