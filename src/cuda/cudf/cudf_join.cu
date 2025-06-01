@@ -81,6 +81,8 @@ void cudf_mixed_join(vector<shared_ptr<GPUColumn>>& probe_columns, vector<shared
     std::vector<cudf::column_view> build_conditional_columns;
 
     std::vector<cudf::ast::operation> cudf_exprs;
+    std::vector<cudf::ast::column_reference> owned_left_column_references;
+    std::vector<cudf::ast::column_reference> owned_right_column_references;
     for (int cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
         if (conditions[cond_idx].comparison == ExpressionType::COMPARE_EQUAL || conditions[cond_idx].comparison == ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
             probe_equal_columns.push_back(probe_columns[cond_idx]->convertToCudfColumn());
@@ -91,21 +93,23 @@ void cudf_mixed_join(vector<shared_ptr<GPUColumn>>& probe_columns, vector<shared
                 build_conditional_columns.push_back(build_columns[cond_idx]->convertToCudfColumn());
 
                 auto not_equal_op = cudf::ast::ast_operator::NOT_EQUAL;
-                auto left_ref = cudf::ast::column_reference(probe_conditional_columns.size() - 1, cudf::ast::table_reference::LEFT);
-                auto right_ref = cudf::ast::column_reference(build_conditional_columns.size() - 1, cudf::ast::table_reference::RIGHT);
-                auto cudf_expr = cudf::ast::operation(not_equal_op, left_ref, right_ref);
-                cudf_exprs.push_back(cudf_expr);
+                owned_left_column_references.emplace_back(probe_conditional_columns.size() - 1, cudf::ast::table_reference::LEFT);
+                owned_right_column_references.emplace_back(build_conditional_columns.size() - 1, cudf::ast::table_reference::RIGHT);
+                cudf_exprs.emplace_back(not_equal_op, owned_left_column_references.back(), owned_right_column_references.back());
             } else {
                 throw NotImplementedException("Unsupported comparison type");
             }
         }
     }
 
-    //merge cudf_exprs into a single expression
-    cudf::ast::operation final_expr = cudf_exprs[0];
+    // merge cudf_exprs into a single expression, it's guaranteed from caller that `cudf_exprs` is not empty
+    std::vector<cudf::ast::operation> intermediate_cudf_exprs;
+    intermediate_cudf_exprs.push_back(std::move(cudf_exprs[0]));
     for (int expr_idx = 1; expr_idx < cudf_exprs.size(); expr_idx++) {
-        final_expr = cudf::ast::operation(cudf::ast::ast_operator::BITWISE_AND, final_expr, cudf_exprs[expr_idx]);
+        intermediate_cudf_exprs.emplace_back(
+            cudf::ast::ast_operator::BITWISE_AND, intermediate_cudf_exprs.back(), cudf_exprs[expr_idx]);
     }
+    const auto& final_expr = intermediate_cudf_exprs.back();
 
     auto probe_equal_table = cudf::table_view(probe_equal_columns);
     auto build_equal_table = cudf::table_view(build_equal_columns);
