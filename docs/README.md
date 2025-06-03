@@ -11,6 +11,12 @@ Sirius is a GPU acceleration layer for SQL analytics. It plugs into existing eng
   <img src="sirius-architecture.png" alt="Diagram" width="900"/>
 </p>
 
+## Supported OS/GPU/CUDA/CMake
+- Ubuntu >= 20.04
+- NVIDIA Volta™ or higher with compute capability 7.0+
+- CUDA >= 11.2
+- CMake >= 3.30.4 (follow this [instruction](https://medium.com/@yulin_li/how-to-update-cmake-on-ubuntu-9602521deecb) to upgrade CMake)
+
 ## Installing dependencies
 
 ### Install duckdb dependencies
