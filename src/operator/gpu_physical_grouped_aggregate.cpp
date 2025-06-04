@@ -53,7 +53,8 @@ CombineColumns(shared_ptr<GPUColumn> column1, shared_ptr<GPUColumn> column2, GPU
 		return ResolveTypeCombineStrings(column1, column2, gpuBufferManager);
 		break;
 	  default:
-        throw NotImplementedException("Unsupported column type");
+        throw NotImplementedException("Unsupported column type in `CombineColumns: %d",
+																			static_cast<int>(column1->data_wrapper.type));
     }
 }
 
@@ -259,7 +260,8 @@ HandleGroupByAggregateExpression(vector<shared_ptr<GPUColumn>> &group_by_keys, v
 		} else if (aggregate_type == ColumnType::FLOAT64) {
 			ResolveTypeGroupByString<double>(group_by_keys, aggregate_keys, gpuBufferManager, aggregates, num_group_keys);
 		} else {
-			throw NotImplementedException("Unsupported column type");
+			throw NotImplementedException("Unsupported column type in `HandleGroupByAggregateExpression`: {}",
+																		static_cast<int>(aggregate_type));
 		}
 	} else {
 		//check if all the group by keys are all integers
@@ -274,12 +276,13 @@ HandleGroupByAggregateExpression(vector<shared_ptr<GPUColumn>> &group_by_keys, v
 				ResolveTypeGroupByAggregateExpression<uint64_t, uint64_t>(group_by_keys, aggregate_keys, gpuBufferManager, aggregates, num_group_keys);
 			} else if (aggregate_type == ColumnType::FLOAT64) {
 				ResolveTypeGroupByAggregateExpression<uint64_t, double>(group_by_keys, aggregate_keys, gpuBufferManager, aggregates, num_group_keys);
-			} else throw NotImplementedException("Unsupported column type");
+			} else throw NotImplementedException("Unsupported column type in `HandleGroupByAggregateExpression`: {}",
+																					 static_cast<int>(aggregate_type));
 			break;
 		case ColumnType::FLOAT64:
-			throw NotImplementedException("Unsupported column type");
 		default:
-			throw NotImplementedException("Unsupported column type");
+			throw NotImplementedException("Unsupported column type in `HandleGroupByAggregateExpression`: {}",
+																		static_cast<int>(group_by_keys[0]->data_wrapper.type));
 		}
 	}
 }
@@ -349,9 +352,9 @@ void HandleDuplicateElimination(vector<shared_ptr<GPUColumn>> &group_by_keys, GP
 	  	ResolveTypeDuplicateElimination<uint64_t>(group_by_keys, gpuBufferManager, num_group_keys);
 		break;
       case ColumnType::FLOAT64:
-	  	throw NotImplementedException("Unsupported column type");
       default:
-        throw NotImplementedException("Unsupported column type");
+        throw NotImplementedException("Unsupported column type in `HandleDuplicateElimination`: %d",
+																			static_cast<int>(group_by_keys[0]->data_wrapper.type));
     }
 }
 
@@ -414,12 +417,13 @@ void HandleDistinctGroupBy(vector<shared_ptr<GPUColumn>> &group_by_keys, vector<
       case ColumnType::INT64: {
 	  	if (aggregate_keys[0]->data_wrapper.type == ColumnType::INT64) {
 			ResolveTypeDistinctGroupBy<uint64_t, uint64_t>(group_by_keys, aggregate_keys, gpuBufferManager, distinct_info, num_group_keys);
-		} else throw NotImplementedException("Unsupported column type");
+		} else throw NotImplementedException("Unsupported column type in `HandleDistinctGroupBy`: %d",
+																				 static_cast<int>(aggregate_keys[0]->data_wrapper.type));
 		break;
 	  } case ColumnType::FLOAT64:
-	  	throw NotImplementedException("Unsupported column type");
       default:
-        throw NotImplementedException("Unsupported column type");
+        throw NotImplementedException("Unsupported column type in `HandleDistinctGroupBy`: %d",
+																			static_cast<int>(group_by_keys[0]->data_wrapper.type));
     }
 }
 

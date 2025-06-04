@@ -69,7 +69,8 @@ HandleMaterializeExpression(shared_ptr<GPUColumn> column, BoundReferenceExpressi
         case ColumnType::VARCHAR:
             return ResolveTypeMaterializeString(column, bound_ref, gpuBufferManager);
         default:
-            throw NotImplementedException("Unsupported column type");
+            throw NotImplementedException("Unsupported column type in `HandleMaterializeExpression`: {}",
+                                          static_cast<int>(column->data_wrapper.type));
     }
 }
 

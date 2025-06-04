@@ -67,7 +67,8 @@ HandleNestedLoopJoin(vector<shared_ptr<GPUColumn>> &left_keys, vector<shared_ptr
 	  	ResolveTypeNestedLoopJoin<double>(left_keys, right_keys, count, row_ids_left, row_ids_right, conditions, join_type, gpuBufferManager);
 		break;
       default:
-        throw NotImplementedException("Unsupported column type");
+        throw NotImplementedException("Unsupported column type in `HandleNestedLoopJoin`: %d",
+																			static_cast<int>(left_keys[0]->data_wrapper.type));
     }
 }
 
