@@ -160,7 +160,8 @@ GPUPhysicalMaterializedCollector::FinalMaterialize(GPUIntermediateRelation input
 		FinalMaterializeString(input_relation, output_relation, col);
 		break;
 	default:
-		throw NotImplementedException("Unsupported column type");
+		throw NotImplementedException("Unsupported column type in `FinalMaterialize`: %d",
+																	static_cast<int>(input_relation.columns[col]->data_wrapper.type));
 	}
 	// output_relation.length = output_relation.columns[col]->column_length;
 	// SIRIUS_LOG_DEBUG("Final materialize size {} bytes", size_bytes);
@@ -182,7 +183,8 @@ LogicalType ColumnTypeToLogicalType(ColumnType type) {
 		case ColumnType::VARCHAR:
 			return LogicalType::VARCHAR;
 		default:
-			throw NotImplementedException("Unsupported column type");
+			throw NotImplementedException("Unsupported column type in `ColumnTypeToLogicalType`: %d",
+																		static_cast<int>(type));
 	}
 }
 
@@ -200,7 +202,8 @@ Vector rawDataToVector(uint8_t* host_data, size_t vector_offset, ColumnType type
 		case ColumnType::BOOLEAN:
 			sizeof_type = sizeof(uint8_t); break;
 		default:
-			throw NotImplementedException("Unsupported column type");
+			throw NotImplementedException("Unsupported column type in `rawDataToVector`: %d",
+																		static_cast<int>(type));
 	}
 	uint8_t* data = host_data + vector_offset * STANDARD_VECTOR_SIZE * sizeof_type;
 	return Vector(ColumnTypeToLogicalType(type), data);

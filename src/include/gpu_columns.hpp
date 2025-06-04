@@ -46,7 +46,8 @@ inline ColumnType convertLogicalTypeToColumnType(LogicalType type) {
             column_type = ColumnType::VARCHAR;
             break;
         default:
-            throw InvalidInputException("Unsupported column type");
+            throw InvalidInputException("Unsupported column type in `convertLogicalTypeToColumnType`: %d",
+                                        static_cast<int>(type.id()));
             break;
     }
     return column_type;
