@@ -676,14 +676,15 @@ GPUBufferManager::createTableAndColumnInGPU(Catalog& catalog, ClientContext& con
     //finding column_name in column_names
     //convert column_name to uppercase
     string up_column_name = column_name;
+    //when caching table, it has to be exaclty the same as the column name in the table (case sensitive)
     transform(up_column_name.begin(), up_column_name.end(), up_column_name.begin(), ::toupper);
-    if (find(column_names.begin(), column_names.end(), up_column_name) != column_names.end()) {
+    if (find(column_names.begin(), column_names.end(), column_name) != column_names.end()) {
         // convert table_name to uppercase
-        size_t column_id = table.GetColumnIndex(up_column_name, false).index;
+        size_t column_id = table.GetColumnIndex(column_name, false).index;
         string up_table_name = table_name;
         transform(up_table_name.begin(), up_table_name.end(), up_table_name.begin(), ::toupper);
         createTable(up_table_name, table.GetTypes().size());
-        ColumnType column_type = convertLogicalTypeToColumnType(table.GetColumn(up_column_name).GetType());
+        ColumnType column_type = convertLogicalTypeToColumnType(table.GetColumn(column_name).GetType());
         SIRIUS_LOG_DEBUG("Creating column {}", up_column_name);
         createColumn(up_table_name, up_column_name, column_type, column_id, unique_columns);
     } else {
