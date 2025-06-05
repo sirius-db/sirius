@@ -48,7 +48,7 @@ export LIBCUDF_ENV_PREFIX={PATH to libcudf-env}
 
 ### Clone the Sirius repository
 ```
-git clone --recurse-submodules https://github.com/bwyogatama/sirius.git
+git clone --recurse-submodules https://github.com/sirius-db/sirius.git
 cd sirius
 export SIRIUS_HOME_PATH=`pwd`
 cd duckdb
