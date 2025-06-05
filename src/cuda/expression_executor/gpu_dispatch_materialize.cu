@@ -207,7 +207,8 @@ std::unique_ptr<cudf::column> GpuDispatcher::DispatchMaterialize(const GPUColumn
                                    input->row_id_count,
                                    mr);
     default:
-      throw InternalException("Dispatch[Materialize]: Unsupported column type!");
+      throw InternalException("Unsupported sirius column type in `Dispatch[Materialize]`: %d",
+                              static_cast<int>(input->data_wrapper.type));
   }
 }
 

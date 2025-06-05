@@ -45,7 +45,7 @@ GPUExpressionExecutor::HandleBinaryConstantExpression(shared_ptr<GPUColumn> colu
         double constant = expr.value.GetValue<double>();
         return ResolveTypeBinaryConstantExpression<double>(column, constant, gpuBufferManager, function_name);
       } default:
-        throw NotImplementedException("Unsupported column type in `HandleBinaryConstantExpression`: %d",
+        throw NotImplementedException("Unsupported sirius column type in `HandleBinaryConstantExpression`: %d",
                                       static_cast<int>(column->data_wrapper.type));
     }
 }
@@ -84,7 +84,7 @@ GPUExpressionExecutor::HandleBinaryExpression(shared_ptr<GPUColumn> column1, sha
       case ColumnType::FLOAT64:
         return ResolveTypeBinaryExpression<double>(column1, column2, gpuBufferManager, function_name);
       default:
-        throw NotImplementedException("Unsupported column type in `HandleBinaryExpression`: %d",
+        throw NotImplementedException("Unsupported sirius column type in `HandleBinaryExpression`: %d",
                                       static_cast<int>(column1->data_wrapper.type));
     }
 }
@@ -147,7 +147,7 @@ GPUExpressionExecutor::HandleComparisonConstantExpression(shared_ptr<GPUColumn> 
         ResolveTypeComparisonConstantExpression<uint8_t>(column, expr1, expr2, count, row_ids, expression_type);
         break;
       default:
-        throw NotImplementedException("Unsupported column type in `HandleComparisonConstantExpression`: %d",
+        throw NotImplementedException("Unsupported sirius column type in `HandleComparisonConstantExpression`: %d",
                                       static_cast<int>(column->data_wrapper.type));
     }
 }
@@ -198,7 +198,7 @@ GPUExpressionExecutor::HandleComparisonExpression(shared_ptr<GPUColumn> column1,
         ResolveTypeComparisonExpression<double>(column1, column2, count, row_ids, expression_type);
         break;
       default:
-        throw NotImplementedException("Unsupported column type in `HandleComparisonExpression`: %d",
+        throw NotImplementedException("Unsupported sirius column type in `HandleComparisonExpression`: %d",
                                       static_cast<int>(column1->data_wrapper.type));
     }
 }
@@ -222,7 +222,7 @@ GPUExpressionExecutor::HandleRoundExpression(shared_ptr<GPUColumn> column, int d
         shared_ptr<GPUColumn> result = make_shared_ptr<GPUColumn>(size, column->data_wrapper.type, reinterpret_cast<uint8_t*>(c));
         return result;
       } default:
-        throw NotImplementedException("Unsupported column type in `HandleRoundExpression`: %d",
+        throw NotImplementedException("Unsupported sirius column type in `HandleRoundExpression`: %d",
                                       static_cast<int>(column->data_wrapper.type));
     }
 }
