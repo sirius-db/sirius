@@ -630,9 +630,10 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
     }
   }
 
-  SIRIUS_LOG_DEBUG("Table Scanning {}", table_name);
   //Find table name in the buffer manager
   auto gpuBufferManager = &(GPUBufferManager::GetInstance());
+  transform(table_name.begin(), table_name.end(), table_name.begin(), ::toupper);
+  SIRIUS_LOG_DEBUG("Table Scanning {}", table_name);
   auto it = gpuBufferManager->tables.find(table_name);
   shared_ptr<GPUIntermediateRelation> table;
   //If there is a filter: apply filter, and write to output_relation (late materialized)
@@ -643,16 +644,15 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
             SIRIUS_LOG_DEBUG("Cached Column name: {}", table->column_names[i]);
         }
         for (int col = 0; col < column_ids.size(); col++) {
-            SIRIUS_LOG_DEBUG("Finding column {}", names[column_ids[col].GetPrimaryIndex()]);
-            auto column_it = find(table->column_names.begin(), table->column_names.end(), names[column_ids[col].GetPrimaryIndex()]);
+            auto column_to_find = names[column_ids[col].GetPrimaryIndex()];
+            transform(column_to_find.begin(), column_to_find.end(), column_to_find.begin(), ::toupper);
+            SIRIUS_LOG_DEBUG("Finding column {}", column_to_find);
+            auto column_it = find(table->column_names.begin(), table->column_names.end(), column_to_find);
             if (column_it == table->column_names.end()) {
                 throw InvalidInputException("Column not found");
             }
             auto column_name = table->column_names[column_ids[col].GetPrimaryIndex()];
             SIRIUS_LOG_DEBUG("Column found {}", column_name);
-            if (column_name != names[column_ids[col].GetPrimaryIndex()]) {
-                throw InvalidInputException("Column name mismatch");
-            }
         }
     } else {
         // table not found
