@@ -232,10 +232,12 @@ void SiriusExtension::GPUProcessingFunction(ClientContext &context, TableFunctio
 	}
 
 	auto result_chunk = data.res->Fetch();
-	if (!result_chunk) {
+	if (result_chunk == nullptr) {
+		output.SetCardinality(0);
 		return;
 	}
-	output.Move(*result_chunk);
+
+	output.Reference(*result_chunk);
 	return;
 }
 
