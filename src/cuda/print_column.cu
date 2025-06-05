@@ -3,6 +3,7 @@
 #include <cuda.h>
 #include "gpu_buffer_manager.hpp"
 #include "operator/cuda_helper.cuh"
+#include "log/logging.hpp"
 
 namespace duckdb {
 
@@ -10,9 +11,8 @@ template <typename T>
 __global__ void print_gpu_column(T* a, uint64_t N) {
     if (blockIdx.x == 0 && threadIdx.x == 0) {
         for (uint64_t i = 0; i < N; i++) {
-            printf("a: %ld ", a[i]);
+            // FIXME: do this in cpu code using logging
         }
-        printf("\n");
     }
 }
 
@@ -31,15 +31,15 @@ template <typename T>
 void printGPUColumn(T* a, size_t N, int gpu) {
     CHECK_ERROR();
     if (N == 0) {
-        printf("N is 0\n");
+        SIRIUS_LOG_DEBUG("Input size is 0");
         return;
     }
-    T* result_host_temp = new T[1];
-    cudaMemcpy(result_host_temp, a, sizeof(T), cudaMemcpyDeviceToHost);
+    T result_host_temp;
+    cudaMemcpy(&result_host_temp, a, sizeof(T), cudaMemcpyDeviceToHost);
     CHECK_ERROR();
     cudaDeviceSynchronize();
-    printf("Result: %ld and N: %d\n", result_host_temp[0], N);
-    printf("N: %ld\n", N);
+    SIRIUS_LOG_DEBUG("Result: {} and N: {}", result_host_temp, N);
+    SIRIUS_LOG_DEBUG("Input size: {}", N);
     print_gpu_column<T><<<1, 1>>>(a, N);
     CHECK_ERROR();
     cudaDeviceSynchronize();

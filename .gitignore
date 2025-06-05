@@ -1,6 +1,7 @@
 build
 .idea
 cmake-build-debug
+cmake-build-release
 duckdb_unittest_tempdir/
 .DS_Store
 testext

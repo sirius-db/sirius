@@ -1,6 +1,7 @@
 #include "cuda_helper.cuh"
 #include "gpu_physical_nested_loop_join.hpp"
 #include "gpu_buffer_manager.hpp"
+#include "log/logging.hpp"
 
 namespace duckdb {
 
@@ -49,7 +50,6 @@ __global__ void nested_loop_join_count(T *left_keys, T* right_keys, uint64_t *of
                 } else if (condition_mode == 2 && left_keys[tile_offset + threadIdx.x + ITEM * B] >= right_keys[i]) {
                     local_found = 0;
                 } else if (condition_mode == 3 && left_keys[tile_offset + threadIdx.x + ITEM * B] <= right_keys[i]) {
-                    // printf("left_keys: %.2f right_keys: %.2f\n", left_keys[tile_offset + threadIdx.x + ITEM * B], right_keys[i]);
                     local_found = 0;
                 }
 
@@ -140,16 +140,18 @@ __global__ void nested_loop_join<uint64_t, BLOCK_THREADS, 1>(uint64_t *left_keys
 template <typename T>
 void nestedLoopJoin(T** left_data, T** right_data, uint64_t* &row_ids_left, uint64_t* &row_ids_right, uint64_t* &count, uint64_t left_size, uint64_t right_size, int* condition_mode, int num_keys) {
     CHECK_ERROR();
+    SETUP_TIMING();
+    START_TIMER();
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
     if (left_size == 0 || right_size == 0) {
         uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
         h_count[0] = 0;
         count = h_count;
-        printf("N is 0\n");
+        SIRIUS_LOG_DEBUG("Input size is 0");
         return;
     }
-    printf("Launching Nested Loop Join Kernel\n");
-    // printf("left size: %lu right size : %lu\n", left_size, right_size);
+    SIRIUS_LOG_DEBUG("Launching Nested Loop Join Kernel");
+    // SIRIUS_LOG_DEBUG("left size: {} right size : {}", left_size, right_size);
     int tile_items = BLOCK_THREADS * 1;
     count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
     cudaMemset(count, 0, sizeof(uint64_t));
@@ -165,7 +167,7 @@ void nestedLoopJoin(T** left_data, T** right_data, uint64_t* &row_ids_left, uint
     uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
     cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
     assert(h_count[0] > 0);
-    printf("Count: %lu\n", h_count[0]);
+    SIRIUS_LOG_DEBUG("Nested Loop Join Result Count: {}", h_count[0]);
 
     row_ids_left = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
     row_ids_right = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
@@ -176,6 +178,7 @@ void nestedLoopJoin(T** left_data, T** right_data, uint64_t* &row_ids_left, uint
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(offset_each_thread), 0);
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(count), 0);
     count = h_count;
+    STOP_TIMER();
 }
 
 template

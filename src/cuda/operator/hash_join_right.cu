@@ -1,6 +1,7 @@
 #include "cuda_helper.cuh"
 #include "gpu_physical_hash_join.hpp"
 #include "gpu_buffer_manager.hpp"
+#include "log/logging.hpp"
 
 namespace duckdb {
 
@@ -144,10 +145,10 @@ void scanHashTableRight(unsigned long long* ht, uint64_t ht_len, uint64_t* &row_
         uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
         h_count[0] = 0;
         count = h_count;
-        printf("N is 0\n");
+        SIRIUS_LOG_DEBUG("Input size is 0");
         return;
     }
-    printf("Launching Scan Kernel\n");
+    SIRIUS_LOG_DEBUG("Launching Scan Kernel");
     SETUP_TIMING();
     START_TIMER();
     count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
@@ -167,14 +168,10 @@ void scanHashTableRight(unsigned long long* ht, uint64_t ht_len, uint64_t* &row_
     scan_right<BLOCK_THREADS, ITEMS_PER_THREAD><<<(ht_len + tile_items - 1)/tile_items, BLOCK_THREADS>>>(ht, (unsigned long long*) count, ht_len, row_ids, num_keys, join_mode, 0);
     CHECK_ERROR();
     cudaDeviceSynchronize();
-    printf("Scan Count: %lu\n", h_count[0]);
+    SIRIUS_LOG_DEBUG("Scan Count: {}", h_count[0]);
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(count), 0);
     count = h_count;
 
-    // thrust::device_vector<uint64_t> sorted_keys(row_ids, row_ids + h_count[0]);
-    // thrust::sort(thrust::device, sorted_keys.begin(), sorted_keys.end());
-    // uint64_t* raw_row_ids = thrust::raw_pointer_cast(sorted_keys.data());
-    // testprint<<<1, 1>>>(raw_row_ids, h_count[0]);
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(ht), 0);
 
     CHECK_ERROR();
@@ -185,22 +182,21 @@ void scanHashTableRight(unsigned long long* ht, uint64_t ht_len, uint64_t* &row_
 void probeHashTableRightSemiAnti(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t N, int* condition_mode, int num_keys) {
     CHECK_ERROR();
     if (N == 0) {
-        printf("N is 0\n");
+        SIRIUS_LOG_DEBUG("Input size is 0");
         return;
     }
-    printf("Launching Probe Kernel\n");
+    SIRIUS_LOG_DEBUG("Launching Probe Kernel");
     SETUP_TIMING();
     START_TIMER();
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 
     //reinterpret cast the keys to uint64_t
-    uint64_t** keys_data = new uint64_t*[num_keys];
+    uint64_t** keys_data = gpuBufferManager->customCudaHostAlloc<uint64_t*>(num_keys);
     for (int idx = 0; idx < num_keys; idx++) {
         keys_data[idx] = reinterpret_cast<uint64_t*>(keys[idx]);
     }
 
-    uint64_t** keys_dev;
-    cudaMalloc((void**) &keys_dev, num_keys * sizeof(uint64_t*));
+    uint64_t** keys_dev = gpuBufferManager->customCudaMalloc<uint64_t*>(num_keys, 0, 0);
     cudaMemcpy(keys_dev, keys_data, num_keys * sizeof(uint64_t*), cudaMemcpyHostToDevice);
 
     int equal_keys = 0;
@@ -216,9 +212,9 @@ void probeHashTableRightSemiAnti(uint8_t **keys, unsigned long long* ht, uint64_
     CHECK_ERROR();
     cudaDeviceSynchronize();
 
-    printf("Finished probe right\n");
+    SIRIUS_LOG_DEBUG("Finished probe right");
     STOP_TIMER();
-    cudaFree(keys_dev);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(keys_dev), 0);
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(condition_mode_dev), 0);
 }
 

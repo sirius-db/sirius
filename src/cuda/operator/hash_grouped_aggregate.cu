@@ -1,6 +1,7 @@
 #include "cuda_helper.cuh"
 #include "gpu_physical_grouped_aggregate.hpp"
 #include "gpu_buffer_manager.hpp"
+#include "log/logging.hpp"
 
 namespace duckdb {
 
@@ -152,7 +153,6 @@ __global__ void hash_groupby_smem(T **group_key, V** aggregate, T* max, T* min, 
             }
 
             // final_slot[ITEM] = hash_key % ht_len;
-            // printf("hash_key: %llu %llu %llu\n", group_key[0][offset], hash_key, local_ht[final_slot[ITEM] * n_ht_column]);
             cudaAssert(hash_key < ht_len);
             final_slot[ITEM] = hash_key;
 
@@ -200,7 +200,6 @@ __global__ void hash_groupby_smem(T **group_key, V** aggregate, T* max, T* min, 
                 ht[threadIdx.x * n_ht_column + n] = local_ht[threadIdx.x * n_ht_column + n];
             }
             // ht[threadIdx.x * n_ht_column + n] = local_ht[threadIdx.x * n_ht_column + n];
-            // printf("%llu %llu\n", ht[threadIdx.x * n_ht_column + n], local_ht[threadIdx.x * n_ht_column + n]);
         }
         for (int n = 0; n < num_aggregates; n++) {
             V* ptr = reinterpret_cast<V*>(ht + (threadIdx.x * n_ht_column + num_keys + n));
@@ -392,46 +391,24 @@ __global__ void get_min_max(T *keys, T* res_max, T* res_min, uint64_t N) {
     }
 }
 
-// __global__ void print_hash_table_group(unsigned long long* a, uint64_t N, uint64_t num_keys, uint64_t num_aggregates, bool need_count) {
-//     if (blockIdx.x == 0 && threadIdx.x == 0) {
-//         for (uint64_t i = 0; i < N; i++) {
-//             // for (uint64_t j = 0; j < num_keys + num_aggregates + need_count; j++) {
-//             //     printf("%llu ", a[i * (num_keys + num_aggregates + need_count) + j]);
-//             // }
-//             printf("%llu %.2f", a[i * 2], reinterpret_cast<double*>(a + (i * 2 + 1))[0]);
-//             printf("\n");
-//         }
-//     }
-// }
-
-// template <typename V>
-// __global__ void print_column_agg(V* a, uint64_t N) {
-//     if (blockIdx.x == 0 && threadIdx.x == 0) {
-//         for (uint64_t i = 0; i < N; i++) {
-//             printf("%.2f ", a[i]);
-//         }
-//         printf("\n");
-//     }
-// }
-
 template <typename T, typename V>
 void hashGroupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count, uint64_t N, uint64_t num_keys, uint64_t num_aggregates, int* agg_mode) {
     CHECK_ERROR();
     if (N == 0) {
         count[0] = 0;
-        printf("N is 0\n");
+        SIRIUS_LOG_DEBUG("Input size is 0");
         return;
     }
+    SETUP_TIMING();
+    START_TIMER();
 
-    printf("Launching Hash Grouped Aggregate Kernel\n");
+    SIRIUS_LOG_DEBUG("Launching Hash Grouped Aggregate Kernel");
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 
-    T** keys_dev;
-    cudaMalloc((void**) &keys_dev, num_keys * sizeof(T*));
+    T** keys_dev = gpuBufferManager->customCudaMalloc<T*>(num_keys, 0, 0);
     cudaMemcpy(keys_dev, reinterpret_cast<T*>(keys), num_keys * sizeof(T*), cudaMemcpyHostToDevice);
 
-    V** aggregate_keys_dev;
-    cudaMalloc((void**) &aggregate_keys_dev, num_aggregates * sizeof(V*));
+    V** aggregate_keys_dev = gpuBufferManager->customCudaMalloc<V*>(num_aggregates, 0, 0);
     cudaMemcpy(aggregate_keys_dev, reinterpret_cast<V*>(aggregate_keys), num_aggregates * sizeof(V*), cudaMemcpyHostToDevice);
 
     int* agg_mode_dev = gpuBufferManager->customCudaMalloc<int>(num_aggregates, 0, 0);
@@ -458,8 +435,8 @@ void hashGroupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* co
         CHECK_ERROR();
     }
 
-    T* max_key_host = new T[num_keys];
-    T* min_key_host = new T[num_keys];
+    T* max_key_host = gpuBufferManager->customCudaHostAlloc<T>(num_keys);
+    T* min_key_host = gpuBufferManager->customCudaHostAlloc<T>(num_keys);
     cudaMemcpy(max_key_host, max_key, num_keys * sizeof(T), cudaMemcpyDeviceToHost);
     cudaMemcpy(min_key_host, min_key, num_keys * sizeof(T), cudaMemcpyDeviceToHost);
 
@@ -468,17 +445,15 @@ void hashGroupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* co
         C *= (max_key_host[i] - min_key_host[i] + 1);
     }
 
-    printf("N: %lu\n", N);
-    printf("max %ld min %ld\n", max_key_host[0], min_key_host[0]);
+    SIRIUS_LOG_DEBUG("Input size: {}", N);
+    SIRIUS_LOG_DEBUG("max {} min {}", max_key_host[0], min_key_host[0]);
 
     V init_max; V init_min;
     if constexpr (std::is_same<V, double>::value) {
         // Do something if T is int
-        std::cout << "V is double" << std::endl;
         init_max = -DBL_MAX; init_min = DBL_MAX;
     } else if constexpr (std::is_same<V, uint64_t>::value) {
         // Do something else if T is not int
-        std::cout << "V is not double" << std::endl;
         init_max = INT_MIN; init_min = INT64_MAX;
     } else {
         assert(0);
@@ -487,6 +462,7 @@ void hashGroupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* co
     unsigned long long* ht;
     uint64_t ht_len;
     if (C < BLOCK_THREADS) {
+        SIRIUS_LOG_DEBUG("Hash grouped aggregate in shared memory");
         ht_len = C;
         size_t smem_size;
         if (need_count) {
@@ -505,6 +481,7 @@ void hashGroupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* co
         CHECK_ERROR();
 
     } else{
+        SIRIUS_LOG_DEBUG("Hash grouped aggregate in global memory");
         ht_len = N * 2;
         if (need_count) {
             ht = (unsigned long long*) gpuBufferManager->customCudaMalloc<uint64_t>(ht_len * (num_keys + num_aggregates + 1), 0, 0);         
@@ -522,8 +499,8 @@ void hashGroupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* co
     
     CHECK_ERROR();
 
-    uint8_t** keys_dev_result;
-    uint8_t** aggregate_keys_dev_result;
+    uint8_t** keys_dev_result = gpuBufferManager->customCudaMalloc<uint8_t*>(num_keys, 0, 0);
+    uint8_t** aggregate_keys_dev_result = gpuBufferManager->customCudaMalloc<uint8_t*>(num_aggregates, 0, 0);
     uint64_t* d_count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
     cudaMemset(d_count, 0, sizeof(uint64_t));
     scan_hash_group<T, V, BLOCK_THREADS, ITEMS_PER_THREAD><<<(ht_len + tile_items - 1)/tile_items, BLOCK_THREADS>>>(ht, nullptr, nullptr, 
@@ -534,8 +511,8 @@ void hashGroupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* co
     cudaMemcpy(h_count, d_count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
     assert(h_count[0] > 0);
 
-    uint8_t** keys_result = new uint8_t*[num_keys];
-    uint8_t** aggregate_keys_result = new uint8_t*[num_aggregates];
+    uint8_t** keys_result = gpuBufferManager->customCudaHostAlloc<uint8_t*>(num_keys);
+    uint8_t** aggregate_keys_result = gpuBufferManager->customCudaHostAlloc<uint8_t*>(num_aggregates);
     for (int i = 0; i < num_keys; i++) {
         keys_result[i] = gpuBufferManager->customCudaMalloc<uint8_t>(h_count[0] * sizeof(T), 0, 0);
     }
@@ -549,8 +526,6 @@ void hashGroupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* co
         }
     }
     
-    cudaMalloc((void**) &keys_dev_result, num_keys * sizeof(uint8_t*));
-    cudaMalloc((void**) &aggregate_keys_dev_result, num_aggregates * sizeof(uint8_t*));
     cudaMemcpy(keys_dev_result, keys_result, num_keys * sizeof(uint8_t*), cudaMemcpyHostToDevice);
     cudaMemcpy(aggregate_keys_dev_result, aggregate_keys_result, num_aggregates * sizeof(uint8_t*), cudaMemcpyHostToDevice);
     cudaMemset(d_count, 0, sizeof(uint64_t));
@@ -563,7 +538,7 @@ void hashGroupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* co
 
     // CHECK_ERROR();
 
-    printf("Count: %lu\n", h_count[0]);
+    SIRIUS_LOG_DEBUG("Hash Grouped Aggregate Count: {}", h_count[0]);
 
     for (uint64_t i = 0; i < num_keys; i++) {
         gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(keys[i]), 0);
@@ -577,10 +552,10 @@ void hashGroupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* co
 
     count[0] = h_count[0];
 
-    cudaFree(keys_dev);
-    cudaFree(aggregate_keys_dev);
-    cudaFree(keys_dev_result);
-    cudaFree(aggregate_keys_dev_result);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(keys_dev), 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(aggregate_keys_dev), 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(keys_dev_result), 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(aggregate_keys_dev_result), 0);
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_count), 0);
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(agg_mode_dev), 0);
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(max_key), 0);
@@ -602,6 +577,7 @@ void hashGroupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* co
             gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(ht), 0);
         }
     }
+    STOP_TIMER();
 
 }
 

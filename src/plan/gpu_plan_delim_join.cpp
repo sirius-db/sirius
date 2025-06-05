@@ -11,17 +11,22 @@
 #include "gpu_physical_grouped_aggregate.hpp"
 #include "gpu_physical_plan_generator.hpp"
 #include "gpu_physical_column_data_scan.hpp"
+#include "log/logging.hpp"
 
 namespace duckdb {
 
 static void GatherDelimScans(GPUPhysicalOperator &op, vector<const_reference<GPUPhysicalOperator>> &delim_scans,
 		idx_t delim_index) {
 	if (op.type == PhysicalOperatorType::DELIM_SCAN) {
-		printf("Found a delim scan\n");
-		printf("op type: %s\n", PhysicalOperatorToString(op.type).c_str());
+		SIRIUS_LOG_DEBUG("Found a delim scan");
+		SIRIUS_LOG_DEBUG("op type: {}", PhysicalOperatorToString(op.type));
 		auto &scan = op.Cast<GPUPhysicalColumnDataScan>();
 		scan.delim_index = optional_idx(delim_index);
-		printf("Scan delim index: %d\n", scan.delim_index);
+		if (scan.delim_index.IsValid()) {
+			SIRIUS_LOG_DEBUG("Scan delim index: {}", scan.delim_index.GetIndex());
+		} else {
+			SIRIUS_LOG_DEBUG("Scan delim index invalid");
+		}
 		delim_scans.push_back(op);
 	}
 	for (auto &child : op.children) {

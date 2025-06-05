@@ -8,6 +8,7 @@
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
+#include "log/logging.hpp"
 
 namespace duckdb {
 
@@ -29,7 +30,7 @@ GPUExpressionExecutor::HandlingSpecificFilter(GPUIntermediateRelation& input_rel
                             expr2.children[2]->type == ExpressionType::COMPARE_GREATERTHANOREQUALTO && expr2.children[3]->type == ExpressionType::COMPARE_LESSTHANOREQUALTO && expr2.children[4]->type == ExpressionType::COMPARE_IN) {
                     auto &expr3 = expr2.children[4]->Cast<BoundOperatorExpression>();
                     if (expr3.children.size() == 5) {
-                            printf("Filter expression of Q19\n");
+                            SIRIUS_LOG_DEBUG("Filter expression of Q19");
                             // string t = "(((P_BRAND = 12) AND (L_QUANTITY <= 11) AND (P_SIZE <= 5) AND (P_CONTAINER IN (0, 1, 4, 5))) OR ((P_BRAND = 23) AND (L_QUANTITY >= 10) AND (L_QUANTITY <= 20) AND (P_SIZE <= 10) AND (P_CONTAINER IN (17, 18, 20, 21))) OR ((P_BRAND = 34) AND (L_QUANTITY >= 20) AND (L_QUANTITY <= 30) AND (P_SIZE <= 15) AND (P_CONTAINER IN (8, 9, 12, 13))))";
                             string t = "(((P_BRAND = 12) AND (P_SIZE <= 5) AND (L_QUANTITY <= 11.0) AND (P_CONTAINER IN (0, 1, 4, 5))) OR ((P_BRAND = 23) AND (P_SIZE <= 10) AND (L_QUANTITY >= 10.0) AND (L_QUANTITY <= 20.0) AND (P_CONTAINER IN (17, 18, 20, 21))) OR ((P_BRAND = 34) AND (P_SIZE <= 15) AND (L_QUANTITY >= 20.0) AND (L_QUANTITY <= 30.0) AND (P_CONTAINER IN (8, 9, 12, 13))))";
                             if (!expression.ToString().compare(t)) {
@@ -71,7 +72,7 @@ GPUExpressionExecutor::HandlingSpecificFilter(GPUIntermediateRelation& input_rel
 
             //Q7 HACK!!!
             if (expr.children.size() == 2 && expr.type == ExpressionType::CONJUNCTION_OR && expr.children[0]->type == ExpressionType::COMPARE_EQUAL && expr.children[1]->type == ExpressionType::COMPARE_EQUAL) {
-                printf("Filter expression of Q7\n");
+                SIRIUS_LOG_DEBUG("Filter expression of Q7");
                 // string t = "((N_NATIONKEY = X) OR (N_NATIONKEY = Y))";
                 // if (!expression.ToString().compare(t)) {
                     
@@ -102,7 +103,7 @@ GPUExpressionExecutor::HandlingSpecificFilter(GPUIntermediateRelation& input_rel
             if (expr.children.size() == 2 && expr.children[0]->type == ExpressionType::CONJUNCTION_AND && expr.children[1]->type == ExpressionType::CONJUNCTION_AND) {
                 auto &expr2 = expr.children[0]->Cast<BoundConjunctionExpression>();
                 if (expr2.children.size() == 2 && expr2.children[0]->type == ExpressionType::COMPARE_EQUAL && expr2.children[1]->type == ExpressionType::COMPARE_EQUAL) {
-                    printf("Filter expression of Q7\n");
+                    SIRIUS_LOG_DEBUG("Filter expression of Q7");
                     string t = "(((N_NATIONKEY = 6) AND (N_NATIONKEY = 7)) OR ((N_NATIONKEY = 7) AND (N_NATIONKEY = 6)))";
                     if (!expression.ToString().compare(t)) {
                         
@@ -131,7 +132,7 @@ GPUExpressionExecutor::HandlingSpecificFilter(GPUIntermediateRelation& input_rel
             auto &expr = expression.Cast<BoundConjunctionExpression>();
             //Q16 HACK!!!
             // if (expr.children.size() == 3 && expr.children[0]->type == ExpressionType::COMPARE_NOTEQUAL && expr.children[1]->type == ExpressionType::CONJUNCTION_OR && expr.children[2]->type == ExpressionType::COMPARE_IN) {
-            //     printf("Filter expression of Q16\n");
+            //     SIRIUS_LOG_DEBUG("Filter expression of Q16");
             //     string t = "((P_BRAND != 45) AND ((P_TYPE < 65) OR (P_TYPE >= 70)) AND (P_SIZE IN (49, 14, 23, 45, 19, 3, 36, 9)))";
             //     if (!expression.ToString().compare(t)) {
             //         BoundComparisonExpression& first = expr.children[0]->Cast<BoundComparisonExpression>();
@@ -163,7 +164,7 @@ GPUExpressionExecutor::HandlingSpecificFilter(GPUIntermediateRelation& input_rel
 
             //Q16 HACK!!!
             if (expr.children.size() == 2 && expr.children[0]->type == ExpressionType::CONJUNCTION_OR && expr.children[1]->type == ExpressionType::COMPARE_IN) {
-                printf("Filter expression of Q16\n");
+                SIRIUS_LOG_DEBUG("Filter expression of Q16");
                 string t = "(((P_TYPE < 65) OR (P_TYPE >= 70)) AND (P_SIZE IN (49, 14, 23, 45, 19, 3, 36, 9)))";
                 if (!expression.ToString().compare(t)) {
                     BoundConjunctionExpression& second = expr.children[0]->Cast<BoundConjunctionExpression>();
@@ -190,7 +191,7 @@ GPUExpressionExecutor::HandlingSpecificFilter(GPUIntermediateRelation& input_rel
 
             //Q12 HACK!!!
             if (expr.children.size() == 3 && expr.children[0]->type == ExpressionType::COMPARE_LESSTHAN && expr.children[1]->type == ExpressionType::COMPARE_LESSTHAN && expr.children[2]->type == ExpressionType::COMPARE_IN) {
-                printf("Filter expression of Q12\n");
+                SIRIUS_LOG_DEBUG("Filter expression of Q12");
                 string t = "((L_COMMITDATE < L_RECEIPTDATE) AND (L_SHIPDATE < L_COMMITDATE) AND (L_SHIPMODE IN (4, 6)))";
                 if (!expression.ToString().compare(t)) {
                     BoundConjunctionExpression& expr = expression.Cast<BoundConjunctionExpression>();
@@ -230,7 +231,7 @@ GPUExpressionExecutor::HandlingSpecificFilter(GPUIntermediateRelation& input_rel
         if (expression.type == ExpressionType::COMPARE_EQUAL) {
             auto &expr = expression.Cast<BoundComparisonExpression>();
             if (expr.left->type == ExpressionType::BOUND_FUNCTION && expr.right->type == ExpressionType::VALUE_CONSTANT) {
-                printf("Filter expression of Q2\n");
+                SIRIUS_LOG_DEBUG("Filter expression of Q2");
                 string t = "(((P_TYPE + 3) % 5) = 0)";
                 if (!expression.ToString().compare(t)) {
                     auto &expr = expression.Cast<BoundComparisonExpression>();	
@@ -297,7 +298,7 @@ GPUExpressionExecutor::HandlingSpecificFilter(GPUIntermediateRelation& input_rel
         }
 
         if (count && comparison_idx) {
-            if (count[0] == 0) throw NotImplementedException("No match found");
+            // if (count[0] == 0) throw NotImplementedException("No match found");
             HandleMaterializeRowIDs(input_relation, output_relation, count[0], comparison_idx, gpuBufferManager, true);
             return true;
         }

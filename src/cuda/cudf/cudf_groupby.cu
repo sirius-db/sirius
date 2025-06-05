@@ -1,12 +1,15 @@
 #include "cudf/cudf_utils.hpp"
+#include "../operator/cuda_helper.cuh"
 #include "gpu_physical_grouped_aggregate.hpp"
 #include "gpu_buffer_manager.hpp"
+#include "log/logging.hpp"
+
 namespace duckdb {
 
 void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColumn>>& aggregate_keys, uint64_t num_keys, uint64_t num_aggregates, AggregationType* agg_mode) 
 {
   if (keys[0]->column_length == 0) {
-    printf("N is 0\n");
+    SIRIUS_LOG_DEBUG("Input size is 0");
     for (idx_t group = 0; group < num_keys; group++) {
       bool old_unique = keys[group]->is_unique;
       if (keys[group]->data_wrapper.type == ColumnType::VARCHAR) {
@@ -27,17 +30,27 @@ void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColu
     return;
   }
 
+  SIRIUS_LOG_DEBUG("CUDF Group By");
+  SIRIUS_LOG_DEBUG("Input size: {}", keys[0]->column_length);
+  SETUP_TIMING();
+  START_TIMER();
+
   GPUBufferManager *gpuBufferManager = &(GPUBufferManager::GetInstance());
   cudf::set_current_device_resource(gpuBufferManager->mr);
 
   std::vector<cudf::column_view> keys_cudf;
 
   //TODO: This is a hack to get the size of the keys
-  size_t size = keys[0]->column_length;
+  size_t size = 0;
 
   for (int key = 0; key < num_keys; key++) {
-    auto cudf_column = keys[key]->convertToCudfColumn();
-    keys_cudf.push_back(cudf_column);
+    if (keys[key]->data_wrapper.data != nullptr) {
+      auto cudf_column = keys[key]->convertToCudfColumn();
+      keys_cudf.push_back(cudf_column);
+      size = keys[key]->column_length;
+    } else {
+      throw NotImplementedException("Group by on non-nullable column not supported");
+    }
   }
 
   auto keys_table = cudf::table_view(keys_cudf);
@@ -47,7 +60,7 @@ void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColu
   for (int agg = 0; agg < num_aggregates; agg++) {
     requests.emplace_back(cudf::groupby::aggregation_request());
     if (aggregate_keys[agg]->data_wrapper.data == nullptr && agg_mode[agg] == AggregationType::COUNT && aggregate_keys[agg]->column_length == 0) {
-      printf("Count aggregation\n");
+      SIRIUS_LOG_DEBUG("Count aggregation");
       auto aggregate = cudf::make_sum_aggregation<cudf::groupby_aggregation>();
       requests[agg].aggregations.push_back(std::move(aggregate));
       // auto const_scalar = cudf::make_fixed_width_scalar<uint64_t>(static_cast<uint64_t>(0));
@@ -113,14 +126,15 @@ void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColu
       if (agg_mode[agg] == AggregationType::COUNT || agg_mode[agg] == AggregationType::COUNT_STAR) {
         auto agg_val_view = agg_val->view();
         auto temp_data = convertInt32ToUInt64(const_cast<int32_t*>(agg_val_view.data<int32_t>()), agg_val_view.size());
-        size_t size = agg_val_view.size();
-        aggregate_keys[agg] = make_shared_ptr<GPUColumn>(size, ColumnType::INT64, reinterpret_cast<uint8_t*>(temp_data));
+        aggregate_keys[agg] = make_shared_ptr<GPUColumn>(agg_val_view.size(), ColumnType::INT64, reinterpret_cast<uint8_t*>(temp_data));
       } else {
         aggregate_keys[agg]->setFromCudfColumn(*agg_val, false, nullptr, 0, gpuBufferManager);
         // aggregate_keys[agg] = gpuBufferManager->copyDataFromcuDFColumn(agg_val_view, 0);
       }
   }
 
+  STOP_TIMER();
+  SIRIUS_LOG_DEBUG("CUDF Groupby result count: {}", keys[0]->column_length);
 }
 
 } //namespace duckdb

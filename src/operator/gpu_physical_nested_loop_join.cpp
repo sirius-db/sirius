@@ -13,6 +13,7 @@
 #include "duckdb/common/enums/physical_operator_type.hpp"
 #include "gpu_buffer_manager.hpp"
 #include "gpu_materialize.hpp"
+#include "log/logging.hpp"
 
 namespace duckdb {
 
@@ -20,8 +21,8 @@ template <typename T>
 void ResolveTypeNestedLoopJoin(vector<shared_ptr<GPUColumn>> &left_keys, vector<shared_ptr<GPUColumn>> &right_keys, uint64_t* &count, uint64_t* &row_ids_left, uint64_t* &row_ids_right, 
 		const vector<JoinCondition> &conditions, JoinType join_type, GPUBufferManager* gpuBufferManager) {
 	int num_keys = conditions.size();
-	T** left_data = new T*[num_keys];
-	T** right_data = new T*[num_keys];
+	T** left_data = gpuBufferManager->customCudaHostAlloc<T*>(num_keys);
+	T** right_data = gpuBufferManager->customCudaHostAlloc<T*>(num_keys);
 
 	for (int key = 0; key < num_keys; key++) {
 		left_data[key] = reinterpret_cast<T*>(left_keys[key]->data_wrapper.data);
@@ -31,7 +32,7 @@ void ResolveTypeNestedLoopJoin(vector<shared_ptr<GPUColumn>> &left_keys, vector<
 	size_t right_size = right_keys[0]->column_length;
 
 
-	int* condition_mode = new int[num_keys];
+	int* condition_mode = gpuBufferManager->customCudaHostAlloc<int>(num_keys);
 	for (int key = 0; key < num_keys; key++) {
 		if (conditions[key].comparison == ExpressionType::COMPARE_EQUAL || conditions[key].comparison == ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
 			condition_mode[key] = 0;
@@ -142,11 +143,11 @@ GPUPhysicalNestedLoopJoin::Sink(GPUIntermediateRelation &input_relation) const {
 	for (idx_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
 		auto &condition = conditions[cond_idx];
         auto join_key_index = condition.right->Cast<BoundReferenceExpression>().index;
-        printf("Reading join key from right side from idx %ld\n", join_key_index);
+        SIRIUS_LOG_DEBUG("Reading join key from right side from idx {}", join_key_index);
 	}
 
     for (int i = 0; i < input_relation.columns.size(); i++) {
-        printf("Passing column idx %d from right side to idx %d in right temp relation\n", i, i);
+        SIRIUS_LOG_DEBUG("Passing column idx {} from right side to idx {} in right temp relation", i, i);
 		right_temp_data->columns[i] = make_shared_ptr<GPUColumn>(input_relation.columns[i]->column_length, input_relation.columns[i]->data_wrapper.type, input_relation.columns[i]->data_wrapper.data);
 		right_temp_data->columns[i]->row_ids = input_relation.columns[i]->row_ids;
 		right_temp_data->columns[i]->row_id_count = input_relation.columns[i]->row_id_count;
@@ -155,7 +156,7 @@ GPUPhysicalNestedLoopJoin::Sink(GPUIntermediateRelation &input_relation) const {
 	//measure time
 	auto end = std::chrono::high_resolution_clock::now();
 	auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-	printf("Result collector time: %.2f ms\n", duration.count()/1000.0);
+	SIRIUS_LOG_DEBUG("Nested loop join Sink time: {:.2f} ms", duration.count()/1000.0);
 	
 	return SinkResultType::FINISHED;
 
@@ -189,15 +190,16 @@ void GPUPhysicalNestedLoopJoin::ResolveSimpleJoin(GPUIntermediateRelation &input
 	for (idx_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
 		auto &condition = conditions[cond_idx];
         auto join_key_index = condition.left->Cast<BoundReferenceExpression>().index;
-        printf("Reading join key from left side from index %ld\n", join_key_index);
+        SIRIUS_LOG_DEBUG("Reading join key from left side from index {}", join_key_index);
         input_relation.checkLateMaterialization(join_key_index);
 	}
 
+	GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 	if (join_type == JoinType::SEMI || join_type == JoinType::ANTI || join_type == JoinType::MARK) {
-		printf("Writing row IDs from left side to output relation\n");
-		uint64_t* left_row_ids = new uint64_t[1];
+		SIRIUS_LOG_DEBUG("Writing row IDs from left side to output relation");
+		uint64_t* left_row_ids = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
 		for (idx_t i = 0; i < input_relation.column_count; i++) {
-			printf("Passing column idx %ld from LHS (late materialized) to idx %ld in output relation\n", i, i);
+			SIRIUS_LOG_DEBUG("Passing column idx {} from LHS (late materialized) to idx {} in output relation", i, i);
 			output_relation.columns[i] = input_relation.columns[i];
 			output_relation.columns[i]->row_ids = left_row_ids;
 		}
@@ -208,6 +210,8 @@ void GPUPhysicalNestedLoopJoin::ResolveSimpleJoin(GPUIntermediateRelation &input
 
 OperatorResultType 
 GPUPhysicalNestedLoopJoin::ResolveComplexJoin(GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation) const {
+
+	auto start = std::chrono::high_resolution_clock::now();
 
 	GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 	vector<shared_ptr<GPUColumn>> left_keys(conditions.size());
@@ -223,16 +227,14 @@ GPUPhysicalNestedLoopJoin::ResolveComplexJoin(GPUIntermediateRelation &input_rel
 	for (idx_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
 		auto &condition = conditions[cond_idx];
         auto join_key_index = condition.left->Cast<BoundReferenceExpression>().index;
-        printf("Reading join key from left side from index %ld\n", join_key_index);
-        // input_relation.checkLateMaterialization(join_key_index);
+        SIRIUS_LOG_DEBUG("Reading join key from left relation from index {}", join_key_index);
 		left_keys[cond_idx] = HandleMaterializeExpression(input_relation.columns[join_key_index], condition.left->Cast<BoundReferenceExpression>(), gpuBufferManager);
 	}
 
 	for (idx_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
 		auto &condition = conditions[cond_idx];
         auto join_key_index = condition.right->Cast<BoundReferenceExpression>().index;
-        printf("Reading join key from right side from index %ld\n", join_key_index);
-        // right_temp_data->checkLateMaterialization(join_key_index);
+        SIRIUS_LOG_DEBUG("Reading join key from right relation from index {}", join_key_index);
 		right_keys[cond_idx] = HandleMaterializeExpression(right_temp_data->columns[join_key_index], condition.right->Cast<BoundReferenceExpression>(), gpuBufferManager);
 	}
 
@@ -252,27 +254,33 @@ GPUPhysicalNestedLoopJoin::ResolveComplexJoin(GPUIntermediateRelation &input_rel
 	}
 
 	if (join_type == JoinType::INNER) {
-		printf("Nested loop join\n");
+		SIRIUS_LOG_DEBUG("Nested loop join");
 		HandleNestedLoopJoin(left_keys, right_keys, count, row_ids_left, row_ids_right, conditions, join_type, gpuBufferManager);
 
 		vector<column_t> rhs_output_columns;
 		for (idx_t i = 0; i < right_temp_data->columns.size(); i++) rhs_output_columns.push_back(i);
 
-		if (count[0] == 0) throw NotImplementedException("No match found in nested loop join");
-		printf("Writing row IDs from LHS to output relation\n");
+		// if (count[0] == 0) throw NotImplementedException("No match found in nested loop join");
+		SIRIUS_LOG_DEBUG("Writing row IDs from LHS to output relation");
 		HandleMaterializeRowIDs(input_relation, output_relation, count[0], row_ids_left, gpuBufferManager, false);
-		printf("Writing row IDs from RHS to output relation\n");
+		SIRIUS_LOG_DEBUG("Writing row IDs from RHS to output relation");
 		HandleMaterializeRowIDsRHS(*right_temp_data, output_relation, rhs_output_columns, input_relation.column_count, count[0], row_ids_right, gpuBufferManager, false);
 
 	} else {
         throw NotImplementedException("Unimplemented type for complex nested loop join!");
     }
 
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+	SIRIUS_LOG_DEBUG("Nested loop join Execute time: {:.2f} ms", duration.count()/1000.0);
+
     return OperatorResultType::FINISHED;
 }
 
 SourceResultType 
 GPUPhysicalNestedLoopJoin::GetData(GPUIntermediateRelation& output_relation) const {
+
+	auto start = std::chrono::high_resolution_clock::now();
 
     // check if we need to scan any unmatched tuples from the RHS for the full/right outer join
 	idx_t left_column_count = output_relation.columns.size() - right_temp_data->columns.size();
@@ -286,10 +294,13 @@ GPUPhysicalNestedLoopJoin::GetData(GPUIntermediateRelation& output_relation) con
 	}
 
 	for (idx_t i = 0; i < right_temp_data->columns.size(); i++) {
-		printf("Writing right temp data column idx %ld to idx %ld in output relation\n", i, i);
+		SIRIUS_LOG_DEBUG("Writing right temp data column idx {} to idx {} in output relation", i, left_column_count + i);
 		output_relation.columns[left_column_count + i] = right_temp_data->columns[i];
 	}
 
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+	SIRIUS_LOG_DEBUG("Nested loop join GetData time: {:.2f} ms", duration.count()/1000.0);
     return SourceResultType::FINISHED;
 
 }

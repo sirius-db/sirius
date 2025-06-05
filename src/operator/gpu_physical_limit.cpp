@@ -1,6 +1,7 @@
 #include "operator/gpu_physical_limit.hpp"
 #include "operator/gpu_materialize.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "log/logging.hpp"
 
 namespace duckdb {
 
@@ -13,21 +14,21 @@ GPUPhysicalStreamingLimit::GPUPhysicalStreamingLimit(vector<LogicalType> types, 
 OperatorResultType 
 GPUPhysicalStreamingLimit::Execute(GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation) const {
 
-	printf("Executing streaming limit\n");
-  // printf("limit type: %d\n", limit_val.Type());
-  printf("Limit value %ld\n", limit_val.GetConstantValue());
+	SIRIUS_LOG_DEBUG("Executing streaming limit");
+  // SIRIUS_LOG_DEBUG("limit type: {}", limit_val.Type());
+  SIRIUS_LOG_DEBUG("Limit value {}", limit_val.GetConstantValue());
   if (limit_val.Type() != LimitNodeType::CONSTANT_VALUE) {
     throw NotImplementedException("Streaming limit other than constant value not implemented");
   }
   auto limit_const = limit_val.GetConstantValue();
-  // printf("Offset value %ld\n", offset_val.GetConstantValue());
+  // SIRIUS_LOG_DEBUG("Offset value {}", offset_val.GetConstantValue());
   // auto offset_const = offset_val.GetConstantValue();
   // if (offset_const > 0) {
   //   throw NotImplementedException("Streaming limit with offset not implemented");
   // }
   GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 	for (int col_idx = 0; col_idx < output_relation.columns.size(); col_idx++) {
-    BoundReferenceExpression& bound_ref = *new BoundReferenceExpression(LogicalType::INTEGER, col_idx);
+    BoundReferenceExpression bound_ref(LogicalType::INTEGER, col_idx);
     shared_ptr<GPUColumn> materialize_column = HandleMaterializeExpression(input_relation.columns[col_idx], bound_ref, gpuBufferManager);
 
     limit_const = min(limit_const, materialize_column->column_length);
@@ -40,7 +41,7 @@ GPUPhysicalStreamingLimit::Execute(GPUIntermediateRelation &input_relation, GPUI
 			callCudaMemcpyDeviceToHost<uint64_t>(new_num_bytes, materialize_column->data_wrapper.offset + limit_const, 1, 0);
       output_relation.columns[col_idx]->data_wrapper.num_bytes = new_num_bytes[0];
     }
-    printf("Column %d has %ld rows\n", col_idx, output_relation.columns[col_idx]->column_length);
+    SIRIUS_LOG_DEBUG("Column {} has {} rows", col_idx, output_relation.columns[col_idx]->column_length);
 	}
 
   return OperatorResultType::FINISHED;

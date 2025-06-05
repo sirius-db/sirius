@@ -5,5 +5,6 @@ set(CUDA_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/cudf_groupby.cu
         ${CMAKE_CURRENT_SOURCE_DIR}/cudf_orderby.cu
         ${CMAKE_CURRENT_SOURCE_DIR}/cudf_utils.cu
+        ${CMAKE_CURRENT_SOURCE_DIR}/cudf_aggregate.cu
         PARENT_SCOPE
 )

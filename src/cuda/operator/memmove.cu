@@ -1,4 +1,5 @@
 #include "cuda_helper.cuh"
+#include "log/logging.hpp"
 #include <chrono>
 #include <cub/cub.cuh>
 #include <thrust/device_vector.h>
@@ -113,13 +114,13 @@ void cudaMemmove(uint8_t* destination,
   // Determine if there is memory overlap
   if (destination + num < source)
   {
-    printf("This is just cudaMemcpy\n");
+    SIRIUS_LOG_DEBUG("This is just cudaMemcpy");
     cudaMemcpy(destination, source, num, cudaMemcpyDeviceToDevice);
     CHECK_ERROR();
   }
   else
   {
-    printf("This is actual memmove\n");
+    SIRIUS_LOG_DEBUG("This is actual memmove");
     // We need memmove
     using scan_tile_state_t = cub::ScanTileState<bool>;
 

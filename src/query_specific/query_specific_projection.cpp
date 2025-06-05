@@ -7,6 +7,7 @@
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "log/logging.hpp"
 
 namespace duckdb {
 
@@ -21,7 +22,7 @@ GPUExpressionExecutor::HandlingSpecificProjection(GPUIntermediateRelation& input
 			if (expr.case_checks[0].then_expr->type == ExpressionType::BOUND_REF) {
 				//Q8 HACK!!!
 				//case when nation = 1 then volume else 0 
-				printf("Case expression of Q8\n");
+				SIRIUS_LOG_DEBUG("Case expression of Q8");
 				auto &when_expr = expr.case_checks[0].when_expr->Cast<BoundComparisonExpression>();
 				auto nation = when_expr.left->Cast<BoundReferenceExpression>().index;
 
@@ -45,13 +46,13 @@ GPUExpressionExecutor::HandlingSpecificProjection(GPUIntermediateRelation& input
 			} else if (expr.case_checks[0].then_expr->type == ExpressionType::BOUND_FUNCTION) {
 
 				auto &then_expr = expr.case_checks[0].then_expr->Cast<BoundFunctionExpression>();
-				printf("function name %s\n", then_expr.function.name.c_str());
+				SIRIUS_LOG_DEBUG("function name {}", then_expr.function.name);
 
 				if (then_expr.function.name.compare("error") == 0) {
 					// Q11 & Q22 HACK!!!
 					// CASE  WHEN ((#1 > 1)) THEN (error('More than one row returned by a subquery used as an expression - scalar subqueries can only return a single row.
 					// Use "SET scalar_subquery_error_on_multiple_rows=false" to revert to previous behavior of returning a random row.')) ELSE #0 END
-					printf("Case expression of Q11 & Q22\n");
+					SIRIUS_LOG_DEBUG("Case expression of Q11 & Q22");
 					auto &when_expr = expr.case_checks[0].when_expr->Cast<BoundComparisonExpression>();
 					auto left_ref = when_expr.left->Cast<BoundReferenceExpression>().index;
 					auto else_expr = expr.else_expr->Cast<BoundReferenceExpression>().index;
@@ -63,10 +64,10 @@ GPUExpressionExecutor::HandlingSpecificProjection(GPUIntermediateRelation& input
 
 				} else if (then_expr.function.name.compare("*") == 0) {
 					// Q14 HACK!!!
-					printf("Case expression of Q14\n");
+					SIRIUS_LOG_DEBUG("Case expression of Q14");
 					//CASE  WHEN ((P_TYPE >= 125)) THEN ((L_EXTENDEDPRICE * (1.0 - L_DISCOUNT))) ELSE 0.0 END
 					auto &when_expr = expr.case_checks[0].when_expr->Cast<BoundComparisonExpression>();
-					// printf("%s\n", ExpressionTypeToString(when_expr.type).c_str());
+					// SIRIUS_LOG_DEBUG("{}", ExpressionTypeToString(when_expr.type));
 					// auto &compare_expr = when_expr.children[0]->Cast<BoundComparisonExpression>();
 					auto p_type = when_expr.left->Cast<BoundReferenceExpression>().index;
 
@@ -96,7 +97,7 @@ GPUExpressionExecutor::HandlingSpecificProjection(GPUIntermediateRelation& input
 				if (when_expr.type == ExpressionType::CONJUNCTION_AND) {
 					// Q12 HACK!!!
 					// case when o_orderpriority <> 0 and o_orderpriority <> 1 then 1 else 0
-					printf("Case expression of Q12\n");
+					SIRIUS_LOG_DEBUG("Case expression of Q12");
 					auto &compare_expr = when_expr.children[0]->Cast<BoundComparisonExpression>();
 					auto o_orderpriority = compare_expr.left->Cast<BoundReferenceExpression>().index;
 
@@ -111,7 +112,7 @@ GPUExpressionExecutor::HandlingSpecificProjection(GPUIntermediateRelation& input
 				} else if (when_expr.type == ExpressionType::CONJUNCTION_OR) {
 					// Q12 HACK!!!
 					// case when o_orderpriority = 0 or o_orderpriority = 1 then 1 else 0
-					printf("Case expression of Q12\n");
+					SIRIUS_LOG_DEBUG("Case expression of Q12");
 					auto &compare_expr = when_expr.children[0]->Cast<BoundComparisonExpression>();
 					auto o_orderpriority = compare_expr.left->Cast<BoundReferenceExpression>().index;
 
@@ -129,12 +130,12 @@ GPUExpressionExecutor::HandlingSpecificProjection(GPUIntermediateRelation& input
 
 		if (expression.expression_class == ExpressionClass::BOUND_FUNCTION) {
 			auto &expr = expression.Cast<BoundFunctionExpression>();
-			// printf("Function name %s\n", expr.function.name.c_str());
+			// SIRIUS_LOG_DEBUG("Function name {}", expr.function.name);
 
 			if (expr.children[0]->type == ExpressionType::OPERATOR_CAST) {
 				//Q7 Q8 Q9 HACK!!!
 				//(CAST(O_ORDERDATE AS DOUBLE) // 10000.0)
-				printf("Projection expression of Q7, Q8, Q9\n");
+				SIRIUS_LOG_DEBUG("Projection expression of Q7, Q8, Q9");
 				auto &cast_expr = expr.children[0]->Cast<BoundCastExpression>();
 				auto date = cast_expr.child->Cast<BoundReferenceExpression>().index;
 
@@ -158,7 +159,7 @@ GPUExpressionExecutor::HandlingSpecificProjection(GPUIntermediateRelation& input
 					if (function_expr.function.name.compare("+") == 0) {
 						//Q1 HACK!!!
 						//#4 * (1 + l_tax)
-						printf("Projection expression of Q1\n");
+						SIRIUS_LOG_DEBUG("Projection expression of Q1");
 						auto l_tax = function_expr.children[1]->Cast<BoundReferenceExpression>().index;
 
 						auto materialize_4 = HandleMaterializeExpression(input_relation.columns[l_extendedprice_or_4], ref_expr, gpuBufferManager);
@@ -174,7 +175,7 @@ GPUExpressionExecutor::HandlingSpecificProjection(GPUIntermediateRelation& input
 
 					}  else if (function_expr.function.name.compare("-") == 0) {
 						//l_extendedprice * (1 - l_discount)
-						printf("Common projection expression l_extendedprice * (1 - l_discount)\n");
+						SIRIUS_LOG_DEBUG("Common projection expression l_extendedprice * (1 - l_discount)");
 						auto l_discount = function_expr.children[1]->Cast<BoundReferenceExpression>().index;
 
 						auto materialize_extendedprice = HandleMaterializeExpression(input_relation.columns[l_extendedprice_or_4], ref_expr, gpuBufferManager);
@@ -191,7 +192,7 @@ GPUExpressionExecutor::HandlingSpecificProjection(GPUIntermediateRelation& input
 				} else if (expr.children[0]->type == ExpressionType::BOUND_FUNCTION) {
 						//Q9 HACK!!!
                         //((L_EXTENDEDPRICE * (1.0 - L_DISCOUNT)) - (PS_SUPPLYCOST * L_QUANTITY))
-						printf("Projection expression of Q9\n");
+						SIRIUS_LOG_DEBUG("Projection expression of Q9");
 						auto &left_function_expr = expr.children[0]->Cast<BoundFunctionExpression>();
 						auto l_extendedprice = left_function_expr.children[0]->Cast<BoundReferenceExpression>().index;
 						auto &left_right_function_expr = left_function_expr.children[1]->Cast<BoundFunctionExpression>();
@@ -222,7 +223,7 @@ GPUExpressionExecutor::HandlingSpecificProjection(GPUIntermediateRelation& input
 				if (expr.children[0]->type == ExpressionType::BOUND_FUNCTION) {
 					//Q14 HACK!!!
 					//((sum(CASE  WHEN (((P_TYPE >= CAST(125 AS BIGINT)) AND (P_TYPE < CAST(150 AS BIGINT)))) THEN ((L_EXTENDEDPRICE * (CAST(1 AS DOUBLE) - L_DISCOUNT))) ELSE CAST(0.0 AS DOUBLE) END) * 100.0) / sum((L_EXTENDEDPRICE * (CAST(1 AS DOUBLE) - L_DISCOUNT))))
-					printf("Projection expression of Q14\n");
+					SIRIUS_LOG_DEBUG("Projection expression of Q14");
 					auto &left_function_expr = expr.children[0]->Cast<BoundFunctionExpression>();
 					auto sum_case = left_function_expr.children[0]->Cast<BoundReferenceExpression>().index;
 					auto value = left_function_expr.children[1]->Cast<BoundConstantExpression>().value.GetValue<double>();
@@ -247,7 +248,7 @@ GPUExpressionExecutor::HandlingSpecificProjection(GPUIntermediateRelation& input
 
 
         if (result) {
-			printf("Writing projection result to idx %ld\n", output_idx);
+			SIRIUS_LOG_DEBUG("Writing projection result to idx {}", output_idx);
             output_relation.columns[output_idx] = result;
             output_relation.columns[output_idx]->row_ids = nullptr;
             output_relation.columns[output_idx]->row_id_count = 0;

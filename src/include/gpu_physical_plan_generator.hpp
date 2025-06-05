@@ -59,7 +59,7 @@ protected:
 	// unique_ptr<GPUPhysicalOperator> CreatePlan(LogicalDistinct &op);
 	unique_ptr<GPUPhysicalOperator> CreatePlan(LogicalDummyScan &expr);
 	unique_ptr<GPUPhysicalOperator> CreatePlan(LogicalEmptyResult &op);
-	// unique_ptr<GPUPhysicalOperator> CreatePlan(LogicalExpressionGet &op);
+	unique_ptr<GPUPhysicalOperator> CreatePlan(LogicalExpressionGet &op);
 	// unique_ptr<GPUPhysicalOperator> CreatePlan(LogicalExport &op);
 	unique_ptr<GPUPhysicalOperator> CreatePlan(LogicalFilter &op);
 	unique_ptr<GPUPhysicalOperator> CreatePlan(LogicalGet &op);
