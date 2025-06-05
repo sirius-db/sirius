@@ -301,6 +301,10 @@ void HandleArbitraryConstantExpression(vector<shared_ptr<GPUColumn>> &column, ui
         total_bytes += sizeof(double);
         data_type[expr] = FLOAT64;
         break;
+      } case ColumnType::DATE: {
+        total_bytes += sizeof(int);
+        data_type[expr] = DATE;
+        break;
       } case ColumnType::VARCHAR: {
         std::string lower_string = filter_constant[expr]->constant.ToString();
         total_bytes += lower_string.size();
@@ -321,7 +325,8 @@ void HandleArbitraryConstantExpression(vector<shared_ptr<GPUColumn>> &column, ui
     offset[expr] = column[expr]->data_wrapper.offset;
 
     switch(column[expr]->data_wrapper.type) {
-      case ColumnType::INT32: {
+      case ColumnType::INT32:
+      case ColumnType::DATE: {
         int temp = filter_constant[expr]->constant.GetValue<int>();
         memcpy(constant_compare + init_offset, &temp, sizeof(int));
         constant_offset[expr] = init_offset;
