@@ -5,7 +5,6 @@ EXT_NAME=sirius
 EXT_CONFIG=${PROJ_DIR}extension_config.cmake
 GEN=ninja
 BUILD_PYTHON=1
-DEBUG_STACKTRACE=1
 
 # Include the Makefile from extension-ci-tools
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
