@@ -12,6 +12,7 @@
 #include "duckdb/execution/physical_operator_states.hpp"
 #include "duckdb/common/enums/order_preservation_type.hpp"
 #include "gpu_columns.hpp"
+#include "helper/types.hpp"
 
 namespace duckdb {
 class GPUExecutor;

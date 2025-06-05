@@ -1,3 +1,5 @@
+#pragma once
+
 namespace duckdb {
 
 enum class OrderByType {
@@ -11,7 +13,8 @@ enum class AggregationType {
 	MAX,
 	COUNT,
     COUNT_STAR,
-	AVERAGE
+	AVERAGE,
+	FIRST
 };
 
 }

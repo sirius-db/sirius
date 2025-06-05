@@ -1,5 +1,6 @@
 #include "gpu_columns.hpp"
 #include "gpu_buffer_manager.hpp"
+#include "log/logging.hpp"
 
 namespace duckdb {
 
@@ -62,6 +63,7 @@ GPUColumn::GPUColumn(GPUColumn& other) {
 
 cudf::column_view
 GPUColumn::convertToCudfColumn() {
+    SIRIUS_LOG_DEBUG("Converting GPUColumn to cuDF column");
     cudf::size_type size = column_length;
     if (data_wrapper.type == ColumnType::INT64) {
         auto column = cudf::column_view(cudf::data_type(cudf::type_id::UINT64), size, reinterpret_cast<void*>(data_wrapper.data), nullptr, 0);
@@ -79,7 +81,6 @@ GPUColumn::convertToCudfColumn() {
         auto column = cudf::column_view(cudf::data_type(cudf::type_id::BOOL8), size, reinterpret_cast<void*>(data_wrapper.data), nullptr, 0);
         return column;
     } else if (data_wrapper.type == ColumnType::VARCHAR) {
-
         //convert offset to int32
         int32_t* new_offset = convertSiriusOffsetToCudfOffset();
 
@@ -106,14 +107,15 @@ GPUColumn::convertToCudfColumn() {
         );
         return str_col;
     }
+    throw duckdb::InternalException("Unsupported gpu column type in `convertToCudfColumn()`: %d", data_wrapper.type);
 }
 
 void
 GPUColumn::setFromCudfColumn(cudf::column& cudf_column, bool _is_unique, int32_t* _row_ids, uint64_t _row_id_count, GPUBufferManager* gpuBufferManager) {
+    SIRIUS_LOG_DEBUG("Set a GPUColumn from cudf::column");
     cudf::data_type col_type = cudf_column.type();
     cudf::size_type col_size = cudf_column.size();
     cudf::column::contents cont = cudf_column.release();
-    // rmm_owned_buffer = std::move(cont.data);
     gpuBufferManager->rmm_stored_buffers.push_back(std::move(cont.data));
 
     data_wrapper.data = reinterpret_cast<uint8_t*>(gpuBufferManager->rmm_stored_buffers.back()->data());
@@ -121,13 +123,12 @@ GPUColumn::setFromCudfColumn(cudf::column& cudf_column, bool _is_unique, int32_t
     column_length = data_wrapper.size;
     is_unique = _is_unique;
     //add data to allocation table in gpu buffer manager
-    gpuBufferManager->allocation_table[0][reinterpret_cast<void*>(data_wrapper.data)] = column_length;
-
     if (col_type == cudf::data_type(cudf::type_id::STRING)) {
         cudf::column::contents child_cont = cont.children[0]->release();
+        gpuBufferManager->rmm_stored_buffers.push_back(std::move(child_cont.data));
         data_wrapper.is_string_data = true;
         data_wrapper.type = ColumnType::VARCHAR;
-        int32_t* temp_offset = reinterpret_cast<int32_t*>(child_cont.data->data());
+        int32_t* temp_offset = reinterpret_cast<int32_t*>(gpuBufferManager->rmm_stored_buffers.back()->data());
         convertCudfOffsetToSiriusOffset(temp_offset);
         //copy data from offset to num_bytes
         uint64_t* temp_num_bytes = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
@@ -169,6 +170,51 @@ GPUColumn::setFromCudfColumn(cudf::column& cudf_column, bool _is_unique, int32_t
     }
 }
 
+void
+GPUColumn::setFromCudfScalar(cudf::scalar& cudf_scalar, GPUBufferManager* gpuBufferManager) {
+    SIRIUS_LOG_DEBUG("Set a GPUColumn from cudf::scalar");
+    cudf::data_type scalar_type = cudf_scalar.type();
+    if (scalar_type == cudf::data_type(cudf::type_id::UINT64)) {
+        auto& typed_scalar = static_cast<cudf::numeric_scalar<uint64_t>&>(cudf_scalar);
+        data_wrapper.data = gpuBufferManager->customCudaMalloc<uint8_t>(sizeof(uint64_t), 0, 0);
+        callCudaMemcpyDeviceToDevice<uint8_t>(data_wrapper.data, reinterpret_cast<uint8_t*>(typed_scalar.data()), sizeof(uint64_t), 0);
+        data_wrapper.type = ColumnType::INT64;
+        data_wrapper.num_bytes = sizeof(uint64_t);
+    } else if (scalar_type == cudf::data_type(cudf::type_id::INT32)) {
+        auto& typed_scalar = static_cast<cudf::numeric_scalar<int32_t>&>(cudf_scalar);
+        data_wrapper.data = gpuBufferManager->customCudaMalloc<uint8_t>(sizeof(int32_t), 0, 0);
+        callCudaMemcpyDeviceToDevice<uint8_t>(data_wrapper.data, reinterpret_cast<uint8_t*>(typed_scalar.data()), sizeof(int32_t), 0);
+        data_wrapper.type = ColumnType::INT32;
+        data_wrapper.num_bytes = sizeof(int32_t);
+    } else if (scalar_type == cudf::data_type(cudf::type_id::FLOAT32)) {
+        auto& typed_scalar = static_cast<cudf::numeric_scalar<float>&>(cudf_scalar);
+        data_wrapper.data = gpuBufferManager->customCudaMalloc<uint8_t>(sizeof(float), 0, 0);
+        callCudaMemcpyDeviceToDevice<uint8_t>(data_wrapper.data, reinterpret_cast<uint8_t*>(typed_scalar.data()), sizeof(float), 0);
+        data_wrapper.type = ColumnType::FLOAT32;
+        data_wrapper.num_bytes = sizeof(float);
+    } else if (scalar_type == cudf::data_type(cudf::type_id::FLOAT64)) {
+        auto& typed_scalar = static_cast<cudf::numeric_scalar<double>&>(cudf_scalar);
+        data_wrapper.data = gpuBufferManager->customCudaMalloc<uint8_t>(sizeof(double), 0, 0);
+        callCudaMemcpyDeviceToDevice<uint8_t>(data_wrapper.data, reinterpret_cast<uint8_t*>(typed_scalar.data()), sizeof(double), 0);
+        data_wrapper.type = ColumnType::FLOAT64;
+        data_wrapper.num_bytes = sizeof(double);
+    } else if (scalar_type == cudf::data_type(cudf::type_id::BOOL8)) {
+        auto& typed_scalar = static_cast<cudf::numeric_scalar<bool>&>(cudf_scalar);
+        data_wrapper.data = gpuBufferManager->customCudaMalloc<uint8_t>(sizeof(uint8_t), 0, 0);
+        callCudaMemcpyDeviceToDevice<uint8_t>(data_wrapper.data, reinterpret_cast<uint8_t*>(typed_scalar.data()), sizeof(uint8_t), 0);
+        data_wrapper.type = ColumnType::BOOLEAN;
+        data_wrapper.num_bytes = sizeof(uint8_t);
+    }
+
+    data_wrapper.size = 1;
+    column_length = 1;
+    data_wrapper.offset = nullptr;
+    data_wrapper.is_string_data = false;
+    row_ids = nullptr;
+    row_id_count = 0;
+
+}
+
 int32_t*
 GPUColumn::convertSiriusOffsetToCudfOffset() {
     return convertUInt64ToInt32(data_wrapper.offset, column_length + 1);
@@ -200,16 +246,16 @@ GPUIntermediateRelation::GPUIntermediateRelation(size_t column_count) :
 
 bool
 GPUIntermediateRelation::checkLateMaterialization(size_t idx) {
-    printf("Checking if column idx %ld needs to be materialized from column size %d\n", idx, columns.size());
+    SIRIUS_LOG_DEBUG("Checking if column idx {} needs to be materialized from column size {}", idx, columns.size());
     if (columns[idx] == nullptr) {
-        printf("Column idx %ld is null\n", idx);
+        SIRIUS_LOG_DEBUG("Column idx {} is null", idx);
         return false;
     }
 
     if (columns[idx]->row_ids == nullptr) {
-        printf("Column idx %d already materialized\n", idx);
+        SIRIUS_LOG_DEBUG("Column idx {} already materialized", idx);
     } else {
-        printf("Column idx %d needs to be materialized\n", idx);
+        SIRIUS_LOG_DEBUG("Column idx {} needs to be materialized", idx);
     }
     return columns[idx]->row_ids != nullptr;
 }

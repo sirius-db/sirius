@@ -97,8 +97,13 @@ __global__ void fill_row_ids_buffer(uint64_t* d_row_ids, uint64_t num_rows) {
 void orderByString(uint8_t** col_keys, uint64_t** col_offsets, int* sort_orders, uint64_t* col_num_bytes, uint64_t num_rows, uint64_t num_cols) {
     CHECK_ERROR();
     if(num_rows == 0) {
+        SIRIUS_LOG_DEBUG("Input size is 0");
         return;
     }
+
+    SIRIUS_LOG_DEBUG("Launching Order By String kernel");
+    SETUP_TIMING();
+    START_TIMER();
 
     // Copy over the ptrs onto the GPU
     auto preprocess_start_time = high_resolution_clock::now();
@@ -117,7 +122,7 @@ void orderByString(uint8_t** col_keys, uint64_t** col_offsets, int* sort_orders,
     cudaMemcpy(d_sort_orders, sort_orders, num_cols * sizeof(int), cudaMemcpyHostToDevice);
     auto preprocess_end_time = high_resolution_clock::now();
     auto preprocess_time_ms = std::chrono::duration_cast<duration<double, std::milli>>(preprocess_end_time - preprocess_start_time).count();
-    std::cout << "STRING ORDER BY: Preprocessing took " << preprocess_time_ms << " ms" << std::endl;
+    SIRIUS_LOG_DEBUG("STRING ORDER BY: Preprocessing took {} ms", preprocess_time_ms);
 
     // Now sort those row ids using the custom comparator
     auto sort_start_time = high_resolution_clock::now();
@@ -148,7 +153,7 @@ void orderByString(uint8_t** col_keys, uint64_t** col_offsets, int* sort_orders,
 
     auto sort_end_time = high_resolution_clock::now();
     auto sort_time_ms = std::chrono::duration_cast<duration<double, std::milli>>(sort_end_time - sort_start_time).count();
-    std::cout << "STRING ORDER BY: Sorting required " << sort_temp_storage_bytes << " bytes and took " << sort_time_ms << " ms" << std::endl;
+    SIRIUS_LOG_DEBUG("STRING ORDER BY: Sorting required {} bytes and took {} ms", sort_temp_storage_bytes, sort_time_ms);
 
     for(uint64_t i = 0; i < num_cols; i++) {
         // Get the original column
@@ -170,6 +175,8 @@ void orderByString(uint8_t** col_keys, uint64_t** col_offsets, int* sort_orders,
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_row_ids), 0);
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_sort_orders), 0);
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(sort_temp_storage), 0);
+
+    STOP_TIMER();
 }
 
 }

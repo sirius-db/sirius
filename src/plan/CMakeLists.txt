@@ -16,5 +16,6 @@ set(EXTENSION_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/gpu_plan_cte.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/gpu_plan_recursive_cte.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/gpu_plan_top_n.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/gpu_plan_expression_get.cpp
         PARENT_SCOPE
 )

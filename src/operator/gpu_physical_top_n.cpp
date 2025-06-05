@@ -8,6 +8,8 @@
 #include "gpu_physical_top_n.hpp"
 #include "gpu_physical_order.hpp"
 #include "gpu_materialize.hpp"
+#include "gpu_buffer_manager.hpp"
+#include "log/logging.hpp"
 
 namespace duckdb {
 
@@ -27,7 +29,8 @@ GPUPhysicalTopN::~GPUPhysicalTopN() {
 
 void
 HandleTopN(vector<shared_ptr<GPUColumn>> &order_by_keys, vector<shared_ptr<GPUColumn>> &projection_columns, const vector<BoundOrderByNode> &orders, uint64_t num_projections) {
-	OrderByType* order_by_type = new OrderByType[orders.size()];
+	GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+	OrderByType* order_by_type = gpuBufferManager->customCudaHostAlloc<OrderByType>(orders.size());
 	for (int order_idx = 0; order_idx < orders.size(); order_idx++) {
 		if (orders[order_idx].type == OrderType::ASCENDING) {
 			order_by_type[order_idx] = OrderByType::ASCENDING;
@@ -44,6 +47,7 @@ HandleTopN(vector<shared_ptr<GPUColumn>> &order_by_keys, vector<shared_ptr<GPUCo
 //===--------------------------------------------------------------------===//
 // SinkResultType PhysicalTopN::Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const {
 SinkResultType GPUPhysicalTopN::Sink(GPUIntermediateRelation& input_relation) const {
+	auto start = std::chrono::high_resolution_clock::now();
     // throw NotImplementedException("Top N Sink not implemented");
     if (dynamic_filter) {
         throw NotImplementedException("Top N Sink with dynamic filter not implemented");
@@ -104,6 +108,9 @@ SinkResultType GPUPhysicalTopN::Sink(GPUIntermediateRelation& input_relation) co
 	// sink.heap.Sink(chunk, &gstate.boundary_value);
 	// sink.heap.Reduce();
 	// return SinkResultType::NEED_MORE_INPUT;
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+	SIRIUS_LOG_DEBUG("Top N Sink time: {:.2f} ms", duration.count()/1000.0);
 	return SinkResultType::FINISHED;
 }
 
@@ -147,12 +154,13 @@ SinkResultType GPUPhysicalTopN::Sink(GPUIntermediateRelation& input_relation) co
 
 // SourceResultType PhysicalTopN::GetData(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &input) const {
 SourceResultType GPUPhysicalTopN::GetData(GPUIntermediateRelation& output_relation) const {
+	auto start = std::chrono::high_resolution_clock::now();
 	if (limit == 0) {
 		return SourceResultType::FINISHED;
 	}
 
 	for (int col = 0; col < sort_result->columns.size(); col++) {
-		printf("Writing top n result to column %d\n", col);
+		SIRIUS_LOG_DEBUG("Writing top n result to column {}", col);
     	auto limit_const = min(limit, sort_result->columns[col]->column_length);
     	output_relation.columns[col] = make_shared_ptr<GPUColumn>(limit_const, sort_result->columns[col]->data_wrapper.type, sort_result->columns[col]->data_wrapper.data,
                           sort_result->columns[col]->data_wrapper.offset, sort_result->columns[col]->data_wrapper.num_bytes, sort_result->columns[col]->data_wrapper.is_string_data);
@@ -176,6 +184,9 @@ SourceResultType GPUPhysicalTopN::GetData(GPUIntermediateRelation& output_relati
 	// gstate.heap.Scan(state.state, chunk);
 
 	// return chunk.size() == 0 ? SourceResultType::FINISHED : SourceResultType::HAVE_MORE_OUTPUT;
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+	SIRIUS_LOG_DEBUG("Top N GetData time: {:.2f} ms", duration.count()/1000.0);
     return SourceResultType::FINISHED;
 }
 

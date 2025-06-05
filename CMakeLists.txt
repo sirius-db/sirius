@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.30.4)
 
+# Enable compile_commands.json generation for clang lsp
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 # Check for USE_CUDF environment variable
 if(DEFINED ENV{USE_CUDF})
     message(STATUS "USE_CUDF environment variable is set")
@@ -27,7 +30,7 @@ else()
 endif()
 
 # Set CUDA architecture and flags
-set(CMAKE_CUDA_ARCHITECTURES 75)
+set(CMAKE_CUDA_ARCHITECTURES native)
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-extended-lambda --expt-relaxed-constexpr -rdc=true")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++17")
 
@@ -73,6 +76,8 @@ add_subdirectory(src/cuda/operator)
 add_subdirectory(src/cuda/query_specific)
 if (USE_CUDF)
   add_subdirectory(src/cuda/cudf)
+  add_subdirectory(src/cuda/expression_executor)
+  add_subdirectory(src/expression_executor)
 endif()
 
 set(CMAKE_CUDA_STANDARD 17)
@@ -112,21 +117,11 @@ set_target_properties(${LOADABLE_EXTENSION_NAME} PROPERTIES CUDA_SEPARABLE_COMPI
 if (USE_CUDF)
   target_link_libraries(${EXTENSION_NAME}
     substrait_extension
-    cuda 
-    cudart 
-    cupti 
-    curand 
-    cudadevrt
     cudf::cudf 
     rmm::rmm
   )
   target_link_libraries(${LOADABLE_EXTENSION_NAME} 
     substrait_extension
-    cuda 
-    cudart 
-    cupti 
-    curand 
-    cudadevrt
     cudf::cudf 
     rmm::rmm
   )
@@ -155,6 +150,12 @@ else()
     ${CUDA_DEVRT_LIBRARY}
   )
 endif()
+
+# Third-party
+set(DEPS_PREFIX "_deps")
+include(third_party/spdlog.cmake)
+target_link_libraries(${EXTENSION_NAME} spdlog::spdlog)
+target_link_libraries(${LOADABLE_EXTENSION_NAME} spdlog::spdlog)
 
 install(
   TARGETS ${EXTENSION_NAME}

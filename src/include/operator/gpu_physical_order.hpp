@@ -3,7 +3,6 @@
 #include "gpu_physical_operator.hpp"
 #include "gpu_buffer_manager.hpp"
 #include "duckdb/planner/bound_query_node.hpp"
-#include "helper/types.hpp"
 
 namespace duckdb {
 void cudf_orderby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColumn>>& projection, uint64_t num_keys, uint64_t num_projections, OrderByType* order_by_type); 

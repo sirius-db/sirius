@@ -1,4 +1,5 @@
 #include "operator/gpu_materialize.hpp"
+#include "log/logging.hpp"
 
 namespace duckdb {
 
@@ -21,7 +22,6 @@ ResolveTypeMaterializeExpression(shared_ptr<GPUColumn> column, BoundReferenceExp
     }
     shared_ptr<GPUColumn> result = make_shared_ptr<GPUColumn>(size, column->data_wrapper.type, reinterpret_cast<uint8_t*>(a));
     result->is_unique = column->is_unique;
-    // result->rmm_owned_buffer = std::move(column->rmm_owned_buffer);
     return result;
 }
 
@@ -48,10 +48,8 @@ ResolveTypeMaterializeString(shared_ptr<GPUColumn> column, BoundReferenceExpress
         new_num_bytes = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
         new_num_bytes[0] = column->data_wrapper.num_bytes;
     }
-    // printf("Materialized string column with size %ld\n", new_num_bytes[0]);
     shared_ptr<GPUColumn> result = make_shared_ptr<GPUColumn>(size, column->data_wrapper.type, a, result_offset, new_num_bytes[0], column->data_wrapper.is_string_data);
     result->is_unique = column->is_unique;
-    // result->rmm_owned_buffer = std::move(column->rmm_owned_buffer);
     return result;
 }
 
@@ -80,7 +78,7 @@ HandleMaterializeRowIDs(GPUIntermediateRelation& input_relation, GPUIntermediate
     vector<uint64_t*> new_row_ids;
     vector<uint64_t*> prev_row_ids;
     for (int i = 0; i < input_relation.columns.size(); i++) {
-        printf("Passing column idx %d in input relation to idx %d in output relation\n", i, i);
+        SIRIUS_LOG_DEBUG("Materializing column idx {} in input relation to idx {} in output relation", i, i);
         if (count == 0) {
             output_relation.columns[i] = make_shared_ptr<GPUColumn>(0, input_relation.columns[i]->data_wrapper.type, input_relation.columns[i]->data_wrapper.data,
                         input_relation.columns[i]->data_wrapper.offset, 0, input_relation.columns[i]->data_wrapper.is_string_data);
@@ -128,7 +126,7 @@ HandleMaterializeRowIDsRHS(GPUIntermediateRelation& hash_table_result, GPUInterm
     vector<uint64_t*> prev_row_ids;
     for (idx_t i = 0; i < rhs_output_columns.size(); i++) {
         const auto rhs_col = rhs_output_columns[i];
-        printf("Passing column idx %d from hash table to idx %d in output relation\n", rhs_col, offset + i);
+        SIRIUS_LOG_DEBUG("Materializing column idx {} from hash table to idx {} in output relation", rhs_col, offset + i);
         if (count == 0) {
             output_relation.columns[offset + i] = make_shared_ptr<GPUColumn>(0, hash_table_result.columns[rhs_col]->data_wrapper.type, hash_table_result.columns[rhs_col]->data_wrapper.data,
                         hash_table_result.columns[rhs_col]->data_wrapper.offset, 0, hash_table_result.columns[rhs_col]->data_wrapper.is_string_data);
@@ -176,7 +174,7 @@ HandleMaterializeRowIDsLHS(GPUIntermediateRelation& input_relation, GPUIntermedi
     vector<uint64_t*> prev_row_ids;
     for (idx_t i = 0; i < lhs_output_columns.size(); i++) {
         const auto lhs_col = lhs_output_columns[i];
-        printf("Passing column idx %d from input relation to idx %d in output relation\n", lhs_col, i);
+        SIRIUS_LOG_DEBUG("Materializing column idx {} from input relation to idx {} in output relation", lhs_col, i);
         if (count == 0) {
             output_relation.columns[i] = make_shared_ptr<GPUColumn>(0, input_relation.columns[lhs_col]->data_wrapper.type, input_relation.columns[lhs_col]->data_wrapper.data,
                 input_relation.columns[lhs_col]->data_wrapper.offset, 0, input_relation.columns[lhs_col]->data_wrapper.is_string_data);

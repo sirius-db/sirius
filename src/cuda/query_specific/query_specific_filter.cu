@@ -1,5 +1,6 @@
 #include "../operator/cuda_helper.cuh"
 #include "gpu_expression_executor.hpp"
+#include "log/logging.hpp"
 
 namespace duckdb {
 
@@ -466,10 +467,10 @@ void q19FilterExpression(uint64_t *p_brand, double *l_quantity, uint64_t *p_size
         uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
         h_count[0] = 0;
         count = h_count;
-        printf("N is 0\n");
+        SIRIUS_LOG_DEBUG("Input size is 0");
         return;
     }
-    printf("Launching Q19 Filter Kernel\n");
+    SIRIUS_LOG_DEBUG("Launching Q19 Filter Kernel");
 
     uint64_t* d_p_brand_val = gpuBufferManager->customCudaMalloc<uint64_t>(3, 0, 0);
     double* d_l_quantity_val = gpuBufferManager->customCudaMalloc<double>(6, 0, 0);
@@ -492,7 +493,7 @@ void q19FilterExpression(uint64_t *p_brand, double *l_quantity, uint64_t *p_size
     CHECK_ERROR();
     cudaDeviceSynchronize();
     count = h_count;
-    printf("Count: %lu\n", h_count[0]);
+    SIRIUS_LOG_DEBUG("Count: {}", h_count[0]);
 }
 
 // void q16FilterExpression(uint64_t *p_brand, uint64_t *p_type, uint64_t *p_size, uint64_t p_brand_val, uint64_t p_type_val1, uint64_t p_type_val2, uint64_t *p_size_val, uint64_t* &row_ids, uint64_t* &count, uint64_t N) {
@@ -501,10 +502,10 @@ void q19FilterExpression(uint64_t *p_brand, double *l_quantity, uint64_t *p_size
 //         uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
 //         h_count[0] = 0;
 //         count = h_count;
-//         printf("N is 0\n");
+//         SIRIUS_LOG_DEBUG("Input size is 0");
 //         return;
 //     }
-//     printf("Launching Q16 Filter Kernel\n");
+//     SIRIUS_LOG_DEBUG("Launching Q16 Filter Kernel");
 
 //     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 //     uint64_t* d_p_size_val = gpuBufferManager->customCudaMalloc<uint64_t>(8, 0, 0);
@@ -522,7 +523,7 @@ void q19FilterExpression(uint64_t *p_brand, double *l_quantity, uint64_t *p_size
 //     CHECK_ERROR();
 //     cudaDeviceSynchronize();
 //     count = h_count;
-//     printf("Count: %lu\n", h_count[0]);
+//     SIRIUS_LOG_DEBUG("Count: {}", h_count[0]);
 // }
 
 void q16FilterExpression(uint64_t *p_type, uint64_t *p_size,  uint64_t p_type_val1, uint64_t p_type_val2, uint64_t *p_size_val, uint64_t* &row_ids, uint64_t* &count, uint64_t N) {
@@ -532,10 +533,10 @@ void q16FilterExpression(uint64_t *p_type, uint64_t *p_size,  uint64_t p_type_va
         uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
         h_count[0] = 0;
         count = h_count;
-        printf("N is 0\n");
+        SIRIUS_LOG_DEBUG("Input size is 0");
         return;
     }
-    printf("Launching Q16 Filter Kernel\n");
+    SIRIUS_LOG_DEBUG("Launching Q16 Filter Kernel");
 
     uint64_t* d_p_size_val = gpuBufferManager->customCudaMalloc<uint64_t>(8, 0, 0);
     callCudaMemcpyHostToDevice<uint64_t>(d_p_size_val, p_size_val, 8, 0);
@@ -552,7 +553,7 @@ void q16FilterExpression(uint64_t *p_type, uint64_t *p_size,  uint64_t p_type_va
     CHECK_ERROR();
     cudaDeviceSynchronize();
     count = h_count;
-    printf("Count: %lu\n", h_count[0]);
+    SIRIUS_LOG_DEBUG("Count: {}", h_count[0]);
 }
 
 void q12FilterExpression(uint64_t *l_commitdate, uint64_t *l_receiptdate, uint64_t *l_shipdate, uint64_t *l_shipmode, uint64_t l_shipmode_val1, uint64_t l_shipmode_val2, uint64_t* &row_ids, uint64_t* &count, uint64_t N) {
@@ -562,10 +563,10 @@ void q12FilterExpression(uint64_t *l_commitdate, uint64_t *l_receiptdate, uint64
         uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
         h_count[0] = 0;
         count = h_count;
-        printf("N is 0\n");
+        SIRIUS_LOG_DEBUG("Input size is 0");
         return;
     }
-    printf("Launching Q12 Filter Kernel\n");
+    SIRIUS_LOG_DEBUG("Launching Q12 Filter Kernel");
     cudaMemset(count, 0, sizeof(uint64_t));
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
     q12_filter<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(l_commitdate, l_receiptdate, l_shipdate, l_shipmode, l_shipmode_val1, l_shipmode_val2, row_ids, (unsigned long long*) count, N, 1);
@@ -578,7 +579,7 @@ void q12FilterExpression(uint64_t *l_commitdate, uint64_t *l_receiptdate, uint64
     CHECK_ERROR();
     cudaDeviceSynchronize();
     count = h_count;
-    printf("Count: %lu\n", h_count[0]);
+    SIRIUS_LOG_DEBUG("Count: {}", h_count[0]);
 }
 
 void q2FilterExpression(uint64_t *p_type, uint64_t p_type_val, uint64_t* &row_ids, uint64_t* &count, uint64_t N) {
@@ -588,10 +589,10 @@ void q2FilterExpression(uint64_t *p_type, uint64_t p_type_val, uint64_t* &row_id
         uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
         h_count[0] = 0;
         count = h_count;
-        printf("N is 0\n");
+        SIRIUS_LOG_DEBUG("Input size is 0");
         return;
     }
-    printf("Launching Q2 Filter Kernel\n");
+    SIRIUS_LOG_DEBUG("Launching Q2 Filter Kernel");
     cudaMemset(count, 0, sizeof(uint64_t));
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
     q2_filter<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(p_type, p_type_val, row_ids, (unsigned long long*) count, N, 1);
@@ -604,7 +605,7 @@ void q2FilterExpression(uint64_t *p_type, uint64_t p_type_val, uint64_t* &row_id
     CHECK_ERROR();
     cudaDeviceSynchronize();
     count = h_count;
-    printf("Count: %lu\n", h_count[0]);
+    SIRIUS_LOG_DEBUG("Count: {}", h_count[0]);
 }
 
 void q7FilterExpression(uint64_t *n1_nationkey, uint64_t *n2_nationkey, uint64_t val1, uint64_t val2, uint64_t val3, uint64_t val4, 
@@ -615,10 +616,10 @@ void q7FilterExpression(uint64_t *n1_nationkey, uint64_t *n2_nationkey, uint64_t
         uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
         h_count[0] = 0;
         count = h_count;
-        printf("N is 0\n");
+        SIRIUS_LOG_DEBUG("Input size is 0");
         return;
     }
-    printf("Launching Q7 Filter Kernel\n");
+    SIRIUS_LOG_DEBUG("Launching Q7 Filter Kernel");
     cudaMemset(count, 0, sizeof(uint64_t));
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
     q7_filter<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(n1_nationkey, n2_nationkey, val1, val2, val3, val4, row_ids, (unsigned long long*) count, N, 1);
@@ -631,7 +632,7 @@ void q7FilterExpression(uint64_t *n1_nationkey, uint64_t *n2_nationkey, uint64_t
     CHECK_ERROR();
     cudaDeviceSynchronize();
     count = h_count;
-    printf("Count: %lu\n", h_count[0]);
+    SIRIUS_LOG_DEBUG("Count: {}", h_count[0]);
 }
 
 void q7FilterExpression2(uint64_t *n1_nationkey, uint64_t *n2_nationkey, uint64_t val1, uint64_t val2, 
@@ -642,10 +643,10 @@ void q7FilterExpression2(uint64_t *n1_nationkey, uint64_t *n2_nationkey, uint64_
         uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
         h_count[0] = 0;
         count = h_count;
-        printf("N is 0\n");
+        SIRIUS_LOG_DEBUG("Input size is 0");
         return;
     }
-    printf("Launching Q7 Filter Kernel\n");
+    SIRIUS_LOG_DEBUG("Launching Q7 Filter Kernel");
     cudaMemset(count, 0, sizeof(uint64_t));
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
     q7_filter2<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(n1_nationkey, n2_nationkey, val1, val2, row_ids, (unsigned long long*) count, N, 1);
@@ -658,7 +659,7 @@ void q7FilterExpression2(uint64_t *n1_nationkey, uint64_t *n2_nationkey, uint64_
     CHECK_ERROR();
     cudaDeviceSynchronize();
     count = h_count;
-    printf("Count: %lu\n", h_count[0]);
+    SIRIUS_LOG_DEBUG("Count: {}", h_count[0]);
 }
 
 __global__ void q22_filter(char* a, uint64_t* offset, uint64_t start_idx, uint64_t length, uint8_t** d_c_phone_val, 
@@ -687,7 +688,6 @@ __global__ void q22_filter(char* a, uint64_t* offset, uint64_t start_idx, uint64
             }
         }
         if (local_match) {
-            // printf("%c %c %c %c\n", a[substring_start_idx], a[substring_start_idx + 1], d_c_phone_val[i][0], d_c_phone_val[i][1]);
             match = true;
             t_count = 1;
             break;
@@ -711,7 +711,6 @@ __global__ void q22_filter(char* a, uint64_t* offset, uint64_t start_idx, uint64
     if (is_count) return;
 
     if (match) {
-        // if (block_off >= 41996) printf("Warning here %ld %d %ld %ld\n", block_off, c_t_count, tid, N);
         // uint64_t idx = block_off + c_t_count;
         row_ids[block_off + local_idx] = tid;
     }
@@ -719,9 +718,8 @@ __global__ void q22_filter(char* a, uint64_t* offset, uint64_t start_idx, uint64
 
 __global__ void printstring(uint8_t* a, uint64_t* offset, uint64_t N) {
     for (int i = 0; i < 100; i++) {
-        printf("%c %c %c %c %c\n", a[offset[i]], a[offset[i] + 1], a[offset[i] + 2], a[offset[i] + 3], a[offset[i] + 4]);
+        // FIXME: do this in cpu code using logging
     }
-    printf("\n");
 }
 
 void q22FilterExpression(uint8_t *a, uint64_t* offset, uint64_t start_idx, uint64_t length, string c_phone_val, uint64_t* &row_ids, uint64_t* &count, uint64_t N, int num_predicates) {
@@ -731,23 +729,22 @@ void q22FilterExpression(uint8_t *a, uint64_t* offset, uint64_t start_idx, uint6
         uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
         h_count[0] = 0;
         count = h_count;
-        printf("N is 0\n");
+        SIRIUS_LOG_DEBUG("Input size is 0");
         return;
     }
-    printf("Launching Q22 Filter Kernel\n");
+    SIRIUS_LOG_DEBUG("Launching Q22 Filter Kernel");
 
     uint8_t* temp = gpuBufferManager->customCudaMalloc<uint8_t>(num_predicates * length, 0, 0);
     cudaMemcpy(temp, c_phone_val.c_str(), num_predicates * length * sizeof(uint8_t), cudaMemcpyHostToDevice);
-    uint8_t** h_c_phone_val = new uint8_t*[num_predicates];
+    uint8_t** h_c_phone_val = gpuBufferManager->customCudaHostAlloc<uint8_t*>(num_predicates);
     for (int i = 0; i < num_predicates; i++) {
         h_c_phone_val[i] = temp + i * length;
     }
-    uint8_t** d_c_phone_val;
-    cudaMalloc((void**) &d_c_phone_val, num_predicates * sizeof(uint8_t*));
+    uint8_t** d_c_phone_val = gpuBufferManager->customCudaMalloc<uint8_t*>(num_predicates, 0, 0);
     cudaMemcpy(d_c_phone_val, h_c_phone_val, num_predicates * sizeof(uint8_t*), cudaMemcpyHostToDevice);
     cudaMemset(count, 0, sizeof(uint64_t));
 
-    printf("N is %ld\n", N);
+    SIRIUS_LOG_DEBUG("N is {}", N);
     uint64_t num_blocks = (N + 128 - 1)/128;
 
     // printstring<<<1, 1>>>(a, offset, N);
@@ -766,7 +763,9 @@ void q22FilterExpression(uint8_t *a, uint64_t* offset, uint64_t start_idx, uint6
     CHECK_ERROR();
     cudaDeviceSynchronize();
     count = h_count;
-    printf("Count: %lu\n", h_count[0]);
+    SIRIUS_LOG_DEBUG("Count: {}", h_count[0]);
+
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_c_phone_val), 0);
 }
 
 } // namespace duckdb

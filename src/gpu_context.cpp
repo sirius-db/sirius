@@ -14,8 +14,8 @@
 #include "duckdb/main/prepared_statement_data.hpp"
 #include "duckdb/execution/operator/helper/physical_result_collector.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
-
 #include "duckdb/execution/operator/scan/physical_dummy_scan.hpp"
+#include "log/logging.hpp"
 
 #include <stdio.h>
 #include <iostream>
@@ -105,7 +105,7 @@ GPUContext::GPUPendingStatementInternal(ClientContext &context, shared_ptr<GPUPr
 
 	unique_ptr<GPUExecutor> temp = make_uniq<GPUExecutor>(context, *this);
 	auto prop = temp->context.GetClientProperties();
-	// std::cout << "Properties: " << prop.time_zone << std::endl;
+	// SIRIUS_LOG_DEBUG("Properties: {}", prop.time_zone);
 	gpu_active_query->gpu_executor = std::move(temp);
 	auto &gpu_executor = GetGPUExecutor();
 	// auto stream_result = parameters.allow_stream_result && statement.properties.allow_stream_result;
@@ -120,7 +120,7 @@ GPUContext::GPUPendingStatementInternal(ClientContext &context, shared_ptr<GPUPr
 	auto types = gpu_collector->GetTypes();
 	D_ASSERT(types == statement.types);
 	gpu_executor.Initialize(std::move(gpu_collector));
-	// printf("type %d\n", gpu_executor.gpu_physical_plan.get()->type);
+	// SIRIUS_LOG_DEBUG("type {}", gpu_executor.gpu_physical_plan.get()->type);
 
 	D_ASSERT(!gpu_active_query->HasOpenResult());
 
@@ -166,7 +166,7 @@ GPUContext::GPUExecutePendingQueryResult(PendingQueryResult &pending) {
 		gpu_executor.Execute();
 	} catch (std::exception &e) {
 		ErrorData error(e);
-		printf("\033[1;31m"); printf("Error in GPUExecutePendingQueryResult: %s\n", error.RawMessage().c_str()); printf("\033[0m");
+		SIRIUS_LOG_ERROR("Error in GPUExecutePendingQueryResult: {}", error.RawMessage());
 		return GPUErrorResult<MaterializedQueryResult>(error);
 	}
 	if (pending.HasError()) {
@@ -174,7 +174,7 @@ GPUContext::GPUExecutePendingQueryResult(PendingQueryResult &pending) {
 		ErrorData error = pending.GetErrorObject();
 		return make_uniq<MaterializedQueryResult>(error);
 	}
-	printf("Done executing\n");
+	SIRIUS_LOG_DEBUG("Done ExecutePendingQueryResult");
 	auto result = FetchResultInternal(pending);
 	// context.reset();
 	return result;
@@ -194,7 +194,7 @@ GPUContext::GPUExecuteQuery(ClientContext &context, const string &query, shared_
 	} else {
 		current_result = GPUExecutePendingQueryResult(*pending_query);
 	}
-	printf("Done executing query\n");
+	SIRIUS_LOG_DEBUG("Done GPUExecuteQuery");
 	return current_result;
 };
 
@@ -231,9 +231,9 @@ GPUContext::FetchResultInternal(PendingQueryResult &pending) {
 	unique_ptr<QueryResult> result;
 	D_ASSERT(gpu_executor.HasResultCollector());
 	// we have a result collector - fetch the result directly from the result collector
-	// printf("Getting result\n");
+	// SIRIUS_LOG_DEBUG("Getting result");
 	result = gpu_executor.GetResult();
-	// printf("Fetching result\n");
+	// SIRIUS_LOG_DEBUG("Fetching result");
 	// if (!create_stream_result) {
 		CleanupInternal(result.get(), false);
 	// } else {
@@ -248,7 +248,7 @@ GPUContext::CleanupInternal(BaseQueryResult *result, bool invalidate_transaction
 		// no query currently active
 		return;
 	}
-	// printf("Cleaning up\n");
+	// SIRIUS_LOG_DEBUG("Cleaning up");
 	if (gpu_active_query->gpu_executor) {
 		gpu_active_query->gpu_executor->CancelTasks();
 	}
@@ -267,6 +267,7 @@ GPUContext::EndQueryInternal(bool success, bool invalidate_transaction) {
 
 	if (gpu_active_query->gpu_executor) {
 		gpu_active_query->gpu_executor->CancelTasks();
+		gpu_active_query->gpu_executor->gpuBufferManager->ResetBuffer();
 	}
 	// Notify any registered state of query end
 	// for (auto const &s : registered_state) {
@@ -278,7 +279,7 @@ GPUContext::EndQueryInternal(bool success, bool invalidate_transaction) {
 	gpu_active_query.reset();
 	// query_progress.Initialize();
 	ErrorData error;
-	// printf("Ending query\n");
+	// SIRIUS_LOG_DEBUG("Ending query");
 	// try {
 	// 	if (transaction.HasActiveTransaction()) {
 	// 		transaction.ResetActiveQuery();
@@ -350,7 +351,7 @@ GPUContext::GPUExecuteRelation(ClientContext &context, shared_ptr<Relation> rela
 // 	}
 // 	err_str += "]";
 // 	return GPUErrorResult<MaterializedQueryResult>(context, ErrorData(err_str));
-
+	throw duckdb::InternalException("`GPUExecuteRelation` is unimplemented");
 }
 
 }; // namespace duckdb

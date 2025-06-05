@@ -1,21 +1,22 @@
 #include "operator/gpu_physical_ungrouped_aggregate.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "gpu_materialize.hpp"
+#include "log/logging.hpp"
 
 namespace duckdb {
 
 template <typename T>
 void
 ResolveTypeAggregateExpression(vector<shared_ptr<GPUColumn>> &aggregate_keys, GPUBufferManager* gpuBufferManager, const vector<unique_ptr<Expression>> &aggregates) {
-	uint8_t** aggregate_data = new uint8_t*[aggregates.size()];
-	uint8_t** result = new uint8_t*[aggregates.size()];
+	uint8_t** aggregate_data = gpuBufferManager->customCudaHostAlloc<uint8_t*>(aggregates.size());
+	uint8_t** result = gpuBufferManager->customCudaHostAlloc<uint8_t*>(aggregates.size());
 	for (int agg_idx = 0; agg_idx < aggregates.size(); agg_idx++) {
 		result[agg_idx] = nullptr;
 	}
 
 	size_t size = aggregate_keys[0]->column_length;
 
-	int* agg_mode = new int[aggregates.size()];
+	int* agg_mode = gpuBufferManager->customCudaHostAlloc<int>(aggregates.size());
 
 	for (int agg_idx = 0; agg_idx < aggregates.size(); agg_idx++) {
 		auto& expr = aggregates[agg_idx]->Cast<BoundAggregateExpression>();
@@ -58,7 +59,6 @@ ResolveTypeAggregateExpression(vector<shared_ptr<GPUColumn>> &aggregate_keys, GP
 		auto& expr = aggregates[agg_idx]->Cast<BoundAggregateExpression>();
 		if (expr.function.name.compare("count_star") == 0 || expr.function.name.compare("count") == 0) {
 			aggregate_keys[agg_idx] = make_shared_ptr<GPUColumn>(1, ColumnType::INT64, reinterpret_cast<uint8_t*>(result[agg_idx]));
-			// if (result[agg_idx] != nullptr) printGPUColumn<uint64_t>(reinterpret_cast<uint64_t*>(aggregate_keys[agg_idx]->data_wrapper.data), aggregate_keys[agg_idx]->column_length, 0);
 		} else if (size == 0){
 			aggregate_keys[agg_idx] = make_shared_ptr<GPUColumn>(0, ColumnType::INT64, reinterpret_cast<uint8_t*>(result[agg_idx]));
 		} else { 
@@ -102,6 +102,39 @@ HandleAggregateExpression(vector<shared_ptr<GPUColumn>> &aggregate_keys, GPUBuff
     }
 }
 
+void
+HandleAggregateExpressionCuDF(vector<shared_ptr<GPUColumn>> &aggregate_keys, GPUBufferManager* gpuBufferManager, const vector<unique_ptr<Expression>> &aggregates) {
+	AggregationType* agg_mode = gpuBufferManager->customCudaHostAlloc<AggregationType>(aggregates.size());
+	SIRIUS_LOG_DEBUG("Handling ungrouped aggregate expression");
+	for (int agg_idx = 0; agg_idx < aggregates.size(); agg_idx++) {
+		auto& expr = aggregates[agg_idx]->Cast<BoundAggregateExpression>();
+		if (expr.function.name.compare("count") == 0 && aggregate_keys[agg_idx]->data_wrapper.data == nullptr && aggregate_keys[agg_idx]->column_length == 0) {
+			agg_mode[agg_idx] = AggregationType::COUNT;
+		} else if (expr.function.name.compare("sum") == 0 && aggregate_keys[agg_idx]->data_wrapper.data == nullptr && aggregate_keys[agg_idx]->column_length == 0) {
+			agg_mode[agg_idx] = AggregationType::SUM;
+		} else if (expr.function.name.compare("sum") == 0 && aggregate_keys[agg_idx]->data_wrapper.data != nullptr) {
+			agg_mode[agg_idx] = AggregationType::SUM;
+		} else if (expr.function.name.compare("avg") == 0 && aggregate_keys[agg_idx]->data_wrapper.data != nullptr) {
+			agg_mode[agg_idx] = AggregationType::AVERAGE;
+		} else if (expr.function.name.compare("max") == 0 && aggregate_keys[agg_idx]->data_wrapper.data != nullptr) {
+			agg_mode[agg_idx] = AggregationType::MAX;
+		} else if (expr.function.name.compare("min") == 0 && aggregate_keys[agg_idx]->data_wrapper.data != nullptr) {
+			agg_mode[agg_idx] = AggregationType::MIN;
+		} else if (expr.function.name.compare("count_star") == 0 && aggregate_keys[agg_idx]->data_wrapper.data == nullptr) {
+			agg_mode[agg_idx] = AggregationType::COUNT_STAR;
+		} else if (expr.function.name.compare("count") == 0 && aggregate_keys[agg_idx]->data_wrapper.data != nullptr) {
+			agg_mode[agg_idx] = AggregationType::COUNT;
+		} else if (expr.function.name.compare("first") == 0) {
+			agg_mode[agg_idx] = AggregationType::FIRST;
+		} else {
+			SIRIUS_LOG_DEBUG("Aggregate function not supported: {}", expr.function.name);
+			throw NotImplementedException("Aggregate function not supported");
+		}
+	}
+
+	cudf_aggregate(aggregate_keys, aggregates.size(), agg_mode);
+}
+
 GPUPhysicalUngroupedAggregate::GPUPhysicalUngroupedAggregate(vector<LogicalType> types,
                                                        vector<unique_ptr<Expression>> expressions,
                                                        idx_t estimated_cardinality)
@@ -117,12 +150,10 @@ GPUPhysicalUngroupedAggregate::GPUPhysicalUngroupedAggregate(vector<LogicalType>
 
 }
 
-// SinkResultType
-// GPUPhysicalUngroupedAggregate::Sink(ExecutionContext &context, GPUIntermediateRelation& input_relation, OperatorSinkInput &input) const {
-
 SinkResultType 
 GPUPhysicalUngroupedAggregate::Sink(GPUIntermediateRelation &input_relation) const {
-	printf("Performing ungrouped aggregation\n");
+	SIRIUS_LOG_DEBUG("Performing ungrouped aggregation");
+	auto start = std::chrono::high_resolution_clock::now();
 
 	if (distinct_data) {
 		SinkDistinct(input_relation);
@@ -135,7 +166,14 @@ GPUPhysicalUngroupedAggregate::Sink(GPUIntermediateRelation &input_relation) con
 	for (int aggr_idx = 0; aggr_idx < aggregates.size(); aggr_idx++) {
 		aggregate_column[aggr_idx] = nullptr;
 	}
-	int size = 0;
+
+	uint64_t column_size = 0;
+	for (int i = 0; i < input_relation.columns.size(); i++) {
+		if (input_relation.columns[i] != nullptr) {
+			column_size = input_relation.columns[i]->column_length;
+			break;
+		}
+	}
 
 	for (idx_t aggr_idx = 0; aggr_idx < aggregates.size(); aggr_idx++) {
 		D_ASSERT(aggregates[aggr_idx]->GetExpressionClass() == ExpressionClass::BOUND_AGGREGATE);
@@ -150,79 +188,75 @@ GPUPhysicalUngroupedAggregate::Sink(GPUIntermediateRelation &input_relation) con
 
 		if (aggregate.filter) {
 			auto &bound_ref_expr = aggregate.filter->Cast<BoundReferenceExpression>();
-			printf("Reading filter column from index %ld\n", bound_ref_expr.index);
+			SIRIUS_LOG_DEBUG("Reading filter column from index {}", bound_ref_expr.index);
 		}
 
 		idx_t payload_cnt = 0;
 
-		printf("Aggregate type: %s\n", aggregate.function.name.c_str());
+		SIRIUS_LOG_DEBUG("Aggregate type: {}", aggregate.function.name);
 		if (aggregate.children.size() > 1) throw NotImplementedException("Aggregates with multiple children not supported yet");
 		for (idx_t i = 0; i < aggregate.children.size(); ++i) {
 			for (auto &child_expr : aggregate.children) {
 				D_ASSERT(child_expr->type == ExpressionType::BOUND_REF);
-				printf("Reading aggregation column from index %ld and passing it to index %ld in aggregation result\n", payload_idx + payload_cnt, aggr_idx);
-				// input_relation.checkLateMaterialization(payload_idx + payload_cnt);
+				SIRIUS_LOG_DEBUG("Reading aggregation column from index {} and passing it to index {} in aggregation result", payload_idx + payload_cnt, aggr_idx);
 				auto &bound_ref_expr = child_expr->Cast<BoundReferenceExpression>();
 				aggregate_column[aggr_idx] = HandleMaterializeExpression(input_relation.columns[payload_idx + payload_cnt], bound_ref_expr, gpuBufferManager);
-				// aggregation_result->columns[aggr_idx] = input_relation.columns[payload_idx + payload_cnt];
-				size = aggregate_column[aggr_idx]->column_length;
 				payload_cnt++;
 			}
 		}
+	}
+
+	for (int aggr_idx = 0; aggr_idx < aggregates.size(); aggr_idx++) {
+		auto &aggregate = aggregates[aggr_idx]->Cast<BoundAggregateExpression>();
 		//here we probably have count(*) or sum(*) or something like that
 		if (aggregate.children.size() == 0) {
-			// throw NotImplementedException("Aggregate without children not supported yet");
-			printf("Passing * aggregate to index %d in aggregation result\n", aggr_idx);
-			if (size == 0) {
-				if (input_relation.columns[0]->row_ids) {
-					size = input_relation.columns[0]->row_id_count;
-				} else {
-					size = input_relation.columns[0]->column_length;
-				}
-			}
-			aggregate_column[aggr_idx] = make_shared_ptr<GPUColumn>(size, ColumnType::INT64, input_relation.columns[0]->data_wrapper.data);
+			SIRIUS_LOG_DEBUG("Passing * aggregate to index {} in aggregation result", aggr_idx);
+			aggregate_column[aggr_idx] = make_shared_ptr<GPUColumn>(column_size, ColumnType::INT64, nullptr);
 		}
 	}
 
-	HandleAggregateExpression(aggregate_column, gpuBufferManager, aggregates);
+	bool string_cudf_supported = true;
+	for (int col = 0; col < aggregates.size(); col++) {
+		// if types is VARCHAR, check the number of bytes
+		if (aggregate_column[col]->data_wrapper.type == ColumnType::VARCHAR) {
+			throw NotImplementedException("String column not supported");
+		}
+	}
+	if (aggregate_column[0]->column_length > INT32_MAX) {
+		HandleAggregateExpression(aggregate_column, gpuBufferManager, aggregates);
+	} else {
+		HandleAggregateExpressionCuDF(aggregate_column, gpuBufferManager, aggregates);
+	}
 
 	for (int aggr_idx = 0; aggr_idx < aggregates.size(); aggr_idx++) {
-		// group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] = new GPUColumn(count[0], ColumnType::FLOAT64, reinterpret_cast<uint8_t*>(aggregate_vals[aggr_idx]));
 		//TODO: has to fix this for columns with partially NULL values
 		if (aggregation_result->columns[aggr_idx] == nullptr && aggregate_column[aggr_idx]->column_length > 0 && aggregate_column[aggr_idx]->data_wrapper.data != nullptr) {
 			aggregation_result->columns[aggr_idx] = aggregate_column[aggr_idx];
 			aggregation_result->columns[aggr_idx]->row_ids = nullptr;
 			aggregation_result->columns[aggr_idx]->row_id_count = 0;
 		}
-		// printf("%ld\n", aggregation_result->columns[aggr_idx]->column_length);
-		// printf("%d\n", aggregation_result->columns[aggr_idx]->data_wrapper.type);
-		// printf("%p\n", aggregation_result->columns[aggr_idx]->data_wrapper.data);
-		// double* data = reinterpret_cast<double*>(aggregation_result->columns[aggr_idx]->data_wrapper.data);
-		// printGPUColumn<double>(data, aggregation_result->columns[aggr_idx]->column_length, 0);
 	}
 
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+	SIRIUS_LOG_DEBUG("Ungrouped aggregate Sink time: {:.2f} ms", duration.count()/1000.0);
   	return SinkResultType::FINISHED;
 }
-
-// SourceResultType
-// GPUPhysicalUngroupedAggregate::GetData(ExecutionContext &context, GPUIntermediateRelation &output_relation, OperatorSourceInput &input) const {
   
 SourceResultType
 GPUPhysicalUngroupedAggregate::GetData(GPUIntermediateRelation &output_relation) const {
-  for (int col = 0; col < aggregation_result->columns.size(); col++) {
-    printf("Writing aggregation result to column %ld\n", col);
-    // output_relation.columns[col] = aggregation_result->columns[col];
-	// HERE
-	output_relation.columns[col] = make_shared_ptr<GPUColumn>(aggregation_result->columns[col]->column_length, aggregation_result->columns[col]->data_wrapper.type, aggregation_result->columns[col]->data_wrapper.data);
-	// printf("Column length: %ld\n", aggregation_result->columns[col]->column_length);
-	// printGPUColumn<uint64_t>(reinterpret_cast<uint64_t*>(aggregation_result->columns[col]->data_wrapper.data), aggregation_result->columns[col]->column_length, 0);
-  }
+	auto start = std::chrono::high_resolution_clock::now();
+	for (int col = 0; col < aggregation_result->columns.size(); col++) {
+		SIRIUS_LOG_DEBUG("Writing aggregation result to column {}", col);
+		output_relation.columns[col] = make_shared_ptr<GPUColumn>(aggregation_result->columns[col]->column_length, aggregation_result->columns[col]->data_wrapper.type, aggregation_result->columns[col]->data_wrapper.data);
+	}
 
-  return SourceResultType::FINISHED;
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+	SIRIUS_LOG_DEBUG("Ungrouped aggregate GetData time: {:.2f} ms", duration.count()/1000.0);
+	return SourceResultType::FINISHED;
 }
 
-// void
-// GPUPhysicalUngroupedAggregate::SinkDistinct(ExecutionContext &context, GPUIntermediateRelation &input_relation, OperatorSinkInput &input) const {
 void
 GPUPhysicalUngroupedAggregate::SinkDistinct(GPUIntermediateRelation &input_relation) const {
 	auto &distinct_info = *distinct_collection_info;
@@ -236,12 +270,12 @@ GPUPhysicalUngroupedAggregate::SinkDistinct(GPUIntermediateRelation &input_relat
 
 		if (aggregate.filter) {
 			auto &bound_ref_expr = aggregate.filter->Cast<BoundReferenceExpression>();
-			printf("Reading filter column from index %ld\n", bound_ref_expr.index);
+			SIRIUS_LOG_DEBUG("Reading filter column from index {}", bound_ref_expr.index);
 
 			for (idx_t child_idx = 0; child_idx < aggregate.children.size(); child_idx++) {
 				auto &child = aggregate.children[child_idx];
 				auto &bound_ref = child->Cast<BoundReferenceExpression>();
-				printf("Reading aggregation column from index %ld and passing it to index %ld in groupby result\n", bound_ref.index, bound_ref.index);
+				SIRIUS_LOG_DEBUG("Reading aggregation column from index {} and passing it to index {} in groupby result", bound_ref.index, bound_ref.index);
 				input_relation.checkLateMaterialization(bound_ref.index);
 				aggregation_result->columns[bound_ref.index] = input_relation.columns[bound_ref.index];
 			}
@@ -249,7 +283,7 @@ GPUPhysicalUngroupedAggregate::SinkDistinct(GPUIntermediateRelation &input_relat
 			for (idx_t child_idx = 0; child_idx < aggregate.children.size(); child_idx++) {
 				auto &child = aggregate.children[child_idx];
 				auto &bound_ref = child->Cast<BoundReferenceExpression>();
-				printf("Reading aggregation column from index %ld and passing it to index %ld in groupby result\n", bound_ref.index, bound_ref.index);
+				SIRIUS_LOG_DEBUG("Reading aggregation column from index {} and passing it to index {} in groupby result", bound_ref.index, bound_ref.index);
 				input_relation.checkLateMaterialization(bound_ref.index);
 				aggregation_result->columns[bound_ref.index] = input_relation.columns[bound_ref.index];
 			}

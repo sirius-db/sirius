@@ -9,7 +9,7 @@ namespace duckdb {
 
 class GPUResultCollection { 
 public: 
-	GPUResultCollection() : read_idx(0), write_idx(0), num_rows(0) {
+	GPUResultCollection() : read_idx(0), write_idx(0), num_rows(0), data_chunks(nullptr) {
 
 	}
 

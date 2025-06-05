@@ -1,32 +1,44 @@
 #include "cudf/cudf_utils.hpp"
+#include "../operator/cuda_helper.cuh"
 #include "gpu_physical_hash_join.hpp"
 #include "gpu_buffer_manager.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "log/logging.hpp"
 
 namespace duckdb {
 
-void cudf_probe(vector<shared_ptr<GPUColumn>>& probe_keys, cudf::hash_join* hash_table, int num_keys, uint64_t*& row_ids_left, uint64_t*& row_ids_right, uint64_t*& count)
-{
+void cudf_inner_join(vector<shared_ptr<GPUColumn>>& probe_keys, vector<shared_ptr<GPUColumn>>& build_keys, int num_keys, uint64_t*& row_ids_left, uint64_t*& row_ids_right, uint64_t*& count) {
     GPUBufferManager *gpuBufferManager = &(GPUBufferManager::GetInstance());
-    if (probe_keys[0]->column_length == 0) {
-        printf("N is 0\n");
+    if (build_keys[0]->column_length == 0 || probe_keys[0]->column_length == 0) {
+        SIRIUS_LOG_DEBUG("Input size is 0");
         count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
         count[0] = 0;
         return;
     }
 
+    SIRIUS_LOG_DEBUG("CUDF inner join");
+    SIRIUS_LOG_DEBUG("Build Input size: {}", build_keys[0]->column_length);
+    SIRIUS_LOG_DEBUG("Probe Input size: {}", probe_keys[0]->column_length);
+    SETUP_TIMING();
+    START_TIMER();
+
     cudf::set_current_device_resource(gpuBufferManager->mr);
-    printf("CUDF probe\n");
+
+    std::vector<cudf::column_view> build_keys_cudf;
+    for (int key = 0; key < num_keys; key++) {
+        build_keys_cudf.push_back(build_keys[key]->convertToCudfColumn());
+    }
+
+    auto build_table = cudf::table_view(build_keys_cudf);
+    auto hash_table = cudf::hash_join(build_table, cudf::null_equality::EQUAL);
 
     std::vector<cudf::column_view> probe_keys_cudf;
-
     for (int key = 0; key < num_keys; key++) {
         probe_keys_cudf.push_back(probe_keys[key]->convertToCudfColumn());
     }
 
     auto probe_table = cudf::table_view(probe_keys_cudf);
-
-    auto result = hash_table->inner_join(probe_table);
+    auto result = hash_table.inner_join(probe_table);
     
     auto result_count = result.first->size();
     rmm::device_buffer row_ids_left_buffer = result.first->release();
@@ -40,38 +52,26 @@ void cudf_probe(vector<shared_ptr<GPUColumn>>& probe_keys, cudf::hash_join* hash
 
     count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
     count[0] = result_count;
-}
 
-void cudf_build(vector<shared_ptr<GPUColumn>>& build_columns, cudf::hash_join*& hash_table, int num_keys) {
-
-    if (build_columns[0]->column_length == 0) {
-        printf("N is 0\n");
-        return;
-    }
-
-    GPUBufferManager *gpuBufferManager = &(GPUBufferManager::GetInstance());
-    cudf::set_current_device_resource(gpuBufferManager->mr);
-
-    std::vector<cudf::column_view> build_keys_cudf;
-    for (int key = 0; key < num_keys; key++) {
-        build_keys_cudf.push_back(build_columns[key]->convertToCudfColumn());
-    }
-
-    auto build_table = cudf::table_view(build_keys_cudf);
-    hash_table = new cudf::hash_join(build_table, cudf::null_equality::EQUAL);
+    STOP_TIMER();
+    SIRIUS_LOG_DEBUG("CUDF Inner join result count: {}", count[0]);
 }
 
 void cudf_mixed_join(vector<shared_ptr<GPUColumn>>& probe_columns, vector<shared_ptr<GPUColumn>>& build_columns, const vector<JoinCondition>& conditions, JoinType join_type, uint64_t*& row_ids_left, uint64_t*& row_ids_right, uint64_t*& count) {
     
     GPUBufferManager *gpuBufferManager = &(GPUBufferManager::GetInstance());
     if (build_columns[0]->column_length == 0 || probe_columns[0]->column_length == 0) {
-        printf("N is 0\n");
+        SIRIUS_LOG_DEBUG("Input size is 0");
         count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
         count[0] = 0;
         return;
     }
 
-    printf("CUDF mixed join\n");
+    SIRIUS_LOG_DEBUG("CUDF mixed join");
+    SIRIUS_LOG_DEBUG("Build Input size: {}", build_columns[0]->column_length);
+    SIRIUS_LOG_DEBUG("Probe Input size: {}", probe_columns[0]->column_length);
+    SETUP_TIMING();
+    START_TIMER();
 
     cudf::set_current_device_resource(gpuBufferManager->mr);
 
@@ -80,9 +80,9 @@ void cudf_mixed_join(vector<shared_ptr<GPUColumn>>& probe_columns, vector<shared
     std::vector<cudf::column_view> probe_conditional_columns;
     std::vector<cudf::column_view> build_conditional_columns;
 
-    printf("CUDF mixed join\n");
-
     std::vector<cudf::ast::operation> cudf_exprs;
+    std::vector<cudf::ast::column_reference> owned_left_column_references;
+    std::vector<cudf::ast::column_reference> owned_right_column_references;
     for (int cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
         if (conditions[cond_idx].comparison == ExpressionType::COMPARE_EQUAL || conditions[cond_idx].comparison == ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
             probe_equal_columns.push_back(probe_columns[cond_idx]->convertToCudfColumn());
@@ -93,25 +93,23 @@ void cudf_mixed_join(vector<shared_ptr<GPUColumn>>& probe_columns, vector<shared
                 build_conditional_columns.push_back(build_columns[cond_idx]->convertToCudfColumn());
 
                 auto not_equal_op = cudf::ast::ast_operator::NOT_EQUAL;
-                auto left_ref = cudf::ast::column_reference(probe_conditional_columns.size() - 1, cudf::ast::table_reference::LEFT);
-                auto right_ref = cudf::ast::column_reference(build_conditional_columns.size() - 1, cudf::ast::table_reference::RIGHT);
-                auto cudf_expr = cudf::ast::operation(not_equal_op, left_ref, right_ref);
-                cudf_exprs.push_back(cudf_expr);
+                owned_left_column_references.emplace_back(probe_conditional_columns.size() - 1, cudf::ast::table_reference::LEFT);
+                owned_right_column_references.emplace_back(build_conditional_columns.size() - 1, cudf::ast::table_reference::RIGHT);
+                cudf_exprs.emplace_back(not_equal_op, owned_left_column_references.back(), owned_right_column_references.back());
             } else {
                 throw NotImplementedException("Unsupported comparison type");
             }
         }
     }
 
-    printf("CUDF mixed join\n");
-
-    //merge cudf_exprs into a single expression
-    cudf::ast::operation final_expr = cudf_exprs[0];
+    // merge cudf_exprs into a single expression, it's guaranteed from caller that `cudf_exprs` is not empty
+    std::vector<cudf::ast::operation> intermediate_cudf_exprs;
+    intermediate_cudf_exprs.push_back(std::move(cudf_exprs[0]));
     for (int expr_idx = 1; expr_idx < cudf_exprs.size(); expr_idx++) {
-        final_expr = cudf::ast::operation(cudf::ast::ast_operator::BITWISE_AND, final_expr, cudf_exprs[expr_idx]);
+        intermediate_cudf_exprs.emplace_back(
+            cudf::ast::ast_operator::BITWISE_AND, intermediate_cudf_exprs.back(), cudf_exprs[expr_idx]);
     }
-
-    printf("CUDF mixed join\n");
+    const auto& final_expr = intermediate_cudf_exprs.back();
 
     auto probe_equal_table = cudf::table_view(probe_equal_columns);
     auto build_equal_table = cudf::table_view(build_equal_columns);
@@ -124,8 +122,6 @@ void cudf_mixed_join(vector<shared_ptr<GPUColumn>>& probe_columns, vector<shared
     rmm::device_buffer row_ids_left_buffer = result.first->release();
     rmm::device_buffer row_ids_right_buffer = result.second->release();
 
-    printf("CUDF mixed join\n");
-
     row_ids_left = convertInt32ToUInt64(reinterpret_cast<int32_t*>(row_ids_left_buffer.data()), result_count);
     row_ids_right = convertInt32ToUInt64(reinterpret_cast<int32_t*>(row_ids_right_buffer.data()), result_count);
 
@@ -134,6 +130,9 @@ void cudf_mixed_join(vector<shared_ptr<GPUColumn>>& probe_columns, vector<shared
 
     count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
     count[0] = result_count;
+
+    STOP_TIMER();
+    SIRIUS_LOG_DEBUG("CUDF Mixed join result count: {}", count[0]);
 }
 
 } //namespace duckdb

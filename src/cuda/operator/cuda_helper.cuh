@@ -15,6 +15,7 @@
 #include <assert.h>
 #include <limits>
 #include "gpu_buffer_manager.hpp"
+#include "log/logging.hpp"
 
 #include <iostream> 
 #include <string> 
@@ -22,7 +23,13 @@
 
 #define CUB_STDERR
 
-#define cudaAssert( X ) if ( !(X) ) { printf( "Thread %d:%d failed assert at %s:%d!\n", blockIdx.x, threadIdx.x, __FILE__, __LINE__ ); return; }
+// FIXME: handle error message from kernel to log file
+#define cudaAssert( X ) { \
+    if ( !(X) ) { \
+        /* printf( "Thread %d:%d failed assert at %s:%d!\n", blockIdx.x, threadIdx.x, __FILE__, __LINE__ ); */ \
+        return; \
+    } \
+}
 
 #define CHECK_ERROR() { \
   cudaDeviceSynchronize(); \
@@ -44,15 +51,20 @@
   } \
 }
 
-#define CHECK_CU_ERROR(err, cufunc)                                     \
-    if (err != CUDA_SUCCESS) { printf ("Error %d for CUDA Driver API function '%s'\n", err, cufunc); return -1; }
+// FIXME: handle error message from kernel to log file
+#define CHECK_CU_ERROR(err, cufunc) { \
+    if (err != CUDA_SUCCESS) { \
+        /* printf ("Error %d for CUDA Driver API function '%s'\n", err, cufunc); */ \
+        return -1; \
+    } \
+}
 
 #define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
 inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true)
 {
    if (code != cudaSuccess) 
    {
-      fprintf(stderr,"GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
+      SIRIUS_LOG_ERROR("GPUassert: {} {} {}\n", cudaGetErrorString(code), file, line);
       if (abort) exit(code);
    }
 }
@@ -81,7 +93,7 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
     cudaEventSynchronize(stop); \
     float elapsedTime = 0; \
     cudaEventElapsedTime(&elapsedTime, start, stop); \
-    printf("Elapsed time op: %f\n", elapsedTime); \
+    SIRIUS_LOG_DEBUG("Elapsed time op: {}", elapsedTime); \
 }
 
 #define BLOCK_THREADS 128

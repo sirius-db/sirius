@@ -15,9 +15,7 @@
 
 namespace duckdb {
 
-void cudf_probe(vector<shared_ptr<GPUColumn>>& probe_keys, cudf::hash_join* hash_table, int num_keys, uint64_t*& row_ids_left, uint64_t*& row_ids_right, uint64_t*& count);
-
-void cudf_build(vector<shared_ptr<GPUColumn>>& build_keys, cudf::hash_join*& hash_table, int num_keys);
+void cudf_inner_join(vector<shared_ptr<GPUColumn>>& probe_keys, vector<shared_ptr<GPUColumn>>& build_keys, int num_keys, uint64_t*& row_ids_left, uint64_t*& row_ids_right, uint64_t*& count);
 
 void cudf_mixed_join(vector<shared_ptr<GPUColumn>>& probe_columns, vector<shared_ptr<GPUColumn>>& build_columns, const vector<JoinCondition>& conditions, JoinType join_type, uint64_t*& row_ids_left, uint64_t*& row_ids_right, uint64_t*& count);
 
@@ -79,8 +77,6 @@ public:
 	mutable bool unique_build_keys = false;
 
 	mutable bool unique_probe_keys = false;
-
-	mutable cudf::hash_join* cudf_hash_table;
 
 	// OperatorResultType Execute(ExecutionContext &context, GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation,
 	// 									GlobalOperatorState &gstate, OperatorState &state) const override;

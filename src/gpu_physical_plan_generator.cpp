@@ -104,7 +104,6 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::CreatePlan(LogicalOper
 		plan = CreatePlan(op.Cast<LogicalOrder>());
 		break;
 	case LogicalOperatorType::LOGICAL_TOP_N:
-		// throw NotImplementedException("Top N not supported");
 		plan = CreatePlan(op.Cast<LogicalTopN>());
 		break;
 	case LogicalOperatorType::LOGICAL_COPY_TO_FILE:
@@ -154,8 +153,7 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::CreatePlan(LogicalOper
 		plan = CreatePlan(op.Cast<LogicalDelimGet>());
 		break;
 	case LogicalOperatorType::LOGICAL_EXPRESSION_GET:
-		throw NotImplementedException("Expression get not supported");
-		// plan = CreatePlan(op.Cast<LogicalExpressionGet>());
+		plan = CreatePlan(op.Cast<LogicalExpressionGet>());
 		break;
 	case LogicalOperatorType::LOGICAL_UPDATE:
 		throw NotImplementedException("Update not supported");
