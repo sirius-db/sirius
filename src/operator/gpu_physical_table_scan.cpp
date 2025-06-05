@@ -117,7 +117,7 @@ void HandleComparisonConstantExpression(shared_ptr<GPUColumn> column, uint64_t* 
         ResolveStringExpression(column, count, row_ids, filter_constant, expression_type);
         break;
       default:
-        throw NotImplementedException("Unsupported column type in `HandleComparisonConstantExpression`: %d",
+        throw NotImplementedException("Unsupported sirius column type in `HandleComparisonConstantExpression`: %d",
                                       static_cast<int>(column->data_wrapper.type));
     }
 }
@@ -177,7 +177,7 @@ void HandleBetweenExpression(shared_ptr<GPUColumn> column, uint64_t* &count, uin
         ResolveStringBetweenExpression(column, count, row_ids, filter_constant1, filter_constant2);
         break;
       default:
-        throw NotImplementedException("Unsupported column type in `HandleBetweenExpression`: %d",
+        throw NotImplementedException("Unsupported sirius column type in `HandleBetweenExpression`: %d",
                                       static_cast<int>(column->data_wrapper.type));
     }
 }
@@ -244,7 +244,7 @@ HandleMaterializeExpression(shared_ptr<GPUColumn> column, GPUBufferManager* gpuB
         case ColumnType::VARCHAR:
             return ResolveStringMateralizeExpression(column, gpuBufferManager);
         default:
-            throw NotImplementedException("Unsupported column type in `HandleMaterializeExpression`: %d",
+            throw NotImplementedException("Unsupported sirius column type in `HandleMaterializeExpression`: %d",
                                           static_cast<int>(column->data_wrapper.type));
     }
 }
@@ -307,7 +307,7 @@ void HandleArbitraryConstantExpression(vector<shared_ptr<GPUColumn>> &column, ui
         data_type[expr] = VARCHAR;
         break;
       } default: {
-        throw NotImplementedException("Unsupported column type in `HandleArbitraryConstantExpression`: %d",
+        throw NotImplementedException("Unsupported sirius column type in `HandleArbitraryConstantExpression`: %d",
                                       static_cast<int>(column[expr]->data_wrapper.type));
       }
     }
@@ -352,7 +352,7 @@ void HandleArbitraryConstantExpression(vector<shared_ptr<GPUColumn>> &column, ui
         init_offset += lower_string.size();
         break;
       } default: {
-        throw NotImplementedException("Unsupported column type in `HandleArbitraryConstantExpression`: %d",
+        throw NotImplementedException("Unsupported sirius column type in `HandleArbitraryConstantExpression`: %d",
                                       column[expr]->data_wrapper.type);
       }
     }

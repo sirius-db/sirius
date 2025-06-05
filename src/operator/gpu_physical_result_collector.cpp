@@ -136,6 +136,7 @@ GPUPhysicalMaterializedCollector::FinalMaterialize(GPUIntermediateRelation input
 		size_bytes = output_relation.columns[col]->column_length * sizeof(uint64_t);
 		break;
 	case ColumnType::INT32:
+	case ColumnType::DATE:
 		FinalMaterializeInternal<int>(input_relation, output_relation, col);
 		size_bytes = output_relation.columns[col]->column_length * sizeof(int);
 		break;
@@ -155,7 +156,7 @@ GPUPhysicalMaterializedCollector::FinalMaterialize(GPUIntermediateRelation input
 		FinalMaterializeString(input_relation, output_relation, col);
 		break;
 	default:
-		throw NotImplementedException("Unsupported column type in `FinalMaterialize`: %d",
+		throw NotImplementedException("Unsupported sirius column type in `FinalMaterialize`: %d",
 																	static_cast<int>(input_relation.columns[col]->data_wrapper.type));
 	}
 	// output_relation.length = output_relation.columns[col]->column_length;
@@ -175,10 +176,12 @@ LogicalType ColumnTypeToLogicalType(ColumnType type) {
 			return LogicalType::DOUBLE;
 		case ColumnType::BOOLEAN:
 			return LogicalType::BOOLEAN;
+		case ColumnType::DATE:
+			return LogicalType::DATE;
 		case ColumnType::VARCHAR:
 			return LogicalType::VARCHAR;
 		default:
-			throw NotImplementedException("Unsupported column type in `ColumnTypeToLogicalType`: %d",
+			throw NotImplementedException("Unsupported sirius column type in `ColumnTypeToLogicalType`: %d",
 																		static_cast<int>(type));
 	}
 }
@@ -187,6 +190,7 @@ Vector rawDataToVector(uint8_t* host_data, size_t vector_offset, ColumnType type
 	size_t sizeof_type;
 	switch (type) {
 		case ColumnType::INT32:
+		case ColumnType::DATE:
 			sizeof_type = sizeof(int); break;
 		case ColumnType::INT64:
 			sizeof_type = sizeof(uint64_t); break;
@@ -197,7 +201,7 @@ Vector rawDataToVector(uint8_t* host_data, size_t vector_offset, ColumnType type
 		case ColumnType::BOOLEAN:
 			sizeof_type = sizeof(uint8_t); break;
 		default:
-			throw NotImplementedException("Unsupported column type in `rawDataToVector`: %d",
+			throw NotImplementedException("Unsupported sirius column type in `rawDataToVector`: %d",
 																		static_cast<int>(type));
 	}
 	uint8_t* data = host_data + vector_offset * STANDARD_VECTOR_SIZE * sizeof_type;

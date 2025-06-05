@@ -98,7 +98,7 @@ HandleAggregateExpression(vector<shared_ptr<GPUColumn>> &aggregate_keys, GPUBuff
 	  	ResolveTypeAggregateExpression<double>(aggregate_keys, gpuBufferManager, aggregates);
 		break;
       default:
-        throw NotImplementedException("Unsupported column type in `HandleAggregateExpression`: %d",
+        throw NotImplementedException("Unsupported sirius column type in `HandleAggregateExpression`: %d",
 																			static_cast<int>(aggregate_keys[0]->data_wrapper.type));
     }
 }

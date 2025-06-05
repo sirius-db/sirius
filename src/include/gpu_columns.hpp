@@ -21,6 +21,7 @@ enum class ColumnType {
     FLOAT32,
     FLOAT64,
     BOOLEAN,
+    DATE,
     VARCHAR
 };
 
@@ -42,11 +43,14 @@ inline ColumnType convertLogicalTypeToColumnType(LogicalType type) {
         case LogicalTypeId::BOOLEAN:
             column_type = ColumnType::BOOLEAN;
             break;
+        case LogicalTypeId::DATE:
+            column_type = ColumnType::DATE;
+            break;
         case LogicalTypeId::VARCHAR:
             column_type = ColumnType::VARCHAR;
             break;
         default:
-            throw InvalidInputException("Unsupported column type in `convertLogicalTypeToColumnType`: %d",
+            throw InvalidInputException("Unsupported duckdb column type in `convertLogicalTypeToColumnType`: %d",
                                         static_cast<int>(type.id()));
             break;
     }

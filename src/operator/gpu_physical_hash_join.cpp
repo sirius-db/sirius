@@ -72,7 +72,7 @@ HandleProbeExpression(vector<shared_ptr<GPUColumn>> &probe_keys, uint64_t* &coun
 	  	ResolveTypeProbeExpression(probe_keys, count, row_ids_left, row_ids_right, ht, ht_len, conditions, join_type, unique_build_keys, gpuBufferManager);
 		break;
       default:
-        throw NotImplementedException("Unsupported column type in `HandleProbeExpression`: %d",
+        throw NotImplementedException("Unsupported sirius column type in `HandleProbeExpression`: %d",
 																			static_cast<int>(probe_keys[0]->data_wrapper.type));
     }
 }
@@ -114,7 +114,7 @@ HandleMarkExpression(vector<shared_ptr<GPUColumn>> &probe_keys, uint8_t* &output
 		break;
       case ColumnType::FLOAT64:
       default:
-        throw NotImplementedException("Unsupported column type in `HandleMarkExpression`: %d",
+        throw NotImplementedException("Unsupported sirius column type in `HandleMarkExpression`: %d",
 																			static_cast<int>(probe_keys[0]->data_wrapper.type));
     }
 }
@@ -163,7 +163,7 @@ HandleBuildExpression(vector<shared_ptr<GPUColumn>> &build_keys, unsigned long l
 	  	ResolveTypeBuildExpression(build_keys, ht, ht_len, conditions, join_type, gpuBufferManager);
 		break;
       default:
-        throw NotImplementedException("Unsupported column type in `HandleBuildExpression`: %d",
+        throw NotImplementedException("Unsupported sirius column type in `HandleBuildExpression`: %d",
 																			static_cast<int>(build_keys[0]->data_wrapper.type));
     }
 }
