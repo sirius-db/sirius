@@ -200,6 +200,11 @@ std::unique_ptr<cudf::column> GpuDispatcher::DispatchMaterialize(const GPUColumn
                                           input->row_ids,
                                           input->row_id_count,
                                           mr);
+    case ColumnType::DATE:
+      return MaterializeNumeric<cudf::timestamp_D>::Do(reinterpret_cast<const cudf::timestamp_D*>(input_data),
+                                                       input->row_ids,
+                                                       input->row_id_count,
+                                                       mr);
     case ColumnType::VARCHAR:
       return MaterializeString::Do(input_data,
                                    input_offsets,
