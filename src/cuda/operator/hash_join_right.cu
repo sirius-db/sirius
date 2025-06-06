@@ -181,8 +181,8 @@ void scanHashTableRight(unsigned long long* ht, uint64_t ht_len, uint64_t* &row_
 
 void probeHashTableRightSemiAnti(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t N, int* condition_mode, int num_keys) {
     CHECK_ERROR();
-    if (N == 0) {
-        SIRIUS_LOG_DEBUG("Input size is 0");
+    if (N == 0 || ht_len == 0) {
+        SIRIUS_LOG_DEBUG("Input size is 0 or hash table is empty");
         return;
     }
     SIRIUS_LOG_DEBUG("Launching Probe Kernel");

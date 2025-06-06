@@ -199,8 +199,8 @@ __global__ void probe_multikey<BLOCK_THREADS, ITEMS_PER_THREAD>(uint64_t **keys,
 
 void buildHashTable(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t N, int* condition_mode, int num_keys, bool is_right) {
     CHECK_ERROR();
-    if (N == 0) {
-        SIRIUS_LOG_DEBUG("Input size is 0");
+    if (N == 0 || ht_len == 0) {
+        SIRIUS_LOG_DEBUG("Input size is 0 or hash table is empty");
         return;
     }
     SIRIUS_LOG_DEBUG("Launching Build Kernel");
@@ -239,11 +239,11 @@ void buildHashTable(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uin
 void probeHashTable(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t* &row_ids_left, uint64_t* &row_ids_right, uint64_t* &count, uint64_t N, int* condition_mode, int num_keys, bool is_right) {
     CHECK_ERROR();
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
-    if (N == 0) {
+    if (N == 0 || ht_len == 0) {
         uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
         h_count[0] = 0;
         count = h_count;
-        SIRIUS_LOG_DEBUG("Input size is 0");
+        SIRIUS_LOG_DEBUG("Input size is 0 or hash table is empty");
         return;
     }
     SIRIUS_LOG_DEBUG("Launching Probe Kernel");

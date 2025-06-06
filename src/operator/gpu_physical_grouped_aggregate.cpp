@@ -550,6 +550,20 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 		return SinkResultType::FINISHED;
 	}
 
+	uint64_t column_size = 0;
+	for (int i = 0; i < input_relation.columns.size(); i++) {
+		if (input_relation.columns[i] != nullptr) {
+			if (input_relation.columns[i]->row_ids != nullptr) {
+				column_size = input_relation.columns[i]->row_id_count;
+			} else if (input_relation.columns[i]->data_wrapper.data != nullptr) {
+				column_size = input_relation.columns[i]->column_length;
+			}
+			break;
+		} else {
+			throw NotImplementedException("Input relation is null");
+		}
+	}
+
 	// DataChunk &aggregate_input_chunk = local_state.aggregate_input_chunk;
 	auto &aggregates = grouped_aggregate_data.aggregates;
 	idx_t aggregate_input_idx = 0;
@@ -565,14 +579,6 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 	}
 	for (int i = 0; i < aggregates.size(); i++) {
 		aggregate_column[i] = nullptr;
-	}
-
-	uint64_t column_size = 0;
-	for (int i = 0; i < input_relation.columns.size(); i++) {
-		if (input_relation.columns[i] != nullptr) {
-			column_size = input_relation.columns[i]->column_length;
-			break;
-		}
 	}
 
 	// Reading groupby columns based on the grouping set
@@ -608,6 +614,8 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 	for (auto &aggregate : aggregates) {
 		auto &aggr = aggregate->Cast<BoundAggregateExpression>();
 		if (aggr.children.size() == 0) {
+			//we have a count(*) aggregate
+			SIRIUS_LOG_DEBUG("Passing * aggregate to index {} in aggregation result", aggr_idx);
 			aggregate_column[aggr_idx] = make_shared_ptr<GPUColumn>(column_size, ColumnType::INT64, nullptr);
 		}
 		if (aggr.filter) {
@@ -645,14 +653,23 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 	for (idx_t i = 0; i < groupings.size(); i++) {
 		for (int idx = 0; idx < grouping_sets[i].size(); idx++) {
 			//TODO: has to fix this for columns with partially NULL values
-			if (group_by_result->columns[idx] == nullptr && group_by_column[idx]->column_length > 0 && group_by_column[idx]->data_wrapper.data != nullptr) {
+			if (group_by_result->columns[idx] == nullptr) {
 				SIRIUS_LOG_DEBUG("Passing group by column {} to group by result column {}", idx, idx);
 				group_by_result->columns[idx] = group_by_column[idx];
 				group_by_result->columns[idx]->row_ids = nullptr;
 				group_by_result->columns[idx]->row_id_count = 0;
-			} else if (group_by_result->columns[idx] != nullptr && group_by_column[idx]->column_length > 0 && group_by_column[idx]->data_wrapper.data != nullptr) {
-				SIRIUS_LOG_DEBUG("Combining group by column {} with group by result column {}", idx, idx);
-				group_by_result->columns[idx] = CombineColumns(group_by_result->columns[idx], group_by_column[idx], gpuBufferManager);
+			} else if (group_by_result->columns[idx] != nullptr) {
+				if (group_by_column[idx]->data_wrapper.data != nullptr && group_by_result->columns[idx]->data_wrapper.data != nullptr) {
+					SIRIUS_LOG_DEBUG("Combining group by column {} with group by result column {}", idx, idx);
+					group_by_result->columns[idx] = CombineColumns(group_by_result->columns[idx], group_by_column[idx], gpuBufferManager);
+				} else if (group_by_column[idx]->data_wrapper.data != nullptr && group_by_result->columns[idx]->data_wrapper.data == nullptr) {
+					SIRIUS_LOG_DEBUG("Passing group by column {} to group by result column {}", idx, idx);
+					group_by_result->columns[idx] = group_by_column[idx];
+					group_by_result->columns[idx]->row_ids = nullptr;
+					group_by_result->columns[idx]->row_id_count = 0;
+				} else {
+					SIRIUS_LOG_DEBUG("Group by column {} is null, skipping", idx);
+				}
 			}
 
 		}
@@ -660,14 +677,23 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 
 	for (int aggr_idx = 0; aggr_idx < aggregates.size(); aggr_idx++) {
 		//TODO: has to fix this for columns with partially NULL values
-		if (group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] == nullptr && aggregate_column[aggr_idx]->column_length > 0 && aggregate_column[aggr_idx]->data_wrapper.data != nullptr) {
-			SIRIUS_LOG_DEBUG("Passing aggregate column {} to group by result column {}", grouped_aggregate_data.groups.size() + aggr_idx, grouped_aggregate_data.groups.size() + aggr_idx);
+		if (group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] == nullptr) {
+			SIRIUS_LOG_DEBUG("Passing aggregate column {} to group by result column {}", aggr_idx, grouped_aggregate_data.groups.size() + aggr_idx);
 			group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] = aggregate_column[aggr_idx];
 			group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx]->row_ids = nullptr;
 			group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx]->row_id_count = 0;
-		} else if (group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] != nullptr && aggregate_column[aggr_idx]->column_length > 0 && aggregate_column[aggr_idx]->data_wrapper.data != nullptr) {
-			SIRIUS_LOG_DEBUG("Combining aggregate column {} with group by result column {}", grouped_aggregate_data.groups.size() + aggr_idx, grouped_aggregate_data.groups.size() + aggr_idx);
-			group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] = CombineColumns(group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx], aggregate_column[aggr_idx], gpuBufferManager);
+		} else if (group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] != nullptr) {
+			if (aggregate_column[aggr_idx]->data_wrapper.data != nullptr && group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx]->data_wrapper.data != nullptr) {
+				SIRIUS_LOG_DEBUG("Combining aggregate column {} with group by result column {}", aggr_idx, grouped_aggregate_data.groups.size() + aggr_idx);
+				group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] = CombineColumns(group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx], aggregate_column[aggr_idx], gpuBufferManager);
+			} else if (aggregate_column[aggr_idx]->data_wrapper.data != nullptr && group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx]->data_wrapper.data == nullptr) {
+				SIRIUS_LOG_DEBUG("Passing aggregate column {} to group by result column {}", aggr_idx, grouped_aggregate_data.groups.size() + aggr_idx);
+				group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx] = aggregate_column[aggr_idx];
+				group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx]->row_ids = nullptr;
+				group_by_result->columns[grouped_aggregate_data.groups.size() + aggr_idx]->row_id_count = 0;
+			} else {
+				SIRIUS_LOG_DEBUG("Aggregate column {} is null, skipping", aggr_idx);
+			}
 		}
 	}
 

@@ -180,14 +180,18 @@ SiriusExtension::GPUProcessingBind(ClientContext &context, TableFunctionBindInpu
 	//generate physical plan from the logical plan
 	unique_ptr<LogicalOperator> query_plan = SiriusInitPlanExtractor(context, *result, *result->conn);
 	SIRIUS_LOG_DEBUG("Query plan:\n{}", query_plan->ToString());
-	try {
-		auto gpu_physical_plan = GPUGeneratePhysicalPlan(context, *result->gpu_context, query_plan, *result->conn);
-		auto gpu_prepared = make_shared_ptr<GPUPreparedStatementData>(std::move(prepared), std::move(gpu_physical_plan));
-		result->gpu_prepared = gpu_prepared;
-	} catch (std::exception &e) {
-		ErrorData error(e);
-		SIRIUS_LOG_ERROR("Error in GPUGeneratePhysicalPlan: {}", error.RawMessage());
-		result->plan_error = true;
+	if (buffer_is_initialized) {
+		try {
+			auto gpu_physical_plan = GPUGeneratePhysicalPlan(context, *result->gpu_context, query_plan, *result->conn);
+			auto gpu_prepared = make_shared_ptr<GPUPreparedStatementData>(std::move(prepared), std::move(gpu_physical_plan));
+			result->gpu_prepared = gpu_prepared;
+		} catch (std::exception &e) {
+			ErrorData error(e);
+			SIRIUS_LOG_ERROR("Error in GPUGeneratePhysicalPlan: {}", error.RawMessage());
+			result->plan_error = true;
+		}
+	} else {
+		result->gpu_prepared = nullptr;
 	}
 
 	for (auto &column : planner.names) {
@@ -228,10 +232,12 @@ void SiriusExtension::GPUProcessingFunction(ClientContext &context, TableFunctio
 	}
 
 	auto result_chunk = data.res->Fetch();
-	if (!result_chunk) {
+	if (result_chunk == nullptr) {
+		output.SetCardinality(0);
 		return;
 	}
-	output.Move(*result_chunk);
+
+	output.Reference(*result_chunk);
 	return;
 }
 

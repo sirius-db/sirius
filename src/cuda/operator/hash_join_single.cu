@@ -224,11 +224,11 @@ void probeHashTableSingleMatch(uint8_t **keys, unsigned long long* ht, uint64_t 
             uint64_t* &count, uint64_t N, int* condition_mode, int num_keys, int join_mode) {
     CHECK_ERROR();
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
-    if (N == 0) {
+    if (N == 0 || ht_len == 0) {
         uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
         h_count[0] = 0;
         count = h_count;
-        SIRIUS_LOG_DEBUG("Input size is 0");
+        SIRIUS_LOG_DEBUG("Input size is 0 or hash table is empty");
         return;
     }
     SIRIUS_LOG_DEBUG("Launching Probe Kernel Unique Join");
@@ -292,8 +292,8 @@ void probeHashTableSingleMatch(uint8_t **keys, unsigned long long* ht, uint64_t 
 
 void probeHashTableRightSemiAntiSingleMatch(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t N, int* condition_mode, int num_keys) {
     CHECK_ERROR();
-    if (N == 0) {
-        SIRIUS_LOG_DEBUG("Input size is 0");
+    if (N == 0 || ht_len == 0) {
+        SIRIUS_LOG_DEBUG("Input size is 0 or hash table is empty");
         return;
     }
     SIRIUS_LOG_DEBUG("Launching Probe Kernel Unique Join");
@@ -332,14 +332,16 @@ void probeHashTableRightSemiAntiSingleMatch(uint8_t **keys, unsigned long long* 
 
 void probeHashTableMark(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uint8_t* &output, uint64_t N, int* condition_mode, int num_keys) {
     CHECK_ERROR();
-    if (N == 0) {
-        SIRIUS_LOG_DEBUG("Input size is 0");
+    GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+    if (N == 0 || ht_len == 0) {
+        output = gpuBufferManager->customCudaMalloc<uint8_t>(N, 0, 0);
+        cudaMemset(output, 0, N * sizeof(uint8_t));
+        SIRIUS_LOG_DEBUG("Input size is 0 or hash table is empty");
         return;
     }
     SIRIUS_LOG_DEBUG("Launching Probe Kernel Mark");
     SETUP_TIMING();
     START_TIMER();
-    GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 
     //reinterpret cast the keys to uint64_t
     uint64_t** keys_data = gpuBufferManager->customCudaHostAlloc<uint64_t*>(num_keys);

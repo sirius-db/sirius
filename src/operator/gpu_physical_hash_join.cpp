@@ -342,6 +342,14 @@ GPUPhysicalHashJoin::GetData(GPUIntermediateRelation &output_relation) const {
 	// 	}
 	// }
 
+	//check if all output columns has the same size
+	// for (idx_t i = 1; i < output_relation.columns.size(); i++) {
+	// 	if (output_relation.columns[i]->column_length != output_relation.columns[0]->column_length) {
+	// 		printf("Column %d has length %zu, while column 0 has length %zu\n", i, output_relation.columns[i]->column_length, output_relation.columns[0]->column_length);
+	// 		throw InvalidInputException("Output columns have different sizes");
+	// 	}
+	// }
+
 	auto end = std::chrono::high_resolution_clock::now();
 	auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
 	SIRIUS_LOG_DEBUG("Hash Join GetData time: {:.2f} ms", duration.count()/1000.0);
@@ -390,7 +398,7 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 	uint64_t* count;
 	uint64_t* row_ids_left = nullptr;
 	uint64_t* row_ids_right = nullptr;
-	uint8_t* output; // for MARK JOIN
+	uint8_t* output = nullptr; // for MARK JOIN
 	// if (conditions.size() > 1) throw NotImplementedException("Multiple conditions not supported yet");
 
 	for (idx_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
@@ -541,7 +549,7 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 	}
 
 	if (join_type == JoinType::INNER || join_type == JoinType::SEMI || join_type == JoinType::MARK) {
-		gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(gpu_hash_table), 0);
+		if (gpu_hash_table != nullptr) gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(gpu_hash_table), 0);
 	}
 	auto end = std::chrono::high_resolution_clock::now();
 	auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
@@ -579,10 +587,13 @@ GPUPhysicalHashJoin::Sink(GPUIntermediateRelation &input_relation) const {
 	SIRIUS_LOG_DEBUG("Building hash table");
 	ht_len = build_keys[0]->column_length * 2;
 	if (join_type == JoinType::INNER || join_type == JoinType::SEMI || join_type == JoinType::MARK) {
-		gpu_hash_table = (unsigned long long*) gpuBufferManager->customCudaMalloc<uint64_t>(ht_len * (conditions.size() + 1), 0, 0);
+		if (ht_len == 0) gpu_hash_table = nullptr;
+		else gpu_hash_table = (unsigned long long*) gpuBufferManager->customCudaMalloc<uint64_t>(ht_len * (conditions.size() + 1), 0, 0);
 	} else if (join_type == JoinType::RIGHT || join_type == JoinType::RIGHT_SEMI || join_type == JoinType::RIGHT_ANTI) {
-		gpu_hash_table = (unsigned long long*) gpuBufferManager->customCudaMalloc<uint64_t>(ht_len * (conditions.size() + 2), 0, 0);
+		if (ht_len == 0) gpu_hash_table = nullptr;
+		else gpu_hash_table = (unsigned long long*) gpuBufferManager->customCudaMalloc<uint64_t>(ht_len * (conditions.size() + 2), 0, 0);
 	}
+	
 
 	if (join_type == JoinType::INNER) {
 		// check if there is a non-equality condition
