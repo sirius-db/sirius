@@ -43,12 +43,12 @@ conda install -c rapidsai -c conda-forge -c nvidia rapidsai::libcudf
 Set the environment variables `USE_CUDF` to 1 and `LIBCUDF_ENV_PREFIX` to the conda environment's path. For example, if we installed miniconda in `~/miniconda3` and installed libcudf in the conda environment `libcudf-env`, then we would set the `LIBCUDF_ENV_PREFIX` to `~/miniconda3/envs/libcudf-env`.
 ```
 export USE_CUDF=1
-export LIBCUDF_ENV_PREFIX = {PATH to libcudf-env}
+export LIBCUDF_ENV_PREFIX={PATH to libcudf-env}
 ```
 
 ### Clone the Sirius repository
 ```
-git clone --recurse-submodules https://github.com/bwyogatama/sirius.git
+git clone --recurse-submodules https://github.com/sirius-db/sirius.git
 cd sirius
 export SIRIUS_HOME_PATH=`pwd`
 cd duckdb

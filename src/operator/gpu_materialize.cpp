@@ -8,7 +8,7 @@ shared_ptr<GPUColumn>
 ResolveTypeMaterializeExpression(shared_ptr<GPUColumn> column, BoundReferenceExpression& bound_ref, GPUBufferManager* gpuBufferManager) {
     size_t size;
     T* a;
-    if (column->data_wrapper.data == nullptr) {
+    if (column->data_wrapper.data == nullptr || column->column_length == 0) {
         return make_shared_ptr<GPUColumn>(column->column_length, column->data_wrapper.type, nullptr);
     }
     if (column->row_ids != nullptr) {
@@ -31,7 +31,7 @@ ResolveTypeMaterializeString(shared_ptr<GPUColumn> column, BoundReferenceExpress
     uint8_t* a;
     uint64_t* result_offset; 
     uint64_t* new_num_bytes;
-    if (column->data_wrapper.data == nullptr) {
+    if (column->data_wrapper.data == nullptr || column->column_length == 0) {
         return make_shared_ptr<GPUColumn>(column->column_length, column->data_wrapper.type, nullptr, nullptr, column->data_wrapper.num_bytes, column->data_wrapper.is_string_data);
     }
     if (column->row_ids != nullptr) {
@@ -82,8 +82,8 @@ HandleMaterializeRowIDs(GPUIntermediateRelation& input_relation, GPUIntermediate
     for (int i = 0; i < input_relation.columns.size(); i++) {
         SIRIUS_LOG_DEBUG("Materializing column idx {} in input relation to idx {} in output relation", i, i);
         if (count == 0) {
-            output_relation.columns[i] = make_shared_ptr<GPUColumn>(0, input_relation.columns[i]->data_wrapper.type, input_relation.columns[i]->data_wrapper.data,
-                        input_relation.columns[i]->data_wrapper.offset, 0, input_relation.columns[i]->data_wrapper.is_string_data);
+            output_relation.columns[i] = make_shared_ptr<GPUColumn>(0, input_relation.columns[i]->data_wrapper.type, nullptr,
+                        nullptr, 0, input_relation.columns[i]->data_wrapper.is_string_data);
             output_relation.columns[i]->row_id_count = 0;
             if (maintain_unique) {
                 output_relation.columns[i]->is_unique = input_relation.columns[i]->is_unique;
@@ -128,10 +128,9 @@ HandleMaterializeRowIDsRHS(GPUIntermediateRelation& hash_table_result, GPUInterm
     vector<uint64_t*> prev_row_ids;
     for (idx_t i = 0; i < rhs_output_columns.size(); i++) {
         const auto rhs_col = rhs_output_columns[i];
-        SIRIUS_LOG_DEBUG("Materializing column idx {} from hash table to idx {} in output relation", rhs_col, offset + i);
         if (count == 0) {
-            output_relation.columns[offset + i] = make_shared_ptr<GPUColumn>(0, hash_table_result.columns[rhs_col]->data_wrapper.type, hash_table_result.columns[rhs_col]->data_wrapper.data,
-                        hash_table_result.columns[rhs_col]->data_wrapper.offset, 0, hash_table_result.columns[rhs_col]->data_wrapper.is_string_data);
+            output_relation.columns[offset + i] = make_shared_ptr<GPUColumn>(0, hash_table_result.columns[rhs_col]->data_wrapper.type, nullptr,
+                        nullptr, 0, hash_table_result.columns[rhs_col]->data_wrapper.is_string_data);
             output_relation.columns[offset + i]->row_id_count = 0;
             if (maintain_unique) {
                 output_relation.columns[offset + i]->is_unique = hash_table_result.columns[rhs_col]->is_unique;
@@ -178,8 +177,8 @@ HandleMaterializeRowIDsLHS(GPUIntermediateRelation& input_relation, GPUIntermedi
         const auto lhs_col = lhs_output_columns[i];
         SIRIUS_LOG_DEBUG("Materializing column idx {} from input relation to idx {} in output relation", lhs_col, i);
         if (count == 0) {
-            output_relation.columns[i] = make_shared_ptr<GPUColumn>(0, input_relation.columns[lhs_col]->data_wrapper.type, input_relation.columns[lhs_col]->data_wrapper.data,
-                input_relation.columns[lhs_col]->data_wrapper.offset, 0, input_relation.columns[lhs_col]->data_wrapper.is_string_data);
+            output_relation.columns[i] = make_shared_ptr<GPUColumn>(0, input_relation.columns[lhs_col]->data_wrapper.type, nullptr,
+                nullptr, 0, input_relation.columns[lhs_col]->data_wrapper.is_string_data);
             output_relation.columns[i]->row_id_count = 0;
             if (maintain_unique) {
                 output_relation.columns[i]->is_unique = input_relation.columns[lhs_col]->is_unique;
