@@ -65,6 +65,7 @@ void GpuExpressionExecutor::SetInputColumns(const GPUIntermediateRelation& input
   else
   {
     // All columns should have the same count
+    //TODO: This is assuming that all columns have the same size, which is not always true if the pipeline source is the hash table from RIGHT join
     const auto col = input_columns[0];
     // The input column may be null, in which case the expression evaluation should be a no-op
     input_count = col == nullptr            ? 0
