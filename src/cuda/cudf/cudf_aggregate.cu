@@ -47,7 +47,7 @@ void cudf_aggregate(vector<shared_ptr<GPUColumn>>& column, uint64_t num_aggregat
 
     uint64_t size = 0;
     for (int agg = 0; agg < num_aggregates; agg++) {
-        if (column[agg]->data_wrapper.data != nullptr) {
+        if (column[agg]->data_wrapper.data != nullptr || (column[agg]->data_wrapper.data == nullptr && agg_mode[agg] == AggregationType::COUNT_STAR && column[agg]->column_length > 0)) {
             size = column[agg]->column_length;
             break;
         }

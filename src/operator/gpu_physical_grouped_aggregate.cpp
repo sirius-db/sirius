@@ -546,6 +546,20 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 		return SinkResultType::FINISHED;
 	}
 
+	uint64_t column_size = 0;
+	for (int i = 0; i < input_relation.columns.size(); i++) {
+		if (input_relation.columns[i] != nullptr) {
+			if (input_relation.columns[i]->row_ids != nullptr) {
+				column_size = input_relation.columns[i]->row_id_count;
+			} else if (input_relation.columns[i]->data_wrapper.data != nullptr) {
+				column_size = input_relation.columns[i]->column_length;
+			}
+			break;
+		} else {
+			throw NotImplementedException("Input relation is null");
+		}
+	}
+
 	// DataChunk &aggregate_input_chunk = local_state.aggregate_input_chunk;
 	auto &aggregates = grouped_aggregate_data.aggregates;
 	idx_t aggregate_input_idx = 0;
@@ -561,14 +575,6 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 	}
 	for (int i = 0; i < aggregates.size(); i++) {
 		aggregate_column[i] = nullptr;
-	}
-
-	uint64_t column_size = 0;
-	for (int i = 0; i < input_relation.columns.size(); i++) {
-		if (input_relation.columns[i] != nullptr) {
-			column_size = input_relation.columns[i]->column_length;
-			break;
-		}
 	}
 
 	// Reading groupby columns based on the grouping set
@@ -604,6 +610,8 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 	for (auto &aggregate : aggregates) {
 		auto &aggr = aggregate->Cast<BoundAggregateExpression>();
 		if (aggr.children.size() == 0) {
+			//we have a count(*) aggregate
+			SIRIUS_LOG_DEBUG("Passing * aggregate to index {} in aggregation result", aggr_idx);
 			aggregate_column[aggr_idx] = make_shared_ptr<GPUColumn>(column_size, ColumnType::INT64, nullptr);
 		}
 		if (aggr.filter) {

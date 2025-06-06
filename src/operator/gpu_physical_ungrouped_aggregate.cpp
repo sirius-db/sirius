@@ -159,20 +159,26 @@ GPUPhysicalUngroupedAggregate::Sink(GPUIntermediateRelation &input_relation) con
 		SinkDistinct(input_relation);
 	}
 
+	uint64_t column_size = 0;
+	for (int i = 0; i < input_relation.columns.size(); i++) {
+		if (input_relation.columns[i] != nullptr) {
+			if (input_relation.columns[i]->row_ids != nullptr) {
+				column_size = input_relation.columns[i]->row_id_count;
+			} else if (input_relation.columns[i]->data_wrapper.data != nullptr) {
+				column_size = input_relation.columns[i]->column_length;
+			}
+			break;
+		} else {
+			throw NotImplementedException("Input relation is null");
+		}
+	}
+
 	idx_t payload_idx = 0;
 	idx_t next_payload_idx = 0;
 	GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 	vector<shared_ptr<GPUColumn>> aggregate_column(aggregates.size());
 	for (int aggr_idx = 0; aggr_idx < aggregates.size(); aggr_idx++) {
 		aggregate_column[aggr_idx] = nullptr;
-	}
-
-	uint64_t column_size = 0;
-	for (int i = 0; i < input_relation.columns.size(); i++) {
-		if (input_relation.columns[i] != nullptr) {
-			column_size = input_relation.columns[i]->column_length;
-			break;
-		}
 	}
 
 	for (idx_t aggr_idx = 0; aggr_idx < aggregates.size(); aggr_idx++) {
