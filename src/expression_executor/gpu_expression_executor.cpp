@@ -106,6 +106,16 @@ void GpuExpressionExecutor::Execute(const GPUIntermediateRelation& input_relatio
     // Execute the expression
     auto result = ExecuteExpression(i);
 
+    // Cast the `result` from libcudf to `return_type` if `result` has different types.
+    // E.g., `extract(year from col)` from libcudf returns int16_t but duckdb requires int64_t
+    auto cudf_return_type = GpuExpressionState::GetCudfType(expressions[i]->return_type);
+    if (result->type().id() != cudf_return_type.id()) {
+      result = cudf::cast(result->view(),
+                          cudf_return_type,
+                          cudf::get_default_stream(),
+                          resource_ref);
+    }
+
     // Transfer to output relation (zero copy)
     output_relation.columns[i]->setFromCudfColumn(*result,
                                                   false,

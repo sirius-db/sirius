@@ -403,21 +403,6 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 		probe_key[cond_idx] = HandleMaterializeExpression(input_relation.columns[join_key_index], condition.left->Cast<BoundReferenceExpression>(), gpuBufferManager);
 	}
 
-	//check if all probe keys are int64 or all the probe keys are float64
-	bool all_int64 = true;
-	bool all_float64 = true;
-	for (idx_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
-		if (probe_key[cond_idx]->data_wrapper.type != ColumnType::INT64) {
-			all_int64 = false;
-		}
-		if (probe_key[cond_idx]->data_wrapper.type != ColumnType::FLOAT64) {
-			all_float64 = false;
-		}
-	}
-	if (!all_int64 && !all_float64) {
-		throw NotImplementedException("Hash join only supports integer or float64 keys");
-	}
-
 	//probing hash table
 	SIRIUS_LOG_DEBUG("Probing hash table");
 	if (join_type == JoinType::INNER) {
@@ -589,21 +574,6 @@ GPUPhysicalHashJoin::Sink(GPUIntermediateRelation &input_relation) const {
 		}
 		SIRIUS_LOG_DEBUG("Materializing join key for building hash table from index {}", join_key_index);
 		build_keys[cond_idx] = HandleMaterializeExpression(input_relation.columns[join_key_index], condition.right->Cast<BoundReferenceExpression>(), gpuBufferManager);
-	}
-
-	//check if all probe keys are int64 or all the probe keys are float64
-	bool all_int64 = true;
-	bool all_float64 = true;
-	for (idx_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
-		if (build_keys[cond_idx]->data_wrapper.type != ColumnType::INT64) {
-			all_int64 = false;
-		}
-		if (build_keys[cond_idx]->data_wrapper.type != ColumnType::FLOAT64) {
-			all_float64 = false;
-		}
-	}
-	if (!all_int64 && !all_float64) {
-		throw NotImplementedException("Hash join only supports integer or float64 keys");
 	}
 
 	SIRIUS_LOG_DEBUG("Building hash table");
