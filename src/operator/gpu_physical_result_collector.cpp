@@ -9,6 +9,7 @@
 #include "gpu_buffer_manager.hpp"
 #include "gpu_materialize.hpp"
 #include "log/logging.hpp"
+#include "utils.hpp"
 
 namespace duckdb {
 
@@ -174,6 +175,8 @@ LogicalType ColumnTypeToLogicalType(ColumnType type) {
 			return LogicalType::BOOLEAN;
 		case ColumnType::VARCHAR:
 			return LogicalType::VARCHAR;
+		case ColumnType::INT128:
+			return LogicalType::HUGEINT;
 		default:
 			throw NotImplementedException("Unsupported column type");
 	}
@@ -192,6 +195,8 @@ Vector rawDataToVector(uint8_t* host_data, size_t vector_offset, ColumnType type
 			sizeof_type = sizeof(double); break;
 		case ColumnType::BOOLEAN:
 			sizeof_type = sizeof(uint8_t); break;
+		case ColumnType::INT128:
+			sizeof_type = 2 * sizeof(uint64_t); break;
 		default:
 			throw NotImplementedException("Unsupported column type");
 	}
@@ -231,8 +236,8 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 	char* all_columns_chars = reinterpret_cast<char*>(combined_buffer + all_columns_strings_buffer_size);
 
 	size_t size_bytes = 0;
-	Allocator& allocator = Allocator::DefaultAllocator();
 	uint8_t** host_data = gpuBufferManager->customCudaHostAlloc<uint8_t*>(input_relation.columns.size());
+
 	GPUIntermediateRelation materialized_relation(input_relation.columns.size());
 	string_t** duckdb_strings = gpuBufferManager->customCudaHostAlloc<string_t*>(input_relation.columns.size());
 	string_t* curr_column_string_buffer = all_columns_string;
@@ -249,9 +254,26 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 		ColumnType col_type = input_relation.columns[col]->data_wrapper.type;
 		bool is_string = false;
 		if(col_type != ColumnType::VARCHAR) {
-			// host_data[col] = allocator.AllocateData(size_bytes);
-			host_data[col] = gpuBufferManager->customCudaHostAlloc<uint8_t>(size_bytes);
-			callCudaMemcpyDeviceToHost<uint8_t>(host_data[col], materialized_relation.columns[col]->data_wrapper.data, size_bytes, 0);
+			if (types[col].InternalType() == PhysicalType::INT128) {
+				if (materialized_relation.columns[col]->data_wrapper.type == ColumnType::INT64) {
+					SIRIUS_LOG_DEBUG("Converting INT64 to INT128 for column {}", col);
+					uint8_t* temp_int128 = gpuBufferManager->customCudaMalloc<uint8_t>(size_bytes * 2, 0, 0);
+					convertInt64ToInt128(materialized_relation.columns[col]->data_wrapper.data, temp_int128, materialized_relation.columns[col]->column_length);
+					host_data[col] = gpuBufferManager->customCudaHostAlloc<uint8_t>(size_bytes * 2);
+					callCudaMemcpyDeviceToHost<uint8_t>(host_data[col], temp_int128, size_bytes * 2, 0);
+				} else if (materialized_relation.columns[col]->data_wrapper.type == ColumnType::INT32) {
+					SIRIUS_LOG_DEBUG("Converting INT32 to INT128 for column {}", col);
+					uint8_t* temp_int128 = gpuBufferManager->customCudaMalloc<uint8_t>(size_bytes * 4, 0, 0);
+					convertInt32ToInt128(materialized_relation.columns[col]->data_wrapper.data, temp_int128, materialized_relation.columns[col]->column_length);
+					host_data[col] = gpuBufferManager->customCudaHostAlloc<uint8_t>(size_bytes * 4);
+					callCudaMemcpyDeviceToHost<uint8_t>(host_data[col], temp_int128, size_bytes * 4, 0);
+				} else {
+					throw NotImplementedException("Unsupported column type for INT128 conversion");
+				}
+			} else {
+				host_data[col] = gpuBufferManager->customCudaHostAlloc<uint8_t>(size_bytes);
+				callCudaMemcpyDeviceToHost<uint8_t>(host_data[col], materialized_relation.columns[col]->data_wrapper.data, size_bytes, 0);
+			}
 		} else {
 			// Use the helper method to materialize the string on the GPU
 			shared_ptr<GPUColumn> str_column = materialized_relation.columns[col];
@@ -284,8 +306,13 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 		chunk.InitializeEmpty(types);
 		for (int col = 0; col < materialized_relation.columns.size(); col++) {
 			if(materialized_relation.columns[col]->data_wrapper.type != ColumnType::VARCHAR) {
-				Vector vector = rawDataToVector(host_data[col], vec, materialized_relation.columns[col]->data_wrapper.type);
-				chunk.data[col].Reference(vector);
+				if (types[col].InternalType() == PhysicalType::INT128) {
+					Vector vector = rawDataToVector(host_data[col], vec, ColumnType::INT128);
+					chunk.data[col].Reference(vector);
+				} else {
+					Vector vector = rawDataToVector(host_data[col], vec, materialized_relation.columns[col]->data_wrapper.type);
+					chunk.data[col].Reference(vector);
+				}
 			} else {
 				// Add the strings to the vector
 				Vector str_vector(LogicalType::VARCHAR, reinterpret_cast<data_ptr_t>(duckdb_strings[col] + read_index));
