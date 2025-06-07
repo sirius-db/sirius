@@ -17,7 +17,22 @@ Sirius is a GPU acceleration layer for SQL analytics. It plugs into existing eng
 - CUDA >= 11.2
 - CMake >= 3.30.4 (follow this [instruction](https://medium.com/@yulin_li/how-to-update-cmake-on-ubuntu-9602521deecb) to upgrade CMake)
 
-## Installing dependencies
+## Dependencies (Option 1): Use Docker Image
+To use the docker image with dependencies fully installed:
+```
+sudo docker run --gpus all -it yifeiyang7/sirius_dependencies:latest bash
+```
+
+Make sure both `nvidia-driver` and `nvidia-container-toolkit` are installed, `nvidia-driver` can be installed by
+```
+sudo apt install nvidia-driver-535
+```
+and `nvidia-container-toolkit` can be installed following the [instructions](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html). Then restart docker by
+```
+sudo systemctl restart docker
+```
+
+## Dependencies (Option 2): Install Manually
 
 ### Install duckdb dependencies
 ```
@@ -46,7 +61,8 @@ export USE_CUDF=1
 export LIBCUDF_ENV_PREFIX={PATH to libcudf-env}
 ```
 
-### Clone the Sirius repository
+## Building Sirius
+To clone the Sirius repository:
 ```
 git clone --recurse-submodules https://github.com/sirius-db/sirius.git
 cd sirius
@@ -60,14 +76,20 @@ cd $SIRIUS_HOME_PATH
 ```
 The `--recurse-submodules` will ensure DuckDB is pulled which is required to build the extension.
 
-## Building Sirius
 To build Sirius:
 ```
 make -j {nproc}
 ```
 
-## Generating TPC-H dataset
-Unzip `dbgen.zip` and run `./dbgen -s {SF}`.
+## Generating and Loading TPC-H dataset
+To generate the TPC-H dataset
+```
+unzip dbgen.zip
+cd dbgen
+./dbgen -s 1 && mkdir s1 && mv *.tbl s1  # this generates dataset of SF1
+cd ..
+```
+
 To load the TPC-H dataset to duckdb:
 ```
 ./build/release/duckdb {DATABASE_NAME}.duckdb
@@ -79,7 +101,7 @@ To run Sirius, simply start the shell with `./build/release/duckdb {DATABASE_NAM
 From the duckdb shell, initialize the Sirius buffer manager with `call gpu_buffer_init`. This API accepts 2 parameters, the GPU caching region size and the GPU processing region size. The GPU caching region is a memory region where the raw data is stored in GPUs, whereas the GPU processing region is where intermediate results are stored in GPUs (hash tables, join results .etc).
 For example, to set the caching region as 1 GB and the processing region as 2 GB, we can run the following command:
 ```
-call gpu_buffer_init("1 GB", "2 GB")
+call gpu_buffer_init("1 GB", "2 GB");
 ```
 
 After setting up Sirius, we can execute SQL queries using the `call gpu_processing`:
