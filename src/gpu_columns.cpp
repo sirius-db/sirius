@@ -80,6 +80,9 @@ GPUColumn::convertToCudfColumn() {
     } else if (data_wrapper.type == ColumnType::BOOLEAN) {
         auto column = cudf::column_view(cudf::data_type(cudf::type_id::BOOL8), size, reinterpret_cast<void*>(data_wrapper.data), nullptr, 0);
         return column;
+    } else if (data_wrapper.type == ColumnType::DATE) {
+        auto column = cudf::column_view(cudf::data_type(cudf::type_id::TIMESTAMP_DAYS), size, reinterpret_cast<void*>(data_wrapper.data), nullptr, 0);
+        return column;
     } else if (data_wrapper.type == ColumnType::VARCHAR) {
         //convert offset to int32
         int32_t* new_offset = convertSiriusOffsetToCudfOffset();
