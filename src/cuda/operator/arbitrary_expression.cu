@@ -131,7 +131,7 @@ __global__ void table_scan_expression(uint8_t **col, uint64_t** offset, uint8_t 
         for (int expr = 0; expr < num_expr; expr++) {
             if (threadIdx.x + ITEM * B < num_tile_items) {
 
-                if (data_type[expr] == INT32) {
+                if (data_type[expr] == INT32 || data_type[expr] == DATE) {
                     uint64_t item_idx = tile_offset + threadIdx.x + ITEM * B;
                     int item = (reinterpret_cast<int*>(col[expr]))[item_idx];
 

@@ -57,6 +57,7 @@ shared_ptr<GPUColumn>
 HandleMaterializeExpression(shared_ptr<GPUColumn> column, BoundReferenceExpression& bound_ref, GPUBufferManager* gpuBufferManager) {
     switch(column->data_wrapper.type) {
         case ColumnType::INT32:
+        case ColumnType::DATE:
             return ResolveTypeMaterializeExpression<int>(column, bound_ref, gpuBufferManager);
         case ColumnType::INT64:
             return ResolveTypeMaterializeExpression<uint64_t>(column, bound_ref, gpuBufferManager);
@@ -69,7 +70,8 @@ HandleMaterializeExpression(shared_ptr<GPUColumn> column, BoundReferenceExpressi
         case ColumnType::VARCHAR:
             return ResolveTypeMaterializeString(column, bound_ref, gpuBufferManager);
         default:
-            throw NotImplementedException("Unsupported column type");
+            throw NotImplementedException("Unsupported sirius column type in `HandleMaterializeExpression`: %d",
+                                          static_cast<int>(column->data_wrapper.type));
     }
 }
 
