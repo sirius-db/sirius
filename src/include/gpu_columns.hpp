@@ -21,7 +21,8 @@ enum class ColumnType {
     FLOAT32,
     FLOAT64,
     BOOLEAN,
-    VARCHAR
+    VARCHAR,
+    INT128
 };
 
 inline ColumnType convertLogicalTypeToColumnType(LogicalType type) {

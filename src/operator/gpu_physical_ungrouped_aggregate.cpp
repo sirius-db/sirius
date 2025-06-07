@@ -114,6 +114,10 @@ HandleAggregateExpressionCuDF(vector<shared_ptr<GPUColumn>> &aggregate_keys, GPU
 			agg_mode[agg_idx] = AggregationType::SUM;
 		} else if (expr.function.name.compare("sum") == 0 && aggregate_keys[agg_idx]->data_wrapper.data != nullptr) {
 			agg_mode[agg_idx] = AggregationType::SUM;
+		} else if (expr.function.name.compare("sum_no_overflow") == 0 && aggregate_keys[agg_idx]->data_wrapper.data == nullptr && aggregate_keys[agg_idx]->column_length == 0) {
+			agg_mode[agg_idx] = AggregationType::SUM;
+		} else if (expr.function.name.compare("sum_no_overflow") == 0 && aggregate_keys[agg_idx]->data_wrapper.data != nullptr) {
+			agg_mode[agg_idx] = AggregationType::SUM;
 		} else if (expr.function.name.compare("avg") == 0 && aggregate_keys[agg_idx]->data_wrapper.data != nullptr) {
 			agg_mode[agg_idx] = AggregationType::AVERAGE;
 		} else if (expr.function.name.compare("max") == 0 && aggregate_keys[agg_idx]->data_wrapper.data != nullptr) {
