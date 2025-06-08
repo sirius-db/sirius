@@ -35,8 +35,8 @@ __global__ void convert_int64_to_int128(uint8_t *input, uint8_t *output, size_t 
     // for (int i = 0; i < 8; ++i) {
       // output[idx * 16 + i] = input[idx * 8 + i];
       // output[idx * 16 + i + 8] = 0;
-      output_ptr[0] = input_ptr[0];
-      output_ptr[1] = 0; // Set the upper 64 bits to zero
+      // output_ptr[0] = input_ptr[0];
+      // output_ptr[1] = 0; // Set the upper 64 bits to zero
     // }
   }
 }
@@ -53,6 +53,16 @@ __global__ void convert_int32_to_int128(uint8_t *input, uint8_t *output, size_t 
       output_ptr[2] = 0; // Set the upper 64 bits to zero
       output_ptr[3] = 0; // Set the upper 64 bits to zero
     // }
+  }
+}
+
+__global__ void convert_int32_to_int64(uint8_t *input, uint8_t *output, size_t count) {
+  size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < count) {
+    // Store the converted value as 16 bytes in output
+    int32_t* input_ptr = reinterpret_cast<int32_t*>(input + idx * 4);
+    int64_t* output_ptr = reinterpret_cast<int64_t*>(output + idx * 8);
+    output_ptr[0] = input_ptr[0];
   }
 }
 
@@ -82,6 +92,17 @@ void convertInt32ToInt128(uint8_t *input, uint8_t *output, size_t count) {
   size_t blocks = (count + threads_per_block - 1) / threads_per_block;
 
   convert_int32_to_int128<<<blocks, threads_per_block>>>(input, output, count);
+  cudaDeviceSynchronize();
+}
+
+void convertInt32ToInt64(uint8_t *input, uint8_t *output, size_t count) {
+  if (count == 0) return;
+
+  // Launch the kernel to convert the data
+  size_t threads_per_block = 256;
+  size_t blocks = (count + threads_per_block - 1) / threads_per_block;
+
+  convert_int32_to_int64<<<blocks, threads_per_block>>>(input, output, count);
   cudaDeviceSynchronize();
 }
 
