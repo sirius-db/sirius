@@ -1,8 +1,24 @@
 #include "gpu_columns.hpp"
 #include "gpu_buffer_manager.hpp"
 #include "log/logging.hpp"
+#include "duckdb/common/types/decimal.hpp"
 
 namespace duckdb {
+
+size_t GPUDecimalTypeInfo::GetDecimalTypeSize() const {
+    if (width_ <= Decimal::MAX_WIDTH_INT16) {
+        return sizeof(int16_t);
+    } else if (width_ <= Decimal::MAX_WIDTH_INT32) {
+        return sizeof(int32_t);
+    } else if (width_ <= Decimal::MAX_WIDTH_INT64) {
+        return sizeof(int64_t);
+    } else if (width_ <= Decimal::MAX_WIDTH_INT128) {
+        return sizeof(__int128_t);
+    } else {
+        throw InternalException("Decimal has a width of %d which is bigger than the maximum supported width of %d",
+                                width_, DecimalType::MaxWidth());
+    }
+}
 
 DataWrapper::DataWrapper(GPUColumnType _type, uint8_t* _data, size_t _size) : data(_data), size(_size) {
     type = _type;
@@ -31,6 +47,13 @@ DataWrapper::getColumnTypeSize() {
             return sizeof(uint8_t);
         case GPUColumnTypeId::VARCHAR:
             return 128;
+        case GPUColumnTypeId::DECIMAL: {
+            GPUDecimalTypeInfo* decimal_type_info = type.GetDecimalTypeInfo();
+            if (decimal_type_info == nullptr) {
+                throw InternalException("`decimal_type_info` not set for DECIMAL type in `getColumnTypeSize`");
+            }
+            return decimal_type_info->GetDecimalTypeSize();
+        }
         default:
             throw duckdb::InternalException("Unsupported sirius column type in `getColumnTypeSize()`: %d",
                                             static_cast<int>(type.id()));

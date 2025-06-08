@@ -24,7 +24,20 @@ enum class GPUColumnTypeId {
     BOOLEAN,
     DATE,
     VARCHAR,
-    INT128
+    INT128,
+    DECIMAL
+};
+
+struct GPUDecimalTypeInfo {
+    GPUDecimalTypeInfo(uint8_t width, uint8_t scale)
+        : width_(width), scale_(scale) {
+        D_ASSERT(width >= scale);
+    }
+
+    size_t GetDecimalTypeSize() const;
+
+    uint8_t width_;
+	uint8_t scale_;
 };
 
 struct GPUColumnType {
@@ -37,8 +50,17 @@ public:
         return id_;
     }
 
+    inline GPUDecimalTypeInfo* GetDecimalTypeInfo() const {
+        return decimal_type_info_.get();
+    }
+
+    void SetDecimalTypeInfo(uint8_t width, uint8_t scale) {
+        decimal_type_info_ = make_shared_ptr<GPUDecimalTypeInfo>(width, scale);
+    }
+
 private:
     GPUColumnTypeId id_;
+    shared_ptr<GPUDecimalTypeInfo> decimal_type_info_;
 };
 
 inline GPUColumnType convertLogicalTypeToColumnType(LogicalType type) {
@@ -57,6 +79,11 @@ inline GPUColumnType convertLogicalTypeToColumnType(LogicalType type) {
             return GPUColumnType(GPUColumnTypeId::DATE);
         case LogicalTypeId::VARCHAR:
             return GPUColumnType(GPUColumnTypeId::VARCHAR);
+        case LogicalTypeId::DECIMAL: {
+            GPUColumnType column_type(GPUColumnTypeId::DECIMAL);
+            column_type.SetDecimalTypeInfo(DecimalType::GetWidth(type), DecimalType::GetScale(type));
+            return column_type;
+        }
         default:
             throw InvalidInputException("Unsupported duckdb column type in `convertLogicalTypeToColumnType`: %d",
                                         static_cast<int>(type.id()));

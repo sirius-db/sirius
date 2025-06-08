@@ -154,6 +154,23 @@ GPUPhysicalMaterializedCollector::FinalMaterialize(GPUIntermediateRelation input
 	case GPUColumnTypeId::VARCHAR:
 		FinalMaterializeString(input_relation, output_relation, col);
 		break;
+	case GPUColumnTypeId::DECIMAL: {
+		switch (input_relation.columns[col]->data_wrapper.getColumnTypeSize()) {
+			case sizeof(int32_t): {
+				FinalMaterializeInternal<int32_t>(input_relation, output_relation, col);
+				size_bytes = output_relation.columns[col]->column_length * sizeof(int32_t);
+				break;
+			}
+			case sizeof(int64_t): {
+				FinalMaterializeInternal<int64_t>(input_relation, output_relation, col);
+				size_bytes = output_relation.columns[col]->column_length * sizeof(int64_t);
+				break;
+			}
+			throw NotImplementedException("Unsupported sirius DECIMAL column type size in `FinalMaterialize`: %zu",
+                                    input_relation.columns[col]->data_wrapper.getColumnTypeSize());
+		}
+		break;
+	}
 	default:
 		throw NotImplementedException("Unsupported sirius column type in `FinalMaterialize`: %d",
 																	static_cast<int>(input_relation.columns[col]->data_wrapper.type.id()));
@@ -181,6 +198,13 @@ LogicalType ColumnTypeToLogicalType(const GPUColumnType& type) {
 			return LogicalType::VARCHAR;
 		case GPUColumnTypeId::INT128:
 			return LogicalType::HUGEINT;
+		case GPUColumnTypeId::DECIMAL: {
+			GPUDecimalTypeInfo* decimal_type_info = type.GetDecimalTypeInfo();
+			if (decimal_type_info == nullptr) {
+					throw InternalException("`decimal_type_info` not set for DECIMAL type in `ColumnTypeToLogicalType`");
+			}
+			return LogicalType::DECIMAL(decimal_type_info->width_, decimal_type_info->scale_);
+		}
 		default:
 			throw NotImplementedException("Unsupported sirius column type in `ColumnTypeToLogicalType`: %d",
 																		static_cast<int>(type.id()));
@@ -203,6 +227,14 @@ Vector rawDataToVector(uint8_t* host_data, size_t vector_offset, const GPUColumn
 			sizeof_type = sizeof(uint8_t); break;
 		case GPUColumnTypeId::INT128:
 			sizeof_type = 2 * sizeof(uint64_t); break;
+		case GPUColumnTypeId::DECIMAL: {
+			GPUDecimalTypeInfo* decimal_type_info = type.GetDecimalTypeInfo();
+			if (decimal_type_info == nullptr) {
+				throw InternalException("`decimal_type_info` not set for DECIMAL type in `rawDataToVector`");
+			}
+			sizeof_type = decimal_type_info->GetDecimalTypeSize();
+			break;
+		}
 		default:
 			throw NotImplementedException("Unsupported sirius column type in `rawDataToVector`: %d",
 																		static_cast<int>(type.id()));

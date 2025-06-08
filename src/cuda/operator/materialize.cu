@@ -60,6 +60,8 @@ template
 __global__ void materialize_expression<double, BLOCK_THREADS, ITEMS_PER_THREAD>(const double *a, double* result, uint64_t *row_ids, uint64_t N);
 template
 __global__ void materialize_expression<uint8_t, BLOCK_THREADS, ITEMS_PER_THREAD>(const uint8_t *a, uint8_t* result, uint64_t *row_ids, uint64_t N);
+template
+__global__ void materialize_expression<int64_t, BLOCK_THREADS, ITEMS_PER_THREAD>(const int64_t *a, int64_t* result, uint64_t *row_ids, uint64_t N);
 
 template <typename T>
 void materializeExpression(T *a, T*& result, uint64_t *row_ids, uint64_t result_len, uint64_t input_len) {
@@ -189,5 +191,7 @@ template
 void materializeExpression<double>(double *a, double*& result, uint64_t *row_ids, uint64_t result_len, uint64_t input_size);
 template
 void materializeExpression<uint8_t>(uint8_t *a, uint8_t*& result, uint64_t *row_ids, uint64_t result_len, uint64_t input_size);
+template
+void materializeExpression<int64_t>(int64_t *a, int64_t*& result, uint64_t *row_ids, uint64_t result_len, uint64_t input_size);
 
 } // namespace duckdb
