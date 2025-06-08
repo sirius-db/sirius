@@ -59,15 +59,16 @@ void ResolveTypeNestedLoopJoin(vector<shared_ptr<GPUColumn>> &left_keys, vector<
 void
 HandleNestedLoopJoin(vector<shared_ptr<GPUColumn>> &left_keys, vector<shared_ptr<GPUColumn>> &right_keys, uint64_t* &count, uint64_t* &row_ids_left, uint64_t* &row_ids_right, 
 		const vector<JoinCondition> &conditions, JoinType join_type, GPUBufferManager* gpuBufferManager) {
-    switch(left_keys[0]->data_wrapper.type) {
-      case ColumnType::INT64:
+    switch(left_keys[0]->data_wrapper.type.id()) {
+      case GPUColumnTypeId::INT64:
 		ResolveTypeNestedLoopJoin<uint64_t>(left_keys, right_keys, count, row_ids_left, row_ids_right, conditions, join_type, gpuBufferManager);
 		break;
-      case ColumnType::FLOAT64:
+      case GPUColumnTypeId::FLOAT64:
 	  	ResolveTypeNestedLoopJoin<double>(left_keys, right_keys, count, row_ids_left, row_ids_right, conditions, join_type, gpuBufferManager);
 		break;
       default:
-        throw NotImplementedException("Unsupported column type");
+        throw NotImplementedException("Unsupported sirius column type in `HandleNestedLoopJoin`: %d",
+																			static_cast<int>(left_keys[0]->data_wrapper.type.id()));
     }
 }
 
@@ -242,10 +243,10 @@ GPUPhysicalNestedLoopJoin::ResolveComplexJoin(GPUIntermediateRelation &input_rel
 	bool all_int64 = true;
 	bool all_float64 = true;
 	for (idx_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
-		if (left_keys[cond_idx]->data_wrapper.type != ColumnType::INT64) {
+		if (left_keys[cond_idx]->data_wrapper.type.id() != GPUColumnTypeId::INT64) {
 			all_int64 = false;
 		}
-		if (left_keys[cond_idx]->data_wrapper.type != ColumnType::FLOAT64) {
+		if (left_keys[cond_idx]->data_wrapper.type.id() != GPUColumnTypeId::FLOAT64) {
 			all_float64 = false;
 		}
 	}
@@ -287,7 +288,7 @@ GPUPhysicalNestedLoopJoin::GetData(GPUIntermediateRelation& output_relation) con
 	if (join_type == JoinType::RIGHT || join_type == JoinType::OUTER) {
 		for (idx_t col = 0; col < left_column_count; col++) {
 			//pretend this to be NUll column from the left table (it should be NULL for the RIGHT join)
-			output_relation.columns[col] = make_shared_ptr<GPUColumn>(0, ColumnType::INT64, nullptr);
+			output_relation.columns[col] = make_shared_ptr<GPUColumn>(0, GPUColumnType(GPUColumnTypeId::INT64), nullptr);
 		}
 	} else {
 		throw InvalidInputException("Get data not supported for this join type");

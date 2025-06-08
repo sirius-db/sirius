@@ -16,6 +16,7 @@ enum ScanDataType {
 	FLOAT32,
 	FLOAT64,
 	BOOLEAN,
+	DATE,
 	VARCHAR
 };
 

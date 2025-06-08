@@ -57,10 +57,12 @@ struct GpuExpressionState
         return cudf::data_type(cudf::type_id::FLOAT64);
       case LogicalTypeId::BOOLEAN:
         return cudf::data_type(cudf::type_id::BOOL8);
+      case LogicalTypeId::DATE:
+        return cudf::data_type(cudf::type_id::TIMESTAMP_DAYS);
       case LogicalTypeId::VARCHAR:
         return cudf::data_type(cudf::type_id::STRING);
       default:
-        throw InvalidInputException("GetCudfType: Unsupported type");
+        throw InvalidInputException("GetCudfType: Unsupported duckdb type: %d", static_cast<int>(logical_type.id()));
     }
   }
 };

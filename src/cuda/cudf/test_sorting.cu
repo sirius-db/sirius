@@ -108,7 +108,7 @@ int main() {
     // //copy the projection columns to a new array
     // GPUColumn** projection_columns = new GPUColumn*[num_projections];
     // for (int projection_idx = 0; projection_idx < num_projections; projection_idx++) {
-    //     if (projection[projection_idx]->data_wrapper.type == ColumnType::VARCHAR) {
+    //     if (projection[projection_idx]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
     //         uint64_t* temp_offset = gpuBufferManager->customCudaMalloc<uint64_t>(projection[projection_idx]->column_length, 0, false);
     //         uint8_t* temp_column = gpuBufferManager->customCudaMalloc<uint8_t>(projection[projection_idx]->data_wrapper.num_bytes, 0, false);
     //         callCudaMemcpyDeviceToDevice<uint64_t>(temp_offset, projection[projection_idx]->data_wrapper.offset, projection[projection_idx]->column_length, 0);

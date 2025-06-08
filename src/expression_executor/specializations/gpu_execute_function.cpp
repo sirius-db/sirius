@@ -7,6 +7,7 @@
 #include "expression_executor/gpu_expression_executor_state.hpp"
 #include "gpu_physical_strings_matching.hpp"
 #include <cudf/binaryop.hpp>
+#include <cudf/datetime.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/strings/contains.hpp>
 #include <cudf/strings/find.hpp>
@@ -34,6 +35,9 @@ namespace sirius
 #define NOT_LIKE_FUNC_STR "!~~"
 #define CONTAINS_FUNC_STR "contains"
 #define PREFIX_FUNC_STR "prefix"
+#define YEAR_FUNC_STR "year"
+#define MONTH_FUNC_STR "month"
+#define DAY_FUNC_STR "day"
 #define ERROR_FUNC_STR "error"
 
 #define SPLIT_DELIMITER "%"
@@ -248,6 +252,28 @@ struct NumericBinaryFunctionDispatcher
   }
 };
 
+//----------DatetimeExtractFunctionDispatcher----------//
+template <cudf::datetime::datetime_component COMP>
+struct DatetimeExtractFunctionDispatcher {
+  // The executor
+  GpuExpressionExecutor& executor;
+
+  // Constructor
+  explicit DatetimeExtractFunctionDispatcher(GpuExpressionExecutor& exec)
+      : executor(exec) {}
+
+  // Dispatch operator
+  std::unique_ptr<cudf::column> operator()(const BoundFunctionExpression& expr,
+                                           GpuExpressionState* state) {
+    D_ASSERT(expr.children.size() == 1);
+    auto input = executor.Execute(*expr.children[0], state->child_states[0].get());
+    return cudf::datetime::extract_datetime_component(input->view(),
+                                                      COMP,
+                                                      cudf::get_default_stream(),
+                                                      executor.resource_ref);
+  }
+};
+
 //----------Execute----------//
 std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundFunctionExpression& expr,
                                                              GpuExpressionState* state)
@@ -340,9 +366,22 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundFunction
     return dispatcher(expr, state);
   }
 
+  //----------Datetime Extract Functions----------//
+  else if (func_str == YEAR_FUNC_STR) {
+    DatetimeExtractFunctionDispatcher<cudf::datetime::datetime_component::YEAR> dispatcher(*this);
+    return dispatcher(expr, state);
+  }
+  else if (func_str == MONTH_FUNC_STR) {
+    DatetimeExtractFunctionDispatcher<cudf::datetime::datetime_component::MONTH> dispatcher(*this);
+    return dispatcher(expr, state);
+  }
+  else if (func_str == DAY_FUNC_STR) {
+    DatetimeExtractFunctionDispatcher<cudf::datetime::datetime_component::DAY> dispatcher(*this);
+    return dispatcher(expr, state);
+  }
+
   // If we've gotten this far, we've encountered a unimplemented function type
-  std::cerr << "UNKNOWN FUNCTION STRING: " << func_str << "\n";
-  throw InternalException("Execute[Function]: Unknown function type!");
+  throw InternalException("Execute[Function]: Unknown function type: %s", func_str);
 }
 
 } // namespace sirius

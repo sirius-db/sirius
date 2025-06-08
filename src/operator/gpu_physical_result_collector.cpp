@@ -115,7 +115,7 @@ GPUPhysicalMaterializedCollector::FinalMaterializeString(GPUIntermediateRelation
 
 		materializeString(data, offset, result, result_offset, row_ids, new_num_bytes, num_rows, input_relation.columns[col]->column_length, input_relation.columns[col]->data_wrapper.num_bytes);
 
-		output_relation.columns[col] = make_shared_ptr<GPUColumn>(num_rows, ColumnType::VARCHAR, reinterpret_cast<uint8_t*>(result), result_offset, new_num_bytes[0], true);
+		output_relation.columns[col] = make_shared_ptr<GPUColumn>(num_rows, GPUColumnType(GPUColumnTypeId::VARCHAR), reinterpret_cast<uint8_t*>(result), result_offset, new_num_bytes[0], true);
 		output_relation.columns[col]->row_id_count = 0;
 		output_relation.columns[col]->row_ids = nullptr;
 		output_relation.columns[col]->is_unique = input_relation.columns[col]->is_unique;
@@ -129,76 +129,83 @@ size_t
 GPUPhysicalMaterializedCollector::FinalMaterialize(GPUIntermediateRelation input_relation, GPUIntermediateRelation &output_relation, size_t col) const {
 	size_t size_bytes;
 	
-	switch (input_relation.columns[col]->data_wrapper.type) {
-	case ColumnType::INT64:
+	switch (input_relation.columns[col]->data_wrapper.type.id()) {
+	case GPUColumnTypeId::INT64:
 		FinalMaterializeInternal<uint64_t>(input_relation, output_relation, col);
 		size_bytes = output_relation.columns[col]->column_length * sizeof(uint64_t);
 		break;
-	case ColumnType::INT32:
+	case GPUColumnTypeId::INT32:
+	case GPUColumnTypeId::DATE:
 		FinalMaterializeInternal<int>(input_relation, output_relation, col);
 		size_bytes = output_relation.columns[col]->column_length * sizeof(int);
 		break;
-	case ColumnType::FLOAT64:
+	case GPUColumnTypeId::FLOAT64:
 		FinalMaterializeInternal<double>(input_relation, output_relation, col);
 		size_bytes = output_relation.columns[col]->column_length * sizeof(double);
 		break;
-	case ColumnType::FLOAT32:
+	case GPUColumnTypeId::FLOAT32:
 		FinalMaterializeInternal<float>(input_relation, output_relation, col);
 		size_bytes = output_relation.columns[col]->column_length * sizeof(float);
 		break;
-	case ColumnType::BOOLEAN:
+	case GPUColumnTypeId::BOOLEAN:
 		FinalMaterializeInternal<uint8_t>(input_relation, output_relation, col);
 		size_bytes = output_relation.columns[col]->column_length * sizeof(uint8_t);
 		break;
-	case ColumnType::VARCHAR:
+	case GPUColumnTypeId::VARCHAR:
 		FinalMaterializeString(input_relation, output_relation, col);
 		break;
 	default:
-		throw NotImplementedException("Unsupported column type");
+		throw NotImplementedException("Unsupported sirius column type in `FinalMaterialize`: %d",
+																	static_cast<int>(input_relation.columns[col]->data_wrapper.type.id()));
 	}
 	// output_relation.length = output_relation.columns[col]->column_length;
 	// SIRIUS_LOG_DEBUG("Final materialize size {} bytes", size_bytes);
 	return size_bytes;
 }
 
-LogicalType ColumnTypeToLogicalType(ColumnType type) {
-	switch (type) {
-		case ColumnType::INT32:
+LogicalType ColumnTypeToLogicalType(const GPUColumnType& type) {
+	switch (type.id()) {
+		case GPUColumnTypeId::INT32:
 			return LogicalType::INTEGER;
-		case ColumnType::INT64:
+		case GPUColumnTypeId::INT64:
 			return LogicalType::BIGINT;
-		case ColumnType::FLOAT32:
+		case GPUColumnTypeId::FLOAT32:
 			return LogicalType::FLOAT;
-		case ColumnType::FLOAT64:
+		case GPUColumnTypeId::FLOAT64:
 			return LogicalType::DOUBLE;
-		case ColumnType::BOOLEAN:
+		case GPUColumnTypeId::BOOLEAN:
 			return LogicalType::BOOLEAN;
-		case ColumnType::VARCHAR:
+		case GPUColumnTypeId::DATE:
+			return LogicalType::DATE;
+		case GPUColumnTypeId::VARCHAR:
 			return LogicalType::VARCHAR;
-		case ColumnType::INT128:
+		case GPUColumnTypeId::INT128:
 			return LogicalType::HUGEINT;
 		default:
-			throw NotImplementedException("Unsupported column type");
+			throw NotImplementedException("Unsupported sirius column type in `ColumnTypeToLogicalType`: %d",
+																		static_cast<int>(type.id()));
 	}
 }
 
-Vector rawDataToVector(uint8_t* host_data, size_t vector_offset, ColumnType type) {
+Vector rawDataToVector(uint8_t* host_data, size_t vector_offset, const GPUColumnType& type) {
 	size_t sizeof_type;
-	switch (type) {
-		case ColumnType::INT32:
+	switch (type.id()) {
+		case GPUColumnTypeId::INT32:
+		case GPUColumnTypeId::DATE:
 			sizeof_type = sizeof(int); break;
-		case ColumnType::INT64:
+		case GPUColumnTypeId::INT64:
 			sizeof_type = sizeof(uint64_t); break;
-		case ColumnType::FLOAT32:
+		case GPUColumnTypeId::FLOAT32:
 			sizeof_type = sizeof(float); break;
-		case ColumnType::FLOAT64:
+		case GPUColumnTypeId::FLOAT64:
 			sizeof_type = sizeof(double); break;
-		case ColumnType::BOOLEAN:
+		case GPUColumnTypeId::BOOLEAN:
 			sizeof_type = sizeof(uint8_t); break;
-		case ColumnType::INT128:
+		case GPUColumnTypeId::INT128:
 			sizeof_type = 2 * sizeof(uint64_t); break;
 		default:
-			throw NotImplementedException("Unsupported column type");
+			throw NotImplementedException("Unsupported sirius column type in `rawDataToVector`: %d",
+																		static_cast<int>(type.id()));
 	}
 	uint8_t* data = host_data + vector_offset * STANDARD_VECTOR_SIZE * sizeof_type;
 	return Vector(ColumnTypeToLogicalType(type), data);
@@ -221,7 +228,7 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 	size_t all_columns_total_chars = 0;
 	for (int col = 0; col < input_relation.columns.size(); col++) {
 		DataWrapper column_data_wrapper = input_relation.columns[col]->data_wrapper;
-		if(column_data_wrapper.type == ColumnType::VARCHAR) {
+		if(column_data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
 			all_columns_num_strings += column_data_wrapper.size;
 			all_columns_total_chars += column_data_wrapper.num_bytes;
 		}
@@ -251,17 +258,17 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 		// Final materialization
 		size_bytes = FinalMaterialize(input_relation, materialized_relation, col);
 
-		ColumnType col_type = input_relation.columns[col]->data_wrapper.type;
+		const GPUColumnType& col_type = input_relation.columns[col]->data_wrapper.type;
 		bool is_string = false;
-		if(col_type != ColumnType::VARCHAR) {
+		if(col_type.id() != GPUColumnTypeId::VARCHAR) {
 			if (types[col].InternalType() == PhysicalType::INT128) {
-				if (materialized_relation.columns[col]->data_wrapper.type == ColumnType::INT64) {
+				if (materialized_relation.columns[col]->data_wrapper.type.id() == GPUColumnTypeId::INT64) {
 					SIRIUS_LOG_DEBUG("Converting INT64 to INT128 for column {}", col);
 					uint8_t* temp_int128 = gpuBufferManager->customCudaMalloc<uint8_t>(size_bytes * 2, 0, 0);
 					convertInt64ToInt128(materialized_relation.columns[col]->data_wrapper.data, temp_int128, materialized_relation.columns[col]->column_length);
 					host_data[col] = gpuBufferManager->customCudaHostAlloc<uint8_t>(size_bytes * 2);
 					callCudaMemcpyDeviceToHost<uint8_t>(host_data[col], temp_int128, size_bytes * 2, 0);
-				} else if (materialized_relation.columns[col]->data_wrapper.type == ColumnType::INT32) {
+				} else if (materialized_relation.columns[col]->data_wrapper.type.id() == GPUColumnTypeId::INT32) {
 					SIRIUS_LOG_DEBUG("Converting INT32 to INT128 for column {}", col);
 					uint8_t* temp_int128 = gpuBufferManager->customCudaMalloc<uint8_t>(size_bytes * 4, 0, 0);
 					convertInt32ToInt128(materialized_relation.columns[col]->data_wrapper.data, temp_int128, materialized_relation.columns[col]->column_length);
@@ -305,9 +312,9 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 		DataChunk chunk;
 		chunk.InitializeEmpty(types);
 		for (int col = 0; col < materialized_relation.columns.size(); col++) {
-			if(materialized_relation.columns[col]->data_wrapper.type != ColumnType::VARCHAR) {
+			if(materialized_relation.columns[col]->data_wrapper.type.id() != GPUColumnTypeId::VARCHAR) {
 				if (types[col].InternalType() == PhysicalType::INT128) {
-					Vector vector = rawDataToVector(host_data[col], vec, ColumnType::INT128);
+					Vector vector = rawDataToVector(host_data[col], vec, GPUColumnType(GPUColumnTypeId::INT128));
 					chunk.data[col].Reference(vector);
 				} else {
 					Vector vector = rawDataToVector(host_data[col], vec, materialized_relation.columns[col]->data_wrapper.type);
