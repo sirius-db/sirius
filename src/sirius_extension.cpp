@@ -51,7 +51,7 @@ struct GPUCachingFunctionData : public TableFunctionData {
 	GPUCachingFunctionData() = default;
 	unique_ptr<Connection> conn;
 	GPUBufferManager *gpuBufferManager;
-	ColumnType type;
+	GPUColumnType type;
 	uint8_t *data;
 	string column;
 	string table;

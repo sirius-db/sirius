@@ -100,25 +100,25 @@ void ResolveStringExpression(shared_ptr<GPUColumn> string_column, uint64_t* &cou
 }
 
 void HandleComparisonConstantExpression(shared_ptr<GPUColumn> column, uint64_t* &count, uint64_t* &row_ids, ConstantFilter filter_constant, ExpressionType expression_type) {
-    switch(column->data_wrapper.type) {
-      case ColumnType::INT32:
+    switch(column->data_wrapper.type.id()) {
+      case GPUColumnTypeId::INT32:
         ResolveTypeComparisonConstantExpression<int>(column, count, row_ids, filter_constant, expression_type);
         break;
-      case ColumnType::INT64:
+      case GPUColumnTypeId::INT64:
         ResolveTypeComparisonConstantExpression<uint64_t>(column, count, row_ids, filter_constant, expression_type);
         break;
-      case ColumnType::FLOAT32:
+      case GPUColumnTypeId::FLOAT32:
         ResolveTypeComparisonConstantExpression<float>(column, count, row_ids, filter_constant, expression_type);
         break;
-      case ColumnType::FLOAT64:
+      case GPUColumnTypeId::FLOAT64:
         ResolveTypeComparisonConstantExpression<double>(column, count, row_ids, filter_constant, expression_type);
         break;
-      case ColumnType::VARCHAR:
+      case GPUColumnTypeId::VARCHAR:
         ResolveStringExpression(column, count, row_ids, filter_constant, expression_type);
         break;
       default:
         throw NotImplementedException("Unsupported sirius column type in `HandleComparisonConstantExpression`: %d",
-                                      static_cast<int>(column->data_wrapper.type));
+                                      static_cast<int>(column->data_wrapper.type.id()));
     }
 }
 
@@ -160,25 +160,25 @@ void ResolveStringBetweenExpression(shared_ptr<GPUColumn> string_column, uint64_
 }
 
 void HandleBetweenExpression(shared_ptr<GPUColumn> column, uint64_t* &count, uint64_t* &row_ids, ConstantFilter filter_constant1, ConstantFilter filter_constant2) {
-    switch(column->data_wrapper.type) {
-      case ColumnType::INT32:
+    switch(column->data_wrapper.type.id()) {
+      case GPUColumnTypeId::INT32:
         ResolveTypeBetweenExpression<int>(column, count, row_ids, filter_constant1, filter_constant2);
         break;
-      case ColumnType::INT64:
+      case GPUColumnTypeId::INT64:
         ResolveTypeBetweenExpression<uint64_t>(column, count, row_ids, filter_constant1, filter_constant2);
         break;
-      case ColumnType::FLOAT32:
+      case GPUColumnTypeId::FLOAT32:
         ResolveTypeBetweenExpression<float>(column, count, row_ids, filter_constant1, filter_constant2);
         break;
-      case ColumnType::FLOAT64:
+      case GPUColumnTypeId::FLOAT64:
         ResolveTypeBetweenExpression<double>(column, count, row_ids, filter_constant1, filter_constant2);
         break;
-      case ColumnType::VARCHAR:
+      case GPUColumnTypeId::VARCHAR:
         ResolveStringBetweenExpression(column, count, row_ids, filter_constant1, filter_constant2);
         break;
       default:
         throw NotImplementedException("Unsupported sirius column type in `HandleBetweenExpression`: %d",
-                                      static_cast<int>(column->data_wrapper.type));
+                                      static_cast<int>(column->data_wrapper.type.id()));
     }
 }
 
@@ -223,29 +223,29 @@ shared_ptr<GPUColumn> ResolveStringMateralizeExpression(shared_ptr<GPUColumn> co
     new_num_bytes[0] = column->data_wrapper.num_bytes;
   }
   //HERE
-  shared_ptr<GPUColumn> result_column = make_shared_ptr<GPUColumn>(num_rows, ColumnType::VARCHAR, reinterpret_cast<uint8_t*>(result), result_offset, new_num_bytes[0], true);
+  shared_ptr<GPUColumn> result_column = make_shared_ptr<GPUColumn>(num_rows, GPUColumnType(GPUColumnTypeId::VARCHAR), reinterpret_cast<uint8_t*>(result), result_offset, new_num_bytes[0], true);
   result_column->is_unique = column->is_unique;
   return result_column;
 }
 
 shared_ptr<GPUColumn> 
 HandleMaterializeExpression(shared_ptr<GPUColumn> column, GPUBufferManager* gpuBufferManager) {
-    switch(column->data_wrapper.type) {
-        case ColumnType::INT32:
+    switch(column->data_wrapper.type.id()) {
+        case GPUColumnTypeId::INT32:
             return ResolveTypeMaterializeExpression<int>(column, gpuBufferManager);
-        case ColumnType::INT64:
+        case GPUColumnTypeId::INT64:
             return ResolveTypeMaterializeExpression<uint64_t>(column, gpuBufferManager);
-        case ColumnType::FLOAT32:
+        case GPUColumnTypeId::FLOAT32:
             return ResolveTypeMaterializeExpression<float>(column, gpuBufferManager);
-        case ColumnType::FLOAT64:
+        case GPUColumnTypeId::FLOAT64:
             return ResolveTypeMaterializeExpression<double>(column, gpuBufferManager);
-        case ColumnType::BOOLEAN:
+        case GPUColumnTypeId::BOOLEAN:
             return ResolveTypeMaterializeExpression<uint8_t>(column, gpuBufferManager);
-        case ColumnType::VARCHAR:
+        case GPUColumnTypeId::VARCHAR:
             return ResolveStringMateralizeExpression(column, gpuBufferManager);
         default:
             throw NotImplementedException("Unsupported sirius column type in `HandleMaterializeExpression`: %d",
-                                          static_cast<int>(column->data_wrapper.type));
+                                          static_cast<int>(column->data_wrapper.type.id()));
     }
 }
 
@@ -284,35 +284,35 @@ void HandleArbitraryConstantExpression(vector<shared_ptr<GPUColumn>> &column, ui
       }
     }
 
-    switch(column[expr]->data_wrapper.type) {
-      case ColumnType::INT32: {
+    switch(column[expr]->data_wrapper.type.id()) {
+      case GPUColumnTypeId::INT32: {
         total_bytes += sizeof(int);
         data_type[expr] = INT32;
         break;
-      } case ColumnType::INT64: {
+      } case GPUColumnTypeId::INT64: {
         total_bytes += sizeof(uint64_t);
         data_type[expr] = INT64;
         break;
-      } case ColumnType::FLOAT32: {
+      } case GPUColumnTypeId::FLOAT32: {
         total_bytes += sizeof(float);
         data_type[expr] = FLOAT32;
         break;
-      } case ColumnType::FLOAT64: {
+      } case GPUColumnTypeId::FLOAT64: {
         total_bytes += sizeof(double);
         data_type[expr] = FLOAT64;
         break;
-      } case ColumnType::DATE: {
+      } case GPUColumnTypeId::DATE: {
         total_bytes += sizeof(int);
         data_type[expr] = DATE;
         break;
-      } case ColumnType::VARCHAR: {
+      } case GPUColumnTypeId::VARCHAR: {
         std::string lower_string = filter_constant[expr]->constant.ToString();
         total_bytes += lower_string.size();
         data_type[expr] = VARCHAR;
         break;
       } default: {
         throw NotImplementedException("Unsupported sirius column type in `HandleArbitraryConstantExpression`: %d",
-                                      static_cast<int>(column[expr]->data_wrapper.type));
+                                      static_cast<int>(column[expr]->data_wrapper.type.id()));
       }
     }
   }
@@ -324,33 +324,33 @@ void HandleArbitraryConstantExpression(vector<shared_ptr<GPUColumn>> &column, ui
     col[expr] = column[expr]->data_wrapper.data;
     offset[expr] = column[expr]->data_wrapper.offset;
 
-    switch(column[expr]->data_wrapper.type) {
-      case ColumnType::INT32:
-      case ColumnType::DATE: {
+    switch(column[expr]->data_wrapper.type.id()) {
+      case GPUColumnTypeId::INT32:
+      case GPUColumnTypeId::DATE: {
         int temp = filter_constant[expr]->constant.GetValue<int>();
         memcpy(constant_compare + init_offset, &temp, sizeof(int));
         constant_offset[expr] = init_offset;
         init_offset += sizeof(int);
         break;
-      } case ColumnType::INT64: {
+      } case GPUColumnTypeId::INT64: {
         uint64_t temp = filter_constant[expr]->constant.GetValue<uint64_t>();
         memcpy(constant_compare + init_offset, &temp, sizeof(uint64_t));
         constant_offset[expr] = init_offset;
         init_offset += sizeof(uint64_t);
         break;
-      } case ColumnType::FLOAT32: {
+      } case GPUColumnTypeId::FLOAT32: {
         float temp = filter_constant[expr]->constant.GetValue<float>();
         memcpy(constant_compare + init_offset, &temp, sizeof(float));
         constant_offset[expr] = init_offset;
         init_offset += sizeof(float);
         break;
-      } case ColumnType::FLOAT64: {
+      } case GPUColumnTypeId::FLOAT64: {
         double temp = filter_constant[expr]->constant.GetValue<double>();
         memcpy(constant_compare + init_offset, &temp, sizeof(double));
         constant_offset[expr] = init_offset;
         init_offset += sizeof(double);
         break;
-      } case ColumnType::VARCHAR: {
+      } case GPUColumnTypeId::VARCHAR: {
         std::string lower_string = filter_constant[expr]->constant.ToString();
         memcpy(constant_compare + init_offset, lower_string.data(), lower_string.size());
         constant_offset[expr] = init_offset;
@@ -358,7 +358,7 @@ void HandleArbitraryConstantExpression(vector<shared_ptr<GPUColumn>> &column, ui
         break;
       } default: {
         throw NotImplementedException("Unsupported sirius column type in `HandleArbitraryConstantExpression`: %d",
-                                      column[expr]->data_wrapper.type);
+                                      column[expr]->data_wrapper.type.id());
       }
     }
   }
@@ -610,7 +610,7 @@ GPUPhysicalTableScan::ScanDataDuckDB(GPUBufferManager* gpuBufferManager, string 
                 throw InvalidInputException("Column not found");
             }
             int column_idx = column_it - gpuBufferManager->tables[up_table_name]->column_names.begin();
-            ColumnType column_type = convertLogicalTypeToColumnType(scanned_types[col]);
+            GPUColumnType column_type = convertLogicalTypeToColumnType(scanned_types[col]);
             gpuBufferManager->tables[up_table_name]->columns[column_idx]->column_length = collection->Count();
             if (scanned_types[col] == LogicalType::VARCHAR) {
               gpuBufferManager->tables[up_table_name]->columns[column_idx]->data_wrapper = DataWrapper(column_type, d_ptr[col], d_offset_ptr[col], collection->Count(), column_size[col], true);

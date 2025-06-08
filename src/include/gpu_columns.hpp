@@ -15,8 +15,9 @@ template <typename T> void callCudaMemcpyHostToDevice(T* dest, T* src, size_t si
 template <typename T> void callCudaMemcpyDeviceToHost(T* dest, T* src, size_t size, int gpu);
 template <typename T> void callCudaMemcpyDeviceToDevice(T* dest, T* src, size_t size, int gpu);
 
-enum class ColumnType {
-    INT32 = 0,
+enum class GPUColumnTypeId {
+    INVALID = 0,
+    INT32,
     INT64,
     FLOAT32,
     FLOAT64,
@@ -26,44 +27,48 @@ enum class ColumnType {
     INT128
 };
 
-inline ColumnType convertLogicalTypeToColumnType(LogicalType type) {
-    ColumnType column_type;
+struct GPUColumnType {
+public:
+    GPUColumnType() : id_(GPUColumnTypeId::INVALID) {}
+    explicit GPUColumnType(GPUColumnTypeId id) : id_(id) {}
+    ~GPUColumnType() = default;
+
+    inline GPUColumnTypeId id() const {
+        return id_;
+    }
+
+private:
+    GPUColumnTypeId id_;
+};
+
+inline GPUColumnType convertLogicalTypeToColumnType(LogicalType type) {
     switch (type.id()) {
         case LogicalTypeId::INTEGER:
-            column_type = ColumnType::INT32;
-            break;
+            return GPUColumnType(GPUColumnTypeId::INT32);
         case LogicalTypeId::BIGINT:
-            column_type = ColumnType::INT64;
-            break;
+            return GPUColumnType(GPUColumnTypeId::INT64);
         case LogicalTypeId::FLOAT:
-            column_type = ColumnType::FLOAT32;
-            break;
+            return GPUColumnType(GPUColumnTypeId::FLOAT32);
         case LogicalTypeId::DOUBLE:
-            column_type = ColumnType::FLOAT64;
-            break;
+            return GPUColumnType(GPUColumnTypeId::FLOAT64);
         case LogicalTypeId::BOOLEAN:
-            column_type = ColumnType::BOOLEAN;
-            break;
+            return GPUColumnType(GPUColumnTypeId::BOOLEAN);
         case LogicalTypeId::DATE:
-            column_type = ColumnType::DATE;
-            break;
+            return GPUColumnType(GPUColumnTypeId::DATE);
         case LogicalTypeId::VARCHAR:
-            column_type = ColumnType::VARCHAR;
-            break;
+            return GPUColumnType(GPUColumnTypeId::VARCHAR);
         default:
             throw InvalidInputException("Unsupported duckdb column type in `convertLogicalTypeToColumnType`: %d",
                                         static_cast<int>(type.id()));
-            break;
     }
-    return column_type;
 }
 
 class DataWrapper {
 public:
     DataWrapper() = default; // Add default constructor
-    DataWrapper(ColumnType type, uint8_t* data, size_t size);
-    DataWrapper(ColumnType type, uint8_t* data, uint64_t* offset, size_t size, size_t num_bytes, bool is_string_data);
-	ColumnType type;
+    DataWrapper(GPUColumnType type, uint8_t* data, size_t size);
+    DataWrapper(GPUColumnType type, uint8_t* data, uint64_t* offset, size_t size, size_t num_bytes, bool is_string_data);
+	GPUColumnType type;
 	uint8_t* data;
     size_t size; // number of rows in the column (currently equals to column_length)
     uint64_t* offset{nullptr};
@@ -74,8 +79,8 @@ public:
 
 class GPUColumn {
 public:
-    GPUColumn(size_t column_length, ColumnType type, uint8_t* data);
-    GPUColumn(size_t _column_length, ColumnType type, uint8_t* data, uint64_t* offset, size_t num_bytes, bool is_string_data);
+    GPUColumn(size_t column_length, GPUColumnType type, uint8_t* data);
+    GPUColumn(size_t _column_length, GPUColumnType type, uint8_t* data, uint64_t* offset, size_t num_bytes, bool is_string_data);
     GPUColumn(GPUColumn& other);
     ~GPUColumn(){};
     int* GetDataInt32();

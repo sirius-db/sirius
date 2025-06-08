@@ -84,7 +84,7 @@ SinkResultType GPUPhysicalTopN::Sink(GPUIntermediateRelation& input_relation) co
   
 	for (int col = 0; col < types.size(); col++) {
 		// if types is VARCHAR, check the number of bytes
-		if (projection_columns[col]->data_wrapper.type == ColumnType::VARCHAR) {
+		if (projection_columns[col]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
 			if (projection_columns[col]->data_wrapper.num_bytes > INT32_MAX) {
 				throw NotImplementedException("String column size greater than INT32_MAX is not supported");
 			}
@@ -165,7 +165,7 @@ SourceResultType GPUPhysicalTopN::GetData(GPUIntermediateRelation& output_relati
     	output_relation.columns[col] = make_shared_ptr<GPUColumn>(limit_const, sort_result->columns[col]->data_wrapper.type, sort_result->columns[col]->data_wrapper.data,
                           sort_result->columns[col]->data_wrapper.offset, sort_result->columns[col]->data_wrapper.num_bytes, sort_result->columns[col]->data_wrapper.is_string_data);
     	output_relation.columns[col]->is_unique = sort_result->columns[col]->is_unique;
-		if (limit_const > 0 && output_relation.columns[col]->data_wrapper.type == ColumnType::VARCHAR) {
+		if (limit_const > 0 && output_relation.columns[col]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
 			Allocator& allocator = Allocator::DefaultAllocator();
 			uint64_t* new_num_bytes = reinterpret_cast<uint64_t*>(allocator.AllocateData(sizeof(uint64_t)));
 			callCudaMemcpyDeviceToHost<uint64_t>(new_num_bytes, sort_result->columns[col]->data_wrapper.offset + limit_const, 1, 0);

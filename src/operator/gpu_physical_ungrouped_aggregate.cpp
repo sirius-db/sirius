@@ -30,7 +30,7 @@ ResolveTypeAggregateExpression(vector<shared_ptr<GPUColumn>> &aggregate_keys, GP
 			agg_mode[agg_idx] = 0;
 			aggregate_data[agg_idx] = (aggregate_keys[agg_idx]->data_wrapper.data);
 		} else if (expr.function.name.compare("avg") == 0) {
-			if (aggregate_keys[agg_idx]->data_wrapper.type != ColumnType::FLOAT64) throw NotImplementedException("Column type is supposed to be double");
+			if (aggregate_keys[agg_idx]->data_wrapper.type.id() != GPUColumnTypeId::FLOAT64) throw NotImplementedException("Column type is supposed to be double");
 			agg_mode[agg_idx] = 1;
 			aggregate_data[agg_idx] = (aggregate_keys[agg_idx]->data_wrapper.data);
 		} else if (expr.function.name.compare("max") == 0) {
@@ -58,9 +58,9 @@ ResolveTypeAggregateExpression(vector<shared_ptr<GPUColumn>> &aggregate_keys, GP
 	for (int agg_idx = 0; agg_idx < aggregates.size(); agg_idx++) {
 		auto& expr = aggregates[agg_idx]->Cast<BoundAggregateExpression>();
 		if (expr.function.name.compare("count_star") == 0 || expr.function.name.compare("count") == 0) {
-			aggregate_keys[agg_idx] = make_shared_ptr<GPUColumn>(1, ColumnType::INT64, reinterpret_cast<uint8_t*>(result[agg_idx]));
+			aggregate_keys[agg_idx] = make_shared_ptr<GPUColumn>(1, GPUColumnType(GPUColumnTypeId::INT64), reinterpret_cast<uint8_t*>(result[agg_idx]));
 		} else if (size == 0){
-			aggregate_keys[agg_idx] = make_shared_ptr<GPUColumn>(0, ColumnType::INT64, reinterpret_cast<uint8_t*>(result[agg_idx]));
+			aggregate_keys[agg_idx] = make_shared_ptr<GPUColumn>(0, GPUColumnType(GPUColumnTypeId::INT64), reinterpret_cast<uint8_t*>(result[agg_idx]));
 		} else { 
 			aggregate_keys[agg_idx] = make_shared_ptr<GPUColumn>(1, aggregate_keys[agg_idx]->data_wrapper.type, reinterpret_cast<uint8_t*>(result[agg_idx]));
 		}
@@ -71,7 +71,7 @@ void
 HandleAggregateExpression(vector<shared_ptr<GPUColumn>> &aggregate_keys, GPUBufferManager* gpuBufferManager, const vector<unique_ptr<Expression>> &aggregates) {
 	//check if all the aggregate functions are of the same type
 	bool same_type = true;
-	ColumnType prev_type;
+	GPUColumnType prev_type;
 	for (int i = 0; i < aggregates.size(); i++) {
 		if (aggregates[i]->Cast<BoundAggregateExpression>().function.name.compare("count") != 0 && 
 					aggregates[i]->Cast<BoundAggregateExpression>().function.name.compare("count_star") != 0) {
@@ -82,24 +82,24 @@ HandleAggregateExpression(vector<shared_ptr<GPUColumn>> &aggregate_keys, GPUBuff
 	for (int i = 0; i < aggregates.size(); i++) {
 		if (aggregates[i]->Cast<BoundAggregateExpression>().function.name.compare("count") != 0 && 
 					aggregates[i]->Cast<BoundAggregateExpression>().function.name.compare("count_star") != 0) {
-			ColumnType aggregate_type = aggregate_keys[i]->data_wrapper.type;
-			if (aggregate_type != prev_type) {
+			const GPUColumnType& aggregate_type = aggregate_keys[i]->data_wrapper.type;
+			if (aggregate_type.id() != prev_type.id()) {
 				throw NotImplementedException("All aggregate functions must be of the same type");
 			}
 			prev_type = aggregate_type;
 		}
 	}
 
-    switch(aggregate_keys[0]->data_wrapper.type) {
-      case ColumnType::INT64:
+    switch(aggregate_keys[0]->data_wrapper.type.id()) {
+      case GPUColumnTypeId::INT64:
 		ResolveTypeAggregateExpression<uint64_t>(aggregate_keys, gpuBufferManager, aggregates);
 		break;
-      case ColumnType::FLOAT64:
+      case GPUColumnTypeId::FLOAT64:
 	  	ResolveTypeAggregateExpression<double>(aggregate_keys, gpuBufferManager, aggregates);
 		break;
       default:
         throw NotImplementedException("Unsupported sirius column type in `HandleAggregateExpression`: %d",
-																			static_cast<int>(aggregate_keys[0]->data_wrapper.type));
+																			static_cast<int>(aggregate_keys[0]->data_wrapper.type.id()));
     }
 }
 
@@ -222,14 +222,14 @@ GPUPhysicalUngroupedAggregate::Sink(GPUIntermediateRelation &input_relation) con
 		//here we probably have count(*) or sum(*) or something like that
 		if (aggregate.children.size() == 0) {
 			SIRIUS_LOG_DEBUG("Passing * aggregate to index {} in aggregation result", aggr_idx);
-			aggregate_column[aggr_idx] = make_shared_ptr<GPUColumn>(column_size, ColumnType::INT64, nullptr);
+			aggregate_column[aggr_idx] = make_shared_ptr<GPUColumn>(column_size, GPUColumnType(GPUColumnTypeId::INT64), nullptr);
 		}
 	}
 
 	bool string_cudf_supported = true;
 	for (int col = 0; col < aggregates.size(); col++) {
 		// if types is VARCHAR, check the number of bytes
-		if (aggregate_column[col]->data_wrapper.type == ColumnType::VARCHAR) {
+		if (aggregate_column[col]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
 			throw NotImplementedException("String column not supported");
 		}
 	}
