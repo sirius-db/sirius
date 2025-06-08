@@ -29,7 +29,7 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundReferenc
     // DispatchMaterialize will handle byte overflow from the materialized offsets
     return GpuDispatcher::DispatchMaterialize(input_column.get(), resource_ref);
   }
-  if (input_column->data_wrapper.type == ColumnType::VARCHAR &&
+  if (input_column->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR &&
       input_column->data_wrapper.num_bytes > INT32_MAX)
   {
     throw NotImplementedException(

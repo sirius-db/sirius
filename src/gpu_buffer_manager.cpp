@@ -290,7 +290,7 @@ GPUBufferManager::copyDataFromcuDFColumn(cudf::column_view& column, int gpu) {
         uint8_t* temp_column = customCudaMalloc<uint8_t>(temp_num_bytes, 0, false);
         callCudaMemcpyDeviceToDevice<uint8_t>(temp_column, data, temp_num_bytes, 0);
 
-        shared_ptr<GPUColumn> column_ptr = make_shared_ptr<GPUColumn>(column.size(), ColumnType::VARCHAR, temp_column);
+        shared_ptr<GPUColumn> column_ptr = make_shared_ptr<GPUColumn>(column.size(), GPUColumnType(GPUColumnTypeId::VARCHAR), temp_column);
         column_ptr->convertCudfOffsetToSiriusOffset(temp_offset);
         column_ptr->data_wrapper.num_bytes = temp_num_bytes;
         column_ptr->data_wrapper.is_string_data = true;
@@ -298,23 +298,23 @@ GPUBufferManager::copyDataFromcuDFColumn(cudf::column_view& column, int gpu) {
     } else if (column.type() == cudf::data_type(cudf::type_id::UINT64)) {
         uint8_t* temp_column = customCudaMalloc<uint8_t>(column.size() * sizeof(uint64_t), 0, false);
         callCudaMemcpyDeviceToDevice<uint8_t>(temp_column, data, column.size() * sizeof(uint64_t), 0);
-        return make_shared_ptr<GPUColumn>(column.size(), ColumnType::INT64, temp_column);
+        return make_shared_ptr<GPUColumn>(column.size(), GPUColumnType(GPUColumnTypeId::INT64), temp_column);
     } else if (column.type() == cudf::data_type(cudf::type_id::INT32)) {
         uint8_t* temp_column = customCudaMalloc<uint8_t>(column.size() * sizeof(int32_t), 0, false);
         callCudaMemcpyDeviceToDevice<uint8_t>(temp_column, data, column.size() * sizeof(int32_t), 0);
-        return make_shared_ptr<GPUColumn>(column.size(), ColumnType::INT32, temp_column);
+        return make_shared_ptr<GPUColumn>(column.size(), GPUColumnType(GPUColumnTypeId::INT32), temp_column);
     } else if (column.type() == cudf::data_type(cudf::type_id::FLOAT32)) {
         uint8_t* temp_column = customCudaMalloc<uint8_t>(column.size() * sizeof(float), 0, false);
         callCudaMemcpyDeviceToDevice<uint8_t>(temp_column, data, column.size() * sizeof(float), 0);
-        return make_shared_ptr<GPUColumn>(column.size(), ColumnType::FLOAT32, temp_column);
+        return make_shared_ptr<GPUColumn>(column.size(), GPUColumnType(GPUColumnTypeId::FLOAT32), temp_column);
     } else if (column.type() == cudf::data_type(cudf::type_id::FLOAT64)) {
         uint8_t* temp_column = customCudaMalloc<uint8_t>(column.size() * sizeof(double), 0, false);
         callCudaMemcpyDeviceToDevice<uint8_t>(temp_column, data, column.size() * sizeof(double), 0);
-        return make_shared_ptr<GPUColumn>(column.size(), ColumnType::FLOAT64, temp_column);
+        return make_shared_ptr<GPUColumn>(column.size(), GPUColumnType(GPUColumnTypeId::FLOAT64), temp_column);
     } else if (column.type() == cudf::data_type(cudf::type_id::BOOL8)) {
         uint8_t* temp_column = customCudaMalloc<uint8_t>(column.size() * sizeof(bool), 0, false);
         callCudaMemcpyDeviceToDevice<uint8_t>(temp_column, data, column.size() * sizeof(bool), 0);
-        return make_shared_ptr<GPUColumn>(column.size(), ColumnType::BOOLEAN, temp_column);
+        return make_shared_ptr<GPUColumn>(column.size(), GPUColumnType(GPUColumnTypeId::BOOLEAN), temp_column);
     }
     throw duckdb::InternalException("Unsupported cuDF column: {}", static_cast<int>(column.type().id()));
 }
@@ -381,7 +381,7 @@ DataWrapper GPUBufferManager::allocateStringChunk(DataChunk &input_chunk, size_t
     }
 
     DataWrapper result;
-    result.type = ColumnType::VARCHAR;
+    result.type = GPUColumnType(GPUColumnTypeId::VARCHAR);
     // SIRIUS_LOG_DEBUG("chunk size {}", chunk_size);
     result.size = prev_data.size + chunk_size;
 
@@ -431,7 +431,7 @@ GPUBufferManager::allocateChunk(DataChunk &input){
 	size_t chunk_size = input.size();
 	LogicalType vector_type = input.data[0].GetType();
     uint8_t* ptr = nullptr;
-    ColumnType column_type;
+    GPUColumnType column_type;
 
     //the allocation below is assuming its contiguous with prev_data
     switch (vector_type.id()) {
@@ -439,35 +439,35 @@ GPUBufferManager::allocateChunk(DataChunk &input){
             int* ptr_int = customCudaHostAlloc<int>(chunk_size);
             ptr = reinterpret_cast<uint8_t*>(ptr_int);
             memcpy(ptr, input.data[0].GetData(), input.size() * sizeof(int));
-            column_type = ColumnType::INT32;
+            column_type = GPUColumnType(GPUColumnTypeId::INT32);
             break;
         }
         case LogicalTypeId::BIGINT: {
             uint64_t* ptr_int64 = customCudaHostAlloc<uint64_t>(chunk_size);
             ptr = reinterpret_cast<uint8_t*>(ptr_int64);
             memcpy(ptr, input.data[0].GetData(), input.size() * sizeof(uint64_t));
-            column_type = ColumnType::INT64;
+            column_type = GPUColumnType(GPUColumnTypeId::INT64);
             break;
         }
         case LogicalTypeId::FLOAT: {
             float* ptr_float = customCudaHostAlloc<float>(chunk_size);
             ptr = reinterpret_cast<uint8_t*>(ptr_float);
             memcpy(ptr, input.data[0].GetData(), input.size() * sizeof(float));
-            column_type = ColumnType::FLOAT32;
+            column_type = GPUColumnType(GPUColumnTypeId::FLOAT32);
             break;
         }
         case LogicalTypeId::DOUBLE: {
             double* ptr_double = customCudaHostAlloc<double>(chunk_size);
             ptr = reinterpret_cast<uint8_t*>(ptr_double);
             memcpy(ptr, input.data[0].GetData(), input.size() * sizeof(double));
-            column_type = ColumnType::FLOAT64;
+            column_type = GPUColumnType(GPUColumnTypeId::FLOAT64);
             break;
         }
         case LogicalTypeId::BOOLEAN: {
             uint8_t* ptr_bool = customCudaHostAlloc<uint8_t>(chunk_size);
             ptr = reinterpret_cast<uint8_t*>(ptr_bool);
             memcpy(ptr, input.data[0].GetData(), input.size() * sizeof(uint8_t));
-            column_type = ColumnType::BOOLEAN;
+            column_type = GPUColumnType(GPUColumnTypeId::BOOLEAN);
             break;
         }
         case LogicalTypeId::VARCHAR: {
@@ -476,7 +476,7 @@ GPUBufferManager::allocateChunk(DataChunk &input){
             char* ptr_varchar = customCudaHostAlloc<char>(chunk_size * 128);
             ptr = reinterpret_cast<uint8_t*>(ptr_varchar);
             memcpy(ptr, input.data[0].GetData(), input.size() * sizeof(double));
-            column_type = ColumnType::VARCHAR;
+            column_type = GPUColumnType(GPUColumnTypeId::VARCHAR);
             break;
         }
         default:
@@ -496,7 +496,7 @@ GPUBufferManager::allocateColumnBufferInCPU(unique_ptr<MaterializedQueryResult> 
 		throw InvalidInputException("No data in input chunk");
 	}
 
-    DataWrapper result_wrapper(ColumnType::INT32, nullptr, 0);
+    DataWrapper result_wrapper(GPUColumnType(GPUColumnTypeId::INT32), nullptr, 0);
     if (input_chunk->data[0].GetType().id() == LogicalTypeId::VARCHAR) {
         result_wrapper = allocateStringChunk(*input_chunk, row_count, result_wrapper);
     } else {
@@ -523,7 +523,7 @@ DataWrapper GPUBufferManager::allocateStrColumnInGPU(DataWrapper cpu_data, int g
 
     DataWrapper result;
     result.is_string_data = cpu_data.is_string_data;
-    result.type = ColumnType::VARCHAR;
+    result.type = GPUColumnType(GPUColumnTypeId::VARCHAR);
 
     // First allocate and copy the offset buffer
     result.size = cpu_data.size;
@@ -550,43 +550,43 @@ GPUBufferManager::allocateColumnBufferInGPU(DataWrapper cpu_data, int gpu) {
     }
     
     uint8_t* ptr = nullptr;
-    ColumnType column_type;
+    GPUColumnType column_type;
 
-	switch (cpu_data.type) {
-		case ColumnType::INT32: {
+	switch (cpu_data.type.id()) {
+		case GPUColumnTypeId::INT32: {
             int* ptr_int = customCudaMalloc<int>(cpu_data.size, 0, true);
             ptr = reinterpret_cast<uint8_t*>(ptr_int);
-            column_type = ColumnType::INT32;
+            column_type = GPUColumnType(GPUColumnTypeId::INT32);
 			break;
         }
-		case ColumnType::INT64: {
+		case GPUColumnTypeId::INT64: {
             uint64_t* ptr_int64 = customCudaMalloc<uint64_t>(cpu_data.size, 0, true);
             ptr = reinterpret_cast<uint8_t*>(ptr_int64);
-            column_type = ColumnType::INT64;
+            column_type = GPUColumnType(GPUColumnTypeId::INT64);
 			break;
         }
-		case ColumnType::FLOAT32: {
+		case GPUColumnTypeId::FLOAT32: {
             float* ptr_float = customCudaMalloc<float>(cpu_data.size, 0, true);
             ptr = reinterpret_cast<uint8_t*>(ptr_float);
-            column_type = ColumnType::FLOAT32;
+            column_type = GPUColumnType(GPUColumnTypeId::FLOAT32);
 			break;
         }
-		case ColumnType::FLOAT64: {
+		case GPUColumnTypeId::FLOAT64: {
             double* ptr_double = customCudaMalloc<double>(cpu_data.size, 0, true);
             ptr = reinterpret_cast<uint8_t*>(ptr_double);
-            column_type = ColumnType::FLOAT64;
+            column_type = GPUColumnType(GPUColumnTypeId::FLOAT64);
 			break;
         }
-		case ColumnType::BOOLEAN: {
+		case GPUColumnTypeId::BOOLEAN: {
             uint8_t* ptr_bool = customCudaMalloc<uint8_t>(cpu_data.size, 0, true);
             ptr = reinterpret_cast<uint8_t*>(ptr_bool);
-            column_type = ColumnType::BOOLEAN;
+            column_type = GPUColumnType(GPUColumnTypeId::BOOLEAN);
 			break;
         }
-		case ColumnType::VARCHAR: {
+		case GPUColumnTypeId::VARCHAR: {
             char* ptr_char = customCudaMalloc<char>(cpu_data.size, 0, true);
             ptr = reinterpret_cast<uint8_t*>(ptr_char);
-            column_type = ColumnType::VARCHAR;
+            column_type = GPUColumnType(GPUColumnTypeId::VARCHAR);
 			break;
         }
         default:
@@ -684,7 +684,7 @@ GPUBufferManager::createTableAndColumnInGPU(Catalog& catalog, ClientContext& con
         string up_table_name = table_name;
         transform(up_table_name.begin(), up_table_name.end(), up_table_name.begin(), ::toupper);
         createTable(up_table_name, table.GetTypes().size());
-        ColumnType column_type = convertLogicalTypeToColumnType(table.GetColumn(column_name).GetType());
+        GPUColumnType column_type = convertLogicalTypeToColumnType(table.GetColumn(column_name).GetType());
         SIRIUS_LOG_DEBUG("Creating column {}", up_column_name);
         createColumn(up_table_name, up_column_name, column_type, column_id, unique_columns);
     } else {
@@ -721,7 +721,7 @@ GPUBufferManager::checkIfColumnCached(string table_name, string column_name) {
 }
 
 void
-GPUBufferManager::createColumn(string up_table_name, string up_column_name, ColumnType column_type, size_t column_id, vector<size_t> unique_columns) {
+GPUBufferManager::createColumn(string up_table_name, string up_column_name, GPUColumnType column_type, size_t column_id, vector<size_t> unique_columns) {
     shared_ptr<GPUIntermediateRelation> table = tables[up_table_name];
     table->column_names[column_id] = up_column_name;
     if (find(unique_columns.begin(), unique_columns.end(), column_id) != unique_columns.end()) {

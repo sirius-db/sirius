@@ -31,21 +31,22 @@ GPUExpressionExecutor::ResolveTypeBinaryConstantExpression(shared_ptr<GPUColumn>
 
 shared_ptr<GPUColumn>
 GPUExpressionExecutor::HandleBinaryConstantExpression(shared_ptr<GPUColumn> column, BoundConstantExpression& expr, GPUBufferManager* gpuBufferManager, string function_name) {
-    switch(column->data_wrapper.type) {
-      case ColumnType::INT32: {
+    switch(column->data_wrapper.type.id()) {
+      case GPUColumnTypeId::INT32: {
         int constant = expr.value.GetValue<int>();
         return ResolveTypeBinaryConstantExpression<int>(column, constant, gpuBufferManager, function_name);
-      } case ColumnType::INT64: {
+      } case GPUColumnTypeId::INT64: {
         uint64_t constant = expr.value.GetValue<uint64_t>();
         return ResolveTypeBinaryConstantExpression<uint64_t>(column, constant, gpuBufferManager, function_name);
-      } case ColumnType::FLOAT32: {
+      } case GPUColumnTypeId::FLOAT32: {
         float constant = expr.value.GetValue<float>();
         return ResolveTypeBinaryConstantExpression<float>(column, constant, gpuBufferManager, function_name);
-      } case ColumnType::FLOAT64: {
+      } case GPUColumnTypeId::FLOAT64: {
         double constant = expr.value.GetValue<double>();
         return ResolveTypeBinaryConstantExpression<double>(column, constant, gpuBufferManager, function_name);
       } default:
-        throw NotImplementedException("Unsupported column type");
+        throw NotImplementedException("Unsupported sirius column type in `HandleBinaryConstantExpression`: %d",
+                                      static_cast<int>(column->data_wrapper.type.id()));
     }
 }
 
@@ -73,17 +74,18 @@ GPUExpressionExecutor::ResolveTypeBinaryExpression(shared_ptr<GPUColumn> column1
 
 shared_ptr<GPUColumn>
 GPUExpressionExecutor::HandleBinaryExpression(shared_ptr<GPUColumn> column1, shared_ptr<GPUColumn> column2, GPUBufferManager* gpuBufferManager, string function_name) {
-    switch(column1->data_wrapper.type) {
-      case ColumnType::INT32:
+    switch(column1->data_wrapper.type.id()) {
+      case GPUColumnTypeId::INT32:
         return ResolveTypeBinaryExpression<int>(column1, column2, gpuBufferManager, function_name);
-      case ColumnType::INT64:
+      case GPUColumnTypeId::INT64:
         return ResolveTypeBinaryExpression<uint64_t>(column1, column2, gpuBufferManager, function_name);
-      case ColumnType::FLOAT32:
+      case GPUColumnTypeId::FLOAT32:
         return ResolveTypeBinaryExpression<float>(column1, column2, gpuBufferManager, function_name);
-      case ColumnType::FLOAT64:
+      case GPUColumnTypeId::FLOAT64:
         return ResolveTypeBinaryExpression<double>(column1, column2, gpuBufferManager, function_name);
       default:
-        throw NotImplementedException("Unsupported column type");
+        throw NotImplementedException("Unsupported sirius column type in `HandleBinaryExpression`: %d",
+                                      static_cast<int>(column1->data_wrapper.type.id()));
     }
 }
 
@@ -128,24 +130,25 @@ GPUExpressionExecutor::ResolveTypeComparisonConstantExpression (shared_ptr<GPUCo
 
 void 
 GPUExpressionExecutor::HandleComparisonConstantExpression(shared_ptr<GPUColumn> column, BoundConstantExpression& expr1, BoundConstantExpression& expr2, uint64_t* &count, uint64_t* &row_ids, ExpressionType expression_type) {
-    switch(column->data_wrapper.type) {
-      case ColumnType::INT32:
+    switch(column->data_wrapper.type.id()) {
+      case GPUColumnTypeId::INT32:
         ResolveTypeComparisonConstantExpression<int>(column, expr1, expr2, count, row_ids, expression_type);
         break;
-      case ColumnType::INT64:
+      case GPUColumnTypeId::INT64:
         ResolveTypeComparisonConstantExpression<uint64_t>(column, expr1, expr2, count, row_ids, expression_type);
         break;
-      case ColumnType::FLOAT32:
+      case GPUColumnTypeId::FLOAT32:
         ResolveTypeComparisonConstantExpression<float>(column, expr1, expr2, count, row_ids, expression_type);
         break;
-      case ColumnType::FLOAT64:
+      case GPUColumnTypeId::FLOAT64:
         ResolveTypeComparisonConstantExpression<double>(column, expr1, expr2, count, row_ids, expression_type);
         break;
-      case ColumnType::BOOLEAN:
+      case GPUColumnTypeId::BOOLEAN:
         ResolveTypeComparisonConstantExpression<uint8_t>(column, expr1, expr2, count, row_ids, expression_type);
         break;
       default:
-        throw NotImplementedException("Unsupported column type");
+        throw NotImplementedException("Unsupported sirius column type in `HandleComparisonConstantExpression`: %d",
+                                      static_cast<int>(column->data_wrapper.type.id()));
     }
 }
 
@@ -181,36 +184,37 @@ GPUExpressionExecutor::ResolveTypeComparisonExpression (shared_ptr<GPUColumn> co
 
 void 
 GPUExpressionExecutor::HandleComparisonExpression(shared_ptr<GPUColumn> column1, shared_ptr<GPUColumn> column2, uint64_t* &count, uint64_t* &row_ids, ExpressionType expression_type) {
-    switch(column1->data_wrapper.type) {
-      case ColumnType::INT32:
+    switch(column1->data_wrapper.type.id()) {
+      case GPUColumnTypeId::INT32:
         ResolveTypeComparisonExpression<int>(column1, column2, count, row_ids, expression_type);
         break;
-      case ColumnType::INT64:
+      case GPUColumnTypeId::INT64:
         ResolveTypeComparisonExpression<uint64_t>(column1, column2, count, row_ids, expression_type);
         break;
-      case ColumnType::FLOAT32:
+      case GPUColumnTypeId::FLOAT32:
         ResolveTypeComparisonExpression<float>(column1, column2, count, row_ids, expression_type);
         break;
-      case ColumnType::FLOAT64:
+      case GPUColumnTypeId::FLOAT64:
         ResolveTypeComparisonExpression<double>(column1, column2, count, row_ids, expression_type);
         break;
       default:
-        throw NotImplementedException("Unsupported column type");
+        throw NotImplementedException("Unsupported sirius column type in `HandleComparisonExpression`: %d",
+                                      static_cast<int>(column1->data_wrapper.type.id()));
     }
 }
 
 shared_ptr<GPUColumn>
 GPUExpressionExecutor::HandleRoundExpression(shared_ptr<GPUColumn> column, int decimal_places) {
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
-    switch(column->data_wrapper.type) {
-      case ColumnType::FLOAT32: {
+    switch(column->data_wrapper.type.id()) {
+      case GPUColumnTypeId::FLOAT32: {
         float* a = reinterpret_cast<float*> (column->data_wrapper.data);
         size_t size = column->column_length;
         float* c = gpuBufferManager->customCudaMalloc<float>(size, 0, 0);
         floatRoundExpression(a, c, decimal_places, size);
         shared_ptr<GPUColumn> result = make_shared_ptr<GPUColumn>(size, column->data_wrapper.type, reinterpret_cast<uint8_t*>(c));
         return result;
-      } case ColumnType::FLOAT64: {
+      } case GPUColumnTypeId::FLOAT64: {
         double* a = reinterpret_cast<double*> (column->data_wrapper.data);
         size_t size = column->column_length;
         double* c = gpuBufferManager->customCudaMalloc<double>(size, 0, 0);
@@ -218,7 +222,8 @@ GPUExpressionExecutor::HandleRoundExpression(shared_ptr<GPUColumn> column, int d
         shared_ptr<GPUColumn> result = make_shared_ptr<GPUColumn>(size, column->data_wrapper.type, reinterpret_cast<uint8_t*>(c));
         return result;
       } default:
-        throw NotImplementedException("Unsupported column type");
+        throw NotImplementedException("Unsupported sirius column type in `HandleRoundExpression`: %d",
+                                      static_cast<int>(column->data_wrapper.type.id()));
     }
 }
 
@@ -547,7 +552,7 @@ GPUExpressionExecutor::ProjectionRecursiveExpression(GPUIntermediateRelation& in
                 output_relation.columns[output_idx]->row_ids = nullptr;
                 output_relation.columns[output_idx]->row_id_count = 0;
             } else {
-                output_relation.columns[output_idx] = make_shared_ptr<GPUColumn>(0, ColumnType::INT32, nullptr);
+                output_relation.columns[output_idx] = make_shared_ptr<GPUColumn>(0, GPUColumnType(GPUColumnTypeId::INT32), nullptr);
             }
         }
     }

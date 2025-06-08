@@ -101,7 +101,7 @@ GPUPhysicalOrder::Sink(GPUIntermediateRelation &input_relation) const {
     //   sort_columns[idx] = HandleMaterializeExpression(
     //     input_relation.columns[input_idx], bound_ref_expr, gpuBufferManager
     //   );
-    //   if (sort_columns[idx]->data_wrapper.type == ColumnType::VARCHAR) {
+    //   if (sort_columns[idx]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
     //     string_sort = true;
     //   }
 
@@ -165,7 +165,7 @@ GPUPhysicalOrder::Sink(GPUIntermediateRelation &input_relation) const {
 
     for (int col = 0; col < projections.size(); col++) {
       // if types is VARCHAR, check the number of bytes
-      if (projection_columns[col]->data_wrapper.type == ColumnType::VARCHAR) {
+      if (projection_columns[col]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
         if (projection_columns[col]->data_wrapper.num_bytes > INT32_MAX) {
           throw NotImplementedException("String column size greater than INT32_MAX is not supported");
         }

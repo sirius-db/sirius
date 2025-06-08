@@ -173,41 +173,47 @@ std::unique_ptr<cudf::column> GpuDispatcher::DispatchMaterialize(const GPUColumn
   const auto* input_data    = input->data_wrapper.data;
   const auto* input_offsets = input->data_wrapper.offset; // Maybe unused
 
-  switch (input->data_wrapper.type)
+  switch (input->data_wrapper.type.id())
   {
-    case ColumnType::INT32:
+    case GPUColumnTypeId::INT32:
       return MaterializeNumeric<int32_t>::Do(reinterpret_cast<const int32_t*>(input_data),
                                              input->row_ids,
                                              input->row_id_count,
                                              mr);
-    case ColumnType::INT64:
+    case GPUColumnTypeId::INT64:
       return MaterializeNumeric<uint64_t>::Do(reinterpret_cast<const uint64_t*>(input_data),
                                               input->row_ids,
                                               input->row_id_count,
                                               mr);
-    case ColumnType::FLOAT32:
+    case GPUColumnTypeId::FLOAT32:
       return MaterializeNumeric<float_t>::Do(reinterpret_cast<const float_t*>(input_data),
                                              input->row_ids,
                                              input->row_id_count,
                                              mr);
-    case ColumnType::FLOAT64:
+    case GPUColumnTypeId::FLOAT64:
       return MaterializeNumeric<double_t>::Do(reinterpret_cast<const double_t*>(input_data),
                                               input->row_ids,
                                               input->row_id_count,
                                               mr);
-    case ColumnType::BOOLEAN:
+    case GPUColumnTypeId::BOOLEAN:
       return MaterializeNumeric<bool>::Do(reinterpret_cast<const bool*>(input_data),
                                           input->row_ids,
                                           input->row_id_count,
                                           mr);
-    case ColumnType::VARCHAR:
+    case GPUColumnTypeId::DATE:
+      return MaterializeNumeric<cudf::timestamp_D>::Do(reinterpret_cast<const cudf::timestamp_D*>(input_data),
+                                                       input->row_ids,
+                                                       input->row_id_count,
+                                                       mr);
+    case GPUColumnTypeId::VARCHAR:
       return MaterializeString::Do(input_data,
                                    input_offsets,
                                    input->row_ids,
                                    input->row_id_count,
                                    mr);
     default:
-      throw InternalException("Dispatch[Materialize]: Unsupported column type!");
+      throw InternalException("Unsupported sirius column type in `Dispatch[Materialize]`: %d",
+                              static_cast<int>(input->data_wrapper.type.id()));
   }
 }
 

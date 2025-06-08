@@ -57,7 +57,7 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::CreatePlan(LogicalExpr
             throw NotImplementedException("Expression get not supported");
         }
         chunk_scan->intermediate_relation = make_shared_ptr<GPUIntermediateRelation>(1);
-        chunk_scan->intermediate_relation->columns[0] = make_shared_ptr<GPUColumn>(1, ColumnType::INT64, reinterpret_cast<uint8_t*>(d_data));
+        chunk_scan->intermediate_relation->columns[0] = make_shared_ptr<GPUColumn>(1, GPUColumnType(GPUColumnTypeId::INT64), reinterpret_cast<uint8_t*>(d_data));
     }
     return std::move(chunk_scan);
 }

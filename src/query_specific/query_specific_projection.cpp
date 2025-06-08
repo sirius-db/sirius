@@ -41,7 +41,7 @@ GPUExpressionExecutor::HandlingSpecificProjection(GPUIntermediateRelation& input
 				double else_val = 0;
                 q8CaseExpression(a, b, nation_val, else_val, out, size);
 
-                result = make_shared_ptr<GPUColumn>(size, ColumnType::FLOAT64, reinterpret_cast<uint8_t*>(out));
+                result = make_shared_ptr<GPUColumn>(size, GPUColumnType(GPUColumnTypeId::FLOAT64), reinterpret_cast<uint8_t*>(out));
 
 			} else if (expr.case_checks[0].then_expr->type == ExpressionType::BOUND_FUNCTION) {
 
@@ -89,7 +89,7 @@ GPUExpressionExecutor::HandlingSpecificProjection(GPUIntermediateRelation& input
 					double* out = gpuBufferManager->customCudaMalloc<double>(size, 0, 0);
 					q14CaseExpression(a, b, c, p_type_value1, p_type_value2, out, size);
 
-					result = make_shared_ptr<GPUColumn>(size, ColumnType::FLOAT64, reinterpret_cast<uint8_t*>(out));
+					result = make_shared_ptr<GPUColumn>(size, GPUColumnType(GPUColumnTypeId::FLOAT64), reinterpret_cast<uint8_t*>(out));
 				}
 
 			} else if (expr.case_checks[0].then_expr->expression_class == ExpressionClass::BOUND_CONSTANT) {
@@ -107,7 +107,7 @@ GPUExpressionExecutor::HandlingSpecificProjection(GPUIntermediateRelation& input
                     double* out = gpuBufferManager->customCudaMalloc<double>(size, 0, 0);
                     commonCaseExpression(a, a, out, size, 1);
 
-					result = make_shared_ptr<GPUColumn>(size, ColumnType::FLOAT64, reinterpret_cast<uint8_t*>(out));
+					result = make_shared_ptr<GPUColumn>(size, GPUColumnType(GPUColumnTypeId::FLOAT64), reinterpret_cast<uint8_t*>(out));
 
 				} else if (when_expr.type == ExpressionType::CONJUNCTION_OR) {
 					// Q12 HACK!!!
@@ -122,7 +122,7 @@ GPUExpressionExecutor::HandlingSpecificProjection(GPUIntermediateRelation& input
                     double* out = gpuBufferManager->customCudaMalloc<double>(size, 0, 0);
 					commonCaseExpression(a, a, out, size, 2);
 
-					result = make_shared_ptr<GPUColumn>(size, ColumnType::FLOAT64, reinterpret_cast<uint8_t*>(out));
+					result = make_shared_ptr<GPUColumn>(size, GPUColumnType(GPUColumnTypeId::FLOAT64), reinterpret_cast<uint8_t*>(out));
 
 				}
 			}
@@ -145,7 +145,7 @@ GPUExpressionExecutor::HandlingSpecificProjection(GPUIntermediateRelation& input
 				uint64_t* out = gpuBufferManager->customCudaMalloc<uint64_t>(size, 0, 0);
 				extractYear(a, out, size);
 
-				result = make_shared_ptr<GPUColumn>(size, ColumnType::INT64, reinterpret_cast<uint8_t*>(out));
+				result = make_shared_ptr<GPUColumn>(size, GPUColumnType(GPUColumnTypeId::INT64), reinterpret_cast<uint8_t*>(out));
 
 			} else if (expr.children[1]->type == ExpressionType::BOUND_FUNCTION) {
 				
@@ -170,7 +170,7 @@ GPUExpressionExecutor::HandlingSpecificProjection(GPUIntermediateRelation& input
 						double* out = gpuBufferManager->customCudaMalloc<double>(size, 0, 0);
 						commonArithmeticExpression(a, b, a, a, out, size, 1);
 
-						result = make_shared_ptr<GPUColumn>(size, ColumnType::FLOAT64, reinterpret_cast<uint8_t*>(out));
+						result = make_shared_ptr<GPUColumn>(size, GPUColumnType(GPUColumnTypeId::FLOAT64), reinterpret_cast<uint8_t*>(out));
 
 
 					}  else if (function_expr.function.name.compare("-") == 0) {
@@ -186,7 +186,7 @@ GPUExpressionExecutor::HandlingSpecificProjection(GPUIntermediateRelation& input
 						double* out = gpuBufferManager->customCudaMalloc<double>(size, 0, 0);
 						commonArithmeticExpression(a, b, a, a, out, size, 0);
 
-						result = make_shared_ptr<GPUColumn>(size, ColumnType::FLOAT64, reinterpret_cast<uint8_t*>(out));
+						result = make_shared_ptr<GPUColumn>(size, GPUColumnType(GPUColumnTypeId::FLOAT64), reinterpret_cast<uint8_t*>(out));
 					}
 
 				} else if (expr.children[0]->type == ExpressionType::BOUND_FUNCTION) {
@@ -216,7 +216,7 @@ GPUExpressionExecutor::HandlingSpecificProjection(GPUIntermediateRelation& input
 						double* out = gpuBufferManager->customCudaMalloc<double>(size, 0, 0);
 						commonArithmeticExpression(a, b, c, d, out, size, 2);
 
-						result = make_shared_ptr<GPUColumn>(size, ColumnType::FLOAT64, reinterpret_cast<uint8_t*>(out));
+						result = make_shared_ptr<GPUColumn>(size, GPUColumnType(GPUColumnTypeId::FLOAT64), reinterpret_cast<uint8_t*>(out));
 				}
 
 			} else if (expr.children[1]->type == ExpressionType::BOUND_REF) {
@@ -239,7 +239,7 @@ GPUExpressionExecutor::HandlingSpecificProjection(GPUIntermediateRelation& input
 					double* out = gpuBufferManager->customCudaMalloc<double>(size, 0, 0);
 					commonArithmeticExpression(a, b, a, a, out, size, 3);
 
-					result = make_shared_ptr<GPUColumn>(size, ColumnType::FLOAT64, reinterpret_cast<uint8_t*>(out));
+					result = make_shared_ptr<GPUColumn>(size, GPUColumnType(GPUColumnTypeId::FLOAT64), reinterpret_cast<uint8_t*>(out));
 
 					
 				}
