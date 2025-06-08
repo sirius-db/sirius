@@ -19,7 +19,7 @@ shared_ptr<GPUColumn> HandleSubString(shared_ptr<GPUColumn> string_column, uint6
     uint64_t* result_offset = std::get<1>(result);
     uint64_t result_bytes = std::get<2>(result);
 
-    return make_shared_ptr<GPUColumn>(string_column->column_length, ColumnType::VARCHAR, result_data, result_offset, result_bytes, true);
+    return make_shared_ptr<GPUColumn>(string_column->column_length, GPUColumnType(GPUColumnTypeId::VARCHAR), result_data, result_offset, result_bytes, true);
 }
 
 }

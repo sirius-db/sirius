@@ -64,16 +64,16 @@ void
 HandleProbeExpression(vector<shared_ptr<GPUColumn>> &probe_keys, uint64_t* &count, uint64_t* &row_ids_left, uint64_t* &row_ids_right, 
 		unsigned long long* ht, uint64_t ht_len, const vector<JoinCondition> &conditions, JoinType join_type, 
 		bool unique_build_keys, GPUBufferManager* gpuBufferManager) {
-    switch(probe_keys[0]->data_wrapper.type) {
-      case ColumnType::INT64:
+    switch(probe_keys[0]->data_wrapper.type.id()) {
+      case GPUColumnTypeId::INT64:
 		ResolveTypeProbeExpression(probe_keys, count, row_ids_left, row_ids_right, ht, ht_len, conditions, join_type, unique_build_keys, gpuBufferManager);
 		break;
-      case ColumnType::FLOAT64:
+      case GPUColumnTypeId::FLOAT64:
 	  	ResolveTypeProbeExpression(probe_keys, count, row_ids_left, row_ids_right, ht, ht_len, conditions, join_type, unique_build_keys, gpuBufferManager);
 		break;
       default:
         throw NotImplementedException("Unsupported sirius column type in `HandleProbeExpression`: %d",
-																			static_cast<int>(probe_keys[0]->data_wrapper.type));
+																			static_cast<int>(probe_keys[0]->data_wrapper.type.id()));
     }
 }
 
@@ -108,14 +108,14 @@ ResolveTypeMarkExpression(vector<shared_ptr<GPUColumn>> &probe_keys, uint8_t* &o
 void
 HandleMarkExpression(vector<shared_ptr<GPUColumn>> &probe_keys, uint8_t* &output, 
 		unsigned long long* ht, uint64_t ht_len, const vector<JoinCondition> &conditions, GPUBufferManager* gpuBufferManager) {
-    switch(probe_keys[0]->data_wrapper.type) {
-      case ColumnType::INT64:
+    switch(probe_keys[0]->data_wrapper.type.id()) {
+      case GPUColumnTypeId::INT64:
 		ResolveTypeMarkExpression(probe_keys, output, ht, ht_len, conditions, gpuBufferManager);
 		break;
-      case ColumnType::FLOAT64:
+      case GPUColumnTypeId::FLOAT64:
       default:
         throw NotImplementedException("Unsupported sirius column type in `HandleMarkExpression`: %d",
-																			static_cast<int>(probe_keys[0]->data_wrapper.type));
+																			static_cast<int>(probe_keys[0]->data_wrapper.type.id()));
     }
 }
 
@@ -155,16 +155,16 @@ ResolveTypeBuildExpression(vector<shared_ptr<GPUColumn>> &build_keys, unsigned l
 void
 HandleBuildExpression(vector<shared_ptr<GPUColumn>> &build_keys, unsigned long long* ht, uint64_t ht_len, 
 	const vector<JoinCondition> &conditions, JoinType join_type, GPUBufferManager* gpuBufferManager) {
-    switch(build_keys[0]->data_wrapper.type) {
-      case ColumnType::INT64:
+    switch(build_keys[0]->data_wrapper.type.id()) {
+      case GPUColumnTypeId::INT64:
 		ResolveTypeBuildExpression(build_keys, ht, ht_len, conditions, join_type, gpuBufferManager);
 		break;
-      case ColumnType::FLOAT64:
+      case GPUColumnTypeId::FLOAT64:
 	  	ResolveTypeBuildExpression(build_keys, ht, ht_len, conditions, join_type, gpuBufferManager);
 		break;
       default:
         throw NotImplementedException("Unsupported sirius column type in `HandleBuildExpression`: %d",
-																			static_cast<int>(build_keys[0]->data_wrapper.type));
+																			static_cast<int>(build_keys[0]->data_wrapper.type.id()));
     }
 }
 
@@ -312,7 +312,7 @@ GPUPhysicalHashJoin::GetData(GPUIntermediateRelation &output_relation) const {
 		for (idx_t col = 0; col < left_column_count; col++) {
 			//pretend this to be NUll column from the left table (it should be NULL for the RIGHT join)
 			SIRIUS_LOG_DEBUG("Right join so columns from LHS will be null");
-			output_relation.columns[col] = make_shared_ptr<GPUColumn>(0, ColumnType::INT64, nullptr);
+			output_relation.columns[col] = make_shared_ptr<GPUColumn>(0, GPUColumnType(GPUColumnTypeId::INT64), nullptr);
 		}
 	} else {
 		throw InvalidInputException("Get data not supported for this join type");
@@ -336,7 +336,7 @@ GPUPhysicalHashJoin::GetData(GPUIntermediateRelation &output_relation) const {
 	// for (idx_t i = 0; i < hash_table_result->columns.size(); i++) {
 	// 	if (find(rhs_output_columns.col_idxs.begin(), rhs_output_columns.col_idxs.end(), i) == rhs_output_columns.col_idxs.end()) {
 	// 		gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(hash_table_result->columns[i]->data_wrapper.data), 0);
-	// 		if (hash_table_result->columns[i]->data_wrapper.type == ColumnType::VARCHAR) {
+	// 		if (hash_table_result->columns[i]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
 	// 			gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(hash_table_result->columns[i]->data_wrapper.offset), 0);
 	// 		}
 	// 	}
@@ -421,12 +421,12 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 		}
 		for (int col = 0; col < conditions.size(); col++) {
 			// if types is VARCHAR, check the number of bytes
-			if (build_key[col]->data_wrapper.type == ColumnType::VARCHAR) {
+			if (build_key[col]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
 				if (build_key[col]->data_wrapper.num_bytes > INT32_MAX) {
 					throw NotImplementedException("String column size greater than INT32_MAX is not supported");
 				}
 			}
-			if (probe_key[col]->data_wrapper.type == ColumnType::VARCHAR) {
+			if (probe_key[col]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
 				if (probe_key[col]->data_wrapper.num_bytes > INT32_MAX) {
 					throw NotImplementedException("String column size greater than INT32_MAX is not supported");
 				}
@@ -474,7 +474,7 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 		// for (idx_t i = 0; i < input_relation.columns.size(); i++) {
 		// 	if (find(lhs_output_columns.col_idxs.begin(), lhs_output_columns.col_idxs.end(), i) == lhs_output_columns.col_idxs.end()) {
 		// 		gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(input_relation.columns[i]->data_wrapper.data), 0);
-		// 		if (input_relation.columns[i]->data_wrapper.type == ColumnType::VARCHAR) {
+		// 		if (input_relation.columns[i]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
 		// 			gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(input_relation.columns[i]->data_wrapper.offset), 0);
 		// 		}
 		// 	}
@@ -493,14 +493,14 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 				output_relation.columns[i]->is_unique = false;
 			}
 		}
-		output_relation.columns[lhs_output_columns.col_idxs.size()] = make_shared_ptr<GPUColumn>(probe_key[0]->column_length, ColumnType::BOOLEAN, output);
+		output_relation.columns[lhs_output_columns.col_idxs.size()] = make_shared_ptr<GPUColumn>(probe_key[0]->column_length, GPUColumnType(GPUColumnTypeId::BOOLEAN), output);
 		output_relation.columns[lhs_output_columns.col_idxs.size()]->row_ids = probe_key[0]->row_ids;
 		output_relation.columns[lhs_output_columns.col_idxs.size()]->row_id_count = probe_key[0]->row_id_count;
 		// free all the columns in the input relation that are not in the lhs_output_columns
 		// for (idx_t i = 0; i < input_relation.columns.size(); i++) {
 		// 	if (find(lhs_output_columns.col_idxs.begin(), lhs_output_columns.col_idxs.end(), i) == lhs_output_columns.col_idxs.end()) {
 		// 		gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(input_relation.columns[i]->data_wrapper.data), 0);
-		// 		if (input_relation.columns[i]->data_wrapper.type == ColumnType::VARCHAR) {
+		// 		if (input_relation.columns[i]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
 		// 			gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(input_relation.columns[i]->data_wrapper.offset), 0);
 		// 		}
 		// 	}
@@ -518,7 +518,7 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 			gpuBufferManager->lockAllocation(reinterpret_cast<uint8_t*>(hash_table_result->columns[col]->data_wrapper.data), 0);
 			gpuBufferManager->lockAllocation(reinterpret_cast<uint8_t*>(hash_table_result->columns[col]->row_ids), 0);
 			// If the column type is VARCHAR, also lock the offset allocation
-			if (hash_table_result->columns[col]->data_wrapper.type == ColumnType::VARCHAR) {
+			if (hash_table_result->columns[col]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
 				gpuBufferManager->lockAllocation(reinterpret_cast<uint8_t*>(hash_table_result->columns[col]->data_wrapper.offset), 0);
 			}
 		}
@@ -532,7 +532,7 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 			// for (idx_t i = 0; i < hash_table_result->columns.size(); i++) {
 			// 	if (find(rhs_output_columns.col_idxs.begin(), rhs_output_columns.col_idxs.end(), i) == rhs_output_columns.col_idxs.end()) {
 			// 		gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(hash_table_result->columns[i]->data_wrapper.data), 0);
-			// 		if (hash_table_result->columns[i]->data_wrapper.type == ColumnType::VARCHAR) {
+			// 		if (hash_table_result->columns[i]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
             // 			gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(hash_table_result->columns[i]->data_wrapper.offset), 0);
         	// 		}
 			// 	}

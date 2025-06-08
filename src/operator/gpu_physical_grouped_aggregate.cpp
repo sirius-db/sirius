@@ -33,7 +33,7 @@ ResolveTypeCombineStrings(shared_ptr<GPUColumn> column1, shared_ptr<GPUColumn> c
 	uint64_t num_bytes_b = column2->data_wrapper.num_bytes;
 
 	combineStrings(a, b, combine, offset_a, offset_b, offset_combine, num_bytes_a, num_bytes_b, column1->column_length, column2->column_length);
-	shared_ptr<GPUColumn> result = make_shared_ptr<GPUColumn>(column1->column_length + column2->column_length, ColumnType::VARCHAR, combine, offset_combine, num_bytes_a + num_bytes_b, true);
+	shared_ptr<GPUColumn> result = make_shared_ptr<GPUColumn>(column1->column_length + column2->column_length, GPUColumnType(GPUColumnTypeId::VARCHAR), combine, offset_combine, num_bytes_a + num_bytes_b, true);
 	if (column1->is_unique && column2->is_unique) {
 		result->is_unique = true;
 	}
@@ -42,19 +42,19 @@ ResolveTypeCombineStrings(shared_ptr<GPUColumn> column1, shared_ptr<GPUColumn> c
 
 shared_ptr<GPUColumn>
 CombineColumns(shared_ptr<GPUColumn> column1, shared_ptr<GPUColumn> column2, GPUBufferManager* gpuBufferManager) {
-    switch(column1->data_wrapper.type) {
-      case ColumnType::INT64:
+    switch(column1->data_wrapper.type.id()) {
+      case GPUColumnTypeId::INT64:
 		return ResolveTypeCombineColumns<uint64_t>(column1, column2, gpuBufferManager);
 		break;
-      case ColumnType::FLOAT64:
+      case GPUColumnTypeId::FLOAT64:
 		return ResolveTypeCombineColumns<double>(column1, column2, gpuBufferManager);
 		break;
-      case ColumnType::VARCHAR:
+      case GPUColumnTypeId::VARCHAR:
 		return ResolveTypeCombineStrings(column1, column2, gpuBufferManager);
 		break;
 	  default:
         throw NotImplementedException("Unsupported sirius column type in `CombineColumns: %d",
-																			static_cast<int>(column1->data_wrapper.type));
+																			static_cast<int>(column1->data_wrapper.type.id()));
     }
 }
 
@@ -88,7 +88,7 @@ ResolveTypeGroupByAggregateExpression(vector<shared_ptr<GPUColumn>> &group_by_ke
 			agg_mode[agg_idx] = 0;
 			aggregate_data[agg_idx] = (aggregate_keys[agg_idx]->data_wrapper.data);
 		} else if (expr.function.name.compare("avg") == 0) {
-			if (aggregate_keys[agg_idx]->data_wrapper.type != ColumnType::FLOAT64) throw NotImplementedException("Column type is supposed to be double");
+			if (aggregate_keys[agg_idx]->data_wrapper.type.id() != GPUColumnTypeId::FLOAT64) throw NotImplementedException("Column type is supposed to be double");
 			agg_mode[agg_idx] = 1;
 			aggregate_data[agg_idx] = (aggregate_keys[agg_idx]->data_wrapper.data);
 		} else if (expr.function.name.compare("max") == 0) {
@@ -121,7 +121,7 @@ ResolveTypeGroupByAggregateExpression(vector<shared_ptr<GPUColumn>> &group_by_ke
 	for (int agg_idx = 0; agg_idx < aggregates.size(); agg_idx++) {
 		auto& expr = aggregates[agg_idx]->Cast<BoundAggregateExpression>();
 		if (expr.function.name.compare("count_star") == 0 || expr.function.name.compare("count") == 0) {
-			aggregate_keys[agg_idx] = make_shared_ptr<GPUColumn>(count[0], ColumnType::INT64, reinterpret_cast<uint8_t*>(aggregate_data[agg_idx]));
+			aggregate_keys[agg_idx] = make_shared_ptr<GPUColumn>(count[0], GPUColumnType(GPUColumnTypeId::INT64), reinterpret_cast<uint8_t*>(aggregate_data[agg_idx]));
 		} else {
 			aggregate_keys[agg_idx] = make_shared_ptr<GPUColumn>(count[0], aggregate_keys[agg_idx]->data_wrapper.type, reinterpret_cast<uint8_t*>(aggregate_data[agg_idx]));
 		}
@@ -146,7 +146,7 @@ ResolveTypeGroupByString(vector<shared_ptr<GPUColumn>> &group_by_keys, vector<sh
 			throw NotImplementedException("Group by column is null");
 		}
 
-		if (group_by_keys[group]->data_wrapper.type == ColumnType::VARCHAR) {
+		if (group_by_keys[group]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
 			offset_data[group] = (group_by_keys[group]->data_wrapper.offset);
 		} else {
 			size_t column_size = group_by_keys[group]->data_wrapper.getColumnTypeSize();
@@ -168,7 +168,7 @@ ResolveTypeGroupByString(vector<shared_ptr<GPUColumn>> &group_by_keys, vector<sh
 			agg_mode[agg_idx] = 0;
 			aggregate_data[agg_idx] = (aggregate_keys[agg_idx]->data_wrapper.data);
 		} else if (expr.function.name.compare("avg") == 0) {
-			if (aggregate_keys[agg_idx]->data_wrapper.type != ColumnType::FLOAT64) throw NotImplementedException("Column type is supposed to be double");
+			if (aggregate_keys[agg_idx]->data_wrapper.type.id() != GPUColumnTypeId::FLOAT64) throw NotImplementedException("Column type is supposed to be double");
 			agg_mode[agg_idx] = 1;
 			aggregate_data[agg_idx] = (aggregate_keys[agg_idx]->data_wrapper.data);
 		} else if (expr.function.name.compare("max") == 0) {
@@ -200,7 +200,7 @@ ResolveTypeGroupByString(vector<shared_ptr<GPUColumn>> &group_by_keys, vector<sh
 	// Reading groupby columns based on the grouping set
 	for (idx_t group = 0; group < num_group_keys; group++) {
 		bool old_unique = group_by_keys[group]->is_unique;
-		if (group_by_keys[group]->data_wrapper.type == ColumnType::VARCHAR) {
+		if (group_by_keys[group]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
 			if (offset_data[group] == nullptr && count[0] > 0) throw NotImplementedException("Offset data is null");
 			group_by_keys[group] = make_shared_ptr<GPUColumn>(count[0], group_by_keys[group]->data_wrapper.type, reinterpret_cast<uint8_t*>(group_by_data[group]), reinterpret_cast<uint64_t*>(offset_data[group]), num_bytes[group], true);
 		} else {
@@ -212,7 +212,7 @@ ResolveTypeGroupByString(vector<shared_ptr<GPUColumn>> &group_by_keys, vector<sh
 	for (int agg_idx = 0; agg_idx < aggregates.size(); agg_idx++) {
 		auto& expr = aggregates[agg_idx]->Cast<BoundAggregateExpression>();
 		if (expr.function.name.compare("count_star") == 0 || expr.function.name.compare("count") == 0) {
-			aggregate_keys[agg_idx] = make_shared_ptr<GPUColumn>(count[0], ColumnType::INT64, reinterpret_cast<uint8_t*>(aggregate_data[agg_idx]));
+			aggregate_keys[agg_idx] = make_shared_ptr<GPUColumn>(count[0], GPUColumnType(GPUColumnTypeId::INT64), reinterpret_cast<uint8_t*>(aggregate_data[agg_idx]));
 		} else {
 			aggregate_keys[agg_idx] = make_shared_ptr<GPUColumn>(count[0], aggregate_keys[agg_idx]->data_wrapper.type, reinterpret_cast<uint8_t*>(aggregate_data[agg_idx]));
 		}
@@ -223,18 +223,18 @@ void
 HandleGroupByAggregateExpression(vector<shared_ptr<GPUColumn>> &group_by_keys, vector<shared_ptr<GPUColumn>> &aggregate_keys, GPUBufferManager* gpuBufferManager, const vector<unique_ptr<Expression>> &aggregates, int num_group_keys) {
 	bool string_groupby = false;
 	for (int i = 0; i < num_group_keys; i++) {
-		if (group_by_keys[i]->data_wrapper.type == ColumnType::VARCHAR) {
+		if (group_by_keys[i]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
 			string_groupby = true;
 		}
 	}
 
-	ColumnType aggregate_type;
+	GPUColumnType aggregate_type;
 	if (aggregates.size() == 1) {
 		aggregate_type = aggregate_keys[0]->data_wrapper.type;
 	} else {
 		//check if all the aggregate functions are of the same type
 		bool same_type = true;
-		ColumnType prev_type;
+		GPUColumnType prev_type;
 		for (int i = 0; i < aggregates.size(); i++) {
 			if (aggregates[i]->Cast<BoundAggregateExpression>().function.name.compare("count") != 0 && 
 						aggregates[i]->Cast<BoundAggregateExpression>().function.name.compare("count_star") != 0) {
@@ -246,7 +246,7 @@ HandleGroupByAggregateExpression(vector<shared_ptr<GPUColumn>> &group_by_keys, v
 			if (aggregates[i]->Cast<BoundAggregateExpression>().function.name.compare("count") != 0 && 
 						aggregates[i]->Cast<BoundAggregateExpression>().function.name.compare("count_star") != 0) {
 				aggregate_type = aggregate_keys[i]->data_wrapper.type;
-				if (aggregate_type != prev_type) {
+				if (aggregate_type.id() != prev_type.id()) {
 					throw NotImplementedException("All aggregate functions must be of the same type");
 				}
 				prev_type = aggregate_type;
@@ -255,34 +255,34 @@ HandleGroupByAggregateExpression(vector<shared_ptr<GPUColumn>> &group_by_keys, v
 	}
 
 	if (string_groupby) {
-		if (aggregate_type == ColumnType::INT64) {
+		if (aggregate_type.id() == GPUColumnTypeId::INT64) {
 			ResolveTypeGroupByString<uint64_t>(group_by_keys, aggregate_keys, gpuBufferManager, aggregates, num_group_keys);
-		} else if (aggregate_type == ColumnType::FLOAT64) {
+		} else if (aggregate_type.id() == GPUColumnTypeId::FLOAT64) {
 			ResolveTypeGroupByString<double>(group_by_keys, aggregate_keys, gpuBufferManager, aggregates, num_group_keys);
 		} else {
 			throw NotImplementedException("Unsupported sirius column type in `HandleGroupByAggregateExpression`: {}",
-																		static_cast<int>(aggregate_type));
+																		static_cast<int>(aggregate_type.id()));
 		}
 	} else {
 		//check if all the group by keys are all integers
 		for (int i = 0; i < num_group_keys; i++) {
-			if (group_by_keys[i]->data_wrapper.type != ColumnType::INT64) {
+			if (group_by_keys[i]->data_wrapper.type.id() != GPUColumnTypeId::INT64) {
 				throw NotImplementedException("Group by column is not an integer");
 			}
 		}
-		switch(group_by_keys[0]->data_wrapper.type) {
-		case ColumnType::INT64:
-			if (aggregate_type == ColumnType::INT64) {
+		switch(group_by_keys[0]->data_wrapper.type.id()) {
+		case GPUColumnTypeId::INT64:
+			if (aggregate_type.id() == GPUColumnTypeId::INT64) {
 				ResolveTypeGroupByAggregateExpression<uint64_t, uint64_t>(group_by_keys, aggregate_keys, gpuBufferManager, aggregates, num_group_keys);
-			} else if (aggregate_type == ColumnType::FLOAT64) {
+			} else if (aggregate_type.id() == GPUColumnTypeId::FLOAT64) {
 				ResolveTypeGroupByAggregateExpression<uint64_t, double>(group_by_keys, aggregate_keys, gpuBufferManager, aggregates, num_group_keys);
 			} else throw NotImplementedException("Unsupported sirius column type in `HandleGroupByAggregateExpression`: {}",
-																					 static_cast<int>(aggregate_type));
+																					 static_cast<int>(aggregate_type.id()));
 			break;
-		case ColumnType::FLOAT64:
+		case GPUColumnTypeId::FLOAT64:
 		default:
 			throw NotImplementedException("Unsupported sirius column type in `HandleGroupByAggregateExpression`: {}",
-																		static_cast<int>(group_by_keys[0]->data_wrapper.type));
+																		static_cast<int>(group_by_keys[0]->data_wrapper.type.id()));
 		}
 	}
 }
@@ -347,18 +347,18 @@ void ResolveTypeDuplicateElimination(vector<shared_ptr<GPUColumn>> &group_by_key
 void HandleDuplicateElimination(vector<shared_ptr<GPUColumn>> &group_by_keys, GPUBufferManager* gpuBufferManager, int num_group_keys) {
 	//check if all the group by keys are all integers
 	for (int i = 0; i < num_group_keys; i++) {
-		if (group_by_keys[i]->data_wrapper.type != ColumnType::INT64) {
+		if (group_by_keys[i]->data_wrapper.type.id() != GPUColumnTypeId::INT64) {
 			throw NotImplementedException("Group by column is not an integer");
 		}
 	}
-    switch(group_by_keys[0]->data_wrapper.type) {
-      case ColumnType::INT64:
+    switch(group_by_keys[0]->data_wrapper.type.id()) {
+      case GPUColumnTypeId::INT64:
 	  	ResolveTypeDuplicateElimination<uint64_t>(group_by_keys, gpuBufferManager, num_group_keys);
 		break;
-      case ColumnType::FLOAT64:
+      case GPUColumnTypeId::FLOAT64:
       default:
         throw NotImplementedException("Unsupported sirius column type in `HandleDuplicateElimination`: %d",
-																			static_cast<int>(group_by_keys[0]->data_wrapper.type));
+																			static_cast<int>(group_by_keys[0]->data_wrapper.type.id()));
     }
 }
 
@@ -402,7 +402,7 @@ void ResolveTypeDistinctGroupBy(vector<shared_ptr<GPUColumn>> &group_by_keys, ve
 		auto distinct_idx = distinct_info.indices[idx];
 		auto& expr = distinct_info.aggregates[distinct_idx]->Cast<BoundAggregateExpression>();
 		if (expr.function.name.compare("count") == 0) {
-			aggregate_keys[idx] = make_shared_ptr<GPUColumn>(count[0], ColumnType::INT64, reinterpret_cast<uint8_t*>(distinct_aggregate_data[idx]));
+			aggregate_keys[idx] = make_shared_ptr<GPUColumn>(count[0], GPUColumnType(GPUColumnTypeId::INT64), reinterpret_cast<uint8_t*>(distinct_aggregate_data[idx]));
 		}
 	}
 
@@ -413,21 +413,21 @@ void HandleDistinctGroupBy(vector<shared_ptr<GPUColumn>> &group_by_keys, vector<
 	//check if all the group by keys are all integers
 	SIRIUS_LOG_DEBUG("Handling distinct group by");
 	for (int i = 0; i < num_group_keys; i++) {
-		if (group_by_keys[i]->data_wrapper.type != ColumnType::INT64) {
+		if (group_by_keys[i]->data_wrapper.type.id() != GPUColumnTypeId::INT64) {
 			throw NotImplementedException("Group by column is not an integer");
 		}
 	}
-    switch(group_by_keys[0]->data_wrapper.type) {
-      case ColumnType::INT64: {
-	  	if (aggregate_keys[0]->data_wrapper.type == ColumnType::INT64) {
+    switch(group_by_keys[0]->data_wrapper.type.id()) {
+      case GPUColumnTypeId::INT64: {
+	  	if (aggregate_keys[0]->data_wrapper.type.id() == GPUColumnTypeId::INT64) {
 			ResolveTypeDistinctGroupBy<uint64_t, uint64_t>(group_by_keys, aggregate_keys, gpuBufferManager, distinct_info, num_group_keys);
 		} else throw NotImplementedException("Unsupported sirius column type in `HandleDistinctGroupBy`: %d",
-																				 static_cast<int>(aggregate_keys[0]->data_wrapper.type));
+																				 static_cast<int>(aggregate_keys[0]->data_wrapper.type.id()));
 		break;
-	  } case ColumnType::FLOAT64:
+	  } case GPUColumnTypeId::FLOAT64:
       default:
         throw NotImplementedException("Unsupported sirius column type in `HandleDistinctGroupBy`: %d",
-																			static_cast<int>(group_by_keys[0]->data_wrapper.type));
+																			static_cast<int>(group_by_keys[0]->data_wrapper.type.id()));
     }
 }
 
@@ -620,7 +620,7 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 		if (aggr.children.size() == 0) {
 			//we have a count(*) aggregate
 			SIRIUS_LOG_DEBUG("Passing * aggregate to index {} in aggregation result", aggr_idx);
-			aggregate_column[aggr_idx] = make_shared_ptr<GPUColumn>(column_size, ColumnType::INT64, nullptr);
+			aggregate_column[aggr_idx] = make_shared_ptr<GPUColumn>(column_size, GPUColumnType(GPUColumnTypeId::INT64), nullptr);
 		}
 		if (aggr.filter) {
 			throw NotImplementedException("Filter not supported yet");
@@ -639,7 +639,7 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 		bool string_cudf_supported = true;
 		for (int col = 0; col < num_group_keys; col++) {
 			// if types is VARCHAR, check the number of bytes
-			if (group_by_column[col]->data_wrapper.type == ColumnType::VARCHAR) {
+			if (group_by_column[col]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
 				if (group_by_column[col]->data_wrapper.num_bytes > INT32_MAX) {
 					string_cudf_supported = false;
 				}
@@ -716,7 +716,7 @@ GPUPhysicalGroupedAggregate::GetData(GPUIntermediateRelation &output_relation) c
 		SIRIUS_LOG_DEBUG("Writing group by result to column {}", col);
 		// output_relation.columns[col] = group_by_result->columns[col];
 		bool old_unique = group_by_result->columns[col]->is_unique;
-		if (group_by_result->columns[col]->data_wrapper.type == ColumnType::VARCHAR) {
+		if (group_by_result->columns[col]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
 			output_relation.columns[col] = make_shared_ptr<GPUColumn>(group_by_result->columns[col]->column_length, group_by_result->columns[col]->data_wrapper.type, group_by_result->columns[col]->data_wrapper.data,
 					group_by_result->columns[col]->data_wrapper.offset, group_by_result->columns[col]->data_wrapper.num_bytes, true);
 		} else {

@@ -33,7 +33,7 @@ void cudf_aggregate(vector<shared_ptr<GPUColumn>>& column, uint64_t num_aggregat
             if (agg_mode[agg_idx] == AggregationType::COUNT_STAR || agg_mode[agg_idx] == AggregationType::COUNT) {
                 uint64_t* temp = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
                 cudaMemset(temp, 0, sizeof(uint64_t));
-                column[agg_idx] = make_shared_ptr<GPUColumn>(1, ColumnType::INT64, reinterpret_cast<uint8_t*>(temp));
+                column[agg_idx] = make_shared_ptr<GPUColumn>(1, GPUColumnType(GPUColumnTypeId::INT64), reinterpret_cast<uint8_t*>(temp));
             } else {
                 column[agg_idx] = make_shared_ptr<GPUColumn>(0, column[agg_idx]->data_wrapper.type, column[agg_idx]->data_wrapper.data);
             }
@@ -58,17 +58,17 @@ void cudf_aggregate(vector<shared_ptr<GPUColumn>>& column, uint64_t num_aggregat
         if (column[agg]->data_wrapper.data == nullptr && agg_mode[agg] == AggregationType::COUNT && column[agg]->column_length == 0) {
             uint64_t* temp = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
             cudaMemset(temp, 0, sizeof(uint64_t));
-            column[agg] = make_shared_ptr<GPUColumn>(1, ColumnType::INT64, reinterpret_cast<uint8_t*>(temp));
+            column[agg] = make_shared_ptr<GPUColumn>(1, GPUColumnType(GPUColumnTypeId::INT64), reinterpret_cast<uint8_t*>(temp));
         } else if (column[agg]->data_wrapper.data == nullptr && agg_mode[agg] == AggregationType::SUM && column[agg]->column_length == 0) {
             uint64_t* temp = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
             cudaMemset(temp, 0, sizeof(uint64_t));
-            column[agg] = make_shared_ptr<GPUColumn>(1, ColumnType::INT64, reinterpret_cast<uint8_t*>(temp));
+            column[agg] = make_shared_ptr<GPUColumn>(1, GPUColumnType(GPUColumnTypeId::INT64), reinterpret_cast<uint8_t*>(temp));
         } else if (column[agg]->data_wrapper.data == nullptr && agg_mode[agg] == AggregationType::COUNT_STAR && column[agg]->column_length != 0) {
             uint64_t* res = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
             res[0] = size;
             uint64_t* result_temp = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
             cudaMemcpy(result_temp, res, sizeof(uint64_t), cudaMemcpyHostToDevice);
-            column[agg] = make_shared_ptr<GPUColumn>(1, ColumnType::INT64, reinterpret_cast<uint8_t*>(result_temp));
+            column[agg] = make_shared_ptr<GPUColumn>(1, GPUColumnType(GPUColumnTypeId::INT64), reinterpret_cast<uint8_t*>(result_temp));
         } else if (agg_mode[agg] == AggregationType::SUM) {
             auto aggregate = make_reduce_aggregation<cudf::reduce_aggregation::SUM>();
             auto cudf_column = column[agg]->convertToCudfColumn();
@@ -94,29 +94,29 @@ void cudf_aggregate(vector<shared_ptr<GPUColumn>>& column, uint64_t num_aggregat
             res[0] = size;
             uint64_t* result_temp = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
             cudaMemcpy(result_temp, res, sizeof(uint64_t), cudaMemcpyHostToDevice);
-            column[agg] = make_shared_ptr<GPUColumn>(1, ColumnType::INT64, reinterpret_cast<uint8_t*>(result_temp));
+            column[agg] = make_shared_ptr<GPUColumn>(1, GPUColumnType(GPUColumnTypeId::INT64), reinterpret_cast<uint8_t*>(result_temp));
         } else if (agg_mode[agg] == AggregationType::FIRST) {
-            if (column[agg]->data_wrapper.type == ColumnType::INT64) {
+            if (column[agg]->data_wrapper.type.id() == GPUColumnTypeId::INT64) {
                 uint64_t* result_temp = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
                 cudaMemcpy(result_temp, reinterpret_cast<uint64_t*>(column[agg]->data_wrapper.data), sizeof(uint64_t), cudaMemcpyDeviceToDevice);
-                column[agg] = make_shared_ptr<GPUColumn>(1, ColumnType::INT64, reinterpret_cast<uint8_t*>(result_temp));
-            } else if (column[agg]->data_wrapper.type == ColumnType::INT32) {
+                column[agg] = make_shared_ptr<GPUColumn>(1, GPUColumnType(GPUColumnTypeId::INT64), reinterpret_cast<uint8_t*>(result_temp));
+            } else if (column[agg]->data_wrapper.type.id() == GPUColumnTypeId::INT32) {
                 int32_t* result_temp = gpuBufferManager->customCudaMalloc<int32_t>(1, 0, 0);
                 cudaMemcpy(result_temp, reinterpret_cast<int32_t*>(column[agg]->data_wrapper.data), sizeof(int32_t), cudaMemcpyDeviceToDevice);
-                column[agg] = make_shared_ptr<GPUColumn>(1, ColumnType::INT32, reinterpret_cast<uint8_t*>(result_temp));
-            } else if (column[agg]->data_wrapper.type == ColumnType::FLOAT32) {
+                column[agg] = make_shared_ptr<GPUColumn>(1, GPUColumnType(GPUColumnTypeId::INT32), reinterpret_cast<uint8_t*>(result_temp));
+            } else if (column[agg]->data_wrapper.type.id() == GPUColumnTypeId::FLOAT32) {
                 float* result_temp = gpuBufferManager->customCudaMalloc<float>(1, 0, 0);
                 cudaMemcpy(result_temp, reinterpret_cast<float*>(column[agg]->data_wrapper.data), sizeof(float), cudaMemcpyDeviceToDevice);
-                column[agg] = make_shared_ptr<GPUColumn>(1, ColumnType::FLOAT32, reinterpret_cast<uint8_t*>(result_temp));
-            } else if (column[agg]->data_wrapper.type == ColumnType::FLOAT64) {
+                column[agg] = make_shared_ptr<GPUColumn>(1, GPUColumnType(GPUColumnTypeId::FLOAT32), reinterpret_cast<uint8_t*>(result_temp));
+            } else if (column[agg]->data_wrapper.type.id() == GPUColumnTypeId::FLOAT64) {
                 double* result_temp = gpuBufferManager->customCudaMalloc<double>(1, 0, 0);
                 cudaMemcpy(result_temp, reinterpret_cast<double*>(column[agg]->data_wrapper.data), sizeof(double), cudaMemcpyDeviceToDevice);
-                column[agg] = make_shared_ptr<GPUColumn>(1, ColumnType::FLOAT64, reinterpret_cast<uint8_t*>(result_temp));
-            } else if (column[agg]->data_wrapper.type == ColumnType::BOOLEAN) {
+                column[agg] = make_shared_ptr<GPUColumn>(1, GPUColumnType(GPUColumnTypeId::FLOAT64), reinterpret_cast<uint8_t*>(result_temp));
+            } else if (column[agg]->data_wrapper.type.id() == GPUColumnTypeId::BOOLEAN) {
                 uint8_t* result_temp = gpuBufferManager->customCudaMalloc<uint8_t>(1, 0, 0);
                 cudaMemcpy(result_temp, reinterpret_cast<uint8_t*>(column[agg]->data_wrapper.data), sizeof(uint8_t), cudaMemcpyDeviceToDevice);
-                column[agg] = make_shared_ptr<GPUColumn>(1, ColumnType::BOOLEAN, reinterpret_cast<uint8_t*>(result_temp));
-            } else if (column[agg]->data_wrapper.type == ColumnType::VARCHAR) {
+                column[agg] = make_shared_ptr<GPUColumn>(1, GPUColumnType(GPUColumnTypeId::BOOLEAN), reinterpret_cast<uint8_t*>(result_temp));
+            } else if (column[agg]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
                 uint64_t* length = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
                 cudaMemcpy(length, column[agg]->data_wrapper.offset + 1, sizeof(uint64_t), cudaMemcpyDeviceToHost);
 
@@ -126,7 +126,7 @@ void cudf_aggregate(vector<shared_ptr<GPUColumn>>& column, uint64_t num_aggregat
                 uint64_t* new_offset = gpuBufferManager->customCudaMalloc<uint64_t>(2, 0, 0);
                 cudaMemcpy(new_offset, column[agg]->data_wrapper.offset, 2 * sizeof(uint64_t), cudaMemcpyDeviceToDevice);
 
-                column[agg] = make_shared_ptr<GPUColumn>(1, ColumnType::VARCHAR, reinterpret_cast<uint8_t*>(result_temp), new_offset, length[0], true);
+                column[agg] = make_shared_ptr<GPUColumn>(1, GPUColumnType(GPUColumnTypeId::VARCHAR), reinterpret_cast<uint8_t*>(result_temp), new_offset, length[0], true);
             }
         } 
         else {

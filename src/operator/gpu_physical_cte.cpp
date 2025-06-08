@@ -82,7 +82,7 @@ SinkResultType GPUPhysicalCTE::Sink(GPUIntermediateRelation &input_relation) con
 		gpuBufferManager->lockAllocation(working_table_gpu->columns[col_idx]->data_wrapper.data, 0);
 		gpuBufferManager->lockAllocation(working_table_gpu->columns[col_idx]->row_ids, 0);
 		// If the column type is VARCHAR, also lock the offset allocation
-		if (working_table_gpu->columns[col_idx]->data_wrapper.type == ColumnType::VARCHAR) {
+		if (working_table_gpu->columns[col_idx]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
 			gpuBufferManager->lockAllocation(working_table_gpu->columns[col_idx]->data_wrapper.offset, 0);
 		}
 	}

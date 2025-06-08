@@ -12,7 +12,7 @@ void cudf_orderby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColu
         SIRIUS_LOG_DEBUG("Input size is 0");
         for (idx_t col = 0; col < num_projections; col++) {
             bool old_unique = projection[col]->is_unique;
-            if (projection[col]->data_wrapper.type == ColumnType::VARCHAR) {
+            if (projection[col]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
                 projection[col] = make_shared_ptr<GPUColumn>(0, projection[col]->data_wrapper.type, projection[col]->data_wrapper.data, projection[col]->data_wrapper.offset, 0, true);
             } else {
                 projection[col] = make_shared_ptr<GPUColumn>(0, projection[col]->data_wrapper.type, projection[col]->data_wrapper.data);
@@ -75,7 +75,7 @@ void cudf_orderby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColu
     //copy the projection columns to a new array
     // GPUColumn** projection_columns = new GPUColumn*[num_projections];
     // for (int projection_idx = 0; projection_idx < num_projections; projection_idx++) {
-    //     if (projection[projection_idx]->data_wrapper.type == ColumnType::VARCHAR) {
+    //     if (projection[projection_idx]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
     //         uint64_t* temp_offset = gpuBufferManager->customCudaMalloc<uint64_t>(projection[projection_idx]->column_length, 0, false);
     //         uint8_t* temp_column = gpuBufferManager->customCudaMalloc<uint8_t>(projection[projection_idx]->data_wrapper.num_bytes, 0, false);
     //         callCudaMemcpyDeviceToDevice<uint64_t>(temp_offset, projection[projection_idx]->data_wrapper.offset, projection[projection_idx]->column_length, 0);
