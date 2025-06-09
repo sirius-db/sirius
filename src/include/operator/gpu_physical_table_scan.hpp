@@ -17,7 +17,9 @@ enum ScanDataType {
 	FLOAT64,
 	BOOLEAN,
 	DATE,
-	VARCHAR
+	VARCHAR,
+	DECIMAL32,
+	DECIMAL64
 };
 
 enum CompareType {

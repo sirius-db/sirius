@@ -61,6 +61,17 @@ struct GpuExpressionState
         return cudf::data_type(cudf::type_id::TIMESTAMP_DAYS);
       case LogicalTypeId::VARCHAR:
         return cudf::data_type(cudf::type_id::STRING);
+      case LogicalTypeId::DECIMAL: {
+        switch (logical_type.InternalType()) {
+          case PhysicalType::INT32:
+            return cudf::data_type(cudf::type_id::DECIMAL32, DecimalType::GetScale(logical_type));
+          case PhysicalType::INT64:
+            return cudf::data_type(cudf::type_id::DECIMAL64, DecimalType::GetScale(logical_type));
+          default:
+            throw InvalidInputException("GetCudfType: Unsupported duckdb decimal physical type: %d",
+                                        static_cast<int>(logical_type.InternalType()));
+        }
+      }
       default:
         throw InvalidInputException("GetCudfType: Unsupported duckdb type: %d", static_cast<int>(logical_type.id()));
     }
