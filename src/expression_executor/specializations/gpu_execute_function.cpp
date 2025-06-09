@@ -149,7 +149,7 @@ struct NumericBinaryFunctionDispatcher
       : executor(exec)
   {}
 
-  // Left scalar binary operator
+  // Left scalar binary operator for numeric types
   template <typename T>
   std::unique_ptr<cudf::column> DoLeftScalarBinaryOp(const T& left_value,
                                                      const cudf::column_view& right,
@@ -165,7 +165,24 @@ struct NumericBinaryFunctionDispatcher
                                   executor.resource_ref);
   }
 
-  // Right scalar binary operator
+  // Left scalar binary operator for decimal types
+  template <typename T>
+  std::unique_ptr<cudf::column> DoLeftScalarBinaryOp(typename T::rep left_value,
+                                                     numeric::scale_type scale,
+                                                     const cudf::column_view& right,
+                                                     const cudf::data_type& return_type)
+  {
+    auto left_decimal_scalar = cudf::fixed_point_scalar<T>(
+      left_value, scale, true, cudf::get_default_stream(), executor.resource_ref);
+    return cudf::binary_operation(left_decimal_scalar,
+                                  right,
+                                  BinOp,
+                                  return_type,
+                                  cudf::get_default_stream(),
+                                  executor.resource_ref);
+  }
+
+  // Right scalar binary operator for numeric types
   template <typename T>
   std::unique_ptr<cudf::column> DoRightScalarBinaryOp(const cudf::column_view& left,
                                                       const T& right_value,
@@ -175,6 +192,23 @@ struct NumericBinaryFunctionDispatcher
       cudf::numeric_scalar(right_value, true, cudf::get_default_stream(), executor.resource_ref);
     return cudf::binary_operation(left,
                                   right_numeric_scalar,
+                                  BinOp,
+                                  return_type,
+                                  cudf::get_default_stream(),
+                                  executor.resource_ref);
+  }
+
+  // Right scalar binary operator for decimal types
+  template <typename T>
+  std::unique_ptr<cudf::column> DoRightScalarBinaryOp(const cudf::column_view& left,
+                                                      typename T::rep right_value,
+                                                      numeric::scale_type scale,
+                                                      const cudf::data_type& return_type)
+  {
+    auto right_decimal_scalar = cudf::fixed_point_scalar<T>(
+      right_value, scale, true, cudf::get_default_stream(), executor.resource_ref);
+    return cudf::binary_operation(left,
+                                  right_decimal_scalar,
                                   BinOp,
                                   return_type,
                                   cudf::get_default_stream(),
@@ -205,6 +239,16 @@ struct NumericBinaryFunctionDispatcher
           return DoLeftScalarBinaryOp(left_value.GetValue<float_t>(), right->view(), return_type);
         case cudf::type_id::FLOAT64:
           return DoLeftScalarBinaryOp(left_value.GetValue<double_t>(), right->view(), return_type);
+        case cudf::type_id::DECIMAL32:
+          return DoLeftScalarBinaryOp<numeric::decimal32>(
+            left_value.GetValueUnsafe<int32_t>(),
+            numeric::scale_type{duckdb::DecimalType::GetScale(left_value.type())},
+            right->view(), return_type);
+        case cudf::type_id::DECIMAL64:
+          return DoLeftScalarBinaryOp<numeric::decimal64>(
+            left_value.GetValueUnsafe<int64_t>(),
+            numeric::scale_type{duckdb::DecimalType::GetScale(left_value.type())},
+            right->view(), return_type);
         case cudf::type_id::BOOL8:
           throw NotImplementedException("Execute[Function]: Boolean types not supported for "
                                         "numeric binary operations!");
@@ -229,6 +273,16 @@ struct NumericBinaryFunctionDispatcher
           return DoRightScalarBinaryOp(left->view(), right_value.GetValue<float_t>(), return_type);
         case cudf::type_id::FLOAT64:
           return DoRightScalarBinaryOp(left->view(), right_value.GetValue<double_t>(), return_type);
+        case cudf::type_id::DECIMAL32:
+          return DoRightScalarBinaryOp<numeric::decimal32>(
+            left->view(), right_value.GetValueUnsafe<int32_t>(),
+            numeric::scale_type{duckdb::DecimalType::GetScale(right_value.type())},
+            return_type);
+        case cudf::type_id::DECIMAL64:
+          return DoRightScalarBinaryOp<numeric::decimal64>(
+            left->view(), right_value.GetValueUnsafe<int64_t>(),
+            numeric::scale_type{duckdb::DecimalType::GetScale(right_value.type())},
+            return_type);
         case cudf::type_id::BOOL8:
           throw NotImplementedException("Execute[Function]: Boolean types not supported for "
                                         "numeric binary operations!");

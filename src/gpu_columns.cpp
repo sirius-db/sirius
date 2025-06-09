@@ -137,6 +137,22 @@ GPUColumn::convertToCudfColumn() {
             std::move(children)
         );
         return str_col;
+    } else if (data_wrapper.type.id() == GPUColumnTypeId::DECIMAL) {
+        cudf::data_type cudf_type;
+        switch (data_wrapper.getColumnTypeSize()) {
+            case sizeof(int32_t): {
+                cudf_type = cudf::data_type(cudf::type_id::DECIMAL32, data_wrapper.type.GetDecimalTypeInfo()->scale_);
+                break;
+            }
+            case sizeof(int64_t): {
+                cudf_type = cudf::data_type(cudf::type_id::DECIMAL64, data_wrapper.type.GetDecimalTypeInfo()->scale_);
+                break;
+            }
+            default:
+                throw duckdb::InternalException("Unsupported sirius DECIMAL column type size in `convertToCudfColumn()`: %zu",
+                                                data_wrapper.getColumnTypeSize());
+        }
+        return cudf::column_view(cudf_type, size, reinterpret_cast<void*>(data_wrapper.data), nullptr, 0);
     }
     throw duckdb::InternalException("Unsupported sirius column type in `convertToCudfColumn()`: %d", data_wrapper.type.id());
 }
