@@ -30,7 +30,7 @@ DataWrapper::DataWrapper(GPUColumnType _type, uint8_t* _data, uint64_t* _offset,
     data(_data), size(_size), type(_type), offset(_offset), num_bytes(_num_bytes), is_string_data(_is_string_data) {};
 
 size_t 
-DataWrapper::getColumnTypeSize() {
+DataWrapper::getColumnTypeSize() const {
     switch (type.id()) {
         case GPUColumnTypeId::INT32:
         case GPUColumnTypeId::DATE:

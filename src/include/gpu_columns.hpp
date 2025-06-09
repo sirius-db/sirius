@@ -100,7 +100,7 @@ public:
     size_t size; // number of rows in the column (currently equals to column_length)
     uint64_t* offset{nullptr};
     size_t num_bytes; // number of bytes in the column
-    size_t getColumnTypeSize();
+    size_t getColumnTypeSize() const;
     bool is_string_data{false};
 };
 
