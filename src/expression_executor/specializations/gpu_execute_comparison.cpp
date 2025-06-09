@@ -93,11 +93,11 @@ struct ComparisonDispatcher
                                               return_type);
         case cudf::type_id::FLOAT32:
           return DoScalarComparison<float_t>(left->view(),
-                                             right_value.GetValue<float>(),
+                                             right_value.GetValue<float_t>(),
                                              return_type);
         case cudf::type_id::FLOAT64:
           return DoScalarComparison<double_t>(left->view(),
-                                              right_value.GetValue<double>(),
+                                              right_value.GetValue<double_t>(),
                                               return_type);
         case cudf::type_id::BOOL8:
           return DoScalarComparison<bool>(left->view(), right_value.GetValue<bool>(), return_type);
