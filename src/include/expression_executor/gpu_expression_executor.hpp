@@ -46,6 +46,8 @@ struct GpuExpressionExecutor
   rmm::device_async_resource_ref resource_ref = GPUBufferManager::GetInstance().mr;
   // The input count for the current relation (needed for materializing constants)
   cudf::size_type input_count;
+  // Whether some input column is empty
+  bool has_null_input_column;
   // Static flag indicating whether to use cudf or sirius for string functions
   static constexpr bool use_cudf = USE_CUDF_EXPR;
 
@@ -58,6 +60,12 @@ struct GpuExpressionExecutor
 
   // Set the input count and columns for the expression executor
   void SetInputColumns(const GPUIntermediateRelation& input_relation);
+
+  // Before evaluating an expression, check the leaves for nullptrs
+  // (Assumes the input columns have already been set)
+  bool HasNullLeaf(const Expression& expr) const;
+  template <typename ExpressionT>
+  bool HasNullLeafLoop(const ExpressionT& expr) const;
 
   // Execute the set of expressions with the given input relation and store the result in the output
   // relation (Provides the main interface with client code for Projections).
