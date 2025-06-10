@@ -49,7 +49,7 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundConjunct
                                                  output_column->view(),
                                                  cudf::binary_operator::LOGICAL_AND,
                                                  return_type,
-                                                 cudf::get_default_stream(),
+                                                 execution_stream,
                                                  resource_ref);
           break;
         case ExpressionType::CONJUNCTION_OR:
@@ -57,7 +57,7 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundConjunct
                                                  output_column->view(),
                                                  cudf::binary_operator::LOGICAL_OR,
                                                  return_type,
-                                                 cudf::get_default_stream(),
+                                                 execution_stream,
                                                  resource_ref);
           break;
         default:

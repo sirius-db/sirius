@@ -26,8 +26,7 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundReferenc
       throw NotImplementedException(
         "Execute[Reference]: row_id_counts larger than int32_t are not supported in libcudf");
     }
-    // DispatchMaterialize will handle byte overflow from the materialized offsets
-    return GpuDispatcher::DispatchMaterialize(input_column.get(), resource_ref);
+    return GpuDispatcher::DispatchMaterialize(input_column.get(), resource_ref, execution_stream);
   }
   if (input_column->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR &&
       input_column->data_wrapper.num_bytes > INT32_MAX)
@@ -45,7 +44,7 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundReferenc
   // buffer manager)
   auto input_column_view = input_column->convertToCudfColumn();
   return std::make_unique<cudf::column>(input_column_view,
-                                        cudf::get_default_stream(),
+                                        execution_stream,
                                         resource_ref);
 }
 
