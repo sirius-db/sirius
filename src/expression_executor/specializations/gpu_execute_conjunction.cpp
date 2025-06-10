@@ -1,4 +1,5 @@
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/types.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "expression_executor/gpu_expression_executor.hpp"
 #include "expression_executor/gpu_expression_executor_state.hpp"
@@ -30,7 +31,7 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundConjunct
   std::unique_ptr<cudf::column> output_column;
   for (idx_t i = 0; i < expr.children.size(); i++)
   {
-    D_ASSERT(state->intermediate_columns[i].data_wrapper.type.id() == GPUColumnTypeId::BOOLEAN);
+    D_ASSERT(state->child_states[i]->expr.return_type = LogicalType::BOOLEAN;);
 
     auto current_result = Execute(*expr.children[i], state->child_states[i].get());
 
