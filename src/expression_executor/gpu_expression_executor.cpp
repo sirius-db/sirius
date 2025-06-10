@@ -1,4 +1,5 @@
 #include "expression_executor/gpu_expression_executor.hpp"
+#include "cuda_stream_view.hpp"
 #include "duckdb/common/exception.hpp"
 #include "expression_executor/gpu_dispatcher.hpp"
 #include "expression_executor/gpu_expression_executor_state.hpp"
@@ -65,7 +66,8 @@ void GpuExpressionExecutor::SetInputColumns(const GPUIntermediateRelation& input
   else
   {
     // All columns should have the same count
-    //TODO: This is assuming that all columns have the same size, which is not always true if the pipeline source is the hash table from RIGHT join
+    // TODO: This is assuming that all columns have the same size, which is not always true if the
+    // pipeline source is the hash table from RIGHT join
     const auto col = input_columns[0];
     // The input column may be null, in which case the expression evaluation should be a no-op
     input_count = col == nullptr            ? 0
@@ -75,10 +77,13 @@ void GpuExpressionExecutor::SetInputColumns(const GPUIntermediateRelation& input
 }
 
 void GpuExpressionExecutor::Execute(const GPUIntermediateRelation& input_relation,
-                                    GPUIntermediateRelation& output_relation)
+                                    GPUIntermediateRelation& output_relation,
+                                    rmm::cuda_stream_view stream)
 {
   D_ASSERT(expressions.size() == output_relation.columns);
   D_ASSERT(!expressions.empty());
+
+  execution_stream = stream;
   SetInputColumns(input_relation);
 
   // Loop over expressions to execute
@@ -110,11 +115,10 @@ void GpuExpressionExecutor::Execute(const GPUIntermediateRelation& input_relatio
     // Cast the `result` from libcudf to `return_type` if `result` has different types.
     // E.g., `extract(year from col)` from libcudf returns int16_t but duckdb requires int64_t
     auto cudf_return_type = GpuExpressionState::GetCudfType(expressions[i]->return_type);
-    if (result->type().id() != cudf_return_type.id()) {
-      result = cudf::cast(result->view(),
-                          cudf_return_type,
-                          cudf::get_default_stream(),
-                          resource_ref);
+    if (result->type().id() != cudf_return_type.id())
+    {
+      result =
+        cudf::cast(result->view(), cudf_return_type, cudf::get_default_stream(), resource_ref);
     }
 
     // Transfer to output relation (zero copy)
@@ -127,11 +131,13 @@ void GpuExpressionExecutor::Execute(const GPUIntermediateRelation& input_relatio
 }
 
 void GpuExpressionExecutor::Select(GPUIntermediateRelation& input_relation,
-                                   GPUIntermediateRelation& output_relation)
+                                   GPUIntermediateRelation& output_relation,
+                                  rmm::cuda_stream_view stream)
 {
   D_ASSERT(expressions.size() == 1);
   D_ASSERT(expressions[0]->return_type == LogicalType::BOOLEAN);
 
+  execution_stream = stream;
   SetInputColumns(input_relation);
 
   // If input count is zero, no-op
