@@ -16,22 +16,40 @@ Sirius is a GPU acceleration layer for SQL analytics. It plugs into existing eng
 - CUDA >= 11.2
 - CMake >= 3.30.4 (follow this [instruction](https://medium.com/@yulin_li/how-to-update-cmake-on-ubuntu-9602521deecb) to upgrade CMake)
 
-## Dependencies (Option 1): Use Docker Image
+## Dependencies (Option 1): Use AWS Image
+For users who have access to AWS and want to launch AWS EC2 instances to run Sirius, the following images are prepared with dependencies fully installed.
+
+|  AWS AZ   |                    AMI Name                     |        AMI ID         |
+|-----------|-------------------------------------------------|-----------------------|
+| us-east-2 | Sirius Dependencies AMI (Ubuntu 24.04) 20250611 | ami-016b589f441fecc5d |
+
+Supported EC2 instances: G4dn, G5, G6, Gr6, G6e.
+
+## Dependencies (Option 2): Use Docker Image
 To use the docker image with dependencies fully installed:
 ```
 sudo docker run --gpus all -it yifeiyang7/sirius_dependencies:latest bash
 ```
 
-Make sure both `nvidia-driver` and `nvidia-container-toolkit` are installed, `nvidia-driver` can be installed by
+If encounting errors like the following when running the docker image as above:
+```
+docker: Error response from daemon: could not select device driver “” with capabilities: [[gpu]].
+```
+This means `nvidia-driver` or `nvidia-container-toolkit` is not installed.
+
+To install `nvidia-driver`:
 ```
 sudo apt install nvidia-driver-535
 ```
-and `nvidia-container-toolkit` can be installed following the [instructions](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html). Then restart docker by
+
+To install `nvidia-container-toolkit`, please follow the [instructions](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
+
+Finally restart docker by
 ```
 sudo systemctl restart docker
 ```
 
-## Dependencies (Option 2): Install Manually
+## Dependencies (Option 3): Install Manually
 
 ### Install duckdb dependencies
 ```
