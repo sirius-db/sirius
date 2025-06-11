@@ -36,7 +36,8 @@ struct ExecuteNumericIn
 {
   static std::unique_ptr<cudf::column> Do(const BoundOperatorExpression& expr,
                                           const cudf::column_view& input_view,
-                                          rmm::device_async_resource_ref mr)
+                                          rmm::device_async_resource_ref mr, 
+                                          rmm::cuda_stream_view stream)
   {
     std::vector<T> children_vals;
     for (idx_t child = 1; child < expr.children.size(); ++child)
@@ -44,19 +45,19 @@ struct ExecuteNumericIn
       const auto& child_expression = expr.children[child]->Cast<BoundConstantExpression>();
       children_vals.push_back(child_expression.value.GetValue<T>());
     }
-    rmm::device_uvector<T> children_vals_d(children_vals.size(), rmm::cuda_stream_default, mr);
+    rmm::device_uvector<T> children_vals_d(children_vals.size(), stream, mr);
     CUDF_CUDA_TRY(cudaMemcpyAsync(children_vals_d.data(),
                                   children_vals.data(),
                                   children_vals.size() * sizeof(T),
                                   cudaMemcpyHostToDevice,
-                                  cudf::get_default_stream()));
+                                  stream));
     cudf::column_view children_view(input_view.type(),
                                     static_cast<cudf::size_type>(children_vals.size()),
                                     children_vals_d.data(),
                                     nullptr,
                                     0,
                                     0);
-    return cudf::contains(children_view, input_view, cudf::get_default_stream(), mr);
+    return cudf::contains(children_view, input_view, stream, mr);
   }
 };
 // For strings
@@ -64,7 +65,8 @@ struct ExecuteStringIn
 {
   static std::unique_ptr<cudf::column> Do(const BoundOperatorExpression& expr,
                                           const cudf::column_view& input_view,
-                                          rmm::device_async_resource_ref mr)
+                                          rmm::device_async_resource_ref mr,
+                                        rmm::cuda_stream_view stream)
   {
     auto num_strings = static_cast<cudf::size_type>(expr.children.size() - 1);
     auto num_offsets = num_strings + 1;
@@ -84,20 +86,20 @@ struct ExecuteStringIn
     offsets.push_back(offset);
 
     // Allocate buffers and copy to device
-    rmm::device_uvector<char> chars_buffer(offset, cudf::get_default_stream(), mr);
+    rmm::device_uvector<char> chars_buffer(offset, stream, mr);
     rmm::device_uvector<cudf::size_type> offsets_buffer(num_offsets,
-                                                        cudf::get_default_stream(),
+                                                        stream,
                                                         mr);
     CUDF_CUDA_TRY(cudaMemcpyAsync(chars_buffer.data(),
                                   chars.data(),
                                   chars.size() * sizeof(char),
                                   cudaMemcpyHostToDevice,
-                                  cudf::get_default_stream()));
+                                  stream));
     CUDF_CUDA_TRY(cudaMemcpyAsync(offsets_buffer.data(),
                                   offsets.data(),
                                   offsets.size() * sizeof(cudf::size_type),
                                   cudaMemcpyHostToDevice,
-                                  cudf::get_default_stream()));
+                                  stream));
 
     // Make CuDF things
     auto offsets_col = std::make_unique<cudf::column>(cudf::data_type(cudf::type_id::INT32),
@@ -115,7 +117,7 @@ struct ExecuteStringIn
                                                          std::move(children));
 
     // Execute the search
-    return cudf::contains(in_strings_col->view(), input_view, cudf::get_default_stream(), mr);
+    return cudf::contains(in_strings_col->view(), input_view, stream, mr);
   }
 };
 
@@ -146,17 +148,17 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundOperator
       switch (left_type.id())
       {
         case cudf::type_id::INT32:
-          return ExecuteNumericIn<int32_t>::Do(expr, left->view(), resource_ref);
+          return ExecuteNumericIn<int32_t>::Do(expr, left->view(), resource_ref, execution_stream);
         case cudf::type_id::UINT64:
-          return ExecuteNumericIn<uint64_t>::Do(expr, left->view(), resource_ref);
+          return ExecuteNumericIn<uint64_t>::Do(expr, left->view(), resource_ref, execution_stream);
         case cudf::type_id::FLOAT32:
-          return ExecuteNumericIn<float_t>::Do(expr, left->view(), resource_ref);
+          return ExecuteNumericIn<float_t>::Do(expr, left->view(), resource_ref, execution_stream);
         case cudf::type_id::FLOAT64:
-          return ExecuteNumericIn<double_t>::Do(expr, left->view(), resource_ref);
+          return ExecuteNumericIn<double_t>::Do(expr, left->view(), resource_ref, execution_stream);
         case cudf::type_id::BOOL8:
-          return ExecuteNumericIn<uint8_t>::Do(expr, left->view(), resource_ref);
+          return ExecuteNumericIn<uint8_t>::Do(expr, left->view(), resource_ref, execution_stream);
         case cudf::type_id::STRING:
-          return ExecuteStringIn::Do(expr, left->view(), resource_ref);
+          return ExecuteStringIn::Do(expr, left->view(), resource_ref, execution_stream);
         default:
           SIRIUS_LOG_ERROR("UNKNOWN TYPE: {}", static_cast<int32_t>(left->type().id()));
           throw NotImplementedException("Execute[IN_CONSTANTS]: Unimplemented type!");
@@ -173,7 +175,7 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundOperator
                                                       comparator->view(),
                                                       cudf::binary_operator::EQUAL,
                                                       return_type,
-                                                      cudf::get_default_stream(),
+                                                      execution_stream,
                                                       resource_ref);
 
       if (child == 1)
@@ -188,7 +190,7 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundOperator
                                                      comparison_result->view(),
                                                      cudf::binary_operator::LOGICAL_OR,
                                                      return_type,
-                                                     cudf::get_default_stream(),
+                                                     execution_stream,
                                                      resource_ref);
       }
     }
@@ -199,7 +201,7 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundOperator
       // Negate the result and return
       return cudf::unary_operation(intermediate_result->view(),
                                    cudf::unary_operator::NOT,
-                                   cudf::get_default_stream(),
+                                   execution_stream,
                                    resource_ref);
     }
     else
@@ -222,7 +224,7 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundOperator
       case ExpressionType::OPERATOR_NOT:
         return cudf::unary_operation(child->view(),
                                      cudf::unary_operator::NOT,
-                                     cudf::get_default_stream(),
+                                     execution_stream,
                                      resource_ref);
       case ExpressionType::OPERATOR_IS_NULL:
         throw NotImplementedException("Execute[OPERATOR_IS_NULL]: Not yet implemented!");

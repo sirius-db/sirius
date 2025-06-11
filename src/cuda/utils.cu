@@ -35,8 +35,8 @@ __global__ void convert_int64_to_int128(uint8_t *input, uint8_t *output, size_t 
     // for (int i = 0; i < 8; ++i) {
       // output[idx * 16 + i] = input[idx * 8 + i];
       // output[idx * 16 + i + 8] = 0;
-      // output_ptr[0] = input_ptr[0];
-      // output_ptr[1] = 0; // Set the upper 64 bits to zero
+      output_ptr[0] = input_ptr[0];
+      output_ptr[1] = 0; // Set the upper 64 bits to zero
     // }
   }
 }

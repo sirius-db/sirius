@@ -1,4 +1,5 @@
 #include "expression_executor/gpu_expression_executor.hpp"
+#include "cuda_stream_view.hpp"
 #include "duckdb/common/exception.hpp"
 #include "expression_executor/gpu_dispatcher.hpp"
 #include "expression_executor/gpu_expression_executor_state.hpp"
@@ -156,11 +157,13 @@ bool GpuExpressionExecutor::HasNullLeaf(const Expression& expr) const
 }
 
 void GpuExpressionExecutor::Execute(const GPUIntermediateRelation& input_relation,
-                                    GPUIntermediateRelation& output_relation)
+                                    GPUIntermediateRelation& output_relation,
+                                    rmm::cuda_stream_view stream)
 {
   D_ASSERT(expressions.size() == output_relation.columns.size());
   D_ASSERT(!expressions.empty());
 
+  execution_stream = stream;
   SetInputColumns(input_relation);
 
   // Loop over expressions to execute
@@ -208,11 +211,13 @@ void GpuExpressionExecutor::Execute(const GPUIntermediateRelation& input_relatio
 }
 
 void GpuExpressionExecutor::Select(GPUIntermediateRelation& input_relation,
-                                   GPUIntermediateRelation& output_relation)
+                                   GPUIntermediateRelation& output_relation,
+                                  rmm::cuda_stream_view stream)
 {
   D_ASSERT(expressions.size() == 1);
   D_ASSERT(expressions[0]->return_type == LogicalType::BOOLEAN);
 
+  execution_stream = stream;
   SetInputColumns(input_relation);
 
   // If the input count is zero or if there is a null leaf, just materialize
