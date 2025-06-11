@@ -184,7 +184,7 @@ std::unique_ptr<cudf::column> DoSubstring(const char* input_data,
    length);
 
   // Return a cudf::column
-  auto offsets_col = std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::INT32},
+  auto offsets_col = std::make_unique<cudf::column>(cudf::data_type{cudf::type_id::INT64},
                                                     offset_count,
                                                     output_offsets.release(),
                                                     rmm::device_buffer{0, stream, mr},
