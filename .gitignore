@@ -6,6 +6,7 @@ duckdb_unittest_tempdir/
 .DS_Store
 testext
 test/python/__pycache__/
+test/__pycache__/
 .Rhistory
 tpch-data/dbgen
 .vscode/
