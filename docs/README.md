@@ -146,7 +146,7 @@ To use the Sirius Python API, add the following code to the beginning of your Py
 ```
 import duckdb
 con = duckdb.connect('{DATABASE_NAME}.duckdb', config={"allow_unsigned_extensions": "true"})
-con.execute("load '/mnt/nvme/sirius/build/release/extension/sirius/sirius.duckdb_extension'")
+con.execute("load '{SIRIUS_HOME_PATH}/build/release/extension/sirius/sirius.duckdb_extension'")
 con.execute("call gpu_buffer_init('{GPU_CACHE_SIZE}', '{GPU_PROCESSING_SIZE}')")
 ```
 To execute query in Python:
