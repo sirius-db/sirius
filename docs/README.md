@@ -80,6 +80,12 @@ To build Sirius:
 ```
 make -j {nproc}
 ```
+Optionally, to use the Python API in Sirius, we also need to build the duckdb-python package with the following commands:
+```
+cd duckdb/tools/pythonpkg/
+pip install .
+cd $SIRIUS_HOME_PATH
+```
 
 ## Generating and Loading TPC-H dataset
 To generate the TPC-H dataset
@@ -96,14 +102,13 @@ To load the TPC-H dataset to duckdb:
 .read tpch_load_duckdb.sql
 ```
 
-## Running Sirius
-To run Sirius, simply start the shell with `./build/release/duckdb {DATABASE_NAME}.duckdb`. 
+## Running Sirius: CLI
+To run Sirius CLI, simply start the shell with `./build/release/duckdb {DATABASE_NAME}.duckdb`. 
 From the duckdb shell, initialize the Sirius buffer manager with `call gpu_buffer_init`. This API accepts 2 parameters, the GPU caching region size and the GPU processing region size. The GPU caching region is a memory region where the raw data is stored in GPUs, whereas the GPU processing region is where intermediate results are stored in GPUs (hash tables, join results .etc).
 For example, to set the caching region as 1 GB and the processing region as 2 GB, we can run the following command:
 ```
 call gpu_buffer_init("1 GB", "2 GB");
 ```
-
 After setting up Sirius, we can execute SQL queries using the `call gpu_processing`:
 ```
 call gpu_processing("select
@@ -129,11 +134,45 @@ order by
   revenue desc,
   o_orderdate");
 ```
-The cold run in Sirius would be significantly slower due to data loading from storage and conversion from DuckDB format to Sirius native format. Subsequent runs would be faster since it benefits from caching on GPU memory.
+**The cold run in Sirius would be significantly slower due to data loading from storage and conversion from DuckDB format to Sirius native format. Subsequent runs would be faster since it benefits from caching on GPU memory.**
 
 All 22 TPC-H queries are saved in tpch-queries.sql. To run all queries:
 ```
 .read tpch-queries.sql
+```
+
+## Running Sirius (Optional): Python API
+To use the Sirius Python API, add the following code to the beginning of your Python program:
+```
+import duckdb
+con = duckdb.connect('{DATABASE_NAME}.duckdb', config={"allow_unsigned_extensions": "true"})
+con.execute("load '/mnt/nvme/sirius/build/release/extension/sirius/sirius.duckdb_extension'")
+con.execute("call gpu_buffer_init('{GPU_CACHE_SIZE}', '{GPU_PROCESSING_SIZE}')")
+```
+To execute query in Python:
+```
+con.execute("call gpu_processing('select \
+    l_orderkey, \
+    sum(l_extendedprice * (1 - l_discount)) as revenue, \
+    o_orderdate, \
+    o_shippriority \
+from \
+    customer, \
+    orders, \
+    lineitem \
+where \
+    c_mktsegment = 1 \
+    and c_custkey = o_custkey \
+    and l_orderkey = o_orderkey \
+    and o_orderdate < 19950315 \
+    and l_shipdate > 19950315 \
+group by \
+    l_orderkey, \
+    o_orderdate, \
+    o_shippriority \
+order by \
+    revenue desc, \
+    o_orderdate')").fetchall()
 ```
 
 ## Testing
