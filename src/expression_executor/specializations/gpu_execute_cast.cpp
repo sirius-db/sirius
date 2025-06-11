@@ -17,7 +17,7 @@ GpuExpressionExecutor::InitializeState(const BoundCastExpression& expr,
 }
 
 
-// KEVIN: potential optimization path: if the child is a constant, skip Execute() for it
+// Note that constants are CASTed before they reach the execution engine
 std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundCastExpression& expr,
                                                              GpuExpressionState* state)
 {
@@ -30,7 +30,7 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundCastExpr
   // Execute the cast
   return cudf::cast(child->view(),
                     cudf::data_type{return_type_id},
-                    cudf::get_default_stream(),
+                    execution_stream,
                     resource_ref);
 }
 

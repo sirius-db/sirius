@@ -9,64 +9,64 @@
 namespace duckdb {
 
 //----------Kernels----------//
-template<typename IdxT>
-__global__ void get_new_length(const IdxT* prev_offsets, IdxT* new_len, IdxT num_strings, IdxT start_idx, IdxT length) {
+template<typename OffsetT, typename SizeT>
+__global__ void get_new_length(const OffsetT* prev_offsets, OffsetT* new_len, SizeT num_strings, OffsetT start_idx, OffsetT length) {
   // Get which string this thread workers on
-  IdxT tid = threadIdx.x + blockIdx.x * blockDim.x;
+  OffsetT tid = threadIdx.x + blockIdx.x * blockDim.x;
   if(tid >= num_strings) return; 
 
   // Determine the length of this substring
-  IdxT curr_str_start_idx = prev_offsets[tid]; IdxT curr_str_end_idx = prev_offsets[tid + 1];
-  IdxT substring_start_idx = min(curr_str_start_idx + start_idx, curr_str_end_idx);
-  IdxT substring_end_idx = min(substring_start_idx + length, curr_str_end_idx);
-  IdxT substring_length = substring_end_idx - substring_start_idx;
+  OffsetT curr_str_start_idx = prev_offsets[tid]; OffsetT curr_str_end_idx = prev_offsets[tid + 1];
+  OffsetT substring_start_idx = min(curr_str_start_idx + start_idx, curr_str_end_idx);
+  OffsetT substring_end_idx = min(substring_start_idx + length, curr_str_end_idx);
+  OffsetT substring_length = substring_end_idx - substring_start_idx;
   new_len[tid] = substring_length;
 }
 
-template<typename IdxT>
-__global__ void substring_copy_chars(const char* prev_chars, char* new_chars, const IdxT* prev_offsets, IdxT* new_offsets, IdxT num_strings, 
-    IdxT start_idx, IdxT length) {
+template<typename OffsetT, typename SizeT>
+__global__ void substring_copy_chars(const char* prev_chars, char* new_chars, const OffsetT* prev_offsets, OffsetT* new_offsets, SizeT num_strings, 
+    OffsetT start_idx, OffsetT length) {
 
   // Get which string this thread workers on
-  IdxT tid = threadIdx.x + blockIdx.x * blockDim.x;
+  OffsetT tid = threadIdx.x + blockIdx.x * blockDim.x;
   if(tid >= num_strings) return; 
 
   // Determine the range for this substring
-  IdxT curr_str_start_idx = prev_offsets[tid]; IdxT curr_str_end_idx = prev_offsets[tid + 1];
-  IdxT substring_start_idx = min(curr_str_start_idx + start_idx, curr_str_end_idx);
-  IdxT substring_end_idx = min(substring_start_idx + length, curr_str_end_idx);
-  IdxT substring_length = substring_end_idx - substring_start_idx;
+  OffsetT curr_str_start_idx = prev_offsets[tid]; OffsetT curr_str_end_idx = prev_offsets[tid + 1];
+  OffsetT substring_start_idx = min(curr_str_start_idx + start_idx, curr_str_end_idx);
+  OffsetT substring_end_idx = min(substring_start_idx + length, curr_str_end_idx);
+  OffsetT substring_length = substring_end_idx - substring_start_idx;
 
   // Copy over the chars
-  IdxT string_new_offset = new_offsets[tid];
+  OffsetT string_new_offset = new_offsets[tid];
   memcpy(new_chars + string_new_offset, prev_chars + substring_start_idx, substring_length * sizeof(char));
 }
 
 // Instantiations
-template __global__ void get_new_length<uint64_t>(const uint64_t* prev_offsets,
-                                                  uint64_t* new_len,
-                                                  uint64_t num_strings,
-                                                  uint64_t start_idx,
-                                                  uint64_t length);
-template __global__ void get_new_length<cudf::size_type>(const cudf::size_type* prev_offsets,
-                                                         cudf::size_type* new_len,
-                                                         cudf::size_type num_strings,
-                                                         cudf::size_type start_idx,
-                                                         cudf::size_type length);
-template __global__ void substring_copy_chars<uint64_t>(const char* prev_chars,
-                                                        char* new_chars,
-                                                        const uint64_t* prev_offsets,
-                                                        uint64_t* new_offsets,
-                                                        uint64_t num_strings,
-                                                        uint64_t start_idx,
-                                                        uint64_t length);
-template __global__ void substring_copy_chars<cudf::size_type>(const char* prev_chars,
-                                                               char* new_chars,
-                                                               const cudf::size_type* prev_offsets,
-                                                               cudf::size_type* new_offsets,
-                                                               cudf::size_type num_strings,
-                                                               cudf::size_type start_idx,
-                                                               cudf::size_type length);
+template __global__ void get_new_length<uint64_t, uint64_t>(const uint64_t* prev_offsets,
+                                                            uint64_t* new_len,
+                                                            uint64_t num_strings,
+                                                            uint64_t start_idx,
+                                                            uint64_t length);
+template __global__ void get_new_length<int64_t, cudf::size_type>(const int64_t* prev_offsets,
+                                                                  int64_t* new_len,
+                                                                  cudf::size_type num_strings,
+                                                                  int64_t start_idx,
+                                                                  int64_t length);
+template __global__ void substring_copy_chars<uint64_t, uint64_t>(const char* prev_chars,
+                                                                  char* new_chars,
+                                                                  const uint64_t* prev_offsets,
+                                                                  uint64_t* new_offsets,
+                                                                  uint64_t num_strings,
+                                                                  uint64_t start_idx,
+                                                                  uint64_t length);
+template __global__ void substring_copy_chars<int64_t, cudf::size_type>(const char* prev_chars,
+                                                                        char* new_chars,
+                                                                        const int64_t* prev_offsets,
+                                                                        int64_t* new_offsets,
+                                                                        cudf::size_type num_strings,
+                                                                        int64_t start_idx,
+                                                                        int64_t length);
 
 //----------Kernel Wrappers----------//
 std::tuple<char*, uint64_t*, uint64_t> PerformSubstring(char* char_data, uint64_t* str_indices, uint64_t num_chars, uint64_t num_strings, 
@@ -124,8 +124,8 @@ std::tuple<char*, uint64_t*, uint64_t> PerformSubstring(char* char_data, uint64_
 
 //----------Substring for CuDF compatibility----------//
 // Macro to simplify kernel launch syntax
-#define LAUNCH_KERNEL(K, T, N, S)                                                                  \
-  K<T><<<cuda::ceil_div((N), THREADS_PER_BLOCK), THREADS_PER_BLOCK, 0, S>>>
+#define LAUNCH_KERNEL(K, T1, T2, N, S)                                                             \
+  K<T1, T2><<<cuda::ceil_div((N), THREADS_PER_BLOCK), THREADS_PER_BLOCK, 0, S>>>
 
 // This is a replication of PerformSubstring() above for compatibility with CuDF
 // The key points are 1) avoid conversion back and forth from cudf::size_type and uint64_t
@@ -133,24 +133,24 @@ std::tuple<char*, uint64_t*, uint64_t> PerformSubstring(char* char_data, uint64_
 //                       to cudf::columns
 std::unique_ptr<cudf::column> DoSubstring(const char* input_data,
                                           cudf::size_type input_count,
-                                          const cudf::size_type* input_offsets,
-                                          cudf::size_type start_idx,
-                                          cudf::size_type length,
-                                          rmm::device_async_resource_ref mr)
+                                          const int64_t* input_offsets,
+                                          int64_t start_idx,
+                                          int64_t length,
+                                          rmm::device_async_resource_ref mr,
+                                          rmm::cuda_stream_view stream)
 {
   static_assert(std::is_same_v<int32_t, cudf::size_type>); // Sanity check
 
-  auto stream       = cudf::get_default_stream();
   auto offset_count = input_count + 1;
 
   // Allocate temporary string length and output offsets buffer
-  rmm::device_uvector<cudf::size_type> temp_string_lengths(offset_count, stream, mr);
-  rmm::device_uvector<cudf::size_type> output_offsets(offset_count, stream, mr);
+  rmm::device_uvector<int64_t> temp_string_lengths(offset_count, stream, mr);
+  rmm::device_uvector<int64_t> output_offsets(offset_count, stream, mr);
   // Set the last string length to 0, so that the exclusive scan places the total sum at the end
-  CUDF_CUDA_TRY(cudaMemset(temp_string_lengths.data() + input_count, 0, sizeof(cudf::size_type)));
+  CUDF_CUDA_TRY(cudaMemset(temp_string_lengths.data() + input_count, 0, sizeof(int64_t)));
 
   // Compute the new lengths
-  LAUNCH_KERNEL(get_new_length, cudf::size_type, input_count, stream)
+  LAUNCH_KERNEL(get_new_length, int64_t, cudf::size_type, input_count, stream)
   (input_offsets, temp_string_lengths.data(), input_count, start_idx, length);
 
   // Compute the new offsets
@@ -174,7 +174,7 @@ std::unique_ptr<cudf::column> DoSubstring(const char* input_data,
   rmm::device_uvector<char> output_data(output_bytes, stream, mr);
 
   // Copy the substring data
-  LAUNCH_KERNEL(substring_copy_chars, cudf::size_type, input_count, stream)
+  LAUNCH_KERNEL(substring_copy_chars, int64_t, cudf::size_type, input_count, stream)
   (input_data,
    output_data.data(),
    input_offsets,

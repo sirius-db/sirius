@@ -68,7 +68,7 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundCaseExpr
       auto any_result = cudf::reduce(current_mask->view(),
                                      *cudf::make_any_aggregation<cudf::reduce_aggregation>(),
                                      cudf::data_type(cudf::type_id::BOOL8),
-                                     cudf::get_default_stream(),
+                                     execution_stream,
                                      resource_ref);
       if (static_cast<cudf::scalar_type_t<bool>*>(any_result.get())->value())
       {
@@ -84,7 +84,7 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundCaseExpr
     current_output    = cudf::copy_if_else(current_then->view(),
                                         current_output->view(),
                                         current_mask->view(),
-                                        cudf::get_default_stream(),
+                                        execution_stream,
                                         resource_ref);
   }
   return std::move(current_output);
