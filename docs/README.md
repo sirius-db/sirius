@@ -33,12 +33,12 @@ sudo systemctl restart docker
 
 ## Dependencies (Option 2): Install Manually
 
-#### Install duckdb dependencies
+### Install duckdb dependencies
 ```
 sudo apt-get update && sudo apt-get install -y git g++ cmake ninja-build libssl-dev
 ```
 
-#### Install CUDA
+### Install CUDA
 If CUDA is not installed, download [here](https://developer.nvidia.com/cuda-downloads). Follow the instructions for the deb(local) installer and complete the [post-installation steps](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/#mandatory-actions).
 
 Verify installation:
@@ -47,7 +47,7 @@ nvcc --version
 nvidia-smi
 ```
 
-#### Install libcudf dependencies
+### Install libcudf dependencies
 libcudf will be installed via conda/miniconda. Miniconda can be downloaded [here](https://www.anaconda.com/docs/getting-started/miniconda/install). After downloading miniconda, install libcudf by running these commands:
 ```
 conda create --name libcudf-env
