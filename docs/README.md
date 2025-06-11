@@ -151,34 +151,43 @@ con.execute("call gpu_buffer_init('{GPU_CACHE_SIZE}', '{GPU_PROCESSING_SIZE}')")
 ```
 To execute query in Python:
 ```
-con.execute("call gpu_processing('select \
-    l_orderkey, \
-    sum(l_extendedprice * (1 - l_discount)) as revenue, \
-    o_orderdate, \
-    o_shippriority \
-from \
-    customer, \
-    orders, \
-    lineitem \
-where \
-    c_mktsegment = 1 \
-    and c_custkey = o_custkey \
-    and l_orderkey = o_orderkey \
-    and o_orderdate < 19950315 \
-    and l_shipdate > 19950315 \
-group by \
-    l_orderkey, \
-    o_orderdate, \
-    o_shippriority \
-order by \
-    revenue desc, \
-    o_orderdate')").fetchall()
+con.execute('''
+    call gpu_processing("select
+      l_orderkey,
+      sum(l_extendedprice * (1 - l_discount)) as revenue,
+      o_orderdate,
+      o_shippriority
+    from
+      customer,
+      orders,
+      lineitem
+    where
+      c_mktsegment = 1
+      and c_custkey = o_custkey
+      and l_orderkey = o_orderkey
+      and o_orderdate < 19950315
+      and l_shipdate > 19950315
+    group by
+      l_orderkey,
+      o_orderdate,
+      o_shippriority
+    order by
+      revenue desc,
+      o_orderdate")
+            ''').fetchall()
 ```
 
-## Testing
-Sirius provides a unit test that compares Sirius against DuckDB for correctness across all 22 TPC-H queries. To run the unittest, generate SF=1 TPC-H dataset using method described [here](https://github.com/sirius-db/sirius?tab=readme-ov-file#generating-tpc-h-dataset) and run the unittest using the following command:
+## Correctness Testing
+Sirius provides a unit test that compares Sirius against DuckDB for correctness across all 22 TPC-H queries. To run the unittest, generate SF=1 TPC-H dataset using the method described [here](https://github.com/sirius-db/sirius?tab=readme-ov-file#generating-tpc-h-dataset) and run the unittest using the following command:
 ```
 make test
+```
+
+## Performance Testing
+Make sure to build the duckdb-python package before running this test using the method described [here](https://github.com/sirius-db/sirius?tab=readme-ov-file#building-sirius). To test Sirius performance against DuckDB across all 22 TPC-H queries, run the following command (replace {SF} with the desired scale factor):
+```
+python3 test/generate_test_data.py {SF}
+python3 test/performance_test.py {SF}
 ```
 
 ## Logging
