@@ -55,6 +55,9 @@ void GpuExpressionExecutor::Initialize(const Expression& expr, GpuExpressionExec
 
 void GpuExpressionExecutor::SetInputColumns(const GPUIntermediateRelation& input_relation)
 {
+  input_count           = 0;
+  has_null_input_column = false;
+
   // Shallow copy the columns
   input_columns = input_relation.columns;
 
@@ -65,22 +68,99 @@ void GpuExpressionExecutor::SetInputColumns(const GPUIntermediateRelation& input
   }
   else
   {
-    // All columns should have the same count
-    // TODO: This is assuming that all columns have the same size, which is not always true if the
-    // pipeline source is the hash table from RIGHT join
-    const auto col = input_columns[0];
-    // The input column may be null, in which case the expression evaluation should be a no-op
-    input_count = col == nullptr            ? 0
-                  : col->row_ids == nullptr ? static_cast<cudf::size_type>(col->column_length)
-                                            : static_cast<cudf::size_type>(col->row_id_count);
+    // All columns that are not null should have the same count
+    for (const auto& col : input_columns)
+    {
+      const auto temp_count = col == nullptr ? 0
+                              : col->row_ids == nullptr
+                                ? static_cast<cudf::size_type>(col->column_length)
+                                : static_cast<cudf::size_type>(col->row_id_count);
+      if (temp_count > 0)
+      {
+        input_count = temp_count;
+      }
+      else
+      {
+        has_null_input_column = true;
+      }
+    }
   }
+}
+
+// Helper template function for HasNullLeaf()
+template <typename ExpressionT>
+bool GpuExpressionExecutor::HasNullLeafLoop(const ExpressionT& expr) const
+{
+  for (const auto& child : expr.children)
+  {
+    if (HasNullLeaf(*child))
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool GpuExpressionExecutor::HasNullLeaf(const Expression& expr) const
+{
+  // Check if the expression is a null reference
+  switch (expr.GetExpressionClass())
+  {
+    case ExpressionClass::BOUND_BETWEEN: {
+      const auto& between_expr = expr.Cast<BoundBetweenExpression>();
+      return HasNullLeaf(*between_expr.input) || HasNullLeaf(*between_expr.lower) ||
+             HasNullLeaf(*between_expr.upper);
+    }
+    case ExpressionClass::BOUND_CASE: {
+      const auto& case_expr = expr.Cast<BoundCaseExpression>();
+      for (const auto& case_check : case_expr.case_checks)
+      {
+        if (HasNullLeaf(*case_check.when_expr) || HasNullLeaf(*case_check.then_expr))
+        {
+          return true;
+        }
+      }
+      return HasNullLeaf(*case_expr.else_expr);
+    }
+    case ExpressionClass::BOUND_CAST: {
+      const auto& cast_expr = expr.Cast<BoundCastExpression>();
+      return HasNullLeaf(*cast_expr.child);
+    }
+    case ExpressionClass::BOUND_COMPARISON: {
+      const auto& comp_expr = expr.Cast<BoundComparisonExpression>();
+      return HasNullLeaf(*comp_expr.left) || HasNullLeaf(*comp_expr.right);
+    }
+    case ExpressionClass::BOUND_CONJUNCTION: {
+      return HasNullLeafLoop(expr.Cast<BoundConjunctionExpression>());
+    }
+    case ExpressionClass::BOUND_CONSTANT: {
+      // Base case
+      return false;
+    }
+    case ExpressionClass::BOUND_FUNCTION: {
+      return HasNullLeafLoop(expr.Cast<BoundFunctionExpression>());
+    }
+    case ExpressionClass::BOUND_OPERATOR: {
+      return HasNullLeafLoop(expr.Cast<BoundOperatorExpression>());
+    }
+    case ExpressionClass::BOUND_REF: {
+      // Base case
+      const auto& ref_expr = expr.Cast<BoundReferenceExpression>();
+      const auto& col      = input_columns[ref_expr.index];
+      return col == nullptr || col->data_wrapper.data == nullptr;
+    }
+    default:
+      throw InternalException("HasNullLeaf called on an expression [" + expr.ToString() +
+                              "] with unsupported expression class!");
+  }
+  return false;
 }
 
 void GpuExpressionExecutor::Execute(const GPUIntermediateRelation& input_relation,
                                     GPUIntermediateRelation& output_relation,
                                     rmm::cuda_stream_view stream)
 {
-  D_ASSERT(expressions.size() == output_relation.columns);
+  D_ASSERT(expressions.size() == output_relation.columns.size());
   D_ASSERT(!expressions.empty());
 
   execution_stream = stream;
@@ -89,27 +169,27 @@ void GpuExpressionExecutor::Execute(const GPUIntermediateRelation& input_relatio
   // Loop over expressions to execute
   for (idx_t i = 0; i < expressions.size(); ++i)
   {
+    const auto& expr = *expressions[i];
+
     // If the expression is a reference, just pass it through
-    if (expressions[i]->expression_class == ExpressionClass::BOUND_REF)
+    if (expr.expression_class == ExpressionClass::BOUND_REF)
     {
-      auto input_idx             = expressions[i]->Cast<BoundReferenceExpression>().index;
+      auto input_idx             = expr.Cast<BoundReferenceExpression>().index;
       output_relation.columns[i] = input_relation.columns[input_idx];
       continue;
     }
 
-    // Make placeholder column
+    // Make placeholder output column
     output_relation.columns[i] =
-      make_shared_ptr<GPUColumn>(0,
-                                 convertLogicalTypeToColumnType(expressions[i]->return_type),
-                                 nullptr);
+      make_shared_ptr<GPUColumn>(0, convertLogicalTypeToColumnType(expr.return_type), nullptr);
 
-    // If input count is zero, no-op
-    if (input_count == 0)
+    // Skip execution if the input count is zero or if there is a null leaf
+    if (input_count == 0 || (has_null_input_column && HasNullLeaf(expr)))
     {
       continue;
     }
 
-    // Execute the expression
+    // Otherwise, execute the expression
     auto result = ExecuteExpression(i);
 
     // Cast the `result` from libcudf to `return_type` if `result` has different types.
@@ -123,7 +203,7 @@ void GpuExpressionExecutor::Execute(const GPUIntermediateRelation& input_relatio
 
     // Transfer to output relation (zero copy)
     output_relation.columns[i]->setFromCudfColumn(*result,
-                                                  false,
+                                                  false, // How to know?
                                                   nullptr,
                                                   0,
                                                   &GPUBufferManager::GetInstance());
@@ -140,12 +220,12 @@ void GpuExpressionExecutor::Select(GPUIntermediateRelation& input_relation,
   execution_stream = stream;
   SetInputColumns(input_relation);
 
-  // If input count is zero, no-op
-  if (input_count == 0)
+  // If the input count is zero or if there is a null leaf, just materialize
+  if (input_count == 0 || (has_null_input_column && HasNullLeaf(*expressions[0])))
   {
     HandleMaterializeRowIDs(input_relation,
                             output_relation,
-                            input_count,
+                            0,
                             nullptr,
                             &GPUBufferManager::GetInstance(),
                             true);

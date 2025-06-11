@@ -116,7 +116,7 @@ struct MaterializeString
     rmm::device_uvector<int64_t> temp_string_lengths(offset_count, stream, mr);
     rmm::device_uvector<int64_t> output_offsets(offset_count, stream, mr);
     // Set the last string length to 0, so that the exclusive scan places the total sum at the end
-    CUDF_CUDA_TRY(cudaMemset(temp_string_lengths.data() + row_id_count, 0, sizeof(int64_t)));
+    CUDF_CUDA_TRY(cudaMemsetAsync(temp_string_lengths.data() + row_id_count, 0, sizeof(int64_t), stream));
 
     // Gather the string lengths
     thrust::transform(exec,
