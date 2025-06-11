@@ -502,12 +502,12 @@ std::string SiriusExtension::Name() {
 
 extern "C" {
 
-DUCKDB_EXTENSION_API void Sirius_init(duckdb::DatabaseInstance &db) {
+DUCKDB_EXTENSION_API void sirius_init(duckdb::DatabaseInstance &db) {
     duckdb::DuckDB db_wrapper(db);
     db_wrapper.LoadExtension<duckdb::SiriusExtension>();
 }
 
-DUCKDB_EXTENSION_API const char *Sirius_version() {
+DUCKDB_EXTENSION_API const char *sirius_version() {
 	return duckdb::DuckDB::LibraryVersion();
 }
 }
