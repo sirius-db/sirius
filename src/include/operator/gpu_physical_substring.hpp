@@ -11,9 +11,10 @@ shared_ptr<GPUColumn> HandleSubString(shared_ptr<GPUColumn> string_column, uint6
 // For CuDF compatibility
 std::unique_ptr<cudf::column> DoSubstring(const char* input_data,
                                           cudf::size_type input_count,
-                                          const cudf::size_type* input_offsets,
-                                          cudf::size_type start_idx,
-                                          cudf::size_type length,
-                                          rmm::device_async_resource_ref mr);
+                                          const int64_t* input_offsets,
+                                          int64_t start_idx,
+                                          int64_t length,
+                                          rmm::device_async_resource_ref mr,
+                                          rmm::cuda_stream_view stream = rmm::cuda_stream_default);
 
 } // namespace duckdb

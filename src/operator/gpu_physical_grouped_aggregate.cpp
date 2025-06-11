@@ -646,14 +646,14 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 		HandleDuplicateElimination(group_by_column, gpuBufferManager, num_group_keys);
 	} else {
 		bool string_cudf_supported = true;
-		for (int col = 0; col < num_group_keys; col++) {
-			// if types is VARCHAR, check the number of bytes
-			if (group_by_column[col]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
-				if (group_by_column[col]->data_wrapper.num_bytes > INT32_MAX) {
-					string_cudf_supported = false;
-				}
-			}
-		}
+		// for (int col = 0; col < num_group_keys; col++) {
+		// 	// if types is VARCHAR, check the number of bytes
+		// 	if (group_by_column[col]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
+		// 		if (group_by_column[col]->data_wrapper.num_bytes > INT32_MAX) {
+		// 			string_cudf_supported = false;
+		// 		}
+		// 	}
+		// }
 		if (group_by_column[0]->column_length > INT32_MAX || aggregate_column[0]->column_length > INT32_MAX || !string_cudf_supported) {
 			HandleGroupByAggregateExpression(group_by_column, aggregate_column, gpuBufferManager, aggregates, num_group_keys);
 		} else {

@@ -44,24 +44,24 @@ struct ComparisonDispatcher
     {
       // Create a string scalar from the constant value
       auto string_scalar =
-        cudf::string_scalar(right_value, true, cudf::get_default_stream(), executor.resource_ref);
+        cudf::string_scalar(right_value, true, executor.execution_stream, executor.resource_ref);
       return cudf::binary_operation(left,
                                     string_scalar,
                                     ComparisonOp,
                                     return_type,
-                                    cudf::get_default_stream(),
+                                    executor.execution_stream,
                                     executor.resource_ref);
     }
     else
     {
       // Create a numeric scalar from the constant value
       auto numeric_scalar =
-        cudf::numeric_scalar(right_value, true, cudf::get_default_stream(), executor.resource_ref);
+        cudf::numeric_scalar(right_value, true, executor.execution_stream, executor.resource_ref);
       return cudf::binary_operation(left,
                                     numeric_scalar,
                                     ComparisonOp,
                                     return_type,
-                                    cudf::get_default_stream(),
+                                    executor.execution_stream,
                                     executor.resource_ref);
     }
   }
@@ -118,7 +118,7 @@ struct ComparisonDispatcher
                                   right->view(),
                                   ComparisonOp,
                                   return_type,
-                                  cudf::get_default_stream(),
+                                  executor.execution_stream,
                                   executor.resource_ref);
   }
 };

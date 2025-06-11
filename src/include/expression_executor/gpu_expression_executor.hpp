@@ -23,7 +23,7 @@ namespace sirius
 
 /// CONFIG ///
 // Whether to use CuDF or Sirius for string functions
-#define USE_CUDF_EXPR true
+#define USE_CUDF_EXPR false
 /// CONFIG ///
 
 //----------GpuExpressionExecutor----------//
@@ -48,6 +48,8 @@ struct GpuExpressionExecutor
   cudf::size_type input_count;
   // Whether some input column is empty
   bool has_null_input_column;
+  // The stream in which to execute the given set of expressions
+  rmm::cuda_stream_view execution_stream;
   // Static flag indicating whether to use cudf or sirius for string functions
   static constexpr bool use_cudf = USE_CUDF_EXPR;
 
@@ -70,12 +72,15 @@ struct GpuExpressionExecutor
   // Execute the set of expressions with the given input relation and store the result in the output
   // relation (Provides the main interface with client code for Projections).
   void Execute(const GPUIntermediateRelation& input_relation,
-               GPUIntermediateRelation& output_relation);
+               GPUIntermediateRelation& output_relation,
+               rmm::cuda_stream_view stream = rmm::cuda_stream_default);
 
   // Execute the set of expressions with the given input relation and compact into the output
   // relation based on the resulting selection vector (Provides the main interface with client code
   // for Filters).
-  void Select(GPUIntermediateRelation& input_relation, GPUIntermediateRelation& output_relation);
+  void Select(GPUIntermediateRelation& input_relation,
+              GPUIntermediateRelation& output_relation,
+              rmm::cuda_stream_view stream = rmm::cuda_stream_default);
 
   // Execute the expression at the given index and return the result
   std::unique_ptr<cudf::column> ExecuteExpression(idx_t expression_idx);
