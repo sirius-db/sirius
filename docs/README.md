@@ -11,13 +11,13 @@ Sirius is a GPU acceleration layer for SQL analytics. It plugs into existing eng
   <img src="sirius-architecture.png" alt="Diagram" width="900"/>
 </p>
 
-## Supported OS/GPU/CUDA/CMake
+# Supported OS/GPU/CUDA/CMake
 - Ubuntu >= 20.04
 - NVIDIA Volta™ or higher with compute capability 7.0+
 - CUDA >= 11.2
 - CMake >= 3.30.4 (follow this [instruction](https://medium.com/@yulin_li/how-to-update-cmake-on-ubuntu-9602521deecb) to upgrade CMake)
 
-## Dependencies (Option 1): Use Docker Image
+# Dependencies (Option 1): Use Docker Image
 To use the docker image with dependencies fully installed:
 ```
 sudo docker run --gpus all -it yifeiyang7/sirius_dependencies:latest bash
@@ -32,7 +32,7 @@ and `nvidia-container-toolkit` can be installed following the [instructions](htt
 sudo systemctl restart docker
 ```
 
-## Dependencies (Option 2): Install Manually
+# Dependencies (Option 2): Install Manually
 
 ### Install duckdb dependencies
 ```
@@ -61,7 +61,7 @@ export USE_CUDF=1
 export LIBCUDF_ENV_PREFIX={PATH to libcudf-env}
 ```
 
-## Building Sirius
+# Building Sirius
 To clone the Sirius repository:
 ```
 git clone --recurse-submodules https://github.com/sirius-db/sirius.git
@@ -87,7 +87,7 @@ pip install .
 cd $SIRIUS_HOME_PATH
 ```
 
-## Generating and Loading TPC-H dataset
+# Generating and Loading TPC-H dataset
 To generate the TPC-H dataset
 ```
 unzip dbgen.zip
@@ -102,7 +102,7 @@ To load the TPC-H dataset to duckdb:
 .read tpch_load_duckdb.sql
 ```
 
-## Running Sirius: CLI
+# Running Sirius: CLI
 To run Sirius CLI, simply start the shell with `./build/release/duckdb {DATABASE_NAME}.duckdb`. 
 From the duckdb shell, initialize the Sirius buffer manager with `call gpu_buffer_init`. This API accepts 2 parameters, the GPU caching region size and the GPU processing region size. The GPU caching region is a memory region where the raw data is stored in GPUs, whereas the GPU processing region is where intermediate results are stored in GPUs (hash tables, join results .etc).
 For example, to set the caching region as 1 GB and the processing region as 2 GB, we can run the following command:
@@ -141,8 +141,8 @@ All 22 TPC-H queries are saved in tpch-queries.sql. To run all queries:
 .read tpch-queries.sql
 ```
 
-## Running Sirius (Optional): Python API
-To use the Sirius Python API, add the following code to the beginning of your Python program:
+# Running Sirius: Python API
+Make sure to build the duckdb-python package before using the Python API with the method described [here](https://github.com/sirius-db/sirius?tab=readme-ov-file#building-sirius). To use the Sirius Python API, add the following code to the beginning of your Python program:
 ```
 import duckdb
 con = duckdb.connect('{DATABASE_NAME}.duckdb', config={"allow_unsigned_extensions": "true"})
@@ -177,32 +177,32 @@ con.execute('''
             ''').fetchall()
 ```
 
-## Correctness Testing
+# Correctness Testing
 Sirius provides a unit test that compares Sirius against DuckDB for correctness across all 22 TPC-H queries. To run the unittest, generate SF=1 TPC-H dataset using the method described [here](https://github.com/sirius-db/sirius?tab=readme-ov-file#generating-tpc-h-dataset) and run the unittest using the following command:
 ```
 make test
 ```
 
-## Performance Testing
+# Performance Testing
 Make sure to build the duckdb-python package before running this test using the method described [here](https://github.com/sirius-db/sirius?tab=readme-ov-file#building-sirius). To test Sirius performance against DuckDB across all 22 TPC-H queries, run the following command (replace {SF} with the desired scale factor):
 ```
 python3 test/generate_test_data.py {SF}
 python3 test/performance_test.py {SF}
 ```
 
-## Logging
+# Logging
 Sirius uses [spdlog](https://github.com/gabime/spdlog) for logging messages during query execution. Default log directory is `${CMAKE_BINARY_DIR}/log` and default log level is `info`, which can be configured by environment variables `SIRIUS_LOG_DIR` and `SIRIUS_LOG_LEVEL`. For example:
 ```
 export SIRIUS_LOG_DIR={PATH for logging}
 export SIRIUS_LOG_LEVEL=debug
 ```
 
-## Performance
+# Performance
 Running TPC-H on SF=100, Sirius achieves ~10x speedup over existing CPU query engines at the same hardware rental cost, making it well-suited for interactive analytics, financial workloads, and ETL jobs.
 
 ![Performance](sirius-performance.png)
 
-## Limitations
+# Limitations
 Sirius is under active development, and several features are still in progress. Notable current limitations include:
 - **Working Set Size Limitations:** Sirius recently switches to libcudf to implement `FILTER`, `PROJECTION`, `JOIN`, `GROUP-BY`, `ORDER-BY`, `AGGREGATION`. However, since libcudf uses `int32_t` for row IDs and string offsets, this imposes limits on the maximum working set size that Sirius can currently handle. For string columns this imposes a ~2 GB limit, for `int32_t` columns this imposes a ~8 GB limit. See libcudf issue [#13159](https://github.com/rapidsai/cudf/issues/13159) for more details. We are actively addressing this by adding support for partitioning and chunked pipeline execution. See Sirius issue [#12](https://github.com/sirius-db/sirius/issues/12) for more details.
 - **Limited Data Type Support:** Sirius currently only supports `INTEGER`, `BIGINT`, `FLOAT`, `DOUBLE`, and `VARCHAR` data types. We are actively working on supporting additional data types—such as `DECIMAL`, `DATE/TIME`, and nested types. See issue [#20](https://github.com/sirius-db/sirius/issues/20) for more details.
@@ -211,7 +211,7 @@ Sirius is under active development, and several features are still in progress. 
 
 For a full list of current limitations and ongoing work, please refer to our [GitHub issues page](https://github.com/sirius-db/sirius/issues). **If these issues are encountered when running Sirius, Sirius will gracefully fallback to DuckDB query execution on CPUs.**
 
-## Future Roadmap
+# Future Roadmap
 Sirius is still under major development and we are working on adding more features to Sirius, such as [storage/disk support](https://github.com/sirius-db/sirius/issues/19), [multi-GPUs](https://github.com/sirius-db/sirius/issues/18), [multi-node](https://github.com/sirius-db/sirius/issues/18), more [operators](https://github.com/sirius-db/sirius/issues/21), [data types](https://github.com/sirius-db/sirius/issues/20), accelerating more engines, and many more.
 
 Sirius always welcomes new contributors! If you are interested, check our [website](https://www.sirius-db.com/), reach out to our [email](siriusdb@cs.wisc.edu), or join our [slack channel](https://join.slack.com/t/sirius-db/shared_invite/zt-33tuwt1sk-aa2dk0EU_dNjklSjIGW3vg).
