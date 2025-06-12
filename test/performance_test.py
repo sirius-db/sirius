@@ -8,7 +8,10 @@ from duckdb_queries import run_duckdb
 if __name__ == "__main__":
   con = duckdb.connect('performance_test.duckdb', config={"allow_unsigned_extensions": "true"})
   # con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
-  con.execute("load '/mnt/nvme/sirius/build/release/extension/sirius/sirius.duckdb_extension'")
+  extension_path = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    'build/release/extension/sirius/sirius.duckdb_extension')
+  con.execute("load '{}'".format(extension_path))
   
   SF = sys.argv[1]
   

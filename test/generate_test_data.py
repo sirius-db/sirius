@@ -5,7 +5,10 @@ import sys
 if __name__ == "__main__":
   con = duckdb.connect('performance_test.duckdb', config={"allow_unsigned_extensions": "true"})
 #   con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
-  con.execute("load '/mnt/nvme/sirius/build/release/extension/sirius/sirius.duckdb_extension'")
+  extension_path = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    'build/release/extension/sirius/sirius.duckdb_extension')
+  con.execute("load '{}'".format(extension_path))
   
   SF = sys.argv[1]
   command = f"cd dbgen && ./dbgen -f -s {SF} && mv *.tbl perf_test/"
@@ -16,6 +19,15 @@ if __name__ == "__main__":
   os.system(command)
 
   print("Creating Region, Nation, Part, Supplier, Partsupp, Customer, Orders, Lineitem tables...")
+  con.execute('DROP TABLE IF EXISTS REGION;')
+  con.execute('DROP TABLE IF EXISTS NATION;')
+  con.execute('DROP TABLE IF EXISTS PART;')
+  con.execute('DROP TABLE IF EXISTS SUPPLIER;')
+  con.execute('DROP TABLE IF EXISTS PARTSUPP;')
+  con.execute('DROP TABLE IF EXISTS CUSTOMER;')
+  con.execute('DROP TABLE IF EXISTS ORDERS;')
+  con.execute('DROP TABLE IF EXISTS LINEITEM;')
+
   con.execute('''
   CREATE TABLE REGION  (
       R_REGIONKEY  BIGINT NOT NULL UNIQUE PRIMARY KEY,
