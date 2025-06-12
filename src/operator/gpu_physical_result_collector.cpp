@@ -10,6 +10,7 @@
 #include "gpu_materialize.hpp"
 #include "log/logging.hpp"
 #include "utils.hpp"
+#include "expression_executor/gpu_expression_executor_state.hpp"
 
 namespace duckdb {
 
@@ -293,7 +294,7 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 		const GPUColumnType& col_type = input_relation.columns[col]->data_wrapper.type;
 		bool is_string = false;
 		if(col_type.id() != GPUColumnTypeId::VARCHAR) {
-			if (types[col].InternalType() == PhysicalType::INT128 && types[col].id() != LogicalTypeId::DECIMAL) {
+			if (types[col].InternalType() == PhysicalType::INT128) {
 				if (materialized_relation.columns[col]->data_wrapper.type.id() == GPUColumnTypeId::INT64) {
 					SIRIUS_LOG_DEBUG("Converting INT64 to INT128 for column {}", col);
 					uint8_t* temp_int128 = gpuBufferManager->customCudaMalloc<uint8_t>(size_bytes * 2, 0, 0);
@@ -306,6 +307,33 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 					convertInt32ToInt128(materialized_relation.columns[col]->data_wrapper.data, temp_int128, materialized_relation.columns[col]->column_length);
 					host_data[col] = gpuBufferManager->customCudaHostAlloc<uint8_t>(size_bytes * 4);
 					callCudaMemcpyDeviceToHost<uint8_t>(host_data[col], temp_int128, size_bytes * 4, 0);
+				} else if (materialized_relation.columns[col]->data_wrapper.type.id() == GPUColumnTypeId::DECIMAL) {
+					if (types[col].id() != LogicalTypeId::DECIMAL) {
+						throw InternalException("Destiation type is not decimal when performing INT128 (physical type) conversion for decimal,"
+																		" destination type: %d", static_cast<int>(types[col].id()));
+					}
+					int from_decimal_size = materialized_relation.columns[col]->data_wrapper.getColumnTypeSize();
+					int from_scale = materialized_relation.columns[col]->data_wrapper.type.GetDecimalTypeInfo()->scale_;
+					int to_width = DecimalType::GetWidth(types[col]);
+					int to_scale = DecimalType::GetScale(types[col]);
+					if (from_decimal_size != sizeof(__int128_t) || from_scale != to_scale) {
+						// `from` and `to` decimal types are different, need to cast
+						auto from_cudf_column_view = materialized_relation.columns[col]->convertToCudfColumn();
+						auto to_cudf_type = sirius::GpuExpressionState::GetCudfType(types[col]);
+						auto to_cudf_column = cudf::cast(from_cudf_column_view,
+																						 to_cudf_type,
+																						 cudf::get_default_stream(),
+																						 GPUBufferManager::GetInstance().mr);
+						size_bytes = materialized_relation.columns[col]->column_length * sizeof(__int128_t);
+						host_data[col] = gpuBufferManager->customCudaHostAlloc<uint8_t>(size_bytes);
+						uint8_t* to_cudf_data = const_cast<uint8_t*>(to_cudf_column->view().data<uint8_t>());
+						callCudaMemcpyDeviceToHost<uint8_t>(host_data[col], to_cudf_data, size_bytes, 0);
+					} else {
+						// `from` and `to` decimal types are the same
+						host_data[col] = gpuBufferManager->customCudaHostAlloc<uint8_t>(size_bytes);
+						callCudaMemcpyDeviceToHost<uint8_t>(host_data[col], materialized_relation.columns[col]->data_wrapper.data, size_bytes, 0);
+					}
+					materialized_relation.columns[col]->data_wrapper.type.SetDecimalTypeInfo(to_width, to_scale);
 				} else {
 					throw NotImplementedException("Unsupported siris column type for INT128 conversion: %d",
 																				static_cast<int>(materialized_relation.columns[col]->data_wrapper.type.id()));

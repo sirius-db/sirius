@@ -206,6 +206,21 @@ GPUColumn::setFromCudfColumn(cudf::column& cudf_column, bool _is_unique, int32_t
         data_wrapper.type = GPUColumnType(GPUColumnTypeId::BOOLEAN);
         data_wrapper.num_bytes = col_size * data_wrapper.getColumnTypeSize();
         data_wrapper.offset = nullptr;
+    } else if (col_type.id() == cudf::type_id::DECIMAL32) {
+        data_wrapper.is_string_data = false;
+        data_wrapper.type = GPUColumnType(GPUColumnTypeId::DECIMAL);
+        data_wrapper.type.SetDecimalTypeInfo(Decimal::MAX_WIDTH_INT32, col_type.scale());
+        data_wrapper.num_bytes = col_size * data_wrapper.getColumnTypeSize();
+        data_wrapper.offset = nullptr;
+    } else if (col_type.id() == cudf::type_id::DECIMAL64) {
+        data_wrapper.is_string_data = false;
+        data_wrapper.type = GPUColumnType(GPUColumnTypeId::DECIMAL);
+        data_wrapper.type.SetDecimalTypeInfo(Decimal::MAX_WIDTH_INT64, col_type.scale());
+        data_wrapper.num_bytes = col_size * data_wrapper.getColumnTypeSize();
+        data_wrapper.offset = nullptr;
+    } else {
+        throw NotImplementedException("Unsupported cudf data type in `setFromCudfColumn`: %d",
+                                      static_cast<int>(col_type.id()));
     }
 
     if (_row_ids != nullptr) {
