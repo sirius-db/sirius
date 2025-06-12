@@ -206,6 +206,11 @@ GPUColumn::setFromCudfColumn(cudf::column& cudf_column, bool _is_unique, int32_t
         data_wrapper.type = GPUColumnType(GPUColumnTypeId::BOOLEAN);
         data_wrapper.num_bytes = col_size * data_wrapper.getColumnTypeSize();
         data_wrapper.offset = nullptr;
+    } else if (col_type == cudf::data_type(cudf::type_id::TIMESTAMP_DAYS)) {
+        data_wrapper.is_string_data = false;
+        data_wrapper.type = GPUColumnType(GPUColumnTypeId::DATE);
+        data_wrapper.num_bytes = col_size * data_wrapper.getColumnTypeSize();
+        data_wrapper.offset = nullptr;
     } else if (col_type.id() == cudf::type_id::DECIMAL32) {
         data_wrapper.is_string_data = false;
         data_wrapper.type = GPUColumnType(GPUColumnTypeId::DECIMAL);
