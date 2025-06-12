@@ -28,11 +28,11 @@ For users who have access to AWS and want to launch AWS EC2 instances to run Sir
   <tr>
     <td rowspan="3">Sirius Dependencies AMI (Ubuntu 24.04) 20250611</td>
     <td>us-east-1</td>
-    <td>ami-016b589f441fecc5d</td>
+    <td>ami-06020f2b2161f5d62</td>
   </tr>
   <tr>
     <td>us-east-2</td>
-    <td>ami-06020f2b2161f5d62</td>
+    <td>ami-016b589f441fecc5d</td>
   </tr>
   <tr>
     <td>us-west-2</td>
