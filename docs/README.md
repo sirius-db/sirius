@@ -19,11 +19,28 @@ Sirius is a GPU acceleration layer for SQL analytics. It plugs into existing eng
 ## Dependencies (Option 1): Use AWS Image
 For users who have access to AWS and want to launch AWS EC2 instances to run Sirius, the following images are prepared with dependencies fully installed.
 
-|  AWS AZ   |                    AMI Name                     |        AMI ID         |
-|-----------|-------------------------------------------------|-----------------------|
-| us-east-2 | Sirius Dependencies AMI (Ubuntu 24.04) 20250611 | ami-016b589f441fecc5d |
+<table border="1" cellpadding="6" cellspacing="0">
+  <tr>
+    <td><b>AMI Name</b></td>
+    <td><b>AWS Region</b></td>
+    <td><b>AMI ID</b></td>
+  </tr>
+  <tr>
+    <td rowspan="3">Sirius Dependencies AMI (Ubuntu 24.04) 20250611</td>
+    <td>us-east-1</td>
+    <td>ami-016b589f441fecc5d</td>
+  </tr>
+  <tr>
+    <td>us-east-2</td>
+    <td>ami-06020f2b2161f5d62</td>
+  </tr>
+  <tr>
+    <td>us-west-2</td>
+    <td>ami-060043bae3f9b5eb4</td>
+  </tr>
+</table>
 
-Supported EC2 instances: G4dn, G5, G6, Gr6, G6e, P4, P5, P6
+Supported EC2 instances: G4dn, G5, G6, Gr6, G6e, P4, P5, P6.
 
 ## Dependencies (Option 2): Use Docker Image
 To use the docker image with dependencies fully installed:
