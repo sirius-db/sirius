@@ -44,24 +44,24 @@ struct ComparisonDispatcher
     {
       // Create a string scalar from the constant value
       auto string_scalar =
-        cudf::string_scalar(right_value, true, cudf::get_default_stream(), executor.resource_ref);
+        cudf::string_scalar(right_value, true, executor.execution_stream, executor.resource_ref);
       return cudf::binary_operation(left,
                                     string_scalar,
                                     ComparisonOp,
                                     return_type,
-                                    cudf::get_default_stream(),
+                                    executor.execution_stream,
                                     executor.resource_ref);
     }
     else
     {
       // Create a numeric scalar from the constant value
       auto numeric_scalar =
-        cudf::numeric_scalar(right_value, true, cudf::get_default_stream(), executor.resource_ref);
+        cudf::numeric_scalar(right_value, true, executor.execution_stream, executor.resource_ref);
       return cudf::binary_operation(left,
                                     numeric_scalar,
                                     ComparisonOp,
                                     return_type,
-                                    cudf::get_default_stream(),
+                                    executor.execution_stream,
                                     executor.resource_ref);
     }
   }
@@ -93,11 +93,11 @@ struct ComparisonDispatcher
                                               return_type);
         case cudf::type_id::FLOAT32:
           return DoScalarComparison<float_t>(left->view(),
-                                             right_value.GetValue<float>(),
+                                             right_value.GetValue<float_t>(),
                                              return_type);
         case cudf::type_id::FLOAT64:
           return DoScalarComparison<double_t>(left->view(),
-                                              right_value.GetValue<double>(),
+                                              right_value.GetValue<double_t>(),
                                               return_type);
         case cudf::type_id::BOOL8:
           return DoScalarComparison<bool>(left->view(), right_value.GetValue<bool>(), return_type);
@@ -118,7 +118,7 @@ struct ComparisonDispatcher
                                   right->view(),
                                   ComparisonOp,
                                   return_type,
-                                  cudf::get_default_stream(),
+                                  executor.execution_stream,
                                   executor.resource_ref);
   }
 };

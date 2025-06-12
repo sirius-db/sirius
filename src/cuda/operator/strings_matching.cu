@@ -1,4 +1,5 @@
 #include "cuda_helper.cuh"
+#include "cuda_stream_view.hpp"
 #include "gpu_physical_strings_matching.hpp"
 #include "gpu_buffer_manager.hpp"
 #include "log/logging.hpp"
@@ -56,12 +57,12 @@ template __global__ void determine_start_kernel<uint64_t>(const uint64_t* indice
                                                           uint64_t num_workers,
                                                           uint64_t chunk_size,
                                                           uint64_t last_char);
-template __global__ void determine_start_kernel<cudf::size_type>(const cudf::size_type* indices,
-                                                                 cudf::size_type num_strings,
-                                                                 cudf::size_type* worker_start_term,
-                                                                 cudf::size_type num_workers,
-                                                                 cudf::size_type chunk_size,
-                                                                 cudf::size_type last_char);
+template __global__ void determine_start_kernel<int64_t>(const int64_t* indices,
+                                                         int64_t num_strings,
+                                                         int64_t* worker_start_term,
+                                                         int64_t num_workers,
+                                                         int64_t chunk_size,
+                                                         int64_t last_char);
 
 template<typename IdxT>
 __global__ void single_term_kmp_kernel(const char* char_data, const IdxT* indices, const int* kmp_automato, const IdxT* worker_start_term, bool* results, 
@@ -117,17 +118,17 @@ template __global__ void single_term_kmp_kernel<uint64_t>(const char* char_data,
                                                           uint64_t sub_chunk_size,
                                                           uint64_t last_char,
                                                           uint64_t num_strings);
-template __global__ void single_term_kmp_kernel<cudf::size_type>(const char* char_data,
-                                                                 const cudf::size_type* indices,
-                                                                 const int* kmp_automato,
-                                                                 const cudf::size_type* worker_start_term,
-                                                                 bool* results,
-                                                                 cudf::size_type pattern_size,
-                                                                 cudf::size_type num_workers,
-                                                                 cudf::size_type chunk_size,
-                                                                 cudf::size_type sub_chunk_size,
-                                                                 cudf::size_type last_char,
-                                                                 cudf::size_type num_strings);
+template __global__ void single_term_kmp_kernel<int64_t>(const char* char_data,
+                                                         const int64_t* indices,
+                                                         const int* kmp_automato,
+                                                         const int64_t* worker_start_term,
+                                                         bool* results,
+                                                         int64_t pattern_size,
+                                                         int64_t num_workers,
+                                                         int64_t chunk_size,
+                                                         int64_t sub_chunk_size,
+                                                         int64_t last_char,
+                                                         int64_t num_strings);
 
 __global__ void write_matching_rows(bool* results, uint64_t num_strings, uint64_t* matching_rows, uint64_t* count) {
   uint64_t tile_size = gridDim.x * blockDim.x;
@@ -305,19 +306,19 @@ template __global__ void multi_term_kmp_kernel<uint64_t>(const char* char_data,
                                                          uint64_t sub_chunk_size,
                                                          uint64_t last_char,
                                                          uint64_t num_strings);
-template __global__ void multi_term_kmp_kernel<cudf::size_type>(const char* char_data,
-                                                                const cudf::size_type* indices,
-                                                                const int* kmp_automato,
-                                                                cudf::size_type* worker_start_term,
-                                                                cudf::size_type* curr_term_answer,
-                                                                cudf::size_type* prev_term_answer,
-                                                                bool* found_term,
-                                                                int pattern_size,
-                                                                cudf::size_type num_workers,
-                                                                cudf::size_type chunk_size,
-                                                                cudf::size_type sub_chunk_size,
-                                                                cudf::size_type last_char,
-                                                                cudf::size_type num_strings);
+template __global__ void multi_term_kmp_kernel<int64_t>(const char* char_data,
+                                                        const int64_t* indices,
+                                                        const int* kmp_automato,
+                                                        int64_t* worker_start_term,
+                                                        int64_t* curr_term_answer,
+                                                        int64_t* prev_term_answer,
+                                                        bool* found_term,
+                                                        int pattern_size,
+                                                        int64_t num_workers,
+                                                        int64_t chunk_size,
+                                                        int64_t sub_chunk_size,
+                                                        int64_t last_char,
+                                                        int64_t num_strings);
 
 template<typename IdxT>
 __global__ void initialize_term_answers(IdxT* curr_term_answer, IdxT num_chars, IdxT num_strings) {
@@ -331,9 +332,8 @@ __global__ void initialize_term_answers(IdxT* curr_term_answer, IdxT num_chars, 
 template __global__ void initialize_term_answers<uint64_t>(uint64_t* curr_term_answer,
                                                            uint64_t num_chars,
                                                            uint64_t num_strings);
-template __global__ void initialize_term_answers<cudf::size_type>(cudf::size_type* curr_term_answer,
-                                                                  cudf::size_type num_chars,
-                                                                  cudf::size_type num_strings);
+template __global__ void
+initialize_term_answers<int64_t>(int64_t* curr_term_answer, int64_t num_chars, int64_t num_strings);
 
 void MultiStringMatching(char* char_data, uint64_t* str_indices, std::vector<std::string> all_terms,
        uint64_t* &row_id, uint64_t* &count, uint64_t num_chars, uint64_t num_strings, int not_equal) {
@@ -509,13 +509,13 @@ template __global__ void prefix_kernel<uint64_t>(const char* char_data,
                                                  const char* prefix_chars,
                                                  uint64_t num_prefix_chars,
                                                  bool* results);
-template __global__ void prefix_kernel<cudf::size_type>(const char* char_data,
-                                                        cudf::size_type num_chars,
-                                                        const cudf::size_type* str_indices,
-                                                        cudf::size_type num_strings,
-                                                        const char* prefix_chars,
-                                                        cudf::size_type num_prefix_chars,
-                                                        bool* results);
+template __global__ void prefix_kernel<int64_t>(const char* char_data,
+                                                int64_t num_chars,
+                                                const int64_t* str_indices,
+                                                int64_t num_strings,
+                                                const char* prefix_chars,
+                                                int64_t num_prefix_chars,
+                                                bool* results);
 
 void PrefixMatching(char* char_data, uint64_t* str_indices, std::string match_prefix, uint64_t* &row_id, uint64_t* &count, 
   uint64_t num_chars, uint64_t num_strings, int not_equal) {
@@ -589,17 +589,16 @@ void PrefixMatching(char* char_data, uint64_t* str_indices, std::string match_pr
 //----------String Matching----------//
 std::unique_ptr<cudf::column> DoStringMatching(const char* input_data,
                                                cudf::size_type input_count,
-                                               const cudf::size_type* input_offsets,
-                                               cudf::size_type byte_count,
+                                               const int64_t* input_offsets,
+                                               int64_t byte_count,
                                                const std::string& match_string,
-                                               rmm::device_async_resource_ref mr)
+                                               rmm::device_async_resource_ref mr,
+                                               rmm::cuda_stream_view stream)
 {
   static_assert(std::is_same_v<int32_t, cudf::size_type>); // Sanity check
 
-  auto stream = cudf::get_default_stream();
-
   // Compute the automato for this string
-  const auto match_length      = static_cast<cudf::size_type>(match_string.size());
+  const auto match_length      = static_cast<int32_t>(match_string.size());
   const auto* match_char       = match_string.c_str();
   const auto kmp_automato_size = match_length * CHARS_IN_BYTE;
   std::vector<int32_t> kmp_automato(kmp_automato_size, 0);
@@ -619,11 +618,10 @@ std::unique_ptr<cudf::column> DoStringMatching(const char* input_data,
   }
 
   // Copy match string to device memory
-  const auto match_byte_count = static_cast<cudf::size_type>(match_string.size());
-  rmm::device_uvector<char> d_match_string(match_byte_count, stream, mr);
+  rmm::device_uvector<char> d_match_string(match_length, stream, mr);
   CUDF_CUDA_TRY(cudaMemcpyAsync(d_match_string.data(),
                                 match_string.data(),
-                                match_byte_count,
+                                match_length * sizeof(char),
                                 cudaMemcpyHostToDevice,
                                 stream));
 
@@ -636,8 +634,8 @@ std::unique_ptr<cudf::column> DoStringMatching(const char* input_data,
                                 stream));
 
   // Allocate start terms memory and the boolean output buffer
-  const auto workers_needed = cuda::ceil_div(byte_count, CHUNK_SIZE);
-  rmm::device_uvector<int32_t> d_worker_start_term(workers_needed, stream, mr);
+  const auto workers_needed = cuda::ceil_div(byte_count, static_cast<int64_t>(CHUNK_SIZE));
+  rmm::device_uvector<int64_t> d_worker_start_term(workers_needed, stream, mr);
   rmm::device_uvector<bool> output(input_count, stream, mr);
 
   // Initialize the output buffer to false
@@ -645,9 +643,9 @@ std::unique_ptr<cudf::column> DoStringMatching(const char* input_data,
 
   // Launch kernel to determine the start offset for each worker
   LAUNCH_KERNEL_DIV(determine_start_kernel,
-                    cudf::size_type,
+                    int64_t,
                     workers_needed,
-                    THREADS_PER_BLOCK_STRINGS,
+                    static_cast<int64_t>(THREADS_PER_BLOCK_STRINGS),
                     stream)
   (input_offsets,
    input_count,
@@ -658,7 +656,7 @@ std::unique_ptr<cudf::column> DoStringMatching(const char* input_data,
 
   // Launch KMP kernel
   LAUNCH_KERNEL_DIRECT(single_term_kmp_kernel,
-                       cudf::size_type,
+                       int64_t,
                        workers_needed,
                        THREADS_PER_BLOCK_STRINGS,
                        stream)
@@ -681,20 +679,19 @@ std::unique_ptr<cudf::column> DoStringMatching(const char* input_data,
 //----------Multi-Term String Matching----------//
 std::unique_ptr<cudf::column> DoMultiStringMatching(const char* input_data,
                                                     cudf::size_type input_count,
-                                                    const cudf::size_type* input_offsets,
-                                                    cudf::size_type byte_count,
+                                                    const int64_t* input_offsets,
+                                                    int64_t byte_count,
                                                     const std::vector<std::string>& match_strings,
-                                                    rmm::device_async_resource_ref mr)
+                                                    rmm::device_async_resource_ref mr,
+                                                    rmm::cuda_stream_view stream)
 {
   static_assert(std::is_same_v<int32_t, cudf::size_type>); // Sanity check
-
-  auto stream = cudf::get_default_stream();
 
   // Compute the automato for each term
   std::vector<rmm::device_uvector<int32_t>> d_kmp_automatos;
   for (const auto& match_string : match_strings)
   {
-    const auto match_length      = static_cast<cudf::size_type>(match_string.size());
+    const auto match_length      = static_cast<int32_t>(match_string.size());
     const auto* match_char       = match_string.c_str();
     const auto kmp_automato_size = match_length * CHARS_IN_BYTE;
     std::vector<int32_t> kmp_automato(kmp_automato_size, 0);
@@ -723,26 +720,25 @@ std::unique_ptr<cudf::column> DoMultiStringMatching(const char* input_data,
   }
 
   // Allocate start terms memory, rotating answer indices, and the boolean output buffer
-  const auto workers_needed = cuda::ceil_div(byte_count, CHUNK_SIZE);
-  rmm::device_uvector<int32_t> d_worker_start_term(workers_needed, stream, mr);
-  rmm::device_uvector<cudf::size_type> d_answer_idxs(input_count, stream, mr);
-  rmm::device_uvector<cudf::size_type> d_prev_answer_idxs(input_count, stream, mr);
+  const auto workers_needed = cuda::ceil_div(byte_count, static_cast<int64_t>(CHUNK_SIZE));
+  rmm::device_uvector<int64_t> d_worker_start_term(workers_needed, stream, mr);
+  rmm::device_uvector<int64_t> d_answer_idxs(input_count, stream, mr);
+  rmm::device_uvector<int64_t> d_prev_answer_idxs(input_count, stream, mr);
   rmm::device_uvector<bool> output(input_count, stream, mr);
 
   // Initialize answer indices to zero, and copy offsets to previous answer indices
-  CUDF_CUDA_TRY(
-    cudaMemsetAsync(d_answer_idxs.data(), 0, input_count * sizeof(cudf::size_type), stream));
+  CUDF_CUDA_TRY(cudaMemsetAsync(d_answer_idxs.data(), 0, input_count * sizeof(int64_t), stream));
   CUDF_CUDA_TRY(cudaMemcpyAsync(d_prev_answer_idxs.data(),
                                 input_offsets,
-                                input_count * sizeof(cudf::size_type),
+                                input_count * sizeof(int64_t),
                                 cudaMemcpyDeviceToDevice,
                                 stream));
 
   // Launch kernel to determine the start offset for each worker
   LAUNCH_KERNEL_DIV(determine_start_kernel,
-                    cudf::size_type,
+                    int64_t,
                     workers_needed,
-                    THREADS_PER_BLOCK_STRINGS,
+                    static_cast<int64_t>(THREADS_PER_BLOCK_STRINGS),
                     stream)
   (input_offsets,
    input_count,
@@ -756,13 +752,13 @@ std::unique_ptr<cudf::column> DoMultiStringMatching(const char* input_data,
   auto* prev_answer_idxs_ptr = d_prev_answer_idxs.data();
   for (int32_t i = 0; i < match_strings.size(); i++)
   {
-    const auto curr_term_length    = static_cast<cudf::size_type>(match_strings[i].size());
+    const auto curr_term_length    = static_cast<int32_t>(match_strings[i].size());
     const auto* curr_term_automato = d_kmp_automatos[i].data();
 
     // Preprocessing
     CUDF_CUDA_TRY(cudaMemsetAsync(output.data(), 0, input_count * sizeof(bool), stream));
     LAUNCH_KERNEL_DIV(initialize_term_answers,
-                      cudf::size_type,
+                      int64_t,
                       input_count,
                       THREADS_PER_BLOCK_STRINGS,
                       stream)
@@ -770,7 +766,7 @@ std::unique_ptr<cudf::column> DoMultiStringMatching(const char* input_data,
 
     // Launch the KMP kernel for the current term
     LAUNCH_KERNEL_DIRECT(multi_term_kmp_kernel,
-                         cudf::size_type,
+                         int64_t,
                          workers_needed,
                          THREADS_PER_BLOCK_STRINGS,
                          stream)
@@ -803,17 +799,16 @@ std::unique_ptr<cudf::column> DoMultiStringMatching(const char* input_data,
 //----------Prefix Matching----------//
 std::unique_ptr<cudf::column> DoPrefixMatching(const char* input_data,
                                                cudf::size_type input_count,
-                                               const cudf::size_type* input_offsets,
-                                               cudf::size_type byte_count,
+                                               const int64_t* input_offsets,
+                                               int64_t byte_count,
                                                const std::string& match_prefix,
-                                               rmm::device_async_resource_ref mr)
+                                               rmm::device_async_resource_ref mr,
+                                               rmm::cuda_stream_view stream)
 {
   static_assert(std::is_same_v<int32_t, cudf::size_type>); // Sanity check
 
-  auto stream = cudf::get_default_stream();
-
   // Copy prefix string to device memory
-  const auto prefix_byte_count = static_cast<cudf::size_type>(match_prefix.size());
+  const auto prefix_byte_count = static_cast<int32_t>(match_prefix.size());
   rmm::device_uvector<char> d_match_prefix(prefix_byte_count, stream, mr);
   CUDF_CUDA_TRY(cudaMemcpyAsync(d_match_prefix.data(),
                                 match_prefix.data(),
@@ -825,7 +820,7 @@ std::unique_ptr<cudf::column> DoPrefixMatching(const char* input_data,
   rmm::device_uvector<bool> output(input_count, stream, mr);
 
   // Launch kernel to perform prefix matching
-  LAUNCH_KERNEL_DIV(prefix_kernel, cudf::size_type, input_count, BLOCK_THREADS, stream)
+  LAUNCH_KERNEL_DIV(prefix_kernel, int64_t, input_count, BLOCK_THREADS, stream)
   (input_data,
    byte_count,
    input_offsets,

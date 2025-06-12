@@ -33,19 +33,19 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundBetweenE
                                           lower->view(),
                                           cudf::binary_operator::GREATER_EQUAL,
                                           cudf::data_type{cudf::type_id::BOOL8},
-                                          cudf::get_default_stream(),
+                                          execution_stream,
                                           resource_ref);
   auto upper_cmp = cudf::binary_operation(input->view(),
                                           upper->view(),
                                           cudf::binary_operator::LESS_EQUAL,
                                           cudf::data_type{cudf::type_id::BOOL8},
-                                          cudf::get_default_stream(),
+                                          execution_stream,
                                           resource_ref);
   return cudf::binary_operation(lower_cmp->view(),
                                 upper_cmp->view(),
                                 cudf::binary_operator::LOGICAL_AND,
                                 cudf::data_type{cudf::type_id::BOOL8},
-                                cudf::get_default_stream(),
+                                execution_stream,
                                 resource_ref);
 }
 
