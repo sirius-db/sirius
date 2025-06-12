@@ -163,14 +163,14 @@ GPUPhysicalOrder::Sink(GPUIntermediateRelation &input_relation) const {
       throw NotImplementedException("Order by with column length greater than INT32_MAX is not supported");
     }
 
-    for (int col = 0; col < projections.size(); col++) {
-      // if types is VARCHAR, check the number of bytes
-      if (projection_columns[col]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
-        if (projection_columns[col]->data_wrapper.num_bytes > INT32_MAX) {
-          throw NotImplementedException("String column size greater than INT32_MAX is not supported");
-        }
-      }
-    }
+    // for (int col = 0; col < projections.size(); col++) {
+    //   // if types is VARCHAR, check the number of bytes
+    //   if (projection_columns[col]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
+    //     if (projection_columns[col]->data_wrapper.num_bytes > INT32_MAX) {
+    //       throw NotImplementedException("String column size greater than INT32_MAX is not supported");
+    //     }
+    //   }
+    // }
     HandleOrderBy(order_by_keys, projection_columns, orders, projections.size());
 
     for (int col = 0; col < projections.size(); col++) {

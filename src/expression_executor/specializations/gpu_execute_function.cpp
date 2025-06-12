@@ -91,7 +91,7 @@ struct StringMatchingDispatcher
         auto like = cudf::strings::like(cudf::strings_column_view(input_view),
                                         cudf::string_scalar(match_str),
                                         cudf::string_scalar(""),
-                                        cudf::get_default_stream(),
+                                        executor.execution_stream,
                                         executor.resource_ref);
 
         // LIKE or NOT LIKE?
@@ -104,26 +104,26 @@ struct StringMatchingDispatcher
           // Negate the match result
           return cudf::unary_operation(like->view(),
                                        cudf::unary_operator::NOT,
-                                       cudf::get_default_stream(),
+                                       executor.execution_stream,
                                        executor.resource_ref);
         }
       }
       else if constexpr (MatchType == StringMatchingType::CONTAINS)
       {
         const auto match_str_scalar =
-          cudf::string_scalar(match_str, true, cudf::get_default_stream(), executor.resource_ref);
+          cudf::string_scalar(match_str, true, executor.execution_stream, executor.resource_ref);
         return cudf::strings::contains(input_view,
                                        match_str_scalar,
-                                       cudf::get_default_stream(),
+                                       executor.execution_stream,
                                        executor.resource_ref);
       }
       else if constexpr (MatchType == StringMatchingType::PREFIX)
       {
         const auto match_str_scalar =
-          cudf::string_scalar(match_str, true, cudf::get_default_stream(), executor.resource_ref);
+          cudf::string_scalar(match_str, true, executor.execution_stream, executor.resource_ref);
         return cudf::strings::starts_with(input_view,
                                           match_str_scalar,
-                                          cudf::get_default_stream(),
+                                          executor.execution_stream,
                                           executor.resource_ref);
       }
     }
@@ -156,12 +156,12 @@ struct NumericBinaryFunctionDispatcher
                                                      const cudf::data_type& return_type)
   {
     auto left_numeric_scalar =
-      cudf::numeric_scalar(left_value, true, cudf::get_default_stream(), executor.resource_ref);
+      cudf::numeric_scalar(left_value, true, executor.execution_stream, executor.resource_ref);
     return cudf::binary_operation(left_numeric_scalar,
                                   right,
                                   BinOp,
                                   return_type,
-                                  cudf::get_default_stream(),
+                                  executor.execution_stream,
                                   executor.resource_ref);
   }
 
@@ -189,12 +189,12 @@ struct NumericBinaryFunctionDispatcher
                                                       const cudf::data_type& return_type)
   {
     auto right_numeric_scalar =
-      cudf::numeric_scalar(right_value, true, cudf::get_default_stream(), executor.resource_ref);
+      cudf::numeric_scalar(right_value, true, executor.execution_stream, executor.resource_ref);
     return cudf::binary_operation(left,
                                   right_numeric_scalar,
                                   BinOp,
                                   return_type,
-                                  cudf::get_default_stream(),
+                                  executor.execution_stream,
                                   executor.resource_ref);
   }
 
@@ -301,29 +301,32 @@ struct NumericBinaryFunctionDispatcher
                                   right->view(),
                                   BinOp,
                                   GpuExpressionState::GetCudfType(expr.return_type),
-                                  cudf::get_default_stream(),
+                                  executor.execution_stream,
                                   executor.resource_ref);
   }
 };
 
 //----------DatetimeExtractFunctionDispatcher----------//
 template <cudf::datetime::datetime_component COMP>
-struct DatetimeExtractFunctionDispatcher {
+struct DatetimeExtractFunctionDispatcher
+{
   // The executor
   GpuExpressionExecutor& executor;
 
   // Constructor
   explicit DatetimeExtractFunctionDispatcher(GpuExpressionExecutor& exec)
-      : executor(exec) {}
+      : executor(exec)
+  {}
 
   // Dispatch operator
   std::unique_ptr<cudf::column> operator()(const BoundFunctionExpression& expr,
-                                           GpuExpressionState* state) {
+                                           GpuExpressionState* state)
+  {
     D_ASSERT(expr.children.size() == 1);
     auto input = executor.Execute(*expr.children[0], state->child_states[0].get());
     return cudf::datetime::extract_datetime_component(input->view(),
                                                       COMP,
-                                                      cudf::get_default_stream(),
+                                                      executor.execution_stream,
                                                       executor.resource_ref);
   }
 };
@@ -386,7 +389,12 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundFunction
       const auto cudf_start = start_expr.value.GetValue<cudf::size_type>() - 1;
       const auto cudf_end   = len_expr.value.GetValue<cudf::size_type>() + cudf_start;
 
-      return cudf::strings::slice_strings(input_view, cudf_start, cudf_end);
+      return cudf::strings::slice_strings(input_view,
+                                          cudf_start,
+                                          cudf_end,
+                                          1, // Step
+                                          execution_stream,
+                                          resource_ref);
     }
     else
     {
@@ -396,7 +404,8 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundFunction
       return GpuDispatcher::DispatchSubstring(input->view(),
                                               sirius_start,
                                               sirius_len,
-                                              resource_ref);
+                                              resource_ref,
+                                              execution_stream);
     }
   }
   else if (func_str == LIKE_FUNC_STR)
@@ -421,15 +430,18 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundFunction
   }
 
   //----------Datetime Extract Functions----------//
-  else if (func_str == YEAR_FUNC_STR) {
+  else if (func_str == YEAR_FUNC_STR)
+  {
     DatetimeExtractFunctionDispatcher<cudf::datetime::datetime_component::YEAR> dispatcher(*this);
     return dispatcher(expr, state);
   }
-  else if (func_str == MONTH_FUNC_STR) {
+  else if (func_str == MONTH_FUNC_STR)
+  {
     DatetimeExtractFunctionDispatcher<cudf::datetime::datetime_component::MONTH> dispatcher(*this);
     return dispatcher(expr, state);
   }
-  else if (func_str == DAY_FUNC_STR) {
+  else if (func_str == DAY_FUNC_STR)
+  {
     DatetimeExtractFunctionDispatcher<cudf::datetime::datetime_component::DAY> dispatcher(*this);
     return dispatcher(expr, state);
   }

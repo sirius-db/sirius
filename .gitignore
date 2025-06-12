@@ -6,6 +6,7 @@ duckdb_unittest_tempdir/
 .DS_Store
 testext
 test/python/__pycache__/
+test/__pycache__/
 .Rhistory
 tpch-data/dbgen
 .vscode/
@@ -14,5 +15,6 @@ duckdb/*
 CMakeFiles/
 CMakeCache.txt
 dbgen/
+.venv
 cufile.log
 4stock_5day_avg_close.csv
