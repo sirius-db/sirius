@@ -251,6 +251,23 @@ GPUColumn::setFromCudfScalar(cudf::scalar& cudf_scalar, GPUBufferManager* gpuBuf
         callCudaMemcpyDeviceToDevice<uint8_t>(data_wrapper.data, reinterpret_cast<uint8_t*>(typed_scalar.data()), sizeof(uint8_t), 0);
         data_wrapper.type = GPUColumnType(GPUColumnTypeId::BOOLEAN);
         data_wrapper.num_bytes = sizeof(uint8_t);
+    } else if (scalar_type.id() == cudf::type_id::DECIMAL32){
+        auto& typed_scalar = static_cast<cudf::fixed_point_scalar<numeric::decimal32>&>(cudf_scalar);
+        data_wrapper.data = gpuBufferManager->customCudaMalloc<uint8_t>(sizeof(int32_t), 0, 0);
+        callCudaMemcpyDeviceToDevice<uint8_t>(data_wrapper.data, reinterpret_cast<uint8_t*>(typed_scalar.data()), sizeof(int32_t), 0);
+        data_wrapper.type = GPUColumnType(GPUColumnTypeId::DECIMAL);
+        data_wrapper.type.SetDecimalTypeInfo(Decimal::MAX_WIDTH_INT32, typed_scalar.type().scale());
+        data_wrapper.num_bytes = sizeof(int32_t);
+    } else if (scalar_type.id() == cudf::type_id::DECIMAL64){
+        auto& typed_scalar = static_cast<cudf::fixed_point_scalar<numeric::decimal64>&>(cudf_scalar);
+        data_wrapper.data = gpuBufferManager->customCudaMalloc<uint8_t>(sizeof(int64_t), 0, 0);
+        callCudaMemcpyDeviceToDevice<uint8_t>(data_wrapper.data, reinterpret_cast<uint8_t*>(typed_scalar.data()), sizeof(int64_t), 0);
+        data_wrapper.type = GPUColumnType(GPUColumnTypeId::DECIMAL);
+        data_wrapper.type.SetDecimalTypeInfo(Decimal::MAX_WIDTH_INT64, typed_scalar.type().scale());
+        data_wrapper.num_bytes = sizeof(int64_t);
+    } else {
+        throw NotImplementedException("Unsupported cudf data type in `setFromCudfScalar`: %d",
+                                      static_cast<int>(scalar_type.id()));
     }
 
     data_wrapper.size = 1;

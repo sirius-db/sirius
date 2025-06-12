@@ -293,7 +293,7 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 		const GPUColumnType& col_type = input_relation.columns[col]->data_wrapper.type;
 		bool is_string = false;
 		if(col_type.id() != GPUColumnTypeId::VARCHAR) {
-			if (types[col].InternalType() == PhysicalType::INT128) {
+			if (types[col].InternalType() == PhysicalType::INT128 && types[col].id() != LogicalTypeId::DECIMAL) {
 				if (materialized_relation.columns[col]->data_wrapper.type.id() == GPUColumnTypeId::INT64) {
 					SIRIUS_LOG_DEBUG("Converting INT64 to INT128 for column {}", col);
 					uint8_t* temp_int128 = gpuBufferManager->customCudaMalloc<uint8_t>(size_bytes * 2, 0, 0);
@@ -307,7 +307,8 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 					host_data[col] = gpuBufferManager->customCudaHostAlloc<uint8_t>(size_bytes * 4);
 					callCudaMemcpyDeviceToHost<uint8_t>(host_data[col], temp_int128, size_bytes * 4, 0);
 				} else {
-					throw NotImplementedException("Unsupported column type for INT128 conversion");
+					throw NotImplementedException("Unsupported siris column type for INT128 conversion: %d",
+																				static_cast<int>(materialized_relation.columns[col]->data_wrapper.type.id()));
 				}
 			} else {
 				host_data[col] = gpuBufferManager->customCudaHostAlloc<uint8_t>(size_bytes);
@@ -345,7 +346,7 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 		chunk.InitializeEmpty(types);
 		for (int col = 0; col < materialized_relation.columns.size(); col++) {
 			if(materialized_relation.columns[col]->data_wrapper.type.id() != GPUColumnTypeId::VARCHAR) {
-				if (types[col].InternalType() == PhysicalType::INT128) {
+				if (types[col].InternalType() == PhysicalType::INT128 && types[col].id() != LogicalTypeId::DECIMAL) {
 					Vector vector = rawDataToVector(host_data[col], vec, GPUColumnType(GPUColumnTypeId::INT128));
 					chunk.data[col].Reference(vector);
 				} else {
