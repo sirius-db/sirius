@@ -49,9 +49,10 @@ struct MaterializeDecimal
                                           const uint64_t* row_ids,
                                           uint64_t row_id_count,
                                           const cudf::data_type& cudf_type,
-                                          rmm::device_async_resource_ref mr)
+                                          rmm::device_async_resource_ref mr,
+                                          rmm::cuda_stream_view stream = rmm::cuda_stream_default)
   {
-    auto stream = cudf::get_default_stream();
+    // Define the thrust execution policy
     rmm::mr::thrust_allocator<uint8_t> thrust_allocator(stream, mr);
     auto exec = thrust::cuda::par(thrust_allocator).on(stream);
 
@@ -252,7 +253,8 @@ std::unique_ptr<cudf::column> GpuDispatcher::DispatchMaterialize(const GPUColumn
                                                  input->row_ids,
                                                  input->row_id_count,
                                                  cudf_type,
-                                                 mr);
+                                                 mr,
+                                                 stream);
         }
         case sizeof(int64_t): {
           cudf::data_type cudf_type(cudf::type_id::DECIMAL64,
@@ -261,7 +263,8 @@ std::unique_ptr<cudf::column> GpuDispatcher::DispatchMaterialize(const GPUColumn
                                                  input->row_ids,
                                                  input->row_id_count,
                                                  cudf_type,
-                                                 mr);
+                                                 mr,
+                                                 stream);
         }
         default:
           throw NotImplementedException("Unsupported sirius DECIMAL column type size in `Dispatch[Materialize]`: %zu",

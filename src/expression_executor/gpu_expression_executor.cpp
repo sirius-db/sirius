@@ -198,7 +198,7 @@ void GpuExpressionExecutor::Execute(const GPUIntermediateRelation& input_relatio
     if (result->type().id() != cudf_return_type.id())
     {
       result =
-        cudf::cast(result->view(), cudf_return_type, cudf::get_default_stream(), resource_ref);
+        cudf::cast(result->view(), cudf_return_type, execution_stream, resource_ref);
     }
 
     // Transfer to output relation (zero copy)
