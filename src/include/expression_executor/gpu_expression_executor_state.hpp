@@ -67,6 +67,8 @@ struct GpuExpressionState
             return cudf::data_type(cudf::type_id::DECIMAL32, DecimalType::GetScale(logical_type));
           case PhysicalType::INT64:
             return cudf::data_type(cudf::type_id::DECIMAL64, DecimalType::GetScale(logical_type));
+          case PhysicalType::INT128:
+            return cudf::data_type(cudf::type_id::DECIMAL128, DecimalType::GetScale(logical_type));
           default:
             throw InvalidInputException("GetCudfType: Unsupported duckdb decimal physical type: %d",
                                         static_cast<int>(logical_type.InternalType()));
