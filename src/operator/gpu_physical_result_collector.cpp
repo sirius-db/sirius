@@ -322,7 +322,7 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 						auto to_cudf_type = sirius::GpuExpressionState::GetCudfType(types[col]);
 						auto to_cudf_column = cudf::cast(from_cudf_column_view,
 																						 to_cudf_type,
-																						 cudf::get_default_stream(),
+																						 rmm::cuda_stream_default,
 																						 GPUBufferManager::GetInstance().mr);
 						size_bytes = materialized_relation.columns[col]->column_length * sizeof(__int128_t);
 						host_data[col] = gpuBufferManager->customCudaHostAlloc<uint8_t>(size_bytes);

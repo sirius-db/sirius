@@ -173,12 +173,12 @@ struct NumericBinaryFunctionDispatcher
                                                      const cudf::data_type& return_type)
   {
     auto left_decimal_scalar = cudf::fixed_point_scalar<T>(
-      left_value, scale, true, cudf::get_default_stream(), executor.resource_ref);
+      left_value, scale, true, executor.execution_stream, executor.resource_ref);
     return cudf::binary_operation(left_decimal_scalar,
                                   right,
                                   BinOp,
                                   return_type,
-                                  cudf::get_default_stream(),
+                                  executor.execution_stream,
                                   executor.resource_ref);
   }
 
@@ -206,12 +206,12 @@ struct NumericBinaryFunctionDispatcher
                                                       const cudf::data_type& return_type)
   {
     auto right_decimal_scalar = cudf::fixed_point_scalar<T>(
-      right_value, scale, true, cudf::get_default_stream(), executor.resource_ref);
+      right_value, scale, true, executor.execution_stream, executor.resource_ref);
     return cudf::binary_operation(left,
                                   right_decimal_scalar,
                                   BinOp,
                                   return_type,
-                                  cudf::get_default_stream(),
+                                  executor.execution_stream,
                                   executor.resource_ref);
   }
 
