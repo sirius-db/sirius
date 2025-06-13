@@ -247,8 +247,9 @@ std::unique_ptr<cudf::column> GpuDispatcher::DispatchMaterialize(const GPUColumn
     case GPUColumnTypeId::DECIMAL: {
       switch (input->data_wrapper.getColumnTypeSize()) {
         case sizeof(int32_t): {
+          // cudf decimal type uses negative scale, same for below
           cudf::data_type cudf_type(cudf::type_id::DECIMAL32,
-                                    input->data_wrapper.type.GetDecimalTypeInfo()->scale_);
+                                    -input->data_wrapper.type.GetDecimalTypeInfo()->scale_);
           return MaterializeDecimal<int32_t>::Do(reinterpret_cast<const int32_t*>(input_data),
                                                  input->row_ids,
                                                  input->row_id_count,
@@ -258,7 +259,7 @@ std::unique_ptr<cudf::column> GpuDispatcher::DispatchMaterialize(const GPUColumn
         }
         case sizeof(int64_t): {
           cudf::data_type cudf_type(cudf::type_id::DECIMAL64,
-                                    input->data_wrapper.type.GetDecimalTypeInfo()->scale_);
+                                    -input->data_wrapper.type.GetDecimalTypeInfo()->scale_);
           return MaterializeDecimal<int64_t>::Do(reinterpret_cast<const int64_t*>(input_data),
                                                  input->row_ids,
                                                  input->row_id_count,
