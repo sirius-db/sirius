@@ -240,14 +240,15 @@ struct NumericBinaryFunctionDispatcher
         case cudf::type_id::FLOAT64:
           return DoLeftScalarBinaryOp(left_value.GetValue<double_t>(), right->view(), return_type);
         case cudf::type_id::DECIMAL32:
+          // cudf decimal type uses negative scale, same for below
           return DoLeftScalarBinaryOp<numeric::decimal32>(
             left_value.GetValueUnsafe<int32_t>(),
-            numeric::scale_type{duckdb::DecimalType::GetScale(left_value.type())},
+            numeric::scale_type{-duckdb::DecimalType::GetScale(left_value.type())},
             right->view(), return_type);
         case cudf::type_id::DECIMAL64:
           return DoLeftScalarBinaryOp<numeric::decimal64>(
             left_value.GetValueUnsafe<int64_t>(),
-            numeric::scale_type{duckdb::DecimalType::GetScale(left_value.type())},
+            numeric::scale_type{-duckdb::DecimalType::GetScale(left_value.type())},
             right->view(), return_type);
         case cudf::type_id::BOOL8:
           throw NotImplementedException("Execute[Function]: Boolean types not supported for "
@@ -274,14 +275,15 @@ struct NumericBinaryFunctionDispatcher
         case cudf::type_id::FLOAT64:
           return DoRightScalarBinaryOp(left->view(), right_value.GetValue<double_t>(), return_type);
         case cudf::type_id::DECIMAL32:
+          // cudf decimal type uses negative scale, same for below
           return DoRightScalarBinaryOp<numeric::decimal32>(
             left->view(), right_value.GetValueUnsafe<int32_t>(),
-            numeric::scale_type{duckdb::DecimalType::GetScale(right_value.type())},
+            numeric::scale_type{-duckdb::DecimalType::GetScale(right_value.type())},
             return_type);
         case cudf::type_id::DECIMAL64:
           return DoRightScalarBinaryOp<numeric::decimal64>(
             left->view(), right_value.GetValueUnsafe<int64_t>(),
-            numeric::scale_type{duckdb::DecimalType::GetScale(right_value.type())},
+            numeric::scale_type{-duckdb::DecimalType::GetScale(right_value.type())},
             return_type);
         case cudf::type_id::BOOL8:
           throw NotImplementedException("Execute[Function]: Boolean types not supported for "

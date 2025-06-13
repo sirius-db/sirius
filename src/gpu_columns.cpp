@@ -141,11 +141,12 @@ GPUColumn::convertToCudfColumn() {
         cudf::data_type cudf_type;
         switch (data_wrapper.getColumnTypeSize()) {
             case sizeof(int32_t): {
-                cudf_type = cudf::data_type(cudf::type_id::DECIMAL32, data_wrapper.type.GetDecimalTypeInfo()->scale_);
+                // cudf decimal type uses negative scale, same for below
+                cudf_type = cudf::data_type(cudf::type_id::DECIMAL32, -data_wrapper.type.GetDecimalTypeInfo()->scale_);
                 break;
             }
             case sizeof(int64_t): {
-                cudf_type = cudf::data_type(cudf::type_id::DECIMAL64, data_wrapper.type.GetDecimalTypeInfo()->scale_);
+                cudf_type = cudf::data_type(cudf::type_id::DECIMAL64, -data_wrapper.type.GetDecimalTypeInfo()->scale_);
                 break;
             }
             default:
@@ -226,13 +227,14 @@ GPUColumn::setFromCudfColumn(cudf::column& cudf_column, bool _is_unique, int32_t
     } else if (col_type.id() == cudf::type_id::DECIMAL32) {
         data_wrapper.is_string_data = false;
         data_wrapper.type = GPUColumnType(GPUColumnTypeId::DECIMAL);
-        data_wrapper.type.SetDecimalTypeInfo(Decimal::MAX_WIDTH_INT32, col_type.scale());
+        // cudf decimal type uses negative scale, same for below
+        data_wrapper.type.SetDecimalTypeInfo(Decimal::MAX_WIDTH_INT32, -col_type.scale());
         data_wrapper.num_bytes = col_size * data_wrapper.getColumnTypeSize();
         data_wrapper.offset = nullptr;
     } else if (col_type.id() == cudf::type_id::DECIMAL64) {
         data_wrapper.is_string_data = false;
         data_wrapper.type = GPUColumnType(GPUColumnTypeId::DECIMAL);
-        data_wrapper.type.SetDecimalTypeInfo(Decimal::MAX_WIDTH_INT64, col_type.scale());
+        data_wrapper.type.SetDecimalTypeInfo(Decimal::MAX_WIDTH_INT64, -col_type.scale());
         data_wrapper.num_bytes = col_size * data_wrapper.getColumnTypeSize();
         data_wrapper.offset = nullptr;
     } else {
@@ -288,14 +290,15 @@ GPUColumn::setFromCudfScalar(cudf::scalar& cudf_scalar, GPUBufferManager* gpuBuf
         data_wrapper.data = gpuBufferManager->customCudaMalloc<uint8_t>(sizeof(int32_t), 0, 0);
         callCudaMemcpyDeviceToDevice<uint8_t>(data_wrapper.data, reinterpret_cast<uint8_t*>(typed_scalar.data()), sizeof(int32_t), 0);
         data_wrapper.type = GPUColumnType(GPUColumnTypeId::DECIMAL);
-        data_wrapper.type.SetDecimalTypeInfo(Decimal::MAX_WIDTH_INT32, typed_scalar.type().scale());
+         // cudf decimal type uses negative scale, same for below
+        data_wrapper.type.SetDecimalTypeInfo(Decimal::MAX_WIDTH_INT32, -typed_scalar.type().scale());
         data_wrapper.num_bytes = sizeof(int32_t);
     } else if (scalar_type.id() == cudf::type_id::DECIMAL64){
         auto& typed_scalar = static_cast<cudf::fixed_point_scalar<numeric::decimal64>&>(cudf_scalar);
         data_wrapper.data = gpuBufferManager->customCudaMalloc<uint8_t>(sizeof(int64_t), 0, 0);
         callCudaMemcpyDeviceToDevice<uint8_t>(data_wrapper.data, reinterpret_cast<uint8_t*>(typed_scalar.data()), sizeof(int64_t), 0);
         data_wrapper.type = GPUColumnType(GPUColumnTypeId::DECIMAL);
-        data_wrapper.type.SetDecimalTypeInfo(Decimal::MAX_WIDTH_INT64, typed_scalar.type().scale());
+        data_wrapper.type.SetDecimalTypeInfo(Decimal::MAX_WIDTH_INT64, -typed_scalar.type().scale());
         data_wrapper.num_bytes = sizeof(int64_t);
     } else {
         throw NotImplementedException("Unsupported cudf data type in `setFromCudfScalar`: %d",
