@@ -291,8 +291,8 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 
 			// Advance the buffer pointers based on this column's details
 			DataWrapper str_column_data = str_column->data_wrapper;
-			curr_column_chars_buffer += str_column_data.num_bytes * sizeof(char);
-			curr_column_string_buffer += str_column_data.size * sizeof(string_t);
+			curr_column_chars_buffer += str_column_data.num_bytes;
+			curr_column_string_buffer += str_column_data.size;
 		}
 	}
 	auto materialize_end_time = std::chrono::high_resolution_clock::now();
