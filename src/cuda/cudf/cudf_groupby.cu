@@ -87,6 +87,17 @@ void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColu
     } else if (agg_mode[agg] == AggregationType::AVERAGE) {
       auto aggregate = cudf::make_mean_aggregation<cudf::groupby_aggregation>();
       requests[agg].aggregations.push_back(std::move(aggregate));
+      // If aggregate input column is decimal, need to convert to double following duckdb
+      if (aggregate_keys[agg]->data_wrapper.type.id() == GPUColumnTypeId::DECIMAL) {
+        if (aggregate_keys[agg]->data_wrapper.getColumnTypeSize() != sizeof(int64_t)) {
+          throw NotImplementedException("Only support decimal64 for decimal AVG group-by");
+        }
+        auto from_cudf_column_view = aggregate_keys[agg]->convertToCudfColumn();
+        auto to_cudf_type = cudf::data_type(cudf::type_id::FLOAT64);
+        auto to_cudf_column = cudf::cast(
+          from_cudf_column_view, to_cudf_type, rmm::cuda_stream_default, GPUBufferManager::GetInstance().mr);
+        aggregate_keys[agg]->setFromCudfColumn(*to_cudf_column, false, nullptr, 0, gpuBufferManager);
+      }
       requests[agg].values = aggregate_keys[agg]->convertToCudfColumn();
     } else if (agg_mode[agg] == AggregationType::MIN) {
       auto aggregate = cudf::make_min_aggregation<cudf::groupby_aggregation>();
