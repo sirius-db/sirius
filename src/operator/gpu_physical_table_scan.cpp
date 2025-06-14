@@ -290,7 +290,7 @@ void HandleArbitraryConstantExpression(vector<shared_ptr<GPUColumn>> &column, ui
         data_type[expr] = INT32;
         break;
       } case GPUColumnTypeId::INT64: {
-        total_bytes += sizeof(uint64_t);
+        total_bytes += sizeof(int64_t);
         data_type[expr] = INT64;
         break;
       } case GPUColumnTypeId::FLOAT32: {
@@ -309,6 +309,22 @@ void HandleArbitraryConstantExpression(vector<shared_ptr<GPUColumn>> &column, ui
         std::string lower_string = filter_constant[expr]->constant.ToString();
         total_bytes += lower_string.size();
         data_type[expr] = VARCHAR;
+        break;
+      } case GPUColumnTypeId::DECIMAL: {
+        switch (column[expr]->data_wrapper.getColumnTypeSize()) {
+          case sizeof(int32_t): {
+            total_bytes += sizeof(int32_t);
+            data_type[expr] = DECIMAL32;
+            break;
+          }
+          case sizeof(int64_t): {
+            total_bytes += sizeof(int64_t);
+            data_type[expr] = DECIMAL64;
+            break;
+          }
+          throw NotImplementedException("Unsupported sirius DECIMAL column type size in `HandleArbitraryConstantExpression`: %zu",
+                                        column[expr]->data_wrapper.getColumnTypeSize());
+        }
         break;
       } default: {
         throw NotImplementedException("Unsupported sirius column type in `HandleArbitraryConstantExpression`: %d",
@@ -333,10 +349,10 @@ void HandleArbitraryConstantExpression(vector<shared_ptr<GPUColumn>> &column, ui
         init_offset += sizeof(int);
         break;
       } case GPUColumnTypeId::INT64: {
-        uint64_t temp = filter_constant[expr]->constant.GetValue<uint64_t>();
-        memcpy(constant_compare + init_offset, &temp, sizeof(uint64_t));
+        int64_t temp = filter_constant[expr]->constant.GetValue<int64_t>();
+        memcpy(constant_compare + init_offset, &temp, sizeof(int64_t));
         constant_offset[expr] = init_offset;
-        init_offset += sizeof(uint64_t);
+        init_offset += sizeof(int64_t);
         break;
       } case GPUColumnTypeId::FLOAT32: {
         float temp = filter_constant[expr]->constant.GetValue<float>();
@@ -355,6 +371,27 @@ void HandleArbitraryConstantExpression(vector<shared_ptr<GPUColumn>> &column, ui
         memcpy(constant_compare + init_offset, lower_string.data(), lower_string.size());
         constant_offset[expr] = init_offset;
         init_offset += lower_string.size();
+        break;
+      } case GPUColumnTypeId::DECIMAL: {
+        switch (column[expr]->data_wrapper.getColumnTypeSize()) {
+          case sizeof(int32_t): {
+            // `GetValue()` cannot work since it will convert to double first, same for below
+            int32_t temp = filter_constant[expr]->constant.GetValueUnsafe<int32_t>();
+            memcpy(constant_compare + init_offset, &temp, sizeof(int32_t));
+            constant_offset[expr] = init_offset;
+            init_offset += sizeof(int32_t);
+            break;
+          }
+          case sizeof(int64_t): {
+            int64_t temp = filter_constant[expr]->constant.GetValueUnsafe<int64_t>();
+            memcpy(constant_compare + init_offset, &temp, sizeof(int64_t));
+            constant_offset[expr] = init_offset;
+            init_offset += sizeof(int64_t);
+            break;
+          }
+          throw NotImplementedException("Unsupported sirius DECIMAL column type size in `HandleArbitraryConstantExpression`: %zu",
+                                        column[expr]->data_wrapper.getColumnTypeSize());
+        }
         break;
       } default: {
         throw NotImplementedException("Unsupported sirius column type in `HandleArbitraryConstantExpression`: %d",

@@ -1,8 +1,24 @@
 #include "gpu_columns.hpp"
 #include "gpu_buffer_manager.hpp"
 #include "log/logging.hpp"
+#include "duckdb/common/types/decimal.hpp"
 
 namespace duckdb {
+
+size_t GPUDecimalTypeInfo::GetDecimalTypeSize() const {
+    if (width_ <= Decimal::MAX_WIDTH_INT16) {
+        return sizeof(int16_t);
+    } else if (width_ <= Decimal::MAX_WIDTH_INT32) {
+        return sizeof(int32_t);
+    } else if (width_ <= Decimal::MAX_WIDTH_INT64) {
+        return sizeof(int64_t);
+    } else if (width_ <= Decimal::MAX_WIDTH_INT128) {
+        return sizeof(__int128_t);
+    } else {
+        throw InternalException("Decimal has a width of %d which is bigger than the maximum supported width of %d",
+                                width_, DecimalType::MaxWidth());
+    }
+}
 
 DataWrapper::DataWrapper(GPUColumnType _type, uint8_t* _data, size_t _size) : data(_data), size(_size) {
     type = _type;
@@ -14,7 +30,7 @@ DataWrapper::DataWrapper(GPUColumnType _type, uint8_t* _data, uint64_t* _offset,
     data(_data), size(_size), type(_type), offset(_offset), num_bytes(_num_bytes), is_string_data(_is_string_data) {};
 
 size_t 
-DataWrapper::getColumnTypeSize() {
+DataWrapper::getColumnTypeSize() const {
     switch (type.id()) {
         case GPUColumnTypeId::INT32:
         case GPUColumnTypeId::DATE:
@@ -31,6 +47,13 @@ DataWrapper::getColumnTypeSize() {
             return sizeof(uint8_t);
         case GPUColumnTypeId::VARCHAR:
             return 128;
+        case GPUColumnTypeId::DECIMAL: {
+            GPUDecimalTypeInfo* decimal_type_info = type.GetDecimalTypeInfo();
+            if (decimal_type_info == nullptr) {
+                throw InternalException("`decimal_type_info` not set for DECIMAL type in `getColumnTypeSize`");
+            }
+            return decimal_type_info->GetDecimalTypeSize();
+        }
         default:
             throw duckdb::InternalException("Unsupported sirius column type in `getColumnTypeSize()`: %d",
                                             static_cast<int>(type.id()));
@@ -114,6 +137,23 @@ GPUColumn::convertToCudfColumn() {
             std::move(children)
         );
         return str_col;
+    } else if (data_wrapper.type.id() == GPUColumnTypeId::DECIMAL) {
+        cudf::data_type cudf_type;
+        switch (data_wrapper.getColumnTypeSize()) {
+            case sizeof(int32_t): {
+                // cudf decimal type uses negative scale, same for below
+                cudf_type = cudf::data_type(cudf::type_id::DECIMAL32, -data_wrapper.type.GetDecimalTypeInfo()->scale_);
+                break;
+            }
+            case sizeof(int64_t): {
+                cudf_type = cudf::data_type(cudf::type_id::DECIMAL64, -data_wrapper.type.GetDecimalTypeInfo()->scale_);
+                break;
+            }
+            default:
+                throw duckdb::InternalException("Unsupported sirius DECIMAL column type size in `convertToCudfColumn()`: %zu",
+                                                data_wrapper.getColumnTypeSize());
+        }
+        return cudf::column_view(cudf_type, size, reinterpret_cast<void*>(data_wrapper.data), nullptr, 0);
     }
     throw duckdb::InternalException("Unsupported sirius column type in `convertToCudfColumn()`: %d", data_wrapper.type.id());
 }
@@ -179,6 +219,27 @@ GPUColumn::setFromCudfColumn(cudf::column& cudf_column, bool _is_unique, int32_t
         data_wrapper.type = GPUColumnType(GPUColumnTypeId::BOOLEAN);
         data_wrapper.num_bytes = col_size * data_wrapper.getColumnTypeSize();
         data_wrapper.offset = nullptr;
+    } else if (col_type == cudf::data_type(cudf::type_id::TIMESTAMP_DAYS)) {
+        data_wrapper.is_string_data = false;
+        data_wrapper.type = GPUColumnType(GPUColumnTypeId::DATE);
+        data_wrapper.num_bytes = col_size * data_wrapper.getColumnTypeSize();
+        data_wrapper.offset = nullptr;
+    } else if (col_type.id() == cudf::type_id::DECIMAL32) {
+        data_wrapper.is_string_data = false;
+        data_wrapper.type = GPUColumnType(GPUColumnTypeId::DECIMAL);
+        // cudf decimal type uses negative scale, same for below
+        data_wrapper.type.SetDecimalTypeInfo(Decimal::MAX_WIDTH_INT32, -col_type.scale());
+        data_wrapper.num_bytes = col_size * data_wrapper.getColumnTypeSize();
+        data_wrapper.offset = nullptr;
+    } else if (col_type.id() == cudf::type_id::DECIMAL64) {
+        data_wrapper.is_string_data = false;
+        data_wrapper.type = GPUColumnType(GPUColumnTypeId::DECIMAL);
+        data_wrapper.type.SetDecimalTypeInfo(Decimal::MAX_WIDTH_INT64, -col_type.scale());
+        data_wrapper.num_bytes = col_size * data_wrapper.getColumnTypeSize();
+        data_wrapper.offset = nullptr;
+    } else {
+        throw NotImplementedException("Unsupported cudf data type in `setFromCudfColumn`: %d",
+                                      static_cast<int>(col_type.id()));
     }
 
     if (_row_ids != nullptr) {
@@ -224,6 +285,24 @@ GPUColumn::setFromCudfScalar(cudf::scalar& cudf_scalar, GPUBufferManager* gpuBuf
         callCudaMemcpyDeviceToDevice<uint8_t>(data_wrapper.data, reinterpret_cast<uint8_t*>(typed_scalar.data()), sizeof(uint8_t), 0);
         data_wrapper.type = GPUColumnType(GPUColumnTypeId::BOOLEAN);
         data_wrapper.num_bytes = sizeof(uint8_t);
+    } else if (scalar_type.id() == cudf::type_id::DECIMAL32){
+        auto& typed_scalar = static_cast<cudf::fixed_point_scalar<numeric::decimal32>&>(cudf_scalar);
+        data_wrapper.data = gpuBufferManager->customCudaMalloc<uint8_t>(sizeof(int32_t), 0, 0);
+        callCudaMemcpyDeviceToDevice<uint8_t>(data_wrapper.data, reinterpret_cast<uint8_t*>(typed_scalar.data()), sizeof(int32_t), 0);
+        data_wrapper.type = GPUColumnType(GPUColumnTypeId::DECIMAL);
+         // cudf decimal type uses negative scale, same for below
+        data_wrapper.type.SetDecimalTypeInfo(Decimal::MAX_WIDTH_INT32, -typed_scalar.type().scale());
+        data_wrapper.num_bytes = sizeof(int32_t);
+    } else if (scalar_type.id() == cudf::type_id::DECIMAL64){
+        auto& typed_scalar = static_cast<cudf::fixed_point_scalar<numeric::decimal64>&>(cudf_scalar);
+        data_wrapper.data = gpuBufferManager->customCudaMalloc<uint8_t>(sizeof(int64_t), 0, 0);
+        callCudaMemcpyDeviceToDevice<uint8_t>(data_wrapper.data, reinterpret_cast<uint8_t*>(typed_scalar.data()), sizeof(int64_t), 0);
+        data_wrapper.type = GPUColumnType(GPUColumnTypeId::DECIMAL);
+        data_wrapper.type.SetDecimalTypeInfo(Decimal::MAX_WIDTH_INT64, -typed_scalar.type().scale());
+        data_wrapper.num_bytes = sizeof(int64_t);
+    } else {
+        throw NotImplementedException("Unsupported cudf data type in `setFromCudfScalar`: %d",
+                                      static_cast<int>(scalar_type.id()));
     }
 
     data_wrapper.size = 1;

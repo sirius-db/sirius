@@ -131,7 +131,7 @@ __global__ void table_scan_expression(uint8_t **col, uint64_t** offset, uint8_t 
         for (int expr = 0; expr < num_expr; expr++) {
             if (threadIdx.x + ITEM * B < num_tile_items) {
 
-                if (data_type[expr] == INT32 || data_type[expr] == DATE) {
+                if (data_type[expr] == INT32 || data_type[expr] == DATE || data_type[expr] == DECIMAL32) {
                     uint64_t item_idx = tile_offset + threadIdx.x + ITEM * B;
                     int item = (reinterpret_cast<int*>(col[expr]))[item_idx];
 
@@ -141,15 +141,15 @@ __global__ void table_scan_expression(uint8_t **col, uint64_t** offset, uint8_t 
 
                     selection_flags[ITEM] = device_comparison<int>(item, constant, compare_mode[expr]);
 
-                } else if (data_type[expr] == INT64) {
+                } else if (data_type[expr] == INT64 || data_type[expr] == DECIMAL64) {
                     uint64_t item_idx = tile_offset + threadIdx.x + ITEM * B;
-                    uint64_t item = (reinterpret_cast<uint64_t*>(col[expr]))[item_idx];
+                    int64_t item = (reinterpret_cast<int64_t*>(col[expr]))[item_idx];
 
                     uint64_t start_constant_offset = constant_offset[expr]; 
-                    uint64_t constant;
-                    memcpy(&constant, constant_compare + start_constant_offset, sizeof(uint64_t));
+                    int64_t constant;
+                    memcpy(&constant, constant_compare + start_constant_offset, sizeof(int64_t));
                     
-                    selection_flags[ITEM] = device_comparison<uint64_t>(item, constant, compare_mode[expr]);
+                    selection_flags[ITEM] = device_comparison<int64_t>(item, constant, compare_mode[expr]);
 
                 } else if (data_type[expr] == FLOAT32) {
                     uint64_t item_idx = tile_offset + threadIdx.x + ITEM * B;

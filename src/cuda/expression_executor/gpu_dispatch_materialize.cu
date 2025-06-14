@@ -41,6 +41,36 @@ struct MaterializeNumeric
   }
 };
 
+//----------Decimals----------//
+template <typename T>
+struct MaterializeDecimal
+{
+  static std::unique_ptr<cudf::column> Do(const T* input_data,
+                                          const uint64_t* row_ids,
+                                          uint64_t row_id_count,
+                                          const cudf::data_type& cudf_type,
+                                          rmm::device_async_resource_ref mr,
+                                          rmm::cuda_stream_view stream = rmm::cuda_stream_default)
+  {
+    // Define the thrust execution policy
+    rmm::mr::thrust_allocator<uint8_t> thrust_allocator(stream, mr);
+    auto exec = thrust::cuda::par(thrust_allocator).on(stream);
+
+    // Allocate output buffer
+    rmm::device_uvector<T> output_data(row_id_count, stream, mr);
+
+    // Gather the input data
+    thrust::gather(exec, row_ids, row_ids + row_id_count, input_data, output_data.begin());
+
+    // Construct and return a cudf::column
+    return std::make_unique<cudf::column>(cudf_type,
+                                          static_cast<cudf::size_type>(row_id_count),
+                                          output_data.release(),
+                                          rmm::device_buffer(0, stream, mr),
+                                          0);
+  }
+};
+
 //----------Strings----------//
 struct MaterializeString
 {
@@ -214,6 +244,34 @@ std::unique_ptr<cudf::column> GpuDispatcher::DispatchMaterialize(const GPUColumn
                                    input->row_id_count,
                                    mr,
                                    stream);
+    case GPUColumnTypeId::DECIMAL: {
+      switch (input->data_wrapper.getColumnTypeSize()) {
+        case sizeof(int32_t): {
+          // cudf decimal type uses negative scale, same for below
+          cudf::data_type cudf_type(cudf::type_id::DECIMAL32,
+                                    -input->data_wrapper.type.GetDecimalTypeInfo()->scale_);
+          return MaterializeDecimal<int32_t>::Do(reinterpret_cast<const int32_t*>(input_data),
+                                                 input->row_ids,
+                                                 input->row_id_count,
+                                                 cudf_type,
+                                                 mr,
+                                                 stream);
+        }
+        case sizeof(int64_t): {
+          cudf::data_type cudf_type(cudf::type_id::DECIMAL64,
+                                    -input->data_wrapper.type.GetDecimalTypeInfo()->scale_);
+          return MaterializeDecimal<int64_t>::Do(reinterpret_cast<const int64_t*>(input_data),
+                                                 input->row_ids,
+                                                 input->row_id_count,
+                                                 cudf_type,
+                                                 mr,
+                                                 stream);
+        }
+        default:
+          throw NotImplementedException("Unsupported sirius DECIMAL column type size in `Dispatch[Materialize]`: %zu",
+                                        input->data_wrapper.getColumnTypeSize());
+      }
+    }
     default:
       throw InternalException("Unsupported sirius column type in `Dispatch[Materialize]`: %d",
                               static_cast<int>(input->data_wrapper.type.id()));
