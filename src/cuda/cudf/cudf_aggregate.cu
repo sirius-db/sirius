@@ -76,6 +76,17 @@ void cudf_aggregate(vector<shared_ptr<GPUColumn>>& column, uint64_t num_aggregat
             column[agg]->setFromCudfScalar(*result, gpuBufferManager);
         } else if (agg_mode[agg] == AggregationType::AVERAGE) {
             auto aggregate = make_reduce_aggregation<cudf::reduce_aggregation::MEAN>();
+            // If aggregate input column is decimal, need to convert to double following duckdb
+            if (column[agg]->data_wrapper.type.id() == GPUColumnTypeId::DECIMAL) {
+                if (column[agg]->data_wrapper.getColumnTypeSize() != sizeof(int64_t)) {
+                    throw NotImplementedException("Only support decimal64 for decimal AVG aggregate");
+                }
+                auto from_cudf_column_view = column[agg]->convertToCudfColumn();
+                auto to_cudf_type = cudf::data_type(cudf::type_id::FLOAT64);
+                auto to_cudf_column = cudf::cast(
+                    from_cudf_column_view, to_cudf_type, rmm::cuda_stream_default, GPUBufferManager::GetInstance().mr);
+                column[agg]->setFromCudfColumn(*to_cudf_column, false, nullptr, 0, gpuBufferManager);
+            }
             auto cudf_column = column[agg]->convertToCudfColumn();
             auto result = cudf::reduce(cudf_column, *aggregate, cudf_column.type());
             column[agg]->setFromCudfScalar(*result, gpuBufferManager);

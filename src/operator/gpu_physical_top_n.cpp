@@ -50,7 +50,8 @@ SinkResultType GPUPhysicalTopN::Sink(GPUIntermediateRelation& input_relation) co
 	auto start = std::chrono::high_resolution_clock::now();
     // throw NotImplementedException("Top N Sink not implemented");
     if (dynamic_filter) {
-        throw NotImplementedException("Top N Sink with dynamic filter not implemented");
+				// `dynamic_filter` is currently not leveraged
+        SIRIUS_LOG_WARN("`dynamic_filter` is currently not leveraged in `GPUPhysicalTopN`");
     }
     if (offset > 0) {
         throw NotImplementedException("Top N Sink with offset not implemented");
