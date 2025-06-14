@@ -69,6 +69,17 @@ HandleMaterializeExpression(shared_ptr<GPUColumn> column, BoundReferenceExpressi
             return ResolveTypeMaterializeExpression<uint8_t>(column, bound_ref, gpuBufferManager);
         case GPUColumnTypeId::VARCHAR:
             return ResolveTypeMaterializeString(column, bound_ref, gpuBufferManager);
+        case GPUColumnTypeId::DECIMAL: {
+            switch (column->data_wrapper.getColumnTypeSize()) {
+                case sizeof(int32_t):
+                    return ResolveTypeMaterializeExpression<int32_t>(column, bound_ref, gpuBufferManager);
+                case sizeof(int64_t):
+                    return ResolveTypeMaterializeExpression<int64_t>(column, bound_ref, gpuBufferManager);
+                default:
+                    throw NotImplementedException("Unsupported sirius DECIMAL column type size in `HandleMaterializeExpression`: %zu",
+                                                  column->data_wrapper.getColumnTypeSize());
+            }
+        }
         default:
             throw NotImplementedException("Unsupported sirius column type in `HandleMaterializeExpression`: %d",
                                           static_cast<int>(column->data_wrapper.type.id()));

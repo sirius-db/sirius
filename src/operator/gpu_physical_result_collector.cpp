@@ -10,6 +10,7 @@
 #include "gpu_materialize.hpp"
 #include "log/logging.hpp"
 #include "utils.hpp"
+#include "expression_executor/gpu_expression_executor_state.hpp"
 
 namespace duckdb {
 
@@ -154,6 +155,23 @@ GPUPhysicalMaterializedCollector::FinalMaterialize(GPUIntermediateRelation input
 	case GPUColumnTypeId::VARCHAR:
 		FinalMaterializeString(input_relation, output_relation, col);
 		break;
+	case GPUColumnTypeId::DECIMAL: {
+		switch (input_relation.columns[col]->data_wrapper.getColumnTypeSize()) {
+			case sizeof(int32_t): {
+				FinalMaterializeInternal<int32_t>(input_relation, output_relation, col);
+				size_bytes = output_relation.columns[col]->column_length * sizeof(int32_t);
+				break;
+			}
+			case sizeof(int64_t): {
+				FinalMaterializeInternal<int64_t>(input_relation, output_relation, col);
+				size_bytes = output_relation.columns[col]->column_length * sizeof(int64_t);
+				break;
+			}
+			throw NotImplementedException("Unsupported sirius DECIMAL column type size in `FinalMaterialize`: %zu",
+                                    input_relation.columns[col]->data_wrapper.getColumnTypeSize());
+		}
+		break;
+	}
 	default:
 		throw NotImplementedException("Unsupported sirius column type in `FinalMaterialize`: %d",
 																	static_cast<int>(input_relation.columns[col]->data_wrapper.type.id()));
@@ -181,6 +199,13 @@ LogicalType ColumnTypeToLogicalType(const GPUColumnType& type) {
 			return LogicalType::VARCHAR;
 		case GPUColumnTypeId::INT128:
 			return LogicalType::HUGEINT;
+		case GPUColumnTypeId::DECIMAL: {
+			GPUDecimalTypeInfo* decimal_type_info = type.GetDecimalTypeInfo();
+			if (decimal_type_info == nullptr) {
+					throw InternalException("`decimal_type_info` not set for DECIMAL type in `ColumnTypeToLogicalType`");
+			}
+			return LogicalType::DECIMAL(decimal_type_info->width_, decimal_type_info->scale_);
+		}
 		default:
 			throw NotImplementedException("Unsupported sirius column type in `ColumnTypeToLogicalType`: %d",
 																		static_cast<int>(type.id()));
@@ -203,6 +228,14 @@ Vector rawDataToVector(uint8_t* host_data, size_t vector_offset, const GPUColumn
 			sizeof_type = sizeof(uint8_t); break;
 		case GPUColumnTypeId::INT128:
 			sizeof_type = 2 * sizeof(uint64_t); break;
+		case GPUColumnTypeId::DECIMAL: {
+			GPUDecimalTypeInfo* decimal_type_info = type.GetDecimalTypeInfo();
+			if (decimal_type_info == nullptr) {
+				throw InternalException("`decimal_type_info` not set for DECIMAL type in `rawDataToVector`");
+			}
+			sizeof_type = decimal_type_info->GetDecimalTypeSize();
+			break;
+		}
 		default:
 			throw NotImplementedException("Unsupported sirius column type in `rawDataToVector`: %d",
 																		static_cast<int>(type.id()));
@@ -274,8 +307,36 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 					convertInt32ToInt128(materialized_relation.columns[col]->data_wrapper.data, temp_int128, materialized_relation.columns[col]->column_length);
 					host_data[col] = gpuBufferManager->customCudaHostAlloc<uint8_t>(size_bytes * 4);
 					callCudaMemcpyDeviceToHost<uint8_t>(host_data[col], temp_int128, size_bytes * 4, 0);
+				} else if (materialized_relation.columns[col]->data_wrapper.type.id() == GPUColumnTypeId::DECIMAL) {
+					if (types[col].id() != LogicalTypeId::DECIMAL) {
+						throw InternalException("Destiation type is not decimal when performing INT128 (physical type) conversion for decimal,"
+																		" destination type: %d", static_cast<int>(types[col].id()));
+					}
+					int from_decimal_size = materialized_relation.columns[col]->data_wrapper.getColumnTypeSize();
+					int from_scale = materialized_relation.columns[col]->data_wrapper.type.GetDecimalTypeInfo()->scale_;
+					int to_width = DecimalType::GetWidth(types[col]);
+					int to_scale = DecimalType::GetScale(types[col]);
+					if (from_decimal_size != sizeof(__int128_t) || from_scale != to_scale) {
+						// `from` and `to` decimal types are different, need to cast
+						auto from_cudf_column_view = materialized_relation.columns[col]->convertToCudfColumn();
+						auto to_cudf_type = sirius::GpuExpressionState::GetCudfType(types[col]);
+						auto to_cudf_column = cudf::cast(from_cudf_column_view,
+																						 to_cudf_type,
+																						 rmm::cuda_stream_default,
+																						 GPUBufferManager::GetInstance().mr);
+						size_bytes = materialized_relation.columns[col]->column_length * sizeof(__int128_t);
+						host_data[col] = gpuBufferManager->customCudaHostAlloc<uint8_t>(size_bytes);
+						uint8_t* to_cudf_data = const_cast<uint8_t*>(to_cudf_column->view().data<uint8_t>());
+						callCudaMemcpyDeviceToHost<uint8_t>(host_data[col], to_cudf_data, size_bytes, 0);
+					} else {
+						// `from` and `to` decimal types are the same
+						host_data[col] = gpuBufferManager->customCudaHostAlloc<uint8_t>(size_bytes);
+						callCudaMemcpyDeviceToHost<uint8_t>(host_data[col], materialized_relation.columns[col]->data_wrapper.data, size_bytes, 0);
+					}
+					materialized_relation.columns[col]->data_wrapper.type.SetDecimalTypeInfo(to_width, to_scale);
 				} else {
-					throw NotImplementedException("Unsupported column type for INT128 conversion");
+					throw NotImplementedException("Unsupported siris column type for INT128 conversion: %d",
+																				static_cast<int>(materialized_relation.columns[col]->data_wrapper.type.id()));
 				}
 			} else {
 				host_data[col] = gpuBufferManager->customCudaHostAlloc<uint8_t>(size_bytes);
@@ -313,7 +374,7 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 		chunk.InitializeEmpty(types);
 		for (int col = 0; col < materialized_relation.columns.size(); col++) {
 			if(materialized_relation.columns[col]->data_wrapper.type.id() != GPUColumnTypeId::VARCHAR) {
-				if (types[col].InternalType() == PhysicalType::INT128) {
+				if (types[col].InternalType() == PhysicalType::INT128 && types[col].id() != LogicalTypeId::DECIMAL) {
 					Vector vector = rawDataToVector(host_data[col], vec, GPUColumnType(GPUColumnTypeId::INT128));
 					chunk.data[col].Reference(vector);
 				} else {
