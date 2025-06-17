@@ -32,6 +32,20 @@ struct MakeColumnFromConstant
                                  mr);
       return cudf::make_column_from_scalar(scalar, count, stream, mr);
     }
+    else if constexpr (std::is_same_v<T, numeric::decimal32> || std::is_same_v<T, numeric::decimal64>)
+    {
+      auto type = expr.value.type();
+      if (type.id() != LogicalTypeId::DECIMAL) {
+        throw InternalException("Invalid duckdb type for decimal constant: %d", static_cast<int>(type.id()));
+      }
+      // cudf decimal type uses negative scale
+      auto scalar = cudf::fixed_point_scalar<T>(expr.value.GetValueUnsafe<typename T::rep>(),
+                                                numeric::scale_type{-DecimalType::GetScale(type)},
+                                                true,
+                                                stream,
+                                                mr);
+      return cudf::make_column_from_scalar(scalar, count, stream, mr);
+    }
     else
     {
       auto scalar =
@@ -47,7 +61,8 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundConstant
   D_ASSERT(expr.value.type() == expr.return_type);
 
   // In many cases, this column materialization is pruned away
-  switch (GpuExpressionState::GetCudfType(expr.return_type).id())
+  auto cudf_type = GpuExpressionState::GetCudfType(expr.return_type);
+  switch (cudf_type.id())
   {
     case cudf::type_id::INT32:
       return MakeColumnFromConstant<int32_t>::Do(expr, input_count, resource_ref, execution_stream);
@@ -61,8 +76,12 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundConstant
       return MakeColumnFromConstant<bool>::Do(expr, input_count, resource_ref, execution_stream);
     case cudf::type_id::STRING:
       return MakeColumnFromConstant<std::string>::Do(expr, input_count, resource_ref, execution_stream);
+    case cudf::type_id::DECIMAL32:
+      return MakeColumnFromConstant<numeric::decimal32>::Do(expr, input_count, resource_ref, execution_stream);
+    case cudf::type_id::DECIMAL64:
+      return MakeColumnFromConstant<numeric::decimal64>::Do(expr, input_count, resource_ref, execution_stream);
     default:
-      throw InternalException("Execute[Constant]: Unknown type!");
+      throw InternalException("Execute[Constant]: Unknown cudf type: %d", static_cast<int>(cudf_type.id()));
   }
 }
 
