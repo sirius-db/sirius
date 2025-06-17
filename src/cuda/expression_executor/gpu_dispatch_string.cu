@@ -80,6 +80,11 @@ GpuDispatcher::DispatchStringMatching(const cudf::column_view& input,
                             mr,
                             stream);
   }
+  else
+  {
+    throw NotImplementedException("Unsupported StringMatchingType when not using cudf: %d",
+                                  static_cast<int>(MatchType));
+  }
 }
 
 //----------Instantiations----------//
@@ -94,6 +99,7 @@ INSTANTIATE_STR_MATCHING(CONTAINS)
 INSTANTIATE_STR_MATCHING(LIKE)
 INSTANTIATE_STR_MATCHING(NOT_LIKE)
 INSTANTIATE_STR_MATCHING(PREFIX)
+INSTANTIATE_STR_MATCHING(SUFFIX)
 
 #undef SPLIT_DELIMITER
 #undef INSTANTIATE_STR_MATCHING

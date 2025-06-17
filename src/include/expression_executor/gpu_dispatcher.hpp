@@ -16,7 +16,8 @@ enum class StringMatchingType : uint8_t
   LIKE,
   NOT_LIKE,
   CONTAINS,
-  PREFIX
+  PREFIX,
+  SUFFIX
 };
 
 //----------Gpu Dispatcher----------//

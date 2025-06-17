@@ -6,6 +6,7 @@
 #include "expression_executor/gpu_expression_executor.hpp"
 #include "expression_executor/gpu_expression_executor_state.hpp"
 #include "gpu_physical_strings_matching.hpp"
+#include "log/logging.hpp"
 #include <cudf/binaryop.hpp>
 #include <cudf/datetime.hpp>
 #include <cudf/scalar/scalar.hpp>
@@ -35,6 +36,7 @@ namespace sirius
 #define NOT_LIKE_FUNC_STR "!~~"
 #define CONTAINS_FUNC_STR "contains"
 #define PREFIX_FUNC_STR "prefix"
+#define SUFFIX_FUNC_STR "suffix"
 #define YEAR_FUNC_STR "year"
 #define MONTH_FUNC_STR "month"
 #define DAY_FUNC_STR "day"
@@ -79,6 +81,18 @@ struct StringMatchingDispatcher
     const auto& match_str_expr = expr.children[1]->Cast<BoundConstantExpression>();
     const auto& match_str      = match_str_expr.value.GetValue<std::string>();
 
+    // For the following `MatchType`, we only support using cudf
+    if constexpr (MatchType == StringMatchingType::SUFFIX)
+    {
+      const auto match_str_scalar =
+        cudf::string_scalar(match_str, true, executor.execution_stream, executor.resource_ref);
+      return cudf::strings::ends_with(input->view(),
+                                      match_str_scalar,
+                                      executor.execution_stream,
+                                      executor.resource_ref);
+    }
+
+    // For the following `MatchType`, we support using both cudf or the one implmented by Sirius
     if constexpr (UseCudf)
     {
       //----------Using CuDF----------//
@@ -125,6 +139,10 @@ struct StringMatchingDispatcher
                                           match_str_scalar,
                                           executor.execution_stream,
                                           executor.resource_ref);
+      }
+      else {
+        throw NotImplementedException("Unsupported StringMatchingType when using cudf: %d",
+                                      static_cast<int>(MatchType));
       }
     }
     else
@@ -428,6 +446,11 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundFunction
   else if (func_str == PREFIX_FUNC_STR)
   {
     StringMatchingDispatcher<StringMatchingType::PREFIX, use_cudf> dispatcher(*this);
+    return dispatcher(expr, state);
+  }
+  else if (func_str == SUFFIX_FUNC_STR)
+  {
+    StringMatchingDispatcher<StringMatchingType::SUFFIX, use_cudf> dispatcher(*this);
     return dispatcher(expr, state);
   }
 

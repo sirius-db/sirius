@@ -9,6 +9,7 @@
 
 namespace duckdb {
 
+template <typename T>
 void 
 ResolveTypeProbeExpression(vector<shared_ptr<GPUColumn>> &probe_keys, uint64_t* &count, uint64_t* &row_ids_left, uint64_t* &row_ids_right, 
 		unsigned long long* ht, uint64_t ht_len, const vector<JoinCondition> &conditions, JoinType join_type,
@@ -35,25 +36,25 @@ ResolveTypeProbeExpression(vector<shared_ptr<GPUColumn>> &probe_keys, uint64_t* 
 	//TODO: Need to handle special case for unique keys for better performance
 	if (join_type == JoinType::INNER) {
 		if (unique_build_keys) {
-			probeHashTableSingleMatch(probe_data, ht, ht_len, row_ids_left, row_ids_right, count, size, condition_mode, num_keys, 0);
+			probeHashTableSingleMatch<T>(probe_data, ht, ht_len, row_ids_left, row_ids_right, count, size, condition_mode, num_keys, 0);
 		} else {
-			probeHashTable(probe_data, ht, ht_len, row_ids_left, row_ids_right, count, size, condition_mode, num_keys, false);
+			probeHashTable<T>(probe_data, ht, ht_len, row_ids_left, row_ids_right, count, size, condition_mode, num_keys, false);
 		}
 	} else if (join_type == JoinType::SEMI) {
-		probeHashTableSingleMatch(probe_data, ht, ht_len, row_ids_left, row_ids_right, count, size, condition_mode, num_keys, 1);
+		probeHashTableSingleMatch<T>(probe_data, ht, ht_len, row_ids_left, row_ids_right, count, size, condition_mode, num_keys, 1);
 	} else if (join_type == JoinType::ANTI) {
-		probeHashTableSingleMatch(probe_data, ht, ht_len, row_ids_left, row_ids_right, count, size, condition_mode, num_keys, 2);
+		probeHashTableSingleMatch<T>(probe_data, ht, ht_len, row_ids_left, row_ids_right, count, size, condition_mode, num_keys, 2);
 	} else if (join_type == JoinType::RIGHT) {
 		if (unique_build_keys) {
-			probeHashTableSingleMatch(probe_data, ht, ht_len, row_ids_left, row_ids_right, count, size, condition_mode, num_keys, 3);
+			probeHashTableSingleMatch<T>(probe_data, ht, ht_len, row_ids_left, row_ids_right, count, size, condition_mode, num_keys, 3);
 		} else {
-			probeHashTable(probe_data, ht, ht_len, row_ids_left, row_ids_right, count, size, condition_mode, num_keys, true);
+			probeHashTable<T>(probe_data, ht, ht_len, row_ids_left, row_ids_right, count, size, condition_mode, num_keys, true);
 		}
 	} else if (join_type == JoinType::RIGHT_SEMI || join_type == JoinType::RIGHT_ANTI) {
 		if (unique_build_keys) {
-			probeHashTableRightSemiAntiSingleMatch(probe_data, ht, ht_len, size, condition_mode, num_keys);
+			probeHashTableRightSemiAntiSingleMatch<T>(probe_data, ht, ht_len, size, condition_mode, num_keys);
 		} else {
-			probeHashTableRightSemiAnti(probe_data, ht, ht_len, size, condition_mode, num_keys);
+			probeHashTableRightSemiAnti<T>(probe_data, ht, ht_len, size, condition_mode, num_keys);
 		}
 	} else {
 		throw NotImplementedException("Unsupported join type");
@@ -65,12 +66,13 @@ HandleProbeExpression(vector<shared_ptr<GPUColumn>> &probe_keys, uint64_t* &coun
 		unsigned long long* ht, uint64_t ht_len, const vector<JoinCondition> &conditions, JoinType join_type, 
 		bool unique_build_keys, GPUBufferManager* gpuBufferManager) {
     switch(probe_keys[0]->data_wrapper.type.id()) {
+      case GPUColumnTypeId::INT32:
+				ResolveTypeProbeExpression<int32_t>(probe_keys, count, row_ids_left, row_ids_right, ht, ht_len, conditions, join_type, unique_build_keys, gpuBufferManager);
+				break;
       case GPUColumnTypeId::INT64:
-		ResolveTypeProbeExpression(probe_keys, count, row_ids_left, row_ids_right, ht, ht_len, conditions, join_type, unique_build_keys, gpuBufferManager);
-		break;
       case GPUColumnTypeId::FLOAT64:
-	  	ResolveTypeProbeExpression(probe_keys, count, row_ids_left, row_ids_right, ht, ht_len, conditions, join_type, unique_build_keys, gpuBufferManager);
-		break;
+				ResolveTypeProbeExpression<int64_t>(probe_keys, count, row_ids_left, row_ids_right, ht, ht_len, conditions, join_type, unique_build_keys, gpuBufferManager);
+				break;
       default:
         throw NotImplementedException("Unsupported sirius column type in `HandleProbeExpression`: %d",
 																			static_cast<int>(probe_keys[0]->data_wrapper.type.id()));
@@ -119,6 +121,7 @@ HandleMarkExpression(vector<shared_ptr<GPUColumn>> &probe_keys, uint8_t* &output
     }
 }
 
+template <typename T>
 void 
 ResolveTypeBuildExpression(vector<shared_ptr<GPUColumn>> &build_keys, unsigned long long* ht, uint64_t ht_len, 
 	const vector<JoinCondition> &conditions, JoinType join_type, GPUBufferManager* gpuBufferManager) {
@@ -144,9 +147,9 @@ ResolveTypeBuildExpression(vector<shared_ptr<GPUColumn>> &build_keys, unsigned l
 	}
 
 	if (join_type == JoinType::INNER || join_type == JoinType::SEMI || join_type == JoinType::MARK) {
-		buildHashTable(build_data, ht, ht_len, size, condition_mode, num_keys, 0);
+		buildHashTable<T>(build_data, ht, ht_len, size, condition_mode, num_keys, 0);
 	} else if (join_type == JoinType::RIGHT || join_type == JoinType::RIGHT_SEMI || join_type == JoinType::RIGHT_ANTI) {
-		buildHashTable(build_data, ht, ht_len, size, condition_mode, num_keys, 1);
+		buildHashTable<T>(build_data, ht, ht_len, size, condition_mode, num_keys, 1);
 	} else {
 		throw NotImplementedException("Unsupported join type");
 	}
@@ -156,12 +159,13 @@ void
 HandleBuildExpression(vector<shared_ptr<GPUColumn>> &build_keys, unsigned long long* ht, uint64_t ht_len, 
 	const vector<JoinCondition> &conditions, JoinType join_type, GPUBufferManager* gpuBufferManager) {
     switch(build_keys[0]->data_wrapper.type.id()) {
+			case GPUColumnTypeId::INT32:
+				ResolveTypeBuildExpression<int32_t>(build_keys, ht, ht_len, conditions, join_type, gpuBufferManager);
+				break;
       case GPUColumnTypeId::INT64:
-		ResolveTypeBuildExpression(build_keys, ht, ht_len, conditions, join_type, gpuBufferManager);
-		break;
       case GPUColumnTypeId::FLOAT64:
-	  	ResolveTypeBuildExpression(build_keys, ht, ht_len, conditions, join_type, gpuBufferManager);
-		break;
+	  		ResolveTypeBuildExpression<int64_t>(build_keys, ht, ht_len, conditions, join_type, gpuBufferManager);
+				break;
       default:
         throw NotImplementedException("Unsupported sirius column type in `HandleBuildExpression`: %d",
 																			static_cast<int>(build_keys[0]->data_wrapper.type.id()));
