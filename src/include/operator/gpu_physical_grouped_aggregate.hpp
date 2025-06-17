@@ -146,5 +146,8 @@ public:
 // 	//! Create groups in the main ht for groups that would otherwise get filtered out completely
 // 	SinkResultType SinkGroupsOnly(ExecutionContext &context, GlobalSinkState &state, LocalSinkState &lstate,
 // 	                              DataChunk &input) const;
+
+private:
+	static bool CheckGroupKeyTypesForSiriusImpl(const vector<shared_ptr<GPUColumn>> &columns);
 };
 } // namespace duckdb

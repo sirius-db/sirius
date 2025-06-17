@@ -268,7 +268,7 @@ HandleGroupByAggregateExpression(vector<shared_ptr<GPUColumn>> &group_by_keys, v
 		//check if all the group by keys are all integers
 		for (int i = 0; i < num_group_keys; i++) {
 			if (group_by_keys[i]->data_wrapper.type.id() != GPUColumnTypeId::INT64) {
-				throw NotImplementedException("Group by column is not an integer");
+				throw NotImplementedException("Group by column is not an integer in `HandleGroupByAggregateExpression`");
 			}
 		}
 		switch(group_by_keys[0]->data_wrapper.type.id()) {
@@ -357,7 +357,7 @@ void HandleDuplicateElimination(vector<shared_ptr<GPUColumn>> &group_by_keys, GP
 	//check if all the group by keys are all integers
 	for (int i = 0; i < num_group_keys; i++) {
 		if (group_by_keys[i]->data_wrapper.type.id() != GPUColumnTypeId::INT64) {
-			throw NotImplementedException("Group by column is not an integer");
+			throw NotImplementedException("Group by column is not an integer in `HandleDuplicateElimination`");
 		}
 	}
     switch(group_by_keys[0]->data_wrapper.type.id()) {
@@ -423,7 +423,7 @@ void HandleDistinctGroupBy(vector<shared_ptr<GPUColumn>> &group_by_keys, vector<
 	SIRIUS_LOG_DEBUG("Handling distinct group by");
 	for (int i = 0; i < num_group_keys; i++) {
 		if (group_by_keys[i]->data_wrapper.type.id() != GPUColumnTypeId::INT64) {
-			throw NotImplementedException("Group by column is not an integer");
+			throw NotImplementedException("Group by column is not an integer in `HandleDistinctGroupBy`");
 		}
 	}
     switch(group_by_keys[0]->data_wrapper.type.id()) {
@@ -641,9 +641,14 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 		aggr_idx++;
 	}
 
+	bool can_use_sirius_impl = CheckGroupKeyTypesForSiriusImpl(group_by_column);
 	uint64_t count[1];
 	if (aggregates.size() == 0) {
-		HandleDuplicateElimination(group_by_column, gpuBufferManager, num_group_keys);
+		if (can_use_sirius_impl) {
+			HandleDuplicateElimination(group_by_column, gpuBufferManager, num_group_keys);
+		} else {
+			HandleGroupByAggregateCuDF(group_by_column, aggregate_column, gpuBufferManager, aggregates, num_group_keys);
+		}
 	} else {
 		bool string_cudf_supported = true;
 		// for (int col = 0; col < num_group_keys; col++) {
@@ -846,6 +851,15 @@ GPUPhysicalGroupedAggregate::SinkDistinctGrouping(GPUIntermediateRelation& input
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
 	SIRIUS_LOG_DEBUG("Group Aggregate Distinct Sink time: {:.2f} ms", duration.count()/1000.0);
+}
+
+bool GPUPhysicalGroupedAggregate::CheckGroupKeyTypesForSiriusImpl(const vector<shared_ptr<GPUColumn>> &columns) {
+	for (const auto& column: columns) {
+		if (column->data_wrapper.type.id() != GPUColumnTypeId::INT64) {
+			return false;
+		}
+	}
+	return true;
 }
 
 } // namespace duckdb
