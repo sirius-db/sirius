@@ -149,6 +149,10 @@ GPUColumn::convertToCudfColumn() {
                 cudf_type = cudf::data_type(cudf::type_id::DECIMAL64, -data_wrapper.type.GetDecimalTypeInfo()->scale_);
                 break;
             }
+            case sizeof(__int128_t): {
+                cudf_type = cudf::data_type(cudf::type_id::DECIMAL128, -data_wrapper.type.GetDecimalTypeInfo()->scale_);
+                break;
+            }
             default:
                 throw duckdb::InternalException("Unsupported sirius DECIMAL column type size in `convertToCudfColumn()`: %zu",
                                                 data_wrapper.getColumnTypeSize());
@@ -235,6 +239,12 @@ GPUColumn::setFromCudfColumn(cudf::column& cudf_column, bool _is_unique, int32_t
         data_wrapper.is_string_data = false;
         data_wrapper.type = GPUColumnType(GPUColumnTypeId::DECIMAL);
         data_wrapper.type.SetDecimalTypeInfo(Decimal::MAX_WIDTH_INT64, -col_type.scale());
+        data_wrapper.num_bytes = col_size * data_wrapper.getColumnTypeSize();
+        data_wrapper.offset = nullptr;
+    } else if (col_type.id() == cudf::type_id::DECIMAL128) {
+        data_wrapper.is_string_data = false;
+        data_wrapper.type = GPUColumnType(GPUColumnTypeId::DECIMAL);
+        data_wrapper.type.SetDecimalTypeInfo(Decimal::MAX_WIDTH_INT128, -col_type.scale());
         data_wrapper.num_bytes = col_size * data_wrapper.getColumnTypeSize();
         data_wrapper.offset = nullptr;
     } else {

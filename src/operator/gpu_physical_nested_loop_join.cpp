@@ -6,9 +6,12 @@
 #include "duckdb/execution/nested_loop_join.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/execution/operator/join/outer_join_marker.hpp"
+#include "expression_executor/gpu_expression_executor_state.hpp"
+#include "gpu_physical_hash_join.hpp"
 #include "gpu_physical_nested_loop_join.hpp"
 #include "gpu_pipeline.hpp"
 #include "gpu_meta_pipeline.hpp"
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/common/enums/physical_operator_type.hpp"
 #include "gpu_buffer_manager.hpp"
@@ -227,16 +230,60 @@ GPUPhysicalNestedLoopJoin::ResolveComplexJoin(GPUIntermediateRelation &input_rel
 
 	for (idx_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
 		auto &condition = conditions[cond_idx];
-        auto join_key_index = condition.left->Cast<BoundReferenceExpression>().index;
-        SIRIUS_LOG_DEBUG("Reading join key from left relation from index {}", join_key_index);
-		left_keys[cond_idx] = HandleMaterializeExpression(input_relation.columns[join_key_index], condition.left->Cast<BoundReferenceExpression>(), gpuBufferManager);
+		if (condition.left->GetExpressionClass() == ExpressionClass::BOUND_REF) {
+			auto join_key_index = condition.left->Cast<BoundReferenceExpression>().index;
+			SIRIUS_LOG_DEBUG("Reading join key from left relation from index {}", join_key_index);
+			left_keys[cond_idx] = HandleMaterializeExpression(input_relation.columns[join_key_index], condition.left->Cast<BoundReferenceExpression>(), gpuBufferManager);
+		} else if (condition.left->GetExpressionClass() == ExpressionClass::BOUND_CAST) {
+			auto& child = condition.left->Cast<BoundCastExpression>().child;
+			if (child->GetExpressionClass() != ExpressionClass::BOUND_REF) {
+				throw NotImplementedException("Unsupported expression type of left join condition in nested loop join: %d",
+																			static_cast<int>(child->GetExpressionClass()));
+			}
+			auto join_key_index = child->Cast<BoundReferenceExpression>().index;
+			SIRIUS_LOG_DEBUG("Reading join key from left relation from index {}", join_key_index);
+			left_keys[cond_idx] = HandleMaterializeExpression(input_relation.columns[join_key_index], child->Cast<BoundReferenceExpression>(), gpuBufferManager);
+			// Perform cast
+			auto from_cudf_column_view = left_keys[cond_idx]->convertToCudfColumn();
+			auto to_cudf_type = sirius::GpuExpressionState::GetCudfType(condition.left->return_type);
+			auto to_cudf_column = cudf::cast(from_cudf_column_view,
+																			 to_cudf_type,
+																			 rmm::cuda_stream_default,
+																			 GPUBufferManager::GetInstance().mr);
+			left_keys[cond_idx]->setFromCudfColumn(*to_cudf_column, false, nullptr, 0, gpuBufferManager);
+		} else {
+			throw NotImplementedException("Unsupported expression type of left join condition in nested loop join: %d",
+																		static_cast<int>(condition.left->GetExpressionClass()));
+		}
 	}
 
 	for (idx_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
 		auto &condition = conditions[cond_idx];
-        auto join_key_index = condition.right->Cast<BoundReferenceExpression>().index;
-        SIRIUS_LOG_DEBUG("Reading join key from right relation from index {}", join_key_index);
-		right_keys[cond_idx] = HandleMaterializeExpression(right_temp_data->columns[join_key_index], condition.right->Cast<BoundReferenceExpression>(), gpuBufferManager);
+		if (condition.right->GetExpressionClass() == ExpressionClass::BOUND_REF) {
+			auto join_key_index = condition.right->Cast<BoundReferenceExpression>().index;
+			SIRIUS_LOG_DEBUG("Reading join key from right relation from index {}", join_key_index);
+			right_keys[cond_idx] = HandleMaterializeExpression(right_temp_data->columns[join_key_index], condition.right->Cast<BoundReferenceExpression>(), gpuBufferManager);
+		} else if (condition.right->GetExpressionClass() == ExpressionClass::BOUND_CAST) {
+			auto& child = condition.right->Cast<BoundCastExpression>().child;
+			if (child->GetExpressionClass() != ExpressionClass::BOUND_REF) {
+				throw NotImplementedException("Unsupported expression type of right join condition in nested loop join: %d",
+																			static_cast<int>(child->GetExpressionClass()));
+			}
+			auto join_key_index = child->Cast<BoundReferenceExpression>().index;
+			SIRIUS_LOG_DEBUG("Reading join key from right relation from index {}", join_key_index);
+			right_keys[cond_idx] = HandleMaterializeExpression(right_temp_data->columns[join_key_index], child->Cast<BoundReferenceExpression>(), gpuBufferManager);
+			// Perform cast
+			auto from_cudf_column_view = right_keys[cond_idx]->convertToCudfColumn();
+			auto to_cudf_type = sirius::GpuExpressionState::GetCudfType(condition.right->return_type);
+			auto to_cudf_column = cudf::cast(from_cudf_column_view,
+																			 to_cudf_type,
+																			 rmm::cuda_stream_default,
+																			 GPUBufferManager::GetInstance().mr);
+			right_keys[cond_idx]->setFromCudfColumn(*to_cudf_column, false, nullptr, 0, gpuBufferManager);
+		} else {
+			throw NotImplementedException("Unsupported expression type of right join condition in nested loop join: %d",
+																		static_cast<int>(condition.right->GetExpressionClass()));
+		}
 	}
 
 	//check if all probe keys are int64 or all the probe keys are float64
@@ -250,32 +297,36 @@ GPUPhysicalNestedLoopJoin::ResolveComplexJoin(GPUIntermediateRelation &input_rel
 			all_float64 = false;
 		}
 	}
+	SIRIUS_LOG_DEBUG("Nested loop join");
 	if (!all_int64 && !all_float64) {
-		throw NotImplementedException("Hash join only supports integer or float64 keys");
-	}
-
-	if (join_type == JoinType::INNER) {
-		SIRIUS_LOG_DEBUG("Nested loop join");
-		HandleNestedLoopJoin(left_keys, right_keys, count, row_ids_left, row_ids_right, conditions, join_type, gpuBufferManager);
-
-		vector<column_t> rhs_output_columns;
-		for (idx_t i = 0; i < right_temp_data->columns.size(); i++) rhs_output_columns.push_back(i);
-
-		// if (count[0] == 0) throw NotImplementedException("No match found in nested loop join");
-		SIRIUS_LOG_DEBUG("Writing row IDs from LHS to output relation");
-		HandleMaterializeRowIDs(input_relation, output_relation, count[0], row_ids_left, gpuBufferManager, false);
-		SIRIUS_LOG_DEBUG("Writing row IDs from RHS to output relation");
-		HandleMaterializeRowIDsRHS(*right_temp_data, output_relation, rhs_output_columns, input_relation.column_count, count[0], row_ids_right, gpuBufferManager, false);
-
-	} else {
-        throw NotImplementedException("Unimplemented type for complex nested loop join!");
+		// Not supported by Sirius implementation, use cudf instead
+		if (join_type == JoinType::INNER) {
+			cudf_mixed_or_conditional_inner_join(left_keys, right_keys, conditions, join_type, row_ids_left, row_ids_right, count);
+		} else {
+			throw NotImplementedException("Unimplemented type for complex nested loop join using cudf!");
     }
+	} else {
+		// Supported by Sirius implementation
+		if (join_type == JoinType::INNER) {
+			HandleNestedLoopJoin(left_keys, right_keys, count, row_ids_left, row_ids_right, conditions, join_type, gpuBufferManager);
+		} else {
+			throw NotImplementedException("Unimplemented type for complex nested loop join not using cudf!");
+    }
+	}
+	vector<column_t> rhs_output_columns;
+	for (idx_t i = 0; i < right_temp_data->columns.size(); i++) rhs_output_columns.push_back(i);
 
-    auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+	// if (count[0] == 0) throw NotImplementedException("No match found in nested loop join");
+	SIRIUS_LOG_DEBUG("Writing row IDs from LHS to output relation");
+	HandleMaterializeRowIDs(input_relation, output_relation, count[0], row_ids_left, gpuBufferManager, false);
+	SIRIUS_LOG_DEBUG("Writing row IDs from RHS to output relation");
+	HandleMaterializeRowIDsRHS(*right_temp_data, output_relation, rhs_output_columns, input_relation.column_count, count[0], row_ids_right, gpuBufferManager, false);
+
+	auto end = std::chrono::high_resolution_clock::now();
+	auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
 	SIRIUS_LOG_DEBUG("Nested loop join Execute time: {:.2f} ms", duration.count()/1000.0);
 
-    return OperatorResultType::FINISHED;
+	return OperatorResultType::FINISHED;
 }
 
 SourceResultType 

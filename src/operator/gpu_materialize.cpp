@@ -75,6 +75,8 @@ HandleMaterializeExpression(shared_ptr<GPUColumn> column, BoundReferenceExpressi
                     return ResolveTypeMaterializeExpression<int32_t>(column, bound_ref, gpuBufferManager);
                 case sizeof(int64_t):
                     return ResolveTypeMaterializeExpression<int64_t>(column, bound_ref, gpuBufferManager);
+                case sizeof(__int128_t):
+                    return ResolveTypeMaterializeExpression<__int128_t>(column, bound_ref, gpuBufferManager);
                 default:
                     throw NotImplementedException("Unsupported sirius DECIMAL column type size in `HandleMaterializeExpression`: %zu",
                                                   column->data_wrapper.getColumnTypeSize());

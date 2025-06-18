@@ -15,9 +15,9 @@
 
 namespace duckdb {
 
-void cudf_inner_join(vector<shared_ptr<GPUColumn>>& probe_keys, vector<shared_ptr<GPUColumn>>& build_keys, int num_keys, uint64_t*& row_ids_left, uint64_t*& row_ids_right, uint64_t*& count);
+void cudf_hash_inner_join(vector<shared_ptr<GPUColumn>>& probe_keys, vector<shared_ptr<GPUColumn>>& build_keys, int num_keys, uint64_t*& row_ids_left, uint64_t*& row_ids_right, uint64_t*& count);
 
-void cudf_mixed_join(vector<shared_ptr<GPUColumn>>& probe_columns, vector<shared_ptr<GPUColumn>>& build_columns, const vector<JoinCondition>& conditions, JoinType join_type, uint64_t*& row_ids_left, uint64_t*& row_ids_right, uint64_t*& count);
+void cudf_mixed_or_conditional_inner_join(vector<shared_ptr<GPUColumn>>& probe_columns, vector<shared_ptr<GPUColumn>>& build_columns, const vector<JoinCondition>& conditions, JoinType join_type, uint64_t*& row_ids_left, uint64_t*& row_ids_right, uint64_t*& count);
 
 template <typename T>
 void probeHashTable(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t* &row_ids_left, uint64_t* &row_ids_right, uint64_t* &count, 
