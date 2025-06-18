@@ -190,9 +190,40 @@ struct NumericBinaryFunctionDispatcher
                                                      const cudf::column_view& right,
                                                      const cudf::data_type& return_type)
   {
-    auto left_decimal_scalar = cudf::fixed_point_scalar<T>(
-      left_value, scale, true, executor.execution_stream, executor.resource_ref);
-    return cudf::binary_operation(left_decimal_scalar,
+    std::unique_ptr<cudf::scalar> left_decimal_scalar;
+    if (right.type().id() == cudf::type_to_id<T>()) {
+      left_decimal_scalar = std::make_unique<cudf::fixed_point_scalar<T>>(
+        left_value, scale, true, executor.execution_stream, executor.resource_ref);
+    } else {
+      // If types are different, need to construct `left_decimal_scalar` using `right.type()`
+      switch (right.type().id()) {
+        case cudf::type_id::DECIMAL32: {
+          if (left_value > std::numeric_limits<int32_t>::max()) {
+            throw InternalException("Cannot cast left decimal scalar to decimal32, value greater than INT32_MAX");
+          }
+          left_decimal_scalar = std::make_unique<cudf::fixed_point_scalar<numeric::decimal32>>(
+            static_cast<int32_t>(left_value), scale, true, executor.execution_stream, executor.resource_ref);
+          break;
+        }
+        case cudf::type_id::DECIMAL64: {
+          if (left_value > std::numeric_limits<int64_t>::max()) {
+            throw InternalException("Cannot cast left decimal scalar to decimal64, value greater than INT64_MAX");
+          }
+          left_decimal_scalar = std::make_unique<cudf::fixed_point_scalar<numeric::decimal64>>(
+            static_cast<int64_t>(left_value), scale, true, executor.execution_stream, executor.resource_ref);
+          break;
+        }
+        case cudf::type_id::DECIMAL128: {
+          left_decimal_scalar = std::make_unique<cudf::fixed_point_scalar<numeric::decimal128>>(
+            static_cast<__int128_t>(left_value), scale, true, executor.execution_stream, executor.resource_ref);
+          break;
+        }
+        default:
+          throw InternalException("Right column is not decimal with left decimal constant in `DoLeftScalarBinaryOp`: %d",
+                                  static_cast<int>(right.type().id()));
+      }
+    }
+    return cudf::binary_operation(*left_decimal_scalar,
                                   right,
                                   BinOp,
                                   return_type,
@@ -223,10 +254,41 @@ struct NumericBinaryFunctionDispatcher
                                                       numeric::scale_type scale,
                                                       const cudf::data_type& return_type)
   {
-    auto right_decimal_scalar = cudf::fixed_point_scalar<T>(
-      right_value, scale, true, executor.execution_stream, executor.resource_ref);
+    std::unique_ptr<cudf::scalar> right_decimal_scalar;
+    if (left.type().id() == cudf::type_to_id<T>()) {
+      right_decimal_scalar = std::make_unique<cudf::fixed_point_scalar<T>>(
+        right_value, scale, true, executor.execution_stream, executor.resource_ref);
+    } else {
+      // If types are different, need to construct `right_decimal_scalar` using `left.type()`
+      switch (left.type().id()) {
+        case cudf::type_id::DECIMAL32: {
+          if (right_value > std::numeric_limits<int32_t>::max()) {
+            throw InternalException("Cannot cast right decimal scalar to decimal32, value greater than INT32_MAX");
+          }
+          right_decimal_scalar = std::make_unique<cudf::fixed_point_scalar<numeric::decimal32>>(
+            static_cast<int32_t>(right_value), scale, true, executor.execution_stream, executor.resource_ref);
+          break;
+        }
+        case cudf::type_id::DECIMAL64: {
+          if (right_value > std::numeric_limits<int64_t>::max()) {
+            throw InternalException("Cannot cast right decimal scalar to decimal64, value greater than INT64_MAX");
+          }
+          right_decimal_scalar = std::make_unique<cudf::fixed_point_scalar<numeric::decimal64>>(
+            static_cast<int64_t>(right_value), scale, true, executor.execution_stream, executor.resource_ref);
+          break;
+        }
+        case cudf::type_id::DECIMAL128: {
+          right_decimal_scalar = std::make_unique<cudf::fixed_point_scalar<numeric::decimal128>>(
+            static_cast<__int128_t>(right_value), scale, true, executor.execution_stream, executor.resource_ref);
+          break;
+        }
+        default:
+          throw InternalException("Left column is not decimal with right decimal constant in `DoRightScalarBinaryOp`: %d",
+                                  static_cast<int>(left.type().id()));
+      }
+    }
     return cudf::binary_operation(left,
-                                  right_decimal_scalar,
+                                  *right_decimal_scalar,
                                   BinOp,
                                   return_type,
                                   executor.execution_stream,
@@ -247,7 +309,8 @@ struct NumericBinaryFunctionDispatcher
       const auto& left_value = expr.children[0]->Cast<BoundConstantExpression>().value;
       const auto& right      = executor.Execute(*expr.children[1], state->child_states[1].get());
 
-      switch (GpuExpressionState::GetCudfType(expr.children[0]->return_type).id())
+      auto cudf_type = GpuExpressionState::GetCudfType(expr.children[0]->return_type);
+      switch (cudf_type.id())
       {
         case cudf::type_id::INT32:
           return DoLeftScalarBinaryOp(left_value.GetValue<int32_t>(), right->view(), return_type);
@@ -268,12 +331,19 @@ struct NumericBinaryFunctionDispatcher
             left_value.GetValueUnsafe<int64_t>(),
             numeric::scale_type{-duckdb::DecimalType::GetScale(left_value.type())},
             right->view(), return_type);
+        case cudf::type_id::DECIMAL128: {
+          duckdb::hugeint_t hugeint_value = left_value.GetValueUnsafe<duckdb::hugeint_t>();
+          return DoLeftScalarBinaryOp<numeric::decimal128>(
+            (__int128_t(hugeint_value.upper) << 64) | hugeint_value.lower,
+            numeric::scale_type{-duckdb::DecimalType::GetScale(left_value.type())},
+            right->view(), return_type);
+        }
         case cudf::type_id::BOOL8:
           throw NotImplementedException("Execute[Function]: Boolean types not supported for "
                                         "numeric binary operations!");
         default:
-          throw InternalException("Execute[Function]: Unknown constant type for binary "
-                                  "operation!");
+          throw InternalException("Execute[Function]: Unknown cudf type of left constant for binary operation: %d",
+                                  static_cast<int>(cudf_type.id()));
       }
     }
     else if (expr.children[1]->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT)
@@ -282,7 +352,8 @@ struct NumericBinaryFunctionDispatcher
       const auto& right_value = expr.children[1]->Cast<BoundConstantExpression>().value;
       const auto& left        = executor.Execute(*expr.children[0], state->child_states[0].get());
 
-      switch (GpuExpressionState::GetCudfType(expr.children[1]->return_type).id())
+      auto cudf_type = GpuExpressionState::GetCudfType(expr.children[1]->return_type);
+      switch (cudf_type.id())
       {
         case cudf::type_id::INT32:
           return DoRightScalarBinaryOp(left->view(), right_value.GetValue<int32_t>(), return_type);
@@ -303,12 +374,19 @@ struct NumericBinaryFunctionDispatcher
             left->view(), right_value.GetValueUnsafe<int64_t>(),
             numeric::scale_type{-duckdb::DecimalType::GetScale(right_value.type())},
             return_type);
+        case cudf::type_id::DECIMAL128: {
+          duckdb::hugeint_t hugeint_value = right_value.GetValueUnsafe<duckdb::hugeint_t>();
+          return DoRightScalarBinaryOp<numeric::decimal128>(
+            left->view(), (__int128_t(hugeint_value.upper) << 64) | hugeint_value.lower,
+            numeric::scale_type{-duckdb::DecimalType::GetScale(right_value.type())},
+            return_type);
+        }
         case cudf::type_id::BOOL8:
           throw NotImplementedException("Execute[Function]: Boolean types not supported for "
                                         "numeric binary operations!");
         default:
-          throw InternalException("Execute[Function]: Unknown constant type for binary "
-                                  "operation!");
+          throw InternalException("Execute[Function]: Unknown cudf type of right constant for binary operation: %d",
+                                  static_cast<int>(cudf_type.id()));
       }
     }
 

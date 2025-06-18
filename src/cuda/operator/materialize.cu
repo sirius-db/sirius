@@ -193,5 +193,7 @@ template
 void materializeExpression<uint8_t>(uint8_t *a, uint8_t*& result, uint64_t *row_ids, uint64_t result_len, uint64_t input_size);
 template
 void materializeExpression<int64_t>(int64_t *a, int64_t*& result, uint64_t *row_ids, uint64_t result_len, uint64_t input_size);
+template
+void materializeExpression<__int128_t>(__int128_t *a, __int128_t*& result, uint64_t *row_ids, uint64_t result_len, uint64_t input_size);
 
 } // namespace duckdb
