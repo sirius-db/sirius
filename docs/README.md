@@ -10,11 +10,17 @@ Sirius is a GPU acceleration layer for SQL analytics. It plugs into existing eng
   <img src="sirius-architecture.png" alt="Diagram" width="900"/>
 </p>
 
+## Performance
+Running TPC-H on SF=100, Sirius achieves ~10x speedup over existing CPU query engines at the same hardware rental cost, making it well-suited for interactive analytics, financial workloads, and ETL jobs.
+
+![Performance](sirius-performance.png)
+
 ## Supported OS/GPU/CUDA/CMake
 - Ubuntu >= 20.04
 - NVIDIA Volta™ or higher with compute capability 7.0+
 - CUDA >= 11.2
 - CMake >= 3.30.4 (follow this [instruction](https://medium.com/@yulin_li/how-to-update-cmake-on-ubuntu-9602521deecb) to upgrade CMake)
+- We recommend building Sirius with at least **16 vCPUs** to ensure faster compilation.
 
 ## Dependencies (Option 1): Use AWS Image
 For users who have access to AWS and want to launch AWS EC2 instances to run Sirius, the following images are prepared with dependencies fully installed.
@@ -230,11 +236,6 @@ Sirius uses [spdlog](https://github.com/gabime/spdlog) for logging messages duri
 export SIRIUS_LOG_DIR={PATH for logging}
 export SIRIUS_LOG_LEVEL=debug
 ```
-
-## Performance
-Running TPC-H on SF=100, Sirius achieves ~10x speedup over existing CPU query engines at the same hardware rental cost, making it well-suited for interactive analytics, financial workloads, and ETL jobs.
-
-![Performance](sirius-performance.png)
 
 ## Limitations
 Sirius is under active development, and several features are still in progress. Notable current limitations include:
