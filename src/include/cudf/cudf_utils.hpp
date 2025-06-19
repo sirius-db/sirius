@@ -24,3 +24,29 @@
 #include <cudf/round.hpp>
 #include <cudf/unary.hpp>
 #include <cudf/ast/expressions.hpp>
+
+#include "duckdb/common/exception.hpp"
+
+namespace duckdb {
+
+inline bool IsCudfTypeDecimal(const cudf::data_type& type) {
+  return type.id() == cudf::type_id::DECIMAL32 ||
+         type.id() == cudf::type_id::DECIMAL64 ||
+         type.id() == cudf::type_id::DECIMAL128;
+}
+
+inline int GetCudfDecimalTypeSize(const cudf::data_type& type) {
+  if (type.id() == cudf::type_id::DECIMAL32) {
+    return sizeof(int32_t);
+  }
+  if (type.id() == cudf::type_id::DECIMAL64) {
+    return sizeof(int64_t);
+  }
+  if (type.id() == cudf::type_id::DECIMAL128) {
+    return sizeof(__int128_t);
+  }
+  throw InternalException("Non decimal cudf type called in `GetCudfDecimalTypeSize`: %d",
+                          static_cast<int>(type.id()));
+}
+
+}

@@ -24,20 +24,44 @@ void cudf_hash_inner_join(vector<shared_ptr<GPUColumn>>& probe_keys, vector<shar
 
     cudf::set_current_device_resource(gpuBufferManager->mr);
 
-    std::vector<cudf::column_view> build_keys_cudf;
+    std::vector<cudf::column_view> build_keys_cudf, probe_keys_cudf;
+    std::vector<std::unique_ptr<cudf::column>> keys_cast;
     for (int key = 0; key < num_keys; key++) {
-        build_keys_cudf.push_back(build_keys[key]->convertToCudfColumn());
+        auto build_key_cudf = build_keys[key]->convertToCudfColumn();
+        auto probe_key_cudf = probe_keys[key]->convertToCudfColumn();
+        if (build_key_cudf.type().id() == probe_key_cudf.type().id()) {
+            build_keys_cudf.push_back(build_key_cudf);
+            probe_keys_cudf.push_back(probe_key_cudf);
+        } else if (IsCudfTypeDecimal(build_key_cudf.type()) && IsCudfTypeDecimal(probe_key_cudf.type())) {
+            // Cast for decimal join key
+            int build_decimal_size = GetCudfDecimalTypeSize(build_key_cudf.type());
+            int probe_decimal_size = GetCudfDecimalTypeSize(probe_key_cudf.type());
+            if (build_decimal_size < probe_decimal_size) {
+                // Cast for build side to probe side
+                keys_cast.push_back(cudf::cast(build_key_cudf,
+                                               probe_key_cudf.type(),
+                                               rmm::cuda_stream_default,
+                                               GPUBufferManager::GetInstance().mr));
+                build_keys_cudf.push_back(keys_cast.back()->view());
+                probe_keys_cudf.push_back(probe_key_cudf);
+            } else {
+                // Cast for probe side to build side
+                keys_cast.push_back(cudf::cast(probe_key_cudf,
+                                               build_key_cudf.type(),
+                                               rmm::cuda_stream_default,
+                                               GPUBufferManager::GetInstance().mr));
+                build_keys_cudf.push_back(build_key_cudf);
+                probe_keys_cudf.push_back(keys_cast.back()->view());
+            }
+        } else {
+            throw InternalException("Build and probe key type mismatch in `cudf_hash_inner_join`: %d vs %d",
+                static_cast<int>(build_key_cudf.type().id()), static_cast<int>(probe_key_cudf.type().id()));
+        }
     }
-
     auto build_table = cudf::table_view(build_keys_cudf);
-    auto hash_table = cudf::hash_join(build_table, cudf::null_equality::EQUAL);
-
-    std::vector<cudf::column_view> probe_keys_cudf;
-    for (int key = 0; key < num_keys; key++) {
-        probe_keys_cudf.push_back(probe_keys[key]->convertToCudfColumn());
-    }
-
     auto probe_table = cudf::table_view(probe_keys_cudf);
+
+    auto hash_table = cudf::hash_join(build_table, cudf::null_equality::EQUAL);
     auto result = hash_table.inner_join(probe_table);
     
     auto result_count = result.first->size();
