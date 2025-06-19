@@ -44,15 +44,14 @@ ResolveTypeCombineStrings(shared_ptr<GPUColumn> column1, shared_ptr<GPUColumn> c
 shared_ptr<GPUColumn>
 CombineColumns(shared_ptr<GPUColumn> column1, shared_ptr<GPUColumn> column2, GPUBufferManager* gpuBufferManager) {
     switch(column1->data_wrapper.type.id()) {
+      case GPUColumnTypeId::INT32:
+				return ResolveTypeCombineColumns<int32_t>(column1, column2, gpuBufferManager);
       case GPUColumnTypeId::INT64:
-		return ResolveTypeCombineColumns<uint64_t>(column1, column2, gpuBufferManager);
-		break;
+				return ResolveTypeCombineColumns<uint64_t>(column1, column2, gpuBufferManager);
       case GPUColumnTypeId::FLOAT64:
-		return ResolveTypeCombineColumns<double>(column1, column2, gpuBufferManager);
-		break;
+				return ResolveTypeCombineColumns<double>(column1, column2, gpuBufferManager);
       case GPUColumnTypeId::VARCHAR:
-		return ResolveTypeCombineStrings(column1, column2, gpuBufferManager);
-		break;
+				return ResolveTypeCombineStrings(column1, column2, gpuBufferManager);
 	  default:
         throw NotImplementedException("Unsupported sirius column type in `CombineColumns: %d",
 																			static_cast<int>(column1->data_wrapper.type.id()));
