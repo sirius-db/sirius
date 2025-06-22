@@ -7,6 +7,82 @@
 
 namespace duckdb {
 
+__device__ uint32_t warp_bitmask_set(uint32_t bitset) {
+    uint32_t lane_id = threadIdx.x % warpSize;
+    uint32_t set = (bitset << lane_id);
+    for (int offset = 16; offset >= 1; offset /= 2) {
+        set |= __shfl_down_sync(0xFFFFFFFF, set, offset);
+    }
+    return set;
+}
+
+
+template <typename T, int B, int I>
+__global__ void materialize_expression_with_null(const T *a, T* result, uint32_t* mask, uint32_t* out_mask, uint64_t *row_ids, uint64_t N) {
+
+    uint64_t tile_size = B * I;
+    uint64_t tile_offset = blockIdx.x * tile_size;
+
+    uint64_t num_tiles = (N + tile_size - 1) / tile_size;
+    uint64_t num_tile_items = tile_size;
+
+    if (blockIdx.x == num_tiles - 1) {
+        num_tile_items = N - tile_offset;
+    }
+
+    uint32_t isvalid[I];
+    #pragma unroll
+    for (int ITEM = 0; ITEM < I; ++ITEM) {
+        isvalid[ITEM] = 0;
+    }
+
+    uint64_t mask_tile_size = (B * I) / 32;
+    uint64_t mask_tile_offset = blockIdx.x * mask_tile_size;
+
+    #pragma unroll
+    for (int ITEM = 0; ITEM < I; ++ITEM) {
+        if (threadIdx.x + ITEM * B < num_tile_items) {
+            uint64_t items_ids = row_ids[tile_offset + threadIdx.x + ITEM * B];
+            uint64_t word_offset = items_ids / 32;
+            uint64_t bit_offset = items_ids % 32;
+            isvalid[ITEM] = mask[word_offset] & (1 << bit_offset) ? 1 : 0;
+            result[tile_offset + threadIdx.x + ITEM * B] = a[items_ids];
+        }
+    }
+
+    #pragma unroll
+    for (int ITEM = 0; ITEM < I; ++ITEM) {
+        uint32_t set = warp_bitmask_set(isvalid[ITEM]);
+        __syncwarp();
+        if (threadIdx.x % 32 == 0 && threadIdx.x + ITEM * B < num_tile_items) {
+            out_mask[mask_tile_offset + (threadIdx.x / 32) + ITEM * (B / 32)] = set;
+        }
+        __syncwarp();
+    }
+}
+
+
+__global__ void materialize_offset_with_null(uint64_t* offset, uint64_t* result_length, uint32_t* mask, uint32_t* out_mask, uint64_t* row_ids, size_t N) {
+    size_t tid = threadIdx.x + blockIdx.x * blockDim.x;
+    bool isvalid = 0;
+    if(tid < N) {
+        uint64_t copy_row_id = row_ids[tid];
+        uint64_t new_length = offset[copy_row_id + 1] - offset[copy_row_id];
+        result_length[tid] = new_length;
+
+        uint64_t word_offset = copy_row_id / 32;
+        uint64_t bit_offset = copy_row_id % 32;
+        isvalid = mask[word_offset] & (1 << bit_offset) ? 1 : 0;
+    }
+
+    uint32_t set = warp_bitmask_set(isvalid);
+    __syncwarp();
+    if (threadIdx.x % 32 == 0 && tid < N) {
+        out_mask[tid / 32] = set;
+    }
+    __syncwarp();
+}
+
 template <typename T, int B, int I>
 __global__ void materialize_expression(const T *a, T* result, uint64_t *row_ids, uint64_t N) {
 
@@ -23,7 +99,7 @@ __global__ void materialize_expression(const T *a, T* result, uint64_t *row_ids,
     #pragma unroll
     for (int ITEM = 0; ITEM < I; ++ITEM) {
         if (threadIdx.x + ITEM * B < num_tile_items) {
-            int items_ids = row_ids[tile_offset + threadIdx.x + ITEM * B];
+            uint64_t items_ids = row_ids[tile_offset + threadIdx.x + ITEM * B];
             result[tile_offset + threadIdx.x + ITEM * B] = a[items_ids];
         }
     }
@@ -62,6 +138,17 @@ template
 __global__ void materialize_expression<uint8_t, BLOCK_THREADS, ITEMS_PER_THREAD>(const uint8_t *a, uint8_t* result, uint64_t *row_ids, uint64_t N);
 template
 __global__ void materialize_expression<int64_t, BLOCK_THREADS, ITEMS_PER_THREAD>(const int64_t *a, int64_t* result, uint64_t *row_ids, uint64_t N);
+
+template
+__global__ void materialize_expression_with_null<int, BLOCK_THREADS, ITEMS_PER_THREAD>(const int *a, int* result, uint32_t* mask, uint32_t* out_mask, uint64_t *row_ids, uint64_t N);
+template
+__global__ void materialize_expression_with_null<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD>(const uint64_t *a, uint64_t* result, uint32_t* mask, uint32_t* out_mask, uint64_t *row_ids, uint64_t N);
+template
+__global__ void materialize_expression_with_null<float, BLOCK_THREADS, ITEMS_PER_THREAD>(const float *a, float* result, uint32_t* mask, uint32_t* out_mask, uint64_t *row_ids, uint64_t N);
+template
+__global__ void materialize_expression_with_null<double, BLOCK_THREADS, ITEMS_PER_THREAD>(const double *a, double* result, uint32_t* mask, uint32_t* out_mask, uint64_t *row_ids, uint64_t N);
+template
+__global__ void materialize_expression_with_null<uint8_t, BLOCK_THREADS, ITEMS_PER_THREAD>(const uint8_t *a, uint8_t* result, uint32_t* mask, uint32_t* out_mask, uint64_t *row_ids, uint64_t N);
 
 template <typename T>
 void materializeExpression(T *a, T*& result, uint64_t *row_ids, uint64_t result_len, uint64_t input_len) {

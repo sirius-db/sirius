@@ -126,4 +126,22 @@ void callCudaMemcpyDeviceToDevice(T* dest, T* src, size_t size, int gpu) {
     STOP_TIMER();
 }
 
+void callCudaMemset(void* ptr, int value, size_t size, int gpu) {
+    CHECK_ERROR();
+    if (size == 0) {
+        SIRIUS_LOG_DEBUG("Input size is 0");
+        return;
+    }
+    SETUP_TIMING();
+    START_TIMER();
+    SIRIUS_LOG_DEBUG("Setting memory on GPU");
+    cudaSetDevice(gpu);
+    gpuErrchk(cudaMemset(ptr, value, size));
+    CHECK_ERROR();
+    gpuErrchk(cudaDeviceSynchronize());
+    cudaSetDevice(0);
+    SIRIUS_LOG_DEBUG("Done setting memory on GPU");
+    STOP_TIMER();
+}
+
 } // namespace duckdb
