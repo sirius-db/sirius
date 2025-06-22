@@ -95,11 +95,11 @@ conda create --name libcudf-env
 conda activate libcudf-env
 conda install -c rapidsai -c conda-forge -c nvidia rapidsai::libcudf
 ```
-Set the environment variables `USE_CUDF` to 1 and `LIBCUDF_ENV_PREFIX` to the conda environment's path. For example, if we installed miniconda in `~/miniconda3` and installed libcudf in the conda environment `libcudf-env`, then we would set the `LIBCUDF_ENV_PREFIX` to `~/miniconda3/envs/libcudf-env`.
+Set the environment variables `LIBCUDF_ENV_PREFIX` to the conda environment's path. For example, if we installed miniconda in `~/miniconda3` and installed libcudf in the conda environment `libcudf-env`, then we would set the `LIBCUDF_ENV_PREFIX` to `~/miniconda3/envs/libcudf-env`.
 ```
-export USE_CUDF=1
 export LIBCUDF_ENV_PREFIX={PATH to libcudf-env}
 ```
+It is recommended to add the environment variables to your `bashrc` to avoid repetition.
 
 ## Building Sirius
 To clone the Sirius repository:
@@ -125,6 +125,11 @@ Optionally, to use the Python API in Sirius, we also need to build the duckdb-py
 cd duckdb/tools/pythonpkg/
 pip install .
 cd $SIRIUS_HOME_PATH
+```
+Common issues: If `pip install .` only works inside an environment, then do the following from the Sirius home directory before the installation:
+```
+python3 -m venv --prompt duckdb .venv
+source .venv/bin/activate
 ```
 
 ## Generating and Loading TPC-H dataset
