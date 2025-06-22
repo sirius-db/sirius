@@ -50,6 +50,9 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::CreatePlan(LogicalExpr
         uint64_t* d_data = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
         if (op.expressions[expression_idx][0]->type == ExpressionType::VALUE_CONSTANT) {
             auto &constant_expr = op.expressions[expression_idx][0]->Cast<BoundConstantExpression>();
+			if (constant_expr.value.type() != LogicalType::BIGINT) {
+				throw InvalidInputException("Expression get only supports BIGINT constants");
+			}
             h_data[0] = constant_expr.value.GetValue<uint64_t>();
             // callCudaMemcpy(d_data, h_data, 1 * sizeof(uint64_t), cudaMemcpyHostToDevice);
             callCudaMemcpyHostToDevice<uint64_t>(d_data, h_data, 1, 0);
