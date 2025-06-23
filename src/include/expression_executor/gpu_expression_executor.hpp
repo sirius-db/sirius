@@ -23,7 +23,7 @@ namespace sirius
 
 /// CONFIG ///
 // Whether to use CuDF or Sirius for string functions
-#define USE_CUDF_EXPR false
+#define USE_CUDF_EXPR true
 /// CONFIG ///
 
 //----------GpuExpressionExecutor----------//

@@ -34,11 +34,11 @@ GPUPhysicalFilter::GPUPhysicalFilter(vector<LogicalType> types, vector<unique_pt
 OperatorResultType 
 GPUPhysicalFilter::Execute(GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation) const {
 	SIRIUS_LOG_DEBUG("Executing expression {}", expression->ToString());
-  auto start = std::chrono::high_resolution_clock::now();
+ 	auto start = std::chrono::high_resolution_clock::now();
 
-  // The new executor...
-  sirius::GpuExpressionExecutor gpu_expression_executor(*expression.get());
-  gpu_expression_executor.Select(input_relation, output_relation);
+	// The new executor...
+	sirius::GpuExpressionExecutor gpu_expression_executor(*expression.get());
+	gpu_expression_executor.Select(input_relation, output_relation);
   
 	auto end = std::chrono::high_resolution_clock::now();
 	auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);

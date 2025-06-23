@@ -1,7 +1,6 @@
 #pragma once
 
 #include "gpu_physical_operator.hpp"
-#include "gpu_expression_executor.hpp"
 
 namespace duckdb {
 
