@@ -47,16 +47,16 @@ struct GPUTableFunctionData : public TableFunctionData {
 	bool plan_error = false;
 };
 
-struct GPUCachingFunctionData : public TableFunctionData {
-	GPUCachingFunctionData() = default;
-	unique_ptr<Connection> conn;
-	GPUBufferManager *gpuBufferManager;
-	GPUColumnType type;
-	uint8_t *data;
-	string column;
-	string table;
-	bool finished = false;
-};
+// struct GPUCachingFunctionData : public TableFunctionData {
+// 	GPUCachingFunctionData() = default;
+// 	unique_ptr<Connection> conn;
+// 	GPUBufferManager *gpuBufferManager;
+// 	GPUColumnType type;
+// 	uint8_t *data;
+// 	string column;
+// 	string table;
+// 	bool finished = false;
+// };
 
 void do_nothing_context(ClientContext *) {
 }
@@ -90,65 +90,65 @@ unique_ptr<GPUPhysicalOperator> GPUGeneratePhysicalPlan(ClientContext& context, 
 
 //The result of the GPUProcessingBind function is a unique pointer to a FunctionData object.
 //This result of this function is used as an argument to the GPUProcessingFunction function (data_p argument), which is called to execute the table function.
-unique_ptr<FunctionData> 
-SiriusExtension::GPUCachingBind(ClientContext &context, TableFunctionBindInput &input,
-                                                vector<LogicalType> &return_types, vector<string> &names) {
-	auto result = make_uniq<GPUCachingFunctionData>();
-	result->conn = make_uniq<Connection>(*context.db);
-	if (input.inputs[0].IsNull()) {
-		throw BinderException("gpu_caching cannot be called with a NULL parameter");
-	}
+// unique_ptr<FunctionData> 
+// SiriusExtension::GPUCachingBind(ClientContext &context, TableFunctionBindInput &input,
+//                                                 vector<LogicalType> &return_types, vector<string> &names) {
+// 	auto result = make_uniq<GPUCachingFunctionData>();
+// 	result->conn = make_uniq<Connection>(*context.db);
+// 	if (input.inputs[0].IsNull()) {
+// 		throw BinderException("gpu_caching cannot be called with a NULL parameter");
+// 	}
 
-	result->gpuBufferManager = &(GPUBufferManager::GetInstance());
+// 	result->gpuBufferManager = &(GPUBufferManager::GetInstance());
 
-	string input_string = input.inputs[0].ToString();
-    size_t pos = input_string.find('.');  // Find the position of the period
+// 	string input_string = input.inputs[0].ToString();
+//     size_t pos = input_string.find('.');  // Find the position of the period
 
-    if (pos != string::npos) {
-        string table_name = input_string.substr(0, pos);  // Extract the first word
-        string column_name = input_string.substr(pos + 1); // Extract the second word
-		result->table = table_name;
-		result->column = column_name;
-    } else {
-        throw InvalidInputException("Incorrect input format, use table.column");
-    }
+//     if (pos != string::npos) {
+//         string table_name = input_string.substr(0, pos);  // Extract the first word
+//         string column_name = input_string.substr(pos + 1); // Extract the second word
+// 		result->table = table_name;
+// 		result->column = column_name;
+//     } else {
+//         throw InvalidInputException("Incorrect input format, use table.column");
+//     }
 
-	return_types.emplace_back(LogicalType(LogicalTypeId::VARCHAR));
-	names.emplace_back("GPU Caching");
+// 	return_types.emplace_back(LogicalType(LogicalTypeId::VARCHAR));
+// 	names.emplace_back("GPU Caching");
 
-	return std::move(result);
-}
+// 	return std::move(result);
+// }
 
-void SiriusExtension::GPUCachingFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
-	auto &data = (GPUCachingFunctionData &)*data_p.bind_data;
-	if (data.finished) {
-		return;
-	}
+// void SiriusExtension::GPUCachingFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+// 	auto &data = (GPUCachingFunctionData &)*data_p.bind_data;
+// 	if (data.finished) {
+// 		return;
+// 	}
 
-	if (!buffer_is_initialized) {
-		printf("\033[1;31m"); printf("GPUBufferManager not initialized, please call gpu_buffer_init first\n"); printf("\033[0m");
-		return;
-	}
+// 	if (!buffer_is_initialized) {
+// 		printf("\033[1;31m"); printf("GPUBufferManager not initialized, please call gpu_buffer_init first\n"); printf("\033[0m");
+// 		return;
+// 	}
 
-	//get data in CPU buffer
-	string query = "SELECT " + data.column + " FROM " + data.table + ";";
-	SIRIUS_LOG_DEBUG("Query: {}", query);
-	auto cpu_res = data.conn->Query(query);
+// 	//get data in CPU buffer
+// 	string query = "SELECT " + data.column + " FROM " + data.table + ";";
+// 	SIRIUS_LOG_DEBUG("Query: {}", query);
+// 	auto cpu_res = data.conn->Query(query);
 	
-	auto &catalog_table = Catalog::GetCatalog(context, INVALID_CATALOG);
-	data.gpuBufferManager->createTableAndColumnInGPU(catalog_table, context, data.table, data.column);
+// 	auto &catalog_table = Catalog::GetCatalog(context, INVALID_CATALOG);
+// 	data.gpuBufferManager->createTableAndColumnInGPU(catalog_table, context, data.table, data.column);
 
-	DataWrapper buffered_data = data.gpuBufferManager->allocateColumnBufferInCPU(move(cpu_res));
-	// update the catalog in GPU buffer manager (adding tables/columns)
+// 	DataWrapper buffered_data = data.gpuBufferManager->allocateColumnBufferInCPU(move(cpu_res));
+// 	// update the catalog in GPU buffer manager (adding tables/columns)
 
-	data.gpuBufferManager->cacheDataInGPU(buffered_data, data.table, data.column, 0);  // Send data to GPU
+// 	data.gpuBufferManager->cacheDataInGPU(buffered_data, data.table, data.column, 0);  // Send data to GPU
 
-	output.SetCardinality(1);
-	output.SetValue(0, 0, "Successful");
-	data.finished = true;
+// 	output.SetCardinality(1);
+// 	output.SetValue(0, 0, "Successful");
+// 	data.finished = true;
 
-	return;
-}
+// 	return;
+// }
 
 //The result of the GPUProcessingBind function is a unique pointer to a FunctionData object.
 //This result of this function is used as an argument to the GPUProcessingFunction function (data_p argument), which is called to execute the table function.
@@ -460,9 +460,9 @@ void SiriusExtension::InitializeGPUExtension(Connection &con) {
 	CreateTableFunctionInfo gpu_buffer_init_info(gpu_buffer_init);
 	catalog.CreateTableFunction(*con.context, gpu_buffer_init_info);
 
-	TableFunction gpu_caching("gpu_caching", {LogicalType::VARCHAR}, GPUCachingFunction, GPUCachingBind);
-	CreateTableFunctionInfo gpu_caching_info(gpu_caching);
-	catalog.CreateTableFunction(*con.context, gpu_caching_info);
+	// TableFunction gpu_caching("gpu_caching", {LogicalType::VARCHAR}, GPUCachingFunction, GPUCachingBind);
+	// CreateTableFunctionInfo gpu_caching_info(gpu_caching);
+	// catalog.CreateTableFunction(*con.context, gpu_caching_info);
 
 	TableFunction gpu_processing("gpu_processing", {LogicalType::VARCHAR}, GPUProcessingFunction, GPUProcessingBind);
 	gpu_processing.named_parameters["enable_optimizer"] = LogicalType::BOOLEAN;
