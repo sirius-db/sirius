@@ -35,11 +35,12 @@ ResolveTypeProbeExpression(vector<shared_ptr<GPUColumn>> &probe_keys, uint64_t* 
 
 	//TODO: Need to handle special case for unique keys for better performance
 	if (join_type == JoinType::INNER) {
-		if (unique_build_keys) {
-			probeHashTableSingleMatch<T>(probe_data, ht, ht_len, row_ids_left, row_ids_right, count, size, condition_mode, num_keys, 0);
-		} else {
-			probeHashTable<T>(probe_data, ht, ht_len, row_ids_left, row_ids_right, count, size, condition_mode, num_keys, false);
-		}
+		// if (unique_build_keys) {
+		// 	probeHashTableSingleMatch<T>(probe_data, ht, ht_len, row_ids_left, row_ids_right, count, size, condition_mode, num_keys, 0);
+		// } else {
+		// 	probeHashTable<T>(probe_data, ht, ht_len, row_ids_left, row_ids_right, count, size, condition_mode, num_keys, false);
+		// }
+		throw NotImplementedException("Unsupported join type: INNER");
 	} else if (join_type == JoinType::SEMI) {
 		probeHashTableSingleMatch<T>(probe_data, ht, ht_len, row_ids_left, row_ids_right, count, size, condition_mode, num_keys, 1);
 	} else if (join_type == JoinType::ANTI) {
@@ -437,8 +438,7 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 			}
 		}
 		if (build_key[0]->column_length > INT32_MAX || probe_key[0]->column_length > INT32_MAX) {
-			HandleBuildExpression(build_key, gpu_hash_table, ht_len, conditions, join_type, gpuBufferManager);
-			HandleProbeExpression(probe_key, count, row_ids_left, row_ids_right, gpu_hash_table, ht_len, conditions, join_type, unique_build_keys, gpuBufferManager);
+   			throw NotImplementedException("Column length greater than INT32_MAX is not supported");
 		} else {
 			bool has_non_equality_condition = false;
 			for (idx_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {

@@ -7,34 +7,34 @@
 
 namespace duckdb {
 
-void ResolveOrderByString(vector<shared_ptr<GPUColumn>> &sort_columns, int* sort_orders, int num_cols) {
-  GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
-  uint8_t** col_keys = gpuBufferManager->customCudaHostAlloc<uint8_t*>(num_cols);
-  uint64_t** col_offsets = gpuBufferManager->customCudaHostAlloc<uint64_t*>(num_cols);
-  uint64_t* col_num_bytes = gpuBufferManager->customCudaHostAlloc<uint64_t>(num_cols);
+// void ResolveOrderByString(vector<shared_ptr<GPUColumn>> &sort_columns, int* sort_orders, int num_cols) {
+//   GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+//   uint8_t** col_keys = gpuBufferManager->customCudaHostAlloc<uint8_t*>(num_cols);
+//   uint64_t** col_offsets = gpuBufferManager->customCudaHostAlloc<uint64_t*>(num_cols);
+//   uint64_t* col_num_bytes = gpuBufferManager->customCudaHostAlloc<uint64_t>(num_cols);
 
-  for(int i = 0; i < num_cols; i++) {
-    shared_ptr<GPUColumn> curr_column = sort_columns[i];
-    col_keys[i] = curr_column->data_wrapper.data;
-    col_offsets[i] = curr_column->data_wrapper.offset;
+//   for(int i = 0; i < num_cols; i++) {
+//     shared_ptr<GPUColumn> curr_column = sort_columns[i];
+//     col_keys[i] = curr_column->data_wrapper.data;
+//     col_offsets[i] = curr_column->data_wrapper.offset;
     
-    SIRIUS_LOG_DEBUG("ResolveOrderByString: For idx {} got num bytes of {}", i, curr_column->data_wrapper.num_bytes);
-  }
-  uint64_t num_rows = static_cast<uint64_t>(sort_columns[0]->column_length);
+//     SIRIUS_LOG_DEBUG("ResolveOrderByString: For idx {} got num bytes of {}", i, curr_column->data_wrapper.num_bytes);
+//   }
+//   uint64_t num_rows = static_cast<uint64_t>(sort_columns[0]->column_length);
 
-  // Sort the results
-  orderByString(col_keys, col_offsets, sort_orders, col_num_bytes, num_rows, num_cols);
+//   // Sort the results
+//   orderByString(col_keys, col_offsets, sort_orders, col_num_bytes, num_rows, num_cols);
 
-  // Write the results back
-  for(int i = 0; i < num_cols; i++) {
-    shared_ptr<GPUColumn> curr_column = sort_columns[i];
-    curr_column->data_wrapper.data = col_keys[i];
-    curr_column->data_wrapper.offset = col_offsets[i];
-    curr_column->data_wrapper.num_bytes = col_num_bytes[i];
+//   // Write the results back
+//   for(int i = 0; i < num_cols; i++) {
+//     shared_ptr<GPUColumn> curr_column = sort_columns[i];
+//     curr_column->data_wrapper.data = col_keys[i];
+//     curr_column->data_wrapper.offset = col_offsets[i];
+//     curr_column->data_wrapper.num_bytes = col_num_bytes[i];
 
-    SIRIUS_LOG_DEBUG("ResolveOrderByString: Wrote num bytes of {} for idx {}", col_num_bytes[i], i);
-  }
-}
+//     SIRIUS_LOG_DEBUG("ResolveOrderByString: Wrote num bytes of {} for idx {}", col_num_bytes[i], i);
+//   }
+// }
 
 void
 HandleOrderBy(vector<shared_ptr<GPUColumn>> &order_by_keys, vector<shared_ptr<GPUColumn>> &projection_columns, const vector<BoundOrderByNode> &orders, uint64_t num_projections) {

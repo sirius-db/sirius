@@ -1,5 +1,5 @@
 #include "cuda_helper.cuh"
-#include "gpu_expression_executor.hpp"
+#include "gpu_physical_table_scan.hpp"
 #include "log/logging.hpp"
 
 #include <thrust/device_vector.h>

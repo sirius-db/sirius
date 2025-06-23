@@ -714,6 +714,33 @@ void combineColumns(T* a, T* b, T*& c, uint64_t N_a, uint64_t N_b) {
     cudaDeviceSynchronize();
 }
 
+__global__ void add_offset(uint64_t* a, uint64_t* b, uint64_t offset, uint64_t N) {
+    uint64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < N) {
+        a[idx] = b[idx] + offset;
+    }
+}
+
+void combineStrings(uint8_t* a, uint8_t* b, uint8_t*& c, 
+        uint64_t* offset_a, uint64_t* offset_b, uint64_t*& offset_c, 
+        uint64_t num_bytes_a, uint64_t num_bytes_b, uint64_t N_a, uint64_t N_b) {
+    CHECK_ERROR();
+    if (N_a == 0 || N_b == 0) {
+        SIRIUS_LOG_DEBUG("Input size is 0");
+        return;
+    }
+    GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+    c = gpuBufferManager->customCudaMalloc<uint8_t>(num_bytes_a + num_bytes_b, 0, 0);
+    offset_c = gpuBufferManager->customCudaMalloc<uint64_t>(N_a + N_b + 1, 0, 0);
+    cudaMemcpy(c, a, num_bytes_a * sizeof(uint8_t), cudaMemcpyDeviceToDevice);
+    cudaMemcpy(c + num_bytes_a, b, num_bytes_b * sizeof(uint8_t), cudaMemcpyDeviceToDevice);
+
+    cudaMemcpy(offset_c, offset_a, N_a * sizeof(uint64_t), cudaMemcpyDeviceToDevice);
+    add_offset<<<((N_b + 1) + BLOCK_THREADS - 1)/(BLOCK_THREADS), BLOCK_THREADS>>>(offset_c + N_a, offset_b, num_bytes_a, N_b + 1);
+    CHECK_ERROR();
+    cudaDeviceSynchronize();
+}
+
 template
 void groupedAggregate<uint64_t, uint64_t>(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count, uint64_t N, uint64_t num_keys, uint64_t num_aggregates, int* agg_mode);
 

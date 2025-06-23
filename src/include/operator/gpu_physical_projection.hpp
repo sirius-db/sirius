@@ -3,7 +3,6 @@
 #include "gpu_physical_operator.hpp"
 // #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/planner/expression.hpp"
-#include "gpu_expression_executor.hpp"
 
 namespace duckdb {
 
