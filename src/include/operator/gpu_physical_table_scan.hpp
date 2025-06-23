@@ -79,6 +79,8 @@ public:
 
 	uint64_t* column_size;
 
+	uint64_t* mask_size;
+
 	bool* already_cached;
 
 	vector<LogicalType> scanned_types;

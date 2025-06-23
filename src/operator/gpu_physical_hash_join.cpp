@@ -598,7 +598,6 @@ GPUPhysicalHashJoin::Sink(GPUIntermediateRelation &input_relation) const {
 		else gpu_hash_table = (unsigned long long*) gpuBufferManager->customCudaMalloc<uint64_t>(ht_len * (conditions.size() + 2), 0, 0);
 	}
 	
-
 	if (join_type == JoinType::INNER) {
 		// check if there is a non-equality condition
 		// bool has_non_equality_condition = false;

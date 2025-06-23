@@ -18,6 +18,8 @@ static std::unique_ptr<cudf::reduce_aggregation> make_reduce_aggregation()
       return cudf::make_mean_aggregation<cudf::reduce_aggregation>();
     case cudf::reduce_aggregation::SUM:
       return cudf::make_sum_aggregation<cudf::reduce_aggregation>();
+    case cudf::reduce_aggregation::NUNIQUE:
+      return cudf::make_nunique_aggregation<cudf::reduce_aggregation>();
     default:
       throw NotImplementedException("Unsupported reduce aggregation");
   }
@@ -106,6 +108,11 @@ void cudf_aggregate(vector<shared_ptr<GPUColumn>>& column, uint64_t num_aggregat
             uint64_t* result_temp = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
             cudaMemcpy(result_temp, res, sizeof(uint64_t), cudaMemcpyHostToDevice);
             column[agg] = make_shared_ptr<GPUColumn>(1, GPUColumnType(GPUColumnTypeId::INT64), reinterpret_cast<uint8_t*>(result_temp));
+        } else if (agg_mode[agg] == AggregationType::COUNT_DISTINCT) {
+            auto aggregate = make_reduce_aggregation<cudf::reduce_aggregation::NUNIQUE>();
+            auto cudf_column = column[agg]->convertToCudfColumn();
+            auto result = cudf::reduce(cudf_column, *aggregate, cudf_column.type());
+            column[agg]->setFromCudfScalar(*result, gpuBufferManager);
         } else if (agg_mode[agg] == AggregationType::FIRST) {
             if (column[agg]->data_wrapper.type.id() == GPUColumnTypeId::INT64) {
                 uint64_t* result_temp = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);

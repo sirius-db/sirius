@@ -331,65 +331,15 @@ HandleGroupByAggregateCuDF(vector<shared_ptr<GPUColumn>> &group_by_keys, vector<
 	cudf_groupby(group_by_keys, aggregate_keys, num_group_keys, aggregates.size(), agg_mode);
 }
 
-template <typename T>
-void ResolveTypeDuplicateElimination(vector<shared_ptr<GPUColumn>> &group_by_keys, GPUBufferManager* gpuBufferManager, int num_group_keys) {
-	uint64_t count[1];
-	count[0] = 0;
-	uint8_t** group_by_data = gpuBufferManager->customCudaHostAlloc<uint8_t*>(num_group_keys);
-
-	for (int group = 0; group < num_group_keys; group++) {
-		group_by_data[group] = (group_by_keys[group]->data_wrapper.data);
-	}
-	size_t size = group_by_keys[0]->column_length;
-
-	groupedWithoutAggregate<T>(group_by_data, count, size, num_group_keys);
-
-	// Reading groupby columns based on the grouping set
-	for (idx_t group = 0; group < num_group_keys; group++) {
-		bool old_unique = group_by_keys[group]->is_unique;
-		group_by_keys[group] = make_shared_ptr<GPUColumn>(count[0], group_by_keys[group]->data_wrapper.type, reinterpret_cast<uint8_t*>(group_by_data[group]));
-		group_by_keys[group]->is_unique = old_unique;
-	}
-}
-
-void HandleDuplicateElimination(vector<shared_ptr<GPUColumn>> &group_by_keys, GPUBufferManager* gpuBufferManager, int num_group_keys) {
-	//check if all the group by keys are all integers
-	for (int i = 0; i < num_group_keys; i++) {
-		if (group_by_keys[i]->data_wrapper.type.id() != GPUColumnTypeId::INT64) {
-			throw NotImplementedException("Group by column is not an integer in `HandleDuplicateElimination`");
-		}
-	}
-    switch(group_by_keys[0]->data_wrapper.type.id()) {
-      case GPUColumnTypeId::INT64:
-	  	ResolveTypeDuplicateElimination<uint64_t>(group_by_keys, gpuBufferManager, num_group_keys);
-		break;
-      case GPUColumnTypeId::FLOAT64:
-      default:
-        throw NotImplementedException("Unsupported sirius column type in `HandleDuplicateElimination`: %d",
-																			static_cast<int>(group_by_keys[0]->data_wrapper.type.id()));
-    }
-}
-
-template <typename T, typename V>
-void ResolveTypeDistinctGroupBy(vector<shared_ptr<GPUColumn>> &group_by_keys, vector<shared_ptr<GPUColumn>> &aggregate_keys, GPUBufferManager* gpuBufferManager, DistinctAggregateCollectionInfo &distinct_info, int num_group_keys) {
-	uint64_t count[1];
-	count[0] = 0;
-	uint8_t** group_by_data = gpuBufferManager->customCudaHostAlloc<uint8_t*>(num_group_keys);
-	uint8_t** distinct_aggregate_data = gpuBufferManager->customCudaHostAlloc<uint8_t*>(distinct_info.indices.size());
-
-	for (int group = 0; group < num_group_keys; group++) {
-		group_by_data[group] = (group_by_keys[group]->data_wrapper.data);
-	}
-	size_t size = group_by_keys[0]->column_length;
-
-	int* distinct_mode = gpuBufferManager->customCudaHostAlloc<int>(distinct_info.indices.size());
+void
+HandleDistinctGroupByCuDF(vector<shared_ptr<GPUColumn>> &group_by_keys, vector<shared_ptr<GPUColumn>> &aggregate_keys, GPUBufferManager* gpuBufferManager, DistinctAggregateCollectionInfo &distinct_info, int num_group_keys) {
+	AggregationType* distinct_mode = gpuBufferManager->customCudaHostAlloc<AggregationType>(distinct_info.indices.size());
 
 	for (int idx = 0; idx < distinct_info.indices.size(); idx++) {
 		auto distinct_idx = distinct_info.indices[idx];
 		auto& expr = distinct_info.aggregates[distinct_idx]->Cast<BoundAggregateExpression>();
 		if (expr.function.name.compare("count") == 0 && aggregate_keys[idx]->data_wrapper.data != nullptr) {
-			distinct_mode[idx] = 0;
-			distinct_aggregate_data[idx] = aggregate_keys[idx]->data_wrapper.data;
+			distinct_mode[idx] = AggregationType::COUNT_DISTINCT;
 		} else if (aggregate_keys[idx]->data_wrapper.data == nullptr) {
 			throw NotImplementedException("Count distinct with null column not supported yet");		
 		} else {
@@ -397,47 +347,121 @@ void ResolveTypeDistinctGroupBy(vector<shared_ptr<GPUColumn>> &group_by_keys, ve
 		}
 	}
 
-	groupedDistinctAggregate<uint64_t, uint64_t>(group_by_data, distinct_aggregate_data, count, size, num_group_keys, distinct_info.indices.size(), distinct_mode);
-
-	// Reading groupby columns based on the grouping set
-	for (idx_t group = 0; group < num_group_keys; group++) {
-		bool old_unique = group_by_keys[group]->is_unique;
-		group_by_keys[group] = make_shared_ptr<GPUColumn>(count[0], group_by_keys[group]->data_wrapper.type, reinterpret_cast<uint8_t*>(group_by_data[group]));
-		group_by_keys[group]->is_unique = old_unique;
-	}
-
-	for (int idx = 0; idx < distinct_info.indices.size(); idx++) {
-		auto distinct_idx = distinct_info.indices[idx];
-		auto& expr = distinct_info.aggregates[distinct_idx]->Cast<BoundAggregateExpression>();
-		if (expr.function.name.compare("count") == 0) {
-			aggregate_keys[idx] = make_shared_ptr<GPUColumn>(count[0], GPUColumnType(GPUColumnTypeId::INT64), reinterpret_cast<uint8_t*>(distinct_aggregate_data[idx]));
-		}
-	}
-
+	cudf_groupby(group_by_keys, aggregate_keys, num_group_keys, distinct_info.indices.size(), distinct_mode);
 }
 
-//TODO: Distinct Aggregate currently does not support string type
-void HandleDistinctGroupBy(vector<shared_ptr<GPUColumn>> &group_by_keys, vector<shared_ptr<GPUColumn>> &aggregate_keys, GPUBufferManager* gpuBufferManager, DistinctAggregateCollectionInfo &distinct_info, int num_group_keys) {
-	//check if all the group by keys are all integers
-	SIRIUS_LOG_DEBUG("Handling distinct group by");
-	for (int i = 0; i < num_group_keys; i++) {
-		if (group_by_keys[i]->data_wrapper.type.id() != GPUColumnTypeId::INT64) {
-			throw NotImplementedException("Group by column is not an integer in `HandleDistinctGroupBy`");
-		}
-	}
-    switch(group_by_keys[0]->data_wrapper.type.id()) {
-      case GPUColumnTypeId::INT64: {
-	  	if (aggregate_keys[0]->data_wrapper.type.id() == GPUColumnTypeId::INT64) {
-			ResolveTypeDistinctGroupBy<uint64_t, uint64_t>(group_by_keys, aggregate_keys, gpuBufferManager, distinct_info, num_group_keys);
-		} else throw NotImplementedException("Unsupported sirius column type in `HandleDistinctGroupBy`: %d",
-																				 static_cast<int>(aggregate_keys[0]->data_wrapper.type.id()));
-		break;
-	  } case GPUColumnTypeId::FLOAT64:
-      default:
-        throw NotImplementedException("Unsupported sirius column type in `HandleDistinctGroupBy`: %d",
-																			static_cast<int>(group_by_keys[0]->data_wrapper.type.id()));
-    }
+void
+HandleDuplicateEliminationCuDF(vector<shared_ptr<GPUColumn>> &group_by_keys, GPUBufferManager* gpuBufferManager, int num_group_keys) {
+	cudf_duplicate_elimination(group_by_keys, num_group_keys);
 }
+
+// template <typename T>
+// void ResolveTypeDuplicateElimination(vector<shared_ptr<GPUColumn>> &group_by_keys, GPUBufferManager* gpuBufferManager, int num_group_keys) {
+// 	uint64_t count[1];
+// 	count[0] = 0;
+// 	uint8_t** group_by_data = gpuBufferManager->customCudaHostAlloc<uint8_t*>(num_group_keys);
+
+// 	for (int group = 0; group < num_group_keys; group++) {
+// 		group_by_data[group] = (group_by_keys[group]->data_wrapper.data);
+// 	}
+// 	size_t size = group_by_keys[0]->column_length;
+
+// 	groupedWithoutAggregate<T>(group_by_data, count, size, num_group_keys);
+
+// 	// Reading groupby columns based on the grouping set
+// 	for (idx_t group = 0; group < num_group_keys; group++) {
+// 		bool old_unique = group_by_keys[group]->is_unique;
+// 		group_by_keys[group] = make_shared_ptr<GPUColumn>(count[0], group_by_keys[group]->data_wrapper.type, reinterpret_cast<uint8_t*>(group_by_data[group]));
+// 		group_by_keys[group]->is_unique = old_unique;
+// 	}
+// }
+
+// void HandleDuplicateElimination(vector<shared_ptr<GPUColumn>> &group_by_keys, GPUBufferManager* gpuBufferManager, int num_group_keys) {
+// 	//check if all the group by keys are all integers
+// 	for (int i = 0; i < num_group_keys; i++) {
+// 		if (group_by_keys[i]->data_wrapper.type.id() != GPUColumnTypeId::INT64) {
+// 			throw NotImplementedException("Group by column is not an integer in `HandleDuplicateElimination`");
+// 		}
+// 	}
+//     switch(group_by_keys[0]->data_wrapper.type.id()) {
+//       case GPUColumnTypeId::INT64:
+// 	  	ResolveTypeDuplicateElimination<uint64_t>(group_by_keys, gpuBufferManager, num_group_keys);
+// 		break;
+//       case GPUColumnTypeId::FLOAT64:
+//       default:
+//         throw NotImplementedException("Unsupported sirius column type in `HandleDuplicateElimination`: %d",
+// 																			static_cast<int>(group_by_keys[0]->data_wrapper.type.id()));
+//     }
+// }
+
+// template <typename T, typename V>
+// void ResolveTypeDistinctGroupBy(vector<shared_ptr<GPUColumn>> &group_by_keys, vector<shared_ptr<GPUColumn>> &aggregate_keys, GPUBufferManager* gpuBufferManager, DistinctAggregateCollectionInfo &distinct_info, int num_group_keys) {
+// 	uint64_t count[1];
+// 	count[0] = 0;
+// 	uint8_t** group_by_data = gpuBufferManager->customCudaHostAlloc<uint8_t*>(num_group_keys);
+// 	uint8_t** distinct_aggregate_data = gpuBufferManager->customCudaHostAlloc<uint8_t*>(distinct_info.indices.size());
+
+// 	for (int group = 0; group < num_group_keys; group++) {
+// 		group_by_data[group] = (group_by_keys[group]->data_wrapper.data);
+// 	}
+// 	size_t size = group_by_keys[0]->column_length;
+
+// 	int* distinct_mode = gpuBufferManager->customCudaHostAlloc<int>(distinct_info.indices.size());
+
+// 	for (int idx = 0; idx < distinct_info.indices.size(); idx++) {
+// 		auto distinct_idx = distinct_info.indices[idx];
+// 		auto& expr = distinct_info.aggregates[distinct_idx]->Cast<BoundAggregateExpression>();
+// 		if (expr.function.name.compare("count") == 0 && aggregate_keys[idx]->data_wrapper.data != nullptr) {
+// 			distinct_mode[idx] = 0;
+// 			distinct_aggregate_data[idx] = aggregate_keys[idx]->data_wrapper.data;
+// 		} else if (aggregate_keys[idx]->data_wrapper.data == nullptr) {
+// 			throw NotImplementedException("Count distinct with null column not supported yet");		
+// 		} else {
+// 			throw NotImplementedException("Aggregate function not supported");
+// 		}
+// 	}
+
+// 	groupedDistinctAggregate<uint64_t, uint64_t>(group_by_data, distinct_aggregate_data, count, size, num_group_keys, distinct_info.indices.size(), distinct_mode);
+
+// 	// Reading groupby columns based on the grouping set
+// 	for (idx_t group = 0; group < num_group_keys; group++) {
+// 		bool old_unique = group_by_keys[group]->is_unique;
+// 		group_by_keys[group] = make_shared_ptr<GPUColumn>(count[0], group_by_keys[group]->data_wrapper.type, reinterpret_cast<uint8_t*>(group_by_data[group]));
+// 		group_by_keys[group]->is_unique = old_unique;
+// 	}
+
+// 	for (int idx = 0; idx < distinct_info.indices.size(); idx++) {
+// 		auto distinct_idx = distinct_info.indices[idx];
+// 		auto& expr = distinct_info.aggregates[distinct_idx]->Cast<BoundAggregateExpression>();
+// 		if (expr.function.name.compare("count") == 0) {
+// 			aggregate_keys[idx] = make_shared_ptr<GPUColumn>(count[0], GPUColumnType(GPUColumnTypeId::INT64), reinterpret_cast<uint8_t*>(distinct_aggregate_data[idx]));
+// 		}
+// 	}
+
+// }
+
+// //TODO: Distinct Aggregate currently does not support string type
+// void HandleDistinctGroupBy(vector<shared_ptr<GPUColumn>> &group_by_keys, vector<shared_ptr<GPUColumn>> &aggregate_keys, GPUBufferManager* gpuBufferManager, DistinctAggregateCollectionInfo &distinct_info, int num_group_keys) {
+// 	//check if all the group by keys are all integers
+// 	SIRIUS_LOG_DEBUG("Handling distinct group by");
+// 	for (int i = 0; i < num_group_keys; i++) {
+// 		if (group_by_keys[i]->data_wrapper.type.id() != GPUColumnTypeId::INT64) {
+// 			throw NotImplementedException("Group by column is not an integer in `HandleDistinctGroupBy`");
+// 		}
+// 	}
+//     switch(group_by_keys[0]->data_wrapper.type.id()) {
+//       case GPUColumnTypeId::INT64: {
+// 	  	if (aggregate_keys[0]->data_wrapper.type.id() == GPUColumnTypeId::INT64) {
+// 			ResolveTypeDistinctGroupBy<uint64_t, uint64_t>(group_by_keys, aggregate_keys, gpuBufferManager, distinct_info, num_group_keys);
+// 		} else throw NotImplementedException("Unsupported sirius column type in `HandleDistinctGroupBy`: %d",
+// 																				 static_cast<int>(aggregate_keys[0]->data_wrapper.type.id()));
+// 		break;
+// 	  } case GPUColumnTypeId::FLOAT64:
+//       default:
+//         throw NotImplementedException("Unsupported sirius column type in `HandleDistinctGroupBy`: %d",
+// 																			static_cast<int>(group_by_keys[0]->data_wrapper.type.id()));
+//     }
+// }
 
 
 static vector<LogicalType> CreateGroupChunkTypes(vector<unique_ptr<Expression>> &groups) {
@@ -643,10 +667,15 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 	bool can_use_sirius_impl = CheckGroupKeyTypesForSiriusImpl(group_by_column);
 	uint64_t count[1];
 	if (aggregates.size() == 0) {
-		if (can_use_sirius_impl) {
-			HandleDuplicateElimination(group_by_column, gpuBufferManager, num_group_keys);
+		// if (can_use_sirius_impl) {
+		// 	HandleDuplicateElimination(group_by_column, gpuBufferManager, num_group_keys);
+		// } else {
+			// HandleGroupByAggregateCuDF(group_by_column, aggregate_column, gpuBufferManager, aggregates, num_group_keys);
+		// }
+		if (group_by_column[0]->column_length > INT32_MAX) {
+			throw NotImplementedException("Group by column length or aggregate column length is too large for CuDF");
 		} else {
-			HandleGroupByAggregateCuDF(group_by_column, aggregate_column, gpuBufferManager, aggregates, num_group_keys);
+			HandleDuplicateEliminationCuDF(group_by_column, gpuBufferManager, num_group_keys);
 		}
 	} else {
 		if (group_by_column[0]->column_length > INT32_MAX || aggregate_column[0]->column_length > INT32_MAX) {
@@ -807,7 +836,11 @@ GPUPhysicalGroupedAggregate::SinkDistinctGrouping(GPUIntermediateRelation& input
 	}
 
 	uint64_t count[1];
-	HandleDistinctGroupBy(group_by_column, distinct_aggregate_columns, gpuBufferManager, distinct_info, num_group_keys);
+	if (group_by_column[0]->column_length > INT32_MAX || distinct_aggregate_columns[0]->column_length > INT32_MAX) {
+		throw NotImplementedException("Group by column length or distinct aggregate column length is too large for CuDF");
+	} else {
+		HandleDistinctGroupByCuDF(group_by_column, distinct_aggregate_columns, gpuBufferManager, distinct_info, num_group_keys);
+	}
 
 	// Reading groupby columns based on the grouping set
 	for (int idx = 0; idx < grouped_aggregate_data.groups.size(); idx++) {

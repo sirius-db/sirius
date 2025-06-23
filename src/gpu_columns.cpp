@@ -20,14 +20,25 @@ size_t GPUDecimalTypeInfo::GetDecimalTypeSize() const {
     }
 }
 
-DataWrapper::DataWrapper(GPUColumnType _type, uint8_t* _data, size_t _size) : data(_data), size(_size) {
+DataWrapper::DataWrapper(GPUColumnType _type, uint8_t* _data, size_t _size, uint32_t* _validity_mask, size_t _mask_bytes) : data(_data), size(_size) {
+    // if (_validity_mask == nullptr) {
+    //     throw duckdb::InternalException("Validity mask cannot be null for GPUColumn");
+    // }
     type = _type;
     num_bytes = size * getColumnTypeSize();
     is_string_data = false;
+    validity_mask = _validity_mask;
+    mask_bytes = _mask_bytes;
 };
 
-DataWrapper::DataWrapper(GPUColumnType _type, uint8_t* _data, uint64_t* _offset, size_t _size, size_t _num_bytes, bool _is_string_data) : 
-    data(_data), size(_size), type(_type), offset(_offset), num_bytes(_num_bytes), is_string_data(_is_string_data) {};
+DataWrapper::DataWrapper(GPUColumnType _type, uint8_t* _data, uint64_t* _offset, size_t _size, 
+        size_t _num_bytes, bool _is_string_data, uint32_t* _validity_mask, size_t _mask_bytes) : 
+    data(_data), size(_size), type(_type), offset(_offset), num_bytes(_num_bytes), 
+    is_string_data(_is_string_data), validity_mask(_validity_mask), mask_bytes(_mask_bytes) {
+    // if (_validity_mask == nullptr) {
+    //     throw duckdb::InternalException("Validity mask cannot be null for GPUColumn");
+    // }
+};
 
 size_t 
 DataWrapper::getColumnTypeSize() const {
@@ -60,18 +71,25 @@ DataWrapper::getColumnTypeSize() const {
     }
 }
 
-GPUColumn::GPUColumn(size_t _column_length, GPUColumnType type, uint8_t* data) {
+GPUColumn::GPUColumn(size_t _column_length, GPUColumnType type, uint8_t* data, uint32_t* validity_mask, size_t mask_bytes) {
+    // if (validity_mask == nullptr) {
+    //     throw duckdb::InternalException("Validity mask cannot be null for GPUColumn");
+    // }
     column_length = _column_length;
-    data_wrapper = DataWrapper(type, data, _column_length);
+    data_wrapper = DataWrapper(type, data, _column_length, validity_mask, mask_bytes);
     row_ids = nullptr;
     data_wrapper.offset = nullptr;
     data_wrapper.num_bytes = column_length * data_wrapper.getColumnTypeSize();
     is_unique = false;
 }
 
-GPUColumn::GPUColumn(size_t _column_length, GPUColumnType type, uint8_t* data, uint64_t* offset, size_t num_bytes, bool is_string_data) {
+GPUColumn::GPUColumn(size_t _column_length, GPUColumnType type, uint8_t* data, uint64_t* offset, 
+    size_t num_bytes, bool is_string_data, uint32_t* validity_mask, size_t mask_bytes) {
+    // if (validity_mask == nullptr) {
+    //     throw duckdb::InternalException("Validity mask cannot be null for GPUColumn");
+    // }
     column_length = _column_length;
-    data_wrapper = DataWrapper(type, data, offset, _column_length, num_bytes, is_string_data);
+    data_wrapper = DataWrapper(type, data, offset, _column_length, num_bytes, is_string_data, validity_mask, mask_bytes);
     row_ids = nullptr;
     if (is_string_data) {
         data_wrapper.num_bytes = num_bytes;
@@ -87,6 +105,16 @@ GPUColumn::GPUColumn(GPUColumn& other) {
     row_id_count = other.row_id_count;
     column_length = other.column_length;
     is_unique = other.is_unique;
+}
+
+void
+GPUColumn::convertCudfMaskToSiriusMask(std::unique_ptr<rmm::device_buffer> cudf_mask, GPUBufferManager* gpuBufferManager) {
+    if (cudf_mask == nullptr) {
+        data_wrapper.validity_mask = nullptr;
+        return;
+    }
+    gpuBufferManager->rmm_stored_buffers.push_back(std::move(cudf_mask));
+    data_wrapper.validity_mask = reinterpret_cast<uint32_t*>(gpuBufferManager->rmm_stored_buffers.back()->data());
 }
 
 cudf::column_view
