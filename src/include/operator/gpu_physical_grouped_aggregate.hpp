@@ -15,14 +15,16 @@ uint64_t* createFixedSizeOffsets(size_t record_size, uint64_t num_rows);
 
 void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColumn>>& aggregate_keys, uint64_t num_keys, uint64_t num_aggregates, AggregationType* agg_mode);
 
+void cudf_duplicate_elimination(vector<shared_ptr<GPUColumn>>& keys, uint64_t num_keys);
+
 // template <typename T, typename V>
 // void groupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count, uint64_t N, uint64_t num_keys, uint64_t num_aggregates, int* agg_mode);
 
-template <typename T>
-void groupedWithoutAggregate(uint8_t **keys, uint64_t* count, uint64_t N, uint64_t num_keys);
+// template <typename T>
+// void groupedWithoutAggregate(uint8_t **keys, uint64_t* count, uint64_t N, uint64_t num_keys);
 
-template <typename T, typename V>
-void groupedDistinctAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count, uint64_t N, uint64_t num_keys, uint64_t num_aggregates, int* distinct_mode);
+// template <typename T, typename V>
+// void groupedDistinctAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count, uint64_t N, uint64_t num_keys, uint64_t num_aggregates, int* distinct_mode);
 
 // template <typename V>
 // void groupedStringAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t** offset, uint64_t* num_bytes, uint64_t* count, uint64_t N, uint64_t num_keys, uint64_t num_aggregates, int* agg_mode);

@@ -10,6 +10,11 @@
 #include "log/logging.hpp"
 
 namespace duckdb {
+
+uint64_t GetChunkDataByteSize(LogicalType type, idx_t cardinality) {
+		auto physical_size = GetTypeIdSize(type.InternalType());
+		return cardinality * physical_size;
+}
   
 GPUPhysicalTableScan::GPUPhysicalTableScan(vector<LogicalType> types, TableFunction function_p,
     unique_ptr<FunctionData> bind_data_p, vector<LogicalType> returned_types_p,
@@ -24,8 +29,10 @@ GPUPhysicalTableScan::GPUPhysicalTableScan(vector<LogicalType> types, TableFunct
 
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
     column_size = gpuBufferManager->customCudaHostAlloc<uint64_t>(column_ids.size());
+    mask_size = gpuBufferManager->customCudaHostAlloc<uint64_t>(column_ids.size());
     for (int col = 0; col < column_ids.size(); col++) {
       column_size[col] = 0;
+      mask_size[col] = 0;
       scanned_types.push_back(returned_types[column_ids[col].GetPrimaryIndex()]);
       scanned_ids.push_back(col);
     }
@@ -524,16 +531,22 @@ GPUPhysicalTableScan::GetDataDuckDB(ExecutionContext &exec_context) {
                 column_size[col] += curr_string.length();
               }
             } else {
-              column_size[col] += chunk->data[col].GetAllocationSize(chunk->size());
+              column_size[col] += GetChunkDataByteSize(scanned_types[col], chunk->size());
             }
+            ValidityMask validity_mask = FlatVector::Validity(chunk->data[col]);
+            uint64_t validity_mask_size = validity_mask.ValidityMaskSize(chunk->size());
+            mask_size[col] += validity_mask_size;
         }
         collection->Append(*chunk);
       } while (has_more_output);
 
       uint64_t total_size = 0;
       for (int col = 0; col < column_ids.size(); col++) {
+        //round up to nearest 64 byte to adjust with libcudf valdity mask
+        mask_size[col] = 64 * ((mask_size[col] + 63) / 64);
         if (!already_cached[col]) {
           total_size += column_size[col];
+          total_size += mask_size[col];
         }
       }
 
@@ -572,6 +585,9 @@ GPUPhysicalTableScan::ScanDataDuckDB(GPUBufferManager* gpuBufferManager, string 
       uint8_t** ptr = gpuBufferManager->customCudaHostAlloc<uint8_t*>(scanned_types.size());
       uint8_t** d_ptr = gpuBufferManager->customCudaHostAlloc<uint8_t*>(scanned_types.size());
       uint8_t** tmp_ptr = gpuBufferManager->customCudaHostAlloc<uint8_t*>(scanned_types.size());
+      uint8_t** d_mask_ptr = gpuBufferManager->customCudaHostAlloc<uint8_t*>(scanned_types.size());
+      uint8_t** mask_ptr = gpuBufferManager->customCudaHostAlloc<uint8_t*>(scanned_types.size());
+      uint8_t** tmp_mask_ptr = gpuBufferManager->customCudaHostAlloc<uint8_t*>(scanned_types.size());
       uint64_t** offset_ptr = gpuBufferManager->customCudaHostAlloc<uint64_t*>(scanned_types.size());
       uint64_t** d_offset_ptr = gpuBufferManager->customCudaHostAlloc<uint64_t*>(scanned_types.size());
 
@@ -579,12 +595,16 @@ GPUPhysicalTableScan::ScanDataDuckDB(GPUBufferManager* gpuBufferManager, string 
         if (!already_cached[col]) {
           ptr[col] = gpuBufferManager->customCudaHostAlloc<uint8_t>(column_size[col]);
           d_ptr[col] = gpuBufferManager->customCudaMalloc<uint8_t>(column_size[col], 0, 1);
+          mask_ptr[col] = gpuBufferManager->customCudaHostAlloc<uint8_t>(mask_size[col]);
+          memset(mask_ptr[col], 0, mask_size[col] * sizeof(uint8_t));
+          d_mask_ptr[col] = gpuBufferManager->customCudaMalloc<uint8_t>(mask_size[col], 0, 1);
           if (scanned_types[col] == LogicalType::VARCHAR) {
             offset_ptr[col] = gpuBufferManager->customCudaHostAlloc<uint64_t>(collection->Count() + 1);
             d_offset_ptr[col] = gpuBufferManager->customCudaMalloc<uint64_t>(collection->Count() + 1, 0, 1);
             offset_ptr[col][0] = 0;
           }
           tmp_ptr[col] = ptr[col];
+          tmp_mask_ptr[col] = mask_ptr[col];
         }
       } 
       bool scan_initialized = false;
@@ -612,9 +632,18 @@ GPUPhysicalTableScan::ScanDataDuckDB(GPUBufferManager* gpuBufferManager, string 
                 tmp_ptr[col] += curr_string.length();
               }
             } else {
-              memcpy(tmp_ptr[col], result->data[col].GetData(), result->data[col].GetAllocationSize(result->size()));
-              tmp_ptr[col] += result->data[col].GetAllocationSize(result->size());
+              memcpy(tmp_ptr[col], result->data[col].GetData(), GetChunkDataByteSize(scanned_types[col], result->size()));
+              tmp_ptr[col] += GetChunkDataByteSize(scanned_types[col], result->size());
             }
+            ValidityMask validity_mask = FlatVector::Validity(result->data[col]);
+            uint64_t validity_mask_size = validity_mask.ValidityMaskSize(result->size());
+            //TODO: We currently assume that the validity mask is always stored. There can be an optimization where we don't store the validity mask if all valuesa are valid
+            if (validity_mask.GetData() == nullptr) {
+              memset(tmp_mask_ptr[col], 0xff, validity_mask_size * sizeof(uint8_t));
+            } else {
+              memcpy(tmp_mask_ptr[col], reinterpret_cast<uint8_t*>(validity_mask.GetData()), validity_mask_size * sizeof(uint8_t));
+            }
+            tmp_mask_ptr[col] += validity_mask_size;
           }
         }
         start_idx += result->size();
@@ -633,6 +662,7 @@ GPUPhysicalTableScan::ScanDataDuckDB(GPUBufferManager* gpuBufferManager, string 
             } else {
               callCudaMemcpyHostToDevice<uint8_t>(d_ptr[col], ptr[col], column_size[col], 0);
             }
+            callCudaMemcpyHostToDevice<uint8_t>(d_mask_ptr[col], mask_ptr[col], mask_size[col], 0);
         }
       }
 
@@ -649,10 +679,11 @@ GPUPhysicalTableScan::ScanDataDuckDB(GPUBufferManager* gpuBufferManager, string 
             int column_idx = column_it - gpuBufferManager->tables[up_table_name]->column_names.begin();
             GPUColumnType column_type = convertLogicalTypeToColumnType(scanned_types[col]);
             gpuBufferManager->tables[up_table_name]->columns[column_idx]->column_length = collection->Count();
+            uint32_t* validity_mask = reinterpret_cast<uint32_t*>(d_mask_ptr[col]);
             if (scanned_types[col] == LogicalType::VARCHAR) {
-              gpuBufferManager->tables[up_table_name]->columns[column_idx]->data_wrapper = DataWrapper(column_type, d_ptr[col], d_offset_ptr[col], collection->Count(), column_size[col], true);
+              gpuBufferManager->tables[up_table_name]->columns[column_idx]->data_wrapper = DataWrapper(column_type, d_ptr[col], d_offset_ptr[col], collection->Count(), column_size[col], true, validity_mask, mask_size[col]);
             } else {
-              gpuBufferManager->tables[up_table_name]->columns[column_idx]->data_wrapper = DataWrapper(column_type, d_ptr[col], collection->Count());
+              gpuBufferManager->tables[up_table_name]->columns[column_idx]->data_wrapper = DataWrapper(column_type, d_ptr[col], collection->Count(), validity_mask, mask_size[col]);
             }
             SIRIUS_LOG_DEBUG("Column {} cached in GPU at index {}", up_column_name, column_idx);
         }
@@ -807,7 +838,8 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
           SIRIUS_LOG_DEBUG("Reading column index (late materialized) {} and passing it to index in output relation {}", column_ids[projection_id].GetPrimaryIndex(), index);
           SIRIUS_LOG_DEBUG("Writing row IDs to output relation in index {}", index);
           output_relation.columns[index] = make_shared_ptr<GPUColumn>(table->columns[column_ids[projection_id].GetPrimaryIndex()]->column_length, table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.type, table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.data,
-                          table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.offset, table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.num_bytes, table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.is_string_data);
+                          table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.offset, table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.num_bytes, table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.is_string_data,
+                          table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.validity_mask, table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.mask_bytes);
           output_relation.columns[index]->is_unique = table->columns[column_ids[projection_id].GetPrimaryIndex()]->is_unique;
           if (row_ids) {
             output_relation.columns[index]->row_ids = row_ids; 
@@ -824,7 +856,8 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
             SIRIUS_LOG_DEBUG("Reading column index (late materialized) {} and passing it to index in output relation {}", column_id.GetPrimaryIndex(), index);
             SIRIUS_LOG_DEBUG("Writing row IDs to output relation in index {}", index);
             output_relation.columns[index] = make_shared_ptr<GPUColumn>(table->columns[column_id.GetPrimaryIndex()]->column_length, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.type, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.data,
-                            table->columns[column_id.GetPrimaryIndex()]->data_wrapper.offset, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.num_bytes, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.is_string_data);
+                            table->columns[column_id.GetPrimaryIndex()]->data_wrapper.offset, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.num_bytes, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.is_string_data,
+                            table->columns[column_id.GetPrimaryIndex()]->data_wrapper.validity_mask, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.mask_bytes);
             output_relation.columns[index]->is_unique = table->columns[column_id.GetPrimaryIndex()]->is_unique;
             if (row_ids) {
               output_relation.columns[index]->row_ids = row_ids; 
@@ -841,7 +874,8 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
           SIRIUS_LOG_DEBUG("Reading column index (late materialized) {} and passing it to index in output relation {}", column_id.GetPrimaryIndex(), index);
           SIRIUS_LOG_DEBUG("Writing row IDs to output relation in index {}", index);
           output_relation.columns[index] = make_shared_ptr<GPUColumn>(table->columns[column_id.GetPrimaryIndex()]->column_length, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.type, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.data,
-                          table->columns[column_id.GetPrimaryIndex()]->data_wrapper.offset, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.num_bytes, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.is_string_data);
+                          table->columns[column_id.GetPrimaryIndex()]->data_wrapper.offset, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.num_bytes, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.is_string_data,
+                          table->columns[column_id.GetPrimaryIndex()]->data_wrapper.validity_mask, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.mask_bytes);
           output_relation.columns[index]->is_unique = table->columns[column_id.GetPrimaryIndex()]->is_unique;
           if (row_ids) {
             output_relation.columns[index]->row_ids = row_ids; 

@@ -97,7 +97,8 @@ GPUPhysicalMaterializedCollector::FinalMaterializeInternal(GPUIntermediateRelati
 		output_relation.columns[col]->row_ids = nullptr;
 		output_relation.columns[col]->is_unique = input_relation.columns[col]->is_unique;
 	} else {
-		output_relation.columns[col] = make_shared_ptr<GPUColumn>(input_relation.columns[col]->column_length, input_relation.columns[col]->data_wrapper.type, input_relation.columns[col]->data_wrapper.data);
+		output_relation.columns[col] = make_shared_ptr<GPUColumn>(input_relation.columns[col]->column_length, input_relation.columns[col]->data_wrapper.type, input_relation.columns[col]->data_wrapper.data,
+					input_relation.columns[col]->data_wrapper.validity_mask, input_relation.columns[col]->data_wrapper.mask_bytes);
 		output_relation.columns[col]->is_unique = input_relation.columns[col]->is_unique;
 	}
 }
@@ -121,7 +122,10 @@ GPUPhysicalMaterializedCollector::FinalMaterializeString(GPUIntermediateRelation
 		output_relation.columns[col]->row_ids = nullptr;
 		output_relation.columns[col]->is_unique = input_relation.columns[col]->is_unique;
 	} else {
-		output_relation.columns[col] = make_shared_ptr<GPUColumn>(*input_relation.columns[col]);
+		// output_relation.columns[col] = make_shared_ptr<GPUColumn>(*input_relation.columns[col]);
+		output_relation.columns[col] = make_shared_ptr<GPUColumn>(input_relation.columns[col]->column_length, input_relation.columns[col]->data_wrapper.type, input_relation.columns[col]->data_wrapper.data,
+					input_relation.columns[col]->data_wrapper.offset, input_relation.columns[col]->data_wrapper.num_bytes, true,
+					input_relation.columns[col]->data_wrapper.validity_mask, input_relation.columns[col]->data_wrapper.mask_bytes);	
 		output_relation.columns[col]->is_unique = input_relation.columns[col]->is_unique;
 	}
 }
@@ -277,6 +281,7 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 
 	size_t size_bytes = 0;
 	uint8_t** host_data = gpuBufferManager->customCudaHostAlloc<uint8_t*>(input_relation.columns.size());
+	uint8_t** host_mask_data = gpuBufferManager->customCudaHostAlloc<uint8_t*>(input_relation.columns.size());
 
 	GPUIntermediateRelation materialized_relation(input_relation.columns.size());
 	string_t** duckdb_strings = gpuBufferManager->customCudaHostAlloc<string_t*>(input_relation.columns.size());
@@ -342,6 +347,20 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 				host_data[col] = gpuBufferManager->customCudaHostAlloc<uint8_t>(size_bytes);
 				callCudaMemcpyDeviceToHost<uint8_t>(host_data[col], materialized_relation.columns[col]->data_wrapper.data, size_bytes, 0);
 			}
+			
+			if (materialized_relation.columns[col]->data_wrapper.validity_mask == nullptr) {
+				SIRIUS_LOG_DEBUG("Column {} has no validity mask, creating a mask with all valid values\n", col);
+				uint64_t necessary_bytes = (materialized_relation.columns[col]->column_length + 7) / 8;
+				uint64_t padded_bytes = 64 * ((necessary_bytes + 63) / 64); // Pad to the nearest 64 bytes
+				// If the validity mask is null, we create a mask with all valid values
+				host_mask_data[col] = gpuBufferManager->customCudaHostAlloc<uint8_t>(padded_bytes);
+				memset(host_mask_data[col], 0xFF, padded_bytes); // All bits set to 1 (valid)
+			} else {
+				// Copy the existing validity mask
+				SIRIUS_LOG_DEBUG("Copying validity mask for column {}\n", col);
+				host_mask_data[col] = gpuBufferManager->customCudaHostAlloc<uint8_t>(materialized_relation.columns[col]->data_wrapper.mask_bytes);
+				callCudaMemcpyDeviceToHost<uint8_t>(host_mask_data[col], reinterpret_cast<uint8_t*>(materialized_relation.columns[col]->data_wrapper.validity_mask), materialized_relation.columns[col]->data_wrapper.mask_bytes, 0);
+			}
 		} else {
 			// Use the helper method to materialize the string on the GPU
 			shared_ptr<GPUColumn> str_column = materialized_relation.columns[col];
@@ -349,6 +368,19 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 			duckdb_strings[col] = curr_column_string_buffer;
 			materialized_relation.columns[col] = str_column;
 			is_string = true;
+			if (str_column->data_wrapper.validity_mask == nullptr) {
+				SIRIUS_LOG_DEBUG("Column {} has no validity mask, creating a mask with all valid values\n", col);
+				uint64_t necessary_bytes = (materialized_relation.columns[col]->column_length + 7) / 8;
+				uint64_t padded_bytes = 64 * ((necessary_bytes + 63) / 64); // Pad to the nearest 64 bytes
+				// If the validity mask is null, we create a mask with all valid values
+				host_mask_data[col] = gpuBufferManager->customCudaHostAlloc<uint8_t>(padded_bytes);
+				memset(host_mask_data[col], 0xFF, padded_bytes); // All bits set to 1 (valid)
+			} else {
+				// Copy the existing validity mask
+				SIRIUS_LOG_DEBUG("Copying validity mask for column {}\n", col);
+				host_mask_data[col] = gpuBufferManager->customCudaHostAlloc<uint8_t>(str_column->data_wrapper.mask_bytes);
+				callCudaMemcpyDeviceToHost<uint8_t>(host_mask_data[col], reinterpret_cast<uint8_t*>(str_column->data_wrapper.validity_mask), str_column->data_wrapper.mask_bytes, 0);
+			}
 
 			// Advance the buffer pointers based on this column's details
 			DataWrapper str_column_data = str_column->data_wrapper;
@@ -376,14 +408,20 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 			if(materialized_relation.columns[col]->data_wrapper.type.id() != GPUColumnTypeId::VARCHAR) {
 				if (types[col].InternalType() == PhysicalType::INT128 && types[col].id() != LogicalTypeId::DECIMAL) {
 					Vector vector = rawDataToVector(host_data[col], vec, GPUColumnType(GPUColumnTypeId::INT128));
+					ValidityMask validity_mask(reinterpret_cast<validity_t*>(host_mask_data[col]), chunk_cardinality);
+					FlatVector::SetValidity(vector, validity_mask);
 					chunk.data[col].Reference(vector);
 				} else {
 					Vector vector = rawDataToVector(host_data[col], vec, materialized_relation.columns[col]->data_wrapper.type);
+					ValidityMask validity_mask(reinterpret_cast<validity_t*>(host_mask_data[col]), chunk_cardinality);
+					FlatVector::SetValidity(vector, validity_mask);
 					chunk.data[col].Reference(vector);
 				}
 			} else {
 				// Add the strings to the vector
 				Vector str_vector(LogicalType::VARCHAR, reinterpret_cast<data_ptr_t>(duckdb_strings[col] + read_index));
+				ValidityMask validity_mask(reinterpret_cast<validity_t*>(host_mask_data[col]), chunk_cardinality);
+				FlatVector::SetValidity(str_vector, validity_mask);
 				chunk.data[col].Reference(str_vector);
 			}
 		}

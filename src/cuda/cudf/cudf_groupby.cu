@@ -6,6 +6,51 @@
 
 namespace duckdb {
 
+template<typename T>
+void combineColumns(T* a, T* b, T*& c, uint64_t N_a, uint64_t N_b) {
+    CHECK_ERROR();
+    if (N_a == 0 || N_b == 0) {
+        SIRIUS_LOG_DEBUG("Input size is 0");
+        return;
+    }
+    SIRIUS_LOG_DEBUG("Launching Combine Columns Kernel");
+    GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+    c = gpuBufferManager->customCudaMalloc<T>(N_a + N_b, 0, 0);
+    cudaMemcpy(c, a, N_a * sizeof(T), cudaMemcpyDeviceToDevice);
+    cudaMemcpy(c + N_a, b, N_b * sizeof(T), cudaMemcpyDeviceToDevice);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(a), 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(b), 0);
+    CHECK_ERROR();
+    cudaDeviceSynchronize();
+}
+
+__global__ void add_offset(uint64_t* a, uint64_t* b, uint64_t offset, uint64_t N) {
+    uint64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < N) {
+        a[idx] = b[idx] + offset;
+    }
+}
+
+void combineStrings(uint8_t* a, uint8_t* b, uint8_t*& c, 
+        uint64_t* offset_a, uint64_t* offset_b, uint64_t*& offset_c, 
+        uint64_t num_bytes_a, uint64_t num_bytes_b, uint64_t N_a, uint64_t N_b) {
+    CHECK_ERROR();
+    if (N_a == 0 || N_b == 0) {
+        SIRIUS_LOG_DEBUG("Input size is 0");
+        return;
+    }
+    GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+    c = gpuBufferManager->customCudaMalloc<uint8_t>(num_bytes_a + num_bytes_b, 0, 0);
+    offset_c = gpuBufferManager->customCudaMalloc<uint64_t>(N_a + N_b + 1, 0, 0);
+    cudaMemcpy(c, a, num_bytes_a * sizeof(uint8_t), cudaMemcpyDeviceToDevice);
+    cudaMemcpy(c + num_bytes_a, b, num_bytes_b * sizeof(uint8_t), cudaMemcpyDeviceToDevice);
+
+    cudaMemcpy(offset_c, offset_a, N_a * sizeof(uint64_t), cudaMemcpyDeviceToDevice);
+    add_offset<<<((N_b + 1) + BLOCK_THREADS - 1)/(BLOCK_THREADS), BLOCK_THREADS>>>(offset_c + N_a, offset_b, num_bytes_a, N_b + 1);
+    CHECK_ERROR();
+    cudaDeviceSynchronize();
+}
+
 void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColumn>>& aggregate_keys, uint64_t num_keys, uint64_t num_aggregates, AggregationType* agg_mode) 
 {
   if (keys[0]->column_length == 0) {
@@ -111,6 +156,10 @@ void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColu
       auto aggregate = cudf::make_count_aggregation<cudf::groupby_aggregation>(cudf::null_policy::EXCLUDE);
       requests[agg].aggregations.push_back(std::move(aggregate));
       requests[agg].values = aggregate_keys[agg]->convertToCudfColumn();
+    } else if (agg_mode[agg] == AggregationType::COUNT_DISTINCT) {
+      auto aggregate = cudf::make_nunique_aggregation<cudf::groupby_aggregation>(cudf::null_policy::EXCLUDE);
+      requests[agg].aggregations.push_back(std::move(aggregate));
+      requests[agg].values = aggregate_keys[agg]->convertToCudfColumn();
     } else {
       throw NotImplementedException("Aggregate function not supported");
     }
@@ -122,23 +171,30 @@ void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColu
   for (int key = 0; key < num_keys; key++) {
       cudf::column group_key = result_key->get_column(key);
       keys[key]->setFromCudfColumn(group_key, keys[key]->is_unique, nullptr, 0, gpuBufferManager);
-      // keys[key] = gpuBufferManager->copyDataFromcuDFColumn(group_key, 0);
   }
 
   for (int agg = 0; agg < num_aggregates; agg++) {
       auto agg_val = std::move(result.second[agg].results[0]);
-      if (agg_mode[agg] == AggregationType::COUNT || agg_mode[agg] == AggregationType::COUNT_STAR) {
+      if (agg_mode[agg] == AggregationType::COUNT || agg_mode[agg] == AggregationType::COUNT_STAR || agg_mode[agg] == AggregationType::COUNT_DISTINCT) {
         auto agg_val_view = agg_val->view();
         auto temp_data = convertInt32ToUInt64(const_cast<int32_t*>(agg_val_view.data<int32_t>()), agg_val_view.size());
         aggregate_keys[agg] = make_shared_ptr<GPUColumn>(agg_val_view.size(), GPUColumnType(GPUColumnTypeId::INT64), reinterpret_cast<uint8_t*>(temp_data));
       } else {
         aggregate_keys[agg]->setFromCudfColumn(*agg_val, false, nullptr, 0, gpuBufferManager);
-        // aggregate_keys[agg] = gpuBufferManager->copyDataFromcuDFColumn(agg_val_view, 0);
       }
   }
 
   STOP_TIMER();
   SIRIUS_LOG_DEBUG("CUDF Groupby result count: {}", keys[0]->column_length);
 }
+
+template
+void combineColumns<int32_t>(int32_t* a, int32_t* b, int32_t*& c, uint64_t N_a, uint64_t N_b);
+
+template
+void combineColumns<uint64_t>(uint64_t* a, uint64_t* b, uint64_t*& c, uint64_t N_a, uint64_t N_b);
+
+template
+void combineColumns<double>(double* a, double* b, double*& c, uint64_t N_a, uint64_t N_b);
 
 } //namespace duckdb

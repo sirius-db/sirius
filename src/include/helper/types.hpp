@@ -14,7 +14,8 @@ enum class AggregationType {
 	COUNT,
     COUNT_STAR,
 	AVERAGE,
-	FIRST
+	FIRST,
+	COUNT_DISTINCT
 };
 
 }
