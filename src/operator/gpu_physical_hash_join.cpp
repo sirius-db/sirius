@@ -413,7 +413,7 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 			unique_probe_keys = true;
 		}
 		SIRIUS_LOG_DEBUG("Materializing join key for probing hash table from index {}", join_key_index);
-		probe_key[cond_idx] = HandleMaterializeExpression(input_relation.columns[join_key_index], condition.left->Cast<BoundReferenceExpression>(), gpuBufferManager);
+		probe_key[cond_idx] = HandleMaterializeExpression(input_relation.columns[join_key_index], gpuBufferManager);
 	}
 
 	//probing hash table
@@ -585,7 +585,7 @@ GPUPhysicalHashJoin::Sink(GPUIntermediateRelation &input_relation) const {
 			unique_build_keys = true;
 		}
 		SIRIUS_LOG_DEBUG("Materializing join key for building hash table from index {}", join_key_index);
-		build_keys[cond_idx] = HandleMaterializeExpression(input_relation.columns[join_key_index], condition.right->Cast<BoundReferenceExpression>(), gpuBufferManager);
+		build_keys[cond_idx] = HandleMaterializeExpression(input_relation.columns[join_key_index], gpuBufferManager);
 	}
 
 	SIRIUS_LOG_DEBUG("Building hash table");

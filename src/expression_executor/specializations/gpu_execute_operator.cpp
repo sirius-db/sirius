@@ -73,21 +73,21 @@ struct ExecuteStringIn
 
     // We need to convert to cudf/arrow format...
     std::vector<char> chars;
-    std::vector<cudf::size_type> offsets;
-    cudf::size_type offset = 0;
+    std::vector<int64_t> offsets;
+    int64_t offset = 0;
     for (idx_t child = 1; child < expr.children.size(); ++child)
     {
       const auto& child_expression = expr.children[child]->Cast<BoundConstantExpression>();
       const auto& child_string     = child_expression.value.GetValue<std::string>();
       chars.insert(chars.end(), child_string.begin(), child_string.end());
       offsets.push_back(offset);
-      offset += static_cast<cudf::size_type>(child_string.size());
+      offset += static_cast<int64_t>(child_string.size());
     }
     offsets.push_back(offset);
 
     // Allocate buffers and copy to device
     rmm::device_uvector<char> chars_buffer(offset, stream, mr);
-    rmm::device_uvector<cudf::size_type> offsets_buffer(num_offsets,
+    rmm::device_uvector<int64_t> offsets_buffer(num_offsets,
                                                         stream,
                                                         mr);
     CUDF_CUDA_TRY(cudaMemcpyAsync(chars_buffer.data(),
@@ -97,12 +97,12 @@ struct ExecuteStringIn
                                   stream));
     CUDF_CUDA_TRY(cudaMemcpyAsync(offsets_buffer.data(),
                                   offsets.data(),
-                                  offsets.size() * sizeof(cudf::size_type),
+                                  offsets.size() * sizeof(int64_t),
                                   cudaMemcpyHostToDevice,
                                   stream));
 
     // Make CuDF things
-    auto offsets_col = std::make_unique<cudf::column>(cudf::data_type(cudf::type_id::INT32),
+    auto offsets_col = std::make_unique<cudf::column>(cudf::data_type(cudf::type_id::INT64),
                                                       num_offsets,
                                                       std::move(offsets_buffer).release(),
                                                       rmm::device_buffer{},

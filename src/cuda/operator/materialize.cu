@@ -151,7 +151,7 @@ template
 __global__ void materialize_expression_with_null<uint8_t, BLOCK_THREADS, ITEMS_PER_THREAD>(const uint8_t *a, uint8_t* result, uint32_t* mask, uint32_t* out_mask, uint64_t *row_ids, uint64_t N);
 
 template <typename T>
-void materializeExpression(T *a, T*& result, uint64_t *row_ids, uint64_t result_len, uint64_t input_len) {
+void materializeExpression(T *a, T*& result, uint64_t *row_ids, uint64_t result_len) {
     CHECK_ERROR();
     if (result_len == 0) {
         SIRIUS_LOG_DEBUG("result_len is 0");
@@ -170,7 +170,7 @@ void materializeExpression(T *a, T*& result, uint64_t *row_ids, uint64_t result_
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(a), 0);
 }
 
-void materializeString(uint8_t* data, uint64_t* offset, uint8_t* &result, uint64_t* &result_offset, uint64_t* row_ids, uint64_t* &result_bytes, uint64_t result_len, uint64_t input_size, uint64_t input_bytes) {
+void materializeString(uint8_t* data, uint64_t* offset, uint8_t* &result, uint64_t* &result_offset, uint64_t* row_ids, uint64_t* &result_bytes, uint64_t result_len) {
     CHECK_ERROR();
     if (result_len == 0) {
         SIRIUS_LOG_DEBUG("result_len is 0");
@@ -269,18 +269,18 @@ void materializeStringColumnToDuckdbFormat(shared_ptr<GPUColumn> column, char* c
 }
 
 template
-void materializeExpression<int>(int *a, int*& result, uint64_t *row_ids, uint64_t result_len, uint64_t input_size);
+void materializeExpression<int>(int *a, int*& result, uint64_t *row_ids, uint64_t result_len);
 template
-void materializeExpression<uint64_t>(uint64_t *a, uint64_t*& result, uint64_t *row_ids, uint64_t result_len, uint64_t input_size);
+void materializeExpression<uint64_t>(uint64_t *a, uint64_t*& result, uint64_t *row_ids, uint64_t result_len);
 template
-void materializeExpression<float>(float *a, float*& result, uint64_t *row_ids, uint64_t result_len, uint64_t input_size);
+void materializeExpression<float>(float *a, float*& result, uint64_t *row_ids, uint64_t result_len);
 template
-void materializeExpression<double>(double *a, double*& result, uint64_t *row_ids, uint64_t result_len, uint64_t input_size);
+void materializeExpression<double>(double *a, double*& result, uint64_t *row_ids, uint64_t result_len);
 template
-void materializeExpression<uint8_t>(uint8_t *a, uint8_t*& result, uint64_t *row_ids, uint64_t result_len, uint64_t input_size);
+void materializeExpression<uint8_t>(uint8_t *a, uint8_t*& result, uint64_t *row_ids, uint64_t result_len);
 template
-void materializeExpression<int64_t>(int64_t *a, int64_t*& result, uint64_t *row_ids, uint64_t result_len, uint64_t input_size);
+void materializeExpression<int64_t>(int64_t *a, int64_t*& result, uint64_t *row_ids, uint64_t result_len);
 template
-void materializeExpression<__int128_t>(__int128_t *a, __int128_t*& result, uint64_t *row_ids, uint64_t result_len, uint64_t input_size);
+void materializeExpression<__int128_t>(__int128_t *a, __int128_t*& result, uint64_t *row_ids, uint64_t result_len);
 
 } // namespace duckdb

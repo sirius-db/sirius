@@ -529,7 +529,7 @@ void optimizedGroupedStringAggregate(uint8_t **keys, uint8_t **aggregate_keys, u
         // Materialize the string column
         uint8_t* result; uint64_t* result_offset; uint64_t* new_num_bytes;
         // void materializeString(uint8_t* data, uint64_t* offset, uint8_t* &result, uint64_t* &result_offset, uint64_t* row_ids, uint64_t* &result_bytes, uint64_t result_len, uint64_t input_size, uint64_t input_bytes)
-        materializeString(group_key_chars, group_key_offsets, result, result_offset, d_original_row_ids, new_num_bytes, num_groups, N, num_bytes[i]);
+        materializeString(group_key_chars, group_key_offsets, result, result_offset, d_original_row_ids, new_num_bytes, num_groups);
 
         // Write back the result
         keys[i] = result;

@@ -162,7 +162,7 @@ void orderByString(uint8_t** col_keys, uint64_t** col_offsets, int* sort_orders,
         
         // Materialize the column in the new order
         uint8_t* sorted_chars; uint64_t* sorted_offsets; uint64_t* new_num_bytes;
-        materializeString(unsorted_col_chars, unsorted_col_offsets, sorted_chars, sorted_offsets, d_row_ids, new_num_bytes, num_rows, num_rows, col_num_bytes[i]);
+        materializeString(unsorted_col_chars, unsorted_col_offsets, sorted_chars, sorted_offsets, d_row_ids, new_num_bytes, num_rows);
 
         // Write back the result
         col_keys[i] = sorted_chars;

@@ -144,8 +144,7 @@ GPUPhysicalOrder::Sink(GPUIntermediateRelation &input_relation) const {
     
     for (int projection_idx = 0; projection_idx < projections.size(); projection_idx++) {
         auto input_idx = projections[projection_idx];
-        auto expr = BoundReferenceExpression(LogicalType::ANY, input_idx);
-        projection_columns[projection_idx] = HandleMaterializeExpression(input_relation.columns[input_idx], expr, gpuBufferManager);
+        projection_columns[projection_idx] = HandleMaterializeExpression(input_relation.columns[input_idx], gpuBufferManager);
         input_relation.columns[input_idx] = projection_columns[projection_idx];
     }
     
@@ -155,7 +154,7 @@ GPUPhysicalOrder::Sink(GPUIntermediateRelation &input_relation) const {
         throw NotImplementedException("Order by expression not supported");
       }
       auto input_idx = expr.Cast<BoundReferenceExpression>().index;
-      order_by_keys[order_idx] = HandleMaterializeExpression(input_relation.columns[input_idx], expr.Cast<BoundReferenceExpression>(), gpuBufferManager);
+      order_by_keys[order_idx] = HandleMaterializeExpression(input_relation.columns[input_idx], gpuBufferManager);
     }
 
 
