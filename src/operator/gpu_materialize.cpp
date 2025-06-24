@@ -5,7 +5,7 @@ namespace duckdb {
 
 template <typename T>
 shared_ptr<GPUColumn> 
-ResolveTypeMaterializeExpression(shared_ptr<GPUColumn> column, BoundReferenceExpression& bound_ref, GPUBufferManager* gpuBufferManager) {
+ResolveTypeMaterializeExpression(shared_ptr<GPUColumn> column, GPUBufferManager* gpuBufferManager) {
     size_t size;
     T* a;
     if (column->data_wrapper.data == nullptr || column->column_length == 0) {
@@ -14,7 +14,7 @@ ResolveTypeMaterializeExpression(shared_ptr<GPUColumn> column, BoundReferenceExp
     if (column->row_ids != nullptr) {
         T* temp = reinterpret_cast<T*> (column->data_wrapper.data);
         uint64_t* row_ids_input = reinterpret_cast<uint64_t*> (column->row_ids);
-        materializeExpression<T>(temp, a, row_ids_input, column->row_id_count, column->column_length);
+        materializeExpression<T>(temp, a, row_ids_input, column->row_id_count);
         size = column->row_id_count;
     } else {
         a = reinterpret_cast<T*> (column->data_wrapper.data);
@@ -26,7 +26,7 @@ ResolveTypeMaterializeExpression(shared_ptr<GPUColumn> column, BoundReferenceExp
 }
 
 shared_ptr<GPUColumn> 
-ResolveTypeMaterializeString(shared_ptr<GPUColumn> column, BoundReferenceExpression& bound_ref, GPUBufferManager* gpuBufferManager) {
+ResolveTypeMaterializeString(shared_ptr<GPUColumn> column, GPUBufferManager* gpuBufferManager) {
     size_t size;
     uint8_t* a;
     uint64_t* result_offset; 
@@ -40,7 +40,7 @@ ResolveTypeMaterializeString(shared_ptr<GPUColumn> column, BoundReferenceExpress
 		uint64_t* offset = column->data_wrapper.offset;
 		uint64_t* row_ids = column->row_ids;
 		size = column->row_id_count;
-		materializeString(data, offset, a, result_offset, row_ids, new_num_bytes, size, column->column_length, column->data_wrapper.num_bytes);
+		materializeString(data, offset, a, result_offset, row_ids, new_num_bytes, size);
     } else {
         a = column->data_wrapper.data;
         result_offset = column->data_wrapper.offset;
@@ -54,29 +54,29 @@ ResolveTypeMaterializeString(shared_ptr<GPUColumn> column, BoundReferenceExpress
 }
 
 shared_ptr<GPUColumn> 
-HandleMaterializeExpression(shared_ptr<GPUColumn> column, BoundReferenceExpression& bound_ref, GPUBufferManager* gpuBufferManager) {
+HandleMaterializeExpression(shared_ptr<GPUColumn> column, GPUBufferManager* gpuBufferManager) {
     switch(column->data_wrapper.type.id()) {
         case GPUColumnTypeId::INT32:
         case GPUColumnTypeId::DATE:
-            return ResolveTypeMaterializeExpression<int>(column, bound_ref, gpuBufferManager);
+            return ResolveTypeMaterializeExpression<int>(column, gpuBufferManager);
         case GPUColumnTypeId::INT64:
-            return ResolveTypeMaterializeExpression<uint64_t>(column, bound_ref, gpuBufferManager);
+            return ResolveTypeMaterializeExpression<uint64_t>(column, gpuBufferManager);
         case GPUColumnTypeId::FLOAT32:
-            return ResolveTypeMaterializeExpression<float>(column, bound_ref, gpuBufferManager);
+            return ResolveTypeMaterializeExpression<float>(column, gpuBufferManager);
         case GPUColumnTypeId::FLOAT64:
-            return ResolveTypeMaterializeExpression<double>(column, bound_ref, gpuBufferManager);
+            return ResolveTypeMaterializeExpression<double>(column, gpuBufferManager);
         case GPUColumnTypeId::BOOLEAN:
-            return ResolveTypeMaterializeExpression<uint8_t>(column, bound_ref, gpuBufferManager);
+            return ResolveTypeMaterializeExpression<uint8_t>(column, gpuBufferManager);
         case GPUColumnTypeId::VARCHAR:
-            return ResolveTypeMaterializeString(column, bound_ref, gpuBufferManager);
+            return ResolveTypeMaterializeString(column, gpuBufferManager);
         case GPUColumnTypeId::DECIMAL: {
             switch (column->data_wrapper.getColumnTypeSize()) {
                 case sizeof(int32_t):
-                    return ResolveTypeMaterializeExpression<int32_t>(column, bound_ref, gpuBufferManager);
+                    return ResolveTypeMaterializeExpression<int32_t>(column, gpuBufferManager);
                 case sizeof(int64_t):
-                    return ResolveTypeMaterializeExpression<int64_t>(column, bound_ref, gpuBufferManager);
+                    return ResolveTypeMaterializeExpression<int64_t>(column, gpuBufferManager);
                 case sizeof(__int128_t):
-                    return ResolveTypeMaterializeExpression<__int128_t>(column, bound_ref, gpuBufferManager);
+                    return ResolveTypeMaterializeExpression<__int128_t>(column, gpuBufferManager);
                 default:
                     throw NotImplementedException("Unsupported sirius DECIMAL column type size in `HandleMaterializeExpression`: %zu",
                                                   column->data_wrapper.getColumnTypeSize());
@@ -123,7 +123,7 @@ HandleMaterializeRowIDs(GPUIntermediateRelation& input_relation, GPUIntermediate
                 } else {
                     uint64_t* temp_prev_row_ids = reinterpret_cast<uint64_t*> (input_relation.columns[i]->row_ids);
                     uint64_t* temp_new_row_ids;
-                    materializeExpression<uint64_t>(temp_prev_row_ids, temp_new_row_ids, row_ids, count, input_relation.columns[i]->column_length);
+                    materializeExpression<uint64_t>(temp_prev_row_ids, temp_new_row_ids, row_ids, count);
                     output_relation.columns[i]->row_ids = temp_new_row_ids;
                     new_row_ids.push_back(temp_new_row_ids);
                     prev_row_ids.push_back(temp_prev_row_ids);
@@ -170,7 +170,7 @@ HandleMaterializeRowIDsRHS(GPUIntermediateRelation& hash_table_result, GPUInterm
                 } else {
                     uint64_t* temp_prev_row_ids = reinterpret_cast<uint64_t*> (hash_table_result.columns[rhs_col]->row_ids);
                     uint64_t* temp_new_row_ids;
-                    materializeExpression<uint64_t>(temp_prev_row_ids, temp_new_row_ids, row_ids, count, hash_table_result.columns[rhs_col]->column_length);
+                    materializeExpression<uint64_t>(temp_prev_row_ids, temp_new_row_ids, row_ids, count);
                     output_relation.columns[offset + i]->row_ids = temp_new_row_ids;
                     new_row_ids.push_back(temp_new_row_ids);
                     prev_row_ids.push_back(temp_prev_row_ids);
@@ -218,7 +218,7 @@ HandleMaterializeRowIDsLHS(GPUIntermediateRelation& input_relation, GPUIntermedi
                 } else {
                     uint64_t* temp_prev_row_ids = reinterpret_cast<uint64_t*> (input_relation.columns[lhs_col]->row_ids);
                     uint64_t* temp_new_row_ids;
-                    materializeExpression<uint64_t>(temp_prev_row_ids, temp_new_row_ids, row_ids, count, input_relation.columns[lhs_col]->column_length);
+                    materializeExpression<uint64_t>(temp_prev_row_ids, temp_new_row_ids, row_ids, count);
                     output_relation.columns[i]->row_ids = temp_new_row_ids;
                     new_row_ids.push_back(temp_new_row_ids);
                     prev_row_ids.push_back(temp_prev_row_ids);

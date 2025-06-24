@@ -65,8 +65,7 @@ SinkResultType GPUPhysicalTopN::Sink(GPUIntermediateRelation& input_relation) co
   
 	for (int projection_idx = 0; projection_idx < types.size(); projection_idx++) {
 		auto input_idx = projection_idx;
-		auto expr = BoundReferenceExpression(LogicalType::ANY, input_idx);
-		projection_columns[projection_idx] = HandleMaterializeExpression(input_relation.columns[input_idx], expr, gpuBufferManager);
+		projection_columns[projection_idx] = HandleMaterializeExpression(input_relation.columns[input_idx], gpuBufferManager);
 		input_relation.columns[input_idx] = projection_columns[projection_idx];
 	}
 
@@ -76,7 +75,7 @@ SinkResultType GPUPhysicalTopN::Sink(GPUIntermediateRelation& input_relation) co
 		throw NotImplementedException("Order by expression not supported");
 		}
 		auto input_idx = expr.Cast<BoundReferenceExpression>().index;
-		order_by_keys[order_idx] = HandleMaterializeExpression(input_relation.columns[input_idx], expr.Cast<BoundReferenceExpression>(), gpuBufferManager);
+		order_by_keys[order_idx] = HandleMaterializeExpression(input_relation.columns[input_idx], gpuBufferManager);
 	}
 
 	if (order_by_keys[0]->column_length > INT32_MAX ) {

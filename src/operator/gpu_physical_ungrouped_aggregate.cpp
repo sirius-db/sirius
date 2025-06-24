@@ -218,8 +218,7 @@ GPUPhysicalUngroupedAggregate::Sink(GPUIntermediateRelation &input_relation) con
 			for (auto &child_expr : aggregate.children) {
 				D_ASSERT(child_expr->type == ExpressionType::BOUND_REF);
 				SIRIUS_LOG_DEBUG("Reading aggregation column from index {} and passing it to index {} in aggregation result", payload_idx + payload_cnt, aggr_idx);
-				auto &bound_ref_expr = child_expr->Cast<BoundReferenceExpression>();
-				aggregate_column[aggr_idx] = HandleMaterializeExpression(input_relation.columns[payload_idx + payload_cnt], bound_ref_expr, gpuBufferManager);
+				aggregate_column[aggr_idx] = HandleMaterializeExpression(input_relation.columns[payload_idx + payload_cnt], gpuBufferManager);
 				payload_cnt++;
 			}
 		}

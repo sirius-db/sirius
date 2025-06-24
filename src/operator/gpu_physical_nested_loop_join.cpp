@@ -233,7 +233,7 @@ GPUPhysicalNestedLoopJoin::ResolveComplexJoin(GPUIntermediateRelation &input_rel
 		if (condition.left->GetExpressionClass() == ExpressionClass::BOUND_REF) {
 			auto join_key_index = condition.left->Cast<BoundReferenceExpression>().index;
 			SIRIUS_LOG_DEBUG("Reading join key from left relation from index {}", join_key_index);
-			left_keys[cond_idx] = HandleMaterializeExpression(input_relation.columns[join_key_index], condition.left->Cast<BoundReferenceExpression>(), gpuBufferManager);
+			left_keys[cond_idx] = HandleMaterializeExpression(input_relation.columns[join_key_index], gpuBufferManager);
 		} else if (condition.left->GetExpressionClass() == ExpressionClass::BOUND_CAST) {
 			auto& child = condition.left->Cast<BoundCastExpression>().child;
 			if (child->GetExpressionClass() != ExpressionClass::BOUND_REF) {
@@ -242,7 +242,7 @@ GPUPhysicalNestedLoopJoin::ResolveComplexJoin(GPUIntermediateRelation &input_rel
 			}
 			auto join_key_index = child->Cast<BoundReferenceExpression>().index;
 			SIRIUS_LOG_DEBUG("Reading join key from left relation from index {}", join_key_index);
-			left_keys[cond_idx] = HandleMaterializeExpression(input_relation.columns[join_key_index], child->Cast<BoundReferenceExpression>(), gpuBufferManager);
+			left_keys[cond_idx] = HandleMaterializeExpression(input_relation.columns[join_key_index], gpuBufferManager);
 			// Perform cast
 			auto from_cudf_column_view = left_keys[cond_idx]->convertToCudfColumn();
 			auto to_cudf_type = sirius::GpuExpressionState::GetCudfType(condition.left->return_type);
@@ -262,7 +262,7 @@ GPUPhysicalNestedLoopJoin::ResolveComplexJoin(GPUIntermediateRelation &input_rel
 		if (condition.right->GetExpressionClass() == ExpressionClass::BOUND_REF) {
 			auto join_key_index = condition.right->Cast<BoundReferenceExpression>().index;
 			SIRIUS_LOG_DEBUG("Reading join key from right relation from index {}", join_key_index);
-			right_keys[cond_idx] = HandleMaterializeExpression(right_temp_data->columns[join_key_index], condition.right->Cast<BoundReferenceExpression>(), gpuBufferManager);
+			right_keys[cond_idx] = HandleMaterializeExpression(right_temp_data->columns[join_key_index], gpuBufferManager);
 		} else if (condition.right->GetExpressionClass() == ExpressionClass::BOUND_CAST) {
 			auto& child = condition.right->Cast<BoundCastExpression>().child;
 			if (child->GetExpressionClass() != ExpressionClass::BOUND_REF) {
@@ -271,7 +271,7 @@ GPUPhysicalNestedLoopJoin::ResolveComplexJoin(GPUIntermediateRelation &input_rel
 			}
 			auto join_key_index = child->Cast<BoundReferenceExpression>().index;
 			SIRIUS_LOG_DEBUG("Reading join key from right relation from index {}", join_key_index);
-			right_keys[cond_idx] = HandleMaterializeExpression(right_temp_data->columns[join_key_index], child->Cast<BoundReferenceExpression>(), gpuBufferManager);
+			right_keys[cond_idx] = HandleMaterializeExpression(right_temp_data->columns[join_key_index], gpuBufferManager);
 			// Perform cast
 			auto from_cudf_column_view = right_keys[cond_idx]->convertToCudfColumn();
 			auto to_cudf_type = sirius::GpuExpressionState::GetCudfType(condition.right->return_type);

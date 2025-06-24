@@ -627,7 +627,7 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 			D_ASSERT(group->type == ExpressionType::BOUND_REF);
 			auto &bound_ref_expr = group->Cast<BoundReferenceExpression>();
 			SIRIUS_LOG_DEBUG("Passing input column index {} to group by column index {}", bound_ref_expr.index, idx);
-			group_by_column[idx] = HandleMaterializeExpression(input_relation.columns[bound_ref_expr.index], bound_ref_expr, gpuBufferManager);
+			group_by_column[idx] = HandleMaterializeExpression(input_relation.columns[bound_ref_expr.index], gpuBufferManager);
 			idx++;
 		}
 	}
@@ -641,7 +641,7 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 			D_ASSERT(child_expr->type == ExpressionType::BOUND_REF);
 			auto &bound_ref_expr = child_expr->Cast<BoundReferenceExpression>();
 			SIRIUS_LOG_DEBUG("Passing input column index {} to aggregate column index {}", bound_ref_expr.index, aggr_idx);
-			aggregate_column[aggr_idx] = HandleMaterializeExpression(input_relation.columns[bound_ref_expr.index], bound_ref_expr, gpuBufferManager);
+			aggregate_column[aggr_idx] = HandleMaterializeExpression(input_relation.columns[bound_ref_expr.index], gpuBufferManager);
 		}
 		aggr_idx++;
 	}
@@ -790,7 +790,7 @@ GPUPhysicalGroupedAggregate::SinkDistinctGrouping(GPUIntermediateRelation& input
 	for (idx_t group_idx = 0; group_idx < grouped_aggregate_data.groups.size(); group_idx++) {
 		auto &group = grouped_aggregate_data.groups[group_idx];
 		auto &bound_ref = group->Cast<BoundReferenceExpression>();
-		group_by_column[group_idx] = HandleMaterializeExpression(input_relation.columns[bound_ref.index], bound_ref, gpuBufferManager);
+		group_by_column[group_idx] = HandleMaterializeExpression(input_relation.columns[bound_ref.index], gpuBufferManager);
 	}
 
 	int aggr_idx = 0;
@@ -829,7 +829,7 @@ GPUPhysicalGroupedAggregate::SinkDistinctGrouping(GPUIntermediateRelation& input
 				SIRIUS_LOG_DEBUG("Reading aggregation column from index {} and passing it to index {} in distinct aggregatec column", bound_ref.index, aggr_idx);
 				// input_relation.checkLateMaterialization(bound_ref.index);
 				// group_by_result->columns[grouped_aggregate_data.groups.size() + idx] = input_relation.columns[bound_ref.index];
-				distinct_aggregate_columns[aggr_idx] = HandleMaterializeExpression(input_relation.columns[bound_ref.index], bound_ref, gpuBufferManager);
+				distinct_aggregate_columns[aggr_idx] = HandleMaterializeExpression(input_relation.columns[bound_ref.index], gpuBufferManager);
 			}
 			aggr_idx++;
 		}
