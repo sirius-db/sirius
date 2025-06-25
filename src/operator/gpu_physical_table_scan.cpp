@@ -471,17 +471,17 @@ GPUPhysicalTableScan::GetDataDuckDB(ExecutionContext &exec_context) {
         has_more_output = chunk->size() > 0;
         // get the size of each column in the chunk
         for (int col = 0; col < column_ids.size(); col++) {
-            if (chunk->data[col].GetType() == LogicalType::VARCHAR) {
-              Vector string_vector = chunk->data[col];
-              string_vector.Flatten(chunk->size());
+            Vector vec = chunk->data[col];
+            vec.Flatten(chunk->size());
+            if (vec.GetType() == LogicalType::VARCHAR) {
               for (int row = 0; row < chunk->size(); row++) {
-                std::string curr_string = string_vector.GetValue(row).ToString();
+                std::string curr_string = vec.GetValue(row).ToString();
                 column_size[col] += curr_string.length();
               }
             } else {
               column_size[col] += GetChunkDataByteSize(scanned_types[col], chunk->size());
             }
-            ValidityMask validity_mask = FlatVector::Validity(chunk->data[col]);
+            ValidityMask validity_mask = FlatVector::Validity(vec);
             uint64_t validity_mask_size = validity_mask.ValidityMaskSize(chunk->size());
             mask_size[col] += validity_mask_size;
         }
@@ -570,20 +570,20 @@ GPUPhysicalTableScan::ScanDataDuckDB(GPUBufferManager* gpuBufferManager, string 
         collection->Scan(scan_state, *result);
         for (int col = 0; col < result->ColumnCount(); col++) {
           if (!already_cached[col]) {
-            if (result->data[col].GetType() == LogicalType::VARCHAR) {
-              Vector string_vector = result->data[col];
-              string_vector.Flatten(result->size());
+            Vector vec = result->data[col];
+            vec.Flatten(result->size());
+            if (vec.GetType() == LogicalType::VARCHAR) {
               for (int row = 0; row < result->size(); row++) {
-                std::string curr_string = string_vector.GetValue(row).ToString();
+                std::string curr_string = vec.GetValue(row).ToString();
                 memcpy(tmp_ptr[col], curr_string.data(), curr_string.length());
                 offset_ptr[col][start_idx + row + 1] = offset_ptr[col][start_idx + row] + curr_string.length();
                 tmp_ptr[col] += curr_string.length();
               }
             } else {
-              memcpy(tmp_ptr[col], result->data[col].GetData(), GetChunkDataByteSize(scanned_types[col], result->size()));
+              memcpy(tmp_ptr[col], vec.GetData(), GetChunkDataByteSize(scanned_types[col], result->size()));
               tmp_ptr[col] += GetChunkDataByteSize(scanned_types[col], result->size());
             }
-            ValidityMask validity_mask = FlatVector::Validity(result->data[col]);
+            ValidityMask validity_mask = FlatVector::Validity(vec);
             uint64_t validity_mask_size = validity_mask.ValidityMaskSize(result->size());
             //TODO: We currently assume that the validity mask is always stored. There can be an optimization where we don't store the validity mask if all valuesa are valid
             if (validity_mask.GetData() == nullptr) {

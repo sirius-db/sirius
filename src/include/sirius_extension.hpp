@@ -17,7 +17,6 @@
 #pragma once
 
 #include "duckdb.hpp"
-#include "communication.hpp"
 
 namespace duckdb {
 class GPUBufferManager;
