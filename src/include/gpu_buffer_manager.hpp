@@ -15,8 +15,6 @@ template <typename T> T* callCudaHostAlloc(size_t size, bool return_dev_ptr);
 template <typename T> void callCudaFree(T* ptr, int gpu);
 template <typename T> void callCudaMemcpyHostToDevice(T* dest, T* src, size_t size, int gpu);
 template <typename T> void callCudaMemcpyDeviceToHost(T* dest, T* src, size_t size, int gpu);
-template <typename T> void materializeExpression(T *a, T*& result, uint64_t *row_ids, uint64_t result_len);
-void materializeString(uint8_t* data, uint64_t* offset, uint8_t* &result, uint64_t* &result_offset, uint64_t* row_ids, uint64_t* &result_bytes, uint64_t result_len);
 template <typename T> void printGPUColumn(T* a, size_t N, int gpu);
 void cudaMemmove(uint8_t* destination, uint8_t* source, size_t num);
 uint8_t* allocatePinnedCPUMemory(size_t size);

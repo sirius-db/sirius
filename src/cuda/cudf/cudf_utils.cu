@@ -63,4 +63,14 @@ uint64_t* convertInt32ToUInt64(int32_t* data, size_t N) {
     return output_dev;
 }
 
+cudf::bitmask_type* createNullMask(size_t size, cudf::mask_state state) {
+    GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+    size_t mask_bytes = getMaskBytesSize(size);
+    uint8_t* mask = gpuBufferManager->customCudaMalloc<uint8_t>(mask_bytes, 0, 0);
+    if (state == cudf::mask_state::ALL_VALID) {
+        cudaMemset(mask, 0xFF, mask_bytes);
+    }
+    return reinterpret_cast<cudf::bitmask_type*>(mask);
+}
+
 } // namespace duckdb

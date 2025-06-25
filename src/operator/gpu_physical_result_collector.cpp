@@ -90,15 +90,16 @@ GPUPhysicalMaterializedCollector::FinalMaterializeInternal(GPUIntermediateRelati
 	if (input_relation.checkLateMaterialization(col)) {
 		T* data = reinterpret_cast<T*> (input_relation.columns[col]->data_wrapper.data);
 		uint64_t* row_ids = reinterpret_cast<uint64_t*> (input_relation.columns[col]->row_ids);
-		T* materialized;
-		materializeExpression<T>(data, materialized, row_ids, input_relation.columns[col]->row_id_count);
-		output_relation.columns[col] = make_shared_ptr<GPUColumn>(input_relation.columns[col]->row_id_count, input_relation.columns[col]->data_wrapper.type, reinterpret_cast<uint8_t*>(materialized));
+		cudf::bitmask_type* mask = input_relation.columns[col]->data_wrapper.validity_mask;
+		T* materialized; cudf::bitmask_type* out_mask = nullptr;
+		materializeExpression<T>(data, materialized, row_ids, input_relation.columns[col]->row_id_count, mask, out_mask);
+		output_relation.columns[col] = make_shared_ptr<GPUColumn>(input_relation.columns[col]->row_id_count, input_relation.columns[col]->data_wrapper.type, reinterpret_cast<uint8_t*>(materialized), out_mask);
 		output_relation.columns[col]->row_id_count = 0;
 		output_relation.columns[col]->row_ids = nullptr;
 		output_relation.columns[col]->is_unique = input_relation.columns[col]->is_unique;
 	} else {
 		output_relation.columns[col] = make_shared_ptr<GPUColumn>(input_relation.columns[col]->column_length, input_relation.columns[col]->data_wrapper.type, input_relation.columns[col]->data_wrapper.data,
-					input_relation.columns[col]->data_wrapper.validity_mask, input_relation.columns[col]->data_wrapper.mask_bytes);
+					input_relation.columns[col]->data_wrapper.validity_mask);
 		output_relation.columns[col]->is_unique = input_relation.columns[col]->is_unique;
 	}
 }
@@ -111,13 +112,14 @@ GPUPhysicalMaterializedCollector::FinalMaterializeString(GPUIntermediateRelation
 		uint64_t* offset = input_relation.columns[col]->data_wrapper.offset;
 		uint64_t* row_ids = input_relation.columns[col]->row_ids;
 		size_t num_rows = input_relation.columns[col]->row_id_count;
-		uint8_t* result; uint64_t* result_offset; uint64_t* new_num_bytes;
+		uint8_t* result; uint64_t* result_offset; uint64_t* new_num_bytes; cudf::bitmask_type* out_mask = nullptr;
+		cudf::bitmask_type* mask = input_relation.columns[col]->data_wrapper.validity_mask;
 
 		SIRIUS_LOG_DEBUG("Running string late materalization with {} rows", num_rows);
 
-		materializeString(data, offset, result, result_offset, row_ids, new_num_bytes, num_rows);
+		materializeString(data, offset, result, result_offset, row_ids, new_num_bytes, num_rows, mask, out_mask);
 
-		output_relation.columns[col] = make_shared_ptr<GPUColumn>(num_rows, GPUColumnType(GPUColumnTypeId::VARCHAR), reinterpret_cast<uint8_t*>(result), result_offset, new_num_bytes[0], true);
+		output_relation.columns[col] = make_shared_ptr<GPUColumn>(num_rows, GPUColumnType(GPUColumnTypeId::VARCHAR), reinterpret_cast<uint8_t*>(result), result_offset, new_num_bytes[0], true, out_mask);
 		output_relation.columns[col]->row_id_count = 0;
 		output_relation.columns[col]->row_ids = nullptr;
 		output_relation.columns[col]->is_unique = input_relation.columns[col]->is_unique;
@@ -125,7 +127,7 @@ GPUPhysicalMaterializedCollector::FinalMaterializeString(GPUIntermediateRelation
 		// output_relation.columns[col] = make_shared_ptr<GPUColumn>(*input_relation.columns[col]);
 		output_relation.columns[col] = make_shared_ptr<GPUColumn>(input_relation.columns[col]->column_length, input_relation.columns[col]->data_wrapper.type, input_relation.columns[col]->data_wrapper.data,
 					input_relation.columns[col]->data_wrapper.offset, input_relation.columns[col]->data_wrapper.num_bytes, true,
-					input_relation.columns[col]->data_wrapper.validity_mask, input_relation.columns[col]->data_wrapper.mask_bytes);	
+					input_relation.columns[col]->data_wrapper.validity_mask);	
 		output_relation.columns[col]->is_unique = input_relation.columns[col]->is_unique;
 	}
 }
@@ -350,8 +352,7 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 			
 			if (materialized_relation.columns[col]->data_wrapper.validity_mask == nullptr) {
 				SIRIUS_LOG_DEBUG("Column {} has no validity mask, creating a mask with all valid values\n", col);
-				uint64_t necessary_bytes = (materialized_relation.columns[col]->column_length + 7) / 8;
-				uint64_t padded_bytes = 64 * ((necessary_bytes + 63) / 64); // Pad to the nearest 64 bytes
+				uint64_t padded_bytes = getMaskBytesSize(materialized_relation.columns[col]->column_length);
 				// If the validity mask is null, we create a mask with all valid values
 				host_mask_data[col] = gpuBufferManager->customCudaHostAlloc<uint8_t>(padded_bytes);
 				memset(host_mask_data[col], 0xFF, padded_bytes); // All bits set to 1 (valid)
@@ -370,8 +371,8 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 			is_string = true;
 			if (str_column->data_wrapper.validity_mask == nullptr) {
 				SIRIUS_LOG_DEBUG("Column {} has no validity mask, creating a mask with all valid values\n", col);
-				uint64_t necessary_bytes = (materialized_relation.columns[col]->column_length + 7) / 8;
-				uint64_t padded_bytes = 64 * ((necessary_bytes + 63) / 64); // Pad to the nearest 64 bytes
+				// printf("Column %d has no validity mask, creating a mask with all valid values\n", col);
+				uint64_t padded_bytes = getMaskBytesSize(str_column->column_length);
 				// If the validity mask is null, we create a mask with all valid values
 				host_mask_data[col] = gpuBufferManager->customCudaHostAlloc<uint8_t>(padded_bytes);
 				memset(host_mask_data[col], 0xFF, padded_bytes); // All bits set to 1 (valid)
