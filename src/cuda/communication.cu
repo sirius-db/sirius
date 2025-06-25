@@ -17,7 +17,6 @@
 #include <iostream>
 #include <cuda_runtime.h>
 #include <cuda.h>
-#include "communication.hpp"
 #include "gpu_columns.hpp"
 #include "operator/cuda_helper.cuh"
 #include "log/logging.hpp"
