@@ -14,6 +14,9 @@ callCudaMalloc<uint64_t>(size_t size, int gpu);
 template uint8_t*
 callCudaMalloc<uint8_t>(size_t size, int gpu);
 
+template uint32_t*
+callCudaMalloc<uint32_t>(size_t size, int gpu);
+
 template float*
 callCudaMalloc<float>(size_t size, int gpu);
 
@@ -29,6 +32,9 @@ callCudaHostAlloc<uint64_t>(size_t size, bool return_dev_ptr);
 template uint8_t*
 callCudaHostAlloc<uint8_t>(size_t size, bool return_dev_ptr);
 
+template uint32_t*
+callCudaHostAlloc<uint32_t>(size_t size, bool return_dev_ptr);
+
 template float*
 callCudaHostAlloc<float>(size_t size, bool return_dev_ptr);
 
@@ -43,6 +49,9 @@ callCudaFree<uint64_t>(uint64_t* ptr, int gpu);
 
 template void
 callCudaFree<uint8_t>(uint8_t* ptr, int gpu);
+
+template void
+callCudaFree<uint32_t>(uint32_t* ptr, int gpu);
 
 template void
 callCudaFree<float>(float* ptr, int gpu);

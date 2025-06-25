@@ -15,6 +15,11 @@ template <typename T> void callCudaMemcpyHostToDevice(T* dest, T* src, size_t si
 template <typename T> void callCudaMemcpyDeviceToHost(T* dest, T* src, size_t size, int gpu);
 template <typename T> void callCudaMemcpyDeviceToDevice(T* dest, T* src, size_t size, int gpu);
 void callCudaMemset(void* ptr, int value, size_t size, int gpu);
+template <typename T> void materializeExpression(T *a, T*& result, uint64_t *row_ids, uint64_t result_len, cudf::bitmask_type* mask, cudf::bitmask_type* &out_mask);
+template <typename T> void materializeWithoutNull(T *a, T*& result, uint64_t *row_ids, uint64_t result_len);
+void materializeString(uint8_t* data, uint64_t* offset, uint8_t* &result, uint64_t* &result_offset, uint64_t* row_ids, uint64_t* &result_bytes, uint64_t result_len, cudf::bitmask_type* mask, cudf::bitmask_type* &out_mask);
+size_t getMaskBytesSize(uint64_t column_length);
+cudf::bitmask_type* createNullMask(size_t size, cudf::mask_state state = cudf::mask_state::ALL_VALID);
 
 enum class GPUColumnTypeId {
     INVALID = 0,
@@ -94,8 +99,8 @@ inline GPUColumnType convertLogicalTypeToColumnType(LogicalType type) {
 class DataWrapper {
 public:
     DataWrapper() = default; // Add default constructor
-    DataWrapper(GPUColumnType type, uint8_t* data, size_t size, uint32_t* validity_mask, size_t mask_bytes);
-    DataWrapper(GPUColumnType type, uint8_t* data, uint64_t* offset, size_t size, size_t num_bytes, bool is_string_data, uint32_t* validity_mask, size_t mask_bytes);
+    DataWrapper(GPUColumnType type, uint8_t* data, size_t size, cudf::bitmask_type* validity_mask);
+    DataWrapper(GPUColumnType type, uint8_t* data, uint64_t* offset, size_t size, size_t num_bytes, bool is_string_data, cudf::bitmask_type* validity_mask);
 	GPUColumnType type;
 	uint8_t* data;
     size_t size; // number of rows in the column (currently equals to column_length)
@@ -103,14 +108,16 @@ public:
     size_t num_bytes; // number of bytes in the column
     size_t getColumnTypeSize() const;
     bool is_string_data{false};
-    uint32_t* validity_mask{nullptr}; // validity mask for the column, used to represent NULL values
+    cudf::bitmask_type* validity_mask{nullptr}; // validity mask for the column, used to represent NULL values
     size_t mask_bytes{0};
 };
 
 class GPUColumn {
 public:
-    GPUColumn(size_t column_length, GPUColumnType type, uint8_t* data, uint32_t* validity_mask = nullptr, size_t mask_bytes = 0);
-    GPUColumn(size_t _column_length, GPUColumnType type, uint8_t* data, uint64_t* offset, size_t num_bytes, bool is_string_data, uint32_t* validity_mask = nullptr, size_t mask_bytes = 0);
+    GPUColumn(size_t column_length, GPUColumnType type, uint8_t* data, 
+            cudf::bitmask_type* validity_mask = nullptr);
+    GPUColumn(size_t _column_length, GPUColumnType type, uint8_t* data, uint64_t* offset, size_t num_bytes, bool is_string_data, 
+            cudf::bitmask_type* validity_mask = nullptr);
     GPUColumn(GPUColumn& other);
     ~GPUColumn(){};
     int* GetDataInt32();
@@ -137,7 +144,7 @@ public:
     void setFromCudfScalar(cudf::scalar& cudf_scalar, GPUBufferManager* gpuBufferManager); // set the GPUColumn from the cudf scalar
     //cudf mask is int32_t type, but has the granularity of 64B
     //duckdb mask is uint64_t type and the granularity of 8B
-    void convertCudfMaskToSiriusMask(std::unique_ptr<rmm::device_buffer> cudf_mask, GPUBufferManager* gpuBufferManager);
+    // void convertCudfMaskToSiriusMask(std::unique_ptr<rmm::device_buffer> cudf_mask, cudf::size_type col_size, GPUBufferManager* gpuBufferManager);
 };
 
 class GPUIntermediateRelation {

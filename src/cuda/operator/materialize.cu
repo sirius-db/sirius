@@ -84,7 +84,7 @@ __global__ void materialize_offset_with_null(uint64_t* offset, uint64_t* result_
 }
 
 template <typename T, int B, int I>
-__global__ void materialize_expression(const T *a, T* result, uint64_t *row_ids, uint64_t N) {
+__global__ void materialize_without_null(const T *a, T* result, uint64_t *row_ids, uint64_t N) {
 
     uint64_t tile_size = B * I;
     uint64_t tile_offset = blockIdx.x * tile_size;
@@ -127,17 +127,17 @@ __global__ void materialize_string(uint8_t* data, uint8_t* result, uint64_t* inp
 }
 
 template
-__global__ void materialize_expression<int, BLOCK_THREADS, ITEMS_PER_THREAD>(const int *a, int* result, uint64_t *row_ids, uint64_t N);
+__global__ void materialize_without_null<int, BLOCK_THREADS, ITEMS_PER_THREAD>(const int *a, int* result, uint64_t *row_ids, uint64_t N);
 template
-__global__ void materialize_expression<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD>(const uint64_t *a, uint64_t* result, uint64_t *row_ids, uint64_t N);
+__global__ void materialize_without_null<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD>(const uint64_t *a, uint64_t* result, uint64_t *row_ids, uint64_t N);
 template
-__global__ void materialize_expression<float, BLOCK_THREADS, ITEMS_PER_THREAD>(const float *a, float* result, uint64_t *row_ids, uint64_t N);
+__global__ void materialize_without_null<float, BLOCK_THREADS, ITEMS_PER_THREAD>(const float *a, float* result, uint64_t *row_ids, uint64_t N);
 template
-__global__ void materialize_expression<double, BLOCK_THREADS, ITEMS_PER_THREAD>(const double *a, double* result, uint64_t *row_ids, uint64_t N);
+__global__ void materialize_without_null<double, BLOCK_THREADS, ITEMS_PER_THREAD>(const double *a, double* result, uint64_t *row_ids, uint64_t N);
 template
-__global__ void materialize_expression<uint8_t, BLOCK_THREADS, ITEMS_PER_THREAD>(const uint8_t *a, uint8_t* result, uint64_t *row_ids, uint64_t N);
+__global__ void materialize_without_null<uint8_t, BLOCK_THREADS, ITEMS_PER_THREAD>(const uint8_t *a, uint8_t* result, uint64_t *row_ids, uint64_t N);
 template
-__global__ void materialize_expression<int64_t, BLOCK_THREADS, ITEMS_PER_THREAD>(const int64_t *a, int64_t* result, uint64_t *row_ids, uint64_t N);
+__global__ void materialize_without_null<int64_t, BLOCK_THREADS, ITEMS_PER_THREAD>(const int64_t *a, int64_t* result, uint64_t *row_ids, uint64_t N);
 
 template
 __global__ void materialize_expression_with_null<int, BLOCK_THREADS, ITEMS_PER_THREAD>(const int *a, int* result, uint32_t* mask, uint32_t* out_mask, uint64_t *row_ids, uint64_t N);
@@ -151,7 +151,7 @@ template
 __global__ void materialize_expression_with_null<uint8_t, BLOCK_THREADS, ITEMS_PER_THREAD>(const uint8_t *a, uint8_t* result, uint32_t* mask, uint32_t* out_mask, uint64_t *row_ids, uint64_t N);
 
 template <typename T>
-void materializeExpression(T *a, T*& result, uint64_t *row_ids, uint64_t result_len) {
+void materializeWithoutNull(T *a, T*& result, uint64_t *row_ids, uint64_t result_len) {
     CHECK_ERROR();
     if (result_len == 0) {
         SIRIUS_LOG_DEBUG("result_len is 0");
@@ -163,14 +163,102 @@ void materializeExpression(T *a, T*& result, uint64_t *row_ids, uint64_t result_
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
     result = gpuBufferManager->customCudaMalloc<T>(result_len, 0, 0);
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
-    materialize_expression<T, BLOCK_THREADS, ITEMS_PER_THREAD><<<(result_len + tile_items - 1)/tile_items, BLOCK_THREADS>>>(a, result, row_ids, result_len);
+    materialize_without_null<T, BLOCK_THREADS, ITEMS_PER_THREAD><<<(result_len + tile_items - 1)/tile_items, BLOCK_THREADS>>>(a, result, row_ids, result_len);
     CHECK_ERROR();
     cudaDeviceSynchronize();
-    STOP_TIMER();
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(a), 0);
+    STOP_TIMER();
 }
 
-void materializeString(uint8_t* data, uint64_t* offset, uint8_t* &result, uint64_t* &result_offset, uint64_t* row_ids, uint64_t* &result_bytes, uint64_t result_len) {
+template <typename T>
+void materializeExpression(T *a, T*& result, uint64_t *row_ids, uint64_t result_len, cudf::bitmask_type* mask, cudf::bitmask_type*& out_mask) {
+    CHECK_ERROR();
+    if (result_len == 0) {
+        SIRIUS_LOG_DEBUG("result_len is 0");
+        return;
+    }
+    SETUP_TIMING();
+    START_TIMER();
+    SIRIUS_LOG_DEBUG("Launching Materialize Kernel");
+    GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+    result = gpuBufferManager->customCudaMalloc<T>(result_len, 0, 0);
+
+    if (mask != nullptr) {
+        out_mask = gpuBufferManager->customCudaMalloc<uint32_t>(getMaskBytesSize(result_len) / sizeof(uint32_t), 0, 0);
+    } else {
+        out_mask = nullptr;
+    }
+
+    int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
+    if (mask != nullptr) {
+        materialize_expression_with_null<T, BLOCK_THREADS, ITEMS_PER_THREAD><<<(result_len + tile_items - 1)/tile_items, BLOCK_THREADS>>>(a, result, mask, out_mask, row_ids, result_len);
+    } else {
+        materialize_without_null<T, BLOCK_THREADS, ITEMS_PER_THREAD><<<(result_len + tile_items - 1)/tile_items, BLOCK_THREADS>>>(a, result, row_ids, result_len);
+    }
+    
+    CHECK_ERROR();
+    cudaDeviceSynchronize();
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(a), 0);
+    if (mask != nullptr) {
+        gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(mask), 0);
+    }
+    STOP_TIMER();
+}
+
+// void materializeString(uint8_t* data, uint64_t* offset, uint8_t* &result, uint64_t* &result_offset, uint64_t* row_ids, uint64_t* &result_bytes, uint64_t result_len) {
+//     CHECK_ERROR();
+//     if (result_len == 0) {
+//         SIRIUS_LOG_DEBUG("result_len is 0");
+//         return;
+//     }
+//     SETUP_TIMING();
+//     START_TIMER();
+//     SIRIUS_LOG_DEBUG("Launching Materialize String Kernel");
+//     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+//     //allocate temp memory and copying keys
+//     uint64_t* temp_len = gpuBufferManager->customCudaMalloc<uint64_t>(result_len + 1, 0, 0);
+//     result_offset = gpuBufferManager->customCudaMalloc<uint64_t>(result_len + 1, 0, 0);
+
+//     cudaMemset(temp_len + result_len, 0, sizeof(uint64_t));
+//     CHECK_ERROR();
+
+//     // Copy over the offsets
+//     uint64_t num_blocks = std::max((uint64_t) 1, (uint64_t) (result_len + BLOCK_THREADS - 1)/BLOCK_THREADS);
+//     materialize_offset<<<num_blocks, BLOCK_THREADS>>>(offset, temp_len, row_ids, result_len);
+//     cudaDeviceSynchronize();
+//     CHECK_ERROR();
+
+//     //cub scan
+//     void* d_temp_storage = nullptr;
+//     size_t temp_storage_bytes = 0;
+//     cub::DeviceScan::ExclusiveSum(d_temp_storage, temp_storage_bytes, temp_len, result_offset, result_len + 1);
+
+//     // Allocate temporary storage for exclusive prefix sum
+//     d_temp_storage = reinterpret_cast<void*> (gpuBufferManager->customCudaMalloc<uint8_t>(temp_storage_bytes, 0, 0));
+
+//     // Run exclusive prefix sum
+//     cub::DeviceScan::ExclusiveSum(d_temp_storage, temp_storage_bytes, temp_len, result_offset, result_len + 1);
+//     CHECK_ERROR();
+
+//     result_bytes = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
+//     cudaMemcpy(result_bytes, result_offset + result_len, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+
+//     CHECK_ERROR();
+
+//     result = gpuBufferManager->customCudaMalloc<uint8_t>(result_bytes[0], 0, 0);
+
+//     materialize_string<<<num_blocks, BLOCK_THREADS>>>(data, result, offset, result_offset, row_ids, result_len);
+//     cudaDeviceSynchronize();
+
+//     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(temp_len), 0);
+//     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_temp_storage), 0);
+//     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(data), 0);
+//     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(offset), 0);
+//     CHECK_ERROR();
+//     STOP_TIMER();
+// }
+
+void materializeString(uint8_t* data, uint64_t* offset, uint8_t* &result, uint64_t* &result_offset, uint64_t* row_ids, uint64_t* &result_bytes, uint64_t result_len, cudf::bitmask_type* mask, cudf::bitmask_type* &out_mask) {
     CHECK_ERROR();
     if (result_len == 0) {
         SIRIUS_LOG_DEBUG("result_len is 0");
@@ -184,12 +272,24 @@ void materializeString(uint8_t* data, uint64_t* offset, uint8_t* &result, uint64
     uint64_t* temp_len = gpuBufferManager->customCudaMalloc<uint64_t>(result_len + 1, 0, 0);
     result_offset = gpuBufferManager->customCudaMalloc<uint64_t>(result_len + 1, 0, 0);
 
+    if (mask != nullptr) {
+        out_mask = gpuBufferManager->customCudaMalloc<uint32_t>(getMaskBytesSize(result_len) / sizeof(uint32_t), 0, 0);
+    } else {
+        out_mask = nullptr;
+    }
+
     cudaMemset(temp_len + result_len, 0, sizeof(uint64_t));
     CHECK_ERROR();
 
     // Copy over the offsets
     uint64_t num_blocks = std::max((uint64_t) 1, (uint64_t) (result_len + BLOCK_THREADS - 1)/BLOCK_THREADS);
-    materialize_offset<<<num_blocks, BLOCK_THREADS>>>(offset, temp_len, row_ids, result_len);
+
+    if (mask != nullptr) {
+        materialize_offset_with_null<<<num_blocks, BLOCK_THREADS>>>(offset, temp_len, mask, out_mask, row_ids, result_len);
+    } else {
+        materialize_offset<<<num_blocks, BLOCK_THREADS>>>(offset, temp_len, row_ids, result_len);
+    }
+    
     cudaDeviceSynchronize();
     CHECK_ERROR();
 
@@ -219,6 +319,9 @@ void materializeString(uint8_t* data, uint64_t* offset, uint8_t* &result, uint64
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_temp_storage), 0);
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(data), 0);
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(offset), 0);
+    if (mask != nullptr) {
+        gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(mask), 0);
+    }
     CHECK_ERROR();
     STOP_TIMER();
 }
@@ -269,18 +372,33 @@ void materializeStringColumnToDuckdbFormat(shared_ptr<GPUColumn> column, char* c
 }
 
 template
-void materializeExpression<int>(int *a, int*& result, uint64_t *row_ids, uint64_t result_len);
+void materializeWithoutNull<int>(int *a, int*& result, uint64_t *row_ids, uint64_t result_len);
 template
-void materializeExpression<uint64_t>(uint64_t *a, uint64_t*& result, uint64_t *row_ids, uint64_t result_len);
+void materializeWithoutNull<uint64_t>(uint64_t *a, uint64_t*& result, uint64_t *row_ids, uint64_t result_len);
 template
-void materializeExpression<float>(float *a, float*& result, uint64_t *row_ids, uint64_t result_len);
+void materializeWithoutNull<float>(float *a, float*& result, uint64_t *row_ids, uint64_t result_len);
 template
-void materializeExpression<double>(double *a, double*& result, uint64_t *row_ids, uint64_t result_len);
+void materializeWithoutNull<double>(double *a, double*& result, uint64_t *row_ids, uint64_t result_len);
 template
-void materializeExpression<uint8_t>(uint8_t *a, uint8_t*& result, uint64_t *row_ids, uint64_t result_len);
+void materializeWithoutNull<uint8_t>(uint8_t *a, uint8_t*& result, uint64_t *row_ids, uint64_t result_len);
 template
-void materializeExpression<int64_t>(int64_t *a, int64_t*& result, uint64_t *row_ids, uint64_t result_len);
+void materializeWithoutNull<int64_t>(int64_t *a, int64_t*& result, uint64_t *row_ids, uint64_t result_len);
 template
-void materializeExpression<__int128_t>(__int128_t *a, __int128_t*& result, uint64_t *row_ids, uint64_t result_len);
+void materializeWithoutNull<__int128_t>(__int128_t *a, __int128_t*& result, uint64_t *row_ids, uint64_t result_len);
+
+template
+void materializeExpression<int>(int *a, int*& result, uint64_t *row_ids, uint64_t result_len, cudf::bitmask_type* mask, cudf::bitmask_type* &out_mask);
+template
+void materializeExpression<uint64_t>(uint64_t *a, uint64_t*& result, uint64_t *row_ids, uint64_t result_len, cudf::bitmask_type* mask, cudf::bitmask_type* &out_mask);
+template
+void materializeExpression<float>(float *a, float*& result, uint64_t *row_ids, uint64_t result_len, cudf::bitmask_type* mask, cudf::bitmask_type* &out_mask);
+template
+void materializeExpression<double>(double *a, double*& result, uint64_t *row_ids, uint64_t result_len, cudf::bitmask_type* mask, cudf::bitmask_type* &out_mask);
+template
+void materializeExpression<uint8_t>(uint8_t *a, uint8_t*& result, uint64_t *row_ids, uint64_t result_len, cudf::bitmask_type* mask, cudf::bitmask_type* &out_mask);
+template
+void materializeExpression<int64_t>(int64_t *a, int64_t*& result, uint64_t *row_ids, uint64_t result_len, cudf::bitmask_type* mask, cudf::bitmask_type* &out_mask);
+template
+void materializeExpression<__int128_t>(__int128_t *a, __int128_t*& result, uint64_t *row_ids, uint64_t result_len, cudf::bitmask_type* mask, cudf::bitmask_type* &out_mask);
 
 } // namespace duckdb
