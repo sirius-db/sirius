@@ -1,9 +1,32 @@
+/*
+ * Copyright 2025, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #include "gpu_columns.hpp"
 #include "gpu_buffer_manager.hpp"
 #include "log/logging.hpp"
 #include "duckdb/common/types/decimal.hpp"
 
 namespace duckdb {
+
+size_t getMaskBytesSize(uint64_t column_length) {
+    // Calculate the number of bytes needed for the validity mask
+    uint64_t necessary_bytes = (column_length + 7) / 8;
+    uint64_t padded_bytes = 64 * ((necessary_bytes + 63) / 64); // Pad to the nearest 64 bytes
+    return padded_bytes;
+}
 
 size_t GPUDecimalTypeInfo::GetDecimalTypeSize() const {
     if (width_ <= Decimal::MAX_WIDTH_INT16) {
@@ -20,14 +43,42 @@ size_t GPUDecimalTypeInfo::GetDecimalTypeSize() const {
     }
 }
 
-DataWrapper::DataWrapper(GPUColumnType _type, uint8_t* _data, size_t _size) : data(_data), size(_size) {
-    type = _type;
+DataWrapper::DataWrapper(GPUColumnType _type, uint8_t* _data, size_t _size, cudf::bitmask_type* _validity_mask) : 
+    data(_data), size(_size), type(_type), validity_mask(_validity_mask) {
+    // if (_validity_mask == nullptr) {
+    //     throw duckdb::InternalException("Validity mask cannot be null for GPUColumn");
+    // }
     num_bytes = size * getColumnTypeSize();
     is_string_data = false;
+    mask_bytes = getMaskBytesSize(size);
+    // if (null_count == 0xFFFFFFFFFFFFFFFF) {
+    //     if (validity_mask != nullptr) {
+    //         // Calculate null count from the validity mask
+    //         null_count = cudf::null_count(validity_mask, size);
+    //     } else {
+    //         null_count = 0;
+    //     }
+    // }
 };
 
-DataWrapper::DataWrapper(GPUColumnType _type, uint8_t* _data, uint64_t* _offset, size_t _size, size_t _num_bytes, bool _is_string_data) : 
-    data(_data), size(_size), type(_type), offset(_offset), num_bytes(_num_bytes), is_string_data(_is_string_data) {};
+DataWrapper::DataWrapper(GPUColumnType _type, uint8_t* _data, uint64_t* _offset, size_t _size, 
+        size_t _num_bytes, bool _is_string_data, cudf::bitmask_type* _validity_mask) : 
+    data(_data), size(_size), type(_type), offset(_offset), num_bytes(_num_bytes), 
+    is_string_data(_is_string_data), validity_mask(_validity_mask) {
+    // if (_validity_mask == nullptr) {
+    //     throw duckdb::InternalException("Validity mask cannot be null for GPUColumn");
+    // }
+    mask_bytes = getMaskBytesSize(size);
+    // if null_count is not set, it means that the null count is not calculated yet
+    // if (null_count == 0xFFFFFFFFFFFFFFFF) {
+    //     if (validity_mask != nullptr) {
+    //         // Calculate null count from the validity mask
+    //         null_count = cudf::null_count(validity_mask, size);
+    //     } else {
+    //         null_count = 0;
+    //     }
+    // }
+};
 
 size_t 
 DataWrapper::getColumnTypeSize() const {
@@ -60,18 +111,26 @@ DataWrapper::getColumnTypeSize() const {
     }
 }
 
-GPUColumn::GPUColumn(size_t _column_length, GPUColumnType type, uint8_t* data) {
+GPUColumn::GPUColumn(size_t _column_length, GPUColumnType type, uint8_t* data, 
+    cudf::bitmask_type* validity_mask) {
+    // if (validity_mask == nullptr) {
+    //     throw duckdb::InternalException("Validity mask cannot be null for GPUColumn");
+    // }
     column_length = _column_length;
-    data_wrapper = DataWrapper(type, data, _column_length);
+    data_wrapper = DataWrapper(type, data, _column_length, validity_mask);
     row_ids = nullptr;
     data_wrapper.offset = nullptr;
     data_wrapper.num_bytes = column_length * data_wrapper.getColumnTypeSize();
     is_unique = false;
 }
 
-GPUColumn::GPUColumn(size_t _column_length, GPUColumnType type, uint8_t* data, uint64_t* offset, size_t num_bytes, bool is_string_data) {
+GPUColumn::GPUColumn(size_t _column_length, GPUColumnType type, uint8_t* data, uint64_t* offset, 
+    size_t num_bytes, bool is_string_data, cudf::bitmask_type* validity_mask) {
+    // if (validity_mask == nullptr) {
+    //     throw duckdb::InternalException("Validity mask cannot be null for GPUColumn");
+    // }
     column_length = _column_length;
-    data_wrapper = DataWrapper(type, data, offset, _column_length, num_bytes, is_string_data);
+    data_wrapper = DataWrapper(type, data, offset, _column_length, num_bytes, is_string_data, validity_mask);
     row_ids = nullptr;
     if (is_string_data) {
         data_wrapper.num_bytes = num_bytes;
@@ -89,27 +148,105 @@ GPUColumn::GPUColumn(GPUColumn& other) {
     is_unique = other.is_unique;
 }
 
+// cudf::column_view
+// GPUColumn::convertToCudfColumn() {
+//     SIRIUS_LOG_DEBUG("Converting GPUColumn to cuDF column");
+//     cudf::size_type size = column_length;
+//     if (data_wrapper.type.id() == GPUColumnTypeId::INT64) {
+//         auto column = cudf::column_view(cudf::data_type(cudf::type_id::UINT64), size, reinterpret_cast<void*>(data_wrapper.data), nullptr, 0);
+//         return column;
+//     } else if (data_wrapper.type.id() == GPUColumnTypeId::INT32) {
+//         auto column = cudf::column_view(cudf::data_type(cudf::type_id::INT32), size, reinterpret_cast<void*>(data_wrapper.data), nullptr, 0);
+//         return column;
+//     } else if (data_wrapper.type.id() == GPUColumnTypeId::FLOAT32) {
+//         auto column = cudf::column_view(cudf::data_type(cudf::type_id::FLOAT32), size, reinterpret_cast<void*>(data_wrapper.data), nullptr, 0);
+//         return column;
+//     } else if (data_wrapper.type.id() == GPUColumnTypeId::FLOAT64) {
+//         auto column = cudf::column_view(cudf::data_type(cudf::type_id::FLOAT64), size, reinterpret_cast<void*>(data_wrapper.data), nullptr, 0);
+//         return column;
+//     } else if (data_wrapper.type.id() == GPUColumnTypeId::BOOLEAN) {
+//         auto column = cudf::column_view(cudf::data_type(cudf::type_id::BOOL8), size, reinterpret_cast<void*>(data_wrapper.data), nullptr, 0);
+//         return column;
+//     } else if (data_wrapper.type.id() == GPUColumnTypeId::DATE) {
+//         auto column = cudf::column_view(cudf::data_type(cudf::type_id::TIMESTAMP_DAYS), size, reinterpret_cast<void*>(data_wrapper.data), nullptr, 0);
+//         return column;
+//     } else if (data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
+//         //convert offset to int32
+//         // int32_t* new_offset = convertSiriusOffsetToCudfOffset();
+
+//         auto offsets_col = cudf::column_view(
+//             cudf::data_type{cudf::type_id::INT64},
+//             size + 1,
+//             reinterpret_cast<void*>(data_wrapper.offset),
+//             nullptr,
+//             0
+//         );
+
+//         std::vector<cudf::column_view> children;
+//         children.push_back(offsets_col);
+
+//         // Build string column
+//         auto str_col = cudf::column_view(
+//             cudf::data_type{cudf::type_id::STRING},
+//             size,
+//             reinterpret_cast<void*>(data_wrapper.data),    // No top-level data buffer
+//             nullptr,    // Optional null mask
+//             0,                       // Null count
+//             0,                       // Offset
+//             std::move(children)
+//         );
+//         return str_col;
+//     } else if (data_wrapper.type.id() == GPUColumnTypeId::DECIMAL) {
+//         cudf::data_type cudf_type;
+//         switch (data_wrapper.getColumnTypeSize()) {
+//             case sizeof(int32_t): {
+//                 // cudf decimal type uses negative scale, same for below
+//                 cudf_type = cudf::data_type(cudf::type_id::DECIMAL32, -data_wrapper.type.GetDecimalTypeInfo()->scale_);
+//                 break;
+//             }
+//             case sizeof(int64_t): {
+//                 cudf_type = cudf::data_type(cudf::type_id::DECIMAL64, -data_wrapper.type.GetDecimalTypeInfo()->scale_);
+//                 break;
+//             }
+//             case sizeof(__int128_t): {
+//                 cudf_type = cudf::data_type(cudf::type_id::DECIMAL128, -data_wrapper.type.GetDecimalTypeInfo()->scale_);
+//                 break;
+//             }
+//             default:
+//                 throw duckdb::InternalException("Unsupported sirius DECIMAL column type size in `convertToCudfColumn()`: %zu",
+//                                                 data_wrapper.getColumnTypeSize());
+//         }
+//         return cudf::column_view(cudf_type, size, reinterpret_cast<void*>(data_wrapper.data), nullptr, 0);
+//     }
+//     throw duckdb::InternalException("Unsupported sirius column type in `convertToCudfColumn()`: %d", data_wrapper.type.id());
+// }
+
 cudf::column_view
 GPUColumn::convertToCudfColumn() {
     SIRIUS_LOG_DEBUG("Converting GPUColumn to cuDF column");
     cudf::size_type size = column_length;
+    if (data_wrapper.validity_mask == nullptr) {
+        data_wrapper.validity_mask = createNullMask(column_length);
+        data_wrapper.mask_bytes = getMaskBytesSize(size);
+    }
+    cudf::size_type null_count = cudf::null_count(data_wrapper.validity_mask, 0, size);
     if (data_wrapper.type.id() == GPUColumnTypeId::INT64) {
-        auto column = cudf::column_view(cudf::data_type(cudf::type_id::UINT64), size, reinterpret_cast<void*>(data_wrapper.data), nullptr, 0);
+        auto column = cudf::column_view(cudf::data_type(cudf::type_id::UINT64), size, reinterpret_cast<void*>(data_wrapper.data), data_wrapper.validity_mask, null_count);
         return column;
     } else if (data_wrapper.type.id() == GPUColumnTypeId::INT32) {
-        auto column = cudf::column_view(cudf::data_type(cudf::type_id::INT32), size, reinterpret_cast<void*>(data_wrapper.data), nullptr, 0);
+        auto column = cudf::column_view(cudf::data_type(cudf::type_id::INT32), size, reinterpret_cast<void*>(data_wrapper.data), data_wrapper.validity_mask, null_count);
         return column;
     } else if (data_wrapper.type.id() == GPUColumnTypeId::FLOAT32) {
-        auto column = cudf::column_view(cudf::data_type(cudf::type_id::FLOAT32), size, reinterpret_cast<void*>(data_wrapper.data), nullptr, 0);
+        auto column = cudf::column_view(cudf::data_type(cudf::type_id::FLOAT32), size, reinterpret_cast<void*>(data_wrapper.data), data_wrapper.validity_mask, null_count);
         return column;
     } else if (data_wrapper.type.id() == GPUColumnTypeId::FLOAT64) {
-        auto column = cudf::column_view(cudf::data_type(cudf::type_id::FLOAT64), size, reinterpret_cast<void*>(data_wrapper.data), nullptr, 0);
+        auto column = cudf::column_view(cudf::data_type(cudf::type_id::FLOAT64), size, reinterpret_cast<void*>(data_wrapper.data), data_wrapper.validity_mask, null_count);
         return column;
     } else if (data_wrapper.type.id() == GPUColumnTypeId::BOOLEAN) {
-        auto column = cudf::column_view(cudf::data_type(cudf::type_id::BOOL8), size, reinterpret_cast<void*>(data_wrapper.data), nullptr, 0);
+        auto column = cudf::column_view(cudf::data_type(cudf::type_id::BOOL8), size, reinterpret_cast<void*>(data_wrapper.data), data_wrapper.validity_mask, null_count);
         return column;
     } else if (data_wrapper.type.id() == GPUColumnTypeId::DATE) {
-        auto column = cudf::column_view(cudf::data_type(cudf::type_id::TIMESTAMP_DAYS), size, reinterpret_cast<void*>(data_wrapper.data), nullptr, 0);
+        auto column = cudf::column_view(cudf::data_type(cudf::type_id::TIMESTAMP_DAYS), size, reinterpret_cast<void*>(data_wrapper.data), data_wrapper.validity_mask, null_count);
         return column;
     } else if (data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
         //convert offset to int32
@@ -131,8 +268,8 @@ GPUColumn::convertToCudfColumn() {
             cudf::data_type{cudf::type_id::STRING},
             size,
             reinterpret_cast<void*>(data_wrapper.data),    // No top-level data buffer
-            nullptr,    // Optional null mask
-            0,                       // Null count
+            data_wrapper.validity_mask,    // Optional null mask
+            null_count,                       // Null count
             0,                       // Offset
             std::move(children)
         );
@@ -157,7 +294,7 @@ GPUColumn::convertToCudfColumn() {
                 throw duckdb::InternalException("Unsupported sirius DECIMAL column type size in `convertToCudfColumn()`: %zu",
                                                 data_wrapper.getColumnTypeSize());
         }
-        return cudf::column_view(cudf_type, size, reinterpret_cast<void*>(data_wrapper.data), nullptr, 0);
+        return cudf::column_view(cudf_type, size, reinterpret_cast<void*>(data_wrapper.data), data_wrapper.validity_mask, null_count);
     }
     throw duckdb::InternalException("Unsupported sirius column type in `convertToCudfColumn()`: %d", data_wrapper.type.id());
 }
@@ -173,7 +310,16 @@ GPUColumn::setFromCudfColumn(cudf::column& cudf_column, bool _is_unique, int32_t
     data_wrapper.data = reinterpret_cast<uint8_t*>(gpuBufferManager->rmm_stored_buffers.back()->data());
     data_wrapper.size = col_size;
     column_length = data_wrapper.size;
+    data_wrapper.mask_bytes = getMaskBytesSize(column_length);
     is_unique = _is_unique;
+
+    if (cont.null_mask->data() == nullptr || cudf_column.nullable() == false) {
+        data_wrapper.validity_mask = createNullMask(column_length);
+    } else {
+        gpuBufferManager->rmm_stored_buffers.push_back(std::move(cont.null_mask));
+        data_wrapper.validity_mask = reinterpret_cast<cudf::bitmask_type*>(gpuBufferManager->rmm_stored_buffers.back()->data());
+    }
+
     //add data to allocation table in gpu buffer manager
     if (col_type == cudf::data_type(cudf::type_id::STRING)) {
         if (cont.children[0]->type().id() == cudf::type_id::INT32) {
@@ -321,12 +467,17 @@ GPUColumn::setFromCudfScalar(cudf::scalar& cudf_scalar, GPUBufferManager* gpuBuf
     }
 
     data_wrapper.size = 1;
+    data_wrapper.validity_mask = gpuBufferManager->customCudaMalloc<cudf::bitmask_type>(1, 0, 0);
+    cudf::bitmask_type* host_mask = gpuBufferManager->customCudaHostAlloc<cudf::bitmask_type>(1);
+    host_mask[0] = 1;
+    callCudaMemcpyHostToDevice<uint8_t>(reinterpret_cast<uint8_t*>(data_wrapper.validity_mask), 
+            reinterpret_cast<uint8_t*>(host_mask), sizeof(cudf::bitmask_type), 0);
+    data_wrapper.mask_bytes = getMaskBytesSize(data_wrapper.size);
     column_length = 1;
     data_wrapper.offset = nullptr;
     data_wrapper.is_string_data = false;
     row_ids = nullptr;
     row_id_count = 0;
-
 }
 
 int32_t*

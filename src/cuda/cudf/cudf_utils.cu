@@ -1,3 +1,19 @@
+/*
+ * Copyright 2025, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #include "../operator/cuda_helper.cuh"
 #include "gpu_columns.hpp"
 
@@ -61,6 +77,16 @@ uint64_t* convertInt32ToUInt64(int32_t* data, size_t N) {
     convert_int32_to_uint64<BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(data, output_dev, N);
     CHECK_ERROR();
     return output_dev;
+}
+
+cudf::bitmask_type* createNullMask(size_t size, cudf::mask_state state) {
+    GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+    size_t mask_bytes = getMaskBytesSize(size);
+    uint8_t* mask = gpuBufferManager->customCudaMalloc<uint8_t>(mask_bytes, 0, 0);
+    if (state == cudf::mask_state::ALL_VALID) {
+        cudaMemset(mask, 0xFF, mask_bytes);
+    }
+    return reinterpret_cast<cudf::bitmask_type*>(mask);
 }
 
 } // namespace duckdb

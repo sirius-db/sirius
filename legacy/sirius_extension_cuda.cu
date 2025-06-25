@@ -14,18 +14,24 @@
  * limitations under the License.
  */
 
-#include "duckdb/execution/operator/scan/physical_empty_result.hpp"
-#include "duckdb/execution/physical_plan_generator.hpp"
-#include "duckdb/planner/operator/logical_empty_result.hpp"
-
-#include "gpu_physical_empty_result.hpp"
-#include "gpu_physical_plan_generator.hpp"
+#include <iostream>
+#include <cuda_runtime.h>
+#include <cuda.h>
+#include "../include/sirius_extension.hpp"
+#include "log/logging.hpp"
 
 namespace duckdb {
 
-unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::CreatePlan(LogicalEmptyResult &op) {
-	D_ASSERT(op.children.size() == 0);
-	return make_uniq<GPUPhysicalEmptyResult>(op.types, op.estimated_cardinality);
+//Define the CUDA kernel
+__global__ void kernelFunction() {
+    // Noop
+}
+
+// Define the host function that launches the CUDA kernel
+void myKernel() {
+    SIRIUS_LOG_DEBUG("My kernel");
+    kernelFunction<<<1, 1>>>();
+    cudaDeviceSynchronize();
 }
 
 } // namespace duckdb

@@ -1,3 +1,19 @@
+/*
+ * Copyright 2025, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #include "operator/gpu_physical_limit.hpp"
 #include "operator/gpu_materialize.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
@@ -28,8 +44,7 @@ GPUPhysicalStreamingLimit::Execute(GPUIntermediateRelation &input_relation, GPUI
   // }
   GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 	for (int col_idx = 0; col_idx < output_relation.columns.size(); col_idx++) {
-    BoundReferenceExpression bound_ref(LogicalType::INTEGER, col_idx);
-    shared_ptr<GPUColumn> materialize_column = HandleMaterializeExpression(input_relation.columns[col_idx], bound_ref, gpuBufferManager);
+    shared_ptr<GPUColumn> materialize_column = HandleMaterializeExpression(input_relation.columns[col_idx], gpuBufferManager);
 
     limit_const = min(limit_const, materialize_column->column_length);
     output_relation.columns[col_idx] = make_shared_ptr<GPUColumn>(limit_const, materialize_column->data_wrapper.type, materialize_column->data_wrapper.data,

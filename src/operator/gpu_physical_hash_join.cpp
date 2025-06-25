@@ -1,3 +1,19 @@
+/*
+ * Copyright 2025, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #include "operator/gpu_physical_hash_join.hpp"
 #include "gpu_pipeline.hpp"
 #include "gpu_meta_pipeline.hpp"
@@ -413,7 +429,7 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 			unique_probe_keys = true;
 		}
 		SIRIUS_LOG_DEBUG("Materializing join key for probing hash table from index {}", join_key_index);
-		probe_key[cond_idx] = HandleMaterializeExpression(input_relation.columns[join_key_index], condition.left->Cast<BoundReferenceExpression>(), gpuBufferManager);
+		probe_key[cond_idx] = HandleMaterializeExpression(input_relation.columns[join_key_index], gpuBufferManager);
 	}
 
 	//probing hash table
@@ -585,7 +601,7 @@ GPUPhysicalHashJoin::Sink(GPUIntermediateRelation &input_relation) const {
 			unique_build_keys = true;
 		}
 		SIRIUS_LOG_DEBUG("Materializing join key for building hash table from index {}", join_key_index);
-		build_keys[cond_idx] = HandleMaterializeExpression(input_relation.columns[join_key_index], condition.right->Cast<BoundReferenceExpression>(), gpuBufferManager);
+		build_keys[cond_idx] = HandleMaterializeExpression(input_relation.columns[join_key_index], gpuBufferManager);
 	}
 
 	SIRIUS_LOG_DEBUG("Building hash table");
@@ -598,7 +614,6 @@ GPUPhysicalHashJoin::Sink(GPUIntermediateRelation &input_relation) const {
 		else gpu_hash_table = (unsigned long long*) gpuBufferManager->customCudaMalloc<uint64_t>(ht_len * (conditions.size() + 2), 0, 0);
 	}
 	
-
 	if (join_type == JoinType::INNER) {
 		// check if there is a non-equality condition
 		// bool has_non_equality_condition = false;

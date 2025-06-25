@@ -1,3 +1,19 @@
+/*
+ * Copyright 2025, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #pragma once
 #include "cudf_utils.hpp"
 #include "helper/common.h"
@@ -15,8 +31,6 @@ template <typename T> T* callCudaHostAlloc(size_t size, bool return_dev_ptr);
 template <typename T> void callCudaFree(T* ptr, int gpu);
 template <typename T> void callCudaMemcpyHostToDevice(T* dest, T* src, size_t size, int gpu);
 template <typename T> void callCudaMemcpyDeviceToHost(T* dest, T* src, size_t size, int gpu);
-template <typename T> void materializeExpression(T *a, T*& result, uint64_t *row_ids, uint64_t result_len, uint64_t input_len);
-void materializeString(uint8_t* data, uint64_t* offset, uint8_t* &result, uint64_t* &result_offset, uint64_t* row_ids, uint64_t* &result_bytes, uint64_t result_len, uint64_t input_size, uint64_t input_bytes);
 template <typename T> void printGPUColumn(T* a, size_t N, int gpu);
 void cudaMemmove(uint8_t* destination, uint8_t* source, size_t num);
 uint8_t* allocatePinnedCPUMemory(size_t size);
@@ -105,7 +119,6 @@ public:
 	void createTable(string table_name, size_t column_count);
 	void createColumn(string table_name, string column_name, GPUColumnType column_type, size_t column_id, vector<size_t> unique_columns);
 	bool checkIfColumnCached(string table_name, string column_name);
-	shared_ptr<GPUColumn> copyDataFromcuDFColumn(cudf::column_view& column, int gpu);
 
 	std::vector<std::unique_ptr<rmm::device_buffer>> rmm_stored_buffers;
 

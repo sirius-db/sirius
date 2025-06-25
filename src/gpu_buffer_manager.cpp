@@ -1,3 +1,19 @@
+/*
+ * Copyright 2025, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #include "gpu_buffer_manager.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/types.hpp"
@@ -20,6 +36,9 @@ GPUBufferManager::customCudaMalloc<uint64_t>(size_t size, int gpu, bool caching)
 
 template int64_t*
 GPUBufferManager::customCudaMalloc<int64_t>(size_t size, int gpu, bool caching);
+
+template uint32_t*
+GPUBufferManager::customCudaMalloc<uint32_t>(size_t size, int gpu, bool caching);
 
 template uint8_t*
 GPUBufferManager::customCudaMalloc<uint8_t>(size_t size, int gpu, bool caching);
@@ -74,6 +93,9 @@ GPUBufferManager::customCudaHostAlloc<int>(size_t size);
 
 template uint64_t*
 GPUBufferManager::customCudaHostAlloc<uint64_t>(size_t size);
+
+template uint32_t*
+GPUBufferManager::customCudaHostAlloc<uint32_t>(size_t size);
 
 template uint8_t*
 GPUBufferManager::customCudaHostAlloc<uint8_t>(size_t size);
@@ -289,50 +311,6 @@ GPUBufferManager::customCudaMalloc(size_t size, int gpu, bool caching) {
         return reinterpret_cast<T*>(ptr);
     }
 };
-
-shared_ptr<GPUColumn> 
-GPUBufferManager::copyDataFromcuDFColumn(cudf::column_view& column, int gpu) {
-    //copy the data to the gpu
-    //create a column
-    //return the column
-    uint8_t* data = const_cast<uint8_t*>(column.data<uint8_t>());
-
-    if (column.type() == cudf::data_type(cudf::type_id::STRING)) {
-
-        int32_t temp_num_bytes;
-        int32_t* temp_offset = const_cast<int32_t*>(column.child(0).data<int32_t>());
-        callCudaMemcpyDeviceToHost<int32_t>(&temp_num_bytes, temp_offset + column.size(), 1, 0);
-        uint8_t* temp_column = customCudaMalloc<uint8_t>(temp_num_bytes, 0, false);
-        callCudaMemcpyDeviceToDevice<uint8_t>(temp_column, data, temp_num_bytes, 0);
-
-        shared_ptr<GPUColumn> column_ptr = make_shared_ptr<GPUColumn>(column.size(), GPUColumnType(GPUColumnTypeId::VARCHAR), temp_column);
-        column_ptr->convertCudfOffsetToSiriusOffset(temp_offset);
-        column_ptr->data_wrapper.num_bytes = temp_num_bytes;
-        column_ptr->data_wrapper.is_string_data = true;
-        return column_ptr;
-    } else if (column.type() == cudf::data_type(cudf::type_id::UINT64)) {
-        uint8_t* temp_column = customCudaMalloc<uint8_t>(column.size() * sizeof(uint64_t), 0, false);
-        callCudaMemcpyDeviceToDevice<uint8_t>(temp_column, data, column.size() * sizeof(uint64_t), 0);
-        return make_shared_ptr<GPUColumn>(column.size(), GPUColumnType(GPUColumnTypeId::INT64), temp_column);
-    } else if (column.type() == cudf::data_type(cudf::type_id::INT32)) {
-        uint8_t* temp_column = customCudaMalloc<uint8_t>(column.size() * sizeof(int32_t), 0, false);
-        callCudaMemcpyDeviceToDevice<uint8_t>(temp_column, data, column.size() * sizeof(int32_t), 0);
-        return make_shared_ptr<GPUColumn>(column.size(), GPUColumnType(GPUColumnTypeId::INT32), temp_column);
-    } else if (column.type() == cudf::data_type(cudf::type_id::FLOAT32)) {
-        uint8_t* temp_column = customCudaMalloc<uint8_t>(column.size() * sizeof(float), 0, false);
-        callCudaMemcpyDeviceToDevice<uint8_t>(temp_column, data, column.size() * sizeof(float), 0);
-        return make_shared_ptr<GPUColumn>(column.size(), GPUColumnType(GPUColumnTypeId::FLOAT32), temp_column);
-    } else if (column.type() == cudf::data_type(cudf::type_id::FLOAT64)) {
-        uint8_t* temp_column = customCudaMalloc<uint8_t>(column.size() * sizeof(double), 0, false);
-        callCudaMemcpyDeviceToDevice<uint8_t>(temp_column, data, column.size() * sizeof(double), 0);
-        return make_shared_ptr<GPUColumn>(column.size(), GPUColumnType(GPUColumnTypeId::FLOAT64), temp_column);
-    } else if (column.type() == cudf::data_type(cudf::type_id::BOOL8)) {
-        uint8_t* temp_column = customCudaMalloc<uint8_t>(column.size() * sizeof(bool), 0, false);
-        callCudaMemcpyDeviceToDevice<uint8_t>(temp_column, data, column.size() * sizeof(bool), 0);
-        return make_shared_ptr<GPUColumn>(column.size(), GPUColumnType(GPUColumnTypeId::BOOLEAN), temp_column);
-    }
-    throw duckdb::InternalException("Unsupported cuDF column: {}", static_cast<int>(column.type().id()));
-}
 
 void
 GPUBufferManager::lockAllocation(void* ptr, int gpu) {

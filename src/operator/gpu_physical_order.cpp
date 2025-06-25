@@ -1,3 +1,19 @@
+/*
+ * Copyright 2025, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #include "operator/gpu_physical_order.hpp"
 #include "operator/gpu_materialize.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
@@ -144,8 +160,7 @@ GPUPhysicalOrder::Sink(GPUIntermediateRelation &input_relation) const {
     
     for (int projection_idx = 0; projection_idx < projections.size(); projection_idx++) {
         auto input_idx = projections[projection_idx];
-        auto expr = BoundReferenceExpression(LogicalType::ANY, input_idx);
-        projection_columns[projection_idx] = HandleMaterializeExpression(input_relation.columns[input_idx], expr, gpuBufferManager);
+        projection_columns[projection_idx] = HandleMaterializeExpression(input_relation.columns[input_idx], gpuBufferManager);
         input_relation.columns[input_idx] = projection_columns[projection_idx];
     }
     
@@ -155,7 +170,7 @@ GPUPhysicalOrder::Sink(GPUIntermediateRelation &input_relation) const {
         throw NotImplementedException("Order by expression not supported");
       }
       auto input_idx = expr.Cast<BoundReferenceExpression>().index;
-      order_by_keys[order_idx] = HandleMaterializeExpression(input_relation.columns[input_idx], expr.Cast<BoundReferenceExpression>(), gpuBufferManager);
+      order_by_keys[order_idx] = HandleMaterializeExpression(input_relation.columns[input_idx], gpuBufferManager);
     }
 
 

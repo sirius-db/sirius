@@ -1,3 +1,19 @@
+/*
+ * Copyright 2025, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #include <iostream>
 #include "operator/cuda_helper.cuh"
 #include "gpu_buffer_manager.hpp"
@@ -14,6 +30,9 @@ callCudaMalloc<uint64_t>(size_t size, int gpu);
 template uint8_t*
 callCudaMalloc<uint8_t>(size_t size, int gpu);
 
+template uint32_t*
+callCudaMalloc<uint32_t>(size_t size, int gpu);
+
 template float*
 callCudaMalloc<float>(size_t size, int gpu);
 
@@ -29,6 +48,9 @@ callCudaHostAlloc<uint64_t>(size_t size, bool return_dev_ptr);
 template uint8_t*
 callCudaHostAlloc<uint8_t>(size_t size, bool return_dev_ptr);
 
+template uint32_t*
+callCudaHostAlloc<uint32_t>(size_t size, bool return_dev_ptr);
+
 template float*
 callCudaHostAlloc<float>(size_t size, bool return_dev_ptr);
 
@@ -43,6 +65,9 @@ callCudaFree<uint64_t>(uint64_t* ptr, int gpu);
 
 template void
 callCudaFree<uint8_t>(uint8_t* ptr, int gpu);
+
+template void
+callCudaFree<uint32_t>(uint32_t* ptr, int gpu);
 
 template void
 callCudaFree<float>(float* ptr, int gpu);
