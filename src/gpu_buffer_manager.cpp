@@ -79,6 +79,9 @@ GPUBufferManager::customCudaMalloc<uint8_t*>(size_t size, int gpu, bool caching)
 template uint64_t**
 GPUBufferManager::customCudaMalloc<uint64_t*>(size_t size, int gpu, bool caching);
 
+template uint32_t**
+GPUBufferManager::customCudaMalloc<uint32_t*>(size_t size, int gpu, bool caching);
+
 template int32_t**
 GPUBufferManager::customCudaMalloc<int32_t*>(size_t size, int gpu, bool caching);
 
@@ -138,6 +141,9 @@ GPUBufferManager::customCudaHostAlloc<uint64_t*>(size_t size);
 
 template uint8_t**
 GPUBufferManager::customCudaHostAlloc<uint8_t*>(size_t size);
+
+template uint32_t**
+GPUBufferManager::customCudaHostAlloc<uint32_t*>(size_t size);
 
 template float**
 GPUBufferManager::customCudaHostAlloc<float*>(size_t size);

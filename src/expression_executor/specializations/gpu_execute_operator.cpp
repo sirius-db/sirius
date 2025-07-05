@@ -237,16 +237,20 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundOperator
 
     switch (expr.GetExpressionType())
     {
-      case ExpressionType::OPERATOR_NOT:
+      case ExpressionType::OPERATOR_NOT: {
         return cudf::unary_operation(child->view(),
                                      cudf::unary_operator::NOT,
                                      execution_stream,
                                      resource_ref);
-      case ExpressionType::OPERATOR_IS_NULL:
-        throw NotImplementedException("Execute[OPERATOR_IS_NULL]: Not yet implemented!");
-      case ExpressionType::OPERATOR_IS_NOT_NULL:
-        throw NotImplementedException("Execute[OPERATOR_IS_NOT_NULL]: Not yet implemented!");
-      default:
+      } case ExpressionType::OPERATOR_IS_NULL: {
+        return cudf::is_null(child->view(), execution_stream, resource_ref);
+      } case ExpressionType::OPERATOR_IS_NOT_NULL: {
+        std::unique_ptr<cudf::column> temp = cudf::is_null(child->view(), execution_stream, resource_ref);
+        return cudf::unary_operation(temp->view(),
+                                     cudf::unary_operator::NOT,
+                                     execution_stream,
+                                     resource_ref);
+      } default:
         throw NotImplementedException("Execute[OPERATOR]: Unimplemented operator type with 1 "
                                       "child!");
     }
