@@ -3,7 +3,7 @@
   <img src="sirius-full.png" alt="Diagram" width="500"/>
 </p>
 
-Sirius is a GPU acceleration layer for SQL analytics. It plugs into existing engines such as DuckDB via the standard Substrait query format, requiring no query rewrites or major system changes. Currently supports DuckDB and Doris (coming soon), other systems marked with * are on our roadmap.
+Sirius is a GPU-native SQL engine. It plugs into existing databases such as DuckDB via the standard Substrait query format, requiring no query rewrites or major system changes. Sirius currently supports DuckDB and Doris (coming soon), other systems marked with * are on our roadmap.
 
 <!-- ![Architecture](sirius-architecture.png) -->
 <p align="center">
@@ -12,6 +12,10 @@ Sirius is a GPU acceleration layer for SQL analytics. It plugs into existing eng
 
 ## Performance
 Running TPC-H on SF=100, Sirius achieves ~10x speedup over existing CPU query engines at the same hardware rental cost, making it well-suited for interactive analytics, financial workloads, and ETL jobs.
+
+Experiment Setup:
+- GPU instance: GH200@LambdaLabs ($3.2/hour)
+- CPU instance: m7i.16xlarge@AWS ($3.2/hour)
 
 ![Performance](sirius-performance.png)
 
@@ -244,7 +248,8 @@ export SIRIUS_LOG_LEVEL=debug
 
 ## Limitations
 Sirius is under active development, and several features are still in progress. Notable current limitations include:
-- **Working Set Size Limitations:** Sirius recently switches to libcudf to implement `FILTER`, `PROJECTION`, `JOIN`, `GROUP-BY`, `ORDER-BY`, `AGGREGATION`. However, since libcudf uses `int32_t` for row IDs, this imposes limits on the maximum working set size that Sirius can currently handle (~2B rows). See libcudf issue [#13159](https://github.com/rapidsai/cudf/issues/13159) for more details. We are actively addressing this by adding support for partitioning and chunked pipeline execution. See Sirius issue [#12](https://github.com/sirius-db/sirius/issues/12) for more details.
+- **Data Size Limitations:** Sirius currently only works when the dataset fits in the GPU memory capacity. To be more specific, it would return an error if the input data size is larger than the GPU caching region or if the intermediate results is larger than the GPU processing region. We are actively addressing this issue by adding support for partitioning and batch execution (issues [#12](https://github.com/sirius-db/sirius/issues/12) and [#19](https://github.com/sirius-db/sirius/issues/19)), multi-GPUs execution (issue [#18](https://github.com/sirius-db/sirius/issues/18)), spilling to disk/host memory (issue [#19](https://github.com/sirius-db/sirius/issues/19)), and distributed query execution (issue [#18](https://github.com/sirius-db/sirius/issues/18)).
+- **Row Count Limitations:** Sirius uses libcudf to implement `FILTER`, `PROJECTION`, `JOIN`, `GROUP-BY`, `ORDER-BY`, `AGGREGATION`. However, since libcudf uses `int32_t` for row IDs, this imposes limits on the maximum row count that Sirius can currently handle (~2B rows). See libcudf issue [#13159](https://github.com/rapidsai/cudf/issues/13159) for more details. We are actively addressing this by adding support for partitioning and batch execution. See Sirius issue [#12](https://github.com/sirius-db/sirius/issues/12) for more details.
 - **Data Type Coverage:** Sirius currently supports data types including `INTEGER`, `BIGINT`, `FLOAT`, `DOUBLE`, `VARCHAR`, `DATE`, and `DECIMAL`. We are actively working on supporting additional data types—such as `TIME` and nested types. See issue [#20](https://github.com/sirius-db/sirius/issues/20) for more details.
 - **Operator Coverage:** At present, Sirius only supports a range of operators including `FILTER`, `PROJECTION`, `JOIN`, `GROUP-BY`, `ORDER-BY`, `AGGREGATION`, `TOP-N`, `LIMIT`, and `CTE`. We are working on adding more advanced operators such as `WINDOW` functions and `ASOF JOIN`, etc. See issue [#21](https://github.com/sirius-db/sirius/issues/21) for more details.
 - **No Support for Partially NULL Columns:** Sirius currently does not support columns where only some values are `NULL`. This limitation is being tracked and will be addressed in a future update. See issue [#27](https://github.com/sirius-db/sirius/issues/27) for more details.
