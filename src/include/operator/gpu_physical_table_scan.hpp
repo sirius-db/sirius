@@ -34,7 +34,8 @@ enum ScanDataType {
 	DATE,
 	VARCHAR,
 	DECIMAL32,
-	DECIMAL64
+	DECIMAL64,
+	SQLNULL
 };
 
 enum CompareType {
@@ -43,7 +44,9 @@ enum CompareType {
 	GREATERTHAN,
 	GREATERTHANOREQUALTO,
 	LESSTHAN,
-	LESSTHANOREQUALTO
+	LESSTHANOREQUALTO,
+	IS_NULL,
+	IS_NOT_NULL
 };
 
 template <typename T> void comparisonConstantExpression(T *a, T b, T c, uint64_t* &row_ids, uint64_t* &count, uint64_t N, int op_mode);
@@ -51,7 +54,7 @@ template <typename T> void comparisonExpression(T *a, T* b, uint64_t* &row_ids, 
 void comparisonStringBetweenExpression(char* char_data, uint64_t num_chars, uint64_t* str_indices, uint64_t num_strings, std::string lower_string, std::string upper_string, 
     bool is_lower_inclusive, bool is_upper_inclusive, uint64_t* &row_id, uint64_t* &count);
 void comparisonStringExpression(char* char_data, uint64_t num_chars, uint64_t* str_indices, uint64_t num_strings, std::string comparison_string, int op_mode, uint64_t* &row_id, uint64_t* &count);
-void tableScanExpression(uint8_t **col, uint64_t** offset, uint8_t *constant_compare, uint64_t *constant_offset, 
+void tableScanExpression(uint8_t **col, uint64_t** offset, cudf::bitmask_type** bitmask, uint8_t *constant_compare, uint64_t *constant_offset, 
 	ScanDataType* data_type, uint64_t *&row_ids, uint64_t* &count, uint64_t N, CompareType* compare_mode, int num_expr);
 
 class GPUPhysicalTableScan : public GPUPhysicalOperator {

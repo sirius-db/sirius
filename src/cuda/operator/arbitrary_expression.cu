@@ -46,6 +46,23 @@ __device__ bool device_comparison(T item, T compare, CompareType compare_mode) {
     return flag;
 }
 
+__device__ bool device_comparison_null(uint32_t validity_bit, CompareType compare_mode) {
+    bool flag = 0;
+    if (compare_mode == IS_NULL) {
+        flag = (validity_bit == 0);
+    } else if (compare_mode == IS_NOT_NULL) {
+        flag = (validity_bit != 0);
+    } else if (compare_mode == EQUAL || compare_mode == NOTEQUAL || 
+               compare_mode == GREATERTHAN || compare_mode == GREATERTHANOREQUALTO || 
+               compare_mode == LESSTHAN || compare_mode == LESSTHANOREQUALTO) {
+        // These modes are not applicable for NULL checks
+        flag = false;
+    } else {
+        cudaAssert(0);
+    }
+    return flag;
+}
+
 __device__ int device_comparison_string(char* char_data, uint64_t char_len, char* compare_chars, uint64_t compare_length, CompareType compare_mode) {
     
     // First compare the chars
@@ -111,7 +128,7 @@ __device__ int device_comparison_string(char* char_data, uint64_t char_len, char
 }
 
 template <int B, int I>
-__global__ void table_scan_expression(uint8_t **col, uint64_t** offset, uint8_t *constant_compare, uint64_t *constant_offset, 
+__global__ void table_scan_expression(uint8_t **col, uint64_t** offset, uint32_t** bitmask, uint8_t *constant_compare, uint64_t *constant_offset, 
         ScanDataType* data_type, uint64_t *row_ids, unsigned long long* count, uint64_t N, CompareType* compare_mode, int is_count, int num_expr) {
 
     typedef cub::BlockScan<int, B> BlockScanInt;
@@ -147,8 +164,8 @@ __global__ void table_scan_expression(uint8_t **col, uint64_t** offset, uint8_t 
         for (int expr = 0; expr < num_expr; expr++) {
             if (threadIdx.x + ITEM * B < num_tile_items) {
 
+                uint64_t item_idx = tile_offset + threadIdx.x + ITEM * B;
                 if (data_type[expr] == INT32 || data_type[expr] == DATE || data_type[expr] == DECIMAL32) {
-                    uint64_t item_idx = tile_offset + threadIdx.x + ITEM * B;
                     int item = (reinterpret_cast<int*>(col[expr]))[item_idx];
 
                     uint64_t start_constant_offset = constant_offset[expr]; 
@@ -158,7 +175,6 @@ __global__ void table_scan_expression(uint8_t **col, uint64_t** offset, uint8_t 
                     selection_flags[ITEM] = device_comparison<int>(item, constant, compare_mode[expr]);
 
                 } else if (data_type[expr] == INT64 || data_type[expr] == DECIMAL64) {
-                    uint64_t item_idx = tile_offset + threadIdx.x + ITEM * B;
                     int64_t item = (reinterpret_cast<int64_t*>(col[expr]))[item_idx];
 
                     uint64_t start_constant_offset = constant_offset[expr]; 
@@ -168,7 +184,6 @@ __global__ void table_scan_expression(uint8_t **col, uint64_t** offset, uint8_t 
                     selection_flags[ITEM] = device_comparison<int64_t>(item, constant, compare_mode[expr]);
 
                 } else if (data_type[expr] == FLOAT32) {
-                    uint64_t item_idx = tile_offset + threadIdx.x + ITEM * B;
                     float item = (reinterpret_cast<float*>(col[expr]))[item_idx];
 
                     uint64_t start_constant_offset = constant_offset[expr]; 
@@ -177,7 +192,6 @@ __global__ void table_scan_expression(uint8_t **col, uint64_t** offset, uint8_t 
                     
                     selection_flags[ITEM] = device_comparison<float>(item, constant, compare_mode[expr]);
                 } else if (data_type[expr] == FLOAT64) {
-                    uint64_t item_idx = tile_offset + threadIdx.x + ITEM * B;
                     double item = (reinterpret_cast<double*>(col[expr]))[item_idx];
 
                     uint64_t start_constant_offset = constant_offset[expr]; 
@@ -186,7 +200,6 @@ __global__ void table_scan_expression(uint8_t **col, uint64_t** offset, uint8_t 
                     
                     selection_flags[ITEM] = device_comparison<double>(item, constant, compare_mode[expr]);
                 } else if (data_type[expr] == BOOLEAN) {
-                    uint64_t item_idx = tile_offset + threadIdx.x + ITEM * B;
                     uint8_t item = (reinterpret_cast<uint8_t*>(col[expr]))[item_idx];
 
                     uint64_t start_constant_offset = constant_offset[expr]; 
@@ -194,8 +207,6 @@ __global__ void table_scan_expression(uint8_t **col, uint64_t** offset, uint8_t 
                     
                     selection_flags[ITEM] = device_comparison<uint8_t>(item, constant, compare_mode[expr]);
                 } else if (data_type[expr] == VARCHAR) {
-                    uint64_t item_idx = tile_offset + threadIdx.x + ITEM * B;
-
                     uint64_t start_offset = offset[expr][item_idx]; 
                     uint64_t end_offset = offset[expr][item_idx + 1];
                     uint64_t curr_str_length = end_offset - start_offset;
@@ -207,6 +218,12 @@ __global__ void table_scan_expression(uint8_t **col, uint64_t** offset, uint8_t 
                     char* compare_chars = (char*) constant_compare + start_constant_offset;
 
                     selection_flags[ITEM] = device_comparison_string(curr_str_chars, curr_str_length, compare_chars, compare_length, compare_mode[expr]);
+                } else if (data_type[expr] == SQLNULL) {
+                    uint64_t bitindex = (item_idx / 32);
+                    uint64_t bitoffset = (item_idx % 32);
+                    uint32_t validity_bit = (bitmask[expr][bitindex] >> bitoffset) & 0x00000001;
+                    
+                    selection_flags[ITEM] = device_comparison_null(validity_bit, compare_mode[expr]);
                 } else {
                     cudaAssert(0);
                 }
@@ -245,75 +262,8 @@ __global__ void table_scan_expression(uint8_t **col, uint64_t** offset, uint8_t 
     }
 }
 
-__global__ void print_columns(uint8_t **col, uint64_t** offset, uint64_t N) {
-    if (threadIdx.x == 0) {
-        for (int i = 0; i < 100; i++) {
-            // FIXME: do this in cpu code using logging
-        }
-    }
-}
-
-// void 
-// tableScanExpression(uint8_t **col, uint64_t** offset, uint8_t *constant_compare, uint64_t *constant_offset, 
-//         ScanDataType* data_type, uint64_t *&row_ids, uint64_t* &count, uint64_t N, CompareType* compare_mode, int num_expr) {
-
-//     CHECK_ERROR();
-//     if (N == 0) {
-//         uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
-//         h_count[0] = 0;
-//         count = h_count;
-//         SIRIUS_LOG_DEBUG("Input size is 0");
-//         return;
-//     }
-//     SIRIUS_LOG_DEBUG("Launching Arbitrary Table Scan Kernel");
-//     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
-
-//     uint64_t constant_size = constant_offset[num_expr];
-//     uint8_t* d_constant_compare = gpuBufferManager->customCudaMalloc<uint8_t>(constant_size, 0, 0);
-//     uint64_t* d_constant_offset = gpuBufferManager->customCudaMalloc<uint64_t>(num_expr + 1, 0, 0);
-//     cudaMemcpy(d_constant_compare, constant_compare, constant_size * sizeof(uint8_t), cudaMemcpyHostToDevice);
-//     cudaMemcpy(d_constant_offset, constant_offset, (num_expr + 1) * sizeof(uint64_t), cudaMemcpyHostToDevice);
-
-//     CompareType* d_compare_mode = (CompareType*) gpuBufferManager->customCudaMalloc<int>(num_expr, 0, 0);
-//     cudaMemcpy(d_compare_mode, compare_mode, num_expr * sizeof(int), cudaMemcpyHostToDevice);
-//     ScanDataType* d_data_type = (ScanDataType*) gpuBufferManager->customCudaMalloc<int>(num_expr, 0, 0);
-//     cudaMemcpy(d_data_type, data_type, num_expr * sizeof(int), cudaMemcpyHostToDevice);
-
-//     uint8_t** d_col;
-//     uint64_t** d_offset;
-//     cudaMalloc((void**) &d_col, num_expr * sizeof(uint8_t*));
-//     cudaMalloc((void**) &d_offset, num_expr * sizeof(uint64_t*));
-//     cudaMemcpy(d_col, col, num_expr * sizeof(uint8_t*), cudaMemcpyHostToDevice);
-//     cudaMemcpy(d_offset, offset, num_expr * sizeof(uint64_t*), cudaMemcpyHostToDevice);
-
-//     cudaMemset(count, 0, sizeof(uint64_t));
-//     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
-//     // table_scan_expression<BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(
-//     //         d_col, d_offset, d_constant_compare, d_constant_offset, d_data_type, row_ids, (unsigned long long*) count, N, d_compare_mode, 1, num_expr);
-//     // CHECK_ERROR();
-//     size_t openmalloc_full = (gpuBufferManager->processing_size_per_gpu - gpuBufferManager->gpuProcessingPointer[0] - 1024) / sizeof(uint64_t);
-//     // SIRIUS_LOG_DEBUG("openmalloc_full: {}", openmalloc_full);
-//     // SIRIUS_LOG_DEBUG("gpuBufferManager->gpuProcessingPointer[0]: {}", gpuBufferManager->gpuProcessingPointer[0]);
-//     row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(openmalloc_full, 0, 0);
-
-//     // uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
-//     // cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
-//     // row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
-//     // cudaMemset(count, 0, sizeof(uint64_t));
-//     table_scan_expression<BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(
-//             d_col, d_offset, d_constant_compare, d_constant_offset, d_data_type, row_ids, (unsigned long long*) count, N, d_compare_mode, 0, num_expr);
-//     CHECK_ERROR();
-
-//     uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
-//     cudaMemcpy(h_count, count, sizeof(uint64_t), cudaMemcpyDeviceToHost);
-//     CHECK_ERROR();
-//     gpuBufferManager->gpuProcessingPointer[0] = (reinterpret_cast<uint8_t*>(row_ids + h_count[0]) - gpuBufferManager->gpuProcessing[0]);
-//     count = h_count;
-//     SIRIUS_LOG_DEBUG("Count: {}", h_count[0]); 
-// }
-
 void 
-tableScanExpression(uint8_t **col, uint64_t** offset, uint8_t *constant_compare, uint64_t *constant_offset, 
+tableScanExpression(uint8_t **col, uint64_t** offset, cudf::bitmask_type** bitmask, uint8_t *constant_compare, uint64_t *constant_offset, 
         ScanDataType* data_type, uint64_t *&row_ids, uint64_t* &count, uint64_t N, CompareType* compare_mode, int num_expr) {
 
     CHECK_ERROR();
@@ -344,8 +294,10 @@ tableScanExpression(uint8_t **col, uint64_t** offset, uint8_t *constant_compare,
 
     uint8_t** d_col = gpuBufferManager->customCudaMalloc<uint8_t*>(num_expr, 0, 0);
     uint64_t** d_offset = gpuBufferManager->customCudaMalloc<uint64_t*>(num_expr, 0, 0);
+    uint32_t** d_bitmask = gpuBufferManager->customCudaMalloc<uint32_t*>(num_expr, 0, 0);
     cudaMemcpy(d_col, col, num_expr * sizeof(uint8_t*), cudaMemcpyHostToDevice);
     cudaMemcpy(d_offset, offset, num_expr * sizeof(uint64_t*), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_bitmask, bitmask, num_expr * sizeof(cudf::bitmask_type*), cudaMemcpyHostToDevice);
     CHECK_ERROR();
 
     count = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
@@ -355,7 +307,7 @@ tableScanExpression(uint8_t **col, uint64_t** offset, uint8_t *constant_compare,
     row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(N, 0, 0);
 
     table_scan_expression<BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(
-            d_col, d_offset, d_constant_compare, d_constant_offset, d_data_type, row_ids, (unsigned long long*) count, N, d_compare_mode, 0, num_expr);
+            d_col, d_offset, d_bitmask, d_constant_compare, d_constant_offset, d_data_type, row_ids, (unsigned long long*) count, N, d_compare_mode, 0, num_expr);
     CHECK_ERROR();
 
     uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);

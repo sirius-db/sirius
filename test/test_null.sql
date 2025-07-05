@@ -12,7 +12,10 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 
-CREATE TABLE T (A BIGINT);
-INSERT INTO T VALUES (1), (NULL), (3), (NULL), (5);
+CREATE TABLE T (A BIGINT, B BIGINT);
+INSERT INTO T VALUES (3, 1), (NULL, 2), (3, 3), (NULL, 4), (3, 5);
 call gpu_buffer_init("1 GB", "1 GB");
-call gpu_processing("select * from T");
+call gpu_processing("select A from T where A = 3");
+call gpu_processing("select A from T where A = NULL");
+call gpu_processing("select A from T where A IS NOT NULL");
+call gpu_processing("select A from T where A IS NULL");

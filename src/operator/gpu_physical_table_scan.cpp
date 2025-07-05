@@ -208,12 +208,13 @@ void HandleBetweenExpression(shared_ptr<GPUColumn> column, uint64_t* &count, uin
 void HandleArbitraryConstantExpression(vector<shared_ptr<GPUColumn>> &column, uint64_t* &count, uint64_t* &row_ids, ConstantFilter** &filter_constant, int num_expr) {
   GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
   uint8_t** col = gpuBufferManager->customCudaHostAlloc<uint8_t*>(num_expr);
+  uint32_t** bitmask = gpuBufferManager->customCudaHostAlloc<uint32_t*>(num_expr);
   uint64_t** offset = gpuBufferManager->customCudaHostAlloc<uint64_t*>(num_expr);
   uint64_t* constant_offset = gpuBufferManager->customCudaHostAlloc<uint64_t>(num_expr + 1);
   CompareType* compare_mode = gpuBufferManager->customCudaHostAlloc<CompareType>(num_expr);
   ScanDataType* data_type = gpuBufferManager->customCudaHostAlloc<ScanDataType>(num_expr);
 
-  int total_bytes = 0;
+  uint64_t total_bytes = 0;
   for (int expr = 0; expr < num_expr; expr++) {
     switch(filter_constant[expr]->comparison_type) {
       case ExpressionType::COMPARE_EQUAL: {
@@ -234,9 +235,21 @@ void HandleArbitraryConstantExpression(vector<shared_ptr<GPUColumn>> &column, ui
       } case ExpressionType::COMPARE_LESSTHANOREQUALTO: {
         compare_mode[expr] = LESSTHANOREQUALTO;
         break;
+      } case ExpressionType::OPERATOR_IS_NULL: {
+        compare_mode[expr] = IS_NULL;
+        break;
+      } case ExpressionType::OPERATOR_IS_NOT_NULL: {
+        compare_mode[expr] = IS_NOT_NULL;
+        break;
       } default: {
         throw NotImplementedException("Unsupported comparison type");
       }
+    }
+
+    if (filter_constant[expr]->constant.IsNull()) {
+      total_bytes += sizeof(int);
+      data_type[expr] = ScanDataType::SQLNULL;
+      continue;
     }
 
     switch(column[expr]->data_wrapper.type.id()) {
@@ -294,6 +307,15 @@ void HandleArbitraryConstantExpression(vector<shared_ptr<GPUColumn>> &column, ui
   for (int expr = 0; expr < num_expr; expr++) {
     col[expr] = column[expr]->data_wrapper.data;
     offset[expr] = column[expr]->data_wrapper.offset;
+    bitmask[expr] = column[expr]->data_wrapper.validity_mask;
+
+    if (filter_constant[expr]->constant.IsNull()) {
+      int temp = 0xFFFFFFFF; // Use a sentinel value to indicate NULL
+      memcpy(constant_compare + init_offset, &temp, sizeof(int));
+      constant_offset[expr] = init_offset;
+      init_offset += sizeof(int);
+      continue;
+    }
 
     switch(column[expr]->data_wrapper.type.id()) {
       case GPUColumnTypeId::INT32:
@@ -357,7 +379,7 @@ void HandleArbitraryConstantExpression(vector<shared_ptr<GPUColumn>> &column, ui
   constant_offset[num_expr] = init_offset;
   
   uint64_t N = column[0]->column_length;
-  tableScanExpression(col, offset, constant_compare, constant_offset, data_type, row_ids, count, N, compare_mode, num_expr);
+  tableScanExpression(col, offset, bitmask, constant_compare, constant_offset, data_type, row_ids, count, N, compare_mode, num_expr);
 }
 
 class TableScanGlobalSourceState : public GlobalSourceState {
