@@ -179,8 +179,8 @@ __global__ void probe_single_match(T **keys, unsigned long long* ht, uint64_t ht
 
 }
 
-template <int B, int I>
-__global__ void probe_mark(uint64_t **keys, unsigned long long* ht, uint64_t ht_len, uint8_t* output,
+template <int B, int I, typename T>
+__global__ void probe_mark(T **keys, unsigned long long* ht, uint64_t ht_len, uint8_t* output,
             uint64_t N, int* condition_mode, int num_keys, int equal_keys) {
 
     uint64_t tile_size = B * I;
@@ -223,10 +223,6 @@ __global__ void probe_mark(uint64_t **keys, unsigned long long* ht, uint64_t ht_
         }
     }
 }
-
-template
-__global__ void probe_mark<BLOCK_THREADS, ITEMS_PER_THREAD>(uint64_t **keys, unsigned long long* ht, uint64_t ht_len, uint8_t* output,
-            uint64_t N, int* condition_mode, int num_keys, int equal_keys);
 
 template <typename T>
 void probeHashTableSingleMatch(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t* &row_ids_left, uint64_t* &row_ids_right, 
@@ -340,6 +336,7 @@ void probeHashTableRightSemiAntiSingleMatch(uint8_t **keys, unsigned long long* 
     STOP_TIMER();
 }
 
+template <typename T>
 void probeHashTableMark(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uint8_t* &output, uint64_t N, int* condition_mode, int num_keys) {
     CHECK_ERROR();
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
@@ -353,14 +350,14 @@ void probeHashTableMark(uint8_t **keys, unsigned long long* ht, uint64_t ht_len,
     SETUP_TIMING();
     START_TIMER();
 
-    //reinterpret cast the keys to uint64_t
-    uint64_t** keys_data = gpuBufferManager->customCudaHostAlloc<uint64_t*>(num_keys);
+    //reinterpret cast the keys to type T
+    T** keys_data = gpuBufferManager->customCudaHostAlloc<T*>(num_keys);
     for (int idx = 0; idx < num_keys; idx++) {
-        keys_data[idx] = reinterpret_cast<uint64_t*>(keys[idx]);
+        keys_data[idx] = reinterpret_cast<T*>(keys[idx]);
     }
 
-    uint64_t** keys_dev = gpuBufferManager->customCudaMalloc<uint64_t*>(num_keys, 0, 0);
-    cudaMemcpy(keys_dev, keys_data, num_keys * sizeof(uint64_t*), cudaMemcpyHostToDevice);
+    T** keys_dev = gpuBufferManager->customCudaMalloc<T*>(num_keys, 0, 0);
+    cudaMemcpy(keys_dev, keys_data, num_keys * sizeof(T*), cudaMemcpyHostToDevice);
 
     CHECK_ERROR();
 
@@ -375,7 +372,7 @@ void probeHashTableMark(uint8_t **keys, unsigned long long* ht, uint64_t ht_len,
 
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
     CHECK_ERROR();
-    probe_mark<BLOCK_THREADS, ITEMS_PER_THREAD><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(keys_dev, ht, ht_len, output, 
+    probe_mark<BLOCK_THREADS, ITEMS_PER_THREAD, T><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(keys_dev, ht, ht_len, output, 
             N, condition_mode_dev, num_keys, equal_keys);
     CHECK_ERROR();
     cudaDeviceSynchronize();
@@ -398,5 +395,11 @@ void probeHashTableRightSemiAntiSingleMatch<int32_t>(uint8_t **keys, unsigned lo
 
 template
 void probeHashTableRightSemiAntiSingleMatch<int64_t>(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t N, int* condition_mode, int num_keys);
+
+template
+void probeHashTableMark<int32_t>(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uint8_t* &output, uint64_t N, int* condition_mode, int num_keys);
+
+template
+void probeHashTableMark<int64_t>(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uint8_t* &output, uint64_t N, int* condition_mode, int num_keys);
 
 }

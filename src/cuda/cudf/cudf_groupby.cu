@@ -177,7 +177,8 @@ void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColu
       requests[agg].aggregations.push_back(std::move(aggregate));
       requests[agg].values = aggregate_keys[agg]->convertToCudfColumn();
     } else {
-      throw NotImplementedException("Aggregate function not supported");
+      throw NotImplementedException("Aggregate function not supported in `cudf_groupby`: %d",
+                                    static_cast<int>(agg_mode[agg]));
     }
   }
 

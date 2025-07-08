@@ -28,7 +28,7 @@ enum class AggregationType {
 	MIN,
 	MAX,
 	COUNT,
-    COUNT_STAR,
+	COUNT_STAR,
 	AVERAGE,
 	FIRST,
 	COUNT_DISTINCT

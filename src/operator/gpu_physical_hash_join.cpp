@@ -96,6 +96,7 @@ HandleProbeExpression(vector<shared_ptr<GPUColumn>> &probe_keys, uint64_t* &coun
     }
 }
 
+template <typename T>
 void
 ResolveTypeMarkExpression(vector<shared_ptr<GPUColumn>> &probe_keys, uint8_t* &output, 
 		unsigned long long* ht, uint64_t ht_len, const vector<JoinCondition> &conditions, GPUBufferManager* gpuBufferManager) {
@@ -121,17 +122,20 @@ ResolveTypeMarkExpression(vector<shared_ptr<GPUColumn>> &probe_keys, uint8_t* &o
 		}
 	}
 
-	probeHashTableMark(probe_data, ht, ht_len, output, size, condition_mode, num_keys);
+	probeHashTableMark<T>(probe_data, ht, ht_len, output, size, condition_mode, num_keys);
 }
 
 void
 HandleMarkExpression(vector<shared_ptr<GPUColumn>> &probe_keys, uint8_t* &output, 
 		unsigned long long* ht, uint64_t ht_len, const vector<JoinCondition> &conditions, GPUBufferManager* gpuBufferManager) {
     switch(probe_keys[0]->data_wrapper.type.id()) {
+      case GPUColumnTypeId::INT32:
+				ResolveTypeMarkExpression<int32_t>(probe_keys, output, ht, ht_len, conditions, gpuBufferManager);
+				break;
       case GPUColumnTypeId::INT64:
-		ResolveTypeMarkExpression(probe_keys, output, ht, ht_len, conditions, gpuBufferManager);
-		break;
       case GPUColumnTypeId::FLOAT64:
+				ResolveTypeMarkExpression<int64_t>(probe_keys, output, ht, ht_len, conditions, gpuBufferManager);
+				break;
       default:
         throw NotImplementedException("Unsupported sirius column type in `HandleMarkExpression`: %d",
 																			static_cast<int>(probe_keys[0]->data_wrapper.type.id()));
@@ -504,7 +508,9 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 		for (idx_t i = 0; i < lhs_output_columns.col_idxs.size(); i++) {
 			auto lhs_col = lhs_output_columns.col_idxs[i];
 			SIRIUS_LOG_DEBUG("Passing column idx {} from LHS to idx {} in output relation", lhs_col, i);
-			output_relation.columns[i] = make_shared_ptr<GPUColumn>(input_relation.columns[lhs_col]->column_length, input_relation.columns[lhs_col]->data_wrapper.type, input_relation.columns[lhs_col]->data_wrapper.data);
+			output_relation.columns[i] = make_shared_ptr<GPUColumn>(input_relation.columns[lhs_col]->column_length, input_relation.columns[lhs_col]->data_wrapper.type, input_relation.columns[lhs_col]->data_wrapper.data,
+							input_relation.columns[lhs_col]->data_wrapper.offset, input_relation.columns[lhs_col]->data_wrapper.num_bytes, input_relation.columns[lhs_col]->data_wrapper.is_string_data,
+							input_relation.columns[lhs_col]->data_wrapper.validity_mask);
 			output_relation.columns[i]->row_ids = input_relation.columns[lhs_col]->row_ids;
 			output_relation.columns[i]->row_id_count = input_relation.columns[lhs_col]->row_id_count;
 			if (unique_build_keys) {

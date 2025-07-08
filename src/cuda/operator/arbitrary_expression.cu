@@ -68,25 +68,30 @@ __device__ int device_comparison_string(char* char_data, uint64_t char_len, char
     // First compare the chars
     bool is_valid = true;
     bool found_answer = false;
-    if (compare_mode == EQUAL || compare_mode == NOTEQUAL) {
-        if (compare_mode == EQUAL && compare_length != char_len) {
+    if (compare_mode == EQUAL) {
+        if (compare_length != char_len) {
             is_valid = false;
-        } else if (compare_mode == NOTEQUAL && compare_length != char_len) {
-            is_valid = true;
         } else {
-            for(uint64_t j = 0; j < compare_length; j++) {
+            for (uint64_t j = 0; j < compare_length; j++) {
                 char curr_str_char = char_data[j];
                 char compare_char = compare_chars[j];
-                if (compare_mode == EQUAL) {
-                    if(curr_str_char != compare_char) {
-                        is_valid = false;
-                        break;
-                    }
-                } else if (compare_mode == NOTEQUAL) {
-                    if(curr_str_char == compare_char) {
-                        is_valid = false;
-                        break;
-                    }
+                if (curr_str_char != compare_char) {
+                    is_valid = false;
+                    break;
+                }
+            }
+        }
+    } else if (compare_mode == NOTEQUAL) {
+        if (compare_length != char_len) {
+            is_valid = true;
+        } else {
+            is_valid = false;
+            for (uint64_t j = 0; j < compare_length; j++) {
+                char curr_str_char = char_data[j];
+                char compare_char = compare_chars[j];
+                if (curr_str_char != compare_char) {
+                    is_valid = true;
+                    break;
                 }
             }
         }
