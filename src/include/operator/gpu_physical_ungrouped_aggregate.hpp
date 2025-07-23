@@ -82,7 +82,7 @@ public:
 	// void CombineDistinct(ExecutionContext &context, OperatorSinkCombineInput &input) const;
 	// //! Sink the distinct aggregates
 	// void SinkDistinct(ExecutionContext &context, GPUIntermediateRelation &input_relation, OperatorSinkInput &input) const;
-	void SinkDistinct(GPUIntermediateRelation &input_relation) const;
+	void MaterializeDistinctInput(GPUIntermediateRelation &input_relation, vector<shared_ptr<GPUColumn>>& aggregate_column) const;
     
 };
 } // namespace duckdb

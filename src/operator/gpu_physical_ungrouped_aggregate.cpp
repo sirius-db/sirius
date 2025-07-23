@@ -125,43 +125,66 @@ HandleAggregateExpressionCuDF(vector<shared_ptr<GPUColumn>> &aggregate_keys, GPU
 	SIRIUS_LOG_DEBUG("Handling ungrouped aggregate expression");
 	for (int agg_idx = 0; agg_idx < aggregates.size(); agg_idx++) {
 		auto& expr = aggregates[agg_idx]->Cast<BoundAggregateExpression>();
-		if (expr.function.name.compare("count") == 0 && aggregate_keys[agg_idx]->data_wrapper.data == nullptr && aggregate_keys[agg_idx]->column_length == 0) {
-			agg_mode[agg_idx] = AggregationType::COUNT;
-		} else if (expr.function.name.compare("sum") == 0 && aggregate_keys[agg_idx]->data_wrapper.data == nullptr && aggregate_keys[agg_idx]->column_length == 0) {
-			agg_mode[agg_idx] = AggregationType::SUM;
-		} else if (expr.function.name.compare("sum") == 0 && aggregate_keys[agg_idx]->data_wrapper.data != nullptr) {
-			agg_mode[agg_idx] = AggregationType::SUM;
-		} else if (expr.function.name.compare("sum_no_overflow") == 0 && aggregate_keys[agg_idx]->data_wrapper.data == nullptr && aggregate_keys[agg_idx]->column_length == 0) {
-			agg_mode[agg_idx] = AggregationType::SUM;
-		} else if (expr.function.name.compare("sum_no_overflow") == 0 && aggregate_keys[agg_idx]->data_wrapper.data != nullptr) {
-			agg_mode[agg_idx] = AggregationType::SUM;
-			if (aggregate_keys[agg_idx]->data_wrapper.type.id() == GPUColumnTypeId::INT32) {
-				SIRIUS_LOG_DEBUG("Converting INT32 to INT64 for sum_no_overflow");
-				uint64_t* temp = gpuBufferManager->customCudaMalloc<uint64_t>(aggregate_keys[agg_idx]->column_length, 0, 0);
-				convertInt32ToInt64(aggregate_keys[agg_idx]->data_wrapper.data, reinterpret_cast<uint8_t*>(temp), aggregate_keys[agg_idx]->column_length);
-				aggregate_keys[agg_idx]->data_wrapper.data = reinterpret_cast<uint8_t*>(temp);
-				aggregate_keys[agg_idx]->data_wrapper.type = GPUColumnType(GPUColumnTypeId::INT64);
-				aggregate_keys[agg_idx]->data_wrapper.num_bytes = aggregate_keys[agg_idx]->data_wrapper.num_bytes * 2;
+		if (expr.IsDistinct()) {
+			if (expr.function.name.compare("count") == 0 && aggregate_keys[agg_idx]->data_wrapper.data != nullptr) {
+				agg_mode[agg_idx] = AggregationType::COUNT_DISTINCT;
+			} else {
+				SIRIUS_LOG_DEBUG("Aggregate function (distinct)  not supported: {}", expr.function.name);
+				throw NotImplementedException("Aggregate function (distinct) not supported");
 			}
-		} else if (expr.function.name.compare("avg") == 0 && aggregate_keys[agg_idx]->data_wrapper.data != nullptr) {
-			agg_mode[agg_idx] = AggregationType::AVERAGE;
-		} else if (expr.function.name.compare("max") == 0 && aggregate_keys[agg_idx]->data_wrapper.data != nullptr) {
-			agg_mode[agg_idx] = AggregationType::MAX;
-		} else if (expr.function.name.compare("min") == 0 && aggregate_keys[agg_idx]->data_wrapper.data != nullptr) {
-			agg_mode[agg_idx] = AggregationType::MIN;
-		} else if (expr.function.name.compare("count_star") == 0 && aggregate_keys[agg_idx]->data_wrapper.data == nullptr) {
-			agg_mode[agg_idx] = AggregationType::COUNT_STAR;
-		} else if (expr.function.name.compare("count") == 0 && aggregate_keys[agg_idx]->data_wrapper.data != nullptr) {
-			agg_mode[agg_idx] = AggregationType::COUNT;
-		} else if (expr.function.name.compare("first") == 0) {
-			agg_mode[agg_idx] = AggregationType::FIRST;
 		} else {
-			SIRIUS_LOG_DEBUG("Aggregate function not supported: {}", expr.function.name);
-			throw NotImplementedException("Aggregate function not supported");
+			if (expr.function.name.compare("count") == 0 && aggregate_keys[agg_idx]->data_wrapper.data == nullptr && aggregate_keys[agg_idx]->column_length == 0) {
+				agg_mode[agg_idx] = AggregationType::COUNT;
+			} else if (expr.function.name.compare("sum") == 0 && aggregate_keys[agg_idx]->data_wrapper.data == nullptr && aggregate_keys[agg_idx]->column_length == 0) {
+				agg_mode[agg_idx] = AggregationType::SUM;
+			} else if (expr.function.name.compare("sum") == 0 && aggregate_keys[agg_idx]->data_wrapper.data != nullptr) {
+				agg_mode[agg_idx] = AggregationType::SUM;
+			} else if (expr.function.name.compare("sum_no_overflow") == 0 && aggregate_keys[agg_idx]->data_wrapper.data == nullptr && aggregate_keys[agg_idx]->column_length == 0) {
+				agg_mode[agg_idx] = AggregationType::SUM;
+			} else if (expr.function.name.compare("sum_no_overflow") == 0 && aggregate_keys[agg_idx]->data_wrapper.data != nullptr) {
+				agg_mode[agg_idx] = AggregationType::SUM;
+				if (aggregate_keys[agg_idx]->data_wrapper.type.id() == GPUColumnTypeId::INT32) {
+					SIRIUS_LOG_DEBUG("Converting INT32 to INT64 for sum_no_overflow");
+					uint64_t* temp = gpuBufferManager->customCudaMalloc<uint64_t>(aggregate_keys[agg_idx]->column_length, 0, 0);
+					convertInt32ToInt64(aggregate_keys[agg_idx]->data_wrapper.data, reinterpret_cast<uint8_t*>(temp), aggregate_keys[agg_idx]->column_length);
+					aggregate_keys[agg_idx]->data_wrapper.data = reinterpret_cast<uint8_t*>(temp);
+					aggregate_keys[agg_idx]->data_wrapper.type = GPUColumnType(GPUColumnTypeId::INT64);
+					aggregate_keys[agg_idx]->data_wrapper.num_bytes = aggregate_keys[agg_idx]->data_wrapper.num_bytes * 2;
+				}
+			} else if (expr.function.name.compare("avg") == 0 && aggregate_keys[agg_idx]->data_wrapper.data != nullptr) {
+				agg_mode[agg_idx] = AggregationType::AVERAGE;
+			} else if (expr.function.name.compare("max") == 0 && aggregate_keys[agg_idx]->data_wrapper.data != nullptr) {
+				agg_mode[agg_idx] = AggregationType::MAX;
+			} else if (expr.function.name.compare("min") == 0 && aggregate_keys[agg_idx]->data_wrapper.data != nullptr) {
+				agg_mode[agg_idx] = AggregationType::MIN;
+			} else if (expr.function.name.compare("count_star") == 0 && aggregate_keys[agg_idx]->data_wrapper.data == nullptr) {
+				agg_mode[agg_idx] = AggregationType::COUNT_STAR;
+			} else if (expr.function.name.compare("count") == 0 && aggregate_keys[agg_idx]->data_wrapper.data != nullptr) {
+				agg_mode[agg_idx] = AggregationType::COUNT;
+			} else if (expr.function.name.compare("first") == 0) {
+				agg_mode[agg_idx] = AggregationType::FIRST;
+			} else {
+				SIRIUS_LOG_DEBUG("Aggregate function (not distinct)  not supported: {}", expr.function.name);
+				throw NotImplementedException("Aggregate function (not distinct) not supported");
+			}
 		}
 	}
 
 	cudf_aggregate(aggregate_keys, aggregates.size(), agg_mode);
+
+	// Duckdb requires count(distinct) returns int64
+	for (int agg_idx = 0; agg_idx < aggregates.size(); agg_idx++) {
+		if (agg_mode[agg_idx] == AggregationType::COUNT_DISTINCT &&
+				aggregate_keys[agg_idx]->data_wrapper.type.id() != GPUColumnTypeId::INT64) {
+			auto from_cudf_column_view = aggregate_keys[agg_idx]->convertToCudfColumn();
+			auto to_cudf_type = cudf::data_type(cudf::type_id::INT64);
+			auto to_cudf_column = cudf::cast(from_cudf_column_view,
+																			 to_cudf_type,
+																		 	 rmm::cuda_stream_default,
+																	  	 GPUBufferManager::GetInstance().mr);
+			aggregate_keys[agg_idx]->setFromCudfColumn(*to_cudf_column, false, nullptr, 0, gpuBufferManager);
+		}
+	}
 }
 
 GPUPhysicalUngroupedAggregate::GPUPhysicalUngroupedAggregate(vector<LogicalType> types,
@@ -183,9 +206,13 @@ SinkResultType
 GPUPhysicalUngroupedAggregate::Sink(GPUIntermediateRelation &input_relation) const {
 	SIRIUS_LOG_DEBUG("Performing ungrouped aggregation");
 	auto start = std::chrono::high_resolution_clock::now();
+	vector<shared_ptr<GPUColumn>> aggregate_column(aggregates.size());
+	for (int aggr_idx = 0; aggr_idx < aggregates.size(); aggr_idx++) {
+		aggregate_column[aggr_idx] = nullptr;
+	}
 
 	if (distinct_data) {
-		SinkDistinct(input_relation);
+		MaterializeDistinctInput(input_relation, aggregate_column);
 	}
 
 	uint64_t column_size = 0;
@@ -205,10 +232,6 @@ GPUPhysicalUngroupedAggregate::Sink(GPUIntermediateRelation &input_relation) con
 	idx_t payload_idx = 0;
 	idx_t next_payload_idx = 0;
 	GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
-	vector<shared_ptr<GPUColumn>> aggregate_column(aggregates.size());
-	for (int aggr_idx = 0; aggr_idx < aggregates.size(); aggr_idx++) {
-		aggregate_column[aggr_idx] = nullptr;
-	}
 
 	for (idx_t aggr_idx = 0; aggr_idx < aggregates.size(); aggr_idx++) {
 		D_ASSERT(aggregates[aggr_idx]->GetExpressionClass() == ExpressionClass::BOUND_AGGREGATE);
@@ -304,7 +327,8 @@ GPUPhysicalUngroupedAggregate::GetData(GPUIntermediateRelation &output_relation)
 }
 
 void
-GPUPhysicalUngroupedAggregate::SinkDistinct(GPUIntermediateRelation &input_relation) const {
+GPUPhysicalUngroupedAggregate::MaterializeDistinctInput(
+		GPUIntermediateRelation &input_relation, vector<shared_ptr<GPUColumn>>& aggregate_column) const {
 	auto &distinct_info = *distinct_collection_info;
 	auto &distinct_indices = distinct_info.Indices();
 	auto &distinct_filter = distinct_info.Indices();
@@ -323,7 +347,7 @@ GPUPhysicalUngroupedAggregate::SinkDistinct(GPUIntermediateRelation &input_relat
 				auto &bound_ref = child->Cast<BoundReferenceExpression>();
 				SIRIUS_LOG_DEBUG("Reading aggregation column from index {} and passing it to index {} in groupby result", bound_ref.index, bound_ref.index);
 				input_relation.checkLateMaterialization(bound_ref.index);
-				aggregation_result->columns[bound_ref.index] = input_relation.columns[bound_ref.index];
+				aggregate_column[bound_ref.index] = input_relation.columns[bound_ref.index];
 			}
 		} else {
 			for (idx_t child_idx = 0; child_idx < aggregate.children.size(); child_idx++) {
@@ -331,7 +355,7 @@ GPUPhysicalUngroupedAggregate::SinkDistinct(GPUIntermediateRelation &input_relat
 				auto &bound_ref = child->Cast<BoundReferenceExpression>();
 				SIRIUS_LOG_DEBUG("Reading aggregation column from index {} and passing it to index {} in groupby result", bound_ref.index, bound_ref.index);
 				input_relation.checkLateMaterialization(bound_ref.index);
-				aggregation_result->columns[bound_ref.index] = input_relation.columns[bound_ref.index];
+				aggregate_column[bound_ref.index] = input_relation.columns[bound_ref.index];
 			}
 		}
 	}
