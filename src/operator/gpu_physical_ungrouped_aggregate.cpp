@@ -272,13 +272,6 @@ GPUPhysicalUngroupedAggregate::Sink(GPUIntermediateRelation &input_relation) con
 		}
 	}
 
-	bool string_cudf_supported = true;
-	for (int col = 0; col < aggregates.size(); col++) {
-		// if types is VARCHAR, check the number of bytes
-		if (aggregate_column[col]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
-			throw NotImplementedException("String column not supported");
-		}
-	}
 	if (aggregate_column[0]->column_length > INT32_MAX) {
 		throw NotImplementedException("Column length greater than INT32_MAX is not supported");
 	} else {
