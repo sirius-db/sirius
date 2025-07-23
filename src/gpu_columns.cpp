@@ -472,6 +472,12 @@ GPUColumn::setFromCudfScalar(cudf::scalar& cudf_scalar, GPUBufferManager* gpuBuf
         data_wrapper.type = GPUColumnType(GPUColumnTypeId::DECIMAL);
         data_wrapper.type.SetDecimalTypeInfo(Decimal::MAX_WIDTH_INT64, -typed_scalar.type().scale());
         data_wrapper.num_bytes = sizeof(int64_t);
+    } else if (scalar_type.id() == cudf::type_id::TIMESTAMP_DAYS) {
+        auto& typed_scalar = static_cast<cudf::numeric_scalar<int32_t>&>(cudf_scalar);
+        data_wrapper.data = gpuBufferManager->customCudaMalloc<uint8_t>(sizeof(int32_t), 0, 0);
+        callCudaMemcpyDeviceToDevice<uint8_t>(data_wrapper.data, reinterpret_cast<uint8_t*>(typed_scalar.data()), sizeof(int32_t), 0);
+        data_wrapper.type = GPUColumnType(GPUColumnTypeId::DATE);
+        data_wrapper.num_bytes = sizeof(int32_t);
     } else {
         throw NotImplementedException("Unsupported cudf data type in `setFromCudfScalar`: %d",
                                       static_cast<int>(scalar_type.id()));
