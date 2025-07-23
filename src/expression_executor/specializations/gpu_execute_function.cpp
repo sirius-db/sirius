@@ -330,8 +330,8 @@ struct NumericBinaryFunctionDispatcher
       {
         case cudf::type_id::INT32:
           return DoLeftScalarBinaryOp(left_value.GetValue<int32_t>(), right->view(), return_type);
-        case cudf::type_id::UINT64:
-          return DoLeftScalarBinaryOp(left_value.GetValue<uint64_t>(), right->view(), return_type);
+        case cudf::type_id::INT64:
+          return DoLeftScalarBinaryOp(left_value.GetValue<int64_t>(), right->view(), return_type);
         case cudf::type_id::FLOAT32:
           return DoLeftScalarBinaryOp(left_value.GetValue<float_t>(), right->view(), return_type);
         case cudf::type_id::FLOAT64:
@@ -373,8 +373,8 @@ struct NumericBinaryFunctionDispatcher
       {
         case cudf::type_id::INT32:
           return DoRightScalarBinaryOp(left->view(), right_value.GetValue<int32_t>(), return_type);
-        case cudf::type_id::UINT64:
-          return DoRightScalarBinaryOp(left->view(), right_value.GetValue<uint64_t>(), return_type);
+        case cudf::type_id::INT64:
+          return DoRightScalarBinaryOp(left->view(), right_value.GetValue<int64_t>(), return_type);
         case cudf::type_id::FLOAT32:
           return DoRightScalarBinaryOp(left->view(), right_value.GetValue<float_t>(), return_type);
         case cudf::type_id::FLOAT64:

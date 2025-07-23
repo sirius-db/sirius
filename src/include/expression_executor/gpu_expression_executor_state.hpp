@@ -66,7 +66,7 @@ struct GpuExpressionState
       case LogicalTypeId::INTEGER:
         return cudf::data_type(cudf::type_id::INT32);
       case LogicalTypeId::BIGINT:
-        return cudf::data_type(cudf::type_id::UINT64);
+        return cudf::data_type(cudf::type_id::INT64);
       case LogicalTypeId::FLOAT:
         return cudf::data_type(cudf::type_id::FLOAT32);
       case LogicalTypeId::DOUBLE:

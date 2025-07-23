@@ -165,8 +165,8 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundOperator
       {
         case cudf::type_id::INT32:
           return ExecuteNumericIn<int32_t>::Do(expr, left->view(), resource_ref, execution_stream);
-        case cudf::type_id::UINT64:
-          return ExecuteNumericIn<uint64_t>::Do(expr, left->view(), resource_ref, execution_stream);
+        case cudf::type_id::INT64:
+          return ExecuteNumericIn<int64_t>::Do(expr, left->view(), resource_ref, execution_stream);
         case cudf::type_id::FLOAT32:
           return ExecuteNumericIn<float_t>::Do(expr, left->view(), resource_ref, execution_stream);
         case cudf::type_id::FLOAT64:

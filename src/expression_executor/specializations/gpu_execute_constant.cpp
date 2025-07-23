@@ -82,8 +82,8 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundConstant
   {
     case cudf::type_id::INT32:
       return MakeColumnFromConstant<int32_t>::Do(expr, input_count, resource_ref, execution_stream);
-    case cudf::type_id::UINT64:
-      return MakeColumnFromConstant<uint64_t>::Do(expr, input_count, resource_ref, execution_stream);
+    case cudf::type_id::INT64:
+      return MakeColumnFromConstant<int64_t>::Do(expr, input_count, resource_ref, execution_stream);
     case cudf::type_id::FLOAT32:
       return MakeColumnFromConstant<float_t>::Do(expr, input_count, resource_ref, execution_stream);
     case cudf::type_id::FLOAT64:

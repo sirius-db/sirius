@@ -233,7 +233,7 @@ GPUColumn::convertToCudfColumn() {
     }
     cudf::size_type null_count = cudf::null_count(data_wrapper.validity_mask, 0, size);
     if (data_wrapper.type.id() == GPUColumnTypeId::INT64) {
-        auto column = cudf::column_view(cudf::data_type(cudf::type_id::UINT64), size, reinterpret_cast<void*>(data_wrapper.data), data_wrapper.validity_mask, null_count);
+        auto column = cudf::column_view(cudf::data_type(cudf::type_id::INT64), size, reinterpret_cast<void*>(data_wrapper.data), data_wrapper.validity_mask, null_count);
         return column;
     } else if (data_wrapper.type.id() == GPUColumnTypeId::INT32) {
         auto column = cudf::column_view(cudf::data_type(cudf::type_id::INT32), size, reinterpret_cast<void*>(data_wrapper.data), data_wrapper.validity_mask, null_count);
@@ -349,7 +349,7 @@ GPUColumn::setFromCudfColumn(cudf::column& cudf_column, bool _is_unique, int32_t
             callCudaMemcpyDeviceToHost<uint64_t>(temp_num_bytes, data_wrapper.offset + column_length, 1, 0);
             data_wrapper.num_bytes = temp_num_bytes[0];
         }
-    } else if (col_type == cudf::data_type(cudf::type_id::UINT64)) {
+    } else if (col_type == cudf::data_type(cudf::type_id::INT64)) {
         data_wrapper.is_string_data = false;
         data_wrapper.type = GPUColumnType(GPUColumnTypeId::INT64);
         data_wrapper.num_bytes = col_size * data_wrapper.getColumnTypeSize();
@@ -421,7 +421,7 @@ void
 GPUColumn::setFromCudfScalar(cudf::scalar& cudf_scalar, GPUBufferManager* gpuBufferManager) {
     SIRIUS_LOG_DEBUG("Set a GPUColumn from cudf::scalar");
     cudf::data_type scalar_type = cudf_scalar.type();
-    if (scalar_type == cudf::data_type(cudf::type_id::UINT64)) {
+    if (scalar_type == cudf::data_type(cudf::type_id::INT64)) {
         auto& typed_scalar = static_cast<cudf::numeric_scalar<uint64_t>&>(cudf_scalar);
         data_wrapper.data = gpuBufferManager->customCudaMalloc<uint8_t>(sizeof(uint64_t), 0, 0);
         callCudaMemcpyDeviceToDevice<uint8_t>(data_wrapper.data, reinterpret_cast<uint8_t*>(typed_scalar.data()), sizeof(uint64_t), 0);
