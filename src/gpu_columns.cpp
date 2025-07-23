@@ -238,6 +238,9 @@ GPUColumn::convertToCudfColumn() {
     } else if (data_wrapper.type.id() == GPUColumnTypeId::INT32) {
         auto column = cudf::column_view(cudf::data_type(cudf::type_id::INT32), size, reinterpret_cast<void*>(data_wrapper.data), data_wrapper.validity_mask, null_count);
         return column;
+    } else if (data_wrapper.type.id() == GPUColumnTypeId::INT16) {
+        auto column = cudf::column_view(cudf::data_type(cudf::type_id::INT16), size, reinterpret_cast<void*>(data_wrapper.data), data_wrapper.validity_mask, null_count);
+        return column;
     } else if (data_wrapper.type.id() == GPUColumnTypeId::FLOAT32) {
         auto column = cudf::column_view(cudf::data_type(cudf::type_id::FLOAT32), size, reinterpret_cast<void*>(data_wrapper.data), data_wrapper.validity_mask, null_count);
         return column;
@@ -430,6 +433,12 @@ GPUColumn::setFromCudfScalar(cudf::scalar& cudf_scalar, GPUBufferManager* gpuBuf
         callCudaMemcpyDeviceToDevice<uint8_t>(data_wrapper.data, reinterpret_cast<uint8_t*>(typed_scalar.data()), sizeof(int32_t), 0);
         data_wrapper.type = GPUColumnType(GPUColumnTypeId::INT32);
         data_wrapper.num_bytes = sizeof(int32_t);
+    } else if (scalar_type == cudf::data_type(cudf::type_id::INT16)) {
+        auto& typed_scalar = static_cast<cudf::numeric_scalar<int16_t>&>(cudf_scalar);
+        data_wrapper.data = gpuBufferManager->customCudaMalloc<uint8_t>(sizeof(int16_t), 0, 0);
+        callCudaMemcpyDeviceToDevice<uint8_t>(data_wrapper.data, reinterpret_cast<uint8_t*>(typed_scalar.data()), sizeof(int16_t), 0);
+        data_wrapper.type = GPUColumnType(GPUColumnTypeId::INT16);
+        data_wrapper.num_bytes = sizeof(int16_t);
     } else if (scalar_type == cudf::data_type(cudf::type_id::FLOAT32)) {
         auto& typed_scalar = static_cast<cudf::numeric_scalar<float>&>(cudf_scalar);
         data_wrapper.data = gpuBufferManager->customCudaMalloc<uint8_t>(sizeof(float), 0, 0);

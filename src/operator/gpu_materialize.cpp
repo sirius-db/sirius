@@ -74,6 +74,8 @@ ResolveTypeMaterializeString(shared_ptr<GPUColumn> column, GPUBufferManager* gpu
 shared_ptr<GPUColumn> 
 HandleMaterializeExpression(shared_ptr<GPUColumn> column, GPUBufferManager* gpuBufferManager) {
     switch(column->data_wrapper.type.id()) {
+        case GPUColumnTypeId::INT16:
+            return ResolveTypeMaterializeExpression<int16_t>(column, gpuBufferManager);
         case GPUColumnTypeId::INT32:
         case GPUColumnTypeId::DATE:
             return ResolveTypeMaterializeExpression<int>(column, gpuBufferManager);

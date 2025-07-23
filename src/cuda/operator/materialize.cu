@@ -403,6 +403,8 @@ template
 void materializeWithoutNull<__int128_t>(__int128_t *a, __int128_t*& result, uint64_t *row_ids, uint64_t result_len);
 
 template
+void materializeExpression<int16_t>(int16_t *a, int16_t*& result, uint64_t *row_ids, uint64_t result_len, cudf::bitmask_type* mask, cudf::bitmask_type* &out_mask);
+template
 void materializeExpression<int>(int *a, int*& result, uint64_t *row_ids, uint64_t result_len, cudf::bitmask_type* mask, cudf::bitmask_type* &out_mask);
 template
 void materializeExpression<uint64_t>(uint64_t *a, uint64_t*& result, uint64_t *row_ids, uint64_t result_len, cudf::bitmask_type* mask, cudf::bitmask_type* &out_mask);

@@ -28,6 +28,9 @@
 
 namespace duckdb {
 
+template int16_t*
+GPUBufferManager::customCudaMalloc<int16_t>(size_t size, int gpu, bool caching);
+
 template int*
 GPUBufferManager::customCudaMalloc<int>(size_t size, int gpu, bool caching);
 

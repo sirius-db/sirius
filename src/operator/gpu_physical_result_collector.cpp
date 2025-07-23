@@ -162,6 +162,10 @@ GPUPhysicalMaterializedCollector::FinalMaterialize(GPUIntermediateRelation input
 		FinalMaterializeInternal<int>(input_relation, output_relation, col);
 		size_bytes = output_relation.columns[col]->column_length * sizeof(int);
 		break;
+	case GPUColumnTypeId::INT16:
+		FinalMaterializeInternal<int16_t>(input_relation, output_relation, col);
+		size_bytes = output_relation.columns[col]->column_length * sizeof(int16_t);
+		break;
 	case GPUColumnTypeId::FLOAT64:
 		FinalMaterializeInternal<double>(input_relation, output_relation, col);
 		size_bytes = output_relation.columns[col]->column_length * sizeof(double);
@@ -330,6 +334,12 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 					convertInt32ToInt128(materialized_relation.columns[col]->data_wrapper.data, temp_int128, materialized_relation.columns[col]->column_length);
 					host_data[col] = gpuBufferManager->customCudaHostAlloc<uint8_t>(size_bytes * 4);
 					callCudaMemcpyDeviceToHost<uint8_t>(host_data[col], temp_int128, size_bytes * 4, 0);
+				} else if (materialized_relation.columns[col]->data_wrapper.type.id() == GPUColumnTypeId::INT16) {
+					SIRIUS_LOG_DEBUG("Converting INT16 to INT128 for column {}", col);
+					uint8_t* temp_int128 = gpuBufferManager->customCudaMalloc<uint8_t>(size_bytes * 8, 0, 0);
+					convertInt16ToInt128(materialized_relation.columns[col]->data_wrapper.data, temp_int128, materialized_relation.columns[col]->column_length);
+					host_data[col] = gpuBufferManager->customCudaHostAlloc<uint8_t>(size_bytes * 8);
+					callCudaMemcpyDeviceToHost<uint8_t>(host_data[col], temp_int128, size_bytes * 8, 0);
 				} else if (materialized_relation.columns[col]->data_wrapper.type.id() == GPUColumnTypeId::DECIMAL) {
 					if (types[col].id() != LogicalTypeId::DECIMAL) {
 						throw InternalException("Destiation type is not decimal when performing INT128 (physical type) conversion for decimal,"
