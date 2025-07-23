@@ -209,6 +209,8 @@ GPUPhysicalMaterializedCollector::FinalMaterialize(GPUIntermediateRelation input
 
 LogicalType ColumnTypeToLogicalType(const GPUColumnType& type) {
 	switch (type.id()) {
+		case GPUColumnTypeId::INT16:
+			return LogicalType::SMALLINT;
 		case GPUColumnTypeId::INT32:
 			return LogicalType::INTEGER;
 		case GPUColumnTypeId::INT64:
@@ -241,6 +243,8 @@ LogicalType ColumnTypeToLogicalType(const GPUColumnType& type) {
 Vector rawDataToVector(uint8_t* host_data, size_t vector_offset, const GPUColumnType& type) {
 	size_t sizeof_type;
 	switch (type.id()) {
+		case GPUColumnTypeId::INT16:
+			sizeof_type = sizeof(int16_t); break;
 		case GPUColumnTypeId::INT32:
 		case GPUColumnTypeId::DATE:
 			sizeof_type = sizeof(int); break;
