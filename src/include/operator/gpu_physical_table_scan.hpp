@@ -26,6 +26,7 @@
 namespace duckdb {
 
 enum ScanDataType {
+	INT16,
 	INT32,
 	INT64,
 	FLOAT32,

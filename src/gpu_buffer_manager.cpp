@@ -712,8 +712,9 @@ GPUBufferManager::checkIfColumnCached(string table_name, string column_name) {
     if (table_it == tables.end()) {
         return false;
     }
-    auto column_it = find(tables[table_name]->column_names.begin(), tables[table_name]->column_names.end(), up_column_name);
-    if (column_it == tables[up_table_name]->column_names.end()) {
+    const auto& table = table_it->second;
+    auto column_it = find(table->column_names.begin(), table->column_names.end(), up_column_name);
+    if (column_it == table->column_names.end()) {
         return false;
     }
     return true;

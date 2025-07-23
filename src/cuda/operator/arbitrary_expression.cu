@@ -170,7 +170,16 @@ __global__ void table_scan_expression(uint8_t **col, uint64_t** offset, uint32_t
             if (threadIdx.x + ITEM * B < num_tile_items) {
 
                 uint64_t item_idx = tile_offset + threadIdx.x + ITEM * B;
-                if (data_type[expr] == INT32 || data_type[expr] == DATE || data_type[expr] == DECIMAL32) {
+                if (data_type[expr] == INT16) {
+                    int16_t item = (reinterpret_cast<int16_t*>(col[expr]))[item_idx];
+
+                    uint64_t start_constant_offset = constant_offset[expr]; 
+                    int16_t constant;
+                    memcpy(&constant, constant_compare + start_constant_offset, sizeof(int16_t));
+
+                    selection_flags[ITEM] = device_comparison<int16_t>(item, constant, compare_mode[expr]);
+
+                } else if (data_type[expr] == INT32 || data_type[expr] == DATE || data_type[expr] == DECIMAL32) {
                     int item = (reinterpret_cast<int*>(col[expr]))[item_idx];
 
                     uint64_t start_constant_offset = constant_offset[expr]; 

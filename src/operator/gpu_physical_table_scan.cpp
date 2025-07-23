@@ -253,7 +253,11 @@ void HandleArbitraryConstantExpression(vector<shared_ptr<GPUColumn>> &column, ui
     }
 
     switch(column[expr]->data_wrapper.type.id()) {
-      case GPUColumnTypeId::INT32: {
+      case GPUColumnTypeId::INT16: {
+        total_bytes += sizeof(int16_t);
+        data_type[expr] = INT16;
+        break;
+      } case GPUColumnTypeId::INT32: {
         total_bytes += sizeof(int);
         data_type[expr] = INT32;
         break;
@@ -318,6 +322,13 @@ void HandleArbitraryConstantExpression(vector<shared_ptr<GPUColumn>> &column, ui
     }
 
     switch(column[expr]->data_wrapper.type.id()) {
+      case GPUColumnTypeId::INT16: {
+        int temp = filter_constant[expr]->constant.GetValue<int16_t>();
+        memcpy(constant_compare + init_offset, &temp, sizeof(int16_t));
+        constant_offset[expr] = init_offset;
+        init_offset += sizeof(int16_t);
+        break;
+      }
       case GPUColumnTypeId::INT32:
       case GPUColumnTypeId::DATE: {
         int temp = filter_constant[expr]->constant.GetValue<int>();

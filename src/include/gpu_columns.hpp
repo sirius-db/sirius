@@ -39,6 +39,7 @@ cudf::bitmask_type* createNullMask(size_t size, cudf::mask_state state = cudf::m
 
 enum class GPUColumnTypeId {
     INVALID = 0,
+    INT16,
     INT32,
     INT64,
     FLOAT32,
@@ -87,6 +88,8 @@ private:
 
 inline GPUColumnType convertLogicalTypeToColumnType(LogicalType type) {
     switch (type.id()) {
+        case LogicalTypeId::SMALLINT:
+            return GPUColumnType(GPUColumnTypeId::INT16);
         case LogicalTypeId::INTEGER:
             return GPUColumnType(GPUColumnTypeId::INT32);
         case LogicalTypeId::BIGINT:
