@@ -157,10 +157,10 @@ public:
 // 	//! Sink the distinct aggregates for a single grouping
 	// void SinkDistinctGrouping(ExecutionContext &context, GPUIntermediateRelation &input_relation, OperatorSinkInput &input,
 	//                           idx_t grouping_idx) const;
-	void SinkDistinctGrouping(GPUIntermediateRelation &input_relation, idx_t grouping_idx) const;
+	// void SinkDistinctGrouping(GPUIntermediateRelation &input_relation, idx_t grouping_idx) const;
 // 	//! Sink the distinct aggregates
 	// void SinkDistinct(ExecutionContext &context, GPUIntermediateRelation& input_relation, OperatorSinkInput &input) const;
-	void SinkDistinct(GPUIntermediateRelation &input_relation) const;
+	// void SinkDistinct(GPUIntermediateRelation &input_relation) const;
 // 	//! Create groups in the main ht for groups that would otherwise get filtered out completely
 // 	SinkResultType SinkGroupsOnly(ExecutionContext &context, GlobalSinkState &state, LocalSinkState &lstate,
 // 	                              DataChunk &input) const;

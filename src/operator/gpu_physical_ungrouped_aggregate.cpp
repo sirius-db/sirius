@@ -164,7 +164,7 @@ HandleAggregateExpressionCuDF(vector<shared_ptr<GPUColumn>> &aggregate_keys, GPU
 			} else if (expr.function.name.compare("first") == 0) {
 				agg_mode[agg_idx] = AggregationType::FIRST;
 			} else {
-				SIRIUS_LOG_DEBUG("Aggregate function (not distinct)  not supported: {}", expr.function.name);
+				SIRIUS_LOG_DEBUG("Aggregate function (not distinct) not supported: {}", expr.function.name);
 				throw NotImplementedException("Aggregate function (not distinct) not supported");
 			}
 		}
