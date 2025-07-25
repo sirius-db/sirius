@@ -89,7 +89,11 @@ DataWrapper::getColumnTypeSize() const {
         case GPUColumnTypeId::DATE:
             return sizeof(int);
         case GPUColumnTypeId::INT64:
-            return sizeof(uint64_t);
+        case GPUColumnTypeId::TIMESTAMP_SEC:
+        case GPUColumnTypeId::TIMESTAMP_MS:
+        case GPUColumnTypeId::TIMESTAMP_US:
+        case GPUColumnTypeId::TIMESTAMP_NS:
+            return sizeof(int64_t);
         case GPUColumnTypeId::INT128:
             return sizeof(__uint128_t);
         case GPUColumnTypeId::FLOAT32:
@@ -252,6 +256,18 @@ GPUColumn::convertToCudfColumn() {
         return column;
     } else if (data_wrapper.type.id() == GPUColumnTypeId::DATE) {
         auto column = cudf::column_view(cudf::data_type(cudf::type_id::TIMESTAMP_DAYS), size, reinterpret_cast<void*>(data_wrapper.data), data_wrapper.validity_mask, null_count);
+        return column;
+    } else if (data_wrapper.type.id() == GPUColumnTypeId::TIMESTAMP_SEC) {
+        auto column = cudf::column_view(cudf::data_type(cudf::type_id::TIMESTAMP_SECONDS), size, reinterpret_cast<void*>(data_wrapper.data), data_wrapper.validity_mask, null_count);
+        return column;
+    } else if (data_wrapper.type.id() == GPUColumnTypeId::TIMESTAMP_MS) {
+        auto column = cudf::column_view(cudf::data_type(cudf::type_id::TIMESTAMP_MILLISECONDS), size, reinterpret_cast<void*>(data_wrapper.data), data_wrapper.validity_mask, null_count);
+        return column;
+    } else if (data_wrapper.type.id() == GPUColumnTypeId::TIMESTAMP_US) {
+        auto column = cudf::column_view(cudf::data_type(cudf::type_id::TIMESTAMP_MICROSECONDS), size, reinterpret_cast<void*>(data_wrapper.data), data_wrapper.validity_mask, null_count);
+        return column;
+    } else if (data_wrapper.type.id() == GPUColumnTypeId::TIMESTAMP_NS) {
+        auto column = cudf::column_view(cudf::data_type(cudf::type_id::TIMESTAMP_NANOSECONDS), size, reinterpret_cast<void*>(data_wrapper.data), data_wrapper.validity_mask, null_count);
         return column;
     } else if (data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
         //convert offset to int32

@@ -75,6 +75,14 @@ struct GpuExpressionState
         return cudf::data_type(cudf::type_id::BOOL8);
       case LogicalTypeId::DATE:
         return cudf::data_type(cudf::type_id::TIMESTAMP_DAYS);
+      case LogicalTypeId::TIMESTAMP_SEC:
+        return cudf::data_type(cudf::type_id::TIMESTAMP_SECONDS);
+      case LogicalTypeId::TIMESTAMP_MS:
+        return cudf::data_type(cudf::type_id::TIMESTAMP_MILLISECONDS);
+      case LogicalTypeId::TIMESTAMP:
+        return cudf::data_type(cudf::type_id::TIMESTAMP_MICROSECONDS);
+      case LogicalTypeId::TIMESTAMP_NS:
+        return cudf::data_type(cudf::type_id::TIMESTAMP_NANOSECONDS);
       case LogicalTypeId::VARCHAR:
         return cudf::data_type(cudf::type_id::STRING);
       case LogicalTypeId::DECIMAL: {

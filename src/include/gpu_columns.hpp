@@ -46,6 +46,10 @@ enum class GPUColumnTypeId {
     FLOAT64,
     BOOLEAN,
     DATE,
+    TIMESTAMP_SEC,
+    TIMESTAMP_MS,
+    TIMESTAMP_US,
+    TIMESTAMP_NS,
     VARCHAR,
     INT128,
     DECIMAL
@@ -102,6 +106,14 @@ inline GPUColumnType convertLogicalTypeToColumnType(LogicalType type) {
             return GPUColumnType(GPUColumnTypeId::BOOLEAN);
         case LogicalTypeId::DATE:
             return GPUColumnType(GPUColumnTypeId::DATE);
+        case LogicalTypeId::TIMESTAMP_SEC:
+            return GPUColumnType(GPUColumnTypeId::TIMESTAMP_SEC);
+        case LogicalTypeId::TIMESTAMP_MS:
+            return GPUColumnType(GPUColumnTypeId::TIMESTAMP_MS);
+        case LogicalTypeId::TIMESTAMP:
+            return GPUColumnType(GPUColumnTypeId::TIMESTAMP_US);
+        case LogicalTypeId::TIMESTAMP_NS:
+            return GPUColumnType(GPUColumnTypeId::TIMESTAMP_NS);
         case LogicalTypeId::VARCHAR:
             return GPUColumnType(GPUColumnTypeId::VARCHAR);
         case LogicalTypeId::DECIMAL: {

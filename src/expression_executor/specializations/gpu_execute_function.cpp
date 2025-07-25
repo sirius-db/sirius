@@ -56,6 +56,11 @@ namespace sirius
 #define YEAR_FUNC_STR "year"
 #define MONTH_FUNC_STR "month"
 #define DAY_FUNC_STR "day"
+#define HOUR_FUNC_STR "hour"
+#define MINUTE_FUNC_STR "minute"
+#define SECOND_FUNC_STR "second"
+#define MILLISECOND_FUNC_STR "millisecond"
+#define MICROSECOND_FUNC_STR "microsecond"
 #define ERROR_FUNC_STR "error"
 
 #define SPLIT_DELIMITER "%"
@@ -562,6 +567,31 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundFunction
   else if (func_str == DAY_FUNC_STR)
   {
     DatetimeExtractFunctionDispatcher<cudf::datetime::datetime_component::DAY> dispatcher(*this);
+    return dispatcher(expr, state);
+  }
+  else if (func_str == HOUR_FUNC_STR)
+  {
+    DatetimeExtractFunctionDispatcher<cudf::datetime::datetime_component::HOUR> dispatcher(*this);
+    return dispatcher(expr, state);
+  }
+  else if (func_str == MINUTE_FUNC_STR)
+  {
+    DatetimeExtractFunctionDispatcher<cudf::datetime::datetime_component::MINUTE> dispatcher(*this);
+    return dispatcher(expr, state);
+  }
+  else if (func_str == SECOND_FUNC_STR)
+  {
+    DatetimeExtractFunctionDispatcher<cudf::datetime::datetime_component::SECOND> dispatcher(*this);
+    return dispatcher(expr, state);
+  }
+  else if (func_str == MILLISECOND_FUNC_STR)
+  {
+    DatetimeExtractFunctionDispatcher<cudf::datetime::datetime_component::MILLISECOND> dispatcher(*this);
+    return dispatcher(expr, state);
+  }
+  else if (func_str == MICROSECOND_FUNC_STR)
+  {
+    DatetimeExtractFunctionDispatcher<cudf::datetime::datetime_component::MICROSECOND> dispatcher(*this);
     return dispatcher(expr, state);
   }
 
