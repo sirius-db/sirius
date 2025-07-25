@@ -108,11 +108,11 @@ SinkResultType GPUPhysicalTopN::Sink(GPUIntermediateRelation& input_relation) co
   	HandleTopN(order_by_keys, projection_columns, orders, types.size());
 
 	for (int col = 0; col < types.size(); col++) {
-		if (sort_result->columns[col] == nullptr && projection_columns[col]->column_length > 0 && projection_columns[col]->data_wrapper.data != nullptr) {
+		if (sort_result->columns[col] == nullptr) {
 			sort_result->columns[col] = projection_columns[col];
 			sort_result->columns[col]->row_ids = nullptr;
 			sort_result->columns[col]->row_id_count = 0;
-		} else if (sort_result->columns[col] != nullptr && projection_columns[col]->column_length > 0 && projection_columns[col]->data_wrapper.data != nullptr) {
+		} else {
 			throw NotImplementedException("Order by with partially NULL values is not supported");
 		}
 	}

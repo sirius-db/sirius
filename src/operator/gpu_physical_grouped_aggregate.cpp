@@ -314,8 +314,8 @@ HandleGroupByAggregateCuDF(vector<shared_ptr<GPUColumn>> &group_by_keys, vector<
 			if (expr.function.name.compare("count") == 0 && aggregate_keys[agg_idx]->data_wrapper.data != nullptr) {
 				agg_mode[agg_idx] = AggregationType::COUNT_DISTINCT;
 			} else {
-				SIRIUS_LOG_DEBUG("Gropued aggregate function (distinct)  not supported: {}", expr.function.name);
-				throw NotImplementedException("Gropued aggregate function (distinct) not supported");
+				SIRIUS_LOG_DEBUG("Grouped aggregate function (distinct)  not supported: {}", expr.function.name);
+				throw NotImplementedException("Grouped aggregate function (distinct) not supported: %s", expr.function.name);
 			}
 		} else {
 			if (expr.function.name.compare("count") == 0 && aggregate_keys[agg_idx]->data_wrapper.data == nullptr && aggregate_keys[agg_idx]->column_length == 0) {
@@ -348,7 +348,7 @@ HandleGroupByAggregateCuDF(vector<shared_ptr<GPUColumn>> &group_by_keys, vector<
 				agg_mode[agg_idx] = AggregationType::COUNT;
 			} else {
 				SIRIUS_LOG_DEBUG("Grouped aggregate function (not distinct) not supported: {}", expr.function.name);
-				throw NotImplementedException("Grouped aggregate (not distinct) function not supported");
+				throw NotImplementedException("Grouped aggregate (not distinct) function not supported: %s", expr.function.name);
 			}
 		}
 	}
@@ -690,23 +690,26 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 		aggr_idx++;
 	}
 
-	// bool can_use_sirius_impl = CheckGroupKeyTypesForSiriusImpl(group_by_column);
-	if (aggregates.size() == 0) {
-		// if (can_use_sirius_impl) {
-		// 	HandleDuplicateElimination(group_by_column, gpuBufferManager, num_group_keys);
-		// } else {
-			// HandleGroupByAggregateCuDF(group_by_column, aggregate_column, gpuBufferManager, aggregates, num_group_keys);
-		// }
-		if (group_by_column[0]->column_length > INT32_MAX) {
-			throw NotImplementedException("Group by column length or aggregate column length is too large for CuDF");
+	// Execute only if input is not empty
+	if (column_size > 0) {
+		// bool can_use_sirius_impl = CheckGroupKeyTypesForSiriusImpl(group_by_column);
+		if (aggregates.size() == 0) {
+			// if (can_use_sirius_impl) {
+			// 	HandleDuplicateElimination(group_by_column, gpuBufferManager, num_group_keys);
+			// } else {
+				// HandleGroupByAggregateCuDF(group_by_column, aggregate_column, gpuBufferManager, aggregates, num_group_keys);
+			// }
+			if (group_by_column[0]->column_length > INT32_MAX) {
+				throw NotImplementedException("Group by column length or aggregate column length is too large for CuDF");
+			} else {
+				HandleDuplicateEliminationCuDF(group_by_column, gpuBufferManager, num_group_keys);
+			}
 		} else {
-			HandleDuplicateEliminationCuDF(group_by_column, gpuBufferManager, num_group_keys);
-		}
-	} else {
-		if (group_by_column[0]->column_length > INT32_MAX || aggregate_column[0]->column_length > INT32_MAX) {
-			throw NotImplementedException("Group by column length or aggregate column length is too large for CuDF");
-		} else {
-			HandleGroupByAggregateCuDF(group_by_column, aggregate_column, gpuBufferManager, aggregates, num_group_keys);
+			if (group_by_column[0]->column_length > INT32_MAX || aggregate_column[0]->column_length > INT32_MAX) {
+				throw NotImplementedException("Group by column length or aggregate column length is too large for CuDF");
+			} else {
+				HandleGroupByAggregateCuDF(group_by_column, aggregate_column, gpuBufferManager, aggregates, num_group_keys);
+			}
 		}
 	}
 	
