@@ -325,6 +325,7 @@ GPUColumn::setFromCudfColumn(cudf::column& cudf_column, bool _is_unique, int32_t
     SIRIUS_LOG_DEBUG("Set a GPUColumn from cudf::column");
     cudf::data_type col_type = cudf_column.type();
     cudf::size_type col_size = cudf_column.size();
+    bool nullable = cudf_column.nullable();
     cudf::column::contents cont = cudf_column.release();
     gpuBufferManager->rmm_stored_buffers.push_back(std::move(cont.data));
 
@@ -334,7 +335,7 @@ GPUColumn::setFromCudfColumn(cudf::column& cudf_column, bool _is_unique, int32_t
     data_wrapper.mask_bytes = getMaskBytesSize(column_length);
     is_unique = _is_unique;
 
-    if (cont.null_mask->data() == nullptr || cudf_column.nullable() == false) {
+    if (cont.null_mask->data() == nullptr || nullable == false) {
         data_wrapper.validity_mask = createNullMask(column_length);
     } else {
         gpuBufferManager->rmm_stored_buffers.push_back(std::move(cont.null_mask));

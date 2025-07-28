@@ -484,7 +484,6 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 		// Move to the next chunk
 		remaining -= chunk_cardinality; read_index += chunk_cardinality;
 	}
-	printf("BBBBB num_rows=%zu\n", result_collection->num_rows);
 	auto chunk_end_time = std::chrono::high_resolution_clock::now();
 	auto chunking_duration_ms = std::chrono::duration_cast<std::chrono::microseconds>(chunk_end_time - chunk_start_time).count()/1000.0;
 	SIRIUS_LOG_DEBUG("Result Collector Chunking Time: {:.2f} ms", chunking_duration_ms);
