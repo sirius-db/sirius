@@ -227,6 +227,14 @@ LogicalType ColumnTypeToLogicalType(const GPUColumnType& type) {
 			return LogicalType::BOOLEAN;
 		case GPUColumnTypeId::DATE:
 			return LogicalType::DATE;
+		case GPUColumnTypeId::TIMESTAMP_SEC:
+			return LogicalType::TIMESTAMP_S;
+		case GPUColumnTypeId::TIMESTAMP_MS:
+			return LogicalType::TIMESTAMP_MS;
+		case GPUColumnTypeId::TIMESTAMP_US:
+			return LogicalType::TIMESTAMP;
+		case GPUColumnTypeId::TIMESTAMP_NS:
+			return LogicalType::TIMESTAMP_NS;
 		case GPUColumnTypeId::VARCHAR:
 			return LogicalType::VARCHAR;
 		case GPUColumnTypeId::INT128:
@@ -253,7 +261,11 @@ Vector rawDataToVector(uint8_t* host_data, size_t vector_offset, const GPUColumn
 		case GPUColumnTypeId::DATE:
 			sizeof_type = sizeof(int); break;
 		case GPUColumnTypeId::INT64:
-			sizeof_type = sizeof(uint64_t); break;
+		case GPUColumnTypeId::TIMESTAMP_SEC:
+		case GPUColumnTypeId::TIMESTAMP_MS:
+		case GPUColumnTypeId::TIMESTAMP_US:
+		case GPUColumnTypeId::TIMESTAMP_NS:
+			sizeof_type = sizeof(int64_t); break;
 		case GPUColumnTypeId::FLOAT32:
 			sizeof_type = sizeof(float); break;
 		case GPUColumnTypeId::FLOAT64:
@@ -261,7 +273,7 @@ Vector rawDataToVector(uint8_t* host_data, size_t vector_offset, const GPUColumn
 		case GPUColumnTypeId::BOOLEAN:
 			sizeof_type = sizeof(uint8_t); break;
 		case GPUColumnTypeId::INT128:
-			sizeof_type = 2 * sizeof(uint64_t); break;
+			sizeof_type = 2 * sizeof(int64_t); break;
 		case GPUColumnTypeId::DECIMAL: {
 			GPUDecimalTypeInfo* decimal_type_info = type.GetDecimalTypeInfo();
 			if (decimal_type_info == nullptr) {
@@ -321,8 +333,12 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 	for (int col = 0; col < input_relation.columns.size(); col++) {
 		auto col_materialize_start_time = std::chrono::high_resolution_clock::now();
 
-		// TODO: Need to fix this for the future, but for now, we will just return when there is null column
-		if (input_relation.columns[col]->data_wrapper.data == nullptr) return SinkResultType::FINISHED;
+		// Just return when there is an empty column
+		size_t actual_column_len = input_relation.columns[col]->row_ids ?
+			input_relation.columns[col]->row_id_count : input_relation.columns[col]->column_length;
+		if (actual_column_len == 0) {
+			return SinkResultType::FINISHED;
+		}
 		// Final materialization
 		size_bytes = FinalMaterialize(input_relation, materialized_relation, col);
 
@@ -468,6 +484,7 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 		// Move to the next chunk
 		remaining -= chunk_cardinality; read_index += chunk_cardinality;
 	}
+	printf("BBBBB num_rows=%zu\n", result_collection->num_rows);
 	auto chunk_end_time = std::chrono::high_resolution_clock::now();
 	auto chunking_duration_ms = std::chrono::duration_cast<std::chrono::microseconds>(chunk_end_time - chunk_start_time).count()/1000.0;
 	SIRIUS_LOG_DEBUG("Result Collector Chunking Time: {:.2f} ms", chunking_duration_ms);
