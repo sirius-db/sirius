@@ -108,6 +108,9 @@ public:
 	vector<idx_t> scanned_ids;
 
 	unique_ptr<TableFilterSet> fake_table_filters;
+
+	//! Whether it's required to generate a seperate row id column (e.g., in some select *)
+	bool gen_row_id_column;
 public:
 	// string GetName() const override;
 	// string ParamsToString() const override;

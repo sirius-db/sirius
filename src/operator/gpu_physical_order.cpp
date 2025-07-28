@@ -189,7 +189,8 @@ GPUPhysicalOrder::Sink(GPUIntermediateRelation &input_relation) const {
     HandleOrderBy(order_by_keys, projection_columns, orders, projections.size());
 
     for (int col = 0; col < projections.size(); col++) {
-      if (sort_result->columns[col] == nullptr && projection_columns[col]->column_length > 0 && projection_columns[col]->data_wrapper.data != nullptr) {
+      if (sort_result->columns[col] == nullptr || sort_result->columns[col]->column_length == 0 ||
+          sort_result->columns[col]->data_wrapper.data == nullptr) {
         sort_result->columns[col] = projection_columns[col];
         sort_result->columns[col]->row_ids = nullptr;
         sort_result->columns[col]->row_id_count = 0;

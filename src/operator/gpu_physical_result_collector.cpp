@@ -154,8 +154,12 @@ GPUPhysicalMaterializedCollector::FinalMaterialize(GPUIntermediateRelation input
 	
 	switch (input_relation.columns[col]->data_wrapper.type.id()) {
 	case GPUColumnTypeId::INT64:
-		FinalMaterializeInternal<uint64_t>(input_relation, output_relation, col);
-		size_bytes = output_relation.columns[col]->column_length * sizeof(uint64_t);
+	case GPUColumnTypeId::TIMESTAMP_SEC:
+	case GPUColumnTypeId::TIMESTAMP_MS:
+	case GPUColumnTypeId::TIMESTAMP_US:
+	case GPUColumnTypeId::TIMESTAMP_NS:
+		FinalMaterializeInternal<int64_t>(input_relation, output_relation, col);
+		size_bytes = output_relation.columns[col]->column_length * sizeof(int64_t);
 		break;
 	case GPUColumnTypeId::INT32:
 	case GPUColumnTypeId::DATE:

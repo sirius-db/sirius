@@ -80,7 +80,11 @@ HandleMaterializeExpression(shared_ptr<GPUColumn> column, GPUBufferManager* gpuB
         case GPUColumnTypeId::DATE:
             return ResolveTypeMaterializeExpression<int>(column, gpuBufferManager);
         case GPUColumnTypeId::INT64:
-            return ResolveTypeMaterializeExpression<uint64_t>(column, gpuBufferManager);
+        case GPUColumnTypeId::TIMESTAMP_SEC:
+        case GPUColumnTypeId::TIMESTAMP_MS:
+        case GPUColumnTypeId::TIMESTAMP_US:
+        case GPUColumnTypeId::TIMESTAMP_NS:
+            return ResolveTypeMaterializeExpression<int64_t>(column, gpuBufferManager);
         case GPUColumnTypeId::FLOAT32:
             return ResolveTypeMaterializeExpression<float>(column, gpuBufferManager);
         case GPUColumnTypeId::FLOAT64:

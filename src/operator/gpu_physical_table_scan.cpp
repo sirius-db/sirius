@@ -23,6 +23,7 @@
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "gpu_columns.hpp"
 #include "gpu_materialize.hpp"
+#include "utils.hpp"
 #include "log/logging.hpp"
 
 namespace duckdb {
@@ -41,12 +42,13 @@ GPUPhysicalTableScan::GPUPhysicalTableScan(vector<LogicalType> types, TableFunct
         : GPUPhysicalOperator(PhysicalOperatorType::TABLE_SCAN, std::move(types), estimated_cardinality),
         function(std::move(function_p)), bind_data(std::move(bind_data_p)), returned_types(std::move(returned_types_p)),
         column_ids(std::move(column_ids_p)), projection_ids(std::move(projection_ids_p)), names(std::move(names_p)),
-        table_filters(std::move(table_filters_p)), extra_info(extra_info), parameters(std::move(parameters_p)) {
+        table_filters(std::move(table_filters_p)), extra_info(extra_info), parameters(std::move(parameters_p)),
+        gen_row_id_column(column_ids.back().GetPrimaryIndex() == DConstants::INVALID_INDEX) {
 
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
     column_size = gpuBufferManager->customCudaHostAlloc<uint64_t>(column_ids.size());
     mask_size = gpuBufferManager->customCudaHostAlloc<uint64_t>(column_ids.size());
-    for (int col = 0; col < column_ids.size(); col++) {
+    for (int col = 0; col < column_ids.size() - gen_row_id_column; col++) {
       column_size[col] = 0;
       mask_size[col] = 0;
       scanned_types.push_back(returned_types[column_ids[col].GetPrimaryIndex()]);
@@ -471,7 +473,7 @@ GPUPhysicalTableScan::GetDataDuckDB(ExecutionContext &exec_context) {
     auto &catalog_table = Catalog::GetCatalog(exec_context.client, INVALID_CATALOG);
 
     bool all_cached = true;
-    for (int col = 0; col < column_ids.size(); col++) {
+    for (int col = 0; col < column_ids.size() - gen_row_id_column; col++) {
         already_cached[col] = gpuBufferManager->checkIfColumnCached(table_name, names[column_ids[col].GetPrimaryIndex()]);
         if (!already_cached[col]) {
           all_cached = false;
@@ -503,7 +505,7 @@ GPUPhysicalTableScan::GetDataDuckDB(ExecutionContext &exec_context) {
         function.function(exec_context.client, data, *chunk);
         has_more_output = chunk->size() > 0;
         // get the size of each column in the chunk
-        for (int col = 0; col < column_ids.size(); col++) {
+        for (int col = 0; col < column_ids.size() - gen_row_id_column; col++) {
             Vector vec = chunk->data[col];
             vec.Flatten(chunk->size());
             if (vec.GetType() == LogicalType::VARCHAR) {
@@ -536,12 +538,12 @@ GPUPhysicalTableScan::GetDataDuckDB(ExecutionContext &exec_context) {
           throw InvalidInputException("Total size of columns to be cached is greater than the cache size");
         }
         gpuBufferManager->ResetCache();
-        for (int col = 0; col < column_ids.size(); col++) {
+        for (int col = 0; col < column_ids.size() - gen_row_id_column; col++) {
           already_cached[col] = false;
           gpuBufferManager->createTableAndColumnInGPU(catalog_table, exec_context.client, table_name, names[column_ids[col].GetPrimaryIndex()]);
         }
       } else {
-          for (int col = 0; col < column_ids.size(); col++) {
+          for (int col = 0; col < column_ids.size() - gen_row_id_column; col++) {
               if (!already_cached[col]) {
                 gpuBufferManager->createTableAndColumnInGPU(catalog_table, exec_context.client, table_name, names[column_ids[col].GetPrimaryIndex()]);
               } 
@@ -632,7 +634,7 @@ GPUPhysicalTableScan::ScanDataDuckDB(GPUBufferManager* gpuBufferManager, string 
       } while (has_more_output);
 
 
-      for (int col = 0; col < column_ids.size(); col++) {
+      for (int col = 0; col < column_ids.size() - gen_row_id_column; col++) {
         if (!already_cached[col]) {
             if (scanned_types[col] == LogicalType::VARCHAR) {
               if (column_size[col] != offset_ptr[col][collection->Count()]) {
@@ -647,7 +649,7 @@ GPUPhysicalTableScan::ScanDataDuckDB(GPUBufferManager* gpuBufferManager, string 
         }
       }
 
-      for (int col = 0; col < column_ids.size(); col++) {
+      for (int col = 0; col < column_ids.size() - gen_row_id_column; col++) {
         if (!already_cached[col]) {
             auto up_column_name = names[column_ids[col].GetPrimaryIndex()];
             auto up_table_name = table_name;
@@ -702,7 +704,7 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
         for (int i = 0; i < table->column_names.size(); i++) {
             SIRIUS_LOG_DEBUG("Cached Column name: {}", table->column_names[i]);
         }
-        for (int col = 0; col < column_ids.size(); col++) {
+        for (int col = 0; col < column_ids.size() - gen_row_id_column; col++) {
             auto column_to_find = names[column_ids[col].GetPrimaryIndex()];
             transform(column_to_find.begin(), column_to_find.end(), column_to_find.begin(), ::toupper);
             SIRIUS_LOG_DEBUG("Finding column {}", column_to_find);
@@ -815,7 +817,8 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
     int index = 0;
     // projection id means that from this set of column ids that are being scanned, which index of column ids are getting projected out
     if (function.filter_prune) {
-      for (auto projection_id : projection_ids) {
+      for (int col = 0; col < projection_ids.size() - gen_row_id_column; ++col) {
+          auto projection_id = projection_ids[col];
           SIRIUS_LOG_DEBUG("Reading column index (late materialized) {} and passing it to index in output relation {}", column_ids[projection_id].GetPrimaryIndex(), index);
           SIRIUS_LOG_DEBUG("Writing row IDs to output relation in index {}", index);
           output_relation.columns[index] = make_shared_ptr<GPUColumn>(table->columns[column_ids[projection_id].GetPrimaryIndex()]->column_length, table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.type, table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.data,
@@ -833,7 +836,8 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
 
       if (projection_ids.size() == 0) {
         SIRIUS_LOG_DEBUG("Projection ids size is 0 so we are projecting all columns");
-        for (auto column_id : column_ids) {
+        for (int col = 0; col < column_ids.size() - gen_row_id_column; col++) {
+            auto column_id = column_ids[col];
             SIRIUS_LOG_DEBUG("Reading column index (late materialized) {} and passing it to index in output relation {}", column_id.GetPrimaryIndex(), index);
             SIRIUS_LOG_DEBUG("Writing row IDs to output relation in index {}", index);
             output_relation.columns[index] = make_shared_ptr<GPUColumn>(table->columns[column_id.GetPrimaryIndex()]->column_length, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.type, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.data,
@@ -851,7 +855,8 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
       }
     } else {
       //THIS IS FOR INDEX_SCAN
-      for (auto column_id : column_ids) {
+      for (int col = 0; col < column_ids.size() - gen_row_id_column; col++) {
+          auto column_id = column_ids[col];
           SIRIUS_LOG_DEBUG("Reading column index (late materialized) {} and passing it to index in output relation {}", column_id.GetPrimaryIndex(), index);
           SIRIUS_LOG_DEBUG("Writing row IDs to output relation in index {}", index);
           output_relation.columns[index] = make_shared_ptr<GPUColumn>(table->columns[column_id.GetPrimaryIndex()]->column_length, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.type, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.data,
@@ -867,7 +872,25 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
           index++;
       }
     }
-  
+
+    // Create row id column if required
+    if (gen_row_id_column) {
+      if (output_relation.column_count < 2) {
+        throw InternalException("Should have at least one data column to generate row_id column");
+      }
+      auto num_rows = output_relation.columns[0]->column_length;
+      auto data = gpuBufferManager->customCudaMalloc<uint8_t>(num_rows * sizeof(int64_t), 0, 0);
+      createRowIdColumn(data, num_rows);
+      output_relation.columns.back() = make_shared_ptr<GPUColumn>(
+        num_rows, GPUColumnType(GPUColumnTypeId::INT64), data, nullptr, num_rows * sizeof(int64_t), false, nullptr);
+      if (row_ids) {
+        output_relation.columns.back()->row_ids = row_ids; 
+      }
+      if (count) {
+        output_relation.columns.back()->row_id_count = count[0];
+      }
+    }
+
     //measure time
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);

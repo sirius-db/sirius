@@ -101,6 +101,13 @@ __global__ void convert_int32_to_int64(uint8_t *input, uint8_t *output, size_t c
   }
 }
 
+__global__ void create_row_id_column(uint8_t *data, size_t count) {
+  size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < count) {
+    reinterpret_cast<int64_t*>(data)[idx] = idx;
+  }
+}
+
 void warmup_gpu() {
   // Perform the warmup
   cudaFree(0);
@@ -149,6 +156,15 @@ void convertInt32ToInt64(uint8_t *input, uint8_t *output, size_t count) {
   size_t blocks = (count + threads_per_block - 1) / threads_per_block;
 
   convert_int32_to_int64<<<blocks, threads_per_block>>>(input, output, count);
+  cudaDeviceSynchronize();
+}
+
+void createRowIdColumn(uint8_t *data, size_t count) {
+  // Launch the kernel to write row ids
+  size_t threads_per_block = 256;
+  size_t blocks = (count + threads_per_block - 1) / threads_per_block;
+
+  create_row_id_column<<<blocks, threads_per_block>>>(data, count);
   cudaDeviceSynchronize();
 }
 
