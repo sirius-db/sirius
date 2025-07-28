@@ -168,9 +168,16 @@ __global__ void table_scan_expression(uint8_t **col, uint64_t** offset, uint32_t
     for (int ITEM = 0; ITEM < I; ++ITEM) {
         for (int expr = 0; expr < num_expr; expr++) {
             if (threadIdx.x + ITEM * B < num_tile_items) {
-
                 uint64_t item_idx = tile_offset + threadIdx.x + ITEM * B;
-                if (data_type[expr] == INT16) {
+                uint64_t bitindex = (item_idx / 32);
+                uint64_t bitoffset = (item_idx % 32);
+                uint32_t validity_bit = (bitmask[expr][bitindex] >> bitoffset) & 0x00000001;
+
+                if (data_type[expr] == SQLNULL) {
+                    selection_flags[ITEM] = device_comparison_null(validity_bit, compare_mode[expr]);
+                } else if (validity_bit == 0) {
+                    selection_flags[ITEM] = false;
+                } else if (data_type[expr] == INT16) {
                     int16_t item = (reinterpret_cast<int16_t*>(col[expr]))[item_idx];
 
                     uint64_t start_constant_offset = constant_offset[expr]; 
@@ -232,12 +239,6 @@ __global__ void table_scan_expression(uint8_t **col, uint64_t** offset, uint32_t
                     char* compare_chars = (char*) constant_compare + start_constant_offset;
 
                     selection_flags[ITEM] = device_comparison_string(curr_str_chars, curr_str_length, compare_chars, compare_length, compare_mode[expr]);
-                } else if (data_type[expr] == SQLNULL) {
-                    uint64_t bitindex = (item_idx / 32);
-                    uint64_t bitoffset = (item_idx % 32);
-                    uint32_t validity_bit = (bitmask[expr][bitindex] >> bitoffset) & 0x00000001;
-                    
-                    selection_flags[ITEM] = device_comparison_null(validity_bit, compare_mode[expr]);
                 } else {
                     cudaAssert(0);
                 }
