@@ -744,10 +744,11 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
                 auto& filter_inside = filter_conjunction_and.child_filters[expr];
                 if (filter_inside->filter_type == TableFilterType::CONSTANT_COMPARISON) {
                   num_expr++;
-                } else if (filter_inside->filter_type == TableFilterType::IS_NOT_NULL) {
+                } else if (filter_inside->filter_type == TableFilterType::IS_NOT_NULL ||
+                           filter_inside->filter_type == TableFilterType::OPTIONAL_FILTER) {
                   continue;
                 } else {
-                  throw NotImplementedException("Filter type not supported");
+                  throw NotImplementedException("Filter type not supported: %d", static_cast<int>(filter_inside->filter_type));
                 }
             }
           } else {
@@ -788,10 +789,11 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
                   filter_constants[expr_idx] = &(filter_inside->Cast<ConstantFilter>());
                   expression_columns[expr_idx] = table->columns[column_ids[column_index].GetPrimaryIndex()];
                   expr_idx++;
-                } else if (filter_inside->filter_type == TableFilterType::IS_NOT_NULL) {
+                } else if (filter_inside->filter_type == TableFilterType::IS_NOT_NULL ||
+                           filter_inside->filter_type == TableFilterType::OPTIONAL_FILTER) {
                   continue;
                 } else {
-                  throw NotImplementedException("Filter type not supported");
+                  throw NotImplementedException("Filter type not supported: %d", static_cast<int>(filter_inside->filter_type));
                 }
             }
 
