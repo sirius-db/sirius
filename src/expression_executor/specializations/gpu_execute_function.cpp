@@ -29,10 +29,13 @@
 #include <cudf/strings/attributes.hpp>
 #include <cudf/strings/contains.hpp>
 #include <cudf/strings/find.hpp>
+#include <cudf/strings/regex/regex_program.hpp>
+#include <cudf/strings/replace_re.hpp>
 #include <cudf/strings/slice.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/unary.hpp>
 #include <string>
+#include <regex>
 
 namespace duckdb
 {
@@ -64,6 +67,7 @@ namespace sirius
 #define MICROSECOND_FUNC_STR "microsecond"
 #define STRLEN_FUNC_STR "strlen"
 #define LENGTH_FUNC_STR "length"
+#define REGEXP_REPLACE_FUNC_STR "regexp_replace"
 #define ERROR_FUNC_STR "error"
 
 #define SPLIT_DELIMITER "%"
@@ -484,6 +488,47 @@ struct UnaryFunctionDispatcher {
   }
 };
 
+//----------RegexFunctionDispatcher----------//
+struct RegexFunctionDispatcher {
+  // The executor
+  GpuExpressionExecutor& executor;
+
+  // Constructor
+  explicit RegexFunctionDispatcher(GpuExpressionExecutor& exec)
+      : executor(exec) {}
+
+  // Dispatch operator
+  std::unique_ptr<cudf::column> operator()(const BoundFunctionExpression& expr,
+                                           GpuExpressionState* state) {
+    auto input_cudf_column = executor.Execute(*expr.children[0], state->child_states[0].get());
+    std::string pattern_str = expr.children[1]->Cast<BoundConstantExpression>().value.GetValue<std::string>();
+    std::string replace_str = expr.children[2]->Cast<BoundConstantExpression>().value.GetValue<std::string>();
+    bool has_backrefs = std::regex_search(replace_str, std::regex(R"(\\[0-9])"));
+    if (has_backrefs) {
+      auto regex_prog = cudf::strings::regex_program::create(std::string_view(pattern_str));
+      return cudf::strings::replace_with_backrefs(cudf::strings_column_view(input_cudf_column->view()),
+                                                  *regex_prog,
+                                                  std::string_view(replace_str),
+                                                  executor.execution_stream,
+                                                  executor.resource_ref);
+    } else {
+      auto replace_cudf_column = cudf::make_column_from_scalar(cudf::string_scalar(replace_str,
+                                                                                  true,
+                                                                                  executor.execution_stream,
+                                                                                  executor.resource_ref),
+                                                               1,
+                                                               executor.execution_stream,
+                                                               executor.resource_ref);
+      return cudf::strings::replace_re(cudf::strings_column_view(input_cudf_column->view()),
+                                       {pattern_str},
+                                       cudf::strings_column_view(replace_cudf_column->view()),
+                                       cudf::strings::regex_flags::DEFAULT,
+                                       executor.execution_stream,
+                                       executor.resource_ref);
+    }
+  }
+};
+
 //----------Execute----------//
 std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundFunctionExpression& expr,
                                                              GpuExpressionState* state)
@@ -636,6 +681,12 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundFunction
   }
   else if (func_str == LENGTH_FUNC_STR) {
     UnaryFunctionDispatcher<UnaryFunctionType::LENGTH> dispatcher(*this);
+    return dispatcher(expr, state);
+  }
+
+  //----------Regex Functions----------//
+  else if (func_str == REGEXP_REPLACE_FUNC_STR) {
+    RegexFunctionDispatcher dispatcher(*this);
     return dispatcher(expr, state);
   }
 
