@@ -26,6 +26,7 @@
 #include <cudf/binaryop.hpp>
 #include <cudf/datetime.hpp>
 #include <cudf/scalar/scalar.hpp>
+#include <cudf/strings/attributes.hpp>
 #include <cudf/strings/contains.hpp>
 #include <cudf/strings/find.hpp>
 #include <cudf/strings/slice.hpp>
@@ -61,6 +62,8 @@ namespace sirius
 #define SECOND_FUNC_STR "second"
 #define MILLISECOND_FUNC_STR "millisecond"
 #define MICROSECOND_FUNC_STR "microsecond"
+#define STRLEN_FUNC_STR "strlen"
+#define LENGTH_FUNC_STR "length"
 #define ERROR_FUNC_STR "error"
 
 #define SPLIT_DELIMITER "%"
@@ -450,6 +453,37 @@ struct DatetimeExtractFunctionDispatcher
   }
 };
 
+//----------UnaryFunctionDispatcher----------//
+template <UnaryFunctionType FuncType>
+struct UnaryFunctionDispatcher {
+  // The executor
+  GpuExpressionExecutor& executor;
+
+  // Constructor
+  explicit UnaryFunctionDispatcher(GpuExpressionExecutor& exec)
+      : executor(exec) {}
+
+  // Dispatch operator
+  std::unique_ptr<cudf::column> operator()(const BoundFunctionExpression& expr,
+                                           GpuExpressionState* state) {
+    D_ASSERT(expr.children.size() == 1);
+    auto input = executor.Execute(*expr.children[0], state->child_states[0].get());
+
+    switch (FuncType) {
+      case UnaryFunctionType::STRLEN:
+        return cudf::strings::count_bytes(input->view(),
+                                          executor.execution_stream,
+                                          executor.resource_ref);
+      case UnaryFunctionType::LENGTH:
+        return cudf::strings::count_characters(input->view(),
+                                               executor.execution_stream,
+                                               executor.resource_ref);
+      default:
+        throw NotImplementedException("Unsupported UnaryFunctionType: %d", static_cast<int>(FuncType));
+    }
+  }
+};
+
 //----------Execute----------//
 std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundFunctionExpression& expr,
                                                              GpuExpressionState* state)
@@ -592,6 +626,16 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundFunction
   else if (func_str == MICROSECOND_FUNC_STR)
   {
     DatetimeExtractFunctionDispatcher<cudf::datetime::datetime_component::MICROSECOND> dispatcher(*this);
+    return dispatcher(expr, state);
+  }
+
+  //----------Unary Functions----------//
+  else if (func_str == STRLEN_FUNC_STR) {
+    UnaryFunctionDispatcher<UnaryFunctionType::STRLEN> dispatcher(*this);
+    return dispatcher(expr, state);
+  }
+  else if (func_str == LENGTH_FUNC_STR) {
+    UnaryFunctionDispatcher<UnaryFunctionType::LENGTH> dispatcher(*this);
     return dispatcher(expr, state);
   }
 

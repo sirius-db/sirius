@@ -36,6 +36,11 @@ enum class StringMatchingType : uint8_t
   SUFFIX
 };
 
+enum class UnaryFunctionType {
+  STRLEN,
+  LENGTH
+};
+
 //----------Gpu Dispatcher----------//
 struct GpuDispatcher
 {
