@@ -98,6 +98,8 @@ inline GPUColumnType convertLogicalTypeToColumnType(LogicalType type) {
             return GPUColumnType(GPUColumnTypeId::INT32);
         case LogicalTypeId::BIGINT:
             return GPUColumnType(GPUColumnTypeId::INT64);
+        case LogicalTypeId::HUGEINT:
+            return GPUColumnType(GPUColumnTypeId::INT128);
         case LogicalTypeId::FLOAT:
             return GPUColumnType(GPUColumnTypeId::FLOAT32);
         case LogicalTypeId::DOUBLE:

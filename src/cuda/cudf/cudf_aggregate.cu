@@ -88,9 +88,24 @@ void cudf_aggregate(vector<shared_ptr<GPUColumn>>& column, uint64_t num_aggregat
             cudaMemcpy(result_temp, res, sizeof(uint64_t), cudaMemcpyHostToDevice);
             column[agg] = make_shared_ptr<GPUColumn>(1, GPUColumnType(GPUColumnTypeId::INT64), reinterpret_cast<uint8_t*>(result_temp));
         } else if (agg_mode[agg] == AggregationType::SUM) {
+            // Sum may cause overflow, need to adjust return type based on input, so far use a conservative estimation
+            // purely based on the number of rows
             auto aggregate = make_reduce_aggregation<cudf::reduce_aggregation::SUM>();
             auto cudf_column = column[agg]->convertToCudfColumn();
-            auto result = cudf::reduce(cudf_column, *aggregate, cudf_column.type());
+            auto to_cudf_type = cudf_column.type();
+            cudf::size_type num_rows = cudf_column.size();
+            if (to_cudf_type.id() == cudf::type_id::INT32) {
+                if (num_rows > 1) {
+                    to_cudf_type = cudf::data_type(cudf::type_id::INT64);
+                }
+            } else if (to_cudf_type.id() == cudf::type_id::INT16) {
+                if (num_rows > std::numeric_limits<int32_t>::max() / std::numeric_limits<int16_t>::max()) {
+                    to_cudf_type = cudf::data_type(cudf::type_id::INT64);
+                } else if (num_rows > 1) {
+                    to_cudf_type = cudf::data_type(cudf::type_id::INT32);
+                }
+            }
+            auto result = cudf::reduce(cudf_column, *aggregate, to_cudf_type);
             column[agg]->setFromCudfScalar(*result, gpuBufferManager);
         } else if (agg_mode[agg] == AggregationType::AVERAGE) {
             auto aggregate = make_reduce_aggregation<cudf::reduce_aggregation::MEAN>();

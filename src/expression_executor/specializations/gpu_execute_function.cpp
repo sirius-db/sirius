@@ -340,6 +340,8 @@ struct NumericBinaryFunctionDispatcher
       auto cudf_type = GpuExpressionState::GetCudfType(expr.children[0]->return_type);
       switch (cudf_type.id())
       {
+        case cudf::type_id::INT16:
+          return DoLeftScalarBinaryOp(left_value.GetValue<int16_t>(), right->view(), return_type);
         case cudf::type_id::INT32:
           return DoLeftScalarBinaryOp(left_value.GetValue<int32_t>(), right->view(), return_type);
         case cudf::type_id::INT64:
@@ -383,6 +385,8 @@ struct NumericBinaryFunctionDispatcher
       auto cudf_type = GpuExpressionState::GetCudfType(expr.children[1]->return_type);
       switch (cudf_type.id())
       {
+        case cudf::type_id::INT16:
+          return DoRightScalarBinaryOp(left->view(), right_value.GetValue<int16_t>(), return_type);
         case cudf::type_id::INT32:
           return DoRightScalarBinaryOp(left->view(), right_value.GetValue<int32_t>(), return_type);
         case cudf::type_id::INT64:
