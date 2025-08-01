@@ -25,8 +25,9 @@ ResolveTypeMaterializeExpression(shared_ptr<GPUColumn> column, GPUBufferManager*
     size_t size;
     T* a;
     cudf::bitmask_type* out_mask = nullptr;
-    if (column->data_wrapper.data == nullptr || column->column_length == 0) {
-        return make_shared_ptr<GPUColumn>(column->column_length, column->data_wrapper.type, nullptr);
+    if (column->data_wrapper.data == nullptr || column->column_length == 0 ||
+        (column->row_ids != nullptr && column->row_id_count == 0)) {
+        return make_shared_ptr<GPUColumn>(0, column->data_wrapper.type, nullptr);
     }
     if (column->row_ids != nullptr) {
         T* temp = reinterpret_cast<T*> (column->data_wrapper.data);
@@ -49,8 +50,9 @@ ResolveTypeMaterializeString(shared_ptr<GPUColumn> column, GPUBufferManager* gpu
     uint64_t* result_offset; 
     uint64_t* new_num_bytes;
     cudf::bitmask_type* out_mask = nullptr;
-    if (column->data_wrapper.data == nullptr || column->column_length == 0) {
-        return make_shared_ptr<GPUColumn>(column->column_length, column->data_wrapper.type, nullptr, nullptr, column->data_wrapper.num_bytes, column->data_wrapper.is_string_data);
+    if (column->data_wrapper.data == nullptr || column->column_length == 0 ||
+        (column->row_ids != nullptr && column->row_id_count == 0)) {
+        return make_shared_ptr<GPUColumn>(0, column->data_wrapper.type, nullptr, nullptr, 0, column->data_wrapper.is_string_data);
     }
     if (column->row_ids != nullptr) {
 		// Late materalize the input relationship
