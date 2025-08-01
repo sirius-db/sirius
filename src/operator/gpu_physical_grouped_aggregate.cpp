@@ -702,12 +702,14 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 			if (group_by_column[0]->column_length > INT32_MAX) {
 				throw NotImplementedException("Group by column length or aggregate column length is too large for CuDF");
 			} else {
+				SIRIUS_LOG_DEBUG("Calling HandleDuplicateEliminationCuDF with num groups: {}", num_group_keys);
 				HandleDuplicateEliminationCuDF(group_by_column, gpuBufferManager, num_group_keys);
 			}
 		} else {
 			if (group_by_column[0]->column_length > INT32_MAX || aggregate_column[0]->column_length > INT32_MAX) {
 				throw NotImplementedException("Group by column length or aggregate column length is too large for CuDF");
 			} else {
+				SIRIUS_LOG_DEBUG("Calling HandleGroupByAggregateCuDF with num groups: {}", num_group_keys);
 				HandleGroupByAggregateCuDF(group_by_column, aggregate_column, gpuBufferManager, aggregates, num_group_keys);
 			}
 		}

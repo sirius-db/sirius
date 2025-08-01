@@ -67,8 +67,91 @@ void combineStrings(uint8_t* a, uint8_t* b, uint8_t*& c,
     cudaDeviceSynchronize();
 }
 
+struct CustomLess
+{
+  template <typename T>
+  __forceinline__ __device__ bool operator()(const T &lhs, const T &rhs)
+  {
+    return lhs < rhs;
+  }
+};
+
+struct CustomSum
+{
+    template <typename T>
+    __device__ __forceinline__ T operator()(const T &a, const T &b) const {
+      return a + b;
+    }
+};
+
+__global__ void initialize_counts(int32_t* sorted_keys, int32_t* sorted_values, int32_t* record_count, uint64_t num_records) { 
+  const uint64_t curr_idx = threadIdx.x + blockIdx.x * blockDim.x;
+  if(curr_idx > 0 && curr_idx < num_records) { 
+    // Consider it unique if: 1) It is the first pair for this key, 2) It has a different value for the same key
+    record_count[curr_idx] = (sorted_keys[curr_idx] != sorted_keys[curr_idx - 1]) || (sorted_values[curr_idx] != sorted_values[curr_idx - 1]);
+  } else if(curr_idx == 0) { 
+    record_count[curr_idx] = 1;
+  }
+}
+
+void TestCountDistinct(DataWrapper& keys, DataWrapper& values, uint64_t num_records) { 
+  SETUP_TIMING();
+
+  int32_t* d_keys_ptr = reinterpret_cast<int32_t*>(keys.data);
+  int32_t* d_vals_ptr = reinterpret_cast<int32_t*>(values.data);
+
+  // First sort the input data in (key, value) order
+  START_TIMER();
+  CustomLess less_operator;
+  void* d_temp_storage = nullptr;
+  size_t temp_storage_bytes = 0;
+
+  cub::DeviceMergeSort::SortPairs(
+    d_temp_storage, temp_storage_bytes,
+    d_keys_ptr, d_vals_ptr, num_records, less_operator
+  );
+
+  GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+  d_temp_storage = gpuBufferManager->customCudaMalloc<uint8_t>(temp_storage_bytes, 0, 0);
+
+  cub::DeviceMergeSort::SortPairs(
+    d_temp_storage, temp_storage_bytes,
+    d_keys_ptr, d_vals_ptr, num_records, less_operator
+  );
+  RECORD_TIMER("TEST COUNT DISTINCT Cols Sort Time");
+
+  // Now initialize the count for each key
+  START_TIMER();
+  int32_t* d_counts = gpuBufferManager->customCudaMalloc<int32_t>(num_records, 0, 0);
+  uint64_t num_blocks = (num_records + BLOCK_THREADS - 1)/BLOCK_THREADS;
+  initialize_counts<<<num_blocks, BLOCK_THREADS>>>(d_keys_ptr, d_vals_ptr, d_counts, num_records);
+  RECORD_TIMER("TEST COUNT DISTINCT Unique Calculator");
+
+  // Now perform the key reduction
+  START_TIMER();
+  
+  int32_t* d_result_groups = gpuBufferManager->customCudaMalloc<int32_t>(num_records, 0, 0);
+  int32_t* d_result_aggregates = gpuBufferManager->customCudaMalloc<int32_t>(num_records, 0, 0);
+  uint64_t* d_num_groups_out = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+  CustomSum sum_operator;
+
+  cub::DeviceReduce::ReduceByKey( d_temp_storage, temp_storage_bytes, d_keys_ptr, d_result_groups, 
+    d_counts, d_result_aggregates, d_num_groups_out, sum_operator, num_records);
+
+  d_temp_storage = gpuBufferManager->customCudaMalloc<uint8_t>(temp_storage_bytes, 0, 0);
+
+  cub::DeviceReduce::ReduceByKey(d_temp_storage, temp_storage_bytes, d_keys_ptr, d_result_groups, 
+    d_counts, d_result_aggregates, d_num_groups_out, sum_operator, num_records);
+
+  RECORD_TIMER("TEST COUNT DISTINCT Key Reduction");
+}
+
 void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColumn>>& aggregate_keys, uint64_t num_keys, uint64_t num_aggregates, AggregationType* agg_mode) 
 {
+
+  TestCountDistinct(keys[0]->data_wrapper, aggregate_keys[0]->data_wrapper, keys[0]->column_length);
+
+
   if (keys[0]->column_length == 0) {
     SIRIUS_LOG_DEBUG("Input size is 0");
     for (idx_t group = 0; group < num_keys; group++) {
@@ -93,6 +176,7 @@ void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColu
 
   SIRIUS_LOG_DEBUG("CUDF Group By");
   SIRIUS_LOG_DEBUG("Input size: {}", keys[0]->column_length);
+
   SETUP_TIMING();
   START_TIMER();
 
@@ -113,10 +197,11 @@ void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColu
       throw NotImplementedException("Group by on non-nullable column not supported");
     }
   }
+  RECORD_TIMER("CUDF AGGREGATE Size Calculator");
 
+  START_TIMER();
   auto keys_table = cudf::table_view(keys_cudf);
   cudf::groupby::groupby grpby_obj(keys_table);
-
   std::vector<cudf::groupby::aggregation_request> requests;
   for (int agg = 0; agg < num_aggregates; agg++) {
     requests.emplace_back(cudf::groupby::aggregation_request());
@@ -181,9 +266,13 @@ void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColu
                                     static_cast<int>(agg_mode[agg]));
     }
   }
+  RECORD_TIMER("CUDF AGGREGATE Agg Initialize");
 
+  START_TIMER();
   auto result = grpby_obj.aggregate(requests);
+  RECORD_TIMER("CUDF AGGREGATE Agg Time");
 
+  START_TIMER();
   auto result_key = std::move(result.first);
   for (int key = 0; key < num_keys; key++) {
       cudf::column group_key = result_key->get_column(key);
@@ -200,8 +289,8 @@ void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColu
         aggregate_keys[agg]->setFromCudfColumn(*agg_val, false, nullptr, 0, gpuBufferManager);
       }
   }
+  RECORD_TIMER("CUDF AGGREGATE Result Materialize");
 
-  STOP_TIMER();
   SIRIUS_LOG_DEBUG("CUDF Groupby result count: {}", keys[0]->column_length);
 }
 

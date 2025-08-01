@@ -1,0 +1,3206 @@
+<?xml version="1.0" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg version="1.1" width="1200" height="2134" onload="init(evt)" viewBox="0 0 1200 2134" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+<!-- Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples. -->
+<!-- NOTES:  -->
+<defs>
+	<linearGradient id="background" y1="0" y2="1" x1="0" x2="0" >
+		<stop stop-color="#eeeeee" offset="5%" />
+		<stop stop-color="#eeeeb0" offset="95%" />
+	</linearGradient>
+</defs>
+<style type="text/css">
+	text { font-family:Verdana; font-size:12px; fill:rgb(0,0,0); }
+	#search, #ignorecase { opacity:0.1; cursor:pointer; }
+	#search:hover, #search.show, #ignorecase:hover, #ignorecase.show { opacity:1; }
+	#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+	#title { text-anchor:middle; font-size:17px}
+	#unzoom { cursor:pointer; }
+	#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+	.hide { display:none; }
+	.parent { opacity:0.5; }
+</style>
+<script type="text/ecmascript">
+<![CDATA[
+	"use strict";
+	var details, searchbtn, unzoombtn, matchedtxt, svg, searching, currentSearchTerm, ignorecase, ignorecaseBtn;
+	function init(evt) {
+		details = document.getElementById("details").firstChild;
+		searchbtn = document.getElementById("search");
+		ignorecaseBtn = document.getElementById("ignorecase");
+		unzoombtn = document.getElementById("unzoom");
+		matchedtxt = document.getElementById("matched");
+		svg = document.getElementsByTagName("svg")[0];
+		searching = 0;
+		currentSearchTerm = null;
+
+		// use GET parameters to restore a flamegraphs state.
+		var params = get_params();
+		if (params.x && params.y)
+			zoom(find_group(document.querySelector('[x="' + params.x + '"][y="' + params.y + '"]')));
+                if (params.s) search(params.s);
+	}
+
+	// event listeners
+	window.addEventListener("click", function(e) {
+		var target = find_group(e.target);
+		if (target) {
+			if (target.nodeName == "a") {
+				if (e.ctrlKey === false) return;
+				e.preventDefault();
+			}
+			if (target.classList.contains("parent")) unzoom(true);
+			zoom(target);
+			if (!document.querySelector('.parent')) {
+				// we have basically done a clearzoom so clear the url
+				var params = get_params();
+				if (params.x) delete params.x;
+				if (params.y) delete params.y;
+				history.replaceState(null, null, parse_params(params));
+				unzoombtn.classList.add("hide");
+				return;
+			}
+
+			// set parameters for zoom state
+			var el = target.querySelector("rect");
+			if (el && el.attributes && el.attributes.y && el.attributes._orig_x) {
+				var params = get_params()
+				params.x = el.attributes._orig_x.value;
+				params.y = el.attributes.y.value;
+				history.replaceState(null, null, parse_params(params));
+			}
+		}
+		else if (e.target.id == "unzoom") clearzoom();
+		else if (e.target.id == "search") search_prompt();
+		else if (e.target.id == "ignorecase") toggle_ignorecase();
+	}, false)
+
+	// mouse-over for info
+	// show
+	window.addEventListener("mouseover", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = "Function: " + g_to_text(target);
+	}, false)
+
+	// clear
+	window.addEventListener("mouseout", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = ' ';
+	}, false)
+
+	// ctrl-F for search
+	// ctrl-I to toggle case-sensitive search
+	window.addEventListener("keydown",function (e) {
+		if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+			e.preventDefault();
+			search_prompt();
+		}
+		else if (e.ctrlKey && e.keyCode === 73) {
+			e.preventDefault();
+			toggle_ignorecase();
+		}
+	}, false)
+
+	// functions
+	function get_params() {
+		var params = {};
+		var paramsarr = window.location.search.substr(1).split('&');
+		for (var i = 0; i < paramsarr.length; ++i) {
+			var tmp = paramsarr[i].split("=");
+			if (!tmp[0] || !tmp[1]) continue;
+			params[tmp[0]]  = decodeURIComponent(tmp[1]);
+		}
+		return params;
+	}
+	function parse_params(params) {
+		var uri = "?";
+		for (var key in params) {
+			uri += key + '=' + encodeURIComponent(params[key]) + '&';
+		}
+		if (uri.slice(-1) == "&")
+			uri = uri.substring(0, uri.length - 1);
+		if (uri == '?')
+			uri = window.location.href.split('?')[0];
+		return uri;
+	}
+	function find_child(node, selector) {
+		var children = node.querySelectorAll(selector);
+		if (children.length) return children[0];
+	}
+	function find_group(node) {
+		var parent = node.parentElement;
+		if (!parent) return;
+		if (parent.id == "frames") return node;
+		return find_group(parent);
+	}
+	function orig_save(e, attr, val) {
+		if (e.attributes["_orig_" + attr] != undefined) return;
+		if (e.attributes[attr] == undefined) return;
+		if (val == undefined) val = e.attributes[attr].value;
+		e.setAttribute("_orig_" + attr, val);
+	}
+	function orig_load(e, attr) {
+		if (e.attributes["_orig_"+attr] == undefined) return;
+		e.attributes[attr].value = e.attributes["_orig_" + attr].value;
+		e.removeAttribute("_orig_"+attr);
+	}
+	function g_to_text(e) {
+		var text = find_child(e, "title").firstChild.nodeValue;
+		return (text)
+	}
+	function g_to_func(e) {
+		var func = g_to_text(e);
+		// if there's any manipulation we want to do to the function
+		// name before it's searched, do it here before returning.
+		return (func);
+	}
+	function update_text(e) {
+		var r = find_child(e, "rect");
+		var t = find_child(e, "text");
+		var w = parseFloat(r.attributes.width.value) -3;
+		var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+		t.attributes.x.value = parseFloat(r.attributes.x.value) + 3;
+
+		// Smaller than this size won't fit anything
+		if (w < 2 * 12 * 0.59) {
+			t.textContent = "";
+			return;
+		}
+
+		t.textContent = txt;
+		var sl = t.getSubStringLength(0, txt.length);
+		// check if only whitespace or if we can fit the entire string into width w
+		if (/^ *$/.test(txt) || sl < w)
+			return;
+
+		// this isn't perfect, but gives a good starting point
+		// and avoids calling getSubStringLength too often
+		var start = Math.floor((w/sl) * txt.length);
+		for (var x = start; x > 0; x = x-2) {
+			if (t.getSubStringLength(0, x + 2) <= w) {
+				t.textContent = txt.substring(0, x) + "..";
+				return;
+			}
+		}
+		t.textContent = "";
+	}
+
+	// zoom
+	function zoom_reset(e) {
+		if (e.attributes != undefined) {
+			orig_load(e, "x");
+			orig_load(e, "width");
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_reset(c[i]);
+		}
+	}
+	function zoom_child(e, x, ratio) {
+		if (e.attributes != undefined) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = (parseFloat(e.attributes.x.value) - x - 10) * ratio + 10;
+				if (e.tagName == "text")
+					e.attributes.x.value = find_child(e.parentNode, "rect[x]").attributes.x.value + 3;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseFloat(e.attributes.width.value) * ratio;
+			}
+		}
+
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_child(c[i], x - 10, ratio);
+		}
+	}
+	function zoom_parent(e) {
+		if (e.attributes) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = 10;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseInt(svg.width.baseVal.value) - (10 * 2);
+			}
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_parent(c[i]);
+		}
+	}
+	function zoom(node) {
+		var attr = find_child(node, "rect").attributes;
+		var width = parseFloat(attr.width.value);
+		var xmin = parseFloat(attr.x.value);
+		var xmax = parseFloat(xmin + width);
+		var ymin = parseFloat(attr.y.value);
+		var ratio = (svg.width.baseVal.value - 2 * 10) / width;
+
+		// XXX: Workaround for JavaScript float issues (fix me)
+		var fudge = 0.0001;
+
+		unzoombtn.classList.remove("hide");
+
+		var el = document.getElementById("frames").children;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var a = find_child(e, "rect").attributes;
+			var ex = parseFloat(a.x.value);
+			var ew = parseFloat(a.width.value);
+			var upstack;
+			// Is it an ancestor
+			if (0 == 0) {
+				upstack = parseFloat(a.y.value) > ymin;
+			} else {
+				upstack = parseFloat(a.y.value) < ymin;
+			}
+			if (upstack) {
+				// Direct ancestor
+				if (ex <= xmin && (ex+ew+fudge) >= xmax) {
+					e.classList.add("parent");
+					zoom_parent(e);
+					update_text(e);
+				}
+				// not in current path
+				else
+					e.classList.add("hide");
+			}
+			// Children maybe
+			else {
+				// no common path
+				if (ex < xmin || ex + fudge >= xmax) {
+					e.classList.add("hide");
+				}
+				else {
+					zoom_child(e, xmin, ratio);
+					update_text(e);
+				}
+			}
+		}
+		search();
+	}
+	function unzoom(dont_update_text) {
+		unzoombtn.classList.add("hide");
+		var el = document.getElementById("frames").children;
+		for(var i = 0; i < el.length; i++) {
+			el[i].classList.remove("parent");
+			el[i].classList.remove("hide");
+			zoom_reset(el[i]);
+			if(!dont_update_text) update_text(el[i]);
+		}
+		search();
+	}
+	function clearzoom() {
+		unzoom();
+
+		// remove zoom state
+		var params = get_params();
+		if (params.x) delete params.x;
+		if (params.y) delete params.y;
+		history.replaceState(null, null, parse_params(params));
+	}
+
+	// search
+	function toggle_ignorecase() {
+		ignorecase = !ignorecase;
+		if (ignorecase) {
+			ignorecaseBtn.classList.add("show");
+		} else {
+			ignorecaseBtn.classList.remove("show");
+		}
+		reset_search();
+		search();
+	}
+	function reset_search() {
+		var el = document.querySelectorAll("#frames rect");
+		for (var i = 0; i < el.length; i++) {
+			orig_load(el[i], "fill")
+		}
+		var params = get_params();
+		delete params.s;
+		history.replaceState(null, null, parse_params(params));
+	}
+	function search_prompt() {
+		if (!searching) {
+			var term = prompt("Enter a search term (regexp " +
+			    "allowed, eg: ^ext4_)"
+			    + (ignorecase ? ", ignoring case" : "")
+			    + "\nPress Ctrl-i to toggle case sensitivity", "");
+			if (term != null) search(term);
+		} else {
+			reset_search();
+			searching = 0;
+			currentSearchTerm = null;
+			searchbtn.classList.remove("show");
+			searchbtn.firstChild.nodeValue = "Search"
+			matchedtxt.classList.add("hide");
+			matchedtxt.firstChild.nodeValue = ""
+		}
+	}
+	function search(term) {
+		if (term) currentSearchTerm = term;
+		if (currentSearchTerm === null) return;
+
+		var re = new RegExp(currentSearchTerm, ignorecase ? 'i' : '');
+		var el = document.getElementById("frames").children;
+		var matches = new Object();
+		var maxwidth = 0;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var func = g_to_func(e);
+			var rect = find_child(e, "rect");
+			if (func == null || rect == null)
+				continue;
+
+			// Save max width. Only works as we have a root frame
+			var w = parseFloat(rect.attributes.width.value);
+			if (w > maxwidth)
+				maxwidth = w;
+
+			if (func.match(re)) {
+				// highlight
+				var x = parseFloat(rect.attributes.x.value);
+				orig_save(rect, "fill");
+				rect.attributes.fill.value = "rgb(230,0,230)";
+
+				// remember matches
+				if (matches[x] == undefined) {
+					matches[x] = w;
+				} else {
+					if (w > matches[x]) {
+						// overwrite with parent
+						matches[x] = w;
+					}
+				}
+				searching = 1;
+			}
+		}
+		if (!searching)
+			return;
+		var params = get_params();
+		params.s = currentSearchTerm;
+		history.replaceState(null, null, parse_params(params));
+
+		searchbtn.classList.add("show");
+		searchbtn.firstChild.nodeValue = "Reset Search";
+
+		// calculate percent matched, excluding vertical overlap
+		var count = 0;
+		var lastx = -1;
+		var lastw = 0;
+		var keys = Array();
+		for (k in matches) {
+			if (matches.hasOwnProperty(k))
+				keys.push(k);
+		}
+		// sort the matched frames by their x location
+		// ascending, then width descending
+		keys.sort(function(a, b){
+			return a - b;
+		});
+		// Step through frames saving only the biggest bottom-up frames
+		// thanks to the sort order. This relies on the tree property
+		// where children are always smaller than their parents.
+		var fudge = 0.0001;	// JavaScript floating point
+		for (var k in keys) {
+			var x = parseFloat(keys[k]);
+			var w = matches[keys[k]];
+			if (x >= lastx + lastw - fudge) {
+				count += w;
+				lastx = x;
+				lastw = w;
+			}
+		}
+		// display matched percent
+		matchedtxt.classList.remove("hide");
+		var pct = 100 * count / maxwidth;
+		if (pct != 100) pct = pct.toFixed(1)
+		matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+	}
+]]>
+</script>
+<rect x="0.0" y="0" width="1200.0" height="2134.0" fill="url(#background)"  />
+<text id="title" x="600.00" y="24" >Flame Graph</text>
+<text id="details" x="10.00" y="2117" > </text>
+<text id="unzoom" x="10.00" y="24" class="hide">Reset Zoom</text>
+<text id="search" x="1090.00" y="24" >Search</text>
+<text id="ignorecase" x="1174.00" y="24" >ic</text>
+<text id="matched" x="1090.00" y="2117" > </text>
+<g id="frames">
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="53" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="63.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (144,120 samples, 0.15%)</title><rect x="1041.7" y="1733" width="1.8" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1044.73" y="1743.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="1157" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1167.5" ></text>
+</g>
+<g >
+<title>[unknown] (702,665 samples, 0.74%)</title><rect x="806.2" y="1717" width="8.6" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1727.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (142,333 samples, 0.15%)</title><rect x="25.7" y="2005" width="1.7" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="28.67" y="2015.5" ></text>
+</g>
+<g >
+<title>cudaLaunchKernel (1,275,199 samples, 1.34%)</title><rect x="1066.2" y="2037" width="15.8" height="15.0" fill="rgb(216,51,12)" rx="2" ry="2" />
+<text  x="1069.25" y="2047.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (160,364 samples, 0.17%)</title><rect x="1030.9" y="1877" width="2.0" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1033.93" y="1887.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (218,553 samples, 0.23%)</title><rect x="886.1" y="1973" width="2.7" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="889.06" y="1983.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (305,164 samples, 0.32%)</title><rect x="836.2" y="1861" width="3.8" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="839.24" y="1871.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (218,529 samples, 0.23%)</title><rect x="888.8" y="1909" width="2.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="891.76" y="1919.5" ></text>
+</g>
+<g >
+<title>[unknown] (258,825 samples, 0.27%)</title><rect x="1059.5" y="1797" width="3.2" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="1062.48" y="1807.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (152,441 samples, 0.16%)</title><rect x="1093.6" y="1973" width="1.9" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1096.58" y="1983.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (24,889,664 samples, 26.06%)</title><rect x="208.9" y="1893" width="307.5" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="211.85" y="1903.5" >[libcuda.so.560.35.05]</text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (295,586 samples, 0.31%)</title><rect x="891.5" y="1989" width="3.6" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="894.46" y="1999.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (601,409 samples, 0.63%)</title><rect x="1109.3" y="1925" width="7.5" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1112.32" y="1935.5" ></text>
+</g>
+<g >
+<title>[unknown] (816,114 samples, 0.85%)</title><rect x="806.2" y="1989" width="10.0" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1999.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (755,883 samples, 0.79%)</title><rect x="942.7" y="1717" width="9.4" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="945.75" y="1727.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (321,286 samples, 0.34%)</title><rect x="1028.9" y="2021" width="4.0" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="1031.94" y="2031.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (946,516 samples, 0.99%)</title><rect x="940.4" y="1781" width="11.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="943.39" y="1791.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (186,858 samples, 0.20%)</title><rect x="927.3" y="1925" width="2.3" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="930.34" y="1935.5" ></text>
+</g>
+<g >
+<title>duckdb::BoundOrderModifier::~BoundOrderModifier (127,520 samples, 0.13%)</title><rect x="958.6" y="2037" width="1.6" height="15.0" fill="rgb(234,137,32)" rx="2" ry="2" />
+<text  x="961.59" y="2047.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (213,098 samples, 0.22%)</title><rect x="1079.4" y="1701" width="2.6" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1082.37" y="1711.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (1,603,803 samples, 1.68%)</title><rect x="1116.8" y="1909" width="19.8" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1119.75" y="1919.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (1,603,803 samples, 1.68%)</title><rect x="1116.8" y="1877" width="19.8" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1119.75" y="1887.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (670,530 samples, 0.70%)</title><rect x="905.3" y="1893" width="8.3" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="908.32" y="1903.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (187,311 samples, 0.20%)</title><rect x="938.1" y="1829" width="2.3" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="941.08" y="1839.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (424,940 samples, 0.44%)</title><rect x="1076.8" y="1797" width="5.2" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1079.75" y="1807.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="629" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="639.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (2,486,863 samples, 2.60%)</title><rect x="1136.6" y="1925" width="30.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1139.57" y="1935.5" >[l..</text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (295,586 samples, 0.31%)</title><rect x="891.5" y="1957" width="3.6" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="894.46" y="1967.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (298,017 samples, 0.31%)</title><rect x="1091.8" y="2021" width="3.7" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="1094.78" y="2031.5" ></text>
+</g>
+<g >
+<title>duckdb::TableBinding::TableBinding (120,059 samples, 0.13%)</title><rect x="956.0" y="1973" width="1.5" height="15.0" fill="rgb(217,57,13)" rx="2" ry="2" />
+<text  x="959.03" y="1983.5" ></text>
+</g>
+<g >
+<title>cudf::groupby::detail::sort::sort_groupby_helper::key_sort_order (1,111,521 samples, 1.16%)</title><rect x="913.6" y="1989" width="13.7" height="15.0" fill="rgb(250,209,50)" rx="2" ry="2" />
+<text  x="916.61" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="885" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="895.5" ></text>
+</g>
+<g >
+<title>duckdb::FunctionBinder::BindFunction (136,985 samples, 0.14%)</title><rect x="1090.1" y="2053" width="1.7" height="15.0" fill="rgb(215,46,11)" rx="2" ry="2" />
+<text  x="1093.09" y="2063.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (185,748 samples, 0.19%)</title><rect x="949.8" y="1685" width="2.3" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="952.79" y="1695.5" ></text>
+</g>
+<g >
+<title>[unknown] (816,114 samples, 0.85%)</title><rect x="806.2" y="2021" width="10.0" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="2031.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (218,553 samples, 0.23%)</title><rect x="886.1" y="1909" width="2.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="889.06" y="1919.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="949" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="959.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="1237" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1247.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (1,021,193 samples, 1.07%)</title><rect x="10.1" y="2037" width="12.6" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="13.06" y="2047.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (218,529 samples, 0.23%)</title><rect x="888.8" y="1957" width="2.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="891.76" y="1967.5" ></text>
+</g>
+<g >
+<title>[unknown] (564,334 samples, 0.59%)</title><rect x="806.2" y="1493" width="6.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1503.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (141,978 samples, 0.15%)</title><rect x="925.6" y="1861" width="1.7" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="928.59" y="1871.5" ></text>
+</g>
+<g >
+<title>[unknown] (564,334 samples, 0.59%)</title><rect x="806.2" y="1621" width="6.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1631.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="565" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="575.5" ></text>
+</g>
+<g >
+<title>[unknown] (564,334 samples, 0.59%)</title><rect x="806.2" y="1605" width="6.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1615.5" ></text>
+</g>
+<g >
+<title>[unknown] (816,114 samples, 0.85%)</title><rect x="806.2" y="1893" width="10.0" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1903.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (139,850 samples, 0.15%)</title><rect x="923.9" y="1909" width="1.7" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="926.86" y="1919.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="597" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="607.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (186,858 samples, 0.20%)</title><rect x="927.3" y="1877" width="2.3" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="930.34" y="1887.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (2,486,863 samples, 2.60%)</title><rect x="1136.6" y="1909" width="30.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1139.57" y="1919.5" >[l..</text>
+</g>
+<g >
+<title>ctl_lookup (96,130 samples, 0.10%)</title><rect x="1027.8" y="2053" width="1.1" height="15.0" fill="rgb(211,27,6)" rx="2" ry="2" />
+<text  x="1030.75" y="2063.5" ></text>
+</g>
+<g >
+<title>cudf::groupby::detail::sort::sort_groupby_helper::group_labels (191,139 samples, 0.20%)</title><rect x="817.8" y="2021" width="2.4" height="15.0" fill="rgb(225,92,22)" rx="2" ry="2" />
+<text  x="820.84" y="2031.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (587,742 samples, 0.62%)</title><rect x="1036.3" y="1813" width="7.2" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1039.25" y="1823.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (829,693 samples, 0.87%)</title><rect x="913.6" y="1765" width="10.3" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="916.61" y="1775.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="1205" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1215.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (439,246 samples, 0.46%)</title><rect x="932.6" y="1925" width="5.5" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="935.65" y="1935.5" ></text>
+</g>
+<g >
+<title>duckdb::StringUtil::CIHash (138,331 samples, 0.14%)</title><rect x="813.1" y="1637" width="1.7" height="15.0" fill="rgb(241,169,40)" rx="2" ry="2" />
+<text  x="816.13" y="1647.5" ></text>
+</g>
+<g >
+<title>__memmove_sse2_unaligned_erms (204,857 samples, 0.21%)</title><rect x="1114.2" y="1877" width="2.6" height="15.0" fill="rgb(208,14,3)" rx="2" ry="2" />
+<text  x="1117.22" y="1887.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="917" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="927.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (587,742 samples, 0.62%)</title><rect x="1036.3" y="2005" width="7.2" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="1039.25" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="1269" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1279.5" ></text>
+</g>
+<g >
+<title>duckdb::cudf_groupby (559,405 samples, 0.59%)</title><rect x="825.9" y="1925" width="6.9" height="15.0" fill="rgb(225,95,22)" rx="2" ry="2" />
+<text  x="828.89" y="1935.5" ></text>
+</g>
+<g >
+<title>[unknown] (6,233,002 samples, 6.53%)</title><rect x="806.2" y="2037" width="77.0" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="2047.5" >[unknown]</text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="981" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="991.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (239,018 samples, 0.25%)</title><rect x="902.4" y="1861" width="2.9" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="905.37" y="1871.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (246,638 samples, 0.26%)</title><rect x="1043.5" y="1877" width="3.1" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1046.52" y="1887.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="469" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="479.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (400,767 samples, 0.42%)</title><rect x="1111.8" y="1893" width="5.0" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1114.80" y="1903.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (3,342,367 samples, 3.50%)</title><rect x="840.0" y="1797" width="41.3" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="843.01" y="1807.5" >[li..</text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (587,742 samples, 0.62%)</title><rect x="1036.3" y="1797" width="7.2" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1039.25" y="1807.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (213,098 samples, 0.22%)</title><rect x="1079.4" y="1733" width="2.6" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1082.37" y="1743.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (1,133,827 samples, 1.19%)</title><rect x="938.1" y="1925" width="14.0" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="941.08" y="1935.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (141,978 samples, 0.15%)</title><rect x="925.6" y="1765" width="1.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="928.59" y="1775.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (200,302 samples, 0.21%)</title><rect x="15.8" y="1973" width="2.5" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="18.84" y="1983.5" ></text>
+</g>
+<g >
+<title>start_thread (1,021,193 samples, 1.07%)</title><rect x="10.1" y="2053" width="12.6" height="15.0" fill="rgb(212,34,8)" rx="2" ry="2" />
+<text  x="13.06" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="837" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="847.5" ></text>
+</g>
+<g >
+<title>[unknown] (702,665 samples, 0.74%)</title><rect x="806.2" y="1749" width="8.6" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1759.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (829,693 samples, 0.87%)</title><rect x="913.6" y="1829" width="10.3" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="916.61" y="1839.5" ></text>
+</g>
+<g >
+<title>duckdb::StringUtil::CIHash (113,449 samples, 0.12%)</title><rect x="814.8" y="1781" width="1.4" height="15.0" fill="rgb(241,169,40)" rx="2" ry="2" />
+<text  x="817.84" y="1791.5" ></text>
+</g>
+<g >
+<title>duckdb::Binder::Bind (120,059 samples, 0.13%)</title><rect x="956.0" y="2005" width="1.5" height="15.0" fill="rgb(241,169,40)" rx="2" ry="2" />
+<text  x="959.03" y="2015.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (3,043,558 samples, 3.19%)</title><rect x="843.7" y="1621" width="37.6" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="846.70" y="1631.5" >[li..</text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (1,275,199 samples, 1.34%)</title><rect x="1066.2" y="1973" width="15.8" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="1069.25" y="1983.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="101" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="111.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (218,529 samples, 0.23%)</title><rect x="888.8" y="1941" width="2.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="891.76" y="1951.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (601,409 samples, 0.63%)</title><rect x="1109.3" y="1941" width="7.5" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1112.32" y="1951.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (1,275,199 samples, 1.34%)</title><rect x="1066.2" y="1893" width="15.8" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1069.25" y="1903.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (187,311 samples, 0.20%)</title><rect x="938.1" y="1877" width="2.3" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="941.08" y="1887.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="517" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="527.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="1301" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1311.5" ></text>
+</g>
+<g >
+<title>cudf::groupby::groupby::sort_aggregate (4,262,007 samples, 4.46%)</title><rect x="899.4" y="2037" width="52.7" height="15.0" fill="rgb(240,161,38)" rx="2" ry="2" />
+<text  x="902.43" y="2047.5" >cudf:..</text>
+</g>
+<g >
+<title>cudaLaunchKernel (142,333 samples, 0.15%)</title><rect x="25.7" y="2021" width="1.7" height="15.0" fill="rgb(216,51,12)" rx="2" ry="2" />
+<text  x="28.67" y="2031.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (288,815 samples, 0.30%)</title><rect x="1062.7" y="1845" width="3.5" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1065.68" y="1855.5" ></text>
+</g>
+<g >
+<title>duckdb::GPUPhysicalGroupedAggregate::Sink (559,405 samples, 0.59%)</title><rect x="825.9" y="1941" width="6.9" height="15.0" fill="rgb(234,133,31)" rx="2" ry="2" />
+<text  x="828.89" y="1951.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (246,638 samples, 0.26%)</title><rect x="1043.5" y="1925" width="3.1" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1046.52" y="1935.5" ></text>
+</g>
+<g >
+<title>[unknown] (702,665 samples, 0.74%)</title><rect x="806.2" y="1685" width="8.6" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1695.5" ></text>
+</g>
+<g >
+<title>cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags (158,437 samples, 0.17%)</title><rect x="825.9" y="1893" width="1.9" height="15.0" fill="rgb(214,42,10)" rx="2" ry="2" />
+<text  x="828.89" y="1903.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (1,072,710 samples, 1.12%)</title><rect x="1068.7" y="1829" width="13.3" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1071.75" y="1839.5" ></text>
+</g>
+<g >
+<title>sysmalloc (145,027 samples, 0.15%)</title><rect x="1107.5" y="2053" width="1.8" height="15.0" fill="rgb(213,38,9)" rx="2" ry="2" />
+<text  x="1110.53" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="149" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="159.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (670,530 samples, 0.70%)</title><rect x="905.3" y="1797" width="8.3" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="908.32" y="1807.5" ></text>
+</g>
+<g >
+<title>duckdb::Linenoise::Edit (64,433 samples, 0.07%)</title><rect x="965.6" y="2037" width="0.8" height="15.0" fill="rgb(250,208,49)" rx="2" ry="2" />
+<text  x="968.57" y="2047.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (434,435 samples, 0.45%)</title><rect x="908.2" y="1717" width="5.4" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="911.24" y="1727.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (4,324,942 samples, 4.53%)</title><rect x="1136.6" y="2005" width="53.4" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="1139.57" y="2015.5" >[libc..</text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (1,275,199 samples, 1.34%)</title><rect x="1066.2" y="2021" width="15.8" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="1069.25" y="2031.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (246,638 samples, 0.26%)</title><rect x="1043.5" y="1813" width="3.1" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1046.52" y="1823.5" ></text>
+</g>
+<g >
+<title>cub::CUB_200700_700_750_800_860_900_1000_1200_NS::DeviceMergeSortPartitionKernel&lt;int*, long, cudf::experimental::row::lexicographic::less_comparator&lt;cudf::experimental::row::lexicographic::device_row_comparator&lt;false, cudf::nullate::DYNAMIC, cudf::experimental::row::lexicographic::sorting_physical_element_comparator&gt; &gt;, int&gt; (218,529 samples, 0.23%)</title><rect x="888.8" y="2037" width="2.7" height="15.0" fill="rgb(206,4,1)" rx="2" ry="2" />
+<text  x="891.76" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (35,287 samples, 0.04%)</title><rect x="992.3" y="2021" width="0.5" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="995.34" y="2031.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (288,815 samples, 0.30%)</title><rect x="1062.7" y="1909" width="3.5" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1065.68" y="1919.5" ></text>
+</g>
+<g >
+<title>cudf::detail::sorted_order&lt; (1,111,521 samples, 1.16%)</title><rect x="913.6" y="1941" width="13.7" height="15.0" fill="rgb(230,117,28)" rx="2" ry="2" />
+<text  x="916.61" y="1951.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (670,530 samples, 0.70%)</title><rect x="905.3" y="1813" width="8.3" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="908.32" y="1823.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (670,530 samples, 0.70%)</title><rect x="905.3" y="1749" width="8.3" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="908.32" y="1759.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (1,275,199 samples, 1.34%)</title><rect x="1066.2" y="1861" width="15.8" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1069.25" y="1871.5" ></text>
+</g>
+<g >
+<title>__memset_avx512_unaligned_erms (221,399 samples, 0.23%)</title><rect x="1133.8" y="1813" width="2.8" height="15.0" fill="rgb(214,43,10)" rx="2" ry="2" />
+<text  x="1136.83" y="1823.5" ></text>
+</g>
+<g >
+<title>[unknown] (557,758 samples, 0.58%)</title><rect x="970.2" y="2021" width="6.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="973.25" y="2031.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (298,017 samples, 0.31%)</title><rect x="1091.8" y="1989" width="3.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1094.78" y="1999.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (946,516 samples, 0.99%)</title><rect x="940.4" y="1813" width="11.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="943.39" y="1823.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (829,693 samples, 0.87%)</title><rect x="913.6" y="1845" width="10.3" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="916.61" y="1855.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (288,815 samples, 0.30%)</title><rect x="1062.7" y="1797" width="3.5" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1065.68" y="1807.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (239,018 samples, 0.25%)</title><rect x="902.4" y="1893" width="2.9" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="905.37" y="1903.5" ></text>
+</g>
+<g >
+<title>duckdb::Utf8Proc::RenderWidth (64,430 samples, 0.07%)</title><rect x="979.2" y="2037" width="0.8" height="15.0" fill="rgb(239,157,37)" rx="2" ry="2" />
+<text  x="982.18" y="2047.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (601,409 samples, 0.63%)</title><rect x="1109.3" y="1957" width="7.5" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1112.32" y="1967.5" ></text>
+</g>
+<g >
+<title>cudf::detail::gather_helper&lt;long const*, long*, cudf::detail::input_indexalator&gt; (1,550,921 samples, 1.62%)</title><rect x="1043.5" y="2021" width="19.2" height="15.0" fill="rgb(207,11,2)" rx="2" ry="2" />
+<text  x="1046.52" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (816,114 samples, 0.85%)</title><rect x="806.2" y="1957" width="10.0" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1967.5" ></text>
+</g>
+<g >
+<title>[unknown] (138,236 samples, 0.14%)</title><rect x="962.2" y="2021" width="1.7" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="965.18" y="2031.5" ></text>
+</g>
+<g >
+<title>cudf::detail::column_scatterer_impl&lt;int, void&gt;::operator (1,133,827 samples, 1.19%)</title><rect x="938.1" y="1957" width="14.0" height="15.0" fill="rgb(243,179,42)" rx="2" ry="2" />
+<text  x="941.08" y="1967.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="421" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="431.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (187,311 samples, 0.20%)</title><rect x="938.1" y="1781" width="2.3" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="941.08" y="1791.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (4,324,942 samples, 4.53%)</title><rect x="1136.6" y="2021" width="53.4" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="1139.57" y="2031.5" >[libc..</text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (194,547 samples, 0.20%)</title><rect x="897.0" y="1877" width="2.4" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="900.02" y="1887.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (3,342,367 samples, 3.50%)</title><rect x="840.0" y="1637" width="41.3" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="843.01" y="1647.5" >[li..</text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (288,815 samples, 0.30%)</title><rect x="1062.7" y="1941" width="3.5" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1065.68" y="1951.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (218,529 samples, 0.23%)</title><rect x="888.8" y="1877" width="2.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="891.76" y="1887.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (2,486,863 samples, 2.60%)</title><rect x="1136.6" y="1957" width="30.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1139.57" y="1967.5" >[l..</text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (160,364 samples, 0.17%)</title><rect x="1030.9" y="1893" width="2.0" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1033.93" y="1903.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (587,742 samples, 0.62%)</title><rect x="1036.3" y="1829" width="7.2" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1039.25" y="1839.5" ></text>
+</g>
+<g >
+<title>[unknown] (130,045 samples, 0.14%)</title><rect x="1088.5" y="2037" width="1.6" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="1091.48" y="2047.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (142,333 samples, 0.15%)</title><rect x="25.7" y="1989" width="1.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="28.67" y="1999.5" ></text>
+</g>
+<g >
+<title>cub::CUB_200700_700_750_800_860_900_1000_1200_NS::DeviceRadixSort::SortPairsDescending&lt;long, int, long&gt; (3,342,367 samples, 3.50%)</title><rect x="840.0" y="1829" width="41.3" height="15.0" fill="rgb(230,117,28)" rx="2" ry="2" />
+<text  x="843.01" y="1839.5" >cub..</text>
+</g>
+<g >
+<title>__vfprintf_internal (135,447 samples, 0.14%)</title><rect x="883.6" y="2037" width="1.7" height="15.0" fill="rgb(232,125,30)" rx="2" ry="2" />
+<text  x="886.61" y="2047.5" ></text>
+</g>
+<g >
+<title>cudf::groupby::detail::aggregate_result_functor::operator (4,023,851 samples, 4.21%)</title><rect x="902.4" y="2021" width="49.7" height="15.0" fill="rgb(224,88,21)" rx="2" ry="2" />
+<text  x="905.37" y="2031.5" >cudf:..</text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (649,842 samples, 0.68%)</title><rect x="873.3" y="1541" width="8.0" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="876.28" y="1551.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (587,742 samples, 0.62%)</title><rect x="1036.3" y="1989" width="7.2" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="1039.25" y="1999.5" ></text>
+</g>
+<g >
+<title>duckdb::GPUContext::EndQueryInternal (322,540 samples, 0.34%)</title><rect x="821.9" y="1925" width="4.0" height="15.0" fill="rgb(234,137,32)" rx="2" ry="2" />
+<text  x="824.91" y="1935.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (434,435 samples, 0.45%)</title><rect x="908.2" y="1701" width="5.4" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="911.24" y="1711.5" ></text>
+</g>
+<g >
+<title>realloc (243,925 samples, 0.26%)</title><rect x="1130.8" y="1797" width="3.0" height="15.0" fill="rgb(246,189,45)" rx="2" ry="2" />
+<text  x="1133.82" y="1807.5" ></text>
+</g>
+<g >
+<title>cudf::detail::sorted_order&lt; (3,342,367 samples, 3.50%)</title><rect x="840.0" y="1877" width="41.3" height="15.0" fill="rgb(230,117,28)" rx="2" ry="2" />
+<text  x="843.01" y="1887.5" >cud..</text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (218,529 samples, 0.23%)</title><rect x="888.8" y="2005" width="2.7" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="891.76" y="2015.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (901,454 samples, 0.94%)</title><rect x="870.2" y="1573" width="11.1" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="873.17" y="1583.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (246,638 samples, 0.26%)</title><rect x="1043.5" y="1845" width="3.1" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1046.52" y="1855.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="341" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="351.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (38,775,514 samples, 40.60%)</title><rect x="39.1" y="1941" width="479.1" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="42.14" y="1951.5" >[libcuda.so.560.35.05]</text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (141,978 samples, 0.15%)</title><rect x="925.6" y="1845" width="1.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="928.59" y="1855.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (349,332 samples, 0.37%)</title><rect x="895.1" y="1973" width="4.3" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="898.11" y="1983.5" ></text>
+</g>
+<g >
+<title>cudf::allocate_host_as_pinned_threshold (270,660 samples, 0.28%)</title><rect x="1032.9" y="2037" width="3.4" height="15.0" fill="rgb(244,183,43)" rx="2" ry="2" />
+<text  x="1035.91" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (164,071 samples, 0.17%)</title><rect x="954.0" y="2005" width="2.0" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="957.00" y="2015.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (1,838,079 samples, 1.92%)</title><rect x="1167.3" y="1941" width="22.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1170.29" y="1951.5" >[..</text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="373" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="383.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (1,838,079 samples, 1.92%)</title><rect x="1167.3" y="1909" width="22.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1170.29" y="1919.5" >[..</text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (1,133,827 samples, 1.19%)</title><rect x="938.1" y="1893" width="14.0" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="941.08" y="1903.5" ></text>
+</g>
+<g >
+<title>[unknown] (816,114 samples, 0.85%)</title><rect x="806.2" y="1925" width="10.0" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1935.5" ></text>
+</g>
+<g >
+<title>[unknown] (564,334 samples, 0.59%)</title><rect x="806.2" y="1573" width="6.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1583.5" ></text>
+</g>
+<g >
+<title>[unknown] (87,031 samples, 0.09%)</title><rect x="957.5" y="2021" width="1.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="960.51" y="2031.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (194,547 samples, 0.20%)</title><rect x="897.0" y="1861" width="2.4" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="900.02" y="1871.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="197" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="207.5" ></text>
+</g>
+<g >
+<title>[unknown] (816,114 samples, 0.85%)</title><rect x="806.2" y="1813" width="10.0" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1823.5" ></text>
+</g>
+<g >
+<title>__poll (59,674 samples, 0.06%)</title><rect x="20.5" y="2005" width="0.7" height="15.0" fill="rgb(250,208,49)" rx="2" ry="2" />
+<text  x="23.50" y="2015.5" ></text>
+</g>
+<g >
+<title>duckdb::ColumnDataCollectionSegment::GetValidityPointer (123,394 samples, 0.13%)</title><rect x="1083.6" y="2053" width="1.5" height="15.0" fill="rgb(245,187,44)" rx="2" ry="2" />
+<text  x="1086.62" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="661" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="671.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (587,742 samples, 0.62%)</title><rect x="1036.3" y="1973" width="7.2" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="1039.25" y="1983.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (1,304,283 samples, 1.37%)</title><rect x="1046.6" y="1829" width="16.1" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1049.56" y="1839.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (141,978 samples, 0.15%)</title><rect x="925.6" y="1877" width="1.7" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="928.59" y="1887.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (1,603,803 samples, 1.68%)</title><rect x="1116.8" y="1941" width="19.8" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1119.75" y="1951.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (246,638 samples, 0.26%)</title><rect x="1043.5" y="1829" width="3.1" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1046.52" y="1839.5" ></text>
+</g>
+<g >
+<title>duckdb::GPUContext::GPUExecuteQuery (4,807,708 samples, 5.03%)</title><rect x="821.9" y="1989" width="59.4" height="15.0" fill="rgb(247,194,46)" rx="2" ry="2" />
+<text  x="824.91" y="1999.5" >duckdb..</text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (321,286 samples, 0.34%)</title><rect x="1028.9" y="1989" width="4.0" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1031.94" y="1999.5" ></text>
+</g>
+<g >
+<title>duckdb_libpgquery::base_yyparse (77,065 samples, 0.08%)</title><rect x="1095.5" y="2053" width="0.9" height="15.0" fill="rgb(220,72,17)" rx="2" ry="2" />
+<text  x="1098.46" y="2063.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (288,815 samples, 0.30%)</title><rect x="1062.7" y="1989" width="3.5" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="1065.68" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (145,027 samples, 0.15%)</title><rect x="1107.5" y="2037" width="1.8" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="1110.53" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="277" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="287.5" ></text>
+</g>
+<g >
+<title>duckdb::SiriusExtension::GPUProcessingFunction (4,807,708 samples, 5.03%)</title><rect x="821.9" y="2005" width="59.4" height="15.0" fill="rgb(253,221,52)" rx="2" ry="2" />
+<text  x="824.91" y="2015.5" >duckdb..</text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (946,516 samples, 0.99%)</title><rect x="940.4" y="1733" width="11.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="943.39" y="1743.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (1,304,283 samples, 1.37%)</title><rect x="1046.6" y="1861" width="16.1" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1049.56" y="1871.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (3,342,367 samples, 3.50%)</title><rect x="840.0" y="1781" width="41.3" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="843.01" y="1791.5" >[li..</text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (321,286 samples, 0.34%)</title><rect x="1028.9" y="1973" width="4.0" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1031.94" y="1983.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (305,164 samples, 0.32%)</title><rect x="836.2" y="1893" width="3.8" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="839.24" y="1903.5" ></text>
+</g>
+<g >
+<title>duckdb::DataWrapper::DataWrapper (123,045 samples, 0.13%)</title><rect x="834.7" y="1877" width="1.5" height="15.0" fill="rgb(247,196,46)" rx="2" ry="2" />
+<text  x="837.72" y="1887.5" ></text>
+</g>
+<g >
+<title>__memmove_avx512_unaligned_erms (102,941 samples, 0.11%)</title><rect x="1002.0" y="2053" width="1.3" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="1005.04" y="2063.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (139,850 samples, 0.15%)</title><rect x="923.9" y="1877" width="1.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="926.86" y="1887.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (1,304,283 samples, 1.37%)</title><rect x="1046.6" y="1909" width="16.1" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1049.56" y="1919.5" ></text>
+</g>
+<g >
+<title>pthread_mutex_lock@@GLIBC_2.2.5 (322,540 samples, 0.34%)</title><rect x="821.9" y="1909" width="4.0" height="15.0" fill="rgb(244,179,42)" rx="2" ry="2" />
+<text  x="824.91" y="1919.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (349,332 samples, 0.37%)</title><rect x="895.1" y="1957" width="4.3" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="898.11" y="1967.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="133" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="143.5" ></text>
+</g>
+<g >
+<title>cudf::detail::column_sorted_order_fn&lt; (3,342,367 samples, 3.50%)</title><rect x="840.0" y="1845" width="41.3" height="15.0" fill="rgb(208,17,4)" rx="2" ry="2" />
+<text  x="843.01" y="1855.5" >cud..</text>
+</g>
+<g >
+<title>_int_malloc (1,821,120 samples, 1.91%)</title><rect x="1003.4" y="2053" width="22.5" height="15.0" fill="rgb(215,47,11)" rx="2" ry="2" />
+<text  x="1006.36" y="2063.5" >_..</text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (1,304,283 samples, 1.37%)</title><rect x="1046.6" y="1925" width="16.1" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="1049.56" y="1935.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (829,693 samples, 0.87%)</title><rect x="913.6" y="1797" width="10.3" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="916.61" y="1807.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (186,858 samples, 0.20%)</title><rect x="927.3" y="1957" width="2.3" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="930.34" y="1967.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (343,310 samples, 0.36%)</title><rect x="14.1" y="1989" width="4.2" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="17.07" y="1999.5" ></text>
+</g>
+<g >
+<title>duckdb::ColumnDataCopy&lt;int&gt; (131,636 samples, 0.14%)</title><rect x="1085.1" y="2053" width="1.7" height="15.0" fill="rgb(211,29,7)" rx="2" ry="2" />
+<text  x="1088.14" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="725" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="735.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (349,332 samples, 0.37%)</title><rect x="895.1" y="1941" width="4.3" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="898.11" y="1951.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (1,603,803 samples, 1.68%)</title><rect x="1116.8" y="1973" width="19.8" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="1119.75" y="1983.5" ></text>
+</g>
+<g >
+<title>[unknown] (164,071 samples, 0.17%)</title><rect x="954.0" y="2021" width="2.0" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="957.00" y="2031.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (670,530 samples, 0.70%)</title><rect x="905.3" y="1941" width="8.3" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="908.32" y="1951.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (153,685 samples, 0.16%)</title><rect x="827.8" y="1797" width="1.9" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="830.85" y="1807.5" ></text>
+</g>
+<g >
+<title>duckdb::ComparisonSimplificationRule::ComparisonSimplificationRule (136,270 samples, 0.14%)</title><rect x="963.9" y="2005" width="1.7" height="15.0" fill="rgb(250,207,49)" rx="2" ry="2" />
+<text  x="966.88" y="2015.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (218,529 samples, 0.23%)</title><rect x="888.8" y="1829" width="2.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="891.76" y="1839.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (239,018 samples, 0.25%)</title><rect x="902.4" y="1877" width="2.9" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="905.37" y="1887.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (141,978 samples, 0.15%)</title><rect x="925.6" y="1733" width="1.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="928.59" y="1743.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (41,319,697 samples, 43.26%)</title><rect x="28.4" y="1957" width="510.5" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="31.38" y="1967.5" >[libcuda.so.560.35.05]</text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (152,441 samples, 0.16%)</title><rect x="1093.6" y="1941" width="1.9" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1096.58" y="1951.5" ></text>
+</g>
+<g >
+<title>cudaLaunchKernel (909,548 samples, 0.95%)</title><rect x="902.4" y="1973" width="11.2" height="15.0" fill="rgb(216,51,12)" rx="2" ry="2" />
+<text  x="905.37" y="1983.5" ></text>
+</g>
+<g >
+<title>[unknown] (564,334 samples, 0.59%)</title><rect x="806.2" y="1541" width="6.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1551.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="789" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="799.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (153,685 samples, 0.16%)</title><rect x="827.8" y="1765" width="1.9" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="830.85" y="1775.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="405" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="415.5" ></text>
+</g>
+<g >
+<title>pthread_mutex_unlock@@GLIBC_2.2.5 (218,529 samples, 0.23%)</title><rect x="888.8" y="1813" width="2.7" height="15.0" fill="rgb(227,104,24)" rx="2" ry="2" />
+<text  x="891.76" y="1823.5" ></text>
+</g>
+<g >
+<title>cub::CUB_200700_700_750_800_860_900_1000_1200_NS::DeviceRadixSortHistogramKernel&lt;cub::CUB_200700_700_750_800_860_900_1000_1200_NS::DeviceRadixSortPolicy&lt;int, int, unsigned long long&gt;::Policy900, false, int, unsigned long long, cub::CUB_200700_700_750_800_860_900_1000_1200_NS::detail::identity_decomposer_t&gt; (142,333 samples, 0.15%)</title><rect x="25.7" y="2037" width="1.7" height="15.0" fill="rgb(231,119,28)" rx="2" ry="2" />
+<text  x="28.67" y="2047.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (601,409 samples, 0.63%)</title><rect x="1109.3" y="1909" width="7.5" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1112.32" y="1919.5" ></text>
+</g>
+<g >
+<title>duckdb::RLEScanPartialInternal&lt;long, true&gt; (270,031 samples, 0.28%)</title><rect x="966.9" y="2037" width="3.3" height="15.0" fill="rgb(222,80,19)" rx="2" ry="2" />
+<text  x="969.91" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (8,585,761 samples, 8.99%)</title><rect x="700.1" y="1941" width="106.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="703.08" y="1951.5" >[unknown]</text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (1,838,079 samples, 1.92%)</title><rect x="1167.3" y="1861" width="22.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1170.29" y="1871.5" >[..</text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="69" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="79.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (670,530 samples, 0.70%)</title><rect x="905.3" y="1781" width="8.3" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="908.32" y="1791.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (349,332 samples, 0.37%)</title><rect x="895.1" y="1989" width="4.3" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="898.11" y="1999.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (946,516 samples, 0.99%)</title><rect x="940.4" y="1765" width="11.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="943.39" y="1775.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (158,437 samples, 0.17%)</title><rect x="825.9" y="1813" width="1.9" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="828.89" y="1823.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (62,952,563 samples, 65.91%)</title><rect x="28.4" y="1973" width="777.8" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="31.38" y="1983.5" >[libcuda.so.560.35.05]</text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (3,342,367 samples, 3.50%)</title><rect x="840.0" y="1685" width="41.3" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="843.01" y="1695.5" >[li..</text>
+</g>
+<g >
+<title>duckdb::RLEScanPartialInternal&lt;int, true&gt; (557,758 samples, 0.58%)</title><rect x="970.2" y="2005" width="6.9" height="15.0" fill="rgb(225,92,22)" rx="2" ry="2" />
+<text  x="973.25" y="2015.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (829,693 samples, 0.87%)</title><rect x="913.6" y="1893" width="10.3" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="916.61" y="1903.5" ></text>
+</g>
+<g >
+<title>[unknown] (138,236 samples, 0.14%)</title><rect x="962.2" y="2005" width="1.7" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="965.18" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (1,448,883 samples, 1.52%)</title><rect x="521.0" y="1925" width="17.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="523.98" y="1935.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (239,018 samples, 0.25%)</title><rect x="902.4" y="1941" width="2.9" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="905.37" y="1951.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="757" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="767.5" ></text>
+</g>
+<g >
+<title>duckdb::BaseTableRef::~BaseTableRef (120,059 samples, 0.13%)</title><rect x="956.0" y="2037" width="1.5" height="15.0" fill="rgb(205,3,0)" rx="2" ry="2" />
+<text  x="959.03" y="2047.5" ></text>
+</g>
+<g >
+<title>duckdb::AggregateObject::AggregateObject (155,030 samples, 0.16%)</title><rect x="952.1" y="2037" width="1.9" height="15.0" fill="rgb(247,196,47)" rx="2" ry="2" />
+<text  x="955.08" y="2047.5" ></text>
+</g>
+<g >
+<title>duckdb::ColumnData::Deserialize (164,071 samples, 0.17%)</title><rect x="954.0" y="1989" width="2.0" height="15.0" fill="rgb(248,200,47)" rx="2" ry="2" />
+<text  x="957.00" y="1999.5" ></text>
+</g>
+<g >
+<title>duckdb::GPUContext::GPUExecutePendingQueryResult (4,807,708 samples, 5.03%)</title><rect x="821.9" y="1973" width="59.4" height="15.0" fill="rgb(239,158,37)" rx="2" ry="2" />
+<text  x="824.91" y="1983.5" >duckdb..</text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (349,332 samples, 0.37%)</title><rect x="895.1" y="1925" width="4.3" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="898.11" y="1935.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (1,045,458 samples, 1.09%)</title><rect x="1046.6" y="1781" width="12.9" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1049.56" y="1791.5" ></text>
+</g>
+<g >
+<title>[unknown] (816,114 samples, 0.85%)</title><rect x="806.2" y="1829" width="10.0" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1839.5" ></text>
+</g>
+<g >
+<title>[unknown] (120,059 samples, 0.13%)</title><rect x="956.0" y="2021" width="1.5" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="959.03" y="2031.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (141,978 samples, 0.15%)</title><rect x="925.6" y="1701" width="1.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="928.59" y="1711.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="677" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="687.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (1,603,803 samples, 1.68%)</title><rect x="1116.8" y="1893" width="19.8" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1119.75" y="1903.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (153,685 samples, 0.16%)</title><rect x="827.8" y="1877" width="1.9" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="830.85" y="1887.5" ></text>
+</g>
+<g >
+<title>duckdb::RLEScanState&lt;int&gt;::~RLEScanState (557,758 samples, 0.58%)</title><rect x="970.2" y="2037" width="6.9" height="15.0" fill="rgb(226,99,23)" rx="2" ry="2" />
+<text  x="973.25" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (170,737 samples, 0.18%)</title><rect x="23.6" y="2021" width="2.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="26.56" y="2031.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (213,098 samples, 0.22%)</title><rect x="1079.4" y="1717" width="2.6" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1082.37" y="1727.5" ></text>
+</g>
+<g >
+<title>pthread_mutex_unlock@@GLIBC_2.2.5 (142,333 samples, 0.15%)</title><rect x="25.7" y="1877" width="1.7" height="15.0" fill="rgb(227,104,24)" rx="2" ry="2" />
+<text  x="28.67" y="1887.5" ></text>
+</g>
+<g >
+<title>duckdb::cudf_orderby (3,647,531 samples, 3.82%)</title><rect x="836.2" y="1925" width="45.1" height="15.0" fill="rgb(235,140,33)" rx="2" ry="2" />
+<text  x="839.24" y="1935.5" >duck..</text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (670,530 samples, 0.70%)</title><rect x="905.3" y="1861" width="8.3" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="908.32" y="1871.5" ></text>
+</g>
+<g >
+<title>cudf::groupby::detail::sort::sort_groupby_helper::unsorted_keys_labels (1,133,827 samples, 1.19%)</title><rect x="938.1" y="1989" width="14.0" height="15.0" fill="rgb(230,119,28)" rx="2" ry="2" />
+<text  x="941.08" y="1999.5" ></text>
+</g>
+<g >
+<title>pthread_mutex_unlock@@GLIBC_2.2.5 (28,332 samples, 0.03%)</title><rect x="992.4" y="1957" width="0.4" height="15.0" fill="rgb(227,104,24)" rx="2" ry="2" />
+<text  x="995.43" y="1967.5" ></text>
+</g>
+<g >
+<title>[unknown] (3,432,997 samples, 3.59%)</title><rect x="473.9" y="1861" width="42.5" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="476.95" y="1871.5" >[un..</text>
+</g>
+<g >
+<title>duckdb::ExpressionExecutor::InitializeState (87,031 samples, 0.09%)</title><rect x="957.5" y="2005" width="1.1" height="15.0" fill="rgb(211,30,7)" rx="2" ry="2" />
+<text  x="960.51" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (35,287 samples, 0.04%)</title><rect x="992.3" y="2005" width="0.5" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="995.34" y="2015.5" ></text>
+</g>
+<g >
+<title>duckdb::CatalogSet::GetEntry (138,236 samples, 0.14%)</title><rect x="962.2" y="1989" width="1.7" height="15.0" fill="rgb(215,48,11)" rx="2" ry="2" />
+<text  x="965.18" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="325" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="335.5" ></text>
+</g>
+<g >
+<title>duckdb::SingleFileBlockManager::~SingleFileBlockManager (159,709 samples, 0.17%)</title><rect x="977.1" y="2037" width="2.0" height="15.0" fill="rgb(222,80,19)" rx="2" ry="2" />
+<text  x="980.14" y="2047.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (1,304,283 samples, 1.37%)</title><rect x="1046.6" y="1845" width="16.1" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1049.56" y="1855.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (882,181 samples, 0.92%)</title><rect x="1179.1" y="1797" width="10.9" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1182.10" y="1807.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="1141" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1151.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (670,530 samples, 0.70%)</title><rect x="905.3" y="1909" width="8.3" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="908.32" y="1919.5" ></text>
+</g>
+<g >
+<title>cudf::detail::gather_bitmask&lt; (1,275,199 samples, 1.34%)</title><rect x="1066.2" y="2053" width="15.8" height="15.0" fill="rgb(235,139,33)" rx="2" ry="2" />
+<text  x="1069.25" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="1109" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1119.5" ></text>
+</g>
+<g >
+<title>cudf::detail::column_sorted_order_fn&lt; (141,978 samples, 0.15%)</title><rect x="925.6" y="1925" width="1.7" height="15.0" fill="rgb(208,17,4)" rx="2" ry="2" />
+<text  x="928.59" y="1935.5" ></text>
+</g>
+<g >
+<title>[unknown] (1,323,157 samples, 1.39%)</title><rect x="1009.5" y="2037" width="16.4" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="1012.51" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (136,270 samples, 0.14%)</title><rect x="963.9" y="2021" width="1.7" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="966.88" y="2031.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (946,516 samples, 0.99%)</title><rect x="940.4" y="1749" width="11.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="943.39" y="1759.5" ></text>
+</g>
+<g >
+<title>duckdb::PipelineInitializeTask::~PipelineInitializeTask (155,924 samples, 0.16%)</title><rect x="984.7" y="2005" width="1.9" height="15.0" fill="rgb(250,207,49)" rx="2" ry="2" />
+<text  x="987.66" y="2015.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (439,246 samples, 0.46%)</title><rect x="932.6" y="1909" width="5.5" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="935.65" y="1919.5" ></text>
+</g>
+<g >
+<title>duckdb::ColumnDataCollectionSegment::ReadChunk (137,983 samples, 0.14%)</title><rect x="820.2" y="2021" width="1.7" height="15.0" fill="rgb(213,38,9)" rx="2" ry="2" />
+<text  x="823.20" y="2031.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (435,961 samples, 0.46%)</title><rect x="1038.1" y="1765" width="5.4" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1041.13" y="1775.5" ></text>
+</g>
+<g >
+<title>malloc (487,850 samples, 0.51%)</title><rect x="1096.4" y="2053" width="6.0" height="15.0" fill="rgb(230,119,28)" rx="2" ry="2" />
+<text  x="1099.42" y="2063.5" ></text>
+</g>
+<g >
+<title>__GI___pthread_enable_asynccancel (111,658 samples, 0.12%)</title><rect x="19.1" y="2005" width="1.4" height="15.0" fill="rgb(240,165,39)" rx="2" ry="2" />
+<text  x="22.12" y="2015.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="389" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="399.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (37,110,164 samples, 38.86%)</title><rect x="57.9" y="1925" width="458.5" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="60.87" y="1935.5" >[libcuda.so.560.35.05]</text>
+</g>
+<g >
+<title>__malloc_trim (515,966 samples, 0.54%)</title><rect x="995.7" y="2053" width="6.3" height="15.0" fill="rgb(221,76,18)" rx="2" ry="2" />
+<text  x="998.67" y="2063.5" ></text>
+</g>
+<g >
+<title>cudaEventSynchronize (247,283 samples, 0.26%)</title><rect x="829.7" y="1909" width="3.1" height="15.0" fill="rgb(252,218,52)" rx="2" ry="2" />
+<text  x="832.75" y="1919.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="1045" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1055.5" ></text>
+</g>
+<g >
+<title>thrust::cuda_cub::__unique::unique&lt;thrust::detail::execute_with_allocator&lt;rmm::mr::thrust_allocator&lt;char&gt;, thrust::cuda_cub::execute_on_stream_base&gt;, thrust::counting_iterator&lt;int, thrust::use_default, thrust::use_default, thrust::use_default&gt;, int*, cudf::groupby::detail::permuted_row_equality_comparator&lt;cudf::experimental::row::equality::device_row_comparator&lt;false, cudf::nullate::DYNAMIC, cudf::experimental::row::equality::nan_equal_physical_equality_comparator&gt;, int const*&gt; &gt; (186,858 samples, 0.20%)</title><rect x="927.3" y="1989" width="2.3" height="15.0" fill="rgb(244,182,43)" rx="2" ry="2" />
+<text  x="930.34" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (816,114 samples, 0.85%)</title><rect x="806.2" y="1973" width="10.0" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1983.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (62,952,563 samples, 65.91%)</title><rect x="28.4" y="1989" width="777.8" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="31.38" y="1999.5" >[libcuda.so.560.35.05]</text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (946,516 samples, 0.99%)</title><rect x="940.4" y="1845" width="11.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="943.39" y="1855.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (424,940 samples, 0.44%)</title><rect x="1076.8" y="1781" width="5.2" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1079.75" y="1791.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="1429" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1439.5" ></text>
+</g>
+<g >
+<title>__libc_calloc (233,412 samples, 0.24%)</title><rect x="992.8" y="2053" width="2.9" height="15.0" fill="rgb(205,4,0)" rx="2" ry="2" />
+<text  x="995.78" y="2063.5" ></text>
+</g>
+<g >
+<title>malloc (55,829 samples, 0.06%)</title><rect x="21.3" y="2005" width="0.6" height="15.0" fill="rgb(230,119,28)" rx="2" ry="2" />
+<text  x="24.25" y="2015.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (1,575,225 samples, 1.65%)</title><rect x="1170.5" y="1813" width="19.5" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1173.54" y="1823.5" ></text>
+</g>
+<g >
+<title>[unknown] (816,114 samples, 0.85%)</title><rect x="806.2" y="1941" width="10.0" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1951.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (587,742 samples, 0.62%)</title><rect x="1036.3" y="1925" width="7.2" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1039.25" y="1935.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (649,842 samples, 0.68%)</title><rect x="873.3" y="1525" width="8.0" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="876.28" y="1535.5" ></text>
+</g>
+<g >
+<title>std::__cxx11::basic_stringbuf&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;::overflow (154,939 samples, 0.16%)</title><rect x="1104.4" y="2053" width="1.9" height="15.0" fill="rgb(221,75,18)" rx="2" ry="2" />
+<text  x="1107.42" y="2063.5" ></text>
+</g>
+<g >
+<title>cudf::detail::gather (1,839,736 samples, 1.93%)</title><rect x="1043.5" y="2053" width="22.7" height="15.0" fill="rgb(212,33,7)" rx="2" ry="2" />
+<text  x="1046.52" y="2063.5" >c..</text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (1,083,417 samples, 1.13%)</title><rect x="1139.9" y="1877" width="13.4" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1142.89" y="1887.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (153,685 samples, 0.16%)</title><rect x="827.8" y="1781" width="1.9" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="830.85" y="1791.5" ></text>
+</g>
+<g >
+<title>[unknown] (564,334 samples, 0.59%)</title><rect x="806.2" y="1509" width="6.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1519.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (246,638 samples, 0.26%)</title><rect x="1043.5" y="1893" width="3.1" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1046.52" y="1903.5" ></text>
+</g>
+<g >
+<title>[unknown] (564,334 samples, 0.59%)</title><rect x="806.2" y="1637" width="6.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1647.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (1,603,803 samples, 1.68%)</title><rect x="1116.8" y="1845" width="19.8" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1119.75" y="1855.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="1365" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1375.5" ></text>
+</g>
+<g >
+<title>[unknown] (155,924 samples, 0.16%)</title><rect x="984.7" y="2021" width="1.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="987.66" y="2031.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (288,815 samples, 0.30%)</title><rect x="1062.7" y="1973" width="3.5" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="1065.68" y="1983.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="1397" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1407.5" ></text>
+</g>
+<g >
+<title>cudf::detail::cuda_memcpy_async_impl (349,332 samples, 0.37%)</title><rect x="895.1" y="2037" width="4.3" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="898.11" y="2047.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (1,275,199 samples, 1.34%)</title><rect x="1066.2" y="2005" width="15.8" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="1069.25" y="2015.5" ></text>
+</g>
+<g >
+<title>execute_native_thread_routine (35,287 samples, 0.04%)</title><rect x="992.3" y="1989" width="0.5" height="15.0" fill="rgb(233,129,30)" rx="2" ry="2" />
+<text  x="995.34" y="1999.5" ></text>
+</g>
+<g >
+<title>std::char_traits&lt;char&gt;::copy (96,551 samples, 0.10%)</title><rect x="1106.3" y="2053" width="1.2" height="15.0" fill="rgb(231,121,29)" rx="2" ry="2" />
+<text  x="1109.34" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (816,114 samples, 0.85%)</title><rect x="806.2" y="2005" width="10.0" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="2015.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (1,838,079 samples, 1.92%)</title><rect x="1167.3" y="1845" width="22.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1170.29" y="1855.5" >[..</text>
+</g>
+<g >
+<title>cudaStreamSynchronize (186,858 samples, 0.20%)</title><rect x="927.3" y="1973" width="2.3" height="15.0" fill="rgb(217,58,14)" rx="2" ry="2" />
+<text  x="930.34" y="1983.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="453" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="463.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (239,018 samples, 0.25%)</title><rect x="902.4" y="1925" width="2.9" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="905.37" y="1935.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (212,388 samples, 0.22%)</title><rect x="935.5" y="1861" width="2.6" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="938.45" y="1871.5" ></text>
+</g>
+<g >
+<title>cudaLaunchKernel (829,693 samples, 0.87%)</title><rect x="913.6" y="1909" width="10.3" height="15.0" fill="rgb(216,51,12)" rx="2" ry="2" />
+<text  x="916.61" y="1919.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (434,435 samples, 0.45%)</title><rect x="908.2" y="1733" width="5.4" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="911.24" y="1743.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (829,693 samples, 0.87%)</title><rect x="913.6" y="1781" width="10.3" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="916.61" y="1791.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (213,212 samples, 0.22%)</title><rect x="908.2" y="1685" width="2.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="911.24" y="1695.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (151,745 samples, 0.16%)</title><rect x="891.5" y="1941" width="1.8" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="894.46" y="1951.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (218,553 samples, 0.23%)</title><rect x="886.1" y="1941" width="2.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="889.06" y="1951.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (439,246 samples, 0.46%)</title><rect x="932.6" y="1893" width="5.5" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="935.65" y="1903.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (170,737 samples, 0.18%)</title><rect x="23.6" y="2037" width="2.1" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="26.56" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="997" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1007.5" ></text>
+</g>
+<g >
+<title>[unknown] (323,813 samples, 0.34%)</title><rect x="986.6" y="2021" width="4.0" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="989.58" y="2031.5" ></text>
+</g>
+<g >
+<title>cudf::detail::result_cache::add_result (238,156 samples, 0.25%)</title><rect x="899.4" y="2021" width="3.0" height="15.0" fill="rgb(219,68,16)" rx="2" ry="2" />
+<text  x="902.43" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="1077" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1087.5" ></text>
+</g>
+<g >
+<title>pthread_mutex_unlock@@GLIBC_2.2.5 (67,529 samples, 0.07%)</title><rect x="980.0" y="2021" width="0.8" height="15.0" fill="rgb(227,104,24)" rx="2" ry="2" />
+<text  x="982.98" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="85" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="95.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="821" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="831.5" ></text>
+</g>
+<g >
+<title>[unknown] (816,114 samples, 0.85%)</title><rect x="806.2" y="1861" width="10.0" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1871.5" ></text>
+</g>
+<g >
+<title>duckdb::ClientContext::CleanupInternal (339,510 samples, 0.36%)</title><rect x="807.1" y="37" width="4.2" height="15.0" fill="rgb(240,164,39)" rx="2" ry="2" />
+<text  x="810.13" y="47.5" ></text>
+</g>
+<g >
+<title>duckdb::shared_ptr&lt;duckdb::RowGroupSegmentTree, true&gt;::AssertNotNull (159,709 samples, 0.17%)</title><rect x="977.1" y="1989" width="2.0" height="15.0" fill="rgb(239,158,37)" rx="2" ry="2" />
+<text  x="980.14" y="1999.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (153,685 samples, 0.16%)</title><rect x="827.8" y="1861" width="1.9" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="830.85" y="1871.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (142,333 samples, 0.15%)</title><rect x="25.7" y="1941" width="1.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="28.67" y="1951.5" ></text>
+</g>
+<g >
+<title>cudaStreamSynchronize (139,850 samples, 0.15%)</title><rect x="923.9" y="1925" width="1.7" height="15.0" fill="rgb(217,58,14)" rx="2" ry="2" />
+<text  x="926.86" y="1935.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (359,098 samples, 0.38%)</title><rect x="1148.8" y="1845" width="4.5" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1151.84" y="1855.5" ></text>
+</g>
+<g >
+<title>__memset_avx512_unaligned_erms (1,673,412 samples, 1.75%)</title><rect x="518.2" y="1941" width="20.7" height="15.0" fill="rgb(214,43,10)" rx="2" ry="2" />
+<text  x="521.21" y="1951.5" ></text>
+</g>
+<g >
+<title>cudaEventRecord (153,685 samples, 0.16%)</title><rect x="827.8" y="1909" width="1.9" height="15.0" fill="rgb(254,225,53)" rx="2" ry="2" />
+<text  x="830.85" y="1919.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="501" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="511.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (1,045,458 samples, 1.09%)</title><rect x="1046.6" y="1813" width="12.9" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1049.56" y="1823.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="1461" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1471.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="1317" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1327.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (3,342,367 samples, 3.50%)</title><rect x="840.0" y="1765" width="41.3" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="843.01" y="1775.5" >[li..</text>
+</g>
+<g >
+<title>cudaDeviceSynchronize (298,017 samples, 0.31%)</title><rect x="1091.8" y="2037" width="3.7" height="15.0" fill="rgb(248,200,48)" rx="2" ry="2" />
+<text  x="1094.78" y="2047.5" ></text>
+</g>
+<g >
+<title>__select (32,697 samples, 0.03%)</title><rect x="883.2" y="2037" width="0.4" height="15.0" fill="rgb(251,215,51)" rx="2" ry="2" />
+<text  x="886.21" y="2047.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (1,304,283 samples, 1.37%)</title><rect x="1046.6" y="1893" width="16.1" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1049.56" y="1903.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (187,311 samples, 0.20%)</title><rect x="938.1" y="1813" width="2.3" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="941.08" y="1823.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (829,693 samples, 0.87%)</title><rect x="913.6" y="1813" width="10.3" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="916.61" y="1823.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="853" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="863.5" ></text>
+</g>
+<g >
+<title>duckdb::GPUPhysicalProjection::Execute (155,187 samples, 0.16%)</title><rect x="832.8" y="1941" width="1.9" height="15.0" fill="rgb(250,210,50)" rx="2" ry="2" />
+<text  x="835.80" y="1951.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (321,286 samples, 0.34%)</title><rect x="1028.9" y="1957" width="4.0" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1031.94" y="1967.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="965" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="975.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (829,693 samples, 0.87%)</title><rect x="913.6" y="1861" width="10.3" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="916.61" y="1871.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (439,246 samples, 0.46%)</title><rect x="932.6" y="1877" width="5.5" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="935.65" y="1887.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (288,815 samples, 0.30%)</title><rect x="1062.7" y="1829" width="3.5" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1065.68" y="1839.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (3,342,367 samples, 3.50%)</title><rect x="840.0" y="1653" width="41.3" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="843.01" y="1663.5" >[li..</text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (1,838,079 samples, 1.92%)</title><rect x="1167.3" y="1957" width="22.7" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="1170.29" y="1967.5" >[..</text>
+</g>
+<g >
+<title>[unknown] (564,334 samples, 0.59%)</title><rect x="806.2" y="1589" width="6.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1599.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="741" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="751.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (855,305 samples, 0.90%)</title><rect x="1071.4" y="1813" width="10.6" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1074.43" y="1823.5" ></text>
+</g>
+<g >
+<title>cudf::detail::count_unset_bits (858,402 samples, 0.90%)</title><rect x="1032.9" y="2053" width="10.6" height="15.0" fill="rgb(249,206,49)" rx="2" ry="2" />
+<text  x="1035.91" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="1349" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1359.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="533" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="543.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="645" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="655.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (1,275,199 samples, 1.34%)</title><rect x="1066.2" y="1909" width="15.8" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1069.25" y="1919.5" ></text>
+</g>
+<g >
+<title>[unknown] (564,334 samples, 0.59%)</title><rect x="806.2" y="1525" width="6.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1535.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (139,850 samples, 0.15%)</title><rect x="923.9" y="1813" width="1.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="926.86" y="1823.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (435,961 samples, 0.46%)</title><rect x="1038.1" y="1781" width="5.4" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1041.13" y="1791.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (587,742 samples, 0.62%)</title><rect x="1036.3" y="1861" width="7.2" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1039.25" y="1871.5" ></text>
+</g>
+<g >
+<title>cudf::detail::label_segments&lt;int const*, int*&gt; (191,139 samples, 0.20%)</title><rect x="817.8" y="2005" width="2.4" height="15.0" fill="rgb(208,17,4)" rx="2" ry="2" />
+<text  x="820.84" y="2015.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (1,703,642 samples, 1.78%)</title><rect x="1169.0" y="1829" width="21.0" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1171.95" y="1839.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (1,838,079 samples, 1.92%)</title><rect x="1167.3" y="1973" width="22.7" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="1170.29" y="1983.5" >[..</text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (170,737 samples, 0.18%)</title><rect x="23.6" y="2053" width="2.1" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="26.56" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (238,078 samples, 0.25%)</title><rect x="981.7" y="2021" width="3.0" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="984.71" y="2031.5" ></text>
+</g>
+<g >
+<title>duckdb::Binder::PrepareModifiers (127,520 samples, 0.13%)</title><rect x="958.6" y="2005" width="1.6" height="15.0" fill="rgb(250,210,50)" rx="2" ry="2" />
+<text  x="961.59" y="2015.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (1,603,803 samples, 1.68%)</title><rect x="1116.8" y="1957" width="19.8" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="1119.75" y="1967.5" ></text>
+</g>
+<g >
+<title>cub::CUB_200700_700_750_800_860_900_1000_1200_NS::DeviceFor::Bulk&lt;long, thrust::cuda_cub::__tabulate::functor&lt;int*, thrust::system::detail::generic::detail::compute_sequence_value&lt;int, void&gt;, long&gt; &gt; (829,693 samples, 0.87%)</title><rect x="913.6" y="1925" width="10.3" height="15.0" fill="rgb(236,145,34)" rx="2" ry="2" />
+<text  x="916.61" y="1935.5" ></text>
+</g>
+<g >
+<title>cudaLaunchKernel (4,324,942 samples, 4.53%)</title><rect x="1136.6" y="2037" width="53.4" height="15.0" fill="rgb(216,51,12)" rx="2" ry="2" />
+<text  x="1139.57" y="2047.5" >cudaL..</text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="1029" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1039.5" ></text>
+</g>
+<g >
+<title>std::ostream::sentry::~sentry (150,647 samples, 0.16%)</title><rect x="881.3" y="2021" width="1.9" height="15.0" fill="rgb(237,150,36)" rx="2" ry="2" />
+<text  x="884.31" y="2031.5" ></text>
+</g>
+<g >
+<title>duckdb::GPUPhysicalTopN::Sink (3,647,531 samples, 3.82%)</title><rect x="836.2" y="1941" width="45.1" height="15.0" fill="rgb(220,69,16)" rx="2" ry="2" />
+<text  x="839.24" y="1951.5" >duck..</text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (237,594 samples, 0.25%)</title><rect x="1187.1" y="1717" width="2.9" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1190.06" y="1727.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (3,342,367 samples, 3.50%)</title><rect x="840.0" y="1701" width="41.3" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="843.01" y="1711.5" >[li..</text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (139,850 samples, 0.15%)</title><rect x="923.9" y="1893" width="1.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="926.86" y="1903.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (218,553 samples, 0.23%)</title><rect x="886.1" y="1893" width="2.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="889.06" y="1903.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (424,940 samples, 0.44%)</title><rect x="1076.8" y="1765" width="5.2" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1079.75" y="1775.5" ></text>
+</g>
+<g >
+<title>duckdb::GPUExecutor::Execute (4,485,168 samples, 4.70%)</title><rect x="825.9" y="1957" width="55.4" height="15.0" fill="rgb(236,145,34)" rx="2" ry="2" />
+<text  x="828.89" y="1967.5" >duckd..</text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (158,437 samples, 0.17%)</title><rect x="825.9" y="1797" width="1.9" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="828.89" y="1807.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (909,548 samples, 0.95%)</title><rect x="902.4" y="1957" width="11.2" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="905.37" y="1967.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (670,530 samples, 0.70%)</title><rect x="905.3" y="1765" width="8.3" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="908.32" y="1775.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (298,017 samples, 0.31%)</title><rect x="1091.8" y="2005" width="3.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1094.78" y="2015.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (175,173 samples, 0.18%)</title><rect x="16.1" y="1941" width="2.2" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="19.15" y="1951.5" ></text>
+</g>
+<g >
+<title>cudf::detail::gather&lt;thrust::transform_iterator&lt;cuda::__4::__detail::__return_type_wrapper&lt;int, __nv_dl_wrapper_t&lt;__nv_dl_tag&lt;std::unique_ptr&lt;cudf::table, std::default_delete&lt;cudf::table&gt; &gt;  (288,815 samples, 0.30%)</title><rect x="1062.7" y="2037" width="3.5" height="15.0" fill="rgb(226,98,23)" rx="2" ry="2" />
+<text  x="1065.68" y="2047.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (3,342,367 samples, 3.50%)</title><rect x="840.0" y="1717" width="41.3" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="843.01" y="1727.5" >[li..</text>
+</g>
+<g >
+<title>__strcmp_evex (149,318 samples, 0.16%)</title><rect x="516.4" y="1925" width="1.8" height="15.0" fill="rgb(234,134,32)" rx="2" ry="2" />
+<text  x="519.36" y="1935.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (741,802 samples, 0.78%)</title><rect x="1180.8" y="1781" width="9.2" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1183.84" y="1791.5" ></text>
+</g>
+<g >
+<title>thrust::cuda_cub::__unique::doit_step&lt;thrust::counting_iterator&lt;int, thrust::use_default, thrust::use_default, thrust::use_default&gt;, int*, cudf::groupby::detail::permuted_row_equality_comparator&lt;cudf::experimental::row::equality::device_row_comparator&lt;false, cudf::nullate::DYNAMIC, cudf::experimental::row::equality::nan_equal_physical_equality_comparator&gt;, int const*&gt;, int, int*&gt; (4,324,942 samples, 4.53%)</title><rect x="1136.6" y="2053" width="53.4" height="15.0" fill="rgb(238,152,36)" rx="2" ry="2" />
+<text  x="1139.57" y="2063.5" >thrus..</text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (829,693 samples, 0.87%)</title><rect x="913.6" y="1749" width="10.3" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="916.61" y="1759.5" ></text>
+</g>
+<g >
+<title>cudf::detail::stable_sorted_order (439,246 samples, 0.46%)</title><rect x="932.6" y="1989" width="5.5" height="15.0" fill="rgb(252,217,52)" rx="2" ry="2" />
+<text  x="935.65" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (702,665 samples, 0.74%)</title><rect x="806.2" y="1653" width="8.6" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1663.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (186,858 samples, 0.20%)</title><rect x="927.3" y="1861" width="2.3" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="930.34" y="1871.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (231,756 samples, 0.24%)</title><rect x="1128.0" y="1781" width="2.8" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1130.95" y="1791.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (1,391,896 samples, 1.46%)</title><rect x="1119.4" y="1829" width="17.2" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1122.37" y="1839.5" ></text>
+</g>
+<g >
+<title>[unknown] (702,665 samples, 0.74%)</title><rect x="806.2" y="1765" width="8.6" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1775.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (144,120 samples, 0.15%)</title><rect x="1041.7" y="1749" width="1.8" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1044.73" y="1759.5" ></text>
+</g>
+<g >
+<title>cudaLaunchKernel (321,286 samples, 0.34%)</title><rect x="1028.9" y="2037" width="4.0" height="15.0" fill="rgb(216,51,12)" rx="2" ry="2" />
+<text  x="1031.94" y="2047.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (246,638 samples, 0.26%)</title><rect x="1043.5" y="1861" width="3.1" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1046.52" y="1871.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (537,213 samples, 0.56%)</title><rect x="917.2" y="1653" width="6.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="920.22" y="1663.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (153,685 samples, 0.16%)</title><rect x="827.8" y="1829" width="1.9" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="830.85" y="1839.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (587,742 samples, 0.62%)</title><rect x="1036.3" y="1957" width="7.2" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="1039.25" y="1967.5" ></text>
+</g>
+<g >
+<title>cfree@GLIBC_2.2.5 (62,776 samples, 0.07%)</title><rect x="885.3" y="2037" width="0.8" height="15.0" fill="rgb(233,131,31)" rx="2" ry="2" />
+<text  x="888.28" y="2047.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (158,437 samples, 0.17%)</title><rect x="825.9" y="1845" width="1.9" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="828.89" y="1855.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (829,693 samples, 0.87%)</title><rect x="913.6" y="1877" width="10.3" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="916.61" y="1887.5" ></text>
+</g>
+<g >
+<title>malloc_consolidate (160,006 samples, 0.17%)</title><rect x="1102.4" y="2053" width="2.0" height="15.0" fill="rgb(239,159,38)" rx="2" ry="2" />
+<text  x="1105.44" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (564,334 samples, 0.59%)</title><rect x="806.2" y="1477" width="6.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1487.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="1285" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1295.5" ></text>
+</g>
+<g >
+<title>duckdb_moodycamel::ConcurrentQueue&lt;duckdb::shared_ptr&lt;duckdb::Task, true&gt;, duckdb_moodycamel::ConcurrentQueueDefaultTraits&gt;::ExplicitProducer::~ExplicitProducer (238,078 samples, 0.25%)</title><rect x="981.7" y="2037" width="3.0" height="15.0" fill="rgb(208,17,4)" rx="2" ry="2" />
+<text  x="984.71" y="2047.5" ></text>
+</g>
+<g >
+<title>pthread_mutex_lock@@GLIBC_2.2.5 (65,312 samples, 0.07%)</title><rect x="18.3" y="1989" width="0.8" height="15.0" fill="rgb(244,179,42)" rx="2" ry="2" />
+<text  x="21.31" y="1999.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (587,742 samples, 0.62%)</title><rect x="1036.3" y="1941" width="7.2" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="1039.25" y="1951.5" ></text>
+</g>
+<g >
+<title>duckdb::callCudaMemcpyHostToDevice&lt;unsigned char&gt; (298,017 samples, 0.31%)</title><rect x="1091.8" y="2053" width="3.7" height="15.0" fill="rgb(241,169,40)" rx="2" ry="2" />
+<text  x="1094.78" y="2063.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (158,437 samples, 0.17%)</title><rect x="825.9" y="1829" width="1.9" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="828.89" y="1839.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="1173" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1183.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (218,553 samples, 0.23%)</title><rect x="886.1" y="1877" width="2.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="889.06" y="1887.5" ></text>
+</g>
+<g >
+<title>duckdb::CatalogSearchPath::GetDefault (78,271 samples, 0.08%)</title><rect x="806.2" y="37" width="0.9" height="15.0" fill="rgb(219,67,16)" rx="2" ry="2" />
+<text  x="809.16" y="47.5" ></text>
+</g>
+<g >
+<title>cudaMemsetAsync (141,978 samples, 0.15%)</title><rect x="925.6" y="1893" width="1.7" height="15.0" fill="rgb(252,218,52)" rx="2" ry="2" />
+<text  x="928.59" y="1903.5" ></text>
+</g>
+<g >
+<title>cub::CUB_200700_700_750_800_860_900_1000_1200_NS::DeviceRadixSort::SortPairs&lt;int, int, long&gt; (141,978 samples, 0.15%)</title><rect x="925.6" y="1909" width="1.7" height="15.0" fill="rgb(220,70,16)" rx="2" ry="2" />
+<text  x="928.59" y="1919.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="309" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="319.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (484,428 samples, 0.51%)</title><rect x="1147.3" y="1861" width="6.0" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1150.29" y="1871.5" ></text>
+</g>
+<g >
+<title>[unknown] (564,334 samples, 0.59%)</title><rect x="806.2" y="1557" width="6.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1567.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (26,913,411 samples, 28.18%)</title><rect x="183.8" y="1909" width="332.6" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="186.85" y="1919.5" >[libcuda.so.560.35.05]</text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (938,264 samples, 0.98%)</title><rect x="1122.2" y="1813" width="11.6" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1125.24" y="1823.5" ></text>
+</g>
+<g >
+<title>duckdb::BoundConstantExpression::~BoundConstantExpression (87,031 samples, 0.09%)</title><rect x="957.5" y="2037" width="1.1" height="15.0" fill="rgb(249,203,48)" rx="2" ry="2" />
+<text  x="960.51" y="2047.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (288,815 samples, 0.30%)</title><rect x="1062.7" y="1957" width="3.5" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="1065.68" y="1967.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (158,437 samples, 0.17%)</title><rect x="825.9" y="1861" width="1.9" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="828.89" y="1871.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (158,437 samples, 0.17%)</title><rect x="825.9" y="1877" width="1.9" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="828.89" y="1887.5" ></text>
+</g>
+<g >
+<title>cub::CUB_200700_700_750_800_860_900_1000_1200_NS::DeviceFor::Bulk&lt;long, thrust::cuda_cub::__transform::unary_transform_f&lt;thrust::counting_iterator&lt;int, thrust::use_default, thrust::use_default, thrust::use_default&gt;, int*, thrust::cuda_cub::__transform::no_stencil_tag, cudf::groupby::detail::(anonymous namespace)::is_unique_iterator_fn&lt;false, cudf::nullate::DYNAMIC&gt;, thrust::cuda_cub::__transform::always_true_predicate&gt; &gt; (909,548 samples, 0.95%)</title><rect x="902.4" y="1989" width="11.2" height="15.0" fill="rgb(247,194,46)" rx="2" ry="2" />
+<text  x="905.37" y="1999.5" ></text>
+</g>
+<g >
+<title>duckdb::TaskScheduler::ExecuteForever (238,078 samples, 0.25%)</title><rect x="981.7" y="1989" width="3.0" height="15.0" fill="rgb(231,123,29)" rx="2" ry="2" />
+<text  x="984.71" y="1999.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (1,838,079 samples, 1.92%)</title><rect x="1167.3" y="1925" width="22.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1170.29" y="1935.5" >[..</text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (1,072,710 samples, 1.12%)</title><rect x="1068.7" y="1845" width="13.3" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1071.75" y="1855.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (200,302 samples, 0.21%)</title><rect x="15.8" y="1957" width="2.5" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="18.84" y="1967.5" ></text>
+</g>
+<g >
+<title>[unknown] (816,114 samples, 0.85%)</title><rect x="806.2" y="1797" width="10.0" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1807.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (141,978 samples, 0.15%)</title><rect x="925.6" y="1717" width="1.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="928.59" y="1727.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (649,842 samples, 0.68%)</title><rect x="873.3" y="1557" width="8.0" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="876.28" y="1567.5" ></text>
+</g>
+<g >
+<title>cudaLaunchKernel (218,553 samples, 0.23%)</title><rect x="886.1" y="2021" width="2.7" height="15.0" fill="rgb(216,51,12)" rx="2" ry="2" />
+<text  x="889.06" y="2031.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (152,441 samples, 0.16%)</title><rect x="1093.6" y="1957" width="1.9" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1096.58" y="1967.5" ></text>
+</g>
+<g >
+<title>cub::CUB_200700_800_NS::MaxSmOccupancy&lt;void  (158,437 samples, 0.17%)</title><rect x="825.9" y="1909" width="1.9" height="15.0" fill="rgb(232,124,29)" rx="2" ry="2" />
+<text  x="828.89" y="1919.5" ></text>
+</g>
+<g >
+<title>[unknown] (702,665 samples, 0.74%)</title><rect x="806.2" y="1733" width="8.6" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1743.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (247,283 samples, 0.26%)</title><rect x="829.7" y="1893" width="3.1" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="832.75" y="1903.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (424,940 samples, 0.44%)</title><rect x="1076.8" y="1749" width="5.2" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1079.75" y="1759.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="709" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="719.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="1381" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1391.5" ></text>
+</g>
+<g >
+<title>duckdb::Checksum (163,025 samples, 0.17%)</title><rect x="960.2" y="2037" width="2.0" height="15.0" fill="rgb(211,32,7)" rx="2" ry="2" />
+<text  x="963.16" y="2047.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (322,965 samples, 0.34%)</title><rect x="877.3" y="1509" width="4.0" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="880.32" y="1519.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (587,742 samples, 0.62%)</title><rect x="1036.3" y="1909" width="7.2" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1039.25" y="1919.5" ></text>
+</g>
+<g >
+<title>std::_Sp_counted_ptr_inplace&lt;duckdb::DataChunk, std::allocator&lt;duckdb::DataChunk&gt;,  (323,813 samples, 0.34%)</title><rect x="986.6" y="2037" width="4.0" height="15.0" fill="rgb(219,67,16)" rx="2" ry="2" />
+<text  x="989.58" y="2047.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (187,311 samples, 0.20%)</title><rect x="938.1" y="1861" width="2.3" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="941.08" y="1871.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="261" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="271.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (670,530 samples, 0.70%)</title><rect x="905.3" y="1877" width="8.3" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="908.32" y="1887.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (1,550,921 samples, 1.62%)</title><rect x="1043.5" y="1989" width="19.2" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="1046.52" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (159,709 samples, 0.17%)</title><rect x="977.1" y="2021" width="2.0" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="980.14" y="2031.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (246,638 samples, 0.26%)</title><rect x="1043.5" y="1797" width="3.1" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1046.52" y="1807.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (186,858 samples, 0.20%)</title><rect x="927.3" y="1941" width="2.3" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="930.34" y="1951.5" ></text>
+</g>
+<g >
+<title>duckdb::ExpressionRewriter::~ExpressionRewriter (136,270 samples, 0.14%)</title><rect x="963.9" y="2037" width="1.7" height="15.0" fill="rgb(231,122,29)" rx="2" ry="2" />
+<text  x="966.88" y="2047.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (218,553 samples, 0.23%)</title><rect x="886.1" y="1989" width="2.7" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="889.06" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (702,665 samples, 0.74%)</title><rect x="806.2" y="1781" width="8.6" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1791.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (4,324,942 samples, 4.53%)</title><rect x="1136.6" y="1989" width="53.4" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="1139.57" y="1999.5" >[libc..</text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="1061" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1071.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (139,850 samples, 0.15%)</title><rect x="923.9" y="1861" width="1.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="926.86" y="1871.5" ></text>
+</g>
+<g >
+<title>[unknown] (816,114 samples, 0.85%)</title><rect x="806.2" y="1877" width="10.0" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1887.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (141,978 samples, 0.15%)</title><rect x="925.6" y="1781" width="1.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="928.59" y="1791.5" ></text>
+</g>
+<g >
+<title>std::__detail::_Prime_rehash_policy::_M_need_rehash (142,389 samples, 0.15%)</title><rect x="990.6" y="2037" width="1.7" height="15.0" fill="rgb(228,109,26)" rx="2" ry="2" />
+<text  x="993.58" y="2047.5" ></text>
+</g>
+<g >
+<title>duckdb::Highlighting::Tokenize (44,573 samples, 0.05%)</title><rect x="966.4" y="2021" width="0.5" height="15.0" fill="rgb(223,83,19)" rx="2" ry="2" />
+<text  x="969.36" y="2031.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (1,275,199 samples, 1.34%)</title><rect x="1066.2" y="1877" width="15.8" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1069.25" y="1887.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (1,550,921 samples, 1.62%)</title><rect x="1043.5" y="1957" width="19.2" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="1046.52" y="1967.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (212,388 samples, 0.22%)</title><rect x="935.5" y="1845" width="2.6" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="938.45" y="1855.5" ></text>
+</g>
+<g >
+<title>cudf::detail::count_set_bits (587,742 samples, 0.62%)</title><rect x="1036.3" y="2037" width="7.2" height="15.0" fill="rgb(216,51,12)" rx="2" ry="2" />
+<text  x="1039.25" y="2047.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="1253" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1263.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (246,638 samples, 0.26%)</title><rect x="1043.5" y="1909" width="3.1" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1046.52" y="1919.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (153,685 samples, 0.16%)</title><rect x="827.8" y="1813" width="1.9" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="830.85" y="1823.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (321,286 samples, 0.34%)</title><rect x="1028.9" y="2005" width="4.0" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1031.94" y="2015.5" ></text>
+</g>
+<g >
+<title>duckdb::GPUPhysicalTableScan::GetDataDuckDB (123,045 samples, 0.13%)</title><rect x="834.7" y="1941" width="1.5" height="15.0" fill="rgb(214,43,10)" rx="2" ry="2" />
+<text  x="837.72" y="1951.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="613" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="623.5" ></text>
+</g>
+<g >
+<title>[unknown] (816,114 samples, 0.85%)</title><rect x="806.2" y="1845" width="10.0" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1855.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (1,603,803 samples, 1.68%)</title><rect x="1116.8" y="1925" width="19.8" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1119.75" y="1935.5" ></text>
+</g>
+<g >
+<title>[unknown] (127,520 samples, 0.13%)</title><rect x="958.6" y="2021" width="1.6" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="961.59" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (816,114 samples, 0.85%)</title><rect x="806.2" y="1909" width="10.0" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1919.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (349,332 samples, 0.37%)</title><rect x="895.1" y="1909" width="4.3" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="898.11" y="1919.5" ></text>
+</g>
+<g >
+<title>duckdb::GPUColumn::GPUColumn (123,045 samples, 0.13%)</title><rect x="834.7" y="1893" width="1.5" height="15.0" fill="rgb(218,60,14)" rx="2" ry="2" />
+<text  x="837.72" y="1903.5" ></text>
+</g>
+<g >
+<title>__isoc99_sscanf (168,226 samples, 0.18%)</title><rect x="538.9" y="1957" width="2.1" height="15.0" fill="rgb(236,146,35)" rx="2" ry="2" />
+<text  x="541.88" y="1967.5" ></text>
+</g>
+<g >
+<title>[duckdb] (76,974 samples, 0.08%)</title><rect x="27.4" y="2037" width="1.0" height="15.0" fill="rgb(213,38,9)" rx="2" ry="2" />
+<text  x="30.43" y="2047.5" ></text>
+</g>
+<g >
+<title>all (95,507,803 samples, 100%)</title><rect x="10.0" y="2085" width="1180.0" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="13.00" y="2095.5" ></text>
+</g>
+<g >
+<title>std::_Sp_counted_deleter&lt;duckdb::PipelineInitializeTask*, std::default_delete&lt;duckdb::PipelineInitializeTask&gt;, std::allocator&lt;void&gt;,  (155,924 samples, 0.16%)</title><rect x="984.7" y="2037" width="1.9" height="15.0" fill="rgb(211,28,6)" rx="2" ry="2" />
+<text  x="987.66" y="2047.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (829,693 samples, 0.87%)</title><rect x="913.6" y="1717" width="10.3" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="916.61" y="1727.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="357" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="367.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="933" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="943.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (359,098 samples, 0.38%)</title><rect x="1148.8" y="1829" width="4.5" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1151.84" y="1839.5" ></text>
+</g>
+<g >
+<title>cudf::groupby::detail::group_nunique (909,548 samples, 0.95%)</title><rect x="902.4" y="2005" width="11.2" height="15.0" fill="rgb(246,191,45)" rx="2" ry="2" />
+<text  x="905.37" y="2015.5" ></text>
+</g>
+<g >
+<title>duckdb::Binder::Bind (120,059 samples, 0.13%)</title><rect x="956.0" y="1989" width="1.5" height="15.0" fill="rgb(241,169,40)" rx="2" ry="2" />
+<text  x="959.03" y="1999.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (349,332 samples, 0.37%)</title><rect x="895.1" y="1893" width="4.3" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="898.11" y="1903.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (670,530 samples, 0.70%)</title><rect x="905.3" y="1829" width="8.3" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="908.32" y="1839.5" ></text>
+</g>
+<g >
+<title>__memset_avx512_unaligned_erms (258,825 samples, 0.27%)</title><rect x="1059.5" y="1813" width="3.2" height="15.0" fill="rgb(214,43,10)" rx="2" ry="2" />
+<text  x="1062.48" y="1823.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (186,858 samples, 0.20%)</title><rect x="927.3" y="1909" width="2.3" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="930.34" y="1919.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="181" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="191.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (321,286 samples, 0.34%)</title><rect x="1028.9" y="1925" width="4.0" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1031.94" y="1935.5" ></text>
+</g>
+<g >
+<title>duckdb::PhysicalTableScan::GetData (4,807,708 samples, 5.03%)</title><rect x="821.9" y="2021" width="59.4" height="15.0" fill="rgb(230,116,27)" rx="2" ry="2" />
+<text  x="824.91" y="2031.5" >duckdb..</text>
+</g>
+<g >
+<title>duckdb_je_tcache_flush (67,529 samples, 0.07%)</title><rect x="980.0" y="2037" width="0.8" height="15.0" fill="rgb(217,56,13)" rx="2" ry="2" />
+<text  x="982.98" y="2047.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (1,275,199 samples, 1.34%)</title><rect x="1066.2" y="1925" width="15.8" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1069.25" y="1935.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="213" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="223.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (587,742 samples, 0.62%)</title><rect x="1036.3" y="1845" width="7.2" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1039.25" y="1855.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (685,268 samples, 0.72%)</title><rect x="915.4" y="1685" width="8.5" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="918.39" y="1695.5" ></text>
+</g>
+<g >
+<title>[unknown] (78,134,280 samples, 81.81%)</title><rect x="27.4" y="2053" width="965.4" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="30.43" y="2063.5" >[unknown]</text>
+</g>
+<g >
+<title>__memmove_sse2_unaligned_erms (21,464,640 samples, 22.47%)</title><rect x="541.0" y="1957" width="265.2" height="15.0" fill="rgb(208,14,3)" rx="2" ry="2" />
+<text  x="543.96" y="1967.5" >__memmove_sse2_unaligned_erms</text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (288,815 samples, 0.30%)</title><rect x="1062.7" y="1861" width="3.5" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1065.68" y="1871.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (1,603,803 samples, 1.68%)</title><rect x="1116.8" y="1861" width="19.8" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1119.75" y="1871.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (24,889,664 samples, 26.06%)</title><rect x="208.9" y="1877" width="307.5" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="211.85" y="1887.5" >[libcuda.so.560.35.05]</text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (670,530 samples, 0.70%)</title><rect x="905.3" y="1925" width="8.3" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="908.32" y="1935.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (349,332 samples, 0.37%)</title><rect x="895.1" y="2005" width="4.3" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="898.11" y="2015.5" ></text>
+</g>
+<g >
+<title>duckdb::sirius::GpuExpressionExecutor::AddExpression (155,187 samples, 0.16%)</title><rect x="832.8" y="1909" width="1.9" height="15.0" fill="rgb(247,197,47)" rx="2" ry="2" />
+<text  x="835.80" y="1919.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (295,586 samples, 0.31%)</title><rect x="891.5" y="1973" width="3.6" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="894.46" y="1983.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (3,342,367 samples, 3.50%)</title><rect x="840.0" y="1749" width="41.3" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="843.01" y="1759.5" >[li..</text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (1,304,283 samples, 1.37%)</title><rect x="1046.6" y="1941" width="16.1" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="1049.56" y="1951.5" ></text>
+</g>
+<g >
+<title>cudaLaunchKernel (1,550,921 samples, 1.62%)</title><rect x="1043.5" y="2005" width="19.2" height="15.0" fill="rgb(216,51,12)" rx="2" ry="2" />
+<text  x="1046.52" y="2015.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (1,133,827 samples, 1.19%)</title><rect x="938.1" y="1909" width="14.0" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="941.08" y="1919.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (2,486,863 samples, 2.60%)</title><rect x="1136.6" y="1941" width="30.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1139.57" y="1951.5" >[l..</text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="901" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="911.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (829,693 samples, 0.87%)</title><rect x="913.6" y="1733" width="10.3" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="916.61" y="1743.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="245" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="255.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="805" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="815.5" ></text>
+</g>
+<g >
+<title>cudf::detail::gather_helper&lt;long const*, long*, thrust::transform_iterator&lt;cuda::__4::__detail::__return_type_wrapper&lt;int, __nv_dl_wrapper_t&lt;__nv_dl_tag&lt;std::unique_ptr&lt;cudf::table, std::default_delete&lt;cudf::table&gt; &gt;  (288,815 samples, 0.30%)</title><rect x="1062.7" y="2021" width="3.5" height="15.0" fill="rgb(206,6,1)" rx="2" ry="2" />
+<text  x="1065.68" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="693" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="703.5" ></text>
+</g>
+<g >
+<title>pthread_mutex_lock@@GLIBC_2.2.5 (59,672 samples, 0.06%)</title><rect x="21.9" y="2021" width="0.8" height="15.0" fill="rgb(244,179,42)" rx="2" ry="2" />
+<text  x="24.94" y="2031.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (408,273 samples, 0.43%)</title><rect x="918.8" y="1637" width="5.1" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="921.81" y="1647.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="581" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="591.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (670,530 samples, 0.70%)</title><rect x="905.3" y="1845" width="8.3" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="908.32" y="1855.5" ></text>
+</g>
+<g >
+<title>cudf::detail::scatter&lt;cudf::detail::input_indexalator&gt; (1,133,827 samples, 1.19%)</title><rect x="938.1" y="1973" width="14.0" height="15.0" fill="rgb(232,128,30)" rx="2" ry="2" />
+<text  x="941.08" y="1983.5" ></text>
+</g>
+<g >
+<title>cub::CUB_200700_700_750_800_860_900_1000_1200_NS::PtxVersion (295,586 samples, 0.31%)</title><rect x="891.5" y="2037" width="3.6" height="15.0" fill="rgb(231,120,28)" rx="2" ry="2" />
+<text  x="894.46" y="2047.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (141,978 samples, 0.15%)</title><rect x="925.6" y="1829" width="1.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="928.59" y="1839.5" ></text>
+</g>
+<g >
+<title>cudf::sorted_order (3,342,367 samples, 3.50%)</title><rect x="840.0" y="1909" width="41.3" height="15.0" fill="rgb(217,58,14)" rx="2" ry="2" />
+<text  x="843.01" y="1919.5" >cud..</text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (946,516 samples, 0.99%)</title><rect x="940.4" y="1861" width="11.7" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="943.39" y="1871.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (218,529 samples, 0.23%)</title><rect x="888.8" y="1925" width="2.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="891.76" y="1935.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (142,333 samples, 0.15%)</title><rect x="25.7" y="1925" width="1.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="28.67" y="1935.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (946,516 samples, 0.99%)</title><rect x="940.4" y="1829" width="11.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="943.39" y="1839.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (321,286 samples, 0.34%)</title><rect x="1028.9" y="1909" width="4.0" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1031.94" y="1919.5" ></text>
+</g>
+<g >
+<title>duckdb::GPUContext::CleanupInternal (322,540 samples, 0.34%)</title><rect x="821.9" y="1941" width="4.0" height="15.0" fill="rgb(237,148,35)" rx="2" ry="2" />
+<text  x="824.91" y="1951.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (533,659 samples, 0.56%)</title><rect x="12.5" y="2005" width="6.6" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="15.53" y="2015.5" ></text>
+</g>
+<g >
+<title>cudf::detail::sorted_order&lt; (439,246 samples, 0.46%)</title><rect x="932.6" y="1973" width="5.5" height="15.0" fill="rgb(230,117,28)" rx="2" ry="2" />
+<text  x="935.65" y="1983.5" ></text>
+</g>
+<g >
+<title>cudaFuncGetAttributes (295,586 samples, 0.31%)</title><rect x="891.5" y="2021" width="3.6" height="15.0" fill="rgb(210,23,5)" rx="2" ry="2" />
+<text  x="894.46" y="2031.5" ></text>
+</g>
+<g >
+<title>cudf::detail::gather&lt;cudf::detail::input_indexalator&gt; (1,550,921 samples, 1.62%)</title><rect x="1043.5" y="2037" width="19.2" height="15.0" fill="rgb(227,103,24)" rx="2" ry="2" />
+<text  x="1046.52" y="2047.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (185,748 samples, 0.19%)</title><rect x="949.8" y="1669" width="2.3" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="952.79" y="1679.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (537,213 samples, 0.56%)</title><rect x="917.2" y="1669" width="6.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="920.22" y="1679.5" ></text>
+</g>
+<g >
+<title>cudaLaunchKernel (218,529 samples, 0.23%)</title><rect x="888.8" y="2021" width="2.7" height="15.0" fill="rgb(216,51,12)" rx="2" ry="2" />
+<text  x="891.76" y="2031.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (185,748 samples, 0.19%)</title><rect x="949.8" y="1701" width="2.3" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="952.79" y="1711.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="437" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="447.5" ></text>
+</g>
+<g >
+<title>cudf::detail::sorted_order (3,342,367 samples, 3.50%)</title><rect x="840.0" y="1893" width="41.3" height="15.0" fill="rgb(218,60,14)" rx="2" ry="2" />
+<text  x="843.01" y="1903.5" >cud..</text>
+</g>
+<g >
+<title>duckdb_libpgquery::core_yylex (73,123 samples, 0.08%)</title><rect x="980.8" y="2037" width="0.9" height="15.0" fill="rgb(236,147,35)" rx="2" ry="2" />
+<text  x="983.81" y="2047.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (218,553 samples, 0.23%)</title><rect x="886.1" y="1957" width="2.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="889.06" y="1967.5" ></text>
+</g>
+<g >
+<title>std::thread::_State_impl&lt;std::thread::_Invoker&lt;std::tuple&lt;spdlog::details::periodic_worker::periodic_worker (28,332 samples, 0.03%)</title><rect x="992.4" y="1973" width="0.4" height="15.0" fill="rgb(236,144,34)" rx="2" ry="2" />
+<text  x="995.43" y="1983.5" ></text>
+</g>
+<g >
+<title>cfree@GLIBC_2.2.5 (146,553 samples, 0.15%)</title><rect x="811.3" y="1461" width="1.8" height="15.0" fill="rgb(233,131,31)" rx="2" ry="2" />
+<text  x="814.32" y="1471.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (1,838,079 samples, 1.92%)</title><rect x="1167.3" y="1877" width="22.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1170.29" y="1887.5" >[..</text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (587,742 samples, 0.62%)</title><rect x="1036.3" y="1893" width="7.2" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1039.25" y="1903.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (1,045,458 samples, 1.09%)</title><rect x="1046.6" y="1797" width="12.9" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1049.56" y="1807.5" ></text>
+</g>
+<g >
+<title>cudf::groupby::detail::sort::sort_groupby_helper::sorted_values (1,815,924 samples, 1.90%)</title><rect x="929.6" y="2005" width="22.5" height="15.0" fill="rgb(241,169,40)" rx="2" ry="2" />
+<text  x="932.65" y="2015.5" >c..</text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (587,742 samples, 0.62%)</title><rect x="1036.3" y="1877" width="7.2" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1039.25" y="1887.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (246,638 samples, 0.26%)</title><rect x="1043.5" y="1941" width="3.1" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1046.52" y="1951.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (142,333 samples, 0.15%)</title><rect x="25.7" y="1893" width="1.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="28.67" y="1903.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (153,685 samples, 0.16%)</title><rect x="827.8" y="1893" width="1.9" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="830.85" y="1903.5" ></text>
+</g>
+<g >
+<title>cudaLaunchKernel (288,815 samples, 0.30%)</title><rect x="1062.7" y="2005" width="3.5" height="15.0" fill="rgb(216,51,12)" rx="2" ry="2" />
+<text  x="1065.68" y="2015.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (1,275,199 samples, 1.34%)</title><rect x="1066.2" y="1957" width="15.8" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="1069.25" y="1967.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (186,858 samples, 0.20%)</title><rect x="927.3" y="1893" width="2.3" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="930.34" y="1903.5" ></text>
+</g>
+<g >
+<title>thrust::cuda_cub::__merge_sort::doit_step&lt;int*, int*, long, cudf::experimental::row::lexicographic::less_comparator&lt;cudf::experimental::row::lexicographic::device_row_comparator&lt;false, cudf::nullate::DYNAMIC, cudf::experimental::row::lexicographic::sorting_physical_element_comparator&gt; &gt; &gt; (2,205,212 samples, 2.31%)</title><rect x="1109.3" y="2053" width="27.3" height="15.0" fill="rgb(206,4,1)" rx="2" ry="2" />
+<text  x="1112.32" y="2063.5" >t..</text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="1413" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1423.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (685,268 samples, 0.72%)</title><rect x="915.4" y="1701" width="8.5" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="918.39" y="1711.5" ></text>
+</g>
+<g >
+<title>cudaGetLastError (191,139 samples, 0.20%)</title><rect x="817.8" y="1989" width="2.4" height="15.0" fill="rgb(253,222,53)" rx="2" ry="2" />
+<text  x="820.84" y="1999.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="485" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="495.5" ></text>
+</g>
+<g >
+<title>[unknown] (702,665 samples, 0.74%)</title><rect x="806.2" y="1701" width="8.6" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1711.5" ></text>
+</g>
+<g >
+<title>cuda-EvtHandlr (1,026,310 samples, 1.07%)</title><rect x="10.0" y="2069" width="12.7" height="15.0" fill="rgb(215,46,11)" rx="2" ry="2" />
+<text  x="13.00" y="2079.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (1,275,199 samples, 1.34%)</title><rect x="1066.2" y="1989" width="15.8" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="1069.25" y="1999.5" ></text>
+</g>
+<g >
+<title>__snprintf_chk (64,430 samples, 0.07%)</title><rect x="965.6" y="2021" width="0.8" height="15.0" fill="rgb(209,20,4)" rx="2" ry="2" />
+<text  x="968.57" y="2031.5" ></text>
+</g>
+<g >
+<title>[unknown] (159,709 samples, 0.17%)</title><rect x="977.1" y="2005" width="2.0" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="980.14" y="2015.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (141,978 samples, 0.15%)</title><rect x="925.6" y="1797" width="1.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="928.59" y="1807.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (400,658 samples, 0.42%)</title><rect x="1185.0" y="1749" width="5.0" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1188.05" y="1759.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (141,978 samples, 0.15%)</title><rect x="925.6" y="1749" width="1.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="928.59" y="1759.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (187,311 samples, 0.20%)</title><rect x="938.1" y="1797" width="2.3" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="941.08" y="1807.5" ></text>
+</g>
+<g >
+<title>std::__shared_count&lt; (164,071 samples, 0.17%)</title><rect x="954.0" y="1973" width="2.0" height="15.0" fill="rgb(248,201,48)" rx="2" ry="2" />
+<text  x="957.00" y="1983.5" ></text>
+</g>
+<g >
+<title>[unknown] (143,841 samples, 0.15%)</title><rect x="893.3" y="1941" width="1.8" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="896.33" y="1951.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (195,910 samples, 0.21%)</title><rect x="1111.8" y="1877" width="2.4" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1114.80" y="1887.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (186,858 samples, 0.20%)</title><rect x="927.3" y="1845" width="2.3" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="930.34" y="1855.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="1221" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1231.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (601,409 samples, 0.63%)</title><rect x="1109.3" y="1973" width="7.5" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1112.32" y="1983.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="1093" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1103.5" ></text>
+</g>
+<g >
+<title>cudaLaunchKernel (3,342,367 samples, 3.50%)</title><rect x="840.0" y="1813" width="41.3" height="15.0" fill="rgb(216,51,12)" rx="2" ry="2" />
+<text  x="843.01" y="1823.5" >cud..</text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (218,529 samples, 0.23%)</title><rect x="888.8" y="1893" width="2.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="891.76" y="1903.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (1,275,199 samples, 1.34%)</title><rect x="1066.2" y="1941" width="15.8" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1069.25" y="1951.5" ></text>
+</g>
+<g >
+<title>duckdb::GPUBufferManager::createTableAndColumnInGPU (123,045 samples, 0.13%)</title><rect x="834.7" y="1925" width="1.5" height="15.0" fill="rgb(213,41,9)" rx="2" ry="2" />
+<text  x="837.72" y="1935.5" ></text>
+</g>
+<g >
+<title>cudaLaunchKernel (1,133,827 samples, 1.19%)</title><rect x="938.1" y="1941" width="14.0" height="15.0" fill="rgb(216,51,12)" rx="2" ry="2" />
+<text  x="941.08" y="1951.5" ></text>
+</g>
+<g >
+<title>duckdb::AttachedDatabase::~AttachedDatabase (164,071 samples, 0.17%)</title><rect x="954.0" y="2037" width="2.0" height="15.0" fill="rgb(235,140,33)" rx="2" ry="2" />
+<text  x="957.00" y="2047.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (231,756 samples, 0.24%)</title><rect x="1128.0" y="1797" width="2.8" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1130.95" y="1807.5" ></text>
+</g>
+<g >
+<title>pthread_mutex_lock@@GLIBC_2.2.5 (138,236 samples, 0.14%)</title><rect x="962.2" y="1973" width="1.7" height="15.0" fill="rgb(244,179,42)" rx="2" ry="2" />
+<text  x="965.18" y="1983.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (142,333 samples, 0.15%)</title><rect x="25.7" y="1909" width="1.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="28.67" y="1919.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (305,164 samples, 0.32%)</title><rect x="836.2" y="1877" width="3.8" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="839.24" y="1887.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="869" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="879.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (3,342,367 samples, 3.50%)</title><rect x="840.0" y="1669" width="41.3" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="843.01" y="1679.5" >[li..</text>
+</g>
+<g >
+<title>pthread_mutex_unlock@@GLIBC_2.2.5 (268,097 samples, 0.28%)</title><rect x="920.5" y="1621" width="3.4" height="15.0" fill="rgb(227,104,24)" rx="2" ry="2" />
+<text  x="923.55" y="1631.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (218,553 samples, 0.23%)</title><rect x="886.1" y="2005" width="2.7" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="889.06" y="2015.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (142,333 samples, 0.15%)</title><rect x="25.7" y="2053" width="1.7" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="28.67" y="2063.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (218,529 samples, 0.23%)</title><rect x="888.8" y="1861" width="2.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="891.76" y="1871.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (139,850 samples, 0.15%)</title><rect x="923.9" y="1829" width="1.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="926.86" y="1839.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="1333" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1343.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="549" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="559.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (152,441 samples, 0.16%)</title><rect x="1093.6" y="1925" width="1.9" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1096.58" y="1935.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (239,018 samples, 0.25%)</title><rect x="902.4" y="1909" width="2.9" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="905.37" y="1919.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="165" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="175.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (62,952,563 samples, 65.91%)</title><rect x="28.4" y="2021" width="777.8" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="31.38" y="2031.5" >[libcudart.so.12.6.77]</text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (237,594 samples, 0.25%)</title><rect x="1187.1" y="1733" width="2.9" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1190.06" y="1743.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="1445" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1455.5" ></text>
+</g>
+<g >
+<title>cudf::groupby::detail::sort::sort_groupby_helper::group_offsets (1,298,379 samples, 1.36%)</title><rect x="913.6" y="2005" width="16.0" height="15.0" fill="rgb(253,221,52)" rx="2" ry="2" />
+<text  x="916.61" y="2015.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (139,850 samples, 0.15%)</title><rect x="923.9" y="1845" width="1.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="926.86" y="1855.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (295,586 samples, 0.31%)</title><rect x="891.5" y="2005" width="3.6" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="894.46" y="2015.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (2,205,212 samples, 2.31%)</title><rect x="1109.3" y="2021" width="27.3" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="1112.32" y="2031.5" >[..</text>
+</g>
+<g >
+<title>std::thread::_State_impl&lt;std::thread::_Invoker&lt;std::tuple&lt;spdlog::details::periodic_worker::periodic_worker (35,287 samples, 0.04%)</title><rect x="992.3" y="2037" width="0.5" height="15.0" fill="rgb(236,144,34)" rx="2" ry="2" />
+<text  x="995.34" y="2047.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (2,205,212 samples, 2.31%)</title><rect x="1109.3" y="2005" width="27.3" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="1112.32" y="2015.5" >[..</text>
+</g>
+<g >
+<title>duckdb (94,481,493 samples, 98.93%)</title><rect x="22.7" y="2069" width="1167.3" height="15.0" fill="rgb(251,215,51)" rx="2" ry="2" />
+<text  x="25.68" y="2079.5" >duckdb</text>
+</g>
+<g >
+<title>cub::CUB_200700_700_750_800_860_900_1000_1200_NS::DeviceMergeSortMergeKernel&lt;cub::CUB_200700_700_750_800_860_900_1000_1200_NS::DeviceMergeSortPolicy&lt;int*&gt;::Policy600, int*, cub::CUB_200700_700_750_800_860_900_1000_1200_NS::NullType*, int*, cub::CUB_200700_700_750_800_860_900_1000_1200_NS::NullType*, long, cudf::experimental::row::lexicographic::less_comparator&lt;cudf::experimental::row::lexicographic::device_row_comparator&lt;false, cudf::nullate::DYNAMIC, cudf::experimental::row::lexicographic::sorting_physical_element_comparator&gt; &gt;, int, cub::CUB_200700_700_750_800_860_900_1000_1200_NS::NullType&gt; (218,553 samples, 0.23%)</title><rect x="886.1" y="2037" width="2.7" height="15.0" fill="rgb(205,3,0)" rx="2" ry="2" />
+<text  x="889.06" y="2047.5" ></text>
+</g>
+<g >
+<title>duckdb::DuckCatalog::~DuckCatalog (138,236 samples, 0.14%)</title><rect x="962.2" y="2037" width="1.7" height="15.0" fill="rgb(206,8,1)" rx="2" ry="2" />
+<text  x="965.18" y="2047.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (1,550,921 samples, 1.62%)</title><rect x="1043.5" y="1973" width="19.2" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="1046.52" y="1983.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (153,685 samples, 0.16%)</title><rect x="827.8" y="1845" width="1.9" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="830.85" y="1855.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (946,516 samples, 0.99%)</title><rect x="940.4" y="1877" width="11.7" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="943.39" y="1887.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (1,304,283 samples, 1.37%)</title><rect x="1046.6" y="1877" width="16.1" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1049.56" y="1887.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (321,286 samples, 0.34%)</title><rect x="1028.9" y="1941" width="4.0" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1031.94" y="1951.5" ></text>
+</g>
+<g >
+<title>duckdb::sirius::GpuExpressionExecutor::GpuExpressionExecutor (155,187 samples, 0.16%)</title><rect x="832.8" y="1925" width="1.9" height="15.0" fill="rgb(250,208,49)" rx="2" ry="2" />
+<text  x="835.80" y="1935.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="229" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="239.5" ></text>
+</g>
+<g >
+<title>cudaLaunchKernel (587,742 samples, 0.62%)</title><rect x="1036.3" y="2021" width="7.2" height="15.0" fill="rgb(216,51,12)" rx="2" ry="2" />
+<text  x="1039.25" y="2031.5" ></text>
+</g>
+<g >
+<title>cudaLaunchKernel (2,205,212 samples, 2.31%)</title><rect x="1109.3" y="2037" width="27.3" height="15.0" fill="rgb(216,51,12)" rx="2" ry="2" />
+<text  x="1112.32" y="2047.5" >c..</text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (3,342,367 samples, 3.50%)</title><rect x="840.0" y="1733" width="41.3" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="843.01" y="1743.5" >[li..</text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="1013" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1023.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (141,978 samples, 0.15%)</title><rect x="925.6" y="1813" width="1.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="928.59" y="1823.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (62,952,563 samples, 65.91%)</title><rect x="28.4" y="2037" width="777.8" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="31.38" y="2047.5" >[libcudart.so.12.6.77]</text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (62,952,563 samples, 65.91%)</title><rect x="28.4" y="2005" width="777.8" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="31.38" y="2015.5" >[libcuda.so.560.35.05]</text>
+</g>
+<g >
+<title>cub::CUB_200700_800_NS::DeviceMergeSort::SortPairsNoNVTX&lt;int*, int*, unsigned long, duckdb::CustomLess&gt; (321,286 samples, 0.34%)</title><rect x="1028.9" y="2053" width="4.0" height="15.0" fill="rgb(216,54,13)" rx="2" ry="2" />
+<text  x="1031.94" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="1125" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1135.5" ></text>
+</g>
+<g >
+<title>__memmove_avx512_unaligned_erms (129,411 samples, 0.14%)</title><rect x="816.2" y="2021" width="1.6" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="819.24" y="2031.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (1,838,079 samples, 1.92%)</title><rect x="1167.3" y="1893" width="22.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1170.29" y="1903.5" >[..</text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (218,529 samples, 0.23%)</title><rect x="888.8" y="1973" width="2.7" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="891.76" y="1983.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (218,529 samples, 0.23%)</title><rect x="888.8" y="1845" width="2.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="891.76" y="1855.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (237,594 samples, 0.25%)</title><rect x="1187.1" y="1701" width="2.9" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1190.06" y="1711.5" ></text>
+</g>
+<g >
+<title>cudf::detail::sorted_order&lt; (3,342,367 samples, 3.50%)</title><rect x="840.0" y="1861" width="41.3" height="15.0" fill="rgb(230,117,28)" rx="2" ry="2" />
+<text  x="843.01" y="1871.5" >cud..</text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (946,516 samples, 0.99%)</title><rect x="940.4" y="1797" width="11.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="943.39" y="1807.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (218,553 samples, 0.23%)</title><rect x="886.1" y="1925" width="2.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="889.06" y="1935.5" ></text>
+</g>
+<g >
+<title>std::_Sp_counted_ptr_inplace&lt;duckdb::DataChunk, std::allocator&lt;duckdb::DataChunk&gt;,  (323,813 samples, 0.34%)</title><rect x="986.6" y="2005" width="4.0" height="15.0" fill="rgb(219,67,16)" rx="2" ry="2" />
+<text  x="989.58" y="2015.5" ></text>
+</g>
+<g >
+<title>duckdb::GPUContext::FetchResultInternal (322,540 samples, 0.34%)</title><rect x="821.9" y="1957" width="4.0" height="15.0" fill="rgb(243,177,42)" rx="2" ry="2" />
+<text  x="824.91" y="1967.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (186,858 samples, 0.20%)</title><rect x="927.3" y="1829" width="2.3" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="930.34" y="1839.5" ></text>
+</g>
+<g >
+<title>cudf::detail::sorted_order&lt; (1,111,521 samples, 1.16%)</title><rect x="913.6" y="1957" width="13.7" height="15.0" fill="rgb(230,117,28)" rx="2" ry="2" />
+<text  x="916.61" y="1967.5" ></text>
+</g>
+<g >
+<title>cudaStreamSynchronize (439,246 samples, 0.46%)</title><rect x="932.6" y="1957" width="5.5" height="15.0" fill="rgb(217,58,14)" rx="2" ry="2" />
+<text  x="935.65" y="1967.5" ></text>
+</g>
+<g >
+<title>duckdb::GPUBufferManager::createColumn (123,045 samples, 0.13%)</title><rect x="834.7" y="1909" width="1.5" height="15.0" fill="rgb(249,204,49)" rx="2" ry="2" />
+<text  x="837.72" y="1919.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (2,486,863 samples, 2.60%)</title><rect x="1136.6" y="1973" width="30.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1139.57" y="1983.5" >[l..</text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (2,224,826 samples, 2.33%)</title><rect x="853.8" y="1589" width="27.5" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="856.82" y="1599.5" >[..</text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (359,098 samples, 0.38%)</title><rect x="1148.8" y="1813" width="4.5" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1151.84" y="1823.5" ></text>
+</g>
+<g >
+<title>__memmove_sse2_unaligned_erms (1,134,373 samples, 1.19%)</title><rect x="1153.3" y="1877" width="14.0" height="15.0" fill="rgb(208,14,3)" rx="2" ry="2" />
+<text  x="1156.28" y="1887.5" ></text>
+</g>
+<g >
+<title>cudf::detail::stable_sorted_order (1,111,521 samples, 1.16%)</title><rect x="913.6" y="1973" width="13.7" height="15.0" fill="rgb(252,217,52)" rx="2" ry="2" />
+<text  x="916.61" y="1983.5" ></text>
+</g>
+<g >
+<title>cudaEventRecord (305,164 samples, 0.32%)</title><rect x="836.2" y="1909" width="3.8" height="15.0" fill="rgb(254,225,53)" rx="2" ry="2" />
+<text  x="839.24" y="1919.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (288,815 samples, 0.30%)</title><rect x="1062.7" y="1877" width="3.5" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1065.68" y="1887.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (218,529 samples, 0.23%)</title><rect x="888.8" y="1989" width="2.7" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="891.76" y="1999.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (142,333 samples, 0.15%)</title><rect x="25.7" y="1957" width="1.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="28.67" y="1967.5" ></text>
+</g>
+<g >
+<title>[unknown] (702,665 samples, 0.74%)</title><rect x="806.2" y="1669" width="8.6" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1679.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (185,748 samples, 0.19%)</title><rect x="949.8" y="1653" width="2.3" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="952.79" y="1663.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="773" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="783.5" ></text>
+</g>
+<g >
+<title>cfree@GLIBC_2.2.5 (153,431 samples, 0.16%)</title><rect x="1025.9" y="2053" width="1.9" height="15.0" fill="rgb(233,131,31)" rx="2" ry="2" />
+<text  x="1028.86" y="2063.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (288,815 samples, 0.30%)</title><rect x="1062.7" y="1925" width="3.5" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1065.68" y="1935.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (288,815 samples, 0.30%)</title><rect x="1062.7" y="1813" width="3.5" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1065.68" y="1823.5" ></text>
+</g>
+<g >
+<title>[unknown] (238,078 samples, 0.25%)</title><rect x="981.7" y="2005" width="3.0" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="984.71" y="2015.5" ></text>
+</g>
+<g >
+<title>duckdb::Linenoise::EditInsert (44,573 samples, 0.05%)</title><rect x="966.4" y="2037" width="0.5" height="15.0" fill="rgb(237,147,35)" rx="2" ry="2" />
+<text  x="969.36" y="2047.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (187,311 samples, 0.20%)</title><rect x="938.1" y="1845" width="2.3" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="941.08" y="1855.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (158,437 samples, 0.17%)</title><rect x="825.9" y="1781" width="1.9" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="828.89" y="1791.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="1189" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="1199.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="117" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="127.5" ></text>
+</g>
+<g >
+<title>cudaMemcpyAsync (349,332 samples, 0.37%)</title><rect x="895.1" y="2021" width="4.3" height="15.0" fill="rgb(252,218,52)" rx="2" ry="2" />
+<text  x="898.11" y="2031.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (569,252 samples, 0.60%)</title><rect x="1183.0" y="1765" width="7.0" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1185.97" y="1775.5" ></text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (2,205,212 samples, 2.31%)</title><rect x="1109.3" y="1989" width="27.3" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="1112.32" y="1999.5" >[..</text>
+</g>
+<g >
+<title>[libcudart.so.12.6.77] (439,246 samples, 0.46%)</title><rect x="932.6" y="1941" width="5.5" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="935.65" y="1951.5" ></text>
+</g>
+<g >
+<title>do_lookup_x (130,819 samples, 0.14%)</title><rect x="1082.0" y="2053" width="1.6" height="15.0" fill="rgb(245,187,44)" rx="2" ry="2" />
+<text  x="1085.00" y="2063.5" ></text>
+</g>
+<g >
+<title>[unknown] (417,781 samples, 0.44%)</title><rect x="806.2" y="293" width="5.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="809.16" y="303.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (142,333 samples, 0.15%)</title><rect x="25.7" y="1973" width="1.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="28.67" y="1983.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (3,043,558 samples, 3.19%)</title><rect x="843.7" y="1605" width="37.6" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="846.70" y="1615.5" >[li..</text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (288,815 samples, 0.30%)</title><rect x="1062.7" y="1893" width="3.5" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1065.68" y="1903.5" ></text>
+</g>
+<g >
+<title>[unknown] (419,442 samples, 0.44%)</title><rect x="1162.1" y="1861" width="5.2" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="1165.11" y="1871.5" ></text>
+</g>
+<g >
+<title>duckdb::ColumnDataCopy&lt;long&gt; (268,897 samples, 0.28%)</title><rect x="1086.8" y="2053" width="3.3" height="15.0" fill="rgb(208,18,4)" rx="2" ry="2" />
+<text  x="1089.77" y="2063.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (2,486,863 samples, 2.60%)</title><rect x="1136.6" y="1893" width="30.7" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="1139.57" y="1903.5" >[l..</text>
+</g>
+<g >
+<title>pthread_mutex_unlock@@GLIBC_2.2.5 (221,223 samples, 0.23%)</title><rect x="910.9" y="1685" width="2.7" height="15.0" fill="rgb(227,104,24)" rx="2" ry="2" />
+<text  x="913.87" y="1695.5" ></text>
+</g>
+<g >
+<title>[libcuda.so.560.35.05] (961,521 samples, 1.01%)</title><rect x="10.1" y="2021" width="11.8" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="13.06" y="2031.5" ></text>
+</g>
+</g>
+</svg>
