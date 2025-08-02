@@ -80,11 +80,14 @@ void cudf_orderby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColu
     }
 
     std::vector<cudf::order> orders;
+    std::vector<cudf::null_order> null_orders;
     for (int i = 0; i < num_keys; i++) {
         if (order_by_type[i] == OrderByType::ASCENDING) {
             orders.push_back(cudf::order::ASCENDING);
+            null_orders.push_back(cudf::null_order::AFTER);
         } else {
             orders.push_back(cudf::order::DESCENDING);
+            null_orders.push_back(cudf::null_order::BEFORE);
         }
     }
 
@@ -115,7 +118,7 @@ void cudf_orderby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColu
     // printGPUColumn<uint64_t>(b_gpu, 25, 0);
 
     // SIRIUS_LOG_DEBUG("Sorting keys");
-    auto sorted_order = cudf::sorted_order(keys_table, orders);
+    auto sorted_order = cudf::sorted_order(keys_table, orders, null_orders);
     auto sorted_order_view = sorted_order->view();
     // SIRIUS_LOG_DEBUG("keys table num columns: {}", keys_table.num_columns());
     // SIRIUS_LOG_DEBUG("orders size: {}", orders.size());
@@ -153,8 +156,6 @@ void cudf_orderby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColu
 
     STOP_TIMER();
     // throw NotImplementedException("Order by is not implemented");
-
-
 }
 
 } //namespace duckdb

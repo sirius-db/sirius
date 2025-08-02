@@ -100,6 +100,13 @@ void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColu
   cudf::set_current_device_resource(gpuBufferManager->mr);
 
   std::vector<cudf::column_view> keys_cudf;
+  bool has_nullable_key = false;
+  for (int key = 0; key < num_keys; key++) {
+    if (keys[key]->data_wrapper.validity_mask != nullptr) {
+      has_nullable_key = true;
+      break;
+    }
+  }
 
   //TODO: This is a hack to get the size of the keys
   size_t size = 0;
@@ -115,7 +122,8 @@ void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColu
   }
 
   auto keys_table = cudf::table_view(keys_cudf);
-  cudf::groupby::groupby grpby_obj(keys_table);
+  cudf::groupby::groupby grpby_obj(
+    keys_table, has_nullable_key ? cudf::null_policy::INCLUDE : cudf::null_policy::EXCLUDE);
 
   std::vector<cudf::groupby::aggregation_request> requests;
   for (int agg = 0; agg < num_aggregates; agg++) {

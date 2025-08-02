@@ -37,6 +37,7 @@ ResolveTypeMaterializeExpression(shared_ptr<GPUColumn> column, GPUBufferManager*
     } else {
         a = reinterpret_cast<T*> (column->data_wrapper.data);
         size = column->column_length;
+        out_mask = column->data_wrapper.validity_mask;
     }
     shared_ptr<GPUColumn> result = make_shared_ptr<GPUColumn>(size, column->data_wrapper.type, reinterpret_cast<uint8_t*>(a), out_mask);
     result->is_unique = column->is_unique;
@@ -67,6 +68,7 @@ ResolveTypeMaterializeString(shared_ptr<GPUColumn> column, GPUBufferManager* gpu
         size = column->column_length;
         new_num_bytes = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
         new_num_bytes[0] = column->data_wrapper.num_bytes;
+        out_mask = column->data_wrapper.validity_mask;
     }
     shared_ptr<GPUColumn> result = make_shared_ptr<GPUColumn>(size, column->data_wrapper.type, a, result_offset, new_num_bytes[0], column->data_wrapper.is_string_data, out_mask);
     result->is_unique = column->is_unique;

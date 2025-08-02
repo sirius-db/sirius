@@ -777,14 +777,20 @@ GPUPhysicalGroupedAggregate::GetData(GPUIntermediateRelation &output_relation) c
 		// output_relation.columns[col] = group_by_result->columns[col];
 		bool old_unique = group_by_result->columns[col]->is_unique;
 		if (group_by_result->columns[col]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
-			output_relation.columns[col] = make_shared_ptr<GPUColumn>(group_by_result->columns[col]->column_length, group_by_result->columns[col]->data_wrapper.type, group_by_result->columns[col]->data_wrapper.data,
-					group_by_result->columns[col]->data_wrapper.offset, group_by_result->columns[col]->data_wrapper.num_bytes, true);
+			output_relation.columns[col] = make_shared_ptr<GPUColumn>(
+				group_by_result->columns[col]->column_length, group_by_result->columns[col]->data_wrapper.type,
+				group_by_result->columns[col]->data_wrapper.data, group_by_result->columns[col]->data_wrapper.offset,
+				group_by_result->columns[col]->data_wrapper.num_bytes, true, group_by_result->columns[col]->data_wrapper.validity_mask);
 		} else {
-			output_relation.columns[col] = make_shared_ptr<GPUColumn>(group_by_result->columns[col]->column_length, group_by_result->columns[col]->data_wrapper.type, group_by_result->columns[col]->data_wrapper.data);
+			output_relation.columns[col] = make_shared_ptr<GPUColumn>(
+				group_by_result->columns[col]->column_length, group_by_result->columns[col]->data_wrapper.type,
+				group_by_result->columns[col]->data_wrapper.data, nullptr, group_by_result->columns[col]->data_wrapper.num_bytes,
+				false, group_by_result->columns[col]->data_wrapper.validity_mask);
 		}
 		output_relation.columns[col]->is_unique = old_unique;
 	}
-  	return SourceResultType::FINISHED;
+
+	return SourceResultType::FINISHED;
 }
 
 // void
