@@ -20,6 +20,8 @@
 #include "gpu_buffer_manager.hpp"
 #include "log/logging.hpp"
 
+#include <limits>
+
 namespace duckdb {
 
 template<typename T>
@@ -94,63 +96,318 @@ __global__ void initialize_counts(int32_t* sorted_keys, int32_t* sorted_values, 
   }
 }
 
-void TestCountDistinct(DataWrapper& keys, DataWrapper& values, uint64_t num_records) { 
+struct __align__(16) str_count_distinct_type { 
+  string_group_by_metadata_type* group_by_metadata;
+	uint32_t row_id;
+	uint32_t key_signature;
+
+  __host__ __device__ str_count_distinct_type() : group_by_metadata(nullptr), row_id(0), key_signature(0) {}
+  __host__ __device__ str_count_distinct_type(string_group_by_metadata_type* _metadata, uint32_t _row_id, uint32_t _signature) : 
+    group_by_metadata(_metadata), row_id(_row_id), key_signature(_signature) {}
+
+  __device__ __forceinline__ bool operator==(const str_count_distinct_type &other) const { 
+    // First check if the signatures match
+    if(key_signature != other.key_signature) return false;
+
+    // If the signatures are the same then compare the keys (need to do this since we may have hash collisions)
+    const uint32_t num_keys = group_by_metadata->num_keys;
+    uint32_t left_row_id = row_id; uint32_t right_row_id = other.row_id;
+    for(uint32_t col_id = 0; col_id < num_keys; col_id++) { 
+      // Determine the details for the left and right row
+      uint64_t* col_offsets = group_by_metadata->all_offsets[col_id];
+      uint64_t left_start = col_offsets[left_row_id];
+      const uint64_t left_length = col_offsets[left_row_id + 1] - left_start;
+
+      uint64_t right_start = col_offsets[right_row_id];
+      const uint64_t right_length = col_offsets[right_row_id + 1] - right_start;
+
+      // First ensure that the lengths match
+      if(left_length != right_length) return false;
+
+      // If the lengths match then compare the chars
+      uint8_t* col_chars = group_by_metadata->all_keys[col_id];
+      uint8_t* left_chars = col_chars + left_start; uint8_t* right_chars = col_chars + right_start;
+
+      #pragma unroll
+      for(uint32_t i = 0; i < left_length; i++) { 
+        if(left_chars[i] != right_chars[i]) return false;
+      }
+    }
+
+    return true;
+  }
+
+  // This is used during the sorting so in that case we also want to compare the aggregates so that not only the records are sorted
+  // in key order but values within a key are also sorted in order
+  __device__ __forceinline__ bool operator<(const str_count_distinct_type &other) const { 
+    // If the signatures are different then compare the keys
+    if(key_signature != other.key_signature) return key_signature < other.key_signature;
+
+    // If the signatures are the same then compare the keys (need to do this since we may have hash collisions)
+    const uint32_t num_keys = group_by_metadata->num_keys;
+    uint32_t left_row_id = row_id; uint32_t right_row_id = other.row_id;
+    for(uint32_t col_id = 0; col_id < num_keys; col_id++) { 
+      // Determine the details for the left and right row
+      uint64_t* col_offsets = group_by_metadata->all_offsets[col_id];
+      uint64_t left_start = col_offsets[left_row_id];
+      const uint64_t left_length = col_offsets[left_row_id + 1] - left_start;
+
+      uint64_t right_start = col_offsets[right_row_id];
+      const uint64_t right_length = col_offsets[right_row_id + 1] - right_start;
+
+      // First ensure that the lengths match
+      if(left_length != right_length) return left_length < right_length;
+
+      // If the lengths match then compare the chars
+      uint8_t* col_chars = group_by_metadata->all_keys[col_id];
+      uint8_t* left_chars = col_chars + left_start; uint8_t* right_chars = col_chars + right_start;
+
+      #pragma unroll
+      for(uint32_t i = 0; i < left_length; i++) { 
+        if(left_chars[i] != right_chars[i]) return left_chars[i] < right_chars[i];
+      }
+    }
+
+    // If the keys match finally compare the aggregates
+    uint64_t* agg_values = reinterpret_cast<uint64_t*>(group_by_metadata->all_keys[num_keys]);
+    return agg_values[left_row_id] < agg_values[right_row_id];
+  }
+};
+
+struct CustomGroupByLess { 
+  __forceinline__ __device__ bool operator()(const str_count_distinct_type &lhs, const str_count_distinct_type &rhs) { 
+    return lhs < rhs;
+  }
+};
+
+struct CustomGroupBySum
+{
+    template <typename T>
+    __device__ __forceinline__ T operator()(const T &a, const T &b) const {
+      return a + b;
+    }
+};
+
+__global__ void create_metadata_record(string_group_by_metadata_type* group_by_metadata, uint8_t** keys, uint64_t** offsets, uint32_t num_keys) { 
+  group_by_metadata->all_keys = keys;
+  group_by_metadata->all_offsets = offsets;
+  group_by_metadata->num_keys = num_keys;
+}
+
+__global__ void create_col_offsets(uint64_t* offsets_buffer, uint64_t num_records, uint64_t col_size) { 
+  uint64_t worker_idx = threadIdx.x + blockIdx.x * blockDim.x;
+  if(worker_idx <= num_records) { 
+    offsets_buffer[worker_idx] = worker_idx * col_size;
+  }
+}
+
+__global__ void create_group_by_records(str_count_distinct_type* records, string_group_by_metadata_type* group_by_metadata, uint32_t num_records) { 
+  uint32_t row_id = threadIdx.x + blockIdx.x * blockDim.x;
+  if(row_id < num_records) { 
+    // Calculate the hash for this row by iterating through its group by keys
+    uint32_t signature = 0;
+    uint32_t curr_power = 1;
+    const uint64_t num_keys = group_by_metadata->num_keys;
+
+    for (uint64_t col_id = 0; col_id < num_keys; col_id++) { 
+      uint64_t* curr_col_offsets = group_by_metadata->all_offsets[col_id];
+      uint64_t curr_row_start = curr_col_offsets[row_id];
+      const uint64_t curr_row_length = curr_col_offsets[row_id + 1] - curr_row_start;
+      uint8_t* curr_record_chars = group_by_metadata->all_keys[col_id] + curr_row_start;
+
+      // Update the signature based on the record value. Note that we don't need to worry about
+      // overflow as we are using unsigned data types which is well defined in the C++ standard:
+      // https://stackoverflow.com/questions/18195715/why-is-unsigned-integer-overflow-defined-behavior-but-signed-integer-overflow-is
+      for(uint32_t i = 0; i < curr_row_length; i++) { 
+        signature = signature + static_cast<uint32_t>(curr_record_chars[i]) * curr_power;
+        curr_power = curr_power * STRING_HASH_POWER;
+      }
+    }
+
+    // Use this to create the record
+    records[row_id] = str_count_distinct_type(group_by_metadata, row_id, signature);
+  }
+}
+
+__global__ void determine_is_unique(string_group_by_metadata_type* group_by_metadata, str_count_distinct_type* records, uint64_t* is_unique, uint32_t num_records) { 
+  uint32_t curr_idx = threadIdx.x + blockIdx.x * blockDim.x;
+  if(curr_idx > 0 && curr_idx < num_records) { 
+    const bool is_key_different = !(records[curr_idx] == records[curr_idx - 1]); // First check if the records are equal
+    
+    // Also check if the aggregates are
+    uint32_t left_row_id = records[curr_idx].row_id; uint32_t right_row_id = records[curr_idx - 1].row_id;
+    uint64_t* agg_values = reinterpret_cast<uint64_t*>(group_by_metadata->all_keys[group_by_metadata->num_keys]);
+    bool is_record_different = is_key_different || (agg_values[left_row_id] != agg_values[right_row_id]); 
+    is_unique[curr_idx] = static_cast<uint64_t>(is_record_different);
+  } else if(curr_idx == 0) { 
+    is_unique[curr_idx] = 1;
+  }
+}
+
+__global__ void materialize_determine_lengths(str_count_distinct_type* result_groups, uint64_t* col_lengths, uint64_t col_id, uint64_t num_groups) { 
+  uint32_t curr_group = threadIdx.x + blockIdx.x * blockDim.x;
+  if(curr_group < num_groups) { 
+    // Get the details for this (group, col)
+    uint32_t row_id = result_groups[curr_group].row_id;
+    uint64_t* col_offsets = result_groups[curr_group].group_by_metadata->all_offsets[col_id];
+    col_lengths[curr_group] = col_offsets[row_id + 1] - col_offsets[row_id];
+  } else if(curr_group == num_groups) { 
+    // Set the value of the last string to zero so therefore it will populate the last offset properly
+    col_lengths[curr_group] = 0;
+  }
+}
+
+__global__ void materialize_copy_string(str_count_distinct_type* result_groups, uint8_t* result_chars, uint64_t* result_offsets, uint64_t col_id, uint64_t num_groups) { 
+  uint32_t curr_group = threadIdx.x + blockIdx.x * blockDim.x;
+  if(curr_group < num_groups) { 
+    string_group_by_metadata_type* group_by_metadata = result_groups[curr_group].group_by_metadata;
+    uint32_t group_row_id = result_groups[curr_group].row_id;
+
+    uint64_t* col_offsets = group_by_metadata->all_offsets[col_id];
+    uint64_t start_offset = col_offsets[group_row_id];
+    const uint64_t record_length = col_offsets[group_row_id + 1] - start_offset;
+
+    uint8_t* read_ptr = group_by_metadata->all_keys[col_id] + start_offset;
+    uint8_t* write_ptr = result_chars + result_offsets[curr_group];
+
+    #pragma unroll
+    for(uint64_t i = 0; i < record_length; i++) { 
+      write_ptr[i] = read_ptr[i];
+    }
+  }
+}
+
+void ValSortCountDistinct(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColumn>>& aggregate_keys, uint64_t num_keys, uint64_t num_aggregates, AggregationType* agg_mode, uint32_t num_records) { 
   SETUP_TIMING();
 
-  int32_t* d_keys_ptr = reinterpret_cast<int32_t*>(keys.data);
-  int32_t* d_vals_ptr = reinterpret_cast<int32_t*>(values.data);
-
-  // First sort the input data in (key, value) order
-  START_TIMER();
-  CustomLess less_operator;
-  void* d_temp_storage = nullptr;
-  size_t temp_storage_bytes = 0;
-
-  cub::DeviceMergeSort::SortPairs(
-    d_temp_storage, temp_storage_bytes,
-    d_keys_ptr, d_vals_ptr, num_records, less_operator
-  );
-
+  uint32_t num_offsets_worker = (num_records + BLOCK_THREADS - 1)/BLOCK_THREADS;
   GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
-  d_temp_storage = gpuBufferManager->customCudaMalloc<uint8_t>(temp_storage_bytes, 0, 0);
 
-  cub::DeviceMergeSort::SortPairs(
-    d_temp_storage, temp_storage_bytes,
-    d_keys_ptr, d_vals_ptr, num_records, less_operator
-  );
-  RECORD_TIMER("TEST COUNT DISTINCT Cols Sort Time");
+  // First convert any non string keys to string type
+  for(uint64_t i = 0; i < num_keys; i++) { 
+    DataWrapper& col_data = keys[i]->data_wrapper;
+    if(col_data.type.id() != GPUColumnTypeId::VARCHAR) { 
+      // Create the offsets buffer based on the col size
+      uint64_t col_size = static_cast<uint64_t>(col_data.getColumnTypeSize());
+      col_data.offset = gpuBufferManager->customCudaMalloc<uint64_t>(num_records + 1, 0, 0);
+      create_col_offsets<<<num_offsets_worker, BLOCK_THREADS>>>(col_data.offset, num_records, col_size);
+    }
+  }
 
-  // Now initialize the count for each key
-  START_TIMER();
-  int32_t* d_counts = gpuBufferManager->customCudaMalloc<int32_t>(num_records, 0, 0);
-  uint64_t num_blocks = (num_records + BLOCK_THREADS - 1)/BLOCK_THREADS;
-  initialize_counts<<<num_blocks, BLOCK_THREADS>>>(d_keys_ptr, d_vals_ptr, d_counts, num_records);
-  RECORD_TIMER("TEST COUNT DISTINCT Unique Calculator");
+  // Also create the metadata
+  uint32_t num_hash_cols = static_cast<uint32_t>(num_keys) + 1;
+  uint8_t** d_keys = reinterpret_cast<uint8_t**>(gpuBufferManager->customCudaMalloc<void*>(num_hash_cols, 0, 0));
+  uint64_t** d_offsets = reinterpret_cast<uint64_t**>(gpuBufferManager->customCudaMalloc<void*>(num_hash_cols, 0, 0));
+  uint8_t* h_keys[num_hash_cols]; uint64_t* h_offsets[num_hash_cols];
+  for(uint64_t i = 0; i < num_keys; i++) { 
+    h_keys[i] = keys[i]->data_wrapper.data; h_offsets[i] = keys[i]->data_wrapper.offset;
+  }
+
+  // We also store the aggregate column (just data) as we use it for the sort
+  h_keys[num_keys] = aggregate_keys[0]->data_wrapper.data; 
+  h_offsets[num_keys] = nullptr;
+
+  cudaMemcpy(d_keys, h_keys, num_hash_cols * sizeof(uint8_t*), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_offsets, h_offsets, num_hash_cols * sizeof(uint64_t*), cudaMemcpyHostToDevice);
+
+  string_group_by_metadata_type* d_group_by_metadata = gpuBufferManager->customCudaMalloc<string_group_by_metadata_type>(1, 0, 0);
+  create_metadata_record<<<1, 1>>>(d_group_by_metadata, d_keys, d_offsets, num_keys);
+
+  // Determine the record for each row by hashing it
+  str_count_distinct_type* d_records = reinterpret_cast<str_count_distinct_type*>(gpuBufferManager->customCudaMalloc<string_group_by_record_type>(num_records, 0, 0));
+  uint32_t num_hash_workers = num_offsets_worker;
+  create_group_by_records<<<num_hash_workers, BLOCK_THREADS>>>(d_records, d_group_by_metadata, num_records);
+
+  // Now sort the records considering both the key and the aggregate (check the str_count_distinct_type < operator for details)
+  CustomGroupByLess record_compare_operator;
+  void* d_sort_temp_storage = nullptr;
+  size_t sort_temp_storage_bytes = 0;
+
+  cub::DeviceMergeSort::SortKeys(d_sort_temp_storage, sort_temp_storage_bytes, d_records, num_records, record_compare_operator);
+  d_sort_temp_storage = gpuBufferManager->customCudaMalloc<uint8_t>(sort_temp_storage_bytes, 0, 0);
+  cub::DeviceMergeSort::SortKeys(d_sort_temp_storage, sort_temp_storage_bytes, d_records, num_records, record_compare_operator);
+
+  // Now determine if this is a unique record or not by comparing the previous record
+  uint64_t* d_is_unique_record = gpuBufferManager->customCudaMalloc<uint64_t>(num_records, 0, 0);
+  uint32_t num_unique_workers = num_offsets_worker;
+  determine_is_unique<<<num_unique_workers, BLOCK_THREADS>>>(d_group_by_metadata, d_records, d_is_unique_record, num_records);
 
   // Now perform the key reduction
-  START_TIMER();
-  
-  int32_t* d_result_groups = gpuBufferManager->customCudaMalloc<int32_t>(num_records, 0, 0);
-  int32_t* d_result_aggregates = gpuBufferManager->customCudaMalloc<int32_t>(num_records, 0, 0);
-  uint64_t* d_num_groups_out = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
-  CustomSum sum_operator;
+  CustomGroupBySum reduce_sum_operator;
+  str_count_distinct_type* d_result_groups = reinterpret_cast<str_count_distinct_type*>(gpuBufferManager->customCudaMalloc<string_group_by_record_type>(num_records, 0, 0));
+  uint64_t* d_result_aggs = gpuBufferManager->customCudaMalloc<uint64_t>(num_records, 0, 0);
+  uint64_t* d_num_groups = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
 
-  cub::DeviceReduce::ReduceByKey( d_temp_storage, temp_storage_bytes, d_keys_ptr, d_result_groups, 
-    d_counts, d_result_aggregates, d_num_groups_out, sum_operator, num_records);
+  void* d_key_reduction_temp_storage = nullptr;
+  size_t key_reduction_temp_storage_bytes = 0;
+  cub::DeviceReduce::ReduceByKey(
+    d_key_reduction_temp_storage, key_reduction_temp_storage_bytes, d_records, d_result_groups, d_is_unique_record,
+    d_result_aggs, d_num_groups, reduce_sum_operator, num_records
+  );
+  d_key_reduction_temp_storage = gpuBufferManager->customCudaMalloc<uint8_t>(key_reduction_temp_storage_bytes, 0, 0);
+  cub::DeviceReduce::ReduceByKey(
+    d_key_reduction_temp_storage, key_reduction_temp_storage_bytes, d_records, d_result_groups, d_is_unique_record,
+    d_result_aggs, d_num_groups, reduce_sum_operator, num_records
+  );
 
-  d_temp_storage = gpuBufferManager->customCudaMalloc<uint8_t>(temp_storage_bytes, 0, 0);
+  // Finally materialize the results
+  uint64_t num_groups = 0;
+  cudaMemcpy(&num_groups, d_num_groups, sizeof(uint64_t), cudaMemcpyDeviceToHost);
 
-  cub::DeviceReduce::ReduceByKey(d_temp_storage, temp_storage_bytes, d_keys_ptr, d_result_groups, 
-    d_counts, d_result_aggregates, d_num_groups_out, sum_operator, num_records);
+  // First copy over each of the group by columns
+  uint32_t num_materialize_worker = (num_groups + BLOCK_THREADS)/BLOCK_THREADS;
+  for(uint32_t col_id = 0; col_id < num_keys; col_id++) {
+    shared_ptr<GPUColumn> src_col = keys[col_id];
 
-  RECORD_TIMER("TEST COUNT DISTINCT Key Reduction");
+    // First determine the new offsets using a prefix sum
+    uint64_t* d_new_offsets = gpuBufferManager->customCudaMalloc<uint64_t>(num_groups + 1, 0, 0);
+    materialize_determine_lengths<<<num_materialize_worker, BLOCK_THREADS>>>(d_result_groups, d_new_offsets, col_id, num_groups);
+
+    void* d_prefix_sum_temp_storage = nullptr;
+    size_t prefix_sum_temp_storage_bytes = 0;
+    cub::DeviceScan::ExclusiveSum(d_prefix_sum_temp_storage, prefix_sum_temp_storage_bytes, d_new_offsets, d_new_offsets, num_groups + 1);
+    d_prefix_sum_temp_storage = reinterpret_cast<void*>(gpuBufferManager->customCudaMalloc<uint8_t>(prefix_sum_temp_storage_bytes, 0, 0));
+    cub::DeviceScan::ExclusiveSum(d_prefix_sum_temp_storage, prefix_sum_temp_storage_bytes, d_new_offsets, d_new_offsets, num_groups + 1);
+
+    // Now copy over the actual characters
+    uint64_t num_total_bytes;
+    cudaMemcpy(&num_total_bytes, d_new_offsets + num_groups, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+    uint8_t* d_result_chars = gpuBufferManager->customCudaMalloc<uint8_t>(num_total_bytes, 0, 0);
+    materialize_copy_string<<<num_materialize_worker, BLOCK_THREADS>>>(d_result_groups, d_result_chars, d_new_offsets, col_id, num_groups);
+
+    // Set the new column
+    GPUColumnType src_col_type = src_col->data_wrapper.type;
+    bool is_str_col = src_col_type.id() == GPUColumnTypeId::VARCHAR;
+    keys[col_id] = make_shared_ptr<GPUColumn>(num_groups, src_col_type, d_result_chars, d_new_offsets, num_total_bytes, is_str_col);
+  }
+
+  // Also set the aggregate column
+  aggregate_keys[0] = make_shared_ptr<GPUColumn>(num_groups, GPUColumnType(GPUColumnTypeId::INT64), reinterpret_cast<uint8_t*>(d_result_aggs));
 }
+
+constexpr bool USE_CUSTOM_COUNT_DISTINCT = true; // Set this to false if you want to use the default CUDF implementation
 
 void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColumn>>& aggregate_keys, uint64_t num_keys, uint64_t num_aggregates, AggregationType* agg_mode) 
 {
 
-  TestCountDistinct(keys[0]->data_wrapper, aggregate_keys[0]->data_wrapper, keys[0]->column_length);
+  if constexpr(USE_CUSTOM_COUNT_DISTINCT) { 
+    // See if we can use the custom count distinct implementation
+    uint32_t num_records = static_cast<uint32_t>(keys[0]->column_length);
+    bool valid_agg_type = (num_aggregates == 1) && agg_mode[0] == AggregationType::COUNT_DISTINCT && aggregate_keys[0]->data_wrapper.type.id() == GPUColumnTypeId::INT64;
+    bool has_string_col = false;
 
+    for(uint64_t i = 0; i < num_keys; i++) {
+      if (keys[i]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
+        has_string_col = true;
+        break;
+      }
+    }
+
+    if (valid_agg_type && has_string_col) {
+      ValSortCountDistinct(keys, aggregate_keys, num_keys, num_aggregates, agg_mode, num_records);
+      return;
+    }
+  }
 
   if (keys[0]->column_length == 0) {
     SIRIUS_LOG_DEBUG("Input size is 0");
@@ -178,7 +435,6 @@ void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColu
   SIRIUS_LOG_DEBUG("Input size: {}", keys[0]->column_length);
 
   SETUP_TIMING();
-  START_TIMER();
 
   GPUBufferManager *gpuBufferManager = &(GPUBufferManager::GetInstance());
   cudf::set_current_device_resource(gpuBufferManager->mr);
@@ -197,9 +453,7 @@ void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColu
       throw NotImplementedException("Group by on non-nullable column not supported");
     }
   }
-  RECORD_TIMER("CUDF AGGREGATE Size Calculator");
 
-  START_TIMER();
   auto keys_table = cudf::table_view(keys_cudf);
   cudf::groupby::groupby grpby_obj(keys_table);
   std::vector<cudf::groupby::aggregation_request> requests;
@@ -266,13 +520,8 @@ void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColu
                                     static_cast<int>(agg_mode[agg]));
     }
   }
-  RECORD_TIMER("CUDF AGGREGATE Agg Initialize");
-
-  START_TIMER();
   auto result = grpby_obj.aggregate(requests);
-  RECORD_TIMER("CUDF AGGREGATE Agg Time");
 
-  START_TIMER();
   auto result_key = std::move(result.first);
   for (int key = 0; key < num_keys; key++) {
       cudf::column group_key = result_key->get_column(key);
@@ -289,7 +538,6 @@ void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColu
         aggregate_keys[agg]->setFromCudfColumn(*agg_val, false, nullptr, 0, gpuBufferManager);
       }
   }
-  RECORD_TIMER("CUDF AGGREGATE Result Materialize");
 
   SIRIUS_LOG_DEBUG("CUDF Groupby result count: {}", keys[0]->column_length);
 }

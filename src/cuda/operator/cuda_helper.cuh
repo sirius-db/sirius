@@ -259,6 +259,5 @@ inline __device__ uint64_t hash_combine(uint64_t old_key, uint64_t new_key) {
 }
 
 #define STRING_HASH_POWER 31
-#define STRING_HASH_MOD_VALUE 1000000009
 #define BITS_IN_BYTE 8
 #define BYTES_IN_INTEGER 8

@@ -43,15 +43,15 @@ struct pointer_and_key {
 };
 
 struct string_group_by_metadata_type {
-    void* all_keys;
-    void* offsets;
+    uint8_t** all_keys;
+    uint64_t** all_offsets;
     uint64_t num_keys;
 };
 
-struct string_group_by_record_type {
+struct __align__(16) string_group_by_record_type {
 	string_group_by_metadata_type* group_by_metadata;
-	uint64_t row_id;
-	uint64_t row_signature;
+	uint32_t row_id;
+	uint32_t row_signature;
 };
 
 struct duckdb_string_type {
