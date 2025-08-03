@@ -163,6 +163,8 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundOperator
       // All types should be the same
       switch (left_type.id())
       {
+        case cudf::type_id::INT16:
+          return ExecuteNumericIn<int16_t>::Do(expr, left->view(), resource_ref, execution_stream);
         case cudf::type_id::INT32:
           return ExecuteNumericIn<int32_t>::Do(expr, left->view(), resource_ref, execution_stream);
         case cudf::type_id::INT64:
@@ -177,7 +179,8 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundOperator
           return ExecuteStringIn::Do(expr, left->view(), resource_ref, execution_stream);
         default:
           SIRIUS_LOG_ERROR("UNKNOWN TYPE: {}", static_cast<int32_t>(left->type().id()));
-          throw NotImplementedException("Execute[IN_CONSTANTS]: Unimplemented type!");
+          throw NotImplementedException("Execute[IN_CONSTANTS]: Unimplemented type: %d!",
+            static_cast<int>(left_type.id()));
       }
     }
 
