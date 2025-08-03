@@ -176,19 +176,6 @@ SourceResultType GPUPhysicalTopN::GetData(GPUIntermediateRelation& output_relati
 
 	for (int col = 0; col < sort_result->columns.size(); col++) {
 		SIRIUS_LOG_DEBUG("Writing top n result to column {}", col);
-    // 	auto limit_const = min(limit, sort_result->columns[col]->column_length);
-    // 	output_relation.columns[col] = make_shared_ptr<GPUColumn>(
-		// 		limit_const, sort_result->columns[col]->data_wrapper.type, sort_result->columns[col]->data_wrapper.data,
-		// 		sort_result->columns[col]->data_wrapper.offset, sort_result->columns[col]->data_wrapper.num_bytes,
-		// 		sort_result->columns[col]->data_wrapper.is_string_data, sort_result->columns[col]->data_wrapper.validity_mask);
-    // 	output_relation.columns[col]->is_unique = sort_result->columns[col]->is_unique;
-		// if (limit_const > 0 && output_relation.columns[col]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
-		// 	Allocator& allocator = Allocator::DefaultAllocator();
-		// 	uint64_t* new_num_bytes = reinterpret_cast<uint64_t*>(allocator.AllocateData(sizeof(uint64_t)));
-		// 	callCudaMemcpyDeviceToHost<uint64_t>(new_num_bytes, sort_result->columns[col]->data_wrapper.offset + limit_const, 1, 0);
-		// 	output_relation.columns[col]->data_wrapper.num_bytes = new_num_bytes[0];
-		// }
-
 		if (offset >= sort_result->columns[col]->column_length) {
 			output_relation.columns[col] = make_shared_ptr<GPUColumn>(
 				0, sort_result->columns[col]->data_wrapper.type, nullptr, nullptr,
