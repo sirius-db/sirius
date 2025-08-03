@@ -25,6 +25,7 @@
 #include "gpu_materialize.hpp"
 #include "gpu_buffer_manager.hpp"
 #include "log/logging.hpp"
+#include "utils.hpp"
 
 namespace duckdb {
 
@@ -67,9 +68,6 @@ SinkResultType GPUPhysicalTopN::Sink(GPUIntermediateRelation& input_relation) co
 	if (dynamic_filter) {
 		// `dynamic_filter` is currently not leveraged
 		SIRIUS_LOG_WARN("`dynamic_filter` is currently not leveraged in `GPUPhysicalTopN`");
-	}
-	if (offset > 0) {
-		throw NotImplementedException("Top N Sink with offset not implemented");
 	}
 
 	vector<shared_ptr<GPUColumn>> order_by_keys(orders.size());
@@ -174,20 +172,53 @@ SourceResultType GPUPhysicalTopN::GetData(GPUIntermediateRelation& output_relati
 	if (limit == 0) {
 		return SourceResultType::FINISHED;
 	}
+	GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 
 	for (int col = 0; col < sort_result->columns.size(); col++) {
 		SIRIUS_LOG_DEBUG("Writing top n result to column {}", col);
-    	auto limit_const = min(limit, sort_result->columns[col]->column_length);
-    	output_relation.columns[col] = make_shared_ptr<GPUColumn>(
-				limit_const, sort_result->columns[col]->data_wrapper.type, sort_result->columns[col]->data_wrapper.data,
-				sort_result->columns[col]->data_wrapper.offset, sort_result->columns[col]->data_wrapper.num_bytes,
-				sort_result->columns[col]->data_wrapper.is_string_data, sort_result->columns[col]->data_wrapper.validity_mask);
-    	output_relation.columns[col]->is_unique = sort_result->columns[col]->is_unique;
-		if (limit_const > 0 && output_relation.columns[col]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
-			Allocator& allocator = Allocator::DefaultAllocator();
-			uint64_t* new_num_bytes = reinterpret_cast<uint64_t*>(allocator.AllocateData(sizeof(uint64_t)));
-			callCudaMemcpyDeviceToHost<uint64_t>(new_num_bytes, sort_result->columns[col]->data_wrapper.offset + limit_const, 1, 0);
-			output_relation.columns[col]->data_wrapper.num_bytes = new_num_bytes[0];
+    // 	auto limit_const = min(limit, sort_result->columns[col]->column_length);
+    // 	output_relation.columns[col] = make_shared_ptr<GPUColumn>(
+		// 		limit_const, sort_result->columns[col]->data_wrapper.type, sort_result->columns[col]->data_wrapper.data,
+		// 		sort_result->columns[col]->data_wrapper.offset, sort_result->columns[col]->data_wrapper.num_bytes,
+		// 		sort_result->columns[col]->data_wrapper.is_string_data, sort_result->columns[col]->data_wrapper.validity_mask);
+    // 	output_relation.columns[col]->is_unique = sort_result->columns[col]->is_unique;
+		// if (limit_const > 0 && output_relation.columns[col]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
+		// 	Allocator& allocator = Allocator::DefaultAllocator();
+		// 	uint64_t* new_num_bytes = reinterpret_cast<uint64_t*>(allocator.AllocateData(sizeof(uint64_t)));
+		// 	callCudaMemcpyDeviceToHost<uint64_t>(new_num_bytes, sort_result->columns[col]->data_wrapper.offset + limit_const, 1, 0);
+		// 	output_relation.columns[col]->data_wrapper.num_bytes = new_num_bytes[0];
+		// }
+
+		if (offset >= sort_result->columns[col]->column_length) {
+			output_relation.columns[col] = make_shared_ptr<GPUColumn>(
+				0, sort_result->columns[col]->data_wrapper.type, nullptr, nullptr,
+				0, sort_result->columns[col]->data_wrapper.is_string_data);
+		} else {
+			auto limit_const = min(limit, sort_result->columns[col]->column_length - offset);
+			uint8_t* output_col_data = sort_result->columns[col]->data_wrapper.data;
+			uint64_t* output_col_offset = sort_result->columns[col]->data_wrapper.offset;
+			uint64_t output_col_num_bytes = sort_result->columns[col]->data_wrapper.num_bytes;
+			if (sort_result->columns[col]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
+				output_col_offset += offset;
+				uint64_t bytes_skipped;
+				callCudaMemcpyDeviceToHost<uint64_t>(&bytes_skipped, output_col_offset, 1, 0);
+				output_col_data += bytes_skipped;
+				output_col_num_bytes -= bytes_skipped;
+				subtractToEach(output_col_offset, bytes_skipped, limit_const + 1);
+			} else {
+				size_t column_type_size = sort_result->columns[col]->data_wrapper.getColumnTypeSize();
+				output_col_data += offset * column_type_size;
+				output_col_num_bytes = limit_const * column_type_size;
+			}
+			auto output_col_validity_mask = sort_result->columns[col]->data_wrapper.validity_mask;
+			if (offset > 0) {
+				auto new_mask = cudf::copy_bitmask(output_col_validity_mask, offset, offset + limit_const);
+				gpuBufferManager->rmm_stored_buffers.push_back(std::make_unique<rmm::device_buffer>(std::move(new_mask)));
+				output_col_validity_mask = reinterpret_cast<cudf::bitmask_type*>(gpuBufferManager->rmm_stored_buffers.back()->data());
+			}
+			output_relation.columns[col] = make_shared_ptr<GPUColumn>(
+				limit_const, sort_result->columns[col]->data_wrapper.type, output_col_data, output_col_offset,
+				output_col_num_bytes, sort_result->columns[col]->data_wrapper.is_string_data, output_col_validity_mask);
 		}
 	}
 
