@@ -18,3 +18,5 @@ dbgen/
 .venv
 cufile.log
 4stock_5day_avg_close.csv
+*result.csv
+*output.txt
