@@ -65,6 +65,7 @@ namespace sirius
 #define SECOND_FUNC_STR "second"
 #define MILLISECOND_FUNC_STR "millisecond"
 #define MICROSECOND_FUNC_STR "microsecond"
+#define DATE_TRUNC_FUNC_STR "date_trunc"
 #define STRLEN_FUNC_STR "strlen"
 #define LENGTH_FUNC_STR "length"
 #define REGEXP_REPLACE_FUNC_STR "regexp_replace"
@@ -340,6 +341,8 @@ struct NumericBinaryFunctionDispatcher
       auto cudf_type = GpuExpressionState::GetCudfType(expr.children[0]->return_type);
       switch (cudf_type.id())
       {
+        case cudf::type_id::INT16:
+          return DoLeftScalarBinaryOp(left_value.GetValue<int16_t>(), right->view(), return_type);
         case cudf::type_id::INT32:
           return DoLeftScalarBinaryOp(left_value.GetValue<int32_t>(), right->view(), return_type);
         case cudf::type_id::INT64:
@@ -383,6 +386,8 @@ struct NumericBinaryFunctionDispatcher
       auto cudf_type = GpuExpressionState::GetCudfType(expr.children[1]->return_type);
       switch (cudf_type.id())
       {
+        case cudf::type_id::INT16:
+          return DoRightScalarBinaryOp(left->view(), right_value.GetValue<int16_t>(), return_type);
         case cudf::type_id::INT32:
           return DoRightScalarBinaryOp(left->view(), right_value.GetValue<int32_t>(), return_type);
         case cudf::type_id::INT64:
@@ -454,6 +459,58 @@ struct DatetimeExtractFunctionDispatcher
                                                       COMP,
                                                       executor.execution_stream,
                                                       executor.resource_ref);
+  }
+};
+
+//----------DatetimeTruncateFunctionDispatcher----------//
+struct DatetimeTruncateFunctionDispatcher {
+  // The executor
+  GpuExpressionExecutor& executor;
+
+  // Constructor
+  explicit DatetimeTruncateFunctionDispatcher(GpuExpressionExecutor& exec)
+      : executor(exec) {}
+
+  // Dispatch operator
+  std::unique_ptr<cudf::column> operator()(const BoundFunctionExpression& expr,
+                                           GpuExpressionState* state)
+  {
+    D_ASSERT(expr.children.size() == 2);
+    std::string freq_str = expr.children[0]->Cast<BoundConstantExpression>().value.GetValue<std::string>();
+    auto input = executor.Execute(*expr.children[1], state->child_states[1].get());
+    if (freq_str == "day") {
+      return cudf::datetime::floor_datetimes(input->view(),
+                                             cudf::datetime::rounding_frequency::DAY,
+                                             executor.execution_stream,
+                                             executor.resource_ref);
+    } else if (freq_str == "hour") {
+      return cudf::datetime::floor_datetimes(input->view(),
+                                             cudf::datetime::rounding_frequency::HOUR,
+                                             executor.execution_stream,
+                                             executor.resource_ref);
+    } else if (freq_str == "minute") {
+      return cudf::datetime::floor_datetimes(input->view(),
+                                             cudf::datetime::rounding_frequency::MINUTE,
+                                             executor.execution_stream,
+                                             executor.resource_ref);
+    } else if (freq_str == "second") {
+      return cudf::datetime::floor_datetimes(input->view(),
+                                             cudf::datetime::rounding_frequency::SECOND,
+                                             executor.execution_stream,
+                                             executor.resource_ref);
+    } else if (freq_str == "millisecond") {
+      return cudf::datetime::floor_datetimes(input->view(),
+                                             cudf::datetime::rounding_frequency::MILLISECOND,
+                                             executor.execution_stream,
+                                             executor.resource_ref);
+    } else if (freq_str == "microsecond") {
+      return cudf::datetime::floor_datetimes(input->view(),
+                                             cudf::datetime::rounding_frequency::MICROSECOND,
+                                             executor.execution_stream,
+                                             executor.resource_ref);
+    } else {
+      throw InvalidInputException("Execute[Function]: Unknown extract type for date_trunc(): %s", freq_str);
+    }
   }
 };
 
@@ -671,6 +728,12 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundFunction
   else if (func_str == MICROSECOND_FUNC_STR)
   {
     DatetimeExtractFunctionDispatcher<cudf::datetime::datetime_component::MICROSECOND> dispatcher(*this);
+    return dispatcher(expr, state);
+  }
+
+  //----------DateTime Truncate Functions----------//
+  else if (func_str == DATE_TRUNC_FUNC_STR) {
+    DatetimeTruncateFunctionDispatcher dispatcher(*this);
     return dispatcher(expr, state);
   }
 

@@ -27,4 +27,7 @@ void convertInt16ToInt128(uint8_t *input, uint8_t *output, size_t count);
 void convertInt32ToInt64(uint8_t *input, uint8_t *output, size_t count);
 void createRowIdColumn(uint8_t *data, size_t count);
 
+template <typename T>
+void subtractToEach(T* data, T delta, size_t count);
+
 } // namespace duckdb

@@ -108,6 +108,14 @@ __global__ void create_row_id_column(uint8_t *data, size_t count) {
   }
 }
 
+template <typename T>
+__global__ void subtract_to_each(T* data, T delta, size_t count) {
+  size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < count) {
+    data[idx] -= delta;
+  }
+}
+
 void warmup_gpu() {
   // Perform the warmup
   cudaFree(0);
@@ -167,5 +175,17 @@ void createRowIdColumn(uint8_t *data, size_t count) {
   create_row_id_column<<<blocks, threads_per_block>>>(data, count);
   cudaDeviceSynchronize();
 }
+
+template <typename T>
+void subtractToEach(T* data, T delta, size_t count) {
+  size_t threads_per_block = 256;
+  size_t blocks = (count + threads_per_block - 1) / threads_per_block;
+
+  subtract_to_each<uint64_t><<<blocks, threads_per_block>>>(data, delta, count);
+  cudaDeviceSynchronize();
+}
+
+template
+void subtractToEach<uint64_t>(uint64_t* data, uint64_t delta, size_t count);
 
 } // namespace duckdb

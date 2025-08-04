@@ -80,6 +80,8 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundConstant
   auto cudf_type = GpuExpressionState::GetCudfType(expr.return_type);
   switch (cudf_type.id())
   {
+    case cudf::type_id::INT16:
+      return MakeColumnFromConstant<int16_t>::Do(expr, input_count, resource_ref, execution_stream);
     case cudf::type_id::INT32:
       return MakeColumnFromConstant<int32_t>::Do(expr, input_count, resource_ref, execution_stream);
     case cudf::type_id::INT64:

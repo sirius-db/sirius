@@ -99,6 +99,10 @@ struct ComparisonDispatcher
 
       switch (GpuExpressionState::GetCudfType(expr.right->return_type).id())
       {
+        case cudf::type_id::INT16:
+          return DoScalarComparison<int16_t>(left->view(),
+                                             right_value.GetValue<int16_t>(),
+                                             return_type);
         case cudf::type_id::INT32:
           return DoScalarComparison<int32_t>(left->view(),
                                              right_value.GetValue<int32_t>(),
@@ -122,7 +126,8 @@ struct ComparisonDispatcher
                                                  right_value.GetValue<std::string>(),
                                                  return_type);
         default:
-          throw InternalException("Execute[Comparison]: Unsupported constant type for comparison!");
+          throw InternalException("Execute[Comparison]: Unsupported constant type for comparison: %d!",
+            static_cast<int>(GpuExpressionState::GetCudfType(expr.right->return_type).id()));
       }
     }
 

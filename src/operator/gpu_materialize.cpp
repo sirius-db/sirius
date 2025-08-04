@@ -25,8 +25,9 @@ ResolveTypeMaterializeExpression(shared_ptr<GPUColumn> column, GPUBufferManager*
     size_t size;
     T* a;
     cudf::bitmask_type* out_mask = nullptr;
-    if (column->data_wrapper.data == nullptr || column->column_length == 0) {
-        return make_shared_ptr<GPUColumn>(column->column_length, column->data_wrapper.type, nullptr);
+    if (column->data_wrapper.data == nullptr || column->column_length == 0 ||
+        (column->row_ids != nullptr && column->row_id_count == 0)) {
+        return make_shared_ptr<GPUColumn>(0, column->data_wrapper.type, nullptr);
     }
     if (column->row_ids != nullptr) {
         T* temp = reinterpret_cast<T*> (column->data_wrapper.data);
@@ -36,6 +37,7 @@ ResolveTypeMaterializeExpression(shared_ptr<GPUColumn> column, GPUBufferManager*
     } else {
         a = reinterpret_cast<T*> (column->data_wrapper.data);
         size = column->column_length;
+        out_mask = column->data_wrapper.validity_mask;
     }
     shared_ptr<GPUColumn> result = make_shared_ptr<GPUColumn>(size, column->data_wrapper.type, reinterpret_cast<uint8_t*>(a), out_mask);
     result->is_unique = column->is_unique;
@@ -49,8 +51,9 @@ ResolveTypeMaterializeString(shared_ptr<GPUColumn> column, GPUBufferManager* gpu
     uint64_t* result_offset; 
     uint64_t* new_num_bytes;
     cudf::bitmask_type* out_mask = nullptr;
-    if (column->data_wrapper.data == nullptr || column->column_length == 0) {
-        return make_shared_ptr<GPUColumn>(column->column_length, column->data_wrapper.type, nullptr, nullptr, column->data_wrapper.num_bytes, column->data_wrapper.is_string_data);
+    if (column->data_wrapper.data == nullptr || column->column_length == 0 ||
+        (column->row_ids != nullptr && column->row_id_count == 0)) {
+        return make_shared_ptr<GPUColumn>(0, column->data_wrapper.type, nullptr, nullptr, 0, column->data_wrapper.is_string_data);
     }
     if (column->row_ids != nullptr) {
 		// Late materalize the input relationship
@@ -65,6 +68,7 @@ ResolveTypeMaterializeString(shared_ptr<GPUColumn> column, GPUBufferManager* gpu
         size = column->column_length;
         new_num_bytes = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
         new_num_bytes[0] = column->data_wrapper.num_bytes;
+        out_mask = column->data_wrapper.validity_mask;
     }
     shared_ptr<GPUColumn> result = make_shared_ptr<GPUColumn>(size, column->data_wrapper.type, a, result_offset, new_num_bytes[0], column->data_wrapper.is_string_data, out_mask);
     result->is_unique = column->is_unique;

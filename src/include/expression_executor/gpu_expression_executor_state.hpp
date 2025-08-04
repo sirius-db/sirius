@@ -17,6 +17,7 @@
 #pragma once
 
 #include "duckdb/planner/expression.hpp"
+#include "log/logging.hpp"
 #include <cudf/column/column.hpp>
 #include <cudf/types.hpp>
 #include <memory>
@@ -63,9 +64,12 @@ struct GpuExpressionState
   {
     switch (logical_type.id())
     {
+      case LogicalTypeId::SMALLINT:
+        return cudf::data_type(cudf::type_id::INT16);
       case LogicalTypeId::INTEGER:
         return cudf::data_type(cudf::type_id::INT32);
       case LogicalTypeId::BIGINT:
+      case LogicalTypeId::HUGEINT: // FIXME: unsafe conversion from duckdb HugeInt to cudf Int64, since cudf does not support Int128.
         return cudf::data_type(cudf::type_id::INT64);
       case LogicalTypeId::FLOAT:
         return cudf::data_type(cudf::type_id::FLOAT32);
