@@ -385,7 +385,7 @@ void ValSortCountDistinct(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr
   aggregate_keys[0] = make_shared_ptr<GPUColumn>(num_groups, GPUColumnType(GPUColumnTypeId::INT64), reinterpret_cast<uint8_t*>(d_result_aggs));
 }
 
-constexpr bool USE_CUSTOM_COUNT_DISTINCT = true; // Set this to false if you want to use the default CUDF implementation
+constexpr bool USE_CUSTOM_COUNT_DISTINCT = false; // Set this to false if you want to use the default CUDF implementation
 
 void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColumn>>& aggregate_keys, uint64_t num_keys, uint64_t num_aggregates, AggregationType* agg_mode) 
 {
