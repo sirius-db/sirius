@@ -34,7 +34,7 @@ void HandlePrefixMatching(shared_ptr<GPUColumn> string_column, std::string match
 std::unique_ptr<cudf::column>
 DoStringMatching(const char* input_data,
                  cudf::size_type input_count,
-                 const int64_t* input_offsets,
+                 const uint64_t* input_offsets,
                  int64_t byte_count,
                  const std::string& match_string,
                  rmm::device_async_resource_ref mr,
@@ -42,7 +42,7 @@ DoStringMatching(const char* input_data,
 std::unique_ptr<cudf::column>
 DoMultiStringMatching(const char* input_data,
                       cudf::size_type input_count,
-                      const int64_t* input_offsets,
+                      const uint64_t* input_offsets,
                       int64_t byte_count,
                       const std::vector<std::string>& match_strings,
                       rmm::device_async_resource_ref mr,
