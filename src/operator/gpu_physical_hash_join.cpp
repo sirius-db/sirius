@@ -444,19 +444,6 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 		for (int cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
 			build_key[cond_idx] = materialized_build_key->columns[cond_idx];
 		}
-		for (int col = 0; col < conditions.size(); col++) {
-			// if types is VARCHAR, check the number of bytes
-			if (build_key[col]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
-				if (build_key[col]->data_wrapper.num_bytes > INT32_MAX) {
-					throw NotImplementedException("String column size greater than INT32_MAX is not supported");
-				}
-			}
-			if (probe_key[col]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
-				if (probe_key[col]->data_wrapper.num_bytes > INT32_MAX) {
-					throw NotImplementedException("String column size greater than INT32_MAX is not supported");
-				}
-			}
-		}
 		if (build_key[0]->column_length > INT32_MAX || probe_key[0]->column_length > INT32_MAX) {
    			throw NotImplementedException("Column length greater than INT32_MAX is not supported");
 		} else {
