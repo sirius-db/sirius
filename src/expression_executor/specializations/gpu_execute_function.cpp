@@ -72,6 +72,7 @@ namespace sirius
 #define ERROR_FUNC_STR "error"
 
 #define SPLIT_DELIMITER "%"
+#define WARP_SIZE 32
 
 //----------InitializeState----------//
 std::unique_ptr<GpuExpressionState>
@@ -153,12 +154,26 @@ struct StringMatchingDispatcher
       }
       else if constexpr (MatchType == StringMatchingType::CONTAINS)
       {
-        const auto match_str_scalar =
-          cudf::string_scalar(match_str, true, executor.execution_stream, executor.resource_ref);
-        return cudf::strings::contains(input_view,
-                                       match_str_scalar,
-                                       executor.execution_stream,
-                                       executor.resource_ref);
+        // There is an int32 overflow bug in `contains()` to be fixed by cudf, have to use `like()` for now
+        // if the input is too large
+        bool can_use_contains = input->size() <= INT32_MAX / WARP_SIZE;
+        if (can_use_contains) {
+          return cudf::strings::contains(input->view(),
+                                         cudf::string_scalar(match_str,
+                                                             true,
+                                                             executor.execution_stream,
+                                                             executor.resource_ref),
+                                         executor.execution_stream,
+                                         executor.resource_ref);
+        }
+        return cudf::strings::like(cudf::strings_column_view(input_view),
+                                   cudf::string_scalar("%" + match_str + "%",
+                                                       true,
+                                                       executor.execution_stream,
+                                                       executor.resource_ref),
+                                   cudf::string_scalar(""),
+                                   executor.execution_stream,
+                                   executor.resource_ref);
       }
       else if constexpr (MatchType == StringMatchingType::PREFIX)
       {
