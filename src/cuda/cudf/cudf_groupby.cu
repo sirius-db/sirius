@@ -146,29 +146,53 @@ struct __align__(16) str_count_distinct_type {
     // If the signatures are the same then compare the keys (need to do this since we may have hash collisions)
     const uint32_t num_keys = group_by_metadata->num_keys;
     uint32_t left_row_id = row_id; uint32_t right_row_id = other.row_id;
+
+    #pragma unroll
     for(uint32_t col_id = 0; col_id < num_keys; col_id++) { 
       // Determine the details for the left and right row
       uint64_t* col_offsets = group_by_metadata->all_offsets[col_id];
-      uint64_t left_start = col_offsets[left_row_id];
-      const uint64_t left_length = col_offsets[left_row_id + 1] - left_start;
+      uint64_t left_offset = col_offsets[left_row_id];
+      const uint64_t left_length = col_offsets[left_row_id + 1] - left_offset;
 
-      uint64_t right_start = col_offsets[right_row_id];
-      const uint64_t right_length = col_offsets[right_row_id + 1] - right_start;
+      uint64_t right_offset = col_offsets[right_row_id];
+      const uint64_t right_length = col_offsets[right_row_id + 1] - right_offset;
 
       // First ensure that the lengths match
       if(left_length != right_length) return left_length < right_length;
 
       // If the lengths match then compare the chars
-      uint8_t* col_chars = group_by_metadata->all_keys[col_id];
-      uint8_t* left_chars = col_chars + left_start; uint8_t* right_chars = col_chars + right_start;
+      uint8_t* curr_column_chars = group_by_metadata->all_keys[col_id];
+      uint64_t* curr_column_keys = reinterpret_cast<uint64_t*>(curr_column_chars);
+      uint64_t bytes_remaining = left_length;
+      while (bytes_remaining > 0) {
+        // Read in the left and right value
+        uint64_t left_int_idx = left_offset / BYTES_IN_INTEGER;
+        uint64_t left_read_idx = left_offset % BYTES_IN_INTEGER;
+        uint64_t curr_left_int = curr_column_keys[left_int_idx];
 
-      #pragma unroll
-      for(uint32_t i = 0; i < left_length; i++) { 
-        if(left_chars[i] != right_chars[i]) return left_chars[i] < right_chars[i];
+        uint64_t right_int_idx = right_offset / BYTES_IN_INTEGER;
+        uint64_t right_read_idx = right_offset % BYTES_IN_INTEGER;
+        uint64_t curr_right_int = curr_column_keys[right_int_idx];
+
+        // Compare current batch of bytes
+        uint64_t batch_size = min(BYTES_IN_INTEGER - max(left_read_idx, right_read_idx), bytes_remaining);
+        uint64_t keep_mask = (1ULL << (BITS_IN_BYTE * batch_size)) - 1;
+        uint64_t left_shifted_val = curr_left_int >> (BYTES_IN_INTEGER * left_read_idx);
+        uint64_t left_val = left_shifted_val & keep_mask;
+        uint64_t right_shifted_val = curr_right_int >> (BYTES_IN_INTEGER * right_read_idx);
+        uint64_t right_val = right_shifted_val & keep_mask;
+
+        // Now actually compare the values
+        if (left_val != right_val) return left_val < right_val;
+
+        // Update trackers
+        bytes_remaining -= batch_size;
+        left_offset += batch_size;
+        right_offset += batch_size;
       }
     }
 
-    // If the keys match finally compare the aggregates
+    // If the keys match finally compare the aggregates values
     uint64_t* agg_values = reinterpret_cast<uint64_t*>(group_by_metadata->all_keys[num_keys]);
     return agg_values[left_row_id] < agg_values[right_row_id];
   }
@@ -440,13 +464,6 @@ void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColu
   cudf::set_current_device_resource(gpuBufferManager->mr);
 
   std::vector<cudf::column_view> keys_cudf;
-  bool has_nullable_key = false;
-  for (int key = 0; key < num_keys; key++) {
-    if (keys[key]->data_wrapper.validity_mask != nullptr) {
-      has_nullable_key = true;
-      break;
-    }
-  }
 
   //TODO: This is a hack to get the size of the keys
   size_t size = 0;
@@ -462,9 +479,7 @@ void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColu
   }
 
   auto keys_table = cudf::table_view(keys_cudf);
-  cudf::groupby::groupby grpby_obj(
-    keys_table, has_nullable_key ? cudf::null_policy::INCLUDE : cudf::null_policy::EXCLUDE);
-
+  cudf::groupby::groupby grpby_obj(keys_table);
   std::vector<cudf::groupby::aggregation_request> requests;
   for (int agg = 0; agg < num_aggregates; agg++) {
     requests.emplace_back(cudf::groupby::aggregation_request());

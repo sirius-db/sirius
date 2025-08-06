@@ -355,13 +355,8 @@ HandleGroupByAggregateCuDF(vector<shared_ptr<GPUColumn>> &group_by_keys, vector<
 			}
 		}
 	}
-	
-	auto start_time = std::chrono::high_resolution_clock::now();
+
 	cudf_groupby(group_by_keys, aggregate_keys, num_group_keys, aggregates.size(), agg_mode);
-	auto end_time = std::chrono::high_resolution_clock::now();
-	auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
-	double elapsed_seconds = static_cast<double>(duration.count())/pow(10.0, 3.0);
-	std::cout << "Group by implementation took " << elapsed_seconds << " seconds" << std::endl;
 }
 
 void

@@ -45,6 +45,7 @@
 #include "gpu_buffer_manager.hpp"
 
 #include <cstdlib>
+#include <cuda_profiler_api.h>
 
 namespace duckdb {
 
@@ -227,6 +228,7 @@ void SiriusExtension::GPUProcessingFunction(ClientContext &context, TableFunctio
 	}
 
 	if (!data.res) {
+		cudaProfilerStart();
 		auto start = std::chrono::high_resolution_clock::now();
 		if (!buffer_is_initialized) {
 			printf("\033[1;31m"); printf("GPUBufferManager not initialized, please call gpu_buffer_init first\n"); printf("\033[0m");
@@ -245,6 +247,7 @@ void SiriusExtension::GPUProcessingFunction(ClientContext &context, TableFunctio
 		auto end = std::chrono::high_resolution_clock::now();
 		auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
 		SIRIUS_LOG_INFO("Execute query time: {:.2f} ms", duration.count()/1000.0);
+		cudaProfilerStop();
 	}
 
 	auto result_chunk = data.res->Fetch();
