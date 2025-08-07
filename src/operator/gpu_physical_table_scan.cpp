@@ -533,7 +533,7 @@ GPUPhysicalTableScan::GetDataDuckDB(ExecutionContext &exec_context) {
         }
       }
 
-      if (gpuBufferManager->gpuCachingPointer[0] + total_size >= gpuBufferManager->cache_size_per_gpu) {
+      if (gpuBufferManager->gpuCachingPointer[0] + gpuBufferManager->cpuCachingPointer[0] + total_size >= gpuBufferManager->cache_size_per_gpu) {
         if (total_size > gpuBufferManager->cache_size_per_gpu) {
           throw InvalidInputException("Total size of columns to be cached is greater than the cache size");
         }

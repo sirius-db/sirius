@@ -183,6 +183,7 @@ GPUContext::GPUExecutePendingQueryResult(PendingQueryResult &pending) {
 	} catch (std::exception &e) {
 		ErrorData error(e);
 		SIRIUS_LOG_ERROR("Error in GPUExecutePendingQueryResult: {}", error.RawMessage());
+		gpu_executor.gpuBufferManager->ResetBuffer();
 		return GPUErrorResult<MaterializedQueryResult>(error);
 	}
 	if (pending.HasError()) {

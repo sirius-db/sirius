@@ -461,7 +461,8 @@ SiriusExtension::GPUBufferInitFunction(ClientContext &context, TableFunctionInpu
 	size_t processing_size = data.processing_size;
 	if (!buffer_is_initialized) {
 		SIRIUS_LOG_DEBUG("GPU Buffer Manager initialized\n");
-		GPUBufferManager *gpuBufferManager = &(GPUBufferManager::GetInstance(cache_size, processing_size, processing_size));
+		GPUBufferManager *gpuBufferManager = &(GPUBufferManager::GetInstance(
+			cache_size, processing_size, std::max(cache_size, processing_size)));
 		buffer_is_initialized = true;
 	} else {
 		SIRIUS_LOG_WARN("GPUBufferManager already initialized");

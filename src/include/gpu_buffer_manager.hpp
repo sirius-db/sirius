@@ -35,6 +35,7 @@ template <typename T> void printGPUColumn(T* a, size_t N, int gpu);
 void cudaMemmove(uint8_t* destination, uint8_t* source, size_t num);
 uint8_t* allocatePinnedCPUMemory(size_t size);
 void freePinnedCPUMemory(uint8_t* ptr);
+size_t getFreeGPUMemorySize(int gpu);
 void warmup_gpu();
 
 struct pointer_and_key {
@@ -83,14 +84,16 @@ public:
 
     void ResetBuffer();
     void ResetCache();
-	uint8_t** gpuCache; //each gpu has one
+	uint8_t** gpuCache, **cpuCache; //each gpu has one, `cpuCache` will be used if `gpuCache` is full
 	uint8_t** gpuProcessing, *cpuProcessing;
-	size_t* gpuProcessingPointer, *gpuCachingPointer; //each gpu has one
+	size_t* gpuProcessingPointer, *gpuCachingPointer, *cpuCachingPointer; //each gpu has one
 	size_t cpuProcessingPointer; 
 
 	size_t cache_size_per_gpu;
 	size_t processing_size_per_gpu;
-    size_t processing_size_per_cpu;
+	size_t processing_size_per_cpu;
+
+	vector<size_t> available_gpu_cache_size;
 
 	rmm::mr::cuda_memory_resource* cuda_mr;
 	rmm::mr::pool_memory_resource<rmm::mr::cuda_memory_resource>* mr;
@@ -105,7 +108,7 @@ public:
 
 	void Print();
 
-    map<string, shared_ptr<GPUIntermediateRelation>> tables;
+	map<string, shared_ptr<GPUIntermediateRelation>> tables;
 
 	// DataWrapper allocateChunk(DataChunk &input);
 	// DataWrapper allocateColumnBufferInCPU(unique_ptr<MaterializedQueryResult> input);

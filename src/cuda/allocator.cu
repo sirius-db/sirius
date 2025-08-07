@@ -153,4 +153,12 @@ void callCudaFree(T* ptr, int gpu) {
     cudaSetDevice(gpu);
 }
 
+size_t getFreeGPUMemorySize(int gpu) {
+    gpuErrchk(cudaSetDevice(gpu));
+    size_t free, total;
+    gpuErrchk(cudaMemGetInfo(&free, &total));
+    gpuErrchk(cudaSetDevice(0));
+    return free;
+}
+
 } // namespace duckdb

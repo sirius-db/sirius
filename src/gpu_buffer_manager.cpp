@@ -167,27 +167,44 @@ GPUBufferManager::GPUBufferManager(size_t cache_size_per_gpu, size_t processing_
     cache_size_per_gpu(cache_size_per_gpu), processing_size_per_gpu(processing_size_per_gpu), processing_size_per_cpu(processing_size_per_cpu) {
     SIRIUS_LOG_INFO("Initializing GPU buffer manager");
     gpuCache = new uint8_t*[NUM_GPUS];
+    cpuCache = new uint8_t*[NUM_GPUS];
     gpuProcessing = new uint8_t*[NUM_GPUS];
     cpuProcessing = allocatePinnedCPUMemory(processing_size_per_cpu);
     gpuProcessingPointer = new size_t[NUM_GPUS];
     gpuCachingPointer = new size_t[NUM_GPUS];
+    cpuCachingPointer = new size_t[NUM_GPUS];
     cpuProcessingPointer = 0;
+    available_gpu_cache_size.resize(NUM_GPUS);
 
     cuda_mr = new rmm::mr::cuda_memory_resource();
-    SIRIUS_LOG_INFO("Allocating cache size {} in GPU 0", cache_size_per_gpu);
-    SIRIUS_LOG_INFO("Allocating processing size {} in GPU 0", processing_size_per_gpu);
     mr = new rmm::mr::pool_memory_resource(cuda_mr, processing_size_per_gpu, processing_size_per_cpu);
     cudf::set_current_device_resource(mr);
     allocation_table.resize(NUM_GPUS);
     locked_allocation_table.resize(NUM_GPUS);
+    SIRIUS_LOG_INFO("Allocated processing size {} in GPU 0", processing_size_per_gpu);
 
     for (int gpu = 0; gpu < NUM_GPUS; gpu++) {
-        gpuCache[gpu] = callCudaMalloc<uint8_t>(cache_size_per_gpu, gpu);
+        // We cannot allocate exactly all free memory using `cudaMalloc()`
+        size_t free_gpu_mem_size = getFreeGPUMemorySize(gpu) * 0.99;
+        if (free_gpu_mem_size >= cache_size_per_gpu) {
+            gpuCache[gpu] = callCudaMalloc<uint8_t>(cache_size_per_gpu, gpu);
+            cpuCache[gpu] = nullptr;
+            available_gpu_cache_size[gpu] = cache_size_per_gpu;
+            SIRIUS_LOG_INFO("Allocated cache size {} in GPU 0", cache_size_per_gpu);
+        } else {
+            gpuCache[gpu] = callCudaMalloc<uint8_t>(free_gpu_mem_size, gpu);
+            cpuCache[gpu] = allocatePinnedCPUMemory(cache_size_per_gpu - free_gpu_mem_size);
+            available_gpu_cache_size[gpu] = free_gpu_mem_size;
+            SIRIUS_LOG_INFO("Allocated cache size {} for GPU 0 ({} in GPU, {} in CPU)",
+                cache_size_per_gpu, free_gpu_mem_size, cache_size_per_gpu - free_gpu_mem_size);
+        }
+
         // gpuProcessing[gpu] = callCudaMalloc<uint8_t>(processing_size_per_gpu, gpu);
         // gpuCache[gpu] = callCudaHostAlloc<uint8_t>(cache_size_per_gpu, 1);
         // gpuProcessing[gpu] = callCudaHostAlloc<uint8_t>(processing_size_per_gpu, 1);
         gpuProcessingPointer[gpu] = 0;
         gpuCachingPointer[gpu] = 0;
+        cpuCachingPointer[gpu] = 0;
     }
 
     warmup_gpu();
@@ -196,14 +213,19 @@ GPUBufferManager::GPUBufferManager(size_t cache_size_per_gpu, size_t processing_
 GPUBufferManager::~GPUBufferManager() {
     for (int gpu = 0; gpu < NUM_GPUS; gpu++) {
         callCudaFree<uint8_t>(gpuCache[gpu], gpu);
+        if (cpuCache[gpu] != nullptr) {
+            freePinnedCPUMemory(cpuCache[gpu]);
+        }
         // callCudaFree<uint8_t>(gpuProcessing[gpu], gpu);
         mr->deallocate((void*) gpuProcessing[gpu], processing_size_per_gpu);
     }
     freePinnedCPUMemory(cpuProcessing);
     delete[] gpuCache;
+    delete[] cpuCache;
     delete[] gpuProcessing;
     delete[] gpuProcessingPointer;
     delete[] gpuCachingPointer;
+    delete[] cpuCachingPointer;
     delete mr;
     delete cuda_mr;
 }
@@ -265,8 +287,8 @@ void GPUBufferManager::ResetCache() {
     SIRIUS_LOG_DEBUG("Resetting cache");
     for (int gpu = 0; gpu < NUM_GPUS; gpu++) {
         gpuCachingPointer[gpu] = 0;
+        cpuCachingPointer[gpu] = 0;
     }
-    cpuProcessingPointer = 0;
     for (auto it = tables.begin(); it != tables.end(); it++) {
         shared_ptr<GPUIntermediateRelation> table = it->second;
         for (int col = 0; col < table->columns.size(); col++) {
@@ -287,11 +309,18 @@ GPUBufferManager::customCudaMalloc(size_t size, int gpu, bool caching) {
     alloc = alloc + (alignment - alloc % alignment);
     if (caching) {
         size_t start = __atomic_fetch_add(&gpuCachingPointer[gpu], alloc, __ATOMIC_RELAXED);
-        assert((start + alloc) < cache_size_per_gpu);
-        if (start + alloc >= cache_size_per_gpu) {
-            throw InvalidInputException("Out of GPU caching memory");
+        T* ptr = nullptr;
+        if (start + alloc <= available_gpu_cache_size[gpu]) {
+            ptr = reinterpret_cast<T*>(gpuCache[gpu] + start);
+        } else {
+            __atomic_fetch_sub(&gpuCachingPointer[gpu], alloc, __ATOMIC_RELAXED);
+            start = __atomic_fetch_add(&cpuCachingPointer[gpu], alloc, __ATOMIC_RELAXED);
+            if (start + alloc > cache_size_per_gpu - available_gpu_cache_size[gpu]) {
+                __atomic_fetch_sub(&cpuCachingPointer[gpu], alloc, __ATOMIC_RELAXED);
+                throw InvalidInputException("Out of caching memory");
+            }
+            ptr = reinterpret_cast<T*>(cpuCache[gpu] + start);
         }
-        T* ptr = reinterpret_cast<T*>(gpuCache[gpu] + start);
         if (reinterpret_cast<uintptr_t>(ptr) % alignof(double) != 0) {
             throw InvalidInputException("Memory is not properly aligned");
         } 
@@ -336,26 +365,34 @@ void
 GPUBufferManager::customCudaFree(uint8_t* ptr, int gpu) {
     //check if ptr is not in gpuCaching
     cudf::set_current_device_resource(mr);
-    if (ptr != nullptr && (ptr < gpuCache[gpu] || ptr >= gpuCache[gpu] + cache_size_per_gpu)) {
-        auto it = allocation_table[gpu].find(reinterpret_cast<void*>(ptr));
-        if (it != allocation_table[gpu].end()) {
-            // SIRIUS_LOG_DEBUG("Deallocating Pointer {} size {}", static_cast<void*>(ptr), it->second);
-            mr->deallocate((void*) ptr, it->second);
-            allocation_table[gpu].erase(it);
-        } else {
-            auto locked_it = locked_allocation_table[gpu].find(reinterpret_cast<void*>(ptr));
-            if (locked_it == locked_allocation_table[gpu].end()) {
-                // check if in rmm_stored_buffer
-                bool found = 0;
-                for (int it = 0; it < rmm_stored_buffers.size(); it++) {
-                    if (ptr == reinterpret_cast<uint8_t*>(rmm_stored_buffers[it]->data())) {
-                        found = 1; break;
-                    }
+    if (ptr == nullptr) {
+        return;
+    }
+    if (ptr >= gpuCache[gpu] && ptr < gpuCache[gpu] + available_gpu_cache_size[gpu]) {
+        return;
+    }
+    if (cpuCache[gpu] != nullptr && ptr >= cpuCache[gpu] &&
+        ptr < cpuCache[gpu] + cache_size_per_gpu - available_gpu_cache_size[gpu]) {
+        return;
+    }
+    auto it = allocation_table[gpu].find(reinterpret_cast<void*>(ptr));
+    if (it != allocation_table[gpu].end()) {
+        // SIRIUS_LOG_DEBUG("Deallocating Pointer {} size {}", static_cast<void*>(ptr), it->second);
+        mr->deallocate((void*) ptr, it->second);
+        allocation_table[gpu].erase(it);
+    } else {
+        auto locked_it = locked_allocation_table[gpu].find(reinterpret_cast<void*>(ptr));
+        if (locked_it == locked_allocation_table[gpu].end()) {
+            // check if in rmm_stored_buffer
+            bool found = 0;
+            for (int it = 0; it < rmm_stored_buffers.size(); it++) {
+                if (ptr == reinterpret_cast<uint8_t*>(rmm_stored_buffers[it]->data())) {
+                    found = 1; break;
                 }
-                if (!found) {
-                    SIRIUS_LOG_DEBUG("Invalid Pointer {}", static_cast<void*>(ptr));
-                    throw InvalidInputException("Pointer not found in allocation table");
-                }
+            }
+            if (!found) {
+                SIRIUS_LOG_DEBUG("Invalid Pointer {}", static_cast<void*>(ptr));
+                throw InvalidInputException("Pointer not found in allocation table");
             }
         }
     }
