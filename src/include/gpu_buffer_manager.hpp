@@ -49,6 +49,11 @@ struct string_group_by_metadata_type {
     uint64_t num_keys;
 };
 
+struct string_top_n_record_type {
+	uint32_t row_id;
+	uint32_t key_prefix;
+};
+
 struct string_group_by_record_type {
 	string_group_by_metadata_type* group_by_metadata;
 	uint64_t row_id;

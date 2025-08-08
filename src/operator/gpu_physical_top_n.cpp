@@ -44,7 +44,7 @@ GPUPhysicalTopN::~GPUPhysicalTopN() {
 
 
 void
-HandleTopN(vector<shared_ptr<GPUColumn>> &order_by_keys, vector<shared_ptr<GPUColumn>> &projection_columns, const vector<BoundOrderByNode> &orders, uint64_t num_projections) {
+HandleTopN(vector<shared_ptr<GPUColumn>> &order_by_keys, vector<shared_ptr<GPUColumn>> &projection_columns, const vector<BoundOrderByNode> &orders, uint64_t num_projections, idx_t num_results) {
 	GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 	OrderByType* order_by_type = gpuBufferManager->customCudaHostAlloc<OrderByType>(orders.size());
 	for (int order_idx = 0; order_idx < orders.size(); order_idx++) {
@@ -55,7 +55,7 @@ HandleTopN(vector<shared_ptr<GPUColumn>> &order_by_keys, vector<shared_ptr<GPUCo
 		}
 	}
 	
-	cudf_orderby(order_by_keys, projection_columns, orders.size(), num_projections, order_by_type);
+	cudf_orderby(order_by_keys, projection_columns, orders.size(), num_projections, order_by_type, num_results);
 }
 
 //===--------------------------------------------------------------------===//
@@ -94,7 +94,7 @@ SinkResultType GPUPhysicalTopN::Sink(GPUIntermediateRelation& input_relation) co
 		throw NotImplementedException("Order by with column length greater than INT32_MAX is not supported");
 	}
 
-	HandleTopN(order_by_keys, projection_columns, orders, types.size());
+	HandleTopN(order_by_keys, projection_columns, orders, types.size(), limit);
 
 	for (int col = 0; col < types.size(); col++) {
 		if (sort_result->columns[col] == nullptr || sort_result->columns[col]->column_length == 0 ||
