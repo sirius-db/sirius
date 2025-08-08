@@ -48,10 +48,15 @@ struct string_group_by_metadata_type {
     uint64_t num_keys;
 };
 
-struct __align__(16) string_group_by_record_type {
+struct string_group_by_record_type {
 	string_group_by_metadata_type* group_by_metadata;
 	uint32_t row_id;
 	uint32_t row_signature;
+};
+
+struct string_top_n_record_type {
+	uint32_t row_id;
+	uint32_t key_prefix;
 };
 
 struct duckdb_string_type {
