@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "config.hpp"
 #include "cudf_utils.hpp"
 #include "../operator/cuda_helper.cuh"
 #include "gpu_physical_order.hpp"
@@ -284,14 +285,12 @@ void CustomStringTopN(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPU
     RECORD_TIMER("STRING TOP N Result Write Time");
 }
 
-static constexpr bool USE_CUSTOM_TOP_N = true;
-
 void cudf_orderby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColumn>>& projection, uint64_t num_keys, uint64_t num_projections, OrderByType* order_by_type, idx_t num_results) 
 {
     // See if we can use the custom kernel to perform the top N by performing the following checks:
     // - num_results > 0
     // - We have a singular varchar column as the key and projection column
-    if constexpr(USE_CUSTOM_TOP_N) { 
+    if constexpr(Config::USE_CUSTOM_TOP_N) { 
         bool use_customed_implementation = num_results > 0 && num_keys == num_projections && num_keys == 1;
         for(size_t col = 0; col < keys.size(); col++) { 
             use_customed_implementation = use_customed_implementation && keys[col]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR;

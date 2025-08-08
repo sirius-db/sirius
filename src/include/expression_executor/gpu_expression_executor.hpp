@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "config.hpp"
 #include "duckdb/planner/expression/bound_between_expression.hpp"
 #include "duckdb/planner/expression/bound_case_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
@@ -36,11 +37,6 @@ namespace duckdb
 {
 namespace sirius
 {
-
-/// CONFIG ///
-// Whether to use CuDF or Sirius for string functions
-#define USE_CUDF_EXPR true
-/// CONFIG ///
 
 //----------GpuExpressionExecutor----------//
 struct GpuExpressionExecutor
@@ -67,7 +63,7 @@ struct GpuExpressionExecutor
   // The stream in which to execute the given set of expressions
   rmm::cuda_stream_view execution_stream;
   // Static flag indicating whether to use cudf or sirius for string functions
-  static constexpr bool use_cudf = USE_CUDF_EXPR;
+  static constexpr bool use_cudf = Config::USE_CUDF_EXPR;
 
   //----------Methods----------//
   void AddExpression(const Expression& expr);
