@@ -885,6 +885,7 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
       createRowIdColumn(data, num_rows);
       output_relation.columns.back() = make_shared_ptr<GPUColumn>(
         num_rows, GPUColumnType(GPUColumnTypeId::INT64), data, nullptr, num_rows * sizeof(int64_t), false, nullptr);
+      output_relation.columns.back()->is_unique = true;
       if (row_ids) {
         output_relation.columns.back()->row_ids = row_ids; 
       }
