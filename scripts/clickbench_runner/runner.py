@@ -103,10 +103,6 @@ def benchmark_query(args, query_to_run, query_label):
     os.remove(query_temp_file_path)
     os.remove(result_temp_file_path)
 
-    # Check if the command failed
-    if SIRIUS_FAILURE_MESSAGE in command_result:
-        return -1.0
-
     # Now get the warm run time
     result_lines = command_result.split("\n")
     query_run_times = []
@@ -117,7 +113,7 @@ def benchmark_query(args, query_to_run, query_label):
             query_run_times.append(float(run_time_line_parts[4]))
 
     # Return the average time
-    return min(query_run_times[1:])
+    return SIRIUS_FAILURE_MESSAGE in command_result, -1 if len(query_run_times) < 3 else min(query_run_times[2:])
 
 def main():
     args = load_args()
@@ -151,11 +147,11 @@ def main():
     for query_idx, query in enumerate(queries):
         # Run the query
         print("Benchmarking query", query_idx + 1)
-        query_to_run = query.strip()
-        query_run_time = benchmark_query(args, query, f"query{query_idx + 1}")
+        fallback, query_run_time = benchmark_query(args, query, f"query{query_idx + 1}")
         query_result.append({
             "query" : query_idx + 1,
-            "query_time_sec" : query_run_time
+            "query_time_sec" : query_run_time,
+            "fallback": fallback
         })
 
     # Save the results to the specified file
