@@ -104,12 +104,14 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
     cudaEventSynchronize(start); \
 }
 
-#define STOP_TIMER() { \
+#define STOP_TIMER() RECORD_TIMER("Elapsed time op")
+
+#define RECORD_TIMER(timer_name) { \
     cudaEventRecord(stop, 0); \
     cudaEventSynchronize(stop); \
     float elapsedTime = 0; \
     cudaEventElapsedTime(&elapsedTime, start, stop); \
-    SIRIUS_LOG_DEBUG("Elapsed time op: {}", elapsedTime); \
+    SIRIUS_LOG_DEBUG("{} : {}", timer_name, elapsedTime); \
 }
 
 #define BLOCK_THREADS 128
