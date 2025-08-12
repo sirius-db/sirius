@@ -260,10 +260,13 @@ void CustomStringTopN(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPU
     // Finally copy over the resulting records to the output columns
     START_TIMER();
 
+    DataWrapper project_col_data = projection[0]->data_wrapper;
+    uint8_t* project_col_chars = project_col_data.data; uint64_t* project_col_offsets = project_col_data.offset;
+
     // First determine the new offsets using a prefix sum
     uint32_t num_materialize_worker = (num_results + BLOCK_THREADS)/BLOCK_THREADS;
     uint64_t* d_new_offsets = gpuBufferManager->customCudaMalloc<uint64_t>(num_results + 1, 0, 0);
-    materialize_determine_lengths<<<num_materialize_worker, BLOCK_THREADS>>>(d_records, col_offsets, d_new_offsets, num_results);
+    materialize_determine_lengths<<<num_materialize_worker, BLOCK_THREADS>>>(d_records, project_col_offsets, d_new_offsets, num_results);
 
     void* d_prefix_sum_temp_storage = nullptr;
     size_t prefix_sum_temp_storage_bytes = 0;
@@ -275,12 +278,12 @@ void CustomStringTopN(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPU
     uint64_t num_total_bytes;
     cudaMemcpy(&num_total_bytes, d_new_offsets + num_results, sizeof(uint64_t), cudaMemcpyDeviceToHost);
     uint8_t* d_result_chars = gpuBufferManager->customCudaMalloc<uint8_t>(num_total_bytes, 0, 0);
-    materialize_copy_string<<<num_materialize_worker, BLOCK_THREADS>>>(d_records, col_chars, col_offsets, d_result_chars, d_new_offsets, num_results);
+    materialize_copy_string<<<num_materialize_worker, BLOCK_THREADS>>>(d_records, project_col_chars, project_col_offsets, d_result_chars, d_new_offsets, num_results);
     
     // Set the new column
-    GPUColumnType src_col_type = src_col->data_wrapper.type;
-    bool is_str_col = src_col_type.id() == GPUColumnTypeId::VARCHAR;
-    projection[0] = make_shared_ptr<GPUColumn>(num_results, src_col_type, d_result_chars, d_new_offsets, num_total_bytes, is_str_col);
+    GPUColumnType project_col_type =  project_col_data.type;
+    bool is_str_col = project_col_data.type.id() == GPUColumnTypeId::VARCHAR;
+    projection[0] = make_shared_ptr<GPUColumn>(num_results, project_col_type, d_result_chars, d_new_offsets, num_total_bytes, is_str_col);
 
     RECORD_TIMER("STRING TOP N Result Write Time");
 }
@@ -292,8 +295,11 @@ void cudf_orderby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColu
     // - We have a singular varchar column as the key and projection column
     if constexpr(Config::USE_CUSTOM_TOP_N) { 
         bool use_customed_implementation = num_results > 0 && num_keys == num_projections && num_keys == 1;
-        for(size_t col = 0; col < keys.size(); col++) { 
+        for(size_t col = 0; col < num_keys; col++) { 
             use_customed_implementation = use_customed_implementation && keys[col]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR;
+        }
+        for(size_t col = 0; col < num_projections; col++) { 
+            use_customed_implementation = use_customed_implementation && projection[col]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR;
         }
         SIRIUS_LOG_DEBUG("Cudf order using custom top n of {} has val {}", num_results, use_customed_implementation);
         
