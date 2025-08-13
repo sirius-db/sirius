@@ -171,7 +171,7 @@ __global__ void table_scan_expression(uint8_t **col, uint64_t** offset, uint32_t
                 uint64_t item_idx = tile_offset + threadIdx.x + ITEM * B;
                 uint64_t bitindex = (item_idx / 32);
                 uint64_t bitoffset = (item_idx % 32);
-                uint32_t validity_bit = (bitmask[expr][bitindex] >> bitoffset) & 0x00000001;
+                uint32_t validity_bit = bitmask[expr] ? (bitmask[expr][bitindex] >> bitoffset) & 0x00000001 : 1;
 
                 if (data_type[expr] == SQLNULL) {
                     selection_flags[ITEM] = device_comparison_null(validity_bit, compare_mode[expr]);

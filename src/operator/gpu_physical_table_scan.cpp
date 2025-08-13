@@ -14,12 +14,15 @@
  * limitations under the License.
  */
 
+#include "config.hpp"
 #include "operator/gpu_physical_table_scan.hpp"
 #include "gpu_buffer_manager.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/execution/execution_context.hpp"
 #include "duckdb/parallel/thread_context.hpp"
+#include "duckdb/parallel/task_executor.hpp"
+#include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "gpu_columns.hpp"
 #include "gpu_materialize.hpp"
@@ -46,6 +49,7 @@ GPUPhysicalTableScan::GPUPhysicalTableScan(vector<LogicalType> types, TableFunct
         gen_row_id_column(column_ids.back().GetPrimaryIndex() == DConstants::INVALID_INDEX) {
 
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+    num_rows = 0;
     column_size = gpuBufferManager->customCudaHostAlloc<uint64_t>(column_ids.size());
     mask_size = gpuBufferManager->customCudaHostAlloc<uint64_t>(column_ids.size());
     for (int col = 0; col < column_ids.size() - gen_row_id_column; col++) {
@@ -413,6 +417,8 @@ public:
 		if (op.function.in_out_function) {
       throw NotImplementedException("In-out function not supported");
 		}
+    row_offset = 0;
+    column_data_offsets.resize(op.column_ids.size(), 0);
 	}
 
 	idx_t max_threads = 0;
@@ -427,6 +433,22 @@ public:
 	idx_t MaxThreads() override {
 		return max_threads;
 	}
+
+  // Used in `TableScanCoalesceTask`
+  void NextChunkOffsets(uint64_t chunk_rows, const vector<uint64_t>& chunk_column_sizes,
+                        uint64_t* out_row_offset, vector<uint64_t>& out_column_data_offsets) {
+    std::unique_lock lock(offset_mutex);
+    *out_row_offset = row_offset;
+    out_column_data_offsets = column_data_offsets;
+    row_offset += chunk_rows;
+    for (size_t i = 0; i < chunk_column_sizes.size(); ++i) {
+      column_data_offsets[i] += chunk_column_sizes[i];
+    }
+  }
+
+  std::mutex offset_mutex;
+  uint64_t row_offset;
+  vector<uint64_t> column_data_offsets;
 };
 
 class TableScanLocalSourceState : public LocalSourceState {
@@ -438,9 +460,17 @@ public:
 			                             gstate.GetTableFilters(op), op.extra_info.sample_options);
 			local_state = op.function.init_local(context, input, gstate.global_state.get());
 		}
+    num_rows = 0;
+    column_size.resize(op.column_ids.size(), 0);
+    mask_size.resize(op.column_ids.size(), 0);
 	}
 
 	unique_ptr<LocalTableFunctionState> local_state;
+
+  // Used in `TableScanGetSizeTask`
+  uint64_t num_rows;
+  vector<uint64_t> column_size;
+  vector<uint64_t> mask_size;
 };
 
 unique_ptr<LocalSourceState> GPUPhysicalTableScan::GetLocalSourceState(ExecutionContext &context,
@@ -452,8 +482,393 @@ unique_ptr<GlobalSourceState> GPUPhysicalTableScan::GetGlobalSourceState(ClientC
 	return make_uniq<TableScanGlobalSourceState>(context, *this);
 }
 
+class TableScanGetSizeTask : public BaseExecutorTask {
+public:
+	TableScanGetSizeTask(TaskExecutor &executor, int task_id_p, TableFunction& function_p, ExecutionContext& context_p,
+                       GPUPhysicalTableScan& op_p, GlobalSourceState* g_state_p, LocalSourceState* l_state_p)
+	    : BaseExecutorTask(executor), task_id(task_id_p), function(function_p), context(context_p),
+        op(op_p), g_state(g_state_p), l_state(l_state_p) {}
+
+	void ExecuteTask() override {
+    auto &g_state_scan = g_state->Cast<TableScanGlobalSourceState>();
+    auto &l_state_scan = l_state->Cast<TableScanLocalSourceState>();
+    TableFunctionInput data(op.bind_data.get(), l_state_scan.local_state.get(), g_state_scan.global_state.get());
+    auto chunk = make_uniq<DataChunk>();
+    chunk->Initialize(Allocator::Get(context.client), op.scanned_types);
+    while (true) {
+      // Get next chunk
+      function.function(context.client, data, *chunk);
+      if (chunk->size() == 0) {
+        break;
+      }
+      // Get column size and mask size of each column in the chunk
+      l_state_scan.num_rows += chunk->size();
+      for (int col = 0; col < op.column_ids.size() - op.gen_row_id_column; col++) {
+        auto& vec = chunk->data[col];
+        if (vec.GetType().id() == LogicalTypeId::VARCHAR) {
+          vec.Flatten(chunk->size());
+          auto duckdb_strings = reinterpret_cast<string_t*>(vec.GetData());
+          auto &validity = FlatVector::Validity(vec);
+          for (int row = 0; row < chunk->size(); row++) {
+            if (validity.RowIsValid(row)) {
+              l_state_scan.column_size[col] += duckdb_strings[row].GetSize();
+            }
+          }
+        } else {
+          l_state_scan.column_size[col] += GetChunkDataByteSize(op.scanned_types[col], chunk->size());
+        }
+        l_state_scan.mask_size[col] += TemplatedValidityMask<validity_t>::ValidityMaskSize(chunk->size());
+      }
+      // Clear the chunk
+      chunk->Reset();
+    }
+	}
+
+private:
+  int task_id;
+  TableFunction& function;
+  ExecutionContext& context;
+  GPUPhysicalTableScan& op;
+  GlobalSourceState* g_state;
+  LocalSourceState* l_state;
+};
+
+class TableScanCoalesceTask : public BaseExecutorTask {
+public:
+	TableScanCoalesceTask(TaskExecutor &executor, int task_id_p, TableFunction& function_p, ExecutionContext& context_p,
+                        GPUPhysicalTableScan& op_p, GlobalSourceState* g_state_p, LocalSourceState* l_state_p,
+                        uint8_t** data_ptr_p, uint64_t** offset_ptr_p)
+	    : BaseExecutorTask(executor), task_id(task_id_p), function(function_p), context(context_p),
+        op(op_p), g_state(g_state_p), l_state(l_state_p), data_ptr(data_ptr_p), offset_ptr(offset_ptr_p) {}
+
+	void ExecuteTask() override {
+    auto &g_state_scan = g_state->Cast<TableScanGlobalSourceState>();
+    auto &l_state_scan = l_state->Cast<TableScanLocalSourceState>();
+    TableFunctionInput data(op.bind_data.get(), l_state_scan.local_state.get(), g_state_scan.global_state.get());
+    auto chunk = make_uniq<DataChunk>();
+    chunk->Initialize(Allocator::Get(context.client), op.scanned_types);
+    uint64_t row_offset;
+    vector<uint64_t> column_data_offsets;
+    vector<uint64_t> chunk_column_sizes;
+    while (true) {
+      // Get next chunk
+      function.function(context.client, data, *chunk);
+      if (chunk->size() == 0) {
+        break;
+      }
+      // Compute chunk column size and get write offset
+      chunk_column_sizes.assign(op.column_ids.size(), 0);
+      for (int col = 0; col < op.column_ids.size() - op.gen_row_id_column; col++) {
+        if (!op.already_cached[col]) {
+          auto& vec = chunk->data[col];
+          vec.Flatten(chunk->size());
+          if (vec.GetType().id() == LogicalTypeId::VARCHAR) {
+            auto duckdb_strings = reinterpret_cast<string_t*>(vec.GetData());
+            auto &validity = FlatVector::Validity(vec);
+            for (int row = 0; row < chunk->size(); row++) {
+              if (validity.RowIsValid(row)) {
+                chunk_column_sizes[col] += duckdb_strings[row].GetSize();
+              }
+            }
+          } else {
+            chunk_column_sizes[col] = GetChunkDataByteSize(vec.GetType(), chunk->size());
+          }
+        }
+      }
+      g_state_scan.NextChunkOffsets(chunk->size(), chunk_column_sizes, &row_offset, column_data_offsets);
+      // Copy data to pinned cpu memory
+      for (int col = 0; col < op.column_ids.size() - op.gen_row_id_column; col++) {
+        if (!op.already_cached[col]) {
+          auto& vec = chunk->data[col];
+          if (vec.GetType().id() == LogicalTypeId::VARCHAR) {
+            auto duckdb_strings = reinterpret_cast<string_t*>(vec.GetData());
+            auto &validity = FlatVector::Validity(vec);
+            uint64_t chunk_data_offset = 0;
+            for (int row = 0; row < chunk->size(); row++) {
+              if (validity.RowIsValid(row)) {
+                uint64_t len = duckdb_strings[row].GetSize();
+                offset_ptr[col][row_offset + row + 1] = len;
+                uint64_t write_offset = column_data_offsets[col] + chunk_data_offset;
+                memcpy(data_ptr[col] + write_offset, duckdb_strings[row].GetData(), len);
+                chunk_data_offset += len;
+              } else {
+                offset_ptr[col][row_offset + row + 1] = 0;
+              }
+            }
+          } else {
+            uint64_t write_offset = row_offset * GetTypeIdSize(vec.GetType().InternalType());
+            memcpy(data_ptr[col] + write_offset, vec.GetData(), chunk_column_sizes[col]);
+          }
+        }
+      }
+      // Clear the chunk
+      chunk->Reset();
+    }
+	}
+
+private:
+  int task_id;
+  TableFunction& function;
+  ExecutionContext& context;
+  GPUPhysicalTableScan& op;
+  GlobalSourceState* g_state;
+  LocalSourceState* l_state;
+  uint8_t** data_ptr;
+  uint64_t** offset_ptr;
+};
+
+SourceResultType
+GPUPhysicalTableScan::GetDataDuckDBOpt(ExecutionContext &exec_context) {
+  auto t0 = std::chrono::high_resolution_clock::now();
+
+  // Check if columns are all cached
+  D_ASSERT(!column_ids.empty());
+  auto gpuBufferManager = &(GPUBufferManager::GetInstance());
+
+  SIRIUS_LOG_DEBUG("Reading data from duckdb storage");
+
+  TableFunctionToStringInput input(function, bind_data.get());
+  auto to_string_result = function.to_string(input);
+  string table_name;
+  for (const auto &it : to_string_result) {
+    if (it.first.compare("Table") == 0) {
+      table_name = it.second;
+      break;
+    }
+  }
+
+  shared_ptr<GPUIntermediateRelation> table;
+  auto &catalog_table = Catalog::GetCatalog(exec_context.client, INVALID_CATALOG);
+
+  bool all_cached = true;
+  for (int col = 0; col < column_ids.size() - gen_row_id_column; col++) {
+    already_cached[col] = gpuBufferManager->checkIfColumnCached(table_name, names[column_ids[col].GetPrimaryIndex()]);
+    if (!already_cached[col]) {
+      all_cached = false;
+    } 
+  }
+  auto t1 = std::chrono::high_resolution_clock::now();
+  auto t01 = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0);
+  printf(" t01 = %.2f ms\n", t01.count()/1000.0);
+
+  if (all_cached) {
+    return SourceResultType::FINISHED;
+  }
+
+  if (function.function) {
+    // Read data and converting data from duckdb
+    auto start = std::chrono::high_resolution_clock::now();
+
+    // Perform the first scan to get column size and mask size. Here we perform two scans streamingly
+    // since storing all scanned chunks together in memory is extremely slow.
+    int num_threads = TaskScheduler::GetScheduler(exec_context.client).NumberOfThreads();
+    TaskExecutor executor(exec_context.client);
+    auto g_state = GetGlobalSourceState(exec_context.client);
+    vector<unique_ptr<LocalSourceState>> l_states;
+    l_states.resize(num_threads);
+    for (int i = 0; i < num_threads; ++i) {
+      l_states[i] = GetLocalSourceState(exec_context, *g_state);
+      auto task = make_uniq<TableScanGetSizeTask>(executor, i, function, exec_context, *this,
+                                                  g_state.get(), l_states[i].get());
+      executor.ScheduleTask(std::move(task));
+    }
+    executor.WorkOnTasks();
+    for (int i = 0; i < num_threads; ++i) {
+      auto &l_state_scan = l_states[i]->Cast<TableScanLocalSourceState>();
+      num_rows += l_state_scan.num_rows;
+      for (int col = 0; col < column_ids.size() - gen_row_id_column; col++) {
+        column_size[col] += l_state_scan.column_size[col];
+        mask_size[col] += l_state_scan.mask_size[col];
+      }
+    }
+    uint64_t total_size = 0;
+    for (int col = 0; col < column_ids.size() - gen_row_id_column; col++) {
+      // Round up to nearest 64 byte to adjust with libcudf validity mask
+      mask_size[col] = 64 * ((mask_size[col] + 63) / 64);
+      if (!already_cached[col]) {
+        total_size += column_size[col];
+        total_size += mask_size[col];
+        if (scanned_types[col].id() == LogicalTypeId::VARCHAR) {
+          // Add size of offsets
+          total_size += sizeof(uint64_t) * (num_rows + 1);
+        }
+      }
+    }
+
+    auto t2 = std::chrono::high_resolution_clock::now();
+    auto t12 = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1);
+    printf(" t12 = %.2f ms\n", t12.count()/1000.0);
+
+    // Create table/columns in gpu and check OOM
+    if (gpuBufferManager->gpuCachingPointer[0] + gpuBufferManager->cpuCachingPointer[0] + total_size >=
+        gpuBufferManager->cache_size_per_gpu) {
+      if (total_size > gpuBufferManager->cache_size_per_gpu) {
+        throw InvalidInputException("Total size of columns (%lu) to be cached is greater than the cache size (%lu)",
+                                    total_size, gpuBufferManager->cache_size_per_gpu);
+      }
+      gpuBufferManager->ResetCache();
+      for (int col = 0; col < column_ids.size() - gen_row_id_column; col++) {
+        already_cached[col] = false;
+        gpuBufferManager->createTableAndColumnInGPU(catalog_table, exec_context.client, table_name, names[column_ids[col].GetPrimaryIndex()]);
+      }
+    } else {
+      for (int col = 0; col < column_ids.size() - gen_row_id_column; col++) {
+        if (!already_cached[col]) {
+          gpuBufferManager->createTableAndColumnInGPU(catalog_table, exec_context.client, table_name, names[column_ids[col].GetPrimaryIndex()]);
+        } 
+      }
+    }
+
+    auto t3 = std::chrono::high_resolution_clock::now();
+    auto t23 = std::chrono::duration_cast<std::chrono::microseconds>(t3 - t2);
+    printf(" t23 = %.2f ms\n", t23.count()/1000.0);
+
+    // Perform the second scan to copy data to gpu
+    ScanDataDuckDBOpt(exec_context, gpuBufferManager, table_name);
+
+    auto t4 = std::chrono::high_resolution_clock::now();
+    auto t34 = std::chrono::duration_cast<std::chrono::microseconds>(t4 - t3);
+    printf(" t34 = %.2f ms\n", t34.count()/1000.0);
+    // throw NotImplementedException("WIP in table scan");
+
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    SIRIUS_LOG_DEBUG("Reading data and converting data from duckdb time: {:.2f} ms", duration.count()/1000.0);
+    return SourceResultType::FINISHED;
+  } else {
+    throw NotImplementedException("Table in-out function not supported");
+  }
+}
+
+void GPUPhysicalTableScan::ScanDataDuckDBOpt(
+  ExecutionContext &exec_context, GPUBufferManager* gpuBufferManager, string table_name) {
+  if (function.function) {
+    // Perform the second scan to coalesce duckdb chunk data to continuous pinned memory data,
+    // `offset_ptr` represents string length before copied to gpu, after which we do prefix sum
+    uint8_t** data_ptr = gpuBufferManager->customCudaHostAlloc<uint8_t*>(scanned_types.size());
+    uint64_t** offset_ptr = gpuBufferManager->customCudaHostAlloc<uint64_t*>(scanned_types.size());
+
+    for (int col = 0; col < column_ids.size() - gen_row_id_column; col++) {
+      if (!already_cached[col]) {
+        data_ptr[col] = gpuBufferManager->customCudaHostAlloc<uint8_t>(column_size[col]);
+        if (scanned_types[col].id() == LogicalTypeId::VARCHAR) {
+          offset_ptr[col] = gpuBufferManager->customCudaHostAlloc<uint64_t>(num_rows + 1);
+          offset_ptr[col][0] = 0;
+        }
+      }
+    }
+
+    int num_threads = TaskScheduler::GetScheduler(exec_context.client).NumberOfThreads();
+    TaskExecutor executor(exec_context.client);
+    auto g_state = GetGlobalSourceState(exec_context.client);
+    vector<unique_ptr<LocalSourceState>> l_states;
+    l_states.resize(num_threads);
+    for (int i = 0; i < num_threads; ++i) {
+      l_states[i] = GetLocalSourceState(exec_context, *g_state);
+      auto task = make_uniq<TableScanCoalesceTask>(executor, i, function, exec_context, *this,
+                                                   g_state.get(), l_states[i].get(),
+                                                   data_ptr, offset_ptr);
+      executor.ScheduleTask(std::move(task));
+    }
+    executor.WorkOnTasks();
+
+    // Copy data from pinned cpu memory to gpu
+    uint8_t** d_data_ptr = gpuBufferManager->customCudaHostAlloc<uint8_t*>(scanned_types.size());
+    uint64_t** d_offset_ptr = gpuBufferManager->customCudaHostAlloc<uint64_t*>(scanned_types.size());
+    for (int col = 0; col < scanned_types.size(); col++) {
+      if (!already_cached[col]) {
+        d_data_ptr[col] = gpuBufferManager->customCudaMalloc<uint8_t>(column_size[col], 0, 1);
+        if (scanned_types[col].id() == LogicalTypeId::VARCHAR) {
+          d_offset_ptr[col] = gpuBufferManager->customCudaMalloc<uint64_t>(num_rows + 1, 0, 1);
+        }
+      }
+    }
+
+    uint64_t num_cuda_memcpy = 0;
+    vector<cudaStream_t> streams(Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS);
+    for (int i = 0; i < Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS; i++) {
+      cudaStreamCreate(&streams[i]);
+    }
+    for (int col = 0; col < column_ids.size() - gen_row_id_column; col++) {
+      if (!already_cached[col]) {
+        // For data
+        uint64_t write_offset = 0;
+        while (write_offset < column_size[col]) {
+          uint64_t write_len = std::min(Config::OPT_TABLE_SCAN_CUDA_MEMCPY_SIZE, column_size[col] - write_offset);
+          cudaMemcpyAsync(d_data_ptr[col] + write_offset, data_ptr[col] + write_offset,
+                          write_len, cudaMemcpyHostToDevice,
+                          streams[num_cuda_memcpy++ % Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS]);
+          write_offset += write_len;
+        }
+        if (scanned_types[col].id() == LogicalTypeId::VARCHAR) {
+          // For offsets
+          write_offset = 0;
+          while (write_offset < sizeof(uint64_t) * (num_rows + 1)) {
+            uint64_t write_len = std::min(Config::OPT_TABLE_SCAN_CUDA_MEMCPY_SIZE,
+                                          sizeof(uint64_t) * (num_rows + 1) - write_offset);
+            cudaMemcpyAsync(reinterpret_cast<uint8_t*>(d_offset_ptr[col]) + write_offset,
+                            reinterpret_cast<uint8_t*>(offset_ptr[col]) + write_offset,
+                            write_len, cudaMemcpyHostToDevice,
+                            streams[num_cuda_memcpy++ % Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS]);
+            write_offset += write_len;
+          }
+        }
+      }
+    }
+    cudaDeviceSynchronize();
+
+    // Perform prefix sum on gpu to form string offsets
+    int num_prefix_sum = 0;
+    for (int col = 0; col < column_ids.size() - gen_row_id_column; col++) {
+      if (!already_cached[col]) {
+        if (scanned_types[col].id() == LogicalTypeId::VARCHAR) {
+          callCubPrefixSum(d_offset_ptr[col], d_offset_ptr[col], num_rows + 1, true,
+                           streams[num_prefix_sum++ % Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS],
+                           [&](size_t size) {
+            return gpuBufferManager->customCudaMalloc<uint8_t>(size, 0, 0);
+          });
+        }
+      }
+    }
+    cudaDeviceSynchronize();
+
+    for (int col = 0; col < column_ids.size() - gen_row_id_column; col++) {
+      if (!already_cached[col]) {
+        auto up_column_name = names[column_ids[col].GetPrimaryIndex()];
+        auto up_table_name = table_name;
+        transform(up_table_name.begin(), up_table_name.end(), up_table_name.begin(), ::toupper);
+        transform(up_column_name.begin(), up_column_name.end(), up_column_name.begin(), ::toupper);
+        auto column_it = find(gpuBufferManager->tables[up_table_name]->column_names.begin(),
+                              gpuBufferManager->tables[up_table_name]->column_names.end(), up_column_name);
+        if (column_it == gpuBufferManager->tables[up_table_name]->column_names.end()) {
+          throw InvalidInputException("Column not found: %s.%s", up_table_name, up_column_name);
+        }
+        int column_idx = column_it - gpuBufferManager->tables[up_table_name]->column_names.begin();
+        GPUColumnType column_type = convertLogicalTypeToColumnType(scanned_types[col]);
+        gpuBufferManager->tables[up_table_name]->columns[column_idx]->column_length = num_rows;
+        cudf::bitmask_type* validity_mask = nullptr;
+        if (scanned_types[col] == LogicalType::VARCHAR) {
+          gpuBufferManager->tables[up_table_name]->columns[column_idx]->data_wrapper =
+            DataWrapper(column_type, d_data_ptr[col], d_offset_ptr[col], num_rows, column_size[col], true, validity_mask);
+        } else {
+          gpuBufferManager->tables[up_table_name]->columns[column_idx]->data_wrapper =
+            DataWrapper(column_type, d_data_ptr[col], num_rows, validity_mask);
+        }
+        SIRIUS_LOG_DEBUG("Column {}.{} cached in GPU at index {}", up_table_name, up_column_name, column_idx);
+      }
+    }
+  } else {
+    throw NotImplementedException("Table in-out function not supported");
+  }
+}
+
 SourceResultType
 GPUPhysicalTableScan::GetDataDuckDB(ExecutionContext &exec_context) {
+  // Use optimized scan if required
+  if constexpr (Config::USE_OPT_TABLE_SCAN) {
+    return GetDataDuckDBOpt(exec_context);
+  }
+
     D_ASSERT(!column_ids.empty());
     auto gpuBufferManager = &(GPUBufferManager::GetInstance());
 

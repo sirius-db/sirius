@@ -18,6 +18,8 @@
 
 #include "duckdb.hpp"
 
+#include <driver_types.h>
+
 namespace duckdb {
 
 void warmup_gpu();
@@ -29,5 +31,10 @@ void createRowIdColumn(uint8_t *data, size_t count);
 
 template <typename T>
 void subtractToEach(T* data, T delta, size_t count);
+
+using CubPrefixSumAllocFunc = std::function<void*(size_t)>;
+template <typename T>
+void callCubPrefixSum(T* in, T* out, size_t count, bool inclusive,
+                      cudaStream_t stream, CubPrefixSumAllocFunc allocator);
 
 } // namespace duckdb

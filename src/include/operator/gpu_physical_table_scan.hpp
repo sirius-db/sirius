@@ -97,6 +97,8 @@ public:
 
 	unique_ptr<ColumnDataCollection> collection;
 
+	uint64_t num_rows;	// Only used in optimized table scan
+
 	uint64_t* column_size;
 
 	uint64_t* mask_size;
@@ -120,9 +122,13 @@ public:
 public:
 	SourceResultType GetData(GPUIntermediateRelation& output_relation) const override;
 
-	void ScanDataDuckDB(GPUBufferManager* gpuBufferManager, string up_table_name) const;
+	SourceResultType GetDataDuckDBOpt(ExecutionContext &exec_context);
+	void ScanDataDuckDBOpt(ExecutionContext &exec_context,
+												 GPUBufferManager* gpuBufferManager,
+												 string up_table_name);
 
 	SourceResultType GetDataDuckDB(ExecutionContext &exec_context);
+	void ScanDataDuckDB(GPUBufferManager* gpuBufferManager, string up_table_name) const;
 
 	bool IsSource() const override {
 		return true;

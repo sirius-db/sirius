@@ -15,6 +15,7 @@
  */
 
 #include <iostream>
+#include <cub/cub.cuh>
 #include <cuda_runtime.h>
 #include <cuda.h>
 #include <inttypes.h>
@@ -185,7 +186,25 @@ void subtractToEach(T* data, T delta, size_t count) {
   cudaDeviceSynchronize();
 }
 
+template <typename T>
+void callCubPrefixSum(T* in, T* out, size_t count, bool inclusive,
+                      cudaStream_t stream, CubPrefixSumAllocFunc allocator) {
+  void *d_temp_storage = nullptr;
+  size_t temp_storage_bytes = 0;
+  inclusive
+    ? cub::DeviceScan::InclusiveSum(d_temp_storage, temp_storage_bytes, in, out, count, stream)
+    : cub::DeviceScan::ExclusiveSum(d_temp_storage, temp_storage_bytes, in, out, count, stream);
+  d_temp_storage = allocator(temp_storage_bytes);
+  inclusive
+    ? cub::DeviceScan::InclusiveSum(d_temp_storage, temp_storage_bytes, in, out, count, stream)
+    : cub::DeviceScan::ExclusiveSum(d_temp_storage, temp_storage_bytes, in, out, count, stream);
+}
+
 template
 void subtractToEach<uint64_t>(uint64_t* data, uint64_t delta, size_t count);
+
+template
+void callCubPrefixSum<uint64_t>(uint64_t* in, uint64_t* out, size_t count, bool inclusive,
+                                cudaStream_t stream, CubPrefixSumAllocFunc allocator);
 
 } // namespace duckdb
