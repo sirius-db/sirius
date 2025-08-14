@@ -97,8 +97,6 @@ public:
 
 	unique_ptr<ColumnDataCollection> collection;
 
-	uint64_t num_rows;	// Only used in optimized table scan
-
 	uint64_t* column_size;
 
 	uint64_t* mask_size;
@@ -113,6 +111,11 @@ public:
 
 	//! Whether it's required to generate a seperate row id column (e.g., in some select *)
 	bool gen_row_id_column;
+
+	//! Only used in optimized table scan
+	uint64_t num_rows;
+	vector<idx_t> uncached_scan_column_ids;
+	vector<cudaStream_t> cuda_streams;
 public:
 	// string GetName() const override;
 	// string ParamsToString() const override;

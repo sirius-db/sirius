@@ -49,7 +49,6 @@ GPUPhysicalTableScan::GPUPhysicalTableScan(vector<LogicalType> types, TableFunct
         gen_row_id_column(column_ids.back().GetPrimaryIndex() == DConstants::INVALID_INDEX) {
 
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
-    num_rows = 0;
     column_size = gpuBufferManager->customCudaHostAlloc<uint64_t>(column_ids.size());
     mask_size = gpuBufferManager->customCudaHostAlloc<uint64_t>(column_ids.size());
     for (int col = 0; col < column_ids.size() - gen_row_id_column; col++) {
@@ -60,6 +59,13 @@ GPUPhysicalTableScan::GPUPhysicalTableScan(vector<LogicalType> types, TableFunct
     }
     fake_table_filters = make_uniq<TableFilterSet>();
     already_cached = gpuBufferManager->customCudaHostAlloc<bool>(column_ids.size());
+    if (Config::USE_OPT_TABLE_SCAN) {
+      num_rows = 0;
+      cuda_streams.resize(Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS);
+      for (int i = 0; i < Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS; i++) {
+        cudaStreamCreate(&cuda_streams[i]);
+      }
+    }
     SIRIUS_LOG_DEBUG("Table scan column ids: {}", column_ids.size());
 }
 
@@ -537,9 +543,10 @@ class TableScanCoalesceTask : public BaseExecutorTask {
 public:
 	TableScanCoalesceTask(TaskExecutor &executor, int task_id_p, TableFunction& function_p, ExecutionContext& context_p,
                         GPUPhysicalTableScan& op_p, GlobalSourceState* g_state_p, LocalSourceState* l_state_p,
-                        uint8_t** data_ptr_p, uint64_t** offset_ptr_p)
+                        uint8_t** data_ptr_p, uint64_t** offset_ptr_p, int64_t* duckdb_storage_row_ids_ptr_p)
 	    : BaseExecutorTask(executor), task_id(task_id_p), function(function_p), context(context_p),
-        op(op_p), g_state(g_state_p), l_state(l_state_p), data_ptr(data_ptr_p), offset_ptr(offset_ptr_p) {}
+        op(op_p), g_state(g_state_p), l_state(l_state_p), data_ptr(data_ptr_p), offset_ptr(offset_ptr_p),
+        duckdb_storage_row_ids_ptr(duckdb_storage_row_ids_ptr_p) {}
 
 	void ExecuteTask() override {
     auto &g_state_scan = g_state->Cast<TableScanGlobalSourceState>();
@@ -601,6 +608,13 @@ public:
           }
         }
       }
+      // Also copy row id if required
+      if (duckdb_storage_row_ids_ptr != nullptr) {
+        int col = op.scanned_ids.size() - 1;
+        auto& vec = chunk->data[col];
+        vec.Flatten(chunk->size());
+        memcpy(duckdb_storage_row_ids_ptr + row_offset, vec.GetData(), chunk->size() * sizeof(int64_t));
+      }
       // Clear the chunk
       chunk->Reset();
     }
@@ -615,6 +629,7 @@ private:
   LocalSourceState* l_state;
   uint8_t** data_ptr;
   uint64_t** offset_ptr;
+  int64_t* duckdb_storage_row_ids_ptr;
 };
 
 SourceResultType
@@ -637,14 +652,13 @@ GPUPhysicalTableScan::GetDataDuckDBOpt(ExecutionContext &exec_context) {
     }
   }
 
-  shared_ptr<GPUIntermediateRelation> table;
-  auto &catalog_table = Catalog::GetCatalog(exec_context.client, INVALID_CATALOG);
-
+  // Get cached column info
   bool all_cached = true;
   for (int col = 0; col < column_ids.size() - gen_row_id_column; col++) {
     already_cached[col] = gpuBufferManager->checkIfColumnCached(table_name, names[column_ids[col].GetPrimaryIndex()]);
     if (!already_cached[col]) {
       all_cached = false;
+      uncached_scan_column_ids.push_back(column_ids[col].GetPrimaryIndex());
     } 
   }
   auto t1 = std::chrono::high_resolution_clock::now();
@@ -700,6 +714,7 @@ GPUPhysicalTableScan::GetDataDuckDBOpt(ExecutionContext &exec_context) {
     printf(" t12 = %.2f ms\n", t12.count()/1000.0);
 
     // Create table/columns in gpu and check OOM
+    auto &catalog_table = Catalog::GetCatalog(exec_context.client, INVALID_CATALOG);
     if (gpuBufferManager->gpuCachingPointer[0] + gpuBufferManager->cpuCachingPointer[0] + total_size >=
         gpuBufferManager->cache_size_per_gpu) {
       if (total_size > gpuBufferManager->cache_size_per_gpu) {
@@ -758,6 +773,22 @@ void GPUPhysicalTableScan::ScanDataDuckDBOpt(
       }
     }
 
+    // Get table in gpu buffer manager
+    auto up_table_name = table_name;
+    transform(up_table_name.begin(), up_table_name.end(), up_table_name.begin(), ::toupper);
+    auto& table = gpuBufferManager->tables[up_table_name];
+
+    // Since we are doing parallel scan in optimized table scan and store it into gpu cache, we need to keep
+    // row orders of different columns consistent (e.g., one scan caches col_0 and another scan caches col_1).
+    // Now we achieve this by aligning the row order of scanned columns according to duckdb storage row ids.
+    bool scan_duckdb_storage_row_ids = num_rows > 1 && uncached_scan_column_ids.size() < table->column_count;
+    int64_t* duckdb_storage_row_ids_ptr = nullptr;
+    if (scan_duckdb_storage_row_ids) {
+      duckdb_storage_row_ids_ptr = gpuBufferManager->customCudaHostAlloc<int64_t>(num_rows);
+      scanned_ids.push_back(scanned_ids.size());
+      scanned_types.push_back(LogicalType::BIGINT);
+    }
+
     int num_threads = TaskScheduler::GetScheduler(exec_context.client).NumberOfThreads();
     TaskExecutor executor(exec_context.client);
     auto g_state = GetGlobalSourceState(exec_context.client);
@@ -767,7 +798,7 @@ void GPUPhysicalTableScan::ScanDataDuckDBOpt(
       l_states[i] = GetLocalSourceState(exec_context, *g_state);
       auto task = make_uniq<TableScanCoalesceTask>(executor, i, function, exec_context, *this,
                                                    g_state.get(), l_states[i].get(),
-                                                   data_ptr, offset_ptr);
+                                                   data_ptr, offset_ptr, duckdb_storage_row_ids_ptr);
       executor.ScheduleTask(std::move(task));
     }
     executor.WorkOnTasks();
@@ -785,10 +816,6 @@ void GPUPhysicalTableScan::ScanDataDuckDBOpt(
     }
 
     uint64_t num_cuda_memcpy = 0;
-    vector<cudaStream_t> streams(Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS);
-    for (int i = 0; i < Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS; i++) {
-      cudaStreamCreate(&streams[i]);
-    }
     for (int col = 0; col < column_ids.size() - gen_row_id_column; col++) {
       if (!already_cached[col]) {
         // For data
@@ -797,7 +824,7 @@ void GPUPhysicalTableScan::ScanDataDuckDBOpt(
           uint64_t write_len = std::min(Config::OPT_TABLE_SCAN_CUDA_MEMCPY_SIZE, column_size[col] - write_offset);
           cudaMemcpyAsync(d_data_ptr[col] + write_offset, data_ptr[col] + write_offset,
                           write_len, cudaMemcpyHostToDevice,
-                          streams[num_cuda_memcpy++ % Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS]);
+                          cuda_streams[num_cuda_memcpy++ % Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS]);
           write_offset += write_len;
         }
         if (scanned_types[col].id() == LogicalTypeId::VARCHAR) {
@@ -809,10 +836,25 @@ void GPUPhysicalTableScan::ScanDataDuckDBOpt(
             cudaMemcpyAsync(reinterpret_cast<uint8_t*>(d_offset_ptr[col]) + write_offset,
                             reinterpret_cast<uint8_t*>(offset_ptr[col]) + write_offset,
                             write_len, cudaMemcpyHostToDevice,
-                            streams[num_cuda_memcpy++ % Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS]);
+                            cuda_streams[num_cuda_memcpy++ % Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS]);
             write_offset += write_len;
           }
         }
+      }
+    }
+    // For duckdb storage row ids
+    int64_t* d_duckdb_storage_row_ids_ptr = nullptr;
+    if (scan_duckdb_storage_row_ids) {
+      d_duckdb_storage_row_ids_ptr = gpuBufferManager->customCudaMalloc<int64_t>(num_rows, 0, 0);
+      uint64_t write_offset = 0;
+      while (write_offset < sizeof(int64_t) * num_rows) {
+        uint64_t write_len = std::min(Config::OPT_TABLE_SCAN_CUDA_MEMCPY_SIZE,
+                                      sizeof(int64_t) * num_rows - write_offset);
+        cudaMemcpyAsync(reinterpret_cast<uint8_t*>(d_duckdb_storage_row_ids_ptr) + write_offset,
+                        reinterpret_cast<uint8_t*>(duckdb_storage_row_ids_ptr) + write_offset,
+                        write_len, cudaMemcpyHostToDevice,
+                        cuda_streams[num_cuda_memcpy++ % Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS]);
+        write_offset += write_len;
       }
     }
     cudaDeviceSynchronize();
@@ -823,7 +865,7 @@ void GPUPhysicalTableScan::ScanDataDuckDBOpt(
       if (!already_cached[col]) {
         if (scanned_types[col].id() == LogicalTypeId::VARCHAR) {
           callCubPrefixSum(d_offset_ptr[col], d_offset_ptr[col], num_rows + 1, true,
-                           streams[num_prefix_sum++ % Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS],
+                           cuda_streams[num_prefix_sum++ % Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS],
                            [&](size_t size) {
             return gpuBufferManager->customCudaMalloc<uint8_t>(size, 0, 0);
           });
@@ -835,27 +877,71 @@ void GPUPhysicalTableScan::ScanDataDuckDBOpt(
     for (int col = 0; col < column_ids.size() - gen_row_id_column; col++) {
       if (!already_cached[col]) {
         auto up_column_name = names[column_ids[col].GetPrimaryIndex()];
-        auto up_table_name = table_name;
-        transform(up_table_name.begin(), up_table_name.end(), up_table_name.begin(), ::toupper);
         transform(up_column_name.begin(), up_column_name.end(), up_column_name.begin(), ::toupper);
-        auto column_it = find(gpuBufferManager->tables[up_table_name]->column_names.begin(),
-                              gpuBufferManager->tables[up_table_name]->column_names.end(), up_column_name);
-        if (column_it == gpuBufferManager->tables[up_table_name]->column_names.end()) {
+        auto column_it = find(table->column_names.begin(), table->column_names.end(), up_column_name);
+        if (column_it == table->column_names.end()) {
           throw InvalidInputException("Column not found: %s.%s", up_table_name, up_column_name);
         }
-        int column_idx = column_it - gpuBufferManager->tables[up_table_name]->column_names.begin();
+        int column_idx = column_it - table->column_names.begin();
         GPUColumnType column_type = convertLogicalTypeToColumnType(scanned_types[col]);
-        gpuBufferManager->tables[up_table_name]->columns[column_idx]->column_length = num_rows;
+        table->columns[column_idx]->column_length = num_rows;
         cudf::bitmask_type* validity_mask = nullptr;
         if (scanned_types[col] == LogicalType::VARCHAR) {
-          gpuBufferManager->tables[up_table_name]->columns[column_idx]->data_wrapper =
-            DataWrapper(column_type, d_data_ptr[col], d_offset_ptr[col], num_rows, column_size[col], true, validity_mask);
+          table->columns[column_idx]->data_wrapper = DataWrapper(column_type, d_data_ptr[col], d_offset_ptr[col],
+                                                                 num_rows, column_size[col], true, validity_mask);
         } else {
-          gpuBufferManager->tables[up_table_name]->columns[column_idx]->data_wrapper =
-            DataWrapper(column_type, d_data_ptr[col], num_rows, validity_mask);
+          table->columns[column_idx]->data_wrapper = DataWrapper(column_type, d_data_ptr[col], num_rows, validity_mask);
         }
         SIRIUS_LOG_DEBUG("Column {}.{} cached in GPU at index {}", up_table_name, up_column_name, column_idx);
       }
+    }
+
+    // Align the row order of scanned columns according to duckdb storage row ids if required
+    if (scan_duckdb_storage_row_ids) {
+      // Get output indices of reordering based on duckdb storage row ids
+      uint64_t* reorder_row_ids_out_indices = gpuBufferManager->customCudaMalloc<uint64_t>(num_rows, 0, 0);
+      reorderRowIds(d_duckdb_storage_row_ids_ptr, reorder_row_ids_out_indices, num_rows);
+      // Reorder each scanned column
+      for (int col: uncached_scan_column_ids) {
+        // Materialize column
+        table->columns[col]->row_ids = reorder_row_ids_out_indices;
+        table->columns[col]->row_id_count = num_rows;
+        auto reordered_column = HandleMaterializeExpression(table->columns[col], gpuBufferManager);
+        // Copy materialized column (in processing region) to cached column (caching region)
+        num_cuda_memcpy = 0;
+        uint64_t write_offset = 0;
+        while (write_offset < table->columns[col]->data_wrapper.num_bytes) {
+          uint64_t write_len = std::min(Config::OPT_TABLE_SCAN_CUDA_MEMCPY_SIZE,
+                                        table->columns[col]->data_wrapper.num_bytes - write_offset);
+          cudaMemcpyAsync(table->columns[col]->data_wrapper.data + write_offset,
+                          reordered_column->data_wrapper.data + write_offset,
+                          write_len, cudaMemcpyDeviceToDevice,
+                          cuda_streams[num_cuda_memcpy++ % Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS]);
+          write_offset += write_len;
+        }
+        if (table->columns[col]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
+          write_offset = 0;
+          while (write_offset < sizeof(uint64_t) * (num_rows + 1)) {
+            uint64_t write_len = std::min(Config::OPT_TABLE_SCAN_CUDA_MEMCPY_SIZE,
+                                          sizeof(uint64_t) * (num_rows + 1) - write_offset);
+            cudaMemcpyAsync(reinterpret_cast<uint8_t*>(table->columns[col]->data_wrapper.offset) + write_offset,
+                            reinterpret_cast<uint8_t*>(reordered_column->data_wrapper.offset) + write_offset,
+                            write_len, cudaMemcpyDeviceToDevice,
+                            cuda_streams[num_cuda_memcpy++ % Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS]);
+            write_offset += write_len;
+          }
+        }
+        cudaDeviceSynchronize();
+        // Reset column's `row_ids` and `row_id_count` and free data of `reordered_column` in processing region
+        table->columns[col]->row_ids = nullptr;
+        table->columns[col]->row_id_count = 0;
+        gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(reordered_column->data_wrapper.data), 0);
+        if (table->columns[col]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
+          gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(reordered_column->data_wrapper.offset), 0);
+        }
+      }
+      // Free `reorder_row_ids_out_indices`
+      gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(reorder_row_ids_out_indices), 0);
     }
   } else {
     throw NotImplementedException("Table in-out function not supported");

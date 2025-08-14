@@ -100,6 +100,9 @@ GPUBufferManager::customCudaMalloc<double*>(size_t size, int gpu, bool caching);
 template int*
 GPUBufferManager::customCudaHostAlloc<int>(size_t size);
 
+template int64_t*
+GPUBufferManager::customCudaHostAlloc<int64_t>(size_t size);
+
 template uint64_t*
 GPUBufferManager::customCudaHostAlloc<uint64_t>(size_t size);
 

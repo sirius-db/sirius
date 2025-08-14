@@ -37,4 +37,9 @@ template <typename T>
 void callCubPrefixSum(T* in, T* out, size_t count, bool inclusive,
                       cudaStream_t stream, CubPrefixSumAllocFunc allocator);
 
+// Reorder input row ids (with values from `0` to `count - 1`) such that `out_indices` represents
+// how to reorder the rows such that row ids are monotonically increasing.
+// E.g., `in_row_ids` = `1, 3, 0, 2, 4`, then `out_indices` = `2, 0, 3, 1, 4`.
+void reorderRowIds(int64_t* in_row_ids, uint64_t* out_indices, size_t count);
+
 } // namespace duckdb

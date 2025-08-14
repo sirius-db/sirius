@@ -117,6 +117,13 @@ __global__ void subtract_to_each(T* data, T delta, size_t count) {
   }
 }
 
+__global__ void reorder_row_ids(int64_t* in_row_ids, uint64_t* out_indices, size_t count) {
+  size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < count) {
+    out_indices[in_row_ids[idx]] = idx;
+  }
+}
+
 void warmup_gpu() {
   // Perform the warmup
   cudaFree(0);
@@ -198,6 +205,14 @@ void callCubPrefixSum(T* in, T* out, size_t count, bool inclusive,
   inclusive
     ? cub::DeviceScan::InclusiveSum(d_temp_storage, temp_storage_bytes, in, out, count, stream)
     : cub::DeviceScan::ExclusiveSum(d_temp_storage, temp_storage_bytes, in, out, count, stream);
+}
+
+void reorderRowIds(int64_t* in_row_ids, uint64_t* out_indices, size_t count) {
+  size_t threads_per_block = 256;
+  size_t blocks = (count + threads_per_block - 1) / threads_per_block;
+
+  reorder_row_ids<<<blocks, threads_per_block>>>(in_row_ids, out_indices, count);
+  cudaDeviceSynchronize();
 }
 
 template
