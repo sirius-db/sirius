@@ -116,6 +116,9 @@ public:
 	uint64_t num_rows;
 	vector<idx_t> uncached_scan_column_ids;
 	vector<cudaStream_t> cuda_streams;
+	vector<ColumnIndex> orig_column_ids;
+	vector<idx_t> orig_scanned_ids;
+	vector<LogicalType> orig_scanned_types;
 public:
 	// string GetName() const override;
 	// string ParamsToString() const override;

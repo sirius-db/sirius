@@ -565,7 +565,7 @@ public:
       }
       // Compute chunk column size and get write offset
       chunk_column_sizes.assign(op.column_ids.size(), 0);
-      for (int col = 0; col < op.column_ids.size() - op.gen_row_id_column; col++) {
+      for (int col = 0; col < op.orig_column_ids.size() - op.gen_row_id_column; col++) {
         if (!op.already_cached[col]) {
           auto& vec = chunk->data[col];
           vec.Flatten(chunk->size());
@@ -584,7 +584,7 @@ public:
       }
       g_state_scan.NextChunkOffsets(chunk->size(), chunk_column_sizes, &row_offset, column_data_offsets);
       // Copy data to pinned cpu memory
-      for (int col = 0; col < op.column_ids.size() - op.gen_row_id_column; col++) {
+      for (int col = 0; col < op.orig_column_ids.size() - op.gen_row_id_column; col++) {
         if (!op.already_cached[col]) {
           auto& vec = chunk->data[col];
           if (vec.GetType().id() == LogicalTypeId::VARCHAR) {
@@ -634,8 +634,6 @@ private:
 
 SourceResultType
 GPUPhysicalTableScan::GetDataDuckDBOpt(ExecutionContext &exec_context) {
-  auto t0 = std::chrono::high_resolution_clock::now();
-
   // Check if columns are all cached
   D_ASSERT(!column_ids.empty());
   auto gpuBufferManager = &(GPUBufferManager::GetInstance());
@@ -661,9 +659,6 @@ GPUPhysicalTableScan::GetDataDuckDBOpt(ExecutionContext &exec_context) {
       uncached_scan_column_ids.push_back(column_ids[col].GetPrimaryIndex());
     } 
   }
-  auto t1 = std::chrono::high_resolution_clock::now();
-  auto t01 = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0);
-  printf(" t01 = %.2f ms\n", t01.count()/1000.0);
 
   if (all_cached) {
     return SourceResultType::FINISHED;
@@ -709,10 +704,6 @@ GPUPhysicalTableScan::GetDataDuckDBOpt(ExecutionContext &exec_context) {
       }
     }
 
-    auto t2 = std::chrono::high_resolution_clock::now();
-    auto t12 = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1);
-    printf(" t12 = %.2f ms\n", t12.count()/1000.0);
-
     // Create table/columns in gpu and check OOM
     auto &catalog_table = Catalog::GetCatalog(exec_context.client, INVALID_CATALOG);
     if (gpuBufferManager->gpuCachingPointer[0] + gpuBufferManager->cpuCachingPointer[0] + total_size >=
@@ -734,17 +725,8 @@ GPUPhysicalTableScan::GetDataDuckDBOpt(ExecutionContext &exec_context) {
       }
     }
 
-    auto t3 = std::chrono::high_resolution_clock::now();
-    auto t23 = std::chrono::duration_cast<std::chrono::microseconds>(t3 - t2);
-    printf(" t23 = %.2f ms\n", t23.count()/1000.0);
-
     // Perform the second scan to copy data to gpu
     ScanDataDuckDBOpt(exec_context, gpuBufferManager, table_name);
-
-    auto t4 = std::chrono::high_resolution_clock::now();
-    auto t34 = std::chrono::duration_cast<std::chrono::microseconds>(t4 - t3);
-    printf(" t34 = %.2f ms\n", t34.count()/1000.0);
-    // throw NotImplementedException("WIP in table scan");
 
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
@@ -783,8 +765,17 @@ void GPUPhysicalTableScan::ScanDataDuckDBOpt(
     // Now we achieve this by aligning the row order of scanned columns according to duckdb storage row ids.
     bool scan_duckdb_storage_row_ids = num_rows > 1 && uncached_scan_column_ids.size() < table->column_count;
     int64_t* duckdb_storage_row_ids_ptr = nullptr;
+    // Need to save the original column info, since we need to modify them to let duckdb produce row_id column,
+    // but after the scan finishes we still need to use the original column info.
+    orig_column_ids = column_ids;
+    orig_scanned_ids = scanned_ids;
+    orig_scanned_types = scanned_types;
     if (scan_duckdb_storage_row_ids) {
       duckdb_storage_row_ids_ptr = gpuBufferManager->customCudaHostAlloc<int64_t>(num_rows);
+      // Need to modify column info used during duckdb scan to let it produce row_id column
+      if (column_ids.back().GetPrimaryIndex() != COLUMN_IDENTIFIER_ROW_ID) {
+        column_ids.push_back(ColumnIndex(COLUMN_IDENTIFIER_ROW_ID));
+      }
       scanned_ids.push_back(scanned_ids.size());
       scanned_types.push_back(LogicalType::BIGINT);
     }
@@ -803,6 +794,13 @@ void GPUPhysicalTableScan::ScanDataDuckDBOpt(
     }
     executor.WorkOnTasks();
 
+    // Restore the modified column info
+    if (scan_duckdb_storage_row_ids) {
+      column_ids = orig_column_ids;
+      scanned_ids = orig_scanned_ids;
+      scanned_types = orig_scanned_types;
+    }
+  
     // Copy data from pinned cpu memory to gpu
     uint8_t** d_data_ptr = gpuBufferManager->customCudaHostAlloc<uint8_t*>(scanned_types.size());
     uint64_t** d_offset_ptr = gpuBufferManager->customCudaHostAlloc<uint64_t*>(scanned_types.size());
