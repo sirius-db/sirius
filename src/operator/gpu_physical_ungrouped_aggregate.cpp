@@ -126,7 +126,7 @@ HandleAggregateExpressionCuDF(vector<shared_ptr<GPUColumn>> &aggregate_keys, GPU
 	for (int agg_idx = 0; agg_idx < aggregates.size(); agg_idx++) {
 		auto& expr = aggregates[agg_idx]->Cast<BoundAggregateExpression>();
 		if (expr.IsDistinct()) {
-			if (expr.function.name.compare("count") == 0 && aggregate_keys[agg_idx]->data_wrapper.data != nullptr) {
+			if (expr.function.name.compare("count") == 0) {
 				agg_mode[agg_idx] = AggregationType::COUNT_DISTINCT;
 			} else {
 				SIRIUS_LOG_DEBUG("Aggregate function (distinct)  not supported: {}", expr.function.name);
@@ -322,6 +322,7 @@ GPUPhysicalUngroupedAggregate::GetData(GPUIntermediateRelation &output_relation)
 void
 GPUPhysicalUngroupedAggregate::MaterializeDistinctInput(
 		GPUIntermediateRelation &input_relation, vector<shared_ptr<GPUColumn>>& aggregate_column) const {
+	GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 	auto &distinct_info = *distinct_collection_info;
 	auto &distinct_indices = distinct_info.Indices();
 	auto &distinct_filter = distinct_info.Indices();
@@ -334,22 +335,13 @@ GPUPhysicalUngroupedAggregate::MaterializeDistinctInput(
 		if (aggregate.filter) {
 			auto &bound_ref_expr = aggregate.filter->Cast<BoundReferenceExpression>();
 			SIRIUS_LOG_DEBUG("Reading filter column from index {}", bound_ref_expr.index);
+		}
 
-			for (idx_t child_idx = 0; child_idx < aggregate.children.size(); child_idx++) {
-				auto &child = aggregate.children[child_idx];
-				auto &bound_ref = child->Cast<BoundReferenceExpression>();
-				SIRIUS_LOG_DEBUG("Reading aggregation column from index {} and passing it to index {} in groupby result", bound_ref.index, bound_ref.index);
-				input_relation.checkLateMaterialization(bound_ref.index);
-				aggregate_column[bound_ref.index] = input_relation.columns[bound_ref.index];
-			}
-		} else {
-			for (idx_t child_idx = 0; child_idx < aggregate.children.size(); child_idx++) {
-				auto &child = aggregate.children[child_idx];
-				auto &bound_ref = child->Cast<BoundReferenceExpression>();
-				SIRIUS_LOG_DEBUG("Reading aggregation column from index {} and passing it to index {} in groupby result", bound_ref.index, bound_ref.index);
-				input_relation.checkLateMaterialization(bound_ref.index);
-				aggregate_column[bound_ref.index] = input_relation.columns[bound_ref.index];
-			}
+		for (idx_t child_idx = 0; child_idx < aggregate.children.size(); child_idx++) {
+			auto &child = aggregate.children[child_idx];
+			auto &bound_ref = child->Cast<BoundReferenceExpression>();
+			SIRIUS_LOG_DEBUG("Reading aggregation column from index {} and passing it to index {} in groupby result", bound_ref.index, bound_ref.index);
+			aggregate_column[bound_ref.index] = HandleMaterializeExpression(input_relation.columns[bound_ref.index], gpuBufferManager);
 		}
 	}
 
