@@ -48,7 +48,8 @@ void cudf_aggregate(vector<shared_ptr<GPUColumn>>& column, uint64_t num_aggregat
     if (column[0]->column_length == 0) {
         SIRIUS_LOG_DEBUG("Input size is 0");
         for (int agg_idx = 0; agg_idx < num_aggregates; agg_idx++) {
-            if (agg_mode[agg_idx] == AggregationType::COUNT_STAR || agg_mode[agg_idx] == AggregationType::COUNT) {
+            if (agg_mode[agg_idx] == AggregationType::COUNT_STAR || agg_mode[agg_idx] == AggregationType::COUNT ||
+                agg_mode[agg_idx] == AggregationType::COUNT_DISTINCT) {
                 uint64_t* temp = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
                 cudaMemset(temp, 0, sizeof(uint64_t));
                 column[agg_idx] = make_shared_ptr<GPUColumn>(1, GPUColumnType(GPUColumnTypeId::INT64), reinterpret_cast<uint8_t*>(temp));
