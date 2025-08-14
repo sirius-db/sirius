@@ -938,8 +938,9 @@ void GPUPhysicalTableScan::ScanDataDuckDBOpt(
           gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(reordered_column->data_wrapper.offset), 0);
         }
       }
-      // Free `reorder_row_ids_out_indices`
+      // Free `reorder_row_ids_out_indices` and `d_duckdb_storage_row_ids_ptr`
       gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(reorder_row_ids_out_indices), 0);
+      gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(d_duckdb_storage_row_ids_ptr), 0);
     }
   } else {
     throw NotImplementedException("Table in-out function not supported");
