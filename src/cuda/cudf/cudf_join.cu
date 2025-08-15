@@ -23,7 +23,7 @@
 
 namespace duckdb {
 
-void cudf_hash_inner_join(vector<shared_ptr<GPUColumn>>& probe_keys, vector<shared_ptr<GPUColumn>>& build_keys, int num_keys, uint64_t*& row_ids_left, uint64_t*& row_ids_right, uint64_t*& count) {
+void cudf_hash_inner_join(vector<shared_ptr<GPUColumn>>& probe_keys, vector<shared_ptr<GPUColumn>>& build_keys, int num_keys, uint64_t*& row_ids_left, uint64_t*& row_ids_right, uint64_t*& count, bool unique_build_keys) {
     GPUBufferManager *gpuBufferManager = &(GPUBufferManager::GetInstance());
     if (build_keys[0]->column_length == 0 || probe_keys[0]->column_length == 0) {
         SIRIUS_LOG_DEBUG("Input size is 0");
@@ -77,21 +77,39 @@ void cudf_hash_inner_join(vector<shared_ptr<GPUColumn>>& probe_keys, vector<shar
     auto build_table = cudf::table_view(build_keys_cudf);
     auto probe_table = cudf::table_view(probe_keys_cudf);
 
-    auto hash_table = cudf::hash_join(build_table, cudf::null_equality::EQUAL);
-    auto result = hash_table.inner_join(probe_table);
-    
-    auto result_count = result.first->size();
-    rmm::device_buffer row_ids_left_buffer = result.first->release();
-    rmm::device_buffer row_ids_right_buffer = result.second->release();
+    if (unique_build_keys) {
+        auto hash_table = cudf::distinct_hash_join(build_table, cudf::null_equality::EQUAL);
+        auto result = hash_table.inner_join(probe_table);
+        
+        auto result_count = result.first->size();
+        rmm::device_buffer row_ids_left_buffer = result.first->release();
+        rmm::device_buffer row_ids_right_buffer = result.second->release();
 
-    row_ids_left = convertInt32ToUInt64(reinterpret_cast<int32_t*>(row_ids_left_buffer.data()), result_count);
-    row_ids_right = convertInt32ToUInt64(reinterpret_cast<int32_t*>(row_ids_right_buffer.data()), result_count);
+        row_ids_left = convertInt32ToUInt64(reinterpret_cast<int32_t*>(row_ids_left_buffer.data()), result_count);
+        row_ids_right = convertInt32ToUInt64(reinterpret_cast<int32_t*>(row_ids_right_buffer.data()), result_count);
 
-    gpuBufferManager->rmm_stored_buffers.push_back(std::make_unique<rmm::device_buffer>(std::move(row_ids_left_buffer)));
-    gpuBufferManager->rmm_stored_buffers.push_back(std::make_unique<rmm::device_buffer>(std::move(row_ids_right_buffer)));
+        gpuBufferManager->rmm_stored_buffers.push_back(std::make_unique<rmm::device_buffer>(std::move(row_ids_left_buffer)));
+        gpuBufferManager->rmm_stored_buffers.push_back(std::make_unique<rmm::device_buffer>(std::move(row_ids_right_buffer)));
 
-    count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
-    count[0] = result_count;
+        count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
+        count[0] = result_count;
+    } else {
+        auto hash_table = cudf::hash_join(build_table, cudf::null_equality::EQUAL);
+        auto result = hash_table.inner_join(probe_table);
+        
+        auto result_count = result.first->size();
+        rmm::device_buffer row_ids_left_buffer = result.first->release();
+        rmm::device_buffer row_ids_right_buffer = result.second->release();
+
+        row_ids_left = convertInt32ToUInt64(reinterpret_cast<int32_t*>(row_ids_left_buffer.data()), result_count);
+        row_ids_right = convertInt32ToUInt64(reinterpret_cast<int32_t*>(row_ids_right_buffer.data()), result_count);
+
+        gpuBufferManager->rmm_stored_buffers.push_back(std::make_unique<rmm::device_buffer>(std::move(row_ids_left_buffer)));
+        gpuBufferManager->rmm_stored_buffers.push_back(std::make_unique<rmm::device_buffer>(std::move(row_ids_right_buffer)));
+
+        count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
+        count[0] = result_count;
+    }
 
     STOP_TIMER();
     SIRIUS_LOG_DEBUG("CUDF Inner join result count: {}", count[0]);
