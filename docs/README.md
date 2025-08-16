@@ -130,10 +130,12 @@ python3 -m venv --prompt duckdb .venv
 source .venv/bin/activate
 ```
 
-## Generating and Loading TPC-H dataset
+## Generating and Loading test datasets
+
+### TPC-H Datasets
 To generate the TPC-H dataset
 ```
-unzip dbgen.zip
+unzip test_datasets/dbgen.zip
 cd dbgen
 ./dbgen -s 1 && mkdir s1 && mv *.tbl s1  # this generates dataset of SF1
 cd ..
@@ -143,6 +145,22 @@ To load the TPC-H dataset to duckdb:
 ```
 ./build/release/duckdb {DATABASE_NAME}.duckdb
 .read tpch_load_duckdb.sql
+```
+
+### Clickbench Datasets
+
+To generate the clickbench dataset:
+```
+cd test_datasets
+wget https://sirius-datasets.s3.us-east-2.amazonaws.com/test_hits.tsv.gz
+gzip -d test_hits.tsv.gz
+cd ..
+```
+
+To load the Clickbench dataset to duckdb:
+```
+./build/release/duckdb {DATABASE_NAME}.duckdb
+.read clickbench_load_duckdb.sql
 ```
 
 ## Running Sirius: CLI
@@ -224,6 +242,11 @@ con.execute('''
 Sirius provides a unit test that compares Sirius against DuckDB for correctness across all 22 TPC-H queries. To run the unittest, generate SF=1 TPC-H dataset using the method described [here](https://github.com/sirius-db/sirius?tab=readme-ov-file#generating-tpc-h-dataset) and run the unittest using the following command:
 ```
 make test
+```
+
+To run only one of tests do: 
+```
+build/release/test/unittest sirius_tpch_queries.test
 ```
 
 ## Performance Testing
