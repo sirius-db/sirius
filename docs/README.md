@@ -93,6 +93,9 @@ nvidia-smi
 ```
 
 ### Install libcudf dependencies
+
+This approach requires cloning the repo following the instructions specifed in [Building Sirius](#building-sirius). 
+
 libcudf will be installed via conda/miniconda. Miniconda can be downloaded [here](https://www.anaconda.com/docs/getting-started/miniconda/install). After downloading miniconda, install libcudf by running these commands:
 ```
 conda env create -f environment.yml
@@ -102,7 +105,7 @@ Set the environment variables `LIBCUDF_ENV_PREFIX` to the conda environment's pa
 ```
 export LIBCUDF_ENV_PREFIX={PATH to libcudf-env}
 ```
-It is recommended to add the environment variables to your `bashrc` to avoid repetition.
+It is recommended to add the environment variables to your `bashrc` to avoid repetition. 
 
 ## Building Sirius
 To clone the Sirius repository:
