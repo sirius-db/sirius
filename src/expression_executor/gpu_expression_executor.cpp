@@ -197,7 +197,7 @@ void GpuExpressionExecutor::Execute(const GPUIntermediateRelation& input_relatio
 
     // Make placeholder output column
     output_relation.columns[i] =
-      make_shared_ptr<GPUColumn>(0, convertLogicalTypeToColumnType(expr.return_type), nullptr);
+      make_shared_ptr<GPUColumn>(0, convertLogicalTypeToColumnType(expr.return_type), nullptr, nullptr);
 
     // Skip execution if the input count is zero or if there is a null leaf
     if (input_count == 0 || (has_null_input_column && HasNullLeaf(expr)))

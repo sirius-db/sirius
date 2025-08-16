@@ -28,10 +28,13 @@ template <typename T>
 shared_ptr<GPUColumn>
 ResolveTypeCombineColumns(shared_ptr<GPUColumn> column1, shared_ptr<GPUColumn> column2, GPUBufferManager* gpuBufferManager) {
 	T* combine;
+	cudf::bitmask_type* combine_mask;
 	T* a = reinterpret_cast<T*> (column1->data_wrapper.data);
 	T* b = reinterpret_cast<T*> (column2->data_wrapper.data);
 	combineColumns<T>(a, b, combine, column1->column_length, column2->column_length);
-	shared_ptr<GPUColumn> result = make_shared_ptr<GPUColumn>(column1->column_length + column2->column_length, column1->data_wrapper.type, reinterpret_cast<uint8_t*>(combine));
+	combineMasks(column1->data_wrapper.validity_mask, column2->data_wrapper.validity_mask,
+				combine_mask, column1->column_length, column2->column_length);
+	shared_ptr<GPUColumn> result = make_shared_ptr<GPUColumn>(column1->column_length + column2->column_length, column1->data_wrapper.type, reinterpret_cast<uint8_t*>(combine), combine_mask);
 	if (column1->is_unique && column2->is_unique) {
 		result->is_unique = true;
 	}
@@ -42,6 +45,7 @@ shared_ptr<GPUColumn>
 ResolveTypeCombineStrings(shared_ptr<GPUColumn> column1, shared_ptr<GPUColumn> column2, GPUBufferManager* gpuBufferManager) {
 	uint8_t* combine;
 	uint64_t* offset_combine;
+	cudf::bitmask_type* combine_mask;
 	uint8_t* a = column1->data_wrapper.data;
 	uint8_t* b = column2->data_wrapper.data;
 	uint64_t* offset_a = column1->data_wrapper.offset;
@@ -50,7 +54,9 @@ ResolveTypeCombineStrings(shared_ptr<GPUColumn> column1, shared_ptr<GPUColumn> c
 	uint64_t num_bytes_b = column2->data_wrapper.num_bytes;
 
 	combineStrings(a, b, combine, offset_a, offset_b, offset_combine, num_bytes_a, num_bytes_b, column1->column_length, column2->column_length);
-	shared_ptr<GPUColumn> result = make_shared_ptr<GPUColumn>(column1->column_length + column2->column_length, GPUColumnType(GPUColumnTypeId::VARCHAR), combine, offset_combine, num_bytes_a + num_bytes_b, true);
+	combineMasks(column1->data_wrapper.validity_mask, column2->data_wrapper.validity_mask,
+				combine_mask, column1->column_length, column2->column_length);
+	shared_ptr<GPUColumn> result = make_shared_ptr<GPUColumn>(column1->column_length + column2->column_length, GPUColumnType(GPUColumnTypeId::VARCHAR), combine, offset_combine, num_bytes_a + num_bytes_b, true, combine_mask);
 	if (column1->is_unique && column2->is_unique) {
 		result->is_unique = true;
 	}
@@ -678,7 +684,7 @@ GPUPhysicalGroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const
 		if (aggr.children.size() == 0) {
 			//we have a count(*) aggregate
 			SIRIUS_LOG_DEBUG("Passing * aggregate to index {} in aggregation result", aggr_idx);
-			aggregate_column[aggr_idx] = make_shared_ptr<GPUColumn>(column_size, GPUColumnType(GPUColumnTypeId::INT64), nullptr);
+			aggregate_column[aggr_idx] = make_shared_ptr<GPUColumn>(column_size, GPUColumnType(GPUColumnTypeId::INT64), nullptr, nullptr);
 		}
 		if (aggr.filter) {
 			throw NotImplementedException("Filter not supported yet");
@@ -777,15 +783,17 @@ GPUPhysicalGroupedAggregate::GetData(GPUIntermediateRelation &output_relation) c
 		// output_relation.columns[col] = group_by_result->columns[col];
 		bool old_unique = group_by_result->columns[col]->is_unique;
 		if (group_by_result->columns[col]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
-			output_relation.columns[col] = make_shared_ptr<GPUColumn>(
-				group_by_result->columns[col]->column_length, group_by_result->columns[col]->data_wrapper.type,
-				group_by_result->columns[col]->data_wrapper.data, group_by_result->columns[col]->data_wrapper.offset,
-				group_by_result->columns[col]->data_wrapper.num_bytes, true, group_by_result->columns[col]->data_wrapper.validity_mask);
+			// output_relation.columns[col] = make_shared_ptr<GPUColumn>(
+			// 	group_by_result->columns[col]->column_length, group_by_result->columns[col]->data_wrapper.type,
+			// 	group_by_result->columns[col]->data_wrapper.data, group_by_result->columns[col]->data_wrapper.offset,
+			// 	group_by_result->columns[col]->data_wrapper.num_bytes, true, group_by_result->columns[col]->data_wrapper.validity_mask);
+			output_relation.columns[col] = make_shared_ptr<GPUColumn>(group_by_result->columns[col]);
 		} else {
-			output_relation.columns[col] = make_shared_ptr<GPUColumn>(
-				group_by_result->columns[col]->column_length, group_by_result->columns[col]->data_wrapper.type,
-				group_by_result->columns[col]->data_wrapper.data, nullptr, group_by_result->columns[col]->data_wrapper.num_bytes,
-				false, group_by_result->columns[col]->data_wrapper.validity_mask);
+			// output_relation.columns[col] = make_shared_ptr<GPUColumn>(
+			// 	group_by_result->columns[col]->column_length, group_by_result->columns[col]->data_wrapper.type,
+			// 	group_by_result->columns[col]->data_wrapper.data, nullptr, group_by_result->columns[col]->data_wrapper.num_bytes,
+			// 	false, group_by_result->columns[col]->data_wrapper.validity_mask);
+			output_relation.columns[col] = make_shared_ptr<GPUColumn>(group_by_result->columns[col]);
 		}
 		output_relation.columns[col]->is_unique = old_unique;
 	}

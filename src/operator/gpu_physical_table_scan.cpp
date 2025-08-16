@@ -823,10 +823,11 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
           auto projection_id = projection_ids[col];
           SIRIUS_LOG_DEBUG("Reading column index (late materialized) {} and passing it to index in output relation {}", column_ids[projection_id].GetPrimaryIndex(), index);
           SIRIUS_LOG_DEBUG("Writing row IDs to output relation in index {}", index);
-          output_relation.columns[index] = make_shared_ptr<GPUColumn>(table->columns[column_ids[projection_id].GetPrimaryIndex()]->column_length, table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.type, table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.data,
-                          table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.offset, table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.num_bytes, table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.is_string_data,
-                          table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.validity_mask);
-          output_relation.columns[index]->is_unique = table->columns[column_ids[projection_id].GetPrimaryIndex()]->is_unique;
+          // output_relation.columns[index] = make_shared_ptr<GPUColumn>(table->columns[column_ids[projection_id].GetPrimaryIndex()]->column_length, table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.type, table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.data,
+          //                 table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.offset, table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.num_bytes, table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.is_string_data,
+          //                 table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.validity_mask);
+          // output_relation.columns[index]->is_unique = table->columns[column_ids[projection_id].GetPrimaryIndex()]->is_unique;
+          output_relation.columns[index] = make_shared_ptr<GPUColumn>(table->columns[column_ids[projection_id].GetPrimaryIndex()]);
           if (row_ids) {
             output_relation.columns[index]->row_ids = row_ids; 
           }
@@ -842,10 +843,11 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
             auto column_id = column_ids[col];
             SIRIUS_LOG_DEBUG("Reading column index (late materialized) {} and passing it to index in output relation {}", column_id.GetPrimaryIndex(), index);
             SIRIUS_LOG_DEBUG("Writing row IDs to output relation in index {}", index);
-            output_relation.columns[index] = make_shared_ptr<GPUColumn>(table->columns[column_id.GetPrimaryIndex()]->column_length, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.type, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.data,
-                            table->columns[column_id.GetPrimaryIndex()]->data_wrapper.offset, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.num_bytes, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.is_string_data,
-                            table->columns[column_id.GetPrimaryIndex()]->data_wrapper.validity_mask);
-            output_relation.columns[index]->is_unique = table->columns[column_id.GetPrimaryIndex()]->is_unique;
+            // output_relation.columns[index] = make_shared_ptr<GPUColumn>(table->columns[column_id.GetPrimaryIndex()]->column_length, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.type, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.data,
+            //                 table->columns[column_id.GetPrimaryIndex()]->data_wrapper.offset, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.num_bytes, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.is_string_data,
+            //                 table->columns[column_id.GetPrimaryIndex()]->data_wrapper.validity_mask);
+            // output_relation.columns[index]->is_unique = table->columns[column_id.GetPrimaryIndex()]->is_unique;
+            output_relation.columns[index] = make_shared_ptr<GPUColumn>(table->columns[column_id.GetPrimaryIndex()]);
             if (row_ids) {
               output_relation.columns[index]->row_ids = row_ids; 
             }
@@ -861,10 +863,11 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
           auto column_id = column_ids[col];
           SIRIUS_LOG_DEBUG("Reading column index (late materialized) {} and passing it to index in output relation {}", column_id.GetPrimaryIndex(), index);
           SIRIUS_LOG_DEBUG("Writing row IDs to output relation in index {}", index);
-          output_relation.columns[index] = make_shared_ptr<GPUColumn>(table->columns[column_id.GetPrimaryIndex()]->column_length, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.type, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.data,
-                          table->columns[column_id.GetPrimaryIndex()]->data_wrapper.offset, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.num_bytes, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.is_string_data,
-                          table->columns[column_id.GetPrimaryIndex()]->data_wrapper.validity_mask);
-          output_relation.columns[index]->is_unique = table->columns[column_id.GetPrimaryIndex()]->is_unique;
+          // output_relation.columns[index] = make_shared_ptr<GPUColumn>(table->columns[column_id.GetPrimaryIndex()]->column_length, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.type, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.data,
+          //                 table->columns[column_id.GetPrimaryIndex()]->data_wrapper.offset, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.num_bytes, table->columns[column_id.GetPrimaryIndex()]->data_wrapper.is_string_data,
+          //                 table->columns[column_id.GetPrimaryIndex()]->data_wrapper.validity_mask);
+          // output_relation.columns[index]->is_unique = table->columns[column_id.GetPrimaryIndex()]->is_unique;
+          output_relation.columns[index] = make_shared_ptr<GPUColumn>(table->columns[column_id.GetPrimaryIndex()]);
           if (row_ids) {
             output_relation.columns[index]->row_ids = row_ids; 
           }

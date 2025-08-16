@@ -333,13 +333,17 @@ GPUPhysicalHashJoin::GetData(GPUIntermediateRelation &output_relation) const {
 	if (join_type == JoinType::RIGHT_SEMI || join_type == JoinType::RIGHT_ANTI) {
 		SIRIUS_LOG_DEBUG("Right semi or right anti join so there will be no columns from LHS");
 		left_column_count = 0;
-	} else if (join_type == JoinType::RIGHT) {
+	} else if (join_type == JoinType::RIGHT || join_type == JoinType::OUTER) {
 		for (idx_t col = 0; col < left_column_count; col++) {
 			//pretend this to be NUll column from the left table (it should be NULL for the RIGHT join)
 			SIRIUS_LOG_DEBUG("Right join so columns from LHS will be null");
-			output_relation.columns[col] = make_shared_ptr<GPUColumn>(0, GPUColumnType(GPUColumnTypeId::INT64), nullptr);
+			output_relation.columns[col] = make_shared_ptr<GPUColumn>(0, GPUColumnType(GPUColumnTypeId::INT64), nullptr, nullptr);
 		}
 	} else {
+		throw InvalidInputException("Get data not supported for this join type");
+	}
+
+	if (join_type == JoinType::OUTER) {
 		throw InvalidInputException("Get data not supported for this join type");
 	}
 
@@ -460,7 +464,7 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 				cudf_mixed_or_conditional_inner_join(probe_key, build_key, conditions, join_type, row_ids_left, row_ids_right, count);
 			}
 		}
-	} else if (join_type == JoinType::SEMI || join_type == JoinType::ANTI || join_type == JoinType::OUTER || join_type == JoinType::RIGHT) {
+	} else if (join_type == JoinType::SEMI || join_type == JoinType::ANTI || join_type == JoinType::OUTER || join_type == JoinType::RIGHT || join_type == JoinType::LEFT) {
 		HandleProbeExpression(probe_key, count, row_ids_left, row_ids_right, gpu_hash_table, ht_len, conditions, join_type, unique_build_keys, gpuBufferManager);
 		// if (count[0] == 0) throw NotImplementedException("No match found");
 	} else if (join_type == JoinType::MARK) {
@@ -473,7 +477,7 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 	}
 
 	//materialize columns from the left table
-	if (join_type == JoinType::SEMI || join_type == JoinType::ANTI || join_type == JoinType::INNER || join_type == JoinType::OUTER || join_type == JoinType::RIGHT) {
+	if (join_type == JoinType::SEMI || join_type == JoinType::ANTI || join_type == JoinType::INNER || join_type == JoinType::RIGHT || join_type == JoinType::LEFT || join_type == JoinType::OUTER) {
 		SIRIUS_LOG_DEBUG("Writing LHS columns to output relation");
 
 		if (join_type == JoinType::SEMI || join_type == JoinType::ANTI || unique_build_keys) {
@@ -495,9 +499,10 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 		for (idx_t i = 0; i < lhs_output_columns.col_idxs.size(); i++) {
 			auto lhs_col = lhs_output_columns.col_idxs[i];
 			SIRIUS_LOG_DEBUG("Passing column idx {} from LHS to idx {} in output relation", lhs_col, i);
-			output_relation.columns[i] = make_shared_ptr<GPUColumn>(input_relation.columns[lhs_col]->column_length, input_relation.columns[lhs_col]->data_wrapper.type, input_relation.columns[lhs_col]->data_wrapper.data,
-							input_relation.columns[lhs_col]->data_wrapper.offset, input_relation.columns[lhs_col]->data_wrapper.num_bytes, input_relation.columns[lhs_col]->data_wrapper.is_string_data,
-							input_relation.columns[lhs_col]->data_wrapper.validity_mask);
+			// output_relation.columns[i] = make_shared_ptr<GPUColumn>(input_relation.columns[lhs_col]->column_length, input_relation.columns[lhs_col]->data_wrapper.type, input_relation.columns[lhs_col]->data_wrapper.data,
+			// 				input_relation.columns[lhs_col]->data_wrapper.offset, input_relation.columns[lhs_col]->data_wrapper.num_bytes, input_relation.columns[lhs_col]->data_wrapper.is_string_data,
+			// 				input_relation.columns[lhs_col]->data_wrapper.validity_mask);
+			output_relation.columns[i] = make_shared_ptr<GPUColumn>(input_relation.columns[lhs_col]);
 			output_relation.columns[i]->row_ids = input_relation.columns[lhs_col]->row_ids;
 			output_relation.columns[i]->row_id_count = input_relation.columns[lhs_col]->row_id_count;
 			if (unique_build_keys) {
@@ -506,7 +511,9 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 				output_relation.columns[i]->is_unique = false;
 			}
 		}
-		output_relation.columns[lhs_output_columns.col_idxs.size()] = make_shared_ptr<GPUColumn>(probe_key[0]->column_length, GPUColumnType(GPUColumnTypeId::BOOLEAN), output);
+		// output_relation.columns[lhs_output_columns.col_idxs.size()] = make_shared_ptr<GPUColumn>(probe_key[0]->column_length, GPUColumnType(GPUColumnTypeId::BOOLEAN), output);
+		auto validity_mask = createNullMask(probe_key[0]->column_length);
+		output_relation.columns[lhs_output_columns.col_idxs.size()] = make_shared_ptr<GPUColumn>(probe_key[0]->column_length, GPUColumnType(GPUColumnTypeId::BOOLEAN), output, validity_mask);
 		output_relation.columns[lhs_output_columns.col_idxs.size()]->row_ids = probe_key[0]->row_ids;
 		output_relation.columns[lhs_output_columns.col_idxs.size()]->row_id_count = probe_key[0]->row_id_count;
 		// free all the columns in the input relation that are not in the lhs_output_columns
@@ -525,7 +532,7 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 	}
 
 	//materialize columns from the right tables
-	if (join_type == JoinType::INNER || join_type == JoinType::OUTER || join_type == JoinType::LEFT || join_type == JoinType::RIGHT) {
+	if (join_type == JoinType::INNER || join_type == JoinType::RIGHT || join_type == JoinType::LEFT || join_type == JoinType::OUTER) {
 		SIRIUS_LOG_DEBUG("Writing row IDs from RHS to output relation");
 		for (int col = 0; col < hash_table_result->columns.size(); col++) {
 			gpuBufferManager->lockAllocation(reinterpret_cast<uint8_t*>(hash_table_result->columns[col]->data_wrapper.data), 0);
@@ -540,7 +547,7 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 		} else {
 			HandleMaterializeRowIDsRHS(*hash_table_result, output_relation, rhs_output_columns.col_idxs, lhs_output_columns.col_idxs.size(), count[0], row_ids_right, gpuBufferManager, false);
 		}
-		if (join_type == JoinType::INNER || join_type == JoinType::LEFT) {
+		if (join_type == JoinType::INNER) {
 			// free all the columns in the hash table result that are not in the rhs_output_columns
 			// for (idx_t i = 0; i < hash_table_result->columns.size(); i++) {
 			// 	if (find(rhs_output_columns.col_idxs.begin(), rhs_output_columns.col_idxs.end(), i) == rhs_output_columns.col_idxs.end()) {
@@ -553,11 +560,10 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 		}
 	} else if (join_type == JoinType::RIGHT_SEMI || join_type == JoinType::RIGHT_ANTI) {
 		SIRIUS_LOG_DEBUG("Writing row IDs from RHS to output relation");
-		// on the RHS, we need to fetch the data from the hash table
 		for (idx_t i = 0; i < rhs_output_columns.col_idxs.size(); i++) {
 			const auto rhs_col = rhs_output_columns.col_idxs[i];
 			SIRIUS_LOG_DEBUG("Passing column idx {} from RHS (late materialized) to idx {} in output relation", rhs_col, i);
-			output_relation.columns[i] = make_shared_ptr<GPUColumn>(0, hash_table_result->columns[rhs_col]->data_wrapper.type, nullptr);
+			output_relation.columns[i] = make_shared_ptr<GPUColumn>(0, hash_table_result->columns[rhs_col]->data_wrapper.type, nullptr, nullptr);
 		}
 	}
 

@@ -40,6 +40,70 @@ void combineColumns(T* a, T* b, T*& c, uint64_t N_a, uint64_t N_b) {
     cudaDeviceSynchronize();
 }
 
+
+__global__ void copy_mask(uint32_t* b, uint32_t* c, uint64_t offset, uint64_t N) {
+    uint64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t int_idx = (idx + offset) / 32;
+    uint64_t bit_idx = (idx + offset) % 32;
+    uint32_t mask = 0;
+    if (idx < N) {
+        mask = (b[int_idx] >> bit_idx) & 1;
+    }
+
+    uint32_t lane_id = threadIdx.x % 32;
+    uint32_t set = (mask << lane_id);
+    for (int lane = 16; lane >= 1; lane /= 2) {
+        set |= __shfl_down_sync(0xFFFFFFFF, set, lane);
+    }
+    __syncwarp();
+    if (lane_id == 0) {
+        c[idx / 32] = set;
+    }
+}
+
+void combineMasks(cudf::bitmask_type* a, cudf::bitmask_type* b, cudf::bitmask_type*& c, uint64_t N_a, uint64_t N_b) {
+    CHECK_ERROR();
+    if (N_a == 0 || N_b == 0) {
+        SIRIUS_LOG_DEBUG("Input size is 0");
+        return;
+    }
+    SIRIUS_LOG_DEBUG("Launching Combine Columns Kernel");
+    GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+    auto size_a = getMaskBytesSize(N_a) / sizeof(cudf::bitmask_type);
+    auto size_c = getMaskBytesSize(N_a + N_b) / sizeof(cudf::bitmask_type);
+    c = gpuBufferManager->customCudaMalloc<uint32_t>(size_c, 0, 0);
+    cudaMemcpy(c, a, size_a * sizeof(uint32_t), cudaMemcpyDeviceToDevice);
+
+    if (N_a % 32 == 0) {
+      auto offset_after_a = (N_a + 31) / 32;
+      auto offset_remain_after_a = 0;
+      auto N = N_b - offset_remain_after_a;
+      copy_mask<<<(N + BLOCK_THREADS - 1) / BLOCK_THREADS, BLOCK_THREADS>>>(b, c + offset_after_a, offset_remain_after_a, N);
+      CHECK_ERROR();
+    } else {
+      auto offset_after_a = (N_a + 31) / 32;
+      auto offset_remain_after_a = 32 - (N_a % 32);
+      auto N = N_b - offset_remain_after_a;
+      copy_mask<<<(N + BLOCK_THREADS - 1) / BLOCK_THREADS, BLOCK_THREADS>>>(b, c + offset_after_a, offset_remain_after_a, N);
+      CHECK_ERROR();
+
+      uint32_t temp = 0;
+      uint32_t temp2 = 0;
+      cudaMemcpy(&temp, c + offset_after_a - 1, sizeof(uint32_t), cudaMemcpyDeviceToHost);
+      cudaMemcpy(&temp2, b, sizeof(uint32_t), cudaMemcpyDeviceToHost);
+      temp = (temp << offset_remain_after_a) >> offset_remain_after_a;
+      temp2 = temp2 << (N_a % 32);
+      temp = temp | temp2;
+      cudaMemcpy(c + offset_after_a - 1, &temp, sizeof(uint32_t), cudaMemcpyHostToDevice);
+      CHECK_ERROR();
+    }
+
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(a), 0);
+    gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(b), 0);
+    CHECK_ERROR();
+    cudaDeviceSynchronize();
+}
+
 __global__ void add_offset(uint64_t* a, uint64_t* b, uint64_t offset, uint64_t N) {
     uint64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < N) {
@@ -74,18 +138,18 @@ void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColu
     for (idx_t group = 0; group < num_keys; group++) {
       bool old_unique = keys[group]->is_unique;
       if (keys[group]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
-        keys[group] = make_shared_ptr<GPUColumn>(0, keys[group]->data_wrapper.type, keys[group]->data_wrapper.data, keys[group]->data_wrapper.offset, 0, true);
+        keys[group] = make_shared_ptr<GPUColumn>(0, keys[group]->data_wrapper.type, keys[group]->data_wrapper.data, keys[group]->data_wrapper.offset, 0, true, nullptr);
       } else {
-        keys[group] = make_shared_ptr<GPUColumn>(0, keys[group]->data_wrapper.type, keys[group]->data_wrapper.data);
+        keys[group] = make_shared_ptr<GPUColumn>(0, keys[group]->data_wrapper.type, keys[group]->data_wrapper.data, nullptr);
       }
       keys[group]->is_unique = old_unique;
     }
 
     for (int agg_idx = 0; agg_idx < num_aggregates; agg_idx++) {
       if (agg_mode[agg_idx] == AggregationType::COUNT_STAR || agg_mode[agg_idx] == AggregationType::COUNT) {
-        aggregate_keys[agg_idx] = make_shared_ptr<GPUColumn>(0, GPUColumnType(GPUColumnTypeId::INT64), aggregate_keys[agg_idx]->data_wrapper.data);
+        aggregate_keys[agg_idx] = make_shared_ptr<GPUColumn>(0, GPUColumnType(GPUColumnTypeId::INT64), aggregate_keys[agg_idx]->data_wrapper.data, nullptr);
       } else {
-        aggregate_keys[agg_idx] = make_shared_ptr<GPUColumn>(0, aggregate_keys[agg_idx]->data_wrapper.type, aggregate_keys[agg_idx]->data_wrapper.data);
+        aggregate_keys[agg_idx] = make_shared_ptr<GPUColumn>(0, aggregate_keys[agg_idx]->data_wrapper.type, aggregate_keys[agg_idx]->data_wrapper.data, nullptr);
       }
     }
     return;
@@ -133,21 +197,24 @@ void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColu
       requests[agg].aggregations.push_back(std::move(aggregate));
       uint64_t* temp = gpuBufferManager->customCudaMalloc<uint64_t>(size, 0, 0);
       cudaMemset(temp, 0, size * sizeof(uint64_t));
-      shared_ptr<GPUColumn> temp_column = make_shared_ptr<GPUColumn>(size, GPUColumnType(GPUColumnTypeId::INT64), reinterpret_cast<uint8_t*>(temp));
+      auto validity_mask = createNullMask(size);
+      shared_ptr<GPUColumn> temp_column = make_shared_ptr<GPUColumn>(size, GPUColumnType(GPUColumnTypeId::INT64), reinterpret_cast<uint8_t*>(temp), validity_mask);
       requests[agg].values = temp_column->convertToCudfColumn();
     } else if (aggregate_keys[agg]->data_wrapper.data == nullptr && agg_mode[agg] == AggregationType::SUM && aggregate_keys[agg]->column_length == 0) {
       auto aggregate = cudf::make_sum_aggregation<cudf::groupby_aggregation>();
       requests[agg].aggregations.push_back(std::move(aggregate));
       uint64_t* temp = gpuBufferManager->customCudaMalloc<uint64_t>(size, 0, 0);
       cudaMemset(temp, 0, size * sizeof(uint64_t));
-      shared_ptr<GPUColumn> temp_column = make_shared_ptr<GPUColumn>(size, GPUColumnType(GPUColumnTypeId::INT64), reinterpret_cast<uint8_t*>(temp));
+      auto validity_mask = createNullMask(size, cudf::mask_state::ALL_NULL);
+      shared_ptr<GPUColumn> temp_column = make_shared_ptr<GPUColumn>(size, GPUColumnType(GPUColumnTypeId::INT64), reinterpret_cast<uint8_t*>(temp), validity_mask);
       requests[agg].values = temp_column->convertToCudfColumn();
     } else if (aggregate_keys[agg]->data_wrapper.data == nullptr && agg_mode[agg] == AggregationType::COUNT_STAR && aggregate_keys[agg]->column_length != 0) {
-      auto aggregate = cudf::make_count_aggregation<cudf::groupby_aggregation>(cudf::null_policy::EXCLUDE);
+      auto aggregate = cudf::make_count_aggregation<cudf::groupby_aggregation>(cudf::null_policy::INCLUDE);
       requests[agg].aggregations.push_back(std::move(aggregate));
       uint64_t* temp = gpuBufferManager->customCudaMalloc<uint64_t>(size, 0, 0);
       cudaMemset(temp, 0, size * sizeof(uint64_t));
-      shared_ptr<GPUColumn> temp_column = make_shared_ptr<GPUColumn>(size, GPUColumnType(GPUColumnTypeId::INT64), reinterpret_cast<uint8_t*>(temp));
+      auto validity_mask = createNullMask(size);
+      shared_ptr<GPUColumn> temp_column = make_shared_ptr<GPUColumn>(size, GPUColumnType(GPUColumnTypeId::INT64), reinterpret_cast<uint8_t*>(temp), validity_mask);
       requests[agg].values = temp_column->convertToCudfColumn();
     } else if (agg_mode[agg] == AggregationType::SUM) {
       auto aggregate = cudf::make_sum_aggregation<cudf::groupby_aggregation>();
@@ -200,10 +267,17 @@ void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColu
 
   for (int agg = 0; agg < num_aggregates; agg++) {
       auto agg_val = std::move(result.second[agg].results[0]);
+
+      // cudf::bitmask_type* host_mask = gpuBufferManager->customCudaHostAlloc<cudf::bitmask_type>(1);
+      // callCudaMemcpyDeviceToHost<uint8_t>(reinterpret_cast<uint8_t*>(host_mask), 
+      //     reinterpret_cast<uint8_t*>(agg_val->view()->), sizeof(cudf::bitmask_type), 0);
+      // printf("host_mask: %x\n", host_mask);
+      // printf("host_mask: %b\n", host_mask);
       if (agg_mode[agg] == AggregationType::COUNT || agg_mode[agg] == AggregationType::COUNT_STAR || agg_mode[agg] == AggregationType::COUNT_DISTINCT) {
         auto agg_val_view = agg_val->view();
         auto temp_data = convertInt32ToUInt64(const_cast<int32_t*>(agg_val_view.data<int32_t>()), agg_val_view.size());
-        aggregate_keys[agg] = make_shared_ptr<GPUColumn>(agg_val_view.size(), GPUColumnType(GPUColumnTypeId::INT64), reinterpret_cast<uint8_t*>(temp_data));
+        auto validity_mask = createNullMask(agg_val_view.size());
+        aggregate_keys[agg] = make_shared_ptr<GPUColumn>(agg_val_view.size(), GPUColumnType(GPUColumnTypeId::INT64), reinterpret_cast<uint8_t*>(temp_data), validity_mask);
       } else {
         aggregate_keys[agg]->setFromCudfColumn(*agg_val, false, nullptr, 0, gpuBufferManager);
       }

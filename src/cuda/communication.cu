@@ -57,6 +57,9 @@ template void
 callCudaMemcpyDeviceToHost<char>(char* dest, char* src, size_t size, int gpu);
 
 template void
+callCudaMemcpyDeviceToHost<uint32_t>(uint32_t* dest, uint32_t* src, size_t size, int gpu);
+
+template void
 callCudaMemcpyDeviceToHost<string_t>(string_t* dest, string_t* src, size_t size, int gpu);
 
 template void

@@ -58,6 +58,8 @@ void combineStrings(uint8_t* a, uint8_t* b, uint8_t*& c,
         uint64_t* offset_a, uint64_t* offset_b, uint64_t*& offset_c, 
         uint64_t num_bytes_a, uint64_t num_bytes_b, uint64_t N_a, uint64_t N_b);
 
+void combineMasks(cudf::bitmask_type* a, cudf::bitmask_type* b, cudf::bitmask_type*& c, uint64_t N_a, uint64_t N_b);
+
 class ClientContext;
 
 class GPUPhysicalGroupedAggregate : public GPUPhysicalOperator {

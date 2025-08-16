@@ -29,9 +29,9 @@ void cudf_duplicate_elimination(vector<shared_ptr<GPUColumn>>& keys, uint64_t nu
     for (idx_t group = 0; group < num_keys; group++) {
       bool old_unique = keys[group]->is_unique;
       if (keys[group]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
-        keys[group] = make_shared_ptr<GPUColumn>(0, keys[group]->data_wrapper.type, keys[group]->data_wrapper.data, keys[group]->data_wrapper.offset, 0, true);
+        keys[group] = make_shared_ptr<GPUColumn>(0, keys[group]->data_wrapper.type, keys[group]->data_wrapper.data, keys[group]->data_wrapper.offset, 0, true, nullptr);
       } else {
-        keys[group] = make_shared_ptr<GPUColumn>(0, keys[group]->data_wrapper.type, keys[group]->data_wrapper.data);
+        keys[group] = make_shared_ptr<GPUColumn>(0, keys[group]->data_wrapper.type, keys[group]->data_wrapper.data, nullptr);
       }
       keys[group]->is_unique = old_unique;
     }
