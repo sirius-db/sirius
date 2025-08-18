@@ -154,6 +154,12 @@ For example, to set the caching region as 1 GB and the processing region as 2 GB
 ```
 call gpu_buffer_init("1 GB", "2 GB");
 ```
+
+By default, Sirius also allocates pinned memory based on the above two arguments. To explicility specify the amount of pinned memory to allocate during initialization run:
+```
+call gpu_buffer_init("1 GB", "2 GB", pinned_memory_size = "4 GB");
+```
+
 After setting up Sirius, we can execute SQL queries using the `call gpu_processing`:
 ```
 call gpu_processing("select
