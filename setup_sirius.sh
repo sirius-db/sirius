@@ -1,7 +1,8 @@
 #!/bin/bash
 
+echo -e "\nexport SIRIUS_HOME_PATH=\"$(pwd)\"" >> ~/.bashrc
+source ~/.bashrc
 git submodule update --init --recursive
-export SIRIUS_HOME_PATH=`pwd`
 cd duckdb
 mkdir -p extension_external && cd extension_external
 git clone https://github.com/duckdb/substrait.git
