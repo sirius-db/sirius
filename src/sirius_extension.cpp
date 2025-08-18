@@ -48,6 +48,7 @@
 
 namespace duckdb {
 
+const std::string PINNED_MEMORY_PARAM_KEY = "pinned_memory_size";
 bool SiriusExtension::buffer_is_initialized = false;
 
 struct GPUTableFunctionData : public TableFunctionData {
@@ -380,6 +381,7 @@ struct GPUBufferInitFunctionData : public TableFunctionData {
 	bool finished = false;
 	size_t cache_size;
 	size_t processing_size;
+	size_t pinned_memory_size;
 };
 
 unique_ptr<FunctionData> 
@@ -389,6 +391,11 @@ SiriusExtension::GPUBufferInitBind(ClientContext &context, TableFunctionBindInpu
 
 	string gpu_cache_size = input.inputs[0].ToString();
 	string gpu_processing_size = input.inputs[1].ToString();
+	string pinned_memory_size("0 GB"); // Default size of pinned memory
+	if(input.named_parameters.find(PINNED_MEMORY_PARAM_KEY) != input.named_parameters.end()) { 
+		// If the pinned memory size is specified in the arguments then use that
+		pinned_memory_size = input.named_parameters[PINNED_MEMORY_PARAM_KEY].ToString();
+	}
 
 	//parsing 2GB or 2GiB to size_t
 	// Function to parse size strings like "2GB" or "2GiB" to size_t
@@ -443,6 +450,7 @@ SiriusExtension::GPUBufferInitBind(ClientContext &context, TableFunctionBindInpu
 	// Parse the input sizes
 	result->cache_size = parse_size(gpu_cache_size);
 	result->processing_size = parse_size(gpu_processing_size);
+	result->pinned_memory_size = parse_size(pinned_memory_size);
 
 	auto type = LogicalType(LogicalTypeId::BOOLEAN);
 	return_types.emplace_back(type);
@@ -459,10 +467,16 @@ SiriusExtension::GPUBufferInitFunction(ClientContext &context, TableFunctionInpu
 
 	size_t cache_size = data.cache_size;
 	size_t processing_size = data.processing_size;
+	size_t pinned_memory_size = data.pinned_memory_size;
+	if(pinned_memory_size == 0) {
+		pinned_memory_size = std::max(cache_size, processing_size);
+	}
+
 	if (!buffer_is_initialized) {
-		SIRIUS_LOG_DEBUG("GPU Buffer Manager initialized\n");
+		SIRIUS_LOG_DEBUG("GPU Buffer Manager initialized with args: Cache Size - {}, Processing Size - {}, Pinned Mem Size - {}\n", 
+			cache_size, processing_size, pinned_memory_size);
 		GPUBufferManager *gpuBufferManager = &(GPUBufferManager::GetInstance(
-			cache_size, processing_size, std::max(cache_size, processing_size)));
+			cache_size, processing_size, pinned_memory_size));
 		buffer_is_initialized = true;
 	} else {
 		SIRIUS_LOG_WARN("GPUBufferManager already initialized");
@@ -474,6 +488,7 @@ void SiriusExtension::InitializeGPUExtension(Connection &con) {
 	auto &catalog = Catalog::GetSystemCatalog(*con.context);
 
 	TableFunction gpu_buffer_init("gpu_buffer_init", {LogicalType::VARCHAR, LogicalType::VARCHAR}, GPUBufferInitFunction, GPUBufferInitBind);
+	gpu_buffer_init.named_parameters[PINNED_MEMORY_PARAM_KEY] = LogicalType::VARCHAR;
 	CreateTableFunctionInfo gpu_buffer_init_info(gpu_buffer_init);
 	catalog.CreateTableFunction(*con.context, gpu_buffer_init_info);
 
