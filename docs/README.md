@@ -274,8 +274,7 @@ make test
 
 To run a specific test run the command from the root directory:
 ```
-build/release/test/unittest --test-dir . test/sql/tpch_queries.test
-
+build/release/test/unittest --test-dir . test/sql/clickbench_queries.test
 ```
 
 ## Performance Testing
