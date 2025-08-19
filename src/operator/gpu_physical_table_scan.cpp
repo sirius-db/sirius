@@ -537,7 +537,6 @@ public:
 		}
     num_rows = 0;
     column_size.resize(op.column_ids.size(), 0);
-    mask_size.resize(op.column_ids.size(), 0);
 	}
 
 	unique_ptr<LocalTableFunctionState> local_state;
@@ -545,7 +544,6 @@ public:
   // Used in `TableScanGetSizeTask`
   uint64_t num_rows;
   vector<uint64_t> column_size;
-  vector<uint64_t> mask_size;
 };
 
 unique_ptr<LocalSourceState> GPUPhysicalTableScan::GetLocalSourceState(ExecutionContext &context,
@@ -592,7 +590,6 @@ public:
         } else {
           l_state_scan.column_size[col] += GetChunkDataByteSize(op.scanned_types[col], chunk->size());
         }
-        l_state_scan.mask_size[col] += TemplatedValidityMask<validity_t>::ValidityMaskSize(chunk->size());
       }
       // Clear the chunk
       chunk->Reset();
@@ -825,13 +822,11 @@ GPUPhysicalTableScan::GetDataDuckDBOpt(ExecutionContext &exec_context) {
       num_rows += l_state_scan.num_rows;
       for (int col = 0; col < column_ids.size() - gen_row_id_column; col++) {
         column_size[col] += l_state_scan.column_size[col];
-        mask_size[col] += l_state_scan.mask_size[col];
       }
     }
+    std::fill(mask_size, mask_size + (column_ids.size() - gen_row_id_column), getMaskBytesSize(num_rows));
     uint64_t total_size = 0;
     for (int col = 0; col < column_ids.size() - gen_row_id_column; col++) {
-      // Round up to nearest 64 byte to adjust with libcudf validity mask
-      mask_size[col] = 64 * ((mask_size[col] + 63) / 64);
       if (!already_cached[col]) {
         total_size += column_size[col];
         total_size += mask_size[col];
