@@ -727,7 +727,7 @@ public:
               memcpy(data_ptr[col] + write_offset, vec.GetData() + read_offset, chunk_column_sizes_unaligned[col]);
             }
           }
-          // For aligned null mask bytes, unaligned null mask bytes are handled in `NextChunkOffsetsUnaligned()`
+          // Write aligned null mask bytes. Unaligned null mask bytes are handled in `NextChunkOffsetsUnaligned()`.
           if (num_rows_aligned > 0) {
             if (validity.GetData() == nullptr) {
               memset(mask_ptr[col] + row_offset_aligned / 8, 0xff, num_rows_aligned / 8);
@@ -883,7 +883,9 @@ void GPUPhysicalTableScan::ScanDataDuckDBOpt(
     uint8_t** data_ptr = gpuBufferManager->customCudaHostAlloc<uint8_t*>(scanned_types.size());
     uint8_t** mask_ptr = gpuBufferManager->customCudaHostAlloc<uint8_t*>(scanned_types.size());
     uint64_t** offset_ptr = gpuBufferManager->customCudaHostAlloc<uint64_t*>(scanned_types.size());
-
+    std::fill(data_ptr, data_ptr + scanned_types.size(), nullptr);
+    std::fill(mask_ptr, mask_ptr + scanned_types.size(), nullptr);
+    std::fill(offset_ptr, offset_ptr + scanned_types.size(), nullptr);
     for (int col = 0; col < column_ids.size() - gen_row_id_column; col++) {
       if (!already_cached[col]) {
         data_ptr[col] = gpuBufferManager->customCudaHostAlloc<uint8_t>(column_size[col]);
@@ -947,6 +949,9 @@ void GPUPhysicalTableScan::ScanDataDuckDBOpt(
     uint8_t** d_data_ptr = gpuBufferManager->customCudaHostAlloc<uint8_t*>(scanned_types.size());
     uint8_t** d_mask_ptr = gpuBufferManager->customCudaHostAlloc<uint8_t*>(scanned_types.size());
     uint64_t** d_offset_ptr = gpuBufferManager->customCudaHostAlloc<uint64_t*>(scanned_types.size());
+    std::fill(d_data_ptr, d_data_ptr + scanned_types.size(), nullptr);
+    std::fill(d_mask_ptr, d_mask_ptr + scanned_types.size(), nullptr);
+    std::fill(d_offset_ptr, d_offset_ptr + scanned_types.size(), nullptr);
     for (int col = 0; col < scanned_types.size(); col++) {
       if (!already_cached[col]) {
         d_data_ptr[col] = gpuBufferManager->customCudaMalloc<uint8_t>(column_size[col], 0, 1);
