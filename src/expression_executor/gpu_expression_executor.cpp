@@ -251,6 +251,12 @@ void GpuExpressionExecutor::Select(GPUIntermediateRelation& input_relation,
   // Execute the boolean expression
   auto bitmap = ExecuteExpression(0);
 
+  // Need to covert `null` values in bitmap to `false`, to be consistent with SQL `where` clause
+  if (bitmap->null_count() > 0) {
+    cudf::numeric_scalar<bool> false_scalar(false);
+    bitmap = cudf::replace_nulls(bitmap->view(), false_scalar);
+  }
+
   // Generate the selection vector
   auto [row_ids, count] = GpuDispatcher::DispatchSelect(bitmap->view(), resource_ref);
 

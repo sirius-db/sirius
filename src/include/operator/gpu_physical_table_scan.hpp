@@ -111,6 +111,14 @@ public:
 
 	//! Whether it's required to generate a seperate row id column (e.g., in some select *)
 	bool gen_row_id_column;
+
+	//! Only used in optimized table scan
+	uint64_t num_rows;
+	vector<idx_t> uncached_scan_column_ids;
+	vector<cudaStream_t> cuda_streams;
+	vector<ColumnIndex> orig_column_ids;
+	vector<idx_t> orig_scanned_ids;
+	vector<LogicalType> orig_scanned_types;
 public:
 	// string GetName() const override;
 	// string ParamsToString() const override;
@@ -120,9 +128,13 @@ public:
 public:
 	SourceResultType GetData(GPUIntermediateRelation& output_relation) const override;
 
-	void ScanDataDuckDB(GPUBufferManager* gpuBufferManager, string up_table_name) const;
+	SourceResultType GetDataDuckDBOpt(ExecutionContext &exec_context);
+	void ScanDataDuckDBOpt(ExecutionContext &exec_context,
+												 GPUBufferManager* gpuBufferManager,
+												 string up_table_name);
 
 	SourceResultType GetDataDuckDB(ExecutionContext &exec_context);
+	void ScanDataDuckDB(GPUBufferManager* gpuBufferManager, string up_table_name) const;
 
 	bool IsSource() const override {
 		return true;

@@ -16,11 +16,24 @@
 
 #pragma once
 
+#include <cstdint>
+
 namespace duckdb {
 
 struct Config {
+  // For gpu buffer manager
+  static constexpr bool USE_PIN_MEM_FOR_CPU_PROCESSING = true;
+
+  // For expression executor
   static constexpr bool USE_CUDF_EXPR = true;
+  
+  // For gpu physical top-N
   static constexpr bool USE_CUSTOM_TOP_N = true;
+
+  // For gpu physical table scan
+  static constexpr bool USE_OPT_TABLE_SCAN = true;
+  static constexpr int OPT_TABLE_SCAN_NUM_CUDA_STREAMS = 8;
+  static constexpr uint64_t OPT_TABLE_SCAN_CUDA_MEMCPY_SIZE = 64UL * 1024 * 1024;  // 64 MB
 };
 
 }

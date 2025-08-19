@@ -15,6 +15,7 @@
  */
 
 #include <iostream>
+#include <cub/cub.cuh>
 #include <cuda_runtime.h>
 #include <cuda.h>
 #include <inttypes.h>
@@ -116,6 +117,13 @@ __global__ void subtract_to_each(T* data, T delta, size_t count) {
   }
 }
 
+__global__ void reorder_row_ids(int64_t* in_row_ids, uint64_t* out_indices, size_t count) {
+  size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < count) {
+    out_indices[in_row_ids[idx]] = idx;
+  }
+}
+
 void warmup_gpu() {
   // Perform the warmup
   cudaFree(0);
@@ -185,7 +193,33 @@ void subtractToEach(T* data, T delta, size_t count) {
   cudaDeviceSynchronize();
 }
 
+template <typename T>
+void callCubPrefixSum(T* in, T* out, size_t count, bool inclusive,
+                      cudaStream_t stream, CubPrefixSumAllocFunc allocator) {
+  void *d_temp_storage = nullptr;
+  size_t temp_storage_bytes = 0;
+  inclusive
+    ? cub::DeviceScan::InclusiveSum(d_temp_storage, temp_storage_bytes, in, out, count, stream)
+    : cub::DeviceScan::ExclusiveSum(d_temp_storage, temp_storage_bytes, in, out, count, stream);
+  d_temp_storage = allocator(temp_storage_bytes);
+  inclusive
+    ? cub::DeviceScan::InclusiveSum(d_temp_storage, temp_storage_bytes, in, out, count, stream)
+    : cub::DeviceScan::ExclusiveSum(d_temp_storage, temp_storage_bytes, in, out, count, stream);
+}
+
+void reorderRowIds(int64_t* in_row_ids, uint64_t* out_indices, size_t count) {
+  size_t threads_per_block = 256;
+  size_t blocks = (count + threads_per_block - 1) / threads_per_block;
+
+  reorder_row_ids<<<blocks, threads_per_block>>>(in_row_ids, out_indices, count);
+  cudaDeviceSynchronize();
+}
+
 template
 void subtractToEach<uint64_t>(uint64_t* data, uint64_t delta, size_t count);
+
+template
+void callCubPrefixSum<uint64_t>(uint64_t* in, uint64_t* out, size_t count, bool inclusive,
+                                cudaStream_t stream, CubPrefixSumAllocFunc allocator);
 
 } // namespace duckdb

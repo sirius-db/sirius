@@ -141,8 +141,16 @@ uint8_t* allocatePinnedCPUMemory(size_t size) {
     return ptr;
 }
 
+uint8_t* allocatePageableCPUMemory(size_t size) {
+    return (uint8_t*)malloc(size * sizeof(uint8_t));
+}
+
 void freePinnedCPUMemory(uint8_t* ptr) {
     cudaFreeHost(ptr);
+}
+
+void freePageableCPUMemory(uint8_t* ptr) {
+    free(ptr);
 }
 
 template <typename T>

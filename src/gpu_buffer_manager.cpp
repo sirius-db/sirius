@@ -15,6 +15,7 @@
  */
 
 #include "gpu_buffer_manager.hpp"
+#include "config.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/parser/constraints/unique_constraint.hpp"
@@ -100,6 +101,9 @@ GPUBufferManager::customCudaMalloc<double*>(size_t size, int gpu, bool caching);
 template int*
 GPUBufferManager::customCudaHostAlloc<int>(size_t size);
 
+template int64_t*
+GPUBufferManager::customCudaHostAlloc<int64_t>(size_t size);
+
 template uint64_t*
 GPUBufferManager::customCudaHostAlloc<uint64_t>(size_t size);
 
@@ -172,7 +176,8 @@ GPUBufferManager::GPUBufferManager(size_t cache_size_per_gpu, size_t processing_
     gpuCache = new uint8_t*[NUM_GPUS];
     cpuCache = new uint8_t*[NUM_GPUS];
     gpuProcessing = new uint8_t*[NUM_GPUS];
-    cpuProcessing = allocatePinnedCPUMemory(processing_size_per_cpu);
+    cpuProcessing = Config::USE_PIN_MEM_FOR_CPU_PROCESSING
+        ? allocatePinnedCPUMemory(processing_size_per_cpu) : allocatePageableCPUMemory(processing_size_per_cpu);
     gpuProcessingPointer = new size_t[NUM_GPUS];
     gpuCachingPointer = new size_t[NUM_GPUS];
     cpuCachingPointer = new size_t[NUM_GPUS];
@@ -222,7 +227,8 @@ GPUBufferManager::~GPUBufferManager() {
         // callCudaFree<uint8_t>(gpuProcessing[gpu], gpu);
         mr->deallocate((void*) gpuProcessing[gpu], processing_size_per_gpu);
     }
-    freePinnedCPUMemory(cpuProcessing);
+    Config::USE_PIN_MEM_FOR_CPU_PROCESSING
+        ? freePinnedCPUMemory(cpuProcessing) : freePageableCPUMemory(cpuProcessing);
     delete[] gpuCache;
     delete[] cpuCache;
     delete[] gpuProcessing;
