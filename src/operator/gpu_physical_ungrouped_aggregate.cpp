@@ -268,7 +268,7 @@ GPUPhysicalUngroupedAggregate::Sink(GPUIntermediateRelation &input_relation) con
 		//here we probably have count(*) or sum(*) or something like that
 		if (aggregate.children.size() == 0) {
 			SIRIUS_LOG_DEBUG("Passing * aggregate to index {} in aggregation result", aggr_idx);
-			aggregate_column[aggr_idx] = make_shared_ptr<GPUColumn>(column_size, GPUColumnType(GPUColumnTypeId::INT64), nullptr);
+			aggregate_column[aggr_idx] = make_shared_ptr<GPUColumn>(column_size, GPUColumnType(GPUColumnTypeId::INT64), nullptr, nullptr);
 		}
 	}
 
@@ -310,7 +310,8 @@ GPUPhysicalUngroupedAggregate::GetData(GPUIntermediateRelation &output_relation)
 	auto start = std::chrono::high_resolution_clock::now();
 	for (int col = 0; col < aggregation_result->columns.size(); col++) {
 		SIRIUS_LOG_DEBUG("Writing aggregation result to column {}", col);
-		output_relation.columns[col] = make_shared_ptr<GPUColumn>(aggregation_result->columns[col]->column_length, aggregation_result->columns[col]->data_wrapper.type, aggregation_result->columns[col]->data_wrapper.data);
+		// output_relation.columns[col] = make_shared_ptr<GPUColumn>(aggregation_result->columns[col]->column_length, aggregation_result->columns[col]->data_wrapper.type, aggregation_result->columns[col]->data_wrapper.data);
+		output_relation.columns[col] = make_shared_ptr<GPUColumn>(aggregation_result->columns[col]);
 	}
 
     auto end = std::chrono::high_resolution_clock::now();

@@ -283,7 +283,9 @@ void CustomStringTopN(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPU
     // Set the new column
     GPUColumnType project_col_type =  project_col_data.type;
     bool is_str_col = project_col_data.type.id() == GPUColumnTypeId::VARCHAR;
-    projection[0] = make_shared_ptr<GPUColumn>(num_results, project_col_type, d_result_chars, d_new_offsets, num_total_bytes, is_str_col);
+    //TODO: FOR DEVESH, WE NEED TO MAKE SURE THAT THE VALIDITY MASK IS ADDED HERE, RIGHT NOW WE ASSUME IT'S ALL VALID
+    auto validity_mask = createNullMask(num_results, cudf::mask_state::ALL_VALID);
+    projection[0] = make_shared_ptr<GPUColumn>(num_results, project_col_type, d_result_chars, d_new_offsets, num_total_bytes, is_str_col, validity_mask);
 
     RECORD_TIMER("STRING TOP N Result Write Time");
 }
@@ -314,9 +316,9 @@ void cudf_orderby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColu
         for (idx_t col = 0; col < num_projections; col++) {
             bool old_unique = projection[col]->is_unique;
             if (projection[col]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
-                projection[col] = make_shared_ptr<GPUColumn>(0, projection[col]->data_wrapper.type, projection[col]->data_wrapper.data, projection[col]->data_wrapper.offset, 0, true);
+                projection[col] = make_shared_ptr<GPUColumn>(0, projection[col]->data_wrapper.type, projection[col]->data_wrapper.data, projection[col]->data_wrapper.offset, 0, true, nullptr);
             } else {
-                projection[col] = make_shared_ptr<GPUColumn>(0, projection[col]->data_wrapper.type, projection[col]->data_wrapper.data);
+                projection[col] = make_shared_ptr<GPUColumn>(0, projection[col]->data_wrapper.type, projection[col]->data_wrapper.data, nullptr);
             }
             projection[col]->is_unique = old_unique;
         }

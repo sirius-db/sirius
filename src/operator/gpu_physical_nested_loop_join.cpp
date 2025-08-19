@@ -168,9 +168,10 @@ GPUPhysicalNestedLoopJoin::Sink(GPUIntermediateRelation &input_relation) const {
 
     for (int i = 0; i < input_relation.columns.size(); i++) {
         SIRIUS_LOG_DEBUG("Passing column idx {} from right side to idx {} in right temp relation", i, i);
-		right_temp_data->columns[i] = make_shared_ptr<GPUColumn>(input_relation.columns[i]->column_length, input_relation.columns[i]->data_wrapper.type, input_relation.columns[i]->data_wrapper.data);
-		right_temp_data->columns[i]->row_ids = input_relation.columns[i]->row_ids;
-		right_temp_data->columns[i]->row_id_count = input_relation.columns[i]->row_id_count;
+		// right_temp_data->columns[i] = make_shared_ptr<GPUColumn>(input_relation.columns[i]->column_length, input_relation.columns[i]->data_wrapper.type, input_relation.columns[i]->data_wrapper.data);
+		// right_temp_data->columns[i]->row_ids = input_relation.columns[i]->row_ids;
+		// right_temp_data->columns[i]->row_id_count = input_relation.columns[i]->row_id_count;
+		right_temp_data->columns[i] = make_shared_ptr<GPUColumn>(input_relation.columns[i]);
     }
 
 	//measure time
@@ -355,7 +356,7 @@ GPUPhysicalNestedLoopJoin::GetData(GPUIntermediateRelation& output_relation) con
 	if (join_type == JoinType::RIGHT || join_type == JoinType::OUTER) {
 		for (idx_t col = 0; col < left_column_count; col++) {
 			//pretend this to be NUll column from the left table (it should be NULL for the RIGHT join)
-			output_relation.columns[col] = make_shared_ptr<GPUColumn>(0, GPUColumnType(GPUColumnTypeId::INT64), nullptr);
+			output_relation.columns[col] = make_shared_ptr<GPUColumn>(0, GPUColumnType(GPUColumnTypeId::INT64), nullptr, nullptr);
 		}
 	} else {
 		throw InvalidInputException("Get data not supported for this join type");

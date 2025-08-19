@@ -93,17 +93,20 @@ nvidia-smi
 ```
 
 ### Install libcudf dependencies
+
+This approach requires cloning the repo following the instructions specifed in [Building Sirius](#building-sirius). 
+
 libcudf will be installed via conda/miniconda. Miniconda can be downloaded [here](https://www.anaconda.com/docs/getting-started/miniconda/install). After downloading miniconda, install libcudf by running these commands:
 ```
 conda create --name libcudf-env
 conda activate libcudf-env
-conda install -c rapidsai -c conda-forge -c nvidia rapidsai::libcudf
+conda install -c rapidsai -c conda-forge -c nvidia rapidsai::libcudf=25.08
 ```
 Set the environment variables `LIBCUDF_ENV_PREFIX` to the conda environment's path. For example, if we installed miniconda in `~/miniconda3` and installed libcudf in the conda environment `libcudf-env`, then we would set the `LIBCUDF_ENV_PREFIX` to `~/miniconda3/envs/libcudf-env`.
 ```
 export LIBCUDF_ENV_PREFIX={PATH to libcudf-env}
 ```
-It is recommended to add the environment variables to your `bashrc` to avoid repetition.
+It is recommended to add the environment variables to your `bashrc` to avoid repetition. 
 
 ## Building Sirius
 To clone the Sirius repository:
@@ -152,6 +155,12 @@ For example, to set the caching region as 1 GB and the processing region as 2 GB
 ```
 call gpu_buffer_init("1 GB", "2 GB");
 ```
+
+By default, Sirius also allocates pinned memory based on the above two arguments. To explicility specify the amount of pinned memory to allocate during initialization run:
+```
+call gpu_buffer_init("1 GB", "2 GB", pinned_memory_size = "4 GB");
+```
+
 After setting up Sirius, we can execute SQL queries using the `call gpu_processing`:
 ```
 call gpu_processing("select

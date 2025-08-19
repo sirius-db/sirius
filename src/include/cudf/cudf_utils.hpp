@@ -17,7 +17,11 @@
 #pragma once
 
 #include <cudf/table/table.hpp>
-#include <cudf/join.hpp>
+#include <cudf/join/join.hpp>
+#include <cudf/join/hash_join.hpp>
+#include <cudf/join/mixed_join.hpp>
+#include <cudf/join/conditional_join.hpp>
+#include <cudf/join/distinct_hash_join.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/column/column_view.hpp>
 #include <cudf/scalar/scalar.hpp>

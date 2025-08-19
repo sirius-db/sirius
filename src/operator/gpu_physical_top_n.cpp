@@ -170,7 +170,7 @@ SourceResultType GPUPhysicalTopN::GetData(GPUIntermediateRelation& output_relati
 		if (offset >= sort_result->columns[col]->column_length) {
 			output_relation.columns[col] = make_shared_ptr<GPUColumn>(
 				0, sort_result->columns[col]->data_wrapper.type, nullptr, nullptr,
-				0, sort_result->columns[col]->data_wrapper.is_string_data);
+				0, sort_result->columns[col]->data_wrapper.is_string_data, nullptr);
 		} else {
 			auto limit_const = min(limit, sort_result->columns[col]->column_length - offset);
 			uint8_t* output_col_data = sort_result->columns[col]->data_wrapper.data;

@@ -27,7 +27,7 @@ ResolveTypeMaterializeExpression(shared_ptr<GPUColumn> column, GPUBufferManager*
     cudf::bitmask_type* out_mask = nullptr;
     if (column->data_wrapper.data == nullptr || column->column_length == 0 ||
         (column->row_ids != nullptr && column->row_id_count == 0)) {
-        return make_shared_ptr<GPUColumn>(0, column->data_wrapper.type, nullptr);
+        return make_shared_ptr<GPUColumn>(0, column->data_wrapper.type, nullptr, nullptr);
     }
     if (column->row_ids != nullptr) {
         T* temp = reinterpret_cast<T*> (column->data_wrapper.data);
@@ -53,7 +53,7 @@ ResolveTypeMaterializeString(shared_ptr<GPUColumn> column, GPUBufferManager* gpu
     cudf::bitmask_type* out_mask = nullptr;
     if (column->data_wrapper.data == nullptr || column->column_length == 0 ||
         (column->row_ids != nullptr && column->row_id_count == 0)) {
-        return make_shared_ptr<GPUColumn>(0, column->data_wrapper.type, nullptr, nullptr, 0, column->data_wrapper.is_string_data);
+        return make_shared_ptr<GPUColumn>(0, column->data_wrapper.type, nullptr, nullptr, 0, column->data_wrapper.is_string_data, nullptr);
     }
     if (column->row_ids != nullptr) {
 		// Late materalize the input relationship
@@ -124,7 +124,7 @@ HandleMaterializeRowIDs(GPUIntermediateRelation& input_relation, GPUIntermediate
         SIRIUS_LOG_DEBUG("Materializing column idx {} in input relation to idx {} in output relation", i, i);
         if (count == 0) {
             output_relation.columns[i] = make_shared_ptr<GPUColumn>(0, input_relation.columns[i]->data_wrapper.type, nullptr,
-                        nullptr, 0, input_relation.columns[i]->data_wrapper.is_string_data);
+                        nullptr, 0, input_relation.columns[i]->data_wrapper.is_string_data, nullptr);
             output_relation.columns[i]->row_id_count = 0;
             if (maintain_unique) {
                 output_relation.columns[i]->is_unique = input_relation.columns[i]->is_unique;
@@ -172,7 +172,7 @@ HandleMaterializeRowIDsRHS(GPUIntermediateRelation& hash_table_result, GPUInterm
         const auto rhs_col = rhs_output_columns[i];
         if (count == 0) {
             output_relation.columns[offset + i] = make_shared_ptr<GPUColumn>(0, hash_table_result.columns[rhs_col]->data_wrapper.type, nullptr,
-                        nullptr, 0, hash_table_result.columns[rhs_col]->data_wrapper.is_string_data);
+                        nullptr, 0, hash_table_result.columns[rhs_col]->data_wrapper.is_string_data, nullptr);
             output_relation.columns[offset + i]->row_id_count = 0;
             if (maintain_unique) {
                 output_relation.columns[offset + i]->is_unique = hash_table_result.columns[rhs_col]->is_unique;
@@ -221,7 +221,7 @@ HandleMaterializeRowIDsLHS(GPUIntermediateRelation& input_relation, GPUIntermedi
         SIRIUS_LOG_DEBUG("Materializing column idx {} from input relation to idx {} in output relation", lhs_col, i);
         if (count == 0) {
             output_relation.columns[i] = make_shared_ptr<GPUColumn>(0, input_relation.columns[lhs_col]->data_wrapper.type, nullptr,
-                nullptr, 0, input_relation.columns[lhs_col]->data_wrapper.is_string_data);
+                nullptr, 0, input_relation.columns[lhs_col]->data_wrapper.is_string_data, nullptr);
             output_relation.columns[i]->row_id_count = 0;
             if (maintain_unique) {
                 output_relation.columns[i]->is_unique = input_relation.columns[lhs_col]->is_unique;

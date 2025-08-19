@@ -93,8 +93,9 @@ SinkResultType GPUPhysicalCTE::Sink(GPUIntermediateRelation &input_relation) con
 	SIRIUS_LOG_DEBUG("Sinking data into CTE");
 	GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 	for (int col_idx = 0; col_idx < input_relation.columns.size(); col_idx++) {
-		working_table_gpu->columns[col_idx] = make_shared_ptr<GPUColumn>(input_relation.columns[col_idx]->column_length, input_relation.columns[col_idx]->data_wrapper.type, input_relation.columns[col_idx]->data_wrapper.data);
-		working_table_gpu->columns[col_idx]->is_unique = input_relation.columns[col_idx]->is_unique;
+		// working_table_gpu->columns[col_idx] = make_shared_ptr<GPUColumn>(input_relation.columns[col_idx]->column_length, input_relation.columns[col_idx]->data_wrapper.type, input_relation.columns[col_idx]->data_wrapper.data);
+		// working_table_gpu->columns[col_idx]->is_unique = input_relation.columns[col_idx]->is_unique;
+		working_table_gpu->columns[col_idx] = make_shared_ptr<GPUColumn>(input_relation.columns[col_idx]);
 		gpuBufferManager->lockAllocation(working_table_gpu->columns[col_idx]->data_wrapper.data, 0);
 		gpuBufferManager->lockAllocation(working_table_gpu->columns[col_idx]->row_ids, 0);
 		// If the column type is VARCHAR, also lock the offset allocation
