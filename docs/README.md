@@ -98,8 +98,9 @@ This approach requires cloning the repo following the instructions specifed in [
 
 libcudf will be installed via conda/miniconda. Miniconda can be downloaded [here](https://www.anaconda.com/docs/getting-started/miniconda/install). After downloading miniconda, install libcudf by running these commands:
 ```
-conda env create -f environment.yml
+conda create --name libcudf-env
 conda activate libcudf-env
+conda install -c rapidsai -c conda-forge -c nvidia rapidsai::libcudf=25.08
 ```
 Set the environment variables `LIBCUDF_ENV_PREFIX` to the conda environment's path. For example, if we installed miniconda in `~/miniconda3` and installed libcudf in the conda environment `libcudf-env`, then we would set the `LIBCUDF_ENV_PREFIX` to `~/miniconda3/envs/libcudf-env`.
 ```
