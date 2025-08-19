@@ -34,7 +34,9 @@ template <typename T> void callCudaMemcpyDeviceToHost(T* dest, T* src, size_t si
 template <typename T> void printGPUColumn(T* a, size_t N, int gpu);
 void cudaMemmove(uint8_t* destination, uint8_t* source, size_t num);
 uint8_t* allocatePinnedCPUMemory(size_t size);
+uint8_t* allocatePageableCPUMemory(size_t size);
 void freePinnedCPUMemory(uint8_t* ptr);
+void freePageableCPUMemory(uint8_t* ptr);
 size_t getFreeGPUMemorySize(int gpu);
 void warmup_gpu();
 

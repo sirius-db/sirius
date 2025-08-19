@@ -21,6 +21,9 @@
 namespace duckdb {
 
 struct Config {
+  // For gpu buffer manager
+  static constexpr bool USE_PIN_MEM_FOR_CPU_PROCESSING = true;
+
   // For expression executor
   static constexpr bool USE_CUDF_EXPR = true;
   

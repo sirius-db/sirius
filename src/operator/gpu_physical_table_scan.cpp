@@ -423,8 +423,6 @@ public:
 		if (op.function.in_out_function) {
       throw NotImplementedException("In-out function not supported");
 		}
-    row_offset = 0;
-    column_data_offsets.resize(op.column_ids.size(), 0);
 	}
 
 	idx_t max_threads = 0;
@@ -440,21 +438,92 @@ public:
 		return max_threads;
 	}
 
-  // Used in `TableScanCoalesceTask`
-  void NextChunkOffsets(uint64_t chunk_rows, const vector<uint64_t>& chunk_column_sizes,
-                        uint64_t* out_row_offset, vector<uint64_t>& out_column_data_offsets) {
-    std::unique_lock lock(offset_mutex);
-    *out_row_offset = row_offset;
-    out_column_data_offsets = column_data_offsets;
-    row_offset += chunk_rows;
-    for (size_t i = 0; i < chunk_column_sizes.size(); ++i) {
-      column_data_offsets[i] += chunk_column_sizes[i];
+  // The followings are used in `TableScanCoalesceTask`
+  void InitForTableScanCoalesceTask(const GPUPhysicalTableScan& op, uint8_t** mask_ptr_p) {
+    offset_info_aligned.row_offset = 0;
+    offset_info_aligned.column_data_offsets.resize(op.column_ids.size(), 0);
+    offset_info_unaligned.row_offset = op.num_rows;
+    offset_info_unaligned.column_data_offsets.assign(op.column_size, op.column_size + op.column_ids.size());
+    mask_ptr = mask_ptr_p;
+    unaligned_mask_byte_pos = op.num_rows / 8;
+    unaligned_mask_in_byte_pos = op.num_rows % 8;
+    if (unaligned_mask_in_byte_pos == 0) {
+      --unaligned_mask_byte_pos;
+      unaligned_mask_in_byte_pos += 8;
     }
   }
 
-  std::mutex offset_mutex;
-  uint64_t row_offset;
-  vector<uint64_t> column_data_offsets;
+  void NextChunkOffsetsAligned(uint64_t chunk_rows, const vector<uint64_t>& chunk_column_sizes,
+                               uint64_t* out_row_offset, vector<uint64_t>& out_column_data_offsets) {
+    auto& offset_info = offset_info_aligned;
+    std::unique_lock lock(offset_info.mutex);
+    *out_row_offset = offset_info.row_offset;
+    out_column_data_offsets = offset_info.column_data_offsets;
+    offset_info.row_offset += chunk_rows;
+    for (size_t i = 0; i < chunk_column_sizes.size(); ++i) {
+      offset_info.column_data_offsets[i] += chunk_column_sizes[i];
+    }
+  }
+
+  inline void AssignBits(uint8_t from, int from_pos, uint8_t* to, int to_pos, int n) {
+    uint8_t mask = (1u << n) - 1;
+    uint8_t bits = (from >> from_pos) & mask;
+    *to &= ~(mask << to_pos);
+    *to |= (bits << to_pos);
+  }
+
+  void NextChunkOffsetsUnaligned(uint64_t chunk_rows, const vector<uint64_t>& chunk_column_sizes,
+                                 uint64_t* out_row_offset, vector<uint64_t>& out_column_data_offsets,
+                                 const vector<uint8_t>& chunk_unaligned_mask_bytes) {
+    auto& offset_info = offset_info_unaligned;
+    std::unique_lock lock(offset_info.mutex);
+    offset_info.row_offset -= chunk_rows;
+    for (size_t i = 0; i < chunk_column_sizes.size(); ++i) {
+      offset_info.column_data_offsets[i] -= chunk_column_sizes[i];
+    }
+    *out_row_offset = offset_info.row_offset;
+    out_column_data_offsets = offset_info.column_data_offsets;
+
+    // Need to compact the unaligned mask byte per column
+    if (unaligned_mask_in_byte_pos >= chunk_rows) {
+      for (size_t i = 0; i < chunk_unaligned_mask_bytes.size(); ++i) {
+        if (mask_ptr[i] == nullptr) {
+          continue;
+        }
+        AssignBits(chunk_unaligned_mask_bytes[i], 0, mask_ptr[i] + unaligned_mask_byte_pos,
+                   unaligned_mask_in_byte_pos - chunk_rows, chunk_rows);
+      }
+      unaligned_mask_in_byte_pos -= chunk_rows;
+      if (unaligned_mask_in_byte_pos == 0) {
+        --unaligned_mask_byte_pos;
+        unaligned_mask_in_byte_pos += 8;
+      }
+    } else {
+      int n1 = unaligned_mask_in_byte_pos, n2 = chunk_rows - n1;
+      for (size_t i = 0; i < chunk_unaligned_mask_bytes.size(); ++i) {
+        if (mask_ptr[i] == nullptr) {
+          continue;
+        }
+        AssignBits(chunk_unaligned_mask_bytes[i], n2, mask_ptr[i] + unaligned_mask_byte_pos, 0, n1);
+        AssignBits(chunk_unaligned_mask_bytes[i], 0, mask_ptr[i] + unaligned_mask_byte_pos - 1, 8 - n2, n2);
+      }
+      --unaligned_mask_byte_pos;
+      unaligned_mask_in_byte_pos = 8 - n2;
+    }
+  }
+
+  // For both rows which are null mask aligned and unaligned
+  struct {
+    std::mutex mutex;
+    uint64_t row_offset;
+    vector<uint64_t> column_data_offsets;
+  } offset_info_aligned, offset_info_unaligned;
+
+  // For compacting null mask bytes of unaligned portion per column. We write starting from last bit
+  // since the unaligned portion is written from the end.
+  uint8_t** mask_ptr;
+  uint64_t unaligned_mask_byte_pos;
+  int unaligned_mask_in_byte_pos;
 };
 
 class TableScanLocalSourceState : public LocalSourceState {
@@ -543,10 +612,11 @@ class TableScanCoalesceTask : public BaseExecutorTask {
 public:
 	TableScanCoalesceTask(TaskExecutor &executor, int task_id_p, TableFunction& function_p, ExecutionContext& context_p,
                         GPUPhysicalTableScan& op_p, GlobalSourceState* g_state_p, LocalSourceState* l_state_p,
-                        uint8_t** data_ptr_p, uint64_t** offset_ptr_p, int64_t* duckdb_storage_row_ids_ptr_p)
+                        uint8_t** data_ptr_p, uint8_t** mask_ptr_p, uint64_t** offset_ptr_p,
+                        int64_t* duckdb_storage_row_ids_ptr_p)
 	    : BaseExecutorTask(executor), task_id(task_id_p), function(function_p), context(context_p),
-        op(op_p), g_state(g_state_p), l_state(l_state_p), data_ptr(data_ptr_p), offset_ptr(offset_ptr_p),
-        duckdb_storage_row_ids_ptr(duckdb_storage_row_ids_ptr_p) {}
+        op(op_p), g_state(g_state_p), l_state(l_state_p), data_ptr(data_ptr_p), mask_ptr(mask_ptr_p),
+        offset_ptr(offset_ptr_p), duckdb_storage_row_ids_ptr(duckdb_storage_row_ids_ptr_p) {}
 
 	void ExecuteTask() override {
     auto &g_state_scan = g_state->Cast<TableScanGlobalSourceState>();
@@ -554,17 +624,23 @@ public:
     TableFunctionInput data(op.bind_data.get(), l_state_scan.local_state.get(), g_state_scan.global_state.get());
     auto chunk = make_uniq<DataChunk>();
     chunk->Initialize(Allocator::Get(context.client), op.scanned_types);
-    uint64_t row_offset;
-    vector<uint64_t> column_data_offsets;
-    vector<uint64_t> chunk_column_sizes;
+    uint64_t row_offset_aligned, row_offset_unaligned;
+    vector<uint64_t> column_data_offsets_aligned, column_data_offsets_unaligned;
+    vector<uint64_t> chunk_column_sizes_aligned, chunk_column_sizes_unaligned;
+    vector<uint8_t> unaligned_mask_bytes;
+    unaligned_mask_bytes.resize(op.orig_column_ids.size() - op.gen_row_id_column);
     while (true) {
       // Get next chunk
       function.function(context.client, data, *chunk);
       if (chunk->size() == 0) {
         break;
       }
-      // Compute chunk column size and get write offset
-      chunk_column_sizes.assign(op.column_ids.size(), 0);
+      // Compute chunk column size and get write offset, here we treat null mask aligned rows and
+      // unaligned rows separately.
+      uint64_t num_rows_unaligned = chunk->size() % 8;
+      uint64_t num_rows_aligned = chunk->size() - num_rows_unaligned;
+      chunk_column_sizes_aligned.assign(op.column_ids.size(), 0);
+      chunk_column_sizes_unaligned.assign(op.column_ids.size(), 0);
       for (int col = 0; col < op.orig_column_ids.size() - op.gen_row_id_column; col++) {
         if (!op.already_cached[col]) {
           auto& vec = chunk->data[col];
@@ -572,39 +648,92 @@ public:
           if (vec.GetType().id() == LogicalTypeId::VARCHAR) {
             auto duckdb_strings = reinterpret_cast<string_t*>(vec.GetData());
             auto &validity = FlatVector::Validity(vec);
-            for (int row = 0; row < chunk->size(); row++) {
+            for (int row = 0; row < num_rows_aligned; row++) {
               if (validity.RowIsValid(row)) {
-                chunk_column_sizes[col] += duckdb_strings[row].GetSize();
+                chunk_column_sizes_aligned[col] += duckdb_strings[row].GetSize();
+              }
+            }
+            for (int row = num_rows_aligned; row < chunk->size(); row++) {
+              if (validity.RowIsValid(row)) {
+                chunk_column_sizes_unaligned[col] += duckdb_strings[row].GetSize();
               }
             }
           } else {
-            chunk_column_sizes[col] = GetChunkDataByteSize(vec.GetType(), chunk->size());
+            chunk_column_sizes_aligned[col] = GetChunkDataByteSize(vec.GetType(), num_rows_aligned);
+            chunk_column_sizes_unaligned[col] = GetChunkDataByteSize(vec.GetType(), num_rows_unaligned);
           }
         }
       }
-      g_state_scan.NextChunkOffsets(chunk->size(), chunk_column_sizes, &row_offset, column_data_offsets);
-      // Copy data to pinned cpu memory
+      if (num_rows_aligned > 0) {
+        g_state_scan.NextChunkOffsetsAligned(num_rows_aligned, chunk_column_sizes_aligned,
+                                             &row_offset_aligned, column_data_offsets_aligned);
+      }
+      if (num_rows_unaligned > 0) {
+        for (int col = 0; col < op.orig_column_ids.size() - op.gen_row_id_column; col++) {
+          auto &validity = FlatVector::Validity(chunk->data[col]);
+          unaligned_mask_bytes[col] = (validity.GetData() == nullptr) ? 0xff
+            : reinterpret_cast<uint8_t*>(validity.GetData())[num_rows_aligned / 8];
+        }
+        g_state_scan.NextChunkOffsetsUnaligned(num_rows_unaligned, chunk_column_sizes_unaligned,
+                                               &row_offset_unaligned, column_data_offsets_unaligned,
+                                               unaligned_mask_bytes);
+      }
+      // Copy data to pinned cpu memory. We write rows which are null mask aligned from the beginning of the pinned
+      // memory buffer, and write rows which are null mask unaligned from the end of the pinned memory buffer.
       for (int col = 0; col < op.orig_column_ids.size() - op.gen_row_id_column; col++) {
         if (!op.already_cached[col]) {
           auto& vec = chunk->data[col];
+          // For data
+          auto &validity = FlatVector::Validity(vec);
           if (vec.GetType().id() == LogicalTypeId::VARCHAR) {
             auto duckdb_strings = reinterpret_cast<string_t*>(vec.GetData());
-            auto &validity = FlatVector::Validity(vec);
+            // For rows with null mask aligned
             uint64_t chunk_data_offset = 0;
-            for (int row = 0; row < chunk->size(); row++) {
+            for (int row = 0; row < num_rows_aligned; row++) {
               if (validity.RowIsValid(row)) {
                 uint64_t len = duckdb_strings[row].GetSize();
-                offset_ptr[col][row_offset + row + 1] = len;
-                uint64_t write_offset = column_data_offsets[col] + chunk_data_offset;
+                offset_ptr[col][row_offset_aligned + row + 1] = len;
+                uint64_t write_offset = column_data_offsets_aligned[col] + chunk_data_offset;
                 memcpy(data_ptr[col] + write_offset, duckdb_strings[row].GetData(), len);
                 chunk_data_offset += len;
               } else {
-                offset_ptr[col][row_offset + row + 1] = 0;
+                offset_ptr[col][row_offset_aligned + row + 1] = 0;
+              }
+            }
+            // For rows with null mask unaligned
+            chunk_data_offset = 0;
+            for (int row = num_rows_aligned; row < chunk->size(); row++) {
+              if (validity.RowIsValid(row)) {
+                uint64_t len = duckdb_strings[row].GetSize();
+                offset_ptr[col][row_offset_unaligned + (row - num_rows_aligned) + 1] = len;
+                uint64_t write_offset = column_data_offsets_unaligned[col] + chunk_data_offset;
+                memcpy(data_ptr[col] + write_offset, duckdb_strings[row].GetData(), len);
+                chunk_data_offset += len;
+              } else {
+                offset_ptr[col][row_offset_unaligned + (row - num_rows_aligned) + 1] = 0;
               }
             }
           } else {
-            uint64_t write_offset = row_offset * GetTypeIdSize(vec.GetType().InternalType());
-            memcpy(data_ptr[col] + write_offset, vec.GetData(), chunk_column_sizes[col]);
+            auto typeIdSize = GetTypeIdSize(vec.GetType().InternalType());
+            // For rows with null mask aligned
+            if (num_rows_aligned > 0) {
+              uint64_t write_offset = row_offset_aligned * typeIdSize;
+              memcpy(data_ptr[col] + write_offset, vec.GetData(), chunk_column_sizes_aligned[col]);
+            }
+            // For rows with null mask unaligned
+            if (num_rows_unaligned > 0) {
+              uint64_t write_offset = row_offset_unaligned * typeIdSize;
+              uint64_t read_offset = num_rows_aligned * typeIdSize;
+              memcpy(data_ptr[col] + write_offset, vec.GetData() + read_offset, chunk_column_sizes_unaligned[col]);
+            }
+          }
+          // For aligned null mask bytes, unaligned null mask bytes are handled in `NextChunkOffsetsUnaligned()`
+          if (num_rows_aligned > 0) {
+            if (validity.GetData() == nullptr) {
+              memset(mask_ptr[col] + row_offset_aligned / 8, 0xff, num_rows_aligned / 8);
+            } else {
+              memcpy(mask_ptr[col] + row_offset_aligned / 8, validity.GetData(), num_rows_aligned / 8);
+            }
           }
         }
       }
@@ -613,7 +742,15 @@ public:
         int col = op.scanned_ids.size() - 1;
         auto& vec = chunk->data[col];
         vec.Flatten(chunk->size());
-        memcpy(duckdb_storage_row_ids_ptr + row_offset, vec.GetData(), chunk->size() * sizeof(int64_t));
+        // For rows with null mask aligned
+        if (num_rows_aligned > 0) {
+          memcpy(duckdb_storage_row_ids_ptr + row_offset_aligned, vec.GetData(), num_rows_aligned * sizeof(int64_t));
+        }
+        // For rows with null mask unaligned
+        if (num_rows_unaligned > 0) {
+          memcpy(duckdb_storage_row_ids_ptr + row_offset_unaligned, vec.GetData() + num_rows_aligned * sizeof(int64_t),
+                 num_rows_unaligned * sizeof(int64_t));
+        }
       }
       // Clear the chunk
       chunk->Reset();
@@ -628,6 +765,7 @@ private:
   GlobalSourceState* g_state;
   LocalSourceState* l_state;
   uint8_t** data_ptr;
+  uint8_t** mask_ptr;
   uint64_t** offset_ptr;
   int64_t* duckdb_storage_row_ids_ptr;
 };
@@ -743,11 +881,13 @@ void GPUPhysicalTableScan::ScanDataDuckDBOpt(
     // Perform the second scan to coalesce duckdb chunk data to continuous pinned memory data,
     // `offset_ptr` represents string length before copied to gpu, after which we do prefix sum
     uint8_t** data_ptr = gpuBufferManager->customCudaHostAlloc<uint8_t*>(scanned_types.size());
+    uint8_t** mask_ptr = gpuBufferManager->customCudaHostAlloc<uint8_t*>(scanned_types.size());
     uint64_t** offset_ptr = gpuBufferManager->customCudaHostAlloc<uint64_t*>(scanned_types.size());
 
     for (int col = 0; col < column_ids.size() - gen_row_id_column; col++) {
       if (!already_cached[col]) {
         data_ptr[col] = gpuBufferManager->customCudaHostAlloc<uint8_t>(column_size[col]);
+        mask_ptr[col] = gpuBufferManager->customCudaHostAlloc<uint8_t>(mask_size[col]);
         if (scanned_types[col].id() == LogicalTypeId::VARCHAR) {
           offset_ptr[col] = gpuBufferManager->customCudaHostAlloc<uint64_t>(num_rows + 1);
           offset_ptr[col][0] = 0;
@@ -783,13 +923,15 @@ void GPUPhysicalTableScan::ScanDataDuckDBOpt(
     int num_threads = TaskScheduler::GetScheduler(exec_context.client).NumberOfThreads();
     TaskExecutor executor(exec_context.client);
     auto g_state = GetGlobalSourceState(exec_context.client);
+    g_state->Cast<TableScanGlobalSourceState>().InitForTableScanCoalesceTask(*this, mask_ptr);
     vector<unique_ptr<LocalSourceState>> l_states;
     l_states.resize(num_threads);
     for (int i = 0; i < num_threads; ++i) {
       l_states[i] = GetLocalSourceState(exec_context, *g_state);
       auto task = make_uniq<TableScanCoalesceTask>(executor, i, function, exec_context, *this,
                                                    g_state.get(), l_states[i].get(),
-                                                   data_ptr, offset_ptr, duckdb_storage_row_ids_ptr);
+                                                   data_ptr, mask_ptr, offset_ptr,
+                                                   duckdb_storage_row_ids_ptr);
       executor.ScheduleTask(std::move(task));
     }
     executor.WorkOnTasks();
@@ -803,10 +945,12 @@ void GPUPhysicalTableScan::ScanDataDuckDBOpt(
   
     // Copy data from pinned cpu memory to gpu
     uint8_t** d_data_ptr = gpuBufferManager->customCudaHostAlloc<uint8_t*>(scanned_types.size());
+    uint8_t** d_mask_ptr = gpuBufferManager->customCudaHostAlloc<uint8_t*>(scanned_types.size());
     uint64_t** d_offset_ptr = gpuBufferManager->customCudaHostAlloc<uint64_t*>(scanned_types.size());
     for (int col = 0; col < scanned_types.size(); col++) {
       if (!already_cached[col]) {
         d_data_ptr[col] = gpuBufferManager->customCudaMalloc<uint8_t>(column_size[col], 0, 1);
+        d_mask_ptr[col] = gpuBufferManager->customCudaMalloc<uint8_t>(mask_size[col], 0, 1);
         if (scanned_types[col].id() == LogicalTypeId::VARCHAR) {
           d_offset_ptr[col] = gpuBufferManager->customCudaMalloc<uint64_t>(num_rows + 1, 0, 1);
         }
@@ -821,6 +965,15 @@ void GPUPhysicalTableScan::ScanDataDuckDBOpt(
         while (write_offset < column_size[col]) {
           uint64_t write_len = std::min(Config::OPT_TABLE_SCAN_CUDA_MEMCPY_SIZE, column_size[col] - write_offset);
           cudaMemcpyAsync(d_data_ptr[col] + write_offset, data_ptr[col] + write_offset,
+                          write_len, cudaMemcpyHostToDevice,
+                          cuda_streams[num_cuda_memcpy++ % Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS]);
+          write_offset += write_len;
+        }
+        // For mask
+        write_offset = 0;
+        while (write_offset < mask_size[col]) {
+          uint64_t write_len = std::min(Config::OPT_TABLE_SCAN_CUDA_MEMCPY_SIZE, mask_size[col] - write_offset);
+          cudaMemcpyAsync(d_mask_ptr[col] + write_offset, mask_ptr[col] + write_offset,
                           write_len, cudaMemcpyHostToDevice,
                           cuda_streams[num_cuda_memcpy++ % Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS]);
           write_offset += write_len;
@@ -883,7 +1036,7 @@ void GPUPhysicalTableScan::ScanDataDuckDBOpt(
         int column_idx = column_it - table->column_names.begin();
         GPUColumnType column_type = convertLogicalTypeToColumnType(scanned_types[col]);
         table->columns[column_idx]->column_length = num_rows;
-        cudf::bitmask_type* validity_mask = nullptr;
+        cudf::bitmask_type* validity_mask = reinterpret_cast<cudf::bitmask_type*>(d_mask_ptr[col]);
         if (scanned_types[col] == LogicalType::VARCHAR) {
           table->columns[column_idx]->data_wrapper = DataWrapper(column_type, d_data_ptr[col], d_offset_ptr[col],
                                                                  num_rows, column_size[col], true, validity_mask);
@@ -924,6 +1077,18 @@ void GPUPhysicalTableScan::ScanDataDuckDBOpt(
                                           sizeof(uint64_t) * (num_rows + 1) - write_offset);
             cudaMemcpyAsync(reinterpret_cast<uint8_t*>(table->columns[col]->data_wrapper.offset) + write_offset,
                             reinterpret_cast<uint8_t*>(reordered_column->data_wrapper.offset) + write_offset,
+                            write_len, cudaMemcpyDeviceToDevice,
+                            cuda_streams[num_cuda_memcpy++ % Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS]);
+            write_offset += write_len;
+          }
+        }
+        if (table->columns[col]->data_wrapper.validity_mask != nullptr) {
+          write_offset = 0;
+          while (write_offset < table->columns[col]->data_wrapper.mask_bytes) {
+            uint64_t write_len = std::min(Config::OPT_TABLE_SCAN_CUDA_MEMCPY_SIZE,
+                                          table->columns[col]->data_wrapper.mask_bytes - write_offset);
+            cudaMemcpyAsync(reinterpret_cast<uint8_t*>(table->columns[col]->data_wrapper.validity_mask) + write_offset,
+                            reinterpret_cast<uint8_t*>(reordered_column->data_wrapper.validity_mask) + write_offset,
                             write_len, cudaMemcpyDeviceToDevice,
                             cuda_streams[num_cuda_memcpy++ % Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS]);
             write_offset += write_len;
