@@ -100,7 +100,7 @@ libcudf will be installed via conda/miniconda. Miniconda can be downloaded [here
 ```
 conda create --name libcudf-env
 conda activate libcudf-env
-conda install -c rapidsai -c conda-forge -c nvidia rapidsai::libcudf=25.08
+conda install -c rapidsai -c conda-forge -c nvidia rapidsai-nightly::libcudf
 ```
 Set the environment variables `LIBCUDF_ENV_PREFIX` to the conda environment's path. For example, if we installed miniconda in `~/miniconda3` and installed libcudf in the conda environment `libcudf-env`, then we would set the `LIBCUDF_ENV_PREFIX` to `~/miniconda3/envs/libcudf-env`.
 ```
@@ -121,6 +121,18 @@ To build Sirius:
 ```
 make -j {nproc}
 ```
+Common issues: If you encounter an error such as:
+```
+/usr/bin/ld: /home/ubuntu/miniconda3/envs/libcudf-env/lib/libcudf.so: undefined reference to `std::ios_base_library_init()@GLIBCXX_3.4.32'
+/usr/bin/ld: /home/ubuntu/miniconda3/envs/libcudf-env/lib/libcudf.so: undefined reference to `__cxa_call_terminate@CXXABI_1.3.15'
+```
+Solve this issue by running the following command, then delete the build directory and install Sirius once again:
+```
+export LDFLAGS="-Wl,-rpath,$CONDA_PREFIX/lib -L$CONDA_PREFIX/lib $LDFLAGS"
+rm -rf build
+make -j {nproc}
+```
+
 Optionally, to use the Python API in Sirius, we also need to build the duckdb-python package with the following commands:
 ```
 cd duckdb/tools/pythonpkg/
