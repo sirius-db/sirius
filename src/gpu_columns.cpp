@@ -59,9 +59,6 @@ DataWrapper::DataWrapper(GPUColumnType _type, uint8_t* _data, size_t _size, cudf
     //         null_count = 0;
     //     }
     // }
-    if (validity_mask == nullptr && data != nullptr) {
-        throw NotImplementedException("Validity mask is null for GPUColumn with data, this should not happen");
-    }
 };
 
 DataWrapper::DataWrapper(GPUColumnType _type, uint8_t* _data, uint64_t* _offset, size_t _size, 
@@ -81,9 +78,6 @@ DataWrapper::DataWrapper(GPUColumnType _type, uint8_t* _data, uint64_t* _offset,
     //         null_count = 0;
     //     }
     // }
-    if (validity_mask == nullptr && data != nullptr) {
-        throw NotImplementedException("Validity mask is null for GPUColumn with data, this should not happen");
-    }
 };
 
 size_t 
@@ -134,9 +128,6 @@ GPUColumn::GPUColumn(size_t _column_length, GPUColumnType type, uint8_t* data,
     data_wrapper.offset = nullptr;
     data_wrapper.num_bytes = column_length * data_wrapper.getColumnTypeSize();
     is_unique = false;
-    if (data_wrapper.validity_mask == nullptr && data_wrapper.data != nullptr) {
-        throw NotImplementedException("Validity mask is null for GPUColumn with data, this should not happen");
-    }
 }
 
 GPUColumn::GPUColumn(size_t _column_length, GPUColumnType type, uint8_t* data, uint64_t* offset, 
@@ -153,9 +144,6 @@ GPUColumn::GPUColumn(size_t _column_length, GPUColumnType type, uint8_t* data, u
         data_wrapper.num_bytes = column_length * data_wrapper.getColumnTypeSize();
     }
     is_unique = false;
-    if (data_wrapper.validity_mask == nullptr && data_wrapper.data != nullptr) {
-        throw NotImplementedException("Validity mask is null for GPUColumn with data, this should not happen");
-    }
 }
 
 GPUColumn::GPUColumn(shared_ptr<GPUColumn> other) {
@@ -164,9 +152,6 @@ GPUColumn::GPUColumn(shared_ptr<GPUColumn> other) {
     row_id_count = other->row_id_count;
     column_length = other->column_length;
     is_unique = other->is_unique;
-    if (data_wrapper.validity_mask == nullptr && data_wrapper.data != nullptr) {
-        throw NotImplementedException("Validity mask is null for GPUColumn with data, this should not happen");
-    }
 }
 
 // cudf::column_view
