@@ -54,8 +54,13 @@ Supported EC2 instances: G4dn, G5, G6, Gr6, G6e, P4, P5, P6.
 
 ## Dependencies (Option 2): Use Docker Image
 To use the docker image with dependencies fully installed:
+For x86 machine:
 ```
-sudo docker run --gpus all -it yifeiyang7/sirius_dependencies:latest bash
+sudo docker run --gpus all -it sirius/sirius_dependencies_x86:stable bash
+```
+For aarch64 machine:
+```
+sudo docker run --gpus all -it sirius/sirius_dependencies_aarch64:stable bash
 ```
 
 If encounting errors like the following when running the docker image as above:
@@ -100,7 +105,7 @@ libcudf will be installed via conda/miniconda. Miniconda can be downloaded [here
 ```
 conda create --name libcudf-env
 conda activate libcudf-env
-conda install -c rapidsai -c conda-forge -c nvidia rapidsai-nightly::libcudf
+conda install -c rapidsai -c conda-forge -c nvidia rapidsai::libcudf=25.04
 ```
 Set the environment variables `LIBCUDF_ENV_PREFIX` to the conda environment's path. For example, if we installed miniconda in `~/miniconda3` and installed libcudf in the conda environment `libcudf-env`, then we would set the `LIBCUDF_ENV_PREFIX` to `~/miniconda3/envs/libcudf-env`.
 ```
@@ -113,7 +118,7 @@ To clone the Sirius repository:
 ```
 git clone --recurse-submodules https://github.com/sirius-db/sirius.git
 cd sirius
-./setup_sirius.sh
+source setup_sirius.sh
 ```
 The `--recurse-submodules` will ensure DuckDB is pulled which is required to build the extension.
 

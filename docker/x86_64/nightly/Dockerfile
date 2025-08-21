@@ -1,15 +1,15 @@
-FROM nvidia/cuda:12.6.1-devel-ubuntu22.04
+FROM nvidia/cuda:12.8.1-devel-ubuntu24.04
 ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /root
 
 # Common dependencies
 RUN apt-get update && apt-get install -y git g++ cmake ninja-build libssl-dev wget vim unzip
 
-# CMake 3.30.4
-RUN wget https://github.com/Kitware/CMake/releases/download/v3.30.4/cmake-3.30.4-linux-x86_64.sh && \
-    chmod +x cmake-3.30.4-linux-x86_64.sh && \
-    ./cmake-3.30.4-linux-x86_64.sh --skip-license --prefix=/usr/local && \
-    rm cmake-3.30.4-linux-x86_64.sh
+# CMake 4.1.0
+RUN wget https://github.com/Kitware/CMake/releases/download/v4.1.0/cmake-4.1.0-linux-x86_64.sh && \
+    chmod +x cmake-4.1.0-linux-x86_64.sh && \
+    ./cmake-4.1.0-linux-x86_64.sh --skip-license --prefix=/usr/local && \
+    rm cmake-4.1.0-linux-x86_64.sh
 
 # Install Miniconda
 ENV CONDA_DIR=/opt/conda
@@ -21,7 +21,7 @@ ENV PATH=$CONDA_DIR/bin:$PATH
 # Create conda env with libcudf
 RUN conda update -n base -c defaults conda && \
     conda create -n libcudf-env -y && \
-    conda run -n libcudf-env conda install -y -c rapidsai -c conda-forge -c nvidia rapidsai::libcudf=25.04
+    conda run -n libcudf-env conda install -y -c rapidsai -c conda-forge -c nvidia rapidsai-nightly::libcudf
 ENV USE_CUDF=1
 ENV LIBCUDF_ENV_PREFIX=$CONDA_DIR/envs/libcudf-env
 
