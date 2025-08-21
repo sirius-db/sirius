@@ -54,6 +54,7 @@ Supported EC2 instances: G4dn, G5, G6, Gr6, G6e, P4, P5, P6.
 
 ## Dependencies (Option 2): Use Docker Image
 To use the docker image with dependencies fully installed:
+
 For x86 machine:
 ```
 sudo docker run --gpus all -it sirius/sirius_dependencies_x86:stable bash
