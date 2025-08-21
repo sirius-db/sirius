@@ -18,6 +18,31 @@ cmake_minimum_required(VERSION 3.30.4)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 add_compile_definitions(ENABLE_CUDF)
+if(DEFINED ENV{CUDF_VERSION})
+    # Split by "."
+    string(REPLACE "." ";" VERSION_PARTS $ENV{CUDF_VERSION})
+    list(GET VERSION_PARTS 0 CUDF_MAJOR)
+    list(GET VERSION_PARTS 1 CUDF_MINOR_RAW)
+
+    # Pad the minor to 2 digits if necessary
+    if(CUDF_MINOR_RAW MATCHES "^[0-9]$")
+        # single digit, pad
+        set(CUDF_MINOR "0${CUDF_MINOR_RAW}")
+    else()
+        # already 2 digits
+        set(CUDF_MINOR ${CUDF_MINOR_RAW})
+    endif()
+
+    # Numeric encoding: major*100 + minor
+    math(EXPR CUDF_NUMERIC "${CUDF_MAJOR} * 100 + ${CUDF_MINOR}")
+
+    message(STATUS "Detected cuDF version: $ENV{CUDF_VERSION}")
+    message(STATUS "Normalized cuDF major: ${CUDF_MAJOR}")
+    message(STATUS "Normalized cuDF minor: ${CUDF_MINOR}")
+    message(STATUS "Numeric cuDF version: ${CUDF_NUMERIC}")
+
+    add_compile_definitions(CUDF_VERSION_NUM=${CUDF_NUMERIC})
+endif()
 
 # Set extension name here
 set(TARGET_NAME sirius)
