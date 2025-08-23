@@ -516,7 +516,15 @@ void SiriusExtension::InitializeGPUExtension(Connection &con) {
 
 }
 
+void SiriusExtension::InitialGPUConfigs(DuckDB &db) {
+	auto &config = DBConfig::GetConfig(*db.instance);
+	config.AddExtensionOption();
+}
+
 void SiriusExtension::Load(DuckDB &db) {
+	// First initialize the config before acquring a connection the database
+	InitialGPUConfigs(db);
+	
 	Connection con(db);
 	con.BeginTransaction();
 
