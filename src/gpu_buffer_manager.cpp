@@ -172,7 +172,7 @@ GPUBufferManager::customCudaHostAlloc<ConstantFilter*>(size_t size);
 
 GPUBufferManager::GPUBufferManager(size_t cache_size_per_gpu, size_t processing_size_per_gpu, size_t processing_size_per_cpu) : 
     cache_size_per_gpu(cache_size_per_gpu), processing_size_per_gpu(processing_size_per_gpu), processing_size_per_cpu(processing_size_per_cpu) {
-    SIRIUS_LOG_INFO("Initializing GPU buffer manager");
+    SIRIUS_LOG_INFO("Initializing GPU buffer manager with use pin of {}", Config::USE_PIN_MEM_FOR_CPU_PROCESSING);
     gpuCache = new uint8_t*[NUM_GPUS];
     cpuCache = new uint8_t*[NUM_GPUS];
     gpuProcessing = new uint8_t*[NUM_GPUS];

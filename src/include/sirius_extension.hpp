@@ -24,6 +24,7 @@ class SiriusExtension : public Extension {
 public:
 	void Load(DuckDB &db) override;
 	std::string Name() override;
+	void InitialGPUConfigs(DuckDB& db);
 	void InitializeGPUExtension(Connection &con);
 	static void GPUProcessingSubstraitFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output);
 	static void GPUProcessingFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output);

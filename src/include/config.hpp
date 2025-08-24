@@ -20,20 +20,23 @@
 
 namespace duckdb {
 
+// If you are adding a new field to this struct, then you also need to make the following changes:
+// * Specify the default value in config.cpp
+// * Add a configuration field associated with Sirius (see InitialGPUConfigs in sirius_extension.cpp for examples)
 struct Config {
   // For gpu buffer manager
-  static constexpr bool USE_PIN_MEM_FOR_CPU_PROCESSING = true;
+  static bool USE_PIN_MEM_FOR_CPU_PROCESSING; // use_pin_memory
 
   // For expression executor
-  static constexpr bool USE_CUDF_EXPR = true;
+  static bool USE_CUDF_EXPR; // use_cudf_expr
   
   // For gpu physical top-N
-  static constexpr bool USE_CUSTOM_TOP_N = true;
+  static bool USE_CUSTOM_TOP_N; // use_custom_top_n
 
   // For gpu physical table scan
-  static constexpr bool USE_OPT_TABLE_SCAN = true;
-  static constexpr int OPT_TABLE_SCAN_NUM_CUDA_STREAMS = 8;
-  static constexpr uint64_t OPT_TABLE_SCAN_CUDA_MEMCPY_SIZE = 64UL * 1024 * 1024;  // 64 MB
+  static bool USE_OPT_TABLE_SCAN; // use_opt_table_scan
+  static int OPT_TABLE_SCAN_NUM_CUDA_STREAMS; // opt_table_scan_num_streams
+  static uint64_t OPT_TABLE_SCAN_CUDA_MEMCPY_SIZE; // opt_table_scan_memcpy_size
 };
 
 }

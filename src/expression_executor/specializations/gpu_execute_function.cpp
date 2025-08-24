@@ -89,15 +89,16 @@ GpuExpressionExecutor::InitializeState(const BoundFunctionExpression& expr,
 
 //----------StringMatchingDispatcher----------//
 // Helper template functor for string matching operations to reduce bloat in Execute()
-template <StringMatchingType MatchType, bool UseCudf>
+template <StringMatchingType MatchType>
 struct StringMatchingDispatcher
 {
   // The executor
   GpuExpressionExecutor& executor;
+  const bool UseCudf;
 
   // Constructor
-  explicit StringMatchingDispatcher(GpuExpressionExecutor& exec)
-      : executor(exec)
+  explicit StringMatchingDispatcher(GpuExpressionExecutor& exec, bool use_cudf)
+      : executor(exec), UseCudf(use_cudf)
   {}
 
   // Dispatch operator
@@ -123,7 +124,7 @@ struct StringMatchingDispatcher
     }
 
     // For the following `MatchType`, we support using both cudf or the one implmented by Sirius
-    if constexpr (UseCudf)
+    if (UseCudf)
     {
       //----------Using CuDF----------//
       cudf::strings_column_view input_view(input->view());
@@ -640,7 +641,7 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundFunction
 
     auto input = Execute(*expr.children[0], state->child_states[0].get());
 
-    if constexpr (use_cudf)
+    if (Config::USE_CUDF_EXPR)
     {
       cudf::strings_column_view input_view(input->view());
       const auto cudf_start = start_expr.value.GetValue<cudf::size_type>() - 1;
@@ -667,27 +668,27 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundFunction
   }
   else if (func_str == LIKE_FUNC_STR)
   {
-    StringMatchingDispatcher<StringMatchingType::LIKE, use_cudf> dispatcher(*this);
+    StringMatchingDispatcher<StringMatchingType::LIKE> dispatcher(*this, Config::USE_CUDF_EXPR);
     return dispatcher(expr, state);
   }
   else if (func_str == NOT_LIKE_FUNC_STR)
   {
-    StringMatchingDispatcher<StringMatchingType::NOT_LIKE, use_cudf> dispatcher(*this);
+    StringMatchingDispatcher<StringMatchingType::NOT_LIKE> dispatcher(*this, Config::USE_CUDF_EXPR);
     return dispatcher(expr, state);
   }
   else if (func_str == CONTAINS_FUNC_STR)
   {
-    StringMatchingDispatcher<StringMatchingType::CONTAINS, use_cudf> dispatcher(*this);
+    StringMatchingDispatcher<StringMatchingType::CONTAINS> dispatcher(*this, Config::USE_CUDF_EXPR);
     return dispatcher(expr, state);
   }
   else if (func_str == PREFIX_FUNC_STR)
   {
-    StringMatchingDispatcher<StringMatchingType::PREFIX, use_cudf> dispatcher(*this);
+    StringMatchingDispatcher<StringMatchingType::PREFIX> dispatcher(*this, Config::USE_CUDF_EXPR);
     return dispatcher(expr, state);
   }
   else if (func_str == SUFFIX_FUNC_STR)
   {
-    StringMatchingDispatcher<StringMatchingType::SUFFIX, use_cudf> dispatcher(*this);
+    StringMatchingDispatcher<StringMatchingType::SUFFIX> dispatcher(*this, Config::USE_CUDF_EXPR);
     return dispatcher(expr, state);
   }
 
