@@ -25,18 +25,18 @@ namespace duckdb {
 // * Add a configuration field associated with Sirius (see InitialGPUConfigs in sirius_extension.cpp for examples)
 struct Config {
   // For gpu buffer manager
-  static bool USE_PIN_MEM_FOR_CPU_PROCESSING;
+  static bool USE_PIN_MEM_FOR_CPU_PROCESSING; // use_pin_memory
 
   // For expression executor
-  static bool USE_CUDF_EXPR;
+  static bool USE_CUDF_EXPR; // use_cudf_expr
   
   // For gpu physical top-N
-  static bool USE_CUSTOM_TOP_N;
+  static bool USE_CUSTOM_TOP_N; // use_custom_top_n
 
   // For gpu physical table scan
-  static bool USE_OPT_TABLE_SCAN;
-  static int OPT_TABLE_SCAN_NUM_CUDA_STREAMS;
-  static uint64_t OPT_TABLE_SCAN_CUDA_MEMCPY_SIZE;
+  static bool USE_OPT_TABLE_SCAN; // use_opt_table_scan
+  static int OPT_TABLE_SCAN_NUM_CUDA_STREAMS; // opt_table_scan_num_streams
+  static uint64_t OPT_TABLE_SCAN_CUDA_MEMCPY_SIZE; // opt_table_scan_memcpy_size
 };
 
 }

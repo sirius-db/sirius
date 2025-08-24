@@ -62,8 +62,6 @@ struct GpuExpressionExecutor
   bool has_null_input_column;
   // The stream in which to execute the given set of expressions
   rmm::cuda_stream_view execution_stream;
-  // Static flag indicating whether to use cudf or sirius for string functions
-  static constexpr bool use_cudf = Config::USE_CUDF_EXPR;
 
   //----------Methods----------//
   void AddExpression(const Expression& expr);

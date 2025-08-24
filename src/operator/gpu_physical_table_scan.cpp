@@ -1115,7 +1115,7 @@ void GPUPhysicalTableScan::ScanDataDuckDBOpt(
 SourceResultType
 GPUPhysicalTableScan::GetDataDuckDB(ExecutionContext &exec_context) {
   // Use optimized scan if required
-  if constexpr (Config::USE_OPT_TABLE_SCAN) {
+  if (Config::USE_OPT_TABLE_SCAN) {
     return GetDataDuckDBOpt(exec_context);
   }
 

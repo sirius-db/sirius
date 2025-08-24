@@ -43,6 +43,7 @@
 #include "gpu_context.hpp"
 #include "gpu_physical_plan_generator.hpp"
 #include "gpu_buffer_manager.hpp"
+#include "config.hpp"
 
 #include <cstdlib>
 
@@ -516,9 +517,58 @@ void SiriusExtension::InitializeGPUExtension(Connection &con) {
 
 }
 
+static void SetUsePinMemory(ClientContext &context, SetScope scope, Value &parameter) {
+	Config::USE_PIN_MEM_FOR_CPU_PROCESSING = BooleanValue::Get(parameter);
+	SIRIUS_LOG_DEBUG("Updated config USE_PIN_MEM_FOR_CPU_PROCESSING to {}", Config::USE_PIN_MEM_FOR_CPU_PROCESSING);
+}
+
+static void SetUseCudfExpr(ClientContext &context, SetScope scope, Value &parameter) {
+	Config::USE_CUDF_EXPR = BooleanValue::Get(parameter);
+	SIRIUS_LOG_DEBUG("Updated config USE_CUDF_EXPR to {}", Config::USE_CUDF_EXPR);
+}
+
+static void SetUseCustomTopN(ClientContext &context, SetScope scope, Value &parameter) {
+	Config::USE_CUSTOM_TOP_N = BooleanValue::Get(parameter);
+	SIRIUS_LOG_DEBUG("Updated config USE_CUSTOM_TOP_N to {}", Config::USE_CUSTOM_TOP_N);
+}
+
+static void SetUseOptTableScan(ClientContext &context, SetScope scope, Value &parameter) {
+	Config::USE_OPT_TABLE_SCAN = BooleanValue::Get(parameter);
+	SIRIUS_LOG_DEBUG("Updated config USE_OPT_TABLE_SCAN to {}", Config::USE_OPT_TABLE_SCAN);
+}
+
+static void SetOptTableScanNumStreams(ClientContext &context, SetScope scope, Value &parameter) {
+	Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS = IntegerValue::Get(parameter);
+	SIRIUS_LOG_DEBUG("Updated config OPT_TABLE_SCAN_NUM_CUDA_STREAMS to {}", Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS);
+}
+
+static void SetOptTableScanMemcpySize(ClientContext &context, SetScope scope, Value &parameter) {
+	Config::OPT_TABLE_SCAN_CUDA_MEMCPY_SIZE = UBigIntValue::Get(parameter);
+	SIRIUS_LOG_DEBUG("Updated config OPT_TABLE_SCAN_CUDA_MEMCPY_SIZE to {}", Config::OPT_TABLE_SCAN_CUDA_MEMCPY_SIZE);
+}
+
 void SiriusExtension::InitialGPUConfigs(DuckDB &db) {
 	auto &config = DBConfig::GetConfig(*db.instance);
-	config.AddExtensionOption();
+
+	// Add in config option for gpu buffer manager
+	config.AddExtensionOption("use_pin_memory", "Whether or not the buffer manager is initialized with pinned memory", LogicalType::BOOLEAN, 
+		Value::BOOLEAN(Config::USE_PIN_MEM_FOR_CPU_PROCESSING), SetUsePinMemory);
+
+	// Add in config option for expression executor
+	config.AddExtensionOption("use_cudf_expr", "Whether or not cudf is used to evaluate expressions", LogicalType::BOOLEAN, 
+		Value::BOOLEAN(Config::USE_CUDF_EXPR), SetUseCudfExpr);
+
+	// Add in config option for top-N
+	config.AddExtensionOption("use_custom_top_n", "Whether or not custom kernel is used to evalaute top n", LogicalType::BOOLEAN, 
+		Value::BOOLEAN(Config::USE_CUSTOM_TOP_N), SetUseCustomTopN);
+
+	// Add in config options for custom table scan
+	config.AddExtensionOption("use_opt_table_scan", "Whether or not the optional table scan is used", LogicalType::BOOLEAN, 
+		Value::BOOLEAN(Config::USE_OPT_TABLE_SCAN), SetUseOptTableScan);
+	config.AddExtensionOption("opt_table_scan_num_streams", "The number of cuda streams to use in the optional table scan", LogicalType::INTEGER, 
+		Value::INTEGER(Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS), SetOptTableScanNumStreams);
+	config.AddExtensionOption("opt_table_scan_memcpy_size", "The memcpy size (in bytes) used by the optional table scan", LogicalType::UBIGINT, 
+		Value::UBIGINT(Config::OPT_TABLE_SCAN_CUDA_MEMCPY_SIZE), SetOptTableScanNumStreams);
 }
 
 void SiriusExtension::Load(DuckDB &db) {
