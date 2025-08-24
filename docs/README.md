@@ -267,13 +267,14 @@ con.execute('''
 ```
 
 ## Correctness Testing
-Sirius provides a unit test that compares Sirius against DuckDB for correctness across all 22 TPC-H queries. To run the unittest, generate SF=1 TPC-H dataset using the method described [here](https://github.com/sirius-db/sirius?tab=readme-ov-file#generating-tpc-h-dataset) and run the unittest using the following command:
+Sirius provides a unit test that compares Sirius against DuckDB for correctness across many test queries. To run the unittest, generate the datasets using the method described [here](https://github.com/sirius-db/sirius?tab=readme-ov-file#generating-tpc-h-dataset) and run the unittest using the following command:
 ```
 make test
 ```
 
 To run a specific test run the command from the root directory:
 ```
+make -j {nproc}
 build/release/test/unittest --test-dir . test/sql/clickbench_queries.test
 ```
 
