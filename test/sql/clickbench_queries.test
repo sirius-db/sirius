@@ -133,10 +133,10 @@ CREATE TABLE hits
 );
 
 statement ok
-COPY hits FROM 'hits.tsv' (QUOTE '');
+COPY hits FROM 'test_datasets/test_hits.tsv' (QUOTE '');
 
 statement ok
-call gpu_buffer_init("2 GB", "2 GB");
+call gpu_buffer_init("1 GB", "1 GB");
 
 
 # Q1
@@ -201,7 +201,7 @@ call gpu_processing("SELECT RegionID, SUM(AdvEngineID) AS sum, COUNT(*) AS c, AV
 
 # Q11
 query I
-call gpu_processing("SELECT MobilePhoneModel, COUNT(DISTINCT UserID) AS u FROM hits WHERE MobilePhoneModel <> '' GROUP BY MobilePhoneModel ORDER BY u DESC LIMIT 10;");
+call gpu_processing("SELECT MobilePhoneModel, COUNT(DISTINCT UserID) AS u FROM hits WHERE MobilePhoneModel <> '' GROUP BY MobilePhoneModel ORDER BY u DESC, MobilePhoneModel DESC LIMIT 10;");
 ----
 <FILE>:test/answers/clickbench/q11.csv
 
@@ -243,13 +243,13 @@ call gpu_processing("SELECT UserID, SearchPhrase, COUNT(*) AS count FROM hits GR
 
 # Q18
 query I
-call gpu_processing("SELECT UserID, SearchPhrase, COUNT(*) AS count FROM hits GROUP BY UserID, SearchPhrase ORDER BY UserID LIMIT 10;");
+call gpu_processing("SELECT UserID, SearchPhrase, COUNT(*) AS count FROM hits GROUP BY UserID, SearchPhrase ORDER BY UserID, SearchPhrase, count LIMIT 10;");
 ----
 <FILE>:test/answers/clickbench/q18.csv
 
 # Q19
 query I
-call gpu_processing("SELECT UserID, extract(minute FROM EventTime) AS m, SearchPhrase, COUNT(*) FROM hits GROUP BY UserID, m, SearchPhrase ORDER BY COUNT(*) DESC LIMIT 10;");
+call gpu_processing("SELECT UserID, extract(minute FROM EventTime) AS m, SearchPhrase, COUNT(*) FROM hits GROUP BY UserID, m, SearchPhrase ORDER BY COUNT(*) DESC, m, SearchPhrase, UserID LIMIT 10;");
 ----
 <FILE>:test/answers/clickbench/q19.csv
 
@@ -273,7 +273,7 @@ call gpu_processing("SELECT SearchPhrase, MIN(URL) AS min, COUNT(*) AS c FROM hi
 
 # Q23
 query I
-call gpu_processing("SELECT SearchPhrase, MIN(URL) AS min_url, MIN(Title) AS min_title, COUNT(*) AS c, COUNT(DISTINCT UserID) AS c_distinct FROM hits WHERE Title LIKE '%Google%' AND URL NOT LIKE '%.google.%' AND SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10;");
+call gpu_processing("SELECT SearchPhrase, MIN(URL) AS min_url, MIN(Title) AS min_title, COUNT(*) AS c, COUNT(DISTINCT UserID) AS c_distinct FROM hits WHERE Title LIKE '%Google%' AND URL NOT LIKE '%.google.%' AND SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c DESC, SearchPhrase, min_url, min_title LIMIT 10;");
 ----
 <FILE>:test/answers/clickbench/q23.csv
 
@@ -321,19 +321,19 @@ call gpu_processing("SELECT SUM(ResolutionWidth), SUM(ResolutionWidth + 1), SUM(
 
 # Q31
 query I
-call gpu_processing("SELECT SearchEngineID, ClientIP, COUNT(*) AS c, SUM(IsRefresh) AS sum, AVG(ResolutionWidth) AS avg FROM hits WHERE SearchPhrase <> '' GROUP BY SearchEngineID, ClientIP ORDER BY c DESC LIMIT 10;");
+call gpu_processing("SELECT SearchEngineID, ClientIP, COUNT(*) AS c, SUM(IsRefresh) AS sum, AVG(ResolutionWidth) AS avg FROM hits WHERE SearchPhrase <> '' GROUP BY SearchEngineID, ClientIP ORDER BY c DESC, SearchEngineID, ClientIP, avg, sum LIMIT 10;");
 ----
 <FILE>:test/answers/clickbench/q31.csv
 
 # Q32
 query I
-call gpu_processing("SELECT WatchID, ClientIP, COUNT(*) AS c, SUM(IsRefresh) AS sum, AVG(ResolutionWidth) AS avg FROM hits WHERE SearchPhrase <> '' GROUP BY WatchID, ClientIP ORDER BY c DESC LIMIT 10;");
+call gpu_processing("SELECT WatchID, ClientIP, COUNT(*) AS c, SUM(IsRefresh) AS sum, AVG(ResolutionWidth) AS avg FROM hits WHERE SearchPhrase <> '' GROUP BY WatchID, ClientIP ORDER BY c DESC, ClientIP, WatchID, sum, avg LIMIT 10;");
 ----
 <FILE>:test/answers/clickbench/q32.csv
 
 # Q33
 query I
-call gpu_processing("SELECT WatchID, ClientIP, COUNT(*) AS c, SUM(IsRefresh) AS sum, AVG(ResolutionWidth) AS avg FROM hits GROUP BY WatchID, ClientIP ORDER BY c DESC LIMIT 10;");
+call gpu_processing("SELECT WatchID, ClientIP, COUNT(*) AS c, SUM(IsRefresh) AS sum, AVG(ResolutionWidth) AS avg FROM hits GROUP BY WatchID, ClientIP ORDER BY c DESC, WatchID, ClientIP, avg, sum LIMIT 10;");
 ----
 <FILE>:test/answers/clickbench/q33.csv
 
@@ -369,25 +369,25 @@ call gpu_processing("SELECT Title, COUNT(*) AS PageViews FROM hits WHERE Counter
 
 # Q39
 query I
-call gpu_processing("SELECT URL, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND IsLink <> 0 AND IsDownload = 0 GROUP BY URL ORDER BY PageViews DESC LIMIT 10 OFFSET 1000;");
+call gpu_processing("SELECT URL, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND IsLink <> 0 AND IsDownload = 0 GROUP BY URL ORDER BY PageViews DESC, URL LIMIT 10 OFFSET 1000;");
 ----
 <FILE>:test/answers/clickbench/q39.csv
 
 # Q40
 query I
-call gpu_processing("SELECT TraficSourceID, SearchEngineID, AdvEngineID, CASE WHEN (SearchEngineID = 0 AND AdvEngineID = 0) THEN Referer ELSE '' END AS Src, URL AS Dst, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 GROUP BY TraficSourceID, SearchEngineID, AdvEngineID, Src, Dst ORDER BY PageViews DESC LIMIT 10 OFFSET 1000;");
+call gpu_processing("SELECT TraficSourceID, SearchEngineID, AdvEngineID, CASE WHEN (SearchEngineID = 0 AND AdvEngineID = 0) THEN Referer ELSE '' END AS Src, URL AS Dst, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 GROUP BY TraficSourceID, SearchEngineID, AdvEngineID, Src, Dst ORDER BY PageViews DESC, TraficSourceID, SearchEngineID, AdvEngineID, Src, Dst LIMIT 10 OFFSET 1000;");
 ----
 <FILE>:test/answers/clickbench/q40.csv
 
 # Q41
 query I
-call gpu_processing("SELECT URLHash, EventDate, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND TraficSourceID IN (-1, 6) AND RefererHash = 3594120000172545465 GROUP BY URLHash, EventDate ORDER BY PageViews DESC LIMIT 10 OFFSET 100;");
+call gpu_processing("SELECT URLHash, EventDate, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND TraficSourceID IN (-1, 6) AND RefererHash = 3594120000172545465 GROUP BY URLHash, EventDate ORDER BY PageViews DESC, URLHash, EventDate LIMIT 10 OFFSET 100;");
 ----
 <FILE>:test/answers/clickbench/q41.csv
 
 # Q42
 query I
-call gpu_processing("SELECT WindowClientWidth, WindowClientHeight, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND DontCountHits = 0 AND URLHash = 2868770270353813622 GROUP BY WindowClientWidth, WindowClientHeight ORDER BY PageViews DESC LIMIT 10 OFFSET 10000;");
+call gpu_processing("SELECT WindowClientWidth, WindowClientHeight, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND DontCountHits = 0 AND URLHash = 2868770270353813622 GROUP BY WindowClientWidth, WindowClientHeight ORDER BY PageViews DESC, WindowClientHeight, WindowClientWidth LIMIT 10 OFFSET 10000;");
 ----
 <FILE>:test/answers/clickbench/q42.csv
 

@@ -1358,6 +1358,11 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
 
   //Find table name in the buffer manager
   auto gpuBufferManager = &(GPUBufferManager::GetInstance());
+  SIRIUS_LOG_DEBUG("Buffer Manager has {} cached tables", gpuBufferManager->tables.size());
+  for (const auto& curr_pair : gpuBufferManager->tables) {
+    SIRIUS_LOG_DEBUG("Buffer Manager Cached Table {}", curr_pair.first);
+  }
+
   transform(table_name.begin(), table_name.end(), table_name.begin(), ::toupper);
   SIRIUS_LOG_DEBUG("Table Scanning {}", table_name);
   auto it = gpuBufferManager->tables.find(table_name);
