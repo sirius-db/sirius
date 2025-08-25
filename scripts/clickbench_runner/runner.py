@@ -20,6 +20,11 @@ default_duckdb_db_path = os.path.join(sirius_path, "clickbench.duckdb")
 default_result_save_path = os.path.join(os.path.dirname(current_path), "result.csv")
 default_output_save_path = os.path.join(os.path.dirname(current_path), "output.txt")
 
+# For q24 we need a large enough cache size to hold the entire dataset
+q24_caching_region_size = "80 GB"
+q24_processing_region_size = "15 GB"
+q24_cpu_processing_region_size = "100 GB"
+
 def load_args():
     parser = argparse.ArgumentParser(description="Script to run clickbench queries against a DuckDB database.")
     parser.add_argument("--sirius_exec_path", type=str, default=default_sirius_exec_path, help="Path to the Sirius executable.")
@@ -79,7 +84,10 @@ def benchmark_query(args, query_to_run, query_label):
     query_temp_file_path = query_temp_file.name
     with open(query_temp_file_path, 'w+') as writer:
         writer.write(".timer on\n")
-        writer.write(f"call gpu_buffer_init('{args.caching_region_size}', '{args.processing_region_size}');\n")
+        if (query_label == 'query24'):
+            writer.write(f"call gpu_buffer_init('{q24_caching_region_size}', '{q24_processing_region_size}', pinned_memory_size = '{q24_cpu_processing_region_size}');\n")
+        else:
+            writer.write(f"call gpu_buffer_init('{args.caching_region_size}', '{args.processing_region_size}');\n")
         for _ in range(args.num_warm_runs + 1):
             writer.write(f'call gpu_processing("{query_to_run}");\n')
 

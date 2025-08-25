@@ -667,9 +667,11 @@ public:
       }
       if (num_rows_unaligned > 0) {
         for (int col = 0; col < op.orig_column_ids.size() - op.gen_row_id_column; col++) {
-          auto &validity = FlatVector::Validity(chunk->data[col]);
-          unaligned_mask_bytes[col] = (validity.GetData() == nullptr) ? 0xff
-            : reinterpret_cast<uint8_t*>(validity.GetData())[num_rows_aligned / 8];
+          if (!op.already_cached[col]) {
+            auto &validity = FlatVector::Validity(chunk->data[col]);
+            unaligned_mask_bytes[col] = (validity.GetData() == nullptr) ? 0xff
+              : reinterpret_cast<uint8_t*>(validity.GetData())[num_rows_aligned / 8];
+          }
         }
         g_state_scan.NextChunkOffsetsUnaligned(num_rows_unaligned, chunk_column_sizes_unaligned,
                                                &row_offset_unaligned, column_data_offsets_unaligned,
@@ -846,8 +848,10 @@ GPUPhysicalTableScan::GetDataDuckDBOpt(ExecutionContext &exec_context) {
                                     total_size, gpuBufferManager->cache_size_per_gpu);
       }
       gpuBufferManager->ResetCache();
+      uncached_scan_column_ids.clear();
       for (int col = 0; col < column_ids.size() - gen_row_id_column; col++) {
         already_cached[col] = false;
+        uncached_scan_column_ids.push_back(column_ids[col].GetPrimaryIndex());
         gpuBufferManager->createTableAndColumnInGPU(catalog_table, exec_context.client, table_name, names[column_ids[col].GetPrimaryIndex()]);
       }
     } else {

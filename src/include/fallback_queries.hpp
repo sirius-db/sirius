@@ -24,7 +24,6 @@
 namespace duckdb {
 
 std::unordered_map<std::string, std::string> FALLBACK_QUERIES = {
-  {"SELECT * FROM hits WHERE URL LIKE '%google%' ORDER BY EventTime LIMIT 10;", "ClickBench Q24"}
 };
 
 void check_fallback_queries(const std::string& query) {
