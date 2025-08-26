@@ -1,0 +1,28 @@
+name: Sirius Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - name: Cleanup
+        run: |
+          pwd
+          rm -rf *
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          submodules: recursive
+          fetch-depth: 0
+      - name: Setup
+        run: |
+          source setup_sirius.sh
+      - name: Build
+        run: |
+          export LIBCUDF_ENV_PREFIX=~/miniconda3/envs/libcudf-env
+          source ~/miniconda3/etc/profile.d/conda.sh
+          conda activate libcudf-env
+          make -j$(nproc)
