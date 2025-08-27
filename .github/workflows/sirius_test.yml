@@ -2,6 +2,10 @@ name: Sirius Test
 
 on: [push, pull_request, workflow_dispatch]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.ref != 'refs/heads/main' || github.sha }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: [self-hosted, Linux, X64]
@@ -12,7 +16,6 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: main
           submodules: recursive
           fetch-depth: 0
       - name: Setup
