@@ -82,6 +82,53 @@ struct ComparisonDispatcher
     }
   }
 
+  // Scalar comparison operator for decimal types
+  template <typename T>
+  std::unique_ptr<cudf::column> DoScalarComparison(const cudf::column_view& left,
+                                                   typename T::rep right_value,
+                                                   numeric::scale_type scale,
+                                                   const cudf::data_type& return_type) {
+    std::unique_ptr<cudf::scalar> right_decimal_scalar;
+    if (left.type().id() == cudf::type_to_id<T>()) {
+      right_decimal_scalar = std::make_unique<cudf::fixed_point_scalar<T>>(
+        right_value, scale, true, executor.execution_stream, executor.resource_ref);
+    } else {
+      // If types are different, need to construct `right_decimal_scalar` using `left.type()`
+      switch (left.type().id()) {
+        case cudf::type_id::DECIMAL32: {
+          if (right_value > std::numeric_limits<int32_t>::max()) {
+            throw InternalException("Cannot cast right decimal scalar to decimal32, value greater than INT32_MAX");
+          }
+          right_decimal_scalar = std::make_unique<cudf::fixed_point_scalar<numeric::decimal32>>(
+            static_cast<int32_t>(right_value), scale, true, executor.execution_stream, executor.resource_ref);
+          break;
+        }
+        case cudf::type_id::DECIMAL64: {
+          if (right_value > std::numeric_limits<int64_t>::max()) {
+            throw InternalException("Cannot cast right decimal scalar to decimal64, value greater than INT64_MAX");
+          }
+          right_decimal_scalar = std::make_unique<cudf::fixed_point_scalar<numeric::decimal64>>(
+            static_cast<int64_t>(right_value), scale, true, executor.execution_stream, executor.resource_ref);
+          break;
+        }
+        case cudf::type_id::DECIMAL128: {
+          right_decimal_scalar = std::make_unique<cudf::fixed_point_scalar<numeric::decimal128>>(
+            static_cast<__int128_t>(right_value), scale, true, executor.execution_stream, executor.resource_ref);
+          break;
+        }
+        default:
+          throw InternalException("Left column is not decimal with right decimal constant in `DoRightScalarBinaryOp`: %d",
+                                  static_cast<int>(left.type().id()));
+      }
+    }
+    return cudf::binary_operation(left,
+                                  *right_decimal_scalar,
+                                  ComparisonOp,
+                                  return_type,
+                                  executor.execution_stream,
+                                  executor.resource_ref);
+  }
+
   // Dispatch operator
   std::unique_ptr<cudf::column> operator()(const BoundComparisonExpression& expr,
                                            GpuExpressionState* state)
@@ -125,6 +172,24 @@ struct ComparisonDispatcher
           return DoScalarComparison<std::string>(left->view(),
                                                  right_value.GetValue<std::string>(),
                                                  return_type);
+        case cudf::type_id::DECIMAL32:
+          // cudf decimal type uses negative scale, same for below
+          return DoScalarComparison<numeric::decimal32>(
+            left->view(), right_value.GetValueUnsafe<int32_t>(),
+            numeric::scale_type{-duckdb::DecimalType::GetScale(right_value.type())},
+            return_type);
+        case cudf::type_id::DECIMAL64:
+          return DoScalarComparison<numeric::decimal64>(
+            left->view(), right_value.GetValueUnsafe<int64_t>(),
+            numeric::scale_type{-duckdb::DecimalType::GetScale(right_value.type())},
+            return_type);
+        case cudf::type_id::DECIMAL128: {
+          duckdb::hugeint_t hugeint_value = right_value.GetValueUnsafe<duckdb::hugeint_t>();
+          return DoScalarComparison<numeric::decimal128>(
+            left->view(), (__int128_t(hugeint_value.upper) << 64) | hugeint_value.lower,
+            numeric::scale_type{-duckdb::DecimalType::GetScale(right_value.type())},
+            return_type);
+        }
         default:
           throw InternalException("Execute[Comparison]: Unsupported constant type for comparison: %d!",
             static_cast<int>(GpuExpressionState::GetCudfType(expr.right->return_type).id()));
