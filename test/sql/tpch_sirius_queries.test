@@ -12,7 +12,7 @@
 # the License.
 # =============================================================================
 
-# name: test/sql/sirius_queries.test
+# name: test/sql/tpch_sirius_queries.test
 # description: test TPC-H queries with GPU processing
 # group: [sirius]
 
@@ -168,7 +168,7 @@ order by
   l_returnflag,
   l_linestatus;");
 ----
-<FILE>:test/answers/q1.csv
+<FILE>:test/answers/tpch/q1.csv
 
 #Q2
 query I
@@ -216,7 +216,7 @@ order by
   s_name,
   p_partkey");
 ----
-<FILE>:test/answers/q2.csv
+<FILE>:test/answers/tpch/q2.csv
 
 #Q3
 query I
@@ -243,7 +243,7 @@ order by
   revenue desc,
   o_orderdate");
 ----
-<FILE>:test/answers/q3.csv
+<FILE>:test/answers/tpch/q3.csv
 
 #Q4
 query I
@@ -269,7 +269,7 @@ group by
 order by
   o_orderpriority;");
 ----
-<FILE>:test/answers/q4.csv
+<FILE>:test/answers/tpch/q4.csv
 
 #Q5
 query I
@@ -298,7 +298,7 @@ group by
 order by
   revenue desc;");
 ----
-<FILE>:test/answers/q5.csv
+<FILE>:test/answers/tpch/q5.csv
 
 #Q6
 query I
@@ -312,7 +312,7 @@ where
   and l_discount between 0.05 and 0.07
   and l_quantity < 24;");
 ----
-<FILE>:test/answers/q6.csv
+<FILE>:test/answers/tpch/q6.csv
 
 #Q7
 query I
@@ -355,7 +355,7 @@ order by
   cust_nation,
   l_year;");
 ----
-<FILE>:test/answers/q7.csv
+<FILE>:test/answers/tpch/q7.csv
 
 #Q8
 query I
@@ -397,7 +397,7 @@ group by
 order by
   o_year;");
 ----
-<FILE>:test/answers/q8.csv
+<FILE>:test/answers/tpch/q8.csv
 
 #Q9
 query I
@@ -433,7 +433,7 @@ order by
   nation,
   o_year desc;");
 ----
-<FILE>:test/answers/q9.csv
+<FILE>:test/answers/tpch/q9.csv
 
 #Q10
 query I
@@ -470,7 +470,7 @@ order by
   c_custkey,
   revenue desc;");
 ----
-<FILE>:test/answers/q10.csv
+<FILE>:test/answers/tpch/q10.csv
 
 #Q11
 query I
@@ -508,7 +508,7 @@ order by
   value desc,
   ps_partkey;");
 ----
-<FILE>:test/answers/q11.csv
+<FILE>:test/answers/tpch/q11.csv
 
 #Q12
 query I
@@ -541,7 +541,7 @@ group by
 order by
   l_shipmode;");
 ----
-<FILE>:test/answers/q12.csv
+<FILE>:test/answers/tpch/q12.csv
 
 #Q13
 query I
@@ -566,7 +566,7 @@ order by
   custdist desc,
   c_count desc;");
 ----
-<FILE>:test/answers/q13.csv
+<FILE>:test/answers/tpch/q13.csv
 
 #Q14
 query I
@@ -584,7 +584,7 @@ where
   and l_shipdate >= 19950901
   and l_shipdate <= 19950931;");
 ----
-<FILE>:test/answers/q14.csv
+<FILE>:test/answers/tpch/q14.csv
 
 #Q15
 query I
@@ -617,7 +617,7 @@ where
 order by
   s_suppkey;");
 ----
-<FILE>:test/answers/q15.csv
+<FILE>:test/answers/tpch/q15.csv
 
 #Q16
 query I
@@ -652,7 +652,7 @@ order by
   p_type,
   p_size;");
 ----
-<FILE>:test/answers/q16.csv
+<FILE>:test/answers/tpch/q16.csv
 
 #Q17
 query I
@@ -674,7 +674,7 @@ where
       l_partkey = p_partkey
   );");
 ----
-<FILE>:test/answers/q17.csv
+<FILE>:test/answers/tpch/q17.csv
 
 #Q18
 query I
@@ -713,7 +713,7 @@ order by
   o_orderdate,
   o_orderkey;");
 ----
-<FILE>:test/answers/q18.csv
+<FILE>:test/answers/tpch/q18.csv
 
 #Q19
 query I
@@ -753,7 +753,7 @@ where
     )
   );");
 ----
-<FILE>:test/answers/q19.csv
+<FILE>:test/answers/tpch/q19.csv
 
 #Q20
 query I
@@ -794,7 +794,7 @@ where
   order by
     s_name;");
 ----
-<FILE>:test/answers/q20.csv
+<FILE>:test/answers/tpch/q20.csv
 
 #Q21
 query I
@@ -838,7 +838,7 @@ order by
   numwait desc,
   s_name;");
 ----
-<FILE>:test/answers/q21.csv
+<FILE>:test/answers/tpch/q21.csv
 
 #Q22
 query I
@@ -877,4 +877,4 @@ group by
 order by
   cntrycode;");
 ----
-<FILE>:test/answers/q22.csv
+<FILE>:test/answers/tpch/q22.csv

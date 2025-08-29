@@ -1,0 +1,399 @@
+# =============================================================================
+# Copyright 2025, Sirius Contributors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
+# in compliance with the License. You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software distributed under the License
+# is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+# or implied. See the License for the specific language governing permissions and limitations under
+# the License.
+# =============================================================================
+
+# name: test/sql/clickbench_sirius_queries.test
+# description: test clickbench queries with GPU processing
+# group: [sirius]
+
+# Load required extensions
+require sirius
+
+require substrait
+
+# Load clickbench data
+statement ok
+CREATE TABLE hits
+(
+    WatchID BIGINT NOT NULL,
+    JavaEnable SMALLINT NOT NULL,
+    Title TEXT,
+    GoodEvent SMALLINT NOT NULL,
+    EventTime TIMESTAMP NOT NULL,
+    EventDate Date NOT NULL,
+    CounterID INTEGER NOT NULL,
+    ClientIP INTEGER NOT NULL,
+    RegionID INTEGER NOT NULL,
+    UserID BIGINT NOT NULL,
+    CounterClass SMALLINT NOT NULL,
+    OS SMALLINT NOT NULL,
+    UserAgent SMALLINT NOT NULL,
+    URL TEXT,
+    Referer TEXT,
+    IsRefresh SMALLINT NOT NULL,
+    RefererCategoryID SMALLINT NOT NULL,
+    RefererRegionID INTEGER NOT NULL,
+    URLCategoryID SMALLINT NOT NULL,
+    URLRegionID INTEGER NOT NULL,
+    ResolutionWidth SMALLINT NOT NULL,
+    ResolutionHeight SMALLINT NOT NULL,
+    ResolutionDepth SMALLINT NOT NULL,
+    FlashMajor SMALLINT NOT NULL,
+    FlashMinor SMALLINT NOT NULL,
+    FlashMinor2 TEXT,
+    NetMajor SMALLINT NOT NULL,
+    NetMinor SMALLINT NOT NULL,
+    UserAgentMajor SMALLINT NOT NULL,
+    UserAgentMinor VARCHAR(255) NOT NULL,
+    CookieEnable SMALLINT NOT NULL,
+    JavascriptEnable SMALLINT NOT NULL,
+    IsMobile SMALLINT NOT NULL,
+    MobilePhone SMALLINT NOT NULL,
+    MobilePhoneModel TEXT,
+    Params TEXT,
+    IPNetworkID INTEGER NOT NULL,
+    TraficSourceID SMALLINT NOT NULL,
+    SearchEngineID SMALLINT NOT NULL,
+    SearchPhrase TEXT,
+    AdvEngineID SMALLINT NOT NULL,
+    IsArtifical SMALLINT NOT NULL,
+    WindowClientWidth SMALLINT NOT NULL,
+    WindowClientHeight SMALLINT NOT NULL,
+    ClientTimeZone SMALLINT NOT NULL,
+    ClientEventTime TIMESTAMP NOT NULL,
+    SilverlightVersion1 SMALLINT NOT NULL,
+    SilverlightVersion2 SMALLINT NOT NULL,
+    SilverlightVersion3 INTEGER NOT NULL,
+    SilverlightVersion4 SMALLINT NOT NULL,
+    PageCharset TEXT,
+    CodeVersion INTEGER NOT NULL,
+    IsLink SMALLINT NOT NULL,
+    IsDownload SMALLINT NOT NULL,
+    IsNotBounce SMALLINT NOT NULL,
+    FUniqID BIGINT NOT NULL,
+    OriginalURL TEXT,
+    HID INTEGER NOT NULL,
+    IsOldCounter SMALLINT NOT NULL,
+    IsEvent SMALLINT NOT NULL,
+    IsParameter SMALLINT NOT NULL,
+    DontCountHits SMALLINT NOT NULL,
+    WithHash SMALLINT NOT NULL,
+    HitColor CHAR NOT NULL,
+    LocalEventTime TIMESTAMP NOT NULL,
+    Age SMALLINT NOT NULL,
+    Sex SMALLINT NOT NULL,
+    Income SMALLINT NOT NULL,
+    Interests SMALLINT NOT NULL,
+    Robotness SMALLINT NOT NULL,
+    RemoteIP INTEGER NOT NULL,
+    WindowName INTEGER NOT NULL,
+    OpenerName INTEGER NOT NULL,
+    HistoryLength SMALLINT NOT NULL,
+    BrowserLanguage TEXT,
+    BrowserCountry TEXT,
+    SocialNetwork TEXT,
+    SocialAction TEXT,
+    HTTPError SMALLINT NOT NULL,
+    SendTiming INTEGER NOT NULL,
+    DNSTiming INTEGER NOT NULL,
+    ConnectTiming INTEGER NOT NULL,
+    ResponseStartTiming INTEGER NOT NULL,
+    ResponseEndTiming INTEGER NOT NULL,
+    FetchTiming INTEGER NOT NULL,
+    SocialSourceNetworkID SMALLINT NOT NULL,
+    SocialSourcePage TEXT,
+    ParamPrice BIGINT NOT NULL,
+    ParamOrderID TEXT,
+    ParamCurrency TEXT,
+    ParamCurrencyID SMALLINT NOT NULL,
+    OpenstatServiceName TEXT,
+    OpenstatCampaignID TEXT,
+    OpenstatAdID TEXT,
+    OpenstatSourceID TEXT,
+    UTMSource TEXT,
+    UTMMedium TEXT,
+    UTMCampaign TEXT,
+    UTMContent TEXT,
+    UTMTerm TEXT,
+    FromTag TEXT,
+    HasGCLID SMALLINT NOT NULL,
+    RefererHash BIGINT NOT NULL,
+    URLHash BIGINT NOT NULL,
+    CLID INTEGER NOT NULL
+);
+
+statement ok
+COPY hits FROM 'test_datasets/test_hits.tsv' (QUOTE '');
+
+# Initialize GPU region
+
+statement ok
+call gpu_buffer_init("2 GB", "2 GB");
+
+# Q1
+query I
+call gpu_processing("SELECT COUNT(*) AS total FROM hits;");
+----
+<FILE>:test/answers/clickbench/q1.csv
+
+# Q2
+query I
+call gpu_processing("SELECT COUNT(*) AS total FROM hits WHERE AdvEngineID <> 0;");
+----
+<FILE>:test/answers/clickbench/q2.csv
+
+# Q3
+query I
+call gpu_processing("SELECT SUM(AdvEngineID) AS sum, COUNT(*) AS count, AVG(ResolutionWidth) AS average FROM hits;");
+----
+<FILE>:test/answers/clickbench/q3.csv
+
+# Q4
+query I
+call gpu_processing("SELECT AVG(UserID) AS average FROM hits;");
+----
+<FILE>:test/answers/clickbench/q4.csv
+
+# Q5
+query I
+call gpu_processing("SELECT COUNT(DISTINCT UserID) AS c_dist FROM hits;");
+----
+<FILE>:test/answers/clickbench/q5.csv
+
+# Q6
+query I
+call gpu_processing("SELECT COUNT(DISTINCT SearchPhrase) AS c_dist FROM hits;");
+----
+<FILE>:test/answers/clickbench/q6.csv
+
+# Q7
+query I
+call gpu_processing("SELECT MIN(EventDate) AS min_date, MAX(EventDate) AS max_date FROM hits;");
+----
+<FILE>:test/answers/clickbench/q7.csv
+
+# Q8
+query I
+call gpu_processing("SELECT AdvEngineID, COUNT(*) AS count FROM hits WHERE AdvEngineID <> 0 GROUP BY AdvEngineID ORDER BY count DESC;");
+----
+<FILE>:test/answers/clickbench/q8.csv
+
+# Q9
+query I
+call gpu_processing("SELECT RegionID, COUNT(DISTINCT UserID) AS u FROM hits GROUP BY RegionID ORDER BY u DESC LIMIT 10;");
+----
+<FILE>:test/answers/clickbench/q9.csv
+
+# Q10
+query I
+call gpu_processing("SELECT RegionID, SUM(AdvEngineID) AS sum, COUNT(*) AS c, AVG(ResolutionWidth) AS avg, COUNT(DISTINCT UserID) AS c_dist FROM hits GROUP BY RegionID ORDER BY c DESC LIMIT 10;");
+----
+<FILE>:test/answers/clickbench/q10.csv
+
+# Q11
+query I
+call gpu_processing("SELECT MobilePhoneModel, COUNT(DISTINCT UserID) AS u FROM hits WHERE MobilePhoneModel <> '' GROUP BY MobilePhoneModel ORDER BY u DESC, MobilePhoneModel DESC LIMIT 10;");
+----
+<FILE>:test/answers/clickbench/q11.csv
+
+# Q12
+query I
+call gpu_processing("SELECT MobilePhone, MobilePhoneModel, COUNT(DISTINCT UserID) AS u FROM hits WHERE MobilePhoneModel <> '' GROUP BY MobilePhone, MobilePhoneModel ORDER BY u DESC LIMIT 10;");
+----
+<FILE>:test/answers/clickbench/q12.csv
+
+# Q13
+query I
+call gpu_processing("SELECT SearchPhrase, COUNT(*) AS c FROM hits WHERE SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10;");
+----
+<FILE>:test/answers/clickbench/q13.csv
+
+# Q14
+query I
+call gpu_processing("SELECT SearchPhrase, COUNT(DISTINCT UserID) AS u FROM hits WHERE SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY u DESC LIMIT 10;");
+----
+<FILE>:test/answers/clickbench/q14.csv
+
+# Q15
+query I
+call gpu_processing("SELECT SearchEngineID, SearchPhrase, COUNT(*) AS c FROM hits WHERE SearchPhrase <> '' GROUP BY SearchEngineID, SearchPhrase ORDER BY c DESC LIMIT 10;");
+----
+<FILE>:test/answers/clickbench/q15.csv
+
+# Q16
+query I
+call gpu_processing("SELECT UserID, COUNT(*) AS count FROM hits GROUP BY UserID ORDER BY COUNT(*) DESC LIMIT 10;");
+----
+<FILE>:test/answers/clickbench/q16.csv
+
+# Q17
+query I
+call gpu_processing("SELECT UserID, SearchPhrase, COUNT(*) AS count FROM hits GROUP BY UserID, SearchPhrase ORDER BY COUNT(*) DESC LIMIT 10;");
+----
+<FILE>:test/answers/clickbench/q17.csv
+
+# Q18
+query I
+call gpu_processing("SELECT UserID, SearchPhrase, COUNT(*) AS count FROM hits GROUP BY UserID, SearchPhrase ORDER BY UserID, SearchPhrase, count LIMIT 10;");
+----
+<FILE>:test/answers/clickbench/q18.csv
+
+# Q19
+query I
+call gpu_processing("SELECT UserID, extract(minute FROM EventTime) AS m, SearchPhrase, COUNT(*) FROM hits GROUP BY UserID, m, SearchPhrase ORDER BY COUNT(*) DESC, m, SearchPhrase, UserID LIMIT 10;");
+----
+<FILE>:test/answers/clickbench/q19.csv
+
+# Q20
+query I
+call gpu_processing("SELECT UserID FROM hits WHERE UserID = 435090932899640449;");
+----
+<FILE>:test/answers/clickbench/q20.csv
+
+# Q21
+query I
+call gpu_processing("SELECT COUNT(*) AS count FROM hits WHERE URL LIKE '%google%';");
+----
+<FILE>:test/answers/clickbench/q21.csv
+
+# Q22
+query I
+call gpu_processing("SELECT SearchPhrase, MIN(URL) AS min, COUNT(*) AS c FROM hits WHERE URL LIKE '%google%' AND SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10;");
+----
+<FILE>:test/answers/clickbench/q22.csv
+
+# Q23
+query I
+call gpu_processing("SELECT SearchPhrase, MIN(URL) AS min_url, MIN(Title) AS min_title, COUNT(*) AS c, COUNT(DISTINCT UserID) AS c_distinct FROM hits WHERE Title LIKE '%Google%' AND URL NOT LIKE '%.google.%' AND SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c DESC, SearchPhrase, min_url, min_title LIMIT 10;");
+----
+<FILE>:test/answers/clickbench/q23.csv
+
+# Q24
+query I
+call gpu_processing("SELECT * FROM hits WHERE URL LIKE '%google%' ORDER BY EventTime LIMIT 10;");
+----
+<FILE>:test/answers/clickbench/q24.csv
+
+# Q25
+query I
+call gpu_processing("SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '' ORDER BY EventTime LIMIT 10;");
+----
+<FILE>:test/answers/clickbench/q25.csv
+
+# Q26
+query I
+call gpu_processing("SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '' ORDER BY SearchPhrase LIMIT 10;");
+----
+<FILE>:test/answers/clickbench/q26.csv
+
+# Q27
+query I
+call gpu_processing("SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '' ORDER BY EventTime, SearchPhrase LIMIT 10;");
+----
+<FILE>:test/answers/clickbench/q27.csv
+
+# Q28
+query I
+call gpu_processing("SELECT CounterID, AVG(STRLEN(URL)) AS l, COUNT(*) AS c FROM hits WHERE URL <> '' GROUP BY CounterID HAVING COUNT(*) > 100000 ORDER BY l DESC LIMIT 25;");
+----
+<FILE>:test/answers/clickbench/q28.csv
+
+# Q29
+query I
+call gpu_processing("SELECT REGEXP_REPLACE(Referer, '^https?://(?:www\.)?([^/]+)/.*$', '\1') AS k, AVG(STRLEN(Referer)) AS l, COUNT(*) AS c, MIN(Referer) AS min FROM hits WHERE Referer <> '' GROUP BY k HAVING COUNT(*) > 100000 ORDER BY l DESC LIMIT 25;");
+----
+<FILE>:test/answers/clickbench/q29.csv
+
+# Q30
+query I
+call gpu_processing("SELECT SUM(ResolutionWidth), SUM(ResolutionWidth + 1), SUM(ResolutionWidth + 2), SUM(ResolutionWidth + 3), SUM(ResolutionWidth + 4), SUM(ResolutionWidth + 5), SUM(ResolutionWidth + 6), SUM(ResolutionWidth + 7), SUM(ResolutionWidth + 8), SUM(ResolutionWidth + 9), SUM(ResolutionWidth + 10), SUM(ResolutionWidth + 11), SUM(ResolutionWidth + 12), SUM(ResolutionWidth + 13), SUM(ResolutionWidth + 14), SUM(ResolutionWidth + 15), SUM(ResolutionWidth + 16), SUM(ResolutionWidth + 17), SUM(ResolutionWidth + 18), SUM(ResolutionWidth + 19), SUM(ResolutionWidth + 20), SUM(ResolutionWidth + 21), SUM(ResolutionWidth + 22), SUM(ResolutionWidth + 23), SUM(ResolutionWidth + 24), SUM(ResolutionWidth + 25), SUM(ResolutionWidth + 26), SUM(ResolutionWidth + 27), SUM(ResolutionWidth + 28), SUM(ResolutionWidth + 29), SUM(ResolutionWidth + 30), SUM(ResolutionWidth + 31), SUM(ResolutionWidth + 32), SUM(ResolutionWidth + 33), SUM(ResolutionWidth + 34), SUM(ResolutionWidth + 35), SUM(ResolutionWidth + 36), SUM(ResolutionWidth + 37), SUM(ResolutionWidth + 38), SUM(ResolutionWidth + 39), SUM(ResolutionWidth + 40), SUM(ResolutionWidth + 41), SUM(ResolutionWidth + 42), SUM(ResolutionWidth + 43), SUM(ResolutionWidth + 44), SUM(ResolutionWidth + 45), SUM(ResolutionWidth + 46), SUM(ResolutionWidth + 47), SUM(ResolutionWidth + 48), SUM(ResolutionWidth + 49), SUM(ResolutionWidth + 50), SUM(ResolutionWidth + 51), SUM(ResolutionWidth + 52), SUM(ResolutionWidth + 53), SUM(ResolutionWidth + 54), SUM(ResolutionWidth + 55), SUM(ResolutionWidth + 56), SUM(ResolutionWidth + 57), SUM(ResolutionWidth + 58), SUM(ResolutionWidth + 59), SUM(ResolutionWidth + 60), SUM(ResolutionWidth + 61), SUM(ResolutionWidth + 62), SUM(ResolutionWidth + 63), SUM(ResolutionWidth + 64), SUM(ResolutionWidth + 65), SUM(ResolutionWidth + 66), SUM(ResolutionWidth + 67), SUM(ResolutionWidth + 68), SUM(ResolutionWidth + 69), SUM(ResolutionWidth + 70), SUM(ResolutionWidth + 71), SUM(ResolutionWidth + 72), SUM(ResolutionWidth + 73), SUM(ResolutionWidth + 74), SUM(ResolutionWidth + 75), SUM(ResolutionWidth + 76), SUM(ResolutionWidth + 77), SUM(ResolutionWidth + 78), SUM(ResolutionWidth + 79), SUM(ResolutionWidth + 80), SUM(ResolutionWidth + 81), SUM(ResolutionWidth + 82), SUM(ResolutionWidth + 83), SUM(ResolutionWidth + 84), SUM(ResolutionWidth + 85), SUM(ResolutionWidth + 86), SUM(ResolutionWidth + 87), SUM(ResolutionWidth + 88), SUM(ResolutionWidth + 89) FROM hits;");
+----
+<FILE>:test/answers/clickbench/q30.csv
+
+# Q31
+query I
+call gpu_processing("SELECT SearchEngineID, ClientIP, COUNT(*) AS c, SUM(IsRefresh) AS sum, AVG(ResolutionWidth) AS avg FROM hits WHERE SearchPhrase <> '' GROUP BY SearchEngineID, ClientIP ORDER BY c DESC, SearchEngineID, ClientIP, avg, sum LIMIT 10;");
+----
+<FILE>:test/answers/clickbench/q31.csv
+
+# Q32
+query I
+call gpu_processing("SELECT WatchID, ClientIP, COUNT(*) AS c, SUM(IsRefresh) AS sum, AVG(ResolutionWidth) AS avg FROM hits WHERE SearchPhrase <> '' GROUP BY WatchID, ClientIP ORDER BY c DESC, ClientIP, WatchID, sum, avg LIMIT 10;");
+----
+<FILE>:test/answers/clickbench/q32.csv
+
+# Q33
+query I
+call gpu_processing("SELECT WatchID, ClientIP, COUNT(*) AS c, SUM(IsRefresh) AS sum, AVG(ResolutionWidth) AS avg FROM hits GROUP BY WatchID, ClientIP ORDER BY c DESC, WatchID, ClientIP, avg, sum LIMIT 10;");
+----
+<FILE>:test/answers/clickbench/q33.csv
+
+# Q34
+query I
+call gpu_processing("SELECT URL, COUNT(*) AS c FROM hits GROUP BY URL ORDER BY c DESC LIMIT 10;");
+----
+<FILE>:test/answers/clickbench/q34.csv
+
+# Q35
+query I
+call gpu_processing("SELECT 1, URL, COUNT(*) AS c FROM hits GROUP BY 1, URL ORDER BY c DESC LIMIT 10;");
+----
+<FILE>:test/answers/clickbench/q35.csv
+
+# Q36
+query I
+call gpu_processing("SELECT ClientIP, ClientIP - 1, ClientIP - 2, ClientIP - 3, COUNT(*) AS c FROM hits GROUP BY ClientIP, ClientIP - 1, ClientIP - 2, ClientIP - 3 ORDER BY c DESC LIMIT 10;");
+----
+<FILE>:test/answers/clickbench/q36.csv
+
+# Q37
+query I
+call gpu_processing("SELECT URL, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND DontCountHits = 0 AND IsRefresh = 0 AND URL <> '' GROUP BY URL ORDER BY PageViews DESC LIMIT 10;");
+----
+<FILE>:test/answers/clickbench/q37.csv
+
+# Q38
+query I
+call gpu_processing("SELECT Title, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND DontCountHits = 0 AND IsRefresh = 0 AND Title <> '' GROUP BY Title ORDER BY PageViews DESC LIMIT 10;");
+----
+<FILE>:test/answers/clickbench/q38.csv
+
+# Q39
+query I
+call gpu_processing("SELECT URL, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND IsLink <> 0 AND IsDownload = 0 GROUP BY URL ORDER BY PageViews DESC, URL LIMIT 10 OFFSET 1000;");
+----
+<FILE>:test/answers/clickbench/q39.csv
+
+# Q40
+query I
+call gpu_processing("SELECT TraficSourceID, SearchEngineID, AdvEngineID, CASE WHEN (SearchEngineID = 0 AND AdvEngineID = 0) THEN Referer ELSE '' END AS Src, URL AS Dst, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 GROUP BY TraficSourceID, SearchEngineID, AdvEngineID, Src, Dst ORDER BY PageViews DESC, TraficSourceID, SearchEngineID, AdvEngineID, Src, Dst LIMIT 10 OFFSET 1000;");
+----
+<FILE>:test/answers/clickbench/q40.csv
+
+# Q41
+query I
+call gpu_processing("SELECT URLHash, EventDate, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND TraficSourceID IN (-1, 6) AND RefererHash = 3594120000172545465 GROUP BY URLHash, EventDate ORDER BY PageViews DESC, URLHash, EventDate LIMIT 10 OFFSET 100;");
+----
+<FILE>:test/answers/clickbench/q41.csv
+
+# Q42
+query I
+call gpu_processing("SELECT WindowClientWidth, WindowClientHeight, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND IsRefresh = 0 AND DontCountHits = 0 AND URLHash = 2868770270353813622 GROUP BY WindowClientWidth, WindowClientHeight ORDER BY PageViews DESC, WindowClientHeight, WindowClientWidth LIMIT 10 OFFSET 10000;");
+----
+<FILE>:test/answers/clickbench/q42.csv
+
+# Q43
+query I
+call gpu_processing("SELECT DATE_TRUNC('minute', EventTime) AS M, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-14' AND EventDate <= '2013-07-15' AND IsRefresh = 0 AND DontCountHits = 0 GROUP BY DATE_TRUNC('minute', EventTime) ORDER BY DATE_TRUNC('minute', EventTime) LIMIT 10 OFFSET 1000;");
+----
+<FILE>:test/answers/clickbench/q43.csv
