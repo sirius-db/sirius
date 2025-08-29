@@ -665,7 +665,8 @@ GPUBufferManager::customCudaHostAlloc(size_t size) {
 
 void
 GPUBufferManager::createTableAndColumnInGPU(Catalog& catalog, ClientContext& context, string table_name, string column_name) {
-	TableCatalogEntry &table = catalog.GetEntry(context, CatalogType::TABLE_ENTRY, DEFAULT_SCHEMA, table_name).Cast<TableCatalogEntry>();
+	SIRIUS_LOG_DEBUG("CreateTable and Column called for table {} and col {}", table_name, column_name);
+    TableCatalogEntry &table = catalog.GetEntry(context, CatalogType::TABLE_ENTRY, DEFAULT_SCHEMA, table_name).Cast<TableCatalogEntry>();
     auto column_names = table.GetColumns().GetColumnNames();
     auto& constraints = table.GetConstraints();
     vector<size_t> unique_columns;
@@ -745,6 +746,7 @@ void
 GPUBufferManager::createTable(string up_table_name, size_t column_count) {
     //we will update the length later
     //check if table already exists
+    SIRIUS_LOG_DEBUG("Crate Table called for table {} with {} cols", up_table_name, column_count);
     if (tables.find(up_table_name) == tables.end()) {
         tables[up_table_name] = make_shared_ptr<GPUIntermediateRelation>(column_count);
         tables[up_table_name]->names = up_table_name;
