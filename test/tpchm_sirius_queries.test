@@ -12,7 +12,7 @@
 # the License.
 # =============================================================================
 
-# name: test/sql/tpch_sirius_queries_mod.test
+# name: test/sql/tpchm_sirius_queries.test
 # description: test TPC-H queries with GPU processing
 # group: [sirius]
 

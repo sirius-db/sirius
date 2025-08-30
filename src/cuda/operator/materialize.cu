@@ -183,6 +183,7 @@ void materializeWithoutNull(T *a, T*& result, uint64_t *row_ids, uint64_t result
     CHECK_ERROR();
     cudaDeviceSynchronize();
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(a), 0);
+    CHECK_ERROR();
     STOP_TIMER();
 }
 
@@ -218,6 +219,7 @@ void materializeExpression(T *a, T*& result, uint64_t *row_ids, uint64_t result_
     if (mask != nullptr) {
         gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(mask), 0);
     }
+    CHECK_ERROR();
     STOP_TIMER();
 }
 
@@ -384,6 +386,7 @@ void materializeStringColumnToDuckdbFormat(shared_ptr<GPUColumn> column, char* c
     // Copy over the strings to the CPU
     column->data_wrapper.data = reinterpret_cast<uint8_t*>(column_char_write_buffer);
     cudaMemcpy((uint8_t*) column_string_write_buffer, (uint8_t*) d_column_strings, cpu_str_bytes, cudaMemcpyDeviceToHost);
+    CHECK_ERROR();
     STOP_TIMER();
 }
 
