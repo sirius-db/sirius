@@ -13,138 +13,141 @@
 -- limitations under the License.
 
 call gpu_processing("select
-  l_returnflag,
-  l_linestatus,
-  sum(l_quantity) as sum_qty,
-  sum(l_extendedprice) as sum_base_price,
-  sum(l_extendedprice * (1 - l_discount)) as sum_disc_price,
-  sum(l_extendedprice * (1 - l_discount) * (1 + l_tax)) as sum_charge,
-  avg(l_quantity) as avg_qty,
-  avg(l_extendedprice) as avg_price,
-  avg(l_discount) as avg_disc,
-  count(*) as count_order
+    l_returnflag,
+    l_linestatus,
+    sum(l_quantity) as sum_qty,
+    sum(l_extendedprice) as sum_base_price,
+    sum(l_extendedprice * (1 - l_discount)) as sum_disc_price,
+    sum(l_extendedprice * (1 - l_discount) * (1 + l_tax)) as sum_charge,
+    avg(l_quantity) as avg_qty,
+    avg(l_extendedprice) as avg_price,
+    avg(l_discount) as avg_disc,
+    count(*) as count_order
 from
-  lineitem
+    lineitem
 where
-  l_shipdate <= 19940902
+    l_shipdate <= date '1998-12-01' - interval '1200' day
 group by
-  l_returnflag,
-  l_linestatus
+    l_returnflag,
+    l_linestatus
 order by
-  l_returnflag,
-  l_linestatus;");
+    l_returnflag,
+    l_linestatus;");
 
 call gpu_processing("select
-  s_acctbal,
-  s_name,
-  n_name,
-  p_partkey,
-  p_mfgr,
-  s_address,
-  s_phone,
-  s_comment
+  s.s_acctbal,
+  s.s_name,
+  n.n_name,
+  p.p_partkey,
+  p.p_mfgr,
+  s.s_address,
+  s.s_phone,
+  s.s_comment
 from
-  part,
-  supplier,
-  partsupp,
-  nation,
-  region
+  part p,
+  supplier s,
+  partsupp ps,
+  nation n,
+  region r
 where
-  p_partkey = ps_partkey
-  and s_suppkey = ps_suppkey
-  and p_size = 15
-  and (p_type + 3) % 5 = 0
-  and s_nationkey = n_nationkey
-  and n_regionkey = r_regionkey
-  and r_name = 'EUROPE'
-  and ps_supplycost = (
+  p.p_partkey = ps.ps_partkey
+  and s.s_suppkey = ps.ps_suppkey
+  and p.p_size = 41
+  and p.p_type like '%NICKEL'
+  and s.s_nationkey = n.n_nationkey
+  and n.n_regionkey = r.r_regionkey
+  and r.r_name = 'EUROPE'
+  and ps.ps_supplycost = (
     select
-      min(ps_supplycost)
+      min(ps.ps_supplycost)
     from
-      partsupp,
-      supplier,
-      nation,
-      region
+      partsupp ps,
+      supplier s,
+      nation n,
+      region r
     where
-      p_partkey = ps_partkey
-      and s_suppkey = ps_suppkey
-      and s_nationkey = n_nationkey
-      and n_regionkey = r_regionkey
-      and r_name = 'EUROPE'
-    )
+      p.p_partkey = ps.ps_partkey
+      and s.s_suppkey = ps.ps_suppkey
+      and s.s_nationkey = n.n_nationkey
+      and n.n_regionkey = r.r_regionkey
+      and r.r_name = 'EUROPE'
+  )
 order by
-  s_acctbal desc,
-  n_name,
-  s_name,
-  p_partkey");
+  s.s_acctbal desc,
+  n.n_name,
+  s.s_name,
+  p.p_partkey
+limit 100;");
     
 call gpu_processing("select
-  l_orderkey,
-  sum(l_extendedprice * (1 - l_discount)) as revenue,
-  o_orderdate,
-  o_shippriority
+  l.l_orderkey,
+  sum(l.l_extendedprice * (1 - l.l_discount)) as revenue,
+  o.o_orderdate,
+  o.o_shippriority
 from
-  customer,
-  orders,
-  lineitem
+  customer c,
+  orders o,
+  lineitem l
 where
-  c_mktsegment = 1
-  and c_custkey = o_custkey
-  and l_orderkey = o_orderkey
-  and o_orderdate < 19950315
-  and l_shipdate > 19950315
+  c.c_mktsegment = 'HOUSEHOLD'
+  and c.c_custkey = o.o_custkey
+  and l.l_orderkey = o.o_orderkey
+  and o.o_orderdate < date '1995-03-25'
+  and l.l_shipdate > date '1995-03-25'
 group by
-  l_orderkey,
-  o_orderdate,
-  o_shippriority
+  l.l_orderkey,
+  o.o_orderdate,
+  o.o_shippriority
 order by
   revenue desc,
-  o_orderdate");
+  o.o_orderdate
+limit 10;");
 
 call gpu_processing("select
-  o_orderpriority,
+  o.o_orderpriority,
   count(*) as order_count
 from
-  orders
+  orders o
 where
-  o_orderdate >= 19930701
-  and o_orderdate <= 19930931
-  and exists (
+  o.o_orderdate >= date '1996-10-01'
+  and o.o_orderdate < date '1996-10-01' + interval '3' month
+  and
+  exists (
     select
       *
     from
-      lineitem
+      lineitem l
     where
-      l_orderkey = o_orderkey
-      and l_commitdate < l_receiptdate
-    )
+      l.l_orderkey = o.o_orderkey
+      and l.l_commitdate < l.l_receiptdate
+  )
 group by
-  o_orderpriority
+  o.o_orderpriority
 order by
-  o_orderpriority;");
+  o.o_orderpriority;");
 
 call gpu_processing("select
-  n_name,
-  sum(l_extendedprice * (1 - l_discount)) as revenue
+  n.n_name,
+  sum(l.l_extendedprice * (1 - l.l_discount)) as revenue
 from
-  customer,
-  orders,
-  lineitem,
-  supplier,
-  nation,
-  region
+  orders o,
+  lineitem l,
+  supplier s,
+  nation n,
+  region r,
+  customer c
 where
-  c_custkey = o_custkey
-  and l_orderkey = o_orderkey
-  and l_suppkey = s_suppkey
-  and c_nationkey = s_nationkey
-  and s_nationkey = n_nationkey
-  and n_regionkey = r_regionkey
-  and r_name = 'ASIA'
-  and o_orderdate >= 19940101
-  and o_orderdate <= 19941231
+  c.c_custkey = o.o_custkey
+  and l.l_orderkey = o.o_orderkey
+  and l.l_suppkey = s.s_suppkey
+  and c.c_nationkey = s.s_nationkey
+  and s.s_nationkey = n.n_nationkey
+  and n.n_regionkey = r.r_regionkey
+  and r.r_name = 'EUROPE'
+  and o.o_orderdate >= date '1997-01-01'
+  and o.o_orderdate < date '1997-01-01' + interval '1' year
 group by
-  n_name
+  n.n_name
 order by
   revenue desc;");
 
@@ -153,9 +156,10 @@ call gpu_processing("select
 from
   lineitem
 where
-  l_shipdate >= 19940101
-  and l_shipdate <= 19941231
-  and l_discount between 0.05 and 0.07
+  l_shipdate >= date '1997-01-01'
+  and l_shipdate < date '1997-01-01' + interval '1' year
+  and
+  l_discount between 0.03 - 0.01 and 0.03 + 0.01
   and l_quantity < 24;");
 
 call gpu_processing("select
@@ -163,30 +167,31 @@ call gpu_processing("select
   cust_nation,
   l_year,
   sum(volume) as revenue
-from (
-  select
-    n1.n_name as supp_nation,
-    n2.n_name as cust_nation,
-    l_shipdate//10000 as l_year,
-    l_extendedprice * (1 - l_discount) as volume
-  from
-    supplier,
-    lineitem,
-    orders,
-    customer,
-    nation n1,
-    nation n2
-  where
-    s_suppkey = l_suppkey
-    and o_orderkey = l_orderkey
-    and c_custkey = o_custkey
-    and s_nationkey = n1.n_nationkey
-    and c_nationkey = n2.n_nationkey
-    and (
-      (n1.n_name = 'FRANCE' and n2.n_name = 'GERMANY')
-      or (n1.n_name = 'FRANCE' and n2.n_name = 'GERMANY')
-    )
-    and l_shipdate between 19950101 and 19961231
+from
+  (
+    select
+      n1.n_name as supp_nation,
+      n2.n_name as cust_nation,
+      extract(year from l.l_shipdate) as l_year,
+      l.l_extendedprice * (1 - l.l_discount) as volume
+    from
+      supplier s,
+      lineitem l,
+      orders o,
+      customer c,
+      nation n1,
+      nation n2
+    where
+      s.s_suppkey = l.l_suppkey
+      and o.o_orderkey = l.l_orderkey
+      and c.c_custkey = o.o_custkey
+      and s.s_nationkey = n1.n_nationkey
+      and c.c_nationkey = n2.n_nationkey
+      and (
+        (n1.n_name = 'EGYPT' and n2.n_name = 'UNITED STATES')
+        or (n1.n_name = 'UNITED STATES' and n2.n_name = 'EGYPT')
+      )
+      and l.l_shipdate between date '1995-01-01' and date '1996-12-31'
   ) as shipping
 group by
   supp_nation,
@@ -200,35 +205,35 @@ order by
 call gpu_processing("select
   o_year,
   sum(case
-    when nation = 1
-    then volume
+    when nation = 'EGYPT' then volume
     else 0
   end) / sum(volume) as mkt_share
-from (
-  select
-    o_orderdate//10000 as o_year,
-    l_extendedprice * (1 - l_discount) as volume,
-    n2.n_nationkey as nation
-  from
-    part,
-    supplier,
-    lineitem,
-    orders,
-    customer,
-    nation n1,
-    nation n2,
-    region
-  where
-    p_partkey = l_partkey
-    and s_suppkey = l_suppkey
-    and l_orderkey = o_orderkey
-    and o_custkey = c_custkey
-    and c_nationkey = n1.n_nationkey
-    and n1.n_regionkey = r_regionkey
-    and r_regionkey = 1
-    and s_nationkey = n2.n_nationkey
-    and o_orderdate between 19950101 and 19961231
-    and p_type = 103
+from
+  (
+    select
+      extract(year from o.o_orderdate) as o_year,
+      l.l_extendedprice * (1 - l.l_discount) as volume,
+      n2.n_name as nation
+    from
+      lineitem l,
+      part p,
+      supplier s,
+      orders o,
+      customer c,
+      nation n1,
+      nation n2,
+      region r
+    where
+      p.p_partkey = l.l_partkey
+      and s.s_suppkey = l.l_suppkey
+      and l.l_orderkey = o.o_orderkey
+      and o.o_custkey = c.c_custkey
+      and c.c_nationkey = n1.n_nationkey
+      and n1.n_regionkey = r.r_regionkey
+      and r.r_name = 'MIDDLE EAST'
+      and s.s_nationkey = n2.n_nationkey
+      and o.o_orderdate between date '1995-01-01' and date '1996-12-31'
+      and p.p_type = 'PROMO BRUSHED COPPER'
   ) as all_nations
 group by
   o_year
@@ -239,26 +244,27 @@ call gpu_processing("select
   nation,
   o_year,
   sum(amount) as sum_profit
-from(
-  select
-    n_name as nation,
-    o_orderdate//10000 as o_year,
-    l_extendedprice * (1 - l_discount) - ps_supplycost * l_quantity as amount
-  from
-    part,
-    supplier,
-    lineitem,
-    partsupp,
-    orders,
-    nation
-  where
-    s_suppkey = l_suppkey
-    and ps_suppkey = l_suppkey
-    and ps_partkey = l_partkey
-    and p_partkey = l_partkey
-    and o_orderkey = l_orderkey
-    and s_nationkey = n_nationkey
-    and p_name like '%green%'
+from
+  (
+    select
+      n.n_name as nation,
+      extract(year from o.o_orderdate) as o_year,
+      l.l_extendedprice * (1 - l.l_discount) - ps.ps_supplycost * l.l_quantity as amount
+    from
+      part p,
+      supplier s,
+      lineitem l,
+      partsupp ps,
+      orders o,
+      nation n
+    where
+      s.s_suppkey = l.l_suppkey
+      and ps.ps_suppkey = l.l_suppkey
+      and ps.ps_partkey = l.l_partkey
+      and p.p_partkey = l.l_partkey
+      and o.o_orderkey = l.l_orderkey
+      and s.s_nationkey = n.n_nationkey
+      and p.p_name like '%yellow%'
   ) as profit
 group by
   nation,
@@ -268,115 +274,111 @@ order by
   o_year desc;");
 
 call gpu_processing("select
-  c_custkey,
-  c_name,
-  sum(l_extendedprice * (1 - l_discount)) as revenue,
-  c_acctbal,
-  n_name,
-  c_address,
-  c_phone,
-  c_comment
+  c.c_custkey,
+  c.c_name,
+  sum(l.l_extendedprice * (1 - l.l_discount)) as revenue,
+  c.c_acctbal,
+  n.n_name,
+  c.c_address,
+  c.c_phone,
+  c.c_comment
 from
-  customer,
-  orders,
-  lineitem,
-  nation
+  customer c,
+  orders o,
+  lineitem l,
+  nation n
 where
-  c_custkey = o_custkey
-  and l_orderkey = o_orderkey
-  and o_orderdate >= 19931001
-  and o_orderdate <= 19931231
-  and l_returnflag = 0
-  and c_nationkey = n_nationkey
+  c.c_custkey = o.o_custkey
+  and l.l_orderkey = o.o_orderkey
+  and o.o_orderdate >= date '1994-03-01'
+  and o.o_orderdate < date '1994-03-01' + interval '3' month
+  and l.l_returnflag = 'R'
+  and c.c_nationkey = n.n_nationkey
 group by
-  c_custkey,
-  c_name,
-  c_acctbal,
-  c_phone,
-  n_name,
-  c_address,
-  c_comment 
+  c.c_custkey,
+  c.c_name,
+  c.c_acctbal,
+  c.c_phone,
+  n.n_name,
+  c.c_address,
+  c.c_comment
 order by
-  revenue desc;");
+  revenue desc
+limit 20;");
 
 call gpu_processing("select
-  *
-from (
-  select
-    ps_partkey,
-    sum(ps_supplycost * ps_availqty) as value
-  from
-    partsupp,
-    supplier,
-    nation
-  where
-    ps_suppkey = s_suppkey
-    and s_nationkey = n_nationkey
-    and n_name = 'GERMANY'
-  group by
-    ps_partkey
-) as inner_query
+  ps.ps_partkey,
+  sum(ps.ps_supplycost * ps.ps_availqty) as value
+from
+  partsupp ps,
+  supplier s,
+  nation n
 where
-  value > (
-    select
-      sum(ps_supplycost * ps_availqty) * 0.0000000333
-    from
-      partsupp,
-      supplier,
-      nation
-    where
-      ps_suppkey = s_suppkey
-      and s_nationkey = n_nationkey
-      and n_name = 'GERMANY'
-  )
+  ps.ps_suppkey = s.s_suppkey
+  and s.s_nationkey = n.n_nationkey
+  and n.n_name = 'JAPAN'
+group by
+  ps.ps_partkey having
+    sum(ps.ps_supplycost * ps.ps_availqty) > (
+      select
+        sum(ps.ps_supplycost * ps.ps_availqty) * 0.0001000000
+      from
+        partsupp ps,
+        supplier s,
+        nation n
+      where
+        ps.ps_suppkey = s.s_suppkey
+        and s.s_nationkey = n.n_nationkey
+        and n.n_name = 'JAPAN'
+    )
 order by
-  value desc,
-  ps_partkey;");
+  value desc;");
 
 call gpu_processing("select
-  l_shipmode,
+  l.l_shipmode,
   sum(case
-    when o_orderpriority = 0
-      or o_orderpriority = 1
-    then CAST(1 AS DOUBLE)
-    else CAST(0 AS DOUBLE)
+    when o.o_orderpriority = '1-URGENT'
+      or o.o_orderpriority = '2-HIGH'
+      then 1
+    else 0
   end) as high_line_count,
   sum(case
-    when o_orderpriority <> 0
-      and o_orderpriority <> 1
-    then CAST(1 AS DOUBLE)
-    else CAST(0 AS DOUBLE)
+    when o.o_orderpriority <> '1-URGENT'
+      and o.o_orderpriority <> '2-HIGH'
+      then 1
+    else 0
   end) as low_line_count
 from
-  orders,
-  lineitem
+  orders o,
+  lineitem l
 where
-  o_orderkey = l_orderkey
-  and l_shipmode in (4, 6)
-  and l_commitdate < l_receiptdate
-  and l_shipdate < l_commitdate
-  and l_receiptdate >= 19940101
-  and l_receiptdate <= 19941231
+  o.o_orderkey = l.l_orderkey
+  and l.l_shipmode in ('TRUCK', 'REG AIR')
+  and l.l_commitdate < l.l_receiptdate
+  and l.l_shipdate < l.l_commitdate
+  and l.l_receiptdate >= date '1994-01-01'
+  and l.l_receiptdate < date '1994-01-01' + interval '1' year
 group by
-  l_shipmode
+  l.l_shipmode
 order by
-  l_shipmode;");
+  l.l_shipmode;");
 
 call gpu_processing("select
   c_count,
   count(*) as custdist
-from (
-  select
-    c_custkey,
-    count(o_orderkey) as c_count
-  from
-    customer left outer join orders on (
-      c_custkey = o_custkey
-      and o_comment not like '%special%requests%'
-    )
-  group by
-    c_custkey
-  ) as c_orders
+from
+  (
+    select
+      c.c_custkey,
+      count(o.o_orderkey)
+    from
+      customer c
+      left outer join orders o
+        on c.c_custkey = o.o_custkey
+        and o.o_comment not like '%special%requests%'
+    group by
+      c.c_custkey
+  ) as orders (c_custkey, c_count)
 group by
   c_count
 order by
@@ -384,18 +386,18 @@ order by
   c_count desc;");
 
 call gpu_processing("select
-    sum(case
-    when (p_type >= 125 and p_type < 150)
-    then l_extendedprice * (1 - l_discount)
-    else 0.0
-    end) * 100.0 / sum(l_extendedprice * (1 - l_discount)) as promo_revenue
+  100.00 * sum(case
+    when p.p_type like 'PROMO%'
+      then l.l_extendedprice * (1 - l.l_discount)
+    else 0
+  end) / sum(l.l_extendedprice * (1 - l.l_discount)) as promo_revenue
 from
-  lineitem,
-  part
+  lineitem l,
+  part p
 where
-  l_partkey = p_partkey
-  and l_shipdate >= 19950901
-  and l_shipdate <= 19950931;");
+  l.l_partkey = p.p_partkey
+  and l.l_shipdate >= date '1994-08-01'
+  and l.l_shipdate < date '1994-08-01' + interval '1' month;");
 
 call gpu_processing("with revenue_view as (
   select
@@ -404,198 +406,201 @@ call gpu_processing("with revenue_view as (
   from
     lineitem
   where
-    l_shipdate >= 19960101
-    and l_shipdate <= 19960331
+    l_shipdate >= date '1993-05-01'
+    and l_shipdate < date '1993-05-01' + interval '3' month
   group by
     l_suppkey
 )
 
 select
-  s_suppkey,
-  total_revenue
+  s.s_suppkey,
+  s.s_name,
+  s.s_address,
+  s.s_phone,
+  r.total_revenue
 from
-  supplier,
-  revenue_view
+  supplier s,
+  revenue_view r
 where
-  s_suppkey = supplier_no
-  and total_revenue = (
+  s.s_suppkey = r.supplier_no
+  and r.total_revenue = (
     select
       max(total_revenue)
     from
       revenue_view
-    )
+  )
 order by
-  s_suppkey;");
+  s.s_suppkey;");
 
 call gpu_processing("select
-  p_brand,
-  p_type,
-  count(distinct ps_suppkey) as supplier_cnt,
-  p_size
+  p.p_brand,
+  p.p_type,
+  p.p_size,
+  count(distinct ps.ps_suppkey) as supplier_cnt
 from
-  partsupp,
-  part
+  partsupp ps,
+  part p
 where
-  p_partkey = ps_partkey
-  and p_brand <> 45
-  and (p_type < 65 or p_type >= 70)
-  and p_size in (49, 14, 23, 45, 19, 3, 36, 9)
-  and ps_suppkey not in (
+  p.p_partkey = ps.ps_partkey
+  and p.p_brand <> 'Brand#21'
+  and p.p_type not like 'MEDIUM PLATED%'
+  and p.p_size in (38, 2, 8, 31, 44, 5, 14, 24)
+  and ps.ps_suppkey not in (
     select
-      s_suppkey
+      s.s_suppkey
     from
-      supplier
+      supplier s
     where
-      s_comment like '%Customer%Complaints%'
+      s.s_comment like '%Customer%Complaints%'
   )
 group by
-  p_brand,
-  p_type,
-  p_size
+  p.p_brand,
+  p.p_type,
+  p.p_size
 order by
   supplier_cnt desc,
-  p_brand,
-  p_type,
-  p_size;");
+  p.p_brand,
+  p.p_type,
+  p.p_size;");
 
 call gpu_processing("select
-  sum(l_extendedprice) / 7.0 as avg_yearly
+  sum(l.l_extendedprice) / 7.0 as avg_yearly
 from
-  lineitem,
-  part
+  lineitem l,
+  part p
 where
-  p_partkey = l_partkey
-  and p_brand = 23
-  and p_container = 17
-  and l_quantity < (
+  p.p_partkey = l.l_partkey
+  and p.p_brand = 'Brand#13'
+  and p.p_container = 'JUMBO CAN'
+  and l.l_quantity < (
     select
-      avg(l_quantity) * 0.2
+      0.2 * avg(l2.l_quantity)
     from
-      lineitem
+      lineitem l2
     where
-      l_partkey = p_partkey
+      l2.l_partkey = p.p_partkey
   );");
 
 call gpu_processing("select
-  c_name,
-  c_custkey,
-  o_orderkey,
-  o_orderdate,
-  o_totalprice,
-  sum(l_quantity)
+  c.c_name,
+  c.c_custkey,
+  o.o_orderkey,
+  o.o_orderdate,
+  o.o_totalprice,
+  sum(l.l_quantity)
 from
-  customer,
-  orders,
-  lineitem
+  customer c,
+  orders o,
+  lineitem l
 where
-  o_orderkey in (
+  o.o_orderkey in (
     select
       l_orderkey
     from
       lineitem
     group by
-      l_orderkey
-    having
-      sum(l_quantity) > 300
-    )
-  and c_custkey = o_custkey
-  and o_orderkey = l_orderkey
+      l_orderkey having
+        sum(l_quantity) > 300
+  )
+  and c.c_custkey = o.o_custkey
+  and o.o_orderkey = l.l_orderkey
 group by
-  c_name,
-  c_custkey,
-  o_orderkey,
-  o_orderdate,
-  o_totalprice
+  c.c_name,
+  c.c_custkey,
+  o.o_orderkey,
+  o.o_orderdate,
+  o.o_totalprice
 order by
-  o_totalprice desc,
-  o_orderdate,
-  o_orderkey;");
+  o.o_totalprice desc,
+  o.o_orderdate
+limit 100;");
 
 call gpu_processing("select
-  sum(l_extendedprice * (1 - l_discount)) as revenue
+  sum(l.l_extendedprice* (1 - l.l_discount)) as revenue
 from
-  lineitem,
-  part
+  lineitem l,
+  part p
 where
-  p_partkey = l_partkey
-  and (
-    (
-      p_brand = 12
-      and p_container in (0, 1, 4, 5)
-      and l_quantity >= 1 and l_quantity <= 11
-      and p_size between 1 and 5
-      and l_shipmode in (0, 1)
-      and l_shipinstruct = 0
-    )
-    or
-    (
-      p_brand = 23
-      and p_container in (17, 18, 20, 21)
-      and l_quantity >= 10 and l_quantity <= 20
-      and p_size between 1 and 10
-      and l_shipmode in (0, 1)
-      and l_shipinstruct = 0
-    )
-    or
-    (
-      p_brand = 34
-      and p_container in (8, 9, 12, 13)
-      and l_quantity >= 20 and l_quantity <= 30
-      and p_size between 1 and 15
-      and l_shipmode in (0, 1)
-      and l_shipinstruct = 0
-    )
+  (
+    p.p_partkey = l.l_partkey
+    and p.p_brand = 'Brand#41'
+    and p.p_container in ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG')
+    and l.l_quantity >= 2 and l.l_quantity <= 2 + 10
+    and p.p_size between 1 and 5
+    and l.l_shipmode in ('AIR', 'AIR REG')
+    and l.l_shipinstruct = 'DELIVER IN PERSON'
+  )
+  or
+  (
+    p.p_partkey = l.l_partkey
+    and p.p_brand = 'Brand#13'
+    and p.p_container in ('MED BAG', 'MED BOX', 'MED PKG', 'MED PACK')
+    and l.l_quantity >= 14 and l.l_quantity <= 14 + 10
+    and p.p_size between 1 and 10
+    and l.l_shipmode in ('AIR', 'AIR REG')
+    and l.l_shipinstruct = 'DELIVER IN PERSON'
+  )
+  or
+  (
+    p.p_partkey = l.l_partkey
+    and p.p_brand = 'Brand#55'
+    and p.p_container in ('LG CASE', 'LG BOX', 'LG PACK', 'LG PKG')
+    and l.l_quantity >= 23 and l.l_quantity <= 23 + 10
+    and p.p_size between 1 and 15
+    and l.l_shipmode in ('AIR', 'AIR REG')
+    and l.l_shipinstruct = 'DELIVER IN PERSON'
   );");
 
 call gpu_processing("select
-  s_name,
-  s_address
+  s.s_name,
+  s.s_address
 from
-  supplier, nation
+  supplier s,
+  nation n
 where
-  s_suppkey in (
+  s.s_suppkey in (
     select
-      ps_suppkey
+      ps.ps_suppkey
     from
-      partsupp
+      partsupp ps
     where
-      ps_partkey in (
+      ps. ps_partkey in (
         select
-          p_partkey
+          p.p_partkey
         from
-          part
+          part p
         where
-          p_name like 'forest%'
-        )
-      and ps_availqty > (
+          p.p_name like 'antique%'
+      )
+      and ps.ps_availqty > (
         select
-          sum(l_quantity) * 0.5
+          0.5 * sum(l.l_quantity)
         from
-          lineitem
+          lineitem l
         where
-          l_partkey = ps_partkey
-          and l_suppkey = ps_suppkey
-          and l_shipdate >= 19940101
-          and l_shipdate <= 19941231
-        )
-    )
-  and s_nationkey = n_nationkey
-  and n_name = 'CANADA'
-  order by
-    s_name;");
+          l.l_partkey = ps.ps_partkey
+          and l.l_suppkey = ps.ps_suppkey
+          and l.l_shipdate >= date '1993-01-01'
+          and l.l_shipdate < date '1993-01-01' + interval '1' year
+      )
+  )
+  and s.s_nationkey = n.n_nationkey
+  and n.n_name = 'KENYA'
+order by
+  s.s_name;");
 
 call gpu_processing("select
-  s_name,
+  s.s_name,
   count(*) as numwait
 from
-  supplier,
+  supplier s,
   lineitem l1,
-  orders,
-  nation
+  orders o,
+  nation n
 where
-  s_suppkey = l1.l_suppkey
-  and o_orderkey = l1.l_orderkey
-  and o_orderstatus = 1
+  s.s_suppkey = l1.l_suppkey
+  and o.o_orderkey = l1.l_orderkey
+  and o.o_orderstatus = 'F'
   and l1.l_receiptdate > l1.l_commitdate
   and exists (
     select
@@ -616,43 +621,47 @@ where
       and l3.l_suppkey <> l1.l_suppkey
       and l3.l_receiptdate > l3.l_commitdate
   )
-  and s_nationkey = n_nationkey
-  and n_name = 'SAUDI ARABIA'
+  and s.s_nationkey = n.n_nationkey
+  and n.n_name = 'BRAZIL'
 group by
-  s_name
+  s.s_name
 order by
   numwait desc,
-  s_name;");
+  s.s_name
+limit 100;");
 
 call gpu_processing("select
   cntrycode,
   count(*) as numcust,
   sum(c_acctbal) as totacctbal
-from (
-  select
-    substr(c_phone, 1, 2) as cntrycode,
-    c_acctbal
-  from
-    customer
-  where
-    substr(c_phone, 1, 2) in ('13', '31', '23')
-    and c_acctbal > (
-      select
-        avg(c_acctbal)
-      from
-        customer
-      where
-        c_acctbal > 0.00
-        and substr(c_phone, 1, 2) in ('13', '31', '23', '29', '30', '18', '17')
+from
+  (
+    select
+      substring(c_phone from 1 for 2) as cntrycode,
+      c_acctbal
+    from
+      customer c
+    where
+      substring(c_phone from 1 for 2) in
+        ('24', '31', '11', '16', '21', '20', '34')
+      and c_acctbal > (
+        select
+          avg(c_acctbal)
+        from
+          customer
+        where
+          c_acctbal > 0.00
+          and substring(c_phone from 1 for 2) in
+            ('24', '31', '11', '16', '21', '20', '34')
       )
-    and not exists (
-      select
-        *
-      from
-        orders
-      where
-        o_custkey = c_custkey
-    )
+      and not exists (
+        select
+          *
+        from
+          orders o
+        where
+          o.o_custkey = c.c_custkey
+      )
   ) as custsale
 group by
   cntrycode
