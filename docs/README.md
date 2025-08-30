@@ -202,27 +202,28 @@ call gpu_buffer_init("1 GB", "2 GB", pinned_memory_size = "4 GB");
 After setting up Sirius, we can execute SQL queries using the `call gpu_processing`:
 ```
 call gpu_processing("select
-  l_orderkey,
-  sum(l_extendedprice * (1 - l_discount)) as revenue,
-  o_orderdate,
-  o_shippriority
+  l.l_orderkey,
+  sum(l.l_extendedprice * (1 - l.l_discount)) as revenue,
+  o.o_orderdate,
+  o.o_shippriority
 from
-  customer,
-  orders,
-  lineitem
+  customer c,
+  orders o,
+  lineitem l
 where
-  c_mktsegment = 1
-  and c_custkey = o_custkey
-  and l_orderkey = o_orderkey
-  and o_orderdate < 19950315
-  and l_shipdate > 19950315
+  c.c_mktsegment = 'HOUSEHOLD'
+  and c.c_custkey = o.o_custkey
+  and l.l_orderkey = o.o_orderkey
+  and o.o_orderdate < date '1995-03-25'
+  and l.l_shipdate > date '1995-03-25'
 group by
-  l_orderkey,
-  o_orderdate,
-  o_shippriority
+  l.l_orderkey,
+  o.o_orderdate,
+  o.o_shippriority
 order by
   revenue desc,
-  o_orderdate");
+  o.o_orderdate
+limit 10;");
 ```
 **The cold run in Sirius would be significantly slower due to data loading from storage and conversion from DuckDB format to Sirius native format. Subsequent runs would be faster since it benefits from caching on GPU memory.**
 
@@ -242,28 +243,29 @@ con.execute("call gpu_buffer_init('{GPU_CACHE_SIZE}', '{GPU_PROCESSING_SIZE}')")
 To execute query in Python:
 ```
 con.execute('''
-    call gpu_processing("select
-      l_orderkey,
-      sum(l_extendedprice * (1 - l_discount)) as revenue,
-      o_orderdate,
-      o_shippriority
-    from
-      customer,
-      orders,
-      lineitem
-    where
-      c_mktsegment = 1
-      and c_custkey = o_custkey
-      and l_orderkey = o_orderkey
-      and o_orderdate < 19950315
-      and l_shipdate > 19950315
-    group by
-      l_orderkey,
-      o_orderdate,
-      o_shippriority
-    order by
-      revenue desc,
-      o_orderdate")
+  call gpu_processing("select
+    l.l_orderkey,
+    sum(l.l_extendedprice * (1 - l.l_discount)) as revenue,
+    o.o_orderdate,
+    o.o_shippriority
+  from
+    customer c,
+    orders o,
+    lineitem l
+  where
+    c.c_mktsegment = 'HOUSEHOLD'
+    and c.c_custkey = o.o_custkey
+    and l.l_orderkey = o.o_orderkey
+    and o.o_orderdate < date '1995-03-25'
+    and l.l_shipdate > date '1995-03-25'
+  group by
+    l.l_orderkey,
+    o.o_orderdate,
+    o.o_shippriority
+  order by
+    revenue desc,
+    o.o_orderdate
+  limit 10;");
             ''').fetchall()
 ```
 
