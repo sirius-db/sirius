@@ -29,10 +29,11 @@ jobs:
           make -j$(nproc)
       - name: Prepare test datasets
         run: |
-          unzip test_datasets/dbgen.zip
-          cd dbgen
+          cd test_datasets
+          unzip tpch-dbgen.zip
+          cd tpch-dbgen
           ./dbgen -s 1 && mkdir s1 && mv *.tbl s1
-          cd ..
+          cd ../../
           cd test_datasets
           wget https://pages.cs.wisc.edu/~yxy/sirius-datasets/test_hits.tsv.gz
           gzip -d test_hits.tsv.gz

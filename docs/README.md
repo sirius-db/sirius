@@ -157,7 +157,8 @@ source .venv/bin/activate
 
 To generate the TPC-H dataset
 ```
-cd test_datasets && unzip tpch-dbgen.zip
+cd test_datasets
+unzip tpch-dbgen.zip
 cd tpch-dbgen
 ./dbgen -s 1 && mkdir s1 && mv *.tbl s1  # this generates dataset of SF1
 cd ../../
