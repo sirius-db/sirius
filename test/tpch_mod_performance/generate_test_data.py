@@ -25,11 +25,11 @@ if __name__ == "__main__":
   con.execute("load '{}'".format(extension_path))
   
   SF = sys.argv[1]
-  command = f"cd dbgen && ./dbgen -f -s {SF} && mv *.tbl perf_test/"
+  command = f"cd test_datasets/tpch-mod-dbgen && ./dbgen -f -s {SF} && mv *.tbl perf_test/"
   
   print("Generating TPC-H data...")
-  os.system("mkdir -p dbgen/perf_test")
-  os.system("rm -f dbgen/perf_test/*")
+  os.system("mkdir -p test_datasets/tpch-mod-dbgen/perf_test")
+  os.system("rm -f test_datasets/tpch-mod-dbgen/perf_test/*")
   os.system(command)
 
   print("Creating Region, Nation, Part, Supplier, Partsupp, Customer, Orders, Lineitem tables...")
@@ -139,35 +139,35 @@ if __name__ == "__main__":
   print("Copying data into tables...")
 
   con.execute('''
-  COPY lineitem FROM 'dbgen/perf_test/lineitem.tbl' WITH (HEADER false, DELIMITER '|')
+  COPY lineitem FROM 'test_datasets/tpch-mod-dbgen/perf_test/lineitem.tbl' WITH (HEADER false, DELIMITER '|')
   ''')
 
   con.execute('''
-  COPY orders FROM 'dbgen/perf_test/orders.tbl' WITH (HEADER false, DELIMITER '|')
+  COPY orders FROM 'test_datasets/tpch-mod-dbgen/perf_test/orders.tbl' WITH (HEADER false, DELIMITER '|')
   ''')
 
   con.execute('''
-  COPY supplier FROM 'dbgen/perf_test/supplier.tbl' WITH (HEADER false, DELIMITER '|')
+  COPY supplier FROM 'test_datasets/tpch-mod-dbgen/perf_test/supplier.tbl' WITH (HEADER false, DELIMITER '|')
   ''')
 
   con.execute('''
-  COPY part FROM 'dbgen/perf_test/part.tbl' WITH (HEADER false, DELIMITER '|')
+  COPY part FROM 'test_datasets/tpch-mod-dbgen/perf_test/part.tbl' WITH (HEADER false, DELIMITER '|')
   ''')
 
   con.execute('''
-  COPY customer FROM 'dbgen/perf_test/customer.tbl' WITH (HEADER false, DELIMITER '|')
+  COPY customer FROM 'test_datasets/tpch-mod-dbgen/perf_test/customer.tbl' WITH (HEADER false, DELIMITER '|')
   ''')
 
   con.execute('''
-  COPY partsupp FROM 'dbgen/perf_test/partsupp.tbl' WITH (HEADER false, DELIMITER '|')
+  COPY partsupp FROM 'test_datasets/tpch-mod-dbgen/perf_test/partsupp.tbl' WITH (HEADER false, DELIMITER '|')
   ''')
 
   con.execute('''
-  COPY nation FROM 'dbgen/perf_test/nation.tbl' WITH (HEADER false, DELIMITER '|')
+  COPY nation FROM 'test_datasets/tpch-mod-dbgen/perf_test/nation.tbl' WITH (HEADER false, DELIMITER '|')
   ''')
 
   con.execute('''
-  COPY region FROM 'dbgen/perf_test/region.tbl' WITH (HEADER false, DELIMITER '|')
+  COPY region FROM 'test_datasets/tpch-mod-dbgen/perf_test/region.tbl' WITH (HEADER false, DELIMITER '|')
   ''')
   
   con.close()

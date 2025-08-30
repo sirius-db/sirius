@@ -7,16 +7,16 @@ DROP TABLE IF EXISTS orders;
 DROP TABLE IF EXISTS customer;
 DROP TABLE IF EXISTS lineitem;
 
-CREATE TABLE nation  ( n_nationkey  INTEGER NOT NULL,
+CREATE TABLE nation  ( n_nationkey  INTEGER NOT NULL UNIQUE PRIMARY KEY,
                        n_name       CHAR(25) NOT NULL,
                        n_regionkey  INTEGER NOT NULL,
                        n_comment    VARCHAR(152));
 
-CREATE TABLE region  ( r_regionkey  INTEGER NOT NULL,
+CREATE TABLE region  ( r_regionkey  INTEGER NOT NULL UNIQUE PRIMARY KEY,
                        r_name       CHAR(25) NOT NULL,
                        r_comment    VARCHAR(152));
 
-CREATE TABLE part  ( p_partkey     BIGINT NOT NULL,
+CREATE TABLE part  ( p_partkey     BIGINT NOT NULL UNIQUE PRIMARY KEY,
                      p_name        VARCHAR(55) NOT NULL,
                      p_mfgr        CHAR(25) NOT NULL,
                      p_brand       CHAR(10) NOT NULL,
@@ -26,7 +26,7 @@ CREATE TABLE part  ( p_partkey     BIGINT NOT NULL,
                      p_retailprice DECIMAL(15,2) NOT NULL,
                      p_comment     VARCHAR(23) NOT NULL );
 
-CREATE TABLE supplier ( s_suppkey     BIGINT NOT NULL,
+CREATE TABLE supplier ( s_suppkey     BIGINT NOT NULL UNIQUE PRIMARY KEY,
                         s_name        CHAR(25) NOT NULL,
                         s_address     VARCHAR(40) NOT NULL,
                         s_nationkey   INTEGER NOT NULL,
@@ -38,9 +38,10 @@ CREATE TABLE partsupp ( ps_partkey     BIGINT NOT NULL,
                         ps_suppkey     BIGINT NOT NULL,
                         ps_availqty    INTEGER NOT NULL,
                         ps_supplycost  DECIMAL(15,2)  NOT NULL,
-                        ps_comment     VARCHAR(199) NOT NULL );
+                        ps_comment     VARCHAR(199) NOT NULL,
+                        CONSTRAINT PS_PARTSUPPKEY UNIQUE(PS_PARTKEY, PS_SUPPKEY) );
 
-CREATE TABLE customer ( c_custkey     INTEGER NOT NULL,
+CREATE TABLE customer ( c_custkey     INTEGER NOT NULL UNIQUE PRIMARY KEY,
                         c_name        VARCHAR(25) NOT NULL,
                         c_address     VARCHAR(40) NOT NULL,
                         c_nationkey   INTEGER NOT NULL,
@@ -49,7 +50,7 @@ CREATE TABLE customer ( c_custkey     INTEGER NOT NULL,
                         c_mktsegment  CHAR(10) NOT NULL,
                         c_comment     VARCHAR(117) NOT NULL);
 
-CREATE TABLE orders  ( o_orderkey       BIGINT NOT NULL,
+CREATE TABLE orders  ( o_orderkey       BIGINT NOT NULL UNIQUE PRIMARY KEY,
                        o_custkey        INTEGER NOT NULL,
                        o_orderstatus    CHAR(1) NOT NULL,
                        o_totalprice     DECIMAL(15,2) NOT NULL,
@@ -76,11 +77,11 @@ CREATE TABLE lineitem ( l_orderkey    BIGINT NOT NULL,
                         l_shipmode     CHAR(10) NOT NULL,
                         l_comment      VARCHAR(44) NOT NULL);
 
-COPY lineitem FROM 'tpch-dbgen/s1/lineitem.tbl' WITH (HEADER false, DELIMITER '|');
-COPY orders FROM 'tpch-dbgen/s1/orders.tbl' WITH (HEADER false, DELIMITER '|');
-COPY supplier FROM 'tpch-dbgen/s1/supplier.tbl' WITH (HEADER false, DELIMITER '|');
-COPY part FROM 'tpch-dbgen/s1/part.tbl' WITH (HEADER false, DELIMITER '|');
-COPY customer FROM 'tpch-dbgen/s1/customer.tbl' WITH (HEADER false, DELIMITER '|');
-COPY partsupp FROM 'tpch-dbgen/s1/partsupp.tbl' WITH (HEADER false, DELIMITER '|');
-COPY nation FROM 'tpch-dbgen/s1/nation.tbl' WITH (HEADER false, DELIMITER '|');
-COPY region FROM 'tpch-dbgen/s1/region.tbl' WITH (HEADER false, DELIMITER '|');
+COPY lineitem FROM 'test_datasets/tpch-dbgen/s1/lineitem.tbl' WITH (HEADER false, DELIMITER '|');
+COPY orders FROM 'test_datasets/tpch-dbgen/s1/orders.tbl' WITH (HEADER false, DELIMITER '|');
+COPY supplier FROM 'test_datasets/tpch-dbgen/s1/supplier.tbl' WITH (HEADER false, DELIMITER '|');
+COPY part FROM 'test_datasets/tpch-dbgen/s1/part.tbl' WITH (HEADER false, DELIMITER '|');
+COPY customer FROM 'test_datasets/tpch-dbgen/s1/customer.tbl' WITH (HEADER false, DELIMITER '|');
+COPY partsupp FROM 'test_datasets/tpch-dbgen/s1/partsupp.tbl' WITH (HEADER false, DELIMITER '|');
+COPY nation FROM 'test_datasets/tpch-dbgen/s1/nation.tbl' WITH (HEADER false, DELIMITER '|');
+COPY region FROM 'test_datasets/tpch-dbgen/s1/region.tbl' WITH (HEADER false, DELIMITER '|');

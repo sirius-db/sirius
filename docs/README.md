@@ -157,16 +157,16 @@ source .venv/bin/activate
 
 To generate the TPC-H dataset
 ```
-unzip test_datasets/dbgen.zip
-cd dbgen
+cd test_datasets && unzip tpch-dbgen.zip
+cd tpch-dbgen
 ./dbgen -s 1 && mkdir s1 && mv *.tbl s1  # this generates dataset of SF1
-cd ..
+cd ../../
 ```
 
 To load the TPC-H dataset to duckdb:
 ```
 ./build/release/duckdb {DATABASE_NAME}.duckdb
-.read tpch_load_duckdb.sql
+.read tpch_load.sql
 ```
 
 ### ClickBench Dataset
@@ -179,7 +179,7 @@ gzip -d test_hits.tsv.gz
 cd ..
 ```
 
-To load the dataset to duckdb run:
+To load the dataset to duckdb:
 ```
 ./build/release/duckdb {DATABASE_NAME}.duckdb
 .read clickbench_load_duckdb.sql
@@ -275,14 +275,14 @@ make test
 To run a specific test run the command from the root directory:
 ```
 make -j {nproc}
-build/release/test/unittest --test-dir . test/sql/tpch_sirius_queries.test
+build/release/test/unittest --test-dir . test/sql/tpch-sirius.test
 ```
 
 ## Performance Testing
 Make sure to build the duckdb-python package before running this test using the method described [here](https://github.com/sirius-db/sirius?tab=readme-ov-file#building-sirius). To test Sirius performance against DuckDB across all 22 TPC-H queries, run the following command (replace {SF} with the desired scale factor):
 ```
-python3 test/generate_test_data.py {SF}
-python3 test/performance_test.py {SF}
+python3 test/tpch_performance/generate_test_data.py {SF}
+python3 test/tpch_performance/performance_test.py {SF}
 ```
 
 ## Logging
