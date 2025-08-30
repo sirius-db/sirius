@@ -80,7 +80,7 @@ __global__ void hash_groupby_gmem(T **group_key, V** aggregate, unsigned long lo
                 } else {
                     n = 0;
                     atomic = true;
-                    slot = (slot + 100007) % ht_len;
+                    slot = (slot + 65599) % ht_len;
                 }
             }
         }

@@ -21,15 +21,6 @@
 
 namespace duckdb {
 
-__device__ uint64_t hash64_multikey(uint64_t key1, uint64_t key2) {
-    uint64_t h = key1 * 0xc6a4a7935bd1e995ull;
-    h ^= (h >> 33);
-    h ^= key2 * 0xc6a4a7935bd1e995ull;
-    h *= 0xc6a4a7935bd1e995ull;
-    h ^= (h >> 33);
-    return h;
-}
-
 template <int B, int I, typename T>
 __global__ void probe_multikey_count(T **keys, unsigned long long* ht, uint64_t ht_len, uint64_t *offset_each_thread, 
             unsigned long long* total_count, uint64_t N, int* condition_mode, int num_keys, int equal_keys, bool is_right) {
@@ -71,7 +62,8 @@ __global__ void probe_multikey_count(T **keys, unsigned long long* ht, uint64_t 
         if (threadIdx.x + (ITEM * B) < num_tile_items) {
             
             uint64_t slot;
-            if (equal_keys == 1) slot = keys[0][tile_offset + threadIdx.x + ITEM * B] % ht_len;
+            // if (equal_keys == 1) slot = keys[0][tile_offset + threadIdx.x + ITEM * B] % ht_len;
+            if (equal_keys == 1) slot = hash64_single(keys[0][tile_offset + threadIdx.x + ITEM * B]) % ht_len;
             else if (equal_keys == 2) slot = hash64_multikey(keys[0][tile_offset + threadIdx.x + ITEM * B], keys[1][tile_offset + threadIdx.x + ITEM * B]) % ht_len;
             else cudaAssert(0);
             
@@ -88,7 +80,7 @@ __global__ void probe_multikey_count(T **keys, unsigned long long* ht, uint64_t 
                 if (local_found) {
                     items_count[ITEM]++;
                 }
-                slot = (slot + 100007) % ht_len;
+                slot = (slot + 65599) % ht_len;
             }
             t_count += items_count[ITEM];
         }
@@ -136,7 +128,8 @@ __global__ void probe_multikey(T **keys, unsigned long long* ht, uint64_t ht_len
     for (int ITEM = 0; ITEM < I; ITEM++) {
         if (threadIdx.x + (ITEM * B) < num_tile_items) {
             uint64_t slot;
-            if (equal_keys == 1) slot = keys[0][tile_offset + threadIdx.x + ITEM * B] % ht_len;
+            // if (equal_keys == 1) slot = keys[0][tile_offset + threadIdx.x + ITEM * B] % ht_len;
+            if (equal_keys == 1) slot = hash64_single(keys[0][tile_offset + threadIdx.x + ITEM * B]) % ht_len;
             else if (equal_keys == 2) slot = hash64_multikey(keys[0][tile_offset + threadIdx.x + ITEM * B], keys[1][tile_offset + threadIdx.x + ITEM * B]) % ht_len;
             else cudaAssert(0);
             
@@ -158,7 +151,7 @@ __global__ void probe_multikey(T **keys, unsigned long long* ht, uint64_t ht_len
                     if (is_right) ht[slot * n_ht_column + num_keys + 1] = tile_offset + threadIdx.x + ITEM * B;
                     output_offset++;
                 }
-                slot = (slot + 100007) % ht_len;
+                slot = (slot + 65599) % ht_len;
             }
         }
     }
@@ -185,17 +178,19 @@ __global__ void build_multikey(T **keys, unsigned long long* ht, uint64_t ht_len
     for (int ITEM = 0; ITEM < I; ITEM++) {
         if (threadIdx.x + (ITEM * B) < num_tile_items) {
             uint64_t slot;
-            if (equal_keys == 1) slot = keys[0][tile_offset + threadIdx.x + ITEM * B] % ht_len;
+            // if (equal_keys == 1) slot = keys[0][tile_offset + threadIdx.x + ITEM * B] % ht_len;
+            if (equal_keys == 1) slot = hash64_single(keys[0][tile_offset + threadIdx.x + ITEM * B]) % ht_len;
             else if (equal_keys == 2) slot = hash64_multikey(keys[0][tile_offset + threadIdx.x + ITEM * B], keys[1][tile_offset + threadIdx.x + ITEM * B]) % ht_len;
             else cudaAssert(0);
             
             uint64_t item = keys[0][tile_offset + threadIdx.x + ITEM * B];
             while(atomicCAS(&ht[slot * n_ht_column], 0xFFFFFFFFFFFFFFFF, (unsigned long long) item) != 0xFFFFFFFFFFFFFFFF) {                
-                slot = (slot + 100007) % ht_len;
+                slot = (slot + 65599) % ht_len;
             }
 
             for (int n = 1; n < num_keys; n++) {
-                ht[slot * n_ht_column + n] = keys[n][tile_offset + threadIdx.x + ITEM * B];
+                uint64_t key = keys[n][tile_offset + threadIdx.x + ITEM * B];
+                ht[slot * n_ht_column + n] = key;
             }
             ht[slot * n_ht_column + num_keys] = tile_offset + threadIdx.x + (ITEM * B);
         }

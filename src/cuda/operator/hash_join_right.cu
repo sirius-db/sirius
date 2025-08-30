@@ -49,8 +49,9 @@ __global__ void probe_right_semi_anti(T **keys, unsigned long long* ht, uint64_t
         if (threadIdx.x + (ITEM * B) < num_tile_items) {
             
             uint64_t slot;
-            if (equal_keys == 1) slot = keys[0][tile_offset + threadIdx.x + ITEM * B] % ht_len;
-            else if (equal_keys == 2) slot = hash64_right(keys[0][tile_offset + threadIdx.x + ITEM * B], keys[1][tile_offset + threadIdx.x + ITEM * B]) % ht_len;
+            // if (equal_keys == 1) slot = keys[0][tile_offset + threadIdx.x + ITEM * B] % ht_len;
+            if (equal_keys == 1) slot = hash64_single(keys[0][tile_offset + threadIdx.x + ITEM * B]) % ht_len;
+            else if (equal_keys == 2) slot = hash64_multikey(keys[0][tile_offset + threadIdx.x + ITEM * B], keys[1][tile_offset + threadIdx.x + ITEM * B]) % ht_len;
             else cudaAssert(0);
             
             while (ht[slot * (num_keys + 2)] != 0xFFFFFFFFFFFFFFFF) {
@@ -63,7 +64,7 @@ __global__ void probe_right_semi_anti(T **keys, unsigned long long* ht, uint64_t
                 if (local_found) {
                     ht[slot * (num_keys + 2) + num_keys + 1] = tile_offset + threadIdx.x + ITEM * B;
                 }
-                slot = (slot + 100007) % ht_len;
+                slot = (slot + 65599) % ht_len;
             }
         }
     }

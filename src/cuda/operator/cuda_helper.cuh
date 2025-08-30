@@ -258,6 +258,23 @@ inline __device__ uint64_t hash_combine(uint64_t old_key, uint64_t new_key) {
     return old_key ^ (custom_hash_int(new_key) + 0x9e3779b9 + (old_key << 6) + (old_key >> 2));
 }
 
+inline __device__ uint64_t hash64_multikey(uint64_t key1, uint64_t key2) {
+    uint64_t h = key1 * 0xc6a4a7935bd1e995ull;
+    h ^= (h >> 33);
+    h ^= key2 * 0xc6a4a7935bd1e995ull;
+    h *= 0xc6a4a7935bd1e995ull;
+    h ^= (h >> 33);
+    return h;
+}
+
+inline __device__ uint64_t hash64_single(uint64_t key) {
+    uint64_t z = key;
+    z += 0x9e3779b97f4a7c15ULL;
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+    return z ^ (z >> 31);
+}
+
 #define STRING_HASH_POWER 31
 #define STRING_HASH_MOD_VALUE 1000000009
 #define BITS_IN_BYTE 8
