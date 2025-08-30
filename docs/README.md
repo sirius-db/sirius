@@ -174,7 +174,7 @@ To load the TPC-H dataset to duckdb:
 To download the dataset run:
 ```
 cd test_datasets
-wget https://sirius-datasets.s3.us-east-2.amazonaws.com/test_hits.tsv.gz
+wget https://pages.cs.wisc.edu/~yxy/sirius-datasets/test_hits.tsv.gz
 gzip -d test_hits.tsv.gz
 cd ..
 ```
