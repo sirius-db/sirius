@@ -12,124 +12,9 @@
 # the License.
 # =============================================================================
 
-# name: test/sql/tpch_sirius_queries.test
-# description: test TPC-H queries with GPU processing
-# group: [sirius]
-
-# Load required extensions
-require sirius
-
-require substrait
-
-# Load tpch data
-
-statement ok
-CREATE TABLE nation  ( n_nationkey  INTEGER NOT NULL,
-                       n_name       CHAR(25) NOT NULL,
-                       n_regionkey  INTEGER NOT NULL,
-                       n_comment    VARCHAR(152));
-
-statement ok
-CREATE TABLE region  ( r_regionkey  INTEGER NOT NULL,
-                       r_name       CHAR(25) NOT NULL,
-                       r_comment    VARCHAR(152));
-
-statement ok
-CREATE TABLE part  ( p_partkey     INTEGER NOT NULL,
-                     p_name        VARCHAR(55) NOT NULL,
-                     p_mfgr        CHAR(25) NOT NULL,
-                     p_brand       CHAR(10) NOT NULL,
-                     p_type        VARCHAR(25) NOT NULL,
-                     p_size        INTEGER NOT NULL,
-                     p_container   CHAR(10) NOT NULL,
-                     p_retailprice DECIMAL(15,2) NOT NULL,
-                     p_comment     VARCHAR(23) NOT NULL );
-
-statement ok
-CREATE TABLE supplier ( s_suppkey     INTEGER NOT NULL,
-                        s_name        CHAR(25) NOT NULL,
-                        s_address     VARCHAR(40) NOT NULL,
-                        s_nationkey   INTEGER NOT NULL,
-                        s_phone       CHAR(15) NOT NULL,
-                        s_acctbal     DECIMAL(15,2) NOT NULL,
-                        s_comment     VARCHAR(101) NOT NULL);
-
-statement ok
-CREATE TABLE partsupp ( ps_partkey     INTEGER NOT NULL,
-                        ps_suppkey     INTEGER NOT NULL,
-                        ps_availqty    INTEGER NOT NULL,
-                        ps_supplycost  DECIMAL(15,2)  NOT NULL,
-                        ps_comment     VARCHAR(199) NOT NULL );
-
-statement ok
-CREATE TABLE customer ( c_custkey     INTEGER NOT NULL,
-                        c_name        VARCHAR(25) NOT NULL,
-                        c_address     VARCHAR(40) NOT NULL,
-                        c_nationkey   INTEGER NOT NULL,
-                        c_phone       CHAR(15) NOT NULL,
-                        c_acctbal     DECIMAL(15,2)   NOT NULL,
-                        c_mktsegment  CHAR(10) NOT NULL,
-                        c_comment     VARCHAR(117) NOT NULL);
-
-statement ok
-CREATE TABLE orders  ( o_orderkey       BIGINT NOT NULL,
-                       o_custkey        INTEGER NOT NULL,
-                       o_orderstatus    CHAR(1) NOT NULL,
-                       o_totalprice     DECIMAL(15,2) NOT NULL,
-                       o_orderdate      DATE NOT NULL,
-                       o_orderpriority  CHAR(15) NOT NULL,
-                       o_clerk          CHAR(15) NOT NULL,
-                       o_shippriority   INTEGER NOT NULL,
-                       o_comment        VARCHAR(79) NOT NULL);
-
-statement ok
-CREATE TABLE lineitem ( l_orderkey    BIGINT NOT NULL,
-                        l_partkey     INTEGER NOT NULL,
-                        l_suppkey     INTEGER NOT NULL,
-                        l_linenumber  INTEGER NOT NULL,
-                        l_quantity    DECIMAL(15,2) NOT NULL,
-                        l_extendedprice  DECIMAL(15,2) NOT NULL,
-                        l_discount    DECIMAL(15,2) NOT NULL,
-                        l_tax         DECIMAL(15,2) NOT NULL,
-                        l_returnflag  CHAR(1) NOT NULL,
-                        l_linestatus  CHAR(1) NOT NULL,
-                        l_shipdate    DATE NOT NULL,
-                        l_commitdate  DATE NOT NULL,
-                        l_receiptdate DATE NOT NULL,
-                        l_shipinstruct CHAR(25) NOT NULL,
-                        l_shipmode     CHAR(10) NOT NULL,
-                        l_comment      VARCHAR(44) NOT NULL);
-
-statement ok
-COPY lineitem FROM 'tpch-dbgen/s1/lineitem.tbl' WITH (HEADER false, DELIMITER '|');
-
-statement ok
-COPY orders FROM 'tpch-dbgen/s1/orders.tbl' WITH (HEADER false, DELIMITER '|');
-
-statement ok
-COPY supplier FROM 'tpch-dbgen/s1/supplier.tbl' WITH (HEADER false, DELIMITER '|');
-
-statement ok
-COPY part FROM 'tpch-dbgen/s1/part.tbl' WITH (HEADER false, DELIMITER '|');
-
-statement ok
-COPY customer FROM 'tpch-dbgen/s1/customer.tbl' WITH (HEADER false, DELIMITER '|');
-
-statement ok
-COPY partsupp FROM 'tpch-dbgen/s1/partsupp.tbl' WITH (HEADER false, DELIMITER '|');
-
-statement ok
-COPY nation FROM 'tpch-dbgen/s1/nation.tbl' WITH (HEADER false, DELIMITER '|');
-
-statement ok
-COPY region FROM 'tpch-dbgen/s1/region.tbl' WITH (HEADER false, DELIMITER '|');
-
-statement ok
-call gpu_buffer_init("1 GB", "1 GB");
-
-# Q1
-query I
-call gpu_processing("select
+def q1(con):
+    con.execute('''
+select
     l_returnflag,
     l_linestatus,
     sum(l_quantity) as sum_qty,
@@ -149,13 +34,12 @@ group by
     l_linestatus
 order by
     l_returnflag,
-    l_linestatus;");
-----
-<FILE>:test/answers/tpch/q1.csv
-
-#Q2
-query I
-call gpu_processing("select
+    l_linestatus
+                ''')
+    
+def q2(con):
+    con.execute('''
+select
   s.s_acctbal,
   s.s_name,
   n.n_name,
@@ -197,13 +81,12 @@ order by
   s.s_acctbal desc,
   n.n_name,
   s.s_name,
-  p.p_partkey;");
-----
-<FILE>:test/answers/tpch/q2.csv
-
-#Q3
-query I
-call gpu_processing("select
+  p.p_partkey           
+                ''')
+    
+def q3(con):
+    con.execute('''
+select
   l.l_orderkey,
   sum(l.l_extendedprice * (1 - l.l_discount)) as revenue,
   o.o_orderdate,
@@ -224,13 +107,12 @@ group by
   o.o_shippriority
 order by
   revenue desc,
-  o.o_orderdate;");
-----
-<FILE>:test/answers/tpch/q3.csv
-
-#Q4
-query I
-call gpu_processing("select
+  o.o_orderdate
+                ''')
+    
+def q4(con):
+    con.execute('''
+select
   o.o_orderpriority,
   count(*) as order_count
 from
@@ -251,13 +133,12 @@ where
 group by
   o.o_orderpriority
 order by
-  o.o_orderpriority;");
-----
-<FILE>:test/answers/tpch/q4.csv
-
-#Q5
-query I
-call gpu_processing("select
+  o.o_orderpriority
+                ''')
+    
+def q5(con):
+    con.execute('''
+select
   n.n_name,
   sum(l.l_extendedprice * (1 - l.l_discount)) as revenue
 from
@@ -280,28 +161,25 @@ where
 group by
   n.n_name
 order by
-  revenue desc;");
-----
-<FILE>:test/answers/tpch/q5.csv
+  revenue desc
+                ''')
 
-#Q6
-query I
-call gpu_processing("select
+def q6(con):
+    con.execute('''
+select
   sum(l_extendedprice * l_discount) as revenue
 from
   lineitem
 where
   l_shipdate >= date '1997-01-01'
   and l_shipdate < date '1997-01-01' + interval '1' year
-  and
-  l_discount between 0.03 - 0.01 and 0.03 + 0.01
-  and l_quantity < 24;");
-----
-<FILE>:test/answers/tpch/q6.csv
-
-#Q7
-query I
-call gpu_processing("select
+  and l_discount between 0.03 - 0.01 and 0.03 + 0.01
+  and l_quantity < 24
+                ''')
+    
+def q7(con):
+    con.execute('''
+select
   supp_nation,
   cust_nation,
   l_year,
@@ -339,13 +217,12 @@ group by
 order by
   supp_nation,
   cust_nation,
-  l_year;");
-----
-<FILE>:test/answers/tpch/q7.csv
-
-#Q8
-query I
-call gpu_processing("select
+  l_year
+                ''')
+    
+def q8(con):
+    con.execute('''
+select
   o_year,
   sum(case
     when nation = 'EGYPT' then volume
@@ -381,13 +258,12 @@ from
 group by
   o_year
 order by
-  o_year;");
-----
-<FILE>:test/answers/tpch/q8.csv
+  o_year
+                ''')
 
-#Q9
-query I
-call gpu_processing("select
+def q9(con):
+    con.execute('''
+select
   nation,
   o_year,
   sum(amount) as sum_profit
@@ -418,13 +294,12 @@ group by
   o_year
 order by
   nation,
-  o_year desc;");
-----
-<FILE>:test/answers/tpch/q9.csv
-
-#Q10
-query I
-call gpu_processing("select
+  o_year desc
+                ''')
+    
+def q10(con):
+    con.execute('''
+select
   c.c_custkey,
   c.c_name,
   sum(l.l_extendedprice * (1 - l.l_discount)) as revenue,
@@ -455,13 +330,12 @@ group by
   c.c_comment
 order by
   c.c_custkey,
-  revenue desc;");
-----
-<FILE>:test/answers/tpch/q10.csv
-
-#Q11
-query I
-call gpu_processing("select
+  revenue desc
+                ''')
+    
+def q11(con):
+    con.execute('''
+select
   ps.ps_partkey,
   sum(ps.ps_supplycost * ps.ps_availqty) as value
 from
@@ -488,13 +362,12 @@ group by
     )
 order by
   value desc,
-  ps.ps_partkey;");
-----
-<FILE>:test/answers/tpch/q11.csv
-
-#Q12
-query I
-call gpu_processing("select
+  ps.ps_partkey
+                ''')
+    
+def q12(con):
+    con.execute('''
+select
   l.l_shipmode,
   sum(case
     when o.o_orderpriority = '1-URGENT'
@@ -521,13 +394,12 @@ where
 group by
   l.l_shipmode
 order by
-  l.l_shipmode;");
-----
-<FILE>:test/answers/tpch/q12.csv
-
-#Q13
-query I
-call gpu_processing("select
+  l.l_shipmode
+                ''')
+    
+def q13(con):
+    con.execute('''
+select
   c_count,
   count(*) as custdist
 from
@@ -547,13 +419,12 @@ group by
   c_count
 order by
   custdist desc,
-  c_count desc;");
-----
-<FILE>:test/answers/tpch/q13.csv
-
-#Q14
-query I
-call gpu_processing("select
+  c_count desc
+                ''')
+    
+def q14(con):
+    con.execute('''
+select
   100.00 * sum(case
     when p.p_type like 'PROMO%'
       then l.l_extendedprice * (1 - l.l_discount)
@@ -565,13 +436,12 @@ from
 where
   l.l_partkey = p.p_partkey
   and l.l_shipdate >= date '1994-08-01'
-  and l.l_shipdate < date '1994-08-01' + interval '1' month;");
-----
-<FILE>:test/answers/tpch/q14.csv
-
-#Q15
-query I
-call gpu_processing("with revenue_view as (
+  and l.l_shipdate < date '1994-08-01' + interval '1' month
+                ''')
+    
+def q15(con):
+    con.execute('''
+with revenue_view as (
   select
     l_suppkey as supplier_no,
     sum(l_extendedprice * (1 - l_discount)) as total_revenue
@@ -583,6 +453,7 @@ call gpu_processing("with revenue_view as (
   group by
     l_suppkey
 )
+
 select
   s.s_suppkey,
   s.s_name,
@@ -601,13 +472,12 @@ where
       revenue_view
   )
 order by
-  s.s_suppkey;");
-----
-<FILE>:test/answers/tpch/q15.csv
-
-#Q16
-query I
-call gpu_processing("select
+  s.s_suppkey
+                ''')
+    
+def q16(con):
+    con.execute('''
+select
   p.p_brand,
   p.p_type,
   p.p_size,
@@ -636,13 +506,12 @@ order by
   supplier_cnt desc,
   p.p_brand,
   p.p_type,
-  p.p_size;");
-----
-<FILE>:test/answers/tpch/q16.csv
-
-#Q17
-query I
-call gpu_processing("select
+  p.p_size
+                ''')
+    
+def q17(con):
+    con.execute('''
+select
   sum(l.l_extendedprice) / 7.0 as avg_yearly
 from
   lineitem l,
@@ -658,13 +527,12 @@ where
       lineitem l2
     where
       l2.l_partkey = p.p_partkey
-  );");
-----
-<FILE>:test/answers/tpch/q17.csv
-
-#Q18
-query I
-call gpu_processing("select
+  )
+                ''')
+    
+def q18(con):
+    con.execute('''
+select
   c.c_name,
   c.c_custkey,
   o.o_orderkey,
@@ -696,13 +564,12 @@ group by
 order by
   o.o_totalprice desc,
   o.o_orderdate,
-  o.o_orderkey;");
-----
-<FILE>:test/answers/tpch/q18.csv
-
-#Q19
-query I
-call gpu_processing("select
+  o.o_orderkey
+                ''')
+    
+def q19(con):
+    con.execute('''
+select
   sum(l.l_extendedprice* (1 - l.l_discount)) as revenue
 from
   lineitem l,
@@ -736,13 +603,12 @@ where
     and p.p_size between 1 and 15
     and l.l_shipmode in ('AIR', 'AIR REG')
     and l.l_shipinstruct = 'DELIVER IN PERSON'
-  );");
-----
-<FILE>:test/answers/tpch/q19.csv
-
-#Q20
-query I
-call gpu_processing("select
+  )
+                ''')
+    
+def q20(con):
+    con.execute('''
+select
   s.s_name,
   s.s_address
 from
@@ -778,13 +644,12 @@ where
   and s.s_nationkey = n.n_nationkey
   and n.n_name = 'KENYA'
 order by
-  s.s_name;");
-----
-<FILE>:test/answers/tpch/q20.csv
-
-#Q21
-query I
-call gpu_processing("select
+  s.s_name
+                ''')
+    
+def q21(con):
+    con.execute('''
+select
   s.s_name,
   count(*) as numwait
 from
@@ -822,13 +687,12 @@ group by
   s.s_name
 order by
   numwait desc,
-  s.s_name;");
-----
-<FILE>:test/answers/tpch/q21.csv
-
-#Q22
-query I
-call gpu_processing("select
+  s.s_name
+                ''')
+    
+def q22(con):
+    con.execute('''
+select
   cntrycode,
   count(*) as numcust,
   sum(c_acctbal) as totacctbal
@@ -864,6 +728,51 @@ from
 group by
   cntrycode
 order by
-  cntrycode;");
-----
-<FILE>:test/answers/tpch/q22.csv
+  cntrycode
+                ''')
+
+def run_duckdb(con, warmup=False):
+    q1(con)
+    print("Q1 done") if (not warmup) else None
+    q2(con)
+    print("Q2 done") if (not warmup) else None 
+    q3(con)
+    print("Q3 done") if (not warmup) else None
+    q4(con)
+    print("Q4 done") if (not warmup) else None
+    q5(con)
+    print("Q5 done") if (not warmup) else None
+    q6(con)
+    print("Q6 done") if (not warmup) else None
+    q7(con)
+    print("Q7 done") if (not warmup) else None
+    q8(con)
+    print("Q8 done") if (not warmup) else None
+    q9(con)
+    print("Q9 done") if (not warmup) else None
+    q10(con)
+    print("Q10 done") if (not warmup) else None
+    q11(con)
+    print("Q11 done") if (not warmup) else None
+    q12(con)
+    print("Q12 done") if (not warmup) else None
+    q13(con)
+    print("Q13 done") if (not warmup) else None
+    q14(con)
+    print("Q14 done") if (not warmup) else None
+    q15(con)
+    print("Q15 done") if (not warmup) else None
+    q16(con)
+    print("Q16 done") if (not warmup) else None
+    q17(con)
+    print("Q17 done") if (not warmup) else None
+    q18(con)
+    print("Q18 done") if (not warmup) else None
+    q19(con)
+    print("Q19 done") if (not warmup) else None
+    q20(con)
+    print("Q20 done") if (not warmup) else None
+    q21(con)
+    print("Q21 done") if (not warmup) else None
+    q22(con)
+    print("Q22 done") if (not warmup) else None

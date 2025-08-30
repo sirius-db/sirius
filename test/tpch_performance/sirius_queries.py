@@ -1,17 +1,19 @@
--- Copyright 2025 Sirius Contributors
---
--- Licensed under the Apache License, Version 2.0 (the "License");
--- you may not use this file except in compliance with the License.
--- You may obtain a copy of the License at
---
---     http://www.apache.org/licenses/LICENSE-2.0
---
--- Unless required by applicable law or agreed to in writing, software
--- distributed under the License is distributed on an "AS IS" BASIS,
--- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
--- See the License for the specific language governing permissions and
--- limitations under the License.
+# =============================================================================
+# Copyright 2025, Sirius Contributors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
+# in compliance with the License. You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software distributed under the License
+# is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+# or implied. See the License for the specific language governing permissions and limitations under
+# the License.
+# =============================================================================
 
+def q1(con):
+    con.execute('''
 call gpu_processing("select
     l_returnflag,
     l_linestatus,
@@ -33,7 +35,10 @@ group by
 order by
     l_returnflag,
     l_linestatus;");
-
+                ''')
+    
+def q2(con):
+    con.execute('''
 call gpu_processing("select
   s.s_acctbal,
   s.s_name,
@@ -77,8 +82,11 @@ order by
   n.n_name,
   s.s_name,
   p.p_partkey
-limit 100;");
+limit 100;");               
+                ''')
     
+def q3(con):
+    con.execute('''
 call gpu_processing("select
   l.l_orderkey,
   sum(l.l_extendedprice * (1 - l.l_discount)) as revenue,
@@ -102,7 +110,10 @@ order by
   revenue desc,
   o.o_orderdate
 limit 10;");
-
+                ''')
+    
+def q4(con):
+    con.execute('''
 call gpu_processing("select
   o.o_orderpriority,
   count(*) as order_count
@@ -124,8 +135,11 @@ where
 group by
   o.o_orderpriority
 order by
-  o.o_orderpriority;");
-
+  o.o_orderpriority;");   
+                ''')
+    
+def q5(con):
+    con.execute('''
 call gpu_processing("select
   n.n_name,
   sum(l.l_extendedprice * (1 - l.l_discount)) as revenue
@@ -150,7 +164,10 @@ group by
   n.n_name
 order by
   revenue desc;");
+                ''')
 
+def q6(con):
+    con.execute('''
 call gpu_processing("select
   sum(l_extendedprice * l_discount) as revenue
 from
@@ -160,7 +177,10 @@ where
   and l_shipdate < date '1997-01-01' + interval '1' year
   and l_discount between 0.03 - 0.01 and 0.03 + 0.01
   and l_quantity < 24;");
-
+                ''')
+    
+def q7(con):
+    con.execute('''
 call gpu_processing("select
   supp_nation,
   cust_nation,
@@ -200,7 +220,10 @@ order by
   supp_nation,
   cust_nation,
   l_year;");
-
+                ''')
+    
+def q8(con):
+    con.execute('''
 call gpu_processing("select
   o_year,
   sum(case
@@ -238,7 +261,10 @@ group by
   o_year
 order by
   o_year;");
+                ''')
 
+def q9(con):
+    con.execute('''
 call gpu_processing("select
   nation,
   o_year,
@@ -271,7 +297,10 @@ group by
 order by
   nation,
   o_year desc;");
-
+                ''')
+    
+def q10(con):
+    con.execute('''
 call gpu_processing("select
   c.c_custkey,
   c.c_name,
@@ -304,7 +333,10 @@ group by
 order by
   revenue desc
 limit 20;");
-
+                ''')
+    
+def q11(con):
+    con.execute('''
 call gpu_processing("select
   ps.ps_partkey,
   sum(ps.ps_supplycost * ps.ps_availqty) as value
@@ -332,7 +364,10 @@ group by
     )
 order by
   value desc;");
-
+                ''')
+    
+def q12(con):
+    con.execute('''
 call gpu_processing("select
   l.l_shipmode,
   sum(case
@@ -361,7 +396,10 @@ group by
   l.l_shipmode
 order by
   l.l_shipmode;");
-
+                ''')
+    
+def q13(con):
+    con.execute('''
 call gpu_processing("select
   c_count,
   count(*) as custdist
@@ -383,7 +421,10 @@ group by
 order by
   custdist desc,
   c_count desc;");
-
+                ''')
+    
+def q14(con):
+    con.execute('''
 call gpu_processing("select
   100.00 * sum(case
     when p.p_type like 'PROMO%'
@@ -397,7 +438,10 @@ where
   l.l_partkey = p.p_partkey
   and l.l_shipdate >= date '1994-08-01'
   and l.l_shipdate < date '1994-08-01' + interval '1' month;");
-
+                ''')
+    
+def q15(con):
+    con.execute('''
 call gpu_processing("with revenue_view as (
   select
     l_suppkey as supplier_no,
@@ -430,7 +474,10 @@ where
   )
 order by
   s.s_suppkey;");
-
+                ''')
+    
+def q16(con):
+    con.execute('''
 call gpu_processing("select
   p.p_brand,
   p.p_type,
@@ -461,7 +508,10 @@ order by
   p.p_brand,
   p.p_type,
   p.p_size;");
-
+                ''')
+    
+def q17(con):
+    con.execute('''
 call gpu_processing("select
   sum(l.l_extendedprice) / 7.0 as avg_yearly
 from
@@ -479,7 +529,10 @@ where
     where
       l2.l_partkey = p.p_partkey
   );");
-
+                ''')
+    
+def q18(con):
+    con.execute('''
 call gpu_processing("select
   c.c_name,
   c.c_custkey,
@@ -513,7 +566,10 @@ order by
   o.o_totalprice desc,
   o.o_orderdate
 limit 100;");
-
+                ''')
+    
+def q19(con):
+    con.execute('''
 call gpu_processing("select
   sum(l.l_extendedprice* (1 - l.l_discount)) as revenue
 from
@@ -549,7 +605,10 @@ where
     and l.l_shipmode in ('AIR', 'AIR REG')
     and l.l_shipinstruct = 'DELIVER IN PERSON'
   );");
-
+                ''')
+    
+def q20(con):
+    con.execute('''
 call gpu_processing("select
   s.s_name,
   s.s_address
@@ -587,7 +646,10 @@ where
   and n.n_name = 'KENYA'
 order by
   s.s_name;");
-
+                ''')
+    
+def q21(con):
+    con.execute('''
 call gpu_processing("select
   s.s_name,
   count(*) as numwait
@@ -628,7 +690,10 @@ order by
   numwait desc,
   s.s_name
 limit 100;");
-
+                ''')
+    
+def q22(con):
+    con.execute('''
 call gpu_processing("select
   cntrycode,
   count(*) as numcust,
@@ -666,3 +731,50 @@ group by
   cntrycode
 order by
   cntrycode;");
+                ''')
+
+def run_sirius(con, warmup=False):
+    q1(con)
+    print("Q1 done") if (not warmup) else None
+    q2(con)
+    print("Q2 done") if (not warmup) else None 
+    q3(con)
+    print("Q3 done") if (not warmup) else None
+    q4(con)
+    print("Q4 done") if (not warmup) else None
+    q5(con)
+    print("Q5 done") if (not warmup) else None
+    q6(con)
+    print("Q6 done") if (not warmup) else None
+    q7(con)
+    print("Q7 done") if (not warmup) else None
+    q8(con)
+    print("Q8 done") if (not warmup) else None
+    q9(con)
+    print("Q9 done") if (not warmup) else None
+    q10(con)
+    print("Q10 done") if (not warmup) else None
+    q11(con)
+    print("Q11 done") if (not warmup) else None
+    q12(con)
+    print("Q12 done") if (not warmup) else None
+    q13(con)
+    print("Q13 done") if (not warmup) else None
+    q14(con)
+    print("Q14 done") if (not warmup) else None
+    q15(con)
+    print("Q15 done") if (not warmup) else None
+    q16(con)
+    print("Q16 done") if (not warmup) else None
+    q17(con)
+    print("Q17 done") if (not warmup) else None
+    q18(con)
+    print("Q18 done") if (not warmup) else None
+    q19(con)
+    print("Q19 done") if (not warmup) else None
+    q20(con)
+    print("Q20 done") if (not warmup) else None
+    q21(con)
+    print("Q21 done") if (not warmup) else None
+    q22(con)
+    print("Q22 done") if (not warmup) else None

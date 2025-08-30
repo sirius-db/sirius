@@ -19,9 +19,11 @@
 # Load required extensions
 require sirius
 
-require substrait
-
 # Load clickbench data
+
+statement ok
+DROP TABLE IF EXISTS hits;
+
 statement ok
 CREATE TABLE hits
 (
@@ -136,9 +138,8 @@ statement ok
 COPY hits FROM 'test_datasets/test_hits.tsv' (QUOTE '');
 
 # Initialize GPU region
-
 statement ok
-call gpu_buffer_init("2 GB", "2 GB");
+call gpu_buffer_init("4 GB", "4 GB");
 
 # Q1
 query I

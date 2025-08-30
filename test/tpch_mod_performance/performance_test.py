@@ -23,7 +23,7 @@ if __name__ == "__main__":
   con = duckdb.connect('performance_test.duckdb', config={"allow_unsigned_extensions": "true"})
   # con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
   extension_path = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     'build/release/extension/sirius/sirius.duckdb_extension')
   con.execute("load '{}'".format(extension_path))
   
