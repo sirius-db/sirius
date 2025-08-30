@@ -15,7 +15,9 @@ duckdb/*
 CMakeFiles/
 CMakeCache.txt
 dbgen/
-tpch-dbgen/
+test_datasets/tpch-dbgen/
+test_datasets/tpch-mod-dbgen/
+test_datasets/test_hits.tsv
 .venv
 cufile.log
 4stock_5day_avg_close.csv
