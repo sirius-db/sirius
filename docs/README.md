@@ -57,11 +57,11 @@ To use the docker image with dependencies fully installed:
 
 For x86 machine:
 ```
-sudo docker run --gpus all -it sirius/sirius_dependencies_x86:stable bash
+sudo docker run --gpus all -it siriusdb/sirius_dependencies_x86_64:stable bash
 ```
 For aarch64 machine:
 ```
-sudo docker run --gpus all -it sirius/sirius_dependencies_aarch64:stable bash
+sudo docker run --gpus all -it siriusdb/sirius_dependencies_aarch64:stable bash
 ```
 
 If encounting errors like the following when running the docker image as above:
