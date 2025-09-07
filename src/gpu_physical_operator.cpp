@@ -106,6 +106,11 @@ SinkResultType GPUPhysicalOperator::Sink(GPUIntermediateRelation& input_relation
 	throw InternalException("Calling Sink on a node that is not a sink!");
 }
 
+SinkFinalizeType GPUPhysicalOperator::CombineFinalize(vector<shared_ptr<GPUIntermediateRelation>> &input,
+																				 					  	GPUIntermediateRelation& output) const {
+	throw InternalException("Calling CombineFinalize on a node that is not a sink!");
+}
+
 //===--------------------------------------------------------------------===//
 // Pipeline Construction
 //===--------------------------------------------------------------------===//

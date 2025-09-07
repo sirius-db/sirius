@@ -20,6 +20,7 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/common/enums/physical_operator_type.hpp"
 #include "gpu_buffer_manager.hpp"
+#include "gpu_combine.hpp"
 #include "gpu_materialize.hpp"
 #include "log/logging.hpp"
 
@@ -656,6 +657,13 @@ GPUPhysicalHashJoin::Sink(GPUIntermediateRelation &input_relation) const {
     return SinkResultType::FINISHED;
 };
 
+SinkFinalizeType
+GPUPhysicalHashJoin::CombineFinalize(vector<shared_ptr<GPUIntermediateRelation>> &input,
+  															 		 GPUIntermediateRelation& output) const {
+	CombineChunks(input, output);
+  return output.column_count == 0 || output.columns[0]->column_length == 0
+		? SinkFinalizeType::NO_OUTPUT_POSSIBLE : SinkFinalizeType::READY;
+}
 
 //===--------------------------------------------------------------------===//
 // Pipeline Construction

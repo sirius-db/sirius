@@ -28,6 +28,7 @@ set(EXTENSION_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/gpu_physical_result_collector.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/gpu_physical_table_scan.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/gpu_physical_nested_loop_join.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/gpu_combine.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/gpu_materialize.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/gpu_physical_strings_matching.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/gpu_physical_substring.cpp
