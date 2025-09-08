@@ -547,6 +547,11 @@ static void SetOptTableScanMemcpySize(ClientContext &context, SetScope scope, Va
 	SIRIUS_LOG_DEBUG("Updated config OPT_TABLE_SCAN_CUDA_MEMCPY_SIZE to {}", Config::OPT_TABLE_SCAN_CUDA_MEMCPY_SIZE);
 }
 
+static void SetPrintGPUTableMaxRows(ClientContext &context, SetScope scope, Value &parameter) {
+	Config::PRINT_GPU_TABLE_MAX_ROWS = UBigIntValue::Get(parameter);
+	SIRIUS_LOG_DEBUG("Updated config PRINT_GPU_TABLE_MAX_ROWS to {}", Config::PRINT_GPU_TABLE_MAX_ROWS);
+}
+
 void SiriusExtension::InitialGPUConfigs(DuckDB &db) {
 	auto &config = DBConfig::GetConfig(*db.instance);
 
@@ -568,7 +573,11 @@ void SiriusExtension::InitialGPUConfigs(DuckDB &db) {
 	config.AddExtensionOption("opt_table_scan_num_streams", "The number of cuda streams to use in the optional table scan", LogicalType::INTEGER, 
 		Value::INTEGER(Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS), SetOptTableScanNumStreams);
 	config.AddExtensionOption("opt_table_scan_memcpy_size", "The memcpy size (in bytes) used by the optional table scan", LogicalType::UBIGINT, 
-		Value::UBIGINT(Config::OPT_TABLE_SCAN_CUDA_MEMCPY_SIZE), SetOptTableScanNumStreams);
+		Value::UBIGINT(Config::OPT_TABLE_SCAN_CUDA_MEMCPY_SIZE), SetOptTableScanMemcpySize);
+
+	// Add in config options for printing gpu table
+	config.AddExtensionOption("print_gpu_table_max_rows", "Maximal amount of rows to render when printing gpu table", LogicalType::UBIGINT, 
+		Value::UBIGINT(Config::PRINT_GPU_TABLE_MAX_ROWS), SetPrintGPUTableMaxRows);
 }
 
 void SiriusExtension::Load(DuckDB &db) {

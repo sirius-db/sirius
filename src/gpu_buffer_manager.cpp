@@ -235,6 +235,7 @@ GPUBufferManager::~GPUBufferManager() {
     delete[] gpuProcessingPointer;
     delete[] gpuCachingPointer;
     delete[] cpuCachingPointer;
+    rmm_stored_buffers.clear();
     delete mr;
     delete cuda_mr;
 }

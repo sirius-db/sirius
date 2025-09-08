@@ -22,6 +22,6 @@
 
 namespace duckdb {
 
-void CombineChunks(vector<shared_ptr<GPUIntermediateRelation>> &input, GPUIntermediateRelation& output);
+shared_ptr<GPUIntermediateRelation> CombineChunks(const vector<shared_ptr<GPUIntermediateRelation>> &input);
 
 }

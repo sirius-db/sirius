@@ -21,36 +21,56 @@
 
 namespace duckdb {
 
-void CombineChunks(vector<shared_ptr<GPUIntermediateRelation>> &input, GPUIntermediateRelation& output) {
+shared_ptr<GPUIntermediateRelation> CombineChunks(const vector<shared_ptr<GPUIntermediateRelation>> &input){
   // Special cases
-  if (input.empty() || input[0]->column_count == 0) {
-    return;
+  if (input.empty()) {
+    throw InternalException("`input` is empty in `CombineChunks`");
   }
-  output.column_names = input[0]->column_names;
-  output.column_count = input[0]->column_count;
-  output.columns = input[0]->columns;
-  if (input.size() <= 1) {
-    return;
+  size_t num_columns = input[0]->column_count;
+  if (input.size() == 1 || num_columns == 0) {
+    return input[0];
+  }
+  vector<shared_ptr<GPUIntermediateRelation>> non_empty_input;
+  for (const auto &chunk: input) {
+    int num_rows = chunk->columns[0]->row_ids == nullptr
+      ? chunk->columns[0]->column_length : chunk->columns[0]->row_id_count;
+    if (num_rows > 0) {
+      non_empty_input.push_back(chunk);
+    }
+  }
+  if (non_empty_input.empty()) {
+    return input[0];
+  }
+
+  // Create output table
+  auto output = make_shared_ptr<GPUIntermediateRelation>(num_columns);
+  output->column_names = input[0]->column_names;
+  for (int i = 0; i < num_columns; ++i) {
+    output->columns[i] = make_shared_ptr<GPUColumn>(
+      0, input[0]->columns[i]->data_wrapper.type, nullptr, nullptr,
+      0, input[0]->columns[i]->data_wrapper.is_string_data, nullptr);
   }
 
   // Materialize each input chunk and convert to cudf column
   GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
   vector<vector<cudf::column_view>> input_cudf_columns;
-  input_cudf_columns.resize(output.column_count);
+  input_cudf_columns.resize(num_columns);
   for (auto& chunk: input) {
-    for (int i = 0; i < chunk->column_count; ++i) {
+    for (int i = 0; i < num_columns; ++i) {
       chunk->columns[i] = HandleMaterializeExpression(chunk->columns[i], gpuBufferManager);
       input_cudf_columns[i].push_back(chunk->columns[i]->convertToCudfColumn());
     }
   }
 
   // Call cudf concatenate
-  for (int i = 0; i < output.column_count; ++i) {
+  for (int i = 0; i < num_columns; ++i) {
     const auto &cols = input_cudf_columns[i];
     auto output_cudf_column = cudf::concatenate(cudf::host_span<cudf::column_view const>(cols.data(), cols.size()));
-    output.columns[i]->setFromCudfColumn(*output_cudf_column, input[0]->columns[i]->is_unique,
-                                         nullptr, 0, gpuBufferManager);;
+    output->columns[i]->setFromCudfColumn(*output_cudf_column, input[0]->columns[i]->is_unique,
+                                          nullptr, 0, gpuBufferManager);;
   }
+
+  return output;
 }
 
 }

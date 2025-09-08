@@ -660,8 +660,12 @@ GPUPhysicalHashJoin::Sink(GPUIntermediateRelation &input_relation) const {
 SinkFinalizeType
 GPUPhysicalHashJoin::CombineFinalize(vector<shared_ptr<GPUIntermediateRelation>> &input,
   															 		 GPUIntermediateRelation& output) const {
-	CombineChunks(input, output);
-  return output.column_count == 0 || output.columns[0]->column_length == 0
+	if (input.empty()) {
+		return SinkFinalizeType::NO_OUTPUT_POSSIBLE;
+	}
+	auto combined = CombineChunks(input);
+	output = move(*combined);
+	return output.column_count == 0 || output.columns[0]->column_length == 0
 		? SinkFinalizeType::NO_OUTPUT_POSSIBLE : SinkFinalizeType::READY;
 }
 
