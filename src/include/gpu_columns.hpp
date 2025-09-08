@@ -129,6 +129,47 @@ inline GPUColumnType convertLogicalTypeToColumnType(LogicalType type) {
     }
 }
 
+inline LogicalType convertColumnTypeToLogicalType(const GPUColumnType& type) {
+	switch (type.id()) {
+		case GPUColumnTypeId::INT16:
+			return LogicalType::SMALLINT;
+		case GPUColumnTypeId::INT32:
+			return LogicalType::INTEGER;
+		case GPUColumnTypeId::INT64:
+			return LogicalType::BIGINT;
+		case GPUColumnTypeId::FLOAT32:
+			return LogicalType::FLOAT;
+		case GPUColumnTypeId::FLOAT64:
+			return LogicalType::DOUBLE;
+		case GPUColumnTypeId::BOOLEAN:
+			return LogicalType::BOOLEAN;
+		case GPUColumnTypeId::DATE:
+			return LogicalType::DATE;
+		case GPUColumnTypeId::TIMESTAMP_SEC:
+			return LogicalType::TIMESTAMP_S;
+		case GPUColumnTypeId::TIMESTAMP_MS:
+			return LogicalType::TIMESTAMP_MS;
+		case GPUColumnTypeId::TIMESTAMP_US:
+			return LogicalType::TIMESTAMP;
+		case GPUColumnTypeId::TIMESTAMP_NS:
+			return LogicalType::TIMESTAMP_NS;
+		case GPUColumnTypeId::VARCHAR:
+			return LogicalType::VARCHAR;
+		case GPUColumnTypeId::INT128:
+			return LogicalType::HUGEINT;
+		case GPUColumnTypeId::DECIMAL: {
+			GPUDecimalTypeInfo* decimal_type_info = type.GetDecimalTypeInfo();
+			if (decimal_type_info == nullptr) {
+					throw InternalException("`decimal_type_info` not set for DECIMAL type in `ColumnTypeToLogicalType`");
+			}
+			return LogicalType::DECIMAL(decimal_type_info->width_, decimal_type_info->scale_);
+		}
+		default:
+			throw NotImplementedException("Unsupported sirius column type in `ColumnTypeToLogicalType`: %d",
+																		static_cast<int>(type.id()));
+	}
+}
+
 class DataWrapper {
 public:
     DataWrapper() = default; // Add default constructor

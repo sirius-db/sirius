@@ -93,7 +93,7 @@ add_subdirectory(src/plan)
 set(CUDA_SOURCES 
   src/cuda/communication.cu 
   src/cuda/allocator.cu
-  src/cuda/print_column.cu
+  src/cuda/print.cu
   src/cuda/utils.cu
 )
 add_subdirectory(src/cuda/operator)

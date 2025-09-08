@@ -102,7 +102,7 @@ public:
 
 template <typename T>
 void 
-GPUPhysicalMaterializedCollector::FinalMaterializeInternal(GPUIntermediateRelation input_relation, GPUIntermediateRelation &output_relation, size_t col) const {
+GPUPhysicalMaterializedCollector::FinalMaterializeInternal(GPUIntermediateRelation input_relation, GPUIntermediateRelation &output_relation, size_t col) {
 	if (input_relation.checkLateMaterialization(col)) {
 		T* data = reinterpret_cast<T*> (input_relation.columns[col]->data_wrapper.data);
 		uint64_t* row_ids = reinterpret_cast<uint64_t*> (input_relation.columns[col]->row_ids);
@@ -121,7 +121,7 @@ GPUPhysicalMaterializedCollector::FinalMaterializeInternal(GPUIntermediateRelati
 }
 
 void 
-GPUPhysicalMaterializedCollector::FinalMaterializeString(GPUIntermediateRelation input_relation, GPUIntermediateRelation& output_relation, size_t col) const {
+GPUPhysicalMaterializedCollector::FinalMaterializeString(GPUIntermediateRelation input_relation, GPUIntermediateRelation& output_relation, size_t col) {
 	if (input_relation.checkLateMaterialization(col)) {
 		// Late materalize the input relationship
 		uint8_t* data = input_relation.columns[col]->data_wrapper.data;
@@ -149,7 +149,7 @@ GPUPhysicalMaterializedCollector::FinalMaterializeString(GPUIntermediateRelation
 }
 
 size_t
-GPUPhysicalMaterializedCollector::FinalMaterialize(GPUIntermediateRelation input_relation, GPUIntermediateRelation &output_relation, size_t col) const {
+GPUPhysicalMaterializedCollector::FinalMaterialize(GPUIntermediateRelation input_relation, GPUIntermediateRelation &output_relation, size_t col) {
 	size_t size_bytes;
 	
 	switch (input_relation.columns[col]->data_wrapper.type.id()) {
@@ -211,86 +211,9 @@ GPUPhysicalMaterializedCollector::FinalMaterialize(GPUIntermediateRelation input
 	return size_bytes;
 }
 
-LogicalType ColumnTypeToLogicalType(const GPUColumnType& type) {
-	switch (type.id()) {
-		case GPUColumnTypeId::INT16:
-			return LogicalType::SMALLINT;
-		case GPUColumnTypeId::INT32:
-			return LogicalType::INTEGER;
-		case GPUColumnTypeId::INT64:
-			return LogicalType::BIGINT;
-		case GPUColumnTypeId::FLOAT32:
-			return LogicalType::FLOAT;
-		case GPUColumnTypeId::FLOAT64:
-			return LogicalType::DOUBLE;
-		case GPUColumnTypeId::BOOLEAN:
-			return LogicalType::BOOLEAN;
-		case GPUColumnTypeId::DATE:
-			return LogicalType::DATE;
-		case GPUColumnTypeId::TIMESTAMP_SEC:
-			return LogicalType::TIMESTAMP_S;
-		case GPUColumnTypeId::TIMESTAMP_MS:
-			return LogicalType::TIMESTAMP_MS;
-		case GPUColumnTypeId::TIMESTAMP_US:
-			return LogicalType::TIMESTAMP;
-		case GPUColumnTypeId::TIMESTAMP_NS:
-			return LogicalType::TIMESTAMP_NS;
-		case GPUColumnTypeId::VARCHAR:
-			return LogicalType::VARCHAR;
-		case GPUColumnTypeId::INT128:
-			return LogicalType::HUGEINT;
-		case GPUColumnTypeId::DECIMAL: {
-			GPUDecimalTypeInfo* decimal_type_info = type.GetDecimalTypeInfo();
-			if (decimal_type_info == nullptr) {
-					throw InternalException("`decimal_type_info` not set for DECIMAL type in `ColumnTypeToLogicalType`");
-			}
-			return LogicalType::DECIMAL(decimal_type_info->width_, decimal_type_info->scale_);
-		}
-		default:
-			throw NotImplementedException("Unsupported sirius column type in `ColumnTypeToLogicalType`: %d",
-																		static_cast<int>(type.id()));
-	}
-}
-
-Vector rawDataToVector(uint8_t* host_data, size_t vector_offset, const GPUColumnType& type) {
-	size_t sizeof_type;
-	switch (type.id()) {
-		case GPUColumnTypeId::INT16:
-			sizeof_type = sizeof(int16_t); break;
-		case GPUColumnTypeId::INT32:
-		case GPUColumnTypeId::DATE:
-			sizeof_type = sizeof(int); break;
-		case GPUColumnTypeId::INT64:
-		case GPUColumnTypeId::TIMESTAMP_SEC:
-		case GPUColumnTypeId::TIMESTAMP_MS:
-		case GPUColumnTypeId::TIMESTAMP_US:
-		case GPUColumnTypeId::TIMESTAMP_NS:
-			sizeof_type = sizeof(int64_t); break;
-		case GPUColumnTypeId::FLOAT32:
-			sizeof_type = sizeof(float); break;
-		case GPUColumnTypeId::FLOAT64:
-			sizeof_type = sizeof(double); break;
-		case GPUColumnTypeId::BOOLEAN:
-			sizeof_type = sizeof(uint8_t); break;
-		case GPUColumnTypeId::INT128:
-			sizeof_type = 2 * sizeof(int64_t); break;
-		case GPUColumnTypeId::DECIMAL: {
-			GPUDecimalTypeInfo* decimal_type_info = type.GetDecimalTypeInfo();
-			if (decimal_type_info == nullptr) {
-				throw InternalException("`decimal_type_info` not set for DECIMAL type in `rawDataToVector`");
-			}
-			sizeof_type = decimal_type_info->GetDecimalTypeSize();
-			break;
-		}
-		default:
-			throw NotImplementedException("Unsupported sirius column type in `rawDataToVector`: %d",
-																		static_cast<int>(type.id()));
-	}
-	uint8_t* data = host_data + vector_offset * STANDARD_VECTOR_SIZE * sizeof_type;
-	return Vector(ColumnTypeToLogicalType(type), data);
-}
-
-SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &input_relation) const {
+SinkResultType GPUPhysicalMaterializedCollector::ConvertGPUTableToCPUCollection(
+	GPUIntermediateRelation& input_relation, const vector<LogicalType>& types, GPUResultCollection* result_collection,
+	GPUBufferManager *gpuBufferManager) {
 	//TODO: Don't forget to check the if input relation is already materialized or not, if not then materialize it
 	if (types.size() != input_relation.columns.size()) {
 		throw InvalidInputException("Column count mismatch");
@@ -329,7 +252,6 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 	string_t** duckdb_strings = gpuBufferManager->customCudaHostAlloc<string_t*>(input_relation.columns.size());
 	string_t* curr_column_string_buffer = all_columns_string;
 	char* curr_column_chars_buffer = all_columns_chars;
-	GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 	for (int col = 0; col < input_relation.columns.size(); col++) {
 		auto col_materialize_start_time = std::chrono::high_resolution_clock::now();
 
@@ -456,18 +378,12 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 		DataChunk chunk;
 		chunk.InitializeEmpty(types);
 		for (int col = 0; col < materialized_relation.columns.size(); col++) {
-			if(materialized_relation.columns[col]->data_wrapper.type.id() != GPUColumnTypeId::VARCHAR) {
-				if (types[col].InternalType() == PhysicalType::INT128 && types[col].id() != LogicalTypeId::DECIMAL) {
-					Vector vector = rawDataToVector(host_data[col], vec, GPUColumnType(GPUColumnTypeId::INT128));
-					ValidityMask validity_mask(reinterpret_cast<validity_t*>(host_mask_data[col]), chunk_cardinality);
-					FlatVector::SetValidity(vector, validity_mask);
-					chunk.data[col].Reference(vector);
-				} else {
-					Vector vector = rawDataToVector(host_data[col], vec, materialized_relation.columns[col]->data_wrapper.type);
-					ValidityMask validity_mask(reinterpret_cast<validity_t*>(host_mask_data[col]), chunk_cardinality);
-					FlatVector::SetValidity(vector, validity_mask);
-					chunk.data[col].Reference(vector);
-				}
+			if (materialized_relation.columns[col]->data_wrapper.type.id() != GPUColumnTypeId::VARCHAR) {
+				uint8_t* data = host_data[col] + vec * STANDARD_VECTOR_SIZE * GetTypeIdSize(types[col].InternalType());
+				Vector vector(types[col], data);
+				ValidityMask validity_mask(reinterpret_cast<validity_t*>(host_mask_data[col]), chunk_cardinality);
+				FlatVector::SetValidity(vector, validity_mask);
+				chunk.data[col].Reference(vector);
 			} else {
 				// Add the strings to the vector
 				Vector str_vector(LogicalType::VARCHAR, reinterpret_cast<data_ptr_t>(duckdb_strings[col] + read_index));
@@ -493,6 +409,10 @@ SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &i
 	auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
 	SIRIUS_LOG_DEBUG("Result collector time: {:.2f} ms", duration.count()/1000.0);
 	return SinkResultType::FINISHED;
+}
+
+SinkResultType GPUPhysicalMaterializedCollector::Sink(GPUIntermediateRelation &input_relation) const {
+	return ConvertGPUTableToCPUCollection(input_relation, types, result_collection.get(), gpuBufferManager);
 }
 
 unique_ptr<GlobalSinkState> GPUPhysicalMaterializedCollector::GetGlobalSinkState(ClientContext &context) const {
