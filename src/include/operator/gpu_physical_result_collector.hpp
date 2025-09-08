@@ -73,15 +73,18 @@ public:
 
 public:
 	// Sink interface
+	static SinkResultType ConvertGPUTableToCPUCollection(
+		GPUIntermediateRelation& input_relation, const vector<LogicalType>& types,
+		GPUResultCollection* result_collection, GPUBufferManager *gpuBufferManager);
 	SinkResultType Sink(GPUIntermediateRelation &input_relation) const override;
 	// SinkCombineResultType Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const override;
 
 	unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const override;
 	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
 
-	template <typename T> void FinalMaterializeInternal(GPUIntermediateRelation input_relation, GPUIntermediateRelation& output_relation, size_t col) const;
-	void FinalMaterializeString(GPUIntermediateRelation input_relation, GPUIntermediateRelation& output_relation, size_t col) const;
-	size_t FinalMaterialize(GPUIntermediateRelation input_relation, GPUIntermediateRelation& output_relation, size_t col) const;
+	template <typename T> static void FinalMaterializeInternal(GPUIntermediateRelation input_relation, GPUIntermediateRelation& output_relation, size_t col);
+	static void FinalMaterializeString(GPUIntermediateRelation input_relation, GPUIntermediateRelation& output_relation, size_t col);
+	static size_t FinalMaterialize(GPUIntermediateRelation input_relation, GPUIntermediateRelation& output_relation, size_t col);
 
 	// bool ParallelSink() const override;
 	// bool SinkOrderDependent() const override;
