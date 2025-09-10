@@ -153,3 +153,20 @@ install(
   EXPORT "${DUCKDB_EXPORT_SET}"
   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
+
+# Unit tests
+set(TEST_NAME ${TARGET_NAME}_unittest)
+add_subdirectory(test/cpp)
+add_executable(${TEST_NAME} ${TEST_SOURCES})
+target_include_directories(${TEST_NAME} PRIVATE
+  duckdb/third_party/catch
+  test/cpp)
+target_link_libraries(${TEST_NAME} ${EXTENSION_NAME})
+set(TEST_EXEC_DIR "${CMAKE_CURRENT_BINARY_DIR}/test/cpp")
+set(TEST_LOG_DIR "${CMAKE_CURRENT_BINARY_DIR}/test/cpp/log")
+set_target_properties(${TEST_NAME} PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${TEST_EXEC_DIR}"
+)
+target_compile_definitions(${TEST_NAME} PRIVATE
+  SIRIUS_UNITTEST_LOG_DIR="${TEST_LOG_DIR}"
+)

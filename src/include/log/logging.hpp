@@ -71,10 +71,12 @@ inline std::string GetLogDir() {
   return SIRIUS_DEFAULT_LOG_DIR;
 }
 
-inline void InitGlobalLogger() {
+inline void InitGlobalLogger(std::string log_file = "") {
   // Log file
-  auto log_dir = GetLogDir();
-  auto log_file = log_dir + "/sirius.log";
+  if (log_file.empty()) {
+    auto log_dir = GetLogDir();
+    log_file = log_dir + "/sirius.log";
+  }
   auto file_sink = std::make_shared<spdlog::sinks::daily_file_sink_mt>(log_file, 0, 0, false);
   file_sink->set_pattern("[%Y-%m-%d %T.%e] [%l] [%s:%#] %v");
 
