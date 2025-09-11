@@ -142,6 +142,8 @@ public:
 	// virtual SinkResultType Sink(ExecutionContext &context, GPUIntermediateRelation &input, OperatorSinkInput &input) const;
 	// virtual SinkResultType Sink(ExecutionContext &context, GPUIntermediateRelation &input_relation, OperatorSinkInput &input) const;
 	virtual SinkResultType Sink(GPUIntermediateRelation &input_relation) const;
+	virtual SinkFinalizeType CombineFinalize(vector<shared_ptr<GPUIntermediateRelation>> &input,
+																	  			 GPUIntermediateRelation& output) const;
 	virtual unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const;
 	virtual unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const;
 	

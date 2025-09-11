@@ -37,6 +37,9 @@ struct Config {
   static bool USE_OPT_TABLE_SCAN; // use_opt_table_scan
   static int OPT_TABLE_SCAN_NUM_CUDA_STREAMS; // opt_table_scan_num_streams
   static uint64_t OPT_TABLE_SCAN_CUDA_MEMCPY_SIZE; // opt_table_scan_memcpy_size
+
+  // For printing gpu table
+  static uint64_t PRINT_GPU_TABLE_MAX_ROWS;
 };
 
 }

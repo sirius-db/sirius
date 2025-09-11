@@ -14,20 +14,18 @@
  * limitations under the License.
  */
 
-#include "config.hpp"
+#define CATCH_CONFIG_RUNNER
 
-namespace duckdb {
+#include "catch.hpp"
+#include "log/logging.hpp"
 
-bool Config::USE_PIN_MEM_FOR_CPU_PROCESSING = true;
+using namespace duckdb;
 
-bool Config::USE_CUDF_EXPR = true;
+int main(int argc, char* argv[]) {
+  // Initialize the logger
+  std::string log_dir = SIRIUS_UNITTEST_LOG_DIR;
+  InitGlobalLogger(log_dir + "/sirius_unittest.log");
 
-bool Config::USE_CUSTOM_TOP_N = true;
-
-bool Config::USE_OPT_TABLE_SCAN = true;
-int Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS = 8;
-uint64_t Config::OPT_TABLE_SCAN_CUDA_MEMCPY_SIZE = 64UL * 1024 * 1024;  // 64 MB
-
-uint64_t Config::PRINT_GPU_TABLE_MAX_ROWS = 1000;
-
+  // Run tests
+  return Catch::Session().run(argc, argv);
 }

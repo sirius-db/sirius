@@ -14,15 +14,17 @@
  * limitations under the License.
  */
 
+#include "print.hpp"
+#include "config.hpp"
+#include "duckdb/common/box_renderer.hpp"
+#include "duckdb/common/printer.hpp"
+#include "log/logging.hpp"
+#include "operator/cuda_helper.cuh"
+#include "operator/gpu_physical_result_collector.hpp"
+
 #include <iostream>
 #include <cuda_runtime.h>
 #include <cuda.h>
-#include "print.hpp"
-#include "operator/cuda_helper.cuh"
-#include "operator/gpu_physical_result_collector.hpp"
-#include "log/logging.hpp"
-#include "duckdb/common/box_renderer.hpp"
-#include "duckdb/common/printer.hpp"
 
 namespace duckdb {
 
@@ -94,6 +96,7 @@ void printGPUTable(GPUIntermediateRelation& table, ClientContext &context) {
         StatementType::SELECT_STATEMENT, StatementProperties(), table.column_names,
         move(column_data_collection), context.GetClientProperties());
     BoxRendererConfig box_render_config;
+    box_render_config.max_rows = Config::PRINT_GPU_TABLE_MAX_ROWS;
     Printer::Print(materialized_query_result->ToBox(context, box_render_config));
 }
 
