@@ -38,10 +38,13 @@ jobs:
           wget https://pages.cs.wisc.edu/~yxy/sirius-datasets/test_hits.tsv.gz
           gzip -d test_hits.tsv.gz
           cd ..
-      - name: Run tests
+      - name: Run sqllogic tests
         run: |
           make test | tee test.log
           if grep -q "Error in GPUExecuteQuery" test.log; then
             echo "GPU execution errors detected!"
             exit 1
           fi
+      - name: Run unittests tests
+        run: |
+          build/release/extension/sirius/sirius_tests
