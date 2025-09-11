@@ -78,7 +78,6 @@ set(EXTENSION_SOURCES
   src/sirius_extension.cpp
   src/gpu_context.cpp
   src/gpu_executor.cpp
-  src/cpu_cache.cpp
   src/gpu_physical_operator.cpp
   src/gpu_pipeline.cpp
   src/gpu_meta_pipeline.cpp
@@ -154,40 +153,3 @@ install(
   EXPORT "${DUCKDB_EXPORT_SET}"
   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
-
-include(CTest)
-if (BUILD_TESTING)
-  file(GLOB TEST_SOURCES test/cpp/*.cpp)
-  add_executable(${TARGET_NAME}_tests ${TEST_SOURCES})
-
-  # Ensure that all of the C++ depenedencies are loaded for the tests
-  target_sources(${TARGET_NAME}_tests PRIVATE
-    ${EXTENSION_SOURCES}
-    ${CUDA_SOURCES}
-  )
-
-  target_include_directories(${TARGET_NAME}_tests PRIVATE
-    test/cpp
-    src/include
-    ${CONDA_PREFIX}/include
-    ${CUDA_INCLUDE_DIRS}
-    ${PROJECT_SOURCE_DIR}/duckdb/test/include
-    ${PROJECT_SOURCE_DIR}/duckdb/third_party/catch
-  )
-
-  target_link_libraries(${TARGET_NAME}_tests
-    duckdb
-    cudf::cudf
-    rmm::rmm
-    spdlog::spdlog
-    substrait_extension
-  )
-
-  set_target_properties(${TARGET_NAME}_tests PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
-    CUDA_RESOLVE_DEVICE_SYMBOLS ON
-    LINKER_LANGUAGE CUDA
-  )
-
-  add_test(NAME sirius_tests COMMAND ${TARGET_NAME}_tests)
-endif()

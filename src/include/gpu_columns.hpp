@@ -209,9 +209,6 @@ public:
     size_t column_length; // number of rows in the column (currently equals to column_length)
     bool is_unique; // indicator whether the column has unique values
 
-    uint8_t* segment_start_ptr{nullptr}; // Pointer to the start of the segment where this column is stored, if this column is cached on CPU
-    int segment_id{-1}; // Metadata used by the CPU cache to identify where in the CPU this column is cached
-
     cudf::column_view convertToCudfColumn();
     int32_t* convertSiriusOffsetToCudfOffset(); // convert the offset of GPUColumn to the offset of the cudf column
     int32_t* convertSiriusRowIdsToCudfRowIds(); // convert the row_ids of the GPUColumn to the row_ids of the cudf column

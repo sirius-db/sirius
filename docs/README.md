@@ -270,10 +270,7 @@ con.execute('''
 ```
 
 ## Correctness Testing
-
-### SQLLogic Tests
-
-Sirius provides a unit test that compares Sirius against DuckDB for correctness across many test queries. Note that these tests are meant to be end to end tests as they run SQL queries using Sirius and compare that against the expected result. To run the unittest, generate the datasets using the method described [here](#generating-and-loading-test-datasets) and run the unittest using the following command:
+Sirius provides a unit test that compares Sirius against DuckDB for correctness across many test queries. To run the unittest, generate the datasets using the method described [here](#generating-and-loading-test-datasets) and run the unittest using the following command:
 ```
 make test
 ```
@@ -283,22 +280,6 @@ To run a specific test run the command from the root directory:
 make -j {nproc}
 build/release/test/unittest --test-dir . test/sql/tpch-sirius.test
 ```
-
-### C++ Tests
-
-Sirius also implements C++ tests for all of the APIs it implements. These tests are meant to be individual unit tests for each of the classes/functions used to run Sirius. You can find examples on how to implement these unit tests in `test/cpp`. You can run all of the unit tests using:
-```
-make -j {nproc}
-build/release/extension/sirius/sirius_tests
-```
-
-To run tests associated with specific tag you can run something like this:
-```
-make -j {nproc}
-build/release/extension/sirius/sirius_tests "[cpu_cache]"
-```
-
-We are using [Catch2](https://github.com/catchorg/Catch2) as our testing framework so more details about writing and running tests can be found there.  
 
 ## Performance Testing
 Make sure to build the duckdb-python package before running this test using the method described [here](https://github.com/sirius-db/sirius?tab=readme-ov-file#building-sirius). To test Sirius performance against DuckDB across all 22 TPC-H queries, run the following command (replace {SF} with the desired scale factor):
