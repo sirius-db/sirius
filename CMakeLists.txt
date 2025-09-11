@@ -84,6 +84,7 @@ set(EXTENSION_SOURCES
   src/gpu_physical_plan_generator.cpp
   src/gpu_buffer_manager.cpp
   src/gpu_columns.cpp
+  src/cpu_cache.cpp
   src/gpu_query_result.cpp
   src/config.cpp
 )
