@@ -45,7 +45,7 @@ std::string rand_str(int len) {
 }
 
 shared_ptr<GPUIntermediateRelation> create_table(
-  GPUBufferManager* gpuBufferManager, const vector<GPUColumnType>& types, const int num_rows,
+  GPUBufferManager* gpu_buffer_manager, const vector<GPUColumnType>& types, const int num_rows,
   uint8_t**& host_data, uint64_t**& host_offset) {
   int num_columns = types.size();
   auto table = make_shared_ptr<GPUIntermediateRelation>(num_columns);
@@ -56,7 +56,7 @@ shared_ptr<GPUIntermediateRelation> create_table(
     switch (types[c].id()) {
       case GPUColumnTypeId::INT32: {
         table->columns[c] = make_shared_ptr<GPUColumn>(num_rows, types[c], nullptr, nullptr);
-        table->columns[c]->data_wrapper.data = gpuBufferManager->customCudaMalloc<uint8_t>(
+        table->columns[c]->data_wrapper.data = gpu_buffer_manager->customCudaMalloc<uint8_t>(
           num_rows * sizeof(int32_t), 0, false);
         host_data[c] = new uint8_t[num_rows * sizeof(int32_t)];
         for (int r = 0; r < num_rows; ++r) {
@@ -69,7 +69,7 @@ shared_ptr<GPUIntermediateRelation> create_table(
       }
       case GPUColumnTypeId::INT64: {
         table->columns[c] = make_shared_ptr<GPUColumn>(num_rows, types[c], nullptr, nullptr);
-        table->columns[c]->data_wrapper.data = gpuBufferManager->customCudaMalloc<uint8_t>(
+        table->columns[c]->data_wrapper.data = gpu_buffer_manager->customCudaMalloc<uint8_t>(
           num_rows * sizeof(int64_t), 0, false);
         host_data[c] = new uint8_t[num_rows * sizeof(int64_t)];
         for (int r = 0; r < num_rows; ++r) {
@@ -95,8 +95,9 @@ shared_ptr<GPUIntermediateRelation> create_table(
           std::string str = rand_str(len);
           memcpy(host_data[c] + host_offset[c][r], str.data(), len);
         }
-        table->columns[c]->data_wrapper.offset = gpuBufferManager->customCudaMalloc<uint64_t>(num_rows + 1, 0, false);
-        table->columns[c]->data_wrapper.data = gpuBufferManager->customCudaMalloc<uint8_t>(
+        table->columns[c]->data_wrapper.offset = gpu_buffer_manager->customCudaMalloc<uint64_t>(
+          num_rows + 1, 0, false);
+        table->columns[c]->data_wrapper.data = gpu_buffer_manager->customCudaMalloc<uint8_t>(
           host_offset[c][num_rows], 0, false);
         cudaMemcpy(table->columns[c]->data_wrapper.offset, host_offset[c], (num_rows + 1) * sizeof(uint64_t),
                    cudaMemcpyHostToDevice);
@@ -112,10 +113,10 @@ shared_ptr<GPUIntermediateRelation> create_table(
   return table;
 }
 
-void verify_table(GPUBufferManager* gpuBufferManager, GPUIntermediateRelation& table,
+void verify_table(GPUBufferManager* gpu_buffer_manager, GPUIntermediateRelation& table,
                   uint8_t** expected_host_data, uint64_t** expected_host_offset) {
   for (int c = 0; c < table.column_count; ++c) {
-    auto column = HandleMaterializeExpression(table.columns[c], gpuBufferManager);
+    auto column = HandleMaterializeExpression(table.columns[c], gpu_buffer_manager);
     switch (column->data_wrapper.type.id()) {
       case GPUColumnTypeId::INT32: {
         int32_t* actual_host_data = new int32_t[column->column_length];
@@ -161,9 +162,7 @@ void verify_table(GPUBufferManager* gpuBufferManager, GPUIntermediateRelation& t
   }
 }
 
-void free_buffer(GPUBufferManager* gpuBufferManager, const vector<GPUColumnType>& types,
-                 uint8_t** host_data, uint64_t** host_offset) {
-  gpuBufferManager->ResetBuffer();
+void free_cpu_buffer(const vector<GPUColumnType>& types, uint8_t** host_data, uint64_t** host_offset) {
   for (int i = 0; i < types.size(); ++i) {
     delete[] host_data[i];
     if (types[i].id() == GPUColumnTypeId::VARCHAR) {

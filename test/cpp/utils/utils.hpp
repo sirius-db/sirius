@@ -30,13 +30,12 @@ T rand_int(T low, T high);
 std::string rand_str(int len);
 
 shared_ptr<GPUIntermediateRelation> create_table(
-  GPUBufferManager* gpuBufferManager, const vector<GPUColumnType>& types, const int num_rows,
+  GPUBufferManager* gpu_buffer_manager, const vector<GPUColumnType>& types, const int num_rows,
   uint8_t**& host_data, uint64_t**& host_offset);
 
-void verify_table(GPUBufferManager* gpuBufferManager, GPUIntermediateRelation& table,
+void verify_table(GPUBufferManager* gpu_buffer_manager, GPUIntermediateRelation& table,
                   uint8_t** expected_host_data, uint64_t** expected_host_offset);
 
-void free_buffer(GPUBufferManager* gpuBufferManager, const vector<GPUColumnType>& types,
-                 uint8_t** host_data, uint64_t** host_offset);
+void free_cpu_buffer(const vector<GPUColumnType>& types, uint8_t** host_data, uint64_t** host_offset);
 
 }
