@@ -27,7 +27,7 @@ jobs:
           source ~/miniconda3/etc/profile.d/conda.sh
           conda activate libcudf-env
           make -j$(nproc)
-      - name: Run unit tests
+      - name: Run C++ unit tests
         run: |
           ./build/release/extension/sirius/test/cpp/sirius_unittest
       - name: Prepare SQL test datasets
@@ -41,7 +41,7 @@ jobs:
           wget https://pages.cs.wisc.edu/~yxy/sirius-datasets/test_hits.tsv.gz
           gzip -d test_hits.tsv.gz
           cd ..
-      - name: Run SQL tests
+      - name: Run sqllogic tests
         run: |
           make test | tee test.log
           if grep -q "Error in GPUExecuteQuery" test.log; then

@@ -19,6 +19,12 @@
 #include "catch.hpp"
 #include "gpu_materialize.hpp"
 
+#include <cuda_runtime.h>
+#include <cuda.h>
+#include <cstdint>
+#include <cstdlib>
+#include <cmath>
+
 namespace duckdb {
 
 std::mt19937_64& global_rng() {
@@ -42,6 +48,23 @@ std::string rand_str(int len) {
       result += chars[dist(global_rng())];
   }
   return result;
+}
+
+GPUBufferManager* initialize_test_buffer_manager() { 
+  return &(GPUBufferManager::GetInstance(TEST_BUFFER_MANAGER_MEMORY_BYTES, TEST_BUFFER_MANAGER_MEMORY_BYTES, TEST_BUFFER_MANAGER_MEMORY_BYTES));
+}
+
+void fill_gpu_buffer_with_random_data(uint8_t* gpu_buffer, size_t num_bytes) { 
+    // First fill the buffer with random data in chunks of 4 bytes
+    int32_t* random_values = reinterpret_cast<int32_t*>(std::malloc(num_bytes));
+    size_t num_chunks = num_bytes / 4;
+    for (size_t i = 0; i < num_chunks; i++) {
+      random_values[i] = static_cast<uint32_t>(rand());
+    }
+
+    // Now copy the data to the GPU and free the temporary buffer
+    cudaMemcpy(gpu_buffer, (uint8_t*) random_values, num_bytes, cudaMemcpyHostToDevice);
+    std::free(random_values);
 }
 
 shared_ptr<GPUIntermediateRelation> create_table(
@@ -171,6 +194,106 @@ void free_cpu_buffer(const vector<GPUColumnType>& types, uint8_t** host_data, ui
   }
   delete[] host_data;
   delete[] host_offset;
+}
+
+void verify_cuda_errors(const char *msg) {
+    cudaError_t __err = cudaGetLastError();
+    if (__err != cudaSuccess) {
+        printf("CUDA error: %s (%s at %s:%d)\n",
+                msg, cudaGetErrorString(__err),
+                __FILE__, __LINE__);
+        REQUIRE(1 == 2);
+    }   
+}
+
+void verify_gpu_buffer_equality(uint8_t* buffer_1, uint8_t* buffer_2, size_t num_bytes) { 
+  // If the first buffer is null then verify that the second one is null as well
+  if(buffer_1 == nullptr) {
+    REQUIRE(buffer_2 == nullptr);
+    return;
+  }
+
+  // Allocate temporary host buffers to copy the data back
+  uint8_t* host_buffer_1 = (uint8_t*) malloc(num_bytes);
+  uint8_t* host_buffer_2 = (uint8_t*) malloc(num_bytes);
+
+  // Copy the data back to the host
+  cudaMemcpy(host_buffer_1, buffer_1, num_bytes, cudaMemcpyDeviceToHost);
+  cudaMemcpy(host_buffer_2, buffer_2, num_bytes, cudaMemcpyDeviceToHost);
+
+  // Now compare the two buffers
+  REQUIRE(memcmp(host_buffer_1, host_buffer_2, num_bytes) == 0);
+
+  // Free the temporary host buffers
+  free(host_buffer_1);
+  free(host_buffer_2);
+}
+
+void verify_gpu_column_equality(shared_ptr<GPUColumn> col1, shared_ptr<GPUColumn> col2) { 
+  // First verify that all of the metadata is the same
+  REQUIRE(col1->column_length == col2->column_length);
+  REQUIRE(col1->row_id_count == col2->row_id_count);
+  REQUIRE(col1->is_unique == col2->is_unique);
+
+  DataWrapper col1_data = col1->data_wrapper;
+  DataWrapper col2_data = col2->data_wrapper;
+  REQUIRE(col1_data.type.id() == col2_data.type.id());
+  REQUIRE(col1_data.size == col2_data.size);
+  REQUIRE(col1_data.num_bytes == col2_data.num_bytes);
+  REQUIRE(col1_data.is_string_data == col2_data.is_string_data);
+  REQUIRE(col1_data.mask_bytes == col2_data.mask_bytes);
+
+  // Now verify all of the buffers are the same
+  verify_gpu_buffer_equality((uint8_t*) col1->row_ids, (uint8_t*) col2->row_ids, col1->row_id_count * sizeof(uint64_t));
+  verify_gpu_buffer_equality(col1_data.data, col2_data.data, col1_data.num_bytes);
+  verify_gpu_buffer_equality((uint8_t*) col1_data.validity_mask, (uint8_t*) col2_data.validity_mask, col1_data.mask_bytes);
+  if(col1_data.is_string_data) {
+    verify_gpu_buffer_equality((uint8_t*) col1_data.offset, (uint8_t*) col2_data.offset, col1_data.size * sizeof(uint64_t));
+  }
+}
+
+
+shared_ptr<GPUColumn> create_column_with_random_data(GPUColumnTypeId col_type, size_t num_records, size_t chars_per_record, size_t num_materialize_row_ids, bool has_null_mask) { 
+  // Initialize an empty column
+  GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+  shared_ptr<GPUColumn> column = make_shared_ptr<GPUColumn>(num_records, GPUColumnType(col_type), nullptr, nullptr);  
+
+  // Populate the data of the column based on whether it is a fixed or variable length type
+  size_t num_data_bytes = 0;
+  if(col_type == GPUColumnTypeId::VARCHAR) { 
+    num_data_bytes = num_records * chars_per_record;
+    column->data_wrapper.is_string_data = true;
+
+    // Also populate the offsets column if is a string column
+    size_t num_offset_records = (num_records + 1);
+    column->data_wrapper.offset = gpuBufferManager->customCudaMalloc<uint64_t>(num_offset_records, 0, 0);
+    fill_gpu_buffer_with_random_data((uint8_t*) column->data_wrapper.offset, num_offset_records * sizeof(uint64_t));
+  } else { 
+    column->data_wrapper.is_string_data = false;
+    num_data_bytes = num_records * column->data_wrapper.getColumnTypeSize();
+  }
+  column->data_wrapper.data = gpuBufferManager->customCudaMalloc<uint8_t>(num_data_bytes, 0, 0);
+  column->data_wrapper.num_bytes = num_data_bytes;
+  fill_gpu_buffer_with_random_data(column->data_wrapper.data, num_data_bytes);
+
+  // If specified then set the null mask
+  if(has_null_mask) { 
+    size_t null_mask_bytes = getMaskBytesSize(num_records);
+    column->data_wrapper.mask_bytes = null_mask_bytes;
+    column->data_wrapper.validity_mask = reinterpret_cast<cudf::bitmask_type*>(gpuBufferManager->customCudaMalloc<uint8_t>(null_mask_bytes, 0, 0));
+    fill_gpu_buffer_with_random_data((uint8_t*) column->data_wrapper.validity_mask, null_mask_bytes);
+  }
+
+  // Also initialize the materialize row ids pointer
+  column->row_id_count = num_materialize_row_ids;
+  if(num_materialize_row_ids > 0) { 
+    column->row_ids = gpuBufferManager->customCudaMalloc<uint64_t>(num_materialize_row_ids, 0, 0);
+    fill_gpu_buffer_with_random_data((uint8_t*) column->row_ids, num_materialize_row_ids * sizeof(uint64_t));
+  } else { 
+    column->row_ids = nullptr;
+  }
+
+  return column;
 }
 
 }
