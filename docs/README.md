@@ -292,10 +292,16 @@ make -j {nproc}
 build/release/extension/sirius/test/cpp/sirius_unittest
 ```
 
-To run tests associated with specific tag you can run something like this:
+To run tests associated with specific tag or to run a specific test you can execute the the test script like this:
 ```
 make -j {nproc}
-build/release/extension/sirius/test/cpp/sirius_unittest "[pipeline]"
+build/release/extension/sirius/test/cpp/sirius_unittest "[cpu_cache]"
+build/release/extension/sirius/test/cpp/sirius_unittest "test_cpu_cache_basic_string_single_col"
+```
+
+Any logs produced during test execution are saved in: 
+```
+build/release/extension/sirius/test/cpp/log
 ```
 
 Just like duckdb, we are using [Catch2](https://github.com/catchorg/Catch2) as our testing framework so more details about writing and running tests can be found there.  

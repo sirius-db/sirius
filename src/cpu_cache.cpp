@@ -15,7 +15,7 @@
  */
 
 #include "cpu_cache.hpp"
-
+#include "log/logging.hpp"
 #include "duckdb/common/assert.hpp"
 
 namespace duckdb {
@@ -103,20 +103,10 @@ std::pair<uint8_t*, int> MallocCPUCache::get_cache_buffer(size_t size) {
     return std::make_pair(allocatePageableCPUMemory(size), -1);
 }
 
-shared_ptr<GPUColumn> MallocCPUCache::cache_column_to_cpu(shared_ptr<GPUColumn> gpu_column, cudaStream_t& copy_stream) { 
+shared_ptr<GPUColumn> MallocCPUCache::cache_column_to_cpu(shared_ptr<GPUColumn> gpu_column, cudaStream_t& copy_stream, cudaEvent_t& copy_complete_event) { 
     // First determine the number of bytes needed to cache this column on the CPU
     shared_ptr<GPUColumn> cpu_cached_column = make_shared_ptr<GPUColumn>(gpu_column);
-    size_t cpu_buffer_size = 0; 
-    if(cpu_cached_column->row_ids != nullptr) {
-        cpu_buffer_size += cpu_cached_column->row_id_count * sizeof(uint64_t);
-    }
-    if(cpu_cached_column->data_wrapper.validity_mask != nullptr) {
-        cpu_buffer_size += cpu_cached_column->data_wrapper.mask_bytes;
-    }
-    if(cpu_cached_column->data_wrapper.is_string_data) {
-        cpu_buffer_size += cpu_cached_column->data_wrapper.size * sizeof(uint64_t); // Add space to store string offset
-    }
-    cpu_buffer_size += cpu_cached_column->data_wrapper.num_bytes;
+    size_t cpu_buffer_size = cpu_cached_column->getTotalColumnSize();
 
     // Allocate a buffer of the requested size from the buffer pool
     std::pair<uint8_t*, int> cpu_buffer_info = get_cache_buffer(cpu_buffer_size);
@@ -140,7 +130,7 @@ shared_ptr<GPUColumn> MallocCPUCache::cache_column_to_cpu(shared_ptr<GPUColumn> 
     }
 
     if(cpu_cached_column->data_wrapper.is_string_data) { 
-        size_t offset_bytes = cpu_cached_column->data_wrapper.size * sizeof(uint64_t);
+        size_t offset_bytes = (cpu_cached_column->data_wrapper.size + 1) * sizeof(uint64_t);
         cudaMemcpyAsync(cpu_store_buffer, (uint8_t*) cpu_cached_column->data_wrapper.offset, offset_bytes, cudaMemcpyDeviceToHost, copy_stream);
         cpu_cached_column->data_wrapper.offset = reinterpret_cast<uint64_t*>(cpu_store_buffer);
         cpu_store_buffer += offset_bytes;
@@ -150,7 +140,8 @@ shared_ptr<GPUColumn> MallocCPUCache::cache_column_to_cpu(shared_ptr<GPUColumn> 
     cudaMemcpyAsync(cpu_store_buffer, (uint8_t*) cpu_cached_column->data_wrapper.data, data_bytes, cudaMemcpyDeviceToHost, copy_stream);
     cpu_cached_column->data_wrapper.data = cpu_store_buffer;
 
-    // Return the cached column
+    // Record the event to indicate that the copy is complete
+    cudaEventRecord(copy_complete_event, copy_stream);
     return cpu_cached_column;
 }
 
@@ -158,30 +149,40 @@ uint32_t MallocCPUCache::moveDataToCPU(shared_ptr<GPUIntermediateRelation> relat
     // Generate a unique id for this chunk
     uint32_t chunk_id = next_chunk_id.fetch_add(1);
 
-    // For each column in the relationship, copy it over from gpu memory using a different stream for each column
+    // Initialize events that can be be tracked when a columns copy is completed
     uint32_t num_columns = relationship->columns.size();
+    cudaEvent_t* col_copy_complete_events = new cudaEvent_t[num_columns];
+    #pragma unroll
+    for (size_t i = 0; i < num_columns; i++) {
+        // These flags that: 1) we don't need timing information for these events and, 2) instead of busy-waiting
+        // on the event, we want to block the CPU thread until the event is actually recorded
+        cudaEventCreateWithFlags(&col_copy_complete_events[i], cudaEventDisableTiming | cudaEventBlockingSync);
+    }
+
+    // For each column in the relationship, copy it over from gpu memory using a different stream for each column
     uint32_t stream_sequence_num = copy_stream_sequence.fetch_add(num_columns);
     shared_ptr<GPUIntermediateRelation> cpu_rel = make_shared_ptr<GPUIntermediateRelation>(num_columns);
     #pragma unroll
     for(uint32_t i = 0; i < num_columns; i++) { 
         uint32_t column_stream_idx = (stream_sequence_num + i) % num_streams;
         cudaStream_t& col_copy_stream = streams[column_stream_idx];
-        cpu_rel->columns[i] = cache_column_to_cpu(relationship->columns[i], col_copy_stream);
+        cpu_rel->columns[i] = cache_column_to_cpu(relationship->columns[i], col_copy_stream, col_copy_complete_events[i]);
     }
 
-    // Now synchronize all the streams to ensure that the copy is complete before we return
+    // Now synchronize on all the events to ensure that the copy is complete before we return
     #pragma unroll
     for (size_t i = 0; i < num_columns; i++) {
-        uint32_t column_stream_idx = (stream_sequence_num + i) % num_streams;
-        cudaStreamSynchronize(streams[column_stream_idx]);
+        cudaEventSynchronize(col_copy_complete_events[i]);
+        cudaEventDestroy(col_copy_complete_events[i]);
     }
+    delete[] col_copy_complete_events;
 
     // Save the cached relationship in the map and return the key to the caller
     all_cached_relationships[chunk_id] = cpu_rel;
     return chunk_id;
 }
 
-shared_ptr<GPUColumn> MallocCPUCache::move_cached_column_to_gpu(shared_ptr<GPUColumn> cpu_column, cudaStream_t& copy_stream, bool evict_from_cpu) { 
+shared_ptr<GPUColumn> MallocCPUCache::move_cached_column_to_gpu(shared_ptr<GPUColumn> cpu_column, cudaStream_t& copy_stream, cudaEvent_t& copy_complete_event) { 
     // Create the gpu column by copying over all of the metadata
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
     shared_ptr<GPUColumn> gpu_column = make_shared_ptr<GPUColumn>(cpu_column);
@@ -203,8 +204,8 @@ shared_ptr<GPUColumn> MallocCPUCache::move_cached_column_to_gpu(shared_ptr<GPUCo
 
     // If it is a string column also copy over the offsets
     if(gpu_column->data_wrapper.is_string_data) {
-        size_t offset_bytes = gpu_column->data_wrapper.size * sizeof(uint64_t);
-        gpu_column->data_wrapper.offset = gpuBufferManager->customCudaMalloc<uint64_t>(gpu_column->data_wrapper.size, 0, 0);
+        size_t offset_bytes = (gpu_column->data_wrapper.size + 1) * sizeof(uint64_t);
+        gpu_column->data_wrapper.offset = gpuBufferManager->customCudaMalloc<uint64_t>(gpu_column->data_wrapper.size + 1, 0, 0);
         cudaMemcpyAsync(gpu_column->data_wrapper.offset, cpu_column->data_wrapper.offset, offset_bytes, cudaMemcpyHostToDevice, copy_stream);
     }
 
@@ -213,45 +214,65 @@ shared_ptr<GPUColumn> MallocCPUCache::move_cached_column_to_gpu(shared_ptr<GPUCo
     gpu_column->data_wrapper.data = gpuBufferManager->customCudaMalloc<uint8_t>(data_bytes, 0, 0);
     cudaMemcpyAsync(gpu_column->data_wrapper.data, cpu_column->data_wrapper.data, data_bytes, cudaMemcpyHostToDevice, copy_stream);
 
-    // If evict is specified then also clear the CPU memory associated with this column
-    if(evict_from_cpu) {
-        if(cpu_column->segment_id != -1) { 
-            // If the column was cached in a segment in the pinned memory pool then mark that segment as free
-            std::shared_lock lock(segment_lock);
-            segments[cpu_column->segment_id]->occupied.store(false, std::memory_order_relaxed);
-        } else {
-            // Just free the pageable memory that was allocated for this segment
-            freePageableCPUMemory(cpu_column->segment_start_ptr);
-        }
-    }
-
+    // Record the event to indicate that the copy is complete
+    cudaEventRecord(copy_complete_event, copy_stream);
     return gpu_column;
 }
 
 shared_ptr<GPUIntermediateRelation> MallocCPUCache::moveDataToGPU(uint32_t chunk_id, bool evict_from_cpu) { 
     // First load the chunk from the map and if specified evict it from the map
-    D_ASSERT(all_cached_relationships.find(chunk_id) != all_cached_relationships.end());
+    if(all_cached_relationships.find(chunk_id) == all_cached_relationships.end()) { 
+        SIRIUS_LOG_DEBUG("ERROR: moveDataToGPU failed to find chunk {} in cached map", chunk_id);
+        throw InternalException("Trying to move an evicted chunk from the CPU cache");
+    }
+
     shared_ptr<GPUIntermediateRelation> cpu_rel = all_cached_relationships[chunk_id];
     if(evict_from_cpu) { 
         all_cached_relationships.erase(chunk_id);
     }
 
+    // Initialize events that can be be tracked when a columns copy is completed
+    const uint32_t num_columns = cpu_rel->columns.size();
+    cudaEvent_t* col_copy_complete_events = new cudaEvent_t[num_columns];
+    #pragma unroll
+    for (size_t i = 0; i < num_columns; i++) {
+        // These flags that: 1) we don't need timing information for these events and, 2) instead of busy-waiting
+        // on the event, we want to block the CPU thread until the event is actually recorded
+        cudaEventCreateWithFlags(&col_copy_complete_events[i], cudaEventDisableTiming | cudaEventBlockingSync);
+    }
+
     // For each column in the relationship, copy it over to gpu memory using a different stream for each column
-    uint32_t num_columns = cpu_rel->columns.size();
     uint32_t stream_sequence_num = copy_stream_sequence.fetch_add(num_columns);
     shared_ptr<GPUIntermediateRelation> gpu_rel = make_shared_ptr<GPUIntermediateRelation>(num_columns);
     #pragma unroll
     for(uint32_t i = 0; i < num_columns; i++) { 
         uint32_t column_stream_idx = (stream_sequence_num + i) % num_streams;
         cudaStream_t& col_copy_stream = streams[column_stream_idx];
-        gpu_rel->columns[i] = move_cached_column_to_gpu(cpu_rel->columns[i], col_copy_stream, evict_from_cpu);
+        gpu_rel->columns[i] = move_cached_column_to_gpu(cpu_rel->columns[i], col_copy_stream, col_copy_complete_events[i]);
     }
 
-    // Now synchronize all the streams to ensure that the copy is complete before we return
+    // Now synchronize on all the events to ensure that the copy is complete before we return
     #pragma unroll
     for (size_t i = 0; i < num_columns; i++) {
-        uint32_t column_stream_idx = (stream_sequence_num + i) % num_streams;
-        cudaStreamSynchronize(streams[column_stream_idx]);
+        cudaEventSynchronize(col_copy_complete_events[i]);
+        cudaEventDestroy(col_copy_complete_events[i]);
+    }
+    delete[] col_copy_complete_events;
+
+    // If we are evicting from cpu then also free the cpu memory associated with each column
+    if(evict_from_cpu) {
+        #pragma unroll
+        for (size_t i = 0; i < num_columns; i++) {
+            shared_ptr<GPUColumn> cpu_column = cpu_rel->columns[i];
+            if(cpu_column->segment_id != -1) { 
+                // If the column was cached in a segment in the pinned memory pool then mark that segment as free
+                std::shared_lock lock(segment_lock);
+                segments[cpu_column->segment_id]->occupied.store(false, std::memory_order_relaxed);
+            } else {
+                // Just free the pageable memory that was allocated for this segment
+                freePageableCPUMemory(cpu_column->segment_start_ptr);
+            }
+        }         
     }
 
     return gpu_rel;

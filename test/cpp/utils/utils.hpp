@@ -25,12 +25,20 @@
 
 namespace duckdb {
 
+// The buffer manager is shared across all threads so we need to allocate the memory needed by all tests
+// upfront when initializating the buffer manager
+constexpr size_t TEST_BUFFER_MANAGER_MEMORY_BYTES = 2L * 1024L * 1024L * 1024L; // 2 GB for testing
+
 std::mt19937_64& global_rng();
 
 template <typename T>
 T rand_int(T low, T high);
 
 std::string rand_str(int len);
+
+GPUBufferManager* initialize_test_buffer_manager();
+
+void fill_gpu_buffer_with_random_data(uint8_t* gpu_buffer, size_t num_bytes);
 
 shared_ptr<GPUIntermediateRelation> create_table(
   GPUBufferManager* gpu_buffer_manager, const vector<GPUColumnType>& types, const int num_rows,
@@ -46,5 +54,8 @@ void verify_cuda_errors(const char *msg);
 void verify_gpu_buffer_equality(uint8_t* buffer_1, uint8_t* buffer_2, size_t num_bytes);
 
 void verify_gpu_column_equality(shared_ptr<GPUColumn> col1, shared_ptr<GPUColumn> col2);
+
+shared_ptr<GPUColumn> create_column_with_random_data(GPUColumnTypeId col_type, size_t num_records, 
+  size_t chars_per_record = 1, size_t num_materialize_row_ids = 0, bool has_null_mask = false);
 
 }

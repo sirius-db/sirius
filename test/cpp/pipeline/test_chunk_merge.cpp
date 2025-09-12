@@ -98,9 +98,8 @@ void merge_and_verify(GPUBufferManager* gpu_buffer_manager, const vector<shared_
 }
 
 void test_chunk_merge() {
-  // Initialize
-  static constexpr size_t buffer_size = 1024L * 1024;
-  GPUBufferManager* gpu_buffer_manager = &(GPUBufferManager::GetInstance(buffer_size, buffer_size, buffer_size));
+  // Initialize the buffer manager
+  GPUBufferManager* gpu_buffer_manager = initialize_test_buffer_manager();
 
   // Prepare input data
   vector<GPUColumnType> types{GPUColumnType(GPUColumnTypeId::INT32),

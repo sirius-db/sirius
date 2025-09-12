@@ -222,6 +222,9 @@ public:
     //cudf mask is int32_t type, but has the granularity of 64B
     //duckdb mask is uint64_t type and the granularity of 8B
     // void convertCudfMaskToSiriusMask(std::unique_ptr<rmm::device_buffer> cudf_mask, cudf::size_type col_size, GPUBufferManager* gpuBufferManager);
+
+    // Returns the total number of bytes to store all of the column details
+    size_t getTotalColumnSize();
 };
 
 class GPUIntermediateRelation {

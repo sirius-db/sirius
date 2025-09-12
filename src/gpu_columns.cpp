@@ -555,6 +555,18 @@ GPUColumn::convertCudfOffsetToSiriusOffset(int32_t* cudf_offset) {
     data_wrapper.offset = convertInt32ToUInt64(cudf_offset, column_length + 1);
 }
 
+size_t GPUColumn::getTotalColumnSize() { 
+    // First get the base data size
+    size_t total_bytes = data_wrapper.num_bytes; 
+    if(data_wrapper.is_string_data) { // For strings add in the offset size
+        total_bytes += (data_wrapper.size + 1) * sizeof(uint64_t);
+    }
+
+    // Now add in the bitmask and row ids size
+    total_bytes += data_wrapper.mask_bytes + row_id_count * sizeof(uint64_t);
+    return total_bytes;
+}
+
 GPUIntermediateRelation::GPUIntermediateRelation(size_t column_count) :
         column_count(column_count) {
     column_names.resize(column_count);

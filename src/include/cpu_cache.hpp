@@ -68,12 +68,13 @@ private:
     std::pair<uint8_t*, int> get_cache_buffer(size_t size);
 
     // Helper method to cache a column with data on the GPU into the CPU cache using the provided stream. 
-    // It returns a GPUColumn object representing the cached column with data now on the CPU
-    shared_ptr<GPUColumn> cache_column_to_cpu(shared_ptr<GPUColumn> gpu_column, cudaStream_t& copy_stream);
+    // It returns a GPUColumn object representing the cached column with data now on the CPU. Also sets the
+    // event that can be used to track when the copy is complete
+    shared_ptr<GPUColumn> cache_column_to_cpu(shared_ptr<GPUColumn> gpu_column, cudaStream_t& copy_stream, cudaEvent_t& copy_complete_event);
 
     /// Helper method to move a cached column from CPU back to GPU memory using the provided stream. If evict is specified
-    /// then we also free the CPU memory associated with caching this column
-    shared_ptr<GPUColumn> move_cached_column_to_gpu(shared_ptr<GPUColumn> cpu_column, cudaStream_t& copy_stream, bool evict_from_cpu);
+    /// then we also free the CPU memory associated with caching this column. ALso sets the event that can be used to track when the copy is complete
+    shared_ptr<GPUColumn> move_cached_column_to_gpu(shared_ptr<GPUColumn> cpu_column, cudaStream_t& copy_stream, cudaEvent_t& copy_complete_event);
 
     uint8_t* pinned_memory_buffer; // Pointer to the pinned memory buffer
     size_t pinned_memory_capacity; // Total capacity of the pinned memory buffer
