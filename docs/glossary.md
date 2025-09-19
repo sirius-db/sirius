@@ -26,9 +26,9 @@ This document contains definitions of key terms and concepts used throughout the
 
 ## G
 
-**GPU Thread** - A thread which has a stream associated with it and can be used to execute tasks on a GPU. It pulls from the pipeline queue in order to get tasks to process.
+**GPU Scheduling Thread** - A thread which has a stream associated with it and can be used to execute tasks on a GPU. It pulls from the pipeline queue in order to get tasks to process.
 
-**GPU Thread Pool** - A pool of GPU threads that exist in the pipeline executor and are used to process tasks as they are added to the queue. The number of threads here define the parallelism of gpu compute.
+**GPU Thread Pool** - A pool of GPU Scheduling threads that exist in the pipeline executor and are used to process tasks as they are added to the queue. The number of threads here define the parallelism of gpu compute.
 
 ## H
 
