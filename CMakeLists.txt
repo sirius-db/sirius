@@ -87,6 +87,7 @@ set(EXTENSION_SOURCES
   src/cpu_cache.cpp
   src/gpu_query_result.cpp
   src/config.cpp
+  src/memory/memory_reservation.cpp
 )
 add_subdirectory(src/operator)
 add_subdirectory(src/plan)
