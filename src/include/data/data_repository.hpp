@@ -16,10 +16,11 @@
 
 #pragma once
 #include "data_batch.hpp"
+#include <mutex>
 
 namespace sirius {
 
-//TODO: currently not thread safe, just a template for our interface design
+//TODO: have to make sure that this is thread safe
 class DataRepository {
 public:
 
@@ -38,6 +39,7 @@ public:
 
 private:
     std::vector<std::vector<std::unique_ptr<DataBatch>>> data_batches_;
+    std::mutex mutex_; // Mutex to protect access to data_batches
 };
 
 }

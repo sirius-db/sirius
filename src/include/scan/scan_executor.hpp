@@ -28,7 +28,9 @@
 namespace sirius {
 
 // This executor is just handling out the task to duckdb scheduler, and converting the duckdb output chunk to a data batch
-// TODO: making sure that ScanExecutor can do this in batches, instead scanning all at once.
+// TODO: one idea to make scan executor work is by having each thread continue calling 'function' until it accumulates 2GB of data
+// then convert it into Data Batch, push it to repository, then continue scan to produce a new data batch, until the scan is done.
+// For the first step, we assume that we will not run out of CPU memory.
 class ScanExecutor {
     ScanExecutor(duckdb::TaskExecutor &executor, duckdb::TableFunction& function_p, duckdb::ExecutionContext& context_p,
                        duckdb::GPUPhysicalTableScan& op_p, DataRepository& data_repository) :
