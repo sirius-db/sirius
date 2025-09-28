@@ -15,29 +15,21 @@
  */
 
 #pragma once
-#include "data_batch.hpp"
+#include "spilling/downgrade_executor.hpp"
 
 namespace sirius {
 
-//TODO: currently not thread safe, just a template for our interface design
-class DataRepository {
+class GPUMemoryManager {
 public:
+    GPUMemoryManager(DataRepository &data_repository, DowngradeExecutor &downgrade_executor);
+    ~GPUMemoryManager();
 
-    DataRepository(size_t num_pipelines) {
-        data_batches_.resize(num_pipelines);
-    }
-
-    // Add a new DataBatch to the repository at the specified pipeline_id and idx
-    void addNewDataBatch(size_t pipeline_id, size_t idx, std::unique_ptr<DataBatch> data_batch) {
-    }
-
-    // Get a DataBatch by pipeline_id and idx and transfer ownership
-    std::unique_ptr<DataBatch> getDataBatch(size_t pipeline_id, size_t idx) {
-        return nullptr;
-    }
+    // scan data repository for data batches residing in GPU memory and schedule downgrade tasks
+    void scanDowngradeTask();
 
 private:
-    std::vector<std::vector<std::unique_ptr<DataBatch>>> data_batches_;
+    DataRepository &data_repository_;
+    DowngradeExecutor &downgrade_executor_;
 };
 
-}
+} // namespace sirius

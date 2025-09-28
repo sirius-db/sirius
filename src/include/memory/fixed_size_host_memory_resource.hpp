@@ -28,7 +28,6 @@
 #include <algorithm>
 
 namespace sirius {
-namespace spilling {
 
 /**
  * @brief A host memory resource that allocates fixed-size blocks using pinned host memory as upstream.
@@ -214,5 +213,4 @@ private:
     mutable std::mutex mutex_;                                 ///< Mutex for thread safety
 };
 
-} // namespace spilling
 } // namespace sirius

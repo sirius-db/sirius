@@ -17,7 +17,7 @@
 #pragma once
 
 #include <rmm/mr/host/host_memory_resource.hpp>
-#include "fixed_size_host_memory_resource.hpp"
+#include "memory/fixed_size_host_memory_resource.hpp"
 
 #include <cudf/table/table.hpp>
 #include <cudf/column/column.hpp>
@@ -29,7 +29,6 @@
 #include <vector>
 
 namespace sirius {
-namespace spilling {
 
 /**
  * @brief Structure containing both the host memory allocation and metadata for table recreation.
@@ -100,6 +99,4 @@ private:
                       rmm::cuda_stream_view stream);
 
 };
-
-} // namespace spilling
 } // namespace sirius

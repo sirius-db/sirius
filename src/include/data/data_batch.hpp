@@ -18,7 +18,7 @@
 #include <variant>
 #include <memory>
 #include <cudf/table/table.hpp>
-#include "data/spilling.hpp"
+#include "data/cudf_table_converter.hpp"
 
 namespace sirius {
 
@@ -31,14 +31,14 @@ enum class Location {
 class DataBatch {
 public:
     // Define the variant type to hold either cudf::table or spilling::allocation
-    using DataVariant = std::variant<std::unique_ptr<cudf::table>, std::unique_ptr<spilling::table_allocation>>;
+    using DataVariant = std::variant<std::unique_ptr<cudf::table>, std::unique_ptr<sirius::table_allocation>>;
 
     // Constructor to initialize with cudf::table
     DataBatch(std::unique_ptr<cudf::table> gpu_data) 
         : data_(std::move(gpu_data)), location_(Location::GPU) {}
 
     // Constructor to initialize with spilling::allocation
-    DataBatch(std::unique_ptr<spilling::table_allocation> cpu_data) 
+    DataBatch(std::unique_ptr<sirius::table_allocation> cpu_data) 
         : data_(std::move(cpu_data)), location_(Location::CPU) {}
 
     // Function to convert data to GPU
@@ -59,13 +59,13 @@ private:
     Location location_;
 
     // Implement these conversion functions according to your specific logic
-    std::unique_ptr<cudf::table> convertToGPU(std::unique_ptr<spilling::table_allocation> cpu_data) {
+    std::unique_ptr<cudf::table> convertToGPU(std::unique_ptr<sirius::table_allocation> cpu_data) {
         // Conversion logic here
         // ...
         return nullptr; // Replace with actual conversion result
     }
 
-    std::unique_ptr<spilling::table_allocation> convertToGPU(std::unique_ptr<cudf::table> gpu_data) {
+    std::unique_ptr<sirius::table_allocation> convertToGPU(std::unique_ptr<cudf::table> gpu_data) {
         // Conversion logic here
         // ...
         return nullptr; // Replace with actual conversion result

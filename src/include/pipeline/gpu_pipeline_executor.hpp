@@ -15,7 +15,7 @@
  */
 
 #pragma once
-#include "pipeline_executor/gpu_pipeline_task.hpp"
+#include "pipeline/gpu_pipeline_task.hpp"
 #include "memory/memory_reservation.hpp"
 #include "data_repository.hpp"
 #include <ctpl_stl.h> // Include the CTPL header
@@ -33,7 +33,7 @@ private:
     void workerThreadFunction(int id);
 
     // Execute a given PipelineTask by invoking each operator in a pipeline
-    void ExecuteTask(std::unique_ptr<GPUPipelineTask> task);
+    void executeTask(std::unique_ptr<GPUPipelineTask> task);
 
     // pull a task from the PipelineTaskQueue
     std::unique_ptr<GPUPipelineTask> pullTask();
