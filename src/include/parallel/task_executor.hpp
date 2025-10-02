@@ -17,7 +17,6 @@
 #pragma once
 
 #include "task_scheduler.hpp"
-
 #include "duckdb/common/vector.hpp"
 
 #include <atomic>
@@ -26,25 +25,25 @@
 namespace sirius {
 namespace parallel {
 
+struct TaskExecutorThread {
+  explicit TaskExecutorThread(duckdb::unique_ptr<std::thread> thread)
+    : internal_thread_(std::move(thread)) {}
+
+  duckdb::unique_ptr<std::thread> internal_thread_;
+};
+
+struct TaskExecutorConfig {
+  int num_threads;
+  bool retry_on_error;
+};
+
 /**
  * Interface for a thread pool used by different concrete executors like `GPUPipelineExecutor`, can be
  * extended to support various kinds of tasks and scheduling policies.
  */
 class ITaskExecutor {
 public:
-  struct WorkerThread {
-    explicit WorkerThread(duckdb::unique_ptr<std::thread> thread)
-      : internal_thread_(std::move(thread)) {}
-
-	  duckdb::unique_ptr<std::thread> internal_thread_;
-  };
-
-  struct Config {
-    int num_threads = std::thread::hardware_concurrency();
-    bool retry_on_error = true;
-  };
-
-  ITaskExecutor(duckdb::unique_ptr<ITaskScheduler> scheduler, Config config)
+  ITaskExecutor(duckdb::unique_ptr<ITaskScheduler> scheduler, TaskExecutorConfig config)
     : scheduler_(std::move(scheduler)), config_(config), running_(false) {}
   
   virtual ~ITaskExecutor() {
@@ -77,9 +76,9 @@ private:
 
 private:
   duckdb::unique_ptr<ITaskScheduler> scheduler_;
-  Config config_;
+  TaskExecutorConfig config_;
   std::atomic<bool> running_;
-  duckdb::vector<duckdb::unique_ptr<WorkerThread>> threads_;
+  duckdb::vector<duckdb::unique_ptr<TaskExecutorThread>> threads_;
 };
 
 } // namespace parallel

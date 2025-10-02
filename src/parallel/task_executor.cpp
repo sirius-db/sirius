@@ -30,7 +30,7 @@ void ITaskExecutor::Start() {
   threads_.reserve(config_.num_threads);
   for (int i = 0; i < config_.num_threads; ++i) {
     threads_.push_back(
-      duckdb::make_uniq<WorkerThread>(duckdb::make_uniq<std::thread>(&ITaskExecutor::WorkerLoop, this, i)));
+      duckdb::make_uniq<TaskExecutorThread>(duckdb::make_uniq<std::thread>(&ITaskExecutor::WorkerLoop, this, i)));
   }
 }
 
