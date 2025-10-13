@@ -16,20 +16,22 @@
 
 #pragma once
 
-#include "task_scheduler.hpp"
-#include "duckdb/common/vector.hpp"
+#include "task_queue.hpp"
 
 #include <atomic>
 #include <thread>
+#include <vector>
+#include <mutex>
+#include <condition_variable>
 
 namespace sirius {
 namespace parallel {
 
 struct TaskExecutorThread {
-  explicit TaskExecutorThread(duckdb::unique_ptr<std::thread> thread)
+  explicit TaskExecutorThread(std::unique_ptr<std::thread> thread)
     : internal_thread_(std::move(thread)) {}
 
-  duckdb::unique_ptr<std::thread> internal_thread_;
+  std::unique_ptr<std::thread> internal_thread_;
 };
 
 struct TaskExecutorConfig {
@@ -43,8 +45,8 @@ struct TaskExecutorConfig {
  */
 class ITaskExecutor {
 public:
-  ITaskExecutor(duckdb::unique_ptr<ITaskScheduler> scheduler, TaskExecutorConfig config)
-    : scheduler_(std::move(scheduler)), config_(config), running_(false) {}
+  ITaskExecutor(std::unique_ptr<ITaskQueue> task_queue, TaskExecutorConfig config)
+    : task_queue_(std::move(task_queue)), config_(config), running_(false) {}
   
   virtual ~ITaskExecutor() {
     Stop();
@@ -63,22 +65,29 @@ public:
   virtual void Stop();
 
   // Schedule a task.
-  virtual void Schedule(duckdb::unique_ptr<ITask> task);
+  virtual void Schedule(std::unique_ptr<ITask> task);
+
+  // Wait until all tasks are finished.
+  virtual void Wait();
 
 private:
   // Helper functions.
   virtual void OnStart();
   virtual void OnStop();
-  virtual void OnTaskError(int worker_id, duckdb::unique_ptr<ITask> task, const std::exception& e);
+  virtual void OnTaskError(int worker_id, std::unique_ptr<ITask> task, const std::exception& e);
 
   // Main thread loop.
   virtual void WorkerLoop(int worker_id);
 
 private:
-  duckdb::unique_ptr<ITaskScheduler> scheduler_;
+  std::unique_ptr<ITaskQueue> task_queue_;
   TaskExecutorConfig config_;
   std::atomic<bool> running_;
-  duckdb::vector<duckdb::unique_ptr<TaskExecutorThread>> threads_;
+  std::vector<std::unique_ptr<TaskExecutorThread>> threads_;
+  std::atomic<uint64_t> total_tasks_ = 0;
+  std::atomic<uint64_t> finished_tasks_ = 0;
+  std::mutex finish_mutex_;
+  std::condition_variable finish_cv_;
 };
 
 } // namespace parallel

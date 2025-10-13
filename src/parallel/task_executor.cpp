@@ -16,8 +16,6 @@
 
 #include "parallel/task_executor.hpp"
 
-#include "duckdb/common/helper.hpp"
-
 namespace sirius {
 namespace parallel {
 
@@ -30,7 +28,7 @@ void ITaskExecutor::Start() {
   threads_.reserve(config_.num_threads);
   for (int i = 0; i < config_.num_threads; ++i) {
     threads_.push_back(
-      duckdb::make_uniq<TaskExecutorThread>(duckdb::make_uniq<std::thread>(&ITaskExecutor::WorkerLoop, this, i)));
+      std::make_unique<TaskExecutorThread>(std::make_unique<std::thread>(&ITaskExecutor::WorkerLoop, this, i)));
   }
 }
 
@@ -41,26 +39,36 @@ void ITaskExecutor::Stop() {
   }
   OnStop();
   for (auto& thread : threads_) {
-    thread->internal_thread_->join();
+    if (thread->internal_thread_->joinable()) {
+      thread->internal_thread_->join();
+    }
   }
   threads_.clear();
 }
 
-void ITaskExecutor::Schedule(duckdb::unique_ptr<ITask> task) {
-  scheduler_->Push(std::move(task));
+void ITaskExecutor::Schedule(std::unique_ptr<ITask> task) {
+  task_queue_->Push(std::move(task));
+  total_tasks_.fetch_add(1);
+}
+
+void ITaskExecutor::Wait() {
+  std::unique_lock<std::mutex> lock(finish_mutex_);
+  finish_cv_.wait(lock, [&]() {
+    return total_tasks_.load() == finished_tasks_.load();
+  });
 }
 
 void ITaskExecutor::OnStart() {
-  scheduler_->Open();
+  task_queue_->Open();
 }
 
 void ITaskExecutor::OnStop() {
-  scheduler_->Close();
+  task_queue_->Close();
 }
 
-void ITaskExecutor::OnTaskError(int worker_id, duckdb::unique_ptr<ITask> task, const std::exception& e) {
+void ITaskExecutor::OnTaskError(int worker_id, std::unique_ptr<ITask> task, const std::exception& e) {
   if (config_.retry_on_error) {
-    scheduler_->Push(std::move(task));
+    Schedule(std::move(task));
   } else {
     Stop();
   }
@@ -72,15 +80,22 @@ void ITaskExecutor::WorkerLoop(int worker_id) {
       // Executor is stopped.
       break;
     }
-    auto task = scheduler_->Pull();
+    auto task = task_queue_->Pull();
     if (task == nullptr) {
-      // Scheduler is closed.
+      // Task queue is closed.
       break;
     }
     try {
       task->Execute();
     } catch (const std::exception& e) {
       OnTaskError(worker_id, std::move(task), e);
+    }
+    {
+      std::unique_lock<std::mutex> lock(finish_mutex_);
+      finished_tasks_.fetch_add(1);
+      if (total_tasks_.load() == finished_tasks_.load()) {
+        finish_cv_.notify_one();
+      }
     }
   }
 }

@@ -16,8 +16,7 @@
 
 #pragma once
 
-#include "duckdb/common/shared_ptr.hpp"
-#include "duckdb/common/unique_ptr.hpp"
+#include <memory>
 
 namespace sirius {
 namespace parallel {
@@ -43,7 +42,7 @@ public:
  */
 class ITask {
 public:
-  ITask(duckdb::unique_ptr<ITaskLocalState> local_state, duckdb::shared_ptr<ITaskGlobalState> global_state)
+  ITask(std::unique_ptr<ITaskLocalState> local_state, std::shared_ptr<ITaskGlobalState> global_state)
     : local_state_(std::move(local_state)), global_state_(global_state) {}
 
   virtual ~ITask() = default;
@@ -58,8 +57,8 @@ public:
   virtual void Execute() = 0;
 
 protected:
-  duckdb::unique_ptr<ITaskLocalState> local_state_;
-  duckdb::shared_ptr<ITaskGlobalState> global_state_;
+  std::unique_ptr<ITaskLocalState> local_state_;
+  std::shared_ptr<ITaskGlobalState> global_state_;
 };
 
 } // namespace parallel

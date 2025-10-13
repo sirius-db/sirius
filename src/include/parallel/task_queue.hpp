@@ -18,27 +18,29 @@
 
 #include "task.hpp"
 
+#include <memory>
+
 namespace sirius {
 namespace parallel {
 
 /**
- * Interface for concrete scheduling policies.
+ * Interface for concrete task queues for customized scheduling policies.
  */
-class ITaskScheduler {
+class ITaskQueue {
 public:
-  virtual ~ITaskScheduler() = default;
+  virtual ~ITaskQueue() = default;
 
-  // Open the scheduler and start accepting new tasks.
+  // Open the queue and start accepting new tasks.
   virtual void Open() = 0;
 
-  // Close the scheduler and stop processing new tasks.
+  // Close the queue and stop processing new tasks.
   virtual void Close() = 0;
 
-  // Add a task to the scheduler.
-  virtual void Push(duckdb::unique_ptr<ITask> task) = 0;
+  // Add a task to the queue.
+  virtual void Push(std::unique_ptr<ITask> task) = 0;
 
-  // Pull a task. Wait until a task available or the scheduler is closed.
-  virtual duckdb::unique_ptr<ITask> Pull() = 0;
+  // Pull a task from the queue. Wait until a task available or the queue is closed.
+  virtual std::unique_ptr<ITask> Pull() = 0;
 };
 
 } // namespace parallel
