@@ -18,14 +18,12 @@ jobs:
         with:
           submodules: recursive
           fetch-depth: 0
-      - name: Setup
-        run: |
-          source setup_sirius.sh
       - name: Build
         run: |
           export LIBCUDF_ENV_PREFIX=~/miniconda3/envs/libcudf-env
           source ~/miniconda3/etc/profile.d/conda.sh
           conda activate libcudf-env
+          source setup_sirius.sh
           make -j$(nproc)
       - name: Run C++ unit tests
         run: |
