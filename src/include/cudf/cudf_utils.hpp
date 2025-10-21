@@ -23,6 +23,8 @@
 #include <cudf/join/mixed_join.hpp>
 #include <cudf/join/conditional_join.hpp>
 #include <cudf/join/distinct_hash_join.hpp>
+#include <cudf/detail/aggregation/aggregation.hpp>
+#include <cudf/detail/stream_compaction.hpp>
 #else
 #include <cudf/join.hpp>
 #endif

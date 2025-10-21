@@ -150,7 +150,15 @@ void cudf_aggregate(vector<shared_ptr<GPUColumn>>& column, uint64_t num_aggregat
         } else if (agg_mode[agg] == AggregationType::COUNT_DISTINCT) {
             auto aggregate = make_reduce_aggregation<cudf::reduce_aggregation::NUNIQUE>();
             auto cudf_column = column[agg]->convertToCudfColumn();
-            auto result = cudf::reduce(cudf_column, *aggregate, cudf_column.type());
+            std::unique_ptr<cudf::scalar> result;
+// cudf higher than 25.04 will trigger `NUNIQUE is not supported for boolean or non-numeric types`
+#if CUDF_VERSION_NUM > 2504
+            auto nunique_agg = static_cast<cudf::detail::nunique_aggregation const&>(*aggregate);
+            result = cudf::make_fixed_width_scalar(
+                cudf::detail::distinct_count(cudf_column, nunique_agg._null_handling, cudf::nan_policy::NAN_IS_VALID, cudf::get_default_stream()));
+#else
+            result = cudf::reduce(cudf_column, *aggregate, cudf_column.type());
+#endif
             column[agg]->setFromCudfScalar(*result, gpuBufferManager);
         } else if (agg_mode[agg] == AggregationType::FIRST) {
             uint32_t* bitmask_host = gpuBufferManager->customCudaHostAlloc<uint32_t>(1);
