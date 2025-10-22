@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "cudf/cudf_utils.hpp"
 #include "duckdb/common/assert.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"

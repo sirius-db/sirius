@@ -16,6 +16,9 @@
 
 #pragma once
 
+#include <cudf/version_config.hpp>
+#define CUDF_VERSION_NUM (CUDF_VERSION_MAJOR * 100 + CUDF_VERSION_MINOR)
+
 #include <cudf/table/table.hpp>
 #if CUDF_VERSION_NUM > 2504
 #include <cudf/join/join.hpp>
