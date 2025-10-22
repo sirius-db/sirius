@@ -155,8 +155,9 @@ struct StringMatchingDispatcher
       }
       else if constexpr (MatchType == StringMatchingType::CONTAINS)
       {
-        // There is an int32 overflow bug in `contains()` to be fixed by cudf, have to use `like()` for now
+        // There is an int32 overflow bug in `contains()` before cudf-25.10, where we have to use `like()`
         // if the input is too large
+#if CUDF_VERSION_NUM < 2510
         bool can_use_contains = input->size() <= INT32_MAX / WARP_SIZE;
         if (can_use_contains) {
           return cudf::strings::contains(input->view(),
@@ -175,6 +176,15 @@ struct StringMatchingDispatcher
                                    cudf::string_scalar(""),
                                    executor.execution_stream,
                                    executor.resource_ref);
+#else
+        return cudf::strings::contains(input->view(),
+                                       cudf::string_scalar(match_str,
+                                                           true,
+                                                           executor.execution_stream,
+                                                           executor.resource_ref),
+                                       executor.execution_stream,
+                                       executor.resource_ref);
+#endif
       }
       else if constexpr (MatchType == StringMatchingType::PREFIX)
       {
