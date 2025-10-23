@@ -26,29 +26,83 @@ namespace sirius {
 
 using sirius::memory::Tier;
 
+/**
+ * @brief A view into a DataBatch that provides CUDF table interface while managing reference counting.
+ * 
+ * DataBatchView extends cudf::table_view to provide a high-level interface for working with
+ * columnar data while maintaining proper reference counting on the underlying DataBatch.
+ * This ensures that the DataBatch cannot be evicted or destroyed while views are still active.
+ * 
+ * Key characteristics:
+ * - Inherits from cudf::table_view, providing full CUDF API compatibility
+ * - Automatically manages reference counting on construction/destruction/assignment
+ * - Copyable (each copy increments reference count)
+ * - Thread-safe reference counting operations
+ * - RAII semantics ensure proper cleanup
+ * 
+ * Usage pattern:
+ * ```cpp
+ * auto view = std::make_unique<DataBatchView>(batch, columns);
+ * // Use view with any CUDF operations
+ * auto result = cudf::filter(view->select({0, 1}), predicate);
+ * // Reference count automatically decremented when view goes out of scope
+ * ```
+ * 
+ * @note The underlying DataBatch must remain valid for the lifetime of any views referencing it.
+ */
 class DataBatchView : public cudf::table_view {
 public:
+    /**
+     * @brief Construct a new DataBatchView from a DataBatch and column specifications.
+     * 
+     * @param batch Pointer to the DataBatch to create a view of (must remain valid)
+     * @param cols Vector of column views that define the structure of this table view
+     * 
+     * @note Automatically increments the reference count on the provided batch
+     */
     DataBatchView(DataBatch* batch, std::vector<cudf::column_view> const& cols)
         : cudf::table_view(cols), batch_(batch) {
-        batch_->increment_refcount();
+        batch_->IncrementRefCount();
     }
 
+    /**
+     * @brief Copy constructor - creates a new view referencing the same batch.
+     * 
+     * @param other The DataBatchView to copy from
+     * 
+     * @note Automatically increments the reference count on the underlying batch
+     */
     DataBatchView(const DataBatchView& other)
         : cudf::table_view(other), batch_(other.batch_) {
-        batch_->increment_refcount();
+        batch_->IncrementRefCount();
     }
 
+    /**
+     * @brief Copy assignment operator - updates this view to reference a different batch.
+     * 
+     * Properly manages reference counts by decrementing the old batch's count (implicitly
+     * through destruction) and incrementing the new batch's count.
+     * 
+     * @param other The DataBatchView to copy from
+     * @return DataBatchView& Reference to this view
+     */
     DataBatchView& operator=(const DataBatchView& other) {
         if (this != &other) {
             cudf::table_view::operator=(other);
             batch_ = other.batch_;
-            batch_->increment_refcount();
+            batch_->IncrementRefCount();
         }
         return *this;
     }
 
+    /**
+     * @brief Destructor - automatically decrements the reference count on the underlying batch.
+     * 
+     * This enables the DataBatch to be safely evicted or destroyed when no more views
+     * are referencing it.
+     */
     ~DataBatchView() {
-        batch_->decrement_refcount();
+        batch_->DecrementRefCount();
     }
 
 private:

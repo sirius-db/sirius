@@ -31,36 +31,40 @@ using sirius::memory::Tier;
  * @brief Data representation for a table being stored in GPU memory.
  * 
  * This class currently represents a table just as a cuDF table along with the allocation where the cudf's table data actually resides.
- * The primary purpose for this is to that the table can be directly passed to cuDF APIs for processing without any additional copying
+ * The primary purpose for this is that the table can be directly passed to cuDF APIs for processing without any additional copying
  * while the underlying memory is still owned/tracked by our memory allocator.
  * 
  * TODO: Once the GPU memory resource is implemented, replace the allocation type from IAllocatedMemory to the concrete
  * type returned by the GPU memory allocator.  
  */
-class gpu_table_representation : public IDataRepresentation {
+class GPUTableRepresentation : public IDataRepresentation {
 public:    
     /**
-     * @brief Construct a new gpu_table_representation object
+     * @brief Construct a new GpuTableRepresentation object
      * 
-     * @param alloc The underlying allocation owning the actual data
      * @param table The actual cuDF table with the data
-     * @param data_sz The size of the actual data in bytes
      */
-    gpu_table_representation(cudf::table table, std::size_t data_sz)
-        : table_(std::move(table)), data_size_(data_sz) {}
+    GPUTableRepresentation(cudf::table table)
+        : table_(std::move(table)) {}
     
     /**
      * @brief Get the tier of memory that this representation resides in
      */
-    Tier getCurrentTier() const override { return Tier::GPU; }
+    Tier GetCurrentTier() const override { return Tier::GPU; }
+
+    /**
+     * @brief Get the size of the data representation in bytes
+     * 
+     * @return std::size_t The number of bytes used to store this representation
+     */
+    std::size_t GetSizeInBytes() const override;
 
     /**
      * @brief Get the underlying cuDF table
      * 
      * @return const cudf::table& Reference to the cuDF table
      */
-    const cudf::table& get_table() const { return table_; }
-
+    const cudf::table& GetTable() const { return table_; }
 
     /**
      * @brief Convert this GPU table representation to a different memory tier
@@ -68,9 +72,9 @@ public:
      * @param target_tier The target memory tier to convert to
      * @return sirius::unique_ptr<IDataRepresentation> A new data representation in the target tier
      */
-    sirius::unique_ptr<IDataRepresentation> convertToTier(Tier target_tier) override;
+    sirius::unique_ptr<IDataRepresentation> ConvertToTier(Tier target_tier) override;
 
-public:
+private:
     cudf::table table_; ///< The actual cuDF table with the data
 };
 

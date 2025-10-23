@@ -20,13 +20,69 @@
 
 namespace sirius {
 
+/**
+ * @brief Abstract interface for managing collections of DataBatchView objects within a pipeline.
+ * 
+ * IDataRepository defines the contract for storing, retrieving, and managing data batches
+ * within a specific pipeline. Different implementations can provide various storage strategies,
+ * such as:
+ * - FIFO (First In, First Out) repositories for streaming data
+ * - LRU (Least Recently Used) repositories for caching scenarios
+ * - Priority-based repositories for workload-aware scheduling
+ * 
+ * The repository is responsible for:
+ * - Managing the lifecycle of DataBatchView objects
+ * - Implementing eviction policies when memory pressure occurs
+ * - Providing downgrade candidates for memory tier management
+ * - Thread-safe access to shared data structures
+ * 
+ * @note Implementations must be thread-safe as multiple threads may access
+ *       the repository concurrently during query execution.
+ */
 class IDataRepository {
 public:
-    virtual void AddNewDataBatch(sirius::unique_ptr<DataBatchView> data_batch) = 0;
+    /**
+     * @brief Add a new data batch to this repository.
+     * 
+     * The repository takes ownership of the DataBatchView and will manage its lifecycle
+     * according to the implementation's storage policy.
+     * 
+     * @param data_batch Unique pointer to the DataBatchView to add (ownership transferred)
+     * 
+     * @note Thread-safe operation protected by internal mutex
+     */
+    virtual void AddNewDataBatchView(sirius::unique_ptr<DataBatchView> data_batch) = 0;
 
-    virtual sirius::unique_ptr<DataBatchView> EvictDataBatch() = 0;
+    /**
+     * @brief Remove and return a data batch from this repository according to eviction policy.
+     * 
+     * The specific data batch returned depends on the implementation's eviction strategy:
+     * - FIFO: Returns the oldest batch
+     * - LRU: Returns the least recently used batch
+     * - Priority: Returns the lowest priority batch
+     * 
+     * @return sirius::unique_ptr<DataBatchView> The evicted data batch, or nullptr if empty
+     * 
+     * @note Thread-safe operation protected by internal mutex
+     */
+    virtual sirius::unique_ptr<DataBatchView> EvictDataBatchView() = 0;
 
-    virtual std::vector<uint64_t> GetDowngradableDataBatches(size_t num_data_batches) = 0;
+    /**
+     * @brief Get a list of data batch IDs that are candidates for tier downgrading.
+     * 
+     * This method identifies data batches that can be moved to lower-cost memory tiers
+     * (e.g., from GPU memory to host memory) to free up high-performance memory.
+     * The selection criteria depend on the implementation but typically consider:
+     * - Access patterns and frequency
+     * - Age of the data batch
+     * - Reference count (batches with no active views are preferred)
+     * 
+     * @param num_data_batches Maximum number of candidates to return
+     * @return std::vector<uint64_t> Vector of batch IDs suitable for downgrading
+     * 
+     * @note Thread-safe operation protected by internal mutex
+     */
+    virtual std::vector<uint64_t> GetDowngradableDataBatches(size_t size_in_bytes) = 0;
 private:
     sirius::mutex mutex_;                                      ///< Mutex for thread-safe access to repository operations
     sirius::vector<sirius::unique_ptr<DataBatchView>> data_batches_;  ///< Map of pipeline source to DataBatchView

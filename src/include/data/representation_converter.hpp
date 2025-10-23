@@ -31,50 +31,50 @@
 
 namespace sirius {
 
-using sirius::multiple_blocks_allocation;
-using sirius::host_table_representation;
-using sirius::gpu_table_representation;
+using sirius::MultipleBlocksAllocation;
+using sirius::HostTableRepresentation;
+using sirius::GPUTableRepresentation;
 
 /**
  * @brief Utility class for converting between different DataRepresentation types.
  */
-class data_representation_converter {
+class DataRepresentationConverter {
 public:
     /**
-     * @brief Converts a gpu_table_representation to a host_table_representation
+     * @brief Converts a GPUTableRepresentation to a HostTableRepresentation
      * 
-     * This function takes a gpu_table_representation, converts its cuDF table it to packed columns (contiguous memory layout),
+     * This function takes a GpuTableRepresentation, converts its cuDF table to packed columns (contiguous memory layout),
      * and then copies both the data and metadata piece by piece into a multiple_blocks_allocation
      * using the provided memory resource. The metadata is preserved so the cuDF columns can be
      * recreated later using cudf::unpack().
      * 
-     * @param table The cuDF table to convert
+     * @param table The GPU table representation to convert
      * @param mr The host memory resource to use for allocation
      * @param stream CUDA stream to use for memory operations
-     * @return host_table_representation containing both the allocation and metadata for recreation
+     * @return sirius::unique_ptr<HostTableRepresentation> containing both the allocation and metadata for recreation
      * @throws sirius::bad_alloc if memory allocation fails
      */
-    static sirius::unique_ptr<host_table_representation>
-    convert_to_host_representation(const sirius::unique_ptr<gpu_table_representation>& table,
-                    fixed_size_host_memory_resource* mr,
-                    rmm::cuda_stream_view stream);
+    static sirius::unique_ptr<HostTableRepresentation>
+    ConvertToHostRepresentation(const sirius::unique_ptr<GPUTableRepresentation>& table,
+                               FixedSizeHostMemoryResource* mr,
+                               rmm::cuda_stream_view stream);
 
     /**
-     * @brief Converts a host_table_representation to a gpu_table_representation
+     * @brief Converts a HostTableRepresentation to a GPUTableRepresentation
      * 
-     * This function first copies the data from the host representation's multiple_blocks_allocation into a contingous buffer
+     * This function first copies the data from the host representation's multiple_blocks_allocation into a contiguous buffer
      * using the provided memory resource. It then uses cudf::unpack() along with the preserved metadata to recreate the original cuDF table.
-     * The resulting cuDF table is then wrapped in a gpu_table_representation.
+     * The resulting cuDF table is then wrapped in a GpuTableRepresentation.
      * 
-     * @param table The table allocation containing the packed data and metadata
+     * @param table The host table representation containing the packed data and metadata
      * @param mr The GPU memory resource to use for allocation
      * @param stream CUDA stream to use for memory operations
-     * @return cudf::table The recreated table (owns the data)
+     * @return sirius::unique_ptr<GpuTableRepresentation> The recreated table (owns the data)
      */
-    static sirius::unique_ptr<gpu_table_representation> 
-    convert_to_gpu_representation(const sirius::unique_ptr<host_table_representation>& table, 
-                    rmm::mr::device_memory_resource* mr, // TODO: Replace eventually with actual allocator type 
-                    rmm::cuda_stream_view stream);
+    static sirius::unique_ptr<GPUTableRepresentation> 
+    ConvertToGPURepresentation(const sirius::unique_ptr<HostTableRepresentation>& table, 
+                              rmm::mr::device_memory_resource* mr, // TODO: Replace eventually with actual allocator type 
+                              rmm::cuda_stream_view stream);
 
 private:
     /**
@@ -84,13 +84,13 @@ private:
      * @param mr The memory resource to use for allocation
      * @param data_size Output parameter: size of the data
      * @param stream CUDA stream to use for memory operations
-     * @return multiple_blocks_allocation RAII wrapper containing the copied data
+     * @return sirius::unique_ptr<multiple_blocks_allocation> RAII wrapper containing the copied data
      */
-    static sirius::unique_ptr<multiple_blocks_allocation> 
-    copy_data_to_host(const rmm::device_buffer* gpu_data, 
-                      fixed_size_host_memory_resource* mr,
-                      std::size_t& data_size,
-                      rmm::cuda_stream_view stream);
+    static sirius::unique_ptr<MultipleBlocksAllocation> 
+    CopyDataToHost(const rmm::device_buffer* gpu_data, 
+                   FixedSizeHostMemoryResource* mr,
+                   std::size_t& data_size,
+                   rmm::cuda_stream_view stream);
 
 };
 } // namespace sirius

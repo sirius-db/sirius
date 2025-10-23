@@ -25,42 +25,41 @@
 namespace sirius {
 
 using sirius::memory::Tier;
-using sirius::multiple_blocks_allocation;
+using sirius::MultipleBlocksAllocation;
 
 /**
  * @brief Data representation for a table being stored in host memory.
  * 
- * This represents a table who data is stored across multiple blocks (not necessarily contiguous) in host memory.
- * The host_table_representation doesn't own the actual data but is instead owned by the multiple_blocks_allocation.
+ * This represents a table whose data is stored across multiple blocks (not necessarily contiguous) in host memory.
+ * The HostTableRepresentation doesn't own the actual data but is instead owned by the multiple_blocks_allocation.
  */
-class host_table_representation : public IDataRepresentation {
+class HostTableRepresentation : public IDataRepresentation {
 public:  
     /**
-     * @brief Construct a new host_table_representation object
+     * @brief Construct a new HostTableRepresentation object
      * 
-     * @param alloc The underlying allocation owning the actual data
+     * @param allocation_blocks The underlying allocation owning the actual data
      * @param meta Metadata required to reconstruct the cuDF columns (using cudf::unpack())
-     * @param data_sz The size of the actual data in bytes
+     * @param size The size of the actual data in bytes
      */
-    host_table_representation(sirius::unique_ptr<multiple_blocks_allocation> alloc,
-                     sirius::unique_ptr<sirius::vector<uint8_t>> meta,
-                     std::size_t data_sz)
-        : allocation(std::move(alloc)), metadata(std::move(meta)), data_size(data_sz) {}
-    
+    HostTableRepresentation(sirius::unique_ptr<MultipleBlocksAllocation> allocation_blocks,
+                           sirius::unique_ptr<sirius::vector<uint8_t>> meta,
+                           std::size_t size)
+        : allocation_(std::move(allocation_blocks)), metadata_(std::move(meta)), data_size_(size) {}
     
     /**
      * @brief Get the tier of memory that this representation resides in
      * 
      * @return Tier The memory tier
      */
-    Tier getCurrentTier() const override { return Tier::HOST; }
+    Tier GetCurrentTier() const override { return Tier::HOST; }
 
     /**
-     * @brief Get the metadata required to reconstruct the cuDF columns
+     * @brief Get the size of the data representation in bytes
      * 
-     * @return const sirius::vector<uint8_t>& Reference to the metadata
+     * @return std::size_t The number of bytes used to store this representation
      */
-    const sirius::vector<uint8_t>& getMetadata() const { return *metadata; }
+    std::size_t GetSizeInBytes() const override { return data_size_; }
 
     /**
      * @brief Convert this CPU table representation to a different memory tier
@@ -68,11 +67,14 @@ public:
      * @param target_tier The target memory tier to convert to
      * @return sirius::unique_ptr<IDataRepresentation> A new data representation in the target tier
      */
-    sirius::unique_ptr<IDataRepresentation> convertToTier(Tier target_tier) override;
+    sirius::unique_ptr<IDataRepresentation> ConvertToTier(Tier target_tier) override;
 
 public:
-    sirius::unique_ptr<multiple_blocks_allocation> allocation; // The allocation where the actual data resides
-    sirius::unique_ptr<sirius::vector<uint8_t>> metadata; // The metadata required to reconstruct the cuDF columns
+    sirius::unique_ptr<MultipleBlocksAllocation> allocation_; ///< The allocation where the actual data resides
+    sirius::unique_ptr<sirius::vector<uint8_t>> metadata_;     ///< The metadata required to reconstruct the cuDF columns
+
+private:
+    std::size_t data_size_;  ///< The size of the actual data in bytes
 };
 
 }
