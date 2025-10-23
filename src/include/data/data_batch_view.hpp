@@ -17,6 +17,7 @@
 #pragma once
 #include <variant>
 #include <memory>
+#include <stdexcept>
 #include <cudf/table/table.hpp>
 
 #include "helper/helper.hpp"
@@ -55,25 +56,37 @@ public:
     /**
      * @brief Construct a new DataBatchView from a DataBatch and column specifications.
      * 
+     * This constructor performs the following thread-safe operations:
+     * 1. Acquires a lock on the DataBatch
+     * 2. Validates that the data is currently in GPU tier
+     * 3. Increments the reference count
+     * 4. Releases the lock
+     * 
      * @param batch Pointer to the DataBatch to create a view of (must remain valid)
      * @param cols Vector of column views that define the structure of this table view
      * 
+     * @throws std::runtime_error if the data is not currently in GPU tier
      * @note Automatically increments the reference count on the provided batch
      */
     DataBatchView(DataBatch* batch, std::vector<cudf::column_view> const& cols)
         : cudf::table_view(cols), batch_(batch) {
+        // Thread-safe: acquire lock, validate GPU tier, increment ref count, release lock
         batch_->IncrementRefCount();
     }
 
     /**
      * @brief Copy constructor - creates a new view referencing the same batch.
      * 
+     * Performs thread-safe validation and reference counting operations.
+     * 
      * @param other The DataBatchView to copy from
      * 
+     * @throws std::runtime_error if the data is not currently in GPU tier
      * @note Automatically increments the reference count on the underlying batch
      */
     DataBatchView(const DataBatchView& other)
         : cudf::table_view(other), batch_(other.batch_) {
+        // Thread-safe: acquire lock, validate GPU tier, increment ref count, release lock
         batch_->IncrementRefCount();
     }
 
@@ -81,15 +94,18 @@ public:
      * @brief Copy assignment operator - updates this view to reference a different batch.
      * 
      * Properly manages reference counts by decrementing the old batch's count (implicitly
-     * through destruction) and incrementing the new batch's count.
+     * through destruction) and incrementing the new batch's count with validation.
      * 
      * @param other The DataBatchView to copy from
      * @return DataBatchView& Reference to this view
+     * 
+     * @throws std::runtime_error if the new data is not currently in GPU tier
      */
     DataBatchView& operator=(const DataBatchView& other) {
         if (this != &other) {
             cudf::table_view::operator=(other);
             batch_ = other.batch_;
+            // Thread-safe: acquire lock, validate GPU tier, increment ref count, release lock
             batch_->IncrementRefCount();
         }
         return *this;

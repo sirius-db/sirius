@@ -17,6 +17,7 @@
 #pragma once
 #include <variant>
 #include <memory>
+#include <stdexcept>
 #include <cudf/table/table.hpp>
 
 #include "helper/helper.hpp"
@@ -101,26 +102,37 @@ public:
     }
 
     /**
-     * @brief Atomically increment the reference count.
-     * 
-     * Called when a new DataBatchView is created that references this batch.
-     * Uses relaxed memory ordering as reference counting doesn't require synchronization
-     * with other memory operations.
-     */
-    void IncrementRefCount() {
-        ref_count_.fetch_add(1, std::memory_order_relaxed);
-    }
-
-    /**
      * @brief Atomically decrement the reference count.
      * 
      * Called when a DataBatchView is destroyed. When the reference count reaches zero,
      * this batch can be safely evicted or moved between memory tiers.
      * Uses relaxed memory ordering as reference counting doesn't require synchronization
-     * with other memory operations.
+     * 
+     * @throws std::runtime_error if data is not currently in GPU tier
      */
     void DecrementRefCount() {
+        std::lock_guard<sirius::mutex> lock(mutex_);
+        if (data_->getCurrentTier() != Tier::GPU) {
+            throw std::runtime_error("DataBatchView should always be in GPU tier");
+        }
         ref_count_.fetch_sub(1, std::memory_order_relaxed);
+    }
+
+    /**
+     * @brief Thread-safe method to increment reference count with tier validation.
+     * 
+     * This method is used by DataBatchView constructor to ensure the data is in GPU tier
+     * before creating a view. Provides thread-safe access to both tier checking and
+     * reference count incrementing.
+     * 
+     * @throws std::runtime_error if data is not currently in GPU tier
+     */
+    void IncrementRefCount() {
+        std::lock_guard<sirius::mutex> lock(mutex_);
+        if (data_->getCurrentTier() != Tier::GPU) {
+            throw std::runtime_error("DataBatch data must be in GPU tier to create DataBatchView");
+        }
+        ref_count_.fetch_add(1, std::memory_order_relaxed);
     }
 
     /**
@@ -135,6 +147,7 @@ public:
     }
 
 private:
+    mutable sirius::mutex mutex_;                         ///< Mutex for thread-safe access to tier checking and reference counting
     uint64_t batch_id_;                                   ///< Unique identifier for this data batch
     sirius::unique_ptr<IDataRepresentation> data_;       ///< Pointer to the actual data representation
     sirius::atomic<size_t> ref_count_ = 0;               ///< Reference count for tracking usage
