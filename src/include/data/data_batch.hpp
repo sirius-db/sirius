@@ -27,47 +27,17 @@ namespace sirius {
 
 using sirius::memory::Tier;
 
-/**
- * @brief A container representing input and output data units for pipeline operations.
- * 
- * The DataBatch in Sirius represents a batch/chunk/row group of data that is processed
- * by or output from a task within a pipeline, following the "morsel-driven" execution
- * model used by many modern database systems. The underlying data can be stored in
- * different memory tiers and formats, with ownership managed by the underlying
- * IDataRepresentation rather than the DataBatch itself.
- * 
- * This design allows for efficient data movement between different memory hierarchies
- * (GPU memory, CPU memory, disk) while maintaining a consistent interface for
- * pipeline operations.
- */
 class DataBatch {
 public:
-    /**
-     * @brief Constructs a new DataBatch object
-     * 
-     * @param batch_id Unique identifier for this data batch
-     * @param data The actual data representation associated with this batch
-     */
     DataBatch(uint64_t batch_id, sirius::unique_ptr<IDataRepresentation> data) 
         : batch_id_(batch_id), data_(std::move(data)) {}
     
-    /**
-     * @brief Move constructor for DataBatch
-     * 
-     * @param other The DataBatch object to move from
-     */
     DataBatch(DataBatch&& other) noexcept
         : batch_id_(other.batch_id_), data_(std::move(other.data_)) {
         other.batch_id_ = 0;
         other.data_ = nullptr;
     }
 
-    /**
-     * @brief Move assignment operator for DataBatch
-     * 
-     * @param other The DataBatch object to move from
-     * @return DataBatch& Reference to this object
-     */
     DataBatch& operator=(DataBatch&& other) noexcept {
         if (this != &other) {
             batch_id_ = other.batch_id_;
@@ -78,27 +48,26 @@ public:
         return *this;
     }
 
-    /**
-     * @brief Gets the memory tier where this data batch currently resides
-     * 
-     * @return Tier The memory tier (e.g., GPU, CPU, disk) where the data is stored
-     */
     Tier getCurrentTier() const {
         return data_->getCurrentTier();
     }
 
-    /**
-     * @brief Gets this DataBatch's unique identifier
-     * 
-     * @return uint64_t The unique identifier associated with this DataBatch
-     */
     uint64_t getBatchId() const {
         return batch_id_;
+    }
+
+    void increment_refcount() {
+        ref_count_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void decrement_refcount() {
+        ref_count_.fetch_sub(1, std::memory_order_relaxed);
     }
 
 private:
     uint64_t batch_id_;                                   ///< Unique identifier for this data batch
     sirius::unique_ptr<IDataRepresentation> data_;       ///< Pointer to the actual data representation
+    sirius::atomic<size_t> ref_count_ = 0;               ///< Reference count for tracking usage
 };
 
 } // namespace sirius
