@@ -64,13 +64,11 @@ public:
     /**
      * @brief Convert this CPU table representation to a different memory tier
      * 
-     * @param target_tier The target memory tier to convert to
      * @param device_mr The device memory resource to use for GPU tier allocations
      * @param stream CUDA stream to use for memory operations
      * @return sirius::unique_ptr<IDataRepresentation> A new data representation in the target tier
      */
     sirius::unique_ptr<IDataRepresentation> ConvertToGPU(
-        Tier target_tier,
         rmm::mr::device_memory_resource* device_mr = nullptr,
         rmm::cuda_stream_view stream = rmm::cuda_stream_default);
 
