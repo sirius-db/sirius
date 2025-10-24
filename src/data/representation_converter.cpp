@@ -21,11 +21,14 @@
 namespace sirius {
 
 sirius::unique_ptr<HostTableRepresentation>
-DataRepresentationConverter::ConvertToHostRepresentation(const sirius::unique_ptr<GPUTableRepresentation>& table) {
+DataRepresentationConverter::ConvertToHostRepresentation(const sirius::unique_ptr<GPUTableRepresentation>& table, FixedSizeHostMemoryResource* mr,
+                               rmm::cuda_stream_view stream) {
 }
 
 sirius::unique_ptr<GPUTableRepresentation> 
-DataRepresentationConverter::ConvertToGPURepresentation(const sirius::unique_ptr<HostTableRepresentation>& table) {
+DataRepresentationConverter::ConvertToGPURepresentation(const sirius::unique_ptr<HostTableRepresentation>& table, 
+                              rmm::mr::device_memory_resource* mr, // TODO: Replace eventually with actual allocator type 
+                              rmm::cuda_stream_view stream) {
 }
 
 } // namespace sirius
