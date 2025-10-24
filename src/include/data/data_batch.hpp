@@ -26,6 +26,8 @@
 
 namespace sirius {
 
+class DataBatchView; // Forward declaration
+
 using sirius::memory::Tier;
 
 /**
@@ -89,7 +91,7 @@ public:
      * @return Tier The memory tier (GPU, HOST, or STORAGE)
      */
     Tier GetCurrentTier() const {
-        return data_->getCurrentTier();
+        return data_->GetCurrentTier();
     }
 
     /**
@@ -112,7 +114,7 @@ public:
      */
     void DecrementRefCount() {
         std::lock_guard<sirius::mutex> lock(mutex_);
-        if (data_->getCurrentTier() != Tier::GPU) {
+        if (data_->GetCurrentTier() != Tier::GPU) {
             throw std::runtime_error("DataBatchView should always be in GPU tier");
         }
         ref_count_.fetch_sub(1, std::memory_order_relaxed);
@@ -129,7 +131,7 @@ public:
      */
     void IncrementRefCount() {
         std::lock_guard<sirius::mutex> lock(mutex_);
-        if (data_->getCurrentTier() != Tier::GPU) {
+        if (data_->GetCurrentTier() != Tier::GPU) {
             throw std::runtime_error("DataBatch data must be in GPU tier to create DataBatchView");
         }
         ref_count_.fetch_add(1, std::memory_order_relaxed);
@@ -142,8 +144,18 @@ public:
      * 
      * @return sirius::unique_ptr<DataBatchView> A unique pointer to the new DataBatchView
      */
-    sirius::unique_ptr<DataBatchView> CreateDataBatchView() {
-        return sirius::make_unique<DataBatchView>(this, cols);
+    sirius::unique_ptr<DataBatchView> CreateView();
+
+    /**
+     * @brief Get the current reference count.
+     * 
+     * Returns the number of DataBatchViews currently referencing this batch.
+     * 
+     * @return size_t The current reference count
+     * @note Thread-safe atomic operation
+     */
+    size_t GetRefCount() const {
+        return ref_count_.load(std::memory_order_relaxed);
     }
 
 private:

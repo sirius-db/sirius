@@ -21,6 +21,7 @@
 #include <cudf/table/table.hpp>
 
 #include "helper/helper.hpp"
+#include "data/data_batch.hpp"
 #include "data/common.hpp"
 
 namespace sirius {
@@ -68,8 +69,8 @@ public:
      * @throws std::runtime_error if the data is not currently in GPU tier
      * @note Automatically increments the reference count on the provided batch
      */
-    DataBatchView(DataBatch* batch, std::vector<cudf::column_view> const& cols)
-        : cudf::table_view(cols), batch_(batch) {
+    DataBatchView(DataBatch* batch, const std::vector<cudf::column_view>& cols)
+        : batch_(batch), cudf::table_view(cols) {
         // Thread-safe: acquire lock, validate GPU tier, increment ref count, release lock
         batch_->IncrementRefCount();
     }

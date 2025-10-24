@@ -69,7 +69,10 @@ public:
      * 
      * @note Thread-safe operation
      */
-    void AddNewRepository(size_t pipeline_id, sirius::unique_ptr<IDataRepository> repository);
+    void AddNewRepository(size_t pipeline_id, sirius::unique_ptr<IDataRepository> repository) {
+        sirius::lock_guard<sirius::mutex> lock(mutex_);
+        repositories[pipeline_id] = std::move(repository);
+    }
 
     /**
      * @brief Add a data batch to the repository for the specified pipeline.
@@ -83,7 +86,14 @@ public:
      * @throws std::out_of_range If no repository exists for the specified pipeline
      * @note Thread-safe operation
      */
-    void AddNewDataBatch(size_t pipeline_id, sirius::unique_ptr<DataBatchView> data_batch_view);
+    void AddNewDataBatchView(size_t pipeline_id, sirius::unique_ptr<DataBatchView> data_batch_view) {        
+        auto it = repositories.find(pipeline_id);
+        if (it == repositories.end()) {
+            throw std::out_of_range("No repository found for pipeline ID: " + std::to_string(pipeline_id));
+        }
+        
+        it->second->AddNewDataBatchView(std::move(data_batch_view));
+    }
 
     /**
      * @brief Evict a data batch from the repository for the specified pipeline.
@@ -97,7 +107,69 @@ public:
      * @throws std::out_of_range If no repository exists for the specified pipeline
      * @note Thread-safe operation
      */
-    sirius::unique_ptr<DataBatchView> EvictDataBatch(size_t pipeline_id);
+    sirius::unique_ptr<DataBatchView> EvictDataBatchView(size_t pipeline_id) {
+        auto it = repositories.find(pipeline_id);
+        if (it == repositories.end()) {
+            throw std::out_of_range("No repository found for pipeline ID: " + std::to_string(pipeline_id));
+        }
+        
+        return it->second->EvictDataBatchView();
+    }
+
+    /**
+     * @brief Add a new DataBatch to the holder.
+     * 
+     * This method stores the actual DataBatch object in the manager's holder.
+     * DataBatchViews reference these batches.
+     * 
+     * @param data_batch The DataBatch to add (ownership transferred)
+     * 
+     * @note Thread-safe operation
+     */
+    void AddNewDataBatch(DataBatch data_batch) {
+        sirius::lock_guard<sirius::mutex> lock(mutex_);
+        holder.push_back(std::move(data_batch));
+    }
+
+    /**
+     * @brief Destroy a DataBatch from the holder.
+     * 
+     * This method removes a DataBatch from the holder and destroy it. It should only be called
+     * when the reference counter is zero (i.e., no DataBatchViews are referencing it).
+     * 
+     * @param batch_id The unique ID of the batch to destroy
+     * 
+     * @throws std::out_of_range If no batch exists with the given ID
+     * @note Thread-safe operation
+     * @warning Caller must ensure the reference count is zero before calling this method
+     */
+    void DestroyDataBatch(uint64_t batch_id) {
+        sirius::lock_guard<sirius::mutex> lock(mutex_);
+        
+        // Find the data batch with the given ID
+        auto it = std::find_if(holder.begin(), holder.end(),
+            [batch_id](const DataBatch& batch) {
+                return batch.GetBatchId() == batch_id;
+            });
+        
+        if (it == holder.end()) {
+            throw std::out_of_range("No data batch found with ID: " + std::to_string(batch_id));
+        }
+        
+        // Check if the reference counter is zero
+        if (it->GetRefCount() != 0) {
+            throw std::runtime_error("Cannot destroy DataBatch with ID " + std::to_string(batch_id) + 
+                                    " because it still has " + std::to_string(it->GetRefCount()) + 
+                                    " active reference(s)");
+        }
+        
+        // Erase the batch from the holder
+        // This will invoke the DataBatch destructor, which will:
+        // 1. Destroy the underlying IDataRepresentation (via unique_ptr)
+        // 2. Deallocate all associated memory (GPU/Host/Disk)
+        // 3. Release the DataBatch object itself
+        holder.erase(it);
+    }
 
     /**
      * @brief Get direct access to a pipeline's repository for advanced operations.
@@ -134,7 +206,7 @@ private:
     mutex mutex_;                                      ///< Mutex for thread-safe access to holder
     sirius::atomic<uint64_t> next_data_batch_id_ = 0;  ///< Atomic counter for generating unique data batch identifiers
     sirius::unordered_map<size_t, sirius::unique_ptr<IDataRepository>> repositories; ///< Map of pipeline ID to IDataRepository
-    sirius::unordered_map<size_t, DataBatch*> holder;  ///< Map to hold the actual DataBatch
+    sirius::vector<DataBatch> holder;  ///< Map to hold the actual DataBatch
 };
 
 }

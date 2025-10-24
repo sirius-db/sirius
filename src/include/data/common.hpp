@@ -38,14 +38,14 @@ public:
      * 
      * @return Tier The memory tier
      */
-    virtual Tier getCurrentTier() const = 0;
+    virtual Tier GetCurrentTier() const = 0;
 
     /**
      * @brief Get the size of the data representation in bytes
      * 
      * @return std::size_t The number of bytes used to store this representation
      */
-    virtual std::size_t getSizeInBytes() const = 0;
+    virtual std::size_t GetSizeInBytes() const = 0;
 
     /**
      * @brief Convert this representation to the target memory tier
@@ -53,7 +53,29 @@ public:
      * @param target_tier The target memory tier
      * @return sirius::unique_ptr<IDataRepresentation> The converted representation
      */
-    virtual sirius::unique_ptr<IDataRepresentation> convertToTier(Tier target_tier) = 0;
+    virtual sirius::unique_ptr<IDataRepresentation> ConvertToTier(Tier target_tier) = 0;
+
+    /**
+     * @brief Safely casts this interface to a specific derived type
+     * 
+     * @tparam TARGET The target type to cast to
+     * @return TARGET& Reference to the casted object
+     */
+	template <class TARGET>
+	TARGET &Cast() {
+		return reinterpret_cast<TARGET &>(*this);
+	}
+
+    /**
+     * @brief Safely casts this interface to a specific derived type (const version)
+     * 
+     * @tparam TARGET The target type to cast to
+     * @return const TARGET& Const reference to the casted object
+     */
+	template <class TARGET>
+	const TARGET &Cast() const {
+		return reinterpret_cast<const TARGET &>(*this);
+	}
 };
 
 } // namespace sirius

@@ -69,11 +69,9 @@ public:
      */
     sirius::unique_ptr<IDataRepresentation> ConvertToTier(Tier target_tier) override;
 
-public:
+private:
     sirius::unique_ptr<MultipleBlocksAllocation> allocation_; ///< The allocation where the actual data resides
     sirius::unique_ptr<sirius::vector<uint8_t>> metadata_;     ///< The metadata required to reconstruct the cuDF columns
-
-private:
     std::size_t data_size_;  ///< The size of the actual data in bytes
 };
 

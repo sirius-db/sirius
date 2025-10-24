@@ -51,7 +51,10 @@ public:
      * 
      * @note Thread-safe operation protected by internal mutex
      */
-    virtual void AddNewDataBatchView(sirius::unique_ptr<DataBatchView> data_batch) = 0;
+    virtual void AddNewDataBatchView(sirius::unique_ptr<DataBatchView> data_batch) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        data_batches_.push_back(std::move(data_batch));
+    }
 
     /**
      * @brief Remove and return a data batch from this repository according to eviction policy.
@@ -65,7 +68,15 @@ public:
      * 
      * @note Thread-safe operation protected by internal mutex
      */
-    virtual sirius::unique_ptr<DataBatchView> EvictDataBatchView() = 0;
+    virtual sirius::unique_ptr<DataBatchView> EvictDataBatchView() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (data_batches_.empty()) {
+            return nullptr;
+        }
+        auto batch = std::move(data_batches_.front());
+        data_batches_.erase(data_batches_.begin());
+        return batch;
+    }
 
     /**
      * @brief Get a list of data batch IDs that are candidates for tier downgrading.
