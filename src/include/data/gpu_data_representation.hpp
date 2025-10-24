@@ -70,9 +70,14 @@ public:
      * @brief Convert this GPU table representation to a different memory tier
      * 
      * @param target_tier The target memory tier to convert to
+     * @param host_mr The host memory resource to use for HOST tier allocations
+     * @param stream CUDA stream to use for memory operations
      * @return sirius::unique_ptr<IDataRepresentation> A new data representation in the target tier
      */
-    sirius::unique_ptr<IDataRepresentation> ConvertToTier(Tier target_tier) override;
+    sirius::unique_ptr<IDataRepresentation> ConvertToHost(
+        Tier target_tier,
+        FixedSizeHostMemoryResource* host_mr = nullptr,
+        rmm::cuda_stream_view stream = rmm::cuda_stream_default);
 
 private:
     cudf::table table_; ///< The actual cuDF table with the data

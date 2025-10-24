@@ -16,12 +16,18 @@
 
 #pragma once
 
+#include <rmm/cuda_stream_view.hpp>
+#include <rmm/mr/device/device_memory_resource.hpp>
+
 #include "memory/common.hpp"
 #include "helper/helper.hpp"
 
 namespace sirius {
 
 using sirius::memory::Tier;
+
+// Forward declarations
+class FixedSizeHostMemoryResource;
 
 /**
  * @brief Interface representing a data representation residing in a specific memory tier.
@@ -46,14 +52,6 @@ public:
      * @return std::size_t The number of bytes used to store this representation
      */
     virtual std::size_t GetSizeInBytes() const = 0;
-
-    /**
-     * @brief Convert this representation to the target memory tier
-     * 
-     * @param target_tier The target memory tier
-     * @return sirius::unique_ptr<IDataRepresentation> The converted representation
-     */
-    virtual sirius::unique_ptr<IDataRepresentation> ConvertToTier(Tier target_tier) = 0;
 
     /**
      * @brief Safely casts this interface to a specific derived type
