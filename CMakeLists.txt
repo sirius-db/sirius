@@ -62,7 +62,10 @@ set(EXTENSION_SOURCES
   src/cpu_cache.cpp
   src/gpu_query_result.cpp
   src/config.cpp
+  src/memory/common.cpp
+  src/memory/memory_space.cpp
   src/memory/memory_reservation.cpp
+  src/memory/fixed_size_host_memory_resource.cpp
   src/parallel/task_executor.cpp
 )
 add_subdirectory(src/operator)
