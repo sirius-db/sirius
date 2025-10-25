@@ -25,7 +25,7 @@
 #include <unordered_map>
 
 // RMM includes for memory resource management
-#include <rmm/device_memory_resource.hpp>
+#include <rmm/mr/device/device_memory_resource.hpp>
 
 namespace sirius {
 namespace memory {
@@ -130,11 +130,11 @@ public:
         Tier tier;
         size_t device_id;
         size_t memory_limit;
-        std::vector<std::unique_ptr<rmm::device_memory_resource>> allocators;
+        std::vector<std::unique_ptr<rmm::mr::device_memory_resource>> allocators;
         
         // Constructor - allocators must be explicitly provided
         MemorySpaceConfig(Tier t, size_t dev_id, size_t mem_limit, 
-                         std::vector<std::unique_ptr<rmm::device_memory_resource>> allocs);
+                         std::vector<std::unique_ptr<rmm::mr::device_memory_resource>> allocs);
         
         // Move constructor
         MemorySpaceConfig(MemorySpaceConfig&&) = default;

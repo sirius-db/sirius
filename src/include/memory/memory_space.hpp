@@ -25,7 +25,7 @@
 #include <string>
 
 // RMM includes for memory resource management
-#include <rmm/device_memory_resource.hpp>
+#include <rmm/mr/device/device_memory_resource.hpp>
 #include <rmm/resource_ref.hpp>
 
 namespace sirius {
@@ -55,7 +55,7 @@ public:
      * @param allocators Vector of RMM memory allocators (must be non-empty)
      */
     MemorySpace(Tier tier, size_t device_id, size_t memory_limit, 
-                std::vector<std::unique_ptr<rmm::device_memory_resource>> allocators);
+                std::vector<std::unique_ptr<rmm::mr::device_memory_resource>> allocators);
     
     // Disable copy/move to ensure stable addresses for reservations
     MemorySpace(const MemorySpace&) = delete;
@@ -101,7 +101,7 @@ private:
     const size_t memory_limit_;
     
     // Memory resources owned by this MemorySpace
-    std::vector<std::unique_ptr<rmm::device_memory_resource>> allocators_;
+    std::vector<std::unique_ptr<rmm::mr::device_memory_resource>> allocators_;
     
     mutable std::mutex mutex_;
     std::condition_variable cv_;

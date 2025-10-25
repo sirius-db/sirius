@@ -62,7 +62,7 @@ MemoryReservationManager::MemoryReservationManager(std::vector<MemorySpaceConfig
 
 MemoryReservationManager::MemorySpaceConfig::MemorySpaceConfig(
     Tier t, size_t dev_id, size_t mem_limit, 
-    std::vector<std::unique_ptr<rmm::device_memory_resource>> allocs)
+    std::vector<std::unique_ptr<rmm::mr::device_memory_resource>> allocs)
     : tier(t), device_id(dev_id), memory_limit(mem_limit), allocators(std::move(allocs)) {
     if (allocators.empty()) {
         throw std::invalid_argument("At least one allocator must be provided");
@@ -71,7 +71,7 @@ MemoryReservationManager::MemorySpaceConfig::MemorySpaceConfig(
 
 void MemoryReservationManager::initialize(std::vector<MemorySpaceConfig> configs) {
     std::call_once(initialized_, [configs = std::move(configs)]() mutable {
-        instance_ = std::make_unique<MemoryReservationManager>(std::move(configs));
+        instance_ = std::unique_ptr<MemoryReservationManager>(new MemoryReservationManager(std::move(configs)));
     });
 }
 

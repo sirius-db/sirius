@@ -28,7 +28,7 @@ namespace memory {
 //===----------------------------------------------------------------------===//
 
 MemorySpace::MemorySpace(Tier tier, size_t device_id, size_t memory_limit, 
-                         std::vector<std::unique_ptr<rmm::device_memory_resource>> allocators)
+                         std::vector<std::unique_ptr<rmm::mr::device_memory_resource>> allocators)
     : tier_(tier), device_id_(device_id), memory_limit_(memory_limit), allocators_(std::move(allocators)) {
     if (memory_limit == 0) {
         throw std::invalid_argument("Memory limit must be greater than 0");

@@ -42,13 +42,13 @@
 #include "test_gpu_kernels.cuh"
 
 // RMM includes for creating allocators
-#include <rmm/cuda_async_memory_resource.hpp>
+#include <rmm/mr/device/cuda_async_memory_resource.hpp>
 
 using namespace sirius::memory;
 
 // Helper function to create test allocators for multi-device scenario
-std::vector<std::unique_ptr<rmm::device_memory_resource>> createTestAllocatorsForMemorySpace(Tier tier) {
-    std::vector<std::unique_ptr<rmm::device_memory_resource>> allocators;
+std::vector<std::unique_ptr<rmm::mr::device_memory_resource>> createTestAllocatorsForMemorySpace(Tier tier) {
+    std::vector<std::unique_ptr<rmm::mr::device_memory_resource>> allocators;
     
     switch (tier) {
         case Tier::GPU: {

@@ -16,7 +16,9 @@
 
 #pragma once
 
-#include <rmm/device_memory_resource.hpp>
+#include <rmm/mr/device/device_memory_resource.hpp>
+#include <rmm/cuda_stream_view.hpp>
+#include <rmm/aligned.hpp>
 #include <atomic>
 #include <cstdlib>
 
@@ -24,7 +26,7 @@ namespace sirius {
 namespace memory {
 
 /**
- * @brief A fixed-size host memory resource that implements rmm::device_memory_resource interface.
+ * @brief A fixed-size host memory resource that implements rmm::mr::device_memory_resource interface.
  * 
  * This memory resource provides a fixed pool of host memory with thread-safe allocation tracking.
  * It's designed to work within the RMM ecosystem while managing host memory allocations.
@@ -42,13 +44,13 @@ namespace memory {
  * @note This resource allocates host memory using std::aligned_alloc, which provides
  *       aligned memory suitable for efficient CPU access patterns.
  */
-class fixed_size_host_memory_resource : public rmm::device_memory_resource {
+class fixed_size_host_memory_resource : public rmm::mr::device_memory_resource {
 public:
     /**
      * @brief Constructs a fixed-size host memory resource.
      * 
      * @param total_size The total size of the memory pool in bytes. Must be greater than 0.
-     * @throws rmm::bad_alloc if total_size is 0
+     * @throws rmm::out_of_memory if total_size is 0
      */
     explicit fixed_size_host_memory_resource(std::size_t total_size);
 
@@ -97,20 +99,20 @@ private:
      * @brief Allocates memory from the fixed-size pool.
      * 
      * @param bytes The number of bytes to allocate
-     * @param alignment The alignment requirement
+     * @param stream The CUDA stream to use for the allocation
      * @return Pointer to allocated memory
-     * @throws rmm::bad_alloc if allocation fails (insufficient memory or system allocation failure)
+     * @throws rmm::out_of_memory if allocation fails (insufficient memory or system allocation failure)
      */
-    void* do_allocate(std::size_t bytes, std::size_t alignment) override;
+    void* do_allocate(std::size_t bytes, rmm::cuda_stream_view stream) override;
 
     /**
      * @brief Deallocates previously allocated memory.
      * 
      * @param ptr Pointer to memory to deallocate
      * @param bytes The number of bytes that were allocated
-     * @param alignment The alignment that was used
+     * @param stream The CUDA stream to use for the deallocation
      */
-    void do_deallocate(void* ptr, std::size_t bytes, std::size_t alignment) override;
+    void do_deallocate(void* ptr, std::size_t bytes, rmm::cuda_stream_view stream) override;
 
     /**
      * @brief Checks equality with another memory resource.
@@ -118,7 +120,7 @@ private:
      * @param other The other memory resource to compare with
      * @return true if this resource is the same as other
      */
-    bool do_is_equal(const rmm::device_memory_resource& other) const noexcept override;
+    bool do_is_equal(const rmm::mr::device_memory_resource& other) const noexcept override;
 
 private:
     const std::size_t total_size_;           ///< Total size of the memory pool

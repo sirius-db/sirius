@@ -15,7 +15,7 @@
  */
 
 #include "memory/fixed_size_host_memory_resource.hpp"
-#include <rmm/bad_alloc.hpp>
+#include <rmm/error.hpp>
 #include <algorithm>
 #include <cstdlib>
 
@@ -25,17 +25,17 @@ namespace memory {
 fixed_size_host_memory_resource::fixed_size_host_memory_resource(std::size_t total_size)
     : total_size_(total_size), allocated_size_(0) {
     if (total_size == 0) {
-        throw rmm::bad_alloc("Total size must be greater than 0");
+        throw rmm::out_of_memory("Total size must be greater than 0");
     }
 }
 
-void* fixed_size_host_memory_resource::do_allocate(std::size_t bytes, std::size_t alignment) {
+void* fixed_size_host_memory_resource::do_allocate(std::size_t bytes, rmm::cuda_stream_view stream) {
     if (bytes == 0) {
         return nullptr;
     }
 
-    // Ensure minimum alignment of sizeof(void*) for portability
-    alignment = std::max(alignment, sizeof(void*));
+    // Use RMM's standard CUDA allocation alignment
+    constexpr std::size_t alignment = rmm::CUDA_ALLOCATION_ALIGNMENT;
     
     // Align the size to the requested alignment
     std::size_t aligned_size = (bytes + alignment - 1) & ~(alignment - 1);
@@ -44,7 +44,7 @@ void* fixed_size_host_memory_resource::do_allocate(std::size_t bytes, std::size_
     std::size_t current_allocated = allocated_size_.load();
     while (true) {
         if (current_allocated + aligned_size > total_size_) {
-            throw rmm::bad_alloc("Insufficient memory in fixed_size_host_memory_resource: "
+            throw rmm::out_of_memory("Insufficient memory in fixed_size_host_memory_resource: "
                                "requested " + std::to_string(aligned_size) + 
                                " bytes, available " + std::to_string(total_size_ - current_allocated) + 
                                " bytes");
@@ -62,7 +62,7 @@ void* fixed_size_host_memory_resource::do_allocate(std::size_t bytes, std::size_
     if (!ptr) {
         // Rollback the allocation accounting on system allocation failure
         allocated_size_.fetch_sub(aligned_size);
-        throw rmm::bad_alloc("Failed to allocate " + std::to_string(aligned_size) + 
+        throw rmm::out_of_memory("Failed to allocate " + std::to_string(aligned_size) + 
                            " bytes of aligned host memory with alignment " + 
                            std::to_string(alignment));
     }
@@ -70,13 +70,13 @@ void* fixed_size_host_memory_resource::do_allocate(std::size_t bytes, std::size_
     return ptr;
 }
 
-void fixed_size_host_memory_resource::do_deallocate(void* ptr, std::size_t bytes, std::size_t alignment) {
+void fixed_size_host_memory_resource::do_deallocate(void* ptr, std::size_t bytes, rmm::cuda_stream_view stream) {
     if (ptr == nullptr || bytes == 0) {
         return;
     }
 
-    // Ensure minimum alignment matches what was used in allocation
-    alignment = std::max(alignment, sizeof(void*));
+    // Use the same RMM alignment as used in allocation
+    constexpr std::size_t alignment = rmm::CUDA_ALLOCATION_ALIGNMENT;
     
     // Align the size to match what was allocated
     std::size_t aligned_size = (bytes + alignment - 1) & ~(alignment - 1);
@@ -88,7 +88,7 @@ void fixed_size_host_memory_resource::do_deallocate(void* ptr, std::size_t bytes
     allocated_size_.fetch_sub(aligned_size);
 }
 
-bool fixed_size_host_memory_resource::do_is_equal(const rmm::device_memory_resource& other) const noexcept {
+bool fixed_size_host_memory_resource::do_is_equal(const rmm::mr::device_memory_resource& other) const noexcept {
     // Two memory resources are equal if they are the same instance
     return this == &other;
 }

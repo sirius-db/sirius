@@ -23,10 +23,8 @@
 #include "memory/memory_reservation.hpp"
 
 // RMM includes for creating test allocators
-#include <rmm/pool_memory_resource.hpp>
-#include <rmm/device_memory_resource.hpp>
-#include <rmm/cuda_memory_resource.hpp>
-#include <rmm/cuda_async_memory_resource.hpp>
+#include <rmm/mr/device/device_memory_resource.hpp>
+#include <rmm/mr/device/cuda_async_memory_resource.hpp>
 
 // Sirius memory components
 #include "memory/memory_reservation.hpp"
@@ -35,13 +33,13 @@
 using namespace sirius::memory;
 
 // Helper function to create test allocators for a given tier
-std::vector<std::unique_ptr<rmm::device_memory_resource>> createTestAllocators(Tier tier) {
-    std::vector<std::unique_ptr<rmm::device_memory_resource>> allocators;
+std::vector<std::unique_ptr<rmm::mr::device_memory_resource>> createTestAllocators(Tier tier) {
+    std::vector<std::unique_ptr<rmm::mr::device_memory_resource>> allocators;
     
     switch (tier) {
         case Tier::GPU: {
             // Create cuda_async_memory_resource for GPU tier as requested
-            auto cuda_async_allocator = std::make_unique<rmm::cuda_async_memory_resource>();
+            auto cuda_async_allocator = std::make_unique<rmm::mr::cuda_async_memory_resource>();
             allocators.push_back(std::move(cuda_async_allocator));
             break;
         }
@@ -799,7 +797,7 @@ TEST_CASE("Specific Allocator Types", "[memory]") {
 // Test that allocators must be explicitly provided
 TEST_CASE("Explicit Allocator Requirement", "[memory]") {
     // Test that MemorySpaceConfig requires at least one allocator
-    std::vector<std::unique_ptr<rmm::device_memory_resource>> empty_allocators;
+    std::vector<std::unique_ptr<rmm::mr::device_memory_resource>> empty_allocators;
     
     REQUIRE_THROWS_AS(
         MemoryReservationManager::MemorySpaceConfig(Tier::GPU, 0, 1000, std::move(empty_allocators)),
@@ -843,7 +841,7 @@ TEST_CASE("Fixed Size Host Memory Resource", "[memory]") {
     REQUIRE(resource->get_allocated_size() < size_after_first_dealloc);
     
     // Test allocation limit
-    REQUIRE_THROWS_AS(resource->allocate(total_size + 1, 8), rmm::bad_alloc);
+    REQUIRE_THROWS_AS(resource->allocate(total_size + 1, 8), rmm::out_of_memory);
     
     // Test zero-size allocation
     void* zero_ptr = resource->allocate(0, 8);
