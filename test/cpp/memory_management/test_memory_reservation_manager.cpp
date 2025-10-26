@@ -558,7 +558,7 @@ TEST_CASE("Mixed Operations", "[memory]") {
 }
 
 // Test multiple MemorySpaces of same tier
-TEST_CASE("Multiple MemorySpaces Same Tier", "[memory]") {
+TEST_CASE("Multiple MemorySpaces Same Tier", "[memory][.multi]") {
     initializeMultiDeviceManager();
     auto& manager = MemoryReservationManager::getInstance();
     
@@ -614,7 +614,7 @@ TEST_CASE("Multiple MemorySpaces Same Tier", "[memory]") {
 }
 
 // Test reservation request strategies in detail
-TEST_CASE("Advanced Reservation Strategies", "[memory]") {
+TEST_CASE("Advanced Reservation Strategies", "[memory][.multi]") {
     initializeMultiDeviceManager();
     auto& manager = MemoryReservationManager::getInstance();
     
