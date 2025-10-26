@@ -23,15 +23,149 @@
 #include <variant>
 #include <optional>
 #include <unordered_map>
+#include <string>
+#include <stdexcept>
 
 // RMM includes for memory resource management
 #include <rmm/mr/device/device_memory_resource.hpp>
+#include <rmm/cuda_stream_view.hpp>
+#include <rmm/detail/error.hpp>
 
 namespace sirius {
 namespace memory {
 
 // Forward declarations
 class MemoryReservationManager;
+class per_stream_tracking_resource_adaptor;
+struct Reservation;
+
+//===----------------------------------------------------------------------===//
+// Reservation Limit Policy Interface
+//===----------------------------------------------------------------------===//
+
+/**
+ * @brief Base class for reservation limit policies that control behavior when stream reservations are exceeded.
+ * 
+ * Reservation limit policies are pluggable strategies that determine what happens when an allocation
+ * would cause a stream's memory usage to exceed its reservation limit.
+ */
+class ReservationLimitPolicy {
+public:
+    virtual ~ReservationLimitPolicy() = default;
+
+    /**
+     * @brief Handle an allocation that would exceed the stream's reservation.
+     * 
+     * This method is called when an allocation would cause the current allocated bytes
+     * plus the new allocation to exceed the stream's reservation. The policy can:
+     * 1. Allow the allocation to proceed (ignore policy)
+     * 2. Increase the reservation and allow the allocation (increase policy)
+     * 3. Throw an exception to prevent the allocation (fail policy)
+     * 
+     * @param adaptor Reference to the tracking resource adaptor
+     * @param stream The stream that would exceed its reservation
+     * @param current_allocated Current allocated bytes on the stream
+     * @param requested_bytes Number of bytes being requested
+     * @param reservation Pointer to the stream's reservation (may be null if no reservation set)
+     * @throws rmm::out_of_memory if the policy decides to reject the allocation
+     */
+    virtual void handle_over_reservation(
+        per_stream_tracking_resource_adaptor& adaptor,
+        rmm::cuda_stream_view stream,
+        std::size_t current_allocated,
+        std::size_t requested_bytes,
+        Reservation* reservation) = 0;
+
+    /**
+     * @brief Get a human-readable name for this policy.
+     * @return Policy name string
+     */
+    virtual std::string get_policy_name() const = 0;
+};
+
+/**
+ * @brief Ignore policy - allows allocations to proceed even if they exceed reservations.
+ * 
+ * This policy simply ignores reservation limits and allows all allocations to proceed.
+ * It's useful for soft reservations where you want to track usage but not enforce limits.
+ */
+class IgnoreReservationLimitPolicy : public ReservationLimitPolicy {
+public:
+    void handle_over_reservation(
+        per_stream_tracking_resource_adaptor& adaptor,
+        rmm::cuda_stream_view stream,
+        std::size_t current_allocated,
+        std::size_t requested_bytes,
+        Reservation* reservation) override {
+        // Do nothing - allow the allocation to proceed
+    }
+
+    std::string get_policy_name() const override {
+        return "ignore";
+    }
+};
+
+/**
+ * @brief Fail policy - throws an exception when reservations are exceeded.
+ * 
+ * This policy enforces strict reservation limits by throwing rmm::out_of_memory
+ * when an allocation would exceed the stream's reservation.
+ */
+class FailReservationLimitPolicy : public ReservationLimitPolicy {
+public:
+    void handle_over_reservation(
+        per_stream_tracking_resource_adaptor& adaptor,
+        rmm::cuda_stream_view stream,
+        std::size_t current_allocated,
+        std::size_t requested_bytes,
+        Reservation* reservation) override;
+
+    std::string get_policy_name() const override {
+        return "fail";
+    }
+};
+
+/**
+ * @brief Increase policy - automatically increases reservations when limits are exceeded.
+ * 
+ * This policy automatically increases the stream's reservation when an allocation would
+ * exceed the current limit. It uses a padding factor to avoid frequent reservation increases.
+ */
+class IncreaseReservationLimitPolicy : public ReservationLimitPolicy {
+public:
+    /**
+     * @brief Constructs an increase policy with the specified padding factor.
+     * 
+     * @param padding_factor Factor by which to pad reservation increases (default 1.5)
+     *                      For example, 1.5 means increase by 50% more than needed
+     */
+     explicit IncreaseReservationLimitPolicy(double padding_factor = 2.0d)
+        : padding_factor_(padding_factor) {
+        if (padding_factor < 1.0) {
+            throw std::invalid_argument("Padding factor must be >= 1.0");
+        }
+    }
+
+    void handle_over_reservation(
+        per_stream_tracking_resource_adaptor& adaptor,
+        rmm::cuda_stream_view stream,
+        std::size_t current_allocated,
+        std::size_t requested_bytes,
+        Reservation* reservation) override;
+
+    std::string get_policy_name() const override {
+        return "increase(padding=" + std::to_string(padding_factor_) + ")";
+    }
+
+    /**
+     * @brief Get the padding factor used by this policy.
+     * @return The padding factor
+     */
+    double get_padding_factor() const { return padding_factor_; }
+
+private:
+    double padding_factor_;
+};
 
 //===----------------------------------------------------------------------===//
 // Reservation Request Strategies
@@ -98,6 +232,38 @@ struct Reservation {
     // Helper method to get the memory space from the manager
     const MemorySpace* getMemorySpace(const MemoryReservationManager& manager) const;
     
+    //===----------------------------------------------------------------------===//
+    // Reservation Size Management
+    //===----------------------------------------------------------------------===//
+    
+    /**
+     * @brief Attempts to grow this reservation to a new larger size.
+     * @param new_size The new size for the reservation (must be larger than current size)
+     * @return true if the reservation was successfully grown, false otherwise
+     */
+    bool grow_to(size_t new_size);
+    
+    /**
+     * @brief Attempts to grow this reservation by additional bytes.
+     * @param additional_bytes Number of bytes to add to the current reservation
+     * @return true if the reservation was successfully grown, false otherwise
+     */
+    bool grow_by(size_t additional_bytes);
+    
+    /**
+     * @brief Attempts to shrink this reservation to a new smaller size.
+     * @param new_size The new size for the reservation (must be smaller than current size)
+     * @return true if the reservation was successfully shrunk, false otherwise
+     */
+    bool shrink_to(size_t new_size);
+    
+    /**
+     * @brief Attempts to shrink this reservation by removing bytes.
+     * @param bytes_to_remove Number of bytes to remove from the current reservation
+     * @return true if the reservation was successfully shrunk, false otherwise
+     */
+    bool shrink_by(size_t bytes_to_remove);
+    
     // Disable copy/move to prevent issues with MemorySpace tracking
     Reservation(const Reservation&) = delete;
     Reservation& operator=(const Reservation&) = delete;
@@ -162,6 +328,9 @@ public:
     MemoryReservationManager& operator=(const MemoryReservationManager&) = delete;
     MemoryReservationManager(MemoryReservationManager&&) = delete;
     MemoryReservationManager& operator=(MemoryReservationManager&&) = delete;
+    
+    // Public destructor (required for std::unique_ptr)
+    ~MemoryReservationManager() = default;
     
     //===----------------------------------------------------------------------===//
     // Reservation Interface
@@ -236,7 +405,6 @@ private:
      * Private constructor - use initialize() and getInstance() instead.
      */
     explicit MemoryReservationManager(std::vector<MemorySpaceConfig> configs);
-    ~MemoryReservationManager() = default;
 
     // Singleton state
     static std::unique_ptr<MemoryReservationManager> instance_;

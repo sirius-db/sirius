@@ -39,6 +39,7 @@
 #include <future>
 #include "memory/memory_reservation.hpp"
 #include "memory/fixed_size_host_memory_resource.hpp"
+#include "rmm/mr/device/cuda_async_memory_resource.hpp"
 #include "test_gpu_kernels.cuh"
 
 // RMM includes for creating allocators
@@ -52,12 +53,12 @@ std::vector<std::unique_ptr<rmm::mr::device_memory_resource>> createTestAllocato
     
     switch (tier) {
         case Tier::GPU: {
-            auto cuda_async_allocator = std::make_unique<rmm::cuda_async_memory_resource>();
+            auto cuda_async_allocator = std::make_unique<rmm::mr::cuda_async_memory_resource>();
             allocators.push_back(std::move(cuda_async_allocator));
             break;
         }
         case Tier::HOST: {
-            auto host_allocator = std::make_unique<fixed_size_host_memory_resource>(10 * 1024 * 1024); // 10MB
+            auto host_allocator = std::make_unique<fixed_size_host_memory_resource>(10ull * 1024 * 1024); // 10MB
             allocators.push_back(std::move(host_allocator));
             break;
         }
@@ -80,13 +81,13 @@ void initializeSingleDeviceMemoryManager() {
     std::vector<MemoryReservationManager::MemorySpaceConfig> configs;
     
     // Single GPU device - 2GB
-    configs.emplace_back(Tier::GPU, 0, 2048 * 1024 * 1024, createTestAllocatorsForMemorySpace(Tier::GPU));  // GPU device 0: 2GB
+    configs.emplace_back(Tier::GPU, 0, 2048ull * 1024 * 1024, createTestAllocatorsForMemorySpace(Tier::GPU));  // GPU device 0: 2GB
     
     // Single HOST NUMA node - 4GB
-    configs.emplace_back(Tier::HOST, 0, 4096 * 1024 * 1024, createTestAllocatorsForMemorySpace(Tier::HOST)); // HOST NUMA 0: 4GB
+    configs.emplace_back(Tier::HOST, 0, 4096ull * 1024 * 1024, createTestAllocatorsForMemorySpace(Tier::HOST)); // HOST NUMA 0: 4GB
     
     // Single DISK device - 8GB
-    configs.emplace_back(Tier::DISK, 0, 8192 * 1024 * 1024, createTestAllocatorsForMemorySpace(Tier::DISK)); // DISK path 0: 8GB
+    configs.emplace_back(Tier::DISK, 0, 8192ull * 1024 * 1024, createTestAllocatorsForMemorySpace(Tier::DISK)); // DISK path 0: 8GB
     
     MemoryReservationManager::initialize(std::move(configs));
 }
@@ -96,16 +97,16 @@ void initializeMultiDeviceMemoryManager() {
     std::vector<MemoryReservationManager::MemorySpaceConfig> configs;
     
     // Multiple GPU devices
-    configs.emplace_back(Tier::GPU, 0, 1024 * 1024 * 1024, createTestAllocatorsForMemorySpace(Tier::GPU));  // GPU device 0: 1GB
-    configs.emplace_back(Tier::GPU, 1, 1024 * 1024 * 1024, createTestAllocatorsForMemorySpace(Tier::GPU));  // GPU device 1: 1GB
+    configs.emplace_back(Tier::GPU, 0, 1024ull * 1024 * 1024, createTestAllocatorsForMemorySpace(Tier::GPU));  // GPU device 0: 1GB
+    configs.emplace_back(Tier::GPU, 1, 1024ull * 1024 * 1024, createTestAllocatorsForMemorySpace(Tier::GPU));  // GPU device 1: 1GB
     
     // Multiple HOST NUMA nodes
-    configs.emplace_back(Tier::HOST, 0, 2048 * 1024 * 1024, createTestAllocatorsForMemorySpace(Tier::HOST)); // HOST NUMA 0: 2GB
-    configs.emplace_back(Tier::HOST, 1, 2048 * 1024 * 1024, createTestAllocatorsForMemorySpace(Tier::HOST)); // HOST NUMA 1: 2GB
+    configs.emplace_back(Tier::HOST, 0, 2048ull * 1024 * 1024, createTestAllocatorsForMemorySpace(Tier::HOST)); // HOST NUMA 0: 2GB
+    configs.emplace_back(Tier::HOST, 1, 2048ull * 1024 * 1024, createTestAllocatorsForMemorySpace(Tier::HOST)); // HOST NUMA 1: 2GB
     
     // Multiple DISK devices  
-    configs.emplace_back(Tier::DISK, 0, 4096 * 1024 * 1024, createTestAllocatorsForMemorySpace(Tier::DISK)); // DISK path 0: 4GB
-    configs.emplace_back(Tier::DISK, 1, 4096 * 1024 * 1024, createTestAllocatorsForMemorySpace(Tier::DISK)); // DISK path 1: 4GB
+    configs.emplace_back(Tier::DISK, 0, 4096ull * 1024 * 1024, createTestAllocatorsForMemorySpace(Tier::DISK)); // DISK path 0: 4GB
+    configs.emplace_back(Tier::DISK, 1, 4096ull * 1024 * 1024, createTestAllocatorsForMemorySpace(Tier::DISK)); // DISK path 1: 4GB
     
     MemoryReservationManager::initialize(std::move(configs));
 }
@@ -116,9 +117,9 @@ TEST_CASE("Single-Device Memory Space Access", "[memory_space]") {
     auto& manager = MemoryReservationManager::getInstance();
     
     // Expected memory capacities
-    const size_t expected_gpu_capacity = 2048 * 1024 * 1024;   // 2GB
-    const size_t expected_host_capacity = 4096 * 1024 * 1024;  // 4GB
-    const size_t expected_disk_capacity = 8192 * 1024 * 1024;  // 8GB
+    const size_t expected_gpu_capacity = 2048ull * 1024 * 1024;   // 2GB
+    const size_t expected_host_capacity = 4096ull * 1024 * 1024;  // 4GB
+    const size_t expected_disk_capacity = 8192ull * 1024 * 1024;  // 8GB
     const size_t expected_device_id = 0; // All devices should have ID 0
     
     // Test single GPU memory space
@@ -165,13 +166,13 @@ TEST_CASE("Device-Specific Memory Reservations", "[memory_space]") {
     auto& manager = MemoryReservationManager::getInstance();
     
     // Memory size constants
-    const size_t gpu_allocation_size = 200 * 1024 * 1024;    // 200MB
-    const size_t host_allocation_size = 500 * 1024 * 1024;   // 500MB
-    const size_t disk_allocation_size = 1000 * 1024 * 1024;  // 1GB
+    const size_t gpu_allocation_size = 200ull * 1024 * 1024;    // 200MB
+    const size_t host_allocation_size = 500ull * 1024 * 1024;   // 500MB
+    const size_t disk_allocation_size = 1000ull * 1024 * 1024;  // 1GB
     
-    const size_t gpu_capacity = 2048 * 1024 * 1024;          // 2GB
-    const size_t host_capacity = 4096 * 1024 * 1024;         // 4GB
-    const size_t disk_capacity = 8192 * 1024 * 1024;         // 8GB
+    const size_t gpu_capacity = 2048ull * 1024 * 1024;          // 2GB
+    const size_t host_capacity = 4096ull * 1024 * 1024;         // 4GB
+    const size_t disk_capacity = 8192ull * 1024 * 1024;         // 8GB
     
     auto gpu_device_0 = manager.getMemorySpace(Tier::GPU, 0);
     auto host_numa_0 = manager.getMemorySpace(Tier::HOST, 0);
@@ -239,14 +240,14 @@ TEST_CASE("Tier-Level Aggregated Statistics", "[memory_space]") {
     auto& manager = MemoryReservationManager::getInstance();
     
     // Test allocation sizes
-    const size_t gpu_test_allocation = 200 * 1024 * 1024;   // 200MB
-    const size_t host_test_allocation = 500 * 1024 * 1024;  // 500MB
-    const size_t disk_test_allocation = 1000 * 1024 * 1024; // 1GB
+    const size_t gpu_test_allocation = 200ull * 1024 * 1024;   // 200MB
+    const size_t host_test_allocation = 500ull * 1024 * 1024;  // 500MB
+    const size_t disk_test_allocation = 1000ull * 1024 * 1024; // 1GB
     
     // Memory capacities
-    const size_t gpu_total_capacity = 2048 * 1024 * 1024;   // 2GB
-    const size_t host_total_capacity = 4096 * 1024 * 1024;  // 4GB
-    const size_t disk_total_capacity = 8192 * 1024 * 1024;  // 8GB
+    const size_t gpu_total_capacity = 2048ull * 1024 * 1024;   // 2GB
+    const size_t host_total_capacity = 4096ull * 1024 * 1024;  // 4GB
+    const size_t disk_total_capacity = 8192ull * 1024 * 1024;  // 8GB
     
     auto gpu_device_0 = manager.getMemorySpace(Tier::GPU, 0);
     auto host_numa_0 = manager.getMemorySpace(Tier::HOST, 0);
@@ -326,9 +327,9 @@ TEST_CASE("Reservation Strategies with Single Devices", "[memory_space]") {
     auto& manager = MemoryReservationManager::getInstance();
     
     // Test allocation sizes
-    const size_t small_allocation = 25 * 1024 * 1024;    // 25MB
-    const size_t medium_allocation = 50 * 1024 * 1024;   // 50MB
-    const size_t large_allocation = 100 * 1024 * 1024;   // 100MB
+    const size_t small_allocation = 25ull * 1024 * 1024;    // 25MB
+    const size_t medium_allocation = 50ull * 1024 * 1024;   // 50MB
+    const size_t large_allocation = 100ull * 1024 * 1024;   // 100MB
     
     // Test requesting reservation in any GPU
     auto gpu_any_reservation = manager.requestReservation(AnyMemorySpaceInTier(Tier::GPU), medium_allocation);
@@ -468,8 +469,8 @@ TEST_CASE("Concurrent Allocations with Real Memory Work", "[memory_space][thread
     auto host_numa_0 = manager.getMemorySpace(Tier::HOST, 0);
     
     // Memory pressure test constants
-    const size_t host_memory_capacity = 4096 * 1024 * 1024;  // 4GB HOST space capacity
-    const size_t thread_allocation_size = 800 * 1024 * 1024; // 800MB per thread
+    const size_t host_memory_capacity = 4096ull * 1024 * 1024;  // 4GB HOST space capacity
+    const size_t thread_allocation_size = 800ull * 1024 * 1024; // 800MB per thread
     const int concurrent_threads = 8;
     const size_t total_requested_memory = concurrent_threads * thread_allocation_size; // 6.4GB total
     const size_t blocking_wait_threshold_ms = 1; // Consider >1ms wait as blocking
@@ -552,8 +553,8 @@ TEST_CASE("Concurrent Allocations with Real Memory Work", "[memory_space][thread
 // Test oversubscription prevention with limited memory
 TEST_CASE("Oversubscription Prevention", "[memory_space][threading]") {
     // Oversubscription test configuration
-    const size_t limited_memory_capacity = 5 * 1024 * 1024;  // Only 5MB available
-    const size_t per_thread_allocation = 2 * 1024 * 1024;    // 2MB per thread
+    const size_t limited_memory_capacity = 5ull * 1024 * 1024;  // Only 5MB available
+    const size_t per_thread_allocation = 2ull * 1024 * 1024;    // 2MB per thread
     const int oversubscribing_threads = 10;                  // 10 threads
     const size_t total_requested = oversubscribing_threads * per_thread_allocation; // 20MB requested
     const size_t blocking_wait_threshold_ms = 1;
@@ -647,12 +648,12 @@ TEST_CASE("Concurrent Cross-Space Allocations", "[memory_space][threading]") {
     auto& manager = MemoryReservationManager::getInstance();
     
     // Memory space capacities
-    const size_t gpu_space_capacity = 2048 * 1024 * 1024;  // 2GB GPU space
-    const size_t host_space_capacity = 4096 * 1024 * 1024; // 4GB HOST space
-    const size_t disk_space_capacity = 8192 * 1024 * 1024; // 8GB DISK space
+    const size_t gpu_space_capacity = 2048ull * 1024 * 1024;  // 2GB GPU space
+    const size_t host_space_capacity = 4096ull * 1024 * 1024; // 4GB HOST space
+    const size_t disk_space_capacity = 8192ull * 1024 * 1024; // 8GB DISK space
     
     // Cross-space allocation test constants
-    const size_t per_thread_allocation = 600 * 1024 * 1024; // 600MB per thread
+    const size_t per_thread_allocation = 600ull * 1024 * 1024; // 600MB per thread
     const int threads_per_space = 6;
     const size_t total_per_space = threads_per_space * per_thread_allocation; // 3.6GB total per space
     const size_t blocking_wait_threshold_ms = 1;
@@ -778,7 +779,7 @@ TEST_CASE("Memory Pressure with Reservation Strategies", "[memory_space][threadi
     auto& manager = MemoryReservationManager::getInstance();
     
     // Memory pressure test configuration
-    const size_t pressure_allocation_size = 1200 * 1024 * 1024; // 1.2GB per thread
+    const size_t pressure_allocation_size = 1200ull * 1024 * 1024; // 1.2GB per thread
     const int total_competing_threads = 12;
     const size_t total_requested_memory = total_competing_threads * pressure_allocation_size; // 14.4GB total
     const size_t blocking_wait_threshold_ms = 1;
@@ -842,12 +843,14 @@ TEST_CASE("Memory Pressure with Reservation Strategies", "[memory_space][threadi
                 
                 if (reservation) {
                     // Perform actual allocation and work
-                    auto allocator = reservation->memory_space->getDefaultAllocator();
+                    auto& manager = MemoryReservationManager::getInstance();
+                    const MemorySpace* memory_space = manager.getMemorySpace(reservation->tier, reservation->device_id);
+                    auto allocator = memory_space->getDefaultAllocator();
                     void* ptr = allocator.allocate(pressure_allocation_size, memory_alignment);
                     
                     if (ptr) {
                         // Do substantial work to prevent optimization
-                        doMemoryWork(reservation->memory_space, ptr, pressure_allocation_size, work_done);
+                        doMemoryWork(memory_space, ptr, pressure_allocation_size, work_done);
                         
                         // Hold allocation for realistic time
                         std::this_thread::sleep_for(std::chrono::milliseconds(hold_allocation_time_ms));
@@ -906,7 +909,7 @@ TEST_CASE("GPU vs Host Memory Work Verification", "[memory_space][threading][gpu
     auto gpu_space = manager.getMemorySpace(Tier::GPU, 0);
     auto host_space = manager.getMemorySpace(Tier::HOST, 0);
     
-    const size_t allocation_size = 4 * 1024 * 1024; // 4MB
+    const size_t allocation_size = 4ull * 1024 * 1024; // 4MB
     
     std::atomic<uint64_t> gpu_work_result{0};
     std::atomic<uint64_t> host_work_result{0};

@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <stdexcept>
 #include <mutex>
+#include <cstdint>
 
 namespace sirius {
 namespace memory {
@@ -30,6 +31,95 @@ Reservation::Reservation(Tier t, size_t dev_id, size_t s) : tier(t), device_id(d
 
 const MemorySpace* Reservation::getMemorySpace(const MemoryReservationManager& manager) const {
     return manager.getMemorySpace(tier, device_id);
+}
+
+bool Reservation::grow_to(size_t new_size) {
+    if (new_size <= size) {
+        return false; // Invalid operation - must grow to larger size
+    }
+    
+    auto& manager = MemoryReservationManager::getInstance();
+    return manager.growReservation(this, new_size);
+}
+
+bool Reservation::grow_by(size_t additional_bytes) {
+    if (additional_bytes == 0) {
+        return true; // No change needed
+    }
+    
+    // Check for overflow
+    if (size > SIZE_MAX - additional_bytes) {
+        return false;
+    }
+    
+    return grow_to(size + additional_bytes);
+}
+
+bool Reservation::shrink_to(size_t new_size) {
+    if (new_size >= size) {
+        return false; // Invalid operation - must shrink to smaller size
+    }
+    
+    auto& manager = MemoryReservationManager::getInstance();
+    return manager.shrinkReservation(this, new_size);
+}
+
+bool Reservation::shrink_by(size_t bytes_to_remove) {
+    if (bytes_to_remove == 0) {
+        return true; // No change needed
+    }
+    
+    if (bytes_to_remove >= size) {
+        return false; // Cannot shrink by more than current size
+    }
+    
+    return shrink_to(size - bytes_to_remove);
+}
+
+//===----------------------------------------------------------------------===//
+// Reservation Limit Policy Implementations
+//===----------------------------------------------------------------------===//
+
+void FailReservationLimitPolicy::handle_over_reservation(
+    per_stream_tracking_resource_adaptor& adaptor,
+    rmm::cuda_stream_view stream,
+    std::size_t current_allocated,
+    std::size_t requested_bytes,
+    Reservation* reservation) {
+    
+    std::size_t reservation_size = reservation ? reservation->size : 0;
+    RMM_FAIL("Allocation of " + std::to_string(requested_bytes) + 
+             " bytes would exceed stream reservation of " + std::to_string(reservation_size) +
+             " bytes (current: " + std::to_string(current_allocated) + " bytes)",
+             rmm::out_of_memory);
+}
+
+void IncreaseReservationLimitPolicy::handle_over_reservation(
+    per_stream_tracking_resource_adaptor& adaptor,
+    rmm::cuda_stream_view stream,
+    std::size_t current_allocated,
+    std::size_t requested_bytes,
+    Reservation* reservation) {
+    
+    if (!reservation) {
+        RMM_FAIL("No reservation set for stream", rmm::out_of_memory);
+    }
+    
+    // Calculate how much we need
+    std::size_t needed_size = current_allocated + requested_bytes;
+    
+    // Add padding to avoid frequent increases
+    std::size_t new_reservation_size = static_cast<std::size_t>(needed_size * padding_factor_);
+    
+    // Try to grow the reservation
+    if (!reservation->grow_to(new_reservation_size)) {
+        // If we can't grow to the padded size, try to grow to just what we need
+        if (!reservation->grow_to(needed_size)) {
+            // If we can't even grow to what we need, throw an error
+            RMM_FAIL("Failed to increase stream reservation from " + std::to_string(reservation->size) +
+                     " to " + std::to_string(needed_size) + " bytes", rmm::out_of_memory);
+        }
+    }
 }
 
 //===----------------------------------------------------------------------===//
