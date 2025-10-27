@@ -72,6 +72,7 @@ set(EXTENSION_SOURCES
 )
 add_subdirectory(src/operator)
 add_subdirectory(src/plan)
+add_subdirectory(src/data)
 
 set(CUDA_SOURCES 
   src/cuda/communication.cu 

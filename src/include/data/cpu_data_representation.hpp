@@ -24,9 +24,6 @@
 
 namespace sirius {
 
-using sirius::memory::Tier;
-using sirius::MultipleBlocksAllocation;
-
 /**
  * @brief Data representation for a table being stored in host memory.
  * 
@@ -68,8 +65,8 @@ public:
      * @return sirius::unique_ptr<IDataRepresentation> A new data representation in the target tier
      */
     sirius::unique_ptr<IDataRepresentation> ConvertToTier(Tier target_tier,
-                                                         rmm::mr::device_memory_resource* device_mr = nullptr,
-                                                         rmm::cuda_stream_view stream = rmm::cuda_stream_default) override;
+                                                         rmm::mr::device_memory_resource* mr,
+                                                         rmm::cuda_stream_view stream) override;
 
 private:
     sirius::unique_ptr<MultipleBlocksAllocation> allocation_; ///< The allocation where the actual data resides

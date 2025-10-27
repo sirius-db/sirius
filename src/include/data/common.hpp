@@ -19,12 +19,16 @@
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/mr/device/device_memory_resource.hpp>
 
-#include "memory/common.hpp"
 #include "helper/helper.hpp"
 
 namespace sirius {
 
-using sirius::memory::Tier;
+enum class Tier {
+    GPU,    // GPU device memory (fastest but limited)
+    HOST,   // Host system memory (fast, larger capacity)
+    DISK,   // Disk/storage memory (slowest but largest capacity)
+    SIZE    // Value = size of the enum, allows code to be more dynamic
+};
 
 // Forward declarations
 class FixedSizeHostMemoryResource;
@@ -59,8 +63,9 @@ public:
      * @param target_tier The target tier to convert to
      * @param device_mr The device memory resource to use for GPU tier allocations
      * @param stream CUDA stream to use for memory operations
+     * @return sirius::unique_ptr<IDataRepresentation> A new data representation in the target tier
      */
-    virtual void ConvertToTier(Tier target_tier, rmm::mr::device_memory_resource* mr = nullptr, rmm::cuda_stream_view stream = rmm::cuda_stream_default) = 0;
+    virtual sirius::unique_ptr<IDataRepresentation> ConvertToTier(Tier target_tier, rmm::mr::device_memory_resource* mr = nullptr, rmm::cuda_stream_view stream = rmm::cuda_stream_default) = 0;
 
     /**
      * @brief Safely casts this interface to a specific derived type

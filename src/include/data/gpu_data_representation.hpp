@@ -19,13 +19,10 @@
 #include <vector>
 
 #include "data/common.hpp"
-#include "memory/fixed_size_host_memory_resource.hpp"
 #include "cudf/cudf_utils.hpp"
 #include "helper/helper.hpp"
 
 namespace sirius {
-
-using sirius::memory::Tier;
 
 /**
  * @brief Data representation for a table being stored in GPU memory.
@@ -73,8 +70,8 @@ public:
      * @return sirius::unique_ptr<IDataRepresentation> A new data representation in the target tier
      */
     sirius::unique_ptr<IDataRepresentation> ConvertToTier(Tier target_tier,
-                                                         rmm::mr::device_memory_resource* device_mr = nullptr,
-                                                         rmm::cuda_stream_view stream = rmm::cuda_stream_default) override;
+                                                         rmm::mr::device_memory_resource* mr,
+                                                         rmm::cuda_stream_view stream) override;
 
 private:
     cudf::table table_; ///< The actual cuDF table with the data

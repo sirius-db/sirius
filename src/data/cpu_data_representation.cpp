@@ -32,8 +32,8 @@ std::size_t HostTableRepresentation::GetSizeInBytes() const {
 }
 
 sirius::unique_ptr<IDataRepresentation> HostTableRepresentation::ConvertToTier(Tier target_tier,
-                                                         rmm::mr::device_memory_resource* mr = nullptr,
-                                                         rmm::cuda_stream_view stream = rmm::cuda_stream_default) override {
+                                                         rmm::mr::device_memory_resource* mr,
+                                                         rmm::cuda_stream_view stream) {
     // TODO: Implement conversion to GPU representation
     // This should use DataRepresentationConverter::ConvertToGPURepresentation
     throw std::runtime_error("HostTableRepresentation::ConvertToTier not yet implemented");

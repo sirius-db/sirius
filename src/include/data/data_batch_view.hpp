@@ -26,8 +26,6 @@
 
 namespace sirius {
 
-using sirius::memory::Tier;
-
 /**
  * @brief A view into a DataBatch that manages reference counting and provides CUDF table access.
  * 

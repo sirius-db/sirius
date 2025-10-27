@@ -22,13 +22,10 @@
 
 #include "helper/helper.hpp"
 #include "data/common.hpp"
-#include "memory/memory_reservation.hpp"
 
 namespace sirius {
 
 class DataBatchView; // Forward declaration
-
-using sirius::memory::Tier;
 
 /**
  * @brief A data batch represents a collection of data that can be moved between different memory tiers.
@@ -177,9 +174,9 @@ public:
      * Returns a pointer to the IDataRepresentation that holds the actual data.
      * This allows access to tier-specific operations and data access methods.
      * 
-     * @return sirius::unique_ptr<IDataRepresentation> Pointer to the data representation
+     * @return IDataRepresentation* Pointer to the data representation (non-owning)
      */
-    sirius::unique_ptr<IDataRepresentation> GetData() const;
+    IDataRepresentation* GetData() const;
 
 private:
     mutable sirius::mutex mutex_;                         ///< Mutex for thread-safe access to tier checking and reference counting

@@ -74,12 +74,12 @@ void DataBatch::IncrementPinRefCount() {
     pin_count_.fetch_add(1, std::memory_order_relaxed);
 }
 
-sirius::unique_ptr<IDataRepresentation> DataBatch::GetData() const {
-    return data_;
+IDataRepresentation* DataBatch::GetData() const {
+    return data_.get();
 }
 
 sirius::unique_ptr<DataBatchView> DataBatch::CreateView() {
-    return sirius::make_unique<DataBatchView>(this, data_->Cast<GPUTableRepresentation>().GetTable().view());
+    return sirius::make_unique<DataBatchView>(this);
 }
 
 size_t DataBatch::GetViewCount() const {

@@ -15,6 +15,7 @@
  */
 
 #include "data/data_batch_view.hpp"
+#include "data/gpu_data_representation.hpp"
 
 namespace sirius {
 

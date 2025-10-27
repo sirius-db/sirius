@@ -15,6 +15,7 @@
  */
 
 #include "data/data_repository.hpp"
+#include "data/data_batch_view.hpp"
 
 namespace sirius {
 

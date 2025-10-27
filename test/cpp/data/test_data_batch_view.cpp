@@ -21,10 +21,8 @@
 #include "data/data_batch_view.hpp"
 #include "data/data_batch.hpp"
 #include "data/common.hpp"
-#include "memory/memory_reservation.hpp"
 
 using namespace sirius;
-using sirius::memory::Tier;
 
 // Mock IDataRepresentation for testing
 class MockDataRepresentation : public IDataRepresentation {
@@ -38,6 +36,10 @@ public:
     
     std::size_t GetSizeInBytes() const override {
         return size_;
+    }
+    
+    sirius::unique_ptr<IDataRepresentation> ConvertToTier(Tier target_tier, rmm::mr::device_memory_resource* mr = nullptr, rmm::cuda_stream_view stream = rmm::cuda_stream_default) override {
+        // Empty implementation for testing
     }
     
     void SetTier(Tier tier) {
