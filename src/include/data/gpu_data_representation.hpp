@@ -44,13 +44,12 @@ public:
      * 
      * @param table The actual cuDF table with the data
      */
-    GPUTableRepresentation(cudf::table table)
-        : table_(std::move(table)) {}
+    GPUTableRepresentation(cudf::table table);
     
     /**
      * @brief Get the tier of memory that this representation resides in
      */
-    Tier GetCurrentTier() const override { return Tier::GPU; }
+    Tier GetCurrentTier() const override;
 
     /**
      * @brief Get the size of the data representation in bytes
@@ -64,7 +63,7 @@ public:
      * 
      * @return const cudf::table& Reference to the cuDF table
      */
-    const cudf::table& GetTable() const { return table_; }
+    const cudf::table& GetTable() const;
 
     /**
      * @brief Convert this GPU table representation to a different memory tier
@@ -73,9 +72,9 @@ public:
      * @param stream CUDA stream to use for memory operations
      * @return sirius::unique_ptr<IDataRepresentation> A new data representation in the target tier
      */
-    sirius::unique_ptr<IDataRepresentation> ConvertToHost(
-        FixedSizeHostMemoryResource* host_mr = nullptr,
-        rmm::cuda_stream_view stream = rmm::cuda_stream_default);
+    sirius::unique_ptr<IDataRepresentation> ConvertToTier(Tier target_tier,
+                                                         rmm::mr::device_memory_resource* device_mr = nullptr,
+                                                         rmm::cuda_stream_view stream = rmm::cuda_stream_default) override;
 
 private:
     cudf::table table_; ///< The actual cuDF table with the data

@@ -44,22 +44,21 @@ public:
      */
     HostTableRepresentation(sirius::unique_ptr<MultipleBlocksAllocation> allocation_blocks,
                            sirius::unique_ptr<sirius::vector<uint8_t>> meta,
-                           std::size_t size)
-        : allocation_(std::move(allocation_blocks)), metadata_(std::move(meta)), data_size_(size) {}
+                           std::size_t size);
     
     /**
      * @brief Get the tier of memory that this representation resides in
      * 
      * @return Tier The memory tier
      */
-    Tier GetCurrentTier() const override { return Tier::HOST; }
+    Tier GetCurrentTier() const override;
 
     /**
      * @brief Get the size of the data representation in bytes
      * 
      * @return std::size_t The number of bytes used to store this representation
      */
-    std::size_t GetSizeInBytes() const override { return data_size_; }
+    std::size_t GetSizeInBytes() const override;
 
     /**
      * @brief Convert this CPU table representation to a different memory tier
@@ -68,9 +67,9 @@ public:
      * @param stream CUDA stream to use for memory operations
      * @return sirius::unique_ptr<IDataRepresentation> A new data representation in the target tier
      */
-    sirius::unique_ptr<IDataRepresentation> ConvertToGPU(
-        rmm::mr::device_memory_resource* device_mr = nullptr,
-        rmm::cuda_stream_view stream = rmm::cuda_stream_default);
+    sirius::unique_ptr<IDataRepresentation> ConvertToTier(Tier target_tier,
+                                                         rmm::mr::device_memory_resource* device_mr = nullptr,
+                                                         rmm::cuda_stream_view stream = rmm::cuda_stream_default) override;
 
 private:
     sirius::unique_ptr<MultipleBlocksAllocation> allocation_; ///< The allocation where the actual data resides

@@ -42,6 +42,11 @@ namespace sirius {
 class IDataRepository {
 public:
     /**
+     * @brief Virtual destructor for proper cleanup of derived classes.
+     */
+    virtual ~IDataRepository() = default;
+
+    /**
      * @brief Add a new data batch to this repository.
      * 
      * The repository takes ownership of the DataBatchView and will manage its lifecycle
@@ -51,10 +56,7 @@ public:
      * 
      * @note Thread-safe operation protected by internal mutex
      */
-    virtual void AddNewDataBatchView(sirius::unique_ptr<DataBatchView> data_batch) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        data_batches_.push_back(std::move(data_batch));
-    }
+    virtual void AddNewDataBatchView(sirius::unique_ptr<DataBatchView> data_batch);
 
     /**
      * @brief Remove and return a data batch from this repository according to eviction policy.
@@ -68,33 +70,9 @@ public:
      * 
      * @note Thread-safe operation protected by internal mutex
      */
-    virtual sirius::unique_ptr<DataBatchView> EvictDataBatchView() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (data_batches_.empty()) {
-            return nullptr;
-        }
-        auto batch = std::move(data_batches_.front());
-        data_batches_.erase(data_batches_.begin());
-        return batch;
-    }
+    virtual sirius::unique_ptr<DataBatchView> PullDataBatchView();
 
-    /**
-     * @brief Get a list of data batch IDs that are candidates for tier downgrading.
-     * 
-     * This method identifies data batches that can be moved to lower-cost memory tiers
-     * (e.g., from GPU memory to host memory) to free up high-performance memory.
-     * The selection criteria depend on the implementation but typically consider:
-     * - Access patterns and frequency
-     * - Age of the data batch
-     * - Reference count (batches with no active views are preferred)
-     * 
-     * @param num_data_batches Maximum number of candidates to return
-     * @return std::vector<uint64_t> Vector of batch IDs suitable for downgrading
-     * 
-     * @note Thread-safe operation protected by internal mutex
-     */
-    virtual std::vector<uint64_t> GetDowngradableDataBatches(size_t size_in_bytes) = 0;
-private:
+protected:
     sirius::mutex mutex_;                                      ///< Mutex for thread-safe access to repository operations
     sirius::vector<sirius::unique_ptr<DataBatchView>> data_batches_;  ///< Map of pipeline source to DataBatchView
 };

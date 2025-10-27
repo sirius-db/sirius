@@ -55,114 +55,138 @@ public:
      * @param batch_id Unique identifier for this batch (obtained from DataRepositoryManager)
      * @param data Ownership of the data representation is transferred to this batch
      */
-    DataBatch(uint64_t batch_id, sirius::unique_ptr<IDataRepresentation> data) 
-        : batch_id_(batch_id), data_(std::move(data)) {}
+    DataBatch(uint64_t batch_id, sirius::unique_ptr<IDataRepresentation> data);
     
     /**
      * @brief Move constructor - transfers ownership of the batch and its data.
      * 
-     * @param other The batch to move from (will be left in a valid but unspecified state)
+     * Moves the batch_id and data from the other batch, then resets the other batch's
+     * batch_id to 0 and data pointer to nullptr.
+     * 
+     * @param other The batch to move from (will have batch_id set to 0 and data set to nullptr)
      */
-    DataBatch(DataBatch&& other) noexcept
-        : batch_id_(other.batch_id_), data_(std::move(other.data_)) {
-        other.batch_id_ = 0;
-        other.data_ = nullptr;
-    }
+    DataBatch(DataBatch&& other) noexcept;
 
     /**
      * @brief Move assignment operator - transfers ownership of the batch and its data.
      * 
-     * @param other The batch to move from (will be left in a valid but unspecified state)
+     * Performs self-assignment check, then moves the batch_id and data from the other batch.
+     * Resets the other batch's batch_id to 0 and data pointer to nullptr.
+     * 
+     * @param other The batch to move from (will have batch_id set to 0 and data set to nullptr)
      * @return DataBatch& Reference to this batch
      */
-    DataBatch& operator=(DataBatch&& other) noexcept {
-        if (this != &other) {
-            batch_id_ = other.batch_id_;
-            data_ = std::move(other.data_);
-            other.batch_id_ = 0;
-            other.data_ = nullptr;
-        }
-        return *this;
-    }
+    DataBatch& operator=(DataBatch&& other) noexcept;
 
     /**
      * @brief Get the current memory tier where this batch's data resides.
      * 
      * @return Tier The memory tier (GPU, HOST, or STORAGE)
      */
-    Tier GetCurrentTier() const {
-        return data_->GetCurrentTier();
-    }
+    Tier GetCurrentTier() const;
 
     /**
      * @brief Get the unique identifier for this data batch.
      * 
      * @return uint64_t The batch ID assigned during construction
      */
-    uint64_t GetBatchId() const {
-        return batch_id_;
-    }
+    uint64_t GetBatchId() const;
 
     /**
      * @brief Atomically decrement the reference count.
      * 
      * Called when a DataBatchView is destroyed. When the reference count reaches zero,
-     * this batch can be safely evicted or moved between memory tiers.
-     * Uses relaxed memory ordering as reference counting doesn't require synchronization
+     * this DataBatch object deletes itself.
+     * Uses relaxed memory ordering as reference counting doesn't require synchronization.
+     * View count == 0 means that the DataBatch can be destroyed.
      * 
-     * @throws std::runtime_error if data is not currently in GPU tier
+     * @warning This method will delete the DataBatch object when ref count reaches zero.
      */
-    void DecrementRefCount() {
-        std::lock_guard<sirius::mutex> lock(mutex_);
-        if (data_->GetCurrentTier() != Tier::GPU) {
-            throw std::runtime_error("DataBatchView should always be in GPU tier");
-        }
-        ref_count_.fetch_sub(1, std::memory_order_relaxed);
-    }
+    void DecrementViewRefCount();
 
     /**
-     * @brief Thread-safe method to increment reference count with tier validation.
+     * @brief Atomically increment the reference count.
      * 
-     * This method is used by DataBatchView constructor to ensure the data is in GPU tier
-     * before creating a view. Provides thread-safe access to both tier checking and
-     * reference count incrementing.
+     * Called when a new DataBatchView is created. Uses relaxed memory ordering
+     * for performance as reference counting doesn't require synchronization.
+     */
+    void IncrementViewRefCount();
+
+    /**
+     * @brief Thread-safe method to increment pin count with tier validation.
+     * 
+     * Called when a batch is pinned in memory to prevent eviction. This method
+     * validates that the data is in GPU tier before incrementing the pin count.
+     * Uses a mutex lock for thread-safe tier checking and atomic operations.
+     * Pin count == 0 means that the DataBatch can be downgraded from GPU memory.
      * 
      * @throws std::runtime_error if data is not currently in GPU tier
      */
-    void IncrementRefCount() {
-        std::lock_guard<sirius::mutex> lock(mutex_);
-        if (data_->GetCurrentTier() != Tier::GPU) {
-            throw std::runtime_error("DataBatch data must be in GPU tier to create DataBatchView");
-        }
-        ref_count_.fetch_add(1, std::memory_order_relaxed);
-    }
+    void IncrementPinRefCount();
+
+    /**
+     * @brief Thread-safe method to decrement pin count with tier validation.
+     * 
+     * Called when a pin is released. This method validates that the data is in GPU tier
+     * before decrementing the pin count. When the pin count reaches zero, the batch can be
+     * considered for eviction or tier movement according to memory management policies.
+     * Uses a mutex lock for thread-safe tier checking and atomic operations.
+     * 
+     * @throws std::runtime_error if data is not currently in GPU tier
+     */
+    void DecrementPinRefCount();
 
     /**
      * @brief Create a DataBatchView referencing this DataBatch.
      * 
-     * Increments the reference count to account for the new view.
+     * Casts the underlying data representation to GPUTableRepresentation and creates
+     * a DataBatchView from its CUDF table view. The DataBatchView constructor will
+     * handle incrementing the reference count.
      * 
      * @return sirius::unique_ptr<DataBatchView> A unique pointer to the new DataBatchView
+     * @note Assumes data is already in GPU tier as GPUTableRepresentation
      */
     sirius::unique_ptr<DataBatchView> CreateView();
 
     /**
-     * @brief Get the current reference count.
+     * @brief Get the current view reference count.
      * 
      * Returns the number of DataBatchViews currently referencing this batch.
+     * Uses relaxed memory ordering for the atomic load.
      * 
-     * @return size_t The current reference count
-     * @note Thread-safe atomic operation
+     * @return size_t The current view reference count
+     * @note Thread-safe atomic operation with relaxed memory ordering
      */
-    size_t GetRefCount() const {
-        return ref_count_.load(std::memory_order_relaxed);
-    }
+    size_t GetViewCount() const;
+
+    /**
+     * @brief Get the current pin count.
+     * 
+     * Returns the number of active pins on this batch. A non-zero pin count
+     * indicates the batch should not be evicted or moved between memory tiers.
+     * Uses relaxed memory ordering for the atomic load.
+     * 
+     * @return size_t The current pin count
+     * @note Thread-safe atomic operation with relaxed memory ordering
+     */
+    size_t GetPinCount() const;
+
+    /**
+     * @brief Get the underlying data representation.
+     * 
+     * Returns a pointer to the IDataRepresentation that holds the actual data.
+     * This allows access to tier-specific operations and data access methods.
+     * 
+     * @return sirius::unique_ptr<IDataRepresentation> Pointer to the data representation
+     */
+    sirius::unique_ptr<IDataRepresentation> GetData() const;
 
 private:
     mutable sirius::mutex mutex_;                         ///< Mutex for thread-safe access to tier checking and reference counting
     uint64_t batch_id_;                                   ///< Unique identifier for this data batch
     sirius::unique_ptr<IDataRepresentation> data_;       ///< Pointer to the actual data representation
-    sirius::atomic<size_t> ref_count_ = 0;               ///< Reference count for tracking usage
+    sirius::atomic<size_t> view_count_ = 0;               ///< Reference count for tracking views
+    sirius::atomic<size_t> pin_count_ = 0;                ///< Reference count for tracking pins to prevent eviction
 };
 
 } // namespace sirius

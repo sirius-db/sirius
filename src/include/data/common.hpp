@@ -54,6 +54,15 @@ public:
     virtual std::size_t GetSizeInBytes() const = 0;
 
     /**
+     * @brief Convert this data representation to a different memory tier
+     * 
+     * @param target_tier The target tier to convert to
+     * @param device_mr The device memory resource to use for GPU tier allocations
+     * @param stream CUDA stream to use for memory operations
+     */
+    virtual void ConvertToTier(Tier target_tier, rmm::mr::device_memory_resource* mr = nullptr, rmm::cuda_stream_view stream = rmm::cuda_stream_default) = 0;
+
+    /**
      * @brief Safely casts this interface to a specific derived type
      * 
      * @tparam TARGET The target type to cast to

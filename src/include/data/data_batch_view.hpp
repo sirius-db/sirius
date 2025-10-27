@@ -29,101 +29,113 @@ namespace sirius {
 using sirius::memory::Tier;
 
 /**
- * @brief A view into a DataBatch that provides CUDF table interface while managing reference counting.
+ * @brief A view into a DataBatch that manages reference counting and provides CUDF table access.
  * 
- * DataBatchView extends cudf::table_view to provide a high-level interface for working with
- * columnar data while maintaining proper reference counting on the underlying DataBatch.
- * This ensures that the DataBatch cannot be evicted or destroyed while views are still active.
+ * DataBatchView maintains a pointer to a DataBatch and manages reference counting to ensure
+ * the batch cannot be destroyed while views are still active. It provides pin/unpin functionality
+ * to prevent eviction and allows access to CUDF table_view when pinned.
  * 
  * Key characteristics:
- * - Inherits from cudf::table_view, providing full CUDF API compatibility
- * - Automatically manages reference counting on construction/destruction/assignment
+ * - Manages reference counting on the underlying DataBatch
  * - Copyable (each copy increments reference count)
- * - Thread-safe reference counting operations
- * - RAII semantics ensure proper cleanup
+ * - Thread-safe reference counting through atomic operations in DataBatch
+ * - Pin/unpin functionality prevents batch eviction from GPU memory
+ * - Provides CUDF table_view access when pinned
  * 
  * Usage pattern:
  * ```cpp
- * auto view = std::make_unique<DataBatchView>(batch, columns);
- * // Use view with any CUDF operations
- * auto result = cudf::filter(view->select({0, 1}), predicate);
- * // Reference count automatically decremented when view goes out of scope
+ * auto view = batch->CreateView();
+ * view->Pin();  // Prevents eviction
+ * auto cudf_view = view->GetCudfTableView();
+ * // Use cudf_view with CUDF operations
+ * view->Unpin();  // Allows eviction again
  * ```
  * 
  * @note The underlying DataBatch must remain valid for the lifetime of any views referencing it.
  */
-class DataBatchView : public cudf::table_view {
+class DataBatchView {
 public:
     /**
-     * @brief Construct a new DataBatchView from a DataBatch and column specifications.
+     * @brief Construct a new DataBatchView from a DataBatch.
      * 
-     * This constructor performs the following thread-safe operations:
-     * 1. Acquires a lock on the DataBatch
-     * 2. Validates that the data is currently in GPU tier
-     * 3. Increments the reference count
-     * 4. Releases the lock
+     * Stores the batch pointer and increments the view reference count on the batch.
+     * Uses atomic operations for thread-safe reference counting.
      * 
      * @param batch Pointer to the DataBatch to create a view of (must remain valid)
-     * @param cols Vector of column views that define the structure of this table view
-     * 
-     * @throws std::runtime_error if the data is not currently in GPU tier
      * @note Automatically increments the reference count on the provided batch
      */
-    DataBatchView(DataBatch* batch, const std::vector<cudf::column_view>& cols)
-        : batch_(batch), cudf::table_view(cols) {
-        // Thread-safe: acquire lock, validate GPU tier, increment ref count, release lock
-        batch_->IncrementRefCount();
-    }
+    DataBatchView(DataBatch* batch);
 
     /**
      * @brief Copy constructor - creates a new view referencing the same batch.
      * 
-     * Performs thread-safe validation and reference counting operations.
+     * Copies the batch pointer from the other view and increments the reference count.
+     * Uses atomic operations for thread-safe reference counting.
      * 
      * @param other The DataBatchView to copy from
-     * 
-     * @throws std::runtime_error if the data is not currently in GPU tier
      * @note Automatically increments the reference count on the underlying batch
      */
-    DataBatchView(const DataBatchView& other)
-        : cudf::table_view(other), batch_(other.batch_) {
-        // Thread-safe: acquire lock, validate GPU tier, increment ref count, release lock
-        batch_->IncrementRefCount();
-    }
+    DataBatchView(const DataBatchView& other);
 
     /**
      * @brief Copy assignment operator - updates this view to reference a different batch.
      * 
-     * Properly manages reference counts by decrementing the old batch's count (implicitly
-     * through destruction) and incrementing the new batch's count with validation.
+     * Performs self-assignment check, then copies the batch pointer and increments
+     * the new batch's reference count.
      * 
      * @param other The DataBatchView to copy from
      * @return DataBatchView& Reference to this view
      * 
-     * @throws std::runtime_error if the new data is not currently in GPU tier
+     * @warning Currently does not decrement the old batch's reference count before assignment.
+     *          This may result in reference count leaks.
+     * @warning Implementation calls cudf::table_view::operator= but this class doesn't inherit from it.
      */
-    DataBatchView& operator=(const DataBatchView& other) {
-        if (this != &other) {
-            cudf::table_view::operator=(other);
-            batch_ = other.batch_;
-            // Thread-safe: acquire lock, validate GPU tier, increment ref count, release lock
-            batch_->IncrementRefCount();
-        }
-        return *this;
-    }
+    DataBatchView& operator=(const DataBatchView& other);
 
     /**
-     * @brief Destructor - automatically decrements the reference count on the underlying batch.
+     * @brief Destructor - automatically unpins if pinned and decrements the view reference count on the underlying batch.
      * 
-     * This enables the DataBatch to be safely evicted or destroyed when no more views
-     * are referencing it.
+     * If the view is pinned, calls Unpin() to decrement the pin count and clear the pinned flag.
+     * Decrements the view reference count on the underlying batch.
      */
-    ~DataBatchView() {
-        batch_->DecrementRefCount();
-    }
+    ~DataBatchView();
+
+    /**
+     * @brief Pin the DataBatchView to prevent batch eviction from GPU memory.
+     * 
+     * Validates that the data is in GPU tier and not already pinned, then sets the
+     * pinned flag and increments the pin reference count on the underlying batch.
+     * 
+     * @throws std::runtime_error if data is not in GPU tier
+     * @throws std::runtime_error if the view is already pinned
+     * @note Future implementation will support automatic tier movement to GPU
+     */
+    void Pin();
+
+    /**
+     * @brief Unpin the DataBatchView to allow batch eviction.
+     * 
+     * Validates that the view is currently pinned, then clears the pinned flag
+     * and decrements the pin reference count on the underlying batch.
+     * 
+     * @throws std::runtime_error if the view is not currently pinned
+     */
+    void Unpin();
+
+    /**
+     * @brief Get a CUDF table_view for performing CUDF operations.
+     * 
+     * Returns a CUDF table_view by casting the underlying data to GPUTableRepresentation
+     * and extracting the table view. Requires the view to be pinned before calling.
+     * 
+     * @return cudf::table_view A CUDF table view for this batch's data
+     * @throws std::runtime_error if the view is not currently pinned
+     */
+    cudf::table_view GetCudfTableView();
 
 private:
-    DataBatch* batch_;
+    DataBatch* batch_;  ///< Pointer to the underlying DataBatch being viewed
+    bool pinned_ = false;  ///< Whether the batch is pinned
 };
 
 } // namespace sirius
