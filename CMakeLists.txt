@@ -62,6 +62,7 @@ set(EXTENSION_SOURCES
   src/cpu_cache.cpp
   src/gpu_query_result.cpp
   src/config.cpp
+  src/fallback.cpp
   src/memory/memory_reservation.cpp
   src/parallel/task_executor.cpp
 )
