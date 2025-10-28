@@ -61,8 +61,10 @@ public:
      * batch_id to 0 and data pointer to nullptr.
      * 
      * @param other The batch to move from (will have batch_id set to 0 and data set to nullptr)
+     * @throws std::runtime_error if the source batch has active views (view_count != 0)
+     * @throws std::runtime_error if the source batch has active pins (pin_count != 0)
      */
-    DataBatch(DataBatch&& other) noexcept;
+    DataBatch(DataBatch&& other);
 
     /**
      * @brief Move assignment operator - transfers ownership of the batch and its data.
@@ -72,8 +74,10 @@ public:
      * 
      * @param other The batch to move from (will have batch_id set to 0 and data set to nullptr)
      * @return DataBatch& Reference to this batch
+     * @throws std::runtime_error if the source batch has active views (view_count != 0)
+     * @throws std::runtime_error if the source batch has active pins (pin_count != 0)
      */
-    DataBatch& operator=(DataBatch&& other) noexcept;
+    DataBatch& operator=(DataBatch&& other);
 
     /**
      * @brief Get the current memory tier where this batch's data resides.

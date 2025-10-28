@@ -129,7 +129,7 @@ public:
      * @return cudf::table_view A CUDF table view for this batch's data
      * @throws std::runtime_error if the view is not currently pinned
      */
-    cudf::table_view GetCudfTableView();
+    cudf::table_view GetCudfTableView() const;
 
 private:
     DataBatch* batch_;  ///< Pointer to the underlying DataBatch being viewed

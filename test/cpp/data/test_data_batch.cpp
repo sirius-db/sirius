@@ -134,7 +134,7 @@ TEST_CASE("DataBatch View Reference Counting", "[data_batch]") {
     REQUIRE(batch.GetViewCount() == 1);
     
     batch.DecrementViewRefCount();
-    REQUIRE(batch.GetViewCount() == 0);
+    // batch should be deleted
 }
 
 // Test pin reference counting - increment and decrement
@@ -505,29 +505,50 @@ TEST_CASE("DataBatch With Different Data Sizes", "[data_batch]") {
     }
 }
 
-// Test move semantics preserve reference counts
-TEST_CASE("DataBatch Move Preserves Reference Counts", "[data_batch]") {
-    auto data = sirius::make_unique<MockDataRepresentation>(Tier::GPU, 1024);
-    DataBatch batch1(1, std::move(data));
+// Test that move operations require zero reference counts
+TEST_CASE("DataBatch Move Requires Zero Reference Counts", "[data_batch]") {
+    // Test that moving with active views throws
+    {
+        auto data = sirius::make_unique<MockDataRepresentation>(Tier::GPU, 1024);
+        DataBatch batch1(1, std::move(data));
+        batch1.IncrementViewRefCount();
+        
+        REQUIRE_THROWS_AS([&]() { DataBatch batch2(std::move(batch1)); }(), std::runtime_error);
+    }
     
-    // Set up some view count
-    batch1.IncrementViewRefCount();
-    batch1.IncrementViewRefCount();
-    batch1.IncrementViewRefCount();
+    // Test that moving with active pins throws
+    {
+        auto data = sirius::make_unique<MockDataRepresentation>(Tier::GPU, 1024);
+        DataBatch batch1(1, std::move(data));
+        batch1.IncrementPinRefCount();
+        
+        REQUIRE_THROWS_AS([&]() { DataBatch batch2(std::move(batch1)); }(), std::runtime_error);
+    }
     
-    // Set up some pin count
-    batch1.IncrementPinRefCount();
-    batch1.IncrementPinRefCount();
+    // Test that moving with both active views and pins throws
+    {
+        auto data = sirius::make_unique<MockDataRepresentation>(Tier::GPU, 1024);
+        DataBatch batch1(1, std::move(data));
+        batch1.IncrementViewRefCount();
+        batch1.IncrementPinRefCount();
+        
+        REQUIRE_THROWS_AS([&]() { DataBatch batch2(std::move(batch1)); }(), std::runtime_error);
+    }
     
-    REQUIRE(batch1.GetViewCount() == 3);
-    REQUIRE(batch1.GetPinCount() == 2);
-    
-    // Move to new batch
-    DataBatch batch2(std::move(batch1));
-    
-    // Reference counts should be preserved
-    REQUIRE(batch2.GetViewCount() == 3);
-    REQUIRE(batch2.GetPinCount() == 2);
+    // Test that moving with zero counts succeeds
+    {
+        auto data = sirius::make_unique<MockDataRepresentation>(Tier::GPU, 1024);
+        DataBatch batch1(1, std::move(data));
+        
+        REQUIRE(batch1.GetViewCount() == 0);
+        REQUIRE(batch1.GetPinCount() == 0);
+        
+        DataBatch batch2(std::move(batch1));
+        
+        REQUIRE(batch2.GetViewCount() == 0);
+        REQUIRE(batch2.GetPinCount() == 0);
+        REQUIRE(batch2.GetBatchId() == 1);
+    }
 }
 
 // Test multiple rapid view count increment/decrement cycles

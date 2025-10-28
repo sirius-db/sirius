@@ -23,14 +23,31 @@ namespace sirius {
 DataBatch::DataBatch(uint64_t batch_id, sirius::unique_ptr<IDataRepresentation> data)
     : batch_id_(batch_id), data_(std::move(data)) {}
 
-DataBatch::DataBatch(DataBatch&& other) noexcept
-    : batch_id_(other.batch_id_), data_(std::move(other.data_)) {
+DataBatch::DataBatch(DataBatch&& other)
+    : batch_id_(other.batch_id_), 
+      data_(std::move(other.data_)) {
+    size_t other_view_count = other.view_count_.load(std::memory_order_relaxed);
+    size_t other_pin_count = other.pin_count_.load(std::memory_order_relaxed);
+    if (other_view_count != 0) {
+        throw std::runtime_error("Cannot move DataBatch with active views (view_count != 0)");
+    }
+    if (other_pin_count != 0) {
+        throw std::runtime_error("Cannot move DataBatch with active pins (pin_count != 0)");
+    }
     other.batch_id_ = 0;
     other.data_ = nullptr;
 }
 
-DataBatch& DataBatch::operator=(DataBatch&& other) noexcept {
+DataBatch& DataBatch::operator=(DataBatch&& other) {
     if (this != &other) {
+        size_t other_view_count = other.view_count_.load(std::memory_order_relaxed);
+        size_t other_pin_count = other.pin_count_.load(std::memory_order_relaxed);
+        if (other_view_count != 0) {
+            throw std::runtime_error("Cannot move DataBatch with active views (view_count != 0)");
+        }
+        if (other_pin_count != 0) {
+            throw std::runtime_error("Cannot move DataBatch with active pins (pin_count != 0)");
+        }
         batch_id_ = other.batch_id_;
         data_ = std::move(other.data_);
         other.batch_id_ = 0;
@@ -54,7 +71,8 @@ void DataBatch::IncrementViewRefCount() {
 void DataBatch::DecrementViewRefCount() {
     size_t old_count = view_count_.fetch_sub(1, std::memory_order_relaxed);
     if (old_count == 1) {
-        delete this;
+        // TODO: later on we will have to figure out a way to delete the batch safely and efficiently
+        // delete this;
     }
 }
 

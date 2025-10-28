@@ -33,6 +33,10 @@ DataBatchView::DataBatchView(const DataBatchView& other)
 
 DataBatchView& DataBatchView::operator=(const DataBatchView& other) {
     if (this != &other) {
+        if (pinned_) {
+            Unpin();
+        }
+        batch_->DecrementViewRefCount();
         batch_ = other.batch_;
         // Thread-safe: acquire lock, validate GPU tier, increment ref count, release lock
         batch_->IncrementViewRefCount();
@@ -40,8 +44,8 @@ DataBatchView& DataBatchView::operator=(const DataBatchView& other) {
     return *this;
 }
 
-cudf::table_view 
-DataBatchView::GetCudfTableView() {
+cudf::table_view
+DataBatchView::GetCudfTableView() const {
     if (!pinned_) {
         throw std::runtime_error("DataBatchView is not pinned");
     }
@@ -72,6 +76,7 @@ DataBatchView::~DataBatchView() {
     if (pinned_) {
         Unpin();
     }
+    batch_->DecrementViewRefCount();
 }
 
 } // namespace sirius

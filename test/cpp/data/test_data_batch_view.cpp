@@ -40,6 +40,7 @@ public:
     
     sirius::unique_ptr<IDataRepresentation> ConvertToTier(Tier target_tier, rmm::mr::device_memory_resource* mr = nullptr, rmm::cuda_stream_view stream = rmm::cuda_stream_default) override {
         // Empty implementation for testing
+        return nullptr;
     }
     
     void SetTier(Tier tier) {
@@ -99,8 +100,6 @@ TEST_CASE("DataBatchView Copy Assignment", "[data_batch_view]") {
     // Copy assign
     view1 = view2;
     
-    // Note: Current implementation doesn't decrement old batch's count (potential leak)
-    // but increments new batch's count
     REQUIRE(batch2->GetViewCount() == 2);
 }
 
