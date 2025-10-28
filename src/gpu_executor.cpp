@@ -59,10 +59,15 @@ void GPUExecutor::Initialize(unique_ptr<GPUPhysicalOperator> plan) {
 
 void GPUExecutor::Execute() {
 	// Check if we should fall back to duckdb execution.
+<<<<<<< HEAD
 	if (Config::ENABLE_FALLBACK_CHECK) {
 		FallbackChecker fallback_checker(scheduled);
 		fallback_checker.Check();
 	}
+=======
+	FallbackChecker fallback_checker(scheduled);
+	fallback_checker.Check();
+>>>>>>> c4417dc0 (Fall back regex expression to duckdb)
 
 	// Execution starts here.
 	int initial_idx = 0;

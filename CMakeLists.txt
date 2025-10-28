@@ -49,7 +49,7 @@ include_directories(duckdb/extension_external/substrait/src/include)
 include_directories(${TARGET_NAME} duckdb/extension_external/substrait/third_party/substrait)
 include_directories(${TARGET_NAME} duckdb/extension_external/substrait/third_party)
 
-set(EXTENSION_SOURCES 
+set(EXTENSION_SOURCES
   src/sirius_extension.cpp
   src/gpu_context.cpp
   src/gpu_executor.cpp
