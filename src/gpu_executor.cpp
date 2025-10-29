@@ -17,6 +17,7 @@
 #include "gpu_context.hpp"
 #include "duckdb/execution/operator/set/physical_recursive_cte.hpp"
 #include "duckdb/execution/operator/helper/physical_result_collector.hpp"
+#include "config.hpp"
 #include "fallback.hpp"
 #include "gpu_physical_operator.hpp"
 #include "operator/gpu_physical_result_collector.hpp"
@@ -58,8 +59,10 @@ void GPUExecutor::Initialize(unique_ptr<GPUPhysicalOperator> plan) {
 
 void GPUExecutor::Execute() {
 	// Check if we should fall back to duckdb execution.
-	FallbackChecker fallback_checker(scheduled);
-	fallback_checker.Check();
+	if (Config::ENABLE_FALLBACK_CHECK) {
+		FallbackChecker fallback_checker(scheduled);
+		fallback_checker.Check();
+	}
 
 	// Execution starts here.
 	int initial_idx = 0;

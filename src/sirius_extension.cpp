@@ -552,6 +552,11 @@ static void SetPrintGPUTableMaxRows(ClientContext &context, SetScope scope, Valu
 	SIRIUS_LOG_DEBUG("Updated config PRINT_GPU_TABLE_MAX_ROWS to {}", Config::PRINT_GPU_TABLE_MAX_ROWS);
 }
 
+static void SetEnableFallbackCheck(ClientContext &context, SetScope scope, Value &parameter) {
+	Config::ENABLE_FALLBACK_CHECK = BooleanValue::Get(parameter);
+	SIRIUS_LOG_DEBUG("Updated config ENABLE_FALLBACK_CHECK to {}", Config::ENABLE_FALLBACK_CHECK);
+}
+
 void SiriusExtension::InitialGPUConfigs(DuckDB &db) {
 	auto &config = DBConfig::GetConfig(*db.instance);
 
@@ -578,6 +583,10 @@ void SiriusExtension::InitialGPUConfigs(DuckDB &db) {
 	// Add in config options for printing gpu table
 	config.AddExtensionOption("print_gpu_table_max_rows", "Maximal amount of rows to render when printing gpu table", LogicalType::UBIGINT, 
 		Value::UBIGINT(Config::PRINT_GPU_TABLE_MAX_ROWS), SetPrintGPUTableMaxRows);
+	
+	// Add in config options for duckdb fallback checking
+	config.AddExtensionOption("enable_fallback_check", "Whether to enable checking of fallback to duckdb execution", LogicalType::BOOLEAN, 
+		Value::BOOLEAN(Config::ENABLE_FALLBACK_CHECK), SetEnableFallbackCheck);
 }
 
 void SiriusExtension::Load(DuckDB &db) {

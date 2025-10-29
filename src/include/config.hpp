@@ -40,6 +40,9 @@ struct Config {
 
   // For printing gpu table
   static uint64_t PRINT_GPU_TABLE_MAX_ROWS;
+
+  // For checking whether to fall back to duckdb execution
+  static bool ENABLE_FALLBACK_CHECK;
 };
 
 }

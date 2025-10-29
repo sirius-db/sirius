@@ -119,7 +119,7 @@ void FallbackChecker::CheckExpression(const BoundConjunctionExpression& expr) co
 void FallbackChecker::CheckExpression(const BoundFunctionExpression& expr) const {
   const auto& func_str = expr.function.name;
   if (func_str == REGEXP_REPLACE_FUNC_STR) {
-    throw InternalException("Fallback unsupported expression: %s", REGEXP_REPLACE_FUNC_STR);
+    throw InternalException("[Fallback checker] unsupported expression: %s", REGEXP_REPLACE_FUNC_STR);
   }
   for (const auto& child: expr.children) {
     CheckExpression(*child);
