@@ -27,42 +27,42 @@
 namespace sirius {
 
 /**
- * @brief A view into a DataBatch that manages reference counting and provides CUDF table access.
+ * @brief A view into a data_batch that manages reference counting and provides CUDF table access.
  * 
- * DataBatchView maintains a pointer to a DataBatch and manages reference counting to ensure
+ * data_batch_view maintains a pointer to a data_batch and manages reference counting to ensure
  * the batch cannot be destroyed while views are still active. It provides pin/unpin functionality
  * to prevent eviction and allows access to CUDF table_view when pinned.
  * 
  * Key characteristics:
- * - Manages reference counting on the underlying DataBatch
+ * - Manages reference counting on the underlying data_batch
  * - Copyable (each copy increments reference count)
- * - Thread-safe reference counting through atomic operations in DataBatch
+ * - Thread-safe reference counting through atomic operations in data_batch
  * - Pin/unpin functionality prevents batch eviction from GPU memory
  * - Provides CUDF table_view access when pinned
  * 
  * Usage pattern:
  * ```cpp
- * auto view = batch->CreateView();
- * view->Pin();  // Prevents eviction
- * auto cudf_view = view->GetCudfTableView();
+ * auto view = batch->create_view();
+ * view->pin();  // Prevents eviction
+ * auto cudf_view = view->get_cudf_table_view();
  * // Use cudf_view with CUDF operations
- * view->Unpin();  // Allows eviction again
+ * view->unpin();  // Allows eviction again
  * ```
  * 
- * @note The underlying DataBatch must remain valid for the lifetime of any views referencing it.
+ * @note The underlying data_batch must remain valid for the lifetime of any views referencing it.
  */
-class DataBatchView {
+class data_batch_view {
 public:
     /**
-     * @brief Construct a new DataBatchView from a DataBatch.
+     * @brief Construct a new data_batch_view from a data_batch.
      * 
      * Stores the batch pointer and increments the view reference count on the batch.
      * Uses atomic operations for thread-safe reference counting.
      * 
-     * @param batch Pointer to the DataBatch to create a view of (must remain valid)
+     * @param batch Pointer to the data_batch to create a view of (must remain valid)
      * @note Automatically increments the reference count on the provided batch
      */
-    DataBatchView(DataBatch* batch);
+    data_batch_view(data_batch* batch);
 
     /**
      * @brief Copy constructor - creates a new view referencing the same batch.
@@ -70,10 +70,10 @@ public:
      * Copies the batch pointer from the other view and increments the reference count.
      * Uses atomic operations for thread-safe reference counting.
      * 
-     * @param other The DataBatchView to copy from
+     * @param other The data_batch_view to copy from
      * @note Automatically increments the reference count on the underlying batch
      */
-    DataBatchView(const DataBatchView& other);
+    data_batch_view(const data_batch_view& other);
 
     /**
      * @brief Copy assignment operator - updates this view to reference a different batch.
@@ -81,25 +81,25 @@ public:
      * Performs self-assignment check, then copies the batch pointer and increments
      * the new batch's reference count.
      * 
-     * @param other The DataBatchView to copy from
-     * @return DataBatchView& Reference to this view
+     * @param other The data_batch_view to copy from
+     * @return data_batch_view& Reference to this view
      * 
      * @warning Currently does not decrement the old batch's reference count before assignment.
      *          This may result in reference count leaks.
      * @warning Implementation calls cudf::table_view::operator= but this class doesn't inherit from it.
      */
-    DataBatchView& operator=(const DataBatchView& other);
+    data_batch_view& operator=(const data_batch_view& other);
 
     /**
      * @brief Destructor - automatically unpins if pinned and decrements the view reference count on the underlying batch.
      * 
-     * If the view is pinned, calls Unpin() to decrement the pin count and clear the pinned flag.
+     * If the view is pinned, calls unpin() to decrement the pin count and clear the pinned flag.
      * Decrements the view reference count on the underlying batch.
      */
-    ~DataBatchView();
+    ~data_batch_view();
 
     /**
-     * @brief Pin the DataBatchView to prevent batch eviction from GPU memory.
+     * @brief Pin the data_batch_view to prevent batch eviction from GPU memory.
      * 
      * Validates that the data is in GPU tier and not already pinned, then sets the
      * pinned flag and increments the pin reference count on the underlying batch.
@@ -108,32 +108,32 @@ public:
      * @throws std::runtime_error if the view is already pinned
      * @note Future implementation will support automatic tier movement to GPU
      */
-    void Pin();
+    void pin();
 
     /**
-     * @brief Unpin the DataBatchView to allow batch eviction.
+     * @brief Unpin the data_batch_view to allow batch eviction.
      * 
      * Validates that the view is currently pinned, then clears the pinned flag
      * and decrements the pin reference count on the underlying batch.
      * 
      * @throws std::runtime_error if the view is not currently pinned
      */
-    void Unpin();
+    void unpin();
 
     /**
      * @brief Get a CUDF table_view for performing CUDF operations.
      * 
-     * Returns a CUDF table_view by casting the underlying data to GPUTableRepresentation
+     * Returns a CUDF table_view by casting the underlying data to gpu_table_representation
      * and extracting the table view. Requires the view to be pinned before calling.
      * 
      * @return cudf::table_view A CUDF table view for this batch's data
      * @throws std::runtime_error if the view is not currently pinned
      */
-    cudf::table_view GetCudfTableView() const;
+    cudf::table_view get_cudf_table_view() const;
 
 private:
-    DataBatch* batch_;  ///< Pointer to the underlying DataBatch being viewed
-    bool pinned_ = false;  ///< Whether the batch is pinned
+    data_batch* _batch;  ///< Pointer to the underlying data_batch being viewed
+    bool _pinned = false;  ///< Whether the batch is pinned
 };
 
 } // namespace sirius

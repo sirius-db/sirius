@@ -19,18 +19,18 @@
 
 namespace sirius {
 
-GPUTableRepresentation::GPUTableRepresentation(cudf::table table)
-    : table_(std::move(table)) {}
+gpu_table_representation::gpu_table_representation(cudf::table table)
+    : _table(std::move(table)) {}
 
-Tier GPUTableRepresentation::GetCurrentTier() const {
+Tier gpu_table_representation::get_current_tier() const {
     return Tier::GPU;
 }
 
-std::size_t GPUTableRepresentation::GetSizeInBytes() const {
+std::size_t gpu_table_representation::get_size_in_bytes() const {
     // TODO: Implement proper size calculation
     // This should return the total size of all columns in the table
     std::size_t total_size = 0;
-    for (auto const& col : table_.view()) {
+    for (auto const& col : _table.view()) {
         // For now, we can calculate a rough estimate based on column size
         // This will need to be refined to account for all buffers (data, validity, offsets, etc.)
         total_size += col.size() * cudf::size_of(col.type());
@@ -38,16 +38,16 @@ std::size_t GPUTableRepresentation::GetSizeInBytes() const {
     return total_size;
 }
 
-const cudf::table& GPUTableRepresentation::GetTable() const {
-    return table_;
+const cudf::table& gpu_table_representation::get_table() const {
+    return _table;
 }
 
-sirius::unique_ptr<IDataRepresentation> GPUTableRepresentation::ConvertToTier(Tier target_tier,
-                                                         rmm::mr::device_memory_resource* mr,
-                                                         rmm::cuda_stream_view stream) {
+sirius::unique_ptr<idata_representation> gpu_table_representation::convert_to_tier(Tier target_tier,
+                                                                                   rmm::mr::device_memory_resource* mr,
+                                                                                   rmm::cuda_stream_view stream) {
     // TODO: Implement conversion to GPU representation
-    // This should use DataRepresentationConverter::ConvertToGPURepresentation
-    throw std::runtime_error("GPUTableRepresentation::ConvertToTier not yet implemented");
+    // This should use data_representation_converter::convert_to_gpu_representation
+    throw std::runtime_error("gpu_table_representation::convert_to_tier not yet implemented");
 }
 
 } // namespace sirius

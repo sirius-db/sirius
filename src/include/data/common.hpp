@@ -41,21 +41,21 @@ class FixedSizeHostMemoryResource;
  * 
  * See representation_converter.hpp for utilities to convert between different underlying representations.
  */
-class IDataRepresentation {
+class idata_representation {
 public:
     /**
      * @brief Get the tier of memory that this representation resides in
      * 
      * @return Tier The memory tier
      */
-    virtual Tier GetCurrentTier() const = 0;
+    virtual Tier get_current_tier() const = 0;
 
     /**
      * @brief Get the size of the data representation in bytes
      * 
      * @return std::size_t The number of bytes used to store this representation
      */
-    virtual std::size_t GetSizeInBytes() const = 0;
+    virtual std::size_t get_size_in_bytes() const = 0;
 
     /**
      * @brief Convert this data representation to a different memory tier
@@ -63,30 +63,30 @@ public:
      * @param target_tier The target tier to convert to
      * @param device_mr The device memory resource to use for GPU tier allocations
      * @param stream CUDA stream to use for memory operations
-     * @return sirius::unique_ptr<IDataRepresentation> A new data representation in the target tier
+     * @return sirius::unique_ptr<idata_representation> A new data representation in the target tier
      */
-    virtual sirius::unique_ptr<IDataRepresentation> ConvertToTier(Tier target_tier, rmm::mr::device_memory_resource* mr = nullptr, rmm::cuda_stream_view stream = rmm::cuda_stream_default) = 0;
+    virtual sirius::unique_ptr<idata_representation> convert_to_tier(Tier target_tier, rmm::mr::device_memory_resource* mr = nullptr, rmm::cuda_stream_view stream = rmm::cuda_stream_default) = 0;
 
     /**
      * @brief Safely casts this interface to a specific derived type
      * 
-     * @tparam TARGET The target type to cast to
-     * @return TARGET& Reference to the casted object
+     * @tparam TargetType The target type to cast to
+     * @return TargetType& Reference to the casted object
      */
-	template <class TARGET>
-	TARGET &Cast() {
-		return reinterpret_cast<TARGET &>(*this);
+	template <class TargetType>
+	TargetType &cast() {
+		return reinterpret_cast<TargetType &>(*this);
 	}
 
     /**
      * @brief Safely casts this interface to a specific derived type (const version)
      * 
-     * @tparam TARGET The target type to cast to
-     * @return const TARGET& Const reference to the casted object
+     * @tparam TargetType The target type to cast to
+     * @return const TargetType& Const reference to the casted object
      */
-	template <class TARGET>
-	const TARGET &Cast() const {
-		return reinterpret_cast<const TARGET &>(*this);
+	template <class TargetType>
+	const TargetType &cast() const {
+		return reinterpret_cast<const TargetType &>(*this);
 	}
 };
 

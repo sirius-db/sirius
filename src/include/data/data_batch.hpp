@@ -25,34 +25,34 @@
 
 namespace sirius {
 
-class DataBatchView; // Forward declaration
+class data_batch_view; // Forward declaration
 
 /**
  * @brief A data batch represents a collection of data that can be moved between different memory tiers.
  * 
- * DataBatch is the core unit of data management in the Sirius system. It wraps an IDataRepresentation
+ * data_batch is the core unit of data management in the Sirius system. It wraps an idata_representation
  * and provides reference counting functionality to track how many views are currently accessing the data.
  * This enables safe memory management and efficient data movement between GPU memory, host memory, 
  * and storage tiers.
  * 
  * Key characteristics:
  * - Move-only semantics (no copy constructor/assignment)
- * - Reference counting for safe shared access via DataBatchView
- * - Delegated tier management to underlying IDataRepresentation
+ * - Reference counting for safe shared access via data_batch_view
+ * - Delegated tier management to underlying idata_representation
  * - Unique batch ID for tracking and debugging purposes
  * 
  * @note This class is not thread-safe for construction/destruction, but the reference counting
  *       operations are atomic and thread-safe.
  */
-class DataBatch {
+class data_batch {
 public:
     /**
-     * @brief Construct a new DataBatch with the given ID and data representation.
+     * @brief Construct a new data_batch with the given ID and data representation.
      * 
-     * @param batch_id Unique identifier for this batch (obtained from DataRepositoryManager)
+     * @param batch_id Unique identifier for this batch (obtained from data_repository_manager)
      * @param data Ownership of the data representation is transferred to this batch
      */
-    DataBatch(uint64_t batch_id, sirius::unique_ptr<IDataRepresentation> data);
+    data_batch(uint64_t batch_id, sirius::unique_ptr<idata_representation> data);
     
     /**
      * @brief Move constructor - transfers ownership of the batch and its data.
@@ -64,7 +64,7 @@ public:
      * @throws std::runtime_error if the source batch has active views (view_count != 0)
      * @throws std::runtime_error if the source batch has active pins (pin_count != 0)
      */
-    DataBatch(DataBatch&& other);
+    data_batch(data_batch&& other);
 
     /**
      * @brief Move assignment operator - transfers ownership of the batch and its data.
@@ -73,45 +73,45 @@ public:
      * Resets the other batch's batch_id to 0 and data pointer to nullptr.
      * 
      * @param other The batch to move from (will have batch_id set to 0 and data set to nullptr)
-     * @return DataBatch& Reference to this batch
+     * @return data_batch& Reference to this batch
      * @throws std::runtime_error if the source batch has active views (view_count != 0)
      * @throws std::runtime_error if the source batch has active pins (pin_count != 0)
      */
-    DataBatch& operator=(DataBatch&& other);
+    data_batch& operator=(data_batch&& other);
 
     /**
      * @brief Get the current memory tier where this batch's data resides.
      * 
      * @return Tier The memory tier (GPU, HOST, or STORAGE)
      */
-    Tier GetCurrentTier() const;
+    Tier get_current_tier() const;
 
     /**
      * @brief Get the unique identifier for this data batch.
      * 
      * @return uint64_t The batch ID assigned during construction
      */
-    uint64_t GetBatchId() const;
+    uint64_t get_batch_id() const;
 
     /**
      * @brief Atomically decrement the reference count.
      * 
-     * Called when a DataBatchView is destroyed. When the reference count reaches zero,
-     * this DataBatch object deletes itself.
+     * Called when a data_batch_view is destroyed. When the reference count reaches zero,
+     * this data_batch object deletes itself.
      * Uses relaxed memory ordering as reference counting doesn't require synchronization.
-     * View count == 0 means that the DataBatch can be destroyed.
+     * View count == 0 means that the data_batch can be destroyed.
      * 
-     * @warning This method will delete the DataBatch object when ref count reaches zero.
+     * @warning This method will delete the data_batch object when ref count reaches zero.
      */
-    void DecrementViewRefCount();
+    void decrement_view_ref_count();
 
     /**
      * @brief Atomically increment the reference count.
      * 
-     * Called when a new DataBatchView is created. Uses relaxed memory ordering
+     * Called when a new data_batch_view is created. Uses relaxed memory ordering
      * for performance as reference counting doesn't require synchronization.
      */
-    void IncrementViewRefCount();
+    void increment_view_ref_count();
 
     /**
      * @brief Thread-safe method to increment pin count with tier validation.
@@ -119,11 +119,11 @@ public:
      * Called when a batch is pinned in memory to prevent eviction. This method
      * validates that the data is in GPU tier before incrementing the pin count.
      * Uses a mutex lock for thread-safe tier checking and atomic operations.
-     * Pin count == 0 means that the DataBatch can be downgraded from GPU memory.
+     * Pin count == 0 means that the data_batch can be downgraded from GPU memory.
      * 
      * @throws std::runtime_error if data is not currently in GPU tier
      */
-    void IncrementPinRefCount();
+    void increment_pin_ref_count();
 
     /**
      * @brief Thread-safe method to decrement pin count with tier validation.
@@ -135,30 +135,30 @@ public:
      * 
      * @throws std::runtime_error if data is not currently in GPU tier
      */
-    void DecrementPinRefCount();
+    void decrement_pin_ref_count();
 
     /**
-     * @brief Create a DataBatchView referencing this DataBatch.
+     * @brief Create a data_batch_view referencing this data_batch.
      * 
-     * Casts the underlying data representation to GPUTableRepresentation and creates
-     * a DataBatchView from its CUDF table view. The DataBatchView constructor will
+     * Casts the underlying data representation to gpu_table_representation and creates
+     * a data_batch_view from its CUDF table view. The data_batch_view constructor will
      * handle incrementing the reference count.
      * 
-     * @return sirius::unique_ptr<DataBatchView> A unique pointer to the new DataBatchView
-     * @note Assumes data is already in GPU tier as GPUTableRepresentation
+     * @return sirius::unique_ptr<data_batch_view> A unique pointer to the new data_batch_view
+     * @note Assumes data is already in GPU tier as gpu_table_representation
      */
-    sirius::unique_ptr<DataBatchView> CreateView();
+    sirius::unique_ptr<data_batch_view> create_view();
 
     /**
      * @brief Get the current view reference count.
      * 
-     * Returns the number of DataBatchViews currently referencing this batch.
+     * Returns the number of data_batch_views currently referencing this batch.
      * Uses relaxed memory ordering for the atomic load.
      * 
      * @return size_t The current view reference count
      * @note Thread-safe atomic operation with relaxed memory ordering
      */
-    size_t GetViewCount() const;
+    size_t get_view_count() const;
 
     /**
      * @brief Get the current pin count.
@@ -170,24 +170,24 @@ public:
      * @return size_t The current pin count
      * @note Thread-safe atomic operation with relaxed memory ordering
      */
-    size_t GetPinCount() const;
+    size_t get_pin_count() const;
 
     /**
      * @brief Get the underlying data representation.
      * 
-     * Returns a pointer to the IDataRepresentation that holds the actual data.
+     * Returns a pointer to the idata_representation that holds the actual data.
      * This allows access to tier-specific operations and data access methods.
      * 
-     * @return IDataRepresentation* Pointer to the data representation (non-owning)
+     * @return idata_representation* Pointer to the data representation (non-owning)
      */
-    IDataRepresentation* GetData() const;
+    idata_representation* get_data() const;
 
 private:
-    mutable sirius::mutex mutex_;                         ///< Mutex for thread-safe access to tier checking and reference counting
-    uint64_t batch_id_;                                   ///< Unique identifier for this data batch
-    sirius::unique_ptr<IDataRepresentation> data_;       ///< Pointer to the actual data representation
-    sirius::atomic<size_t> view_count_ = 0;               ///< Reference count for tracking views
-    sirius::atomic<size_t> pin_count_ = 0;                ///< Reference count for tracking pins to prevent eviction
+    mutable sirius::mutex _mutex;                         ///< Mutex for thread-safe access to tier checking and reference counting
+    uint64_t _batch_id;                                   ///< Unique identifier for this data batch
+    sirius::unique_ptr<idata_representation> _data;       ///< Pointer to the actual data representation
+    sirius::atomic<size_t> _view_count = 0;               ///< Reference count for tracking views
+    sirius::atomic<size_t> _pin_count = 0;                ///< Reference count for tracking pins to prevent eviction
 };
 
 } // namespace sirius

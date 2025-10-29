@@ -19,64 +19,64 @@
 
 namespace sirius {
 
-DataBatchView::DataBatchView(DataBatch* batch)
-    : batch_(batch) {
+data_batch_view::data_batch_view(data_batch* batch)
+    : _batch(batch) {
     // Thread-safe: acquire lock, validate GPU tier, increment ref count, release lock
-    batch_->IncrementViewRefCount();
+    _batch->increment_view_ref_count();
 }
 
-DataBatchView::DataBatchView(const DataBatchView& other)
-    : batch_(other.batch_) {
+data_batch_view::data_batch_view(const data_batch_view& other)
+    : _batch(other._batch) {
     // Thread-safe: acquire lock, validate GPU tier, increment ref count, release lock
-    batch_->IncrementViewRefCount();
+    _batch->increment_view_ref_count();
 }
 
-DataBatchView& DataBatchView::operator=(const DataBatchView& other) {
+data_batch_view& data_batch_view::operator=(const data_batch_view& other) {
     if (this != &other) {
-        if (pinned_) {
-            Unpin();
+        if (_pinned) {
+            unpin();
         }
-        batch_->DecrementViewRefCount();
-        batch_ = other.batch_;
+        _batch->decrement_view_ref_count();
+        _batch = other._batch;
         // Thread-safe: acquire lock, validate GPU tier, increment ref count, release lock
-        batch_->IncrementViewRefCount();
+        _batch->increment_view_ref_count();
     }
     return *this;
 }
 
 cudf::table_view
-DataBatchView::GetCudfTableView() const {
-    if (!pinned_) {
-        throw std::runtime_error("DataBatchView is not pinned");
+data_batch_view::get_cudf_table_view() const {
+    if (!_pinned) {
+        throw std::runtime_error("data_batch_view is not pinned");
     }
-    return batch_->GetData()->Cast<GPUTableRepresentation>().GetTable().view();
+    return _batch->get_data()->cast<gpu_table_representation>().get_table().view();
 }
 
-void DataBatchView::Pin() {
-    if (batch_->GetData()->GetCurrentTier() != Tier::GPU) {
-        throw std::runtime_error("DataBatchView must be in GPU tier to be pinned");
+void data_batch_view::pin() {
+    if (_batch->get_data()->get_current_tier() != Tier::GPU) {
+        throw std::runtime_error("data_batch_view must be in GPU tier to be pinned");
         // TODO: later on we will add a method here to move the data to GPU tier
     }
-    if (pinned_) {
-        throw std::runtime_error("DataBatchView is already pinned");
+    if (_pinned) {
+        throw std::runtime_error("data_batch_view is already pinned");
     }
-    pinned_ = true;
-    batch_->IncrementPinRefCount();
+    _pinned = true;
+    _batch->increment_pin_ref_count();
 }
 
-void DataBatchView::Unpin() {
-    if (!pinned_) {
-        throw std::runtime_error("DataBatchView is not pinned");
+void data_batch_view::unpin() {
+    if (!_pinned) {
+        throw std::runtime_error("data_batch_view is not pinned");
     }
-    pinned_ = false;
-    batch_->DecrementPinRefCount();
+    _pinned = false;
+    _batch->decrement_pin_ref_count();
 }
 
-DataBatchView::~DataBatchView() {
-    if (pinned_) {
-        Unpin();
+data_batch_view::~data_batch_view() {
+    if (_pinned) {
+        unpin();
     }
-    batch_->DecrementViewRefCount();
+    _batch->decrement_view_ref_count();
 }
 
 } // namespace sirius

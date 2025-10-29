@@ -21,9 +21,9 @@
 namespace sirius {
 
 /**
- * @brief Abstract interface for managing collections of DataBatchView objects within a pipeline.
+ * @brief Abstract interface for managing collections of data_batch_view objects within a pipeline.
  * 
- * IDataRepository defines the contract for storing, retrieving, and managing data batches
+ * idata_repository defines the contract for storing, retrieving, and managing data batches
  * within a specific pipeline. Different implementations can provide various storage strategies,
  * such as:
  * - FIFO (First In, First Out) repositories for streaming data
@@ -31,7 +31,7 @@ namespace sirius {
  * - Priority-based repositories for workload-aware scheduling
  * 
  * The repository is responsible for:
- * - Managing the lifecycle of DataBatchView objects
+ * - Managing the lifecycle of data_batch_view objects
  * - Implementing eviction policies when memory pressure occurs
  * - Providing downgrade candidates for memory tier management
  * - Thread-safe access to shared data structures
@@ -39,24 +39,24 @@ namespace sirius {
  * @note Implementations must be thread-safe as multiple threads may access
  *       the repository concurrently during query execution.
  */
-class IDataRepository {
+class idata_repository {
 public:
     /**
      * @brief Virtual destructor for proper cleanup of derived classes.
      */
-    virtual ~IDataRepository() = default;
+    virtual ~idata_repository() = default;
 
     /**
      * @brief Add a new data batch to this repository.
      * 
-     * The repository takes ownership of the DataBatchView and will manage its lifecycle
+     * The repository takes ownership of the data_batch_view and will manage its lifecycle
      * according to the implementation's storage policy.
      * 
-     * @param data_batch Unique pointer to the DataBatchView to add (ownership transferred)
+     * @param data_batch Unique pointer to the data_batch_view to add (ownership transferred)
      * 
      * @note Thread-safe operation protected by internal mutex
      */
-    virtual void AddNewDataBatchView(sirius::unique_ptr<DataBatchView> data_batch);
+    virtual void add_new_data_batch_view(sirius::unique_ptr<data_batch_view> data_batch);
 
     /**
      * @brief Remove and return a data batch from this repository according to eviction policy.
@@ -66,15 +66,15 @@ public:
      * - LRU: Returns the least recently used batch
      * - Priority: Returns the lowest priority batch
      * 
-     * @return sirius::unique_ptr<DataBatchView> The evicted data batch, or nullptr if empty
+     * @return sirius::unique_ptr<data_batch_view> The evicted data batch, or nullptr if empty
      * 
      * @note Thread-safe operation protected by internal mutex
      */
-    virtual sirius::unique_ptr<DataBatchView> PullDataBatchView();
+    virtual sirius::unique_ptr<data_batch_view> pull_data_batch_view();
 
 protected:
-    sirius::mutex mutex_;                                      ///< Mutex for thread-safe access to repository operations
-    sirius::vector<sirius::unique_ptr<DataBatchView>> data_batches_;  ///< Map of pipeline source to DataBatchView
+    sirius::mutex _mutex;                                      ///< Mutex for thread-safe access to repository operations
+    sirius::vector<sirius::unique_ptr<data_batch_view>> _data_batches;  ///< Map of pipeline source to data_batch_view
 };
 
 } // namespace sirius

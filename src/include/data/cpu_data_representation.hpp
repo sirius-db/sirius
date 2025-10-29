@@ -28,50 +28,50 @@ namespace sirius {
  * @brief Data representation for a table being stored in host memory.
  * 
  * This represents a table whose data is stored across multiple blocks (not necessarily contiguous) in host memory.
- * The HostTableRepresentation doesn't own the actual data but is instead owned by the multiple_blocks_allocation.
+ * The host_table_representation doesn't own the actual data but is instead owned by the multiple_blocks_allocation.
  */
-class HostTableRepresentation : public IDataRepresentation {
+class host_table_representation : public idata_representation {
 public:  
     /**
-     * @brief Construct a new HostTableRepresentation object
+     * @brief Construct a new host_table_representation object
      * 
      * @param allocation_blocks The underlying allocation owning the actual data
      * @param meta Metadata required to reconstruct the cuDF columns (using cudf::unpack())
      * @param size The size of the actual data in bytes
      */
-    HostTableRepresentation(sirius::unique_ptr<MultipleBlocksAllocation> allocation_blocks,
-                           sirius::unique_ptr<sirius::vector<uint8_t>> meta,
-                           std::size_t size);
+    host_table_representation(sirius::unique_ptr<multiple_blocks_allocation> allocation_blocks,
+                             sirius::unique_ptr<sirius::vector<uint8_t>> meta,
+                             std::size_t size);
     
     /**
      * @brief Get the tier of memory that this representation resides in
      * 
      * @return Tier The memory tier
      */
-    Tier GetCurrentTier() const override;
+    Tier get_current_tier() const override;
 
     /**
      * @brief Get the size of the data representation in bytes
      * 
      * @return std::size_t The number of bytes used to store this representation
      */
-    std::size_t GetSizeInBytes() const override;
+    std::size_t get_size_in_bytes() const override;
 
     /**
      * @brief Convert this CPU table representation to a different memory tier
      * 
      * @param device_mr The device memory resource to use for GPU tier allocations
      * @param stream CUDA stream to use for memory operations
-     * @return sirius::unique_ptr<IDataRepresentation> A new data representation in the target tier
+     * @return sirius::unique_ptr<idata_representation> A new data representation in the target tier
      */
-    sirius::unique_ptr<IDataRepresentation> ConvertToTier(Tier target_tier,
-                                                         rmm::mr::device_memory_resource* mr,
-                                                         rmm::cuda_stream_view stream) override;
+    sirius::unique_ptr<idata_representation> convert_to_tier(Tier target_tier,
+                                                             rmm::mr::device_memory_resource* mr,
+                                                             rmm::cuda_stream_view stream) override;
 
 private:
-    sirius::unique_ptr<MultipleBlocksAllocation> allocation_; ///< The allocation where the actual data resides
-    sirius::unique_ptr<sirius::vector<uint8_t>> metadata_;     ///< The metadata required to reconstruct the cuDF columns
-    std::size_t data_size_;  ///< The size of the actual data in bytes
+    sirius::unique_ptr<multiple_blocks_allocation> _allocation; ///< The allocation where the actual data resides
+    sirius::unique_ptr<sirius::vector<uint8_t>> _metadata;     ///< The metadata required to reconstruct the cuDF columns
+    std::size_t _data_size;  ///< The size of the actual data in bytes
 };
 
 }

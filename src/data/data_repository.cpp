@@ -19,18 +19,18 @@
 
 namespace sirius {
 
-void IDataRepository::AddNewDataBatchView(sirius::unique_ptr<DataBatchView> data_batch) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    data_batches_.push_back(std::move(data_batch));
+void idata_repository::add_new_data_batch_view(sirius::unique_ptr<data_batch_view> data_batch) {
+    std::lock_guard<std::mutex> lock(_mutex);
+    _data_batches.push_back(std::move(data_batch));
 }
 
-sirius::unique_ptr<DataBatchView> IDataRepository::PullDataBatchView() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (data_batches_.empty()) {
+sirius::unique_ptr<data_batch_view> idata_repository::pull_data_batch_view() {
+    std::lock_guard<std::mutex> lock(_mutex);
+    if (_data_batches.empty()) {
         return nullptr;
     }
-    auto batch = std::move(data_batches_.front());
-    data_batches_.erase(data_batches_.begin());
+    auto batch = std::move(_data_batches.front());
+    _data_batches.erase(_data_batches.begin());
     return batch;
 }
 

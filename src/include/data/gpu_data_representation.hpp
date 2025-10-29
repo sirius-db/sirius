@@ -34,47 +34,47 @@ namespace sirius {
  * TODO: Once the GPU memory resource is implemented, replace the allocation type from IAllocatedMemory to the concrete
  * type returned by the GPU memory allocator.  
  */
-class GPUTableRepresentation : public IDataRepresentation {
+class gpu_table_representation : public idata_representation {
 public:    
     /**
-     * @brief Construct a new GpuTableRepresentation object
+     * @brief Construct a new gpu_table_representation object
      * 
      * @param table The actual cuDF table with the data
      */
-    GPUTableRepresentation(cudf::table table);
+    gpu_table_representation(cudf::table table);
     
     /**
      * @brief Get the tier of memory that this representation resides in
      */
-    Tier GetCurrentTier() const override;
+    Tier get_current_tier() const override;
 
     /**
      * @brief Get the size of the data representation in bytes
      * 
      * @return std::size_t The number of bytes used to store this representation
      */
-    std::size_t GetSizeInBytes() const override;
+    std::size_t get_size_in_bytes() const override;
 
     /**
      * @brief Get the underlying cuDF table
      * 
      * @return const cudf::table& Reference to the cuDF table
      */
-    const cudf::table& GetTable() const;
+    const cudf::table& get_table() const;
 
     /**
      * @brief Convert this GPU table representation to a different memory tier
      * 
      * @param host_mr The host memory resource to use for HOST tier allocations
      * @param stream CUDA stream to use for memory operations
-     * @return sirius::unique_ptr<IDataRepresentation> A new data representation in the target tier
+     * @return sirius::unique_ptr<idata_representation> A new data representation in the target tier
      */
-    sirius::unique_ptr<IDataRepresentation> ConvertToTier(Tier target_tier,
-                                                         rmm::mr::device_memory_resource* mr,
-                                                         rmm::cuda_stream_view stream) override;
+    sirius::unique_ptr<idata_representation> convert_to_tier(Tier target_tier,
+                                                             rmm::mr::device_memory_resource* mr,
+                                                             rmm::cuda_stream_view stream) override;
 
 private:
-    cudf::table table_; ///< The actual cuDF table with the data
+    cudf::table _table; ///< The actual cuDF table with the data
 };
 
 }

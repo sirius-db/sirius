@@ -18,25 +18,25 @@
 
 namespace sirius {
 
-HostTableRepresentation::HostTableRepresentation(sirius::unique_ptr<MultipleBlocksAllocation> allocation_blocks,
-                                                 sirius::unique_ptr<sirius::vector<uint8_t>> meta,
-                                                 std::size_t size)
-    : allocation_(std::move(allocation_blocks)), metadata_(std::move(meta)), data_size_(size) {}
+host_table_representation::host_table_representation(sirius::unique_ptr<MultipleBlocksAllocation> allocation_blocks,
+                                                     sirius::unique_ptr<sirius::vector<uint8_t>> meta,
+                                                     std::size_t size)
+    : _allocation(std::move(allocation_blocks)), _metadata(std::move(meta)), _data_size(size) {}
 
-Tier HostTableRepresentation::GetCurrentTier() const {
+Tier host_table_representation::get_current_tier() const {
     return Tier::HOST;
 }
 
-std::size_t HostTableRepresentation::GetSizeInBytes() const {
-    return data_size_;
+std::size_t host_table_representation::get_size_in_bytes() const {
+    return _data_size;
 }
 
-sirius::unique_ptr<IDataRepresentation> HostTableRepresentation::ConvertToTier(Tier target_tier,
-                                                         rmm::mr::device_memory_resource* mr,
-                                                         rmm::cuda_stream_view stream) {
+sirius::unique_ptr<idata_representation> host_table_representation::convert_to_tier(Tier target_tier,
+                                                                                    rmm::mr::device_memory_resource* mr,
+                                                                                    rmm::cuda_stream_view stream) {
     // TODO: Implement conversion to GPU representation
-    // This should use DataRepresentationConverter::ConvertToGPURepresentation
-    throw std::runtime_error("HostTableRepresentation::ConvertToTier not yet implemented");
+    // This should use data_representation_converter::convert_to_gpu_representation
+    throw std::runtime_error("host_table_representation::convert_to_tier not yet implemented");
 }
 
 } // namespace sirius

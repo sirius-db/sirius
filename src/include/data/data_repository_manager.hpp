@@ -27,8 +27,8 @@ namespace sirius {
 /**
  * @brief Central manager for coordinating data repositories across multiple pipelines.
  * 
- * DataRepositoryManager serves as the top-level coordinator for data management in the
- * Sirius system. It maintains a collection of IDataRepository instances, each associated
+ * data_repository_manager serves as the top-level coordinator for data management in the
+ * Sirius system. It maintains a collection of idata_repository instances, each associated
  * with a specific pipeline, and provides centralized services for:
  * 
  * - Repository lifecycle management (creation, access, cleanup)
@@ -38,10 +38,10 @@ namespace sirius {
  * 
  * Architecture:
  * ```
- * DataRepositoryManager
- * ├── Pipeline 1 → IDataRepository (FIFO/LRU/Priority)
- * ├── Pipeline 2 → IDataRepository (FIFO/LRU/Priority)  
- * └── Pipeline N → IDataRepository (FIFO/LRU/Priority)
+ * data_repository_manager
+ * ├── Pipeline 1 → idata_repository (FIFO/LRU/Priority)
+ * ├── Pipeline 2 → idata_repository (FIFO/LRU/Priority)  
+ * └── Pipeline N → idata_repository (FIFO/LRU/Priority)
  * ```
  * 
  * The manager abstracts the complexity of multi-pipeline data management and provides
@@ -50,12 +50,12 @@ namespace sirius {
  * @note All operations are thread-safe and can be called concurrently from multiple
  *       pipeline execution threads.
  */
-class DataRepositoryManager {
+class data_repository_manager {
 public:
     /**
      * @brief Default constructor - initializes empty repository manager.
      */
-    DataRepositoryManager() = default;
+    data_repository_manager() = default;
 
     /**
      * @brief Register a new data repository for the specified pipeline.
@@ -69,19 +69,19 @@ public:
      * 
      * @note Thread-safe operation
      */
-    void AddNewRepository(size_t pipeline_id, sirius::unique_ptr<IDataRepository> repository);
+    void add_new_repository(size_t pipeline_id, sirius::unique_ptr<idata_repository> repository);
 
     /**
-     * @brief Add a new DataBatch to the holder.
+     * @brief Add a new data_batch to the holder.
      * 
-     * This method stores the actual DataBatch object in the manager's holder.
-     * DataBatchViews reference these batches.
+     * This method stores the actual data_batch object in the manager's holder.
+     * data_batch_views reference these batches.
      * 
-     * @param data_batch The DataBatch to add (ownership transferred)
+     * @param data_batch The data_batch to add (ownership transferred)
      * 
      * @note Thread-safe operation
      */
-    void AddNewDataBatch(sirius::unique_ptr<DataBatch> data_batch, sirius::vector<size_t> pipeline_ids);
+    void add_new_data_batch(sirius::unique_ptr<data_batch> data_batch, sirius::vector<size_t> pipeline_ids);
 
     /**
      * @brief Get direct access to a pipeline's repository for advanced operations.
@@ -90,12 +90,12 @@ public:
      * for repository-specific operations that aren't covered by the common interface.
      * 
      * @param pipeline_id ID of the pipeline whose repository to access
-     * @return sirius::unique_ptr<IDataRepository>& Reference to the repository
+     * @return sirius::unique_ptr<idata_repository>& Reference to the repository
      * 
      * @throws std::out_of_range If no repository exists for the specified pipeline
      * @note Thread-safe for read access, but modifications should use the repository's own thread safety
      */
-    sirius::unique_ptr<IDataRepository>& GetRepository(size_t pipeline_id);
+    sirius::unique_ptr<idata_repository>& get_repository(size_t pipeline_id);
 
     /**
      * @brief Generate a globally unique data batch identifier.
@@ -108,13 +108,13 @@ public:
      * 
      * @note Thread-safe atomic operation with no contention
      */
-    uint64_t GetNextDataBatchId();
+    uint64_t get_next_data_batch_id();
 
 private:
-    mutex mutex_;                                      ///< Mutex for thread-safe access to holder
-    sirius::atomic<uint64_t> next_data_batch_id_ = 0;  ///< Atomic counter for generating unique data batch identifiers
-    sirius::unordered_map<size_t, sirius::unique_ptr<IDataRepository>> repositories; ///< Map of pipeline ID to IDataRepository
-    sirius::vector<sirius::unique_ptr<DataBatch>> holder;  ///< Map to hold the actual DataBatch
+    mutex _mutex;                                      ///< Mutex for thread-safe access to holder
+    sirius::atomic<uint64_t> _next_data_batch_id = 0;  ///< Atomic counter for generating unique data batch identifiers
+    sirius::unordered_map<size_t, sirius::unique_ptr<idata_repository>> _repositories; ///< Map of pipeline ID to idata_repository
+    sirius::vector<sirius::unique_ptr<data_batch>> _holder;  ///< Map to hold the actual data_batch
 };
 
 }

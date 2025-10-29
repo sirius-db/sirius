@@ -20,26 +20,26 @@
 
 namespace sirius {
 
-void DataRepositoryManager::AddNewRepository(size_t pipeline_id, sirius::unique_ptr<IDataRepository> repository) {
-    sirius::lock_guard<sirius::mutex> lock(mutex_);
-    repositories[pipeline_id] = std::move(repository);
+void data_repository_manager::add_new_repository(size_t pipeline_id, sirius::unique_ptr<idata_repository> repository) {
+    sirius::lock_guard<sirius::mutex> lock(_mutex);
+    _repositories[pipeline_id] = std::move(repository);
 }
 
-void DataRepositoryManager::AddNewDataBatch(sirius::unique_ptr<DataBatch> data_batch, sirius::vector<size_t> pipeline_ids) {
+void data_repository_manager::add_new_data_batch(sirius::unique_ptr<data_batch> data_batch, sirius::vector<size_t> pipeline_ids) {
     for (size_t pipeline_id : pipeline_ids) {
-        auto data_batch_view = data_batch->CreateView();
-        repositories[pipeline_id]->AddNewDataBatchView(std::move(data_batch_view));
+        auto data_batch_view = data_batch->create_view();
+        _repositories[pipeline_id]->add_new_data_batch_view(std::move(data_batch_view));
     }
-    sirius::lock_guard<sirius::mutex> lock(mutex_);
-    holder.push_back(std::move(data_batch));
+    sirius::lock_guard<sirius::mutex> lock(_mutex);
+    _holder.push_back(std::move(data_batch));
 }
 
-sirius::unique_ptr<IDataRepository>& DataRepositoryManager::GetRepository(size_t pipeline_id) {
-    return repositories.at(pipeline_id);
+sirius::unique_ptr<idata_repository>& data_repository_manager::get_repository(size_t pipeline_id) {
+    return _repositories.at(pipeline_id);
 }
 
-uint64_t DataRepositoryManager::GetNextDataBatchId() {
-    return next_data_batch_id_++;
+uint64_t data_repository_manager::get_next_data_batch_id() {
+    return _next_data_batch_id++;
 }
 
 } // namespace sirius
