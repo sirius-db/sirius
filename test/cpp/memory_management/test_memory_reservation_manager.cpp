@@ -411,16 +411,18 @@ TEST_CASE("Different Memory Spaces", "[memory]") {
     REQUIRE(manager.getTotalReservedMemoryForTier(Tier::DISK) == 0);
 }
 
+#include <iostream>
 // Test blocking behavior with proper thread coordination
 TEST_CASE("Blocking Behavior", "[memory]") {
     initializeTestManager();
     auto& manager = MemoryReservationManager::getInstance();
     
     auto gpu_space = manager.getMemorySpace(Tier::GPU, 0);
-    
+    std::cout<<"here"<<std::endl;
     // Reserve most of the memory (900 out of 1000)
     auto reservation1 = manager.requestReservation(AnyMemorySpaceInTierWithPreference(Tier::GPU, 0), 900);
     REQUIRE(reservation1 != nullptr);
+    std::cout<<"here2"<<std::endl;
     REQUIRE(gpu_space->getAvailableMemory() == 100);
     
     // Thread coordination variables
@@ -428,9 +430,10 @@ TEST_CASE("Blocking Behavior", "[memory]") {
     std::atomic<bool> waiting_thread_completed{false};
     std::atomic<bool> release_thread_completed{false};
     std::unique_ptr<Reservation> waiting_reservation{nullptr};
-    
+    std::cout<<"here3"<<std::endl;
     // Thread 1: Try to reserve more than available (should block)
     std::thread waiting_thread([&]() {
+        std::cout<<"here4"<<std::endl;
         waiting_thread_started = true;
         
         // This should block because we're trying to reserve 200 but only 100 is available
@@ -438,11 +441,13 @@ TEST_CASE("Blocking Behavior", "[memory]") {
         
         waiting_reservation = std::move(reservation);
         waiting_thread_completed = true;
+        std::cout<<"here5"<<std::endl;
     });
     
     // Thread 2: Release memory after a short delay to unblock thread 1
     std::thread release_thread([&]() {
         // Wait for waiting thread to start
+        std::cout<<"here6"<<std::endl;
         while (!waiting_thread_started.load()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
@@ -453,11 +458,13 @@ TEST_CASE("Blocking Behavior", "[memory]") {
         // Release the reservation to unblock the waiting thread
         manager.releaseReservation(std::move(reservation1));
         release_thread_completed = true;
+        std::cout<<"here7"<<std::endl;
     });
     
     // Wait for both threads to complete with timeout
     auto start_time = std::chrono::steady_clock::now();
     while (!waiting_thread_completed.load() || !release_thread_completed.load()) {
+        std::cout<<"here8"<<std::endl;
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
         auto elapsed = std::chrono::steady_clock::now() - start_time;
         if (elapsed > std::chrono::seconds(5)) {
@@ -466,8 +473,9 @@ TEST_CASE("Blocking Behavior", "[memory]") {
             release_thread.detach();
             FAIL("Test timed out - blocking behavior may not be working correctly");
         }
+        std::cout<<"here9"<<std::endl;
     }
-    
+    std::cout<<"here10"<<std::endl;
     // Join threads
     waiting_thread.join();
     release_thread.join();

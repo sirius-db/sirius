@@ -17,114 +17,207 @@
 #pragma once
 
 #include <rmm/mr/device/device_memory_resource.hpp>
+#include <rmm/mr/host/host_memory_resource.hpp>
+#include <rmm/mr/host/pinned_host_memory_resource.hpp>
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/aligned.hpp>
-#include <atomic>
-#include <cstdlib>
+#include <rmm/detail/nvtx/ranges.hpp>
+
+#include <cstddef>
+#include <memory>
+#include <vector>
+#include <mutex>
+#include <algorithm>
 
 namespace sirius {
 namespace memory {
 
 /**
- * @brief A fixed-size host memory resource that implements rmm::mr::device_memory_resource interface.
+ * @brief A host memory resource that allocates fixed-size blocks using pinned host memory as upstream.
+ *
+ * This memory resource pre-allocates a pool of fixed-size blocks from the pinned host memory
+ * resource and manages them in a free list. Allocations are limited to the configured block size.
  * 
- * This memory resource provides a fixed pool of host memory with thread-safe allocation tracking.
- * It's designed to work within the RMM ecosystem while managing host memory allocations.
+ * The pool is allocated as a single large allocation from the upstream resource and then split
+ * into individual blocks for efficient memory management and reduced allocation overhead.
+ * 
+ * When the pool is exhausted, it automatically expands by allocating additional blocks from
+ * the upstream resource, making it suitable for workloads with varying memory requirements.
  * 
  * Based on the implementation from:
  * https://github.com/felipeblazing/memory_spilling/blob/main/include/fixed_size_host_memory_resource.hpp
- * Modified to derive from device_memory_resource instead of host_memory_resource.
- * 
- * Features:
- * - Thread-safe allocation/deallocation using atomic operations
- * - Fixed total memory pool size with overflow protection
- * - Proper alignment handling for memory allocations
- * - Exception-safe with proper rollback on allocation failures
- * 
- * @note This resource allocates host memory using std::aligned_alloc, which provides
- *       aligned memory suitable for efficient CPU access patterns.
+ * Modified to derive from device_memory_resource instead of host_memory_resource for RMM compatibility.
  */
 class fixed_size_host_memory_resource : public rmm::mr::device_memory_resource {
 public:
-    /**
-     * @brief Constructs a fixed-size host memory resource.
-     * 
-     * @param total_size The total size of the memory pool in bytes. Must be greater than 0.
-     * @throws rmm::out_of_memory if total_size is 0
-     */
-    explicit fixed_size_host_memory_resource(std::size_t total_size);
+    static constexpr std::size_t default_block_size = 1 << 20;  ///< Default block size (1MB)
+    static constexpr std::size_t default_pool_size = 128;       ///< Default number of blocks in pool
+    static constexpr std::size_t default_initial_number_pools = 4; ///< Default number of pools to pre-allocate
 
     /**
-     * @brief Destructor.
+     * @brief Construct a new fixed-size host memory resource.
+     *
+     * @param block_size Size of each block in bytes
+     * @param pool_size Number of blocks to pre-allocate
+     * @param initial_pools Number of pools to pre-allocate
      */
-    ~fixed_size_host_memory_resource() override = default;
+    explicit fixed_size_host_memory_resource(
+        std::size_t block_size = default_block_size,
+        std::size_t pool_size = default_pool_size,
+        std::size_t initial_pools = default_initial_number_pools);
 
-    // Non-copyable and non-movable to ensure resource stability
+    /**
+     * @brief Construct with custom upstream resource.
+     *
+     * @param upstream_mr Upstream memory resource to use
+     * @param block_size Size of each block in bytes
+     * @param pool_size Number of blocks to pre-allocate
+     * @param initial_pools Number of pools to pre-allocate
+     */
+    explicit fixed_size_host_memory_resource(
+        std::unique_ptr<rmm::mr::host_memory_resource> upstream_mr,
+        std::size_t block_size = default_block_size,
+        std::size_t pool_size = default_pool_size,
+        std::size_t initial_pools = default_initial_number_pools);
+
+    // Disable copy and move
     fixed_size_host_memory_resource(const fixed_size_host_memory_resource&) = delete;
     fixed_size_host_memory_resource& operator=(const fixed_size_host_memory_resource&) = delete;
     fixed_size_host_memory_resource(fixed_size_host_memory_resource&&) = delete;
     fixed_size_host_memory_resource& operator=(fixed_size_host_memory_resource&&) = delete;
 
     /**
-     * @brief Gets the total size of the memory pool.
-     * @return The total size in bytes
+     * @brief Destructor - frees all allocated blocks.
      */
-    std::size_t get_total_size() const noexcept { return total_size_; }
+    ~fixed_size_host_memory_resource() override;
 
     /**
-     * @brief Gets the currently allocated size.
-     * @return The allocated size in bytes
+     * @brief Get the block size.
+     *
+     * @return std::size_t The size of each block in bytes
      */
-    std::size_t get_allocated_size() const noexcept { return allocated_size_.load(); }
+    [[nodiscard]] std::size_t get_block_size() const noexcept;
 
     /**
-     * @brief Gets the available size in the memory pool.
-     * @return The available size in bytes
+     * @brief Get the number of free blocks.
+     *
+     * @return std::size_t Number of available blocks
      */
-    std::size_t get_available_size() const noexcept { 
-        return total_size_ - allocated_size_.load(); 
-    }
+    [[nodiscard]] std::size_t get_free_blocks() const noexcept;
 
     /**
-     * @brief Checks if the resource can allocate the requested size.
-     * @param bytes The number of bytes to check
-     * @return true if allocation would succeed, false otherwise
+     * @brief Get the total number of blocks in the pool.
+     *
+     * @return std::size_t Total number of blocks
      */
-    bool can_allocate(std::size_t bytes) const noexcept {
-        return allocated_size_.load() + bytes <= total_size_;
-    }
+    [[nodiscard]] std::size_t get_total_blocks() const noexcept;
 
-private:
     /**
-     * @brief Allocates memory from the fixed-size pool.
-     * 
-     * @param bytes The number of bytes to allocate
-     * @param stream The CUDA stream to use for the allocation
-     * @return Pointer to allocated memory
-     * @throws rmm::out_of_memory if allocation fails (insufficient memory or system allocation failure)
+     * @brief Get the upstream memory resource.
+     *
+     * @return rmm::mr::host_memory_resource* Pointer to upstream resource (nullptr if using pinned host)
+     */
+    [[nodiscard]] rmm::mr::host_memory_resource* get_upstream_resource() const noexcept;
+
+    /**
+     * @brief Simple RAII wrapper for multiple block allocations.
+     */
+    struct multiple_blocks_allocation {
+        std::vector<void*> blocks;
+        fixed_size_host_memory_resource* mr;
+        std::size_t block_size;
+
+        multiple_blocks_allocation(std::vector<void*> b, fixed_size_host_memory_resource* m, std::size_t bs)
+            : blocks(std::move(b)), mr(m), block_size(bs) {}
+
+        ~multiple_blocks_allocation() {
+            for (void* ptr : blocks) {
+                mr->deallocate(ptr, block_size);
+            }
+        }
+
+        // Disable copy to prevent double deallocation
+        multiple_blocks_allocation(const multiple_blocks_allocation&) = delete;
+        multiple_blocks_allocation& operator=(const multiple_blocks_allocation&) = delete;
+
+        // Enable move
+        multiple_blocks_allocation(multiple_blocks_allocation&& other) noexcept
+            : blocks(std::move(other.blocks)), mr(other.mr), block_size(other.block_size) {
+            other.blocks.clear();
+        }
+
+        multiple_blocks_allocation& operator=(multiple_blocks_allocation&& other) noexcept {
+            if (this != &other) {
+                for (void* ptr : blocks) {
+                    mr->deallocate(ptr, block_size);
+                }
+                blocks = std::move(other.blocks);
+                mr = other.mr;
+                block_size = other.block_size;
+                other.blocks.clear();
+            }
+            return *this;
+        }
+
+        std::size_t size() const noexcept { return blocks.size(); }
+        void* operator[](std::size_t i) const { return blocks[i]; }
+    };
+
+    /**
+     * @brief Allocate multiple blocks to satisfy a large allocation request.
+     *
+     * This method allocates the minimum number of blocks needed to satisfy the requested size.
+     * The blocks are returned as a RAII wrapper that automatically deallocates all blocks
+     * when it goes out of scope, preventing memory leaks.
+     *
+     * @param total_bytes Total size in bytes to allocate across multiple blocks
+     * @return multiple_blocks_allocation RAII wrapper for the allocated blocks
+     * @throws std::bad_alloc if insufficient blocks are available or upstream allocation fails
+     */
+    [[nodiscard]] multiple_blocks_allocation allocate_multiple_blocks(std::size_t total_bytes);
+
+protected:
+    /**
+     * @brief Allocate memory of the specified size.
+     *
+     * @param bytes Size in bytes (must be <= block_size_)
+     * @param stream CUDA stream (ignored for host memory)
+     * @return void* Pointer to allocated memory
+     * @throws std::bad_alloc if allocation size exceeds block size or upstream allocation fails
      */
     void* do_allocate(std::size_t bytes, rmm::cuda_stream_view stream) override;
 
     /**
-     * @brief Deallocates previously allocated memory.
-     * 
-     * @param ptr Pointer to memory to deallocate
-     * @param bytes The number of bytes that were allocated
-     * @param stream The CUDA stream to use for the deallocation
+     * @brief Deallocate memory.
+     *
+     * @param ptr Pointer to deallocate
+     * @param bytes Size in bytes (must be <= block_size_)
+     * @param stream CUDA stream (ignored for host memory)
      */
     void do_deallocate(void* ptr, std::size_t bytes, rmm::cuda_stream_view stream) override;
 
     /**
-     * @brief Checks equality with another memory resource.
-     * 
-     * @param other The other memory resource to compare with
-     * @return true if this resource is the same as other
+     * @brief Check if this resource is equal to another.
+     *
+     * @param other Other resource to compare
+     * @return bool True if equal
      */
-    bool do_is_equal(const rmm::mr::device_memory_resource& other) const noexcept override;
+    [[nodiscard]] bool do_is_equal(const rmm::mr::device_memory_resource& other) const noexcept override;
 
 private:
-    const std::size_t total_size_;           ///< Total size of the memory pool
-    std::atomic<std::size_t> allocated_size_; ///< Currently allocated size (thread-safe)
+    /**
+     * @brief Expand the pool by allocating more blocks from upstream.
+     * 
+     * Allocates a new chunk of blocks and adds them to the free list.
+     */
+    void expand_pool();
+
+    std::size_t block_size_;                                    ///< Size of each block
+    std::size_t pool_size_;                                     ///< Number of blocks in pool
+    std::unique_ptr<rmm::mr::host_memory_resource> upstream_mr_; ///< Upstream memory resource (optional)
+    std::vector<void*> allocated_blocks_;                       ///< All allocated blocks
+    std::vector<void*> free_blocks_;                           ///< Currently free blocks
+    mutable std::mutex mutex_;                                 ///< Mutex for thread safety
 };
 
 } // namespace memory
