@@ -29,118 +29,125 @@ using namespace std::chrono_literals;
 /**
  * Dummy task for tests.
  */
-struct DummyTaskGlobalState : public ITaskGlobalState {
+struct dummy_task_global_state : public itask_global_state {
   std::atomic<int> counter{0};
 };
 
-struct DummyTaskLocalState : public ITaskLocalState {
-  explicit DummyTaskLocalState(int id) : id_(id) {}
-  int id_;
+struct dummy_task_local_state : public itask_local_state {
+  explicit dummy_task_local_state(int id) : _id(id) {}
+  int _id;
 };
 
-class DummyTask : public ITask {
+class dummy_task : public itask {
 public:
-  DummyTask(std::unique_ptr<DummyTaskLocalState> local_state, std::shared_ptr<DummyTaskGlobalState> global_state)
-    : ITask(std::move(local_state), std::move(global_state)) {}
+  dummy_task(std::unique_ptr<dummy_task_local_state> local_state, std::shared_ptr<dummy_task_global_state> global_state)
+    : itask(std::move(local_state), std::move(global_state)) {}
 
-  void Execute() override {
-    auto* g = static_cast<DummyTaskGlobalState*>(global_state_.get());
-    auto* l = static_cast<DummyTaskLocalState*>(local_state_.get());
+  void execute() override {
+    auto* g = static_cast<dummy_task_global_state*>(_global_state.get());
+    auto* l = static_cast<dummy_task_local_state*>(_local_state.get());
     // Simulate work
     std::this_thread::sleep_for(10ms);
-    g->counter.fetch_add(1 + l->id_);
+    g->counter.fetch_add(1 + l->_id);
   }
 };
 
 /**
  * Dummy task queue for tests.
  */
-class DummyTaskQueue : public ITaskQueue {
+class dummy_task_queue : public itask_queue {
 public:
-  ~DummyTaskQueue() override = default;
+  ~dummy_task_queue() override = default;
 
-  void Open() override {
+  void open() override {
     {
-      std::lock_guard<std::mutex> lock(mutex_);
-      open_ = true;
+      std::lock_guard<std::mutex> lock(_mutex);
+      _open = true;
     }
-    cv_.notify_all();
+    _cv.notify_all();
   }
 
-  void Close() override {
+  void close() override {
     {
-      std::lock_guard<std::mutex> lock(mutex_);
-      open_ = false;
+      std::lock_guard<std::mutex> lock(_mutex);
+      _open = false;
     }
-    cv_.notify_all();
+    _cv.notify_all();
   }
 
-  void Push(std::unique_ptr<ITask> task) override {
+  void push(std::unique_ptr<itask> task) override {
     {
-      std::lock_guard<std::mutex> lock(mutex_);
-      if (!open_) {
+      std::lock_guard<std::mutex> lock(_mutex);
+      if (!_open) {
         return;
       }
-      tasks_.push(std::move(task));
+      _tasks.push(std::move(task));
     }
-    cv_.notify_one();
+    _cv.notify_one();
   }
 
-  std::unique_ptr<ITask> Pull() override {
-    std::unique_lock<std::mutex> lock(mutex_);
-    cv_.wait(lock, [&]() {
-      return !tasks_.empty() || !open_;
+  std::unique_ptr<itask> pull() override {
+    std::unique_lock<std::mutex> lock(_mutex);
+    _cv.wait(lock, [&]() {
+      return !_tasks.empty() || !_open;
     });
-    if (tasks_.empty()) {
+    if (_tasks.empty()) {
       return nullptr;
     }
-    auto task = std::move(tasks_.front());
-    tasks_.pop();
+    auto task = std::move(_tasks.front());
+    _tasks.pop();
     return task;
   }
 
 private:
-  std::queue<std::unique_ptr<ITask>> tasks_;
-  std::mutex mutex_;
-  std::condition_variable cv_;
-  bool open_ = false;
+  std::queue<std::unique_ptr<itask>> _tasks;
+  std::mutex _mutex;
+  std::condition_variable _cv;
+  bool _open = false;
 };
 
 /**
  * Dummy task executor for tests.
  */
-class DummyTaskExecutor : public ITaskExecutor {
+class dummy_task_executor : public itask_executor {
 public:
-  using ITaskExecutor::ITaskExecutor;
+  using itask_executor::itask_executor;
 };
 
 TEST_CASE("Executor can start and stop gracefully", "[task_executor]") {
-  auto queue = std::make_unique<DummyTaskQueue>();
-  TaskExecutorConfig config{4, false};
-  DummyTaskExecutor executor(std::move(queue), config);
+  auto queue = std::make_unique<dummy_task_queue>();
+  task_executor_config config{4, false};
+  dummy_task_executor executor(std::move(queue), config);
 
-  REQUIRE_NOTHROW(executor.Start());
-  REQUIRE_NOTHROW(executor.Stop());
+  REQUIRE_NOTHROW(executor.start());
+  REQUIRE_NOTHROW(executor.stop());
 }
 
 TEST_CASE("Executor executes scheduled tasks", "[task_executor]") {
-  auto queue = std::make_unique<DummyTaskQueue>();
-  auto g = std::make_shared<DummyTaskGlobalState>();
-  TaskExecutorConfig config{4, false};
-  DummyTaskExecutor executor(std::move(queue), config);
-  REQUIRE_NOTHROW(executor.Start());
+  auto queue = std::make_unique<dummy_task_queue>();
+  auto g = std::make_shared<dummy_task_global_state>();
+  task_executor_config config{4, false};
+  dummy_task_executor executor(std::move(queue), config);
+  REQUIRE_NOTHROW(executor.start());
 
   // Schedule some tasks
   int num_tasks = 20;
   for (int i = 0; i < num_tasks; ++i) {
-    executor.Schedule(std::make_unique<DummyTask>(std::make_unique<DummyTaskLocalState>(i), g));
+    executor.schedule(std::make_unique<dummy_task>(std::make_unique<dummy_task_local_state>(i), g));
   }
 
-  // Wait and check the result
-  executor.Wait();
+  // Wait for tasks to complete by polling the counter
   int expected_counter = num_tasks * (num_tasks + 1) / 2;
+  auto start_time = std::chrono::steady_clock::now();
+  auto timeout = std::chrono::seconds(5);
+  while (g->counter.load() < expected_counter) {
+    std::this_thread::sleep_for(50ms);
+    if (std::chrono::steady_clock::now() - start_time > timeout) {
+      FAIL("Test timed out waiting for tasks to complete");
+    }
+  }
   REQUIRE(g->counter.load() == expected_counter);
 
-  REQUIRE_NOTHROW(executor.Stop());
+  REQUIRE_NOTHROW(executor.stop());
 }
 
