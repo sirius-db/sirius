@@ -81,7 +81,6 @@ bool Reservation::shrink_by(size_t bytes_to_remove) {
 //===----------------------------------------------------------------------===//
 
 void FailReservationLimitPolicy::handle_over_reservation(
-    per_stream_tracking_resource_adaptor& adaptor,
     rmm::cuda_stream_view stream,
     std::size_t current_allocated,
     std::size_t requested_bytes,
@@ -95,7 +94,6 @@ void FailReservationLimitPolicy::handle_over_reservation(
 }
 
 void IncreaseReservationLimitPolicy::handle_over_reservation(
-    per_stream_tracking_resource_adaptor& adaptor,
     rmm::cuda_stream_view stream,
     std::size_t current_allocated,
     std::size_t requested_bytes,

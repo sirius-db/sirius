@@ -38,7 +38,6 @@ namespace memory {
 
 // Forward declarations
 class MemoryReservationManager;
-class per_stream_tracking_resource_adaptor;
 struct Reservation;
 
 //===----------------------------------------------------------------------===//
@@ -72,7 +71,6 @@ public:
      * @throws rmm::out_of_memory if the policy decides to reject the allocation
      */
     virtual void handle_over_reservation(
-        per_stream_tracking_resource_adaptor& adaptor,
         rmm::cuda_stream_view stream,
         std::size_t current_allocated,
         std::size_t requested_bytes,
@@ -94,7 +92,6 @@ public:
 class IgnoreReservationLimitPolicy : public ReservationLimitPolicy {
 public:
     void handle_over_reservation(
-        per_stream_tracking_resource_adaptor& adaptor,
         rmm::cuda_stream_view stream,
         std::size_t current_allocated,
         std::size_t requested_bytes,
@@ -116,7 +113,6 @@ public:
 class FailReservationLimitPolicy : public ReservationLimitPolicy {
 public:
     void handle_over_reservation(
-        per_stream_tracking_resource_adaptor& adaptor,
         rmm::cuda_stream_view stream,
         std::size_t current_allocated,
         std::size_t requested_bytes,
@@ -149,7 +145,6 @@ public:
     }
 
     void handle_over_reservation(
-        per_stream_tracking_resource_adaptor& adaptor,
         rmm::cuda_stream_view stream,
         std::size_t current_allocated,
         std::size_t requested_bytes,
