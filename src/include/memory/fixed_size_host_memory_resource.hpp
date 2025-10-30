@@ -17,8 +17,7 @@
 #pragma once
 
 #include <rmm/mr/device/device_memory_resource.hpp>
-#include <rmm/mr/host/host_memory_resource.hpp>
-#include <rmm/mr/host/pinned_host_memory_resource.hpp>
+#include <rmm/mr/pinned_host_memory_resource.hpp>
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/aligned.hpp>
 #include <rmm/detail/nvtx/ranges.hpp>
@@ -75,7 +74,7 @@ public:
      * @param initial_pools Number of pools to pre-allocate
      */
     explicit fixed_size_host_memory_resource(
-        std::unique_ptr<rmm::mr::host_memory_resource> upstream_mr,
+        std::unique_ptr<rmm::mr::pinned_host_memory_resource> upstream_mr,
         std::size_t block_size = default_block_size,
         std::size_t pool_size = default_pool_size,
         std::size_t initial_pools = default_initial_number_pools);
@@ -117,7 +116,7 @@ public:
      *
      * @return rmm::mr::host_memory_resource* Pointer to upstream resource (nullptr if using pinned host)
      */
-    [[nodiscard]] rmm::mr::host_memory_resource* get_upstream_resource() const noexcept;
+    [[nodiscard]] rmm::mr::pinned_host_memory_resource* get_upstream_resource() const noexcept;
 
     /**
      * @brief Simple RAII wrapper for multiple block allocations.
@@ -214,7 +213,7 @@ private:
 
     std::size_t block_size_;                                    ///< Size of each block
     std::size_t pool_size_;                                     ///< Number of blocks in pool
-    std::unique_ptr<rmm::mr::host_memory_resource> upstream_mr_; ///< Upstream memory resource (optional)
+    std::unique_ptr<rmm::mr::pinned_host_memory_resource> upstream_mr_; ///< Upstream memory resource (optional)
     std::vector<void*> allocated_blocks_;                       ///< All allocated blocks
     std::vector<void*> free_blocks_;                           ///< Currently free blocks
     mutable std::mutex mutex_;                                 ///< Mutex for thread safety

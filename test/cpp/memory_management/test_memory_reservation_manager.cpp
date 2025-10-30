@@ -819,44 +819,48 @@ TEST_CASE("Explicit Allocator Requirement", "[memory]") {
     );
 }
 
-// Test fixed_size_host_memory_resource functionality
+// Test fixed_size_host_memory_resource functionality aligned with its API
 TEST_CASE("Fixed Size Host Memory Resource", "[memory]") {
-    // Test the custom fixed_size_host_memory_resource directly
-    const std::size_t total_size = 1024; // 1KB for testing
-    auto resource = std::make_unique<fixed_size_host_memory_resource>(total_size);
-    
-    // Test initial state
-    REQUIRE(resource->get_total_size() == total_size);
-    REQUIRE(resource->get_allocated_size() == 0);
-    REQUIRE(resource->get_available_size() == total_size);
-    
-    // Test allocation
-    void* ptr1 = resource->allocate(100, 8); // 100 bytes with 8-byte alignment
-    REQUIRE(ptr1 != nullptr);
-    REQUIRE(resource->get_allocated_size() > 0);
-    REQUIRE(resource->get_available_size() < total_size);
-    
-    // Test another allocation
-    void* ptr2 = resource->allocate(200, 8); // 200 bytes
-    REQUIRE(ptr2 != nullptr);
-    REQUIRE(ptr1 != ptr2); // Different pointers
-    
-    // Test deallocation
-    resource->deallocate(ptr1, 100, 8);
-    std::size_t size_after_first_dealloc = resource->get_allocated_size();
-    
-    resource->deallocate(ptr2, 200, 8);
-    REQUIRE(resource->get_allocated_size() < size_after_first_dealloc);
-    
-    // Test allocation limit
-    REQUIRE_THROWS_AS(resource->allocate(total_size + 1, 8), rmm::out_of_memory);
-    
-    // Test zero-size allocation
-    void* zero_ptr = resource->allocate(0, 8);
-    REQUIRE(zero_ptr == nullptr); // Should return nullptr for zero size
-    
-    // Test that we can still allocate after failed allocation
-    void* ptr3 = resource->allocate(50, 8);
-    REQUIRE(ptr3 != nullptr);
-    resource->deallocate(ptr3, 50, 8);
+    // Configure small, predictable pool: block=256B, pool=4 blocks, 2 pools
+    const std::size_t block_size = 256;
+    const std::size_t pool_size = 4;
+    const std::size_t initial_pools = 2;
+
+    fixed_size_host_memory_resource resource(block_size, pool_size, initial_pools);
+
+    // Initial state
+    REQUIRE(resource.get_block_size() == block_size);
+    REQUIRE(resource.get_total_blocks() == pool_size * initial_pools);
+    REQUIRE(resource.get_free_blocks() == pool_size * initial_pools);
+
+    // Allocate enough bytes to require multiple blocks (600B -> 3 blocks)
+    {
+        auto blocks = resource.allocate_multiple_blocks(600);
+        REQUIRE(blocks.size() == 3);
+        REQUIRE(resource.get_free_blocks() == pool_size * initial_pools - 3);
+        REQUIRE(blocks[0] != nullptr);
+        REQUIRE(blocks[1] != nullptr);
+        REQUIRE(blocks[2] != nullptr);
+        REQUIRE(blocks[0] != blocks[1]);
+        REQUIRE(blocks[1] != blocks[2]);
+    } // RAII release on scope exit restores free list
+
+    REQUIRE(resource.get_free_blocks() == pool_size * initial_pools);
+
+    // Zero-size multi-block allocation is a no-op
+    {
+        auto zero = resource.allocate_multiple_blocks(0);
+        REQUIRE(zero.size() == 0);
+        REQUIRE(resource.get_free_blocks() == pool_size * initial_pools);
+    }
+
+    // Request more than a single pool's capacity to force pool expansion
+    {
+        auto many = resource.allocate_multiple_blocks(block_size * pool_size + 1); // pool_size + 1 blocks
+        REQUIRE(many.size() == pool_size + 1);
+    }
+
+    // After RAII release, total/free blocks should reflect any expansion (>= initial)
+    REQUIRE(resource.get_total_blocks() >= pool_size * initial_pools);
+    REQUIRE(resource.get_free_blocks() >= pool_size * initial_pools);
 }

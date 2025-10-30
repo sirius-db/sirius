@@ -32,7 +32,7 @@ fixed_size_host_memory_resource::fixed_size_host_memory_resource(
 }
 
 fixed_size_host_memory_resource::fixed_size_host_memory_resource(
-    std::unique_ptr<rmm::mr::host_memory_resource> upstream_mr,
+    std::unique_ptr<rmm::mr::pinned_host_memory_resource> upstream_mr,
     std::size_t block_size,
     std::size_t pool_size,
     std::size_t initial_pools)
@@ -74,7 +74,7 @@ std::size_t fixed_size_host_memory_resource::get_total_blocks() const noexcept {
     return allocated_blocks_.size() * pool_size_;
 }
 
-rmm::mr::host_memory_resource* fixed_size_host_memory_resource::get_upstream_resource() const noexcept {
+rmm::mr::pinned_host_memory_resource* fixed_size_host_memory_resource::get_upstream_resource() const noexcept {
     return upstream_mr_.get();
 }
 

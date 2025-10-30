@@ -173,13 +173,24 @@ MemoryReservationManager& MemoryReservationManager::getInstance() {
 }
 
 std::unique_ptr<Reservation> MemoryReservationManager::requestReservation(const ReservationRequest& request, size_t size) {
+    // Fast path: try to find a MemorySpace immediately
     const MemorySpace* selected_space = selectMemorySpace(request, size);
-    if (!selected_space) {
-        throw std::runtime_error("No suitable MemorySpace found for the request");
+    if (selected_space) {
+        return const_cast<MemorySpace*>(selected_space)->requestReservation(size);
     }
-    
-    // Delegate to the selected MemorySpace
-    return const_cast<MemorySpace*>(selected_space)->requestReservation(size);
+
+    // If none available, block until any MemorySpace can satisfy the request
+    std::unique_lock<std::mutex> lock(wait_mutex_);
+    for (;;) {
+        selected_space = selectMemorySpace(request, size);
+        if (selected_space) {
+            // Release the wait lock before delegating to the MemorySpace
+            lock.unlock();
+            return const_cast<MemorySpace*>(selected_space)->requestReservation(size);
+        }
+        // Wait until notified that memory may be available again
+        wait_cv_.wait(lock);
+    }
 }
 
 
@@ -196,6 +207,9 @@ void MemoryReservationManager::releaseReservation(std::unique_ptr<Reservation> r
     
     // Delegate to the appropriate MemorySpace
     const_cast<MemorySpace*>(memory_space)->releaseReservation(std::move(reservation));
+
+    // Notify all waiters that memory availability may have changed
+    wait_cv_.notify_all();
 }
 
 bool MemoryReservationManager::shrinkReservation(Reservation* reservation, size_t new_size) {

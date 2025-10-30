@@ -25,6 +25,8 @@
 #include <unordered_map>
 #include <string>
 #include <stdexcept>
+#include <mutex>
+#include <condition_variable>
 
 // RMM includes for memory resource management
 #include <rmm/mr/device/device_memory_resource.hpp>
@@ -423,6 +425,10 @@ private:
     const MemorySpace* selectFromList(const std::vector<const MemorySpace*>& candidates, size_t size) const;
     
     void buildLookupTables();
+
+    // Synchronization for cross-space waiting when no MemorySpace can currently satisfy a request
+    mutable std::mutex wait_mutex_;
+    std::condition_variable wait_cv_;
 };
 
 } // namespace memory
