@@ -29,6 +29,7 @@
 // Sirius memory components
 #include "memory/memory_reservation.hpp"
 #include "memory/fixed_size_host_memory_resource.hpp"
+#include "memory/null_device_memory_resource.hpp"
 
 using namespace sirius::memory;
 
@@ -51,10 +52,8 @@ std::vector<std::unique_ptr<rmm::mr::device_memory_resource>> createTestAllocato
             break;
         }
         case Tier::DISK: {
-            // For DISK tier, use a very large size since disk-backed memory should rarely be limited
-            // TODO: Consider creating an "unlimited_host_memory_resource" that always succeeds
-            // until system memory is exhausted, since disk space is typically much larger
-            auto disk_allocator = std::make_unique<fixed_size_host_memory_resource>(1024ULL * 1024 * 1024 * 1024); // 1TB
+            // DISK tier uses a null allocator to satisfy API without real allocations
+            auto disk_allocator = std::make_unique<null_device_memory_resource>();
             allocators.push_back(std::move(disk_allocator));
             break;
         }
@@ -414,6 +413,7 @@ TEST_CASE("Different Memory Spaces", "[memory]") {
 #include <iostream>
 // Test blocking behavior with proper thread coordination
 TEST_CASE("Blocking Behavior", "[memory]") {
+    std::cout<<std::endl<<"here0"<<std::endl;
     initializeTestManager();
     auto& manager = MemoryReservationManager::getInstance();
     
@@ -774,7 +774,7 @@ TEST_CASE("Specific Allocator Types", "[memory]") {
     // Test that HOST uses fixed_size_host_memory_resource
     auto host_allocator = host_space->getDefaultAllocator();
     
-    // Test that DISK uses fixed_size_host_memory_resource (larger size)
+    // Test that DISK uses a valid allocator (null_device_memory_resource)
     auto disk_allocator = disk_space->getDefaultAllocator();
     
     // Verify allocators can be used (basic functionality test)
