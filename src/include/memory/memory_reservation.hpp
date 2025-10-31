@@ -313,6 +313,12 @@ public:
     static void initialize(std::vector<MemorySpaceConfig> configs);
     
     /**
+     * Test-only: Reset the singleton so tests can reinitialize with different configs.
+     * Not thread-safe; intended only for unit tests.
+     */
+    static void reset_for_testing();
+    
+    /**
      * Get the singleton instance. 
      * Throws if initialize() has not been called first.
      */
@@ -404,6 +410,7 @@ private:
     // Singleton state
     static std::unique_ptr<MemoryReservationManager> instance_;
     static std::once_flag initialized_;
+    static bool allow_reinitialize_for_tests_;
     
     // Storage for MemorySpace instances (owned by the manager)
     std::vector<std::unique_ptr<MemorySpace>> memory_spaces_;

@@ -22,50 +22,15 @@
 #include <array>
 #include "memory/memory_reservation.hpp"
 
-// RMM includes for creating test allocators
-#include <rmm/mr/device/device_memory_resource.hpp>
-#include <rmm/mr/device/cuda_async_memory_resource.hpp>
-
-// Sirius memory components
-#include "memory/memory_reservation.hpp"
-#include "memory/fixed_size_host_memory_resource.hpp"
-#include "memory/null_device_memory_resource.hpp"
+#include "memory_test_common.hpp"
 
 using namespace sirius::memory;
 
-// Helper function to create test allocators for a given tier
-std::vector<std::unique_ptr<rmm::mr::device_memory_resource>> createTestAllocators(Tier tier) {
-    std::vector<std::unique_ptr<rmm::mr::device_memory_resource>> allocators;
-    
-    switch (tier) {
-        case Tier::GPU: {
-            // Create cuda_async_memory_resource for GPU tier as requested
-            auto cuda_async_allocator = std::make_unique<rmm::mr::cuda_async_memory_resource>();
-            allocators.push_back(std::move(cuda_async_allocator));
-            break;
-        }
-        case Tier::HOST: {
-            // Create fixed_size_host_memory_resource for HOST tier
-            // Use a reasonable size for testing (e.g., 10MB)
-            auto host_allocator = std::make_unique<fixed_size_host_memory_resource>(10 * 1024 * 1024);
-            allocators.push_back(std::move(host_allocator));
-            break;
-        }
-        case Tier::DISK: {
-            // DISK tier uses a null allocator to satisfy API without real allocations
-            auto disk_allocator = std::make_unique<null_device_memory_resource>();
-            allocators.push_back(std::move(disk_allocator));
-            break;
-        }
-        default:
-            throw std::invalid_argument("Unknown tier type");
-    }
-    
-    return allocators;
-}
+// createTestAllocators now provided by memory_test_common.hpp
 
 // Helper function to initialize the manager for tests
 void initializeTestManager() {
+    MemoryReservationManager::reset_for_testing();
     // Initialize with test MemorySpaces: GPU(id:0)=1000, HOST(id:0)=2000, DISK(id:0)=5000
     std::vector<MemoryReservationManager::MemorySpaceConfig> configs;
     configs.emplace_back(Tier::GPU, 0, 1000, createTestAllocators(Tier::GPU));
@@ -76,6 +41,7 @@ void initializeTestManager() {
 
 // Helper function for multi-device initialization
 void initializeMultiDeviceManager() {
+    MemoryReservationManager::reset_for_testing();
     std::vector<MemoryReservationManager::MemorySpaceConfig> configs;
     configs.emplace_back(Tier::GPU, 0, 1000, createTestAllocators(Tier::GPU));    // GPU device 0
     configs.emplace_back(Tier::GPU, 1, 2000, createTestAllocators(Tier::GPU));    // GPU device 1
@@ -354,8 +320,12 @@ TEST_CASE("Edge Cases", "[memory]") {
     REQUIRE_FALSE(manager.growReservation(nullptr, 100));
     REQUIRE_FALSE(manager.shrinkReservation(nullptr, 50));
     
-    // Test requesting more memory than available
-    REQUIRE_THROWS_AS(manager.requestReservation(AnyMemorySpaceInTierWithPreference(Tier::GPU, 0), 2000), std::runtime_error);
+    // Test requesting more memory than available should succeed when no outstanding reservations
+    auto oversize_reservation = manager.requestReservation(AnyMemorySpaceInTierWithPreference(Tier::GPU, 0), 2000);
+    REQUIRE(oversize_reservation != nullptr);
+    REQUIRE(oversize_reservation->size == 2000);
+    // Clean up
+    manager.releaseReservation(std::move(oversize_reservation));
 }
 
 // Test different memory spaces
@@ -410,19 +380,15 @@ TEST_CASE("Different Memory Spaces", "[memory]") {
     REQUIRE(manager.getTotalReservedMemoryForTier(Tier::DISK) == 0);
 }
 
-#include <iostream>
 // Test blocking behavior with proper thread coordination
 TEST_CASE("Blocking Behavior", "[memory]") {
-    std::cout<<std::endl<<"here0"<<std::endl;
     initializeTestManager();
     auto& manager = MemoryReservationManager::getInstance();
     
     auto gpu_space = manager.getMemorySpace(Tier::GPU, 0);
-    std::cout<<"here"<<std::endl;
     // Reserve most of the memory (900 out of 1000)
     auto reservation1 = manager.requestReservation(AnyMemorySpaceInTierWithPreference(Tier::GPU, 0), 900);
     REQUIRE(reservation1 != nullptr);
-    std::cout<<"here2"<<std::endl;
     REQUIRE(gpu_space->getAvailableMemory() == 100);
     
     // Thread coordination variables
@@ -430,10 +396,8 @@ TEST_CASE("Blocking Behavior", "[memory]") {
     std::atomic<bool> waiting_thread_completed{false};
     std::atomic<bool> release_thread_completed{false};
     std::unique_ptr<Reservation> waiting_reservation{nullptr};
-    std::cout<<"here3"<<std::endl;
     // Thread 1: Try to reserve more than available (should block)
     std::thread waiting_thread([&]() {
-        std::cout<<"here4"<<std::endl;
         waiting_thread_started = true;
         
         // This should block because we're trying to reserve 200 but only 100 is available
@@ -441,13 +405,11 @@ TEST_CASE("Blocking Behavior", "[memory]") {
         
         waiting_reservation = std::move(reservation);
         waiting_thread_completed = true;
-        std::cout<<"here5"<<std::endl;
     });
     
     // Thread 2: Release memory after a short delay to unblock thread 1
     std::thread release_thread([&]() {
         // Wait for waiting thread to start
-        std::cout<<"here6"<<std::endl;
         while (!waiting_thread_started.load()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
@@ -458,13 +420,11 @@ TEST_CASE("Blocking Behavior", "[memory]") {
         // Release the reservation to unblock the waiting thread
         manager.releaseReservation(std::move(reservation1));
         release_thread_completed = true;
-        std::cout<<"here7"<<std::endl;
     });
     
     // Wait for both threads to complete with timeout
     auto start_time = std::chrono::steady_clock::now();
     while (!waiting_thread_completed.load() || !release_thread_completed.load()) {
-        std::cout<<"here8"<<std::endl;
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
         auto elapsed = std::chrono::steady_clock::now() - start_time;
         if (elapsed > std::chrono::seconds(5)) {
@@ -473,9 +433,7 @@ TEST_CASE("Blocking Behavior", "[memory]") {
             release_thread.detach();
             FAIL("Test timed out - blocking behavior may not be working correctly");
         }
-        std::cout<<"here9"<<std::endl;
     }
-    std::cout<<"here10"<<std::endl;
     // Join threads
     waiting_thread.join();
     release_thread.join();

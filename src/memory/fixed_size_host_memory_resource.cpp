@@ -15,6 +15,7 @@
  */
 
 #include "memory/fixed_size_host_memory_resource.hpp"
+#include <string>
 
 namespace sirius {
 namespace memory {
@@ -119,7 +120,11 @@ void* fixed_size_host_memory_resource::do_allocate(std::size_t bytes, rmm::cuda_
     if (bytes == 0) {
         return nullptr;
     }
-    RMM_EXPECTS(bytes <= block_size_, "Allocation size exceeds block size");
+    RMM_EXPECTS(
+        bytes <= block_size_,
+        (std::string("Allocation size exceeds block size: requested=") + std::to_string(bytes) +
+         " bytes, block_size=" + std::to_string(block_size_) + " bytes")
+            .c_str());
 
     std::lock_guard<std::mutex> lock(mutex_);
     

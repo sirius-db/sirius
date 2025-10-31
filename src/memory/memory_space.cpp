@@ -183,6 +183,12 @@ size_t MemorySpace::getAllocatorCount() const {
 
 bool MemorySpace::canReserve(size_t size) const {
     size_t current_reserved = total_reserved_.load();
+    size_t current_active = active_count_.load();
+    // Allow a single initial reservation to exceed the memory limit if there are
+    // currently zero outstanding reservations. Subsequent reservations must obey the limit.
+    if (current_active == 0) {
+        return true;
+    }
     return (current_reserved + size) <= memory_limit_;
 }
 

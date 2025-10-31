@@ -123,6 +123,7 @@ void IncreaseReservationLimitPolicy::handle_over_reservation(
 
 std::unique_ptr<MemoryReservationManager> MemoryReservationManager::instance_ = nullptr;
 std::once_flag MemoryReservationManager::initialized_;
+bool MemoryReservationManager::allow_reinitialize_for_tests_{false};
 
 MemoryReservationManager::MemoryReservationManager(std::vector<MemorySpaceConfig> configs) {
     if (configs.empty()) {
@@ -155,9 +156,21 @@ MemoryReservationManager::MemorySpaceConfig::MemorySpaceConfig(
 }
 
 void MemoryReservationManager::initialize(std::vector<MemorySpaceConfig> configs) {
+    // Test hook: if a test called reset_for_testing(), allow reinitialization bypassing call_once
+    if (allow_reinitialize_for_tests_) {
+        allow_reinitialize_for_tests_ = false;
+        instance_ = std::unique_ptr<MemoryReservationManager>(new MemoryReservationManager(std::move(configs)));
+        return;
+    }
     std::call_once(initialized_, [configs = std::move(configs)]() mutable {
         instance_ = std::unique_ptr<MemoryReservationManager>(new MemoryReservationManager(std::move(configs)));
     });
+}
+
+void MemoryReservationManager::reset_for_testing() {
+    // Not thread-safe; intended for unit tests only
+    instance_.reset();
+    allow_reinitialize_for_tests_ = true;
 }
 
 MemoryReservationManager& MemoryReservationManager::getInstance() {
