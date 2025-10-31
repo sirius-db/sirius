@@ -241,7 +241,7 @@ private:
      * @param bytes The number of bytes that were allocated
      * @param stream The CUDA stream to use for the deallocation
      */
-    void do_deallocate(void* ptr, std::size_t bytes, rmm::cuda_stream_view stream) override;
+    void do_deallocate(void* ptr, std::size_t bytes, rmm::cuda_stream_view stream) noexcept override;
 
     /**
      * @brief Checks equality with another memory resource.

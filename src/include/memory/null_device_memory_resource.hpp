@@ -34,7 +34,7 @@ public:
 
 protected:
     void* do_allocate(std::size_t bytes, rmm::cuda_stream_view stream) override { return nullptr; }
-    void do_deallocate(void* p, std::size_t bytes, rmm::cuda_stream_view stream) override {}
+    void do_deallocate(void* p, std::size_t bytes, rmm::cuda_stream_view stream) noexcept override {}
     [[nodiscard]] bool do_is_equal(const rmm::mr::device_memory_resource& other) const noexcept override {
         return this == &other;
     }

@@ -125,7 +125,7 @@ void* per_stream_tracking_resource_adaptor::do_allocate(std::size_t bytes, rmm::
     return ptr;
 }
 
-void per_stream_tracking_resource_adaptor::do_deallocate(void* ptr, std::size_t bytes, rmm::cuda_stream_view stream) {
+void per_stream_tracking_resource_adaptor::do_deallocate(void* ptr, std::size_t bytes, rmm::cuda_stream_view stream) noexcept {
     // Deallocate from upstream first
     upstream_->deallocate(ptr, bytes, stream);
     

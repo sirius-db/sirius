@@ -142,7 +142,7 @@ void* fixed_size_host_memory_resource::do_allocate(std::size_t bytes, rmm::cuda_
     return ptr;
 }
 
-void fixed_size_host_memory_resource::do_deallocate(void* ptr, std::size_t bytes, rmm::cuda_stream_view stream) {
+void fixed_size_host_memory_resource::do_deallocate(void* ptr, std::size_t bytes, rmm::cuda_stream_view stream) noexcept {
     RMM_FUNC_RANGE();
     
     if (ptr == nullptr) {

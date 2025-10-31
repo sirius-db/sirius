@@ -194,7 +194,7 @@ protected:
      * @param bytes Size in bytes (must be <= block_size_)
      * @param stream CUDA stream (ignored for host memory)
      */
-    void do_deallocate(void* ptr, std::size_t bytes, rmm::cuda_stream_view stream) override;
+    void do_deallocate(void* ptr, std::size_t bytes, rmm::cuda_stream_view stream) noexcept override;
 
     /**
      * @brief Check if this resource is equal to another.
