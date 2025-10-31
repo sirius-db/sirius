@@ -102,7 +102,7 @@ fixed_size_host_memory_resource::multiple_blocks_allocation fixed_size_host_memo
             for (void* ptr : allocated_blocks) {
                 free_blocks_.push_back(ptr);
             }
-            throw std::bad_alloc();
+            throw rmm::out_of_memory("Not enough free blocks available in fixed_size_host_memory_resource and pool expansion failed.");
         }
 
         void* ptr = free_blocks_.back();
@@ -119,10 +119,7 @@ void* fixed_size_host_memory_resource::do_allocate(std::size_t bytes, rmm::cuda_
     if (bytes == 0) {
         return nullptr;
     }
-
-    if (bytes > block_size_) {
-        throw std::bad_alloc();
-    }
+    RMM_EXPECTS(bytes <= block_size_, "Allocation size exceeds block size");
 
     std::lock_guard<std::mutex> lock(mutex_);
     
@@ -131,7 +128,7 @@ void* fixed_size_host_memory_resource::do_allocate(std::size_t bytes, rmm::cuda_
     }
 
     if (free_blocks_.empty()) {
-        throw std::bad_alloc();
+        throw rmm::out_of_memory("No free blocks available in fixed_size_host_memory_resource.");
     }
 
     void* ptr = free_blocks_.back();

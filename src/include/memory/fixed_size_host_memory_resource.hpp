@@ -171,7 +171,7 @@ public:
      *
      * @param total_bytes Total size in bytes to allocate across multiple blocks
      * @return multiple_blocks_allocation RAII wrapper for the allocated blocks
-     * @throws std::bad_alloc if insufficient blocks are available or upstream allocation fails
+     * @throws rmm::out_of_memory if insufficient blocks are available or upstream allocation fails
      */
     [[nodiscard]] multiple_blocks_allocation allocate_multiple_blocks(std::size_t total_bytes);
 
@@ -182,7 +182,8 @@ protected:
      * @param bytes Size in bytes (must be <= block_size_)
      * @param stream CUDA stream (ignored for host memory)
      * @return void* Pointer to allocated memory
-     * @throws std::bad_alloc if allocation size exceeds block size or upstream allocation fails
+     * @throws rmm::logic_error if allocation size exceeds block size
+     * @throws rmm::out_of_memory if no free blocks are available and upstream allocation fails
      */
     void* do_allocate(std::size_t bytes, rmm::cuda_stream_view stream) override;
 

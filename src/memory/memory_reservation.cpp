@@ -29,9 +29,6 @@ namespace memory {
 
 Reservation::Reservation(Tier t, size_t dev_id, size_t s) : tier(t), device_id(dev_id), size(s) {}
 
-const MemorySpace* Reservation::getMemorySpace(const MemoryReservationManager& manager) const {
-    return manager.getMemorySpace(tier, device_id);
-}
 
 bool Reservation::grow_to(size_t new_size) {
     if (new_size <= size) {

@@ -226,8 +226,6 @@ struct Reservation {
     
     Reservation(Tier t, size_t dev_id, size_t s);
     
-    // Helper method to get the memory space from the manager
-    const MemorySpace* getMemorySpace(const MemoryReservationManager& manager) const;
     
     //===----------------------------------------------------------------------===//
     // Reservation Size Management
