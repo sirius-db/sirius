@@ -168,20 +168,18 @@ MemoryReservationManager& MemoryReservationManager::getInstance() {
 }
 
 std::unique_ptr<Reservation> MemoryReservationManager::requestReservation(const ReservationRequest& request, size_t size) {
-    // Fast path: try to find a MemorySpace immediately
-    const MemorySpace* selected_space = selectMemorySpace(request, size);
-    if (selected_space) {
-        return const_cast<MemorySpace*>(selected_space)->requestReservation(size);
+    // Fast path: try to make a reservation immediately
+    if (auto res = selectMemorySpaceAndMakeReservation(request, size); res.has_value()) {
+        return std::move(res.value());
     }
 
     // If none available, block until any MemorySpace can satisfy the request
     std::unique_lock<std::mutex> lock(wait_mutex_);
     for (;;) {
-        selected_space = selectMemorySpace(request, size);
-        if (selected_space) {
-            // Release the wait lock before delegating to the MemorySpace
+        if (auto res = selectMemorySpaceAndMakeReservation(request, size); res.has_value()) {
+            // Release the wait lock before returning the reservation
             lock.unlock();
-            return const_cast<MemorySpace*>(selected_space)->requestReservation(size);
+            return std::move(res.value());
         }
         // Wait until notified that memory may be available again
         wait_cv_.wait(lock);
@@ -316,55 +314,52 @@ size_t MemoryReservationManager::getActiveReservationCount() const {
     return total;
 }
 
-const MemorySpace* MemoryReservationManager::selectMemorySpace(const ReservationRequest& request, size_t size) const {
-    return std::visit([this, size](const auto& req) -> const MemorySpace* {
+std::optional<std::unique_ptr<Reservation>> MemoryReservationManager::selectMemorySpaceAndMakeReservation(const ReservationRequest& request, size_t size) const {
+    auto try_candidates = [this, size](const std::vector<const MemorySpace*>& candidates) -> std::optional<std::unique_ptr<Reservation>> {
+        for (const MemorySpace* space : candidates) {
+            if (space && space->canReserve(size)) {
+                // Delegate to MemorySpace to create the reservation
+                return const_cast<MemorySpace*>(space)->requestReservation(size);
+            }
+        }
+        return std::nullopt;
+    };
+
+    return std::visit([this, size, &try_candidates](const auto& req) -> std::optional<std::unique_ptr<Reservation>> {
         using T = std::decay_t<decltype(req)>;
-        
+
         if constexpr (std::is_same_v<T, AnyMemorySpaceInTierWithPreference>) {
-            // Find space in the specified tier, preferring the specified device if available
             auto candidates = getMemorySpacesForTier(req.tier);
-            
+
             // If a preferred device is specified, try it first
             if (req.preferred_device_id.has_value()) {
                 for (const MemorySpace* space : candidates) {
+                    //TODO: we need canReserve and requestReservation to happen in one operation so we can lock and prevent
+                    //race conditions. because we can wait on the memoryspace itself it will work for now but 
+                    //we should change that behavior at some point
                     if (space && space->getDeviceId() == req.preferred_device_id.value() && space->canReserve(size)) {
-                        return space;
+                        return const_cast<MemorySpace*>(space)->requestReservation(size);
                     }
                 }
             }
-            
+
             // Fall back to any space in the tier
-            return selectFromList(candidates, size);
-        }
-        else if constexpr (std::is_same_v<T, AnyMemorySpaceInTier>) {
-            // Find any space in the specified tier that can handle the request
+            return try_candidates(candidates);
+        } else if constexpr (std::is_same_v<T, AnyMemorySpaceInTier>) {
             auto candidates = getMemorySpacesForTier(req.tier);
-            return selectFromList(candidates, size);
-        }
-        else if constexpr (std::is_same_v<T, AnyMemorySpaceInTiers>) {
-            // Try tiers in order of preference
+            return try_candidates(candidates);
+        } else if constexpr (std::is_same_v<T, AnyMemorySpaceInTiers>) {
             for (Tier tier : req.tiers) {
                 auto candidates = getMemorySpacesForTier(tier);
-                const MemorySpace* selected = selectFromList(candidates, size);
-                if (selected) {
-                    return selected;
+                if (auto res = try_candidates(candidates); res.has_value()) {
+                    return res;
                 }
             }
-            return nullptr;
-        }
-        else {
-            static_assert(false, "Unhandled ReservationRequest type");
+            return std::nullopt;
+        } else {
+            static_assert(!sizeof(T*), "Unhandled ReservationRequest type");
         }
     }, request);
-}
-
-const MemorySpace* MemoryReservationManager::selectFromList(const std::vector<const MemorySpace*>& candidates, size_t size) const {
-    for (const MemorySpace* space : candidates) {
-        if (space && space->canReserve(size)) {
-            return space;
-        }
-    }
-    return nullptr;
 }
 
 void MemoryReservationManager::buildLookupTables() {
@@ -385,3 +380,4 @@ void MemoryReservationManager::buildLookupTables() {
 
 } // namespace memory
 } // namespace sirius
+

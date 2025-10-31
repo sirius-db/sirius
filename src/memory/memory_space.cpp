@@ -57,6 +57,10 @@ size_t MemorySpace::getDeviceId() const {
 std::unique_ptr<Reservation> MemorySpace::requestReservation(size_t size) {
     std::unique_lock<std::mutex> lock(mutex_);
     
+    //TODO: This is kind of wrong. Given that we are trying to handle the blocking 
+    //on the memory reservation manager. For now  I am going to leave it but
+    //we should probably and some locking mechanism for seeing if there is space AND returning the
+    //reservation if there is space in one operation.
     // Wait until we can allocate the requested size
     waitForMemory(size, lock);
     

@@ -413,9 +413,9 @@ private:
                       std::hash<std::pair<Tier, size_t>>> memory_space_lookup_;
     std::unordered_map<Tier, std::vector<const MemorySpace*>> tier_to_memory_spaces_;
     
-    // Helper methods for request processing
-    const MemorySpace* selectMemorySpace(const ReservationRequest& request, size_t size) const;
-    const MemorySpace* selectFromList(const std::vector<const MemorySpace*>& candidates, size_t size) const;
+    // Helper method: attempts to select a space and immediately make a reservation
+    // Returns a reservation when successful, or std::nullopt if none can satisfy the request
+    std::optional<std::unique_ptr<Reservation>> selectMemorySpaceAndMakeReservation(const ReservationRequest& request, size_t size) const;
     
     void buildLookupTables();
 
