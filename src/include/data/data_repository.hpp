@@ -52,11 +52,11 @@ public:
      * The repository takes ownership of the data_batch_view and will manage its lifecycle
      * according to the implementation's storage policy.
      * 
-     * @param data_batch Unique pointer to the data_batch_view to add (ownership transferred)
+     * @param batch_view Unique pointer to the data_batch_view to add (ownership transferred)
      * 
      * @note Thread-safe operation protected by internal mutex
      */
-    virtual void add_new_data_batch_view(sirius::unique_ptr<data_batch_view> data_batch);
+    virtual void add_new_data_batch_view(sirius::unique_ptr<data_batch_view> batch_view);
 
     /**
      * @brief Remove and return a data batch from this repository according to eviction policy.

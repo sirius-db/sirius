@@ -19,6 +19,8 @@
 #include <vector>
 #include <memory>
 #include "data/data_batch.hpp"
+#include "data/data_batch_view.hpp"
+#include "data/data_repository_manager.hpp"
 #include "data/common.hpp"
 
 using namespace sirius;
@@ -53,19 +55,22 @@ private:
 
 // Test basic construction
 TEST_CASE("data_batch Construction", "[data_batch]") {
+    data_repository_manager manager;
     auto data = sirius::make_unique<mock_data_representation>(Tier::GPU, 2048);
-    data_batch batch(1, std::move(data));
+    data_batch batch(1, manager, std::move(data));
     
     REQUIRE(batch.get_batch_id() == 1);
     REQUIRE(batch.get_current_tier() == Tier::GPU);
     REQUIRE(batch.get_view_count() == 0);
     REQUIRE(batch.get_pin_count() == 0);
+    REQUIRE(batch.get_data_repository_manager() == &manager);
 }
 
 // Test move constructor
 TEST_CASE("data_batch Move Constructor", "[data_batch]") {
+    data_repository_manager manager;
     auto data = sirius::make_unique<mock_data_representation>(Tier::HOST, 1024);
-    data_batch batch1(42, std::move(data));
+    data_batch batch1(42, manager, std::move(data));
     
     REQUIRE(batch1.get_batch_id() == 42);
     REQUIRE(batch1.get_current_tier() == Tier::HOST);
@@ -80,11 +85,12 @@ TEST_CASE("data_batch Move Constructor", "[data_batch]") {
 
 // Test move assignment
 TEST_CASE("data_batch Move Assignment", "[data_batch]") {
+    data_repository_manager manager;
     auto data1 = sirius::make_unique<mock_data_representation>(Tier::GPU, 512);
     auto data2 = sirius::make_unique<mock_data_representation>(Tier::HOST, 1024);
     
-    data_batch batch1(10, std::move(data1));
-    data_batch batch2(20, std::move(data2));
+    data_batch batch1(10, manager, std::move(data1));
+    data_batch batch2(20, manager, std::move(data2));
     
     REQUIRE(batch1.get_batch_id() == 10);
     REQUIRE(batch2.get_batch_id() == 20);
@@ -99,8 +105,9 @@ TEST_CASE("data_batch Move Assignment", "[data_batch]") {
 
 // Test self-assignment (move)
 TEST_CASE("data_batch Self Move Assignment", "[data_batch]") {
+    data_repository_manager manager;
     auto data = sirius::make_unique<mock_data_representation>(Tier::GPU, 1024);
-    data_batch batch(100, std::move(data));
+    data_batch batch(100, manager, std::move(data));
     
     // Self-assignment should not crash
     batch = std::move(batch);
@@ -111,8 +118,9 @@ TEST_CASE("data_batch Self Move Assignment", "[data_batch]") {
 
 // Test view reference counting - increment and decrement
 TEST_CASE("data_batch View Reference Counting", "[data_batch]") {
+    data_repository_manager manager;
     auto data = sirius::make_unique<mock_data_representation>(Tier::GPU, 1024);
-    data_batch batch(1, std::move(data));
+    data_batch batch(1, manager, std::move(data));
     
     REQUIRE(batch.get_view_count() == 0);
     
@@ -127,20 +135,25 @@ TEST_CASE("data_batch View Reference Counting", "[data_batch]") {
     REQUIRE(batch.get_view_count() == 3);
     
     // Decrement view count
-    batch.decrement_view_ref_count();
+    size_t old_count = batch.decrement_view_ref_count();
+    REQUIRE(old_count == 3);
     REQUIRE(batch.get_view_count() == 2);
     
-    batch.decrement_view_ref_count();
+    old_count = batch.decrement_view_ref_count();
+    REQUIRE(old_count == 2);
     REQUIRE(batch.get_view_count() == 1);
     
-    batch.decrement_view_ref_count();
-    // batch should be deleted
+    old_count = batch.decrement_view_ref_count();
+    REQUIRE(old_count == 1);
+    REQUIRE(batch.get_view_count() == 0);
+    // Note: batch is not automatically deleted - deletion happens via data_batch_view destructor
 }
 
 // Test pin reference counting - increment and decrement
 TEST_CASE("data_batch Pin Reference Counting", "[data_batch]") {
+    data_repository_manager manager;
     auto data = sirius::make_unique<mock_data_representation>(Tier::GPU, 1024);
-    data_batch batch(1, std::move(data));
+    data_batch batch(1, manager, std::move(data));
     
     REQUIRE(batch.get_pin_count() == 0);
     
@@ -167,8 +180,9 @@ TEST_CASE("data_batch Pin Reference Counting", "[data_batch]") {
 
 // Test increment pin count throws when not in GPU tier
 TEST_CASE("data_batch increment_pin_ref_count GPU Tier Validation", "[data_batch]") {
+    data_repository_manager manager;
     auto data = sirius::make_unique<mock_data_representation>(Tier::HOST, 1024);
-    data_batch batch(1, std::move(data));
+    data_batch batch(1, manager, std::move(data));
     
     // Should throw because data is not in GPU tier
     REQUIRE_THROWS_AS(batch.increment_pin_ref_count(), std::runtime_error);
@@ -177,8 +191,9 @@ TEST_CASE("data_batch increment_pin_ref_count GPU Tier Validation", "[data_batch
 
 // Test decrement pin count throws when not in GPU tier
 TEST_CASE("data_batch decrement_pin_ref_count GPU Tier Validation", "[data_batch]") {
+    data_repository_manager manager;
     auto data = sirius::make_unique<mock_data_representation>(Tier::GPU, 1024);
-    data_batch batch(1, std::move(data));
+    data_batch batch(1, manager, std::move(data));
     
     // First increment while in GPU tier
     batch.increment_pin_ref_count();
@@ -191,8 +206,9 @@ TEST_CASE("data_batch decrement_pin_ref_count GPU Tier Validation", "[data_batch
 
 // Test that view count operations work regardless of tier
 TEST_CASE("data_batch View Count No Tier Validation", "[data_batch]") {
+    data_repository_manager manager;
     auto data = sirius::make_unique<mock_data_representation>(Tier::HOST, 1024);
-    data_batch batch(1, std::move(data));
+    data_batch batch(1, manager, std::move(data));
     
     // View count should work even when not in GPU tier
     batch.increment_view_ref_count();
@@ -204,11 +220,12 @@ TEST_CASE("data_batch View Count No Tier Validation", "[data_batch]") {
 
 // Test multiple batches with different IDs
 TEST_CASE("Multiple data_batch Instances", "[data_batch]") {
+    data_repository_manager manager;
     std::vector<data_batch> batches;
     
     for (uint64_t i = 0; i < 10; ++i) {
         auto data = sirius::make_unique<mock_data_representation>(Tier::GPU, 1024 * (i + 1));
-        batches.emplace_back(i, std::move(data));
+        batches.emplace_back(i, manager, std::move(data));
     }
     
     // Verify all batches have correct IDs and tiers
@@ -222,32 +239,34 @@ TEST_CASE("Multiple data_batch Instances", "[data_batch]") {
 
 // Test get_current_tier delegates to idata_representation
 TEST_CASE("data_batch get_current_tier Delegation", "[data_batch]") {
+    data_repository_manager manager;
     // Test GPU tier
     {
         auto data = sirius::make_unique<mock_data_representation>(Tier::GPU, 1024);
-        data_batch batch(1, std::move(data));
+        data_batch batch(1, manager, std::move(data));
         REQUIRE(batch.get_current_tier() == Tier::GPU);
     }
     
     // Test HOST tier
     {
         auto data = sirius::make_unique<mock_data_representation>(Tier::HOST, 1024);
-        data_batch batch(2, std::move(data));
+        data_batch batch(2, manager, std::move(data));
         REQUIRE(batch.get_current_tier() == Tier::HOST);
     }
     
     // Test DISK tier
     {
         auto data = sirius::make_unique<mock_data_representation>(Tier::DISK, 1024);
-        data_batch batch(3, std::move(data));
+        data_batch batch(3, manager, std::move(data));
         REQUIRE(batch.get_current_tier() == Tier::DISK);
     }
 }
 
 // Test thread-safe view reference counting
 TEST_CASE("data_batch Thread-Safe View Reference Counting", "[data_batch]") {
+    data_repository_manager manager;
     auto data = sirius::make_unique<mock_data_representation>(Tier::GPU, 1024);
-    data_batch batch(1, std::move(data));
+    data_batch batch(1, manager, std::move(data));
     
     constexpr int num_threads = 10;
     constexpr int increments_per_thread = 100;
@@ -293,8 +312,9 @@ TEST_CASE("data_batch Thread-Safe View Reference Counting", "[data_batch]") {
 
 // Test thread-safe pin reference counting
 TEST_CASE("data_batch Thread-Safe Pin Reference Counting", "[data_batch]") {
+    data_repository_manager manager;
     auto data = sirius::make_unique<mock_data_representation>(Tier::GPU, 1024);
-    data_batch batch(1, std::move(data));
+    data_batch batch(1, manager, std::move(data));
     
     constexpr int num_threads = 10;
     constexpr int increments_per_thread = 100;
@@ -340,8 +360,9 @@ TEST_CASE("data_batch Thread-Safe Pin Reference Counting", "[data_batch]") {
 
 // Test concurrent view increment and decrement
 TEST_CASE("data_batch Concurrent View Increment and Decrement", "[data_batch]") {
+    data_repository_manager manager;
     auto data = sirius::make_unique<mock_data_representation>(Tier::GPU, 1024);
-    data_batch batch(1, std::move(data));
+    data_batch batch(1, manager, std::move(data));
     
     // Pre-increment to avoid hitting zero during concurrent operations
     for (int i = 0; i < 1000; ++i) {
@@ -386,8 +407,9 @@ TEST_CASE("data_batch Concurrent View Increment and Decrement", "[data_batch]") 
 
 // Test concurrent pin increment and decrement
 TEST_CASE("data_batch Concurrent Pin Increment and Decrement", "[data_batch]") {
+    data_repository_manager manager;
     auto data = sirius::make_unique<mock_data_representation>(Tier::GPU, 1024);
-    data_batch batch(1, std::move(data));
+    data_batch batch(1, manager, std::move(data));
     
     // Pre-increment to avoid hitting zero during concurrent operations
     for (int i = 0; i < 1000; ++i) {
@@ -432,6 +454,7 @@ TEST_CASE("data_batch Concurrent Pin Increment and Decrement", "[data_batch]") {
 
 // Test batch ID uniqueness in practice
 TEST_CASE("data_batch Unique IDs", "[data_batch]") {
+    data_repository_manager manager;
     std::vector<uint64_t> batch_ids = {0, 1, 100, 999, 1000, 9999, 
                                         UINT64_MAX - 1, UINT64_MAX};
     
@@ -439,7 +462,7 @@ TEST_CASE("data_batch Unique IDs", "[data_batch]") {
     
     for (auto id : batch_ids) {
         auto data = sirius::make_unique<mock_data_representation>(Tier::GPU, 1024);
-        batches.emplace_back(id, std::move(data));
+        batches.emplace_back(id, manager, std::move(data));
     }
     
     // Verify each batch has the correct ID
@@ -450,8 +473,9 @@ TEST_CASE("data_batch Unique IDs", "[data_batch]") {
 
 // Test edge case: zero view count operations
 TEST_CASE("data_batch Zero View Count", "[data_batch]") {
+    data_repository_manager manager;
     auto data = sirius::make_unique<mock_data_representation>(Tier::GPU, 1024);
-    data_batch batch(1, std::move(data));
+    data_batch batch(1, manager, std::move(data));
     
     // Starting view count should be zero
     REQUIRE(batch.get_view_count() == 0);
@@ -471,8 +495,9 @@ TEST_CASE("data_batch Zero View Count", "[data_batch]") {
 
 // Test edge case: zero pin count operations
 TEST_CASE("data_batch Zero Pin Count", "[data_batch]") {
+    data_repository_manager manager;
     auto data = sirius::make_unique<mock_data_representation>(Tier::GPU, 1024);
-    data_batch batch(1, std::move(data));
+    data_batch batch(1, manager, std::move(data));
     
     // Starting pin count should be zero
     REQUIRE(batch.get_pin_count() == 0);
@@ -492,12 +517,13 @@ TEST_CASE("data_batch Zero Pin Count", "[data_batch]") {
 
 // Test with different data sizes
 TEST_CASE("data_batch With Different Data Sizes", "[data_batch]") {
+    data_repository_manager manager;
     std::vector<size_t> sizes = {0, 1, 1024, 1024 * 1024, 1024 * 1024 * 100};
     
     for (size_t size : sizes) {
         auto data = sirius::make_unique<mock_data_representation>(Tier::GPU, size);
         auto* data_ptr = data.get();
-        data_batch batch(1, std::move(data));
+        data_batch batch(1, manager, std::move(data));
         
         // Verify the data representation is accessible through the batch
         REQUIRE(batch.get_current_tier() == Tier::GPU);
@@ -507,10 +533,11 @@ TEST_CASE("data_batch With Different Data Sizes", "[data_batch]") {
 
 // Test that move operations require zero reference counts
 TEST_CASE("data_batch Move Requires Zero Reference Counts", "[data_batch]") {
+    data_repository_manager manager;
     // Test that moving with active views throws
     {
         auto data = sirius::make_unique<mock_data_representation>(Tier::GPU, 1024);
-        data_batch batch1(1, std::move(data));
+        data_batch batch1(1, manager, std::move(data));
         batch1.increment_view_ref_count();
         
         REQUIRE_THROWS_AS([&]() { data_batch batch2(std::move(batch1)); }(), std::runtime_error);
@@ -519,7 +546,7 @@ TEST_CASE("data_batch Move Requires Zero Reference Counts", "[data_batch]") {
     // Test that moving with active pins throws
     {
         auto data = sirius::make_unique<mock_data_representation>(Tier::GPU, 1024);
-        data_batch batch1(1, std::move(data));
+        data_batch batch1(1, manager, std::move(data));
         batch1.increment_pin_ref_count();
         
         REQUIRE_THROWS_AS([&]() { data_batch batch2(std::move(batch1)); }(), std::runtime_error);
@@ -528,7 +555,7 @@ TEST_CASE("data_batch Move Requires Zero Reference Counts", "[data_batch]") {
     // Test that moving with both active views and pins throws
     {
         auto data = sirius::make_unique<mock_data_representation>(Tier::GPU, 1024);
-        data_batch batch1(1, std::move(data));
+        data_batch batch1(1, manager, std::move(data));
         batch1.increment_view_ref_count();
         batch1.increment_pin_ref_count();
         
@@ -538,7 +565,7 @@ TEST_CASE("data_batch Move Requires Zero Reference Counts", "[data_batch]") {
     // Test that moving with zero counts succeeds
     {
         auto data = sirius::make_unique<mock_data_representation>(Tier::GPU, 1024);
-        data_batch batch1(1, std::move(data));
+        data_batch batch1(1, manager, std::move(data));
         
         REQUIRE(batch1.get_view_count() == 0);
         REQUIRE(batch1.get_pin_count() == 0);
@@ -553,8 +580,9 @@ TEST_CASE("data_batch Move Requires Zero Reference Counts", "[data_batch]") {
 
 // Test multiple rapid view count increment/decrement cycles
 TEST_CASE("data_batch Rapid View Count Cycles", "[data_batch]") {
+    data_repository_manager manager;
     auto data = sirius::make_unique<mock_data_representation>(Tier::GPU, 1024);
-    data_batch batch(1, std::move(data));
+    data_batch batch(1, manager, std::move(data));
     
     // Perform many cycles of increment and decrement
     for (int cycle = 0; cycle < 100; ++cycle) {
@@ -575,8 +603,9 @@ TEST_CASE("data_batch Rapid View Count Cycles", "[data_batch]") {
 
 // Test multiple rapid pin count increment/decrement cycles
 TEST_CASE("data_batch Rapid Pin Count Cycles", "[data_batch]") {
+    data_repository_manager manager;
     auto data = sirius::make_unique<mock_data_representation>(Tier::GPU, 1024);
-    data_batch batch(1, std::move(data));
+    data_batch batch(1, manager, std::move(data));
     
     // Perform many cycles of increment and decrement
     for (int cycle = 0; cycle < 100; ++cycle) {
@@ -597,8 +626,9 @@ TEST_CASE("data_batch Rapid Pin Count Cycles", "[data_batch]") {
 
 // Test independent view and pin counts
 TEST_CASE("data_batch Independent View and Pin Counts", "[data_batch]") {
+    data_repository_manager manager;
     auto data = sirius::make_unique<mock_data_representation>(Tier::GPU, 1024);
-    data_batch batch(1, std::move(data));
+    data_batch batch(1, manager, std::move(data));
     
     // Increment view count
     batch.increment_view_ref_count();
@@ -622,5 +652,91 @@ TEST_CASE("data_batch Independent View and Pin Counts", "[data_batch]") {
     batch.decrement_pin_ref_count();
     REQUIRE(batch.get_view_count() == 2); // View count unchanged
     REQUIRE(batch.get_pin_count() == 1);
+}
+
+// =============================================================================
+// Tests for data_batch with data_repository_manager integration
+// =============================================================================
+
+// Test that data_batch can be managed by data_repository_manager
+TEST_CASE("data_batch With Data Repository Manager", "[data_batch][integration]") {
+    data_repository_manager manager;
+    
+    auto data = sirius::make_unique<mock_data_representation>(Tier::GPU, 2048);
+    uint64_t batch_id = manager.get_next_data_batch_id();
+    auto batch = sirius::make_unique<data_batch>(batch_id, manager, std::move(data));
+    auto* batch_ptr = batch.get();
+    
+    // Add to manager
+    sirius::vector<size_t> empty_pipelines;
+    manager.add_new_data_batch(std::move(batch), empty_pipelines);
+    
+    // Batch is now managed by the manager
+    REQUIRE(batch_ptr->get_data_repository_manager() == &manager);
+    REQUIRE(batch_ptr->get_batch_id() == batch_id);
+    REQUIRE(batch_ptr->get_view_count() == 0);
+    
+    // Create a view and let it go out of scope - this will trigger deletion
+    {
+        data_batch_view view(batch_ptr);
+        REQUIRE(batch_ptr->get_view_count() == 1);
+    }
+    // Batch is now deleted by the manager
+}
+
+// Test view count returns old value correctly
+TEST_CASE("data_batch Decrement View Count Returns Old Value", "[data_batch]") {
+    data_repository_manager manager;
+    auto data = sirius::make_unique<mock_data_representation>(Tier::GPU, 1024);
+    data_batch batch(1, manager, std::move(data));
+    
+    // Increment to 5
+    for (int i = 0; i < 5; ++i) {
+        batch.increment_view_ref_count();
+    }
+    REQUIRE(batch.get_view_count() == 5);
+    
+    // Decrement and check old values
+    size_t old_count;
+    
+    old_count = batch.decrement_view_ref_count();
+    REQUIRE(old_count == 5);
+    REQUIRE(batch.get_view_count() == 4);
+    
+    old_count = batch.decrement_view_ref_count();
+    REQUIRE(old_count == 4);
+    REQUIRE(batch.get_view_count() == 3);
+    
+    old_count = batch.decrement_view_ref_count();
+    REQUIRE(old_count == 3);
+    REQUIRE(batch.get_view_count() == 2);
+    
+    old_count = batch.decrement_view_ref_count();
+    REQUIRE(old_count == 2);
+    REQUIRE(batch.get_view_count() == 1);
+    
+    old_count = batch.decrement_view_ref_count();
+    REQUIRE(old_count == 1);
+    REQUIRE(batch.get_view_count() == 0);
+}
+
+// Test create_view method
+TEST_CASE("data_batch Create View", "[data_batch][integration]") {
+    data_repository_manager manager;
+    
+    auto data = sirius::make_unique<mock_data_representation>(Tier::GPU, 1024);
+    uint64_t batch_id = manager.get_next_data_batch_id();
+    auto batch = sirius::make_unique<data_batch>(batch_id, manager, std::move(data));
+    auto* batch_ptr = batch.get();
+    
+    // Add to manager
+    sirius::vector<size_t> empty_pipelines;
+    manager.add_new_data_batch(std::move(batch), empty_pipelines);
+    
+    // Create view using the create_view method
+    auto view = batch_ptr->create_view();
+    REQUIRE(batch_ptr->get_view_count() == 1);
+    
+    // Let view go out of scope - batch will be deleted
 }
 

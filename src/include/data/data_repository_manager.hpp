@@ -77,11 +77,20 @@ public:
      * This method stores the actual data_batch object in the manager's holder.
      * data_batch_views reference these batches.
      * 
-     * @param data_batch The data_batch to add (ownership transferred)
+     * @param batch The data_batch to add (ownership transferred)
      * 
      * @note Thread-safe operation
      */
-    void add_new_data_batch(sirius::unique_ptr<data_batch> data_batch, sirius::vector<size_t> pipeline_ids);
+    void add_new_data_batch(sirius::unique_ptr<data_batch> batch, sirius::vector<size_t> pipeline_ids);
+
+    /**
+     * @brief Delete a data batch from the manager.
+     * 
+     * Deletes a data batch from the manager.
+     * 
+     * @param batch_id The ID of the data batch to delete
+     */
+    void delete_data_batch(size_t batch_id);
 
     /**
      * @brief Get direct access to a pipeline's repository for advanced operations.
@@ -114,7 +123,7 @@ private:
     mutex _mutex;                                      ///< Mutex for thread-safe access to holder
     sirius::atomic<uint64_t> _next_data_batch_id = 0;  ///< Atomic counter for generating unique data batch identifiers
     sirius::unordered_map<size_t, sirius::unique_ptr<idata_repository>> _repositories; ///< Map of pipeline ID to idata_repository
-    sirius::vector<sirius::unique_ptr<data_batch>> _holder;  ///< Map to hold the actual data_batch
+    unordered_map<size_t, sirius::unique_ptr<data_batch>> _data_batches;
 };
 
 }

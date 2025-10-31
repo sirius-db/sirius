@@ -16,6 +16,7 @@
 
 #include "data/data_batch_view.hpp"
 #include "data/gpu_data_representation.hpp"
+#include "data/data_repository_manager.hpp"
 
 namespace sirius {
 
@@ -76,7 +77,11 @@ data_batch_view::~data_batch_view() {
     if (_pinned) {
         unpin();
     }
-    _batch->decrement_view_ref_count();
+    size_t old_count = _batch->decrement_view_ref_count();
+    if (old_count == 1) {
+        data_repository_manager* data_repo_mgr = _batch->get_data_repository_manager();
+        data_repo_mgr->delete_data_batch(_batch->get_batch_id());
+    }
 }
 
 } // namespace sirius

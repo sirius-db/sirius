@@ -19,6 +19,7 @@
 #include <vector>
 #include <memory>
 #include "data/data_repository.hpp"
+#include "data/data_repository_manager.hpp"
 #include "data/data_batch.hpp"
 #include "data/data_batch_view.hpp"
 #include "data/common.hpp"
@@ -64,11 +65,12 @@ TEST_CASE("idata_repository Construction", "[data_repository]") {
 
 // Test adding and pulling a single batch
 TEST_CASE("idata_repository Add and Pull Single Batch", "[data_repository]") {
+    data_repository_manager manager;
     idata_repository repository;
     
     // Create a batch and view
     auto data = sirius::make_unique<mock_data_representation>(Tier::GPU, 1024);
-    auto* batch = new data_batch(1, std::move(data));
+    auto* batch = new data_batch(1, manager, std::move(data));
     batch->increment_view_ref_count(); // Prevent auto-delete
     
     auto view = sirius::make_unique<data_batch_view>(batch);
@@ -91,6 +93,7 @@ TEST_CASE("idata_repository Add and Pull Single Batch", "[data_repository]") {
 
 // Test FIFO behavior
 TEST_CASE("idata_repository FIFO Order", "[data_repository]") {
+    data_repository_manager manager;
     idata_repository repository;
     
     std::vector<data_batch*> batches;
@@ -98,7 +101,7 @@ TEST_CASE("idata_repository FIFO Order", "[data_repository]") {
     // Create multiple batches and add them
     for (uint64_t i = 1; i <= 5; ++i) {
         auto data = sirius::make_unique<mock_data_representation>(Tier::GPU, 1024);
-        auto* batch = new data_batch(i, std::move(data));
+        auto* batch = new data_batch(i, manager, std::move(data));
         batch->increment_view_ref_count(); // Prevent auto-delete
         batches.push_back(batch);
         
@@ -125,6 +128,7 @@ TEST_CASE("idata_repository FIFO Order", "[data_repository]") {
 
 // Test multiple add and pull operations
 TEST_CASE("idata_repository Multiple Add Pull Operations", "[data_repository]") {
+    data_repository_manager manager;
     idata_repository repository;
     
     std::vector<data_batch*> batches;
@@ -132,7 +136,7 @@ TEST_CASE("idata_repository Multiple Add Pull Operations", "[data_repository]") 
     // Add 3 batches
     for (uint64_t i = 1; i <= 3; ++i) {
         auto data = sirius::make_unique<mock_data_representation>(Tier::GPU, 1024);
-        auto* batch = new data_batch(i, std::move(data));
+        auto* batch = new data_batch(i, manager, std::move(data));
         batch->increment_view_ref_count(); // Prevent auto-delete
         batches.push_back(batch);
         
@@ -149,7 +153,7 @@ TEST_CASE("idata_repository Multiple Add Pull Operations", "[data_repository]") 
     // Add 2 more batches
     for (uint64_t i = 4; i <= 5; ++i) {
         auto data = sirius::make_unique<mock_data_representation>(Tier::GPU, 1024);
-        auto* batch = new data_batch(i, std::move(data));
+        auto* batch = new data_batch(i, manager, std::move(data));
         batch->increment_view_ref_count(); // Prevent auto-delete
         batches.push_back(batch);
         
@@ -188,6 +192,7 @@ TEST_CASE("idata_repository Pull From Empty", "[data_repository]") {
 
 // Test thread-safe adding
 TEST_CASE("idata_repository Thread-Safe Adding", "[data_repository]") {
+    data_repository_manager manager;
     idata_repository repository;
     
     constexpr int num_threads = 10;
@@ -202,7 +207,7 @@ TEST_CASE("idata_repository Thread-Safe Adding", "[data_repository]") {
             for (int j = 0; j < batches_per_thread; ++j) {
                 auto data = sirius::make_unique<mock_data_representation>(Tier::GPU, 1024);
                 uint64_t batch_id = i * batches_per_thread + j;
-                auto* batch = new data_batch(batch_id, std::move(data));
+                auto* batch = new data_batch(batch_id, manager, std::move(data));
                 batch->increment_view_ref_count(); // Prevent auto-delete
                 thread_batches[i].push_back(batch);
                 
@@ -236,6 +241,7 @@ TEST_CASE("idata_repository Thread-Safe Adding", "[data_repository]") {
 
 // Test thread-safe pulling
 TEST_CASE("idata_repository Thread-Safe Pulling", "[data_repository]") {
+    data_repository_manager manager;
     idata_repository repository;
     
     constexpr int num_batches = 500;
@@ -244,7 +250,7 @@ TEST_CASE("idata_repository Thread-Safe Pulling", "[data_repository]") {
     // Add many batches
     for (int i = 0; i < num_batches; ++i) {
         auto data = sirius::make_unique<mock_data_representation>(Tier::GPU, 1024);
-        auto* batch = new data_batch(i, std::move(data));
+        auto* batch = new data_batch(i, manager, std::move(data));
         batch->increment_view_ref_count(); // Prevent auto-delete
         batches.push_back(batch);
         
@@ -291,6 +297,7 @@ TEST_CASE("idata_repository Thread-Safe Pulling", "[data_repository]") {
 
 // Test concurrent adding and pulling
 TEST_CASE("idata_repository Concurrent Add and Pull", "[data_repository]") {
+    data_repository_manager manager;
     idata_repository repository;
     
     constexpr int num_add_threads = 5;
@@ -307,7 +314,7 @@ TEST_CASE("idata_repository Concurrent Add and Pull", "[data_repository]") {
             for (int j = 0; j < batches_per_thread; ++j) {
                 auto data = sirius::make_unique<mock_data_representation>(Tier::GPU, 1024);
                 uint64_t batch_id = i * batches_per_thread + j;
-                auto* batch = new data_batch(batch_id, std::move(data));
+                auto* batch = new data_batch(batch_id, manager, std::move(data));
                 batch->increment_view_ref_count(); // Prevent auto-delete
                 thread_batches[i].push_back(batch);
                 
@@ -355,6 +362,7 @@ TEST_CASE("idata_repository Concurrent Add and Pull", "[data_repository]") {
 
 // Test large number of batches
 TEST_CASE("idata_repository Large Number of Batches", "[data_repository]") {
+    data_repository_manager manager;
     idata_repository repository;
     
     constexpr int num_batches = 10000;
@@ -363,7 +371,7 @@ TEST_CASE("idata_repository Large Number of Batches", "[data_repository]") {
     // Add many batches
     for (int i = 0; i < num_batches; ++i) {
         auto data = sirius::make_unique<mock_data_representation>(Tier::GPU, 1024);
-        auto* batch = new data_batch(i, std::move(data));
+        auto* batch = new data_batch(i, manager, std::move(data));
         batch->increment_view_ref_count(); // Prevent auto-delete
         batches.push_back(batch);
         
@@ -387,6 +395,7 @@ TEST_CASE("idata_repository Large Number of Batches", "[data_repository]") {
 
 // Test add after pull all
 TEST_CASE("idata_repository Add After Pull All", "[data_repository]") {
+    data_repository_manager manager;
     idata_repository repository;
     
     std::vector<data_batch*> batches;
@@ -394,7 +403,7 @@ TEST_CASE("idata_repository Add After Pull All", "[data_repository]") {
     // Add some batches
     for (int i = 0; i < 5; ++i) {
         auto data = sirius::make_unique<mock_data_representation>(Tier::GPU, 1024);
-        auto* batch = new data_batch(i, std::move(data));
+        auto* batch = new data_batch(i, manager, std::move(data));
         batch->increment_view_ref_count(); // Prevent auto-delete
         batches.push_back(batch);
         
@@ -412,7 +421,7 @@ TEST_CASE("idata_repository Add After Pull All", "[data_repository]") {
     // Add more batches
     for (int i = 5; i < 10; ++i) {
         auto data = sirius::make_unique<mock_data_representation>(Tier::GPU, 1024);
-        auto* batch = new data_batch(i, std::move(data));
+        auto* batch = new data_batch(i, manager, std::move(data));
         batch->increment_view_ref_count(); // Prevent auto-delete
         batches.push_back(batch);
         
@@ -435,6 +444,7 @@ TEST_CASE("idata_repository Add After Pull All", "[data_repository]") {
 
 // Test repository with different batch sizes
 TEST_CASE("idata_repository Different Batch Sizes", "[data_repository]") {
+    data_repository_manager manager;
     idata_repository repository;
     
     std::vector<size_t> sizes = {100, 1024, 10240, 102400, 1024000};
@@ -443,7 +453,7 @@ TEST_CASE("idata_repository Different Batch Sizes", "[data_repository]") {
     // Add batches with different sizes
     for (size_t i = 0; i < sizes.size(); ++i) {
         auto data = sirius::make_unique<mock_data_representation>(Tier::GPU, sizes[i]);
-        auto* batch = new data_batch(i, std::move(data));
+        auto* batch = new data_batch(i, manager, std::move(data));
         batch->increment_view_ref_count(); // Prevent auto-delete
         batches.push_back(batch);
         
@@ -467,6 +477,7 @@ TEST_CASE("idata_repository Different Batch Sizes", "[data_repository]") {
 
 // Test interleaved add and pull
 TEST_CASE("idata_repository Interleaved Add and Pull", "[data_repository]") {
+    data_repository_manager manager;
     idata_repository repository;
     
     std::vector<data_batch*> batches;
@@ -475,7 +486,7 @@ TEST_CASE("idata_repository Interleaved Add and Pull", "[data_repository]") {
         // Add some batches
         for (int i = 0; i < 3; ++i) {
             auto data = sirius::make_unique<mock_data_representation>(Tier::GPU, 1024);
-            auto* batch = new data_batch(cycle * 3 + i, std::move(data));
+            auto* batch = new data_batch(cycle * 3 + i, manager, std::move(data));
             batch->increment_view_ref_count(); // Prevent auto-delete
             batches.push_back(batch);
             

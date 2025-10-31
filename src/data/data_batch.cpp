@@ -20,12 +20,13 @@
 
 namespace sirius {
 
-data_batch::data_batch(uint64_t batch_id, sirius::unique_ptr<idata_representation> data)
-    : _batch_id(batch_id), _data(std::move(data)) {}
+data_batch::data_batch(uint64_t batch_id, data_repository_manager& data_repo_mgr, sirius::unique_ptr<idata_representation> data)
+    : _batch_id(batch_id), _data(std::move(data)), _data_repo_mgr(&data_repo_mgr) {}
 
 data_batch::data_batch(data_batch&& other)
     : _batch_id(other._batch_id), 
-      _data(std::move(other._data)) {
+      _data(std::move(other._data)),
+      _data_repo_mgr(other._data_repo_mgr) {
     size_t other_view_count = other._view_count.load(std::memory_order_relaxed);
     size_t other_pin_count = other._pin_count.load(std::memory_order_relaxed);
     if (other_view_count != 0) {
@@ -50,6 +51,7 @@ data_batch& data_batch::operator=(data_batch&& other) {
         }
         _batch_id = other._batch_id;
         _data = std::move(other._data);
+        _data_repo_mgr = other._data_repo_mgr;
         other._batch_id = 0;
         other._data = nullptr;
     }
@@ -68,12 +70,9 @@ void data_batch::increment_view_ref_count() {
     _view_count.fetch_add(1, std::memory_order_relaxed);
 }
 
-void data_batch::decrement_view_ref_count() {
+size_t data_batch::decrement_view_ref_count() {
     size_t old_count = _view_count.fetch_sub(1, std::memory_order_relaxed);
-    if (old_count == 1) {
-        // TODO: later on we will have to figure out a way to delete the batch safely and efficiently
-        // delete this;
-    }
+    return old_count;
 }
 
 void data_batch::decrement_pin_ref_count() {
@@ -106,6 +105,10 @@ size_t data_batch::get_view_count() const {
 
 size_t data_batch::get_pin_count() const {
     return _pin_count.load(std::memory_order_relaxed);
+}
+
+data_repository_manager* data_batch::get_data_repository_manager() const {
+    return _data_repo_mgr;
 }
 
 } // namespace sirius

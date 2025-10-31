@@ -25,7 +25,8 @@
 
 namespace sirius {
 
-class data_batch_view; // Forward declaration
+class data_batch_view; // Forward declarationc
+class data_repository_manager; // Forward declaration
 
 /**
  * @brief A data batch represents a collection of data that can be moved between different memory tiers.
@@ -52,7 +53,7 @@ public:
      * @param batch_id Unique identifier for this batch (obtained from data_repository_manager)
      * @param data Ownership of the data representation is transferred to this batch
      */
-    data_batch(uint64_t batch_id, sirius::unique_ptr<idata_representation> data);
+    data_batch(uint64_t batch_id, data_repository_manager& data_repo_mgr, sirius::unique_ptr<idata_representation> data);
     
     /**
      * @brief Move constructor - transfers ownership of the batch and its data.
@@ -102,8 +103,9 @@ public:
      * View count == 0 means that the data_batch can be destroyed.
      * 
      * @warning This method will delete the data_batch object when ref count reaches zero.
+     * @return size_t The old view reference count
      */
-    void decrement_view_ref_count();
+    size_t decrement_view_ref_count();
 
     /**
      * @brief Atomically increment the reference count.
@@ -182,12 +184,22 @@ public:
      */
     idata_representation* get_data() const;
 
+    /**
+     * @brief Get the data batch holder.
+     * 
+     * Returns a pointer to the data batch holder.
+     * 
+     * @return data_repository_manager* Pointer to the data repository manager
+     */
+    data_repository_manager* get_data_repository_manager() const;
+
 private:
     mutable sirius::mutex _mutex;                         ///< Mutex for thread-safe access to tier checking and reference counting
     uint64_t _batch_id;                                   ///< Unique identifier for this data batch
     sirius::unique_ptr<idata_representation> _data;       ///< Pointer to the actual data representation
     sirius::atomic<size_t> _view_count = 0;               ///< Reference count for tracking views
     sirius::atomic<size_t> _pin_count = 0;                ///< Reference count for tracking pins to prevent eviction
+    data_repository_manager* _data_repo_mgr;                ///< Pointer to the data repository manager
 };
 
 } // namespace sirius
