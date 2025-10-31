@@ -31,7 +31,7 @@ enum class Tier {
 };
 
 // Forward declarations
-class FixedSizeHostMemoryResource;
+class fixed_size_host_memory_resource;
 
 /**
  * @brief Interface representing a data representation residing in a specific memory tier.
@@ -44,11 +44,29 @@ class FixedSizeHostMemoryResource;
 class idata_representation {
 public:
     /**
+     * @brief Construct a new idata_representation object
+     * 
+     * @param memory_space The memory space where the data resides
+     */
+    idata_representation(sirius::memory_space& memory_space) : _memory_space(memory_space) {}
+
+    /**
      * @brief Get the tier of memory that this representation resides in
      * 
      * @return Tier The memory tier
      */
-    virtual Tier get_current_tier() const = 0;
+    Tier get_current_tier() const {
+        return _memory_space.get_tier();
+    }
+
+    /**
+     * @brief Get the device ID where the data resides
+     * 
+     * @return device_id The device ID
+     */
+    size_t get_device_id() const {
+        return _memory_space.get_device_id();
+    }
 
     /**
      * @brief Get the size of the data representation in bytes
@@ -60,12 +78,11 @@ public:
     /**
      * @brief Convert this data representation to a different memory tier
      * 
-     * @param target_tier The target tier to convert to
-     * @param device_mr The device memory resource to use for GPU tier allocations
+     * @param target_memory_space The target memory space to convert to
      * @param stream CUDA stream to use for memory operations
-     * @return sirius::unique_ptr<idata_representation> A new data representation in the target tier
+     * @return sirius::unique_ptr<idata_representation> A new data representation in the target memory space
      */
-    virtual sirius::unique_ptr<idata_representation> convert_to_tier(Tier target_tier, rmm::mr::device_memory_resource* mr = nullptr, rmm::cuda_stream_view stream = rmm::cuda_stream_default) = 0;
+    virtual sirius::unique_ptr<idata_representation> convert_to_memory_space(sirius::memory_space& target_memory_space, rmm::cuda_stream_view stream = rmm::cuda_stream_default) = 0;
 
     /**
      * @brief Safely casts this interface to a specific derived type
@@ -88,6 +105,9 @@ public:
 	const TargetType &cast() const {
 		return reinterpret_cast<const TargetType &>(*this);
 	}
+
+private:
+    sirius::memory_space& _memory_space; ///< The memory space where the data resides
 };
 
 } // namespace sirius
