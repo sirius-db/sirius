@@ -16,6 +16,7 @@
 
 #include "gpu_buffer_manager.hpp"
 #include "config.hpp"
+#include <rmm/aligned.hpp>
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/parser/constraints/unique_constraint.hpp"
@@ -314,9 +315,9 @@ template <typename T>
 T*
 GPUBufferManager::customCudaMalloc(size_t size, int gpu, bool caching) {
 	size_t alloc = (size * sizeof(T));
-    //always ensure that it aligns with 8B
+    //always ensure that it aligns with RMM's CUDA allocation alignment
     // int alignment = alignof(double);
-    int alignment = 256;
+    int alignment = rmm::CUDA_ALLOCATION_ALIGNMENT;
     alloc = alloc + (alignment - alloc % alignment);
     if (caching) {
         size_t start = __atomic_fetch_add(&gpuCachingPointer[gpu], alloc, __ATOMIC_RELAXED);
