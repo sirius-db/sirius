@@ -17,7 +17,8 @@
 #include "gpu_context.hpp"
 #include "duckdb/execution/operator/set/physical_recursive_cte.hpp"
 #include "duckdb/execution/operator/helper/physical_result_collector.hpp"
-#include "fallback_queries.hpp"
+#include "config.hpp"
+#include "fallback.hpp"
 #include "gpu_physical_operator.hpp"
 #include "operator/gpu_physical_result_collector.hpp"
 #include "operator/gpu_physical_hash_join.hpp"
@@ -57,8 +58,13 @@ void GPUExecutor::Initialize(unique_ptr<GPUPhysicalOperator> plan) {
 }
 
 void GPUExecutor::Execute() {
-	check_fallback_queries(gpu_context.gpu_active_query->query);
+	// Check if we should fall back to duckdb execution.
+	if (Config::ENABLE_FALLBACK_CHECK) {
+		FallbackChecker fallback_checker(scheduled);
+		fallback_checker.Check();
+	}
 
+	// Execution starts here.
 	int initial_idx = 0;
 
 	SIRIUS_LOG_DEBUG("Total meta pipelines {}", scheduled.size());

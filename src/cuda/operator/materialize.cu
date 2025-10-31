@@ -131,14 +131,80 @@ __global__ void materialize_offset(uint64_t* offset, uint64_t* result_length, ui
     }
 }
 
-__global__ void materialize_string(uint8_t* data, uint8_t* result, uint64_t* input_offset, uint64_t* materialized_offset, uint64_t* row_ids, size_t num_rows) {
-    size_t tid = threadIdx.x + blockIdx.x * blockDim.x;
-    if(tid < num_rows) {
-        uint64_t copy_row_id = row_ids[tid];
-        uint64_t input_start_idx = input_offset[copy_row_id];
-        uint64_t input_length = input_offset[copy_row_id + 1] - input_offset[copy_row_id];
-        uint64_t output_start_idx = materialized_offset[tid];
-        memcpy(result + output_start_idx, data + input_start_idx, input_length * sizeof(uint8_t));
+__global__ void materialize_string(
+    const uint8_t* __restrict__ data,
+    uint8_t* __restrict__ result,
+    const uint64_t* __restrict__ input_offset,
+    const uint64_t* __restrict__ materialized_offset,
+    const uint64_t* __restrict__ row_ids,
+    size_t num_rows)
+{
+    constexpr int WARP_SIZE = 32;
+    size_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    size_t lane = threadIdx.x % WARP_SIZE;
+    if (warp_id >= num_rows) return;
+
+    uint64_t copy_row_id = row_ids[warp_id];
+    uint64_t input_start_idx = input_offset[copy_row_id];
+    uint64_t input_length = input_offset[copy_row_id + 1] - input_start_idx;
+    uint64_t output_start_idx = materialized_offset[warp_id];
+
+    const uint8_t* __restrict__ src = data + input_start_idx;
+    uint8_t* __restrict__ dst = result + output_start_idx;
+
+    uintptr_t src_addr = reinterpret_cast<uintptr_t>(src);
+    uintptr_t dst_addr = reinterpret_cast<uintptr_t>(dst);
+
+    bool aligned16 = ((src_addr | dst_addr) & 15) == 0;
+    bool aligned8  = ((src_addr | dst_addr) & 7) == 0;
+    bool aligned4  = ((src_addr | dst_addr) & 3) == 0;
+    bool aligned2  = ((src_addr | dst_addr) & 1) == 0;
+
+    // 16-byte vectorized copy
+    if (aligned16 && input_length >= 16) {
+        for (uint64_t i = lane * 16; i + 16 <= input_length; i += WARP_SIZE * 16) {
+            *reinterpret_cast<uint4*>(dst + i) = *reinterpret_cast<const uint4*>(src + i);
+        }
+        uint64_t rem_start = (input_length / 16) * 16;
+        for (uint64_t i = lane + rem_start; i < input_length; i += WARP_SIZE) {
+            dst[i] = src[i];
+        }
+    }
+    // 8-byte path
+    else if (aligned8 && input_length >= 8) {
+        for (uint64_t i = lane * 8; i + 8 <= input_length; i += WARP_SIZE * 8) {
+            *reinterpret_cast<uint64_t*>(dst + i) = *reinterpret_cast<const uint64_t*>(src + i);
+        }
+        uint64_t rem_start = (input_length / 8) * 8;
+        for (uint64_t i = lane + rem_start; i < input_length; i += WARP_SIZE) {
+            dst[i] = src[i];
+        }
+    }
+    // 4-byte path
+    else if (aligned4 && input_length >= 4) {
+        for (uint64_t i = lane * 4; i + 4 <= input_length; i += WARP_SIZE * 4) {
+            *reinterpret_cast<uint32_t*>(dst + i) = *reinterpret_cast<const uint32_t*>(src + i);
+        }
+        uint64_t rem_start = (input_length / 4) * 4;
+        for (uint64_t i = lane + rem_start; i < input_length; i += WARP_SIZE) {
+            dst[i] = src[i];
+        }
+    }
+    // 2-byte path
+    else if (aligned2 && input_length >= 2) {
+        for (uint64_t i = lane * 2; i + 2 <= input_length; i += WARP_SIZE * 2) {
+            *reinterpret_cast<uint16_t*>(dst + i) = *reinterpret_cast<const uint16_t*>(src + i);
+        }
+        uint64_t rem_start = (input_length / 2) * 2;
+        for (uint64_t i = lane + rem_start; i < input_length; i += WARP_SIZE) {
+            dst[i] = src[i];
+        }
+    }
+    // byte-by-byte fallback
+    else {
+        for (uint64_t i = lane; i < input_length; i += WARP_SIZE) {
+            dst[i] = src[i];
+        }
     }
 }
 
@@ -329,6 +395,10 @@ void materializeString(uint8_t* data, uint64_t* offset, uint8_t* &result, uint64
     CHECK_ERROR();
 
     result = gpuBufferManager->customCudaMalloc<uint8_t>(result_bytes[0], 0, 0);
+
+    constexpr int WARP_SIZE = 32;
+    uint64_t warps_per_block = BLOCK_THREADS / WARP_SIZE;
+    num_blocks = std::max<uint64_t>(1, (result_len + warps_per_block - 1) / warps_per_block);
 
     materialize_string<<<num_blocks, BLOCK_THREADS>>>(data, result, offset, result_offset, row_ids, result_len);
     cudaDeviceSynchronize();

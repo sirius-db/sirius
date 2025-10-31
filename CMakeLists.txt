@@ -64,6 +64,7 @@ set(EXTENSION_SOURCES
   src/config.cpp
   src/memory/common.cpp
   src/memory/memory_space.cpp
+  src/fallback.cpp
   src/memory/memory_reservation.cpp
   src/memory/fixed_size_host_memory_resource.cpp
   src/memory/null_device_memory_resource.cpp

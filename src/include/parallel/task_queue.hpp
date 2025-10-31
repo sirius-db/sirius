@@ -26,21 +26,21 @@ namespace parallel {
 /**
  * Interface for concrete task queues for customized scheduling policies.
  */
-class ITaskQueue {
+class itask_queue {
 public:
-  virtual ~ITaskQueue() = default;
+  virtual ~itask_queue() = default;
 
   // Open the queue and start accepting new tasks.
-  virtual void Open() = 0;
+  virtual void open() = 0;
 
   // Close the queue and stop processing new tasks.
-  virtual void Close() = 0;
+  virtual void close() = 0;
 
   // Add a task to the queue.
-  virtual void Push(std::unique_ptr<ITask> task) = 0;
+  virtual void push(std::unique_ptr<itask> task) = 0;
 
   // Pull a task from the queue. Wait until a task available or the queue is closed.
-  virtual std::unique_ptr<ITask> Pull() = 0;
+  virtual std::unique_ptr<itask> pull() = 0;
 };
 
 } // namespace parallel

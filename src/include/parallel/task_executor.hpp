@@ -17,77 +17,66 @@
 #pragma once
 
 #include "task_queue.hpp"
-
-#include <atomic>
-#include <thread>
-#include <vector>
-#include <mutex>
 #include <condition_variable>
+#include "helper/helper.hpp"
 
 namespace sirius {
 namespace parallel {
 
-struct TaskExecutorThread {
-  explicit TaskExecutorThread(std::unique_ptr<std::thread> thread)
-    : internal_thread_(std::move(thread)) {}
+struct task_executor_thread {
+  explicit task_executor_thread(sirius::unique_ptr<std::thread> thread)
+    : _internal_thread(std::move(thread)) {}
 
-  std::unique_ptr<std::thread> internal_thread_;
+  sirius::unique_ptr<std::thread> _internal_thread;
 };
 
-struct TaskExecutorConfig {
+struct task_executor_config {
   int num_threads;
   bool retry_on_error;
 };
 
 /**
- * Interface for a thread pool used by different concrete executors like `GPUPipelineExecutor`, can be
+ * Interface for a thread pool used by different concrete executors like `gpu_pipeline_executor`, can be
  * extended to support various kinds of tasks and scheduling policies.
  */
-class ITaskExecutor {
+class itask_executor {
 public:
-  ITaskExecutor(std::unique_ptr<ITaskQueue> task_queue, TaskExecutorConfig config)
-    : task_queue_(std::move(task_queue)), config_(config), running_(false) {}
+  itask_executor(sirius::unique_ptr<itask_queue> task_queue, task_executor_config config)
+    : _task_queue(std::move(task_queue)), _config(config), _running(false) {}
   
-  virtual ~ITaskExecutor() {
-    Stop();
+  virtual ~itask_executor() {
+    stop();
   }
 
   // Non-copyable and movable
-  ITaskExecutor(const ITaskExecutor&) = delete;
-  ITaskExecutor& operator=(const ITaskExecutor&) = delete;
-  ITaskExecutor(ITaskExecutor&&) = default;
-  ITaskExecutor& operator=(ITaskExecutor&&) = default;
+  itask_executor(const itask_executor&) = delete;
+  itask_executor& operator=(const itask_executor&) = delete;
+  itask_executor(itask_executor&&) = default;
+  itask_executor& operator=(itask_executor&&) = default;
 
   // Start worker threads
-  virtual void Start();
+  virtual void start();
 
   // Stop accepting new tasks, and join worker threads.
-  virtual void Stop();
+  virtual void stop();
 
   // Schedule a task.
-  virtual void Schedule(std::unique_ptr<ITask> task);
+  virtual void schedule(sirius::unique_ptr<itask> task);
 
-  // Wait until all tasks are finished.
-  virtual void Wait();
-
-private:
+protected:
   // Helper functions.
-  virtual void OnStart();
-  virtual void OnStop();
-  virtual void OnTaskError(int worker_id, std::unique_ptr<ITask> task, const std::exception& e);
+  virtual void on_start();
+  virtual void on_stop();
+  virtual void on_task_error(int worker_id, sirius::unique_ptr<itask> task, const std::exception& e);
 
   // Main thread loop.
-  virtual void WorkerLoop(int worker_id);
+  virtual void worker_loop(int worker_id);
 
-private:
-  std::unique_ptr<ITaskQueue> task_queue_;
-  TaskExecutorConfig config_;
-  std::atomic<bool> running_;
-  std::vector<std::unique_ptr<TaskExecutorThread>> threads_;
-  std::atomic<uint64_t> total_tasks_ = 0;
-  std::atomic<uint64_t> finished_tasks_ = 0;
-  std::mutex finish_mutex_;
-  std::condition_variable finish_cv_;
+protected:
+  sirius::unique_ptr<itask_queue> _task_queue;
+  task_executor_config _config;
+  sirius::atomic<bool> _running;
+  sirius::vector<sirius::unique_ptr<task_executor_thread>> _threads;
 };
 
 } // namespace parallel

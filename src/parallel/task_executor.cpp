@@ -19,83 +19,68 @@
 namespace sirius {
 namespace parallel {
 
-void ITaskExecutor::Start() {
+void itask_executor::start() {
   bool expected = false;
-  if (!running_.compare_exchange_strong(expected, true)) {
+  if (!_running.compare_exchange_strong(expected, true)) {
     return;
   }
-  OnStart();
-  threads_.reserve(config_.num_threads);
-  for (int i = 0; i < config_.num_threads; ++i) {
-    threads_.push_back(
-      std::make_unique<TaskExecutorThread>(std::make_unique<std::thread>(&ITaskExecutor::WorkerLoop, this, i)));
+  on_start();
+  _threads.reserve(_config.num_threads);
+  for (int i = 0; i < _config.num_threads; ++i) {
+    _threads.push_back(
+      sirius::make_unique<task_executor_thread>(sirius::make_unique<sirius::thread>(&itask_executor::worker_loop, this, i)));
   }
 }
 
-void ITaskExecutor::Stop() {
+void itask_executor::stop() {
   bool expected = true;
-  if (!running_.compare_exchange_strong(expected, false)) {
+  if (!_running.compare_exchange_strong(expected, false)) {
     return;
   }
-  OnStop();
-  for (auto& thread : threads_) {
-    if (thread->internal_thread_->joinable()) {
-      thread->internal_thread_->join();
+  on_stop();
+  for (auto& thread : _threads) {
+    if (thread->_internal_thread->joinable()) {
+      thread->_internal_thread->join();
     }
   }
-  threads_.clear();
+  _threads.clear();
 }
 
-void ITaskExecutor::Schedule(std::unique_ptr<ITask> task) {
-  task_queue_->Push(std::move(task));
-  total_tasks_.fetch_add(1);
+void itask_executor::schedule(sirius::unique_ptr<itask> task) {
+  _task_queue->push(std::move(task));
 }
 
-void ITaskExecutor::Wait() {
-  std::unique_lock<std::mutex> lock(finish_mutex_);
-  finish_cv_.wait(lock, [&]() {
-    return total_tasks_.load() == finished_tasks_.load();
-  });
+void itask_executor::on_start() {
+  _task_queue->open();
 }
 
-void ITaskExecutor::OnStart() {
-  task_queue_->Open();
+void itask_executor::on_stop() {
+  _task_queue->close();
 }
 
-void ITaskExecutor::OnStop() {
-  task_queue_->Close();
-}
-
-void ITaskExecutor::OnTaskError(int worker_id, std::unique_ptr<ITask> task, const std::exception& e) {
-  if (config_.retry_on_error) {
-    Schedule(std::move(task));
+void itask_executor::on_task_error(int worker_id, sirius::unique_ptr<itask> task, const std::exception& e) {
+  if (_config.retry_on_error) {
+    schedule(std::move(task));
   } else {
-    Stop();
+    stop();
   }
 }
 
-void ITaskExecutor::WorkerLoop(int worker_id) {
+void itask_executor::worker_loop(int worker_id) {
   while (true) {
-    if (!running_.load()) {
+    if (!_running.load()) {
       // Executor is stopped.
       break;
     }
-    auto task = task_queue_->Pull();
+    auto task = _task_queue->pull();
     if (task == nullptr) {
       // Task queue is closed.
       break;
     }
     try {
-      task->Execute();
+      task->execute();
     } catch (const std::exception& e) {
-      OnTaskError(worker_id, std::move(task), e);
-    }
-    {
-      std::unique_lock<std::mutex> lock(finish_mutex_);
-      finished_tasks_.fetch_add(1);
-      if (total_tasks_.load() == finished_tasks_.load()) {
-        finish_cv_.notify_one();
-      }
+      on_task_error(worker_id, std::move(task), e);
     }
   }
 }

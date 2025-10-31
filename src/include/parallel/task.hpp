@@ -16,7 +16,8 @@
 
 #pragma once
 
-#include <memory>
+#include "helper/helper.hpp"
+#include "memory/memory_reservation.hpp"
 
 namespace sirius {
 namespace parallel {
@@ -24,41 +25,65 @@ namespace parallel {
 /**
  * Interface for concrete task local states.
  */
-class ITaskLocalState {
+class itask_local_state {
 public:
-  virtual ~ITaskLocalState() = default;
+  virtual ~itask_local_state() = default;
+
+	template <class TargetType>
+	TargetType &cast() {
+		DynamicCastCheck<TargetType>(this);
+		return reinterpret_cast<TargetType &>(*this);
+	}
+
+	template <class TargetType>
+	const TargetType &cast() const {
+		DynamicCastCheck<TargetType>(this);
+		return reinterpret_cast<const TargetType &>(*this);
+	}
 };
 
 /**
  * Interface for concrete task global states.
  */
-class ITaskGlobalState {
+class itask_global_state {
 public:
-  virtual ~ITaskGlobalState() = default;
+  virtual ~itask_global_state() = default;
+
+  template <class TargetType>
+	TargetType &cast() {
+		DynamicCastCheck<TargetType>(this);
+		return reinterpret_cast<TargetType &>(*this);
+	}
+
+	template <class TargetType>
+	const TargetType &cast() const {
+		DynamicCastCheck<TargetType>(this);
+		return reinterpret_cast<const TargetType &>(*this);
+	}
 };
 
 /**
  * Interface for concrete executor tasks.
  */
-class ITask {
+class itask {
 public:
-  ITask(std::unique_ptr<ITaskLocalState> local_state, std::shared_ptr<ITaskGlobalState> global_state)
-    : local_state_(std::move(local_state)), global_state_(global_state) {}
+  itask(sirius::unique_ptr<itask_local_state> local_state, sirius::shared_ptr<itask_global_state> global_state)
+    : _local_state(std::move(local_state)), _global_state(global_state) {}
 
-  virtual ~ITask() = default;
+  virtual ~itask() = default;
 
   // Non-copyable and movable.
-  ITask(const ITask&) = delete;
-  ITask& operator=(const ITask&) = delete;
-  ITask(ITask&&) = default;
-  ITask& operator=(ITask&&) = default;
+  itask(const itask&) = delete;
+  itask& operator=(const itask&) = delete;
+  itask(itask&&) = default;
+  itask& operator=(itask&&) = default;
 
   // Execution function.
-  virtual void Execute() = 0;
+  virtual void execute() = 0;
 
 protected:
-  std::unique_ptr<ITaskLocalState> local_state_;
-  std::shared_ptr<ITaskGlobalState> global_state_;
+  sirius::unique_ptr<itask_local_state> _local_state;
+  sirius::shared_ptr<itask_global_state> _global_state;
 };
 
 } // namespace parallel
