@@ -27,6 +27,7 @@
 
 // Include existing reservation system
 #include "memory/memory_reservation.hpp"
+#include "memory_reservation.hpp"
 
 namespace sirius {
 namespace memory {
@@ -136,7 +137,7 @@ public:
      * @return true if reservation was successfully set, false otherwise
      */
     bool set_stream_reservation(rmm::cuda_stream_view stream, 
-                               const ReservationRequest& reservation_request, 
+                               const reservation_request& reservation_request, 
                                std::size_t reservation_bytes);
 
     /**
@@ -151,21 +152,21 @@ public:
      * @param stream The CUDA stream to query
      * @return Pointer to the reservation (may be null if no reservation set)
      */
-    const Reservation* get_stream_reservation(rmm::cuda_stream_view stream) const;
+    const reservation* get_stream_reservation(rmm::cuda_stream_view stream) const;
 
     /**
      * @brief Sets the reservation policy for a specific stream.
      * @param stream The CUDA stream to set policy for
      * @param policy The reservation policy to use (takes ownership)
      */
-    void set_stream_policy(rmm::cuda_stream_view stream, std::unique_ptr<ReservationLimitPolicy> policy);
+    void set_stream_policy(rmm::cuda_stream_view stream, std::unique_ptr<reservation_limit_policy> policy);
 
     /**
      * @brief Gets the reservation policy for a specific stream.
      * @param stream The CUDA stream to query
      * @return Reference to the policy (never null)
      */
-    const ReservationLimitPolicy& get_stream_policy(rmm::cuda_stream_view stream) const;
+    const reservation_limit_policy& get_stream_policy(rmm::cuda_stream_view stream) const;
 
     /**
      * @brief Gets the name of the reservation policy for a specific stream.
@@ -178,51 +179,51 @@ public:
      * @brief Sets the default reservation policy for new streams.
      * @param policy The default policy to use (takes ownership)
      */
-    void set_default_policy(std::unique_ptr<ReservationLimitPolicy> policy);
+    void set_default_policy(std::unique_ptr<reservation_limit_policy> policy);
 
     /**
      * @brief Gets the default reservation policy.
      * @return Reference to the default policy
      */
-    const ReservationLimitPolicy& get_default_policy() const;
+    const reservation_limit_policy& get_default_policy() const;
 
 private:
     /**
      * @brief Stream tracking information.
      */
-    struct StreamStats {
+    struct stream_stats {
         std::atomic<std::size_t> allocated_bytes{0};      ///< Current allocated bytes
         std::atomic<std::size_t> peak_allocated_bytes{0}; ///< Peak allocated bytes observed
-        std::unique_ptr<Reservation> reservation;         ///< Stream memory reservation (may be null)
-        std::unique_ptr<ReservationLimitPolicy> policy;        ///< Reservation policy for this stream
+        std::unique_ptr<reservation> stream_memory_reservation;         ///< Stream memory reservation (may be null)
+        std::unique_ptr<reservation_limit_policy> policy;        ///< Reservation policy for this stream
 
-        StreamStats() = default;
-        StreamStats(const StreamStats& other) 
+        stream_stats() = default;
+        stream_stats(const stream_stats& other) 
             : allocated_bytes(other.allocated_bytes.load())
             , peak_allocated_bytes(other.peak_allocated_bytes.load()) {
             // Note: reservation and policy are not copied, will be set separately if needed
         }
         
         // Move constructor
-        StreamStats(StreamStats&& other) noexcept
+        stream_stats(stream_stats&& other) noexcept
             : allocated_bytes(other.allocated_bytes.load())
             , peak_allocated_bytes(other.peak_allocated_bytes.load())
-            , reservation(std::move(other.reservation))
+            , stream_memory_reservation(std::move(other.stream_memory_reservation))
             , policy(std::move(other.policy)) {}
         
         // Move assignment
-        StreamStats& operator=(StreamStats&& other) noexcept {
+        stream_stats& operator=(stream_stats&& other) noexcept {
             if (this != &other) {
                 allocated_bytes.store(other.allocated_bytes.load());
                 peak_allocated_bytes.store(other.peak_allocated_bytes.load());
-                reservation = std::move(other.reservation);
+                stream_memory_reservation = std::move(other.stream_memory_reservation);
                 policy = std::move(other.policy);
             }
             return *this;
         }
         
         // Delete copy assignment since we have unique_ptr
-        StreamStats& operator=(const StreamStats&) = delete;
+        stream_stats& operator=(const stream_stats&) = delete;
     };
 
     /**
@@ -256,33 +257,33 @@ private:
      * @param stream The CUDA stream
      * @return Reference to the stream statistics
      */
-    StreamStats& get_stream_stats(rmm::cuda_stream_view stream);
+    stream_stats& get_stream_stats(rmm::cuda_stream_view stream);
 
     /**
      * @brief Gets stream statistics for the given stream (const version).
      * @param stream The CUDA stream
      * @return Pointer to stream statistics, or nullptr if not found
      */
-    const StreamStats* get_stream_stats_const(rmm::cuda_stream_view stream) const;
+    const stream_stats* get_stream_stats_const(rmm::cuda_stream_view stream) const;
 
     /// The upstream memory resource
-    std::unique_ptr<rmm::mr::device_memory_resource> upstream_;
+    std::unique_ptr<rmm::mr::device_memory_resource> _upstream;
     
     /// Per-stream allocation tracking
-    mutable std::mutex streams_mutex_;
-    std::unordered_map<cudaStream_t, std::unique_ptr<StreamStats>> stream_stats_;
+    mutable std::mutex _streams_mutex;
+    std::unordered_map<cudaStream_t, std::unique_ptr<stream_stats>> _stream_stats;
     
     /// Global totals for efficiency
-    std::atomic<std::size_t> total_allocated_bytes_{0};
-    std::atomic<std::size_t> peak_total_allocated_bytes_{0};
+    std::atomic<std::size_t> _total_allocated_bytes{0};
+    std::atomic<std::size_t> _peak_total_allocated_bytes{0};
     
     /// Default policy for new streams
-    std::unique_ptr<ReservationLimitPolicy> default_policy_;
+    std::unique_ptr<reservation_limit_policy> _default_policy;
     
     /// Helper method to check if allocation would exceed reservation and handle policy
     void check_reservation_and_handle_policy(rmm::cuda_stream_view stream, 
                                            std::size_t requested_bytes,
-                                           StreamStats& stats);
+                                           stream_stats& stats);
 };
 
 } // namespace memory

@@ -20,7 +20,7 @@ namespace sirius {
 namespace memory {
 
 // Helper function to create test allocators for a given tier
-inline std::vector<std::unique_ptr<rmm::mr::device_memory_resource>> createTestAllocators(Tier tier) {
+inline std::vector<std::unique_ptr<rmm::mr::device_memory_resource>> create_test_allocators(Tier tier) {
     std::vector<std::unique_ptr<rmm::mr::device_memory_resource>> allocators;
 
     switch (tier) {

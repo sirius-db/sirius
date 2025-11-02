@@ -49,49 +49,49 @@
 
 using namespace sirius::memory;
 
-// Use shared createTestAllocators from memory_test_common.hpp
+// Use shared create_test_allocators from memory_test_common.hpp
 
 // Helper function to initialize single-device memory manager
 void initializeSingleDeviceMemoryManager() {
-    MemoryReservationManager::reset_for_testing();
-    std::vector<MemoryReservationManager::MemorySpaceConfig> configs;
+    memory_reservation_manager::reset_for_testing();
+    std::vector<memory_reservation_manager::memory_space_config> configs;
     
     // Single GPU device - 2GB
-    configs.emplace_back(Tier::GPU, 0, 2048ull * 1024 * 1024, createTestAllocators(Tier::GPU));  // GPU device 0: 2GB
+    configs.emplace_back(Tier::GPU, 0, 2048ull * 1024 * 1024, create_test_allocators(Tier::GPU));  // GPU device 0: 2GB
     
     // Single HOST NUMA node - 4GB
-    configs.emplace_back(Tier::HOST, 0, 4096ull * 1024 * 1024, createTestAllocators(Tier::HOST)); // HOST NUMA 0: 4GB
+    configs.emplace_back(Tier::HOST, 0, 4096ull * 1024 * 1024, create_test_allocators(Tier::HOST)); // HOST NUMA 0: 4GB
     
     // Single DISK device - 8GB
-    configs.emplace_back(Tier::DISK, 0, 8192ull * 1024 * 1024, createTestAllocators(Tier::DISK)); // DISK path 0: 8GB
+    configs.emplace_back(Tier::DISK, 0, 8192ull * 1024 * 1024, create_test_allocators(Tier::DISK)); // DISK path 0: 8GB
     
-    MemoryReservationManager::initialize(std::move(configs));
+    memory_reservation_manager::initialize(std::move(configs));
 }
 
 // Helper function to initialize multi-device memory manager (for multi-device tests only)
 void initializeMultiDeviceMemoryManager() {
-    MemoryReservationManager::reset_for_testing();
-    std::vector<MemoryReservationManager::MemorySpaceConfig> configs;
+    memory_reservation_manager::reset_for_testing();
+    std::vector<memory_reservation_manager::memory_space_config> configs;
     
     // Multiple GPU devices
-    configs.emplace_back(Tier::GPU, 0, 1024ull * 1024 * 1024, createTestAllocators(Tier::GPU));  // GPU device 0: 1GB
-    configs.emplace_back(Tier::GPU, 1, 1024ull * 1024 * 1024, createTestAllocators(Tier::GPU));  // GPU device 1: 1GB
+    configs.emplace_back(Tier::GPU, 0, 1024ull * 1024 * 1024, create_test_allocators(Tier::GPU));  // GPU device 0: 1GB
+    configs.emplace_back(Tier::GPU, 1, 1024ull * 1024 * 1024, create_test_allocators(Tier::GPU));  // GPU device 1: 1GB
     
     // Multiple HOST NUMA nodes
-    configs.emplace_back(Tier::HOST, 0, 2048ull * 1024 * 1024, createTestAllocators(Tier::HOST)); // HOST NUMA 0: 2GB
-    configs.emplace_back(Tier::HOST, 1, 2048ull * 1024 * 1024, createTestAllocators(Tier::HOST)); // HOST NUMA 1: 2GB
+    configs.emplace_back(Tier::HOST, 0, 2048ull * 1024 * 1024, create_test_allocators(Tier::HOST)); // HOST NUMA 0: 2GB
+    configs.emplace_back(Tier::HOST, 1, 2048ull * 1024 * 1024, create_test_allocators(Tier::HOST)); // HOST NUMA 1: 2GB
     
     // Multiple DISK devices  
-    configs.emplace_back(Tier::DISK, 0, 4096ull * 1024 * 1024, createTestAllocators(Tier::DISK)); // DISK path 0: 4GB
-    configs.emplace_back(Tier::DISK, 1, 4096ull * 1024 * 1024, createTestAllocators(Tier::DISK)); // DISK path 1: 4GB
+    configs.emplace_back(Tier::DISK, 0, 4096ull * 1024 * 1024, create_test_allocators(Tier::DISK)); // DISK path 0: 4GB
+    configs.emplace_back(Tier::DISK, 1, 4096ull * 1024 * 1024, create_test_allocators(Tier::DISK)); // DISK path 1: 4GB
     
-    MemoryReservationManager::initialize(std::move(configs));
+    memory_reservation_manager::initialize(std::move(configs));
 }
 
 // Test single-device memory space access
 TEST_CASE("Single-Device Memory Space Access", "[memory_space]") {
     initializeSingleDeviceMemoryManager();
-    auto& manager = MemoryReservationManager::getInstance();
+    auto& manager = memory_reservation_manager::get_instance();
     
     // Expected memory capacities
     const size_t expected_gpu_capacity = 2048ull * 1024 * 1024;   // 2GB
@@ -100,36 +100,36 @@ TEST_CASE("Single-Device Memory Space Access", "[memory_space]") {
     const size_t expected_device_id = 0; // All devices should have ID 0
     
     // Test single GPU memory space
-    auto gpu_device_0 = manager.getMemorySpace(Tier::GPU, 0);
+    auto gpu_device_0 = manager.get_memory_space(Tier::GPU, 0);
     
     REQUIRE(gpu_device_0 != nullptr);
-    REQUIRE(gpu_device_0->getTier() == Tier::GPU);
-    REQUIRE(gpu_device_0->getDeviceId() == expected_device_id);
-    REQUIRE(gpu_device_0->getMaxMemory() == expected_gpu_capacity);
-    REQUIRE(gpu_device_0->getAvailableMemory() == expected_gpu_capacity);
+    REQUIRE(gpu_device_0->get_tier() == Tier::GPU);
+    REQUIRE(gpu_device_0->get_device_id() == expected_device_id);
+    REQUIRE(gpu_device_0->get_max_memory() == expected_gpu_capacity);
+    REQUIRE(gpu_device_0->get_available_memory() == expected_gpu_capacity);
     
     // Test single HOST memory space (NUMA node)
-    auto host_numa_0 = manager.getMemorySpace(Tier::HOST, 0);
+    auto host_numa_0 = manager.get_memory_space(Tier::HOST, 0);
     
     REQUIRE(host_numa_0 != nullptr);
-    REQUIRE(host_numa_0->getTier() == Tier::HOST);
-    REQUIRE(host_numa_0->getDeviceId() == expected_device_id);
-    REQUIRE(host_numa_0->getMaxMemory() == expected_host_capacity);
-    REQUIRE(host_numa_0->getAvailableMemory() == expected_host_capacity);
+    REQUIRE(host_numa_0->get_tier() == Tier::HOST);
+    REQUIRE(host_numa_0->get_device_id() == expected_device_id);
+    REQUIRE(host_numa_0->get_max_memory() == expected_host_capacity);
+    REQUIRE(host_numa_0->get_available_memory() == expected_host_capacity);
     
     // Test single DISK memory space
-    auto disk_0 = manager.getMemorySpace(Tier::DISK, 0);
+    auto disk_0 = manager.get_memory_space(Tier::DISK, 0);
     
     REQUIRE(disk_0 != nullptr);
-    REQUIRE(disk_0->getTier() == Tier::DISK);
-    REQUIRE(disk_0->getDeviceId() == expected_device_id);
-    REQUIRE(disk_0->getMaxMemory() == expected_disk_capacity);
-    REQUIRE(disk_0->getAvailableMemory() == expected_disk_capacity);
+    REQUIRE(disk_0->get_tier() == Tier::DISK);
+    REQUIRE(disk_0->get_device_id() == expected_device_id);
+    REQUIRE(disk_0->get_max_memory() == expected_disk_capacity);
+    REQUIRE(disk_0->get_available_memory() == expected_disk_capacity);
     
     // Test non-existent devices (only device 0 exists for each tier)
-    REQUIRE(manager.getMemorySpace(Tier::GPU, 1) == nullptr);
-    REQUIRE(manager.getMemorySpace(Tier::HOST, 1) == nullptr);
-    REQUIRE(manager.getMemorySpace(Tier::DISK, 1) == nullptr);
+    REQUIRE(manager.get_memory_space(Tier::GPU, 1) == nullptr);
+    REQUIRE(manager.get_memory_space(Tier::HOST, 1) == nullptr);
+    REQUIRE(manager.get_memory_space(Tier::DISK, 1) == nullptr);
     
     // Verify all memory spaces are different objects
     REQUIRE(gpu_device_0 != host_numa_0);
@@ -140,7 +140,7 @@ TEST_CASE("Single-Device Memory Space Access", "[memory_space]") {
 // Test memory reservations on specific devices
 TEST_CASE("Device-Specific Memory Reservations", "[memory_space]") {
     initializeSingleDeviceMemoryManager();
-    auto& manager = MemoryReservationManager::getInstance();
+    auto& manager = memory_reservation_manager::get_instance();
     
     // Memory size constants
     const size_t gpu_allocation_size = 200ull * 1024 * 1024;    // 200MB
@@ -151,70 +151,70 @@ TEST_CASE("Device-Specific Memory Reservations", "[memory_space]") {
     const size_t host_capacity = 4096ull * 1024 * 1024;         // 4GB
     const size_t disk_capacity = 8192ull * 1024 * 1024;         // 8GB
     
-    auto gpu_device_0 = manager.getMemorySpace(Tier::GPU, 0);
-    auto host_numa_0 = manager.getMemorySpace(Tier::HOST, 0);
-    auto disk_0 = manager.getMemorySpace(Tier::DISK, 0);
+    auto gpu_device_0 = manager.get_memory_space(Tier::GPU, 0);
+    auto host_numa_0 = manager.get_memory_space(Tier::HOST, 0);
+    auto disk_0 = manager.get_memory_space(Tier::DISK, 0);
     
     // Test reservation on GPU device
-    auto gpu_reservation = manager.requestReservation(AnyMemorySpaceInTierWithPreference(Tier::GPU, 0), gpu_allocation_size);
+    auto gpu_reservation = manager.request_reservation(any_memory_space_in_tier_with_preference(Tier::GPU, 0), gpu_allocation_size);
     REQUIRE(gpu_reservation != nullptr);
     REQUIRE(gpu_reservation->tier == Tier::GPU);
     REQUIRE(gpu_reservation->device_id == 0);
     REQUIRE(gpu_reservation->size == gpu_allocation_size);
     
     // Check memory accounting on GPU device
-    REQUIRE(gpu_device_0->getTotalReservedMemory() == gpu_allocation_size);
-    REQUIRE(gpu_device_0->getActiveReservationCount() == 1);
-    REQUIRE(gpu_device_0->getAvailableMemory() == gpu_capacity - gpu_allocation_size);
+    REQUIRE(gpu_device_0->get_total_reserved_memory() == gpu_allocation_size);
+    REQUIRE(gpu_device_0->get_active_reservation_count() == 1);
+    REQUIRE(gpu_device_0->get_available_memory() == gpu_capacity - gpu_allocation_size);
     
     // Check that other devices are unaffected
-    REQUIRE(host_numa_0->getTotalReservedMemory() == 0);
-    REQUIRE(host_numa_0->getActiveReservationCount() == 0);
-    REQUIRE(disk_0->getTotalReservedMemory() == 0);
-    REQUIRE(disk_0->getActiveReservationCount() == 0);
+    REQUIRE(host_numa_0->get_total_reserved_memory() == 0);
+    REQUIRE(host_numa_0->get_active_reservation_count() == 0);
+    REQUIRE(disk_0->get_total_reserved_memory() == 0);
+    REQUIRE(disk_0->get_active_reservation_count() == 0);
     
     // Test reservation on HOST NUMA node
-    auto host_reservation = manager.requestReservation(AnyMemorySpaceInTierWithPreference(Tier::HOST, 0), host_allocation_size);
+    auto host_reservation = manager.request_reservation(any_memory_space_in_tier_with_preference(Tier::HOST, 0), host_allocation_size);
     REQUIRE(host_reservation != nullptr);
     REQUIRE(host_reservation->tier == Tier::HOST);
     REQUIRE(host_reservation->device_id == 0);
     REQUIRE(host_reservation->size == host_allocation_size);
     
     // Check HOST memory accounting
-    REQUIRE(host_numa_0->getTotalReservedMemory() == host_allocation_size);
-    REQUIRE(host_numa_0->getActiveReservationCount() == 1);
-    REQUIRE(host_numa_0->getAvailableMemory() == host_capacity - host_allocation_size);
+    REQUIRE(host_numa_0->get_total_reserved_memory() == host_allocation_size);
+    REQUIRE(host_numa_0->get_active_reservation_count() == 1);
+    REQUIRE(host_numa_0->get_available_memory() == host_capacity - host_allocation_size);
     
     // Test reservation on DISK device
-    auto disk_reservation = manager.requestReservation(AnyMemorySpaceInTierWithPreference(Tier::DISK, 0), disk_allocation_size);
+    auto disk_reservation = manager.request_reservation(any_memory_space_in_tier_with_preference(Tier::DISK, 0), disk_allocation_size);
     REQUIRE(disk_reservation != nullptr);
     REQUIRE(disk_reservation->tier == Tier::DISK);
     REQUIRE(disk_reservation->device_id == 0);
     REQUIRE(disk_reservation->size == disk_allocation_size);
     
     // Clean up
-    manager.releaseReservation(std::move(gpu_reservation));
-    manager.releaseReservation(std::move(host_reservation));
-    manager.releaseReservation(std::move(disk_reservation));
+    manager.release_reservation(std::move(gpu_reservation));
+    manager.release_reservation(std::move(host_reservation));
+    manager.release_reservation(std::move(disk_reservation));
     
     // Verify cleanup
-    REQUIRE(gpu_device_0->getTotalReservedMemory() == 0);
-    REQUIRE(gpu_device_0->getActiveReservationCount() == 0);
-    REQUIRE(gpu_device_0->getAvailableMemory() == gpu_capacity);
+    REQUIRE(gpu_device_0->get_total_reserved_memory() == 0);
+    REQUIRE(gpu_device_0->get_active_reservation_count() == 0);
+    REQUIRE(gpu_device_0->get_available_memory() == gpu_capacity);
     
-    REQUIRE(host_numa_0->getTotalReservedMemory() == 0);
-    REQUIRE(host_numa_0->getActiveReservationCount() == 0);
-    REQUIRE(host_numa_0->getAvailableMemory() == host_capacity);
+    REQUIRE(host_numa_0->get_total_reserved_memory() == 0);
+    REQUIRE(host_numa_0->get_active_reservation_count() == 0);
+    REQUIRE(host_numa_0->get_available_memory() == host_capacity);
     
-    REQUIRE(disk_0->getTotalReservedMemory() == 0);
-    REQUIRE(disk_0->getActiveReservationCount() == 0);
-    REQUIRE(disk_0->getAvailableMemory() == disk_capacity);
+    REQUIRE(disk_0->get_total_reserved_memory() == 0);
+    REQUIRE(disk_0->get_active_reservation_count() == 0);
+    REQUIRE(disk_0->get_available_memory() == disk_capacity);
 }
 
 // Test tier-level aggregated statistics
 TEST_CASE("Tier-Level Aggregated Statistics", "[memory_space]") {
     initializeSingleDeviceMemoryManager();
-    auto& manager = MemoryReservationManager::getInstance();
+    auto& manager = memory_reservation_manager::get_instance();
     
     // Test allocation sizes
     const size_t gpu_test_allocation = 200ull * 1024 * 1024;   // 200MB
@@ -226,82 +226,82 @@ TEST_CASE("Tier-Level Aggregated Statistics", "[memory_space]") {
     const size_t host_total_capacity = 4096ull * 1024 * 1024;  // 4GB
     const size_t disk_total_capacity = 8192ull * 1024 * 1024;  // 8GB
     
-    auto gpu_device_0 = manager.getMemorySpace(Tier::GPU, 0);
-    auto host_numa_0 = manager.getMemorySpace(Tier::HOST, 0);
-    auto disk_0 = manager.getMemorySpace(Tier::DISK, 0);
+    auto gpu_device_0 = manager.get_memory_space(Tier::GPU, 0);
+    auto host_numa_0 = manager.get_memory_space(Tier::HOST, 0);
+    auto disk_0 = manager.get_memory_space(Tier::DISK, 0);
     
     // Make reservations on single devices
-    auto gpu_reservation = manager.requestReservation(AnyMemorySpaceInTierWithPreference(Tier::GPU, 0), gpu_test_allocation);
-    auto host_reservation = manager.requestReservation(AnyMemorySpaceInTierWithPreference(Tier::HOST, 0), host_test_allocation);
-    auto disk_reservation = manager.requestReservation(AnyMemorySpaceInTierWithPreference(Tier::DISK, 0), disk_test_allocation);
+    auto gpu_reservation = manager.request_reservation(any_memory_space_in_tier_with_preference(Tier::GPU, 0), gpu_test_allocation);
+    auto host_reservation = manager.request_reservation(any_memory_space_in_tier_with_preference(Tier::HOST, 0), host_test_allocation);
+    auto disk_reservation = manager.request_reservation(any_memory_space_in_tier_with_preference(Tier::DISK, 0), disk_test_allocation);
     
     // Test GPU tier-level statistics
-    REQUIRE(manager.getTotalReservedMemoryForTier(Tier::GPU) == gpu_test_allocation);
-    REQUIRE(manager.getActiveReservationCountForTier(Tier::GPU) == 1);
-    REQUIRE(manager.getAvailableMemoryForTier(Tier::GPU) == gpu_total_capacity - gpu_test_allocation);
+    REQUIRE(manager.get_total_reserved_memory_for_tier(Tier::GPU) == gpu_test_allocation);
+    REQUIRE(manager.get_active_reservation_count_for_tier(Tier::GPU) == 1);
+    REQUIRE(manager.get_available_memory_for_tier(Tier::GPU) == gpu_total_capacity - gpu_test_allocation);
     
     // Test HOST tier-level statistics
-    REQUIRE(manager.getTotalReservedMemoryForTier(Tier::HOST) == host_test_allocation);
-    REQUIRE(manager.getActiveReservationCountForTier(Tier::HOST) == 1);
-    REQUIRE(manager.getAvailableMemoryForTier(Tier::HOST) == host_total_capacity - host_test_allocation);
+    REQUIRE(manager.get_total_reserved_memory_for_tier(Tier::HOST) == host_test_allocation);
+    REQUIRE(manager.get_active_reservation_count_for_tier(Tier::HOST) == 1);
+    REQUIRE(manager.get_available_memory_for_tier(Tier::HOST) == host_total_capacity - host_test_allocation);
     
     // Test DISK tier-level statistics
-    REQUIRE(manager.getTotalReservedMemoryForTier(Tier::DISK) == disk_test_allocation);
-    REQUIRE(manager.getActiveReservationCountForTier(Tier::DISK) == 1);
-    REQUIRE(manager.getAvailableMemoryForTier(Tier::DISK) == disk_total_capacity - disk_test_allocation);
+    REQUIRE(manager.get_total_reserved_memory_for_tier(Tier::DISK) == disk_test_allocation);
+    REQUIRE(manager.get_active_reservation_count_for_tier(Tier::DISK) == 1);
+    REQUIRE(manager.get_available_memory_for_tier(Tier::DISK) == disk_total_capacity - disk_test_allocation);
     
     // Clean up
-    manager.releaseReservation(std::move(gpu_reservation));
-    manager.releaseReservation(std::move(host_reservation));
-    manager.releaseReservation(std::move(disk_reservation));
+    manager.release_reservation(std::move(gpu_reservation));
+    manager.release_reservation(std::move(host_reservation));
+    manager.release_reservation(std::move(disk_reservation));
     
     // Verify cleanup at tier level
-    REQUIRE(manager.getTotalReservedMemoryForTier(Tier::GPU) == 0);
-    REQUIRE(manager.getActiveReservationCountForTier(Tier::GPU) == 0);
-    REQUIRE(manager.getTotalReservedMemoryForTier(Tier::HOST) == 0);
-    REQUIRE(manager.getActiveReservationCountForTier(Tier::HOST) == 0);
-    REQUIRE(manager.getTotalReservedMemoryForTier(Tier::DISK) == 0);
-    REQUIRE(manager.getActiveReservationCountForTier(Tier::DISK) == 0);
+    REQUIRE(manager.get_total_reserved_memory_for_tier(Tier::GPU) == 0);
+    REQUIRE(manager.get_active_reservation_count_for_tier(Tier::GPU) == 0);
+    REQUIRE(manager.get_total_reserved_memory_for_tier(Tier::HOST) == 0);
+    REQUIRE(manager.get_active_reservation_count_for_tier(Tier::HOST) == 0);
+    REQUIRE(manager.get_total_reserved_memory_for_tier(Tier::DISK) == 0);
+    REQUIRE(manager.get_active_reservation_count_for_tier(Tier::DISK) == 0);
 }
 
 // Test memory space enumeration for tiers
 TEST_CASE("Memory Space Enumeration", "[memory_space]") {
     initializeSingleDeviceMemoryManager();
-    auto& manager = MemoryReservationManager::getInstance();
+    auto& manager = memory_reservation_manager::get_instance();
     
     // Test getting all GPU memory spaces
-    auto gpu_spaces = manager.getMemorySpacesForTier(Tier::GPU);
+    auto gpu_spaces = manager.get_memory_spaces_for_tier(Tier::GPU);
     REQUIRE(gpu_spaces.size() == 1);
     
     // Verify device ID
-    REQUIRE(gpu_spaces[0]->getTier() == Tier::GPU);
-    REQUIRE(gpu_spaces[0]->getDeviceId() == 0);
+    REQUIRE(gpu_spaces[0]->get_tier() == Tier::GPU);
+    REQUIRE(gpu_spaces[0]->get_device_id() == 0);
     
     // Test getting all HOST memory spaces
-    auto host_spaces = manager.getMemorySpacesForTier(Tier::HOST);
+    auto host_spaces = manager.get_memory_spaces_for_tier(Tier::HOST);
     REQUIRE(host_spaces.size() == 1);
     
     // Verify NUMA node ID
-    REQUIRE(host_spaces[0]->getTier() == Tier::HOST);
-    REQUIRE(host_spaces[0]->getDeviceId() == 0);
+    REQUIRE(host_spaces[0]->get_tier() == Tier::HOST);
+    REQUIRE(host_spaces[0]->get_device_id() == 0);
     
     // Test getting all DISK memory spaces
-    auto disk_spaces = manager.getMemorySpacesForTier(Tier::DISK);
+    auto disk_spaces = manager.get_memory_spaces_for_tier(Tier::DISK);
     REQUIRE(disk_spaces.size() == 1);
     
     // Verify disk device ID
-    REQUIRE(disk_spaces[0]->getTier() == Tier::DISK);
-    REQUIRE(disk_spaces[0]->getDeviceId() == 0);
+    REQUIRE(disk_spaces[0]->get_tier() == Tier::DISK);
+    REQUIRE(disk_spaces[0]->get_device_id() == 0);
     
     // Test getting all memory spaces
-    auto all_spaces = manager.getAllMemorySpaces();
+    auto all_spaces = manager.get_all_memory_spaces();
     REQUIRE(all_spaces.size() == 3); // 1 GPU + 1 HOST + 1 DISK
 }
 
 // Test reservation strategies with single devices
 TEST_CASE("Reservation Strategies with Single Devices", "[memory_space]") {
     initializeSingleDeviceMemoryManager();
-    auto& manager = MemoryReservationManager::getInstance();
+    auto& manager = memory_reservation_manager::get_instance();
     
     // Test allocation sizes
     const size_t small_allocation = 25ull * 1024 * 1024;    // 25MB
@@ -309,7 +309,7 @@ TEST_CASE("Reservation Strategies with Single Devices", "[memory_space]") {
     const size_t large_allocation = 100ull * 1024 * 1024;   // 100MB
     
     // Test requesting reservation in any GPU
-    auto gpu_any_reservation = manager.requestReservation(AnyMemorySpaceInTier(Tier::GPU), medium_allocation);
+    auto gpu_any_reservation = manager.request_reservation(any_memory_space_in_tier(Tier::GPU), medium_allocation);
     REQUIRE(gpu_any_reservation != nullptr);
     REQUIRE(gpu_any_reservation->tier == Tier::GPU);
     REQUIRE(gpu_any_reservation->size == medium_allocation);
@@ -319,7 +319,7 @@ TEST_CASE("Reservation Strategies with Single Devices", "[memory_space]") {
     
     // Test requesting reservation across multiple tiers (simulates "anywhere")
     std::vector<Tier> any_tier_preferences = {Tier::GPU, Tier::HOST, Tier::DISK};
-    auto anywhere_reservation = manager.requestReservation(AnyMemorySpaceInTiers(any_tier_preferences), small_allocation);
+    auto anywhere_reservation = manager.request_reservation(any_memory_space_in_tiers(any_tier_preferences), small_allocation);
     REQUIRE(anywhere_reservation != nullptr);
     REQUIRE(anywhere_reservation->size == small_allocation);
     
@@ -329,7 +329,7 @@ TEST_CASE("Reservation Strategies with Single Devices", "[memory_space]") {
     
     // Test specific memory space in tiers list with HOST preference
     std::vector<Tier> tier_preferences = {Tier::HOST, Tier::GPU, Tier::DISK};
-    auto preference_reservation = manager.requestReservation(AnyMemorySpaceInTiers(tier_preferences), large_allocation);
+    auto preference_reservation = manager.request_reservation(any_memory_space_in_tiers(tier_preferences), large_allocation);
     REQUIRE(preference_reservation != nullptr);
     REQUIRE(preference_reservation->size == large_allocation);
     
@@ -337,32 +337,32 @@ TEST_CASE("Reservation Strategies with Single Devices", "[memory_space]") {
     REQUIRE(preference_reservation->tier == Tier::HOST);
     
     // Clean up
-    manager.releaseReservation(std::move(gpu_any_reservation));
-    manager.releaseReservation(std::move(anywhere_reservation));
-    manager.releaseReservation(std::move(preference_reservation));
+    manager.release_reservation(std::move(gpu_any_reservation));
+    manager.release_reservation(std::move(anywhere_reservation));
+    manager.release_reservation(std::move(preference_reservation));
 }
 
 // Test allocator access for multiple devices
 TEST_CASE("Allocator Access Multi-Device", "[memory_space][.multi-device]") {
     initializeMultiDeviceMemoryManager();
-    auto& manager = MemoryReservationManager::getInstance();
+    auto& manager = memory_reservation_manager::get_instance();
     
-    auto gpu_device_0 = manager.getMemorySpace(Tier::GPU, 0);
-    auto gpu_device_1 = manager.getMemorySpace(Tier::GPU, 1);
-    auto host_numa_0 = manager.getMemorySpace(Tier::HOST, 0);
-    auto disk_path_0 = manager.getMemorySpace(Tier::DISK, 0);
+    auto gpu_device_0 = manager.get_memory_space(Tier::GPU, 0);
+    auto gpu_device_1 = manager.get_memory_space(Tier::GPU, 1);
+    auto host_numa_0 = manager.get_memory_space(Tier::HOST, 0);
+    auto disk_path_0 = manager.get_memory_space(Tier::DISK, 0);
     
     // Test that each memory space has exactly one allocator
-    REQUIRE(gpu_device_0->getAllocatorCount() == 1);
-    REQUIRE(gpu_device_1->getAllocatorCount() == 1);
-    REQUIRE(host_numa_0->getAllocatorCount() == 1);
-    REQUIRE(disk_path_0->getAllocatorCount() == 1);
+    REQUIRE(gpu_device_0->get_allocator_count() == 1);
+    REQUIRE(gpu_device_1->get_allocator_count() == 1);
+    REQUIRE(host_numa_0->get_allocator_count() == 1);
+    REQUIRE(disk_path_0->get_allocator_count() == 1);
     
     // Test that we can get default allocators from each device
-    auto gpu_0_allocator = gpu_device_0->getDefaultAllocator();
-    auto gpu_1_allocator = gpu_device_1->getDefaultAllocator();
-    auto host_0_allocator = host_numa_0->getDefaultAllocator();
-    auto disk_0_allocator = disk_path_0->getDefaultAllocator();
+    auto gpu_0_allocator = gpu_device_0->get_default_allocator();
+    auto gpu_1_allocator = gpu_device_1->get_default_allocator();
+    auto host_0_allocator = host_numa_0->get_default_allocator();
+    auto disk_0_allocator = disk_path_0->get_default_allocator();
     
     // Test that allocators are valid (basic smoke test)
     REQUIRE(&gpu_0_allocator != nullptr);
@@ -371,12 +371,12 @@ TEST_CASE("Allocator Access Multi-Device", "[memory_space][.multi-device]") {
     REQUIRE(&disk_0_allocator != nullptr);
     
     // Test getting allocator by index
-    auto gpu_0_allocator_by_index = gpu_device_0->getAllocator(0);
+    auto gpu_0_allocator_by_index = gpu_device_0->get_allocator(0);
     REQUIRE(&gpu_0_allocator_by_index != nullptr);
     
     // Test out of bounds access
-    REQUIRE_THROWS_AS(gpu_device_0->getAllocator(1), std::out_of_range);
-    REQUIRE_THROWS_AS(host_numa_0->getAllocator(100), std::out_of_range);
+    REQUIRE_THROWS_AS(gpu_device_0->get_allocator(1), std::out_of_range);
+    REQUIRE_THROWS_AS(host_numa_0->get_allocator(100), std::out_of_range);
 }
 
 // Helper function to do actual memory work on host memory
@@ -427,10 +427,10 @@ void doGpuMemoryWork(void* gpu_ptr, size_t size, std::atomic<uint64_t>& work_cou
 }
 
 // Unified memory work function that chooses the appropriate method based on memory space tier
-void doMemoryWork(const MemorySpace* memory_space, void* ptr, size_t size, std::atomic<uint64_t>& work_counter) {
+void doMemoryWork(const memory_space* memory_space, void* ptr, size_t size, std::atomic<uint64_t>& work_counter) {
     if (!memory_space || !ptr || size == 0) return;
     
-    if (memory_space->getTier() == Tier::GPU) {
+    if (memory_space->get_tier() == Tier::GPU) {
         doGpuMemoryWork(ptr, size, work_counter);
     } else {
         // HOST and DISK tiers use host memory
@@ -441,10 +441,10 @@ void doMemoryWork(const MemorySpace* memory_space, void* ptr, size_t size, std::
 // Test concurrent allocations with actual memory work
 TEST_CASE("Concurrent Allocations with Real Memory Work", "[memory_space][threading]") {
     initializeSingleDeviceMemoryManager();
-    auto& manager = MemoryReservationManager::getInstance();
+    auto& manager = memory_reservation_manager::get_instance();
     
 
-    auto gpu_device_0 = manager.getMemorySpace(Tier::GPU, 0);
+    auto gpu_device_0 = manager.get_memory_space(Tier::GPU, 0);
     // Memory pressure test constants
     const size_t host_memory_capacity = 4096ull * 1024 * 1024;  // 4GB HOST space capacity
     const size_t thread_allocation_size = 800ull * 1024 * 1024; // 800MB per thread
@@ -474,7 +474,7 @@ TEST_CASE("Concurrent Allocations with Real Memory Work", "[memory_space][thread
                 auto start_time = std::chrono::steady_clock::now();
                 
                 // Make reservation
-                auto reservation = manager.requestReservation(AnyMemorySpaceInTierWithPreference(Tier::GPU, 0), thread_allocation_size);
+                auto reservation = manager.request_reservation(any_memory_space_in_tier_with_preference(Tier::GPU, 0), thread_allocation_size);
                 
                 auto reservation_time = std::chrono::steady_clock::now();
                 auto wait_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -488,7 +488,7 @@ TEST_CASE("Concurrent Allocations with Real Memory Work", "[memory_space][thread
                     successful_allocations.fetch_add(1);
                     
                     // Perform actual memory allocation using the allocator (GPU)
-                    auto allocator = memory_space->getDefaultAllocator();
+                    auto allocator = memory_space->get_default_allocator();
                     void* ptr = allocator.allocate(thread_allocation_size, memory_alignment);
                     
                     if (ptr) {
@@ -500,7 +500,7 @@ TEST_CASE("Concurrent Allocations with Real Memory Work", "[memory_space][thread
                     }
                     
                     // Release reservation
-                    manager.releaseReservation(std::move(reservation));
+                    manager.release_reservation(std::move(reservation));
                 }
             } catch (const std::exception& e) {
                 failed_allocations.fetch_add(1);
@@ -523,8 +523,8 @@ TEST_CASE("Concurrent Allocations with Real Memory Work", "[memory_space][thread
     REQUIRE(blocked_threads.load() >= minimum_expected_blocked_threads);
     
     // Verify memory is properly released
-    REQUIRE(gpu_device_0->getTotalReservedMemory() == 0);
-    REQUIRE(gpu_device_0->getActiveReservationCount() == 0);
+    REQUIRE(gpu_device_0->get_total_reserved_memory() == 0);
+    REQUIRE(gpu_device_0->get_active_reservation_count() == 0);
 }
 
 // Test oversubscription prevention with limited memory
@@ -541,12 +541,12 @@ TEST_CASE("Oversubscription Prevention", "[memory_space][threading]") {
     // Pressure: 20MB requested / 5MB available = 4x oversubscription
     
     // Create a manager with very limited memory
-    std::vector<MemoryReservationManager::MemorySpaceConfig> configs;
-    configs.emplace_back(Tier::HOST, 0, limited_memory_capacity, createTestAllocators(Tier::HOST));
-    MemoryReservationManager::initialize(std::move(configs));
+    std::vector<memory_reservation_manager::memory_space_config> configs;
+    configs.emplace_back(Tier::HOST, 0, limited_memory_capacity, create_test_allocators(Tier::HOST));
+    memory_reservation_manager::initialize(std::move(configs));
     
-    auto& manager = MemoryReservationManager::getInstance();
-    auto host_space = manager.getMemorySpace(Tier::HOST, 0);
+    auto& manager = memory_reservation_manager::get_instance();
+    auto host_space = manager.get_memory_space(Tier::HOST, 0);
     
     const int num_threads = oversubscribing_threads;
     
@@ -563,7 +563,7 @@ TEST_CASE("Oversubscription Prevention", "[memory_space][threading]") {
                 auto start_time = std::chrono::steady_clock::now();
                 
                 // This should block when memory is exhausted
-                auto reservation = manager.requestReservation(AnyMemorySpaceInTierWithPreference(Tier::HOST, 0), per_thread_allocation);
+                auto reservation = manager.request_reservation(any_memory_space_in_tier_with_preference(Tier::HOST, 0), per_thread_allocation);
                 
                 auto allocation_time = std::chrono::steady_clock::now() - start_time;
                 if (allocation_time > std::chrono::milliseconds(blocking_wait_threshold_ms)) {
@@ -573,7 +573,7 @@ TEST_CASE("Oversubscription Prevention", "[memory_space][threading]") {
                 successful_reservations.fetch_add(1);
                 
                 // Perform actual allocation and work
-                auto allocator = host_space->getDefaultAllocator();
+                auto allocator = host_space->get_default_allocator();
                 void* ptr = allocator.allocate(per_thread_allocation, memory_alignment);
                 
                 if (ptr) {
@@ -585,7 +585,7 @@ TEST_CASE("Oversubscription Prevention", "[memory_space][threading]") {
                 // Hold the reservation briefly
                 std::this_thread::sleep_for(std::chrono::milliseconds(contention_hold_time_ms));
                 
-                manager.releaseReservation(std::move(reservation));
+                manager.release_reservation(std::move(reservation));
                 
             } catch (const std::exception& e) {
                 // Allocations should not fail, they should block instead
@@ -610,8 +610,8 @@ TEST_CASE("Oversubscription Prevention", "[memory_space][threading]") {
     REQUIRE(work_counter.load() > 0); // Actual work was performed
     
     // Verify no memory leaks
-    REQUIRE(host_space->getTotalReservedMemory() == 0);
-    REQUIRE(host_space->getActiveReservationCount() == 0);
+    REQUIRE(host_space->get_total_reserved_memory() == 0);
+    REQUIRE(host_space->get_active_reservation_count() == 0);
     
     // Verify that memory was not oversubscribed (4x pressure: 20MB requested vs 5MB available)
     // Since allocations were 2MB each, at most 2-3 concurrent allocations should fit
@@ -622,7 +622,7 @@ TEST_CASE("Oversubscription Prevention", "[memory_space][threading]") {
 // Test memory pressure simulation with reservation strategies
 TEST_CASE("Memory Pressure with Reservation Strategies", "[memory_space][threading]") {
     initializeSingleDeviceMemoryManager();
-    auto& manager = MemoryReservationManager::getInstance();
+    auto& manager = memory_reservation_manager::get_instance();
     
     // Memory pressure test configuration
     const size_t pressure_allocation_size = 1200ull * 1024 * 1024; // 1.2GB per thread
@@ -649,7 +649,7 @@ TEST_CASE("Memory Pressure with Reservation Strategies", "[memory_space][threadi
     // Strategy distribution: some prefer GPU, some HOST, some DISK, some anywhere
     for (int i = 0; i < num_competing_threads; ++i) {
         auto future = std::async(std::launch::async, [&, i]() {
-            std::unique_ptr<Reservation> reservation;
+            std::unique_ptr<reservation> reservation;
             try {
                 int strategy_type = i % 4;
 
@@ -658,21 +658,21 @@ TEST_CASE("Memory Pressure with Reservation Strategies", "[memory_space][threadi
 
                 switch (strategy_type) {
                     case 0: // Prefer GPU
-                        reservation = manager.requestReservation(AnyMemorySpaceInTier(Tier::GPU), pressure_allocation_size);
+                        reservation = manager.request_reservation(any_memory_space_in_tier(Tier::GPU), pressure_allocation_size);
                         if (reservation) tier_gpu_successes.fetch_add(1);
                         break;
                     case 1: // Prefer HOST
-                        reservation = manager.requestReservation(AnyMemorySpaceInTier(Tier::HOST), pressure_allocation_size);
+                        reservation = manager.request_reservation(any_memory_space_in_tier(Tier::HOST), pressure_allocation_size);
                         if (reservation) tier_host_successes.fetch_add(1);
                         break;
                     case 2: // Prefer DISK
-                        reservation = manager.requestReservation(AnyMemorySpaceInTier(Tier::DISK), pressure_allocation_size);
+                        reservation = manager.request_reservation(any_memory_space_in_tier(Tier::DISK), pressure_allocation_size);
                         if (reservation) tier_disk_successes.fetch_add(1);
                         break;
                     case 3: // Anywhere
                         {
                             std::vector<Tier> all_tiers = {Tier::GPU, Tier::HOST, Tier::DISK};
-                            reservation = manager.requestReservation(AnyMemorySpaceInTiers(all_tiers), pressure_allocation_size);
+                            reservation = manager.request_reservation(any_memory_space_in_tiers(all_tiers), pressure_allocation_size);
                         }
                         if (reservation) anywhere_successes.fetch_add(1);
                         break;
@@ -690,14 +690,14 @@ TEST_CASE("Memory Pressure with Reservation Strategies", "[memory_space][threadi
 
                 if (reservation) {
                     // Perform work or simulate hold depending on tier
-                    const MemorySpace* memory_space = manager.getMemorySpace(reservation->tier, reservation->device_id);
+                    const memory_space* mem_space = manager.get_memory_space(reservation->tier, reservation->device_id);
                     if (reservation->tier == Tier::GPU) {
-                        auto allocator = memory_space->getDefaultAllocator();
+                        auto allocator = mem_space->get_default_allocator();
                         void* ptr = allocator.allocate(pressure_allocation_size, memory_alignment);
 
                         if (ptr) {
                             // Do substantial work to prevent optimization
-                            doMemoryWork(memory_space, ptr, pressure_allocation_size, work_done);
+                            doMemoryWork(mem_space, ptr, pressure_allocation_size, work_done);
 
                             // Hold allocation for realistic time
                             std::this_thread::sleep_for(std::chrono::milliseconds(hold_allocation_time_ms));
@@ -712,14 +712,14 @@ TEST_CASE("Memory Pressure with Reservation Strategies", "[memory_space][threadi
                         work_done.fetch_add(1);
                     }
 
-                    manager.releaseReservation(std::move(reservation));
+                    manager.release_reservation(std::move(reservation));
                 }
 
             } catch (const std::exception& e) {
                 // Large allocations might fail on some tiers, that's expected
                 // The system should handle this gracefully
                 if (reservation) {
-                    manager.releaseReservation(std::move(reservation));
+                    manager.release_reservation(std::move(reservation));
                 }
             }
         });
@@ -753,10 +753,10 @@ TEST_CASE("Memory Pressure with Reservation Strategies", "[memory_space][threadi
     REQUIRE(total_blocked.load() >= minimum_expected_blocked);
     
     // Verify system is clean after pressure test
-    auto all_spaces = manager.getAllMemorySpaces();
+    auto all_spaces = manager.get_all_memory_spaces();
     for (const auto* space : all_spaces) {
-        REQUIRE(space->getTotalReservedMemory() == 0);
-        REQUIRE(space->getActiveReservationCount() == 0);
+        REQUIRE(space->get_total_reserved_memory() == 0);
+        REQUIRE(space->get_active_reservation_count() == 0);
     }
     
     // The DISK tier should have handled most of the large allocations
@@ -767,10 +767,10 @@ TEST_CASE("Memory Pressure with Reservation Strategies", "[memory_space][threadi
 // Test GPU vs Host memory work to verify CUDA kernels are used
 TEST_CASE("GPU vs Host Memory Work Verification", "[memory_space][threading][gpu]") {
     initializeSingleDeviceMemoryManager();
-    auto& manager = MemoryReservationManager::getInstance();
+    auto& manager = memory_reservation_manager::get_instance();
     
-    auto gpu_space = manager.getMemorySpace(Tier::GPU, 0);
-    auto host_space = manager.getMemorySpace(Tier::HOST, 0);
+    auto gpu_space = manager.get_memory_space(Tier::GPU, 0);
+    auto host_space = manager.get_memory_space(Tier::HOST, 0);
     
     const size_t allocation_size = 4ull * 1024 * 1024; // 4MB
     
@@ -782,10 +782,10 @@ TEST_CASE("GPU vs Host Memory Work Verification", "[memory_space][threading][gpu
     // Thread for GPU work
     std::thread gpu_thread([&]() {
         try {
-            auto reservation = manager.requestReservation(AnyMemorySpaceInTierWithPreference(Tier::GPU, 0), allocation_size);
+            auto reservation = manager.request_reservation(any_memory_space_in_tier_with_preference(Tier::GPU, 0), allocation_size);
             REQUIRE(reservation != nullptr);
             
-            auto allocator = gpu_space->getDefaultAllocator();
+            auto allocator = gpu_space->get_default_allocator();
             void* gpu_ptr = allocator.allocate(allocation_size, 64);
             
             if (gpu_ptr) {
@@ -802,7 +802,7 @@ TEST_CASE("GPU vs Host Memory Work Verification", "[memory_space][threading][gpu
                 allocator.deallocate(gpu_ptr, allocation_size, 64);
             }
             
-            manager.releaseReservation(std::move(reservation));
+            manager.release_reservation(std::move(reservation));
             gpu_work_completed = true;
             
         } catch (const std::exception& e) {
@@ -813,10 +813,10 @@ TEST_CASE("GPU vs Host Memory Work Verification", "[memory_space][threading][gpu
     // Thread for Host work
     std::thread host_thread([&]() {
         try {
-            auto reservation = manager.requestReservation(AnyMemorySpaceInTierWithPreference(Tier::HOST, 0), allocation_size);
+            auto reservation = manager.request_reservation(any_memory_space_in_tier_with_preference(Tier::HOST, 0), allocation_size);
             REQUIRE(reservation != nullptr);
             
-            auto allocator = host_space->getDefaultAllocator();
+            auto allocator = host_space->get_default_allocator();
             void* host_ptr = allocator.allocate(allocation_size, 64);
             
             if (host_ptr) {
@@ -833,7 +833,7 @@ TEST_CASE("GPU vs Host Memory Work Verification", "[memory_space][threading][gpu
                 allocator.deallocate(host_ptr, allocation_size, 64);
             }
             
-            manager.releaseReservation(std::move(reservation));
+            manager.release_reservation(std::move(reservation));
             host_work_completed = true;
             
         } catch (const std::exception& e) {
@@ -860,8 +860,8 @@ TEST_CASE("GPU vs Host Memory Work Verification", "[memory_space][threading][gpu
     REQUIRE(gpu_work_result.load() != host_work_result.load());
     
     // Verify cleanup
-    REQUIRE(gpu_space->getTotalReservedMemory() == 0);
-    REQUIRE(host_space->getTotalReservedMemory() == 0);
-    REQUIRE(gpu_space->getActiveReservationCount() == 0);
-    REQUIRE(host_space->getActiveReservationCount() == 0);
+    REQUIRE(gpu_space->get_total_reserved_memory() == 0);
+    REQUIRE(host_space->get_total_reserved_memory() == 0);
+    REQUIRE(gpu_space->get_active_reservation_count() == 0);
+    REQUIRE(host_space->get_active_reservation_count() == 0);
 }

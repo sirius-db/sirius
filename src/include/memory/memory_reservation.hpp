@@ -37,8 +37,8 @@ namespace sirius {
 namespace memory {
 
 // Forward declarations
-class MemoryReservationManager;
-struct Reservation;
+class memory_reservation_manager;
+struct reservation;
 
 //===----------------------------------------------------------------------===//
 // Reservation Limit Policy Interface
@@ -50,9 +50,9 @@ struct Reservation;
  * Reservation limit policies are pluggable strategies that determine what happens when an allocation
  * would cause a stream's memory usage to exceed its reservation limit.
  */
-class ReservationLimitPolicy {
+class reservation_limit_policy {
 public:
-    virtual ~ReservationLimitPolicy() = default;
+    virtual ~reservation_limit_policy() = default;
 
     /**
      * @brief Handle an allocation that would exceed the stream's reservation.
@@ -74,7 +74,7 @@ public:
         rmm::cuda_stream_view stream,
         std::size_t current_allocated,
         std::size_t requested_bytes,
-        Reservation* reservation) = 0;
+        reservation* reservation) = 0;
 
     /**
      * @brief Get a human-readable name for this policy.
@@ -89,13 +89,13 @@ public:
  * This policy simply ignores reservation limits and allows all allocations to proceed.
  * It's useful for soft reservations where you want to track usage but not enforce limits.
  */
-class IgnoreReservationLimitPolicy : public ReservationLimitPolicy {
+class ignore_reservation_limit_policy : public reservation_limit_policy {
 public:
     void handle_over_reservation(
         rmm::cuda_stream_view stream,
         std::size_t current_allocated,
         std::size_t requested_bytes,
-        Reservation* reservation) override {
+        reservation* reservation) override {
         // Do nothing - allow the allocation to proceed
     }
 
@@ -110,13 +110,13 @@ public:
  * This policy enforces strict reservation limits by throwing rmm::out_of_memory
  * when an allocation would exceed the stream's reservation.
  */
-class FailReservationLimitPolicy : public ReservationLimitPolicy {
+class fail_reservation_limit_policy : public reservation_limit_policy {
 public:
     void handle_over_reservation(
         rmm::cuda_stream_view stream,
         std::size_t current_allocated,
         std::size_t requested_bytes,
-        Reservation* reservation) override;
+        reservation* reservation) override;
 
     std::string get_policy_name() const override {
         return "fail";
@@ -129,7 +129,7 @@ public:
  * This policy automatically increases the stream's reservation when an allocation would
  * exceed the current limit. It uses a padding factor to avoid frequent reservation increases.
  */
-class IncreaseReservationLimitPolicy : public ReservationLimitPolicy {
+class increase_reservation_limit_policy : public reservation_limit_policy {
 public:
     /**
      * @brief Constructs an increase policy with the specified padding factor.
@@ -137,8 +137,8 @@ public:
      * @param padding_factor Factor by which to pad reservation increases (default 1.5)
      *                      For example, 1.5 means increase by 50% more than needed
      */
-     explicit IncreaseReservationLimitPolicy(double padding_factor = 2.0d)
-        : padding_factor_(padding_factor) {
+     explicit increase_reservation_limit_policy(double padding_factor = 2.0d)
+        : _padding_factor(padding_factor) {
         if (padding_factor < 1.0) {
             throw std::invalid_argument("Padding factor must be >= 1.0");
         }
@@ -148,20 +148,20 @@ public:
         rmm::cuda_stream_view stream,
         std::size_t current_allocated,
         std::size_t requested_bytes,
-        Reservation* reservation) override;
+        reservation* reservation) override;
 
     std::string get_policy_name() const override {
-        return "increase(padding=" + std::to_string(padding_factor_) + ")";
+        return "increase(padding=" + std::to_string(_padding_factor) + ")";
     }
 
     /**
      * @brief Get the padding factor used by this policy.
      * @return The padding factor
      */
-    double get_padding_factor() const { return padding_factor_; }
+    double get_padding_factor() const { return _padding_factor; }
 
 private:
-    double padding_factor_;
+    double _padding_factor;
 };
 
 //===----------------------------------------------------------------------===//
@@ -172,29 +172,29 @@ private:
  * Request reservation in any memory space within a tier, with optional device preference.
  * If preferred_device_id is specified, that device will be tried first.
  */
-struct AnyMemorySpaceInTierWithPreference {
+struct any_memory_space_in_tier_with_preference {
     Tier tier;
     std::optional<size_t> preferred_device_id; // Optional preferred device within tier
     
-    explicit AnyMemorySpaceInTierWithPreference(Tier t, std::optional<size_t> device_id = std::nullopt) 
+    explicit any_memory_space_in_tier_with_preference(Tier t, std::optional<size_t> device_id = std::nullopt) 
         : tier(t), preferred_device_id(device_id) {}
 };
 
 /**
  * Request reservation in any memory space within a specific tier.
  */
-struct AnyMemorySpaceInTier {
+struct any_memory_space_in_tier {
     Tier tier;
-    explicit AnyMemorySpaceInTier(Tier t) : tier(t) {}
+    explicit any_memory_space_in_tier(Tier t) : tier(t) {}
 };
 
 /**
  * Request reservation in memory spaces across multiple tiers, ordered by preference.
  * The first available tier in the list will be selected.
  */
-struct AnyMemorySpaceInTiers {
+struct any_memory_space_in_tiers {
     std::vector<Tier> tiers; // Ordered by preference
-    explicit AnyMemorySpaceInTiers(std::vector<Tier> t) : tiers(std::move(t)) {}
+    explicit any_memory_space_in_tiers(std::vector<Tier> t) : tiers(std::move(t)) {}
 };
 
 /**
@@ -204,10 +204,10 @@ struct AnyMemorySpaceInTiers {
  * 2. Any device in a specific tier 
  * 3. Any device across multiple tiers (ordered by preference)
  */
-using ReservationRequest = std::variant<
-    AnyMemorySpaceInTierWithPreference,
-    AnyMemorySpaceInTier, 
-    AnyMemorySpaceInTiers
+using reservation_request = std::variant<
+    any_memory_space_in_tier_with_preference,
+    any_memory_space_in_tier, 
+    any_memory_space_in_tiers
 >;
 
 //===----------------------------------------------------------------------===//
@@ -217,14 +217,14 @@ using ReservationRequest = std::variant<
 /**
  * Represents a memory reservation in a specific memory space.
  * Contains only the essential identifying information (tier, device_id, size).
- * The actual MemorySpace can be obtained through the MemoryReservationManager.
+ * The actual memory_space can be obtained through the memory_reservation_manager.
  */
-struct Reservation {
+struct reservation {
     Tier tier;
     size_t device_id;
     size_t size;
     
-    Reservation(Tier t, size_t dev_id, size_t s);
+    reservation(Tier t, size_t dev_id, size_t s);
     
     
     //===----------------------------------------------------------------------===//
@@ -259,17 +259,17 @@ struct Reservation {
      */
     bool shrink_by(size_t bytes_to_remove);
     
-    // Disable copy/move to prevent issues with MemorySpace tracking
-    Reservation(const Reservation&) = delete;
-    Reservation& operator=(const Reservation&) = delete;
-    Reservation(Reservation&&) = delete;
-    Reservation& operator=(Reservation&&) = delete;
+    // Disable copy/move to prevent issues with memory_space tracking
+    reservation(const reservation&) = delete;
+    reservation& operator=(const reservation&) = delete;
+    reservation(reservation&&) = delete;
+    reservation& operator=(reservation&&) = delete;
     
-    ~Reservation() = default;
+    ~reservation() = default;
 };
 
 //===----------------------------------------------------------------------===//
-// MemoryReservationManager
+// memory_reservation_manager
 //===----------------------------------------------------------------------===//
 
 /**
@@ -277,40 +277,40 @@ struct Reservation {
  * Implements singleton pattern and coordinates reservation requests using
  * different strategies (specific space, tier-based, multi-tier fallback).
  */
-class MemoryReservationManager {
+class memory_reservation_manager {
 public:
     //===----------------------------------------------------------------------===//
     // Configuration and Initialization
     //===----------------------------------------------------------------------===//
     
     /**
-     * Configuration for a single MemorySpace.
-     * Contains all parameters needed to create a MemorySpace instance.
+     * Configuration for a single memory_space.
+     * Contains all parameters needed to create a memory_space instance.
      */
-    struct MemorySpaceConfig {
+    struct memory_space_config {
         Tier tier;
         size_t device_id;
         size_t memory_limit;
         std::vector<std::unique_ptr<rmm::mr::device_memory_resource>> allocators;
         
         // Constructor - allocators must be explicitly provided
-        MemorySpaceConfig(Tier t, size_t dev_id, size_t mem_limit, 
+        memory_space_config(Tier t, size_t dev_id, size_t mem_limit, 
                          std::vector<std::unique_ptr<rmm::mr::device_memory_resource>> allocs);
         
         // Move constructor
-        MemorySpaceConfig(MemorySpaceConfig&&) = default;
-        MemorySpaceConfig& operator=(MemorySpaceConfig&&) = default;
+        memory_space_config(memory_space_config&&) = default;
+        memory_space_config& operator=(memory_space_config&&) = default;
         
         // Delete copy constructor/assignment since allocators contain unique_ptr
-        MemorySpaceConfig(const MemorySpaceConfig&) = delete;
-        MemorySpaceConfig& operator=(const MemorySpaceConfig&) = delete;
+        memory_space_config(const memory_space_config&) = delete;
+        memory_space_config& operator=(const memory_space_config&) = delete;
     };
     
     /**
      * Initialize the singleton instance with the given memory space configurations.
-     * Must be called before getInstance() can be used.
+     * Must be called before get_instance() can be used.
      */
-    static void initialize(std::vector<MemorySpaceConfig> configs);
+    static void initialize(std::vector<memory_space_config> configs);
     
     /**
      * Test-only: Reset the singleton so tests can reinitialize with different configs.
@@ -322,16 +322,16 @@ public:
      * Get the singleton instance. 
      * Throws if initialize() has not been called first.
      */
-    static MemoryReservationManager& getInstance();
+    static memory_reservation_manager& get_instance();
     
     // Disable copy/move for singleton
-    MemoryReservationManager(const MemoryReservationManager&) = delete;
-    MemoryReservationManager& operator=(const MemoryReservationManager&) = delete;
-    MemoryReservationManager(MemoryReservationManager&&) = delete;
-    MemoryReservationManager& operator=(MemoryReservationManager&&) = delete;
+    memory_reservation_manager(const memory_reservation_manager&) = delete;
+    memory_reservation_manager& operator=(const memory_reservation_manager&) = delete;
+    memory_reservation_manager(memory_reservation_manager&&) = delete;
+    memory_reservation_manager& operator=(memory_reservation_manager&&) = delete;
     
     // Public destructor (required for std::unique_ptr)
-    ~MemoryReservationManager() = default;
+    ~memory_reservation_manager() = default;
     
     //===----------------------------------------------------------------------===//
     // Reservation Interface
@@ -339,9 +339,9 @@ public:
     
     /**
      * Main reservation interface using strategy pattern.
-     * Supports different reservation strategies through the ReservationRequest variant.
+     * Supports different reservation strategies through the reservation_request variant.
      */
-    std::unique_ptr<Reservation> requestReservation(const ReservationRequest& request, size_t size);
+    std::unique_ptr<reservation> request_reservation(const reservation_request& request, size_t size);
     
     
     //===----------------------------------------------------------------------===//
@@ -350,85 +350,85 @@ public:
     
     /**
      * Release a reservation, making its memory available for other requests.
-     * Looks up the appropriate MemorySpace using the reservation's tier and device_id.
+     * Looks up the appropriate memory_space using the reservation's tier and device_id.
      */
-    void releaseReservation(std::unique_ptr<Reservation> reservation);
+    void release_reservation(std::unique_ptr<reservation> reservation);
     
     /**
      * Attempt to shrink an existing reservation to a smaller size.
      * Returns true if successful, false otherwise.
      */
-    bool shrinkReservation(Reservation* reservation, size_t new_size);
+    bool shrink_reservation(reservation* reservation, size_t new_size);
     
     /**
      * Attempt to grow an existing reservation to a larger size.
      * Returns true if successful, false if insufficient memory available.
      */
-    bool growReservation(Reservation* reservation, size_t new_size);
+    bool grow_reservation(reservation* reservation, size_t new_size);
     
     //===----------------------------------------------------------------------===//
-    // MemorySpace Access and Queries
+    // memory_space Access and Queries
     //===----------------------------------------------------------------------===//
     
     /**
-     * Get a specific MemorySpace by tier and device ID.
+     * Get a specific memory_space by tier and device ID.
      * Returns nullptr if no such space exists.
      */
-    const MemorySpace* getMemorySpace(Tier tier, size_t device_id) const;
+    const memory_space* get_memory_space(Tier tier, size_t device_id) const;
     
     /**
-     * Get all MemorySpaces for a specific tier.
+     * Get all memory_spaces for a specific tier.
      * Returns empty vector if no spaces exist for that tier.
      */
-    std::vector<const MemorySpace*> getMemorySpacesForTier(Tier tier) const;
+    std::vector<const memory_space*> get_memory_spaces_for_tier(Tier tier) const;
     
     /**
-     * Get all MemorySpaces managed by this instance.
+     * Get all memory_spaces managed by this instance.
      */
-    std::vector<const MemorySpace*> getAllMemorySpaces() const;
+    std::vector<const memory_space*> get_all_memory_spaces() const;
     
     //===----------------------------------------------------------------------===//
     // Aggregated Queries
     //===----------------------------------------------------------------------===//
     
     // Tier-level aggregations
-    size_t getAvailableMemoryForTier(Tier tier) const;
-    size_t getTotalReservedMemoryForTier(Tier tier) const;
-    size_t getActiveReservationCountForTier(Tier tier) const;
+    size_t get_available_memory_for_tier(Tier tier) const;
+    size_t get_total_reserved_memory_for_tier(Tier tier) const;
+    size_t get_active_reservation_count_for_tier(Tier tier) const;
     
     // System-wide aggregations
-    size_t getTotalAvailableMemory() const;
-    size_t getTotalReservedMemory() const;
-    size_t getActiveReservationCount() const;
+    size_t get_total_available_memory() const;
+    size_t get_total_reserved_memory() const;
+    size_t get_active_reservation_count() const;
 
 private:
     /**
-     * Private constructor - use initialize() and getInstance() instead.
+     * Private constructor - use initialize() and get_instance() instead.
      */
-    explicit MemoryReservationManager(std::vector<MemorySpaceConfig> configs);
+    explicit memory_reservation_manager(std::vector<memory_space_config> configs);
 
     // Singleton state
-    static std::unique_ptr<MemoryReservationManager> instance_;
-    static std::once_flag initialized_;
-    static bool allow_reinitialize_for_tests_;
+    static std::unique_ptr<memory_reservation_manager> _instance;
+    static std::once_flag _initialized;
+    static bool _allow_reinitialize_for_tests;
     
-    // Storage for MemorySpace instances (owned by the manager)
-    std::vector<std::unique_ptr<MemorySpace>> memory_spaces_;
+    // Storage for memory_space instances (owned by the manager)
+    std::vector<std::unique_ptr<memory_space>> _memory_spaces;
     
     // Fast lookups
-    std::unordered_map<std::pair<Tier, size_t>, const MemorySpace*, 
-                      std::hash<std::pair<Tier, size_t>>> memory_space_lookup_;
-    std::unordered_map<Tier, std::vector<const MemorySpace*>> tier_to_memory_spaces_;
+    std::unordered_map<std::pair<Tier, size_t>, const memory_space*, 
+                      std::hash<std::pair<Tier, size_t>>> _memory_space_lookup;
+    std::unordered_map<Tier, std::vector<const memory_space*>> _tier_to_memory_spaces;
     
     // Helper method: attempts to select a space and immediately make a reservation
     // Returns a reservation when successful, or std::nullopt if none can satisfy the request
-    std::optional<std::unique_ptr<Reservation>> selectMemorySpaceAndMakeReservation(const ReservationRequest& request, size_t size) const;
+    std::optional<std::unique_ptr<reservation>> select_memory_space_and_make_reservation(const reservation_request& request, size_t size) const;
     
-    void buildLookupTables();
+    void build_lookup_tables();
 
-    // Synchronization for cross-space waiting when no MemorySpace can currently satisfy a request
-    mutable std::mutex wait_mutex_;
-    std::condition_variable wait_cv_;
+    // Synchronization for cross-space waiting when no memory_space can currently satisfy a request
+    mutable std::mutex _wait_mutex;
+    std::condition_variable _wait_cv;
 };
 
 } // namespace memory

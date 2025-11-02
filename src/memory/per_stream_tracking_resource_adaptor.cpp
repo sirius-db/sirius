@@ -23,13 +23,13 @@ namespace memory {
 
 per_stream_tracking_resource_adaptor::per_stream_tracking_resource_adaptor(
     std::unique_ptr<rmm::mr::device_memory_resource> upstream)
-    : upstream_(std::move(upstream)) {
+    : _upstream(std::move(upstream)) {
     
-    RMM_EXPECTS(upstream_ != nullptr, "Upstream resource cannot be null");
+    RMM_EXPECTS(_upstream != nullptr, "Upstream resource cannot be null");
 }
 
 rmm::mr::device_memory_resource& per_stream_tracking_resource_adaptor::get_upstream_resource() const noexcept {
-    return *upstream_;
+    return *_upstream;
 }
 
 std::size_t per_stream_tracking_resource_adaptor::get_allocated_bytes(rmm::cuda_stream_view stream) const {
@@ -43,40 +43,40 @@ std::size_t per_stream_tracking_resource_adaptor::get_peak_allocated_bytes(rmm::
 }
 
 std::size_t per_stream_tracking_resource_adaptor::get_total_allocated_bytes() const {
-    return total_allocated_bytes_.load();
+    return _total_allocated_bytes.load();
 }
 
 std::size_t per_stream_tracking_resource_adaptor::get_peak_total_allocated_bytes() const {
-    return peak_total_allocated_bytes_.load();
+    return _peak_total_allocated_bytes.load();
 }
 
 void per_stream_tracking_resource_adaptor::reset_peak_allocated_bytes(rmm::cuda_stream_view stream) {
-    std::lock_guard<std::mutex> lock(streams_mutex_);
+    std::lock_guard<std::mutex> lock(_streams_mutex);
     
-    auto it = stream_stats_.find(stream.value());
-    if (it != stream_stats_.end()) {
+    auto it = _stream_stats.find(stream.value());
+    if (it != _stream_stats.end()) {
         it->second->peak_allocated_bytes.store(0);
     }
 }
 
 void per_stream_tracking_resource_adaptor::reset_all_peak_allocated_bytes() {
-    std::lock_guard<std::mutex> lock(streams_mutex_);
+    std::lock_guard<std::mutex> lock(_streams_mutex);
     
-    for (auto& [stream_id, stats] : stream_stats_) {
+    for (auto& [stream_id, stats] : _stream_stats) {
         stats->peak_allocated_bytes.store(0);
     }
     
     // Also reset the global peak
-    peak_total_allocated_bytes_.store(0);
+    _peak_total_allocated_bytes.store(0);
 }
 
 std::vector<rmm::cuda_stream_view> per_stream_tracking_resource_adaptor::get_tracked_streams() const {
-    std::lock_guard<std::mutex> lock(streams_mutex_);
+    std::lock_guard<std::mutex> lock(_streams_mutex);
     
     std::vector<rmm::cuda_stream_view> streams;
-    streams.reserve(stream_stats_.size());
+    streams.reserve(_stream_stats.size());
     
-    for (const auto& [stream_id, stats] : stream_stats_) {
+    for (const auto& [stream_id, stats] : _stream_stats) {
         streams.emplace_back(rmm::cuda_stream_view{stream_id});
     }
     
@@ -84,13 +84,13 @@ std::vector<rmm::cuda_stream_view> per_stream_tracking_resource_adaptor::get_tra
 }
 
 bool per_stream_tracking_resource_adaptor::is_stream_tracked(rmm::cuda_stream_view stream) const {
-    std::lock_guard<std::mutex> lock(streams_mutex_);
-    return stream_stats_.find(stream.value()) != stream_stats_.end();
+    std::lock_guard<std::mutex> lock(_streams_mutex);
+    return _stream_stats.find(stream.value()) != _stream_stats.end();
 }
 
 void* per_stream_tracking_resource_adaptor::do_allocate(std::size_t bytes, rmm::cuda_stream_view stream) {
     // Perform the upstream allocation first
-    void* ptr = upstream_->allocate(bytes, stream);
+    void* ptr = _upstream->allocate(bytes, stream);
     
     try {
         // Update stream-specific tracking
@@ -106,19 +106,19 @@ void* per_stream_tracking_resource_adaptor::do_allocate(std::size_t bytes, rmm::
         }
         
         // Update global totals
-        std::size_t new_total = total_allocated_bytes_.fetch_add(bytes) + bytes;
+        std::size_t new_total = _total_allocated_bytes.fetch_add(bytes) + bytes;
         
         // Update global peak if this is a new peak
-        std::size_t current_peak = peak_total_allocated_bytes_.load();
-        while (new_total > current_peak) {
-            if (peak_total_allocated_bytes_.compare_exchange_weak(current_peak, new_total)) {
+        std::size_t current_peak_total = _peak_total_allocated_bytes.load();
+        while (new_total > current_peak_total) {
+            if (_peak_total_allocated_bytes.compare_exchange_weak(current_peak_total, new_total)) {
                 break;
             }
         }
         
     } catch (...) {
         // If tracking fails, deallocate the upstream allocation to maintain consistency
-        upstream_->deallocate(ptr, bytes, stream);
+        _upstream->deallocate(ptr, bytes, stream);
         throw;
     }
     
@@ -127,7 +127,7 @@ void* per_stream_tracking_resource_adaptor::do_allocate(std::size_t bytes, rmm::
 
 void per_stream_tracking_resource_adaptor::do_deallocate(void* ptr, std::size_t bytes, rmm::cuda_stream_view stream) noexcept {
     // Deallocate from upstream first
-    upstream_->deallocate(ptr, bytes, stream);
+    _upstream->deallocate(ptr, bytes, stream);
     
     // Update stream-specific tracking
     auto& stats = get_stream_stats(stream);
@@ -145,7 +145,7 @@ void per_stream_tracking_resource_adaptor::do_deallocate(void* ptr, std::size_t 
     } while (!stats.allocated_bytes.compare_exchange_weak(current_allocated, new_allocated));
     
     // Update global total (with similar protection against negative values)
-    std::size_t current_total = total_allocated_bytes_.load();
+    std::size_t current_total = _total_allocated_bytes.load();
     std::size_t new_total;
     
     do {
@@ -154,7 +154,7 @@ void per_stream_tracking_resource_adaptor::do_deallocate(void* ptr, std::size_t 
         } else {
             new_total = current_total - bytes;
         }
-    } while (!total_allocated_bytes_.compare_exchange_weak(current_total, new_total));
+    } while (!_total_allocated_bytes.compare_exchange_weak(current_total, new_total));
 }
 
 bool per_stream_tracking_resource_adaptor::do_is_equal(const rmm::mr::device_memory_resource& other) const noexcept {
@@ -165,31 +165,31 @@ bool per_stream_tracking_resource_adaptor::do_is_equal(const rmm::mr::device_mem
     }
     
     // Check if the upstream resources are equal
-    return upstream_->is_equal(other_adaptor->get_upstream_resource());
+    return _upstream->is_equal(other_adaptor->get_upstream_resource());
 }
 
-per_stream_tracking_resource_adaptor::StreamStats& 
+per_stream_tracking_resource_adaptor::stream_stats& 
 per_stream_tracking_resource_adaptor::get_stream_stats(rmm::cuda_stream_view stream) {
-    std::lock_guard<std::mutex> lock(streams_mutex_);
+    std::lock_guard<std::mutex> lock(_streams_mutex);
     
-    auto it = stream_stats_.find(stream.value());
-    if (it == stream_stats_.end()) {
+    auto it = _stream_stats.find(stream.value());
+    if (it == _stream_stats.end()) {
         // Create new stats for this stream
-        auto stats = std::make_unique<StreamStats>();
+        auto stats = std::make_unique<stream_stats>();
         auto* stats_ptr = stats.get();
-        stream_stats_[stream.value()] = std::move(stats);
+        _stream_stats[stream.value()] = std::move(stats);
         return *stats_ptr;
     }
     
     return *it->second;
 }
 
-const per_stream_tracking_resource_adaptor::StreamStats* 
+const per_stream_tracking_resource_adaptor::stream_stats* 
 per_stream_tracking_resource_adaptor::get_stream_stats_const(rmm::cuda_stream_view stream) const {
-    std::lock_guard<std::mutex> lock(streams_mutex_);
+    std::lock_guard<std::mutex> lock(_streams_mutex);
     
-    auto it = stream_stats_.find(stream.value());
-    if (it == stream_stats_.end()) {
+    auto it = _stream_stats.find(stream.value());
+    if (it == _stream_stats.end()) {
         return nullptr;
     }
     

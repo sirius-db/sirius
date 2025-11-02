@@ -32,93 +32,93 @@ namespace sirius {
 namespace memory {
 
 // Forward declaration
-struct Reservation;
+struct reservation;
 
 /**
- * MemorySpace represents a specific memory location identified by a tier and device ID.
+ * memory_space represents a specific memory location identified by a tier and device ID.
  * It manages memory reservations within that space and owns allocator resources.
  * 
- * Each MemorySpace:
+ * Each memory_space:
  * - Has a fixed memory limit
  * - Tracks active reservations
  * - Provides thread-safe reservation management
  * - Owns one or more RMM memory allocators
  */
-class MemorySpace {
+class memory_space {
 public:
     /**
-     * Construct a MemorySpace with the given parameters.
+     * Construct a memory_space with the given parameters.
      * 
      * @param tier The memory tier (GPU, HOST, DISK)
      * @param device_id The device identifier within the tier
      * @param memory_limit Maximum memory capacity in bytes
      * @param allocators Vector of RMM memory allocators (must be non-empty)
      */
-    MemorySpace(Tier tier, size_t device_id, size_t memory_limit, 
+    memory_space(Tier tier, size_t device_id, size_t memory_limit, 
                 std::vector<std::unique_ptr<rmm::mr::device_memory_resource>> allocators);
     
     // Disable copy/move to ensure stable addresses for reservations
-    MemorySpace(const MemorySpace&) = delete;
-    MemorySpace& operator=(const MemorySpace&) = delete;
-    MemorySpace(MemorySpace&&) = delete;
-    MemorySpace& operator=(MemorySpace&&) = delete;
+    memory_space(const memory_space&) = delete;
+    memory_space& operator=(const memory_space&) = delete;
+    memory_space(memory_space&&) = delete;
+    memory_space& operator=(memory_space&&) = delete;
     
-    ~MemorySpace() = default;
+    ~memory_space() = default;
 
     // Comparison operators
-    bool operator==(const MemorySpace& other) const;
-    bool operator!=(const MemorySpace& other) const;
+    bool operator==(const memory_space& other) const;
+    bool operator!=(const memory_space& other) const;
 
     // Basic properties
-    Tier getTier() const;
-    size_t getDeviceId() const;
+    Tier get_tier() const;
+    size_t get_device_id() const;
     
     // Reservation management - these are the core methods that do the actual work
-    std::unique_ptr<Reservation> requestReservation(size_t size);
-    void releaseReservation(std::unique_ptr<Reservation> reservation);
+    std::unique_ptr<reservation> request_reservation(size_t size);
+    void release_reservation(std::unique_ptr<reservation> res);
     
-    bool shrinkReservation(Reservation* reservation, size_t new_size);
-    bool growReservation(Reservation* reservation, size_t new_size);
+    bool shrink_reservation(reservation* res, size_t new_size);
+    bool grow_reservation(reservation* res, size_t new_size);
     
     // State queries
-    size_t getAvailableMemory() const;
-    size_t getTotalReservedMemory() const;
-    size_t getMaxMemory() const;
-    size_t getActiveReservationCount() const;
+    size_t get_available_memory() const;
+    size_t get_total_reserved_memory() const;
+    size_t get_max_memory() const;
+    size_t get_active_reservation_count() const;
     
     // Allocator management
-    rmm::device_async_resource_ref getDefaultAllocator() const;
-    rmm::device_async_resource_ref getAllocator(size_t index) const;
-    size_t getAllocatorCount() const;
+    rmm::device_async_resource_ref get_default_allocator() const;
+    rmm::device_async_resource_ref get_allocator(size_t index) const;
+    size_t get_allocator_count() const;
     
     // Utility methods
-    bool canReserve(size_t size) const;
-    std::string toString() const;
+    bool can_reserve(size_t size) const;
+    std::string to_string() const;
 
 private:
-    const Tier tier_;
-    const size_t device_id_;
-    const size_t memory_limit_;
+    const Tier _tier;
+    const size_t _device_id;
+    const size_t _memory_limit;
     
-    // Memory resources owned by this MemorySpace
-    std::vector<std::unique_ptr<rmm::mr::device_memory_resource>> allocators_;
+    // Memory resources owned by this memory_space
+    std::vector<std::unique_ptr<rmm::mr::device_memory_resource>> _allocators;
     
-    mutable std::mutex mutex_;
-    std::condition_variable cv_;
+    mutable std::mutex _mutex;
+    std::condition_variable _cv;
     
-    std::atomic<size_t> total_reserved_{0};
-    std::atomic<size_t> active_count_{0};
+    std::atomic<size_t> _total_reserved{0};
+    std::atomic<size_t> _active_count{0};
     
-    void waitForMemory(size_t size, std::unique_lock<std::mutex>& lock);
-    bool validateReservation(const Reservation* reservation) const;
+    void wait_for_memory(size_t size, std::unique_lock<std::mutex>& lock);
+    bool validate_reservation(const reservation* res) const;
 };
 
 /**
- * Hash function for MemorySpace to enable use in unordered containers.
+ * Hash function for memory_space to enable use in unordered containers.
  * Hash is based on tier and device_id combination.
  */
-struct MemorySpaceHash {
-    size_t operator()(const MemorySpace& ms) const;
+struct memory_space_hash {
+    size_t operator()(const memory_space& ms) const;
 };
 
 } // namespace memory
