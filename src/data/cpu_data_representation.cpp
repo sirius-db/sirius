@@ -18,7 +18,7 @@
 
 namespace sirius {
 
-host_table_representation::host_table_representation(sirius::unique_ptr<sirius::memory::table_allocation> host_table, sirius::memory_space& memory_space)
+host_table_representation::host_table_representation(sirius::unique_ptr<sirius::memory::host_table_allocation> host_table, sirius::memory_space& memory_space)
     : idata_representation(memory_space), _host_table(std::move(host_table)) {}
 
 std::size_t host_table_representation::get_size_in_bytes() const {
