@@ -138,10 +138,10 @@ Solve this issue by running the following command, then delete the build directo
 ```
 export LDFLAGS="-Wl,-rpath,$CONDA_PREFIX/lib -L$CONDA_PREFIX/lib $LDFLAGS"
 rm -rf build
-make -j {nproc}
+CMAKE_BUILD_PARALLEL_LEVEL={nproc} make
 ```
 
-Note that if you notice that if the building extension takes too much memory reduce `CMAKE_BUILD_PARALLEL_LEVEL` value used when calling `make`. 
+Note that if building the extension consumes too much memory, try reducing the `CMAKE_BUILD_PARALLEL_LEVEL` value used when invoking `make`.
 
 Optionally, to use the Python API in Sirius, we also need to build the duckdb-python package with the following commands:
 ```
@@ -284,7 +284,7 @@ make test
 
 To run a specific test run the command from the root directory:
 ```
-make -j {nproc}
+CMAKE_BUILD_PARALLEL_LEVEL={nproc} make
 build/release/test/unittest --test-dir . test/sql/tpch-sirius.test
 ```
 
@@ -292,13 +292,13 @@ build/release/test/unittest --test-dir . test/sql/tpch-sirius.test
 
 Sirius also implements C++ tests for all of the APIs it implements. These tests are meant to be individual unit tests for each of the classes/functions used to run Sirius. You can find examples on how to implement these unit tests in `test/cpp`. You can run all of the unit tests using:
 ```
-make -j {nproc}
+CMAKE_BUILD_PARALLEL_LEVEL={nproc} make
 build/release/extension/sirius/test/cpp/sirius_unittest
 ```
 
 To run tests associated with specific tag or to run a specific test you can execute the the test script like this:
 ```
-make -j {nproc}
+CMAKE_BUILD_PARALLEL_LEVEL={nproc} make
 build/release/extension/sirius/test/cpp/sirius_unittest "[cpu_cache]"
 build/release/extension/sirius/test/cpp/sirius_unittest "test_cpu_cache_basic_string_single_col"
 ```
