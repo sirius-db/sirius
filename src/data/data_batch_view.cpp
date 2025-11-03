@@ -54,7 +54,7 @@ data_batch_view::get_cudf_table_view() const {
 }
 
 void data_batch_view::pin() {
-    if (_batch->get_data()->get_current_tier() != Tier::GPU) {
+    if (_batch->get_data()->get_current_tier() != memory::Tier::GPU) {
         throw std::runtime_error("data_batch_view must be in GPU tier to be pinned");
         // TODO: later on we will add a method here to move the data to GPU tier
     }

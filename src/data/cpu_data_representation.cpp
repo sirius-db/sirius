@@ -18,14 +18,14 @@
 
 namespace sirius {
 
-host_table_representation::host_table_representation(sirius::unique_ptr<sirius::memory::host_table_allocation> host_table, sirius::memory_space& memory_space)
+host_table_representation::host_table_representation(sirius::unique_ptr<sirius::memory::host_table_allocation> host_table, sirius::memory::memory_space& memory_space)
     : idata_representation(memory_space), _host_table(std::move(host_table)) {}
 
 std::size_t host_table_representation::get_size_in_bytes() const {
     return _host_table->data_size;
 }
 
-sirius::unique_ptr<idata_representation> host_table_representation::convert_to_memory_space(sirius::memory_space& target_memory_space, rmm::cuda_stream_view stream) {
+sirius::unique_ptr<idata_representation> host_table_representation::convert_to_memory_space(sirius::memory::memory_space& target_memory_space, rmm::cuda_stream_view stream) {
     // TODO: Implement conversion to GPU representation
     // This should use data_representation_converter::convert_to_gpu_representation
     throw std::runtime_error("host_table_representation::convert_to_memory_space not yet implemented");

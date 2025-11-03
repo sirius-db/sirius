@@ -58,7 +58,7 @@ data_batch& data_batch::operator=(data_batch&& other) {
     return *this;
 }
 
-Tier data_batch::get_current_tier() const {
+memory::Tier data_batch::get_current_tier() const {
     return _data->get_current_tier();
 }
 
@@ -77,7 +77,7 @@ size_t data_batch::decrement_view_ref_count() {
 
 void data_batch::decrement_pin_ref_count() {
     std::lock_guard<sirius::mutex> lock(_mutex);
-    if (_data->get_current_tier() != Tier::GPU) {
+    if (_data->get_current_tier() != memory::Tier::GPU) {
         throw std::runtime_error("data_batch_view should always be in GPU tier");
     }
     _pin_count.fetch_sub(1, std::memory_order_relaxed);
@@ -85,7 +85,7 @@ void data_batch::decrement_pin_ref_count() {
 
 void data_batch::increment_pin_ref_count() {
     std::lock_guard<sirius::mutex> lock(_mutex);
-    if (_data->get_current_tier() != Tier::GPU) {
+    if (_data->get_current_tier() != memory::Tier::GPU) {
         throw std::runtime_error("data_batch data must be in GPU tier to create cudf_table_view_wrapper");
     }
     _pin_count.fetch_add(1, std::memory_order_relaxed);

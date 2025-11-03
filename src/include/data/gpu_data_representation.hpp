@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "data/common.hpp"
+#include "memory/memory_space.hpp"
 #include "cudf/cudf_utils.hpp"
 #include "helper/helper.hpp"
 
@@ -41,7 +42,7 @@ public:
      * 
      * @param table The actual cuDF table with the data
      */
-    gpu_table_representation(cudf::table table, sirius::memory_space& memory_space);
+    gpu_table_representation(cudf::table table, sirius::memory::memory_space& memory_space);
 
     /**
      * @brief Get the size of the data representation in bytes
@@ -63,7 +64,7 @@ public:
      * @param stream CUDA stream to use for memory operations
      * @return sirius::unique_ptr<idata_representation> A new data representation in the target memory space
      */
-    sirius::unique_ptr<idata_representation> convert_to_memory_space(sirius::memory_space& target_memory_space, rmm::cuda_stream_view stream = rmm::cuda_stream_default) override;
+    sirius::unique_ptr<idata_representation> convert_to_memory_space(sirius::memory::memory_space& target_memory_space, rmm::cuda_stream_view stream = rmm::cuda_stream_default) override;
 
 private:
     cudf::table _table; ///< The actual cuDF table with the data

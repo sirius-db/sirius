@@ -19,7 +19,7 @@
 
 namespace sirius {
 
-gpu_table_representation::gpu_table_representation(cudf::table table, sirius::memory_space& memory_space)
+gpu_table_representation::gpu_table_representation(cudf::table table, sirius::memory::memory_space& memory_space)
     : idata_representation(memory_space), _table(std::move(table)) {}
 
 std::size_t gpu_table_representation::get_size_in_bytes() const {
@@ -38,7 +38,7 @@ const cudf::table& gpu_table_representation::get_table() const {
     return _table;
 }
 
-sirius::unique_ptr<idata_representation> gpu_table_representation::convert_to_memory_space(sirius::memory_space& target_memory_space, rmm::cuda_stream_view stream) {
+sirius::unique_ptr<idata_representation> gpu_table_representation::convert_to_memory_space(sirius::memory::memory_space& target_memory_space, rmm::cuda_stream_view stream) {
     // TODO: Implement conversion to GPU representation
     // This should use data_representation_converter::convert_to_gpu_representation
     throw std::runtime_error("gpu_table_representation::convert_to_memory_space not yet implemented");

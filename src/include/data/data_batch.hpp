@@ -85,7 +85,7 @@ public:
      * 
      * @return Tier The memory tier (GPU, HOST, or STORAGE)
      */
-    Tier get_current_tier() const;
+    memory::Tier get_current_tier() const;
 
     /**
      * @brief Get the unique identifier for this data batch.

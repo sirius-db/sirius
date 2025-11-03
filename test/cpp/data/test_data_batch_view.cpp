@@ -18,38 +18,57 @@
 #include <thread>
 #include <vector>
 #include <memory>
+#include <map>
+#include <mutex>
 #include "data/data_batch_view.hpp"
 #include "data/data_batch.hpp"
 #include "data/data_repository_manager.hpp"
 #include "data/common.hpp"
+#include "memory/null_device_memory_resource.hpp"
 
 using namespace sirius;
 
-// Mock idata_representation for testing
-class mock_data_representation : public idata_representation {
+// Mock memory_space for testing - provides a simple memory_space without real allocators
+class mock_memory_space : public memory::memory_space {
 public:
-    explicit mock_data_representation(Tier tier, size_t size = 1024)
-        : _tier(tier), _size(size) {}
+    mock_memory_space(memory::Tier tier, size_t device_id = 0)
+        : memory::memory_space(tier, device_id, 1024 * 1024 * 1024, create_null_allocators()) {}
     
-    Tier get_current_tier() const override {
-        return _tier;
+private:
+    static std::vector<std::unique_ptr<rmm::mr::device_memory_resource>> create_null_allocators() {
+        std::vector<std::unique_ptr<rmm::mr::device_memory_resource>> allocators;
+        allocators.push_back(std::make_unique<memory::null_device_memory_resource>());
+        return allocators;
     }
+};
+
+// Helper base class to hold memory_space - initialized before idata_representation
+struct mock_memory_space_holder {
+    std::shared_ptr<mock_memory_space> space;
+    
+    mock_memory_space_holder(memory::Tier tier, size_t device_id)
+        : space(std::make_shared<mock_memory_space>(tier, device_id)) {}
+};
+
+// Mock idata_representation for testing
+// Inherits from mock_memory_space_holder first to ensure it's constructed before idata_representation
+class mock_data_representation : private mock_memory_space_holder, public idata_representation {
+public:
+    explicit mock_data_representation(memory::Tier tier, size_t size = 1024, size_t device_id = 0)
+        : mock_memory_space_holder(tier, device_id)  // Construct holder first
+        , idata_representation(*space)                // Pass reference to base class
+        , _size(size) {}
     
     std::size_t get_size_in_bytes() const override {
         return _size;
     }
     
-    sirius::unique_ptr<idata_representation> convert_to_tier(Tier target_tier, rmm::mr::device_memory_resource* mr = nullptr, rmm::cuda_stream_view stream = rmm::cuda_stream_default) override {
+    sirius::unique_ptr<idata_representation> convert_to_memory_space(memory::memory_space& target_memory_space, rmm::cuda_stream_view stream = rmm::cuda_stream_default) override {
         // Empty implementation for testing
         return nullptr;
     }
-    
-    void set_tier(Tier tier) {
-        _tier = tier;
-    }
 
 private:
-    Tier _tier;
     size_t _size;
 };
 
@@ -58,7 +77,7 @@ private:
 // The batch is stored in the manager and will be auto-deleted when views reach 0
 std::pair<uint64_t, data_batch*> create_managed_batch(
     data_repository_manager& manager,
-    Tier tier = Tier::GPU,
+    memory::Tier tier = memory::Tier::GPU,
     size_t size = 1024) {
     
     auto data = sirius::make_unique<mock_data_representation>(tier, size);
@@ -81,7 +100,7 @@ struct managed_batch_holder {
     uint64_t batch_id;
     data_batch* batch_ptr;
     
-    managed_batch_holder(Tier tier = Tier::GPU, size_t size = 1024) {
+    managed_batch_holder(memory::Tier tier = memory::Tier::GPU, size_t size = 1024) {
         auto data = sirius::make_unique<mock_data_representation>(tier, size);
         batch_id = manager.get_next_data_batch_id();
         auto batch = sirius::make_unique<data_batch>(batch_id, manager, std::move(data));
@@ -94,7 +113,7 @@ struct managed_batch_holder {
 
 // Test basic construction
 TEST_CASE("data_batch_view Construction", "[data_batch_view]") {
-    managed_batch_holder holder(Tier::GPU, 2048);
+    managed_batch_holder holder(memory::Tier::GPU, 2048);
     auto* batch = holder.batch_ptr;
     
     REQUIRE(batch->get_view_count() == 0);
@@ -117,7 +136,7 @@ TEST_CASE("data_batch_view Construction", "[data_batch_view]") {
 
 // Test copy constructor
 TEST_CASE("data_batch_view Copy Constructor", "[data_batch_view]") {
-    managed_batch_holder holder(Tier::GPU, 2048);
+    managed_batch_holder holder(memory::Tier::GPU, 2048);
     auto* batch = holder.batch_ptr;
     
     // Prevent deletion by keeping an extra ref count
@@ -141,8 +160,8 @@ TEST_CASE("data_batch_view Copy Constructor", "[data_batch_view]") {
 
 // Test copy assignment
 TEST_CASE("data_batch_view Copy Assignment", "[data_batch_view]") {
-    managed_batch_holder holder1(Tier::GPU, 512);
-    managed_batch_holder holder2(Tier::GPU, 1024);
+    managed_batch_holder holder1(memory::Tier::GPU, 512);
+    managed_batch_holder holder2(memory::Tier::GPU, 1024);
     auto* batch1 = holder1.batch_ptr;
     auto* batch2 = holder2.batch_ptr;
     
@@ -280,9 +299,9 @@ TEST_CASE("data_batch_view Unpin Throws When Not Pinned", "[data_batch_view]") {
     batch->decrement_view_ref_count();
 }
 
-// Test Pin throws when not in GPU tier
-TEST_CASE("data_batch_view Pin Throws When Not In GPU Tier", "[data_batch_view]") {
-    managed_batch_holder holder(Tier::HOST);
+// Test Pin throws when not in GPU memory::Tier
+TEST_CASE("data_batch_view Pin Throws When Not In GPU memory::Tier", "[data_batch_view]") {
+    managed_batch_holder holder(memory::Tier::HOST);
     auto* batch = holder.batch_ptr;
     
     // Increment to prevent auto-delete
@@ -290,7 +309,7 @@ TEST_CASE("data_batch_view Pin Throws When Not In GPU Tier", "[data_batch_view]"
     
     data_batch_view view(batch);
     
-    // Should throw because data is not in GPU tier
+    // Should throw because data is not in GPU memory::Tier
     REQUIRE_THROWS_AS(view.pin(), std::runtime_error);
     REQUIRE(batch->get_pin_count() == 0);
     
@@ -363,7 +382,7 @@ TEST_CASE("Multiple data_batch_views on Same Batch", "[data_batch_view]") {
 // Test view count is independent of pin count
 TEST_CASE("data_batch_view Independent View and Pin Counts", "[data_batch_view]") {
     data_repository_manager manager;
-    auto data = sirius::make_unique<mock_data_representation>(Tier::GPU, 1024);
+    auto data = sirius::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
     auto* batch = new data_batch(1, manager, std::move(data));
     
     // Increment to prevent auto-delete
@@ -396,7 +415,7 @@ TEST_CASE("data_batch_view Independent View and Pin Counts", "[data_batch_view]"
 // Test multiple pin/unpin cycles
 TEST_CASE("data_batch_view Multiple Pin Unpin Cycles", "[data_batch_view]") {
     data_repository_manager manager;
-    auto data = sirius::make_unique<mock_data_representation>(Tier::GPU, 1024);
+    auto data = sirius::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
     auto* batch = new data_batch(1, manager, std::move(data));
     
     // Increment to prevent auto-delete
@@ -422,7 +441,7 @@ TEST_CASE("data_batch_view Multiple Pin Unpin Cycles", "[data_batch_view]") {
 // Test thread-safe view count operations
 TEST_CASE("data_batch_view Thread-Safe View Count", "[data_batch_view]") {
     data_repository_manager manager;
-    auto data = sirius::make_unique<mock_data_representation>(Tier::GPU, 1024);
+    auto data = sirius::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
     auto* batch = new data_batch(1, manager, std::move(data));
     
     // Increment to prevent auto-delete
@@ -467,7 +486,7 @@ TEST_CASE("data_batch_view Thread-Safe View Count", "[data_batch_view]") {
 // Test thread-safe pin operations
 TEST_CASE("data_batch_view Thread-Safe Pin Operations", "[data_batch_view]") {
     data_repository_manager manager;
-    auto data = sirius::make_unique<mock_data_representation>(Tier::GPU, 1024);
+    auto data = sirius::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
     auto* batch = new data_batch(1, manager, std::move(data));
     
     // Increment to prevent auto-delete
@@ -536,7 +555,7 @@ TEST_CASE("data_batch_view Thread-Safe Pin Operations", "[data_batch_view]") {
 // Test concurrent view creation and destruction
 TEST_CASE("data_batch_view Concurrent View Creation and Destruction", "[data_batch_view]") {
     data_repository_manager manager;
-    auto data = sirius::make_unique<mock_data_representation>(Tier::GPU, 1024);
+    auto data = sirius::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
     auto* batch = new data_batch(1, manager, std::move(data));
     
     // Increment to prevent auto-delete
@@ -574,7 +593,7 @@ TEST_CASE("data_batch_view Concurrent View Creation and Destruction", "[data_bat
 // Test view copy preserves unpinned state
 TEST_CASE("data_batch_view Copy Does Not Copy Pin State", "[data_batch_view]") {
     data_repository_manager manager;
-    auto data = sirius::make_unique<mock_data_representation>(Tier::GPU, 1024);
+    auto data = sirius::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
     auto* batch = new data_batch(1, manager, std::move(data));
     
     // Increment to prevent auto-delete
@@ -610,7 +629,7 @@ TEST_CASE("data_batch_view Copy Does Not Copy Pin State", "[data_batch_view]") {
 // Test multiple views with independent pin states
 TEST_CASE("data_batch_view Multiple Views Independent Pin States", "[data_batch_view]") {
     data_repository_manager manager;
-    auto data = sirius::make_unique<mock_data_representation>(Tier::GPU, 1024);
+    auto data = sirius::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
     auto* batch = new data_batch(1, manager, std::move(data));
     
     // Increment to prevent auto-delete
@@ -658,7 +677,7 @@ TEST_CASE("data_batch_view Multiple Views Independent Pin States", "[data_batch_
 // Test rapid view creation and destruction cycles
 TEST_CASE("data_batch_view Rapid Creation and Destruction Cycles", "[data_batch_view]") {
     data_repository_manager manager;
-    auto data = sirius::make_unique<mock_data_representation>(Tier::GPU, 1024);
+    auto data = sirius::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
     auto* batch = new data_batch(1, manager, std::move(data));
     
     // Increment to prevent auto-delete
@@ -686,9 +705,9 @@ TEST_CASE("data_batch_view Rapid Creation and Destruction Cycles", "[data_batch_
 // Test view with different batch IDs
 TEST_CASE("data_batch_view Multiple Batches", "[data_batch_view]") {
     data_repository_manager manager;
-    auto data1 = sirius::make_unique<mock_data_representation>(Tier::GPU, 1024);
-    auto data2 = sirius::make_unique<mock_data_representation>(Tier::GPU, 2048);
-    auto data3 = sirius::make_unique<mock_data_representation>(Tier::GPU, 4096);
+    auto data1 = sirius::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+    auto data2 = sirius::make_unique<mock_data_representation>(memory::Tier::GPU, 2048);
+    auto data3 = sirius::make_unique<mock_data_representation>(memory::Tier::GPU, 4096);
     
     auto* batch1 = new data_batch(1, manager, std::move(data1));
     auto* batch2 = new data_batch(2, manager, std::move(data2));
@@ -740,7 +759,7 @@ TEST_CASE("data_batch_view Multiple Batches", "[data_batch_view]") {
 // Test stress test with many views and pins
 TEST_CASE("data_batch_view Stress Test", "[data_batch_view]") {
     data_repository_manager manager;
-    auto data = sirius::make_unique<mock_data_representation>(Tier::GPU, 1024);
+    auto data = sirius::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
     auto* batch = new data_batch(1, manager, std::move(data));
     
     // Increment to prevent auto-delete
@@ -783,7 +802,7 @@ TEST_CASE("data_batch_view Stress Test", "[data_batch_view]") {
 // Test view lifetime with mixed operations
 TEST_CASE("data_batch_view Mixed Lifetime Operations", "[data_batch_view]") {
     data_repository_manager manager;
-    auto data = sirius::make_unique<mock_data_representation>(Tier::GPU, 1024);
+    auto data = sirius::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
     auto* batch = new data_batch(1, manager, std::move(data));
     
     // Increment to prevent auto-delete
@@ -831,7 +850,7 @@ TEST_CASE("data_batch_view Mixed Lifetime Operations", "[data_batch_view]") {
 // Test destructor with pinned view
 TEST_CASE("data_batch_view Destructor With Pinned View", "[data_batch_view]") {
     data_repository_manager manager;
-    auto data = sirius::make_unique<mock_data_representation>(Tier::GPU, 1024);
+    auto data = sirius::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
     auto* batch = new data_batch(1, manager, std::move(data));
     
     // Increment to prevent auto-delete
@@ -862,7 +881,7 @@ TEST_CASE("data_batch_view Destructor With Pinned View", "[data_batch_view]") {
 // Test edge case: zero to non-zero pin transitions
 TEST_CASE("data_batch_view Zero to Non-Zero Pin Transitions", "[data_batch_view]") {
     data_repository_manager manager;
-    auto data = sirius::make_unique<mock_data_representation>(Tier::GPU, 1024);
+    auto data = sirius::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
     auto* batch = new data_batch(1, manager, std::move(data));
     
     // Increment to prevent auto-delete
@@ -899,7 +918,7 @@ TEST_CASE("data_batch_view Zero to Non-Zero Pin Transitions", "[data_batch_view]
 // Test rapid pin/unpin with multiple views
 TEST_CASE("data_batch_view Rapid Pin Unpin Multiple Views", "[data_batch_view]") {
     data_repository_manager manager;
-    auto data = sirius::make_unique<mock_data_representation>(Tier::GPU, 1024);
+    auto data = sirius::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
     auto* batch = new data_batch(1, manager, std::move(data));
     
     // Increment to prevent auto-delete
@@ -1091,8 +1110,8 @@ TEST_CASE("data_batch_view Concurrent Auto Deletion", "[data_batch_view][deletio
 TEST_CASE("data_batch_view Auto Delete After Pin Exception", "[data_batch_view][deletion]") {
     data_repository_manager manager;
     
-    // Create batch in HOST tier (can't be pinned)
-    auto [batch_id, batch] = create_managed_batch(manager, Tier::HOST);
+    // Create batch in HOST memory::Tier (can't be pinned)
+    auto [batch_id, batch] = create_managed_batch(manager, memory::Tier::HOST);
     
     {
         data_batch_view view(batch);

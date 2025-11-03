@@ -18,20 +18,10 @@
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/mr/device/device_memory_resource.hpp>
-
+#include "memory/memory_space.hpp"
 #include "helper/helper.hpp"
 
 namespace sirius {
-
-enum class Tier {
-    GPU,    // GPU device memory (fastest but limited)
-    HOST,   // Host system memory (fast, larger capacity)
-    DISK,   // Disk/storage memory (slowest but largest capacity)
-    SIZE    // Value = size of the enum, allows code to be more dynamic
-};
-
-// Forward declarations
-class fixed_size_host_memory_resource;
 
 /**
  * @brief Interface representing a data representation residing in a specific memory tier.
@@ -48,14 +38,19 @@ public:
      * 
      * @param memory_space The memory space where the data resides
      */
-    idata_representation(sirius::memory_space& memory_space) : _memory_space(memory_space) {}
+    idata_representation(sirius::memory::memory_space& memory_space) : _memory_space(memory_space) {}
+
+    /**
+     * @brief Virtual destructor to ensure proper cleanup of derived classes
+     */
+    virtual ~idata_representation() = default;
 
     /**
      * @brief Get the tier of memory that this representation resides in
      * 
      * @return Tier The memory tier
      */
-    Tier get_current_tier() const {
+    memory::Tier get_current_tier() const {
         return _memory_space.get_tier();
     }
 
@@ -82,7 +77,7 @@ public:
      * @param stream CUDA stream to use for memory operations
      * @return sirius::unique_ptr<idata_representation> A new data representation in the target memory space
      */
-    virtual sirius::unique_ptr<idata_representation> convert_to_memory_space(sirius::memory_space& target_memory_space, rmm::cuda_stream_view stream = rmm::cuda_stream_default) = 0;
+    virtual sirius::unique_ptr<idata_representation> convert_to_memory_space(sirius::memory::memory_space& target_memory_space, rmm::cuda_stream_view stream = rmm::cuda_stream_default) = 0;
 
     /**
      * @brief Safely casts this interface to a specific derived type
@@ -107,7 +102,7 @@ public:
 	}
 
 private:
-    sirius::memory_space& _memory_space; ///< The memory space where the data resides
+    sirius::memory::memory_space& _memory_space; ///< The memory space where the data resides
 };
 
 } // namespace sirius

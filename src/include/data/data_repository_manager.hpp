@@ -51,6 +51,9 @@ namespace sirius {
  *       pipeline execution threads.
  */
 class data_repository_manager {
+    // Friend declaration to allow data_batch_view destructor to call delete_data_batch
+    friend class data_batch_view;
+
 public:
     /**
      * @brief Default constructor - initializes empty repository manager.
@@ -84,15 +87,6 @@ public:
     void add_new_data_batch(sirius::unique_ptr<data_batch> batch, sirius::vector<size_t> pipeline_ids);
 
     /**
-     * @brief Delete a data batch from the manager.
-     * 
-     * Deletes a data batch from the manager.
-     * 
-     * @param batch_id The ID of the data batch to delete
-     */
-    void delete_data_batch(size_t batch_id);
-
-    /**
      * @brief Get direct access to a pipeline's repository for advanced operations.
      * 
      * Provides direct access to the underlying repository implementation, allowing
@@ -120,6 +114,20 @@ public:
     uint64_t get_next_data_batch_id();
 
 private:
+    /**
+     * @brief Delete a data batch from the manager.
+     * 
+     * This method is private and can only be called by data_batch_view destructor
+     * when the last view to a batch is destroyed. This enforces proper lifecycle
+     * management through RAII and reference counting.
+     * 
+     * @param batch_id The ID of the data batch to delete
+     * 
+     * @note Thread-safe operation
+     * @note Private method - only accessible via friend class data_batch_view
+     */
+    void delete_data_batch(size_t batch_id);
+
     mutex _mutex;                                      ///< Mutex for thread-safe access to holder
     sirius::atomic<uint64_t> _next_data_batch_id = 0;  ///< Atomic counter for generating unique data batch identifiers
     sirius::unordered_map<size_t, sirius::unique_ptr<idata_repository>> _repositories; ///< Map of pipeline ID to idata_repository
