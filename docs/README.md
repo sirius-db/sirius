@@ -125,9 +125,11 @@ The `--recurse-submodules` will ensure DuckDB is pulled which is required to bui
 
 To build Sirius:
 ```
-make -j {nproc}
+CMAKE_BUILD_PARALLEL_LEVEL={nproc} make
 ```
-Common issues: If you encounter an error such as:
+
+Common issues: 
+If you encounter an error such as:
 ```
 /usr/bin/ld: /home/ubuntu/miniconda3/envs/libcudf-env/lib/libcudf.so: undefined reference to `std::ios_base_library_init()@GLIBCXX_3.4.32'
 /usr/bin/ld: /home/ubuntu/miniconda3/envs/libcudf-env/lib/libcudf.so: undefined reference to `__cxa_call_terminate@CXXABI_1.3.15'
@@ -138,6 +140,8 @@ export LDFLAGS="-Wl,-rpath,$CONDA_PREFIX/lib -L$CONDA_PREFIX/lib $LDFLAGS"
 rm -rf build
 make -j {nproc}
 ```
+
+Note that if you notice that if the building extension takes too much memory reduce `CMAKE_BUILD_PARALLEL_LEVEL` value used when calling `make`. 
 
 Optionally, to use the Python API in Sirius, we also need to build the duckdb-python package with the following commands:
 ```
