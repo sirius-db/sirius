@@ -1,0 +1,52 @@
+/*
+ * Copyright 2025, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "operator/merge/gpu_merge.hpp"
+#include "data/gpu_data_representation.hpp"
+
+#include <cudf/concatenate.hpp>
+
+namespace sirius {
+namespace op {
+
+sirius::unique_ptr<data_batch>
+gpu_merge::concat(const sirius::vector<sirius::unique_ptr<data_batch_view>>& input,
+                rmm::cuda_stream_view stream,
+                sirius::memory::memory_space& memory_space,
+                sirius::data_repository_manager& data_repository_mgr) {
+    // Sanity check.
+    if (input.size() < 2) {
+        throw std::runtime_error("`input` in `concat()` should at least contain two data batches");
+    }
+
+    // Pull input cudf tables and merge.
+    sirius::vector<cudf::table_view> input_cudf_table_views;
+    input_cudf_table_views.resize(input.size());
+    for (int i = 0; i < input.size(); ++i) {
+        input_cudf_table_views[i] = input[i]->get_cudf_table_view();
+    }
+    auto output_cudf_table = cudf::concatenate(input_cudf_table_views, stream, memory_space.get_default_allocator());
+
+    // Create output data batch.
+    auto gpu_table_representation = sirius::make_unique<sirius::gpu_table_representation>(
+        *output_cudf_table, memory_space);
+    return sirius::make_unique<sirius::data_batch>(data_repository_mgr.get_next_data_batch_id(),
+                                                data_repository_mgr,
+                                                std::move(gpu_table_representation));
+}
+
+} // namespace op
+} // namespace sirius
