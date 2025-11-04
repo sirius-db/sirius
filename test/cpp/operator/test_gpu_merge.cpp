@@ -82,6 +82,9 @@ void validate_concat(const sirius::vector<sirius::unique_ptr<data_batch_view>>& 
 
     for (int c = 0; c < output_table_view.num_columns(); ++c) {
         REQUIRE(input_table_views[0].column(c).type().id() == output_table_view.column(c).type().id());
+        if (expected_num_rows == 0) {
+            continue;
+        }
 
         switch (output_table_view.column(c).type().id()) {
             case cudf::type_id::INT32: {
@@ -119,6 +122,9 @@ void validate_concat(const sirius::vector<sirius::unique_ptr<data_batch_view>>& 
                 sirius::vector<cudf::size_type> expected_offsets{0};
                 sirius::vector<char> expected_data(actual_data.size());
                 for (int i = 0; i < input_views.size(); ++i) {
+                    if (input_table_views[i].num_rows() == 0) {
+                        continue;
+                    }
                     sirius::vector<cudf::size_type> input_offsets(input_table_views[i].num_rows() + 1);
                     str_col = cudf::strings_column_view(input_table_views[i].column(c));
                     cudaMemcpy(input_offsets.data(),
@@ -203,4 +209,42 @@ TEST_CASE("Concatenate one data batch", "[operator][merge_concat]") {
                                         *mem_space,
                                         data_repo_manager),
                     std::runtime_error);
+}
+
+TEST_CASE("Concatenate multiple data batches but no input rows", "[operator][merge_concat]") {
+    data_repository_manager data_repo_manager;
+    auto* mem_space = get_default_memory_space();
+    constexpr int num_batches = 10;
+    constexpr size_t num_rows_per_batch = 0;
+    sirius::vector<int> num_input_rows(num_batches, num_rows_per_batch);
+    sirius::vector<cudf::data_type> column_types = {cudf::data_type{cudf::type_id::INT32},
+                                                    cudf::data_type{cudf::type_id::STRING}};
+
+    auto input_views = create_batches_with_random_data(
+        num_batches, num_input_rows, column_types, data_repo_manager, *mem_space);
+    auto output_batch = gpu_merge::concat(input_views,
+                                        cudf::get_default_stream(),
+                                        *mem_space,
+                                        data_repo_manager);
+    validate_concat(input_views, *output_batch);
+}
+
+TEST_CASE("Concatenate mixed empty and non-empty data batches", "[operator][merge_concat]") {
+    data_repository_manager data_repo_manager;
+    auto* mem_space = get_default_memory_space();
+    constexpr int num_batches = 10;
+    sirius::vector<int> num_input_rows;
+    for (int i = 0; i < num_batches; ++i) {
+        num_input_rows.push_back(i % 2 == 1 ? 0 : (i + 1) * 10);
+    }
+    sirius::vector<cudf::data_type> column_types = {cudf::data_type{cudf::type_id::INT32},
+                                                    cudf::data_type{cudf::type_id::STRING}};
+
+    auto input_views = create_batches_with_random_data(
+        num_batches, num_input_rows, column_types, data_repo_manager, *mem_space);
+    auto output_batch = gpu_merge::concat(input_views,
+                                        cudf::get_default_stream(),
+                                        *mem_space,
+                                        data_repo_manager);
+    validate_concat(input_views, *output_batch);
 }
