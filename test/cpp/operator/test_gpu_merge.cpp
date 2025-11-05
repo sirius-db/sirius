@@ -309,7 +309,7 @@ sirius::vector<sirius::unique_ptr<data_batch_view>> create_batches_with_partial_
     return partial_aggregate_batches;
 }
 
-template <typename T>
+template <typename TIn, typename TOut>
 void validate_ungrouped_aggregate_numeric(const sirius::vector<cudf::table_view>& input_table_views,
                                         cudf::table_view output_table_view,
                                         const sirius::vector<cudf::aggregation::Kind>& aggregates,
@@ -326,17 +326,17 @@ void validate_ungrouped_aggregate_numeric(const sirius::vector<cudf::table_view>
     }
 
     // Compare result
-    T actual_result;
+    TOut actual_result;
     cudaMemcpy(&actual_result,
-            output_table_view.column(c).data<T>(),
-            sizeof(T),
+            output_table_view.column(c).data<TOut>(),
+            sizeof(TOut),
             cudaMemcpyDeviceToHost);
-    sirius::vector<T> input_data_without_nulls;
+    sirius::vector<TIn> input_data_without_nulls;
     for (const auto& input_table_view: input_table_views) {
-        sirius::vector<T> input_data(input_table_view.num_rows());
+        sirius::vector<TIn> input_data(input_table_view.num_rows());
         cudaMemcpy(input_data.data(),
-                input_table_view.column(c).data<T>(),
-                sizeof(T) * input_table_view.num_rows(),
+                input_table_view.column(c).data<TIn>(),
+                sizeof(TIn) * input_table_view.num_rows(),
                 cudaMemcpyDeviceToHost);
         auto* d_null_mask = input_table_view.column(c).null_mask();
         if (d_null_mask == nullptr) {
@@ -356,25 +356,26 @@ void validate_ungrouped_aggregate_numeric(const sirius::vector<cudf::table_view>
         }
     }
 
-    T expected_result;
     switch (aggregates[c]) {
         case cudf::aggregation::Kind::MIN: {
-            expected_result = *std::min_element(input_data_without_nulls.begin(), input_data_without_nulls.end());
+            TIn expected_result = *std::min_element(input_data_without_nulls.begin(), input_data_without_nulls.end());
+            REQUIRE(expected_result == actual_result);
             break;
         }
         case cudf::aggregation::Kind::MAX: {
-            expected_result = *std::max_element(input_data_without_nulls.begin(), input_data_without_nulls.end());
+            TIn expected_result = *std::max_element(input_data_without_nulls.begin(), input_data_without_nulls.end());
+            REQUIRE(expected_result == actual_result);
             break;
         }
         case cudf::aggregation::Kind::SUM:
         case cudf::aggregation::Kind::COUNT_ALL:
         case cudf::aggregation::Kind::COUNT_VALID: {
-            expected_result = std::accumulate(input_data_without_nulls.begin(), input_data_without_nulls.end(), 0);
+            int64_t expected_result = std::accumulate(
+                input_data_without_nulls.begin(), input_data_without_nulls.end(), int64_t{0});
+            REQUIRE(expected_result == actual_result);
             break;
         }
     }
-
-    REQUIRE(expected_result == actual_result);
 }
 
 void validate_ungrouped_aggregate(const sirius::vector<sirius::unique_ptr<data_batch_view>>& input_views,
@@ -389,18 +390,57 @@ void validate_ungrouped_aggregate(const sirius::vector<sirius::unique_ptr<data_b
     REQUIRE(output_table_view.num_rows() == 1);
 
     for (int c = 0; c < output_table_view.num_columns(); ++c) {
-        switch (output_table_view.column(c).type().id()) {
-            case cudf::type_id::INT32: {
-                validate_ungrouped_aggregate_numeric<int32_t>(input_table_views, output_table_view, aggregates, c);
+        cudf::data_type expected_output_type = input_table_views[0].column(c).type();
+        switch (aggregates[c]) {
+            case cudf::aggregation::Kind::SUM: {
+                if (expected_output_type.id() == cudf::type_id::INT8
+                    || expected_output_type.id() == cudf::type_id::INT16
+                    || expected_output_type.id() == cudf::type_id::INT32) {
+                    expected_output_type = cudf::data_type(cudf::type_id::INT64);
+                }
                 break;
             }
-            case cudf::type_id::INT64: {
-                validate_ungrouped_aggregate_numeric<int64_t>(input_table_views, output_table_view, aggregates, c);
+            case cudf::aggregation::Kind::COUNT_ALL:
+            case cudf::aggregation::Kind::COUNT_VALID: {
+                expected_output_type = cudf::data_type(cudf::type_id::INT64);
                 break;
             }
-            default:
-                throw std::runtime_error("Unsupported cudf::data_type in `validate_ungrouped_aggregate()`: "
-                    + std::to_string(static_cast<int>(output_table_view.column(c).type().id())));
+        }
+
+        REQUIRE(output_table_view.column(c).type().id() == expected_output_type.id());
+
+        if (expected_output_type.id() == cudf::type_id::INT64) {
+            switch (output_table_view.column(c).type().id()) {
+                case cudf::type_id::INT32: {
+                    validate_ungrouped_aggregate_numeric<int32_t, int64_t>(
+                        input_table_views, output_table_view, aggregates, c);
+                    break;
+                }
+                case cudf::type_id::INT64: {
+                    validate_ungrouped_aggregate_numeric<int64_t, int64_t>(
+                        input_table_views, output_table_view, aggregates, c);
+                    break;
+                }
+                default:
+                    throw std::runtime_error("Unsupported cudf::data_type in `validate_ungrouped_aggregate()`: "
+                        + std::to_string(static_cast<int>(output_table_view.column(c).type().id())));
+            }
+        } else {
+            switch (output_table_view.column(c).type().id()) {
+                case cudf::type_id::INT32: {
+                    validate_ungrouped_aggregate_numeric<int32_t, int32_t>(
+                        input_table_views, output_table_view, aggregates, c);
+                    break;
+                }
+                case cudf::type_id::INT64: {
+                    validate_ungrouped_aggregate_numeric<int64_t, int64_t>(
+                        input_table_views, output_table_view, aggregates, c);
+                    break;
+                }
+                default:
+                    throw std::runtime_error("Unsupported cudf::data_type in `validate_ungrouped_aggregate()`: "
+                        + std::to_string(static_cast<int>(output_table_view.column(c).type().id())));
+            }
         }
     }
 }
@@ -488,6 +528,48 @@ TEST_CASE("Ungrouped merge aggregate of with mixed empty and non-empty partial a
 
     auto input_views = create_batches_with_partial_ungrouped_agg_result(
         num_batches, num_base_input_rows, column_types, aggregates, data_repo_manager, *mem_space);
+    auto output_batch = gpu_merge::merge_ungrouped_aggregate(
+        input_views, aggregates, cudf::get_default_stream(), *mem_space, data_repo_manager);
+    validate_ungrouped_aggregate(input_views, *output_batch, aggregates);
+}
+
+TEST_CASE("Ungrouped merge aggregate with overflow", "[operator][merge_ungrouped_agg]") {
+    data_repository_manager data_repo_manager;
+    auto* mem_space = get_default_memory_space();
+    constexpr int num_batches = 10;
+    sirius::vector<cudf::aggregation::Kind> aggregates(3, cudf::aggregation::Kind::SUM);
+
+    // Create partial aggregated batches that can trigger overflow
+    sirius::vector<sirius::unique_ptr<cudf::scalar>> scalars;
+    scalars.push_back(std::move(cudf::make_fixed_width_scalar<int8_t>(
+        SCHAR_MAX, cudf::get_default_stream(), mem_space->get_default_allocator())));
+    scalars.push_back(std::move(cudf::make_fixed_width_scalar<int16_t>(
+        SHRT_MAX, cudf::get_default_stream(), mem_space->get_default_allocator())));
+    scalars.push_back(std::move(cudf::make_fixed_width_scalar<int32_t>(
+        INT_MAX, cudf::get_default_stream(), mem_space->get_default_allocator())));
+    sirius::vector<sirius::unique_ptr<data_batch_view>> input_views;
+    for (int i = 0; i < num_batches; ++i) {
+        // Create cudf table
+        sirius::vector<sirius::unique_ptr<cudf::column>> cudf_cols;
+        for (const auto& scalar: scalars) {
+            cudf_cols.push_back(std::move(
+                cudf::make_column_from_scalar(
+                    *scalar, 1, cudf::get_default_stream(), mem_space->get_default_allocator())));
+        }
+        auto cudf_table = sirius::make_unique<cudf::table>(std::move(cudf_cols));
+
+        // Create a batch from the table
+        auto gpu_repr = sirius::make_unique<gpu_table_representation>(*cudf_table, *mem_space);
+        auto batch = sirius::make_unique<data_batch>(data_repo_manager.get_next_data_batch_id(),
+                                                    data_repo_manager,
+                                                    std::move(gpu_repr));
+        auto* batch_ptr = batch.get();
+        data_repo_manager.add_new_data_batch(std::move(batch), {});
+        input_views.push_back(sirius::make_unique<data_batch_view>(batch_ptr));
+        input_views.back()->pin();
+    }
+
+    // Call merge function
     auto output_batch = gpu_merge::merge_ungrouped_aggregate(
         input_views, aggregates, cudf::get_default_stream(), *mem_space, data_repo_manager);
     validate_ungrouped_aggregate(input_views, *output_batch, aggregates);

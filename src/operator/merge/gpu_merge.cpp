@@ -84,9 +84,27 @@ gpu_merge::merge_ungrouped_aggregate(const sirius::vector<sirius::unique_ptr<dat
                 reduce_aggregation = cudf::make_max_aggregation<cudf::reduce_aggregation>();
                 break;
             }
-            case cudf::aggregation::Kind::SUM:
+            case cudf::aggregation::Kind::SUM: {
+                switch (output_type.id()) {
+                    case cudf::type_id::INT8:
+                    case cudf::type_id::INT16:
+                    case cudf::type_id::INT32: {
+                        output_type = cudf::data_type(cudf::type_id::INT64);
+                        break;
+                    }
+                    case cudf::type_id::UINT8:
+                    case cudf::type_id::UINT16:
+                    case cudf::type_id::UINT32: {
+                        output_type = cudf::data_type(cudf::type_id::UINT64);
+                        break;
+                    }
+                }
+                reduce_aggregation = cudf::make_sum_aggregation<cudf::reduce_aggregation>();
+                break;
+            }
             case cudf::aggregation::Kind::COUNT_ALL:
             case cudf::aggregation::Kind::COUNT_VALID: {
+                output_type = cudf::data_type(cudf::type_id::INT64);
                 reduce_aggregation = cudf::make_sum_aggregation<cudf::reduce_aggregation>();
                 break;
             }
