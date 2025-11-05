@@ -20,6 +20,8 @@
 #include "data/data_repository_manager.hpp"
 #include "memory/memory_space.hpp"
 
+#include <cudf/cudf_utils.hpp>
+
 namespace sirius {
 namespace op {
 
@@ -42,11 +44,30 @@ public:
      * @param input The input batches to be concatenated.
      * @param stream CUDA stream used for device memory operations and kernel launches.
      * @param memory_space The memory space used to allocate memory for the output data batch.
+     * @param data_repository_mgr The data repository manager that the output data batch belongs to.
      * 
      * @return The concatenated data batch with ownership.
      */
     static sirius::unique_ptr<data_batch> concat(
         const sirius::vector<sirius::unique_ptr<data_batch_view>>& input,
+        rmm::cuda_stream_view stream,
+        sirius::memory::memory_space& memory_space,
+        sirius::data_repository_manager& data_repository_mgr);
+
+    /**
+     * @brief Perform ungrouped merge aggregate on multiple data batches.
+     * 
+     * @param input The input batches to be merged.
+     * @param aggregates The aggregate functions, the size should be same as num columns of the input batches.
+     * @param stream CUDA stream used for device memory operations and kernel launches.
+     * @param memory_space The memory space used to allocate memory for the output data batch.
+     * @param data_repository_mgr The data repository manager that the output data batch belongs to.
+     * 
+     * @return The concatenated data batch with ownership.
+     */
+    static sirius::unique_ptr<data_batch> merge_ungrouped_aggregate(
+        const sirius::vector<sirius::unique_ptr<data_batch_view>>& input,
+        sirius::vector<cudf::aggregation::Kind> aggregates,
         rmm::cuda_stream_view stream,
         sirius::memory::memory_space& memory_space,
         sirius::data_repository_manager& data_repository_mgr);

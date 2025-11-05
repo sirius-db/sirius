@@ -300,6 +300,28 @@ std::mt19937_64& global_rng() {
   return gen;
 }
 
+template <typename T>
+sirius::unique_ptr<cudf::column> create_numeric_column_with_random_data(
+    size_t num_rows,
+    const cudf::data_type& dtype,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+    auto& gen = global_rng();
+    auto col = cudf::make_numeric_column(dtype,
+                                        num_rows,
+                                        cudf::mask_state::UNALLOCATED,
+                                        stream,
+                                        mr);
+    auto view = col->mutable_view();
+
+    std::uniform_int_distribution<T> dist(0, 1000);
+    sirius::vector<T> h_data(num_rows);
+    for (size_t r = 0; r < num_rows; ++r) h_data[r] = dist(gen);
+
+    cudaMemcpy(view.data<T>(), h_data.data(), sizeof(T) * num_rows, cudaMemcpyHostToDevice);
+    return col;
+}
+
 sirius::unique_ptr<cudf::table> create_cudf_table_with_random_data(
     size_t num_rows,
     const sirius::vector<cudf::data_type>& column_types,
@@ -312,19 +334,13 @@ sirius::unique_ptr<cudf::table> create_cudf_table_with_random_data(
     for (const auto& dtype : column_types) {
         switch (dtype.id()) {
             case cudf::type_id::INT32: {
-                auto col = cudf::make_numeric_column(dtype,
-                                                    num_rows,
-                                                    cudf::mask_state::UNALLOCATED,
-                                                    stream,
-                                                    mr);
-                auto view = col->mutable_view();
-
-                std::uniform_int_distribution<int32_t> dist(0, 1000);
-                sirius::vector<int32_t> h_data(num_rows);
-                for (size_t r = 0; r < num_rows; ++r) h_data[r] = dist(gen);
-
-                cudaMemcpy(view.data<int32_t>(), h_data.data(), sizeof(int32_t) * num_rows, cudaMemcpyHostToDevice);
-                cols.push_back(std::move(col));
+                cols.push_back(std::move(create_numeric_column_with_random_data<int32_t>(
+                    num_rows, dtype, stream, mr)));
+                break;
+            }
+            case cudf::type_id::INT64: {
+                cols.push_back(std::move(create_numeric_column_with_random_data<int64_t>(
+                    num_rows, dtype, stream, mr)));
                 break;
             }
             case cudf::type_id::STRING: {
