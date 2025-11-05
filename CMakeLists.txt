@@ -71,8 +71,9 @@ set(EXTENSION_SOURCES
   src/parallel/task_executor.cpp
 )
 add_subdirectory(src/operator)
-add_subdirectory(src/plan)
+add_subdirectory(src/scan)
 add_subdirectory(src/data)
+add_subdirectory(src/plan)
 
 set(CUDA_SOURCES 
   src/cuda/communication.cu 

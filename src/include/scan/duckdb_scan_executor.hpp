@@ -36,7 +36,7 @@ class duckdb_scan_executor : public itask_executor {
   {
   }
 
-  int get_num_threads() const { return _config.num_threads; }
+  int32_t get_num_threads() const { return _config.num_threads; }
 };
 
 }  // namespace sirius::parallel
