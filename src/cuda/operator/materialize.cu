@@ -131,7 +131,7 @@ __global__ void materialize_offset(uint64_t* offset, uint64_t* result_length, ui
     }
 }
 
-__global__ void materialize_string(
+__global__ void materialize_string_per_warp(
     const uint8_t* __restrict__ data,
     uint8_t* __restrict__ result,
     const uint64_t* __restrict__ input_offset,
@@ -140,7 +140,7 @@ __global__ void materialize_string(
     size_t num_rows)
 {
     constexpr int WARP_SIZE = 32;
-    size_t warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    size_t warp_id = (size_t(blockIdx.x) * blockDim.x + threadIdx.x) / WARP_SIZE;
     size_t lane = threadIdx.x % WARP_SIZE;
     if (warp_id >= num_rows) return;
 
@@ -205,6 +205,17 @@ __global__ void materialize_string(
         for (uint64_t i = lane; i < input_length; i += WARP_SIZE) {
             dst[i] = src[i];
         }
+    }
+}
+
+__global__ void materialize_string_per_thread(uint8_t* data, uint8_t* result, uint64_t* input_offset, uint64_t* materialized_offset, uint64_t* row_ids, size_t num_rows) {
+    size_t tid = threadIdx.x + size_t(blockIdx.x) * blockDim.x;
+    if (tid < num_rows) {
+        uint64_t copy_row_id = row_ids[tid];
+        uint64_t input_start_idx = input_offset[copy_row_id];
+        uint64_t input_length = input_offset[copy_row_id + 1] - input_offset[copy_row_id];
+        uint64_t output_start_idx = materialized_offset[tid];
+        memcpy(result + output_start_idx, data + input_start_idx, input_length * sizeof(uint8_t));
     }
 }
 
@@ -396,11 +407,18 @@ void materializeString(uint8_t* data, uint64_t* offset, uint8_t* &result, uint64
 
     result = gpuBufferManager->customCudaMalloc<uint8_t>(result_bytes[0], 0, 0);
 
-    constexpr int WARP_SIZE = 32;
-    uint64_t warps_per_block = BLOCK_THREADS / WARP_SIZE;
-    num_blocks = std::max<uint64_t>(1, (result_len + warps_per_block - 1) / warps_per_block);
+    // Adaptivly choose between thread-per-row and warp-per-row based on average string len,
+    // so far use a empricial threshold which can be refined later
+    uint64_t result_avg_len = *result_bytes / result_len;
+    if (result_avg_len > 8) {
+        constexpr int WARP_SIZE = 32;
+        uint64_t warps_per_block = BLOCK_THREADS / WARP_SIZE;
+        num_blocks = std::max<uint64_t>(1, (result_len + warps_per_block - 1) / warps_per_block);
+        materialize_string_per_warp<<<num_blocks, BLOCK_THREADS>>>(data, result, offset, result_offset, row_ids, result_len);
+    } else {
+        materialize_string_per_thread<<<num_blocks, BLOCK_THREADS>>>(data, result, offset, result_offset, row_ids, result_len);
+    }
 
-    materialize_string<<<num_blocks, BLOCK_THREADS>>>(data, result, offset, result_offset, row_ids, result_len);
     cudaDeviceSynchronize();
 
     gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(temp_len), 0);
