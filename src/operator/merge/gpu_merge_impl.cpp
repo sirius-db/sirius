@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "operator/merge/gpu_merge.hpp"
+#include "operator/merge/gpu_merge_impl.hpp"
 #include "data/gpu_data_representation.hpp"
 
 #include <cudf/concatenate.hpp>
@@ -23,10 +23,10 @@ namespace sirius {
 namespace op {
 
 sirius::unique_ptr<data_batch>
-gpu_merge::concat(const sirius::vector<sirius::unique_ptr<data_batch_view>>& input,
-                rmm::cuda_stream_view stream,
-                sirius::memory::memory_space& memory_space,
-                sirius::data_repository_manager& data_repository_mgr) {
+gpu_merge_impl::concat(const sirius::vector<sirius::unique_ptr<data_batch_view>>& input,
+                    rmm::cuda_stream_view stream,
+                    memory::memory_space& memory_space,
+                    data_repository_manager& data_repository_mgr) {
     // Sanity check.
     if (input.size() < 2) {
         throw std::runtime_error("`input` in `concat()` should at least contain two data batches");
@@ -49,11 +49,11 @@ gpu_merge::concat(const sirius::vector<sirius::unique_ptr<data_batch_view>>& inp
 }
 
 sirius::unique_ptr<data_batch> 
-gpu_merge::merge_ungrouped_aggregate(const sirius::vector<sirius::unique_ptr<data_batch_view>>& input,
-                                    sirius::vector<cudf::aggregation::Kind> aggregates,
-                                    rmm::cuda_stream_view stream,
-                                    sirius::memory::memory_space& memory_space,
-                                    sirius::data_repository_manager& data_repository_mgr) {
+gpu_merge_impl::merge_ungrouped_aggregate(const sirius::vector<sirius::unique_ptr<data_batch_view>>& input,
+                                        const sirius::vector<cudf::aggregation::Kind>& aggregates,
+                                        rmm::cuda_stream_view stream,
+                                        memory::memory_space& memory_space,
+                                        data_repository_manager& data_repository_mgr) {
     // Sanity check.
     if (input.size() < 2) {
         throw std::runtime_error("`input` in `merge_ungrouped_aggregate()` should at least contain two data batches");
@@ -109,7 +109,7 @@ gpu_merge::merge_ungrouped_aggregate(const sirius::vector<sirius::unique_ptr<dat
                 break;
             }
             default:
-                throw std::runtime_error("Unsupported cudf aggregate kind in `merge_ungrouped_aggregate`: "
+                throw std::runtime_error("Unsupported cudf aggregate kind in `merge_ungrouped_aggregate()`: "
                     + std::to_string(static_cast<int>(aggregates[c])));
         }
         auto output_scalar = cudf::reduce(concatenated->get_column(c),

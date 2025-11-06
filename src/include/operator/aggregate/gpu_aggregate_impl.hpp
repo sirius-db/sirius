@@ -26,51 +26,58 @@ namespace sirius {
 namespace op {
 
 /**
- * @brief Functionalities for mergeing multiple data batches into a single one.
+ * @brief Functionalities for running local aggregation on a data batch.
  * 
  * Provide functionalities including:
- * - Concatenate multiple data batches;
- * - Merge aggregation over multiple data batches (presumebaly each input data batch is a local aggregation result);
- * - Merge sort over multiple sorted data batches.
+ * - Local ungrouped aggregation;
+ * - Local grouped aggregation
  * 
  * Require caller to have already upgraded input data batches into `gpu_table_representation`
  * (the input data batch views are pinned).
  */
-class gpu_merge {
+class gpu_aggregate_impl {
 public:
     /**
-     * @brief Concatenate multiple data batches.
+     * @brief Perform local ungrouped aggregate on the input data batch.
      * 
-     * @param input The input batches to be concatenated.
+     * @param input The input data batch.
+     * @param aggregates The aggregate functions.
+     * @param aggregate_idx The aggregate columns, should have the same size as `aggregates`.
      * @param stream CUDA stream used for device memory operations and kernel launches.
      * @param memory_space The memory space used to allocate memory for the output data batch.
      * @param data_repository_mgr The data repository manager that the output data batch belongs to.
      * 
-     * @return The concatenated data batch with ownership.
+     * @return The output data batch with ownership.
      */
-    static sirius::unique_ptr<data_batch> concat(
-        const sirius::vector<sirius::unique_ptr<data_batch_view>>& input,
+    static sirius::unique_ptr<data_batch> local_ungrouped_aggregate(
+        const data_batch_view& input,
+        const sirius::vector<cudf::aggregation::Kind>& aggregates,
+        const sirius::vector<int>& aggregate_idx,
         rmm::cuda_stream_view stream,
-        sirius::memory::memory_space& memory_space,
-        sirius::data_repository_manager& data_repository_mgr);
+        memory::memory_space& memory_space,
+        data_repository_manager& data_repository_mgr);
 
     /**
-     * @brief Perform ungrouped merge aggregate on multiple data batches.
+     * @brief Perform local grouped aggregate on the input data batch.
      * 
-     * @param input The input batches to be merged.
-     * @param aggregates The aggregate functions, the size should be same as num columns of the input batches.
+     * @param input The input data batch.
+     * @param group_idx The group columns.
+     * @param aggregates The aggregate functions.
+     * @param aggregate_idx The aggregate columns, should have the same size as `aggregates`.
      * @param stream CUDA stream used for device memory operations and kernel launches.
      * @param memory_space The memory space used to allocate memory for the output data batch.
      * @param data_repository_mgr The data repository manager that the output data batch belongs to.
      * 
-     * @return The concatenated data batch with ownership.
+     * @return The output data batch with ownership.
      */
-    static sirius::unique_ptr<data_batch> merge_ungrouped_aggregate(
-        const sirius::vector<sirius::unique_ptr<data_batch_view>>& input,
-        sirius::vector<cudf::aggregation::Kind> aggregates,
+    static sirius::unique_ptr<data_batch> local_grouped_aggregate(
+        const data_batch_view& input,
+        const sirius::vector<int>& group_idx,
+        const sirius::vector<cudf::aggregation::Kind>& aggregates,
+        const sirius::vector<int>& aggregate_idx,
         rmm::cuda_stream_view stream,
-        sirius::memory::memory_space& memory_space,
-        sirius::data_repository_manager& data_repository_mgr);
+        memory::memory_space& memory_space,
+        data_repository_manager& data_repository_mgr);
 };
 
 } // namespace op
