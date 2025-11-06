@@ -30,6 +30,6 @@ uint64_t Config::OPT_TABLE_SCAN_CUDA_MEMCPY_SIZE = 64UL * 1024 * 1024;  // 64 MB
 
 uint64_t Config::PRINT_GPU_TABLE_MAX_ROWS = 1000;
 
-bool Config::ENABLE_FALLBACK_CHECK = true;
+bool Config::ENABLE_FALLBACK_CHECK = false;
 
 }
