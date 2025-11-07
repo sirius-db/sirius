@@ -20,22 +20,24 @@
 #include <scan/duckdb_scan_task.hpp>
 
 // duckdb
+#include <duckdb/common/types.hpp>
 #include <duckdb/function/table_function.hpp>
-
-#include <cstddef>
+#include <sys/types.h>
 
 namespace sirius::parallel {
 
 //===----------------------------------------------------------------------===//
-// DuckDB Scan Task Global State
+// duckdb_scan_task_global_state
 //===----------------------------------------------------------------------===//
 duckdb_scan_task_global_state::duckdb_scan_task_global_state(
   uint64_t pipeline_id,
-  duckdb_scan_executor const& scan_executor,
+  duckdb_scan_executor& scan_exec,
   duckdb::ClientContext& client_ctx,
   duckdb::physical_table_scan_adapter const& ptsa)
   : pipeline_id(pipeline_id),
-    max_threads(scan_executor.get_num_threads()) op(ptsa.physical_table_scan)
+    max_threads(scan_exec.get_num_threads()),
+    scan_executor(scan_exec),
+    op(ptsa.physical_table_scan)
 {
   // Initialize global table function state
   if (op.function.init_global) {
@@ -58,15 +60,177 @@ duckdb_scan_task_global_state::duckdb_scan_task_global_state(
 }
 
 //===----------------------------------------------------------------------===//
-// DuckDB Scan Task Local State
+// duckdb_scan_task_local_state::column_builder
+//===----------------------------------------------------------------------===//
+duckdb_scan_task_local_state::column_builder::column_builder(duckdb::LogicalType t)
+  : type(t), type_size(duckdb::GetTypeIdSize(type.InternalType()))
+{
+  auto& mem_res_mgr  = memory::memory_reservation_manager::get_instance();
+  auto mem_spaces    = mem_res_mgr.get_memory_spaces_for_tier(memory::Tier::HOST);
+  auto allocator_ref = mem_spaces[HOST_SPACE_INDEX]->get_default_allocator();
+  // allocator = dynamic_cast<sirius::memory::fixed_size_host_memory_resource>(allocator_ref);
+}
+
+duckdb_scan_task_local_state::column_builder::~column_builder()
+{
+  // Release reservations. Memory is deallocated automatically.
+  auto& mem_res_mgr = memory::memory_reservation_manager::get_instance();
+  if (data_reservation) { mem_res_mgr.release_reservation(std::move(data_reservation)); }
+  if (mask_reservation) { mem_res_mgr.release_reservation(std::move(mask_reservation)); }
+  if (offset_reservation) { mem_res_mgr.release_reservation(std::move(offset_reservation)); }
+}
+
+void duckdb_scan_task_local_state::column_builder::reserve_memory(size_t estimated_num_rows)
+{
+  assert(size > 0);
+
+  auto& mem_res_mgr = memory::memory_reservation_manager::get_instance();
+  data_reservation  = mem_res_mgr.request_reservation(res_request, type_size * estimated_num_rows);
+  mask_reservation =
+    mem_res_mgr.request_reservation(res_request, utils::ceil_div_8(estimated_num_rows));
+  if (type == duckdb::LogicalTypeId::VARCHAR) {
+    offset_reservation =
+      mem_res_mgr.request_reservation(res_request, sizeof(int64_t) * (estimated_num_rows + 1));
+  }
+}
+
+void duckdb_scan_task_local_state::column_builder::allocate_memory()
+{
+  assert(data_reservation);
+  assert(mask_reservation);
+
+  data_blocks_accessor.initialize(sirius::make_unique<multiple_blocks_allocation>(
+    allocator->allocate_multiple_blocks(data_reservation->size)));
+  mask_blocks_accessor.initialize(sirius::make_unique<multiple_blocks_allocation>(
+    allocator->allocate_multiple_blocks(mask_reservation->size)));
+  if (type == duckdb::LogicalTypeId::VARCHAR) {
+    assert(offset_reservation);
+
+    offset_blocks_accessor.initialize(sirius::make_unique<multiple_blocks_allocation>(
+      allocator->allocate_multiple_blocks(offset_reservation->size)));
+
+    // Initialize the running prefix sum of offsets to zero
+    offset_blocks_accessor.set_current(0);
+  }
+}
+
+bool duckdb_scan_task_local_state::column_builder::sufficient_space_for_column(
+  duckdb::Vector& vec, duckdb::ValidityMask const& validity, size_t num_rows)
+{
+  size_t data_bytes = 0;
+  if (type == duckdb::LogicalTypeId::VARCHAR) {
+    auto const* str_data = reinterpret_cast<duckdb::string_t const*>(vec.GetData());
+    for (size_t row = 0; row < num_rows; ++row) {
+      data_bytes += str_data[row].GetSize();
+    }
+  } else {
+    // Fixed-width column
+    data_bytes = type_size * num_rows;
+  }
+  return data_bytes + total_data_bytes <= data_reservation->size;
+}
+
+void duckdb_scan_task_local_state::column_builder::process_mask_for_column(
+  duckdb::ValidityMask const& validity, size_t num_rows, size_t row_offset)
+{
+  auto const* src_valid = reinterpret_cast<uint8_t const*>(validity.GetData());
+  auto const cur_bit    = utils::mod_8(row_offset);  //< bit offset in current byte
+  auto const num_bits   = num_rows;
+
+  if (cur_bit == 0) {
+    // Byte aligned case
+    auto const full_bytes = utils::div_8(num_bits);
+    auto const tail_bits  = utils::mod_8(num_bits);
+    mask_blocks_accessor.memcpy_from(src_valid, full_bytes);
+    if (tail_bits > 0) {
+      auto const tail_mask = utils::make_mask<uint8_t>(tail_bits);
+      auto const tail      = src_valid[full_bytes] & tail_mask;
+      mask_blocks_accessor.set_current(tail);
+      mask_blocks_accessor.advance();
+    }
+  } else {
+    // Byte unaligned case
+    auto const num_bytes = utils::ceil_div_8(num_bits);
+    for (size_t b = 0; b < num_bytes; ++b) {
+      auto src_byte = src_valid[b];
+      // The current number of bits we are copying from src_byte
+      auto const cur_bits = std::min<uint32_t>(CHAR_BIT, num_bits - utils::mul_8(b));
+      // Mask the source byte to only the bits we care about
+      src_byte = src_byte & utils::make_mask<uint8_t>(cur_bits);
+      // The number of bits that fit in the current destination byte (the lower bits from src_byte)
+      auto const num_lower_bits = std::min<uint32_t>(CHAR_BIT - cur_bit, cur_bits);
+      // The lower bits from the source byte to copy into the current destination byte, shifted into
+      // position for copying into the destination byte
+      auto const lower_bits =
+        static_cast<uint8_t>((src_byte & utils::make_mask<uint8_t>(num_lower_bits)) << cur_bit);
+      // The mask for the lower bits in the destination byte
+      auto const lower_mask =
+        static_cast<uint8_t>(utils::make_mask<uint8_t>(num_lower_bits) << cur_bit);
+      // Set the lower bits in the current destination byte
+      mask_blocks_accessor.set_current((mask_blocks_accessor.get_current() & ~lower_mask) |
+                                       lower_bits);
+      mask_blocks_accessor.advance();
+
+      // There may be leftover bits (the upper bits from src_byte) to propagate to the next byte
+      auto const num_upper_bits = cur_bits - num_lower_bits;
+      if (num_upper_bits > 0) {
+        // The mask for the bits in the next destination byte
+        auto const upper_mask = utils::make_mask<uint8_t>(num_upper_bits);
+        // The upper bits from the source byte to copy into the next destination byte, shifted into
+        // postion for copying into the destination byte
+        auto const upper_bits = static_cast<uint8_t>((src_byte >> num_lower_bits) & upper_mask);
+        // Set the bits in the next destination byte
+        mask_blocks_accessor.set_current((mask_blocks_accessor.get_current() & ~upper_mask) |
+                                         upper_bits);
+      }
+    }
+  }
+}
+
+void duckdb_scan_task_local_state::column_builder::process_column(
+  duckdb::Vector& vec, duckdb::ValidityMask const& validity, size_t num_rows, size_t row_offset)
+{
+  // PRECONDITION: Vector must be flattened
+  if (type == duckdb::LogicalTypeId::VARCHAR) {
+    size_t data_bytes    = 0;
+    auto const* str_data = reinterpret_cast<duckdb::string_t const*>(vec.GetData());
+    for (size_t row = 0; row < num_rows; ++row) {
+      auto const prev_offset = offset_blocks_accessor.get_current();
+      offset_blocks_accessor.advance();
+      if (validity.RowIsValid(row)) {
+        auto const& str = str_data[row];
+        auto const len  = str.GetSize();
+        offset_blocks_accessor.set_current(prev_offset + len);
+
+        // Copy string data
+        data_blocks_accessor.memcpy_from(str.GetData(), len);
+
+        // Update data bytes
+        data_bytes += len;
+      } else {
+        offset_blocks_accessor.set_current(prev_offset);
+      }
+    }
+    total_data_bytes += data_bytes;
+  } else {
+    // Fixed-width column
+    auto const data_bytes = type_size * num_rows;
+    data_blocks_accessor.memcpy_from(vec.GetData(), data_bytes);
+    total_data_bytes += data_bytes;
+  }
+
+  process_mask_for_column(validity, num_rows, row_offset);
+}
+
+//===----------------------------------------------------------------------===//
+// duckdb_scan_task_local_state
 //===----------------------------------------------------------------------===//
 //===----------Constructor----------===//
 duckdb_scan_task_local_state::duckdb_scan_task_local_state(
   duckdb_scan_task_global_state& g_state,
-  memory::memory_reservation_manager& mem_res_mgr,
   duckdb::ExecutionContext& exec_ctx,
   size_t approximate_batch_size = DEFAULT_APPROXIMATE_BATCH_SIZE)
-  : mem_res_mgr(mem_res_mgr), exec_ctx(exec_ctx), approximate_batch_size(approximate_batch_size)
+  : approximate_batch_size(approximate_batch_size), exec_ctx(exec_ctx)
 {
   auto const& op = g_state.op;
   num_columns    = op.projection_ids.size();
@@ -74,26 +238,14 @@ duckdb_scan_task_local_state::duckdb_scan_task_local_state(
   // Initialize local table function state
   initialize_local_table_function_state(op, exec_ctx, g_state.global_tf_state.get());
 
-  // Initialize the batch metadata and get the estimated row size in bytes
-  auto const estimated_row_size = initialize_batch_metadata(op);
+  // Initialize the column builders and get the estimated row size in bytes
+  initialize_builders(op);
 
   // Estimate number of rows per batch
-  auto const estimated_num_rows = estimate_rows_per_batch(estimated_row_size);
+  estimate_rows_per_batch();
 
   // Allocate data buffers
-  make_memory_reservations(mem_res_mgr, estimated_num_rows);
-}
-
-//===----------Destructor----------===//
-duckdb_scan_task_local_state::~duckdb_scan_task_local_state()
-{
-  for (size_t i = 0; i < num_columns; ++i) {
-    if (data_reservations[i]) { mem_res_mgr.release_reservation(std::move(data_reservations[i])); }
-    if (mask_reservations[i]) { mem_res_mgr.release_reservation(std::move(mask_reservations[i])); }
-    if (offset_reservations[i]) {
-      mem_res_mgr.release_reservation(std::move(offset_reservations[i]));
-    }
-  }
+  initialize_buffers();
 }
 
 void duckdb_scan_task_local_state::initialize_local_table_function_state(
@@ -108,56 +260,129 @@ void duckdb_scan_task_local_state::initialize_local_table_function_state(
   }
 }
 
-size_t duckdb_scan_task_local_state::initialize_batch_metadata(const duckdb::PhysicalTableScan& op)
+void duckdb_scan_task_local_state::initialize_builders(const duckdb::PhysicalTableScan& op)
 {
   // Initialize projected types and column sizes
-  scanned_types.resize(num_columns);
-  column_sizes.resize(num_columns);
-  size_t estimated_row_size = 0;
+  column_builders.reserve(num_columns);
   for (size_t i = 0; i < num_columns; ++i) {
-    scanned_types[i] = op.returned_types[op.column_ids[i].GetPrimaryIndex()];
-    if (scanned_types[i] == duckdb::LogicalTypeId::VARCHAR) {
+    duckdb::LogicalType const col_type = op.returned_types[op.column_ids[i].GetPrimaryIndex()];
+    column_builders.emplace_back(col_type);
+    if (col_type == duckdb::LogicalTypeId::VARCHAR) {
       varchar_indices.push_back(i);
-      column_sizes[i] = DEFAULT_VARCHAR_SIZE;
+      estimated_row_size += DEFAULT_VARCHAR_SIZE;
     } else {
-      column_sizes[i] = duckdb::GetTypeIdSize(scanned_types[i].InternalType());
+      estimated_row_size += duckdb::GetTypeIdSize(col_type.InternalType());
     }
-    byte_offsets[i] = 0;
-    estimated_row_size += column_sizes[i];
   }
-  return estimated_row_size;
 }
 
-void duckdb_scan_task_local_state::make_memory_reservations(
-  memory::memory_reservation_manager& mem_res_mgr, size_t estimated_num_rows)
+void duckdb_scan_task_local_state::estimate_rows_per_batch()
 {
-  data_reservations.resize(num_columns, nullptr);
-  mask_reservations.resize(num_columns, nullptr);
-  offset_reservations.resize(num_columns, nullptr);
+  estimated_rows_per_batch =
+    utils::ceil_div(estimated_row_size * CHAR_BIT + num_columns, approximate_batch_size * CHAR_BIT);
+}
 
-  // HOST memory reservation request
-  struct memory::any_memory_space_in_tier res_request(memory::Tier::HOST);
-
+void duckdb_scan_task_local_state::initialize_buffers()
+{
   for (size_t i = 0; i < num_columns; ++i) {
-    // Allocate data buffer
-    data_reservations[i] =
-      mem_res_mgr.request_reservation(res_request, column_sizes[i] * estimated_num_rows);
-
-    // Allocate null mask buffer
-    mask_reservations[i] =
-      mem_res_mgr.request_reservation(res_request, utils::ceil_div_8(estimated_num_rows));
-
-    // Allocate offset buffer for VARCHAR columns
-    if (scanned_types[i] == duckdb::LogicalTypeId::VARCHAR) {
-      offset_reservations[i] =
-        mem_res_mgr.request_reservation(res_request, sizeof(uint64_t) * (estimated_num_rows + 1));
-    }
+    column_builders[i].reserve_memory(estimated_rows_per_batch);
+    column_builders[i].allocate_memory();
   }
 }
 
-size_t duckdb_scan_task_local_state::estimate_rows_per_batch(size_t estimated_row_size)
+//===----------------------------------------------------------------------===//
+// DuckDB Scan Task
+//===----------------------------------------------------------------------===//
+bool get_next_chunk(duckdb_scan_task_local_state& l_state, duckdb_scan_task_global_state& g_state)
 {
-  return utils::ceil_div(estimated_row_size * CHAR_BIT + 1, approximate_batch_size * CHAR_BIT);
+  duckdb::TableFunctionInput tf_input(
+    g_state.op.bind_data.get(), l_state.local_tf_state.get(), g_state.global_tf_state.get());
+  g_state.op.function.function(l_state.exec_ctx.client, tf_input, l_state.chunk);
+
+  if (l_state.chunk.size() == 0) {
+    g_state.SetSourceDrained();
+    return false;
+  }
+  return true;
+}
+
+bool chunk_fits(duckdb_scan_task_local_state& l_state)
+{
+  // Loop over the VARCHAR columns and check if they fit in the allocated buffers
+  for (auto varchar_idx : l_state.varchar_indices) {
+    if (!l_state.column_builders[varchar_idx].sufficient_space_for_column(
+          l_state.chunk.data[varchar_idx],
+          duckdb::FlatVector::Validity(l_state.chunk.data[varchar_idx]),
+          l_state.chunk.size())) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void duckdb_scan_task::process_chunk(duckdb_scan_task_local_state& l_state)
+{
+  for (size_t i = 0; i < l_state.num_columns; ++i) {
+    auto& vec = l_state.chunk.data[i];
+    vec.Flatten(l_state.chunk.size());
+    auto const& validity = duckdb::FlatVector::Validity(vec);
+    l_state.column_builders[i].process_column(
+      vec, validity, l_state.chunk.size(), l_state.row_offset);
+  }
+  l_state.row_offset += l_state.chunk.size();
+}
+
+void duckdb_scan_task::execute()
+{
+  // Cast base task states to DuckDB scan task states
+  auto& l_state = this->_local_state->cast<duckdb_scan_task_local_state>();
+  auto& g_state = this->_global_state->cast<duckdb_scan_task_global_state>();
+
+  // Initialize the data chunk
+  l_state.chunk.Initialize(duckdb::Allocator::Get(l_state.exec_ctx.client),
+                           g_state.op.returned_types);
+
+  // Enter the scan loop to accumulate a data batch
+  bool is_finished = g_state.IsSourceDrained();
+  while (get_next_chunk(l_state, g_state)) {
+    // We know a priori that the fixed-width columns and masks will fit in the allocated buffers.
+    // For variable-length columns, we need to check that we have enough space.
+    // If there isn't enough space, we just throw an exception for now. In the future, we will
+    // push the current data batch into a new scan task.
+    if (!chunk_fits(l_state)) {
+      std::string err_msg =
+        "[duckdb_scan_task]: current chunk does not fit in the allocated buffers.";
+      throw duckdb::InternalException(err_msg);
+    }
+
+    // Process the chunk into the column builders
+    process_chunk(l_state);
+    l_state.row_offset += l_state.chunk.size();
+
+    // Termination condition
+    if (STANDARD_VECTOR_SIZE * l_state.row_offset >= l_state.estimated_rows_per_batch) { break; }
+  }
+
+  // Add tasks back to the queue if the scan is not finished
+  if (!g_state.IsSourceDrained()) {
+    /// FUTURE WORK: we need the task_creator to get the next task id. For now, we just increment
+    /// the task id by the number of workers.
+    auto const new_task_id = this->task_id + g_state.max_threads;
+    auto new_local_state   = sirius::make_unique<duckdb_scan_task_local_state>(
+      g_state, l_state.exec_ctx, l_state.approximate_batch_size);
+    auto shared_global_state =
+      std::static_pointer_cast<duckdb_scan_task_global_state>(this->_global_state);
+    auto next_task = sirius::make_unique<duckdb_scan_task>(
+      new_task_id, dr_mgr, std::move(new_local_state), shared_global_state);
+    g_state.scan_executor.schedule(std::move(next_task));
+  }
+
+  // TODO: Create the data batch and push it to the data repository.
+  // Temporary solution, given the difficulty of constructing host table metadata, is to make a
+  // cudf::table in device memory, then move it to the host memory tier, so that CUDF can handle the
+  // metadata construction.
+
+  /// FUTURE WORK: Notify task_creator of completion by sending a message to the message queue
 }
 
 }  // namespace sirius::parallel
