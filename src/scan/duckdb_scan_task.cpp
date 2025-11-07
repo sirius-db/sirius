@@ -65,10 +65,16 @@ duckdb_scan_task_global_state::duckdb_scan_task_global_state(
 duckdb_scan_task_local_state::column_builder::column_builder(duckdb::LogicalType t)
   : type(t), type_size(duckdb::GetTypeIdSize(type.InternalType()))
 {
-  auto& mem_res_mgr  = memory::memory_reservation_manager::get_instance();
-  auto mem_spaces    = mem_res_mgr.get_memory_spaces_for_tier(memory::Tier::HOST);
-  auto allocator_ref = mem_spaces[HOST_SPACE_INDEX]->get_default_allocator();
-  // allocator = dynamic_cast<sirius::memory::fixed_size_host_memory_resource>(allocator_ref);
+  auto& mem_res_mgr = memory::memory_reservation_manager::get_instance();
+  auto mem_space    = mem_res_mgr.get_memory_spaces_for_tier(memory::Tier::HOST)[HOST_SPACE_INDEX];
+  allocator =
+    mem_space->get_default_allocator_as<sirius::memory::fixed_size_host_memory_resource>();
+
+  // Check that the allocator is not nullptr
+  if (allocator == nullptr) {
+    throw std::runtime_error(
+      "Failed to get fixed_size_host_memory_resource allocator for HOST memory space.");
+  }
 }
 
 duckdb_scan_task_local_state::column_builder::~column_builder()
@@ -293,7 +299,8 @@ void duckdb_scan_task_local_state::initialize_buffers()
 //===----------------------------------------------------------------------===//
 // DuckDB Scan Task
 //===----------------------------------------------------------------------===//
-bool get_next_chunk(duckdb_scan_task_local_state& l_state, duckdb_scan_task_global_state& g_state)
+bool duckdb_scan_task::get_next_chunk(duckdb_scan_task_local_state& l_state,
+                                      duckdb_scan_task_global_state& g_state)
 {
   duckdb::TableFunctionInput tf_input(
     g_state.op.bind_data.get(), l_state.local_tf_state.get(), g_state.global_tf_state.get());
@@ -306,14 +313,15 @@ bool get_next_chunk(duckdb_scan_task_local_state& l_state, duckdb_scan_task_glob
   return true;
 }
 
-bool chunk_fits(duckdb_scan_task_local_state& l_state)
+bool duckdb_scan_task::chunk_fits(duckdb_scan_task_local_state& l_state)
 {
   // Loop over the VARCHAR columns and check if they fit in the allocated buffers
   for (auto varchar_idx : l_state.varchar_indices) {
+    auto& vec = l_state.chunk.data[varchar_idx];
+    vec.Flatten(l_state.chunk.size());
+    auto const& validity = duckdb::FlatVector::Validity(l_state.chunk.data[varchar_idx]);
     if (!l_state.column_builders[varchar_idx].sufficient_space_for_column(
-          l_state.chunk.data[varchar_idx],
-          duckdb::FlatVector::Validity(l_state.chunk.data[varchar_idx]),
-          l_state.chunk.size())) {
+          vec, validity, l_state.chunk.size())) {
       return false;
     }
   }
@@ -347,8 +355,8 @@ void duckdb_scan_task::execute()
   while (get_next_chunk(l_state, g_state)) {
     // We know a priori that the fixed-width columns and masks will fit in the allocated buffers.
     // For variable-length columns, we need to check that we have enough space.
-    // If there isn't enough space, we just throw an exception for now. In the future, we will
-    // push the current data batch into a new scan task.
+    // If there isn't enough space, we just throw an exception for now.
+    /// FUTURE WORK: push the current data batch into a new scan task.
     if (!chunk_fits(l_state)) {
       std::string err_msg =
         "[duckdb_scan_task]: current chunk does not fit in the allocated buffers.";
@@ -377,7 +385,7 @@ void duckdb_scan_task::execute()
     g_state.scan_executor.schedule(std::move(next_task));
   }
 
-  // TODO: Create the data batch and push it to the data repository.
+  /// TODO: Create the data batch and push it to the data repository.
   // Temporary solution, given the difficulty of constructing host table metadata, is to make a
   // cudf::table in device memory, then move it to the host memory tier, so that CUDF can handle the
   // metadata construction.

@@ -22,6 +22,10 @@
 
 namespace sirius::parallel {
 
+//===----------------------------------------------------------------------===//
+// DuckDB Scan Executor
+//===----------------------------------------------------------------------===//
+
 /**
  * @brief A task executor for duckdb scan tasks.
  *
@@ -31,11 +35,18 @@ namespace sirius::parallel {
  */
 class duckdb_scan_executor : public itask_executor {
  public:
+  //===----------Constructor----------===//
   explicit duckdb_scan_executor(task_executor_config config)
     : itask_executor(make_unique<duckdb_scan_task_queue>(), config)
   {
   }
 
+  //===----------Methods----------===//
+  /**
+   * @brief Get the number of threads in the thread pool for this executor.
+   *
+   * @return The number of threads in the thread pool for this executor.
+   */
   int32_t get_num_threads() const { return _config.num_threads; }
 };
 

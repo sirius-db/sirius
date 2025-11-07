@@ -24,18 +24,37 @@
 #include <duckdb/function/table_function.hpp>
 
 namespace duckdb {
-//===--------------------------------------------------===//
-// DuckDBPhysicalTableScan
-//===--------------------------------------------------===//
+//===----------------------------------------------------------------------===//
+// Physical Table Scan Adapter
+//===----------------------------------------------------------------------===//
 
 /**
- * @brief Adapter class that wraps a DuckDB PhysicalTableScan operator for use in Sirius pipelines.
+ * @brief Adapter class that wraps a DuckDB PhysicalTableScan operator and inherits from
+ * GPUPhysicalOperator.
  */
 class physical_table_scan_adapter : GPUPhysicalOperator {
  public:
   static constexpr PhysicalOperatorType TYPE = PhysicalOperatorType::TABLE_SCAN;
 
   //===----------Constructor----------===//
+  /**
+   * @brief Construct a new physical_table_scan_adapter object (has the same signature as DuckDB's
+   * PhysicalTableScan).
+   *
+   * @param[in] type
+   * @param[in] function the table function
+   * @param[in] bind_data bind data for the table function
+   * @param[in] returned_types the types of ALL columns that can be returned by the table function
+   * @param[in] column_ids the column ids used within the table function
+   * @param[in] projection_ids the projected-out column ids
+   * @param[in] names the names of the columns
+   * @param[in] table_filters the table filters
+   * @param[in] estimated_cardinality the estimated cardinality of the scan
+   * @param[in] extra_info extra operator info (currently stores info related to filters pushed down
+   * into MultiFileLists and sample rate pushed down into the table scan)
+   * @param[in] parameters contains a reference to dynamically generated table filters (through e.g.
+   * a join up in the tree)
+   */
   physical_table_scan_adapter(vector<duckdb::LogicalType> types,
                               TableFunction function,
                               unique_ptr<FunctionData> bind_data,

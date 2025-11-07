@@ -17,8 +17,7 @@
 #pragma once
 
 // sirius
-#include "parallel/task.hpp"
-
+#include <parallel/task.hpp>
 #include <parallel/task_queue.hpp>
 
 // duckdb
@@ -29,19 +28,25 @@
 
 namespace sirius::parallel {
 
+//===----------------------------------------------------------------------===//
+// DuckDB Scan Task Queue
+//===----------------------------------------------------------------------===//
+
 /**
  * @brief A concurrent scan task queue for duckdb scan tasks.
  *
  * This class implements a concurrent task queue simply by wrapping moodycamel's
- * BlockingConcurrentQueue, provided as an external dependency by DuckDB.
+ * BlockingConcurrentQueue, provided as an external dependency by DuckDB. The constructor uses the
+ * default configuration for the underlying BlockingConcurrentQueue.
  *
  */
 class duckdb_scan_task_queue : public itask_queue {
  public:
-  // Constructor using the default configuration for the underlying BlockingConcurrentQueue.
+  //===----------Constructor & Destructor----------===//
   duckdb_scan_task_queue() : _queue() {}
   ~duckdb_scan_task_queue() override = default;
 
+  //===----------Methods----------===//
   void open() override { _is_open.store(true, std::memory_order_release); }
 
   void close() override { _is_open.store(false, std::memory_order_release); }
@@ -64,6 +69,7 @@ class duckdb_scan_task_queue : public itask_queue {
   }
 
  private:
+  //===----------Fields----------===//
   std::atomic<bool> _is_open{false};
   duckdb_moodycamel::BlockingConcurrentQueue<unique_ptr<itask>> _queue;
 };
