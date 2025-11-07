@@ -53,15 +53,24 @@ __device__ void extract_domain(cudf::string_view* out, cuda::std::optional<cudf:
         next = next.substr(4, next.length() - 4);
     }
 
-    // For "([^/]+)"
+    // For "([^/]+)/"
     if (next.empty() || next[0] == '/') {
         *out = url;
         return;
     }
-
-    // For "/.*" and "\1"
     auto pos = next.find('/');
-    *out = (pos == cudf::string_view::npos) ? url : next.substr(0, pos);
+    if (pos == cudf::string_view::npos) {
+        *out = url;
+        return;
+    }
+    *out = next.substr(0, pos);
+
+    // For "/.*", a newline ('\n') will trigger mismatch
+    next = next.substr(pos + 1, next.length() - pos - 1);
+    if (next.find('\n') != cudf::string_view::npos) {
+        *out = url;
+        return;
+    }
 }
 )***";
 
