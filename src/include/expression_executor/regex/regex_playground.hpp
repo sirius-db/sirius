@@ -14,24 +14,20 @@
  * limitations under the License.
  */
 
-#include "config.hpp"
+#pragma once
 
-namespace duckdb {
+#include <cudf/column/column_factories.hpp>
+#include <cudf/transform.hpp>
+#include <cudf/copying.hpp>
+#include <rmm/cuda_stream_view.hpp>
 
-bool Config::USE_PIN_MEM_FOR_CPU_PROCESSING = true;
+namespace sirius {
+namespace expression {
 
-bool Config::USE_CUDF_EXPR = true;
+class regex_playground {
+public:
+    static std::unique_ptr<cudf::column> jit_transform_clickbench_q28_regex(const cudf::column_view& input);
+};
 
-bool Config::USE_CUSTOM_TOP_N = true;
-
-bool Config::USE_OPT_TABLE_SCAN = true;
-int Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS = 8;
-uint64_t Config::OPT_TABLE_SCAN_CUDA_MEMCPY_SIZE = 64UL * 1024 * 1024;  // 64 MB
-
-uint64_t Config::PRINT_GPU_TABLE_MAX_ROWS = 1000;
-
-bool Config::ENABLE_FALLBACK_CHECK = false;
-
-bool Config::ENABLE_REGEX_JIT_IMPL = true;
-
-}
+} // namespace expression
+} // namespace sirius

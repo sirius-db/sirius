@@ -309,11 +309,11 @@ call gpu_processing("SELECT CounterID, AVG(STRLEN(URL)) AS l, COUNT(*) AS c FROM
 ----
 <FILE>:test/answers/clickbench/q28.csv
 
-# Q29 (currently fall back to duckdb)
-# query I
-# call gpu_processing("SELECT REGEXP_REPLACE(Referer, '^https?://(?:www\.)?([^/]+)/.*$', '\1') AS k, AVG(STRLEN(Referer)) AS l, COUNT(*) AS c, MIN(Referer) AS min FROM hits WHERE Referer <> '' GROUP BY k HAVING COUNT(*) > 100000 ORDER BY l DESC LIMIT 25;");
-# ----
-# <FILE>:test/answers/clickbench/q29.csv
+# Q29
+query I
+call gpu_processing("SELECT REGEXP_REPLACE(Referer, '^https?://(?:www\.)?([^/]+)/.*$', '\1') AS k, AVG(STRLEN(Referer)) AS l, COUNT(*) AS c, MIN(Referer) AS min FROM hits WHERE Referer <> '' GROUP BY k HAVING COUNT(*) > 100000 ORDER BY l DESC LIMIT 25;");
+----
+<FILE>:test/answers/clickbench/q29.csv
 
 # Q30
 query I
