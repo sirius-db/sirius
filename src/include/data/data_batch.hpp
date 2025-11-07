@@ -23,6 +23,8 @@
 #include "helper/helper.hpp"
 #include "data/common.hpp"
 
+namespace sirius { namespace memory { class memory_space; } }
+
 namespace sirius {
 
 class data_batch_view; // Forward declarationc
@@ -54,6 +56,7 @@ public:
      * @param data Ownership of the data representation is transferred to this batch
      */
     data_batch(uint64_t batch_id, data_repository_manager& data_repo_mgr, sirius::unique_ptr<idata_representation> data);
+    data_batch(uint64_t batch_id, data_repository_manager& data_repo_mgr, sirius::unique_ptr<idata_representation> data, sirius::memory::memory_space& memory_space);
     
     /**
      * @brief Move constructor - transfers ownership of the batch and its data.
@@ -193,6 +196,26 @@ public:
      */
     data_repository_manager* get_data_repository_manager() const;
 
+    /**
+     * @brief Get the memory_space where this batch currently resides.
+     */
+    sirius::memory::memory_space* get_memory_space() const;
+
+    /**
+     * @brief Replace the underlying data representation.
+     *        Requires no active views or pins.
+     */
+    void set_data(sirius::unique_ptr<idata_representation> data);
+
+    /**
+     * @brief Convert the underlying representation to the target memory_space.
+     *        Requires no active views or pins.
+     */
+    void convert_to_memory_space(const sirius::memory::memory_space* target_memory_space,
+                                 rmm::cuda_stream_view stream);
+
+    
+
 private:
     mutable sirius::mutex _mutex;                         ///< Mutex for thread-safe access to tier checking and reference counting
     uint64_t _batch_id;                                   ///< Unique identifier for this data batch
@@ -200,6 +223,7 @@ private:
     sirius::atomic<size_t> _view_count = 0;               ///< Reference count for tracking views
     sirius::atomic<size_t> _pin_count = 0;                ///< Reference count for tracking pins to prevent eviction
     data_repository_manager* _data_repo_mgr;                ///< Pointer to the data repository manager
+    sirius::memory::memory_space* _memory_space;            ///< Memory space where the data resides
 };
 
 } // namespace sirius

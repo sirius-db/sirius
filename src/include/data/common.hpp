@@ -77,7 +77,7 @@ public:
      * @param stream CUDA stream to use for memory operations
      * @return sirius::unique_ptr<idata_representation> A new data representation in the target memory space
      */
-    virtual sirius::unique_ptr<idata_representation> convert_to_memory_space(sirius::memory::memory_space& target_memory_space, rmm::cuda_stream_view stream = rmm::cuda_stream_default) = 0;
+    virtual sirius::unique_ptr<idata_representation> convert_to_memory_space(const sirius::memory::memory_space* target_memory_space, rmm::cuda_stream_view stream) = 0;
 
     /**
      * @brief Safely casts this interface to a specific derived type

@@ -20,6 +20,7 @@
 #include "helper/helper.hpp"
 #include "data/data_repository.hpp"
 #include "config.hpp"
+#include "memory/common.hpp"
 
 namespace sirius {
 namespace parallel {
@@ -54,11 +55,11 @@ public:
  */
 class downgrade_task_local_state : public itask_local_state {
 public:
-    explicit downgrade_task_local_state(uint64_t task_id, uint64_t pipeline_id, sirius::unique_ptr<data_batch_view> batch_view) : 
-        _task_id(task_id), _pipeline_id(pipeline_id), _batch_view(std::move(batch_view)) {}
+    explicit downgrade_task_local_state(uint64_t task_id, uint64_t pipeline_id, sirius::unique_ptr<data_batch> batch) : 
+        _task_id(task_id), _pipeline_id(pipeline_id), _batch(std::move(batch)) {}
     uint64_t _task_id;
     uint64_t _pipeline_id;
-    sirius::unique_ptr<data_batch_view> _batch_view;
+    sirius::unique_ptr<data_batch> _batch;
 };
 
 /**

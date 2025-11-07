@@ -91,6 +91,19 @@ public:
     rmm::device_async_resource_ref get_allocator(size_t index) const;
     size_t get_allocator_count() const;
     
+    /**
+     * @brief Attempt to retrieve the default allocator as a concrete type.
+     *
+     * Returns nullptr if the default allocator is not of the requested type.
+     */
+    template <typename T>
+    T* get_default_allocator_as() const {
+        if (_allocators.empty()) {
+            return nullptr;
+        }
+        return dynamic_cast<T*>(_allocators[0].get());
+    }
+    
     // Utility methods
     bool can_reserve(size_t size) const;
     std::string to_string() const;
