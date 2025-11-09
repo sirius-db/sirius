@@ -47,7 +47,7 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundConjunct
   std::unique_ptr<cudf::column> output_column;
   for (idx_t i = 0; i < expr.children.size(); i++)
   {
-    D_ASSERT(state->child_states[i]->expr.return_type = LogicalType::BOOLEAN;);
+    D_ASSERT(state->child_states[i]->expr.return_type == LogicalType::BOOLEAN;);
 
     auto current_result = Execute(*expr.children[i], state->child_states[i].get());
 
