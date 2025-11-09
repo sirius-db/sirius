@@ -411,9 +411,9 @@ void HandleArbitraryConstantExpression(vector<shared_ptr<GPUColumn>> &column, ui
   tableScanExpression(col, offset, bitmask, constant_compare, constant_offset, data_type, row_ids, count, N, compare_mode, num_expr);
 }
 
-class TableScanGlobalSourceState : public GlobalSourceState {
+class GPUTableScanGlobalSourceState : public GlobalSourceState {
 public:
-	TableScanGlobalSourceState(ClientContext &context, const GPUPhysicalTableScan &op) {
+	GPUTableScanGlobalSourceState(ClientContext &context, const GPUPhysicalTableScan &op) {
     if (op.function.init_global) {
 			auto filters = table_filters ? *table_filters : GetTableFilters(op);
 			TableFunctionInitInput input(op.bind_data.get(), op.column_ids, op.scanned_ids, filters,
@@ -532,9 +532,9 @@ public:
   int unaligned_mask_in_byte_pos;
 };
 
-class TableScanLocalSourceState : public LocalSourceState {
+class GPUTableScanLocalSourceState : public LocalSourceState {
 public:
-	TableScanLocalSourceState(ExecutionContext &context, TableScanGlobalSourceState &gstate,
+	GPUTableScanLocalSourceState(ExecutionContext &context, GPUTableScanGlobalSourceState &gstate,
 	                          const GPUPhysicalTableScan &op) {
 		if (op.function.init_local) {
 			TableFunctionInitInput input(op.bind_data.get(), op.column_ids, op.scanned_ids,
@@ -554,11 +554,11 @@ public:
 
 unique_ptr<LocalSourceState> GPUPhysicalTableScan::GetLocalSourceState(ExecutionContext &context,
                                                                     GlobalSourceState &gstate) const {
-	return make_uniq<TableScanLocalSourceState>(context, gstate.Cast<TableScanGlobalSourceState>(), *this);
+	return make_uniq<GPUTableScanLocalSourceState>(context, gstate.Cast<GPUTableScanGlobalSourceState>(), *this);
 }
 
 unique_ptr<GlobalSourceState> GPUPhysicalTableScan::GetGlobalSourceState(ClientContext &context) const {
-	return make_uniq<TableScanGlobalSourceState>(context, *this);
+	return make_uniq<GPUTableScanGlobalSourceState>(context, *this);
 }
 
 class TableScanGetSizeTask : public BaseExecutorTask {
@@ -570,8 +570,8 @@ public:
 
 	void ExecuteTask() override {
     auto num_cols = op.column_ids.size() - op.gen_row_id_column;
-    auto &g_state_scan = g_state->Cast<TableScanGlobalSourceState>();
-    auto &l_state_scan = l_state->Cast<TableScanLocalSourceState>();
+    auto &g_state_scan = g_state->Cast<GPUTableScanGlobalSourceState>();
+    auto &l_state_scan = l_state->Cast<GPUTableScanLocalSourceState>();
     TableFunctionInput data(op.bind_data.get(), l_state_scan.local_state.get(), g_state_scan.global_state.get());
     auto chunk = make_uniq<DataChunk>();
     chunk->Initialize(Allocator::Get(context.client), op.scanned_types);
@@ -625,8 +625,8 @@ public:
         offset_ptr(offset_ptr_p), duckdb_storage_row_ids_ptr(duckdb_storage_row_ids_ptr_p) {}
 
 	void ExecuteTask() override {
-    auto &g_state_scan = g_state->Cast<TableScanGlobalSourceState>();
-    auto &l_state_scan = l_state->Cast<TableScanLocalSourceState>();
+    auto &g_state_scan = g_state->Cast<GPUTableScanGlobalSourceState>();
+    auto &l_state_scan = l_state->Cast<GPUTableScanLocalSourceState>();
     TableFunctionInput data(op.bind_data.get(), l_state_scan.local_state.get(), g_state_scan.global_state.get());
     auto chunk = make_uniq<DataChunk>();
     chunk->Initialize(Allocator::Get(context.client), op.scanned_types);
@@ -843,7 +843,7 @@ GPUPhysicalTableScan::GetDataDuckDBOpt(ExecutionContext &exec_context) {
     SIRIUS_LOG_DEBUG("GetDataDuckdbOpt: Tasks finished executing");
 
     for (int i = 0; i < num_threads; ++i) {
-      auto &l_state_scan = l_states[i]->Cast<TableScanLocalSourceState>();
+      auto &l_state_scan = l_states[i]->Cast<GPUTableScanLocalSourceState>();
       num_rows += l_state_scan.num_rows;
       for (int col = 0; col < column_ids.size() - gen_row_id_column; col++) {
         column_size[col] += l_state_scan.column_size[col];
@@ -957,7 +957,7 @@ void GPUPhysicalTableScan::ScanDataDuckDBOpt(
     int num_threads = TaskScheduler::GetScheduler(exec_context.client).NumberOfThreads();
     TaskExecutor executor(exec_context.client);
     auto g_state = GetGlobalSourceState(exec_context.client);
-    g_state->Cast<TableScanGlobalSourceState>().InitForTableScanCoalesceTask(*this, mask_ptr);
+    g_state->Cast<GPUTableScanGlobalSourceState>().InitForTableScanCoalesceTask(*this, mask_ptr);
     vector<unique_ptr<LocalSourceState>> l_states;
     l_states.resize(num_threads);
     for (int i = 0; i < num_threads; ++i) {
@@ -1194,8 +1194,8 @@ GPUPhysicalTableScan::GetDataDuckDB(ExecutionContext &exec_context) {
     auto g_state = GetGlobalSourceState(exec_context.client);
     auto l_state = GetLocalSourceState(exec_context, *g_state);
 
-    auto &l_state_scan = l_state->Cast<TableScanLocalSourceState>();
-    auto &g_state_scan = g_state->Cast<TableScanGlobalSourceState>();
+    auto &l_state_scan = l_state->Cast<GPUTableScanLocalSourceState>();
+    auto &g_state_scan = g_state->Cast<GPUTableScanGlobalSourceState>();
 
     TableFunctionInput data(bind_data.get(), l_state_scan.local_state.get(), g_state_scan.global_state.get());
 
