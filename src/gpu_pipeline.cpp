@@ -41,59 +41,6 @@ ClientContext &GPUPipeline::GetClientContext() {
 	return executor.context;
 }
 
-// bool GPUPipeline::GetProgress(double &current_percentage, idx_t &source_cardinality) {
-// 	D_ASSERT(source);
-// 	source_cardinality = source->estimated_cardinality;
-// 	if (!initialized) {
-// 		current_percentage = 0;
-// 		return true;
-// 	}
-// 	auto &client = executor.context;
-// 	current_percentage = source->GetProgress(client, *source_state);
-// 	return current_percentage >= 0;
-// }
-
-// void GPUPipeline::ScheduleSequentialTask(shared_ptr<Event> &event) {
-// 	vector<shared_ptr<Task>> tasks;
-// 	tasks.push_back(make_uniq<PipelineTask>(*this, event));
-// 	event->SetTasks(std::move(tasks));
-// }
-
-// bool GPUPipeline::ScheduleParallel(shared_ptr<Event> &event) {
-// 	// check if the sink, source and all intermediate operators support parallelism
-// 	if (!sink->ParallelSink()) {
-// 		return false;
-// 	}
-// 	if (!source->ParallelSource()) {
-// 		return false;
-// 	}
-// 	for (auto &op_ref : operators) {
-// 		auto &op = op_ref.get();
-// 		if (!op.ParallelOperator()) {
-// 			return false;
-// 		}
-// 	}
-// 	if (sink->RequiresBatchIndex()) {
-// 		if (!source->SupportsBatchIndex()) {
-// 			throw InternalException(
-// 			    "Attempting to schedule a pipeline where the sink requires batch index but source does not support it");
-// 		}
-// 	}
-// 	auto max_threads = source_state->MaxThreads();
-// 	auto &scheduler = TaskScheduler::GetScheduler(executor.context);
-// 	auto active_threads = NumericCast<idx_t>(scheduler.NumberOfThreads());
-// 	if (max_threads > active_threads) {
-// 		max_threads = active_threads;
-// 	}
-// 	if (sink && sink->sink_state) {
-// 		max_threads = sink->sink_state->MaxThreads(max_threads);
-// 	}
-// 	if (max_threads > active_threads) {
-// 		max_threads = active_threads;
-// 	}
-// 	return LaunchScanTasks(event, max_threads);
-// }
-
 bool GPUPipeline::IsOrderDependent() const {
 	auto &config = DBConfig::GetConfig(executor.context);
 	if (source) {
@@ -122,32 +69,6 @@ bool GPUPipeline::IsOrderDependent() const {
 	}
 	return false;
 }
-
-// void GPUPipeline::Schedule(shared_ptr<Event> &event) {
-// 	D_ASSERT(ready);
-// 	D_ASSERT(sink);
-// 	Reset();
-// 	if (!ScheduleParallel(event)) {
-// 		// could not parallelize this pipeline: push a sequential task instead
-// 		ScheduleSequentialTask(event);
-// 	}
-// }
-
-// bool GPUPipeline::LaunchScanTasks(shared_ptr<Event> &event, idx_t max_threads) {
-// 	// split the scan up into parts and schedule the parts
-// 	if (max_threads <= 1) {
-// 		// too small to parallelize
-// 		return false;
-// 	}
-
-// 	// launch a task for every thread
-// 	vector<shared_ptr<Task>> tasks;
-// 	for (idx_t i = 0; i < max_threads; i++) {
-// 		tasks.push_back(make_uniq<PipelineTask>(*this, event));
-// 	}
-// 	event->SetTasks(std::move(tasks));
-// 	return true;
-// }
 
 void GPUPipeline::ResetSink() {
 	if (sink) {

@@ -45,25 +45,10 @@ unique_ptr<GlobalOperatorState> GPUPhysicalOperator::GetGlobalOperatorState(Clie
 	return make_uniq<GlobalOperatorState>();
 }
 
-// OperatorResultType GPUPhysicalOperator::Execute(ExecutionContext &context, DataChunk &input, DataChunk &chunk,
-//                                              GlobalOperatorState &gstate, OperatorState &state) const {
-// 	throw InternalException("Calling Execute on a node that is not an operator!");
-// }
-
-// OperatorResultType GPUPhysicalOperator::Execute(ExecutionContext &context, GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation,
-// 										GlobalOperatorState &gstate, OperatorState &state) const {
-// 	throw InternalException("Calling Execute on a node that is not an operator!");
-// }
 
 OperatorResultType GPUPhysicalOperator::Execute(GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation) const {
 	throw InternalException("Calling Execute on a node that is not an operator!");
 }
-
-// OperatorFinalizeResultType GPUPhysicalOperator::FinalExecute(ExecutionContext &context, DataChunk &chunk,
-//                                                           GlobalOperatorState &gstate, OperatorState &state) const {
-// 	throw InternalException("Calling FinalExecute on a node that is not an operator!");
-// }
-// LCOV_EXCL_STOP
 
 //===--------------------------------------------------------------------===//
 // Source
@@ -76,11 +61,6 @@ unique_ptr<LocalSourceState> GPUPhysicalOperator::GetLocalSourceState(ExecutionC
 unique_ptr<GlobalSourceState> GPUPhysicalOperator::GetGlobalSourceState(ClientContext &context) const {
 	return make_uniq<GlobalSourceState>();
 }
-
-// SourceResultType GPUPhysicalOperator::GetData(ExecutionContext &context, GPUIntermediateRelation& output_relation,
-//                                            OperatorSourceInput &input) const {
-// 	throw InternalException("Calling GetData on a node that is not a source!");
-// }
 
 SourceResultType GPUPhysicalOperator::GetData(GPUIntermediateRelation& output_relation) const {
 	throw InternalException("Calling GetData on a node that is not a source!");
@@ -97,10 +77,6 @@ unique_ptr<LocalSinkState> GPUPhysicalOperator::GetLocalSinkState(ExecutionConte
 unique_ptr<GlobalSinkState> GPUPhysicalOperator::GetGlobalSinkState(ClientContext &context) const {
 	return make_uniq<GlobalSinkState>();
 }
-
-// SinkResultType GPUPhysicalOperator::Sink(ExecutionContext &context, GPUIntermediateRelation& input_relation, OperatorSinkInput &input) const {
-// 	throw InternalException("Calling Sink on a node that is not a sink!");
-// }
 
 SinkResultType GPUPhysicalOperator::Sink(GPUIntermediateRelation& input_relation) const {
 	throw InternalException("Calling Sink on a node that is not a sink!");

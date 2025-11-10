@@ -23,35 +23,6 @@
 
 namespace duckdb {
 
-// void ResolveOrderByString(vector<shared_ptr<GPUColumn>> &sort_columns, int* sort_orders, int num_cols) {
-//   GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
-//   uint8_t** col_keys = gpuBufferManager->customCudaHostAlloc<uint8_t*>(num_cols);
-//   uint64_t** col_offsets = gpuBufferManager->customCudaHostAlloc<uint64_t*>(num_cols);
-//   uint64_t* col_num_bytes = gpuBufferManager->customCudaHostAlloc<uint64_t>(num_cols);
-
-//   for(int i = 0; i < num_cols; i++) {
-//     shared_ptr<GPUColumn> curr_column = sort_columns[i];
-//     col_keys[i] = curr_column->data_wrapper.data;
-//     col_offsets[i] = curr_column->data_wrapper.offset;
-    
-//     SIRIUS_LOG_DEBUG("ResolveOrderByString: For idx {} got num bytes of {}", i, curr_column->data_wrapper.num_bytes);
-//   }
-//   uint64_t num_rows = static_cast<uint64_t>(sort_columns[0]->column_length);
-
-//   // Sort the results
-//   orderByString(col_keys, col_offsets, sort_orders, col_num_bytes, num_rows, num_cols);
-
-//   // Write the results back
-//   for(int i = 0; i < num_cols; i++) {
-//     shared_ptr<GPUColumn> curr_column = sort_columns[i];
-//     curr_column->data_wrapper.data = col_keys[i];
-//     curr_column->data_wrapper.offset = col_offsets[i];
-//     curr_column->data_wrapper.num_bytes = col_num_bytes[i];
-
-//     SIRIUS_LOG_DEBUG("ResolveOrderByString: Wrote num bytes of {} for idx {}", col_num_bytes[i], i);
-//   }
-// }
-
 void
 HandleOrderBy(vector<shared_ptr<GPUColumn>> &order_by_keys, vector<shared_ptr<GPUColumn>> &projection_columns, const vector<BoundOrderByNode> &orders, uint64_t num_projections) {
   GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
@@ -97,63 +68,6 @@ GPUPhysicalOrder::Sink(GPUIntermediateRelation &input_relation) const {
 
     auto start = std::chrono::high_resolution_clock::now();
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
-    // shared_ptr<GPUColumn>* sort_columns = new shared_ptr<GPUColumn>[orders.size()];
-    // int* sort_orders = new int[orders.size()];
-    // int idx = 0;
-    // bool string_sort = false;
-    // for (auto &order : orders) {
-    //   // key_types.push_back(order.expression->return_type);
-    //   // key_executor.AddExpression(*order.expression);
-    //   auto& expr = *order.expression;
-    //   expr.Print();
-    //   if (expr.expression_class != ExpressionClass::BOUND_REF) {
-    //     throw NotImplementedException("Order by expression not supported");
-    //   }
-
-    //   // Record the column to sort on
-    //   auto &bound_ref_expr = expr.Cast<BoundReferenceExpression>();
-    //   auto input_idx = bound_ref_expr.index;
-    //   SIRIUS_LOG_DEBUG("Reading order by keys from index {}", input_idx);
-    //   sort_columns[idx] = HandleMaterializeExpression(
-    //     input_relation.columns[input_idx], bound_ref_expr, gpuBufferManager
-    //   );
-    //   if (sort_columns[idx]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
-    //     string_sort = true;
-    //   }
-
-    //   // Record the sort method
-    //   auto sort_method = order.type;
-    //   int sort_type = 0;
-    //   if(sort_method == OrderType::DESCENDING) {
-    //     sort_type = 1;
-    //   }
-    //   sort_orders[idx] = sort_type;
-    //   SIRIUS_LOG_DEBUG(
-    //     "Order By got sort column: Col Length - {}, Size - {}, Bytes - {}, Sort Order - {}\n", 
-    //     (int) sort_columns[idx]->column_length, (int) sort_columns[idx]->data_wrapper.size,  
-    //     (int) sort_columns[idx]->data_wrapper.num_bytes, sort_orders[idx]
-    //   );
-
-    //   idx++;
-    // }
-
-    // // Now actually perform the order by
-    // if(string_sort) {
-    //   ResolveOrderByString(sort_columns, sort_orders, orders.size());
-    // } else {
-    //   throw NotImplementedException("Non String Order By not yet supported");
-    // }
-
-    // // Copy the sorted columns back into the input relationship
-    // int sort_cols_idx = 0;
-    // for (auto &order : orders) {
-    //   auto& expr = *order.expression;
-    //   auto &bound_ref_expr = expr.Cast<BoundReferenceExpression>();
-    //   auto input_idx = bound_ref_expr.index;
-    //   input_relation.columns[input_idx] = sort_columns[sort_cols_idx];
-
-    //   sort_cols_idx += 1;
-    // }
 
     vector<shared_ptr<GPUColumn>> order_by_keys(orders.size());
     vector<shared_ptr<GPUColumn>> projection_columns(projections.size());

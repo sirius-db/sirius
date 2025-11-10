@@ -94,25 +94,6 @@ T* callCudaMalloc(size_t size, int gpu) {
         SIRIUS_LOG_ERROR("CUDA driver error: {}", cudaGetErrorString(err));
     }
     SIRIUS_LOG_DEBUG("Number of devices: {}", nDevices);
-  
-    // for (int i = 0; i < nDevices; i++) {
-    //     cudaDeviceProp prop;
-    //     cudaGetDeviceProperties(&prop, i);
-    //     SIRIUS_LOG_DEBUG("Device Number: {}", i);
-    //     SIRIUS_LOG_DEBUG("  Device name: {}", prop.name);
-    //     SIRIUS_LOG_DEBUG("  Memory Clock Rate (MHz): {}",
-    //             prop.memoryClockRate/1024);
-    //     SIRIUS_LOG_DEBUG("  Memory Bus Width (bits): {}",
-    //             prop.memoryBusWidth);
-    //     SIRIUS_LOG_DEBUG("  Peak Memory Bandwidth (GB/s): {:.1f}",
-    //             2.0*prop.memoryClockRate*(prop.memoryBusWidth/8)/1.0e6);
-    //     SIRIUS_LOG_DEBUG("  Total global memory (Gbytes) {:.1f}",(float)(prop.totalGlobalMem)/1024.0/1024.0/1024.0);
-    //     SIRIUS_LOG_DEBUG("  Shared memory per block (Kbytes) {:.1f}",(float)(prop.sharedMemPerBlock)/1024.0);
-    //     SIRIUS_LOG_DEBUG("  minor-major: {}-{}\n", prop.minor, prop.major);
-    //     SIRIUS_LOG_DEBUG("  Warp-size: {}", prop.warpSize);
-    //     SIRIUS_LOG_DEBUG("  Concurrent kernels: {}", prop.concurrentKernels ? "yes" : "no");
-    //     SIRIUS_LOG_DEBUG("  Concurrent computation/communication: {}",prop.deviceOverlap ? "yes" : "no");
-    // }
     CHECK_ERROR();
 
     SIRIUS_LOG_DEBUG("Allocating {} bytes on GPU {}", size * sizeof(T), gpu);
