@@ -12,16 +12,10 @@
 # the License.
 # =============================================================================
 
-include_directories(${CMAKE_CURRENT_SOURCE_DIR})
-
-add_subdirectory(pipeline)
-add_subdirectory(utils)
-add_subdirectory(memory_management)
-add_subdirectory(parallel)
-add_subdirectory(data)
-add_subdirectory(scan)
-
 set(TEST_SOURCES
   ${TEST_SOURCES}
-  ${CMAKE_CURRENT_SOURCE_DIR}/unittest.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_multiple_blocks_allocation_accessor.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_column_builder.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_scan_executor.cpp
+  # ${CMAKE_CURRENT_SOURCE_DIR}/test_scan_executor_lineitem.cpp
   PARENT_SCOPE)

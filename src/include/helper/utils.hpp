@@ -67,7 +67,7 @@ inline constexpr S make_mask(T num_bits)
   static_assert(std::is_unsigned<T>::value, "make_mask requires an unsigned type for num_bits");
   static_assert(std::is_integral<S>::value, "make_mask requires an integral type for return");
   static_assert(std::is_unsigned<S>::value, "make_mask requires an unsigned type for return");
-  return static_cast<S>(1) << (num_bits - static_cast<S>(1));
+  return static_cast<S>((static_cast<S>(1) << num_bits) - 1);
 }
 
 }  // namespace sirius::utils

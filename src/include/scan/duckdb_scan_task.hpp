@@ -17,6 +17,8 @@
 #pragma once
 
 // sirius
+#include "duckdb/main/connection.hpp"
+
 #include <data/data_repository_manager.hpp>
 #include <memory/fixed_size_host_memory_resource.hpp>
 #include <memory/memory_reservation.hpp>
@@ -105,6 +107,8 @@ class duckdb_scan_task_global_state : public itask_global_state, public duckdb::
  * allocated by the fixed-size host memory resource. It manages the current
  * position within the allocation and provides methods to set/get values,
  * advance the cursor, and perform memcpy operations.
+ * NOTE: the caller is responsible for allocating sufficient blocks and ensure the cursor does not
+ * go out of bounds. Otherwise, behavior is undefined.
  *
  * @tparam T The underlying data type to be accessed.
  */
@@ -123,6 +127,8 @@ struct multiple_blocks_allocation_accessor {
    * @brief Initialize the accessor with a multiple blocks allocation.
    *
    * @param[in] alloc The multiple blocks allocation to initialize the accessor with.
+   * @throws duckdb::InternalException if the underlying type size does not align with the block
+   * size.
    */
   void initialize(unique_ptr<multiple_blocks_allocation> alloc)
   {
@@ -159,6 +165,7 @@ struct multiple_blocks_allocation_accessor {
    */
   T get_current() const
   {
+    assert(block_index < allocation->blocks.size());
     return *reinterpret_cast<T*>(static_cast<uint8_t*>(allocation->blocks[block_index]) +
                                  offset_in_block);
   }
@@ -186,6 +193,7 @@ struct multiple_blocks_allocation_accessor {
     size_t bytes_copied = 0;
     // Loop over blocks into which to copy the src
     while (bytes_copied < bytes) {
+      assert(block_index < allocation->blocks.size());
       // Do as much of a bulk copy as possible in the current block
       auto const bytes_to_copy =
         std::min(bytes - bytes_copied, allocation->block_size - offset_in_block);
@@ -234,7 +242,8 @@ class duckdb_scan_task_local_state : public itask_local_state {
    */
   struct column_builder {
     static constexpr size_t HOST_SPACE_INDEX =
-      0;  ///< There is currently only one HOST memory space
+      0;                                       ///< There is currently only one HOST memory space
+    static constexpr size_t FULL_MASK = 0xFF;  ///< Mask with all bits set
 
     //===----------Fields----------===//
     duckdb::LogicalType type;  ///< DuckDB logical type of the column
@@ -398,7 +407,7 @@ class duckdb_scan_task_local_state : public itask_local_state {
 //===----------------------------------------------------------------------===//
 
 /**
- * @brief TODO
+ * @brief A scan task for the scan_executor using the DuckDB table function interface.
  *
  * The duckdb_scan_task represents a unit of work for scanning data from a DuckDB table function.
  * It accumulates approximately the target batch size specified in the local state before pushing
@@ -406,6 +415,9 @@ class duckdb_scan_task_local_state : public itask_local_state {
  * incomplete upon task completion, the task will push a new scan_task onto the task queue.
  */
 class duckdb_scan_task : public itask {
+  // Friend declaration for test access
+  friend class test_scan_task;
+  
  public:
   //===----------Constructor----------===//
   /**
@@ -424,7 +436,7 @@ class duckdb_scan_task : public itask {
 
   void execute() override;
 
- private:
+ protected:
   //===----------Methods----------===//
   /**
    * @brief Fetches the next data chunk from the DuckDB table function into the local state's data
@@ -449,6 +461,26 @@ class duckdb_scan_task : public itask {
    * @brief Processes the current data chunk and copies its data into the column builders' buffers.
    */
   void process_chunk(duckdb_scan_task_local_state& l_state);
+
+  /**
+   * @brief Gets the global state of the scan task.
+   *
+   * @return A pointer to the global state.
+   */
+  duckdb_scan_task_global_state const* get_global_state() const
+  {
+    return &this->_global_state->cast<duckdb_scan_task_global_state>();
+  }
+
+  /**
+   * @brief Gets the local state of the scan task.
+   *
+   * @return A pointer to the local state.
+   */
+  duckdb_scan_task_local_state const* get_local_state() const
+  {
+    return &this->_local_state->cast<duckdb_scan_task_local_state>();
+  }
 
   //===----------Fields----------===//
   data_repository_manager& dr_mgr;  ///< Data repository manager to which to push batches

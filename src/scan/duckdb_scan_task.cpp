@@ -143,6 +143,52 @@ void duckdb_scan_task_local_state::column_builder::process_mask_for_column(
   auto const cur_bit    = utils::mod_8(row_offset);  //< bit offset in current byte
   auto const num_bits   = num_rows;
 
+  if (src_valid == nullptr) {
+    // All valid case
+    if (cur_bit == 0) {
+      // Byte aligned case
+      auto const full_bytes = utils::div_8(num_bits);
+      auto const tail_bits  = utils::mod_8(num_bits);
+      for (auto b = 0; b < full_bytes; ++b) {
+        mask_blocks_accessor.set_current(FULL_MASK);
+        mask_blocks_accessor.advance();
+      }
+      if (tail_bits > 0) {
+        auto const tail_mask = utils::make_mask<uint8_t>(tail_bits);
+        mask_blocks_accessor.set_current(tail_mask);
+        mask_blocks_accessor.advance();
+      }
+    } else {
+      // Byte unaligned case
+      auto const bits_in_current_byte = std::min<uint32_t>(CHAR_BIT - cur_bit, num_bits);
+      auto const remaining_bits =
+        num_bits - bits_in_current_byte;  // Remaining bits after filling current byte
+      auto const remaining_bytes = utils::div_8(remaining_bits);
+      auto const tail_bits       = utils::mod_8(remaining_bits);
+
+      // Set bits in the current byte
+      auto const current_byte_mask =
+        static_cast<uint8_t>(utils::make_mask<uint8_t>(bits_in_current_byte) << cur_bit);
+      mask_blocks_accessor.set_current((mask_blocks_accessor.get_current() & ~current_byte_mask) |
+                                       current_byte_mask);
+      mask_blocks_accessor.advance();
+
+      // Set full bytes
+      for (size_t b = 0; b < remaining_bytes; ++b) {
+        mask_blocks_accessor.set_current(FULL_MASK);
+        mask_blocks_accessor.advance();
+      }
+
+      // Set tail bits
+      if (tail_bits > 0) {
+        auto const tail_mask = utils::make_mask<uint8_t>(tail_bits);
+        mask_blocks_accessor.set_current(tail_mask);
+        mask_blocks_accessor.advance();
+      }
+    }
+    return;
+  }
+  // condition: src_valid != nullptr
   if (cur_bit == 0) {
     // Byte aligned case
     auto const full_bytes = utils::div_8(num_bits);
@@ -152,7 +198,6 @@ void duckdb_scan_task_local_state::column_builder::process_mask_for_column(
       auto const tail_mask = utils::make_mask<uint8_t>(tail_bits);
       auto const tail      = src_valid[full_bytes] & tail_mask;
       mask_blocks_accessor.set_current(tail);
-      mask_blocks_accessor.advance();
     }
   } else {
     // Byte unaligned case
@@ -351,7 +396,6 @@ void duckdb_scan_task::execute()
                            g_state.op.returned_types);
 
   // Enter the scan loop to accumulate a data batch
-  bool is_finished = g_state.IsSourceDrained();
   while (get_next_chunk(l_state, g_state)) {
     // We know a priori that the fixed-width columns and masks will fit in the allocated buffers.
     // For variable-length columns, we need to check that we have enough space.
@@ -385,10 +429,7 @@ void duckdb_scan_task::execute()
     g_state.scan_executor.schedule(std::move(next_task));
   }
 
-  /// TODO: Create the data batch and push it to the data repository.
-  // Temporary solution, given the difficulty of constructing host table metadata, is to make a
-  // cudf::table in device memory, then move it to the host memory tier, so that CUDF can handle the
-  // metadata construction.
+  /// FUTURE WORK: Create the data batch and push it to the data repository.
 
   /// FUTURE WORK: Notify task_creator of completion by sending a message to the message queue
 }
