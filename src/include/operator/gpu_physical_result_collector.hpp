@@ -65,8 +65,6 @@ class GPUPhysicalMaterializedCollector : public GPUPhysicalResultCollector {
 public:
 	GPUPhysicalMaterializedCollector(GPUPreparedStatementData &data);
 	unique_ptr<GPUResultCollection> result_collection;
-	// ColumnDataAppendState append_state;
-	// bool parallel;
 
 public:
 	unique_ptr<QueryResult> GetResult(GlobalSinkState &state) override;
@@ -77,7 +75,6 @@ public:
 		GPUIntermediateRelation& input_relation, const vector<LogicalType>& types,
 		GPUResultCollection* result_collection, GPUBufferManager *gpuBufferManager);
 	SinkResultType Sink(GPUIntermediateRelation &input_relation) const override;
-	// SinkCombineResultType Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const override;
 
 	unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const override;
 	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
@@ -86,8 +83,6 @@ public:
 	static void FinalMaterializeString(GPUIntermediateRelation input_relation, GPUIntermediateRelation& output_relation, size_t col);
 	static size_t FinalMaterialize(GPUIntermediateRelation input_relation, GPUIntermediateRelation& output_relation, size_t col);
 
-	// bool ParallelSink() const override;
-	// bool SinkOrderDependent() const override;
 };
 
 } // namespace duckdb

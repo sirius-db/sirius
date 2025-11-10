@@ -52,7 +52,6 @@ public:
 
 	virtual ~GPUPhysicalOperator() {
 	}
-	// ~GPUPhysicalOperator() = default;
 
 	//! The physical operator type
 	PhysicalOperatorType type;
@@ -94,12 +93,6 @@ public:
 	// Operator interface
 	virtual unique_ptr<OperatorState> GetOperatorState(ExecutionContext &context) const;
 	virtual unique_ptr<GlobalOperatorState> GetGlobalOperatorState(ClientContext &context) const;
-	// virtual OperatorResultType Execute(ExecutionContext &context, DataChunk &input, DataChunk &chunk,
-	//                                    GlobalOperatorState &gstate, OperatorState &state) const;
-	// virtual OperatorResultType Execute(ExecutionContext &context, GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation,
-	// 									GlobalOperatorState &gstate, OperatorState &state) const;
-	// virtual OperatorFinalizeResultType FinalExecute(ExecutionContext &context, DataChunk &chunk,
-	//                                                 GlobalOperatorState &gstate, OperatorState &state) const;
 
 	virtual OperatorResultType Execute(GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation) const;
 
@@ -118,7 +111,6 @@ public:
 
 public:
 	//Source Interface
-	// virtual SourceResultType GetData(ExecutionContext &context, GPUIntermediateRelation &output_relation, OperatorSourceInput &input) const;
 	virtual SourceResultType GetData(GPUIntermediateRelation &output_relation) const;
 	virtual unique_ptr<LocalSourceState> GetLocalSourceState(ExecutionContext &context,
 	                                                         GlobalSourceState &gstate) const;
@@ -139,8 +131,6 @@ public:
 
 public:
 	//Sink interface
-	// virtual SinkResultType Sink(ExecutionContext &context, GPUIntermediateRelation &input, OperatorSinkInput &input) const;
-	// virtual SinkResultType Sink(ExecutionContext &context, GPUIntermediateRelation &input_relation, OperatorSinkInput &input) const;
 	virtual SinkResultType Sink(GPUIntermediateRelation &input_relation) const;
 	virtual SinkFinalizeType CombineFinalize(vector<shared_ptr<GPUIntermediateRelation>> &input,
 																	  			 GPUIntermediateRelation& output) const;
@@ -168,7 +158,6 @@ public:
 public:
 	// Pipeline construction
 	virtual vector<const_reference<GPUPhysicalOperator>> GetSources() const;
-	// bool AllSourcesSupportBatchIndex() const;
 
 	virtual void BuildPipelines(GPUPipeline &current, GPUMetaPipeline &meta_pipeline);
 

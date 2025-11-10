@@ -92,15 +92,7 @@ public:
 	                      vector<const_reference<GPUPhysicalOperator>> delim_scans, idx_t estimated_cardinality,
 						  optional_idx delim_idx);
 
-// public:
-// 	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
-// 	unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const override;
-	// SinkResultType Sink(ExecutionContext &context, GPUIntermediateRelation &input_relation, OperatorSinkInput &input) const override;
 	SinkResultType Sink(GPUIntermediateRelation &input_relation) const override;
-	// SinkCombineResultType Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const override;
-	// void PrepareFinalize(ClientContext &context, GlobalSinkState &sink_state) const override;
-	// SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
-	//                           OperatorSinkFinalizeInput &input) const override;
 
 public:
 	void BuildPipelines(GPUPipeline &current, GPUMetaPipeline &meta_pipeline) override;

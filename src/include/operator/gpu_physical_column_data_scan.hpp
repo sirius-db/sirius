@@ -44,8 +44,6 @@ public:
 	shared_ptr<GPUIntermediateRelation> intermediate_relation;
 
 public:
-	// unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;
-	// SourceResultType GetData(ExecutionContext &context, GPUIntermediateRelation& output_relation, OperatorSourceInput &input) const override;
 	SourceResultType GetData(GPUIntermediateRelation& output_relation) const override;
 
 
@@ -53,9 +51,6 @@ public:
 		return true;
 	}
 
-	// string ParamsToString() const override;
-
-// public:
 	void BuildPipelines(GPUPipeline &current, GPUMetaPipeline &meta_pipeline) override;
 };
 

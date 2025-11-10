@@ -62,19 +62,8 @@ public:
 
     shared_ptr<GPUIntermediateRelation> right_temp_data;
 
-public:
-	// Operator Interface
-	// unique_ptr<OperatorState> GetOperatorState(ExecutionContext &context) const override;
-
-	// bool ParallelOperator() const override {
-	// 	return true;
-	// }
-
 protected:
 	// CachingOperator Interface
-	// OperatorResultType ExecuteInternal(ExecutionContext &context, DataChunk &input, DataChunk &chunk,
-	//                                    GlobalOperatorState &gstate, OperatorState &state) const override;
-
     OperatorResultType Execute(GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation) const override;
 
     static void BuildJoinPipelines(GPUPipeline &current, GPUMetaPipeline &meta_pipeline, GPUPhysicalOperator &op, bool build_rhs = true);
@@ -82,10 +71,6 @@ protected:
 
 public:
 	// Source interface
-	// unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;
-	// unique_ptr<LocalSourceState> GetLocalSourceState(ExecutionContext &context,
-	//                                                  GlobalSourceState &gstate) const override;
-	// SourceResultType GetData(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &input) const override;
     SourceResultType GetData(GPUIntermediateRelation& output_relation) const override;
 
 	bool IsSource() const override {
@@ -97,13 +82,7 @@ public:
 
 public:
 	// Sink Interface
-	// unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
-	// unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const override;
-	// SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override;
     SinkResultType Sink(GPUIntermediateRelation &input_relation) const override;
-	// SinkCombineResultType Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const override;
-	// SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
-	//                           OperatorSinkFinalizeInput &input) const override;
 
 	bool IsSink() const override {
 		return true;
@@ -119,12 +98,6 @@ public:
 	vector<LogicalType> GetJoinTypes() const;
 
 private:
-	// // // resolve joins that output max N elements (SEMI, ANTI, MARK)
-	// void ResolveSimpleJoin(ExecutionContext &context, GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation, OperatorState &state) const;
-	// // // resolve joins that can potentially output N*M elements (INNER, LEFT, FULL)
-	// OperatorResultType ResolveComplexJoin(ExecutionContext &context, GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation,
-	//                                       OperatorState &state) const;
-
 	// // resolve joins that output max N elements (SEMI, ANTI, MARK)
 	void ResolveSimpleJoin(GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation) const;
 	// // resolve joins that can potentially output N*M elements (INNER, LEFT, FULL)

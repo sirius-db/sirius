@@ -119,11 +119,6 @@ public:
 	vector<ColumnIndex> orig_column_ids;
 	vector<idx_t> orig_scanned_ids;
 	vector<LogicalType> orig_scanned_types;
-public:
-	// string GetName() const override;
-	// string ParamsToString() const override;
-
-	// bool Equals(const GPUPhysicalOperator &other) const override;
 
 public:
 	SourceResultType GetData(GPUIntermediateRelation& output_relation) const override;
@@ -146,14 +141,6 @@ public:
 	unique_ptr<LocalSourceState> GetLocalSourceState(ExecutionContext &context,
 		GlobalSourceState &gstate) const override;
 	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;
-	// SourceResultType GetData(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &input) const override;
-	// OperatorPartitionData GetPartitionData(ExecutionContext &context, DataChunk &chunk, GlobalSourceState &gstate,
-	// LocalSourceState &lstate,
-	// const OperatorPartitionInfo &partition_info) const override;
-
-	// bool SupportsPartitioning(const OperatorPartitionInfo &partition_info) const override;
-
-	// ProgressData GetProgress(ClientContext &context, GlobalSourceState &gstate) const override;
 };
 
 } // namespace duckdb

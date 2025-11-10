@@ -41,9 +41,6 @@ public:
 	shared_ptr<DynamicFilterData> dynamic_filter;
 	shared_ptr<GPUIntermediateRelation> sort_result;
 public:
-	// Source interface
-	// unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;
-	// SourceResultType GetData(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &input) const override;
 	SourceResultType GetData(GPUIntermediateRelation& output_relation) const override;
 
 	bool IsSource() const override {
@@ -54,13 +51,7 @@ public:
 	}
 
 public:
-	// SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override;
-	// SinkCombineResultType Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const override;
     SinkResultType Sink(GPUIntermediateRelation& input_relation) const override;
-	// SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
-	//                           OperatorSinkFinalizeInput &input) const override;
-	// unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const override;
-	// unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
 
 	bool IsSink() const override {
 		return true;
@@ -69,7 +60,6 @@ public:
 		return true;
 	}
 
-	// InsertionOrderPreservingMap<string> ParamsToString() const override;
 };
 
 } // namespace duckdb

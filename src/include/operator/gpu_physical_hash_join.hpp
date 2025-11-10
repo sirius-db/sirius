@@ -100,8 +100,6 @@ public:
 
 	mutable bool unique_probe_keys = false;
 
-	// OperatorResultType Execute(ExecutionContext &context, GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation,
-	// 									GlobalOperatorState &gstate, OperatorState &state) const override;
 	OperatorResultType Execute(GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation) const override;
 
 	static void BuildJoinPipelines(GPUPipeline &current, GPUMetaPipeline &meta_pipeline, GPUPhysicalOperator &op, bool build_rhs = true);
@@ -110,15 +108,7 @@ public:
 	//! Join Keys statistics (optional)
 	vector<unique_ptr<BaseStatistics>> join_stats;
 protected:
-	// CachingOperator Interface
-	// OperatorResultType ExecuteInternal(ExecutionContext &context, DataChunk &input, DataChunk &chunk,
-	//                                    GlobalOperatorState &gstate, OperatorState &state) const override;
-
 	// Source interface
-	// unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;
-	// unique_ptr<LocalSourceState> GetLocalSourceState(ExecutionContext &context,
-	//                                                  GlobalSourceState &gstate) const override;
-	// SourceResultType GetData(ExecutionContext &context, GPUIntermediateRelation &output_relation, OperatorSourceInput &input) const override;
 	SourceResultType GetData(GPUIntermediateRelation& output_relation) const override;
 
 	// double GetProgress(ClientContext &context, GlobalSourceState &gstate) const override;
@@ -134,16 +124,9 @@ protected:
 
 public:
 	// Sink Interface
-	// unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
-
-	// unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const override;
-	// SinkResultType Sink(ExecutionContext &context, GPUIntermediateRelation &input_relation, OperatorSinkInput &input) const override;
 	SinkResultType Sink(GPUIntermediateRelation &input_relation) const override;
 	SinkFinalizeType CombineFinalize(vector<shared_ptr<GPUIntermediateRelation>> &input,
   															 	 GPUIntermediateRelation& output) const override;
-	// SinkCombineResultType Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const override;
-	// SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
-	//                           OperatorSinkFinalizeInput &input) const override;
 
 	bool IsSink() const override {
 		return true;

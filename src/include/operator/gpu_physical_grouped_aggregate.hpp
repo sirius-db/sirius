@@ -33,24 +33,6 @@ void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColu
 
 void cudf_duplicate_elimination(vector<shared_ptr<GPUColumn>>& keys, uint64_t num_keys);
 
-// template <typename T, typename V>
-// void groupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count, uint64_t N, uint64_t num_keys, uint64_t num_aggregates, int* agg_mode);
-
-// template <typename T>
-// void groupedWithoutAggregate(uint8_t **keys, uint64_t* count, uint64_t N, uint64_t num_keys);
-
-// template <typename T, typename V>
-// void groupedDistinctAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count, uint64_t N, uint64_t num_keys, uint64_t num_aggregates, int* distinct_mode);
-
-// template <typename V>
-// void groupedStringAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t** offset, uint64_t* num_bytes, uint64_t* count, uint64_t N, uint64_t num_keys, uint64_t num_aggregates, int* agg_mode);
-
-// template <typename V>
-// void optimizedGroupedStringAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t** offset, uint64_t* num_bytes, uint64_t* count, uint64_t N, uint64_t num_keys, uint64_t num_aggregates, int* agg_mode);
-
-// template <typename T, typename V>
-// void hashGroupedAggregate(uint8_t **keys, uint8_t **aggregate_keys, uint64_t* count, uint64_t N, uint64_t num_keys, uint64_t num_aggregates, int* agg_mode);
-
 template<typename T>
 void combineColumns(T* a, T* b, T*& c, uint64_t N_a, uint64_t N_b);
 
@@ -94,14 +76,8 @@ public:
 	shared_ptr<GPUIntermediateRelation> group_by_result;
 
 public:
-	// // Source interface
-	// unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;
-	// unique_ptr<LocalSourceState> GetLocalSourceState(ExecutionContext &context,
-	//                                                  GlobalSourceState &gstate) const override;
-	// SourceResultType GetData(ExecutionContext &context, GPUIntermediateRelation &output_relation, OperatorSourceInput &input) const override;
+	// Source interface
 	SourceResultType GetData(GPUIntermediateRelation& output_relation) const override;
-
-	// double GetProgress(ClientContext &context, GlobalSourceState &gstate) const override;
 
 	//Source interface
 	bool IsSource() const override {
@@ -117,16 +93,7 @@ public:
 
 public:
 	// Sink interface
-	// SinkResultType Sink(ExecutionContext &context, GPUIntermediateRelation& input_relation, OperatorSinkInput &input) const override;
 	SinkResultType Sink(GPUIntermediateRelation &input_relation) const override;
-	// SinkCombineResultType Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const override;
-	// SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
-	//                           OperatorSinkFinalizeInput &input) const override;
-	// SinkFinalizeType FinalizeInternal(Pipeline &pipeline, Event &event, ClientContext &context, GlobalSinkState &gstate,
-	//                                   bool check_distinct) const;
-
-	// unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const override;
-	// unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
 
 	// Sink interface
 	bool IsSink() const override {
@@ -140,32 +107,6 @@ public:
 	bool SinkOrderDependent() const override {
 		return false;
 	}
-
-// public:
-// 	string ParamsToString() const override;
-// 	//! Toggle multi-scan capability on a hash table, which prevents the scan of the aggregate from being destructive
-// 	//! If this is not toggled the GetData method will destroy the hash table as it is scanning it
-// 	static void SetMultiScan(GlobalSinkState &state);
-
-// private:
-// 	//! When we only have distinct aggregates, we can delay adding groups to the main ht
-// 	bool CanSkipRegularSink() const;
-
-// 	//! Finalize the distinct aggregates
-// 	SinkFinalizeType FinalizeDistinct(Pipeline &pipeline, Event &event, ClientContext &context,
-// 	                                  GlobalSinkState &gstate) const;
-// 	//! Combine the distinct aggregates
-// 	void CombineDistinct(ExecutionContext &context, OperatorSinkCombineInput &input) const;
-// 	//! Sink the distinct aggregates for a single grouping
-	// void SinkDistinctGrouping(ExecutionContext &context, GPUIntermediateRelation &input_relation, OperatorSinkInput &input,
-	//                           idx_t grouping_idx) const;
-	// void SinkDistinctGrouping(GPUIntermediateRelation &input_relation, idx_t grouping_idx) const;
-// 	//! Sink the distinct aggregates
-	// void SinkDistinct(ExecutionContext &context, GPUIntermediateRelation& input_relation, OperatorSinkInput &input) const;
-	// void SinkDistinct(GPUIntermediateRelation &input_relation) const;
-// 	//! Create groups in the main ht for groups that would otherwise get filtered out completely
-// 	SinkResultType SinkGroupsOnly(ExecutionContext &context, GlobalSinkState &state, LocalSinkState &lstate,
-// 	                              DataChunk &input) const;
 
 private:
 	static bool CheckGroupKeyTypesForSiriusImpl(const vector<shared_ptr<GPUColumn>> &columns);
