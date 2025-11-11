@@ -15,5 +15,6 @@
 set(EXTENSION_SOURCES
   ${EXTENSION_SOURCES}
   ${CMAKE_CURRENT_SOURCE_DIR}/duckdb_scan_task.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/duckdb_scan_executor.cpp
   PARENT_SCOPE
 )

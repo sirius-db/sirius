@@ -43,11 +43,37 @@ class duckdb_scan_executor : public itask_executor {
 
   //===----------Methods----------===//
   /**
+   * @brief Schedule a new task for execution.
+   *
+   * @param task The task to be scheduled.
+   */
+  void schedule(sirius::unique_ptr<itask> task) override;
+
+  /**
+   * @brief Wait for all scheduled tasks to complete.
+   */
+  void wait();
+
+  /**
+   * @brief Worker thread loop.
+   *
+   * @param worker_id The ID of the worker thread.
+   */
+  void worker_loop(int32_t worker_id) override;
+
+  /**
    * @brief Get the number of threads in the thread pool for this executor.
    *
    * @return The number of threads in the thread pool for this executor.
    */
   int32_t get_num_threads() const { return _config.num_threads; }
+
+  //===----------Fields----------===//
+ private:
+  sirius::atomic<uint64_t> _total_tasks    = 0;  // The total number of scheduled tasks
+  sirius::atomic<uint64_t> _finished_tasks = 0;
+  sirius::mutex _finish_mutex;
+  std::condition_variable _finish_cv;
 };
 
 }  // namespace sirius::parallel

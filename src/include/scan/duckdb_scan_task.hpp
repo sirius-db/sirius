@@ -93,7 +93,7 @@ class duckdb_scan_task_global_state : public itask_global_state, public duckdb::
   unique_ptr<duckdb::GlobalTableFunctionState>
     global_tf_state;                    ///< Global state for the table function
   duckdb_scan_executor& scan_executor;  ///< The scan executor executing this scan task
-  const duckdb::PhysicalTableScan& op;  ///< The physical table scan operator adapter being executed
+  const duckdb::PhysicalTableScan& op;  ///< The physical table scan being executed
 };
 
 //===----------------------------------------------------------------------===//
@@ -161,26 +161,42 @@ struct multiple_blocks_allocation_accessor {
   }
 
   /**
-   * @brief Get the value at the current position in the allocation.
+   * @brief Get the value at the current position in the allocation as a different type.
+   *
+   * @tparam S The type to which to cast the value.
    */
-  T get_current() const
+  template <typename S>
+  S get_current_as() const
   {
     assert(block_index < allocation->blocks.size());
-    return *reinterpret_cast<T*>(static_cast<uint8_t*>(allocation->blocks[block_index]) +
+    return *reinterpret_cast<S*>(static_cast<uint8_t*>(allocation->blocks[block_index]) +
                                  offset_in_block);
   }
 
   /**
-   * @brief Advance the cursor into the allocation to the next position.
+   * @brief Get the value at the current position in the allocation using the underlying type.
    */
-  void advance()
+  T get_current() const { return get_current_as<underlying_type>(); }
+
+  /**
+   * @brief Advance the cursor into the allocation to the next position as type S.
+   *
+   * @tparam S The type size to use for advancing the cursor.
+   */
+  template <typename S>
+  void advance_as()
   {
-    offset_in_block += sizeof(underlying_type);
+    offset_in_block += sizeof(S);
     if (offset_in_block == allocation->block_size) {
       ++block_index;
       offset_in_block = 0;
     }
   }
+
+  /**
+   * @brief Advance the cursor into the allocation to the next position using the underlying type.
+   */
+  void advance() { advance_as<underlying_type>(); }
 
   /**
    * @brief Copy from a given source buffer into the allocation starting at the current position.
@@ -199,6 +215,34 @@ struct multiple_blocks_allocation_accessor {
         std::min(bytes - bytes_copied, allocation->block_size - offset_in_block);
       std::memcpy(static_cast<uint8_t*>(allocation->blocks[block_index]) + offset_in_block,
                   static_cast<uint8_t const*>(src) + bytes_copied,
+                  bytes_to_copy);
+      bytes_copied += bytes_to_copy;
+      offset_in_block += bytes_to_copy;
+      // Check if we need to advance to the next block
+      if (offset_in_block == allocation->block_size) {
+        ++block_index;
+        offset_in_block = 0;
+      }
+    }
+  }
+
+  /**
+   * @brief Copy the data from the allocation to a destination buffer.
+   *
+   * @param[in] dest Pointer to the destination buffer.
+   * @param[in] bytes Number of bytes to copy to the destination buffer.
+   */
+  void memcpy_to(void* dest, size_t bytes)
+  {
+    size_t bytes_copied = 0;
+    // Loop over blocks from which to copy the data
+    while (bytes_copied < bytes) {
+      assert(block_index < allocation->blocks.size());
+      // Do as much of a bulk copy as possible in the current block
+      auto const bytes_to_copy =
+        std::min(bytes - bytes_copied, allocation->block_size - offset_in_block);
+      std::memcpy(static_cast<uint8_t*>(dest) + bytes_copied,
+                  static_cast<uint8_t*>(allocation->blocks[block_index]) + offset_in_block,
                   bytes_to_copy);
       bytes_copied += bytes_to_copy;
       offset_in_block += bytes_to_copy;
@@ -348,15 +392,19 @@ class duckdb_scan_task_local_state : public itask_local_state {
    * @param[in] g_state The global state for the scan task.
    * @param[in] exec_ctx The DuckDB execution context.
    * @param[in] approximate_batch_size The approximate target batch size in bytes.
+   * @param[in] default_varchar_size The default size for VARCHAR columns in bytes (used for row
+   * size estimation)
    */
   duckdb_scan_task_local_state(duckdb_scan_task_global_state& g_state,
                                duckdb::ExecutionContext& exec_ctx,
-                               size_t approximate_batch_size);
+                               size_t approximate_batch_size,
+                               size_t default_varchar_size);
 
   //===----------Fields----------===//
   size_t approximate_batch_size;           ///< Approximate target batch size in bytes
+  size_t default_varchar_size;             ///< Default size for VARCHAR columns in bytes
   size_t num_columns;                      ///< Number of columns to be scanned
-  size_t estimated_row_size;               ///< Estimated size of each row in bytes
+  size_t estimated_row_size = 0;           ///< Estimated size of each row in bytes
   size_t estimated_rows_per_batch;         ///< Estimated number of rows per batch
   vector<column_builder> column_builders;  ///< Column builders for each column
   vector<size_t> varchar_indices;          ///< Indices of VARCHAR columns
@@ -417,7 +465,7 @@ class duckdb_scan_task_local_state : public itask_local_state {
 class duckdb_scan_task : public itask {
   // Friend declaration for test access
   friend class test_scan_task;
-  
+
  public:
   //===----------Constructor----------===//
   /**
@@ -436,6 +484,7 @@ class duckdb_scan_task : public itask {
 
   void execute() override;
 
+  /// TODO: change protected to private when data can be tested against data in the data repository
  protected:
   //===----------Methods----------===//
   /**
@@ -462,6 +511,7 @@ class duckdb_scan_task : public itask {
    */
   void process_chunk(duckdb_scan_task_local_state& l_state);
 
+ public:
   /**
    * @brief Gets the global state of the scan task.
    *
@@ -482,6 +532,7 @@ class duckdb_scan_task : public itask {
     return &this->_local_state->cast<duckdb_scan_task_local_state>();
   }
 
+ protected:
   //===----------Fields----------===//
   data_repository_manager& dr_mgr;  ///< Data repository manager to which to push batches
   uint64_t task_id;                 ///< The unique id of this scan task

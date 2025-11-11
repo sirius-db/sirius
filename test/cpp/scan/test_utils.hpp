@@ -35,10 +35,11 @@ using namespace sirius::memory;
  * @brief Create test allocators for a specific memory tier.
  *
  * @param tier The memory tier (GPU, HOST, or DISK)
+ * @param size The size of the allocator (only used for HOST tier)
  * @return A vector containing the appropriate allocator for the tier
  */
 inline std::vector<std::unique_ptr<rmm::mr::device_memory_resource>> create_test_allocators(
-  Tier tier)
+  Tier tier, size_t size = 0)
 {
   std::vector<std::unique_ptr<rmm::mr::device_memory_resource>> allocators;
 
@@ -49,9 +50,11 @@ inline std::vector<std::unique_ptr<rmm::mr::device_memory_resource>> create_test
       break;
     }
     case Tier::HOST: {
-      // Use a larger host memory resource for integration tests (100MB)
-      auto host_allocator =
-        sirius::make_unique<fixed_size_host_memory_resource>(100ull * 1024 * 1024);
+      // Use the specified size for the host memory resource
+      if (size == 0) {
+        size = 100ull * 1024 * 1024; // Default to 100MB
+      }
+      auto host_allocator = sirius::make_unique<fixed_size_host_memory_resource>(size);
       allocators.push_back(std::move(host_allocator));
       break;
     }
@@ -79,10 +82,15 @@ inline void initialize_memory_manager()
   if (!initialized) {
     memory_reservation_manager::reset_for_testing();
     std::vector<memory_reservation_manager::memory_space_config> configs;
-    // Use much smaller memory sizes for faster initialization (1MB GPU, 10MB HOST, 10MB DISK)
-    configs.emplace_back(Tier::GPU, 0, 1ULL * 1024 * 1024, create_test_allocators(Tier::GPU));
-    configs.emplace_back(Tier::HOST, 0, 10ULL * 1024 * 1024, create_test_allocators(Tier::HOST));
-    configs.emplace_back(Tier::DISK, 0, 10ULL * 1024 * 1024, create_test_allocators(Tier::DISK));
+    // Use appropriate memory sizes - allocator size must match the memory space limit
+    // Need enough HOST memory for multiple columns with data + masks + offsets
+    size_t gpu_size = 1ULL * 1024 * 1024;     // 1MB
+    size_t host_size = 100ULL * 1024 * 1024;  // 100MB - enough for test data
+    size_t disk_size = 10ULL * 1024 * 1024;   // 10MB
+    
+    configs.emplace_back(Tier::GPU, 0, gpu_size, create_test_allocators(Tier::GPU, gpu_size));
+    configs.emplace_back(Tier::HOST, 0, host_size, create_test_allocators(Tier::HOST, host_size));
+    configs.emplace_back(Tier::DISK, 0, disk_size, create_test_allocators(Tier::DISK, disk_size));
     memory_reservation_manager::initialize(std::move(configs));
     initialized = true;
   }

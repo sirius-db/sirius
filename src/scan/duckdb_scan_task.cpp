@@ -24,6 +24,8 @@
 #include <duckdb/function/table_function.hpp>
 #include <sys/types.h>
 
+#include <iostream>
+
 namespace sirius::parallel {
 
 //===----------------------------------------------------------------------===//
@@ -37,7 +39,7 @@ duckdb_scan_task_global_state::duckdb_scan_task_global_state(
   : pipeline_id(pipeline_id),
     max_threads(scan_exec.get_num_threads()),
     scan_executor(scan_exec),
-    op(ptsa.physical_table_scan)
+    op(ptsa.get_physical_table_scan())
 {
   // Initialize global table function state
   if (op.function.init_global) {
@@ -94,7 +96,7 @@ void duckdb_scan_task_local_state::column_builder::reserve_memory(size_t estimat
   data_reservation  = mem_res_mgr.request_reservation(res_request, type_size * estimated_num_rows);
   mask_reservation =
     mem_res_mgr.request_reservation(res_request, utils::ceil_div_8(estimated_num_rows));
-  if (type == duckdb::LogicalTypeId::VARCHAR) {
+  if (type.InternalType() == duckdb::PhysicalType::VARCHAR) {
     offset_reservation =
       mem_res_mgr.request_reservation(res_request, sizeof(int64_t) * (estimated_num_rows + 1));
   }
@@ -107,9 +109,11 @@ void duckdb_scan_task_local_state::column_builder::allocate_memory()
 
   data_blocks_accessor.initialize(sirius::make_unique<multiple_blocks_allocation>(
     allocator->allocate_multiple_blocks(data_reservation->size)));
+
   mask_blocks_accessor.initialize(sirius::make_unique<multiple_blocks_allocation>(
     allocator->allocate_multiple_blocks(mask_reservation->size)));
-  if (type == duckdb::LogicalTypeId::VARCHAR) {
+
+  if (type.InternalType() == duckdb::PhysicalType::VARCHAR) {
     assert(offset_reservation);
 
     offset_blocks_accessor.initialize(sirius::make_unique<multiple_blocks_allocation>(
@@ -124,7 +128,7 @@ bool duckdb_scan_task_local_state::column_builder::sufficient_space_for_column(
   duckdb::Vector& vec, duckdb::ValidityMask const& validity, size_t num_rows)
 {
   size_t data_bytes = 0;
-  if (type == duckdb::LogicalTypeId::VARCHAR) {
+  if (type.InternalType() == duckdb::PhysicalType::VARCHAR) {
     auto const* str_data = reinterpret_cast<duckdb::string_t const*>(vec.GetData());
     for (size_t row = 0; row < num_rows; ++row) {
       data_bytes += str_data[row].GetSize();
@@ -242,7 +246,7 @@ void duckdb_scan_task_local_state::column_builder::process_column(
   duckdb::Vector& vec, duckdb::ValidityMask const& validity, size_t num_rows, size_t row_offset)
 {
   // PRECONDITION: Vector must be flattened
-  if (type == duckdb::LogicalTypeId::VARCHAR) {
+  if (type.InternalType() == duckdb::PhysicalType::VARCHAR) {
     size_t data_bytes    = 0;
     auto const* str_data = reinterpret_cast<duckdb::string_t const*>(vec.GetData());
     for (size_t row = 0; row < num_rows; ++row) {
@@ -280,8 +284,12 @@ void duckdb_scan_task_local_state::column_builder::process_column(
 duckdb_scan_task_local_state::duckdb_scan_task_local_state(
   duckdb_scan_task_global_state& g_state,
   duckdb::ExecutionContext& exec_ctx,
-  size_t approximate_batch_size = DEFAULT_APPROXIMATE_BATCH_SIZE)
-  : approximate_batch_size(approximate_batch_size), exec_ctx(exec_ctx)
+  size_t approximate_batch_size = DEFAULT_APPROXIMATE_BATCH_SIZE,
+  size_t default_varchar_size   = DEFAULT_VARCHAR_SIZE)
+  : approximate_batch_size(approximate_batch_size),
+    default_varchar_size(default_varchar_size),
+    estimated_row_size(0),
+    exec_ctx(exec_ctx)
 {
   auto const& op = g_state.op;
   num_columns    = op.projection_ids.size();
@@ -313,14 +321,15 @@ void duckdb_scan_task_local_state::initialize_local_table_function_state(
 
 void duckdb_scan_task_local_state::initialize_builders(const duckdb::PhysicalTableScan& op)
 {
+  estimated_row_size = 0;
   // Initialize projected types and column sizes
   column_builders.reserve(num_columns);
   for (size_t i = 0; i < num_columns; ++i) {
     duckdb::LogicalType const col_type = op.returned_types[op.column_ids[i].GetPrimaryIndex()];
     column_builders.emplace_back(col_type);
-    if (col_type == duckdb::LogicalTypeId::VARCHAR) {
+    if (col_type.InternalType() == duckdb::PhysicalType::VARCHAR) {
       varchar_indices.push_back(i);
-      estimated_row_size += DEFAULT_VARCHAR_SIZE;
+      estimated_row_size += default_varchar_size;
     } else {
       estimated_row_size += duckdb::GetTypeIdSize(col_type.InternalType());
     }
@@ -330,7 +339,7 @@ void duckdb_scan_task_local_state::initialize_builders(const duckdb::PhysicalTab
 void duckdb_scan_task_local_state::estimate_rows_per_batch()
 {
   estimated_rows_per_batch =
-    utils::ceil_div(estimated_row_size * CHAR_BIT + num_columns, approximate_batch_size * CHAR_BIT);
+    utils::ceil_div(approximate_batch_size * CHAR_BIT, estimated_row_size * CHAR_BIT + num_columns);
 }
 
 void duckdb_scan_task_local_state::initialize_buffers()
@@ -347,6 +356,9 @@ void duckdb_scan_task_local_state::initialize_buffers()
 bool duckdb_scan_task::get_next_chunk(duckdb_scan_task_local_state& l_state,
                                       duckdb_scan_task_global_state& g_state)
 {
+  // Reset the chunk before calling the table function to ensure it starts empty
+  l_state.chunk.Reset();
+
   duckdb::TableFunctionInput tf_input(
     g_state.op.bind_data.get(), l_state.local_tf_state.get(), g_state.global_tf_state.get());
   g_state.op.function.function(l_state.exec_ctx.client, tf_input, l_state.chunk);
@@ -409,10 +421,9 @@ void duckdb_scan_task::execute()
 
     // Process the chunk into the column builders
     process_chunk(l_state);
-    l_state.row_offset += l_state.chunk.size();
 
     // Termination condition
-    if (STANDARD_VECTOR_SIZE * l_state.row_offset >= l_state.estimated_rows_per_batch) { break; }
+    if (STANDARD_VECTOR_SIZE + l_state.row_offset >= l_state.estimated_rows_per_batch) { break; }
   }
 
   // Add tasks back to the queue if the scan is not finished

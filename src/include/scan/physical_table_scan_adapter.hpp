@@ -41,46 +41,24 @@ class physical_table_scan_adapter : GPUPhysicalOperator {
    * @brief Construct a new physical_table_scan_adapter object (has the same signature as DuckDB's
    * PhysicalTableScan).
    *
-   * @param[in] type
-   * @param[in] function the table function
-   * @param[in] bind_data bind data for the table function
-   * @param[in] returned_types the types of ALL columns that can be returned by the table function
-   * @param[in] column_ids the column ids used within the table function
-   * @param[in] projection_ids the projected-out column ids
-   * @param[in] names the names of the columns
-   * @param[in] table_filters the table filters
-   * @param[in] estimated_cardinality the estimated cardinality of the scan
-   * @param[in] extra_info extra operator info (currently stores info related to filters pushed down
-   * into MultiFileLists and sample rate pushed down into the table scan)
-   * @param[in] parameters contains a reference to dynamically generated table filters (through e.g.
-   * a join up in the tree)
+   * @param[in] physical_table_scan The DuckDB PhysicalTableScan operator to be wrapped.
    */
-  physical_table_scan_adapter(vector<duckdb::LogicalType> types,
-                              TableFunction function,
-                              unique_ptr<FunctionData> bind_data,
-                              vector<LogicalType> returned_types,
-                              vector<ColumnIndex> column_ids,
-                              vector<idx_t> projection_ids,
-                              vector<string> names,
-                              unique_ptr<TableFilterSet> table_filters,
-                              idx_t estimated_cardinality,
-                              ExtraOperatorInfo extra_info,
-                              vector<Value> parameters)
-    : GPUPhysicalOperator(PhysicalOperatorType::TABLE_SCAN, types, estimated_cardinality),
-      physical_table_scan(std::move(types),
-                          std::move(function),
-                          std::move(bind_data),
-                          std::move(returned_types),
-                          std::move(column_ids),
-                          std::move(projection_ids),
-                          std::move(names),
-                          std::move(table_filters),
-                          estimated_cardinality,
-                          extra_info,
-                          std::move(parameters)) {};
+  physical_table_scan_adapter(std::unique_ptr<PhysicalTableScan> physical_table_scan)
+    : GPUPhysicalOperator(PhysicalOperatorType::TABLE_SCAN,
+                          physical_table_scan->types,
+                          physical_table_scan->estimated_cardinality),
+      physical_table_scan(std::move(physical_table_scan)) {};
+
+  //===----------Methods----------===//
+  /**
+   * @brief Get the underlying PhysicalTableScan operator.
+   *
+   * @return PhysicalTableScan& Reference to the underlying PhysicalTableScan operator.
+   */
+  PhysicalTableScan const& get_physical_table_scan() const { return *physical_table_scan; }
 
   //===----------Fields----------===//
-  duckdb::PhysicalTableScan physical_table_scan;
+  std::unique_ptr<PhysicalTableScan> physical_table_scan;
 };
 
 }  // namespace duckdb

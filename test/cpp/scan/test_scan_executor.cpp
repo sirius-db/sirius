@@ -17,8 +17,13 @@
 // catch2
 #include <catch.hpp>
 
+// test utilities
+#include "test_utils.hpp"
+
 // sirius
+#include <data/data_batch_view.hpp>
 #include <data/data_repository.hpp>
+#include <data/data_repository_manager.hpp>
 #include <scan/duckdb_scan_executor.hpp>
 #include <scan/duckdb_scan_task.hpp>
 #include <scan/physical_table_scan_adapter.hpp>
@@ -26,6 +31,7 @@
 // duckdb
 #include <duckdb.hpp>
 #include <duckdb/catalog/catalog_entry/table_catalog_entry.hpp>
+#include <duckdb/catalog/catalog_transaction.hpp>
 #include <duckdb/common/types.hpp>
 #include <duckdb/execution/execution_context.hpp>
 #include <duckdb/execution/operator/scan/physical_table_scan.hpp>
@@ -34,10 +40,11 @@
 #include <duckdb/parallel/thread_context.hpp>
 
 // standard library
-#include <chrono>
+//#include <chrono>
+#include <cstdint>
 #include <memory>
 #include <string>
-#include <thread>
+//#include <thread>
 
 using idx_t = duckdb::idx_t;
 using namespace sirius;
@@ -47,7 +54,7 @@ using namespace sirius;
 //===----------------------------------------------------------------------===//
 
 /**
- * @brief Test version of duckdb_scan_task that appends scanned data to a DuckDB table
+ * @brief Test version of duckdb_scan_task that appends scanned data to a DuckDB table.
  *
  * This task executes the full scan pipeline (get_next_chunk -> process_chunk)
  * and then reads data from the column_builders to append to a staging table.
@@ -55,14 +62,12 @@ using namespace sirius;
 class test_scan_task : public parallel::duckdb_scan_task {
  public:
   test_scan_task(uint64_t task_id,
+                 data_repository_manager& dr_mgr,
                  duckdb::Connection& con,
                  std::string const& table_name,
                  sirius::unique_ptr<parallel::duckdb_scan_task_local_state> l_state,
                  sirius::shared_ptr<parallel::duckdb_scan_task_global_state> g_state)
-    : duckdb_scan_task(task_id,
-                       *reinterpret_cast<data_repository_manager*>(std::nullptr),  // Not used
-                       std::move(l_state),
-                       g_state),
+    : duckdb_scan_task(task_id, dr_mgr, std::move(l_state), g_state),
       con_(con),
       table_name_(table_name)
   {
@@ -85,19 +90,18 @@ class test_scan_task : public parallel::duckdb_scan_task {
 
       // Process the chunk into column builders
       process_chunk(l_state);
-      l_state.row_offset += l_state.chunk.size();
 
       // Termination condition
-      if (STANDARD_VECTOR_SIZE * l_state.row_offset >= l_state.estimated_rows_per_batch) { break; }
+      if (STANDARD_VECTOR_SIZE + l_state.row_offset >= l_state.estimated_rows_per_batch) { break; }
     }
 
     // Add tasks back to the queue if the scan is not finished
     if (!g_state.IsSourceDrained()) {
       auto const new_task_id = this->task_id + g_state.max_threads;
-      auto new_local_state   = sirius::make_unique<duckdb_scan_task_local_state>(
+      auto new_local_state   = sirius::make_unique<parallel::duckdb_scan_task_local_state>(
         g_state, l_state.exec_ctx, l_state.approximate_batch_size);
       auto shared_global_state =
-        std::static_pointer_cast<duckdb_scan_task_global_state>(this->_global_state);
+        std::static_pointer_cast<parallel::duckdb_scan_task_global_state>(this->_global_state);
       auto next_task = sirius::make_unique<duckdb_scan_task>(
         new_task_id, dr_mgr, std::move(new_local_state), shared_global_state);
       g_state.scan_executor.schedule(std::move(next_task));
@@ -111,11 +115,10 @@ class test_scan_task : public parallel::duckdb_scan_task {
   /**
    * @brief Helper to check if a bit in a validity mask is set (1 = valid, 0 = invalid)
    */
-  static inline bool is_valid(uint8_t const* mask, idx_t row_idx)
+  static inline bool is_valid(uint8_t current_mask, idx_t row_idx)
   {
-    auto const byte_idx = row_idx / 8;
-    auto const bit_idx  = row_idx % 8;
-    return (mask[byte_idx] & (1 << bit_idx)) != 0;
+    auto const bit_idx = row_idx % 8;
+    return (current_mask & (1 << bit_idx)) != 0;
   }
 
   /**
@@ -132,22 +135,28 @@ class test_scan_task : public parallel::duckdb_scan_task {
     }
 
     duckdb::Appender app(con_, table_name_);
-    auto const& column_builders = l_state.column_builders;
+    auto& column_builders = l_state.column_builders;
 
-    for (idx_t i = 0; i < num_rows; ++i) {
+    // First, reset the cursors of all column builders
+    for (size_t col = 0; col < column_builders.size(); ++col) {
+      auto& builder = column_builders[col];
+
+      // Get raw pointers to the data
+      builder.data_blocks_accessor.set_cursor(0);
+      builder.mask_blocks_accessor.set_cursor(0);
+      builder.offset_blocks_accessor.set_cursor(0);
+    }
+
+    for (size_t i = 0; i < num_rows; ++i) {
       app.BeginRow();
 
-      for (idx_t col = 0; col < column_builders.size(); ++col) {
-        auto const& builder = column_builders[col];
-        auto const& type    = builder.type;
+      for (size_t col = 0; col < column_builders.size(); ++col) {
+        auto& builder    = column_builders[col];
+        auto const& type = builder.type;
 
-        // Get raw pointers to the data
-        auto const* data_ptr = builder.data_blocks_accessor.get_base_ptr();
-        auto const* mask_ptr = builder.mask_blocks_accessor.get_base_ptr();
-
-        // Check validity
-        bool valid = true;
-        if (mask_ptr) { valid = is_valid(mask_ptr, i); }
+        // Check validity - advance mask accessor every 8 rows
+        if (i > 0 && i % 8 == 0) { builder.mask_blocks_accessor.advance(); }
+        bool valid = is_valid(builder.mask_blocks_accessor.get_current(), i);
 
         if (!valid) {
           app.Append(duckdb::Value());  // NULL value
@@ -158,32 +167,39 @@ class test_scan_task : public parallel::duckdb_scan_task {
         switch (type.id()) {
           case duckdb::LogicalTypeId::CHAR:  // Fallthrough
           case duckdb::LogicalTypeId::VARCHAR: {
-            auto const* offset_ptr = builder.offset_blocks_accessor.get_base_ptr();
-            auto const beg         = offset_ptr[i];
-            auto const end         = offset_ptr[i + 1];
-            auto const* str_ptr    = reinterpret_cast<const char*>(data_ptr + beg);
-            auto const len         = end - beg;
-            app.Append<duckdb::string_t>(std::string(str_ptr, len));
+            auto const beg = builder.offset_blocks_accessor.get_current();
+            builder.offset_blocks_accessor.advance();
+            auto const end = builder.offset_blocks_accessor.get_current();
+            auto const len = end - beg;
+            // We need to copy the string data from the multiple blocks allocation to a contiguous
+            // buffer.
+            std::string str(len, '\0');
+            builder.data_blocks_accessor.memcpy_to(str.data(), len);
+            app.Append<duckdb::string_t>(str);
             break;
           }
           case duckdb::LogicalTypeId::INTEGER: {
-            auto const* int_ptr = reinterpret_cast<const int32_t*>(data_ptr);
-            app.Append<int32_t>(int_ptr[i]);
+            auto const int_val = builder.data_blocks_accessor.get_current_as<int32_t>();
+            app.Append<int32_t>(int_val);
+            builder.data_blocks_accessor.advance_as<int32_t>();
             break;
           }
           case duckdb::LogicalTypeId::BIGINT: {
-            auto const* bigint_ptr = reinterpret_cast<const int64_t*>(data_ptr);
-            app.Append<int64_t>(bigint_ptr[i]);
+            auto const bigint_val = builder.data_blocks_accessor.get_current_as<int64_t>();
+            app.Append<int64_t>(bigint_val);
+            builder.data_blocks_accessor.advance_as<int64_t>();
             break;
           }
           case duckdb::LogicalTypeId::DOUBLE: {
-            auto const* double_ptr = reinterpret_cast<const double*>(data_ptr);
-            app.Append<double>(double_ptr[i]);
+            auto const double_val = builder.data_blocks_accessor.get_current_as<double>();
+            app.Append<double>(double_val);
+            builder.data_blocks_accessor.advance_as<double>();
             break;
           }
           case duckdb::LogicalTypeId::FLOAT: {
-            auto const* float_ptr = reinterpret_cast<const float*>(data_ptr);
-            app.Append<float>(float_ptr[i]);
+            auto const float_val = builder.data_blocks_accessor.get_current_as<float>();
+            app.Append<float>(float_val);
+            builder.data_blocks_accessor.advance_as<float>();
             break;
           }
           case duckdb::LogicalTypeId::DECIMAL: {
@@ -192,23 +208,28 @@ class test_scan_task : public parallel::duckdb_scan_task {
 
             switch (type.InternalType()) {
               case duckdb::PhysicalType::INT16: {
-                auto const* dec_ptr = reinterpret_cast<const int16_t*>(data_ptr);
-                app.Append(duckdb::Value::DECIMAL(dec_ptr[i], width, scale));
+                auto const dec_val = builder.data_blocks_accessor.get_current_as<int16_t>();
+                app.Append(duckdb::Value::DECIMAL(dec_val, width, scale));
+                builder.data_blocks_accessor.advance_as<int16_t>();
                 break;
               }
               case duckdb::PhysicalType::INT32: {
-                auto const* dec_ptr = reinterpret_cast<const int32_t*>(data_ptr);
-                app.Append(duckdb::Value::DECIMAL(dec_ptr[i], width, scale));
+                auto const dec_val = builder.data_blocks_accessor.get_current_as<int32_t>();
+                app.Append(duckdb::Value::DECIMAL(dec_val, width, scale));
+                builder.data_blocks_accessor.advance_as<int32_t>();
                 break;
               }
               case duckdb::PhysicalType::INT64: {
-                auto const* dec_ptr = reinterpret_cast<const int64_t*>(data_ptr);
-                app.Append(duckdb::Value::DECIMAL(dec_ptr[i], width, scale));
+                auto const dec_val = builder.data_blocks_accessor.get_current_as<int64_t>();
+                app.Append(duckdb::Value::DECIMAL(dec_val, width, scale));
+                builder.data_blocks_accessor.advance_as<int64_t>();
                 break;
               }
               case duckdb::PhysicalType::INT128: {
-                auto const* dec_ptr = reinterpret_cast<const duckdb::hugeint_t*>(data_ptr);
-                app.Append(duckdb::Value::DECIMAL(dec_ptr[i], width, scale));
+                auto const dec_val =
+                  builder.data_blocks_accessor.get_current_as<duckdb::hugeint_t>();
+                app.Append(duckdb::Value::DECIMAL(dec_val, width, scale));
+                builder.data_blocks_accessor.advance_as<duckdb::hugeint_t>();
                 break;
               }
               default: FAIL("Unsupported decimal internal type");
@@ -216,8 +237,9 @@ class test_scan_task : public parallel::duckdb_scan_task {
             break;
           }
           case duckdb::LogicalTypeId::DATE: {
-            auto const* date_ptr = reinterpret_cast<const int32_t*>(data_ptr);
-            app.Append<duckdb::date_t>(duckdb::date_t(date_ptr[i]));
+            auto const date_val = builder.data_blocks_accessor.get_current_as<duckdb::date_t>();
+            app.Append<duckdb::date_t>(date_val);
+            builder.data_blocks_accessor.advance_as<duckdb::date_t>();
             break;
           }
           default: FAIL("Type not handled in test scan task appender");
@@ -357,18 +379,21 @@ static void validate_tables_equal(duckdb::Connection& con,
 static std::unique_ptr<duckdb::PhysicalTableScan> make_physical_table_scan(
   duckdb::ClientContext& ctx, std::string const& table_name)
 {
-  auto& catalog = duckdb::Catalog::GetCatalog(ctx, INVALID_CATALOG);
-  auto& schema  = catalog.GetSchema(ctx, DEFAULT_SCHEMA);
+  auto& catalog = duckdb::Catalog::GetCatalog(ctx, "");
+  duckdb::CatalogTransaction txn(catalog, ctx);
+  auto& schema = catalog.GetSchema(txn, "main");
 
-  auto table_entry = schema.GetEntry(ctx, duckdb::CatalogType::TABLE_ENTRY, table_name);
+  auto table_entry = schema.GetEntry(txn, duckdb::CatalogType::TABLE_ENTRY, table_name);
   REQUIRE(table_entry);
 
   auto& table_catalog_entry = table_entry->Cast<duckdb::TableCatalogEntry>();
 
-  // Get all column IDs
-  std::vector<duckdb::column_t> column_ids;
+  // Get all column IDs as ColumnIndex
+  duckdb::vector<duckdb::ColumnIndex> column_ids;
+  duckdb::vector<duckdb::idx_t> projection_ids;
   for (size_t i = 0; i < table_catalog_entry.GetColumns().LogicalColumnCount(); ++i) {
-    column_ids.push_back(static_cast<duckdb::column_t>(i));
+    column_ids.push_back(duckdb::ColumnIndex(i));
+    projection_ids.push_back(i);  // Map output column i to internal column i
   }
 
   // Create bind data
@@ -377,15 +402,28 @@ static std::unique_ptr<duckdb::PhysicalTableScan> make_physical_table_scan(
   // Get the table scan function
   auto table_scan_function = duckdb::TableScanFunction::GetFunction();
 
-  // Create PhysicalTableScan
+  // Get column names
+  duckdb::vector<std::string> column_names;
+  for (size_t i = 0; i < table_catalog_entry.GetColumns().LogicalColumnCount(); ++i) {
+    column_names.push_back(table_catalog_entry.GetColumn(duckdb::LogicalIndex(i)).GetName());
+  }
+
+  // Create extra operator info (must be a variable, not a temporary)
+  duckdb::ExtraOperatorInfo extra_info;
+
+  // Create PhysicalTableScan with all required parameters
   auto physical_scan = sirius::make_unique<duckdb::PhysicalTableScan>(
-    table_catalog_entry.GetTypes(),
-    table_scan_function,
-    std::move(bind_data),
-    column_ids,
-    std::vector<duckdb::LogicalType>(),                  // projection_ids (empty = all columns)
-    std::vector<std::unique_ptr<duckdb::Expression>>(),  // table_filters
-    0                                                    // estimated_cardinality
+    table_catalog_entry.GetTypes(),  // types
+    table_scan_function,             // function
+    std::move(bind_data),            // bind_data
+    table_catalog_entry.GetTypes(),  // returned_types
+    std::move(column_ids),           // column_ids
+    std::move(projection_ids),       // projection_ids (maps output to internal columns)
+    std::move(column_names),         // names
+    nullptr,                         // table_filters
+    0,                               // estimated_cardinality
+    extra_info,                      // extra_info
+    duckdb::vector<duckdb::Value>()  // parameters
   );
 
   return physical_scan;
@@ -397,6 +435,14 @@ static std::unique_ptr<duckdb::PhysicalTableScan> make_physical_table_scan(
 
 TEST_CASE("scan_executor - single threaded small table", "[scan_executor][single_thread]")
 {
+  // Initialize memory manager for tests
+  initialize_memory_manager();
+
+  // Verify memory manager is initialized
+  auto& mem_mgr    = memory::memory_reservation_manager::get_instance();
+  auto host_spaces = mem_mgr.get_memory_spaces_for_tier(memory::Tier::HOST);
+  REQUIRE(host_spaces.size() > 0);
+
   // Setup DuckDB database
   duckdb::DuckDB db(nullptr);
   duckdb::Connection con(db);
@@ -411,12 +457,15 @@ TEST_CASE("scan_executor - single threaded small table", "[scan_executor][single
   // Get client context
   auto& client_ctx = *con.context;
 
+  // We need to be in a transaction for catalog access
+  auto begin_result = con.Query("BEGIN TRANSACTION");
+  REQUIRE(begin_result);
+  REQUIRE(!begin_result->HasError());
+
   // Create physical table scan
   auto physical_scan = make_physical_table_scan(client_ctx, table_name);
   REQUIRE(physical_scan);
-
-  // Create physical table scan adapter
-  duckdb::physical_table_scan_adapter ptsa(*physical_scan);
+  duckdb::physical_table_scan_adapter ptsa(std::move(physical_scan));
 
   // Create staging table for scanned data
   std::string staging_table = table_name + "_scanned";
@@ -425,26 +474,52 @@ TEST_CASE("scan_executor - single threaded small table", "[scan_executor][single
   REQUIRE(create_result);
   REQUIRE(!create_result->HasError());
 
+  // Create scan executor (task scheduler)
+  parallel::duckdb_scan_executor scan_executor({num_threads, false});
+
+  // Use a dummy query to establish execution context
+  auto dummy_query = "SELECT * FROM " + table_name + " LIMIT 0";
+  auto prepared    = con.Prepare(dummy_query);
+  REQUIRE(prepared);
+  REQUIRE(!prepared->HasError());
+  auto dummy_result = prepared->Execute();
+  REQUIRE(dummy_result);
+  REQUIRE(!dummy_result->HasError());
+
+  // Now create thread context
+  duckdb::ThreadContext thread_ctx(client_ctx);
+  duckdb::ExecutionContext exec_ctx(client_ctx, thread_ctx, nullptr);
+
+  // Create data repository manager (empty, unused for this test)
+  data_repository_manager dr_mgr;
+
   // Create global state
   uint64_t pipeline_id = 1;
-  parallel::duckdb_scan_executor scan_executor({num_threads, false});
-  auto global_state = sirius::make_shared<parallel::duckdb_scan_task_global_state>(
+  auto global_state    = sirius::make_shared<parallel::duckdb_scan_task_global_state>(
     pipeline_id, scan_executor, client_ctx, ptsa);
 
-  // Create and execute test task
+  // Create local state
   auto local_state = sirius::make_unique<parallel::duckdb_scan_task_local_state>(
-    *global_state, client_ctx, 1000000);  // Large batch size to scan all rows
+    *global_state, exec_ctx, 1000000);  // Large batch size to scan all rows
 
+  // Create and schedule test tasks
   uint64_t task_id = 1;
   auto task        = sirius::make_unique<test_scan_task>(
-    task_id, con, staging_table, std::move(local_state), global_state);
+    task_id, dr_mgr, con, staging_table, std::move(local_state), global_state);
+  scan_executor.schedule(std::move(task));
 
-  // Execute the task (will append to staging_table)
-  task->execute();
-  REQUIRE(task->get_global_state()->IsSourceDrained());
+  // Run task
+  scan_executor.start();
+  scan_executor.wait();
+  scan_executor.stop();
 
   // Validate tables are identical
   validate_tables_equal(con, table_name, staging_table);
+
+  // End the transaction
+  auto commit_result = con.Query("COMMIT");
+  REQUIRE(commit_result);
+  REQUIRE(!commit_result->HasError());
 
   // Cleanup
   con.Query("DROP TABLE " + staging_table);
