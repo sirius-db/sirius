@@ -47,7 +47,7 @@ class physical_table_scan_adapter : GPUPhysicalOperator {
     : GPUPhysicalOperator(PhysicalOperatorType::TABLE_SCAN,
                           physical_table_scan->types,
                           physical_table_scan->estimated_cardinality),
-      physical_table_scan(std::move(physical_table_scan)) {};
+      physical_table_scan(std::move(physical_table_scan)) {}
 
   //===----------Methods----------===//
   /**

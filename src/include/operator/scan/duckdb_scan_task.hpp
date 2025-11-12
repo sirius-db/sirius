@@ -274,7 +274,7 @@ struct multiple_blocks_allocation_accessor {
 class duckdb_scan_task_local_state : public itask_local_state {
   static constexpr size_t DEFAULT_APPROXIMATE_BATCH_SIZE = 2ULL * 1024 * 1024 * 1024;  ///< 2 GB
 
-  // The following VARCHAR size is selected to accomodate all CHAR/VARCHAR TPC-H columns.
+  // The following VARCHAR size is selected to accommodate all CHAR/VARCHAR TPC-H columns.
   static constexpr size_t DEFAULT_VARCHAR_SIZE = 256ULL;  ///< 256 bytes
 
  public:
@@ -423,7 +423,7 @@ class duckdb_scan_task_local_state : public itask_local_state {
 
   unique_ptr<duckdb::LocalTableFunctionState>
     local_tf_state;                    ///< Local state for the table function.
-  duckdb::ExecutionContext& exec_ctx;  ///< The duckdb execution context, needed for initializings
+  duckdb::ExecutionContext& exec_ctx;  ///< The duckdb execution context, needed for initializing
                                        ///< the local table function state
 
  private:
@@ -439,7 +439,7 @@ class duckdb_scan_task_local_state : public itask_local_state {
                                              duckdb::GlobalTableFunctionState* global_tf_state);
 
   /**
-   * @brief Initilizes the column builders. Does not reserve or allocate memory for the builders.
+   * @brief Initializes the column builders. Does not reserve or allocate memory for the builders.
    *
    * @param[in] op The physical table scan operator being executed.
    */
@@ -468,7 +468,7 @@ class duckdb_scan_task_local_state : public itask_local_state {
  *
  * The duckdb_scan_task represents a unit of work for scanning data from a DuckDB table function.
  * It accumulates approximately the target batch size specified in the local state before pushing
- * the batch to the data repository and notifying the task creater. If the table scan is
+ * the batch to the data repository and notifying the task creator. If the table scan is
  * incomplete upon task completion, the task will push a new scan_task onto the task queue.
  */
 class duckdb_scan_task : public itask {
@@ -508,7 +508,7 @@ class duckdb_scan_task : public itask {
                              duckdb_scan_task_global_state& g_state);
 
   /**
-   * @brief Checks if the current data chunk fits in the allocated buffers of the column buiilders.
+   * @brief Checks if the current data chunk fits in the allocated buffers of the column builders.
    *
    * @param[in,out] l_state The local state of the scan task.
    * @return true if the chunk fits, false otherwise.

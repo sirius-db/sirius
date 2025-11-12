@@ -89,7 +89,7 @@ duckdb_scan_task_local_state::column_builder::~column_builder()
 
 void duckdb_scan_task_local_state::column_builder::reserve_memory(size_t estimated_num_rows)
 {
-  assert(size > 0);
+  assert(estimated_num_rows > 0);
 
   auto& mem_res_mgr = memory::memory_reservation_manager::get_instance();
   data_reservation  = mem_res_mgr.request_reservation(res_request, type_size * estimated_num_rows);
@@ -232,7 +232,7 @@ void duckdb_scan_task_local_state::column_builder::process_mask_for_column(
         // The mask for the bits in the next destination byte
         auto const upper_mask = utils::make_mask<uint8_t>(num_upper_bits);
         // The upper bits from the source byte to copy into the next destination byte, shifted into
-        // postion for copying into the destination byte
+        // position for copying into the destination byte
         auto const upper_bits = static_cast<uint8_t>((src_byte >> num_lower_bits) & upper_mask);
         // Set the bits in the next destination byte
         mask_blocks_accessor.set_current((mask_blocks_accessor.get_current() & ~upper_mask) |
@@ -328,6 +328,8 @@ void duckdb_scan_task_local_state::initialize_local_table_function_state(
 
 void duckdb_scan_task_local_state::initialize_builders(const duckdb::PhysicalTableScan& op)
 {
+  assert(num_columns <= op.column_ids.size());
+
   estimated_row_size = 0;
   // Initialize projected types and column sizes
   column_builders.reserve(num_columns);
