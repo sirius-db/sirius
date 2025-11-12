@@ -26,7 +26,7 @@ void duckdb_scan_executor::schedule(std::unique_ptr<itask> task)
 {
   {
     std::unique_lock<std::mutex> lock(_finish_mutex);
-    _total_tasks.fetch_add(1, std::memory_order_release);
+    _total_tasks.fetch_add(1, std::memory_order_relaxed);
   }
   _task_queue->push(std::move(task));
 }
@@ -35,8 +35,8 @@ void duckdb_scan_executor::wait()
 {
   std::unique_lock<std::mutex> lock(_finish_mutex);
   _finish_cv.wait(lock, [&]() {
-    return _total_tasks.load(std::memory_order_acquire) ==
-           _finished_tasks.load(std::memory_order_acquire);
+    return _total_tasks.load(std::memory_order_relaxed) ==
+           _finished_tasks.load(std::memory_order_relaxed);
   });
 }
 
@@ -56,9 +56,9 @@ void duckdb_scan_executor::worker_loop(int32_t worker_id)
     // Update counters and notify
     {
       std::unique_lock<std::mutex> lock(_finish_mutex);
-      _finished_tasks.fetch_add(1, std::memory_order_release);
-      if (_finished_tasks.load(std::memory_order_acquire) ==
-          _total_tasks.load(std::memory_order_acquire)) {
+      _finished_tasks.fetch_add(1, std::memory_order_relaxed);
+      if (_finished_tasks.load(std::memory_order_relaxed) ==
+          _total_tasks.load(std::memory_order_relaxed)) {
         _finish_cv.notify_one();
       }
     }
