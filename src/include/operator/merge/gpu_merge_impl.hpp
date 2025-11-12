@@ -71,6 +71,27 @@ public:
         rmm::cuda_stream_view stream,
         memory::memory_space& memory_space,
         data_repository_manager& data_repository_mgr);
+
+    /**
+     * @brief Perform grouped merge aggregate on multiple data batches. 
+     * For each batch, the first `num_group_cols` are the group columns, followed by aggregate columns corresponding to `aggregates`.
+     * 
+     * @param input The input batches to be merged.
+     * @param num_group_cols The number of group columns.
+     * @param aggregates The aggregate functions. Should satisfy `num_group_cols + group_idx.size() = num input columns`.
+     * @param stream CUDA stream used for device memory operations and kernel launches.
+     * @param memory_space The memory space used to allocate memory for the output data batch.
+     * @param data_repository_mgr The data repository manager that the output data batch belongs to.
+     * 
+     * @return The output data batch with ownership.
+     */
+    static sirius::unique_ptr<data_batch> merge_grouped_aggregate(
+        const sirius::vector<sirius::unique_ptr<data_batch_view>>& input,
+        int num_group_cols,
+        const sirius::vector<cudf::aggregation::Kind>& aggregates,
+        rmm::cuda_stream_view stream,
+        memory::memory_space& memory_space,
+        data_repository_manager& data_repository_mgr);
 };
 
 } // namespace op

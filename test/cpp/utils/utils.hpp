@@ -66,6 +66,7 @@ std::mt19937_64& global_rng();
 sirius::unique_ptr<cudf::table> create_cudf_table_with_random_data(
     size_t num_rows,
     const sirius::vector<cudf::data_type>& column_types,
+    const sirius::vector<std::optional<std::pair<int, int>>>& ranges,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr);
 

@@ -130,5 +130,77 @@ gpu_merge_impl::merge_ungrouped_aggregate(const sirius::vector<sirius::unique_pt
                                                 std::move(gpu_table_representation));
 }
 
+sirius::unique_ptr<data_batch>
+gpu_merge_impl::merge_grouped_aggregate(const sirius::vector<sirius::unique_ptr<data_batch_view>>& input,
+                                    int num_group_cols,
+                                    const sirius::vector<cudf::aggregation::Kind>& aggregates,
+                                    rmm::cuda_stream_view stream,
+                                    memory::memory_space& memory_space,
+                                    data_repository_manager& data_repository_mgr) {
+    // Sanity check.
+    if (input.size() < 2) {
+        throw std::runtime_error("`input` in `merge_ungrouped_aggregate()` should at least contain two data batches");
+    }
+    
+    // Pull input cudf tables and concatenate.
+    sirius::vector<cudf::table_view> input_cudf_table_views;
+    input_cudf_table_views.resize(input.size());
+    for (int i = 0; i < input.size(); ++i) {
+        input_cudf_table_views[i] = input[i]->get_cudf_table_view();
+    }
+    if (input_cudf_table_views[0].num_columns() != num_group_cols + aggregates.size()) {
+        throw std::runtime_error("`num columns = num_group_cols + num aggregates` not true in `merge_grouped_aggregate()`");
+    }
+    auto concatenated = cudf::concatenate(input_cudf_table_views, stream, memory_space.get_default_allocator());
+
+    // Create cudf groupby and make aggregation requests.
+    // Here we don't need to explicitly cast input/output for count or sum of integers,
+    // because cudf groupby produces INT64 for sum of integers (both signed and unsigned).
+    sirius::vector<cudf::column_view> group_cols;
+    for (int c = 0; c < num_group_cols; ++c) {
+        group_cols.push_back(concatenated->get_column(c).view());
+    }
+    cudf::groupby::groupby grpby_obj(cudf::table_view(group_cols), cudf::null_policy::INCLUDE);
+    sirius::vector<cudf::groupby::aggregation_request> requests;
+    sirius::vector<sirius::unique_ptr<cudf::column>> cast_columns;
+    for (int i = 0; i < aggregates.size(); ++i) {
+        int aggregate_col_id = num_group_cols + i;
+        cudf::groupby::aggregation_request request;
+        request.values = concatenated->get_column(aggregate_col_id).view();
+        switch (aggregates[i]) {
+            case cudf::aggregation::Kind::MIN: {
+                request.aggregations.push_back(cudf::make_min_aggregation<cudf::groupby_aggregation>());
+                break;
+            }
+            case cudf::aggregation::Kind::MAX: {
+                request.aggregations.push_back(cudf::make_max_aggregation<cudf::groupby_aggregation>());
+                break;
+            }
+            case cudf::aggregation::Kind::SUM:
+            case cudf::aggregation::Kind::COUNT_ALL:
+            case cudf::aggregation::Kind::COUNT_VALID: {
+                request.aggregations.push_back(cudf::make_sum_aggregation<cudf::groupby_aggregation>());
+                break;
+            }
+        }
+        requests.push_back(std::move(request));
+    }
+
+    // Call cudf groupby and populate output columns
+    auto groupby_result = grpby_obj.aggregate(requests, stream, memory_space.get_default_allocator());
+    auto output_cols = groupby_result.first->release();
+    for (auto& aggregation_result: groupby_result.second) {
+        output_cols.push_back(std::move(aggregation_result.results[0]));
+    }
+
+    // Create the output data batch
+    auto output_table = sirius::make_unique<cudf::table>(std::move(output_cols));
+    auto gpu_table_representation = sirius::make_unique<sirius::gpu_table_representation>(
+        *output_table, memory_space);
+    return sirius::make_unique<sirius::data_batch>(data_repository_mgr.get_next_data_batch_id(),
+                                                data_repository_mgr,
+                                                std::move(gpu_table_representation));
+}
+
 } // namespace op
 } // namespace sirius

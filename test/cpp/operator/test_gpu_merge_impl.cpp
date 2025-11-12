@@ -47,14 +47,16 @@ memory_space* get_default_memory_space() {
 
 sirius::vector<sirius::unique_ptr<data_batch_view>> create_batches_with_random_data(
         const int num_batches, const sirius::vector<int> num_rows,
-        const sirius::vector<cudf::data_type>& column_types, data_repository_manager& data_repo_manager,
-        memory_space& mem_space) {
+        const sirius::vector<cudf::data_type>& column_types,
+        const sirius::vector<std::optional<std::pair<int, int>>>& ranges,
+        data_repository_manager& data_repo_manager, memory_space& mem_space) {
     sirius::vector<sirius::unique_ptr<data_batch_view>> batches;
     for (int i = 0; i < num_batches; ++i) {
         // Create a data batch
         auto table = create_cudf_table_with_random_data(
             num_rows[i],
             column_types,
+            ranges,
             cudf::get_default_stream(),
             mem_space.get_default_allocator());
         auto gpu_repr = sirius::make_unique<gpu_table_representation>(*table, mem_space);
@@ -169,7 +171,8 @@ TEST_CASE("Concatenate multiple data batches", "[operator][merge_concat]") {
                                                     cudf::data_type{cudf::type_id::STRING}};
 
     auto input_views = create_batches_with_random_data(
-        num_batches, num_input_rows, column_types, data_repo_manager, *mem_space);
+        num_batches, num_input_rows, column_types, {column_types.size(), std::nullopt},
+        data_repo_manager, *mem_space);
     auto output_batch = gpu_merge_impl::concat(input_views,
                                             cudf::get_default_stream(),
                                             *mem_space,
@@ -189,7 +192,8 @@ TEST_CASE("Concatenate multiple data batches with different size", "[operator][m
                                                     cudf::data_type{cudf::type_id::STRING}};
 
     auto input_views = create_batches_with_random_data(
-        num_batches, num_input_rows, column_types, data_repo_manager, *mem_space);
+        num_batches, num_input_rows, column_types, {column_types.size(), std::nullopt},
+        data_repo_manager, *mem_space);
     auto output_batch = gpu_merge_impl::concat(input_views,
                                             cudf::get_default_stream(),
                                             *mem_space,
@@ -197,7 +201,7 @@ TEST_CASE("Concatenate multiple data batches with different size", "[operator][m
     validate_concat(input_views, *output_batch);
 }
 
-TEST_CASE("Concatenate one data batch", "[operator][merge_concat]") {
+TEST_CASE("Concatenate with invalid input", "[operator][merge_concat]") {
     data_repository_manager data_repo_manager;
     auto* mem_space = get_default_memory_space();
     constexpr int num_batches = 1;
@@ -206,8 +210,10 @@ TEST_CASE("Concatenate one data batch", "[operator][merge_concat]") {
     sirius::vector<cudf::data_type> column_types = {cudf::data_type{cudf::type_id::INT32},
                                                     cudf::data_type{cudf::type_id::STRING}};
 
+    // Invalid input: less than two input batches
     auto input_views = create_batches_with_random_data(
-        num_batches, num_input_rows, column_types, data_repo_manager, *mem_space);
+        num_batches, num_input_rows, column_types, {column_types.size(), std::nullopt},
+        data_repo_manager, *mem_space);
     REQUIRE_THROWS_AS(gpu_merge_impl::concat(input_views,
                                             cudf::get_default_stream(),
                                             *mem_space,
@@ -225,7 +231,8 @@ TEST_CASE("Concatenate multiple data batches but no input rows", "[operator][mer
                                                     cudf::data_type{cudf::type_id::STRING}};
 
     auto input_views = create_batches_with_random_data(
-        num_batches, num_input_rows, column_types, data_repo_manager, *mem_space);
+        num_batches, num_input_rows, column_types, {column_types.size(), std::nullopt},
+        data_repo_manager, *mem_space);
     auto output_batch = gpu_merge_impl::concat(input_views,
                                             cudf::get_default_stream(),
                                             *mem_space,
@@ -245,7 +252,8 @@ TEST_CASE("Concatenate mixed empty and non-empty data batches", "[operator][merg
                                                     cudf::data_type{cudf::type_id::STRING}};
 
     auto input_views = create_batches_with_random_data(
-        num_batches, num_input_rows, column_types, data_repo_manager, *mem_space);
+        num_batches, num_input_rows, column_types, {column_types.size(), std::nullopt},
+        data_repo_manager, *mem_space);
     auto output_batch = gpu_merge_impl::concat(input_views,
                                             cudf::get_default_stream(),
                                             *mem_space,
@@ -259,7 +267,8 @@ sirius::vector<sirius::unique_ptr<data_batch_view>> create_batches_with_partial_
         data_repository_manager& data_repo_manager, memory_space& mem_space) {
     // Base input batches
     auto base_input_batches = create_batches_with_random_data(
-        num_batches, num_base_input_rows, column_types, data_repo_manager, mem_space);
+        num_batches, num_base_input_rows, column_types, {column_types.size(), std::nullopt},
+        data_repo_manager, mem_space);
     
     // Compute partial ungrouped aggregates
     sirius::vector<sirius::unique_ptr<data_batch_view>> partial_aggregate_batches;
@@ -402,17 +411,31 @@ TEST_CASE("Ungrouped merge aggregate of min/max/count/sum", "[operator][merge_un
     validate_ungrouped_aggregate(input_views, *output_batch, aggregates);
 }
 
-TEST_CASE("Ungrouped merge aggregate on one data batch", "[operator][merge_ungrouped_agg]") {
+TEST_CASE("Ungrouped merge aggregate with invalid input", "[operator][merge_ungrouped_agg]") {
     data_repository_manager data_repo_manager;
     auto* mem_space = get_default_memory_space();
-    constexpr int num_batches = 1;
+    int num_batches = 1;
     constexpr size_t num_base_input_rows_per_batch = 100;
     sirius::vector<int> num_base_input_rows(num_batches, num_base_input_rows_per_batch);
     sirius::vector<cudf::data_type> column_types = {cudf::data_type{cudf::type_id::INT32}};
     sirius::vector<cudf::aggregation::Kind> aggregates = {cudf::aggregation::Kind::SUM};
 
+    // Invalid input: less than two input batches
     auto input_views = create_batches_with_partial_ungrouped_agg_result(
         num_batches, num_base_input_rows, column_types, aggregates, data_repo_manager, *mem_space);
+    REQUIRE_THROWS_AS(gpu_merge_impl::merge_ungrouped_aggregate(input_views,
+                                                            aggregates,
+                                                            cudf::get_default_stream(),
+                                                            *mem_space,
+                                                            data_repo_manager),
+                    std::runtime_error);
+
+    // Invalid input: mismatch between num columns and num aggregations
+    num_batches = 10;
+    num_base_input_rows = sirius::vector<int>(num_batches, num_base_input_rows_per_batch);
+    input_views = create_batches_with_partial_ungrouped_agg_result(
+        num_batches, num_base_input_rows, column_types, aggregates, data_repo_manager, *mem_space);
+    aggregates.push_back(cudf::aggregation::Kind::SUM);
     REQUIRE_THROWS_AS(gpu_merge_impl::merge_ungrouped_aggregate(input_views,
                                                             aggregates,
                                                             cudf::get_default_stream(),
@@ -466,4 +489,262 @@ TEST_CASE("Ungrouped merge aggregate of with mixed empty and non-empty partial a
     auto output_batch = gpu_merge_impl::merge_ungrouped_aggregate(
         input_views, aggregates, cudf::get_default_stream(), *mem_space, data_repo_manager);
     validate_ungrouped_aggregate(input_views, *output_batch, aggregates);
+}
+
+sirius::vector<sirius::unique_ptr<data_batch_view>> create_batches_with_partial_grouped_agg_result(
+        const int num_batches, const sirius::vector<int> num_base_input_rows,
+        const sirius::vector<cudf::data_type>& column_types, const sirius::vector<int>& group_idx,
+        const sirius::vector<cudf::aggregation::Kind>& aggregates, const sirius::vector<int>& aggregate_idx,
+        data_repository_manager& data_repo_manager, memory_space& mem_space) {
+    // Base input batches, make group key value ranges small so that we have multiple values in a single group
+    sirius::vector<std::optional<std::pair<int, int>>> ranges(column_types.size(), std::nullopt);
+    for (int group_col_id: group_idx) {
+        ranges[group_col_id] = {0, 3};
+    }
+    auto base_input_batches = create_batches_with_random_data(
+        num_batches, num_base_input_rows, column_types, ranges, data_repo_manager, mem_space);
+    
+    // Compute partial ungrouped aggregates
+    sirius::vector<sirius::unique_ptr<data_batch_view>> partial_aggregate_batches;
+    for (int i = 0; i < num_batches; ++i) {
+        auto batch = gpu_aggregate_impl::local_grouped_aggregate(
+            *base_input_batches[i], group_idx, aggregates, aggregate_idx, cudf::get_default_stream(),
+            mem_space, data_repo_manager);
+        auto* batch_ptr = batch.get();
+        data_repo_manager.add_new_data_batch(std::move(batch), {});
+        partial_aggregate_batches.push_back(sirius::make_unique<data_batch_view>(batch_ptr));
+        partial_aggregate_batches.back()->pin();
+    }
+
+    return partial_aggregate_batches;
+}
+
+void copy_data_to_host(cudf::table_view table, sirius::vector<sirius::vector<int64_t>>& h_data) {
+    for (int c = 0; c < table.num_columns(); ++c) {
+        const auto& col = table.column(c);
+        switch (col.type().id()) {
+            case cudf::type_id::INT32: {
+                sirius::vector<int32_t> h_buf(table.num_rows());
+                cudaMemcpy(h_buf.data(), col.data<int32_t>(), sizeof(int32_t) * table.num_rows(), 
+                        cudaMemcpyDeviceToHost);
+                for (auto val: h_buf) {
+                    h_data[c].push_back(val);
+                }
+                break;
+            }
+            case cudf::type_id::INT64: {
+                sirius::vector<int64_t> h_buf(table.num_rows());
+                cudaMemcpy(h_buf.data(), col.data<int64_t>(), sizeof(int64_t) * table.num_rows(), 
+                        cudaMemcpyDeviceToHost);
+                for (auto val: h_buf) {
+                    h_data[c].push_back(val);
+                }
+                break;
+            }
+            default:
+                throw std::runtime_error("Unsupported cudf::data_type in `pull_data_to_host()`: "
+                    + std::to_string(static_cast<int>(col.type().id())));
+        }
+    }
+}
+
+void validate_grouped_aggregate(const sirius::vector<sirius::unique_ptr<data_batch_view>>& input_views,
+                                const sirius::data_batch& output,
+                                int num_group_cols,
+                                const sirius::vector<cudf::aggregation::Kind>& aggregates) {
+    sirius::vector<cudf::table_view> input_table_views;
+    for (const auto& input_view: input_views) {
+        input_table_views.push_back(input_view->get_cudf_table_view());
+    }
+    cudf::table_view output_table_view = output.get_data()->cast<gpu_table_representation>().get_table().view();
+
+    // Compute expected results
+    sirius::vector<sirius::vector<int64_t>> h_input_data(input_table_views[0].num_columns());
+    for (const auto& table: input_table_views) {
+        copy_data_to_host(table, h_input_data);
+    }
+    sirius::vector<std::map<sirius::vector<int64_t>, int64_t>> expected(aggregates.size());
+    for (int r = 0; r < h_input_data[0].size(); ++r) {
+        sirius::vector<int64_t> group_key;
+        for (int c = 0; c < num_group_cols; ++c) {
+            group_key.push_back(h_input_data[c][r]);
+        }
+        for (int i = 0; i < aggregates.size(); ++i) {
+            int64_t val = h_input_data[num_group_cols + i][r];
+            switch (aggregates[i]) {
+                case cudf::aggregation::Kind::MIN: {
+                    if (!expected[i].contains(group_key)) {
+                        expected[i][group_key] = val;
+                    } else {
+                        expected[i][group_key] = min(expected[i][group_key], val);
+                    }
+                    break;
+                }
+                case cudf::aggregation::Kind::MAX: {
+                    if (!expected[i].contains(group_key)) {
+                        expected[i][group_key] = val;
+                    } else {
+                        expected[i][group_key] = max(expected[i][group_key], val);
+                    }
+                    break;
+                }
+                case cudf::aggregation::Kind::SUM:
+                case cudf::aggregation::Kind::COUNT_ALL:
+                case cudf::aggregation::Kind::COUNT_VALID: {
+                    expected[i][group_key] += val;
+                    break;
+                }
+            }
+        }
+    }
+
+    // Get actual results
+    sirius::vector<sirius::vector<int64_t>> actual(output_table_view.num_columns());
+    copy_data_to_host(output_table_view, actual);
+
+    // Check results
+    REQUIRE(output_table_view.num_rows() == expected[0].size());
+    REQUIRE(output_table_view.num_columns() == num_group_cols + aggregates.size());
+    for (int r = 0; r < output_table_view.num_rows(); ++r) {
+        sirius::vector<int64_t> group_key;
+        for (int c = 0; c < num_group_cols; ++c) {
+            group_key.push_back(actual[c][r]);
+        }
+        for (int i = 0; i < aggregates.size(); ++i) {
+            int actual_val = actual[num_group_cols + i][r];
+            int expected_val = expected[i][group_key];
+            REQUIRE(actual_val == expected_val);
+        }
+    }
+}
+
+TEST_CASE("Grouped merge aggregate of min/max/count/sum", "[operator][merge_grouped_agg]") {
+    data_repository_manager data_repo_manager;
+    auto* mem_space = get_default_memory_space();
+    constexpr int num_batches = 10;
+    constexpr size_t num_base_input_rows_per_batch = 100;
+    sirius::vector<int> num_base_input_rows(num_batches, num_base_input_rows_per_batch);
+    sirius::vector<cudf::data_type> column_types = {
+        cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::INT64},
+        cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::INT64},
+        cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::INT64}};
+    sirius::vector<int> group_idx = {0, 1};
+    sirius::vector<cudf::aggregation::Kind> aggregates = {
+        cudf::aggregation::Kind::MIN, cudf::aggregation::Kind::MAX,
+        cudf::aggregation::Kind::COUNT_ALL, cudf::aggregation::Kind::SUM};
+    sirius::vector<int> aggregate_idx = {2, 3, 4, 5};
+
+    auto input_views = create_batches_with_partial_grouped_agg_result(
+        num_batches, num_base_input_rows, column_types, group_idx, aggregates, aggregate_idx,
+        data_repo_manager, *mem_space);
+    auto output_batch = gpu_merge_impl::merge_grouped_aggregate(
+        input_views, group_idx.size(), aggregates, cudf::get_default_stream(), *mem_space, data_repo_manager);
+    validate_grouped_aggregate(input_views, *output_batch, group_idx.size(), aggregates);
+}
+
+TEST_CASE("Grouped merge aggregate with invalid input", "[operator][merge_grouped_agg]") {
+    data_repository_manager data_repo_manager;
+    auto* mem_space = get_default_memory_space();
+    int num_batches = 1;
+    constexpr size_t num_base_input_rows_per_batch = 100;
+    sirius::vector<int> num_base_input_rows(num_batches, num_base_input_rows_per_batch);
+    sirius::vector<cudf::data_type> column_types = {
+        cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::INT64}};
+    sirius::vector<int> group_idx = {0};
+    sirius::vector<cudf::aggregation::Kind> aggregates = {cudf::aggregation::Kind::MIN};
+    sirius::vector<int> aggregate_idx = {1};
+
+    // Invalid input: less than two input batches
+    auto input_views = create_batches_with_partial_grouped_agg_result(
+        num_batches, num_base_input_rows, column_types, group_idx, aggregates, aggregate_idx,
+        data_repo_manager, *mem_space);
+    REQUIRE_THROWS_AS(gpu_merge_impl::merge_grouped_aggregate(
+                        input_views, group_idx.size(), aggregates, cudf::get_default_stream(),
+                        *mem_space, data_repo_manager),
+                    std::runtime_error);
+
+    // Invalid input: mismatch between num columns, num_groups, and num aggregations
+    num_batches = 10;
+    num_base_input_rows = sirius::vector<int>(num_batches, num_base_input_rows_per_batch);
+    input_views = create_batches_with_partial_ungrouped_agg_result(
+        num_batches, num_base_input_rows, column_types, aggregates, data_repo_manager, *mem_space);
+    group_idx.push_back(1);
+    REQUIRE_THROWS_AS(gpu_merge_impl::merge_grouped_aggregate(
+                        input_views, group_idx.size(), aggregates, cudf::get_default_stream(),
+                        *mem_space, data_repo_manager),
+                    std::runtime_error);
+}
+
+TEST_CASE("Grouped merge aggregate with empty partial aggregate results", "[operator][merge_grouped_agg]") {
+    data_repository_manager data_repo_manager;
+    auto* mem_space = get_default_memory_space();
+    constexpr int num_batches = 10;
+    constexpr size_t num_base_input_rows_per_batch = 0;
+    sirius::vector<int> num_base_input_rows(num_batches, num_base_input_rows_per_batch);
+    sirius::vector<cudf::data_type> column_types = {
+        cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::INT64},
+        cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::INT64},
+        cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::INT64}};
+    sirius::vector<int> group_idx = {0, 1};
+    sirius::vector<cudf::aggregation::Kind> aggregates = {
+        cudf::aggregation::Kind::MIN, cudf::aggregation::Kind::MAX,
+        cudf::aggregation::Kind::COUNT_ALL, cudf::aggregation::Kind::SUM};
+    sirius::vector<int> aggregate_idx = {2, 3, 4, 5};
+
+    auto input_views = create_batches_with_partial_grouped_agg_result(
+        num_batches, num_base_input_rows, column_types, group_idx, aggregates, aggregate_idx,
+        data_repo_manager, *mem_space);
+    auto output_batch = gpu_merge_impl::merge_grouped_aggregate(
+        input_views, group_idx.size(), aggregates, cudf::get_default_stream(), *mem_space, data_repo_manager);
+    validate_grouped_aggregate(input_views, *output_batch, group_idx.size(), aggregates);
+}
+
+TEST_CASE("Grouped merge aggregate with mixed empty and non-empty partial aggregate results",
+        "[operator][merge_grouped_agg]") {
+    data_repository_manager data_repo_manager;
+    auto* mem_space = get_default_memory_space();
+    constexpr int num_batches = 10;
+    sirius::vector<int> num_base_input_rows;
+    for (int i = 0; i < num_batches; ++i) {
+        num_base_input_rows.push_back(i % 2 == 1 ? 0 : (i + 1) * 10);
+    }
+    sirius::vector<cudf::data_type> column_types = {
+        cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::INT64},
+        cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::INT64},
+        cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::INT64}};
+    sirius::vector<int> group_idx = {0, 1};
+    sirius::vector<cudf::aggregation::Kind> aggregates = {
+        cudf::aggregation::Kind::MIN, cudf::aggregation::Kind::MAX,
+        cudf::aggregation::Kind::COUNT_ALL, cudf::aggregation::Kind::SUM};
+    sirius::vector<int> aggregate_idx = {2, 3, 4, 5};
+
+    auto input_views = create_batches_with_partial_grouped_agg_result(
+        num_batches, num_base_input_rows, column_types, group_idx, aggregates, aggregate_idx,
+        data_repo_manager, *mem_space);
+    auto output_batch = gpu_merge_impl::merge_grouped_aggregate(
+        input_views, group_idx.size(), aggregates, cudf::get_default_stream(), *mem_space, data_repo_manager);
+    validate_grouped_aggregate(input_views, *output_batch, group_idx.size(), aggregates);
+}
+
+TEST_CASE("Grouped merge aggregate with multiple aggregations on the same column", "[operator][merge_grouped_agg]") {
+    data_repository_manager data_repo_manager;
+    auto* mem_space = get_default_memory_space();
+    constexpr int num_batches = 10;
+    constexpr size_t num_base_input_rows_per_batch = 100;
+    sirius::vector<int> num_base_input_rows(num_batches, num_base_input_rows_per_batch);
+    sirius::vector<cudf::data_type> column_types = {
+        cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::INT64},
+        cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::INT64}};
+    sirius::vector<int> group_idx = {0, 1};
+    sirius::vector<cudf::aggregation::Kind> aggregates = {
+        cudf::aggregation::Kind::MIN, cudf::aggregation::Kind::MAX,
+        cudf::aggregation::Kind::COUNT_ALL, cudf::aggregation::Kind::SUM};
+    sirius::vector<int> aggregate_idx = {2, 3, 2, 3};
+
+    auto input_views = create_batches_with_partial_grouped_agg_result(
+        num_batches, num_base_input_rows, column_types, group_idx, aggregates, aggregate_idx,
+        data_repo_manager, *mem_space);
+    auto output_batch = gpu_merge_impl::merge_grouped_aggregate(
+        input_views, group_idx.size(), aggregates, cudf::get_default_stream(), *mem_space, data_repo_manager);
+    validate_grouped_aggregate(input_views, *output_batch, group_idx.size(), aggregates);
 }
