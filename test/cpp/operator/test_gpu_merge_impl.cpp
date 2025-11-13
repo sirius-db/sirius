@@ -22,6 +22,7 @@
 #include "memory_management/memory_test_common.hpp"
 #include "merge/gpu_merge_impl.hpp"
 #include "aggregate/gpu_aggregate_impl.hpp"
+#include "order/gpu_order_impl.hpp"
 #include "utils/utils.hpp"
 
 #include <cudf/utilities/bit.hpp>
@@ -261,7 +262,7 @@ TEST_CASE("Concatenate mixed empty and non-empty data batches", "[operator][merg
     validate_concat(input_views, *output_batch);
 }
 
-sirius::vector<sirius::unique_ptr<data_batch_view>> create_batches_with_partial_ungrouped_agg_result(
+sirius::vector<sirius::unique_ptr<data_batch_view>> create_batches_with_local_ungrouped_agg_result(
         const int num_batches, const sirius::vector<int> num_base_input_rows,
         const sirius::vector<cudf::data_type>& column_types, const sirius::vector<cudf::aggregation::Kind>& aggregates,
         data_repository_manager& data_repo_manager, memory_space& mem_space) {
@@ -270,8 +271,8 @@ sirius::vector<sirius::unique_ptr<data_batch_view>> create_batches_with_partial_
         num_batches, num_base_input_rows, column_types, {column_types.size(), std::nullopt},
         data_repo_manager, mem_space);
     
-    // Compute partial ungrouped aggregates
-    sirius::vector<sirius::unique_ptr<data_batch_view>> partial_aggregate_batches;
+    // Compute local ungrouped aggregates
+    sirius::vector<sirius::unique_ptr<data_batch_view>> local_aggregate_batches;
     sirius::vector<int> aggregate_idx(aggregates.size());
     for (int i = 0; i < aggregates.size(); ++i) {
         aggregate_idx[i] = i;
@@ -282,10 +283,10 @@ sirius::vector<sirius::unique_ptr<data_batch_view>> create_batches_with_partial_
             mem_space, data_repo_manager);
         auto* batch_ptr = batch.get();
         data_repo_manager.add_new_data_batch(std::move(batch), {});
-        partial_aggregate_batches.push_back(sirius::make_unique<data_batch_view>(batch_ptr));
-        partial_aggregate_batches.back()->pin();
+        local_aggregate_batches.push_back(sirius::make_unique<data_batch_view>(batch_ptr));
+        local_aggregate_batches.back()->pin();
     }
-    return partial_aggregate_batches;
+    return local_aggregate_batches;
 }
 
 template <typename T>
@@ -404,7 +405,7 @@ TEST_CASE("Ungrouped merge aggregate of min/max/count/sum", "[operator][merge_un
                                                         cudf::aggregation::Kind::COUNT_ALL,
                                                         cudf::aggregation::Kind::SUM};
     
-    auto input_views = create_batches_with_partial_ungrouped_agg_result(
+    auto input_views = create_batches_with_local_ungrouped_agg_result(
         num_batches, num_base_input_rows, column_types, aggregates, data_repo_manager, *mem_space);
     auto output_batch = gpu_merge_impl::merge_ungrouped_aggregate(
         input_views, aggregates, cudf::get_default_stream(), *mem_space, data_repo_manager);
@@ -421,7 +422,7 @@ TEST_CASE("Ungrouped merge aggregate with invalid input", "[operator][merge_ungr
     sirius::vector<cudf::aggregation::Kind> aggregates = {cudf::aggregation::Kind::SUM};
 
     // Invalid input: less than two input batches
-    auto input_views = create_batches_with_partial_ungrouped_agg_result(
+    auto input_views = create_batches_with_local_ungrouped_agg_result(
         num_batches, num_base_input_rows, column_types, aggregates, data_repo_manager, *mem_space);
     REQUIRE_THROWS_AS(gpu_merge_impl::merge_ungrouped_aggregate(input_views,
                                                             aggregates,
@@ -433,7 +434,7 @@ TEST_CASE("Ungrouped merge aggregate with invalid input", "[operator][merge_ungr
     // Invalid input: mismatch between num columns and num aggregations
     num_batches = 10;
     num_base_input_rows = sirius::vector<int>(num_batches, num_base_input_rows_per_batch);
-    input_views = create_batches_with_partial_ungrouped_agg_result(
+    input_views = create_batches_with_local_ungrouped_agg_result(
         num_batches, num_base_input_rows, column_types, aggregates, data_repo_manager, *mem_space);
     aggregates.push_back(cudf::aggregation::Kind::SUM);
     REQUIRE_THROWS_AS(gpu_merge_impl::merge_ungrouped_aggregate(input_views,
@@ -444,7 +445,7 @@ TEST_CASE("Ungrouped merge aggregate with invalid input", "[operator][merge_ungr
                     std::runtime_error);
 }
 
-TEST_CASE("Ungrouped merge aggregate of with empty partial aggregate results", "[operator][merge_ungrouped_agg]") {
+TEST_CASE("Ungrouped merge aggregate of with empty local aggregate results", "[operator][merge_ungrouped_agg]") {
     data_repository_manager data_repo_manager;
     auto* mem_space = get_default_memory_space();
     constexpr int num_batches = 10;
@@ -459,14 +460,14 @@ TEST_CASE("Ungrouped merge aggregate of with empty partial aggregate results", "
                                                         cudf::aggregation::Kind::COUNT_ALL,
                                                         cudf::aggregation::Kind::SUM};
 
-    auto input_views = create_batches_with_partial_ungrouped_agg_result(
+    auto input_views = create_batches_with_local_ungrouped_agg_result(
         num_batches, num_base_input_rows, column_types, aggregates, data_repo_manager, *mem_space);
     auto output_batch = gpu_merge_impl::merge_ungrouped_aggregate(
         input_views, aggregates, cudf::get_default_stream(), *mem_space, data_repo_manager);
     validate_ungrouped_aggregate(input_views, *output_batch, aggregates);
 }
 
-TEST_CASE("Ungrouped merge aggregate of with mixed empty and non-empty partial aggregate results",
+TEST_CASE("Ungrouped merge aggregate of with mixed empty and non-empty local aggregate results",
         "[operator][merge_ungrouped_agg]") {
     data_repository_manager data_repo_manager;
     auto* mem_space = get_default_memory_space();
@@ -484,14 +485,14 @@ TEST_CASE("Ungrouped merge aggregate of with mixed empty and non-empty partial a
                                                         cudf::aggregation::Kind::COUNT_ALL,
                                                         cudf::aggregation::Kind::SUM};
 
-    auto input_views = create_batches_with_partial_ungrouped_agg_result(
+    auto input_views = create_batches_with_local_ungrouped_agg_result(
         num_batches, num_base_input_rows, column_types, aggregates, data_repo_manager, *mem_space);
     auto output_batch = gpu_merge_impl::merge_ungrouped_aggregate(
         input_views, aggregates, cudf::get_default_stream(), *mem_space, data_repo_manager);
     validate_ungrouped_aggregate(input_views, *output_batch, aggregates);
 }
 
-sirius::vector<sirius::unique_ptr<data_batch_view>> create_batches_with_partial_grouped_agg_result(
+sirius::vector<sirius::unique_ptr<data_batch_view>> create_batches_with_local_grouped_agg_result(
         const int num_batches, const sirius::vector<int> num_base_input_rows,
         const sirius::vector<cudf::data_type>& column_types, const sirius::vector<int>& group_idx,
         const sirius::vector<cudf::aggregation::Kind>& aggregates, const sirius::vector<int>& aggregate_idx,
@@ -504,19 +505,19 @@ sirius::vector<sirius::unique_ptr<data_batch_view>> create_batches_with_partial_
     auto base_input_batches = create_batches_with_random_data(
         num_batches, num_base_input_rows, column_types, ranges, data_repo_manager, mem_space);
     
-    // Compute partial ungrouped aggregates
-    sirius::vector<sirius::unique_ptr<data_batch_view>> partial_aggregate_batches;
+    // Compute local ungrouped aggregates
+    sirius::vector<sirius::unique_ptr<data_batch_view>> local_aggregate_batches;
     for (int i = 0; i < num_batches; ++i) {
         auto batch = gpu_aggregate_impl::local_grouped_aggregate(
             *base_input_batches[i], group_idx, aggregates, aggregate_idx, cudf::get_default_stream(),
             mem_space, data_repo_manager);
         auto* batch_ptr = batch.get();
         data_repo_manager.add_new_data_batch(std::move(batch), {});
-        partial_aggregate_batches.push_back(sirius::make_unique<data_batch_view>(batch_ptr));
-        partial_aggregate_batches.back()->pin();
+        local_aggregate_batches.push_back(sirius::make_unique<data_batch_view>(batch_ptr));
+        local_aggregate_batches.back()->pin();
     }
 
-    return partial_aggregate_batches;
+    return local_aggregate_batches;
 }
 
 void copy_data_to_host(cudf::table_view table, sirius::vector<sirius::vector<int64_t>>& h_data) {
@@ -634,7 +635,7 @@ TEST_CASE("Grouped merge aggregate of min/max/count/sum", "[operator][merge_grou
         cudf::aggregation::Kind::COUNT_ALL, cudf::aggregation::Kind::SUM};
     sirius::vector<int> aggregate_idx = {2, 3, 4, 5};
 
-    auto input_views = create_batches_with_partial_grouped_agg_result(
+    auto input_views = create_batches_with_local_grouped_agg_result(
         num_batches, num_base_input_rows, column_types, group_idx, aggregates, aggregate_idx,
         data_repo_manager, *mem_space);
     auto output_batch = gpu_merge_impl::merge_grouped_aggregate(
@@ -655,7 +656,7 @@ TEST_CASE("Grouped merge aggregate with invalid input", "[operator][merge_groupe
     sirius::vector<int> aggregate_idx = {1};
 
     // Invalid input: less than two input batches
-    auto input_views = create_batches_with_partial_grouped_agg_result(
+    auto input_views = create_batches_with_local_grouped_agg_result(
         num_batches, num_base_input_rows, column_types, group_idx, aggregates, aggregate_idx,
         data_repo_manager, *mem_space);
     REQUIRE_THROWS_AS(gpu_merge_impl::merge_grouped_aggregate(
@@ -666,7 +667,7 @@ TEST_CASE("Grouped merge aggregate with invalid input", "[operator][merge_groupe
     // Invalid input: mismatch between num columns, num_groups, and num aggregations
     num_batches = 10;
     num_base_input_rows = sirius::vector<int>(num_batches, num_base_input_rows_per_batch);
-    input_views = create_batches_with_partial_ungrouped_agg_result(
+    input_views = create_batches_with_local_ungrouped_agg_result(
         num_batches, num_base_input_rows, column_types, aggregates, data_repo_manager, *mem_space);
     group_idx.push_back(1);
     REQUIRE_THROWS_AS(gpu_merge_impl::merge_grouped_aggregate(
@@ -675,7 +676,7 @@ TEST_CASE("Grouped merge aggregate with invalid input", "[operator][merge_groupe
                     std::runtime_error);
 }
 
-TEST_CASE("Grouped merge aggregate with empty partial aggregate results", "[operator][merge_grouped_agg]") {
+TEST_CASE("Grouped merge aggregate with empty local aggregate results", "[operator][merge_grouped_agg]") {
     data_repository_manager data_repo_manager;
     auto* mem_space = get_default_memory_space();
     constexpr int num_batches = 10;
@@ -691,7 +692,7 @@ TEST_CASE("Grouped merge aggregate with empty partial aggregate results", "[oper
         cudf::aggregation::Kind::COUNT_ALL, cudf::aggregation::Kind::SUM};
     sirius::vector<int> aggregate_idx = {2, 3, 4, 5};
 
-    auto input_views = create_batches_with_partial_grouped_agg_result(
+    auto input_views = create_batches_with_local_grouped_agg_result(
         num_batches, num_base_input_rows, column_types, group_idx, aggregates, aggregate_idx,
         data_repo_manager, *mem_space);
     auto output_batch = gpu_merge_impl::merge_grouped_aggregate(
@@ -699,7 +700,7 @@ TEST_CASE("Grouped merge aggregate with empty partial aggregate results", "[oper
     validate_grouped_aggregate(input_views, *output_batch, group_idx.size(), aggregates);
 }
 
-TEST_CASE("Grouped merge aggregate with mixed empty and non-empty partial aggregate results",
+TEST_CASE("Grouped merge aggregate with mixed empty and non-empty local aggregate results",
         "[operator][merge_grouped_agg]") {
     data_repository_manager data_repo_manager;
     auto* mem_space = get_default_memory_space();
@@ -718,7 +719,7 @@ TEST_CASE("Grouped merge aggregate with mixed empty and non-empty partial aggreg
         cudf::aggregation::Kind::COUNT_ALL, cudf::aggregation::Kind::SUM};
     sirius::vector<int> aggregate_idx = {2, 3, 4, 5};
 
-    auto input_views = create_batches_with_partial_grouped_agg_result(
+    auto input_views = create_batches_with_local_grouped_agg_result(
         num_batches, num_base_input_rows, column_types, group_idx, aggregates, aggregate_idx,
         data_repo_manager, *mem_space);
     auto output_batch = gpu_merge_impl::merge_grouped_aggregate(
@@ -741,10 +742,405 @@ TEST_CASE("Grouped merge aggregate with multiple aggregations on the same column
         cudf::aggregation::Kind::COUNT_ALL, cudf::aggregation::Kind::SUM};
     sirius::vector<int> aggregate_idx = {2, 3, 2, 3};
 
-    auto input_views = create_batches_with_partial_grouped_agg_result(
+    auto input_views = create_batches_with_local_grouped_agg_result(
         num_batches, num_base_input_rows, column_types, group_idx, aggregates, aggregate_idx,
         data_repo_manager, *mem_space);
     auto output_batch = gpu_merge_impl::merge_grouped_aggregate(
         input_views, group_idx.size(), aggregates, cudf::get_default_stream(), *mem_space, data_repo_manager);
     validate_grouped_aggregate(input_views, *output_batch, group_idx.size(), aggregates);
+}
+
+sirius::vector<sirius::unique_ptr<data_batch_view>> create_batches_with_local_orderby_or_topn_result(
+        const int num_batches, const sirius::vector<int> num_base_input_rows,
+        const std::optional<std::pair<int, int>>& limit_offset, const sirius::vector<cudf::data_type>& column_types,
+        const sirius::vector<int>& order_key_idx, const sirius::vector<cudf::order>& column_order,
+        const sirius::vector<cudf::null_order>& null_precedence, data_repository_manager& data_repo_manager,
+        memory_space& mem_space) {
+    // Base input batches, make order key value ranges small so that some rows are compared by multiple columns
+    sirius::vector<std::optional<std::pair<int, int>>> ranges(column_types.size(), std::nullopt);
+    for (int idx: order_key_idx) {
+        ranges[idx] = {0, 4};
+    }
+    auto base_input_batches = create_batches_with_random_data(
+        num_batches, num_base_input_rows, column_types, ranges, data_repo_manager, mem_space);
+
+    // Compute local order_by
+    sirius::vector<sirius::unique_ptr<data_batch_view>> local_order_by_batches;
+    sirius::vector<int> projections(column_types.size());
+    for (int i = 0; i < column_types.size(); ++i) {
+        projections[i] = i;
+    }
+    for (int i = 0; i < num_batches; ++i) {
+        auto batch = limit_offset.has_value()
+            ? gpu_order_impl::local_top_n(
+                *base_input_batches[i], limit_offset->first, limit_offset->second, order_key_idx, column_order,
+                null_precedence, projections, cudf::get_default_stream(), mem_space, data_repo_manager)
+            : gpu_order_impl::local_order_by(
+                *base_input_batches[i], order_key_idx, column_order, null_precedence, projections,
+                cudf::get_default_stream(), mem_space, data_repo_manager);
+        auto* batch_ptr = batch.get();
+        data_repo_manager.add_new_data_batch(std::move(batch), {});
+        local_order_by_batches.push_back(sirius::make_unique<data_batch_view>(batch_ptr));
+        local_order_by_batches.back()->pin();
+    }
+    return local_order_by_batches;
+}
+
+void validate_order_by(const sirius::vector<sirius::unique_ptr<data_batch_view>>& input_views,
+                    const sirius::data_batch& output,
+                    const sirius::vector<int>& order_key_idx,
+                    const sirius::vector<cudf::order>& column_order) {
+    sirius::vector<cudf::table_view> input_table_views;
+    int expected_num_rows = 0;
+    for (const auto& input_view: input_views) {
+        input_table_views.push_back(input_view->get_cudf_table_view());
+        expected_num_rows += input_table_views.back().num_rows();
+    }
+    cudf::table_view output_table_view = output.get_data()->cast<gpu_table_representation>().get_table().view();
+
+    REQUIRE(output_table_view.num_rows() == expected_num_rows);
+    REQUIRE(output_table_view.num_columns() == input_table_views[0].num_columns());
+    for (int c = 0; c < output_table_view.num_columns(); ++c) {
+        REQUIRE(output_table_view.column(c).type().id() == input_table_views[0].column(c).type().id());
+    }
+
+    sirius::vector<sirius::vector<int64_t>> actual(output_table_view.num_columns());
+    copy_data_to_host(output_table_view, actual);
+    auto comp = [&](int r) {
+        for (int i = 0; i < order_key_idx.size(); ++i) {
+            int col = order_key_idx[i];
+            if (actual[col][r] == actual[col][r - 1]) {
+                continue;
+            }
+            return (column_order[i] == cudf::order::ASCENDING && actual[col][r] > actual[col][r - 1])
+                || (column_order[i] == cudf::order::DESCENDING && actual[col][r] < actual[col][r - 1]);
+        }
+        return true;
+    };
+    for (int r = 1; r < output_table_view.num_rows(); ++r) {
+        REQUIRE(comp(r));
+    }
+}
+
+TEST_CASE("Merge order-by basic", "[operator][merge_order_by]") {
+    data_repository_manager data_repo_manager;
+    auto* mem_space = get_default_memory_space();
+    constexpr int num_batches = 10;
+    constexpr size_t num_base_input_rows_per_batch = 100;
+    sirius::vector<int> num_base_input_rows(num_batches, num_base_input_rows_per_batch);
+    sirius::vector<cudf::data_type> column_types = {
+        cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::INT64},
+        cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::INT64}};
+    sirius::vector<int> order_key_idx = {0, 1, 2};
+    sirius::vector<cudf::order> column_order = {
+        cudf::order::ASCENDING, cudf::order::DESCENDING, cudf::order::ASCENDING};
+    sirius::vector<cudf::null_order> null_precedence = {
+        cudf::null_order::AFTER, cudf::null_order::BEFORE, cudf::null_order::AFTER};
+    
+    auto input_views = create_batches_with_local_orderby_or_topn_result(
+        num_batches, num_base_input_rows, std::nullopt, column_types, order_key_idx,
+        column_order, null_precedence, data_repo_manager, *mem_space);
+    auto output_batch = gpu_merge_impl::merge_order_by(
+        input_views, order_key_idx, column_order, null_precedence, cudf::get_default_stream(),
+        *mem_space, data_repo_manager);
+    validate_order_by(input_views, *output_batch, order_key_idx, column_order);
+}
+
+TEST_CASE("Merge order-by with invalid input", "[operator][merge_order_by]") {
+    data_repository_manager data_repo_manager;
+    auto* mem_space = get_default_memory_space();
+    int num_batches = 1;
+    constexpr size_t num_base_input_rows_per_batch = 100;
+    sirius::vector<int> num_base_input_rows(num_batches, num_base_input_rows_per_batch);
+    sirius::vector<cudf::data_type> column_types = {
+        cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::INT64},
+        cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::INT64}};
+    sirius::vector<int> order_key_idx = {0, 1, 2};
+    sirius::vector<cudf::order> column_order = {
+        cudf::order::ASCENDING, cudf::order::DESCENDING, cudf::order::ASCENDING};
+    sirius::vector<cudf::null_order> null_precedence = {
+        cudf::null_order::AFTER, cudf::null_order::BEFORE, cudf::null_order::AFTER};
+
+    // Invalid input: less than two input batches
+    auto input_views = create_batches_with_local_orderby_or_topn_result(
+        num_batches, num_base_input_rows, std::nullopt, column_types, order_key_idx,
+        column_order, null_precedence, data_repo_manager, *mem_space);
+    REQUIRE_THROWS_AS(gpu_merge_impl::merge_order_by(
+                        input_views, order_key_idx, column_order, null_precedence, cudf::get_default_stream(),
+                        *mem_space, data_repo_manager),
+                    std::runtime_error);
+
+    // Invalid input: mismatch between sizes of `order_key_idx`, `column_order`, and `null_precedence`
+    num_batches = 10;
+    num_base_input_rows = sirius::vector<int>(num_batches, num_base_input_rows_per_batch);
+    input_views = create_batches_with_local_orderby_or_topn_result(
+        num_batches, num_base_input_rows, std::nullopt, column_types, order_key_idx,
+        column_order, null_precedence, data_repo_manager, *mem_space);
+    order_key_idx.push_back(3);
+    REQUIRE_THROWS_AS(gpu_merge_impl::merge_order_by(
+                        input_views, order_key_idx, column_order, null_precedence, cudf::get_default_stream(),
+                        *mem_space, data_repo_manager),
+                    std::runtime_error);
+}
+
+TEST_CASE("Merge order-by with empty local order-by results", "[operator][merge_order_by]") {
+    data_repository_manager data_repo_manager;
+    auto* mem_space = get_default_memory_space();
+    constexpr int num_batches = 10;
+    constexpr size_t num_base_input_rows_per_batch = 0;
+    sirius::vector<int> num_base_input_rows(num_batches, num_base_input_rows_per_batch);
+    sirius::vector<cudf::data_type> column_types = {
+        cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::INT64},
+        cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::INT64}};
+    sirius::vector<int> order_key_idx = {0, 1, 2};
+    sirius::vector<cudf::order> column_order = {
+        cudf::order::ASCENDING, cudf::order::DESCENDING, cudf::order::ASCENDING};
+    sirius::vector<cudf::null_order> null_precedence = {
+        cudf::null_order::AFTER, cudf::null_order::BEFORE, cudf::null_order::AFTER};
+    
+    auto input_views = create_batches_with_local_orderby_or_topn_result(
+        num_batches, num_base_input_rows, std::nullopt, column_types, order_key_idx,
+        column_order, null_precedence, data_repo_manager, *mem_space);
+    auto output_batch = gpu_merge_impl::merge_order_by(
+        input_views, order_key_idx, column_order, null_precedence, cudf::get_default_stream(),
+        *mem_space, data_repo_manager);
+    validate_order_by(input_views, *output_batch, order_key_idx, column_order);
+}
+
+TEST_CASE("Merge order-by with mixed empty and non-empty local order-by results", "[operator][merge_order_by]") {
+    data_repository_manager data_repo_manager;
+    auto* mem_space = get_default_memory_space();
+    constexpr int num_batches = 10;
+    sirius::vector<int> num_base_input_rows;
+    for (int i = 0; i < num_batches; ++i) {
+        num_base_input_rows.push_back(i % 2 == 1 ? 0 : (i + 1) * 10);
+    }
+    sirius::vector<cudf::data_type> column_types = {
+        cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::INT64},
+        cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::INT64}};
+    sirius::vector<int> order_key_idx = {0, 1, 2};
+    sirius::vector<cudf::order> column_order = {
+        cudf::order::ASCENDING, cudf::order::DESCENDING, cudf::order::ASCENDING};
+    sirius::vector<cudf::null_order> null_precedence = {
+        cudf::null_order::AFTER, cudf::null_order::BEFORE, cudf::null_order::AFTER};
+    
+    auto input_views = create_batches_with_local_orderby_or_topn_result(
+        num_batches, num_base_input_rows, std::nullopt, column_types, order_key_idx,
+        column_order, null_precedence, data_repo_manager, *mem_space);
+    auto output_batch = gpu_merge_impl::merge_order_by(
+        input_views, order_key_idx, column_order, null_precedence, cudf::get_default_stream(),
+        *mem_space, data_repo_manager);
+    validate_order_by(input_views, *output_batch, order_key_idx, column_order);
+}
+
+void validate_top_n(const sirius::vector<sirius::unique_ptr<data_batch_view>>& input_views,
+                    const sirius::data_batch& output,
+                    const std::pair<int, int>& limit_offset,
+                    const sirius::vector<int>& order_key_idx,
+                    const sirius::vector<cudf::order>& column_order) {
+    sirius::vector<cudf::table_view> input_table_views;
+    int num_input_rows = 0;
+    for (const auto& input_view: input_views) {
+        input_table_views.push_back(input_view->get_cudf_table_view());
+        num_input_rows += input_table_views.back().num_rows();
+    }
+    int limit = limit_offset.first, offset = limit_offset.second;
+    cudf::table_view output_table_view = output.get_data()->cast<gpu_table_representation>().get_table().view();
+    int expected_num_rows = (limit + offset <= num_input_rows) ? limit : std::max(0, num_input_rows - offset);
+
+    // Compute sorted input
+    sirius::vector<sirius::vector<int64_t>> h_input_data(input_table_views[0].num_columns());
+    for (const auto& table: input_table_views) {
+        copy_data_to_host(table, h_input_data);
+    }
+    sirius::vector<sirius::vector<int64_t>> h_input_data_rows(
+        h_input_data[0].size(), sirius::vector<int64_t>(h_input_data.size()));
+    for (int r = 0; r < h_input_data_rows.size(); ++r) {
+        for (int c = 0; c < h_input_data_rows[0].size(); ++c) {
+            h_input_data_rows[r][c] = h_input_data[c][r];
+        }
+    }
+    sort(h_input_data_rows.begin(), h_input_data_rows.end(),
+        [&](const sirius::vector<int64_t>& r1, const sirius::vector<int64_t>& r2) {
+            for (int i = 0; i < order_key_idx.size(); ++i) {
+                int col = order_key_idx[i];
+                if (r1[col] == r2[col]) {
+                    continue;
+                }
+                return (column_order[i] == cudf::order::ASCENDING && r1[col] < r2[col])
+                    || (column_order[i] == cudf::order::DESCENDING && r1[col] > r2[col]);
+            }
+            return false;
+        });
+
+    // Check
+    REQUIRE(output_table_view.num_rows() == expected_num_rows);
+    REQUIRE(output_table_view.num_columns() == input_table_views[0].num_columns());
+    for (int c = 0; c < output_table_view.num_columns(); ++c) {
+        REQUIRE(output_table_view.column(c).type().id() == input_table_views[0].column(c).type().id());
+    }
+
+    sirius::vector<sirius::vector<int64_t>> actual(output_table_view.num_columns());
+    copy_data_to_host(output_table_view, actual);
+    auto comp_lower = [&](int r) {
+        if (offset == 0) {
+            return true;
+        }
+        const auto& lower = h_input_data_rows[offset - 1];
+        for (int i = 0; i < order_key_idx.size(); ++i) {
+            int col = order_key_idx[i];
+            if (actual[col][r] == lower[col]) {
+                continue;
+            }
+            return (column_order[i] == cudf::order::ASCENDING && actual[col][r] > lower[col])
+                || (column_order[i] == cudf::order::DESCENDING && actual[col][r] < lower[col]);
+        }
+        return true;
+    };
+    auto comp_upper = [&](int r) {
+        if (offset + limit >= num_input_rows) {
+            return true;
+        }
+        const auto& upper = h_input_data_rows[offset + limit];
+        for (int i = 0; i < order_key_idx.size(); ++i) {
+            int col = order_key_idx[i];
+            if (actual[col][r] == upper[col]) {
+                continue;
+            }
+            return (column_order[i] == cudf::order::ASCENDING && actual[col][r] < upper[col])
+                || (column_order[i] == cudf::order::DESCENDING && actual[col][r] > upper[col]);
+        }
+        return true;
+    };
+    for (int r = 0; r < output_table_view.num_rows(); ++r) {
+        REQUIRE(comp_lower(r));
+        REQUIRE(comp_upper(r));
+    }
+}
+
+TEST_CASE("Merge top-n basic", "[operator][merge_top_n]") {
+    data_repository_manager data_repo_manager;
+    auto* mem_space = get_default_memory_space();
+    constexpr int num_batches = 10;
+    constexpr size_t num_base_input_rows_per_batch = 100;
+    sirius::vector<int> num_base_input_rows(num_batches, num_base_input_rows_per_batch);
+    sirius::vector<cudf::data_type> column_types = {
+        cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::INT64},
+        cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::INT64}};
+    std::pair<int, int> limit_offset = {10, 20};
+    sirius::vector<int> order_key_idx = {0, 1, 2};
+    sirius::vector<cudf::order> column_order = {
+        cudf::order::ASCENDING, cudf::order::DESCENDING, cudf::order::ASCENDING};
+    sirius::vector<cudf::null_order> null_precedence = {
+        cudf::null_order::AFTER, cudf::null_order::BEFORE, cudf::null_order::AFTER};
+    
+    auto input_views = create_batches_with_local_orderby_or_topn_result(
+        num_batches, num_base_input_rows, limit_offset, column_types, order_key_idx,
+        column_order, null_precedence, data_repo_manager, *mem_space);
+    auto output_batch = gpu_merge_impl::merge_top_n(
+        input_views, limit_offset.first, limit_offset.second, order_key_idx, column_order, null_precedence,
+        cudf::get_default_stream(), *mem_space, data_repo_manager);
+    validate_top_n(input_views, *output_batch, limit_offset, order_key_idx, column_order);
+}
+
+TEST_CASE("Merge top-n with empty local top-n results", "[operator][merge_top_n]") {
+    data_repository_manager data_repo_manager;
+    auto* mem_space = get_default_memory_space();
+    constexpr int num_batches = 10;
+    constexpr size_t num_base_input_rows_per_batch = 0;
+    sirius::vector<int> num_base_input_rows(num_batches, num_base_input_rows_per_batch);
+    sirius::vector<cudf::data_type> column_types = {
+        cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::INT64},
+        cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::INT64}};
+    std::pair<int, int> limit_offset = {10, 20};
+    sirius::vector<int> order_key_idx = {0, 1, 2};
+    sirius::vector<cudf::order> column_order = {
+        cudf::order::ASCENDING, cudf::order::DESCENDING, cudf::order::ASCENDING};
+    sirius::vector<cudf::null_order> null_precedence = {
+        cudf::null_order::AFTER, cudf::null_order::BEFORE, cudf::null_order::AFTER};
+    
+    auto input_views = create_batches_with_local_orderby_or_topn_result(
+        num_batches, num_base_input_rows, limit_offset, column_types, order_key_idx,
+        column_order, null_precedence, data_repo_manager, *mem_space);
+    auto output_batch = gpu_merge_impl::merge_top_n(
+        input_views, limit_offset.first, limit_offset.second, order_key_idx, column_order, null_precedence,
+        cudf::get_default_stream(), *mem_space, data_repo_manager);
+    validate_top_n(input_views, *output_batch, limit_offset, order_key_idx, column_order);
+}
+
+TEST_CASE("Merge top-n with mixed empty and non-empty local top-n results", "[operator][merge_top_n]") {
+    data_repository_manager data_repo_manager;
+    auto* mem_space = get_default_memory_space();
+    constexpr int num_batches = 10;
+    sirius::vector<int> num_base_input_rows;
+    for (int i = 0; i < num_batches; ++i) {
+        num_base_input_rows.push_back(i % 2 == 1 ? 0 : (i + 1) * 10);
+    }
+    sirius::vector<cudf::data_type> column_types = {
+        cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::INT64},
+        cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::INT64}};
+    std::pair<int, int> limit_offset = {10, 20};
+    sirius::vector<int> order_key_idx = {0, 1, 2};
+    sirius::vector<cudf::order> column_order = {
+        cudf::order::ASCENDING, cudf::order::DESCENDING, cudf::order::ASCENDING};
+    sirius::vector<cudf::null_order> null_precedence = {
+        cudf::null_order::AFTER, cudf::null_order::BEFORE, cudf::null_order::AFTER};
+    
+    auto input_views = create_batches_with_local_orderby_or_topn_result(
+        num_batches, num_base_input_rows, limit_offset, column_types, order_key_idx,
+        column_order, null_precedence, data_repo_manager, *mem_space);
+    auto output_batch = gpu_merge_impl::merge_top_n(
+        input_views, limit_offset.first, limit_offset.second, order_key_idx, column_order, null_precedence,
+        cudf::get_default_stream(), *mem_space, data_repo_manager);
+    validate_top_n(input_views, *output_batch, limit_offset, order_key_idx, column_order);
+}
+
+TEST_CASE("Merge top-n with `limit = 0`", "[operator][merge_top_n]") {
+    data_repository_manager data_repo_manager;
+    auto* mem_space = get_default_memory_space();
+    constexpr int num_batches = 10;
+    constexpr size_t num_base_input_rows_per_batch = 100;
+    sirius::vector<int> num_base_input_rows(num_batches, num_base_input_rows_per_batch);
+    sirius::vector<cudf::data_type> column_types = {
+        cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::INT64},
+        cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::INT64}};
+    std::pair<int, int> limit_offset = {0, 20};
+    sirius::vector<int> order_key_idx = {0, 1, 2};
+    sirius::vector<cudf::order> column_order = {
+        cudf::order::ASCENDING, cudf::order::DESCENDING, cudf::order::ASCENDING};
+    sirius::vector<cudf::null_order> null_precedence = {
+        cudf::null_order::AFTER, cudf::null_order::BEFORE, cudf::null_order::AFTER};
+    
+    auto input_views = create_batches_with_local_orderby_or_topn_result(
+        num_batches, num_base_input_rows, limit_offset, column_types, order_key_idx,
+        column_order, null_precedence, data_repo_manager, *mem_space);
+    auto output_batch = gpu_merge_impl::merge_top_n(
+        input_views, limit_offset.first, limit_offset.second, order_key_idx, column_order, null_precedence,
+        cudf::get_default_stream(), *mem_space, data_repo_manager);
+    validate_top_n(input_views, *output_batch, limit_offset, order_key_idx, column_order);
+}
+
+TEST_CASE("Merge top-n with `num_input_rows - limit <= offset < num_input-rows`", "[operator][merge_top_n]") {
+    data_repository_manager data_repo_manager;
+    auto* mem_space = get_default_memory_space();
+    constexpr int num_batches = 10;
+    constexpr size_t num_base_input_rows_per_batch = 100;
+    sirius::vector<int> num_base_input_rows(num_batches, num_base_input_rows_per_batch);
+    sirius::vector<cudf::data_type> column_types = {
+        cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::INT64},
+        cudf::data_type{cudf::type_id::INT32}, cudf::data_type{cudf::type_id::INT64}};
+    std::pair<int, int> limit_offset = {200, 900};
+    sirius::vector<int> order_key_idx = {0, 1, 2};
+    sirius::vector<cudf::order> column_order = {
+        cudf::order::ASCENDING, cudf::order::DESCENDING, cudf::order::ASCENDING};
+    sirius::vector<cudf::null_order> null_precedence = {
+        cudf::null_order::AFTER, cudf::null_order::BEFORE, cudf::null_order::AFTER};
+    
+    auto input_views = create_batches_with_local_orderby_or_topn_result(
+        num_batches, num_base_input_rows, limit_offset, column_types, order_key_idx,
+        column_order, null_precedence, data_repo_manager, *mem_space);
+    auto output_batch = gpu_merge_impl::merge_top_n(
+        input_views, limit_offset.first, limit_offset.second, order_key_idx, column_order, null_precedence,
+        cudf::get_default_stream(), *mem_space, data_repo_manager);
+    validate_top_n(input_views, *output_batch, limit_offset, order_key_idx, column_order);
 }
