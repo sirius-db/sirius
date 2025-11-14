@@ -39,5 +39,6 @@ set(EXTENSION_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/aggregate/gpu_aggregate_impl.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/order/gpu_order_impl.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/merge/gpu_merge_impl.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/partition/gpu_partition_impl.cpp
         PARENT_SCOPE
 )

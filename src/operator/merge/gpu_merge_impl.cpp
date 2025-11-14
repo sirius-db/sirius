@@ -277,7 +277,7 @@ sirius::unique_ptr<data_batch> gpu_merge_impl::merge_top_n(
         output_table = std::move(merged_table);
     } else {
         output_table = sirius::make_unique<cudf::table>(
-            cudf::slice(merged_table->view(), {offset, std::min(merged_table->num_rows(), offset + limit)})[0],
+            cudf::slice(merged_table->view(), {offset, std::min(merged_table->num_rows(), offset + limit)}, stream)[0],
             stream, memory_space.get_default_allocator());
     }
 

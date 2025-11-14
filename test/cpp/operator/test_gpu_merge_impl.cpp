@@ -31,6 +31,8 @@ using namespace sirius;
 using namespace sirius::memory;
 using namespace sirius::op;
 
+namespace {
+
 // Helper function to initialize single-device memory manager
 void initialize_memory_manager() {
         memory_reservation_manager::reset_for_testing();
@@ -162,6 +164,8 @@ void validate_concat(const sirius::vector<sirius::unique_ptr<data_batch_view>>& 
     }
 }
 
+}
+
 TEST_CASE("Concatenate multiple data batches", "[operator][merge_concat]") {
     data_repository_manager data_repo_manager;
     auto* mem_space = get_default_memory_space();
@@ -261,6 +265,8 @@ TEST_CASE("Concatenate mixed empty and non-empty data batches", "[operator][merg
                                             data_repo_manager);
     validate_concat(input_views, *output_batch);
 }
+
+namespace {
 
 sirius::vector<sirius::unique_ptr<data_batch_view>> create_batches_with_local_ungrouped_agg_result(
         const int num_batches, const sirius::vector<int> num_base_input_rows,
@@ -390,6 +396,8 @@ void validate_ungrouped_aggregate(const sirius::vector<sirius::unique_ptr<data_b
     }
 }
 
+}
+
 TEST_CASE("Ungrouped merge aggregate of min/max/count/sum", "[operator][merge_ungrouped_agg]") {
     data_repository_manager data_repo_manager;
     auto* mem_space = get_default_memory_space();
@@ -491,6 +499,8 @@ TEST_CASE("Ungrouped merge aggregate of with mixed empty and non-empty local agg
         input_views, aggregates, cudf::get_default_stream(), *mem_space, data_repo_manager);
     validate_ungrouped_aggregate(input_views, *output_batch, aggregates);
 }
+
+namespace {
 
 sirius::vector<sirius::unique_ptr<data_batch_view>> create_batches_with_local_grouped_agg_result(
         const int num_batches, const sirius::vector<int> num_base_input_rows,
@@ -617,6 +627,8 @@ void validate_grouped_aggregate(const sirius::vector<sirius::unique_ptr<data_bat
             REQUIRE(actual_val == expected_val);
         }
     }
+}
+
 }
 
 TEST_CASE("Grouped merge aggregate of min/max/count/sum", "[operator][merge_grouped_agg]") {
@@ -750,6 +762,8 @@ TEST_CASE("Grouped merge aggregate with multiple aggregations on the same column
     validate_grouped_aggregate(input_views, *output_batch, group_idx.size(), aggregates);
 }
 
+namespace {
+
 sirius::vector<sirius::unique_ptr<data_batch_view>> create_batches_with_local_orderby_or_topn_result(
         const int num_batches, const sirius::vector<int> num_base_input_rows,
         const std::optional<std::pair<int, int>>& limit_offset, const sirius::vector<cudf::data_type>& column_types,
@@ -820,6 +834,8 @@ void validate_order_by(const sirius::vector<sirius::unique_ptr<data_batch_view>>
     for (int r = 1; r < output_table_view.num_rows(); ++r) {
         REQUIRE(comp(r));
     }
+}
+
 }
 
 TEST_CASE("Merge order-by basic", "[operator][merge_order_by]") {
@@ -933,6 +949,8 @@ TEST_CASE("Merge order-by with mixed empty and non-empty local order-by results"
     validate_order_by(input_views, *output_batch, order_key_idx, column_order);
 }
 
+namespace {
+
 void validate_top_n(const sirius::vector<sirius::unique_ptr<data_batch_view>>& input_views,
                     const sirius::data_batch& output,
                     const std::pair<int, int>& limit_offset,
@@ -1016,6 +1034,8 @@ void validate_top_n(const sirius::vector<sirius::unique_ptr<data_batch_view>>& i
         REQUIRE(comp_lower(r));
         REQUIRE(comp_upper(r));
     }
+}
+
 }
 
 TEST_CASE("Merge top-n basic", "[operator][merge_top_n]") {
