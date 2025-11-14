@@ -104,7 +104,7 @@ sirius::unique_ptr<data_batch> gpu_aggregate_impl::local_grouped_aggregate(
         data_repository_manager& data_repository_mgr) {
     // Sanity check
     if (aggregates.size() != aggregate_idx.size()) {
-        throw std::runtime_error("mismatch between the size of `aggregates` and `aggregate_idx in "
+        throw std::runtime_error("mismatch between the size of `aggregates` and `aggregate_idx` in "
             "`local_grouped_aggregate()`");
     }
 

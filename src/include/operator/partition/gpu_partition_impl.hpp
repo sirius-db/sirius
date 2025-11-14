@@ -26,11 +26,11 @@ namespace sirius {
 namespace op {
 
 /**
- * @brief Functionalities for partition the input data batch into multiple output batches.
+ * @brief Functionalities for partitioning the input data batch into multiple output batches.
  * 
  * Provide functionalities including:
  * - Hash partitioning with specified partitioning columns;
- * - Evenly partitioning with evenly split the input table.
+ * - Evenly partitioning to evenly split the input table.
  * 
  * Require caller to have already upgraded input data batches into `gpu_table_representation`
  * (the input data batch views are pinned).

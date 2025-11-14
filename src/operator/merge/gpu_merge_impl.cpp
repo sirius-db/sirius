@@ -140,7 +140,7 @@ gpu_merge_impl::merge_grouped_aggregate(const sirius::vector<sirius::unique_ptr<
                                     data_repository_manager& data_repository_mgr) {
     // Sanity check.
     if (input.size() < 2) {
-        throw std::runtime_error("`input` in `merge_ungrouped_aggregate()` should at least contain two data batches");
+        throw std::runtime_error("`input` in `merge_grouped_aggregate()` should at least contain two data batches");
     }
     
     // Pull input cudf tables and concatenate.

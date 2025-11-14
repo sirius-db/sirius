@@ -453,7 +453,7 @@ TEST_CASE("Ungrouped merge aggregate with invalid input", "[operator][merge_ungr
                     std::runtime_error);
 }
 
-TEST_CASE("Ungrouped merge aggregate of with empty local aggregate results", "[operator][merge_ungrouped_agg]") {
+TEST_CASE("Ungrouped merge aggregate with empty local aggregate results", "[operator][merge_ungrouped_agg]") {
     data_repository_manager data_repo_manager;
     auto* mem_space = get_default_memory_space();
     constexpr int num_batches = 10;
@@ -475,7 +475,7 @@ TEST_CASE("Ungrouped merge aggregate of with empty local aggregate results", "[o
     validate_ungrouped_aggregate(input_views, *output_batch, aggregates);
 }
 
-TEST_CASE("Ungrouped merge aggregate of with mixed empty and non-empty local aggregate results",
+TEST_CASE("Ungrouped merge aggregate with mixed empty and non-empty local aggregate results",
         "[operator][merge_ungrouped_agg]") {
     data_repository_manager data_repo_manager;
     auto* mem_space = get_default_memory_space();
@@ -515,7 +515,7 @@ sirius::vector<sirius::unique_ptr<data_batch_view>> create_batches_with_local_gr
     auto base_input_batches = create_batches_with_random_data(
         num_batches, num_base_input_rows, column_types, ranges, data_repo_manager, mem_space);
     
-    // Compute local ungrouped aggregates
+    // Compute local grouped aggregates
     sirius::vector<sirius::unique_ptr<data_batch_view>> local_aggregate_batches;
     for (int i = 0; i < num_batches; ++i) {
         auto batch = gpu_aggregate_impl::local_grouped_aggregate(

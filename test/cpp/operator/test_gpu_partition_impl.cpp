@@ -146,7 +146,7 @@ void validate_hash_partition(const sirius::data_batch_view& input_view,
 
 }
 
-TEST_CASE("Hash parition basic", "[operator][hash_partition]") {
+TEST_CASE("Hash partition basic", "[operator][hash_partition]") {
     data_repository_manager data_repo_manager;
     auto* mem_space = get_default_memory_space();
     constexpr size_t num_input_rows = 100;
@@ -165,7 +165,7 @@ TEST_CASE("Hash parition basic", "[operator][hash_partition]") {
     validate_hash_partition(*input_view, output_batches, num_partitions);
 }
 
-TEST_CASE("Hash parition with invalid input", "[operator][hash_partition]") {
+TEST_CASE("Hash partition with invalid input", "[operator][hash_partition]") {
     data_repository_manager data_repo_manager;
     auto* mem_space = get_default_memory_space();
     constexpr size_t num_input_rows = 100;
@@ -184,7 +184,7 @@ TEST_CASE("Hash parition with invalid input", "[operator][hash_partition]") {
                     std::runtime_error);
 }
 
-TEST_CASE("Hash parition with empty input", "[operator][hash_partition]") {
+TEST_CASE("Hash partition with empty input", "[operator][hash_partition]") {
     data_repository_manager data_repo_manager;
     auto* mem_space = get_default_memory_space();
     constexpr size_t num_input_rows = 0;
@@ -203,7 +203,7 @@ TEST_CASE("Hash parition with empty input", "[operator][hash_partition]") {
     validate_hash_partition(*input_view, output_batches, num_partitions);
 }
 
-TEST_CASE("Hash parition with all the same partitioning keys", "[operator][hash_partition]") {
+TEST_CASE("Hash partition with all the same partitioning keys", "[operator][hash_partition]") {
     data_repository_manager data_repo_manager;
     auto* mem_space = get_default_memory_space();
     constexpr size_t num_input_rows = 100;
@@ -224,7 +224,7 @@ TEST_CASE("Hash parition with all the same partitioning keys", "[operator][hash_
     validate_hash_partition(*input_view, output_batches, num_partitions);
 }
 
-TEST_CASE("Hash parition with num partitions larger than input size", "[operator][hash_partition]") {
+TEST_CASE("Hash partition with num partitions larger than input size", "[operator][hash_partition]") {
     data_repository_manager data_repo_manager;
     auto* mem_space = get_default_memory_space();
     constexpr size_t num_input_rows = 10;
@@ -290,7 +290,7 @@ void validate_evenly_partition(const sirius::data_batch_view& input_view,
 
 }
 
-TEST_CASE("Evenly parition basic", "[operator][evenly_partition]") {
+TEST_CASE("Evenly partition basic", "[operator][evenly_partition]") {
     data_repository_manager data_repo_manager;
     auto* mem_space = get_default_memory_space();
     constexpr size_t num_input_rows = 100;
@@ -307,7 +307,7 @@ TEST_CASE("Evenly parition basic", "[operator][evenly_partition]") {
     validate_evenly_partition(*input_view, output_batches, num_partitions);
 }
 
-TEST_CASE("Evenly parition basic with empty input", "[operator][evenly_partition]") {
+TEST_CASE("Evenly partition basic with empty input", "[operator][evenly_partition]") {
     data_repository_manager data_repo_manager;
     auto* mem_space = get_default_memory_space();
     constexpr size_t num_input_rows = 0;
@@ -324,7 +324,7 @@ TEST_CASE("Evenly parition basic with empty input", "[operator][evenly_partition
     validate_evenly_partition(*input_view, output_batches, num_partitions);
 }
 
-TEST_CASE("Evenly parition basic with num partitions larger than input size", "[operator][evenly_partition]") {
+TEST_CASE("Evenly partition basic with num partitions larger than input size", "[operator][evenly_partition]") {
     data_repository_manager data_repo_manager;
     auto* mem_space = get_default_memory_space();
     constexpr size_t num_input_rows = 10;
