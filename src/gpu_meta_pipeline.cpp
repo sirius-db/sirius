@@ -83,37 +83,6 @@ void GPUMetaPipeline::AssignNextBatchIndex(GPUPipeline &pipeline) {
 	pipeline.base_batch_index = next_batch_index++ * GPUPipelineBuildState::BATCH_INCREMENT;
 }
 
-// void GPUMetaPipeline::BuildGPUPipelines(GPUPhysicalOperator &node, GPUPipeline &current) {
-// 	node.op_state.reset();
-
-// 	auto &state = GetState();
-// 	if (node.IsSink()) {
-// 		// operator is a sink, build a pipeline
-// 		node.sink_state.reset();
-// 		D_ASSERT(node.children.size() == 1);
-
-// 		// single operator: the operator becomes the data source of the current pipeline
-// 		state.SetPipelineSource(current, node);
-
-// 		// we create a new pipeline starting from the child
-// 		auto &child_meta_pipeline = CreateChildMetaPipeline(current, node);
-// 		child_meta_pipeline.Build(*node.children[0]);
-// 	} else {
-// 		// operator is not a sink! recurse in children
-// 		if (node.children.empty()) {
-// 			// source
-// 			state.SetPipelineSource(current, node);
-// 		} else {
-// 			if (node.children.size() != 1) {
-// 				throw InternalException("Operator not supported in BuildPipelines");
-// 			}
-// 			state.AddPipelineOperator(current, node);
-// 			// node.children[0]->BuildPipelines(current, meta_pipeline);
-// 			BuildGPUPipelines(*node.children[0], current);
-// 		}
-// 	}
-// }
-
 void GPUMetaPipeline::Build(GPUPhysicalOperator &op) {
 	D_ASSERT(pipelines.size() == 1);
 	D_ASSERT(children.empty());

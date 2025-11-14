@@ -42,49 +42,6 @@ GPUPhysicalCTE::GPUPhysicalCTE(string ctename, idx_t table_index, vector<Logical
 GPUPhysicalCTE::~GPUPhysicalCTE() {
 }
 
-//===--------------------------------------------------------------------===//
-// Sink
-//===--------------------------------------------------------------------===//
-// class CTEGlobalState : public GlobalSinkState {
-// public:
-// 	explicit CTEGlobalState(ClientContext &context, const PhysicalCTE &op) : working_table_ref(op.working_table.get()) {
-// 	}
-// 	optional_ptr<ColumnDataCollection> working_table_ref;
-
-// 	mutex lhs_lock;
-
-// 	void MergeIT(ColumnDataCollection &input) {
-// 		lock_guard<mutex> guard(lhs_lock);
-// 		working_table_ref->Combine(input);
-// 	}
-// };
-
-// class CTELocalState : public LocalSinkState {
-// public:
-// 	explicit CTELocalState(ClientContext &context, const PhysicalCTE &op)
-// 	    : lhs_data(context, op.working_table->Types()) {
-// 		lhs_data.InitializeAppend(append_state);
-// 	}
-
-// 	unique_ptr<LocalSinkState> distinct_state;
-// 	ColumnDataCollection lhs_data;
-// 	ColumnDataAppendState append_state;
-
-// 	void Append(DataChunk &input) {
-// 		lhs_data.Append(input);
-// 	}
-// };
-
-// unique_ptr<GlobalSinkState> PhysicalCTE::GetGlobalSinkState(ClientContext &context) const {
-// 	working_table->Reset();
-// 	return make_uniq<CTEGlobalState>(context, *this);
-// }
-
-// unique_ptr<LocalSinkState> PhysicalCTE::GetLocalSinkState(ExecutionContext &context) const {
-// 	auto state = make_uniq<CTELocalState>(context.client, *this);
-// 	return std::move(state);
-// }
-
 SinkResultType GPUPhysicalCTE::Sink(GPUIntermediateRelation &input_relation) const {
 	// auto &lstate = input.local_state.Cast<CTELocalState>();
 	// lstate.lhs_data.Append(lstate.append_state, chunk);
@@ -105,14 +62,6 @@ SinkResultType GPUPhysicalCTE::Sink(GPUIntermediateRelation &input_relation) con
 	}
     return SinkResultType::FINISHED;
 }
-
-// SinkCombineResultType PhysicalCTE::Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const {
-// 	auto &lstate = input.local_state.Cast<CTELocalState>();
-// 	auto &gstate = input.global_state.Cast<CTEGlobalState>();
-// 	gstate.MergeIT(lstate.lhs_data);
-
-// 	return SinkCombineResultType::FINISHED;
-// }
 
 //===--------------------------------------------------------------------===//
 // Pipeline Construction
@@ -137,12 +86,5 @@ void GPUPhysicalCTE::BuildPipelines(GPUPipeline &current, GPUMetaPipeline &meta_
 vector<const_reference<GPUPhysicalOperator>> GPUPhysicalCTE::GetSources() const {
 	return children[1]->GetSources();
 }
-
-// InsertionOrderPreservingMap<string> GPUPhysicalCTE::ParamsToString() const {
-// 	InsertionOrderPreservingMap<string> result;
-// 	result["CTE Name"] = ctename;
-// 	result["Table Index"] = StringUtil::Format("%llu", table_index);
-// 	return result;
-// }
 
 } // namespace duckdb

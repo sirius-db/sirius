@@ -28,32 +28,8 @@
 
 namespace duckdb {
 
-// class GPULeftDelimJoinGlobalState : public GlobalSinkState {
-// public:
-// 	explicit GPULeftDelimJoinGlobalState(ClientContext &context, const GPUPhysicalLeftDelimJoin &delim_join)
-// 	    : lhs_data(context, delim_join.children[0]->GetTypes()) {
-// 		D_ASSERT(!delim_join.delim_scans.empty());
-// 		// set up the delim join chunk to scan in the original join
-// 		auto &cached_chunk_scan = delim_join.join->children[0]->Cast<GPUPhysicalColumnDataScan>();
-// 		cached_chunk_scan.intermediate_relation = lhs_data;
-// 	}
-
-// 	shared_ptr<GPUIntermediateRelation> lhs_data;
-// 	mutex lhs_lock;
-
-// 	void Merge(ColumnDataCollection &input) {
-// 		lock_guard<mutex> guard(lhs_lock);
-// 		lhs_data.Combine(input);
-// 	}
-// };
-
 class GPULeftDelimJoinLocalState : public LocalSinkState {
 public:
-	// explicit GPULeftDelimJoinLocalState(ClientContext &context, const GPUPhysicalLeftDelimJoin &delim_join)
-	//     : lhs_data(context, delim_join.children[0]->GetTypes()) {
-	// 	lhs_data.InitializeAppend(append_state);
-	// }
-
 	unique_ptr<LocalSinkState> distinct_state;
 	shared_ptr<GPUIntermediateRelation> lhs_data;
 	ColumnDataAppendState append_state;
@@ -62,8 +38,6 @@ public:
 	// 	lhs_data.Append(input);
 	// }
 };
-
-// class GPURightDelimJoinGlobalState : public GlobalSinkState {};
 
 class GPURightDelimJoinLocalState : public LocalSinkState {
 public:
@@ -113,10 +87,6 @@ GPUPhysicalLeftDelimJoin::GPUPhysicalLeftDelimJoin(vector<LogicalType> types, un
 	join->children[0] = std::move(cached_chunk_scan);
 }
 
-// SinkResultType 
-// GPUPhysicalRightDelimJoin::Sink(ExecutionContext &context, GPUIntermediateRelation &input_relation,
-//                                             OperatorSinkInput &input) const {
-
 SinkResultType 
 GPUPhysicalRightDelimJoin::Sink(GPUIntermediateRelation &input_relation) const {
 	// auto &lstate = input.local_state.Cast<GPURightDelimJoinLocalState>();
@@ -133,10 +103,6 @@ GPUPhysicalRightDelimJoin::Sink(GPUIntermediateRelation &input_relation) const {
 
 	return SinkResultType::FINISHED;
 }
-
-// SinkResultType 
-// GPUPhysicalLeftDelimJoin::Sink(ExecutionContext &context, GPUIntermediateRelation &input_relation,
-//                                            OperatorSinkInput &input) const {
 
 SinkResultType 
 GPUPhysicalLeftDelimJoin::Sink(GPUIntermediateRelation &input_relation) const {

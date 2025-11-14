@@ -119,45 +119,6 @@ SinkResultType GPUPhysicalTopN::Sink(GPUIntermediateRelation& input_relation) co
 	return SinkResultType::FINISHED;
 }
 
-// //===--------------------------------------------------------------------===//
-// // Combine
-// //===--------------------------------------------------------------------===//
-// SinkCombineResultType PhysicalTopN::Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const {
-// 	auto &gstate = input.global_state.Cast<TopNGlobalState>();
-// 	auto &lstate = input.local_state.Cast<TopNLocalState>();
-
-// 	// scan the local top N and append it to the global heap
-// 	lock_guard<mutex> glock(gstate.lock);
-// 	gstate.heap.Combine(lstate.heap);
-
-// 	return SinkCombineResultType::FINISHED;
-// }
-
-// //===--------------------------------------------------------------------===//
-// // Finalize
-// //===--------------------------------------------------------------------===//
-// SinkFinalizeType PhysicalTopN::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
-//                                         OperatorSinkFinalizeInput &input) const {
-// 	auto &gstate = input.global_state.Cast<TopNGlobalState>();
-// 	// global finalize: compute the final top N
-// 	gstate.heap.Finalize();
-// 	return SinkFinalizeType::READY;
-// }
-
-//===--------------------------------------------------------------------===//
-// Source
-//===--------------------------------------------------------------------===//
-// class TopNOperatorState : public GlobalSourceState {
-// public:
-// 	TopNScanState state;
-// 	bool initialized = false;
-// };
-
-// unique_ptr<GlobalSourceState> PhysicalTopN::GetGlobalSourceState(ClientContext &context) const {
-// 	return make_uniq<TopNOperatorState>();
-// }
-
-// SourceResultType PhysicalTopN::GetData(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &input) const {
 SourceResultType GPUPhysicalTopN::GetData(GPUIntermediateRelation& output_relation) const {
 	auto start = std::chrono::high_resolution_clock::now();
 	if (limit == 0) {

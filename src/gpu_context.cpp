@@ -38,29 +38,6 @@
 
 namespace duckdb {
 
-// unique_ptr<LogicalOperator> ExtractPlanFromRelation(ClientContext &context, shared_ptr<Relation> relation) {
-// 	auto relation_stmt = make_uniq<RelationStatement>(relation);
-// 	unique_ptr<SQLStatement> statements = std::move(relation_stmt);
-
-// 	unique_ptr<LogicalOperator> plan;
-// 	Planner planner(context);
-// 	planner.CreatePlan(std::move(statements));
-// 	D_ASSERT(planner.plan);
-
-// 	plan = std::move(planner.plan);
-
-// 	Optimizer optimizer(*planner.binder, context);
-// 	plan = optimizer.Optimize(std::move(plan));
-
-// 	ColumnBindingResolver resolver;
-// 	resolver.Verify(*plan);
-// 	resolver.VisitOperator(*plan);
-
-// 	plan->ResolveOperatorTypes();
-
-// 	return plan;
-// }
-
 void GPUBindPreparedStatementParameters(PreparedStatementData &statement, const PendingQueryParameters &parameters) {
 	case_insensitive_map_t<BoundParameterData> owned_values;
 	// if (parameters.parameters) {

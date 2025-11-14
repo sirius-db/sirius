@@ -99,14 +99,6 @@ public:
 
 	template <class T>
 	unique_ptr<T> GPUErrorResult(ErrorData error, const string &query = string());
-
-// protected:
-// 	//! Whether or not execution was successful
-// 	bool success;
-// 	//! The error (in case execution was not successful)
-// 	ErrorData error;
-
-// 	bool HasError() const;
 };
 
 } // namespace duckdb

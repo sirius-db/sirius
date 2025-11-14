@@ -44,7 +44,6 @@ GPUExecutor::Reset() {
 	total_pipelines = 0;
 	// error_manager.Reset();
 	pipelines.clear();
-	// gpuBufferManager->ResetBuffer();
 	// events.clear();
 	// to_be_rescheduled_tasks.clear();
 	// execution_result = PendingExecutionResult::RESULT_NOT_READY;
@@ -217,11 +216,6 @@ void GPUExecutor::InitializeInternal(GPUPhysicalOperator &plan) {
 		// set root pipelines, i.e., all pipelines that end in the final sink
 		root_pipeline->GetPipelines(root_pipelines, false);		
 		root_pipeline_idx = 0;
-		// for (auto &pipeline : root_pipelines) {
-		// 	auto type = pipeline->source.get()->type;
-		// 	SIRIUS_LOG_DEBUG("root pipeline operators size = {}", pipeline->operators.size());
-		//	SIRIUS_LOG_DEBUG("root pipeline source type {}", PhysicalOperatorToString(type));
-		// }
 
 		// collect all meta-pipelines from the root pipeline
 		vector<shared_ptr<GPUMetaPipeline>> to_schedule;
@@ -290,27 +284,8 @@ void GPUExecutor::InitializeInternal(GPUPhysicalOperator &plan) {
 
 void 
 GPUExecutor::CancelTasks() {
-	// task.reset();
-
-	// {
-	// 	lock_guard<mutex> elock(executor_lock);
-	// 	// mark the query as cancelled so tasks will early-out
-	// 	cancelled = true;
-		// destroy all pipelines, events and states
-		// TODO: SUPPORT RECURSIVE CTE FOR GPU
-		// for (auto &rec_cte_ref : recursive_ctes) {
-		// 	auto &rec_cte = rec_cte_ref.get().Cast<PhysicalRecursiveCTE>();
-		// 	rec_cte.recursive_meta_pipeline.reset();
-		// }
 		pipelines.clear();
 		root_pipelines.clear();
-	// 	to_be_rescheduled_tasks.clear();
-	// 	events.clear();
-	// }
-	// // Take all pending tasks and execute them until they cancel
-	// while (executor_tasks > 0) {
-	// 	WorkOnTasks();
-	// }
 }
 
 shared_ptr<GPUPipeline> 
@@ -344,13 +319,10 @@ GPUExecutor::GetResult() {
 	D_ASSERT(HasResultCollector());
 	if (!gpu_physical_plan) throw InvalidInputException("gpu_physical_plan is NULL");
 	if (gpu_physical_plan.get() == NULL) throw InvalidInputException("gpu_physical_plan is NULL");
-	// auto &result_collector = gpu_physical_plan.get()->Cast<GPUPhysicalResultCollector>();
 	auto &result_collector = gpu_physical_plan.get()->Cast<GPUPhysicalMaterializedCollector>();
 	D_ASSERT(result_collector.sink_state);
-	// SIRIUS_LOG_DEBUG("we are getting result");
 	result_collector.sink_state = result_collector.GetGlobalSinkState(context);
 	unique_ptr<QueryResult> res = result_collector.GetResult(*(result_collector.sink_state));
-	// SIRIUS_LOG_DEBUG("we can get result");
 	return res;
 }
 

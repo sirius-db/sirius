@@ -24,9 +24,6 @@
 
 namespace duckdb {
 
-// template <typename T>
-// void ungroupedAggregate(uint8_t **a, uint8_t **result, uint64_t N, int* agg_mode, int num_aggregates);
-
 void cudf_aggregate(vector<shared_ptr<GPUColumn>>& column, uint64_t num_aggregates, AggregationType* agg_mode);
 
 class GPUPhysicalUngroupedAggregate : public GPUPhysicalOperator {
@@ -42,9 +39,6 @@ public:
 	unique_ptr<DistinctAggregateCollectionInfo> distinct_collection_info;
 	shared_ptr<GPUIntermediateRelation> aggregation_result;
 
-// public:
-// 	// Source interface
-	// SourceResultType GetData(ExecutionContext &context, GPUIntermediateRelation &output_relation, OperatorSourceInput &input) const override;
 	SourceResultType GetData(GPUIntermediateRelation& output_relation) const override;
 
 	bool IsSource() const override {
@@ -52,17 +46,7 @@ public:
 	}
 
 public:
-	// Sink interface
-	// SinkResultType Sink(ExecutionContext &context, GPUIntermediateRelation &input_relation, OperatorSinkInput &input) const override;
 	SinkResultType Sink(GPUIntermediateRelation &input_relation) const override;
-	// SinkCombineResultType Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const override;
-	// SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
-	//                           OperatorSinkFinalizeInput &input) const override;
-
-	// unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const override;
-	// unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
-
-	// string ParamsToString() const override;
 
 	bool IsSink() const override {
 		return true;
@@ -72,16 +56,6 @@ public:
 		return true;
 	}
 
-	// bool SinkOrderDependent() const override;
-
-// private:
-	// //! Finalize the distinct aggregates
-	// SinkFinalizeType FinalizeDistinct(Pipeline &pipeline, Event &event, ClientContext &context,
-	//                                   GlobalSinkState &gstate) const;
-	// //! Combine the distinct aggregates
-	// void CombineDistinct(ExecutionContext &context, OperatorSinkCombineInput &input) const;
-	// //! Sink the distinct aggregates
-	// void SinkDistinct(ExecutionContext &context, GPUIntermediateRelation &input_relation, OperatorSinkInput &input) const;
 	void MaterializeDistinctInput(GPUIntermediateRelation &input_relation, vector<shared_ptr<GPUColumn>>& aggregate_column) const;
     
 };

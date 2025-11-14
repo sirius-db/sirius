@@ -46,11 +46,6 @@ public:
 	// Sink interface
 	SinkResultType Sink(GPUIntermediateRelation &input_relation) const override;
 
-	// unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
-	// unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const override;
-
-	// SinkCombineResultType Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const override;
-
 	bool IsSink() const override {
 		return true;
 	}
@@ -62,8 +57,6 @@ public:
 	bool SinkOrderDependent() const override {
 		return false;
 	}
-
-	// InsertionOrderPreservingMap<string> ParamsToString() const override;
 
 public:
 	void BuildPipelines(GPUPipeline &current, GPUMetaPipeline &meta_pipeline) override;

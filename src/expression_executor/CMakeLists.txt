@@ -25,5 +25,6 @@ set(EXTENSION_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/specializations/gpu_execute_function.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/specializations/gpu_execute_operator.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/specializations/gpu_execute_reference.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/regex/regex_playground.cpp
         PARENT_SCOPE
 )

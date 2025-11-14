@@ -43,6 +43,9 @@ struct Config {
 
   // For checking whether to fall back to duckdb execution
   static bool ENABLE_FALLBACK_CHECK;
+
+  // Whether to use special JIT implementation for particular regex evaluation
+  static bool ENABLE_REGEX_JIT_IMPL;
 };
 
 }

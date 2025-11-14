@@ -17,7 +17,6 @@
 #pragma once
 
 #include "duckdb/common/common.hpp"
-// #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/planner/logical_operator.hpp"
 #include "duckdb/planner/logical_tokens.hpp"
 #include "duckdb/planner/joinside.hpp"

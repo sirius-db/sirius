@@ -37,30 +37,6 @@ GPUPhysicalResultCollector::GPUPhysicalResultCollector(GPUPreparedStatementData 
 	gpuBufferManager = &(GPUBufferManager::GetInstance());
 }
 
-// unique_ptr<GPUPhysicalResultCollector> GPUPhysicalResultCollector::GetResultCollector(ClientContext &context,
-//                                                                                 PreparedStatementData &data) {
-// 	if (!PhysicalPlanGenerator::PreserveInsertionOrder(context, *data.plan)) {
-// 		// the plan is not order preserving, so we just use the parallel materialized collector
-// 		if (data.is_streaming) {
-// 			return make_uniq_base<GPUPhysicalResultCollector, PhysicalBufferedCollector>(data, true);
-// 		}
-// 		return make_uniq_base<PhysicalResultCollector, PhysicalMaterializedCollector>(data, true);
-// 	} else if (!PhysicalPlanGenerator::UseBatchIndex(context, *data.plan)) {
-// 		// the plan is order preserving, but we cannot use the batch index: use a single-threaded result collector
-// 		if (data.is_streaming) {
-// 			return make_uniq_base<GPUPhysicalResultCollector, PhysicalBufferedCollector>(data, false);
-// 		}
-// 		return make_uniq_base<PhysicalResultCollector, PhysicalMaterializedCollector>(data, false);
-// 	} else {
-// 		// we care about maintaining insertion order and the sources all support batch indexes
-// 		// use a batch collector
-// 		if (data.is_streaming) {
-// 			return make_uniq_base<GPUPhysicalResultCollector, PhysicalBufferedCollector>(data, false);
-// 		}
-// 		return make_uniq_base<GPUPhysicalResultCollector, PhysicalBatchCollector>(data);
-// 	}
-// }
-
 vector<const_reference<GPUPhysicalOperator>> 
 GPUPhysicalResultCollector::GetChildren() const {
 	return {plan};

@@ -116,12 +116,6 @@ public:
 
 	map<string, shared_ptr<GPUIntermediateRelation>> tables;
 
-	// DataWrapper allocateChunk(DataChunk &input);
-	// DataWrapper allocateColumnBufferInCPU(unique_ptr<MaterializedQueryResult> input);
-	// DataWrapper allocateStringChunk(DataChunk &input_chunk, size_t row_count, DataWrapper &prev_data);
-	// void cacheDataInGPU(DataWrapper cpu_data, string table_name, string column_name, int gpu);
-	// DataWrapper allocateColumnBufferInGPU(DataWrapper cpu_data, int gpu);
-	// DataWrapper allocateStrColumnInGPU(DataWrapper cpu_data, int gpu);
 	void lockAllocation(void* ptr, int gpu);
 
 	void createTableAndColumnInGPU(Catalog& catalog, ClientContext& context, string table_name, string column_name);

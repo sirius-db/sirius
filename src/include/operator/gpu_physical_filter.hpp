@@ -28,26 +28,22 @@ public:
 	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::FILTER;
 
 public:
-	// GPUPhysicalFilter(vector<LogicalType> types, vector<unique_ptr<Expression>> select_list, idx_t estimated_cardinality);
-
     GPUPhysicalFilter(vector<LogicalType> types, vector<unique_ptr<Expression>> select_list, idx_t estimated_cardinality);
 
-// 	//! The filter expression
+ 	//! The filter expression
 	unique_ptr<Expression> expression;
 
-  // GPUExpressionExecutor* gpu_expression_executor;
+  	// GPUExpressionExecutor* gpu_expression_executor;
 
-// public:
-// 	unique_ptr<OperatorState> GetOperatorState(ExecutionContext &context) const override;
+	// public:
+	// 	unique_ptr<OperatorState> GetOperatorState(ExecutionContext &context) const override;
 
-// 	bool ParallelOperator() const override {
-// 		return true;
-// 	}
+	// 	bool ParallelOperator() const override {
+	// 		return true;
+	// 	}
 
-// 	string ParamsToString() const override;
+	// 	string ParamsToString() const override;
 
-	// OperatorResultType Execute(ExecutionContext &context, GPUIntermediateRelation &input, GPUIntermediateRelation &chunk,
-	//                                    GlobalOperatorState &gstate, OperatorState &state) const override;
 	OperatorResultType Execute(GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation) const override;
 };
 } // namespace duckdb

@@ -16,21 +16,18 @@
 
 #pragma once
 
-#include "gpu_physical_operator.hpp"
-#include "duckdb/planner/expression.hpp"
+#include <cudf/column/column_factories.hpp>
+#include <cudf/transform.hpp>
+#include <cudf/copying.hpp>
+#include <rmm/cuda_stream_view.hpp>
 
-namespace duckdb {
+namespace sirius {
+namespace expression {
 
-class GPUPhysicalProjection : public GPUPhysicalOperator {
+class regex_playground {
 public:
-	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::PROJECTION;
-
-public:
-	GPUPhysicalProjection(vector<LogicalType> types, vector<unique_ptr<Expression>> select_list,
-	                   idx_t estimated_cardinality);
-
-	vector<unique_ptr<Expression>> select_list;
-
-	OperatorResultType Execute(GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation) const override;
+    static std::unique_ptr<cudf::column> jit_transform_clickbench_q28_regex(const cudf::column_view& input);
 };
-} // namespace duckdb
+
+} // namespace expression
+} // namespace sirius

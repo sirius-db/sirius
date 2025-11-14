@@ -557,6 +557,11 @@ static void SetEnableFallbackCheck(ClientContext &context, SetScope scope, Value
 	SIRIUS_LOG_DEBUG("Updated config ENABLE_FALLBACK_CHECK to {}", Config::ENABLE_FALLBACK_CHECK);
 }
 
+static void SetEnableRegexJitImpl(ClientContext &context, SetScope scope, Value &parameter) {
+    Config::ENABLE_REGEX_JIT_IMPL = BooleanValue::Get(parameter);
+    SIRIUS_LOG_DEBUG("Updated config ENABLE_REGEX_JIT_IMPL to {}", Config::ENABLE_REGEX_JIT_IMPL);
+}
+
 void SiriusExtension::InitialGPUConfigs(DuckDB &db) {
 	auto &config = DBConfig::GetConfig(*db.instance);
 
@@ -587,6 +592,10 @@ void SiriusExtension::InitialGPUConfigs(DuckDB &db) {
 	// Add in config options for duckdb fallback checking
 	config.AddExtensionOption("enable_fallback_check", "Whether to enable checking of fallback to duckdb execution", LogicalType::BOOLEAN, 
 		Value::BOOLEAN(Config::ENABLE_FALLBACK_CHECK), SetEnableFallbackCheck);
+
+    // Add in config options for special JIT implemention for regex
+    config.AddExtensionOption("enable_regex_jit_impl", "Whether to use special JIT implementation for particular regex evaluation", LogicalType::BOOLEAN, 
+		Value::BOOLEAN(Config::ENABLE_REGEX_JIT_IMPL), SetEnableRegexJitImpl);
 }
 
 void SiriusExtension::Load(DuckDB &db) {

@@ -22,6 +22,7 @@
 #include "expression_executor/gpu_dispatcher.hpp"
 #include "expression_executor/gpu_expression_executor.hpp"
 #include "expression_executor/gpu_expression_executor_state.hpp"
+#include "expression_executor/regex/regex_playground.hpp"
 #include "gpu_physical_strings_matching.hpp"
 #include "log/logging.hpp"
 #include <cudf/binaryop.hpp>
@@ -589,6 +590,11 @@ struct RegexFunctionDispatcher {
     std::string replace_str = expr.children[2]->Cast<BoundConstantExpression>().value.GetValue<std::string>();
     bool has_backrefs = std::regex_search(replace_str, std::regex(R"(\\[0-9])"));
     if (has_backrefs) {
+      if (Config::ENABLE_REGEX_JIT_IMPL) {
+        if (pattern_str == R"(^https?://(?:www\.)?([^/]+)/.*$)" && replace_str == R"(\1)") {
+          return ::sirius::expression::regex_playground::jit_transform_clickbench_q28_regex(input_cudf_column->view());
+        }
+      }
       auto regex_prog = cudf::strings::regex_program::create(std::string_view(pattern_str));
       return cudf::strings::replace_with_backrefs(cudf::strings_column_view(input_cudf_column->view()),
                                                   *regex_prog,
