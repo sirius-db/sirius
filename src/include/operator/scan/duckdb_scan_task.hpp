@@ -92,11 +92,9 @@ class duckdb_scan_task_global_state : public itask_global_state, public duckdb::
 
   unique_ptr<duckdb::GlobalTableFunctionState>
     global_tf_state;                    ///< Global state for the table function
-  unique_ptr<duckdb::LocalTableFunctionState>
-    shared_local_tf_state;              ///< Shared local state for sequential scanning
   duckdb_scan_executor& scan_executor;  ///< The scan executor executing this scan task
   const duckdb::PhysicalTableScan& op;  ///< The physical table scan being executed
-  
+
   std::mutex scan_mutex;  ///< Mutex to protect table function calls
 };
 
@@ -405,8 +403,8 @@ class duckdb_scan_task_local_state : public itask_local_state {
   duckdb_scan_task_local_state(
     duckdb_scan_task_global_state& g_state,
     duckdb::ExecutionContext& exec_ctx,
-    size_t approximate_batch_size                        = DEFAULT_APPROXIMATE_BATCH_SIZE,
-    size_t default_varchar_size                          = DEFAULT_VARCHAR_SIZE,
+    size_t approximate_batch_size = DEFAULT_APPROXIMATE_BATCH_SIZE,
+    size_t default_varchar_size   = DEFAULT_VARCHAR_SIZE,
     unique_ptr<duckdb::LocalTableFunctionState> existing_local_tf_state = nullptr);
 
   //===----------Fields----------===//
