@@ -621,6 +621,20 @@ static void SetModifiedPipeline(ClientContext& context, SetScope scope, Value& p
   SIRIUS_LOG_DEBUG("Updated config MODIFIED_PIPELINE to {}", Config::MODIFIED_PIPELINE);
 }
 
+static void SetDefaultScanTaskBatchSize(ClientContext& context, SetScope scope, Value& parameter)
+{
+  Config::DEFAULT_SCAN_TASK_BATCH_SIZE = UBigIntValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config DEFAULT_SCAN_TASK_BATCH_SIZE to {}",
+                   Config::DEFAULT_SCAN_TASK_BATCH_SIZE);
+}
+
+static void SetDefaultScanTaskVarcharSize(ClientContext& context, SetScope scope, Value& parameter)
+{
+  Config::DEFAULT_SCAN_TASK_VARCHAR_SIZE = UBigIntValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config DEFAULT_SCAN_TASK_VARCHAR_SIZE to {}",
+                   Config::DEFAULT_SCAN_TASK_VARCHAR_SIZE);
+}
+
 void SiriusExtension::InitialGPUConfigs(DuckDB& db)
 {
   auto& config = DBConfig::GetConfig(*db.instance);
@@ -691,6 +705,21 @@ void SiriusExtension::InitialGPUConfigs(DuckDB& db)
                             LogicalType::BOOLEAN,
                             Value::BOOLEAN(Config::MODIFIED_PIPELINE),
                             SetModifiedPipeline);
+
+  // Add in config options for duckdb scan task
+  // Default batch size
+  config.AddExtensionOption("default_scan_task_batch_size",
+                            "The default batch size for a duckdb scan task",
+                            LogicalType::UBIGINT,
+                            Value::UBIGINT(Config::DEFAULT_SCAN_TASK_BATCH_SIZE),
+                            SetDefaultScanTaskBatchSize);
+  // Default varchar size for estimating rows per batch
+  config.AddExtensionOption(
+    "default_scan_task_varchar_size",
+    "The default varchar size for estimating rows per batch in a duckdb scan task",
+    LogicalType::UBIGINT,
+    Value::UBIGINT(Config::DEFAULT_SCAN_TASK_VARCHAR_SIZE),
+    SetDefaultScanTaskVarcharSize);
 }
 
 void SiriusExtension::Load(DuckDB& db)

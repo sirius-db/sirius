@@ -17,8 +17,7 @@
 #pragma once
 
 // sirius
-#include "duckdb/main/connection.hpp"
-
+#include <config.hpp>
 #include <data/data_repository_manager.hpp>
 #include <memory/fixed_size_host_memory_resource.hpp>
 #include <memory/memory_reservation.hpp>
@@ -270,11 +269,6 @@ struct multiple_blocks_allocation_accessor {
  *
  */
 class duckdb_scan_task_local_state : public itask_local_state {
-  static constexpr size_t DEFAULT_APPROXIMATE_BATCH_SIZE = 2ULL * 1024 * 1024 * 1024;  ///< 2 GB
-
-  // The following VARCHAR size is selected to accommodate all CHAR/VARCHAR TPC-H columns.
-  static constexpr size_t DEFAULT_VARCHAR_SIZE = 256ULL;  ///< 256 bytes
-
  public:
   using multiple_blocks_allocation =
     memory::fixed_size_host_memory_resource::multiple_blocks_allocation;
@@ -403,8 +397,8 @@ class duckdb_scan_task_local_state : public itask_local_state {
   duckdb_scan_task_local_state(
     duckdb_scan_task_global_state& g_state,
     duckdb::ExecutionContext& exec_ctx,
-    size_t approximate_batch_size = DEFAULT_APPROXIMATE_BATCH_SIZE,
-    size_t default_varchar_size   = DEFAULT_VARCHAR_SIZE,
+    size_t approximate_batch_size = duckdb::Config::DEFAULT_SCAN_TASK_BATCH_SIZE,
+    size_t default_varchar_size   = duckdb::Config::DEFAULT_SCAN_TASK_VARCHAR_SIZE,
     unique_ptr<duckdb::LocalTableFunctionState> existing_local_tf_state = nullptr);
 
   //===----------Fields----------===//
