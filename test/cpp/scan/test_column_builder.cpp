@@ -273,6 +273,69 @@ TEST_CASE("column_builder - process_mask_for_column", "[duckdb_scan_task][column
     // Bit 5 should be 0 (invalid)
     REQUIRE((mask_byte_0 & (1 << 5)) == 0);
   }
+
+  SECTION("has_nulls flag is set when validity mask data pointer is not null")
+  {
+    auto int_type = duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER);
+    duckdb_scan_task_local_state::column_builder builder(int_type);
+
+    builder.reserve_memory(100);
+    builder.allocate_memory();
+
+    // Initially, has_nulls should be false
+    REQUIRE(builder.has_nulls == false);
+
+    // Create a validity mask with actual NULLs
+    duckdb::ValidityMask validity_with_nulls(10);
+    validity_with_nulls.Initialize(10);
+    validity_with_nulls.SetAllValid(10);
+    validity_with_nulls.SetInvalid(5);  // Row 5 is NULL
+
+    // Process the mask - has_nulls should be set to true because mask pointer is not null
+    builder.process_mask_for_column(validity_with_nulls, 10, 0);
+    REQUIRE(builder.has_nulls == true);
+  }
+
+  SECTION("has_nulls flag is set even when all rows are valid (mask pointer not null)")
+  {
+    auto int_type = duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER);
+    duckdb_scan_task_local_state::column_builder builder(int_type);
+
+    builder.reserve_memory(100);
+    builder.allocate_memory();
+
+    // Initially, has_nulls should be false
+    REQUIRE(builder.has_nulls == false);
+
+    // Create a validity mask with all valid rows but initialized (GetData() != nullptr)
+    duckdb::ValidityMask validity_all_valid(10);
+    validity_all_valid.Initialize(10);
+    validity_all_valid.SetAllValid(10);
+
+    // Process the mask - has_nulls should be set to true because mask pointer is not null
+    // even though all rows are actually valid
+    builder.process_mask_for_column(validity_all_valid, 10, 0);
+    REQUIRE(builder.has_nulls == true);
+  }
+
+  SECTION("has_nulls flag remains false when validity mask data pointer is null")
+  {
+    auto int_type = duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER);
+    duckdb_scan_task_local_state::column_builder builder(int_type);
+
+    builder.reserve_memory(100);
+    builder.allocate_memory();
+
+    // Initially, has_nulls should be false
+    REQUIRE(builder.has_nulls == false);
+
+    // Create a validity mask without initializing (GetData() will return nullptr)
+    duckdb::ValidityMask validity_null_ptr;
+
+    // Process the mask - has_nulls should remain false because mask pointer is null
+    builder.process_mask_for_column(validity_null_ptr, 10, 0);
+    REQUIRE(builder.has_nulls == false);
+  }
 }
 
 //===----------------------------------------------------------------------===//

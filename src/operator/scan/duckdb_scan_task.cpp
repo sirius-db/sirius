@@ -23,8 +23,6 @@
 #include <duckdb/common/types.hpp>
 #include <duckdb/function/table_function.hpp>
 
-#include <stdexcept>
-
 namespace sirius::parallel {
 
 //===----------------------------------------------------------------------===//
@@ -193,6 +191,7 @@ void duckdb_scan_task_local_state::column_builder::process_mask_for_column(
     return;
   }
   // condition: src_valid != nullptr
+  has_nulls = true;
   if (cur_bit == 0) {
     // Byte aligned case
     auto const full_bytes = utils::div_8(num_bits);

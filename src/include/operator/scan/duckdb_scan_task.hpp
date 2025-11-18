@@ -291,6 +291,7 @@ class duckdb_scan_task_local_state : public itask_local_state {
     size_t type_size;  ///< Size of the column data type in bytes (only used for NON-VARCHAR)
     size_t total_data_bytes =
       0;  ///< Total number of data bytes written for this column (only needed for VARCHAR)
+    bool has_nulls = false;  ///< Whether the column has NULL values
 
     // The memory reservations
     struct memory::any_memory_space_in_tier res_request =
