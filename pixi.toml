@@ -1,0 +1,29 @@
+[workspace]
+channels = ["rapidsai", "conda-forge"]
+name = "sirius"
+platforms = ["linux-64", "linux-aarch64"]
+requires-pixi = "0.59.*"
+
+[system-requirements]
+cuda = "13"
+
+[activation]
+scripts = ["setup_test_datasets.sh"]
+
+[activation.env]
+LIBCUDF_ENV_PREFIX = "$CONDA_PREFIX"
+
+[dependencies]
+cmake = "4.1.*"
+cuda-nvcc = "*"
+cuda-version = "13.*"
+cxx-compiler = "*"
+make = "*"
+ninja = "*"
+sccache = "*"
+unzip = "*"
+
+libcudf = "25.10.*"
+libcurand-dev = "*"
+
+[tasks]

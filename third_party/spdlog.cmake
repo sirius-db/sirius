@@ -27,7 +27,7 @@ ExternalProject_Add(${SPDLOG_BASE}
         UPDATE_DISCONNECTED TRUE
         BUILD_BYPRODUCTS ${SPDLOG_STATIC_LIB}
         CMAKE_ARGS
-        -SPDLOG_BUILD_SHARED:BOOL=OFF
+        -DSPDLOG_BUILD_SHARED:BOOL=OFF
         -DSPDLOG_BUILD_EXAMPLE:BOOL=OFF
         -DSPDLOG_BUILD_TESTS:BOOL=OFF
         -DSPDLOG_BUILD_BENCH:BOOL=OFF
@@ -37,7 +37,7 @@ ExternalProject_Add(${SPDLOG_BASE}
         -DCMAKE_INSTALL_PREFIX=${SPDLOG_INSTALL_DIR}
         )
 
-file(MAKE_DIRECTORY ${SPDLOG_INCLUDE_DIR}) # Include directory needs to exist to run configure 
+file(MAKE_DIRECTORY ${SPDLOG_INCLUDE_DIR}) # Include directory needs to exist to run configure
 
 add_library(spdlog::spdlog STATIC IMPORTED)
 set_target_properties(spdlog::spdlog PROPERTIES IMPORTED_LOCATION ${SPDLOG_STATIC_LIB})

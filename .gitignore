@@ -24,3 +24,6 @@ cufile.log
 *result.csv
 *output.txt
 *.tsv
+# pixi environments
+.pixi/*
+!.pixi/config.toml

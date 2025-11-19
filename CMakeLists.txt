@@ -31,7 +31,8 @@ else()
 endif()
 
 # Set CUDA architecture and flags
-set(CMAKE_CUDA_ARCHITECTURES native)
+# Following https://github.com/rapidsai/rapids-cmake/blob/84f8cf8386ac56e3f4f9400f44e752345d8c2997/rapids-cmake/cuda/set_architectures.cmake#L62
+set(CMAKE_CUDA_ARCHITECTURES 75-real 80-real 86-real 90a-real 100f-real 120a-real 120)
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-extended-lambda --expt-relaxed-constexpr -rdc=true")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++20")
 
@@ -45,9 +46,9 @@ include_directories(
     src/include
     src/include/operator
 )
-include_directories(duckdb/extension_external/substrait/src/include)
-include_directories(${TARGET_NAME} duckdb/extension_external/substrait/third_party/substrait)
-include_directories(${TARGET_NAME} duckdb/extension_external/substrait/third_party)
+include_directories(substrait/src/include)
+include_directories(${TARGET_NAME} substrait/third_party/substrait)
+include_directories(${TARGET_NAME} substrait/third_party)
 
 set(EXTENSION_SOURCES
   src/sirius_extension.cpp
@@ -74,8 +75,8 @@ add_subdirectory(src/operator)
 add_subdirectory(src/plan)
 add_subdirectory(src/data)
 
-set(CUDA_SOURCES 
-  src/cuda/communication.cu 
+set(CUDA_SOURCES
+  src/cuda/communication.cu
   src/cuda/allocator.cu
   src/cuda/print.cu
   src/cuda/utils.cu
@@ -117,12 +118,12 @@ set_target_properties(${LOADABLE_EXTENSION_NAME} PROPERTIES CUDA_SEPARABLE_COMPI
 
 target_link_libraries(${EXTENSION_NAME}
   substrait_extension
-  cudf::cudf 
+  cudf::cudf
   rmm::rmm
 )
-target_link_libraries(${LOADABLE_EXTENSION_NAME} 
+target_link_libraries(${LOADABLE_EXTENSION_NAME}
   substrait_extension
-  cudf::cudf 
+  cudf::cudf
   rmm::rmm
 )
 
