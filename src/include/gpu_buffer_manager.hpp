@@ -119,6 +119,9 @@ public:
 	void lockAllocation(void* ptr, int gpu);
 
 	void createTableAndColumnInGPU(Catalog& catalog, ClientContext& context, string table_name, string column_name);
+	void createTableAndColumnInGPUDirect(string table_name, string column_name,
+                                      const LogicalType &column_type,
+                                      idx_t column_id, size_t total_columns);
 	void createTable(string table_name, size_t column_count);
 	void createColumn(string table_name, string column_name, GPUColumnType column_type, size_t column_id, vector<size_t> unique_columns);
 	bool checkIfColumnCached(string table_name, string column_name);

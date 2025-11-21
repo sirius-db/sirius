@@ -141,6 +141,31 @@ public:
 	unique_ptr<LocalSourceState> GetLocalSourceState(ExecutionContext &context,
 		GlobalSourceState &gstate) const override;
 	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;
+	// SourceResultType GetData(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &input) const override;
+	// OperatorPartitionData GetPartitionData(ExecutionContext &context, DataChunk &chunk, GlobalSourceState &gstate,
+	// LocalSourceState &lstate,
+	// const OperatorPartitionInfo &partition_info) const override;
+
+	// bool SupportsPartitioning(const OperatorPartitionInfo &partition_info) const override;
+
+	// ProgressData GetProgress(ClientContext &context, GlobalSourceState &gstate) const override;
+
+private:
+
+    // NEW: Cache whether this is a table function
+    bool is_table_function;
+
+    // NEW: Cache the generated table name
+    mutable string cached_table_name;
+
+    // NEW: Helper methods
+    bool IsTableFunction() const;
+    string GetTableName() const;
+    string GenerateTableFunctionName() const;
+
+		//! Helper to find column index by name (for table functions with projected columns)
+	int FindColumnIndexByName(const shared_ptr<GPUIntermediateRelation>& table,
+	                          const string& column_name) const;
 };
 
 } // namespace duckdb

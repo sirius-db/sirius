@@ -455,6 +455,41 @@ GPUBufferManager::createTableAndColumnInGPU(Catalog& catalog, ClientContext& con
     SIRIUS_LOG_DEBUG("Table and column created in GPU");
 }
 
+void GPUBufferManager::createTableAndColumnInGPUDirect(
+    string table_name, string column_name,
+    const LogicalType &column_type, idx_t column_id,
+    size_t total_columns) {
+
+    SIRIUS_LOG_DEBUG("CreateTableAndColumnDirect called for table {} and col {} (total cols: {})", table_name, column_name, total_columns);
+
+    // Convert table_name to uppercase for cache key
+    string up_table_name = table_name;
+    transform(up_table_name.begin(), up_table_name.end(),
+              up_table_name.begin(), ::toupper);
+
+    // Convert column_name to uppercase
+    string up_column_name = column_name;
+    transform(up_column_name.begin(), up_column_name.end(),
+              up_column_name.begin(), ::toupper);
+
+    // Create table with known total column count (same as catalog version)
+    createTable(up_table_name, total_columns);
+
+    // Convert type
+    GPUColumnType gpu_column_type = convertLogicalTypeToColumnType(column_type);
+
+    // Table functions don't have constraints
+    vector<size_t> empty_constraints;
+
+    SIRIUS_LOG_DEBUG("Creating column {} with type {}", up_column_name,
+                     column_type.ToString());
+
+    createColumn(up_table_name, up_column_name, gpu_column_type,
+                 column_id, empty_constraints);
+
+    SIRIUS_LOG_DEBUG("Table and column created in GPU (direct mode)");
+}
+
 void
 GPUBufferManager::createTable(string up_table_name, size_t column_count) {
     //we will update the length later
