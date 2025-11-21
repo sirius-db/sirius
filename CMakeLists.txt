@@ -31,8 +31,9 @@ else()
 endif()
 
 # Set CUDA architecture and flags
-# Following https://github.com/rapidsai/rapids-cmake/blob/84f8cf8386ac56e3f4f9400f44e752345d8c2997/rapids-cmake/cuda/set_architectures.cmake#L62
-set(CMAKE_CUDA_ARCHITECTURES 75-real 80-real 86-real 90a-real 100f-real 120a-real 120)
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+  set(CMAKE_CUDA_ARCHITECTURES native)
+endif()
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-extended-lambda --expt-relaxed-constexpr -rdc=true")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++20")
 
