@@ -46,8 +46,7 @@ GPUPhysicalTableScan::GPUPhysicalTableScan(vector<LogicalType> types, TableFunct
         function(std::move(function_p)), bind_data(std::move(bind_data_p)), returned_types(std::move(returned_types_p)),
         column_ids(std::move(column_ids_p)), projection_ids(std::move(projection_ids_p)), names(std::move(names_p)),
         table_filters(std::move(table_filters_p)), extra_info(extra_info), parameters(std::move(parameters_p)),
-        gen_row_id_column(column_ids.back().GetPrimaryIndex() == DConstants::INVALID_INDEX),
-        is_table_function(IsTableFunction()), cached_table_name("") {
+        gen_row_id_column(column_ids.back().GetPrimaryIndex() == DConstants::INVALID_INDEX) {
     
     auto num_cols = column_ids.size() - gen_row_id_column;
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
@@ -74,7 +73,7 @@ GPUPhysicalTableScan::GPUPhysicalTableScan(vector<LogicalType> types, TableFunct
       }
     }
     SIRIUS_LOG_DEBUG("Table scan column ids: {}", column_ids.size());
-    SIRIUS_LOG_DEBUG("Constructor: is_table_function = {}, function.name = {}", is_table_function, function.name);
+    SIRIUS_LOG_DEBUG("Constructor: is_table_function = {}, function.name = {}", IsTableFunction(), function.name);
 }
 
 // Helper method to detect if this is a table function
@@ -98,15 +97,15 @@ string GPUPhysicalTableScan::GenerateTableFunctionName() const {
 
     // Add projection signature to differentiate column sets
     // Extract ONLY the projected column names (not all table columns)
-    // vector<string> projected_names;
-    // for (const auto& col_id : column_ids) {
-    //     projected_names.push_back(names[col_id.GetPrimaryIndex()]);
-    // }
+    vector<string> projected_names;
+    for (const auto& col_id : column_ids) {
+        projected_names.push_back(names[col_id.GetPrimaryIndex()]);
+    }
     // Sort for consistent hashing across different query orders
-    // sort(projected_names.begin(), projected_names.end());
-    // identifier += "_proj_" + StringUtil::Join(projected_names, "|");
-    // SIRIUS_LOG_INFO("IsTableFunction() called: function.name = {}, identifier = {}",
-    //                   function.name, identifier); 
+    sort(projected_names.begin(), projected_names.end());
+    identifier += "_proj_" + StringUtil::Join(projected_names, "|");
+    SIRIUS_LOG_INFO("IsTableFunction() called: function.name = {}, identifier = {}",
+                      function.name, identifier); 
     // Hash the complete identifier for manageable cache key
     size_t hash_value = hash<string>{}(identifier);
 
@@ -115,27 +114,19 @@ string GPUPhysicalTableScan::GenerateTableFunctionName() const {
 
 // Get table name (either from catalog or generate for table functions)
 string GPUPhysicalTableScan::GetTableName() const {
-    // Return cached name if available
-    if (!cached_table_name.empty()) {
-        return cached_table_name;
-    }
-
-    // Generate or retrieve table name
-    if (is_table_function) {
-        cached_table_name = GenerateTableFunctionName();
+    if (IsTableFunction()) {
+        return GenerateTableFunctionName();
     } else {
-        // For catalog tables, use function.to_string() - safe for non-table-functions
+        // For catalog tables, use function.to_string()
         TableFunctionToStringInput input(function, bind_data.get());
         auto to_string_result = function.to_string(input);
         for (const auto &it : to_string_result) {
             if (it.first.compare("Table") == 0) {
-                cached_table_name = it.second;
-                break;
+                return it.second;
             }
         }
+        return "";  // Fallback
     }
-
-    return cached_table_name;
 }
 
 int GPUPhysicalTableScan::FindColumnIndexByName(
@@ -150,9 +141,8 @@ int GPUPhysicalTableScan::FindColumnIndexByName(
         throw InvalidInputException("Column not found: %s", up_column_name.c_str());
     }
 
-    return column_it - table->column_names.begin();  // Sequential index
+    return column_it - table->column_names.begin();
 }
-
 
 template <typename T>
 void ResolveTypeComparisonConstantExpression (shared_ptr<GPUColumn> column, uint64_t* &count, uint64_t* & row_ids, ConstantFilter filter_constant, ExpressionType expression_type) {
@@ -937,10 +927,10 @@ GPUPhysicalTableScan::GetDataDuckDBOpt(ExecutionContext &exec_context) {
 
     // Create table/columns in gpu and check OOM
     SIRIUS_LOG_DEBUG("GetDataDuckDBOpt creating {} columns for table {} with total cols of {}", num_columns, table_name, column_ids.size());
-    SIRIUS_LOG_DEBUG("is_table_function = {}, function.name = {}", is_table_function, function.name);
+    SIRIUS_LOG_DEBUG("is_table_function = {}, function.name = {}", IsTableFunction(), function.name);
     // Only get catalog for non-table-functions
     Catalog *catalog_ptr = nullptr;
-    if (!is_table_function) {
+    if (!IsTableFunction()) {
       SIRIUS_LOG_DEBUG("NOT a table function - getting catalog");
       catalog_ptr = &Catalog::GetCatalog(exec_context.client, INVALID_CATALOG);
     } else {
@@ -958,26 +948,18 @@ GPUPhysicalTableScan::GetDataDuckDBOpt(ExecutionContext &exec_context) {
       for (int col = 0; col < num_columns; col++) {
         already_cached[col] = false;
         uncached_scan_column_ids.push_back(column_ids[col].GetPrimaryIndex());
-        if (is_table_function) {
-          SIRIUS_LOG_DEBUG("OOM path: Calling createTableAndColumnInGPUDirect for col {}: {}", col, names[column_ids[col].GetPrimaryIndex()]);
-          gpuBufferManager->createTableAndColumnInGPUDirect(table_name, names[column_ids[col].GetPrimaryIndex()], scanned_types[col],col, num_columns);
-          auto it = gpuBufferManager->tables.find(table_name);
-          if (it != gpuBufferManager->tables.end()) {
-          SIRIUS_LOG_DEBUG("Table {} has {} columns after createTableAndColumnInGPUDirect",table_name, it->second->columns.size());
-          }
+        if (IsTableFunction()) {
+          gpuBufferManager->createTableAndColumnInGPU(table_name, names[column_ids[col].GetPrimaryIndex()], scanned_types[col], col, num_columns);
         } else {
-          SIRIUS_LOG_DEBUG("OOM path: Calling createTableAndColumnInGPU (catalog) for col {}: {}", col, names[column_ids[col].GetPrimaryIndex()]);
           gpuBufferManager->createTableAndColumnInGPU(*catalog_ptr, exec_context.client, table_name, names[column_ids[col].GetPrimaryIndex()]);
         }
       }
     } else {
       for (int col = 0; col < num_columns; col++) {
         if (!already_cached[col]) {
-          if (is_table_function) {
-            SIRIUS_LOG_DEBUG("cahe OOM path: Calling createTableAndColumnInGPUDirect for col {}: {}", col, names[column_ids[col].GetPrimaryIndex()]);
-            gpuBufferManager->createTableAndColumnInGPUDirect(table_name, names[column_ids[col].GetPrimaryIndex()], scanned_types[col],col, num_columns);
+          if (IsTableFunction()) {
+            gpuBufferManager->createTableAndColumnInGPU(table_name, names[column_ids[col].GetPrimaryIndex()], scanned_types[col], col, num_columns);
           } else {
-            SIRIUS_LOG_DEBUG("cache OOM path: Calling createTableAndColumnInGPU (catalog) for col {}: {}", col, names[column_ids[col].GetPrimaryIndex()]);
             gpuBufferManager->createTableAndColumnInGPU(*catalog_ptr, exec_context.client, table_name, names[column_ids[col].GetPrimaryIndex()]);
           }
         }
@@ -1265,7 +1247,7 @@ GPUPhysicalTableScan::GetDataDuckDB(ExecutionContext &exec_context) {
 
     // Only get catalog for non-table-functions
     Catalog *catalog_ptr = nullptr;
-    if (!is_table_function) {
+    if (!IsTableFunction()) {
       catalog_ptr = &Catalog::GetCatalog(exec_context.client, INVALID_CATALOG);
     }
 
@@ -1340,9 +1322,8 @@ GPUPhysicalTableScan::GetDataDuckDB(ExecutionContext &exec_context) {
         gpuBufferManager->ResetCache();
         for (int col = 0; col < num_columns; col++) {
           already_cached[col] = false;
-          if (is_table_function) {
-            SIRIUS_LOG_DEBUG("Scan OOM path: Calling createTableAndColumnInGPUDirect for col {}: {}", col, names[column_ids[col].GetPrimaryIndex()]);
-            gpuBufferManager->createTableAndColumnInGPUDirect(table_name, names[column_ids[col].GetPrimaryIndex()], scanned_types[col],col, num_columns);
+          if (IsTableFunction()) {
+            gpuBufferManager->createTableAndColumnInGPU(table_name, names[column_ids[col].GetPrimaryIndex()], scanned_types[col], col, num_columns);
           } else {
             gpuBufferManager->createTableAndColumnInGPU(*catalog_ptr, exec_context.client, table_name, names[column_ids[col].GetPrimaryIndex()]);
           }
@@ -1350,9 +1331,8 @@ GPUPhysicalTableScan::GetDataDuckDB(ExecutionContext &exec_context) {
       } else {
           for (int col = 0; col < num_columns; col++) {
               if (!already_cached[col]) {
-                if (is_table_function) {
-                  SIRIUS_LOG_DEBUG("Scan cache OOM path: Calling createTableAndColumnInGPUDirect for col {}: {}", col, names[column_ids[col].GetPrimaryIndex()]);
-                  gpuBufferManager->createTableAndColumnInGPUDirect(table_name, names[column_ids[col].GetPrimaryIndex()], scanned_types[col],col, num_columns);
+                if (IsTableFunction()) {
+                  gpuBufferManager->createTableAndColumnInGPU(table_name, names[column_ids[col].GetPrimaryIndex()], scanned_types[col], col, num_columns);
                 } else {
                   gpuBufferManager->createTableAndColumnInGPU(*catalog_ptr, exec_context.client, table_name, names[column_ids[col].GetPrimaryIndex()]);
                 }

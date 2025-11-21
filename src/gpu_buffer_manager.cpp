@@ -410,11 +410,18 @@ GPUBufferManager::customCudaHostAlloc(size_t size) {
 	return reinterpret_cast<T*>(cpuProcessing + start);
 };
 
-void
-GPUBufferManager::createTableAndColumnInGPU(Catalog& catalog, ClientContext& context, string table_name, string column_name) {
-	SIRIUS_LOG_DEBUG("CreateTable and Column called for table {} and col {}", table_name, column_name);
+// Original function - for catalog tables
+void GPUBufferManager::createTableAndColumnInGPU(Catalog& catalog, ClientContext& context,
+                                                  string table_name, string column_name) {
+	SIRIUS_LOG_DEBUG("createTableAndColumnInGPU (catalog) called for table {} and col {}", table_name, column_name);
     TableCatalogEntry &table = catalog.GetEntry(context, CatalogType::TABLE_ENTRY, DEFAULT_SCHEMA, table_name).Cast<TableCatalogEntry>();
-    auto column_names = table.GetColumns().GetColumnNames();
+
+    // Extract column metadata from catalog
+    auto column_id = table.GetColumnIndex(column_name, false).index;
+    auto column_type = table.GetColumn(column_name).GetType();
+    auto total_columns = table.GetTypes().size();
+
+    // Extract constraints
     auto& constraints = table.GetConstraints();
     vector<size_t> unique_columns;
     
@@ -423,71 +430,45 @@ GPUBufferManager::createTableAndColumnInGPU(Catalog& catalog, ClientContext& con
 			auto &pk = constraint->Cast<UniqueConstraint>();
 			if (pk.HasIndex()) {
                 SIRIUS_LOG_DEBUG("Unique constraint on index {}", pk.GetIndex().index);
-                for (auto &col : pk.GetColumnNames()) {
-                    SIRIUS_LOG_DEBUG("Unique constraint on column {}", col);
-                }
                 unique_columns.push_back(pk.GetIndex().index);
-			} else {
-                for (auto &col : pk.GetColumnNames()) {
-                    SIRIUS_LOG_DEBUG("Unique constraint on column {}", col);
-                }
-            }
+			}
 		}
 	}
-    
-    //finding column_name in column_names
-    //convert column_name to uppercase
+
+    // Normalize names
+    string up_table_name = table_name;
+    transform(up_table_name.begin(), up_table_name.end(), up_table_name.begin(), ::toupper);
     string up_column_name = column_name;
-    //when caching table, it has to be exaclty the same as the column name in the table (case sensitive)
     transform(up_column_name.begin(), up_column_name.end(), up_column_name.begin(), ::toupper);
-    if (find(column_names.begin(), column_names.end(), column_name) != column_names.end()) {
-        // convert table_name to uppercase
-        size_t column_id = table.GetColumnIndex(column_name, false).index;
-        string up_table_name = table_name;
-        transform(up_table_name.begin(), up_table_name.end(), up_table_name.begin(), ::toupper);
-        createTable(up_table_name, table.GetTypes().size());
-        GPUColumnType column_type = convertLogicalTypeToColumnType(table.GetColumn(column_name).GetType());
-        SIRIUS_LOG_DEBUG("Creating column {}", up_column_name);
-        createColumn(up_table_name, up_column_name, column_type, column_id, unique_columns);
-    } else {
-        throw InvalidInputException("Column does not exists");
-    }
-    SIRIUS_LOG_DEBUG("Table and column created in GPU");
+
+    // Create table and column
+    createTable(up_table_name, total_columns);
+    GPUColumnType gpu_column_type = convertLogicalTypeToColumnType(column_type);
+    createColumn(up_table_name, up_column_name, gpu_column_type, column_id, unique_columns);
+
+    SIRIUS_LOG_DEBUG("Table and column created from catalog");
 }
 
-void GPUBufferManager::createTableAndColumnInGPUDirect(
-    string table_name, string column_name,
-    const LogicalType &column_type, idx_t column_id,
-    size_t total_columns) {
+// Overload - for table functions
+void GPUBufferManager::createTableAndColumnInGPU(string table_name, string column_name,
+                                                  const LogicalType &column_type,
+                                                  idx_t column_id, size_t total_columns) {
+    SIRIUS_LOG_DEBUG("createTableAndColumnInGPU (table function) called for table {} and col {} (total cols: {})",
+                     table_name, column_name, total_columns);
 
-    SIRIUS_LOG_DEBUG("CreateTableAndColumnDirect called for table {} and col {} (total cols: {})", table_name, column_name, total_columns);
-
-    // Convert table_name to uppercase for cache key
+    // Normalize names
     string up_table_name = table_name;
-    transform(up_table_name.begin(), up_table_name.end(),
-              up_table_name.begin(), ::toupper);
-
-    // Convert column_name to uppercase
+    transform(up_table_name.begin(), up_table_name.end(), up_table_name.begin(), ::toupper);
     string up_column_name = column_name;
-    transform(up_column_name.begin(), up_column_name.end(),
-              up_column_name.begin(), ::toupper);
+    transform(up_column_name.begin(), up_column_name.end(), up_column_name.begin(), ::toupper);
 
-    // Create table with known total column count (same as catalog version)
+    // Create table and column (no constraints for table functions)
     createTable(up_table_name, total_columns);
-
-    // Convert type
     GPUColumnType gpu_column_type = convertLogicalTypeToColumnType(column_type);
-
-    // Table functions don't have constraints
     vector<size_t> empty_constraints;
+    createColumn(up_table_name, up_column_name, gpu_column_type, column_id, empty_constraints);
 
-    SIRIUS_LOG_DEBUG("Creating column {} with type {}", up_column_name,
-                     column_type.ToString());
-
-    createColumn(up_table_name, up_column_name, gpu_column_type,
-                 column_id, empty_constraints);
-
-    SIRIUS_LOG_DEBUG("Table and column created in GPU (direct mode)");
+    SIRIUS_LOG_DEBUG("Table and column created from table function");
 }
 
 void

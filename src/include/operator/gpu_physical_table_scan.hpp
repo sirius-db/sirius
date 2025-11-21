@@ -151,14 +151,7 @@ public:
 	// ProgressData GetProgress(ClientContext &context, GlobalSourceState &gstate) const override;
 
 private:
-
-    // NEW: Cache whether this is a table function
-    bool is_table_function;
-
-    // NEW: Cache the generated table name
-    mutable string cached_table_name;
-
-    // NEW: Helper methods
+    // Helper methods - compute from existing data
     bool IsTableFunction() const;
     string GetTableName() const;
     string GenerateTableFunctionName() const;
