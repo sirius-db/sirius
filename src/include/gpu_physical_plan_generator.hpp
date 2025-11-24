@@ -25,6 +25,7 @@
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/common/unordered_set.hpp"
 #include "gpu_physical_operator.hpp"
+#include "sirius_extension.hpp"
 
 namespace duckdb {
 class ClientContext;
@@ -110,6 +111,9 @@ protected:
 	unique_ptr<GPUPhysicalOperator> ExtractAggregateExpressions(unique_ptr<GPUPhysicalOperator> child,
 	                                                         vector<unique_ptr<Expression>> &expressions,
 	                                                         vector<unique_ptr<Expression>> &groups);
+
+  unique_ptr<GPUPhysicalOperator> CreateGraphPhysicalPlan(LogicalGraphOperator* graph_op);
+  unique_ptr<GPUPhysicalOperator> CreateEdgeTableScan(const string& table_name);
 
 // private:
 	// bool PreserveInsertionOrder(GPUPhysicalOperator &plan);

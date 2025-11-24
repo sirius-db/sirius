@@ -30,6 +30,12 @@ else()
   message(FATAL_ERROR "LIBCUDF_ENV_PREFIX environment variable is not set.")
 endif()
 
+# Add conda prefix to CMAKE_PREFIX_PATH so find_package can locate cugraph
+#list(APPEND CMAKE_PREFIX_PATH "${CONDA_PREFIX}")
+#list(APPEND CMAKE_PREFIX_PATH "${CONDA_PREFIX}/lib/cmake")
+
+find_package(cugraph CONFIG REQUIRED)
+
 # Set CUDA architecture and flags
 set(CMAKE_CUDA_ARCHITECTURES native)
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-extended-lambda --expt-relaxed-constexpr -rdc=true")
@@ -61,6 +67,9 @@ set(EXTENSION_SOURCES
   src/gpu_columns.cpp
   src/cpu_cache.cpp
   src/gpu_query_result.cpp
+  src/logical_graph_operator.cpp
+  src/gpu_csr_construction_operator.cpp
+  src/gpu_graph_traversal_operator.cpp
   src/config.cpp
   src/fallback.cpp
   src/memory/memory_reservation.cpp
@@ -94,8 +103,10 @@ include_directories(src/include/cudf)
 include_directories(${CONDA_PREFIX}/include)
 include_directories(${CONDA_PREFIX}/include/cudf)
 include_directories(${CONDA_PREFIX}/include/rmm)
+# include_directories(${CONDA_PREFIX}/include/cugraph_c)  # cuGraph C API headers
 
 # add_library(${EXTENSION_NAME} STATIC ${EXTENSION_SOURCES} ${CUDA_SOURCES})
+#add_subdirectory(duckdb)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES} ${CUDA_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES} ${CUDA_SOURCES})
@@ -115,15 +126,24 @@ target_link_libraries(${EXTENSION_NAME}
   cudf::cudf 
   rmm::rmm
 )
-target_link_libraries(${LOADABLE_EXTENSION_NAME} 
+# Link cugraph and raft separately without propagating their CUDA features
+target_link_libraries(${EXTENSION_NAME}
+  $<LINK_ONLY:cugraph::cugraph>
+  $<LINK_ONLY:raft::raft>
+)
+target_link_libraries(${LOADABLE_EXTENSION_NAME}
   substrait_extension
   cudf::cudf 
   rmm::rmm
+  $<LINK_ONLY:cugraph::cugraph>
+  $<LINK_ONLY:raft::raft>
 )
 
 # Third-party
 set(DEPS_PREFIX "_deps")
-include(third_party/spdlog.cmake)
+if(NOT TARGET spdlog::spdlog)
+  include(third_party/spdlog.cmake)
+endif()
 target_link_libraries(${EXTENSION_NAME} spdlog::spdlog)
 target_link_libraries(${LOADABLE_EXTENSION_NAME} spdlog::spdlog)
 

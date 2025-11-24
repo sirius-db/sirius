@@ -16,7 +16,13 @@
 
 #include "gpu_physical_plan_generator.hpp"
 
+#include "logical_graph_operator.hpp"
+#include "gpu_graph_traversal_operator.hpp"
+#include "gpu_csr_construction_operator.hpp"
+#include "gpu_physical_table_scan.hpp"
+#include "gpu_table_function.hpp"
 #include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -26,6 +32,8 @@
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
 #include "duckdb/planner/operator/list.hpp"
 #include "duckdb/execution/operator/helper/physical_verify_vector.hpp"
+
+#include "log/logging.hpp"
 
 namespace duckdb {
 
@@ -58,10 +66,12 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::CreatePlan(unique_ptr<
 	auto &profiler = QueryProfiler::Get(context);
 
 	// first resolve column references
-	profiler.StartPhase(MetricsType::PHYSICAL_PLANNER_COLUMN_BINDING);
-	ColumnBindingResolver resolver;
-	resolver.VisitOperator(*op);
-	profiler.EndPhase();
+  if (op->type != LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR) {
+    profiler.StartPhase(MetricsType::PHYSICAL_PLANNER_COLUMN_BINDING);
+    ColumnBindingResolver resolver;
+    resolver.VisitOperator(*op);
+    profiler.EndPhase();
+  }
 
 	// now resolve types of all the operators
 	profiler.StartPhase(MetricsType::PHYSICAL_PLANNER_RESOLVE_TYPES);
@@ -81,9 +91,136 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::CreatePlan(unique_ptr<
 	return plan;
 }
 
+unique_ptr<GPUPhysicalOperator>
+GPUPhysicalPlanGenerator::CreateEdgeTableScan(const string& table_name) {
+
+  SIRIUS_LOG_INFO("CreateEdgeTableScan: Reading edge table '{}'", table_name);
+
+  auto &catalog = Catalog::GetCatalog(context, INVALID_CATALOG);
+  auto &schema = catalog.GetSchema(context, DEFAULT_SCHEMA);
+  auto transaction = schema.GetCatalogTransaction(context);
+  auto table_or_view = schema.GetEntry(transaction, CatalogType::TABLE_ENTRY, table_name);
+  if (!table_or_view) {
+    throw CatalogException("Table '%s' not found", table_name);
+  }
+
+  auto &table_entry = table_or_view->Cast<TableCatalogEntry>();
+  const auto &columns = table_entry.GetColumns();
+
+  // Find the source and destination column indices
+  vector<LogicalType> column_types;
+  vector<string> column_names;
+  vector<ColumnIndex> column_ids;  // Track which columns we're reading
+
+  bool found_src = false;
+  bool found_dst = false;
+
+  for (idx_t i = 0; i < columns.PhysicalColumnCount(); i++) {
+    auto &col = columns.GetColumn(PhysicalIndex(i));
+    string col_name = col.GetName();
+
+    // Only add source and dest columns
+    if (col_name == "src" || col_name == "source") {  // Common names for source
+      column_types.push_back(col.GetType());
+      column_names.push_back(col_name);
+      column_ids.push_back(ColumnIndex(i));
+      found_src = true;
+      SIRIUS_LOG_DEBUG("Found source column: {} at index {}", col_name, i);
+    } else if (col_name == "dst" || col_name == "dest" || col_name == "target") {  // Common names for dest
+      column_types.push_back(col.GetType());
+      column_names.push_back(col_name);
+      column_ids.push_back(ColumnIndex(i));
+      found_dst = true;
+      SIRIUS_LOG_DEBUG("Found dest column: {} at index {}", col_name, i);
+    }
+  }
+
+  if (!found_src || !found_dst) {
+    throw BinderException("Edge table '%s' must have source and destination columns", table_name);
+  }
+
+  SIRIUS_LOG_DEBUG("Table '{}' has {} columns", table_name, column_names.size());
+  for (size_t i = 0; i < column_names.size(); i++) {
+    SIRIUS_LOG_DEBUG("  Column {}: {} ({})", i, column_names[i], column_types[i].ToString());
+  }
+
+  // Get the table function and bind data for scanning
+  unique_ptr<FunctionData> bind_data;
+  auto table_function = table_entry.GetScanFunction(context, bind_data);
+
+  // Create a LogicalGet for the table with proper column information
+  auto logical_get = make_uniq<LogicalGet>(
+      0,  // binding index - will be reassigned during binding
+      table_function,
+      std::move(bind_data),
+      column_types,
+      column_names
+  );
+
+  // Set the table index
+  logical_get->table_index = table_entry.oid;
+  logical_get->SetColumnIds(std::move(column_ids));  // Tell it which columns to scan
+
+  SIRIUS_LOG_DEBUG("Created LogicalGet for table '{}' with oid={}", table_name, table_entry.oid);
+
+  // Convert LogicalGet to physical plan
+  return CreatePlan(*logical_get);
+}
+
+
+unique_ptr<GPUPhysicalOperator>
+GPUPhysicalPlanGenerator::CreateGraphPhysicalPlan(LogicalGraphOperator* graph_op) {
+  SIRIUS_LOG_DEBUG("Creating graph physical plan");
+
+  // Create a table scan to read the edge table
+  auto edge_scan = CreateEdgeTableScan(graph_op->edge_table);
+
+  // Create CSR construction operator
+  auto csr_builder = make_uniq<GPUCSRConstructionOperator>(
+      std::move(edge_scan),
+      graph_op->source_column,
+      graph_op->dest_column,
+      context,
+      gpu_context
+  );
+
+  // Create graph traversal operator
+  auto traversal = make_uniq<GPUGraphTraversalOperator>(
+      std::move(csr_builder),
+      graph_op->source_vertex,
+      graph_op->algorithm_type,
+      graph_op->max_hops,
+      context,
+      gpu_context
+  );
+
+  return traversal;
+}
+
 unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::CreatePlan(LogicalOperator &op) {
+  SIRIUS_LOG_INFO("CreatePlan START, operator type: {}", (int)op.type);
 	op.estimated_cardinality = op.EstimateCardinality(context);
 	unique_ptr<GPUPhysicalOperator> plan = nullptr;
+
+//   // Check for graph operator FIRST, before the switch statement
+//   if (op.type == LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR) {
+//     auto graph_op = dynamic_cast<LogicalGraphOperator*>(&op);
+//     if (graph_op) {
+//       SIRIUS_LOG_INFO("Creating physical plan for graph operator");
+//       plan = CreateGraphPhysicalPlan(graph_op);
+//
+//       if (!plan) {
+//         throw InternalException("Physical plan generator - no plan generated for graph operator");
+//       }
+//
+//       plan->estimated_cardinality = op.estimated_cardinality;
+// #ifdef DUCKDB_VERIFY_VECTOR_OPERATOR
+//       auto verify = make_uniq<PhysicalVerifyVector>(std::move(plan));
+//       plan = std::move(verify);
+// #endif
+//       return plan;
+//     }
+//   }
 
 	switch (op.type) {
 	case LogicalOperatorType::LOGICAL_GET:
@@ -262,14 +399,20 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::CreatePlan(LogicalOper
 		throw NotImplementedException("Update extensions not supported");
 		// plan = CreatePlan(op.Cast<LogicalSimple>());
 		break;
-	case LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR:
-		throw NotImplementedException("Extension operator not supported");
-		// plan = op.Cast<LogicalExtensionOperator>().CreatePlan(context, *this);
+	case LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR: {
+	  // Check if it's a LogicalGraphOperator
+	  auto graph_op = dynamic_cast<LogicalGraphOperator*>(&op);
+	  if (graph_op) {
+	    return CreateGraphPhysicalPlan(graph_op);
+	  }
+	  throw NotImplementedException("Unknown extension operator");
+	  // throw NotImplementedException("Extension operator not supported");
+	  // plan = op.Cast<LogicalExtensionOperator>().CreatePlan(context, *this);
 
-		// if (!plan) {
-		// 	throw InternalException("Missing GPUPhysicalOperator for Extension Operator");
-		// }
-		break;
+	  // if (!plan) {
+	  // 	throw InternalException("Missing GPUPhysicalOperator for Extension Operator");
+	  // }
+	}
 	case LogicalOperatorType::LOGICAL_JOIN:
 	case LogicalOperatorType::LOGICAL_DEPENDENT_JOIN:
 	case LogicalOperatorType::LOGICAL_INVALID: {

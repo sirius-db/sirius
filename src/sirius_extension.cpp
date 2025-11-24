@@ -44,8 +44,12 @@
 #include "gpu_physical_plan_generator.hpp"
 #include "gpu_buffer_manager.hpp"
 #include "config.hpp"
+#include "logical_graph_operator.hpp"
 
 #include <cstdlib>
+
+#include <signal.h>
+#include <execinfo.h>
 
 namespace duckdb {
 
@@ -63,6 +67,26 @@ struct GPUTableFunctionData : public TableFunctionData {
 	bool enable_optimizer;
 	bool finished = false;
 	bool plan_error = false;
+};
+
+struct GraphProcessingFunctionData : public TableFunctionData {
+  GraphProcessingFunctionData() = default;
+
+  // Execution resources
+  shared_ptr<GPUPreparedStatementData> gpu_prepared;
+  unique_ptr<QueryResult> res;
+  unique_ptr<Connection> conn;
+  unique_ptr<GPUContext> gpu_context;
+
+  string graph_query;       // Original graph query string
+  string edge_table;        // Extracted edge table name
+  int64_t source_vertex;    // Source vertex ID
+  string algorithm_type;    // "SHORTEST_PATH", "SHORTEST_DISTANCE", etc.
+
+  // Execution state flags
+  bool finished = false;
+  bool parse_error = false;
+  bool plan_error = false;
 };
 
 // struct GPUCachingFunctionData : public TableFunctionData {
@@ -485,6 +509,259 @@ SiriusExtension::GPUBufferInitFunction(ClientContext &context, TableFunctionInpu
 	data.finished = true;
 }
 
+ParsedGraphQuery
+SiriusExtension::ParseGraphQuery(const string& query) {
+    ParsedGraphQuery result;
+
+    // Detect algorithm type
+    if (query.find("->*") != string::npos ||
+        query.find("SHORTEST") != string::npos ||
+        query.find("shortest") != string::npos) {
+        result.algorithm_type = "SHORTEST_PATH";
+    } else if (query.find("DISTANCE") != string::npos) {
+        result.algorithm_type = "SHORTEST_DISTANCE";
+    } else {
+        result.algorithm_type = "BFS";  // Default
+    }
+
+    // Detect edge direction
+    if (query.find("<-") != string::npos && query.find("->") != string::npos) {
+        result.is_left_directed = true;
+        result.is_right_directed = true;
+    } else if (query.find("<-") != string::npos) {
+        result.is_left_directed = true;
+    } else if (query.find("->") != string::npos) {
+        result.is_right_directed = true;
+    } else {
+        result.is_any_directed = true;
+    }
+
+    // Extract edge table name (from -[:knows]-> or -[e:knows]->)
+    size_t edge_start = query.find("-[");
+    if (edge_start != string::npos) {
+        edge_start += 2; // Move past "-["
+
+        // Skip optional variable name (e:)
+        size_t colon_pos = query.find(":", edge_start);
+        if (colon_pos != string::npos && colon_pos < query.find("]", edge_start)) {
+            edge_start = colon_pos + 1;
+        }
+
+        size_t edge_end = query.find("]", edge_start);
+        if (edge_end != string::npos) {
+            result.edge_table = query.substr(edge_start, edge_end - edge_start);
+            // Trim whitespace
+            result.edge_table.erase(0, result.edge_table.find_first_not_of(" \t"));
+            result.edge_table.erase(result.edge_table.find_last_not_of(" \t") + 1);
+        }
+    }
+
+    // Extract source vertex ID (from WHERE p.id=14)
+    size_t where_pos = query.find("WHERE");
+    if (where_pos == string::npos) {
+        where_pos = query.find("where");
+    }
+
+    if (where_pos != string::npos) {
+        size_t eq_pos = query.find("=", where_pos);
+        if (eq_pos != string::npos) {
+            size_t num_start = eq_pos + 1;
+            // Skip whitespace
+            while (num_start < query.length() && isspace(query[num_start])) {
+                num_start++;
+            }
+            // Extract digits
+            size_t num_end = num_start;
+            while (num_end < query.length() && isdigit(query[num_end])) {
+                num_end++;
+            }
+            if (num_end > num_start) {
+                string num_str = query.substr(num_start, num_end - num_start);
+                result.source_vertex = std::stoll(num_str);
+            }
+        }
+    }
+
+    // Validate we got the minimum required info
+    result.parse_success = !result.edge_table.empty() && result.source_vertex >= 0;
+
+    return result;
+}
+
+unique_ptr<LogicalOperator>
+SiriusExtension::CreateGraphLogicalPlan(const ParsedGraphQuery& parsed, ClientContext& context, Connection& conn) {
+
+  if (!parsed.parse_success) {
+    throw InvalidInputException("Failed to parse graph query");
+  }
+
+  SIRIUS_LOG_INFO("Creating graph logical plan:");
+
+  // Create the logical graph operator
+  auto graph_op = make_uniq<LogicalGraphOperator>(parsed);
+
+  return graph_op;
+}
+
+unique_ptr<FunctionData>
+SiriusExtension::GPUProcessingGraphBind(ClientContext &context, TableFunctionBindInput &input,
+                                vector<LogicalType> &return_types, vector<string> &names) {
+  auto result = make_uniq<GraphProcessingFunctionData>();
+  result->conn = make_uniq<Connection>(*context.db);
+  result->gpu_context = make_uniq<GPUContext>(context);
+
+  if (input.inputs[0].IsNull()) {
+      throw BinderException("graph_table cannot be called with a NULL parameter");
+  }
+
+  result->graph_query = input.inputs[0].ToString();
+
+  SIRIUS_LOG_INFO("GPUProcessingGraphBind called with: {}", result->graph_query);
+
+  // Parse the graph query
+  auto parsed = ParseGraphQuery(result->graph_query);
+
+  if (!parsed.parse_success) {
+    result->parse_error = true;
+    SIRIUS_LOG_ERROR("Failed to parse graph query: {}", result->graph_query);
+    // Still return the function data, but mark it as errored
+    return_types.emplace_back(LogicalType::BIGINT);
+    names.emplace_back("error");
+    return std::move(result);
+  }
+
+  result->edge_table = parsed.edge_table;
+  result->source_vertex = parsed.source_vertex;
+  result->algorithm_type = parsed.algorithm_type;
+
+  SIRIUS_LOG_INFO("Successfully parsed graph query:");
+  SIRIUS_LOG_INFO("  Edge table: {}", result->edge_table);
+  SIRIUS_LOG_INFO("  Source vertex: {}", result->source_vertex);
+  SIRIUS_LOG_INFO("  Algorithm: {}", result->algorithm_type);
+
+  // Create logical plan for graph
+  try {
+    unique_ptr<LogicalOperator> query_plan = CreateGraphLogicalPlan(parsed, context, *result->conn);
+    SIRIUS_LOG_DEBUG("Graph query plan:\n{}", query_plan->ToString());
+
+    // Set up output schema for graph results
+    return_types.emplace_back(LogicalType::BIGINT);  // vertex_id
+    return_types.emplace_back(LogicalType::BIGINT);  // distance
+    names.emplace_back("vertex_id");
+    names.emplace_back("distance");
+
+    // Create prepared statement
+    auto prepared = make_shared_ptr<PreparedStatementData>(StatementType::SELECT_STATEMENT);
+    prepared->names = names;
+    prepared->types = return_types;
+    prepared->plan = make_uniq<PhysicalOperator>(
+      PhysicalOperatorType::DUMMY_SCAN,
+      vector<LogicalType>{LogicalType::BOOLEAN},
+      0
+    );
+
+    if (buffer_is_initialized) {
+      try {
+        // Generate GPU physical plan
+        auto gpu_physical_plan = GPUGeneratePhysicalPlan(context, *result->gpu_context, query_plan, *result->conn);
+        auto gpu_prepared = make_shared_ptr<GPUPreparedStatementData>(std::move(prepared), std::move(gpu_physical_plan));
+        result->gpu_prepared = gpu_prepared;
+      } catch (std::exception &e) {
+        ErrorData error(e);
+        SIRIUS_LOG_ERROR("Error in GPUGeneratePhysicalPlan: {}", error.RawMessage());
+        result->plan_error = true;
+      }
+    } else {
+      result->gpu_prepared = nullptr;
+    }
+  } catch (std::exception &e) {
+    ErrorData error(e);
+    SIRIUS_LOG_ERROR("Error creating graph logical plan: {}", error.RawMessage());
+    result->plan_error = true;
+  }
+
+  return std::move(result);
+}
+
+void
+SiriusExtension::GPUProcessingGraphFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+  SIRIUS_LOG_ERROR("GPUProcessingGraphFunction");
+
+  auto &data = (GraphProcessingFunctionData &)*data_p.bind_data;
+  if (data.finished) {
+    return;
+  }
+
+  if (data.parse_error) {
+    printf("\033[1;31m"); // Red color
+    printf("Failed to parse graph query\n");
+    printf("\033[0m"); // Reset color
+    printf("=============================================\n");
+    printf("Error in graph query parsing\n");
+    printf("=============================================\n");
+    SIRIUS_LOG_ERROR("Cannot execute graph query due to parse error");
+    output.SetCardinality(0);
+    data.finished = true;
+    return;
+  }
+
+    if (!data.res) {
+      auto start = std::chrono::high_resolution_clock::now();
+
+      if (!buffer_is_initialized) {
+        printf("\033[1;31m"); // Red color
+        printf("GPUBufferManager not initialized, please call gpu_buffer_init first\n");
+        printf("\033[0m"); // Reset color
+        printf("=============================================\n");
+        printf("Error in GPUExecuteQuery, fallback to DuckDB\n");
+        printf("=============================================\n");
+        SIRIUS_LOG_ERROR("GPUBufferManager not initialized, please call gpu_buffer_init first");
+        output.SetCardinality(0);
+        data.finished = true;
+        return;
+      } else if (data.plan_error) {
+        printf("\033[1;31m"); // Red color
+        printf("Error in query planning\n");
+        printf("\033[0m"); // Reset color
+        printf("=============================================\n");
+        printf("Error in graph query planning\n");
+        printf("=============================================\n");
+        SIRIUS_LOG_ERROR("Error in query planning, cannot execute");
+        output.SetCardinality(0);
+        data.finished = true;
+        return;
+      } else {
+        data.res = data.gpu_context->GPUExecuteQuery(context, data.graph_query, data.gpu_prepared, {});
+        if (data.res->HasError()) {
+          printf("\033[1;31m"); // Red color
+          printf("Error in GPUExecuteQuery: %s\n", data.res->GetError().c_str());
+          printf("\033[0m"); // Reset color
+          printf("=============================================\n");
+          printf("Error in graph query execution\n");
+          printf("=============================================\n");
+          SIRIUS_LOG_ERROR("Error in GPUExecuteQuery: {}", data.res->GetError());
+          output.SetCardinality(0);
+          data.finished = true;
+          return;
+        }
+      }
+
+      auto end = std::chrono::high_resolution_clock::now();
+      auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+      SIRIUS_LOG_INFO("Graph query execution time: {:.2f} ms", duration.count()/1000.0);
+    }
+
+    auto result_chunk = data.res->Fetch();
+    if (result_chunk == nullptr) {
+      output.SetCardinality(0);
+      data.finished = true;
+      return;
+    }
+
+    output.Reference(*result_chunk);
+}
+
+
 void SiriusExtension::InitializeGPUExtension(Connection &con) {
 	auto &catalog = Catalog::GetSystemCatalog(*con.context);
 
@@ -506,6 +783,11 @@ void SiriusExtension::InitializeGPUExtension(Connection &con) {
 	// gpu_processing.named_parameters["enable_optimizer"] = LogicalType::BOOLEAN;
 	CreateTableFunctionInfo gpu_processing_substrait_info(gpu_processing_substrait);
 	catalog.CreateTableFunction(*con.context, gpu_processing_substrait_info);
+
+  // graph
+  TableFunction gpu_processing_graph("gpu_processing_graph", {LogicalType::VARCHAR}, GPUProcessingGraphFunction, GPUProcessingGraphBind);
+  CreateTableFunctionInfo gpu_processing_graph_info(gpu_processing_graph);
+  catalog.CreateTableFunction(*con.context, gpu_processing_graph_info);
 
 	// size_t cache_size_per_gpu = 100UL * 1024 * 1024 * 1024; // 10GB
 	// size_t processing_size_per_gpu = 80UL * 1024 * 1024 * 1024; //11GB
@@ -589,7 +871,19 @@ void SiriusExtension::InitialGPUConfigs(DuckDB &db) {
 		Value::BOOLEAN(Config::ENABLE_FALLBACK_CHECK), SetEnableFallbackCheck);
 }
 
+
+void sigsegv_handler(int sig) {
+  void *array[10];
+  size_t size = backtrace(array, 10);
+  fprintf(stderr, "Error: signal %d:\n", sig);
+  backtrace_symbols_fd(array, size, STDERR_FILENO);
+  exit(1);
+}
+
 void SiriusExtension::Load(DuckDB &db) {
+  // debugging helper
+  signal(SIGSEGV, sigsegv_handler);
+
 	// First initialize the config before acquring a connection the database
 	InitialGPUConfigs(db);
 	
