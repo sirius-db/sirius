@@ -448,12 +448,13 @@ GPUColumn::setFromCudfScalar(cudf::scalar& cudf_scalar, GPUBufferManager* gpuBuf
     }
 
     data_wrapper.size = 1;
-    // data_wrapper.validity_mask = gpuBufferManager->customCudaMalloc<cudf::bitmask_type>(1, 0, 0);
-    // cudf::bitmask_type* host_mask = gpuBufferManager->customCudaHostAlloc<cudf::bitmask_type>(1);
-    // host_mask[0] = 1;
-    // callCudaMemcpyHostToDevice<uint8_t>(reinterpret_cast<uint8_t*>(data_wrapper.validity_mask), 
-    //         reinterpret_cast<uint8_t*>(host_mask), sizeof(cudf::bitmask_type), 0);
-    data_wrapper.validity_mask = createNullMask(1);
+    // Check if the scalar is valid (not NULL)
+    // If all input values are NULL, CuDF reduce returns an invalid scalar
+    if (cudf_scalar.is_valid()) {
+        data_wrapper.validity_mask = createNullMask(1, cudf::mask_state::ALL_VALID);
+    } else {
+        data_wrapper.validity_mask = createNullMask(1, cudf::mask_state::ALL_NULL);
+    }
     data_wrapper.mask_bytes = getMaskBytesSize(data_wrapper.size);
     column_length = 1;
     data_wrapper.offset = nullptr;

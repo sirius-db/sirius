@@ -100,6 +100,8 @@ void cudf_aggregate(vector<shared_ptr<GPUColumn>>& column, uint64_t num_aggregat
             auto cudf_column = column[agg]->convertToCudfColumn();
             auto to_cudf_type = cudf_column.type();
             cudf::size_type num_rows = cudf_column.size();
+
+            // Determine the result type (may be promoted to INT64)
             if (to_cudf_type.id() == cudf::type_id::INT32) {
                 if (num_rows > 1) {
                     to_cudf_type = cudf::data_type(cudf::type_id::INT64);
@@ -111,6 +113,9 @@ void cudf_aggregate(vector<shared_ptr<GPUColumn>>& column, uint64_t num_aggregat
                     to_cudf_type = cudf::data_type(cudf::type_id::INT32);
                 }
             }
+
+            // CuDF reduce will return an invalid scalar if all values are NULL
+            // setFromCudfScalar will handle the NULL case by checking is_valid()
             auto result = cudf::reduce(cudf_column, *aggregate, to_cudf_type);
             column[agg]->setFromCudfScalar(*result, gpuBufferManager);
         } else if (agg_mode[agg] == AggregationType::AVERAGE) {
@@ -159,7 +164,17 @@ void cudf_aggregate(vector<shared_ptr<GPUColumn>>& column, uint64_t num_aggregat
 #else
             result = cudf::reduce(cudf_column, *aggregate, cudf_column.type());
 #endif
-            column[agg]->setFromCudfScalar(*result, gpuBufferManager);
+            // COUNT_DISTINCT should return 0 (valid value) when all values are NULL
+            // because it counts distinct non-NULL values, and 0 distinct values = 0
+            if (!result->is_valid()) {
+                // If CuDF returns invalid scalar (all NULL), create a valid scalar with value 0
+                uint64_t* temp = gpuBufferManager->customCudaMalloc<uint64_t>(1, 0, 0);
+                cudaMemset(temp, 0, sizeof(uint64_t));
+                auto validity_mask = createNullMask(1, cudf::mask_state::ALL_VALID);
+                column[agg] = make_shared_ptr<GPUColumn>(1, GPUColumnType(GPUColumnTypeId::INT64), reinterpret_cast<uint8_t*>(temp), validity_mask);
+            } else {
+                column[agg]->setFromCudfScalar(*result, gpuBufferManager);
+            }
         } else if (agg_mode[agg] == AggregationType::FIRST) {
             uint32_t* bitmask_host = gpuBufferManager->customCudaHostAlloc<uint32_t>(1);
             cudaMemcpy(bitmask_host, column[agg]->data_wrapper.validity_mask, sizeof(uint32_t), cudaMemcpyDeviceToHost);
