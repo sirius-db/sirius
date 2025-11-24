@@ -6,3 +6,7 @@
 	path = extension-ci-tools
 	url = https://github.com/duckdb/extension-ci-tools
 	branch = main
+[submodule "substrait"]
+	path = substrait
+	url = https://github.com/duckdb/substrait.git
+	branch = main

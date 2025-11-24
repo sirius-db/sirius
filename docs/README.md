@@ -114,6 +114,37 @@ export LIBCUDF_ENV_PREFIX={PATH to libcudf-env}
 ```
 It is recommended to add the environment variables to your `bashrc` to avoid repetition. 
 
+## Dependencies (Option 4): Use Pixi
+
+There is a [Pixi](https://pixi.sh/) manifest available to set up an environment with all required dependencies installed. 
+
+### Requirements
+
+#### Build
+
+- Git (to clone the repo)
+- Pixi (install instructions [here](https://pixi.sh/latest/installation/))
+
+#### Test
+
+- A supported NVIDIA GPU
+- NVIDIA GPU driver installed
+
+### Setup
+
+The environment activation handles setting up everything needed to build and test.
+
+Start a shell in the environment with:
+```
+pixi shell
+```
+
+Then build and test as described in the sections below.
+```
+make
+make test
+```
+
 ## Building Sirius
 To clone the Sirius repository:
 ```

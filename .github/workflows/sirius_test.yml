@@ -19,6 +19,8 @@ jobs:
           submodules: recursive
           fetch-depth: 0
       - name: Build
+        env:
+          CUDAARCHS: native
         run: |
           export LIBCUDF_ENV_PREFIX=~/miniconda3/envs/libcudf-env
           source ~/miniconda3/etc/profile.d/conda.sh
