@@ -38,10 +38,8 @@ GPUCSRConstructionOperator::~GPUCSRConstructionOperator() {
 }
 
 
-OperatorResultType
-GPUCSRConstructionOperator::Execute(
-  GPUIntermediateRelation &input_relation,
-  GPUIntermediateRelation &output_relation) const {
+SourceResultType
+GPUCSRConstructionOperator::GetData(GPUIntermediateRelation& output_relation) const {
 
   SIRIUS_LOG_INFO("CSR Construction: Starting execution");
 
@@ -51,8 +49,8 @@ GPUCSRConstructionOperator::Execute(
 
       size_t expected_cols = has_weights ? 3 : 2; // 2 or 3 columns: src, dst, (weights)
       GPUIntermediateRelation edge_data(expected_cols);
-      auto result = child->Execute(input_relation, edge_data);
-      if (result != OperatorResultType::FINISHED) {
+      auto result = child->GetData(edge_data);
+      if (result != SourceResultType::FINISHED) {
         return result;  // Propagate if not finished
       }
 
@@ -169,7 +167,7 @@ GPUCSRConstructionOperator::Execute(
     );
   }
 
-  return OperatorResultType::FINISHED;
+  return SourceResultType::FINISHED;
 }
 
 // TODO: build csr internally with cuGraph

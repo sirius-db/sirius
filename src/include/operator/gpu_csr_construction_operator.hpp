@@ -42,10 +42,12 @@ public:
 
   ~GPUCSRConstructionOperator() override;
 
-  OperatorResultType Execute(
-    GPUIntermediateRelation &input_relation,
-    GPUIntermediateRelation &output_relation
-  ) const override;
+  // OperatorResultType Execute(
+  //   GPUIntermediateRelation &input_relation,
+  //   GPUIntermediateRelation &output_relation
+  // ) const override;
+
+  SourceResultType GetData(GPUIntermediateRelation& output_relation) const override;
 
 private:
   void BuildCSR(const vector<int64_t>& src, const vector<int64_t>& dst) const;

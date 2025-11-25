@@ -56,6 +56,8 @@ public:
     GPUIntermediateRelation &output_relation
   ) const override;
 
+  SourceResultType GetData(GPUIntermediateRelation& output_relation) const override;
+
 private:
   void InitializeCuGraph() const;
   void RunEdgeTraversal(int64_t* d_offsets, int64_t* d_indices, int64_t num_vertices, int64_t num_edges) const;

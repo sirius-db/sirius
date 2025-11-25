@@ -176,6 +176,127 @@ GPUGraphTraversalOperator::Execute(
   return OperatorResultType::FINISHED;
 }
 
+SourceResultType
+GPUGraphTraversalOperator::GetData(GPUIntermediateRelation& output_relation) const {
+
+  SIRIUS_LOG_INFO("Graph Traversal: GetData called");
+
+  // Execute child to get CSR data
+  GPUIntermediateRelation csr_data(2);
+  auto child_result = child->GetData(csr_data);
+
+  if (child_result != SourceResultType::FINISHED) {
+    return child_result;
+  }
+
+  // Get CSR pointers from child output
+  auto csr_op = dynamic_cast<GPUCSRConstructionOperator*>(child.get());
+  if (!csr_op) {
+    throw InternalException("Child operator is not GPUCSRConstructionOperator");
+  }
+
+  int64_t* d_offsets = csr_op->d_offsets;
+  int64_t* d_indices = csr_op->d_indices;
+  int64_t num_vertices = csr_op->num_vertices;
+  int64_t num_edges = csr_op->indices.size();
+
+  SIRIUS_LOG_DEBUG("CSR: {} vertices, {} edges", num_vertices, num_edges);
+
+  // Initialize cuGraph if needed
+  if (!handle_initialized) {
+    InitializeCuGraph();
+  }
+
+  // Execute the appropriate algorithm
+  switch (algorithm_type) {
+    case GraphAlgorithmType::EDGE_TRAVERSAL:
+      RunEdgeTraversal(d_offsets, d_indices, num_vertices, num_edges);
+      break;
+    case GraphAlgorithmType::BFS:
+    case GraphAlgorithmType::UNWEIGHTED_SHORTEST_PATH:
+    case GraphAlgorithmType::SHORTEST_DISTANCE:
+      RunBFS(d_offsets, d_indices, num_vertices, num_edges);
+      break;
+    case GraphAlgorithmType::WEIGHTED_SHORTEST_PATH:
+      if (!csr_op->has_weights) {
+        throw InvalidInputException("WEIGHTED_SHORTEST_PATH requires edge weights");
+      }
+      RunSSSP(d_offsets, d_indices, csr_op->d_weights, num_vertices, num_edges);
+      break;
+    default:
+      throw InternalException("Unknown algorithm type");
+  }
+
+  // Filter unreachable vertices (on CPU)
+  vector<int64_t> filtered_vertices;
+  vector<int64_t> filtered_distances;
+  vector<int64_t> filtered_predecessors;
+
+  for (size_t i = 0; i < result_vertices.size(); i++) {
+    if (result_distances[i] != std::numeric_limits<int64_t>::max()) {
+      filtered_vertices.push_back(result_vertices[i]);
+      filtered_distances.push_back(result_distances[i]);
+      if (is_path_query && i < result_predecessors.size()) {
+        filtered_predecessors.push_back(result_predecessors[i]);
+      }
+    }
+  }
+
+  size_t num_results = filtered_vertices.size();
+  SIRIUS_LOG_DEBUG("Graph traversal: {} reachable vertices", num_results);
+
+  // Transfer filtered results to GPU
+  GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+
+  int64_t* d_result_vertices = gpuBufferManager->customCudaMalloc<int64_t>(num_results, 0, 0);
+  int64_t* d_result_distances = gpuBufferManager->customCudaMalloc<int64_t>(num_results, 0, 0);
+
+  cudaMemcpy(d_result_vertices, filtered_vertices.data(),
+             num_results * sizeof(int64_t), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_result_distances, filtered_distances.data(),
+             num_results * sizeof(int64_t), cudaMemcpyHostToDevice);
+
+  // Create output columns
+  output_relation.columns.clear();
+
+  // Column 0: vertex_id
+  auto vertex_col = make_shared_ptr<GPUColumn>(
+    num_results,
+    GPUColumnType(GPUColumnTypeId::INT64),
+    reinterpret_cast<uint8_t*>(d_result_vertices),
+    nullptr
+  );
+  output_relation.columns.push_back(vertex_col);
+
+  // Column 1: distance
+  auto distance_col = make_shared_ptr<GPUColumn>(
+    num_results,
+    GPUColumnType(GPUColumnTypeId::INT64),
+    reinterpret_cast<uint8_t*>(d_result_distances),
+    nullptr
+  );
+  output_relation.columns.push_back(distance_col);
+
+  // Column 2: predecessor (if path query)
+  if (is_path_query && !filtered_predecessors.empty()) {
+    int64_t* d_result_predecessors = gpuBufferManager->customCudaMalloc<int64_t>(num_results, 0, 0);
+    cudaMemcpy(d_result_predecessors, filtered_predecessors.data(),
+               num_results * sizeof(int64_t), cudaMemcpyHostToDevice);
+
+    auto pred_col = make_shared_ptr<GPUColumn>(
+      num_results,
+      GPUColumnType(GPUColumnTypeId::INT64),
+      reinterpret_cast<uint8_t*>(d_result_predecessors),
+      nullptr
+    );
+    output_relation.columns.push_back(pred_col);
+  }
+
+  SIRIUS_LOG_INFO("Graph traversal complete: {} results", num_results);
+
+  return SourceResultType::FINISHED;
+}
+
 void
 GPUGraphTraversalOperator::InitializeCuGraph() const {
   if (handle_initialized) {
