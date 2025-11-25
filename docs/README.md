@@ -174,6 +174,14 @@ To load the TPC-H dataset to duckdb:
 .read tpch_load.sql
 ```
 
+### TPC-H Parquet Dataset (for Testing)
+
+To generate the TPC-H dataset in Parquet format for correctness testing:
+```
+mkdir -p test_datasets/tpch-dbgen-parquet
+duckdb < test/scripts/generate_parquet.sql
+```
+
 ### ClickBench Dataset
 
 To download the dataset run:
