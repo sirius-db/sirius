@@ -17,20 +17,25 @@ public:
   unique_ptr<GPUPhysicalOperator> child;
   string source_column;
   string dest_column;
+  string weight_column;
 
   // CSR data structures (CPU side for now)
   mutable vector<int64_t> offsets;
   mutable vector<int64_t> indices;
+  mutable vector<double> weights;
   mutable int64_t num_vertices;
+  mutable bool has_weights;
 
   // GPU pointers (will be allocated later)
   mutable int64_t* d_offsets = nullptr;
   mutable int64_t* d_indices = nullptr;
+  mutable double* d_weights = nullptr;
 
   GPUCSRConstructionOperator(
     unique_ptr<GPUPhysicalOperator> child,
     const string& src_col,
     const string& dst_col,
+    const string& weight_col,
     ClientContext& context,
     GPUContext& gpu_context
   );
@@ -44,6 +49,7 @@ public:
 
 private:
   void BuildCSR(const vector<int64_t>& src, const vector<int64_t>& dst) const;
+  void BuildCSRWithWeights(const vector<int64_t>& src, const vector<int64_t>& dst, const vector<double>& weights_in) const;
   void TransferCSRToGPU() const;
   mutable bool csr_built = false;
 };

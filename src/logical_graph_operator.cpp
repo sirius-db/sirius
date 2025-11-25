@@ -16,11 +16,18 @@ LogicalGraphOperator::LogicalGraphOperator(const ParsedGraphQuery& parsed)
       max_hops(parsed.max_hops),
       is_left_directed(parsed.is_left_directed),
       is_right_directed(parsed.is_right_directed),
-      is_any_directed(parsed.is_any_directed) {
+      is_any_directed(parsed.is_any_directed),
+      is_left_right_directed(parsed.is_left_right_directed),
+      is_path_query(parsed.is_path_query),
+      path_pattern(parsed.path_pattern),
+      weight_column(parsed.weight_column) {
 
   // Set up output schema: (vertex_id BIGINT, distance BIGINT)
   types.push_back(LogicalType::BIGINT);
   types.push_back(LogicalType::BIGINT);
+  if (is_path_query) {
+    types.push_back(LogicalType::BIGINT);  // path_length
+  }
 }
 
 string LogicalGraphOperator::GetName() const {
@@ -29,10 +36,11 @@ string LogicalGraphOperator::GetName() const {
 
 string LogicalGraphOperator::ToString() const {
   return StringUtil::Format(
-      "GRAPH_TRAVERSAL[table=%s, source=%lld, algo=%s]",
-      edge_table.c_str(),
-      (long long)source_vertex,
-      algorithm_type.c_str()
+    "GRAPH_TRAVERSAL[table=%s, source=%lld, algo=%s, path=%s]",
+    edge_table.c_str(),
+    (long long) source_vertex,
+    algorithm_type.c_str(),
+    is_path_query ? "true" : "false"
   );
 }
 

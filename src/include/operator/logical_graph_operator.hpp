@@ -17,9 +17,17 @@ struct ParsedGraphQuery {
   int64_t source_vertex = -1;
   string algorithm_type;
   int max_hops = -1;
+
   bool is_left_directed = false;
   bool is_right_directed = false;
   bool is_any_directed = false;
+  bool is_left_right_directed = false;
+
+  // Path query flags
+  bool is_path_query = false;
+  string path_pattern = "";
+  string weight_column = "";
+
   bool parse_success = false;
 };
 
@@ -34,6 +42,10 @@ public:
   bool is_left_directed;
   bool is_right_directed;
   bool is_any_directed;
+  bool is_left_right_directed;
+  bool is_path_query;
+  string path_pattern;
+  string weight_column;
 
   explicit LogicalGraphOperator(const ParsedGraphQuery& parsed);
 
@@ -51,6 +63,14 @@ public:
   vector<ColumnBinding> GetColumnBindings() override {
     // Graph operator produces vertex_id and distance columns
     // They don't come from any table, so we create synthetic bindings
+    if (is_path_query) {
+      // may need additional columns (path_length, edges, etc.)
+      return {
+        ColumnBinding(0, 0),  // vertex_id
+        ColumnBinding(0, 1),  // distance/path_length
+        ColumnBinding(0, 2)   // (optional) predecessor, for path reconsutrtrcuuction
+      };
+    }
     return {
       ColumnBinding(0, 0),  // vertex_id
       ColumnBinding(0, 1)   // distance
@@ -59,10 +79,12 @@ public:
 
 protected:
   void ResolveTypes() override {
-    // Graph operator returns (vertex_id BIGINT, distance BIGINT)
     types.clear();
     types.push_back(LogicalType::BIGINT);
     types.push_back(LogicalType::BIGINT);
+    if (is_path_query) {
+      types.push_back(LogicalType::BIGINT);  // path_length or path info
+    }
   }
 };
 

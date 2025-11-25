@@ -78,10 +78,19 @@ struct GraphProcessingFunctionData : public TableFunctionData {
   unique_ptr<Connection> conn;
   unique_ptr<GPUContext> gpu_context;
 
-  string graph_query;       // Original graph query string
-  string edge_table;        // Extracted edge table name
-  int64_t source_vertex;    // Source vertex ID
-  string algorithm_type;    // "SHORTEST_PATH", "SHORTEST_DISTANCE", etc.
+  string graph_query;
+  string edge_table;
+  int64_t source_vertex;
+  string algorithm_type;
+
+  // Graph query parameters
+  bool is_path_query = false;
+  string path_pattern = "";
+  string weight_column = "";
+  bool is_left_directed = false;
+  bool is_right_directed = false;
+  bool is_any_directed = false;
+  bool is_left_right_directed = false;
 
   // Execution state flags
   bool finished = false;
@@ -511,81 +520,119 @@ SiriusExtension::GPUBufferInitFunction(ClientContext &context, TableFunctionInpu
 
 ParsedGraphQuery
 SiriusExtension::ParseGraphQuery(const string& query) {
-    ParsedGraphQuery result;
+  ParsedGraphQuery result;
+  string query_upper = query;
+  ranges::transform(query_upper.begin(), query_upper.end(),
+  query_upper.begin(), ::toupper);
 
-    // Detect algorithm type
-    if (query.find("->*") != string::npos ||
-        query.find("SHORTEST") != string::npos ||
-        query.find("shortest") != string::npos) {
-        result.algorithm_type = "SHORTEST_PATH";
-    } else if (query.find("DISTANCE") != string::npos) {
-        result.algorithm_type = "SHORTEST_DISTANCE";
+  // 1. Detect if this is a PATH query vs simple TRAVERSAL
+  bool is_path_query = query.find("MATCH P =") != string::npos ||
+                        query.find("MATCH P=") != string::npos;
+  result.is_path_query = is_path_query;  // Add this field to ParsedGraphQuery
+
+  // 2. Detect algorithm type based on keywords and patterns
+  if (query.find("ANY SHORTEST") != string::npos) {
+    // Unweighted shortest path (uses BFS)
+    result.algorithm_type = "UNWEIGHTED_SHORTEST_PATH";
+
+    // Check for hop patterns: ->+ (one or more), ->* (zero or more), -> (direct)
+    if (query.find("->+") != string::npos) {
+      result.path_pattern = "ONE_OR_MORE";
+    } else if (query.find("->*") != string::npos) {
+      result.path_pattern = "ZERO_OR_MORE";
     } else {
-        result.algorithm_type = "BFS";  // Default
+      result.path_pattern = "DIRECT";
     }
+  } else if (query.find("SHORTEST DISTANCE") != string::npos ||
+             query.find("CHEAPEST PATH") != string::npos) {
+    // Weighted shortest path (uses SSSP/Bellman-Ford)
+    result.algorithm_type = "WEIGHTED_SHORTEST_PATH";
+  } else if (query.find("->*") != string::npos ||
+             query.find("->+") != string::npos) {
+    // Simple traversal with patterns
+    result.algorithm_type = "BFS";
+  } else {
+    // Default: simple edge traversal
+    result.algorithm_type = "EDGE_TRAVERSAL";
+  }
 
-    // Detect edge direction
-    if (query.find("<-") != string::npos && query.find("->") != string::npos) {
-        result.is_left_directed = true;
-        result.is_right_directed = true;
-    } else if (query.find("<-") != string::npos) {
-        result.is_left_directed = true;
-    } else if (query.find("->") != string::npos) {
-        result.is_right_directed = true;
+  // 3. Detect edge direction
+  if (query.find("<-") != string::npos && query.find("->") != string::npos) {
+    // Check if it's left-right directed: ()<-[]->()
+    size_t left_arrow = query.find("<-");
+    size_t right_arrow = query.find("->");
+    if (right_arrow > left_arrow && right_arrow - left_arrow < 10) {
+      result.is_left_right_directed = true;
     } else {
-        result.is_any_directed = true;
+      result.is_left_directed = true;
+      result.is_right_directed = true;
     }
+  } else if (query.find("<-") != string::npos) {
+    result.is_left_directed = true;
+  } else if (query.find("->") != string::npos) {
+    result.is_right_directed = true;
+  } else {
+    result.is_any_directed = true;
+  }
 
-    // Extract edge table name (from -[:knows]-> or -[e:knows]->)
-    size_t edge_start = query.find("-[");
-    if (edge_start != string::npos) {
-        edge_start += 2; // Move past "-["
-
-        // Skip optional variable name (e:)
-        size_t colon_pos = query.find(":", edge_start);
-        if (colon_pos != string::npos && colon_pos < query.find("]", edge_start)) {
-            edge_start = colon_pos + 1;
-        }
-
-        size_t edge_end = query.find("]", edge_start);
-        if (edge_end != string::npos) {
-            result.edge_table = query.substr(edge_start, edge_end - edge_start);
-            // Trim whitespace
-            result.edge_table.erase(0, result.edge_table.find_first_not_of(" \t"));
-            result.edge_table.erase(result.edge_table.find_last_not_of(" \t") + 1);
-        }
+  // 4. Extract edge table name
+  size_t edge_start = query.find("-[");
+  if (edge_start != string::npos) {
+    edge_start += 2;
+    size_t colon_pos = query.find(":", edge_start);
+    if (colon_pos != string::npos && colon_pos < query.find("]", edge_start)) {
+      edge_start = colon_pos + 1;
     }
-
-    // Extract source vertex ID (from WHERE p.id=14)
-    size_t where_pos = query.find("WHERE");
-    if (where_pos == string::npos) {
-        where_pos = query.find("where");
+    size_t edge_end = query.find("]", edge_start);
+    if (edge_end != string::npos) {
+      result.edge_table = query.substr(edge_start, edge_end - edge_start);
+      result.edge_table.erase(0, result.edge_table.find_first_not_of(" \t"));
+      result.edge_table.erase(result.edge_table.find_last_not_of(" \t") + 1);
     }
+  }
 
-    if (where_pos != string::npos) {
-        size_t eq_pos = query.find("=", where_pos);
-        if (eq_pos != string::npos) {
-            size_t num_start = eq_pos + 1;
-            // Skip whitespace
-            while (num_start < query.length() && isspace(query[num_start])) {
-                num_start++;
-            }
-            // Extract digits
-            size_t num_end = num_start;
-            while (num_end < query.length() && isdigit(query[num_end])) {
-                num_end++;
-            }
-            if (num_end > num_start) {
-                string num_str = query.substr(num_start, num_end - num_start);
-                result.source_vertex = std::stoll(num_str);
-            }
-        }
+  // 5. Extract source vertex
+  size_t where_pos = query.find("WHERE");
+  if (where_pos == string::npos) {
+    where_pos = query.find("where");
+  }
+  if (where_pos != string::npos) {
+    size_t eq_pos = query.find("=", where_pos);
+    if (eq_pos != string::npos) {
+      size_t num_start = eq_pos + 1;
+      while (num_start < query.length() && isspace(query[num_start])) {
+        num_start++;
+      }
+      size_t num_end = num_start;
+      while (num_end < query.length() && isdigit(query[num_end])) {
+        num_end++;
+      }
+      if (num_end > num_start) {
+        string num_str = query.substr(num_start, num_end - num_start);
+        result.source_vertex = std::stoll(num_str);
+      }
     }
+  }
 
-    // Validate we got the minimum required info
-    result.parse_success = !result.edge_table.empty() && result.source_vertex >= 0;
+  // 6. Check for weight column (for weighted shortest path)
+  // Look for patterns like [w:worksAt] where w is the weight variable
+  if (result.algorithm_type == "WEIGHTED_SHORTEST_PATH") {
+    size_t bracket_start = query.find("[");
+    size_t bracket_end = query.find("]");
+    if (bracket_start != string::npos && bracket_end != string::npos) {
+      string bracket_content = query.substr(bracket_start + 1, bracket_end - bracket_start - 1);
+      size_t colon = bracket_content.find(":");
+      if (colon != string::npos) {
+        result.weight_column = bracket_content.substr(0, colon);
+        // Trim whitespace
+        result.weight_column.erase(0, result.weight_column.find_first_not_of(" \t"));
+        result.weight_column.erase(result.weight_column.find_last_not_of(" \t") + 1);
+      }
+    }
+  }
 
-    return result;
+  result.parse_success = !result.edge_table.empty() && result.source_vertex >= 0;
+  return result;
 }
 
 unique_ptr<LogicalOperator>

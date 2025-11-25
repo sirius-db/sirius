@@ -180,6 +180,7 @@ GPUPhysicalPlanGenerator::CreateGraphPhysicalPlan(LogicalGraphOperator* graph_op
       std::move(edge_scan),
       graph_op->source_column,
       graph_op->dest_column,
+      graph_op->weight_column,
       context,
       gpu_context
   );
@@ -189,7 +190,9 @@ GPUPhysicalPlanGenerator::CreateGraphPhysicalPlan(LogicalGraphOperator* graph_op
       std::move(csr_builder),
       graph_op->source_vertex,
       graph_op->algorithm_type,
+      graph_op->is_path_query,
       graph_op->max_hops,
+      graph_op->weight_column,
       context,
       gpu_context
   );

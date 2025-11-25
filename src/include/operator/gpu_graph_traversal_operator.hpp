@@ -12,26 +12,39 @@
 
 namespace duckdb {
 
+enum class GraphAlgorithmType {
+  EDGE_TRAVERSAL,           // Simple edge scanning
+  BFS,                      // Breadth-first search (unweighted)
+  UNWEIGHTED_SHORTEST_PATH, // BFS but return full paths
+  WEIGHTED_SHORTEST_PATH,   // SSSP (Bellman-Ford or Dijkstra)
+  SHORTEST_DISTANCE         // BFS but only return distances
+};
+
 class GPUGraphTraversalOperator : public GPUPhysicalOperator {
 public:
   unique_ptr<GPUPhysicalOperator> child;  // CSR construction operator
   int64_t source_vertex;
-  string algorithm_type;
+  GraphAlgorithmType algorithm_type;
   int max_hops;
+  bool is_path_query;
+  string weight_column;
 
   // Result data
   mutable vector<int64_t> result_vertices;
   mutable vector<int64_t> result_distances;
+  mutable vector<int64_t> result_predecessors;  // For path reconstruction
 
   // cuGraph handles
   mutable void* cugraph_handle = nullptr;
   mutable bool handle_initialized = false;
 
   GPUGraphTraversalOperator(
-    unique_ptr<GPUPhysicalOperator> child,
+    unique_ptr<GPUPhysicalOperator> child_op,
     int64_t source,
-    const string& algo,
+    const string& algo_str,
+    bool is_path,
     int max_hops,
+    const string& weight_col,
     ClientContext& context,
     GPUContext& gpu_context
   );
@@ -45,8 +58,12 @@ public:
 
 private:
   void InitializeCuGraph() const;
+  void RunEdgeTraversal(int64_t* d_offsets, int64_t* d_indices, int64_t num_vertices, int64_t num_edges) const;
   void RunBFS(int64_t* d_offsets, int64_t* d_indices, int64_t num_vertices, int64_t num_edges) const;
-  void RunSSSP(int64_t* d_offsets, int64_t* d_indices, int64_t num_vertices, int64_t num_edges) const;
+  void RunSSSP(int64_t* d_offsets, int64_t* d_indices, double* d_weights, int64_t num_vertices, int64_t num_edges) const;
+
+  // Helper to convert string algorithm type to enum
+  static GraphAlgorithmType StringToAlgorithmType(const string& algo_str);
 };
 
 } // namespace duckdb
