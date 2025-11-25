@@ -19,27 +19,39 @@
 #include <functional>
 #include <utility>
 
-namespace sirius {
-namespace memory {
+namespace sirius
+{
+namespace memory
+{
 
 /**
  * Memory tier enumeration representing different types of memory storage.
  * Ordered roughly by performance (fastest to slowest access).
  */
-enum class Tier {
-    GPU,    // GPU device memory (fastest but limited)
-    HOST,   // Host system memory (fast, larger capacity)
-    DISK,   // Disk/storage memory (slowest but largest capacity)
-    SIZE    // Value = size of the enum, allows code to be more dynamic
+enum class Tier
+{
+  GPU,  // GPU device memory (fastest but limited)
+  HOST, // Host system memory (fast, larger capacity)
+  DISK, // Disk/storage memory (slowest but largest capacity)
+  SIZE  // Value = size of the enum, allows code to be more dynamic
 };
 
 } // namespace memory
 } // namespace sirius
 
 // Specialization for std::hash to enable use of std::pair<Tier, size_t> as key
-namespace std {
-    template<>
-    struct hash<std::pair<sirius::memory::Tier, size_t>> {
-        size_t operator()(const std::pair<sirius::memory::Tier, size_t>& p) const;
-    };
-}
+namespace std
+{
+template <>
+struct hash<std::pair<sirius::memory::Tier, size_t>>
+{
+  size_t operator()(const std::pair<sirius::memory::Tier, size_t>& p) const;
+};
+
+// Specialization for std::hash to enable use of std::pair<Tier, int> as key
+template <>
+struct hash<std::pair<sirius::memory::Tier, int>>
+{
+  size_t operator()(const std::pair<sirius::memory::Tier, int>& p) const;
+};
+} // namespace std

@@ -355,7 +355,7 @@ public:
   memory_reservation_manager& operator=(memory_reservation_manager&&)      = delete;
 
   // Public destructor (required for std::unique_ptr)
-  ~memory_reservation_manager() = default;
+  ~memory_reservation_manager();
 
   //===----------------------------------------------------------------------===//
   // Reservation Interface

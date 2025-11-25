@@ -16,10 +16,17 @@
 
 #include "memory/common.hpp"
 
-namespace std {
-    size_t hash<std::pair<sirius::memory::Tier, size_t>>::operator()(
-        const std::pair<sirius::memory::Tier, size_t>& p) const {
-        return std::hash<int>{}(static_cast<int>(p.first)) ^ 
-               (std::hash<size_t>{}(p.second) << 1);
-    }
+namespace std
+{
+size_t hash<std::pair<sirius::memory::Tier, size_t>>::operator()(
+  const std::pair<sirius::memory::Tier, size_t>& p) const
+{
+  return std::hash<int>{}(static_cast<int>(p.first)) ^ (std::hash<size_t>{}(p.second) << 1);
 }
+
+size_t hash<std::pair<sirius::memory::Tier, int>>::operator()(
+  const std::pair<sirius::memory::Tier, int>& p) const
+{
+  return std::hash<int>{}(static_cast<int>(p.first)) ^ (std::hash<int>{}(p.second) << 1);
+}
+} // namespace std

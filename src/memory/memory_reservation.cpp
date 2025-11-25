@@ -25,6 +25,9 @@ namespace sirius
 namespace memory
 {
 
+// Provide out-of-line definition for the virtual destructor to satisfy linker
+reservation_limit_policy::~reservation_limit_policy() = default;
+
 //===----------------------------------------------------------------------===//
 // reservation Implementation
 //===----------------------------------------------------------------------===//
@@ -171,7 +174,7 @@ memory_reservation_manager::memory_reservation_manager(std::vector<memory_space_
 
 memory_reservation_manager::memory_space_config::memory_space_config(
   Tier t,
-  size_t dev_id,
+  int dev_id,
   size_t mem_limit,
   std::vector<std::unique_ptr<rmm::mr::device_memory_resource>> allocs)
     : tier(t)
@@ -483,19 +486,31 @@ void memory_reservation_manager::build_lookup_tables()
   }
 }
 
+memory_reservation_manager::~memory_reservation_manager()
+{
+  shutdown_requested.store(true);
+  while (!shutdown_finished.load())
+  {
+    std::this_thread::yield();
+  }
+}
+
 void memory_reservation_manager::schedule_downgrade_thread()
 {
   std::thread([this]() {
     while (!shutdown_requested.load())
     {
-      break;
-      if (shutdown_requested.load())
+      for (const auto& space : _memory_spaces)
       {
-        break;
+        if (space->should_downgrade_memory())
+        {
+          size_t amount_to_downgrade = space->get_amount_to_downgrade();
+          // auto data_batches =
+          // _data_repository_manager.get_data_batches_for_downgrade(space->get_id(),
+          // amount_to_downgrade);
+        }
       }
-      std::this_thread::sleep_for(std::chrono::seconds(1));
     }
-    shutdown_finished.store(true);
   }).detach();
 }
 

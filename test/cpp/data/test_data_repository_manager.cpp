@@ -34,8 +34,7 @@ class mock_memory_space : public memory::memory_space
 {
 public:
   mock_memory_space(memory::Tier tier, size_t device_id = 0)
-      : memory::memory_space(tier,
-                             device_id,
+      : memory::memory_space(memory::memory_space_id{tier, static_cast<int>(device_id)},
                              1024 * 1024 * 1024,
                              (1024ULL * 1024ULL * 1024ULL) * 8 / 10,
                              (1024ULL * 1024ULL * 1024ULL) / 2,

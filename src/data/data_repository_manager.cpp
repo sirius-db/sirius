@@ -66,7 +66,7 @@ std::vector<std::unique_ptr<data_batch>> data_repository_manager::get_data_batch
   for (auto& [batch_id, batch] : _data_batches)
   {
 
-    if (batch->get_memory_space()->get_id() == memory_space_id&&)
+    if (batch->get_memory_space()->get_id() == memory_space_id)
     {
       data_batches.push_back(std::move(batch));
     }
