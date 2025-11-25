@@ -200,11 +200,53 @@ GPUGraphTraversalOperator::RunEdgeTraversal(
   int64_t num_vertices,
   int64_t num_edges
 ) const {
-  SIRIUS_LOG_DEBUG("Running edge traversal");
+  SIRIUS_LOG_INFO("Running edge traversal from source vertex {}", source_vertex);
 
-  // TODO: edge traversal is just nested joins
+  // Validate source vertex
+  if (source_vertex < 0 || source_vertex >= num_vertices) {
+    throw InvalidInputException(
+      StringUtil::Format("Source vertex %lld out of range [0, %lld)",
+                        source_vertex, num_vertices)
+    );
+  }
 
-  throw NotImplementedException("Edge traversal not yet implemented");
+  // Get offset range for this vertex in CSR
+  vector<int64_t> h_offsets(2);
+  cudaMemcpy(h_offsets.data(), &d_offsets[source_vertex],
+             2 * sizeof(int64_t), cudaMemcpyDeviceToHost);
+
+  int64_t edge_start = h_offsets[0];
+  int64_t edge_end = h_offsets[1];
+  int64_t num_edges_from_source = edge_end - edge_start;
+
+  SIRIUS_LOG_DEBUG("Source vertex {} has {} outgoing edges",
+                   source_vertex, num_edges_from_source);
+
+  if (num_edges_from_source == 0) {
+    // No edges from this vertex
+    result_vertices.clear();
+    result_distances.clear();
+    SIRIUS_LOG_INFO("No edges from source vertex {}", source_vertex);
+    return;
+  }
+
+  // Copy the destination vertices for these edges
+  result_vertices.resize(num_edges_from_source);
+  cudaMemcpy(result_vertices.data(), &d_indices[edge_start],
+             num_edges_from_source * sizeof(int64_t), cudaMemcpyDeviceToHost);
+
+  // All edges have distance 1 (one hop)
+  result_distances.resize(num_edges_from_source);
+  std::fill(result_distances.begin(), result_distances.end(), 1);
+
+  // If path query, set predecessors (all point back to source)
+  if (is_path_query) {
+    result_predecessors.resize(num_edges_from_source);
+    std::fill(result_predecessors.begin(), result_predecessors.end(), source_vertex);
+  }
+
+  SIRIUS_LOG_INFO("Edge traversal complete: {} edges from vertex {}",
+                  num_edges_from_source, source_vertex);
 }
 
 void

@@ -22,6 +22,15 @@
   class GPUBufferManager;
   struct ParsedGraphQuery;
   class LogicalGraphOperator;
+
+  struct GraphMetadata {
+    string vertex_table;
+    string edge_table;
+    string src_column;
+    string dst_column;
+    string weight_column;  // optional
+  };
+
   class SiriusExtension : public Extension {
   public:
 	  void Load(DuckDB &db) override;
@@ -46,6 +55,9 @@
     );
     static void GPUProcessingGraphFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output);
     static unique_ptr<FunctionData> GPUProcessingGraphBind(ClientContext &context, TableFunctionBindInput &input, vector<LogicalType> &return_types, vector<string> &names);
+    static std::unordered_map<string, GraphMetadata> graph_registry;
+    static void RegisterGraph(const string& graph_name, const GraphMetadata& metadata);
+    static GraphMetadata* LookupGraph(const string& graph_name);
 
 	  static bool buffer_is_initialized;
   };

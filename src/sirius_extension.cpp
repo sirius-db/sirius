@@ -29,6 +29,7 @@
 #include "duckdb/parser/statement/relation_statement.hpp"
 #include "duckdb/main/query_result.hpp"
 #include "duckdb/main/prepared_statement_data.hpp"
+#include "duckdb/main/extension_util.hpp"
 #include "duckdb/common/assert.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/duck_schema_entry.hpp"
@@ -55,6 +56,7 @@ namespace duckdb {
 
 const std::string PINNED_MEMORY_PARAM_KEY = "pinned_memory_size";
 bool SiriusExtension::buffer_is_initialized = false;
+std::unordered_map<string, GraphMetadata> SiriusExtension::graph_registry; // Static registry (persists per session)
 
 struct GPUTableFunctionData : public TableFunctionData {
 	GPUTableFunctionData() = default;
@@ -521,18 +523,51 @@ SiriusExtension::GPUBufferInitFunction(ClientContext &context, TableFunctionInpu
 ParsedGraphQuery
 SiriusExtension::ParseGraphQuery(const string& query) {
   ParsedGraphQuery result;
+
+  // Convert to uppercase
   string query_upper = query;
   ranges::transform(query_upper.begin(), query_upper.end(),
   query_upper.begin(), ::toupper);
 
+  // Extract graph name from "FROM GRAPH_TABLE (graph_name MATCH ...)"
+  size_t graph_table_pos = query_upper.find("GRAPH_TABLE");
+  if (graph_table_pos != string::npos) {
+    size_t open_paren = query_upper.find("(", graph_table_pos);
+    size_t space_or_match = query_upper.find_first_of(" \t\n", open_paren + 1);
+
+    if (open_paren != string::npos && space_or_match != string::npos) {
+      string graph_name = query.substr(open_paren + 1, space_or_match - open_paren - 1);
+
+      // Trim whitespace
+      graph_name.erase(0, graph_name.find_first_not_of(" \t\n"));
+      graph_name.erase(graph_name.find_last_not_of(" \t\n") + 1);
+
+      // Look up in registry
+      auto* metadata = LookupGraph(graph_name);
+      if (metadata) {
+        SIRIUS_LOG_DEBUG("Found registered graph '{}': edge_table={}",
+                        graph_name, metadata->edge_table);
+
+        result.edge_table = metadata->edge_table;
+        result.source_column = metadata->src_column;
+        result.dest_column = metadata->dst_column;
+        result.weight_column = metadata->weight_column;
+      } else {
+        SIRIUS_LOG_WARN("Graph '{}' not registered, treating as edge table name", graph_name);
+        result.edge_table = graph_name;
+        result.source_column = "src";
+        result.dest_column = "dst";
+      }
+    }
+  }
+
   // 1. Detect if this is a PATH query vs simple TRAVERSAL
-  bool is_path_query = query.find("MATCH P =") != string::npos ||
-                        query.find("MATCH P=") != string::npos;
-  result.is_path_query = is_path_query;  // Add this field to ParsedGraphQuery
+  bool is_path_query = query_upper.find("MATCH P =") != string::npos ||
+                       query_upper.find("MATCH P=") != string::npos;
+  result.is_path_query = is_path_query;
 
   // 2. Detect algorithm type based on keywords and patterns
-  if (query.find("ANY SHORTEST") != string::npos) {
-    // Unweighted shortest path (uses BFS)
+  if (query_upper.find("ANY SHORTEST") != string::npos) {
     result.algorithm_type = "UNWEIGHTED_SHORTEST_PATH";
 
     // Check for hop patterns: ->+ (one or more), ->* (zero or more), -> (direct)
@@ -543,22 +578,18 @@ SiriusExtension::ParseGraphQuery(const string& query) {
     } else {
       result.path_pattern = "DIRECT";
     }
-  } else if (query.find("SHORTEST DISTANCE") != string::npos ||
-             query.find("CHEAPEST PATH") != string::npos) {
-    // Weighted shortest path (uses SSSP/Bellman-Ford)
+  } else if (query_upper.find("SHORTEST DISTANCE") != string::npos ||
+             query_upper.find("CHEAPEST PATH") != string::npos) {
     result.algorithm_type = "WEIGHTED_SHORTEST_PATH";
   } else if (query.find("->*") != string::npos ||
              query.find("->+") != string::npos) {
-    // Simple traversal with patterns
     result.algorithm_type = "BFS";
   } else {
-    // Default: simple edge traversal
     result.algorithm_type = "EDGE_TRAVERSAL";
   }
 
   // 3. Detect edge direction
   if (query.find("<-") != string::npos && query.find("->") != string::npos) {
-    // Check if it's left-right directed: ()<-[]->()
     size_t left_arrow = query.find("<-");
     size_t right_arrow = query.find("->");
     if (right_arrow > left_arrow && right_arrow - left_arrow < 10) {
@@ -592,10 +623,7 @@ SiriusExtension::ParseGraphQuery(const string& query) {
   }
 
   // 5. Extract source vertex
-  size_t where_pos = query.find("WHERE");
-  if (where_pos == string::npos) {
-    where_pos = query.find("where");
-  }
+  size_t where_pos = query_upper.find("WHERE");
   if (where_pos != string::npos) {
     size_t eq_pos = query.find("=", where_pos);
     if (eq_pos != string::npos) {
@@ -624,7 +652,6 @@ SiriusExtension::ParseGraphQuery(const string& query) {
       size_t colon = bracket_content.find(":");
       if (colon != string::npos) {
         result.weight_column = bracket_content.substr(0, colon);
-        // Trim whitespace
         result.weight_column.erase(0, result.weight_column.find_first_not_of(" \t"));
         result.weight_column.erase(result.weight_column.find_last_not_of(" \t") + 1);
       }
@@ -808,6 +835,49 @@ SiriusExtension::GPUProcessingGraphFunction(ClientContext &context, TableFunctio
     output.Reference(*result_chunk);
 }
 
+void SiriusExtension::RegisterGraph(const string& graph_name, const GraphMetadata& metadata) {
+  graph_registry[graph_name] = metadata;
+  SIRIUS_LOG_INFO("Registered graph '{}': vertex={}, edge={}, src={}, dst={}, weight={}",
+                  graph_name, metadata.vertex_table, metadata.edge_table,
+                  metadata.src_column, metadata.dst_column, metadata.weight_column);
+}
+
+GraphMetadata* SiriusExtension::LookupGraph(const string& graph_name) {
+  auto it = graph_registry.find(graph_name);
+  if (it != graph_registry.end()) {
+    return &(it->second);
+  }
+  return nullptr;
+}
+
+// Scalar function for registration
+static void RegisterGraphScalarFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+  auto &graph_name_vec = args.data[0];
+  auto &vertex_table_vec = args.data[1];
+  auto &edge_table_vec = args.data[2];
+  auto &src_col_vec = args.data[3];
+  auto &dst_col_vec = args.data[4];
+  auto &weight_col_vec = args.data[5];
+
+  auto graph_name = graph_name_vec.GetValue(0).ToString();
+  auto vertex_table = vertex_table_vec.GetValue(0).ToString();
+  auto edge_table = edge_table_vec.GetValue(0).ToString();
+  auto src_col = src_col_vec.GetValue(0).ToString();
+  auto dst_col = dst_col_vec.GetValue(0).ToString();
+
+  // Weight column is optional (can be NULL)
+  string weight_col = "";
+  if (!weight_col_vec.GetValue(0).IsNull()) {
+    weight_col = weight_col_vec.GetValue(0).ToString();
+  }
+
+  GraphMetadata metadata{vertex_table, edge_table, src_col, dst_col, weight_col};
+  SiriusExtension::RegisterGraph(graph_name, metadata);
+
+  // Return success
+  result.SetValue(0, Value::BOOLEAN(true));
+}
+
 
 void SiriusExtension::InitializeGPUExtension(Connection &con) {
 	auto &catalog = Catalog::GetSystemCatalog(*con.context);
@@ -941,6 +1011,25 @@ void SiriusExtension::Load(DuckDB &db) {
 	InitializeGPUExtension(con);
 
 	con.Commit();
+
+  // Register the graph registration function
+  auto register_graph_func = ScalarFunction(
+    "sirius_register_graph",
+    {
+      LogicalType::VARCHAR,   // graph_name
+      LogicalType::VARCHAR,   // vertex_table
+      LogicalType::VARCHAR,   // edge_table
+      LogicalType::VARCHAR,   // src_column
+      LogicalType::VARCHAR,   // dst_column
+      LogicalType::VARCHAR  // weight_column (optional, can pass NULL)
+    },
+    LogicalType::BOOLEAN,    // returns true on success
+    RegisterGraphScalarFunction
+  );
+
+  ExtensionUtil::RegisterFunction(*db.instance, register_graph_func);
+
+  SIRIUS_LOG_INFO("Registered sirius_register_graph function");
 }
 
 std::string SiriusExtension::Name() {
