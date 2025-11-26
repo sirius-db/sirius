@@ -22,6 +22,7 @@
 #include "duckdb/main/materialized_query_result.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "utils.hpp"
+#include "parquet/gpu_parquet_reader.hpp"
 
 namespace duckdb {
 
@@ -127,6 +128,7 @@ public:
 	void createTable(string table_name, size_t column_count);
 	void createColumn(string table_name, string column_name, GPUColumnType column_type, size_t column_id, vector<size_t> unique_columns);
 	bool checkIfColumnCached(string table_name, string column_name);
+	shared_ptr<GPUIntermediateRelation> LoadParquetTable(const string &logical_name, const GPUParquetReaderOptions &options);
 
 	std::vector<std::unique_ptr<rmm::device_buffer>> rmm_stored_buffers;
 

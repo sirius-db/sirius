@@ -31,6 +31,9 @@ ResolveTypeMaterializeExpression(shared_ptr<GPUColumn> column, GPUBufferManager*
 shared_ptr<GPUColumn> 
 HandleMaterializeExpression(shared_ptr<GPUColumn> column, GPUBufferManager* gpuBufferManager);
 
+shared_ptr<GPUColumn> 
+ResolveTypeMaterializeString(shared_ptr<GPUColumn> column, GPUBufferManager* gpuBufferManager);
+
 void
 HandleMaterializeRowIDs(GPUIntermediateRelation& input_relation, GPUIntermediateRelation& output_relation, uint64_t count, uint64_t* row_ids, GPUBufferManager* gpuBufferManager, bool maintain_unique);
 

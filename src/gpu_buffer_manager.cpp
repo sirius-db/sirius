@@ -377,13 +377,12 @@ GPUBufferManager::customCudaFree(uint8_t* ptr, int gpu) {
     }
     auto it = allocation_table[gpu].find(reinterpret_cast<void*>(ptr));
     if (it != allocation_table[gpu].end()) {
-        // SIRIUS_LOG_DEBUG("Deallocating Pointer {} size {}", static_cast<void*>(ptr), it->second);
+        SIRIUS_LOG_DEBUG("Deallocating Pointer {} size {}", static_cast<void*>(ptr), it->second);
         mr->deallocate((void*) ptr, it->second);
         allocation_table[gpu].erase(it);
     } else {
         auto locked_it = locked_allocation_table[gpu].find(reinterpret_cast<void*>(ptr));
         if (locked_it == locked_allocation_table[gpu].end()) {
-            // check if in rmm_stored_buffer
             bool found = 0;
             for (int it = 0; it < rmm_stored_buffers.size(); it++) {
                 if (ptr == reinterpret_cast<uint8_t*>(rmm_stored_buffers[it]->data())) {
@@ -511,6 +510,19 @@ GPUBufferManager::createColumn(string up_table_name, string up_column_name, GPUC
         table->columns[column_id] = make_shared_ptr<GPUColumn>(0, column_type, nullptr, nullptr);
         table->columns[column_id]->is_unique = false;
     }
+}
+
+shared_ptr<GPUIntermediateRelation>
+GPUBufferManager::LoadParquetTable(const string &logical_name, const GPUParquetReaderOptions &options) {
+	if (logical_name.empty()) {
+		throw InvalidInputException("LoadParquetTable requires a logical table name");
+	}
+	string up_name = logical_name;
+	transform(up_name.begin(), up_name.end(), up_name.begin(), ::toupper);
+	auto relation = GPUParquetReader::ReadFile(options);
+	relation->names = up_name;
+	tables[up_name] = relation;
+	return relation;
 }
 
 }; // namespace duckdb

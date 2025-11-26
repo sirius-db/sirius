@@ -51,6 +51,42 @@ ResolveTypeMaterializeString(shared_ptr<GPUColumn> column, GPUBufferManager* gpu
     uint64_t* result_offset; 
     uint64_t* new_num_bytes;
     cudf::bitmask_type* out_mask = nullptr;
+    // Check where the offset pointer comes from
+    uint64_t* offset_ptr = column->data_wrapper.offset;
+    if (offset_ptr != nullptr) {
+        GPUBufferManager* bm = &(GPUBufferManager::GetInstance());
+        uint8_t* offset_ptr_bytes = reinterpret_cast<uint8_t*>(offset_ptr);
+        bool in_gpu_cache = (offset_ptr_bytes >= bm->gpuCache[0] && 
+                             offset_ptr_bytes < bm->gpuCache[0] + bm->available_gpu_cache_size[0]);
+        bool in_cpu_cache = (bm->cpuCache[0] != nullptr && 
+                             offset_ptr_bytes >= bm->cpuCache[0] && 
+                             offset_ptr_bytes < bm->cpuCache[0] + bm->cache_size_per_gpu - bm->available_gpu_cache_size[0]);
+        if (offset_ptr != nullptr) {
+            SIRIUS_LOG_DEBUG("ResolveTypeMaterializeString: checking offset={}, gpuCache[0]={}, available_gpu_cache_size[0]={}, cpuCache[0]={}", 
+                             static_cast<void*>(offset_ptr), static_cast<void*>(bm->gpuCache[0]), 
+                             bm->available_gpu_cache_size[0], static_cast<void*>(bm->cpuCache[0]));
+        }
+        bool in_allocation_table = (bm->allocation_table[0].find(reinterpret_cast<void*>(offset_ptr)) != bm->allocation_table[0].end());
+        bool in_rmm_buffers = false;
+        for (int i = 0; i < bm->rmm_stored_buffers.size(); i++) {
+            uint8_t* buffer_start = reinterpret_cast<uint8_t*>(bm->rmm_stored_buffers[i]->data());
+            size_t buffer_size = bm->rmm_stored_buffers[i]->size();
+            uint8_t* buffer_end = buffer_start + buffer_size;
+            uint8_t* offset_ptr_bytes = reinterpret_cast<uint8_t*>(offset_ptr);
+            if (offset_ptr_bytes >= buffer_start && offset_ptr_bytes < buffer_end) {
+                in_rmm_buffers = true;
+                SIRIUS_LOG_DEBUG("ResolveTypeMaterializeString: offset={} found in rmm_stored_buffers[{}], buffer_start={}, buffer_size={}", 
+                                 static_cast<void*>(offset_ptr), i, static_cast<void*>(buffer_start), buffer_size);
+                break;
+            }
+        }
+        SIRIUS_LOG_DEBUG("ResolveTypeMaterializeString: offset={} - in_gpu_cache={}, in_cpu_cache={}, in_allocation_table={}, in_rmm_buffers={}", 
+                         static_cast<void*>(offset_ptr), in_gpu_cache, in_cpu_cache, in_allocation_table, in_rmm_buffers);
+    } else {
+        SIRIUS_LOG_DEBUG("ResolveTypeMaterializeString: offset is nullptr");
+    }
+    SIRIUS_LOG_DEBUG("ResolveTypeMaterializeString: column->data_wrapper.offset={}, column->data_wrapper.data={}", 
+                     static_cast<void*>(column->data_wrapper.offset), static_cast<void*>(column->data_wrapper.data));
     if (column->data_wrapper.data == nullptr || column->column_length == 0 ||
         (column->row_ids != nullptr && column->row_id_count == 0)) {
         return make_shared_ptr<GPUColumn>(0, column->data_wrapper.type, nullptr, nullptr, 0, column->data_wrapper.is_string_data, nullptr);
@@ -61,6 +97,7 @@ ResolveTypeMaterializeString(shared_ptr<GPUColumn> column, GPUBufferManager* gpu
 		uint64_t* offset = column->data_wrapper.offset;
 		uint64_t* row_ids = column->row_ids;
 		size = column->row_id_count;
+		SIRIUS_LOG_DEBUG("gpu_materialize.cpp:64 calling materializeString with offset={} from column->data_wrapper.offset", static_cast<void*>(offset));
 		materializeString(data, offset, a, result_offset, row_ids, new_num_bytes, size, column->data_wrapper.validity_mask, out_mask);
     } else {
         a = column->data_wrapper.data;

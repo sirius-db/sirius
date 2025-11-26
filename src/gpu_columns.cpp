@@ -256,20 +256,28 @@ GPUColumn::setFromCudfColumn(cudf::column& cudf_column, bool _is_unique, int32_t
     cudf::column::contents cont = cudf_column.release();
     gpuBufferManager->rmm_stored_buffers.push_back(std::move(cont.data));
 
-    data_wrapper.data = reinterpret_cast<uint8_t*>(gpuBufferManager->rmm_stored_buffers.back()->data());
+    // Store temporary pointers from rmm_stored_buffers
+    uint8_t* temp_data = reinterpret_cast<uint8_t*>(gpuBufferManager->rmm_stored_buffers.back()->data());
     data_wrapper.size = col_size;
     column_length = data_wrapper.size;
     data_wrapper.mask_bytes = getMaskBytesSize(column_length);
     is_unique = _is_unique;
 
+    // Store temporary validity_mask pointer (will be copied to gpuCache later)
+    cudf::bitmask_type* temp_validity_mask = nullptr;
+    bool validity_mask_from_createNullMask = false;
     if (cont.null_mask->data() == nullptr || nullable == false) {
-        data_wrapper.validity_mask = createNullMask(column_length);
+        temp_validity_mask = createNullMask(column_length);
+        validity_mask_from_createNullMask = true;
     } else {
         gpuBufferManager->rmm_stored_buffers.push_back(std::move(cont.null_mask));
-        data_wrapper.validity_mask = reinterpret_cast<cudf::bitmask_type*>(gpuBufferManager->rmm_stored_buffers.back()->data());
+        temp_validity_mask = reinterpret_cast<cudf::bitmask_type*>(gpuBufferManager->rmm_stored_buffers.back()->data());
     }
 
     //add data to allocation table in gpu buffer manager
+    // Store temporary offset pointer (will be copied to gpuCache later)
+    uint64_t* temp_offset_ptr = nullptr;
+    bool offset_from_convertInt32ToUInt64 = false;  // Track if offset is from convertInt32ToUInt64 (needs to be freed)
     if (col_type == cudf::data_type(cudf::type_id::STRING)) {
         if (cont.children[0]->type().id() == cudf::type_id::INT32) {
             cudf::column::contents child_cont = cont.children[0]->release();
@@ -277,7 +285,11 @@ GPUColumn::setFromCudfColumn(cudf::column& cudf_column, bool _is_unique, int32_t
             data_wrapper.is_string_data = true;
             data_wrapper.type = GPUColumnType(GPUColumnTypeId::VARCHAR);
             int32_t* temp_offset = reinterpret_cast<int32_t*>(gpuBufferManager->rmm_stored_buffers.back()->data());
+            SIRIUS_LOG_DEBUG("gpu_columns.cpp:280 calling convertCudfOffsetToSiriusOffset with temp_offset={}", static_cast<void*>(temp_offset));
             convertCudfOffsetToSiriusOffset(temp_offset);
+            temp_offset_ptr = data_wrapper.offset;  // Store temporary offset (from convertInt32ToUInt64, caching=0)
+            offset_from_convertInt32ToUInt64 = true;  // Mark that this needs to be freed
+            SIRIUS_LOG_DEBUG("gpu_columns.cpp:280 after convertCudfOffsetToSiriusOffset, temp_offset_ptr={}", static_cast<void*>(temp_offset_ptr));
             //copy data from offset to num_bytes
             uint64_t* temp_num_bytes = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
             callCudaMemcpyDeviceToHost<uint64_t>(temp_num_bytes, data_wrapper.offset + column_length, 1, 0);
@@ -287,10 +299,11 @@ GPUColumn::setFromCudfColumn(cudf::column& cudf_column, bool _is_unique, int32_t
             gpuBufferManager->rmm_stored_buffers.push_back(std::move(child_cont.data));
             data_wrapper.is_string_data = true;
             data_wrapper.type = GPUColumnType(GPUColumnTypeId::VARCHAR);
-            data_wrapper.offset = reinterpret_cast<uint64_t*>(gpuBufferManager->rmm_stored_buffers.back()->data());
+            // Store temporary INT64 offset pointer (will be copied to gpuCache later)
+            temp_offset_ptr = reinterpret_cast<uint64_t*>(gpuBufferManager->rmm_stored_buffers.back()->data());
             //copy data from offset to num_bytes
             uint64_t* temp_num_bytes = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
-            callCudaMemcpyDeviceToHost<uint64_t>(temp_num_bytes, data_wrapper.offset + column_length, 1, 0);
+            callCudaMemcpyDeviceToHost<uint64_t>(temp_num_bytes, temp_offset_ptr + column_length, 1, 0);
             data_wrapper.num_bytes = temp_num_bytes[0];
         }
     } else if (col_type == cudf::data_type(cudf::type_id::INT64)) {
@@ -370,6 +383,41 @@ GPUColumn::setFromCudfColumn(cudf::column& cudf_column, bool _is_unique, int32_t
     } else {
         throw NotImplementedException("Unsupported cudf data type in `setFromCudfColumn`: %d",
                                       static_cast<int>(col_type.id()));
+    }
+
+    // Copy data from rmm_stored_buffers to gpuCache (consistent with table scan d_data_ptr[col])
+    data_wrapper.data = gpuBufferManager->customCudaMalloc<uint8_t>(data_wrapper.num_bytes, 0, 1);
+    SIRIUS_LOG_DEBUG("gpu_columns.cpp: copying data from rmm_stored_buffers (temp_data={}) to gpuCache (data_wrapper.data={}) size={}", 
+                    static_cast<void*>(temp_data), static_cast<void*>(data_wrapper.data), data_wrapper.num_bytes);
+    callCudaMemcpyDeviceToDevice<uint8_t>(data_wrapper.data, temp_data, data_wrapper.num_bytes, 0);
+
+    // Copy validity_mask to gpuCache (consistent with table scan d_mask_ptr[col])
+    data_wrapper.validity_mask = reinterpret_cast<cudf::bitmask_type*>(
+        gpuBufferManager->customCudaMalloc<uint8_t>(data_wrapper.mask_bytes, 0, 1));
+    SIRIUS_LOG_DEBUG("gpu_columns.cpp: copying validity_mask from {} (temp_validity_mask={}) to gpuCache (data_wrapper.validity_mask={}) size={}", 
+                    validity_mask_from_createNullMask ? "createNullMask" : "rmm_stored_buffers",
+                    static_cast<void*>(temp_validity_mask), static_cast<void*>(data_wrapper.validity_mask), data_wrapper.mask_bytes);
+    callCudaMemcpyDeviceToDevice<uint8_t>(reinterpret_cast<uint8_t*>(data_wrapper.validity_mask), 
+                                          reinterpret_cast<uint8_t*>(temp_validity_mask), 
+                                          data_wrapper.mask_bytes, 0);
+    
+    // Free the temporary validity_mask if it was created by createNullMask (it's in allocation_table)
+    if (validity_mask_from_createNullMask) {
+        gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(temp_validity_mask), 0);
+    }
+
+    // Copy offset to gpuCache (consistent with table scan d_offset_ptr[col])
+    if (data_wrapper.is_string_data && temp_offset_ptr != nullptr) {
+        data_wrapper.offset = gpuBufferManager->customCudaMalloc<uint64_t>(column_length + 1, 0, 1);
+        SIRIUS_LOG_DEBUG("gpu_columns.cpp: copying offset from temp_offset_ptr={} to gpuCache (data_wrapper.offset={}) size={}", 
+                        static_cast<void*>(temp_offset_ptr), static_cast<void*>(data_wrapper.offset), 
+                        (column_length + 1) * sizeof(uint64_t));
+        callCudaMemcpyDeviceToDevice<uint64_t>(data_wrapper.offset, temp_offset_ptr, column_length + 1, 0);
+        // Free the temporary offset if it was from convertInt32ToUInt64 (it's in allocation_table)
+        // For INT64, temp_offset_ptr is in rmm_stored_buffers, so we don't free it
+        if (offset_from_convertInt32ToUInt64) {
+            gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(temp_offset_ptr), 0);
+        }
     }
 
     if (_row_ids != nullptr) {
@@ -480,6 +528,7 @@ GPUColumn::convertCudfRowIdsToSiriusRowIds(int32_t* cudf_row_ids) {
 void
 GPUColumn::convertCudfOffsetToSiriusOffset(int32_t* cudf_offset) {
     data_wrapper.offset = convertInt32ToUInt64(cudf_offset, column_length + 1);
+    SIRIUS_LOG_DEBUG("gpu_columns.cpp:483 convertCudfOffsetToSiriusOffset set data_wrapper.offset={} from cudf_offset={}", static_cast<void*>(data_wrapper.offset), static_cast<void*>(cudf_offset));
 }
 
 size_t GPUColumn::getTotalColumnSize() { 

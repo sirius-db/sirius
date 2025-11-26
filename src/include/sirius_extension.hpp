@@ -34,6 +34,8 @@ public:
 	// static unique_ptr<FunctionData> GPUCachingBind(ClientContext &context, TableFunctionBindInput &input, vector<LogicalType> &return_types, vector<string> &names);
 	static void GPUBufferInitFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output);
 	static unique_ptr<FunctionData> GPUBufferInitBind(ClientContext &context, TableFunctionBindInput &input, vector<LogicalType> &return_types, vector<string> &names);
+	static void GPULoadParquetFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output);
+	static unique_ptr<FunctionData> GPULoadParquetBind(ClientContext &context, TableFunctionBindInput &input, vector<LogicalType> &return_types, vector<string> &names);
 
 	static bool buffer_is_initialized;
 };

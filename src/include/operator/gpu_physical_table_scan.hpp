@@ -159,6 +159,11 @@ private:
 		//! Helper to find column index by name (for table functions with projected columns)
 	int FindColumnIndexByName(const shared_ptr<GPUIntermediateRelation>& table,
 	                          const string& column_name) const;
+
+	bool IsGPUParquetScan() const;
+	bool ExtractParquetFileList(vector<string> &files) const;
+	vector<string> GetProjectedParquetColumns() const;
+	bool TryLoadGPUParquetCache(const string &table_name);
 };
 
 } // namespace duckdb

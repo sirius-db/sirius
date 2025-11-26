@@ -608,7 +608,10 @@ GPUPhysicalHashJoin::Sink(GPUIntermediateRelation &input_relation) const {
 	ht_len = build_keys[0]->column_length * 2;
 	if (join_type == JoinType::INNER || join_type == JoinType::SEMI || join_type == JoinType::MARK) {
 		if (ht_len == 0) gpu_hash_table = nullptr;
-		else gpu_hash_table = (unsigned long long*) gpuBufferManager->customCudaMalloc<uint64_t>(ht_len * (conditions.size() + 1), 0, 0);
+		else {
+			gpu_hash_table = (unsigned long long*) gpuBufferManager->customCudaMalloc<uint64_t>(ht_len * (conditions.size() + 1), 0, 0);
+			SIRIUS_LOG_DEBUG("gpu_physical_hash_join.cpp:611 allocated gpu_hash_table={}", static_cast<void*>(gpu_hash_table));
+		}
 	} else if (join_type == JoinType::RIGHT || join_type == JoinType::RIGHT_SEMI || join_type == JoinType::RIGHT_ANTI) {
 		if (ht_len == 0) gpu_hash_table = nullptr;
 		else gpu_hash_table = (unsigned long long*) gpuBufferManager->customCudaMalloc<uint64_t>(ht_len * (conditions.size() + 2), 0, 0);

@@ -24,6 +24,8 @@
 #include "duckdb/parallel/task_executor.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
+#include "duckdb/common/types/value.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "gpu_columns.hpp"
 #include "gpu_materialize.hpp"
 #include "utils.hpp"
@@ -142,6 +144,141 @@ int GPUPhysicalTableScan::FindColumnIndexByName(
     }
 
     return column_it - table->column_names.begin();
+}
+
+bool GPUPhysicalTableScan::IsGPUParquetScan() const {
+	if (!IsTableFunction()) {
+		return false;
+	}
+	auto lowered = StringUtil::Lower(function.name);
+	SIRIUS_LOG_DEBUG("IsGPUParquetScan called: function.name = {}, lowered = {}", function.name, lowered);
+	return lowered == "read_parquet" || lowered == "parquet_scan";
+}
+
+bool GPUPhysicalTableScan::ExtractParquetFileList(vector<string> &files) const {
+	if (parameters.empty()) {
+		// Can't extract file list without explicit parameters; fall back to CPU path
+		SIRIUS_LOG_WARN("GPU parquet scan parameters missing explicit file list; falling back to DuckDB");
+		return false;
+	}
+	const auto &first_param = parameters.front();
+	if (first_param.IsNull()) {
+		return false;
+	}
+	if (first_param.type().id() == LogicalTypeId::VARCHAR) {
+		files.push_back(StringValue::Get(first_param));
+		return true;
+	}
+	if (first_param.type().id() == LogicalTypeId::LIST) {
+		for (auto &child : ListValue::GetChildren(first_param)) {
+			if (!child.IsNull()) {
+				files.push_back(StringValue::Get(child));
+			}
+		}
+		return !files.empty();
+	}
+	return false;
+}
+
+vector<string> GPUPhysicalTableScan::GetProjectedParquetColumns() const {
+	vector<string> projected;
+	unordered_set<string> seen;
+	auto limit = column_ids.size() - gen_row_id_column;
+	for (idx_t col = 0; col < limit; col++) {
+		auto col_name = names[column_ids[col].GetPrimaryIndex()];
+		if (seen.insert(col_name).second) {
+			projected.push_back(col_name);
+		}
+	}
+	return projected;
+}
+
+bool GPUPhysicalTableScan::TryLoadGPUParquetCache(const string &table_name) {
+	SIRIUS_LOG_DEBUG("=== TryLoadGPUParquetCache START === table_name: {}", table_name);
+	
+	// Debug: Show all tables in GPU Buffer Manager
+	auto &gpuBufferManager = GPUBufferManager::GetInstance();
+	SIRIUS_LOG_INFO("📊 GPU Buffer Manager has {} tables:", gpuBufferManager.tables.size());
+	for (const auto& [name, table] : gpuBufferManager.tables) {
+		uint64_t num_rows = 0;
+		if (!table->columns.empty() && table->columns[0] != nullptr) {
+			num_rows = table->columns[0]->column_length;
+		}
+		SIRIUS_LOG_INFO("  - Table: {} ({} columns, {} rows)", 
+			name, table->columns.size(), num_rows);
+	}
+	
+	if (!IsGPUParquetScan()) {
+		SIRIUS_LOG_DEBUG("Not a GPU parquet scan, returning false");
+		return false;
+	}
+	SIRIUS_LOG_DEBUG("IsGPUParquetScan returned true");
+	vector<string> files;
+	if (!ExtractParquetFileList(files) || files.size() != 1) {
+		SIRIUS_LOG_DEBUG("ExtractParquetFileList failed or multiple files. files.size()={}", files.size());
+		return false;
+	}
+	SIRIUS_LOG_DEBUG("ExtractParquetFileList success, file: {}", files[0]);
+
+	// gpuBufferManager already initialized above
+	auto num_columns = column_ids.size() - gen_row_id_column;
+	SIRIUS_LOG_DEBUG("num_columns: {}, gen_row_id_column: {}", num_columns, gen_row_id_column);
+
+	bool cache_hit = true;
+	for (idx_t col = 0; col < num_columns; col++) {
+		auto column_name = names[column_ids[col].GetPrimaryIndex()];
+		if (!gpuBufferManager.checkIfColumnCached(table_name, column_name)) {
+			cache_hit = false;
+			break;
+		}
+	}
+	if (cache_hit) {
+		SIRIUS_LOG_INFO("✓ GPU CACHE HIT: All columns already in GPU cache for {}", table_name);
+	}
+	if (!cache_hit) {
+		SIRIUS_LOG_INFO("🚀 USING GPU PARQUET READER: Loading {} with cudf", files[0]);
+		GPUParquetReaderOptions options;
+		options.file_path = files[0];
+		options.projected_columns = GetProjectedParquetColumns();
+		
+		// Check cache usage and reset if needed (similar to table scan)
+		size_t current_cache_usage = gpuBufferManager.gpuCachingPointer[0] + gpuBufferManager.cpuCachingPointer[0];
+		size_t cache_threshold = gpuBufferManager.cache_size_per_gpu * 0.8; // Use 80% as threshold
+		if (current_cache_usage >= cache_threshold) {
+			SIRIUS_LOG_INFO("⚠️ Cache usage ({}) >= threshold ({}), resetting cache before loading Parquet file", 
+			               current_cache_usage, cache_threshold);
+			gpuBufferManager.ResetCache();
+		}
+		
+		try {
+			gpuBufferManager.LoadParquetTable(table_name, options);
+			SIRIUS_LOG_INFO("✓ GPU PARQUET SUCCESS: Loaded {} directly into GPU cache as {}", options.file_path, table_name);
+		} catch (std::exception &ex) {
+			std::string error_msg = ex.what();
+			// If we get "Out of caching memory" error, try resetting cache and retry once
+			if (error_msg.find("Out of caching memory") != std::string::npos) {
+				SIRIUS_LOG_WARN("⚠️ Out of caching memory detected, resetting cache and retrying...");
+				gpuBufferManager.ResetCache();
+				try {
+					gpuBufferManager.LoadParquetTable(table_name, options);
+					SIRIUS_LOG_INFO("✓ GPU PARQUET SUCCESS (after cache reset): Loaded {} directly into GPU cache as {}", 
+					               options.file_path, table_name);
+				} catch (std::exception &ex2) {
+					SIRIUS_LOG_ERROR("Failed to load Parquet file {} via GPU reader even after cache reset: {}", 
+					                options.file_path, ex2.what());
+					return false;
+				}
+			} else {
+				SIRIUS_LOG_ERROR("Failed to load Parquet file {} via GPU reader: {}", options.file_path, error_msg);
+				return false;
+			}
+		}
+	}
+	for (idx_t col = 0; col < num_columns; col++) {
+		already_cached[col] = true;
+	}
+	SIRIUS_LOG_DEBUG("Loaded Parquet file {} directly into GPU cache as {}", files[0], table_name);
+	return true;
 }
 
 template <typename T>
@@ -854,10 +991,21 @@ GPUPhysicalTableScan::GetDataDuckDBOpt(ExecutionContext &exec_context) {
   auto gpuBufferManager = &(GPUBufferManager::GetInstance());
 
   SIRIUS_LOG_DEBUG("Reading data from duckdb storage");
+  
+  SIRIUS_LOG_DEBUG("column_ids.size() = {}", column_ids.size());
+  for(int i = 0; i < column_ids.size(); i++) { 
+    SIRIUS_LOG_DEBUG("column_ids[{}].GetPrimaryIndex() = {}", i, column_ids[i].GetPrimaryIndex());
+  }
 
   // Use GetTableName() helper instead of direct function.to_string()
   string table_name = GetTableName();
 
+  if (TryLoadGPUParquetCache(table_name)) {
+    SIRIUS_LOG_INFO("✓ GPU PARQUET PATH: Cache satisfied scan for {}", table_name);
+    return SourceResultType::FINISHED;
+  }
+
+  SIRIUS_LOG_INFO("✗ DUCKDB PATH: TryLoadGPUParquetCache failed, using DuckDB reader");
   // Get cached column info
   for(int i = 0; i < column_ids.size(); i++) { 
     SIRIUS_LOG_DEBUG("Scan Idx {} has column id of {}", i, column_ids[i].GetPrimaryIndex());
@@ -881,6 +1029,7 @@ GPUPhysicalTableScan::GetDataDuckDBOpt(ExecutionContext &exec_context) {
   }
 
   if (function.function) {
+    SIRIUS_LOG_WARN("⚠ USING DUCKDB READER: Calling function.function to read data from DuckDB");
     // Read data and converting data from duckdb
     auto start = std::chrono::high_resolution_clock::now();
 
@@ -1067,6 +1216,8 @@ void GPUPhysicalTableScan::ScanDataDuckDBOpt(
         d_mask_ptr[col] = gpuBufferManager->customCudaMalloc<uint8_t>(mask_size[col], 0, 1);
         if (scanned_types[col].id() == LogicalTypeId::VARCHAR) {
           d_offset_ptr[col] = gpuBufferManager->customCudaMalloc<uint64_t>(num_rows + 1, 0, 1);
+          SIRIUS_LOG_DEBUG("gpu_physical_table_scan.cpp:1189 allocated d_offset_ptr[{}]={} with caching=1 (should be in gpuCache or cpuCache)", 
+                           col, static_cast<void*>(d_offset_ptr[col]));
         }
       }
     }
@@ -1111,6 +1262,7 @@ void GPUPhysicalTableScan::ScanDataDuckDBOpt(
     int64_t* d_duckdb_storage_row_ids_ptr = nullptr;
     if (scan_duckdb_storage_row_ids) {
       d_duckdb_storage_row_ids_ptr = gpuBufferManager->customCudaMalloc<int64_t>(num_rows, 0, 0);
+      SIRIUS_LOG_DEBUG("gpu_physical_table_scan.cpp:1233 allocated d_duckdb_storage_row_ids_ptr={}", static_cast<void*>(d_duckdb_storage_row_ids_ptr));
       uint64_t write_offset = 0;
       while (write_offset < sizeof(int64_t) * num_rows) {
         uint64_t write_len = std::min(Config::OPT_TABLE_SCAN_CUDA_MEMCPY_SIZE,
@@ -1132,7 +1284,9 @@ void GPUPhysicalTableScan::ScanDataDuckDBOpt(
           callCubPrefixSum(d_offset_ptr[col], d_offset_ptr[col], num_rows + 1, true,
                            cuda_streams[num_prefix_sum++ % Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS],
                            [&](size_t size) {
-            return gpuBufferManager->customCudaMalloc<uint8_t>(size, 0, 0);
+            auto ptr = gpuBufferManager->customCudaMalloc<uint8_t>(size, 0, 0);
+            SIRIUS_LOG_DEBUG("gpu_physical_table_scan.cpp:1255 allocated prefix sum temp storage={}", static_cast<void*>(ptr));
+            return ptr;
           });
         }
       }
@@ -1152,6 +1306,7 @@ void GPUPhysicalTableScan::ScanDataDuckDBOpt(
         table->columns[column_idx]->column_length = num_rows;
         cudf::bitmask_type* validity_mask = reinterpret_cast<cudf::bitmask_type*>(d_mask_ptr[col]);
         if (scanned_types[col] == LogicalType::VARCHAR) {
+          SIRIUS_LOG_DEBUG("gpu_physical_table_scan.cpp:1278 setting data_wrapper.offset={} from d_offset_ptr[{}]", static_cast<void*>(d_offset_ptr[col]), col);
           table->columns[column_idx]->data_wrapper = DataWrapper(column_type, d_data_ptr[col], d_offset_ptr[col],
                                                                  num_rows, column_size[col], true, validity_mask);
         } else {
@@ -1165,6 +1320,7 @@ void GPUPhysicalTableScan::ScanDataDuckDBOpt(
     if (scan_duckdb_storage_row_ids) {
       // Get output indices of reordering based on duckdb storage row ids
       uint64_t* reorder_row_ids_out_indices = gpuBufferManager->customCudaMalloc<uint64_t>(num_rows, 0, 0);
+      SIRIUS_LOG_DEBUG("gpu_physical_table_scan.cpp:1287 allocated reorder_row_ids_out_indices={}", static_cast<void*>(reorder_row_ids_out_indices));
       reorderRowIds(d_duckdb_storage_row_ids_ptr, reorder_row_ids_out_indices, num_rows);
       // Reorder each scanned column
       for (int col: uncached_scan_column_ids) {
@@ -1242,6 +1398,11 @@ GPUPhysicalTableScan::GetDataDuckDB(ExecutionContext &exec_context) {
 
     // Use GetTableName() helper instead of direct function.to_string()
     string table_name = GetTableName();
+
+    if (TryLoadGPUParquetCache(table_name)) {
+      SIRIUS_LOG_DEBUG("GPU parquet cache satisfied scan for {}", table_name);
+      return SourceResultType::FINISHED;
+    }
 
     shared_ptr<GPUIntermediateRelation> table;
 
@@ -1641,6 +1802,19 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
             }
             if (count) {
               output_relation.columns[index]->row_id_count = count[0];
+              // // If there's a filter, materialize the column to update column_length
+              // // This ensures column_length matches the filtered row count, preventing
+              // // issues in joins where row_ids_right might be out of bounds for offset arrays
+              // if (output_relation.columns[index]->row_ids != nullptr && 
+              //     output_relation.columns[index]->row_id_count > 0) {
+              //   if (output_relation.columns[index]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
+              //     auto materialized = ResolveTypeMaterializeString(output_relation.columns[index], gpuBufferManager);
+              //     output_relation.columns[index] = materialized;
+              //   } else {
+              //     auto materialized = HandleMaterializeExpression(output_relation.columns[index], gpuBufferManager);
+              //     output_relation.columns[index] = materialized;
+              //   }
+              // }
             }
             index++;
         }
@@ -1661,6 +1835,19 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
             }
             if (count) {
               output_relation.columns[index]->row_id_count = count[0];
+              // // If there's a filter, materialize the column to update column_length
+              // // This ensures column_length matches the filtered row count, preventing
+              // // issues in joins where row_ids_right might be out of bounds for offset arrays
+              // if (output_relation.columns[index]->row_ids != nullptr && 
+              //     output_relation.columns[index]->row_id_count > 0) {
+              //   if (output_relation.columns[index]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
+              //     auto materialized = ResolveTypeMaterializeString(output_relation.columns[index], gpuBufferManager);
+              //     output_relation.columns[index] = materialized;
+              //   } else {
+              //     auto materialized = HandleMaterializeExpression(output_relation.columns[index], gpuBufferManager);
+              //     output_relation.columns[index] = materialized;
+              //   }
+              // }
             }
             index++;
         }
@@ -1700,6 +1887,7 @@ GPUPhysicalTableScan::GetData(GPUIntermediateRelation &output_relation) const {
       }
       
       auto data = gpuBufferManager->customCudaMalloc<uint8_t>(num_out_rows * sizeof(int64_t), 0, 0);
+      SIRIUS_LOG_DEBUG("gpu_physical_table_scan.cpp:1853 allocated row id column data={}", static_cast<void*>(data));
       createRowIdColumn(data, num_out_rows);
       output_relation.columns.back() = make_shared_ptr<GPUColumn>(
         num_out_rows, GPUColumnType(GPUColumnTypeId::INT64), data, nullptr, num_out_rows * sizeof(int64_t), false, nullptr);

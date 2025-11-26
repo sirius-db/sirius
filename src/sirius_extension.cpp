@@ -34,6 +34,7 @@
 #include "duckdb/catalog/catalog_entry/duck_schema_entry.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
+#include "duckdb/common/types/value.hpp"
 
 #include "substrait_extension.hpp"
 #include "to_substrait.hpp"
@@ -63,6 +64,13 @@ struct GPUTableFunctionData : public TableFunctionData {
 	bool enable_optimizer;
 	bool finished = false;
 	bool plan_error = false;
+};
+
+struct GPULoadParquetFunctionData : public TableFunctionData {
+	GPULoadParquetFunctionData() = default;
+	GPUParquetReaderOptions options;
+	string logical_name;
+	bool finished = false;
 };
 
 // struct GPUCachingFunctionData : public TableFunctionData {
@@ -485,6 +493,54 @@ SiriusExtension::GPUBufferInitFunction(ClientContext &context, TableFunctionInpu
 	data.finished = true;
 }
 
+unique_ptr<FunctionData>
+SiriusExtension::GPULoadParquetBind(ClientContext &context, TableFunctionBindInput &input,
+                                    vector<LogicalType> &return_types, vector<string> &names) {
+	if (input.inputs.size() < 2) {
+		throw BinderException("gpu_load_parquet requires <file_path, table_name>");
+	}
+	auto result = make_uniq<GPULoadParquetFunctionData>();
+	result->options.file_path = input.inputs[0].GetValue<string>();
+	result->logical_name = input.inputs[1].GetValue<string>();
+
+	if (input.named_parameters.count("columns")) {
+		auto column_list = input.named_parameters.at("columns");
+		const auto &children = ListValue::GetChildren(column_list);
+		for (auto &child : children) {
+			result->options.projected_columns.push_back(StringValue::Get(child));
+		}
+	}
+	if (input.named_parameters.count("row_groups")) {
+		auto row_group_list = input.named_parameters.at("row_groups");
+		const auto &children = ListValue::GetChildren(row_group_list);
+		for (auto &child : children) {
+			result->options.row_groups.push_back(BigIntValue::Get(child));
+		}
+	}
+
+	auto type = LogicalType(LogicalTypeId::BOOLEAN);
+	return_types.emplace_back(type);
+	names.emplace_back("success");
+	return std::move(result);
+}
+
+void
+SiriusExtension::GPULoadParquetFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &data = data_p.bind_data->CastNoConst<GPULoadParquetFunctionData>();
+	if (data.finished) {
+		return;
+	}
+	if (!buffer_is_initialized) {
+		throw InvalidInputException("GPU buffer manager not initialized. Call gpu_buffer_init first.");
+	}
+	auto *gpu_buffer_manager = &(GPUBufferManager::GetInstance());
+	gpu_buffer_manager->LoadParquetTable(data.logical_name, data.options);
+
+	output.SetValue(0, 0, Value::BOOLEAN(true));
+	output.SetCardinality(1);
+	data.finished = true;
+}
+
 void SiriusExtension::InitializeGPUExtension(Connection &con) {
 	auto &catalog = Catalog::GetSystemCatalog(*con.context);
 
@@ -492,6 +548,13 @@ void SiriusExtension::InitializeGPUExtension(Connection &con) {
 	gpu_buffer_init.named_parameters[PINNED_MEMORY_PARAM_KEY] = LogicalType::VARCHAR;
 	CreateTableFunctionInfo gpu_buffer_init_info(gpu_buffer_init);
 	catalog.CreateTableFunction(*con.context, gpu_buffer_init_info);
+
+	TableFunction gpu_load_parquet("gpu_load_parquet",
+		{LogicalType::VARCHAR, LogicalType::VARCHAR}, GPULoadParquetFunction, GPULoadParquetBind);
+	gpu_load_parquet.named_parameters["columns"] = LogicalType::LIST(LogicalType::VARCHAR);
+	gpu_load_parquet.named_parameters["row_groups"] = LogicalType::LIST(LogicalType::INTEGER);
+	CreateTableFunctionInfo gpu_load_parquet_info(gpu_load_parquet);
+	catalog.CreateTableFunction(*con.context, gpu_load_parquet_info);
 
 	// TableFunction gpu_caching("gpu_caching", {LogicalType::VARCHAR}, GPUCachingFunction, GPUCachingBind);
 	// CreateTableFunctionInfo gpu_caching_info(gpu_caching);

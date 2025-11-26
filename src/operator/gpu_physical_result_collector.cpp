@@ -108,6 +108,7 @@ GPUPhysicalMaterializedCollector::FinalMaterializeString(GPUIntermediateRelation
 		cudf::bitmask_type* mask = input_relation.columns[col]->data_wrapper.validity_mask;
 
 		SIRIUS_LOG_DEBUG("Running string late materalization with {} rows", num_rows);
+		SIRIUS_LOG_DEBUG("gpu_physical_result_collector.cpp:112 calling materializeString with offset={} from input_relation.columns[{}]->data_wrapper.offset", static_cast<void*>(offset), col);
 
 		materializeString(data, offset, result, result_offset, row_ids, new_num_bytes, num_rows, mask, out_mask);
 
