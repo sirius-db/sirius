@@ -404,14 +404,16 @@ GPUGraphTraversalOperator::RunBFS(
   GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
   int64_t* d_distances = gpuBufferManager->customCudaMalloc<int64_t>(num_vertices, 0, 0);
   int64_t* d_predecessors = gpuBufferManager->customCudaMalloc<int64_t>(num_vertices, 0, 0);
+  int64_t* d_sources = gpuBufferManager->customCudaMalloc<int64_t>(1, 0, 0);
+  cudaMemcpy(d_sources, &source_vertex, sizeof(int64_t), cudaMemcpyHostToDevice);
 
-  // Run BFS
+  // Run BFS (TODO: BFS supports multiple sources, i.e., MATCH (p:Person WHERE p.id IN [14, 25])-[:knows]->*(p2:Person))
   cugraph::bfs(
     *handle,
     graph_view,
     d_distances,
     d_predecessors,
-    &source_vertex,
+    d_sources,
     1,
     false,
     std::numeric_limits<int64_t>::max()
