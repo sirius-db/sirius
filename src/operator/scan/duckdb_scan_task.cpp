@@ -129,7 +129,7 @@ bool duckdb_scan_task_local_state::column_builder::sufficient_space_for_column(
   if (type.InternalType() == duckdb::PhysicalType::VARCHAR) {
     auto const* str_data = reinterpret_cast<duckdb::string_t const*>(vec.GetData());
     for (size_t row = 0; row < num_rows; ++row) {
-      data_bytes += str_data[row].GetSize();
+      if (validity.RowIsValid(row)) { data_bytes += str_data[row].GetSize(); }
     }
   } else {
     // Fixed-width column
