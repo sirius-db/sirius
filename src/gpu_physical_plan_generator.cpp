@@ -150,7 +150,7 @@ GPUPhysicalPlanGenerator::CreateEdgeTableScan(const string& table_name) {
 
   // Create a LogicalGet for the table with proper column information
   auto logical_get = make_uniq<LogicalGet>(
-      0,  // binding index - will be reassigned during binding
+      0,  // binding index, will be reassigned during binding
       table_function,
       std::move(bind_data),
       column_types,
@@ -201,29 +201,8 @@ GPUPhysicalPlanGenerator::CreateGraphPhysicalPlan(LogicalGraphOperator* graph_op
 }
 
 unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::CreatePlan(LogicalOperator &op) {
-  SIRIUS_LOG_INFO("CreatePlan START, operator type: {}", (int)op.type);
 	op.estimated_cardinality = op.EstimateCardinality(context);
 	unique_ptr<GPUPhysicalOperator> plan = nullptr;
-
-//   // Check for graph operator FIRST, before the switch statement
-//   if (op.type == LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR) {
-//     auto graph_op = dynamic_cast<LogicalGraphOperator*>(&op);
-//     if (graph_op) {
-//       SIRIUS_LOG_INFO("Creating physical plan for graph operator");
-//       plan = CreateGraphPhysicalPlan(graph_op);
-//
-//       if (!plan) {
-//         throw InternalException("Physical plan generator - no plan generated for graph operator");
-//       }
-//
-//       plan->estimated_cardinality = op.estimated_cardinality;
-// #ifdef DUCKDB_VERIFY_VECTOR_OPERATOR
-//       auto verify = make_uniq<PhysicalVerifyVector>(std::move(plan));
-//       plan = std::move(verify);
-// #endif
-//       return plan;
-//     }
-//   }
 
 	switch (op.type) {
 	case LogicalOperatorType::LOGICAL_GET:
@@ -409,12 +388,6 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::CreatePlan(LogicalOper
 	    return CreateGraphPhysicalPlan(graph_op);
 	  }
 	  throw NotImplementedException("Unknown extension operator");
-	  // throw NotImplementedException("Extension operator not supported");
-	  // plan = op.Cast<LogicalExtensionOperator>().CreatePlan(context, *this);
-
-	  // if (!plan) {
-	  // 	throw InternalException("Missing GPUPhysicalOperator for Extension Operator");
-	  // }
 	}
 	case LogicalOperatorType::LOGICAL_JOIN:
 	case LogicalOperatorType::LOGICAL_DEPENDENT_JOIN:

@@ -759,8 +759,6 @@ SiriusExtension::GPUProcessingGraphBind(ClientContext &context, TableFunctionBin
 
 void
 SiriusExtension::GPUProcessingGraphFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
-  SIRIUS_LOG_ERROR("GPUProcessingGraphFunction");
-
   auto &data = (GraphProcessingFunctionData &)*data_p.bind_data;
   if (data.finished) {
     return;
