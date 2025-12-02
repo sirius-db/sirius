@@ -25,6 +25,7 @@ public:
   std::vector<int64_t> dest_vertices;
   string weight_column;
   GraphAlgorithmType algorithm_type;
+  string path_pattern;
   bool is_path_query;
   int max_hops;
   std::vector<string> output_columns;
@@ -46,6 +47,7 @@ public:
     std::vector<int64_t> dest_vertices,
     const string& weight_col,
     const string& algo_str,
+    string path_pattern,
     bool is_path,
     int max_hops,
     std::vector<string> output_columns,

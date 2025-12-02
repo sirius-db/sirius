@@ -194,6 +194,7 @@ GPUPhysicalPlanGenerator::CreateGraphPhysicalPlan(LogicalGraphOperator* graph_op
       graph_op->dest_vertices,
       graph_op->weight_column,
       graph_op->algorithm_type,
+      graph_op->path_pattern,
       graph_op->is_path_query,
       graph_op->max_hops,
       graph_op->output_columns,

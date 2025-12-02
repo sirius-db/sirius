@@ -43,6 +43,13 @@ CALL gpu_processing_graph("
   )
 ");
 
+CALL gpu_processing_graph("
+  SELECT * FROM GRAPH_TABLE (social
+    MATCH (p:Person WHERE p.id=14)-[:knows]->(p2:Person)
+    COLUMNS (p2.id, distance)
+  )
+");
+
 -- ============================================
 -- Test 2: BFS (All Reachable Vertices)
 -- ============================================
@@ -58,6 +65,20 @@ CALL gpu_processing_graph("
 CALL gpu_processing_graph("
   SELECT * FROM GRAPH_TABLE (social
     MATCH (p:Person WHERE p.id=14)-[:knows]->*(p2:Person)
+    COLUMNS (p2.id, distance)
+  )
+");
+
+CALL gpu_processing_graph("
+  SELECT * FROM GRAPH_TABLE (social
+    MATCH (p:Person WHERE p.id=14)-[:knows]->+(p2:Person)
+    COLUMNS (p2.id)
+  )
+");
+
+CALL gpu_processing_graph("
+  SELECT * FROM GRAPH_TABLE (social
+    MATCH (p:Person WHERE p.id=14)-[:knows]->+(p2:Person)
     COLUMNS (p2.id, distance)
   )
 ");

@@ -46,6 +46,7 @@
 #include "gpu_buffer_manager.hpp"
 #include "config.hpp"
 #include "logical_graph_operator.hpp"
+#include "graph_query_parser.hpp"
 
 #include <cstdlib>
 
@@ -520,299 +521,77 @@ SiriusExtension::GPUBufferInitFunction(ClientContext &context, TableFunctionInpu
 	data.finished = true;
 }
 
-ParsedGraphQuery
-SiriusExtension::ParseGraphQuery(const string& query) {
+ParsedGraphQuery SiriusExtension::ParseGraphQuery(const string& query) {
   ParsedGraphQuery result;
 
-  // Convert to uppercase
-  string query_upper = query;
-  ranges::transform(query_upper.begin(), query_upper.end(),
-                    query_upper.begin(), ::toupper);
+  SIRIUS_LOG_DEBUG("Parsing graph query: {}", query);
 
-  // Extract graph name from "FROM GRAPH_TABLE (graph_name MATCH ...)"
-  size_t graph_table_pos = query_upper.find("GRAPH_TABLE");
-  if (graph_table_pos != string::npos) {
-    size_t open_paren = query_upper.find("(", graph_table_pos);
-    size_t space_or_match = query_upper.find_first_of(" \t\n", open_paren + 1);
+  result.edge_table = GraphQueryParser::ExtractEdgeTable(query);
+  result.source_column = "src";
+  result.dest_column = "dst";
+  SIRIUS_LOG_DEBUG("Edge table: {}", result.edge_table);
 
-    if (open_paren != string::npos && space_or_match != string::npos) {
-      string graph_name = query.substr(open_paren + 1, space_or_match - open_paren - 1);
+  result.is_path_query = GraphQueryParser::IsPathQuery(query);
+  auto algo_info = GraphQueryParser::DetectAlgorithm(query);
+  result.algorithm_type = algo_info.algorithm_type;
+  result.path_pattern = algo_info.path_pattern;
+  SIRIUS_LOG_DEBUG("Algorithm: {}, Path pattern: {}",
+                   result.algorithm_type, result.path_pattern);
 
-      // Trim whitespace
-      graph_name.erase(0, graph_name.find_first_not_of(" \t\n"));
-      graph_name.erase(graph_name.find_last_not_of(" \t\n") + 1);
+  auto direction = GraphQueryParser::DetectDirection(query);
+  result.is_left_directed = direction.is_left_directed;
+  result.is_right_directed = direction.is_right_directed;
+  result.is_any_directed = direction.is_any_directed;
+  result.is_left_right_directed = direction.is_left_right_directed;
+  auto vertex_patterns = GraphQueryParser::ExtractVertexPatterns(query);
 
-      // Look up in registry
-      auto* metadata = LookupGraph(graph_name);
-      if (metadata) {
-        SIRIUS_LOG_DEBUG("Found registered graph '{}': edge_table={}",
-                        graph_name, metadata->edge_table);
+  std::vector<int64_t> all_source_vertices;
+  std::vector<int64_t> all_dest_vertices;
+  for (size_t i = 0; i < vertex_patterns.size(); i++) {
+    const auto& pattern = vertex_patterns[i];
+    auto where_result = GraphQueryParser::ParseWhereClause(pattern);
 
-        result.edge_table = metadata->edge_table;
-        result.source_column = metadata->src_column;
-        result.dest_column = metadata->dst_column;
-        result.weight_column = metadata->weight_column;
+    if (where_result.has_where && !where_result.vertex_ids.empty()) {
+      // First vertex with WHERE = source, second = destination
+      if (all_source_vertices.empty()) {
+        all_source_vertices = where_result.vertex_ids;
+        SIRIUS_LOG_DEBUG("Found {} source vertex(ies)", where_result.vertex_ids.size());
+        for (auto id : where_result.vertex_ids) {
+          SIRIUS_LOG_DEBUG("  Source: {}", id);
+        }
       } else {
-        SIRIUS_LOG_WARN("Graph '{}' not registered, treating as edge table name", graph_name);
-        result.edge_table = graph_name;
-        result.source_column = "src";
-        result.dest_column = "dst";
-      }
-    }
-  }
-
-  // 1. Detect if this is a PATH query vs simple TRAVERSAL
-  bool is_path_query = query_upper.find("MATCH P =") != string::npos ||
-                       query_upper.find("MATCH P=") != string::npos;
-  result.is_path_query = is_path_query;
-
-  // 2. Detect algorithm type based on keywords and patterns
-  if (query_upper.find("ANY SHORTEST") != string::npos) {
-    result.algorithm_type = "UNWEIGHTED_SHORTEST_PATH";
-
-    // Check for hop patterns: ->+ (one or more), ->* (zero or more), -> (direct)
-    if (query.find("->+") != string::npos) {
-      result.path_pattern = "ONE_OR_MORE";
-    } else if (query.find("->*") != string::npos) {
-      result.path_pattern = "ZERO_OR_MORE";
-    } else {
-      result.path_pattern = "DIRECT";
-    }
-  } else if (query_upper.find("SHORTEST DISTANCE") != string::npos ||
-             query_upper.find("CHEAPEST PATH") != string::npos) {
-    result.algorithm_type = "WEIGHTED_SHORTEST_PATH";
-  } else if (query.find("->*") != string::npos ||
-             query.find("->+") != string::npos) {
-    result.algorithm_type = "BFS";
-  } else {
-    result.algorithm_type = "EDGE_TRAVERSAL";
-  }
-
-  // 3. Detect edge direction
-  if (query.find("<-") != string::npos && query.find("->") != string::npos) {
-    size_t left_arrow = query.find("<-");
-    size_t right_arrow = query.find("->");
-    if (right_arrow > left_arrow && right_arrow - left_arrow < 10) {
-      result.is_left_right_directed = true;
-    } else {
-      result.is_left_directed = true;
-      result.is_right_directed = true;
-    }
-  } else if (query.find("<-") != string::npos) {
-    result.is_left_directed = true;
-  } else if (query.find("->") != string::npos) {
-    result.is_right_directed = true;
-  } else {
-    result.is_any_directed = true;
-  }
-
-  // 4. Extract edge table name
-  size_t edge_start = query.find("-[");
-  if (edge_start != string::npos) {
-    edge_start += 2;
-    size_t colon_pos = query.find(":", edge_start);
-    if (colon_pos != string::npos && colon_pos < query.find("]", edge_start)) {
-      edge_start = colon_pos + 1;
-    }
-    size_t edge_end = query.find("]", edge_start);
-    if (edge_end != string::npos) {
-      result.edge_table = query.substr(edge_start, edge_end - edge_start);
-      result.edge_table.erase(0, result.edge_table.find_first_not_of(" \t"));
-      result.edge_table.erase(result.edge_table.find_last_not_of(" \t") + 1);
-    }
-  }
-
-  // 5. Extract ALL WHERE clauses and vertex IDs
-  std::vector<int64_t> source_vertices;
-  std::vector<int64_t> dest_vertices;
-  std::unordered_map<string, int64_t> vertex_id_map; // maps variable names to IDs
-
-  size_t pos = 0;
-  while ((pos = query.find("(", pos)) != string::npos) {
-    size_t close_paren = query.find(")", pos);
-    if (close_paren == string::npos) {
-      pos++;
-      continue;
-    }
-
-    string vertex_pattern = query.substr(pos + 1, close_paren - pos - 1);
-    string vertex_pattern_upper = vertex_pattern;
-    ranges::transform(vertex_pattern_upper.begin(), vertex_pattern_upper.end(),
-                     vertex_pattern_upper.begin(), ::toupper);
-
-    // Extract variable name (before colon)
-    size_t colon = vertex_pattern.find(":");
-    string var_name = "";
-    if (colon != string::npos) {
-      var_name = vertex_pattern.substr(0, colon);
-      var_name.erase(0, var_name.find_first_not_of(" \t"));
-      var_name.erase(var_name.find_last_not_of(" \t") + 1);
-    }
-
-    // Check if this vertex has a WHERE clause
-    size_t where_pos = vertex_pattern_upper.find("WHERE");
-    if (where_pos != string::npos) {
-
-      // Check for IN clause (multi-source)
-      size_t in_pos = vertex_pattern_upper.find(" IN ");
-      if (in_pos == string::npos) {
-        in_pos = vertex_pattern_upper.find("IN(");
-        if (in_pos != string::npos) {
-          in_pos += 2;
-        }
-      }
-
-      if (in_pos != string::npos) {
-        // Pattern: WHERE p.id IN (14, 25, 37)
-        size_t open_paren_in = vertex_pattern.find("(", in_pos);
-        size_t close_paren_in = vertex_pattern.find(")", open_paren_in);
-
-        if (open_paren_in != string::npos && close_paren_in != string::npos) {
-          string ids_str = vertex_pattern.substr(open_paren_in + 1,
-                                                 close_paren_in - open_paren_in - 1);
-
-          // Split by comma and parse each ID
-          size_t id_start = 0;
-          size_t comma_pos = 0;
-          while ((comma_pos = ids_str.find(",", id_start)) != string::npos) {
-            string id_str = ids_str.substr(id_start, comma_pos - id_start);
-            // Trim whitespace
-            id_str.erase(0, id_str.find_first_not_of(" \t"));
-            id_str.erase(id_str.find_last_not_of(" \t") + 1);
-
-            if (!id_str.empty()) {
-              int64_t vertex_id = std::stoll(id_str);
-              source_vertices.push_back(vertex_id);
-              SIRIUS_LOG_DEBUG("Found source vertex (IN clause): {}", vertex_id);
-            }
-            id_start = comma_pos + 1;
-          }
-
-          // Add last ID
-          string id_str = ids_str.substr(id_start);
-          id_str.erase(0, id_str.find_first_not_of(" \t"));
-          id_str.erase(id_str.find_last_not_of(" \t") + 1);
-          if (!id_str.empty()) {
-            int64_t vertex_id = std::stoll(id_str);
-            source_vertices.push_back(vertex_id);
-            SIRIUS_LOG_DEBUG("Found source vertex (IN clause): {}", vertex_id);
-          }
-
-          // Store mapping for first ID (for backward compatibility)
-          if (!var_name.empty() && !source_vertices.empty()) {
-            vertex_id_map[var_name] = source_vertices[0];
-          }
-        }
-      }
-
-      // Single vertex WHERE clause
-      else {
-        // Extract the ID value: WHERE varName.id = value
-        size_t eq_pos = vertex_pattern.find("=", where_pos);
-        if (eq_pos != string::npos) {
-          size_t num_start = eq_pos + 1;
-          while (num_start < vertex_pattern.length() && isspace(vertex_pattern[num_start])) {
-            num_start++;
-          }
-          size_t num_end = num_start;
-          while (num_end < vertex_pattern.length() &&
-                 (isdigit(vertex_pattern[num_end]) || vertex_pattern[num_end] == '-')) {
-            num_end++;
-                 }
-          if (num_end > num_start) {
-            string num_str = vertex_pattern.substr(num_start, num_end - num_start);
-            int64_t vertex_id = std::stoll(num_str);
-
-            // Store in map for later reference
-            if (!var_name.empty()) {
-              vertex_id_map[var_name] = vertex_id;
-            }
-
-            // Determine if this is source or destination based on position
-            // Simple heuristic: first vertex is source, second is destination
-            if (vertex_id_map.size() == 1) {
-              source_vertices.push_back(vertex_id);
-              SIRIUS_LOG_DEBUG("Found source vertex: {} = {}", var_name, vertex_id);
-            } else {
-              dest_vertices.push_back(vertex_id);
-              SIRIUS_LOG_DEBUG("Found destination vertex: {} = {}", var_name, vertex_id);
-            }
-          }
+        all_dest_vertices = where_result.vertex_ids;
+        SIRIUS_LOG_DEBUG("Found {} destination vertex(ies)", where_result.vertex_ids.size());
+        for (auto id : where_result.vertex_ids) {
+          SIRIUS_LOG_DEBUG("  Destination: {}", id);
         }
       }
     }
-
-    pos = close_paren + 1;
   }
 
-  // Store the extracted vertices
-  if (!source_vertices.empty()) {
-    result.source_vertex = source_vertices[0]; // Primary source for backward compatibility
-    result.source_vertices = source_vertices;  // All sources for multi-source BFS
+  // Store vertices
+  if (!all_source_vertices.empty()) {
+    result.source_vertex = all_source_vertices[0];
+    result.source_vertices = all_source_vertices;
   }
-  if (!dest_vertices.empty()) {
-    result.dest_vertex = dest_vertices[0];
-    result.dest_vertices = dest_vertices;
-  }
-
-  // 6. Parse COLUMNS clause
-  // Pattern: COLUMNS (column1, column2.field, ...)
-  size_t columns_pos = query_upper.find("COLUMNS");
-  if (columns_pos != string::npos) {
-    size_t open_paren = query.find("(", columns_pos);
-    size_t close_paren = query.find(")", open_paren);
-
-    if (open_paren != string::npos && close_paren != string::npos) {
-      string columns_str = query.substr(open_paren + 1, close_paren - open_paren - 1);
-
-      // Split by comma
-      size_t start = 0;
-      size_t comma_pos = 0;
-      while ((comma_pos = columns_str.find(",", start)) != string::npos) {
-        string col = columns_str.substr(start, comma_pos - start);
-        col.erase(0, col.find_first_not_of(" \t"));
-        col.erase(col.find_last_not_of(" \t") + 1);
-        if (!col.empty()) {
-          result.output_columns.push_back(col);
-        }
-        start = comma_pos + 1;
-      }
-
-      // Add last column
-      string col = columns_str.substr(start);
-      col.erase(0, col.find_first_not_of(" \t"));
-      col.erase(col.find_last_not_of(" \t") + 1);
-      if (!col.empty()) {
-        result.output_columns.push_back(col);
-      }
-
-      SIRIUS_LOG_DEBUG("Parsed {} output columns", result.output_columns.size());
-      for (const auto& c : result.output_columns) {
-        SIRIUS_LOG_DEBUG("  - {}", c);
-      }
-    }
+  if (!all_dest_vertices.empty()) {
+    result.dest_vertex = all_dest_vertices[0];
+    result.dest_vertices = all_dest_vertices;
   }
 
-  // 7. Check for weight column (for weighted shortest path)
-  // Look for patterns like [w:worksAt] where w is the weight variable
+  result.output_columns = GraphQueryParser::ExtractColumns(query);
+  SIRIUS_LOG_DEBUG("Parsed {} output columns", result.output_columns.size());
+
   if (result.algorithm_type == "WEIGHTED_SHORTEST_PATH") {
-    size_t bracket_start = query.find("[");
-    size_t bracket_end = query.find("]");
-    if (bracket_start != string::npos && bracket_end != string::npos) {
-      string bracket_content = query.substr(bracket_start + 1, bracket_end - bracket_start - 1);
-      size_t colon = bracket_content.find(":");
-      if (colon != string::npos) {
-        result.weight_column = bracket_content.substr(0, colon);
-        result.weight_column.erase(0, result.weight_column.find_first_not_of(" \t"));
-        result.weight_column.erase(result.weight_column.find_last_not_of(" \t") + 1);
-      }
+    string weight_var = GraphQueryParser::ExtractWeightColumn(query);
+    if (!weight_var.empty() && weight_var != result.edge_table) {
+      result.weight_column = weight_var;
     }
   }
 
   result.parse_success = !result.edge_table.empty() && result.source_vertex >= 0;
-
-  SIRIUS_LOG_INFO("Parse complete - edge_table: {}, source: {}, dest: {}, columns: {}",
-                  result.edge_table, result.source_vertex,
+  SIRIUS_LOG_INFO("Parse complete - edge_table: {}, algo: {}, sources: {}, dest: {}, columns: {}",
+                  result.edge_table, result.algorithm_type, result.source_vertices.size(),
                   result.dest_vertex, result.output_columns.size());
 
   return result;
