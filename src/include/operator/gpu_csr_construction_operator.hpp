@@ -1,7 +1,3 @@
-//
-// Created by andy on 11/23/25.
-//
-
 #pragma once
 
 #include "gpu_physical_operator.hpp"
@@ -18,6 +14,7 @@ public:
   string source_column;
   string dest_column;
   string weight_column;
+  mutable std::vector<int64_t> vertex_id_map;
 
   // CSR data structures (CPU side for now)
   mutable vector<int64_t> offsets;

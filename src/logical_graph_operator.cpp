@@ -1,6 +1,3 @@
-//
-// Created by andy on 11/23/25.
-//
 #include "logical_graph_operator.hpp"
 #include "duckdb/common/string_util.hpp"
 
@@ -11,22 +8,32 @@ LogicalGraphOperator::LogicalGraphOperator(const ParsedGraphQuery& parsed)
       edge_table(parsed.edge_table),
       source_column(parsed.source_column),
       dest_column(parsed.dest_column),
+      weight_column(parsed.weight_column),
       source_vertex(parsed.source_vertex),
+      dest_vertex(parsed.dest_vertex),
+      source_vertices(parsed.source_vertices),
+      dest_vertices(parsed.dest_vertices),
       algorithm_type(parsed.algorithm_type),
+      path_pattern(parsed.path_pattern),
+      is_path_query(parsed.is_path_query),
       max_hops(parsed.max_hops),
       is_left_directed(parsed.is_left_directed),
       is_right_directed(parsed.is_right_directed),
       is_any_directed(parsed.is_any_directed),
       is_left_right_directed(parsed.is_left_right_directed),
-      is_path_query(parsed.is_path_query),
-      path_pattern(parsed.path_pattern),
-      weight_column(parsed.weight_column) {
+      output_columns(parsed.output_columns) {
 
-  // Set up output schema: (vertex_id BIGINT, distance BIGINT)
-  types.push_back(LogicalType::BIGINT);
-  types.push_back(LogicalType::BIGINT);
-  if (is_path_query) {
-    types.push_back(LogicalType::BIGINT);  // path_length
+  // Set up output schema based on output_columns or defaults
+  if (!output_columns.empty()) {
+    for (const auto& col : output_columns) {
+      types.push_back(LogicalType::BIGINT);
+    }
+  } else {
+    types.push_back(LogicalType::BIGINT);    // vertex_id
+    types.push_back(LogicalType::BIGINT);    // distance
+    if (is_path_query) {
+      types.push_back(LogicalType::BIGINT);  // predecessor
+    }
   }
 }
 

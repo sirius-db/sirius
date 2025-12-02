@@ -1,7 +1,3 @@
-//
-// Created by andy on 11/23/25.
-//
-
 #pragma once
 
 #include "gpu_physical_operator.hpp"
@@ -24,10 +20,14 @@ class GPUGraphTraversalOperator : public GPUPhysicalOperator {
 public:
   unique_ptr<GPUPhysicalOperator> child;  // CSR construction operator
   int64_t source_vertex;
-  GraphAlgorithmType algorithm_type;
-  int max_hops;
-  bool is_path_query;
+  std::vector<int64_t> source_vertices;
+  int64_t dest_vertex = -1;
+  std::vector<int64_t> dest_vertices;
   string weight_column;
+  GraphAlgorithmType algorithm_type;
+  bool is_path_query;
+  int max_hops;
+  std::vector<string> output_columns;
 
   // Result data
   mutable vector<int64_t> result_vertices;
@@ -40,11 +40,15 @@ public:
 
   GPUGraphTraversalOperator(
     unique_ptr<GPUPhysicalOperator> child_op,
-    int64_t source,
+    int64_t source_vertex,
+    std::vector<int64_t> source_vertices,
+    int64_t dest_vertex,
+    std::vector<int64_t> dest_vertices,
+    const string& weight_col,
     const string& algo_str,
     bool is_path,
     int max_hops,
-    const string& weight_col,
+    std::vector<string> output_columns,
     ClientContext& context,
     GPUContext& gpu_context
   );
@@ -62,9 +66,11 @@ private:
   void InitializeCuGraph() const;
   void RunEdgeTraversal(int64_t* d_offsets, int64_t* d_indices, int64_t num_vertices, int64_t num_edges) const;
   void RunBFS(int64_t* d_offsets, int64_t* d_indices, int64_t num_vertices, int64_t num_edges) const;
+  void RunMultiSourceBFS(int64_t* d_offsets, int64_t* d_indices, int64_t num_vertices, int64_t num_edges) const;
   void RunSSSP(int64_t* d_offsets, int64_t* d_indices, double* d_weights, int64_t num_vertices, int64_t num_edges) const;
 
-  // Helper to convert string algorithm type to enum
+  // Helpers
+  void BuildOutputRelation(GPUIntermediateRelation& output_relation, size_t num_results) const;
   static GraphAlgorithmType StringToAlgorithmType(const string& algo_str);
 };
 

@@ -189,10 +189,14 @@ GPUPhysicalPlanGenerator::CreateGraphPhysicalPlan(LogicalGraphOperator* graph_op
   auto traversal = make_uniq<GPUGraphTraversalOperator>(
       std::move(csr_builder),
       graph_op->source_vertex,
+      graph_op->source_vertices,
+      graph_op->dest_vertex,
+      graph_op->dest_vertices,
+      graph_op->weight_column,
       graph_op->algorithm_type,
       graph_op->is_path_query,
       graph_op->max_hops,
-      graph_op->weight_column,
+      graph_op->output_columns,
       context,
       gpu_context
   );

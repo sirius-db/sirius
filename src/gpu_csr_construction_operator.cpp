@@ -1,10 +1,6 @@
-//
-// Created by andy on 11/23/25.
-//
 #include "gpu_csr_construction_operator.hpp"
 #include "log/logging.hpp"
 #include <algorithm>
-#include <cuda_runtime.h>
 
 namespace duckdb {
 
@@ -183,13 +179,23 @@ GPUCSRConstructionOperator::BuildCSR(
 
   SIRIUS_LOG_DEBUG("CSR Construction: Building CSR from {} edges", src.size());
 
-  // Find max vertex ID to determine number of vertices
-  num_vertices = 0;
+  // Collect all unique vertices and create mapping
+  std::set<int64_t> unique_vertices;
   for (auto v : src) {
-    num_vertices = std::max(num_vertices, v + 1);
+    unique_vertices.insert(v);
   }
   for (auto v : dst) {
-    num_vertices = std::max(num_vertices, v + 1);
+    unique_vertices.insert(v);
+  }
+
+  // Create the vertex ID mapping (sorted order)
+  vertex_id_map.assign(unique_vertices.begin(), unique_vertices.end());
+  num_vertices = vertex_id_map.size();
+
+  // Create reverse mapping: original ID -> array index
+  std::unordered_map<int64_t, int64_t> id_to_index;
+  for (size_t i = 0; i < vertex_id_map.size(); i++) {
+    id_to_index[vertex_id_map[i]] = i;
   }
 
   SIRIUS_LOG_DEBUG("CSR Construction: Number of vertices = {}", num_vertices);
@@ -199,7 +205,8 @@ GPUCSRConstructionOperator::BuildCSR(
 
   // Count out-degree for each vertex
   for (auto v : src) {
-    offsets[v + 1]++;
+    int64_t index = id_to_index[v];
+    offsets[index + 1]++;
   }
 
   // Compute prefix sum to get offsets
@@ -212,10 +219,11 @@ GPUCSRConstructionOperator::BuildCSR(
   vector<int64_t> temp_offsets = offsets;
 
   for (size_t i = 0; i < src.size(); i++) {
-    int64_t v = src[i];
-    int64_t pos = temp_offsets[v];
-    indices[pos] = dst[i];
-    temp_offsets[v]++;
+    int64_t src_index = id_to_index[src[i]];
+    int64_t dst_index = id_to_index[dst[i]];
+    int64_t pos = temp_offsets[src_index];
+    indices[pos] = dst_index;  // Store destination as array index
+    temp_offsets[src_index]++;
   }
 
   SIRIUS_LOG_DEBUG("CSR Construction: Offsets size = {}, Indices size = {}",
@@ -235,13 +243,23 @@ GPUCSRConstructionOperator::BuildCSRWithWeights(
 
   SIRIUS_LOG_DEBUG("CSR Construction: Building CSR (weighted) from {} edges", src.size());
 
-  // Find max vertex ID
-  num_vertices = 0;
+  // Collect all unique vertices and create mapping
+  std::set<int64_t> unique_vertices;
   for (auto v : src) {
-    num_vertices = std::max(num_vertices, v + 1);
+    unique_vertices.insert(v);
   }
   for (auto v : dst) {
-    num_vertices = std::max(num_vertices, v + 1);
+    unique_vertices.insert(v);
+  }
+
+  // Create the vertex ID mapping (sorted order)
+  vertex_id_map.assign(unique_vertices.begin(), unique_vertices.end());
+  num_vertices = vertex_id_map.size();
+
+  // Create reverse mapping: original ID -> array index
+  std::unordered_map<int64_t, int64_t> id_to_index;
+  for (size_t i = 0; i < vertex_id_map.size(); i++) {
+    id_to_index[vertex_id_map[i]] = i;
   }
 
   SIRIUS_LOG_DEBUG("CSR Construction: Number of vertices = {}", num_vertices);
@@ -251,7 +269,8 @@ GPUCSRConstructionOperator::BuildCSRWithWeights(
 
   // Count out-degree
   for (auto v : src) {
-    offsets[v + 1]++;
+    int64_t index = id_to_index[v];
+    offsets[index + 1]++;
   }
 
   // Prefix sum
@@ -265,11 +284,12 @@ GPUCSRConstructionOperator::BuildCSRWithWeights(
   vector<int64_t> temp_offsets = offsets;
 
   for (size_t i = 0; i < src.size(); i++) {
-    int64_t v = src[i];
-    int64_t pos = temp_offsets[v];
-    indices[pos] = dst[i];
+    int64_t src_index = id_to_index[src[i]];
+    int64_t dst_index = id_to_index[dst[i]];
+    int64_t pos = temp_offsets[src_index];
+    indices[pos] = dst_index;  // Store as array index
     weights[pos] = weights_in[i];
-    temp_offsets[v]++;
+    temp_offsets[src_index]++;
   }
 
   SIRIUS_LOG_DEBUG("CSR Construction: Offsets size = {}, Indices size = {}, Weights size = {}",
