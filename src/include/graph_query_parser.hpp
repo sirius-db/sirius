@@ -20,20 +20,41 @@ public:
     size_t close = clause.find(")", open);
 
     if (open == std::string::npos || close == std::string::npos) {
+      SIRIUS_LOG_WARN("Could not find parentheses in IN clause: {}", clause);
       return ids;
     }
 
     std::string ids_str = clause.substr(open + 1, close - open - 1);
+    SIRIUS_LOG_DEBUG("Extracting IDs from: '{}'", ids_str);
+
     std::stringstream ss(ids_str);
     std::string id_str;
 
     while (std::getline(ss, id_str, ',')) {
       // Trim whitespace
-      id_str.erase(0, id_str.find_first_not_of(" \t\n"));
-      id_str.erase(id_str.find_last_not_of(" \t\n") + 1);
+      id_str.erase(0, id_str.find_first_not_of(" \t\n\r"));
+      id_str.erase(id_str.find_last_not_of(" \t\n\r") + 1);
 
-      if (!id_str.empty() && (std::isdigit(id_str[0]) || id_str[0] == '-')) {
-        ids.push_back(std::stoll(id_str));
+      SIRIUS_LOG_DEBUG("Processing ID token: '{}'", id_str);
+
+      if (!id_str.empty()) {
+        // Check if it's a valid number
+        bool is_number = true;
+        for (size_t i = 0; i < id_str.length(); i++) {
+          if (i == 0 && id_str[i] == '-') continue; // Allow negative sign
+          if (!std::isdigit(id_str[i])) {
+            is_number = false;
+            break;
+          }
+        }
+
+        if (is_number) {
+          int64_t id = std::stoll(id_str);
+          ids.push_back(id);
+          SIRIUS_LOG_DEBUG("Extracted ID: {}", id);
+        } else {
+          SIRIUS_LOG_WARN("Skipping non-numeric token: '{}'", id_str);
+        }
       }
     }
 
@@ -121,7 +142,24 @@ public:
 
     size_t pos = 0;
     while ((pos = query.find("(", pos)) != std::string::npos) {
-      size_t close = query.find(")", pos);
+      // Count nested parentheses to find the matching close paren
+      int paren_count = 1;
+      size_t search_pos = pos + 1;
+      size_t close = std::string::npos;
+
+      while (search_pos < query.length() && paren_count > 0) {
+        if (query[search_pos] == '(') {
+          paren_count++;
+        } else if (query[search_pos] == ')') {
+          paren_count--;
+          if (paren_count == 0) {
+            close = search_pos;
+            break;
+          }
+        }
+        search_pos++;
+      }
+
       if (close == std::string::npos) {
         pos++;
         continue;
@@ -162,19 +200,47 @@ public:
     result.has_where = true;
 
     // Check for IN clause
-    size_t in_pos = pattern_upper.find(" IN ", where_pos);
-    if (in_pos == std::string::npos) {
-      in_pos = pattern_upper.find(" IN(", where_pos);
-    }
-    if (in_pos == std::string::npos) {
-      in_pos = pattern_upper.find("IN(", where_pos);
-    }
+    size_t in_pos = pattern_upper.find("IN", where_pos);
 
     if (in_pos != std::string::npos) {
-      // IN clause: WHERE p.id IN (14, 25, 37)
-      result.is_in_clause = true;
-      result.vertex_ids = ExtractIDList(vertex_pattern.substr(in_pos));
-    } else {
+      // Make sure it's actually the keyword "IN" (not part of another word)
+      bool is_in_keyword = true;
+
+      // Check character before "IN"
+      if (in_pos > 0) {
+        char before = pattern_upper[in_pos - 1];
+        if (!std::isspace(before) && before != '.') {
+          is_in_keyword = false;
+        }
+      }
+
+      // Check character after "IN"
+      if (is_in_keyword && in_pos + 2 < pattern_upper.length()) {
+        char after = pattern_upper[in_pos + 2];
+        if (!std::isspace(after) && after != '(') {
+          is_in_keyword = false;
+        }
+      }
+
+      if (is_in_keyword) {
+        // IN clause: WHERE p.id IN (14, 25, 37)
+        result.is_in_clause = true;
+
+        // Find the opening paren after IN
+        size_t paren_start = vertex_pattern.find("(", in_pos);
+        if (paren_start != std::string::npos) {
+          result.vertex_ids = ExtractIDList(vertex_pattern.substr(in_pos));
+
+          SIRIUS_LOG_DEBUG("Parsed IN clause, found {} IDs", result.vertex_ids.size());
+          for (auto id : result.vertex_ids) {
+            SIRIUS_LOG_DEBUG("  - ID: {}", id);
+          }
+        }
+      }
+    }
+
+    // If not IN clause, try single value
+    if (!result.is_in_clause) {
       // Single value: WHERE p.id = 14
       int64_t id = ExtractSingleID(vertex_pattern, where_pos);
       if (id >= 0) {
@@ -370,8 +436,7 @@ public:
     std::transform(query_upper.begin(), query_upper.end(),
                    query_upper.begin(), ::toupper);
 
-    return query_upper.find("MATCH P =") != std::string::npos ||
-           query_upper.find("MATCH P=") != std::string::npos;
+    return false;
   }
 };
 

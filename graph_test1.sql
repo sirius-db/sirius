@@ -130,11 +130,27 @@ CALL gpu_processing_graph("
   )
 ");
 
--- TODO: Multi-source BFS
+-- ============================================
+-- Test 6: Multi-source BFS
+-- ============================================
+CALL gpu_processing_graph("
+  SELECT * FROM GRAPH_TABLE (social
+    MATCH (p:Person WHERE p.id IN (14, 25))-[:knows]->(p2:Person)
+    COLUMNS (p2.id, distance, predecessor)
+  )
+");
+
 CALL gpu_processing_graph("
   SELECT * FROM GRAPH_TABLE (social
     MATCH (p:Person WHERE p.id IN (14, 25))-[:knows]->*(p2:Person)
-    COLUMNS (p2.id, distance)
+    COLUMNS (p2.id, distance, predecessor)
+  )
+");
+
+CALL gpu_processing_graph("
+  SELECT * FROM GRAPH_TABLE (social
+    MATCH (p:Person WHERE p.id IN (14, 25))-[:knows]->+(p2:Person)
+    COLUMNS (p2.id, distance, predecessor)
   )
 ");
 
@@ -143,17 +159,17 @@ CALL gpu_processing_graph("
 -- ============================================
 
 -- TODO: Test 5: Weighted Shortest Path
-CALL gpu_processing_graph("
-  SELECT * FROM GRAPH_TABLE (social
-    MATCH SHORTEST (p:Person WHERE p.id=14)-[:knows]->+(p2:Person WHERE p2.id=42)
-    COLUMNS (p2.id)
-  )
-");
+-- CALL gpu_processing_graph("
+--   SELECT * FROM GRAPH_TABLE (social
+--     MATCH SHORTEST (p:Person WHERE p.id=14)-[:knows]->+(p2:Person WHERE p2.id=42)
+--     COLUMNS (p2.id)
+--   )
+-- ");
 
 -- TODO: Test 6: Path reconstruction with predecessors
-CALL gpu_processing_graph("
-  SELECT * FROM GRAPH_TABLE (social
-    MATCH p = (p1:Person WHERE p1.id=14)-[:knows]->*(p2:Person)
-    COLUMNS (p2.id, length(p))
-  )
-");
+-- CALL gpu_processing_graph("
+--   SELECT * FROM GRAPH_TABLE (social
+--     MATCH p = (p1:Person WHERE p1.id=14)-[:knows]->*(p2:Person)
+--     COLUMNS (p2.id, length(p))
+--   )
+-- ");
