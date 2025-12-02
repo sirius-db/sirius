@@ -110,8 +110,6 @@ GPUGraphTraversalOperator::Execute(
   vector<int64_t> filtered_distances;
   vector<int64_t> filtered_predecessors;
 
-  SIRIUS_LOG_DEBUG("PATH PATTERN: {}", path_pattern);
-
   for (int64_t i = 0; i < num_vertices; i++) {
     if (result_distances[i] == std::numeric_limits<int64_t>::max()) {
       continue; // Skip unreachable vertices
@@ -138,7 +136,7 @@ GPUGraphTraversalOperator::Execute(
 
     filtered_vertices.push_back(result_vertices[i]);
     filtered_distances.push_back(result_distances[i]);
-    if (is_path_query && i < result_predecessors.size()) {
+    if (!result_predecessors.empty() && i < result_predecessors.size()) {
       filtered_predecessors.push_back(result_predecessors[i]);
     }
   }
@@ -153,7 +151,7 @@ GPUGraphTraversalOperator::Execute(
       if (filtered_vertices[i] == dest_vertex) {
         dest_filtered_vertices.push_back(filtered_vertices[i]);
         dest_filtered_distances.push_back(filtered_distances[i]);
-        if (is_path_query && i < filtered_predecessors.size()) {
+        if (!result_predecessors.empty() && i < filtered_predecessors.size()) {
           dest_filtered_predecessors.push_back(filtered_predecessors[i]);
         }
       }
@@ -272,7 +270,7 @@ GPUGraphTraversalOperator::GetData(GPUIntermediateRelation& output_relation) con
 
     filtered_vertices.push_back(result_vertices[i]);
     filtered_distances.push_back(result_distances[i]);
-    if (is_path_query && i < result_predecessors.size()) {
+    if (!result_predecessors.empty() && i < result_predecessors.size()) {
       filtered_predecessors.push_back(result_predecessors[i]);
     }
   }
@@ -287,7 +285,7 @@ GPUGraphTraversalOperator::GetData(GPUIntermediateRelation& output_relation) con
       if (filtered_vertices[i] == dest_vertex) {
         dest_filtered_vertices.push_back(filtered_vertices[i]);
         dest_filtered_distances.push_back(filtered_distances[i]);
-        if (is_path_query && i < filtered_predecessors.size()) {
+        if (!result_predecessors.empty() && i < filtered_predecessors.size()) {
           dest_filtered_predecessors.push_back(filtered_predecessors[i]);
         }
       }
@@ -394,10 +392,14 @@ GPUGraphTraversalOperator::RunEdgeTraversal(
   result_distances.resize(num_edges_from_source);
   std::fill(result_distances.begin(), result_distances.end(), 1);
 
-  // If path query, set predecessors (all point back to source)
-  if (is_path_query) {
+  bool need_predecessors = is_path_query || std::find(output_columns.begin(),
+    output_columns.end(), "predecessor") != output_columns.end();
+
+  if (need_predecessors) {
     result_predecessors.resize(num_edges_from_source);
     std::fill(result_predecessors.begin(), result_predecessors.end(), source_vertex);
+    SIRIUS_LOG_DEBUG("Set {} predecessors (all pointing to source vertex {})",
+                     num_edges_from_source, source_vertex);
   }
 
   SIRIUS_LOG_INFO("Edge traversal complete: {} edges from vertex {}",
@@ -487,13 +489,26 @@ GPUGraphTraversalOperator::RunBFS(
   cudaMemcpy(result_distances.data(), d_distances,
              num_vertices * sizeof(int64_t), cudaMemcpyDeviceToHost);
 
-  // Copy predecessors if path query
   bool need_predecessors = is_path_query || std::find(output_columns.begin(),
     output_columns.end(), "predecessor") != output_columns.end();
+
   if (need_predecessors) {
     result_predecessors.resize(num_vertices);
-    cudaMemcpy(result_predecessors.data(), d_predecessors,
+    vector<int64_t> predecessors_indices(num_vertices);
+
+    // Copy predecessor indices from GPU
+    cudaMemcpy(predecessors_indices.data(), d_predecessors,
                num_vertices * sizeof(int64_t), cudaMemcpyDeviceToHost);
+
+    // Map predecessor indices back to original vertex IDs
+    for (int64_t i = 0; i < num_vertices; i++) {
+      int64_t pred_index = predecessors_indices[i];
+      if (pred_index >= 0 && pred_index < num_vertices) {
+        result_predecessors[i] = csr_op->vertex_id_map[pred_index];
+      } else {
+        result_predecessors[i] = -1;  // No predecessor (unreachable or source)
+      }
+    }
     SIRIUS_LOG_DEBUG("Copied {} predecessors for path reconstruction", num_vertices);
   }
 
@@ -590,10 +605,26 @@ GPUGraphTraversalOperator::RunMultiSourceBFS(
 
   bool need_predecessors = is_path_query || std::find(output_columns.begin(),
     output_columns.end(), "predecessor") != output_columns.end();
+
   if (need_predecessors) {
     result_predecessors.resize(num_vertices);
-    cudaMemcpy(result_predecessors.data(), d_predecessors,
+    vector<int64_t> predecessors_indices(num_vertices);
+
+    // Copy predecessor indices from GPU
+    cudaMemcpy(predecessors_indices.data(), d_predecessors,
                num_vertices * sizeof(int64_t), cudaMemcpyDeviceToHost);
+
+    // Map predecessor indices back to original vertex IDs
+    for (int64_t i = 0; i < num_vertices; i++) {
+      int64_t pred_index = predecessors_indices[i];
+      if (pred_index >= 0 && pred_index < num_vertices) {
+        result_predecessors[i] = csr_op->vertex_id_map[pred_index];
+      } else {
+        result_predecessors[i] = -1;  // No predecessor (unreachable or source)
+      }
+    }
+    SIRIUS_LOG_DEBUG("Copied {} predecessors for path reconstruction", num_vertices);
+
   }
 
   SIRIUS_LOG_INFO("Multi-source BFS results: {} vertices reached",
@@ -792,10 +823,10 @@ GPUGraphTraversalOperator::BuildOutputRelation(
       output_relation.columns.push_back(col);
 
     } else if (col_name == "predecessor") {
-      // Only add if we have predecessor data
-      if (!is_path_query || result_predecessors.empty() || result_predecessors.size() != num_results) {
+      // Only add if predecessor is available
+      if (result_predecessors.empty() || result_predecessors.size() != num_results) {
         SIRIUS_LOG_WARN("Predecessor column requested but not available");
-        continue;  // Skip this column
+        continue;
       }
 
       // Allocate and copy predecessors

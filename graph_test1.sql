@@ -32,10 +32,8 @@ CALL gpu_processing("SELECT * FROM Knows");
 -- SELECT sirius_register_graph('social', 'Person', 'Knows', 'src', 'dst', NULL);
 
 -- ============================================
--- Test 1: Edge Traversal (Direct Neighbors)
+-- Test 1: Edge Traversal (->)
 -- ============================================
--- Expected: Find all people that person 14 directly knows
--- Should return: 25 (Bob), 37 (Charlie), 42 (Dave)
 CALL gpu_processing_graph("
   SELECT * FROM GRAPH_TABLE (social
     MATCH (p:Person WHERE p.id=14)-[:knows]->(p2:Person)
@@ -50,11 +48,16 @@ CALL gpu_processing_graph("
   )
 ");
 
+CALL gpu_processing_graph("
+  SELECT * FROM GRAPH_TABLE (social
+    MATCH (p:Person WHERE p.id=14)-[:knows]->(p2:Person)
+    COLUMNS (p2.id, distance, predecessor)
+  )
+");
+
 -- ============================================
--- Test 2: BFS (All Reachable Vertices)
+-- Test 2: BFS (Zero or more, ->*)
 -- ============================================
--- Expected: Find all people reachable from person 14
--- Should return: 25 (distance 1), 37 (distance 1), 42 (distance 1)
 CALL gpu_processing_graph("
   SELECT * FROM GRAPH_TABLE (social
     MATCH (p:Person WHERE p.id=14)-[:knows]->*(p2:Person)
@@ -65,20 +68,6 @@ CALL gpu_processing_graph("
 CALL gpu_processing_graph("
   SELECT * FROM GRAPH_TABLE (social
     MATCH (p:Person WHERE p.id=14)-[:knows]->*(p2:Person)
-    COLUMNS (p2.id, distance)
-  )
-");
-
-CALL gpu_processing_graph("
-  SELECT * FROM GRAPH_TABLE (social
-    MATCH (p:Person WHERE p.id=14)-[:knows]->+(p2:Person)
-    COLUMNS (p2.id)
-  )
-");
-
-CALL gpu_processing_graph("
-  SELECT * FROM GRAPH_TABLE (social
-    MATCH (p:Person WHERE p.id=14)-[:knows]->+(p2:Person)
     COLUMNS (p2.id, distance)
   )
 ");
@@ -91,10 +80,32 @@ CALL gpu_processing_graph("
 ");
 
 -- ============================================
--- Test 3: BFS from different source
+-- Test 3: BFS (One or more, ->+)
 -- ============================================
--- Expected: Find all people reachable from person 25
--- Should return: 37 (Charlie), and 42 (Dave)
+CALL gpu_processing_graph("
+  SELECT * FROM GRAPH_TABLE (social
+    MATCH (p:Person WHERE p.id=14)-[:knows]->+(p2:Person)
+    COLUMNS (p2.id)
+  )
+");
+
+CALL gpu_processing_graph("
+  SELECT * FROM GRAPH_TABLE (social
+    MATCH (p:Person WHERE p.id=14)-[:knows]->+(p2:Person)
+    COLUMNS (p2.id, distance)
+  )
+");
+
+CALL gpu_processing_graph("
+  SELECT * FROM GRAPH_TABLE (social
+    MATCH (p:Person WHERE p.id=14)-[:knows]->+(p2:Person)
+    COLUMNS (p2.id, distance, predecessor)
+  )
+");
+
+-- ============================================
+-- Test 4: BFS from different source
+-- ============================================
 CALL gpu_processing_graph("
   SELECT * FROM GRAPH_TABLE (social
     MATCH (p:Person WHERE p.id=25)-[:knows]->*(p2:Person)
@@ -102,10 +113,16 @@ CALL gpu_processing_graph("
   )
 ");
 
+CALL gpu_processing_graph("
+  SELECT * FROM GRAPH_TABLE (social
+    MATCH (p:Person WHERE p.id=25)-[:knows]->*(p2:Person)
+    COLUMNS (p2.id, distance, predecessor)
+  )
+");
+
 -- ============================================
--- Test 4: Source with no outgoing edges
+-- Test 5: Source with no outgoing edges
 -- ============================================
--- Expected: Person 42 has no outgoing edges, should return empty
 CALL gpu_processing_graph("
   SELECT * FROM GRAPH_TABLE (social
     MATCH (p:Person WHERE p.id=42)-[:knows]->(p2:Person)
