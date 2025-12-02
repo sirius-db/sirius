@@ -37,6 +37,8 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
+#include <type_traits>
 
 namespace sirius::parallel {
 
@@ -111,7 +113,8 @@ class duckdb_scan_task_global_state : public itask_global_state, public duckdb::
  * NOTE: the caller is responsible for allocating sufficient blocks and ensure the cursor does not
  * go out of bounds. Otherwise, behavior is undefined.
  *
- * @tparam T The underlying data type to be accessed.
+ * @tparam T The underlying data type to be accessed. It is assumed that T is aligned with the block
+ * size of the allocation.
  */
 template <typename T>
 struct multiple_blocks_allocation_accessor {
@@ -120,43 +123,51 @@ struct multiple_blocks_allocation_accessor {
     memory::fixed_size_host_memory_resource::multiple_blocks_allocation;
 
   //===----------Fields----------===//
-  size_t block_index     = 0;                         ///< The current block index
-  size_t offset_in_block = 0;                         ///< The byte offset in the block
-  unique_ptr<multiple_blocks_allocation> allocation;  ///< The multiple blocks allocation
+  size_t block_size      = 0;  ///< The size of each block in bytes
+  size_t num_blocks      = 0;  ///< The number of blocks in the allocation
+  size_t block_index     = 0;  ///< The current block index
+  size_t offset_in_block = 0;  ///< The byte offset in the block
 
   /**
-   * @brief Initialize the accessor with a multiple blocks allocation.
+   * @brief Initialize the accessor with a byte offset within the allocation.
    *
-   * @param[in] alloc The multiple blocks allocation to initialize the accessor with.
-   * @throws duckdb::InternalException if the underlying type size does not align with the block
-   * size.
+   * @throws std::runtime_error if the block size is not a multiple of the size of T.
    */
-  void initialize(unique_ptr<multiple_blocks_allocation> alloc)
+  void initialize(size_t byte_offset, const unique_ptr<multiple_blocks_allocation>& allocation)
   {
-    allocation = std::move(alloc);
+    assert(allocation != nullptr);
 
-    // We require the underlying type to align with the block size.
-    if (allocation->block_size % sizeof(underlying_type) != 0) {
-      std::string error_msg =
-        "[multiple_blocks_allocation_accessor]: type size and block size must align.";
-      throw duckdb::InternalException(error_msg);
+    block_size = allocation->block_size;
+    if (block_size % sizeof(T) != 0) {
+      throw std::runtime_error(
+        "[multiple_blocks_allocation_accessor] The underyling type size must be aligned with the "
+        "block size.");
     }
+    num_blocks = allocation->blocks.size();
+    set_cursor(byte_offset);
   }
 
   /**
    * @brief Set the cursor to a specific byte offset within the allocation.
+   *
+   * @param[in] byte_offset The byte offset within the allocation.
    */
   void set_cursor(size_t byte_offset)
   {
-    block_index     = byte_offset / allocation->block_size;
-    offset_in_block = byte_offset % allocation->block_size;
+    block_index     = byte_offset / block_size;
+    offset_in_block = byte_offset % block_size;
   };
 
   /**
    * @brief Set value at the current position in the allocation.
+   *
+   * @param[in] value The value to set.
+   * @param[in] allocation The allocation.
    */
-  void set_current(T value)
+  void set_current(T value, unique_ptr<multiple_blocks_allocation>& allocation)
   {
+    assert(block_index < num_blocks);
+
     *reinterpret_cast<T*>(static_cast<uint8_t*>(allocation->blocks[block_index]) +
                           offset_in_block) = value;
   }
@@ -165,19 +176,26 @@ struct multiple_blocks_allocation_accessor {
    * @brief Get the value at the current position in the allocation as a different type.
    *
    * @tparam S The type to which to cast the value.
+   * @param[in] allocation The allocation.
    */
   template <typename S>
-  S get_current_as() const
+  S get_current_as(const unique_ptr<multiple_blocks_allocation>& allocation) const
   {
-    assert(block_index < allocation->blocks.size());
+    assert(block_index < num_blocks);
+
     return *reinterpret_cast<S*>(static_cast<uint8_t*>(allocation->blocks[block_index]) +
                                  offset_in_block);
   }
 
   /**
    * @brief Get the value at the current position in the allocation using the underlying type.
+   *
+   * @param[in] allocation The allocation.
    */
-  T get_current() const { return get_current_as<underlying_type>(); }
+  T get_current(const unique_ptr<multiple_blocks_allocation>& allocation) const
+  {
+    return get_current_as<underlying_type>(allocation);
+  }
 
   /**
    * @brief Advance the cursor into the allocation to the next position as type S.
@@ -188,7 +206,7 @@ struct multiple_blocks_allocation_accessor {
   void advance_as()
   {
     offset_in_block += sizeof(S);
-    if (offset_in_block == allocation->block_size) {
+    if (offset_in_block >= block_size) {
       ++block_index;
       offset_in_block = 0;
     }
@@ -204,8 +222,11 @@ struct multiple_blocks_allocation_accessor {
    *
    * @param[in] src Pointer to the source buffer.
    * @param[in] bytes Number of bytes to copy from the source buffer.
+   * @param[in] allocation The allocation.
    */
-  void memcpy_from(void const* src, size_t bytes)
+  void memcpy_from(void const* src,
+                   size_t bytes,
+                   unique_ptr<multiple_blocks_allocation>& allocation)
   {
     size_t bytes_copied = 0;
     // Loop over blocks into which to copy the src
@@ -230,10 +251,11 @@ struct multiple_blocks_allocation_accessor {
   /**
    * @brief Copy the data from the allocation to a destination buffer.
    *
+   * @param[in] allocation The allocation.
    * @param[in] dest Pointer to the destination buffer.
    * @param[in] bytes Number of bytes to copy to the destination buffer.
    */
-  void memcpy_to(void* dest, size_t bytes)
+  void memcpy_to(const unique_ptr<multiple_blocks_allocation>& allocation, void* dest, size_t bytes)
   {
     size_t bytes_copied = 0;
     // Loop over blocks from which to copy the data
@@ -272,6 +294,7 @@ class duckdb_scan_task_local_state : public itask_local_state {
  public:
   using multiple_blocks_allocation =
     memory::fixed_size_host_memory_resource::multiple_blocks_allocation;
+  static constexpr size_t HOST_SPACE_INDEX = 0;  ///< There is currently only one HOST memory space
 
   //===----------------------------------------------------------------------===//
   // Column Builder
@@ -282,31 +305,21 @@ class duckdb_scan_task_local_state : public itask_local_state {
    * vector.
    */
   struct column_builder {
-    static constexpr size_t HOST_SPACE_INDEX =
-      0;                                       ///< There is currently only one HOST memory space
     static constexpr size_t FULL_MASK = 0xFF;  ///< Mask with all bits set
 
     //===----------Fields----------===//
     duckdb::LogicalType type;  ///< DuckDB logical type of the column
-    size_t type_size;  ///< Size of the column data type in bytes (only used for NON-VARCHAR)
+    size_t type_size;  ///< Size of the column data type in bytes (for VARCHAR, just data size)
     size_t total_data_bytes =
       0;  ///< Total number of data bytes written for this column (only needed for VARCHAR)
+    size_t total_data_bytes_allocated =
+      0;  ///< Total number of data bytes allocated for this column (only needed for VARCHAR)
     bool has_nulls = false;  ///< Whether the column has NULL values
 
-    // The memory reservations
-    struct memory::any_memory_space_in_tier res_request =
-      memory::any_memory_space_in_tier(memory::Tier::HOST);
-    unique_ptr<memory::reservation> data_reservation;
-    unique_ptr<memory::reservation> mask_reservation;
-    unique_ptr<memory::reservation> offset_reservation = nullptr;
-
-    // The memory allocations
+    // The allocation accessors for the column data, mask, and offsets
     multiple_blocks_allocation_accessor<uint8_t> data_blocks_accessor;
     multiple_blocks_allocation_accessor<uint8_t> mask_blocks_accessor;
     multiple_blocks_allocation_accessor<int64_t> offset_blocks_accessor;
-
-    // The memory resource
-    memory::fixed_size_host_memory_resource* allocator;
 
     //===----------Constructors & Destructor----------===//
     column_builder() = default;
@@ -317,8 +330,9 @@ class duckdb_scan_task_local_state : public itask_local_state {
      * Uses the type to initialize type_size, which is only used for fixed-width columns.
      *
      * @param[in] t The DuckDB logical type of the column.
+     * @param[in] default_varchar_size The default size to use for VARCHAR data.
      */
-    column_builder(duckdb::LogicalType t);
+    column_builder(duckdb::LogicalType t, size_t default_varchar_size);
 
     // no copying
     column_builder(const column_builder&)            = delete;
@@ -326,26 +340,20 @@ class duckdb_scan_task_local_state : public itask_local_state {
     // explicit moves
     column_builder(column_builder&&) noexcept            = default;
     column_builder& operator=(column_builder&&) noexcept = default;
-
-    /**
-     * @brief Destructor for the column builder.
-     *
-     * Releases any memory reservations held by the column builder.
-     */
-    ~column_builder();
+    ~column_builder()                                    = default;
 
     //===----------Methods----------===//
     /**
-     * @brief Reserve memory for the column based on the estimated number of rows.
+     * @brief Initialize the allocation accessors for the column.
      *
-     * @param[in] estimated_num_rows The estimated number of rows to reserve memory for.
+     * @param[in] estimated_num_rows The estimated number of rows for the scan task data batch.
+     * @param[in] byte_offset The byte offset within the overall allocation where this column's
+     * data starts.
+     * @param[in] allocation The allocation into which to write data for this column.
      */
-    void reserve_memory(size_t estimated_num_rows);
-
-    /**
-     * @brief Allocate memory for the column based on the memory reservation.
-     */
-    void allocate_memory();
+    void initialize_accessors(size_t estimated_num_rows,
+                              size_t byte_offset,
+                              const unique_ptr<multiple_blocks_allocation>& allocation);
 
     /**
      * @brief Checks if there is enough space allocated to hold the data for the given vector.
@@ -359,28 +367,32 @@ class duckdb_scan_task_local_state : public itask_local_state {
                                      size_t num_rows);
 
     /**
-     * @brief Process the validity mask for the column and store it in the allocated mask buffer.
+     * @brief Process the validity mask for the column.
      *
      * @param[in] validity The validity mask indicating NULL values in the vector.
      * @param[in] num_rows The number of rows to be processed from the vector.
-     * @param[in] row_offset The row offset within the buffers for the current scan task.
+     * @param[in] row_offset The row offset within the allocation for the current scan task.
+     * @param[in] allocation The allocation into which to write data for this column.
      */
     void process_mask_for_column(duckdb::ValidityMask const& validity,
                                  size_t num_rows,
-                                 size_t row_offset);
+                                 size_t row_offset,
+                                 unique_ptr<multiple_blocks_allocation>& allocation);
 
     /**
-     * @brief Process the given DuckDB vector and copy its data into the allocated buffers.
+     * @brief Process the given DuckDB vector and copy its data into the allocation.
      *
      * @param[in] vec The DuckDB vector containing the data to be processed.
      * @param[in] validity The validity mask indicating NULL values in the vector.
      * @param[in] num_rows The number of rows to be processed from the vector.
-     * @param[in] row_offset The row offset within the buffers for the current scan task.
+     * @param[in] row_offset The row offset within the allocation for the current scan task.
+     * @param[in] allocation The allocation into which to write data for this column.
      */
     void process_column(duckdb::Vector& vec,
                         duckdb::ValidityMask const& validity,
                         size_t num_rows,
-                        size_t row_offset);
+                        size_t row_offset,
+                        unique_ptr<multiple_blocks_allocation>& allocation);
   };
 
   //===----------Constructor & Destructor----------===//
@@ -402,14 +414,23 @@ class duckdb_scan_task_local_state : public itask_local_state {
     size_t default_varchar_size   = duckdb::Config::DEFAULT_SCAN_TASK_VARCHAR_SIZE,
     unique_ptr<duckdb::LocalTableFunctionState> existing_local_tf_state = nullptr);
 
+  /**
+   * @brief Release the memory reservation held by the local state.
+   */
+  ~duckdb_scan_task_local_state();
+
   //===----------Fields----------===//
   size_t approximate_batch_size;           ///< Approximate target batch size in bytes
   size_t default_varchar_size;             ///< Default size for VARCHAR columns in bytes
   size_t num_columns;                      ///< Number of columns to be scanned
-  size_t estimated_row_size = 0;           ///< Estimated size of each row in bytes
   size_t estimated_rows_per_batch;         ///< Estimated number of rows per batch
   vector<column_builder> column_builders;  ///< Column builders for each column
   vector<size_t> varchar_indices;          ///< Indices of VARCHAR columns
+
+  struct memory::any_memory_space_in_tier res_request =
+    memory::any_memory_space_in_tier(memory::Tier::HOST);
+  unique_ptr<memory::reservation> reservation;        ///< Memory reservation for all column data
+  unique_ptr<multiple_blocks_allocation> allocation;  ///< Memory allocation for all column data
 
   duckdb::DataChunk chunk;  ///< DataChunk buffer
   size_t row_offset = 0;    ///< Current row offset in buffers
@@ -421,6 +442,20 @@ class duckdb_scan_task_local_state : public itask_local_state {
 
  private:
   /**
+   * @brief Estimate the maximum number of rows to process for a batch given the target batch size.
+   *
+   * Uses the actual width of fixed-width types, and a default VARCHAR width, for estimation.
+   *
+   * @param[in] op The physical table scan operator being executed.
+   */
+  void estimate_rows_per_batch(const duckdb::PhysicalTableScan& op);
+
+  /**
+   * @brief Initializes the column builders.
+   */
+  void initialize_builders();
+
+  /**
    * @brief Initializes the duckdb table function local state.
    *
    * @param[in] op The physical table scan operator being executed.
@@ -430,26 +465,6 @@ class duckdb_scan_task_local_state : public itask_local_state {
   void initialize_local_table_function_state(duckdb::PhysicalTableScan const& op,
                                              duckdb::ExecutionContext& exec_ctx,
                                              duckdb::GlobalTableFunctionState* global_tf_state);
-
-  /**
-   * @brief Initializes the column builders. Does not reserve or allocate memory for the builders.
-   *
-   * @param[in] op The physical table scan operator being executed.
-   */
-  void initialize_builders(const duckdb::PhysicalTableScan& op);
-
-  /**
-   * @brief Estimate the maximum number of rows to process for a batch given the target batch size.
-   *
-   * Uses the actual width of fixed-width types, and a default VARCHAR width, for estimation.
-   */
-  void estimate_rows_per_batch();
-
-  /**
-   * @brief Initializes the column buffers in the colum_builders based on the estimated rows per
-   * batch.
-   */
-  void initialize_buffers();
 };
 
 //===----------------------------------------------------------------------===//
