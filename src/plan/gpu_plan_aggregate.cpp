@@ -79,7 +79,7 @@ static bool CanUsePartitionedAggregate(ClientContext &context, LogicalAggregate 
 		switch (child_op.type) {
 		case PhysicalOperatorType::PROJECTION: {
 			// recompute partition columns
-			auto &projection = child_op.Cast<PhysicalProjection>();
+			auto &projection = child_op.Cast<GPUPhysicalProjection>();
 			vector<column_t> new_columns;
 			for (auto &partition_col : partition_columns) {
 				// we only support bound reference here

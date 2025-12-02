@@ -507,14 +507,6 @@ void SiriusExtension::InitializeGPUExtension(Connection &con) {
 	CreateTableFunctionInfo gpu_processing_substrait_info(gpu_processing_substrait);
 	catalog.CreateTableFunction(*con.context, gpu_processing_substrait_info);
 
-	// size_t cache_size_per_gpu = 100UL * 1024 * 1024 * 1024; // 10GB
-	// size_t processing_size_per_gpu = 80UL * 1024 * 1024 * 1024; //11GB
-	// size_t processing_size_per_cpu = 100UL * 1024 * 1024 * 1024; //16GB
-	// size_t cache_size_per_gpu = 10UL * 1024 * 1024 * 1024; // 10GB
-	// size_t processing_size_per_gpu = 11UL * 1024 * 1024 * 1024; //11GB
-	// size_t processing_size_per_cpu = 16UL * 1024 * 1024 * 1024; //16GB
-	// GPUBufferManager *gpuBufferManager = &(GPUBufferManager::GetInstance(cache_size_per_gpu, processing_size_per_gpu, processing_size_per_cpu));
-
 }
 
 static void SetUsePinMemory(ClientContext &context, SetScope scope, Value &parameter) {
@@ -562,6 +554,11 @@ static void SetEnableRegexJitImpl(ClientContext &context, SetScope scope, Value 
     SIRIUS_LOG_DEBUG("Updated config ENABLE_REGEX_JIT_IMPL to {}", Config::ENABLE_REGEX_JIT_IMPL);
 }
 
+static void SetModifiedPipeline(ClientContext &context, SetScope scope, Value &parameter) {
+	Config::MODIFIED_PIPELINE = BooleanValue::Get(parameter);
+	SIRIUS_LOG_DEBUG("Updated config MODIFIED_PIPELINE to {}", Config::MODIFIED_PIPELINE);
+}
+
 void SiriusExtension::InitialGPUConfigs(DuckDB &db) {
 	auto &config = DBConfig::GetConfig(*db.instance);
 
@@ -596,6 +593,10 @@ void SiriusExtension::InitialGPUConfigs(DuckDB &db) {
     // Add in config options for special JIT implemention for regex
     config.AddExtensionOption("enable_regex_jit_impl", "Whether to use special JIT implementation for particular regex evaluation", LogicalType::BOOLEAN, 
 		Value::BOOLEAN(Config::ENABLE_REGEX_JIT_IMPL), SetEnableRegexJitImpl);
+
+	// Add in config options for modified pipeline
+	config.AddExtensionOption("modified_pipeline", "Whether to use modified pipeline for GPU execution", LogicalType::BOOLEAN, 
+		Value::BOOLEAN(Config::MODIFIED_PIPELINE), SetModifiedPipeline);
 }
 
 void SiriusExtension::Load(DuckDB &db) {

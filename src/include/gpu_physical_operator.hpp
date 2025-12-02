@@ -27,6 +27,8 @@
 #include "duckdb/common/optional_idx.hpp"
 #include "duckdb/execution/physical_operator_states.hpp"
 #include "duckdb/common/enums/order_preservation_type.hpp"
+#include "data/data_repository.hpp"
+#include "data/data_batch_view.hpp"
 #include "gpu_columns.hpp"
 #include "helper/types.hpp"
 
@@ -36,6 +38,8 @@ class GPUPhysicalOperator;
 class GPUPipeline;
 class GPUPipelineBuildState;
 class GPUMetaPipeline;
+
+enum class MemoryBarrierType { PIPELINE, PARTIAL, FULL };
 
 //! GPUPhysicalOperator is the base class of the physical operators present in the
 //! execution plan
@@ -95,6 +99,7 @@ public:
 	virtual unique_ptr<GlobalOperatorState> GetGlobalOperatorState(ClientContext &context) const;
 
 	virtual OperatorResultType Execute(GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation) const;
+	virtual ::sirius::vector<::sirius::unique_ptr<::sirius::data_batch>> execute(::sirius::vector<::sirius::unique_ptr<::sirius::data_batch_view>> input_batch);
 
 	virtual bool ParallelOperator() const {
 		return false;
@@ -112,6 +117,8 @@ public:
 public:
 	//Source Interface
 	virtual SourceResultType GetData(GPUIntermediateRelation &output_relation) const;
+	// TODO: Implement SourceExecute if required in future.
+
 	virtual unique_ptr<LocalSourceState> GetLocalSourceState(ExecutionContext &context,
 	                                                         GlobalSourceState &gstate) const;
 	virtual unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const;
@@ -132,6 +139,8 @@ public:
 public:
 	//Sink interface
 	virtual SinkResultType Sink(GPUIntermediateRelation &input_relation) const;
+	// TODO: Implement SinkExecute if batch-based sink execution is required in the future.
+
 	virtual SinkFinalizeType CombineFinalize(vector<shared_ptr<GPUIntermediateRelation>> &input,
 																	  			 GPUIntermediateRelation& output) const;
 	virtual unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const;
@@ -177,6 +186,26 @@ public:
 		}
 		return reinterpret_cast<const TARGET &>(*this);
 	}
+
+    struct port {
+        MemoryBarrierType type;
+        ::sirius::idata_repository* repo;
+        shared_ptr<GPUPipeline> src_pipeline;
+        bool src_pipeline_finished{false};
+    };
+
+	// source pipeline pushed to repo of the ports
+    void push_data_batch_view(std::string_view port_id, ::sirius::data_batch_view batch_view);
+	void add_port(std::string_view port_id, std::unique_ptr<port> p);
+	port* get_port(std::string_view port_id);
+	void add_next_port_after_sink(std::pair<GPUPhysicalOperator*, std::string_view> port_locator);
+	vector<std::pair<GPUPhysicalOperator*, std::string_view>>& get_next_port_after_sink();
+
+private:
+
+    std::unordered_map<std::string, std::unique_ptr<port>> ports;
+	//! The next operators to be executed after this operator when it is used as a sink
+	vector<std::pair<GPUPhysicalOperator*, std::string_view>> next_port_after_sink;
 };
 
 } // namespace duckdb

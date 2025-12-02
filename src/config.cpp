@@ -34,4 +34,6 @@ bool Config::ENABLE_FALLBACK_CHECK = false;
 
 bool Config::ENABLE_REGEX_JIT_IMPL = true;
 
+bool Config::MODIFIED_PIPELINE = false;
+
 }

@@ -18,6 +18,7 @@
 
 #include "duckdb/execution/physical_operator.hpp"
 #include "gpu_physical_operator.hpp"
+#include "operator/gpu_physical_partition.hpp"
 
 namespace duckdb {
 
@@ -33,6 +34,8 @@ public:
 	unique_ptr<GPUPhysicalOperator> join;
 	unique_ptr<GPUPhysicalGroupedAggregate> distinct;
 	vector<const_reference<GPUPhysicalOperator>> delim_scans;
+	GPUPhysicalPartition* partition_join;
+	GPUPhysicalPartition* partition_distinct;
 
 	optional_idx delim_idx;
 

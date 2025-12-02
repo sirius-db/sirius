@@ -50,6 +50,8 @@ OperatorResultType GPUPhysicalOperator::Execute(GPUIntermediateRelation &input_r
 	throw InternalException("Calling Execute on a node that is not an operator!");
 }
 
+// TODO: Implement Execute for sirius::vector<sirius::unique_ptr<sirius::data_batch_view>> input_batch if needed.
+
 //===--------------------------------------------------------------------===//
 // Source
 //===--------------------------------------------------------------------===//
@@ -86,6 +88,8 @@ SinkFinalizeType GPUPhysicalOperator::CombineFinalize(vector<shared_ptr<GPUInter
 																				 					  	GPUIntermediateRelation& output) const {
 	throw InternalException("Calling CombineFinalize on a node that is not a sink!");
 }
+
+// TODO: Implement GPUPhysicalOperator::SinkExecute if required in the future.
 
 //===--------------------------------------------------------------------===//
 // Pipeline Construction
@@ -148,6 +152,34 @@ void GPUPhysicalOperator::Verify() {
 		child->Verify();
 	}
 #endif
+}
+
+void GPUPhysicalOperator::add_port(std::string_view port_id, std::unique_ptr<port> p) {
+	ports[std::string(port_id)] = std::move(p);
+}
+
+GPUPhysicalOperator::port* GPUPhysicalOperator::get_port(std::string_view port_id) {
+	auto it = ports.find(std::string(port_id));
+	if (it == ports.end()) {
+		throw InternalException("Port " + std::string(port_id) + " not found in operator " + GetName());
+	}
+	return it->second.get();
+}
+
+::sirius::vector<::sirius::unique_ptr<::sirius::data_batch>> 
+GPUPhysicalOperator::execute(::sirius::vector<::sirius::unique_ptr<::sirius::data_batch_view>> input_batch) {
+	// not doing anything for now
+	return ::sirius::vector<::sirius::unique_ptr<::sirius::data_batch>>{};
+}
+
+void 
+GPUPhysicalOperator::add_next_port_after_sink(std::pair<GPUPhysicalOperator*, std::string_view> port_locator){
+	next_port_after_sink.push_back(port_locator);
+}
+
+vector<std::pair<GPUPhysicalOperator*, std::string_view>>& 
+GPUPhysicalOperator::get_next_port_after_sink() {
+	return next_port_after_sink;
 }
 
 } // namespace duckdb

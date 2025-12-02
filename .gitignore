@@ -14,6 +14,7 @@ tpch-data/dbgen
 duckdb/*
 CMakeFiles/
 CMakeCache.txt
+cmake_install.cmake
 dbgen/
 test_datasets/tpch-dbgen/
 test_datasets/tpch-mod-dbgen/
