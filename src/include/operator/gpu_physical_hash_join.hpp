@@ -125,8 +125,6 @@ protected:
 public:
 	// Sink Interface
 	SinkResultType Sink(GPUIntermediateRelation &input_relation) const override;
-	SinkFinalizeType CombineFinalize(vector<shared_ptr<GPUIntermediateRelation>> &input,
-  															 	 GPUIntermediateRelation& output) const override;
 
 	bool IsSink() const override {
 		return true;

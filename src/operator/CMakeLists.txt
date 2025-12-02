@@ -30,11 +30,17 @@ set(EXTENSION_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/gpu_physical_result_collector.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/gpu_physical_table_scan.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/gpu_physical_nested_loop_join.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/gpu_combine.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/gpu_materialize.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/gpu_physical_strings_matching.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/gpu_physical_substring.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/gpu_physical_cte.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/gpu_physical_top_n.cpp
+
+        # Below is for the new execution model, and we are gradually migrating operators above
+        # to the new execution model.
+        ${CMAKE_CURRENT_SOURCE_DIR}/aggregate/gpu_aggregate_impl.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/order/gpu_order_impl.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/merge/gpu_merge_impl.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/partition/gpu_partition_impl.cpp
         PARENT_SCOPE
 )

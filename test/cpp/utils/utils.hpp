@@ -20,6 +20,7 @@
 
 #include "gpu_buffer_manager.hpp"
 #include "gpu_columns.hpp"
+#include "helper/helper.hpp"
 
 #include <random>
 
@@ -28,8 +29,6 @@ namespace duckdb {
 // The buffer manager is shared across all threads so we need to allocate the memory needed by all tests
 // upfront when initializating the buffer manager
 constexpr size_t TEST_BUFFER_MANAGER_MEMORY_BYTES = 2L * 1024L * 1024L * 1024L; // 2 GB for testing
-
-std::mt19937_64& global_rng();
 
 template <typename T>
 T rand_int(T low, T high);
@@ -57,5 +56,18 @@ void verify_gpu_column_equality(shared_ptr<GPUColumn> col1, shared_ptr<GPUColumn
 
 shared_ptr<GPUColumn> create_column_with_random_data(GPUColumnTypeId col_type, size_t num_records, 
   size_t chars_per_record = 1, size_t num_materialize_row_ids = 0, bool has_null_mask = false);
+
+}
+
+namespace sirius {
+
+std::mt19937_64& global_rng();
+
+sirius::unique_ptr<cudf::table> create_cudf_table_with_random_data(
+    size_t num_rows,
+    const sirius::vector<cudf::data_type>& column_types,
+    const sirius::vector<std::optional<std::pair<int, int>>>& ranges,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr);
 
 }
