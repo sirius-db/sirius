@@ -52,9 +52,5 @@ void gpu_pipeline_task::mark_task_completion() {
     _global_state->cast<gpu_pipeline_task_global_state>()._message_queue.enqueue_message(std::move(message));
 }
 
-void gpu_pipeline_task::push_data_batch(sirius::unique_ptr<data_batch> batch, uint64_t pipeline_id) {
-    _global_state->cast<gpu_pipeline_task_global_state>()._data_repo_mgr.add_new_data_batch(std::move(batch), {pipeline_id});
-}
-
 } // namespace parallel
 } // namespace sirius
