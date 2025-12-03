@@ -6,6 +6,7 @@
 #include <sstream>
 #include <algorithm>
 #include <cctype>
+#include "log/logging.hpp"
 
 namespace duckdb {
 

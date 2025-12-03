@@ -18,14 +18,14 @@
 
 #include "duckdb/common/common.hpp"
 // #include "duckdb/execution/physical_operator.hpp"
-#include "duckdb/planner/logical_operator.hpp"
-#include "duckdb/planner/logical_tokens.hpp"
-#include "duckdb/planner/joinside.hpp"
 #include "duckdb/catalog/dependency_list.hpp"
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/common/unordered_set.hpp"
+#include "duckdb/planner/joinside.hpp"
+#include "duckdb/planner/logical_operator.hpp"
+#include "duckdb/planner/logical_tokens.hpp"
 #include "gpu_physical_operator.hpp"
-#include "sirius_extension.hpp"
+#include "logical_graph_operator.hpp"
 
 namespace duckdb {
 class ClientContext;

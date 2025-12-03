@@ -40,13 +40,13 @@
 #include "to_substrait.hpp"
 #include "from_substrait.hpp"
 
-#include "log/logging.hpp"
+#include "config.hpp"
+#include "gpu_buffer_manager.hpp"
 #include "gpu_context.hpp"
 #include "gpu_physical_plan_generator.hpp"
-#include "gpu_buffer_manager.hpp"
-#include "config.hpp"
-#include "logical_graph_operator.hpp"
 #include "graph_query_parser.hpp"
+#include "logical_graph_operator.hpp"
+#include "log/logging.hpp"
 
 #include <cstdlib>
 
