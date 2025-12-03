@@ -62,6 +62,9 @@ __global__ void convert_int32_to_uint64(int32_t* data, uint64_t* output, size_t 
 }
 
 int32_t* convertUInt64ToInt32(uint64_t* data, size_t N) {
+    if (N == 0) {
+        return nullptr;
+    }
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
     int32_t* output_dev = gpuBufferManager->customCudaMalloc<int32_t>(N, 0, 0);
@@ -71,6 +74,9 @@ int32_t* convertUInt64ToInt32(uint64_t* data, size_t N) {
 }
 
 uint64_t* convertInt32ToUInt64(int32_t* data, size_t N) {
+    if (N == 0) {
+        return nullptr;
+    }
     int tile_items = BLOCK_THREADS * ITEMS_PER_THREAD;
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
     uint64_t* output_dev = gpuBufferManager->customCudaMalloc<uint64_t>(N, 0, 0);
