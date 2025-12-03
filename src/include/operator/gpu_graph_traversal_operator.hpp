@@ -32,7 +32,7 @@ public:
 
   // Result data
   mutable vector<int64_t> result_vertices;
-  mutable vector<int64_t> result_distances;
+  mutable vector<double> result_distances;
   mutable vector<int64_t> result_predecessors;  // For path reconstruction
 
   // cuGraph handles

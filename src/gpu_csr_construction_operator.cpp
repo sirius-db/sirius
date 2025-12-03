@@ -311,6 +311,16 @@ GPUCSRConstructionOperator::TransferCSRToGPU() const {
   cudaMemcpy(d_indices, indices.data(), indices.size() * sizeof(int64_t),
     cudaMemcpyHostToDevice);
 
+  // Allocate and transfer weights if present
+  if (has_weights && !weights.empty()) {
+    d_weights = gpuBufferManager->customCudaMalloc<double>(weights.size(), 0, 0);
+    cudaMemcpy(d_weights, weights.data(), weights.size() * sizeof(double),
+               cudaMemcpyHostToDevice);
+    SIRIUS_LOG_INFO("CSR Construction: Transferred {} weights to GPU", weights.size());
+  } else {
+    d_weights = nullptr;
+  }
+
 
   SIRIUS_LOG_INFO("CSR Construction: Transfer complete");
 }

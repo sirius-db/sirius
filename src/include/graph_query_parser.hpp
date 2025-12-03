@@ -281,7 +281,7 @@ public:
     else if (query_upper.find("SHORTEST DISTANCE") != std::string::npos ||
              query_upper.find("CHEAPEST PATH") != std::string::npos) {
       info.algorithm_type = "WEIGHTED_SHORTEST_PATH";
-             }
+    }
     // Check for SHORTEST with MATCH (also weighted)
     else if (query_upper.find("SHORTEST") != std::string::npos) {
       info.algorithm_type = "WEIGHTED_SHORTEST_PATH";
@@ -297,7 +297,7 @@ public:
       } else if (query.find("->*") != std::string::npos) {
         info.path_pattern = "ZERO_OR_MORE";
       }
-             }
+    }
     // Default to edge traversal
     else {
       info.algorithm_type = "EDGE_TRAVERSAL";
@@ -369,7 +369,7 @@ public:
         colon_pos < bracket_end) {
       // There's another colon, so skip variable name
       edge_start = colon_pos + 1;
-        }
+    }
 
     if (bracket_end == std::string::npos) {
       return "";
@@ -408,23 +408,17 @@ public:
     return "";
   }
 
-  // Extract weight column variable from edge pattern [w:label]
+  // Extract weight column name for weighted queries
   static std::string ExtractWeightColumn(const std::string& query) {
-    size_t bracket_start = query.find("[");
-    size_t bracket_end = query.find("]");
+    std::string query_upper = query;
+    std::transform(query_upper.begin(), query_upper.end(),
+                   query_upper.begin(), ::toupper);
 
-    if (bracket_start == std::string::npos || bracket_end == std::string::npos) {
-      return "";
-    }
-
-    std::string bracket_content = query.substr(bracket_start + 1, bracket_end - bracket_start - 1);
-    size_t colon = bracket_content.find(":");
-
-    if (colon != std::string::npos) {
-      std::string weight_var = bracket_content.substr(0, colon);
-      weight_var.erase(0, weight_var.find_first_not_of(" \t"));
-      weight_var.erase(weight_var.find_last_not_of(" \t") + 1);
-      return weight_var;
+    // For weighted shortest path queries, use standard weight column name
+    if (query_upper.find("SHORTEST") != std::string::npos ||
+        query_upper.find("CHEAPEST") != std::string::npos) {
+      // Standard column name for edge weights
+      return "weight";
     }
 
     return "";

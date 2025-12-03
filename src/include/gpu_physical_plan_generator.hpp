@@ -113,7 +113,7 @@ protected:
 	                                                         vector<unique_ptr<Expression>> &groups);
 
   unique_ptr<GPUPhysicalOperator> CreateGraphPhysicalPlan(LogicalGraphOperator* graph_op);
-  unique_ptr<GPUPhysicalOperator> CreateEdgeTableScan(const string& table_name);
+  unique_ptr<GPUPhysicalOperator> CreateEdgeTableScan(const string& table_name, const string& weight_column_name = "");
 
 // private:
 	// bool PreserveInsertionOrder(GPUPhysicalOperator &plan);

@@ -664,16 +664,20 @@ SiriusExtension::GPUProcessingGraphBind(ClientContext &context, TableFunctionBin
         }
 
         // Determine type and add directly - NO temporary variable
-        if (col_name == "id" || col_name == "vertex_id" ||
-            col_name == "distance" || col_name == "hop" ||
-            col_name == "predecessor") {
+        if (col_name == "id" || col_name == "vertex_id" || col_name == "predecessor") {
           return_types.emplace_back(LogicalType(LogicalTypeId::BIGINT));
+          names.emplace_back(col_name);
+        } else if (col_name == "distance" || col_name == "weight" || col_name == "cost" || col_name == "hop") {
+          bool is_weighted = (parsed.algorithm_type == "WEIGHTED_SHORTEST_PATH");
+
+          if (is_weighted) {
+            return_types.emplace_back(LogicalType(LogicalTypeId::DOUBLE));  // ← DOUBLE for weighted
+          } else {
+            return_types.emplace_back(LogicalType(LogicalTypeId::BIGINT));  // ← BIGINT for unweighted
+          }
           names.emplace_back(col_name);
         } else if (col_name == "path") {
           return_types.emplace_back(LogicalType(LogicalTypeId::VARCHAR));
-          names.emplace_back(col_name);
-        } else if (col_name == "weight" || col_name == "cost") {
-          return_types.emplace_back(LogicalType(LogicalTypeId::DOUBLE));
           names.emplace_back(col_name);
         } else {
           // Default fallback

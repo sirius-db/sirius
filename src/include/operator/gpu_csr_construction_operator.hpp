@@ -16,7 +16,7 @@ public:
   string weight_column;
   mutable std::vector<int64_t> vertex_id_map;
 
-  // CSR data structures (CPU side for now)
+  // CSR data structures (on CPU side currently)
   mutable vector<int64_t> offsets;
   mutable vector<int64_t> indices;
   mutable vector<double> weights;

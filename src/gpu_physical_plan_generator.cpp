@@ -92,7 +92,7 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::CreatePlan(unique_ptr<
 }
 
 unique_ptr<GPUPhysicalOperator>
-GPUPhysicalPlanGenerator::CreateEdgeTableScan(const string& table_name) {
+GPUPhysicalPlanGenerator::CreateEdgeTableScan(const string& table_name, const string& weight_column_name) {
 
   SIRIUS_LOG_INFO("CreateEdgeTableScan: Reading edge table '{}'", table_name);
 
@@ -114,29 +114,47 @@ GPUPhysicalPlanGenerator::CreateEdgeTableScan(const string& table_name) {
 
   bool found_src = false;
   bool found_dst = false;
+  bool found_weight = false;
+  bool needs_weight = !weight_column_name.empty();
 
   for (idx_t i = 0; i < columns.PhysicalColumnCount(); i++) {
     auto &col = columns.GetColumn(PhysicalIndex(i));
     string col_name = col.GetName();
 
-    // Only add source and dest columns
-    if (col_name == "src" || col_name == "source") {  // Common names for source
+    // Add source column
+    if (col_name == "src" || col_name == "source") { // Common names for source
       column_types.push_back(col.GetType());
       column_names.push_back(col_name);
       column_ids.push_back(ColumnIndex(i));
       found_src = true;
       SIRIUS_LOG_DEBUG("Found source column: {} at index {}", col_name, i);
-    } else if (col_name == "dst" || col_name == "dest" || col_name == "target") {  // Common names for dest
+    }
+
+    // Add dest column
+    else if (col_name == "dst" || col_name == "dest" || col_name == "target") { // Common names for dest
       column_types.push_back(col.GetType());
       column_names.push_back(col_name);
       column_ids.push_back(ColumnIndex(i));
       found_dst = true;
       SIRIUS_LOG_DEBUG("Found dest column: {} at index {}", col_name, i);
     }
+
+    // Add weight column
+    else if (needs_weight && (col_name == weight_column_name || col_name == "weight" || col_name == "cost" || col_name == "distance")) { // Common names for weight
+      column_types.push_back(col.GetType());
+      column_names.push_back(col_name);
+      column_ids.push_back(ColumnIndex(i));
+      found_weight = true;
+      SIRIUS_LOG_DEBUG("Found weight column: {} at index {}", col_name, i);
+    }
   }
 
   if (!found_src || !found_dst) {
     throw BinderException("Edge table '%s' must have source and destination columns", table_name);
+  }
+
+  if (needs_weight && !found_weight) {
+    SIRIUS_LOG_WARN("Weight column requested but not found in table '{}', will use unweighted", table_name);
   }
 
   SIRIUS_LOG_DEBUG("Table '{}' has {} columns", table_name, column_names.size());
@@ -157,13 +175,13 @@ GPUPhysicalPlanGenerator::CreateEdgeTableScan(const string& table_name) {
       column_names
   );
 
-  // Set the table index
+  // Set table index
   logical_get->table_index = table_entry.oid;
-  logical_get->SetColumnIds(std::move(column_ids));  // Tell it which columns to scan
+  logical_get->SetColumnIds(std::move(column_ids));
 
   SIRIUS_LOG_DEBUG("Created LogicalGet for table '{}' with oid={}", table_name, table_entry.oid);
 
-  // Convert LogicalGet to physical plan
+  // Convert to physical plan
   return CreatePlan(*logical_get);
 }
 
@@ -173,7 +191,7 @@ GPUPhysicalPlanGenerator::CreateGraphPhysicalPlan(LogicalGraphOperator* graph_op
   SIRIUS_LOG_DEBUG("Creating graph physical plan");
 
   // Create a table scan to read the edge table
-  auto edge_scan = CreateEdgeTableScan(graph_op->edge_table);
+  auto edge_scan = CreateEdgeTableScan(graph_op->edge_table, graph_op->weight_column);
 
   // Create CSR construction operator
   auto csr_builder = make_uniq<GPUCSRConstructionOperator>(
