@@ -73,13 +73,13 @@ duckdb_scan_task_local_state::column_builder::column_builder(duckdb::LogicalType
 }
 
 void duckdb_scan_task_local_state::column_builder::initialize_accessors(
-  size_t estimated_num_rows,
-  size_t byte_offset,
-  const unique_ptr<multiple_blocks_allocation>& allocation)
+  size_t estimated_num_rows, size_t byte_offset, unique_ptr<multiple_blocks_allocation>& allocation)
 {
   if (type.InternalType() == duckdb::PhysicalType::VARCHAR) {
     // Initialize offset accessor
     offset_blocks_accessor.initialize(byte_offset, allocation);
+    // Write the initial offset value of 0
+    offset_blocks_accessor.set_current(0, allocation);
     // Initialize data accessor
     total_data_bytes_allocated = estimated_num_rows * type_size;
     size_t data_byte_offset    = byte_offset + (estimated_num_rows + 1) * sizeof(int64_t);
@@ -291,6 +291,8 @@ duckdb_scan_task_local_state::duckdb_scan_task_local_state(
       "[duckdb_scan_task_local_state] Failed to get fixed_size_host_memory_resource allocator for "
       "HOST memory space.");
   }
+  allocation = make_unique<multiple_blocks_allocation>(
+    allocator->allocate_multiple_blocks(approximate_batch_size));
 
   // Estimate number of rows per batch
   estimate_rows_per_batch(op);

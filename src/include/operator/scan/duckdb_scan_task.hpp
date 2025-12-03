@@ -38,7 +38,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
-#include <type_traits>
 
 namespace sirius::parallel {
 
@@ -123,10 +122,11 @@ struct multiple_blocks_allocation_accessor {
     memory::fixed_size_host_memory_resource::multiple_blocks_allocation;
 
   //===----------Fields----------===//
-  size_t block_size      = 0;  ///< The size of each block in bytes
-  size_t num_blocks      = 0;  ///< The number of blocks in the allocation
-  size_t block_index     = 0;  ///< The current block index
-  size_t offset_in_block = 0;  ///< The byte offset in the block
+  size_t block_size          = 0;  ///< The size of each block in bytes
+  size_t num_blocks          = 0;  ///< The number of blocks in the allocation
+  size_t block_index         = 0;  ///< The current block index
+  size_t offset_in_block     = 0;  ///< The current byte offset in the block
+  size_t initial_byte_offset = 0;  ///< The initial byte offset set during initialize
 
   /**
    * @brief Initialize the accessor with a byte offset within the allocation.
@@ -143,20 +143,28 @@ struct multiple_blocks_allocation_accessor {
         "[multiple_blocks_allocation_accessor] The underyling type size must be aligned with the "
         "block size.");
     }
-    num_blocks = allocation->blocks.size();
+    num_blocks          = allocation->blocks.size();
+    initial_byte_offset = byte_offset;
     set_cursor(byte_offset);
   }
 
   /**
    * @brief Set the cursor to a specific byte offset within the allocation.
    *
-   * @param[in] byte_offset The byte offset within the allocation.
+   * @param[in] byte_offset The global byte offset within the allocation.
    */
   void set_cursor(size_t byte_offset)
   {
+    assert(block_size != 0);  // Ensure initialized
+    
     block_index     = byte_offset / block_size;
     offset_in_block = byte_offset % block_size;
   };
+
+  /**
+   * @brief Reset the cursor to the initial byte offset set during initialization.
+   */
+  void reset_cursor() { set_cursor(initial_byte_offset); }
 
   /**
    * @brief Set value at the current position in the allocation.
@@ -349,11 +357,11 @@ class duckdb_scan_task_local_state : public itask_local_state {
      * @param[in] estimated_num_rows The estimated number of rows for the scan task data batch.
      * @param[in] byte_offset The byte offset within the overall allocation where this column's
      * data starts.
-     * @param[in] allocation The allocation into which to write data for this column.
+     * @param[in,out] allocation The allocation into which to write data for this column.
      */
     void initialize_accessors(size_t estimated_num_rows,
                               size_t byte_offset,
-                              const unique_ptr<multiple_blocks_allocation>& allocation);
+                              unique_ptr<multiple_blocks_allocation>& allocation);
 
     /**
      * @brief Checks if there is enough space allocated to hold the data for the given vector.

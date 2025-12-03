@@ -50,7 +50,7 @@ TEST_CASE("multiple_blocks_allocation_accessor - basic operations", "[duckdb_sca
       sirius::make_unique<fixed_size_host_memory_resource::multiple_blocks_allocation>(
         std::move(blocks), mr.get(), mr->get_block_size());
 
-    accessor.initialize(std::move(allocation));
+    accessor.initialize(0, allocation);
 
     // Test cursor at the beginning
     accessor.set_cursor(0);
@@ -79,15 +79,15 @@ TEST_CASE("multiple_blocks_allocation_accessor - basic operations", "[duckdb_sca
       sirius::make_unique<fixed_size_host_memory_resource::multiple_blocks_allocation>(
         std::move(blocks), mr.get(), mr->get_block_size());
 
-    accessor.initialize(std::move(allocation));
+    accessor.initialize(0, allocation);
     accessor.set_cursor(0);
 
     // Set and get value
-    accessor.set_current(42);
-    REQUIRE(accessor.get_current() == 42);
+    accessor.set_current(42, allocation);
+    REQUIRE(accessor.get_current(allocation) == 42);
 
-    accessor.set_current(255);
-    REQUIRE(accessor.get_current() == 255);
+    accessor.set_current(255, allocation);
+    REQUIRE(accessor.get_current(allocation) == 255);
   }
 
   SECTION("advance operation")
@@ -102,7 +102,7 @@ TEST_CASE("multiple_blocks_allocation_accessor - basic operations", "[duckdb_sca
       sirius::make_unique<fixed_size_host_memory_resource::multiple_blocks_allocation>(
         std::move(blocks), mr.get(), mr->get_block_size());
 
-    accessor.initialize(std::move(allocation));
+    accessor.initialize(0, allocation);
     accessor.set_cursor(0);
 
     // Advance within first block
@@ -128,15 +128,15 @@ TEST_CASE("multiple_blocks_allocation_accessor - basic operations", "[duckdb_sca
       sirius::make_unique<fixed_size_host_memory_resource::multiple_blocks_allocation>(
         std::move(blocks), mr.get(), mr->get_block_size());
 
-    accessor.initialize(std::move(allocation));
+    accessor.initialize(0, allocation);
     accessor.set_cursor(0);
 
     // Copy data
     uint8_t data[10] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
-    accessor.memcpy_from(data, 10);
+    accessor.memcpy_from(data, 10, allocation);
 
     // Verify
-    auto* block_data = static_cast<uint8_t*>(accessor.allocation->blocks[0]);
+    auto* block_data = static_cast<uint8_t*>(allocation->blocks[0]);
     for (size_t i = 0; i < 10; ++i) {
       REQUIRE(block_data[i] == data[i]);
     }
@@ -156,24 +156,24 @@ TEST_CASE("multiple_blocks_allocation_accessor - basic operations", "[duckdb_sca
       sirius::make_unique<fixed_size_host_memory_resource::multiple_blocks_allocation>(
         std::move(blocks), small_mr.get(), small_mr->get_block_size());
 
-    accessor.initialize(std::move(allocation));
+    accessor.initialize(60, allocation);
 
     // Start near end of first block
     accessor.set_cursor(60);
 
     // Copy 10 bytes (should span two blocks)
     uint8_t data[10] = {10, 11, 12, 13, 14, 15, 16, 17, 18, 19};
-    accessor.memcpy_from(data, 10);
+    accessor.memcpy_from(data, 10, allocation);
 
     // Verify first block
-    auto* block0_data = static_cast<uint8_t*>(accessor.allocation->blocks[0]);
+    auto* block0_data = static_cast<uint8_t*>(allocation->blocks[0]);
     REQUIRE(block0_data[60] == 10);
     REQUIRE(block0_data[61] == 11);
     REQUIRE(block0_data[62] == 12);
     REQUIRE(block0_data[63] == 13);
 
     // Verify second block
-    auto* block1_data = static_cast<uint8_t*>(accessor.allocation->blocks[1]);
+    auto* block1_data = static_cast<uint8_t*>(allocation->blocks[1]);
     REQUIRE(block1_data[0] == 14);
     REQUIRE(block1_data[1] == 15);
     REQUIRE(block1_data[2] == 16);
@@ -203,17 +203,17 @@ TEST_CASE("multiple_blocks_allocation_accessor - int64_t type", "[duckdb_scan_ta
       sirius::make_unique<fixed_size_host_memory_resource::multiple_blocks_allocation>(
         std::move(blocks), mr.get(), mr->get_block_size());
 
-    accessor.initialize(std::move(allocation));
+    accessor.initialize(0, allocation);
     accessor.set_cursor(0);
 
     // Set and get value
-    accessor.set_current(123456789LL);
-    REQUIRE(accessor.get_current() == 123456789LL);
+    accessor.set_current(123456789LL, allocation);
+    REQUIRE(accessor.get_current(allocation) == 123456789LL);
 
     // Test advance
     accessor.advance();
-    accessor.set_current(-987654321LL);
-    REQUIRE(accessor.get_current() == -987654321LL);
+    accessor.set_current(-987654321LL, allocation);
+    REQUIRE(accessor.get_current(allocation) == -987654321LL);
   }
 
   SECTION("advance across block boundary")
@@ -230,12 +230,12 @@ TEST_CASE("multiple_blocks_allocation_accessor - int64_t type", "[duckdb_scan_ta
       sirius::make_unique<fixed_size_host_memory_resource::multiple_blocks_allocation>(
         std::move(blocks), small_mr.get(), small_mr->get_block_size());
 
-    accessor.initialize(std::move(allocation));
+    accessor.initialize(0, allocation);
     accessor.set_cursor(0);
 
     // Fill first block (8 int64_t values)
     for (int i = 0; i < 8; ++i) {
-      accessor.set_current(i * 100LL);
+      accessor.set_current(i * 100LL, allocation);
       accessor.advance();
     }
 
@@ -272,7 +272,7 @@ TEST_CASE("multiple_blocks_allocation_accessor - edge cases", "[duckdb_scan_task
         std::move(blocks), mr.get(), mr->get_block_size());
 
     // This should throw because 1024 % 96 != 0
-    REQUIRE_THROWS_AS(accessor.initialize(std::move(allocation)), duckdb::InternalException);
+    REQUIRE_THROWS_AS(accessor.initialize(0, allocation), std::runtime_error);
   }
 
   SECTION("cursor at last valid position in block")
@@ -288,15 +288,15 @@ TEST_CASE("multiple_blocks_allocation_accessor - edge cases", "[duckdb_scan_task
       sirius::make_unique<fixed_size_host_memory_resource::multiple_blocks_allocation>(
         std::move(blocks), mr.get(), mr->get_block_size());
 
-    accessor.initialize(std::move(allocation));
+    accessor.initialize(0, allocation);
 
     // Set cursor to last byte of first block
     accessor.set_cursor(1023);
     REQUIRE(accessor.block_index == 0);
     REQUIRE(accessor.offset_in_block == 1023);
 
-    accessor.set_current(99);
-    REQUIRE(accessor.get_current() == 99);
+    accessor.set_current(99, allocation);
+    REQUIRE(accessor.get_current(allocation) == 99);
 
     // Advance should move to second block
     accessor.advance();
@@ -317,7 +317,7 @@ TEST_CASE("multiple_blocks_allocation_accessor - edge cases", "[duckdb_scan_task
       sirius::make_unique<fixed_size_host_memory_resource::multiple_blocks_allocation>(
         std::move(blocks), mr.get(), mr->get_block_size());
 
-    accessor.initialize(std::move(allocation));
+    accessor.initialize(0, allocation);
     accessor.set_cursor(0);
 
     // Create data that exactly fills the block
@@ -326,14 +326,14 @@ TEST_CASE("multiple_blocks_allocation_accessor - edge cases", "[duckdb_scan_task
       data[i] = static_cast<uint8_t>(i % 256);
     }
 
-    accessor.memcpy_from(data.data(), 1024);
+    accessor.memcpy_from(data.data(), 1024, allocation);
 
     // Should be at start of second block
     REQUIRE(accessor.block_index == 1);
     REQUIRE(accessor.offset_in_block == 0);
 
     // Verify data in first block
-    auto* block_data = static_cast<uint8_t*>(accessor.allocation->blocks[0]);
+    auto* block_data = static_cast<uint8_t*>(allocation->blocks[0]);
     for (size_t i = 0; i < 1024; ++i) {
       REQUIRE(block_data[i] == static_cast<uint8_t>(i % 256));
     }
@@ -357,7 +357,7 @@ TEST_CASE("multiple_blocks_allocation_accessor - edge cases", "[duckdb_scan_task
       sirius::make_unique<fixed_size_host_memory_resource::multiple_blocks_allocation>(
         std::move(blocks), small_mr.get(), small_mr->get_block_size());
 
-    accessor.initialize(std::move(allocation));
+    accessor.initialize(0, allocation);
     accessor.set_cursor(0);
 
     // Copy exactly 2 blocks worth of data (128 bytes)
@@ -366,15 +366,15 @@ TEST_CASE("multiple_blocks_allocation_accessor - edge cases", "[duckdb_scan_task
       data[i] = static_cast<uint8_t>(i);
     }
 
-    accessor.memcpy_from(data.data(), 128);
+    accessor.memcpy_from(data.data(), 128, allocation);
 
     // Should be at start of third block (index 2)
     REQUIRE(accessor.block_index == 2);
     REQUIRE(accessor.offset_in_block == 0);
 
     // Verify data in first two blocks using the allocation's blocks vector
-    auto* block0_data = static_cast<uint8_t*>(accessor.allocation->blocks[0]);
-    auto* block1_data = static_cast<uint8_t*>(accessor.allocation->blocks[1]);
+    auto* block0_data = static_cast<uint8_t*>(allocation->blocks[0]);
+    auto* block1_data = static_cast<uint8_t*>(allocation->blocks[1]);
 
     for (size_t i = 0; i < 64; ++i) {
       REQUIRE(block0_data[i] == static_cast<uint8_t>(i));
@@ -407,13 +407,13 @@ TEST_CASE("multiple_blocks_allocation_accessor - multi-block traversal",
       sirius::make_unique<fixed_size_host_memory_resource::multiple_blocks_allocation>(
         std::move(blocks), small_mr.get(), small_mr->get_block_size());
 
-    accessor.initialize(std::move(allocation));
+    accessor.initialize(0, allocation);
     accessor.set_cursor(0);
 
     // Each 32-byte block holds 8 int32_t values
     // Write 32 values across 4 blocks
     for (int i = 0; i < 32; ++i) {
-      accessor.set_current(i * 10);
+      accessor.set_current(i * 10, allocation);
       accessor.advance();
     }
 
@@ -423,16 +423,16 @@ TEST_CASE("multiple_blocks_allocation_accessor - multi-block traversal",
 
     // Verify some values by resetting cursor to valid positions
     accessor.set_cursor(0);
-    REQUIRE(accessor.get_current() == 0);
+    REQUIRE(accessor.get_current(allocation) == 0);
 
     accessor.set_cursor(4);  // Second value
-    REQUIRE(accessor.get_current() == 10);
+    REQUIRE(accessor.get_current(allocation) == 10);
 
     accessor.set_cursor(32);  // First value in second block
-    REQUIRE(accessor.get_current() == 80);
+    REQUIRE(accessor.get_current(allocation) == 80);
 
     accessor.set_cursor(96);  // First value in fourth block
-    REQUIRE(accessor.get_current() == 240);
+    REQUIRE(accessor.get_current(allocation) == 240);
   }
 
   SECTION("memcpy_from spanning 5 blocks")
@@ -449,7 +449,7 @@ TEST_CASE("multiple_blocks_allocation_accessor - multi-block traversal",
       sirius::make_unique<fixed_size_host_memory_resource::multiple_blocks_allocation>(
         std::move(blocks), small_mr.get(), small_mr->get_block_size());
 
-    accessor.initialize(std::move(allocation));
+    accessor.initialize(0, allocation);
     accessor.set_cursor(10);  // Start at offset 10 in first block
 
     // Copy 130 bytes - spans from middle of block 0 through end of block 4
@@ -458,16 +458,16 @@ TEST_CASE("multiple_blocks_allocation_accessor - multi-block traversal",
       data[i] = static_cast<uint8_t>(i & 0xFF);
     }
 
-    accessor.memcpy_from(data.data(), 130);
+    accessor.memcpy_from(data.data(), 130, allocation);
 
     // Verify cursor position (10 + 130 = 140 = 4*32 + 12)
     REQUIRE(accessor.block_index == 4);
     REQUIRE(accessor.offset_in_block == 12);
 
     // Verify some data points
-    auto* block0 = static_cast<uint8_t*>(accessor.allocation->blocks[0]);
-    auto* block1 = static_cast<uint8_t*>(accessor.allocation->blocks[1]);
-    auto* block4 = static_cast<uint8_t*>(accessor.allocation->blocks[4]);
+    auto* block0 = static_cast<uint8_t*>(allocation->blocks[0]);
+    auto* block1 = static_cast<uint8_t*>(allocation->blocks[1]);
+    auto* block4 = static_cast<uint8_t*>(allocation->blocks[4]);
 
     REQUIRE(block0[10] == 0);    // First byte of copy
     REQUIRE(block0[31] == 21);   // Last byte of block 0
@@ -489,7 +489,7 @@ TEST_CASE("multiple_blocks_allocation_accessor - multi-block traversal",
       sirius::make_unique<fixed_size_host_memory_resource::multiple_blocks_allocation>(
         std::move(blocks), small_mr.get(), small_mr->get_block_size());
 
-    accessor.initialize(std::move(allocation));
+    accessor.initialize(0, allocation);
 
     // Test various cursor positions
     accessor.set_cursor(0);
@@ -537,7 +537,7 @@ TEST_CASE("multiple_blocks_allocation_accessor - large operations", "[duckdb_sca
       sirius::make_unique<fixed_size_host_memory_resource::multiple_blocks_allocation>(
         std::move(blocks), mr.get(), mr->get_block_size());
 
-    accessor.initialize(std::move(allocation));
+    accessor.initialize(0, allocation);
     accessor.set_cursor(0);
 
     // Copy 4000 bytes (spans ~15.6 blocks)
@@ -546,17 +546,17 @@ TEST_CASE("multiple_blocks_allocation_accessor - large operations", "[duckdb_sca
       data[i] = static_cast<uint8_t>((i * 7) & 0xFF);  // Some pattern
     }
 
-    accessor.memcpy_from(data.data(), 4000);
+    accessor.memcpy_from(data.data(), 4000, allocation);
 
     // Verify cursor (4000 = 15*256 + 160)
     REQUIRE(accessor.block_index == 15);
     REQUIRE(accessor.offset_in_block == 160);
 
     // Spot check some values across different blocks
-    auto* block0  = static_cast<uint8_t*>(accessor.allocation->blocks[0]);
-    auto* block5  = static_cast<uint8_t*>(accessor.allocation->blocks[5]);
-    auto* block10 = static_cast<uint8_t*>(accessor.allocation->blocks[10]);
-    auto* block15 = static_cast<uint8_t*>(accessor.allocation->blocks[15]);
+    auto* block0  = static_cast<uint8_t*>(allocation->blocks[0]);
+    auto* block5  = static_cast<uint8_t*>(allocation->blocks[5]);
+    auto* block10 = static_cast<uint8_t*>(allocation->blocks[10]);
+    auto* block15 = static_cast<uint8_t*>(allocation->blocks[15]);
 
     REQUIRE(block0[0] == 0);
     REQUIRE(block0[100] == static_cast<uint8_t>((100 * 7) & 0xFF));
@@ -581,12 +581,12 @@ TEST_CASE("multiple_blocks_allocation_accessor - large operations", "[duckdb_sca
       sirius::make_unique<fixed_size_host_memory_resource::multiple_blocks_allocation>(
         std::move(blocks), mr.get(), mr->get_block_size());
 
-    accessor.initialize(std::move(allocation));
+    accessor.initialize(0, allocation);
     accessor.set_cursor(0);
 
     // Write 160 values (spans 10 blocks exactly, ends at block 10 offset 0)
     for (int64_t i = 0; i < 160; ++i) {
-      accessor.set_current(i * i);  // Store i^2
+      accessor.set_current(i * i, allocation);  // Store i^2
       accessor.advance();
     }
 
@@ -596,16 +596,16 @@ TEST_CASE("multiple_blocks_allocation_accessor - large operations", "[duckdb_sca
 
     // Verify some values by setting cursor to valid positions
     accessor.set_cursor(0);
-    REQUIRE(accessor.get_current() == 0);
+    REQUIRE(accessor.get_current(allocation) == 0);
 
     accessor.set_cursor(8 * 50);  // 50th value
-    REQUIRE(accessor.get_current() == 2500);
+    REQUIRE(accessor.get_current(allocation) == 2500);
 
     accessor.set_cursor(8 * 100);  // 100th value
-    REQUIRE(accessor.get_current() == 10000);
+    REQUIRE(accessor.get_current(allocation) == 10000);
 
     accessor.set_cursor(8 * 159);  // Last value
-    REQUIRE(accessor.get_current() == 25281);
+    REQUIRE(accessor.get_current(allocation) == 25281);
   }
 }
 
@@ -630,26 +630,26 @@ TEST_CASE("multiple_blocks_allocation_accessor - get_current_as and advance_as",
       sirius::make_unique<fixed_size_host_memory_resource::multiple_blocks_allocation>(
         std::move(blocks), mr.get(), mr->get_block_size());
 
-    accessor.initialize(std::move(allocation));
+    accessor.initialize(0, allocation);
     accessor.set_cursor(0);
 
     // Write some bytes that form a known int32_t value (little-endian: 0x04030201)
-    accessor.set_current(0x01);
+    accessor.set_current(0x01, allocation);
     accessor.advance();
-    accessor.set_current(0x02);
+    accessor.set_current(0x02, allocation);
     accessor.advance();
-    accessor.set_current(0x03);
+    accessor.set_current(0x03, allocation);
     accessor.advance();
-    accessor.set_current(0x04);
+    accessor.set_current(0x04, allocation);
 
     // Read as int32_t
     accessor.set_cursor(0);
-    int32_t val = accessor.get_current_as<int32_t>();
+    int32_t val = accessor.get_current_as<int32_t>(allocation);
     REQUIRE(val == 0x04030201);
 
     // Read as int16_t (first 2 bytes)
     accessor.set_cursor(0);
-    int16_t val16 = accessor.get_current_as<int16_t>();
+    int16_t val16 = accessor.get_current_as<int16_t>(allocation);
     REQUIRE(val16 == 0x0201);
   }
 
@@ -666,7 +666,7 @@ TEST_CASE("multiple_blocks_allocation_accessor - get_current_as and advance_as",
       sirius::make_unique<fixed_size_host_memory_resource::multiple_blocks_allocation>(
         std::move(blocks), mr.get(), mr->get_block_size());
 
-    accessor.initialize(std::move(allocation));
+    accessor.initialize(0, allocation);
     accessor.set_cursor(0);
 
     // Advance as int32_t (4 bytes at a time)
@@ -701,7 +701,7 @@ TEST_CASE("multiple_blocks_allocation_accessor - get_current_as and advance_as",
       sirius::make_unique<fixed_size_host_memory_resource::multiple_blocks_allocation>(
         std::move(blocks), small_mr.get(), small_mr->get_block_size());
 
-    accessor.initialize(std::move(allocation));
+    accessor.initialize(0, allocation);
 
     // Position at byte 60 (4 bytes from end of first block)
     accessor.set_cursor(60);
@@ -735,17 +735,17 @@ TEST_CASE("multiple_blocks_allocation_accessor - memcpy_to", "[duckdb_scan_task]
       sirius::make_unique<fixed_size_host_memory_resource::multiple_blocks_allocation>(
         std::move(blocks), mr.get(), mr->get_block_size());
 
-    accessor.initialize(std::move(allocation));
+    accessor.initialize(0, allocation);
     accessor.set_cursor(0);
 
     // Write some data using memcpy_from
     uint8_t src_data[10] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
-    accessor.memcpy_from(src_data, 10);
+    accessor.memcpy_from(src_data, 10, allocation);
 
     // Read it back using memcpy_to
     accessor.set_cursor(0);
     uint8_t dest_data[10];
-    accessor.memcpy_to(dest_data, 10);
+    accessor.memcpy_to(allocation, dest_data, 10);
 
     // Verify
     for (size_t i = 0; i < 10; ++i) {
@@ -768,7 +768,7 @@ TEST_CASE("multiple_blocks_allocation_accessor - memcpy_to", "[duckdb_scan_task]
       sirius::make_unique<fixed_size_host_memory_resource::multiple_blocks_allocation>(
         std::move(blocks), small_mr.get(), small_mr->get_block_size());
 
-    accessor.initialize(std::move(allocation));
+    accessor.initialize(0, allocation);
 
     // Write data spanning multiple blocks
     std::vector<uint8_t> src_data(150);
@@ -777,12 +777,12 @@ TEST_CASE("multiple_blocks_allocation_accessor - memcpy_to", "[duckdb_scan_task]
     }
 
     accessor.set_cursor(0);
-    accessor.memcpy_from(src_data.data(), 150);
+    accessor.memcpy_from(src_data.data(), 150, allocation);
 
     // Read it back
     accessor.set_cursor(0);
     std::vector<uint8_t> dest_data(150);
-    accessor.memcpy_to(dest_data.data(), 150);
+    accessor.memcpy_to(allocation, dest_data.data(), 150);
 
     // Verify
     for (size_t i = 0; i < 150; ++i) {
@@ -808,18 +808,18 @@ TEST_CASE("multiple_blocks_allocation_accessor - memcpy_to", "[duckdb_scan_task]
       sirius::make_unique<fixed_size_host_memory_resource::multiple_blocks_allocation>(
         std::move(blocks), small_mr.get(), small_mr->get_block_size());
 
-    accessor.initialize(std::move(allocation));
+    accessor.initialize(0, allocation);
 
     // Write data starting from position 50
     accessor.set_cursor(50);
     uint8_t src_data[30] = {10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
                             25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39};
-    accessor.memcpy_from(src_data, 30);
+    accessor.memcpy_from(src_data, 30, allocation);
 
     // Read back from position 50
     accessor.set_cursor(50);
     uint8_t dest_data[30];
-    accessor.memcpy_to(dest_data, 30);
+    accessor.memcpy_to(allocation, dest_data, 30);
 
     // Verify
     for (size_t i = 0; i < 30; ++i) {
@@ -842,7 +842,7 @@ TEST_CASE("multiple_blocks_allocation_accessor - memcpy_to", "[duckdb_scan_task]
       sirius::make_unique<fixed_size_host_memory_resource::multiple_blocks_allocation>(
         std::move(blocks), small_mr.get(), small_mr->get_block_size());
 
-    accessor.initialize(std::move(allocation));
+    accessor.initialize(0, allocation);
 
     // Write exactly 2 blocks worth of data (128 bytes)
     std::vector<uint8_t> src_data(128);
@@ -851,12 +851,12 @@ TEST_CASE("multiple_blocks_allocation_accessor - memcpy_to", "[duckdb_scan_task]
     }
 
     accessor.set_cursor(0);
-    accessor.memcpy_from(src_data.data(), 128);
+    accessor.memcpy_from(src_data.data(), 128, allocation);
 
     // Read back exactly 2 blocks
     accessor.set_cursor(0);
     std::vector<uint8_t> dest_data(128);
-    accessor.memcpy_to(dest_data.data(), 128);
+    accessor.memcpy_to(allocation, dest_data.data(), 128);
 
     // Verify all data
     for (size_t i = 0; i < 128; ++i) {

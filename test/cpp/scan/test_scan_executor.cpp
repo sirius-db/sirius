@@ -155,15 +155,23 @@ class test_scan_task : public parallel::duckdb_scan_task {
 
     duckdb::Appender app(con_, table_name_);
     auto& column_builders = l_state.column_builders;
+    auto& allocation      = l_state.allocation;
 
-    // First, reset the cursors of all column builders
+    // Ensure allocation exists
+    if (!allocation) { throw std::runtime_error("Allocation is null in append_to_table"); }
+
+    // First, reset the cursors of all column builders to their initial positions
     for (size_t col = 0; col < column_builders.size(); ++col) {
       auto& builder = column_builders[col];
 
-      // Get raw pointers to the data
-      builder.data_blocks_accessor.set_cursor(0);
-      builder.mask_blocks_accessor.set_cursor(0);
-      builder.offset_blocks_accessor.set_cursor(0);
+      // Reset accessors to their starting byte offsets in the packed allocation
+      builder.data_blocks_accessor.reset_cursor();
+      builder.mask_blocks_accessor.reset_cursor();
+
+      // Only reset offset accessor for VARCHAR columns (it's only initialized for VARCHAR)
+      if (builder.type.InternalType() == duckdb::PhysicalType::VARCHAR) {
+        builder.offset_blocks_accessor.reset_cursor();
+      }
     }
 
     for (size_t i = 0; i < num_rows; ++i) {
@@ -175,7 +183,7 @@ class test_scan_task : public parallel::duckdb_scan_task {
 
         // Check validity - advance mask accessor every 8 rows
         if (i > 0 && i % 8 == 0) { builder.mask_blocks_accessor.advance(); }
-        bool valid = is_valid(builder.mask_blocks_accessor.get_current(), i);
+        bool valid = is_valid(builder.mask_blocks_accessor.get_current(allocation), i);
 
         if (!valid) {
           app.Append(duckdb::Value());  // NULL value
@@ -186,37 +194,38 @@ class test_scan_task : public parallel::duckdb_scan_task {
         switch (type.id()) {
           case duckdb::LogicalTypeId::CHAR:  // Fallthrough
           case duckdb::LogicalTypeId::VARCHAR: {
-            auto const beg = builder.offset_blocks_accessor.get_current();
+            auto const beg = builder.offset_blocks_accessor.get_current(allocation);
             builder.offset_blocks_accessor.advance();
-            auto const end = builder.offset_blocks_accessor.get_current();
+            auto const end = builder.offset_blocks_accessor.get_current(allocation);
             auto const len = end - beg;
             // We need to copy the string data from the multiple blocks allocation to a contiguous
             // buffer.
             std::string str(len, '\0');
-            builder.data_blocks_accessor.memcpy_to(str.data(), len);
+            builder.data_blocks_accessor.memcpy_to(allocation, str.data(), len);
             app.Append<duckdb::string_t>(str);
             break;
           }
           case duckdb::LogicalTypeId::INTEGER: {
-            auto const int_val = builder.data_blocks_accessor.get_current_as<int32_t>();
+            auto const int_val = builder.data_blocks_accessor.get_current_as<int32_t>(allocation);
             app.Append<int32_t>(int_val);
             builder.data_blocks_accessor.advance_as<int32_t>();
             break;
           }
           case duckdb::LogicalTypeId::BIGINT: {
-            auto const bigint_val = builder.data_blocks_accessor.get_current_as<int64_t>();
+            auto const bigint_val =
+              builder.data_blocks_accessor.get_current_as<int64_t>(allocation);
             app.Append<int64_t>(bigint_val);
             builder.data_blocks_accessor.advance_as<int64_t>();
             break;
           }
           case duckdb::LogicalTypeId::DOUBLE: {
-            auto const double_val = builder.data_blocks_accessor.get_current_as<double>();
+            auto const double_val = builder.data_blocks_accessor.get_current_as<double>(allocation);
             app.Append<double>(double_val);
             builder.data_blocks_accessor.advance_as<double>();
             break;
           }
           case duckdb::LogicalTypeId::FLOAT: {
-            auto const float_val = builder.data_blocks_accessor.get_current_as<float>();
+            auto const float_val = builder.data_blocks_accessor.get_current_as<float>(allocation);
             app.Append<float>(float_val);
             builder.data_blocks_accessor.advance_as<float>();
             break;
@@ -227,26 +236,29 @@ class test_scan_task : public parallel::duckdb_scan_task {
 
             switch (type.InternalType()) {
               case duckdb::PhysicalType::INT16: {
-                auto const dec_val = builder.data_blocks_accessor.get_current_as<int16_t>();
+                auto const dec_val =
+                  builder.data_blocks_accessor.get_current_as<int16_t>(allocation);
                 app.Append(duckdb::Value::DECIMAL(dec_val, width, scale));
                 builder.data_blocks_accessor.advance_as<int16_t>();
                 break;
               }
               case duckdb::PhysicalType::INT32: {
-                auto const dec_val = builder.data_blocks_accessor.get_current_as<int32_t>();
+                auto const dec_val =
+                  builder.data_blocks_accessor.get_current_as<int32_t>(allocation);
                 app.Append(duckdb::Value::DECIMAL(dec_val, width, scale));
                 builder.data_blocks_accessor.advance_as<int32_t>();
                 break;
               }
               case duckdb::PhysicalType::INT64: {
-                auto const dec_val = builder.data_blocks_accessor.get_current_as<int64_t>();
+                auto const dec_val =
+                  builder.data_blocks_accessor.get_current_as<int64_t>(allocation);
                 app.Append(duckdb::Value::DECIMAL(dec_val, width, scale));
                 builder.data_blocks_accessor.advance_as<int64_t>();
                 break;
               }
               case duckdb::PhysicalType::INT128: {
                 auto const dec_val =
-                  builder.data_blocks_accessor.get_current_as<duckdb::hugeint_t>();
+                  builder.data_blocks_accessor.get_current_as<duckdb::hugeint_t>(allocation);
                 app.Append(duckdb::Value::DECIMAL(dec_val, width, scale));
                 builder.data_blocks_accessor.advance_as<duckdb::hugeint_t>();
                 break;
@@ -256,7 +268,8 @@ class test_scan_task : public parallel::duckdb_scan_task {
             break;
           }
           case duckdb::LogicalTypeId::DATE: {
-            auto const date_val = builder.data_blocks_accessor.get_current_as<duckdb::date_t>();
+            auto const date_val =
+              builder.data_blocks_accessor.get_current_as<duckdb::date_t>(allocation);
             app.Append<duckdb::date_t>(date_val);
             builder.data_blocks_accessor.advance_as<duckdb::date_t>();
             break;
