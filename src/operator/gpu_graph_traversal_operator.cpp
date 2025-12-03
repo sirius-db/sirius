@@ -489,7 +489,11 @@ GPUGraphTraversalOperator::RunBFS(
   cudaMemcpy(distances_int.data(), d_distances,
              num_vertices * sizeof(int64_t), cudaMemcpyDeviceToHost);
   for (int64_t i = 0; i < num_vertices; i++) {
-    result_distances[i] = static_cast<double>(distances_int[i]);
+    if (distances_int[i] == std::numeric_limits<int64_t>::max()) {
+      result_distances[i] = std::numeric_limits<double>::max();
+    } else {
+      result_distances[i] = static_cast<double>(distances_int[i]);
+    }
   }
 
   bool need_predecessors = std::find(output_columns.begin(), output_columns.end(), "predecessor") != output_columns.end();
@@ -606,7 +610,11 @@ GPUGraphTraversalOperator::RunMultiSourceBFS(
   cudaMemcpy(distances_int.data(), d_distances,
              num_vertices * sizeof(int64_t), cudaMemcpyDeviceToHost);
   for (int64_t i = 0; i < num_vertices; i++) {
-    result_distances[i] = static_cast<double>(distances_int[i]);
+    if (distances_int[i] == std::numeric_limits<int64_t>::max()) {
+      result_distances[i] = std::numeric_limits<double>::max();
+    } else {
+      result_distances[i] = static_cast<double>(distances_int[i]);
+    }
   }
 
   bool need_predecessors = std::find(output_columns.begin(), output_columns.end(), "predecessor") != output_columns.end();
@@ -745,7 +753,11 @@ GPUGraphTraversalOperator::RunSSSP(
   // Convert to int64 and populate results with mapped vertex IDs
   for (int64_t i = 0; i < num_vertices; i++) {
     result_vertices[i] = csr_op->vertex_id_map[i];
-    result_distances[i] = static_cast<double>(distances_float[i]);
+    if (distances_float[i] == std::numeric_limits<float>::max()) {
+      result_distances[i] = std::numeric_limits<double>::max();
+    } else {
+      result_distances[i] = static_cast<double>(distances_float[i]);
+    }
   }
 
   bool need_predecessors = std::find(output_columns.begin(), output_columns.end(), "predecessor") != output_columns.end();
@@ -850,22 +862,34 @@ GPUGraphTraversalOperator::BuildOutputRelation(
     // Only add if predecessor is available
     else if (col_name == "predecessor") {
       if (result_predecessors.empty() || result_predecessors.size() != num_results) {
-        SIRIUS_LOG_WARN("Predecessor column requested but not available");
-        continue;
+        // Create empty predecessor column
+        SIRIUS_LOG_DEBUG("Creating empty predecessor column for {} results", num_results);
+
+        int64_t* d_result_predecessors = gpuBufferManager->customCudaMalloc<int64_t>(
+          num_results > 0 ? num_results : 1, 0, 0  // Allocate at least 1 element
+        );
+
+        auto col = make_shared_ptr<GPUColumn>(
+          num_results,
+          GPUColumnType(GPUColumnTypeId::INT64),
+          reinterpret_cast<uint8_t*>(d_result_predecessors),
+          nullptr
+        );
+        output_relation.columns.push_back(col);
+      } else {
+        // Predecessors are available
+        int64_t* d_result_predecessors = gpuBufferManager->customCudaMalloc<int64_t>(num_results, 0, 0);
+        cudaMemcpy(d_result_predecessors, result_predecessors.data(),
+                   num_results * sizeof(int64_t), cudaMemcpyHostToDevice);
+
+        auto col = make_shared_ptr<GPUColumn>(
+          num_results,
+          GPUColumnType(GPUColumnTypeId::INT64),
+          reinterpret_cast<uint8_t*>(d_result_predecessors),
+          nullptr
+        );
+        output_relation.columns.push_back(col);
       }
-
-      // Allocate and copy predecessors
-      int64_t* d_result_predecessors = gpuBufferManager->customCudaMalloc<int64_t>(num_results, 0, 0);
-      cudaMemcpy(d_result_predecessors, result_predecessors.data(),
-                 num_results * sizeof(int64_t), cudaMemcpyHostToDevice);
-
-      auto col = make_shared_ptr<GPUColumn>(
-        num_results,
-        GPUColumnType(GPUColumnTypeId::INT64),
-        reinterpret_cast<uint8_t*>(d_result_predecessors),
-        nullptr
-      );
-      output_relation.columns.push_back(col);
     }
   }
 

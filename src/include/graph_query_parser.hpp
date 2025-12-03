@@ -141,7 +141,16 @@ public:
   static std::vector<std::string> ExtractVertexPatterns(const std::string& query) {
     std::vector<std::string> patterns;
 
-    size_t pos = 0;
+    std::string query_upper = query;
+    std::transform(query_upper.begin(), query_upper.end(),
+                   query_upper.begin(), ::toupper);
+
+    size_t match_pos = query_upper.find("MATCH");
+    if (match_pos == std::string::npos) {
+      return patterns;  // No MATCH clause
+    }
+
+    size_t pos = match_pos + 5;  // Skip "MATCH"
     while ((pos = query.find("(", pos)) != std::string::npos) {
       // Count nested parentheses to find the matching close paren
       int paren_count = 1;
@@ -169,7 +178,9 @@ public:
       std::string pattern = query.substr(pos + 1, close - pos - 1);
 
       // Check if this looks like a vertex pattern (has : and optionally WHERE)
-      if (pattern.find(":") != std::string::npos) {
+      if (pattern.find(":") != std::string::npos &&
+          pattern.find("COLUMNS") == std::string::npos &&
+          pattern.find("GRAPH_TABLE") == std::string::npos) {
         patterns.push_back(pattern);
       }
 
@@ -231,11 +242,6 @@ public:
         size_t paren_start = vertex_pattern.find("(", in_pos);
         if (paren_start != std::string::npos) {
           result.vertex_ids = ExtractIDList(vertex_pattern.substr(in_pos));
-
-          SIRIUS_LOG_DEBUG("Parsed IN clause, found {} IDs", result.vertex_ids.size());
-          for (auto id : result.vertex_ids) {
-            SIRIUS_LOG_DEBUG("  - ID: {}", id);
-          }
         }
       }
     }

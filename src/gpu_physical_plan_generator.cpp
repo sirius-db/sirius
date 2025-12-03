@@ -119,11 +119,12 @@ GPUPhysicalPlanGenerator::CreateEdgeTableScan(const string& table_name, const st
 
   for (idx_t i = 0; i < columns.PhysicalColumnCount(); i++) {
     auto &col = columns.GetColumn(PhysicalIndex(i));
+    auto col_type = col.GetType();
     string col_name = col.GetName();
 
     // Add source column
     if (col_name == "src" || col_name == "source") { // Common names for source
-      column_types.push_back(col.GetType());
+      column_types.push_back(col_type);
       column_names.push_back(col_name);
       column_ids.push_back(ColumnIndex(i));
       found_src = true;
@@ -131,8 +132,8 @@ GPUPhysicalPlanGenerator::CreateEdgeTableScan(const string& table_name, const st
     }
 
     // Add dest column
-    else if (col_name == "dst" || col_name == "dest" || col_name == "target") { // Common names for dest
-      column_types.push_back(col.GetType());
+    else if (col_name == "dst" || col_name == "dest" || col_name == "destination" || col_name == "target") { // Common names for dest
+      column_types.push_back(col_type);
       column_names.push_back(col_name);
       column_ids.push_back(ColumnIndex(i));
       found_dst = true;
@@ -141,7 +142,7 @@ GPUPhysicalPlanGenerator::CreateEdgeTableScan(const string& table_name, const st
 
     // Add weight column
     else if (needs_weight && (col_name == weight_column_name || col_name == "weight" || col_name == "cost" || col_name == "distance")) { // Common names for weight
-      column_types.push_back(col.GetType());
+      column_types.push_back(col_type);
       column_names.push_back(col_name);
       column_ids.push_back(ColumnIndex(i));
       found_weight = true;
@@ -167,6 +168,7 @@ GPUPhysicalPlanGenerator::CreateEdgeTableScan(const string& table_name, const st
   auto table_function = table_entry.GetScanFunction(context, bind_data);
 
   // Create a LogicalGet for the table with proper column information
+  // TODO: logical_get doesn't have column_types and column_ids set up correctly
   auto logical_get = make_uniq<LogicalGet>(
       0,  // binding index, will be reassigned during binding
       table_function,
