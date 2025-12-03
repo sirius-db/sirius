@@ -868,3 +868,163 @@ TEST_CASE("multiple_blocks_allocation_accessor - memcpy_to", "[duckdb_scan_task]
     REQUIRE(accessor.offset_in_block == 0);
   }
 }
+
+//===----------------------------------------------------------------------===//
+// Test: reset_cursor functionality
+//===----------------------------------------------------------------------===//
+
+TEST_CASE("multiple_blocks_allocation_accessor - reset_cursor", "[duckdb_scan_task][accessor]")
+{
+  auto mr             = sirius::make_unique<fixed_size_host_memory_resource>(1024, 16, 1);
+  using accessor_type = multiple_blocks_allocation_accessor<uint8_t>;
+
+  SECTION("reset_cursor restores initial position")
+  {
+    accessor_type accessor;
+
+    std::vector<void*> blocks;
+    blocks.push_back(mr->allocate(mr->get_block_size()));
+    blocks.push_back(mr->allocate(mr->get_block_size()));
+
+    auto allocation =
+      sirius::make_unique<fixed_size_host_memory_resource::multiple_blocks_allocation>(
+        std::move(blocks), mr.get(), mr->get_block_size());
+
+    // Initialize at byte offset 0
+    accessor.initialize(0, allocation);
+    REQUIRE(accessor.block_index == 0);
+    REQUIRE(accessor.offset_in_block == 0);
+
+    // Advance several times
+    for (int i = 0; i < 100; ++i) {
+      accessor.advance();
+    }
+    REQUIRE(accessor.block_index == 0);
+    REQUIRE(accessor.offset_in_block == 100);
+
+    // Reset cursor should restore to initial position (0)
+    accessor.reset_cursor();
+    REQUIRE(accessor.block_index == 0);
+    REQUIRE(accessor.offset_in_block == 0);
+  }
+
+  SECTION("reset_cursor with non-zero initial byte offset")
+  {
+    accessor_type accessor;
+
+    std::vector<void*> blocks;
+    blocks.push_back(mr->allocate(mr->get_block_size()));
+    blocks.push_back(mr->allocate(mr->get_block_size()));
+    blocks.push_back(mr->allocate(mr->get_block_size()));
+
+    auto allocation =
+      sirius::make_unique<fixed_size_host_memory_resource::multiple_blocks_allocation>(
+        std::move(blocks), mr.get(), mr->get_block_size());
+
+    // Initialize at byte offset 500
+    accessor.initialize(500, allocation);
+    REQUIRE(accessor.block_index == 0);
+    REQUIRE(accessor.offset_in_block == 500);
+
+    // Advance to cross block boundary
+    for (int i = 0; i < 600; ++i) {
+      accessor.advance();
+    }
+    REQUIRE(accessor.block_index == 1);
+    REQUIRE(accessor.offset_in_block == 76);  // 500 + 600 - 1024 = 76
+
+    // Reset should restore to initial position (500)
+    accessor.reset_cursor();
+    REQUIRE(accessor.block_index == 0);
+    REQUIRE(accessor.offset_in_block == 500);
+  }
+
+  SECTION("reset_cursor after memcpy operations")
+  {
+    accessor_type accessor;
+
+    std::vector<void*> blocks;
+    for (int i = 0; i < 4; ++i) {
+      blocks.push_back(mr->allocate(mr->get_block_size()));
+    }
+
+    auto allocation =
+      sirius::make_unique<fixed_size_host_memory_resource::multiple_blocks_allocation>(
+        std::move(blocks), mr.get(), mr->get_block_size());
+
+    // Initialize at byte offset 200
+    accessor.initialize(200, allocation);
+
+    // Write some data
+    std::vector<uint8_t> data(500, 42);
+    accessor.memcpy_from(data.data(), 500, allocation);
+
+    // Cursor should have advanced
+    REQUIRE(accessor.block_index == 0);
+    REQUIRE(accessor.offset_in_block == 700);
+
+    // Reset and verify
+    accessor.reset_cursor();
+    REQUIRE(accessor.block_index == 0);
+    REQUIRE(accessor.offset_in_block == 200);
+
+    // Read data should work correctly after reset
+    std::vector<uint8_t> read_data(500);
+    accessor.memcpy_to(allocation, read_data.data(), 500);
+    for (size_t i = 0; i < 500; ++i) {
+      REQUIRE(read_data[i] == 42);
+    }
+  }
+
+  SECTION("reset_cursor with initial offset at block boundary")
+  {
+    accessor_type accessor;
+
+    std::vector<void*> blocks;
+    blocks.push_back(mr->allocate(mr->get_block_size()));
+    blocks.push_back(mr->allocate(mr->get_block_size()));
+
+    auto allocation =
+      sirius::make_unique<fixed_size_host_memory_resource::multiple_blocks_allocation>(
+        std::move(blocks), mr.get(), mr->get_block_size());
+
+    // Initialize at block boundary (1024)
+    accessor.initialize(1024, allocation);
+    REQUIRE(accessor.block_index == 1);
+    REQUIRE(accessor.offset_in_block == 0);
+
+    // Set cursor elsewhere
+    accessor.set_cursor(500);
+    REQUIRE(accessor.block_index == 0);
+    REQUIRE(accessor.offset_in_block == 500);
+
+    // Reset should restore to block boundary
+    accessor.reset_cursor();
+    REQUIRE(accessor.block_index == 1);
+    REQUIRE(accessor.offset_in_block == 0);
+  }
+
+  SECTION("multiple reset_cursor calls are idempotent")
+  {
+    accessor_type accessor;
+
+    std::vector<void*> blocks;
+    blocks.push_back(mr->allocate(mr->get_block_size()));
+
+    auto allocation =
+      sirius::make_unique<fixed_size_host_memory_resource::multiple_blocks_allocation>(
+        std::move(blocks), mr.get(), mr->get_block_size());
+
+    accessor.initialize(100, allocation);
+
+    // Advance then reset multiple times
+    for (int iteration = 0; iteration < 3; ++iteration) {
+      for (int i = 0; i < 50; ++i) {
+        accessor.advance();
+      }
+      accessor.reset_cursor();
+      REQUIRE(accessor.block_index == 0);
+      REQUIRE(accessor.offset_in_block == 100);
+    }
+  }
+}
