@@ -19,7 +19,6 @@ GPUGraphTraversalOperator::GPUGraphTraversalOperator(
   const string& weight_col,
   const string& algo_str,
   string path_pattern,
-  bool is_path,
   int max_hops,
   std::vector<string> output_columns,
   ClientContext& context,
@@ -38,7 +37,6 @@ GPUGraphTraversalOperator::GPUGraphTraversalOperator(
     algorithm_type(StringToAlgorithmType(algo_str)),
     path_pattern(path_pattern),
     max_hops(max_hops),
-    is_path_query(is_path),
     weight_column(weight_col) {
 }
 
@@ -394,8 +392,7 @@ GPUGraphTraversalOperator::RunEdgeTraversal(
   result_distances.resize(num_edges_from_source);
   std::fill(result_distances.begin(), result_distances.end(), 1.0);
 
-  bool need_predecessors = is_path_query || std::find(output_columns.begin(),
-    output_columns.end(), "predecessor") != output_columns.end();
+  bool need_predecessors = std::find(output_columns.begin(), output_columns.end(), "predecessor") != output_columns.end();
 
   if (need_predecessors) {
     result_predecessors.resize(num_edges_from_source);
@@ -495,8 +492,7 @@ GPUGraphTraversalOperator::RunBFS(
     result_distances[i] = static_cast<double>(distances_int[i]);
   }
 
-  bool need_predecessors = is_path_query || std::find(output_columns.begin(),
-    output_columns.end(), "predecessor") != output_columns.end();
+  bool need_predecessors = std::find(output_columns.begin(), output_columns.end(), "predecessor") != output_columns.end();
 
   if (need_predecessors) {
     result_predecessors.resize(num_vertices);
@@ -613,8 +609,7 @@ GPUGraphTraversalOperator::RunMultiSourceBFS(
     result_distances[i] = static_cast<double>(distances_int[i]);
   }
 
-  bool need_predecessors = is_path_query || std::find(output_columns.begin(),
-    output_columns.end(), "predecessor") != output_columns.end();
+  bool need_predecessors = std::find(output_columns.begin(), output_columns.end(), "predecessor") != output_columns.end();
 
   if (need_predecessors) {
     result_predecessors.resize(num_vertices);
@@ -753,8 +748,7 @@ GPUGraphTraversalOperator::RunSSSP(
     result_distances[i] = static_cast<double>(distances_float[i]);
   }
 
-  bool need_predecessors = is_path_query || std::find(output_columns.begin(),
-    output_columns.end(), "predecessor") != output_columns.end();
+  bool need_predecessors = std::find(output_columns.begin(), output_columns.end(), "predecessor") != output_columns.end();
 
   if (need_predecessors) {
     result_predecessors.resize(num_vertices);
@@ -791,10 +785,6 @@ GPUGraphTraversalOperator::BuildOutputRelation(
   std::vector<string> cols_to_output = output_columns.empty()
     ? vector<string>{"vertex_id", "distance"}
     : output_columns;
-
-  if (is_path_query && output_columns.empty()) {
-    cols_to_output.push_back("predecessor");
-  }
 
   for (const auto& col_spec : cols_to_output) {
     // Extract field name from dotted notation

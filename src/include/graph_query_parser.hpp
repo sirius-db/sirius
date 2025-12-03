@@ -423,15 +423,6 @@ public:
 
     return "";
   }
-
-  // Check if this is a path query
-  static bool IsPathQuery(const std::string& query) {
-    std::string query_upper = query;
-    std::transform(query_upper.begin(), query_upper.end(),
-                   query_upper.begin(), ::toupper);
-
-    return false;
-  }
 };
 
 } // namespace duckdb

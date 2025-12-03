@@ -68,8 +68,6 @@ set(EXTENSION_SOURCES
   src/cpu_cache.cpp
   src/gpu_query_result.cpp
   src/logical_graph_operator.cpp
-  src/gpu_csr_construction_operator.cpp
-  src/gpu_graph_traversal_operator.cpp
   src/config.cpp
   src/fallback.cpp
   src/memory/memory_reservation.cpp

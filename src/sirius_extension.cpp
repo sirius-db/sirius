@@ -87,7 +87,6 @@ struct GraphProcessingFunctionData : public TableFunctionData {
   string algorithm_type;
 
   // Graph query parameters
-  bool is_path_query = false;
   string path_pattern = "";
   string weight_column = "";
   bool is_left_directed = false;
@@ -531,7 +530,6 @@ ParsedGraphQuery SiriusExtension::ParseGraphQuery(const string& query) {
   result.dest_column = "dst";
   SIRIUS_LOG_DEBUG("Edge table: {}", result.edge_table);
 
-  result.is_path_query = GraphQueryParser::IsPathQuery(query);
   auto algo_info = GraphQueryParser::DetectAlgorithm(query);
   result.algorithm_type = algo_info.algorithm_type;
   result.path_pattern = algo_info.path_pattern;
@@ -693,11 +691,6 @@ SiriusExtension::GPUProcessingGraphBind(ClientContext &context, TableFunctionBin
       return_types.emplace_back(LogicalType(LogicalTypeId::BIGINT));
       names.emplace_back("vertex_id");
       names.emplace_back("distance");
-
-      if (parsed.is_path_query) {
-        return_types.emplace_back(LogicalType(LogicalTypeId::BIGINT));
-        names.emplace_back("predecessor");
-      }
     }
 
     // Create prepared statement

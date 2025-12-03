@@ -34,5 +34,7 @@ set(EXTENSION_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/gpu_physical_substring.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/gpu_physical_cte.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/gpu_physical_top_n.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/gpu_csr_construction_operator.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/gpu_graph_traversal_operator.cpp
         PARENT_SCOPE
 )

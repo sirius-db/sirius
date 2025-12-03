@@ -22,7 +22,6 @@ struct ParsedGraphQuery {
   // Query type
   string algorithm_type;
   string path_pattern = "";
-  bool is_path_query = false;
   int max_hops = -1;
 
   // Edge direction
@@ -48,7 +47,6 @@ public:
   std::vector<int64_t> dest_vertices;
   string algorithm_type;
   string path_pattern;
-  bool is_path_query;
   int max_hops;
   bool is_left_directed;
   bool is_right_directed;
@@ -80,9 +78,6 @@ public:
       // Default bindings
       bindings.push_back(ColumnBinding(0, 0));    // vertex_id
       bindings.push_back(ColumnBinding(0, 1));    // distance
-      if (is_path_query) {
-        bindings.push_back(ColumnBinding(0, 2));  // predecessor
-      }
     }
 
     return bindings;
@@ -101,9 +96,6 @@ protected:
       // Default columns
       types.push_back(LogicalType::BIGINT);    // vertex id
       types.push_back(LogicalType::BIGINT);    // distance
-      if (is_path_query) {
-        types.push_back(LogicalType::BIGINT);  // predecessor
-      }
     }
   }
 };

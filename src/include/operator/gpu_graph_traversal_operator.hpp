@@ -26,7 +26,6 @@ public:
   string weight_column;
   GraphAlgorithmType algorithm_type;
   string path_pattern;
-  bool is_path_query;
   int max_hops;
   std::vector<string> output_columns;
 
@@ -48,7 +47,6 @@ public:
     const string& weight_col,
     const string& algo_str,
     string path_pattern,
-    bool is_path,
     int max_hops,
     std::vector<string> output_columns,
     ClientContext& context,
