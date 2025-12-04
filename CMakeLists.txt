@@ -70,6 +70,7 @@ set(EXTENSION_SOURCES
   src/memory/memory_reservation.cpp
   src/memory/fixed_size_host_memory_resource.cpp
   src/memory/null_device_memory_resource.cpp
+  src/memory/topology_discovery.cpp
   src/parallel/task_executor.cpp
 )
 add_subdirectory(src/operator)
