@@ -1,5 +1,5 @@
 [workspace]
-channels = ["rapidsai", "conda-forge"]
+channels = ["rapidsai", "conda-forge", "nvidia" ]
 name = "sirius"
 platforms = ["linux-64", "linux-aarch64"]
 requires-pixi = "0.59.*"
@@ -18,6 +18,7 @@ CUDAARCHS = "75-real;80-real;86-real;90a-real;100f-real;120a-real;120"
 [dependencies]
 cmake = "4.1.*"
 cuda-nvcc = "*"
+cuda-nvml-dev = "*"
 cuda-version = "13.*"
 cxx-compiler = "*"
 make = "*"
