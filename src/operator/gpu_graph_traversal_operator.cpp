@@ -335,74 +335,83 @@ GPUGraphTraversalOperator::RunEdgeTraversal(
   int64_t num_vertices,
   int64_t num_edges
 ) const {
-  SIRIUS_LOG_INFO("Running edge traversal from source vertex {}", source_vertex);
-
   auto csr_op = dynamic_cast<GPUCSRConstructionOperator*>(child.get());
   if (!csr_op) {
     throw InternalException("Child operator is not GPUCSRConstructionOperator");
   }
 
-  // Validate source vertex
-  int64_t source_index = -1;
-  for (size_t i = 0; i < csr_op->vertex_id_map.size(); i++) {
-    if (csr_op->vertex_id_map[i] == source_vertex) {
-      source_index = i;
-      break;
-    }
-  }
-  if (source_index == -1) {
-    throw InvalidInputException(
-      StringUtil::Format("Source vertex %lld not found in graph", source_vertex)
-    );
-  }
-  SIRIUS_LOG_DEBUG("Mapped source vertex {} to index {}", source_vertex, source_index);
-
-  // Get offset range for this vertex in CSR
-  vector<int64_t> h_offsets(2);
-  cudaMemcpy(h_offsets.data(), &d_offsets[source_index],
-             2 * sizeof(int64_t), cudaMemcpyDeviceToHost);
-
-  int64_t edge_start = h_offsets[0];
-  int64_t edge_end = h_offsets[1];
-  int64_t num_edges_from_source = edge_end - edge_start;
-
-  SIRIUS_LOG_DEBUG("Source vertex {} has {} outgoing edges",
-                   source_vertex, num_edges_from_source);
-
-  if (num_edges_from_source == 0) {
-    // No edges from this vertex
-    result_vertices.clear();
-    result_distances.clear();
-    SIRIUS_LOG_INFO("No edges from source vertex {}", source_vertex);
-    return;
+  // Determine sources to process
+  std::vector<int64_t> sources_to_process;
+  if (source_vertices.empty()) {
+    // Single source mode
+    sources_to_process.push_back(source_vertex);
+    SIRIUS_LOG_INFO("Running edge traversal from source vertex {}", source_vertex);
+  } else {
+    // Multi-source mode
+    sources_to_process = source_vertices;
+    SIRIUS_LOG_INFO("Running edge traversal from {} source vertices", sources_to_process.size());
   }
 
-  // Copy the destination vertices for these edges
-  vector<int64_t> dest_indices(num_edges_from_source);
-  cudaMemcpy(dest_indices.data(), &d_indices[edge_start],
-             num_edges_from_source * sizeof(int64_t), cudaMemcpyDeviceToHost);
-
-  // Map destination indices back to original IDs
-  result_vertices.resize(num_edges_from_source);
-  for (int64_t i = 0; i < num_edges_from_source; i++) {
-    result_vertices[i] = csr_op->vertex_id_map[dest_indices[i]];
-  }
-
-  // All edges have distance 1 (one hop)
-  result_distances.resize(num_edges_from_source);
-  std::fill(result_distances.begin(), result_distances.end(), 1.0);
+  // Clear result vectors
+  result_vertices.clear();
+  result_distances.clear();
+  result_predecessors.clear();
 
   bool need_predecessors = std::find(output_columns.begin(), output_columns.end(), "predecessor") != output_columns.end();
 
-  if (need_predecessors) {
-    result_predecessors.resize(num_edges_from_source);
-    std::fill(result_predecessors.begin(), result_predecessors.end(), source_vertex);
-    SIRIUS_LOG_DEBUG("Set {} predecessors (all pointing to source vertex {})",
-                     num_edges_from_source, source_vertex);
+  // Process each source vertex
+  for (int64_t src_vertex : sources_to_process) {
+    // Validate source vertex
+    int64_t source_index = -1;
+    for (size_t i = 0; i < csr_op->vertex_id_map.size(); i++) {
+      if (csr_op->vertex_id_map[i] == src_vertex) {
+        source_index = i;
+        break;
+      }
+    }
+
+    if (source_index == -1) {
+      SIRIUS_LOG_WARN("Source vertex {} not found in graph, skipping", src_vertex);
+      continue;
+    }
+
+    SIRIUS_LOG_DEBUG("Mapped source vertex {} to index {}", src_vertex, source_index);
+
+    // Get offset range for this vertex in CSR
+    vector<int64_t> h_offsets(2);
+    cudaMemcpy(h_offsets.data(), &d_offsets[source_index],
+               2 * sizeof(int64_t), cudaMemcpyDeviceToHost);
+
+    int64_t edge_start = h_offsets[0];
+    int64_t edge_end = h_offsets[1];
+    int64_t num_edges_from_source = edge_end - edge_start;
+
+    SIRIUS_LOG_DEBUG("Source vertex {} has {} outgoing edges",
+                     src_vertex, num_edges_from_source);
+
+    if (num_edges_from_source == 0) {
+      SIRIUS_LOG_DEBUG("No edges from source vertex {}", src_vertex);
+      continue;
+    }
+
+    // Copy the destination vertices for these edges
+    vector<int64_t> dest_indices(num_edges_from_source);
+    cudaMemcpy(dest_indices.data(), &d_indices[edge_start],
+               num_edges_from_source * sizeof(int64_t), cudaMemcpyDeviceToHost);
+
+    // Append results from this source
+    for (int64_t i = 0; i < num_edges_from_source; i++) {
+      result_vertices.push_back(csr_op->vertex_id_map[dest_indices[i]]);
+      result_distances.push_back(1.0);
+
+      if (need_predecessors) {
+        result_predecessors.push_back(src_vertex);
+      }
+    }
   }
 
-  SIRIUS_LOG_INFO("Edge traversal complete: {} edges from vertex {}",
-                  num_edges_from_source, source_vertex);
+  SIRIUS_LOG_INFO("Edge traversal complete: {} total edges from {} source(s)",
+                  result_vertices.size(), sources_to_process.size());
 }
 
 void
