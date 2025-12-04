@@ -104,7 +104,7 @@ CALL gpu_processing_graph("
 ");
 
 -- ============================================
--- Test 4: BFS from different source
+-- Test 4: From different source
 -- ============================================
 CALL gpu_processing_graph("
   SELECT * FROM GRAPH_TABLE (social
@@ -116,6 +116,34 @@ CALL gpu_processing_graph("
 CALL gpu_processing_graph("
   SELECT * FROM GRAPH_TABLE (social
     MATCH (p:Person WHERE p.id=25)-[:knows]->*(p2:Person)
+    COLUMNS (p2.id, distance, predecessor)
+  )
+");
+
+CALL gpu_processing_graph("
+  SELECT * FROM GRAPH_TABLE (social
+    MATCH (p:Person WHERE p.id=14)-[:knows]->(p2:Person WHERE p2.id=42)
+    COLUMNS (p2.id, distance, predecessor)
+  )
+");
+
+CALL gpu_processing_graph("
+  SELECT * FROM GRAPH_TABLE (social
+    MATCH (p:Person WHERE p.id=37)-[:knows]->(p2:Person WHERE p2.id=42)
+    COLUMNS (p2.id, distance, predecessor)
+  )
+");
+
+CALL gpu_processing_graph("
+  SELECT * FROM GRAPH_TABLE (social
+    MATCH (p:Person WHERE p.id=25)-[:knows]->(p2:Person WHERE p2.id=42)
+    COLUMNS (p2.id, distance, predecessor)
+  )
+");
+
+CALL gpu_processing_graph("
+  SELECT * FROM GRAPH_TABLE (social
+    MATCH (p:Person WHERE p.id=25)-[:knows]->(p2:Person WHERE p2.id=37)
     COLUMNS (p2.id, distance, predecessor)
   )
 ");
