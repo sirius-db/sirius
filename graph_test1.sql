@@ -186,14 +186,6 @@ CALL gpu_processing_graph("
 -- Future Tests (once features are implemented)
 -- ============================================
 
--- TODO: Test 5: Weighted Shortest Path
--- CALL gpu_processing_graph("
---   SELECT * FROM GRAPH_TABLE (social
---     MATCH SHORTEST (p:Person WHERE p.id=14)-[:knows]->+(p2:Person WHERE p2.id=42)
---     COLUMNS (p2.id)
---   )
--- ");
-
 -- TODO: Test 6: Path reconstruction with predecessors
 -- CALL gpu_processing_graph("
 --   SELECT * FROM GRAPH_TABLE (social

@@ -8,7 +8,7 @@ CALL gpu_processing("SELECT * FROM Person_knows_Person");
 
 -- ALTER TABLE Person_knows_Person RENAME COLUMN Person1Id TO source;
 -- ALTER TABLE Person_knows_Person RENAME COLUMN Person2Id TO destination;
-
+--
 -- ALTER TABLE Person DROP COLUMN creationDate;
 -- ALTER TABLE Person_knows_Person DROP COLUMN creationDate;
 
