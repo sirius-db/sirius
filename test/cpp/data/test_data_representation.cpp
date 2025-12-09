@@ -27,23 +27,39 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
+#include <cudf/contiguous_split.hpp>
 #include <rmm/cuda_stream_view.hpp>
+#include <cuda_runtime_api.h>
+#include <rmm/cuda_stream.hpp>
+#include <iostream>
+
+#include "memory/memory_reservation.hpp"
+#include "memory_management/memory_test_common.hpp"
+#include "utils/cudf_test_utils.hpp"
+
+// Declarations from cudf test utils
+namespace sirius {
+namespace test {
+bool cudf_tables_have_equal_contents(const cudf::table& left, const cudf::table& right);
+void expect_cudf_tables_equal(const cudf::table& left, const cudf::table& right);
+}  // namespace test
+}  // namespace sirius
 
 using namespace sirius;
 
 // Mock memory_space for testing - provides a simple memory_space without real allocators
-class mock_memory_space : public memory::memory_space
-{
-public:
+class mock_memory_space : public memory::memory_space {
+ public:
   mock_memory_space(memory::Tier tier, size_t device_id = 0)
-      : memory::memory_space(memory::memory_space_id{tier, static_cast<int>(device_id)},
-                             1024 * 1024 * 1024,
-                             (1024ULL * 1024ULL * 1024ULL) * 8 / 10,
-                             (1024ULL * 1024ULL * 1024ULL) / 2,
-                             create_null_allocators())
-  {}
+    : memory::memory_space(memory::memory_space_id{tier, static_cast<int>(device_id)},
+                           1024 * 1024 * 1024,
+                           (1024ULL * 1024ULL * 1024ULL) * 8 / 10,
+                           (1024ULL * 1024ULL * 1024ULL) / 2,
+                           create_null_allocators())
+  {
+  }
 
-private:
+ private:
   static std::vector<std::unique_ptr<rmm::mr::device_memory_resource>> create_null_allocators()
   {
     std::vector<std::unique_ptr<rmm::mr::device_memory_resource>> allocators;
@@ -53,16 +69,16 @@ private:
 };
 
 // Helper function to create a mock host_table_allocation for testing
-sirius::unique_ptr<memory::host_table_allocation>
-create_mock_host_table_allocation(std::size_t data_size)
+sirius::unique_ptr<memory::host_table_allocation> create_mock_host_table_allocation(
+  std::size_t data_size)
 {
   // Create empty allocation blocks (we're not testing actual allocation here)
   // Use an empty vector and nullptr since we're just mocking
   std::vector<void*> empty_blocks;
   memory::fixed_size_host_memory_resource::multiple_blocks_allocation empty_allocation(
     std::move(empty_blocks),
-    nullptr, // No actual memory resource in mock
-    0        // Block size doesn't matter for empty allocation
+    nullptr,  // No actual memory resource in mock
+    0         // Block size doesn't matter for empty allocation
   );
 
   // Create mock metadata
@@ -71,9 +87,8 @@ create_mock_host_table_allocation(std::size_t data_size)
   metadata->push_back(0x02);
   metadata->push_back(0x03);
 
-  return sirius::make_unique<memory::host_table_allocation>(std::move(empty_allocation),
-                                                            std::move(metadata),
-                                                            data_size);
+  return sirius::make_unique<memory::host_table_allocation>(
+    std::move(empty_allocation), std::move(metadata), data_size);
 }
 
 // Helper function to create a simple cuDF table for testing
@@ -81,20 +96,39 @@ cudf::table create_simple_cudf_table(int num_rows = 100)
 {
   std::vector<std::unique_ptr<cudf::column>> columns;
 
-  // Create a simple INT32 column
-  auto col1 = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
-                                        num_rows,
-                                        cudf::mask_state::UNALLOCATED);
+  // Create and initialize a simple INT32 column
+  auto col1 = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, num_rows, cudf::mask_state::UNALLOCATED);
+  {
+    auto view  = col1->mutable_view();
+    auto bytes = static_cast<size_t>(num_rows) * sizeof(int32_t);
+    if (bytes > 0) cudaMemset(const_cast<void*>(view.head()), 0x11, bytes);
+  }
 
-  // Create another INT64 column
-  auto col2 = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT64},
-                                        num_rows,
-                                        cudf::mask_state::UNALLOCATED);
+  // Create and initialize another INT64 column
+  auto col2 = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT64}, num_rows, cudf::mask_state::UNALLOCATED);
+  {
+    auto view  = col2->mutable_view();
+    auto bytes = static_cast<size_t>(num_rows) * sizeof(int64_t);
+    if (bytes > 0) cudaMemset(const_cast<void*>(view.head()), 0x22, bytes);
+  }
 
   columns.push_back(std::move(col1));
   columns.push_back(std::move(col2));
 
   return cudf::table(std::move(columns));
+}
+
+// Initialize a minimal memory manager with one GPU(0) and one HOST(0)
+static void initialize_memory_for_conversions()
+{
+  using namespace sirius::memory;
+  memory_reservation_manager::reset_for_testing();
+  std::vector<memory_reservation_manager::memory_space_config> configs;
+  configs.emplace_back(Tier::GPU, 0, 2048ull * 1024 * 1024, create_test_allocators(Tier::GPU));
+  configs.emplace_back(Tier::HOST, 0, 4096ull * 1024 * 1024, create_test_allocators(Tier::HOST));
+  memory_reservation_manager::initialize(std::move(configs));
 }
 
 // =============================================================================
@@ -175,15 +209,56 @@ TEST_CASE("host_table_representation device_id", "[cpu_data_representation]")
   }
 }
 
-TEST_CASE("host_table_representation convert_to_memory_space throws", "[cpu_data_representation]")
+TEST_CASE("host_table_representation converts to GPU and preserves contents",
+          "[cpu_data_representation][gpu_data_representation]")
 {
-  mock_memory_space host_space(memory::Tier::HOST, 0);
-  mock_memory_space gpu_space(memory::Tier::GPU, 0);
-  auto host_table = create_mock_host_table_allocation(1024);
-  host_table_representation repr(std::move(host_table), &host_space);
+  initialize_memory_for_conversions();
+  auto& mgr                              = memory::memory_reservation_manager::get_instance();
+  const memory::memory_space* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
+  const memory::memory_space* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
 
-  // Currently not implemented, so should throw
-  REQUIRE_THROWS_AS(repr.convert_to_memory_space(&gpu_space), std::runtime_error);
+  // Start from a known cudf table; pack it and build a host_table_representation
+  auto original = create_simple_cudf_table(128);
+  rmm::cuda_stream pack_stream;
+  auto packed = cudf::pack(original, pack_stream.view());
+  pack_stream.synchronize();
+  auto host_mr = host_space->get_default_allocator_as<memory::fixed_size_host_memory_resource>();
+  REQUIRE(host_mr != nullptr);
+
+  // Copy device buffer to host allocation
+  auto allocation         = host_mr->allocate_multiple_blocks(packed.gpu_data->size());
+  size_t copied           = 0;
+  size_t block_idx        = 0;
+  size_t block_off        = 0;
+  const size_t block_size = allocation.block_size;
+  while (copied < packed.gpu_data->size()) {
+    size_t remain = packed.gpu_data->size() - copied;
+    size_t bytes  = std::min(remain, block_size - block_off);
+    void* dst_ptr = static_cast<uint8_t*>(allocation[block_idx]) + block_off;
+    cudaMemcpy(dst_ptr,
+               static_cast<const uint8_t*>(packed.gpu_data->data()) + copied,
+               bytes,
+               cudaMemcpyDeviceToHost);
+    copied += bytes;
+    block_off += bytes;
+    if (block_off == block_size) {
+      block_off = 0;
+      block_idx++;
+    }
+  }
+
+  auto meta_copy  = sirius::make_unique<sirius::vector<uint8_t>>(*packed.metadata);
+  auto host_alloc = sirius::make_unique<memory::host_table_allocation>(
+    std::move(allocation), std::move(meta_copy), packed.gpu_data->size());
+  host_table_representation host_repr(std::move(host_alloc),
+                                      const_cast<memory::memory_space*>(host_space));
+
+  // Convert to GPU and compare cudf tables
+  auto gpu_stream = gpu_space->acquire_stream();
+  auto gpu_any    = host_repr.convert_to_memory_space(gpu_space, gpu_stream);
+  auto& gpu_repr  = gpu_any->cast<gpu_table_representation>();
+  sirius::test::expect_cudf_tables_equal(original, gpu_repr.get_table());
+  const_cast<memory::memory_space*>(gpu_space)->release_stream(gpu_stream);
 }
 
 // =============================================================================
@@ -283,17 +358,74 @@ TEST_CASE("gpu_table_representation device_id", "[gpu_data_representation]")
   }
 }
 
-TEST_CASE("gpu_table_representation convert_to_memory_space throws", "[gpu_data_representation]")
+TEST_CASE("gpu->host->gpu roundtrip preserves cudf table contents", "[gpu_data_representation]")
 {
-  mock_memory_space gpu_space(memory::Tier::GPU, 0);
-  mock_memory_space host_space(memory::Tier::HOST, 0);
-  auto table = create_simple_cudf_table(100);
-  gpu_table_representation repr(std::move(table), gpu_space);
+  initialize_memory_for_conversions();
+  auto& mgr                              = memory::memory_reservation_manager::get_instance();
+  const memory::memory_space* gpu_space  = mgr.get_memory_space(memory::Tier::GPU, 0);
+  const memory::memory_space* host_space = mgr.get_memory_space(memory::Tier::HOST, 0);
 
-  // Currently not implemented, so should throw
-  REQUIRE_THROWS_AS(repr.convert_to_memory_space(&host_space), std::runtime_error);
+  auto table = create_simple_cudf_table(100);
+  gpu_table_representation repr(std::move(table), *const_cast<memory::memory_space*>(gpu_space));
+
+  // Use one stream for both conversions to enforce order
+  auto chain_stream = gpu_space->acquire_stream();
+  auto cpu_any      = repr.convert_to_memory_space(host_space, chain_stream);
+  auto gpu_any      = cpu_any->convert_to_memory_space(gpu_space, chain_stream);
+
+  auto& back = gpu_any->cast<gpu_table_representation>();
+  sirius::test::expect_cudf_tables_equal(repr.get_table(), back.get_table());
+  const_cast<memory::memory_space*>(gpu_space)->release_stream(chain_stream);
 }
 
+// =============================================================================
+// Multi-GPU Cross-Device Conversion Test
+// =============================================================================
+static void initialize_multi_gpu_for_conversions(int dev_a, int dev_b)
+{
+  using namespace sirius::memory;
+  memory_reservation_manager::reset_for_testing();
+  std::vector<memory_reservation_manager::memory_space_config> configs;
+  configs.emplace_back(Tier::GPU, dev_a, 2048ull * 1024 * 1024, create_test_allocators(Tier::GPU));
+  configs.emplace_back(Tier::GPU, dev_b, 2048ull * 1024 * 1024, create_test_allocators(Tier::GPU));
+  memory_reservation_manager::initialize(std::move(configs));
+}
+
+TEST_CASE("gpu cross-device conversion when multiple GPUs are available",
+          "[gpu_data_representation][.multi-device]")
+{
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count < 2) {
+    SUCCEED("Single GPU or CUDA not available; skipping cross-device test");
+    return;
+  }
+
+  // Pick first two GPUs
+  int dev_src = 0;
+  int dev_dst = 1;
+
+  initialize_multi_gpu_for_conversions(dev_src, dev_dst);
+  auto& mgr                             = memory::memory_reservation_manager::get_instance();
+  const memory::memory_space* src_space = mgr.get_memory_space(memory::Tier::GPU, dev_src);
+  const memory::memory_space* dst_space = mgr.get_memory_space(memory::Tier::GPU, dev_dst);
+  REQUIRE(src_space != nullptr);
+  REQUIRE(dst_space != nullptr);
+
+  // Build a simple cudf table on source GPU and wrap it
+  auto table = create_simple_cudf_table(256);
+  gpu_table_representation src_repr(std::move(table),
+                                    *const_cast<memory::memory_space*>(src_space));
+
+  // Use a single stream for the peer copy
+  auto xfer_stream = src_space->acquire_stream();
+  auto dst_any     = src_repr.convert_to_memory_space(dst_space, xfer_stream);
+  auto& dst_repr   = dst_any->cast<gpu_table_representation>();
+
+  // Compare content equality
+  sirius::test::expect_cudf_tables_equal(src_repr.get_table(), dst_repr.get_table());
+
+  const_cast<memory::memory_space*>(src_space)->release_stream(xfer_stream);
+}
 // =============================================================================
 // idata_representation Interface Tests
 // =============================================================================
@@ -432,9 +564,8 @@ TEST_CASE("gpu_table_representation with single column", "[gpu_data_representati
   mock_memory_space gpu_space(memory::Tier::GPU, 0);
 
   std::vector<std::unique_ptr<cudf::column>> columns;
-  auto col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
-                                       100,
-                                       cudf::mask_state::UNALLOCATED);
+  auto col = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, 100, cudf::mask_state::UNALLOCATED);
   columns.push_back(std::move(col));
 
   cudf::table table(std::move(columns));
@@ -442,7 +573,7 @@ TEST_CASE("gpu_table_representation with single column", "[gpu_data_representati
 
   REQUIRE(repr.get_table().num_columns() == 1);
   REQUIRE(repr.get_table().num_rows() == 100);
-  REQUIRE(repr.get_size_in_bytes() >= 100 * 4); // At least 100 rows * 4 bytes
+  REQUIRE(repr.get_size_in_bytes() >= 100 * 4);  // At least 100 rows * 4 bytes
 }
 
 TEST_CASE("gpu_table_representation with multiple column types", "[gpu_data_representation]")
@@ -452,24 +583,20 @@ TEST_CASE("gpu_table_representation with multiple column types", "[gpu_data_repr
   std::vector<std::unique_ptr<cudf::column>> columns;
 
   // INT8 column
-  auto col1 = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT8},
-                                        100,
-                                        cudf::mask_state::UNALLOCATED);
+  auto col1 = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT8}, 100, cudf::mask_state::UNALLOCATED);
 
   // INT16 column
-  auto col2 = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT16},
-                                        100,
-                                        cudf::mask_state::UNALLOCATED);
+  auto col2 = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT16}, 100, cudf::mask_state::UNALLOCATED);
 
   // INT32 column
-  auto col3 = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
-                                        100,
-                                        cudf::mask_state::UNALLOCATED);
+  auto col3 = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT32}, 100, cudf::mask_state::UNALLOCATED);
 
   // INT64 column
-  auto col4 = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT64},
-                                        100,
-                                        cudf::mask_state::UNALLOCATED);
+  auto col4 = cudf::make_numeric_column(
+    cudf::data_type{cudf::type_id::INT64}, 100, cudf::mask_state::UNALLOCATED);
 
   columns.push_back(std::move(col1));
   columns.push_back(std::move(col2));

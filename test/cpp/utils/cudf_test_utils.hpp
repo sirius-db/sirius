@@ -14,23 +14,15 @@
  * limitations under the License.
  */
 
-#define CATCH_CONFIG_RUNNER
+#pragma once
 
-#include "catch.hpp"
-#include "log/logging.hpp"
-#include <cstdlib>
+#include <cudf/table/table.hpp>
 
-using namespace duckdb;
+namespace sirius {
+namespace test {
 
-int main(int argc, char* argv[])
-{
-  // Initialize the logger
-  std::string log_dir = SIRIUS_UNITTEST_LOG_DIR;
-  InitGlobalLogger(log_dir + "/sirius_unittest.log");
+bool cudf_tables_have_equal_contents(const cudf::table& left, const cudf::table& right);
+void expect_cudf_tables_equal(const cudf::table& left, const cudf::table& right);
 
-  // Run tests
-  int code = Catch::Session().run(argc, argv);
-  std::fflush(stdout);
-  std::fflush(stderr);
-  std::quick_exit(code);
-}
+}  // namespace test
+}  // namespace sirius

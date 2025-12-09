@@ -27,31 +27,24 @@
 // RMM includes for memory resource management
 #include <rmm/mr/device/device_memory_resource.hpp>
 #include <rmm/resource_ref.hpp>
+#include <rmm/cuda_stream_view.hpp>
+#include <rmm/cuda_stream.hpp>
 
-namespace sirius
-{
-namespace memory
-{
+namespace sirius {
+namespace memory {
 
 // Forward declaration
 struct reservation;
 
-struct memory_space_id
-{
+struct memory_space_id {
   Tier tier;
   int device_id;
-  memory_space_id(Tier tier, int device_id)
-      : tier(tier)
-      , device_id(device_id)
-  {}
+  memory_space_id(Tier tier, int device_id) : tier(tier), device_id(device_id) {}
   bool operator==(const memory_space_id& other) const
   {
     return tier == other.tier && device_id == other.device_id;
   }
-  bool operator!=(const memory_space_id& other) const
-  {
-    return !(*this == other);
-  }
+  bool operator!=(const memory_space_id& other) const { return !(*this == other); }
   bool operator<(const memory_space_id& other) const
   {
     return tier < other.tier || (tier == other.tier && device_id < other.device_id);
@@ -80,9 +73,8 @@ struct memory_space_id
  * - Provides thread-safe reservation management
  * - Owns one or more RMM memory allocators
  */
-class memory_space
-{
-public:
+class memory_space {
+ public:
   /**
    * Construct a memory_space with the given parameters.
    *
@@ -142,18 +134,26 @@ public:
   template <typename T>
   T* get_default_allocator_as() const
   {
-    if (_allocators.empty())
-    {
-      return nullptr;
-    }
+    if (_allocators.empty()) { return nullptr; }
     return dynamic_cast<T*>(_allocators[0].get());
   }
+
+  // Stream pool management
+  /**
+   * @brief Acquire a CUDA stream associated with this memory_space's device.
+   *        If all streams are in use, the pool grows.
+   */
+  rmm::cuda_stream_view acquire_stream() const;
+  /**
+   * @brief Release a CUDA stream back to the pool.
+   */
+  void release_stream(rmm::cuda_stream_view stream) const;
 
   // Utility methods
   bool can_reserve(size_t size) const;
   std::string to_string() const;
 
-private:
+ private:
   const memory_space_id _id;
   const size_t _memory_limit;
   const size_t _start_downgrading_memory_threshold;
@@ -170,16 +170,22 @@ private:
 
   void wait_for_memory(size_t size, std::unique_lock<std::mutex>& lock);
   bool validate_reservation(const reservation* res) const;
+
+  // Stream pool (GPU-only usage). Mutable to allow acquisition in const context.
+  mutable std::mutex _streams_mutex;
+  mutable std::vector<std::unique_ptr<rmm::cuda_stream>> _streams;
+  mutable std::vector<bool> _stream_in_use;
+  void initialize_stream_pool_if_needed() const;
+  void grow_stream_pool_unlocked(size_t additional_streams) const;
 };
 
 /**
  * Hash function for memory_space to enable use in unordered containers.
  * Hash is based on tier and device_id combination.
  */
-struct memory_space_hash
-{
+struct memory_space_hash {
   size_t operator()(const memory_space& ms) const;
 };
 
-} // namespace memory
-} // namespace sirius
+}  // namespace memory
+}  // namespace sirius
