@@ -32,18 +32,13 @@
 #include <cuda_runtime_api.h>
 #include <rmm/cuda_stream.hpp>
 #include <iostream>
+#include <iomanip>
 
 #include "memory/memory_reservation.hpp"
 #include "memory_management/memory_test_common.hpp"
 #include "utils/cudf_test_utils.hpp"
 
-// Declarations from cudf test utils
-namespace sirius {
-namespace test {
-bool cudf_tables_have_equal_contents(const cudf::table& left, const cudf::table& right);
-void expect_cudf_tables_equal(const cudf::table& left, const cudf::table& right);
-}  // namespace test
-}  // namespace sirius
+// Declarations provided by utils/cudf_test_utils.hpp
 
 using namespace sirius;
 
@@ -220,7 +215,8 @@ TEST_CASE("host_table_representation converts to GPU and preserves contents",
   // Start from a known cudf table; pack it and build a host_table_representation
   auto original = create_simple_cudf_table(128);
   rmm::cuda_stream pack_stream;
-  auto packed = cudf::pack(original, pack_stream.view());
+  auto view   = original.view();
+  auto packed = cudf::pack(view, pack_stream.view());
   pack_stream.synchronize();
   auto host_mr = host_space->get_default_allocator_as<memory::fixed_size_host_memory_resource>();
   REQUIRE(host_mr != nullptr);
@@ -255,9 +251,12 @@ TEST_CASE("host_table_representation converts to GPU and preserves contents",
 
   // Convert to GPU and compare cudf tables
   auto gpu_stream = gpu_space->acquire_stream();
-  auto gpu_any    = host_repr.convert_to_memory_space(gpu_space, gpu_stream);
-  auto& gpu_repr  = gpu_any->cast<gpu_table_representation>();
-  sirius::test::expect_cudf_tables_equal(original, gpu_repr.get_table());
+  auto gpu_any    = host_repr.convert_to_memory_space(gpu_space, pack_stream);
+  pack_stream.synchronize();
+  auto& gpu_repr = gpu_any->cast<gpu_table_representation>();
+  // Compare using the same stream used for conversion to avoid cross-stream hazards
+  sirius::test::expect_cudf_tables_equal_on_stream(
+    original, gpu_repr.get_table(), pack_stream.view());
   const_cast<memory::memory_space*>(gpu_space)->release_stream(gpu_stream);
 }
 
@@ -371,10 +370,125 @@ TEST_CASE("gpu->host->gpu roundtrip preserves cudf table contents", "[gpu_data_r
   // Use one stream for both conversions to enforce order
   auto chain_stream = gpu_space->acquire_stream();
   auto cpu_any      = repr.convert_to_memory_space(host_space, chain_stream);
-  auto gpu_any      = cpu_any->convert_to_memory_space(gpu_space, chain_stream);
+  // Debug: dump host bytes before converting back to GPU
+  {
+    auto& host_repr_dbg   = cpu_any->cast<host_table_representation>();
+    auto host_alloc_uptr  = host_repr_dbg.get_host_table();
+    const auto data_size  = host_alloc_uptr->data_size;
+    const auto block_size = host_alloc_uptr->allocation.block_size;
+    std::vector<uint8_t> host_bytes;
+    host_bytes.resize(data_size);
+    size_t copied = 0, block_idx = 0, block_off = 0;
+    while (copied < data_size) {
+      size_t remaining = data_size - copied;
+      size_t bytes     = std::min(remaining, block_size - block_off);
+      void* src_ptr    = static_cast<uint8_t*>(host_alloc_uptr->allocation[block_idx]) + block_off;
+      std::memcpy(host_bytes.data() + copied, src_ptr, bytes);
+      copied += bytes;
+      block_off += bytes;
+      if (block_off == block_size) {
+        block_off = 0;
+        block_idx++;
+      }
+    }
+    auto dump_hex = [](const uint8_t* p, size_t len, size_t max_len = 64) {
+      std::ostringstream oss;
+      oss << std::hex << std::setfill('0');
+      size_t dump_len = std::min(len, max_len);
+      for (size_t i = 0; i < dump_len; ++i) {
+        if (i && (i % 16 == 0)) oss << " | ";
+        oss << std::setw(2) << static_cast<unsigned int>(p[i]) << ' ';
+      }
+      if (len > dump_len) oss << "...";
+      return oss.str();
+    };
+    std::cout << "[roundtrip] host bytes size=" << data_size << std::endl;
+    std::cout << "[roundtrip] host first 64B: " << dump_hex(host_bytes.data(), data_size)
+              << std::endl;
+    size_t off = 400;  // expect second column start (INT32 first column = 100*4)
+    if (data_size > off) {
+      size_t ctx_len = std::min(static_cast<size_t>(128), data_size - off);
+      std::cout << "[roundtrip] host bytes @400 (128B): "
+                << dump_hex(host_bytes.data() + off, ctx_len) << std::endl;
+    }
+    // Re-wrap into a host_table_representation to continue conversion
+    host_table_representation host_repr2(std::move(host_alloc_uptr),
+                                         const_cast<memory::memory_space*>(host_space));
+    cpu_any = sirius::make_unique<host_table_representation>(std::move(host_repr2));
+  }
+  auto gpu_any = cpu_any->convert_to_memory_space(gpu_space, chain_stream);
 
   auto& back = gpu_any->cast<gpu_table_representation>();
-  sirius::test::expect_cudf_tables_equal(repr.get_table(), back.get_table());
+  chain_stream.synchronize();
+  // Debug: dump column device pointers and a 64B context around offset 400 right after conversion
+  {
+    auto tv = back.get_table().view();
+    std::cout << "[roundtrip] after_conversion: columns=" << tv.num_columns()
+              << " rows=" << tv.num_rows() << std::endl
+              << std::flush;
+    for (int i = 0; i < tv.num_columns(); ++i) {
+      auto col = tv.column(i);
+      std::cout << "[roundtrip] after_conversion: col[" << i << "] head=" << col.head()
+                << " size=" << col.size() << " type_id=" << static_cast<int>(col.type().id())
+                << std::endl
+                << std::flush;
+    }
+    auto packed_after = cudf::pack(back.get_table(), chain_stream);
+    chain_stream.synchronize();
+    std::vector<uint8_t> bytes_after(packed_after.gpu_data->size());
+    if (!bytes_after.empty()) {
+      cudaMemcpy(bytes_after.data(),
+                 packed_after.gpu_data->data(),
+                 bytes_after.size(),
+                 cudaMemcpyDeviceToHost);
+      auto dump_hex_ctx = [](const uint8_t* p, size_t len, size_t center, size_t ctx = 64) {
+        size_t start = (center > ctx / 2) ? (center - ctx / 2) : 0;
+        if (start + ctx > len) ctx = (len > start) ? (len - start) : 0;
+        std::ostringstream oss;
+        oss << std::hex << std::setfill('0');
+        for (size_t i = 0; i < ctx; ++i) {
+          size_t idx = start + i;
+          if (i && (i % 16 == 0)) oss << " | ";
+          if (idx < len) { oss << std::setw(2) << static_cast<unsigned int>(p[idx]) << ' '; }
+        }
+        return oss.str();
+      };
+      size_t center = std::min<size_t>(400, bytes_after.size() ? bytes_after.size() - 1 : 0);
+      std::cout << "[roundtrip] after_conversion packed @400 (64B): "
+                << dump_hex_ctx(bytes_after.data(), bytes_after.size(), center) << std::endl
+                << std::flush;
+    }
+  }
+  // Debug: dump again right before equality to detect intervening modification
+  {
+    auto packed_before_eq = cudf::pack(back.get_table(), chain_stream);
+    chain_stream.synchronize();
+    std::vector<uint8_t> bytes_before(packed_before_eq.gpu_data->size());
+    if (!bytes_before.empty()) {
+      cudaMemcpy(bytes_before.data(),
+                 packed_before_eq.gpu_data->data(),
+                 bytes_before.size(),
+                 cudaMemcpyDeviceToHost);
+      auto dump_hex_ctx = [](const uint8_t* p, size_t len, size_t center, size_t ctx = 64) {
+        size_t start = (center > ctx / 2) ? (center - ctx / 2) : 0;
+        if (start + ctx > len) ctx = (len > start) ? (len - start) : 0;
+        std::ostringstream oss;
+        oss << std::hex << std::setfill('0');
+        for (size_t i = 0; i < ctx; ++i) {
+          size_t idx = start + i;
+          if (i && (i % 16 == 0)) oss << " | ";
+          if (idx < len) { oss << std::setw(2) << static_cast<unsigned int>(p[idx]) << ' '; }
+        }
+        return oss.str();
+      };
+      size_t center = std::min<size_t>(400, bytes_before.size() ? bytes_before.size() - 1 : 0);
+      std::cout << "[roundtrip] before_equality packed @400 (64B): "
+                << dump_hex_ctx(bytes_before.data(), bytes_before.size(), center) << std::endl
+                << std::flush;
+    }
+  }
+  sirius::test::expect_cudf_tables_equal_on_stream(
+    repr.get_table(), back.get_table(), chain_stream);
   const_cast<memory::memory_space*>(gpu_space)->release_stream(chain_stream);
 }
 
@@ -421,8 +535,9 @@ TEST_CASE("gpu cross-device conversion when multiple GPUs are available",
   auto dst_any     = src_repr.convert_to_memory_space(dst_space, xfer_stream);
   auto& dst_repr   = dst_any->cast<gpu_table_representation>();
 
-  // Compare content equality
-  sirius::test::expect_cudf_tables_equal(src_repr.get_table(), dst_repr.get_table());
+  // Compare content equality using the same stream used for transfer
+  sirius::test::expect_cudf_tables_equal_on_stream(
+    src_repr.get_table(), dst_repr.get_table(), xfer_stream);
 
   const_cast<memory::memory_space*>(src_space)->release_stream(xfer_stream);
 }

@@ -17,12 +17,18 @@
 #pragma once
 
 #include <cudf/table/table.hpp>
+#include <rmm/cuda_stream_view.hpp>
 
 namespace sirius {
 namespace test {
 
-bool cudf_tables_have_equal_contents(const cudf::table& left, const cudf::table& right);
-void expect_cudf_tables_equal(const cudf::table& left, const cudf::table& right);
+// Stream-aware variants to enforce stream ordering with async allocations
+bool cudf_tables_have_equal_contents_on_stream(const cudf::table& left,
+                                               const cudf::table& right,
+                                               rmm::cuda_stream_view stream_view);
+void expect_cudf_tables_equal_on_stream(const cudf::table& left,
+                                        const cudf::table& right,
+                                        rmm::cuda_stream_view stream_view);
 
 }  // namespace test
 }  // namespace sirius
