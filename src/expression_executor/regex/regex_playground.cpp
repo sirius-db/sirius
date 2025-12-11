@@ -29,48 +29,81 @@ __device__ void extract_domain(cuda::std::optional<cudf::string_view>* out, cuda
         return;
     }
     cudf::string_view url = url_opt.value();
-
-    // For "http"
-    if (!(url.length() >= 4 && url[0] == 'h' && url[1] == 't' && url[2] == 't' && url[3] == 'p')) {
+    auto len = url.length();
+    int32_t pos = 0;
+    int32_t g1_start = -1;
+    int32_t g1_end = -1;
+    // ^ start anchor
+    // Literal "http"
+    if (!(len - pos >= 4 && 
+          url[pos + 0] == 'h' && url[pos + 1] == 't' && url[pos + 2] == 't' && url[pos + 3] == 'p'))
+    {
         *out = url;
         return;
     }
-    cudf::string_view next = url.substr(4, url.length() - 4);
-
-    // For "s?"
-    if (!next.empty() && next[0] == 's') {
-        next = next.substr(1, next.length() - 1);
+    pos += 4;
+    // Quantifier ?
+    {
+        int32_t save_pos = pos;
+        if (pos < static_cast<int32_t>(len) && url[pos] == 's') {
+            ++pos;
+        } else {
+            pos = save_pos;
+        }
     }
-
-    // For "://"
-    if (!(next.length() >= 3 && next[0] == ':' && next[1] == '/' && next[2] == '/')) {
+    // Literal "://"
+    if (!(len - pos >= 3 && 
+          url[pos + 0] == ':' && url[pos + 1] == '/' && url[pos + 2] == '/'))
+    {
         *out = url;
         return;
     }
-    next = next.substr(3, next.length() - 3);
-
-    // For "(?:www\.)?"
-    if (next.length() >= 4 && next[0] == 'w' && next[1] == 'w' && next[2] == 'w' && next[3] == '.') {
-        next = next.substr(4, next.length() - 4);
+    pos += 3;
+    // Quantifier ?
+    {
+        int32_t save_pos = pos;
+        if (len - pos >= 4 && 
+            url[pos + 0] == 'w' && url[pos + 1] == 'w' && url[pos + 2] == 'w' && url[pos + 3] == '.') {
+            pos += 4;
+        } else {
+            pos = save_pos;
+        }
     }
-
-    // For "([^/]+)/"
-    if (next.empty() || next[0] == '/') {
+    // Capturing group 1
+    g1_start = pos;
+    // Quantifier +
+    if (pos >= static_cast<int32_t>(len) || url[pos] == '/')
+    {
         *out = url;
         return;
     }
-    auto pos = next.find('/');
-    if (pos == cudf::string_view::npos) {
+    while (pos < static_cast<int32_t>(len) && url[pos] != '/') {
+        ++pos;
+    }
+    g1_end = pos;
+    // Literal "/"
+    if (!(len - pos >= 1 && 
+          url[pos + 0] == '/'))
+    {
         *out = url;
         return;
     }
-    *out = next.substr(0, pos);
-
-    // For "/.*", a newline ('\n') will trigger mismatch
-    next = next.substr(pos + 1, next.length() - pos - 1);
-    if (next.find('\n') != cudf::string_view::npos) {
+    pos += 1;
+    // Quantifier *
+    while (pos < static_cast<int32_t>(len) && url[pos] != '\n') {
+        ++pos;
+    }
+    // $ end anchor
+    if (pos != static_cast<int32_t>(len))
+    {
         *out = url;
         return;
+    }
+    // Build replacement on success
+    if (g1_start >= 0 && g1_end >= g1_start) {
+        *out = url.substr(g1_start, g1_end - g1_start);
+    } else {
+        *out = url;
     }
 }
 )***";
