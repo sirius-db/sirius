@@ -91,6 +91,7 @@ set(EXTENSION_SOURCES
   src/config.cpp
   src/memory/common.cpp
   src/memory/memory_space.cpp
+  src/memory/stream_pool.cpp
   src/fallback.cpp
   src/memory/memory_reservation.cpp
   src/memory/memory_reservation_manager.cpp
