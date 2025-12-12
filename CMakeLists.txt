@@ -14,6 +14,16 @@
 
 cmake_minimum_required(VERSION 3.30.4)
 
+find_program(SCCACHE_PROGRAM sccache)
+
+if(SCCACHE_PROGRAM)
+  message(STATUS "sccache found: ${SCCACHE_PROGRAM}")
+  set(CMAKE_C_COMPILER_LAUNCHER "${SCCACHE_PROGRAM}")
+  set(CMAKE_CXX_COMPILER_LAUNCHER "${SCCACHE_PROGRAM}")
+else()
+  message(STATUS "sccache not found, compiler caching will be disabled.")
+endif()
+
 # Enable compile_commands.json generation for clang lsp
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
@@ -24,8 +34,23 @@ set(TARGET_NAME sirius)
 
 project(${TARGET_NAME} LANGUAGES CXX CUDA)
 find_package(cudf REQUIRED CONFIG)
+
 if(DEFINED ENV{LIBCUDF_ENV_PREFIX})
   set(CONDA_PREFIX "$ENV{LIBCUDF_ENV_PREFIX}")
+
+  find_library(NUMA_LIB 
+    NAMES numa
+    HINTS "${CONDA_PREFIX}/lib"
+    DOC "Path to the libnuma library"
+  )
+
+# Inform the user if found
+  if (NUMA_LIB)
+      message(STATUS "Found libnuma: ${NUMA_LIB}")
+  else()
+      message(FATAL_ERROR "libnuma not found. Checked system paths and ${CONDA_PREFIX}/lib.")
+  endif()
+
 else()
   message(FATAL_ERROR "LIBCUDF_ENV_PREFIX environment variable is not set.")
 endif()
@@ -44,8 +69,8 @@ set(EXTENSION_NAME ${TARGET_NAME}_extension)
 set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
 include_directories(
-    src/include
-    src/include/operator
+  src/include
+  src/include/operator
 )
 include_directories(substrait/src/include)
 include_directories(${TARGET_NAME} substrait/third_party/substrait)
@@ -68,9 +93,13 @@ set(EXTENSION_SOURCES
   src/memory/memory_space.cpp
   src/fallback.cpp
   src/memory/memory_reservation.cpp
+  src/memory/memory_reservation_manager.cpp
   src/memory/fixed_size_host_memory_resource.cpp
   src/memory/null_device_memory_resource.cpp
   src/memory/topology_discovery.cpp
+  src/memory/reservation_aware_resource_adaptor.cpp
+  src/memory/reservation_manager_configurator.cpp
+  src/memory/disk_access_limiter.cpp
   src/parallel/task_executor.cpp
 )
 add_subdirectory(src/operator)
@@ -98,7 +127,6 @@ set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
 
 # Manually specify CUDA include and library directories
 # Include directories
-
 include_directories(${CUDA_INCLUDE_DIRS})
 include_directories(src/include/cudf)
 include_directories(${CONDA_PREFIX}/include)
@@ -106,7 +134,6 @@ include_directories(${CONDA_PREFIX}/include/cudf)
 include_directories(${CONDA_PREFIX}/include/rmm)
 
 # add_library(${EXTENSION_NAME} STATIC ${EXTENSION_SOURCES} ${CUDA_SOURCES})
-
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES} ${CUDA_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES} ${CUDA_SOURCES})
 
@@ -124,6 +151,7 @@ target_link_libraries(${EXTENSION_NAME}
   substrait_extension
   cudf::cudf
   rmm::rmm
+  ${NUMA_LIB}
 )
 target_link_libraries(${LOADABLE_EXTENSION_NAME}
   substrait_extension

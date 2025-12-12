@@ -15,10 +15,12 @@
  */
 
 #include "memory/memory_reservation.hpp"
-#include <algorithm>
-#include <stdexcept>
-#include <mutex>
-#include <cstdint>
+
+#include "memory/common.hpp"
+#include "memory/memory_reservation_manager.hpp"
+#include "memory/memory_space.hpp"
+
+#include <rmm/cuda_device.hpp>
 
 namespace sirius {
 namespace memory {
@@ -30,416 +32,115 @@ reservation_limit_policy::~reservation_limit_policy() = default;
 // reservation Implementation
 //===----------------------------------------------------------------------===//
 
-reservation::reservation(Tier t, int dev_id, size_t s) : tier(t), device_id(dev_id), size(s) {}
-
-bool reservation::grow_to(size_t new_size)
+std::unique_ptr<reservation> reservation::create(memory_space& space,
+                                                 std::unique_ptr<reserved_arena> arena)
 {
-  if (new_size <= size) {
-    return false;  // Invalid operation - must grow to larger size
-  }
-
-  auto& manager = memory_reservation_manager::get_instance();
-  return manager.grow_reservation(this, new_size);
+  return std::unique_ptr<reservation>(new reservation(&space, std::move(arena)));
 }
 
-bool reservation::grow_by(size_t additional_bytes)
+reservation::reservation(const memory_space* space, std::unique_ptr<reserved_arena> arena)
+  : space_(space), arena_(std::move(arena))
 {
-  if (additional_bytes == 0) {
-    return true;  // No change needed
-  }
-
-  // Check for overflow
-  if (size > SIZE_MAX - additional_bytes) { return false; }
-
-  return grow_to(size + additional_bytes);
+  assert(arena_ != nullptr && "Release callback must be provided");
 }
 
-bool reservation::shrink_to(size_t new_size)
-{
-  if (new_size >= size) {
-    return false;  // Invalid operation - must shrink to smaller size
-  }
+reservation::~reservation() = default;
 
-  auto& manager = memory_reservation_manager::get_instance();
-  return manager.shrink_reservation(this, new_size);
+rmm::mr::device_memory_resource* reservation::get_memory_resource() const noexcept
+{
+  return space_->get_default_allocator();
 }
 
-bool reservation::shrink_by(size_t bytes_to_remove)
-{
-  if (bytes_to_remove == 0) {
-    return true;  // No change needed
-  }
+const memory_space& reservation::get_memory_space() const noexcept { return *space_; }
 
-  if (bytes_to_remove >= size) {
-    return false;  // Cannot shrink by more than current size
-  }
+size_t reservation::size() const noexcept { return arena_->size(); }
 
-  return shrink_to(size - bytes_to_remove);
-}
+[[nodiscard]] Tier reservation::tier() const noexcept { return space_->get_tier(); }
+
+[[nodiscard]] int reservation::device_id() const noexcept { return space_->get_device_id(); }
+
+bool reservation::grow_by(size_t additional_bytes) { return arena_->grow_by(additional_bytes); }
+
+void reservation::shrink_to_fit() { return arena_->shrink_to_fit(); }
 
 //===----------------------------------------------------------------------===//
 // Reservation Limit Policy Implementations
 //===----------------------------------------------------------------------===//
 
-void fail_reservation_limit_policy::handle_over_reservation(rmm::cuda_stream_view stream,
-                                                            std::size_t current_allocated,
-                                                            std::size_t requested_bytes,
-                                                            reservation* reservation)
+ignore_reservation_limit_policy::ignore_reservation_limit_policy() = default;
+
+void ignore_reservation_limit_policy::handle_over_reservation(
+  [[maybe_unused]] rmm::cuda_stream_view stream,
+  [[maybe_unused]] std::size_t requested_bytes,
+  [[maybe_unused]] std::size_t current_allocated,
+  [[maybe_unused]] reserved_arena* reserved_bytes)
 {
-  std::size_t reservation_size = reservation ? reservation->size : 0;
+  // do nothing
+}
+
+std::string ignore_reservation_limit_policy::get_policy_name() const { return "ignore"; }
+
+fail_reservation_limit_policy::fail_reservation_limit_policy() = default;
+
+void fail_reservation_limit_policy::handle_over_reservation(
+  [[maybe_unused]] rmm::cuda_stream_view stream,
+  std::size_t requested_bytes,
+  std::size_t current_allocated,
+  reserved_arena* reserved_bytes)
+{
+  std::size_t reservation_size = reserved_bytes ? reserved_bytes->size() : 0;
   RMM_FAIL("Allocation of " + std::to_string(requested_bytes) +
              " bytes would exceed stream reservation of " + std::to_string(reservation_size) +
              " bytes (current: " + std::to_string(current_allocated) + " bytes)",
            rmm::out_of_memory);
 }
 
-void increase_reservation_limit_policy::handle_over_reservation(rmm::cuda_stream_view stream,
-                                                                std::size_t current_allocated,
-                                                                std::size_t requested_bytes,
-                                                                reservation* reservation)
-{
-  if (!reservation) { RMM_FAIL("No reservation set for stream", rmm::out_of_memory); }
+std::string fail_reservation_limit_policy::get_policy_name() const { return "fail"; }
 
-  // Calculate how much we need
-  std::size_t needed_size = current_allocated + requested_bytes;
+increase_reservation_limit_policy::increase_reservation_limit_policy() = default;
+
+increase_reservation_limit_policy::increase_reservation_limit_policy(double padding_factor,
+                                                                     bool allow_beyond_limit)
+  : _padding_factor(padding_factor), allow_reservation_beyond_limit(allow_beyond_limit)
+{
+}
+
+void increase_reservation_limit_policy::handle_over_reservation(rmm::cuda_stream_view stream,
+                                                                std::size_t requested_bytes,
+                                                                std::size_t current_allocated,
+                                                                reserved_arena* reserved_bytes)
+{
+  if (!reserved_bytes) { RMM_FAIL("No reservation set for stream", rmm::out_of_memory); }
+
+  std::size_t post_allocation_size = current_allocated + requested_bytes;
+  std::size_t extra_space_needed   = post_allocation_size - reserved_bytes->size();
 
   // Add padding to avoid frequent increases
-  std::size_t new_reservation_size = static_cast<std::size_t>(needed_size * _padding_factor);
+  std::size_t padded_reservation = static_cast<std::size_t>(extra_space_needed * _padding_factor);
 
   // Try to grow the reservation
-  if (!reservation->grow_to(new_reservation_size)) {
+  if (!reserved_bytes->grow_by(padded_reservation)) {
     // If we can't grow to the padded size, try to grow to just what we need
-    if (!reservation->grow_to(needed_size)) {
+    if (!reserved_bytes->grow_by(extra_space_needed)) {
       // If we can't even grow to what we need, throw an error
-      RMM_FAIL("Failed to increase stream reservation from " + std::to_string(reservation->size) +
-                 " to " + std::to_string(needed_size) + " bytes",
+      RMM_FAIL("Failed to increase stream reservation from " +
+                 std::to_string(reserved_bytes->size()) + " to " +
+                 std::to_string(extra_space_needed) + " bytes",
                rmm::out_of_memory);
     }
   }
 }
 
+std::string increase_reservation_limit_policy::get_policy_name() const { return "increase"; }
+
+std::unique_ptr<reservation_limit_policy> make_default_reservation_limit_policy()
+{
+  return std::make_unique<ignore_reservation_limit_policy>();
+}
+
 //===----------------------------------------------------------------------===//
 // memory_reservation_manager Implementation
 //===----------------------------------------------------------------------===//
-
-std::unique_ptr<memory_reservation_manager> memory_reservation_manager::_instance = nullptr;
-std::once_flag memory_reservation_manager::_initialized;
-bool memory_reservation_manager::_allow_reinitialize_for_tests{false};
-
-memory_reservation_manager::memory_reservation_manager(std::vector<memory_space_config> configs)
-{
-  if (configs.empty()) {
-    throw std::invalid_argument("At least one memory_space configuration must be provided");
-  }
-
-  // Create memory_space instances
-  for (auto& config : configs) {
-    // Move the allocators from config to the memory_space
-    size_t start_threshold = (config.memory_limit * 8) / 10;
-    size_t stop_threshold  = (config.memory_limit) / 2;
-    auto mem_space = std::make_unique<memory_space>(memory_space_id{config.tier, config.device_id},
-                                                    config.memory_limit,
-                                                    start_threshold,
-                                                    stop_threshold,
-                                                    std::move(config.allocators));
-    _memory_spaces.push_back(std::move(mem_space));
-  }
-
-  // Build lookup tables
-  build_lookup_tables();
-}
-
-memory_reservation_manager::memory_space_config::memory_space_config(
-  Tier t,
-  int dev_id,
-  size_t mem_limit,
-  std::vector<std::unique_ptr<rmm::mr::device_memory_resource>> allocs)
-  : tier(t), device_id(dev_id), memory_limit(mem_limit), allocators(std::move(allocs))
-{
-  if (allocators.empty()) {
-    throw std::invalid_argument("At least one allocator must be provided");
-  }
-}
-
-void memory_reservation_manager::initialize(std::vector<memory_space_config> configs)
-{
-  // Test hook: if a test called reset_for_testing(), allow reinitialization bypassing call_once
-  if (_allow_reinitialize_for_tests) {
-    _allow_reinitialize_for_tests = false;
-    _instance                     = std::unique_ptr<memory_reservation_manager>(
-      new memory_reservation_manager(std::move(configs)));
-    return;
-  }
-  std::call_once(_initialized, [configs = std::move(configs)]() mutable {
-    _instance = std::unique_ptr<memory_reservation_manager>(
-      new memory_reservation_manager(std::move(configs)));
-  });
-}
-
-void memory_reservation_manager::reset_for_testing()
-{
-  // Not thread-safe; intended for unit tests only
-  // Ensure any background loops don't block destruction in tests
-  if (_instance) {
-    _instance->shutdown_requested.store(true);
-    _instance->shutdown_finished.store(true);
-  }
-  _instance.reset();
-  _allow_reinitialize_for_tests = true;
-}
-
-memory_reservation_manager& memory_reservation_manager::get_instance()
-{
-  if (!_instance) {
-    throw std::runtime_error(
-      "memory_reservation_manager not initialized. Call initialize() "
-      "first.");
-  }
-  return *_instance;
-}
-
-std::unique_ptr<reservation> memory_reservation_manager::request_reservation(
-  const reservation_request& request, size_t size)
-{
-  // Fast path: try to make a reservation immediately
-  if (auto res = select_memory_space_and_make_reservation(request, size); res.has_value()) {
-    return std::move(res.value());
-  }
-
-  // If none available, block until any memory_space can satisfy the request
-  std::unique_lock<std::mutex> lock(_wait_mutex);
-  for (;;) {
-    if (auto res = select_memory_space_and_make_reservation(request, size); res.has_value()) {
-      // Release the wait lock before returning the reservation
-      lock.unlock();
-      return std::move(res.value());
-    }
-    // Wait until notified that memory may be available again
-    _wait_cv.wait(lock);
-  }
-}
-
-void memory_reservation_manager::release_reservation(std::unique_ptr<reservation> reservation)
-{
-  if (!reservation) { return; }
-
-  // Look up the appropriate memory_space
-  const memory_space* mem_space = get_memory_space(reservation->tier, reservation->device_id);
-  if (!mem_space) { throw std::invalid_argument("Invalid tier/device_id in reservation"); }
-
-  // Delegate to the appropriate memory_space
-  const_cast<memory_space*>(mem_space)->release_reservation(std::move(reservation));
-
-  // Notify all waiters that memory availability may have changed
-  _wait_cv.notify_all();
-}
-
-bool memory_reservation_manager::shrink_reservation(reservation* reservation, size_t new_size)
-{
-  if (!reservation) { return false; }
-
-  // Look up the appropriate memory_space
-  const memory_space* mem_space = get_memory_space(reservation->tier, reservation->device_id);
-  if (!mem_space) { return false; }
-
-  // Delegate to the appropriate memory_space
-  return const_cast<memory_space*>(mem_space)->shrink_reservation(reservation, new_size);
-}
-
-bool memory_reservation_manager::grow_reservation(reservation* reservation, size_t new_size)
-{
-  if (!reservation) { return false; }
-
-  // Look up the appropriate memory_space
-  const memory_space* mem_space = get_memory_space(reservation->tier, reservation->device_id);
-  if (!mem_space) { return false; }
-
-  // Delegate to the appropriate memory_space
-  return const_cast<memory_space*>(mem_space)->grow_reservation(reservation, new_size);
-}
-
-const memory_space* memory_reservation_manager::get_memory_space(Tier tier, int device_id) const
-{
-  auto key = std::make_pair(tier, device_id);
-  auto it  = _memory_space_lookup.find(key);
-  return (it != _memory_space_lookup.end()) ? it->second : nullptr;
-}
-
-std::vector<const memory_space*> memory_reservation_manager::get_memory_spaces_for_tier(
-  Tier tier) const
-{
-  auto it = _tier_to_memory_spaces.find(tier);
-  return (it != _tier_to_memory_spaces.end()) ? it->second : std::vector<const memory_space*>{};
-}
-
-std::vector<const memory_space*> memory_reservation_manager::get_all_memory_spaces() const
-{
-  std::vector<const memory_space*> result;
-  result.reserve(_memory_spaces.size());
-
-  for (const auto& ms : _memory_spaces) {
-    result.push_back(ms.get());
-  }
-
-  return result;
-}
-
-size_t memory_reservation_manager::get_available_memory_for_tier(Tier tier) const
-{
-  size_t total_available = 0;
-  auto spaces            = get_memory_spaces_for_tier(tier);
-
-  for (const auto* space : spaces) {
-    total_available += space->get_available_memory();
-  }
-
-  return total_available;
-}
-
-size_t memory_reservation_manager::get_total_reserved_memory_for_tier(Tier tier) const
-{
-  size_t total_reserved = 0;
-  auto spaces           = get_memory_spaces_for_tier(tier);
-
-  for (const auto* space : spaces) {
-    total_reserved += space->get_total_reserved_memory();
-  }
-
-  return total_reserved;
-}
-
-size_t memory_reservation_manager::get_active_reservation_count_for_tier(Tier tier) const
-{
-  size_t total_count = 0;
-  auto spaces        = get_memory_spaces_for_tier(tier);
-
-  for (const auto* space : spaces) {
-    total_count += space->get_active_reservation_count();
-  }
-
-  return total_count;
-}
-
-size_t memory_reservation_manager::get_total_available_memory() const
-{
-  size_t total = 0;
-  for (const auto& space : _memory_spaces) {
-    total += space->get_available_memory();
-  }
-  return total;
-}
-
-size_t memory_reservation_manager::get_total_reserved_memory() const
-{
-  size_t total = 0;
-  for (const auto& space : _memory_spaces) {
-    total += space->get_total_reserved_memory();
-  }
-  return total;
-}
-
-size_t memory_reservation_manager::get_active_reservation_count() const
-{
-  size_t total = 0;
-  for (const auto& space : _memory_spaces) {
-    total += space->get_active_reservation_count();
-  }
-  return total;
-}
-
-std::optional<std::unique_ptr<reservation>>
-memory_reservation_manager::select_memory_space_and_make_reservation(
-  const reservation_request& request, size_t size) const
-{
-  auto try_candidates = [this, size](const std::vector<const memory_space*>& candidates)
-    -> std::optional<std::unique_ptr<reservation>> {
-    for (const memory_space* space : candidates) {
-      if (space && space->can_reserve(size)) {
-        // Delegate to memory_space to create the reservation
-        return const_cast<memory_space*>(space)->request_reservation(size);
-      }
-    }
-    return std::nullopt;
-  };
-
-  return std::visit(
-    [this, size, &try_candidates](const auto& req) -> std::optional<std::unique_ptr<reservation>> {
-      using T = std::decay_t<decltype(req)>;
-
-      if constexpr (std::is_same_v<T, any_memory_space_in_tier_with_preference>) {
-        auto candidates = get_memory_spaces_for_tier(req.tier);
-
-        // If a preferred device is specified, try it first
-        if (req.preferred_device_id.has_value()) {
-          for (const memory_space* space : candidates) {
-            // TODO: we need can_reserve and request_reservation to happen in one operation so we
-            // can lock and prevent race conditions. because we can wait on the memory_space itself
-            // it will work for now but we should change that behavior at some point
-            if (space && space->get_device_id() == req.preferred_device_id.value() &&
-                space->can_reserve(size)) {
-              return const_cast<memory_space*>(space)->request_reservation(size);
-            }
-          }
-        }
-
-        // Fall back to any space in the tier
-        return try_candidates(candidates);
-      } else if constexpr (std::is_same_v<T, any_memory_space_in_tier>) {
-        auto candidates = get_memory_spaces_for_tier(req.tier);
-        return try_candidates(candidates);
-      } else if constexpr (std::is_same_v<T, any_memory_space_in_tiers>) {
-        for (Tier tier : req.tiers) {
-          auto candidates = get_memory_spaces_for_tier(tier);
-          if (auto res = try_candidates(candidates); res.has_value()) { return res; }
-        }
-        return std::nullopt;
-      } else {
-        static_assert(!sizeof(T*), "Unhandled reservation_request type");
-      }
-    },
-    request);
-}
-
-void memory_reservation_manager::build_lookup_tables()
-{
-  _memory_space_lookup.clear();
-  _tier_to_memory_spaces.clear();
-
-  for (const auto& space : _memory_spaces) {
-    const memory_space* space_ptr = space.get();
-
-    // Build direct lookup table
-    auto key                  = std::make_pair(space_ptr->get_tier(), space_ptr->get_device_id());
-    _memory_space_lookup[key] = space_ptr;
-
-    // Build tier-to-spaces mapping
-    _tier_to_memory_spaces[space_ptr->get_tier()].push_back(space_ptr);
-  }
-}
-
-memory_reservation_manager::~memory_reservation_manager()
-{
-  shutdown_requested.store(true);
-  while (!shutdown_finished.load()) {
-    std::this_thread::yield();
-  }
-}
-
-void memory_reservation_manager::schedule_downgrade_thread()
-{
-  std::thread([this]() {
-    while (!shutdown_requested.load()) {
-      for (const auto& space : _memory_spaces) {
-        if (space->should_downgrade_memory()) {
-          size_t amount_to_downgrade = space->get_amount_to_downgrade();
-          // auto data_batches =
-          // _data_repository_manager.get_data_batches_for_downgrade(space->get_id(),
-          // amount_to_downgrade);
-        }
-      }
-    }
-  }).detach();
-}
 
 }  // namespace memory
 }  // namespace sirius

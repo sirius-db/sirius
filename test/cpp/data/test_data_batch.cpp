@@ -15,32 +15,33 @@
  */
 
 #include "catch.hpp"
-#include <thread>
-#include <vector>
-#include <memory>
-#include <map>
-#include <mutex>
+#include "data/common.hpp"
 #include "data/data_batch.hpp"
 #include "data/data_batch_view.hpp"
 #include "data/data_repository_manager.hpp"
-#include "data/common.hpp"
 #include "memory/null_device_memory_resource.hpp"
+
+#include <map>
+#include <memory>
+#include <mutex>
+#include <thread>
+#include <vector>
 
 using namespace sirius;
 
 // Mock memory_space for testing - provides a simple memory_space without real allocators
-class mock_memory_space : public memory::memory_space
-{
-public:
+class mock_memory_space : public memory::memory_space {
+ public:
   mock_memory_space(memory::Tier tier, size_t device_id = 0)
-      : memory::memory_space(memory::memory_space_id{tier, static_cast<int>(device_id)},
-                             1024 * 1024 * 1024,
-                             (1024ULL * 1024ULL * 1024ULL) * 8 / 10,
-                             (1024ULL * 1024ULL * 1024ULL) / 2,
-                             create_null_allocators())
-  {}
+    : memory::memory_space(memory::memory_space_id{tier, static_cast<int>(device_id)},
+                           1024 * 1024 * 1024,
+                           (1024ULL * 1024ULL * 1024ULL) * 8 / 10,
+                           (1024ULL * 1024ULL * 1024ULL) / 2,
+                           create_null_allocators())
+  {
+  }
 
-private:
+ private:
   static std::vector<std::unique_ptr<rmm::mr::device_memory_resource>> create_null_allocators()
   {
     std::vector<std::unique_ptr<rmm::mr::device_memory_resource>> allocators;
@@ -50,43 +51,40 @@ private:
 };
 
 // Helper base class to hold memory_space - initialized before idata_representation
-struct mock_memory_space_holder
-{
+struct mock_memory_space_holder {
   std::shared_ptr<mock_memory_space> space;
 
   mock_memory_space_holder(memory::Tier tier, size_t device_id)
-      : space(std::make_shared<mock_memory_space>(tier, device_id))
-  {}
+    : space(std::make_shared<mock_memory_space>(tier, device_id))
+  {
+  }
 };
 
 // Mock idata_representation for testing
 // Inherits from mock_memory_space_holder first to ensure it's constructed before
 // idata_representation
-class mock_data_representation
-    : private mock_memory_space_holder
-    , public idata_representation
-{
-public:
+class mock_data_representation : private mock_memory_space_holder, public idata_representation {
+ public:
   explicit mock_data_representation(memory::Tier tier, size_t size = 1024, size_t device_id = 0)
-      : mock_memory_space_holder(tier, device_id) // Construct holder first
-      , idata_representation(*space)              // Pass reference to base class
-      , _size(size)
-  {}
-
-  std::size_t get_size_in_bytes() const override
+    : mock_memory_space_holder(tier, device_id)  // Construct holder first
+      ,
+      idata_representation(*space)  // Pass reference to base class
+      ,
+      _size(size)
   {
-    return _size;
   }
 
-  sirius::unique_ptr<idata_representation>
-  convert_to_memory_space(const memory::memory_space* target_memory_space,
-                          rmm::cuda_stream_view stream = rmm::cuda_stream_default) override
+  std::size_t get_size_in_bytes() const override { return _size; }
+
+  sirius::unique_ptr<idata_representation> convert_to_memory_space(
+    const memory::memory_space* target_memory_space,
+    rmm::cuda_stream_view stream = rmm::cuda_stream_default) override
   {
     // Empty implementation for testing
     return nullptr;
   }
 
-private:
+ private:
   size_t _size;
 };
 
@@ -119,7 +117,7 @@ TEST_CASE("data_batch Move Constructor", "[data_batch]")
 
   REQUIRE(batch2.get_batch_id() == 42);
   REQUIRE(batch2.get_current_tier() == memory::Tier::HOST);
-  REQUIRE(batch1.get_batch_id() == 0); // Moved-from state
+  REQUIRE(batch1.get_batch_id() == 0);  // Moved-from state
 }
 
 // Test move assignment
@@ -140,7 +138,7 @@ TEST_CASE("data_batch Move Assignment", "[data_batch]")
 
   REQUIRE(batch1.get_batch_id() == 20);
   REQUIRE(batch1.get_current_tier() == memory::Tier::HOST);
-  REQUIRE(batch2.get_batch_id() == 0); // Moved-from state
+  REQUIRE(batch2.get_batch_id() == 0);  // Moved-from state
 }
 
 // Test self-assignment (move)
@@ -230,7 +228,7 @@ TEST_CASE("data_batch increment_pin_ref_count GPU memory::Tier Validation", "[da
 
   // Should throw because data is not in GPU memory::Tier
   REQUIRE_THROWS_AS(batch.increment_pin_ref_count(), std::runtime_error);
-  REQUIRE(batch.get_pin_count() == 0); // Count should not change
+  REQUIRE(batch.get_pin_count() == 0);  // Count should not change
 }
 
 // Test decrement pin count throws when not in GPU memory::Tier
@@ -270,15 +268,13 @@ TEST_CASE("Multiple data_batch Instances", "[data_batch]")
   data_repository_manager manager;
   std::vector<data_batch> batches;
 
-  for (uint64_t i = 0; i < 10; ++i)
-  {
+  for (uint64_t i = 0; i < 10; ++i) {
     auto data = sirius::make_unique<mock_data_representation>(memory::Tier::GPU, 1024 * (i + 1));
     batches.emplace_back(i, manager, std::move(data));
   }
 
   // Verify all batches have correct IDs and tiers
-  for (uint64_t i = 0; i < 10; ++i)
-  {
+  for (uint64_t i = 0; i < 10; ++i) {
     REQUIRE(batches[i].get_batch_id() == i);
     REQUIRE(batches[i].get_current_tier() == memory::Tier::GPU);
     REQUIRE(batches[i].get_view_count() == 0);
@@ -325,19 +321,16 @@ TEST_CASE("data_batch Thread-Safe View Reference Counting", "[data_batch]")
   std::vector<std::thread> threads;
 
   // Launch threads to increment view count
-  for (int i = 0; i < num_threads; ++i)
-  {
+  for (int i = 0; i < num_threads; ++i) {
     threads.emplace_back([&batch]() {
-      for (int j = 0; j < increments_per_thread; ++j)
-      {
+      for (int j = 0; j < increments_per_thread; ++j) {
         batch.increment_view_ref_count();
       }
     });
   }
 
   // Wait for all threads to complete
-  for (auto& thread : threads)
-  {
+  for (auto& thread : threads) {
     thread.join();
   }
 
@@ -347,19 +340,16 @@ TEST_CASE("data_batch Thread-Safe View Reference Counting", "[data_batch]")
   threads.clear();
 
   // Launch threads to decrement view count
-  for (int i = 0; i < num_threads; ++i)
-  {
+  for (int i = 0; i < num_threads; ++i) {
     threads.emplace_back([&batch]() {
-      for (int j = 0; j < increments_per_thread; ++j)
-      {
+      for (int j = 0; j < increments_per_thread; ++j) {
         batch.decrement_view_ref_count();
       }
     });
   }
 
   // Wait for all threads to complete
-  for (auto& thread : threads)
-  {
+  for (auto& thread : threads) {
     thread.join();
   }
 
@@ -380,19 +370,16 @@ TEST_CASE("data_batch Thread-Safe Pin Reference Counting", "[data_batch]")
   std::vector<std::thread> threads;
 
   // Launch threads to increment pin count
-  for (int i = 0; i < num_threads; ++i)
-  {
+  for (int i = 0; i < num_threads; ++i) {
     threads.emplace_back([&batch]() {
-      for (int j = 0; j < increments_per_thread; ++j)
-      {
+      for (int j = 0; j < increments_per_thread; ++j) {
         batch.increment_pin_ref_count();
       }
     });
   }
 
   // Wait for all threads to complete
-  for (auto& thread : threads)
-  {
+  for (auto& thread : threads) {
     thread.join();
   }
 
@@ -402,19 +389,16 @@ TEST_CASE("data_batch Thread-Safe Pin Reference Counting", "[data_batch]")
   threads.clear();
 
   // Launch threads to decrement pin count
-  for (int i = 0; i < num_threads; ++i)
-  {
+  for (int i = 0; i < num_threads; ++i) {
     threads.emplace_back([&batch]() {
-      for (int j = 0; j < increments_per_thread; ++j)
-      {
+      for (int j = 0; j < increments_per_thread; ++j) {
         batch.decrement_pin_ref_count();
       }
     });
   }
 
   // Wait for all threads to complete
-  for (auto& thread : threads)
-  {
+  for (auto& thread : threads) {
     thread.join();
   }
 
@@ -430,8 +414,7 @@ TEST_CASE("data_batch Concurrent View Increment and Decrement", "[data_batch]")
   data_batch batch(1, manager, std::move(data));
 
   // Pre-increment to avoid hitting zero during concurrent operations
-  for (int i = 0; i < 1000; ++i)
-  {
+  for (int i = 0; i < 1000; ++i) {
     batch.increment_view_ref_count();
   }
 
@@ -442,34 +425,28 @@ TEST_CASE("data_batch Concurrent View Increment and Decrement", "[data_batch]")
   std::vector<std::thread> dec_threads;
 
   // Launch incrementing threads
-  for (int i = 0; i < num_threads; ++i)
-  {
+  for (int i = 0; i < num_threads; ++i) {
     inc_threads.emplace_back([&batch]() {
-      for (int j = 0; j < operations_per_thread; ++j)
-      {
+      for (int j = 0; j < operations_per_thread; ++j) {
         batch.increment_view_ref_count();
       }
     });
   }
 
   // Launch decrementing threads
-  for (int i = 0; i < num_threads; ++i)
-  {
+  for (int i = 0; i < num_threads; ++i) {
     dec_threads.emplace_back([&batch]() {
-      for (int j = 0; j < operations_per_thread; ++j)
-      {
+      for (int j = 0; j < operations_per_thread; ++j) {
         batch.decrement_view_ref_count();
       }
     });
   }
 
   // Wait for all threads
-  for (auto& thread : inc_threads)
-  {
+  for (auto& thread : inc_threads) {
     thread.join();
   }
-  for (auto& thread : dec_threads)
-  {
+  for (auto& thread : dec_threads) {
     thread.join();
   }
 
@@ -485,8 +462,7 @@ TEST_CASE("data_batch Concurrent Pin Increment and Decrement", "[data_batch]")
   data_batch batch(1, manager, std::move(data));
 
   // Pre-increment to avoid hitting zero during concurrent operations
-  for (int i = 0; i < 1000; ++i)
-  {
+  for (int i = 0; i < 1000; ++i) {
     batch.increment_pin_ref_count();
   }
 
@@ -497,34 +473,28 @@ TEST_CASE("data_batch Concurrent Pin Increment and Decrement", "[data_batch]")
   std::vector<std::thread> dec_threads;
 
   // Launch incrementing threads
-  for (int i = 0; i < num_threads; ++i)
-  {
+  for (int i = 0; i < num_threads; ++i) {
     inc_threads.emplace_back([&batch]() {
-      for (int j = 0; j < operations_per_thread; ++j)
-      {
+      for (int j = 0; j < operations_per_thread; ++j) {
         batch.increment_pin_ref_count();
       }
     });
   }
 
   // Launch decrementing threads
-  for (int i = 0; i < num_threads; ++i)
-  {
+  for (int i = 0; i < num_threads; ++i) {
     dec_threads.emplace_back([&batch]() {
-      for (int j = 0; j < operations_per_thread; ++j)
-      {
+      for (int j = 0; j < operations_per_thread; ++j) {
         batch.decrement_pin_ref_count();
       }
     });
   }
 
   // Wait for all threads
-  for (auto& thread : inc_threads)
-  {
+  for (auto& thread : inc_threads) {
     thread.join();
   }
-  for (auto& thread : dec_threads)
-  {
+  for (auto& thread : dec_threads) {
     thread.join();
   }
 
@@ -540,15 +510,13 @@ TEST_CASE("data_batch Unique IDs", "[data_batch]")
 
   std::vector<data_batch> batches;
 
-  for (auto id : batch_ids)
-  {
+  for (auto id : batch_ids) {
     auto data = sirius::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
     batches.emplace_back(id, manager, std::move(data));
   }
 
   // Verify each batch has the correct ID
-  for (size_t i = 0; i < batch_ids.size(); ++i)
-  {
+  for (size_t i = 0; i < batch_ids.size(); ++i) {
     REQUIRE(batches[i].get_batch_id() == batch_ids[i]);
   }
 }
@@ -605,8 +573,7 @@ TEST_CASE("data_batch With Different Data Sizes", "[data_batch]")
   data_repository_manager manager;
   std::vector<size_t> sizes = {0, 1, 1024, 1024 * 1024, 1024 * 1024 * 100};
 
-  for (size_t size : sizes)
-  {
+  for (size_t size : sizes) {
     auto data      = sirius::make_unique<mock_data_representation>(memory::Tier::GPU, size);
     auto* data_ptr = data.get();
     data_batch batch(1, manager, std::move(data));
@@ -673,16 +640,13 @@ TEST_CASE("data_batch Rapid View Count Cycles", "[data_batch]")
   data_batch batch(1, manager, std::move(data));
 
   // Perform many cycles of increment and decrement
-  for (int cycle = 0; cycle < 100; ++cycle)
-  {
-    for (int i = 0; i < 10; ++i)
-    {
+  for (int cycle = 0; cycle < 100; ++cycle) {
+    for (int i = 0; i < 10; ++i) {
       batch.increment_view_ref_count();
     }
     REQUIRE(batch.get_view_count() == 10);
 
-    for (int i = 0; i < 10; ++i)
-    {
+    for (int i = 0; i < 10; ++i) {
       batch.decrement_view_ref_count();
     }
     REQUIRE(batch.get_view_count() == 0);
@@ -700,16 +664,13 @@ TEST_CASE("data_batch Rapid Pin Count Cycles", "[data_batch]")
   data_batch batch(1, manager, std::move(data));
 
   // Perform many cycles of increment and decrement
-  for (int cycle = 0; cycle < 100; ++cycle)
-  {
-    for (int i = 0; i < 10; ++i)
-    {
+  for (int cycle = 0; cycle < 100; ++cycle) {
+    for (int i = 0; i < 10; ++i) {
       batch.increment_pin_ref_count();
     }
     REQUIRE(batch.get_pin_count() == 10);
 
-    for (int i = 0; i < 10; ++i)
-    {
+    for (int i = 0; i < 10; ++i) {
       batch.decrement_pin_ref_count();
     }
     REQUIRE(batch.get_pin_count() == 0);
@@ -742,11 +703,11 @@ TEST_CASE("data_batch Independent View and Pin Counts", "[data_batch]")
   // Decrement view count
   batch.decrement_view_ref_count();
   REQUIRE(batch.get_view_count() == 2);
-  REQUIRE(batch.get_pin_count() == 2); // Pin count unchanged
+  REQUIRE(batch.get_pin_count() == 2);  // Pin count unchanged
 
   // Decrement pin count
   batch.decrement_pin_ref_count();
-  REQUIRE(batch.get_view_count() == 2); // View count unchanged
+  REQUIRE(batch.get_view_count() == 2);  // View count unchanged
   REQUIRE(batch.get_pin_count() == 1);
 }
 
@@ -789,8 +750,7 @@ TEST_CASE("data_batch Decrement View Count Returns Old Value", "[data_batch]")
   data_batch batch(1, manager, std::move(data));
 
   // Increment to 5
-  for (int i = 0; i < 5; ++i)
-  {
+  for (int i = 0; i < 5; ++i) {
     batch.increment_view_ref_count();
   }
   REQUIRE(batch.get_view_count() == 5);

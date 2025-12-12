@@ -15,32 +15,33 @@
  */
 
 #include "catch.hpp"
+#include "data/common.hpp"
+#include "data/data_batch.hpp"
+#include "data/data_batch_view.hpp"
+#include "data/data_repository_manager.hpp"
+#include "memory/null_device_memory_resource.hpp"
+
+#include <map>
+#include <memory>
+#include <mutex>
 #include <thread>
 #include <vector>
-#include <memory>
-#include <map>
-#include <mutex>
-#include "data/data_batch_view.hpp"
-#include "data/data_batch.hpp"
-#include "data/data_repository_manager.hpp"
-#include "data/common.hpp"
-#include "memory/null_device_memory_resource.hpp"
 
 using namespace sirius;
 
 // Mock memory_space for testing - provides a simple memory_space without real allocators
-class mock_memory_space : public memory::memory_space
-{
-public:
+class mock_memory_space : public memory::memory_space {
+ public:
   mock_memory_space(memory::Tier tier, size_t device_id = 0)
-      : memory::memory_space(memory::memory_space_id{tier, static_cast<int>(device_id)},
-                             1024 * 1024 * 1024,
-                             (1024ULL * 1024ULL * 1024ULL) * 8 / 10,
-                             (1024ULL * 1024ULL * 1024ULL) / 2,
-                             create_null_allocators())
-  {}
+    : memory::memory_space(memory::memory_space_id{tier, static_cast<int>(device_id)},
+                           1024 * 1024 * 1024,
+                           (1024ULL * 1024ULL * 1024ULL) * 8 / 10,
+                           (1024ULL * 1024ULL * 1024ULL) / 2,
+                           create_null_allocators())
+  {
+  }
 
-private:
+ private:
   static std::vector<std::unique_ptr<rmm::mr::device_memory_resource>> create_null_allocators()
   {
     std::vector<std::unique_ptr<rmm::mr::device_memory_resource>> allocators;
@@ -50,43 +51,40 @@ private:
 };
 
 // Helper base class to hold memory_space - initialized before idata_representation
-struct mock_memory_space_holder
-{
+struct mock_memory_space_holder {
   std::shared_ptr<mock_memory_space> space;
 
   mock_memory_space_holder(memory::Tier tier, size_t device_id)
-      : space(std::make_shared<mock_memory_space>(tier, device_id))
-  {}
+    : space(std::make_shared<mock_memory_space>(tier, device_id))
+  {
+  }
 };
 
 // Mock idata_representation for testing
 // Inherits from mock_memory_space_holder first to ensure it's constructed before
 // idata_representation
-class mock_data_representation
-    : private mock_memory_space_holder
-    , public idata_representation
-{
-public:
+class mock_data_representation : private mock_memory_space_holder, public idata_representation {
+ public:
   explicit mock_data_representation(memory::Tier tier, size_t size = 1024, size_t device_id = 0)
-      : mock_memory_space_holder(tier, device_id) // Construct holder first
-      , idata_representation(*space)              // Pass reference to base class
-      , _size(size)
-  {}
-
-  std::size_t get_size_in_bytes() const override
+    : mock_memory_space_holder(tier, device_id)  // Construct holder first
+      ,
+      idata_representation(*space)  // Pass reference to base class
+      ,
+      _size(size)
   {
-    return _size;
   }
 
-  sirius::unique_ptr<idata_representation>
-  convert_to_memory_space(const memory::memory_space* target_memory_space,
-                          rmm::cuda_stream_view stream = rmm::cuda_stream_default) override
+  std::size_t get_size_in_bytes() const override { return _size; }
+
+  sirius::unique_ptr<idata_representation> convert_to_memory_space(
+    const memory::memory_space* target_memory_space,
+    rmm::cuda_stream_view stream = rmm::cuda_stream_default) override
   {
     // Empty implementation for testing
     return nullptr;
   }
 
-private:
+ private:
   size_t _size;
 };
 
@@ -97,7 +95,6 @@ std::pair<uint64_t, data_batch*> create_managed_batch(data_repository_manager& m
                                                       memory::Tier tier = memory::Tier::GPU,
                                                       size_t size       = 1024)
 {
-
   auto data         = sirius::make_unique<mock_data_representation>(tier, size);
   uint64_t batch_id = manager.get_next_data_batch_id();
   auto batch        = sirius::make_unique<data_batch>(batch_id, manager, std::move(data));
@@ -113,8 +110,7 @@ std::pair<uint64_t, data_batch*> create_managed_batch(data_repository_manager& m
 // Helper for old-style tests that need a batch with manager but manual lifecycle
 // Returns tuple of (manager, batch_id, batch_pointer)
 // Note: The manager must outlive the batch and any views
-struct managed_batch_holder
-{
+struct managed_batch_holder {
   data_repository_manager manager;
   uint64_t batch_id;
   data_batch* batch_ptr;
@@ -248,7 +244,7 @@ TEST_CASE("data_batch_view Destructor Decrements View Count", "[data_batch_view]
   {
     data_batch_view view(batch);
     REQUIRE(batch->get_view_count() == 2);
-  } // view destroyed here
+  }  // view destroyed here
 
   // View count should be decremented
   REQUIRE(batch->get_view_count() == 1);
@@ -299,7 +295,7 @@ TEST_CASE("data_batch_view Pin Throws When Already Pinned", "[data_batch_view]")
 
   // Try to pin again - should throw
   REQUIRE_THROWS_AS(view.pin(), std::runtime_error);
-  REQUIRE(batch->get_pin_count() == 1); // Count should not change
+  REQUIRE(batch->get_pin_count() == 1);  // Count should not change
 
   // Unpin and clean up
   view.unpin();
@@ -360,7 +356,7 @@ TEST_CASE("data_batch_view Destructor Auto Unpins", "[data_batch_view]")
     view.pin();
     REQUIRE(batch->get_pin_count() == 1);
     REQUIRE(batch->get_view_count() == 2);
-  } // view destroyed here, should auto-unpin
+  }  // view destroyed here, should auto-unpin
 
   // Pin count should be back to zero
   REQUIRE(batch->get_pin_count() == 0);
@@ -381,8 +377,7 @@ TEST_CASE("Multiple data_batch_views on Same Batch", "[data_batch_view]")
 
   std::vector<std::unique_ptr<data_batch_view>> views;
 
-  for (int i = 0; i < 10; ++i)
-  {
+  for (int i = 0; i < 10; ++i) {
     views.push_back(std::make_unique<data_batch_view>(batch));
   }
 
@@ -390,15 +385,13 @@ TEST_CASE("Multiple data_batch_views on Same Batch", "[data_batch_view]")
   REQUIRE(batch->get_view_count() == 11);
 
   // Pin half of them
-  for (int i = 0; i < 5; ++i)
-  {
+  for (int i = 0; i < 5; ++i) {
     views[i]->pin();
   }
   REQUIRE(batch->get_pin_count() == 5);
 
   // Unpin them
-  for (int i = 0; i < 5; ++i)
-  {
+  for (int i = 0; i < 5; ++i) {
     views[i]->unpin();
   }
   REQUIRE(batch->get_pin_count() == 0);
@@ -440,7 +433,7 @@ TEST_CASE("data_batch_view Independent View and Pin Counts", "[data_batch_view]"
     view.unpin();
     REQUIRE(batch->get_view_count() == 2);
     REQUIRE(batch->get_pin_count() == 0);
-  } // view destroyed here
+  }  // view destroyed here
 
   // Clean up
   batch->decrement_view_ref_count();
@@ -461,14 +454,13 @@ TEST_CASE("data_batch_view Multiple Pin Unpin Cycles", "[data_batch_view]")
     data_batch_view view(batch);
 
     // Perform many cycles
-    for (int i = 0; i < 100; ++i)
-    {
+    for (int i = 0; i < 100; ++i) {
       view.pin();
       REQUIRE(batch->get_pin_count() == 1);
       view.unpin();
       REQUIRE(batch->get_pin_count() == 0);
     }
-  } // view destroyed here
+  }  // view destroyed here
 
   // Clean up
   batch->decrement_view_ref_count();
@@ -492,19 +484,16 @@ TEST_CASE("data_batch_view Thread-Safe View Count", "[data_batch_view]")
   std::vector<std::vector<std::unique_ptr<data_batch_view>>> thread_views(num_threads);
 
   // Launch threads to create views
-  for (int i = 0; i < num_threads; ++i)
-  {
+  for (int i = 0; i < num_threads; ++i) {
     threads.emplace_back([&, i]() {
-      for (int j = 0; j < views_per_thread; ++j)
-      {
+      for (int j = 0; j < views_per_thread; ++j) {
         thread_views[i].push_back(std::make_unique<data_batch_view>(batch));
       }
     });
   }
 
   // Wait for all threads to complete
-  for (auto& thread : threads)
-  {
+  for (auto& thread : threads) {
     thread.join();
   }
 
@@ -512,8 +501,7 @@ TEST_CASE("data_batch_view Thread-Safe View Count", "[data_batch_view]")
   REQUIRE(batch->get_view_count() == 1 + num_threads * views_per_thread);
 
   // Clear all views
-  for (auto& views : thread_views)
-  {
+  for (auto& views : thread_views) {
     views.clear();
   }
 
@@ -539,8 +527,7 @@ TEST_CASE("data_batch_view Thread-Safe Pin Operations", "[data_batch_view]")
   std::vector<std::unique_ptr<data_batch_view>> views;
 
   // Create many views
-  for (int i = 0; i < num_views; ++i)
-  {
+  for (int i = 0; i < num_views; ++i) {
     views.push_back(std::make_unique<data_batch_view>(batch));
   }
 
@@ -549,21 +536,18 @@ TEST_CASE("data_batch_view Thread-Safe Pin Operations", "[data_batch_view]")
   std::vector<std::thread> threads;
 
   // Launch threads to pin views
-  for (int i = 0; i < num_threads; ++i)
-  {
+  for (int i = 0; i < num_threads; ++i) {
     threads.emplace_back([&, i]() {
       int start = i * (num_views / num_threads);
       int end   = (i + 1) * (num_views / num_threads);
-      for (int j = start; j < end; ++j)
-      {
+      for (int j = start; j < end; ++j) {
         views[j]->pin();
       }
     });
   }
 
   // Wait for all threads to complete
-  for (auto& thread : threads)
-  {
+  for (auto& thread : threads) {
     thread.join();
   }
 
@@ -573,21 +557,18 @@ TEST_CASE("data_batch_view Thread-Safe Pin Operations", "[data_batch_view]")
   threads.clear();
 
   // Launch threads to unpin views
-  for (int i = 0; i < num_threads; ++i)
-  {
+  for (int i = 0; i < num_threads; ++i) {
     threads.emplace_back([&, i]() {
       int start = i * (num_views / num_threads);
       int end   = (i + 1) * (num_views / num_threads);
-      for (int j = start; j < end; ++j)
-      {
+      for (int j = start; j < end; ++j) {
         views[j]->unpin();
       }
     });
   }
 
   // Wait for all threads to complete
-  for (auto& thread : threads)
-  {
+  for (auto& thread : threads) {
     thread.join();
   }
 
@@ -618,11 +599,9 @@ TEST_CASE("data_batch_view Concurrent View Creation and Destruction", "[data_bat
   std::vector<std::thread> threads;
 
   // Launch threads that create and destroy views
-  for (int i = 0; i < num_threads; ++i)
-  {
+  for (int i = 0; i < num_threads; ++i) {
     threads.emplace_back([&]() {
-      for (int j = 0; j < operations_per_thread; ++j)
-      {
+      for (int j = 0; j < operations_per_thread; ++j) {
         // Create a view
         auto view = std::make_unique<data_batch_view>(batch);
         // Immediately destroy it
@@ -631,8 +610,7 @@ TEST_CASE("data_batch_view Concurrent View Creation and Destruction", "[data_bat
   }
 
   // Wait for all threads to complete
-  for (auto& thread : threads)
-  {
+  for (auto& thread : threads) {
     thread.join();
   }
 
@@ -674,7 +652,7 @@ TEST_CASE("data_batch_view Copy Does Not Copy Pin State", "[data_batch_view]")
     // Unpin view1
     view1.unpin();
     REQUIRE(batch->get_pin_count() == 0);
-  } // views destroyed here
+  }  // views destroyed here
 
   // Clean up
   batch->decrement_view_ref_count();
@@ -723,7 +701,7 @@ TEST_CASE("data_batch_view Multiple Views Independent Pin States", "[data_batch_
     view2.unpin();
     view3.unpin();
     REQUIRE(batch->get_pin_count() == 0);
-  } // views destroyed here
+  }  // views destroyed here
 
   // Clean up
   batch->decrement_view_ref_count();
@@ -741,8 +719,7 @@ TEST_CASE("data_batch_view Rapid Creation and Destruction Cycles", "[data_batch_
   batch->increment_view_ref_count();
 
   // Perform many cycles of view creation and destruction
-  for (int cycle = 0; cycle < 100; ++cycle)
-  {
+  for (int cycle = 0; cycle < 100; ++cycle) {
     {
       data_batch_view view1(batch);
       data_batch_view view2(batch);
@@ -804,7 +781,7 @@ TEST_CASE("data_batch_view Multiple Batches", "[data_batch_view]")
     view1.unpin();
     view2.unpin();
     view3.unpin();
-  } // views destroyed here
+  }  // views destroyed here
 
   // Clean up
   batch1->decrement_view_ref_count();
@@ -829,24 +806,21 @@ TEST_CASE("data_batch_view Stress Test", "[data_batch_view]")
   std::vector<std::unique_ptr<data_batch_view>> views;
 
   // Create many views
-  for (int i = 0; i < num_views; ++i)
-  {
+  for (int i = 0; i < num_views; ++i) {
     views.push_back(std::make_unique<data_batch_view>(batch));
   }
 
   REQUIRE(batch->get_view_count() == num_views + 1);
 
   // Pin all of them
-  for (int i = 0; i < num_views; ++i)
-  {
+  for (int i = 0; i < num_views; ++i) {
     views[i]->pin();
   }
 
   REQUIRE(batch->get_pin_count() == num_views);
 
   // Unpin all
-  for (int i = 0; i < num_views; ++i)
-  {
+  for (int i = 0; i < num_views; ++i) {
     views[i]->unpin();
   }
 
@@ -875,8 +849,7 @@ TEST_CASE("data_batch_view Mixed Lifetime Operations", "[data_batch_view]")
   std::vector<std::unique_ptr<data_batch_view>> views;
 
   // Create some views
-  for (int i = 0; i < 5; ++i)
-  {
+  for (int i = 0; i < 5; ++i) {
     views.push_back(std::make_unique<data_batch_view>(batch));
   }
   REQUIRE(batch->get_view_count() == 6);
@@ -890,18 +863,17 @@ TEST_CASE("data_batch_view Mixed Lifetime Operations", "[data_batch_view]")
   // Destroy some views (including pinned ones - should auto-unpin)
   views.erase(views.begin() + 2);
   REQUIRE(batch->get_view_count() == 5);
-  REQUIRE(batch->get_pin_count() == 2); // view[2] was unpinned on destruction
+  REQUIRE(batch->get_pin_count() == 2);  // view[2] was unpinned on destruction
 
   // Create more views
-  for (int i = 0; i < 3; ++i)
-  {
+  for (int i = 0; i < 3; ++i) {
     views.push_back(std::make_unique<data_batch_view>(batch));
   }
   REQUIRE(batch->get_view_count() == 8);
 
   // Unpin remaining
   views[0]->unpin();
-  views[3]->unpin(); // This was views[4] before erase
+  views[3]->unpin();  // This was views[4] before erase
   REQUIRE(batch->get_pin_count() == 0);
 
   // Destroy all
@@ -970,14 +942,13 @@ TEST_CASE("data_batch_view Zero to Non-Zero Pin Transitions", "[data_batch_view]
     REQUIRE(batch->get_pin_count() == 0);
 
     // Repeat multiple times
-    for (int i = 0; i < 10; ++i)
-    {
+    for (int i = 0; i < 10; ++i) {
       view.pin();
       REQUIRE(batch->get_pin_count() == 1);
       view.unpin();
       REQUIRE(batch->get_pin_count() == 0);
     }
-  } // view destroyed here
+  }  // view destroyed here
 
   // Clean up
   batch->decrement_view_ref_count();
@@ -997,24 +968,20 @@ TEST_CASE("data_batch_view Rapid Pin Unpin Multiple Views", "[data_batch_view]")
   constexpr int num_views = 10;
   std::vector<std::unique_ptr<data_batch_view>> views;
 
-  for (int i = 0; i < num_views; ++i)
-  {
+  for (int i = 0; i < num_views; ++i) {
     views.push_back(std::make_unique<data_batch_view>(batch));
   }
 
   // Rapid pin/unpin cycles
-  for (int cycle = 0; cycle < 50; ++cycle)
-  {
+  for (int cycle = 0; cycle < 50; ++cycle) {
     // Pin all
-    for (auto& view : views)
-    {
+    for (auto& view : views) {
       view->pin();
     }
     REQUIRE(batch->get_pin_count() == num_views);
 
     // Unpin all
-    for (auto& view : views)
-    {
+    for (auto& view : views) {
       view->unpin();
     }
     REQUIRE(batch->get_pin_count() == 0);
@@ -1070,7 +1037,7 @@ TEST_CASE("data_batch_view Batch Persists With Multiple Views", "[data_batch_vie
 
       data_batch_view view3(batch);
       REQUIRE(batch->get_view_count() == 3);
-    } // view2 and view3 destroyed, count goes 3 → 2 → 1
+    }  // view2 and view3 destroyed, count goes 3 → 2 → 1
 
     // Batch still exists because view1 is alive
     REQUIRE(batch->get_view_count() == 1);
@@ -1141,11 +1108,11 @@ TEST_CASE("data_batch_view Copy Assignment No Premature Deletion", "[data_batch_
 
       // batch2 now has 2 views
       REQUIRE(batch2->get_view_count() == 2);
-    } // view2 destroyed, batch2 count goes 2 → 1
+    }  // view2 destroyed, batch2 count goes 2 → 1
 
     // batch2 still exists
     REQUIRE(batch2->get_view_count() == 1);
-  } // view1 destroyed, batch2 count goes 1 → 0, batch2 deleted
+  }  // view1 destroyed, batch2 count goes 1 → 0, batch2 deleted
 }
 
 // Test concurrent view creation and deletion with manager
@@ -1165,11 +1132,9 @@ TEST_CASE("data_batch_view Concurrent Auto Deletion", "[data_batch_view][deletio
   std::vector<std::thread> threads;
 
   // Launch threads that create and destroy views rapidly
-  for (int i = 0; i < num_threads; ++i)
-  {
+  for (int i = 0; i < num_threads; ++i) {
     threads.emplace_back([&]() {
-      for (int j = 0; j < operations_per_thread; ++j)
-      {
+      for (int j = 0; j < operations_per_thread; ++j) {
         auto view = std::make_unique<data_batch_view>(batch);
         // View immediately destroyed
       }
@@ -1177,8 +1142,7 @@ TEST_CASE("data_batch_view Concurrent Auto Deletion", "[data_batch_view][deletio
   }
 
   // Wait for all threads to complete
-  for (auto& thread : threads)
-  {
+  for (auto& thread : threads) {
     thread.join();
   }
 
@@ -1234,7 +1198,7 @@ TEST_CASE("data_batch_view Multiple Batches Auto Delete Independently",
 
   // Destroy view1 - batch1 should be deleted
   view1.~data_batch_view();
-  new (&view1) data_batch_view(batch3); // Reconstruct as view of batch3
+  new (&view1) data_batch_view(batch3);  // Reconstruct as view of batch3
 
   // batch2 still has 2 views
   REQUIRE(batch2->get_view_count() == 2);
@@ -1255,20 +1219,18 @@ TEST_CASE("data_batch_view Rapid Batch Creation And Deletion", "[data_batch_view
   data_repository_manager manager;
 
   // Create and delete many batches rapidly
-  for (int i = 0; i < 100; ++i)
-  {
+  for (int i = 0; i < 100; ++i) {
     auto [batch_id, batch] = create_managed_batch(manager);
 
     {
       data_batch_view view(batch);
       REQUIRE(batch->get_view_count() == 1);
 
-      if (i % 3 == 0)
-      {
+      if (i % 3 == 0) {
         view.pin();
         REQUIRE(batch->get_pin_count() == 1);
       }
-    } // View destroyed, batch auto-deleted
+    }  // View destroyed, batch auto-deleted
   }
 }
 
@@ -1281,16 +1243,14 @@ TEST_CASE("data_batch_view View Count Transitions During Deletion", "[data_batch
 
   // Create multiple views
   std::vector<std::unique_ptr<data_batch_view>> views;
-  for (int i = 0; i < 10; ++i)
-  {
+  for (int i = 0; i < 10; ++i) {
     views.push_back(std::make_unique<data_batch_view>(batch));
   }
 
   REQUIRE(batch->get_view_count() == 10);
 
   // Destroy views one by one
-  for (int i = 9; i >= 1; --i)
-  {
+  for (int i = 9; i >= 1; --i) {
     views.pop_back();
     REQUIRE(batch->get_view_count() == i);
   }

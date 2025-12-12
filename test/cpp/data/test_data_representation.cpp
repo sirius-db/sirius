@@ -15,30 +15,33 @@
  */
 
 #include "catch.hpp"
-#include <memory>
-#include <vector>
+#include "data/common.hpp"
 #include "data/cpu_data_representation.hpp"
 #include "data/gpu_data_representation.hpp"
-#include "data/common.hpp"
-#include "memory/null_device_memory_resource.hpp"
-#include "memory/host_table.hpp"
 #include "memory/fixed_size_host_memory_resource.hpp"
-
-#include <cudf/column/column_factories.hpp>
-#include <cudf/table/table.hpp>
-#include <cudf/types.hpp>
-#include <cudf/contiguous_split.hpp>
-#include <rmm/cuda_stream_view.hpp>
-#include <cuda_runtime_api.h>
-#include <rmm/cuda_stream.hpp>
-#include <iostream>
-#include <iomanip>
-
+#include "memory/host_table.hpp"
 #include "memory/memory_reservation.hpp"
+#include "memory/null_device_memory_resource.hpp"
 #include "memory_management/memory_test_common.hpp"
 #include "utils/cudf_test_utils.hpp"
 
+#include <cudf/column/column_factories.hpp>
+#include <cudf/contiguous_split.hpp>
+#include <cudf/table/table.hpp>
+#include <cudf/types.hpp>
+
+#include <rmm/cuda_stream.hpp>
+#include <rmm/cuda_stream_view.hpp>
+
+#include <cuda_runtime_api.h>
+
+#include <iomanip>
+#include <iostream>
+
 // Declarations provided by utils/cudf_test_utils.hpp
+
+#include <memory>
+#include <vector>
 
 using namespace sirius;
 
