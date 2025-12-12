@@ -18,7 +18,9 @@
 #include <expression_executor/ast_supported_types.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
 #include <expression_executor/regex/regex_playground.hpp>
+#include <expression_executor/regex/regex_interpreter.hpp>
 #include <sirius/exception.hpp>
+
 
 // duckdb
 #include <duckdb/common/assert.hpp>
@@ -41,9 +43,11 @@
 #include <cudf/strings/replace_re.hpp>
 #include <cudf/strings/slice.hpp>
 #include <cudf/strings/strings_column_view.hpp>
+#include <cudf/transform.hpp>
 #include <cudf/unary.hpp>
 
 // standard library
+#include <optional>
 #include <regex>
 #include <string>
 
@@ -369,9 +373,21 @@ execute_result gpu_expression_executor::execute(duckdb::BoundFunctionExpression 
     auto const has_backrefs = std::regex_search(replace_str, std::regex(R"(\\[0-9])"));
     if (has_backrefs) {
       if (duckdb::Config::ENABLE_REGEX_JIT_IMPL) {
-        if (pattern_str == R"(^https?://(?:www\.)?([^/]+)/.*$)" && replace_str == R"(\1)") {
-          return ::sirius::regex::regex_playground::jit_transform_clickbench_q28_regex(
-            input.get_column_view());
+        try {
+          auto& cache = ::sirius::expression::RegexUdfCache::Instance();
+          const auto& udf = cache.GetOrCreate(pattern_str, replace_str);
+          return cudf::transform({input.get_column_view()},
+                                 udf.source,
+                                 cudf::data_type{cudf::type_id::STRING},
+                                 false,
+                                 std::nullopt,
+                                 cudf::null_aware::YES);
+        } catch (duckdb::NotImplementedException const& ex) {
+          SIRIUS_LOG_DEBUG("Regex JIT interpreter not supported for pattern {}: {}", pattern_str, ex.what());
+        } catch (duckdb::Exception const& ex) {
+          SIRIUS_LOG_WARN("Regex JIT interpreter failed for pattern {}: {}. Falling back to cudf.", pattern_str, ex.what());
+        } catch (std::exception const& ex) {
+          SIRIUS_LOG_WARN("Regex JIT interpreter failed for pattern {}: {}. Falling back to cudf.", pattern_str, ex.what());
         }
       }
       return cudf::strings::replace_with_backrefs(
