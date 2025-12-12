@@ -31,6 +31,10 @@
 namespace sirius {
 namespace memory {
 
+
+    //TODO: this doesn't handle multiple numa domains yet. We need to make our own 
+    //pinned allocator that allocates numa local memory and then registers it with cuda
+
 /**
  * @brief A host memory resource that allocates fixed-size blocks using pinned host memory as upstream.
  *
@@ -63,7 +67,8 @@ public:
     explicit fixed_size_host_memory_resource(
         std::size_t block_size = default_block_size,
         std::size_t pool_size = default_pool_size,
-        std::size_t initial_pools = default_initial_number_pools);
+        std::size_t initial_pools = default_initial_number_pools,
+        std::size_t max_total_allocation_bytes = 0);
 
     /**
      * @brief Construct with custom upstream resource.
@@ -77,7 +82,8 @@ public:
         std::unique_ptr<rmm::mr::pinned_host_memory_resource> upstream_mr,
         std::size_t block_size = default_block_size,
         std::size_t pool_size = default_pool_size,
-        std::size_t initial_pools = default_initial_number_pools);
+        std::size_t initial_pools = default_initial_number_pools,
+        std::size_t max_total_allocation_bytes = 0);
 
     // Disable copy and move
     fixed_size_host_memory_resource(const fixed_size_host_memory_resource&) = delete;
@@ -117,6 +123,16 @@ public:
      * @return rmm::mr::host_memory_resource* Pointer to upstream resource (nullptr if using pinned host)
      */
     [[nodiscard]] rmm::mr::pinned_host_memory_resource* get_upstream_resource() const noexcept;
+
+    /**
+     * @brief Get the current cap for the total allocated bytes across all pools.
+     */
+    [[nodiscard]] std::size_t get_max_total_allocation_bytes() const noexcept { return max_total_allocation_bytes_; }
+
+    /**
+     * @brief Get the number of bytes currently allocated in pools.
+     */
+    [[nodiscard]] std::size_t get_total_allocated_pool_bytes() const noexcept { return total_allocated_bytes_; }
 
     /**
      * @brief Simple RAII wrapper for multiple block allocations.
@@ -218,6 +234,8 @@ private:
     std::vector<void*> allocated_blocks_;                       ///< All allocated blocks
     std::vector<void*> free_blocks_;                           ///< Currently free blocks
     mutable std::mutex mutex_;                                 ///< Mutex for thread safety
+    std::size_t max_total_allocation_bytes_ = 0;               ///< Cap on total bytes allocated in pools
+    std::size_t total_allocated_bytes_ = 0;                    ///< Bytes currently allocated across pools
 };
 
 } // namespace memory

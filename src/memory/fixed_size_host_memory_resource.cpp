@@ -16,17 +16,59 @@
 
 #include "memory/fixed_size_host_memory_resource.hpp"
 #include <string>
+#include <fstream>
+#include <sstream>
+#include <limits>
 
 namespace sirius {
 namespace memory {
 
+namespace {
+// Returns available system memory in bytes if detectable; 0 if unknown
+std::size_t get_available_system_memory_bytes() {
+
+    std::ifstream meminfo("/proc/meminfo");
+    if (!meminfo) {
+        return 0;
+    }
+    std::string line;
+    while (std::getline(meminfo, line)) {
+        if (line.rfind("MemAvailable:", 0) == 0) {
+            std::istringstream iss(line);
+            std::string key, unit;
+            std::size_t value_kb = 0;
+            iss >> key >> value_kb >> unit; // e.g., "MemAvailable:" 123456 "kB"
+            if (value_kb > 0) {
+                // kB in /proc/meminfo are kibibytes
+                return static_cast<std::size_t>(value_kb) * 1024ULL;
+            }
+            break;
+        }
+    }
+    return 0;
+}
+} // namespace
+
 fixed_size_host_memory_resource::fixed_size_host_memory_resource(
     std::size_t block_size,
     std::size_t pool_size,
-    std::size_t initial_pools)
+    std::size_t initial_pools,
+    std::size_t max_total_allocation_bytes)
     : block_size_(rmm::align_up(block_size, alignof(std::max_align_t))),
       pool_size_(pool_size)
 {
+    // Determine cap: default to 50% of available system memory if not provided
+    if (max_total_allocation_bytes == 0) {
+        const std::size_t avail = get_available_system_memory_bytes();
+        if(avail == 0){
+            throw std::runtime_error("Failed to get available system memory");
+        }
+        max_total_allocation_bytes_ = avail / 2;
+    } else {
+        max_total_allocation_bytes_ = max_total_allocation_bytes;
+    }
+
+    total_allocated_bytes_ = 0;
     for (std::size_t i = 0; i < initial_pools; ++i) {
         expand_pool();
     }
@@ -36,11 +78,25 @@ fixed_size_host_memory_resource::fixed_size_host_memory_resource(
     std::unique_ptr<rmm::mr::pinned_host_memory_resource> upstream_mr,
     std::size_t block_size,
     std::size_t pool_size,
-    std::size_t initial_pools)
+    std::size_t initial_pools,
+    std::size_t max_total_allocation_bytes)
     : block_size_(rmm::align_up(block_size, alignof(std::max_align_t))),
       pool_size_(pool_size),
       upstream_mr_(std::move(upstream_mr))
 {
+        // Determine cap: default to 50% of available system memory if not provided
+    // Determine cap: default to 50% of available system memory if not provided
+    if (max_total_allocation_bytes == 0) {
+        const std::size_t avail = get_available_system_memory_bytes();
+        if(avail == 0){
+            throw std::runtime_error("Failed to get available system memory");
+        }
+        max_total_allocation_bytes_ = avail / 2;
+    } else {
+        max_total_allocation_bytes_ = max_total_allocation_bytes;
+    }
+
+    total_allocated_bytes_ = 0;
     for (std::size_t i = 0; i < initial_pools; ++i) {
         expand_pool();
     }
@@ -95,6 +151,8 @@ fixed_size_host_memory_resource::multiple_blocks_allocation fixed_size_host_memo
 
     for (std::size_t i = 0; i < num_blocks; ++i) {
         if (free_blocks_.empty()) {
+            //TODO: this should be happening on a background thread asynchronsously
+            // so that we don't block threads making allocations.
             expand_pool();
         }
 
@@ -163,6 +221,11 @@ bool fixed_size_host_memory_resource::do_is_equal(const rmm::mr::device_memory_r
 
 void fixed_size_host_memory_resource::expand_pool() {
     const std::size_t total_size = block_size_ * pool_size_;
+    // Enforce cap on total allocation size across pools
+    if (total_allocated_bytes_ > max_total_allocation_bytes_ - total_size) {
+        // Cap reached; do not expand
+        return;
+    }
     
     void* large_allocation;
     if (upstream_mr_) {
@@ -172,6 +235,7 @@ void fixed_size_host_memory_resource::expand_pool() {
     }
     
     allocated_blocks_.push_back(large_allocation);
+    total_allocated_bytes_ += total_size;
     
     for (std::size_t i = 0; i < pool_size_; ++i) {
         void* block = static_cast<char*>(large_allocation) + (i * block_size_);

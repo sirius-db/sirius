@@ -18,14 +18,19 @@
 
 #include "catch.hpp"
 #include "log/logging.hpp"
+#include <cstdlib>
 
 using namespace duckdb;
 
-int main(int argc, char* argv[]) {
+int main(int argc, char* argv[])
+{
   // Initialize the logger
   std::string log_dir = SIRIUS_UNITTEST_LOG_DIR;
   InitGlobalLogger(log_dir + "/sirius_unittest.log");
 
   // Run tests
-  return Catch::Session().run(argc, argv);
+  int code = Catch::Session().run(argc, argv);
+  std::fflush(stdout);
+  std::fflush(stderr);
+  std::quick_exit(code);
 }

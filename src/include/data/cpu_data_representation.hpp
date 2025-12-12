@@ -41,7 +41,7 @@ public:
      * @param meta Metadata required to reconstruct the cuDF columns (using cudf::unpack())
      * @param size The size of the actual data in bytes
      */
-    host_table_representation(sirius::unique_ptr<sirius::memory::host_table_allocation> host_table, sirius::memory::memory_space& memory_space);
+    host_table_representation(sirius::unique_ptr<sirius::memory::host_table_allocation> host_table, sirius::memory::memory_space* memory_space);
 
     /**
      * @brief Get the size of the data representation in bytes
@@ -64,7 +64,7 @@ public:
      * @param stream CUDA stream to use for memory operations
      * @return sirius::unique_ptr<idata_representation> A new data representation in the target tier
      */
-    sirius::unique_ptr<idata_representation> convert_to_memory_space(sirius::memory::memory_space& target_memory_space, rmm::cuda_stream_view stream = rmm::cuda_stream_default) override;
+    sirius::unique_ptr<idata_representation> convert_to_memory_space(const sirius::memory::memory_space* target_memory_space, rmm::cuda_stream_view stream = rmm::cuda_stream_default) override;
 
 private:
     sirius::unique_ptr<sirius::memory::host_table_allocation> _host_table; ///< The allocation where the actual data resides

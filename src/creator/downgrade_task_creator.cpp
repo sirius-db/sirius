@@ -14,19 +14,18 @@
  * limitations under the License.
  */
 
-#include "memory/common.hpp"
+#include "downgrade/downgrade_task_creator.hpp"
 
-namespace std
-{
-size_t hash<std::pair<sirius::memory::Tier, size_t>>::operator()(
-  const std::pair<sirius::memory::Tier, size_t>& p) const
-{
-  return std::hash<int>{}(static_cast<int>(p.first)) ^ (std::hash<size_t>{}(p.second) << 1);
+namespace sirius {
+
+void downgrade_task_creator::schedule(sirius::unique_ptr<parallel::downgrade_task> downgrade_task) {
+    // Downgrade-specific scheduling logic
+    // Schedule the downgrade task using the downgrade_task_queue
+    _downgrade_exec.schedule(std::move(downgrade_task));
 }
 
-size_t hash<std::pair<sirius::memory::Tier, int>>::operator()(
-  const std::pair<sirius::memory::Tier, int>& p) const
-{
-  return std::hash<int>{}(static_cast<int>(p.first)) ^ (std::hash<int>{}(p.second) << 1);
+void downgrade_task_creator::worker_loop() {
+
 }
-} // namespace std
+
+} // namespace sirius

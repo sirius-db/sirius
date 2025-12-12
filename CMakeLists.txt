@@ -77,6 +77,7 @@ add_subdirectory(src/operator)
 add_subdirectory(src/plan)
 add_subdirectory(src/data)
 add_subdirectory(src/pipeline)
+add_subdirectory(src/downgrade)
 
 set(CUDA_SOURCES
   src/cuda/communication.cu
