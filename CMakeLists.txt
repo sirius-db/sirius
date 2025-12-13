@@ -14,16 +14,6 @@
 
 cmake_minimum_required(VERSION 3.30.4)
 
-find_program(SCCACHE_PROGRAM sccache)
-
-if(SCCACHE_PROGRAM)
-  message(STATUS "sccache found: ${SCCACHE_PROGRAM}")
-  set(CMAKE_C_COMPILER_LAUNCHER "${SCCACHE_PROGRAM}")
-  set(CMAKE_CXX_COMPILER_LAUNCHER "${SCCACHE_PROGRAM}")
-else()
-  message(STATUS "sccache not found, compiler caching will be disabled.")
-endif()
-
 # Enable compile_commands.json generation for clang lsp
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
