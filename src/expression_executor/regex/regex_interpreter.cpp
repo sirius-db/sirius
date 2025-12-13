@@ -486,6 +486,8 @@ void GenerateQuantified(CodegenContext& ctx, const Quantified& q) {
 
   if (quant == '+' || quant == '*') {
     if (child->kind == NodeKind::DOT) {
+      ctx.Emit("{");
+      ctx.IndentMore();
       ctx.Emit("auto newline_pos = url.find('\\n', pos);");
       if (quant == '+') {
         ctx.Emit("if (pos >= static_cast<int32_t>(len) || newline_pos == pos)");
@@ -500,6 +502,8 @@ void GenerateQuantified(CodegenContext& ctx, const Quantified& q) {
       ctx.Emit("pos = static_cast<int32_t>(newline_pos);");
       ctx.IndentLess();
       ctx.Emit("}");
+      ctx.IndentLess();
+      ctx.Emit("}");
       return;
     }
 
@@ -509,6 +513,8 @@ void GenerateQuantified(CodegenContext& ctx, const Quantified& q) {
         throw duckdb::NotImplementedException("Unsupported child for '+' or '*'");
       }
       auto ch = EmitCharLiteral(cls.chars[0]);
+      ctx.Emit("{");
+      ctx.IndentMore();
       ctx.Emit("auto stop_pos = url.find(" + ch + ", pos);");
       if (quant == '+') {
         ctx.Emit("if (pos >= static_cast<int32_t>(len) || stop_pos == pos)");
@@ -521,6 +527,8 @@ void GenerateQuantified(CodegenContext& ctx, const Quantified& q) {
       ctx.Emit("} else {");
       ctx.IndentMore();
       ctx.Emit("pos = static_cast<int32_t>(stop_pos);");
+      ctx.IndentLess();
+      ctx.Emit("}");
       ctx.IndentLess();
       ctx.Emit("}");
       return;
@@ -536,6 +544,8 @@ void GenerateQuantified(CodegenContext& ctx, const Quantified& q) {
         ctx.Emit("if (pos >= static_cast<int32_t>(len) || url[pos] != " + ch + ")");
         EmitMismatch(ctx);
       }
+      ctx.Emit("{");
+      ctx.IndentMore();
       ctx.Emit("auto next_pos = url.find_first_not_of(" + ch + ", pos);");
       ctx.Emit("if (next_pos == cudf::string_view::npos) {");
       ctx.IndentMore();
@@ -544,6 +554,8 @@ void GenerateQuantified(CodegenContext& ctx, const Quantified& q) {
       ctx.Emit("} else {");
       ctx.IndentMore();
       ctx.Emit("pos = static_cast<int32_t>(next_pos);");
+      ctx.IndentLess();
+      ctx.Emit("}");
       ctx.IndentLess();
       ctx.Emit("}");
       return;
