@@ -20,7 +20,6 @@
 #include "data/gpu_data_representation.hpp"
 #include "memory/memory_reservation_manager.hpp"
 #include "memory/memory_space.hpp"
-#include "memory_management/memory_test_common.hpp"
 #include "merge/gpu_merge_impl.hpp"
 #include "order/gpu_order_impl.hpp"
 #include "utils/utils.hpp"

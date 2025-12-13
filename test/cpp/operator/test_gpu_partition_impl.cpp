@@ -19,7 +19,6 @@
 #include "data/gpu_data_representation.hpp"
 #include "memory/memory_reservation_manager.hpp"
 #include "memory/memory_space.hpp"
-#include "memory_management/memory_test_common.hpp"
 #include "partition/gpu_partition_impl.hpp"
 #include "utils/utils.hpp"
 

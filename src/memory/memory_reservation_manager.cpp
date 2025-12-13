@@ -152,10 +152,8 @@ memory_reservation_manager::~memory_reservation_manager() { shutdown(); }
 
 memory_reservation_manager::memory_space_config::memory_space_config(
   Tier t, int dev_id, size_t mem_limit, DeviceMemoryResourceFactoryFn mr_fn)
-  : tier(t), device_id(dev_id), memory_limit(mem_limit), mr_factory_fn(std::move(mr_fn))
+  : memory_space_config(t, dev_id, mem_limit, mem_limit, std::move(mr_fn))
 {
-  if (mr_factory_fn == nullptr) { mr_factory_fn = make_default_allocator_for_tier(t); }
-  assert(mem_limit <= memory_capacity && "Memory limit cannot exceed device capacity");
 }
 
 memory_reservation_manager::memory_space_config::memory_space_config(

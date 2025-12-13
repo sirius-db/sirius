@@ -34,8 +34,8 @@ class borrowed_stream {
   friend class exclusive_stream_pool;
 
   [[nodiscard]] rmm::cuda_stream_view get() const noexcept;
-  [[nodiscard]] const rmm::cuda_stream* const operator->() const noexcept;
-  [[nodiscard]] const rmm::cuda_stream* const operator->() noexcept;
+  [[nodiscard]] const rmm::cuda_stream* operator->() const noexcept;
+  [[nodiscard]] const rmm::cuda_stream* operator->() noexcept;
   operator rmm::cuda_stream_view() const;
 
   ~borrowed_stream() noexcept;

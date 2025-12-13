@@ -56,8 +56,8 @@ void borrowed_stream::reset() noexcept
 }
 
 rmm::cuda_stream_view borrowed_stream::get() const noexcept { return stream_; }
-const rmm::cuda_stream* const borrowed_stream::operator->() const noexcept { return &stream_; }
-const rmm::cuda_stream* const borrowed_stream::operator->() noexcept { return &stream_; }
+const rmm::cuda_stream* borrowed_stream::operator->() const noexcept { return &stream_; }
+const rmm::cuda_stream* borrowed_stream::operator->() noexcept { return &stream_; }
 
 exclusive_stream_pool::exclusive_stream_pool(rmm::cuda_device_id device_id,
                                              std::size_t pool_size,

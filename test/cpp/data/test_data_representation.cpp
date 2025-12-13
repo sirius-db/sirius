@@ -18,11 +18,11 @@
 #include "data/common.hpp"
 #include "data/cpu_data_representation.hpp"
 #include "data/gpu_data_representation.hpp"
+#include "memory/common.hpp"
 #include "memory/fixed_size_host_memory_resource.hpp"
 #include "memory/host_table.hpp"
 #include "memory/memory_reservation_manager.hpp"
 #include "memory/null_device_memory_resource.hpp"
-#include "memory_management/memory_test_common.hpp"
 #include "utils/cudf_test_utils.hpp"
 
 #include <cudf/column/column_factories.hpp>
@@ -124,8 +124,10 @@ static void initialize_memory_for_conversions()
   using namespace sirius::memory;
   memory_reservation_manager::reset_for_testing();
   std::vector<memory_reservation_manager::memory_space_config> configs;
-  configs.emplace_back(Tier::GPU, 0, 2048ull * 1024 * 1024, create_test_allocators(Tier::GPU));
-  configs.emplace_back(Tier::HOST, 0, 4096ull * 1024 * 1024, create_test_allocators(Tier::HOST));
+  configs.emplace_back(
+    Tier::GPU, 0, 2048ull * 1024 * 1024, make_default_allocator_for_tier(Tier::GPU));
+  configs.emplace_back(
+    Tier::HOST, 0, 4096ull * 1024 * 1024, make_default_allocator_for_tier(Tier::HOST));
   memory_reservation_manager::initialize(std::move(configs));
 }
 
@@ -502,8 +504,8 @@ static void initialize_multi_gpu_for_conversions(int dev_a, int dev_b)
   using namespace sirius::memory;
   memory_reservation_manager::reset_for_testing();
   std::vector<memory_reservation_manager::memory_space_config> configs;
-  configs.emplace_back(Tier::GPU, dev_a, 2048ull * 1024 * 1024, create_test_allocators(Tier::GPU));
-  configs.emplace_back(Tier::GPU, dev_b, 2048ull * 1024 * 1024, create_test_allocators(Tier::GPU));
+  configs.emplace_back(Tier::GPU, dev_a, 2048ull * 1024 * 1024);
+  configs.emplace_back(Tier::GPU, dev_b, 2048ull * 1024 * 1024);
   memory_reservation_manager::initialize(std::move(configs));
 }
 
