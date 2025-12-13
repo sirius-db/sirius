@@ -347,6 +347,8 @@ def _generate_quantified(ctx: CodegenContext, q: Quantified):
 
     elif quant in ("+", "*"):
         if isinstance(child, Dot):
+            ctx.emit("{")
+            ctx.indent_more()
             ctx.emit("auto newline_pos = url.find('\\n', pos);")
             if quant == "+":
                 ctx.emit("if (pos >= static_cast<int32_t>(len) || newline_pos == pos)")
@@ -360,8 +362,12 @@ def _generate_quantified(ctx: CodegenContext, q: Quantified):
             ctx.emit("pos = static_cast<int32_t>(newline_pos);")
             ctx.indent_less()
             ctx.emit("}")
+            ctx.indent_less()
+            ctx.emit("}")
         elif isinstance(child, CharClass) and child.negated and len(child.chars) == 1:
             ch = _emit_char_literal(child.chars[0])
+            ctx.emit("{")
+            ctx.indent_more()
             ctx.emit(f"auto stop_pos = url.find({ch}, pos);")
             if quant == "+":
                 ctx.emit("if (pos >= static_cast<int32_t>(len) || stop_pos == pos)")
@@ -375,11 +381,15 @@ def _generate_quantified(ctx: CodegenContext, q: Quantified):
             ctx.emit("pos = static_cast<int32_t>(stop_pos);")
             ctx.indent_less()
             ctx.emit("}")
+            ctx.indent_less()
+            ctx.emit("}")
         elif isinstance(child, Literal) and len(child.text) == 1:
             ch = _emit_char_literal(child.text)
             if quant == "+":
                 ctx.emit(f"if (pos >= static_cast<int32_t>(len) || url[pos] != {ch})")
                 _emit_mismatch(ctx)
+            ctx.emit("{")
+            ctx.indent_more()
             ctx.emit(f"auto next_pos = url.find_first_not_of({ch}, pos);")
             ctx.emit("if (next_pos == cudf::string_view::npos) {")
             ctx.indent_more()
@@ -388,6 +398,8 @@ def _generate_quantified(ctx: CodegenContext, q: Quantified):
             ctx.emit("} else {")
             ctx.indent_more()
             ctx.emit("pos = static_cast<int32_t>(next_pos);")
+            ctx.indent_less()
+            ctx.emit("}")
             ctx.indent_less()
             ctx.emit("}")
         else:
