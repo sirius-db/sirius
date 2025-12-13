@@ -137,6 +137,8 @@ memory_reservation_manager::memory_reservation_manager(std::vector<memory_space_
       config.tier,
       config.device_id,
       config.memory_limit,
+      config.downgrade_tigger_threshold * config.memory_capacity,
+      config.downgrade_stop_threshold * config.memory_capacity,
       config.memory_capacity,
       config.mr_factory_fn(config.device_id, config.memory_limit, config.memory_capacity));
     _memory_spaces.push_back(std::move(mem_space));

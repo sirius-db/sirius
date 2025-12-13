@@ -27,7 +27,6 @@
 #include <utility>
 
 namespace sirius {
-namespace memory {
 
 template <class... Ts>
 struct overloaded : Ts... {
@@ -37,6 +36,7 @@ struct overloaded : Ts... {
 template <class... Ts>
 overloaded(Ts...) -> overloaded<Ts...>;
 
+namespace memory {
 /**
  * Memory tier enumeration representing different types of memory storage.
  * Ordered roughly by performance (fastest to slowest access).

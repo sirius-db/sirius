@@ -35,22 +35,23 @@ namespace {
 // Returns available system memory in bytes if detectable; 0 if unknown
 std::size_t get_available_system_memory_bytes()
 {
-  std::ifstream meminfo("/proc/meminfo");
-  if (!meminfo) { return 0; }
-  std::string line;
-  while (std::getline(meminfo, line)) {
-    if (line.rfind("MemAvailable:", 0) == 0) {
-      std::istringstream iss(line);
-      std::string key, unit;
-      std::size_t value_kb = 0;
-      iss >> key >> value_kb >> unit;  // e.g., "MemAvailable:" 123456 "kB"
-      if (value_kb > 0) {
-        // kB in /proc/meminfo are kibibytes
-        return static_cast<std::size_t>(value_kb) * 1024ULL;
-      }
-      break;
-    }
-  }
+  // todo (fix this)
+  // std::ifstream meminfo("/proc/meminfo");
+  // if (!meminfo) { return 0; }
+  // std::string line;
+  // while (std::getline(meminfo, line)) {
+  //   if (line.rfind("MemAvailable:", 0) == 0) {
+  //     std::istringstream iss(line);
+  //     std::string key, unit;
+  //     std::size_t value_kb = 0;
+  //     iss >> key >> value_kb >> unit;  // e.g., "MemAvailable:" 123456 "kB"
+  //     if (value_kb > 0) {
+  //       // kB in /proc/meminfo are kibibytes
+  //       return static_cast<std::size_t>(value_kb) * 1024ULL;
+  //     }
+  //     break;
+  //   }
+  // }
   return 0;
 }
 }  // namespace

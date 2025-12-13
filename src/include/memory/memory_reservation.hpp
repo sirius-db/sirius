@@ -74,7 +74,7 @@ struct tier_memory_resource_trait<Tier::GPU> {
  */
 class reservation_limit_policy {
  public:
-  virtual ~reservation_limit_policy() = default;
+  virtual ~reservation_limit_policy();
 
   /**
    * @brief Handle an allocation that would exceed the stream's reservation.

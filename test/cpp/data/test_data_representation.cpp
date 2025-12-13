@@ -20,7 +20,7 @@
 #include "data/gpu_data_representation.hpp"
 #include "memory/fixed_size_host_memory_resource.hpp"
 #include "memory/host_table.hpp"
-#include "memory/memory_reservation.hpp"
+#include "memory/memory_reservation_manager.hpp"
 #include "memory/null_device_memory_resource.hpp"
 #include "memory_management/memory_test_common.hpp"
 #include "utils/cudf_test_utils.hpp"
@@ -260,7 +260,6 @@ TEST_CASE("host_table_representation converts to GPU and preserves contents",
   // Compare using the same stream used for conversion to avoid cross-stream hazards
   sirius::test::expect_cudf_tables_equal_on_stream(
     original, gpu_repr.get_table(), pack_stream.view());
-  const_cast<memory::memory_space*>(gpu_space)->release_stream(gpu_stream);
 }
 
 // =============================================================================
@@ -375,10 +374,10 @@ TEST_CASE("gpu->host->gpu roundtrip preserves cudf table contents", "[gpu_data_r
   auto cpu_any      = repr.convert_to_memory_space(host_space, chain_stream);
   // Debug: dump host bytes before converting back to GPU
   {
-    auto& host_repr_dbg   = cpu_any->cast<host_table_representation>();
-    auto host_alloc_uptr  = host_repr_dbg.get_host_table();
-    const auto data_size  = host_alloc_uptr->data_size;
-    const auto block_size = host_alloc_uptr->allocation.block_size;
+    auto& host_repr_dbg         = cpu_any->cast<host_table_representation>();
+    const auto& host_alloc_uptr = host_repr_dbg.get_host_table();
+    const auto data_size        = host_alloc_uptr->data_size;
+    const auto block_size       = host_alloc_uptr->allocation->block_size;
     std::vector<uint8_t> host_bytes;
     host_bytes.resize(data_size);
     size_t copied = 0, block_idx = 0, block_off = 0;
@@ -753,3 +752,5 @@ TEST_CASE("Representations polymorphism", "[cpu_data_representation][gpu_data_re
   REQUIRE(representations[0]->get_size_in_bytes() == 1024);
   REQUIRE(representations[1]->get_size_in_bytes() > 0);
 }
+
+//  */

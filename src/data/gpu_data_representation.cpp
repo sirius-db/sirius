@@ -15,13 +15,17 @@
  */
 
 #include "data/gpu_data_representation.hpp"
-#include <cudf/utilities/traits.hpp>
-#include "memory/host_table.hpp"
-#include "data/cpu_data_representation.hpp"
-#include "rmm/cuda_stream_view.hpp"
+
 #include "cudf/contiguous_split.hpp"
-#include <rmm/device_uvector.hpp>
+#include "data/cpu_data_representation.hpp"
+#include "memory/host_table.hpp"
+#include "rmm/cuda_stream_view.hpp"
+
+#include <cudf/utilities/traits.hpp>
+
 #include <rmm/device_buffer.hpp>
+#include <rmm/device_uvector.hpp>
+
 #include <cuda_runtime_api.h>
 namespace sirius {
 
@@ -62,7 +66,7 @@ sirius::unique_ptr<idata_representation> gpu_table_representation::convert_to_me
 
     cudaSetDevice(target_device_id);
     rmm::device_uvector<uint8_t> dst_uvector(bytes_to_copy, target_stream, mr);
-    target_stream.synchronize();
+    target_stream->synchronize();
     // Restore previous device before peer copy
     cudaSetDevice(source_device_id);
 
@@ -84,26 +88,26 @@ sirius::unique_ptr<idata_representation> gpu_table_representation::convert_to_me
       cudf::unpack(new_metadata->data(), static_cast<uint8_t const*>(new_gpu_data->data()));
     auto new_table = cudf::table(new_table_view, target_stream, mr);
     // Restore previous device
-    target_stream.synchronize();
+    target_stream.get().synchronize();
     cudaSetDevice(source_device_id);
-    target_memory_space->release_stream(target_stream);
+    target_stream.reset();
 
     return sirius::make_unique<gpu_table_representation>(
       std::move(new_table), *const_cast<sirius::memory::memory_space*>(target_memory_space));
   } else if (target_memory_space->get_tier() == memory::Tier::HOST) {
     auto mr = target_memory_space
-                ->get_default_allocator_as<sirius::memory::fixed_size_host_memory_resource>();
+                ->get_memory_resource_as<sirius::memory::fixed_size_host_memory_resource>();
     auto allocation = mr->allocate_multiple_blocks(packed_data.gpu_data->size());
 
     size_t block_index      = 0;
     size_t block_offset     = 0;
     size_t source_offset    = 0;
-    const size_t block_size = allocation.block_size;
+    const size_t block_size = allocation->block_size;
     while (source_offset < packed_data.gpu_data->size()) {
-      size_t remaining_bytes = packed_data.gpu_data->size() - source_offset;
-      size_t bytes_to_copy   = std::min(remaining_bytes, block_size - block_offset);
-      void* block_ptr        = allocation[block_index];
-      cudaMemcpyAsync(static_cast<uint8_t*>(block_ptr) + block_offset,
+      size_t remaining_bytes         = packed_data.gpu_data->size() - source_offset;
+      size_t bytes_to_copy           = std::min(remaining_bytes, block_size - block_offset);
+      std::span<std::byte> block_ptr = allocation->at(block_index);
+      cudaMemcpyAsync(block_ptr.data() + block_offset,
                       static_cast<const uint8_t*>(packed_data.gpu_data->data()) + source_offset,
                       bytes_to_copy,
                       cudaMemcpyDeviceToHost,

@@ -16,12 +16,14 @@
 
 #include "downgrade/downgrade_task.hpp"
 // #include "downgrade/downgrade_executor.hpp"
-#include "memory/memory_reservation.hpp"
+#include "cudf/contiguous_split.hpp"
 #include "data/cpu_data_representation.hpp"
 #include "data/gpu_data_representation.hpp"
+#include "memory/common.hpp"
 #include "memory/fixed_size_host_memory_resource.hpp"
+#include "memory/memory_reservation_manager.hpp"
+
 #include <rmm/cuda_stream_view.hpp>
-#include "cudf/contiguous_split.hpp"
 
 namespace sirius {
 namespace parallel {
@@ -47,15 +49,11 @@ void downgrade_task::execute()
         throw rmm::out_of_memory("Failed to allocate host memory for downgrade task.");
       }
       // Reservation identifies a memory_space (tier + device). Fetch its default allocator.
-      auto mem_space = mr_manager.get_memory_space(reservation->tier, reservation->device_id);
+      auto mem_space = mr_manager.get_memory_space(reservation->tier(), reservation->device_id());
       if (!mem_space) {
         throw std::runtime_error("Invalid reservation memory_space for HOST tier");
       }
-      auto fixed_mr =
-        mem_space->get_default_allocator_as<sirius::memory::fixed_size_host_memory_resource>();
-      if (fixed_mr == nullptr) {
-        throw std::runtime_error("Default HOST allocator is not fixed_size_host_memory_resource");
-      }
+      auto* fixed_mr = reservation->get_memory_resource_of<memory::Tier::HOST>();
 
       batch->convert_to_memory_space(mem_space, stream);
 

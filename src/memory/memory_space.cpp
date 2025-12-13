@@ -40,20 +40,22 @@ namespace memory {
 memory_space::memory_space(Tier tier,
                            int device_id,
                            size_t memory_limit,
-                           std::unique_ptr<rmm::mr::device_memory_resource> allocator)
-  : memory_space(tier, device_id, memory_limit, memory_limit, std::move(allocator))
-{
-}
-
-memory_space::memory_space(Tier tier,
-                           int device_id,
-                           size_t memory_limit,
+                           size_t start_downgrading_memory_threshold,
+                           size_t stop_downgrading_memory_threshold,
                            size_t capacity,
                            std::unique_ptr<rmm::mr::device_memory_resource> allocator)
   : _id(tier, device_id),
     _memory_limit(memory_limit),
+    _start_downgrading_memory_threshold(start_downgrading_memory_threshold),
+    _stop_downgrading_memory_threshold(stop_downgrading_memory_threshold),
     _capacity(capacity),
-    _allocator(std::move(allocator))
+    _allocator(std::move(allocator)),
+    stream_pool_{[&]() -> std::unique_ptr<exclusive_stream_pool> {
+      if (tier == Tier::GPU) {
+        return std::make_unique<exclusive_stream_pool>(rmm::cuda_device_id(device_id), 16);
+      }
+      return nullptr;
+    }()}
 {
   if (memory_limit == 0) { throw std::invalid_argument("Memory limit must be greater than 0"); }
   if (!_allocator) { throw std::invalid_argument("At least one allocator must be provided"); }
@@ -125,6 +127,14 @@ std::unique_ptr<reservation> memory_space::make_reservation(size_t size)
   return res;
 }
 
+borrowed_stream memory_space::acquire_stream() const
+{
+  if (!stream_pool_) {
+    throw std::runtime_error("Stream pool is not available for non-GPU memory spaces");
+  }
+  return stream_pool_->acquire_stream();
+}
+
 std::size_t memory_space::get_active_reservation_count() const
 {
   return std::visit(
@@ -138,6 +148,23 @@ std::size_t memory_space::get_active_reservation_count() const
                          return mr->get_active_reservation_count();
                        }},
     _reservation_allocator);
+}
+
+bool memory_space::should_downgrade_memory() const
+{
+  return _memory_limit - get_available_memory() >= _start_downgrading_memory_threshold;
+}
+
+bool memory_space::should_stop_downgrading_memory() const
+{
+  return _memory_limit - get_available_memory() <= _stop_downgrading_memory_threshold;
+}
+
+size_t memory_space::get_amount_to_downgrade() const
+{
+  size_t consumed = _memory_limit - get_available_memory();
+  if (consumed <= _stop_downgrading_memory_threshold) { return 0; }
+  return consumed - _stop_downgrading_memory_threshold;
 }
 
 size_t memory_space::get_available_memory(rmm::cuda_stream_view stream) const

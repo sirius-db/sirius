@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "cuda_device.hpp"
+
 #include <rmm/cuda_stream.hpp>
 #include <rmm/cuda_stream_view.hpp>
 
@@ -31,9 +33,9 @@ class borrowed_stream {
  public:
   friend class exclusive_stream_pool;
 
-  rmm::cuda_stream_view get() const noexcept;
-  rmm::cuda_stream_view operator*() const noexcept;
-  rmm::cuda_stream_view operator->() const noexcept;
+  [[nodiscard]] rmm::cuda_stream_view get() const noexcept;
+  [[nodiscard]] const rmm::cuda_stream* const operator->() const noexcept;
+  [[nodiscard]] const rmm::cuda_stream* const operator->() noexcept;
   operator rmm::cuda_stream_view() const;
 
   ~borrowed_stream() noexcept;
@@ -43,10 +45,10 @@ class borrowed_stream {
   borrowed_stream(borrowed_stream const&)            = delete;
   borrowed_stream& operator=(borrowed_stream const&) = delete;
 
+  void reset() noexcept;
+
  private:
   borrowed_stream(rmm::cuda_stream s, std::function<void(rmm::cuda_stream&&)> release_fn) noexcept;
-
-  void reset() noexcept;
 
   rmm::cuda_stream stream_;
   std::function<void(rmm::cuda_stream&&)> release_fn_;
@@ -66,6 +68,7 @@ class exclusive_stream_pool {
    * @param flags Flags used when creating streams in the pool.
    */
   explicit exclusive_stream_pool(
+    rmm::cuda_device_id device_id = {},
     std::size_t pool_size         = default_size,
     rmm::cuda_stream::flags flags = rmm::cuda_stream::flags::sync_default);
 
@@ -93,6 +96,7 @@ class exclusive_stream_pool {
 
   mutable std::mutex mutex_;
   std::condition_variable cv_;
+  rmm::cuda_device_id device_id_;
   rmm::cuda_stream::flags flags_;
   std::vector<rmm::cuda_stream> streams_;
 };

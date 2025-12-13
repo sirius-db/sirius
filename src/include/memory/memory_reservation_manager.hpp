@@ -189,6 +189,8 @@ class memory_reservation_manager {
     Tier tier;
     int device_id;
     size_t memory_limit;
+    float downgrade_tigger_threshold{0.75};
+    float downgrade_stop_threshold{0.65};
     std::size_t memory_capacity;  // Optional total capacity, defaults to device capacity
     DeviceMemoryResourceFactoryFn mr_factory_fn;
 

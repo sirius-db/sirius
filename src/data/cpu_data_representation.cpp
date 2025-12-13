@@ -15,10 +15,14 @@
  */
 
 #include "data/cpu_data_representation.hpp"
-#include "data/gpu_data_representation.hpp"
+
 #include "cudf/contiguous_split.hpp"
+#include "data/gpu_data_representation.hpp"
+
 #include <rmm/device_buffer.hpp>
+
 #include <cuda_runtime_api.h>
+
 #include <algorithm>
 #include <cstring>
 
@@ -33,49 +37,10 @@ host_table_representation::host_table_representation(
 
 std::size_t host_table_representation::get_size_in_bytes() const { return _host_table->data_size; }
 
-sirius::unique_ptr<sirius::memory::host_table_allocation>
+const sirius::unique_ptr<sirius::memory::host_table_allocation>&
 host_table_representation::get_host_table() const
 {
-  using sirius::memory::fixed_size_host_memory_resource;
-  auto const data_size      = _host_table->data_size;
-  auto const src_block_size = _host_table->allocation.block_size;
-  auto* src_mr              = _host_table->allocation.mr;
-
-  // Allocate destination blocks with the same total size
-  auto dst_allocation       = src_mr->allocate_multiple_blocks(data_size);
-  auto const dst_block_size = dst_allocation.block_size;
-  size_t src_block_index    = 0;
-  size_t src_block_offset   = 0;
-  size_t dst_block_index    = 0;
-  size_t dst_block_offset   = 0;
-  size_t copied             = 0;
-  while (copied < data_size) {
-    size_t remaining     = data_size - copied;
-    size_t src_avail     = src_block_size - src_block_offset;
-    size_t dst_avail     = dst_block_size - dst_block_offset;
-    size_t bytes_to_copy = std::min(remaining, std::min(src_avail, dst_avail));
-    void* src_ptr =
-      static_cast<uint8_t*>(_host_table->allocation[src_block_index]) + src_block_offset;
-    void* dst_ptr = static_cast<uint8_t*>(dst_allocation[dst_block_index]) + dst_block_offset;
-    std::memcpy(dst_ptr, src_ptr, bytes_to_copy);
-    copied += bytes_to_copy;
-    src_block_offset += bytes_to_copy;
-    dst_block_offset += bytes_to_copy;
-    if (src_block_offset == src_block_size) {
-      src_block_index++;
-      src_block_offset = 0;
-    }
-    if (dst_block_offset == dst_block_size) {
-      dst_block_index++;
-      dst_block_offset = 0;
-    }
-  }
-
-  // Deep copy metadata
-  auto metadata_copy = sirius::make_unique<sirius::vector<uint8_t>>(*_host_table->metadata);
-
-  return sirius::make_unique<sirius::memory::host_table_allocation>(
-    std::move(dst_allocation), std::move(metadata_copy), data_size);
+  return _host_table;
 }
 
 sirius::unique_ptr<idata_representation> host_table_representation::convert_to_memory_space(
@@ -93,14 +58,14 @@ sirius::unique_ptr<idata_representation> host_table_representation::convert_to_m
     size_t src_block_index      = 0;
     size_t src_block_offset     = 0;
     size_t dst_offset           = 0;
-    size_t const src_block_size = _host_table->allocation.block_size;
+    size_t const src_block_size = _host_table->allocation->block_size;
     while (dst_offset < data_size) {
       size_t remaining_bytes              = data_size - dst_offset;
       size_t bytes_available_in_src_block = src_block_size - src_block_offset;
       size_t bytes_to_copy                = std::min(remaining_bytes, bytes_available_in_src_block);
-      void* src_block_ptr                 = _host_table->allocation[src_block_index];
+      auto src_block                      = _host_table->allocation->at(src_block_index);
       cudaMemcpyAsync(static_cast<uint8_t*>(dst_buffer.data()) + dst_offset,
-                      static_cast<const uint8_t*>(src_block_ptr) + src_block_offset,
+                      src_block.data() + src_block_offset,
                       bytes_to_copy,
                       cudaMemcpyHostToDevice,
                       stream.value());
@@ -125,7 +90,7 @@ sirius::unique_ptr<idata_representation> host_table_representation::convert_to_m
   } else if (target_memory_space->get_tier() == memory::Tier::HOST) {
     assert(this->get_device_id() != target_memory_space->get_device_id());
     auto mr = target_memory_space
-                ->get_default_allocator_as<sirius::memory::fixed_size_host_memory_resource>();
+                ->get_memory_resource_as<sirius::memory::fixed_size_host_memory_resource>();
     if (mr == nullptr) {
       throw std::runtime_error(
         "Target HOST memory_space does not have a fixed_size_host_memory_resource");
@@ -135,17 +100,16 @@ sirius::unique_ptr<idata_representation> host_table_representation::convert_to_m
     size_t src_block_offset     = 0;
     size_t dst_block_index      = 0;
     size_t dst_block_offset     = 0;
-    size_t const src_block_size = _host_table->allocation.block_size;
-    size_t const dst_block_size = dst_allocation.block_size;
+    size_t const src_block_size = _host_table->allocation->block_size;
+    size_t const dst_block_size = dst_allocation->block_size;
     size_t copied               = 0;
     while (copied < data_size) {
       size_t remaining     = data_size - copied;
       size_t src_avail     = src_block_size - src_block_offset;
       size_t dst_avail     = dst_block_size - dst_block_offset;
       size_t bytes_to_copy = std::min(remaining, std::min(src_avail, dst_avail));
-      void* src_ptr =
-        static_cast<uint8_t*>(_host_table->allocation[src_block_index]) + src_block_offset;
-      void* dst_ptr = static_cast<uint8_t*>(dst_allocation[dst_block_index]) + dst_block_offset;
+      auto* src_ptr        = _host_table->allocation->at(src_block_index).data() + src_block_offset;
+      auto* dst_ptr        = dst_allocation->at(dst_block_index).data() + dst_block_offset;
       std::memcpy(dst_ptr, src_ptr, bytes_to_copy);
       copied += bytes_to_copy;
       src_block_offset += bytes_to_copy;
