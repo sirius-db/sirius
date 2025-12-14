@@ -52,15 +52,13 @@ __global__ void convert_int64_to_int128(uint8_t* input, uint8_t* output, size_t 
 {
   size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx < count) {
-    // Store the converted value as 16 bytes in output
-    uint64_t* input_ptr  = reinterpret_cast<uint64_t*>(input + idx * 8);
-    uint64_t* output_ptr = reinterpret_cast<uint64_t*>(output + idx * 16);
-    // for (int i = 0; i < 8; ++i) {
-    // output[idx * 16 + i] = input[idx * 8 + i];
-    // output[idx * 16 + i + 8] = 0;
-    output_ptr[0] = input_ptr[0];
-    output_ptr[1] = 0;  // Set the upper 64 bits to zero
-    // }
+    // Store the converted value as 16 bytes in output with proper sign extension
+    int64_t* input_ptr  = reinterpret_cast<int64_t*>(input + idx * 8);
+    int64_t* output_ptr = reinterpret_cast<int64_t*>(output + idx * 16);
+    int64_t value       = input_ptr[0];
+    output_ptr[0]       = value;
+    // Sign extend: if negative, upper bits should be all 1s (-1), else all 0s
+    output_ptr[1] = (value < 0) ? -1 : 0;
   }
 }
 
@@ -68,15 +66,14 @@ __global__ void convert_int32_to_int128(uint8_t* input, uint8_t* output, size_t 
 {
   size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx < count) {
-    // Store the converted value as 16 bytes in output
+    // Store the converted value as 16 bytes in output with proper sign extension
     int32_t* input_ptr  = reinterpret_cast<int32_t*>(input + idx * 4);
-    int32_t* output_ptr = reinterpret_cast<int32_t*>(output + idx * 16);
-    // for (int i = 0; i < 8; ++i) {
-    output_ptr[0] = input_ptr[0];
-    output_ptr[1] = 0;  // Set the upper 64 bits to zero
-    output_ptr[2] = 0;  // Set the upper 64 bits to zero
-    output_ptr[3] = 0;  // Set the upper 64 bits to zero
-    // }
+    int64_t* output_ptr = reinterpret_cast<int64_t*>(output + idx * 16);
+    int32_t value       = input_ptr[0];
+    // Sign extend to 64 bits first, then to 128 bits
+    int64_t extended = static_cast<int64_t>(value);
+    output_ptr[0]    = extended;
+    output_ptr[1]    = (value < 0) ? -1 : 0;
   }
 }
 
@@ -84,19 +81,14 @@ __global__ void convert_int16_to_int128(uint8_t* input, uint8_t* output, size_t 
 {
   size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx < count) {
-    // Store the converted value as 16 bytes in output
+    // Store the converted value as 16 bytes in output with proper sign extension
     int16_t* input_ptr  = reinterpret_cast<int16_t*>(input + idx * 2);
-    int16_t* output_ptr = reinterpret_cast<int16_t*>(output + idx * 16);
-    // for (int i = 0; i < 8; ++i) {
-    output_ptr[0] = input_ptr[0];
-    output_ptr[1] = 0;  // Set the upper 64 bits to zero
-    output_ptr[2] = 0;  // Set the upper 64 bits to zero
-    output_ptr[3] = 0;  // Set the upper 64 bits to zero
-    output_ptr[4] = 0;  // Set the upper 64 bits to zero
-    output_ptr[5] = 0;  // Set the upper 64 bits to zero
-    output_ptr[6] = 0;  // Set the upper 64 bits to zero
-    output_ptr[7] = 0;  // Set the upper 64 bits to zero
-    // }
+    int64_t* output_ptr = reinterpret_cast<int64_t*>(output + idx * 16);
+    int16_t value       = input_ptr[0];
+    // Sign extend to 64 bits first, then to 128 bits
+    int64_t extended = static_cast<int64_t>(value);
+    output_ptr[0]    = extended;
+    output_ptr[1]    = (value < 0) ? -1 : 0;
   }
 }
 
