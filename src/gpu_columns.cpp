@@ -538,8 +538,12 @@ void GPUColumn::setFromCudfScalar(cudf::scalar& cudf_scalar, GPUBufferManager* g
     } else if (scalar_type.id() == cudf::type_id::STRING ){
         auto& typed_scalar = static_cast<cudf::string_scalar&>(cudf_scalar); 
         size_t string_size = typed_scalar.size();
-        data_wrapper.data = gpuBufferManager->customCudaMalloc<uint8_t>(string_size, 0, 0);
-        callCudaMemcpyDeviceToDevice<uint8_t>(data_wrapper.data, const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(typed_scalar.data())), string_size, 0);
+        if (string_size > 0) {
+            data_wrapper.data = gpuBufferManager->customCudaMalloc<uint8_t>(string_size, 0, 0);
+            callCudaMemcpyDeviceToDevice<uint8_t>(data_wrapper.data, const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(typed_scalar.data())), string_size, 0);
+        } else {
+            data_wrapper.data = nullptr;
+        }
         data_wrapper.type = GPUColumnType(GPUColumnTypeId::VARCHAR);
         data_wrapper.num_bytes = string_size;
         data_wrapper.offset = gpuBufferManager->customCudaMalloc<uint64_t>(2, 0, 0);

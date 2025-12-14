@@ -503,7 +503,7 @@ __global__ void create_cpu_strings(duckdb_string_type* gpu_strings,
       char* gpu_data_ptr               = gpu_chars + str_offset;
       // memcpy(curr_string.value.inlined.inlined, gpu_data_ptr, str_length);
             // copy byte by byte to avoid unaligned access
-            #pragma unroll
+            #pragma unroll 1
             for (size_t i = 0; i < str_length; i++) {
                 curr_string.value.inlined.inlined[i] = gpu_data_ptr[i];
             }
