@@ -1,0 +1,207 @@
+{
+  "1k": {
+    "direct_neighbors": {
+      "median": 0.001,
+      "min": 0.001,
+      "max": 0.002,
+      "all_times": [
+        0.001,
+        0.001,
+        0.001,
+        0.002,
+        0.002
+      ],
+      "num_successful": 5
+    },
+    "bfs": {
+      "median": 0.035,
+      "min": 0.034,
+      "max": 0.05,
+      "all_times": [
+        0.034,
+        0.05,
+        0.035,
+        0.035,
+        0.036
+      ],
+      "num_successful": 5
+    },
+    "any_shortest": {
+      "median": 0.036,
+      "min": 0.035,
+      "max": 0.036,
+      "all_times": [
+        0.035,
+        0.036,
+        0.036,
+        0.036,
+        0.036
+      ],
+      "num_successful": 5
+    }
+  },
+  "10k": {
+    "direct_neighbors": {
+      "median": 0.002,
+      "min": 0.002,
+      "max": 0.002,
+      "all_times": [
+        0.002,
+        0.002,
+        0.002,
+        0.002,
+        0.002
+      ],
+      "num_successful": 5
+    },
+    "bfs": {
+      "median": 2.123,
+      "min": 2.066,
+      "max": 2.216,
+      "all_times": [
+        2.113,
+        2.216,
+        2.123,
+        2.066,
+        2.128
+      ],
+      "num_successful": 5
+    },
+    "any_shortest": {
+      "median": 2.085,
+      "min": 2.052,
+      "max": 2.122,
+      "all_times": [
+        2.085,
+        2.103,
+        2.052,
+        2.064,
+        2.122
+      ],
+      "num_successful": 5
+    }
+  },
+  "50k": {
+    "direct_neighbors": {
+      "median": 0.003,
+      "min": 0.002,
+      "max": 0.003,
+      "all_times": [
+        0.003,
+        0.003,
+        0.002,
+        0.002,
+        0.003
+      ],
+      "num_successful": 5
+    },
+    "bfs": {
+      "median": 56.091,
+      "min": 55.673,
+      "max": 56.27,
+      "all_times": [
+        56.091,
+        55.786,
+        56.27,
+        56.107,
+        55.673
+      ],
+      "num_successful": 5
+    },
+    "any_shortest": {
+      "median": 56.144,
+      "min": 56.02,
+      "max": 56.867,
+      "all_times": [
+        56.02,
+        56.388,
+        56.107,
+        56.867,
+        56.144
+      ],
+      "num_successful": 5
+    }
+  },
+  "100k": {
+    "direct_neighbors": {
+      "median": 0.002,
+      "min": 0.002,
+      "max": 0.003,
+      "all_times": [
+        0.003,
+        0.002,
+        0.002,
+        0.003,
+        0.002
+      ],
+      "num_successful": 5
+    },
+    "bfs": {
+      "median": 236.281,
+      "min": 236.121,
+      "max": 237.12,
+      "all_times": [
+        237.025,
+        236.281,
+        237.12,
+        236.121,
+        236.156
+      ],
+      "num_successful": 5
+    },
+    "any_shortest": {
+      "median": 236.802,
+      "min": 235.788,
+      "max": 239.774,
+      "all_times": [
+        239.774,
+        236.802,
+        235.788,
+        236.869,
+        235.915
+      ],
+      "num_successful": 5
+    }
+  },
+  "500k": {
+    "direct_neighbors": {
+      "median": 0.004,
+      "min": 0.003,
+      "max": 0.004,
+      "all_times": [
+        0.004,
+        0.004,
+        0.004,
+        0.004,
+        0.003
+      ],
+      "num_successful": 5
+    },
+    "bfs": {
+      "median": 1948.929,
+      "min": 1922.482,
+      "max": 2049.131,
+      "all_times": [
+        1940.567,
+        1922.482,
+        1948.929,
+        1991.096,
+        2049.131
+      ],
+      "num_successful": 5
+    },
+    "any_shortest": {
+      "median": 2070.796,
+      "min": 1856.52,
+      "max": 2095.863,
+      "all_times": [
+        2095.863,
+        2085.961,
+        1856.52,
+        1997.6,
+        2070.796
+      ],
+      "num_successful": 5
+    }
+  }
+}

@@ -25,6 +25,7 @@ CREATE OR REPLACE PROPERTY GRAPH snb
   EDGE TABLES (
     Person_knows_Person SOURCE KEY (source) REFERENCES Person (id)
                         DESTINATION KEY (destination) REFERENCES Person (id)
+--                         PROPERTIES (weight)
                         LABEL knows
   );
 
@@ -46,7 +47,7 @@ FROM GRAPH_TABLE (snb
 .timer on
 FROM GRAPH_TABLE (snb
   MATCH p = ANY SHORTEST (p1:person WHERE p1.id = 14)-[k:knows]->*(p2:person)
-  COLUMNS (p2.id as other_person_id, path_length(p))
+  COLUMNS (p2.id, path_length(p))
 );
 .timer off
 
@@ -58,7 +59,16 @@ FROM GRAPH_TABLE (snb
 );
 .timer off
 
--- Query 4: Multi-source BFS with bound
+-- Query 4: Weighted shortest (didn't work)
+-- .timer on
+-- FROM GRAPH_TABLE (snb
+--     MATCH ANY SHORTEST PATHS p = (p1:person WHERE p1.id = 14)-[k:knows]->+(p2:person)
+--     COLUMNS (p2.id, COST(p) AS distance)
+-- );
+-- .timer off
+
+
+-- Query 4: Multi-source BFS with bound (didn't work)
 -- .timer on
 -- FROM GRAPH_TABLE (snb
 --     MATCH p = ANY SHORTEST (p:person WHERE p.id IN (14, 25, 37))-[k:knows]->*(p2:person)
@@ -66,7 +76,7 @@ FROM GRAPH_TABLE (snb
 -- );
 -- .timer off
 
--- Query 5: BFS one-or-more with bound
+-- Query 5: BFS one-or-more with bound (didn't work)
 -- .timer on
 -- FROM GRAPH_TABLE (snb
 --     MATCH (p:person WHERE p.id = 14)-[k:knows]->+(p2:person)

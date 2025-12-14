@@ -1,0 +1,272 @@
+{
+  "1k": {
+    "direct_neighbors": {
+      "median": 0.002,
+      "min": 0.002,
+      "max": 0.002,
+      "all_times": [
+        0.002,
+        0.002,
+        0.002,
+        0.002,
+        0.002
+      ],
+      "num_successful": 5
+    },
+    "bfs": {
+      "median": 0.022,
+      "min": 0.012,
+      "max": 0.028,
+      "all_times": [
+        0.022,
+        0.018,
+        0.012,
+        0.023,
+        0.028
+      ],
+      "num_successful": 5
+    },
+    "any_shortest": {
+      "median": 0.042,
+      "min": 0.024,
+      "max": 0.051,
+      "all_times": [
+        0.046,
+        0.035,
+        0.042,
+        0.051,
+        0.024
+      ],
+      "num_successful": 5
+    },
+    "weighted_shortest": {
+      "median": 0.023,
+      "min": 0.018,
+      "max": 0.044,
+      "all_times": [
+        0.02,
+        0.023,
+        0.034,
+        0.044,
+        0.018
+      ],
+      "num_successful": 5
+    }
+  },
+  "10k": {
+    "direct_neighbors": {
+      "median": 0.014,
+      "min": 0.014,
+      "max": 0.014,
+      "all_times": [
+        0.014,
+        0.014,
+        0.014,
+        0.014,
+        0.014
+      ],
+      "num_successful": 5
+    },
+    "bfs": {
+      "median": 0.056,
+      "min": 0.042,
+      "max": 0.108,
+      "all_times": [
+        0.056,
+        0.042,
+        0.07,
+        0.044,
+        0.108
+      ],
+      "num_successful": 5
+    },
+    "any_shortest": {
+      "median": 0.036,
+      "min": 0.033,
+      "max": 0.053,
+      "all_times": [
+        0.034,
+        0.045,
+        0.053,
+        0.033,
+        0.036
+      ],
+      "num_successful": 5
+    },
+    "weighted_shortest": {
+      "median": 0.046,
+      "min": 0.041,
+      "max": 0.053,
+      "all_times": [
+        0.053,
+        0.046,
+        0.046,
+        0.041,
+        0.053
+      ],
+      "num_successful": 5
+    }
+  },
+  "50k": {
+    "direct_neighbors": {
+      "median": 0.095,
+      "min": 0.095,
+      "max": 0.107,
+      "all_times": [
+        0.096,
+        0.095,
+        0.107,
+        0.095,
+        0.095
+      ],
+      "num_successful": 5
+    },
+    "bfs": {
+      "median": 0.127,
+      "min": 0.114,
+      "max": 0.134,
+      "all_times": [
+        0.127,
+        0.125,
+        0.134,
+        0.134,
+        0.114
+      ],
+      "num_successful": 5
+    },
+    "any_shortest": {
+      "median": 0.126,
+      "min": 0.113,
+      "max": 0.166,
+      "all_times": [
+        0.126,
+        0.113,
+        0.151,
+        0.121,
+        0.166
+      ],
+      "num_successful": 5
+    },
+    "weighted_shortest": {
+      "median": 0.128,
+      "min": 0.123,
+      "max": 0.132,
+      "all_times": [
+        0.123,
+        0.128,
+        0.131,
+        0.125,
+        0.132
+      ],
+      "num_successful": 5
+    }
+  },
+  "100k": {
+    "direct_neighbors": {
+      "median": 0.217,
+      "min": 0.215,
+      "max": 0.217,
+      "all_times": [
+        0.217,
+        0.217,
+        0.216,
+        0.217,
+        0.215
+      ],
+      "num_successful": 5
+    },
+    "bfs": {
+      "median": 0.266,
+      "min": 0.247,
+      "max": 0.35,
+      "all_times": [
+        0.274,
+        0.266,
+        0.247,
+        0.35,
+        0.266
+      ],
+      "num_successful": 5
+    },
+    "any_shortest": {
+      "median": 0.242,
+      "min": 0.234,
+      "max": 0.248,
+      "all_times": [
+        0.242,
+        0.235,
+        0.246,
+        0.248,
+        0.234
+      ],
+      "num_successful": 5
+    },
+    "weighted_shortest": {
+      "median": 0.261,
+      "min": 0.256,
+      "max": 0.277,
+      "all_times": [
+        0.277,
+        0.256,
+        0.277,
+        0.26,
+        0.261
+      ],
+      "num_successful": 5
+    }
+  },
+  "500k": {
+    "direct_neighbors": {
+      "median": 1.399,
+      "min": 1.362,
+      "max": 1.4,
+      "all_times": [
+        1.362,
+        1.4,
+        1.399,
+        1.386,
+        1.4
+      ],
+      "num_successful": 5
+    },
+    "bfs": {
+      "median": 1.448,
+      "min": 1.428,
+      "max": 1.481,
+      "all_times": [
+        1.448,
+        1.428,
+        1.437,
+        1.473,
+        1.481
+      ],
+      "num_successful": 5
+    },
+    "any_shortest": {
+      "median": 1.438,
+      "min": 1.428,
+      "max": 1.747,
+      "all_times": [
+        1.747,
+        1.438,
+        1.436,
+        1.484,
+        1.428
+      ],
+      "num_successful": 5
+    },
+    "weighted_shortest": {
+      "median": 1.529,
+      "min": 1.508,
+      "max": 1.613,
+      "all_times": [
+        1.512,
+        1.508,
+        1.539,
+        1.529,
+        1.613
+      ],
+      "num_successful": 5
+    }
+  }
+}

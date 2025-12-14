@@ -45,6 +45,15 @@ CALL gpu_processing_graph("
 ");
 .timer off
 
+-- Query 4: Weighted query from a source
+CALL gpu_processing_graph("
+  SELECT * FROM GRAPH_TABLE (social
+    MATCH SHORTEST (p:Person_w WHERE p.id=14)-[w:Person_knows_Person]->*(p2:Person_w)
+    COLUMNS (p2.id, distance, predecessor)
+  )
+");
+
+
 -- Query 4: Multi-source BFS
 -- .timer on
 -- CALL gpu_processing_graph("

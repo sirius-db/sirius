@@ -47,13 +47,22 @@ CALL gpu_processing_graph("
 CALL gpu_processing_graph("
   SELECT * FROM GRAPH_TABLE (social
     MATCH SHORTEST (p:Person_w WHERE p.id=14)-[w:Knows_w]->+(p2:Person_w WHERE p2.id=42)
+    COLUMNS (p2.id, distance)
+  )
+");
+
+CALL gpu_processing_graph("
+  SELECT * FROM GRAPH_TABLE (social
+    MATCH SHORTEST (p:Person_w WHERE p.id=14)-[w:Knows_w]->*(p2:Person_w WHERE p2.id=42)
     COLUMNS (p2.id, distance, predecessor)
   )
 ");
 
 CALL gpu_processing_graph("
   SELECT * FROM GRAPH_TABLE (social
-    MATCH SHORTEST (p:Person_w WHERE p.id IN (14, 25))-[w:Knows_w]->+(p2:Person_w WHERE p2.id=42)
+    MATCH SHORTEST (p:Person_w WHERE p.id=14)-[w:Knows_w]->*(p2:Person_w)
     COLUMNS (p2.id, distance, predecessor)
   )
 ");
+
+
