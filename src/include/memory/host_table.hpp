@@ -24,21 +24,23 @@ namespace memory {
 
 /**
  * @brief Structure containing both the host memory allocation and metadata for table recreation.
- * 
- * This structure contains the actual memory allocation and the metadata required to recreate the table.
- * The metadata is a vector of uint8_t that contains the metadata for the table.
- * The data_size is the size of the data in the allocation.
+ *
+ * This structure contains the actual memory allocation and the metadata required to recreate the
+ * table. The metadata is a vector of uint8_t that contains the metadata for the table. The
+ * data_size is the size of the data in the allocation.
  */
- struct host_table_allocation {
-    fixed_size_host_memory_resource::multiple_blocks_allocation allocation;
-    sirius::unique_ptr<sirius::vector<uint8_t>> metadata;
-    std::size_t data_size;
-    
-    host_table_allocation(fixed_size_host_memory_resource::multiple_blocks_allocation alloc,
-                     sirius::unique_ptr<sirius::vector<uint8_t>> meta,
-                     std::size_t data_sz)
-        : allocation(std::move(alloc)), metadata(std::move(meta)), data_size(data_sz) {}
+struct host_table_allocation {
+  memory::fixed_multiple_blocks_allocation allocation;
+  sirius::unique_ptr<sirius::vector<uint8_t>> metadata;
+  std::size_t data_size;
+
+  host_table_allocation(memory::fixed_multiple_blocks_allocation alloc,
+                        sirius::unique_ptr<sirius::vector<uint8_t>> meta,
+                        std::size_t data_sz)
+    : allocation(std::move(alloc)), metadata(std::move(meta)), data_size(data_sz)
+  {
+  }
 };
 
-} // namespace memory
-} // namespace sirius
+}  // namespace memory
+}  // namespace sirius

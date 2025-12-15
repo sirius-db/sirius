@@ -15,10 +15,22 @@
  */
 
 #include "memory/memory_space.hpp"
-#include "memory/memory_reservation.hpp"  // For Reservation struct
-#include <algorithm>
-#include <stdexcept>
+
+#include "cuda_stream_pool.hpp"
+#include "cuda_stream_view.hpp"
+#include "memory/common.hpp"
+#include "memory/disk_access_limiter.hpp"
+#include "memory/fixed_size_host_memory_resource.hpp"
+#include "memory/memory_reservation.hpp"
+#include "memory/reservation_aware_resource_adaptor.hpp"
+
+#include <rmm/cuda_device.hpp>
+
+#include <mutex>
+#include <optional>
 #include <sstream>
+#include <stdexcept>
+#include <variant>
 
 namespace sirius {
 namespace memory {
@@ -27,70 +39,116 @@ namespace memory {
 // memory_space Implementation
 //===----------------------------------------------------------------------===//
 
-memory_space::memory_space(memory_space_id id,
+memory_space::memory_space(Tier tier,
+                           int device_id,
                            size_t memory_limit,
                            size_t start_downgrading_memory_threshold,
                            size_t stop_downgrading_memory_threshold,
-                           std::vector<std::unique_ptr<rmm::mr::device_memory_resource>> allocators)
-  : _id(id),
+                           size_t capacity,
+                           std::unique_ptr<rmm::mr::device_memory_resource> allocator)
+  : _id(tier, device_id),
     _memory_limit(memory_limit),
     _start_downgrading_memory_threshold(start_downgrading_memory_threshold),
     _stop_downgrading_memory_threshold(stop_downgrading_memory_threshold),
-    _allocators(std::move(allocators))
+    _capacity(capacity),
+    _allocator(std::move(allocator)),
+    stream_pool_{[&]() -> std::unique_ptr<rmm::cuda_stream_pool> {
+      rmm::cuda_set_device_raii guard{rmm::cuda_device_id(device_id)};
+      if (tier == Tier::GPU) { return std::make_unique<rmm::cuda_stream_pool>(16); }
+      return nullptr;
+    }()}
 {
   if (memory_limit == 0) { throw std::invalid_argument("Memory limit must be greater than 0"); }
-  if (_allocators.empty()) {
-    throw std::invalid_argument("At least one allocator must be provided");
+  if (!_allocator) { throw std::invalid_argument("At least one allocator must be provided"); }
+  if (tier == Tier::GPU) {
+    _reservation_allocator = std::make_unique<reservation_aware_resource_adaptor>(
+      _id, *_allocator, _memory_limit, _capacity);
+  } else if (tier == Tier::HOST) {
+    _reservation_allocator = std::make_unique<fixed_size_host_memory_resource>(
+      _id.device_id, *_allocator, _memory_limit, _capacity);
+  } else if (tier == Tier::DISK) {
+    _reservation_allocator = std::make_unique<disk_access_limiter>(_id, _memory_limit, _capacity);
   }
+  notification_channel_ = std::make_shared<notification_channel>();
 }
 
-bool memory_space::operator==(const memory_space& other) const { return _id == other._id; }
+memory_space::~memory_space() = default;
+
+bool memory_space::operator==(const memory_space& other) const { return _id == other.get_id(); }
 
 bool memory_space::operator!=(const memory_space& other) const { return !(*this == other); }
 
-memory_space_id memory_space::get_id() const { return _id; }
+memory_space_id memory_space::get_id() const noexcept { return _id; }
 
-Tier memory_space::get_tier() const { return _id.tier; }
+Tier memory_space::get_tier() const noexcept { return _id.tier; }
 
-int memory_space::get_device_id() const { return _id.device_id; }
+int memory_space::get_device_id() const noexcept { return _id.device_id; }
 
-std::unique_ptr<reservation> memory_space::request_reservation(size_t size)
+std::unique_ptr<reservation> memory_space::make_reservation_or_null(size_t size)
 {
-  std::unique_lock<std::mutex> lock(_mutex);
+  std::unique_ptr<reserved_arena> arena =
+    std::visit(sirius::overloaded{[&](std::unique_ptr<disk_access_limiter>& mr) {
+                                    return mr->reserve(size, notification_channel_->get_notifier());
+                                  },
+                                  [&](std::unique_ptr<reservation_aware_resource_adaptor>& mr) {
+                                    return mr->reserve(size, notification_channel_->get_notifier());
+                                  },
+                                  [&](std::unique_ptr<fixed_size_host_memory_resource>& mr) {
+                                    return mr->reserve(size, notification_channel_->get_notifier());
+                                  }},
+               _reservation_allocator);
+  return reservation::create(*this, std::move(arena));
+}
 
-  // TODO: This is kind of wrong. Given that we are trying to handle the blocking
-  // on the memory reservation manager. For now  I am going to leave it but
-  // we should probably and some locking mechanism for seeing if there is space AND returning the
-  // reservation if there is space in one operation.
-  //  Wait until we can allocate the requested size
-  wait_for_memory(size, lock);
+std::unique_ptr<reservation> memory_space::make_reservation_upto(size_t size)
+{
+  std::unique_ptr<reserved_arena> arena = std::visit(
+    sirius::overloaded{[&](std::unique_ptr<disk_access_limiter>& mr) {
+                         return mr->reserve_upto(size, notification_channel_->get_notifier());
+                       },
+                       [&](std::unique_ptr<reservation_aware_resource_adaptor>& mr) {
+                         return mr->reserve_upto(size, notification_channel_->get_notifier());
+                       },
+                       [&](std::unique_ptr<fixed_size_host_memory_resource>& mr) {
+                         return mr->reserve_upto(size, notification_channel_->get_notifier());
+                       }},
+    _reservation_allocator);
+  return reservation::create(*this, std::move(arena));
+}
 
-  // Create the reservation
-  auto res = std::make_unique<reservation>(_id.tier, static_cast<int>(_id.device_id), size);
-
-  // Update tracking
-  _total_reserved.fetch_add(size);
-  _active_count.fetch_add(1);
-
+std::unique_ptr<reservation> memory_space::make_reservation(size_t size)
+{
+  std::unique_ptr<reservation> res = make_reservation_or_null(size);
+  while (!res) {
+    auto status = notification_channel_->wait();
+    if (status == notification_channel::wait_status::SHUTDOWN) { return nullptr; }
+    if (status == notification_channel::wait_status::IDLE) { return make_reservation_upto(size); }
+    res = make_reservation_or_null(size);
+  }
   return res;
 }
 
-void memory_space::release_reservation(std::unique_ptr<reservation> res)
+rmm::cuda_stream_view memory_space::acquire_stream() const
 {
-  if (!res) { return; }
-
-  if (!validate_reservation(res.get())) {
-    throw std::invalid_argument("Reservation does not belong to this memory_space");
+  if (!stream_pool_) {
+    throw std::runtime_error("Stream pool is not available for non-GPU memory spaces");
   }
+  return stream_pool_->get_stream();
+}
 
-  std::lock_guard<std::mutex> lock(_mutex);
-
-  // Update tracking
-  _total_reserved.fetch_sub(res->size);
-  _active_count.fetch_sub(1);
-
-  // Notify waiting threads
-  _cv.notify_all();
+std::size_t memory_space::get_active_reservation_count() const
+{
+  return std::visit(
+    sirius::overloaded{[&](const std::unique_ptr<disk_access_limiter>& mr) {
+                         return mr->get_active_reservation_count();
+                       },
+                       [&](const std::unique_ptr<reservation_aware_resource_adaptor>& mr) {
+                         return mr->get_active_reservation_count();
+                       },
+                       [&](const std::unique_ptr<fixed_size_host_memory_resource>& mr) {
+                         return mr->get_active_reservation_count();
+                       }},
+    _reservation_allocator);
 }
 
 bool memory_space::should_downgrade_memory() const
@@ -105,102 +163,66 @@ bool memory_space::should_stop_downgrading_memory() const
 
 size_t memory_space::get_amount_to_downgrade() const
 {
-  // Reverse engineer from should_stop_downgrading_memory():
-  // should_stop_downgrading_memory() returns true when:
-  //     (_memory_limit - get_available_memory()) <= _stop_downgrading_memory_threshold
-  // i.e., consumed_bytes <= stop_threshold.
-  // Therefore, the amount to downgrade is:
-  //     max(0, consumed_bytes - stop_threshold)
   size_t consumed = _memory_limit - get_available_memory();
   if (consumed <= _stop_downgrading_memory_threshold) { return 0; }
   return consumed - _stop_downgrading_memory_threshold;
 }
 
-bool memory_space::shrink_reservation(reservation* res, size_t new_size)
+size_t memory_space::get_available_memory(rmm::cuda_stream_view stream) const
 {
-  if (!res || new_size >= res->size) {
-    return false;  // Invalid operation
-  }
-
-  if (!validate_reservation(res)) { return false; }
-
-  std::lock_guard<std::mutex> lock(_mutex);
-
-  size_t size_diff = res->size - new_size;
-
-  // Update reservation size
-  res->size = new_size;
-
-  // Update tracking
-  _total_reserved.fetch_sub(size_diff);
-
-  // Notify waiting threads
-  _cv.notify_all();
-
-  return true;
-}
-
-bool memory_space::grow_reservation(reservation* res, size_t new_size)
-{
-  if (!res || new_size <= res->size) {
-    return false;  // Invalid operation
-  }
-
-  if (!validate_reservation(res)) { return false; }
-
-  size_t size_diff = new_size - res->size;
-
-  std::unique_lock<std::mutex> lock(_mutex);
-
-  // Check if we can grow
-  if (!can_reserve(size_diff)) {
-    return false;  // Not enough memory available
-  }
-
-  // Update reservation size
-  res->size = new_size;
-
-  // Update tracking
-  _total_reserved.fetch_add(size_diff);
-
-  return true;
+  return std::visit(
+    sirius::overloaded{
+      [&](const std::unique_ptr<disk_access_limiter>& mr) { return mr->get_available_memory(); },
+      [&](const std::unique_ptr<reservation_aware_resource_adaptor>& mr) {
+        return mr->get_available_memory(stream);
+      },
+      [&](const std::unique_ptr<fixed_size_host_memory_resource>& mr) {
+        return mr->get_available_memory();
+      }},
+    _reservation_allocator);
 }
 
 size_t memory_space::get_available_memory() const
 {
-  std::lock_guard<std::mutex> lock(_mutex);
-  size_t reserved = _total_reserved.load();
-  return (reserved >= _memory_limit) ? 0 : (_memory_limit - reserved);
+  return std::visit(
+    sirius::overloaded{
+      [&](const std::unique_ptr<disk_access_limiter>& mr) { return mr->get_available_memory(); },
+      [](const std::unique_ptr<reservation_aware_resource_adaptor>& mr) {
+        return mr->get_available_memory();
+      },
+      [](const std::unique_ptr<fixed_size_host_memory_resource>& mr) {
+        return mr->get_available_memory();
+      }},
+    _reservation_allocator);
 }
 
-size_t memory_space::get_total_reserved_memory() const { return _total_reserved.load(); }
-
-size_t memory_space::get_max_memory() const { return _memory_limit; }
-
-size_t memory_space::get_active_reservation_count() const { return _active_count.load(); }
-
-rmm::device_async_resource_ref memory_space::get_default_allocator() const
+size_t memory_space::get_total_reserved_memory() const
 {
-  if (_allocators.empty()) { throw std::runtime_error("No allocators available in memory_space"); }
-  return *_allocators[0];
+  return std::visit(
+    sirius::overloaded{[&](const std::unique_ptr<disk_access_limiter>& mr) {
+                         return mr->get_total_reserved_bytes();
+                       },
+                       [](const std::unique_ptr<reservation_aware_resource_adaptor>& mr) {
+                         return mr->get_total_reserved_bytes();
+                       },
+                       [](const std::unique_ptr<fixed_size_host_memory_resource>& mr) {
+                         return mr->get_total_reserved_bytes();
+                       }},
+    _reservation_allocator);
 }
 
-rmm::device_async_resource_ref memory_space::get_allocator(size_t index) const
-{
-  if (index >= _allocators.size()) { throw std::out_of_range("Allocator index out of range"); }
-  return *_allocators[index];
-}
+size_t memory_space::get_max_memory() const noexcept { return _memory_limit; }
 
-size_t memory_space::get_allocator_count() const { return _allocators.size(); }
-
-bool memory_space::can_reserve(size_t size) const
+rmm::mr::device_memory_resource* memory_space::get_default_allocator() const noexcept
 {
-  size_t current_reserved = _total_reserved.load();
-  size_t current_active   = _active_count.load();
-  // Allow a single initial reservation to exceed the memory limit if there are
-  // currently zero outstanding reservations. Subsequent reservations must obey the limit.
-  if (current_active == 0) { return true; }
-  return (current_reserved + size) <= _memory_limit;
+  return std::visit(
+    sirius::overloaded{[this](const std::unique_ptr<disk_access_limiter>& other)
+                         -> rmm::mr::device_memory_resource* { return _allocator.get(); },
+                       [](const std::unique_ptr<reservation_aware_resource_adaptor>& mr)
+                         -> rmm::mr::device_memory_resource* { return mr.get(); },
+                       [](const std::unique_ptr<fixed_size_host_memory_resource>& mr)
+                         -> rmm::mr::device_memory_resource* { return mr.get(); }},
+    _reservation_allocator);
 }
 
 std::string memory_space::to_string() const
@@ -217,78 +239,9 @@ std::string memory_space::to_string() const
   return oss.str();
 }
 
-void memory_space::wait_for_memory(size_t size, std::unique_lock<std::mutex>& lock)
+void memory_space::shutdown()
 {
-  while (!can_reserve(size)) {
-    _cv.wait(lock);
-  }
-}
-
-bool memory_space::validate_reservation(const reservation* res) const
-{
-  return res && res->tier == _id.tier && res->device_id == _id.device_id;
-}
-
-void memory_space::initialize_stream_pool_if_needed() const
-{
-  if (_id.tier != Tier::GPU) { return; }
-  std::lock_guard<std::mutex> lg(_streams_mutex);
-  if (!_streams.empty()) { return; }
-  // Initialize with a small pool size (e.g., 4)
-  int prev_device = -1;
-  cudaGetDevice(&prev_device);
-  cudaSetDevice(_id.device_id);
-  constexpr size_t initial_streams = 4;
-  _streams.reserve(initial_streams);
-  _stream_in_use.reserve(initial_streams);
-  for (size_t i = 0; i < initial_streams; ++i) {
-    _streams.emplace_back(std::make_unique<rmm::cuda_stream>());
-    _stream_in_use.emplace_back(false);
-  }
-  cudaSetDevice(prev_device);
-}
-
-void memory_space::grow_stream_pool_unlocked(size_t additional_streams) const
-{
-  int prev_device = -1;
-  cudaGetDevice(&prev_device);
-  cudaSetDevice(_id.device_id);
-  for (size_t i = 0; i < additional_streams; ++i) {
-    _streams.emplace_back(std::make_unique<rmm::cuda_stream>());
-    _stream_in_use.emplace_back(false);
-  }
-  cudaSetDevice(prev_device);
-}
-
-rmm::cuda_stream_view memory_space::acquire_stream() const
-{
-  initialize_stream_pool_if_needed();
-  std::lock_guard<std::mutex> lg(_streams_mutex);
-  // Find a free stream
-  for (size_t i = 0; i < _streams.size(); ++i) {
-    if (!_stream_in_use[i]) {
-      _stream_in_use[i] = true;
-      return _streams[i]->view();
-    }
-  }
-  // Grow pool and return first new stream
-  size_t old_size = _streams.size();
-  size_t grow_by  = std::max<size_t>(1, old_size);  // double size (or at least +1)
-  grow_stream_pool_unlocked(grow_by);
-  _stream_in_use[old_size] = true;
-  return _streams[old_size]->view();
-}
-
-void memory_space::release_stream(rmm::cuda_stream_view stream) const
-{
-  std::lock_guard<std::mutex> lg(_streams_mutex);
-  for (size_t i = 0; i < _streams.size(); ++i) {
-    if (_streams[i] && _streams[i]->value() == stream.value()) {
-      _stream_in_use[i] = false;
-      return;
-    }
-  }
-  // If not found, ignore silently (defensive)
+  if (notification_channel_) { notification_channel_->shutdown(); }
 }
 
 //===----------------------------------------------------------------------===//
@@ -298,7 +251,7 @@ void memory_space::release_stream(rmm::cuda_stream_view stream) const
 size_t memory_space_hash::operator()(const memory_space& ms) const
 {
   return std::hash<int>{}(static_cast<int>(ms.get_tier())) ^
-         (std::hash<int>{}(ms.get_device_id()) << 1);
+         (std::hash<size_t>{}(ms.get_device_id()) << 1);
 }
 
 }  // namespace memory

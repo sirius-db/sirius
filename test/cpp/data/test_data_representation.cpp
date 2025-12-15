@@ -15,30 +15,33 @@
  */
 
 #include "catch.hpp"
-#include <memory>
-#include <vector>
+#include "data/common.hpp"
 #include "data/cpu_data_representation.hpp"
 #include "data/gpu_data_representation.hpp"
-#include "data/common.hpp"
-#include "memory/null_device_memory_resource.hpp"
-#include "memory/host_table.hpp"
+#include "memory/common.hpp"
 #include "memory/fixed_size_host_memory_resource.hpp"
-
-#include <cudf/column/column_factories.hpp>
-#include <cudf/table/table.hpp>
-#include <cudf/types.hpp>
-#include <cudf/contiguous_split.hpp>
-#include <rmm/cuda_stream_view.hpp>
-#include <cuda_runtime_api.h>
-#include <rmm/cuda_stream.hpp>
-#include <iostream>
-#include <iomanip>
-
-#include "memory/memory_reservation.hpp"
-#include "memory_management/memory_test_common.hpp"
+#include "memory/host_table.hpp"
+#include "memory/memory_reservation_manager.hpp"
+#include "memory/null_device_memory_resource.hpp"
 #include "utils/cudf_test_utils.hpp"
 
+#include <cudf/column/column_factories.hpp>
+#include <cudf/contiguous_split.hpp>
+#include <cudf/table/table.hpp>
+#include <cudf/types.hpp>
+
+#include <rmm/cuda_stream.hpp>
+#include <rmm/cuda_stream_view.hpp>
+
+#include <cuda_runtime_api.h>
+
+#include <iomanip>
+#include <iostream>
+
 // Declarations provided by utils/cudf_test_utils.hpp
+
+#include <memory>
+#include <vector>
 
 using namespace sirius;
 
@@ -121,8 +124,10 @@ static void initialize_memory_for_conversions()
   using namespace sirius::memory;
   memory_reservation_manager::reset_for_testing();
   std::vector<memory_reservation_manager::memory_space_config> configs;
-  configs.emplace_back(Tier::GPU, 0, 2048ull * 1024 * 1024, create_test_allocators(Tier::GPU));
-  configs.emplace_back(Tier::HOST, 0, 4096ull * 1024 * 1024, create_test_allocators(Tier::HOST));
+  configs.emplace_back(
+    Tier::GPU, 0, 2048ull * 1024 * 1024, make_default_allocator_for_tier(Tier::GPU));
+  configs.emplace_back(
+    Tier::HOST, 0, 4096ull * 1024 * 1024, make_default_allocator_for_tier(Tier::HOST));
   memory_reservation_manager::initialize(std::move(configs));
 }
 
@@ -257,7 +262,6 @@ TEST_CASE("host_table_representation converts to GPU and preserves contents",
   // Compare using the same stream used for conversion to avoid cross-stream hazards
   sirius::test::expect_cudf_tables_equal_on_stream(
     original, gpu_repr.get_table(), pack_stream.view());
-  const_cast<memory::memory_space*>(gpu_space)->release_stream(gpu_stream);
 }
 
 // =============================================================================
@@ -372,10 +376,10 @@ TEST_CASE("gpu->host->gpu roundtrip preserves cudf table contents", "[gpu_data_r
   auto cpu_any      = repr.convert_to_memory_space(host_space, chain_stream);
   // Debug: dump host bytes before converting back to GPU
   {
-    auto& host_repr_dbg   = cpu_any->cast<host_table_representation>();
-    auto host_alloc_uptr  = host_repr_dbg.get_host_table();
-    const auto data_size  = host_alloc_uptr->data_size;
-    const auto block_size = host_alloc_uptr->allocation.block_size;
+    auto& host_repr_dbg         = cpu_any->cast<host_table_representation>();
+    const auto& host_alloc_uptr = host_repr_dbg.get_host_table();
+    const auto data_size        = host_alloc_uptr->data_size;
+    const auto block_size       = host_alloc_uptr->allocation->block_size;
     std::vector<uint8_t> host_bytes;
     host_bytes.resize(data_size);
     size_t copied = 0, block_idx = 0, block_off = 0;
@@ -500,8 +504,8 @@ static void initialize_multi_gpu_for_conversions(int dev_a, int dev_b)
   using namespace sirius::memory;
   memory_reservation_manager::reset_for_testing();
   std::vector<memory_reservation_manager::memory_space_config> configs;
-  configs.emplace_back(Tier::GPU, dev_a, 2048ull * 1024 * 1024, create_test_allocators(Tier::GPU));
-  configs.emplace_back(Tier::GPU, dev_b, 2048ull * 1024 * 1024, create_test_allocators(Tier::GPU));
+  configs.emplace_back(Tier::GPU, dev_a, 2048ull * 1024 * 1024);
+  configs.emplace_back(Tier::GPU, dev_b, 2048ull * 1024 * 1024);
   memory_reservation_manager::initialize(std::move(configs));
 }
 
@@ -538,8 +542,6 @@ TEST_CASE("gpu cross-device conversion when multiple GPUs are available",
   // Compare content equality using the same stream used for transfer
   sirius::test::expect_cudf_tables_equal_on_stream(
     src_repr.get_table(), dst_repr.get_table(), xfer_stream);
-
-  const_cast<memory::memory_space*>(src_space)->release_stream(xfer_stream);
 }
 // =============================================================================
 // idata_representation Interface Tests
@@ -750,3 +752,5 @@ TEST_CASE("Representations polymorphism", "[cpu_data_representation][gpu_data_re
   REQUIRE(representations[0]->get_size_in_bytes() == 1024);
   REQUIRE(representations[1]->get_size_in_bytes() > 0);
 }
+
+//  */

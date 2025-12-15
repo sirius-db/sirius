@@ -15,9 +15,10 @@
  */
 
 #include "data/data_batch.hpp"
+
 #include "data/data_batch_view.hpp"
 #include "data/gpu_data_representation.hpp"
-#include "memory/memory_reservation.hpp"
+#include "memory/memory_reservation_manager.hpp"
 
 namespace sirius {
 

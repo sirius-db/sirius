@@ -37,9 +37,9 @@
 using namespace sirius::memory;
 
 // Test topology discovery
-TEST_CASE("Topology Discovery", "[memory_space]")
+TEST_CASE("Topology Discovery", "[hw_topology]")
 {
-  TopologyDiscovery discovery;
+  topology_discovery discovery;
 
   // Call discover() method
   bool success = discovery.discover();
@@ -61,10 +61,8 @@ TEST_CASE("Topology Discovery", "[memory_space]")
   REQUIRE(topology.gpus.size() == topology.num_gpus);
 
   // If GPUs are present, verify their information
-  if (topology.num_gpus > 0)
-  {
-    for (const auto& gpu : topology.gpus)
-    {
+  if (topology.num_gpus > 0) {
+    for (const auto& gpu : topology.gpus) {
       REQUIRE(!gpu.name.empty());
       REQUIRE(!gpu.pci_bus_id.empty());
       REQUIRE(!gpu.uuid.empty());
@@ -77,8 +75,7 @@ TEST_CASE("Topology Discovery", "[memory_space]")
   REQUIRE(topology.network_devices.size() == static_cast<size_t>(topology.num_network_devices));
 
   // If network devices are present, verify their information
-  for (const auto& net_dev : topology.network_devices)
-  {
+  for (const auto& net_dev : topology.network_devices) {
     REQUIRE(!net_dev.name.empty());
     // NUMA node may be -1 if unknown
     REQUIRE(net_dev.numa_node >= -1);

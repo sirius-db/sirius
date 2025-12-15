@@ -16,13 +16,13 @@
 
 #pragma once
 
+#include "helper/helper.hpp"
+#include "memory/memory_space.hpp"
+
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/mr/device/device_memory_resource.hpp>
-#include "memory/memory_space.hpp"
-#include "helper/helper.hpp"
 
-namespace sirius
-{
+namespace sirius {
 
 /**
  * @brief Interface representing a data representation residing in a specific memory tier.
@@ -34,17 +34,14 @@ namespace sirius
  * See representation_converter.hpp for utilities to convert between different underlying
  * representations.
  */
-class idata_representation
-{
-public:
+class idata_representation {
+ public:
   /**
    * @brief Construct a new idata_representation object
    *
    * @param memory_space The memory space where the data resides
    */
-  idata_representation(sirius::memory::memory_space& memory_space)
-      : _memory_space(memory_space)
-  {}
+  idata_representation(sirius::memory::memory_space& memory_space) : _memory_space(memory_space) {}
 
   /**
    * @brief Virtual destructor to ensure proper cleanup of derived classes
@@ -56,20 +53,14 @@ public:
    *
    * @return Tier The memory tier
    */
-  memory::Tier get_current_tier() const
-  {
-    return _memory_space.get_tier();
-  }
+  memory::Tier get_current_tier() const { return _memory_space.get_tier(); }
 
   /**
    * @brief Get the device ID where the data resides
    *
    * @return device_id The device ID
    */
-  int get_device_id() const
-  {
-    return _memory_space.get_device_id();
-  }
+  int get_device_id() const { return _memory_space.get_device_id(); }
 
   /**
    * @brief Get the size of the data representation in bytes
@@ -86,9 +77,8 @@ public:
    * @return sirius::unique_ptr<idata_representation> A new data representation in the target memory
    * space
    */
-  virtual sirius::unique_ptr<idata_representation>
-  convert_to_memory_space(const sirius::memory::memory_space* target_memory_space,
-                          rmm::cuda_stream_view stream) = 0;
+  virtual sirius::unique_ptr<idata_representation> convert_to_memory_space(
+    const sirius::memory::memory_space* target_memory_space, rmm::cuda_stream_view stream) = 0;
 
   /**
    * @brief Safely casts this interface to a specific derived type
@@ -114,8 +104,8 @@ public:
     return reinterpret_cast<const TargetType&>(*this);
   }
 
-private:
-  sirius::memory::memory_space& _memory_space; ///< The memory space where the data resides
+ private:
+  sirius::memory::memory_space& _memory_space;  ///< The memory space where the data resides
 };
 
-} // namespace sirius
+}  // namespace sirius

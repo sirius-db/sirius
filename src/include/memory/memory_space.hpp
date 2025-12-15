@@ -17,51 +17,30 @@
 #pragma once
 
 #include "memory/common.hpp"
-#include <mutex>
-#include <condition_variable>
-#include <atomic>
+#include "memory/disk_access_limiter.hpp"
+#include "memory/notification_channel.hpp"
+
+#include <concepts>
+#include <cstdint>
+#include <cstring>
 #include <memory>
-#include <vector>
 #include <string>
+#include <variant>
 
 // RMM includes for memory resource management
+#include <rmm/cuda_stream.hpp>
+#include <rmm/cuda_stream_pool.hpp>
+#include <rmm/cuda_stream_view.hpp>
 #include <rmm/mr/device/device_memory_resource.hpp>
 #include <rmm/resource_ref.hpp>
-#include <rmm/cuda_stream_view.hpp>
-#include <rmm/cuda_stream.hpp>
 
 namespace sirius {
 namespace memory {
 
 // Forward declaration
 struct reservation;
-
-struct memory_space_id {
-  Tier tier;
-  int device_id;
-  memory_space_id(Tier tier, int device_id) : tier(tier), device_id(device_id) {}
-  bool operator==(const memory_space_id& other) const
-  {
-    return tier == other.tier && device_id == other.device_id;
-  }
-  bool operator!=(const memory_space_id& other) const { return !(*this == other); }
-  bool operator<(const memory_space_id& other) const
-  {
-    return tier < other.tier || (tier == other.tier && device_id < other.device_id);
-  }
-  bool operator>(const memory_space_id& other) const
-  {
-    return tier > other.tier || (tier == other.tier && device_id > other.device_id);
-  }
-  bool operator<=(const memory_space_id& other) const
-  {
-    return tier < other.tier || (tier == other.tier && device_id <= other.device_id);
-  }
-  bool operator>=(const memory_space_id& other) const
-  {
-    return tier > other.tier || (tier == other.tier && device_id >= other.device_id);
-  }
-};
+struct reservation_aware_resource_adaptor;
+struct fixed_size_host_memory_resource;
 
 /**
  * memory_space represents a specific memory location identified by a tier and device ID.
@@ -78,15 +57,19 @@ class memory_space {
   /**
    * Construct a memory_space with the given parameters.
    *
-   * @param id The memory_space identifier (tier + device)
+   * @param tier The memory tier (GPU, HOST, DISK)
+   * @param device_id The device identifier within the tier
    * @param memory_limit Maximum memory capacity in bytes
-   * @param allocators Vector of RMM memory allocators (must be non-empty)
+   * @param capacity Total memory capacity in bytes (optional [default: device capacity])
+   * @param allocator RMM memory allocator (must be non-empty)
    */
-  memory_space(memory_space_id id,
+  memory_space(Tier tier,
+               int device_id,
                size_t memory_limit,
                size_t start_downgrading_memory_threshold,
                size_t stop_downgrading_memory_threshold,
-               std::vector<std::unique_ptr<rmm::mr::device_memory_resource>> allocators);
+               size_t capacity,
+               std::unique_ptr<rmm::mr::device_memory_resource> allocator);
 
   // Disable copy/move to ensure stable addresses for reservations
   memory_space(const memory_space&)            = delete;
@@ -94,89 +77,73 @@ class memory_space {
   memory_space(memory_space&&)                 = delete;
   memory_space& operator=(memory_space&&)      = delete;
 
-  ~memory_space() = default;
+  ~memory_space();
 
   // Comparison operators
   bool operator==(const memory_space& other) const;
   bool operator!=(const memory_space& other) const;
 
   // Basic properties
-  memory_space_id get_id() const;
-  Tier get_tier() const;
-  int get_device_id() const;
+  memory_space_id get_id() const noexcept;
+  Tier get_tier() const noexcept;
+  int get_device_id() const noexcept;
 
   // Reservation management - these are the core methods that do the actual work
-  std::unique_ptr<reservation> request_reservation(size_t size);
-  void release_reservation(std::unique_ptr<reservation> res);
+  std::unique_ptr<reservation> make_reservation_or_null(size_t size);
+  std::unique_ptr<reservation> make_reservation_upto(size_t size);
+  std::unique_ptr<reservation> make_reservation(size_t size);
+  rmm::cuda_stream_view acquire_stream() const;
 
-  bool shrink_reservation(reservation* res, size_t new_size);
-  bool grow_reservation(reservation* res, size_t new_size);
-
-  // State queries
-  size_t get_available_memory() const;
-  size_t get_total_reserved_memory() const;
-  size_t get_max_memory() const;
-  size_t get_active_reservation_count() const;
+  std::size_t get_active_reservation_count() const;
   bool should_downgrade_memory() const;
   bool should_stop_downgrading_memory() const;
   size_t get_amount_to_downgrade() const;
 
-  // Allocator management
-  rmm::device_async_resource_ref get_default_allocator() const;
-  rmm::device_async_resource_ref get_allocator(size_t index) const;
-  size_t get_allocator_count() const;
+  // State queries
+  size_t get_available_memory(rmm::cuda_stream_view stream) const;
+  size_t get_available_memory() const;
+  size_t get_total_reserved_memory() const;
+  size_t get_max_memory() const noexcept;
 
-  /**
-   * @brief Attempt to retrieve the default allocator as a concrete type.
-   *
-   * Returns nullptr if the default allocator is not of the requested type.
-   */
+  // Allocator management
+  rmm::mr::device_memory_resource* get_default_allocator() const noexcept;
+
   template <typename T>
-  T* get_default_allocator_as() const
+    requires std::derived_from<T, rmm::mr::device_memory_resource>
+  T* get_memory_resource_as() const noexcept
   {
-    if (_allocators.empty()) { return nullptr; }
-    return dynamic_cast<T*>(_allocators[0].get());
+    return dynamic_cast<T*>(get_default_allocator());
   }
 
-  // Stream pool management
-  /**
-   * @brief Acquire a CUDA stream associated with this memory_space's device.
-   *        If all streams are in use, the pool grows.
-   */
-  rmm::cuda_stream_view acquire_stream() const;
-  /**
-   * @brief Release a CUDA stream back to the pool.
-   */
-  void release_stream(rmm::cuda_stream_view stream) const;
+  template <Tier TIER>
+  auto* get_memory_resource_of() const noexcept
+  {
+    return get_memory_resource_as<typename tier_memory_resource_trait<TIER>::type>();
+  }
 
   // Utility methods
-  bool can_reserve(size_t size) const;
   std::string to_string() const;
 
- private:
+  void shutdown();
+
+ protected:
+  friend struct reservation;
+
   const memory_space_id _id;
   const size_t _memory_limit;
   const size_t _start_downgrading_memory_threshold;
   const size_t _stop_downgrading_memory_threshold;
+  const size_t _capacity;
+  using reserving_adaptor_type = std::variant<std::unique_ptr<reservation_aware_resource_adaptor>,
+                                              std::unique_ptr<fixed_size_host_memory_resource>,
+                                              std::unique_ptr<disk_access_limiter>>;
+
+  std::shared_ptr<notification_channel> notification_channel_;
 
   // Memory resources owned by this memory_space
-  std::vector<std::unique_ptr<rmm::mr::device_memory_resource>> _allocators;
-
-  mutable std::mutex _mutex;
-  std::condition_variable _cv;
-
-  std::atomic<size_t> _total_reserved{0};
-  std::atomic<size_t> _active_count{0};
-
-  void wait_for_memory(size_t size, std::unique_lock<std::mutex>& lock);
-  bool validate_reservation(const reservation* res) const;
-
-  // Stream pool (GPU-only usage). Mutable to allow acquisition in const context.
-  mutable std::mutex _streams_mutex;
-  mutable std::vector<std::unique_ptr<rmm::cuda_stream>> _streams;
-  mutable std::vector<bool> _stream_in_use;
-  void initialize_stream_pool_if_needed() const;
-  void grow_stream_pool_unlocked(size_t additional_streams) const;
+  std::unique_ptr<rmm::mr::device_memory_resource> _allocator;
+  reserving_adaptor_type _reservation_allocator;
+  std::unique_ptr<rmm::cuda_stream_pool> stream_pool_;
 };
 
 /**

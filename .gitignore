@@ -28,3 +28,4 @@ cufile.log
 # pixi environments
 .pixi/*
 !.pixi/config.toml
+compile_commands.json
