@@ -7,7 +7,17 @@ env:
   SCCACHE_GHA_ENABLED: true
 
 jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+        with:
+          submodules: recursive
+      - name: Run pre-commit
+        uses: pre-commit/action@v3.0.1
   build:
+    needs: lint
     strategy:
       matrix:
         runs-on:
