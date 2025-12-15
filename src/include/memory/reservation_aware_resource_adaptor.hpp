@@ -53,26 +53,56 @@ namespace memory {
  */
 class reservation_aware_resource_adaptor : public rmm::mr::device_memory_resource {
  public:
+  struct device_reserved_arena : public reserved_arena {
+    friend class reservation_aware_resource_adaptor;
+
+    explicit device_reserved_arena(reservation_aware_resource_adaptor& mr,
+                                   std::size_t bytes,
+                                   std::unique_ptr<event_notifier> notifer)
+      : reserved_arena(bytes, std::move(notifer)), mr_(&mr)
+    {
+    }
+
+    ~device_reserved_arena() noexcept { mr_->do_release_reservation(this); }
+
+    bool grow_by(std::size_t additional_bytes) final
+    {
+      return mr_->grow_reservation_by(*this, additional_bytes);
+    }
+
+    void shrink_to_fit() final { mr_->shrink_reservation_to_fit(*this); }
+
+    [[nodiscard]] std::size_t get_available_memory() const noexcept
+    {
+      int64_t current = allocated_bytes.value();
+      int64_t size    = this->size();
+      int64_t outcome = current < size ? size - current : 0LL;
+      return outcome;
+    }
+
+    atomic_bounded_counter<std::int64_t> allocated_bytes{0LL};
+    atomic_peak_tracker<std::int64_t> peak_allocated_bytes{0LL};
+
+   private:
+    reservation_aware_resource_adaptor* mr_;
+  };
+
   /**
    * @brief Reservation state
    */
   struct stream_ordered_tracker_state {
-    std::atomic<std::int64_t> allocated_bytes{0};
-    std::atomic<std::int64_t> peak_allocated_bytes{0};   /// Peak allocated bytes observed
-    std::unique_ptr<reserved_arena> memory_reservation;  /// Stream memory reservation (may be null)
+    std::unique_ptr<device_reserved_arena>
+      memory_reservation;  /// Stream memory reservation (may be null)
     std::unique_ptr<reservation_limit_policy>
       reservation_policy;                             /// Reservation policy for this stream
     std::unique_ptr<oom_handling_policy> oom_policy;  /// out-of-memory handling policy
 
     friend class reservation_aware_resource_adaptor;
 
-    stream_ordered_tracker_state() = default;
-
-    [[nodiscard]] std::size_t get_available_memory() const noexcept
-    {
-      auto current = allocated_bytes.load();
-      return current < memory_reservation->size() ? memory_reservation->size() - current : 0UL;
-    }
+    explicit stream_ordered_tracker_state(
+      std::unique_ptr<device_reserved_arena> arena,
+      std::unique_ptr<reservation_limit_policy> reservation_policy,
+      std::unique_ptr<oom_handling_policy> oom_policy);
 
     /**
      * @brief Checks reservation and handles overflow for an allocation request.
@@ -99,7 +129,7 @@ class reservation_aware_resource_adaptor : public rmm::mr::device_memory_resourc
     virtual void reset_tracker_state(rmm::cuda_stream_view stream) = 0;
 
     virtual void assign_reservation_to_tracker(rmm::cuda_stream_view stream,
-                                               std::unique_ptr<reserved_arena> reservation,
+                                               std::unique_ptr<device_reserved_arena> reservation,
                                                std::unique_ptr<reservation_limit_policy> policy,
                                                std::unique_ptr<oom_handling_policy> oom_policy) = 0;
 
@@ -107,34 +137,6 @@ class reservation_aware_resource_adaptor : public rmm::mr::device_memory_resourc
 
     virtual const stream_ordered_tracker_state* get_tracker_state(
       rmm::cuda_stream_view stream) const = 0;
-  };
-
-  struct device_reserved_arena : public reserved_arena {
-    friend class reservation_aware_resource_adaptor;
-
-    explicit device_reserved_arena(reservation_aware_resource_adaptor& mr,
-                                   std::size_t bytes,
-                                   std::unique_ptr<event_notifier> notifer)
-      : reserved_arena(bytes, std::move(notifer)), mr_(&mr)
-    {
-    }
-
-    ~device_reserved_arena() noexcept { mr_->do_release_reservation(this); }
-
-    const stream_ordered_tracker_state* get_tracker_or_null() const noexcept { return tracker_; }
-
-    bool grow_by(std::size_t additional_bytes) final
-    {
-      return mr_->grow_reservation_by(*this, additional_bytes);
-    }
-
-    void shrink_to_fit() final { mr_->shrink_reservation_to_fit(*this); }
-
-   private:
-    void assign_tracker(const stream_ordered_tracker_state& tracker) { tracker_ = &tracker; }
-
-    reservation_aware_resource_adaptor* mr_;
-    const stream_ordered_tracker_state* tracker_{nullptr};
   };
 
   enum class AllocationTrackingScope {
@@ -202,6 +204,8 @@ class reservation_aware_resource_adaptor : public rmm::mr::device_memory_resourc
    * @brief Returns the available memory left in the resource
    */
   std::size_t get_available_memory(rmm::cuda_stream_view stream) const noexcept;
+
+  std::size_t get_available_memory_print(rmm::cuda_stream_view stream) const noexcept;
 
   /**
    * @brief Gets the currently allocated bytes for a specific stream.
@@ -410,14 +414,13 @@ class reservation_aware_resource_adaptor : public rmm::mr::device_memory_resourc
   const std::size_t _memory_limit;
   const std::size_t _capacity;
 
-  /// Per-stream allocation tracking
-  mutable std::mutex reservation_mutex;
-  std::set<const device_reserved_arena*> reservation_views;
   std::unique_ptr<allocation_tracker_iface> _allocation_tracker;
 
   /// Global totals for efficiency
-  std::atomic<std::size_t> _total_allocated_bytes{0};
-  std::atomic<std::size_t> _peak_total_allocated_bytes{0};
+  std::atomic<size_t> _total_reserved_bytes{0UL};
+  std::atomic<size_t> _number_of_allocations{0UL};
+  atomic_bounded_counter<std::size_t> _total_allocated_bytes{0UL};
+  atomic_peak_tracker<std::size_t> _peak_total_allocated_bytes{0UL};
 
   /// Default policy for new streams
   std::unique_ptr<reservation_limit_policy> _default_reservation_policy;

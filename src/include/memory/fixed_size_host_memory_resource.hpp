@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "memory/common.hpp"
 #include "memory/memory_reservation.hpp"
 #include "memory/notification_channel.hpp"
 
@@ -271,6 +272,12 @@ class fixed_size_host_memory_resource : public rmm::mr::device_memory_resource {
   [[nodiscard]] fixed_multiple_blocks_allocation allocate_multiple_blocks(
     std::size_t total_bytes, reservation* res = nullptr);
 
+  /**
+   * @brief Gets the peak total allocated bytes across all streams.
+   * @return The peak total allocated bytes
+   */
+  std::size_t get_peak_total_allocated_bytes() const;
+
  protected:
   /**
    * @brief grows reservation by a `bytes` size
@@ -354,7 +361,8 @@ class fixed_size_host_memory_resource : public rmm::mr::device_memory_resource {
   std::vector<void*> allocated_blocks_;           ///< All allocated blocks
   std::vector<void*> free_blocks_;                ///< Currently free blocks
   mutable std::mutex mutex_;
-  std::atomic<size_t> allocated_bytes_{0};
+  atomic_bounded_counter<size_t> allocated_bytes_{0};
+  atomic_peak_tracker<size_t> peak_allocated_bytes_{0};
 
   struct allocation_tracker {
     explicit allocation_tracker(std::size_t uid) : uuid(uid) {}

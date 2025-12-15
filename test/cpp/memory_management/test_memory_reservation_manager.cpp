@@ -29,6 +29,7 @@
  */
 
 #include "catch.hpp"
+#include "device_buffer.hpp"
 #include "memory/common.hpp"
 #include "memory/fixed_size_host_memory_resource.hpp"
 #include "memory/memory_reservation.hpp"
@@ -39,6 +40,7 @@
 #include <rmm/cuda_stream.hpp>
 #include <rmm/mr/device/cuda_memory_resource.hpp>
 
+#include <algorithm>
 #include <cstdlib>
 #include <memory>
 #include <vector>
@@ -206,6 +208,130 @@ TEST_CASE("Reservation Strategies with Single Device", "[memory_space]")
 
   // Should prefer HOST first
   REQUIRE(preference_reservation->tier() == Tier::HOST);
+}
+
+SCENARIO("multi-reservation memory_resource mismatch", "[memory_space]")
+{
+  initializeSingleDeviceMemoryManager();
+  auto& manager = memory_reservation_manager::get_instance();
+
+  const size_t res_size         = 1ull * 1024 * 1024;  // 1MB
+  const size_t small_alloc_size = res_size / 2;        // 512KB
+  const size_t large_alloc_size = res_size * 2;        // 2MB
+
+  GIVEN("Two reservations of 1MB each on different on different streams")
+  {
+    auto res1 = manager.request_reservation(specific_memory_space{Tier::GPU, 0}, res_size);
+    auto res2 = manager.request_reservation(specific_memory_space{Tier::GPU, 0}, res_size);
+
+    auto* mr = res1->get_memory_resource_of<Tier::GPU>();
+    rmm::cuda_stream stream1, stream2;
+
+    mr->attach_reservation_to_tracker(stream1, std::move(res1));
+    mr->attach_reservation_to_tracker(stream2, std::move(res2));
+
+    WHEN("releasing allocation from a different memory resource")
+    {
+      auto upstrem_leftover = mr->get_available_memory();
+      REQUIRE(mr->get_available_memory(stream1) == upstrem_leftover + res_size);
+      REQUIRE(mr->get_available_memory(stream2) == upstrem_leftover + res_size);
+      auto* buff1 = mr->allocate(small_alloc_size, stream1);
+      REQUIRE(mr->get_allocated_bytes(stream1) == small_alloc_size);
+      REQUIRE(mr->get_available_memory(stream1) ==
+              mr->get_available_memory() + res_size - small_alloc_size);
+
+      auto* buff2 = mr->allocate(large_alloc_size, stream2);
+      REQUIRE(mr->get_allocated_bytes(stream2) == large_alloc_size);
+      REQUIRE(mr->get_available_memory(stream2) == mr->get_available_memory());
+      THEN(
+        "allocations from another memory resource is abosrbed by other stream as extra reservation")
+      {
+        mr->deallocate(buff2, large_alloc_size, stream1);
+        CHECK(mr->get_available_memory_print(stream1) ==
+              mr->get_available_memory() + large_alloc_size + res_size - small_alloc_size);
+
+        mr->deallocate(buff1, small_alloc_size, stream2);
+        CHECK(mr->get_available_memory_print(stream2) == mr->get_available_memory());
+      }
+    }
+  }
+}
+
+SCENARIO("Peak Tracking On Streams with Reservation", "[memory_space][tracking]")
+{
+  initializeSingleDeviceMemoryManager();
+  auto& manager                 = memory_reservation_manager::get_instance();
+  const size_t reservation_size = 2048;
+  const size_t chunk_size       = 1024;
+
+  GIVEN("A reservation of specific size[= 2048] on GPU")
+  {
+    auto res = manager.request_reservation(specific_memory_space{Tier::GPU, 0}, reservation_size);
+    REQUIRE(res->size() == reservation_size);
+    REQUIRE(res->tier() == Tier::GPU);
+    auto* mr = res->get_memory_resource_of<Tier::GPU>();
+    REQUIRE(mr != nullptr);
+
+    rmm::cuda_stream other_streams;
+    rmm::cuda_stream reserved_stream;
+
+    std::vector<rmm::device_buffer> ptrs;
+    mr->attach_reservation_to_tracker(reserved_stream, std::move(res));
+
+    THEN("reservation is reflected in peak allocated bytes in upstream")
+    {
+      REQUIRE(mr->get_peak_total_allocated_bytes() == reservation_size);
+      REQUIRE(mr->get_peak_allocated_bytes(reserved_stream) == 0);
+      REQUIRE(mr->get_peak_allocated_bytes(other_streams) == 0);
+    }
+
+    WHEN("allocation within reservation on reserved stream, upstream peak doesn't change")
+    {
+      ptrs.emplace_back(chunk_size, reserved_stream, mr);  // within reservation
+
+      THEN("upstream peak allocated bytes remain the same, only stream peak changes")
+      {
+        REQUIRE(mr->get_peak_total_allocated_bytes() == reservation_size);
+        REQUIRE(mr->get_peak_allocated_bytes(reserved_stream) == chunk_size);
+        REQUIRE(mr->get_peak_allocated_bytes(other_streams) == 0);
+      }
+
+      WHEN("allocation is larger than reservation on reserved stream, upstream tracks it")
+      {
+        ptrs.emplace_back(chunk_size, reserved_stream, mr);  // within reservation
+        ptrs.emplace_back(chunk_size, reserved_stream, mr);  // exceeds reservation
+
+        THEN("peak allocated bytes are tracked correctly")
+        {
+          auto total_allocated_bytes = mr->get_total_allocated_bytes();
+          REQUIRE(total_allocated_bytes == 3 * chunk_size);
+          REQUIRE(mr->get_peak_total_allocated_bytes() == total_allocated_bytes);
+          REQUIRE(mr->get_peak_allocated_bytes(reserved_stream) == total_allocated_bytes);
+          REQUIRE(mr->get_peak_allocated_bytes(other_streams) == 0);
+        }
+
+        WHEN("allocations are freed")
+        {
+          std::size_t peak_stream_bytes = mr->get_peak_allocated_bytes(reserved_stream);
+
+          REQUIRE(mr->get_total_allocated_bytes() == 3 * chunk_size);
+          REQUIRE(mr->get_allocated_bytes(reserved_stream) == 3 * chunk_size);
+          mr->reset_stream_reservation(reserved_stream);
+          REQUIRE(mr->get_total_allocated_bytes() == 3 * chunk_size);
+          ptrs.clear();
+          REQUIRE(mr->get_total_allocated_bytes() == 0);
+
+          THEN("peak allocated bytes are tracked correctly")
+          {
+            REQUIRE(mr->get_peak_total_allocated_bytes() == peak_stream_bytes);
+            REQUIRE(mr->get_peak_allocated_bytes(reserved_stream) ==
+                    0);                                     // doesn't have a tracker attached
+            REQUIRE(mr->get_total_allocated_bytes() == 0);  // doesn't have a tracker attached
+          }
+        }
+      }
+    }
+  }
 }
 
 SCENARIO("Reservation Concepts on Single Gpu Manager", "[memory_space]")

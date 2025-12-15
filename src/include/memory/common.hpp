@@ -19,6 +19,8 @@
 #include <rmm/error.hpp>
 #include <rmm/mr/device/device_memory_resource.hpp>
 
+#include <atomic>
+#include <concepts>
 #include <cstdint>
 #include <cstring>
 #include <functional>
@@ -88,6 +90,108 @@ struct sirius_out_of_memory : public rmm::out_of_memory {
 
   const std::size_t requested_bytes;
   const std::size_t global_usage;
+};
+
+template <std::integral T>
+struct atomic_peak_tracker {
+  explicit atomic_peak_tracker(T initial_peak = 0) noexcept : peak_(initial_peak) {}
+
+  void reset(T new_peak = 0) noexcept { peak_.store(new_peak); }
+
+  [[nodiscard]] T peak() const noexcept { return peak_.load(); }
+
+  void update_peak(T current_value)
+  {
+    auto peak_value = peak_.load();
+    while (current_value > peak_value && !peak_.compare_exchange_weak(peak_value, current_value)) {}
+  }
+
+ private:
+  std::atomic<T> peak_{0};
+};
+
+template <std::integral T>
+struct atomic_bounded_counter {
+  explicit atomic_bounded_counter(T initial = 0) : value_(initial) {}
+
+  std::atomic<T>& native_handle() noexcept { return value_; }
+
+  std::atomic<T> const& native_handle() const noexcept { return value_; }
+
+  std::atomic<T>& operator*() noexcept { return native_handle(); }
+
+  std::atomic<T> const& operator*() const noexcept { return native_handle(); }
+
+  std::atomic<T>* operator->() noexcept { return &value_; }
+
+  std::atomic<T> const* operator->() const noexcept { return &value_; }
+
+  [[nodiscard]] T value(std::memory_order order = std::memory_order_seq_cst) const noexcept
+  {
+    return value_.load(order);
+  }
+
+  [[nodiscard]] T load(std::memory_order order = std::memory_order_seq_cst) const noexcept
+  {
+    return value_.load(order);
+  }
+
+  /// \@brief return updated value
+  T add(T diff, std::memory_order order = std::memory_order_seq_cst) noexcept
+  {
+    return value_.fetch_add(diff, order) + diff;
+  }
+
+  [[nodiscard]] std::pair<bool, T> try_add(T diff, T upper_bound)
+  {
+    auto current = value_.load();
+    while (true) {
+      if (upper_bound < current || (upper_bound - current) < diff) { return {false, current}; }
+      if (value_.compare_exchange_weak(current, current + diff)) { return {true, current + diff}; }
+    }
+  }
+
+  [[nodiscard]] T add_bounded(T& diff, T upper_bound)
+  {
+    auto current = value_.load();
+    while (current < upper_bound) {
+      T space_left = upper_bound - current;
+      diff         = std::min(diff, space_left);
+      if (value_.compare_exchange_weak(current, current + diff)) { return current + diff; }
+    }
+    diff = 0;
+    return current;
+  }
+
+  T sub(T diff, std::memory_order order = std::memory_order_seq_cst) noexcept
+  {
+    return value_.fetch_sub(diff, order) - diff;
+  }
+
+  [[nodiscard]] std::pair<bool, T> try_sub(T diff, T lower_bound)
+  {
+    auto current = value_.load();
+    while (true) {
+      if (current < lower_bound || (current - lower_bound) < diff) { return {false, current}; }
+      if (value_.compare_exchange_weak(current, current - diff)) { return {true, current - diff}; }
+    }
+  }
+
+  [[nodiscard]] T sub_bounded(T& diff, T lower_bound)
+  {
+    auto current = value_.load();
+    while (current > lower_bound) {
+      T space_above = current - lower_bound;
+      diff          = std::min(diff, space_above);
+
+      if (value_.compare_exchange_weak(current, current - diff)) { return current - diff; }
+    }
+    diff = 0;
+    return current;
+  }
+
+ private:
+  std::atomic<T> value_{0};
 };
 
 using DeviceMemoryResourceFactoryFn =

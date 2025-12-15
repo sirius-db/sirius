@@ -156,8 +156,9 @@ fixed_size_host_memory_resource::allocate_multiple_blocks(std::size_t total_byte
     }
   }
 
-  if (allocated_bytes_.fetch_add(upstream_tracked_bytes) + upstream_tracked_bytes <=
-      memory_capacity_) {
+  auto [success, post_allocation_size] =
+    allocated_bytes_.try_add(upstream_tracked_bytes, memory_capacity_);
+  if (success) {
     std::vector<std::byte*> allocated_blocks;
     allocated_blocks.reserve(num_blocks);
 
@@ -169,6 +170,8 @@ fixed_size_host_memory_resource::allocate_multiple_blocks(std::size_t total_byte
         for (std::byte* ptr : allocated_blocks) {
           free_blocks_.push_back(ptr);
         }
+        allocated_bytes_.sub(upstream_tracked_bytes);
+        if (tracker) tracker->allocated_bytes.fetch_sub(total_bytes);
         throw rmm::out_of_memory(
           "Not enough free blocks available in fixed_size_host_memory_resource and pool expansion "
           "failed.");
@@ -178,9 +181,9 @@ fixed_size_host_memory_resource::allocate_multiple_blocks(std::size_t total_byte
       free_blocks_.pop_back();
       allocated_blocks.push_back(ptr);
     }
+    peak_allocated_bytes_.update_peak(post_allocation_size);
     return multiple_blocks_allocation::create(std::move(allocated_blocks), *this, res);
   } else {
-    allocated_bytes_.fetch_sub(tracked_bytes);
     if (tracker) tracker->allocated_bytes.fetch_sub(total_bytes);
   }
   return std::unique_ptr<fixed_size_host_memory_resource::multiple_blocks_allocation>(nullptr);
@@ -249,7 +252,7 @@ void fixed_size_host_memory_resource::shrink_reservation_to_fit(reserved_arena& 
   auto current  = tracker.allocated_bytes.load();
   if (current < h_reservation_slot->size()) {
     auto old_res = std::exchange(h_reservation_slot->size_, current);
-    allocated_bytes_.fetch_sub(old_res - current);
+    allocated_bytes_.sub(old_res - current);
   }
 }
 
@@ -257,6 +260,11 @@ std::size_t fixed_size_host_memory_resource::get_active_reservation_count() cons
 {
   std::lock_guard lock(mutex_);
   return active_reservations_.size();
+}
+
+std::size_t fixed_size_host_memory_resource::get_peak_total_allocated_bytes() const
+{
+  return peak_allocated_bytes_.peak();
 }
 
 void fixed_size_host_memory_resource::expand_pool()
@@ -292,7 +300,7 @@ void fixed_size_host_memory_resource::release_reservation(chunked_reserved_area*
 
   auto current                = iter->second.allocated_bytes.load();
   std::size_t reclaimed_bytes = arena->size() > current ? arena->size() - current : 0;
-  allocated_bytes_.fetch_sub(reclaimed_bytes);
+  allocated_bytes_.sub(reclaimed_bytes);
   active_reservations_.erase(iter);
 }
 
@@ -313,33 +321,22 @@ void fixed_size_host_memory_resource::return_allocated_chunks(std::vector<std::b
       reclaimed_bytes = pre_reclaimation_size - arena->size();
     }
   }
-  allocated_bytes_.fetch_sub(reclaimed_bytes);
+  allocated_bytes_.sub(reclaimed_bytes);
 }
 
 bool fixed_size_host_memory_resource::do_reserve(std::size_t bytes, std::size_t mem_limit)
 {
-  auto pre_reservation_bytes = allocated_bytes_.load();
-  while (pre_reservation_bytes + bytes < mem_limit) {
-    if (allocated_bytes_.compare_exchange_weak(
-          pre_reservation_bytes, pre_reservation_bytes + bytes, std::memory_order_seq_cst)) {
-      return true;
-    }
-  }
-  return false;
+  auto [success, post_allocation_size] = allocated_bytes_.try_add(bytes, mem_limit);
+  if (success) { peak_allocated_bytes_.update_peak(post_allocation_size); }
+  return success;
 }
 
 std::size_t fixed_size_host_memory_resource::do_reserve_upto(std::size_t bytes,
                                                              std::size_t mem_limit)
 {
-  auto pre_reservation_bytes = allocated_bytes_.load();
-  while (pre_reservation_bytes < mem_limit) {
-    auto target = std::min(mem_limit, pre_reservation_bytes + bytes);
-    if (allocated_bytes_.compare_exchange_weak(
-          pre_reservation_bytes, target, std::memory_order_seq_cst)) {
-      return target - pre_reservation_bytes;
-    }
-  }
-  return 0;
+  auto post_allocation_size = allocated_bytes_.add_bounded(bytes, mem_limit);
+  if (bytes > 0) { peak_allocated_bytes_.update_peak(post_allocation_size); }
+  return bytes;
 }
 
 }  // namespace memory

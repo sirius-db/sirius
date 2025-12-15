@@ -179,8 +179,7 @@ struct reserved_arena {
   friend class fixed_size_host_memory_resource;
   friend class disk_access_limiter;
 
-  explicit reserved_arena(std::size_t len,
-                          std::unique_ptr<event_notifier> release_notifer = nullptr)
+  explicit reserved_arena(int64_t len, std::unique_ptr<event_notifier> release_notifer = nullptr)
     : size_(len), on_exit_(std::move(release_notifer))
   {
   }
@@ -191,10 +190,10 @@ struct reserved_arena {
 
   virtual void shrink_to_fit() = 0;
 
-  [[gnu::always_inline]] std::size_t size() const noexcept { return size_; }
+  [[gnu::always_inline]] int64_t size() const noexcept { return size_; }
 
  private:
-  std::size_t size_;
+  int64_t size_;
   const notify_on_exit on_exit_;
 };
 
