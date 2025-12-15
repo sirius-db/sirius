@@ -19,7 +19,6 @@
 #include "memory/common.hpp"
 #include "memory/disk_access_limiter.hpp"
 #include "memory/notification_channel.hpp"
-#include "memory/stream_pool.hpp"
 
 #include <concepts>
 #include <cstdint>
@@ -30,6 +29,7 @@
 
 // RMM includes for memory resource management
 #include <rmm/cuda_stream.hpp>
+#include <rmm/cuda_stream_pool.hpp>
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/mr/device/device_memory_resource.hpp>
 #include <rmm/resource_ref.hpp>
@@ -92,7 +92,7 @@ class memory_space {
   std::unique_ptr<reservation> make_reservation_or_null(size_t size);
   std::unique_ptr<reservation> make_reservation_upto(size_t size);
   std::unique_ptr<reservation> make_reservation(size_t size);
-  borrowed_stream acquire_stream() const;
+  rmm::cuda_stream_view acquire_stream() const;
 
   std::size_t get_active_reservation_count() const;
   bool should_downgrade_memory() const;
@@ -143,7 +143,7 @@ class memory_space {
   // Memory resources owned by this memory_space
   std::unique_ptr<rmm::mr::device_memory_resource> _allocator;
   reserving_adaptor_type _reservation_allocator;
-  std::unique_ptr<exclusive_stream_pool> stream_pool_;
+  std::unique_ptr<rmm::cuda_stream_pool> stream_pool_;
 };
 
 /**

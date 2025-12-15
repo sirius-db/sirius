@@ -542,8 +542,6 @@ TEST_CASE("gpu cross-device conversion when multiple GPUs are available",
   // Compare content equality using the same stream used for transfer
   sirius::test::expect_cudf_tables_equal_on_stream(
     src_repr.get_table(), dst_repr.get_table(), xfer_stream);
-
-  const_cast<memory::memory_space*>(src_space)->release_stream(xfer_stream);
 }
 // =============================================================================
 // idata_representation Interface Tests

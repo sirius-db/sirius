@@ -66,7 +66,7 @@ sirius::unique_ptr<idata_representation> gpu_table_representation::convert_to_me
 
     cudaSetDevice(target_device_id);
     rmm::device_uvector<uint8_t> dst_uvector(bytes_to_copy, target_stream, mr);
-    target_stream->synchronize();
+    target_stream.synchronize();
     // Restore previous device before peer copy
     cudaSetDevice(source_device_id);
 
@@ -88,9 +88,8 @@ sirius::unique_ptr<idata_representation> gpu_table_representation::convert_to_me
       cudf::unpack(new_metadata->data(), static_cast<uint8_t const*>(new_gpu_data->data()));
     auto new_table = cudf::table(new_table_view, target_stream, mr);
     // Restore previous device
-    target_stream.get().synchronize();
+    target_stream.synchronize();
     cudaSetDevice(source_device_id);
-    target_stream.reset();
 
     return sirius::make_unique<gpu_table_representation>(
       std::move(new_table), *const_cast<sirius::memory::memory_space*>(target_memory_space));
