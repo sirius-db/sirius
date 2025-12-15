@@ -15,6 +15,7 @@
  */
 
 #include "fallback.hpp"
+
 #include "duckdb/planner/expression/bound_between_expression.hpp"
 #include "duckdb/planner/expression/bound_case_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
@@ -31,15 +32,17 @@ namespace duckdb {
  * So far we fall back to duckdb:
  *   - whenever we meet regular expressions.
  */
-void FallbackChecker::Check() const {
-  for (const auto& pipeline: pipelines) {
-    for (const auto& op: pipeline->GetOperators()) {
+void FallbackChecker::Check() const
+{
+  for (const auto& pipeline : pipelines) {
+    for (const auto& op : pipeline->GetOperators()) {
       CheckOperator(op);
     }
   }
 }
 
-void FallbackChecker::CheckOperator(const GPUPhysicalOperator& op) const {
+void FallbackChecker::CheckOperator(const GPUPhysicalOperator& op) const
+{
   switch (op.type) {
     case PhysicalOperatorType::PROJECTION: {
       CheckOperator(op.Cast<GPUPhysicalProjection>());
@@ -48,13 +51,15 @@ void FallbackChecker::CheckOperator(const GPUPhysicalOperator& op) const {
   }
 }
 
-void FallbackChecker::CheckOperator(const GPUPhysicalProjection& op) const {
-  for (const auto& expr: op.select_list) {
+void FallbackChecker::CheckOperator(const GPUPhysicalProjection& op) const
+{
+  for (const auto& expr : op.select_list) {
     CheckExpression(*expr);
   }
 }
 
-void FallbackChecker::CheckExpression(const Expression& expr) const {
+void FallbackChecker::CheckExpression(const Expression& expr) const
+{
   switch (expr.GetExpressionClass()) {
     case ExpressionClass::BOUND_BETWEEN: {
       CheckExpression(expr.Cast<BoundBetweenExpression>());
@@ -87,49 +92,57 @@ void FallbackChecker::CheckExpression(const Expression& expr) const {
   }
 }
 
-void FallbackChecker::CheckExpression(const BoundBetweenExpression& expr) const {
+void FallbackChecker::CheckExpression(const BoundBetweenExpression& expr) const
+{
   CheckExpression(*expr.input);
   CheckExpression(*expr.lower);
   CheckExpression(*expr.upper);
 }
 
-void FallbackChecker::CheckExpression(const BoundCaseExpression& expr) const {
-  for (const auto& case_check: expr.case_checks) {
+void FallbackChecker::CheckExpression(const BoundCaseExpression& expr) const
+{
+  for (const auto& case_check : expr.case_checks) {
     CheckExpression(*case_check.when_expr);
     CheckExpression(*case_check.then_expr);
   }
   CheckExpression(*expr.else_expr);
 }
 
-void FallbackChecker::CheckExpression(const BoundCastExpression& expr) const {
+void FallbackChecker::CheckExpression(const BoundCastExpression& expr) const
+{
   CheckExpression(*expr.child);
 }
 
-void FallbackChecker::CheckExpression(const BoundComparisonExpression& expr) const {
+void FallbackChecker::CheckExpression(const BoundComparisonExpression& expr) const
+{
   CheckExpression(*expr.left);
   CheckExpression(*expr.right);
 }
 
-void FallbackChecker::CheckExpression(const BoundConjunctionExpression& expr) const {
-  for (const auto& child: expr.children) {
+void FallbackChecker::CheckExpression(const BoundConjunctionExpression& expr) const
+{
+  for (const auto& child : expr.children) {
     CheckExpression(*child);
   }
 }
 
-void FallbackChecker::CheckExpression(const BoundFunctionExpression& expr) const {
+void FallbackChecker::CheckExpression(const BoundFunctionExpression& expr) const
+{
   const auto& func_str = expr.function.name;
   if (func_str == REGEXP_REPLACE_FUNC_STR) {
-    throw InternalException("[Fallback checker] unsupported expression: %s", REGEXP_REPLACE_FUNC_STR);
+    throw InternalException("[Fallback checker] unsupported expression: %s",
+                            REGEXP_REPLACE_FUNC_STR);
   }
-  for (const auto& child: expr.children) {
+  for (const auto& child : expr.children) {
     CheckExpression(*child);
   }
 }
 
-void FallbackChecker::CheckExpression(const BoundOperatorExpression& expr) const {
-  for (const auto& child: expr.children) {
+void FallbackChecker::CheckExpression(const BoundOperatorExpression& expr) const
+{
+  for (const auto& child : expr.children) {
     CheckExpression(*child);
   }
 }
 
-}
+}  // namespace duckdb

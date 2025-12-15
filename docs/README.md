@@ -64,9 +64,9 @@ For aarch64 machine:
 sudo docker run --gpus all -it siriusdb/sirius_dependencies_aarch64:stable bash
 ```
 
-If encounting errors like the following when running the docker image as above:
+If encountering errors like the following when running the docker image as above:
 ```
-docker: Error response from daemon: could not select device driver “” with capabilities: [[gpu]].
+docker: Error response from daemon: could not select device driver "" with capabilities: [[gpu]].
 ```
 This means `nvidia-driver` or `nvidia-container-toolkit` is not installed.
 
@@ -100,7 +100,7 @@ nvidia-smi
 
 ### Install libcudf dependencies
 
-This approach requires cloning the repo following the instructions specifed in [Building Sirius](#building-sirius). 
+This approach requires cloning the repo following the instructions specified in [Building Sirius](#building-sirius).
 
 libcudf will be installed via conda/miniconda. Miniconda can be downloaded [here](https://www.anaconda.com/docs/getting-started/miniconda/install). After downloading miniconda, install libcudf by running these commands:
 ```
@@ -112,11 +112,11 @@ Set the environment variables `LIBCUDF_ENV_PREFIX` to the conda environment's pa
 ```
 export LIBCUDF_ENV_PREFIX={PATH to libcudf-env}
 ```
-It is recommended to add the environment variables to your `bashrc` to avoid repetition. 
+It is recommended to add the environment variables to your `bashrc` to avoid repetition.
 
 ## Dependencies (Option 4): Use Pixi
 
-There is a [Pixi](https://pixi.sh/) manifest available to set up an environment with all required dependencies installed. 
+There is a [Pixi](https://pixi.sh/) manifest available to set up an environment with all required dependencies installed.
 
 ### Requirements
 
@@ -159,7 +159,7 @@ To build Sirius:
 CMAKE_BUILD_PARALLEL_LEVEL={nproc} make
 ```
 
-Common issues: 
+Common issues:
 If you encounter an error such as:
 ```
 /usr/bin/ld: /home/ubuntu/miniconda3/envs/libcudf-env/lib/libcudf.so: undefined reference to `std::ios_base_library_init()@GLIBCXX_3.4.32'
@@ -188,7 +188,7 @@ source .venv/bin/activate
 
 ## Generating and Loading test datasets
 
-### TPC-H Dataset 
+### TPC-H Dataset
 
 To generate the TPC-H dataset
 ```
@@ -222,7 +222,7 @@ To load the dataset to duckdb:
 ```
 
 ## Running Sirius: CLI
-To run Sirius CLI, simply start the shell with `./build/release/duckdb {DATABASE_NAME}.duckdb`. 
+To run Sirius CLI, simply start the shell with `./build/release/duckdb {DATABASE_NAME}.duckdb`.
 From the duckdb shell, initialize the Sirius buffer manager with `call gpu_buffer_init`. This API accepts 2 parameters, the GPU caching region size and the GPU processing region size. The GPU caching region is a memory region where the raw data is stored in GPUs, whereas the GPU processing region is where intermediate results are stored in GPUs (hash tables, join results .etc).
 For example, to set the caching region as 1 GB and the processing region as 2 GB, we can run the following command:
 ```
@@ -334,12 +334,12 @@ build/release/extension/sirius/test/cpp/sirius_unittest "[cpu_cache]"
 build/release/extension/sirius/test/cpp/sirius_unittest "test_cpu_cache_basic_string_single_col"
 ```
 
-Any logs produced during test execution are saved in: 
+Any logs produced during test execution are saved in:
 ```
 build/release/extension/sirius/test/cpp/log
 ```
 
-Just like duckdb, we are using [Catch2](https://github.com/catchorg/Catch2) as our testing framework so more details about writing and running tests can be found there.  
+Just like duckdb, we are using [Catch2](https://github.com/catchorg/Catch2) as our testing framework so more details about writing and running tests can be found there.
 
 ## Performance Testing
 Make sure to build the duckdb-python package before running this test using the method described [here](https://github.com/sirius-db/sirius?tab=readme-ov-file#building-sirius). To test Sirius performance against DuckDB across all 22 TPC-H queries, run the following command (replace {SF} with the desired scale factor):

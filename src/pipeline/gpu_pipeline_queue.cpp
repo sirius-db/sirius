@@ -15,41 +15,42 @@
  */
 
 #include "pipeline/gpu_pipeline_queue.hpp"
+
 #include "config.hpp"
 
 namespace sirius {
 namespace parallel {
 
-void gpu_pipeline_queue::open() {
-    _is_open.store(true, std::memory_order_release);
+void gpu_pipeline_queue::open() { _is_open.store(true, std::memory_order_release); }
+
+void gpu_pipeline_queue::close()
+{
+  _is_open.store(false, std::memory_order_release);
+  // Wake up all threads blocked in wait_dequeue by pushing nullptr sentinels
+  for (size_t i = 0; i < _num_threads; ++i) {
+    _task_queue.enqueue(nullptr);
+  }
 }
 
-void gpu_pipeline_queue::close() {
-    _is_open.store(false, std::memory_order_release);
-    // Wake up all threads blocked in wait_dequeue by pushing nullptr sentinels
-    for (size_t i = 0; i < _num_threads; ++i) {
-        _task_queue.enqueue(nullptr);
-    }
+void gpu_pipeline_queue::push(sirius::unique_ptr<itask> task)
+{
+  _task_queue.enqueue(std::move(task));
 }
 
-void gpu_pipeline_queue::push(sirius::unique_ptr<itask> task) {
-    _task_queue.enqueue(std::move(task));
+sirius::unique_ptr<itask> gpu_pipeline_queue::pull()
+{
+  sirius::unique_ptr<itask> task;
+  while (true) {
+    if (_task_queue.try_dequeue(task)) { return task; }
+
+    // If the queue is closed and empty, return nullptr to indicate no more tasks.
+    if (!_is_open.load(std::memory_order_acquire)) { return nullptr; }
+
+    // Otherwise, wait for a task to become available.
+    _task_queue.wait_dequeue(task);
+    if (task) { return task; }
+  }
 }
 
-sirius::unique_ptr<itask> gpu_pipeline_queue::pull() {
-    sirius::unique_ptr<itask> task;
-    while (true) {
-        if (_task_queue.try_dequeue(task)) { return task; }
-
-        // If the queue is closed and empty, return nullptr to indicate no more tasks.
-        if (!_is_open.load(std::memory_order_acquire)) { return nullptr; }
-
-        // Otherwise, wait for a task to become available.
-        _task_queue.wait_dequeue(task);
-        if (task) { return task; }
-    }
-}
-
-} // namespace parallel
-} // namespace sirius
-
+}  // namespace parallel
+}  // namespace sirius

@@ -17,8 +17,9 @@
 #pragma once
 
 #include <cuda_runtime.h>
-#include <cstdint>
+
 #include <cstddef>
+#include <cstdint>
 
 #ifdef __cplusplus
 extern "C" {
@@ -26,11 +27,11 @@ extern "C" {
 
 /**
  * @brief Performs memory work on GPU memory using CUDA kernels.
- * 
+ *
  * This function launches CUDA kernels to write patterns to GPU memory,
  * read the data back, and compute a checksum. This ensures actual work
  * is performed on the GPU memory and prevents compiler optimizations.
- * 
+ *
  * @param gpu_ptr Pointer to GPU memory (must be device memory)
  * @param size_bytes Size of the memory region in bytes
  * @param result_checksum Output parameter for the computed checksum
@@ -40,10 +41,10 @@ cudaError_t performGpuMemoryWork(void* gpu_ptr, size_t size_bytes, uint64_t* res
 
 /**
  * @brief Verifies that GPU memory work was performed correctly.
- * 
+ *
  * This function launches kernels to verify the memory contains the expected
  * patterns and computes a verification checksum.
- * 
+ *
  * @param gpu_ptr Pointer to GPU memory (must be device memory)
  * @param size_bytes Size of the memory region in bytes
  * @param verification_checksum Output parameter for the verification checksum

@@ -16,8 +16,8 @@
 
 #pragma once
 
-#include <rmm/mr/device/device_memory_resource.hpp>
 #include <rmm/cuda_stream_view.hpp>
+#include <rmm/mr/device/device_memory_resource.hpp>
 
 namespace sirius {
 namespace memory {
@@ -28,19 +28,19 @@ namespace memory {
  * - deallocate is a no-op
  */
 class null_device_memory_resource : public rmm::mr::device_memory_resource {
-public:
-    null_device_memory_resource() = default;
-    ~null_device_memory_resource() override = default;
+ public:
+  null_device_memory_resource()           = default;
+  ~null_device_memory_resource() override = default;
 
-protected:
-    void* do_allocate(std::size_t bytes, rmm::cuda_stream_view stream) override { return nullptr; }
-    void do_deallocate(void* p, std::size_t bytes, rmm::cuda_stream_view stream) noexcept override {}
-    [[nodiscard]] bool do_is_equal(const rmm::mr::device_memory_resource& other) const noexcept override {
-        return this == &other;
-    }
+ protected:
+  void* do_allocate(std::size_t bytes, rmm::cuda_stream_view stream) override { return nullptr; }
+  void do_deallocate(void* p, std::size_t bytes, rmm::cuda_stream_view stream) noexcept override {}
+  [[nodiscard]] bool do_is_equal(
+    const rmm::mr::device_memory_resource& other) const noexcept override
+  {
+    return this == &other;
+  }
 };
 
-} // namespace memory
-} // namespace sirius
-
-
+}  // namespace memory
+}  // namespace sirius

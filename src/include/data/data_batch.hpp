@@ -15,13 +15,14 @@
  */
 
 #pragma once
-#include <variant>
-#include <memory>
-#include <stdexcept>
+#include "data/common.hpp"
+#include "helper/helper.hpp"
+
 #include <cudf/table/table.hpp>
 
-#include "helper/helper.hpp"
-#include "data/common.hpp"
+#include <memory>
+#include <stdexcept>
+#include <variant>
 
 namespace sirius {
 namespace memory {

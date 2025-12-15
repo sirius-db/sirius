@@ -18,14 +18,13 @@
 
 namespace sirius {
 
-void downgrade_task_creator::schedule(sirius::unique_ptr<parallel::downgrade_task> downgrade_task) {
-    // Downgrade-specific scheduling logic
-    // Schedule the downgrade task using the downgrade_task_queue
-    _downgrade_exec.schedule(std::move(downgrade_task));
+void downgrade_task_creator::schedule(sirius::unique_ptr<parallel::downgrade_task> downgrade_task)
+{
+  // Downgrade-specific scheduling logic
+  // Schedule the downgrade task using the downgrade_task_queue
+  _downgrade_exec.schedule(std::move(downgrade_task));
 }
 
-void downgrade_task_creator::worker_loop() {
+void downgrade_task_creator::worker_loop() {}
 
-}
-
-} // namespace sirius
+}  // namespace sirius

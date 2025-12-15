@@ -421,8 +421,8 @@ void* reservation_aware_resource_adaptor::do_allocate_unmanaged(std::size_t allo
                                                                 std::size_t tracking_bytes,
                                                                 rmm::cuda_stream_view stream)
 {
-  auto [sucess, post_allocation_size] = _total_allocated_bytes.try_add(tracking_bytes, _capacity);
-  if (sucess) {
+  auto [success, post_allocation_size] = _total_allocated_bytes.try_add(tracking_bytes, _capacity);
+  if (success) {
     _peak_total_allocated_bytes.update_peak(post_allocation_size);
     try {
       return _upstream.allocate_async(allocation_bytes, stream);

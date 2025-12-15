@@ -19,46 +19,42 @@
 namespace sirius {
 namespace parallel {
 
-void itask_executor::start() {
+void itask_executor::start()
+{
   bool expected = false;
-  if (!_running.compare_exchange_strong(expected, true)) {
-    return;
-  }
+  if (!_running.compare_exchange_strong(expected, true)) { return; }
   on_start();
   _threads.reserve(_config.num_threads);
   for (int i = 0; i < _config.num_threads; ++i) {
-    _threads.push_back(
-      sirius::make_unique<task_executor_thread>(sirius::make_unique<sirius::thread>(&itask_executor::worker_loop, this, i)));
+    _threads.push_back(sirius::make_unique<task_executor_thread>(
+      sirius::make_unique<sirius::thread>(&itask_executor::worker_loop, this, i)));
   }
 }
 
-void itask_executor::stop() {
+void itask_executor::stop()
+{
   bool expected = true;
-  if (!_running.compare_exchange_strong(expected, false)) {
-    return;
-  }
+  if (!_running.compare_exchange_strong(expected, false)) { return; }
   on_stop();
   for (auto& thread : _threads) {
-    if (thread->_internal_thread->joinable()) {
-      thread->_internal_thread->join();
-    }
+    if (thread->_internal_thread->joinable()) { thread->_internal_thread->join(); }
   }
   _threads.clear();
 }
 
-void itask_executor::schedule(sirius::unique_ptr<itask> task) {
+void itask_executor::schedule(sirius::unique_ptr<itask> task)
+{
   _task_queue->push(std::move(task));
 }
 
-void itask_executor::on_start() {
-  _task_queue->open();
-}
+void itask_executor::on_start() { _task_queue->open(); }
 
-void itask_executor::on_stop() {
-  _task_queue->close();
-}
+void itask_executor::on_stop() { _task_queue->close(); }
 
-void itask_executor::on_task_error(int worker_id, sirius::unique_ptr<itask> task, const std::exception& e) {
+void itask_executor::on_task_error(int worker_id,
+                                   sirius::unique_ptr<itask> task,
+                                   const std::exception& e)
+{
   if (_config.retry_on_error) {
     schedule(std::move(task));
   } else {
@@ -66,7 +62,8 @@ void itask_executor::on_task_error(int worker_id, sirius::unique_ptr<itask> task
   }
 }
 
-void itask_executor::worker_loop(int worker_id) {
+void itask_executor::worker_loop(int worker_id)
+{
   while (true) {
     if (!_running.load()) {
       // Executor is stopped.
@@ -85,5 +82,5 @@ void itask_executor::worker_loop(int worker_id) {
   }
 }
 
-} // namespace parallel
-} // namespace sirius
+}  // namespace parallel
+}  // namespace sirius

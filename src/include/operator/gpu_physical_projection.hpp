@@ -16,21 +16,23 @@
 
 #pragma once
 
-#include "gpu_physical_operator.hpp"
 #include "duckdb/planner/expression.hpp"
+#include "gpu_physical_operator.hpp"
 
 namespace duckdb {
 
 class GPUPhysicalProjection : public GPUPhysicalOperator {
-public:
-	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::PROJECTION;
+ public:
+  static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::PROJECTION;
 
-public:
-	GPUPhysicalProjection(vector<LogicalType> types, vector<unique_ptr<Expression>> select_list,
-	                   idx_t estimated_cardinality);
+ public:
+  GPUPhysicalProjection(vector<LogicalType> types,
+                        vector<unique_ptr<Expression>> select_list,
+                        idx_t estimated_cardinality);
 
-	vector<unique_ptr<Expression>> select_list;
+  vector<unique_ptr<Expression>> select_list;
 
-	OperatorResultType Execute(GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation) const override;
+  OperatorResultType Execute(GPUIntermediateRelation& input_relation,
+                             GPUIntermediateRelation& output_relation) const override;
 };
-} // namespace duckdb
+}  // namespace duckdb

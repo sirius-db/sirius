@@ -17,10 +17,10 @@
 #pragma once
 
 #include "duckdb/execution/physical_operator.hpp"
-#include "gpu_physical_operator.hpp"
-#include "operator/gpu_physical_hash_join.hpp"
-#include "operator/gpu_physical_grouped_aggregate.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "gpu_physical_operator.hpp"
+#include "operator/gpu_physical_grouped_aggregate.hpp"
+#include "operator/gpu_physical_hash_join.hpp"
 #include "operator/gpu_physical_order.hpp"
 #include "operator/gpu_physical_top_n.hpp"
 
@@ -29,24 +29,27 @@
 namespace duckdb {
 
 class GPUPhysicalPartition : public GPUPhysicalOperator {
-public:
-	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::INVALID;
+ public:
+  static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::INVALID;
 
-	explicit GPUPhysicalPartition(vector<LogicalType> types, idx_t estimated_cardinality, GPUPhysicalOperator* parent_op, bool is_build = false);
+  explicit GPUPhysicalPartition(vector<LogicalType> types,
+                                idx_t estimated_cardinality,
+                                GPUPhysicalOperator* parent_op,
+                                bool is_build = false);
 
-  	string GetName() const override;
+  string GetName() const override;
 
-	bool IsSource() const override;
+  bool IsSource() const override;
 
-    bool IsSink() const override;
+  bool IsSink() const override;
 
-	bool isBuildPartition();
+  bool isBuildPartition();
 
-private:
-	void GetPartitionKeys(GPUPhysicalOperator* op, bool is_build = false);
-	GPUPhysicalOperator* _parent_op;
-    vector<idx_t> _partition_keys;
-	idx_t _num_partitions;
-	bool _is_build;
+ private:
+  void GetPartitionKeys(GPUPhysicalOperator* op, bool is_build = false);
+  GPUPhysicalOperator* _parent_op;
+  vector<idx_t> _partition_keys;
+  idx_t _num_partitions;
+  bool _is_build;
 };
-} // namespace duckdb
+}  // namespace duckdb

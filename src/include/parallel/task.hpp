@@ -26,65 +26,72 @@ namespace parallel {
  * Interface for concrete task local states.
  */
 class itask_local_state {
-public:
+ public:
   virtual ~itask_local_state() = default;
 
-	template <class TargetType>
-	TargetType &cast() {
-		DynamicCastCheck<TargetType>(this);
-		return reinterpret_cast<TargetType &>(*this);
-	}
+  template <class TargetType>
+  TargetType& cast()
+  {
+    DynamicCastCheck<TargetType>(this);
+    return reinterpret_cast<TargetType&>(*this);
+  }
 
-	template <class TargetType>
-	const TargetType &cast() const {
-		DynamicCastCheck<TargetType>(this);
-		return reinterpret_cast<const TargetType &>(*this);
-	}
+  template <class TargetType>
+  const TargetType& cast() const
+  {
+    DynamicCastCheck<TargetType>(this);
+    return reinterpret_cast<const TargetType&>(*this);
+  }
 };
 
 /**
  * Interface for concrete task global states.
  */
 class itask_global_state {
-public:
+ public:
   virtual ~itask_global_state() = default;
 
   template <class TargetType>
-	TargetType &cast() {
-		DynamicCastCheck<TargetType>(this);
-		return reinterpret_cast<TargetType &>(*this);
-	}
+  TargetType& cast()
+  {
+    DynamicCastCheck<TargetType>(this);
+    return reinterpret_cast<TargetType&>(*this);
+  }
 
-	template <class TargetType>
-	const TargetType &cast() const {
-		DynamicCastCheck<TargetType>(this);
-		return reinterpret_cast<const TargetType &>(*this);
-	}
+  template <class TargetType>
+  const TargetType& cast() const
+  {
+    DynamicCastCheck<TargetType>(this);
+    return reinterpret_cast<const TargetType&>(*this);
+  }
 };
 
 /**
  * Interface for concrete executor tasks.
  */
 class itask {
-public:
-  itask(sirius::unique_ptr<itask_local_state> local_state, sirius::shared_ptr<itask_global_state> global_state)
-    : _local_state(std::move(local_state)), _global_state(global_state) {}
+ public:
+  itask(sirius::unique_ptr<itask_local_state> local_state,
+        sirius::shared_ptr<itask_global_state> global_state)
+    : _local_state(std::move(local_state)), _global_state(global_state)
+  {
+  }
 
   virtual ~itask() = default;
 
   // Non-copyable and movable.
-  itask(const itask&) = delete;
+  itask(const itask&)            = delete;
   itask& operator=(const itask&) = delete;
-  itask(itask&&) = default;
-  itask& operator=(itask&&) = default;
+  itask(itask&&)                 = default;
+  itask& operator=(itask&&)      = default;
 
   // Execution function.
   virtual void execute() = 0;
 
-protected:
+ protected:
   sirius::unique_ptr<itask_local_state> _local_state;
   sirius::shared_ptr<itask_global_state> _global_state;
 };
 
-} // namespace parallel
-} // namespace sirius
+}  // namespace parallel
+}  // namespace sirius

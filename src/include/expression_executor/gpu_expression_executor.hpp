@@ -29,19 +29,17 @@
 #include "expression_executor/gpu_expression_executor_state.hpp"
 #include "gpu_buffer_manager.hpp"
 #include "gpu_columns.hpp"
+
 #include <cudf/types.hpp>
+
 #include <memory>
 #include <vector>
 
-namespace duckdb
-{
-namespace sirius
-{
+namespace duckdb {
+namespace sirius {
 
 //----------GpuExpressionExecutor----------//
-struct GpuExpressionExecutor
-{
-
+struct GpuExpressionExecutor {
   //----------Constructor/Destructor(s)----------//
   GpuExpressionExecutor() = default;
   explicit GpuExpressionExecutor(const Expression& expr);
@@ -137,5 +135,5 @@ struct GpuExpressionExecutor
                                                              GpuExpressionExecutorState& state);
 };
 
-} // namespace sirius
-} // namespace duckdb
+}  // namespace sirius
+}  // namespace duckdb

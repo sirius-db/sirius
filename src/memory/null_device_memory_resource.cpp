@@ -21,7 +21,5 @@ namespace memory {
 
 // All methods are defined inline in the header; this TU ensures linkage.
 
-} // namespace memory
-} // namespace sirius
-
-
+}  // namespace memory
+}  // namespace sirius

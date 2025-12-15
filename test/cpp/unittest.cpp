@@ -18,6 +18,7 @@
 
 #include "catch.hpp"
 #include "log/logging.hpp"
+
 #include <cstdlib>
 
 using namespace duckdb;

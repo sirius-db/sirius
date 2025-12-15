@@ -14,36 +14,29 @@
  * limitations under the License.
  */
 
-#include "operator/gpu_physical_partition.hpp"
+#include "operator/gpu_physical_concat.hpp"
+
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "expression_executor/gpu_expression_executor.hpp"
-#include "operator/gpu_physical_hash_join.hpp"
-#include "operator/gpu_physical_grouped_aggregate.hpp"
-#include "operator/gpu_physical_order.hpp"
-#include "operator/gpu_physical_top_n.hpp"
-#include "operator/gpu_physical_concat.hpp"
 #include "log/logging.hpp"
+#include "operator/gpu_physical_grouped_aggregate.hpp"
+#include "operator/gpu_physical_hash_join.hpp"
+#include "operator/gpu_physical_order.hpp"
+#include "operator/gpu_physical_partition.hpp"
+#include "operator/gpu_physical_top_n.hpp"
 
 namespace duckdb {
 
 GPUPhysicalConcat::GPUPhysicalConcat(vector<LogicalType> types, idx_t estimated_cardinality)
-    : GPUPhysicalOperator(PhysicalOperatorType::INVALID, std::move(types), estimated_cardinality) {
-        _num_partitions = (estimated_cardinality + PARTITION_SIZE - 1)/PARTITION_SIZE;
+  : GPUPhysicalOperator(PhysicalOperatorType::INVALID, std::move(types), estimated_cardinality)
+{
+  _num_partitions = (estimated_cardinality + PARTITION_SIZE - 1) / PARTITION_SIZE;
 }
 
-string 
-GPUPhysicalConcat::GetName() const {
-    return "CONCAT";
-}
+string GPUPhysicalConcat::GetName() const { return "CONCAT"; }
 
-bool 
-GPUPhysicalConcat::IsSource() const {
-    return true;
-}
+bool GPUPhysicalConcat::IsSource() const { return true; }
 
-bool 
-GPUPhysicalConcat::IsSink() const {
-    return true;
-}
+bool GPUPhysicalConcat::IsSink() const { return true; }
 
-} 
+}  // namespace duckdb

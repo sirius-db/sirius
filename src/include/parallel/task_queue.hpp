@@ -27,7 +27,7 @@ namespace parallel {
  * Interface for concrete task queues for customized scheduling policies.
  */
 class itask_queue {
-public:
+ public:
   virtual ~itask_queue() = default;
 
   // Open the queue and start accepting new tasks.
@@ -43,5 +43,5 @@ public:
   virtual std::unique_ptr<itask> pull() = 0;
 };
 
-} // namespace parallel
-} // namespace sirius
+}  // namespace parallel
+}  // namespace sirius

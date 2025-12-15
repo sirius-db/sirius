@@ -15,12 +15,13 @@
  */
 
 #pragma once
-#include "parallel/task_executor.hpp"
-#include "memory/memory_reservation.hpp"
-#include "pipeline/gpu_pipeline_task.hpp"
 #include "data/data_repository.hpp"
+#include "memory/memory_reservation.hpp"
 #include "memory/memory_space.hpp"
+#include "parallel/task_executor.hpp"
+#include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/task_request.hpp"
+
 #include <blockingconcurrentqueue.h>
 
 namespace sirius {
@@ -29,119 +30,122 @@ namespace parallel {
 class pipeline_executor;
 
 class local_task_buffer {
-public:
-    local_task_buffer() = default;
-    void produce(sirius::unique_ptr<itask> task);
-    sirius::unique_ptr<itask> consume();
-    void open();
-    void close();
+ public:
+  local_task_buffer() = default;
+  void produce(sirius::unique_ptr<itask> task);
+  sirius::unique_ptr<itask> consume();
+  void open();
+  void close();
 
-private:
-    mutable std::mutex _mtx;
-    std::condition_variable _cv;
-    std::queue<sirius::unique_ptr<itask>> _queue;
-    std::atomic<bool> _is_open{false}; ///< Whether the queue is open for pushing/pulling tasks
+ private:
+  mutable std::mutex _mtx;
+  std::condition_variable _cv;
+  std::queue<sirius::unique_ptr<itask>> _queue;
+  std::atomic<bool> _is_open{false};  ///< Whether the queue is open for pushing/pulling tasks
 };
 
 /**
  * @brief Executor specialized for executing GPU pipeline operations.
- * 
+ *
  * This executor inherits from itask_executor and uses a gpu_pipeline_task_queue for
  * task scheduling. It manages a pool of threads dedicated to executing GPU pipeline
  * tasks with specialized GPU resource management.
  */
 class gpu_pipeline_executor : public itask_executor {
-public:
-    /**
-     * @brief Constructs a new gpu_pipeline_executor with task execution configuration
-     * 
-     * @param config Configuration for the task executor (thread count, retry policy, etc.)
-     */
-    explicit gpu_pipeline_executor(task_executor_config config, const memory::memory_space* mem_space, pipeline_executor* pipeline_exec);
+ public:
+  /**
+   * @brief Constructs a new gpu_pipeline_executor with task execution configuration
+   *
+   * @param config Configuration for the task executor (thread count, retry policy, etc.)
+   */
+  explicit gpu_pipeline_executor(task_executor_config config,
+                                 const memory::memory_space* mem_space,
+                                 pipeline_executor* pipeline_exec);
 
-    /**
-     * @brief Destructor for the gpu_pipeline_executor.
-     */
-    ~gpu_pipeline_executor() override = default;
+  /**
+   * @brief Destructor for the gpu_pipeline_executor.
+   */
+  ~gpu_pipeline_executor() override = default;
 
-    // Non-copyable but movable
-    gpu_pipeline_executor(const gpu_pipeline_executor&) = delete;
-    gpu_pipeline_executor& operator=(const gpu_pipeline_executor&) = delete;
-    gpu_pipeline_executor(gpu_pipeline_executor&&) = default;
-    gpu_pipeline_executor& operator=(gpu_pipeline_executor&&) = default;
+  // Non-copyable but movable
+  gpu_pipeline_executor(const gpu_pipeline_executor&)            = delete;
+  gpu_pipeline_executor& operator=(const gpu_pipeline_executor&) = delete;
+  gpu_pipeline_executor(gpu_pipeline_executor&&)                 = default;
+  gpu_pipeline_executor& operator=(gpu_pipeline_executor&&)      = default;
 
-    /**
-     * @brief Schedules a task for execution with GPU-specific logic
-     * 
-     * Overrides the base class schedule method to provide specialized scheduling
-     * behavior for GPU pipeline operations, including resource allocation and
-     * GPU context management.
-     * 
-     * @param task The task to schedule (must be a gpu_pipeline_task)
-     */
-    void schedule(sirius::unique_ptr<itask> task) override;
+  /**
+   * @brief Schedules a task for execution with GPU-specific logic
+   *
+   * Overrides the base class schedule method to provide specialized scheduling
+   * behavior for GPU pipeline operations, including resource allocation and
+   * GPU context management.
+   *
+   * @param task The task to schedule (must be a gpu_pipeline_task)
+   */
+  void schedule(sirius::unique_ptr<itask> task) override;
 
-    /**
-     * @brief Main worker loop for executing GPU pipeline tasks
-     * 
-     * Each worker thread runs this loop to continuously pull and execute GPU
-     * pipeline tasks from the queue. Handles GPU-specific operations including
-     * kernel launches, memory transfers, and synchronization.
-     * 
-     * @param worker_id The unique identifier for this worker thread
-     */
-    void worker_loop(int worker_id) override;
+  /**
+   * @brief Main worker loop for executing GPU pipeline tasks
+   *
+   * Each worker thread runs this loop to continuously pull and execute GPU
+   * pipeline tasks from the queue. Handles GPU-specific operations including
+   * kernel launches, memory transfers, and synchronization.
+   *
+   * @param worker_id The unique identifier for this worker thread
+   */
+  void worker_loop(int worker_id) override;
 
-    /**
-     * @brief Starts the executor and initializes worker threads
-     * 
-     * Initializes the thread pool and begins accepting tasks for execution.
-     */
-    void start() override;
+  /**
+   * @brief Starts the executor and initializes worker threads
+   *
+   * Initializes the thread pool and begins accepting tasks for execution.
+   */
+  void start() override;
 
-    /**
-     * @brief Stops the executor and cleanly shuts down worker threads
-     * 
-     * Stops accepting new tasks and waits for all worker threads to complete
-     * their current tasks before shutting down.
-     */
-    void stop() override;
+  /**
+   * @brief Stops the executor and cleanly shuts down worker threads
+   *
+   * Stops accepting new tasks and waits for all worker threads to complete
+   * their current tasks before shutting down.
+   */
+  void stop() override;
 
-    void on_start() override;
-    void on_stop() override;
+  void on_start() override;
+  void on_stop() override;
 
-    /**
-     * @brief Get the memory space view associated with this executor
-     * 
-     * @return memory::memory_space* Pointer to the memory space
-     */
-    memory::memory_space* get_memory_space_view();
+  /**
+   * @brief Get the memory space view associated with this executor
+   *
+   * @return memory::memory_space* Pointer to the memory space
+   */
+  memory::memory_space* get_memory_space_view();
 
-    /**
-     * @brief Manager loop to consume task from local buffer and dispatch to the thread pool
-     */
-    void manager_loop();
+  /**
+   * @brief Manager loop to consume task from local buffer and dispatch to the thread pool
+   */
+  void manager_loop();
 
-    /**
-     * @brief Submit a task request to task_request_queue
-     */
-    void submit_task_request(sirius::unique_ptr<task_request> request);
+  /**
+   * @brief Submit a task request to task_request_queue
+   */
+  void submit_task_request(sirius::unique_ptr<task_request> request);
 
-private:
-    /**
-     * @brief Safely casts itask to gpu_pipeline_task with type validation
-     * 
-     * @param task The itask pointer to cast
-     * @return gpu_pipeline_task* The casted gpu_pipeline_task pointer
-     * @throws std::bad_cast if the task is not of type gpu_pipeline_task
-     */
-    gpu_pipeline_task* cast_to_gpu_pipeline_task(itask* task);
-    
-    sirius::unique_ptr<std::thread> _gpu_pipeline_executor_manager_thread;
-    sirius::unique_ptr<local_task_buffer> _local_task_buffer;
-    pipeline_executor* _pipeline_exec;
-    const memory::memory_space* _memory_space_view; // this is supposed to be the memory space associated with this pipeline executor
+ private:
+  /**
+   * @brief Safely casts itask to gpu_pipeline_task with type validation
+   *
+   * @param task The itask pointer to cast
+   * @return gpu_pipeline_task* The casted gpu_pipeline_task pointer
+   * @throws std::bad_cast if the task is not of type gpu_pipeline_task
+   */
+  gpu_pipeline_task* cast_to_gpu_pipeline_task(itask* task);
+
+  sirius::unique_ptr<std::thread> _gpu_pipeline_executor_manager_thread;
+  sirius::unique_ptr<local_task_buffer> _local_task_buffer;
+  pipeline_executor* _pipeline_exec;
+  const memory::memory_space* _memory_space_view;  // this is supposed to be the memory space
+                                                   // associated with this pipeline executor
 };
 
-} // namespace parallel
-} // namespace sirius
+}  // namespace parallel
+}  // namespace sirius

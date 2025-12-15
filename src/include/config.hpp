@@ -22,21 +22,22 @@ namespace duckdb {
 
 // If you are adding a new field to this struct, then you also need to make the following changes:
 // * Specify the default value in config.cpp
-// * Add a configuration field associated with Sirius (see InitialGPUConfigs in sirius_extension.cpp for examples)
+// * Add a configuration field associated with Sirius (see InitialGPUConfigs in sirius_extension.cpp
+// for examples)
 struct Config {
   // For gpu buffer manager
-  static bool USE_PIN_MEM_FOR_CPU_PROCESSING; // use_pin_memory
+  static bool USE_PIN_MEM_FOR_CPU_PROCESSING;  // use_pin_memory
 
   // For expression executor
-  static bool USE_CUDF_EXPR; // use_cudf_expr
-  
+  static bool USE_CUDF_EXPR;  // use_cudf_expr
+
   // For gpu physical top-N
-  static bool USE_CUSTOM_TOP_N; // use_custom_top_n
+  static bool USE_CUSTOM_TOP_N;  // use_custom_top_n
 
   // For gpu physical table scan
-  static bool USE_OPT_TABLE_SCAN; // use_opt_table_scan
-  static int OPT_TABLE_SCAN_NUM_CUDA_STREAMS; // opt_table_scan_num_streams
-  static uint64_t OPT_TABLE_SCAN_CUDA_MEMCPY_SIZE; // opt_table_scan_memcpy_size
+  static bool USE_OPT_TABLE_SCAN;                   // use_opt_table_scan
+  static int OPT_TABLE_SCAN_NUM_CUDA_STREAMS;       // opt_table_scan_num_streams
+  static uint64_t OPT_TABLE_SCAN_CUDA_MEMCPY_SIZE;  // opt_table_scan_memcpy_size
 
   // For printing gpu table
   static uint64_t PRINT_GPU_TABLE_MAX_ROWS;
@@ -51,16 +52,16 @@ struct Config {
   static bool MODIFIED_PIPELINE;
 };
 
-}
+}  // namespace duckdb
 
 namespace sirius {
 
 struct Config {
-    static const uint64_t NUM_GPU_EXECUTOR_THREADS = 2;
-    static const uint64_t NUM_PIPELINE_EXECUTOR_THREADS = 2;
-    static const uint64_t NUM_DUCKDB_SCAN_EXECUTOR_THREADS = 2;
-    static const uint64_t NUM_DOWNGRADE_EXECUTOR_THREADS = 2;
-    static const uint64_t NUM_GPU = 1;
+  static const uint64_t NUM_GPU_EXECUTOR_THREADS         = 2;
+  static const uint64_t NUM_PIPELINE_EXECUTOR_THREADS    = 2;
+  static const uint64_t NUM_DUCKDB_SCAN_EXECUTOR_THREADS = 2;
+  static const uint64_t NUM_DOWNGRADE_EXECUTOR_THREADS   = 2;
+  static const uint64_t NUM_GPU                          = 1;
 };
 
-}
+}  // namespace sirius
