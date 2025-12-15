@@ -1,0 +1,72 @@
+# To use:
+#
+#     pre-commit run -a
+#
+# Or:
+#
+#     pre-commit install  # (runs every time you commit in git)
+#
+# To update this file:
+#
+#     pre-commit autoupdate
+#
+# See https://github.com/pre-commit/pre-commit
+
+# Global exclusions, csv are exclueded because it os often the answers to a test, we don't want to reformat them
+exclude: \.csv$|^legacy/queries/.*
+
+repos:
+  # Standard hooks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-added-large-files
+      - id: check-case-conflict
+      - id: check-json
+      - id: check-merge-conflict
+      - id: check-symlinks
+      - id: check-toml
+      - id: check-yaml
+      - id: debug-statements
+      - id: destroyed-symlinks
+      - id: detect-private-key
+      - id: end-of-file-fixer
+        exclude: |
+          (?x)^(
+            ^legacy/queries/.*|
+            ^python/cudf/cudf/tests/data/vocab.txt
+          )
+      - id: mixed-line-ending
+      - id: pretty-format-json
+      - id: trailing-whitespace
+  - repo: https://github.com/psf/black
+    rev: 25.1.0
+    hooks:
+      - id: black
+  - repo: https://github.com/sirosen/texthooks
+    rev: 0.7.1
+    hooks:
+      - id: fix-smartquotes
+  - repo: https://github.com/pre-commit/mirrors-clang-format
+    rev: v20.1.4
+    hooks:
+      - id: clang-format
+        types_or: [c++, c, cuda]
+        args: ["-fallback-style=none", "-style=file", "-i"]
+  - repo: https://github.com/codespell-project/codespell
+    rev: v2.4.1
+    hooks:
+      - id: codespell
+        args:
+          [
+            "--write-changes",
+            "--ignore-words=.codespell_words",
+            '--skip="*.eps"',
+          ]
+  - repo: https://github.com/cheshirekow/cmake-format-precommit
+    rev: v0.6.13
+    hooks:
+      - id: cmake-format
+      - id: cmake-lint
+        args:
+          [--line-width  220, --disabled-codes=C0307, --suppress-decorations]
