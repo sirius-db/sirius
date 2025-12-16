@@ -15,24 +15,24 @@
  */
 
 #include "data/data_repository.hpp"
+
 #include "data/data_batch_view.hpp"
 
 namespace sirius {
 
-void idata_repository::add_new_data_batch_view(sirius::unique_ptr<data_batch_view> batch_view) {
-    std::lock_guard<std::mutex> lock(_mutex);
-    _data_batches.push_back(std::move(batch_view));
+void idata_repository::add_new_data_batch_view(sirius::unique_ptr<data_batch_view> batch_view)
+{
+  std::lock_guard<std::mutex> lock(_mutex);
+  _data_batches.push_back(std::move(batch_view));
 }
 
-sirius::unique_ptr<data_batch_view> idata_repository::pull_data_batch_view() {
-    std::lock_guard<std::mutex> lock(_mutex);
-    if (_data_batches.empty()) {
-        return nullptr;
-    }
-    auto batch = std::move(_data_batches.front());
-    _data_batches.erase(_data_batches.begin());
-    return batch;
+sirius::unique_ptr<data_batch_view> idata_repository::pull_data_batch_view()
+{
+  std::lock_guard<std::mutex> lock(_mutex);
+  if (_data_batches.empty()) { return nullptr; }
+  auto batch = std::move(_data_batches.front());
+  _data_batches.erase(_data_batches.begin());
+  return batch;
 }
 
-} // namespace sirius
-
+}  // namespace sirius

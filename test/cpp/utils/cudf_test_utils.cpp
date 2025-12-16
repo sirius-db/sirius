@@ -16,23 +16,23 @@
 
 #include "catch.hpp"
 
+#include <cudf/contiguous_split.hpp>
+#include <cudf/table/table.hpp>
+
+#include <rmm/cuda_stream.hpp>
+#include <rmm/cuda_stream_view.hpp>
+#include <rmm/device_buffer.hpp>
+
 #include <cuda_runtime_api.h>
 
 #include <cstdint>
 #include <cstring>
-#include <memory>
-#include <vector>
-
-#include <cudf/contiguous_split.hpp>
-#include <cudf/table/table.hpp>
-#include <rmm/device_buffer.hpp>
-#include <rmm/cuda_stream_view.hpp>
-#include <rmm/cuda_stream.hpp>
-
-#include <iostream>
-#include <sstream>
 #include <iomanip>
+#include <iostream>
+#include <memory>
+#include <sstream>
 #include <thread>
+#include <vector>
 
 namespace sirius {
 namespace test {

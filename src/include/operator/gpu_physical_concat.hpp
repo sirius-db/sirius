@@ -17,29 +17,29 @@
 #pragma once
 
 #include "duckdb/execution/physical_operator.hpp"
-#include "gpu_physical_operator.hpp"
-#include "operator/gpu_physical_hash_join.hpp"
-#include "operator/gpu_physical_grouped_aggregate.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "gpu_physical_operator.hpp"
+#include "operator/gpu_physical_grouped_aggregate.hpp"
+#include "operator/gpu_physical_hash_join.hpp"
 #include "operator/gpu_physical_order.hpp"
 #include "operator/gpu_physical_top_n.hpp"
 
 namespace duckdb {
 
 class GPUPhysicalConcat : public GPUPhysicalOperator {
-public:
-	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::INVALID;
+ public:
+  static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::INVALID;
 
-	explicit GPUPhysicalConcat(vector<LogicalType> types, idx_t estimated_cardinality);
+  explicit GPUPhysicalConcat(vector<LogicalType> types, idx_t estimated_cardinality);
 
-  	string GetName() const override;
+  string GetName() const override;
 
-	bool IsSource() const override;
+  bool IsSource() const override;
 
-    bool IsSink() const override;
+  bool IsSink() const override;
 
-private:
-    vector<idx_t> _partition_keys;
-	idx_t _num_partitions;
+ private:
+  vector<idx_t> _partition_keys;
+  idx_t _num_partitions;
 };
-} // namespace duckdb
+}  // namespace duckdb

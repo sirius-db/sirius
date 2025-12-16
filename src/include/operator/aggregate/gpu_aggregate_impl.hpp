@@ -27,58 +27,58 @@ namespace op {
 
 /**
  * @brief Functionalities for running local aggregation on a data batch.
- * 
+ *
  * Provide functionalities including:
  * - Local ungrouped aggregation;
  * - Local grouped aggregation
- * 
+ *
  * Require caller to have already upgraded input data batches into `gpu_table_representation`
  * (the input data batch views are pinned).
  */
 class gpu_aggregate_impl {
-public:
-    /**
-     * @brief Perform local ungrouped aggregate on the input data batch.
-     * 
-     * @param input The input data batch.
-     * @param aggregates The aggregate functions.
-     * @param aggregate_idx The aggregate columns, should have the same size as `aggregates`.
-     * @param stream CUDA stream used for device memory operations and kernel launches.
-     * @param memory_space The memory space used to allocate memory for the output data batch.
-     * @param data_repository_mgr The data repository manager that the output data batch belongs to.
-     * 
-     * @return The output data batch with ownership.
-     */
-    static sirius::unique_ptr<data_batch> local_ungrouped_aggregate(
-        const data_batch_view& input,
-        const sirius::vector<cudf::aggregation::Kind>& aggregates,
-        const sirius::vector<int>& aggregate_idx,
-        rmm::cuda_stream_view stream,
-        memory::memory_space& memory_space,
-        data_repository_manager& data_repository_mgr);
+ public:
+  /**
+   * @brief Perform local ungrouped aggregate on the input data batch.
+   *
+   * @param input The input data batch.
+   * @param aggregates The aggregate functions.
+   * @param aggregate_idx The aggregate columns, should have the same size as `aggregates`.
+   * @param stream CUDA stream used for device memory operations and kernel launches.
+   * @param memory_space The memory space used to allocate memory for the output data batch.
+   * @param data_repository_mgr The data repository manager that the output data batch belongs to.
+   *
+   * @return The output data batch with ownership.
+   */
+  static sirius::unique_ptr<data_batch> local_ungrouped_aggregate(
+    const data_batch_view& input,
+    const sirius::vector<cudf::aggregation::Kind>& aggregates,
+    const sirius::vector<int>& aggregate_idx,
+    rmm::cuda_stream_view stream,
+    memory::memory_space& memory_space,
+    data_repository_manager& data_repository_mgr);
 
-    /**
-     * @brief Perform local grouped aggregate on the input data batch.
-     * 
-     * @param input The input data batch.
-     * @param group_idx The group columns.
-     * @param aggregates The aggregate functions.
-     * @param aggregate_idx The aggregate columns, should have the same size as `aggregates`.
-     * @param stream CUDA stream used for device memory operations and kernel launches.
-     * @param memory_space The memory space used to allocate memory for the output data batch.
-     * @param data_repository_mgr The data repository manager that the output data batch belongs to.
-     * 
-     * @return The output data batch with ownership.
-     */
-    static sirius::unique_ptr<data_batch> local_grouped_aggregate(
-        const data_batch_view& input,
-        const sirius::vector<int>& group_idx,
-        const sirius::vector<cudf::aggregation::Kind>& aggregates,
-        const sirius::vector<int>& aggregate_idx,
-        rmm::cuda_stream_view stream,
-        memory::memory_space& memory_space,
-        data_repository_manager& data_repository_mgr);
+  /**
+   * @brief Perform local grouped aggregate on the input data batch.
+   *
+   * @param input The input data batch.
+   * @param group_idx The group columns.
+   * @param aggregates The aggregate functions.
+   * @param aggregate_idx The aggregate columns, should have the same size as `aggregates`.
+   * @param stream CUDA stream used for device memory operations and kernel launches.
+   * @param memory_space The memory space used to allocate memory for the output data batch.
+   * @param data_repository_mgr The data repository manager that the output data batch belongs to.
+   *
+   * @return The output data batch with ownership.
+   */
+  static sirius::unique_ptr<data_batch> local_grouped_aggregate(
+    const data_batch_view& input,
+    const sirius::vector<int>& group_idx,
+    const sirius::vector<cudf::aggregation::Kind>& aggregates,
+    const sirius::vector<int>& aggregate_idx,
+    rmm::cuda_stream_view stream,
+    memory::memory_space& memory_space,
+    data_repository_manager& data_repository_mgr);
 };
 
-} // namespace op
-} // namespace sirius
+}  // namespace op
+}  // namespace sirius

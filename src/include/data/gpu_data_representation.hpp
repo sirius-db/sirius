@@ -16,58 +16,62 @@
 
 #pragma once
 
-#include <vector>
-
-#include "data/common.hpp"
-#include "memory/memory_space.hpp"
 #include "cudf/cudf_utils.hpp"
+#include "data/common.hpp"
 #include "helper/helper.hpp"
+#include "memory/memory_space.hpp"
+
+#include <vector>
 
 namespace sirius {
 
 /**
  * @brief Data representation for a table being stored in GPU memory.
- * 
- * This class currently represents a table just as a cuDF table along with the allocation where the cudf's table data actually resides.
- * The primary purpose for this is that the table can be directly passed to cuDF APIs for processing without any additional copying
- * while the underlying memory is still owned/tracked by our memory allocator.
- * 
- * TODO: Once the GPU memory resource is implemented, replace the allocation type from IAllocatedMemory to the concrete
- * type returned by the GPU memory allocator.  
+ *
+ * This class currently represents a table just as a cuDF table along with the allocation where the
+ * cudf's table data actually resides. The primary purpose for this is that the table can be
+ * directly passed to cuDF APIs for processing without any additional copying while the underlying
+ * memory is still owned/tracked by our memory allocator.
+ *
+ * TODO: Once the GPU memory resource is implemented, replace the allocation type from
+ * IAllocatedMemory to the concrete type returned by the GPU memory allocator.
  */
 class gpu_table_representation : public idata_representation {
-public:    
-    /**
-     * @brief Construct a new gpu_table_representation object
-     * 
-     * @param table The actual cuDF table with the data
-     */
-    gpu_table_representation(cudf::table table, sirius::memory::memory_space& memory_space);
+ public:
+  /**
+   * @brief Construct a new gpu_table_representation object
+   *
+   * @param table The actual cuDF table with the data
+   */
+  gpu_table_representation(cudf::table table, sirius::memory::memory_space& memory_space);
 
-    /**
-     * @brief Get the size of the data representation in bytes
-     * 
-     * @return std::size_t The number of bytes used to store this representation
-     */
-    std::size_t get_size_in_bytes() const override;
+  /**
+   * @brief Get the size of the data representation in bytes
+   *
+   * @return std::size_t The number of bytes used to store this representation
+   */
+  std::size_t get_size_in_bytes() const override;
 
-    /**
-     * @brief Get the underlying cuDF table
-     * 
-     * @return const cudf::table& Reference to the cuDF table
-     */
-    const cudf::table& get_table() const;
+  /**
+   * @brief Get the underlying cuDF table
+   *
+   * @return const cudf::table& Reference to the cuDF table
+   */
+  const cudf::table& get_table() const;
 
-    /**
-     * @brief Convert this GPU table representation to a different memory tier
-     * 
-     * @param stream CUDA stream to use for memory operations
-     * @return sirius::unique_ptr<idata_representation> A new data representation in the target memory space
-     */
-    sirius::unique_ptr<idata_representation> convert_to_memory_space(const sirius::memory::memory_space* target_memory_space, rmm::cuda_stream_view stream = rmm::cuda_stream_default) override;
+  /**
+   * @brief Convert this GPU table representation to a different memory tier
+   *
+   * @param stream CUDA stream to use for memory operations
+   * @return sirius::unique_ptr<idata_representation> A new data representation in the target memory
+   * space
+   */
+  sirius::unique_ptr<idata_representation> convert_to_memory_space(
+    const sirius::memory::memory_space* target_memory_space,
+    rmm::cuda_stream_view stream = rmm::cuda_stream_default) override;
 
-private:
-    cudf::table _table; ///< The actual cuDF table with the data
+ private:
+  cudf::table _table;  ///< The actual cuDF table with the data
 };
 
-}
+}  // namespace sirius

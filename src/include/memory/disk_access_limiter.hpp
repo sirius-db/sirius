@@ -37,8 +37,8 @@ class disk_access_limiter {
     explicit disk_reserved_arena(disk_access_limiter& mr,
                                  std::size_t bytes,
                                  std::string_view base_fname,
-                                 std::unique_ptr<event_notifier> notifer)
-      : reserved_arena(bytes, std::move(notifer)),
+                                 std::unique_ptr<event_notifier> notifier)
+      : reserved_arena(bytes, std::move(notifier)),
         base_name_(base_fname.data(), base_fname.size()),
         mr_(&mr)
     {
@@ -121,19 +121,19 @@ class disk_access_limiter {
 
  private:
   /**
-   * @brief releases reservations and returns the unsed reservation back to allocator
+   * @brief releases reservations and returns the unused reservation back to allocator
    * @param reservation pointer to the reservation being released
    */
   bool do_reserve(std::size_t size_bytes, std::size_t limit_bytes);
 
   /**
-   * @brief releases reservations and returns the unsed reservation back to allocator
+   * @brief releases reservations and returns the unused reservation back to allocator
    * @param reservation pointer to the reservation being released
    */
   std::size_t do_reserve_upto(std::size_t size_bytes, std::size_t limit_bytes);
 
   /**
-   * @brief releases reservations and returns the unsed reservation back to allocator
+   * @brief releases reservations and returns the unused reservation back to allocator
    * @param reservation pointer to the reservation being released
    */
   void do_release_reservation(disk_reserved_arena* reservation) noexcept;

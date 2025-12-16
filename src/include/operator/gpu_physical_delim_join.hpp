@@ -24,81 +24,83 @@ namespace duckdb {
 
 class GPUPhysicalGroupedAggregate;
 
-//! PhysicalDelimJoin represents a join where either the LHS or RHS will be duplicate eliminated and pushed into a
-//! PhysicalColumnDataScan in the other side. Implementations are PhysicalLeftDelimJoin and PhysicalRightDelimJoin
+//! PhysicalDelimJoin represents a join where either the LHS or RHS will be duplicate eliminated and
+//! pushed into a PhysicalColumnDataScan in the other side. Implementations are
+//! PhysicalLeftDelimJoin and PhysicalRightDelimJoin
 class GPUPhysicalDelimJoin : public GPUPhysicalOperator {
-public:
-	GPUPhysicalDelimJoin(PhysicalOperatorType type, vector<LogicalType> types, unique_ptr<GPUPhysicalOperator> original_join,
-	                  vector<const_reference<GPUPhysicalOperator>> delim_scans, idx_t estimated_cardinality, optional_idx delim_idx);
+ public:
+  GPUPhysicalDelimJoin(PhysicalOperatorType type,
+                       vector<LogicalType> types,
+                       unique_ptr<GPUPhysicalOperator> original_join,
+                       vector<const_reference<GPUPhysicalOperator>> delim_scans,
+                       idx_t estimated_cardinality,
+                       optional_idx delim_idx);
 
-	unique_ptr<GPUPhysicalOperator> join;
-	unique_ptr<GPUPhysicalGroupedAggregate> distinct;
-	vector<const_reference<GPUPhysicalOperator>> delim_scans;
-	GPUPhysicalPartition* partition_join;
-	GPUPhysicalPartition* partition_distinct;
+  unique_ptr<GPUPhysicalOperator> join;
+  unique_ptr<GPUPhysicalGroupedAggregate> distinct;
+  vector<const_reference<GPUPhysicalOperator>> delim_scans;
+  GPUPhysicalPartition* partition_join;
+  GPUPhysicalPartition* partition_distinct;
 
-	optional_idx delim_idx;
+  optional_idx delim_idx;
 
-public:
-	// vector<const_reference<GPUPhysicalOperator>> GetChildren() const override;
+ public:
+  // vector<const_reference<GPUPhysicalOperator>> GetChildren() const override;
 
-	bool IsSink() const override {
-		return true;
-	}
-	// bool ParallelSink() const override {
-	// 	return true;
-	// }
+  bool IsSink() const override { return true; }
+  // bool ParallelSink() const override {
+  // 	return true;
+  // }
 
-	OrderPreservationType SourceOrder() const override {
-		return OrderPreservationType::NO_ORDER;
-	}
-	bool SinkOrderDependent() const override {
-		return false;
-	}
+  OrderPreservationType SourceOrder() const override { return OrderPreservationType::NO_ORDER; }
+  bool SinkOrderDependent() const override { return false; }
 
-	// InsertionOrderPreservingMap<string> ParamsToString() const override;
+  // InsertionOrderPreservingMap<string> ParamsToString() const override;
 };
 
-
-//! PhysicalRightDelimJoin represents a join where the RHS will be duplicate eliminated and pushed into a
-//! PhysicalColumnDataScan in the LHS.
+//! PhysicalRightDelimJoin represents a join where the RHS will be duplicate eliminated and pushed
+//! into a PhysicalColumnDataScan in the LHS.
 class GPUPhysicalRightDelimJoin : public GPUPhysicalDelimJoin {
-public:
-	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::RIGHT_DELIM_JOIN;
+ public:
+  static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::RIGHT_DELIM_JOIN;
 
-public:
-	GPUPhysicalRightDelimJoin(vector<LogicalType> types, unique_ptr<GPUPhysicalOperator> original_join,
-	                       vector<const_reference<GPUPhysicalOperator>> delim_scans, idx_t estimated_cardinality,
-						   optional_idx delim_idx);
+ public:
+  GPUPhysicalRightDelimJoin(vector<LogicalType> types,
+                            unique_ptr<GPUPhysicalOperator> original_join,
+                            vector<const_reference<GPUPhysicalOperator>> delim_scans,
+                            idx_t estimated_cardinality,
+                            optional_idx delim_idx);
 
-// public:
-	// unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
-	// unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const override;
-	// SinkResultType Sink(ExecutionContext &context, GPUIntermediateRelation &input_relation, OperatorSinkInput &input) const override;
-	SinkResultType Sink(GPUIntermediateRelation &input_relation) const override;
-	// SinkCombineResultType Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const override;
-	// void PrepareFinalize(ClientContext &context, GlobalSinkState &sink_state) const override;
-	// SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
-	//                           OperatorSinkFinalizeInput &input) const override;
+  // public:
+  // unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
+  // unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const override;
+  // SinkResultType Sink(ExecutionContext &context, GPUIntermediateRelation &input_relation,
+  // OperatorSinkInput &input) const override;
+  SinkResultType Sink(GPUIntermediateRelation& input_relation) const override;
+  // SinkCombineResultType Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const
+  // override; void PrepareFinalize(ClientContext &context, GlobalSinkState &sink_state) const
+  // override; SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
+  //                           OperatorSinkFinalizeInput &input) const override;
 
-public:
-	void BuildPipelines(GPUPipeline &current, GPUMetaPipeline &meta_pipeline) override;
+ public:
+  void BuildPipelines(GPUPipeline& current, GPUMetaPipeline& meta_pipeline) override;
 };
-
 
 class GPUPhysicalLeftDelimJoin : public GPUPhysicalDelimJoin {
-public:
-	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::LEFT_DELIM_JOIN;
+ public:
+  static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::LEFT_DELIM_JOIN;
 
-public:
-	GPUPhysicalLeftDelimJoin(vector<LogicalType> types, unique_ptr<GPUPhysicalOperator> original_join,
-	                      vector<const_reference<GPUPhysicalOperator>> delim_scans, idx_t estimated_cardinality,
-						  optional_idx delim_idx);
+ public:
+  GPUPhysicalLeftDelimJoin(vector<LogicalType> types,
+                           unique_ptr<GPUPhysicalOperator> original_join,
+                           vector<const_reference<GPUPhysicalOperator>> delim_scans,
+                           idx_t estimated_cardinality,
+                           optional_idx delim_idx);
 
-	SinkResultType Sink(GPUIntermediateRelation &input_relation) const override;
+  SinkResultType Sink(GPUIntermediateRelation& input_relation) const override;
 
-public:
-	void BuildPipelines(GPUPipeline &current, GPUMetaPipeline &meta_pipeline) override;
+ public:
+  void BuildPipelines(GPUPipeline& current, GPUMetaPipeline& meta_pipeline) override;
 };
 
-} // namespace duckdb
+}  // namespace duckdb

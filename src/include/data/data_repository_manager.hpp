@@ -16,13 +16,13 @@
 
 #pragma once
 
+#include "data/data_repository.hpp"
+#include "data_batch.hpp"
+#include "gpu_physical_operator.hpp"
+#include "helper/helper.hpp"
+
 #include <map>
 #include <string>
-
-#include "data_batch.hpp"
-#include "helper/helper.hpp"
-#include "data/data_repository.hpp"
-#include "gpu_physical_operator.hpp"
 
 namespace sirius {
 

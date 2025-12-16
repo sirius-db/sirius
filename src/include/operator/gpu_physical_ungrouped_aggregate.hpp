@@ -16,47 +16,45 @@
 
 #pragma once
 
-#include "gpu_physical_operator.hpp"
-#include "duckdb/execution/operator/aggregate/grouped_aggregate_data.hpp"
-#include "duckdb/execution/operator/aggregate/distinct_aggregate_data.hpp"
-#include "duckdb/parser/group_by_node.hpp"
 #include "duckdb/common/unordered_map.hpp"
+#include "duckdb/execution/operator/aggregate/distinct_aggregate_data.hpp"
+#include "duckdb/execution/operator/aggregate/grouped_aggregate_data.hpp"
+#include "duckdb/parser/group_by_node.hpp"
+#include "gpu_physical_operator.hpp"
 
 namespace duckdb {
 
-void cudf_aggregate(vector<shared_ptr<GPUColumn>>& column, uint64_t num_aggregates, AggregationType* agg_mode);
+void cudf_aggregate(vector<shared_ptr<GPUColumn>>& column,
+                    uint64_t num_aggregates,
+                    AggregationType* agg_mode);
 
 class GPUPhysicalUngroupedAggregate : public GPUPhysicalOperator {
-public:
-	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::UNGROUPED_AGGREGATE;
+ public:
+  static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::UNGROUPED_AGGREGATE;
 
-public:
-    GPUPhysicalUngroupedAggregate(vector<LogicalType> types, vector<unique_ptr<Expression>> select_list, idx_t estimated_cardinality);
+ public:
+  GPUPhysicalUngroupedAggregate(vector<LogicalType> types,
+                                vector<unique_ptr<Expression>> select_list,
+                                idx_t estimated_cardinality);
 
-	//! The aggregates that have to be computed
-	vector<unique_ptr<Expression>> aggregates;
-	unique_ptr<DistinctAggregateData> distinct_data;
-	unique_ptr<DistinctAggregateCollectionInfo> distinct_collection_info;
-	shared_ptr<GPUIntermediateRelation> aggregation_result;
+  //! The aggregates that have to be computed
+  vector<unique_ptr<Expression>> aggregates;
+  unique_ptr<DistinctAggregateData> distinct_data;
+  unique_ptr<DistinctAggregateCollectionInfo> distinct_collection_info;
+  shared_ptr<GPUIntermediateRelation> aggregation_result;
 
-	SourceResultType GetData(GPUIntermediateRelation& output_relation) const override;
+  SourceResultType GetData(GPUIntermediateRelation& output_relation) const override;
 
-	bool IsSource() const override {
-		return true;
-	}
+  bool IsSource() const override { return true; }
 
-public:
-	SinkResultType Sink(GPUIntermediateRelation &input_relation) const override;
+ public:
+  SinkResultType Sink(GPUIntermediateRelation& input_relation) const override;
 
-	bool IsSink() const override {
-		return true;
-	}
+  bool IsSink() const override { return true; }
 
-	bool ParallelSink() const override {
-		return true;
-	}
+  bool ParallelSink() const override { return true; }
 
-	void MaterializeDistinctInput(GPUIntermediateRelation &input_relation, vector<shared_ptr<GPUColumn>>& aggregate_column) const;
-    
+  void MaterializeDistinctInput(GPUIntermediateRelation& input_relation,
+                                vector<shared_ptr<GPUColumn>>& aggregate_column) const;
 };
-} // namespace duckdb
+}  // namespace duckdb

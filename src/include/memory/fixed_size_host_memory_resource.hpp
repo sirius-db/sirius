@@ -243,7 +243,7 @@ class fixed_size_host_memory_resource : public rmm::mr::device_memory_resource {
    * @param on_release used to hook callbacks for when the reservation is released
    */
   std::unique_ptr<reserved_arena> reserve(std::size_t bytes,
-                                          std::unique_ptr<event_notifier> notifer = nullptr);
+                                          std::unique_ptr<event_notifier> notifier = nullptr);
 
   /**
    * @brief makes reservations upto the given size
@@ -251,7 +251,7 @@ class fixed_size_host_memory_resource : public rmm::mr::device_memory_resource {
    * @param on_release used to hook callbacks for when the reservation is released
    */
   std::unique_ptr<reserved_arena> reserve_upto(std::size_t bytes,
-                                               std::unique_ptr<event_notifier> notifer = nullptr);
+                                               std::unique_ptr<event_notifier> notifier = nullptr);
 
   /**
    * @brief the number of active reservation
@@ -340,13 +340,13 @@ class fixed_size_host_memory_resource : public rmm::mr::device_memory_resource {
   void register_reservation(chunked_reserved_area* res);
 
   /**
-   * @brief release reservation and returns the unsed bytes to back to the memory resource
+   * @brief release reservation and returns the unused bytes to back to the memory resource
    * @param reservation reserved bytes that is registered with the memory resource
    */
   void release_reservation(chunked_reserved_area* res);
 
   /**
-   * @brief release reservation and returns the unsed bytes to back to the memory resource
+   * @brief release reservation and returns the unused bytes to back to the memory resource
    * @param chunks reserved bytes that is registered with the memory resource
    * @param res is the reserved memory bytes use to allocate the chunks from
    */

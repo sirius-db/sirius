@@ -86,7 +86,9 @@ struct notification_channel : std::enable_shared_from_this<notification_channel>
 using event_notifier = notification_channel::event_notifier;
 
 struct notify_on_exit {
-  explicit notify_on_exit(std::unique_ptr<event_notifier> notifer) : notifer_(std::move(notifer)) {}
+  explicit notify_on_exit(std::unique_ptr<event_notifier> notifier) : notifer_(std::move(notifier))
+  {
+  }
 
   ~notify_on_exit() noexcept
   {

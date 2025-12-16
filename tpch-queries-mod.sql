@@ -77,7 +77,7 @@ order by
   n_name,
   s_name,
   p_partkey");
-    
+
 call gpu_processing("select
   l_orderkey,
   sum(l_extendedprice * (1 - l_discount)) as revenue,
@@ -295,7 +295,7 @@ group by
   c_phone,
   n_name,
   c_address,
-  c_comment 
+  c_comment
 order by
   revenue desc;");
 

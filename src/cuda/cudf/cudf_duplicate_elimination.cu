@@ -14,24 +14,31 @@
  * limitations under the License.
  */
 
-#include "cudf/cudf_utils.hpp"
 #include "../operator/cuda_helper.cuh"
-#include "gpu_physical_grouped_aggregate.hpp"
+#include "cudf/cudf_utils.hpp"
 #include "gpu_buffer_manager.hpp"
+#include "gpu_physical_grouped_aggregate.hpp"
 #include "log/logging.hpp"
 
 namespace duckdb {
 
-void cudf_duplicate_elimination(vector<shared_ptr<GPUColumn>>& keys, uint64_t num_keys) 
+void cudf_duplicate_elimination(vector<shared_ptr<GPUColumn>>& keys, uint64_t num_keys)
 {
   if (keys[0]->column_length == 0) {
     SIRIUS_LOG_DEBUG("Input size is 0");
     for (idx_t group = 0; group < num_keys; group++) {
       bool old_unique = keys[group]->is_unique;
       if (keys[group]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {
-        keys[group] = make_shared_ptr<GPUColumn>(0, keys[group]->data_wrapper.type, keys[group]->data_wrapper.data, keys[group]->data_wrapper.offset, 0, true, nullptr);
+        keys[group] = make_shared_ptr<GPUColumn>(0,
+                                                 keys[group]->data_wrapper.type,
+                                                 keys[group]->data_wrapper.data,
+                                                 keys[group]->data_wrapper.offset,
+                                                 0,
+                                                 true,
+                                                 nullptr);
       } else {
-        keys[group] = make_shared_ptr<GPUColumn>(0, keys[group]->data_wrapper.type, keys[group]->data_wrapper.data, nullptr);
+        keys[group] = make_shared_ptr<GPUColumn>(
+          0, keys[group]->data_wrapper.type, keys[group]->data_wrapper.data, nullptr);
       }
       keys[group]->is_unique = old_unique;
     }
@@ -43,7 +50,7 @@ void cudf_duplicate_elimination(vector<shared_ptr<GPUColumn>>& keys, uint64_t nu
   SETUP_TIMING();
   START_TIMER();
 
-  GPUBufferManager *gpuBufferManager = &(GPUBufferManager::GetInstance());
+  GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
   cudf::set_current_device_resource(gpuBufferManager->mr);
 
   std::vector<cudf::column_view> keys_cudf;
@@ -63,12 +70,12 @@ void cudf_duplicate_elimination(vector<shared_ptr<GPUColumn>>& keys, uint64_t nu
 
   auto result_key = std::move(result.keys);
   for (int key = 0; key < num_keys; key++) {
-      cudf::column group_key = result_key->get_column(key);
-      keys[key]->setFromCudfColumn(group_key, keys[key]->is_unique, nullptr, 0, gpuBufferManager);
+    cudf::column group_key = result_key->get_column(key);
+    keys[key]->setFromCudfColumn(group_key, keys[key]->is_unique, nullptr, 0, gpuBufferManager);
   }
 
   STOP_TIMER();
   SIRIUS_LOG_DEBUG("CUDF Groupby result count: {}", keys[0]->column_length);
 }
 
-} //namespace duckdb
+}  // namespace duckdb

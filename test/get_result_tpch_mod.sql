@@ -313,7 +313,7 @@ group by
   c_phone,
   n_name,
   c_address,
-  c_comment 
+  c_comment
 order by
   c_custkey,
   revenue desc

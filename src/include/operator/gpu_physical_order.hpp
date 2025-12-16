@@ -16,57 +16,56 @@
 
 #pragma once
 
-#include "gpu_physical_operator.hpp"
-#include "gpu_buffer_manager.hpp"
 #include "duckdb/planner/bound_query_node.hpp"
+#include "gpu_buffer_manager.hpp"
+#include "gpu_physical_operator.hpp"
 
 namespace duckdb {
-void cudf_orderby(vector<shared_ptr<GPUColumn>>& keys, vector<shared_ptr<GPUColumn>>& projection, uint64_t num_keys, uint64_t num_projections, OrderByType* order_by_type, idx_t num_results = 0); 
+void cudf_orderby(vector<shared_ptr<GPUColumn>>& keys,
+                  vector<shared_ptr<GPUColumn>>& projection,
+                  uint64_t num_keys,
+                  uint64_t num_projections,
+                  OrderByType* order_by_type,
+                  idx_t num_results = 0);
 
-void orderByString(uint8_t** col_keys, uint64_t** col_offsets, int* sort_orders, uint64_t* col_num_bytes, uint64_t num_rows, uint64_t num_cols);
+void orderByString(uint8_t** col_keys,
+                   uint64_t** col_offsets,
+                   int* sort_orders,
+                   uint64_t* col_num_bytes,
+                   uint64_t num_rows,
+                   uint64_t num_cols);
 
 class GPUPhysicalOrder : public GPUPhysicalOperator {
-public:
-	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::ORDER_BY;
-	
-public:
-    GPUPhysicalOrder(vector<LogicalType> types, vector<BoundOrderByNode> orders, vector<idx_t> projections_p,
-	              idx_t estimated_cardinality);
+ public:
+  static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::ORDER_BY;
 
-	//! Input data
-	vector<BoundOrderByNode> orders;
-	vector<idx_t> projections;
-	shared_ptr<GPUIntermediateRelation> sort_result;
+ public:
+  GPUPhysicalOrder(vector<LogicalType> types,
+                   vector<BoundOrderByNode> orders,
+                   vector<idx_t> projections_p,
+                   idx_t estimated_cardinality);
 
-public:
-	// Source interface
-	SourceResultType GetData(GPUIntermediateRelation& output_relation) const override;
+  //! Input data
+  vector<BoundOrderByNode> orders;
+  vector<idx_t> projections;
+  shared_ptr<GPUIntermediateRelation> sort_result;
 
-	bool IsSource() const override {
-		return true;
-	}
+ public:
+  // Source interface
+  SourceResultType GetData(GPUIntermediateRelation& output_relation) const override;
 
-	bool ParallelSource() const override {
-		return true;
-	}
+  bool IsSource() const override { return true; }
 
-	OrderPreservationType SourceOrder() const override {
-		return OrderPreservationType::FIXED_ORDER;
-	}
+  bool ParallelSource() const override { return true; }
 
-public:
-	// Sink interface
-	SinkResultType Sink(GPUIntermediateRelation &input_relation) const override;
+  OrderPreservationType SourceOrder() const override { return OrderPreservationType::FIXED_ORDER; }
 
-	bool IsSink() const override {
-		return true;
-	}
-	bool ParallelSink() const override {
-		return true;
-	}
-	bool SinkOrderDependent() const override {
-		return false;
-	}
+ public:
+  // Sink interface
+  SinkResultType Sink(GPUIntermediateRelation& input_relation) const override;
 
+  bool IsSink() const override { return true; }
+  bool ParallelSink() const override { return true; }
+  bool SinkOrderDependent() const override { return false; }
 };
-} // namespace duckdb
+}  // namespace duckdb

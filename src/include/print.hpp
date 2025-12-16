@@ -20,8 +20,9 @@
 
 namespace duckdb {
 
-template <typename T> void printGPUColumn(T* a, size_t N, int gpu);
+template <typename T>
+void printGPUColumn(T* a, size_t N, int gpu);
 
-void printGPUTable(GPUIntermediateRelation& table, ClientContext &context);
+void printGPUTable(GPUIntermediateRelation& table, ClientContext& context);
 
-}
+}  // namespace duckdb

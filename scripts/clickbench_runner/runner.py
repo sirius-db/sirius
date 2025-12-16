@@ -25,19 +25,67 @@ q24_caching_region_size = "80 GB"
 q24_processing_region_size = "15 GB"
 q24_cpu_processing_region_size = "100 GB"
 
+
 def load_args():
-    parser = argparse.ArgumentParser(description="Script to run clickbench queries against a DuckDB database.")
-    parser.add_argument("--sirius_exec_path", type=str, default=default_sirius_exec_path, help="Path to the Sirius executable.")
-    parser.add_argument("--duckdb_db_path", type=str, default=default_duckdb_db_path, help="Path to the DuckDB database file.")
-    parser.add_argument("--result_save_path", type=str, default=default_result_save_path, help="Path to save the benchmark result.")
-    parser.add_argument("--output_save_path", type=str, default=default_output_save_path, help="Path to save the output (query result).")
-    parser.add_argument('--reload_dataset', action='store_true', help='If specified, reload the dataset into the DuckDB database.')
-    parser.add_argument("--dataset_path", type=str, required=True, help="Path to the dataset file to load into DuckDB. This must be specified if --reload_dataset is used or if the table doesn't exist.")
-    parser.add_argument("--caching_region_size", type=str, default= "19 GB", help="Size of the caching region.")
-    parser.add_argument("--processing_region_size", type=str, default= "19 GB", help="Size of the processing region.")
-    parser.add_argument("--num_warm_runs", type=int, default=2, help="Number of warm runs of the query to perform.")
+    parser = argparse.ArgumentParser(
+        description="Script to run clickbench queries against a DuckDB database."
+    )
+    parser.add_argument(
+        "--sirius_exec_path",
+        type=str,
+        default=default_sirius_exec_path,
+        help="Path to the Sirius executable.",
+    )
+    parser.add_argument(
+        "--duckdb_db_path",
+        type=str,
+        default=default_duckdb_db_path,
+        help="Path to the DuckDB database file.",
+    )
+    parser.add_argument(
+        "--result_save_path",
+        type=str,
+        default=default_result_save_path,
+        help="Path to save the benchmark result.",
+    )
+    parser.add_argument(
+        "--output_save_path",
+        type=str,
+        default=default_output_save_path,
+        help="Path to save the output (query result).",
+    )
+    parser.add_argument(
+        "--reload_dataset",
+        action="store_true",
+        help="If specified, reload the dataset into the DuckDB database.",
+    )
+    parser.add_argument(
+        "--dataset_path",
+        type=str,
+        required=True,
+        help="Path to the dataset file to load into DuckDB. This must be specified if --reload_dataset is used or if the table doesn't exist.",
+    )
+    parser.add_argument(
+        "--caching_region_size",
+        type=str,
+        default="19 GB",
+        help="Size of the caching region.",
+    )
+    parser.add_argument(
+        "--processing_region_size",
+        type=str,
+        default="19 GB",
+        help="Size of the processing region.",
+    )
+    parser.add_argument(
+        "--num_warm_runs",
+        type=int,
+        default=2,
+        help="Number of warm runs of the query to perform.",
+    )
 
     return parser.parse_args()
+
 
 def run_duckdb_query(db_connection, query):
     # Temporarily update stdout/stderr to a string buffer
@@ -48,7 +96,7 @@ def run_duckdb_query(db_connection, query):
 
     # Run the query
     query = db_connection.sql(query)
-    if query is not None: # This happens for queries that don't return results
+    if query is not None:  # This happens for queries that don't return results
         query.show()
 
     # Reset stdout/stderr
@@ -56,9 +104,11 @@ def run_duckdb_query(db_connection, query):
     sys.stderr = old_stderr
     return string_output.getvalue()
 
+
 def table_exists(db_connection, table_name):
     all_tables = run_duckdb_query(db_connection, "SHOW TABLES;")
     return table_name.lower() in all_tables.lower()
+
 
 def load_dataset(db_connection, dataset_path):
     # First drop any existing tables
@@ -67,27 +117,34 @@ def load_dataset(db_connection, dataset_path):
 
     # Now create the table
     create_table_sql_path = os.path.join(curr_file_dir, "create.sql")
-    with open(create_table_sql_path, 'r') as reader:
+    with open(create_table_sql_path, "r") as reader:
         create_table_query = reader.read().strip()
     run_duckdb_query(db_connection, create_table_query)
 
     # Finally load the dataset
     if not os.path.exists(dataset_path):
-        raise FileNotFoundError(f"Dataset file not found at {dataset_path}. Please provide a valid path.")
+        raise FileNotFoundError(
+            f"Dataset file not found at {dataset_path}. Please provide a valid path."
+        )
     load_query = f"COPY {CLICKBENCH_TABLE_NAME} FROM '{dataset_path}' (QUOTE '')"
     run_duckdb_query(db_connection, load_query)
+
 
 def benchmark_query(args, query_to_run, query_label):
     # Create the complete command to run to benchmark this query
     query_temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".query")
     query_temp_file.close()
     query_temp_file_path = query_temp_file.name
-    with open(query_temp_file_path, 'w+') as writer:
+    with open(query_temp_file_path, "w+") as writer:
         writer.write(".timer on\n")
-        if (query_label == 'query24'):
-            writer.write(f"call gpu_buffer_init('{q24_caching_region_size}', '{q24_processing_region_size}', pinned_memory_size = '{q24_cpu_processing_region_size}');\n")
+        if query_label == "query24":
+            writer.write(
+                f"call gpu_buffer_init('{q24_caching_region_size}', '{q24_processing_region_size}', pinned_memory_size = '{q24_cpu_processing_region_size}');\n"
+            )
         else:
-            writer.write(f"call gpu_buffer_init('{args.caching_region_size}', '{args.processing_region_size}');\n")
+            writer.write(
+                f"call gpu_buffer_init('{args.caching_region_size}', '{args.processing_region_size}');\n"
+            )
         for _ in range(args.num_warm_runs + 1):
             writer.write(f'call gpu_processing("{query_to_run}");\n')
 
@@ -101,7 +158,9 @@ def benchmark_query(args, query_to_run, query_label):
     subprocess.run(command_to_run_str, shell=True)
 
     # Now read the result
-    with open(result_temp_file_path, 'r') as reader, open(args.output_save_path, 'a') as writer:
+    with open(result_temp_file_path, "r") as reader, open(
+        args.output_save_path, "a"
+    ) as writer:
         command_result = reader.read()
         writer.write(f"Output of {query_label}:\n")
         writer.write(command_result)
@@ -121,7 +180,10 @@ def benchmark_query(args, query_to_run, query_label):
             query_run_times.append(float(run_time_line_parts[4]))
 
     # Return the average time
-    return SIRIUS_FAILURE_MESSAGE in command_result, -1 if len(query_run_times) < 3 else min(query_run_times[2:])
+    return SIRIUS_FAILURE_MESSAGE in command_result, (
+        -1 if len(query_run_times) < 3 else min(query_run_times[2:])
+    )
+
 
 def main():
     args = load_args()
@@ -138,7 +200,10 @@ def main():
     db_initialize_connection = duckdb.connect(args.duckdb_db_path)
 
     # See if we need to reload the dataset
-    if not table_exists(db_initialize_connection, CLICKBENCH_TABLE_NAME) or args.reload_dataset:
+    if (
+        not table_exists(db_initialize_connection, CLICKBENCH_TABLE_NAME)
+        or args.reload_dataset
+    ):
         print("Loading clickbench dataset into DuckDB")
         load_dataset(db_initialize_connection, args.dataset_path)
     db_initialize_connection.close()
@@ -146,7 +211,7 @@ def main():
     # Now load the queries to run
     curr_file_dir = os.path.dirname(os.path.abspath(__file__))
     queries_file_path = os.path.join(curr_file_dir, "queries.sql")
-    with open(queries_file_path, 'r') as reader:
+    with open(queries_file_path, "r") as reader:
         queries = reader.read().split("\n")
 
     query_result = []
@@ -156,17 +221,20 @@ def main():
         # Run the query
         print("Benchmarking query", query_idx + 1)
         fallback, query_run_time = benchmark_query(args, query, f"query{query_idx + 1}")
-        query_result.append({
-            "query" : query_idx + 1,
-            "query_time_sec" : query_run_time,
-            "fallback": fallback
-        })
+        query_result.append(
+            {
+                "query": query_idx + 1,
+                "query_time_sec": query_run_time,
+                "fallback": fallback,
+            }
+        )
 
     # Save the results to the specified file
     result_df = pd.DataFrame(query_result)
     result_df.to_csv(args.result_save_path, index=False)
     print(f"Benchmark times saved to {args.result_save_path}.")
     print(f"Benchmark output saved to {args.output_save_path}.")
+
 
 if __name__ == "__main__":
     main()

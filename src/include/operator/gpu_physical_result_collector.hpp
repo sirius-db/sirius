@@ -16,73 +16,75 @@
 
 #pragma once
 
-#include "gpu_physical_operator.hpp"
 #include "duckdb/common/enums/statement_type.hpp"
-#include "gpu_buffer_manager.hpp"
-#include "gpu_query_result.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
+#include "gpu_buffer_manager.hpp"
+#include "gpu_physical_operator.hpp"
+#include "gpu_query_result.hpp"
 
 namespace duckdb {
 
 class GPUPreparedStatementData;
 
 class GPUPhysicalResultCollector : public GPUPhysicalOperator {
+ public:
+  static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::RESULT_COLLECTOR;
 
-public:
-	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::RESULT_COLLECTOR;
+ public:
+  explicit GPUPhysicalResultCollector(GPUPreparedStatementData& data);
 
-public:
-	explicit GPUPhysicalResultCollector(GPUPreparedStatementData &data);
+  StatementType statement_type;
+  StatementProperties properties;
+  GPUPhysicalOperator& plan;
+  vector<string> names;
+  GPUBufferManager* gpuBufferManager;
 
-	StatementType statement_type;
-	StatementProperties properties;
-	GPUPhysicalOperator &plan;
-	vector<string> names;
-	GPUBufferManager *gpuBufferManager;
+  // public:
+  // 	static unique_ptr<PhysicalResultCollector> GetResultCollector(ClientContext &context,
+  // PreparedStatementData &data);
 
-// public:
-// 	static unique_ptr<PhysicalResultCollector> GetResultCollector(ClientContext &context, PreparedStatementData &data);
+ public:
+  // //! The final method used to fetch the query result from this operator
+  virtual unique_ptr<QueryResult> GetResult(GlobalSinkState& state) = 0;
 
-public:
-	// //! The final method used to fetch the query result from this operator
-	virtual unique_ptr<QueryResult> GetResult(GlobalSinkState &state) = 0;
-	
-	bool IsSink() const override {
-		return true;
-	}
+  bool IsSink() const override { return true; }
 
-public:
-	vector<const_reference<GPUPhysicalOperator>> GetChildren() const override;
-	void BuildPipelines(GPUPipeline &current, GPUMetaPipeline &meta_pipeline) override;
+ public:
+  vector<const_reference<GPUPhysicalOperator>> GetChildren() const override;
+  void BuildPipelines(GPUPipeline& current, GPUMetaPipeline& meta_pipeline) override;
 
-	bool IsSource() const override {
-		return true;
-	}
+  bool IsSource() const override { return true; }
 };
-
 
 class GPUPhysicalMaterializedCollector : public GPUPhysicalResultCollector {
-public:
-	GPUPhysicalMaterializedCollector(GPUPreparedStatementData &data);
-	unique_ptr<GPUResultCollection> result_collection;
+ public:
+  GPUPhysicalMaterializedCollector(GPUPreparedStatementData& data);
+  unique_ptr<GPUResultCollection> result_collection;
 
-public:
-	unique_ptr<QueryResult> GetResult(GlobalSinkState &state) override;
+ public:
+  unique_ptr<QueryResult> GetResult(GlobalSinkState& state) override;
 
-public:
-	// Sink interface
-	static SinkResultType ConvertGPUTableToCPUCollection(
-		GPUIntermediateRelation& input_relation, const vector<LogicalType>& types,
-		GPUResultCollection* result_collection, GPUBufferManager *gpuBufferManager);
-	SinkResultType Sink(GPUIntermediateRelation &input_relation) const override;
+ public:
+  // Sink interface
+  static SinkResultType ConvertGPUTableToCPUCollection(GPUIntermediateRelation& input_relation,
+                                                       const vector<LogicalType>& types,
+                                                       GPUResultCollection* result_collection,
+                                                       GPUBufferManager* gpuBufferManager);
+  SinkResultType Sink(GPUIntermediateRelation& input_relation) const override;
 
-	unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const override;
-	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
+  unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext& context) const override;
+  unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext& context) const override;
 
-	template <typename T> static void FinalMaterializeInternal(GPUIntermediateRelation input_relation, GPUIntermediateRelation& output_relation, size_t col);
-	static void FinalMaterializeString(GPUIntermediateRelation input_relation, GPUIntermediateRelation& output_relation, size_t col);
-	static size_t FinalMaterialize(GPUIntermediateRelation input_relation, GPUIntermediateRelation& output_relation, size_t col);
-
+  template <typename T>
+  static void FinalMaterializeInternal(GPUIntermediateRelation input_relation,
+                                       GPUIntermediateRelation& output_relation,
+                                       size_t col);
+  static void FinalMaterializeString(GPUIntermediateRelation input_relation,
+                                     GPUIntermediateRelation& output_relation,
+                                     size_t col);
+  static size_t FinalMaterialize(GPUIntermediateRelation input_relation,
+                                 GPUIntermediateRelation& output_relation,
+                                 size_t col);
 };
 
-} // namespace duckdb
+}  // namespace duckdb

@@ -81,7 +81,7 @@ order by
   s.s_name,
   p.p_partkey
 ) TO 'test/answers/tpch/q2.csv' (HEADER, DELIMITER '|');
-    
+
 COPY (
 select
   l.l_orderkey,

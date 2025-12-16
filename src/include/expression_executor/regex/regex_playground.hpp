@@ -17,17 +17,19 @@
 #pragma once
 
 #include <cudf/column/column_factories.hpp>
-#include <cudf/transform.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/transform.hpp>
+
 #include <rmm/cuda_stream_view.hpp>
 
 namespace sirius {
 namespace expression {
 
 class regex_playground {
-public:
-    static std::unique_ptr<cudf::column> jit_transform_clickbench_q28_regex(const cudf::column_view& input);
+ public:
+  static std::unique_ptr<cudf::column> jit_transform_clickbench_q28_regex(
+    const cudf::column_view& input);
 };
 
-} // namespace expression
-} // namespace sirius
+}  // namespace expression
+}  // namespace sirius

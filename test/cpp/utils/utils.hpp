@@ -17,7 +17,6 @@
 #pragma once
 
 #include "catch.hpp"
-
 #include "gpu_buffer_manager.hpp"
 #include "gpu_columns.hpp"
 #include "helper/helper.hpp"
@@ -26,9 +25,9 @@
 
 namespace duckdb {
 
-// The buffer manager is shared across all threads so we need to allocate the memory needed by all tests
-// upfront when initializating the buffer manager
-constexpr size_t TEST_BUFFER_MANAGER_MEMORY_BYTES = 2L * 1024L * 1024L * 1024L; // 2 GB for testing
+// The buffer manager is shared across all threads so we need to allocate the memory needed by all
+// tests upfront when initializing the buffer manager
+constexpr size_t TEST_BUFFER_MANAGER_MEMORY_BYTES = 2L * 1024L * 1024L * 1024L;  // 2 GB for testing
 
 template <typename T>
 T rand_int(T low, T high);
@@ -39,35 +38,44 @@ GPUBufferManager* initialize_test_buffer_manager();
 
 void fill_gpu_buffer_with_random_data(uint8_t* gpu_buffer, size_t num_bytes);
 
-shared_ptr<GPUIntermediateRelation> create_table(
-  GPUBufferManager* gpu_buffer_manager, const vector<GPUColumnType>& types, const int num_rows,
-  uint8_t**& host_data, uint64_t**& host_offset);
+shared_ptr<GPUIntermediateRelation> create_table(GPUBufferManager* gpu_buffer_manager,
+                                                 const vector<GPUColumnType>& types,
+                                                 const int num_rows,
+                                                 uint8_t**& host_data,
+                                                 uint64_t**& host_offset);
 
-void verify_table(GPUBufferManager* gpu_buffer_manager, GPUIntermediateRelation& table,
-                  uint8_t** expected_host_data, uint64_t** expected_host_offset);
+void verify_table(GPUBufferManager* gpu_buffer_manager,
+                  GPUIntermediateRelation& table,
+                  uint8_t** expected_host_data,
+                  uint64_t** expected_host_offset);
 
-void free_cpu_buffer(const vector<GPUColumnType>& types, uint8_t** host_data, uint64_t** host_offset);
+void free_cpu_buffer(const vector<GPUColumnType>& types,
+                     uint8_t** host_data,
+                     uint64_t** host_offset);
 
-void verify_cuda_errors(const char *msg); 
+void verify_cuda_errors(const char* msg);
 
 void verify_gpu_buffer_equality(uint8_t* buffer_1, uint8_t* buffer_2, size_t num_bytes);
 
 void verify_gpu_column_equality(shared_ptr<GPUColumn> col1, shared_ptr<GPUColumn> col2);
 
-shared_ptr<GPUColumn> create_column_with_random_data(GPUColumnTypeId col_type, size_t num_records, 
-  size_t chars_per_record = 1, size_t num_materialize_row_ids = 0, bool has_null_mask = false);
+shared_ptr<GPUColumn> create_column_with_random_data(GPUColumnTypeId col_type,
+                                                     size_t num_records,
+                                                     size_t chars_per_record        = 1,
+                                                     size_t num_materialize_row_ids = 0,
+                                                     bool has_null_mask             = false);
 
-}
+}  // namespace duckdb
 
 namespace sirius {
 
 std::mt19937_64& global_rng();
 
 sirius::unique_ptr<cudf::table> create_cudf_table_with_random_data(
-    size_t num_rows,
-    const sirius::vector<cudf::data_type>& column_types,
-    const sirius::vector<std::optional<std::pair<int, int>>>& ranges,
-    rmm::cuda_stream_view stream,
-    rmm::device_async_resource_ref mr);
+  size_t num_rows,
+  const sirius::vector<cudf::data_type>& column_types,
+  const sirius::vector<std::optional<std::pair<int, int>>>& ranges,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr);
 
-}
+}  // namespace sirius

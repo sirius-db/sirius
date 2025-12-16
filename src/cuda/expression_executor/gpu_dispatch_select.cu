@@ -16,13 +16,13 @@
 
 #include "expression_executor/gpu_dispatcher.hpp"
 #include "gpu_buffer_manager.hpp"
+
 #include <cub/cub.cuh>
+
 #include <tuple>
 
-namespace duckdb
-{
-namespace sirius
-{
+namespace duckdb {
+namespace sirius {
 
 //----------Select----------//
 std::tuple<uint64_t*, uint64_t> GpuDispatcher::DispatchSelect(const cudf::column_view& bitmap,
@@ -57,5 +57,5 @@ std::tuple<uint64_t*, uint64_t> GpuDispatcher::DispatchSelect(const cudf::column
   return std::make_tuple(row_ids, num_selected);
 }
 
-} // namespace sirius
-} // namespace duckdb
+}  // namespace sirius
+}  // namespace duckdb

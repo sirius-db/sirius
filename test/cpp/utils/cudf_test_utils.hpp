@@ -17,6 +17,7 @@
 #pragma once
 
 #include <cudf/table/table.hpp>
+
 #include <rmm/cuda_stream_view.hpp>
 
 namespace sirius {

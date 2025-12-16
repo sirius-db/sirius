@@ -78,7 +78,7 @@ order by
   s.s_name,
   p.p_partkey
 limit 100;");
-    
+
 call gpu_processing("select
   l.l_orderkey,
   sum(l.l_extendedprice * (1 - l.l_discount)) as revenue,

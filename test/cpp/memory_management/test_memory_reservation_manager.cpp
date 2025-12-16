@@ -244,7 +244,7 @@ SCENARIO("multi-reservation memory_resource mismatch", "[memory_space]")
       REQUIRE(mr->get_allocated_bytes(stream2) == large_alloc_size);
       REQUIRE(mr->get_available_memory(stream2) == mr->get_available_memory());
       THEN(
-        "allocations from another memory resource is abosrbed by other stream as extra reservation")
+        "allocations from another memory resource is absorbed by other stream as extra reservation")
       {
         mr->deallocate(buff2, large_alloc_size, stream1);
         CHECK(mr->get_available_memory_print(stream1) ==

@@ -16,9 +16,9 @@
 
 #pragma once
 
-#include "helper/common.h"
-#include "duckdb/common/types.hpp"
 #include "cudf_utils.hpp"
+#include "duckdb/common/types.hpp"
+#include "helper/common.h"
 using namespace std;
 
 namespace duckdb {
@@ -27,218 +27,239 @@ class GPUBufferManager;
 
 int32_t* convertUInt64ToInt32(uint64_t* data, size_t N);
 uint64_t* convertInt32ToUInt64(int32_t* data, size_t N);
-template <typename T> void callCudaMemcpyHostToDevice(T* dest, T* src, size_t size, int gpu);
-template <typename T> void callCudaMemcpyDeviceToHost(T* dest, T* src, size_t size, int gpu);
-template <typename T> void callCudaMemcpyDeviceToDevice(T* dest, T* src, size_t size, int gpu);
+template <typename T>
+void callCudaMemcpyHostToDevice(T* dest, T* src, size_t size, int gpu);
+template <typename T>
+void callCudaMemcpyDeviceToHost(T* dest, T* src, size_t size, int gpu);
+template <typename T>
+void callCudaMemcpyDeviceToDevice(T* dest, T* src, size_t size, int gpu);
 void callCudaMemset(void* ptr, int value, size_t size, int gpu);
-template <typename T> void materializeExpression(T *a, T*& result, uint64_t *row_ids, uint64_t result_len, cudf::bitmask_type* mask, cudf::bitmask_type* &out_mask);
-template <typename T> void materializeWithoutNull(T *a, T*& result, uint64_t *row_ids, uint64_t result_len);
-void materializeString(uint8_t* data, uint64_t* offset, uint8_t* &result, uint64_t* &result_offset, uint64_t* row_ids, uint64_t* &result_bytes, uint64_t result_len, cudf::bitmask_type* mask, cudf::bitmask_type* &out_mask);
+template <typename T>
+void materializeExpression(T* a,
+                           T*& result,
+                           uint64_t* row_ids,
+                           uint64_t result_len,
+                           cudf::bitmask_type* mask,
+                           cudf::bitmask_type*& out_mask);
+template <typename T>
+void materializeWithoutNull(T* a, T*& result, uint64_t* row_ids, uint64_t result_len);
+void materializeString(uint8_t* data,
+                       uint64_t* offset,
+                       uint8_t*& result,
+                       uint64_t*& result_offset,
+                       uint64_t* row_ids,
+                       uint64_t*& result_bytes,
+                       uint64_t result_len,
+                       cudf::bitmask_type* mask,
+                       cudf::bitmask_type*& out_mask);
 size_t getMaskBytesSize(uint64_t column_length);
-cudf::bitmask_type* createNullMask(size_t size, cudf::mask_state state = cudf::mask_state::ALL_VALID);
+cudf::bitmask_type* createNullMask(size_t size,
+                                   cudf::mask_state state = cudf::mask_state::ALL_VALID);
 
 enum class GPUColumnTypeId {
-    INVALID = 0,
-    INT16,
-    INT32,
-    INT64,
-    FLOAT32,
-    FLOAT64,
-    BOOLEAN,
-    DATE,
-    TIMESTAMP_SEC,
-    TIMESTAMP_MS,
-    TIMESTAMP_US,
-    TIMESTAMP_NS,
-    VARCHAR,
-    INT128,
-    DECIMAL
+  INVALID = 0,
+  INT16,
+  INT32,
+  INT64,
+  FLOAT32,
+  FLOAT64,
+  BOOLEAN,
+  DATE,
+  TIMESTAMP_SEC,
+  TIMESTAMP_MS,
+  TIMESTAMP_US,
+  TIMESTAMP_NS,
+  VARCHAR,
+  INT128,
+  DECIMAL
 };
 
 struct GPUDecimalTypeInfo {
-    GPUDecimalTypeInfo(uint8_t width, uint8_t scale)
-        : width_(width), scale_(scale) {
-        D_ASSERT(width >= scale);
-    }
+  GPUDecimalTypeInfo(uint8_t width, uint8_t scale) : width_(width), scale_(scale)
+  {
+    D_ASSERT(width >= scale);
+  }
 
-    size_t GetDecimalTypeSize() const;
+  size_t GetDecimalTypeSize() const;
 
-    uint8_t width_;
-	uint8_t scale_;
+  uint8_t width_;
+  uint8_t scale_;
 };
 
 struct GPUColumnType {
-public:
-    GPUColumnType() : id_(GPUColumnTypeId::INVALID) {}
-    explicit GPUColumnType(GPUColumnTypeId id) : id_(id) {}
-    ~GPUColumnType() = default;
+ public:
+  GPUColumnType() : id_(GPUColumnTypeId::INVALID) {}
+  explicit GPUColumnType(GPUColumnTypeId id) : id_(id) {}
+  ~GPUColumnType() = default;
 
-    inline GPUColumnTypeId id() const {
-        return id_;
-    }
+  inline GPUColumnTypeId id() const { return id_; }
 
-    inline GPUDecimalTypeInfo* GetDecimalTypeInfo() const {
-        return decimal_type_info_.get();
-    }
+  inline GPUDecimalTypeInfo* GetDecimalTypeInfo() const { return decimal_type_info_.get(); }
 
-    void SetDecimalTypeInfo(uint8_t width, uint8_t scale) {
-        decimal_type_info_ = make_shared_ptr<GPUDecimalTypeInfo>(width, scale);
-    }
+  void SetDecimalTypeInfo(uint8_t width, uint8_t scale)
+  {
+    decimal_type_info_ = make_shared_ptr<GPUDecimalTypeInfo>(width, scale);
+  }
 
-private:
-    GPUColumnTypeId id_;
-    shared_ptr<GPUDecimalTypeInfo> decimal_type_info_;
+ private:
+  GPUColumnTypeId id_;
+  shared_ptr<GPUDecimalTypeInfo> decimal_type_info_;
 };
 
-inline GPUColumnType convertLogicalTypeToColumnType(LogicalType type) {
-    switch (type.id()) {
-        case LogicalTypeId::SMALLINT:
-            return GPUColumnType(GPUColumnTypeId::INT16);
-        case LogicalTypeId::INTEGER:
-            return GPUColumnType(GPUColumnTypeId::INT32);
-        case LogicalTypeId::BIGINT:
-            return GPUColumnType(GPUColumnTypeId::INT64);
-        case LogicalTypeId::HUGEINT:
-            return GPUColumnType(GPUColumnTypeId::INT128);
-        case LogicalTypeId::FLOAT:
-            return GPUColumnType(GPUColumnTypeId::FLOAT32);
-        case LogicalTypeId::DOUBLE:
-            return GPUColumnType(GPUColumnTypeId::FLOAT64);
-        case LogicalTypeId::BOOLEAN:
-            return GPUColumnType(GPUColumnTypeId::BOOLEAN);
-        case LogicalTypeId::DATE:
-            return GPUColumnType(GPUColumnTypeId::DATE);
-        case LogicalTypeId::TIMESTAMP_SEC:
-            return GPUColumnType(GPUColumnTypeId::TIMESTAMP_SEC);
-        case LogicalTypeId::TIMESTAMP_MS:
-            return GPUColumnType(GPUColumnTypeId::TIMESTAMP_MS);
-        case LogicalTypeId::TIMESTAMP:
-            return GPUColumnType(GPUColumnTypeId::TIMESTAMP_US);
-        case LogicalTypeId::TIMESTAMP_NS:
-            return GPUColumnType(GPUColumnTypeId::TIMESTAMP_NS);
-        case LogicalTypeId::VARCHAR:
-            return GPUColumnType(GPUColumnTypeId::VARCHAR);
-        case LogicalTypeId::DECIMAL: {
-            GPUColumnType column_type(GPUColumnTypeId::DECIMAL);
-            column_type.SetDecimalTypeInfo(DecimalType::GetWidth(type), DecimalType::GetScale(type));
-            return column_type;
-        }
-        default:
-            throw InvalidInputException("Unsupported duckdb column type in `convertLogicalTypeToColumnType`: %d",
-                                        static_cast<int>(type.id()));
+inline GPUColumnType convertLogicalTypeToColumnType(LogicalType type)
+{
+  switch (type.id()) {
+    case LogicalTypeId::SMALLINT: return GPUColumnType(GPUColumnTypeId::INT16);
+    case LogicalTypeId::INTEGER: return GPUColumnType(GPUColumnTypeId::INT32);
+    case LogicalTypeId::BIGINT: return GPUColumnType(GPUColumnTypeId::INT64);
+    case LogicalTypeId::HUGEINT: return GPUColumnType(GPUColumnTypeId::INT128);
+    case LogicalTypeId::FLOAT: return GPUColumnType(GPUColumnTypeId::FLOAT32);
+    case LogicalTypeId::DOUBLE: return GPUColumnType(GPUColumnTypeId::FLOAT64);
+    case LogicalTypeId::BOOLEAN: return GPUColumnType(GPUColumnTypeId::BOOLEAN);
+    case LogicalTypeId::DATE: return GPUColumnType(GPUColumnTypeId::DATE);
+    case LogicalTypeId::TIMESTAMP_SEC: return GPUColumnType(GPUColumnTypeId::TIMESTAMP_SEC);
+    case LogicalTypeId::TIMESTAMP_MS: return GPUColumnType(GPUColumnTypeId::TIMESTAMP_MS);
+    case LogicalTypeId::TIMESTAMP: return GPUColumnType(GPUColumnTypeId::TIMESTAMP_US);
+    case LogicalTypeId::TIMESTAMP_NS: return GPUColumnType(GPUColumnTypeId::TIMESTAMP_NS);
+    case LogicalTypeId::VARCHAR: return GPUColumnType(GPUColumnTypeId::VARCHAR);
+    case LogicalTypeId::DECIMAL: {
+      GPUColumnType column_type(GPUColumnTypeId::DECIMAL);
+      column_type.SetDecimalTypeInfo(DecimalType::GetWidth(type), DecimalType::GetScale(type));
+      return column_type;
     }
+    default:
+      throw InvalidInputException(
+        "Unsupported duckdb column type in `convertLogicalTypeToColumnType`: %d",
+        static_cast<int>(type.id()));
+  }
 }
 
-inline LogicalType convertColumnTypeToLogicalType(const GPUColumnType& type) {
-	switch (type.id()) {
-		case GPUColumnTypeId::INT16:
-			return LogicalType::SMALLINT;
-		case GPUColumnTypeId::INT32:
-			return LogicalType::INTEGER;
-		case GPUColumnTypeId::INT64:
-			return LogicalType::BIGINT;
-		case GPUColumnTypeId::FLOAT32:
-			return LogicalType::FLOAT;
-		case GPUColumnTypeId::FLOAT64:
-			return LogicalType::DOUBLE;
-		case GPUColumnTypeId::BOOLEAN:
-			return LogicalType::BOOLEAN;
-		case GPUColumnTypeId::DATE:
-			return LogicalType::DATE;
-		case GPUColumnTypeId::TIMESTAMP_SEC:
-			return LogicalType::TIMESTAMP_S;
-		case GPUColumnTypeId::TIMESTAMP_MS:
-			return LogicalType::TIMESTAMP_MS;
-		case GPUColumnTypeId::TIMESTAMP_US:
-			return LogicalType::TIMESTAMP;
-		case GPUColumnTypeId::TIMESTAMP_NS:
-			return LogicalType::TIMESTAMP_NS;
-		case GPUColumnTypeId::VARCHAR:
-			return LogicalType::VARCHAR;
-		case GPUColumnTypeId::INT128:
-			return LogicalType::HUGEINT;
-		case GPUColumnTypeId::DECIMAL: {
-			GPUDecimalTypeInfo* decimal_type_info = type.GetDecimalTypeInfo();
-			if (decimal_type_info == nullptr) {
-					throw InternalException("`decimal_type_info` not set for DECIMAL type in `ColumnTypeToLogicalType`");
-			}
-			return LogicalType::DECIMAL(decimal_type_info->width_, decimal_type_info->scale_);
-		}
-		default:
-			throw NotImplementedException("Unsupported sirius column type in `ColumnTypeToLogicalType`: %d",
-																		static_cast<int>(type.id()));
-	}
+inline LogicalType convertColumnTypeToLogicalType(const GPUColumnType& type)
+{
+  switch (type.id()) {
+    case GPUColumnTypeId::INT16: return LogicalType::SMALLINT;
+    case GPUColumnTypeId::INT32: return LogicalType::INTEGER;
+    case GPUColumnTypeId::INT64: return LogicalType::BIGINT;
+    case GPUColumnTypeId::FLOAT32: return LogicalType::FLOAT;
+    case GPUColumnTypeId::FLOAT64: return LogicalType::DOUBLE;
+    case GPUColumnTypeId::BOOLEAN: return LogicalType::BOOLEAN;
+    case GPUColumnTypeId::DATE: return LogicalType::DATE;
+    case GPUColumnTypeId::TIMESTAMP_SEC: return LogicalType::TIMESTAMP_S;
+    case GPUColumnTypeId::TIMESTAMP_MS: return LogicalType::TIMESTAMP_MS;
+    case GPUColumnTypeId::TIMESTAMP_US: return LogicalType::TIMESTAMP;
+    case GPUColumnTypeId::TIMESTAMP_NS: return LogicalType::TIMESTAMP_NS;
+    case GPUColumnTypeId::VARCHAR: return LogicalType::VARCHAR;
+    case GPUColumnTypeId::INT128: return LogicalType::HUGEINT;
+    case GPUColumnTypeId::DECIMAL: {
+      GPUDecimalTypeInfo* decimal_type_info = type.GetDecimalTypeInfo();
+      if (decimal_type_info == nullptr) {
+        throw InternalException(
+          "`decimal_type_info` not set for DECIMAL type in `ColumnTypeToLogicalType`");
+      }
+      return LogicalType::DECIMAL(decimal_type_info->width_, decimal_type_info->scale_);
+    }
+    default:
+      throw NotImplementedException(
+        "Unsupported sirius column type in `ColumnTypeToLogicalType`: %d",
+        static_cast<int>(type.id()));
+  }
 }
 
 class DataWrapper {
-public:
-    DataWrapper() = default; // Add default constructor
-    DataWrapper(GPUColumnType type, uint8_t* data, size_t size, cudf::bitmask_type* validity_mask);
-    DataWrapper(GPUColumnType type, uint8_t* data, uint64_t* offset, size_t size, size_t num_bytes, bool is_string_data, cudf::bitmask_type* validity_mask);
-	GPUColumnType type;
-	uint8_t* data;
-    size_t size; // number of rows in the column (currently equals to column_length)
-    uint64_t* offset{nullptr};
-    size_t num_bytes; // number of bytes in the column
-    size_t getColumnTypeSize() const;
-    bool is_string_data{false};
-    cudf::bitmask_type* validity_mask{nullptr}; // validity mask for the column, used to represent NULL values
-    size_t mask_bytes{0};
+ public:
+  DataWrapper() = default;  // Add default constructor
+  DataWrapper(GPUColumnType type, uint8_t* data, size_t size, cudf::bitmask_type* validity_mask);
+  DataWrapper(GPUColumnType type,
+              uint8_t* data,
+              uint64_t* offset,
+              size_t size,
+              size_t num_bytes,
+              bool is_string_data,
+              cudf::bitmask_type* validity_mask);
+  GPUColumnType type;
+  uint8_t* data;
+  size_t size;  // number of rows in the column (currently equals to column_length)
+  uint64_t* offset{nullptr};
+  size_t num_bytes;  // number of bytes in the column
+  size_t getColumnTypeSize() const;
+  bool is_string_data{false};
+  cudf::bitmask_type* validity_mask{
+    nullptr};  // validity mask for the column, used to represent NULL values
+  size_t mask_bytes{0};
 };
 
 class GPUColumn {
-public:
-    GPUColumn(size_t column_length, GPUColumnType type, uint8_t* data, 
+ public:
+  GPUColumn(size_t column_length,
+            GPUColumnType type,
+            uint8_t* data,
             cudf::bitmask_type* validity_mask);
-    GPUColumn(size_t _column_length, GPUColumnType type, uint8_t* data, uint64_t* offset, size_t num_bytes, bool is_string_data, 
+  GPUColumn(size_t _column_length,
+            GPUColumnType type,
+            uint8_t* data,
+            uint64_t* offset,
+            size_t num_bytes,
+            bool is_string_data,
             cudf::bitmask_type* validity_mask);
-    GPUColumn(shared_ptr<GPUColumn> other);
-    ~GPUColumn(){};
-    int* GetDataInt32();
-    uint64_t* GetDataUInt64();
-    float* GetDataFloat32();
-    double* GetDataFloat64();
-    char* GetDataVarChar();
-    uint8_t* GetDataBoolean();
-    uint64_t* GetRowIds();
-    uint8_t* GetData();
+  GPUColumn(shared_ptr<GPUColumn> other);
+  ~GPUColumn() {};
+  int* GetDataInt32();
+  uint64_t* GetDataUInt64();
+  float* GetDataFloat32();
+  double* GetDataFloat64();
+  char* GetDataVarChar();
+  uint8_t* GetDataBoolean();
+  uint64_t* GetRowIds();
+  uint8_t* GetData();
 
-    DataWrapper data_wrapper;
-    uint64_t* row_ids;
-    size_t row_id_count; // number of rows in the row_ids array
-    size_t column_length; // number of rows in the column (currently equals to column_length)
-    bool is_unique; // indicator whether the column has unique values
+  DataWrapper data_wrapper;
+  uint64_t* row_ids;
+  size_t row_id_count;   // number of rows in the row_ids array
+  size_t column_length;  // number of rows in the column (currently equals to column_length)
+  bool is_unique;        // indicator whether the column has unique values
 
-    uint8_t* segment_start_ptr{nullptr}; // Pointer to the start of the segment where this column is stored, if this column is cached on CPU
-    int segment_id{-1}; // Metadata used by the CPU cache to identify where in the CPU this column is cached
+  uint8_t* segment_start_ptr{nullptr};  // Pointer to the start of the segment where this column is
+                                        // stored, if this column is cached on CPU
+  int segment_id{
+    -1};  // Metadata used by the CPU cache to identify where in the CPU this column is cached
 
-    cudf::column_view convertToCudfColumn();
-    int32_t* convertSiriusOffsetToCudfOffset(); // convert the offset of GPUColumn to the offset of the cudf column
-    int32_t* convertSiriusRowIdsToCudfRowIds(); // convert the row_ids of the GPUColumn to the row_ids of the cudf column
-    void convertCudfRowIdsToSiriusRowIds(int32_t* cudf_row_ids); // convert the row_ids of the cudf column to the row_ids of the GPUColumn
-    void convertCudfOffsetToSiriusOffset(int32_t* cudf_offset); // convert the offset of the cudf column to the offset of the GPUColumn
-    void setFromCudfColumn(cudf::column& cudf_column, bool _is_unique, int32_t* _row_ids, uint64_t _row_id_count, GPUBufferManager* gpuBufferManager);
-    void setFromCudfScalar(cudf::scalar& cudf_scalar, GPUBufferManager* gpuBufferManager); // set the GPUColumn from the cudf scalar
-    //cudf mask is int32_t type, but has the granularity of 64B
-    //duckdb mask is uint64_t type and the granularity of 8B
-    // void convertCudfMaskToSiriusMask(std::unique_ptr<rmm::device_buffer> cudf_mask, cudf::size_type col_size, GPUBufferManager* gpuBufferManager);
+  cudf::column_view convertToCudfColumn();
+  int32_t* convertSiriusOffsetToCudfOffset();  // convert the offset of GPUColumn to the offset of
+                                               // the cudf column
+  int32_t* convertSiriusRowIdsToCudfRowIds();  // convert the row_ids of the GPUColumn to the
+                                               // row_ids of the cudf column
+  void convertCudfRowIdsToSiriusRowIds(
+    int32_t*
+      cudf_row_ids);  // convert the row_ids of the cudf column to the row_ids of the GPUColumn
+  void convertCudfOffsetToSiriusOffset(
+    int32_t* cudf_offset);  // convert the offset of the cudf column to the offset of the GPUColumn
+  void setFromCudfColumn(cudf::column& cudf_column,
+                         bool _is_unique,
+                         int32_t* _row_ids,
+                         uint64_t _row_id_count,
+                         GPUBufferManager* gpuBufferManager);
+  void setFromCudfScalar(
+    cudf::scalar& cudf_scalar,
+    GPUBufferManager* gpuBufferManager);  // set the GPUColumn from the cudf scalar
+  // cudf mask is int32_t type, but has the granularity of 64B
+  // duckdb mask is uint64_t type and the granularity of 8B
+  //  void convertCudfMaskToSiriusMask(std::unique_ptr<rmm::device_buffer> cudf_mask,
+  //  cudf::size_type col_size, GPUBufferManager* gpuBufferManager);
 
-    // Returns the total number of bytes to store all of the column details
-    size_t getTotalColumnSize();
+  // Returns the total number of bytes to store all of the column details
+  size_t getTotalColumnSize();
 };
 
 class GPUIntermediateRelation {
-public:
-    GPUIntermediateRelation(size_t column_count);
-    ~GPUIntermediateRelation(){};
-    bool checkLateMaterialization(size_t idx);
+ public:
+  GPUIntermediateRelation(size_t column_count);
+  ~GPUIntermediateRelation() {};
+  bool checkLateMaterialization(size_t idx);
 
-    string names;
-	vector<string> column_names;
-    vector<shared_ptr<GPUColumn>> columns;
-    size_t column_count;
+  string names;
+  vector<string> column_names;
+  vector<shared_ptr<GPUColumn>> columns;
+  size_t column_count;
 };
 
-
-
-} // namespace duckdb   
+}  // namespace duckdb

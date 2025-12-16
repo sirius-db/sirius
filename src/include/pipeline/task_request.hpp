@@ -15,33 +15,34 @@
  */
 
 #pragma once
-#include "parallel/task_executor.hpp"
-#include "memory/memory_reservation.hpp"
-#include "pipeline/gpu_pipeline_task.hpp"
 #include "data/data_repository.hpp"
+#include "memory/memory_reservation.hpp"
 #include "memory/memory_space.hpp"
+#include "parallel/task_executor.hpp"
+#include "pipeline/gpu_pipeline_task.hpp"
+
 #include <blockingconcurrentqueue.h>
 
 namespace sirius {
 namespace parallel {
 
 struct task_request {
-    int device_id;
+  int device_id;
 };
 
 class task_request_queue {
-public:
-    task_request_queue(size_t num_threads) : _num_threads(num_threads) {};
-    void open();
-    void close();
-    void push(sirius::unique_ptr<task_request> request);
-    unique_ptr<task_request> pull();
+ public:
+  task_request_queue(size_t num_threads) : _num_threads(num_threads) {};
+  void open();
+  void close();
+  void push(sirius::unique_ptr<task_request> request);
+  unique_ptr<task_request> pull();
 
-private:
-    size_t _num_threads;
-    duckdb_moodycamel::BlockingConcurrentQueue<sirius::unique_ptr<task_request>> _request_queue;
-    std::atomic<bool> _is_open{false}; ///< Whether the queue is open for pushing/pulling tasks
+ private:
+  size_t _num_threads;
+  duckdb_moodycamel::BlockingConcurrentQueue<sirius::unique_ptr<task_request>> _request_queue;
+  std::atomic<bool> _is_open{false};  ///< Whether the queue is open for pushing/pulling tasks
 };
 
-} // namespace parallel
-} // namespace sirius
+}  // namespace parallel
+}  // namespace sirius

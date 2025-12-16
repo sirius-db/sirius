@@ -22,19 +22,19 @@
 namespace duckdb {
 
 class GPUPhysicalEmptyResult : public GPUPhysicalOperator {
-public:
-	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::EMPTY_RESULT;
+ public:
+  static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::EMPTY_RESULT;
 
-public:
-	explicit GPUPhysicalEmptyResult(vector<LogicalType> types, idx_t estimated_cardinality)
-	    : GPUPhysicalOperator(PhysicalOperatorType::EMPTY_RESULT, std::move(types), estimated_cardinality) {
-	}
+ public:
+  explicit GPUPhysicalEmptyResult(vector<LogicalType> types, idx_t estimated_cardinality)
+    : GPUPhysicalOperator(
+        PhysicalOperatorType::EMPTY_RESULT, std::move(types), estimated_cardinality)
+  {
+  }
 
-public:
-	SourceResultType GetData(GPUIntermediateRelation& output_relation) const override;
+ public:
+  SourceResultType GetData(GPUIntermediateRelation& output_relation) const override;
 
-	bool IsSource() const override {
-		return true;
-	}
+  bool IsSource() const override { return true; }
 };
-} // namespace duckdb
+}  // namespace duckdb
