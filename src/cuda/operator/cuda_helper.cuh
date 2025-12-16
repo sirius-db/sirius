@@ -40,49 +40,47 @@
 
 #define CUB_STDERR
 
+// clang-format off
 // FIXME: handle error message from kernel to log file
-#define cudaAssert(X)                                                                         \
-  {                                                                                           \
-    if (!(X)) {                                                                               \
-      /* printf( "Thread %d:%d failed assert at %s:%d!\n", blockIdx.x, threadIdx.x, __FILE__, \
-       * __LINE__ ); */                                                                       \
-      return;                                                                                 \
-    }                                                                                         \
-  }
+#define cudaAssert( X ) { \
+    if ( !(X) ) { \
+        /* printf( "Thread %d:%d failed assert at %s:%d!\n", blockIdx.x, threadIdx.x, __FILE__, __LINE__ ); */ \
+        return; \
+    } \
+}
 
-#define CHECK_ERROR()                       \
-  {                                         \
-    cudaDeviceSynchronize();                \
-    cudaError_t error = cudaGetLastError(); \
-    if (error != cudaSuccess) {             \
-      gpuErrchk(error);                     \
-      exit(-1);                             \
-    }                                       \
-  }
+#define CHECK_ERROR() { \
+  cudaDeviceSynchronize(); \
+  cudaError_t error = cudaGetLastError(); \
+  if(error != cudaSuccess) \
+  { \
+    gpuErrchk(error); \
+    exit(-1); \
+  } \
+}
 
-#define CHECK_ERROR_STREAM(stream)          \
-  {                                         \
-    cudaStreamSynchronize(stream);          \
-    cudaError_t error = cudaGetLastError(); \
-    if (error != cudaSuccess) {             \
-      gpuErrchk(error);                     \
-      exit(-1);                             \
-    }                                       \
-  }
+#define CHECK_ERROR_STREAM(stream) { \
+  cudaStreamSynchronize(stream); \
+  cudaError_t error = cudaGetLastError(); \
+  if(error != cudaSuccess) \
+  { \
+    gpuErrchk(error); \
+    exit(-1); \
+  } \
+}
 
 // FIXME: handle error message from kernel to log file
-#define CHECK_CU_ERROR(err, cufunc)                                               \
-  {                                                                               \
-    if (err != CUDA_SUCCESS) {                                                    \
-      /* printf ("Error %d for CUDA Driver API function '%s'\n", err, cufunc); */ \
-      return -1;                                                                  \
-    }                                                                             \
-  }
+#define CHECK_CU_ERROR(err, cufunc) { \
+    if (err != CUDA_SUCCESS) { \
+        /* printf ("Error %d for CUDA Driver API function '%s'\n", err, cufunc); */ \
+        return -1; \
+    } \
+}
 
-#define gpuErrchk(and)                    \
-  {                                       \
-    gpuAssert((and), __FILE__, __LINE__); \
-  }
+#define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
+
+// clang-format on
+
 inline void gpuAssert(cudaError_t code, const char* file, int line, bool abort = true)
 {
   if (code != cudaSuccess) {
