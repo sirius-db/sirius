@@ -240,6 +240,12 @@ class reservation_aware_resource_adaptor : public rmm::mr::device_memory_resourc
   void reset_peak_allocated_bytes(rmm::cuda_stream_view stream);
 
   /**
+   * @brief Resets the peak allocated bytes for a specific stream to 0.
+   * @param stream The CUDA stream to reset
+   */
+  void reset_peak_total_allocated_bytes();
+
+  /**
    * @brief Gets the total reserved bytes across all streams.
    * @return The total reserved bytes
    */

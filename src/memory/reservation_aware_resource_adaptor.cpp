@@ -280,6 +280,11 @@ void reservation_aware_resource_adaptor::reset_peak_allocated_bytes(rmm::cuda_st
   if (stats) { stats->memory_reservation->peak_allocated_bytes.reset(0); }
 }
 
+void reservation_aware_resource_adaptor::reset_peak_total_allocated_bytes()
+{
+  _peak_total_allocated_bytes.reset(0);
+}
+
 std::size_t reservation_aware_resource_adaptor::get_total_reserved_bytes() const
 {
   return _total_reserved_bytes.load();
