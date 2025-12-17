@@ -335,7 +335,7 @@ TEST_CASE("data_repository_manager Add Multiple Batches", "[data_repository_mana
   size_t pipeline_id = 1;
   manager.add_new_repository(pipeline_id, std::make_unique<idata_repository>());
 
-  constexpr int num_batches           = 10;
+  constexpr int num_batches        = 10;
   std::vector<size_t> pipeline_ids = {pipeline_id};
 
   // Add multiple batches
@@ -475,7 +475,7 @@ TEST_CASE("data_repository_manager Thread-Safe Delete Batch", "[data_repository_
   size_t pipeline_id = 1;
   manager.add_new_repository(pipeline_id, std::make_unique<idata_repository>());
 
-  constexpr int num_batches           = 100;
+  constexpr int num_batches        = 100;
   std::vector<size_t> pipeline_ids = {pipeline_id};
   std::vector<uint64_t> batch_ids;
 
@@ -687,7 +687,7 @@ TEST_CASE("data_repository_manager High Contention Add Delete via View Destructo
   // Launch threads doing both add and delete operations
   for (int i = 0; i < num_threads; ++i) {
     threads.emplace_back([&]() {
-      auto& repo                          = manager.get_repository(pipeline_id);
+      auto& repo                       = manager.get_repository(pipeline_id);
       std::vector<size_t> pipeline_ids = {pipeline_id};
 
       for (int j = 0; j < operations_per_thread; ++j) {
@@ -818,7 +818,7 @@ TEST_CASE("data_repository_manager Full Workflow", "[data_repository_manager]")
     auto data         = std::make_unique<mock_data_representation>(memory::Tier::GPU, 2048);
     uint64_t batch_id = manager.get_next_data_batch_id();
     batch_ids.push_back(batch_id);
-    auto batch                = std::make_unique<data_batch>(batch_id, manager, std::move(data));
+    auto batch             = std::make_unique<data_batch>(batch_id, manager, std::move(data));
     std::vector<size_t> p0 = {0};
     manager.add_new_data_batch(std::move(batch), p0);
   }
@@ -828,7 +828,7 @@ TEST_CASE("data_repository_manager Full Workflow", "[data_repository_manager]")
     auto data         = std::make_unique<mock_data_representation>(memory::Tier::GPU, 4096);
     uint64_t batch_id = manager.get_next_data_batch_id();
     batch_ids.push_back(batch_id);
-    auto batch = std::make_unique<data_batch>(batch_id, manager, std::move(data));
+    auto batch              = std::make_unique<data_batch>(batch_id, manager, std::move(data));
     std::vector<size_t> p12 = {1, 2};
     manager.add_new_data_batch(std::move(batch), p12);
   }
@@ -920,7 +920,7 @@ TEST_CASE("data_repository_manager Large Number of Batches", "[data_repository_m
   size_t pipeline_id = 1;
   manager.add_new_repository(pipeline_id, std::make_unique<idata_repository>());
 
-  constexpr int num_batches           = 1000;
+  constexpr int num_batches        = 1000;
   std::vector<size_t> pipeline_ids = {pipeline_id};
 
   // Add many batches
@@ -984,7 +984,7 @@ TEST_CASE("data_repository_manager Batches With Different Sizes", "[data_reposit
   size_t pipeline_id = 1;
   manager.add_new_repository(pipeline_id, std::make_unique<idata_repository>());
 
-  std::vector<size_t> sizes           = {1, 1024, 1024 * 1024, 1024 * 1024 * 10};
+  std::vector<size_t> sizes        = {1, 1024, 1024 * 1024, 1024 * 1024 * 10};
   std::vector<size_t> pipeline_ids = {pipeline_id};
 
   // Add batches with different sizes
@@ -1013,7 +1013,7 @@ TEST_CASE("data_repository_manager Batches With Different Tiers", "[data_reposit
   size_t pipeline_id = 1;
   manager.add_new_repository(pipeline_id, std::make_unique<idata_repository>());
 
-  std::vector<memory::Tier> tiers     = {memory::Tier::GPU, memory::Tier::HOST, memory::Tier::DISK};
+  std::vector<memory::Tier> tiers  = {memory::Tier::GPU, memory::Tier::HOST, memory::Tier::DISK};
   std::vector<size_t> pipeline_ids = {pipeline_id};
 
   // Add batches with different tiers
@@ -1043,7 +1043,7 @@ TEST_CASE("data_repository_manager Rapid Add Delete Cycles", "[data_repository_m
   manager.add_new_repository(pipeline_id, std::make_unique<idata_repository>());
 
   std::vector<size_t> pipeline_ids = {pipeline_id};
-  auto& repo                          = manager.get_repository(pipeline_id);
+  auto& repo                       = manager.get_repository(pipeline_id);
 
   // Perform many cycles of add and delete
   for (int cycle = 0; cycle < 100; ++cycle) {

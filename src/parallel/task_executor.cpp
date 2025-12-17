@@ -42,10 +42,7 @@ void itask_executor::stop()
   _threads.clear();
 }
 
-void itask_executor::schedule(std::unique_ptr<itask> task)
-{
-  _task_queue->push(std::move(task));
-}
+void itask_executor::schedule(std::unique_ptr<itask> task) { _task_queue->push(std::move(task)); }
 
 void itask_executor::on_start() { _task_queue->open(); }
 

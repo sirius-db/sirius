@@ -221,7 +221,7 @@ class data_batch {
     _mutex;            ///< Mutex for thread-safe access to tier checking and reference counting
   uint64_t _batch_id;  ///< Unique identifier for this data batch
   std::unique_ptr<idata_representation> _data;  ///< Pointer to the actual data representation
-  size_t _view_count = 0;                          ///< Reference count for tracking views
+  size_t _view_count = 0;                       ///< Reference count for tracking views
   size_t _pin_count  = 0;  ///< Reference count for tracking pins to prevent eviction
   data_repository_manager* _data_repo_mgr;         ///< Pointer to the data repository manager
   cucascade::memory::memory_space* _memory_space;  ///< Memory space where the data resides

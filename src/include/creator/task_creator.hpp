@@ -62,8 +62,8 @@ class itask_creator {
   std::unique_ptr<parallel::task_executor_thread> _thread;
   std::atomic<uint64_t> _next_task_id = 0;  ///< Atomic counter for generating unique task IDs
   std::mutex _mtx;                          ///< Mutex for synchronization
-  std::condition_variable _cv;                 ///< Condition variable for thread coordination
-  bool _ready = false;                         ///< Flag indicating readiness state
+  std::condition_variable _cv;              ///< Condition variable for thread coordination
+  bool _ready = false;                      ///< Flag indicating readiness state
 };
 
 }  // namespace sirius

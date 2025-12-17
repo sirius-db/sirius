@@ -91,8 +91,8 @@ std::unique_ptr<cucascade::data_batch> gpu_aggregate_impl::local_ungrouped_aggre
   auto gpu_table_representation =
     std::make_unique<cucascade::gpu_table_representation>(*output_table, memory_space);
   return std::make_unique<cucascade::data_batch>(data_repository_mgr.get_next_data_batch_id(),
-                                                    data_repository_mgr,
-                                                    std::move(gpu_table_representation));
+                                                 data_repository_mgr,
+                                                 std::move(gpu_table_representation));
 }
 
 std::unique_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggregate(
@@ -123,8 +123,7 @@ std::unique_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
   // Here we don't need to explicitly cast input/output for count or sum of integers,
   // because cudf groupby produces INT32 for count, and promotes to INT64 for sum of integers
   // (both signed and unsigned), so types of local aggregation results are consistent.
-  std::unordered_map<int, std::vector<std::unique_ptr<cudf::groupby_aggregation>>>
-    input_col_to_agg;
+  std::unordered_map<int, std::vector<std::unique_ptr<cudf::groupby_aggregation>>> input_col_to_agg;
   std::unordered_map<int, std::vector<int>> input_col_to_output_idx;
   std::vector<int> input_col_order;
   for (int i = 0; i < aggregates.size(); ++i) {
@@ -165,8 +164,8 @@ std::unique_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
   auto gpu_table_representation =
     std::make_unique<cucascade::gpu_table_representation>(*output_table, memory_space);
   return std::make_unique<cucascade::data_batch>(data_repository_mgr.get_next_data_batch_id(),
-                                                    data_repository_mgr,
-                                                    std::move(gpu_table_representation));
+                                                 data_repository_mgr,
+                                                 std::move(gpu_table_representation));
 }
 
 }  // namespace op

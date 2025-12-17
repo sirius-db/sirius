@@ -133,7 +133,7 @@ class data_repository_manager {
    * safety
    */
   std::unique_ptr<idata_repository>& get_repository(::duckdb::GPUPhysicalOperator* op,
-                                                       std::string_view port_id);
+                                                    std::string_view port_id);
 
   /**
    * @brief Generate a globally unique data batch identifier.

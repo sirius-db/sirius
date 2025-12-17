@@ -61,8 +61,8 @@ std::vector<std::unique_ptr<cucascade::data_batch>> gpu_partition_impl::hash_par
       std::make_unique<cucascade::gpu_table_representation>(*output_partition, memory_space);
     output_batches.push_back(
       std::make_unique<cucascade::data_batch>(data_repository_mgr.get_next_data_batch_id(),
-                                                 data_repository_mgr,
-                                                 std::move(gpu_table_representation)));
+                                              data_repository_mgr,
+                                              std::move(gpu_table_representation)));
   }
 
   return output_batches;
@@ -100,8 +100,8 @@ std::vector<std::unique_ptr<cucascade::data_batch>> gpu_partition_impl::evenly_p
       std::make_unique<cucascade::gpu_table_representation>(*output_partition, memory_space);
     output_batches.push_back(
       std::make_unique<cucascade::data_batch>(data_repository_mgr.get_next_data_batch_id(),
-                                                 data_repository_mgr,
-                                                 std::move(gpu_table_representation)));
+                                              data_repository_mgr,
+                                              std::move(gpu_table_representation)));
   }
 
   return output_batches;

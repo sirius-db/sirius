@@ -174,7 +174,7 @@ TEST_CASE("Concatenate multiple data batches", "[operator][merge_concat]")
   constexpr size_t num_rows_per_batch = 100;
   std::vector<int> num_input_rows(num_batches, num_rows_per_batch);
   std::vector<cudf::data_type> column_types = {cudf::data_type{cudf::type_id::INT32},
-                                                  cudf::data_type{cudf::type_id::STRING}};
+                                               cudf::data_type{cudf::type_id::STRING}};
 
   auto input_views = create_batches_with_random_data(num_batches,
                                                      num_input_rows,
@@ -197,7 +197,7 @@ TEST_CASE("Concatenate multiple data batches with different size", "[operator][m
     num_input_rows.push_back((i + 1) * 10);
   }
   std::vector<cudf::data_type> column_types = {cudf::data_type{cudf::type_id::INT32},
-                                                  cudf::data_type{cudf::type_id::STRING}};
+                                               cudf::data_type{cudf::type_id::STRING}};
 
   auto input_views = create_batches_with_random_data(num_batches,
                                                      num_input_rows,
@@ -218,7 +218,7 @@ TEST_CASE("Concatenate with invalid input", "[operator][merge_concat]")
   constexpr size_t num_rows_per_batch = 100;
   std::vector<int> num_input_rows(num_batches, num_rows_per_batch);
   std::vector<cudf::data_type> column_types = {cudf::data_type{cudf::type_id::INT32},
-                                                  cudf::data_type{cudf::type_id::STRING}};
+                                               cudf::data_type{cudf::type_id::STRING}};
 
   // Invalid input: less than two input batches
   auto input_views = create_batches_with_random_data(num_batches,
@@ -240,7 +240,7 @@ TEST_CASE("Concatenate multiple data batches but no input rows", "[operator][mer
   constexpr size_t num_rows_per_batch = 0;
   std::vector<int> num_input_rows(num_batches, num_rows_per_batch);
   std::vector<cudf::data_type> column_types = {cudf::data_type{cudf::type_id::INT32},
-                                                  cudf::data_type{cudf::type_id::STRING}};
+                                               cudf::data_type{cudf::type_id::STRING}};
 
   auto input_views = create_batches_with_random_data(num_batches,
                                                      num_input_rows,
@@ -263,7 +263,7 @@ TEST_CASE("Concatenate mixed empty and non-empty data batches", "[operator][merg
     num_input_rows.push_back(i % 2 == 1 ? 0 : (i + 1) * 10);
   }
   std::vector<cudf::data_type> column_types = {cudf::data_type{cudf::type_id::INT32},
-                                                  cudf::data_type{cudf::type_id::STRING}};
+                                               cudf::data_type{cudf::type_id::STRING}};
 
   auto input_views = create_batches_with_random_data(num_batches,
                                                      num_input_rows,
@@ -387,10 +387,9 @@ void validate_ungrouped_aggregate_numeric(const std::vector<cudf::table_view>& i
   }
 }
 
-void validate_ungrouped_aggregate(
-  const std::vector<std::unique_ptr<data_batch_view>>& input_views,
-  const cucascade::data_batch& output,
-  const std::vector<cudf::aggregation::Kind>& aggregates)
+void validate_ungrouped_aggregate(const std::vector<std::unique_ptr<data_batch_view>>& input_views,
+                                  const cucascade::data_batch& output,
+                                  const std::vector<cudf::aggregation::Kind>& aggregates)
 {
   std::vector<cudf::table_view> input_table_views;
   for (const auto& input_view : input_views) {
@@ -435,13 +434,13 @@ TEST_CASE("Ungrouped merge aggregate of min/max/count/sum", "[operator][merge_un
   constexpr size_t num_base_input_rows_per_batch = 100;
   std::vector<int> num_base_input_rows(num_batches, num_base_input_rows_per_batch);
   std::vector<cudf::data_type> column_types       = {cudf::data_type{cudf::type_id::INT32},
-                                                        cudf::data_type{cudf::type_id::INT64},
-                                                        cudf::data_type{cudf::type_id::INT32},
-                                                        cudf::data_type{cudf::type_id::INT64}};
+                                                     cudf::data_type{cudf::type_id::INT64},
+                                                     cudf::data_type{cudf::type_id::INT32},
+                                                     cudf::data_type{cudf::type_id::INT64}};
   std::vector<cudf::aggregation::Kind> aggregates = {cudf::aggregation::Kind::MIN,
-                                                        cudf::aggregation::Kind::MAX,
-                                                        cudf::aggregation::Kind::COUNT_ALL,
-                                                        cudf::aggregation::Kind::SUM};
+                                                     cudf::aggregation::Kind::MAX,
+                                                     cudf::aggregation::Kind::COUNT_ALL,
+                                                     cudf::aggregation::Kind::SUM};
 
   auto input_views = create_batches_with_local_ungrouped_agg_result(
     num_batches, num_base_input_rows, column_types, aggregates, data_repo_manager, *mem_space);
@@ -489,13 +488,13 @@ TEST_CASE("Ungrouped merge aggregate with empty local aggregate results",
   constexpr size_t num_base_input_rows_per_batch = 0;
   std::vector<int> num_base_input_rows(num_batches, num_base_input_rows_per_batch);
   std::vector<cudf::data_type> column_types       = {cudf::data_type{cudf::type_id::INT32},
-                                                        cudf::data_type{cudf::type_id::INT64},
-                                                        cudf::data_type{cudf::type_id::INT32},
-                                                        cudf::data_type{cudf::type_id::INT64}};
+                                                     cudf::data_type{cudf::type_id::INT64},
+                                                     cudf::data_type{cudf::type_id::INT32},
+                                                     cudf::data_type{cudf::type_id::INT64}};
   std::vector<cudf::aggregation::Kind> aggregates = {cudf::aggregation::Kind::MIN,
-                                                        cudf::aggregation::Kind::MAX,
-                                                        cudf::aggregation::Kind::COUNT_ALL,
-                                                        cudf::aggregation::Kind::SUM};
+                                                     cudf::aggregation::Kind::MAX,
+                                                     cudf::aggregation::Kind::COUNT_ALL,
+                                                     cudf::aggregation::Kind::SUM};
 
   auto input_views = create_batches_with_local_ungrouped_agg_result(
     num_batches, num_base_input_rows, column_types, aggregates, data_repo_manager, *mem_space);
@@ -515,13 +514,13 @@ TEST_CASE("Ungrouped merge aggregate with mixed empty and non-empty local aggreg
     num_base_input_rows.push_back(i % 2 == 1 ? 0 : (i + 1) * 10);
   }
   std::vector<cudf::data_type> column_types       = {cudf::data_type{cudf::type_id::INT32},
-                                                        cudf::data_type{cudf::type_id::INT64},
-                                                        cudf::data_type{cudf::type_id::INT32},
-                                                        cudf::data_type{cudf::type_id::INT64}};
+                                                     cudf::data_type{cudf::type_id::INT64},
+                                                     cudf::data_type{cudf::type_id::INT32},
+                                                     cudf::data_type{cudf::type_id::INT64}};
   std::vector<cudf::aggregation::Kind> aggregates = {cudf::aggregation::Kind::MIN,
-                                                        cudf::aggregation::Kind::MAX,
-                                                        cudf::aggregation::Kind::COUNT_ALL,
-                                                        cudf::aggregation::Kind::SUM};
+                                                     cudf::aggregation::Kind::MAX,
+                                                     cudf::aggregation::Kind::COUNT_ALL,
+                                                     cudf::aggregation::Kind::SUM};
 
   auto input_views = create_batches_with_local_ungrouped_agg_result(
     num_batches, num_base_input_rows, column_types, aggregates, data_repo_manager, *mem_space);
@@ -604,11 +603,10 @@ void copy_data_to_host(cudf::table_view table, std::vector<std::vector<int64_t>>
   }
 }
 
-void validate_grouped_aggregate(
-  const std::vector<std::unique_ptr<data_batch_view>>& input_views,
-  const cucascade::data_batch& output,
-  int num_group_cols,
-  const std::vector<cudf::aggregation::Kind>& aggregates)
+void validate_grouped_aggregate(const std::vector<std::unique_ptr<data_batch_view>>& input_views,
+                                const cucascade::data_batch& output,
+                                int num_group_cols,
+                                const std::vector<cudf::aggregation::Kind>& aggregates)
 {
   std::vector<cudf::table_view> input_table_views;
   for (const auto& input_view : input_views) {
@@ -687,16 +685,16 @@ TEST_CASE("Grouped merge aggregate of min/max/count/sum", "[operator][merge_grou
   constexpr size_t num_base_input_rows_per_batch = 100;
   std::vector<int> num_base_input_rows(num_batches, num_base_input_rows_per_batch);
   std::vector<cudf::data_type> column_types       = {cudf::data_type{cudf::type_id::INT32},
-                                                        cudf::data_type{cudf::type_id::INT64},
-                                                        cudf::data_type{cudf::type_id::INT32},
-                                                        cudf::data_type{cudf::type_id::INT64},
-                                                        cudf::data_type{cudf::type_id::INT32},
-                                                        cudf::data_type{cudf::type_id::INT64}};
+                                                     cudf::data_type{cudf::type_id::INT64},
+                                                     cudf::data_type{cudf::type_id::INT32},
+                                                     cudf::data_type{cudf::type_id::INT64},
+                                                     cudf::data_type{cudf::type_id::INT32},
+                                                     cudf::data_type{cudf::type_id::INT64}};
   std::vector<int> group_idx                      = {0, 1};
   std::vector<cudf::aggregation::Kind> aggregates = {cudf::aggregation::Kind::MIN,
-                                                        cudf::aggregation::Kind::MAX,
-                                                        cudf::aggregation::Kind::COUNT_ALL,
-                                                        cudf::aggregation::Kind::SUM};
+                                                     cudf::aggregation::Kind::MAX,
+                                                     cudf::aggregation::Kind::COUNT_ALL,
+                                                     cudf::aggregation::Kind::SUM};
   std::vector<int> aggregate_idx                  = {2, 3, 4, 5};
 
   auto input_views  = create_batches_with_local_grouped_agg_result(num_batches,
@@ -724,7 +722,7 @@ TEST_CASE("Grouped merge aggregate with invalid input", "[operator][merge_groupe
   constexpr size_t num_base_input_rows_per_batch = 100;
   std::vector<int> num_base_input_rows(num_batches, num_base_input_rows_per_batch);
   std::vector<cudf::data_type> column_types       = {cudf::data_type{cudf::type_id::INT32},
-                                                        cudf::data_type{cudf::type_id::INT64}};
+                                                     cudf::data_type{cudf::type_id::INT64}};
   std::vector<int> group_idx                      = {0};
   std::vector<cudf::aggregation::Kind> aggregates = {cudf::aggregation::Kind::MIN};
   std::vector<int> aggregate_idx                  = {1};
@@ -770,16 +768,16 @@ TEST_CASE("Grouped merge aggregate with empty local aggregate results",
   constexpr size_t num_base_input_rows_per_batch = 0;
   std::vector<int> num_base_input_rows(num_batches, num_base_input_rows_per_batch);
   std::vector<cudf::data_type> column_types       = {cudf::data_type{cudf::type_id::INT32},
-                                                        cudf::data_type{cudf::type_id::INT64},
-                                                        cudf::data_type{cudf::type_id::INT32},
-                                                        cudf::data_type{cudf::type_id::INT64},
-                                                        cudf::data_type{cudf::type_id::INT32},
-                                                        cudf::data_type{cudf::type_id::INT64}};
+                                                     cudf::data_type{cudf::type_id::INT64},
+                                                     cudf::data_type{cudf::type_id::INT32},
+                                                     cudf::data_type{cudf::type_id::INT64},
+                                                     cudf::data_type{cudf::type_id::INT32},
+                                                     cudf::data_type{cudf::type_id::INT64}};
   std::vector<int> group_idx                      = {0, 1};
   std::vector<cudf::aggregation::Kind> aggregates = {cudf::aggregation::Kind::MIN,
-                                                        cudf::aggregation::Kind::MAX,
-                                                        cudf::aggregation::Kind::COUNT_ALL,
-                                                        cudf::aggregation::Kind::SUM};
+                                                     cudf::aggregation::Kind::MAX,
+                                                     cudf::aggregation::Kind::COUNT_ALL,
+                                                     cudf::aggregation::Kind::SUM};
   std::vector<int> aggregate_idx                  = {2, 3, 4, 5};
 
   auto input_views  = create_batches_with_local_grouped_agg_result(num_batches,
@@ -810,16 +808,16 @@ TEST_CASE("Grouped merge aggregate with mixed empty and non-empty local aggregat
     num_base_input_rows.push_back(i % 2 == 1 ? 0 : (i + 1) * 10);
   }
   std::vector<cudf::data_type> column_types       = {cudf::data_type{cudf::type_id::INT32},
-                                                        cudf::data_type{cudf::type_id::INT64},
-                                                        cudf::data_type{cudf::type_id::INT32},
-                                                        cudf::data_type{cudf::type_id::INT64},
-                                                        cudf::data_type{cudf::type_id::INT32},
-                                                        cudf::data_type{cudf::type_id::INT64}};
+                                                     cudf::data_type{cudf::type_id::INT64},
+                                                     cudf::data_type{cudf::type_id::INT32},
+                                                     cudf::data_type{cudf::type_id::INT64},
+                                                     cudf::data_type{cudf::type_id::INT32},
+                                                     cudf::data_type{cudf::type_id::INT64}};
   std::vector<int> group_idx                      = {0, 1};
   std::vector<cudf::aggregation::Kind> aggregates = {cudf::aggregation::Kind::MIN,
-                                                        cudf::aggregation::Kind::MAX,
-                                                        cudf::aggregation::Kind::COUNT_ALL,
-                                                        cudf::aggregation::Kind::SUM};
+                                                     cudf::aggregation::Kind::MAX,
+                                                     cudf::aggregation::Kind::COUNT_ALL,
+                                                     cudf::aggregation::Kind::SUM};
   std::vector<int> aggregate_idx                  = {2, 3, 4, 5};
 
   auto input_views  = create_batches_with_local_grouped_agg_result(num_batches,
@@ -848,14 +846,14 @@ TEST_CASE("Grouped merge aggregate with multiple aggregations on the same column
   constexpr size_t num_base_input_rows_per_batch = 100;
   std::vector<int> num_base_input_rows(num_batches, num_base_input_rows_per_batch);
   std::vector<cudf::data_type> column_types       = {cudf::data_type{cudf::type_id::INT32},
-                                                        cudf::data_type{cudf::type_id::INT64},
-                                                        cudf::data_type{cudf::type_id::INT32},
-                                                        cudf::data_type{cudf::type_id::INT64}};
+                                                     cudf::data_type{cudf::type_id::INT64},
+                                                     cudf::data_type{cudf::type_id::INT32},
+                                                     cudf::data_type{cudf::type_id::INT64}};
   std::vector<int> group_idx                      = {0, 1};
   std::vector<cudf::aggregation::Kind> aggregates = {cudf::aggregation::Kind::MIN,
-                                                        cudf::aggregation::Kind::MAX,
-                                                        cudf::aggregation::Kind::COUNT_ALL,
-                                                        cudf::aggregation::Kind::SUM};
+                                                     cudf::aggregation::Kind::MAX,
+                                                     cudf::aggregation::Kind::COUNT_ALL,
+                                                     cudf::aggregation::Kind::SUM};
   std::vector<int> aggregate_idx                  = {2, 3, 2, 3};
 
   auto input_views  = create_batches_with_local_grouped_agg_result(num_batches,
@@ -877,8 +875,7 @@ TEST_CASE("Grouped merge aggregate with multiple aggregations on the same column
 
 namespace {
 
-std::vector<std::unique_ptr<data_batch_view>>
-create_batches_with_local_orderby_or_topn_result(
+std::vector<std::unique_ptr<data_batch_view>> create_batches_with_local_orderby_or_topn_result(
   const int num_batches,
   const std::vector<int> num_base_input_rows,
   const std::optional<std::pair<int, int>>& limit_offset,
@@ -978,9 +975,9 @@ TEST_CASE("Merge order-by basic", "[operator][merge_order_by]")
   constexpr size_t num_base_input_rows_per_batch = 100;
   std::vector<int> num_base_input_rows(num_batches, num_base_input_rows_per_batch);
   std::vector<cudf::data_type> column_types = {cudf::data_type{cudf::type_id::INT32},
-                                                  cudf::data_type{cudf::type_id::INT64},
-                                                  cudf::data_type{cudf::type_id::INT32},
-                                                  cudf::data_type{cudf::type_id::INT64}};
+                                               cudf::data_type{cudf::type_id::INT64},
+                                               cudf::data_type{cudf::type_id::INT32},
+                                               cudf::data_type{cudf::type_id::INT64}};
   std::vector<int> order_key_idx            = {0, 1, 2};
   std::vector<cudf::order> column_order     = {
     cudf::order::ASCENDING, cudf::order::DESCENDING, cudf::order::ASCENDING};
@@ -1014,9 +1011,9 @@ TEST_CASE("Merge order-by with invalid input", "[operator][merge_order_by]")
   constexpr size_t num_base_input_rows_per_batch = 100;
   std::vector<int> num_base_input_rows(num_batches, num_base_input_rows_per_batch);
   std::vector<cudf::data_type> column_types = {cudf::data_type{cudf::type_id::INT32},
-                                                  cudf::data_type{cudf::type_id::INT64},
-                                                  cudf::data_type{cudf::type_id::INT32},
-                                                  cudf::data_type{cudf::type_id::INT64}};
+                                               cudf::data_type{cudf::type_id::INT64},
+                                               cudf::data_type{cudf::type_id::INT32},
+                                               cudf::data_type{cudf::type_id::INT64}};
   std::vector<int> order_key_idx            = {0, 1, 2};
   std::vector<cudf::order> column_order     = {
     cudf::order::ASCENDING, cudf::order::DESCENDING, cudf::order::ASCENDING};
@@ -1073,9 +1070,9 @@ TEST_CASE("Merge order-by with empty local order-by results", "[operator][merge_
   constexpr size_t num_base_input_rows_per_batch = 0;
   std::vector<int> num_base_input_rows(num_batches, num_base_input_rows_per_batch);
   std::vector<cudf::data_type> column_types = {cudf::data_type{cudf::type_id::INT32},
-                                                  cudf::data_type{cudf::type_id::INT64},
-                                                  cudf::data_type{cudf::type_id::INT32},
-                                                  cudf::data_type{cudf::type_id::INT64}};
+                                               cudf::data_type{cudf::type_id::INT64},
+                                               cudf::data_type{cudf::type_id::INT32},
+                                               cudf::data_type{cudf::type_id::INT64}};
   std::vector<int> order_key_idx            = {0, 1, 2};
   std::vector<cudf::order> column_order     = {
     cudf::order::ASCENDING, cudf::order::DESCENDING, cudf::order::ASCENDING};
@@ -1112,9 +1109,9 @@ TEST_CASE("Merge order-by with mixed empty and non-empty local order-by results"
     num_base_input_rows.push_back(i % 2 == 1 ? 0 : (i + 1) * 10);
   }
   std::vector<cudf::data_type> column_types = {cudf::data_type{cudf::type_id::INT32},
-                                                  cudf::data_type{cudf::type_id::INT64},
-                                                  cudf::data_type{cudf::type_id::INT32},
-                                                  cudf::data_type{cudf::type_id::INT64}};
+                                               cudf::data_type{cudf::type_id::INT64},
+                                               cudf::data_type{cudf::type_id::INT32},
+                                               cudf::data_type{cudf::type_id::INT64}};
   std::vector<int> order_key_idx            = {0, 1, 2};
   std::vector<cudf::order> column_order     = {
     cudf::order::ASCENDING, cudf::order::DESCENDING, cudf::order::ASCENDING};
@@ -1165,8 +1162,8 @@ void validate_top_n(const std::vector<std::unique_ptr<data_batch_view>>& input_v
   for (const auto& table : input_table_views) {
     copy_data_to_host(table, h_input_data);
   }
-  std::vector<std::vector<int64_t>> h_input_data_rows(
-    h_input_data[0].size(), std::vector<int64_t>(h_input_data.size()));
+  std::vector<std::vector<int64_t>> h_input_data_rows(h_input_data[0].size(),
+                                                      std::vector<int64_t>(h_input_data.size()));
   for (int r = 0; r < h_input_data_rows.size(); ++r) {
     for (int c = 0; c < h_input_data_rows[0].size(); ++c) {
       h_input_data_rows[r][c] = h_input_data[c][r];
@@ -1231,10 +1228,10 @@ TEST_CASE("Merge top-n basic", "[operator][merge_top_n]")
   constexpr size_t num_base_input_rows_per_batch = 100;
   std::vector<int> num_base_input_rows(num_batches, num_base_input_rows_per_batch);
   std::vector<cudf::data_type> column_types = {cudf::data_type{cudf::type_id::INT32},
-                                                  cudf::data_type{cudf::type_id::INT64},
-                                                  cudf::data_type{cudf::type_id::INT32},
-                                                  cudf::data_type{cudf::type_id::INT64}};
-  std::pair<int, int> limit_offset             = {10, 20};
+                                               cudf::data_type{cudf::type_id::INT64},
+                                               cudf::data_type{cudf::type_id::INT32},
+                                               cudf::data_type{cudf::type_id::INT64}};
+  std::pair<int, int> limit_offset          = {10, 20};
   std::vector<int> order_key_idx            = {0, 1, 2};
   std::vector<cudf::order> column_order     = {
     cudf::order::ASCENDING, cudf::order::DESCENDING, cudf::order::ASCENDING};
@@ -1270,10 +1267,10 @@ TEST_CASE("Merge top-n with empty local top-n results", "[operator][merge_top_n]
   constexpr size_t num_base_input_rows_per_batch = 0;
   std::vector<int> num_base_input_rows(num_batches, num_base_input_rows_per_batch);
   std::vector<cudf::data_type> column_types = {cudf::data_type{cudf::type_id::INT32},
-                                                  cudf::data_type{cudf::type_id::INT64},
-                                                  cudf::data_type{cudf::type_id::INT32},
-                                                  cudf::data_type{cudf::type_id::INT64}};
-  std::pair<int, int> limit_offset             = {10, 20};
+                                               cudf::data_type{cudf::type_id::INT64},
+                                               cudf::data_type{cudf::type_id::INT32},
+                                               cudf::data_type{cudf::type_id::INT64}};
+  std::pair<int, int> limit_offset          = {10, 20};
   std::vector<int> order_key_idx            = {0, 1, 2};
   std::vector<cudf::order> column_order     = {
     cudf::order::ASCENDING, cudf::order::DESCENDING, cudf::order::ASCENDING};
@@ -1312,10 +1309,10 @@ TEST_CASE("Merge top-n with mixed empty and non-empty local top-n results",
     num_base_input_rows.push_back(i % 2 == 1 ? 0 : (i + 1) * 10);
   }
   std::vector<cudf::data_type> column_types = {cudf::data_type{cudf::type_id::INT32},
-                                                  cudf::data_type{cudf::type_id::INT64},
-                                                  cudf::data_type{cudf::type_id::INT32},
-                                                  cudf::data_type{cudf::type_id::INT64}};
-  std::pair<int, int> limit_offset             = {10, 20};
+                                               cudf::data_type{cudf::type_id::INT64},
+                                               cudf::data_type{cudf::type_id::INT32},
+                                               cudf::data_type{cudf::type_id::INT64}};
+  std::pair<int, int> limit_offset          = {10, 20};
   std::vector<int> order_key_idx            = {0, 1, 2};
   std::vector<cudf::order> column_order     = {
     cudf::order::ASCENDING, cudf::order::DESCENDING, cudf::order::ASCENDING};
@@ -1351,10 +1348,10 @@ TEST_CASE("Merge top-n with `limit = 0`", "[operator][merge_top_n]")
   constexpr size_t num_base_input_rows_per_batch = 100;
   std::vector<int> num_base_input_rows(num_batches, num_base_input_rows_per_batch);
   std::vector<cudf::data_type> column_types = {cudf::data_type{cudf::type_id::INT32},
-                                                  cudf::data_type{cudf::type_id::INT64},
-                                                  cudf::data_type{cudf::type_id::INT32},
-                                                  cudf::data_type{cudf::type_id::INT64}};
-  std::pair<int, int> limit_offset             = {0, 20};
+                                               cudf::data_type{cudf::type_id::INT64},
+                                               cudf::data_type{cudf::type_id::INT32},
+                                               cudf::data_type{cudf::type_id::INT64}};
+  std::pair<int, int> limit_offset          = {0, 20};
   std::vector<int> order_key_idx            = {0, 1, 2};
   std::vector<cudf::order> column_order     = {
     cudf::order::ASCENDING, cudf::order::DESCENDING, cudf::order::ASCENDING};
@@ -1391,10 +1388,10 @@ TEST_CASE("Merge top-n with `num_input_rows - limit <= offset < num_input-rows`"
   constexpr size_t num_base_input_rows_per_batch = 100;
   std::vector<int> num_base_input_rows(num_batches, num_base_input_rows_per_batch);
   std::vector<cudf::data_type> column_types = {cudf::data_type{cudf::type_id::INT32},
-                                                  cudf::data_type{cudf::type_id::INT64},
-                                                  cudf::data_type{cudf::type_id::INT32},
-                                                  cudf::data_type{cudf::type_id::INT64}};
-  std::pair<int, int> limit_offset             = {200, 900};
+                                               cudf::data_type{cudf::type_id::INT64},
+                                               cudf::data_type{cudf::type_id::INT32},
+                                               cudf::data_type{cudf::type_id::INT64}};
+  std::pair<int, int> limit_offset          = {200, 900};
   std::vector<int> order_key_idx            = {0, 1, 2};
   std::vector<cudf::order> column_order     = {
     cudf::order::ASCENDING, cudf::order::DESCENDING, cudf::order::ASCENDING};

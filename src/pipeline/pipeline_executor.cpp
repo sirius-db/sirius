@@ -34,8 +34,7 @@ pipeline_executor::pipeline_executor(task_executor_config config)
     auto& mem_res_mgr = cucascade::memory::memory_reservation_manager::get_instance();
     const cucascade::memory::memory_space* gpu_mem_space =
       mem_res_mgr.get_memory_space(cucascade::memory::Tier::GPU, i);  // Placeholder
-    _gpu_executors.push_back(
-      std::make_unique<gpu_pipeline_executor>(config, gpu_mem_space, this));
+    _gpu_executors.push_back(std::make_unique<gpu_pipeline_executor>(config, gpu_mem_space, this));
   }
   _task_request_queue = std::make_unique<task_request_queue>(config.num_threads);
 }

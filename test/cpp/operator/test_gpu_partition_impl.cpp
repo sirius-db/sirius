@@ -69,8 +69,7 @@ std::unique_ptr<data_batch_view> create_batch_with_random_data(
   return batch_view;
 }
 
-void copy_data_to_host_by_rows(cudf::table_view table,
-                               std::vector<std::vector<int64_t>>& h_rows)
+void copy_data_to_host_by_rows(cudf::table_view table, std::vector<std::vector<int64_t>>& h_rows)
 {
   std::vector<std::vector<int64_t>> h_cols(table.num_columns());
   for (int c = 0; c < table.num_columns(); ++c) {
@@ -159,13 +158,13 @@ void validate_hash_partition(const cucascade::data_batch_view& input_view,
 TEST_CASE("Hash partition basic", "[operator][hash_partition]")
 {
   cucascade::data_repository_manager data_repo_manager;
-  auto* mem_space                              = get_default_memory_space();
-  constexpr size_t num_input_rows              = 100;
-  constexpr size_t num_partitions              = 4;
+  auto* mem_space                           = get_default_memory_space();
+  constexpr size_t num_input_rows           = 100;
+  constexpr size_t num_partitions           = 4;
   std::vector<cudf::data_type> column_types = {cudf::data_type{cudf::type_id::INT32},
-                                                  cudf::data_type{cudf::type_id::INT64},
-                                                  cudf::data_type{cudf::type_id::INT32},
-                                                  cudf::data_type{cudf::type_id::INT64}};
+                                               cudf::data_type{cudf::type_id::INT64},
+                                               cudf::data_type{cudf::type_id::INT32},
+                                               cudf::data_type{cudf::type_id::INT64}};
   std::vector<int> partition_key_idx        = {0, 1};
   std::vector<std::optional<std::pair<int, int>>> ranges(column_types.size(), std::nullopt);
 
@@ -183,13 +182,13 @@ TEST_CASE("Hash partition basic", "[operator][hash_partition]")
 TEST_CASE("Hash partition with invalid input", "[operator][hash_partition]")
 {
   cucascade::data_repository_manager data_repo_manager;
-  auto* mem_space                              = get_default_memory_space();
-  constexpr size_t num_input_rows              = 100;
-  constexpr size_t num_partitions              = 1;
+  auto* mem_space                           = get_default_memory_space();
+  constexpr size_t num_input_rows           = 100;
+  constexpr size_t num_partitions           = 1;
   std::vector<cudf::data_type> column_types = {cudf::data_type{cudf::type_id::INT32},
-                                                  cudf::data_type{cudf::type_id::INT64},
-                                                  cudf::data_type{cudf::type_id::INT32},
-                                                  cudf::data_type{cudf::type_id::INT64}};
+                                               cudf::data_type{cudf::type_id::INT64},
+                                               cudf::data_type{cudf::type_id::INT32},
+                                               cudf::data_type{cudf::type_id::INT64}};
   std::vector<int> partition_key_idx        = {0, 1};
   std::vector<std::optional<std::pair<int, int>>> ranges(column_types.size(), std::nullopt);
 
@@ -207,13 +206,13 @@ TEST_CASE("Hash partition with invalid input", "[operator][hash_partition]")
 TEST_CASE("Hash partition with empty input", "[operator][hash_partition]")
 {
   cucascade::data_repository_manager data_repo_manager;
-  auto* mem_space                              = get_default_memory_space();
-  constexpr size_t num_input_rows              = 0;
-  constexpr size_t num_partitions              = 4;
+  auto* mem_space                           = get_default_memory_space();
+  constexpr size_t num_input_rows           = 0;
+  constexpr size_t num_partitions           = 4;
   std::vector<cudf::data_type> column_types = {cudf::data_type{cudf::type_id::INT32},
-                                                  cudf::data_type{cudf::type_id::INT64},
-                                                  cudf::data_type{cudf::type_id::INT32},
-                                                  cudf::data_type{cudf::type_id::INT64}};
+                                               cudf::data_type{cudf::type_id::INT64},
+                                               cudf::data_type{cudf::type_id::INT32},
+                                               cudf::data_type{cudf::type_id::INT64}};
   std::vector<int> partition_key_idx        = {0, 1};
   std::vector<std::optional<std::pair<int, int>>> ranges(column_types.size(), std::nullopt);
 
@@ -231,14 +230,14 @@ TEST_CASE("Hash partition with empty input", "[operator][hash_partition]")
 TEST_CASE("Hash partition with all the same partitioning keys", "[operator][hash_partition]")
 {
   cucascade::data_repository_manager data_repo_manager;
-  auto* mem_space                              = get_default_memory_space();
-  constexpr size_t num_input_rows              = 100;
-  constexpr size_t num_partitions              = 4;
-  std::vector<cudf::data_type> column_types = {cudf::data_type{cudf::type_id::INT32},
-                                                  cudf::data_type{cudf::type_id::INT64},
-                                                  cudf::data_type{cudf::type_id::INT32},
-                                                  cudf::data_type{cudf::type_id::INT64}};
-  std::vector<int> partition_key_idx        = {0, 1};
+  auto* mem_space                                        = get_default_memory_space();
+  constexpr size_t num_input_rows                        = 100;
+  constexpr size_t num_partitions                        = 4;
+  std::vector<cudf::data_type> column_types              = {cudf::data_type{cudf::type_id::INT32},
+                                                            cudf::data_type{cudf::type_id::INT64},
+                                                            cudf::data_type{cudf::type_id::INT32},
+                                                            cudf::data_type{cudf::type_id::INT64}};
+  std::vector<int> partition_key_idx                     = {0, 1};
   std::vector<std::optional<std::pair<int, int>>> ranges = {
     std::optional<std::pair<int, int>>({0, 0}),
     std::optional<std::pair<int, int>>({1, 1}),
@@ -259,13 +258,13 @@ TEST_CASE("Hash partition with all the same partitioning keys", "[operator][hash
 TEST_CASE("Hash partition with num partitions larger than input size", "[operator][hash_partition]")
 {
   cucascade::data_repository_manager data_repo_manager;
-  auto* mem_space                              = get_default_memory_space();
-  constexpr size_t num_input_rows              = 10;
-  constexpr size_t num_partitions              = 20;
+  auto* mem_space                           = get_default_memory_space();
+  constexpr size_t num_input_rows           = 10;
+  constexpr size_t num_partitions           = 20;
   std::vector<cudf::data_type> column_types = {cudf::data_type{cudf::type_id::INT32},
-                                                  cudf::data_type{cudf::type_id::INT64},
-                                                  cudf::data_type{cudf::type_id::INT32},
-                                                  cudf::data_type{cudf::type_id::INT64}};
+                                               cudf::data_type{cudf::type_id::INT64},
+                                               cudf::data_type{cudf::type_id::INT32},
+                                               cudf::data_type{cudf::type_id::INT64}};
   std::vector<int> partition_key_idx        = {0, 1};
   std::vector<std::optional<std::pair<int, int>>> ranges(column_types.size(), std::nullopt);
 
@@ -332,13 +331,13 @@ void validate_evenly_partition(const cucascade::data_batch_view& input_view,
 TEST_CASE("Evenly partition basic", "[operator][evenly_partition]")
 {
   cucascade::data_repository_manager data_repo_manager;
-  auto* mem_space                              = get_default_memory_space();
-  constexpr size_t num_input_rows              = 100;
-  constexpr size_t num_partitions              = 4;
+  auto* mem_space                           = get_default_memory_space();
+  constexpr size_t num_input_rows           = 100;
+  constexpr size_t num_partitions           = 4;
   std::vector<cudf::data_type> column_types = {cudf::data_type{cudf::type_id::INT32},
-                                                  cudf::data_type{cudf::type_id::INT64},
-                                                  cudf::data_type{cudf::type_id::INT32},
-                                                  cudf::data_type{cudf::type_id::INT64}};
+                                               cudf::data_type{cudf::type_id::INT64},
+                                               cudf::data_type{cudf::type_id::INT32},
+                                               cudf::data_type{cudf::type_id::INT64}};
   std::vector<std::optional<std::pair<int, int>>> ranges(column_types.size(), std::nullopt);
 
   auto input_view = create_batch_with_random_data(
@@ -351,13 +350,13 @@ TEST_CASE("Evenly partition basic", "[operator][evenly_partition]")
 TEST_CASE("Evenly partition basic with empty input", "[operator][evenly_partition]")
 {
   cucascade::data_repository_manager data_repo_manager;
-  auto* mem_space                              = get_default_memory_space();
-  constexpr size_t num_input_rows              = 0;
-  constexpr size_t num_partitions              = 4;
+  auto* mem_space                           = get_default_memory_space();
+  constexpr size_t num_input_rows           = 0;
+  constexpr size_t num_partitions           = 4;
   std::vector<cudf::data_type> column_types = {cudf::data_type{cudf::type_id::INT32},
-                                                  cudf::data_type{cudf::type_id::INT64},
-                                                  cudf::data_type{cudf::type_id::INT32},
-                                                  cudf::data_type{cudf::type_id::INT64}};
+                                               cudf::data_type{cudf::type_id::INT64},
+                                               cudf::data_type{cudf::type_id::INT32},
+                                               cudf::data_type{cudf::type_id::INT64}};
   std::vector<std::optional<std::pair<int, int>>> ranges(column_types.size(), std::nullopt);
 
   auto input_view = create_batch_with_random_data(
@@ -371,13 +370,13 @@ TEST_CASE("Evenly partition basic with num partitions larger than input size",
           "[operator][evenly_partition]")
 {
   cucascade::data_repository_manager data_repo_manager;
-  auto* mem_space                              = get_default_memory_space();
-  constexpr size_t num_input_rows              = 10;
-  constexpr size_t num_partitions              = 20;
+  auto* mem_space                           = get_default_memory_space();
+  constexpr size_t num_input_rows           = 10;
+  constexpr size_t num_partitions           = 20;
   std::vector<cudf::data_type> column_types = {cudf::data_type{cudf::type_id::INT32},
-                                                  cudf::data_type{cudf::type_id::INT64},
-                                                  cudf::data_type{cudf::type_id::INT32},
-                                                  cudf::data_type{cudf::type_id::INT64}};
+                                               cudf::data_type{cudf::type_id::INT64},
+                                               cudf::data_type{cudf::type_id::INT32},
+                                               cudf::data_type{cudf::type_id::INT64}};
   std::vector<std::optional<std::pair<int, int>>> ranges(column_types.size(), std::nullopt);
 
   auto input_view = create_batch_with_random_data(

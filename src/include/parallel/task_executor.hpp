@@ -73,9 +73,7 @@ class itask_executor {
   // Helper functions.
   virtual void on_start();
   virtual void on_stop();
-  virtual void on_task_error(int worker_id,
-                             std::unique_ptr<itask> task,
-                             const std::exception& e);
+  virtual void on_task_error(int worker_id, std::unique_ptr<itask> task, const std::exception& e);
 
   // Main thread loop.
   virtual void worker_loop(int worker_id);

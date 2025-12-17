@@ -123,7 +123,7 @@ std::unique_ptr<idata_representation> host_table_representation::convert_to_memo
         dst_block_offset = 0;
       }
     }
-    auto metadata_copy = std::make_unique<std::vector<uint8_t>>(*_host_table->metadata);
+    auto metadata_copy         = std::make_unique<std::vector<uint8_t>>(*_host_table->metadata);
     auto host_table_allocation = std::make_unique<cucascade::memory::host_table_allocation>(
       std::move(dst_allocation), std::move(metadata_copy), data_size);
     return std::make_unique<host_table_representation>(

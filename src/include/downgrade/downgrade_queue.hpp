@@ -185,7 +185,7 @@ class downgrade_task_queue : public itask_queue {
   std::queue<std::unique_ptr<downgrade_task>>
     _task_queue;                      ///< FIFO queue storing the downgrade tasks
   bool _is_open = false;              ///< Whether the queue is open for operations
-  mutable std::mutex _mutex;       ///< Mutex for thread-safe access (mutable for const methods)
+  mutable std::mutex _mutex;          ///< Mutex for thread-safe access (mutable for const methods)
   std::counting_semaphore<> _sem{0};  ///< Semaphore for blocking/signaling (starts with 0 permits)
 };
 
