@@ -26,6 +26,8 @@
 #include <sstream>
 #include <utility>
 #include <vector>
+#include <string>
+#include <regex>
 
 namespace sirius {
 namespace expression {
@@ -750,6 +752,81 @@ const RegexUdf& RegexUdfCache::GetOrCreate(const std::string& pattern, const std
     if (it != cache_.end()) {
       return it->second;
     }
+  }
+
+  std::string orOperator = "|";
+  std::string digitOperator = "\\d";
+  std::string nonDigitOperator = "\\D";
+  std::string spaceOperator = "\\s";
+  std::string nonSpaceOperator = "\\S";
+  std::string wordOperator = "\\w";
+  std::string nonWordOperator = "\\W";
+  std::string boundaryOperator = "\\b";
+  std::string notBoundaryOperator = "\\B";
+  std::string minMatchOperator = "{";
+
+  if (replacement != "\\1") {
+    throw duckdb::NotImplementedException("Unsupported replacement.");
+  }
+    
+  if (pattern.find(orOperator) != std::string::npos) {
+    throw duckdb::NotImplementedException("Unsupported operator.");
+  }
+
+  if (pattern.find(digitOperator) != std::string::npos) {
+    throw duckdb::NotImplementedException("Unsupported operator.");
+  }
+
+  if (pattern.find(nonDigitOperator) != std::string::npos) {
+    throw duckdb::NotImplementedException("Unsupported operator.");
+  }
+
+  if (pattern.find(spaceOperator) != std::string::npos) {
+    throw duckdb::NotImplementedException("Unsupported operator.");
+  }
+
+  if (pattern.find(nonSpaceOperator) != std::string::npos) {
+    throw duckdb::NotImplementedException("Unsupported operator.");
+  }
+
+  if (pattern.find(wordOperator) != std::string::npos) {
+    throw duckdb::NotImplementedException("Unsupported operator.");
+  }
+
+  if (pattern.find(nonWordOperator) != std::string::npos) {
+    throw duckdb::NotImplementedException("Unsupported operator.");
+  }
+
+  if (pattern.find(boundaryOperator) != std::string::npos) {
+    throw duckdb::NotImplementedException("Unsupported operator.");
+  }
+
+  if (pattern.find(notBoundaryOperator) != std::string::npos) {
+    throw duckdb::NotImplementedException("Unsupported operator.");
+  }
+
+  if (pattern.find(minMatchOperator) != std::string::npos) {
+    throw duckdb::NotImplementedException("Unsupported operator.");
+  }
+
+  if (pattern[0] != '^' || pattern[pattern.length() - 1] != '$') {
+    throw duckdb::NotImplementedException("Unsupported regex pattern.");
+  }
+
+  if (std::regex_search(pattern, std::regex(R"(\[[^\^])"))) {
+    throw duckdb::NotImplementedException("Unsupported regex pattern.");
+  }
+
+  if (std::regex_search(pattern, std::regex(R"(\[\^[^\\\]][^\\\]]|\[\^\\[^\]][^\]])"))) {
+    throw duckdb::NotImplementedException("Unsupported regex pattern.");
+  }
+
+  if (std::regex_search(pattern, std::regex(R"(\([^\(\)]+\(|\(\()"))) {
+    throw duckdb::NotImplementedException("Unsupported regex pattern.");
+  }
+
+  if (std::regex_search(pattern, std::regex(R"(\.\*\)[^\$]|\.\*[^\)\$]|\.\+\)[^\$]|\.\+[^\)\$])"))) {
+    throw duckdb::NotImplementedException("Unsupported regex pattern.");
   }
 
   auto udf = interpreter_.Generate(normalized_pattern, normalized_replacement);
