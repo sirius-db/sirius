@@ -48,12 +48,12 @@ class gpu_order_impl {
    *
    * @return The output data batch with ownership.
    */
-  static sirius::unique_ptr<cucascade::data_batch> local_order_by(
+  static std::unique_ptr<cucascade::data_batch> local_order_by(
     const cucascade::data_batch_view& input,
-    const sirius::vector<int>& order_key_idx,
-    const sirius::vector<cudf::order>& column_order,
-    const sirius::vector<cudf::null_order>& null_precedence,
-    const sirius::vector<int>& projections,
+    const std::vector<int>& order_key_idx,
+    const std::vector<cudf::order>& column_order,
+    const std::vector<cudf::null_order>& null_precedence,
+    const std::vector<int>& projections,
     rmm::cuda_stream_view stream,
     cucascade::memory::memory_space& memory_space,
     cucascade::data_repository_manager& data_repository_mgr);
@@ -75,14 +75,14 @@ class gpu_order_impl {
    *
    * @return The output data batch with ownership.
    */
-  static sirius::unique_ptr<cucascade::data_batch> local_top_n(
+  static std::unique_ptr<cucascade::data_batch> local_top_n(
     const cucascade::data_batch_view& input,
     const int limit,
     const int offset,
-    const sirius::vector<int>& order_key_idx,
-    const sirius::vector<cudf::order>& column_order,
-    const sirius::vector<cudf::null_order>& null_precedence,
-    const sirius::vector<int>& projections,
+    const std::vector<int>& order_key_idx,
+    const std::vector<cudf::order>& column_order,
+    const std::vector<cudf::null_order>& null_precedence,
+    const std::vector<int>& projections,
     rmm::cuda_stream_view stream,
     cucascade::memory::memory_space& memory_space,
     cucascade::data_repository_manager& data_repository_mgr);

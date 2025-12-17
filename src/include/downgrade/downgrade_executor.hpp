@@ -42,7 +42,7 @@ class downgrade_executor : public itask_executor {
    * @param data_repo_mgr Reference to the data repository for accessing and storing data batches
    */
   explicit downgrade_executor(task_executor_config config, data_repository_manager& data_repo_mgr)
-    : itask_executor(sirius::make_unique<downgrade_task_queue>(), config),
+    : itask_executor(std::make_unique<downgrade_task_queue>(), config),
       _data_repo_mgr(data_repo_mgr)
   {
   }
@@ -66,7 +66,7 @@ class downgrade_executor : public itask_executor {
    *
    * @param downgrade_task The downgrade task to schedule for execution
    */
-  void schedule_downgrade_task(sirius::unique_ptr<downgrade_task> downgrade_task)
+  void schedule_downgrade_task(std::unique_ptr<downgrade_task> downgrade_task)
   {
     // Convert to itask and use parent's schedule method
     schedule(std::move(downgrade_task));
@@ -81,7 +81,7 @@ class downgrade_executor : public itask_executor {
    *
    * @param task The task to schedule (must be a downgrade_task)
    */
-  void schedule(sirius::unique_ptr<itask> task) override;
+  void schedule(std::unique_ptr<itask> task) override;
 
   /**
    * @brief Main worker loop for executing downgrade tasks

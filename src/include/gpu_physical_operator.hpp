@@ -97,8 +97,8 @@ class GPUPhysicalOperator {
 
   virtual OperatorResultType Execute(GPUIntermediateRelation& input_relation,
                                      GPUIntermediateRelation& output_relation) const;
-  virtual ::sirius::vector<::sirius::unique_ptr<::cucascade::data_batch>> execute(
-    ::sirius::vector<::sirius::unique_ptr<::cucascade::data_batch_view>> input_batch);
+  virtual ::std::vector<::std::unique_ptr<::cucascade::data_batch>> execute(
+    ::std::vector<::std::unique_ptr<::cucascade::data_batch_view>> input_batch);
 
   virtual bool ParallelOperator() const { return false; }
 

@@ -14,7 +14,12 @@
  * limitations under the License.
  */
 #pragma once
-#include "helper/helper.hpp"
+
+#include <cstdint>
+#include <memory>
+#include <mutex>
+#include <queue>
+#include <semaphore>
 
 namespace sirius {
 
@@ -65,9 +70,9 @@ class task_completion_message_queue {
    *
    * @param message The completion message to enqueue (ownership is transferred)
    */
-  void enqueue_message(sirius::unique_ptr<task_completion_message> message)
+  void enqueue_message(std::unique_ptr<task_completion_message> message)
   {
-    sirius::lock_guard<sirius::mutex> lock(_mutex);
+    std::lock_guard<std::mutex> lock(_mutex);
     _message_queue.push(std::move(message));
     _sem.release();  // signal that one item is available
   }
@@ -78,13 +83,13 @@ class task_completion_message_queue {
    * This method blocks until a message becomes available, then safely dequeues
    * and returns it to the caller.
    *
-   * @return sirius::unique_ptr<task_completion_message> The dequeued message, or nullptr if queue
+   * @return std::unique_ptr<task_completion_message> The dequeued message, or nullptr if queue
    * is empty
    */
-  sirius::unique_ptr<task_completion_message> dequeue_message()
+  std::unique_ptr<task_completion_message> dequeue_message()
   {
     _sem.acquire();  // wait until there's something
-    sirius::lock_guard<sirius::mutex> lock(_mutex);
+    std::lock_guard<std::mutex> lock(_mutex);
     if (_message_queue.empty()) { return nullptr; }
     auto message = std::move(_message_queue.front());
     _message_queue.pop();
@@ -94,13 +99,13 @@ class task_completion_message_queue {
   /**
    * @brief Alias for dequeue_message for consistent interface
    *
-   * @return sirius::unique_ptr<task_completion_message> The dequeued message
+   * @return std::unique_ptr<task_completion_message> The dequeued message
    */
-  sirius::unique_ptr<task_completion_message> pull_message() { return dequeue_message(); }
+  std::unique_ptr<task_completion_message> pull_message() { return dequeue_message(); }
 
  private:
-  sirius::mutex _mutex;  ///< Mutex for thread-safe queue access
-  sirius::queue<sirius::unique_ptr<task_completion_message>>
+  std::mutex _mutex;  ///< Mutex for thread-safe queue access
+  std::queue<std::unique_ptr<task_completion_message>>
     _message_queue;                   ///< Underlying message queue
   std::counting_semaphore<> _sem{0};  ///< Semaphore for blocking/signaling (starts with 0 permits)
 };

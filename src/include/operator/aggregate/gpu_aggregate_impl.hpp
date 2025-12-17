@@ -49,10 +49,10 @@ class gpu_aggregate_impl {
    *
    * @return The output data batch with ownership.
    */
-  static sirius::unique_ptr<cucascade::data_batch> local_ungrouped_aggregate(
+  static std::unique_ptr<cucascade::data_batch> local_ungrouped_aggregate(
     const cucascade::data_batch_view& input,
-    const sirius::vector<cudf::aggregation::Kind>& aggregates,
-    const sirius::vector<int>& aggregate_idx,
+    const std::vector<cudf::aggregation::Kind>& aggregates,
+    const std::vector<int>& aggregate_idx,
     rmm::cuda_stream_view stream,
     cucascade::memory::memory_space& memory_space,
     cucascade::data_repository_manager& data_repository_mgr);
@@ -70,11 +70,11 @@ class gpu_aggregate_impl {
    *
    * @return The output data batch with ownership.
    */
-  static sirius::unique_ptr<cucascade::data_batch> local_grouped_aggregate(
+  static std::unique_ptr<cucascade::data_batch> local_grouped_aggregate(
     const cucascade::data_batch_view& input,
-    const sirius::vector<int>& group_idx,
-    const sirius::vector<cudf::aggregation::Kind>& aggregates,
-    const sirius::vector<int>& aggregate_idx,
+    const std::vector<int>& group_idx,
+    const std::vector<cudf::aggregation::Kind>& aggregates,
+    const std::vector<int>& aggregate_idx,
     rmm::cuda_stream_view stream,
     cucascade::memory::memory_space& memory_space,
     cucascade::data_repository_manager& data_repository_mgr);

@@ -98,7 +98,7 @@ void downgrade_task::mark_task_completion()
   // notify task_creator about task completion
   uint64_t task_id     = _local_state->cast<downgrade_task_local_state>()._task_id;
   uint64_t pipeline_id = _local_state->cast<downgrade_task_local_state>()._pipeline_id;
-  auto message         = sirius::make_unique<sirius::task_completion_message>();
+  auto message         = std::make_unique<sirius::task_completion_message>();
   message->task_id     = task_id;
   message->pipeline_id = pipeline_id;
   message->source      = sirius::Source::PIPELINE;

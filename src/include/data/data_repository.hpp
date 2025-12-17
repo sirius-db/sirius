@@ -15,8 +15,12 @@
  */
 
 #pragma once
+
 #include "data_batch.hpp"
-#include "helper/helper.hpp"
+
+#include <memory>
+#include <mutex>
+#include <vector>
 
 namespace cucascade {
 
@@ -56,7 +60,7 @@ class idata_repository {
    *
    * @note Thread-safe operation protected by internal mutex
    */
-  virtual void add_new_data_batch_view(sirius::unique_ptr<data_batch_view> batch_view);
+  virtual void add_new_data_batch_view(std::unique_ptr<data_batch_view> batch_view);
 
   /**
    * @brief Remove and return a data batch from this repository according to eviction policy.
@@ -66,15 +70,15 @@ class idata_repository {
    * - LRU: Returns the least recently used batch
    * - Priority: Returns the lowest priority batch
    *
-   * @return sirius::unique_ptr<data_batch_view> The evicted data batch, or nullptr if empty
+   * @return std::unique_ptr<data_batch_view> The evicted data batch, or nullptr if empty
    *
    * @note Thread-safe operation protected by internal mutex
    */
-  virtual sirius::unique_ptr<data_batch_view> pull_data_batch_view();
+  virtual std::unique_ptr<data_batch_view> pull_data_batch_view();
 
  protected:
-  sirius::mutex _mutex;  ///< Mutex for thread-safe access to repository operations
-  sirius::vector<sirius::unique_ptr<data_batch_view>>
+  std::mutex _mutex;  ///< Mutex for thread-safe access to repository operations
+  std::vector<std::unique_ptr<data_batch_view>>
     _data_batches;  ///< Map of pipeline source to data_batch_view
 };
 

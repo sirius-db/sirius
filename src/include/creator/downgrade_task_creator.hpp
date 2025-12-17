@@ -67,7 +67,7 @@ class downgrade_task_creator : public itask_creator {
    *
    * @param downgrade_task The downgrade task to schedule for execution
    */
-  void schedule(sirius::unique_ptr<parallel::downgrade_task> downgrade_task);
+  void schedule(std::unique_ptr<parallel::downgrade_task> downgrade_task);
 
  private:
   cucascade::data_repository_manager&

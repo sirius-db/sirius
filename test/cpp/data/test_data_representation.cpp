@@ -68,7 +68,7 @@ class mock_memory_space : public memory::memory_space {
 };
 
 // Helper function to create a mock host_table_allocation for testing
-sirius::unique_ptr<memory::host_table_allocation> create_mock_host_table_allocation(
+std::unique_ptr<memory::host_table_allocation> create_mock_host_table_allocation(
   std::size_t data_size)
 {
   // Create empty allocation blocks (we're not testing actual allocation here)
@@ -81,12 +81,12 @@ sirius::unique_ptr<memory::host_table_allocation> create_mock_host_table_allocat
   );
 
   // Create mock metadata
-  auto metadata = sirius::make_unique<sirius::vector<uint8_t>>();
+  auto metadata = std::make_unique<std::vector<uint8_t>>();
   metadata->push_back(0x01);
   metadata->push_back(0x02);
   metadata->push_back(0x03);
 
-  return sirius::make_unique<memory::host_table_allocation>(
+  return std::make_unique<memory::host_table_allocation>(
     std::move(empty_allocation), std::move(metadata), data_size);
 }
 
@@ -249,8 +249,8 @@ TEST_CASE("host_table_representation converts to GPU and preserves contents",
     }
   }
 
-  auto meta_copy  = sirius::make_unique<sirius::vector<uint8_t>>(*packed.metadata);
-  auto host_alloc = sirius::make_unique<memory::host_table_allocation>(
+  auto meta_copy  = std::make_unique<std::vector<uint8_t>>(*packed.metadata);
+  auto host_alloc = std::make_unique<memory::host_table_allocation>(
     std::move(allocation), std::move(meta_copy), packed.gpu_data->size());
   host_table_representation host_repr(std::move(host_alloc),
                                       const_cast<memory::memory_space*>(host_space));
@@ -419,7 +419,7 @@ TEST_CASE("gpu->host->gpu roundtrip preserves cudf table contents", "[gpu_data_r
     // Re-wrap into a host_table_representation to continue conversion
     host_table_representation host_repr2(std::move(host_alloc_uptr),
                                          const_cast<memory::memory_space*>(host_space));
-    cpu_any = sirius::make_unique<host_table_representation>(std::move(host_repr2));
+    cpu_any = std::make_unique<host_table_representation>(std::move(host_repr2));
   }
   auto gpu_any = cpu_any->convert_to_memory_space(gpu_space, chain_stream);
 

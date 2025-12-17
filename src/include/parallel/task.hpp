@@ -19,6 +19,8 @@
 #include "helper/helper.hpp"
 #include "memory/memory_reservation.hpp"
 
+#include <memory>
+
 namespace sirius {
 namespace parallel {
 
@@ -71,8 +73,8 @@ class itask_global_state {
  */
 class itask {
  public:
-  itask(sirius::unique_ptr<itask_local_state> local_state,
-        sirius::shared_ptr<itask_global_state> global_state)
+  itask(std::unique_ptr<itask_local_state> local_state,
+        std::shared_ptr<itask_global_state> global_state)
     : _local_state(std::move(local_state)), _global_state(global_state)
   {
   }
@@ -89,8 +91,8 @@ class itask {
   virtual void execute() = 0;
 
  protected:
-  sirius::unique_ptr<itask_local_state> _local_state;
-  sirius::shared_ptr<itask_global_state> _global_state;
+  std::unique_ptr<itask_local_state> _local_state;
+  std::shared_ptr<itask_global_state> _global_state;
 };
 
 }  // namespace parallel

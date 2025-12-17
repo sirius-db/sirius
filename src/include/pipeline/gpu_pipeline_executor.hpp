@@ -32,15 +32,15 @@ class pipeline_executor;
 class local_task_buffer {
  public:
   local_task_buffer() = default;
-  void produce(sirius::unique_ptr<itask> task);
-  sirius::unique_ptr<itask> consume();
+  void produce(std::unique_ptr<itask> task);
+  std::unique_ptr<itask> consume();
   void open();
   void close();
 
  private:
   mutable std::mutex _mtx;
   std::condition_variable _cv;
-  std::queue<sirius::unique_ptr<itask>> _queue;
+  std::queue<std::unique_ptr<itask>> _queue;
   std::atomic<bool> _is_open{false};  ///< Whether the queue is open for pushing/pulling tasks
 };
 
@@ -82,7 +82,7 @@ class gpu_pipeline_executor : public itask_executor {
    *
    * @param task The task to schedule (must be a gpu_pipeline_task)
    */
-  void schedule(sirius::unique_ptr<itask> task) override;
+  void schedule(std::unique_ptr<itask> task) override;
 
   /**
    * @brief Main worker loop for executing GPU pipeline tasks
@@ -128,7 +128,7 @@ class gpu_pipeline_executor : public itask_executor {
   /**
    * @brief Submit a task request to task_request_queue
    */
-  void submit_task_request(sirius::unique_ptr<task_request> request);
+  void submit_task_request(std::unique_ptr<task_request> request);
 
  private:
   /**
@@ -140,8 +140,8 @@ class gpu_pipeline_executor : public itask_executor {
    */
   gpu_pipeline_task* cast_to_gpu_pipeline_task(itask* task);
 
-  sirius::unique_ptr<std::thread> _gpu_pipeline_executor_manager_thread;
-  sirius::unique_ptr<local_task_buffer> _local_task_buffer;
+  std::unique_ptr<std::thread> _gpu_pipeline_executor_manager_thread;
+  std::unique_ptr<local_task_buffer> _local_task_buffer;
   pipeline_executor* _pipeline_exec;
   const cucascade::memory::memory_space*
     _memory_space_view;  // this is supposed to be the memory space

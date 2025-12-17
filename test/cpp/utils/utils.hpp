@@ -19,9 +19,11 @@
 #include "catch.hpp"
 #include "gpu_buffer_manager.hpp"
 #include "gpu_columns.hpp"
-#include "helper/helper.hpp"
 
+#include <memory>
+#include <optional>
 #include <random>
+#include <vector>
 
 namespace duckdb {
 
@@ -71,10 +73,10 @@ namespace sirius {
 
 std::mt19937_64& global_rng();
 
-sirius::unique_ptr<cudf::table> create_cudf_table_with_random_data(
+std::unique_ptr<cudf::table> create_cudf_table_with_random_data(
   size_t num_rows,
-  const sirius::vector<cudf::data_type>& column_types,
-  const sirius::vector<std::optional<std::pair<int, int>>>& ranges,
+  const std::vector<cudf::data_type>& column_types,
+  const std::vector<std::optional<std::pair<int, int>>>& ranges,
   rmm::cuda_stream_view stream,
   rmm::device_async_resource_ref mr);
 

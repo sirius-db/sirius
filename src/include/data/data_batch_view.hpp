@@ -15,9 +15,9 @@
  */
 
 #pragma once
+
 #include "data/common.hpp"
 #include "data/data_batch.hpp"
-#include "helper/helper.hpp"
 
 #include <cudf/table/table.hpp>
 

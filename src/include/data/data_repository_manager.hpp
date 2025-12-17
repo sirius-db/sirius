@@ -19,10 +19,14 @@
 #include "data/data_repository.hpp"
 #include "data_batch.hpp"
 #include "gpu_physical_operator.hpp"
-#include "helper/helper.hpp"
 
+#include <atomic>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 namespace cucascade {
 
@@ -98,7 +102,7 @@ class data_repository_manager {
    */
   void add_new_repository(::duckdb::GPUPhysicalOperator* op,
                           std::string_view port_id,
-                          sirius::unique_ptr<idata_repository> repository);
+                          std::unique_ptr<idata_repository> repository);
 
   /**
    * @brief Add a new data_batch to the holder.
@@ -112,8 +116,8 @@ class data_repository_manager {
    * @note Thread-safe operation
    */
   void add_new_data_batch(
-    sirius::unique_ptr<data_batch> batch,
-    sirius::vector<std::pair<::duckdb::GPUPhysicalOperator*, std::string_view>> ops);
+    std::unique_ptr<data_batch> batch,
+    std::vector<std::pair<::duckdb::GPUPhysicalOperator*, std::string_view>> ops);
 
   /**
    * @brief Get direct access to a pipeline's repository for advanced operations.
@@ -122,13 +126,13 @@ class data_repository_manager {
    * for repository-specific operations that aren't covered by the common interface.
    *
    * @param op the GPUPhysicalOperator whose repository is requested
-   * @return sirius::unique_ptr<idata_repository>& Reference to the repository
+   * @return std::unique_ptr<idata_repository>& Reference to the repository
    *
    * @throws std::out_of_range If no repository exists for the specified pipeline
    * @note Thread-safe for read access, but modifications should use the repository's own thread
    * safety
    */
-  sirius::unique_ptr<idata_repository>& get_repository(::duckdb::GPUPhysicalOperator* op,
+  std::unique_ptr<idata_repository>& get_repository(::duckdb::GPUPhysicalOperator* op,
                                                        std::string_view port_id);
 
   /**
@@ -172,13 +176,13 @@ class data_repository_manager {
    */
   void delete_data_batch(size_t batch_id);
 
-  mutex _mutex;  ///< Mutex for thread-safe access to holder
-  sirius::atomic<uint64_t> _next_data_batch_id =
+  std::mutex _mutex;  ///< Mutex for thread-safe access to holder
+  std::atomic<uint64_t> _next_data_batch_id =
     0;  ///< Atomic counter for generating unique data batch identifiers
-  std::map<operator_port_key, sirius::unique_ptr<idata_repository>>
+  std::map<operator_port_key, std::unique_ptr<idata_repository>>
     _repositories;  ///< Map of pipeline ID to idata_repository (uses std::map for O(log n) lookups
                     ///< without needing a hash function)
-  unordered_map<size_t, sirius::unique_ptr<data_batch>> _data_batches;
+  std::unordered_map<size_t, std::unique_ptr<data_batch>> _data_batches;
 };
 
 }  // namespace cucascade

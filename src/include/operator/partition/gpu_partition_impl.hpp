@@ -49,9 +49,9 @@ class gpu_partition_impl {
    *
    * @return The output data batch with ownership.
    */
-  static sirius::vector<sirius::unique_ptr<cucascade::data_batch>> hash_partition(
+  static std::vector<std::unique_ptr<cucascade::data_batch>> hash_partition(
     const cucascade::data_batch_view& input,
-    const sirius::vector<int>& partition_key_idx,
+    const std::vector<int>& partition_key_idx,
     int num_partitions,
     rmm::cuda_stream_view stream,
     cucascade::memory::memory_space& memory_space,
@@ -68,7 +68,7 @@ class gpu_partition_impl {
    *
    * @return The output data batch with ownership.
    */
-  static sirius::vector<sirius::unique_ptr<cucascade::data_batch>> evenly_partition(
+  static std::vector<std::unique_ptr<cucascade::data_batch>> evenly_partition(
     const cucascade::data_batch_view& input,
     int num_partitions,
     rmm::cuda_stream_view stream,

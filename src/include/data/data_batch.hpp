@@ -15,12 +15,15 @@
  */
 
 #pragma once
+
 #include "data/common.hpp"
-#include "helper/helper.hpp"
 
 #include <cudf/table/table.hpp>
 
+#include <cstddef>
+#include <cstdint>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <variant>
 
@@ -63,10 +66,10 @@ class data_batch {
    */
   data_batch(uint64_t batch_id,
              data_repository_manager& data_repo_mgr,
-             sirius::unique_ptr<idata_representation> data);
+             std::unique_ptr<idata_representation> data);
   data_batch(uint64_t batch_id,
              data_repository_manager& data_repo_mgr,
-             sirius::unique_ptr<idata_representation> data,
+             std::unique_ptr<idata_representation> data,
              cucascade::memory::memory_space& memory_space);
 
   /**
@@ -151,10 +154,10 @@ class data_batch {
    * a data_batch_view from its CUDF table view. The data_batch_view constructor will
    * handle incrementing the reference count.
    *
-   * @return sirius::unique_ptr<data_batch_view> A unique pointer to the new data_batch_view
+   * @return std::unique_ptr<data_batch_view> A unique pointer to the new data_batch_view
    * @note Assumes data is already in GPU tier as gpu_table_representation
    */
-  sirius::unique_ptr<data_batch_view> create_view();
+  std::unique_ptr<data_batch_view> create_view();
 
   /**
    * @brief Get the current view reference count (mutex-protected).
@@ -194,7 +197,7 @@ class data_batch {
    * @brief Replace the underlying data representation.
    *        Requires no active views or pins.
    */
-  void set_data(sirius::unique_ptr<idata_representation> data);
+  void set_data(std::unique_ptr<idata_representation> data);
 
   /**
    * @brief Convert the underlying representation to the target memory_space.
@@ -205,7 +208,7 @@ class data_batch {
 
   bool try_to_lock_for_downgrade()
   {
-    std::lock_guard<sirius::mutex> lock(_mutex);
+    std::lock_guard<std::mutex> lock(_mutex);
     if (_pin_count == 0 && !_downgrade_locked) {
       _downgrade_locked = true;
       return true;
@@ -214,10 +217,10 @@ class data_batch {
   }
 
  private:
-  mutable sirius::mutex
+  mutable std::mutex
     _mutex;            ///< Mutex for thread-safe access to tier checking and reference counting
   uint64_t _batch_id;  ///< Unique identifier for this data batch
-  sirius::unique_ptr<idata_representation> _data;  ///< Pointer to the actual data representation
+  std::unique_ptr<idata_representation> _data;  ///< Pointer to the actual data representation
   size_t _view_count = 0;                          ///< Reference count for tracking views
   size_t _pin_count  = 0;  ///< Reference count for tracking pins to prevent eviction
   data_repository_manager* _data_repo_mgr;         ///< Pointer to the data repository manager

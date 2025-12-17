@@ -15,12 +15,15 @@
  */
 
 #pragma once
+
 #include "config.hpp"
 #include "data/data_repository.hpp"
-#include "helper/helper.hpp"
 #include "memory/common.hpp"
 #include "parallel/task_executor.hpp"
 #include "task_completion.hpp"
+
+#include <cstdint>
+#include <memory>
 
 namespace cucascade {
 namespace parallel {
@@ -61,13 +64,13 @@ class downgrade_task_local_state : public sirius::parallel::itask_local_state {
  public:
   explicit downgrade_task_local_state(uint64_t task_id,
                                       uint64_t pipeline_id,
-                                      sirius::unique_ptr<data_batch> batch)
+                                      std::unique_ptr<data_batch> batch)
     : _task_id(task_id), _pipeline_id(pipeline_id), _batch(std::move(batch))
   {
   }
   uint64_t _task_id;
   uint64_t _pipeline_id;
-  sirius::unique_ptr<data_batch> _batch;
+  std::unique_ptr<data_batch> _batch;
 };
 
 /**
@@ -85,8 +88,8 @@ class downgrade_task : public sirius::parallel::itask {
    * @param local_state The local state specific to this task
    * @param global_state The global state shared across multiple tasks
    */
-  downgrade_task(sirius::unique_ptr<sirius::parallel::itask_local_state> local_state,
-                 sirius::shared_ptr<sirius::parallel::itask_global_state> global_state)
+  downgrade_task(std::unique_ptr<sirius::parallel::itask_local_state> local_state,
+                 std::shared_ptr<sirius::parallel::itask_global_state> global_state)
     : sirius::parallel::itask(std::move(local_state), std::move(global_state))
   {
   }

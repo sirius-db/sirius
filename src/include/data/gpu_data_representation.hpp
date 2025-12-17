@@ -18,9 +18,9 @@
 
 #include "cudf/cudf_utils.hpp"
 #include "data/common.hpp"
-#include "helper/helper.hpp"
 #include "memory/memory_space.hpp"
 
+#include <memory>
 #include <vector>
 
 namespace cucascade {
@@ -63,10 +63,10 @@ class gpu_table_representation : public idata_representation {
    * @brief Convert this GPU table representation to a different memory tier
    *
    * @param stream CUDA stream to use for memory operations
-   * @return sirius::unique_ptr<idata_representation> A new data representation in the target memory
+   * @return std::unique_ptr<idata_representation> A new data representation in the target memory
    * space
    */
-  sirius::unique_ptr<idata_representation> convert_to_memory_space(
+  std::unique_ptr<idata_representation> convert_to_memory_space(
     const cucascade::memory::memory_space* target_memory_space,
     rmm::cuda_stream_view stream = rmm::cuda_stream_default) override;
 

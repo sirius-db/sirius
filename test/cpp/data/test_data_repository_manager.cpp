@@ -78,7 +78,7 @@ class mock_data_representation : private mock_memory_space_holder, public idata_
 
   std::size_t get_size_in_bytes() const override { return _size; }
 
-  sirius::unique_ptr<idata_representation> convert_to_memory_space(
+  std::unique_ptr<idata_representation> convert_to_memory_space(
     const memory::memory_space* target_memory_space,
     rmm::cuda_stream_view stream = rmm::cuda_stream_default) override
   {
@@ -114,7 +114,7 @@ TEST_CASE("data_repository_manager Add Single Repository", "[data_repository_man
   data_repository_manager manager;
 
   size_t pipeline_id = 1;
-  auto repository    = sirius::make_unique<idata_repository>();
+  auto repository    = std::make_unique<idata_repository>();
   manager.add_new_repository(pipeline_id, std::move(repository));
 
   // Repository should be accessible
@@ -131,7 +131,7 @@ TEST_CASE("data_repository_manager Add Multiple Repositories", "[data_repository
 
   // Add repositories for multiple pipelines
   for (size_t i = 0; i < num_pipelines; ++i) {
-    auto repository = sirius::make_unique<idata_repository>();
+    auto repository = std::make_unique<idata_repository>();
     manager.add_new_repository(i, std::move(repository));
   }
 
@@ -150,14 +150,14 @@ TEST_CASE("data_repository_manager Replace Repository", "[data_repository_manage
   size_t pipeline_id = 5;
 
   // Add first repository
-  auto repository1 = sirius::make_unique<idata_repository>();
+  auto repository1 = std::make_unique<idata_repository>();
   auto* repo1_ptr  = repository1.get();
   manager.add_new_repository(pipeline_id, std::move(repository1));
 
   REQUIRE(manager.get_repository(pipeline_id).get() == repo1_ptr);
 
   // Replace with second repository
-  auto repository2 = sirius::make_unique<idata_repository>();
+  auto repository2 = std::make_unique<idata_repository>();
   auto* repo2_ptr  = repository2.get();
   manager.add_new_repository(pipeline_id, std::move(repository2));
 
@@ -172,8 +172,8 @@ TEST_CASE("data_repository_manager Access Non-Existent Repository", "[data_repos
   data_repository_manager manager;
 
   // Add some repositories
-  manager.add_new_repository(1, sirius::make_unique<idata_repository>());
-  manager.add_new_repository(2, sirius::make_unique<idata_repository>());
+  manager.add_new_repository(1, std::make_unique<idata_repository>());
+  manager.add_new_repository(2, std::make_unique<idata_repository>());
 
   // Accessing non-existent repositories should throw
   REQUIRE_THROWS_AS(manager.get_repository(0), std::out_of_range);
@@ -236,14 +236,14 @@ TEST_CASE("data_repository_manager Add Data Batch Single Pipeline", "[data_repos
 
   // Add repository
   size_t pipeline_id = 1;
-  manager.add_new_repository(pipeline_id, sirius::make_unique<idata_repository>());
+  manager.add_new_repository(pipeline_id, std::make_unique<idata_repository>());
 
   // Create and add batch
-  auto data         = sirius::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto data         = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
   uint64_t batch_id = manager.get_next_data_batch_id();
-  auto batch        = sirius::make_unique<data_batch>(batch_id, manager, std::move(data));
+  auto batch        = std::make_unique<data_batch>(batch_id, manager, std::move(data));
 
-  sirius::vector<size_t> pipeline_ids = {pipeline_id};
+  std::vector<size_t> pipeline_ids = {pipeline_id};
   manager.add_new_data_batch(std::move(batch), pipeline_ids);
 
   // Repository should have the batch view
@@ -258,15 +258,15 @@ TEST_CASE("data_repository_manager Add Data Batch Multiple Pipelines", "[data_re
   data_repository_manager manager;
 
   // Add multiple repositories
-  sirius::vector<size_t> pipeline_ids = {1, 2, 3};
+  std::vector<size_t> pipeline_ids = {1, 2, 3};
   for (size_t id : pipeline_ids) {
-    manager.add_new_repository(id, sirius::make_unique<idata_repository>());
+    manager.add_new_repository(id, std::make_unique<idata_repository>());
   }
 
   // Create and add batch to all pipelines
-  auto data         = sirius::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto data         = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
   uint64_t batch_id = manager.get_next_data_batch_id();
-  auto batch        = sirius::make_unique<data_batch>(batch_id, manager, std::move(data));
+  auto batch        = std::make_unique<data_batch>(batch_id, manager, std::move(data));
 
   manager.add_new_data_batch(std::move(batch), pipeline_ids);
 
@@ -284,11 +284,11 @@ TEST_CASE("data_repository_manager Add Data Batch No Pipelines", "[data_reposito
   data_repository_manager manager;
 
   // Create and add batch with empty pipeline list
-  auto data         = sirius::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto data         = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
   uint64_t batch_id = manager.get_next_data_batch_id();
-  auto batch        = sirius::make_unique<data_batch>(batch_id, manager, std::move(data));
+  auto batch        = std::make_unique<data_batch>(batch_id, manager, std::move(data));
 
-  sirius::vector<size_t> empty_pipeline_ids;
+  std::vector<size_t> empty_pipeline_ids;
   manager.add_new_data_batch(std::move(batch), empty_pipeline_ids);
 
   // Batch is stored but no views are created
@@ -302,14 +302,14 @@ TEST_CASE("data_repository_manager Delete Data Batch", "[data_repository_manager
 
   // Add repository
   size_t pipeline_id = 1;
-  manager.add_new_repository(pipeline_id, sirius::make_unique<idata_repository>());
+  manager.add_new_repository(pipeline_id, std::make_unique<idata_repository>());
 
   // Create and add batch
-  auto data         = sirius::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto data         = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
   uint64_t batch_id = manager.get_next_data_batch_id();
-  auto batch        = sirius::make_unique<data_batch>(batch_id, manager, std::move(data));
+  auto batch        = std::make_unique<data_batch>(batch_id, manager, std::move(data));
 
-  sirius::vector<size_t> pipeline_ids = {pipeline_id};
+  std::vector<size_t> pipeline_ids = {pipeline_id};
   manager.add_new_data_batch(std::move(batch), pipeline_ids);
 
   // Pull the view from repository first (views hold pointers to the batch)
@@ -333,16 +333,16 @@ TEST_CASE("data_repository_manager Add Multiple Batches", "[data_repository_mana
 
   // Add repository
   size_t pipeline_id = 1;
-  manager.add_new_repository(pipeline_id, sirius::make_unique<idata_repository>());
+  manager.add_new_repository(pipeline_id, std::make_unique<idata_repository>());
 
   constexpr int num_batches           = 10;
-  sirius::vector<size_t> pipeline_ids = {pipeline_id};
+  std::vector<size_t> pipeline_ids = {pipeline_id};
 
   // Add multiple batches
   for (int i = 0; i < num_batches; ++i) {
-    auto data         = sirius::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+    auto data         = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
     uint64_t batch_id = manager.get_next_data_batch_id();
-    auto batch        = sirius::make_unique<data_batch>(batch_id, manager, std::move(data));
+    auto batch        = std::make_unique<data_batch>(batch_id, manager, std::move(data));
     manager.add_new_data_batch(std::move(batch), pipeline_ids);
   }
 
@@ -408,7 +408,7 @@ TEST_CASE("data_repository_manager Thread-Safe Add Repository", "[data_repositor
   // Launch threads to add repositories
   for (int i = 0; i < num_threads; ++i) {
     threads.emplace_back([&, i]() {
-      auto repository = sirius::make_unique<idata_repository>();
+      auto repository = std::make_unique<idata_repository>();
       manager.add_new_repository(i, std::move(repository));
     });
   }
@@ -432,21 +432,21 @@ TEST_CASE("data_repository_manager Thread-Safe Add Batch", "[data_repository_man
 
   // Add repository
   size_t pipeline_id = 1;
-  manager.add_new_repository(pipeline_id, sirius::make_unique<idata_repository>());
+  manager.add_new_repository(pipeline_id, std::make_unique<idata_repository>());
 
   constexpr int num_threads        = 10;
   constexpr int batches_per_thread = 50;
 
   std::vector<std::thread> threads;
-  sirius::vector<size_t> pipeline_ids = {pipeline_id};
+  std::vector<size_t> pipeline_ids = {pipeline_id};
 
   // Launch threads to add batches
   for (int i = 0; i < num_threads; ++i) {
     threads.emplace_back([&]() {
       for (int j = 0; j < batches_per_thread; ++j) {
-        auto data         = sirius::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+        auto data         = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
         uint64_t batch_id = manager.get_next_data_batch_id();
-        auto batch        = sirius::make_unique<data_batch>(batch_id, manager, std::move(data));
+        auto batch        = std::make_unique<data_batch>(batch_id, manager, std::move(data));
         manager.add_new_data_batch(std::move(batch), pipeline_ids);
       }
     });
@@ -473,24 +473,24 @@ TEST_CASE("data_repository_manager Thread-Safe Delete Batch", "[data_repository_
 
   // Add repository
   size_t pipeline_id = 1;
-  manager.add_new_repository(pipeline_id, sirius::make_unique<idata_repository>());
+  manager.add_new_repository(pipeline_id, std::make_unique<idata_repository>());
 
   constexpr int num_batches           = 100;
-  sirius::vector<size_t> pipeline_ids = {pipeline_id};
+  std::vector<size_t> pipeline_ids = {pipeline_id};
   std::vector<uint64_t> batch_ids;
 
   // Add batches
   for (int i = 0; i < num_batches; ++i) {
-    auto data         = sirius::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+    auto data         = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
     uint64_t batch_id = manager.get_next_data_batch_id();
     batch_ids.push_back(batch_id);
-    auto batch = sirius::make_unique<data_batch>(batch_id, manager, std::move(data));
+    auto batch = std::make_unique<data_batch>(batch_id, manager, std::move(data));
     manager.add_new_data_batch(std::move(batch), pipeline_ids);
   }
 
   // Pull all views from repository to allow safe deletion
   auto& repo = manager.get_repository(pipeline_id);
-  std::vector<sirius::unique_ptr<data_batch_view>> views;
+  std::vector<std::unique_ptr<data_batch_view>> views;
   while (auto view = repo->pull_data_batch_view()) {
     views.push_back(std::move(view));
   }
@@ -525,7 +525,7 @@ TEST_CASE("data_repository_manager Thread-Safe Mixed Operations", "[data_reposit
 
   // Add initial repositories
   for (int i = 0; i < 5; ++i) {
-    manager.add_new_repository(i, sirius::make_unique<idata_repository>());
+    manager.add_new_repository(i, std::make_unique<idata_repository>());
   }
 
   constexpr int num_threads           = 10;
@@ -534,7 +534,7 @@ TEST_CASE("data_repository_manager Thread-Safe Mixed Operations", "[data_reposit
   std::vector<std::thread> threads;
   std::atomic<int> batch_count{0};
   std::mutex view_mutex;
-  std::vector<sirius::unique_ptr<data_batch_view>> all_views;
+  std::vector<std::unique_ptr<data_batch_view>> all_views;
 
   // Launch threads doing mixed operations
   for (int i = 0; i < num_threads; ++i) {
@@ -545,9 +545,9 @@ TEST_CASE("data_repository_manager Thread-Safe Mixed Operations", "[data_reposit
 
         // Add batch to random pipeline
         size_t pipeline_id = (i + j) % 5;
-        auto data          = sirius::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-        auto batch         = sirius::make_unique<data_batch>(batch_id, manager, std::move(data));
-        sirius::vector<size_t> pipeline_ids = {pipeline_id};
+        auto data          = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+        auto batch         = std::make_unique<data_batch>(batch_id, manager, std::move(data));
+        std::vector<size_t> pipeline_ids = {pipeline_id};
         manager.add_new_data_batch(std::move(batch), pipeline_ids);
 
         ++batch_count;
@@ -585,7 +585,7 @@ TEST_CASE("data_repository_manager Concurrent Add and Delete via View Destructor
   // Add repositories for multiple pipelines
   constexpr int num_pipelines = 3;
   for (int i = 0; i < num_pipelines; ++i) {
-    manager.add_new_repository(i, sirius::make_unique<idata_repository>());
+    manager.add_new_repository(i, std::make_unique<idata_repository>());
   }
 
   constexpr int num_adder_threads   = 5;
@@ -606,9 +606,9 @@ TEST_CASE("data_repository_manager Concurrent Add and Delete via View Destructor
 
         // Add batch to one or more pipelines
         size_t pipeline_id = (i + j) % num_pipelines;
-        auto data          = sirius::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
-        auto batch         = sirius::make_unique<data_batch>(batch_id, manager, std::move(data));
-        sirius::vector<size_t> pipeline_ids = {pipeline_id};
+        auto data          = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+        auto batch         = std::make_unique<data_batch>(batch_id, manager, std::move(data));
+        std::vector<size_t> pipeline_ids = {pipeline_id};
         manager.add_new_data_batch(std::move(batch), pipeline_ids);
 
         ++batches_added;
@@ -675,7 +675,7 @@ TEST_CASE("data_repository_manager High Contention Add Delete via View Destructo
 
   // Single pipeline for maximum contention
   size_t pipeline_id = 0;
-  manager.add_new_repository(pipeline_id, sirius::make_unique<idata_repository>());
+  manager.add_new_repository(pipeline_id, std::make_unique<idata_repository>());
 
   constexpr int num_threads           = 20;
   constexpr int operations_per_thread = 50;
@@ -688,13 +688,13 @@ TEST_CASE("data_repository_manager High Contention Add Delete via View Destructo
   for (int i = 0; i < num_threads; ++i) {
     threads.emplace_back([&]() {
       auto& repo                          = manager.get_repository(pipeline_id);
-      sirius::vector<size_t> pipeline_ids = {pipeline_id};
+      std::vector<size_t> pipeline_ids = {pipeline_id};
 
       for (int j = 0; j < operations_per_thread; ++j) {
         // Add a batch
         uint64_t batch_id = manager.get_next_data_batch_id();
-        auto data         = sirius::make_unique<mock_data_representation>(memory::Tier::GPU, 512);
-        auto batch        = sirius::make_unique<data_batch>(batch_id, manager, std::move(data));
+        auto data         = std::make_unique<mock_data_representation>(memory::Tier::GPU, 512);
+        auto batch        = std::make_unique<data_batch>(batch_id, manager, std::move(data));
         manager.add_new_data_batch(std::move(batch), pipeline_ids);
         ++total_added;
 
@@ -735,22 +735,22 @@ TEST_CASE("data_repository_manager Concurrent Add Delete Multiple Views per Batc
   // Add repositories
   constexpr int num_pipelines = 5;
   for (int i = 0; i < num_pipelines; ++i) {
-    manager.add_new_repository(i, sirius::make_unique<idata_repository>());
+    manager.add_new_repository(i, std::make_unique<idata_repository>());
   }
 
   constexpr int num_batches = 50;
   std::atomic<int> views_deleted{0};
 
   // Add batches to ALL pipelines (each batch will have multiple views)
-  sirius::vector<size_t> all_pipeline_ids;
+  std::vector<size_t> all_pipeline_ids;
   for (int i = 0; i < num_pipelines; ++i) {
     all_pipeline_ids.push_back(i);
   }
 
   for (int i = 0; i < num_batches; ++i) {
-    auto data         = sirius::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+    auto data         = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
     uint64_t batch_id = manager.get_next_data_batch_id();
-    auto batch        = sirius::make_unique<data_batch>(batch_id, manager, std::move(data));
+    auto batch        = std::make_unique<data_batch>(batch_id, manager, std::move(data));
     manager.add_new_data_batch(std::move(batch), all_pipeline_ids);
   }
 
@@ -796,9 +796,9 @@ TEST_CASE("data_repository_manager Full Workflow", "[data_repository_manager]")
   data_repository_manager manager;
 
   // Setup: Create 3 pipelines
-  sirius::vector<size_t> pipeline_ids = {0, 1, 2};
+  std::vector<size_t> pipeline_ids = {0, 1, 2};
   for (size_t id : pipeline_ids) {
-    manager.add_new_repository(id, sirius::make_unique<idata_repository>());
+    manager.add_new_repository(id, std::make_unique<idata_repository>());
   }
 
   // Add batches to different pipeline combinations
@@ -806,30 +806,30 @@ TEST_CASE("data_repository_manager Full Workflow", "[data_repository_manager]")
 
   // Batch 0: All pipelines
   {
-    auto data         = sirius::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+    auto data         = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
     uint64_t batch_id = manager.get_next_data_batch_id();
     batch_ids.push_back(batch_id);
-    auto batch = sirius::make_unique<data_batch>(batch_id, manager, std::move(data));
+    auto batch = std::make_unique<data_batch>(batch_id, manager, std::move(data));
     manager.add_new_data_batch(std::move(batch), pipeline_ids);
   }
 
   // Batch 1: Pipeline 0 only
   {
-    auto data         = sirius::make_unique<mock_data_representation>(memory::Tier::GPU, 2048);
+    auto data         = std::make_unique<mock_data_representation>(memory::Tier::GPU, 2048);
     uint64_t batch_id = manager.get_next_data_batch_id();
     batch_ids.push_back(batch_id);
-    auto batch                = sirius::make_unique<data_batch>(batch_id, manager, std::move(data));
-    sirius::vector<size_t> p0 = {0};
+    auto batch                = std::make_unique<data_batch>(batch_id, manager, std::move(data));
+    std::vector<size_t> p0 = {0};
     manager.add_new_data_batch(std::move(batch), p0);
   }
 
   // Batch 2: Pipelines 1 and 2
   {
-    auto data         = sirius::make_unique<mock_data_representation>(memory::Tier::GPU, 4096);
+    auto data         = std::make_unique<mock_data_representation>(memory::Tier::GPU, 4096);
     uint64_t batch_id = manager.get_next_data_batch_id();
     batch_ids.push_back(batch_id);
-    auto batch = sirius::make_unique<data_batch>(batch_id, manager, std::move(data));
-    sirius::vector<size_t> p12 = {1, 2};
+    auto batch = std::make_unique<data_batch>(batch_id, manager, std::move(data));
+    std::vector<size_t> p12 = {1, 2};
     manager.add_new_data_batch(std::move(batch), p12);
   }
 
@@ -874,17 +874,17 @@ TEST_CASE("data_repository_manager Replace Repository With Data", "[data_reposit
   size_t pipeline_id = 1;
 
   // Add first repository
-  manager.add_new_repository(pipeline_id, sirius::make_unique<idata_repository>());
+  manager.add_new_repository(pipeline_id, std::make_unique<idata_repository>());
 
   // Add batch to first repository
-  auto data         = sirius::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+  auto data         = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
   uint64_t batch_id = manager.get_next_data_batch_id();
-  auto batch        = sirius::make_unique<data_batch>(batch_id, manager, std::move(data));
-  sirius::vector<size_t> pipeline_ids = {pipeline_id};
+  auto batch        = std::make_unique<data_batch>(batch_id, manager, std::move(data));
+  std::vector<size_t> pipeline_ids = {pipeline_id};
   manager.add_new_data_batch(std::move(batch), pipeline_ids);
 
   // Replace repository
-  manager.add_new_repository(pipeline_id, sirius::make_unique<idata_repository>());
+  manager.add_new_repository(pipeline_id, std::make_unique<idata_repository>());
 
   // New repository should be empty
   auto& new_repo = manager.get_repository(pipeline_id);
@@ -901,7 +901,7 @@ TEST_CASE("data_repository_manager Large Number of Pipelines", "[data_repository
 
   // Add many pipelines
   for (int i = 0; i < num_pipelines; ++i) {
-    manager.add_new_repository(i, sirius::make_unique<idata_repository>());
+    manager.add_new_repository(i, std::make_unique<idata_repository>());
   }
 
   // All pipelines should be accessible
@@ -918,16 +918,16 @@ TEST_CASE("data_repository_manager Large Number of Batches", "[data_repository_m
 
   // Add repository
   size_t pipeline_id = 1;
-  manager.add_new_repository(pipeline_id, sirius::make_unique<idata_repository>());
+  manager.add_new_repository(pipeline_id, std::make_unique<idata_repository>());
 
   constexpr int num_batches           = 1000;
-  sirius::vector<size_t> pipeline_ids = {pipeline_id};
+  std::vector<size_t> pipeline_ids = {pipeline_id};
 
   // Add many batches
   for (int i = 0; i < num_batches; ++i) {
-    auto data         = sirius::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+    auto data         = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
     uint64_t batch_id = manager.get_next_data_batch_id();
-    auto batch        = sirius::make_unique<data_batch>(batch_id, manager, std::move(data));
+    auto batch        = std::make_unique<data_batch>(batch_id, manager, std::move(data));
     manager.add_new_data_batch(std::move(batch), pipeline_ids);
   }
 
@@ -950,7 +950,7 @@ TEST_CASE("data_repository_manager Pipeline ID Zero", "[data_repository_manager]
   data_repository_manager manager;
 
   // Pipeline ID 0 should work like any other ID
-  manager.add_new_repository(0, sirius::make_unique<idata_repository>());
+  manager.add_new_repository(0, std::make_unique<idata_repository>());
 
   auto& repo = manager.get_repository(0);
   REQUIRE(repo != nullptr);
@@ -965,7 +965,7 @@ TEST_CASE("data_repository_manager Large Pipeline IDs", "[data_repository_manage
 
   // Add repositories with large IDs
   for (size_t id : large_ids) {
-    manager.add_new_repository(id, sirius::make_unique<idata_repository>());
+    manager.add_new_repository(id, std::make_unique<idata_repository>());
   }
 
   // All should be accessible
@@ -982,16 +982,16 @@ TEST_CASE("data_repository_manager Batches With Different Sizes", "[data_reposit
 
   // Add repository
   size_t pipeline_id = 1;
-  manager.add_new_repository(pipeline_id, sirius::make_unique<idata_repository>());
+  manager.add_new_repository(pipeline_id, std::make_unique<idata_repository>());
 
   std::vector<size_t> sizes           = {1, 1024, 1024 * 1024, 1024 * 1024 * 10};
-  sirius::vector<size_t> pipeline_ids = {pipeline_id};
+  std::vector<size_t> pipeline_ids = {pipeline_id};
 
   // Add batches with different sizes
   for (size_t size : sizes) {
-    auto data         = sirius::make_unique<mock_data_representation>(memory::Tier::GPU, size);
+    auto data         = std::make_unique<mock_data_representation>(memory::Tier::GPU, size);
     uint64_t batch_id = manager.get_next_data_batch_id();
-    auto batch        = sirius::make_unique<data_batch>(batch_id, manager, std::move(data));
+    auto batch        = std::make_unique<data_batch>(batch_id, manager, std::move(data));
     manager.add_new_data_batch(std::move(batch), pipeline_ids);
   }
 
@@ -1011,16 +1011,16 @@ TEST_CASE("data_repository_manager Batches With Different Tiers", "[data_reposit
 
   // Add repository
   size_t pipeline_id = 1;
-  manager.add_new_repository(pipeline_id, sirius::make_unique<idata_repository>());
+  manager.add_new_repository(pipeline_id, std::make_unique<idata_repository>());
 
   std::vector<memory::Tier> tiers     = {memory::Tier::GPU, memory::Tier::HOST, memory::Tier::DISK};
-  sirius::vector<size_t> pipeline_ids = {pipeline_id};
+  std::vector<size_t> pipeline_ids = {pipeline_id};
 
   // Add batches with different tiers
   for (memory::Tier tier : tiers) {
-    auto data         = sirius::make_unique<mock_data_representation>(tier, 1024);
+    auto data         = std::make_unique<mock_data_representation>(tier, 1024);
     uint64_t batch_id = manager.get_next_data_batch_id();
-    auto batch        = sirius::make_unique<data_batch>(batch_id, manager, std::move(data));
+    auto batch        = std::make_unique<data_batch>(batch_id, manager, std::move(data));
     manager.add_new_data_batch(std::move(batch), pipeline_ids);
   }
 
@@ -1040,16 +1040,16 @@ TEST_CASE("data_repository_manager Rapid Add Delete Cycles", "[data_repository_m
 
   // Add repository
   size_t pipeline_id = 1;
-  manager.add_new_repository(pipeline_id, sirius::make_unique<idata_repository>());
+  manager.add_new_repository(pipeline_id, std::make_unique<idata_repository>());
 
-  sirius::vector<size_t> pipeline_ids = {pipeline_id};
+  std::vector<size_t> pipeline_ids = {pipeline_id};
   auto& repo                          = manager.get_repository(pipeline_id);
 
   // Perform many cycles of add and delete
   for (int cycle = 0; cycle < 100; ++cycle) {
-    auto data         = sirius::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
+    auto data         = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
     uint64_t batch_id = manager.get_next_data_batch_id();
-    auto batch        = sirius::make_unique<data_batch>(batch_id, manager, std::move(data));
+    auto batch        = std::make_unique<data_batch>(batch_id, manager, std::move(data));
     manager.add_new_data_batch(std::move(batch), pipeline_ids);
 
     // Pull and destroy the view, which triggers batch deletion

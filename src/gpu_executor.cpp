@@ -309,7 +309,7 @@ void GPUExecutor::InitializeInternal(GPUPhysicalOperator& plan)
         SIRIUS_LOG_DEBUG("");  // Blank line for separation
       }
 
-      auto data_repo_manager = ::sirius::make_unique<::cucascade::data_repository_manager>();
+      auto data_repo_manager = ::std::make_unique<::cucascade::data_repository_manager>();
       unordered_map<const GPUPhysicalOperator*, vector<shared_ptr<GPUPipeline>>>
         source_to_pipelines;
 
@@ -581,8 +581,8 @@ void GPUExecutor::InitializeInternal(GPUPhysicalOperator& plan)
         }
 
         for (auto next_port : new_scheduled[i]->sink->get_next_port_after_sink()) {
-          ::sirius::unique_ptr<::cucascade::idata_repository> repo =
-            ::sirius::make_unique<::cucascade::idata_repository>();
+          ::std::unique_ptr<::cucascade::idata_repository> repo =
+            ::std::make_unique<::cucascade::idata_repository>();
           std::string_view port_id = next_port.second;
           auto next_op             = next_port.first;
           data_repo_manager->add_new_repository(next_op, port_id, std::move(repo));
@@ -594,8 +594,8 @@ void GPUExecutor::InitializeInternal(GPUPhysicalOperator& plan)
         }
 
         if (new_scheduled[i]->source->type == PhysicalOperatorType::TABLE_SCAN) {
-          ::sirius::unique_ptr<::cucascade::idata_repository> repo =
-            ::sirius::make_unique<::cucascade::idata_repository>();
+          ::std::unique_ptr<::cucascade::idata_repository> repo =
+            ::std::make_unique<::cucascade::idata_repository>();
           std::string port_id = "scan";
           data_repo_manager->add_new_repository(
             new_scheduled[i]->source.get(), port_id, std::move(repo));
@@ -608,8 +608,8 @@ void GPUExecutor::InitializeInternal(GPUPhysicalOperator& plan)
         }
 
         if (new_scheduled[i]->sink->type == PhysicalOperatorType::RESULT_COLLECTOR) {
-          ::sirius::unique_ptr<::cucascade::idata_repository> repo =
-            ::sirius::make_unique<::cucascade::idata_repository>();
+          ::std::unique_ptr<::cucascade::idata_repository> repo =
+            ::std::make_unique<::cucascade::idata_repository>();
           std::string port_id = "final";
           data_repo_manager->add_new_repository(
             new_scheduled[i]->sink.get(), port_id, std::move(repo));
