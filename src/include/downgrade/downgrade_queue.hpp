@@ -17,16 +17,15 @@
 #pragma once
 
 #include "config.hpp"
-#include "data/data_repository.hpp"
+#include "downgrade/downgrade_task.hpp"
 #include "parallel/task_executor.hpp"
-#include "task_completion.hpp"
 
 #include <memory>
 #include <mutex>
 #include <queue>
 #include <semaphore>
 
-namespace cucascade {
+namespace sirius {
 namespace parallel {
 
 /**
@@ -190,4 +189,4 @@ class downgrade_task_queue : public itask_queue {
 };
 
 }  // namespace parallel
-}  // namespace cucascade
+}  // namespace sirius

@@ -60,6 +60,14 @@ class GPUExecutor {
   //! Storage for pipeline breaker created during pipeline splitting
   vector<unique_ptr<GPUPhysicalOperator>> new_pipeline_breakers;
   vector<unique_ptr<GPUPhysicalOperator>> concat_ops;
+  //! Map from operator pointer to unique ID for data_repository_manager
+  std::unordered_map<const GPUPhysicalOperator*, size_t> operator_to_id;
+  //! Mutex for thread-safe access to operator_to_id map
+  std::mutex operator_id_mutex;
+  //! Counter for generating unique operator IDs
+  std::atomic<size_t> next_operator_id{0};
+  //! Get or create a unique ID for an operator
+  size_t get_operator_id(const GPUPhysicalOperator* op);
   //! The current root pipeline index
   idx_t root_pipeline_idx;
   //! The amount of completed pipelines of the query

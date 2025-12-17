@@ -16,10 +16,10 @@
 
 #pragma once
 
-#include "cudf/cudf_utils.hpp"
 #include "data/common.hpp"
 #include "memory/memory_space.hpp"
 
+#include <cudf/table/table.hpp>
 #include <memory>
 #include <vector>
 

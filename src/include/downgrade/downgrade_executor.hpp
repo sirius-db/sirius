@@ -16,11 +16,12 @@
 
 #pragma once
 #include "data/data_repository.hpp"
+#include "downgrade/downgrade_queue.hpp"
 #include "downgrade/downgrade_task.hpp"
 #include "memory/memory_reservation.hpp"
 #include "parallel/task_executor.hpp"
 
-namespace cucascade {
+namespace sirius {
 namespace parallel {
 
 /**
@@ -41,7 +42,8 @@ class downgrade_executor : public itask_executor {
    * @param config Configuration for the task executor (thread count, retry policy, etc.)
    * @param data_repo_mgr Reference to the data repository for accessing and storing data batches
    */
-  explicit downgrade_executor(task_executor_config config, data_repository_manager& data_repo_mgr)
+  explicit downgrade_executor(task_executor_config config,
+                              cucascade::data_repository_manager& data_repo_mgr)
     : itask_executor(std::make_unique<downgrade_task_queue>(), config),
       _data_repo_mgr(data_repo_mgr)
   {
@@ -120,9 +122,9 @@ class downgrade_executor : public itask_executor {
   downgrade_task* cast_to_downgrade_task(itask* task);
 
  private:
-  data_repository_manager& _data_repo_mgr;  ///< Reference to the data repository manager for
-                                            ///< accessing data during downgrade operations
+  cucascade::data_repository_manager& _data_repo_mgr;  ///< Reference to the data repository manager
+                                                       ///< for accessing data during downgrade operations
 };
 
 }  // namespace parallel
-}  // namespace cucascade
+}  // namespace sirius

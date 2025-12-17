@@ -55,9 +55,21 @@ void GPUExecutor::Reset()
   pipelines.clear();
   new_pipeline_breakers.clear();
   concat_ops.clear();
+  operator_to_id.clear();
+  next_operator_id.store(0);
   // events.clear();
   // to_be_rescheduled_tasks.clear();
   // execution_result = PendingExecutionResult::RESULT_NOT_READY;
+}
+
+size_t GPUExecutor::get_operator_id(const GPUPhysicalOperator* op)
+{
+  std::lock_guard<std::mutex> lock(operator_id_mutex);
+  auto it = operator_to_id.find(op);
+  if (it != operator_to_id.end()) { return it->second; }
+  size_t id          = next_operator_id++;
+  operator_to_id[op] = id;
+  return id;
 }
 
 void GPUExecutor::Initialize(unique_ptr<GPUPhysicalOperator> plan)
@@ -585,25 +597,26 @@ void GPUExecutor::InitializeInternal(GPUPhysicalOperator& plan)
             ::std::make_unique<::cucascade::idata_repository>();
           std::string_view port_id = next_port.second;
           auto next_op             = next_port.first;
-          data_repo_manager->add_new_repository(next_op, port_id, std::move(repo));
+          size_t op_id             = get_operator_id(next_op);
+          data_repo_manager->add_new_repository(op_id, port_id, std::move(repo));
           next_op->add_port(port_id,
                             std::make_unique<GPUPhysicalOperator::port>(
                               MemoryBarrierType::FULL,
-                              data_repo_manager->get_repository(next_op, port_id).get(),
+                              data_repo_manager->get_repository(op_id, port_id).get(),
                               new_scheduled[i]));
         }
 
         if (new_scheduled[i]->source->type == PhysicalOperatorType::TABLE_SCAN) {
           ::std::unique_ptr<::cucascade::idata_repository> repo =
             ::std::make_unique<::cucascade::idata_repository>();
-          std::string port_id = "scan";
-          data_repo_manager->add_new_repository(
-            new_scheduled[i]->source.get(), port_id, std::move(repo));
+          std::string port_id  = "scan";
+          size_t source_op_id  = get_operator_id(new_scheduled[i]->source.get());
+          data_repo_manager->add_new_repository(source_op_id, port_id, std::move(repo));
           new_scheduled[i]->source->add_port(
             port_id,
             std::make_unique<GPUPhysicalOperator::port>(
               MemoryBarrierType::PIPELINE,
-              data_repo_manager->get_repository(new_scheduled[i]->source.get(), port_id).get(),
+              data_repo_manager->get_repository(source_op_id, port_id).get(),
               new_scheduled[i]));
         }
 
@@ -611,13 +624,13 @@ void GPUExecutor::InitializeInternal(GPUPhysicalOperator& plan)
           ::std::unique_ptr<::cucascade::idata_repository> repo =
             ::std::make_unique<::cucascade::idata_repository>();
           std::string port_id = "final";
-          data_repo_manager->add_new_repository(
-            new_scheduled[i]->sink.get(), port_id, std::move(repo));
+          size_t sink_op_id   = get_operator_id(new_scheduled[i]->sink.get());
+          data_repo_manager->add_new_repository(sink_op_id, port_id, std::move(repo));
           new_scheduled[i]->sink->add_port(
             port_id,
             std::make_unique<GPUPhysicalOperator::port>(
               MemoryBarrierType::FULL,
-              data_repo_manager->get_repository(new_scheduled[i]->sink.get(), port_id).get(),
+              data_repo_manager->get_repository(sink_op_id, port_id).get(),
               new_scheduled[i]));
         }
       }

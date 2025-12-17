@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "downgrade/downgrade_task_creator.hpp"
+#include "creator/downgrade_task_creator.hpp"
 
 namespace sirius {
 

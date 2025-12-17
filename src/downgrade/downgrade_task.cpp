@@ -25,7 +25,7 @@
 
 #include <rmm/cuda_stream_view.hpp>
 
-namespace cucascade {
+namespace sirius {
 namespace parallel {
 
 void downgrade_task::execute()
@@ -34,7 +34,7 @@ void downgrade_task::execute()
   rmm::cuda_stream_view stream = rmm::cuda_stream_default;
   // get the memory_space and check that its gpu
   auto memory_space = _local_state->cast<downgrade_task_local_state>()._batch->get_memory_space();
-  if (memory_space->get_tier() != memory::Tier::GPU) {
+  if (memory_space->get_tier() != cucascade::memory::Tier::GPU) {
     mark_task_completion();
     return;
   } else {
@@ -53,7 +53,7 @@ void downgrade_task::execute()
       if (!mem_space) {
         throw std::runtime_error("Invalid reservation memory_space for HOST tier");
       }
-      auto* fixed_mr = reservation->get_memory_resource_of<memory::Tier::HOST>();
+      auto* fixed_mr = reservation->get_memory_resource_of<cucascade::memory::Tier::HOST>();
 
       batch->convert_to_memory_space(mem_space, stream);
 
@@ -112,4 +112,4 @@ uint64_t downgrade_task::get_task_id() const
 }
 
 }  // namespace parallel
-}  // namespace cucascade
+}  // namespace sirius

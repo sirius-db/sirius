@@ -25,7 +25,7 @@
 #include <cstdint>
 #include <memory>
 
-namespace cucascade {
+namespace sirius {
 namespace parallel {
 
 /**
@@ -35,7 +35,7 @@ namespace parallel {
  * an operation need access to, including the data repository for storing results
  * and the message queue for task completion notifications.
  */
-class downgrade_task_global_state : public sirius::parallel::itask_global_state {
+class downgrade_task_global_state : public itask_global_state {
  public:
   /**
    * @brief Construct a new downgrade_task_global_state object
@@ -43,14 +43,14 @@ class downgrade_task_global_state : public sirius::parallel::itask_global_state 
    * @param data_repo_mgr Reference to the data repository manager for storing task outputs
    * @param message_queue Reference to the message queue for task completion notifications
    */
-  explicit downgrade_task_global_state(data_repository_manager& data_repo_mgr,
-                                       sirius::task_completion_message_queue& message_queue)
+  explicit downgrade_task_global_state(cucascade::data_repository_manager& data_repo_mgr,
+                                       task_completion_message_queue& message_queue)
     : _data_repo_mgr(data_repo_mgr), _message_queue(message_queue)
   {
   }
 
-  data_repository_manager& _data_repo_mgr;  ///< Repository for storing and retrieving data batches
-  sirius::task_completion_message_queue&
+  cucascade::data_repository_manager& _data_repo_mgr;  ///< Repository for storing and retrieving data batches
+  task_completion_message_queue&
     _message_queue;  ///< Message queue to notify task_creator about task completion
 };
 
@@ -60,17 +60,17 @@ class downgrade_task_global_state : public sirius::parallel::itask_global_state 
  * This class holds the local state for a downgrade task, including the task ID,
  * the pipeline ID, and the data batch view.
  */
-class downgrade_task_local_state : public sirius::parallel::itask_local_state {
+class downgrade_task_local_state : public itask_local_state {
  public:
   explicit downgrade_task_local_state(uint64_t task_id,
                                       uint64_t pipeline_id,
-                                      std::unique_ptr<data_batch> batch)
+                                      std::unique_ptr<cucascade::data_batch> batch)
     : _task_id(task_id), _pipeline_id(pipeline_id), _batch(std::move(batch))
   {
   }
   uint64_t _task_id;
   uint64_t _pipeline_id;
-  std::unique_ptr<data_batch> _batch;
+  std::unique_ptr<cucascade::data_batch> _batch;
 };
 
 /**
@@ -80,7 +80,7 @@ class downgrade_task_local_state : public sirius::parallel::itask_local_state {
  * downgrade operation. Memory downgrading involves moving data from higher-tier (faster)
  * memory to lower-tier (slower) memory to free up space.
  */
-class downgrade_task : public sirius::parallel::itask {
+class downgrade_task : public itask {
  public:
   /**
    * @brief Construct a new downgrade_task object
@@ -88,9 +88,9 @@ class downgrade_task : public sirius::parallel::itask {
    * @param local_state The local state specific to this task
    * @param global_state The global state shared across multiple tasks
    */
-  downgrade_task(std::unique_ptr<sirius::parallel::itask_local_state> local_state,
-                 std::shared_ptr<sirius::parallel::itask_global_state> global_state)
-    : sirius::parallel::itask(std::move(local_state), std::move(global_state))
+  downgrade_task(std::unique_ptr<itask_local_state> local_state,
+                 std::shared_ptr<itask_global_state> global_state)
+    : itask(std::move(local_state), std::move(global_state))
   {
   }
 
@@ -121,4 +121,4 @@ class downgrade_task : public sirius::parallel::itask {
 };
 
 }  // namespace parallel
-}  // namespace cucascade
+}  // namespace sirius
