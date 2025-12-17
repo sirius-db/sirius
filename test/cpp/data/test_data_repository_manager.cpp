@@ -28,7 +28,6 @@
 #include <thread>
 #include <vector>
 
-
 using namespace cucascade;
 
 // Mock memory_space for testing - provides a simple memory_space without real allocators
@@ -333,7 +332,7 @@ TEST_CASE("data_repository_manager Add Multiple Batches", "[data_repository_mana
   size_t operator_id = 1;
   manager.add_new_repository(operator_id, "default", std::make_unique<idata_repository>());
 
-  constexpr int num_batches = 10;
+  constexpr int num_batches                                       = 10;
   std::vector<std::pair<size_t, std::string_view>> operator_ports = {{operator_id, "default"}};
 
   // Add multiple batches
@@ -473,7 +472,7 @@ TEST_CASE("data_repository_manager Thread-Safe Delete Batch", "[data_repository_
   size_t operator_id = 1;
   manager.add_new_repository(operator_id, "default", std::make_unique<idata_repository>());
 
-  constexpr int num_batches = 100;
+  constexpr int num_batches                                       = 100;
   std::vector<std::pair<size_t, std::string_view>> operator_ports = {{operator_id, "default"}};
   std::vector<uint64_t> batch_ids;
 
@@ -545,7 +544,8 @@ TEST_CASE("data_repository_manager Thread-Safe Mixed Operations", "[data_reposit
         size_t operator_id = (i + j) % 5;
         auto data          = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
         auto batch         = std::make_unique<data_batch>(batch_id, manager, std::move(data));
-        std::vector<std::pair<size_t, std::string_view>> operator_ports = {{operator_id, "default"}};
+        std::vector<std::pair<size_t, std::string_view>> operator_ports = {
+          {operator_id, "default"}};
         manager.add_new_data_batch(std::move(batch), operator_ports);
 
         ++batch_count;
@@ -606,7 +606,8 @@ TEST_CASE("data_repository_manager Concurrent Add and Delete via View Destructor
         size_t operator_id = (i + j) % num_operators;
         auto data          = std::make_unique<mock_data_representation>(memory::Tier::GPU, 1024);
         auto batch         = std::make_unique<data_batch>(batch_id, manager, std::move(data));
-        std::vector<std::pair<size_t, std::string_view>> operator_ports = {{operator_id, "default"}};
+        std::vector<std::pair<size_t, std::string_view>> operator_ports = {
+          {operator_id, "default"}};
         manager.add_new_data_batch(std::move(batch), operator_ports);
 
         ++batches_added;
@@ -922,7 +923,7 @@ TEST_CASE("data_repository_manager Large Number of Batches", "[data_repository_m
   size_t operator_id = 1;
   manager.add_new_repository(operator_id, "default", std::make_unique<idata_repository>());
 
-  constexpr int num_batches = 1000;
+  constexpr int num_batches                                       = 1000;
   std::vector<std::pair<size_t, std::string_view>> operator_ports = {{operator_id, "default"}};
 
   // Add many batches

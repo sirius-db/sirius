@@ -56,7 +56,7 @@ void data_repository_manager::delete_data_batch(size_t batch_id)
 }
 
 std::unique_ptr<idata_repository>& data_repository_manager::get_repository(size_t operator_id,
-                                                                          std::string_view port_id)
+                                                                           std::string_view port_id)
 {
   return _repositories.at({operator_id, std::string(port_id)});
 }

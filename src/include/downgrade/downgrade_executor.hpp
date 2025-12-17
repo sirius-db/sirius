@@ -122,8 +122,9 @@ class downgrade_executor : public itask_executor {
   downgrade_task* cast_to_downgrade_task(itask* task);
 
  private:
-  cucascade::data_repository_manager& _data_repo_mgr;  ///< Reference to the data repository manager
-                                                       ///< for accessing data during downgrade operations
+  cucascade::data_repository_manager&
+    _data_repo_mgr;  ///< Reference to the data repository manager
+                     ///< for accessing data during downgrade operations
 };
 
 }  // namespace parallel

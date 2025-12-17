@@ -609,8 +609,8 @@ void GPUExecutor::InitializeInternal(GPUPhysicalOperator& plan)
         if (new_scheduled[i]->source->type == PhysicalOperatorType::TABLE_SCAN) {
           ::std::unique_ptr<::cucascade::idata_repository> repo =
             ::std::make_unique<::cucascade::idata_repository>();
-          std::string port_id  = "scan";
-          size_t source_op_id  = get_operator_id(new_scheduled[i]->source.get());
+          std::string port_id = "scan";
+          size_t source_op_id = get_operator_id(new_scheduled[i]->source.get());
           data_repo_manager->add_new_repository(source_op_id, port_id, std::move(repo));
           new_scheduled[i]->source->add_port(
             port_id,

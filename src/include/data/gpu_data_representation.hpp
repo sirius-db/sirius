@@ -20,6 +20,7 @@
 #include "memory/memory_space.hpp"
 
 #include <cudf/table/table.hpp>
+
 #include <memory>
 #include <vector>
 

@@ -49,7 +49,8 @@ class downgrade_task_global_state : public itask_global_state {
   {
   }
 
-  cucascade::data_repository_manager& _data_repo_mgr;  ///< Repository for storing and retrieving data batches
+  cucascade::data_repository_manager&
+    _data_repo_mgr;  ///< Repository for storing and retrieving data batches
   task_completion_message_queue&
     _message_queue;  ///< Message queue to notify task_creator about task completion
 };
