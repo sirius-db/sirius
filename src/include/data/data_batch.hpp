@@ -220,9 +220,9 @@ class data_batch {
   sirius::unique_ptr<idata_representation> _data;  ///< Pointer to the actual data representation
   size_t _view_count = 0;                          ///< Reference count for tracking views
   size_t _pin_count  = 0;  ///< Reference count for tracking pins to prevent eviction
-  data_repository_manager* _data_repo_mgr;      ///< Pointer to the data repository manager
+  data_repository_manager* _data_repo_mgr;         ///< Pointer to the data repository manager
   cucascade::memory::memory_space* _memory_space;  ///< Memory space where the data resides
-  bool _downgrade_locked = false;               ///< Whether the batch is locked for downgrade
+  bool _downgrade_locked = false;                  ///< Whether the batch is locked for downgrade
 };
 
 }  // namespace cucascade

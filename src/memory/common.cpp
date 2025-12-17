@@ -51,8 +51,8 @@ std::error_code make_error_code(MemoryError e)
 }
 
 cucascade_out_of_memory::cucascade_out_of_memory(std::string_view message,
-                                           std::size_t requested_bytes,
-                                           std::size_t global_usage)
+                                                 std::size_t requested_bytes,
+                                                 std::size_t global_usage)
   : rmm::out_of_memory(message.data()), requested_bytes(requested_bytes), global_usage(global_usage)
 {
 }

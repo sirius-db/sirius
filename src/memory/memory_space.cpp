@@ -86,17 +86,17 @@ int memory_space::get_device_id() const noexcept { return _id.device_id; }
 
 std::unique_ptr<reservation> memory_space::make_reservation_or_null(size_t size)
 {
-  std::unique_ptr<reserved_arena> arena =
-    std::visit(cucascade::overloaded{[&](std::unique_ptr<disk_access_limiter>& mr) {
-                                    return mr->reserve(size, notification_channel_->get_notifier());
-                                  },
-                                  [&](std::unique_ptr<reservation_aware_resource_adaptor>& mr) {
-                                    return mr->reserve(size, notification_channel_->get_notifier());
-                                  },
-                                  [&](std::unique_ptr<fixed_size_host_memory_resource>& mr) {
-                                    return mr->reserve(size, notification_channel_->get_notifier());
-                                  }},
-               _reservation_allocator);
+  std::unique_ptr<reserved_arena> arena = std::visit(
+    cucascade::overloaded{[&](std::unique_ptr<disk_access_limiter>& mr) {
+                            return mr->reserve(size, notification_channel_->get_notifier());
+                          },
+                          [&](std::unique_ptr<reservation_aware_resource_adaptor>& mr) {
+                            return mr->reserve(size, notification_channel_->get_notifier());
+                          },
+                          [&](std::unique_ptr<fixed_size_host_memory_resource>& mr) {
+                            return mr->reserve(size, notification_channel_->get_notifier());
+                          }},
+    _reservation_allocator);
   return reservation::create(*this, std::move(arena));
 }
 
@@ -104,14 +104,14 @@ std::unique_ptr<reservation> memory_space::make_reservation_upto(size_t size)
 {
   std::unique_ptr<reserved_arena> arena = std::visit(
     cucascade::overloaded{[&](std::unique_ptr<disk_access_limiter>& mr) {
-                         return mr->reserve_upto(size, notification_channel_->get_notifier());
-                       },
-                       [&](std::unique_ptr<reservation_aware_resource_adaptor>& mr) {
-                         return mr->reserve_upto(size, notification_channel_->get_notifier());
-                       },
-                       [&](std::unique_ptr<fixed_size_host_memory_resource>& mr) {
-                         return mr->reserve_upto(size, notification_channel_->get_notifier());
-                       }},
+                            return mr->reserve_upto(size, notification_channel_->get_notifier());
+                          },
+                          [&](std::unique_ptr<reservation_aware_resource_adaptor>& mr) {
+                            return mr->reserve_upto(size, notification_channel_->get_notifier());
+                          },
+                          [&](std::unique_ptr<fixed_size_host_memory_resource>& mr) {
+                            return mr->reserve_upto(size, notification_channel_->get_notifier());
+                          }},
     _reservation_allocator);
   return reservation::create(*this, std::move(arena));
 }
@@ -140,14 +140,14 @@ std::size_t memory_space::get_active_reservation_count() const
 {
   return std::visit(
     cucascade::overloaded{[&](const std::unique_ptr<disk_access_limiter>& mr) {
-                         return mr->get_active_reservation_count();
-                       },
-                       [&](const std::unique_ptr<reservation_aware_resource_adaptor>& mr) {
-                         return mr->get_active_reservation_count();
-                       },
-                       [&](const std::unique_ptr<fixed_size_host_memory_resource>& mr) {
-                         return mr->get_active_reservation_count();
-                       }},
+                            return mr->get_active_reservation_count();
+                          },
+                          [&](const std::unique_ptr<reservation_aware_resource_adaptor>& mr) {
+                            return mr->get_active_reservation_count();
+                          },
+                          [&](const std::unique_ptr<fixed_size_host_memory_resource>& mr) {
+                            return mr->get_active_reservation_count();
+                          }},
     _reservation_allocator);
 }
 
@@ -200,14 +200,14 @@ size_t memory_space::get_total_reserved_memory() const
 {
   return std::visit(
     cucascade::overloaded{[&](const std::unique_ptr<disk_access_limiter>& mr) {
-                         return mr->get_total_reserved_bytes();
-                       },
-                       [](const std::unique_ptr<reservation_aware_resource_adaptor>& mr) {
-                         return mr->get_total_reserved_bytes();
-                       },
-                       [](const std::unique_ptr<fixed_size_host_memory_resource>& mr) {
-                         return mr->get_total_reserved_bytes();
-                       }},
+                            return mr->get_total_reserved_bytes();
+                          },
+                          [](const std::unique_ptr<reservation_aware_resource_adaptor>& mr) {
+                            return mr->get_total_reserved_bytes();
+                          },
+                          [](const std::unique_ptr<fixed_size_host_memory_resource>& mr) {
+                            return mr->get_total_reserved_bytes();
+                          }},
     _reservation_allocator);
 }
 
@@ -217,11 +217,11 @@ rmm::mr::device_memory_resource* memory_space::get_default_allocator() const noe
 {
   return std::visit(
     cucascade::overloaded{[this](const std::unique_ptr<disk_access_limiter>& other)
-                         -> rmm::mr::device_memory_resource* { return _allocator.get(); },
-                       [](const std::unique_ptr<reservation_aware_resource_adaptor>& mr)
-                         -> rmm::mr::device_memory_resource* { return mr.get(); },
-                       [](const std::unique_ptr<fixed_size_host_memory_resource>& mr)
-                         -> rmm::mr::device_memory_resource* { return mr.get(); }},
+                            -> rmm::mr::device_memory_resource* { return _allocator.get(); },
+                          [](const std::unique_ptr<reservation_aware_resource_adaptor>& mr)
+                            -> rmm::mr::device_memory_resource* { return mr.get(); },
+                          [](const std::unique_ptr<fixed_size_host_memory_resource>& mr)
+                            -> rmm::mr::device_memory_resource* { return mr.get(); }},
     _reservation_allocator);
 }
 

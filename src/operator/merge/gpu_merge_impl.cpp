@@ -48,8 +48,8 @@ sirius::unique_ptr<cucascade::data_batch> gpu_merge_impl::concat(
   auto gpu_table_representation =
     sirius::make_unique<cucascade::gpu_table_representation>(*output_cudf_table, memory_space);
   return sirius::make_unique<cucascade::data_batch>(data_repository_mgr.get_next_data_batch_id(),
-                                                 data_repository_mgr,
-                                                 std::move(gpu_table_representation));
+                                                    data_repository_mgr,
+                                                    std::move(gpu_table_representation));
 }
 
 sirius::unique_ptr<cucascade::data_batch> gpu_merge_impl::merge_ungrouped_aggregate(
@@ -135,8 +135,8 @@ sirius::unique_ptr<cucascade::data_batch> gpu_merge_impl::merge_ungrouped_aggreg
   auto gpu_table_representation =
     sirius::make_unique<cucascade::gpu_table_representation>(*output_cudf_table, memory_space);
   return sirius::make_unique<cucascade::data_batch>(data_repository_mgr.get_next_data_batch_id(),
-                                                 data_repository_mgr,
-                                                 std::move(gpu_table_representation));
+                                                    data_repository_mgr,
+                                                    std::move(gpu_table_representation));
 }
 
 sirius::unique_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
@@ -211,8 +211,8 @@ sirius::unique_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregat
   auto gpu_table_representation =
     sirius::make_unique<cucascade::gpu_table_representation>(*output_table, memory_space);
   return sirius::make_unique<cucascade::data_batch>(data_repository_mgr.get_next_data_batch_id(),
-                                                 data_repository_mgr,
-                                                 std::move(gpu_table_representation));
+                                                    data_repository_mgr,
+                                                    std::move(gpu_table_representation));
 }
 
 sirius::unique_ptr<cucascade::data_batch> gpu_merge_impl::merge_order_by(
@@ -253,8 +253,8 @@ sirius::unique_ptr<cucascade::data_batch> gpu_merge_impl::merge_order_by(
   auto gpu_table_representation =
     sirius::make_unique<cucascade::gpu_table_representation>(*output_table, memory_space);
   return sirius::make_unique<cucascade::data_batch>(data_repository_mgr.get_next_data_batch_id(),
-                                                 data_repository_mgr,
-                                                 std::move(gpu_table_representation));
+                                                    data_repository_mgr,
+                                                    std::move(gpu_table_representation));
 }
 
 sirius::unique_ptr<cucascade::data_batch> gpu_merge_impl::merge_top_n(
@@ -315,8 +315,8 @@ sirius::unique_ptr<cucascade::data_batch> gpu_merge_impl::merge_top_n(
   auto gpu_table_representation =
     sirius::make_unique<cucascade::gpu_table_representation>(*output_table, memory_space);
   return sirius::make_unique<cucascade::data_batch>(data_repository_mgr.get_next_data_batch_id(),
-                                                 data_repository_mgr,
-                                                 std::move(gpu_table_representation));
+                                                    data_repository_mgr,
+                                                    std::move(gpu_table_representation));
 }
 
 }  // namespace op

@@ -41,7 +41,9 @@ class idata_representation {
    *
    * @param memory_space The memory space where the data resides
    */
-  idata_representation(cucascade::memory::memory_space& memory_space) : _memory_space(memory_space) {}
+  idata_representation(cucascade::memory::memory_space& memory_space) : _memory_space(memory_space)
+  {
+  }
 
   /**
    * @brief Virtual destructor to ensure proper cleanup of derived classes

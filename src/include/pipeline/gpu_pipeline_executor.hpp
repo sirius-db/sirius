@@ -143,8 +143,9 @@ class gpu_pipeline_executor : public itask_executor {
   sirius::unique_ptr<std::thread> _gpu_pipeline_executor_manager_thread;
   sirius::unique_ptr<local_task_buffer> _local_task_buffer;
   pipeline_executor* _pipeline_exec;
-  const cucascade::memory::memory_space* _memory_space_view;  // this is supposed to be the memory space
-                                                   // associated with this pipeline executor
+  const cucascade::memory::memory_space*
+    _memory_space_view;  // this is supposed to be the memory space
+                         // associated with this pipeline executor
 };
 
 }  // namespace parallel

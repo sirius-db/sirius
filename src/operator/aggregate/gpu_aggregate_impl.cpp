@@ -91,8 +91,8 @@ sirius::unique_ptr<cucascade::data_batch> gpu_aggregate_impl::local_ungrouped_ag
   auto gpu_table_representation =
     sirius::make_unique<cucascade::gpu_table_representation>(*output_table, memory_space);
   return sirius::make_unique<cucascade::data_batch>(data_repository_mgr.get_next_data_batch_id(),
-                                                 data_repository_mgr,
-                                                 std::move(gpu_table_representation));
+                                                    data_repository_mgr,
+                                                    std::move(gpu_table_representation));
 }
 
 sirius::unique_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggregate(
@@ -165,8 +165,8 @@ sirius::unique_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggr
   auto gpu_table_representation =
     sirius::make_unique<cucascade::gpu_table_representation>(*output_table, memory_space);
   return sirius::make_unique<cucascade::data_batch>(data_repository_mgr.get_next_data_batch_id(),
-                                                 data_repository_mgr,
-                                                 std::move(gpu_table_representation));
+                                                    data_repository_mgr,
+                                                    std::move(gpu_table_representation));
 }
 
 }  // namespace op
