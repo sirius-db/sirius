@@ -22,7 +22,7 @@
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/mr/device/device_memory_resource.hpp>
 
-namespace sirius {
+namespace cucascade {
 
 /**
  * @brief Interface representing a data representation residing in a specific memory tier.
@@ -41,7 +41,7 @@ class idata_representation {
    *
    * @param memory_space The memory space where the data resides
    */
-  idata_representation(sirius::memory::memory_space& memory_space) : _memory_space(memory_space) {}
+  idata_representation(cucascade::memory::memory_space& memory_space) : _memory_space(memory_space) {}
 
   /**
    * @brief Virtual destructor to ensure proper cleanup of derived classes
@@ -78,7 +78,7 @@ class idata_representation {
    * space
    */
   virtual sirius::unique_ptr<idata_representation> convert_to_memory_space(
-    const sirius::memory::memory_space* target_memory_space, rmm::cuda_stream_view stream) = 0;
+    const cucascade::memory::memory_space* target_memory_space, rmm::cuda_stream_view stream) = 0;
 
   /**
    * @brief Safely casts this interface to a specific derived type
@@ -105,7 +105,7 @@ class idata_representation {
   }
 
  private:
-  sirius::memory::memory_space& _memory_space;  ///< The memory space where the data resides
+  cucascade::memory::memory_space& _memory_space;  ///< The memory space where the data resides
 };
 
-}  // namespace sirius
+}  // namespace cucascade

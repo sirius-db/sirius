@@ -26,7 +26,7 @@
 #include <variant>
 #include <vector>
 
-namespace sirius {
+namespace cucascade {
 namespace memory {
 
 //===----------------------------------------------------------------------===//
@@ -163,4 +163,4 @@ class reservation_manager_configurator {
 };
 
 }  // namespace memory
-}  // namespace sirius
+}  // namespace cucascade

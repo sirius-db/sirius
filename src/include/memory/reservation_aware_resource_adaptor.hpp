@@ -32,7 +32,7 @@
 #include "memory/notification_channel.hpp"
 #include "memory/oom_handling_policy.hpp"
 
-namespace sirius {
+namespace cucascade {
 namespace memory {
 
 /**
@@ -428,4 +428,4 @@ class reservation_aware_resource_adaptor : public rmm::mr::device_memory_resourc
 };
 
 }  // namespace memory
-}  // namespace sirius
+}  // namespace cucascade

@@ -20,12 +20,12 @@
 #include "data/gpu_data_representation.hpp"
 #include "memory/memory_reservation_manager.hpp"
 
-namespace sirius {
+namespace cucascade {
 
 data_batch::data_batch(uint64_t batch_id,
                        data_repository_manager& data_repo_mgr,
                        sirius::unique_ptr<idata_representation> data,
-                       sirius::memory::memory_space& memory_space)
+                       cucascade::memory::memory_space& memory_space)
   : _batch_id(batch_id),
     _data(std::move(data)),
     _data_repo_mgr(&data_repo_mgr),
@@ -152,13 +152,13 @@ size_t data_batch::get_pin_count() const
 
 data_repository_manager* data_batch::get_data_repository_manager() const { return _data_repo_mgr; }
 
-sirius::memory::memory_space* data_batch::get_memory_space() const
+cucascade::memory::memory_space* data_batch::get_memory_space() const
 {
   if (_memory_space != nullptr) { return _memory_space; }
   if (_data == nullptr) { return nullptr; }
-  auto& manager = sirius::memory::memory_reservation_manager::get_instance();
+  auto& manager = cucascade::memory::memory_reservation_manager::get_instance();
   auto* space   = manager.get_memory_space(_data->get_current_tier(), _data->get_device_id());
-  return const_cast<sirius::memory::memory_space*>(space);
+  return const_cast<cucascade::memory::memory_space*>(space);
 }
 
 void data_batch::set_data(sirius::unique_ptr<idata_representation> data)
@@ -171,15 +171,15 @@ void data_batch::set_data(sirius::unique_ptr<idata_representation> data)
   }
   _data = std::move(data);
   if (_data) {
-    auto& manager = sirius::memory::memory_reservation_manager::get_instance();
+    auto& manager = cucascade::memory::memory_reservation_manager::get_instance();
     auto* space   = manager.get_memory_space(_data->get_current_tier(), _data->get_device_id());
-    _memory_space = const_cast<sirius::memory::memory_space*>(space);
+    _memory_space = const_cast<cucascade::memory::memory_space*>(space);
   } else {
     _memory_space = nullptr;
   }
 }
 
-void data_batch::convert_to_memory_space(const sirius::memory::memory_space* target_memory_space,
+void data_batch::convert_to_memory_space(const cucascade::memory::memory_space* target_memory_space,
                                          rmm::cuda_stream_view stream)
 {
   std::lock_guard<sirius::mutex> lock(_mutex);
@@ -189,7 +189,7 @@ void data_batch::convert_to_memory_space(const sirius::memory::memory_space* tar
   }
   auto new_representation = _data->convert_to_memory_space(target_memory_space, stream);
   _data                   = std::move(new_representation);
-  _memory_space           = const_cast<sirius::memory::memory_space*>(target_memory_space);
+  _memory_space           = const_cast<cucascade::memory::memory_space*>(target_memory_space);
 }
 
-}  // namespace sirius
+}  // namespace cucascade

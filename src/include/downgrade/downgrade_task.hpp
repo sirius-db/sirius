@@ -22,7 +22,7 @@
 #include "parallel/task_executor.hpp"
 #include "task_completion.hpp"
 
-namespace sirius {
+namespace cucascade {
 namespace parallel {
 
 /**
@@ -32,7 +32,7 @@ namespace parallel {
  * an operation need access to, including the data repository for storing results
  * and the message queue for task completion notifications.
  */
-class downgrade_task_global_state : public itask_global_state {
+class downgrade_task_global_state : public sirius::parallel::itask_global_state {
  public:
   /**
    * @brief Construct a new downgrade_task_global_state object
@@ -41,13 +41,13 @@ class downgrade_task_global_state : public itask_global_state {
    * @param message_queue Reference to the message queue for task completion notifications
    */
   explicit downgrade_task_global_state(data_repository_manager& data_repo_mgr,
-                                       task_completion_message_queue& message_queue)
+                                       sirius::task_completion_message_queue& message_queue)
     : _data_repo_mgr(data_repo_mgr), _message_queue(message_queue)
   {
   }
 
   data_repository_manager& _data_repo_mgr;  ///< Repository for storing and retrieving data batches
-  task_completion_message_queue&
+  sirius::task_completion_message_queue&
     _message_queue;  ///< Message queue to notify task_creator about task completion
 };
 
@@ -57,7 +57,7 @@ class downgrade_task_global_state : public itask_global_state {
  * This class holds the local state for a downgrade task, including the task ID,
  * the pipeline ID, and the data batch view.
  */
-class downgrade_task_local_state : public itask_local_state {
+class downgrade_task_local_state : public sirius::parallel::itask_local_state {
  public:
   explicit downgrade_task_local_state(uint64_t task_id,
                                       uint64_t pipeline_id,
@@ -77,7 +77,7 @@ class downgrade_task_local_state : public itask_local_state {
  * downgrade operation. Memory downgrading involves moving data from higher-tier (faster)
  * memory to lower-tier (slower) memory to free up space.
  */
-class downgrade_task : public itask {
+class downgrade_task : public sirius::parallel::itask {
  public:
   /**
    * @brief Construct a new downgrade_task object
@@ -85,9 +85,9 @@ class downgrade_task : public itask {
    * @param local_state The local state specific to this task
    * @param global_state The global state shared across multiple tasks
    */
-  downgrade_task(sirius::unique_ptr<itask_local_state> local_state,
-                 sirius::shared_ptr<itask_global_state> global_state)
-    : itask(std::move(local_state), std::move(global_state))
+  downgrade_task(sirius::unique_ptr<sirius::parallel::itask_local_state> local_state,
+                 sirius::shared_ptr<sirius::parallel::itask_global_state> global_state)
+    : sirius::parallel::itask(std::move(local_state), std::move(global_state))
   {
   }
 
@@ -118,4 +118,4 @@ class downgrade_task : public itask {
 };
 
 }  // namespace parallel
-}  // namespace sirius
+}  // namespace cucascade

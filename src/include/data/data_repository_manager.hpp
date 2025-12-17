@@ -24,7 +24,7 @@
 #include <map>
 #include <string>
 
-namespace sirius {
+namespace cucascade {
 
 /**
  * @brief Key type for identifying a unique operator-port combination.
@@ -155,7 +155,7 @@ class data_repository_manager {
    * downgraded
    */
   std::vector<std::unique_ptr<data_batch>> get_data_batches_for_downgrade(
-    sirius::memory::memory_space_id memory_space_id, size_t amount_to_downgrade);
+    cucascade::memory::memory_space_id memory_space_id, size_t amount_to_downgrade);
 
  private:
   /**
@@ -181,4 +181,4 @@ class data_repository_manager {
   unordered_map<size_t, sirius::unique_ptr<data_batch>> _data_batches;
 };
 
-}  // namespace sirius
+}  // namespace cucascade

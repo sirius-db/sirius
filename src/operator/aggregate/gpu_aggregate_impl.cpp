@@ -38,13 +38,13 @@ sirius::unique_ptr<Base> get_local_aggregation(cudf::aggregation::Kind kind)
   }
 }
 
-sirius::unique_ptr<data_batch> gpu_aggregate_impl::local_ungrouped_aggregate(
-  const data_batch_view& input,
+sirius::unique_ptr<cucascade::data_batch> gpu_aggregate_impl::local_ungrouped_aggregate(
+  const cucascade::data_batch_view& input,
   const sirius::vector<cudf::aggregation::Kind>& aggregates,
   const sirius::vector<int>& aggregate_idx,
   rmm::cuda_stream_view stream,
-  memory::memory_space& memory_space,
-  data_repository_manager& data_repository_mgr)
+  cucascade::memory::memory_space& memory_space,
+  cucascade::data_repository_manager& data_repository_mgr)
 {
   if (aggregates.size() != aggregate_idx.size()) {
     throw std::runtime_error(
@@ -89,20 +89,20 @@ sirius::unique_ptr<data_batch> gpu_aggregate_impl::local_ungrouped_aggregate(
   auto output_table = sirius::make_unique<cudf::table>(std::move(output_cols));
 
   auto gpu_table_representation =
-    sirius::make_unique<sirius::gpu_table_representation>(*output_table, memory_space);
-  return sirius::make_unique<sirius::data_batch>(data_repository_mgr.get_next_data_batch_id(),
+    sirius::make_unique<cucascade::gpu_table_representation>(*output_table, memory_space);
+  return sirius::make_unique<cucascade::data_batch>(data_repository_mgr.get_next_data_batch_id(),
                                                  data_repository_mgr,
                                                  std::move(gpu_table_representation));
 }
 
-sirius::unique_ptr<data_batch> gpu_aggregate_impl::local_grouped_aggregate(
-  const data_batch_view& input,
+sirius::unique_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggregate(
+  const cucascade::data_batch_view& input,
   const sirius::vector<int>& group_idx,
   const sirius::vector<cudf::aggregation::Kind>& aggregates,
   const sirius::vector<int>& aggregate_idx,
   rmm::cuda_stream_view stream,
-  memory::memory_space& memory_space,
-  data_repository_manager& data_repository_mgr)
+  cucascade::memory::memory_space& memory_space,
+  cucascade::data_repository_manager& data_repository_mgr)
 {
   // Sanity check
   if (aggregates.size() != aggregate_idx.size()) {
@@ -163,8 +163,8 @@ sirius::unique_ptr<data_batch> gpu_aggregate_impl::local_grouped_aggregate(
   // Create the output data batch
   auto output_table = sirius::make_unique<cudf::table>(std::move(output_cols));
   auto gpu_table_representation =
-    sirius::make_unique<sirius::gpu_table_representation>(*output_table, memory_space);
-  return sirius::make_unique<sirius::data_batch>(data_repository_mgr.get_next_data_batch_id(),
+    sirius::make_unique<cucascade::gpu_table_representation>(*output_table, memory_space);
+  return sirius::make_unique<cucascade::data_batch>(data_repository_mgr.get_next_data_batch_id(),
                                                  data_repository_mgr,
                                                  std::move(gpu_table_representation));
 }

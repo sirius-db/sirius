@@ -20,7 +20,7 @@
 #include <memory>
 #include <mutex>
 #include <utility>
-namespace sirius {
+namespace cucascade {
 namespace memory {
 
 struct notification_channel : std::enable_shared_from_this<notification_channel> {
@@ -103,4 +103,4 @@ struct notify_on_exit {
 };
 
 }  // namespace memory
-}  // namespace sirius
+}  // namespace cucascade

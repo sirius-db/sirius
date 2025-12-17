@@ -20,7 +20,7 @@
 #include "memory/memory_reservation.hpp"
 #include "parallel/task_executor.hpp"
 
-namespace sirius {
+namespace cucascade {
 namespace parallel {
 
 /**
@@ -125,4 +125,4 @@ class downgrade_executor : public itask_executor {
 };
 
 }  // namespace parallel
-}  // namespace sirius
+}  // namespace cucascade

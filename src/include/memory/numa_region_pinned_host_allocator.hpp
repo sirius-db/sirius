@@ -30,7 +30,7 @@
 #include <cstdlib>
 #include <cstring>
 
-namespace sirius {
+namespace cucascade {
 namespace memory {
 
 class numa_region_pinned_host_memory_resource final : public rmm::mr::device_memory_resource {
@@ -142,4 +142,4 @@ class numa_region_pinned_host_memory_resource final : public rmm::mr::device_mem
 };
 
 }  // namespace memory
-}  // namespace sirius
+}  // namespace cucascade

@@ -30,7 +30,7 @@
 #include <set>
 #include <variant>
 
-namespace sirius {
+namespace cucascade {
 namespace memory {
 
 using builder_reference   = reservation_manager_configurator::builder_reference;
@@ -285,4 +285,4 @@ std::vector<int> reservation_manager_configurator::extract_host_ids(
 }
 
 }  // namespace memory
-}  // namespace sirius
+}  // namespace cucascade

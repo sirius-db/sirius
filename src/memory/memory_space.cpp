@@ -32,7 +32,7 @@
 #include <stdexcept>
 #include <variant>
 
-namespace sirius {
+namespace cucascade {
 namespace memory {
 
 //===----------------------------------------------------------------------===//
@@ -87,7 +87,7 @@ int memory_space::get_device_id() const noexcept { return _id.device_id; }
 std::unique_ptr<reservation> memory_space::make_reservation_or_null(size_t size)
 {
   std::unique_ptr<reserved_arena> arena =
-    std::visit(sirius::overloaded{[&](std::unique_ptr<disk_access_limiter>& mr) {
+    std::visit(cucascade::overloaded{[&](std::unique_ptr<disk_access_limiter>& mr) {
                                     return mr->reserve(size, notification_channel_->get_notifier());
                                   },
                                   [&](std::unique_ptr<reservation_aware_resource_adaptor>& mr) {
@@ -103,7 +103,7 @@ std::unique_ptr<reservation> memory_space::make_reservation_or_null(size_t size)
 std::unique_ptr<reservation> memory_space::make_reservation_upto(size_t size)
 {
   std::unique_ptr<reserved_arena> arena = std::visit(
-    sirius::overloaded{[&](std::unique_ptr<disk_access_limiter>& mr) {
+    cucascade::overloaded{[&](std::unique_ptr<disk_access_limiter>& mr) {
                          return mr->reserve_upto(size, notification_channel_->get_notifier());
                        },
                        [&](std::unique_ptr<reservation_aware_resource_adaptor>& mr) {
@@ -139,7 +139,7 @@ rmm::cuda_stream_view memory_space::acquire_stream() const
 std::size_t memory_space::get_active_reservation_count() const
 {
   return std::visit(
-    sirius::overloaded{[&](const std::unique_ptr<disk_access_limiter>& mr) {
+    cucascade::overloaded{[&](const std::unique_ptr<disk_access_limiter>& mr) {
                          return mr->get_active_reservation_count();
                        },
                        [&](const std::unique_ptr<reservation_aware_resource_adaptor>& mr) {
@@ -171,7 +171,7 @@ size_t memory_space::get_amount_to_downgrade() const
 size_t memory_space::get_available_memory(rmm::cuda_stream_view stream) const
 {
   return std::visit(
-    sirius::overloaded{
+    cucascade::overloaded{
       [&](const std::unique_ptr<disk_access_limiter>& mr) { return mr->get_available_memory(); },
       [&](const std::unique_ptr<reservation_aware_resource_adaptor>& mr) {
         return mr->get_available_memory(stream);
@@ -185,7 +185,7 @@ size_t memory_space::get_available_memory(rmm::cuda_stream_view stream) const
 size_t memory_space::get_available_memory() const
 {
   return std::visit(
-    sirius::overloaded{
+    cucascade::overloaded{
       [&](const std::unique_ptr<disk_access_limiter>& mr) { return mr->get_available_memory(); },
       [](const std::unique_ptr<reservation_aware_resource_adaptor>& mr) {
         return mr->get_available_memory();
@@ -199,7 +199,7 @@ size_t memory_space::get_available_memory() const
 size_t memory_space::get_total_reserved_memory() const
 {
   return std::visit(
-    sirius::overloaded{[&](const std::unique_ptr<disk_access_limiter>& mr) {
+    cucascade::overloaded{[&](const std::unique_ptr<disk_access_limiter>& mr) {
                          return mr->get_total_reserved_bytes();
                        },
                        [](const std::unique_ptr<reservation_aware_resource_adaptor>& mr) {
@@ -216,7 +216,7 @@ size_t memory_space::get_max_memory() const noexcept { return _memory_limit; }
 rmm::mr::device_memory_resource* memory_space::get_default_allocator() const noexcept
 {
   return std::visit(
-    sirius::overloaded{[this](const std::unique_ptr<disk_access_limiter>& other)
+    cucascade::overloaded{[this](const std::unique_ptr<disk_access_limiter>& other)
                          -> rmm::mr::device_memory_resource* { return _allocator.get(); },
                        [](const std::unique_ptr<reservation_aware_resource_adaptor>& mr)
                          -> rmm::mr::device_memory_resource* { return mr.get(); },
@@ -255,4 +255,4 @@ size_t memory_space_hash::operator()(const memory_space& ms) const
 }
 
 }  // namespace memory
-}  // namespace sirius
+}  // namespace cucascade

@@ -36,7 +36,7 @@
 #include <unordered_set>
 #include <vector>
 
-namespace sirius {
+namespace cucascade {
 namespace memory {
 
 // TODO: this doesn't handle multiple numa domains yet. We need to make our own
@@ -377,4 +377,4 @@ using fixed_multiple_blocks_allocation =
   fixed_size_host_memory_resource::fixed_multiple_blocks_allocation;
 
 }  // namespace memory
-}  // namespace sirius
+}  // namespace cucascade

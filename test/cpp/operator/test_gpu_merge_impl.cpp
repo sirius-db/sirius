@@ -27,7 +27,8 @@
 #include <cudf/utilities/bit.hpp>
 
 using namespace sirius;
-using namespace sirius::memory;
+using namespace cucascade;
+using namespace cucascade::memory;
 using namespace sirius::op;
 
 namespace {
@@ -54,7 +55,7 @@ sirius::vector<sirius::unique_ptr<data_batch_view>> create_batches_with_random_d
   const sirius::vector<int> num_rows,
   const sirius::vector<cudf::data_type>& column_types,
   const sirius::vector<std::optional<std::pair<int, int>>>& ranges,
-  data_repository_manager& data_repo_manager,
+  cucascade::data_repository_manager& data_repo_manager,
   memory_space& mem_space)
 {
   sirius::vector<sirius::unique_ptr<data_batch_view>> batches;
@@ -65,7 +66,7 @@ sirius::vector<sirius::unique_ptr<data_batch_view>> create_batches_with_random_d
                                                     ranges,
                                                     cudf::get_default_stream(),
                                                     mem_space.get_default_allocator());
-    auto gpu_repr = sirius::make_unique<gpu_table_representation>(*table, mem_space);
+    auto gpu_repr = sirius::make_unique<cucascade::gpu_table_representation>(*table, mem_space);
     auto batch    = sirius::make_unique<data_batch>(
       data_repo_manager.get_next_data_batch_id(), data_repo_manager, std::move(gpu_repr));
 
@@ -79,7 +80,7 @@ sirius::vector<sirius::unique_ptr<data_batch_view>> create_batches_with_random_d
 }
 
 void validate_concat(const sirius::vector<sirius::unique_ptr<data_batch_view>>& input_views,
-                     const sirius::data_batch& output)
+                     const cucascade::data_batch& output)
 {
   sirius::vector<cudf::table_view> input_table_views;
   int expected_num_rows = 0;
@@ -88,7 +89,7 @@ void validate_concat(const sirius::vector<sirius::unique_ptr<data_batch_view>>& 
     expected_num_rows += input_table_views.back().num_rows();
   }
   cudf::table_view output_table_view =
-    output.get_data()->cast<gpu_table_representation>().get_table().view();
+    output.get_data()->cast<cucascade::gpu_table_representation>().get_table().view();
 
   REQUIRE(expected_num_rows == output_table_view.num_rows());
   REQUIRE(input_table_views[0].num_columns() == output_table_view.num_columns());
@@ -167,7 +168,7 @@ void validate_concat(const sirius::vector<sirius::unique_ptr<data_batch_view>>& 
 
 TEST_CASE("Concatenate multiple data batches", "[operator][merge_concat]")
 {
-  data_repository_manager data_repo_manager;
+  cucascade::data_repository_manager data_repo_manager;
   auto* mem_space                     = get_default_memory_space();
   constexpr int num_batches           = 10;
   constexpr size_t num_rows_per_batch = 100;
@@ -188,7 +189,7 @@ TEST_CASE("Concatenate multiple data batches", "[operator][merge_concat]")
 
 TEST_CASE("Concatenate multiple data batches with different size", "[operator][merge_concat]")
 {
-  data_repository_manager data_repo_manager;
+  cucascade::data_repository_manager data_repo_manager;
   auto* mem_space           = get_default_memory_space();
   constexpr int num_batches = 10;
   sirius::vector<int> num_input_rows;
@@ -211,7 +212,7 @@ TEST_CASE("Concatenate multiple data batches with different size", "[operator][m
 
 TEST_CASE("Concatenate with invalid input", "[operator][merge_concat]")
 {
-  data_repository_manager data_repo_manager;
+  cucascade::data_repository_manager data_repo_manager;
   auto* mem_space                     = get_default_memory_space();
   constexpr int num_batches           = 1;
   constexpr size_t num_rows_per_batch = 100;
@@ -233,7 +234,7 @@ TEST_CASE("Concatenate with invalid input", "[operator][merge_concat]")
 
 TEST_CASE("Concatenate multiple data batches but no input rows", "[operator][merge_concat]")
 {
-  data_repository_manager data_repo_manager;
+  cucascade::data_repository_manager data_repo_manager;
   auto* mem_space                     = get_default_memory_space();
   constexpr int num_batches           = 10;
   constexpr size_t num_rows_per_batch = 0;
@@ -254,7 +255,7 @@ TEST_CASE("Concatenate multiple data batches but no input rows", "[operator][mer
 
 TEST_CASE("Concatenate mixed empty and non-empty data batches", "[operator][merge_concat]")
 {
-  data_repository_manager data_repo_manager;
+  cucascade::data_repository_manager data_repo_manager;
   auto* mem_space           = get_default_memory_space();
   constexpr int num_batches = 10;
   sirius::vector<int> num_input_rows;
@@ -282,7 +283,7 @@ sirius::vector<sirius::unique_ptr<data_batch_view>> create_batches_with_local_un
   const sirius::vector<int> num_base_input_rows,
   const sirius::vector<cudf::data_type>& column_types,
   const sirius::vector<cudf::aggregation::Kind>& aggregates,
-  data_repository_manager& data_repo_manager,
+  cucascade::data_repository_manager& data_repo_manager,
   memory_space& mem_space)
 {
   // Base input batches
@@ -388,7 +389,7 @@ void validate_ungrouped_aggregate_numeric(const sirius::vector<cudf::table_view>
 
 void validate_ungrouped_aggregate(
   const sirius::vector<sirius::unique_ptr<data_batch_view>>& input_views,
-  const sirius::data_batch& output,
+  const cucascade::data_batch& output,
   const sirius::vector<cudf::aggregation::Kind>& aggregates)
 {
   sirius::vector<cudf::table_view> input_table_views;
@@ -396,7 +397,7 @@ void validate_ungrouped_aggregate(
     input_table_views.push_back(input_view->get_cudf_table_view());
   }
   cudf::table_view output_table_view =
-    output.get_data()->cast<gpu_table_representation>().get_table().view();
+    output.get_data()->cast<cucascade::gpu_table_representation>().get_table().view();
 
   REQUIRE(output_table_view.num_rows() == 1);
 
@@ -428,7 +429,7 @@ void validate_ungrouped_aggregate(
 
 TEST_CASE("Ungrouped merge aggregate of min/max/count/sum", "[operator][merge_ungrouped_agg]")
 {
-  data_repository_manager data_repo_manager;
+  cucascade::data_repository_manager data_repo_manager;
   auto* mem_space                                = get_default_memory_space();
   constexpr int num_batches                      = 10;
   constexpr size_t num_base_input_rows_per_batch = 100;
@@ -451,7 +452,7 @@ TEST_CASE("Ungrouped merge aggregate of min/max/count/sum", "[operator][merge_un
 
 TEST_CASE("Ungrouped merge aggregate with invalid input", "[operator][merge_ungrouped_agg]")
 {
-  data_repository_manager data_repo_manager;
+  cucascade::data_repository_manager data_repo_manager;
   auto* mem_space                                = get_default_memory_space();
   int num_batches                                = 1;
   constexpr size_t num_base_input_rows_per_batch = 100;
@@ -482,7 +483,7 @@ TEST_CASE("Ungrouped merge aggregate with invalid input", "[operator][merge_ungr
 TEST_CASE("Ungrouped merge aggregate with empty local aggregate results",
           "[operator][merge_ungrouped_agg]")
 {
-  data_repository_manager data_repo_manager;
+  cucascade::data_repository_manager data_repo_manager;
   auto* mem_space                                = get_default_memory_space();
   constexpr int num_batches                      = 10;
   constexpr size_t num_base_input_rows_per_batch = 0;
@@ -506,7 +507,7 @@ TEST_CASE("Ungrouped merge aggregate with empty local aggregate results",
 TEST_CASE("Ungrouped merge aggregate with mixed empty and non-empty local aggregate results",
           "[operator][merge_ungrouped_agg]")
 {
-  data_repository_manager data_repo_manager;
+  cucascade::data_repository_manager data_repo_manager;
   auto* mem_space           = get_default_memory_space();
   constexpr int num_batches = 10;
   sirius::vector<int> num_base_input_rows;
@@ -538,7 +539,7 @@ sirius::vector<sirius::unique_ptr<data_batch_view>> create_batches_with_local_gr
   const sirius::vector<int>& group_idx,
   const sirius::vector<cudf::aggregation::Kind>& aggregates,
   const sirius::vector<int>& aggregate_idx,
-  data_repository_manager& data_repo_manager,
+  cucascade::data_repository_manager& data_repo_manager,
   memory_space& mem_space)
 {
   // Base input batches, make group key value ranges small so that we have multiple values in a
@@ -605,7 +606,7 @@ void copy_data_to_host(cudf::table_view table, sirius::vector<sirius::vector<int
 
 void validate_grouped_aggregate(
   const sirius::vector<sirius::unique_ptr<data_batch_view>>& input_views,
-  const sirius::data_batch& output,
+  const cucascade::data_batch& output,
   int num_group_cols,
   const sirius::vector<cudf::aggregation::Kind>& aggregates)
 {
@@ -614,7 +615,7 @@ void validate_grouped_aggregate(
     input_table_views.push_back(input_view->get_cudf_table_view());
   }
   cudf::table_view output_table_view =
-    output.get_data()->cast<gpu_table_representation>().get_table().view();
+    output.get_data()->cast<cucascade::gpu_table_representation>().get_table().view();
 
   // Compute expected results
   sirius::vector<sirius::vector<int64_t>> h_input_data(input_table_views[0].num_columns());
@@ -680,7 +681,7 @@ void validate_grouped_aggregate(
 
 TEST_CASE("Grouped merge aggregate of min/max/count/sum", "[operator][merge_grouped_agg]")
 {
-  data_repository_manager data_repo_manager;
+  cucascade::data_repository_manager data_repo_manager;
   auto* mem_space                                = get_default_memory_space();
   constexpr int num_batches                      = 10;
   constexpr size_t num_base_input_rows_per_batch = 100;
@@ -717,7 +718,7 @@ TEST_CASE("Grouped merge aggregate of min/max/count/sum", "[operator][merge_grou
 
 TEST_CASE("Grouped merge aggregate with invalid input", "[operator][merge_grouped_agg]")
 {
-  data_repository_manager data_repo_manager;
+  cucascade::data_repository_manager data_repo_manager;
   auto* mem_space                                = get_default_memory_space();
   int num_batches                                = 1;
   constexpr size_t num_base_input_rows_per_batch = 100;
@@ -763,7 +764,7 @@ TEST_CASE("Grouped merge aggregate with invalid input", "[operator][merge_groupe
 TEST_CASE("Grouped merge aggregate with empty local aggregate results",
           "[operator][merge_grouped_agg]")
 {
-  data_repository_manager data_repo_manager;
+  cucascade::data_repository_manager data_repo_manager;
   auto* mem_space                                = get_default_memory_space();
   constexpr int num_batches                      = 10;
   constexpr size_t num_base_input_rows_per_batch = 0;
@@ -801,7 +802,7 @@ TEST_CASE("Grouped merge aggregate with empty local aggregate results",
 TEST_CASE("Grouped merge aggregate with mixed empty and non-empty local aggregate results",
           "[operator][merge_grouped_agg]")
 {
-  data_repository_manager data_repo_manager;
+  cucascade::data_repository_manager data_repo_manager;
   auto* mem_space           = get_default_memory_space();
   constexpr int num_batches = 10;
   sirius::vector<int> num_base_input_rows;
@@ -841,7 +842,7 @@ TEST_CASE("Grouped merge aggregate with mixed empty and non-empty local aggregat
 TEST_CASE("Grouped merge aggregate with multiple aggregations on the same column",
           "[operator][merge_grouped_agg]")
 {
-  data_repository_manager data_repo_manager;
+  cucascade::data_repository_manager data_repo_manager;
   auto* mem_space                                = get_default_memory_space();
   constexpr int num_batches                      = 10;
   constexpr size_t num_base_input_rows_per_batch = 100;
@@ -885,7 +886,7 @@ create_batches_with_local_orderby_or_topn_result(
   const sirius::vector<int>& order_key_idx,
   const sirius::vector<cudf::order>& column_order,
   const sirius::vector<cudf::null_order>& null_precedence,
-  data_repository_manager& data_repo_manager,
+  cucascade::data_repository_manager& data_repo_manager,
   memory_space& mem_space)
 {
   // Base input batches, make order key value ranges small so that some rows are compared by
@@ -932,7 +933,7 @@ create_batches_with_local_orderby_or_topn_result(
 }
 
 void validate_order_by(const sirius::vector<sirius::unique_ptr<data_batch_view>>& input_views,
-                       const sirius::data_batch& output,
+                       const cucascade::data_batch& output,
                        const sirius::vector<int>& order_key_idx,
                        const sirius::vector<cudf::order>& column_order)
 {
@@ -943,7 +944,7 @@ void validate_order_by(const sirius::vector<sirius::unique_ptr<data_batch_view>>
     expected_num_rows += input_table_views.back().num_rows();
   }
   cudf::table_view output_table_view =
-    output.get_data()->cast<gpu_table_representation>().get_table().view();
+    output.get_data()->cast<cucascade::gpu_table_representation>().get_table().view();
 
   REQUIRE(output_table_view.num_rows() == expected_num_rows);
   REQUIRE(output_table_view.num_columns() == input_table_views[0].num_columns());
@@ -971,7 +972,7 @@ void validate_order_by(const sirius::vector<sirius::unique_ptr<data_batch_view>>
 
 TEST_CASE("Merge order-by basic", "[operator][merge_order_by]")
 {
-  data_repository_manager data_repo_manager;
+  cucascade::data_repository_manager data_repo_manager;
   auto* mem_space                                = get_default_memory_space();
   constexpr int num_batches                      = 10;
   constexpr size_t num_base_input_rows_per_batch = 100;
@@ -1007,7 +1008,7 @@ TEST_CASE("Merge order-by basic", "[operator][merge_order_by]")
 
 TEST_CASE("Merge order-by with invalid input", "[operator][merge_order_by]")
 {
-  data_repository_manager data_repo_manager;
+  cucascade::data_repository_manager data_repo_manager;
   auto* mem_space                                = get_default_memory_space();
   int num_batches                                = 1;
   constexpr size_t num_base_input_rows_per_batch = 100;
@@ -1066,7 +1067,7 @@ TEST_CASE("Merge order-by with invalid input", "[operator][merge_order_by]")
 
 TEST_CASE("Merge order-by with empty local order-by results", "[operator][merge_order_by]")
 {
-  data_repository_manager data_repo_manager;
+  cucascade::data_repository_manager data_repo_manager;
   auto* mem_space                                = get_default_memory_space();
   constexpr int num_batches                      = 10;
   constexpr size_t num_base_input_rows_per_batch = 0;
@@ -1103,7 +1104,7 @@ TEST_CASE("Merge order-by with empty local order-by results", "[operator][merge_
 TEST_CASE("Merge order-by with mixed empty and non-empty local order-by results",
           "[operator][merge_order_by]")
 {
-  data_repository_manager data_repo_manager;
+  cucascade::data_repository_manager data_repo_manager;
   auto* mem_space           = get_default_memory_space();
   constexpr int num_batches = 10;
   sirius::vector<int> num_base_input_rows;
@@ -1142,7 +1143,7 @@ TEST_CASE("Merge order-by with mixed empty and non-empty local order-by results"
 namespace {
 
 void validate_top_n(const sirius::vector<sirius::unique_ptr<data_batch_view>>& input_views,
-                    const sirius::data_batch& output,
+                    const cucascade::data_batch& output,
                     const std::pair<int, int>& limit_offset,
                     const sirius::vector<int>& order_key_idx,
                     const sirius::vector<cudf::order>& column_order)
@@ -1155,7 +1156,7 @@ void validate_top_n(const sirius::vector<sirius::unique_ptr<data_batch_view>>& i
   }
   int limit = limit_offset.first, offset = limit_offset.second;
   cudf::table_view output_table_view =
-    output.get_data()->cast<gpu_table_representation>().get_table().view();
+    output.get_data()->cast<cucascade::gpu_table_representation>().get_table().view();
   int expected_num_rows =
     (limit + offset <= num_input_rows) ? limit : std::max(0, num_input_rows - offset);
 
@@ -1224,7 +1225,7 @@ void validate_top_n(const sirius::vector<sirius::unique_ptr<data_batch_view>>& i
 
 TEST_CASE("Merge top-n basic", "[operator][merge_top_n]")
 {
-  data_repository_manager data_repo_manager;
+  cucascade::data_repository_manager data_repo_manager;
   auto* mem_space                                = get_default_memory_space();
   constexpr int num_batches                      = 10;
   constexpr size_t num_base_input_rows_per_batch = 100;
@@ -1263,7 +1264,7 @@ TEST_CASE("Merge top-n basic", "[operator][merge_top_n]")
 
 TEST_CASE("Merge top-n with empty local top-n results", "[operator][merge_top_n]")
 {
-  data_repository_manager data_repo_manager;
+  cucascade::data_repository_manager data_repo_manager;
   auto* mem_space                                = get_default_memory_space();
   constexpr int num_batches                      = 10;
   constexpr size_t num_base_input_rows_per_batch = 0;
@@ -1303,7 +1304,7 @@ TEST_CASE("Merge top-n with empty local top-n results", "[operator][merge_top_n]
 TEST_CASE("Merge top-n with mixed empty and non-empty local top-n results",
           "[operator][merge_top_n]")
 {
-  data_repository_manager data_repo_manager;
+  cucascade::data_repository_manager data_repo_manager;
   auto* mem_space           = get_default_memory_space();
   constexpr int num_batches = 10;
   sirius::vector<int> num_base_input_rows;
@@ -1344,7 +1345,7 @@ TEST_CASE("Merge top-n with mixed empty and non-empty local top-n results",
 
 TEST_CASE("Merge top-n with `limit = 0`", "[operator][merge_top_n]")
 {
-  data_repository_manager data_repo_manager;
+  cucascade::data_repository_manager data_repo_manager;
   auto* mem_space                                = get_default_memory_space();
   constexpr int num_batches                      = 10;
   constexpr size_t num_base_input_rows_per_batch = 100;
@@ -1384,7 +1385,7 @@ TEST_CASE("Merge top-n with `limit = 0`", "[operator][merge_top_n]")
 TEST_CASE("Merge top-n with `num_input_rows - limit <= offset < num_input-rows`",
           "[operator][merge_top_n]")
 {
-  data_repository_manager data_repo_manager;
+  cucascade::data_repository_manager data_repo_manager;
   auto* mem_space                                = get_default_memory_space();
   constexpr int num_batches                      = 10;
   constexpr size_t num_base_input_rows_per_batch = 100;

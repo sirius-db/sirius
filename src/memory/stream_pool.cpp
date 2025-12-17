@@ -22,7 +22,7 @@
 #include <mutex>
 #include <utility>
 
-namespace sirius {
+namespace cucascade {
 namespace memory {
 
 borrowed_stream::borrowed_stream(rmm::cuda_stream s,
@@ -105,4 +105,4 @@ void exclusive_stream_pool::release_stream(rmm::cuda_stream&& s) noexcept
 }
 
 }  // namespace memory
-}  // namespace sirius
+}  // namespace cucascade

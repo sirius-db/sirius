@@ -25,7 +25,7 @@
 
 #include <rmm/cuda_stream_view.hpp>
 
-namespace sirius {
+namespace cucascade {
 namespace parallel {
 
 void downgrade_task::execute()
@@ -42,9 +42,9 @@ void downgrade_task::execute()
     auto data_size = batch->get_data()->get_size_in_bytes();
 
     try {
-      auto& mr_manager = sirius::memory::memory_reservation_manager::get_instance();
+      auto& mr_manager = cucascade::memory::memory_reservation_manager::get_instance();
       auto reservation = mr_manager.request_reservation(
-        sirius::memory::any_memory_space_in_tier{sirius::memory::Tier::HOST}, data_size);
+        cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::HOST}, data_size);
       if (!reservation) {
         throw rmm::out_of_memory("Failed to allocate host memory for downgrade task.");
       }
@@ -65,15 +65,15 @@ void downgrade_task::execute()
     }
 
     // Obtain HOST-tier memory resource from the memory manager
-    // auto& mr_manager = sirius::memory::memory_reservation_manager::get_instance();
-    // auto host_spaces = mr_manager.get_memory_spaces_for_tier(sirius::memory::Tier::HOST);
+    // auto& mr_manager = cucascade::memory::memory_reservation_manager::get_instance();
+    // auto host_spaces = mr_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
     // if (host_spaces.empty()) {
     //     mark_task_completion();
     //     return;
     // }
     // auto host_allocator_ref = host_spaces[0]->get_default_allocator();
     // auto* host_fixed_mr =
-    // dynamic_cast<sirius::memory::fixed_size_host_memory_resource*>(&host_allocator_ref.get());
+    // dynamic_cast<cucascade::memory::fixed_size_host_memory_resource*>(&host_allocator_ref.get());
 
     // // Fallback: if cast fails, complete task without conversion
     // if (host_fixed_mr == nullptr) {
@@ -112,4 +112,4 @@ uint64_t downgrade_task::get_task_id() const
 }
 
 }  // namespace parallel
-}  // namespace sirius
+}  // namespace cucascade

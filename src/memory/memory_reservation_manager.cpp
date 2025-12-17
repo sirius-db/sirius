@@ -29,7 +29,7 @@
 #include <mutex>
 #include <stdexcept>
 
-namespace sirius {
+namespace cucascade {
 namespace memory {
 
 //===----------------------------------------------------------------------===//
@@ -396,4 +396,4 @@ void memory_reservation_manager::shutdown()
 }
 
 }  // namespace memory
-}  // namespace sirius
+}  // namespace cucascade

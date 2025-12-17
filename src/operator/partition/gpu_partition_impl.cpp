@@ -23,13 +23,13 @@
 namespace sirius {
 namespace op {
 
-sirius::vector<sirius::unique_ptr<data_batch>> gpu_partition_impl::hash_partition(
-  const data_batch_view& input,
+sirius::vector<sirius::unique_ptr<cucascade::data_batch>> gpu_partition_impl::hash_partition(
+  const cucascade::data_batch_view& input,
   const sirius::vector<int>& partition_key_idx,
   int num_partitions,
   rmm::cuda_stream_view stream,
-  memory::memory_space& memory_space,
-  data_repository_manager& data_repository_mgr)
+  cucascade::memory::memory_space& memory_space,
+  cucascade::data_repository_manager& data_repository_mgr)
 {
   // Sanity check.
   if (num_partitions < 2) {
@@ -47,7 +47,7 @@ sirius::vector<sirius::unique_ptr<data_batch>> gpu_partition_impl::hash_partitio
                                                memory_space.get_default_allocator());
 
   // Slice from the reordered table to create separate table partitions
-  sirius::vector<sirius::unique_ptr<data_batch>> output_batches;
+  sirius::vector<sirius::unique_ptr<cucascade::data_batch>> output_batches;
   sirius::vector<int> slice_indices;
   for (int i = 0; i < num_partitions; ++i) {
     slice_indices.push_back(partition_result.second[i]);
@@ -58,9 +58,9 @@ sirius::vector<sirius::unique_ptr<data_batch>> gpu_partition_impl::hash_partitio
   for (int i = 0; i < num_partitions; ++i) {
     auto output_partition = sirius::make_unique<cudf::table>(sliced_partition_views[i]);
     auto gpu_table_representation =
-      sirius::make_unique<sirius::gpu_table_representation>(*output_partition, memory_space);
+      sirius::make_unique<cucascade::gpu_table_representation>(*output_partition, memory_space);
     output_batches.push_back(
-      sirius::make_unique<sirius::data_batch>(data_repository_mgr.get_next_data_batch_id(),
+      sirius::make_unique<cucascade::data_batch>(data_repository_mgr.get_next_data_batch_id(),
                                               data_repository_mgr,
                                               std::move(gpu_table_representation)));
   }
@@ -68,12 +68,12 @@ sirius::vector<sirius::unique_ptr<data_batch>> gpu_partition_impl::hash_partitio
   return output_batches;
 }
 
-sirius::vector<sirius::unique_ptr<data_batch>> gpu_partition_impl::evenly_partition(
-  const data_batch_view& input,
+sirius::vector<sirius::unique_ptr<cucascade::data_batch>> gpu_partition_impl::evenly_partition(
+  const cucascade::data_batch_view& input,
   int num_partitions,
   rmm::cuda_stream_view stream,
-  memory::memory_space& memory_space,
-  data_repository_manager& data_repository_mgr)
+  cucascade::memory::memory_space& memory_space,
+  cucascade::data_repository_manager& data_repository_mgr)
 {
   // Sanity check.
   if (num_partitions < 2) {
@@ -92,14 +92,14 @@ sirius::vector<sirius::unique_ptr<data_batch>> gpu_partition_impl::evenly_partit
   }
 
   // Slice and create separate partitions
-  sirius::vector<sirius::unique_ptr<data_batch>> output_batches;
+  sirius::vector<sirius::unique_ptr<cucascade::data_batch>> output_batches;
   auto sliced_partition_views = cudf::slice(input_table, slice_indices, stream);
   for (int i = 0; i < num_partitions; ++i) {
     auto output_partition = sirius::make_unique<cudf::table>(sliced_partition_views[i]);
     auto gpu_table_representation =
-      sirius::make_unique<sirius::gpu_table_representation>(*output_partition, memory_space);
+      sirius::make_unique<cucascade::gpu_table_representation>(*output_partition, memory_space);
     output_batches.push_back(
-      sirius::make_unique<sirius::data_batch>(data_repository_mgr.get_next_data_batch_id(),
+      sirius::make_unique<cucascade::data_batch>(data_repository_mgr.get_next_data_batch_id(),
                                               data_repository_mgr,
                                               std::move(gpu_table_representation)));
   }

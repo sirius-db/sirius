@@ -19,7 +19,7 @@
 #include "fixed_size_host_memory_resource.hpp"
 #include "helper/helper.hpp"
 
-namespace sirius {
+namespace cucascade {
 namespace memory {
 
 /**
@@ -43,4 +43,4 @@ struct host_table_allocation {
 };
 
 }  // namespace memory
-}  // namespace sirius
+}  // namespace cucascade

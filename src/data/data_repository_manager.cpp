@@ -19,7 +19,7 @@
 #include "data/data_batch.hpp"
 #include "data/data_batch_view.hpp"
 
-namespace sirius {
+namespace cucascade {
 
 void data_repository_manager::add_new_repository(::duckdb::GPUPhysicalOperator* op,
                                                  std::string_view port_id,
@@ -63,7 +63,7 @@ sirius::unique_ptr<idata_repository>& data_repository_manager::get_repository(
 }
 
 std::vector<std::unique_ptr<data_batch>> data_repository_manager::get_data_batches_for_downgrade(
-  sirius::memory::memory_space_id memory_space_id, size_t amount_to_downgrade)
+  cucascade::memory::memory_space_id memory_space_id, size_t amount_to_downgrade)
 {
   std::vector<std::unique_ptr<data_batch>> data_batches;
   size_t downgrade_amount = 0;
@@ -79,4 +79,4 @@ std::vector<std::unique_ptr<data_batch>> data_repository_manager::get_data_batch
 
 uint64_t data_repository_manager::get_next_data_batch_id() { return _next_data_batch_id++; }
 
-}  // namespace sirius
+}  // namespace cucascade

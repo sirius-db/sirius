@@ -59,7 +59,7 @@ class gpu_pipeline_executor : public itask_executor {
    * @param config Configuration for the task executor (thread count, retry policy, etc.)
    */
   explicit gpu_pipeline_executor(task_executor_config config,
-                                 const memory::memory_space* mem_space,
+                                 const cucascade::memory::memory_space* mem_space,
                                  pipeline_executor* pipeline_exec);
 
   /**
@@ -116,9 +116,9 @@ class gpu_pipeline_executor : public itask_executor {
   /**
    * @brief Get the memory space view associated with this executor
    *
-   * @return memory::memory_space* Pointer to the memory space
+   * @return cucascade::memory::memory_space* Pointer to the memory space
    */
-  memory::memory_space* get_memory_space_view();
+  cucascade::memory::memory_space* get_memory_space_view();
 
   /**
    * @brief Manager loop to consume task from local buffer and dispatch to the thread pool
@@ -143,7 +143,7 @@ class gpu_pipeline_executor : public itask_executor {
   sirius::unique_ptr<std::thread> _gpu_pipeline_executor_manager_thread;
   sirius::unique_ptr<local_task_buffer> _local_task_buffer;
   pipeline_executor* _pipeline_exec;
-  const memory::memory_space* _memory_space_view;  // this is supposed to be the memory space
+  const cucascade::memory::memory_space* _memory_space_view;  // this is supposed to be the memory space
                                                    // associated with this pipeline executor
 };
 

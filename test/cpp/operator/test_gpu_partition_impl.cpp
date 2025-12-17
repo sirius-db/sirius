@@ -23,7 +23,8 @@
 #include "utils/utils.hpp"
 
 using namespace sirius;
-using namespace sirius::memory;
+using namespace cucascade;
+using namespace cucascade::memory;
 using namespace sirius::op;
 
 namespace {
@@ -49,7 +50,7 @@ sirius::unique_ptr<data_batch_view> create_batch_with_random_data(
   const int num_rows,
   const sirius::vector<cudf::data_type>& column_types,
   sirius::vector<std::optional<std::pair<int, int>>>& ranges,
-  data_repository_manager& data_repo_manager,
+  cucascade::data_repository_manager& data_repo_manager,
   memory_space& mem_space)
 {
   // Base input batches, make value ranges small so that we have duplicated partition keys
@@ -58,7 +59,7 @@ sirius::unique_ptr<data_batch_view> create_batch_with_random_data(
   }
   auto table = create_cudf_table_with_random_data(
     num_rows, column_types, ranges, cudf::get_default_stream(), mem_space.get_default_allocator());
-  auto gpu_repr = sirius::make_unique<gpu_table_representation>(*table, mem_space);
+  auto gpu_repr = sirius::make_unique<cucascade::gpu_table_representation>(*table, mem_space);
   auto batch    = sirius::make_unique<data_batch>(
     data_repo_manager.get_next_data_batch_id(), data_repo_manager, std::move(gpu_repr));
   auto* batch_ptr = batch.get();
@@ -111,7 +112,7 @@ void copy_data_to_host_by_rows(cudf::table_view table,
   }
 }
 
-void validate_hash_partition(const sirius::data_batch_view& input_view,
+void validate_hash_partition(const cucascade::data_batch_view& input_view,
                              const sirius::vector<sirius::unique_ptr<data_batch>>& output_batches,
                              int num_partitions)
 {
@@ -119,7 +120,7 @@ void validate_hash_partition(const sirius::data_batch_view& input_view,
   sirius::vector<cudf::table_view> output_table_views;
   for (const auto& output_batch : output_batches) {
     output_table_views.push_back(
-      output_batch->get_data()->cast<gpu_table_representation>().get_table().view());
+      output_batch->get_data()->cast<cucascade::gpu_table_representation>().get_table().view());
   }
 
   // Check metadata
@@ -157,7 +158,7 @@ void validate_hash_partition(const sirius::data_batch_view& input_view,
 
 TEST_CASE("Hash partition basic", "[operator][hash_partition]")
 {
-  data_repository_manager data_repo_manager;
+  cucascade::data_repository_manager data_repo_manager;
   auto* mem_space                              = get_default_memory_space();
   constexpr size_t num_input_rows              = 100;
   constexpr size_t num_partitions              = 4;
@@ -181,7 +182,7 @@ TEST_CASE("Hash partition basic", "[operator][hash_partition]")
 
 TEST_CASE("Hash partition with invalid input", "[operator][hash_partition]")
 {
-  data_repository_manager data_repo_manager;
+  cucascade::data_repository_manager data_repo_manager;
   auto* mem_space                              = get_default_memory_space();
   constexpr size_t num_input_rows              = 100;
   constexpr size_t num_partitions              = 1;
@@ -205,7 +206,7 @@ TEST_CASE("Hash partition with invalid input", "[operator][hash_partition]")
 
 TEST_CASE("Hash partition with empty input", "[operator][hash_partition]")
 {
-  data_repository_manager data_repo_manager;
+  cucascade::data_repository_manager data_repo_manager;
   auto* mem_space                              = get_default_memory_space();
   constexpr size_t num_input_rows              = 0;
   constexpr size_t num_partitions              = 4;
@@ -229,7 +230,7 @@ TEST_CASE("Hash partition with empty input", "[operator][hash_partition]")
 
 TEST_CASE("Hash partition with all the same partitioning keys", "[operator][hash_partition]")
 {
-  data_repository_manager data_repo_manager;
+  cucascade::data_repository_manager data_repo_manager;
   auto* mem_space                              = get_default_memory_space();
   constexpr size_t num_input_rows              = 100;
   constexpr size_t num_partitions              = 4;
@@ -257,7 +258,7 @@ TEST_CASE("Hash partition with all the same partitioning keys", "[operator][hash
 
 TEST_CASE("Hash partition with num partitions larger than input size", "[operator][hash_partition]")
 {
-  data_repository_manager data_repo_manager;
+  cucascade::data_repository_manager data_repo_manager;
   auto* mem_space                              = get_default_memory_space();
   constexpr size_t num_input_rows              = 10;
   constexpr size_t num_partitions              = 20;
@@ -281,7 +282,7 @@ TEST_CASE("Hash partition with num partitions larger than input size", "[operato
 
 namespace {
 
-void validate_evenly_partition(const sirius::data_batch_view& input_view,
+void validate_evenly_partition(const cucascade::data_batch_view& input_view,
                                const sirius::vector<sirius::unique_ptr<data_batch>>& output_batches,
                                int num_partitions)
 {
@@ -289,7 +290,7 @@ void validate_evenly_partition(const sirius::data_batch_view& input_view,
   sirius::vector<cudf::table_view> output_table_views;
   for (const auto& output_batch : output_batches) {
     output_table_views.push_back(
-      output_batch->get_data()->cast<gpu_table_representation>().get_table().view());
+      output_batch->get_data()->cast<cucascade::gpu_table_representation>().get_table().view());
   }
 
   // Check metadata
@@ -330,7 +331,7 @@ void validate_evenly_partition(const sirius::data_batch_view& input_view,
 
 TEST_CASE("Evenly partition basic", "[operator][evenly_partition]")
 {
-  data_repository_manager data_repo_manager;
+  cucascade::data_repository_manager data_repo_manager;
   auto* mem_space                              = get_default_memory_space();
   constexpr size_t num_input_rows              = 100;
   constexpr size_t num_partitions              = 4;
@@ -349,7 +350,7 @@ TEST_CASE("Evenly partition basic", "[operator][evenly_partition]")
 
 TEST_CASE("Evenly partition basic with empty input", "[operator][evenly_partition]")
 {
-  data_repository_manager data_repo_manager;
+  cucascade::data_repository_manager data_repo_manager;
   auto* mem_space                              = get_default_memory_space();
   constexpr size_t num_input_rows              = 0;
   constexpr size_t num_partitions              = 4;
@@ -369,7 +370,7 @@ TEST_CASE("Evenly partition basic with empty input", "[operator][evenly_partitio
 TEST_CASE("Evenly partition basic with num partitions larger than input size",
           "[operator][evenly_partition]")
 {
-  data_repository_manager data_repo_manager;
+  cucascade::data_repository_manager data_repo_manager;
   auto* mem_space                              = get_default_memory_space();
   constexpr size_t num_input_rows              = 10;
   constexpr size_t num_partitions              = 20;

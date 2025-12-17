@@ -44,6 +44,7 @@
 #include <vector>
 
 using namespace sirius;
+using namespace cucascade;
 
 // Mock memory_space for testing - provides a simple memory_space without real allocators
 class mock_memory_space : public memory::memory_space {
@@ -121,7 +122,7 @@ cudf::table create_simple_cudf_table(int num_rows = 100)
 // Initialize a minimal memory manager with one GPU(0) and one HOST(0)
 static void initialize_memory_for_conversions()
 {
-  using namespace sirius::memory;
+  using namespace cucascade::memory;
   memory_reservation_manager::reset_for_testing();
   std::vector<memory_reservation_manager::memory_space_config> configs;
   configs.emplace_back(
@@ -501,7 +502,7 @@ TEST_CASE("gpu->host->gpu roundtrip preserves cudf table contents", "[gpu_data_r
 // =============================================================================
 static void initialize_multi_gpu_for_conversions(int dev_a, int dev_b)
 {
-  using namespace sirius::memory;
+  using namespace cucascade::memory;
   memory_reservation_manager::reset_for_testing();
   std::vector<memory_reservation_manager::memory_space_config> configs;
   configs.emplace_back(Tier::GPU, dev_a, 2048ull * 1024 * 1024);

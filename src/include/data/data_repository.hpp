@@ -18,7 +18,7 @@
 #include "data_batch.hpp"
 #include "helper/helper.hpp"
 
-namespace sirius {
+namespace cucascade {
 
 /**
  * @brief Abstract interface for managing collections of data_batch_view objects within a pipeline.
@@ -78,4 +78,4 @@ class idata_repository {
     _data_batches;  ///< Map of pipeline source to data_batch_view
 };
 
-}  // namespace sirius
+}  // namespace cucascade

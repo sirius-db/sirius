@@ -16,7 +16,7 @@
 
 #include "memory/disk_access_limiter.hpp"
 
-namespace sirius {
+namespace cucascade {
 namespace memory {
 
 disk_access_limiter::disk_access_limiter(memory_space_id space_id, std::size_t capacity)
@@ -143,4 +143,4 @@ void disk_access_limiter::update_peak_allocated_bytes() noexcept
 }
 
 }  // namespace memory
-}  // namespace sirius
+}  // namespace cucascade

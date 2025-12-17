@@ -31,7 +31,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace sirius {
+namespace cucascade {
 namespace memory {
 
 using stream_ordered_tracker_state =
@@ -428,10 +428,10 @@ void* reservation_aware_resource_adaptor::do_allocate_unmanaged(std::size_t allo
       return _upstream.allocate_async(allocation_bytes, stream);
     } catch (std::exception& e) {
       _total_allocated_bytes.sub(tracking_bytes);
-      throw sirius_out_of_memory(e.what(), allocation_bytes, post_allocation_size);
+      throw cucascade_out_of_memory(e.what(), allocation_bytes, post_allocation_size);
     }
   } else {
-    throw sirius_out_of_memory(
+    throw cucascade_out_of_memory(
       "not enough capacity to allocate memory", allocation_bytes, post_allocation_size);
   }
 }
@@ -509,4 +509,4 @@ void reservation_aware_resource_adaptor::do_release_reservation(
 }
 
 }  // namespace memory
-}  // namespace sirius
+}  // namespace cucascade

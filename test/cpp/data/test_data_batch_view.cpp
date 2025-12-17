@@ -28,6 +28,7 @@
 #include <vector>
 
 using namespace sirius;
+using namespace cucascade;
 
 // Mock memory_space for testing - provides a simple memory_space without real allocators
 class mock_memory_space : public memory::memory_space {

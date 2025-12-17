@@ -31,9 +31,9 @@ pipeline_executor::pipeline_executor(task_executor_config config)
   _gpu_executors.reserve(Config::NUM_GPU);
   for (int i = 0; i < Config::NUM_GPU; ++i) {
     // TODO: Initialize memory space for each GPU
-    auto& mem_res_mgr = memory::memory_reservation_manager::get_instance();
-    const memory::memory_space* gpu_mem_space =
-      mem_res_mgr.get_memory_space(memory::Tier::GPU, i);  // Placeholder
+    auto& mem_res_mgr = cucascade::memory::memory_reservation_manager::get_instance();
+    const cucascade::memory::memory_space* gpu_mem_space =
+      mem_res_mgr.get_memory_space(cucascade::memory::Tier::GPU, i);  // Placeholder
     _gpu_executors.push_back(
       sirius::make_unique<gpu_pipeline_executor>(config, gpu_mem_space, this));
   }

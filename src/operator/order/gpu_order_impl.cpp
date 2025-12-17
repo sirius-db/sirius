@@ -21,15 +21,15 @@
 namespace sirius {
 namespace op {
 
-sirius::unique_ptr<data_batch> gpu_order_impl::local_order_by(
-  const data_batch_view& input,
+sirius::unique_ptr<cucascade::data_batch> gpu_order_impl::local_order_by(
+  const cucascade::data_batch_view& input,
   const sirius::vector<int>& order_key_idx,
   sirius::vector<cudf::order> const& column_order,
   sirius::vector<cudf::null_order> const& null_precedence,
   const sirius::vector<int>& projections,
   rmm::cuda_stream_view stream,
-  memory::memory_space& memory_space,
-  data_repository_manager& data_repository_mgr)
+  cucascade::memory::memory_space& memory_space,
+  cucascade::data_repository_manager& data_repository_mgr)
 {
   if (order_key_idx.size() != column_order.size() ||
       order_key_idx.size() != null_precedence.size()) {
@@ -56,14 +56,14 @@ sirius::unique_ptr<data_batch> gpu_order_impl::local_order_by(
 
   // Create the output data batch
   auto gpu_table_representation =
-    sirius::make_unique<sirius::gpu_table_representation>(*output_table, memory_space);
-  return sirius::make_unique<sirius::data_batch>(data_repository_mgr.get_next_data_batch_id(),
+    sirius::make_unique<cucascade::gpu_table_representation>(*output_table, memory_space);
+  return sirius::make_unique<cucascade::data_batch>(data_repository_mgr.get_next_data_batch_id(),
                                                  data_repository_mgr,
                                                  std::move(gpu_table_representation));
 }
 
-sirius::unique_ptr<data_batch> gpu_order_impl::local_top_n(
-  const data_batch_view& input,
+sirius::unique_ptr<cucascade::data_batch> gpu_order_impl::local_top_n(
+  const cucascade::data_batch_view& input,
   const int limit,
   const int offset,
   const sirius::vector<int>& order_key_idx,
@@ -71,8 +71,8 @@ sirius::unique_ptr<data_batch> gpu_order_impl::local_top_n(
   const sirius::vector<cudf::null_order>& null_precedence,
   const sirius::vector<int>& projections,
   rmm::cuda_stream_view stream,
-  memory::memory_space& memory_space,
-  data_repository_manager& data_repository_mgr)
+  cucascade::memory::memory_space& memory_space,
+  cucascade::data_repository_manager& data_repository_mgr)
 {
   if (order_key_idx.size() != column_order.size() ||
       order_key_idx.size() != null_precedence.size()) {
@@ -112,8 +112,8 @@ sirius::unique_ptr<data_batch> gpu_order_impl::local_top_n(
 
   // Create the output data batch
   auto gpu_table_representation =
-    sirius::make_unique<sirius::gpu_table_representation>(*output_table, memory_space);
-  return sirius::make_unique<sirius::data_batch>(data_repository_mgr.get_next_data_batch_id(),
+    sirius::make_unique<cucascade::gpu_table_representation>(*output_table, memory_space);
+  return sirius::make_unique<cucascade::data_batch>(data_repository_mgr.get_next_data_batch_id(),
                                                  data_repository_mgr,
                                                  std::move(gpu_table_representation));
 }

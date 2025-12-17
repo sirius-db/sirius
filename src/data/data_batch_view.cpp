@@ -19,7 +19,7 @@
 #include "data/data_repository_manager.hpp"
 #include "data/gpu_data_representation.hpp"
 
-namespace sirius {
+namespace cucascade {
 
 data_batch_view::data_batch_view(data_batch* batch) : _batch(batch)
 {
@@ -79,4 +79,4 @@ data_batch_view::~data_batch_view()
   }
 }
 
-}  // namespace sirius
+}  // namespace cucascade

@@ -46,7 +46,7 @@ class gpu_pipeline_task_global_state : public itask_global_state {
    */
   explicit gpu_pipeline_task_global_state(uint64_t pipeline_id,
                                           duckdb::shared_ptr<duckdb::GPUPipeline> pipeline,
-                                          data_repository_manager& data_repo_mgr,
+                                          cucascade::data_repository_manager& data_repo_mgr,
                                           task_completion_message_queue& message_queue)
     : _pipeline_id(pipeline_id),
       _pipeline(std::move(pipeline)),
@@ -55,7 +55,7 @@ class gpu_pipeline_task_global_state : public itask_global_state {
   {
   }
 
-  data_repository_manager& _data_repo_mgr;  ///< Reference to the data repository manager
+  cucascade::data_repository_manager& _data_repo_mgr;  ///< Reference to the data repository manager
   task_completion_message_queue&
     _message_queue;  ///< Message queue to notify TaskCreator about task completion
   duckdb::shared_ptr<duckdb::GPUPipeline>
@@ -80,23 +80,23 @@ class gpu_pipeline_task_local_state : public itask_local_state {
    */
   explicit gpu_pipeline_task_local_state(
     uint64_t task_id,
-    sirius::vector<sirius::unique_ptr<data_batch_view>> batch_views,
-    sirius::unique_ptr<sirius::memory::reservation> res = nullptr)
+    sirius::vector<sirius::unique_ptr<cucascade::data_batch_view>> batch_views,
+    sirius::unique_ptr<cucascade::memory::reservation> res = nullptr)
     : _task_id(task_id), _batch_views(std::move(batch_views)), _reservation(std::move(res))
   {
   }
 
   uint64_t _task_id;  ///< Unique identifier for this task
-  sirius::vector<sirius::unique_ptr<data_batch_view>>
+  sirius::vector<sirius::unique_ptr<cucascade::data_batch_view>>
     _batch_views;  ///< Input data batch views for the pipeline
 
-  void set_reservation(sirius::unique_ptr<sirius::memory::reservation> res)
+  void set_reservation(sirius::unique_ptr<cucascade::memory::reservation> res)
   {
     _reservation = std::move(res);
   }
 
  private:
-  sirius::unique_ptr<sirius::memory::reservation>
+  sirius::unique_ptr<cucascade::memory::reservation>
     _reservation;  ///< Memory reservation for GPU resources
   // TODO: for now, reservation is passed as a local state, will be null when the task is first
   // created, and will be set when reservation is made
@@ -157,7 +157,7 @@ class gpu_pipeline_task : public itask {
    * @param batch The data batch to push
    * @param pipeline_id The id of the pipeline that produced this data batch
    */
-  void push_data_batch(sirius::unique_ptr<data_batch> batch, uint64_t pipeline_id);
+  void push_data_batch(sirius::unique_ptr<cucascade::data_batch> batch, uint64_t pipeline_id);
 };
 
 }  // namespace parallel

@@ -24,13 +24,13 @@
 #include <stdexcept>
 #include <variant>
 
-namespace sirius {
+namespace cucascade {
 namespace memory {
 class memory_space;
 }
-}  // namespace sirius
+}  // namespace cucascade
 
-namespace sirius {
+namespace cucascade {
 
 class data_batch_view;          // Forward declarationc
 class data_repository_manager;  // Forward declaration
@@ -67,7 +67,7 @@ class data_batch {
   data_batch(uint64_t batch_id,
              data_repository_manager& data_repo_mgr,
              sirius::unique_ptr<idata_representation> data,
-             sirius::memory::memory_space& memory_space);
+             cucascade::memory::memory_space& memory_space);
 
   /**
    * @brief Move constructor - transfers ownership of the batch and its data.
@@ -188,7 +188,7 @@ class data_batch {
   /**
    * @brief Get the memory_space where this batch currently resides.
    */
-  sirius::memory::memory_space* get_memory_space() const;
+  cucascade::memory::memory_space* get_memory_space() const;
 
   /**
    * @brief Replace the underlying data representation.
@@ -200,7 +200,7 @@ class data_batch {
    * @brief Convert the underlying representation to the target memory_space.
    *        Requires no active views or pins.
    */
-  void convert_to_memory_space(const sirius::memory::memory_space* target_memory_space,
+  void convert_to_memory_space(const cucascade::memory::memory_space* target_memory_space,
                                rmm::cuda_stream_view stream);
 
   bool try_to_lock_for_downgrade()
@@ -221,8 +221,8 @@ class data_batch {
   size_t _view_count = 0;                          ///< Reference count for tracking views
   size_t _pin_count  = 0;  ///< Reference count for tracking pins to prevent eviction
   data_repository_manager* _data_repo_mgr;      ///< Pointer to the data repository manager
-  sirius::memory::memory_space* _memory_space;  ///< Memory space where the data resides
+  cucascade::memory::memory_space* _memory_space;  ///< Memory space where the data resides
   bool _downgrade_locked = false;               ///< Whether the batch is locked for downgrade
 };
 
-}  // namespace sirius
+}  // namespace cucascade

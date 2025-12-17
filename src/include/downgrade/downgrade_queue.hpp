@@ -21,7 +21,7 @@
 #include "parallel/task_executor.hpp"
 #include "task_completion.hpp"
 
-namespace sirius {
+namespace cucascade {
 namespace parallel {
 
 /**
@@ -185,4 +185,4 @@ class downgrade_task_queue : public itask_queue {
 };
 
 }  // namespace parallel
-}  // namespace sirius
+}  // namespace cucascade

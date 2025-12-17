@@ -23,7 +23,7 @@
 
 #include <vector>
 
-namespace sirius {
+namespace cucascade {
 
 /**
  * @brief Data representation for a table being stored in GPU memory.
@@ -43,7 +43,7 @@ class gpu_table_representation : public idata_representation {
    *
    * @param table The actual cuDF table with the data
    */
-  gpu_table_representation(cudf::table table, sirius::memory::memory_space& memory_space);
+  gpu_table_representation(cudf::table table, cucascade::memory::memory_space& memory_space);
 
   /**
    * @brief Get the size of the data representation in bytes
@@ -67,11 +67,11 @@ class gpu_table_representation : public idata_representation {
    * space
    */
   sirius::unique_ptr<idata_representation> convert_to_memory_space(
-    const sirius::memory::memory_space* target_memory_space,
+    const cucascade::memory::memory_space* target_memory_space,
     rmm::cuda_stream_view stream = rmm::cuda_stream_default) override;
 
  private:
   cudf::table _table;  ///< The actual cuDF table with the data
 };
 
-}  // namespace sirius
+}  // namespace cucascade

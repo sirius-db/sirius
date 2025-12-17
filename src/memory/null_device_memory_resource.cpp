@@ -16,10 +16,10 @@
 
 #include "memory/null_device_memory_resource.hpp"
 
-namespace sirius {
+namespace cucascade {
 namespace memory {
 
 // All methods are defined inline in the header; this TU ensures linkage.
 
 }  // namespace memory
-}  // namespace sirius
+}  // namespace cucascade

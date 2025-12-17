@@ -16,7 +16,7 @@
 
 #include "downgrade/downgrade_executor.hpp"
 
-namespace sirius {
+namespace cucascade {
 namespace parallel {
 
 void downgrade_executor::schedule(sirius::unique_ptr<itask> task)
@@ -83,4 +83,4 @@ void downgrade_executor::worker_loop(int worker_id)
 }
 
 }  // namespace parallel
-}  // namespace sirius
+}  // namespace cucascade

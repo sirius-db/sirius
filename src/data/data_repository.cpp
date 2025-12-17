@@ -18,7 +18,7 @@
 
 #include "data/data_batch_view.hpp"
 
-namespace sirius {
+namespace cucascade {
 
 void idata_repository::add_new_data_batch_view(sirius::unique_ptr<data_batch_view> batch_view)
 {
@@ -35,4 +35,4 @@ sirius::unique_ptr<data_batch_view> idata_repository::pull_data_batch_view()
   return batch;
 }
 
-}  // namespace sirius
+}  // namespace cucascade

@@ -49,7 +49,7 @@ void local_task_buffer::close()
 }
 
 gpu_pipeline_executor::gpu_pipeline_executor(task_executor_config config,
-                                             const memory::memory_space* mem_space,
+                                             const cucascade::memory::memory_space* mem_space,
                                              pipeline_executor* pipeline_exec)
   : itask_executor(sirius::make_unique<gpu_pipeline_queue>(config.num_threads), config),
     _local_task_buffer(sirius::make_unique<local_task_buffer>()),
