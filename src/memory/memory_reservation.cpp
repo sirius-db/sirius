@@ -22,7 +22,7 @@
 
 #include <rmm/cuda_device.hpp>
 
-namespace sirius {
+namespace cucascade {
 namespace memory {
 
 // Provide out-of-line definition for the virtual destructor to satisfy linker
@@ -143,4 +143,4 @@ std::unique_ptr<reservation_limit_policy> make_default_reservation_limit_policy(
 //===----------------------------------------------------------------------===//
 
 }  // namespace memory
-}  // namespace sirius
+}  // namespace cucascade

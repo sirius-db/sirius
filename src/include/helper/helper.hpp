@@ -18,61 +18,7 @@
 
 #include <nvtx3/nvtx3.hpp>
 
-#include <atomic>
-#include <iostream>
-#include <memory>
-#include <mutex>
-#include <queue>
-#include <thread>
-#include <unordered_map>
-#include <vector>
-
 namespace sirius {
-
-// Smart pointer wrappers
-template <typename T>
-using unique_ptr = std::unique_ptr<T>;
-
-template <typename T>
-using shared_ptr = std::shared_ptr<T>;
-
-// Smart pointer factory functions
-template <typename T, typename... Args>
-constexpr auto make_unique(Args&&... args)
-{
-  return std::make_unique<T>(std::forward<Args>(args)...);
-}
-
-template <typename T, typename... Args>
-auto make_shared(Args&&... args)
-{
-  return std::make_shared<T>(std::forward<Args>(args)...);
-}
-
-// Container wrappers
-template <typename T, typename Allocator = std::allocator<T>>
-using vector = std::vector<T, Allocator>;
-
-template <typename Key,
-          typename T,
-          typename Hash      = std::hash<Key>,
-          typename KeyEqual  = std::equal_to<Key>,
-          typename Allocator = std::allocator<std::pair<const Key, T>>>
-using unordered_map = std::unordered_map<Key, T, Hash, KeyEqual, Allocator>;
-
-template <typename T, typename Container = std::deque<T>>
-using queue = std::queue<T, Container>;
-
-// Threading wrappers
-using mutex = std::mutex;
-
-template <typename Mutex>
-using lock_guard = std::lock_guard<Mutex>;
-
-template <typename T>
-using atomic = std::atomic<T>;
-
-using thread = std::thread;
 
 template <class T, class SRC>
 void DynamicCastCheck(const SRC* source)

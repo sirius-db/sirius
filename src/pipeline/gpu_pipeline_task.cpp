@@ -21,8 +21,8 @@
 namespace sirius {
 namespace parallel {
 
-gpu_pipeline_task::gpu_pipeline_task(sirius::unique_ptr<itask_local_state> local_state,
-                                     sirius::shared_ptr<itask_global_state> global_state)
+gpu_pipeline_task::gpu_pipeline_task(std::unique_ptr<itask_local_state> local_state,
+                                     std::shared_ptr<itask_global_state> global_state)
   : itask(std::move(local_state), std::move(global_state))
 {
 }
@@ -52,7 +52,7 @@ void gpu_pipeline_task::mark_task_completion()
   // notify TaskCreator about task completion
   uint64_t task_id     = _local_state->cast<gpu_pipeline_task_local_state>()._task_id;
   uint64_t pipeline_id = _global_state->cast<gpu_pipeline_task_global_state>()._pipeline_id;
-  auto message         = sirius::make_unique<sirius::task_completion_message>();
+  auto message         = std::make_unique<sirius::task_completion_message>();
   message->task_id     = task_id;
   message->pipeline_id = pipeline_id;
   message->source      = sirius::Source::PIPELINE;

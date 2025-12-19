@@ -18,32 +18,35 @@
 
 #include "data/data_repository.hpp"
 #include "data_batch.hpp"
-#include "gpu_physical_operator.hpp"
-#include "helper/helper.hpp"
 
+#include <atomic>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
-namespace sirius {
+namespace cucascade {
 
 /**
  * @brief Key type for identifying a unique operator-port combination.
  *
- * Uses std::string instead of string_view to ensure the key owns its data,
- * avoiding lifetime issues and allowing use with standard comparison.
+ * Uses size_t operator_id to identify operators. The caller is responsible for mapping
+ * operators to IDs.
  */
 struct operator_port_key {
-  ::duckdb::GPUPhysicalOperator* op;
+  size_t operator_id;
   std::string port_id;
 
   bool operator==(const operator_port_key& other) const
   {
-    return op == other.op && port_id == other.port_id;
+    return operator_id == other.operator_id && port_id == other.port_id;
   }
 
   bool operator<(const operator_port_key& other) const
   {
-    if (op != other.op) return op < other.op;
+    if (operator_id != other.operator_id) return operator_id < other.operator_id;
     return port_id < other.port_id;
   }
 };
@@ -85,20 +88,29 @@ class data_repository_manager {
   data_repository_manager() = default;
 
   /**
-   * @brief Register a new data repository for the specified pipeline.
+   * @brief Destructor - ensures repositories are cleared before data batches.
    *
-   * Associates a data repository implementation with a pipeline ID. Each pipeline
-   * can have exactly one repository, and attempting to add a repository for an
-   * existing pipeline will replace the previous one.
+   * Repositories contain data_batch_view objects that reference data_batch objects.
+   * We must destroy all views before destroying the batches they reference.
+   */
+  ~data_repository_manager() { _repositories.clear(); }
+
+  /**
+   * @brief Register a new data repository for the specified operator ID.
    *
-   * @param op The GPUPhysicalOperator associated with the repository
+   * Associates a data repository implementation with an operator ID and port. Each
+   * operator-port combination can have exactly one repository, and attempting to add
+   * a repository for an existing combination will replace the previous one.
+   *
+   * @param operator_id The unique ID of the operator associated with the repository
+   * @param port_id The port identifier for this repository
    * @param repository Unique pointer to the repository implementation (ownership transferred)
    *
    * @note Thread-safe operation
    */
-  void add_new_repository(::duckdb::GPUPhysicalOperator* op,
+  void add_new_repository(size_t operator_id,
                           std::string_view port_id,
-                          sirius::unique_ptr<idata_repository> repository);
+                          std::unique_ptr<idata_repository> repository);
 
   /**
    * @brief Add a new data_batch to the holder.
@@ -107,29 +119,28 @@ class data_repository_manager {
    * data_batch_views reference these batches.
    *
    * @param batch The data_batch to add (ownership transferred)
-   * @param ops The GPUPhysicalOperators whose repositories will receive views of this batch
+   * @param ops The operator IDs and ports whose repositories will receive views of this batch
    *
    * @note Thread-safe operation
    */
-  void add_new_data_batch(
-    sirius::unique_ptr<data_batch> batch,
-    sirius::vector<std::pair<::duckdb::GPUPhysicalOperator*, std::string_view>> ops);
+  void add_new_data_batch(std::unique_ptr<data_batch> batch,
+                          std::vector<std::pair<size_t, std::string_view>> ops);
 
   /**
-   * @brief Get direct access to a pipeline's repository for advanced operations.
+   * @brief Get direct access to a repository for advanced operations.
    *
    * Provides direct access to the underlying repository implementation, allowing
    * for repository-specific operations that aren't covered by the common interface.
    *
-   * @param op the GPUPhysicalOperator whose repository is requested
-   * @return sirius::unique_ptr<idata_repository>& Reference to the repository
+   * @param operator_id The unique ID of the operator whose repository is requested
+   * @param port_id The port identifier for the repository
+   * @return std::unique_ptr<idata_repository>& Reference to the repository
    *
-   * @throws std::out_of_range If no repository exists for the specified pipeline
+   * @throws std::out_of_range If no repository exists for the specified operator/port
    * @note Thread-safe for read access, but modifications should use the repository's own thread
    * safety
    */
-  sirius::unique_ptr<idata_repository>& get_repository(::duckdb::GPUPhysicalOperator* op,
-                                                       std::string_view port_id);
+  std::unique_ptr<idata_repository>& get_repository(size_t operator_id, std::string_view port_id);
 
   /**
    * @brief Generate a globally unique data batch identifier.
@@ -155,7 +166,7 @@ class data_repository_manager {
    * downgraded
    */
   std::vector<std::unique_ptr<data_batch>> get_data_batches_for_downgrade(
-    sirius::memory::memory_space_id memory_space_id, size_t amount_to_downgrade);
+    cucascade::memory::memory_space_id memory_space_id, size_t amount_to_downgrade);
 
  private:
   /**
@@ -172,13 +183,13 @@ class data_repository_manager {
    */
   void delete_data_batch(size_t batch_id);
 
-  mutex _mutex;  ///< Mutex for thread-safe access to holder
-  sirius::atomic<uint64_t> _next_data_batch_id =
+  std::mutex _mutex;  ///< Mutex for thread-safe access to holder
+  std::atomic<uint64_t> _next_data_batch_id =
     0;  ///< Atomic counter for generating unique data batch identifiers
-  std::map<operator_port_key, sirius::unique_ptr<idata_repository>>
-    _repositories;  ///< Map of pipeline ID to idata_repository (uses std::map for O(log n) lookups
+  std::map<operator_port_key, std::unique_ptr<idata_repository>>
+    _repositories;  ///< Map of operator ID to idata_repository (uses std::map for O(log n) lookups
                     ///< without needing a hash function)
-  unordered_map<size_t, sirius::unique_ptr<data_batch>> _data_batches;
+  std::unordered_map<size_t, std::unique_ptr<data_batch>> _data_batches;
 };
 
-}  // namespace sirius
+}  // namespace cucascade

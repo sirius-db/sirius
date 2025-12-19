@@ -27,10 +27,10 @@
 #include <rmm/device_uvector.hpp>
 
 #include <cuda_runtime_api.h>
-namespace sirius {
+namespace cucascade {
 
 gpu_table_representation::gpu_table_representation(cudf::table table,
-                                                   sirius::memory::memory_space& memory_space)
+                                                   cucascade::memory::memory_space& memory_space)
   : idata_representation(memory_space), _table(std::move(table))
 {
 }
@@ -50,8 +50,8 @@ std::size_t gpu_table_representation::get_size_in_bytes() const
 
 const cudf::table& gpu_table_representation::get_table() const { return _table; }
 
-sirius::unique_ptr<idata_representation> gpu_table_representation::convert_to_memory_space(
-  const sirius::memory::memory_space* target_memory_space, rmm::cuda_stream_view stream)
+std::unique_ptr<idata_representation> gpu_table_representation::convert_to_memory_space(
+  const cucascade::memory::memory_space* target_memory_space, rmm::cuda_stream_view stream)
 {
   auto packed_data = cudf::pack(_table, stream);
   if (target_memory_space->get_tier() == memory::Tier::GPU) {
@@ -83,7 +83,7 @@ sirius::unique_ptr<idata_representation> gpu_table_representation::convert_to_me
     rmm::device_buffer dst_buffer = std::move(dst_uvector).release();
     // Unpack using pointer-based API and construct an owning cudf::table
     auto new_metadata = std::move(packed_data.metadata);
-    auto new_gpu_data = sirius::make_unique<rmm::device_buffer>(std::move(dst_buffer));
+    auto new_gpu_data = std::make_unique<rmm::device_buffer>(std::move(dst_buffer));
     auto new_table_view =
       cudf::unpack(new_metadata->data(), static_cast<uint8_t const*>(new_gpu_data->data()));
     auto new_table = cudf::table(new_table_view, target_stream, mr);
@@ -91,11 +91,11 @@ sirius::unique_ptr<idata_representation> gpu_table_representation::convert_to_me
     target_stream.synchronize();
     cudaSetDevice(source_device_id);
 
-    return sirius::make_unique<gpu_table_representation>(
-      std::move(new_table), *const_cast<sirius::memory::memory_space*>(target_memory_space));
+    return std::make_unique<gpu_table_representation>(
+      std::move(new_table), *const_cast<cucascade::memory::memory_space*>(target_memory_space));
   } else if (target_memory_space->get_tier() == memory::Tier::HOST) {
     auto mr = target_memory_space
-                ->get_memory_resource_as<sirius::memory::fixed_size_host_memory_resource>();
+                ->get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>();
     auto allocation = mr->allocate_multiple_blocks(packed_data.gpu_data->size());
 
     size_t block_index      = 0;
@@ -119,11 +119,11 @@ sirius::unique_ptr<idata_representation> gpu_table_representation::convert_to_me
       }
     }
     stream.synchronize();
-    auto host_table_allocation = sirius::make_unique<sirius::memory::host_table_allocation>(
+    auto host_table_allocation = std::make_unique<cucascade::memory::host_table_allocation>(
       std::move(allocation), std::move(packed_data.metadata), packed_data.gpu_data->size());
-    return sirius::make_unique<host_table_representation>(
+    return std::make_unique<host_table_representation>(
       std::move(host_table_allocation),
-      const_cast<sirius::memory::memory_space*>(target_memory_space));
+      const_cast<cucascade::memory::memory_space*>(target_memory_space));
   } else {
     throw std::runtime_error(
       "Invalid target memory space for "
@@ -131,4 +131,4 @@ sirius::unique_ptr<idata_representation> gpu_table_representation::convert_to_me
   }
 }
 
-}  // namespace sirius
+}  // namespace cucascade

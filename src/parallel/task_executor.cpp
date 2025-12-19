@@ -26,8 +26,8 @@ void itask_executor::start()
   on_start();
   _threads.reserve(_config.num_threads);
   for (int i = 0; i < _config.num_threads; ++i) {
-    _threads.push_back(sirius::make_unique<task_executor_thread>(
-      sirius::make_unique<sirius::thread>(&itask_executor::worker_loop, this, i)));
+    _threads.push_back(std::make_unique<task_executor_thread>(
+      std::make_unique<std::thread>(&itask_executor::worker_loop, this, i)));
   }
 }
 
@@ -42,17 +42,14 @@ void itask_executor::stop()
   _threads.clear();
 }
 
-void itask_executor::schedule(sirius::unique_ptr<itask> task)
-{
-  _task_queue->push(std::move(task));
-}
+void itask_executor::schedule(std::unique_ptr<itask> task) { _task_queue->push(std::move(task)); }
 
 void itask_executor::on_start() { _task_queue->open(); }
 
 void itask_executor::on_stop() { _task_queue->close(); }
 
 void itask_executor::on_task_error(int worker_id,
-                                   sirius::unique_ptr<itask> task,
+                                   std::unique_ptr<itask> task,
                                    const std::exception& e)
 {
   if (_config.retry_on_error) {

@@ -15,9 +15,9 @@
  */
 
 #pragma once
+
 #include "data/common.hpp"
 #include "data/data_batch.hpp"
-#include "helper/helper.hpp"
 
 #include <cudf/table/table.hpp>
 
@@ -25,7 +25,7 @@
 #include <stdexcept>
 #include <variant>
 
-namespace sirius {
+namespace cucascade {
 
 /**
  * @brief A view into a data_batch that manages reference counting and provides CUDF table access.
@@ -139,4 +139,4 @@ class data_batch_view {
   bool _pinned = false;  ///< Whether the batch is pinned
 };
 
-}  // namespace sirius
+}  // namespace cucascade

@@ -97,8 +97,8 @@ class GPUPhysicalOperator {
 
   virtual OperatorResultType Execute(GPUIntermediateRelation& input_relation,
                                      GPUIntermediateRelation& output_relation) const;
-  virtual ::sirius::vector<::sirius::unique_ptr<::sirius::data_batch>> execute(
-    ::sirius::vector<::sirius::unique_ptr<::sirius::data_batch_view>> input_batch);
+  virtual ::std::vector<::std::unique_ptr<::cucascade::data_batch>> execute(
+    ::std::vector<::std::unique_ptr<::cucascade::data_batch_view>> input_batch);
 
   virtual bool ParallelOperator() const { return false; }
 
@@ -178,13 +178,13 @@ class GPUPhysicalOperator {
 
   struct port {
     MemoryBarrierType type;
-    ::sirius::idata_repository* repo;
+    ::cucascade::idata_repository* repo;
     shared_ptr<GPUPipeline> src_pipeline;
     bool src_pipeline_finished{false};
   };
 
   // source pipeline pushed to repo of the ports
-  void push_data_batch_view(std::string_view port_id, ::sirius::data_batch_view batch_view);
+  void push_data_batch_view(std::string_view port_id, ::cucascade::data_batch_view batch_view);
   void add_port(std::string_view port_id, std::unique_ptr<port> p);
   port* get_port(std::string_view port_id);
   void add_next_port_after_sink(std::pair<GPUPhysicalOperator*, std::string_view> port_locator);

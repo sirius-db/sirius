@@ -63,7 +63,7 @@ class pipeline_executor : public itask_executor {
    *
    * @param task The task to schedule (must be a gpu_pipeline_task)
    */
-  void schedule(sirius::unique_ptr<itask> task) override;
+  void schedule(std::unique_ptr<itask> task) override;
 
   /**
    * @brief Main worker loop for executing GPU pipeline tasks
@@ -100,17 +100,16 @@ class pipeline_executor : public itask_executor {
    * @param task The task to schedule
    * @param gpu_id The GPU ID to which the task should be scheduled
    */
-  void dispatch_to_gpu_executor(sirius::unique_ptr<itask> task, int gpu_id);
+  void dispatch_to_gpu_executor(std::unique_ptr<itask> task, int gpu_id);
 
   /**
    * @brief Submit a task request to task_request_queue
    */
-  void submit_task_request(sirius::unique_ptr<task_request> request);
+  void submit_task_request(std::unique_ptr<task_request> request);
 
  private:
-  sirius::vector<sirius::unique_ptr<gpu_pipeline_executor>>
-    _gpu_executors;  ///< Vector of GPU executors
-  sirius::unique_ptr<task_request_queue> _task_request_queue;
+  std::vector<std::unique_ptr<gpu_pipeline_executor>> _gpu_executors;  ///< Vector of GPU executors
+  std::unique_ptr<task_request_queue> _task_request_queue;
 };
 
 }  // namespace parallel

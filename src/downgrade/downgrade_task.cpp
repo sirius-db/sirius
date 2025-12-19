@@ -34,7 +34,7 @@ void downgrade_task::execute()
   rmm::cuda_stream_view stream = rmm::cuda_stream_default;
   // get the memory_space and check that its gpu
   auto memory_space = _local_state->cast<downgrade_task_local_state>()._batch->get_memory_space();
-  if (memory_space->get_tier() != memory::Tier::GPU) {
+  if (memory_space->get_tier() != cucascade::memory::Tier::GPU) {
     mark_task_completion();
     return;
   } else {
@@ -42,9 +42,9 @@ void downgrade_task::execute()
     auto data_size = batch->get_data()->get_size_in_bytes();
 
     try {
-      auto& mr_manager = sirius::memory::memory_reservation_manager::get_instance();
+      auto& mr_manager = cucascade::memory::memory_reservation_manager::get_instance();
       auto reservation = mr_manager.request_reservation(
-        sirius::memory::any_memory_space_in_tier{sirius::memory::Tier::HOST}, data_size);
+        cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::HOST}, data_size);
       if (!reservation) {
         throw rmm::out_of_memory("Failed to allocate host memory for downgrade task.");
       }
@@ -53,7 +53,7 @@ void downgrade_task::execute()
       if (!mem_space) {
         throw std::runtime_error("Invalid reservation memory_space for HOST tier");
       }
-      auto* fixed_mr = reservation->get_memory_resource_of<memory::Tier::HOST>();
+      auto* fixed_mr = reservation->get_memory_resource_of<cucascade::memory::Tier::HOST>();
 
       batch->convert_to_memory_space(mem_space, stream);
 
@@ -65,15 +65,15 @@ void downgrade_task::execute()
     }
 
     // Obtain HOST-tier memory resource from the memory manager
-    // auto& mr_manager = sirius::memory::memory_reservation_manager::get_instance();
-    // auto host_spaces = mr_manager.get_memory_spaces_for_tier(sirius::memory::Tier::HOST);
+    // auto& mr_manager = cucascade::memory::memory_reservation_manager::get_instance();
+    // auto host_spaces = mr_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
     // if (host_spaces.empty()) {
     //     mark_task_completion();
     //     return;
     // }
     // auto host_allocator_ref = host_spaces[0]->get_default_allocator();
     // auto* host_fixed_mr =
-    // dynamic_cast<sirius::memory::fixed_size_host_memory_resource*>(&host_allocator_ref.get());
+    // dynamic_cast<cucascade::memory::fixed_size_host_memory_resource*>(&host_allocator_ref.get());
 
     // // Fallback: if cast fails, complete task without conversion
     // if (host_fixed_mr == nullptr) {
@@ -98,7 +98,7 @@ void downgrade_task::mark_task_completion()
   // notify task_creator about task completion
   uint64_t task_id     = _local_state->cast<downgrade_task_local_state>()._task_id;
   uint64_t pipeline_id = _local_state->cast<downgrade_task_local_state>()._pipeline_id;
-  auto message         = sirius::make_unique<sirius::task_completion_message>();
+  auto message         = std::make_unique<sirius::task_completion_message>();
   message->task_id     = task_id;
   message->pipeline_id = pipeline_id;
   message->source      = sirius::Source::PIPELINE;

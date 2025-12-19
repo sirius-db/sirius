@@ -19,7 +19,7 @@
 namespace sirius {
 namespace parallel {
 
-void downgrade_executor::schedule(sirius::unique_ptr<itask> task)
+void downgrade_executor::schedule(std::unique_ptr<itask> task)
 {
   // Downgrade-specific scheduling logic
   auto downgrade_task = cast_to_downgrade_task(task.get());
@@ -46,8 +46,8 @@ void downgrade_executor::start()
   on_start();
   _threads.reserve(_config.num_threads);
   for (int i = 0; i < _config.num_threads; ++i) {
-    _threads.push_back(sirius::make_unique<task_executor_thread>(
-      sirius::make_unique<sirius::thread>(&downgrade_executor::worker_loop, this, i)));
+    _threads.push_back(std::make_unique<task_executor_thread>(
+      std::make_unique<std::thread>(&downgrade_executor::worker_loop, this, i)));
   }
 }
 

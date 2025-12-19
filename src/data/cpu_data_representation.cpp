@@ -26,25 +26,25 @@
 #include <algorithm>
 #include <cstring>
 
-namespace sirius {
+namespace cucascade {
 
 host_table_representation::host_table_representation(
-  sirius::unique_ptr<sirius::memory::host_table_allocation> host_table,
-  sirius::memory::memory_space* memory_space)
+  std::unique_ptr<cucascade::memory::host_table_allocation> host_table,
+  cucascade::memory::memory_space* memory_space)
   : idata_representation(*memory_space), _host_table(std::move(host_table))
 {
 }
 
 std::size_t host_table_representation::get_size_in_bytes() const { return _host_table->data_size; }
 
-const sirius::unique_ptr<sirius::memory::host_table_allocation>&
+const std::unique_ptr<cucascade::memory::host_table_allocation>&
 host_table_representation::get_host_table() const
 {
   return _host_table;
 }
 
-sirius::unique_ptr<idata_representation> host_table_representation::convert_to_memory_space(
-  const sirius::memory::memory_space* target_memory_space, rmm::cuda_stream_view stream)
+std::unique_ptr<idata_representation> host_table_representation::convert_to_memory_space(
+  const cucascade::memory::memory_space* target_memory_space, rmm::cuda_stream_view stream)
 {
   auto const data_size = _host_table->data_size;
 
@@ -77,20 +77,20 @@ sirius::unique_ptr<idata_representation> host_table_representation::convert_to_m
       }
     }
 
-    auto new_metadata = sirius::make_unique<sirius::vector<uint8_t>>(*_host_table->metadata);
-    auto new_gpu_data = sirius::make_unique<rmm::device_buffer>(std::move(dst_buffer));
+    auto new_metadata = std::make_unique<std::vector<uint8_t>>(*_host_table->metadata);
+    auto new_gpu_data = std::make_unique<rmm::device_buffer>(std::move(dst_buffer));
     auto new_table_view =
       cudf::unpack(new_metadata->data(), static_cast<uint8_t const*>(new_gpu_data->data()));
     auto new_table = cudf::table(new_table_view, stream, mr);
     stream.synchronize();
 
     cudaSetDevice(previous_device);
-    return sirius::make_unique<gpu_table_representation>(
-      std::move(new_table), *const_cast<sirius::memory::memory_space*>(target_memory_space));
+    return std::make_unique<gpu_table_representation>(
+      std::move(new_table), *const_cast<cucascade::memory::memory_space*>(target_memory_space));
   } else if (target_memory_space->get_tier() == memory::Tier::HOST) {
     assert(this->get_device_id() != target_memory_space->get_device_id());
     auto mr = target_memory_space
-                ->get_memory_resource_as<sirius::memory::fixed_size_host_memory_resource>();
+                ->get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>();
     if (mr == nullptr) {
       throw std::runtime_error(
         "Target HOST memory_space does not have a fixed_size_host_memory_resource");
@@ -123,12 +123,12 @@ sirius::unique_ptr<idata_representation> host_table_representation::convert_to_m
         dst_block_offset = 0;
       }
     }
-    auto metadata_copy = sirius::make_unique<sirius::vector<uint8_t>>(*_host_table->metadata);
-    auto host_table_allocation = sirius::make_unique<sirius::memory::host_table_allocation>(
+    auto metadata_copy         = std::make_unique<std::vector<uint8_t>>(*_host_table->metadata);
+    auto host_table_allocation = std::make_unique<cucascade::memory::host_table_allocation>(
       std::move(dst_allocation), std::move(metadata_copy), data_size);
-    return sirius::make_unique<host_table_representation>(
+    return std::make_unique<host_table_representation>(
       std::move(host_table_allocation),
-      const_cast<sirius::memory::memory_space*>(target_memory_space));
+      const_cast<cucascade::memory::memory_space*>(target_memory_space));
   } else if (target_memory_space->get_tier() == memory::Tier::DISK) {
     throw std::runtime_error(
       "Conversion to DISK tier not implemented for host_table_representation");
@@ -138,4 +138,4 @@ sirius::unique_ptr<idata_representation> host_table_representation::convert_to_m
   }
 }
 
-}  // namespace sirius
+}  // namespace cucascade

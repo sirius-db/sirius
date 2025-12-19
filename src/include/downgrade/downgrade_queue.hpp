@@ -15,11 +15,15 @@
  */
 
 #pragma once
+
 #include "config.hpp"
-#include "data/data_repository.hpp"
-#include "helper/helper.hpp"
+#include "downgrade/downgrade_task.hpp"
 #include "parallel/task_executor.hpp"
-#include "task_completion.hpp"
+
+#include <memory>
+#include <mutex>
+#include <queue>
+#include <semaphore>
 
 namespace sirius {
 namespace parallel {
@@ -29,7 +33,7 @@ namespace parallel {
  *
  * This class provides a thread-safe queue implementation for scheduling and retrieving
  * downgrade tasks. It uses mutexes and semaphores to ensure safe concurrent access.
- * Currently, it uses a simple FIFO queue (sirius::queue), but future versions may
+ * Currently, it uses a simple FIFO queue (std::queue), but future versions may
  * implement more sophisticated scheduling algorithms such as priority scheduling,
  * task stealing, or work balancing.
  */
@@ -50,7 +54,7 @@ class downgrade_task_queue : public itask_queue {
    */
   void open() override
   {
-    sirius::lock_guard<sirius::mutex> lock(_mutex);
+    std::lock_guard<std::mutex> lock(_mutex);
     _is_open = true;
   }
 
@@ -67,7 +71,7 @@ class downgrade_task_queue : public itask_queue {
     for (int i = 0; i < Config::NUM_DOWNGRADE_EXECUTOR_THREADS; ++i) {
       _sem.release();
     }
-    sirius::lock_guard<sirius::mutex> lock(_mutex);
+    std::lock_guard<std::mutex> lock(_mutex);
     _is_open = false;
   }
 
@@ -77,11 +81,11 @@ class downgrade_task_queue : public itask_queue {
    * @param task The task to be scheduled (must be a downgrade_task)
    * @throws std::runtime_error If the queue is not currently open for accepting tasks
    */
-  void push(sirius::unique_ptr<itask> task) override
+  void push(std::unique_ptr<itask> task) override
   {
     // Convert itask to downgrade_task - since we know it's a downgrade_task
     auto downgrade_task =
-      sirius::unique_ptr<downgrade_task>(static_cast<downgrade_task*>(task.release()));
+      std::unique_ptr<downgrade_task>(static_cast<downgrade_task*>(task.release()));
     push(std::move(downgrade_task));
   }
 
@@ -91,7 +95,7 @@ class downgrade_task_queue : public itask_queue {
    * @param downgrade_task The downgrade task to be scheduled
    * @throws std::runtime_error If the queue is not currently open for accepting tasks
    */
-  void push(sirius::unique_ptr<downgrade_task> downgrade_task)
+  void push(std::unique_ptr<downgrade_task> downgrade_task)
   {
     enqueue_task(std::move(downgrade_task));
   }
@@ -105,7 +109,7 @@ class downgrade_task_queue : public itask_queue {
    * @return A unique pointer to the task to execute, or nullptr if none available
    * @throws std::runtime_error If the queue is closed and not returning tasks
    */
-  sirius::unique_ptr<itask> pull() override
+  std::unique_ptr<itask> pull() override
   {
     // Delegate to downgrade-specific version and return as base type
     auto downgrade_task = pull_downgrade_task();
@@ -121,7 +125,7 @@ class downgrade_task_queue : public itask_queue {
    * @return A unique pointer to the downgrade task to execute, or nullptr if none available
    * @throws std::runtime_error If the queue is closed and not returning tasks
    */
-  sirius::unique_ptr<downgrade_task> pull_downgrade_task() { return dequeue_task(); }
+  std::unique_ptr<downgrade_task> pull_downgrade_task() { return dequeue_task(); }
 
   /**
    * @brief Enqueues a downgrade task into the queue
@@ -131,9 +135,9 @@ class downgrade_task_queue : public itask_queue {
    *
    * @param downgrade_task The downgrade task to enqueue
    */
-  void enqueue_task(sirius::unique_ptr<downgrade_task> downgrade_task)
+  void enqueue_task(std::unique_ptr<downgrade_task> downgrade_task)
   {
-    sirius::lock_guard<sirius::mutex> lock(_mutex);
+    std::lock_guard<std::mutex> lock(_mutex);
     if (downgrade_task && _is_open) { _task_queue.push(std::move(downgrade_task)); }
     _sem.release();  // signal that one item is available
   }
@@ -147,10 +151,10 @@ class downgrade_task_queue : public itask_queue {
    * @return A unique pointer to the dequeued downgrade task, or nullptr if queue is empty and
    * closed
    */
-  sirius::unique_ptr<downgrade_task> dequeue_task()
+  std::unique_ptr<downgrade_task> dequeue_task()
   {
     _sem.acquire();  // wait until there's something
-    sirius::lock_guard<sirius::mutex> lock(_mutex);
+    std::lock_guard<std::mutex> lock(_mutex);
     // If the queue is closed and empty, return nullptr to signal shutdown
     if (!_is_open && _task_queue.empty()) { return nullptr; }
 
@@ -172,15 +176,15 @@ class downgrade_task_queue : public itask_queue {
    */
   bool is_empty() const
   {
-    sirius::lock_guard<sirius::mutex> lock(_mutex);
+    std::lock_guard<std::mutex> lock(_mutex);
     return _task_queue.empty();
   }
 
  private:
-  sirius::queue<sirius::unique_ptr<downgrade_task>>
+  std::queue<std::unique_ptr<downgrade_task>>
     _task_queue;                      ///< FIFO queue storing the downgrade tasks
   bool _is_open = false;              ///< Whether the queue is open for operations
-  mutable sirius::mutex _mutex;       ///< Mutex for thread-safe access (mutable for const methods)
+  mutable std::mutex _mutex;          ///< Mutex for thread-safe access (mutable for const methods)
   std::counting_semaphore<> _sem{0};  ///< Semaphore for blocking/signaling (starts with 0 permits)
 };
 

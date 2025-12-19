@@ -28,7 +28,7 @@
 #include <system_error>
 #include <utility>
 
-namespace sirius {
+namespace cucascade {
 
 template <class... Ts>
 struct overloaded : Ts... {
@@ -83,10 +83,10 @@ const memory_error_category& memory_category();
 
 inline std::error_code make_error_code(MemoryError e);
 
-struct sirius_out_of_memory : public rmm::out_of_memory {
-  explicit sirius_out_of_memory(std::string_view message,
-                                std::size_t requested_bytes,
-                                std::size_t global_usage);
+struct cucascade_out_of_memory : public rmm::out_of_memory {
+  explicit cucascade_out_of_memory(std::string_view message,
+                                   std::size_t requested_bytes,
+                                   std::size_t global_usage);
 
   const std::size_t requested_bytes;
   const std::size_t global_usage;
@@ -207,16 +207,16 @@ std::unique_ptr<rmm::mr::device_memory_resource> make_default_host_memory_resour
 DeviceMemoryResourceFactoryFn make_default_allocator_for_tier(Tier tier);
 
 }  // namespace memory
-}  // namespace sirius
+}  // namespace cucascade
 
 // Specialization for std::hash to enable use of std::pair<Tier, size_t> as key
 namespace std {
 template <>
-struct hash<sirius::memory::memory_space_id> {
-  size_t operator()(const sirius::memory::memory_space_id& p) const;
+struct hash<cucascade::memory::memory_space_id> {
+  size_t operator()(const cucascade::memory::memory_space_id& p) const;
 };
 
 template <>
-struct is_error_code_enum<sirius::memory::MemoryError> : true_type {};
+struct is_error_code_enum<cucascade::memory::MemoryError> : true_type {};
 
 }  // namespace std

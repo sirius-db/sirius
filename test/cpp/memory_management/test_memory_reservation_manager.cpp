@@ -45,7 +45,7 @@
 #include <memory>
 #include <vector>
 
-using namespace sirius::memory;
+using namespace cucascade::memory;
 
 // Expected memory capacities
 const size_t expected_gpu_capacity  = 2ull << 30;  // 2GB

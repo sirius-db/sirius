@@ -22,7 +22,7 @@
 namespace sirius {
 namespace parallel {
 
-void local_task_buffer::produce(sirius::unique_ptr<itask> task)
+void local_task_buffer::produce(std::unique_ptr<itask> task)
 {
   {
     std::lock_guard<std::mutex> lock(_mtx);
@@ -31,7 +31,7 @@ void local_task_buffer::produce(sirius::unique_ptr<itask> task)
   _cv.notify_one();  // wake consumer
 }
 
-sirius::unique_ptr<itask> local_task_buffer::consume()
+std::unique_ptr<itask> local_task_buffer::consume()
 {
   std::unique_lock<std::mutex> lock(_mtx);
   _cv.wait(lock, [&] { return (!_queue.empty()) || !_is_open.load(std::memory_order_acquire); });
@@ -49,16 +49,16 @@ void local_task_buffer::close()
 }
 
 gpu_pipeline_executor::gpu_pipeline_executor(task_executor_config config,
-                                             const memory::memory_space* mem_space,
+                                             const cucascade::memory::memory_space* mem_space,
                                              pipeline_executor* pipeline_exec)
-  : itask_executor(sirius::make_unique<gpu_pipeline_queue>(config.num_threads), config),
-    _local_task_buffer(sirius::make_unique<local_task_buffer>()),
+  : itask_executor(std::make_unique<gpu_pipeline_queue>(config.num_threads), config),
+    _local_task_buffer(std::make_unique<local_task_buffer>()),
     _memory_space_view(mem_space),
     _pipeline_exec(pipeline_exec)
 {
 }
 
-void gpu_pipeline_executor::schedule(sirius::unique_ptr<itask> task)
+void gpu_pipeline_executor::schedule(std::unique_ptr<itask> task)
 {
   _task_queue->push(std::move(task));
 }
@@ -82,11 +82,11 @@ void gpu_pipeline_executor::start()
   on_start();
   _threads.reserve(_config.num_threads);
   for (int i = 0; i < _config.num_threads; ++i) {
-    _threads.push_back(sirius::make_unique<task_executor_thread>(
-      sirius::make_unique<sirius::thread>(&gpu_pipeline_executor::worker_loop, this, i)));
+    _threads.push_back(std::make_unique<task_executor_thread>(
+      std::make_unique<std::thread>(&gpu_pipeline_executor::worker_loop, this, i)));
   }
   _gpu_pipeline_executor_manager_thread =
-    sirius::make_unique<sirius::thread>(&gpu_pipeline_executor::manager_loop, this);
+    std::make_unique<std::thread>(&gpu_pipeline_executor::manager_loop, this);
 }
 
 void gpu_pipeline_executor::stop()
@@ -128,7 +128,7 @@ void gpu_pipeline_executor::worker_loop(int worker_id)
   }
 }
 
-void gpu_pipeline_executor::submit_task_request(sirius::unique_ptr<task_request> request)
+void gpu_pipeline_executor::submit_task_request(std::unique_ptr<task_request> request)
 {
   _pipeline_exec->submit_task_request(std::move(request));
 }

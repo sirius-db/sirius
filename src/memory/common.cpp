@@ -22,7 +22,7 @@
 #include <rmm/cuda_device.hpp>
 #include <rmm/mr/device/cuda_async_memory_resource.hpp>
 
-namespace sirius {
+namespace cucascade {
 
 namespace memory {
 
@@ -50,9 +50,9 @@ std::error_code make_error_code(MemoryError e)
   return std::error_code(static_cast<int>(e), memory_category());
 }
 
-sirius_out_of_memory::sirius_out_of_memory(std::string_view message,
-                                           std::size_t requested_bytes,
-                                           std::size_t global_usage)
+cucascade_out_of_memory::cucascade_out_of_memory(std::string_view message,
+                                                 std::size_t requested_bytes,
+                                                 std::size_t global_usage)
   : rmm::out_of_memory(message.data()), requested_bytes(requested_bytes), global_usage(global_usage)
 {
 }
@@ -69,7 +69,7 @@ std::unique_ptr<rmm::mr::device_memory_resource> make_default_host_memory_resour
                                                                                    size_t limit,
                                                                                    size_t capacity)
 {
-  return std::make_unique<sirius::memory::numa_region_pinned_host_memory_resource>(numa_node_id);
+  return std::make_unique<cucascade::memory::numa_region_pinned_host_memory_resource>(numa_node_id);
 }
 
 DeviceMemoryResourceFactoryFn make_default_allocator_for_tier(Tier tier)
@@ -84,11 +84,11 @@ DeviceMemoryResourceFactoryFn make_default_allocator_for_tier(Tier tier)
 }
 
 }  // namespace memory
-}  // namespace sirius
+}  // namespace cucascade
 
 namespace std {
-size_t hash<sirius::memory::memory_space_id>::operator()(
-  const sirius::memory::memory_space_id& p) const
+size_t hash<cucascade::memory::memory_space_id>::operator()(
+  const cucascade::memory::memory_space_id& p) const
 {
   return p.uuid();
 }

@@ -26,7 +26,7 @@
 #include "memory/memory_reservation.hpp"
 #include "memory/notification_channel.hpp"
 
-namespace sirius {
+namespace cucascade {
 namespace memory {
 
 class disk_access_limiter {
@@ -166,4 +166,4 @@ class disk_access_limiter {
 };
 
 }  // namespace memory
-}  // namespace sirius
+}  // namespace cucascade

@@ -49,13 +49,13 @@ class gpu_aggregate_impl {
    *
    * @return The output data batch with ownership.
    */
-  static sirius::unique_ptr<data_batch> local_ungrouped_aggregate(
-    const data_batch_view& input,
-    const sirius::vector<cudf::aggregation::Kind>& aggregates,
-    const sirius::vector<int>& aggregate_idx,
+  static std::unique_ptr<cucascade::data_batch> local_ungrouped_aggregate(
+    const cucascade::data_batch_view& input,
+    const std::vector<cudf::aggregation::Kind>& aggregates,
+    const std::vector<int>& aggregate_idx,
     rmm::cuda_stream_view stream,
-    memory::memory_space& memory_space,
-    data_repository_manager& data_repository_mgr);
+    cucascade::memory::memory_space& memory_space,
+    cucascade::data_repository_manager& data_repository_mgr);
 
   /**
    * @brief Perform local grouped aggregate on the input data batch.
@@ -70,14 +70,14 @@ class gpu_aggregate_impl {
    *
    * @return The output data batch with ownership.
    */
-  static sirius::unique_ptr<data_batch> local_grouped_aggregate(
-    const data_batch_view& input,
-    const sirius::vector<int>& group_idx,
-    const sirius::vector<cudf::aggregation::Kind>& aggregates,
-    const sirius::vector<int>& aggregate_idx,
+  static std::unique_ptr<cucascade::data_batch> local_grouped_aggregate(
+    const cucascade::data_batch_view& input,
+    const std::vector<int>& group_idx,
+    const std::vector<cudf::aggregation::Kind>& aggregates,
+    const std::vector<int>& aggregate_idx,
     rmm::cuda_stream_view stream,
-    memory::memory_space& memory_space,
-    data_repository_manager& data_repository_mgr);
+    cucascade::memory::memory_space& memory_space,
+    cucascade::data_repository_manager& data_repository_mgr);
 };
 
 }  // namespace op

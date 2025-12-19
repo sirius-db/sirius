@@ -35,12 +35,12 @@ class task_request_queue {
   task_request_queue(size_t num_threads) : _num_threads(num_threads) {};
   void open();
   void close();
-  void push(sirius::unique_ptr<task_request> request);
+  void push(std::unique_ptr<task_request> request);
   unique_ptr<task_request> pull();
 
  private:
   size_t _num_threads;
-  duckdb_moodycamel::BlockingConcurrentQueue<sirius::unique_ptr<task_request>> _request_queue;
+  duckdb_moodycamel::BlockingConcurrentQueue<std::unique_ptr<task_request>> _request_queue;
   std::atomic<bool> _is_open{false};  ///< Whether the queue is open for pushing/pulling tasks
 };
 

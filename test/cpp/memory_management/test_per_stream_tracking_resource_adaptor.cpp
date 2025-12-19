@@ -48,7 +48,7 @@
 
 #include <cuda_runtime.h>
 
-using namespace sirius::memory;
+using namespace cucascade::memory;
 
 // Test fixture for per-stream tracking tests
 class PerStreamTrackingTest {

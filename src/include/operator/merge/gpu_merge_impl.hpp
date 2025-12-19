@@ -49,11 +49,11 @@ class gpu_merge_impl {
    *
    * @return The output data batch with ownership.
    */
-  static sirius::unique_ptr<data_batch> concat(
-    const sirius::vector<sirius::unique_ptr<data_batch_view>>& input,
+  static std::unique_ptr<cucascade::data_batch> concat(
+    const std::vector<std::unique_ptr<cucascade::data_batch_view>>& input,
     rmm::cuda_stream_view stream,
-    memory::memory_space& memory_space,
-    data_repository_manager& data_repository_mgr);
+    cucascade::memory::memory_space& memory_space,
+    cucascade::data_repository_manager& data_repository_mgr);
 
   /**
    * @brief Perform ungrouped merge aggregate on multiple data batches.
@@ -66,12 +66,12 @@ class gpu_merge_impl {
    *
    * @return The output data batch with ownership.
    */
-  static sirius::unique_ptr<data_batch> merge_ungrouped_aggregate(
-    const sirius::vector<sirius::unique_ptr<data_batch_view>>& input,
-    const sirius::vector<cudf::aggregation::Kind>& aggregates,
+  static std::unique_ptr<cucascade::data_batch> merge_ungrouped_aggregate(
+    const std::vector<std::unique_ptr<cucascade::data_batch_view>>& input,
+    const std::vector<cudf::aggregation::Kind>& aggregates,
     rmm::cuda_stream_view stream,
-    memory::memory_space& memory_space,
-    data_repository_manager& data_repository_mgr);
+    cucascade::memory::memory_space& memory_space,
+    cucascade::data_repository_manager& data_repository_mgr);
 
   /**
    * @brief Perform grouped merge aggregate on multiple data batches.
@@ -88,13 +88,13 @@ class gpu_merge_impl {
    *
    * @return The output data batch with ownership.
    */
-  static sirius::unique_ptr<data_batch> merge_grouped_aggregate(
-    const sirius::vector<sirius::unique_ptr<data_batch_view>>& input,
+  static std::unique_ptr<cucascade::data_batch> merge_grouped_aggregate(
+    const std::vector<std::unique_ptr<cucascade::data_batch_view>>& input,
     int num_group_cols,
-    const sirius::vector<cudf::aggregation::Kind>& aggregates,
+    const std::vector<cudf::aggregation::Kind>& aggregates,
     rmm::cuda_stream_view stream,
-    memory::memory_space& memory_space,
-    data_repository_manager& data_repository_mgr);
+    cucascade::memory::memory_space& memory_space,
+    cucascade::data_repository_manager& data_repository_mgr);
 
   /**
    * @brief Perform merge order-by on multiple data batches.
@@ -111,14 +111,14 @@ class gpu_merge_impl {
    *
    * @return The output data batch with ownership.
    */
-  static sirius::unique_ptr<data_batch> merge_order_by(
-    const sirius::vector<sirius::unique_ptr<data_batch_view>>& input,
-    const sirius::vector<int>& order_key_idx,
-    const sirius::vector<cudf::order>& column_order,
-    const sirius::vector<cudf::null_order>& null_precedence,
+  static std::unique_ptr<cucascade::data_batch> merge_order_by(
+    const std::vector<std::unique_ptr<cucascade::data_batch_view>>& input,
+    const std::vector<int>& order_key_idx,
+    const std::vector<cudf::order>& column_order,
+    const std::vector<cudf::null_order>& null_precedence,
     rmm::cuda_stream_view stream,
-    memory::memory_space& memory_space,
-    data_repository_manager& data_repository_mgr);
+    cucascade::memory::memory_space& memory_space,
+    cucascade::data_repository_manager& data_repository_mgr);
 
   /**
    * @brief Perform merge order-by on multiple data batches.
@@ -137,16 +137,16 @@ class gpu_merge_impl {
    *
    * @return The output data batch with ownership.
    */
-  static sirius::unique_ptr<data_batch> merge_top_n(
-    const sirius::vector<sirius::unique_ptr<data_batch_view>>& input,
+  static std::unique_ptr<cucascade::data_batch> merge_top_n(
+    const std::vector<std::unique_ptr<cucascade::data_batch_view>>& input,
     const int limit,
     const int offset,
-    const sirius::vector<int>& order_key_idx,
-    const sirius::vector<cudf::order>& column_order,
-    const sirius::vector<cudf::null_order>& null_precedence,
+    const std::vector<int>& order_key_idx,
+    const std::vector<cudf::order>& column_order,
+    const std::vector<cudf::null_order>& null_precedence,
     rmm::cuda_stream_view stream,
-    memory::memory_space& memory_space,
-    data_repository_manager& data_repository_mgr);
+    cucascade::memory::memory_space& memory_space,
+    cucascade::data_repository_manager& data_repository_mgr);
 };
 
 }  // namespace op

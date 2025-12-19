@@ -38,7 +38,7 @@
 #include <rmm/detail/error.hpp>
 #include <rmm/mr/device/device_memory_resource.hpp>
 
-namespace sirius {
+namespace cucascade {
 namespace memory {
 
 // Forward declarations
@@ -319,4 +319,4 @@ class memory_reservation_manager {
 };
 
 }  // namespace memory
-}  // namespace sirius
+}  // namespace cucascade

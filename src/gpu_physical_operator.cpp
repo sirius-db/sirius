@@ -54,7 +54,7 @@ OperatorResultType GPUPhysicalOperator::Execute(GPUIntermediateRelation& input_r
   throw InternalException("Calling Execute on a node that is not an operator!");
 }
 
-// TODO: Implement Execute for sirius::vector<sirius::unique_ptr<sirius::data_batch_view>>
+// TODO: Implement Execute for std::vector<std::unique_ptr<cucascade::data_batch_view>>
 // input_batch if needed.
 
 //===--------------------------------------------------------------------===//
@@ -181,11 +181,11 @@ GPUPhysicalOperator::port* GPUPhysicalOperator::get_port(std::string_view port_i
   return it->second.get();
 }
 
-::sirius::vector<::sirius::unique_ptr<::sirius::data_batch>> GPUPhysicalOperator::execute(
-  ::sirius::vector<::sirius::unique_ptr<::sirius::data_batch_view>> input_batch)
+::std::vector<::std::unique_ptr<::cucascade::data_batch>> GPUPhysicalOperator::execute(
+  ::std::vector<::std::unique_ptr<::cucascade::data_batch_view>> input_batch)
 {
   // not doing anything for now
-  return ::sirius::vector<::sirius::unique_ptr<::sirius::data_batch>>{};
+  return ::std::vector<::std::unique_ptr<::cucascade::data_batch>>{};
 }
 
 void GPUPhysicalOperator::add_next_port_after_sink(

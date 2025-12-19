@@ -49,13 +49,13 @@ class gpu_partition_impl {
    *
    * @return The output data batch with ownership.
    */
-  static sirius::vector<sirius::unique_ptr<data_batch>> hash_partition(
-    const data_batch_view& input,
-    const sirius::vector<int>& partition_key_idx,
+  static std::vector<std::unique_ptr<cucascade::data_batch>> hash_partition(
+    const cucascade::data_batch_view& input,
+    const std::vector<int>& partition_key_idx,
     int num_partitions,
     rmm::cuda_stream_view stream,
-    memory::memory_space& memory_space,
-    data_repository_manager& data_repository_mgr);
+    cucascade::memory::memory_space& memory_space,
+    cucascade::data_repository_manager& data_repository_mgr);
 
   /**
    * @brief Perform evenly partitioning on the input data batch.
@@ -68,12 +68,12 @@ class gpu_partition_impl {
    *
    * @return The output data batch with ownership.
    */
-  static sirius::vector<sirius::unique_ptr<data_batch>> evenly_partition(
-    const data_batch_view& input,
+  static std::vector<std::unique_ptr<cucascade::data_batch>> evenly_partition(
+    const cucascade::data_batch_view& input,
     int num_partitions,
     rmm::cuda_stream_view stream,
-    memory::memory_space& memory_space,
-    data_repository_manager& data_repository_mgr);
+    cucascade::memory::memory_space& memory_space,
+    cucascade::data_repository_manager& data_repository_mgr);
 };
 
 }  // namespace op

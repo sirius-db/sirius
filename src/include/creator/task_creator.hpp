@@ -16,10 +16,13 @@
 
 #pragma once
 
-#include "helper/helper.hpp"
 #include "task_executor.hpp"
 
+#include <atomic>
 #include <condition_variable>
+#include <memory>
+#include <mutex>
+#include <thread>
 
 namespace sirius {
 
@@ -55,12 +58,12 @@ class itask_creator {
   virtual uint64_t get_next_task_id();
 
  protected:
-  sirius::atomic<bool> _running;
-  sirius::unique_ptr<parallel::task_executor_thread> _thread;
-  sirius::atomic<uint64_t> _next_task_id = 0;  ///< Atomic counter for generating unique task IDs
-  sirius::mutex _mtx;                          ///< Mutex for synchronization
-  std::condition_variable _cv;                 ///< Condition variable for thread coordination
-  bool _ready = false;                         ///< Flag indicating readiness state
+  std::atomic<bool> _running;
+  std::unique_ptr<parallel::task_executor_thread> _thread;
+  std::atomic<uint64_t> _next_task_id = 0;  ///< Atomic counter for generating unique task IDs
+  std::mutex _mtx;                          ///< Mutex for synchronization
+  std::condition_variable _cv;              ///< Condition variable for thread coordination
+  bool _ready = false;                      ///< Flag indicating readiness state
 };
 
 }  // namespace sirius

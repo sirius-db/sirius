@@ -16,13 +16,15 @@
 
 #pragma once
 
-#include "helper/helper.hpp"
 #include "memory/memory_space.hpp"
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/mr/device/device_memory_resource.hpp>
 
-namespace sirius {
+#include <cstddef>
+#include <memory>
+
+namespace cucascade {
 
 /**
  * @brief Interface representing a data representation residing in a specific memory tier.
@@ -41,7 +43,9 @@ class idata_representation {
    *
    * @param memory_space The memory space where the data resides
    */
-  idata_representation(sirius::memory::memory_space& memory_space) : _memory_space(memory_space) {}
+  idata_representation(cucascade::memory::memory_space& memory_space) : _memory_space(memory_space)
+  {
+  }
 
   /**
    * @brief Virtual destructor to ensure proper cleanup of derived classes
@@ -74,11 +78,11 @@ class idata_representation {
    *
    * @param target_memory_space The target memory space to convert to
    * @param stream CUDA stream to use for memory operations
-   * @return sirius::unique_ptr<idata_representation> A new data representation in the target memory
+   * @return std::unique_ptr<idata_representation> A new data representation in the target memory
    * space
    */
-  virtual sirius::unique_ptr<idata_representation> convert_to_memory_space(
-    const sirius::memory::memory_space* target_memory_space, rmm::cuda_stream_view stream) = 0;
+  virtual std::unique_ptr<idata_representation> convert_to_memory_space(
+    const cucascade::memory::memory_space* target_memory_space, rmm::cuda_stream_view stream) = 0;
 
   /**
    * @brief Safely casts this interface to a specific derived type
@@ -105,7 +109,7 @@ class idata_representation {
   }
 
  private:
-  sirius::memory::memory_space& _memory_space;  ///< The memory space where the data resides
+  cucascade::memory::memory_space& _memory_space;  ///< The memory space where the data resides
 };
 
-}  // namespace sirius
+}  // namespace cucascade

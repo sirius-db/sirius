@@ -17,14 +17,14 @@
 #pragma once
 
 #include "data/common.hpp"
-#include "helper/helper.hpp"
 #include "memory/fixed_size_host_memory_resource.hpp"
 #include "memory/host_table.hpp"
 #include "memory/memory_space.hpp"
 
+#include <memory>
 #include <vector>
 
-namespace sirius {
+namespace cucascade {
 
 /**
  * @brief Data representation for a table being stored in host memory.
@@ -42,8 +42,8 @@ class host_table_representation : public idata_representation {
    * @param meta Metadata required to reconstruct the cuDF columns (using cudf::unpack())
    * @param size The size of the actual data in bytes
    */
-  host_table_representation(sirius::unique_ptr<sirius::memory::host_table_allocation> host_table,
-                            sirius::memory::memory_space* memory_space);
+  host_table_representation(std::unique_ptr<cucascade::memory::host_table_allocation> host_table,
+                            cucascade::memory::memory_space* memory_space);
 
   /**
    * @brief Get the size of the data representation in bytes
@@ -55,25 +55,25 @@ class host_table_representation : public idata_representation {
   /**
    * @brief Get the underlying host table allocation
    *
-   * @return sirius::unique_ptr<sirius::memory::table_allocation> The underlying host table
+   * @return std::unique_ptr<cucascade::memory::table_allocation> The underlying host table
    * allocation
    */
-  const sirius::unique_ptr<sirius::memory::host_table_allocation>& get_host_table() const;
+  const std::unique_ptr<cucascade::memory::host_table_allocation>& get_host_table() const;
 
   /**
    * @brief Convert this CPU table representation to a different memory tier
    *
    * @param target_memory_space The target memory space to convert to
    * @param stream CUDA stream to use for memory operations
-   * @return sirius::unique_ptr<idata_representation> A new data representation in the target tier
+   * @return std::unique_ptr<idata_representation> A new data representation in the target tier
    */
-  sirius::unique_ptr<idata_representation> convert_to_memory_space(
-    const sirius::memory::memory_space* target_memory_space,
+  std::unique_ptr<idata_representation> convert_to_memory_space(
+    const cucascade::memory::memory_space* target_memory_space,
     rmm::cuda_stream_view stream = rmm::cuda_stream_default) override;
 
  private:
-  sirius::unique_ptr<sirius::memory::host_table_allocation>
+  std::unique_ptr<cucascade::memory::host_table_allocation>
     _host_table;  ///< The allocation where the actual data resides
 };
 
-}  // namespace sirius
+}  // namespace cucascade

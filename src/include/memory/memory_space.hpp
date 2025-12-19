@@ -34,7 +34,7 @@
 #include <rmm/mr/device/device_memory_resource.hpp>
 #include <rmm/resource_ref.hpp>
 
-namespace sirius {
+namespace cucascade {
 namespace memory {
 
 // Forward declaration
@@ -155,4 +155,4 @@ struct memory_space_hash {
 };
 
 }  // namespace memory
-}  // namespace sirius
+}  // namespace cucascade

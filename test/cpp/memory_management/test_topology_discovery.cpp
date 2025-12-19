@@ -34,7 +34,7 @@
 #include <cstdlib>
 #include <vector>
 
-using namespace sirius::memory;
+using namespace cucascade::memory;
 
 // Test topology discovery
 TEST_CASE("Topology Discovery", "[hw_topology]")

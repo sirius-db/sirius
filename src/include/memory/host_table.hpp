@@ -17,9 +17,12 @@
 #pragma once
 
 #include "fixed_size_host_memory_resource.hpp"
-#include "helper/helper.hpp"
 
-namespace sirius {
+#include <cstdint>
+#include <memory>
+#include <vector>
+
+namespace cucascade {
 namespace memory {
 
 /**
@@ -31,11 +34,11 @@ namespace memory {
  */
 struct host_table_allocation {
   memory::fixed_multiple_blocks_allocation allocation;
-  sirius::unique_ptr<sirius::vector<uint8_t>> metadata;
+  std::unique_ptr<std::vector<uint8_t>> metadata;
   std::size_t data_size;
 
   host_table_allocation(memory::fixed_multiple_blocks_allocation alloc,
-                        sirius::unique_ptr<sirius::vector<uint8_t>> meta,
+                        std::unique_ptr<std::vector<uint8_t>> meta,
                         std::size_t data_sz)
     : allocation(std::move(alloc)), metadata(std::move(meta)), data_size(data_sz)
   {
@@ -43,4 +46,4 @@ struct host_table_allocation {
 };
 
 }  // namespace memory
-}  // namespace sirius
+}  // namespace cucascade

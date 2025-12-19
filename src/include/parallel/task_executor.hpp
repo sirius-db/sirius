@@ -16,21 +16,24 @@
 
 #pragma once
 
-#include "helper/helper.hpp"
 #include "task_queue.hpp"
 
+#include <atomic>
 #include <condition_variable>
+#include <memory>
+#include <thread>
+#include <vector>
 
 namespace sirius {
 namespace parallel {
 
 struct task_executor_thread {
-  explicit task_executor_thread(sirius::unique_ptr<std::thread> thread)
+  explicit task_executor_thread(std::unique_ptr<std::thread> thread)
     : _internal_thread(std::move(thread))
   {
   }
 
-  sirius::unique_ptr<std::thread> _internal_thread;
+  std::unique_ptr<std::thread> _internal_thread;
 };
 
 struct task_executor_config {
@@ -44,7 +47,7 @@ struct task_executor_config {
  */
 class itask_executor {
  public:
-  itask_executor(sirius::unique_ptr<itask_queue> task_queue, task_executor_config config)
+  itask_executor(std::unique_ptr<itask_queue> task_queue, task_executor_config config)
     : _task_queue(std::move(task_queue)), _config(config), _running(false)
   {
   }
@@ -64,24 +67,22 @@ class itask_executor {
   virtual void stop();
 
   // Schedule a task.
-  virtual void schedule(sirius::unique_ptr<itask> task);
+  virtual void schedule(std::unique_ptr<itask> task);
 
  protected:
   // Helper functions.
   virtual void on_start();
   virtual void on_stop();
-  virtual void on_task_error(int worker_id,
-                             sirius::unique_ptr<itask> task,
-                             const std::exception& e);
+  virtual void on_task_error(int worker_id, std::unique_ptr<itask> task, const std::exception& e);
 
   // Main thread loop.
   virtual void worker_loop(int worker_id);
 
  protected:
-  sirius::unique_ptr<itask_queue> _task_queue;
+  std::unique_ptr<itask_queue> _task_queue;
   task_executor_config _config;
-  sirius::atomic<bool> _running;
-  sirius::vector<sirius::unique_ptr<task_executor_thread>> _threads;
+  std::atomic<bool> _running;
+  std::vector<std::unique_ptr<task_executor_thread>> _threads;
 };
 
 }  // namespace parallel

@@ -14,11 +14,11 @@
  * limitations under the License.
  */
 
-#include "downgrade/downgrade_task_creator.hpp"
+#include "creator/downgrade_task_creator.hpp"
 
 namespace sirius {
 
-void downgrade_task_creator::schedule(sirius::unique_ptr<parallel::downgrade_task> downgrade_task)
+void downgrade_task_creator::schedule(std::unique_ptr<parallel::downgrade_task> downgrade_task)
 {
   // Downgrade-specific scheduling logic
   // Schedule the downgrade task using the downgrade_task_queue

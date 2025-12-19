@@ -37,7 +37,7 @@ class downgrade_task_creator : public itask_creator {
    * batches
    * @param downgrade_exec Reference to the downgrade executor for task execution
    */
-  downgrade_task_creator(data_repository_manager& data_repo_mgr,
+  downgrade_task_creator(cucascade::data_repository_manager& data_repo_mgr,
                          parallel::downgrade_executor& downgrade_exec)
     : itask_creator(), _data_repo_mgr(data_repo_mgr), _downgrade_exec(downgrade_exec)
   {
@@ -67,10 +67,11 @@ class downgrade_task_creator : public itask_creator {
    *
    * @param downgrade_task The downgrade task to schedule for execution
    */
-  void schedule(sirius::unique_ptr<parallel::downgrade_task> downgrade_task);
+  void schedule(std::unique_ptr<parallel::downgrade_task> downgrade_task);
 
  private:
-  data_repository_manager& _data_repo_mgr;  ///< Reference to the data repository for data access
+  cucascade::data_repository_manager&
+    _data_repo_mgr;  ///< Reference to the data repository for data access
   parallel::downgrade_executor&
     _downgrade_exec;  ///< Reference to the downgrade executor for task execution
 };

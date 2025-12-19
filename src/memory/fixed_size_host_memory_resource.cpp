@@ -28,7 +28,7 @@
 #include <mutex>
 #include <stdexcept>
 
-namespace sirius {
+namespace cucascade {
 namespace memory {
 
 namespace {
@@ -340,4 +340,4 @@ std::size_t fixed_size_host_memory_resource::do_reserve_upto(std::size_t bytes,
 }
 
 }  // namespace memory
-}  // namespace sirius
+}  // namespace cucascade

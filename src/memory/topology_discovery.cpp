@@ -19,7 +19,7 @@
 
 namespace fs = std::filesystem;
 
-namespace sirius::memory {
+namespace cucascade::memory {
 
 namespace {
 
@@ -626,4 +626,4 @@ bool topology_discovery::discover()
   return true;
 }
 
-}  // namespace sirius::memory
+}  // namespace cucascade::memory

@@ -24,7 +24,7 @@
 #include <condition_variable>
 #include <mutex>
 
-namespace sirius {
+namespace cucascade {
 namespace memory {
 
 class exclusive_stream_pool;
@@ -102,4 +102,4 @@ class exclusive_stream_pool {
 };
 
 }  // namespace memory
-}  // namespace sirius
+}  // namespace cucascade

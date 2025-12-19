@@ -24,11 +24,11 @@
 namespace sirius {
 namespace op {
 
-sirius::unique_ptr<data_batch> gpu_merge_impl::concat(
-  const sirius::vector<sirius::unique_ptr<data_batch_view>>& input,
+std::unique_ptr<cucascade::data_batch> gpu_merge_impl::concat(
+  const std::vector<std::unique_ptr<cucascade::data_batch_view>>& input,
   rmm::cuda_stream_view stream,
-  memory::memory_space& memory_space,
-  data_repository_manager& data_repository_mgr)
+  cucascade::memory::memory_space& memory_space,
+  cucascade::data_repository_manager& data_repository_mgr)
 {
   // Sanity check.
   if (input.size() < 2) {
@@ -36,7 +36,7 @@ sirius::unique_ptr<data_batch> gpu_merge_impl::concat(
   }
 
   // Pull input cudf tables and merge.
-  sirius::vector<cudf::table_view> input_cudf_table_views;
+  std::vector<cudf::table_view> input_cudf_table_views;
   input_cudf_table_views.resize(input.size());
   for (int i = 0; i < input.size(); ++i) {
     input_cudf_table_views[i] = input[i]->get_cudf_table_view();
@@ -46,18 +46,18 @@ sirius::unique_ptr<data_batch> gpu_merge_impl::concat(
 
   // Create output data batch.
   auto gpu_table_representation =
-    sirius::make_unique<sirius::gpu_table_representation>(*output_cudf_table, memory_space);
-  return sirius::make_unique<sirius::data_batch>(data_repository_mgr.get_next_data_batch_id(),
+    std::make_unique<cucascade::gpu_table_representation>(*output_cudf_table, memory_space);
+  return std::make_unique<cucascade::data_batch>(data_repository_mgr.get_next_data_batch_id(),
                                                  data_repository_mgr,
                                                  std::move(gpu_table_representation));
 }
 
-sirius::unique_ptr<data_batch> gpu_merge_impl::merge_ungrouped_aggregate(
-  const sirius::vector<sirius::unique_ptr<data_batch_view>>& input,
-  const sirius::vector<cudf::aggregation::Kind>& aggregates,
+std::unique_ptr<cucascade::data_batch> gpu_merge_impl::merge_ungrouped_aggregate(
+  const std::vector<std::unique_ptr<cucascade::data_batch_view>>& input,
+  const std::vector<cudf::aggregation::Kind>& aggregates,
   rmm::cuda_stream_view stream,
-  memory::memory_space& memory_space,
-  data_repository_manager& data_repository_mgr)
+  cucascade::memory::memory_space& memory_space,
+  cucascade::data_repository_manager& data_repository_mgr)
 {
   // Sanity check.
   if (input.size() < 2) {
@@ -66,7 +66,7 @@ sirius::unique_ptr<data_batch> gpu_merge_impl::merge_ungrouped_aggregate(
   }
 
   // Pull input cudf tables and concatenate.
-  sirius::vector<cudf::table_view> input_cudf_table_views;
+  std::vector<cudf::table_view> input_cudf_table_views;
   input_cudf_table_views.resize(input.size());
   for (int i = 0; i < input.size(); ++i) {
     input_cudf_table_views[i] = input[i]->get_cudf_table_view();
@@ -79,9 +79,9 @@ sirius::unique_ptr<data_batch> gpu_merge_impl::merge_ungrouped_aggregate(
     cudf::concatenate(input_cudf_table_views, stream, memory_space.get_default_allocator());
 
   // Aggregate on the concatenated table
-  sirius::vector<sirius::unique_ptr<cudf::column>> output_cudf_cols;
+  std::vector<std::unique_ptr<cudf::column>> output_cudf_cols;
   for (int c = 0; c < aggregates.size(); ++c) {
-    sirius::unique_ptr<cudf::reduce_aggregation> reduce_aggregation = nullptr;
+    std::unique_ptr<cudf::reduce_aggregation> reduce_aggregation = nullptr;
     cudf::data_type output_type = concatenated->get_column(c).type();
     switch (aggregates[c]) {
       case cudf::aggregation::Kind::MIN: {
@@ -129,23 +129,23 @@ sirius::unique_ptr<data_batch> gpu_merge_impl::merge_ungrouped_aggregate(
     output_cudf_cols.push_back(cudf::make_column_from_scalar(
       *output_scalar, 1, stream, memory_space.get_default_allocator()));
   }
-  auto output_cudf_table = sirius::make_unique<cudf::table>(std::move(output_cudf_cols));
+  auto output_cudf_table = std::make_unique<cudf::table>(std::move(output_cudf_cols));
 
   // Create output data batch.
   auto gpu_table_representation =
-    sirius::make_unique<sirius::gpu_table_representation>(*output_cudf_table, memory_space);
-  return sirius::make_unique<sirius::data_batch>(data_repository_mgr.get_next_data_batch_id(),
+    std::make_unique<cucascade::gpu_table_representation>(*output_cudf_table, memory_space);
+  return std::make_unique<cucascade::data_batch>(data_repository_mgr.get_next_data_batch_id(),
                                                  data_repository_mgr,
                                                  std::move(gpu_table_representation));
 }
 
-sirius::unique_ptr<data_batch> gpu_merge_impl::merge_grouped_aggregate(
-  const sirius::vector<sirius::unique_ptr<data_batch_view>>& input,
+std::unique_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
+  const std::vector<std::unique_ptr<cucascade::data_batch_view>>& input,
   int num_group_cols,
-  const sirius::vector<cudf::aggregation::Kind>& aggregates,
+  const std::vector<cudf::aggregation::Kind>& aggregates,
   rmm::cuda_stream_view stream,
-  memory::memory_space& memory_space,
-  data_repository_manager& data_repository_mgr)
+  cucascade::memory::memory_space& memory_space,
+  cucascade::data_repository_manager& data_repository_mgr)
 {
   // Sanity check.
   if (input.size() < 2) {
@@ -154,7 +154,7 @@ sirius::unique_ptr<data_batch> gpu_merge_impl::merge_grouped_aggregate(
   }
 
   // Pull input cudf tables and concatenate.
-  sirius::vector<cudf::table_view> input_cudf_table_views;
+  std::vector<cudf::table_view> input_cudf_table_views;
   input_cudf_table_views.resize(input.size());
   for (int i = 0; i < input.size(); ++i) {
     input_cudf_table_views[i] = input[i]->get_cudf_table_view();
@@ -169,13 +169,13 @@ sirius::unique_ptr<data_batch> gpu_merge_impl::merge_grouped_aggregate(
   // Create cudf groupby and make aggregation requests.
   // Here we don't need to explicitly cast input/output for count or sum of integers,
   // because cudf groupby produces INT64 for sum of integers (both signed and unsigned).
-  sirius::vector<cudf::column_view> group_cols;
+  std::vector<cudf::column_view> group_cols;
   for (int c = 0; c < num_group_cols; ++c) {
     group_cols.push_back(concatenated->get_column(c).view());
   }
   cudf::groupby::groupby grpby_obj(cudf::table_view(group_cols), cudf::null_policy::INCLUDE);
-  sirius::vector<cudf::groupby::aggregation_request> requests;
-  sirius::vector<sirius::unique_ptr<cudf::column>> cast_columns;
+  std::vector<cudf::groupby::aggregation_request> requests;
+  std::vector<std::unique_ptr<cudf::column>> cast_columns;
   for (int i = 0; i < aggregates.size(); ++i) {
     int aggregate_col_id = num_group_cols + i;
     cudf::groupby::aggregation_request request;
@@ -207,22 +207,22 @@ sirius::unique_ptr<data_batch> gpu_merge_impl::merge_grouped_aggregate(
   }
 
   // Create the output data batch
-  auto output_table = sirius::make_unique<cudf::table>(std::move(output_cols));
+  auto output_table = std::make_unique<cudf::table>(std::move(output_cols));
   auto gpu_table_representation =
-    sirius::make_unique<sirius::gpu_table_representation>(*output_table, memory_space);
-  return sirius::make_unique<sirius::data_batch>(data_repository_mgr.get_next_data_batch_id(),
+    std::make_unique<cucascade::gpu_table_representation>(*output_table, memory_space);
+  return std::make_unique<cucascade::data_batch>(data_repository_mgr.get_next_data_batch_id(),
                                                  data_repository_mgr,
                                                  std::move(gpu_table_representation));
 }
 
-sirius::unique_ptr<data_batch> gpu_merge_impl::merge_order_by(
-  const sirius::vector<sirius::unique_ptr<data_batch_view>>& input,
-  const sirius::vector<int>& order_key_idx,
-  const sirius::vector<cudf::order>& column_order,
-  const sirius::vector<cudf::null_order>& null_precedence,
+std::unique_ptr<cucascade::data_batch> gpu_merge_impl::merge_order_by(
+  const std::vector<std::unique_ptr<cucascade::data_batch_view>>& input,
+  const std::vector<int>& order_key_idx,
+  const std::vector<cudf::order>& column_order,
+  const std::vector<cudf::null_order>& null_precedence,
   rmm::cuda_stream_view stream,
-  memory::memory_space& memory_space,
-  data_repository_manager& data_repository_mgr)
+  cucascade::memory::memory_space& memory_space,
+  cucascade::data_repository_manager& data_repository_mgr)
 {
   // Sanity check.
   if (input.size() < 2) {
@@ -237,7 +237,7 @@ sirius::unique_ptr<data_batch> gpu_merge_impl::merge_order_by(
   }
 
   // Pull input cudf tables and merge.
-  sirius::vector<cudf::table_view> input_tables;
+  std::vector<cudf::table_view> input_tables;
   input_tables.resize(input.size());
   for (int i = 0; i < input.size(); ++i) {
     input_tables[i] = input[i]->get_cudf_table_view();
@@ -251,22 +251,22 @@ sirius::unique_ptr<data_batch> gpu_merge_impl::merge_order_by(
 
   // Create the output data batch
   auto gpu_table_representation =
-    sirius::make_unique<sirius::gpu_table_representation>(*output_table, memory_space);
-  return sirius::make_unique<sirius::data_batch>(data_repository_mgr.get_next_data_batch_id(),
+    std::make_unique<cucascade::gpu_table_representation>(*output_table, memory_space);
+  return std::make_unique<cucascade::data_batch>(data_repository_mgr.get_next_data_batch_id(),
                                                  data_repository_mgr,
                                                  std::move(gpu_table_representation));
 }
 
-sirius::unique_ptr<data_batch> gpu_merge_impl::merge_top_n(
-  const sirius::vector<sirius::unique_ptr<data_batch_view>>& input,
+std::unique_ptr<cucascade::data_batch> gpu_merge_impl::merge_top_n(
+  const std::vector<std::unique_ptr<cucascade::data_batch_view>>& input,
   const int limit,
   const int offset,
-  const sirius::vector<int>& order_key_idx,
-  const sirius::vector<cudf::order>& column_order,
-  const sirius::vector<cudf::null_order>& null_precedence,
+  const std::vector<int>& order_key_idx,
+  const std::vector<cudf::order>& column_order,
+  const std::vector<cudf::null_order>& null_precedence,
   rmm::cuda_stream_view stream,
-  memory::memory_space& memory_space,
-  data_repository_manager& data_repository_mgr)
+  cucascade::memory::memory_space& memory_space,
+  cucascade::data_repository_manager& data_repository_mgr)
 {
   // Sanity check.
   if (input.size() < 2) {
@@ -280,7 +280,7 @@ sirius::unique_ptr<data_batch> gpu_merge_impl::merge_top_n(
   }
 
   // Pull input cudf tables and merge.
-  sirius::vector<cudf::table_view> input_tables;
+  std::vector<cudf::table_view> input_tables;
   input_tables.resize(input.size());
   for (int i = 0; i < input.size(); ++i) {
     input_tables[i] = input[i]->get_cudf_table_view();
@@ -293,17 +293,17 @@ sirius::unique_ptr<data_batch> gpu_merge_impl::merge_top_n(
                                   memory_space.get_default_allocator());
 
   // Process limit and offset
-  sirius::unique_ptr<cudf::table> output_table = nullptr;
+  std::unique_ptr<cudf::table> output_table = nullptr;
   if (offset >= merged_table->num_rows()) {
-    sirius::vector<sirius::unique_ptr<cudf::column>> empty_cols;
+    std::vector<std::unique_ptr<cudf::column>> empty_cols;
     for (int c = 0; c < merged_table->num_columns(); ++c) {
       empty_cols.push_back(cudf::make_empty_column(merged_table->get_column(c).type()));
     }
-    output_table = sirius::make_unique<cudf::table>(std::move(empty_cols));
+    output_table = std::make_unique<cudf::table>(std::move(empty_cols));
   } else if (offset == 0 && limit >= merged_table->num_rows()) {
     output_table = std::move(merged_table);
   } else {
-    output_table = sirius::make_unique<cudf::table>(
+    output_table = std::make_unique<cudf::table>(
       cudf::slice(merged_table->view(),
                   {offset, std::min(merged_table->num_rows(), offset + limit)},
                   stream)[0],
@@ -313,8 +313,8 @@ sirius::unique_ptr<data_batch> gpu_merge_impl::merge_top_n(
 
   // Create the output data batch
   auto gpu_table_representation =
-    sirius::make_unique<sirius::gpu_table_representation>(*output_table, memory_space);
-  return sirius::make_unique<sirius::data_batch>(data_repository_mgr.get_next_data_batch_id(),
+    std::make_unique<cucascade::gpu_table_representation>(*output_table, memory_space);
+  return std::make_unique<cucascade::data_batch>(data_repository_mgr.get_next_data_batch_id(),
                                                  data_repository_mgr,
                                                  std::move(gpu_table_representation));
 }

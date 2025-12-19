@@ -19,7 +19,7 @@
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/mr/device/device_memory_resource.hpp>
 
-namespace sirius {
+namespace cucascade {
 namespace memory {
 
 /**
@@ -43,4 +43,4 @@ class null_device_memory_resource : public rmm::mr::device_memory_resource {
 };
 
 }  // namespace memory
-}  // namespace sirius
+}  // namespace cucascade

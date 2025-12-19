@@ -27,7 +27,7 @@
 
 #include <fmt/core.h>
 
-namespace sirius {
+namespace cucascade {
 namespace memory {
 
 struct oom_handling_policy {
@@ -71,4 +71,4 @@ inline std::unique_ptr<oom_handling_policy> make_default_oom_policy()
 }
 
 }  // namespace memory
-}  // namespace sirius
+}  // namespace cucascade

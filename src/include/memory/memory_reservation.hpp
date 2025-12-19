@@ -29,7 +29,7 @@
 #include <string>
 #include <utility>
 
-namespace sirius {
+namespace cucascade {
 namespace memory {
 
 // Forward declarations
@@ -267,4 +267,4 @@ struct reservation {
 };
 
 }  // namespace memory
-}  // namespace sirius
+}  // namespace cucascade

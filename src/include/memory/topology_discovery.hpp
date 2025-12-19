@@ -9,7 +9,7 @@
 #include <string>
 #include <vector>
 
-namespace sirius::memory {
+namespace cucascade::memory {
 
 /**
  * @brief GPU information.
@@ -82,7 +82,7 @@ enum class PciePathType {
  *
  * Example usage:
  * @code
- * sirius::memory:topology_discovery discovery;
+ * cucascade::memory:topology_discovery discovery;
  * if (discovery.discover()) {
  *     auto topology = discovery.get_topology();
  * }
@@ -119,4 +119,4 @@ class topology_discovery {
   std::optional<system_topology_info> topology_;  ///< Discovered topology information.
 };
 
-}  // namespace sirius::memory
+}  // namespace cucascade::memory

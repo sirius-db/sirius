@@ -32,11 +32,11 @@ void pipeline_queue::close()
   }
 }
 
-void pipeline_queue::push(sirius::unique_ptr<itask> task) { _task_queue.enqueue(std::move(task)); }
+void pipeline_queue::push(std::unique_ptr<itask> task) { _task_queue.enqueue(std::move(task)); }
 
-sirius::unique_ptr<itask> pipeline_queue::pull()
+std::unique_ptr<itask> pipeline_queue::pull()
 {
-  sirius::unique_ptr<itask> task;
+  std::unique_ptr<itask> task;
   while (true) {
     if (_task_queue.try_dequeue(task)) { return task; }
 

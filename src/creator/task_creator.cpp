@@ -23,8 +23,8 @@ void itask_creator::start()
 {
   bool expected = false;
   if (!_running.compare_exchange_strong(expected, true)) { return; }
-  _thread = sirius::make_unique<parallel::task_executor_thread>(
-    sirius::make_unique<sirius::thread>(&itask_creator::worker_loop, this));
+  _thread = std::make_unique<parallel::task_executor_thread>(
+    std::make_unique<std::thread>(&itask_creator::worker_loop, this));
 }
 
 void itask_creator::stop()
