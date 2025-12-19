@@ -40,7 +40,6 @@
 #include <duckdb/parallel/thread_context.hpp>
 
 // standard library
-#include <chrono>
 #include <cstdint>
 #include <iostream>
 #include <memory>
@@ -120,6 +119,7 @@ class test_scan_task : public parallel::duckdb_scan_task {
     }
 
     // Append data from column_builders to staging table
+    // NOTE: this makes the scan slow due to mutex and row-wise appends
     append_to_table(l_state);
   }
 
@@ -161,9 +161,7 @@ class test_scan_task : public parallel::duckdb_scan_task {
     if (!allocation) { throw std::runtime_error("Allocation is null in append_to_table"); }
 
     // First, reset the cursors of all column builders to their initial positions
-    for (size_t col = 0; col < column_builders.size(); ++col) {
-      auto& builder = column_builders[col];
-
+    for (auto& builder : column_builders) {
       // Reset accessors to their starting byte offsets in the packed allocation
       builder.data_blocks_accessor.reset_cursor();
       builder.mask_blocks_accessor.reset_cursor();
@@ -177,8 +175,7 @@ class test_scan_task : public parallel::duckdb_scan_task {
     for (size_t i = 0; i < num_rows; ++i) {
       app.BeginRow();
 
-      for (size_t col = 0; col < column_builders.size(); ++col) {
-        auto& builder    = column_builders[col];
+      for (auto& builder : column_builders) {
         auto const& type = builder.type;
 
         // Check validity - advance mask accessor every 8 rows
@@ -329,9 +326,9 @@ static void create_synthetic_table(duckdb::Connection& con,
     for (size_t i = start; i < end; ++i) {
       if (i > start) { insert_sql += ", "; }
       // Generate predictable test data
-      int32_t id       = static_cast<int32_t>(i);
-      int64_t value    = static_cast<int64_t>(i * 100);
-      double price     = static_cast<double>(i) * 1.5;
+      auto id          = static_cast<int32_t>(i);
+      auto value       = static_cast<int64_t>(i * 100);
+      auto price       = static_cast<double>(i) * 1.5;
       std::string name = "item_" + std::to_string(i);
 
       insert_sql += "(" + std::to_string(id) + ", " + std::to_string(value) + ", " +
@@ -483,9 +480,9 @@ static void run_scan_test(std::string const& table_name,
   initialize_memory_manager();
 
   // Verify memory manager is initialized
-  auto& mem_mgr    = memory::memory_reservation_manager::get_instance();
-  auto host_spaces = mem_mgr.get_memory_spaces_for_tier(memory::Tier::HOST);
-  REQUIRE(host_spaces.size() > 0);
+  auto& mem_mgr   = memory::memory_reservation_manager::get_instance();
+  auto* mem_space = mem_mgr.get_memory_space(memory::Tier::HOST, 0);
+  REQUIRE(mem_space != nullptr);
 
   // Setup DuckDB database
   duckdb::DuckDB db(nullptr);
@@ -572,7 +569,8 @@ static void run_scan_test(std::string const& table_name,
 
 TEST_CASE("scan_executor - single threaded small table", "[scan_executor][single_thread]")
 {
-  run_scan_test("test_small", 100, 1, 1000000, 1);
+  // Use 10MB batch size to ensure multiple 1MB blocks are allocated
+  run_scan_test("test_small", 100, 1, 10000000, 1);
 }
 
 TEST_CASE("scan_executor - single threaded with small batches", "[scan_executor][single_thread]")
@@ -602,13 +600,7 @@ TEST_CASE("scan_executor - multi threaded medium table", "[scan_executor][multi_
 
 TEST_CASE("scan_executor - multi threaded large table", "[scan_executor][multi_thread]")
 {
-  auto start = std::chrono::high_resolution_clock::now();
-
   run_scan_test("test_mt_large", 500000, 8, 1000000, 5);
-
-  auto end      = std::chrono::high_resolution_clock::now();
-  auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-  std::cout << "Multi-threaded scan (8 threads) of 500000 rows took " << duration.count() << "ms\n";
 }
 
 //===----------------------------------------------------------------------===//

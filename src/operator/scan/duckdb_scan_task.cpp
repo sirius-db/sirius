@@ -23,6 +23,7 @@
 #include <duckdb/common/types.hpp>
 #include <duckdb/function/table_function.hpp>
 
+// standard library
 #include <cstddef>
 
 namespace sirius::parallel {
@@ -75,6 +76,9 @@ duckdb_scan_task_local_state::column_builder::column_builder(duckdb::LogicalType
 void duckdb_scan_task_local_state::column_builder::initialize_accessors(
   size_t estimated_num_rows, size_t byte_offset, unique_ptr<multiple_blocks_allocation>& allocation)
 {
+  assert(allocation != nullptr);
+  assert(!allocation->get_blocks().empty());
+
   if (type.InternalType() == duckdb::PhysicalType::VARCHAR) {
     // Initialize offset accessor
     offset_blocks_accessor.initialize(byte_offset, allocation);
@@ -282,17 +286,20 @@ duckdb_scan_task_local_state::duckdb_scan_task_local_state(
   reservation = mem_res_mgr.request_reservation(res_request, approximate_batch_size);
 
   // Make the allocation
-  auto const* mem_space =
-    mem_res_mgr.get_memory_spaces_for_tier(memory::Tier::HOST)[HOST_SPACE_INDEX];
+  auto const* mem_space = mem_res_mgr.get_memory_space(memory::Tier::HOST, HOST_SPACE_DEVICE_ID);
+  if (mem_space == nullptr) {
+    throw std::runtime_error(
+      "[duckdb_scan_task_local_state] Failed to get HOST memory space with device id " +
+      std::to_string(HOST_SPACE_DEVICE_ID));
+  }
   auto* allocator =
-    mem_space->get_default_allocator_as<sirius::memory::fixed_size_host_memory_resource>();
+    mem_space->get_memory_resource_as<sirius::memory::fixed_size_host_memory_resource>();
   if (allocator == nullptr) {
     throw std::runtime_error(
       "[duckdb_scan_task_local_state] Failed to get fixed_size_host_memory_resource allocator for "
       "HOST memory space.");
   }
-  allocation = make_unique<multiple_blocks_allocation>(
-    allocator->allocate_multiple_blocks(approximate_batch_size));
+  allocation = allocator->allocate_multiple_blocks(approximate_batch_size);
 
   // Estimate number of rows per batch
   estimate_rows_per_batch(op);
@@ -302,12 +309,6 @@ duckdb_scan_task_local_state::duckdb_scan_task_local_state(
 
   // Initialize local table function state (will skip if local_tf_state already set)
   initialize_local_table_function_state(op, exec_ctx, g_state.global_tf_state.get());
-}
-
-duckdb_scan_task_local_state::~duckdb_scan_task_local_state()
-{
-  auto& mem_res_mgr = memory::memory_reservation_manager::get_instance();
-  if (reservation) { mem_res_mgr.release_reservation(std::move(reservation)); }
 }
 
 void duckdb_scan_task_local_state::estimate_rows_per_batch(const duckdb::PhysicalTableScan& op)
@@ -327,12 +328,17 @@ void duckdb_scan_task_local_state::estimate_rows_per_batch(const duckdb::Physica
     }
   }
 
-  // We must make space for a) the extra offset row for each VARCHAR column and
-  //                        b) the leftover bits in the bytes allocated for the masks
-  size_t numerator_bits =
-    (approximate_batch_size - varchar_indices.size() * sizeof(int64_t)) * CHAR_BIT -
-    (num_columns * (CHAR_BIT - 1) / CHAR_BIT);
-  estimated_rows_per_batch = numerator_bits / estimated_row_bytes;
+  // We must make space for the mask bytes (1 bit per row, rounded up to bytes)
+  // Add mask bytes to the estimated row size
+  size_t mask_bytes_per_row = num_columns / CHAR_BIT + (num_columns % CHAR_BIT != 0 ? 1 : 0);
+  estimated_row_bytes += mask_bytes_per_row;
+
+  // For VARCHAR columns, add space for the extra offset at the end
+  size_t extra_varchar_offset_bytes = varchar_indices.size() * sizeof(int64_t);
+
+  // Calculate rows that fit in the batch
+  estimated_rows_per_batch =
+    (approximate_batch_size - extra_varchar_offset_bytes) / estimated_row_bytes;
 
   // Ensure at least 1 vector can fit, otherwise the task will be a no-op
   estimated_rows_per_batch = std::max<size_t>(estimated_rows_per_batch, STANDARD_VECTOR_SIZE);

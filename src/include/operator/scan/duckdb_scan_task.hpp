@@ -21,6 +21,7 @@
 #include <data/data_repository_manager.hpp>
 #include <memory/fixed_size_host_memory_resource.hpp>
 #include <memory/memory_reservation.hpp>
+#include <memory/memory_reservation_manager.hpp>
 #include <operator/gpu_physical_table_scan.hpp>
 #include <parallel/task.hpp>
 #include <scan/duckdb_scan_executor.hpp>
@@ -143,7 +144,7 @@ struct multiple_blocks_allocation_accessor {
         "[multiple_blocks_allocation_accessor] The underyling type size must be aligned with the "
         "block size.");
     }
-    num_blocks          = allocation->blocks.size();
+    num_blocks          = allocation->get_blocks().size();
     initial_byte_offset = byte_offset;
     set_cursor(byte_offset);
   }
@@ -156,7 +157,7 @@ struct multiple_blocks_allocation_accessor {
   void set_cursor(size_t byte_offset)
   {
     assert(block_size != 0);  // Ensure initialized
-    
+
     block_index     = byte_offset / block_size;
     offset_in_block = byte_offset % block_size;
   };
@@ -175,8 +176,10 @@ struct multiple_blocks_allocation_accessor {
   void set_current(T value, unique_ptr<multiple_blocks_allocation>& allocation)
   {
     assert(block_index < num_blocks);
+    assert(allocation != nullptr);
+    assert(offset_in_block + sizeof(T) <= block_size);
 
-    *reinterpret_cast<T*>(static_cast<uint8_t*>(allocation->blocks[block_index]) +
+    *reinterpret_cast<T*>(reinterpret_cast<uint8_t*>(allocation->get_blocks()[block_index]) +
                           offset_in_block) = value;
   }
 
@@ -187,11 +190,13 @@ struct multiple_blocks_allocation_accessor {
    * @param[in] allocation The allocation.
    */
   template <typename S>
-  S get_current_as(const unique_ptr<multiple_blocks_allocation>& allocation) const
+  [[nodiscard]] S get_current_as(const unique_ptr<multiple_blocks_allocation>& allocation) const
   {
     assert(block_index < num_blocks);
+    assert(allocation != nullptr);
+    assert(offset_in_block + sizeof(S) <= block_size);
 
-    return *reinterpret_cast<S*>(static_cast<uint8_t*>(allocation->blocks[block_index]) +
+    return *reinterpret_cast<S*>(reinterpret_cast<uint8_t*>(allocation->get_blocks()[block_index]) +
                                  offset_in_block);
   }
 
@@ -200,7 +205,7 @@ struct multiple_blocks_allocation_accessor {
    *
    * @param[in] allocation The allocation.
    */
-  T get_current(const unique_ptr<multiple_blocks_allocation>& allocation) const
+  [[nodiscard]] T get_current(const unique_ptr<multiple_blocks_allocation>& allocation) const
   {
     return get_current_as<underlying_type>(allocation);
   }
@@ -239,13 +244,14 @@ struct multiple_blocks_allocation_accessor {
     size_t bytes_copied = 0;
     // Loop over blocks into which to copy the src
     while (bytes_copied < bytes) {
-      assert(block_index < allocation->blocks.size());
+      assert(block_index < allocation->get_blocks().size());
       // Do as much of a bulk copy as possible in the current block
       auto const bytes_to_copy =
         std::min(bytes - bytes_copied, allocation->block_size - offset_in_block);
-      std::memcpy(static_cast<uint8_t*>(allocation->blocks[block_index]) + offset_in_block,
-                  static_cast<uint8_t const*>(src) + bytes_copied,
-                  bytes_to_copy);
+      std::memcpy(
+        reinterpret_cast<uint8_t*>(allocation->get_blocks()[block_index]) + offset_in_block,
+        static_cast<uint8_t const*>(src) + bytes_copied,
+        bytes_to_copy);
       bytes_copied += bytes_to_copy;
       offset_in_block += bytes_to_copy;
       // Check if we need to advance to the next block
@@ -268,13 +274,14 @@ struct multiple_blocks_allocation_accessor {
     size_t bytes_copied = 0;
     // Loop over blocks from which to copy the data
     while (bytes_copied < bytes) {
-      assert(block_index < allocation->blocks.size());
+      assert(block_index < allocation->get_blocks().size());
       // Do as much of a bulk copy as possible in the current block
       auto const bytes_to_copy =
         std::min(bytes - bytes_copied, allocation->block_size - offset_in_block);
-      std::memcpy(static_cast<uint8_t*>(dest) + bytes_copied,
-                  static_cast<uint8_t*>(allocation->blocks[block_index]) + offset_in_block,
-                  bytes_to_copy);
+      std::memcpy(
+        static_cast<uint8_t*>(dest) + bytes_copied,
+        reinterpret_cast<uint8_t*>(allocation->get_blocks()[block_index]) + offset_in_block,
+        bytes_to_copy);
       bytes_copied += bytes_to_copy;
       offset_in_block += bytes_to_copy;
       // Check if we need to advance to the next block
@@ -302,7 +309,7 @@ class duckdb_scan_task_local_state : public itask_local_state {
  public:
   using multiple_blocks_allocation =
     memory::fixed_size_host_memory_resource::multiple_blocks_allocation;
-  static constexpr size_t HOST_SPACE_INDEX = 0;  ///< There is currently only one HOST memory space
+  static constexpr size_t HOST_SPACE_DEVICE_ID = 0;  ///< There is currently only one HOST device
 
   //===----------------------------------------------------------------------===//
   // Column Builder
@@ -422,11 +429,6 @@ class duckdb_scan_task_local_state : public itask_local_state {
     size_t default_varchar_size   = duckdb::Config::DEFAULT_SCAN_TASK_VARCHAR_SIZE,
     unique_ptr<duckdb::LocalTableFunctionState> existing_local_tf_state = nullptr);
 
-  /**
-   * @brief Release the memory reservation held by the local state.
-   */
-  ~duckdb_scan_task_local_state();
-
   //===----------Fields----------===//
   size_t approximate_batch_size;           ///< Approximate target batch size in bytes
   size_t default_varchar_size;             ///< Default size for VARCHAR columns in bytes
@@ -435,8 +437,8 @@ class duckdb_scan_task_local_state : public itask_local_state {
   vector<column_builder> column_builders;  ///< Column builders for each column
   vector<size_t> varchar_indices;          ///< Indices of VARCHAR columns
 
-  struct memory::any_memory_space_in_tier res_request =
-    memory::any_memory_space_in_tier(memory::Tier::HOST);
+  sirius::memory::any_memory_space_in_tier res_request =
+    sirius::memory::any_memory_space_in_tier(sirius::memory::Tier::HOST);
   unique_ptr<memory::reservation> reservation;        ///< Memory reservation for all column data
   unique_ptr<multiple_blocks_allocation> allocation;  ///< Memory allocation for all column data
 
@@ -542,7 +544,7 @@ class duckdb_scan_task : public itask {
    *
    * @return A pointer to the global state.
    */
-  duckdb_scan_task_global_state const* get_global_state() const
+  [[nodiscard]] duckdb_scan_task_global_state const* get_global_state() const
   {
     return &this->_global_state->cast<duckdb_scan_task_global_state>();
   }
@@ -552,7 +554,7 @@ class duckdb_scan_task : public itask {
    *
    * @return A pointer to the local state.
    */
-  duckdb_scan_task_local_state const* get_local_state() const
+  [[nodiscard]] duckdb_scan_task_local_state const* get_local_state() const
   {
     return &this->_local_state->cast<duckdb_scan_task_local_state>();
   }

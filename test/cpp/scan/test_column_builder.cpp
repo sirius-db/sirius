@@ -25,6 +25,9 @@
 #include <duckdb/common/types/validity_mask.hpp>
 #include <duckdb/common/types/vector.hpp>
 
+// standard library
+#include <numbers>
+
 using namespace sirius::parallel;
 using namespace sirius::memory;
 
@@ -41,23 +44,15 @@ using namespace sirius::memory;
 static sirius::unique_ptr<fixed_size_host_memory_resource::multiple_blocks_allocation>
 create_test_allocation(size_t total_size)
 {
-  auto& mem_mgr    = sirius::memory::memory_reservation_manager::get_instance();
-  auto host_spaces = mem_mgr.get_memory_spaces_for_tier(sirius::memory::Tier::HOST);
-  REQUIRE(host_spaces.size() > 0);
-  auto* mem_space = host_spaces[0];
+  auto& mem_mgr   = sirius::memory::memory_reservation_manager::get_instance();
+  auto* mem_space = mem_mgr.get_memory_space(sirius::memory::Tier::HOST, 0);
+  REQUIRE(mem_space != nullptr);
   auto* allocator =
-    mem_space->get_default_allocator_as<sirius::memory::fixed_size_host_memory_resource>();
+    mem_space->get_memory_resource_as<sirius::memory::fixed_size_host_memory_resource>();
   REQUIRE(allocator != nullptr);
 
-  std::vector<void*> blocks;
-  size_t bytes_allocated = 0;
-  while (bytes_allocated < total_size) {
-    blocks.push_back(allocator->allocate(allocator->get_block_size()));
-    bytes_allocated += allocator->get_block_size();
-  }
-
-  return sirius::make_unique<fixed_size_host_memory_resource::multiple_blocks_allocation>(
-    std::move(blocks), allocator, allocator->get_block_size());
+  // Use the public allocate_multiple_blocks method instead of manually creating blocks
+  return allocator->allocate_multiple_blocks(total_size);
 }
 
 //===----------------------------------------------------------------------===//
@@ -120,12 +115,11 @@ TEST_CASE("column_builder - accessor initialization", "[duckdb_scan_task][column
   initialize_memory_manager();
   constexpr size_t DEFAULT_VARCHAR_SIZE = 256;
 
-  auto& mem_mgr    = sirius::memory::memory_reservation_manager::get_instance();
-  auto host_spaces = mem_mgr.get_memory_spaces_for_tier(sirius::memory::Tier::HOST);
-  REQUIRE(host_spaces.size() > 0);
-  auto* mem_space = host_spaces[0];
+  auto& mem_mgr   = sirius::memory::memory_reservation_manager::get_instance();
+  auto* mem_space = mem_mgr.get_memory_space(sirius::memory::Tier::HOST, 0);
+  REQUIRE(mem_space != nullptr);
   auto* allocator =
-    mem_space->get_default_allocator_as<sirius::memory::fixed_size_host_memory_resource>();
+    mem_space->get_memory_resource_as<sirius::memory::fixed_size_host_memory_resource>();
   REQUIRE(allocator != nullptr);
 
   SECTION("initialize accessors for fixed-width type")
@@ -137,17 +131,7 @@ TEST_CASE("column_builder - accessor initialization", "[duckdb_scan_task][column
     // Calculate total size needed: data + mask
     size_t total_size = sizeof(int32_t) * num_rows + sirius::utils::ceil_div_8(num_rows);
 
-    // Allocate blocks for the shared allocation
-    std::vector<void*> blocks;
-    size_t bytes_allocated = 0;
-    while (bytes_allocated < total_size) {
-      blocks.push_back(allocator->allocate(allocator->get_block_size()));
-      bytes_allocated += allocator->get_block_size();
-    }
-
-    auto allocation =
-      sirius::make_unique<fixed_size_host_memory_resource::multiple_blocks_allocation>(
-        std::move(blocks), allocator, allocator->get_block_size());
+    auto allocation = create_test_allocation(total_size);
 
     // Initialize the accessors at byte offset 0
     builder.initialize_accessors(num_rows, 0, allocation);
@@ -173,17 +157,8 @@ TEST_CASE("column_builder - accessor initialization", "[duckdb_scan_task][column
                         DEFAULT_VARCHAR_SIZE * num_rows +     // data
                         sirius::utils::ceil_div_8(num_rows);  // mask
 
-    // Allocate blocks for the shared allocation
-    std::vector<void*> blocks;
-    size_t bytes_allocated = 0;
-    while (bytes_allocated < total_size) {
-      blocks.push_back(allocator->allocate(allocator->get_block_size()));
-      bytes_allocated += allocator->get_block_size();
-    }
-
-    auto allocation =
-      sirius::make_unique<fixed_size_host_memory_resource::multiple_blocks_allocation>(
-        std::move(blocks), allocator, allocator->get_block_size());
+    // Use the helper to create the allocation
+    auto allocation = create_test_allocation(total_size);
 
     // Initialize the accessors at byte offset 0
     builder.initialize_accessors(num_rows, 0, allocation);
@@ -206,12 +181,11 @@ TEST_CASE("column_builder - sufficient_space_for_column", "[duckdb_scan_task][co
   initialize_memory_manager();
   constexpr size_t DEFAULT_VARCHAR_SIZE = 256;
 
-  auto& mem_mgr    = sirius::memory::memory_reservation_manager::get_instance();
-  auto host_spaces = mem_mgr.get_memory_spaces_for_tier(sirius::memory::Tier::HOST);
-  REQUIRE(host_spaces.size() > 0);
-  auto* mem_space = host_spaces[0];
+  auto& mem_mgr   = sirius::memory::memory_reservation_manager::get_instance();
+  auto* mem_space = mem_mgr.get_memory_space(sirius::memory::Tier::HOST, 0);
+  REQUIRE(mem_space != nullptr);
   auto* allocator =
-    mem_space->get_default_allocator_as<sirius::memory::fixed_size_host_memory_resource>();
+    mem_space->get_memory_resource_as<sirius::memory::fixed_size_host_memory_resource>();
   REQUIRE(allocator != nullptr);
 
   SECTION("VARCHAR type space check - sufficient space")
@@ -225,16 +199,8 @@ TEST_CASE("column_builder - sufficient_space_for_column", "[duckdb_scan_task][co
                         DEFAULT_VARCHAR_SIZE * num_rows +     // data
                         sirius::utils::ceil_div_8(num_rows);  // mask
 
-    std::vector<void*> blocks;
-    size_t bytes_allocated = 0;
-    while (bytes_allocated < total_size) {
-      blocks.push_back(allocator->allocate(allocator->get_block_size()));
-      bytes_allocated += allocator->get_block_size();
-    }
-
-    auto allocation =
-      sirius::make_unique<fixed_size_host_memory_resource::multiple_blocks_allocation>(
-        std::move(blocks), allocator, allocator->get_block_size());
+    // Use the helper to create the allocation
+    auto allocation = create_test_allocation(total_size);
 
     builder.initialize_accessors(num_rows, 0, allocation);
 
@@ -266,16 +232,8 @@ TEST_CASE("column_builder - sufficient_space_for_column", "[duckdb_scan_task][co
                         10 * num_rows +                       // data (10 bytes per row)
                         sirius::utils::ceil_div_8(num_rows);  // mask
 
-    std::vector<void*> blocks;
-    size_t bytes_allocated = 0;
-    while (bytes_allocated < total_size) {
-      blocks.push_back(allocator->allocate(allocator->get_block_size()));
-      bytes_allocated += allocator->get_block_size();
-    }
-
-    auto allocation =
-      sirius::make_unique<fixed_size_host_memory_resource::multiple_blocks_allocation>(
-        std::move(blocks), allocator, allocator->get_block_size());
+    // Use the helper to create the allocation
+    auto allocation = create_test_allocation(total_size);
 
     builder.initialize_accessors(num_rows, 0, allocation);
 
@@ -483,7 +441,7 @@ TEST_CASE("column_builder - process_column for fixed-width types",
     for (size_t i = 0; i < 10; ++i) {
       int32_t value;
       std::memcpy(&value,
-                  static_cast<uint8_t*>(allocation->blocks[0]) + i * sizeof(int32_t),
+                  reinterpret_cast<uint8_t*>(allocation->get_blocks()[0]) + i * sizeof(int32_t),
                   sizeof(int32_t));
       REQUIRE(value == static_cast<int32_t>(i * 100));
     }
@@ -520,7 +478,7 @@ TEST_CASE("column_builder - process_column for fixed-width types",
     for (size_t i = 0; i < 5; ++i) {
       int64_t value;
       std::memcpy(&value,
-                  static_cast<uint8_t*>(allocation->blocks[0]) + i * sizeof(int64_t),
+                  reinterpret_cast<uint8_t*>(allocation->get_blocks()[0]) + i * sizeof(int64_t),
                   sizeof(int64_t));
       REQUIRE(value == static_cast<int64_t>(i * 1000000LL));
     }
@@ -540,7 +498,7 @@ TEST_CASE("column_builder - process_column for fixed-width types",
     duckdb::Vector vec(double_type, 5);
     auto* data = reinterpret_cast<double*>(vec.GetData());
     for (size_t i = 0; i < 5; ++i) {
-      data[i] = i * 3.14159;
+      data[i] = i * std::numbers::pi;
     }
 
     duckdb::ValidityMask validity(5);
@@ -1051,7 +1009,7 @@ TEST_CASE("column_builder - packed allocation multiple columns",
     // Verify INT data
     int_builder.data_blocks_accessor.set_cursor(int_byte_offset);
     for (size_t i = 0; i < 10; ++i) {
-      int32_t value = int_builder.data_blocks_accessor.get_current_as<int32_t>(allocation);
+      auto value = int_builder.data_blocks_accessor.get_current_as<int32_t>(allocation);
       REQUIRE(value == static_cast<int32_t>(i * 10));
       int_builder.data_blocks_accessor.advance_as<int32_t>();
     }
@@ -1059,7 +1017,7 @@ TEST_CASE("column_builder - packed allocation multiple columns",
     // Verify BIGINT data
     bigint_builder.data_blocks_accessor.set_cursor(bigint_byte_offset);
     for (size_t i = 0; i < 10; ++i) {
-      int64_t value = bigint_builder.data_blocks_accessor.get_current_as<int64_t>(allocation);
+      auto value = bigint_builder.data_blocks_accessor.get_current_as<int64_t>(allocation);
       REQUIRE(value == static_cast<int64_t>(i * 100));
       bigint_builder.data_blocks_accessor.advance_as<int64_t>();
     }
@@ -1121,7 +1079,7 @@ TEST_CASE("column_builder - packed allocation multiple columns",
     // Verify INT data
     int_builder.data_blocks_accessor.set_cursor(int_byte_offset);
     for (size_t i = 0; i < 5; ++i) {
-      int32_t value = int_builder.data_blocks_accessor.get_current_as<int32_t>(allocation);
+      auto value = int_builder.data_blocks_accessor.get_current_as<int32_t>(allocation);
       REQUIRE(value == static_cast<int32_t>(i + 100));
       int_builder.data_blocks_accessor.advance_as<int32_t>();
     }
@@ -1231,7 +1189,8 @@ TEST_CASE("column_builder - packed allocation multiple columns",
     // For VARCHAR, the mask is initialized at: data_offset + total_data_bytes_allocated
     // Where total_data_bytes_allocated = num_rows * default_varchar_size = 8 * 256 = 2048
     size_t varchar_data_offset = int_size + double_size + (num_rows + 1) * sizeof(int64_t);
-    size_t varchar_mask_offset = varchar_data_offset + (num_rows * 256);  // 256 is default_varchar_size
+    size_t varchar_mask_offset =
+      varchar_data_offset + (num_rows * 256);  // 256 is default_varchar_size
     varchar_builder.mask_blocks_accessor.set_cursor(varchar_mask_offset);
     uint8_t varchar_mask = varchar_builder.mask_blocks_accessor.get_current(allocation);
     REQUIRE((varchar_mask & (1 << 0)) == 0);  // Row 0 is NULL
@@ -1252,7 +1211,8 @@ TEST_CASE("column_builder - VARCHAR space checking edge cases",
   SECTION("sufficient_space_for_column returns false when space exceeded")
   {
     auto varchar_type = duckdb::LogicalType(duckdb::LogicalTypeId::VARCHAR);
-    duckdb_scan_task_local_state::column_builder builder(varchar_type, 4);  // Small default size: 5 rows * 4 bytes = 20 bytes allocated
+    duckdb_scan_task_local_state::column_builder builder(
+      varchar_type, 4);  // Small default size: 5 rows * 4 bytes = 20 bytes allocated
 
     size_t num_rows      = 5;
     size_t max_data_size = 20;  // Only 20 bytes of data space
