@@ -24,6 +24,12 @@ add_compile_definitions(ENABLE_CUDF)
 # Set extension name here
 set(TARGET_NAME sirius)
 
+# Set CUDA architecture
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+  set(CMAKE_CUDA_ARCHITECTURES native)
+  message(STATUS "CMAKE_CUDA_ARCHITECTURES not defined. Setting to 'native'.")
+endif()
+
 project(${TARGET_NAME} LANGUAGES CXX CUDA)
 find_package(cudf REQUIRED CONFIG)
 
@@ -49,10 +55,7 @@ else()
   message(FATAL_ERROR "LIBCUDF_ENV_PREFIX environment variable is not set.")
 endif()
 
-# Set CUDA architecture and flags
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES native)
-endif()
+# Set CUDA and CXX flags
 set(CMAKE_CUDA_FLAGS
     "${CMAKE_CUDA_FLAGS} --expt-extended-lambda --expt-relaxed-constexpr -rdc=true"
 )
