@@ -71,9 +71,9 @@ class duckdb_scan_executor : public itask_executor {
   //===----------Fields----------===//
  private:
   std::atomic<uint64_t> _total_tasks    = 0;  ///< The total number of scheduled tasks
-  std::atomic<uint64_t> _finished_tasks = 0; ///< The total number of finished tasks
-  std::mutex _finish_mutex; ///< Mutex to protect condition variable
-  std::condition_variable _finish_cv;  ///< Condition variable to signal task completion
+  std::atomic<uint64_t> _finished_tasks = 0;  ///< The total number of finished tasks
+  std::mutex _finish_mutex;                   ///< Mutex to protect condition variable
+  std::condition_variable _finish_cv;         ///< Condition variable to signal task completion
 };
 
 }  // namespace sirius::parallel

@@ -141,7 +141,7 @@ struct multiple_blocks_allocation_accessor {
     block_size = allocation->block_size;
     if (block_size % sizeof(T) != 0) {
       throw std::runtime_error(
-        "[multiple_blocks_allocation_accessor] The underyling type size must be aligned with the "
+        "[multiple_blocks_allocation_accessor] The underlying type size must be aligned with the "
         "block size.");
     }
     num_blocks          = allocation->get_blocks().size();

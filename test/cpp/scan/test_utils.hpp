@@ -42,26 +42,26 @@ inline void initialize_memory_manager()
   static bool initialized = false;
   if (!initialized) {
     memory_reservation_manager::reset_for_testing();
-    
+
     // Use the configurator to properly set up memory spaces
     reservation_manager_configurator builder;
-    
+
     // Configure GPU (2GB limit, 75% reservation ratio)
     const size_t gpu_capacity = 2ull << 30;  // 2GB
-    const double limit_ratio = 0.75;
+    const double limit_ratio  = 0.75;
     builder.set_gpu_usage_limit(gpu_capacity);
     builder.set_reservation_limit_ratio_per_gpu(limit_ratio);
-    
-    // Configure HOST (4GB capacity, 75% reservation ratio)  
+
+    // Configure HOST (4GB capacity, 75% reservation ratio)
     const size_t host_capacity = 4ull << 30;  // 4GB
     builder.set_capacity_per_numa_node(host_capacity);
     builder.set_host_id_to_numa_maps({{0, -1}});
     builder.set_reservation_limit_ratio_per_numa_node(limit_ratio);
-    
+
     // Build configuration with topology detection
     auto space_configs = builder.build_with_topology();
     memory_reservation_manager::initialize(std::move(space_configs));
-    
+
     initialized = true;
   }
 }

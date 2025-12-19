@@ -27,8 +27,7 @@ set(TARGET_NAME sirius)
 # Set CUDA architecture
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES native)
-  message(STATUS
-          "CMAKE_CUDA_ARCHITECTURES not defined. Setting to 'native'.")
+  message(STATUS "CMAKE_CUDA_ARCHITECTURES not defined. Setting to 'native'.")
 endif()
 
 project(${TARGET_NAME} LANGUAGES CXX CUDA)
