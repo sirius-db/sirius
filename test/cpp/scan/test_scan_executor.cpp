@@ -46,6 +46,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <memory>
 
 using idx_t = duckdb::idx_t;
 using namespace sirius;
@@ -64,11 +65,11 @@ using namespace sirius;
 class test_scan_task : public parallel::duckdb_scan_task {
  public:
   test_scan_task(uint64_t task_id,
-                 data_repository_manager& dr_mgr,
+                 cucascade::data_repository_manager& dr_mgr,
                  duckdb::Connection& con,
                  std::string const& table_name,
-                 sirius::unique_ptr<parallel::duckdb_scan_task_local_state> l_state,
-                 sirius::shared_ptr<parallel::duckdb_scan_task_global_state> g_state)
+                 std::unique_ptr<parallel::duckdb_scan_task_local_state> l_state,
+                 std::shared_ptr<parallel::duckdb_scan_task_global_state> g_state)
     : duckdb_scan_task(task_id, dr_mgr, std::move(l_state), g_state),
       con_(con),
       table_name_(table_name)
@@ -103,7 +104,7 @@ class test_scan_task : public parallel::duckdb_scan_task {
 
       // Create a new local state, passing the existing local_tf_state to continue the scan
       // This ensures DuckDB continues scanning from the current position rather than starting over
-      auto new_local_state = sirius::make_unique<parallel::duckdb_scan_task_local_state>(
+      auto new_local_state = std::make_unique<parallel::duckdb_scan_task_local_state>(
         g_state,
         l_state.exec_ctx,
         l_state.approximate_batch_size,
@@ -113,7 +114,7 @@ class test_scan_task : public parallel::duckdb_scan_task {
       // Create a new reference to the global state
       auto shared_global_state =
         std::static_pointer_cast<parallel::duckdb_scan_task_global_state>(this->_global_state);
-      auto next_task = sirius::make_unique<test_scan_task>(
+      auto next_task = std::make_unique<test_scan_task>(
         new_task_id, dr_mgr, con_, table_name_, std::move(new_local_state), shared_global_state);
       g_state.scan_executor.schedule(std::move(next_task));
     }
@@ -433,7 +434,7 @@ static std::unique_ptr<duckdb::PhysicalTableScan> make_physical_table_scan(
   }
 
   // Create bind data
-  auto bind_data = sirius::make_unique<duckdb::TableScanBindData>(table_catalog_entry);
+  auto bind_data = std::make_unique<duckdb::TableScanBindData>(table_catalog_entry);
 
   // Get the table scan function
   auto table_scan_function = duckdb::TableScanFunction::GetFunction();
@@ -448,7 +449,7 @@ static std::unique_ptr<duckdb::PhysicalTableScan> make_physical_table_scan(
   duckdb::ExtraOperatorInfo extra_info;
 
   // Create PhysicalTableScan with all required parameters
-  auto physical_scan = sirius::make_unique<duckdb::PhysicalTableScan>(
+  auto physical_scan = std::make_unique<duckdb::PhysicalTableScan>(
     table_catalog_entry.GetTypes(),  // types
     table_scan_function,             // function
     std::move(bind_data),            // bind_data
@@ -480,8 +481,8 @@ static void run_scan_test(std::string const& table_name,
   initialize_memory_manager();
 
   // Verify memory manager is initialized
-  auto& mem_mgr   = memory::memory_reservation_manager::get_instance();
-  auto* mem_space = mem_mgr.get_memory_space(memory::Tier::HOST, 0);
+  auto& mem_mgr   = memory_reservation_manager::get_instance();
+  auto* mem_space = mem_mgr.get_memory_space(Tier::HOST, 0);
   REQUIRE(mem_space != nullptr);
 
   // Setup DuckDB database
@@ -529,19 +530,19 @@ static void run_scan_test(std::string const& table_name,
   duckdb::ExecutionContext exec_ctx(client_ctx, thread_ctx, nullptr);
 
   // Create global state
-  auto global_state = sirius::make_shared<parallel::duckdb_scan_task_global_state>(
+  auto global_state = std::make_shared<parallel::duckdb_scan_task_global_state>(
     pipeline_id, scan_executor, client_ctx, ptsa);
 
   // Create data repository manager (empty, unused for this test)
-  data_repository_manager dr_mgr;
+  cucascade::data_repository_manager dr_mgr;
 
   // Create local state
-  auto local_state = sirius::make_unique<parallel::duckdb_scan_task_local_state>(
+  auto local_state = std::make_unique<parallel::duckdb_scan_task_local_state>(
     *global_state, exec_ctx, batch_size);
 
   // Create and schedule test task
   uint64_t task_id = 1;
-  auto task        = sirius::make_unique<test_scan_task>(
+  auto task        = std::make_unique<test_scan_task>(
     task_id, dr_mgr, con, staging_table, std::move(local_state), global_state);
   scan_executor.schedule(std::move(task));
 

@@ -120,7 +120,7 @@ template <typename T>
 struct multiple_blocks_allocation_accessor {
   using underlying_type = T;
   using multiple_blocks_allocation =
-    memory::fixed_size_host_memory_resource::multiple_blocks_allocation;
+    cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation;
 
   //===----------Fields----------===//
   size_t block_size          = 0;  ///< The size of each block in bytes
@@ -308,7 +308,7 @@ struct multiple_blocks_allocation_accessor {
 class duckdb_scan_task_local_state : public itask_local_state {
  public:
   using multiple_blocks_allocation =
-    memory::fixed_size_host_memory_resource::multiple_blocks_allocation;
+    cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation;
   static constexpr size_t HOST_SPACE_DEVICE_ID = 0;  ///< There is currently only one HOST device
 
   //===----------------------------------------------------------------------===//
@@ -437,15 +437,17 @@ class duckdb_scan_task_local_state : public itask_local_state {
   vector<column_builder> column_builders;  ///< Column builders for each column
   vector<size_t> varchar_indices;          ///< Indices of VARCHAR columns
 
-  sirius::memory::any_memory_space_in_tier res_request =
-    sirius::memory::any_memory_space_in_tier(sirius::memory::Tier::HOST);
-  unique_ptr<memory::reservation> reservation;        ///< Memory reservation for all column data
-  unique_ptr<multiple_blocks_allocation> allocation;  ///< Memory allocation for all column data
+  cucascade::memory::any_memory_space_in_tier res_request =
+    cucascade::memory::any_memory_space_in_tier(cucascade::memory::Tier::HOST);
+  std::unique_ptr<cucascade::memory::reservation>
+    reservation;  ///< Memory reservation for all column data
+  std::unique_ptr<cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation>
+    allocation;  ///< Memory allocation for all column data
 
   duckdb::DataChunk chunk;  ///< DataChunk buffer
   size_t row_offset = 0;    ///< Current row offset in buffers
 
-  unique_ptr<duckdb::LocalTableFunctionState>
+  std::unique_ptr<duckdb::LocalTableFunctionState>
     local_tf_state;                    ///< Local state for the table function.
   duckdb::ExecutionContext& exec_ctx;  ///< The duckdb execution context, needed for initializing
                                        ///< the local table function state
@@ -490,6 +492,7 @@ class duckdb_scan_task_local_state : public itask_local_state {
  * incomplete upon task completion, the task will push a new scan_task onto the task queue.
  */
 class duckdb_scan_task : public itask {
+  using data_repository_manager = cucascade::data_repository_manager;
   // Friend declaration for test access
   friend class test_scan_task;
 

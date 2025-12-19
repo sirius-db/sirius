@@ -37,7 +37,7 @@ class duckdb_scan_executor : public itask_executor {
  public:
   //===----------Constructor----------===//
   explicit duckdb_scan_executor(task_executor_config config)
-    : itask_executor(make_unique<duckdb_scan_task_queue>(config.num_threads), config)
+    : itask_executor(std::make_unique<duckdb_scan_task_queue>(config.num_threads), config)
   {
   }
 
@@ -47,7 +47,7 @@ class duckdb_scan_executor : public itask_executor {
    *
    * @param task The task to be scheduled.
    */
-  void schedule(sirius::unique_ptr<itask> task) override;
+  void schedule(std::unique_ptr<itask> task) override;
 
   /**
    * @brief Wait for all scheduled tasks to complete.
@@ -66,7 +66,7 @@ class duckdb_scan_executor : public itask_executor {
    *
    * @return The number of threads in the thread pool for this executor.
    */
-  int32_t get_num_threads() const { return _config.num_threads; }
+  [[nodiscard]] int32_t get_num_threads() const { return _config.num_threads; }
 
   //===----------Fields----------===//
  private:

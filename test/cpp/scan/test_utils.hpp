@@ -27,7 +27,7 @@
 // rmm
 #include <rmm/mr/device/cuda_async_memory_resource.hpp>
 
-using namespace sirius::memory;
+using namespace cucascade::memory;
 
 /**
  * @brief Initialize the memory reservation manager for tests.

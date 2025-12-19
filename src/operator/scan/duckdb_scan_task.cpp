@@ -280,20 +280,21 @@ duckdb_scan_task_local_state::duckdb_scan_task_local_state(
   auto const& op = g_state.op;
   num_columns    = op.projection_ids.size();
 
-  auto& mem_res_mgr = memory::memory_reservation_manager::get_instance();
+  auto& mem_res_mgr = cucascade::memory::memory_reservation_manager::get_instance();
 
   // Make the memory reservation request
   reservation = mem_res_mgr.request_reservation(res_request, approximate_batch_size);
 
   // Make the allocation
-  auto const* mem_space = mem_res_mgr.get_memory_space(memory::Tier::HOST, HOST_SPACE_DEVICE_ID);
+  auto const* mem_space =
+    mem_res_mgr.get_memory_space(cucascade::memory::Tier::HOST, HOST_SPACE_DEVICE_ID);
   if (mem_space == nullptr) {
     throw std::runtime_error(
       "[duckdb_scan_task_local_state] Failed to get HOST memory space with device id " +
       std::to_string(HOST_SPACE_DEVICE_ID));
   }
   auto* allocator =
-    mem_space->get_memory_resource_as<sirius::memory::fixed_size_host_memory_resource>();
+    mem_space->get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>();
   if (allocator == nullptr) {
     throw std::runtime_error(
       "[duckdb_scan_task_local_state] Failed to get fixed_size_host_memory_resource allocator for "
@@ -466,16 +467,16 @@ void duckdb_scan_task::execute()
     // Create a new local state, passing the existing local_tf_state to continue the scan
     // This ensures DuckDB continues scanning from the current position rather than starting over
     auto new_local_state =
-      sirius::make_unique<duckdb_scan_task_local_state>(g_state,
-                                                        l_state.exec_ctx,
-                                                        l_state.approximate_batch_size,
-                                                        l_state.default_varchar_size,
-                                                        std::move(l_state.local_tf_state));
+      std::make_unique<duckdb_scan_task_local_state>(g_state,
+                                                     l_state.exec_ctx,
+                                                     l_state.approximate_batch_size,
+                                                     l_state.default_varchar_size,
+                                                     std::move(l_state.local_tf_state));
 
     // Create a new reference to the global state
     auto shared_global_state =
       std::static_pointer_cast<duckdb_scan_task_global_state>(this->_global_state);
-    auto next_task = sirius::make_unique<duckdb_scan_task>(
+    auto next_task = std::make_unique<duckdb_scan_task>(
       new_task_id, dr_mgr, std::move(new_local_state), shared_global_state);
     g_state.scan_executor.schedule(std::move(next_task));
   }
