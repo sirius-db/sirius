@@ -46,7 +46,6 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
-#include <memory>
 
 using idx_t = duckdb::idx_t;
 using namespace sirius;
@@ -537,8 +536,8 @@ static void run_scan_test(std::string const& table_name,
   cucascade::data_repository_manager dr_mgr;
 
   // Create local state
-  auto local_state = std::make_unique<parallel::duckdb_scan_task_local_state>(
-    *global_state, exec_ctx, batch_size);
+  auto local_state =
+    std::make_unique<parallel::duckdb_scan_task_local_state>(*global_state, exec_ctx, batch_size);
 
   // Create and schedule test task
   uint64_t task_id = 1;

@@ -117,8 +117,7 @@ TEST_CASE("column_builder - accessor initialization", "[duckdb_scan_task][column
   auto& mem_mgr   = memory_reservation_manager::get_instance();
   auto* mem_space = mem_mgr.get_memory_space(Tier::HOST, 0);
   REQUIRE(mem_space != nullptr);
-  auto* allocator =
-    mem_space->get_memory_resource_as<fixed_size_host_memory_resource>();
+  auto* allocator = mem_space->get_memory_resource_as<fixed_size_host_memory_resource>();
   REQUIRE(allocator != nullptr);
 
   SECTION("initialize accessors for fixed-width type")
@@ -183,8 +182,7 @@ TEST_CASE("column_builder - sufficient_space_for_column", "[duckdb_scan_task][co
   auto& mem_mgr   = memory_reservation_manager::get_instance();
   auto* mem_space = mem_mgr.get_memory_space(Tier::HOST, 0);
   REQUIRE(mem_space != nullptr);
-  auto* allocator =
-    mem_space->get_memory_resource_as<fixed_size_host_memory_resource>();
+  auto* allocator = mem_space->get_memory_resource_as<fixed_size_host_memory_resource>();
   REQUIRE(allocator != nullptr);
 
   SECTION("VARCHAR type space check - sufficient space")
