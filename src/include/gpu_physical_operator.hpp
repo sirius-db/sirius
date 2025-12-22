@@ -190,6 +190,8 @@ class GPUPhysicalOperator {
   port* get_port(std::string_view port_id);
   void add_next_port_after_sink(std::pair<GPUPhysicalOperator*, std::string_view> port_locator);
   vector<std::pair<GPUPhysicalOperator*, std::string_view>>& get_next_port_after_sink();
+  void create_next_task_hint();
+  void create_tasks();
 
  private:
   std::unordered_map<std::string, std::unique_ptr<port>> ports;

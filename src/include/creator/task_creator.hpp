@@ -16,54 +16,142 @@
 
 #pragma once
 
-#include "task_executor.hpp"
+#include "gpu_pipeline_hashmap.hpp"
+#include "gpu_physical_operator.hpp"
+#include "gpu_pipeline.hpp"
+#include "data/data_batch_view.hpp"
+#include "parallel/task_executor.hpp"
+#include "helper/helper.hpp"
 
 #include <atomic>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <variant>
 
 namespace sirius {
 
-/**
- * Interface for a Task Creator, can be extended to support various kinds of task creation policies.
- */
-class itask_creator {
+using task_creation_hint = std::variant<std::monostate, ::duckdb::GPUPhysicalOperator*, ::duckdb::GPUPipeline*>;
+
+struct task_creation_info {
+  std::shared_ptr<::duckdb::GPUPipeline> pipeline;
+  std::vector<sirius::data_batch_view> input_batches;
+};
+
+class task_creation_queue {
  public:
-  itask_creator() : _running(false) {}
+  virtual ~task_creation_queue() = default;
 
-  virtual ~itask_creator() { stop(); }
+  // Open the queue and start accepting new tasks.
+  virtual void open() = 0;
 
-  // Non-copyable and movable
-  itask_creator(const itask_creator&)            = delete;
-  itask_creator& operator=(const itask_creator&) = delete;
-  itask_creator(itask_creator&&)                 = default;
-  itask_creator& operator=(itask_creator&&)      = default;
+  // Close the queue and stop processing new tasks.
+  virtual void close() = 0;
 
-  // Start worker threads
-  virtual void start();
+  // Add a task to the queue.
+  virtual void push(std::unique_ptr<task_creation_hint> task) = 0;
 
-  // Stop accepting new tasks, and join worker threads.
-  virtual void stop();
+  // Pull a task from the queue. Wait until a task available or the queue is closed.
+  virtual std::unique_ptr<task_creation_hint> pull() = 0;
+};
 
-  virtual void signal();
+class task_creator {
+    task_creator(std::unique_ptr<task_creation_queue> task_creation_queue, size_t num_threads, gpu_pipeline_hashmap& gpu_pipeline_map)
+      : _task_creation_queue(std::move(task_creation_queue)), _num_threads(num_threads), _running(false)
+    {
+      for (int i = 0; i < gpu_pipeline_map._vec.size(); ++i) {
+        if (gpu_pipeline_map._vec[i]->GetSource() == PhysicalOperatorType::TABLE_SCAN) {
+          priority_scans.push(gpu_pipeline_map._vec[i]);
+        }
+      }
+    }
 
-  virtual void wait();
+    virtual ~task_creator() { stop_thread_pool(); }
 
- protected:
-  // Main thread loop.
-  virtual void worker_loop();
+    // Non-copyable and movable
+    task_creator(const task_creator&)            = delete;
+    task_creator& operator=(const task_creator&) = delete;
+    task_creator(task_creator&&)                 = default;
+    task_creator& operator=(task_creator&&)      = default;
 
-  virtual uint64_t get_next_task_id();
+    void process_next_task(const duckdb::GPUPhysicalOperator* node) {
+        auto hint = node->get_next_task_hint();
+        if (std::holds_alternative<duckdb::GPUPhysicalOperator*>(hint)) {
+            schedule(hint);
+        } else if (std::holds_alternative<duckdb::GPUPipeline*>(hint)) {
+            auto* pipeline = std::get<duckdb::GPUPipeline*>(hint);
+            auto* node = pipeline->GetOperator()[0];
+            process_next_task(node);
+        } else {
+            duckdb::GPUPhysicalOperator* node = priority_scans.front();
+            schedule(std::make_unique<task_creation_hint>(node, nullptr));
+        }
+    }
 
- protected:
-  std::atomic<bool> _running;
-  std::unique_ptr<parallel::task_executor_thread> _thread;
-  std::atomic<uint64_t> _next_task_id = 0;  ///< Atomic counter for generating unique task IDs
-  std::mutex _mtx;                          ///< Mutex for synchronization
-  std::condition_variable _cv;              ///< Condition variable for thread coordination
-  bool _ready = false;                      ///< Flag indicating readiness state
+    void start() {
+        while (!priority_scans.empty()) {
+          auto* node = priority_scans.front();
+          schedule(std::make_unique<task_creation_hint>(node, nullptr));
+          priority_scans.pop();
+        }
+    }
+
+    void start_thread_pool() {
+      bool expected = false;
+      if (!_running.compare_exchange_strong(expected, true)) { return; }
+      on_start();
+      _threads.reserve(_num_threads);
+      for (int i = 0; i < _num_threads; ++i) {
+          _threads.push_back(std::make_unique<std::thread>(
+          &task_creator::worker_function, this, i));
+      }
+    }
+
+    void stop_thread_pool() {
+      bool expected = true;
+      if (!_running.compare_exchange_strong(expected, false)) { return; }
+      on_stop();
+      for (auto& thread : _threads) {
+        if (thread->joinable()) { thread->join(); }
+      }
+      _threads.clear();
+    }
+
+    void schedule(std::unique_ptr<task_creation_hint> hint) {
+        _task_creation_queue->push(std::move(hint));
+    }
+
+    void worker_function(int worker_id) {
+      while (true) {
+        if (!_running.load()) {
+          // Executor is stopped.
+          break;
+        }
+        auto hint = _task_creation_queue->pull();
+        if (hint == nullptr) {
+          // Task queue is closed.
+          break;
+        }
+        try {
+          auto node = std::get<duckdb::GPUPhysicalOperator*>(hint);
+          node->create_tasks();
+        } catch (const std::exception& e) {
+          schedule(std::move(hint));
+        }
+      }
+    }
+
+    void on_start() { _task_creation_queue->open(); }
+
+    void on_stop() { _task_creation_queue->close(); }
+
+    private:
+      size_t _num_threads;
+      std::atomic<bool> _running;
+      std::vector<std::unique_ptr<std::thread>> _threads;
+      std::queue<duckdb::GPUPhysicalOperator*> priority_scans;
+      std::unique_ptr<task_creation_queue> _task_creation_queue;
 };
 
 }  // namespace sirius

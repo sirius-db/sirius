@@ -186,6 +186,11 @@ GPUPhysicalOperator::port* GPUPhysicalOperator::get_port(std::string_view port_i
 ::std::vector<::std::shared_ptr<::cucascade::data_batch>> GPUPhysicalOperator::execute(
   const ::std::vector<::std::shared_ptr<::cucascade::data_batch>>& input_batches)
 {
+  for (auto& [next_op, port_id] : next_port_after_sink) {
+    if (next_op) {
+      // creator->process_next_task(next_op);
+    }
+  }
   // not doing anything for now
   return ::std::vector<::std::shared_ptr<::cucascade::data_batch>>{};
 }
@@ -207,6 +212,26 @@ vector<std::pair<GPUPhysicalOperator*, std::string_view>>&
 GPUPhysicalOperator::get_next_port_after_sink()
 {
   return next_port_after_sink;
+}
+
+task_creation_hint GPUPhysicalOperator::get_next_task_hint() {
+  // iterate through ports
+  for (auto& [port_name, port_ptr] : ports) {
+    if (port_ptr->type == MemoryBarrierType::PIPELINE) {
+      // For Pipeline barrier: need at least one data batch in the port's repository
+      if (port_ptr->repo && port_ptr->repo->pull_data_batch_view() != nullptr) {
+        // create task hint
+        return task_creation_hint(this);
+      }
+    } else if (port_ptr->type == MemoryBarrierType::FULL) {
+      // For Full barrier: all source pipelines must be finished
+      if (port_ptr->src_pipeline_finished) {
+        // create task hint
+        return task_creation_hint(this);
+      }
+    }
+    // PARTIAL barrier type - add logic here if needed in the future
+  }
 }
 
 }  // namespace duckdb
