@@ -501,7 +501,11 @@ __global__ void create_cpu_strings(duckdb_string_type* gpu_strings,
     if (str_length <= inline_threshold) {
       curr_string.value.inlined.length = str_length;
       char* gpu_data_ptr               = gpu_chars + str_offset;
-      memcpy(curr_string.value.inlined.inlined, gpu_data_ptr, str_length);
+      // copy byte by byte to avoid unaligned access
+      for (size_t i = 0; i < str_length; i++) {
+        curr_string.value.inlined.inlined[i] = gpu_data_ptr[i];
+      }
+
     } else {
       curr_string.value.pointer.length = str_length;
       curr_string.value.pointer.ptr    = cpu_chars_buffer + str_offset;

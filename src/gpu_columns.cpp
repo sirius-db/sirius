@@ -535,6 +535,25 @@ void GPUColumn::setFromCudfScalar(cudf::scalar& cudf_scalar, GPUBufferManager* g
       data_wrapper.data, reinterpret_cast<uint8_t*>(typed_scalar.data()), sizeof(int32_t), 0);
     data_wrapper.type      = GPUColumnType(GPUColumnTypeId::DATE);
     data_wrapper.num_bytes = sizeof(int32_t);
+  } else if (scalar_type.id() == cudf::type_id::STRING) {
+    auto& typed_scalar = static_cast<cudf::string_scalar&>(cudf_scalar);
+    size_t string_size = typed_scalar.size();
+    if (string_size > 0) {
+      data_wrapper.data = gpuBufferManager->customCudaMalloc<uint8_t>(string_size, 0, 0);
+      callCudaMemcpyDeviceToDevice<uint8_t>(
+        data_wrapper.data,
+        const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(typed_scalar.data())),
+        string_size,
+        0);
+    } else {
+      data_wrapper.data = nullptr;
+    }
+    data_wrapper.type      = GPUColumnType(GPUColumnTypeId::VARCHAR);
+    data_wrapper.num_bytes = string_size;
+    data_wrapper.offset    = gpuBufferManager->customCudaMalloc<uint64_t>(2, 0, 0);
+    uint64_t offsets[]     = {0, string_size};
+    callCudaMemcpyHostToDevice<uint64_t>(data_wrapper.offset, offsets, 2, 0);
+    data_wrapper.is_string_data = true;
   } else {
     throw NotImplementedException("Unsupported cudf data type in `setFromCudfScalar`: %d",
                                   static_cast<int>(scalar_type.id()));
@@ -548,12 +567,14 @@ void GPUColumn::setFromCudfScalar(cudf::scalar& cudf_scalar, GPUBufferManager* g
   } else {
     data_wrapper.validity_mask = createNullMask(1, cudf::mask_state::ALL_NULL);
   }
-  data_wrapper.mask_bytes     = getMaskBytesSize(data_wrapper.size);
-  column_length               = 1;
-  data_wrapper.offset         = nullptr;
-  data_wrapper.is_string_data = false;
-  row_ids                     = nullptr;
-  row_id_count                = 0;
+  data_wrapper.mask_bytes = getMaskBytesSize(data_wrapper.size);
+  column_length           = 1;
+  if (scalar_type.id() != cudf::type_id::STRING) {
+    data_wrapper.offset         = nullptr;
+    data_wrapper.is_string_data = false;
+  }
+  row_ids      = nullptr;
+  row_id_count = 0;
 }
 
 int32_t* GPUColumn::convertSiriusOffsetToCudfOffset()
