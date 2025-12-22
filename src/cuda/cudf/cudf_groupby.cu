@@ -270,10 +270,8 @@ void cudf_groupby(vector<shared_ptr<GPUColumn>>& keys,
       auto aggregate = cudf::make_mean_aggregation<cudf::groupby_aggregation>();
       requests[agg].aggregations.push_back(std::move(aggregate));
       // If aggregate input column is decimal, need to convert to double following duckdb
+      // Support all DECIMAL sizes (DECIMAL32, DECIMAL64, DECIMAL128)
       if (aggregate_keys[agg]->data_wrapper.type.id() == GPUColumnTypeId::DECIMAL) {
-        if (aggregate_keys[agg]->data_wrapper.getColumnTypeSize() != sizeof(int64_t)) {
-          throw NotImplementedException("Only support decimal64 for decimal AVG group-by");
-        }
         auto from_cudf_column_view = aggregate_keys[agg]->convertToCudfColumn();
         auto to_cudf_type          = cudf::data_type(cudf::type_id::FLOAT64);
         auto to_cudf_column        = cudf::cast(from_cudf_column_view,
