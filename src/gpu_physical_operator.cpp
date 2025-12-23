@@ -214,15 +214,14 @@ GPUPhysicalOperator::get_next_port_after_sink()
   return next_port_after_sink;
 }
 
-::sirius::task_creation_hint GPUPhysicalOperator::get_next_task_hint() {
+::sirius::task_creation_hint GPUPhysicalOperator::get_next_task_hint()
+{
   for (auto& [port_name, port_ptr] : ports) {
     if (port_ptr->type == MemoryBarrierType::PIPELINE) {
       // For pipeline barrier: check if there is a data batch available
       if (!port_ptr->repo->check_data_batch_view_availability()) {
         // No data batch available, return src pipeline or monostate
-        if (port_ptr->src_pipeline) {
-          return ::sirius::task_creation_hint(port_ptr->src_pipeline);
-        }
+        if (port_ptr->src_pipeline) { return ::sirius::task_creation_hint(port_ptr->src_pipeline); }
         return ::sirius::task_creation_hint(std::monostate{});
       }
     } else if (port_ptr->type == MemoryBarrierType::FULL) {
@@ -236,14 +235,14 @@ GPUPhysicalOperator::get_next_port_after_sink()
   }
 
   // All ports are ready (either PIPELINE with data, or FULL with finished pipeline)
-  if (!ports.empty()) {
-    return ::sirius::task_creation_hint(this);
-  }
+  if (!ports.empty()) { return ::sirius::task_creation_hint(this); }
   return ::sirius::task_creation_hint(std::monostate{});
 }
 
-std::vector<::std::unique_ptr<::cucascade::data_batch_view>> GPUPhysicalOperator::get_input_batch() {
-  // take one data batch from each port and schedule a task (a task takes one data batch from each port), do this repeatedly until all ports are empty
+std::vector<::std::unique_ptr<::cucascade::data_batch_view>> GPUPhysicalOperator::get_input_batch()
+{
+  // take one data batch from each port and schedule a task (a task takes one data batch from each
+  // port), do this repeatedly until all ports are empty
   std::vector<::std::unique_ptr<::cucascade::data_batch_view>> input_batch;
   for (auto& [port_name, port_ptr] : ports) {
     // For Pipeline barrier: need at least one data batch in the port's repository

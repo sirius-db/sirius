@@ -40,7 +40,9 @@ class GPUPipeline;
 }  // namespace duckdb
 
 namespace sirius {
-using task_creation_hint = std::variant<std::monostate, ::duckdb::GPUPhysicalOperator*, ::duckdb::shared_ptr<::duckdb::GPUPipeline>>;
+using task_creation_hint = std::variant<std::monostate,
+                                        ::duckdb::GPUPhysicalOperator*,
+                                        ::duckdb::shared_ptr<::duckdb::GPUPipeline>>;
 }  // namespace sirius
 
 namespace duckdb {

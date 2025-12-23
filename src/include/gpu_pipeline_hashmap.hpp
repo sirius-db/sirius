@@ -21,18 +21,20 @@
 namespace sirius {
 
 class gpu_pipeline_hashmap {
-public:
-    gpu_pipeline_hashmap(duckdb::vector<duckdb::shared_ptr<duckdb::GPUPipeline>> vec) : _vec(std::move(vec)) {
-        for (auto& pipeline : _vec) {
-            for (auto& op : pipeline->GetOperators()) {
-                _map.insert({&op.get(), pipeline});
-            }
-            _map.insert({pipeline->GetSink().get(), pipeline});
-        }
-    };
-    ~gpu_pipeline_hashmap() = default;
-    duckdb::vector<duckdb::shared_ptr<duckdb::GPUPipeline>> _vec;
-    std::unordered_map<duckdb::GPUPhysicalOperator*, duckdb::shared_ptr<duckdb::GPUPipeline>> _map;
+ public:
+  gpu_pipeline_hashmap(duckdb::vector<duckdb::shared_ptr<duckdb::GPUPipeline>> vec)
+    : _vec(std::move(vec))
+  {
+    for (auto& pipeline : _vec) {
+      for (auto& op : pipeline->GetOperators()) {
+        _map.insert({&op.get(), pipeline});
+      }
+      _map.insert({pipeline->GetSink().get(), pipeline});
+    }
+  };
+  ~gpu_pipeline_hashmap() = default;
+  duckdb::vector<duckdb::shared_ptr<duckdb::GPUPipeline>> _vec;
+  std::unordered_map<duckdb::GPUPhysicalOperator*, duckdb::shared_ptr<duckdb::GPUPipeline>> _map;
 };
 
-} //namespace sirius
+}  // namespace sirius
