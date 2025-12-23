@@ -214,24 +214,46 @@ GPUPhysicalOperator::get_next_port_after_sink()
   return next_port_after_sink;
 }
 
-task_creation_hint GPUPhysicalOperator::get_next_task_hint() {
-  // iterate through ports
+::sirius::task_creation_hint GPUPhysicalOperator::get_next_task_hint() {
   for (auto& [port_name, port_ptr] : ports) {
     if (port_ptr->type == MemoryBarrierType::PIPELINE) {
-      // For Pipeline barrier: need at least one data batch in the port's repository
-      if (port_ptr->repo && port_ptr->repo->pull_data_batch_view() != nullptr) {
-        // create task hint
-        return task_creation_hint(this);
+      // For pipeline barrier: check if there is a data batch available
+      if (!port_ptr->repo->check_data_batch_view_availability()) {
+        // No data batch available, return src pipeline or monostate
+        if (port_ptr->src_pipeline) {
+          return ::sirius::task_creation_hint(port_ptr->src_pipeline);
+        }
+        return ::sirius::task_creation_hint(std::monostate{});
       }
     } else if (port_ptr->type == MemoryBarrierType::FULL) {
-      // For Full barrier: all source pipelines must be finished
-      if (port_ptr->src_pipeline_finished) {
-        // create task hint
-        return task_creation_hint(this);
+      // For full barrier: src pipeline must be finished and have data
+      // We assume that there will be a data batch if the src pipeline is finished
+      if (!port_ptr->src_pipeline_finished) {
+        // Src pipeline not finished, return it to continue processing
+        return ::sirius::task_creation_hint(port_ptr->src_pipeline);
       }
     }
-    // PARTIAL barrier type - add logic here if needed in the future
   }
+
+  // All ports are ready (either PIPELINE with data, or FULL with finished pipeline)
+  if (!ports.empty()) {
+    return ::sirius::task_creation_hint(this);
+  }
+  return ::sirius::task_creation_hint(std::monostate{});
+}
+
+std::vector<::std::unique_ptr<::cucascade::data_batch_view>> GPUPhysicalOperator::get_input_batch() {
+  // take one data batch from each port and schedule a task (a task takes one data batch from each port), do this repeatedly until all ports are empty
+  std::vector<::std::unique_ptr<::cucascade::data_batch_view>> input_batch;
+  for (auto& [port_name, port_ptr] : ports) {
+    // For Pipeline barrier: need at least one data batch in the port's repository
+    auto batch_view = port_ptr->repo->pull_data_batch_view();
+    input_batch.push_back(std::move(batch_view));
+  }
+  if (input_batch.empty()) {
+    return std::vector<::std::unique_ptr<::cucascade::data_batch_view>>{};
+  }
+  return input_batch;
 }
 
 }  // namespace duckdb

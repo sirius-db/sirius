@@ -23,6 +23,7 @@
 #include "parallel/task_executor.hpp"
 #include "helper/helper.hpp"
 
+#include <blockingconcurrentqueue.h>
 #include <atomic>
 #include <condition_variable>
 #include <memory>
@@ -32,42 +33,106 @@
 
 namespace sirius {
 
-using task_creation_hint = std::variant<std::monostate, ::duckdb::GPUPhysicalOperator*, ::duckdb::GPUPipeline*>;
-
-struct task_creation_info {
-  std::shared_ptr<::duckdb::GPUPipeline> pipeline;
-  std::vector<sirius::data_batch_view> input_batches;
+/**
+ * @brief Contains information needed to create a task.
+ *
+ * This class holds a reference to a GPU physical operator node and its associated
+ * pipeline, which together provide the context needed for task creation.
+ */
+class task_creation_info {
+  public:
+    task_creation_info(::duckdb::GPUPhysicalOperator* node, ::duckdb::shared_ptr<::duckdb::GPUPipeline> pipeline)
+      : node(node), pipeline(std::move(pipeline)) {};
+    ~task_creation_info() = default;
+    ::duckdb::GPUPhysicalOperator* node;
+    ::duckdb::shared_ptr<::duckdb::GPUPipeline> pipeline;
 };
 
+/**
+ * @brief A thread-safe queue for managing task creation requests.
+ *
+ * This queue allows multiple producers to push task creation info and multiple
+ * consumers to pull tasks for processing. It supports open/close semantics to
+ * control when the queue accepts and returns tasks.
+ */
 class task_creation_queue {
- public:
-  virtual ~task_creation_queue() = default;
-
-  // Open the queue and start accepting new tasks.
-  virtual void open() = 0;
-
-  // Close the queue and stop processing new tasks.
-  virtual void close() = 0;
-
-  // Add a task to the queue.
-  virtual void push(std::unique_ptr<task_creation_hint> task) = 0;
-
-  // Pull a task from the queue. Wait until a task available or the queue is closed.
-  virtual std::unique_ptr<task_creation_hint> pull() = 0;
+  public:
+    /**
+     * @brief Construct a new task_creation_queue object.
+     *
+     * @param num_threads The number of worker threads that will consume from this queue.
+     *                    Used to send sentinel values when closing the queue.
+     */
+    task_creation_queue(size_t num_threads);
+ 
+    /**
+     * @brief Opens the task queue to start accepting and returning tasks.
+     */
+    void open();
+ 
+    /**
+     * @brief Closes the task queue from accepting new tasks or returning tasks.
+     *
+     * This method wakes up all threads blocked in pull() by pushing nullptr sentinels.
+     */
+    void close();
+ 
+    /**
+     * @brief Push a new task creation info to be scheduled.
+     *
+     * @param info The task creation info to be scheduled.
+     * @throws sirius::runtime_error If the scheduler is not currently accepting requests.
+     */
+    void push(std::unique_ptr<task_creation_info> info);
+ 
+   /**
+    * @brief Pull a task to execute.
+    *
+    * This is a blocking call that waits for a task to become available. If the queue
+    * is closed and empty, it returns nullptr to signal that no more tasks will arrive.
+    *
+    * @return A unique pointer to the task creation info if available, nullptr if the
+    *         queue is closed and empty.
+    */
+    std::unique_ptr<task_creation_info> pull();
+ 
+  private:
+    size_t _num_threads;
+    duckdb_moodycamel::BlockingConcurrentQueue<std::unique_ptr<task_creation_info>> _queue;
+    std::atomic<bool> _is_open{false};  ///< Whether the queue is open for pushing/pulling tasks
 };
 
+/**
+ * @brief Manages the creation and scheduling of GPU pipeline tasks.
+ *
+ * The task_creator is responsible for creating tasks from GPU pipelines and scheduling
+ * them for execution. It maintains a thread pool that processes task creation requests
+ * from the task_creation_queue. The creator prioritizes table scan pipelines and uses
+ * hints from operators to determine the next tasks to create.
+ *
+ * Usage:
+ *   1. Construct with a task_creation_queue, thread count, and pipeline map.
+ *   2. Call start_thread_pool() to begin processing tasks.
+ *   3. Call start() to schedule initial scan pipelines.
+ *   4. Call stop_thread_pool() when done.
+ */
 class task_creator {
-    task_creator(std::unique_ptr<task_creation_queue> task_creation_queue, size_t num_threads, gpu_pipeline_hashmap& gpu_pipeline_map)
-      : _task_creation_queue(std::move(task_creation_queue)), _num_threads(num_threads), _running(false)
-    {
-      for (int i = 0; i < gpu_pipeline_map._vec.size(); ++i) {
-        if (gpu_pipeline_map._vec[i]->GetSource() == PhysicalOperatorType::TABLE_SCAN) {
-          priority_scans.push(gpu_pipeline_map._vec[i]);
-        }
-      }
-    }
+  public:
+    /**
+     * @brief Construct a new task_creator.
+     *
+     * @param task_creation_queue The queue to pull task creation requests from.
+     * @param num_threads The number of worker threads to use.
+     * @param gpu_pipeline_map A mapping of operators to their pipelines.
+     */
+    task_creator(std::unique_ptr<task_creation_queue> task_creation_queue, 
+                 size_t num_threads, 
+                 gpu_pipeline_hashmap& gpu_pipeline_map);
 
-    virtual ~task_creator() { stop_thread_pool(); }
+    /**
+     * @brief Destructor that ensures the thread pool is stopped.
+     */
+    ~task_creator();
 
     // Non-copyable and movable
     task_creator(const task_creator&)            = delete;
@@ -75,83 +140,79 @@ class task_creator {
     task_creator(task_creator&&)                 = default;
     task_creator& operator=(task_creator&&)      = default;
 
-    void process_next_task(const duckdb::GPUPhysicalOperator* node) {
-        auto hint = node->get_next_task_hint();
-        if (std::holds_alternative<duckdb::GPUPhysicalOperator*>(hint)) {
-            schedule(hint);
-        } else if (std::holds_alternative<duckdb::GPUPipeline*>(hint)) {
-            auto* pipeline = std::get<duckdb::GPUPipeline*>(hint);
-            auto* node = pipeline->GetOperator()[0];
-            process_next_task(node);
-        } else {
-            duckdb::GPUPhysicalOperator* node = priority_scans.front();
-            schedule(std::make_unique<task_creation_hint>(node, nullptr));
-        }
-    }
+    /**
+     * @brief Process and schedule the next task based on operator hints.
+     *
+     * This method queries the given node for a hint about what task to create next.
+     * The hint can be another operator, a pipeline, or empty (in which case a
+     * priority scan is scheduled if available).
+     *
+     * @param node The operator node to get the next task hint from.
+     */
+    void process_next_task(::duckdb::GPUPhysicalOperator* node);
 
-    void start() {
-        while (!priority_scans.empty()) {
-          auto* node = priority_scans.front();
-          schedule(std::make_unique<task_creation_hint>(node, nullptr));
-          priority_scans.pop();
-        }
-    }
+    /**
+     * @brief Start scheduling initial scan pipelines.
+     *
+     * This method schedules all priority scan pipelines that were identified
+     * during construction.
+     */
+    void start();
 
-    void start_thread_pool() {
-      bool expected = false;
-      if (!_running.compare_exchange_strong(expected, true)) { return; }
-      on_start();
-      _threads.reserve(_num_threads);
-      for (int i = 0; i < _num_threads; ++i) {
-          _threads.push_back(std::make_unique<std::thread>(
-          &task_creator::worker_function, this, i));
-      }
-    }
+    /**
+     * @brief Start the worker thread pool.
+     *
+     * Creates and starts the worker threads that process task creation requests.
+     * This method is idempotent - calling it multiple times has no additional effect.
+     */
+    void start_thread_pool();
 
-    void stop_thread_pool() {
-      bool expected = true;
-      if (!_running.compare_exchange_strong(expected, false)) { return; }
-      on_stop();
-      for (auto& thread : _threads) {
-        if (thread->joinable()) { thread->join(); }
-      }
-      _threads.clear();
-    }
+    /**
+     * @brief Stop the worker thread pool.
+     *
+     * Stops all worker threads and waits for them to finish. This method is
+     * idempotent - calling it multiple times has no additional effect.
+     */
+    void stop_thread_pool();
 
-    void schedule(std::unique_ptr<task_creation_hint> hint) {
-        _task_creation_queue->push(std::move(hint));
-    }
+    /**
+     * @brief Schedule a task creation info for processing.
+     *
+     * @param info The task creation info to schedule.
+     */
+    void schedule(std::unique_ptr<task_creation_info> info);
 
-    void worker_function(int worker_id) {
-      while (true) {
-        if (!_running.load()) {
-          // Executor is stopped.
-          break;
-        }
-        auto hint = _task_creation_queue->pull();
-        if (hint == nullptr) {
-          // Task queue is closed.
-          break;
-        }
-        try {
-          auto node = std::get<duckdb::GPUPhysicalOperator*>(hint);
-          node->create_tasks();
-        } catch (const std::exception& e) {
-          schedule(std::move(hint));
-        }
-      }
-    }
+  private:
+    /**
+     * @brief Worker function executed by each thread in the pool.
+     *
+     * Continuously pulls task creation requests from the queue and processes them
+     * until the thread pool is stopped or the queue is closed.
+     *
+     * @param worker_id The identifier of this worker thread.
+     */
+    void worker_function(int worker_id);
 
-    void on_start() { _task_creation_queue->open(); }
+    /**
+     * @brief Called when the thread pool starts.
+     *
+     * Opens the task creation queue to accept requests.
+     */
+    void on_start();
 
-    void on_stop() { _task_creation_queue->close(); }
+    /**
+     * @brief Called when the thread pool stops.
+     *
+     * Closes the task creation queue to signal workers to exit.
+     */
+    void on_stop();
 
-    private:
-      size_t _num_threads;
-      std::atomic<bool> _running;
-      std::vector<std::unique_ptr<std::thread>> _threads;
-      std::queue<duckdb::GPUPhysicalOperator*> priority_scans;
-      std::unique_ptr<task_creation_queue> _task_creation_queue;
+    size_t _num_threads;
+    std::atomic<bool> _running;
+    std::vector<std::unique_ptr<std::thread>> _threads;
+    std::queue<::duckdb::shared_ptr<::duckdb::GPUPipeline>> priority_scans;
+    std::unique_ptr<task_creation_queue> _task_creation_queue;
+    gpu_pipeline_hashmap _gpu_pipeline_map;
 };
 
 }  // namespace sirius

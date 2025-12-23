@@ -37,6 +37,13 @@ namespace duckdb {
 class GPUExecutor;
 class GPUPhysicalOperator;
 class GPUPipeline;
+}  // namespace duckdb
+
+namespace sirius {
+using task_creation_hint = std::variant<std::monostate, ::duckdb::GPUPhysicalOperator*, ::duckdb::shared_ptr<::duckdb::GPUPipeline>>;
+}  // namespace sirius
+
+namespace duckdb {
 class GPUPipelineBuildState;
 class GPUMetaPipeline;
 
@@ -190,8 +197,8 @@ class GPUPhysicalOperator {
   port* get_port(std::string_view port_id);
   void add_next_port_after_sink(std::pair<GPUPhysicalOperator*, std::string_view> port_locator);
   vector<std::pair<GPUPhysicalOperator*, std::string_view>>& get_next_port_after_sink();
-  void create_next_task_hint();
-  void create_tasks();
+  ::sirius::task_creation_hint get_next_task_hint();
+  std::vector<::std::unique_ptr<::cucascade::data_batch_view>> get_input_batch();
 
  private:
   std::unordered_map<std::string, std::unique_ptr<port>> ports;
