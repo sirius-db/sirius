@@ -147,12 +147,12 @@ class gpu_pipeline_task : public itask {
    * @brief Construct a new gpu_pipeline_task object
    *
    * @param task_id The unique identifier for this task
-   * @param data_repo The data repository to push the output of this task to
+   * @param data_repos The data repositories to push the output of this task to
    * @param local_state The local state specific to this task
    * @param global_state The global state shared across multiple tasks
    */
   gpu_pipeline_task(uint64_t task_id,
-                    cucascade::idata_repository& data_repo,
+                    std::vector<cucascade::idata_repository*> data_repos,
                     std::unique_ptr<itask_local_state> local_state,
                     std::shared_ptr<itask_global_state> global_state);
 
@@ -195,8 +195,12 @@ class gpu_pipeline_task : public itask {
 =======
  private:
   uint64_t _task_id;
+<<<<<<< HEAD
   cucascade::idata_repository& _data_repo;
 >>>>>>> 842a98a2 (Using shared_ptr<data_batch> instead of data_batch_view in preparation for cucascade)
+=======
+  std::vector<cucascade::idata_repository*> _data_repos;
+>>>>>>> e15ed165 (Create pipeline task)
 };
 
 }  // namespace parallel

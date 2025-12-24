@@ -63,7 +63,7 @@ using namespace sirius;
 class test_scan_task : public parallel::duckdb_scan_task {
  public:
   test_scan_task(uint64_t task_id,
-                 cucascade::idata_repository& data_repo,
+                 cucascade::idata_repository* data_repo,
                  duckdb::Connection& con,
                  std::string const& table_name,
                  std::unique_ptr<parallel::duckdb_scan_task_local_state> l_state,
@@ -545,7 +545,7 @@ static void run_scan_test(std::string const& table_name,
   // Create and schedule test task
   uint64_t task_id = 1;
   auto task        = std::make_unique<test_scan_task>(
-    task_id, data_repo, con, staging_table, std::move(local_state), global_state);
+    task_id, &data_repo, con, staging_table, std::move(local_state), global_state);
   scan_executor.schedule(std::move(task));
 
   // Run task

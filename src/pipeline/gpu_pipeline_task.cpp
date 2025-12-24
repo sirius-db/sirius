@@ -23,10 +23,12 @@ namespace sirius {
 namespace parallel {
 
 gpu_pipeline_task::gpu_pipeline_task(uint64_t task_id,
-                                     cucascade::idata_repository& data_repo,
+                                     std::vector<cucascade::idata_repository*> data_repos,
                                      std::unique_ptr<itask_local_state> local_state,
                                      std::shared_ptr<itask_global_state> global_state)
-  : itask(std::move(local_state), std::move(global_state)), _task_id(task_id), _data_repo(data_repo)
+  : itask(std::move(local_state), std::move(global_state)),
+    _task_id(task_id),
+    _data_repos(std::move(data_repos))
 {
 }
 

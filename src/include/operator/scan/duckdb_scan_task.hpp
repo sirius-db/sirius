@@ -507,7 +507,7 @@ class duckdb_scan_task : public itask {
    * @param[in] g_state The shared global state for this scan task.
    */
   duckdb_scan_task(uint64_t task_id,
-                   idata_repository& data_repo,
+                   idata_repository* data_repo,
                    unique_ptr<duckdb_scan_task_local_state> l_state,
                    shared_ptr<duckdb_scan_task_global_state> g_state)
     : task_id(task_id), _data_repo(data_repo), itask(std::move(l_state), g_state) {};
@@ -564,7 +564,7 @@ class duckdb_scan_task : public itask {
 
  protected:
   //===----------Fields----------===//
-  idata_repository& _data_repo;  ///< Data repository to which to push batches
+  idata_repository* _data_repo;  ///< Data repository to which to push batches
   uint64_t task_id;              ///< The unique id of this scan task
 };
 

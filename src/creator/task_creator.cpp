@@ -16,6 +16,9 @@
 
 #include "creator/task_creator.hpp"
 
+#include "pipeline/gpu_pipeline_task.hpp"
+#include "scan/duckdb_scan_task.hpp"
+
 namespace sirius {
 
 //------------------------------------------------------------------------------
@@ -61,11 +64,15 @@ std::unique_ptr<task_creation_info> task_creation_queue::pull()
 
 task_creator::task_creator(std::unique_ptr<task_creation_queue> task_creation_queue,
                            size_t num_threads,
-                           gpu_pipeline_hashmap& gpu_pipeline_map)
+                           gpu_pipeline_hashmap& gpu_pipeline_map,
+                           parallel::pipeline_executor& pipeline_executor,
+                           parallel::duckdb_scan_executor& duckdb_scan_executor)
   : _task_creation_queue(std::move(task_creation_queue)),
     _num_threads(num_threads),
     _running(false),
-    _gpu_pipeline_map(gpu_pipeline_map)
+    _gpu_pipeline_map(gpu_pipeline_map),
+    _pipeline_executor(pipeline_executor),
+    _duckdb_scan_executor(duckdb_scan_executor)
 {
   for (int i = 0; i < gpu_pipeline_map._vec.size(); ++i) {
     if (gpu_pipeline_map._vec[i]->GetSource()->type == ::duckdb::PhysicalOperatorType::TABLE_SCAN) {
@@ -146,9 +153,30 @@ void task_creator::worker_function(int worker_id)
       break;
     }
     try {
-      ::duckdb::reference<::duckdb::GPUPhysicalOperator> node = info->pipeline->GetOperators()[0];
-      auto input_batch                                        = node.get().get_input_batch();
-      // TODO: Create task from input_batch, node, and pipeline
+      // scheduling scan task
+      if (info->node->type == ::duckdb::PhysicalOperatorType::TABLE_SCAN) {
+        // auto scan_task_global_state = std::make_shared<scan_task_global_state>(info->pipeline);
+        // auto scan_task_local_state = std::make_unique<scan_task_local_state>(info->node,
+        // info->pipeline); auto scan_task = std::make_unique<scan_task>(get_next_task_id(),
+        // info->destination_data_repositories, std::move(scan_task_local_state),
+        // std::move(scan_task_global_state)); _duckdb_scan_executor.schedule(std::move(scan_task));
+        // scheduling pipeline task
+      } else {
+        ::duckdb::reference<::duckdb::GPUPhysicalOperator> node = info->pipeline->GetOperators()[0];
+        auto input_batch                                        = node.get().get_input_batch();
+        // TODO: Create task from input_batch, node, and pipeline
+        auto global_state =
+          std::make_shared<parallel::gpu_pipeline_task_global_state>(info->pipeline);
+        auto local_state =
+          std::make_unique<parallel::gpu_pipeline_task_local_state>(input_batch, nullptr);
+        auto task =
+          std::make_unique<parallel::gpu_pipeline_task>(get_next_task_id(),
+                                                        info->destination_data_repositories,
+                                                        std::move(local_state),
+                                                        std::move(global_state));
+        _pipeline_executor.schedule(std::move(task));
+      }
+
     } catch (const std::exception& e) {
       schedule(std::move(info));
     }

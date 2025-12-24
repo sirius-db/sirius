@@ -17,11 +17,14 @@
 #pragma once
 
 #include "data/data_batch.hpp"
+#include "data/data_repository.hpp"
 #include "gpu_physical_operator.hpp"
 #include "gpu_pipeline.hpp"
 #include "gpu_pipeline_hashmap.hpp"
 #include "helper/helper.hpp"
 #include "parallel/task_executor.hpp"
+#include "pipeline/pipeline_executor.hpp"
+#include "scan/duckdb_scan_executor.hpp"
 
 #include <blockingconcurrentqueue.h>
 
@@ -44,9 +47,17 @@ class task_creation_info {
  public:
   task_creation_info(::duckdb::GPUPhysicalOperator* node,
                      ::duckdb::shared_ptr<::duckdb::GPUPipeline> pipeline)
-    : node(node), pipeline(std::move(pipeline)) {};
+    : node(node), pipeline(std::move(pipeline))
+  {
+    // get next port after sink and then get the data repository from the port
+    auto next_port_after_sink = pipeline->GetSink()->get_next_port_after_sink();
+    for (auto& [next_op, port_id] : next_port_after_sink) {
+      destination_data_repositories.push_back(next_op->get_port(port_id)->repo);
+    }
+  };
   ~task_creation_info() = default;
   ::duckdb::GPUPhysicalOperator* node;
+  std::vector<cucascade::idata_repository*> destination_data_repositories;
   ::duckdb::shared_ptr<::duckdb::GPUPipeline> pipeline;
 };
 
@@ -126,10 +137,14 @@ class task_creator {
    * @param task_creation_queue The queue to pull task creation requests from.
    * @param num_threads The number of worker threads to use.
    * @param gpu_pipeline_map A mapping of operators to their pipelines.
+   * @param pipeline_executor Reference to the pipeline executor.
+   * @param duckdb_scan_executor Reference to the duckdb scan executor.
    */
   task_creator(std::unique_ptr<task_creation_queue> task_creation_queue,
                size_t num_threads,
-               gpu_pipeline_hashmap& gpu_pipeline_map);
+               gpu_pipeline_hashmap& gpu_pipeline_map,
+               parallel::pipeline_executor& pipeline_executor,
+               parallel::duckdb_scan_executor& duckdb_scan_executor);
 
   /**
    * @brief Destructor that ensures the thread pool is stopped.
@@ -221,7 +236,9 @@ class task_creator {
   std::vector<std::unique_ptr<std::thread>> _threads;
   std::queue<::duckdb::shared_ptr<::duckdb::GPUPipeline>> priority_scans;
   std::unique_ptr<task_creation_queue> _task_creation_queue;
-  gpu_pipeline_hashmap _gpu_pipeline_map;
+  gpu_pipeline_hashmap& _gpu_pipeline_map;
+  parallel::pipeline_executor& _pipeline_executor;
+  parallel::duckdb_scan_executor& _duckdb_scan_executor;
   atomic<uint64_t> _task_id;
 };
 
