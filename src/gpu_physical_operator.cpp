@@ -56,9 +56,6 @@ OperatorResultType GPUPhysicalOperator::Execute(GPUIntermediateRelation& input_r
   throw InternalException("Calling Execute on a node that is not an operator!");
 }
 
-// TODO: Implement Execute for std::vector<std::unique_ptr<cucascade::data_batch_view>>
-// input_batch if needed.
-
 //===--------------------------------------------------------------------===//
 // Source
 //===--------------------------------------------------------------------===//
@@ -239,19 +236,18 @@ GPUPhysicalOperator::get_next_port_after_sink()
   return ::sirius::task_creation_hint(std::monostate{});
 }
 
-std::vector<::std::unique_ptr<::cucascade::data_batch_view>> GPUPhysicalOperator::get_input_batch()
+std::vector<::std::shared_ptr<::cucascade::data_batch>> GPUPhysicalOperator::get_input_batch()
 {
   // take one data batch from each port and schedule a task (a task takes one data batch from each
   // port), do this repeatedly until all ports are empty
-  std::vector<::std::unique_ptr<::cucascade::data_batch_view>> input_batch;
+  std::vector<::std::shared_ptr<::cucascade::data_batch>> input_batch;
   for (auto& [port_name, port_ptr] : ports) {
     // For Pipeline barrier: need at least one data batch in the port's repository
-    auto batch_view = port_ptr->repo->pull_data_batch_view();
-    input_batch.push_back(std::move(batch_view));
+    // TODO: later on we will adjust to the new data repository interface in cuCascade
+    auto batch = port_ptr->repo->pull_data_batch();
+    input_batch.push_back(std::move(batch));
   }
-  if (input_batch.empty()) {
-    return std::vector<::std::unique_ptr<::cucascade::data_batch_view>>{};
-  }
+  if (input_batch.empty()) { return std::vector<::std::shared_ptr<::cucascade::data_batch>>{}; }
   return input_batch;
 }
 

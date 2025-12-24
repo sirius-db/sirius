@@ -23,7 +23,6 @@
 // sirius
 #include <data/data_batch.hpp>
 #include <data/data_repository.hpp>
-#include <data/data_repository_manager.hpp>
 #include <scan/duckdb_scan_executor.hpp>
 #include <scan/duckdb_scan_task.hpp>
 #include <scan/physical_table_scan_adapter.hpp>
@@ -64,12 +63,12 @@ using namespace sirius;
 class test_scan_task : public parallel::duckdb_scan_task {
  public:
   test_scan_task(uint64_t task_id,
-                 cucascade::shared_data_repository_manager& dr_mgr,
+                 cucascade::idata_repository& data_repo,
                  duckdb::Connection& con,
                  std::string const& table_name,
                  std::unique_ptr<parallel::duckdb_scan_task_local_state> l_state,
                  std::shared_ptr<parallel::duckdb_scan_task_global_state> g_state)
-    : duckdb_scan_task(task_id, dr_mgr, std::move(l_state), g_state),
+    : duckdb_scan_task(task_id, data_repo, std::move(l_state), g_state),
       con_(con),
       table_name_(table_name)
   {
@@ -113,8 +112,12 @@ class test_scan_task : public parallel::duckdb_scan_task {
       // Create a new reference to the global state
       auto shared_global_state =
         std::static_pointer_cast<parallel::duckdb_scan_task_global_state>(this->_global_state);
-      auto next_task = std::make_unique<test_scan_task>(
-        new_task_id, dr_mgr, con_, table_name_, std::move(new_local_state), shared_global_state);
+      auto next_task = std::make_unique<test_scan_task>(new_task_id,
+                                                        _data_repo,
+                                                        con_,
+                                                        table_name_,
+                                                        std::move(new_local_state),
+                                                        shared_global_state);
       g_state.scan_executor.schedule(std::move(next_task));
     }
 
@@ -533,7 +536,7 @@ static void run_scan_test(std::string const& table_name,
     pipeline_id, scan_executor, client_ctx, ptsa);
 
   // Create data repository manager (empty, unused for this test)
-  cucascade::shared_data_repository_manager dr_mgr;
+  cucascade::idata_repository data_repo;
 
   // Create local state
   auto local_state =
@@ -542,7 +545,7 @@ static void run_scan_test(std::string const& table_name,
   // Create and schedule test task
   uint64_t task_id = 1;
   auto task        = std::make_unique<test_scan_task>(
-    task_id, dr_mgr, con, staging_table, std::move(local_state), global_state);
+    task_id, data_repo, con, staging_table, std::move(local_state), global_state);
   scan_executor.schedule(std::move(task));
 
   // Run task

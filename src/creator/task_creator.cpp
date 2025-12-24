@@ -159,4 +159,6 @@ void task_creator::on_start() { _task_creation_queue->open(); }
 
 void task_creator::on_stop() { _task_creation_queue->close(); }
 
+uint64_t task_creator::get_next_task_id() { return _task_id.fetch_add(1); }
+
 }  // namespace sirius

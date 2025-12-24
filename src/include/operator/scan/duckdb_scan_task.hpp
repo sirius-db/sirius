@@ -18,7 +18,7 @@
 
 // sirius
 #include <config.hpp>
-#include <data/data_repository_manager.hpp>
+#include <data/data_repository.hpp>
 #include <memory/fixed_size_host_memory_resource.hpp>
 #include <memory/memory_reservation.hpp>
 #include <memory/memory_reservation_manager.hpp>
@@ -492,7 +492,7 @@ class duckdb_scan_task_local_state : public itask_local_state {
  * incomplete upon task completion, the task will push a new scan_task onto the task queue.
  */
 class duckdb_scan_task : public itask {
-  using data_repository_manager = cucascade::shared_data_repository_manager;
+  using idata_repository = cucascade::idata_repository;
   // Friend declaration for test access
   friend class test_scan_task;
 
@@ -502,15 +502,15 @@ class duckdb_scan_task : public itask {
    * @brief Construct a duckdb_scan_task object.
    *
    * @param[in] task_id The unique id of this scan task.
-   * @param[in] dr_mgr The data repository manager to which to push batches.
+   * @param[in] data_repo The data repository to which to push batches.
    * @param[in] l_state The local state for this scan task.
    * @param[in] g_state The shared global state for this scan task.
    */
   duckdb_scan_task(uint64_t task_id,
-                   data_repository_manager& dr_mgr,
+                   idata_repository& data_repo,
                    unique_ptr<duckdb_scan_task_local_state> l_state,
                    shared_ptr<duckdb_scan_task_global_state> g_state)
-    : task_id(task_id), dr_mgr(dr_mgr), itask(std::move(l_state), g_state) {};
+    : task_id(task_id), _data_repo(data_repo), itask(std::move(l_state), g_state) {};
 
   void execute() override;
 
@@ -564,8 +564,8 @@ class duckdb_scan_task : public itask {
 
  protected:
   //===----------Fields----------===//
-  data_repository_manager& dr_mgr;  ///< Data repository manager to which to push batches
-  uint64_t task_id;                 ///< The unique id of this scan task
+  idata_repository& _data_repo;  ///< Data repository to which to push batches
+  uint64_t task_id;              ///< The unique id of this scan task
 };
 
 }  // namespace sirius::parallel

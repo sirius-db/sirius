@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include "data/data_batch_view.hpp"
+#include "data/data_batch.hpp"
 #include "gpu_physical_operator.hpp"
 #include "gpu_pipeline.hpp"
 #include "gpu_pipeline_hashmap.hpp"
@@ -209,12 +209,20 @@ class task_creator {
    */
   void on_stop();
 
+  /**
+   * @brief Get the next task id.
+   *
+   * @return uint64_t The next task id.
+   */
+  uint64_t get_next_task_id();
+
   size_t _num_threads;
   std::atomic<bool> _running;
   std::vector<std::unique_ptr<std::thread>> _threads;
   std::queue<::duckdb::shared_ptr<::duckdb::GPUPipeline>> priority_scans;
   std::unique_ptr<task_creation_queue> _task_creation_queue;
   gpu_pipeline_hashmap _gpu_pipeline_map;
+  atomic<uint64_t> _task_id;
 };
 
 }  // namespace sirius

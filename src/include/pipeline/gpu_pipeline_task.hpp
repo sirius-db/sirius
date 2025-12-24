@@ -18,6 +18,10 @@
 
 #include "config.hpp"
 #include "creator/task_completion.hpp"
+<<<<<<< HEAD
+=======
+#include "data/data_repository.hpp"
+>>>>>>> 842a98a2 (Using shared_ptr<data_batch> instead of data_batch_view in preparation for cucascade)
 #include "gpu_pipeline.hpp"
 #include "parallel/task_executor.hpp"
 
@@ -45,11 +49,9 @@ class gpu_pipeline_task_global_state : public itask_global_state {
   /**
    * @brief Construct a new gpu_pipeline_task_global_state object
    *
-   * @param pipeline_id Identifier for the pipeline this task belongs to
    * @param pipeline Shared pointer to the GPU pipeline to execute
-   * @param data_repo_mgr Reference to the data repository manager for accessing input data
-   * @param message_queue Reference to the message queue for task completion notifications
    */
+<<<<<<< HEAD
   explicit gpu_pipeline_task_global_state(uint64_t pipeline_id,
                                           duckdb::shared_ptr<duckdb::GPUPipeline> pipeline,
                                           cucascade::shared_data_repository_manager& data_repo_mgr,
@@ -65,9 +67,14 @@ class gpu_pipeline_task_global_state : public itask_global_state {
     _data_repo_mgr;  ///< Reference to the data repository manager
   task_completion_message_queue&
     _message_queue;  ///< Message queue to notify TaskCreator about task completion
+=======
+  explicit gpu_pipeline_task_global_state(duckdb::shared_ptr<duckdb::GPUPipeline> pipeline)
+    : _pipeline(std::move(pipeline))
+  {
+  }
+>>>>>>> 842a98a2 (Using shared_ptr<data_batch> instead of data_batch_view in preparation for cucascade)
   duckdb::shared_ptr<duckdb::GPUPipeline>
-    _pipeline;            ///< Shared pointer to the GPU pipeline to execute
-  uint64_t _pipeline_id;  ///< Identifier for the pipeline this task belongs to
+    _pipeline;  ///< Shared pointer to the GPU pipeline to execute
 };
 
 /**
@@ -82,6 +89,7 @@ class gpu_pipeline_task_local_state : public itask_local_state {
   /**
    * @brief Construct a new gpu_pipeline_task_local_state object
    *
+<<<<<<< HEAD
    * @param task_id Unique identifier for this task
    * @param batches Vector of data batches serving as input to the pipeline
    */
@@ -96,6 +104,20 @@ class gpu_pipeline_task_local_state : public itask_local_state {
   uint64_t _task_id;  ///< Unique identifier for this task
   std::vector<std::shared_ptr<cucascade::data_batch>>
     _batches;  ///< Input data batches for the pipeline
+=======
+   * @param batch_views Vector of data batches serving as input to the pipeline
+   * @param res Memory reservation for GPU resources
+   */
+  explicit gpu_pipeline_task_local_state(
+    std::vector<std::shared_ptr<cucascade::data_batch>> batch_views,
+    std::unique_ptr<cucascade::memory::reservation> res = nullptr)
+    : _batch_views(std::move(batch_views)), _reservation(std::move(res))
+  {
+  }
+
+  std::vector<std::shared_ptr<cucascade::data_batch>>
+    _batch_views;  ///< Input data batches for the pipeline
+>>>>>>> 842a98a2 (Using shared_ptr<data_batch> instead of data_batch_view in preparation for cucascade)
 
   void set_reservation(std::unique_ptr<cucascade::memory::reservation> res)
   {
@@ -124,10 +146,14 @@ class gpu_pipeline_task : public itask {
   /**
    * @brief Construct a new gpu_pipeline_task object
    *
+   * @param task_id The unique identifier for this task
+   * @param data_repo The data repository to push the output of this task to
    * @param local_state The local state specific to this task
    * @param global_state The global state shared across multiple tasks
    */
-  gpu_pipeline_task(std::unique_ptr<itask_local_state> local_state,
+  gpu_pipeline_task(uint64_t task_id,
+                    cucascade::idata_repository& data_repo,
+                    std::unique_ptr<itask_local_state> local_state,
                     std::shared_ptr<itask_global_state> global_state);
 
   /**
@@ -158,6 +184,7 @@ class gpu_pipeline_task : public itask {
    */
   void mark_task_completion();
 
+<<<<<<< HEAD
   /**
    * @brief Method to push the output of this task to the Data Repository
    *
@@ -165,6 +192,11 @@ class gpu_pipeline_task : public itask {
    * @param pipeline_id The id of the pipeline that produced this data batch
    */
   void push_data_batch(std::shared_ptr<cucascade::data_batch> batch, uint64_t pipeline_id);
+=======
+ private:
+  uint64_t _task_id;
+  cucascade::idata_repository& _data_repo;
+>>>>>>> 842a98a2 (Using shared_ptr<data_batch> instead of data_batch_view in preparation for cucascade)
 };
 
 }  // namespace parallel
