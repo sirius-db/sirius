@@ -470,7 +470,7 @@ void GPUColumn::setFromCudfScalar(cudf::scalar& cudf_scalar, GPUBufferManager* g
   SIRIUS_LOG_DEBUG("Set a GPUColumn from cudf::scalar");
   cudf::data_type scalar_type = cudf_scalar.type();
   if (scalar_type == cudf::data_type(cudf::type_id::INT64)) {
-    auto& typed_scalar = static_cast<cudf::numeric_scalar<uint64_t>&>(cudf_scalar);
+    auto& typed_scalar = static_cast<cudf::numeric_scalar<int64_t>&>(cudf_scalar);
     data_wrapper.data  = gpuBufferManager->customCudaMalloc<uint8_t>(sizeof(uint64_t), 0, 0);
     callCudaMemcpyDeviceToDevice<uint8_t>(
       data_wrapper.data, reinterpret_cast<uint8_t*>(typed_scalar.data()), sizeof(uint64_t), 0);
