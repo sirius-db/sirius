@@ -220,29 +220,31 @@ GPUPhysicalOperator::get_next_port_after_sink()
   return next_port_after_sink;
 }
 
-::sirius::task_creation_hint GPUPhysicalOperator::get_next_task_hint()
+::sirius::creator::task_creation_hint GPUPhysicalOperator::get_next_task_hint()
 {
   for (auto& [port_name, port_ptr] : ports) {
     if (port_ptr->type == MemoryBarrierType::PIPELINE) {
       // For pipeline barrier: check if there is a data batch available
       if (!port_ptr->repo->check_data_batch_availability()) {
         // No data batch available, return src pipeline or monostate
-        if (port_ptr->src_pipeline) { return ::sirius::task_creation_hint(port_ptr->src_pipeline); }
-        return ::sirius::task_creation_hint(std::monostate{});
+        if (port_ptr->src_pipeline) {
+          return ::sirius::creator::task_creation_hint(port_ptr->src_pipeline);
+        }
+        return ::sirius::creator::task_creation_hint(std::monostate{});
       }
     } else if (port_ptr->type == MemoryBarrierType::FULL) {
       // For full barrier: src pipeline must be finished and have data
       // We assume that there will be a data batch if the src pipeline is finished
       if (!port_ptr->src_pipeline->is_pipeline_finished()) {
         // Src pipeline not finished, return it to continue processing
-        return ::sirius::task_creation_hint(port_ptr->src_pipeline);
+        return ::sirius::creator::task_creation_hint(port_ptr->src_pipeline);
       }
     }
   }
 
   // All ports are ready (either PIPELINE with data, or FULL with finished pipeline)
-  if (!ports.empty()) { return ::sirius::task_creation_hint(this); }
-  return ::sirius::task_creation_hint(std::monostate{});
+  if (!ports.empty()) { return ::sirius::creator::task_creation_hint(this); }
+  return ::sirius::creator::task_creation_hint(std::monostate{});
 }
 
 std::vector<::std::shared_ptr<::cucascade::data_batch>> GPUPhysicalOperator::get_input_batch()
@@ -268,7 +270,10 @@ bool GPUPhysicalOperator::all_ports_empty()
   return true;
 }
 
-void GPUPhysicalOperator::set_creator(::sirius::task_creator* creator) { this->creator = creator; }
+void GPUPhysicalOperator::set_creator(::sirius::creator::task_creator* creator)
+{
+  this->creator = creator;
+}
 
 bool GPUPhysicalOperator::is_source_pipeline_finished()
 {

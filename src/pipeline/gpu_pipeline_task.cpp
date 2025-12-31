@@ -20,12 +20,13 @@
 #include <data/data_repository_manager.hpp>
 
 namespace sirius {
-namespace parallel {
+namespace pipeline {
 
-gpu_pipeline_task::gpu_pipeline_task(uint64_t task_id,
-                                     std::vector<cucascade::idata_repository*> data_repos,
-                                     std::unique_ptr<itask_local_state> local_state,
-                                     std::shared_ptr<itask_global_state> global_state)
+gpu_pipeline_task::gpu_pipeline_task(
+  uint64_t task_id,
+  std::vector<cucascade::idata_repository*> data_repos,
+  std::unique_ptr<sirius::parallel::itask_local_state> local_state,
+  std::shared_ptr<sirius::parallel::itask_global_state> global_state)
   : itask(std::move(local_state), std::move(global_state)),
     _task_id(task_id),
     _data_repos(std::move(data_repos))
@@ -66,5 +67,5 @@ void gpu_pipeline_task::execute()
   // Processing handles are automatically released here when they go out of scope
 }
 
-}  // namespace parallel
+}  // namespace pipeline
 }  // namespace sirius

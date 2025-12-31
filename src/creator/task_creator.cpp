@@ -21,7 +21,7 @@
 
 #include <duckdb/parallel/thread_context.hpp>
 
-namespace sirius {
+namespace sirius::creator {
 
 //------------------------------------------------------------------------------
 // task_creation_queue
@@ -64,20 +64,19 @@ std::unique_ptr<task_creation_info> task_creation_queue::pull()
 // task_creator
 //------------------------------------------------------------------------------
 
-task_creator::task_creator(std::unique_ptr<task_creation_queue> task_creation_queue,
-                           size_t num_threads,
+task_creator::task_creator(size_t num_threads,
                            gpu_pipeline_hashmap& gpu_pipeline_map,
                            ::duckdb::ClientContext& client_context,
-                           parallel::pipeline_executor& pipeline_executor,
-                           parallel::duckdb_scan_executor& duckdb_scan_executor)
-  : _task_creation_queue(std::move(task_creation_queue)),
-    _num_threads(num_threads),
+                           pipeline::pipeline_executor& pipeline_executor,
+                           op::scan::duckdb_scan_executor& duckdb_scan_executor)
+  : _num_threads(num_threads),
     _running(false),
     _gpu_pipeline_map(gpu_pipeline_map),
     _client_context(client_context),
     _pipeline_executor(pipeline_executor),
     _duckdb_scan_executor(duckdb_scan_executor)
 {
+  _task_creation_queue = std::make_unique<task_creation_queue>(num_threads);
   for (int i = 0; i < gpu_pipeline_map._vec.size(); ++i) {
     if (gpu_pipeline_map._vec[i]->GetSource()->type == ::duckdb::PhysicalOperatorType::TABLE_SCAN) {
       priority_scans.push(gpu_pipeline_map._vec[i]);
@@ -115,6 +114,7 @@ void task_creator::process_next_task(::duckdb::GPUPhysicalOperator* node)
 
 void task_creator::start()
 {
+  start_thread_pool();
   while (!priority_scans.empty()) {
     ::duckdb::shared_ptr<::duckdb::GPUPipeline> pipeline = priority_scans.front();
     auto* scan_node                                      = pipeline->GetSource().get();
@@ -122,6 +122,8 @@ void task_creator::start()
     priority_scans.pop();
   }
 }
+
+void task_creator::stop() { stop_thread_pool(); }
 
 void task_creator::start_thread_pool()
 {
@@ -166,17 +168,17 @@ void task_creator::worker_function(int worker_id)
       // scheduling scan task
       if (info->_node->type == ::duckdb::PhysicalOperatorType::TABLE_SCAN) {
         info->_pipeline->GetSource()->set_creator(this);
-        auto scan_task_global_state = std::make_shared<parallel::duckdb_scan_task_global_state>(
+        auto scan_task_global_state = std::make_shared<op::scan::duckdb_scan_task_global_state>(
           info->_pipeline,
           _duckdb_scan_executor,
           _client_context,
           &info->_node->Cast<duckdb::GPUPhysicalTableScan>());
         duckdb::ThreadContext thread_ctx(_client_context);
         duckdb::ExecutionContext exec_ctx(_client_context, thread_ctx, nullptr);
-        auto scan_task_local_state = std::make_unique<parallel::duckdb_scan_task_local_state>(
+        auto scan_task_local_state = std::make_unique<op::scan::duckdb_scan_task_local_state>(
           *scan_task_global_state, exec_ctx);
         auto scan_task =
-          std::make_unique<parallel::duckdb_scan_task>(get_next_task_id(),
+          std::make_unique<op::scan::duckdb_scan_task>(get_next_task_id(),
                                                        info->destination_data_repositories[0],
                                                        std::move(scan_task_local_state),
                                                        std::move(scan_task_global_state));
@@ -190,11 +192,11 @@ void task_creator::worker_function(int worker_id)
         while (!node.get().all_ports_empty()) {
           auto input_batch = node.get().get_input_batch();
           auto global_state =
-            std::make_shared<parallel::gpu_pipeline_task_global_state>(info->_pipeline);
+            std::make_shared<pipeline::gpu_pipeline_task_global_state>(info->_pipeline);
           auto local_state =
-            std::make_unique<parallel::gpu_pipeline_task_local_state>(input_batch, nullptr);
+            std::make_unique<pipeline::gpu_pipeline_task_local_state>(input_batch, nullptr);
           auto task =
-            std::make_unique<parallel::gpu_pipeline_task>(get_next_task_id(),
+            std::make_unique<pipeline::gpu_pipeline_task>(get_next_task_id(),
                                                           info->destination_data_repositories,
                                                           std::move(local_state),
                                                           std::move(global_state));
@@ -214,4 +216,4 @@ void task_creator::on_stop() { _task_creation_queue->close(); }
 
 uint64_t task_creator::get_next_task_id() { return _task_id.fetch_add(1); }
 
-}  // namespace sirius
+}  // namespace sirius::creator

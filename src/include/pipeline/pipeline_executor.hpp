@@ -25,7 +25,7 @@
 #include <data/data_repository.hpp>
 
 namespace sirius {
-namespace parallel {
+namespace pipeline {
 
 /**
  * @brief Executor specialized for executing GPU pipeline operations.
@@ -34,14 +34,14 @@ namespace parallel {
  * task scheduling. It manages a pool of threads dedicated to executing GPU pipeline
  * tasks with specialized GPU resource management.
  */
-class pipeline_executor : public itask_executor {
+class pipeline_executor : public sirius::parallel::itask_executor {
  public:
   /**
    * @brief Constructs a new pipeline_executor with task execution configuration
    *
    * @param config Configuration for the task executor (thread count, retry policy, etc.)
    */
-  explicit pipeline_executor(task_executor_config config);
+  explicit pipeline_executor(sirius::parallel::task_executor_config config);
 
   /**
    * @brief Destructor for the gpu_pipeline_executor.
@@ -63,7 +63,7 @@ class pipeline_executor : public itask_executor {
    *
    * @param task The task to schedule (must be a gpu_pipeline_task)
    */
-  void schedule(std::unique_ptr<itask> task) override;
+  void schedule(std::unique_ptr<sirius::parallel::itask> task) override;
 
   /**
    * @brief Main worker loop for executing GPU pipeline tasks
@@ -100,7 +100,7 @@ class pipeline_executor : public itask_executor {
    * @param task The task to schedule
    * @param gpu_id The GPU ID to which the task should be scheduled
    */
-  void dispatch_to_gpu_executor(std::unique_ptr<itask> task, int gpu_id);
+  void dispatch_to_gpu_executor(std::unique_ptr<sirius::parallel::itask> task, int gpu_id);
 
   /**
    * @brief Submit a task request to task_request_queue
@@ -112,5 +112,5 @@ class pipeline_executor : public itask_executor {
   std::unique_ptr<task_request_queue> _task_request_queue;
 };
 
-}  // namespace parallel
+}  // namespace pipeline
 }  // namespace sirius

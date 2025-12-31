@@ -23,9 +23,9 @@
 #include "gpu_pipeline.hpp"
 #include "gpu_pipeline_hashmap.hpp"
 #include "helper/helper.hpp"
+#include "operator/scan/duckdb_scan_executor.hpp"
 #include "parallel/task_executor.hpp"
 #include "pipeline/pipeline_executor.hpp"
-#include "scan/duckdb_scan_executor.hpp"
 
 #include <blockingconcurrentqueue.h>
 
@@ -36,7 +36,7 @@
 #include <thread>
 #include <variant>
 
-namespace sirius {
+namespace sirius::creator {
 
 /**
  * @brief Contains information needed to create a task.
@@ -142,18 +142,16 @@ class task_creator {
   /**
    * @brief Construct a new task_creator.
    *
-   * @param task_creation_queue The queue to pull task creation requests from.
    * @param num_threads The number of worker threads to use.
    * @param gpu_pipeline_map A mapping of operators to their pipelines.
    * @param pipeline_executor Reference to the pipeline executor.
    * @param duckdb_scan_executor Reference to the duckdb scan executor.
    */
-  task_creator(std::unique_ptr<task_creation_queue> task_creation_queue,
-               size_t num_threads,
+  task_creator(size_t num_threads,
                gpu_pipeline_hashmap& gpu_pipeline_map,
                ::duckdb::ClientContext& client_context,
-               parallel::pipeline_executor& pipeline_executor,
-               parallel::duckdb_scan_executor& duckdb_scan_executor);
+               sirius::pipeline::pipeline_executor& pipeline_executor,
+               sirius::op::scan::duckdb_scan_executor& duckdb_scan_executor);
 
   /**
    * @brief Destructor that ensures the thread pool is stopped.
@@ -184,6 +182,11 @@ class task_creator {
    * during construction.
    */
   void start();
+
+  /**
+   * @brief Stop the task creator and its thread pool.
+   */
+  void stop();
 
   /**
    * @brief Start the worker thread pool.
@@ -254,9 +257,9 @@ class task_creator {
   std::unique_ptr<task_creation_queue> _task_creation_queue;
   gpu_pipeline_hashmap& _gpu_pipeline_map;
   ::duckdb::ClientContext& _client_context;
-  parallel::pipeline_executor& _pipeline_executor;
-  parallel::duckdb_scan_executor& _duckdb_scan_executor;
+  sirius::pipeline::pipeline_executor& _pipeline_executor;
+  sirius::op::scan::duckdb_scan_executor& _duckdb_scan_executor;
   atomic<uint64_t> _task_id;
 };
 
-}  // namespace sirius
+}  // namespace sirius::creator

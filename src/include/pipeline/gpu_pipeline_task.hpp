@@ -34,7 +34,7 @@
 #include <vector>
 
 namespace sirius {
-namespace parallel {
+namespace pipeline {
 
 /**
  * @brief Global state shared across all GPU pipeline tasks in an execution context.
@@ -44,7 +44,7 @@ namespace parallel {
  * for retrieving input data and a message queue for notifying the TaskCreator
  * about task completion events.
  */
-class gpu_pipeline_task_global_state : public itask_global_state {
+class gpu_pipeline_task_global_state : public sirius::parallel::itask_global_state {
  public:
   /**
    * @brief Construct a new gpu_pipeline_task_global_state object
@@ -84,7 +84,7 @@ class gpu_pipeline_task_global_state : public itask_global_state {
  * execution. It holds the task and pipeline identifiers, the GPU pipeline to
  * execute, and the data batch views that serve as input to the pipeline.
  */
-class gpu_pipeline_task_local_state : public itask_local_state {
+class gpu_pipeline_task_local_state : public sirius::parallel::itask_local_state {
  public:
   /**
    * @brief Construct a new gpu_pipeline_task_local_state object
@@ -141,7 +141,7 @@ class gpu_pipeline_task_local_state : public itask_local_state {
  * Note that this class will be further derived to represent specific types of tasks such as build,
  * aggregation, etc..
  */
-class gpu_pipeline_task : public itask {
+class gpu_pipeline_task : public sirius::parallel::itask {
  public:
   /**
    * @brief Construct a new gpu_pipeline_task object
@@ -153,8 +153,8 @@ class gpu_pipeline_task : public itask {
    */
   gpu_pipeline_task(uint64_t task_id,
                     std::vector<cucascade::idata_repository*> data_repos,
-                    std::unique_ptr<itask_local_state> local_state,
-                    std::shared_ptr<itask_global_state> global_state);
+                    std::unique_ptr<sirius::parallel::itask_local_state> local_state,
+                    std::shared_ptr<sirius::parallel::itask_global_state> global_state);
 
   /**
    * @brief Method to actually execute the task
@@ -203,5 +203,5 @@ class gpu_pipeline_task : public itask {
 >>>>>>> e15ed165 (Create pipeline task)
 };
 
-}  // namespace parallel
+}  // namespace pipeline
 }  // namespace sirius

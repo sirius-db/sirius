@@ -59,14 +59,14 @@ using namespace sirius;
  * and then reads data from the column_builders to append to a staging table. It is essentially a
  * replica of duckdb_scan_task that adds an append() hook at the end for validation.
  */
-class test_scan_task : public parallel::duckdb_scan_task {
+class test_scan_task : public op::scan::duckdb_scan_task {
  public:
   test_scan_task(uint64_t task_id,
                  cucascade::idata_repository* data_repo,
                  duckdb::Connection& con,
                  std::string const& table_name,
-                 std::unique_ptr<parallel::duckdb_scan_task_local_state> l_state,
-                 std::shared_ptr<parallel::duckdb_scan_task_global_state> g_state)
+                 std::unique_ptr<op::scan::duckdb_scan_task_local_state> l_state,
+                 std::shared_ptr<op::scan::duckdb_scan_task_global_state> g_state)
     : duckdb_scan_task(task_id, data_repo, std::move(l_state), g_state),
       con_(con),
       table_name_(table_name)
@@ -75,8 +75,8 @@ class test_scan_task : public parallel::duckdb_scan_task {
 
   void execute() override
   {
-    auto& l_state = this->_local_state->cast<parallel::duckdb_scan_task_local_state>();
-    auto& g_state = this->_global_state->cast<parallel::duckdb_scan_task_global_state>();
+    auto& l_state = this->_local_state->cast<op::scan::duckdb_scan_task_local_state>();
+    auto& g_state = this->_global_state->cast<op::scan::duckdb_scan_task_global_state>();
 
     // Initialize the data chunk
     l_state.chunk.Initialize(duckdb::Allocator::Get(l_state.exec_ctx.client),
@@ -101,7 +101,7 @@ class test_scan_task : public parallel::duckdb_scan_task {
 
       // Create a new local state, passing the existing local_tf_state to continue the scan
       // This ensures DuckDB continues scanning from the current position rather than starting over
-      auto new_local_state = std::make_unique<parallel::duckdb_scan_task_local_state>(
+      auto new_local_state = std::make_unique<op::scan::duckdb_scan_task_local_state>(
         g_state,
         l_state.exec_ctx,
         l_state.approximate_batch_size,
@@ -110,7 +110,7 @@ class test_scan_task : public parallel::duckdb_scan_task {
 
       // Create a new reference to the global state
       auto shared_global_state =
-        std::static_pointer_cast<parallel::duckdb_scan_task_global_state>(this->_global_state);
+        std::static_pointer_cast<op::scan::duckdb_scan_task_global_state>(this->_global_state);
       auto next_task = std::make_unique<test_scan_task>(new_task_id,
                                                         _data_repo,
                                                         con_,
@@ -144,7 +144,7 @@ class test_scan_task : public parallel::duckdb_scan_task {
    * NOTE: Uses a mutex to protect DuckDB connection access since DuckDB connections
    * are not thread-safe for concurrent writes.
    */
-  void append_to_table(parallel::duckdb_scan_task_local_state& l_state)
+  void append_to_table(op::scan::duckdb_scan_task_local_state& l_state)
   {
     auto const num_rows = l_state.row_offset;
     if (num_rows == 0) {
@@ -513,7 +513,7 @@ static void run_scan_test(std::string const& table_name,
   REQUIRE(!create_result->HasError());
 
   // Create scan executor (task scheduler)
-  parallel::duckdb_scan_executor scan_executor({num_threads, false});
+  op::scan::duckdb_scan_executor scan_executor({num_threads, false});
 
   // Create execution context using dummy query
   auto dummy_query = "SELECT * FROM " + table_name + " LIMIT 0";
@@ -528,7 +528,7 @@ static void run_scan_test(std::string const& table_name,
   duckdb::ExecutionContext exec_ctx(client_ctx, thread_ctx, nullptr);
 
   // Create global state
-  auto global_state = std::make_shared<parallel::duckdb_scan_task_global_state>(
+  auto global_state = std::make_shared<op::scan::duckdb_scan_task_global_state>(
     nullptr, scan_executor, client_ctx, physical_scan.get());
 
   // Create data repository manager (empty, unused for this test)
@@ -536,7 +536,7 @@ static void run_scan_test(std::string const& table_name,
 
   // Create local state
   auto local_state =
-    std::make_unique<parallel::duckdb_scan_task_local_state>(*global_state, exec_ctx, batch_size);
+    std::make_unique<op::scan::duckdb_scan_task_local_state>(*global_state, exec_ctx, batch_size);
 
   // Create and schedule test task
   uint64_t task_id = 1;

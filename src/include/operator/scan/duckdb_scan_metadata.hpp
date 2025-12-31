@@ -21,7 +21,7 @@
 #include "helper/helper.hpp"
 #include "operator/gpu_physical_table_scan.hpp"
 
-namespace sirius {
+namespace sirius::op::scan {
 
 class duckdb_scan_metadata {
  public:
@@ -37,4 +37,4 @@ class duckdb_scan_metadata {
     _op;  // The GPU physical table scan operator associated with this executor
 };
 
-}  // namespace sirius
+}  // namespace sirius::op::scan

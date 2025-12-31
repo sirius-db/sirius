@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "data/data_repository_manager.hpp"
 #include "duckdb/common/common.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/pair.hpp"
@@ -84,10 +85,13 @@ class GPUExecutor {
   void Initialize(unique_ptr<GPUPhysicalOperator> physical_plan);
   void InitializeInternal(GPUPhysicalOperator& physical_result_collector);
   void Execute();
+  void execute();
   void Reset();
   shared_ptr<GPUPipeline> CreateChildPipeline(GPUPipeline& current, GPUPhysicalOperator& op);
 
   Executor* executor;
+  vector<shared_ptr<GPUPipeline>> new_scheduled;
+  std::unique_ptr<::cucascade::data_repository_manager> data_repo_manager;
 
   //! Convert the DuckDB physical plan to a GPU physical plan
 };

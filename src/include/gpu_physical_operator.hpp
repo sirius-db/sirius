@@ -39,12 +39,12 @@ class GPUPhysicalOperator;
 class GPUPipeline;
 }  // namespace duckdb
 
-namespace sirius {
+namespace sirius::creator {
 class task_creator;
 using task_creation_hint = std::variant<std::monostate,
                                         ::duckdb::GPUPhysicalOperator*,
                                         ::duckdb::shared_ptr<::duckdb::GPUPipeline>>;
-}  // namespace sirius
+}  // namespace sirius::creator
 
 namespace duckdb {
 class GPUPipelineBuildState;
@@ -202,17 +202,17 @@ class GPUPhysicalOperator {
   bool is_source_pipeline_finished();
   void add_next_port_after_sink(std::pair<GPUPhysicalOperator*, std::string_view> port_locator);
   vector<std::pair<GPUPhysicalOperator*, std::string_view>>& get_next_port_after_sink();
-  ::sirius::task_creation_hint get_next_task_hint();
+  ::sirius::creator::task_creation_hint get_next_task_hint();
   std::vector<::std::shared_ptr<::cucascade::data_batch>> get_input_batch();
   bool all_ports_empty();
   bool check_pipeline_finished();
-  void set_creator(::sirius::task_creator* creator);
+  void set_creator(::sirius::creator::task_creator* creator);
 
  private:
   std::unordered_map<std::string, std::unique_ptr<port>> ports;
   //! The next operators to be executed after this operator when it is used as a sink
   vector<std::pair<GPUPhysicalOperator*, std::string_view>> next_port_after_sink;
-  ::sirius::task_creator* creator;
+  ::sirius::creator::task_creator* creator;
 };
 
 }  // namespace duckdb

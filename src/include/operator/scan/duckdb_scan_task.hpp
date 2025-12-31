@@ -39,7 +39,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace sirius::parallel {
+namespace sirius::op::scan {
 
 //===----------------------------------------------------------------------===//
 // DuckDB Scan Task Global State
@@ -48,7 +48,8 @@ namespace sirius::parallel {
 /**
  * @brief The global state for a duckdb_scan_task.
  */
-class duckdb_scan_task_global_state : public itask_global_state, public duckdb::GlobalSourceState {
+class duckdb_scan_task_global_state : public sirius::parallel::itask_global_state,
+                                      public duckdb::GlobalSourceState {
  public:
   //===----------Constructor----------===//
   /**
@@ -305,7 +306,7 @@ struct multiple_blocks_allocation_accessor {
  * chunks into those buffers.
  *
  */
-class duckdb_scan_task_local_state : public itask_local_state {
+class duckdb_scan_task_local_state : public sirius::parallel::itask_local_state {
  public:
   using multiple_blocks_allocation =
     cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation;
@@ -491,7 +492,7 @@ class duckdb_scan_task_local_state : public itask_local_state {
  * the batch to the data repository and notifying the task creator. If the table scan is
  * incomplete upon task completion, the task will push a new scan_task onto the task queue.
  */
-class duckdb_scan_task : public itask {
+class duckdb_scan_task : public sirius::parallel::itask {
   using idata_repository = cucascade::idata_repository;
   // Friend declaration for test access
   friend class test_scan_task;
@@ -510,7 +511,9 @@ class duckdb_scan_task : public itask {
                    idata_repository* data_repo,
                    unique_ptr<duckdb_scan_task_local_state> l_state,
                    shared_ptr<duckdb_scan_task_global_state> g_state)
-    : task_id(task_id), _data_repo(data_repo), itask(std::move(l_state), g_state) {};
+    : task_id(task_id),
+      _data_repo(data_repo),
+      sirius::parallel::itask(std::move(l_state), g_state) {};
 
   void execute() override;
 
@@ -568,4 +571,4 @@ class duckdb_scan_task : public itask {
   uint64_t task_id;              ///< The unique id of this scan task
 };
 
-}  // namespace sirius::parallel
+}  // namespace sirius::op::scan
