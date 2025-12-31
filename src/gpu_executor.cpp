@@ -15,7 +15,6 @@
  */
 
 #include "config.hpp"
-#include <data/data_repository_manager.hpp>
 #include "duckdb/execution/execution_context.hpp"
 #include "duckdb/execution/operator/helper/physical_result_collector.hpp"
 #include "duckdb/execution/operator/set/physical_recursive_cte.hpp"
@@ -34,6 +33,7 @@
 #include "operator/gpu_physical_result_collector.hpp"
 #include "operator/gpu_physical_table_scan.hpp"
 
+#include <data/data_repository_manager.hpp>
 #include <stdio.h>
 
 #include <iostream>

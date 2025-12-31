@@ -18,11 +18,12 @@
 
 #include "config.hpp"
 #include "creator/task_completion.hpp"
+#include "gpu_pipeline.hpp"
+#include "parallel/task_executor.hpp"
+
 #include <data/data_batch.hpp>
 #include <data/data_repository.hpp>
 #include <data/data_repository_manager.hpp>
-#include "gpu_pipeline.hpp"
-#include "parallel/task_executor.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -60,7 +61,8 @@ class gpu_pipeline_task_global_state : public itask_global_state {
   {
   }
 
-  cucascade::shared_data_repository_manager& _data_repo_mgr;  ///< Reference to the data repository manager
+  cucascade::shared_data_repository_manager&
+    _data_repo_mgr;  ///< Reference to the data repository manager
   task_completion_message_queue&
     _message_queue;  ///< Message queue to notify TaskCreator about task completion
   duckdb::shared_ptr<duckdb::GPUPipeline>

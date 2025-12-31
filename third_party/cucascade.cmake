@@ -25,19 +25,20 @@ ExternalProject_Add(
   GIT_SHALLOW ON
   UPDATE_DISCONNECTED TRUE
   BUILD_BYPRODUCTS ${CUCASCADE_STATIC_LIB}
-  CONFIGURE_COMMAND ${CMAKE_COMMAND} --preset release -S <SOURCE_DIR> -B <SOURCE_DIR>/build/release
+  CONFIGURE_COMMAND ${CMAKE_COMMAND} --preset release -S <SOURCE_DIR> -B
+                    <SOURCE_DIR>/build/release
   BUILD_COMMAND ${CMAKE_COMMAND} --build <SOURCE_DIR>/build/release
   INSTALL_COMMAND ""
-  BUILD_IN_SOURCE FALSE
-)
+  BUILD_IN_SOURCE FALSE)
 
-file(MAKE_DIRECTORY ${CUCASCADE_INCLUDE_DIR}) # Include directory needs to exist to run configure
+file(MAKE_DIRECTORY ${CUCASCADE_INCLUDE_DIR}) # Include directory needs to exist
+                                              # to run configure
 
 add_library(cucascade::cucascade STATIC IMPORTED)
 set_target_properties(cucascade::cucascade PROPERTIES IMPORTED_LOCATION
                                                       ${CUCASCADE_STATIC_LIB})
-target_include_directories(cucascade::cucascade INTERFACE ${CUCASCADE_INCLUDE_DIR})
+target_include_directories(cucascade::cucascade
+                           INTERFACE ${CUCASCADE_INCLUDE_DIR})
 # cuCascade uses NUMA-aware memory allocation
 set_property(TARGET cucascade::cucascade PROPERTY INTERFACE_LINK_LIBRARIES numa)
 add_dependencies(cucascade::cucascade ${CUCASCADE_BASE})
-

@@ -20,12 +20,12 @@
 #include "data/sirius_converter_registry.hpp"
 #include "memory/sirius_memory_manager.hpp"
 
+#include <rmm/cuda_stream_view.hpp>
+
 #include <data/cpu_data_representation.hpp>
 #include <data/gpu_data_representation.hpp>
 #include <memory/common.hpp>
 #include <memory/fixed_size_host_memory_resource.hpp>
-
-#include <rmm/cuda_stream_view.hpp>
 
 namespace sirius {
 namespace parallel {
@@ -68,9 +68,7 @@ void downgrade_task::execute()
 
     // Reservation identifies a memory_space (tier + device). Fetch its default allocator.
     auto mem_space = mr_manager.get_memory_space(reservation->tier(), reservation->device_id());
-    if (!mem_space) {
-      throw std::runtime_error("Invalid reservation memory_space for HOST tier");
-    }
+    if (!mem_space) { throw std::runtime_error("Invalid reservation memory_space for HOST tier"); }
 
     // Use the centralized converter registry to convert GPU representation to HOST
     auto& converter_registry = sirius::converter_registry::get();

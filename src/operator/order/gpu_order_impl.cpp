@@ -96,7 +96,8 @@ std::shared_ptr<cucascade::data_batch> gpu_order_impl::local_top_n(
     auto sliced_sorted_order =
       (limit + offset >= static_cast<int>(sorted_order->size()))
         ? sorted_order->view()
-        : cudf::slice(sorted_order->view(), {0, static_cast<cudf::size_type>(limit + offset)}, stream)[0];
+        : cudf::slice(
+            sorted_order->view(), {0, static_cast<cudf::size_type>(limit + offset)}, stream)[0];
     std::vector<cudf::column_view> project_input_cols;
     for (int idx : projections) {
       project_input_cols.push_back(input_table.column(idx));

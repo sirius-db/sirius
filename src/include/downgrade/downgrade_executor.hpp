@@ -15,12 +15,13 @@
  */
 
 #pragma once
-#include <data/data_repository.hpp>
-#include <data/data_repository_manager.hpp>
 #include "downgrade/downgrade_queue.hpp"
 #include "downgrade/downgrade_task.hpp"
 #include "memory/memory_reservation.hpp"
 #include "parallel/task_executor.hpp"
+
+#include <data/data_repository.hpp>
+#include <data/data_repository_manager.hpp>
 
 namespace sirius {
 namespace parallel {

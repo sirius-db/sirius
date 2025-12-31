@@ -19,8 +19,8 @@
 // sirius
 #include <data/sirius_converter_registry.hpp>
 #include <helper/helper.hpp>
-#include <memory/sirius_memory_manager.hpp>
 #include <memory/reservation_manager_configurator.hpp>
+#include <memory/sirius_memory_manager.hpp>
 
 // standard library
 #include <vector>

@@ -34,7 +34,7 @@ namespace sirius {
  * In a future PR, this will be replaced by a proper context class.
  */
 class converter_registry {
-public:
+ public:
   using registry_type = cucascade::representation_converter_registry;
 
   /**
@@ -88,11 +88,10 @@ public:
     instance_.reset();
   }
 
-private:
+ private:
   converter_registry() = default;
   static inline std::unique_ptr<registry_type> instance_;
   static inline std::mutex mutex_;
 };
 
 }  // namespace sirius
-

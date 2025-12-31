@@ -33,8 +33,8 @@ endif()
 project(${TARGET_NAME} LANGUAGES CXX CUDA)
 find_package(cudf REQUIRED CONFIG)
 
-# Derive the environment prefix from where cudf was found
-# cudf_DIR is typically: <prefix>/lib/cmake/cudf
+# Derive the environment prefix from where cudf was found cudf_DIR is typically:
+# <prefix>/lib/cmake/cudf
 cmake_path(GET cudf_DIR PARENT_PATH _cmake_dir)
 cmake_path(GET _cmake_dir PARENT_PATH _lib_dir)
 cmake_path(GET _lib_dir PARENT_PATH CUDF_ENV_PREFIX)
@@ -66,7 +66,8 @@ set(ENV{SKIP_SUBSTRAIT_C_TESTS} ON)
 set(EXTENSION_NAME ${TARGET_NAME}_extension)
 set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
-# Third-party dependencies (must be before include_directories for cuCascade headers)
+# Third-party dependencies (must be before include_directories for cuCascade
+# headers)
 set(DEPS_PREFIX "_deps")
 include(third_party/spdlog.cmake)
 include(third_party/cucascade.cmake)
@@ -116,9 +117,9 @@ set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
 # Manually specify CUDA include and library directories Include directories
 include_directories(${CUDA_INCLUDE_DIRS})
 include_directories(src/include/cudf)
-# Note: cudf::cudf and rmm::rmm targets (from find_package) already provide
-# the necessary include paths. Do not add CONDA_PREFIX includes here as it
-# may point to a different environment causing duplicate definitions.
+# Note: cudf::cudf and rmm::rmm targets (from find_package) already provide the
+# necessary include paths. Do not add CONDA_PREFIX includes here as it may point
+# to a different environment causing duplicate definitions.
 
 # add_library(${EXTENSION_NAME} STATIC ${EXTENSION_SOURCES} ${CUDA_SOURCES})
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES} ${CUDA_SOURCES})
@@ -147,7 +148,8 @@ target_link_libraries(${LOADABLE_EXTENSION_NAME} substrait_extension cudf::cudf
 
 # Link third-party libraries
 target_link_libraries(${EXTENSION_NAME} spdlog::spdlog cucascade::cucascade)
-target_link_libraries(${LOADABLE_EXTENSION_NAME} spdlog::spdlog cucascade::cucascade)
+target_link_libraries(${LOADABLE_EXTENSION_NAME} spdlog::spdlog
+                      cucascade::cucascade)
 
 # Ensure cuCascade is built before extensions
 add_dependencies(${EXTENSION_NAME} cucascade_ep spdlog_ep)

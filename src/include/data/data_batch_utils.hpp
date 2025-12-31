@@ -16,10 +16,10 @@
 
 #pragma once
 
+#include <cudf/table/table_view.hpp>
+
 #include <data/data_batch.hpp>
 #include <data/gpu_data_representation.hpp>
-
-#include <cudf/table/table_view.hpp>
 
 #include <atomic>
 #include <cstdint>
@@ -67,7 +67,8 @@ inline cudf::table_view get_cudf_table_view(const cucascade::data_batch& batch)
 inline std::shared_ptr<cucascade::data_batch> make_data_batch(
   cudf::table&& table, cucascade::memory::memory_space& memory_space)
 {
-  auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(std::move(table), memory_space);
+  auto gpu_repr =
+    std::make_unique<cucascade::gpu_table_representation>(std::move(table), memory_space);
   return std::make_shared<cucascade::data_batch>(get_next_batch_id(), std::move(gpu_repr));
 }
 
@@ -81,7 +82,8 @@ inline std::shared_ptr<cucascade::data_batch> make_data_batch(
 inline std::shared_ptr<cucascade::data_batch> make_data_batch(
   std::unique_ptr<cudf::table> table, cucascade::memory::memory_space& memory_space)
 {
-  auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(std::move(*table), memory_space);
+  auto gpu_repr =
+    std::make_unique<cucascade::gpu_table_representation>(std::move(*table), memory_space);
   return std::make_shared<cucascade::data_batch>(get_next_batch_id(), std::move(gpu_repr));
 }
 
@@ -108,8 +110,8 @@ inline std::shared_ptr<cucascade::data_batch> make_data_batch(
  * @return std::optional<std::vector<cucascade::data_batch_processing_handle>>
  *         Vector of handles if all locks acquired, empty optional otherwise.
  */
-inline std::optional<std::vector<cucascade::data_batch_processing_handle>> acquire_processing_handles(
-  const std::vector<std::shared_ptr<cucascade::data_batch>>& batches)
+inline std::optional<std::vector<cucascade::data_batch_processing_handle>>
+acquire_processing_handles(const std::vector<std::shared_ptr<cucascade::data_batch>>& batches)
 {
   std::vector<cucascade::data_batch_processing_handle> handles;
   handles.reserve(batches.size());

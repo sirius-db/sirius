@@ -17,8 +17,8 @@
 #include "catch.hpp"
 #include "data/data_batch_utils.hpp"
 #include "data/gpu_data_representation.hpp"
-#include "memory/sirius_memory_manager.hpp"
 #include "memory/memory_space.hpp"
+#include "memory/sirius_memory_manager.hpp"
 #include "partition/gpu_partition_impl.hpp"
 #include "scan/test_utils.hpp"
 #include "utils/utils.hpp"
@@ -60,7 +60,6 @@ std::pair<std::shared_ptr<data_batch>, data_batch_processing_handle> create_batc
   auto table = create_cudf_table_with_random_data(
     num_rows, column_types, ranges, cudf::get_default_stream(), mem_space.get_default_allocator());
   auto batch = sirius::make_data_batch(std::move(table), mem_space);
-
 
   REQUIRE(batch->try_to_lock_for_processing());
   data_batch_processing_handle handle(batch.get());
@@ -188,12 +187,10 @@ TEST_CASE("Hash partition with invalid input", "[operator][hash_partition]")
 
   auto [input_batch, input_handle] =
     create_batch_with_random_data(num_input_rows, column_types, ranges, *mem_space);
-  REQUIRE_THROWS_AS(gpu_partition_impl::hash_partition(input_batch,
-                                                       partition_key_idx,
-                                                       num_partitions,
-                                                       cudf::get_default_stream(),
-                                                       *mem_space),
-                    std::runtime_error);
+  REQUIRE_THROWS_AS(
+    gpu_partition_impl::hash_partition(
+      input_batch, partition_key_idx, num_partitions, cudf::get_default_stream(), *mem_space),
+    std::runtime_error);
 }
 
 TEST_CASE("Hash partition with empty input", "[operator][hash_partition]")
@@ -318,8 +315,8 @@ TEST_CASE("Evenly partition basic", "[operator][evenly_partition]")
 
   auto [input_batch, input_handle] =
     create_batch_with_random_data(num_input_rows, column_types, ranges, *mem_space);
-  auto output_batches =
-    gpu_partition_impl::evenly_partition(input_batch, num_partitions, cudf::get_default_stream(), *mem_space);
+  auto output_batches = gpu_partition_impl::evenly_partition(
+    input_batch, num_partitions, cudf::get_default_stream(), *mem_space);
   validate_evenly_partition(*input_batch, output_batches, num_partitions);
 }
 
@@ -336,8 +333,8 @@ TEST_CASE("Evenly partition basic with empty input", "[operator][evenly_partitio
 
   auto [input_batch, input_handle] =
     create_batch_with_random_data(num_input_rows, column_types, ranges, *mem_space);
-  auto output_batches =
-    gpu_partition_impl::evenly_partition(input_batch, num_partitions, cudf::get_default_stream(), *mem_space);
+  auto output_batches = gpu_partition_impl::evenly_partition(
+    input_batch, num_partitions, cudf::get_default_stream(), *mem_space);
   validate_evenly_partition(*input_batch, output_batches, num_partitions);
 }
 
@@ -355,7 +352,7 @@ TEST_CASE("Evenly partition basic with num partitions larger than input size",
 
   auto [input_batch, input_handle] =
     create_batch_with_random_data(num_input_rows, column_types, ranges, *mem_space);
-  auto output_batches =
-    gpu_partition_impl::evenly_partition(input_batch, num_partitions, cudf::get_default_stream(), *mem_space);
+  auto output_batches = gpu_partition_impl::evenly_partition(
+    input_batch, num_partitions, cudf::get_default_stream(), *mem_space);
   validate_evenly_partition(*input_batch, output_batches, num_partitions);
 }

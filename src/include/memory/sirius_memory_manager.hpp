@@ -97,4 +97,3 @@ class memory_manager {
 };
 
 }  // namespace sirius
-

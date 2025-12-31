@@ -194,9 +194,7 @@ void GPUPhysicalOperator::push_data_batch(std::string_view port_id,
                                           std::shared_ptr<::cucascade::data_batch> batch)
 {
   auto* p = get_port(port_id);
-  if (p && p->repo) {
-    p->repo->add_data_batch(std::move(batch));
-  }
+  if (p && p->repo) { p->repo->add_data_batch(std::move(batch)); }
 }
 
 void GPUPhysicalOperator::add_next_port_after_sink(

@@ -17,12 +17,13 @@
 #pragma once
 
 #include "config.hpp"
+#include "parallel/task_executor.hpp"
+#include "task_completion.hpp"
+
 #include <data/data_batch.hpp>
 #include <data/data_repository.hpp>
 #include <data/data_repository_manager.hpp>
 #include <memory/common.hpp>
-#include "parallel/task_executor.hpp"
-#include "task_completion.hpp"
 
 #include <cstdint>
 #include <memory>

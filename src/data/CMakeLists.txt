@@ -14,11 +14,8 @@
 # the License.
 # =============================================================================
 
-# Note: Data module sources are now provided by cuCascade library
-# The following files have been migrated to cuCascade:
-# - cpu_data_representation.cpp
-# - gpu_data_representation.cpp
-# - data_batch.cpp
-# - data_batch_view.cpp (removed - replaced by shared_ptr<data_batch>)
-# - data_repository.cpp
-# - data_repository_manager.cpp
+# Note: Data module sources are now provided by cuCascade library The following
+# files have been migrated to cuCascade: - cpu_data_representation.cpp -
+# gpu_data_representation.cpp - data_batch.cpp - data_batch_view.cpp (removed -
+# replaced by shared_ptr<data_batch>) - data_repository.cpp -
+# data_repository_manager.cpp

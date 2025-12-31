@@ -15,6 +15,5 @@
 # =============================================================================
 
 set(TEST_SOURCES
-    ${TEST_SOURCES}
-    ${CMAKE_CURRENT_SOURCE_DIR}/test_cpu_cache.cpp
+    ${TEST_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/test_cpu_cache.cpp
     PARENT_SCOPE)

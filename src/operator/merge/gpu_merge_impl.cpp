@@ -149,7 +149,8 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
   for (const auto& batch : input) {
     input_cudf_table_views.push_back(get_cudf_table_view(*batch));
   }
-  if (input_cudf_table_views[0].num_columns() != num_group_cols + static_cast<int>(aggregates.size())) {
+  if (input_cudf_table_views[0].num_columns() !=
+      num_group_cols + static_cast<int>(aggregates.size())) {
     throw std::runtime_error(
       "`num columns = num_group_cols + num aggregates` not true in `merge_grouped_aggregate()`");
   }
@@ -285,9 +286,10 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_top_n(
     output_table = std::move(merged_table);
   } else {
     output_table = std::make_unique<cudf::table>(
-      cudf::slice(merged_table->view(),
-                  {offset, std::min(merged_table->num_rows(), static_cast<cudf::size_type>(offset + limit))},
-                  stream)[0],
+      cudf::slice(
+        merged_table->view(),
+        {offset, std::min(merged_table->num_rows(), static_cast<cudf::size_type>(offset + limit))},
+        stream)[0],
       stream,
       memory_space.get_default_allocator());
   }
