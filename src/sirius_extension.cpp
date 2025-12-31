@@ -19,6 +19,7 @@
 #include "sirius_extension.hpp"
 
 #include "config.hpp"
+#include "data/sirius_converter_registry.hpp"
 #include "duckdb.hpp"
 #include "duckdb/catalog/catalog_entry/duck_schema_entry.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
@@ -731,6 +732,11 @@ void SiriusExtension::Load(DuckDB& db)
   con.BeginTransaction();
 
   InitGlobalLogger();
+
+  // Initialize the representation converter registry with builtin converters
+  // This is used for converting data between GPU and HOST representations
+  sirius::converter_registry::initialize();
+
   InitializeGPUExtension(con);
 
   con.Commit();

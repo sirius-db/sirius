@@ -17,6 +17,7 @@
 // sirius
 #include <helper/utils.hpp>
 #include <memory/memory_reservation.hpp>
+#include <memory/sirius_memory_manager.hpp>
 #include <scan/duckdb_scan_task.hpp>
 
 // duckdb
@@ -280,7 +281,7 @@ duckdb_scan_task_local_state::duckdb_scan_task_local_state(
   auto const& op = g_state.op;
   num_columns    = op.projection_ids.size();
 
-  auto& mem_res_mgr = cucascade::memory::memory_reservation_manager::get_instance();
+  auto& mem_res_mgr = sirius::memory_manager::get();
 
   // Make the memory reservation request
   reservation = mem_res_mgr.request_reservation(res_request, approximate_batch_size);

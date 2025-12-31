@@ -18,7 +18,7 @@
 
 #include "config.hpp"
 #include "memory/memory_reservation.hpp"
-#include "memory/memory_reservation_manager.hpp"
+#include "memory/sirius_memory_manager.hpp"
 #include "pipeline/pipeline_queue.hpp"
 
 namespace sirius {
@@ -31,7 +31,7 @@ pipeline_executor::pipeline_executor(task_executor_config config)
   _gpu_executors.reserve(Config::NUM_GPU);
   for (int i = 0; i < Config::NUM_GPU; ++i) {
     // TODO: Initialize memory space for each GPU
-    auto& mem_res_mgr = cucascade::memory::memory_reservation_manager::get_instance();
+    auto& mem_res_mgr = sirius::memory_manager::get();
     const cucascade::memory::memory_space* gpu_mem_space =
       mem_res_mgr.get_memory_space(cucascade::memory::Tier::GPU, i);  // Placeholder
     _gpu_executors.push_back(std::make_unique<gpu_pipeline_executor>(config, gpu_mem_space, this));

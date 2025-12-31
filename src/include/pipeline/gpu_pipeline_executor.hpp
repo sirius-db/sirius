@@ -15,7 +15,7 @@
  */
 
 #pragma once
-#include "data/data_repository.hpp"
+#include <data/data_repository.hpp>
 #include "memory/memory_reservation.hpp"
 #include "memory/memory_space.hpp"
 #include "parallel/task_executor.hpp"

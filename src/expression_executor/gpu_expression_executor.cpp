@@ -16,7 +16,7 @@
 
 #include "expression_executor/gpu_expression_executor.hpp"
 
-#include "cuda_stream_view.hpp"
+#include <rmm/cuda_stream_view.hpp>
 #include "duckdb/common/exception.hpp"
 #include "expression_executor/gpu_dispatcher.hpp"
 #include "expression_executor/gpu_expression_executor_state.hpp"

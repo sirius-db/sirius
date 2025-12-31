@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "cuda_stream_view.hpp"
+#include <rmm/cuda_stream_view.hpp>
 #include "duckdb/common/exception.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "expression_executor/gpu_expression_executor.hpp"

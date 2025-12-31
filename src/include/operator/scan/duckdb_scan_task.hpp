@@ -138,7 +138,7 @@ struct multiple_blocks_allocation_accessor {
   {
     assert(allocation != nullptr);
 
-    block_size = allocation->block_size;
+    block_size = allocation->block_size();
     if (block_size % sizeof(T) != 0) {
       throw std::runtime_error(
         "[multiple_blocks_allocation_accessor] The underlying type size must be aligned with the "
@@ -247,7 +247,7 @@ struct multiple_blocks_allocation_accessor {
       assert(block_index < allocation->get_blocks().size());
       // Do as much of a bulk copy as possible in the current block
       auto const bytes_to_copy =
-        std::min(bytes - bytes_copied, allocation->block_size - offset_in_block);
+        std::min(bytes - bytes_copied, allocation->block_size() - offset_in_block);
       std::memcpy(
         reinterpret_cast<uint8_t*>(allocation->get_blocks()[block_index]) + offset_in_block,
         static_cast<uint8_t const*>(src) + bytes_copied,
@@ -255,7 +255,7 @@ struct multiple_blocks_allocation_accessor {
       bytes_copied += bytes_to_copy;
       offset_in_block += bytes_to_copy;
       // Check if we need to advance to the next block
-      if (offset_in_block == allocation->block_size) {
+      if (offset_in_block == allocation->block_size()) {
         ++block_index;
         offset_in_block = 0;
       }
@@ -277,7 +277,7 @@ struct multiple_blocks_allocation_accessor {
       assert(block_index < allocation->get_blocks().size());
       // Do as much of a bulk copy as possible in the current block
       auto const bytes_to_copy =
-        std::min(bytes - bytes_copied, allocation->block_size - offset_in_block);
+        std::min(bytes - bytes_copied, allocation->block_size() - offset_in_block);
       std::memcpy(
         static_cast<uint8_t*>(dest) + bytes_copied,
         reinterpret_cast<uint8_t*>(allocation->get_blocks()[block_index]) + offset_in_block,
@@ -285,7 +285,7 @@ struct multiple_blocks_allocation_accessor {
       bytes_copied += bytes_to_copy;
       offset_in_block += bytes_to_copy;
       // Check if we need to advance to the next block
-      if (offset_in_block == allocation->block_size) {
+      if (offset_in_block == allocation->block_size()) {
         ++block_index;
         offset_in_block = 0;
       }
@@ -492,7 +492,7 @@ class duckdb_scan_task_local_state : public itask_local_state {
  * incomplete upon task completion, the task will push a new scan_task onto the task queue.
  */
 class duckdb_scan_task : public itask {
-  using data_repository_manager = cucascade::data_repository_manager;
+  using data_repository_manager = cucascade::shared_data_repository_manager;
   // Friend declaration for test access
   friend class test_scan_task;
 

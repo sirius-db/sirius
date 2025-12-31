@@ -15,7 +15,7 @@
  */
 
 #pragma once
-#include "data/data_repository.hpp"
+#include <data/data_repository.hpp>
 #include "memory/memory_reservation.hpp"
 #include "parallel/task_executor.hpp"
 #include "pipeline/gpu_pipeline_executor.hpp"

@@ -222,7 +222,7 @@ TEST_CASE("multiple_blocks_allocation_accessor - int64_t type", "[duckdb_scan_ta
     accessor.initialize(0, allocation);
     accessor.set_cursor(0);
 
-    const auto values_per_block = static_cast<int>(allocation->block_size / sizeof(int64_t));
+    const auto values_per_block = static_cast<int>(allocation->block_size() / sizeof(int64_t));
 
     // Fill first block with values_per_block entries
     for (int i = 0; i < values_per_block; ++i) {

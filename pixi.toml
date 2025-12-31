@@ -11,7 +11,6 @@ cuda = "13"
 scripts = ["setup_test_datasets.sh"]
 
 [activation.env]
-LIBCUDF_ENV_PREFIX = "$CONDA_PREFIX"
 # Following https://github.com/rapidsai/rapids-cmake/blob/84f8cf8386ac56e3f4f9400f44e752345d8c2997/rapids-cmake/cuda/set_architectures.cmake#L62
 CUDAARCHS = "75-real;80-real;86-real;90a-real;100f-real;120a-real;120"
 

@@ -16,20 +16,19 @@
 
 #include "operator/partition/gpu_partition_impl.hpp"
 
-#include "data/gpu_data_representation.hpp"
+#include "data/data_batch_utils.hpp"
 
 #include <cudf/partitioning.hpp>
 
 namespace sirius {
 namespace op {
 
-std::vector<std::unique_ptr<cucascade::data_batch>> gpu_partition_impl::hash_partition(
-  const cucascade::data_batch_view& input,
+std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::hash_partition(
+  std::shared_ptr<cucascade::data_batch> input,
   const std::vector<int>& partition_key_idx,
   int num_partitions,
   rmm::cuda_stream_view stream,
-  cucascade::memory::memory_space& memory_space,
-  cucascade::data_repository_manager& data_repository_mgr)
+  cucascade::memory::memory_space& memory_space)
 {
   // Sanity check.
   if (num_partitions < 2) {
@@ -37,7 +36,7 @@ std::vector<std::unique_ptr<cucascade::data_batch>> gpu_partition_impl::hash_par
   }
 
   // Call cudf hash-partition
-  auto input_table      = input.get_cudf_table_view();
+  auto input_table      = get_cudf_table_view(*input);
   auto partition_result = cudf::hash_partition(input_table,
                                                partition_key_idx,
                                                num_partitions,
@@ -47,8 +46,8 @@ std::vector<std::unique_ptr<cucascade::data_batch>> gpu_partition_impl::hash_par
                                                memory_space.get_default_allocator());
 
   // Slice from the reordered table to create separate table partitions
-  std::vector<std::unique_ptr<cucascade::data_batch>> output_batches;
-  std::vector<int> slice_indices;
+  std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
+  std::vector<cudf::size_type> slice_indices;
   for (int i = 0; i < num_partitions; ++i) {
     slice_indices.push_back(partition_result.second[i]);
     slice_indices.push_back(i == num_partitions - 1 ? input_table.num_rows()
@@ -57,23 +56,17 @@ std::vector<std::unique_ptr<cucascade::data_batch>> gpu_partition_impl::hash_par
   auto sliced_partition_views = cudf::slice(partition_result.first->view(), slice_indices, stream);
   for (int i = 0; i < num_partitions; ++i) {
     auto output_partition = std::make_unique<cudf::table>(sliced_partition_views[i]);
-    auto gpu_table_representation =
-      std::make_unique<cucascade::gpu_table_representation>(*output_partition, memory_space);
-    output_batches.push_back(
-      std::make_unique<cucascade::data_batch>(data_repository_mgr.get_next_data_batch_id(),
-                                              data_repository_mgr,
-                                              std::move(gpu_table_representation)));
+    output_batches.push_back(make_data_batch(std::move(output_partition), memory_space));
   }
 
   return output_batches;
 }
 
-std::vector<std::unique_ptr<cucascade::data_batch>> gpu_partition_impl::evenly_partition(
-  const cucascade::data_batch_view& input,
+std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::evenly_partition(
+  std::shared_ptr<cucascade::data_batch> input,
   int num_partitions,
   rmm::cuda_stream_view stream,
-  cucascade::memory::memory_space& memory_space,
-  cucascade::data_repository_manager& data_repository_mgr)
+  cucascade::memory::memory_space& memory_space)
 {
   // Sanity check.
   if (num_partitions < 2) {
@@ -81,27 +74,22 @@ std::vector<std::unique_ptr<cucascade::data_batch>> gpu_partition_impl::evenly_p
   }
 
   // Compute slice indices
-  auto input_table            = input.get_cudf_table_view();
-  int partition_num_rows_base = input_table.num_rows() / num_partitions;
-  int remainder               = input_table.num_rows() % num_partitions;
-  std::vector<int> slice_indices;
+  auto input_table                        = get_cudf_table_view(*input);
+  cudf::size_type partition_num_rows_base = input_table.num_rows() / num_partitions;
+  cudf::size_type remainder               = input_table.num_rows() % num_partitions;
+  std::vector<cudf::size_type> slice_indices;
   for (int i = 0; i < num_partitions; ++i) {
-    int curr_partition_num_rows = partition_num_rows_base + (i < remainder);
+    cudf::size_type curr_partition_num_rows = partition_num_rows_base + (i < remainder ? 1 : 0);
     slice_indices.push_back(i == 0 ? 0 : slice_indices.back());
     slice_indices.push_back(slice_indices.back() + curr_partition_num_rows);
   }
 
   // Slice and create separate partitions
-  std::vector<std::unique_ptr<cucascade::data_batch>> output_batches;
+  std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
   auto sliced_partition_views = cudf::slice(input_table, slice_indices, stream);
   for (int i = 0; i < num_partitions; ++i) {
     auto output_partition = std::make_unique<cudf::table>(sliced_partition_views[i]);
-    auto gpu_table_representation =
-      std::make_unique<cucascade::gpu_table_representation>(*output_partition, memory_space);
-    output_batches.push_back(
-      std::make_unique<cucascade::data_batch>(data_repository_mgr.get_next_data_batch_id(),
-                                              data_repository_mgr,
-                                              std::move(gpu_table_representation)));
+    output_batches.push_back(make_data_batch(std::move(output_partition), memory_space));
   }
 
   return output_batches;
