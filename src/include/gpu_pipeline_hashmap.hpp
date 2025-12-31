@@ -27,9 +27,17 @@ class gpu_pipeline_hashmap {
   {
     for (auto& pipeline : _vec) {
       for (auto& op : pipeline->GetOperators()) {
-        _map.insert({&op.get(), pipeline});
+        if (_map.find(&op.get()) == _map.end()) {
+          _map.insert({&op.get(), pipeline});
+        } else {
+          throw std::runtime_error("Operator already exists in hashmap");
+        }
       }
-      _map.insert({pipeline->GetSink().get(), pipeline});
+      if (_map.find(pipeline->GetSink().get()) == _map.end()) {
+        _map.insert({pipeline->GetSink().get(), pipeline});
+      } else {
+        throw std::runtime_error("Sink operator already exists in hashmap");
+      }
     }
   };
   ~gpu_pipeline_hashmap() = default;

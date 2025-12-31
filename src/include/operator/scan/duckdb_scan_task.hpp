@@ -25,7 +25,6 @@
 #include <operator/gpu_physical_table_scan.hpp>
 #include <parallel/task.hpp>
 #include <scan/duckdb_scan_executor.hpp>
-#include <scan/physical_table_scan_adapter.hpp>
 
 // duckdb
 #include <duckdb/common/types.hpp>
@@ -55,15 +54,15 @@ class duckdb_scan_task_global_state : public itask_global_state, public duckdb::
   /**
    * @brief Construct a new duckdb_scan_task_global_state object
    *
-   * @param[in] pipeline_id The pipeline id to which this scan task belongs
+   * @param[in] pipeline The GPU pipeline to which this table scan belongs
    * @param[in] scan_exec The scan executor with which to schedule new scan tasks
    * @param[in] client_ctx The DuckDB client context
-   * @param[in] ptsa The physical table scan adapter being executed
+   * @param[in] gpu_pts The GPU physical table scan being executed
    */
-  duckdb_scan_task_global_state(uint64_t pipeline_id,
+  duckdb_scan_task_global_state(duckdb::shared_ptr<duckdb::GPUPipeline> pipeline,
                                 duckdb_scan_executor& scan_exec,
                                 duckdb::ClientContext& client_ctx,
-                                duckdb::physical_table_scan_adapter const& ptsa);
+                                duckdb::GPUPhysicalTableScan* scan_op);
 
   //===----------Methods----------===//
   /**
@@ -88,13 +87,14 @@ class duckdb_scan_task_global_state : public itask_global_state, public duckdb::
 
   //===----------Fields----------===//
   std::atomic<bool> source_drained{false};  ///< Whether the table scan source is fully drained
-  uint64_t pipeline_id;                     ///< The pipeline id to which this table scan belongs
-  uint64_t max_threads;                     ///< Maximum number of threads for this scan task
+  duckdb::shared_ptr<duckdb::GPUPipeline>
+    pipeline;            ///< The pipeline to which this table scan belongs
+  uint64_t max_threads;  ///< Maximum number of threads for this scan task
 
   unique_ptr<duckdb::GlobalTableFunctionState>
     global_tf_state;                    ///< Global state for the table function
   duckdb_scan_executor& scan_executor;  ///< The scan executor executing this scan task
-  const duckdb::PhysicalTableScan& op;  ///< The physical table scan being executed
+  duckdb::GPUPhysicalTableScan& op;     ///< The physical table scan being executed
 
   std::mutex scan_mutex;  ///< Mutex to protect table function calls
 };
@@ -460,7 +460,7 @@ class duckdb_scan_task_local_state : public itask_local_state {
    *
    * @param[in] op The physical table scan operator being executed.
    */
-  void estimate_rows_per_batch(const duckdb::PhysicalTableScan& op);
+  void estimate_rows_per_batch(duckdb::GPUPhysicalTableScan const& op);
 
   /**
    * @brief Initializes the column builders.
@@ -474,7 +474,7 @@ class duckdb_scan_task_local_state : public itask_local_state {
    * @param[in] exec_ctx The duckdb execution context.
    * @param[in] global_tf_state The duckdb table function global state.
    */
-  void initialize_local_table_function_state(duckdb::PhysicalTableScan const& op,
+  void initialize_local_table_function_state(duckdb::GPUPhysicalTableScan const& op,
                                              duckdb::ExecutionContext& exec_ctx,
                                              duckdb::GlobalTableFunctionState* global_tf_state);
 };

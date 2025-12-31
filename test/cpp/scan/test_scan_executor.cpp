@@ -23,9 +23,9 @@
 // sirius
 #include <data/data_batch.hpp>
 #include <data/data_repository.hpp>
+#include <operator/gpu_physical_table_scan.hpp>
 #include <scan/duckdb_scan_executor.hpp>
 #include <scan/duckdb_scan_task.hpp>
-#include <scan/physical_table_scan_adapter.hpp>
 
 // duckdb
 #include <duckdb.hpp>
@@ -33,7 +33,6 @@
 #include <duckdb/catalog/catalog_transaction.hpp>
 #include <duckdb/common/types.hpp>
 #include <duckdb/execution/execution_context.hpp>
-#include <duckdb/execution/operator/scan/physical_table_scan.hpp>
 #include <duckdb/function/table/table_scan.hpp>
 #include <duckdb/function/table_function.hpp>
 #include <duckdb/parallel/thread_context.hpp>
@@ -415,7 +414,7 @@ static void validate_tables_equal(duckdb::Connection& con,
 /**
  * @brief Create a PhysicalTableScan for the given table
  */
-static std::unique_ptr<duckdb::PhysicalTableScan> make_physical_table_scan(
+static std::unique_ptr<duckdb::GPUPhysicalTableScan> make_physical_table_scan(
   duckdb::ClientContext& ctx, std::string const& table_name)
 {
   auto& catalog = duckdb::Catalog::GetCatalog(ctx, "");
@@ -450,8 +449,8 @@ static std::unique_ptr<duckdb::PhysicalTableScan> make_physical_table_scan(
   // Create extra operator info (must be a variable, not a temporary)
   duckdb::ExtraOperatorInfo extra_info;
 
-  // Create PhysicalTableScan with all required parameters
-  auto physical_scan = std::make_unique<duckdb::PhysicalTableScan>(
+  // Create GPUPhysicalTableScan with all required parameters
+  auto physical_scan = std::make_unique<duckdb::GPUPhysicalTableScan>(
     table_catalog_entry.GetTypes(),  // types
     table_scan_function,             // function
     std::move(bind_data),            // bind_data
@@ -506,9 +505,6 @@ static void run_scan_test(std::string const& table_name,
   auto physical_scan = make_physical_table_scan(client_ctx, table_name);
   REQUIRE(physical_scan);
 
-  // Create physical table scan adapter
-  duckdb::physical_table_scan_adapter ptsa(std::move(physical_scan));
-
   // Create staging table for scanned data
   std::string staging_table = table_name + "_scanned";
   auto create_result =
@@ -533,7 +529,7 @@ static void run_scan_test(std::string const& table_name,
 
   // Create global state
   auto global_state = std::make_shared<parallel::duckdb_scan_task_global_state>(
-    pipeline_id, scan_executor, client_ctx, ptsa);
+    nullptr, scan_executor, client_ctx, physical_scan.get());
 
   // Create data repository manager (empty, unused for this test)
   cucascade::idata_repository data_repo;

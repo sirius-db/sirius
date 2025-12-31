@@ -16,6 +16,7 @@
 
 #include "gpu_physical_operator.hpp"
 
+#include "creator/task_creator.hpp"
 #include "gpu_executor.hpp"
 #include "gpu_meta_pipeline.hpp"
 #include "gpu_pipeline.hpp"
@@ -180,14 +181,22 @@ GPUPhysicalOperator::port* GPUPhysicalOperator::get_port(std::string_view port_i
   return it->second.get();
 }
 
+::std::vector<::std::shared_ptr<::cucascade::data_batch>> GPUPhysicalOperator::sink_execute(
+  const ::std::vector<::std::shared_ptr<::cucascade::data_batch>>& input_batches)
+{
+  // submit data batches to the repositories of the next operators
+  // check if the pipeline is finished
+  creator->update_pipeline_status(this);
+  for (auto& [next_op, port_id] : next_port_after_sink) {
+    if (next_op) { creator->process_next_task(next_op); }
+  }
+  // not doing anything for now
+  return ::std::vector<::std::shared_ptr<::cucascade::data_batch>>{};
+}
+
 ::std::vector<::std::shared_ptr<::cucascade::data_batch>> GPUPhysicalOperator::execute(
   const ::std::vector<::std::shared_ptr<::cucascade::data_batch>>& input_batches)
 {
-  for (auto& [next_op, port_id] : next_port_after_sink) {
-    if (next_op) {
-      // creator->process_next_task(next_op);
-    }
-  }
   // not doing anything for now
   return ::std::vector<::std::shared_ptr<::cucascade::data_batch>>{};
 }
@@ -224,7 +233,7 @@ GPUPhysicalOperator::get_next_port_after_sink()
     } else if (port_ptr->type == MemoryBarrierType::FULL) {
       // For full barrier: src pipeline must be finished and have data
       // We assume that there will be a data batch if the src pipeline is finished
-      if (!port_ptr->src_pipeline_finished) {
+      if (!port_ptr->src_pipeline->is_pipeline_finished()) {
         // Src pipeline not finished, return it to continue processing
         return ::sirius::task_creation_hint(port_ptr->src_pipeline);
       }
@@ -251,4 +260,21 @@ std::vector<::std::shared_ptr<::cucascade::data_batch>> GPUPhysicalOperator::get
   return input_batch;
 }
 
+bool GPUPhysicalOperator::all_ports_empty()
+{
+  for (auto& [port_name, port_ptr] : ports) {
+    if (!port_ptr->repo->check_data_batch_view_availability()) { return false; }
+  }
+  return true;
+}
+
+void GPUPhysicalOperator::set_creator(::sirius::task_creator* creator) { this->creator = creator; }
+
+bool GPUPhysicalOperator::is_source_pipeline_finished()
+{
+  for (auto& [port_name, port_ptr] : ports) {
+    if (!port_ptr->src_pipeline->is_pipeline_finished()) { return false; }
+  }
+  return true;
+}
 }  // namespace duckdb

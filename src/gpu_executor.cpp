@@ -610,13 +610,13 @@ void GPUExecutor::InitializeInternal(GPUPhysicalOperator& plan)
           ::std::unique_ptr<::cucascade::shared_data_repository> repo =
             ::std::make_unique<::cucascade::shared_data_repository>();
           std::string port_id = "scan";
-          size_t source_op_id = get_operator_id(new_scheduled[i]->source.get());
-          data_repo_manager->add_new_repository(source_op_id, port_id, std::move(repo));
-          new_scheduled[i]->source->add_port(
+          size_t op_id        = get_operator_id(&(new_scheduled[i]->operators[0].get()));
+          data_repo_manager->add_new_repository(op_id, port_id, std::move(repo));
+          new_scheduled[i]->operators[0].get().add_port(
             port_id,
             std::make_unique<GPUPhysicalOperator::port>(
               MemoryBarrierType::PIPELINE,
-              data_repo_manager->get_repository(source_op_id, port_id).get(),
+              data_repo_manager->get_repository(op_id, port_id).get(),
               new_scheduled[i]));
         }
 

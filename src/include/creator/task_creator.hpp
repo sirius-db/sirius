@@ -18,6 +18,7 @@
 
 #include "data/data_batch.hpp"
 #include "data/data_repository.hpp"
+#include "duckdb/main/client_context.hpp"
 #include "gpu_physical_operator.hpp"
 #include "gpu_pipeline.hpp"
 #include "gpu_pipeline_hashmap.hpp"
@@ -47,18 +48,25 @@ class task_creation_info {
  public:
   task_creation_info(::duckdb::GPUPhysicalOperator* node,
                      ::duckdb::shared_ptr<::duckdb::GPUPipeline> pipeline)
-    : node(node), pipeline(std::move(pipeline))
+    : _node(node), _pipeline(std::move(pipeline))
   {
     // get next port after sink and then get the data repository from the port
-    auto next_port_after_sink = pipeline->GetSink()->get_next_port_after_sink();
+    auto next_port_after_sink = _pipeline->GetSink()->get_next_port_after_sink();
     for (auto& [next_op, port_id] : next_port_after_sink) {
       destination_data_repositories.push_back(next_op->get_port(port_id)->repo);
     }
+    if (_node->type == ::duckdb::PhysicalOperatorType::TABLE_SCAN) {
+      auto& first_operator = _pipeline->GetOperators()[0].get();
+      destination_data_repositories.push_back(first_operator.get_port("scan")->repo);
+    }
+    if (_pipeline->GetSink()->type == ::duckdb::PhysicalOperatorType::RESULT_COLLECTOR) {
+      destination_data_repositories.push_back(_node->get_port("final")->repo);
+    }
   };
   ~task_creation_info() = default;
-  ::duckdb::GPUPhysicalOperator* node;
+  ::duckdb::GPUPhysicalOperator* _node;
   std::vector<cucascade::idata_repository*> destination_data_repositories;
-  ::duckdb::shared_ptr<::duckdb::GPUPipeline> pipeline;
+  ::duckdb::shared_ptr<::duckdb::GPUPipeline> _pipeline;
 };
 
 /**
@@ -143,6 +151,7 @@ class task_creator {
   task_creator(std::unique_ptr<task_creation_queue> task_creation_queue,
                size_t num_threads,
                gpu_pipeline_hashmap& gpu_pipeline_map,
+               ::duckdb::ClientContext& client_context,
                parallel::pipeline_executor& pipeline_executor,
                parallel::duckdb_scan_executor& duckdb_scan_executor);
 
@@ -199,6 +208,13 @@ class task_creator {
    */
   void schedule(std::unique_ptr<task_creation_info> info);
 
+  /**
+   * @brief Update the pipeline status.
+   *
+   * @param node The operator node to update the pipeline status for.
+   */
+  void update_pipeline_status(::duckdb::GPUPhysicalOperator* node);
+
  private:
   /**
    * @brief Worker function executed by each thread in the pool.
@@ -237,6 +253,7 @@ class task_creator {
   std::queue<::duckdb::shared_ptr<::duckdb::GPUPipeline>> priority_scans;
   std::unique_ptr<task_creation_queue> _task_creation_queue;
   gpu_pipeline_hashmap& _gpu_pipeline_map;
+  ::duckdb::ClientContext& _client_context;
   parallel::pipeline_executor& _pipeline_executor;
   parallel::duckdb_scan_executor& _duckdb_scan_executor;
   atomic<uint64_t> _task_id;
