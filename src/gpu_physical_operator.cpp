@@ -225,7 +225,7 @@ GPUPhysicalOperator::get_next_port_after_sink()
   for (auto& [port_name, port_ptr] : ports) {
     if (port_ptr->type == MemoryBarrierType::PIPELINE) {
       // For pipeline barrier: check if there is a data batch available
-      if (!port_ptr->repo->check_data_batch_view_availability()) {
+      if (!port_ptr->repo->check_data_batch_availability()) {
         // No data batch available, return src pipeline or monostate
         if (port_ptr->src_pipeline) { return ::sirius::task_creation_hint(port_ptr->src_pipeline); }
         return ::sirius::task_creation_hint(std::monostate{});
@@ -263,7 +263,7 @@ std::vector<::std::shared_ptr<::cucascade::data_batch>> GPUPhysicalOperator::get
 bool GPUPhysicalOperator::all_ports_empty()
 {
   for (auto& [port_name, port_ptr] : ports) {
-    if (!port_ptr->repo->check_data_batch_view_availability()) { return false; }
+    if (!port_ptr->repo->check_data_batch_availability()) { return false; }
   }
   return true;
 }

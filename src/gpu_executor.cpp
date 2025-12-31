@@ -617,7 +617,7 @@ void GPUExecutor::InitializeInternal(GPUPhysicalOperator& plan)
             std::make_unique<GPUPhysicalOperator::port>(
               MemoryBarrierType::PIPELINE,
               data_repo_manager->get_repository(op_id, port_id).get(),
-              new_scheduled[i]));
+              nullptr));
         }
 
         if (new_scheduled[i]->sink->type == PhysicalOperatorType::RESULT_COLLECTOR) {

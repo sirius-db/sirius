@@ -87,7 +87,6 @@ task_creator::task_creator(std::unique_ptr<task_creation_queue> task_creation_qu
 
 task_creator::~task_creator() { stop_thread_pool(); }
 
-// This is not great, but we will address this in the future
 void task_creator::update_pipeline_status(::duckdb::GPUPhysicalOperator* node)
 {
   auto pipeline = _gpu_pipeline_map._map[node];

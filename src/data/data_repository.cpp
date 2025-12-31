@@ -54,7 +54,7 @@ std::shared_ptr<data_batch> idata_repository::pull_data_batch()
   return batch;
 }
 
-bool idata_repository::check_data_batch_view_availability()
+bool idata_repository::check_data_batch_availability()
 {
   std::lock_guard<std::mutex> lock(_mutex);
   return !_data_batches.empty();

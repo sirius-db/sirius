@@ -15,24 +15,26 @@
  */
 
 #pragma once
-#include "gpu_pipeline.hpp"
-#include "operator/gpu_physical_table_scan.hpp"
 #include "duckdb/execution/execution_context.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "gpu_pipeline.hpp"
 #include "helper/helper.hpp"
+#include "operator/gpu_physical_table_scan.hpp"
 
 namespace sirius {
 
 class duckdb_scan_metadata {
-public:
-    //constructor initializing function and op
-    duckdb_scan_metadata(duckdb::ClientContext& client_context, duckdb::GPUPhysicalTableScan& op)
-        : _client_context(client_context), _op(op) {
-        }
-    //
-    ~duckdb_scan_metadata() = default;
-    duckdb::ClientContext& _client_context; // The client context for the scan operation 
-    duckdb::GPUPhysicalTableScan& _op; // The GPU physical table scan operator associated with this executor
+ public:
+  // constructor initializing function and op
+  duckdb_scan_metadata(duckdb::ClientContext& client_context, duckdb::GPUPhysicalTableScan& op)
+    : _client_context(client_context), _op(op)
+  {
+  }
+  //
+  ~duckdb_scan_metadata() = default;
+  duckdb::ClientContext& _client_context;  // The client context for the scan operation
+  duckdb::GPUPhysicalTableScan&
+    _op;  // The GPU physical table scan operator associated with this executor
 };
 
 }  // namespace sirius

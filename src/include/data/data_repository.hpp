@@ -81,7 +81,7 @@ class idata_repository {
   // cuCascade
   virtual void add_new_data_batch(std::shared_ptr<data_batch> batch);
   virtual std::shared_ptr<data_batch> pull_data_batch();
-  virtual bool check_data_batch_view_availability();
+  virtual bool check_data_batch_availability();
 
  protected:
   std::mutex _mutex;  ///< Mutex for thread-safe access to repository operations
