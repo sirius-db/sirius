@@ -15,7 +15,6 @@
  */
 
 #include "config.hpp"
-#include "data/data_repository_manager.hpp"
 #include "duckdb/execution/execution_context.hpp"
 #include "duckdb/execution/operator/helper/physical_result_collector.hpp"
 #include "duckdb/execution/operator/set/physical_recursive_cte.hpp"
@@ -34,6 +33,7 @@
 #include "operator/gpu_physical_result_collector.hpp"
 #include "operator/gpu_physical_table_scan.hpp"
 
+#include <data/data_repository_manager.hpp>
 #include <stdio.h>
 
 #include <iostream>
@@ -321,7 +321,7 @@ void GPUExecutor::InitializeInternal(GPUPhysicalOperator& plan)
         SIRIUS_LOG_DEBUG("");  // Blank line for separation
       }
 
-      auto data_repo_manager = ::std::make_unique<::cucascade::data_repository_manager>();
+      auto data_repo_manager = ::std::make_unique<::cucascade::shared_data_repository_manager>();
       unordered_map<const GPUPhysicalOperator*, vector<shared_ptr<GPUPipeline>>>
         source_to_pipelines;
 
@@ -593,8 +593,8 @@ void GPUExecutor::InitializeInternal(GPUPhysicalOperator& plan)
         }
 
         for (auto next_port : new_scheduled[i]->sink->get_next_port_after_sink()) {
-          ::std::unique_ptr<::cucascade::idata_repository> repo =
-            ::std::make_unique<::cucascade::idata_repository>();
+          ::std::unique_ptr<::cucascade::shared_data_repository> repo =
+            ::std::make_unique<::cucascade::shared_data_repository>();
           std::string_view port_id = next_port.second;
           auto next_op             = next_port.first;
           size_t op_id             = get_operator_id(next_op);
@@ -607,8 +607,8 @@ void GPUExecutor::InitializeInternal(GPUPhysicalOperator& plan)
         }
 
         if (new_scheduled[i]->source->type == PhysicalOperatorType::TABLE_SCAN) {
-          ::std::unique_ptr<::cucascade::idata_repository> repo =
-            ::std::make_unique<::cucascade::idata_repository>();
+          ::std::unique_ptr<::cucascade::shared_data_repository> repo =
+            ::std::make_unique<::cucascade::shared_data_repository>();
           std::string port_id = "scan";
           size_t source_op_id = get_operator_id(new_scheduled[i]->source.get());
           data_repo_manager->add_new_repository(source_op_id, port_id, std::move(repo));
@@ -621,8 +621,8 @@ void GPUExecutor::InitializeInternal(GPUPhysicalOperator& plan)
         }
 
         if (new_scheduled[i]->sink->type == PhysicalOperatorType::RESULT_COLLECTOR) {
-          ::std::unique_ptr<::cucascade::idata_repository> repo =
-            ::std::make_unique<::cucascade::idata_repository>();
+          ::std::unique_ptr<::cucascade::shared_data_repository> repo =
+            ::std::make_unique<::cucascade::shared_data_repository>();
           std::string port_id = "final";
           size_t sink_op_id   = get_operator_id(new_scheduled[i]->sink.get());
           data_repo_manager->add_new_repository(sink_op_id, port_id, std::move(repo));

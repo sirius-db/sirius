@@ -21,7 +21,7 @@
 #include "test_utils.hpp"
 
 // sirius
-#include <data/data_batch_view.hpp>
+#include <data/data_batch.hpp>
 #include <data/data_repository.hpp>
 #include <data/data_repository_manager.hpp>
 #include <scan/duckdb_scan_executor.hpp>
@@ -64,7 +64,7 @@ using namespace sirius;
 class test_scan_task : public parallel::duckdb_scan_task {
  public:
   test_scan_task(uint64_t task_id,
-                 cucascade::data_repository_manager& dr_mgr,
+                 cucascade::shared_data_repository_manager& dr_mgr,
                  duckdb::Connection& con,
                  std::string const& table_name,
                  std::unique_ptr<parallel::duckdb_scan_task_local_state> l_state,
@@ -480,7 +480,7 @@ static void run_scan_test(std::string const& table_name,
   initialize_memory_manager();
 
   // Verify memory manager is initialized
-  auto& mem_mgr   = memory_reservation_manager::get_instance();
+  auto& mem_mgr   = sirius::memory_manager::get();
   auto* mem_space = mem_mgr.get_memory_space(Tier::HOST, 0);
   REQUIRE(mem_space != nullptr);
 
@@ -533,7 +533,7 @@ static void run_scan_test(std::string const& table_name,
     pipeline_id, scan_executor, client_ctx, ptsa);
 
   // Create data repository manager (empty, unused for this test)
-  cucascade::data_repository_manager dr_mgr;
+  cucascade::shared_data_repository_manager dr_mgr;
 
   // Create local state
   auto local_state =

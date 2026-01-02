@@ -17,12 +17,12 @@
 #pragma once
 
 #include "config.hpp"
-#include "data/data_repository.hpp"
 #include "gpu_pipeline.hpp"
 #include "parallel/task_executor.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 
 #include <blockingconcurrentqueue.h>
+#include <data/data_repository.hpp>
 
 #include <atomic>
 #include <memory>

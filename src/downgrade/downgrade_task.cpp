@@ -17,80 +17,69 @@
 #include "downgrade/downgrade_task.hpp"
 // #include "downgrade/downgrade_executor.hpp"
 #include "cudf/contiguous_split.hpp"
-#include "data/cpu_data_representation.hpp"
-#include "data/gpu_data_representation.hpp"
-#include "memory/common.hpp"
-#include "memory/fixed_size_host_memory_resource.hpp"
-#include "memory/memory_reservation_manager.hpp"
+#include "data/sirius_converter_registry.hpp"
+#include "memory/sirius_memory_manager.hpp"
 
 #include <rmm/cuda_stream_view.hpp>
+
+#include <data/cpu_data_representation.hpp>
+#include <data/gpu_data_representation.hpp>
+#include <memory/common.hpp>
+#include <memory/fixed_size_host_memory_resource.hpp>
 
 namespace sirius {
 namespace parallel {
 
 void downgrade_task::execute()
 {
-  // TODO: store this in local state i think
   rmm::cuda_stream_view stream = rmm::cuda_stream_default;
-  // get the memory_space and check that its gpu
-  auto memory_space = _local_state->cast<downgrade_task_local_state>()._batch->get_memory_space();
-  if (memory_space->get_tier() != cucascade::memory::Tier::GPU) {
+
+  auto& batch = _local_state->cast<downgrade_task_local_state>()._batch;
+
+  // Check if already on host tier - nothing to do
+  auto memory_space = batch->get_memory_space();
+  if (memory_space == nullptr || memory_space->get_tier() != cucascade::memory::Tier::GPU) {
     mark_task_completion();
     return;
-  } else {
-    auto& batch    = _local_state->cast<downgrade_task_local_state>()._batch;
-    auto data_size = batch->get_data()->get_size_in_bytes();
-
-    try {
-      auto& mr_manager = cucascade::memory::memory_reservation_manager::get_instance();
-      auto reservation = mr_manager.request_reservation(
-        cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::HOST}, data_size);
-      if (!reservation) {
-        throw rmm::out_of_memory("Failed to allocate host memory for downgrade task.");
-      }
-      // Reservation identifies a memory_space (tier + device). Fetch its default allocator.
-      auto mem_space = mr_manager.get_memory_space(reservation->tier(), reservation->device_id());
-      if (!mem_space) {
-        throw std::runtime_error("Invalid reservation memory_space for HOST tier");
-      }
-      auto* fixed_mr = reservation->get_memory_resource_of<cucascade::memory::Tier::HOST>();
-
-      batch->convert_to_memory_space(mem_space, stream);
-
-      mark_task_completion();
-      return;
-
-    } catch (const rmm::out_of_memory& e) {
-      throw std::runtime_error("Failed to allocate gpu_memory");
-    }
-
-    // Obtain HOST-tier memory resource from the memory manager
-    // auto& mr_manager = cucascade::memory::memory_reservation_manager::get_instance();
-    // auto host_spaces = mr_manager.get_memory_spaces_for_tier(cucascade::memory::Tier::HOST);
-    // if (host_spaces.empty()) {
-    //     mark_task_completion();
-    //     return;
-    // }
-    // auto host_allocator_ref = host_spaces[0]->get_default_allocator();
-    // auto* host_fixed_mr =
-    // dynamic_cast<cucascade::memory::fixed_size_host_memory_resource*>(&host_allocator_ref.get());
-
-    // // Fallback: if cast fails, complete task without conversion
-    // if (host_fixed_mr == nullptr) {
-    //     mark_task_completion();
-    //     return;
-    // }
-
-    // // Use default CUDA stream for the conversion
-    // rmm::cuda_stream_view stream = rmm::cuda_stream_default;
-
-    // auto host_table = detail::convert_to_host_representation(table, host_fixed_mr, stream);
-    // _local_state->cast<downgrade_task_local_state>()._batch->set_data(std::move(host_table));
-    // mark_task_completion();
-    // return;
   }
 
-  mark_task_completion();
+  // Try to acquire downgrade lock - if batch is being processed, we can't downgrade
+  if (!batch->try_to_lock_for_downgrade()) {
+    // Batch is currently being processed, skip downgrade for now
+    // The scheduler can retry later
+    mark_task_completion();
+    return;
+  }
+
+  // At this point, we have the downgrade lock. The batch state is now 'downgrading'.
+  // When convert_to completes, we need to release the lock by transitioning state back.
+  // Note: The current cuCascade API doesn't have an explicit unlock_from_downgrade(),
+  // so the convert_to operation itself handles the state transition.
+
+  auto data_size = batch->get_data()->get_size_in_bytes();
+
+  try {
+    auto& mr_manager = sirius::memory_manager::get();
+    auto reservation = mr_manager.request_reservation(
+      cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::HOST}, data_size);
+    if (!reservation) {
+      throw rmm::out_of_memory("Failed to allocate host memory for downgrade task.");
+    }
+
+    // Reservation identifies a memory_space (tier + device). Fetch its default allocator.
+    auto mem_space = mr_manager.get_memory_space(reservation->tier(), reservation->device_id());
+    if (!mem_space) { throw std::runtime_error("Invalid reservation memory_space for HOST tier"); }
+
+    // Use the centralized converter registry to convert GPU representation to HOST
+    auto& converter_registry = sirius::converter_registry::get();
+    batch->convert_to<cucascade::host_table_representation>(converter_registry, mem_space, stream);
+
+    mark_task_completion();
+    return;
+
+  } catch (const rmm::out_of_memory& e) {
+    throw std::runtime_error("Failed to allocate host memory for downgrade");
+  }
 }
 
 void downgrade_task::mark_task_completion()

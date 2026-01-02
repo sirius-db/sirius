@@ -16,11 +16,13 @@
 
 #pragma once
 
-#include "data/data_batch_view.hpp"
-#include "data/data_repository_manager.hpp"
-#include "memory/memory_space.hpp"
-
 #include <cudf/cudf_utils.hpp>
+
+#include <data/data_batch.hpp>
+#include <memory/memory_space.hpp>
+
+#include <memory>
+#include <vector>
 
 namespace sirius {
 namespace op {
@@ -28,8 +30,7 @@ namespace op {
 /**
  * @brief Functionalities for running local order-by or top-n on a data batch.
  *
- * Require caller to have already upgraded input data batches into `gpu_table_representation`
- * (the input data batch views are pinned).
+ * Require caller to have already upgraded input data batches into `gpu_table_representation`.
  */
 class gpu_order_impl {
  public:
@@ -44,19 +45,17 @@ class gpu_order_impl {
    * @param projections The columns to construct output based on the sorted order.
    * @param stream CUDA stream used for device memory operations and kernel launches.
    * @param memory_space The memory space used to allocate memory for the output data batch.
-   * @param data_repository_mgr The data repository manager that the output data batch belongs to.
    *
-   * @return The output data batch with ownership.
+   * @return The output data batch.
    */
-  static std::unique_ptr<cucascade::data_batch> local_order_by(
-    const cucascade::data_batch_view& input,
+  static std::shared_ptr<cucascade::data_batch> local_order_by(
+    std::shared_ptr<cucascade::data_batch> input,
     const std::vector<int>& order_key_idx,
     const std::vector<cudf::order>& column_order,
     const std::vector<cudf::null_order>& null_precedence,
     const std::vector<int>& projections,
     rmm::cuda_stream_view stream,
-    cucascade::memory::memory_space& memory_space,
-    cucascade::data_repository_manager& data_repository_mgr);
+    cucascade::memory::memory_space& memory_space);
 
   /**
    * @brief Perform local top-n (with offset) on the input data batch.
@@ -71,12 +70,11 @@ class gpu_order_impl {
    * @param projections The columns to construct output based on the sorted order.
    * @param stream CUDA stream used for device memory operations and kernel launches.
    * @param memory_space The memory space used to allocate memory for the output data batch.
-   * @param data_repository_mgr The data repository manager that the output data batch belongs to.
    *
-   * @return The output data batch with ownership.
+   * @return The output data batch.
    */
-  static std::unique_ptr<cucascade::data_batch> local_top_n(
-    const cucascade::data_batch_view& input,
+  static std::shared_ptr<cucascade::data_batch> local_top_n(
+    std::shared_ptr<cucascade::data_batch> input,
     const int limit,
     const int offset,
     const std::vector<int>& order_key_idx,
@@ -84,8 +82,7 @@ class gpu_order_impl {
     const std::vector<cudf::null_order>& null_precedence,
     const std::vector<int>& projections,
     rmm::cuda_stream_view stream,
-    cucascade::memory::memory_space& memory_space,
-    cucascade::data_repository_manager& data_repository_mgr);
+    cucascade::memory::memory_space& memory_space);
 };
 
 }  // namespace op

@@ -17,9 +17,10 @@
 #pragma once
 
 // sirius
+#include <data/sirius_converter_registry.hpp>
 #include <helper/helper.hpp>
-#include <memory/memory_reservation_manager.hpp>
 #include <memory/reservation_manager_configurator.hpp>
+#include <memory/sirius_memory_manager.hpp>
 
 // standard library
 #include <vector>
@@ -41,8 +42,6 @@ inline void initialize_memory_manager()
 {
   static bool initialized = false;
   if (!initialized) {
-    memory_reservation_manager::reset_for_testing();
-
     // Use the configurator to properly set up memory spaces
     reservation_manager_configurator builder;
 
@@ -60,7 +59,10 @@ inline void initialize_memory_manager()
 
     // Build configuration with topology detection
     auto space_configs = builder.build_with_topology();
-    memory_reservation_manager::initialize(std::move(space_configs));
+    sirius::memory_manager::initialize(std::move(space_configs));
+
+    // Initialize the converter registry for representation conversions
+    sirius::converter_registry::initialize();
 
     initialized = true;
   }

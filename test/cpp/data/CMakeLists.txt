@@ -16,9 +16,5 @@
 
 set(TEST_SOURCES
     ${TEST_SOURCES}
-    # ${CMAKE_CURRENT_SOURCE_DIR}/test_data_batch.cpp
-    # ${CMAKE_CURRENT_SOURCE_DIR}/test_data_batch_view.cpp
-    # ${CMAKE_CURRENT_SOURCE_DIR}/test_data_repository.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/test_data_repository_manager.cpp
-    # ${CMAKE_CURRENT_SOURCE_DIR}/test_data_representation.cpp
+    # Sirius-specific data tests can be added here
     PARENT_SCOPE)

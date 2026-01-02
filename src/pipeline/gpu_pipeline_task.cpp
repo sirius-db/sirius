@@ -16,7 +16,8 @@
 
 #include "pipeline/gpu_pipeline_task.hpp"
 
-#include "data/data_repository_manager.hpp"
+#include <data/data_batch_utils.hpp>
+#include <data/data_repository_manager.hpp>
 
 namespace sirius {
 namespace parallel {
@@ -39,11 +40,30 @@ const duckdb::GPUPipeline* gpu_pipeline_task::get_pipeline() const
 
 void gpu_pipeline_task::execute()
 {
-  // Execute the task
-  // Transfer data batch to GPU memory if not in GPU memory
-  // set reservation_aware_memory_resource_ref as the default cudf allocator
-  // Call cudf operators
-  // after each cudf operator, get the peak total bytes to collect statistics
+  auto& local_state = _local_state->cast<gpu_pipeline_task_local_state>();
+
+  // Acquire processing handles for all input batches.
+  // This prevents the batches from being downgraded while we're processing them.
+  // The handles will automatically release when they go out of scope.
+  auto processing_handles = sirius::acquire_processing_handles(local_state._batches);
+  if (!processing_handles) {
+    // Some batch is being downgraded - cannot process right now
+    // TODO: Add retry logic or re-queue the task
+    mark_task_completion();
+    return;
+  }
+
+  // At this point, all input batches are locked for processing.
+  // They will remain locked until the processing_handles go out of scope.
+
+  // TODO: Implement actual pipeline execution:
+  // 1. Transfer data batch to GPU memory if not already there
+  // 2. Set reservation_aware_memory_resource_ref as the default cudf allocator
+  // 3. Execute cudf operators on the pipeline
+  // 4. After each cudf operator, get peak total bytes to collect statistics
+  // 5. Push output batches to the data repository
+
+  // Processing handles are automatically released here when they go out of scope
   mark_task_completion();
 }
 

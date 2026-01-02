@@ -20,6 +20,8 @@
 #include "gpu_meta_pipeline.hpp"
 #include "gpu_pipeline.hpp"
 
+#include <data/data_batch.hpp>
+
 namespace duckdb {
 
 string GPUPhysicalOperator::GetName() const { return PhysicalOperatorToString(type); }
@@ -181,11 +183,18 @@ GPUPhysicalOperator::port* GPUPhysicalOperator::get_port(std::string_view port_i
   return it->second.get();
 }
 
-::std::vector<::std::unique_ptr<::cucascade::data_batch>> GPUPhysicalOperator::execute(
-  ::std::vector<::std::unique_ptr<::cucascade::data_batch_view>> input_batch)
+::std::vector<::std::shared_ptr<::cucascade::data_batch>> GPUPhysicalOperator::execute(
+  const ::std::vector<::std::shared_ptr<::cucascade::data_batch>>& input_batches)
 {
   // not doing anything for now
-  return ::std::vector<::std::unique_ptr<::cucascade::data_batch>>{};
+  return ::std::vector<::std::shared_ptr<::cucascade::data_batch>>{};
+}
+
+void GPUPhysicalOperator::push_data_batch(std::string_view port_id,
+                                          std::shared_ptr<::cucascade::data_batch> batch)
+{
+  auto* p = get_port(port_id);
+  if (p && p->repo) { p->repo->add_data_batch(std::move(batch)); }
 }
 
 void GPUPhysicalOperator::add_next_port_after_sink(

@@ -16,20 +16,19 @@
 
 #include "operator/order/gpu_order_impl.hpp"
 
-#include "data/gpu_data_representation.hpp"
+#include "data/data_batch_utils.hpp"
 
 namespace sirius {
 namespace op {
 
-std::unique_ptr<cucascade::data_batch> gpu_order_impl::local_order_by(
-  const cucascade::data_batch_view& input,
+std::shared_ptr<cucascade::data_batch> gpu_order_impl::local_order_by(
+  std::shared_ptr<cucascade::data_batch> input,
   const std::vector<int>& order_key_idx,
   std::vector<cudf::order> const& column_order,
   std::vector<cudf::null_order> const& null_precedence,
   const std::vector<int>& projections,
   rmm::cuda_stream_view stream,
-  cucascade::memory::memory_space& memory_space,
-  cucascade::data_repository_manager& data_repository_mgr)
+  cucascade::memory::memory_space& memory_space)
 {
   if (order_key_idx.size() != column_order.size() ||
       order_key_idx.size() != null_precedence.size()) {
@@ -39,7 +38,7 @@ std::unique_ptr<cucascade::data_batch> gpu_order_impl::local_order_by(
   }
 
   // Get sorted order
-  auto input_table = input.get_cudf_table_view();
+  auto input_table = get_cudf_table_view(*input);
   std::vector<cudf::column_view> sort_cols;
   for (int idx : order_key_idx) {
     sort_cols.push_back(input_table.column(idx));
@@ -55,15 +54,11 @@ std::unique_ptr<cucascade::data_batch> gpu_order_impl::local_order_by(
   auto output_table = cudf::gather(cudf::table_view(project_input_cols), sorted_order->view());
 
   // Create the output data batch
-  auto gpu_table_representation =
-    std::make_unique<cucascade::gpu_table_representation>(*output_table, memory_space);
-  return std::make_unique<cucascade::data_batch>(data_repository_mgr.get_next_data_batch_id(),
-                                                 data_repository_mgr,
-                                                 std::move(gpu_table_representation));
+  return make_data_batch(std::move(output_table), memory_space);
 }
 
-std::unique_ptr<cucascade::data_batch> gpu_order_impl::local_top_n(
-  const cucascade::data_batch_view& input,
+std::shared_ptr<cucascade::data_batch> gpu_order_impl::local_top_n(
+  std::shared_ptr<cucascade::data_batch> input,
   const int limit,
   const int offset,
   const std::vector<int>& order_key_idx,
@@ -71,18 +66,17 @@ std::unique_ptr<cucascade::data_batch> gpu_order_impl::local_top_n(
   const std::vector<cudf::null_order>& null_precedence,
   const std::vector<int>& projections,
   rmm::cuda_stream_view stream,
-  cucascade::memory::memory_space& memory_space,
-  cucascade::data_repository_manager& data_repository_mgr)
+  cucascade::memory::memory_space& memory_space)
 {
   if (order_key_idx.size() != column_order.size() ||
       order_key_idx.size() != null_precedence.size()) {
     throw std::runtime_error(
       "mismatch between the sizes of `order_key_idx`, `column_order`, and "
-      "`null_precedence` in `local_order_by()`");
+      "`null_precedence` in `local_top_n()`");
   }
 
   // Get sorted order
-  auto input_table = input.get_cudf_table_view();
+  auto input_table = get_cudf_table_view(*input);
   std::vector<cudf::column_view> sort_cols;
   for (int idx : order_key_idx) {
     sort_cols.push_back(input_table.column(idx));
@@ -100,9 +94,10 @@ std::unique_ptr<cucascade::data_batch> gpu_order_impl::local_top_n(
     output_table = std::make_unique<cudf::table>(std::move(empty_cols));
   } else {
     auto sliced_sorted_order =
-      (limit + offset >= sorted_order->size())
+      (limit + offset >= static_cast<int>(sorted_order->size()))
         ? sorted_order->view()
-        : cudf::slice(sorted_order->view(), {0, limit + offset}, stream)[0];
+        : cudf::slice(
+            sorted_order->view(), {0, static_cast<cudf::size_type>(limit + offset)}, stream)[0];
     std::vector<cudf::column_view> project_input_cols;
     for (int idx : projections) {
       project_input_cols.push_back(input_table.column(idx));
@@ -111,11 +106,7 @@ std::unique_ptr<cucascade::data_batch> gpu_order_impl::local_top_n(
   }
 
   // Create the output data batch
-  auto gpu_table_representation =
-    std::make_unique<cucascade::gpu_table_representation>(*output_table, memory_space);
-  return std::make_unique<cucascade::data_batch>(data_repository_mgr.get_next_data_batch_id(),
-                                                 data_repository_mgr,
-                                                 std::move(gpu_table_representation));
+  return make_data_batch(std::move(output_table), memory_space);
 }
 
 }  // namespace op

@@ -17,10 +17,13 @@
 #pragma once
 
 #include "config.hpp"
-#include "data/data_repository.hpp"
-#include "memory/common.hpp"
 #include "parallel/task_executor.hpp"
 #include "task_completion.hpp"
+
+#include <data/data_batch.hpp>
+#include <data/data_repository.hpp>
+#include <data/data_repository_manager.hpp>
+#include <memory/common.hpp>
 
 #include <cstdint>
 #include <memory>
@@ -43,13 +46,13 @@ class downgrade_task_global_state : public itask_global_state {
    * @param data_repo_mgr Reference to the data repository manager for storing task outputs
    * @param message_queue Reference to the message queue for task completion notifications
    */
-  explicit downgrade_task_global_state(cucascade::data_repository_manager& data_repo_mgr,
+  explicit downgrade_task_global_state(cucascade::shared_data_repository_manager& data_repo_mgr,
                                        task_completion_message_queue& message_queue)
     : _data_repo_mgr(data_repo_mgr), _message_queue(message_queue)
   {
   }
 
-  cucascade::data_repository_manager&
+  cucascade::shared_data_repository_manager&
     _data_repo_mgr;  ///< Repository for storing and retrieving data batches
   task_completion_message_queue&
     _message_queue;  ///< Message queue to notify task_creator about task completion

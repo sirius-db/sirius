@@ -15,9 +15,5 @@
 # =============================================================================
 
 set(TEST_SOURCES
-    ${TEST_SOURCES}
-    ${CMAKE_CURRENT_SOURCE_DIR}/test_cpu_cache.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/test_memory_reservation_manager.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/test_topology_discovery.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/test_gpu_kernels.cu
+    ${TEST_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/test_cpu_cache.cpp
     PARENT_SCOPE)

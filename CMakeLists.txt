@@ -33,26 +33,25 @@ endif()
 project(${TARGET_NAME} LANGUAGES CXX CUDA)
 find_package(cudf REQUIRED CONFIG)
 
-if(DEFINED ENV{LIBCUDF_ENV_PREFIX})
-  set(CONDA_PREFIX "$ENV{LIBCUDF_ENV_PREFIX}")
+# Derive the environment prefix from where cudf was found cudf_DIR is typically:
+# <prefix>/lib/cmake/cudf
+cmake_path(GET cudf_DIR PARENT_PATH _cmake_dir)
+cmake_path(GET _cmake_dir PARENT_PATH _lib_dir)
+cmake_path(GET _lib_dir PARENT_PATH CUDF_ENV_PREFIX)
+message(STATUS "Derived environment prefix from cudf: ${CUDF_ENV_PREFIX}")
 
-  find_library(
-    NUMA_LIB
-    NAMES numa
-    HINTS "${CONDA_PREFIX}/lib"
-    DOC "Path to the libnuma library")
+find_library(
+  NUMA_LIB
+  NAMES numa
+  HINTS "${CUDF_ENV_PREFIX}/lib"
+  DOC "Path to the libnuma library")
 
-  # Inform the user if found
-  if(NUMA_LIB)
-    message(STATUS "Found libnuma: ${NUMA_LIB}")
-  else()
-    message(
-      FATAL_ERROR
-        "libnuma not found. Checked system paths and ${CONDA_PREFIX}/lib.")
-  endif()
-
+if(NUMA_LIB)
+  message(STATUS "Found libnuma: ${NUMA_LIB}")
 else()
-  message(FATAL_ERROR "LIBCUDF_ENV_PREFIX environment variable is not set.")
+  message(
+    FATAL_ERROR
+      "libnuma not found. Checked system paths and ${CUDF_ENV_PREFIX}/lib.")
 endif()
 
 # Set CUDA and CXX flags
@@ -67,6 +66,14 @@ set(ENV{SKIP_SUBSTRAIT_C_TESTS} ON)
 set(EXTENSION_NAME ${TARGET_NAME}_extension)
 set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
+# Third-party dependencies (must be before include_directories for cuCascade
+# headers)
+set(DEPS_PREFIX "_deps")
+include(third_party/spdlog.cmake)
+include(third_party/cucascade.cmake)
+
+# Include directories - cuCascade headers first for memory module
+include_directories(${CUCASCADE_INCLUDE_DIR})
 include_directories(src/include src/include/operator)
 include_directories(substrait/src/include)
 include_directories(${TARGET_NAME} substrait/third_party/substrait)
@@ -85,19 +92,9 @@ set(EXTENSION_SOURCES
     src/cpu_cache.cpp
     src/gpu_query_result.cpp
     src/config.cpp
-    src/memory/common.cpp
-    src/memory/memory_space.cpp
-    src/memory/stream_pool.cpp
     src/fallback.cpp
-    src/memory/memory_reservation.cpp
-    src/memory/memory_reservation_manager.cpp
-    src/memory/fixed_size_host_memory_resource.cpp
-    src/memory/null_device_memory_resource.cpp
-    src/memory/topology_discovery.cpp
-    src/memory/reservation_aware_resource_adaptor.cpp
-    src/memory/reservation_manager_configurator.cpp
-    src/memory/disk_access_limiter.cpp
     src/parallel/task_executor.cpp)
+# Note: Memory module sources are now provided by cuCascade library
 add_subdirectory(src/operator)
 add_subdirectory(src/plan)
 add_subdirectory(src/data)
@@ -120,9 +117,9 @@ set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
 # Manually specify CUDA include and library directories Include directories
 include_directories(${CUDA_INCLUDE_DIRS})
 include_directories(src/include/cudf)
-include_directories(${CONDA_PREFIX}/include)
-include_directories(${CONDA_PREFIX}/include/cudf)
-include_directories(${CONDA_PREFIX}/include/rmm)
+# Note: cudf::cudf and rmm::rmm targets (from find_package) already provide the
+# necessary include paths. Do not add CONDA_PREFIX includes here as it may point
+# to a different environment causing duplicate definitions.
 
 # add_library(${EXTENSION_NAME} STATIC ${EXTENSION_SOURCES} ${CUDA_SOURCES})
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES} ${CUDA_SOURCES})
@@ -149,11 +146,14 @@ target_link_libraries(${EXTENSION_NAME} substrait_extension cudf::cudf rmm::rmm
 target_link_libraries(${LOADABLE_EXTENSION_NAME} substrait_extension cudf::cudf
                       rmm::rmm)
 
-# Third-party
-set(DEPS_PREFIX "_deps")
-include(third_party/spdlog.cmake)
-target_link_libraries(${EXTENSION_NAME} spdlog::spdlog)
-target_link_libraries(${LOADABLE_EXTENSION_NAME} spdlog::spdlog)
+# Link third-party libraries
+target_link_libraries(${EXTENSION_NAME} spdlog::spdlog cucascade::cucascade)
+target_link_libraries(${LOADABLE_EXTENSION_NAME} spdlog::spdlog
+                      cucascade::cucascade)
+
+# Ensure cuCascade is built before extensions
+add_dependencies(${EXTENSION_NAME} cucascade_ep spdlog_ep)
+add_dependencies(${LOADABLE_EXTENSION_NAME} cucascade_ep spdlog_ep)
 
 install(
   TARGETS ${EXTENSION_NAME}

@@ -16,26 +16,27 @@
 
 #pragma once
 
-#include "data/data_batch_view.hpp"
-#include "data/data_repository_manager.hpp"
-#include "memory/memory_space.hpp"
-
 #include <cudf/cudf_utils.hpp>
+
+#include <data/data_batch.hpp>
+#include <memory/memory_space.hpp>
+
+#include <memory>
+#include <vector>
 
 namespace sirius {
 namespace op {
 
 /**
- * @brief Functionalities for mergeing multiple data batches into a single one.
+ * @brief Functionalities for merging multiple data batches into a single one.
  *
  * Provide functionalities including:
  * - Concatenate multiple data batches;
- * - Merge aggregation over multiple data batches (presumebaly each input data batch is a local
+ * - Merge aggregation over multiple data batches (presumably each input data batch is a local
  * aggregation result);
  * - Merge sort over multiple sorted data batches.
  *
- * Require caller to have already upgraded input data batches into `gpu_table_representation`
- * (the input data batch views are pinned).
+ * Require caller to have already upgraded input data batches into `gpu_table_representation`.
  */
 class gpu_merge_impl {
  public:
@@ -45,15 +46,13 @@ class gpu_merge_impl {
    * @param input The input batches to be concatenated.
    * @param stream CUDA stream used for device memory operations and kernel launches.
    * @param memory_space The memory space used to allocate memory for the output data batch.
-   * @param data_repository_mgr The data repository manager that the output data batch belongs to.
    *
-   * @return The output data batch with ownership.
+   * @return The output data batch.
    */
-  static std::unique_ptr<cucascade::data_batch> concat(
-    const std::vector<std::unique_ptr<cucascade::data_batch_view>>& input,
+  static std::shared_ptr<cucascade::data_batch> concat(
+    const std::vector<std::shared_ptr<cucascade::data_batch>>& input,
     rmm::cuda_stream_view stream,
-    cucascade::memory::memory_space& memory_space,
-    cucascade::data_repository_manager& data_repository_mgr);
+    cucascade::memory::memory_space& memory_space);
 
   /**
    * @brief Perform ungrouped merge aggregate on multiple data batches.
@@ -62,16 +61,14 @@ class gpu_merge_impl {
    * @param aggregates The aggregate functions, should have the same size as num input columns.
    * @param stream CUDA stream used for device memory operations and kernel launches.
    * @param memory_space The memory space used to allocate memory for the output data batch.
-   * @param data_repository_mgr The data repository manager that the output data batch belongs to.
    *
-   * @return The output data batch with ownership.
+   * @return The output data batch.
    */
-  static std::unique_ptr<cucascade::data_batch> merge_ungrouped_aggregate(
-    const std::vector<std::unique_ptr<cucascade::data_batch_view>>& input,
+  static std::shared_ptr<cucascade::data_batch> merge_ungrouped_aggregate(
+    const std::vector<std::shared_ptr<cucascade::data_batch>>& input,
     const std::vector<cudf::aggregation::Kind>& aggregates,
     rmm::cuda_stream_view stream,
-    cucascade::memory::memory_space& memory_space,
-    cucascade::data_repository_manager& data_repository_mgr);
+    cucascade::memory::memory_space& memory_space);
 
   /**
    * @brief Perform grouped merge aggregate on multiple data batches.
@@ -84,17 +81,15 @@ class gpu_merge_impl {
    * num input columns`.
    * @param stream CUDA stream used for device memory operations and kernel launches.
    * @param memory_space The memory space used to allocate memory for the output data batch.
-   * @param data_repository_mgr The data repository manager that the output data batch belongs to.
    *
-   * @return The output data batch with ownership.
+   * @return The output data batch.
    */
-  static std::unique_ptr<cucascade::data_batch> merge_grouped_aggregate(
-    const std::vector<std::unique_ptr<cucascade::data_batch_view>>& input,
+  static std::shared_ptr<cucascade::data_batch> merge_grouped_aggregate(
+    const std::vector<std::shared_ptr<cucascade::data_batch>>& input,
     int num_group_cols,
     const std::vector<cudf::aggregation::Kind>& aggregates,
     rmm::cuda_stream_view stream,
-    cucascade::memory::memory_space& memory_space,
-    cucascade::data_repository_manager& data_repository_mgr);
+    cucascade::memory::memory_space& memory_space);
 
   /**
    * @brief Perform merge order-by on multiple data batches.
@@ -107,21 +102,19 @@ class gpu_merge_impl {
    * parameters should be consistent to the sorted order of each input batch.
    * @param stream CUDA stream used for device memory operations and kernel launches.
    * @param memory_space The memory space used to allocate memory for the output data batch.
-   * @param data_repository_mgr The data repository manager that the output data batch belongs to.
    *
-   * @return The output data batch with ownership.
+   * @return The output data batch.
    */
-  static std::unique_ptr<cucascade::data_batch> merge_order_by(
-    const std::vector<std::unique_ptr<cucascade::data_batch_view>>& input,
+  static std::shared_ptr<cucascade::data_batch> merge_order_by(
+    const std::vector<std::shared_ptr<cucascade::data_batch>>& input,
     const std::vector<int>& order_key_idx,
     const std::vector<cudf::order>& column_order,
     const std::vector<cudf::null_order>& null_precedence,
     rmm::cuda_stream_view stream,
-    cucascade::memory::memory_space& memory_space,
-    cucascade::data_repository_manager& data_repository_mgr);
+    cucascade::memory::memory_space& memory_space);
 
   /**
-   * @brief Perform merge order-by on multiple data batches.
+   * @brief Perform merge top-n on multiple data batches.
    *
    * @param input The input batches to be merged.
    * @param limit The number of top rows to output in the final global result.
@@ -133,20 +126,18 @@ class gpu_merge_impl {
    * parameters should be consistent to the top-n order of each input batch.
    * @param stream CUDA stream used for device memory operations and kernel launches.
    * @param memory_space The memory space used to allocate memory for the output data batch.
-   * @param data_repository_mgr The data repository manager that the output data batch belongs to.
    *
-   * @return The output data batch with ownership.
+   * @return The output data batch.
    */
-  static std::unique_ptr<cucascade::data_batch> merge_top_n(
-    const std::vector<std::unique_ptr<cucascade::data_batch_view>>& input,
+  static std::shared_ptr<cucascade::data_batch> merge_top_n(
+    const std::vector<std::shared_ptr<cucascade::data_batch>>& input,
     const int limit,
     const int offset,
     const std::vector<int>& order_key_idx,
     const std::vector<cudf::order>& column_order,
     const std::vector<cudf::null_order>& null_precedence,
     rmm::cuda_stream_view stream,
-    cucascade::memory::memory_space& memory_space,
-    cucascade::data_repository_manager& data_repository_mgr);
+    cucascade::memory::memory_space& memory_space);
 };
 
 }  // namespace op

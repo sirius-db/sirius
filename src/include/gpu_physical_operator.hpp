@@ -16,8 +16,6 @@
 
 #pragma once
 
-#include "data/data_batch_view.hpp"
-#include "data/data_repository.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/common.hpp"
 #include "duckdb/common/enums/operator_result_type.hpp"
@@ -31,6 +29,9 @@
 #include "duckdb/optimizer/join_order/join_node.hpp"
 #include "gpu_columns.hpp"
 #include "helper/types.hpp"
+
+#include <data/data_batch.hpp>
+#include <data/data_repository.hpp>
 
 namespace duckdb {
 class GPUExecutor;
@@ -97,8 +98,8 @@ class GPUPhysicalOperator {
 
   virtual OperatorResultType Execute(GPUIntermediateRelation& input_relation,
                                      GPUIntermediateRelation& output_relation) const;
-  virtual ::std::vector<::std::unique_ptr<::cucascade::data_batch>> execute(
-    ::std::vector<::std::unique_ptr<::cucascade::data_batch_view>> input_batch);
+  virtual ::std::vector<::std::shared_ptr<::cucascade::data_batch>> execute(
+    const ::std::vector<::std::shared_ptr<::cucascade::data_batch>>& input_batches);
 
   virtual bool ParallelOperator() const { return false; }
 
@@ -178,13 +179,13 @@ class GPUPhysicalOperator {
 
   struct port {
     MemoryBarrierType type;
-    ::cucascade::idata_repository* repo;
+    ::cucascade::shared_data_repository* repo;
     shared_ptr<GPUPipeline> src_pipeline;
     bool src_pipeline_finished{false};
   };
 
   // source pipeline pushed to repo of the ports
-  void push_data_batch_view(std::string_view port_id, ::cucascade::data_batch_view batch_view);
+  void push_data_batch(std::string_view port_id, std::shared_ptr<::cucascade::data_batch> batch);
   void add_port(std::string_view port_id, std::unique_ptr<port> p);
   port* get_port(std::string_view port_id);
   void add_next_port_after_sink(std::pair<GPUPhysicalOperator*, std::string_view> port_locator);

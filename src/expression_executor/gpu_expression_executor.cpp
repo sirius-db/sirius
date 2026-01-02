@@ -16,13 +16,14 @@
 
 #include "expression_executor/gpu_expression_executor.hpp"
 
-#include "cuda_stream_view.hpp"
 #include "duckdb/common/exception.hpp"
 #include "expression_executor/gpu_dispatcher.hpp"
 #include "expression_executor/gpu_expression_executor_state.hpp"
 #include "gpu_buffer_manager.hpp"
 #include "gpu_columns.hpp"
 #include "operator/gpu_materialize.hpp"
+
+#include <rmm/cuda_stream_view.hpp>
 
 namespace duckdb {
 namespace sirius {

@@ -15,7 +15,6 @@
  */
 
 #pragma once
-#include "data/data_repository.hpp"
 #include "memory/memory_reservation.hpp"
 #include "memory/memory_space.hpp"
 #include "parallel/task_executor.hpp"
@@ -23,6 +22,7 @@
 #include "pipeline/task_request.hpp"
 
 #include <blockingconcurrentqueue.h>
+#include <data/data_repository.hpp>
 
 namespace sirius {
 namespace parallel {
