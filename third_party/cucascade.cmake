@@ -36,15 +36,11 @@ ExternalProject_Add(
 file(MAKE_DIRECTORY ${CUCASCADE_INCLUDE_DIR}) # Include directory needs to exist
                                               # to run configure
 
-# Find fmt which is required by cuCascade
-find_package(fmt REQUIRED CONFIG)
-
 add_library(cucascade::cucascade STATIC IMPORTED)
 set_target_properties(cucascade::cucascade PROPERTIES IMPORTED_LOCATION
                                                       ${CUCASCADE_STATIC_LIB})
 target_include_directories(cucascade::cucascade
                            INTERFACE ${CUCASCADE_INCLUDE_DIR})
-# cuCascade uses NUMA-aware memory allocation and fmt for string formatting
-set_property(TARGET cucascade::cucascade PROPERTY INTERFACE_LINK_LIBRARIES numa
-                                                  fmt::fmt)
+# cuCascade uses NUMA-aware memory allocation
+set_property(TARGET cucascade::cucascade PROPERTY INTERFACE_LINK_LIBRARIES numa)
 add_dependencies(cucascade::cucascade ${CUCASCADE_BASE})
