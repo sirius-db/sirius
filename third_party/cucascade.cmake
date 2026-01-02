@@ -45,6 +45,6 @@ set_target_properties(cucascade::cucascade PROPERTIES IMPORTED_LOCATION
 target_include_directories(cucascade::cucascade
                            INTERFACE ${CUCASCADE_INCLUDE_DIR})
 # cuCascade uses NUMA-aware memory allocation and fmt for string formatting
-set_property(TARGET cucascade::cucascade PROPERTY INTERFACE_LINK_LIBRARIES
-             numa fmt::fmt)
+set_property(TARGET cucascade::cucascade PROPERTY INTERFACE_LINK_LIBRARIES numa
+                                                  fmt::fmt)
 add_dependencies(cucascade::cucascade ${CUCASCADE_BASE})
