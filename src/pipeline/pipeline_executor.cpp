@@ -22,24 +22,24 @@
 #include "pipeline/pipeline_queue.hpp"
 
 namespace sirius {
-namespace parallel {
+namespace pipeline {
 
-pipeline_executor::pipeline_executor(task_executor_config config)
-  : itask_executor(std::make_unique<pipeline_queue>(config.num_threads), config)
+pipeline_executor::pipeline_executor(sirius::parallel::task_executor_config config)
+  : sirius::parallel::itask_executor(std::make_unique<pipeline_queue>(config.num_threads), config)
 {
   // Initialize GPU pipeline executors for each available GPU
   _gpu_executors.reserve(Config::NUM_GPU);
   for (int i = 0; i < Config::NUM_GPU; ++i) {
-    // TODO: Initialize memory space for each GPU
-    auto& mem_res_mgr = sirius::memory_manager::get();
-    const cucascade::memory::memory_space* gpu_mem_space =
-      mem_res_mgr.get_memory_space(cucascade::memory::Tier::GPU, i);  // Placeholder
+    // auto& mem_res_mgr = cucascade::memory::memory_reservation_manager::get_instance();
+    // const cucascade::memory::memory_space* gpu_mem_space =
+    //   mem_res_mgr.get_memory_space(cucascade::memory::Tier::GPU, i);  // Placeholder
+    const cucascade::memory::memory_space* gpu_mem_space = nullptr;  // Placeholder
     _gpu_executors.push_back(std::make_unique<gpu_pipeline_executor>(config, gpu_mem_space, this));
   }
   _task_request_queue = std::make_unique<task_request_queue>(config.num_threads);
 }
 
-void pipeline_executor::schedule(std::unique_ptr<itask> task)
+void pipeline_executor::schedule(std::unique_ptr<sirius::parallel::itask> task)
 {
   _task_queue->push(std::move(task));
 }
@@ -63,7 +63,7 @@ void pipeline_executor::start()
   on_start();
   _threads.reserve(_config.num_threads);
   for (int i = 0; i < _config.num_threads; ++i) {
-    _threads.push_back(std::make_unique<task_executor_thread>(
+    _threads.push_back(std::make_unique<sirius::parallel::task_executor_thread>(
       std::make_unique<std::thread>(&pipeline_executor::worker_loop, this, i)));
   }
   // Start all GPU executors
@@ -123,7 +123,8 @@ void pipeline_executor::submit_task_request(std::unique_ptr<task_request> reques
   _task_request_queue->push(std::move(request));
 }
 
-void pipeline_executor::dispatch_to_gpu_executor(std::unique_ptr<itask> task, int gpu_id)
+void pipeline_executor::dispatch_to_gpu_executor(std::unique_ptr<sirius::parallel::itask> task,
+                                                 int gpu_id)
 {
   if (gpu_id < 0 || gpu_id >= static_cast<int>(_gpu_executors.size())) {
     throw std::runtime_error("Invalid GPU ID: " + std::to_string(gpu_id));
@@ -131,5 +132,5 @@ void pipeline_executor::dispatch_to_gpu_executor(std::unique_ptr<itask> task, in
   _gpu_executors[gpu_id]->schedule(std::move(task));
 }
 
-}  // namespace parallel
+}  // namespace pipeline
 }  // namespace sirius

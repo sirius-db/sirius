@@ -25,22 +25,22 @@
 #include <data/data_repository.hpp>
 
 namespace sirius {
-namespace parallel {
+namespace pipeline {
 
 class pipeline_executor;
 
 class local_task_buffer {
  public:
   local_task_buffer() = default;
-  void produce(std::unique_ptr<itask> task);
-  std::unique_ptr<itask> consume();
+  void produce(std::unique_ptr<sirius::parallel::itask> task);
+  std::unique_ptr<sirius::parallel::itask> consume();
   void open();
   void close();
 
  private:
   mutable std::mutex _mtx;
   std::condition_variable _cv;
-  std::queue<std::unique_ptr<itask>> _queue;
+  std::queue<std::unique_ptr<sirius::parallel::itask>> _queue;
   std::atomic<bool> _is_open{false};  ///< Whether the queue is open for pushing/pulling tasks
 };
 
@@ -51,14 +51,14 @@ class local_task_buffer {
  * task scheduling. It manages a pool of threads dedicated to executing GPU pipeline
  * tasks with specialized GPU resource management.
  */
-class gpu_pipeline_executor : public itask_executor {
+class gpu_pipeline_executor : public sirius::parallel::itask_executor {
  public:
   /**
    * @brief Constructs a new gpu_pipeline_executor with task execution configuration
    *
    * @param config Configuration for the task executor (thread count, retry policy, etc.)
    */
-  explicit gpu_pipeline_executor(task_executor_config config,
+  explicit gpu_pipeline_executor(sirius::parallel::task_executor_config config,
                                  const cucascade::memory::memory_space* mem_space,
                                  pipeline_executor* pipeline_exec);
 
@@ -82,7 +82,7 @@ class gpu_pipeline_executor : public itask_executor {
    *
    * @param task The task to schedule (must be a gpu_pipeline_task)
    */
-  void schedule(std::unique_ptr<itask> task) override;
+  void schedule(std::unique_ptr<sirius::parallel::itask> task) override;
 
   /**
    * @brief Main worker loop for executing GPU pipeline tasks
@@ -138,7 +138,7 @@ class gpu_pipeline_executor : public itask_executor {
    * @return gpu_pipeline_task* The casted gpu_pipeline_task pointer
    * @throws std::bad_cast if the task is not of type gpu_pipeline_task
    */
-  gpu_pipeline_task* cast_to_gpu_pipeline_task(itask* task);
+  gpu_pipeline_task* cast_to_gpu_pipeline_task(sirius::parallel::itask* task);
 
   std::unique_ptr<std::thread> _gpu_pipeline_executor_manager_thread;
   std::unique_ptr<local_task_buffer> _local_task_buffer;
@@ -148,5 +148,5 @@ class gpu_pipeline_executor : public itask_executor {
                          // associated with this pipeline executor
 };
 
-}  // namespace parallel
+}  // namespace pipeline
 }  // namespace sirius

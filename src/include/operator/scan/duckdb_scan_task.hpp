@@ -18,14 +18,13 @@
 
 // sirius
 #include <config.hpp>
-#include <data/data_repository_manager.hpp>
+#include <data/data_repository.hpp>
 #include <memory/fixed_size_host_memory_resource.hpp>
 #include <memory/memory_reservation.hpp>
 #include <memory/memory_reservation_manager.hpp>
 #include <operator/gpu_physical_table_scan.hpp>
 #include <parallel/task.hpp>
 #include <scan/duckdb_scan_executor.hpp>
-#include <scan/physical_table_scan_adapter.hpp>
 
 // duckdb
 #include <duckdb/common/types.hpp>
@@ -40,7 +39,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace sirius::parallel {
+namespace sirius::op::scan {
 
 //===----------------------------------------------------------------------===//
 // DuckDB Scan Task Global State
@@ -49,21 +48,22 @@ namespace sirius::parallel {
 /**
  * @brief The global state for a duckdb_scan_task.
  */
-class duckdb_scan_task_global_state : public itask_global_state, public duckdb::GlobalSourceState {
+class duckdb_scan_task_global_state : public sirius::parallel::itask_global_state,
+                                      public duckdb::GlobalSourceState {
  public:
   //===----------Constructor----------===//
   /**
    * @brief Construct a new duckdb_scan_task_global_state object
    *
-   * @param[in] pipeline_id The pipeline id to which this scan task belongs
+   * @param[in] pipeline The GPU pipeline to which this table scan belongs
    * @param[in] scan_exec The scan executor with which to schedule new scan tasks
    * @param[in] client_ctx The DuckDB client context
-   * @param[in] ptsa The physical table scan adapter being executed
+   * @param[in] gpu_pts The GPU physical table scan being executed
    */
-  duckdb_scan_task_global_state(uint64_t pipeline_id,
+  duckdb_scan_task_global_state(duckdb::shared_ptr<duckdb::GPUPipeline> pipeline,
                                 duckdb_scan_executor& scan_exec,
                                 duckdb::ClientContext& client_ctx,
-                                duckdb::physical_table_scan_adapter const& ptsa);
+                                duckdb::GPUPhysicalTableScan* scan_op);
 
   //===----------Methods----------===//
   /**
@@ -88,13 +88,14 @@ class duckdb_scan_task_global_state : public itask_global_state, public duckdb::
 
   //===----------Fields----------===//
   std::atomic<bool> source_drained{false};  ///< Whether the table scan source is fully drained
-  uint64_t pipeline_id;                     ///< The pipeline id to which this table scan belongs
-  uint64_t max_threads;                     ///< Maximum number of threads for this scan task
+  duckdb::shared_ptr<duckdb::GPUPipeline>
+    pipeline;            ///< The pipeline to which this table scan belongs
+  uint64_t max_threads;  ///< Maximum number of threads for this scan task
 
   unique_ptr<duckdb::GlobalTableFunctionState>
     global_tf_state;                    ///< Global state for the table function
   duckdb_scan_executor& scan_executor;  ///< The scan executor executing this scan task
-  const duckdb::PhysicalTableScan& op;  ///< The physical table scan being executed
+  duckdb::GPUPhysicalTableScan& op;     ///< The physical table scan being executed
 
   std::mutex scan_mutex;  ///< Mutex to protect table function calls
 };
@@ -305,7 +306,7 @@ struct multiple_blocks_allocation_accessor {
  * chunks into those buffers.
  *
  */
-class duckdb_scan_task_local_state : public itask_local_state {
+class duckdb_scan_task_local_state : public sirius::parallel::itask_local_state {
  public:
   using multiple_blocks_allocation =
     cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation;
@@ -460,7 +461,7 @@ class duckdb_scan_task_local_state : public itask_local_state {
    *
    * @param[in] op The physical table scan operator being executed.
    */
-  void estimate_rows_per_batch(const duckdb::PhysicalTableScan& op);
+  void estimate_rows_per_batch(duckdb::GPUPhysicalTableScan const& op);
 
   /**
    * @brief Initializes the column builders.
@@ -474,7 +475,7 @@ class duckdb_scan_task_local_state : public itask_local_state {
    * @param[in] exec_ctx The duckdb execution context.
    * @param[in] global_tf_state The duckdb table function global state.
    */
-  void initialize_local_table_function_state(duckdb::PhysicalTableScan const& op,
+  void initialize_local_table_function_state(duckdb::GPUPhysicalTableScan const& op,
                                              duckdb::ExecutionContext& exec_ctx,
                                              duckdb::GlobalTableFunctionState* global_tf_state);
 };
@@ -491,8 +492,8 @@ class duckdb_scan_task_local_state : public itask_local_state {
  * the batch to the data repository and notifying the task creator. If the table scan is
  * incomplete upon task completion, the task will push a new scan_task onto the task queue.
  */
-class duckdb_scan_task : public itask {
-  using data_repository_manager = cucascade::shared_data_repository_manager;
+class duckdb_scan_task : public sirius::parallel::itask {
+  using shared_data_repository = cucascade::shared_data_repository;
   // Friend declaration for test access
   friend class test_scan_task;
 
@@ -502,15 +503,17 @@ class duckdb_scan_task : public itask {
    * @brief Construct a duckdb_scan_task object.
    *
    * @param[in] task_id The unique id of this scan task.
-   * @param[in] dr_mgr The data repository manager to which to push batches.
+   * @param[in] data_repo The data repository to which to push batches.
    * @param[in] l_state The local state for this scan task.
    * @param[in] g_state The shared global state for this scan task.
    */
   duckdb_scan_task(uint64_t task_id,
-                   data_repository_manager& dr_mgr,
+                   shared_data_repository* data_repo,
                    unique_ptr<duckdb_scan_task_local_state> l_state,
                    shared_ptr<duckdb_scan_task_global_state> g_state)
-    : task_id(task_id), dr_mgr(dr_mgr), itask(std::move(l_state), g_state) {};
+    : task_id(task_id),
+      _data_repo(data_repo),
+      sirius::parallel::itask(std::move(l_state), g_state) {};
 
   void execute() override;
 
@@ -564,8 +567,8 @@ class duckdb_scan_task : public itask {
 
  protected:
   //===----------Fields----------===//
-  data_repository_manager& dr_mgr;  ///< Data repository manager to which to push batches
-  uint64_t task_id;                 ///< The unique id of this scan task
+  shared_data_repository* _data_repo;  ///< Data repository to which to push batches
+  uint64_t task_id;                    ///< The unique id of this scan task
 };
 
-}  // namespace sirius::parallel
+}  // namespace sirius::op::scan

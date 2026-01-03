@@ -26,7 +26,7 @@
 // standard library
 #include <atomic>
 
-namespace sirius::parallel {
+namespace sirius::op::scan {
 
 //===----------------------------------------------------------------------===//
 // DuckDB Scan Task Queue
@@ -40,7 +40,7 @@ namespace sirius::parallel {
  * default configuration for the underlying BlockingConcurrentQueue.
  *
  */
-class duckdb_scan_task_queue : public itask_queue {
+class duckdb_scan_task_queue : public sirius::parallel::itask_queue {
  public:
   //===----------Constructor & Destructor----------===//
   explicit duckdb_scan_task_queue(size_t num_threads) : _num_threads(num_threads), _queue() {}
@@ -58,11 +58,14 @@ class duckdb_scan_task_queue : public itask_queue {
     }
   }
 
-  void push(std::unique_ptr<itask> task) override { _queue.enqueue(std::move(task)); }
-
-  std::unique_ptr<itask> pull() override
+  void push(std::unique_ptr<sirius::parallel::itask> task) override
   {
-    std::unique_ptr<itask> task;
+    _queue.enqueue(std::move(task));
+  }
+
+  std::unique_ptr<sirius::parallel::itask> pull() override
+  {
+    std::unique_ptr<sirius::parallel::itask> task;
     while (true) {
       if (_queue.try_dequeue(task)) { return task; }
 
@@ -79,8 +82,8 @@ class duckdb_scan_task_queue : public itask_queue {
   //===----------Fields----------===//
   size_t _num_threads;                ///< Number of worker threads (for proper cleanup on close)
   std::atomic<bool> _is_open{false};  ///< Whether the queue is open for pushing/pulling tasks
-  duckdb_moodycamel::BlockingConcurrentQueue<std::unique_ptr<itask>>
+  duckdb_moodycamel::BlockingConcurrentQueue<std::unique_ptr<sirius::parallel::itask>>
     _queue;  ///< The underlying concurrent queue
 };
 
-}  // namespace sirius::parallel
+}  // namespace sirius::op::scan

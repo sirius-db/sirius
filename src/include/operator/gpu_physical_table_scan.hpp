@@ -156,6 +156,7 @@ class GPUPhysicalTableScan : public GPUPhysicalOperator {
   vector<ColumnIndex> orig_column_ids;
   vector<idx_t> orig_scanned_ids;
   vector<LogicalType> orig_scanned_types;
+  bool exhausted = false;
 
  public:
   SourceResultType GetData(GPUIntermediateRelation& output_relation) const override;

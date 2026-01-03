@@ -24,7 +24,7 @@
 #include <data/data_repository.hpp>
 
 namespace sirius {
-namespace parallel {
+namespace pipeline {
 
 struct task_request {
   int device_id;
@@ -44,5 +44,5 @@ class task_request_queue {
   std::atomic<bool> _is_open{false};  ///< Whether the queue is open for pushing/pulling tasks
 };
 
-}  // namespace parallel
+}  // namespace pipeline
 }  // namespace sirius

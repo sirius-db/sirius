@@ -28,7 +28,7 @@
 // standard library
 #include <numbers>
 
-using namespace sirius::parallel;
+using namespace sirius::op::scan;
 using namespace cucascade::memory;
 
 //===----------------------------------------------------------------------===//

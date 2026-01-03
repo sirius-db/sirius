@@ -20,9 +20,9 @@
 // standard library
 #include <mutex>
 
-namespace sirius::parallel {
+namespace sirius::op::scan {
 
-void duckdb_scan_executor::schedule(std::unique_ptr<itask> task)
+void duckdb_scan_executor::schedule(std::unique_ptr<sirius::parallel::itask> task)
 {
   {
     std::unique_lock<std::mutex> lock(_finish_mutex);
@@ -65,4 +65,4 @@ void duckdb_scan_executor::worker_loop(int32_t worker_id)
   }
 }
 
-}  // namespace sirius::parallel
+}  // namespace sirius::op::scan

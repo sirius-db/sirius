@@ -19,7 +19,7 @@
 #include "config.hpp"
 
 namespace sirius {
-namespace parallel {
+namespace pipeline {
 
 void gpu_pipeline_queue::open() { _is_open.store(true, std::memory_order_release); }
 
@@ -32,11 +32,14 @@ void gpu_pipeline_queue::close()
   }
 }
 
-void gpu_pipeline_queue::push(std::unique_ptr<itask> task) { _task_queue.enqueue(std::move(task)); }
-
-std::unique_ptr<itask> gpu_pipeline_queue::pull()
+void gpu_pipeline_queue::push(std::unique_ptr<sirius::parallel::itask> task)
 {
-  std::unique_ptr<itask> task;
+  _task_queue.enqueue(std::move(task));
+}
+
+std::unique_ptr<sirius::parallel::itask> gpu_pipeline_queue::pull()
+{
+  std::unique_ptr<sirius::parallel::itask> task;
   while (true) {
     if (_task_queue.try_dequeue(task)) { return task; }
 
@@ -49,5 +52,5 @@ std::unique_ptr<itask> gpu_pipeline_queue::pull()
   }
 }
 
-}  // namespace parallel
+}  // namespace pipeline
 }  // namespace sirius

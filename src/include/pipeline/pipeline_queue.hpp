@@ -29,7 +29,7 @@
 #include <semaphore>
 
 namespace sirius {
-namespace parallel {
+namespace pipeline {
 
 /**
  * @brief A task queue specifically for managing gpu_pipeline_task instances.
@@ -38,7 +38,7 @@ namespace parallel {
  * tasks. Currently it just uses the std::queue, but in the future we might want to implement a
  * more sophisticated queue that supports priority scheduling, task stealing, etc..
  */
-class pipeline_queue : public itask_queue {
+class pipeline_queue : public sirius::parallel::itask_queue {
  public:
   /**
    * @brief Construct a new pipeline_queue object
@@ -61,7 +61,7 @@ class pipeline_queue : public itask_queue {
    * @param task The task to be scheduled
    * @throws sirius::runtime_error If the scheduler is not currently accepting requests
    */
-  void push(std::unique_ptr<itask> task) override;
+  void push(std::unique_ptr<sirius::parallel::itask> task) override;
 
   /**
    * @brief Pull a task to execute.
@@ -73,7 +73,7 @@ class pipeline_queue : public itask_queue {
    * @throws sirius::runtime_error If the scheduler is not currently stopped and thus not returning
    * tasks
    */
-  std::unique_ptr<itask> pull() override;
+  std::unique_ptr<sirius::parallel::itask> pull() override;
 
   /**
    * @brief Check if the task queue is empty
@@ -84,9 +84,9 @@ class pipeline_queue : public itask_queue {
 
  private:
   size_t _num_threads;
-  duckdb_moodycamel::BlockingConcurrentQueue<std::unique_ptr<itask>> _task_queue;
+  duckdb_moodycamel::BlockingConcurrentQueue<std::unique_ptr<sirius::parallel::itask>> _task_queue;
   std::atomic<bool> _is_open{false};  ///< Whether the queue is open for pushing/pulling tasks
 };
 
-}  // namespace parallel
+}  // namespace pipeline
 }  // namespace sirius

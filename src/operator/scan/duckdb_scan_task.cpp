@@ -27,20 +27,20 @@
 // standard library
 #include <cstddef>
 
-namespace sirius::parallel {
+namespace sirius::op::scan {
 
 //===----------------------------------------------------------------------===//
 // duckdb_scan_task_global_state
 //===----------------------------------------------------------------------===//
 duckdb_scan_task_global_state::duckdb_scan_task_global_state(
-  uint64_t pipeline_id,
+  duckdb::shared_ptr<duckdb::GPUPipeline> pipeline,
   duckdb_scan_executor& scan_exec,
   duckdb::ClientContext& client_ctx,
-  duckdb::physical_table_scan_adapter const& ptsa)
-  : pipeline_id(pipeline_id),
+  duckdb::GPUPhysicalTableScan* scan_op)
+  : pipeline(std::move(pipeline)),
     max_threads(scan_exec.get_num_threads()),
     scan_executor(scan_exec),
-    op(ptsa.get_physical_table_scan())
+    op(*scan_op)
 {
   // Initialize global table function state
   if (op.function.init_global) {
@@ -313,7 +313,7 @@ duckdb_scan_task_local_state::duckdb_scan_task_local_state(
   initialize_local_table_function_state(op, exec_ctx, g_state.global_tf_state.get());
 }
 
-void duckdb_scan_task_local_state::estimate_rows_per_batch(const duckdb::PhysicalTableScan& op)
+void duckdb_scan_task_local_state::estimate_rows_per_batch(duckdb::GPUPhysicalTableScan const& op)
 {
   assert(num_columns <= op.column_ids.size());
 
@@ -366,7 +366,7 @@ void duckdb_scan_task_local_state::initialize_builders()
 }
 
 void duckdb_scan_task_local_state::initialize_local_table_function_state(
-  duckdb::PhysicalTableScan const& op,
+  duckdb::GPUPhysicalTableScan const& op,
   duckdb::ExecutionContext& exec_ctx,
   duckdb::GlobalTableFunctionState* global_tf_state)
 {
@@ -478,7 +478,7 @@ void duckdb_scan_task::execute()
     auto shared_global_state =
       std::static_pointer_cast<duckdb_scan_task_global_state>(this->_global_state);
     auto next_task = std::make_unique<duckdb_scan_task>(
-      new_task_id, dr_mgr, std::move(new_local_state), shared_global_state);
+      new_task_id, _data_repo, std::move(new_local_state), shared_global_state);
     g_state.scan_executor.schedule(std::move(next_task));
   }
 
@@ -487,4 +487,4 @@ void duckdb_scan_task::execute()
   /// FUTURE WORK: Notify task_creator of completion by sending a message to the message queue
 }
 
-}  // namespace sirius::parallel
+}  // namespace sirius::op::scan

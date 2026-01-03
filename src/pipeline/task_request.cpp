@@ -19,7 +19,7 @@
 #include "config.hpp"
 
 namespace sirius {
-namespace parallel {
+namespace pipeline {
 
 void task_request_queue::open() { _is_open.store(true, std::memory_order_release); }
 
@@ -52,5 +52,5 @@ unique_ptr<task_request> task_request_queue::pull()
   }
 }
 
-}  // namespace parallel
+}  // namespace pipeline
 }  // namespace sirius
