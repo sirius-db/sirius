@@ -568,7 +568,7 @@ class duckdb_scan_task : public sirius::parallel::itask {
  protected:
   //===----------Fields----------===//
   shared_data_repository* _data_repo;  ///< Data repository to which to push batches
-  uint64_t task_id;              ///< The unique id of this scan task
+  uint64_t task_id;                    ///< The unique id of this scan task
 };
 
 }  // namespace sirius::op::scan
