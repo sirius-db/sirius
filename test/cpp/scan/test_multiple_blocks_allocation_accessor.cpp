@@ -22,7 +22,7 @@
 #include <memory/numa_region_pinned_host_allocator.hpp>
 #include <scan/duckdb_scan_task.hpp>
 
-using namespace sirius::parallel;
+using namespace sirius::op::scan;
 using namespace cucascade::memory;
 
 // Standalone memory resource for testing with custom block size

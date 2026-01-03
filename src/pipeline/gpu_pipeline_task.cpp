@@ -17,21 +17,24 @@
 #include "pipeline/gpu_pipeline_task.hpp"
 
 #include <data/data_batch_utils.hpp>
+#include <data/data_repository.hpp>
 #include <data/data_repository_manager.hpp>
 
 namespace sirius {
-namespace parallel {
+namespace pipeline {
 
-gpu_pipeline_task::gpu_pipeline_task(std::unique_ptr<itask_local_state> local_state,
-                                     std::shared_ptr<itask_global_state> global_state)
-  : itask(std::move(local_state), std::move(global_state))
+gpu_pipeline_task::gpu_pipeline_task(
+  uint64_t task_id,
+  std::vector<cucascade::shared_data_repository*> data_repos,
+  std::unique_ptr<sirius::parallel::itask_local_state> local_state,
+  std::shared_ptr<sirius::parallel::itask_global_state> global_state)
+  : itask(std::move(local_state), std::move(global_state)),
+    _task_id(task_id),
+    _data_repos(std::move(data_repos))
 {
 }
 
-uint64_t gpu_pipeline_task::get_task_id() const
-{
-  return _local_state->cast<gpu_pipeline_task_local_state>()._task_id;
-}
+uint64_t gpu_pipeline_task::get_task_id() const { return _task_id; }
 
 const duckdb::GPUPipeline* gpu_pipeline_task::get_pipeline() const
 {
@@ -49,7 +52,6 @@ void gpu_pipeline_task::execute()
   if (!processing_handles) {
     // Some batch is being downgraded - cannot process right now
     // TODO: Add retry logic or re-queue the task
-    mark_task_completion();
     return;
   }
 
@@ -64,21 +66,7 @@ void gpu_pipeline_task::execute()
   // 5. Push output batches to the data repository
 
   // Processing handles are automatically released here when they go out of scope
-  mark_task_completion();
 }
 
-void gpu_pipeline_task::mark_task_completion()
-{
-  // notify TaskCreator about task completion
-  uint64_t task_id     = _local_state->cast<gpu_pipeline_task_local_state>()._task_id;
-  uint64_t pipeline_id = _global_state->cast<gpu_pipeline_task_global_state>()._pipeline_id;
-  auto message         = std::make_unique<sirius::task_completion_message>();
-  message->task_id     = task_id;
-  message->pipeline_id = pipeline_id;
-  message->source      = sirius::Source::PIPELINE;
-  _global_state->cast<gpu_pipeline_task_global_state>()._message_queue.enqueue_message(
-    std::move(message));
-}
-
-}  // namespace parallel
+}  // namespace pipeline
 }  // namespace sirius
