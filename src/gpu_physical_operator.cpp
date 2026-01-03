@@ -187,7 +187,8 @@ GPUPhysicalOperator::port* GPUPhysicalOperator::get_port(std::string_view port_i
   // submit data batches to the repositories of the next operators
   // check if the pipeline is finished
   if (!creator) {
-    throw InternalException("GPUPhysicalOperator creator is null in sink_execute for operator " + GetName());
+    throw InternalException("GPUPhysicalOperator creator is null in sink_execute for operator " +
+                            GetName());
   }
   creator->update_pipeline_status(this);
   for (auto& [next_op, port_id] : next_port_after_sink) {
