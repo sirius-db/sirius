@@ -226,7 +226,7 @@ void GPUExecutor::Execute()
   }
 }
 
-// The new execution path
+// ONLY FOR TESTING PURPOSES, WILL BE REMOVED LATER
 void GPUExecutor::execute()
 {
   printf("Starting GPUExecutor::execute()\n");
@@ -271,26 +271,6 @@ void GPUExecutor::execute()
   scan_executor.stop();
   std::cout << "Stopping task creator" << std::endl;
   creator.stop();
-
-  // // add new level to the data_repository according to the number of pipelines
-  // for (size_t pipeline_idx = 0; pipeline_idx < gpu_pipeline_hashmap->vec_.size(); pipeline_idx++)
-  // {
-  // 	// construct SimpleDataRepositoryLevel as the default level
-  // 	data_repository.AddNewLevel(pipeline_idx,
-  // sirius::make_unique<sirius::SimpleDataRepositoryLevel>()); 	auto pipeline =
-  // scheduled[pipeline_idx]; 	auto source_type = pipeline->GetSource()->type; 	if (source_type ==
-  // PhysicalOperatorType::TABLE_SCAN) {
-  // 		// initialize pipeline
-  // 		Pipeline duckdb_pipeline(*executor);
-  // 		ThreadContext thread_context(context);
-  // 		ExecutionContext exec_context(context, thread_context, &duckdb_pipeline);
-  // 		auto &table_scan = pipeline->source->Cast<GPUPhysicalTableScan>();
-  // 		//construct shared_ptr DuckDBScanMetadata
-  // 		sirius::shared_ptr<sirius::DuckDBScanMetadata> scan_metadata =
-  // 			sirius::make_shared<sirius::DuckDBScanMetadata>(exec_context, table_scan);
-  // 		gpu_pipeline_hashmap->scan_metadata_map_.emplace(pipeline_idx, scan_metadata);
-  // 	}
-  // }
 }
 
 void GPUExecutor::InitializeInternal(GPUPhysicalOperator& plan)

@@ -259,7 +259,7 @@ class task_creator {
   ::duckdb::ClientContext& _client_context;
   sirius::pipeline::pipeline_executor& _pipeline_executor;
   sirius::op::scan::duckdb_scan_executor& _duckdb_scan_executor;
-  atomic<uint64_t> _task_id;
+  atomic<uint64_t> _task_id {0};
 };
 
 }  // namespace sirius::creator

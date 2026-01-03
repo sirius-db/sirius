@@ -186,6 +186,9 @@ GPUPhysicalOperator::port* GPUPhysicalOperator::get_port(std::string_view port_i
 {
   // submit data batches to the repositories of the next operators
   // check if the pipeline is finished
+  if (!creator) {
+    throw InternalException("GPUPhysicalOperator creator is null in sink_execute for operator " + GetName());
+  }
   creator->update_pipeline_status(this);
   for (auto& [next_op, port_id] : next_port_after_sink) {
     if (next_op) { creator->process_next_task(next_op); }
@@ -225,7 +228,7 @@ GPUPhysicalOperator::get_next_port_after_sink()
   for (auto& [port_name, port_ptr] : ports) {
     if (port_ptr->type == MemoryBarrierType::PIPELINE) {
       // For pipeline barrier: check if there is a data batch available
-      if (!port_ptr->repo->size() == 0) {
+      if (port_ptr->repo->size() == 0) {
         // No data batch available, return src pipeline or monostate
         if (port_ptr->src_pipeline) {
           return ::sirius::creator::task_creation_hint(port_ptr->src_pipeline);
@@ -265,7 +268,7 @@ std::vector<::std::shared_ptr<::cucascade::data_batch>> GPUPhysicalOperator::get
 bool GPUPhysicalOperator::all_ports_empty()
 {
   for (auto& [port_name, port_ptr] : ports) {
-    if (!port_ptr->repo->size() == 0) { return false; }
+    if (port_ptr->repo->size() != 0) { return false; }
   }
   return true;
 }

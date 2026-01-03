@@ -136,15 +136,6 @@ class gpu_pipeline_task : public sirius::parallel::itask {
    */
   const duckdb::GPUPipeline* get_pipeline() const;
 
-  /**
-   * @brief Method to mark that this task is completed
-   *
-   * This method informs that TaskCreator that the task is completed so that it can start scheduling
-   * tasks that were dependent on this task. This method should be called after pushing the output
-   * of this task to the Data Repository.
-   */
-  void mark_task_completion();
-
  private:
   uint64_t _task_id;
   std::vector<cucascade::shared_data_repository*> _data_repos;

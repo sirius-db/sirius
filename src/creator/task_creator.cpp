@@ -77,7 +77,7 @@ task_creator::task_creator(size_t num_threads,
     _duckdb_scan_executor(duckdb_scan_executor)
 {
   _task_creation_queue = std::make_unique<task_creation_queue>(num_threads);
-  for (int i = 0; i < gpu_pipeline_map._vec.size(); ++i) {
+  for (size_t i = 0; i < gpu_pipeline_map._vec.size(); ++i) {
     if (gpu_pipeline_map._vec[i]->GetSource()->type == ::duckdb::PhysicalOperatorType::TABLE_SCAN) {
       priority_scans.push(gpu_pipeline_map._vec[i]);
     }
@@ -177,6 +177,10 @@ void task_creator::worker_function(int worker_id)
         duckdb::ExecutionContext exec_ctx(_client_context, thread_ctx, nullptr);
         auto scan_task_local_state = std::make_unique<op::scan::duckdb_scan_task_local_state>(
           *scan_task_global_state, exec_ctx);
+        if (info->destination_data_repositories.empty()) {
+          throw std::runtime_error(
+            "No destination data repositories provided for scan task creation.");
+        }
         auto scan_task =
           std::make_unique<op::scan::duckdb_scan_task>(get_next_task_id(),
                                                        info->destination_data_repositories[0],
@@ -205,7 +209,7 @@ void task_creator::worker_function(int worker_id)
       }
 
     } catch (const std::exception& e) {
-      schedule(std::move(info));
+      stop();
     }
   }
 }
