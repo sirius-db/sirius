@@ -111,6 +111,11 @@ class GPUPipeline : public enable_shared_from_this<GPUPipeline> {
   // vector<weak_ptr<GPUPipeline>> dependencies;
   vector<shared_ptr<GPUPipeline>> dependencies;
 
+  //! Updates the pipeline status
+  void update_pipeline_status();
+  //! Checks if the pipeline has been finished
+  bool is_pipeline_finished();
+
  private:
   //! Whether or not the pipeline has been readied
   bool ready;
@@ -144,6 +149,8 @@ class GPUPipeline : public enable_shared_from_this<GPUPipeline> {
   bool LaunchScanTasks(shared_ptr<Event>& event, idx_t max_threads);
 
   bool ScheduleParallel(shared_ptr<Event>& event);
+  //! Whether the pipeline has been finished
+  bool pipeline_finished = false;
 };
 
 }  // namespace duckdb

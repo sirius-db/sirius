@@ -15,6 +15,7 @@
  */
 
 #include "config.hpp"
+#include "creator/task_creator.hpp"
 #include "duckdb/execution/execution_context.hpp"
 #include "duckdb/execution/operator/helper/physical_result_collector.hpp"
 #include "duckdb/execution/operator/set/physical_recursive_cte.hpp"
@@ -23,6 +24,7 @@
 #include "fallback.hpp"
 #include "gpu_context.hpp"
 #include "gpu_physical_operator.hpp"
+#include "gpu_pipeline_hashmap.hpp"
 #include "log/logging.hpp"
 #include "operator/gpu_physical_concat.hpp"
 #include "operator/gpu_physical_cte.hpp"
@@ -32,6 +34,8 @@
 #include "operator/gpu_physical_partition.hpp"
 #include "operator/gpu_physical_result_collector.hpp"
 #include "operator/gpu_physical_table_scan.hpp"
+#include "pipeline/pipeline_executor.hpp"
+#include "scan/duckdb_scan_executor.hpp"
 
 #include <data/data_repository_manager.hpp>
 #include <stdio.h>
@@ -222,6 +226,53 @@ void GPUExecutor::Execute()
   }
 }
 
+// ONLY FOR TESTING PURPOSES, WILL BE REMOVED LATER
+void GPUExecutor::execute()
+{
+  printf("Starting GPUExecutor::execute()\n");
+  // Check if we should fall back to duckdb execution.
+  if (Config::ENABLE_FALLBACK_CHECK) {
+    FallbackChecker fallback_checker(new_scheduled);
+    fallback_checker.Check();
+  }
+
+  printf("Creating gpu_pipeline_hashmap\n");
+  ::sirius::gpu_pipeline_hashmap pipeline_map = ::sirius::gpu_pipeline_hashmap(new_scheduled);
+  ::sirius::parallel::task_executor_config scan_executor_config =
+    ::sirius::parallel::task_executor_config(1, false);
+  ::sirius::parallel::task_executor_config global_executor_config =
+    ::sirius::parallel::task_executor_config(1, false);
+  ::sirius::parallel::task_executor_config gpu_executor_config =
+    ::sirius::parallel::task_executor_config(1, false);
+
+  printf("Creating scan executor\n");
+  ::sirius::op::scan::duckdb_scan_executor scan_executor =
+    ::sirius::op::scan::duckdb_scan_executor(scan_executor_config);
+  printf("Creating pipeline executor\n");
+  ::sirius::pipeline::pipeline_executor pipeline_executor =
+    ::sirius::pipeline::pipeline_executor(global_executor_config);
+
+  // Currently we will start the components after the query start instead of during database
+  // initialization because it is easier for development.
+  printf("Creating task creator\n");
+  ::sirius::creator::task_creator creator(
+    1, pipeline_map, context, pipeline_executor, scan_executor);
+
+  std::cout << "Starting task creator" << std::endl;
+  creator.start();
+  std::cout << "Starting scan executor" << std::endl;
+  scan_executor.start();
+  std::cout << "Starting pipeline executor" << std::endl;
+  pipeline_executor.start();
+
+  std::cout << "Stopping pipeline executor" << std::endl;
+  pipeline_executor.stop();
+  std::cout << "Stopping scan executor" << std::endl;
+  scan_executor.stop();
+  std::cout << "Stopping task creator" << std::endl;
+  creator.stop();
+}
+
 void GPUExecutor::InitializeInternal(GPUPhysicalOperator& plan)
 {
   // auto &scheduler = TaskScheduler::GetScheduler(context);
@@ -321,11 +372,10 @@ void GPUExecutor::InitializeInternal(GPUPhysicalOperator& plan)
         SIRIUS_LOG_DEBUG("");  // Blank line for separation
       }
 
-      auto data_repo_manager = ::std::make_unique<::cucascade::shared_data_repository_manager>();
+      data_repo_manager = ::std::make_unique<::cucascade::shared_data_repository_manager>();
       unordered_map<const GPUPhysicalOperator*, vector<shared_ptr<GPUPipeline>>>
         source_to_pipelines;
 
-      vector<shared_ptr<GPUPipeline>> new_scheduled;
       for (size_t i = 0; i < scheduled.size(); i++) {
         auto current_pipeline = scheduled[i];  // Copy shared_ptr to avoid invalidation
 
@@ -610,14 +660,14 @@ void GPUExecutor::InitializeInternal(GPUPhysicalOperator& plan)
           ::std::unique_ptr<::cucascade::shared_data_repository> repo =
             ::std::make_unique<::cucascade::shared_data_repository>();
           std::string port_id = "scan";
-          size_t source_op_id = get_operator_id(new_scheduled[i]->source.get());
-          data_repo_manager->add_new_repository(source_op_id, port_id, std::move(repo));
-          new_scheduled[i]->source->add_port(
+          size_t op_id        = get_operator_id(&(new_scheduled[i]->operators[0].get()));
+          data_repo_manager->add_new_repository(op_id, port_id, std::move(repo));
+          new_scheduled[i]->operators[0].get().add_port(
             port_id,
             std::make_unique<GPUPhysicalOperator::port>(
               MemoryBarrierType::PIPELINE,
-              data_repo_manager->get_repository(source_op_id, port_id).get(),
-              new_scheduled[i]));
+              data_repo_manager->get_repository(op_id, port_id).get(),
+              nullptr));
         }
 
         if (new_scheduled[i]->sink->type == PhysicalOperatorType::RESULT_COLLECTOR) {
