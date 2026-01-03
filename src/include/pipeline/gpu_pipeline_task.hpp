@@ -113,7 +113,7 @@ class gpu_pipeline_task : public sirius::parallel::itask {
    * @param global_state The global state shared across multiple tasks
    */
   gpu_pipeline_task(uint64_t task_id,
-                    std::vector<cucascade::idata_repository*> data_repos,
+                    std::vector<cucascade::shared_data_repository*> data_repos,
                     std::unique_ptr<sirius::parallel::itask_local_state> local_state,
                     std::shared_ptr<sirius::parallel::itask_global_state> global_state);
 
@@ -145,16 +145,9 @@ class gpu_pipeline_task : public sirius::parallel::itask {
    */
   void mark_task_completion();
 
-  /**
-   * @brief Method to push the output of this task to the Data Repository
-   *
-   * @param batch The data batch to push
-   * @param pipeline_id The id of the pipeline that produced this data batch
-   */
-  void push_data_batch(std::shared_ptr<cucascade::data_batch> batch, uint64_t pipeline_id);
  private:
   uint64_t _task_id;
-  std::vector<cucascade::idata_repository*> _data_repos;
+  std::vector<cucascade::shared_data_repository*> _data_repos;
 };
 
 }  // namespace pipeline

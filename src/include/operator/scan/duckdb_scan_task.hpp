@@ -493,7 +493,7 @@ class duckdb_scan_task_local_state : public sirius::parallel::itask_local_state 
  * incomplete upon task completion, the task will push a new scan_task onto the task queue.
  */
 class duckdb_scan_task : public sirius::parallel::itask {
-  using idata_repository = cucascade::idata_repository;
+  using shared_data_repository = cucascade::shared_data_repository;
   // Friend declaration for test access
   friend class test_scan_task;
 
@@ -508,7 +508,7 @@ class duckdb_scan_task : public sirius::parallel::itask {
    * @param[in] g_state The shared global state for this scan task.
    */
   duckdb_scan_task(uint64_t task_id,
-                   idata_repository* data_repo,
+                   shared_data_repository* data_repo,
                    unique_ptr<duckdb_scan_task_local_state> l_state,
                    shared_ptr<duckdb_scan_task_global_state> g_state)
     : task_id(task_id),
@@ -567,7 +567,7 @@ class duckdb_scan_task : public sirius::parallel::itask {
 
  protected:
   //===----------Fields----------===//
-  idata_repository* _data_repo;  ///< Data repository to which to push batches
+  shared_data_repository* _data_repo;  ///< Data repository to which to push batches
   uint64_t task_id;              ///< The unique id of this scan task
 };
 

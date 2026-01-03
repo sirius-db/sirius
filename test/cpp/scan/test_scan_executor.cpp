@@ -62,7 +62,7 @@ using namespace sirius;
 class test_scan_task : public op::scan::duckdb_scan_task {
  public:
   test_scan_task(uint64_t task_id,
-                 cucascade::idata_repository* data_repo,
+                 cucascade::shared_data_repository* data_repo,
                  duckdb::Connection& con,
                  std::string const& table_name,
                  std::unique_ptr<op::scan::duckdb_scan_task_local_state> l_state,
@@ -532,7 +532,7 @@ static void run_scan_test(std::string const& table_name,
     nullptr, scan_executor, client_ctx, physical_scan.get());
 
   // Create data repository manager (empty, unused for this test)
-  cucascade::idata_repository data_repo;
+  cucascade::shared_data_repository data_repo;
 
   // Create local state
   auto local_state =

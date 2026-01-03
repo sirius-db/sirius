@@ -15,11 +15,7 @@
  */
 
 #include "config.hpp"
-<<<<<<< HEAD
-=======
 #include "creator/task_creator.hpp"
-#include "data/data_repository_manager.hpp"
->>>>>>> eabb2a0a (Namespace change and testing initialization)
 #include "duckdb/execution/execution_context.hpp"
 #include "duckdb/execution/operator/helper/physical_result_collector.hpp"
 #include "duckdb/execution/operator/set/physical_recursive_cte.hpp"
@@ -396,11 +392,7 @@ void GPUExecutor::InitializeInternal(GPUPhysicalOperator& plan)
         SIRIUS_LOG_DEBUG("");  // Blank line for separation
       }
 
-<<<<<<< HEAD
-      auto data_repo_manager = ::std::make_unique<::cucascade::shared_data_repository_manager>();
-=======
-      data_repo_manager = std::make_unique<::cucascade::data_repository_manager>();
->>>>>>> eabb2a0a (Namespace change and testing initialization)
+      data_repo_manager = ::std::make_unique<::cucascade::shared_data_repository_manager>();
       unordered_map<const GPUPhysicalOperator*, vector<shared_ptr<GPUPipeline>>>
         source_to_pipelines;
 

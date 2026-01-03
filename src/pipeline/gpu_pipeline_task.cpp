@@ -17,6 +17,7 @@
 #include "pipeline/gpu_pipeline_task.hpp"
 
 #include <data/data_batch_utils.hpp>
+#include <data/data_repository.hpp>
 #include <data/data_repository_manager.hpp>
 
 namespace sirius {
@@ -24,7 +25,7 @@ namespace pipeline {
 
 gpu_pipeline_task::gpu_pipeline_task(
   uint64_t task_id,
-  std::vector<cucascade::idata_repository*> data_repos,
+  std::vector<cucascade::shared_data_repository*> data_repos,
   std::unique_ptr<sirius::parallel::itask_local_state> local_state,
   std::shared_ptr<sirius::parallel::itask_global_state> global_state)
   : itask(std::move(local_state), std::move(global_state)),

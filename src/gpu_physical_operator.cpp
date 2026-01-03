@@ -225,7 +225,7 @@ GPUPhysicalOperator::get_next_port_after_sink()
   for (auto& [port_name, port_ptr] : ports) {
     if (port_ptr->type == MemoryBarrierType::PIPELINE) {
       // For pipeline barrier: check if there is a data batch available
-      if (!port_ptr->repo->check_data_batch_availability()) {
+      if (!port_ptr->repo->size() == 0) {
         // No data batch available, return src pipeline or monostate
         if (port_ptr->src_pipeline) {
           return ::sirius::creator::task_creation_hint(port_ptr->src_pipeline);
@@ -255,8 +255,8 @@ std::vector<::std::shared_ptr<::cucascade::data_batch>> GPUPhysicalOperator::get
   for (auto& [port_name, port_ptr] : ports) {
     // For Pipeline barrier: need at least one data batch in the port's repository
     // TODO: later on we will adjust to the new data repository interface in cuCascade
-    auto batch = port_ptr->repo->pull_data_batch();
-    input_batch.push_back(std::move(batch));
+    auto batch_and_handle = port_ptr->repo->pull_data_batch();
+    input_batch.push_back(std::move(batch_and_handle.first));
   }
   if (input_batch.empty()) { return std::vector<::std::shared_ptr<::cucascade::data_batch>>{}; }
   return input_batch;
@@ -265,7 +265,7 @@ std::vector<::std::shared_ptr<::cucascade::data_batch>> GPUPhysicalOperator::get
 bool GPUPhysicalOperator::all_ports_empty()
 {
   for (auto& [port_name, port_ptr] : ports) {
-    if (!port_ptr->repo->check_data_batch_availability()) { return false; }
+    if (!port_ptr->repo->size() == 0) { return false; }
   }
   return true;
 }

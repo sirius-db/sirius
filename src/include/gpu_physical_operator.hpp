@@ -111,7 +111,7 @@ class GPUPhysicalOperator {
   virtual ::std::vector<::std::shared_ptr<::cucascade::data_batch>> execute(
     const ::std::vector<::std::shared_ptr<::cucascade::data_batch>>& input_batches);
   virtual ::std::vector<::std::shared_ptr<::cucascade::data_batch>> sink_execute(
-    ::std::vector<::std::shared_ptr<::cucascade::data_batch>>& input_batches);
+    const ::std::vector<::std::shared_ptr<::cucascade::data_batch>>& input_batches);
 
   virtual bool ParallelOperator() const { return false; }
 

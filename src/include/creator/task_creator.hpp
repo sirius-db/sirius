@@ -65,7 +65,7 @@ class task_creation_info {
   };
   ~task_creation_info() = default;
   ::duckdb::GPUPhysicalOperator* _node;
-  std::vector<cucascade::idata_repository*> destination_data_repositories;
+  std::vector<cucascade::shared_data_repository*> destination_data_repositories;
   ::duckdb::shared_ptr<::duckdb::GPUPipeline> _pipeline;
 };
 

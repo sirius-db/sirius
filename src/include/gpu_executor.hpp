@@ -91,7 +91,7 @@ class GPUExecutor {
 
   Executor* executor;
   vector<shared_ptr<GPUPipeline>> new_scheduled;
-  std::unique_ptr<::cucascade::data_repository_manager> data_repo_manager;
+  std::unique_ptr<::cucascade::shared_data_repository_manager> data_repo_manager;
 
   //! Convert the DuckDB physical plan to a GPU physical plan
 };
