@@ -18,10 +18,6 @@
 
 #include "config.hpp"
 #include "creator/task_completion.hpp"
-<<<<<<< HEAD
-=======
-#include "data/data_repository.hpp"
->>>>>>> 842a98a2 (Using shared_ptr<data_batch> instead of data_batch_view in preparation for cucascade)
 #include "gpu_pipeline.hpp"
 #include "parallel/task_executor.hpp"
 
@@ -51,28 +47,10 @@ class gpu_pipeline_task_global_state : public sirius::parallel::itask_global_sta
    *
    * @param pipeline Shared pointer to the GPU pipeline to execute
    */
-<<<<<<< HEAD
-  explicit gpu_pipeline_task_global_state(uint64_t pipeline_id,
-                                          duckdb::shared_ptr<duckdb::GPUPipeline> pipeline,
-                                          cucascade::shared_data_repository_manager& data_repo_mgr,
-                                          task_completion_message_queue& message_queue)
-    : _pipeline_id(pipeline_id),
-      _pipeline(std::move(pipeline)),
-      _data_repo_mgr(data_repo_mgr),
-      _message_queue(message_queue)
-  {
-  }
-
-  cucascade::shared_data_repository_manager&
-    _data_repo_mgr;  ///< Reference to the data repository manager
-  task_completion_message_queue&
-    _message_queue;  ///< Message queue to notify TaskCreator about task completion
-=======
   explicit gpu_pipeline_task_global_state(duckdb::shared_ptr<duckdb::GPUPipeline> pipeline)
     : _pipeline(std::move(pipeline))
   {
   }
->>>>>>> 842a98a2 (Using shared_ptr<data_batch> instead of data_batch_view in preparation for cucascade)
   duckdb::shared_ptr<duckdb::GPUPipeline>
     _pipeline;  ///< Shared pointer to the GPU pipeline to execute
 };
@@ -89,35 +67,18 @@ class gpu_pipeline_task_local_state : public sirius::parallel::itask_local_state
   /**
    * @brief Construct a new gpu_pipeline_task_local_state object
    *
-<<<<<<< HEAD
-   * @param task_id Unique identifier for this task
-   * @param batches Vector of data batches serving as input to the pipeline
-   */
-  explicit gpu_pipeline_task_local_state(
-    uint64_t task_id,
-    std::vector<std::shared_ptr<cucascade::data_batch>> batches,
-    std::unique_ptr<cucascade::memory::reservation> res = nullptr)
-    : _task_id(task_id), _batches(std::move(batches)), _reservation(std::move(res))
-  {
-  }
-
-  uint64_t _task_id;  ///< Unique identifier for this task
-  std::vector<std::shared_ptr<cucascade::data_batch>>
-    _batches;  ///< Input data batches for the pipeline
-=======
    * @param batch_views Vector of data batches serving as input to the pipeline
    * @param res Memory reservation for GPU resources
    */
   explicit gpu_pipeline_task_local_state(
-    std::vector<std::shared_ptr<cucascade::data_batch>> batch_views,
+    std::vector<std::shared_ptr<cucascade::data_batch>> batches,
     std::unique_ptr<cucascade::memory::reservation> res = nullptr)
-    : _batch_views(std::move(batch_views)), _reservation(std::move(res))
+    : _batches(std::move(batches)), _reservation(std::move(res))
   {
   }
 
   std::vector<std::shared_ptr<cucascade::data_batch>>
-    _batch_views;  ///< Input data batches for the pipeline
->>>>>>> 842a98a2 (Using shared_ptr<data_batch> instead of data_batch_view in preparation for cucascade)
+    _batches;  ///< Input data batches for the pipeline
 
   void set_reservation(std::unique_ptr<cucascade::memory::reservation> res)
   {
@@ -184,7 +145,6 @@ class gpu_pipeline_task : public sirius::parallel::itask {
    */
   void mark_task_completion();
 
-<<<<<<< HEAD
   /**
    * @brief Method to push the output of this task to the Data Repository
    *
@@ -192,15 +152,9 @@ class gpu_pipeline_task : public sirius::parallel::itask {
    * @param pipeline_id The id of the pipeline that produced this data batch
    */
   void push_data_batch(std::shared_ptr<cucascade::data_batch> batch, uint64_t pipeline_id);
-=======
  private:
   uint64_t _task_id;
-<<<<<<< HEAD
-  cucascade::idata_repository& _data_repo;
->>>>>>> 842a98a2 (Using shared_ptr<data_batch> instead of data_batch_view in preparation for cucascade)
-=======
   std::vector<cucascade::idata_repository*> _data_repos;
->>>>>>> e15ed165 (Create pipeline task)
 };
 
 }  // namespace pipeline
