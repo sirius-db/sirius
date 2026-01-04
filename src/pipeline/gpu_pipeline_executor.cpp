@@ -35,6 +35,10 @@ std::unique_ptr<sirius::parallel::itask> local_task_buffer::consume()
 {
   std::unique_lock<std::mutex> lock(_mtx);
   _cv.wait(lock, [&] { return (!_queue.empty()) || !_is_open.load(std::memory_order_acquire); });
+
+  // Check if queue is empty after waking up (happens when closed)
+  if (_queue.empty()) { return nullptr; }
+
   auto task = std::move(_queue.front());
   _queue.pop();
   return std::move(task);
@@ -44,7 +48,14 @@ void local_task_buffer::open() { _is_open.store(true, std::memory_order_release)
 
 void local_task_buffer::close()
 {
-  _is_open.store(false, std::memory_order_release);
+  {
+    std::lock_guard<std::mutex> lock(_mtx);
+    _is_open.store(false, std::memory_order_release);
+    // Clear any remaining tasks in the queue to reset state
+    while (!_queue.empty()) {
+      _queue.pop();
+    }
+  }
   _cv.notify_all();
 }
 

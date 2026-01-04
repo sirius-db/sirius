@@ -542,10 +542,10 @@ static void run_scan_test(std::string const& table_name,
   uint64_t task_id = 1;
   auto task        = std::make_unique<test_scan_task>(
     task_id, &data_repo, con, staging_table, std::move(local_state), global_state);
-  scan_executor.schedule(std::move(task));
 
   // Run task
   scan_executor.start();
+  scan_executor.schedule(std::move(task));
   scan_executor.wait();
   scan_executor.stop();
 

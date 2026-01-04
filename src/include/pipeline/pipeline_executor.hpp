@@ -39,9 +39,14 @@ class pipeline_executor : public sirius::parallel::itask_executor {
   /**
    * @brief Constructs a new pipeline_executor with task execution configuration
    *
-   * @param config Configuration for the task executor (thread count, retry policy, etc.)
+   * @param pipeline_config Configuration for the pipeline executor (thread count, retry policy,
+   * etc.)
+   * @param gpu_executor_config Configuration for the GPU pipeline executor
+   * @param num_gpus Number of GPU executors to create
    */
-  explicit pipeline_executor(sirius::parallel::task_executor_config config);
+  explicit pipeline_executor(sirius::parallel::task_executor_config pipeline_config,
+                             sirius::parallel::task_executor_config gpu_executor_config,
+                             size_t num_gpus);
 
   /**
    * @brief Destructor for the gpu_pipeline_executor.

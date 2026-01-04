@@ -47,7 +47,15 @@ class duckdb_scan_task_queue : public sirius::parallel::itask_queue {
   ~duckdb_scan_task_queue() override = default;
 
   //===----------Methods----------===//
-  void open() override { _is_open.store(true, std::memory_order_release); }
+  void open() override
+  {
+    _is_open.store(true, std::memory_order_release);
+    // Drain any remaining items (including nullptr sentinels) from previous close()
+    std::unique_ptr<sirius::parallel::itask> task;
+    while (_queue.try_dequeue(task)) {
+      // Discard old items
+    }
+  }
 
   void close() override
   {

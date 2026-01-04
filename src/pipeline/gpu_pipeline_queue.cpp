@@ -21,7 +21,15 @@
 namespace sirius {
 namespace pipeline {
 
-void gpu_pipeline_queue::open() { _is_open.store(true, std::memory_order_release); }
+void gpu_pipeline_queue::open()
+{
+  _is_open.store(true, std::memory_order_release);
+  // Drain any remaining items (including nullptr sentinels) from previous close()
+  std::unique_ptr<sirius::parallel::itask> task;
+  while (_task_queue.try_dequeue(task)) {
+    // Discard old items
+  }
+}
 
 void gpu_pipeline_queue::close()
 {
