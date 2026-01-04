@@ -81,7 +81,6 @@ class mock_gpu_pipeline_task : public gpu_pipeline_task {
 
     // Increment counter
     global.executed_count.fetch_add(1, std::memory_order_relaxed);
-    printf("Executed count: %d\n", global.executed_count.load());
 
     // Record which GPU (thread) executed this task
     {
@@ -116,11 +115,9 @@ TEST_CASE("Pipeline executor executes tasks through pipeline_queue", "[pipeline_
     auto task = std::make_unique<mock_gpu_pipeline_task>(std::move(local_state), global_state);
 
     // Submit task request
-    printf("Submitting task request for task %d\n", i);
     auto request       = std::make_unique<task_request>();
     request->device_id = 0;
     executor.submit_task_request(std::move(request));
-    printf("Scheduling task %d\n", i);
 
     // Schedule task
     executor.schedule(std::move(task));
@@ -129,12 +126,8 @@ TEST_CASE("Pipeline executor executes tasks through pipeline_queue", "[pipeline_
   // Wait for all tasks to complete
   auto start_time = std::chrono::steady_clock::now();
   auto timeout    = std::chrono::seconds(10);
-  printf("Waiting for tasks to complete...\n");
   while (global_state->executed_count.load(std::memory_order_relaxed) < num_tasks) {
     std::this_thread::sleep_for(10ms);
-    printf("Executed %d / %d tasks\n",
-           global_state->executed_count.load(std::memory_order_relaxed),
-           num_tasks);
     if (std::chrono::steady_clock::now() - start_time > timeout) {
       FAIL("Test timed out waiting for tasks to complete");
     }
@@ -142,9 +135,7 @@ TEST_CASE("Pipeline executor executes tasks through pipeline_queue", "[pipeline_
 
   REQUIRE(global_state->executed_count.load() == num_tasks);
 
-  printf("All tasks completed.\n");
   executor.stop();
-  printf("Executor stopped.\n");
 }
 
 TEST_CASE("Pipeline executor dispatches tasks to multiple GPU executors", "[pipeline_executor]")
