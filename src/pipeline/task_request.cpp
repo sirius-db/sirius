@@ -21,7 +21,15 @@
 namespace sirius {
 namespace pipeline {
 
-void task_request_queue::open() { _is_open.store(true, std::memory_order_release); }
+void task_request_queue::open()
+{
+  _is_open.store(true, std::memory_order_release);
+  // Drain any remaining items (including nullptr sentinels) from previous close()
+  unique_ptr<task_request> request;
+  while (_request_queue.try_dequeue(request)) {
+    // Discard old items
+  }
+}
 
 void task_request_queue::close()
 {
