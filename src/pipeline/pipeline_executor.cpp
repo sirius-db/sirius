@@ -24,14 +24,18 @@
 namespace sirius {
 namespace pipeline {
 
-pipeline_executor::pipeline_executor(sirius::parallel::task_executor_config pipeline_config, sirius::parallel::task_executor_config gpu_executor_config, size_t num_gpus)
-  : sirius::parallel::itask_executor(std::make_unique<pipeline_queue>(pipeline_config.num_threads), pipeline_config)
+pipeline_executor::pipeline_executor(sirius::parallel::task_executor_config pipeline_config,
+                                     sirius::parallel::task_executor_config gpu_executor_config,
+                                     size_t num_gpus)
+  : sirius::parallel::itask_executor(std::make_unique<pipeline_queue>(pipeline_config.num_threads),
+                                     pipeline_config)
 {
   // Initialize GPU pipeline executors for each available GPU
   _gpu_executors.reserve(num_gpus);
   for (int i = 0; i < num_gpus; ++i) {
     const cucascade::memory::memory_space* gpu_mem_space = nullptr;  // Placeholder
-    _gpu_executors.push_back(std::make_unique<gpu_pipeline_executor>(gpu_executor_config, gpu_mem_space, this));
+    _gpu_executors.push_back(
+      std::make_unique<gpu_pipeline_executor>(gpu_executor_config, gpu_mem_space, this));
   }
   _task_request_queue = std::make_unique<task_request_queue>(pipeline_config.num_threads);
 }
