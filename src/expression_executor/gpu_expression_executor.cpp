@@ -256,8 +256,7 @@ std::shared_ptr<cucascade::data_batch> GpuExpressionExecutor::execute(
 
   // Create the data batch and return
   auto const batch_id = data_repo_mgr.get_next_data_batch_id();
-  return std::make_shared<cucascade::data_batch>(
-    batch_id, std::move(output_data_rep));
+  return std::make_shared<cucascade::data_batch>(batch_id, std::move(output_data_rep));
 }
 
 void GpuExpressionExecutor::Select(GPUIntermediateRelation& input_relation,
@@ -324,8 +323,7 @@ std::shared_ptr<cucascade::data_batch> GpuExpressionExecutor::select(
 
   // Create the data batch and return
   auto const batch_id = data_repo_mgr.get_next_data_batch_id();
-  return std::make_shared<cucascade::data_batch>(
-    batch_id, std::move(output_data_rep));
+  return std::make_shared<cucascade::data_batch>(batch_id, std::move(output_data_rep));
 }
 
 std::unique_ptr<cudf::column> GpuExpressionExecutor::ExecuteExpression(idx_t expr_idx)
