@@ -16,12 +16,17 @@
 
 #pragma once
 
-#include "duckdb/planner/expression.hpp"
-#include "log/logging.hpp"
+// sirius
+#include <log/logging.hpp>
 
+// duckdb
+#include <duckdb/planner/expression.hpp>
+
+// cudf
 #include <cudf/column/column.hpp>
 #include <cudf/types.hpp>
 
+// standard library
 #include <memory>
 
 namespace duckdb {

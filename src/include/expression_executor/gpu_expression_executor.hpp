@@ -16,52 +16,92 @@
 
 #pragma once
 
-#include "config.hpp"
-#include "duckdb/planner/expression/bound_between_expression.hpp"
-#include "duckdb/planner/expression/bound_case_expression.hpp"
-#include "duckdb/planner/expression/bound_cast_expression.hpp"
-#include "duckdb/planner/expression/bound_comparison_expression.hpp"
-#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
-#include "duckdb/planner/expression/bound_constant_expression.hpp"
-#include "duckdb/planner/expression/bound_function_expression.hpp"
-#include "duckdb/planner/expression/bound_operator_expression.hpp"
-#include "duckdb/planner/expression/bound_reference_expression.hpp"
-#include "expression_executor/gpu_expression_executor_state.hpp"
-#include "gpu_buffer_manager.hpp"
-#include "gpu_columns.hpp"
+// sirius
+#include <config.hpp>
+#include <expression_executor/gpu_expression_executor_state.hpp>
+#include <gpu_buffer_manager.hpp>
+#include <gpu_columns.hpp>
 
+// duckdb
+#include <duckdb/planner/expression/bound_between_expression.hpp>
+#include <duckdb/planner/expression/bound_case_expression.hpp>
+#include <duckdb/planner/expression/bound_cast_expression.hpp>
+#include <duckdb/planner/expression/bound_comparison_expression.hpp>
+#include <duckdb/planner/expression/bound_conjunction_expression.hpp>
+#include <duckdb/planner/expression/bound_constant_expression.hpp>
+#include <duckdb/planner/expression/bound_function_expression.hpp>
+#include <duckdb/planner/expression/bound_operator_expression.hpp>
+#include <duckdb/planner/expression/bound_reference_expression.hpp>
+
+// cucascades
+#include <data/data_batch.hpp>
+#include <data/data_repository_manager.hpp>
+
+// cudf
 #include <cudf/types.hpp>
 
+// rmm
+#include <rmm/cuda_stream_view.hpp>
+#include <rmm/resource_ref.hpp>
+
+// standard library
 #include <memory>
 #include <vector>
 
 namespace duckdb {
 namespace sirius {
 
-//----------GpuExpressionExecutor----------//
+//===----------------------------------------------------------------------===//
+// GpuExpressionExecutor
+//===----------------------------------------------------------------------===//
+
+/**
+ * @brief The GpuExpressionExecutor is responsible for evaluating expressions on the GPU.
+ */
 struct GpuExpressionExecutor {
-  //----------Constructor/Destructor(s)----------//
-  GpuExpressionExecutor() = default;
-  explicit GpuExpressionExecutor(const Expression& expr);
-  explicit GpuExpressionExecutor(const vector<unique_ptr<Expression>>& expressions);
+  using data_batch              = cucascade::data_batch;
+  using data_repository_manager = cucascade::data_repository_manager<std::shared_ptr<data_batch>>;
 
-  //----------Public Fields----------//
-  // The expressions of the executor
-  std::vector<const Expression*> expressions;
-  // The executor states for the expressions this executor is responsible for
-  std::vector<std::unique_ptr<GpuExpressionExecutorState>> states;
-  // The input (argument) columns for the current physical operator
-  std::vector<shared_ptr<GPUColumn>> input_columns;
-  // The memory resource
-  rmm::device_async_resource_ref resource_ref = GPUBufferManager::GetInstance().mr;
-  // The input count for the current relation (needed for materializing constants)
-  cudf::size_type input_count;
-  // Whether some input column is empty
-  bool has_null_input_column;
-  // The stream in which to execute the given set of expressions
-  rmm::cuda_stream_view execution_stream;
+  //===----------Constructor/Destructor(s)----------===//
+  /**
+   * @brief Constructs an expression executor with a single expression
+   *
+   * @param expr The expression to evaluate
+   * @param resource_ref The rmm::device_async_resource_ref to pass to cudf APIs for allocations
+   */
+  GpuExpressionExecutor(
+    const Expression& expr,
+    rmm::device_async_resource_ref resource_ref = GPUBufferManager::GetInstance().mr);
 
-  //----------Methods----------//
+  /**
+   * @brief Constructs an expression executor with a set of expressions
+   *
+   * @param expressions The expressions to evaluate
+   * @param resource_ref The rmm::device_async_resource_ref to pass to cudf APIs for allocations
+   */
+  GpuExpressionExecutor(
+    const vector<unique_ptr<Expression>>& expressions,
+    rmm::device_async_resource_ref resource_ref = GPUBufferManager::GetInstance().mr);
+
+  //===----------Fields----------===//
+  std::vector<const Expression*> expressions;  ///< The expressions to execute
+  std::vector<std::unique_ptr<GpuExpressionExecutorState>>
+    states;  ///< The execution states associated with each expression to execute
+  std::vector<shared_ptr<GPUColumn>>
+    input_columns;                              ///< The input columns for expression evaluation
+  rmm::device_async_resource_ref resource_ref;  ///< The allocator to pass to cudf APIs
+  cudf::size_type input_count;                  ///< The row count of the input table
+  bool has_null_input_column;                   ///< Whether some input column is null
+  rmm::cuda_stream_view execution_stream;       ///< THe stream in which to execute operations
+
+  //===----------Fields for New Execution Model----------===//
+  bool use_data_batch_apis =
+    false;  ///< Whether to use the data_batch APIs in executing bound references
+  std::vector<std::unique_ptr<cudf::column>>
+    output_columns;              ///< The columns generated by the executed expressions
+  cudf::table_view input_table;  ///< The input table
+
+  //===----------Methods----------===//
   void AddExpression(const Expression& expr);
   void ClearExpressions();
 
@@ -73,7 +113,7 @@ struct GpuExpressionExecutor {
 
   // Before evaluating an expression, check the leaves for nullptrs
   // (Assumes the input columns have already been set)
-  bool HasNullLeaf(const Expression& expr) const;
+  [[nodiscard]] bool HasNullLeaf(const Expression& expr) const;
   template <typename ExpressionT>
   bool HasNullLeafLoop(const ExpressionT& expr) const;
 
@@ -89,6 +129,37 @@ struct GpuExpressionExecutor {
   void Select(GPUIntermediateRelation& input_relation,
               GPUIntermediateRelation& output_relation,
               rmm::cuda_stream_view stream = rmm::cuda_stream_default);
+
+  /**
+   * @brief Executes the current set of expressions against the given input batch and emits a new
+   * output batch holding the results.
+   *
+   * @param input_batch The input batch against which to evaluate expressions
+   * @param data_repo_mgr The data repository manager (for constructing a new output data batch)
+   * @param stream The stream in which to execute the operations in the expression tree
+   *
+   * @return std::shared_ptr<cucascade::data_batch> The result of the evaluated expressions
+   *
+   * @note It is required that there is only one boolean expression in the current expression set.
+   */
+  std::shared_ptr<data_batch> execute(std::shared_ptr<data_batch> input_batch,
+                                      data_repository_manager& data_repo_mgr,
+                                      rmm::cuda_stream_view stream = rmm::cuda_stream_default);
+
+  /**
+   * @brief Evaluates a boolean expression and filters the input batch according to the result.
+   *
+   * @param input_batch The input batch against which to evaluate the expression
+   * @param data_repo_mgr The data repository manager (for constructing a new output data batch)
+   * @param stream The stream in which to execute the operations in the expression tree
+   *
+   * @return std::shared_ptr<cucascade::data_batch> The input batch filtered by the boolean
+   * expression
+   */
+  std::shared_ptr<cucascade::data_batch> select(
+    std::shared_ptr<data_batch> input_batch,
+    data_repository_manager& data_repo_mgr,
+    rmm::cuda_stream_view stream = rmm::cuda_stream_default);
 
   // Execute the expression at the given index and return the result
   std::unique_ptr<cudf::column> ExecuteExpression(idx_t expression_idx);
@@ -112,7 +183,7 @@ struct GpuExpressionExecutor {
   std::unique_ptr<cudf::column> Execute(const BoundReferenceExpression& expr,
                                         GpuExpressionState* state);
 
-  //----------Initialize State + Specializations----------//
+  //===----------Initialize State + Specializations----------===//
   static std::unique_ptr<GpuExpressionState> InitializeState(const Expression& expr,
                                                              GpuExpressionExecutorState& state);
   static std::unique_ptr<GpuExpressionState> InitializeState(const BoundBetweenExpression& expr,
