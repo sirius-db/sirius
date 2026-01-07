@@ -101,7 +101,7 @@ void task_creator::process_next_task(::duckdb::GPUPhysicalOperator* node)
     schedule(std::make_unique<task_creation_info>(hint_node, pipeline));
   } else if (std::holds_alternative<::duckdb::shared_ptr<::duckdb::GPUPipeline>>(hint)) {
     auto pipeline = std::get<::duckdb::shared_ptr<::duckdb::GPUPipeline>>(hint);
-    process_next_task(&pipeline->GetOperators()[0].get());
+    process_next_task(&pipeline->GetInnerOperators()[0].get());
   } else {
     if (!priority_scans.empty()) {
       ::duckdb::shared_ptr<::duckdb::GPUPipeline> pipeline = priority_scans.front();
@@ -190,7 +190,7 @@ void task_creator::worker_function(int worker_id)
         // scheduling pipeline task
       } else {
         ::duckdb::reference<::duckdb::GPUPhysicalOperator> node =
-          info->_pipeline->GetOperators()[0];
+          info->_pipeline->GetInnerOperators()[0];
         info->_pipeline->GetSink()->set_creator(this);
         // need to exhaust input batches until all ports are empty
         while (!node.get().all_ports_empty()) {

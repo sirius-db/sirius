@@ -44,6 +44,9 @@ class GPUPhysicalPartition : public GPUPhysicalOperator {
   bool IsSink() const override;
 
   bool isBuildPartition();
+  
+  //! Get the parent operator (e.g., HASH_JOIN for build partition)
+  GPUPhysicalOperator* getParentOp() const { return _parent_op; }
 
  private:
   void GetPartitionKeys(GPUPhysicalOperator* op, bool is_build = false);

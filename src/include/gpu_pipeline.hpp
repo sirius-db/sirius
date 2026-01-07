@@ -91,8 +91,11 @@ class GPUPipeline : public enable_shared_from_this<GPUPipeline> {
   // bool GetProgress(double &current_percentage, idx_t &estimated_cardinality);
 
   //! Returns a list of all operators (including source and sink) involved in this pipeline
-  vector<reference<GPUPhysicalOperator>> GetOperators();
-  vector<const_reference<GPUPhysicalOperator>> GetOperators() const;
+  vector<reference<GPUPhysicalOperator>> GetAllOperators();
+  vector<const_reference<GPUPhysicalOperator>> GetAllOperators() const;
+
+  //! Returns a list of all inner operators (excluding source and sink) involved in this pipeline
+  vector<reference<GPUPhysicalOperator>> GetInnerOperators();
 
   optional_ptr<GPUPhysicalOperator> GetSink() { return sink; }
 

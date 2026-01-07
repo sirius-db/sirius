@@ -45,7 +45,7 @@ class gpu_pipeline_hashmap {
     : _vec(std::move(vec))
   {
     for (auto& pipeline : _vec) {
-      for (auto& op : pipeline->GetOperators()) {
+      for (auto& op : pipeline->GetInnerOperators()) {
         if (_map.find(&op.get()) == _map.end()) {
           _map.insert({&op.get(), pipeline});
         } else {

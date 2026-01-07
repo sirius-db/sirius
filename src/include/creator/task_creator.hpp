@@ -56,7 +56,7 @@ class task_creation_info {
       destination_data_repositories.push_back(next_op->get_port(port_id)->repo);
     }
     if (_node->type == ::duckdb::PhysicalOperatorType::TABLE_SCAN) {
-      auto& first_operator = _pipeline->GetOperators()[0].get();
+      auto& first_operator = _pipeline->GetInnerOperators()[0].get();
       destination_data_repositories.push_back(first_operator.get_port("scan")->repo);
     }
     if (_pipeline->GetSink()->type == ::duckdb::PhysicalOperatorType::RESULT_COLLECTOR) {

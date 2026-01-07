@@ -193,6 +193,7 @@ class GPUPhysicalOperator {
     MemoryBarrierType type;
     ::cucascade::shared_data_repository* repo;
     shared_ptr<GPUPipeline> src_pipeline;
+    shared_ptr<GPUPipeline> dest_pipeline;
   };
 
   // source pipeline pushed to repo of the ports
