@@ -464,14 +464,12 @@ struct NumericBinaryFunctionDispatcher {
     auto right = executor.Execute(*expr.children[1], state->child_states[1].get());
 
     // Check for BIGINT arithmetic overflow potential (ADD, SUB, MUL)
-    if constexpr (BinOp == cudf::binary_operator::ADD ||
-                  BinOp == cudf::binary_operator::SUB ||
+    if constexpr (BinOp == cudf::binary_operator::ADD || BinOp == cudf::binary_operator::SUB ||
                   BinOp == cudf::binary_operator::MUL) {
       if (left->view().type().id() == cudf::type_id::INT64 &&
           right->view().type().id() == cudf::type_id::INT64) {
         // BIGINT arithmetic can overflow - GPU doesn't check for overflow
-        throw NotImplementedException(
-          "GPU BIGINT arithmetic may overflow - falling back to CPU");
+        throw NotImplementedException("GPU BIGINT arithmetic may overflow - falling back to CPU");
       }
     }
 
