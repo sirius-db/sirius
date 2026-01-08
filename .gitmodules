@@ -10,3 +10,6 @@
 	path = substrait
 	url = https://github.com/duckdb/substrait.git
 	branch = main
+[submodule "third_party/cucascade"]
+	path = third_party/cucascade
+	url = https://github.com/NVIDIA/cuCascade.git

@@ -151,9 +151,9 @@ target_link_libraries(${EXTENSION_NAME} spdlog::spdlog cucascade::cucascade)
 target_link_libraries(${LOADABLE_EXTENSION_NAME} spdlog::spdlog
                       cucascade::cucascade)
 
-# Ensure cuCascade is built before extensions
-add_dependencies(${EXTENSION_NAME} cucascade_ep spdlog_ep)
-add_dependencies(${LOADABLE_EXTENSION_NAME} cucascade_ep spdlog_ep)
+# Ensure spdlog is built before extensions (cuCascade is built at configure time)
+add_dependencies(${EXTENSION_NAME} spdlog_ep)
+add_dependencies(${LOADABLE_EXTENSION_NAME} spdlog_ep)
 
 install(
   TARGETS ${EXTENSION_NAME}
