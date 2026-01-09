@@ -41,7 +41,7 @@ namespace sirius {
 class memory_manager {
  public:
   using manager_type = cucascade::memory::memory_reservation_manager;
-  using config_type  = manager_type::memory_space_config;
+  using config_type  = cucascade::memory::memory_space_config;
 
   /**
    * @brief Initialize the global memory reservation manager.
