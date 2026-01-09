@@ -2,7 +2,7 @@
 channels = ["rapidsai", "conda-forge", "nvidia" ]
 name = "sirius"
 platforms = ["linux-64", "linux-aarch64"]
-requires-pixi = "0.59.*"
+requires-pixi = ">=0.59"
 
 [system-requirements]
 cuda = "13"

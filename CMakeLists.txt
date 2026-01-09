@@ -147,13 +147,22 @@ target_link_libraries(${LOADABLE_EXTENSION_NAME} substrait_extension cudf::cudf
                       rmm::rmm)
 
 # Link third-party libraries
-target_link_libraries(${EXTENSION_NAME} spdlog::spdlog cucascade::cucascade)
+target_link_libraries(${EXTENSION_NAME} spdlog::spdlog cuCascade::cucascade)
 target_link_libraries(${LOADABLE_EXTENSION_NAME} spdlog::spdlog
-                      cucascade::cucascade)
+                      cuCascade::cucascade)
 
-# Ensure cuCascade is built before extensions
-add_dependencies(${EXTENSION_NAME} cucascade_ep spdlog_ep)
-add_dependencies(${LOADABLE_EXTENSION_NAME} cucascade_ep spdlog_ep)
+# Ensure third-party libraries are built before extensions Note: cucascade is
+# added via add_subdirectory, so dependencies are automatic
+add_dependencies(${EXTENSION_NAME} spdlog_ep)
+add_dependencies(${LOADABLE_EXTENSION_NAME} spdlog_ep)
+
+# Install cucascade_static to the DuckDB export set (required for
+# sirius_extension export)
+install(
+  TARGETS cucascade_static
+  EXPORT "${DUCKDB_EXPORT_SET}"
+  LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
+  ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
 
 install(
   TARGETS ${EXTENSION_NAME}

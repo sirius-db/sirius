@@ -1,46 +1,78 @@
-# cuCascade - GPU Memory Reservation Library
+# cuCascade - GPU Memory Reservation Library (submodule)
+#
+# Options: CUCASCADE_GIT_TAG          - Specific git tag/commit hash to checkout
+# (empty = use current) CUCASCADE_UPDATE_SUBMODULE - Update submodule to latest
+# remote before building (OFF by default)
 
-set(CUCASCADE_VERSION "main")
-set(CUCASCADE_GIT_URL "https://github.com/NVIDIA/cuCascade.git")
+set(CUCASCADE_GIT_TAG
+    ""
+    CACHE STRING
+          "Specific git tag/commit hash for cuCascade (empty = use current)")
+option(CUCASCADE_UPDATE_SUBMODULE "Update cuCascade submodule to latest remote"
+       OFF)
 
-include(ExternalProject)
+# #region agent log - Debug CMake directory variables (H1, H2, H3, H4)
+message(STATUS "[DEBUG] CMAKE_SOURCE_DIR: ${CMAKE_SOURCE_DIR}")
+message(STATUS "[DEBUG] CMAKE_CURRENT_SOURCE_DIR: ${CMAKE_CURRENT_SOURCE_DIR}")
+message(STATUS "[DEBUG] PROJECT_SOURCE_DIR: ${PROJECT_SOURCE_DIR}")
+message(STATUS "[DEBUG] sirius_SOURCE_DIR: ${sirius_SOURCE_DIR}")
+# #endregion
 
-set(CUCASCADE_BASE cucascade_ep)
-set(CUCASCADE_PREFIX ${DEPS_PREFIX}/${CUCASCADE_BASE})
-set(CUCASCADE_BASE_DIR ${CMAKE_CURRENT_BINARY_DIR}/${CUCASCADE_PREFIX})
-set(CUCASCADE_SOURCE_DIR ${CUCASCADE_BASE_DIR}/src/${CUCASCADE_BASE})
-set(CUCASCADE_BUILD_DIR ${CUCASCADE_SOURCE_DIR}/build/release)
-set(CUCASCADE_INCLUDE_DIR ${CUCASCADE_SOURCE_DIR}/include)
-set(CUCASCADE_LIB_DIR ${CUCASCADE_BUILD_DIR})
-set(CUCASCADE_STATIC_LIB
-    ${CUCASCADE_LIB_DIR}/${CMAKE_STATIC_LIBRARY_PREFIX}cucascade${CMAKE_STATIC_LIBRARY_SUFFIX}
-)
+set(CUCASCADE_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/cucascade")
 
-ExternalProject_Add(
-  ${CUCASCADE_BASE}
-  PREFIX ${CUCASCADE_BASE_DIR}
-  GIT_REPOSITORY ${CUCASCADE_GIT_URL}
-  GIT_TAG ${CUCASCADE_VERSION}
-  GIT_PROGRESS ON
-  GIT_SHALLOW ON
-  UPDATE_DISCONNECTED TRUE
-  BUILD_BYPRODUCTS ${CUCASCADE_STATIC_LIB}
-  CONFIGURE_COMMAND
-    ${CMAKE_COMMAND} -E env "CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}"
-    ${CMAKE_COMMAND} --preset release -S <SOURCE_DIR> -B
-    <SOURCE_DIR>/build/release
-  BUILD_COMMAND ${CMAKE_COMMAND} --build <SOURCE_DIR>/build/release
-  INSTALL_COMMAND ""
-  BUILD_IN_SOURCE FALSE)
+message(STATUS "CUCASCADE_SOURCE_DIR: ${CUCASCADE_SOURCE_DIR}")
 
-file(MAKE_DIRECTORY ${CUCASCADE_INCLUDE_DIR}) # Include directory needs to exist
-                                              # to run configure
+# Verify submodule exists
+if(NOT EXISTS "${CUCASCADE_SOURCE_DIR}/CMakeLists.txt")
+  message(
+    FATAL_ERROR "cuCascade submodule not found at ${CUCASCADE_SOURCE_DIR}. "
+                "Please run: git submodule update --init cucascade")
+endif()
 
-add_library(cucascade::cucascade STATIC IMPORTED)
-set_target_properties(cucascade::cucascade PROPERTIES IMPORTED_LOCATION
-                                                      ${CUCASCADE_STATIC_LIB})
-target_include_directories(cucascade::cucascade
-                           INTERFACE ${CUCASCADE_INCLUDE_DIR})
-# cuCascade uses NUMA-aware memory allocation
-set_property(TARGET cucascade::cucascade PROPERTY INTERFACE_LINK_LIBRARIES numa)
-add_dependencies(cucascade::cucascade ${CUCASCADE_BASE})
+# Handle submodule update if requested
+if(CUCASCADE_UPDATE_SUBMODULE)
+  message(STATUS "Updating cuCascade submodule to latest remote...")
+  execute_process(
+    COMMAND git submodule update --remote cucascade
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+    RESULT_VARIABLE GIT_SUBMODULE_RESULT)
+  if(NOT GIT_SUBMODULE_RESULT EQUAL 0)
+    message(WARNING "Failed to update cuCascade submodule")
+  endif()
+endif()
+
+# Handle specific git tag/commit checkout
+if(CUCASCADE_GIT_TAG)
+  message(STATUS "Checking out cuCascade at: ${CUCASCADE_GIT_TAG}")
+  execute_process(
+    COMMAND git checkout ${CUCASCADE_GIT_TAG}
+    WORKING_DIRECTORY "${CUCASCADE_SOURCE_DIR}"
+    RESULT_VARIABLE GIT_CHECKOUT_RESULT)
+  if(NOT GIT_CHECKOUT_RESULT EQUAL 0)
+    message(FATAL_ERROR "Failed to checkout cuCascade at ${CUCASCADE_GIT_TAG}")
+  endif()
+endif()
+
+# Configure cuCascade build options
+set(BUILD_TESTS
+    OFF
+    CACHE BOOL "Disable cuCascade tests" FORCE)
+set(BUILD_SHARED_LIBS
+    OFF
+    CACHE BOOL "Disable cuCascade shared lib" FORCE)
+set(BUILD_STATIC_LIBS
+    ON
+    CACHE BOOL "Enable cuCascade static lib" FORCE)
+set(WARNINGS_AS_ERRORS
+    OFF
+    CACHE BOOL "Disable warnings as errors for cuCascade" FORCE)
+
+# Add cuCascade subdirectory (EXCLUDE_FROM_ALL prevents cuCascade's own install
+# rules)
+add_subdirectory("${CUCASCADE_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/cucascade"
+                 EXCLUDE_FROM_ALL)
+
+# Set include directory for use in main CMakeLists.txt
+set(CUCASCADE_INCLUDE_DIR
+    "${CUCASCADE_SOURCE_DIR}/include"
+    CACHE PATH "cuCascade include directory")
