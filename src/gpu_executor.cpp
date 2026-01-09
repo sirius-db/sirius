@@ -239,9 +239,11 @@ void GPUExecutor::execute()
   printf("Creating gpu_pipeline_hashmap\n");
   ::sirius::gpu_pipeline_hashmap pipeline_map = ::sirius::gpu_pipeline_hashmap(new_scheduled);
   ::sirius::parallel::task_executor_config scan_executor_config =
-    ::sirius::parallel::task_executor_config(::sirius::Config::NUM_DUCKDB_SCAN_EXECUTOR_THREADS, false);
+    ::sirius::parallel::task_executor_config(::sirius::Config::NUM_DUCKDB_SCAN_EXECUTOR_THREADS,
+                                             false);
   ::sirius::parallel::task_executor_config global_executor_config =
-    ::sirius::parallel::task_executor_config(::sirius::Config::NUM_PIPELINE_EXECUTOR_THREADS, false);
+    ::sirius::parallel::task_executor_config(::sirius::Config::NUM_PIPELINE_EXECUTOR_THREADS,
+                                             false);
   ::sirius::parallel::task_executor_config gpu_executor_config =
     ::sirius::parallel::task_executor_config(::sirius::Config::NUM_GPU_EXECUTOR_THREADS, false);
 
@@ -249,8 +251,8 @@ void GPUExecutor::execute()
   ::sirius::op::scan::duckdb_scan_executor scan_executor =
     ::sirius::op::scan::duckdb_scan_executor(scan_executor_config);
   printf("Creating pipeline executor\n");
-  ::sirius::pipeline::pipeline_executor pipeline_executor =
-    ::sirius::pipeline::pipeline_executor(global_executor_config, gpu_executor_config, ::sirius::Config::NUM_GPU);
+  ::sirius::pipeline::pipeline_executor pipeline_executor = ::sirius::pipeline::pipeline_executor(
+    global_executor_config, gpu_executor_config, ::sirius::Config::NUM_GPU);
 
   // Currently we will start the components after the query start instead of during database
   // initialization because it is easier for development.
@@ -273,21 +275,22 @@ void GPUExecutor::execute()
   creator.stop();
 }
 
-void 
-GPUExecutor::insert_repository(std::string_view port_id, shared_ptr<GPUPipeline> input_pipeline, shared_ptr<GPUPipeline> dependent_pipeline) {
+void GPUExecutor::insert_repository(std::string_view port_id,
+                                    shared_ptr<GPUPipeline> input_pipeline,
+                                    shared_ptr<GPUPipeline> dependent_pipeline)
+{
   auto next_op = dependent_pipeline->operators.size() == 0
-                ? dependent_pipeline->GetSink().get()
-                : &dependent_pipeline->operators[0].get();
+                   ? dependent_pipeline->GetSink().get()
+                   : &dependent_pipeline->operators[0].get();
   size_t op_id = get_operator_id(next_op);
   data_repo_manager->add_new_repository(
     op_id, port_id, std::make_unique<::cucascade::shared_data_repository>());
-  next_op->add_port(
-    port_id,
-    std::make_unique<GPUPhysicalOperator::port>(
-      MemoryBarrierType::FULL,
-      data_repo_manager->get_repository(op_id, port_id).get(),
-      input_pipeline,
-      dependent_pipeline));
+  next_op->add_port(port_id,
+                    std::make_unique<GPUPhysicalOperator::port>(
+                      MemoryBarrierType::FULL,
+                      data_repo_manager->get_repository(op_id, port_id).get(),
+                      input_pipeline,
+                      dependent_pipeline));
   input_pipeline->GetSink()->add_next_port_after_sink({next_op, port_id});
 }
 
@@ -408,7 +411,8 @@ void GPUExecutor::InitializeInternal(GPUPhysicalOperator& plan)
       // }
 
       data_repo_manager = ::std::make_unique<::cucascade::shared_data_repository_manager>();
-      unordered_map<const GPUPhysicalOperator*, vector<shared_ptr<GPUPipeline>>> source_to_pipelines;
+      unordered_map<const GPUPhysicalOperator*, vector<shared_ptr<GPUPipeline>>>
+        source_to_pipelines;
 
       for (size_t i = 0; i < copied_scheduled.size(); i++) {
         auto current_pipeline = copied_scheduled[i];  // Copy shared_ptr to avoid invalidation
@@ -652,80 +656,83 @@ void GPUExecutor::InitializeInternal(GPUPhysicalOperator& plan)
             new_scheduled[i]->sink->type == PhysicalOperatorType::ORDER_BY ||
             new_scheduled[i]->sink->type == PhysicalOperatorType::TOP_N ||
             new_scheduled[i]->sink->type == PhysicalOperatorType::UNGROUPED_AGGREGATE) {
-            auto sink_op = new_scheduled[i]->GetSink().get();
-            std::string_view port_id = "default";
-            for (auto dependent_pipeline : source_to_pipelines[sink_op]) {
+          auto sink_op             = new_scheduled[i]->GetSink().get();
+          std::string_view port_id = "default";
+          for (auto dependent_pipeline : source_to_pipelines[sink_op]) {
+            insert_repository(port_id, new_scheduled[i], dependent_pipeline);
+          }
+        } else if (new_scheduled[i]->sink->type == PhysicalOperatorType::CTE) {
+          auto& cte_op             = new_scheduled[i]->GetSink()->Cast<GPUPhysicalCTE>();
+          std::string_view port_id = "default";
+          for (auto cte_scan : cte_op.cte_scans) {
+            for (auto dependent_pipeline : source_to_pipelines[&cte_scan.get()]) {
               insert_repository(port_id, new_scheduled[i], dependent_pipeline);
             }
-        } else if (new_scheduled[i]->sink->type == PhysicalOperatorType::CTE) {
-            auto& cte_op = new_scheduled[i]->GetSink()->Cast<GPUPhysicalCTE>();
-            std::string_view port_id = "default";
-            for (auto cte_scan : cte_op.cte_scans) {
-              for (auto dependent_pipeline : source_to_pipelines[&cte_scan.get()]) {
-                insert_repository(port_id, new_scheduled[i], dependent_pipeline);
-              }
-            }
+          }
         } else if (new_scheduled[i]->sink->type == PhysicalOperatorType::RIGHT_DELIM_JOIN ||
                    new_scheduled[i]->sink->type == PhysicalOperatorType::LEFT_DELIM_JOIN) {
-            auto delim_join         = new_scheduled[i]->GetSink();
-            auto partition_join     = delim_join->Cast<GPUPhysicalDelimJoin>().partition_join;
-            auto partition_distinct = delim_join->Cast<GPUPhysicalDelimJoin>().partition_distinct;
-            // Find the pipeline containing the join as the first operator
-            GPUPhysicalOperator* join_op = partition_join->getParentOp();
-            bool found = false;
+          auto delim_join         = new_scheduled[i]->GetSink();
+          auto partition_join     = delim_join->Cast<GPUPhysicalDelimJoin>().partition_join;
+          auto partition_distinct = delim_join->Cast<GPUPhysicalDelimJoin>().partition_distinct;
+          // Find the pipeline containing the join as the first operator
+          GPUPhysicalOperator* join_op = partition_join->getParentOp();
+          bool found                   = false;
+          for (size_t j = 0; j < new_scheduled.size(); j++) {
+            if (new_scheduled[j]->operators.size() > 0 &&
+                &new_scheduled[j]->operators[0].get() == join_op) {
+              insert_repository("build", new_scheduled[i], new_scheduled[j]);
+              found = true;
+              break;
+            }
+          }
+          if (!found) {
+            throw std::runtime_error(
+              "DELIM_JOIN partition_join: could not find pipeline with join as first operator");
+          }
+          for (auto dependent_pipeline : source_to_pipelines[partition_distinct]) {
+            insert_repository("default", new_scheduled[i], dependent_pipeline);
+          }
+        } else if (new_scheduled[i]->sink->type == PhysicalOperatorType::INVALID) {
+          auto& partition          = new_scheduled[i]->GetSink()->Cast<GPUPhysicalPartition>();
+          std::string_view port_id = partition.isBuildPartition() ? "build" : "default";
+
+          if (partition.isBuildPartition()) {
+            // For build partitions, no pipeline uses it as source.
+            // Instead, connect directly to the HASH_JOIN operator stored in parent_op.
+            // Find the pipeline containing this HASH_JOIN as the first operator.
+            GPUPhysicalOperator* hash_join_op = partition.getParentOp();
+            bool found                        = false;
             for (size_t j = 0; j < new_scheduled.size(); j++) {
+              // The join is guaranteed to be the first operator in the pipeline
               if (new_scheduled[j]->operators.size() > 0 &&
-                  &new_scheduled[j]->operators[0].get() == join_op) {
-                insert_repository("build", new_scheduled[i], new_scheduled[j]);
+                  &new_scheduled[j]->operators[0].get() == hash_join_op) {
+                insert_repository(port_id, new_scheduled[i], new_scheduled[j]);
                 found = true;
                 break;
               }
             }
             if (!found) {
-              throw std::runtime_error("DELIM_JOIN partition_join: could not find pipeline with join as first operator");
+              throw std::runtime_error(
+                "Build partition: could not find pipeline with HASH_JOIN as first operator");
             }
-            for (auto dependent_pipeline : source_to_pipelines[partition_distinct]) {
-              insert_repository("default", new_scheduled[i], dependent_pipeline);
+          } else {
+            // Probe partitions have dependent pipelines in source_to_pipelines
+            for (auto dependent_pipeline : source_to_pipelines[new_scheduled[i]->GetSink().get()]) {
+              insert_repository(port_id, new_scheduled[i], dependent_pipeline);
             }
-        } else if (new_scheduled[i]->sink->type == PhysicalOperatorType::INVALID) {
-            auto& partition = new_scheduled[i]->GetSink()->Cast<GPUPhysicalPartition>();
-            std::string_view port_id = partition.isBuildPartition() ? "build" : "default";
-            
-            if (partition.isBuildPartition()) {
-              // For build partitions, no pipeline uses it as source.
-              // Instead, connect directly to the HASH_JOIN operator stored in parent_op.
-              // Find the pipeline containing this HASH_JOIN as the first operator.
-              GPUPhysicalOperator* hash_join_op = partition.getParentOp();
-              bool found = false;
-              for (size_t j = 0; j < new_scheduled.size(); j++) {
-                // The join is guaranteed to be the first operator in the pipeline
-                if (new_scheduled[j]->operators.size() > 0 &&
-                    &new_scheduled[j]->operators[0].get() == hash_join_op) {
-                  insert_repository(port_id, new_scheduled[i], new_scheduled[j]);
-                  found = true;
-                  break;
-                }
-              }
-              if (!found) {
-                throw std::runtime_error("Build partition: could not find pipeline with HASH_JOIN as first operator");
-              }
-            } else {
-              // Probe partitions have dependent pipelines in source_to_pipelines
-              for (auto dependent_pipeline : source_to_pipelines[new_scheduled[i]->GetSink().get()]) {
-                insert_repository(port_id, new_scheduled[i], dependent_pipeline);
-              }
-            }
+          }
         } else if (new_scheduled[i]->sink->type == PhysicalOperatorType::RESULT_COLLECTOR) {
-            std::string_view port_id = "final";
-            size_t sink_op_id   = get_operator_id(new_scheduled[i]->GetSink().get());
-            data_repo_manager->add_new_repository(sink_op_id, port_id, std::make_unique<::cucascade::shared_data_repository>());
-            new_scheduled[i]->sink->add_port(
-              port_id,
-              std::make_unique<GPUPhysicalOperator::port>(
-                MemoryBarrierType::FULL,
-                data_repo_manager->get_repository(sink_op_id, port_id).get(),
-                new_scheduled[i],
-                nullptr));
+          std::string_view port_id = "final";
+          size_t sink_op_id        = get_operator_id(new_scheduled[i]->GetSink().get());
+          data_repo_manager->add_new_repository(
+            sink_op_id, port_id, std::make_unique<::cucascade::shared_data_repository>());
+          new_scheduled[i]->sink->add_port(
+            port_id,
+            std::make_unique<GPUPhysicalOperator::port>(
+              MemoryBarrierType::FULL,
+              data_repo_manager->get_repository(sink_op_id, port_id).get(),
+              new_scheduled[i],
+              nullptr));
         } else {
           throw std::runtime_error("Unsupported sink type for modified pipeline");
         }
@@ -734,18 +741,17 @@ void GPUExecutor::InitializeInternal(GPUPhysicalOperator& plan)
           ::std::unique_ptr<::cucascade::shared_data_repository> repo =
             ::std::make_unique<::cucascade::shared_data_repository>();
           std::string port_id = "scan";
-          auto next_op = new_scheduled[i]->operators.size() == 0
-                        ? new_scheduled[i]->GetSink().get()
-                        : &new_scheduled[i]->operators[0].get();
+          auto next_op        = new_scheduled[i]->operators.size() == 0
+                                  ? new_scheduled[i]->GetSink().get()
+                                  : &new_scheduled[i]->operators[0].get();
           size_t op_id        = get_operator_id(next_op);
           data_repo_manager->add_new_repository(op_id, port_id, std::move(repo));
-          next_op->add_port(
-            port_id,
-            std::make_unique<GPUPhysicalOperator::port>(
-              MemoryBarrierType::PIPELINE,
-              data_repo_manager->get_repository(op_id, port_id).get(),
-              nullptr,
-              new_scheduled[i]));
+          next_op->add_port(port_id,
+                            std::make_unique<GPUPhysicalOperator::port>(
+                              MemoryBarrierType::PIPELINE,
+                              data_repo_manager->get_repository(op_id, port_id).get(),
+                              nullptr,
+                              new_scheduled[i]));
         }
       }
 
@@ -795,7 +801,8 @@ void GPUExecutor::InitializeInternal(GPUPhysicalOperator& plan)
       }
     }
 
-    // collect all pipelines from the root pipelines (recursively) for the progress bar and verify them
+    // collect all pipelines from the root pipelines (recursively) for the progress bar and verify
+    // them
     root_pipeline->GetPipelines(pipelines, true);
     SIRIUS_LOG_DEBUG("total_pipelines = {}", pipelines.size());
   }

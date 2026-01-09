@@ -86,18 +86,14 @@ task_creator::task_creator(size_t num_threads,
 
 task_creator::~task_creator() { stop_thread_pool(); }
 
-void task_creator::update_pipeline_status(::duckdb::GPUPhysicalOperator* node)
-{
-  auto pipeline = _gpu_pipeline_map._map[node];
-  pipeline->update_pipeline_status();
-}
-
 void task_creator::process_next_task(::duckdb::GPUPhysicalOperator* node)
 {
   auto hint = node->get_next_task_hint();
+  // printf("Node %p provided hint of type %zu\n", node, hint.index());
   if (std::holds_alternative<::duckdb::GPUPhysicalOperator*>(hint)) {
+    // printf("Processing next task for hint node %p\n", node);
     auto* hint_node = std::get<::duckdb::GPUPhysicalOperator*>(hint);
-    auto pipeline   = _gpu_pipeline_map._map[hint_node];
+    auto pipeline   = hint_node->get_port("default")->dest_pipeline;
     schedule(std::make_unique<task_creation_info>(hint_node, pipeline));
   } else if (std::holds_alternative<::duckdb::shared_ptr<::duckdb::GPUPipeline>>(hint)) {
     auto pipeline = std::get<::duckdb::shared_ptr<::duckdb::GPUPipeline>>(hint);

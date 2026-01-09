@@ -42,26 +42,9 @@ namespace sirius {
 class gpu_pipeline_hashmap {
  public:
   gpu_pipeline_hashmap(duckdb::vector<duckdb::shared_ptr<duckdb::GPUPipeline>> vec)
-    : _vec(std::move(vec))
-  {
-    for (auto& pipeline : _vec) {
-      for (auto& op : pipeline->GetInnerOperators()) {
-        if (_map.find(&op.get()) == _map.end()) {
-          _map.insert({&op.get(), pipeline});
-        } else {
-          throw std::runtime_error("Operator already exists in hashmap");
-        }
-      }
-      if (_map.find(pipeline->GetSink().get()) == _map.end()) {
-        _map.insert({pipeline->GetSink().get(), pipeline});
-      } else {
-        throw std::runtime_error("Sink operator already exists in hashmap");
-      }
-    }
-  };
+    : _vec(std::move(vec)) {};
   ~gpu_pipeline_hashmap() = default;
   duckdb::vector<duckdb::shared_ptr<duckdb::GPUPipeline>> _vec;
-  std::unordered_map<duckdb::GPUPhysicalOperator*, duckdb::shared_ptr<duckdb::GPUPipeline>> _map;
 };
 
 }  // namespace sirius

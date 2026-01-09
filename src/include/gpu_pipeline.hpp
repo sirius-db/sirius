@@ -68,6 +68,7 @@ class GPUPipeline : public enable_shared_from_this<GPUPipeline> {
 
  public:
   explicit GPUPipeline(GPUExecutor& execution_context);
+  virtual ~GPUPipeline() = default;
 
   GPUExecutor& executor;
 
@@ -117,7 +118,7 @@ class GPUPipeline : public enable_shared_from_this<GPUPipeline> {
   //! Updates the pipeline status
   void update_pipeline_status();
   //! Checks if the pipeline has been finished
-  bool is_pipeline_finished();
+  virtual bool is_pipeline_finished();
 
  private:
   //! Whether or not the pipeline has been readied

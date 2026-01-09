@@ -50,6 +50,9 @@ class task_creation_info {
                      ::duckdb::shared_ptr<::duckdb::GPUPipeline> pipeline)
     : _node(node), _pipeline(std::move(pipeline))
   {
+    if (!_pipeline) {
+      return;  // Skip port setup if no pipeline provided
+    }
     // get next port after sink and then get the data repository from the port
     auto next_port_after_sink = _pipeline->GetSink()->get_next_port_after_sink();
     for (auto& [next_op, port_id] : next_port_after_sink) {
@@ -117,6 +120,13 @@ class task_creation_queue {
    */
   std::unique_ptr<task_creation_info> pull();
 
+  /**
+   * @brief Check if the queue is currently open.
+   *
+   * @return true if the queue is open, false otherwise.
+   */
+  bool is_open() const { return _is_open.load(std::memory_order_acquire); }
+
  private:
   size_t _num_threads;
   duckdb_moodycamel::BlockingConcurrentQueue<std::unique_ptr<task_creation_info>> _queue;
@@ -156,7 +166,7 @@ class task_creator {
   /**
    * @brief Destructor that ensures the thread pool is stopped.
    */
-  ~task_creator();
+  virtual ~task_creator();
 
   // Non-copyable and movable
   task_creator(const task_creator&)            = delete;
@@ -209,16 +219,9 @@ class task_creator {
    *
    * @param info The task creation info to schedule.
    */
-  void schedule(std::unique_ptr<task_creation_info> info);
+  virtual void schedule(std::unique_ptr<task_creation_info> info);
 
-  /**
-   * @brief Update the pipeline status.
-   *
-   * @param node The operator node to update the pipeline status for.
-   */
-  void update_pipeline_status(::duckdb::GPUPhysicalOperator* node);
-
- private:
+ protected:
   /**
    * @brief Worker function executed by each thread in the pool.
    *

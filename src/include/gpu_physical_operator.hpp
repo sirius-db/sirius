@@ -203,7 +203,7 @@ class GPUPhysicalOperator {
   bool is_source_pipeline_finished();
   void add_next_port_after_sink(std::pair<GPUPhysicalOperator*, std::string_view> port_locator);
   vector<std::pair<GPUPhysicalOperator*, std::string_view>>& get_next_port_after_sink();
-  ::sirius::creator::task_creation_hint get_next_task_hint();
+  virtual ::sirius::creator::task_creation_hint get_next_task_hint();
   std::vector<::std::shared_ptr<::cucascade::data_batch>> get_input_batch();
   bool all_ports_empty();
   bool check_pipeline_finished();

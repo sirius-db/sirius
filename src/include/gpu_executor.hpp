@@ -76,7 +76,9 @@ class GPUExecutor {
   //! The total amount of pipelines in the query
   idx_t total_pipelines;
   //! Inserting repository
-  void insert_repository(std::string_view port_id, shared_ptr<GPUPipeline> input_pipeline, shared_ptr<GPUPipeline> dependent_pipeline);
+  void insert_repository(std::string_view port_id,
+                         shared_ptr<GPUPipeline> input_pipeline,
+                         shared_ptr<GPUPipeline> dependent_pipeline);
 
   //! Whether or not the root of the pipeline is a result collector object
   bool HasResultCollector();

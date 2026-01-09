@@ -190,7 +190,11 @@ GPUPhysicalOperator::port* GPUPhysicalOperator::get_port(std::string_view port_i
     throw InternalException("GPUPhysicalOperator creator is null in sink_execute for operator " +
                             GetName());
   }
-  creator->update_pipeline_status(this);
+  if (next_port_after_sink.size() > 0) {
+    auto current_pipeline =
+      next_port_after_sink[0].first->get_port(next_port_after_sink[0].second)->src_pipeline;
+    current_pipeline->update_pipeline_status();
+  }
   for (auto& [next_op, port_id] : next_port_after_sink) {
     if (next_op) { creator->process_next_task(next_op); }
   }
