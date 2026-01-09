@@ -54,7 +54,7 @@ inline void initialize_memory_manager()
     // Configure HOST (4GB capacity, 75% reservation ratio)
     const size_t host_capacity = 4ull << 30;  // 4GB
     builder.set_capacity_per_numa_node(host_capacity);
-    builder.set_host_id_to_numa_maps({{0, -1}});
+    builder.use_gpu_ids_as_host();
     builder.set_reservation_limit_ratio_per_numa_node(limit_ratio);
 
     // Build configuration with topology detection
