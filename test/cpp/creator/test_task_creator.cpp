@@ -52,8 +52,8 @@ using sirius::gpu_pipeline_hashmap;
  */
 class mock_gpu_physical_operator : public duckdb::GPUPhysicalOperator {
  public:
-  mock_gpu_physical_operator(duckdb::PhysicalOperatorType op_type =
-                               duckdb::PhysicalOperatorType::PROJECTION)
+  mock_gpu_physical_operator(
+    duckdb::PhysicalOperatorType op_type = duckdb::PhysicalOperatorType::PROJECTION)
     : duckdb::GPUPhysicalOperator(op_type, {}, 0),
       _use_custom_hint(false),
       _custom_hint(std::monostate{})
@@ -135,9 +135,9 @@ class mock_pipeline_builder {
     duckdb::shared_ptr<duckdb::GPUPipeline> src_pipeline,
     duckdb::shared_ptr<duckdb::GPUPipeline> dest_pipeline)
   {
-    auto port         = std::make_unique<duckdb::GPUPhysicalOperator::port>();
-    port->type        = barrier_type;
-    port->repo        = repo;
+    auto port           = std::make_unique<duckdb::GPUPhysicalOperator::port>();
+    port->type          = barrier_type;
+    port->repo          = repo;
     port->src_pipeline  = src_pipeline;
     port->dest_pipeline = dest_pipeline;
     op.add_port(port_id, std::move(port));
@@ -161,11 +161,8 @@ class testable_task_creator : public task_creator {
                         duckdb::ClientContext& client_context,
                         pipeline_executor& pipeline_executor,
                         duckdb_scan_executor& duckdb_scan_executor)
-    : task_creator(num_threads,
-                   gpu_pipeline_map,
-                   client_context,
-                   pipeline_executor,
-                   duckdb_scan_executor)
+    : task_creator(
+        num_threads, gpu_pipeline_map, client_context, pipeline_executor, duckdb_scan_executor)
   {
   }
 
@@ -204,7 +201,10 @@ class testable_task_creator : public task_creator {
   // Expose protected members for testing
   task_creation_queue* get_queue() { return _task_creation_queue.get(); }
 
-  std::queue<duckdb::shared_ptr<duckdb::GPUPipeline>>& get_priority_scans() { return priority_scans; }
+  std::queue<duckdb::shared_ptr<duckdb::GPUPipeline>>& get_priority_scans()
+  {
+    return priority_scans;
+  }
 
   bool is_running() const { return _running.load(); }
 
@@ -268,10 +268,7 @@ TEST_CASE("task_creation_queue open/close lifecycle", "[task_creation_queue]")
 {
   task_creation_queue queue(2);
 
-  SECTION("Queue starts closed")
-  {
-    REQUIRE_FALSE(queue.is_open());
-  }
+  SECTION("Queue starts closed") { REQUIRE_FALSE(queue.is_open()); }
 
   SECTION("Queue can be opened")
   {
@@ -384,16 +381,10 @@ TEST_CASE("task_creator thread pool starts and stops", "[task_creator]")
 {
   test_fixture fixture;
 
-  testable_task_creator creator(2,
-                                fixture.pipeline_map,
-                                *fixture.con.context,
-                                fixture.pipeline_exec,
-                                fixture.scan_exec);
+  testable_task_creator creator(
+    2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, fixture.scan_exec);
 
-  SECTION("Creator starts not running")
-  {
-    REQUIRE_FALSE(creator.is_running());
-  }
+  SECTION("Creator starts not running") { REQUIRE_FALSE(creator.is_running()); }
 
   SECTION("start_thread_pool creates threads")
   {
@@ -425,11 +416,8 @@ TEST_CASE("task_creator thread pool is idempotent", "[task_creator]")
 {
   test_fixture fixture;
 
-  testable_task_creator creator(2,
-                                fixture.pipeline_map,
-                                *fixture.con.context,
-                                fixture.pipeline_exec,
-                                fixture.scan_exec);
+  testable_task_creator creator(
+    2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, fixture.scan_exec);
 
   SECTION("Multiple start_thread_pool calls don't create extra threads")
   {
@@ -469,11 +457,8 @@ TEST_CASE("task_creator destructor stops thread pool", "[task_creator]")
   test_fixture fixture;
 
   {
-    testable_task_creator creator(2,
-                                  fixture.pipeline_map,
-                                  *fixture.con.context,
-                                  fixture.pipeline_exec,
-                                  fixture.scan_exec);
+    testable_task_creator creator(
+      2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, fixture.scan_exec);
     creator.start_thread_pool();
     // Destructor should stop threads
   }
@@ -490,11 +475,8 @@ TEST_CASE("process_next_task with monostate hint and empty priority_scans", "[ta
 {
   test_fixture fixture;
 
-  testable_task_creator creator(2,
-                                fixture.pipeline_map,
-                                *fixture.con.context,
-                                fixture.pipeline_exec,
-                                fixture.scan_exec);
+  testable_task_creator creator(
+    2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, fixture.scan_exec);
 
   // Create a mock operator with no ports (will return monostate)
   auto mock_op = std::make_unique<mock_gpu_physical_operator>();
@@ -520,11 +502,8 @@ TEST_CASE("process_next_task with monostate hint uses priority_scans", "[task_cr
 
   // Create pipelines with the scan as source - this requires integration test setup
   // For unit testing purposes, we verify the code path via the testable interface
-  testable_task_creator creator(2,
-                                fixture.pipeline_map,
-                                *fixture.con.context,
-                                fixture.pipeline_exec,
-                                fixture.scan_exec);
+  testable_task_creator creator(
+    2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, fixture.scan_exec);
 
   // Initially priority_scans should be empty (no TABLE_SCAN sources in empty pipeline map)
   REQUIRE(creator.get_priority_scans().empty());
@@ -541,11 +520,8 @@ TEST_CASE("process_next_task with operator hint schedules the hint node", "[task
 {
   test_fixture fixture;
 
-  testable_task_creator creator(2,
-                                fixture.pipeline_map,
-                                *fixture.con.context,
-                                fixture.pipeline_exec,
-                                fixture.scan_exec);
+  testable_task_creator creator(
+    2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, fixture.scan_exec);
 
   // Create the source operator that we will call process_next_task on
   auto source_op = std::make_unique<mock_gpu_physical_operator>();
@@ -595,11 +571,8 @@ TEST_CASE("process_next_task with pipeline hint recurses to inner operator", "[t
   // behavior indirectly by verifying that the source operator's
   // get_next_task_hint() is called and the scheduling logic follows through.
 
-  testable_task_creator creator(2,
-                                fixture.pipeline_map,
-                                *fixture.con.context,
-                                fixture.pipeline_exec,
-                                fixture.scan_exec);
+  testable_task_creator creator(
+    2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, fixture.scan_exec);
 
   // Create an operator chain: source_op returns a custom hint that is monostate
   // (simulating the end of recursion)
@@ -611,18 +584,12 @@ TEST_CASE("process_next_task with pipeline hint recurses to inner operator", "[t
   REQUIRE(creator.get_schedule_count() == 0);
 
   // Now test with an operator hint that returns itself (simulating ready operator)
-  auto ready_op = std::make_unique<mock_gpu_physical_operator>();
+  auto ready_op  = std::make_unique<mock_gpu_physical_operator>();
   auto data_repo = std::make_unique<cucascade::shared_data_repository>();
 
   // Set up the port so get_port("default") works
   mock_pipeline_builder::setup_operator_with_pipeline_port(
-    *ready_op,
-    "default",
-    duckdb::MemoryBarrierType::PIPELINE,
-    data_repo.get(),
-    nullptr,
-    nullptr
-  );
+    *ready_op, "default", duckdb::MemoryBarrierType::PIPELINE, data_repo.get(), nullptr, nullptr);
 
   // Configure ready_op to return itself as hint (all ports ready)
   ready_op->set_custom_hint(sirius::creator::task_creation_hint(ready_op.get()));
@@ -641,11 +608,8 @@ TEST_CASE("process_next_task operator hint follows dest_pipeline", "[task_creato
 {
   test_fixture fixture;
 
-  testable_task_creator creator(2,
-                                fixture.pipeline_map,
-                                *fixture.con.context,
-                                fixture.pipeline_exec,
-                                fixture.scan_exec);
+  testable_task_creator creator(
+    2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, fixture.scan_exec);
 
   // Create operators
   auto source_op = std::make_unique<mock_gpu_physical_operator>();
@@ -656,13 +620,7 @@ TEST_CASE("process_next_task operator hint follows dest_pipeline", "[task_creato
 
   // Set up target_op with a default port
   mock_pipeline_builder::setup_operator_with_pipeline_port(
-    *target_op,
-    "default",
-    duckdb::MemoryBarrierType::PIPELINE,
-    data_repo.get(),
-    nullptr,
-    nullptr
-  );
+    *target_op, "default", duckdb::MemoryBarrierType::PIPELINE, data_repo.get(), nullptr, nullptr);
 
   // Source returns target as hint
   source_op->set_custom_hint(sirius::creator::task_creation_hint(target_op.get()));
@@ -679,29 +637,20 @@ TEST_CASE("process_next_task hint traversal chain", "[task_creator]")
 {
   test_fixture fixture;
 
-  testable_task_creator creator(2,
-                                fixture.pipeline_map,
-                                *fixture.con.context,
-                                fixture.pipeline_exec,
-                                fixture.scan_exec);
+  testable_task_creator creator(
+    2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, fixture.scan_exec);
 
   // Test a chain where:
   // op1 returns hint pointing to op2
   // op2 will be scheduled
 
-  auto op1 = std::make_unique<mock_gpu_physical_operator>();
-  auto op2 = std::make_unique<mock_gpu_physical_operator>();
+  auto op1       = std::make_unique<mock_gpu_physical_operator>();
+  auto op2       = std::make_unique<mock_gpu_physical_operator>();
   auto data_repo = std::make_unique<cucascade::shared_data_repository>();
 
   // Set up op2 with default port
   mock_pipeline_builder::setup_operator_with_pipeline_port(
-    *op2,
-    "default",
-    duckdb::MemoryBarrierType::PIPELINE,
-    data_repo.get(),
-    nullptr,
-    nullptr
-  );
+    *op2, "default", duckdb::MemoryBarrierType::PIPELINE, data_repo.get(), nullptr, nullptr);
 
   // op1 returns op2 as hint
   op1->set_custom_hint(sirius::creator::task_creation_hint(op2.get()));
@@ -718,11 +667,8 @@ TEST_CASE("task_creator start/stop lifecycle", "[task_creator]")
 {
   test_fixture fixture;
 
-  testable_task_creator creator(2,
-                                fixture.pipeline_map,
-                                *fixture.con.context,
-                                fixture.pipeline_exec,
-                                fixture.scan_exec);
+  testable_task_creator creator(
+    2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, fixture.scan_exec);
 
   SECTION("start() calls start_thread_pool()")
   {
@@ -744,11 +690,8 @@ TEST_CASE("task_creator get_next_task_id increments", "[task_creator]")
 {
   test_fixture fixture;
 
-  testable_task_creator creator(1,
-                                fixture.pipeline_map,
-                                *fixture.con.context,
-                                fixture.pipeline_exec,
-                                fixture.scan_exec);
+  testable_task_creator creator(
+    1, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, fixture.scan_exec);
 
   // The task_id is protected, but we can verify behavior indirectly
   // by checking that the creator can be constructed and used
@@ -763,11 +706,8 @@ TEST_CASE("task_creator queue integration", "[task_creator]")
 {
   test_fixture fixture;
 
-  testable_task_creator creator(2,
-                                fixture.pipeline_map,
-                                *fixture.con.context,
-                                fixture.pipeline_exec,
-                                fixture.scan_exec);
+  testable_task_creator creator(
+    2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, fixture.scan_exec);
 
   SECTION("Queue is accessible")
   {
@@ -815,13 +755,12 @@ TEST_CASE("get_next_task_hint PIPELINE barrier with empty repo returns src_pipel
   // Create a simple mock pipeline to return as src_pipeline hint
   // Since we can't easily create a real GPUPipeline, we'll test the path
   // where src_pipeline is nullptr (returns monostate)
-  mock_pipeline_builder::setup_operator_with_pipeline_port(
-    op,
-    "input",
-    duckdb::MemoryBarrierType::PIPELINE,
-    data_repo.get(),
-    nullptr,  // src_pipeline is nullptr
-    nullptr   // dest_pipeline
+  mock_pipeline_builder::setup_operator_with_pipeline_port(op,
+                                                           "input",
+                                                           duckdb::MemoryBarrierType::PIPELINE,
+                                                           data_repo.get(),
+                                                           nullptr,  // src_pipeline is nullptr
+                                                           nullptr   // dest_pipeline
   );
 
   // repo is empty, src_pipeline is nullptr → should return monostate
@@ -839,13 +778,7 @@ TEST_CASE("get_next_task_hint PIPELINE barrier with data returns this", "[get_ne
   data_repo->add_data_batch(batch);
 
   mock_pipeline_builder::setup_operator_with_pipeline_port(
-    op,
-    "input",
-    duckdb::MemoryBarrierType::PIPELINE,
-    data_repo.get(),
-    nullptr,
-    nullptr
-  );
+    op, "input", duckdb::MemoryBarrierType::PIPELINE, data_repo.get(), nullptr, nullptr);
 
   // repo has data → all ports ready → should return this operator
   auto hint = op.get_next_task_hint();
@@ -865,22 +798,10 @@ TEST_CASE("get_next_task_hint multiple PIPELINE ports all ready returns this",
   data_repo2->add_data_batch(std::make_shared<cucascade::data_batch>(1, nullptr));
 
   mock_pipeline_builder::setup_operator_with_pipeline_port(
-    op,
-    "input1",
-    duckdb::MemoryBarrierType::PIPELINE,
-    data_repo1.get(),
-    nullptr,
-    nullptr
-  );
+    op, "input1", duckdb::MemoryBarrierType::PIPELINE, data_repo1.get(), nullptr, nullptr);
 
   mock_pipeline_builder::setup_operator_with_pipeline_port(
-    op,
-    "input2",
-    duckdb::MemoryBarrierType::PIPELINE,
-    data_repo2.get(),
-    nullptr,
-    nullptr
-  );
+    op, "input2", duckdb::MemoryBarrierType::PIPELINE, data_repo2.get(), nullptr, nullptr);
 
   // Both repos have data → all ports ready → should return this operator
   auto hint = op.get_next_task_hint();
@@ -900,22 +821,14 @@ TEST_CASE("get_next_task_hint multiple PIPELINE ports one empty returns monostat
   // data_repo2 is empty
 
   mock_pipeline_builder::setup_operator_with_pipeline_port(
-    op,
-    "input1",
-    duckdb::MemoryBarrierType::PIPELINE,
-    data_repo1.get(),
-    nullptr,
-    nullptr
-  );
+    op, "input1", duckdb::MemoryBarrierType::PIPELINE, data_repo1.get(), nullptr, nullptr);
 
-  mock_pipeline_builder::setup_operator_with_pipeline_port(
-    op,
-    "input2",
-    duckdb::MemoryBarrierType::PIPELINE,
-    data_repo2.get(),
-    nullptr,  // no src_pipeline
-    nullptr
-  );
+  mock_pipeline_builder::setup_operator_with_pipeline_port(op,
+                                                           "input2",
+                                                           duckdb::MemoryBarrierType::PIPELINE,
+                                                           data_repo2.get(),
+                                                           nullptr,  // no src_pipeline
+                                                           nullptr);
 
   // One repo is empty with no src_pipeline → should return monostate
   auto hint = op.get_next_task_hint();
@@ -980,8 +893,7 @@ TEST_CASE("get_next_task_hint FULL barrier with unfinished pipeline returns src_
     duckdb::MemoryBarrierType::FULL,
     data_repo.get(),
     mock_pipeline,  // src_pipeline is not finished
-    nullptr
-  );
+    nullptr);
 
   // src_pipeline is not finished → should return the src_pipeline
   auto hint = op.get_next_task_hint();
@@ -1006,8 +918,7 @@ TEST_CASE("get_next_task_hint FULL barrier with finished pipeline returns this",
     duckdb::MemoryBarrierType::FULL,
     data_repo.get(),
     mock_pipeline,  // src_pipeline is finished
-    nullptr
-  );
+    nullptr);
 
   // src_pipeline is finished → all ports ready → should return this operator
   auto hint = op.get_next_task_hint();
@@ -1030,22 +941,10 @@ TEST_CASE("get_next_task_hint multiple FULL barriers all finished returns this",
   mock_pipeline2->set_finished(true);
 
   mock_pipeline_builder::setup_operator_with_pipeline_port(
-    op,
-    "input1",
-    duckdb::MemoryBarrierType::FULL,
-    data_repo1.get(),
-    mock_pipeline1,
-    nullptr
-  );
+    op, "input1", duckdb::MemoryBarrierType::FULL, data_repo1.get(), mock_pipeline1, nullptr);
 
   mock_pipeline_builder::setup_operator_with_pipeline_port(
-    op,
-    "input2",
-    duckdb::MemoryBarrierType::FULL,
-    data_repo2.get(),
-    mock_pipeline2,
-    nullptr
-  );
+    op, "input2", duckdb::MemoryBarrierType::FULL, data_repo2.get(), mock_pipeline2, nullptr);
 
   // Both pipelines finished → all ports ready → should return this operator
   auto hint = op.get_next_task_hint();
@@ -1068,22 +967,10 @@ TEST_CASE("get_next_task_hint multiple FULL barriers one unfinished returns src_
   mock_pipeline2->set_finished(false);  // This one is not finished
 
   mock_pipeline_builder::setup_operator_with_pipeline_port(
-    op,
-    "input1",
-    duckdb::MemoryBarrierType::FULL,
-    data_repo1.get(),
-    mock_pipeline1,
-    nullptr
-  );
+    op, "input1", duckdb::MemoryBarrierType::FULL, data_repo1.get(), mock_pipeline1, nullptr);
 
   mock_pipeline_builder::setup_operator_with_pipeline_port(
-    op,
-    "input2",
-    duckdb::MemoryBarrierType::FULL,
-    data_repo2.get(),
-    mock_pipeline2,
-    nullptr
-  );
+    op, "input2", duckdb::MemoryBarrierType::FULL, data_repo2.get(), mock_pipeline2, nullptr);
 
   // One pipeline is not finished → should return that unfinished pipeline
   auto hint = op.get_next_task_hint();
@@ -1107,23 +994,11 @@ TEST_CASE("get_next_task_hint mixed PIPELINE and FULL barriers", "[get_next_task
 
   // PIPELINE barrier with data
   mock_pipeline_builder::setup_operator_with_pipeline_port(
-    op,
-    "pipeline_input",
-    duckdb::MemoryBarrierType::PIPELINE,
-    data_repo1.get(),
-    nullptr,
-    nullptr
-  );
+    op, "pipeline_input", duckdb::MemoryBarrierType::PIPELINE, data_repo1.get(), nullptr, nullptr);
 
   // FULL barrier with finished pipeline
   mock_pipeline_builder::setup_operator_with_pipeline_port(
-    op,
-    "full_input",
-    duckdb::MemoryBarrierType::FULL,
-    data_repo2.get(),
-    mock_pipeline,
-    nullptr
-  );
+    op, "full_input", duckdb::MemoryBarrierType::FULL, data_repo2.get(), mock_pipeline, nullptr);
 
   // Both ports are ready (PIPELINE has data, FULL is finished) → return this
   auto hint = op.get_next_task_hint();
@@ -1147,23 +1022,11 @@ TEST_CASE("get_next_task_hint mixed barriers with FULL unfinished", "[get_next_t
 
   // PIPELINE barrier with data (ready)
   mock_pipeline_builder::setup_operator_with_pipeline_port(
-    op,
-    "pipeline_input",
-    duckdb::MemoryBarrierType::PIPELINE,
-    data_repo1.get(),
-    nullptr,
-    nullptr
-  );
+    op, "pipeline_input", duckdb::MemoryBarrierType::PIPELINE, data_repo1.get(), nullptr, nullptr);
 
   // FULL barrier with unfinished pipeline (not ready)
   mock_pipeline_builder::setup_operator_with_pipeline_port(
-    op,
-    "full_input",
-    duckdb::MemoryBarrierType::FULL,
-    data_repo2.get(),
-    mock_pipeline,
-    nullptr
-  );
+    op, "full_input", duckdb::MemoryBarrierType::FULL, data_repo2.get(), mock_pipeline, nullptr);
 
   // FULL port is not ready → should return the unfinished src_pipeline
   auto hint = op.get_next_task_hint();
@@ -1194,18 +1057,11 @@ TEST_CASE("get_next_task_hint mixed barriers with PIPELINE empty", "[get_next_ta
     duckdb::MemoryBarrierType::PIPELINE,
     data_repo1.get(),
     pipeline_src,  // src_pipeline to return when empty
-    nullptr
-  );
+    nullptr);
 
   // FULL barrier with finished pipeline (ready)
   mock_pipeline_builder::setup_operator_with_pipeline_port(
-    op,
-    "full_input",
-    duckdb::MemoryBarrierType::FULL,
-    data_repo2.get(),
-    full_src,
-    nullptr
-  );
+    op, "full_input", duckdb::MemoryBarrierType::FULL, data_repo2.get(), full_src, nullptr);
 
   // PIPELINE port is empty → should return its src_pipeline
   auto hint = op.get_next_task_hint();
@@ -1221,11 +1077,8 @@ TEST_CASE("task_creator handles concurrent schedule calls", "[task_creator]")
 {
   test_fixture fixture;
 
-  testable_task_creator creator(4,
-                                fixture.pipeline_map,
-                                *fixture.con.context,
-                                fixture.pipeline_exec,
-                                fixture.scan_exec);
+  testable_task_creator creator(
+    4, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, fixture.scan_exec);
 
   const int num_calls = 100;
   std::atomic<int> completed{0};
@@ -1252,4 +1105,3 @@ TEST_CASE("task_creator handles concurrent schedule calls", "[task_creator]")
 
   REQUIRE(completed.load() == num_calls);
 }
-
