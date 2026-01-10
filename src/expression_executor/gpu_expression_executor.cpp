@@ -14,23 +14,39 @@
  * limitations under the License.
  */
 
-#include "expression_executor/gpu_expression_executor.hpp"
+// sirius
+#include <data/data_repository_manager.hpp>
+#include <data/gpu_data_representation.hpp>
+#include <expression_executor/gpu_dispatcher.hpp>
+#include <expression_executor/gpu_expression_executor.hpp>
+#include <expression_executor/gpu_expression_executor_state.hpp>
+#include <gpu_buffer_manager.hpp>
+#include <gpu_columns.hpp>
+#include <operator/gpu_materialize.hpp>
 
-#include "duckdb/common/exception.hpp"
-#include "expression_executor/gpu_dispatcher.hpp"
-#include "expression_executor/gpu_expression_executor_state.hpp"
-#include "gpu_buffer_manager.hpp"
-#include "gpu_columns.hpp"
-#include "operator/gpu_materialize.hpp"
+// duckdb
+#include <duckdb/common/exception.hpp>
 
+// cudf
+#include <cudf/stream_compaction.hpp>
+
+// rmm
 #include <rmm/cuda_stream_view.hpp>
+#include <rmm/resource_ref.hpp>
 
 namespace duckdb {
 namespace sirius {
 
-GpuExpressionExecutor::GpuExpressionExecutor(const Expression& expr) { AddExpression(expr); }
+GpuExpressionExecutor::GpuExpressionExecutor(const Expression& expr,
+                                             rmm::device_async_resource_ref resource_ref)
+  : resource_ref(resource_ref)
+{
+  AddExpression(expr);
+}
 
-GpuExpressionExecutor::GpuExpressionExecutor(const vector<unique_ptr<Expression>>& expressions)
+GpuExpressionExecutor::GpuExpressionExecutor(const vector<unique_ptr<Expression>>& expressions,
+                                             rmm::device_async_resource_ref resource_ref)
+  : resource_ref(resource_ref)
 {
   D_ASSERT(expressions.size() > 0);
 
@@ -201,6 +217,48 @@ void GpuExpressionExecutor::Execute(const GPUIntermediateRelation& input_relatio
   }
 }
 
+std::shared_ptr<cucascade::data_batch> GpuExpressionExecutor::execute(
+  std::shared_ptr<cucascade::data_batch> input_batch,
+  cucascade::data_repository_manager<std::shared_ptr<cucascade::data_batch>>& data_repo_mgr,
+  rmm::cuda_stream_view stream)
+{
+  assert(!expressions.empty());
+
+  use_data_batch_apis = true;
+  execution_stream    = stream;
+  output_columns.clear();
+  output_columns.resize(expressions.size());
+
+  // Retrieve the table_view from the data_batch
+  auto input_data_rep = input_batch->get_data()->cast<cucascade::gpu_table_representation>();
+  input_table         = input_data_rep.get_table().view();
+  input_count         = static_cast<cudf::size_type>(input_table.num_rows());
+
+  for (size_t i = 0; i < expressions.size(); ++i) {
+    // Execute the expression
+    auto const& expr = *expressions[i];
+    auto result      = ExecuteExpression(i);
+
+    // Cast the `result` from libcudf to `return_type` if `result` has a different type.
+    // E.g., `extract(year from col)` from libcudf returns int16_t but duckdb requires int64_t
+    auto cudf_return_type = GpuExpressionState::GetCudfType(expressions[i]->return_type);
+    if (result->type().id() != cudf_return_type.id()) {
+      result = cudf::cast(result->view(), cudf_return_type, execution_stream, resource_ref);
+    }
+
+    output_columns[i] = std::move(result);
+  }
+
+  // Create the data representation
+  std::unique_ptr<cucascade::idata_representation> output_data_rep =
+    std::make_unique<cucascade::gpu_table_representation>(cudf::table(std::move(output_columns)),
+                                                          *input_batch->get_memory_space());
+
+  // Create the data batch and return
+  auto const batch_id = data_repo_mgr.get_next_data_batch_id();
+  return std::make_shared<cucascade::data_batch>(batch_id, std::move(output_data_rep));
+}
+
 void GpuExpressionExecutor::Select(GPUIntermediateRelation& input_relation,
                                    GPUIntermediateRelation& output_relation,
                                    rmm::cuda_stream_view stream)
@@ -233,6 +291,39 @@ void GpuExpressionExecutor::Select(GPUIntermediateRelation& input_relation,
   // Compact
   HandleMaterializeRowIDs(
     input_relation, output_relation, count, row_ids, &GPUBufferManager::GetInstance(), true);
+}
+
+std::shared_ptr<cucascade::data_batch> GpuExpressionExecutor::select(
+  std::shared_ptr<cucascade::data_batch> input_batch,
+  cucascade::data_repository_manager<std::shared_ptr<cucascade::data_batch>>& data_repo_mgr,
+  rmm::cuda_stream_view stream)
+{
+  assert(expressions.size() == 1);
+  assert(expressions[0]->return_type == LogicalType::BOOLEAN);
+
+  use_data_batch_apis = true;
+  execution_stream    = stream;
+  output_columns.clear();
+
+  // Retrieve the table_view from the data_batch
+  auto input_data_rep = input_batch->get_data()->cast<cucascade::gpu_table_representation>();
+  input_table         = input_data_rep.get_table().view();
+  input_count         = static_cast<cudf::size_type>(input_table.num_rows());
+
+  // Get the bitmap
+  auto bitmap = ExecuteExpression(0);
+
+  // Apply the bitmap
+  auto output_table =
+    cudf::apply_boolean_mask(input_table, bitmap->view(), execution_stream, resource_ref);
+  // Create the data representation
+  std::unique_ptr<cucascade::idata_representation> output_data_rep =
+    std::make_unique<cucascade::gpu_table_representation>(*output_table,
+                                                          *input_batch->get_memory_space());
+
+  // Create the data batch and return
+  auto const batch_id = data_repo_mgr.get_next_data_batch_id();
+  return std::make_shared<cucascade::data_batch>(batch_id, std::move(output_data_rep));
 }
 
 std::unique_ptr<cudf::column> GpuExpressionExecutor::ExecuteExpression(idx_t expr_idx)

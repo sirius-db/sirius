@@ -14,10 +14,13 @@
  * limitations under the License.
  */
 
-#include "duckdb/planner/expression/bound_reference_expression.hpp"
-#include "expression_executor/gpu_dispatcher.hpp"
-#include "expression_executor/gpu_expression_executor.hpp"
-#include "operator/gpu_materialize.hpp"
+// sirius
+#include <expression_executor/gpu_dispatcher.hpp>
+#include <expression_executor/gpu_expression_executor.hpp>
+#include <operator/gpu_materialize.hpp>
+
+// duckdb
+#include <duckdb/planner/expression/bound_reference_expression.hpp>
 
 namespace duckdb {
 namespace sirius {
@@ -31,6 +34,12 @@ std::unique_ptr<GpuExpressionState> GpuExpressionExecutor::InitializeState(
 std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundReferenceExpression& expr,
                                                              GpuExpressionState* state)
 {
+  // Check if we are using data_batch APIs
+  if (use_data_batch_apis) {
+    return std::make_unique<cudf::column>(
+      input_table.column(expr.index), execution_stream, resource_ref);
+  }
+
   // Materialize first, if necessary
   auto input_column = input_columns[expr.index];
   if (input_column->row_ids != nullptr) {
