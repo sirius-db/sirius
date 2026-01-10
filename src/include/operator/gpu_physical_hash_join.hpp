@@ -112,6 +112,11 @@ void scanHashTableRight(unsigned long long* ht,
                         int join_mode,
                         int num_keys);
 
+void scanProbeDataLeft(uint8_t *matched, uint64_t N, uint64_t* &row_ids, uint64_t* &count);
+
+template <typename T>
+void probeHashTableLeftSemiAnti(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t N, int* condition_mode, int num_keys);
+
 class GPUPhysicalHashJoin : public GPUPhysicalOperator {
  public:
   static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::HASH_JOIN;
