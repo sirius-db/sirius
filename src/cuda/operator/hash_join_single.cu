@@ -191,7 +191,7 @@ __global__ void probe_single_match(T** keys,
     if (threadIdx.x + ITEM * B < num_tile_items) {
       if (selection_flags[ITEM]) {
         uint64_t offset = block_off + c_t_count++;
-        if (join_mode == 0 || join_mode == 3) {  // inner join and right join
+        if (join_mode == 0 || join_mode == 3 || join_mode == 4) { // inner join and right join and left join) 
           row_ids_right[offset] = items_off[ITEM];
           row_ids_left[offset]  = tile_offset + threadIdx.x + ITEM * B;
         } else if (join_mode == 1 || join_mode == 2) {  // semi join and anti join
