@@ -113,7 +113,7 @@ __global__ void probe_single_match(T** keys,
 
   // int n_ht_column = num_keys + 1;
   int n_ht_column;
-  if (join_mode == 3)
+  if (join_mode == 3 || join_mode == 4)
     n_ht_column = num_keys + 2;
   else
     n_ht_column = num_keys + 1;
