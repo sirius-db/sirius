@@ -313,7 +313,7 @@ void probeHashTableSingleMatch(uint8_t** keys,
   row_ids_left = gpuBufferManager->customCudaMalloc<uint64_t>(N, 0, 0);
   // if (join_mode == 0 || join_mode == 3) row_ids_right =
   // gpuBufferManager->customCudaMalloc<uint64_t>(openmalloc_half, 0, 0);
-  if (join_mode == 0 || join_mode == 3)
+  if (join_mode == 0 || join_mode == 3 || join_mode == 4)
     row_ids_right = gpuBufferManager->customCudaMalloc<uint64_t>(N, 0, 0);
   cudaMemset(count, 0, sizeof(uint64_t));
   probe_single_match<BLOCK_THREADS, ITEMS_PER_THREAD, T>
