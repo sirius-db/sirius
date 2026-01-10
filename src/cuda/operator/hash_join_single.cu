@@ -157,7 +157,7 @@ __global__ void probe_single_match(T** keys,
         }
       } else {
         if (found) {
-          if (join_mode == 3)
+          if (join_mode == 3 || join_mode == 4)
             ht[slot * (num_keys + 2) + num_keys + 1] = tile_offset + threadIdx.x + ITEM * B;
           t_count++;
           selection_flags[ITEM] = 1;
