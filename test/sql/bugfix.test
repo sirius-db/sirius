@@ -1,0 +1,72 @@
+# =============================================================================
+# Copyright 2025, Sirius Contributors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
+# in compliance with the License. You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software distributed under the License
+# is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+# or implied. See the License for the specific language governing permissions and limitations under
+# the License.
+# =============================================================================
+
+# name: test/sql/bugfix.test
+# description: Tests to confirm bugfixes work and that previous bugs are not reintroduced.
+# group: [sirius]
+
+# Load required extensions
+require sirius
+
+# Initialize GPU region
+statement ok
+call gpu_buffer_init("1 GB", "2 GB");
+
+# Tests for Issue #56 (IS NOT DISTINCT)
+# Load data
+statement ok
+DROP TABLE IF EXISTS issue_56;
+
+statement ok
+CREATE TABLE issue_56
+(
+    rowID INTEGER,
+    dataOne VARCHAR(20),
+    dataTwo VARCHAR(20)
+);
+
+statement ok
+INSERT INTO issue_56 VALUES (1, NULL, NULL);
+
+statement ok
+INSERT INTO issue_56 VALUES (2, 'ABC', 'ABC');
+
+statement ok
+INSERT INTO issue_56 VALUES (3, 'ABC', 'DEF');
+
+statement ok
+INSERT INTO issue_56 VALUES (4, 'ABC', NULL);
+
+statement ok
+INSERT INTO issue_56 VALUES (5, NULL, 'ABC');
+
+# Test IS NOT DISTINCT with data
+query I
+call gpu_processing("SELECT rowID FROM issue_56 WHERE dataOne IS NOT DISTINCT FROM dataTwo;");
+----
+1
+2
+
+# Test IS NOT DISTINCT with non-NULL constant
+query I
+call gpu_processing("SELECT rowID FROM issue_56 WHERE 'DEF' IS NOT DISTINCT FROM dataTwo;");
+----
+3
+
+# Test IS NOT DISTINCT with NULL
+query I
+call gpu_processing("SELECT rowID FROM issue_56 WHERE NULL IS NOT DISTINCT FROM dataTwo;");
+----
+1
+4
