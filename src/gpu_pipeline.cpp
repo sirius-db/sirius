@@ -30,6 +30,7 @@
 #include "gpu_executor.hpp"
 #include "gpu_meta_pipeline.hpp"
 #include "log/logging.hpp"
+#include "operator/gpu_physical_table_scan.hpp"
 
 namespace duckdb {
 
@@ -120,7 +121,7 @@ void GPUPipeline::AddDependency(shared_ptr<GPUPipeline>& pipeline)
 // 	}
 // }
 
-vector<reference<GPUPhysicalOperator>> GPUPipeline::GetOperators()
+vector<reference<GPUPhysicalOperator>> GPUPipeline::GetAllOperators()
 {
   vector<reference<GPUPhysicalOperator>> result;
   D_ASSERT(source);
@@ -132,7 +133,7 @@ vector<reference<GPUPhysicalOperator>> GPUPipeline::GetOperators()
   return result;
 }
 
-vector<const_reference<GPUPhysicalOperator>> GPUPipeline::GetOperators() const
+vector<const_reference<GPUPhysicalOperator>> GPUPipeline::GetAllOperators() const
 {
   vector<const_reference<GPUPhysicalOperator>> result;
   D_ASSERT(source);
@@ -141,6 +142,15 @@ vector<const_reference<GPUPhysicalOperator>> GPUPipeline::GetOperators() const
     result.push_back(op.get());
   }
   if (sink) { result.push_back(*sink); }
+  return result;
+}
+
+vector<reference<GPUPhysicalOperator>> GPUPipeline::GetInnerOperators()
+{
+  vector<reference<GPUPhysicalOperator>> result;
+  for (auto& op : operators) {
+    result.push_back(op.get());
+  }
   return result;
 }
 
@@ -230,6 +240,24 @@ vector<reference<GPUPhysicalOperator>> GPUPipelineBuildState::GetPipelineOperato
   GPUPipeline& pipeline)
 {
   return pipeline.operators;
+}
+
+bool GPUPipeline::is_pipeline_finished() { return pipeline_finished; }
+
+void GPUPipeline::update_pipeline_status()
+{
+  if (GetSource()->type == PhysicalOperatorType::TABLE_SCAN) {
+    auto& table_scan = GetSource()->Cast<GPUPhysicalTableScan>();
+    if (!table_scan.exhausted) {
+      pipeline_finished = false;
+      return;
+    }
+    auto& first_node  = operators[0].get();
+    pipeline_finished = first_node.all_ports_empty();
+  } else {
+    auto& first_node  = operators[0].get();
+    pipeline_finished = first_node.is_source_pipeline_finished() && first_node.all_ports_empty();
+  }
 }
 
 }  // namespace duckdb

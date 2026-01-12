@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "data/data_repository_manager.hpp"
 #include "duckdb/common/common.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/pair.hpp"
@@ -74,6 +75,10 @@ class GPUExecutor {
   atomic<idx_t> completed_pipelines;
   //! The total amount of pipelines in the query
   idx_t total_pipelines;
+  //! Inserting repository
+  void insert_repository(std::string_view port_id,
+                         shared_ptr<GPUPipeline> input_pipeline,
+                         shared_ptr<GPUPipeline> dependent_pipeline);
 
   //! Whether or not the root of the pipeline is a result collector object
   bool HasResultCollector();
@@ -84,10 +89,13 @@ class GPUExecutor {
   void Initialize(unique_ptr<GPUPhysicalOperator> physical_plan);
   void InitializeInternal(GPUPhysicalOperator& physical_result_collector);
   void Execute();
+  void execute();
   void Reset();
   shared_ptr<GPUPipeline> CreateChildPipeline(GPUPipeline& current, GPUPhysicalOperator& op);
 
   Executor* executor;
+  vector<shared_ptr<GPUPipeline>> new_scheduled;
+  std::unique_ptr<::cucascade::shared_data_repository_manager> data_repo_manager;
 
   //! Convert the DuckDB physical plan to a GPU physical plan
 };

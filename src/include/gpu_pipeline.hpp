@@ -68,6 +68,7 @@ class GPUPipeline : public enable_shared_from_this<GPUPipeline> {
 
  public:
   explicit GPUPipeline(GPUExecutor& execution_context);
+  virtual ~GPUPipeline() = default;
 
   GPUExecutor& executor;
 
@@ -91,8 +92,11 @@ class GPUPipeline : public enable_shared_from_this<GPUPipeline> {
   // bool GetProgress(double &current_percentage, idx_t &estimated_cardinality);
 
   //! Returns a list of all operators (including source and sink) involved in this pipeline
-  vector<reference<GPUPhysicalOperator>> GetOperators();
-  vector<const_reference<GPUPhysicalOperator>> GetOperators() const;
+  vector<reference<GPUPhysicalOperator>> GetAllOperators();
+  vector<const_reference<GPUPhysicalOperator>> GetAllOperators() const;
+
+  //! Returns a list of all inner operators (excluding source and sink) involved in this pipeline
+  vector<reference<GPUPhysicalOperator>> GetInnerOperators();
 
   optional_ptr<GPUPhysicalOperator> GetSink() { return sink; }
 
@@ -110,6 +114,11 @@ class GPUPipeline : public enable_shared_from_this<GPUPipeline> {
   //! The dependencies of this pipeline
   // vector<weak_ptr<GPUPipeline>> dependencies;
   vector<shared_ptr<GPUPipeline>> dependencies;
+
+  //! Updates the pipeline status
+  void update_pipeline_status();
+  //! Checks if the pipeline has been finished
+  virtual bool is_pipeline_finished();
 
  private:
   //! Whether or not the pipeline has been readied
@@ -144,6 +153,8 @@ class GPUPipeline : public enable_shared_from_this<GPUPipeline> {
   bool LaunchScanTasks(shared_ptr<Event>& event, idx_t max_threads);
 
   bool ScheduleParallel(shared_ptr<Event>& event);
+  //! Whether the pipeline has been finished
+  bool pipeline_finished = false;
 };
 
 }  // namespace duckdb

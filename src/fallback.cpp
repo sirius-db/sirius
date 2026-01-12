@@ -35,7 +35,7 @@ namespace duckdb {
 void FallbackChecker::Check() const
 {
   for (const auto& pipeline : pipelines) {
-    for (const auto& op : pipeline->GetOperators()) {
+    for (const auto& op : pipeline->GetAllOperators()) {
       CheckOperator(op);
     }
   }

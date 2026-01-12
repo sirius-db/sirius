@@ -16,49 +16,204 @@
 
 #include "creator/task_creator.hpp"
 
-namespace sirius {
+#include "pipeline/gpu_pipeline_task.hpp"
+#include "scan/duckdb_scan_task.hpp"
 
-// spawn the internal thread that runs the task creator loop
-void itask_creator::start()
+#include <duckdb/parallel/thread_context.hpp>
+
+namespace sirius::creator {
+
+//------------------------------------------------------------------------------
+// task_creation_queue
+//------------------------------------------------------------------------------
+
+task_creation_queue::task_creation_queue(size_t num_threads) : _num_threads(num_threads) {}
+
+void task_creation_queue::open() { _is_open.store(true, std::memory_order_release); }
+
+void task_creation_queue::close()
+{
+  _is_open.store(false, std::memory_order_release);
+  // Wake up all threads blocked in wait_dequeue by pushing nullptr sentinels
+  for (size_t i = 0; i < _num_threads; ++i) {
+    _queue.enqueue(nullptr);
+  }
+}
+
+void task_creation_queue::push(std::unique_ptr<task_creation_info> info)
+{
+  _queue.enqueue(std::move(info));
+}
+
+std::unique_ptr<task_creation_info> task_creation_queue::pull()
+{
+  std::unique_ptr<task_creation_info> info;
+  while (true) {
+    if (_queue.try_dequeue(info)) { return info; }
+
+    // If the queue is closed and empty, return nullptr to indicate no more tasks.
+    if (!_is_open.load(std::memory_order_acquire)) { return nullptr; }
+
+    // Otherwise, wait for a task to become available.
+    _queue.wait_dequeue(info);
+    if (info) { return info; }
+  }
+}
+
+//------------------------------------------------------------------------------
+// task_creator
+//------------------------------------------------------------------------------
+
+task_creator::task_creator(size_t num_threads,
+                           gpu_pipeline_hashmap& gpu_pipeline_map,
+                           ::duckdb::ClientContext& client_context,
+                           pipeline::pipeline_executor& pipeline_executor,
+                           op::scan::duckdb_scan_executor& duckdb_scan_executor)
+  : _num_threads(num_threads),
+    _running(false),
+    _gpu_pipeline_map(gpu_pipeline_map),
+    _client_context(client_context),
+    _pipeline_executor(pipeline_executor),
+    _duckdb_scan_executor(duckdb_scan_executor)
+{
+  _task_creation_queue = std::make_unique<task_creation_queue>(num_threads);
+  for (size_t i = 0; i < gpu_pipeline_map._vec.size(); ++i) {
+    if (gpu_pipeline_map._vec[i]->GetSource()->type == ::duckdb::PhysicalOperatorType::TABLE_SCAN) {
+      priority_scans.push(gpu_pipeline_map._vec[i]);
+    }
+  }
+}
+
+task_creator::~task_creator() { stop_thread_pool(); }
+
+void task_creator::process_next_task(::duckdb::GPUPhysicalOperator* node)
+{
+  auto hint = node->get_next_task_hint();
+  // printf("Node %p provided hint of type %zu\n", node, hint.index());
+  if (std::holds_alternative<::duckdb::GPUPhysicalOperator*>(hint)) {
+    // printf("Processing next task for hint node %p\n", node);
+    auto* hint_node = std::get<::duckdb::GPUPhysicalOperator*>(hint);
+    auto pipeline   = hint_node->get_port("default")->dest_pipeline;
+    schedule(std::make_unique<task_creation_info>(hint_node, pipeline));
+  } else if (std::holds_alternative<::duckdb::shared_ptr<::duckdb::GPUPipeline>>(hint)) {
+    auto pipeline = std::get<::duckdb::shared_ptr<::duckdb::GPUPipeline>>(hint);
+    process_next_task(&pipeline->GetInnerOperators()[0].get());
+  } else {
+    if (!priority_scans.empty()) {
+      ::duckdb::shared_ptr<::duckdb::GPUPipeline> pipeline = priority_scans.front();
+      auto* scan_node                                      = pipeline->GetSource().get();
+      schedule(std::make_unique<task_creation_info>(scan_node, pipeline));
+      priority_scans.pop();
+    }
+  }
+}
+
+void task_creator::start()
+{
+  start_thread_pool();
+  while (!priority_scans.empty()) {
+    ::duckdb::shared_ptr<::duckdb::GPUPipeline> pipeline = priority_scans.front();
+    auto* scan_node                                      = pipeline->GetSource().get();
+    schedule(std::make_unique<task_creation_info>(scan_node, pipeline));
+    priority_scans.pop();
+  }
+}
+
+void task_creator::stop() { stop_thread_pool(); }
+
+void task_creator::start_thread_pool()
 {
   bool expected = false;
   if (!_running.compare_exchange_strong(expected, true)) { return; }
-  _thread = std::make_unique<parallel::task_executor_thread>(
-    std::make_unique<std::thread>(&itask_creator::worker_loop, this));
+  on_start();
+  _threads.reserve(_num_threads);
+  for (size_t i = 0; i < _num_threads; ++i) {
+    _threads.push_back(std::make_unique<std::thread>(&task_creator::worker_function, this, i));
+  }
 }
 
-void itask_creator::stop()
+void task_creator::stop_thread_pool()
 {
   bool expected = true;
   if (!_running.compare_exchange_strong(expected, false)) { return; }
-  // stop the internal thread
-  if (_thread->_internal_thread && _thread->_internal_thread->joinable()) {
-    _thread->_internal_thread->join();
-    _thread->_internal_thread.reset();
+  on_stop();
+  for (auto& thread : _threads) {
+    if (thread->joinable()) { thread->join(); }
+  }
+  _threads.clear();
+}
+
+void task_creator::schedule(std::unique_ptr<task_creation_info> info)
+{
+  _task_creation_queue->push(std::move(info));
+}
+
+void task_creator::worker_function(int worker_id)
+{
+  while (true) {
+    if (!_running.load()) {
+      // Executor is stopped.
+      break;
+    }
+    std::unique_ptr<task_creation_info> info = _task_creation_queue->pull();
+    if (info == nullptr) {
+      // Task queue is closed.
+      break;
+    }
+    try {
+      // scheduling scan task
+      if (info->_node->type == ::duckdb::PhysicalOperatorType::TABLE_SCAN) {
+        info->_pipeline->GetSource()->set_creator(this);
+        auto scan_task_global_state = std::make_shared<op::scan::duckdb_scan_task_global_state>(
+          info->_pipeline,
+          _duckdb_scan_executor,
+          _client_context,
+          &info->_node->Cast<duckdb::GPUPhysicalTableScan>());
+        duckdb::ThreadContext thread_ctx(_client_context);
+        duckdb::ExecutionContext exec_ctx(_client_context, thread_ctx, nullptr);
+        auto scan_task_local_state = std::make_unique<op::scan::duckdb_scan_task_local_state>(
+          *scan_task_global_state, exec_ctx);
+        if (info->destination_data_repositories.empty()) {
+          throw std::runtime_error(
+            "No destination data repositories provided for scan task creation.");
+        }
+        auto scan_task =
+          std::make_unique<op::scan::duckdb_scan_task>(get_next_task_id(),
+                                                       info->destination_data_repositories[0],
+                                                       std::move(scan_task_local_state),
+                                                       std::move(scan_task_global_state));
+        _duckdb_scan_executor.schedule(std::move(scan_task));
+        // scheduling pipeline task
+      } else {
+        ::duckdb::reference<::duckdb::GPUPhysicalOperator> node =
+          info->_pipeline->GetInnerOperators()[0];
+        info->_pipeline->GetSink()->set_creator(this);
+        // need to exhaust input batches until all ports are empty
+        while (!node.get().all_ports_empty()) {
+          auto input_batch = node.get().get_input_batch();
+          auto global_state =
+            std::make_shared<pipeline::gpu_pipeline_task_global_state>(info->_pipeline);
+          auto local_state =
+            std::make_unique<pipeline::gpu_pipeline_task_local_state>(input_batch, nullptr);
+          auto task =
+            std::make_unique<pipeline::gpu_pipeline_task>(get_next_task_id(),
+                                                          info->destination_data_repositories,
+                                                          std::move(local_state),
+                                                          std::move(global_state));
+          _pipeline_executor.schedule(std::move(task));
+        }
+      }
+
+    } catch (const std::exception& e) {
+      stop();
+    }
   }
 }
 
-void itask_creator::worker_loop()
-{
-  // Default implementation does nothing
-}
+void task_creator::on_start() { _task_creation_queue->open(); }
 
-void itask_creator::signal()
-{
-  {
-    std::lock_guard<std::mutex> lock(_mtx);
-    _ready = true;
-  }
-  _cv.notify_one();
-}
+void task_creator::on_stop() { _task_creation_queue->close(); }
 
-void itask_creator::wait()
-{
-  std::unique_lock<std::mutex> lock(_mtx);
-  _cv.wait(lock, [this] { return _ready; });
-  _ready = false;
-}
+uint64_t task_creator::get_next_task_id() { return _task_id.fetch_add(1); }
 
-uint64_t itask_creator::get_next_task_id() { return _next_task_id++; }
-
-}  // namespace sirius
+}  // namespace sirius::creator
