@@ -834,6 +834,26 @@ shared_ptr<GPUPipeline> GPUExecutor::CreateChildPipeline(GPUPipeline& current,
   return child_pipeline;
 }
 
+shared_ptr<::sirius::pipeline::sirius_pipeline> GPUExecutor::create_child_pipeline(::sirius::pipeline::sirius_pipeline& current,
+                                                         ::sirius::op::sirius_physical_operator& op)
+{
+  D_ASSERT(!current.operators.empty());
+  D_ASSERT(op.is_source());
+  // found another operator that is a source, schedule a child pipeline
+  // 'op' is the source, and the sink is the same
+  auto child_pipeline    = make_shared_ptr<sirius::pipeline::sirius_pipeline>(*this);
+  child_pipeline->sink   = current.sink;
+  child_pipeline->source = &op;
+
+  // the child pipeline has the same operators up until 'op'
+  for (auto current_op : current.operators) {
+    if (&current_op.get() == &op) { break; }
+    child_pipeline->operators.push_back(current_op);
+  }
+
+  return child_pipeline;
+}
+
 bool GPUExecutor::HasResultCollector()
 {
   return gpu_physical_plan->type == PhysicalOperatorType::RESULT_COLLECTOR;
