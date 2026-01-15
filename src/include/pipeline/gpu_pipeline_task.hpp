@@ -24,6 +24,7 @@
 #include <data/data_batch.hpp>
 #include <data/data_repository.hpp>
 #include <data/data_repository_manager.hpp>
+#include <memory/memory_reservation.hpp>
 
 #include <cstdint>
 #include <memory>
@@ -84,6 +85,8 @@ class gpu_pipeline_task_local_state : public sirius::parallel::itask_local_state
   {
     _reservation = std::move(res);
   }
+
+  const cucascade::memory::reservation* get_reservation() const { return _reservation.get(); }
 
  private:
   std::unique_ptr<cucascade::memory::reservation>

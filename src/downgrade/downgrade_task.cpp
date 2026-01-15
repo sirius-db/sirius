@@ -77,7 +77,7 @@ void downgrade_task::execute()
 
   } catch (const rmm::out_of_memory& e) {
     batch->try_to_release_in_transit();
-    throw std::runtime_error("Failed to allocate host memory for downgrade");
+    throw;
   } catch (...) {
     batch->try_to_release_in_transit();
     throw;
