@@ -16,9 +16,9 @@
 
 #pragma once
 
-#include "gpu_pipeline.hpp"
-#include "gpu_physical_projection.hpp"
 #include "duckdb/common/exception.hpp"
+#include "gpu_physical_projection.hpp"
+#include "gpu_pipeline.hpp"
 
 #include <string>
 
@@ -28,13 +28,15 @@ namespace duckdb {
  * Use to check if we need to fall back a query to duckdb execution.
  */
 class FallbackChecker {
-public:
+ public:
   explicit FallbackChecker(const vector<shared_ptr<GPUPipeline>> pipelines_p)
-    : pipelines(pipelines_p) {}
-  
+    : pipelines(pipelines_p)
+  {
+  }
+
   void Check() const;
 
-private:
+ private:
   void CheckOperator(const GPUPhysicalOperator& op) const;
   void CheckOperator(const GPUPhysicalProjection& op) const;
 
@@ -50,4 +52,4 @@ private:
   vector<shared_ptr<GPUPipeline>> pipelines;
 };
 
-}
+}  // namespace duckdb

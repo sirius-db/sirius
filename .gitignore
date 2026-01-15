@@ -14,6 +14,7 @@ tpch-data/dbgen
 duckdb/*
 CMakeFiles/
 CMakeCache.txt
+cmake_install.cmake
 dbgen/
 test_datasets/tpch-dbgen/
 test_datasets/tpch-mod-dbgen/
@@ -24,3 +25,7 @@ cufile.log
 *result.csv
 *output.txt
 *.tsv
+# pixi environments
+.pixi/*
+!.pixi/config.toml
+compile_commands.json

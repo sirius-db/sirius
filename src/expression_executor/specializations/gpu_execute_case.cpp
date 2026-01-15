@@ -19,25 +19,22 @@
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "expression_executor/gpu_expression_executor.hpp"
 #include "expression_executor/gpu_expression_executor_state.hpp"
+
 #include <cudf/copying.hpp>
 #include <cudf/reduction.hpp>
 
-namespace duckdb
-{
-namespace sirius
-{
+namespace duckdb {
+namespace sirius {
 
 // We need to handle implicit error checks inserted as CASE statements by DuckDB
 #define ERROR_FUNC_STR "error"
 
-std::unique_ptr<GpuExpressionState>
-GpuExpressionExecutor::InitializeState(const BoundCaseExpression& expr,
-                                       GpuExpressionExecutorState& root)
+std::unique_ptr<GpuExpressionState> GpuExpressionExecutor::InitializeState(
+  const BoundCaseExpression& expr, GpuExpressionExecutorState& root)
 {
   // auto result = make_uniq<GpuCaseExpressionState>(expr, root);
   auto result = std::make_unique<GpuExpressionState>(expr, root);
-  for (auto& case_check : expr.case_checks)
-  {
+  for (auto& case_check : expr.case_checks) {
     result->AddChild(*case_check.when_expr);
     result->AddChild(*case_check.then_expr);
   }
@@ -66,9 +63,8 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundCaseExpr
 
   // Loop backwards, so that the THEN of the first true WHEN is copied to the output column
   auto num_checks = static_cast<int32_t>(
-    expr.case_checks.size()); // This is sane, and needed for the descending loop index
-  for (int32_t i = num_checks - 1; i >= 0; --i)
-  {
+    expr.case_checks.size());  // This is sane, and needed for the descending loop index
+  for (int32_t i = num_checks - 1; i >= 0; --i) {
     auto& case_check  = expr.case_checks[i];
     auto* check_state = state->child_states[2 * i].get();
     auto* then_state  = state->child_states[2 * i + 1].get();
@@ -78,19 +74,18 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundCaseExpr
 
     // Check for error functions
     if (case_check.then_expr->GetExpressionClass() == ExpressionClass::BOUND_FUNCTION &&
-        case_check.then_expr->Cast<BoundFunctionExpression>().function.name == ERROR_FUNC_STR)
-    {
+        case_check.then_expr->Cast<BoundFunctionExpression>().function.name == ERROR_FUNC_STR) {
       // If the THEN is true anywhere, throw error()
       auto any_result = cudf::reduce(current_mask->view(),
                                      *cudf::make_any_aggregation<cudf::reduce_aggregation>(),
                                      cudf::data_type(cudf::type_id::BOOL8),
                                      execution_stream,
                                      resource_ref);
-      if (static_cast<cudf::scalar_type_t<bool>*>(any_result.get())->value())
-      {
+      if (static_cast<cudf::scalar_type_t<bool>*>(any_result.get())->value()) {
         // Assume that this arises for the stated error
-        throw InternalException("Execute[Case]: More than one row returned by a subquery used as "
-                                "an expression.");
+        throw InternalException(
+          "Execute[Case]: More than one row returned by a subquery used as "
+          "an expression.");
       }
       continue;
     }
@@ -106,5 +101,5 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundCaseExpr
   return std::move(current_output);
 }
 
-} // namespace sirius
-} // namespace duckdb
+}  // namespace sirius
+}  // namespace duckdb

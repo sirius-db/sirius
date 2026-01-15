@@ -17,23 +17,22 @@
 #include "duckdb/common/exception.hpp"
 #include "expression_executor/gpu_dispatcher.hpp"
 #include "gpu_columns.hpp"
+
 #include <rmm/device_uvector.hpp>
+
 #include <thrust/for_each.h>
 #include <thrust/gather.h>
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/scan.h>
 #include <thrust/transform.h>
 
-namespace duckdb
-{
-namespace sirius
-{
+namespace duckdb {
+namespace sirius {
 
 // Helper (template) functors to reduce bloat
 //----------Numerics----------//
 template <typename T>
-struct MaterializeNumeric
-{
+struct MaterializeNumeric {
   static std::unique_ptr<cudf::column> Do(const T* input_data,
                                           const uint64_t* row_ids,
                                           uint64_t row_id_count,
@@ -51,16 +50,14 @@ struct MaterializeNumeric
     thrust::gather(exec, row_ids, row_ids + row_id_count, input_data, output_data.begin());
 
     // Construct and return a cudf::column
-    return std::make_unique<cudf::column>(std::move(output_data),
-                                          rmm::device_buffer(0, stream, mr),
-                                          0);
+    return std::make_unique<cudf::column>(
+      std::move(output_data), rmm::device_buffer(0, stream, mr), 0);
   }
 };
 
 //----------Decimals----------//
 template <typename T>
-struct MaterializeDecimal
-{
+struct MaterializeDecimal {
   static std::unique_ptr<cudf::column> Do(const T* input_data,
                                           const uint64_t* row_ids,
                                           uint64_t row_id_count,
@@ -88,18 +85,14 @@ struct MaterializeDecimal
 };
 
 //----------Strings----------//
-struct MaterializeString
-{
+struct MaterializeString {
   // Functor for calculating the string lengths
-  struct GatherLengths
-  {
+  struct GatherLengths {
     // Fields
     const uint64_t* input_offsets;
 
     // Constructor
-    explicit GatherLengths(const uint64_t* input_offset)
-        : input_offsets(input_offset)
-    {}
+    explicit GatherLengths(const uint64_t* input_offset) : input_offsets(input_offset) {}
 
     // Operator
     __device__ __forceinline__ int64_t operator()(uint64_t row_id) const
@@ -109,8 +102,7 @@ struct MaterializeString
   };
 
   // Functor for copying string data
-  struct CopyData
-  {
+  struct CopyData {
     // Fields
     const uint64_t* row_ids;
     const uint64_t* input_offsets;
@@ -124,12 +116,13 @@ struct MaterializeString
              const uint8_t* input_data,
              int64_t* output_offsets,
              uint8_t* output_data)
-        : row_ids(row_ids)
-        , input_offsets(input_offsets)
-        , input_data(input_data)
-        , output_offsets(output_offsets)
-        , output_data(output_data)
-    {}
+      : row_ids(row_ids),
+        input_offsets(input_offsets),
+        input_data(input_data),
+        output_offsets(output_offsets),
+        output_data(output_data)
+    {
+    }
 
     // Operator
     __device__ __forceinline__ void operator()(cudf::size_type output_idx)
@@ -151,7 +144,7 @@ struct MaterializeString
                                           rmm::device_async_resource_ref mr,
                                           rmm::cuda_stream_view stream = rmm::cuda_stream_default)
   {
-    static_assert(std::is_same_v<int32_t, cudf::size_type>); // Sanity check
+    static_assert(std::is_same_v<int32_t, cudf::size_type>);  // Sanity check
 
     // Define the thrust execution policy
     rmm::mr::thrust_allocator<uint8_t> thrust_allocator(stream, mr);
@@ -162,7 +155,8 @@ struct MaterializeString
     rmm::device_uvector<int64_t> temp_string_lengths(offset_count, stream, mr);
     rmm::device_uvector<int64_t> output_offsets(offset_count, stream, mr);
     // Set the last string length to 0, so that the exclusive scan places the total sum at the end
-    CUDF_CUDA_TRY(cudaMemsetAsync(temp_string_lengths.data() + row_id_count, 0, sizeof(int64_t), stream));
+    CUDF_CUDA_TRY(
+      cudaMemsetAsync(temp_string_lengths.data() + row_id_count, 0, sizeof(int64_t), stream));
 
     // Gather the string lengths
     thrust::transform(exec,
@@ -212,10 +206,9 @@ std::unique_ptr<cudf::column> GpuDispatcher::DispatchMaterialize(const GPUColumn
   D_ASSERT(input->row_ids->size() > 0);
 
   const auto* input_data    = input->data_wrapper.data;
-  const auto* input_offsets = input->data_wrapper.offset; // Maybe unused
+  const auto* input_offsets = input->data_wrapper.offset;  // Maybe unused
 
-  switch (input->data_wrapper.type.id())
-  {
+  switch (input->data_wrapper.type.id()) {
     case GPUColumnTypeId::INT32:
       return MaterializeNumeric<int32_t>::Do(reinterpret_cast<const int32_t*>(input_data),
                                              input->row_ids,
@@ -241,11 +234,8 @@ std::unique_ptr<cudf::column> GpuDispatcher::DispatchMaterialize(const GPUColumn
                                               mr,
                                               stream);
     case GPUColumnTypeId::BOOLEAN:
-      return MaterializeNumeric<bool>::Do(reinterpret_cast<const bool*>(input_data),
-                                          input->row_ids,
-                                          input->row_id_count,
-                                          mr,
-                                          stream);
+      return MaterializeNumeric<bool>::Do(
+        reinterpret_cast<const bool*>(input_data), input->row_ids, input->row_id_count, mr, stream);
     case GPUColumnTypeId::DATE:
       return MaterializeNumeric<cudf::timestamp_D>::Do(
         reinterpret_cast<const cudf::timestamp_D*>(input_data),
@@ -254,12 +244,8 @@ std::unique_ptr<cudf::column> GpuDispatcher::DispatchMaterialize(const GPUColumn
         mr,
         stream);
     case GPUColumnTypeId::VARCHAR:
-      return MaterializeString::Do(input_data,
-                                   input_offsets,
-                                   input->row_ids,
-                                   input->row_id_count,
-                                   mr,
-                                   stream);
+      return MaterializeString::Do(
+        input_data, input_offsets, input->row_ids, input->row_id_count, mr, stream);
     case GPUColumnTypeId::DECIMAL: {
       switch (input->data_wrapper.getColumnTypeSize()) {
         case sizeof(int32_t): {
@@ -284,8 +270,9 @@ std::unique_ptr<cudf::column> GpuDispatcher::DispatchMaterialize(const GPUColumn
                                                  stream);
         }
         default:
-          throw NotImplementedException("Unsupported sirius DECIMAL column type size in `Dispatch[Materialize]`: %zu",
-                                        input->data_wrapper.getColumnTypeSize());
+          throw NotImplementedException(
+            "Unsupported sirius DECIMAL column type size in `Dispatch[Materialize]`: %zu",
+            input->data_wrapper.getColumnTypeSize());
       }
     }
     default:
@@ -294,5 +281,5 @@ std::unique_ptr<cudf::column> GpuDispatcher::DispatchMaterialize(const GPUColumn
   }
 }
 
-} // namespace sirius
-} // namespace duckdb
+}  // namespace sirius
+}  // namespace duckdb

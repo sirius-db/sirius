@@ -5,7 +5,7 @@ The root makefile contains targets to build and run all of these tests. To run t
 ```bash
 make test
 ```
-or 
+or
 ```bash
 make test_debug
 ```

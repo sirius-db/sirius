@@ -20,16 +20,20 @@
 
 namespace duckdb {
 
-unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::CreatePlan(LogicalTopN &op) {
-	D_ASSERT(op.children.size() == 1);
+unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::CreatePlan(LogicalTopN& op)
+{
+  D_ASSERT(op.children.size() == 1);
 
-	auto plan = CreatePlan(*op.children[0]);
+  auto plan = CreatePlan(*op.children[0]);
 
-	auto top_n =
-	    make_uniq<GPUPhysicalTopN>(op.types, std::move(op.orders), NumericCast<idx_t>(op.limit),
-	                            NumericCast<idx_t>(op.offset), std::move(op.dynamic_filter), op.estimated_cardinality);
-	top_n->children.push_back(std::move(plan));
-	return std::move(top_n);
+  auto top_n = make_uniq<GPUPhysicalTopN>(op.types,
+                                          std::move(op.orders),
+                                          NumericCast<idx_t>(op.limit),
+                                          NumericCast<idx_t>(op.offset),
+                                          std::move(op.dynamic_filter),
+                                          op.estimated_cardinality);
+  top_n->children.push_back(std::move(plan));
+  return std::move(top_n);
 }
 
-} // namespace duckdb
+}  // namespace duckdb

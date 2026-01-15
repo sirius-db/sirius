@@ -16,29 +16,31 @@
 
 #pragma once
 
-#include <iostream>
-#include <cuda_runtime.h>
-#include <cuda.h>
-#include <curand.h>
-#include <cub/cub.cuh>
-#include <cuda/atomic>
-#include <thrust/sort.h>
-#include <thrust/reduce.h>
-#include <float.h>
-#include <thrust/device_vector.h>
-#include <chrono>
-#include <stdexcept>
-#include <assert.h>
-#include <limits>
 #include "gpu_buffer_manager.hpp"
 #include "log/logging.hpp"
 
-#include <iostream> 
-#include <string> 
+#include <cub/cub.cuh>
+#include <cuda.h>
+#include <cuda/atomic>
+#include <cuda_runtime.h>
+#include <thrust/device_vector.h>
+#include <thrust/reduce.h>
+#include <thrust/sort.h>
+
+#include <assert.h>
+#include <curand.h>
+#include <float.h>
+
+#include <chrono>
+#include <iostream>
+#include <limits>
 #include <sstream>
+#include <stdexcept>
+#include <string>
 
 #define CUB_STDERR
 
+// clang-format off
 // FIXME: handle error message from kernel to log file
 #define cudaAssert( X ) { \
     if ( !(X) ) { \
@@ -76,206 +78,222 @@
 }
 
 #define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
-inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true)
+
+// clang-format on
+
+inline void gpuAssert(cudaError_t code, const char* file, int line, bool abort = true)
 {
-   if (code != cudaSuccess) 
-   {
-      SIRIUS_LOG_ERROR("GPUassert: {} {} {}\n", cudaGetErrorString(code), file, line);
-      if (abort) exit(code);
-   }
+  if (code != cudaSuccess) {
+    SIRIUS_LOG_ERROR("GPUassert: {} {} {}\n", cudaGetErrorString(code), file, line);
+    if (abort) exit(code);
+  }
 }
 
-#define SETUP_TIMING() cudaEvent_t start, stop; cudaEventCreate(&start); cudaEventCreate(&stop);
+#define SETUP_TIMING()     \
+  cudaEvent_t start, stop; \
+  cudaEventCreate(&start); \
+  cudaEventCreate(&stop);
 
-#define TIME_FUNC(f,t) { \
-    cudaEventRecord(start, 0); \
-    f; \
-    cudaEventRecord(stop, 0); \
-    cudaEventSynchronize(stop); \
-    cudaEventElapsedTime(&t, start,stop); \
-}
+#define TIME_FUNC(f, t)                    \
+  {                                        \
+    cudaEventRecord(start, 0);             \
+    f;                                     \
+    cudaEventRecord(stop, 0);              \
+    cudaEventSynchronize(stop);            \
+    cudaEventElapsedTime(&t, start, stop); \
+  }
 
-#define CLEANUP(vec) if(vec)CubDebugExit(g_allocator.DeviceFree(vec))
+#define CLEANUP(vec) \
+  if (vec) CubDebugExit(g_allocator.DeviceFree(vec))
 
-#define ALLOCATE(vec,size) CubDebugExit(g_allocator.DeviceAllocate((void**)&vec, size))
+#define ALLOCATE(vec, size) CubDebugExit(g_allocator.DeviceAllocate((void**)&vec, size))
 
-#define START_TIMER() { \
-    cudaEventRecord(start, 0); \
+#define START_TIMER()            \
+  {                              \
+    cudaEventRecord(start, 0);   \
     cudaEventSynchronize(start); \
-}
+  }
 
 #define STOP_TIMER() RECORD_TIMER("Elapsed time op")
 
-#define RECORD_TIMER(timer_name) { \
-    cudaEventRecord(stop, 0); \
-    cudaEventSynchronize(stop); \
-    float elapsedTime = 0; \
-    cudaEventElapsedTime(&elapsedTime, start, stop); \
+#define RECORD_TIMER(timer_name)                          \
+  {                                                       \
+    cudaEventRecord(stop, 0);                             \
+    cudaEventSynchronize(stop);                           \
+    float elapsedTime = 0;                                \
+    cudaEventElapsedTime(&elapsedTime, start, stop);      \
     SIRIUS_LOG_DEBUG("{} : {}", timer_name, elapsedTime); \
-}
+  }
 
-#define BLOCK_THREADS 128
-#define ITEMS_PER_THREAD 4 
+#define BLOCK_THREADS    128
+#define ITEMS_PER_THREAD 4
 // #define TILE_SIZE (BLOCK_THREADS * ITEMS_PER_THREAD)
 
 template <int B, int I>
-__global__ void compact_valid_rows(bool* selection_flags, uint64_t* row_ids, unsigned long long* count, uint64_t N, int is_count, int not_equal) {
+__global__ void compact_valid_rows(bool* selection_flags,
+                                   uint64_t* row_ids,
+                                   unsigned long long* count,
+                                   uint64_t N,
+                                   int is_count,
+                                   int not_equal)
+{
+  typedef cub::BlockScan<int, B> BlockScanInt;
 
-    typedef cub::BlockScan<int, B> BlockScanInt;
+  __shared__ union TempStorage {
+    typename BlockScanInt::TempStorage scan;
+  } temp_storage;
 
-    __shared__ union TempStorage
-    {
-        typename BlockScanInt::TempStorage scan;
-    } temp_storage;
+  uint64_t tile_size   = B * I;
+  uint64_t tile_offset = blockIdx.x * tile_size;
 
-    uint64_t tile_size = B * I;
-    uint64_t tile_offset = blockIdx.x * tile_size;
+  uint64_t num_tiles      = (N + tile_size - 1) / tile_size;
+  uint64_t num_tile_items = tile_size;
 
-    uint64_t num_tiles = (N + tile_size - 1) / tile_size;
-    uint64_t num_tile_items = tile_size;
+  int t_count   = 0;  // Number of items selected per thread
+  int c_t_count = 0;  // Prefix sum of t_count
+  __shared__ uint64_t block_off;
 
-    int t_count = 0; // Number of items selected per thread
-    int c_t_count = 0; //Prefix sum of t_count
-    __shared__ uint64_t block_off;
+  if (blockIdx.x == num_tiles - 1) { num_tile_items = N - tile_offset; }
 
-    if (blockIdx.x == num_tiles - 1) {
-        num_tile_items = N - tile_offset;
+#pragma unroll
+  for (int ITEM = 0; ITEM < I; ++ITEM) {
+    if (threadIdx.x + ITEM * B < num_tile_items) {
+      bool is_selected = selection_flags[tile_offset + threadIdx.x + ITEM * B];
+      if (not_equal) {
+        if (!is_selected) t_count++;
+      } else {
+        if (is_selected) t_count++;
+      }
     }
+  }
 
-    #pragma unroll
-    for (int ITEM = 0; ITEM < I; ++ITEM) {
-        if (threadIdx.x + ITEM * B < num_tile_items) {
-            bool is_selected = selection_flags[tile_offset + threadIdx.x + ITEM * B];
-            if (not_equal) {
-              if(!is_selected) t_count++;
-            } else {
-              if(is_selected) t_count++;
-            }
+  // Barrier
+  __syncthreads();
+
+  BlockScanInt(temp_storage.scan)
+    .ExclusiveSum(t_count, c_t_count);  // doing a prefix sum of all the previous threads in the
+                                        // block and store it to c_t_count
+  if (threadIdx.x ==
+      blockDim.x - 1) {  // if the last thread in the block, add the prefix sum of all the prev
+                         // threads + sum of my threads to global variable total
+    block_off =
+      atomicAdd(count,
+                (unsigned long long)t_count +
+                  c_t_count);  // the previous value of total is gonna be assigned to block_off
+  }  // block_off does not need to be global (it's just need to be shared), because it will get the
+     // previous value from total which is global
+
+  __syncthreads();
+
+  if (is_count) return;
+
+#pragma unroll
+  for (int ITEM = 0; ITEM < I; ++ITEM) {
+    if (threadIdx.x + ITEM * B < num_tile_items) {
+      bool is_selected = selection_flags[tile_offset + threadIdx.x + ITEM * B];
+      if (not_equal) {
+        if (!is_selected) {
+          uint64_t offset = block_off + c_t_count++;
+          row_ids[offset] = tile_offset + threadIdx.x + ITEM * B;
         }
-    }
-
-    //Barrier
-    __syncthreads();
-
-    BlockScanInt(temp_storage.scan).ExclusiveSum(t_count, c_t_count); //doing a prefix sum of all the previous threads in the block and store it to c_t_count
-    if(threadIdx.x == blockDim.x - 1) { //if the last thread in the block, add the prefix sum of all the prev threads + sum of my threads to global variable total
-        block_off = atomicAdd(count, (unsigned long long) t_count+c_t_count); //the previous value of total is gonna be assigned to block_off
-    } //block_off does not need to be global (it's just need to be shared), because it will get the previous value from total which is global
-
-    __syncthreads();
-
-    if (is_count) return;
-
-    #pragma unroll
-    for (int ITEM = 0; ITEM < I; ++ITEM) {
-        if (threadIdx.x + ITEM * B < num_tile_items) {
-            bool is_selected = selection_flags[tile_offset + threadIdx.x + ITEM * B];
-            if (not_equal) {
-              if(!is_selected) {
-                uint64_t offset = block_off + c_t_count++;
-                row_ids[offset] = tile_offset + threadIdx.x + ITEM * B;
-              }
-            } else {
-              if(is_selected) {
-                uint64_t offset = block_off + c_t_count++;
-                row_ids[offset] = tile_offset + threadIdx.x + ITEM * B;
-              }
-            }
+      } else {
+        if (is_selected) {
+          uint64_t offset = block_off + c_t_count++;
+          row_ids[offset] = tile_offset + threadIdx.x + ITEM * B;
         }
+      }
     }
+  }
 }
 
-template<typename T, int B, int I>
-__device__ __forceinline__ T BlockReduce(
-    T  item,
-    T* shared,
-    int op_mode
-    ) {
-    __syncthreads();
+template <typename T, int B, int I>
+__device__ __forceinline__ T BlockReduce(T item, T* shared, int op_mode)
+{
+  __syncthreads();
 
-    T val = item;
-    const int warp_size = 32;
-    int lane = threadIdx.x % warp_size;
-    int wid = threadIdx.x / warp_size;
+  T val               = item;
+  const int warp_size = 32;
+  int lane            = threadIdx.x % warp_size;
+  int wid             = threadIdx.x / warp_size;
 
-    // Calculate sum across warp
+  // Calculate sum across warp
+  for (int offset = 16; offset > 0; offset /= 2) {
+    if (op_mode == 0 || op_mode == 1) {  // sum or avg
+      val += __shfl_down_sync(0xffffffff, val, offset);
+    } else if (op_mode == 2) {  // max
+      val = max(val, __shfl_down_sync(0xffffffff, val, offset));
+    } else if (op_mode == 3) {  // min
+      val = min(val, __shfl_down_sync(0xffffffff, val, offset));
+    }
+  }
+
+  // Store sum in buffer
+  if (lane == 0) { shared[wid] = val; }
+
+  __syncthreads();
+
+  // Load the sums into the first warp
+  if (op_mode == 0 || op_mode == 1) {  // sum or avg
+    val = (threadIdx.x < blockDim.x / warp_size) ? shared[lane] : 0;
+  } else if (op_mode == 2) {  // max
+    val = (threadIdx.x < blockDim.x / warp_size) ? shared[lane] : shared[0];
+  } else if (op_mode == 3) {  // min
+    val = (threadIdx.x < blockDim.x / warp_size) ? shared[lane] : shared[0];
+  }
+
+  // Calculate sum of sums
+  if (wid == 0) {
     for (int offset = 16; offset > 0; offset /= 2) {
-        if (op_mode == 0 || op_mode == 1) { //sum or avg
-            val += __shfl_down_sync(0xffffffff, val, offset);
-        } else if (op_mode == 2) { //max
-            val = max(val, __shfl_down_sync(0xffffffff, val, offset));
-        } else if (op_mode == 3) { //min
-            val = min(val, __shfl_down_sync(0xffffffff, val, offset));
-        }
+      if (op_mode == 0 || op_mode == 1) {  // sum or avg
+        val += __shfl_down_sync(0xffffffff, val, offset);
+      } else if (op_mode == 2) {  // max
+        val = max(val, __shfl_down_sync(0xffffffff, val, offset));
+      } else if (op_mode == 3) {  // min
+        val = min(val, __shfl_down_sync(0xffffffff, val, offset));
+      }
     }
-
-    // Store sum in buffer
-    if (lane == 0) {
-        shared[wid] = val;
-    }
-
-    __syncthreads();
-
-    // Load the sums into the first warp
-    if (op_mode == 0 || op_mode == 1) { //sum or avg
-        val = (threadIdx.x < blockDim.x / warp_size) ? shared[lane] : 0;
-    } else if (op_mode == 2) { //max
-        val = (threadIdx.x < blockDim.x / warp_size) ? shared[lane] : shared[0];
-    } else if (op_mode == 3) { //min
-        val = (threadIdx.x < blockDim.x / warp_size) ? shared[lane] : shared[0];
-    }
-
-    // Calculate sum of sums
-    if (wid == 0) {
-        for (int offset = 16; offset > 0; offset /= 2) {
-            if (op_mode == 0 || op_mode == 1) { //sum or avg
-                val += __shfl_down_sync(0xffffffff, val, offset);
-            } else if (op_mode == 2) { //max
-                val = max(val, __shfl_down_sync(0xffffffff, val, offset));
-            } else if (op_mode == 3) { //min
-                val = min(val, __shfl_down_sync(0xffffffff, val, offset));
-            }
-        }
-    }
+  }
 
   return val;
 }
 
 // Simple hash function for integers
-inline __device__ __host__ uint64_t custom_hash_int(uint64_t key) {
-    key ^= (key >> 21);
-    key ^= (key << 37);
-    key ^= (key >> 4);
-    key *= 2685821657736338717ULL;
-    return key;
+inline __device__ __host__ uint64_t custom_hash_int(uint64_t key)
+{
+  key ^= (key >> 21);
+  key ^= (key << 37);
+  key ^= (key >> 4);
+  key *= 2685821657736338717ULL;
+  return key;
 }
 
 // Combine hashes for an array of keys
-inline __device__ uint64_t hash_combine(uint64_t old_key, uint64_t new_key) {
-    if (old_key == 0xFFFFFFFFFFFFFFFF) {
-        return custom_hash_int(new_key);
-    }
-    return old_key ^ (custom_hash_int(new_key) + 0x9e3779b9 + (old_key << 6) + (old_key >> 2));
+inline __device__ uint64_t hash_combine(uint64_t old_key, uint64_t new_key)
+{
+  if (old_key == 0xFFFFFFFFFFFFFFFF) { return custom_hash_int(new_key); }
+  return old_key ^ (custom_hash_int(new_key) + 0x9e3779b9 + (old_key << 6) + (old_key >> 2));
 }
 
-inline __device__ uint64_t hash64_multikey(uint64_t key1, uint64_t key2) {
-    uint64_t h = key1 * 0xc6a4a7935bd1e995ull;
-    h ^= (h >> 33);
-    h ^= key2 * 0xc6a4a7935bd1e995ull;
-    h *= 0xc6a4a7935bd1e995ull;
-    h ^= (h >> 33);
-    return h;
+inline __device__ uint64_t hash64_multikey(uint64_t key1, uint64_t key2)
+{
+  uint64_t h = key1 * 0xc6a4a7935bd1e995ull;
+  h ^= (h >> 33);
+  h ^= key2 * 0xc6a4a7935bd1e995ull;
+  h *= 0xc6a4a7935bd1e995ull;
+  h ^= (h >> 33);
+  return h;
 }
 
-inline __device__ uint64_t hash64_single(uint64_t key) {
-    uint64_t z = key;
-    z += 0x9e3779b97f4a7c15ULL;
-    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
-    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
-    return z ^ (z >> 31);
+inline __device__ uint64_t hash64_single(uint64_t key)
+{
+  uint64_t z = key;
+  z += 0x9e3779b97f4a7c15ULL;
+  z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+  z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+  return z ^ (z >> 31);
 }
 
-#define STRING_HASH_POWER 31
+#define STRING_HASH_POWER     31
 #define STRING_HASH_MOD_VALUE 1000000009
-#define BITS_IN_BYTE 8
-#define BYTES_IN_INTEGER 8
+#define BITS_IN_BYTE          8
+#define BYTES_IN_INTEGER      8

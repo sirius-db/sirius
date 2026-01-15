@@ -3,21 +3,21 @@
   <img src="sirius-full.png" alt="Diagram" width="500"/>
 </p>
 
-Sirius is a GPU-native SQL engine. It plugs into existing databases such as DuckDB via the standard Substrait query format, requiring no query rewrites or major system changes. Sirius currently supports DuckDB and Doris (coming soon), other systems marked with * are on our roadmap.
+Sirius is a GPU-native SQL engine. It plugs into existing databases such as DuckDB via the standard Substrait query format, requiring no query rewrites or major system changes. Sirius currently supports DuckDB and Doris (coming soon), other systems marked with * are on our roadmap. Built on NVIDIA CUDA-X libraries including cuDF and RAPIDS Memory Manager (RMM), Sirius delivers high-performance GPU-accelerated analytics.
 
 <!-- ![Architecture](sirius-architecture.png) -->
 <p align="center">
-  <img src="sirius-architecture.png" alt="Diagram" width="900"/>
+  <img src="sirius-arch.png" alt="Diagram" width="900"/>
 </p>
 
 ## Performance
 Running TPC-H on SF=100, Sirius achieves ~10x speedup over existing CPU query engines at the same hardware rental cost, making it well-suited for interactive analytics, financial workloads, and ETL jobs.
 
 Experiment Setup:
-- GPU instance: GH200@LambdaLabs ($3.2/hour)
-- CPU instance: m7i.16xlarge@AWS ($3.2/hour)
+- GPU instance: GH200@LambdaLabs ($1.5/hour)
+- CPU instance: c8i.8xlarge@AWS ($1.5/hour)
 
-![Performance](sirius-performance.png)
+![Performance](sirius-perf.png)
 
 ## Supported OS/GPU/CUDA/CMake
 - Ubuntu >= 20.04
@@ -64,9 +64,9 @@ For aarch64 machine:
 sudo docker run --gpus all -it siriusdb/sirius_dependencies_aarch64:stable bash
 ```
 
-If encounting errors like the following when running the docker image as above:
+If encountering errors like the following when running the docker image as above:
 ```
-docker: Error response from daemon: could not select device driver “” with capabilities: [[gpu]].
+docker: Error response from daemon: could not select device driver "" with capabilities: [[gpu]].
 ```
 This means `nvidia-driver` or `nvidia-container-toolkit` is not installed.
 
@@ -100,19 +100,50 @@ nvidia-smi
 
 ### Install libcudf dependencies
 
-This approach requires cloning the repo following the instructions specifed in [Building Sirius](#building-sirius). 
+This approach requires cloning the repo following the instructions specified in [Building Sirius](#building-sirius).
 
 libcudf will be installed via conda/miniconda. Miniconda can be downloaded [here](https://www.anaconda.com/docs/getting-started/miniconda/install). After downloading miniconda, install libcudf by running these commands:
 ```
 conda create --name libcudf-env
 conda activate libcudf-env
-conda install -c rapidsai -c conda-forge -c nvidia rapidsai::libcudf=25.04
+conda install -c rapidsai -c conda-forge -c nvidia rapidsai::libcudf
 ```
 Set the environment variables `LIBCUDF_ENV_PREFIX` to the conda environment's path. For example, if we installed miniconda in `~/miniconda3` and installed libcudf in the conda environment `libcudf-env`, then we would set the `LIBCUDF_ENV_PREFIX` to `~/miniconda3/envs/libcudf-env`.
 ```
 export LIBCUDF_ENV_PREFIX={PATH to libcudf-env}
 ```
-It is recommended to add the environment variables to your `bashrc` to avoid repetition. 
+It is recommended to add the environment variables to your `bashrc` to avoid repetition.
+
+## Dependencies (Option 4): Use Pixi
+
+There is a [Pixi](https://pixi.sh/) manifest available to set up an environment with all required dependencies installed.
+
+### Requirements
+
+#### Build
+
+- Git (to clone the repo)
+- Pixi (install instructions [here](https://pixi.sh/latest/installation/))
+
+#### Test
+
+- A supported NVIDIA GPU
+- NVIDIA GPU driver installed
+
+### Setup
+
+The environment activation handles setting up everything needed to build and test.
+
+Start a shell in the environment with:
+```
+pixi shell
+```
+
+Then build and test as described in the sections below.
+```
+make
+make test
+```
 
 ## Building Sirius
 To clone the Sirius repository:
@@ -128,7 +159,7 @@ To build Sirius:
 CMAKE_BUILD_PARALLEL_LEVEL={nproc} make
 ```
 
-Common issues: 
+Common issues:
 If you encounter an error such as:
 ```
 /usr/bin/ld: /home/ubuntu/miniconda3/envs/libcudf-env/lib/libcudf.so: undefined reference to `std::ios_base_library_init()@GLIBCXX_3.4.32'
@@ -157,7 +188,7 @@ source .venv/bin/activate
 
 ## Generating and Loading test datasets
 
-### TPC-H Dataset 
+### TPC-H Dataset
 
 To generate the TPC-H dataset
 ```
@@ -191,7 +222,7 @@ To load the dataset to duckdb:
 ```
 
 ## Running Sirius: CLI
-To run Sirius CLI, simply start the shell with `./build/release/duckdb {DATABASE_NAME}.duckdb`. 
+To run Sirius CLI, simply start the shell with `./build/release/duckdb {DATABASE_NAME}.duckdb`.
 From the duckdb shell, initialize the Sirius buffer manager with `call gpu_buffer_init`. This API accepts 2 parameters, the GPU caching region size and the GPU processing region size. The GPU caching region is a memory region where the raw data is stored in GPUs, whereas the GPU processing region is where intermediate results are stored in GPUs (hash tables, join results .etc).
 For example, to set the caching region as 1 GB and the processing region as 2 GB, we can run the following command:
 ```
@@ -303,12 +334,12 @@ build/release/extension/sirius/test/cpp/sirius_unittest "[cpu_cache]"
 build/release/extension/sirius/test/cpp/sirius_unittest "test_cpu_cache_basic_string_single_col"
 ```
 
-Any logs produced during test execution are saved in: 
+Any logs produced during test execution are saved in:
 ```
 build/release/extension/sirius/test/cpp/log
 ```
 
-Just like duckdb, we are using [Catch2](https://github.com/catchorg/Catch2) as our testing framework so more details about writing and running tests can be found there.  
+Just like duckdb, we are using [Catch2](https://github.com/catchorg/Catch2) as our testing framework so more details about writing and running tests can be found there.
 
 ## Performance Testing
 Make sure to build the duckdb-python package before running this test using the method described [here](https://github.com/sirius-db/sirius?tab=readme-ov-file#building-sirius). To test Sirius performance against DuckDB across all 22 TPC-H queries, run the following command (replace {SF} with the desired scale factor):
@@ -330,7 +361,6 @@ Sirius is under active development, and several features are still in progress. 
 - **Row Count Limitations:** Sirius uses libcudf to implement `FILTER`, `PROJECTION`, `JOIN`, `GROUP-BY`, `ORDER-BY`, `AGGREGATION`. However, since libcudf uses `int32_t` for row IDs, this imposes limits on the maximum row count that Sirius can currently handle (~2B rows). See libcudf issue [#13159](https://github.com/rapidsai/cudf/issues/13159) for more details. We are actively addressing this by adding support for partitioning and batch execution. See Sirius issue [#12](https://github.com/sirius-db/sirius/issues/12) for more details.
 - **Data Type Coverage:** Sirius currently supports commonly used data types including `INTEGER`, `BIGINT`, `FLOAT`, `DOUBLE`, `VARCHAR`, `DATE`, `TIMESTAMP`, and `DECIMAL`. We are actively working on supporting additional data types—such as nested types. See issue [#20](https://github.com/sirius-db/sirius/issues/20) for more details.
 - **Operator Coverage:** At present, Sirius only supports a range of operators including `FILTER`, `PROJECTION`, `JOIN`, `GROUP-BY`, `ORDER-BY`, `AGGREGATION`, `TOP-N`, `LIMIT`, and `CTE`. We are working on adding more advanced operators such as `WINDOW` functions and `ASOF JOIN`, etc. See issue [#21](https://github.com/sirius-db/sirius/issues/21) for more details.
-- **No Support for Partially NULL Columns:** Sirius currently does not support columns where only some values are `NULL`. This limitation is being tracked and will be addressed in a future update. See issue [#27](https://github.com/sirius-db/sirius/issues/27) for more details.
 
 For a full list of current limitations and ongoing work, please refer to our [GitHub issues page](https://github.com/sirius-db/sirius/issues). **If these issues are encountered when running Sirius, Sirius will gracefully fallback to DuckDB query execution on CPUs.**
 

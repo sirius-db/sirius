@@ -23,23 +23,27 @@
 namespace duckdb {
 
 void warmup_gpu();
-void convertInt64ToInt128(uint8_t *input, uint8_t *output, size_t count);
-void convertInt32ToInt128(uint8_t *input, uint8_t *output, size_t count);
-void convertInt16ToInt128(uint8_t *input, uint8_t *output, size_t count);
-void convertInt32ToInt64(uint8_t *input, uint8_t *output, size_t count);
-void createRowIdColumn(uint8_t *data, size_t count);
+void convertInt64ToInt128(uint8_t* input, uint8_t* output, size_t count);
+void convertInt32ToInt128(uint8_t* input, uint8_t* output, size_t count);
+void convertInt16ToInt128(uint8_t* input, uint8_t* output, size_t count);
+void convertInt32ToInt64(uint8_t* input, uint8_t* output, size_t count);
+void createRowIdColumn(uint8_t* data, size_t count);
 
 template <typename T>
 void subtractToEach(T* data, T delta, size_t count);
 
 using CubPrefixSumAllocFunc = std::function<void*(size_t)>;
 template <typename T>
-void callCubPrefixSum(T* in, T* out, size_t count, bool inclusive,
-                      cudaStream_t stream, CubPrefixSumAllocFunc allocator);
+void callCubPrefixSum(T* in,
+                      T* out,
+                      size_t count,
+                      bool inclusive,
+                      cudaStream_t stream,
+                      CubPrefixSumAllocFunc allocator);
 
 // Reorder input row ids (with values from `0` to `count - 1`) such that `out_indices` represents
 // how to reorder the rows such that row ids are monotonically increasing.
 // E.g., `in_row_ids` = `1, 3, 0, 2, 4`, then `out_indices` = `2, 0, 3, 1, 4`.
 void reorderRowIds(int64_t* in_row_ids, uint64_t* out_indices, size_t count);
 
-} // namespace duckdb
+}  // namespace duckdb

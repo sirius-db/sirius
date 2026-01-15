@@ -16,16 +16,14 @@
 
 #include "duckdb/planner/expression/bound_between_expression.hpp"
 #include "expression_executor/gpu_expression_executor.hpp"
+
 #include <cudf/binaryop.hpp>
 
-namespace duckdb
-{
-namespace sirius
-{
+namespace duckdb {
+namespace sirius {
 
-std::unique_ptr<GpuExpressionState>
-GpuExpressionExecutor::InitializeState(const BoundBetweenExpression& expr,
-                                       GpuExpressionExecutorState& root)
+std::unique_ptr<GpuExpressionState> GpuExpressionExecutor::InitializeState(
+  const BoundBetweenExpression& expr, GpuExpressionExecutorState& root)
 {
   auto result = make_uniq<GpuExpressionState>(expr, root);
   result->AddChild(*expr.input);
@@ -65,5 +63,5 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundBetweenE
                                 resource_ref);
 }
 
-} // namespace sirius
-} // namespace duckdb
+}  // namespace sirius
+}  // namespace duckdb

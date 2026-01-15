@@ -12,8 +12,10 @@
 # the License.
 # =============================================================================
 
+
 def q1(con):
-    con.execute('''
+    con.execute(
+        """
 call gpu_processing("select
     l_returnflag,
     l_linestatus,
@@ -35,10 +37,13 @@ group by
 order by
     l_returnflag,
     l_linestatus;");
-                ''')
-    
+                """
+    )
+
+
 def q2(con):
-    con.execute('''
+    con.execute(
+        """
 call gpu_processing("select
   s.s_acctbal,
   s.s_name,
@@ -82,11 +87,14 @@ order by
   n.n_name,
   s.s_name,
   p.p_partkey
-limit 100;");               
-                ''')
-    
+limit 100;");
+                """
+    )
+
+
 def q3(con):
-    con.execute('''
+    con.execute(
+        """
 call gpu_processing("select
   l.l_orderkey,
   sum(l.l_extendedprice * (1 - l.l_discount)) as revenue,
@@ -110,10 +118,13 @@ order by
   revenue desc,
   o.o_orderdate
 limit 10;");
-                ''')
-    
+                """
+    )
+
+
 def q4(con):
-    con.execute('''
+    con.execute(
+        """
 call gpu_processing("select
   o.o_orderpriority,
   count(*) as order_count
@@ -135,11 +146,14 @@ where
 group by
   o.o_orderpriority
 order by
-  o.o_orderpriority;");   
-                ''')
-    
+  o.o_orderpriority;");
+                """
+    )
+
+
 def q5(con):
-    con.execute('''
+    con.execute(
+        """
 call gpu_processing("select
   n.n_name,
   sum(l.l_extendedprice * (1 - l.l_discount)) as revenue
@@ -164,10 +178,13 @@ group by
   n.n_name
 order by
   revenue desc;");
-                ''')
+                """
+    )
+
 
 def q6(con):
-    con.execute('''
+    con.execute(
+        """
 call gpu_processing("select
   sum(l_extendedprice * l_discount) as revenue
 from
@@ -177,10 +194,13 @@ where
   and l_shipdate < date '1997-01-01' + interval '1' year
   and l_discount between 0.03 - 0.01 and 0.03 + 0.01
   and l_quantity < 24;");
-                ''')
-    
+                """
+    )
+
+
 def q7(con):
-    con.execute('''
+    con.execute(
+        """
 call gpu_processing("select
   supp_nation,
   cust_nation,
@@ -220,10 +240,13 @@ order by
   supp_nation,
   cust_nation,
   l_year;");
-                ''')
-    
+                """
+    )
+
+
 def q8(con):
-    con.execute('''
+    con.execute(
+        """
 call gpu_processing("select
   o_year,
   sum(case
@@ -261,10 +284,13 @@ group by
   o_year
 order by
   o_year;");
-                ''')
+                """
+    )
+
 
 def q9(con):
-    con.execute('''
+    con.execute(
+        """
 call gpu_processing("select
   nation,
   o_year,
@@ -297,10 +323,13 @@ group by
 order by
   nation,
   o_year desc;");
-                ''')
-    
+                """
+    )
+
+
 def q10(con):
-    con.execute('''
+    con.execute(
+        """
 call gpu_processing("select
   c.c_custkey,
   c.c_name,
@@ -333,10 +362,13 @@ group by
 order by
   revenue desc
 limit 20;");
-                ''')
-    
+                """
+    )
+
+
 def q11(con):
-    con.execute('''
+    con.execute(
+        """
 call gpu_processing("select
   ps.ps_partkey,
   sum(ps.ps_supplycost * ps.ps_availqty) as value
@@ -364,10 +396,13 @@ group by
     )
 order by
   value desc;");
-                ''')
-    
+                """
+    )
+
+
 def q12(con):
-    con.execute('''
+    con.execute(
+        """
 call gpu_processing("select
   l.l_shipmode,
   sum(case
@@ -396,10 +431,13 @@ group by
   l.l_shipmode
 order by
   l.l_shipmode;");
-                ''')
-    
+                """
+    )
+
+
 def q13(con):
-    con.execute('''
+    con.execute(
+        """
 call gpu_processing("select
   c_count,
   count(*) as custdist
@@ -421,10 +459,13 @@ group by
 order by
   custdist desc,
   c_count desc;");
-                ''')
-    
+                """
+    )
+
+
 def q14(con):
-    con.execute('''
+    con.execute(
+        """
 call gpu_processing("select
   100.00 * sum(case
     when p.p_type like 'PROMO%'
@@ -438,10 +479,13 @@ where
   l.l_partkey = p.p_partkey
   and l.l_shipdate >= date '1994-08-01'
   and l.l_shipdate < date '1994-08-01' + interval '1' month;");
-                ''')
-    
+                """
+    )
+
+
 def q15(con):
-    con.execute('''
+    con.execute(
+        """
 call gpu_processing("with revenue_view as (
   select
     l_suppkey as supplier_no,
@@ -474,10 +518,13 @@ where
   )
 order by
   s.s_suppkey;");
-                ''')
-    
+                """
+    )
+
+
 def q16(con):
-    con.execute('''
+    con.execute(
+        """
 call gpu_processing("select
   p.p_brand,
   p.p_type,
@@ -508,10 +555,13 @@ order by
   p.p_brand,
   p.p_type,
   p.p_size;");
-                ''')
-    
+                """
+    )
+
+
 def q17(con):
-    con.execute('''
+    con.execute(
+        """
 call gpu_processing("select
   sum(l.l_extendedprice) / 7.0 as avg_yearly
 from
@@ -529,10 +579,13 @@ where
     where
       l2.l_partkey = p.p_partkey
   );");
-                ''')
-    
+                """
+    )
+
+
 def q18(con):
-    con.execute('''
+    con.execute(
+        """
 call gpu_processing("select
   c.c_name,
   c.c_custkey,
@@ -566,10 +619,13 @@ order by
   o.o_totalprice desc,
   o.o_orderdate
 limit 100;");
-                ''')
-    
+                """
+    )
+
+
 def q19(con):
-    con.execute('''
+    con.execute(
+        """
 call gpu_processing("select
   sum(l.l_extendedprice* (1 - l.l_discount)) as revenue
 from
@@ -605,10 +661,13 @@ where
     and l.l_shipmode in ('AIR', 'AIR REG')
     and l.l_shipinstruct = 'DELIVER IN PERSON'
   );");
-                ''')
-    
+                """
+    )
+
+
 def q20(con):
-    con.execute('''
+    con.execute(
+        """
 call gpu_processing("select
   s.s_name,
   s.s_address
@@ -646,10 +705,13 @@ where
   and n.n_name = 'KENYA'
 order by
   s.s_name;");
-                ''')
-    
+                """
+    )
+
+
 def q21(con):
-    con.execute('''
+    con.execute(
+        """
 call gpu_processing("select
   s.s_name,
   count(*) as numwait
@@ -690,10 +752,13 @@ order by
   numwait desc,
   s.s_name
 limit 100;");
-                ''')
-    
+                """
+    )
+
+
 def q22(con):
-    con.execute('''
+    con.execute(
+        """
 call gpu_processing("select
   cntrycode,
   count(*) as numcust,
@@ -731,13 +796,15 @@ group by
   cntrycode
 order by
   cntrycode;");
-                ''')
+                """
+    )
+
 
 def run_sirius(con, warmup=False):
     q1(con)
     print("Q1 done") if (not warmup) else None
     q2(con)
-    print("Q2 done") if (not warmup) else None 
+    print("Q2 done") if (not warmup) else None
     q3(con)
     print("Q3 done") if (not warmup) else None
     q4(con)

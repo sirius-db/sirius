@@ -17,47 +17,59 @@ import os
 import sys
 
 if __name__ == "__main__":
-  con = duckdb.connect('performance_test.duckdb', config={"allow_unsigned_extensions": "true"})
-#   con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
-  extension_path = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-    'build/release/extension/sirius/sirius.duckdb_extension')
-  con.execute("load '{}'".format(extension_path))
-  
-  SF = sys.argv[1]
-  command = f"cd test_datasets/tpch-mod-dbgen && ./dbgen -f -s {SF} && mv *.tbl perf_test/"
-  
-  print("Generating TPC-H data...")
-  os.system("mkdir -p test_datasets/tpch-mod-dbgen/perf_test")
-  os.system("rm -f test_datasets/tpch-mod-dbgen/perf_test/*")
-  os.system(command)
+    con = duckdb.connect(
+        "performance_test.duckdb", config={"allow_unsigned_extensions": "true"}
+    )
+    #   con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
+    extension_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        "build/release/extension/sirius/sirius.duckdb_extension",
+    )
+    con.execute("load '{}'".format(extension_path))
 
-  print("Creating Region, Nation, Part, Supplier, Partsupp, Customer, Orders, Lineitem tables...")
-  con.execute('DROP TABLE IF EXISTS REGION;')
-  con.execute('DROP TABLE IF EXISTS NATION;')
-  con.execute('DROP TABLE IF EXISTS PART;')
-  con.execute('DROP TABLE IF EXISTS SUPPLIER;')
-  con.execute('DROP TABLE IF EXISTS PARTSUPP;')
-  con.execute('DROP TABLE IF EXISTS CUSTOMER;')
-  con.execute('DROP TABLE IF EXISTS ORDERS;')
-  con.execute('DROP TABLE IF EXISTS LINEITEM;')
+    SF = sys.argv[1]
+    command = (
+        f"cd test_datasets/tpch-mod-dbgen && ./dbgen -f -s {SF} && mv *.tbl perf_test/"
+    )
 
-  con.execute('''
+    print("Generating TPC-H data...")
+    os.system("mkdir -p test_datasets/tpch-mod-dbgen/perf_test")
+    os.system("rm -f test_datasets/tpch-mod-dbgen/perf_test/*")
+    os.system(command)
+
+    print(
+        "Creating Region, Nation, Part, Supplier, Partsupp, Customer, Orders, Lineitem tables..."
+    )
+    con.execute("DROP TABLE IF EXISTS REGION;")
+    con.execute("DROP TABLE IF EXISTS NATION;")
+    con.execute("DROP TABLE IF EXISTS PART;")
+    con.execute("DROP TABLE IF EXISTS SUPPLIER;")
+    con.execute("DROP TABLE IF EXISTS PARTSUPP;")
+    con.execute("DROP TABLE IF EXISTS CUSTOMER;")
+    con.execute("DROP TABLE IF EXISTS ORDERS;")
+    con.execute("DROP TABLE IF EXISTS LINEITEM;")
+
+    con.execute(
+        """
   CREATE TABLE REGION  (
       R_REGIONKEY  BIGINT NOT NULL UNIQUE PRIMARY KEY,
       R_NAME       CHAR(25) NOT NULL,
       R_COMMENT    VARCHAR(152) NOT NULL,
-  );''')
+  );"""
+    )
 
-  con.execute('''
+    con.execute(
+        """
   CREATE TABLE NATION  (
       N_NATIONKEY  BIGINT NOT NULL UNIQUE PRIMARY KEY,
       N_NAME       CHAR(25) NOT NULL,
       N_REGIONKEY  BIGINT NOT NULL,
       N_COMMENT    VARCHAR(152) NOT NULL,
-  );''')
+  );"""
+    )
 
-  con.execute('''
+    con.execute(
+        """
   CREATE TABLE PART  (
       P_PARTKEY     BIGINT NOT NULL UNIQUE PRIMARY KEY,
       P_NAME        VARCHAR(55) NOT NULL,
@@ -68,9 +80,11 @@ if __name__ == "__main__":
       P_CONTAINER   BIGINT NOT NULL,
       P_RETAILPRICE DOUBLE NOT NULL,
       P_COMMENT     VARCHAR(23) NOT NULL,
-  );''')
+  );"""
+    )
 
-  con.execute('''
+    con.execute(
+        """
   CREATE TABLE SUPPLIER (
       S_SUPPKEY     BIGINT NOT NULL UNIQUE PRIMARY KEY,
       S_NAME        CHAR(25) NOT NULL,
@@ -79,9 +93,11 @@ if __name__ == "__main__":
       S_PHONE       CHAR(15) NOT NULL,
       S_ACCTBAL     DOUBLE NOT NULL,
       S_COMMENT     VARCHAR(101) NOT NULL,
-  );''')
+  );"""
+    )
 
-  con.execute('''
+    con.execute(
+        """
   CREATE TABLE PARTSUPP (
       PS_PARTKEY     BIGINT NOT NULL,
       PS_SUPPKEY     BIGINT NOT NULL,
@@ -89,9 +105,11 @@ if __name__ == "__main__":
       PS_SUPPLYCOST  DOUBLE  NOT NULL,
       PS_COMMENT     VARCHAR(199) NOT NULL,
       CONSTRAINT PS_PARTSUPPKEY UNIQUE(PS_PARTKEY, PS_SUPPKEY)
-  );''')
+  );"""
+    )
 
-  con.execute('''
+    con.execute(
+        """
   CREATE TABLE CUSTOMER (
       C_CUSTKEY     BIGINT NOT NULL UNIQUE PRIMARY KEY,
       C_NAME        VARCHAR(25) NOT NULL,
@@ -101,9 +119,11 @@ if __name__ == "__main__":
       C_ACCTBAL     DOUBLE NOT NULL,
       C_MKTSEGMENT  BIGINT NOT NULL,
       C_COMMENT     VARCHAR(117) NOT NULL,
-  );''')
+  );"""
+    )
 
-  con.execute('''
+    con.execute(
+        """
   CREATE TABLE ORDERS  (
       O_ORDERKEY       BIGINT NOT NULL UNIQUE PRIMARY KEY,
       O_CUSTKEY        BIGINT NOT NULL,
@@ -114,9 +134,11 @@ if __name__ == "__main__":
       O_CLERK          BIGINT NOT NULL,
       O_SHIPPRIORITY   BIGINT NOT NULL,
       O_COMMENT        VARCHAR(79) NOT NULL,
-  );''')
+  );"""
+    )
 
-  con.execute('''
+    con.execute(
+        """
   CREATE TABLE LINEITEM (
       L_ORDERKEY    BIGINT NOT NULL,
       L_PARTKEY     BIGINT NOT NULL,
@@ -134,40 +156,57 @@ if __name__ == "__main__":
       L_SHIPINSTRUCT BIGINT NOT NULL,
       L_SHIPMODE     BIGINT NOT NULL,
       L_COMMENT      VARCHAR(44) NOT NULL,
-  );''')
-  
-  print("Copying data into tables...")
+  );"""
+    )
 
-  con.execute('''
+    print("Copying data into tables...")
+
+    con.execute(
+        """
   COPY lineitem FROM 'test_datasets/tpch-mod-dbgen/perf_test/lineitem.tbl' WITH (HEADER false, DELIMITER '|')
-  ''')
+  """
+    )
 
-  con.execute('''
+    con.execute(
+        """
   COPY orders FROM 'test_datasets/tpch-mod-dbgen/perf_test/orders.tbl' WITH (HEADER false, DELIMITER '|')
-  ''')
+  """
+    )
 
-  con.execute('''
+    con.execute(
+        """
   COPY supplier FROM 'test_datasets/tpch-mod-dbgen/perf_test/supplier.tbl' WITH (HEADER false, DELIMITER '|')
-  ''')
+  """
+    )
 
-  con.execute('''
+    con.execute(
+        """
   COPY part FROM 'test_datasets/tpch-mod-dbgen/perf_test/part.tbl' WITH (HEADER false, DELIMITER '|')
-  ''')
+  """
+    )
 
-  con.execute('''
+    con.execute(
+        """
   COPY customer FROM 'test_datasets/tpch-mod-dbgen/perf_test/customer.tbl' WITH (HEADER false, DELIMITER '|')
-  ''')
+  """
+    )
 
-  con.execute('''
+    con.execute(
+        """
   COPY partsupp FROM 'test_datasets/tpch-mod-dbgen/perf_test/partsupp.tbl' WITH (HEADER false, DELIMITER '|')
-  ''')
+  """
+    )
 
-  con.execute('''
+    con.execute(
+        """
   COPY nation FROM 'test_datasets/tpch-mod-dbgen/perf_test/nation.tbl' WITH (HEADER false, DELIMITER '|')
-  ''')
+  """
+    )
 
-  con.execute('''
+    con.execute(
+        """
   COPY region FROM 'test_datasets/tpch-mod-dbgen/perf_test/region.tbl' WITH (HEADER false, DELIMITER '|')
-  ''')
-  
-  con.close()
+  """
+    )
+
+    con.close()

@@ -20,14 +20,14 @@
 #define SPDLOG_ACTIVE_LEVEL SPDLOG_LEVEL_TRACE
 #endif
 
+#include <spdlog/sinks/daily_file_sink.h>
+#include <spdlog/spdlog.h>
+
 #include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <optional>
 #include <string>
-
-#include <spdlog/spdlog.h>
-#include <spdlog/sinks/daily_file_sink.h>
 
 #define SIRIUS_LOG_TRACE(...) SPDLOG_LOGGER_TRACE(spdlog::default_logger_raw(), __VA_ARGS__)
 #define SIRIUS_LOG_DEBUG(...) SPDLOG_LOGGER_DEBUG(spdlog::default_logger_raw(), __VA_ARGS__)
@@ -40,16 +40,18 @@ namespace duckdb {
 
 inline constexpr int SIRIUS_LOG_FLUSH_SEC = 3;
 
-inline std::optional<std::string> GetEnvVar(const std::string& name) {
-    const char* val = std::getenv(name.c_str());
-    if (val) {
-        return std::string(val);
-    } else {
-        return std::nullopt;
-    }
+inline std::optional<std::string> GetEnvVar(const std::string& name)
+{
+  const char* val = std::getenv(name.c_str());
+  if (val) {
+    return std::string(val);
+  } else {
+    return std::nullopt;
+  }
 }
 
-inline spdlog::level::level_enum GetLogLevel() {
+inline spdlog::level::level_enum GetLogLevel()
+{
   auto log_level_str = GetEnvVar("SIRIUS_LOG_LEVEL");
   if (log_level_str.has_value()) {
     if (*log_level_str == "trace") return spdlog::level::trace;
@@ -63,29 +65,29 @@ inline spdlog::level::level_enum GetLogLevel() {
   return spdlog::level::info;
 }
 
-inline std::string GetLogDir() {
+inline std::string GetLogDir()
+{
   auto log_dir_str = GetEnvVar("SIRIUS_LOG_DIR");
-  if (log_dir_str.has_value()) {
-    return *log_dir_str;
-  }
+  if (log_dir_str.has_value()) { return *log_dir_str; }
   return SIRIUS_DEFAULT_LOG_DIR;
 }
 
-inline void InitGlobalLogger(std::string log_file = "") {
+inline void InitGlobalLogger(std::string log_file = "")
+{
   // Log file
   if (log_file.empty()) {
     auto log_dir = GetLogDir();
-    log_file = log_dir + "/sirius.log";
+    log_file     = log_dir + "/sirius.log";
   }
   auto file_sink = std::make_shared<spdlog::sinks::daily_file_sink_mt>(log_file, 0, 0, false);
   file_sink->set_pattern("[%Y-%m-%d %T.%e] [%l] [%s:%#] %v");
 
   // Logger
-  auto logger = std::make_shared<spdlog::logger>("", spdlog::sinks_init_list{file_sink});
+  auto logger    = std::make_shared<spdlog::logger>("", spdlog::sinks_init_list{file_sink});
   auto log_level = GetLogLevel();
   logger->set_level(log_level);
   spdlog::flush_every(std::chrono::seconds(SIRIUS_LOG_FLUSH_SEC));
   spdlog::set_default_logger(logger);
 }
 
-}
+}  // namespace duckdb

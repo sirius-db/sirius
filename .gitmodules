@@ -6,3 +6,11 @@
 	path = extension-ci-tools
 	url = https://github.com/duckdb/extension-ci-tools
 	branch = main
+[submodule "substrait"]
+	path = substrait
+	url = https://github.com/duckdb/substrait.git
+	branch = main
+[submodule "cucascade"]
+	path = cucascade
+	url = https://github.com/NVIDIA/cuCascade.git
+	branch = main

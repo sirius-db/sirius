@@ -16,178 +16,204 @@
 
 #pragma once
 
-#include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/common.hpp"
 #include "duckdb/common/enums/operator_result_type.hpp"
+#include "duckdb/common/enums/order_preservation_type.hpp"
 #include "duckdb/common/enums/physical_operator_type.hpp"
+#include "duckdb/common/optional_idx.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/execution/execution_context.hpp"
-#include "duckdb/optimizer/join_order/join_node.hpp"
-#include "duckdb/common/optional_idx.hpp"
+#include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/execution/physical_operator_states.hpp"
-#include "duckdb/common/enums/order_preservation_type.hpp"
+#include "duckdb/optimizer/join_order/join_node.hpp"
 #include "gpu_columns.hpp"
 #include "helper/types.hpp"
+
+#include <data/data_batch.hpp>
+#include <data/data_repository.hpp>
 
 namespace duckdb {
 class GPUExecutor;
 class GPUPhysicalOperator;
 class GPUPipeline;
+}  // namespace duckdb
+
+namespace sirius::creator {
+class task_creator;
+using task_creation_hint = std::variant<std::monostate,
+                                        ::duckdb::GPUPhysicalOperator*,
+                                        ::duckdb::shared_ptr<::duckdb::GPUPipeline>>;
+}  // namespace sirius::creator
+
+namespace duckdb {
 class GPUPipelineBuildState;
 class GPUMetaPipeline;
 
+enum class MemoryBarrierType { PIPELINE, PARTIAL, FULL };
+
 //! GPUPhysicalOperator is the base class of the physical operators present in the
 //! execution plan
-class GPUPhysicalOperator{
-public:
-	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::INVALID;
+class GPUPhysicalOperator {
+ public:
+  static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::INVALID;
 
-public:
-	
-	GPUPhysicalOperator(PhysicalOperatorType type, vector<LogicalType> types, idx_t estimated_cardinality)
-	    : type(type), types(std::move(types)), estimated_cardinality(estimated_cardinality) {
-	}
-	GPUPhysicalOperator() = default;
+ public:
+  GPUPhysicalOperator(PhysicalOperatorType type,
+                      vector<LogicalType> types,
+                      idx_t estimated_cardinality)
+    : type(type), types(std::move(types)), estimated_cardinality(estimated_cardinality)
+  {
+  }
+  GPUPhysicalOperator() = default;
 
-	virtual ~GPUPhysicalOperator() {
-	}
-	// ~GPUPhysicalOperator() = default;
+  virtual ~GPUPhysicalOperator() {}
 
-	//! The physical operator type
-	PhysicalOperatorType type;
-	//! The set of children of the operator
-	vector<unique_ptr<GPUPhysicalOperator>> children;
-	//! The types returned by this physical operator
-	vector<LogicalType> types;
-	//! The estimated cardinality of this physical operator
-	idx_t estimated_cardinality;
+  //! The physical operator type
+  PhysicalOperatorType type;
+  //! The set of children of the operator
+  vector<unique_ptr<GPUPhysicalOperator>> children;
+  //! The types returned by this physical operator
+  vector<LogicalType> types;
+  //! The estimated cardinality of this physical operator
+  idx_t estimated_cardinality;
 
-	//! The global sink state of this operator
-	unique_ptr<GlobalSinkState> sink_state;
-	//! The global state of this operator
-	unique_ptr<GlobalOperatorState> op_state;
-	//! Lock for (re)setting any of the operator states
-	mutex lock;
+  //! The global sink state of this operator
+  unique_ptr<GlobalSinkState> sink_state;
+  //! The global state of this operator
+  unique_ptr<GlobalOperatorState> op_state;
+  //! Lock for (re)setting any of the operator states
+  mutex lock;
 
-public:
-	virtual string GetName() const;
-	// virtual string ParamsToString() const {
-	// 	return "";
-	// }
-	// virtual string ToString() const;
-	// void Print() const;
-	virtual vector<const_reference<GPUPhysicalOperator>> GetChildren() const;
+ public:
+  virtual string GetName() const;
+  // virtual string ParamsToString() const {
+  // 	return "";
+  // }
+  // virtual string ToString() const;
+  // void Print() const;
+  virtual vector<const_reference<GPUPhysicalOperator>> GetChildren() const;
 
-	//! Return a vector of the types that will be returned by this operator
-	const vector<LogicalType> &GetTypes() const {
-		return types;
-	}
+  //! Return a vector of the types that will be returned by this operator
+  const vector<LogicalType>& GetTypes() const { return types; }
 
-	virtual bool Equals(const GPUPhysicalOperator &other) const {
-		return false;
-	}
+  virtual bool Equals(const GPUPhysicalOperator& other) const { return false; }
 
-	virtual void Verify();
+  virtual void Verify();
 
-public:
-	// Operator interface
-	virtual unique_ptr<OperatorState> GetOperatorState(ExecutionContext &context) const;
-	virtual unique_ptr<GlobalOperatorState> GetGlobalOperatorState(ClientContext &context) const;
-	// virtual OperatorResultType Execute(ExecutionContext &context, DataChunk &input, DataChunk &chunk,
-	//                                    GlobalOperatorState &gstate, OperatorState &state) const;
-	// virtual OperatorResultType Execute(ExecutionContext &context, GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation,
-	// 									GlobalOperatorState &gstate, OperatorState &state) const;
-	// virtual OperatorFinalizeResultType FinalExecute(ExecutionContext &context, DataChunk &chunk,
-	//                                                 GlobalOperatorState &gstate, OperatorState &state) const;
+ public:
+  // Operator interface
+  virtual unique_ptr<OperatorState> GetOperatorState(ExecutionContext& context) const;
+  virtual unique_ptr<GlobalOperatorState> GetGlobalOperatorState(ClientContext& context) const;
 
-	virtual OperatorResultType Execute(GPUIntermediateRelation &input_relation, GPUIntermediateRelation &output_relation) const;
+  virtual OperatorResultType Execute(GPUIntermediateRelation& input_relation,
+                                     GPUIntermediateRelation& output_relation) const;
+  virtual ::std::vector<::std::shared_ptr<::cucascade::data_batch>> execute(
+    const ::std::vector<::std::shared_ptr<::cucascade::data_batch>>& input_batches);
+  virtual ::std::vector<::std::shared_ptr<::cucascade::data_batch>> sink_execute(
+    const ::std::vector<::std::shared_ptr<::cucascade::data_batch>>& input_batches);
 
-	virtual bool ParallelOperator() const {
-		return false;
-	}
+  virtual bool ParallelOperator() const { return false; }
 
-	virtual bool RequiresFinalExecute() const {
-		return false;
-	}
+  virtual bool RequiresFinalExecute() const { return false; }
 
-	//! The influence the operator has on order (insertion order means no influence)
-	virtual OrderPreservationType OperatorOrder() const {
-		return OrderPreservationType::INSERTION_ORDER;
-	}
+  //! The influence the operator has on order (insertion order means no influence)
+  virtual OrderPreservationType OperatorOrder() const
+  {
+    return OrderPreservationType::INSERTION_ORDER;
+  }
 
-public:
-	//Source Interface
-	// virtual SourceResultType GetData(ExecutionContext &context, GPUIntermediateRelation &output_relation, OperatorSourceInput &input) const;
-	virtual SourceResultType GetData(GPUIntermediateRelation &output_relation) const;
-	virtual unique_ptr<LocalSourceState> GetLocalSourceState(ExecutionContext &context,
-	                                                         GlobalSourceState &gstate) const;
-	virtual unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const;
+ public:
+  // Source Interface
+  virtual SourceResultType GetData(GPUIntermediateRelation& output_relation) const;
+  // TODO: Implement SourceExecute if required in future.
 
-	virtual bool IsSource() const {
-		return false;
-	}
+  virtual unique_ptr<LocalSourceState> GetLocalSourceState(ExecutionContext& context,
+                                                           GlobalSourceState& gstate) const;
+  virtual unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext& context) const;
 
-	virtual bool ParallelSource() const {
-		return false;
-	}
+  virtual bool IsSource() const { return false; }
 
-	//! The type of order emitted by the operator (as a source)
-	virtual OrderPreservationType SourceOrder() const {
-		return OrderPreservationType::INSERTION_ORDER;
-	}
+  virtual bool ParallelSource() const { return false; }
 
-public:
-	//Sink interface
-	// virtual SinkResultType Sink(ExecutionContext &context, GPUIntermediateRelation &input, OperatorSinkInput &input) const;
-	// virtual SinkResultType Sink(ExecutionContext &context, GPUIntermediateRelation &input_relation, OperatorSinkInput &input) const;
-	virtual SinkResultType Sink(GPUIntermediateRelation &input_relation) const;
-	virtual SinkFinalizeType CombineFinalize(vector<shared_ptr<GPUIntermediateRelation>> &input,
-																	  			 GPUIntermediateRelation& output) const;
-	virtual unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const;
-	virtual unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const;
-	
-	virtual bool IsSink() const {
-		return false;
-	}
+  //! The type of order emitted by the operator (as a source)
+  virtual OrderPreservationType SourceOrder() const
+  {
+    return OrderPreservationType::INSERTION_ORDER;
+  }
 
-	virtual bool ParallelSink() const {
-		return false;
-	}
+ public:
+  // Sink interface
+  virtual SinkResultType Sink(GPUIntermediateRelation& input_relation) const;
+  // TODO: Implement SinkExecute if batch-based sink execution is required in the future.
 
-	virtual bool RequiresBatchIndex() const {
-		return false;
-	}
+  virtual SinkFinalizeType CombineFinalize(vector<shared_ptr<GPUIntermediateRelation>>& input,
+                                           GPUIntermediateRelation& output) const;
+  virtual unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext& context) const;
+  virtual unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext& context) const;
 
-	//! Whether or not the sink operator depends on the order of the input chunks
-	//! If this is set to true, we cannot do things like caching intermediate vectors
-	virtual bool SinkOrderDependent() const {
-		return false;
-	}
+  virtual bool IsSink() const { return false; }
 
-public:
-	// Pipeline construction
-	virtual vector<const_reference<GPUPhysicalOperator>> GetSources() const;
-	// bool AllSourcesSupportBatchIndex() const;
+  virtual bool ParallelSink() const { return false; }
 
-	virtual void BuildPipelines(GPUPipeline &current, GPUMetaPipeline &meta_pipeline);
+  virtual bool RequiresBatchIndex() const { return false; }
 
-public:
-	template <class TARGET>
-	TARGET &Cast() {
-		if (TARGET::TYPE != PhysicalOperatorType::INVALID && type != TARGET::TYPE) {
-			throw InternalException("Failed to cast physical operator to type - physical operator type mismatch");
-		}
-		return reinterpret_cast<TARGET &>(*this);
-	}
+  //! Whether or not the sink operator depends on the order of the input chunks
+  //! If this is set to true, we cannot do things like caching intermediate vectors
+  virtual bool SinkOrderDependent() const { return false; }
 
-	template <class TARGET>
-	const TARGET &Cast() const {
-		if (TARGET::TYPE != PhysicalOperatorType::INVALID && type != TARGET::TYPE) {
-			throw InternalException("Failed to cast physical operator to type - physical operator type mismatch");
-		}
-		return reinterpret_cast<const TARGET &>(*this);
-	}
+ public:
+  // Pipeline construction
+  virtual vector<const_reference<GPUPhysicalOperator>> GetSources() const;
+
+  virtual void BuildPipelines(GPUPipeline& current, GPUMetaPipeline& meta_pipeline);
+
+ public:
+  template <class TARGET>
+  TARGET& Cast()
+  {
+    if (TARGET::TYPE != PhysicalOperatorType::INVALID && type != TARGET::TYPE) {
+      throw InternalException(
+        "Failed to cast physical operator to type - physical operator type mismatch");
+    }
+    return reinterpret_cast<TARGET&>(*this);
+  }
+
+  template <class TARGET>
+  const TARGET& Cast() const
+  {
+    if (TARGET::TYPE != PhysicalOperatorType::INVALID && type != TARGET::TYPE) {
+      throw InternalException(
+        "Failed to cast physical operator to type - physical operator type mismatch");
+    }
+    return reinterpret_cast<const TARGET&>(*this);
+  }
+
+  struct port {
+    MemoryBarrierType type;
+    ::cucascade::shared_data_repository* repo;
+    shared_ptr<GPUPipeline> src_pipeline;
+    shared_ptr<GPUPipeline> dest_pipeline;
+  };
+
+  // source pipeline pushed to repo of the ports
+  void push_data_batch(std::string_view port_id, std::shared_ptr<::cucascade::data_batch> batch);
+  void add_port(std::string_view port_id, std::unique_ptr<port> p);
+  port* get_port(std::string_view port_id);
+  bool is_source_pipeline_finished();
+  void add_next_port_after_sink(std::pair<GPUPhysicalOperator*, std::string_view> port_locator);
+  vector<std::pair<GPUPhysicalOperator*, std::string_view>>& get_next_port_after_sink();
+  virtual ::sirius::creator::task_creation_hint get_next_task_hint();
+  std::vector<::std::shared_ptr<::cucascade::data_batch>> get_input_batch();
+  bool all_ports_empty();
+  bool check_pipeline_finished();
+  void set_creator(::sirius::creator::task_creator* creator);
+
+ private:
+  std::unordered_map<std::string, std::unique_ptr<port>> ports;
+  //! The next operators to be executed after this operator when it is used as a sink
+  vector<std::pair<GPUPhysicalOperator*, std::string_view>> next_port_after_sink;
+  ::sirius::creator::task_creator* creator;
 };
 
-} // namespace duckdb
+}  // namespace duckdb

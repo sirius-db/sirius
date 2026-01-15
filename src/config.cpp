@@ -24,8 +24,8 @@ bool Config::USE_CUDF_EXPR = true;
 
 bool Config::USE_CUSTOM_TOP_N = true;
 
-bool Config::USE_OPT_TABLE_SCAN = true;
-int Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS = 8;
+bool Config::USE_OPT_TABLE_SCAN                  = true;
+int Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS      = 8;
 uint64_t Config::OPT_TABLE_SCAN_CUDA_MEMCPY_SIZE = 64UL * 1024 * 1024;  // 64 MB
 
 uint64_t Config::PRINT_GPU_TABLE_MAX_ROWS = 1000;
@@ -34,4 +34,9 @@ bool Config::ENABLE_FALLBACK_CHECK = false;
 
 bool Config::ENABLE_REGEX_JIT_IMPL = true;
 
-}
+bool Config::MODIFIED_PIPELINE = false;
+
+uint64_t Config::DEFAULT_SCAN_TASK_BATCH_SIZE   = 2ULL * 1024 * 1024 * 1024;  ///< 2 GB
+uint64_t Config::DEFAULT_SCAN_TASK_VARCHAR_SIZE = 256ULL;
+
+}  // namespace duckdb

@@ -27,21 +27,21 @@ AlwaysBreakAfterDefinitionReturnType: None
 AlwaysBreakAfterReturnType: None
 AlwaysBreakBeforeMultilineStrings: true
 AlwaysBreakTemplateDeclarations: Yes
-BinPackArguments:  false
+BinPackArguments: false
 BinPackParameters: false
 BraceWrapping:
-  AfterClass:            false
+  AfterClass: false
   AfterControlStatement: false
-  AfterEnum:             false
-  AfterFunction:         false
-  AfterNamespace:        false
-  AfterObjCDeclaration:  false
-  AfterStruct:           false
-  AfterUnion:            false
-  AfterExternBlock:      false
-  BeforeCatch:           false
-  BeforeElse:            false
-  IndentBraces:          false
+  AfterEnum: false
+  AfterFunction: false
+  AfterNamespace: false
+  AfterObjCDeclaration: false
+  AfterStruct: false
+  AfterUnion: false
+  AfterExternBlock: false
+  BeforeCatch: false
+  BeforeElse: false
+  IndentBraces: false
   # disabling the below splits, else, they'll just add to the vertical length of source files!
   SplitEmptyFunction: false
   SplitEmptyRecord: false
@@ -56,7 +56,7 @@ BreakConstructorInitializers: BeforeColon
 BreakInheritanceList: BeforeColon
 BreakStringLiterals: true
 ColumnLimit: 100
-CommentPragmas: '^ IWYU pragma:'
+CommentPragmas: "^ IWYU pragma:"
 CompactNamespaces: false
 ConstructorInitializerAllOnOneLineOrOnePerLine: true
 # Kept the below 2 to be the same as `IndentWidth` to keep everything uniform
@@ -73,37 +73,37 @@ ForEachMacros:
   - BOOST_FOREACH
 IncludeBlocks: Regroup
 IncludeCategories:
-  - Regex:           '^"' # quoted includes
-    Priority:        1
-  - Regex:           '^<(benchmarks|tests)/' # benchmark includes
-    Priority:        2
-  - Regex:           '^<cudf_test/' # cuDF includes
-    Priority:        3
-  - Regex:           '^<cudf/' # cuDF includes
-    Priority:        4
-  - Regex:           '^<(nvtext|cudf_kafka)' # other libcudf includes
-    Priority:        5
-  - Regex:           '^<(cugraph|cuml|raft|kvikio)' # Other RAPIDS includes
-    Priority:        6
-  - Regex:           '^<rmm/' # RMM includes
-    Priority:        7
-  - Regex:           '^<(thrust|cub|cuda)/' # CCCL includes
-    Priority:        8
-  - Regex:           '^<(cooperative_groups|cuco|cuda.h|cuda_runtime|device_types|math_constants|nvtx3)' # CUDA includes
-    Priority:        8
-  - Regex:           '^<.*\..*' # other system includes (e.g. with a '.')
-    Priority:        9
-  - Regex:           '^<[^.]+' # STL includes (no '.')
-    Priority:        10
+  - Regex: '^"' # quoted includes
+    Priority: 1
+  - Regex: "^<(benchmarks|tests)/" # benchmark includes
+    Priority: 2
+  - Regex: "^<cudf_test/" # cuDF includes
+    Priority: 3
+  - Regex: "^<cudf/" # cuDF includes
+    Priority: 4
+  - Regex: "^<(nvtext|cudf_kafka)" # other libcudf includes
+    Priority: 5
+  - Regex: "^<(cugraph|cuml|raft|kvikio)" # Other RAPIDS includes
+    Priority: 6
+  - Regex: "^<rmm/" # RMM includes
+    Priority: 7
+  - Regex: "^<(thrust|cub|cuda)/" # CCCL includes
+    Priority: 8
+  - Regex: "^<(cooperative_groups|cuco|cuda.h|cuda_runtime|device_types|math_constants|nvtx3)" # CUDA includes
+    Priority: 8
+  - Regex: '^<.*\..*' # other system includes (e.g. with a '.')
+    Priority: 9
+  - Regex: "^<[^.]+" # STL includes (no '.')
+    Priority: 10
 IndentCaseLabels: true
 IndentPPDirectives: None
-IndentWidth:     2
+IndentWidth: 2
 IndentWrappedFunctionNames: false
 JavaScriptQuotes: Leave
 JavaScriptWrapImports: true
 KeepEmptyLinesAtTheStartOfBlocks: false
-MacroBlockBegin: ''
-MacroBlockEnd:   ''
+MacroBlockBegin: ""
+MacroBlockEnd: ""
 MaxEmptyLinesToKeep: 1
 NamespaceIndentation: None
 ObjCBinPackProtocolList: Never
@@ -127,9 +127,9 @@ RawStringFormats:
       - cpp
       - Cpp
       - CPP
-      - 'c++'
-      - 'C++'
-    CanonicalDelimiter: ''
+      - "c++"
+      - "C++"
+    CanonicalDelimiter: ""
   - Language: TextProto
     Delimiters:
       - pb
@@ -144,7 +144,7 @@ RawStringFormats:
       - PARSE_TEXT_PROTO
       - ParseTextOrDie
       - ParseTextProtoOrDie
-    CanonicalDelimiter: ''
+    CanonicalDelimiter: ""
     BasedOnStyle: google
 # Enabling comment reflow causes doxygen comments to be messed up in their formats!
 ReflowComments: true

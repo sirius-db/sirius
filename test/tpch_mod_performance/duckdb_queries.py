@@ -12,8 +12,10 @@
 # the License.
 # =============================================================================
 
+
 def q1(con):
-    con.execute('''
+    con.execute(
+        """
 select
   l_returnflag,
   l_linestatus,
@@ -35,10 +37,13 @@ group by
 order by
   l_returnflag,
   l_linestatus
-                ''')
-    
+                """
+    )
+
+
 def q2(con):
-    con.execute('''
+    con.execute(
+        """
 select
   s_acctbal,
   s_name,
@@ -81,11 +86,14 @@ order by
   s_acctbal desc,
   n_name,
   s_name,
-  p_partkey              
-                ''')
-    
+  p_partkey
+                """
+    )
+
+
 def q3(con):
-    con.execute('''
+    con.execute(
+        """
 select
   l_orderkey,
   sum(l_extendedprice * (1 - l_discount)) as revenue,
@@ -108,10 +116,13 @@ group by
 order by
   revenue desc,
   o_orderdate
-                ''')
-    
+                """
+    )
+
+
 def q4(con):
-    con.execute('''
+    con.execute(
+        """
 select
   o_orderpriority,
   count(*) as order_count
@@ -133,10 +144,13 @@ group by
   o_orderpriority
 order by
   o_orderpriority
-                ''')
-    
+                """
+    )
+
+
 def q5(con):
-    con.execute('''
+    con.execute(
+        """
 select
   n_name,
   sum(l_extendedprice * (1 - l_discount)) as revenue
@@ -161,10 +175,13 @@ group by
   n_name
 order by
   revenue desc
-                ''')
+                """
+    )
+
 
 def q6(con):
-    con.execute('''
+    con.execute(
+        """
 select
   sum(l_extendedprice * l_discount) as revenue
 from
@@ -174,10 +191,13 @@ where
   and l_shipdate <= 19941231
   and l_discount between 0.05 and 0.07
   and l_quantity < 24
-                ''')
-    
+                """
+    )
+
+
 def q7(con):
-    con.execute('''
+    con.execute(
+        """
 select
   supp_nation,
   cust_nation,
@@ -216,10 +236,13 @@ order by
   supp_nation,
   cust_nation,
   l_year
-                ''')
-    
+                """
+    )
+
+
 def q8(con):
-    con.execute('''
+    con.execute(
+        """
 select
   o_year,
   sum(case
@@ -257,10 +280,13 @@ group by
   o_year
 order by
   o_year
-                ''')
+                """
+    )
+
 
 def q9(con):
-    con.execute('''
+    con.execute(
+        """
 select
   nation,
   o_year,
@@ -292,10 +318,13 @@ group by
 order by
   nation,
   o_year desc
-                ''')
-    
+                """
+    )
+
+
 def q10(con):
-    con.execute('''
+    con.execute(
+        """
 select
   c_custkey,
   c_name,
@@ -324,13 +353,16 @@ group by
   c_phone,
   n_name,
   c_address,
-  c_comment 
+  c_comment
 order by
   revenue desc
-                ''')
-    
+                """
+    )
+
+
 def q11(con):
-    con.execute('''
+    con.execute(
+        """
 select
   *
 from (
@@ -364,10 +396,13 @@ where
 order by
   value desc,
   ps_partkey
-                ''')
-    
+                """
+    )
+
+
 def q12(con):
-    con.execute('''
+    con.execute(
+        """
 select
   l_shipmode,
   sum(case
@@ -396,10 +431,13 @@ group by
   l_shipmode
 order by
   l_shipmode
-                ''')
-    
+                """
+    )
+
+
 def q13(con):
-    con.execute('''
+    con.execute(
+        """
 select
   c_count,
   count(*) as custdist
@@ -420,10 +458,13 @@ group by
 order by
   custdist desc,
   c_count desc
-                ''')
-    
+                """
+    )
+
+
 def q14(con):
-    con.execute('''
+    con.execute(
+        """
 select
     sum(case
     when (p_type >= 125 and p_type < 150)
@@ -437,10 +478,13 @@ where
   l_partkey = p_partkey
   and l_shipdate >= 19950901
   and l_shipdate <= 19950931
-                ''')
-    
+                """
+    )
+
+
 def q15(con):
-    con.execute('''
+    con.execute(
+        """
 with revenue_view as (
   select
     l_suppkey as supplier_no,
@@ -470,10 +514,13 @@ where
     )
 order by
   s_suppkey
-                ''')
-    
+                """
+    )
+
+
 def q16(con):
-    con.execute('''
+    con.execute(
+        """
 select
   p_brand,
   p_type,
@@ -504,10 +551,13 @@ order by
   p_brand,
   p_type,
   p_size
-                ''')
-    
+                """
+    )
+
+
 def q17(con):
-    con.execute('''
+    con.execute(
+        """
 select
   sum(l_extendedprice) / 7.0 as avg_yearly
 from
@@ -525,10 +575,13 @@ where
     where
       l_partkey = p_partkey
   )
-                ''')
-    
+                """
+    )
+
+
 def q18(con):
-    con.execute('''
+    con.execute(
+        """
 select
   c_name,
   c_custkey,
@@ -563,10 +616,13 @@ order by
   o_totalprice desc,
   o_orderdate,
   o_orderkey
-                ''')
-    
+                """
+    )
+
+
 def q19(con):
-    con.execute('''
+    con.execute(
+        """
 select
   sum(l_extendedprice * (1 - l_discount)) as revenue
 from
@@ -602,10 +658,13 @@ where
       and l_shipinstruct = 0
     )
   )
-                ''')
-    
+                """
+    )
+
+
 def q20(con):
-    con.execute('''
+    con.execute(
+        """
 select
   s_name,
   s_address
@@ -642,10 +701,13 @@ where
   and n_name = 'CANADA'
   order by
     s_name
-                ''')
-    
+                """
+    )
+
+
 def q21(con):
-    con.execute('''
+    con.execute(
+        """
 select
   s_name,
   count(*) as numwait
@@ -685,10 +747,13 @@ group by
 order by
   numwait desc,
   s_name
-                ''')
-    
+                """
+    )
+
+
 def q22(con):
-    con.execute('''
+    con.execute(
+        """
 select
   cntrycode,
   count(*) as numcust,
@@ -723,13 +788,15 @@ group by
   cntrycode
 order by
   cntrycode
-                ''')
+                """
+    )
+
 
 def run_duckdb(con, warmup=False):
     q1(con)
     print("Q1 done") if (not warmup) else None
     q2(con)
-    print("Q2 done") if (not warmup) else None 
+    print("Q2 done") if (not warmup) else None
     q3(con)
     print("Q3 done") if (not warmup) else None
     q4(con)

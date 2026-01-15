@@ -14,6 +14,9 @@
  * limitations under the License.
  */
 
+#include "log/logging.hpp"
+#include "sirius_extension.hpp"
+
 #include <cudf/aggregation.hpp>
 #include <cudf/groupby.hpp>
 #include <cudf/io/csv.hpp>
@@ -24,19 +27,16 @@
 #include <rmm/mr/device/device_memory_resource.hpp>
 #include <rmm/mr/device/pool_memory_resource.hpp>
 
+#include <stdlib.h>
+
+#include <cstdlib>
+#include <filesystem>
+#include <iostream>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
-#include <iostream>
-#include <stdlib.h>
-#include <cstdlib>
-#include <stdexcept>
-#include <string>
-#include <filesystem>
-
-#include "sirius_extension.hpp"
-#include "log/logging.hpp"
 
 namespace duckdb {
 
@@ -62,14 +62,13 @@ namespace duckdb {
 //   return cudf::io::read_csv(options);
 // }
 
-
 cudf::io::table_with_metadata read_csv(std::string const& file_path)
 {
   SIRIUS_LOG_DEBUG("Reading CSV file: {}", file_path);
   auto source_info = cudf::io::source_info(file_path);
   auto builder     = cudf::io::csv_reader_options::builder(source_info);
   // auto options = cudf::io::csv_reader_options::builder(source_info);
-  auto options     = builder.build();
+  auto options = builder.build();
   // SIRIUS_LOG_DEBUG("{}", options)
   return cudf::io::read_csv(options);
 }
@@ -137,14 +136,14 @@ void test_cudf()
 
   // Determine the paths
   std::filesystem::path sirius_dir(sirius_directory_path);
-  std::filesystem::path input_file = sirius_dir / "4stock_5day.csv";
+  std::filesystem::path input_file  = sirius_dir / "4stock_5day.csv";
   std::filesystem::path output_file = sirius_dir / "4stock_5day_avg_close.csv";
 
   auto stock_table_with_metadata = read_csv(input_file.string());
-  auto result = average_closing_price(*stock_table_with_metadata.tbl);
+  auto result                    = average_closing_price(*stock_table_with_metadata.tbl);
 
   // Write out result
   write_csv(*result, output_file.string());
 }
 
-} //namespace duckdb
+}  // namespace duckdb
