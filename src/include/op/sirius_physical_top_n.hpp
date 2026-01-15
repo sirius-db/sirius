@@ -33,11 +33,11 @@ class sirius_physical_top_n : public sirius_physical_operator {
 
  public:
   sirius_physical_top_n(duckdb::vector<duckdb::LogicalType> types_p,
-                  duckdb::vector<duckdb::BoundOrderByNode> orders,
-                  duckdb::idx_t limit,
-                  duckdb::idx_t offset,
-                  duckdb::shared_ptr<duckdb::DynamicFilterData> dynamic_filter,
-                  duckdb::idx_t estimated_cardinality);
+                        duckdb::vector<duckdb::BoundOrderByNode> orders,
+                        duckdb::idx_t limit,
+                        duckdb::idx_t offset,
+                        duckdb::shared_ptr<duckdb::DynamicFilterData> dynamic_filter,
+                        duckdb::idx_t estimated_cardinality);
   ~sirius_physical_top_n() override;
 
   duckdb::vector<duckdb::BoundOrderByNode> orders;
@@ -47,12 +47,13 @@ class sirius_physical_top_n : public sirius_physical_operator {
   duckdb::shared_ptr<duckdb::DynamicFilterData> dynamic_filter;
 
  public:
-
   bool is_source() const override { return true; }
-  duckdb::OrderPreservationType source_order() const override { return duckdb::OrderPreservationType::FIXED_ORDER; }
+  duckdb::OrderPreservationType source_order() const override
+  {
+    return duckdb::OrderPreservationType::FIXED_ORDER;
+  }
 
  public:
-
   bool is_sink() const override { return true; }
   bool parallel_sink() const override { return true; }
 };

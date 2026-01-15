@@ -22,21 +22,22 @@
 // #include "duckdb/parallel/meta_pipeline.hpp"
 // #include "duckdb/parallel/pipeline.hpp"
 
-#include "pipeline/sirius_meta_pipeline.hpp"
-#include "op/sirius_physical_cte.hpp"
-#include "pipeline/sirius_pipeline.hpp"
 #include "log/logging.hpp"
+#include "op/sirius_physical_cte.hpp"
+#include "pipeline/sirius_meta_pipeline.hpp"
+#include "pipeline/sirius_pipeline.hpp"
 
 namespace sirius {
 namespace op {
 
 sirius_physical_cte::sirius_physical_cte(std::string ctename,
-                               duckdb::idx_t table_index,
-                               duckdb::vector<duckdb::LogicalType> types,
-                               duckdb::unique_ptr<sirius_physical_operator> top,
-                               duckdb::unique_ptr<sirius_physical_operator> bottom,
-                               duckdb::idx_t estimated_cardinality)
-  : sirius_physical_operator(duckdb::PhysicalOperatorType::CTE, std::move(types), estimated_cardinality),
+                                         duckdb::idx_t table_index,
+                                         duckdb::vector<duckdb::LogicalType> types,
+                                         duckdb::unique_ptr<sirius_physical_operator> top,
+                                         duckdb::unique_ptr<sirius_physical_operator> bottom,
+                                         duckdb::idx_t estimated_cardinality)
+  : sirius_physical_operator(
+      duckdb::PhysicalOperatorType::CTE, std::move(types), estimated_cardinality),
     table_index(table_index),
     ctename(std::move(ctename))
 {
@@ -49,7 +50,8 @@ sirius_physical_cte::~sirius_physical_cte() {}
 //===--------------------------------------------------------------------===//
 // Pipeline Construction
 //===--------------------------------------------------------------------===//
-void sirius_physical_cte::build_pipelines(pipeline::sirius_pipeline& current, pipeline::sirius_meta_pipeline& meta_pipeline)
+void sirius_physical_cte::build_pipelines(pipeline::sirius_pipeline& current,
+                                          pipeline::sirius_meta_pipeline& meta_pipeline)
 {
   D_ASSERT(children.size() == 2);
   op_state.reset();
@@ -61,14 +63,16 @@ void sirius_physical_cte::build_pipelines(pipeline::sirius_pipeline& current, pi
   child_meta_pipeline.build(*children[0]);
 
   for (auto& cte_scan : cte_scans) {
-    state.cte_dependencies.insert(
-      duckdb::make_pair(cte_scan, duckdb::reference<pipeline::sirius_pipeline>(*child_meta_pipeline.get_base_pipeline())));
+    state.cte_dependencies.insert(duckdb::make_pair(
+      cte_scan,
+      duckdb::reference<pipeline::sirius_pipeline>(*child_meta_pipeline.get_base_pipeline())));
   }
 
   children[1]->build_pipelines(current, meta_pipeline);
 }
 
-duckdb::vector<duckdb::const_reference<sirius_physical_operator>> sirius_physical_cte::get_sources() const
+duckdb::vector<duckdb::const_reference<sirius_physical_operator>> sirius_physical_cte::get_sources()
+  const
 {
   return children[1]->get_sources();
 }

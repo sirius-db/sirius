@@ -23,8 +23,8 @@
 #include <memory/memory_reservation.hpp>
 #include <memory/memory_reservation_manager.hpp>
 #include <op/gpu_physical_table_scan.hpp>
-#include <parallel/task.hpp>
 #include <op/scan/duckdb_scan_executor.hpp>
+#include <parallel/task.hpp>
 
 // duckdb
 #include <duckdb/common/types.hpp>

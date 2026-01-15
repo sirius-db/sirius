@@ -30,16 +30,19 @@
 namespace sirius {
 namespace op {
 
-sirius_physical_filter::sirius_physical_filter(duckdb::vector<duckdb::LogicalType> types,
-                                     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> select_list,
-                                     duckdb::idx_t estimated_cardinality)
-  : sirius_physical_operator(duckdb::PhysicalOperatorType::FILTER, std::move(types), estimated_cardinality)
+sirius_physical_filter::sirius_physical_filter(
+  duckdb::vector<duckdb::LogicalType> types,
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> select_list,
+  duckdb::idx_t estimated_cardinality)
+  : sirius_physical_operator(
+      duckdb::PhysicalOperatorType::FILTER, std::move(types), estimated_cardinality)
 {
   D_ASSERT(select_list.size() > 0);
   if (select_list.size() > 1) {
     // KEVIN: I don't think this code path is ever entered
     // create a big AND out of the expressions
-    auto conjunction = duckdb::make_uniq<duckdb::BoundConjunctionExpression>(duckdb::ExpressionType::CONJUNCTION_AND);
+    auto conjunction = duckdb::make_uniq<duckdb::BoundConjunctionExpression>(
+      duckdb::ExpressionType::CONJUNCTION_AND);
     for (auto& expr : select_list) {
       conjunction->children.push_back(std::move(expr));
     }

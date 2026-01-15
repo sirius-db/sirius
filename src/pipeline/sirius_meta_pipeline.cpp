@@ -23,9 +23,10 @@
 namespace sirius {
 namespace pipeline {
 
-sirius_meta_pipeline::sirius_meta_pipeline(duckdb::GPUExecutor& executor_p,
-                                 sirius_pipeline_build_state& state_p,
-                                 duckdb::optional_ptr<op::sirius_physical_operator> sink_p)
+sirius_meta_pipeline::sirius_meta_pipeline(
+  duckdb::GPUExecutor& executor_p,
+  sirius_pipeline_build_state& state_p,
+  duckdb::optional_ptr<op::sirius_physical_operator> sink_p)
   : executor(executor_p), state(state_p), sink(sink_p), recursive_cte(false), next_batch_index(0)
 {
   create_pipeline();
@@ -35,11 +36,20 @@ duckdb::GPUExecutor& sirius_meta_pipeline::get_executor() const { return executo
 
 sirius_pipeline_build_state& sirius_meta_pipeline::get_state() const { return state; }
 
-duckdb::optional_ptr<op::sirius_physical_operator> sirius_meta_pipeline::get_sink() const { return sink; }
+duckdb::optional_ptr<op::sirius_physical_operator> sirius_meta_pipeline::get_sink() const
+{
+  return sink;
+}
 
-duckdb::shared_ptr<sirius_pipeline>& sirius_meta_pipeline::get_base_pipeline() { return pipelines[0]; }
+duckdb::optional_ptr<sirius_pipeline> sirius_meta_pipeline::get_parent() const { return parent; }
 
-void sirius_meta_pipeline::get_pipelines(duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& result, bool recursive)
+duckdb::shared_ptr<sirius_pipeline>& sirius_meta_pipeline::get_base_pipeline()
+{
+  return pipelines[0];
+}
+
+void sirius_meta_pipeline::get_pipelines(
+  duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& result, bool recursive)
 {
   result.insert(result.end(), pipelines.begin(), pipelines.end());
   if (recursive) {
@@ -49,11 +59,12 @@ void sirius_meta_pipeline::get_pipelines(duckdb::vector<duckdb::shared_ptr<siriu
   }
 }
 
-void sirius_meta_pipeline::get_meta_pipelines(duckdb::vector<duckdb::shared_ptr<sirius_meta_pipeline>>& result,
-                                       bool recursive,
-                                       bool skip)
+void sirius_meta_pipeline::get_meta_pipelines(
+  duckdb::vector<duckdb::shared_ptr<sirius_meta_pipeline>>& result, bool recursive, bool skip)
 {
-  if (!skip) { result.push_back(duckdb::enable_shared_from_this<sirius_meta_pipeline>::shared_from_this()); }
+  if (!skip) {
+    result.push_back(duckdb::enable_shared_from_this<sirius_meta_pipeline>::shared_from_this());
+  }
   if (recursive) {
     for (auto& child : children) {
       child->get_meta_pipelines(result, true, false);
@@ -61,8 +72,19 @@ void sirius_meta_pipeline::get_meta_pipelines(duckdb::vector<duckdb::shared_ptr<
   }
 }
 
-duckdb::optional_ptr<const duckdb::vector<duckdb::reference<sirius_pipeline>>> sirius_meta_pipeline::get_dependencies(
-  sirius_pipeline& dependent) const
+sirius_meta_pipeline& sirius_meta_pipeline::get_last_child()
+{
+  if (children.empty()) { return *this; }
+  duckdb::reference<const duckdb::vector<duckdb::shared_ptr<sirius_meta_pipeline>>>
+    current_children = children;
+  while (!current_children.get().back()->children.empty()) {
+    current_children = current_children.get().back()->children;
+  }
+  return *current_children.get().back();
+}
+
+duckdb::optional_ptr<const duckdb::vector<duckdb::reference<sirius_pipeline>>>
+sirius_meta_pipeline::get_dependencies(sirius_pipeline& dependent) const
 {
   auto it = dependencies.find(dependent);
   if (it == dependencies.end()) {
@@ -99,11 +121,13 @@ void sirius_meta_pipeline::ready()
   }
 }
 
-sirius_meta_pipeline& sirius_meta_pipeline::create_child_meta_pipeline(sirius_pipeline& current,
-                                                          op::sirius_physical_operator& op)
+sirius_meta_pipeline& sirius_meta_pipeline::create_child_meta_pipeline(
+  sirius_pipeline& current, op::sirius_physical_operator& op)
 {
   children.push_back(duckdb::make_shared_ptr<sirius_meta_pipeline>(executor, state, &op));
   auto child_meta_pipeline = children.back().get();
+  // store the parent
+  child_meta_pipeline->parent = &current;
   // child sirius_meta_pipeline must finish completely before this sirius_meta_pipeline can start
   current.add_dependency(child_meta_pipeline->get_base_pipeline());
   // child meta pipeline is part of the recursive CTE too
@@ -119,8 +143,8 @@ sirius_pipeline& sirius_meta_pipeline::create_pipeline()
 }
 
 void sirius_meta_pipeline::add_dependencies_from(sirius_pipeline& dependent,
-                                          sirius_pipeline& start,
-                                          bool including)
+                                                 sirius_pipeline& start,
+                                                 bool including)
 {
   // find 'start'
   auto it = pipelines.begin();
@@ -143,6 +167,45 @@ void sirius_meta_pipeline::add_dependencies_from(sirius_pipeline& dependent,
   deps.insert(deps.begin(), created_pipelines.begin(), created_pipelines.end());
 }
 
+void sirius_meta_pipeline::add_recursive_dependencies(
+  const duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& new_dependencies,
+  const sirius_meta_pipeline& last_child)
+{
+  if (recursive_cte) {
+    return;  // let's not burn our fingers on this for now
+  }
+
+  duckdb::vector<duckdb::shared_ptr<sirius_meta_pipeline>> child_meta_pipelines;
+  this->get_meta_pipelines(child_meta_pipelines, true, false);
+
+  // find the meta pipeline that has the same sink as 'pipeline'
+  auto it = child_meta_pipelines.begin();
+  for (; !duckdb::RefersToSameObject(last_child, **it); it++) {}
+  D_ASSERT(it != child_meta_pipelines.end());
+
+  // skip over it
+  it++;
+
+  // we try to limit the performance impact of these dependencies on smaller workloads,
+  // by only adding the dependencies if the source operator can likely keep all threads busy
+  // const auto thread_count =
+  // duckdb::NumericCast<idx_t>(duckdb::TaskScheduler::GetScheduler(executor.context).NumberOfThreads());
+  // for (; it != child_meta_pipelines.end(); it++) {
+  // 	for (auto &pipeline : it->get()->pipelines) {
+  // 		if (!PipelineExceedsThreadCount(*pipeline, thread_count)) {
+  // 			continue;
+  // 		}
+  // 		auto &pipeline_deps = pipeline_dependencies[*pipeline];
+  // 		for (auto &new_dependency : new_dependencies) {
+  // 			if (!PipelineExceedsThreadCount(*new_dependency, thread_count)) {
+  // 				continue;
+  // 			}
+  // 			pipeline_deps.push_back(*new_dependency);
+  // 		}
+  // 	}
+  // }
+}
+
 void sirius_meta_pipeline::add_finish_event(sirius_pipeline& pipeline)
 {
   D_ASSERT(finish_pipelines.find(pipeline) == finish_pipelines.end());
@@ -163,13 +226,15 @@ bool sirius_meta_pipeline::has_finish_event(sirius_pipeline& pipeline) const
   return finish_pipelines.find(pipeline) != finish_pipelines.end();
 }
 
-duckdb::optional_ptr<sirius_pipeline> sirius_meta_pipeline::get_finish_group(sirius_pipeline& pipeline) const
+duckdb::optional_ptr<sirius_pipeline> sirius_meta_pipeline::get_finish_group(
+  sirius_pipeline& pipeline) const
 {
   auto it = finish_map.find(pipeline);
   return it == finish_map.end() ? nullptr : &it->second;
 }
 
-sirius_pipeline& sirius_meta_pipeline::create_union_pipeline(sirius_pipeline& current, bool order_matters)
+sirius_pipeline& sirius_meta_pipeline::create_union_pipeline(sirius_pipeline& current,
+                                                             bool order_matters)
 {
   // create the union pipeline (batch index 0, should be set correctly afterwards)
   auto& union_pipeline = create_pipeline();
@@ -191,8 +256,8 @@ sirius_pipeline& sirius_meta_pipeline::create_union_pipeline(sirius_pipeline& cu
 }
 
 void sirius_meta_pipeline::create_child_pipeline(sirius_pipeline& current,
-                                          op::sirius_physical_operator& op,
-                                          sirius_pipeline& last_pipeline)
+                                                 op::sirius_physical_operator& op,
+                                                 sirius_pipeline& last_pipeline)
 {
   // rule 2: 'current' must be fully built (down to the source) before creating the child pipeline
   D_ASSERT(current.source);

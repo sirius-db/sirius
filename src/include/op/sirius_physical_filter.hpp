@@ -30,8 +30,8 @@ class sirius_physical_filter : public sirius_physical_operator {
 
  public:
   sirius_physical_filter(duckdb::vector<duckdb::LogicalType> types,
-                    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> select_list,
-                    duckdb::idx_t estimated_cardinality);
+                         duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> select_list,
+                         duckdb::idx_t estimated_cardinality);
 
   //! The filter expression
   duckdb::unique_ptr<duckdb::Expression> expression;
@@ -39,7 +39,8 @@ class sirius_physical_filter : public sirius_physical_operator {
   // sirius_expression_executor* sirius_expression_executor;
 
   // public:
-  // 	std::unique_ptr<duckdb::OperatorState> get_operator_state(duckdb::ExecutionContext &context) const override;
+  // 	std::unique_ptr<duckdb::OperatorState> get_operator_state(duckdb::ExecutionContext &context)
+  // const override;
 
   // 	bool parallel_operator() const override {
   // 		return true;

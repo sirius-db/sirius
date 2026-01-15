@@ -18,8 +18,8 @@
 
 #include "duckdb/common/enums/statement_type.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
-#include "op/sirius_physical_operator.hpp"
 #include "gpu_query_result.hpp"
+#include "op/sirius_physical_operator.hpp"
 
 namespace duckdb {
 class GPUPreparedStatementData;
@@ -36,7 +36,8 @@ namespace op {
 
 class sirius_physical_result_collector : public sirius_physical_operator {
  public:
-  static constexpr const duckdb::PhysicalOperatorType TYPE = duckdb::PhysicalOperatorType::RESULT_COLLECTOR;
+  static constexpr const duckdb::PhysicalOperatorType TYPE =
+    duckdb::PhysicalOperatorType::RESULT_COLLECTOR;
 
  public:
   explicit sirius_physical_result_collector(duckdb::GPUPreparedStatementData& data);
@@ -54,7 +55,8 @@ class sirius_physical_result_collector : public sirius_physical_operator {
 
  public:
   duckdb::vector<duckdb::const_reference<sirius_physical_operator>> get_children() const override;
-  void build_pipelines(pipeline::sirius_pipeline& current, pipeline::sirius_meta_pipeline& meta_pipeline) override;
+  void build_pipelines(pipeline::sirius_pipeline& current,
+                       pipeline::sirius_meta_pipeline& meta_pipeline) override;
 
   bool is_source() const override { return true; }
 };
@@ -69,8 +71,10 @@ class sirius_physical_materialized_collector : public sirius_physical_result_col
 
  public:
   // Sink interface
-  duckdb::unique_ptr<duckdb::LocalSinkState> get_local_sink_state(duckdb::ExecutionContext& context) const override;
-  duckdb::unique_ptr<duckdb::GlobalSinkState> get_global_sink_state(duckdb::ClientContext& context) const override;
+  duckdb::unique_ptr<duckdb::LocalSinkState> get_local_sink_state(
+    duckdb::ExecutionContext& context) const override;
+  duckdb::unique_ptr<duckdb::GlobalSinkState> get_global_sink_state(
+    duckdb::ClientContext& context) const override;
 };
 
 }  // namespace op

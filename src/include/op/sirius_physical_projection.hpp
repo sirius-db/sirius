@@ -24,12 +24,13 @@ namespace op {
 
 class sirius_physical_projection : public sirius_physical_operator {
  public:
-  static constexpr const duckdb::PhysicalOperatorType TYPE = duckdb::PhysicalOperatorType::PROJECTION;
+  static constexpr const duckdb::PhysicalOperatorType TYPE =
+    duckdb::PhysicalOperatorType::PROJECTION;
 
  public:
   sirius_physical_projection(duckdb::vector<duckdb::LogicalType> types,
-                        duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> select_list,
-                        duckdb::idx_t estimated_cardinality);
+                             duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> select_list,
+                             duckdb::idx_t estimated_cardinality);
 
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> select_list;
 };

@@ -28,10 +28,11 @@ namespace sirius {
 namespace op {
 
 sirius_physical_partition::sirius_physical_partition(duckdb::vector<duckdb::LogicalType> types,
-                                           duckdb::idx_t estimated_cardinality,
-                                           sirius_physical_operator* parent_op,
-                                           bool is_build)
-  : sirius_physical_operator(duckdb::PhysicalOperatorType::INVALID, std::move(types), estimated_cardinality)
+                                                     duckdb::idx_t estimated_cardinality,
+                                                     sirius_physical_operator* parent_op,
+                                                     bool is_build)
+  : sirius_physical_operator(
+      duckdb::PhysicalOperatorType::INVALID, std::move(types), estimated_cardinality)
 {
   _num_partitions = (estimated_cardinality + PARTITION_SIZE - 1) / PARTITION_SIZE;
   _parent_op      = parent_op;
@@ -54,7 +55,8 @@ void sirius_physical_partition::get_partition_keys(sirius_physical_operator* op,
       for (duckdb::idx_t cond_idx = 0; cond_idx < hash_join_op.conditions.size(); cond_idx++) {
         auto& condition = hash_join_op.conditions[cond_idx];
         if (condition.right->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
-          _partition_keys.push_back(condition.right->Cast<duckdb::BoundReferenceExpression>().index);
+          _partition_keys.push_back(
+            condition.right->Cast<duckdb::BoundReferenceExpression>().index);
         }
       }
     } else {

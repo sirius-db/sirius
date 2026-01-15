@@ -261,7 +261,9 @@ GPUPhysicalGroupedAggregate::GPUPhysicalGroupedAggregate(ClientContext& context,
                                 std::move(groups_p),
                                 {},
                                 {},
-                                estimated_cardinality)
+                                estimated_cardinality,
+                                TupleDataValidityType::CAN_HAVE_NULL_VALUES,
+                                TupleDataValidityType::CAN_HAVE_NULL_VALUES)
 {
 }
 
@@ -279,7 +281,9 @@ GPUPhysicalGroupedAggregate::GPUPhysicalGroupedAggregate(
   vector<unique_ptr<Expression>> groups_p,
   vector<GroupingSet> grouping_sets_p,
   vector<unsafe_vector<idx_t>> grouping_functions_p,
-  idx_t estimated_cardinality)
+  idx_t estimated_cardinality,
+  TupleDataValidityType group_validity,
+  TupleDataValidityType distinct_validity)
   : GPUPhysicalOperator(
       PhysicalOperatorType::HASH_GROUP_BY, std::move(types), estimated_cardinality),
     grouping_sets(std::move(grouping_sets_p))
@@ -335,7 +339,11 @@ GPUPhysicalGroupedAggregate::GPUPhysicalGroupedAggregate(
     DistinctAggregateCollectionInfo::Create(grouped_aggregate_data.aggregates);
 
   for (idx_t i = 0; i < grouping_sets.size(); i++) {
-    groupings.emplace_back(grouping_sets[i], grouped_aggregate_data, distinct_collection_info);
+    groupings.emplace_back(grouping_sets[i],
+                           grouped_aggregate_data,
+                           distinct_collection_info,
+                           group_validity,
+                           distinct_validity);
   }
 
   // The output of groupby is ordered as the grouping columns first followed by the aggregate

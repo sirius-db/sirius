@@ -24,13 +24,14 @@
 #include "duckdb/execution/operator/set/physical_recursive_cte.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/parallel/pipeline_event.hpp"
 #include "duckdb/parallel/pipeline_executor.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
-#include "pipeline/sirius_meta_pipeline.hpp"
+#include "gpu_executor.hpp"
 #include "log/logging.hpp"
 #include "op/sirius_physical_table_scan.hpp"
-#include "gpu_executor.hpp"
+#include "pipeline/sirius_meta_pipeline.hpp"
 
 namespace sirius {
 namespace pipeline {
@@ -55,7 +56,9 @@ bool sirius_pipeline::is_order_dependent() const
     if (op.operator_order() == duckdb::OrderPreservationType::NO_ORDER) { return false; }
     if (op.operator_order() == duckdb::OrderPreservationType::FIXED_ORDER) { return true; }
   }
-  if (!config.options.preserve_insertion_order) { return false; }
+  if (!duckdb::DBConfig::GetSetting<duckdb::PreserveInsertionOrderSetting>(executor.context)) {
+    return false;
+  }
   if (sink && sink->sink_order_dependent()) { return true; }
   return false;
 }
@@ -63,7 +66,9 @@ bool sirius_pipeline::is_order_dependent() const
 void sirius_pipeline::reset_sink()
 {
   if (sink) {
-    if (!sink->is_sink()) { throw duckdb::InternalException("Sink of pipeline does not have is_sink set"); }
+    if (!sink->is_sink()) {
+      throw duckdb::InternalException("Sink of pipeline does not have is_sink set");
+    }
     std::lock_guard<std::mutex> guard(sink->lock);
     if (!sink->sink_state) { sink->sink_state = sink->get_global_sink_state(get_client_context()); }
   }
@@ -89,7 +94,9 @@ void sirius_pipeline::reset_source(bool force)
   if (source && !source->is_source()) {
     throw duckdb::InternalException("Source of pipeline does not have is_source set");
   }
-  if (force || !source_state) { source_state = source->get_global_source_state(get_client_context()); }
+  if (force || !source_state) {
+    source_state = source->get_global_source_state(get_client_context());
+  }
 }
 
 void sirius_pipeline::is_ready()
@@ -134,7 +141,8 @@ duckdb::vector<duckdb::reference<op::sirius_physical_operator>> sirius_pipeline:
   return result;
 }
 
-duckdb::vector<duckdb::const_reference<op::sirius_physical_operator>> sirius_pipeline::get_all_operators() const
+duckdb::vector<duckdb::const_reference<op::sirius_physical_operator>>
+sirius_pipeline::get_all_operators() const
 {
   duckdb::vector<duckdb::const_reference<op::sirius_physical_operator>> result;
   D_ASSERT(source);
@@ -146,7 +154,8 @@ duckdb::vector<duckdb::const_reference<op::sirius_physical_operator>> sirius_pip
   return result;
 }
 
-duckdb::vector<duckdb::reference<op::sirius_physical_operator>> sirius_pipeline::get_inner_operators()
+duckdb::vector<duckdb::reference<op::sirius_physical_operator>>
+sirius_pipeline::get_inner_operators()
 {
   duckdb::vector<duckdb::reference<op::sirius_physical_operator>> result;
   for (auto& op : operators) {
@@ -173,14 +182,15 @@ duckdb::idx_t sirius_pipeline::update_batch_index(duckdb::idx_t old_index, duckd
 {
   std::lock_guard<std::mutex> l(batch_lock);
   if (new_index < *batch_indexes.begin()) {
-    throw duckdb::InternalException("Processing batch index %llu, but previous min batch index was %llu",
-                            new_index,
-                            *batch_indexes.begin());
+    throw duckdb::InternalException(
+      "Processing batch index %llu, but previous min batch index was %llu",
+      new_index,
+      *batch_indexes.begin());
   }
   auto entry = batch_indexes.find(old_index);
   if (entry == batch_indexes.end()) {
     throw duckdb::InternalException("Batch index %llu was not found in set of active batch indexes",
-                            old_index);
+                                    old_index);
   }
   batch_indexes.erase(entry);
   batch_indexes.insert(new_index);
@@ -190,55 +200,61 @@ duckdb::idx_t sirius_pipeline::update_batch_index(duckdb::idx_t old_index, duckd
 //===--------------------------------------------------------------------===//
 // GPU Pipeline Build State
 //===--------------------------------------------------------------------===//
-void sirius_pipeline_build_state::set_pipeline_source(sirius_pipeline& pipeline, op::sirius_physical_operator& op)
+void sirius_pipeline_build_state::set_pipeline_source(sirius_pipeline& pipeline,
+                                                      op::sirius_physical_operator& op)
 {
   SIRIUS_LOG_DEBUG("Setting pipeline source {}", duckdb::PhysicalOperatorToString(op.type));
   pipeline.source = &op;
 }
 
-void sirius_pipeline_build_state::set_pipeline_sink(sirius_pipeline& pipeline,
-                                            duckdb::optional_ptr<op::sirius_physical_operator> op,
-                                            duckdb::idx_t sink_pipeline_count)
+void sirius_pipeline_build_state::set_pipeline_sink(
+  sirius_pipeline& pipeline,
+  duckdb::optional_ptr<op::sirius_physical_operator> op,
+  duckdb::idx_t sink_pipeline_count)
 {
   pipeline.sink = op;
   if (pipeline.sink)
-    SIRIUS_LOG_DEBUG("Setting pipeline sink {}", duckdb::PhysicalOperatorToString((*pipeline.sink).type));
+    SIRIUS_LOG_DEBUG("Setting pipeline sink {}",
+                     duckdb::PhysicalOperatorToString((*pipeline.sink).type));
   // set the base batch index of this pipeline based on how many other pipelines have this node as
   // their sink
   pipeline.base_batch_index = BATCH_INCREMENT * sink_pipeline_count;
 }
 
-void sirius_pipeline_build_state::add_pipeline_operator(sirius_pipeline& pipeline, op::sirius_physical_operator& op)
+void sirius_pipeline_build_state::add_pipeline_operator(sirius_pipeline& pipeline,
+                                                        op::sirius_physical_operator& op)
 {
   SIRIUS_LOG_DEBUG("Adding operator to pipeline {}", duckdb::PhysicalOperatorToString(op.type));
   pipeline.operators.push_back(op);
 }
 
-duckdb::optional_ptr<op::sirius_physical_operator> sirius_pipeline_build_state::get_pipeline_source(sirius_pipeline& pipeline)
+duckdb::optional_ptr<op::sirius_physical_operator> sirius_pipeline_build_state::get_pipeline_source(
+  sirius_pipeline& pipeline)
 {
   return pipeline.source;
 }
 
-duckdb::optional_ptr<op::sirius_physical_operator> sirius_pipeline_build_state::get_pipeline_sink(sirius_pipeline& pipeline)
+duckdb::optional_ptr<op::sirius_physical_operator> sirius_pipeline_build_state::get_pipeline_sink(
+  sirius_pipeline& pipeline)
 {
   return pipeline.sink;
 }
 
-void sirius_pipeline_build_state::set_pipeline_operators(sirius_pipeline& pipeline,
-                                                 duckdb::vector<duckdb::reference<op::sirius_physical_operator>> operators)
+void sirius_pipeline_build_state::set_pipeline_operators(
+  sirius_pipeline& pipeline,
+  duckdb::vector<duckdb::reference<op::sirius_physical_operator>> operators)
 {
   pipeline.operators = std::move(operators);
 }
 
-duckdb::shared_ptr<sirius_pipeline> sirius_pipeline_build_state::create_child_pipeline(duckdb::GPUExecutor& executor,
-                                                                   sirius_pipeline& pipeline,
-                                                                   op::sirius_physical_operator& op)
+duckdb::shared_ptr<sirius_pipeline> sirius_pipeline_build_state::create_child_pipeline(
+  duckdb::GPUExecutor& executor, sirius_pipeline& pipeline, op::sirius_physical_operator& op)
 {
   return executor.create_child_pipeline(pipeline, op);
 }
 
-duckdb::vector<duckdb::reference<op::sirius_physical_operator>> sirius_pipeline_build_state::get_pipeline_operators(
-  sirius_pipeline& pipeline)
+duckdb::vector<duckdb::reference<op::sirius_physical_operator>>
+sirius_pipeline_build_state::get_pipeline_operators(sirius_pipeline& pipeline)
 {
   return pipeline.operators;
 }

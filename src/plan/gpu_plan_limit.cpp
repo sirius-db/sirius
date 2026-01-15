@@ -63,27 +63,29 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::CreatePlan(LogicalLimi
       //                                         op.estimated_cardinality);
       break;
     default:
-      // if (!PreserveInsertionOrder(*plan)) {
-      // use parallel streaming limit if insertion order is not important
-      limit = make_uniq<GPUPhysicalStreamingLimit>(op.types,
-                                                   std::move(op.limit_val),
-                                                   std::move(op.offset_val),
-                                                   op.estimated_cardinality,
-                                                   true);
-      // } else {
-      // 	// maintaining insertion order is important
-      // 	if (UseBatchIndex(*plan) && UseBatchLimit(op.limit_val, op.offset_val)) {
-      // 		// source supports batch index: use parallel batch limit
-      // 		throw NotImplementedException("Batch limit not supported in GPU");
-      // 		// limit = make_uniq<PhysicalLimit>(op.types, std::move(op.limit_val),
-      // std::move(op.offset_val),
-      // 		//                                  op.estimated_cardinality);
-      // 	} else {
-      // 		// source does not support batch index: use a non-parallel streaming limit
-      // 		limit = make_uniq<GPUPhysicalStreamingLimit>(op.types, std::move(op.limit_val),
-      // std::move(op.offset_val), op.estimated_cardinality, false);
-      // 	}
-      // }
+      if (!PreserveInsertionOrder(*plan)) {
+        // use parallel streaming limit if insertion order is not important
+        limit = make_uniq<GPUPhysicalStreamingLimit>(op.types,
+                                                     std::move(op.limit_val),
+                                                     std::move(op.offset_val),
+                                                     op.estimated_cardinality,
+                                                     true);
+      } else {
+        throw NotImplementedException(
+          "Streaming limit with insertion order preservation not supported in GPU");
+        // maintaining insertion order is important
+        // 	if (UseBatchIndex(*plan) && UseBatchLimit(op.limit_val, op.offset_val)) {
+        // 		// source supports batch index: use parallel batch limit
+        // 		throw NotImplementedException("Batch limit not supported in GPU");
+        // 		// limit = make_uniq<PhysicalLimit>(op.types, std::move(op.limit_val),
+        // std::move(op.offset_val),
+        // 		//                                  op.estimated_cardinality);
+        // 	} else {
+        // 		// source does not support batch index: use a non-parallel streaming limit
+        // 		limit = make_uniq<GPUPhysicalStreamingLimit>(op.types, std::move(op.limit_val),
+        // std::move(op.offset_val), op.estimated_cardinality, false);
+        // 	}
+      }
       break;
   }
 

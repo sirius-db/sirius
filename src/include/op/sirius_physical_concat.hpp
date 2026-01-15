@@ -18,9 +18,9 @@
 
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
-#include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_hash_join.hpp"
+#include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_order.hpp"
 #include "op/sirius_physical_top_n.hpp"
 
@@ -31,7 +31,8 @@ class sirius_physical_concat : public sirius_physical_operator {
  public:
   static constexpr const duckdb::PhysicalOperatorType TYPE = duckdb::PhysicalOperatorType::INVALID;
 
-  explicit sirius_physical_concat(duckdb::vector<duckdb::LogicalType> types, duckdb::idx_t estimated_cardinality);
+  explicit sirius_physical_concat(duckdb::vector<duckdb::LogicalType> types,
+                                  duckdb::idx_t estimated_cardinality);
 
   std::string get_name() const override;
 

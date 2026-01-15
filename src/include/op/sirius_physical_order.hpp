@@ -28,13 +28,15 @@ class sirius_physical_order : public sirius_physical_operator {
 
  public:
   sirius_physical_order(duckdb::vector<duckdb::LogicalType> types,
-                   duckdb::vector<duckdb::BoundOrderByNode> orders,
-                   duckdb::vector<duckdb::idx_t> projections_p,
-                   duckdb::idx_t estimated_cardinality);
+                        duckdb::vector<duckdb::BoundOrderByNode> orders,
+                        duckdb::vector<duckdb::idx_t> projections_p,
+                        duckdb::idx_t estimated_cardinality,
+                        bool is_index_sort_p = false);
 
   //! Input data
   duckdb::vector<duckdb::BoundOrderByNode> orders;
   duckdb::vector<duckdb::idx_t> projections;
+  bool is_index_sort;
 
  public:
   // Source interface
@@ -42,7 +44,10 @@ class sirius_physical_order : public sirius_physical_operator {
 
   bool parallel_source() const override { return true; }
 
-  duckdb::OrderPreservationType source_order() const override { return duckdb::OrderPreservationType::FIXED_ORDER; }
+  duckdb::OrderPreservationType source_order() const override
+  {
+    return duckdb::OrderPreservationType::FIXED_ORDER;
+  }
 
  public:
   // Sink interface

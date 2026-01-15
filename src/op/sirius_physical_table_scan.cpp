@@ -36,18 +36,21 @@ uint64_t get_chunk_data_byte_size(duckdb::LogicalType type, duckdb::idx_t cardin
   return cardinality * physical_size;
 }
 
-sirius_physical_table_scan::sirius_physical_table_scan(duckdb::vector<duckdb::LogicalType> types,
-                                           duckdb::TableFunction function_p,
-                                           duckdb::unique_ptr<duckdb::FunctionData> bind_data_p,
-                                           duckdb::vector<duckdb::LogicalType> returned_types_p,
-                                           duckdb::vector<duckdb::ColumnIndex> column_ids_p,
-                                           duckdb::vector<duckdb::idx_t> projection_ids_p,
-                                           duckdb::vector<std::string> names_p,
-                                           duckdb::unique_ptr<duckdb::TableFilterSet> table_filters_p,
-                                           duckdb::idx_t estimated_cardinality,
-                                           duckdb::ExtraOperatorInfo extra_info,
-                                           duckdb::vector<duckdb::Value> parameters_p)
-  : sirius_physical_operator(duckdb::PhysicalOperatorType::TABLE_SCAN, std::move(types), estimated_cardinality),
+sirius_physical_table_scan::sirius_physical_table_scan(
+  duckdb::vector<duckdb::LogicalType> types,
+  duckdb::TableFunction function_p,
+  duckdb::unique_ptr<duckdb::FunctionData> bind_data_p,
+  duckdb::vector<duckdb::LogicalType> returned_types_p,
+  duckdb::vector<duckdb::ColumnIndex> column_ids_p,
+  duckdb::vector<duckdb::idx_t> projection_ids_p,
+  duckdb::vector<std::string> names_p,
+  duckdb::unique_ptr<duckdb::TableFilterSet> table_filters_p,
+  duckdb::idx_t estimated_cardinality,
+  duckdb::ExtraOperatorInfo extra_info,
+  duckdb::vector<duckdb::Value> parameters_p,
+  duckdb::virtual_column_map_t virtual_columns_p)
+  : sirius_physical_operator(
+      duckdb::PhysicalOperatorType::TABLE_SCAN, std::move(types), estimated_cardinality),
     function(std::move(function_p)),
     bind_data(std::move(bind_data_p)),
     returned_types(std::move(returned_types_p)),
@@ -55,11 +58,12 @@ sirius_physical_table_scan::sirius_physical_table_scan(duckdb::vector<duckdb::Lo
     projection_ids(std::move(projection_ids_p)),
     names(std::move(names_p)),
     table_filters(std::move(table_filters_p)),
-    extra_info(extra_info),
+    extra_info(std::move(extra_info)),
     parameters(std::move(parameters_p)),
+    virtual_columns(std::move(virtual_columns_p)),
     gen_row_id_column(column_ids.back().GetPrimaryIndex() == duckdb::DConstants::INVALID_INDEX)
 {
-  auto num_cols                            = column_ids.size() - gen_row_id_column;
+  auto num_cols = column_ids.size() - gen_row_id_column;
   // duckdb::GPUBufferManager* gpuBufferManager = &(duckdb::GPUBufferManager::GetInstance());
   // column_size = gpuBufferManager->customCudaHostAlloc<uint64_t>(column_ids.size());
   // mask_size   = gpuBufferManager->customCudaHostAlloc<uint64_t>(column_ids.size());

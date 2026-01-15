@@ -113,6 +113,7 @@ void GPUPhysicalColumnDataScan::BuildPipelines(GPUPipeline& current, GPUMetaPipe
       state.SetPipelineSource(current, *this);
       return;
     }
+    case PhysicalOperatorType::RECURSIVE_RECURRING_CTE_SCAN:
     case PhysicalOperatorType::RECURSIVE_CTE_SCAN:
       throw NotImplementedException("Recursive CTE scan not implemented for GPU");
       if (!meta_pipeline.HasRecursiveCTE()) {

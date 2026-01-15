@@ -36,27 +36,29 @@ class sirius_physical_column_data_scan : public sirius_physical_operator {
   static constexpr const duckdb::PhysicalOperatorType TYPE = duckdb::PhysicalOperatorType::INVALID;
 
  public:
-  sirius_physical_column_data_scan(duckdb::vector<duckdb::LogicalType> types,
-                            duckdb::PhysicalOperatorType op_type,
-                            duckdb::idx_t estimated_cardinality,
-                            duckdb::optionally_owned_ptr<duckdb::ColumnDataCollection> collection);
+  sirius_physical_column_data_scan(
+    duckdb::vector<duckdb::LogicalType> types,
+    duckdb::PhysicalOperatorType op_type,
+    duckdb::idx_t estimated_cardinality,
+    duckdb::optionally_owned_ptr<duckdb::ColumnDataCollection> collection);
 
   sirius_physical_column_data_scan(duckdb::vector<duckdb::LogicalType> types,
-                            duckdb::PhysicalOperatorType op_type,
-                            duckdb::idx_t estimated_cardinality,
-                            duckdb::idx_t cte_index);
+                                   duckdb::PhysicalOperatorType op_type,
+                                   duckdb::idx_t estimated_cardinality,
+                                   duckdb::idx_t cte_index);
 
   //! (optionally owned) column data collection to scan
   duckdb::optionally_owned_ptr<duckdb::ColumnDataCollection> collection;
 
   duckdb::idx_t cte_index;
-  
+
   duckdb::optional_idx delim_index;
 
  public:
   bool is_source() const override { return true; }
 
-  void build_pipelines(pipeline::sirius_pipeline& current, pipeline::sirius_meta_pipeline& meta_pipeline) override;
+  void build_pipelines(pipeline::sirius_pipeline& current,
+                       pipeline::sirius_meta_pipeline& meta_pipeline) override;
 };
 
 }  // namespace op

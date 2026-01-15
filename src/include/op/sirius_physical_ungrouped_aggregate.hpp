@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "duckdb/common/enums/tuple_data_layout_enums.hpp"
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/execution/operator/aggregate/distinct_aggregate_data.hpp"
 #include "duckdb/execution/operator/aggregate/grouped_aggregate_data.hpp"
@@ -27,12 +28,15 @@ namespace op {
 
 class sirius_physical_ungrouped_aggregate : public sirius_physical_operator {
  public:
-  static constexpr const duckdb::PhysicalOperatorType TYPE = duckdb::PhysicalOperatorType::UNGROUPED_AGGREGATE;
+  static constexpr const duckdb::PhysicalOperatorType TYPE =
+    duckdb::PhysicalOperatorType::UNGROUPED_AGGREGATE;
 
  public:
-  sirius_physical_ungrouped_aggregate(duckdb::vector<duckdb::LogicalType> types,
-                                duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> select_list,
-                                duckdb::idx_t estimated_cardinality);
+  sirius_physical_ungrouped_aggregate(
+    duckdb::vector<duckdb::LogicalType> types,
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> select_list,
+    duckdb::idx_t estimated_cardinality,
+    duckdb::TupleDataValidityType distinct_validity);
 
   //! The aggregates that have to be computed
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> aggregates;
@@ -42,11 +46,9 @@ class sirius_physical_ungrouped_aggregate : public sirius_physical_operator {
   bool is_source() const override { return true; }
 
  public:
-
   bool is_sink() const override { return true; }
 
   bool parallel_sink() const override { return true; }
-
 };
 
 }  // namespace op

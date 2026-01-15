@@ -53,22 +53,24 @@ enum compare_type {
 
 class sirius_physical_table_scan : public sirius_physical_operator {
  public:
-  static constexpr const duckdb::PhysicalOperatorType TYPE = duckdb::PhysicalOperatorType::TABLE_SCAN;
+  static constexpr const duckdb::PhysicalOperatorType TYPE =
+    duckdb::PhysicalOperatorType::TABLE_SCAN;
 
  public:
   //! Table scan that immediately projects out filter columns that are unused in the remainder of
   //! the query plan
   sirius_physical_table_scan(duckdb::vector<duckdb::LogicalType> types,
-                       duckdb::TableFunction function,
-                       duckdb::unique_ptr<duckdb::FunctionData> bind_data,
-                       duckdb::vector<duckdb::LogicalType> returned_types,
-                       duckdb::vector<duckdb::ColumnIndex> column_ids,
-                       duckdb::vector<duckdb::idx_t> projection_ids,
-                       duckdb::vector<std::string> names,
-                       duckdb::unique_ptr<duckdb::TableFilterSet> table_filters,
-                       duckdb::idx_t estimated_cardinality,
-                       duckdb::ExtraOperatorInfo extra_info,
-                       duckdb::vector<duckdb::Value> parameters);
+                             duckdb::TableFunction function,
+                             duckdb::unique_ptr<duckdb::FunctionData> bind_data,
+                             duckdb::vector<duckdb::LogicalType> returned_types,
+                             duckdb::vector<duckdb::ColumnIndex> column_ids,
+                             duckdb::vector<duckdb::idx_t> projection_ids,
+                             duckdb::vector<std::string> names,
+                             duckdb::unique_ptr<duckdb::TableFilterSet> table_filters,
+                             duckdb::idx_t estimated_cardinality,
+                             duckdb::ExtraOperatorInfo extra_info,
+                             duckdb::vector<duckdb::Value> parameters,
+                             duckdb::virtual_column_map_t virtual_columns);
 
   //! The table function
   duckdb::TableFunction function;
@@ -93,7 +95,7 @@ class sirius_physical_table_scan : public sirius_physical_operator {
   //! tree)
   duckdb::shared_ptr<duckdb::DynamicTableFilterSet> dynamic_filters;
   //! Virtual columns
-  // virtual_column_map_t virtual_columns;
+  duckdb::virtual_column_map_t virtual_columns;
 
   duckdb::PhysicalTableScan* physical_table_scan;
 
@@ -121,9 +123,10 @@ class sirius_physical_table_scan : public sirius_physical_operator {
   bool is_source() const override { return true; }
   bool parallel_source() const override { return true; }
 
-  duckdb::unique_ptr<duckdb::LocalSourceState> get_local_source_state(duckdb::ExecutionContext& context,
-                                                   duckdb::GlobalSourceState& gstate) const override;
-  duckdb::unique_ptr<duckdb::GlobalSourceState> get_global_source_state(duckdb::ClientContext& context) const override;
+  duckdb::unique_ptr<duckdb::LocalSourceState> get_local_source_state(
+    duckdb::ExecutionContext& context, duckdb::GlobalSourceState& gstate) const override;
+  duckdb::unique_ptr<duckdb::GlobalSourceState> get_global_source_state(
+    duckdb::ClientContext& context) const override;
 };
 
 }  // namespace op

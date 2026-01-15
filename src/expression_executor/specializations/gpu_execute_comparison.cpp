@@ -62,6 +62,29 @@ struct ComparisonDispatcher {
                                     return_type,
                                     executor.execution_stream,
                                     executor.resource_ref);
+    } else if constexpr (std::is_same_v<T, int32_t>) {
+      // For int32_t, check at runtime if this is a TIMESTAMP_DAYS comparison
+      if (left.type().id() == cudf::type_id::TIMESTAMP_DAYS) {
+        auto date_scalar = cudf::timestamp_scalar<cudf::timestamp_D>(
+          cudf::duration_D{right_value}, true, executor.execution_stream, executor.resource_ref);
+        auto result = cudf::binary_operation(left,
+                                             date_scalar,
+                                             ComparisonOp,
+                                             return_type,
+                                             executor.execution_stream,
+                                             executor.resource_ref);
+        return result;
+      } else {
+        // Regular int32_t comparison
+        auto numeric_scalar =
+          cudf::numeric_scalar(right_value, true, executor.execution_stream, executor.resource_ref);
+        return cudf::binary_operation(left,
+                                      numeric_scalar,
+                                      ComparisonOp,
+                                      return_type,
+                                      executor.execution_stream,
+                                      executor.resource_ref);
+      }
     } else {
       // Create a numeric scalar from the constant value
       auto numeric_scalar =
@@ -173,6 +196,11 @@ struct ComparisonDispatcher {
         case cudf::type_id::STRING:
           return DoScalarComparison<std::string>(
             left->view(), right_value.GetValue<std::string>(), return_type);
+        case cudf::type_id::TIMESTAMP_DAYS:
+          // DuckDB DATE is int32_t (days since epoch), same as cuDF TIMESTAMP_DAYS
+          // Use numeric_scalar<int32_t> for the comparison
+          return DoScalarComparison<int32_t>(
+            left->view(), right_value.GetValue<int32_t>(), return_type);
         case cudf::type_id::DECIMAL32:
           // cudf decimal type uses negative scale, same for below
           return DoScalarComparison<numeric::decimal32>(

@@ -31,17 +31,18 @@ namespace op {
 
 class sirius_physical_grouped_aggregate;
 
-//! sirius_physical_delim_join represents a join where either the LHS or RHS will be duplicate eliminated and
-//! pushed into a PhysicalColumnDataScan in the other side. Implementations are
+//! sirius_physical_delim_join represents a join where either the LHS or RHS will be duplicate
+//! eliminated and pushed into a PhysicalColumnDataScan in the other side. Implementations are
 //! sirius_physical_left_delim_join and sirius_physical_right_delim_join
 class sirius_physical_delim_join : public sirius_physical_operator {
  public:
-  sirius_physical_delim_join(duckdb::PhysicalOperatorType type,
-                       duckdb::vector<duckdb::LogicalType> types,
-                       duckdb::unique_ptr<sirius_physical_operator> original_join,
-                       duckdb::vector<duckdb::const_reference<sirius_physical_operator>> delim_scans,
-                       duckdb::idx_t estimated_cardinality,
-                       duckdb::optional_idx delim_idx);
+  sirius_physical_delim_join(
+    duckdb::PhysicalOperatorType type,
+    duckdb::vector<duckdb::LogicalType> types,
+    duckdb::unique_ptr<sirius_physical_operator> original_join,
+    duckdb::vector<duckdb::const_reference<sirius_physical_operator>> delim_scans,
+    duckdb::idx_t estimated_cardinality,
+    duckdb::optional_idx delim_idx);
 
   duckdb::unique_ptr<sirius_physical_operator> join;
   duckdb::unique_ptr<sirius_physical_grouped_aggregate> distinct;
@@ -59,42 +60,51 @@ class sirius_physical_delim_join : public sirius_physical_operator {
   // 	return true;
   // }
 
-  duckdb::OrderPreservationType source_order() const override { return duckdb::OrderPreservationType::NO_ORDER; }
+  duckdb::OrderPreservationType source_order() const override
+  {
+    return duckdb::OrderPreservationType::NO_ORDER;
+  }
   bool sink_order_dependent() const override { return false; }
 
   // InsertionOrderPreservingMap<std::string> params_to_string() const override;
 };
 
-//! sirius_physical_right_delim_join represents a join where the RHS will be duplicate eliminated and pushed
-//! into a PhysicalColumnDataScan in the LHS.
+//! sirius_physical_right_delim_join represents a join where the RHS will be duplicate eliminated
+//! and pushed into a PhysicalColumnDataScan in the LHS.
 class sirius_physical_right_delim_join : public sirius_physical_delim_join {
  public:
-  static constexpr const duckdb::PhysicalOperatorType TYPE = duckdb::PhysicalOperatorType::RIGHT_DELIM_JOIN;
+  static constexpr const duckdb::PhysicalOperatorType TYPE =
+    duckdb::PhysicalOperatorType::RIGHT_DELIM_JOIN;
 
  public:
-  sirius_physical_right_delim_join(duckdb::vector<duckdb::LogicalType> types,
-                            duckdb::unique_ptr<sirius_physical_operator> original_join,
-                            duckdb::vector<duckdb::const_reference<sirius_physical_operator>> delim_scans,
-                            duckdb::idx_t estimated_cardinality,
-                            duckdb::optional_idx delim_idx);
+  sirius_physical_right_delim_join(
+    duckdb::vector<duckdb::LogicalType> types,
+    duckdb::unique_ptr<sirius_physical_operator> original_join,
+    duckdb::vector<duckdb::const_reference<sirius_physical_operator>> delim_scans,
+    duckdb::idx_t estimated_cardinality,
+    duckdb::optional_idx delim_idx);
 
  public:
-  void build_pipelines(pipeline::sirius_pipeline& current, pipeline::sirius_meta_pipeline& meta_pipeline) override;
+  void build_pipelines(pipeline::sirius_pipeline& current,
+                       pipeline::sirius_meta_pipeline& meta_pipeline) override;
 };
 
 class sirius_physical_left_delim_join : public sirius_physical_delim_join {
  public:
-  static constexpr const duckdb::PhysicalOperatorType TYPE = duckdb::PhysicalOperatorType::LEFT_DELIM_JOIN;
+  static constexpr const duckdb::PhysicalOperatorType TYPE =
+    duckdb::PhysicalOperatorType::LEFT_DELIM_JOIN;
 
  public:
-  sirius_physical_left_delim_join(duckdb::vector<duckdb::LogicalType> types,
-                           duckdb::unique_ptr<sirius_physical_operator> original_join,
-                           duckdb::vector<duckdb::const_reference<sirius_physical_operator>> delim_scans,
-                           duckdb::idx_t estimated_cardinality,
-                           duckdb::optional_idx delim_idx);
+  sirius_physical_left_delim_join(
+    duckdb::vector<duckdb::LogicalType> types,
+    duckdb::unique_ptr<sirius_physical_operator> original_join,
+    duckdb::vector<duckdb::const_reference<sirius_physical_operator>> delim_scans,
+    duckdb::idx_t estimated_cardinality,
+    duckdb::optional_idx delim_idx);
 
  public:
-  void build_pipelines(pipeline::sirius_pipeline& current, pipeline::sirius_meta_pipeline& meta_pipeline) override;
+  void build_pipelines(pipeline::sirius_pipeline& current,
+                       pipeline::sirius_meta_pipeline& meta_pipeline) override;
 };
 
 }  // namespace op

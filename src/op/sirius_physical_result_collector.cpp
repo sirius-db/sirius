@@ -15,35 +15,40 @@
  */
 
 #include "op/sirius_physical_result_collector.hpp"
-#include "duckdb/main/prepared_statement_data.hpp"
+
 #include "duckdb/main/config.hpp"
+#include "duckdb/main/prepared_statement_data.hpp"
 #include "expression_executor/gpu_expression_executor_state.hpp"
 #include "gpu_context.hpp"
 #include "gpu_physical_plan_generator.hpp"
 #include "log/logging.hpp"
-#include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
+#include "pipeline/sirius_pipeline.hpp"
 #include "utils.hpp"
 
 namespace sirius {
 namespace op {
 
-sirius_physical_result_collector::sirius_physical_result_collector(duckdb::GPUPreparedStatementData& data)
-  : sirius_physical_operator(duckdb::PhysicalOperatorType::RESULT_COLLECTOR, {duckdb::LogicalType::BOOLEAN}, 0),
+sirius_physical_result_collector::sirius_physical_result_collector(
+  duckdb::GPUPreparedStatementData& data)
+  : sirius_physical_operator(
+      duckdb::PhysicalOperatorType::RESULT_COLLECTOR, {duckdb::LogicalType::BOOLEAN}, 0),
     statement_type(data.prepared->statement_type),
     properties(data.prepared->properties),
     plan(*data.gpu_physical_plan),
     names(data.prepared->names)
 {
-  this->types      = data.prepared->types;
+  this->types = data.prepared->types;
 }
 
-duckdb::vector<duckdb::const_reference<sirius_physical_operator>> sirius_physical_result_collector::get_children() const
+duckdb::vector<duckdb::const_reference<sirius_physical_operator>>
+sirius_physical_result_collector::get_children() const
 {
   return {plan};
 }
 
-void sirius_physical_result_collector::build_pipelines(pipeline::sirius_pipeline& current, pipeline::sirius_meta_pipeline& meta_pipeline)
+void sirius_physical_result_collector::build_pipelines(
+  pipeline::sirius_pipeline& current, pipeline::sirius_meta_pipeline& meta_pipeline)
 {
   // operator is a sink, build a pipeline
   sink_state.reset();
@@ -59,8 +64,10 @@ void sirius_physical_result_collector::build_pipelines(pipeline::sirius_pipeline
   child_meta_pipeline.build(plan);
 }
 
-sirius_physical_materialized_collector::sirius_physical_materialized_collector(duckdb:: GPUPreparedStatementData& data)
-  : sirius_physical_result_collector(data), result_collection(duckdb::make_uniq<duckdb::GPUResultCollection>())
+sirius_physical_materialized_collector::sirius_physical_materialized_collector(
+  duckdb::GPUPreparedStatementData& data)
+  : sirius_physical_result_collector(data),
+    result_collection(duckdb::make_uniq<duckdb::GPUResultCollection>())
 {
 }
 

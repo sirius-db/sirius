@@ -28,6 +28,7 @@
 #include "duckdb/execution/physical_operator_states.hpp"
 #include "duckdb/optimizer/join_order/join_node.hpp"
 #include "helper/types.hpp"
+
 #include <data/data_batch.hpp>
 #include <data/data_repository.hpp>
 
@@ -36,22 +37,22 @@ class GPUExecutor;
 }  // namespace duckdb
 
 namespace sirius {
-                      
+
 namespace op {
-  class sirius_physical_operator;
+class sirius_physical_operator;
 }  // namespace op
 
 namespace pipeline {
-  class sirius_pipeline;
-  class sirius_pipeline_build_state;
-  class sirius_meta_pipeline;
+class sirius_pipeline;
+class sirius_pipeline_build_state;
+class sirius_meta_pipeline;
 }  // namespace pipeline
 
 namespace creator {
 class task_creator;
 using task_hint = std::variant<std::monostate,
-                                        op::sirius_physical_operator*,
-                                        duckdb::shared_ptr<pipeline::sirius_pipeline>>;
+                               op::sirius_physical_operator*,
+                               duckdb::shared_ptr<pipeline::sirius_pipeline>>;
 }  // namespace creator
 
 namespace op {
@@ -65,8 +66,8 @@ class sirius_physical_operator {
 
  public:
   sirius_physical_operator(duckdb::PhysicalOperatorType type,
-                      duckdb::vector<duckdb::LogicalType> types,
-                      duckdb::idx_t estimated_cardinality)
+                           duckdb::vector<duckdb::LogicalType> types,
+                           duckdb::idx_t estimated_cardinality)
     : type(type), types(std::move(types)), estimated_cardinality(estimated_cardinality)
   {
   }
@@ -108,9 +109,11 @@ class sirius_physical_operator {
 
  public:
   // Operator interface
-  virtual duckdb::unique_ptr<duckdb::OperatorState> get_operator_state(duckdb::ExecutionContext& context) const;
+  virtual duckdb::unique_ptr<duckdb::OperatorState> get_operator_state(
+    duckdb::ExecutionContext& context) const;
 
-  virtual duckdb::unique_ptr<duckdb::GlobalOperatorState> get_global_operator_state(duckdb::ClientContext& context) const;
+  virtual duckdb::unique_ptr<duckdb::GlobalOperatorState> get_global_operator_state(
+    duckdb::ClientContext& context) const;
 
   virtual ::std::vector<::std::shared_ptr<::cucascade::data_batch>> execute(
     const ::std::vector<::std::shared_ptr<::cucascade::data_batch>>& input_batches);
@@ -129,10 +132,10 @@ class sirius_physical_operator {
   }
 
  public:
-
-  virtual duckdb::unique_ptr<duckdb::LocalSourceState> get_local_source_state(duckdb::ExecutionContext& context,
-                                                           duckdb::GlobalSourceState& gstate) const;
-  virtual duckdb::unique_ptr<duckdb::GlobalSourceState> get_global_source_state(duckdb::ClientContext& context) const;
+  virtual duckdb::unique_ptr<duckdb::LocalSourceState> get_local_source_state(
+    duckdb::ExecutionContext& context, duckdb::GlobalSourceState& gstate) const;
+  virtual duckdb::unique_ptr<duckdb::GlobalSourceState> get_global_source_state(
+    duckdb::ClientContext& context) const;
 
   virtual bool is_source() const { return false; }
 
@@ -145,10 +148,11 @@ class sirius_physical_operator {
   }
 
  public:
+  virtual duckdb::unique_ptr<duckdb::LocalSinkState> get_local_sink_state(
+    duckdb::ExecutionContext& context) const;
 
-  virtual duckdb::unique_ptr<duckdb::LocalSinkState> get_local_sink_state(duckdb::ExecutionContext& context) const;
-
-  virtual duckdb::unique_ptr<duckdb::GlobalSinkState> get_global_sink_state(duckdb::ClientContext& context) const;
+  virtual duckdb::unique_ptr<duckdb::GlobalSinkState> get_global_sink_state(
+    duckdb::ClientContext& context) const;
 
   virtual bool is_sink() const { return false; }
 
@@ -165,7 +169,8 @@ class sirius_physical_operator {
   virtual duckdb::vector<duckdb::const_reference<sirius_physical_operator>> get_sources() const;
 
   //! Build the pipelines for the operator
-  virtual void build_pipelines(pipeline::sirius_pipeline& current, pipeline::sirius_meta_pipeline& meta_pipeline);
+  virtual void build_pipelines(pipeline::sirius_pipeline& current,
+                               pipeline::sirius_meta_pipeline& meta_pipeline);
 
  public:
   template <class TARGET>
@@ -204,9 +209,11 @@ class sirius_physical_operator {
   //! Check if the source pipeline is finished
   bool is_source_pipeline_finished();
   //! Add a next port after sink
-  void add_next_port_after_sink(std::pair<sirius_physical_operator*, std::string_view> port_locator);
+  void add_next_port_after_sink(
+    std::pair<sirius_physical_operator*, std::string_view> port_locator);
   //! Get the next ports after sink
-  duckdb::vector<std::pair<sirius_physical_operator*, std::string_view>>& get_next_port_after_sink();
+  duckdb::vector<std::pair<sirius_physical_operator*, std::string_view>>&
+  get_next_port_after_sink();
   //! Get the next task hint
   // virtual ::sirius::creator::task_hint get_next_task_hint();
   //! Get the input batch

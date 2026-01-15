@@ -17,8 +17,8 @@
 #pragma once
 
 // sirius
-#include <parallel/task_executor.hpp>
 #include <op/scan/duckdb_scan_task_queue.hpp>
+#include <parallel/task_executor.hpp>
 
 namespace sirius::op::scan {
 

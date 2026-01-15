@@ -451,18 +451,18 @@ static std::unique_ptr<duckdb::GPUPhysicalTableScan> make_physical_table_scan(
 
   // Create GPUPhysicalTableScan with all required parameters
   auto physical_scan = std::make_unique<duckdb::GPUPhysicalTableScan>(
-    table_catalog_entry.GetTypes(),  // types
-    table_scan_function,             // function
-    std::move(bind_data),            // bind_data
-    table_catalog_entry.GetTypes(),  // returned_types
-    std::move(column_ids),           // column_ids
-    std::move(projection_ids),       // projection_ids (maps output to internal columns)
-    std::move(column_names),         // names
-    nullptr,                         // table_filters
-    0,                               // estimated_cardinality
-    extra_info,                      // extra_info
-    duckdb::vector<duckdb::Value>()  // parameters
-  );
+    table_catalog_entry.GetTypes(),   // types
+    table_scan_function,              // function
+    std::move(bind_data),             // bind_data
+    table_catalog_entry.GetTypes(),   // returned_types
+    std::move(column_ids),            // column_ids
+    std::move(projection_ids),        // projection_ids (maps output to internal columns)
+    std::move(column_names),          // names
+    nullptr,                          // table_filters
+    0,                                // estimated_cardinality
+    std::move(extra_info),            // extra_info
+    duckdb::vector<duckdb::Value>(),  // parameters
+    duckdb::virtual_column_map_t());
 
   return physical_scan;
 }
@@ -551,6 +551,12 @@ static void run_scan_test(std::string const& table_name,
 
   // Validate tables are identical
   validate_tables_equal(con, table_name, staging_table);
+
+  // Release DuckDB table function state before committing
+  // The global_tf_state holds a shared checkpoint lock on the source table
+  // (acquired via InitializeParallelScan -> SharedLockTable) that must be
+  // released before COMMIT can proceed
+  global_state.reset();
 
   // End the transaction
   auto commit_result = con.Query("COMMIT");

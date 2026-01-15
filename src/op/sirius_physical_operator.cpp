@@ -26,9 +26,13 @@
 namespace sirius {
 namespace op {
 
-std::string sirius_physical_operator::get_name() const { return duckdb::PhysicalOperatorToString(type); }
+std::string sirius_physical_operator::get_name() const
+{
+  return duckdb::PhysicalOperatorToString(type);
+}
 
-duckdb::vector<duckdb::const_reference<sirius_physical_operator>> sirius_physical_operator::get_children() const
+duckdb::vector<duckdb::const_reference<sirius_physical_operator>>
+sirius_physical_operator::get_children() const
 {
   duckdb::vector<duckdb::const_reference<sirius_physical_operator>> result;
   for (auto& child : children) {
@@ -41,7 +45,8 @@ duckdb::vector<duckdb::const_reference<sirius_physical_operator>> sirius_physica
 // Operator
 //===--------------------------------------------------------------------===//
 // LCOV_EXCL_START
-duckdb::unique_ptr<duckdb::OperatorState> sirius_physical_operator::get_operator_state(duckdb::ExecutionContext& context) const
+duckdb::unique_ptr<duckdb::OperatorState> sirius_physical_operator::get_operator_state(
+  duckdb::ExecutionContext& context) const
 {
   return duckdb::make_uniq<duckdb::OperatorState>();
 }
@@ -51,8 +56,6 @@ duckdb::unique_ptr<duckdb::GlobalOperatorState> sirius_physical_operator::get_gl
 {
   return duckdb::make_uniq<duckdb::GlobalOperatorState>();
 }
-
-
 
 //===--------------------------------------------------------------------===//
 // Source
@@ -71,12 +74,14 @@ duckdb::unique_ptr<duckdb::GlobalSourceState> sirius_physical_operator::get_glob
 //===--------------------------------------------------------------------===//
 // Sink
 //===--------------------------------------------------------------------===//
-duckdb::unique_ptr<duckdb::LocalSinkState> sirius_physical_operator::get_local_sink_state(duckdb::ExecutionContext& context) const
+duckdb::unique_ptr<duckdb::LocalSinkState> sirius_physical_operator::get_local_sink_state(
+  duckdb::ExecutionContext& context) const
 {
   return duckdb::make_uniq<duckdb::LocalSinkState>();
 }
 
-duckdb::unique_ptr<duckdb::GlobalSinkState> sirius_physical_operator::get_global_sink_state(duckdb::ClientContext& context) const
+duckdb::unique_ptr<duckdb::GlobalSinkState> sirius_physical_operator::get_global_sink_state(
+  duckdb::ClientContext& context) const
 {
   return duckdb::make_uniq<duckdb::GlobalSinkState>();
 }
@@ -86,7 +91,8 @@ duckdb::unique_ptr<duckdb::GlobalSinkState> sirius_physical_operator::get_global
 //===--------------------------------------------------------------------===//
 // Pipeline Construction
 //===--------------------------------------------------------------------===//
-void sirius_physical_operator::build_pipelines(pipeline::sirius_pipeline& current, pipeline::sirius_meta_pipeline& meta_pipeline)
+void sirius_physical_operator::build_pipelines(pipeline::sirius_pipeline& current,
+                                               pipeline::sirius_meta_pipeline& meta_pipeline)
 {
   op_state.reset();
 
@@ -117,7 +123,8 @@ void sirius_physical_operator::build_pipelines(pipeline::sirius_pipeline& curren
   }
 }
 
-duckdb::vector<duckdb::const_reference<sirius_physical_operator>> sirius_physical_operator::get_sources() const
+duckdb::vector<duckdb::const_reference<sirius_physical_operator>>
+sirius_physical_operator::get_sources() const
 {
   duckdb::vector<duckdb::const_reference<sirius_physical_operator>> result;
   if (is_sink()) {
@@ -130,7 +137,9 @@ duckdb::vector<duckdb::const_reference<sirius_physical_operator>> sirius_physica
       result.push_back(*this);
       return result;
     } else {
-      if (children.size() != 1) { throw duckdb::InternalException("Operator not supported in get_sources"); }
+      if (children.size() != 1) {
+        throw duckdb::InternalException("Operator not supported in get_sources");
+      }
       return children[0]->get_sources();
     }
   }
@@ -156,7 +165,8 @@ sirius_physical_operator::port* sirius_physical_operator::get_port(std::string_v
 {
   auto it = ports.find(std::string(port_id));
   if (it == ports.end()) {
-    throw duckdb::InternalException("Port " + std::string(port_id) + " not found in operator " + get_name());
+    throw duckdb::InternalException("Port " + std::string(port_id) + " not found in operator " +
+                                    get_name());
   }
   return it->second.get();
 }
@@ -167,7 +177,8 @@ sirius_physical_operator::port* sirius_physical_operator::get_port(std::string_v
   // submit data batches to the repositories of the next operators
   // check if the pipeline is finished
   // if (!creator) {
-  //   throw duckdb::InternalException("sirius_physical_operator creator is null in sink_execute for operator " +
+  //   throw duckdb::InternalException("sirius_physical_operator creator is null in sink_execute for
+  //   operator " +
   //                           get_name());
   // }
   // if (next_port_after_sink.size() > 0) {
@@ -190,7 +201,7 @@ sirius_physical_operator::port* sirius_physical_operator::get_port(std::string_v
 }
 
 void sirius_physical_operator::push_data_batch(std::string_view port_id,
-                                          std::shared_ptr<::cucascade::data_batch> batch)
+                                               std::shared_ptr<::cucascade::data_batch> batch)
 {
   auto* p = get_port(port_id);
   if (p && p->repo) { p->repo->add_data_batch(std::move(batch)); }

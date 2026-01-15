@@ -184,10 +184,10 @@ GPUPhysicalOperator::port* GPUPhysicalOperator::get_port(std::string_view port_i
 // op (sink) -> repo -> next_op
 //           -> repo -> next_op
 
-//input batches -> op (execute) -> output batches -> repo -> next_op
-// current_pipeline -> port -> next_pipeline
+// input batches -> op (execute) -> output batches -> repo -> next_op
+//  current_pipeline -> port -> next_pipeline
 
-void GPUPhysicalOperator::sink_execute(
+::std::vector<::std::shared_ptr<::cucascade::data_batch>> GPUPhysicalOperator::sink_execute(
   const ::std::vector<::std::shared_ptr<::cucascade::data_batch>>& input_batches)
 {
   // take input batches

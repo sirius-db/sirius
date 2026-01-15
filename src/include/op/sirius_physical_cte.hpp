@@ -37,11 +37,11 @@ class sirius_physical_cte : public sirius_physical_operator {
 
  public:
   sirius_physical_cte(std::string ctename,
-                 duckdb::idx_t table_index,
-                 duckdb::vector<duckdb::LogicalType> types,
-                 duckdb::unique_ptr<sirius_physical_operator> top,
-                 duckdb::unique_ptr<sirius_physical_operator> bottom,
-                 duckdb::idx_t estimated_cardinality);
+                      duckdb::idx_t table_index,
+                      duckdb::vector<duckdb::LogicalType> types,
+                      duckdb::unique_ptr<sirius_physical_operator> top,
+                      duckdb::unique_ptr<sirius_physical_operator> bottom,
+                      duckdb::idx_t estimated_cardinality);
   ~sirius_physical_cte() override;
 
   duckdb::vector<duckdb::const_reference<sirius_physical_operator>> cte_scans;
@@ -60,7 +60,8 @@ class sirius_physical_cte : public sirius_physical_operator {
   bool sink_order_dependent() const override { return false; }
 
  public:
-  void build_pipelines(pipeline::sirius_pipeline& current, pipeline::sirius_meta_pipeline& meta_pipeline) override;
+  void build_pipelines(pipeline::sirius_pipeline& current,
+                       pipeline::sirius_meta_pipeline& meta_pipeline) override;
 
   duckdb::vector<duckdb::const_reference<sirius_physical_operator>> get_sources() const override;
 };

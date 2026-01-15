@@ -55,6 +55,7 @@
 #include <duckdb/main/connection.hpp>
 #include <duckdb/main/prepared_statement_data.hpp>
 #include <duckdb/optimizer/optimizer.hpp>
+#include <duckdb/parser/parser.hpp>
 #include <duckdb/planner/planner.hpp>
 
 // standard library
@@ -83,12 +84,13 @@ void safe_load_extension(DuckDB& db)
 {
   if (!g_extension_loaded) {
     try {
-      db.LoadExtension<SiriusExtension>();
+      db.LoadStaticExtension<SiriusExtension>();
       g_extension_loaded = true;
     } catch (const std::exception& e) {
       // Extension might already be loaded by a previous test, that's ok
       std::string msg = e.what();
-      if (msg.find("already exists") == std::string::npos) {
+      if (msg.find("already exists") == std::string::npos &&
+          msg.find("already loaded") == std::string::npos) {
         throw;  // Re-throw if it's a different error
       }
       g_extension_loaded = true;
@@ -338,35 +340,47 @@ duckdb::unique_ptr<GPUPhysicalOperator> generate_gpu_plan(Connection& con,
                                                           GPUContext& gpu_context,
                                                           const std::string& query)
 {
-  // Begin a transaction to ensure we have an active transaction context
-  con.Query("BEGIN TRANSACTION");
-
   // Create a separate connection for extracting the logical plan (like SiriusInitPlanExtractor)
-  Connection plan_conn(*con.context->db);
-  plan_conn.context->config.enable_optimizer      = true;
-  plan_conn.context->config.use_replacement_scans = false;
+  // Connection plan_conn(*con.context->db);
+  con.context->config.enable_optimizer      = true;
+  con.context->config.use_replacement_scans = false;
 
   set<OptimizerType> disabled_optimizers;
   disabled_optimizers.insert(OptimizerType::IN_CLAUSE);
   disabled_optimizers.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
-  DBConfig::GetConfig(*plan_conn.context).options.disabled_optimizers = disabled_optimizers;
+  DBConfig::GetConfig(*con.context).options.disabled_optimizers = disabled_optimizers;
 
-  // Get type information using Planner (like GPUProcessingBind does)
-  auto statements = plan_conn.context->ParseStatements(query);
+  con.Query("BEGIN TRANSACTION");
+
+  Parser parser(con.context->GetParserOptions());
+  parser.ParseQuery(query);
+
   Planner planner(*con.context);
-  auto statement_type = statements[0]->type;
-  planner.CreatePlan(std::move(statements[0]));
+  auto statement_type = parser.statements[0]->type;
+  planner.CreatePlan(std::move(parser.statements[0]));
+  D_ASSERT(planner.plan);
 
   // Create PreparedStatementData with the query's types and names
   auto prepared       = make_shared_ptr<PreparedStatementData>(statement_type);
   prepared->names     = planner.names;
   prepared->types     = planner.types;
   prepared->value_map = std::move(planner.value_map);
-  prepared->plan      = make_uniq<PhysicalOperator>(
-    PhysicalOperatorType::DUMMY_SCAN, duckdb::vector<LogicalType>{LogicalType::BOOLEAN}, 0);
+  // prepared->plan      = make_uniq<PhysicalOperator>(
+  //   PhysicalOperatorType::DUMMY_SCAN, duckdb::vector<LogicalType>{LogicalType::BOOLEAN}, 0);
 
-  // Extract the logical plan
-  auto logical_plan = plan_conn.context->ExtractPlan(query);
+  // Extract the logical plan using Sirius-style extraction (with optimizer configuration)
+  duckdb::unique_ptr<duckdb::LogicalOperator> logical_plan;
+
+  logical_plan = std::move(planner.plan);
+
+  duckdb::Optimizer optimizer(*planner.binder, *con.context);
+  logical_plan = optimizer.Optimize(std::move(logical_plan));
+
+  // After optimization, refresh types before column binding resolution
+  logical_plan->ResolveOperatorTypes();
+  duckdb::ColumnBindingResolver resolver;
+  duckdb::ColumnBindingResolver::Verify(*logical_plan);
+  resolver.VisitOperator(*logical_plan);
 
   // Create the raw GPU physical plan
   GPUPhysicalPlanGenerator physical_planner(*con.context, gpu_context);
@@ -382,8 +396,7 @@ duckdb::unique_ptr<GPUPhysicalOperator> generate_gpu_plan(Connection& con,
   auto gpu_collector =
     make_uniq_base<GPUPhysicalResultCollector, GPUPhysicalMaterializedCollector>(*g_gpu_prepared);
 
-  // Commit the transaction
-  con.Query("COMMIT");
+  con.Query("COMMIT TRANSACTION");
 
   return gpu_collector;
 }
@@ -801,8 +814,7 @@ void validate_modified_pipeline_structure(GPUExecutor& executor, const std::stri
       REQUIRE(port->src_pipeline == pipeline);
       REQUIRE(port->dest_pipeline == nullptr);
 
-    } else if (sink->type == PhysicalOperatorType::RIGHT_DELIM_JOIN ||
-               sink->type == PhysicalOperatorType::LEFT_DELIM_JOIN) {
+    } else if (sink->type == PhysicalOperatorType::RIGHT_DELIM_JOIN) {
       // Validate partition_join and partition_distinct ports
       auto& delim_join         = sink->Cast<GPUPhysicalDelimJoin>();
       auto* partition_join     = delim_join.partition_join;
@@ -836,6 +848,47 @@ void validate_modified_pipeline_structure(GPUExecutor& executor, const std::stri
           auto* port = next_op->get_port("default");
           std::string context =
             pipeline_context + " -> DELIM_JOIN partition_distinct with port 'default'";
+          validate_port_repository(port, context);
+        }
+      }
+
+    } else if (sink->type == PhysicalOperatorType::LEFT_DELIM_JOIN) {
+      // Validate partition_distinct and column_data_scan ports
+      auto& delim_join         = sink->Cast<GPUPhysicalDelimJoin>();
+      auto* partition_distinct = delim_join.partition_distinct;
+      auto* column_data_scan   = delim_join.join->children[0].get();
+
+      REQUIRE(partition_distinct != nullptr);
+      REQUIRE(column_data_scan != nullptr);
+
+      // partition_distinct should use "default" port
+      auto it_distinct = source_to_pipelines.find(partition_distinct);
+      if (it_distinct != source_to_pipelines.end()) {
+        for (auto& dep_pipeline : it_distinct->second) {
+          // next_op is first inner operator or sink
+          auto inner_ops = dep_pipeline->GetInnerOperators();
+          GPUPhysicalOperator* next_op =
+            inner_ops.size() > 0 ? &inner_ops[0].get() : dep_pipeline->GetSink().get();
+
+          auto* port = next_op->get_port("default");
+          std::string context =
+            pipeline_context + " -> LEFT_DELIM_JOIN partition_distinct with port 'default'";
+          validate_port_repository(port, context);
+        }
+      }
+
+      // column_data_scan should use "default" port
+      auto it_scan = source_to_pipelines.find(column_data_scan);
+      if (it_scan != source_to_pipelines.end()) {
+        for (auto& dep_pipeline : it_scan->second) {
+          // next_op is first inner operator or sink
+          auto inner_ops = dep_pipeline->GetInnerOperators();
+          GPUPhysicalOperator* next_op =
+            inner_ops.size() > 0 ? &inner_ops[0].get() : dep_pipeline->GetSink().get();
+
+          auto* port = next_op->get_port("default");
+          std::string context =
+            pipeline_context + " -> LEFT_DELIM_JOIN column_data_scan with port 'default'";
           validate_port_repository(port, context);
         }
       }

@@ -16,11 +16,11 @@
 
 #include "op/sirius_physical_column_data_scan.hpp"
 
-#include "pipeline/sirius_meta_pipeline.hpp"
-#include "pipeline/sirius_pipeline.hpp"
 #include "log/logging.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
+#include "pipeline/sirius_meta_pipeline.hpp"
+#include "pipeline/sirius_pipeline.hpp"
 
 namespace sirius {
 namespace op {
@@ -36,10 +36,11 @@ sirius_physical_column_data_scan::sirius_physical_column_data_scan(
 {
 }
 
-sirius_physical_column_data_scan::sirius_physical_column_data_scan(duckdb::vector<duckdb::LogicalType> types,
-                                                     duckdb::PhysicalOperatorType op_type,
-                                                     duckdb::idx_t estimated_cardinality,
-                                                     duckdb::idx_t cte_index)
+sirius_physical_column_data_scan::sirius_physical_column_data_scan(
+  duckdb::vector<duckdb::LogicalType> types,
+  duckdb::PhysicalOperatorType op_type,
+  duckdb::idx_t estimated_cardinality,
+  duckdb::idx_t cte_index)
   : sirius_physical_operator(op_type, std::move(types), estimated_cardinality),
     collection(nullptr),
     cte_index(cte_index)
@@ -49,7 +50,8 @@ sirius_physical_column_data_scan::sirius_physical_column_data_scan(duckdb::vecto
 //===--------------------------------------------------------------------===//
 // Pipeline Construction
 //===--------------------------------------------------------------------===//
-void sirius_physical_column_data_scan::build_pipelines(pipeline::sirius_pipeline& current, pipeline::sirius_meta_pipeline& meta_pipeline)
+void sirius_physical_column_data_scan::build_pipelines(
+  pipeline::sirius_pipeline& current, pipeline::sirius_meta_pipeline& meta_pipeline)
 {
   // check if there is any additional action we need to do depending on the type
   auto& state = meta_pipeline.get_state();
@@ -84,6 +86,7 @@ void sirius_physical_column_data_scan::build_pipelines(pipeline::sirius_pipeline
       state.set_pipeline_source(current, *this);
       return;
     }
+    case duckdb::PhysicalOperatorType::RECURSIVE_RECURRING_CTE_SCAN:
     case duckdb::PhysicalOperatorType::RECURSIVE_CTE_SCAN:
       throw duckdb::NotImplementedException("Recursive CTE scan not implemented for GPU");
       if (!meta_pipeline.has_recursive_cte()) {

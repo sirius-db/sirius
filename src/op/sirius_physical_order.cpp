@@ -24,12 +24,15 @@ namespace sirius {
 namespace op {
 
 sirius_physical_order::sirius_physical_order(duckdb::vector<duckdb::LogicalType> types,
-                                   duckdb::vector<duckdb::BoundOrderByNode> orders,
-                                   duckdb::vector<duckdb::idx_t> projections_p,
-                                   duckdb::idx_t estimated_cardinality)
-  : sirius_physical_operator(duckdb::PhysicalOperatorType::ORDER_BY, std::move(types), estimated_cardinality),
+                                             duckdb::vector<duckdb::BoundOrderByNode> orders,
+                                             duckdb::vector<duckdb::idx_t> projections_p,
+                                             duckdb::idx_t estimated_cardinality,
+                                             bool is_index_sort_p)
+  : sirius_physical_operator(
+      duckdb::PhysicalOperatorType::ORDER_BY, std::move(types), estimated_cardinality),
     orders(std::move(orders)),
-    projections(std::move(projections_p))
+    projections(std::move(projections_p)),
+    is_index_sort(is_index_sort_p)
 {
   // sort_result = duckdb::make_shared_ptr<GPUIntermediateRelation>(projections.size());
   // for (int col = 0; col < projections.size(); col++) {

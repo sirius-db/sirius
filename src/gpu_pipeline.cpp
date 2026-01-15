@@ -24,6 +24,7 @@
 #include "duckdb/execution/operator/set/physical_recursive_cte.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/parallel/pipeline_event.hpp"
 #include "duckdb/parallel/pipeline_executor.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
@@ -54,7 +55,7 @@ bool GPUPipeline::IsOrderDependent() const
     if (op.OperatorOrder() == OrderPreservationType::NO_ORDER) { return false; }
     if (op.OperatorOrder() == OrderPreservationType::FIXED_ORDER) { return true; }
   }
-  if (!config.options.preserve_insertion_order) { return false; }
+  if (!DBConfig::GetSetting<PreserveInsertionOrderSetting>(executor.context)) { return false; }
   if (sink && sink->SinkOrderDependent()) { return true; }
   return false;
 }

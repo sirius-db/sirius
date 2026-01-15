@@ -39,7 +39,8 @@ namespace op {
 
 class sirius_physical_hash_join : public sirius_physical_operator {
  public:
-  static constexpr const duckdb::PhysicalOperatorType TYPE = duckdb::PhysicalOperatorType::HASH_JOIN;
+  static constexpr const duckdb::PhysicalOperatorType TYPE =
+    duckdb::PhysicalOperatorType::HASH_JOIN;
 
   struct join_projection_columns {
     duckdb::vector<duckdb::idx_t> col_idxs;
@@ -48,21 +49,21 @@ class sirius_physical_hash_join : public sirius_physical_operator {
 
  public:
   sirius_physical_hash_join(duckdb::LogicalOperator& op,
-                      duckdb::unique_ptr<sirius_physical_operator> left,
-                      duckdb::unique_ptr<sirius_physical_operator> right,
-                      duckdb::vector<duckdb::JoinCondition> cond,
-                      duckdb::JoinType join_type,
-                      const duckdb::vector<duckdb::idx_t>& left_projection_map,
-                      const duckdb::vector<duckdb::idx_t>& right_projection_map,
-                      duckdb::vector<duckdb::LogicalType> delim_types,
-                      duckdb::idx_t estimated_cardinality,
-                      duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> pushdown_info);
+                            duckdb::unique_ptr<sirius_physical_operator> left,
+                            duckdb::unique_ptr<sirius_physical_operator> right,
+                            duckdb::vector<duckdb::JoinCondition> cond,
+                            duckdb::JoinType join_type,
+                            const duckdb::vector<duckdb::idx_t>& left_projection_map,
+                            const duckdb::vector<duckdb::idx_t>& right_projection_map,
+                            duckdb::vector<duckdb::LogicalType> delim_types,
+                            duckdb::idx_t estimated_cardinality,
+                            duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> pushdown_info);
   sirius_physical_hash_join(duckdb::LogicalOperator& op,
-                      duckdb::unique_ptr<sirius_physical_operator> left,
-                      duckdb::unique_ptr<sirius_physical_operator> right,
-                      duckdb::vector<duckdb::JoinCondition> cond,
-                      duckdb::JoinType join_type,
-                      duckdb::idx_t estimated_cardinality);
+                            duckdb::unique_ptr<sirius_physical_operator> left,
+                            duckdb::unique_ptr<sirius_physical_operator> right,
+                            duckdb::vector<duckdb::JoinCondition> cond,
+                            duckdb::JoinType join_type,
+                            duckdb::idx_t estimated_cardinality);
 
   duckdb::vector<duckdb::JoinCondition> conditions;
   //! Scans where we should push generated filters into (if any)
@@ -91,16 +92,18 @@ class sirius_physical_hash_join : public sirius_physical_operator {
   mutable bool unique_probe_keys = false;
 
   static void build_join_pipelines(pipeline::sirius_pipeline& current,
-                                 pipeline::sirius_meta_pipeline& meta_pipeline,
-                                 sirius_physical_operator& op,
-                                 bool build_rhs = true);
-  void build_pipelines(pipeline::sirius_pipeline& current, pipeline::sirius_meta_pipeline& meta_pipeline) override;
+                                   pipeline::sirius_meta_pipeline& meta_pipeline,
+                                   sirius_physical_operator& op,
+                                   bool build_rhs = true);
+  void build_pipelines(pipeline::sirius_pipeline& current,
+                       pipeline::sirius_meta_pipeline& meta_pipeline) override;
 
   //! Join Keys statistics (optional)
   duckdb::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> join_stats;
 
  protected:
-  // double get_progress(duckdb::ClientContext &context, duckdb::GlobalSourceState &gstate) const override;
+  // double get_progress(duckdb::ClientContext &context, duckdb::GlobalSourceState &gstate) const
+  // override;
 
   //! Becomes a source when it is an external join
   bool is_source() const override { return true; }
@@ -111,8 +114,6 @@ class sirius_physical_hash_join : public sirius_physical_operator {
   // Sink Interface
   bool is_sink() const override { return true; }
   bool parallel_sink() const override { return true; }
-
-
 };
 
 }  // namespace op

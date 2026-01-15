@@ -30,24 +30,29 @@ namespace op {
 
 class sirius_physical_grouped_aggregate : public sirius_physical_operator {
  public:
-  sirius_physical_grouped_aggregate(duckdb::ClientContext& context,
-                              duckdb::vector<duckdb::LogicalType> types,
-                              duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
-                              duckdb::idx_t estimated_cardinality);
+  sirius_physical_grouped_aggregate(
+    duckdb::ClientContext& context,
+    duckdb::vector<duckdb::LogicalType> types,
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
+    duckdb::idx_t estimated_cardinality);
 
-  sirius_physical_grouped_aggregate(duckdb::ClientContext& context,
-                              duckdb::vector<duckdb::LogicalType> types,
-                              duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
-                              duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups,
-                              duckdb::idx_t estimated_cardinality);
+  sirius_physical_grouped_aggregate(
+    duckdb::ClientContext& context,
+    duckdb::vector<duckdb::LogicalType> types,
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups,
+    duckdb::idx_t estimated_cardinality);
 
-  sirius_physical_grouped_aggregate(duckdb::ClientContext& context,
-                              duckdb::vector<duckdb::LogicalType> types,
-                              duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
-                              duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups,
-                              duckdb::vector<duckdb::GroupingSet> grouping_sets,
-                              duckdb::vector<duckdb::unsafe_vector<duckdb::idx_t>> grouping_functions,
-                              duckdb::idx_t estimated_cardinality);
+  sirius_physical_grouped_aggregate(
+    duckdb::ClientContext& context,
+    duckdb::vector<duckdb::LogicalType> types,
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups,
+    duckdb::vector<duckdb::GroupingSet> grouping_sets,
+    duckdb::vector<duckdb::unsafe_vector<duckdb::idx_t>> grouping_functions,
+    duckdb::idx_t estimated_cardinality,
+    duckdb::TupleDataValidityType group_validity,
+    duckdb::TupleDataValidityType distinct_validity);
 
   //! The grouping sets
   duckdb::GroupedAggregateData grouped_aggregate_data;
@@ -70,7 +75,10 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
   bool is_source() const override { return true; }
   bool parallel_source() const override { return true; }
 
-  duckdb::OrderPreservationType source_order() const override { return duckdb::OrderPreservationType::NO_ORDER; }
+  duckdb::OrderPreservationType source_order() const override
+  {
+    return duckdb::OrderPreservationType::NO_ORDER;
+  }
 
  public:
   // Sink interface
@@ -79,7 +87,6 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
   bool parallel_sink() const override { return true; }
 
   bool sink_order_dependent() const override { return false; }
-
 };
 
 }  // namespace op

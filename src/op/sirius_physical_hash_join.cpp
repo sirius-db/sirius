@@ -18,14 +18,14 @@
 
 #include "duckdb/common/enums/physical_operator_type.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "log/logging.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
-#include "log/logging.hpp"
 
 namespace sirius {
 namespace op {
 
-void reorder_conditions(duckdb::vector<duckdb::JoinCondition>& conditions)
+void reorder_join_conditions(duckdb::vector<duckdb::JoinCondition>& conditions)
 {
   bool is_ordered     = true;
   bool seen_non_equal = false;
@@ -40,9 +40,7 @@ void reorder_conditions(duckdb::vector<duckdb::JoinCondition>& conditions)
       seen_non_equal = true;
     }
   }
-  if (is_ordered) {
-    return;
-  }
+  if (is_ordered) { return; }
   duckdb::vector<duckdb::JoinCondition> equal_conditions;
   duckdb::vector<duckdb::JoinCondition> other_conditions;
   for (auto& cond : conditions) {
@@ -62,21 +60,24 @@ void reorder_conditions(duckdb::vector<duckdb::JoinCondition>& conditions)
   }
 }
 
-sirius_physical_hash_join::sirius_physical_hash_join(duckdb::LogicalOperator& op,
-                                         duckdb::unique_ptr<sirius_physical_operator> left,
-                                         duckdb::unique_ptr<sirius_physical_operator> right,
-                                         duckdb::vector<duckdb::JoinCondition> cond,
-                                         duckdb::JoinType join_type,
-                                         const duckdb::vector<duckdb::idx_t>& left_projection_map,
-                                         const duckdb::vector<duckdb::idx_t>& right_projection_map,
-                                         duckdb::vector<duckdb::LogicalType> delim_types,
-                                         duckdb::idx_t estimated_cardinality,
-                                         duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> pushdown_info_p)
-  : sirius_physical_operator(duckdb::PhysicalOperatorType::HASH_JOIN, op.types, estimated_cardinality),
+sirius_physical_hash_join::sirius_physical_hash_join(
+  duckdb::LogicalOperator& op,
+  duckdb::unique_ptr<sirius_physical_operator> left,
+  duckdb::unique_ptr<sirius_physical_operator> right,
+  duckdb::vector<duckdb::JoinCondition> cond,
+  duckdb::JoinType join_type,
+  const duckdb::vector<duckdb::idx_t>& left_projection_map,
+  const duckdb::vector<duckdb::idx_t>& right_projection_map,
+  duckdb::vector<duckdb::LogicalType> delim_types,
+  duckdb::idx_t estimated_cardinality,
+  duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> pushdown_info_p)
+  : sirius_physical_operator(
+      duckdb::PhysicalOperatorType::HASH_JOIN, op.types, estimated_cardinality),
     join_type(join_type),
-    conditions(std::move(cond))
+    conditions(std::move(cond)),
+    delim_types(std::move(delim_types))
 {
-  reorder_conditions(conditions);
+  reorder_join_conditions(conditions);
 
   filter_pushdown = std::move(pushdown_info_p);
 
@@ -88,8 +89,8 @@ sirius_physical_hash_join::sirius_physical_hash_join(duckdb::LogicalOperator& op
     auto& condition = conditions[cond_idx];
     condition_types.push_back(condition.left->return_type);
     if (condition.right->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
-      build_columns_in_conditions.emplace(condition.right->Cast<duckdb::BoundReferenceExpression>().index,
-                                          cond_idx);
+      build_columns_in_conditions.emplace(
+        condition.right->Cast<duckdb::BoundReferenceExpression>().index, cond_idx);
     }
   }
 
@@ -108,7 +109,8 @@ sirius_physical_hash_join::sirius_physical_hash_join(duckdb::LogicalOperator& op
     lhs_output_columns.col_types.push_back(lhs_col_type);
   }
 
-  if (join_type == duckdb::JoinType::ANTI || join_type == duckdb::JoinType::SEMI || join_type == duckdb::JoinType::MARK) {
+  if (join_type == duckdb::JoinType::ANTI || join_type == duckdb::JoinType::SEMI ||
+      join_type == duckdb::JoinType::MARK) {
     // materialized_build_key =
     //   duckdb::make_shared_ptr<GPUIntermediateRelation>(build_columns_in_conditions.size());
     // hash_table_result =
@@ -141,7 +143,8 @@ sirius_physical_hash_join::sirius_physical_hash_join(duckdb::LogicalOperator& op
     rhs_output_columns.col_types.push_back(rhs_col_type);
   }
 
-  // hash_table_result = duckdb::make_shared_ptr<GPUIntermediateRelation>(build_columns_in_conditions.size() +
+  // hash_table_result =
+  // duckdb::make_shared_ptr<GPUIntermediateRelation>(build_columns_in_conditions.size() +
   //                                                              payload_columns.col_idxs.size());
   // materialized_build_key =
   //   duckdb::make_shared_ptr<GPUIntermediateRelation>(build_columns_in_conditions.size());
@@ -151,9 +154,9 @@ sirius_physical_hash_join::sirius_physical_hash_join(duckdb::LogicalOperator& op
 // Pipeline Construction
 //===--------------------------------------------------------------------===//
 void sirius_physical_hash_join::build_join_pipelines(pipeline::sirius_pipeline& current,
-                                             pipeline::sirius_meta_pipeline& meta_pipeline,
-                                             sirius_physical_operator& op,
-                                             bool build_rhs)
+                                                     pipeline::sirius_meta_pipeline& meta_pipeline,
+                                                     sirius_physical_operator& op,
+                                                     bool build_rhs)
 {
   op.op_state.reset();
   op.sink_state.reset();
@@ -165,12 +168,28 @@ void sirius_physical_hash_join::build_join_pipelines(pipeline::sirius_pipeline& 
   meta_pipeline.get_pipelines(pipelines_so_far, false);
   auto& last_pipeline = *pipelines_so_far.back();
 
+  duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> dependencies;
+  duckdb::optional_ptr<pipeline::sirius_meta_pipeline> last_child_ptr;
   if (build_rhs) {
+    // on the RHS (build side), we construct a child MetaPipeline with this operator as its sink
     auto& child_meta_pipeline = meta_pipeline.create_child_meta_pipeline(current, op);
     child_meta_pipeline.build(*op.children[1]);
+    // if (op.children[1].get().CanSaturateThreads(current.GetClientContext())) {
+    // 	// if the build side can saturate all available threads,
+    // 	// we don't just make the LHS pipeline depend on the RHS, but recursively all LHS children
+    // too.
+    // 	// this prevents breadth-first plan evaluation
+    // 	child_meta_pipeline.GetPipelines(dependencies, false);
+    // 	last_child_ptr = meta_pipeline.GetLastChild();
+    // }
   }
 
   op.children[0]->build_pipelines(current, meta_pipeline);
+
+  // if (last_child_ptr) {
+  // 	// the pointer was set, set up the dependencies
+  // 	meta_pipeline.add_recursive_dependencies(dependencies, *last_child_ptr);
+  // }
 
   switch (op.type) {
     case duckdb::PhysicalOperatorType::POSITIONAL_JOIN:
@@ -190,7 +209,8 @@ void sirius_physical_hash_join::build_join_pipelines(pipeline::sirius_pipeline& 
   if (add_child_pipeline) { meta_pipeline.create_child_pipeline(current, op, last_pipeline); }
 }
 
-void sirius_physical_hash_join::build_pipelines(pipeline::sirius_pipeline& current, pipeline::sirius_meta_pipeline& meta_pipeline)
+void sirius_physical_hash_join::build_pipelines(pipeline::sirius_pipeline& current,
+                                                pipeline::sirius_meta_pipeline& meta_pipeline)
 {
   sirius_physical_hash_join::build_join_pipelines(current, meta_pipeline, *this);
 }

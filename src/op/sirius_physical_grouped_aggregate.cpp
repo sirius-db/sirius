@@ -22,7 +22,8 @@
 namespace sirius {
 namespace op {
 
-static duckdb::vector<duckdb::LogicalType> create_group_chunk_types(duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>& groups)
+static duckdb::vector<duckdb::LogicalType> create_group_chunk_types(
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>& groups)
 {
   duckdb::set<duckdb::idx_t> group_indices;
 
@@ -42,27 +43,31 @@ static duckdb::vector<duckdb::LogicalType> create_group_chunk_types(duckdb::vect
   return types;
 }
 
-sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(duckdb::ClientContext& context,
-                                                         duckdb::vector<duckdb::LogicalType> types,
-                                                         duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
-                                                         duckdb::idx_t estimated_cardinality)
+sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
+  duckdb::ClientContext& context,
+  duckdb::vector<duckdb::LogicalType> types,
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
+  duckdb::idx_t estimated_cardinality)
   : sirius_physical_grouped_aggregate(
       context, std::move(types), std::move(expressions), {}, estimated_cardinality)
 {
 }
 
-sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(duckdb::ClientContext& context,
-                                                         duckdb::vector<duckdb::LogicalType> types,
-                                                         duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
-                                                         duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups_p,
-                                                         duckdb::idx_t estimated_cardinality)
+sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
+  duckdb::ClientContext& context,
+  duckdb::vector<duckdb::LogicalType> types,
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups_p,
+  duckdb::idx_t estimated_cardinality)
   : sirius_physical_grouped_aggregate(context,
-                                std::move(types),
-                                std::move(expressions),
-                                std::move(groups_p),
-                                {},
-                                {},
-                                estimated_cardinality)
+                                      std::move(types),
+                                      std::move(expressions),
+                                      std::move(groups_p),
+                                      {},
+                                      {},
+                                      estimated_cardinality,
+                                      duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES,
+                                      duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES)
 {
 }
 
@@ -80,7 +85,9 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups_p,
   duckdb::vector<duckdb::GroupingSet> grouping_sets_p,
   duckdb::vector<duckdb::unsafe_vector<duckdb::idx_t>> grouping_functions_p,
-  duckdb::idx_t estimated_cardinality)
+  duckdb::idx_t estimated_cardinality,
+  duckdb::TupleDataValidityType group_validity,
+  duckdb::TupleDataValidityType distinct_validity)
   : sirius_physical_operator(
       duckdb::PhysicalOperatorType::HASH_GROUP_BY, std::move(types), estimated_cardinality),
     grouping_sets(std::move(grouping_sets_p))
@@ -112,7 +119,8 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
     } else if (aggr.aggr_type == duckdb::AggregateType::NON_DISTINCT) {
       non_distinct_filter.push_back(i);
     } else {  // LCOV_EXCL_START
-      throw duckdb::NotImplementedException("AggregateType not implemented in PhysicalHashAggregate");
+      throw duckdb::NotImplementedException(
+        "AggregateType not implemented in PhysicalHashAggregate");
     }  // LCOV_EXCL_STOP
   }
 
@@ -136,7 +144,11 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
     duckdb::DistinctAggregateCollectionInfo::Create(grouped_aggregate_data.aggregates);
 
   for (idx_t i = 0; i < grouping_sets.size(); i++) {
-    groupings.emplace_back(grouping_sets[i], grouped_aggregate_data, distinct_collection_info);
+    groupings.emplace_back(grouping_sets[i],
+                           grouped_aggregate_data,
+                           distinct_collection_info,
+                           group_validity,
+                           distinct_validity);
   }
 
   // The output of groupby is ordered as the grouping columns first followed by the aggregate

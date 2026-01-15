@@ -18,9 +18,9 @@
 
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
-#include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_hash_join.hpp"
+#include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_order.hpp"
 #include "op/sirius_physical_top_n.hpp"
 
@@ -34,9 +34,9 @@ class sirius_physical_partition : public sirius_physical_operator {
   static constexpr const duckdb::PhysicalOperatorType TYPE = duckdb::PhysicalOperatorType::INVALID;
 
   explicit sirius_physical_partition(duckdb::vector<duckdb::LogicalType> types,
-                                duckdb::idx_t estimated_cardinality,
-                                sirius_physical_operator* parent_op,
-                                bool is_build = false);
+                                     duckdb::idx_t estimated_cardinality,
+                                     sirius_physical_operator* parent_op,
+                                     bool is_build = false);
 
   std::string get_name() const override;
 

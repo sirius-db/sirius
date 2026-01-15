@@ -21,20 +21,22 @@
 #include "duckdb/function/create_sort_key.hpp"
 #include "duckdb/planner/filter/dynamic_filter.hpp"
 #include "duckdb/storage/data_table.hpp"
-#include "op/sirius_physical_order.hpp"
 #include "log/logging.hpp"
+#include "op/sirius_physical_order.hpp"
 #include "utils.hpp"
 
 namespace sirius {
 namespace op {
 
-sirius_physical_top_n::sirius_physical_top_n(duckdb::vector<duckdb::LogicalType> types_p,
-                                 duckdb::vector<duckdb::BoundOrderByNode> orders,
-                                 duckdb::idx_t limit,
-                                 duckdb::idx_t offset,
-                                 duckdb::shared_ptr<duckdb::DynamicFilterData> dynamic_filter_p,
-                                 duckdb::idx_t estimated_cardinality)
-  : sirius_physical_operator(duckdb::PhysicalOperatorType::TOP_N, std::move(types_p), estimated_cardinality),
+sirius_physical_top_n::sirius_physical_top_n(
+  duckdb::vector<duckdb::LogicalType> types_p,
+  duckdb::vector<duckdb::BoundOrderByNode> orders,
+  duckdb::idx_t limit,
+  duckdb::idx_t offset,
+  duckdb::shared_ptr<duckdb::DynamicFilterData> dynamic_filter_p,
+  duckdb::idx_t estimated_cardinality)
+  : sirius_physical_operator(
+      duckdb::PhysicalOperatorType::TOP_N, std::move(types_p), estimated_cardinality),
     orders(std::move(orders)),
     limit(limit),
     offset(offset),

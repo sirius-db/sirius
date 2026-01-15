@@ -26,14 +26,15 @@ namespace op {
 
 class sirius_physical_streaming_limit : public sirius_physical_operator {
  public:
-  static constexpr const duckdb::PhysicalOperatorType TYPE = duckdb::PhysicalOperatorType::STREAMING_LIMIT;
+  static constexpr const duckdb::PhysicalOperatorType TYPE =
+    duckdb::PhysicalOperatorType::STREAMING_LIMIT;
 
  public:
   sirius_physical_streaming_limit(duckdb::vector<duckdb::LogicalType> types,
-                            duckdb::BoundLimitNode limit_val_p,
-                            duckdb::BoundLimitNode offset_val_p,
-                            duckdb::idx_t estimated_cardinality,
-                            bool parallel);
+                                  duckdb::BoundLimitNode limit_val_p,
+                                  duckdb::BoundLimitNode offset_val_p,
+                                  duckdb::idx_t estimated_cardinality,
+                                  bool parallel);
 
   duckdb::BoundLimitNode limit_val;
   duckdb::BoundLimitNode offset_val;

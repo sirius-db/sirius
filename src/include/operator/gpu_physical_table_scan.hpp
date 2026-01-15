@@ -103,7 +103,8 @@ class GPUPhysicalTableScan : public GPUPhysicalOperator {
                        unique_ptr<TableFilterSet> table_filters,
                        idx_t estimated_cardinality,
                        ExtraOperatorInfo extra_info,
-                       vector<Value> parameters);
+                       vector<Value> parameters,
+                       virtual_column_map_t virtual_columns);
 
   //! The table function
   TableFunction function;
@@ -128,7 +129,7 @@ class GPUPhysicalTableScan : public GPUPhysicalOperator {
   //! tree)
   shared_ptr<DynamicTableFilterSet> dynamic_filters;
   //! Virtual columns
-  // virtual_column_map_t virtual_columns;
+  virtual_column_map_t virtual_columns;
 
   PhysicalTableScan* physical_table_scan;
 
