@@ -80,26 +80,25 @@ include_directories(${TARGET_NAME} substrait/third_party/substrait)
 include_directories(${TARGET_NAME} substrait/third_party)
 
 set(EXTENSION_SOURCES
-  src/sirius_extension.cpp
-  src/gpu_context.cpp
-  src/gpu_executor.cpp
-  src/gpu_physical_operator.cpp
-  src/gpu_pipeline.cpp
-  src/gpu_meta_pipeline.cpp
-  src/gpu_physical_plan_generator.cpp
-  src/gpu_buffer_manager.cpp
-  src/gpu_columns.cpp
-  src/cpu_cache.cpp
-  src/gpu_query_result.cpp
-  src/config.cpp
-  src/memory/common.cpp
-  src/memory/memory_space.cpp
-  src/fallback.cpp
-  src/memory/memory_reservation.cpp
-#   src/memory/fixed_size_host_memory_resource.cpp
-  src/memory/null_device_memory_resource.cpp
-  src/parallel/task_executor.cpp
-)
+    src/sirius_extension.cpp
+    src/gpu_context.cpp
+    src/gpu_executor.cpp
+    src/gpu_physical_operator.cpp
+    src/gpu_pipeline.cpp
+    src/gpu_meta_pipeline.cpp
+    src/gpu_physical_plan_generator.cpp
+    src/gpu_buffer_manager.cpp
+    src/gpu_columns.cpp
+    src/cpu_cache.cpp
+    src/gpu_query_result.cpp
+    src/config.cpp
+    src/memory/common.cpp
+    src/memory/memory_space.cpp
+    src/fallback.cpp
+    src/memory/memory_reservation.cpp
+    # src/memory/fixed_size_host_memory_resource.cpp
+    src/memory/null_device_memory_resource.cpp
+    src/parallel/task_executor.cpp)
 add_subdirectory(src/operator)
 add_subdirectory(src/plan)
 add_subdirectory(src/data)

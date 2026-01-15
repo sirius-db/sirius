@@ -72,62 +72,68 @@ void HandleTopN(vector<shared_ptr<GPUColumn>>& order_by_keys,
 //===--------------------------------------------------------------------===//
 // Sink
 //===--------------------------------------------------------------------===//
-// SinkResultType PhysicalTopN::Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const {
-SinkResultType GPUPhysicalTopN::Sink(GPUIntermediateRelation& input_relation) const {
-	auto start = std::chrono::high_resolution_clock::now();
-	// throw NotImplementedException("Top N Sink not implemented");
-	if (dynamic_filter) {
-		// `dynamic_filter` is currently not leveraged
-		SIRIUS_LOG_WARN("`dynamic_filter` is currently not leveraged in `GPUPhysicalTopN`");
-	}
+// SinkResultType PhysicalTopN::Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput
+// &input) const {
+SinkResultType GPUPhysicalTopN::Sink(GPUIntermediateRelation& input_relation) const
+{
+  auto start = std::chrono::high_resolution_clock::now();
+  // throw NotImplementedException("Top N Sink not implemented");
+  if (dynamic_filter) {
+    // `dynamic_filter` is currently not leveraged
+    SIRIUS_LOG_WARN("`dynamic_filter` is currently not leveraged in `GPUPhysicalTopN`");
+  }
 
-	vector<shared_ptr<GPUColumn>> order_by_keys(orders.size());
-	GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+  vector<shared_ptr<GPUColumn>> order_by_keys(orders.size());
+  GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
 
-	vector<shared_ptr<GPUColumn>> projection_columns(types.size());
-  
-	for (int projection_idx = 0; projection_idx < types.size(); projection_idx++) {
-		auto input_idx = projection_idx;
-		projection_columns[projection_idx] = HandleMaterializeExpression(input_relation.columns[input_idx], gpuBufferManager);
-		input_relation.columns[input_idx] = projection_columns[projection_idx];
-	}
+  vector<shared_ptr<GPUColumn>> projection_columns(types.size());
 
-	for (int order_idx = 0; order_idx < orders.size(); order_idx++) {
-		auto& expr = *orders[order_idx].expression;
-		if (expr.expression_class != ExpressionClass::BOUND_REF) {
-			throw NotImplementedException("Order by expression not supported");
-		}
-		auto input_idx = expr.Cast<BoundReferenceExpression>().index;
-		order_by_keys[order_idx] = HandleMaterializeExpression(input_relation.columns[input_idx], gpuBufferManager);
-	}
+  for (int projection_idx = 0; projection_idx < types.size(); projection_idx++) {
+    auto input_idx = projection_idx;
+    projection_columns[projection_idx] =
+      HandleMaterializeExpression(input_relation.columns[input_idx], gpuBufferManager);
+    input_relation.columns[input_idx] = projection_columns[projection_idx];
+  }
 
-	if (order_by_keys[0]->column_length > INT32_MAX ) {
-		throw NotImplementedException("Order by with column length greater than INT32_MAX is not supported");
-	}
+  for (int order_idx = 0; order_idx < orders.size(); order_idx++) {
+    auto& expr = *orders[order_idx].expression;
+    if (expr.expression_class != ExpressionClass::BOUND_REF) {
+      throw NotImplementedException("Order by expression not supported");
+    }
+    auto input_idx = expr.Cast<BoundReferenceExpression>().index;
+    order_by_keys[order_idx] =
+      HandleMaterializeExpression(input_relation.columns[input_idx], gpuBufferManager);
+  }
 
-	HandleTopN(order_by_keys, projection_columns, orders, types.size(), limit + offset);
+  if (order_by_keys[0]->column_length > INT32_MAX) {
+    throw NotImplementedException(
+      "Order by with column length greater than INT32_MAX is not supported");
+  }
 
-	for (int col = 0; col < types.size(); col++) {
-		if (sort_result->columns[col] == nullptr || sort_result->columns[col]->column_length == 0 ||
-				sort_result->columns[col]->data_wrapper.data == nullptr) {
-			sort_result->columns[col] = projection_columns[col];
-			sort_result->columns[col]->row_ids = nullptr;
-			sort_result->columns[col]->row_id_count = 0;
-		} else if (sort_result->columns[col] != nullptr && projection_columns[col]->column_length > 0 && projection_columns[col]->data_wrapper.data != nullptr) {
-			throw NotImplementedException("TopN with partially NULL values is not supported");
-		}
-	}
-    
-	// append to the local sink state
-	// auto &gstate = input.global_state.Cast<TopNGlobalState>();
-	// auto &sink = input.local_state.Cast<TopNLocalState>();
-	// sink.heap.Sink(chunk, &gstate.boundary_value);
-	// sink.heap.Reduce();
-	// return SinkResultType::NEED_MORE_INPUT;
-	auto end = std::chrono::high_resolution_clock::now();
-	auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-	SIRIUS_LOG_DEBUG("Top N Sink time: {:.2f} ms", duration.count()/1000.0);
-	return SinkResultType::FINISHED;
+  HandleTopN(order_by_keys, projection_columns, orders, types.size(), limit + offset);
+
+  for (int col = 0; col < types.size(); col++) {
+    if (sort_result->columns[col] == nullptr || sort_result->columns[col]->column_length == 0 ||
+        sort_result->columns[col]->data_wrapper.data == nullptr) {
+      sort_result->columns[col]               = projection_columns[col];
+      sort_result->columns[col]->row_ids      = nullptr;
+      sort_result->columns[col]->row_id_count = 0;
+    } else if (sort_result->columns[col] != nullptr && projection_columns[col]->column_length > 0 &&
+               projection_columns[col]->data_wrapper.data != nullptr) {
+      throw NotImplementedException("TopN with partially NULL values is not supported");
+    }
+  }
+
+  // append to the local sink state
+  // auto &gstate = input.global_state.Cast<TopNGlobalState>();
+  // auto &sink = input.local_state.Cast<TopNLocalState>();
+  // sink.heap.Sink(chunk, &gstate.boundary_value);
+  // sink.heap.Reduce();
+  // return SinkResultType::NEED_MORE_INPUT;
+  auto end      = std::chrono::high_resolution_clock::now();
+  auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+  SIRIUS_LOG_DEBUG("Top N Sink time: {:.2f} ms", duration.count() / 1000.0);
+  return SinkResultType::FINISHED;
 }
 
 SourceResultType GPUPhysicalTopN::GetData(GPUIntermediateRelation& output_relation) const
