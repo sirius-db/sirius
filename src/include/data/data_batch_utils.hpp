@@ -117,12 +117,25 @@ acquire_processing_handles(const std::vector<std::shared_ptr<cucascade::data_bat
   handles.reserve(batches.size());
 
   for (const auto& batch : batches) {
-    if (!batch->try_to_lock_for_processing()) {
-      // Failed to acquire lock - handles vector will be destroyed,
-      // releasing any locks we already acquired
+    auto* mem_space = batch->get_memory_space();
+    if (mem_space == nullptr) { return std::nullopt; }
+
+    bool created_task = false;
+    auto lock_result  = batch->try_to_lock_for_processing(mem_space->get_id());
+
+    if (!lock_result.success &&
+        lock_result.status == cucascade::lock_for_processing_status::task_not_created) {
+      created_task = batch->try_to_create_task();
+      if (!created_task) { return std::nullopt; }
+      lock_result = batch->try_to_lock_for_processing(mem_space->get_id());
+    }
+
+    if (!lock_result.success) {
+      if (created_task) { batch->try_to_cancel_task(); }
       return std::nullopt;
     }
-    handles.emplace_back(batch.get());
+
+    handles.emplace_back(std::move(lock_result.handle));
   }
 
   return handles;
@@ -138,8 +151,25 @@ acquire_processing_handles(const std::vector<std::shared_ptr<cucascade::data_bat
 inline std::optional<cucascade::data_batch_processing_handle> acquire_processing_handle(
   const std::shared_ptr<cucascade::data_batch>& batch)
 {
-  if (!batch->try_to_lock_for_processing()) { return std::nullopt; }
-  return cucascade::data_batch_processing_handle(batch.get());
+  auto* mem_space = batch->get_memory_space();
+  if (mem_space == nullptr) { return std::nullopt; }
+
+  bool created_task = false;
+  auto lock_result  = batch->try_to_lock_for_processing(mem_space->get_id());
+
+  if (!lock_result.success &&
+      lock_result.status == cucascade::lock_for_processing_status::task_not_created) {
+    created_task = batch->try_to_create_task();
+    if (!created_task) { return std::nullopt; }
+    lock_result = batch->try_to_lock_for_processing(mem_space->get_id());
+  }
+
+  if (!lock_result.success) {
+    if (created_task) { batch->try_to_cancel_task(); }
+    return std::nullopt;
+  }
+
+  return std::move(lock_result.handle);
 }
 
 }  // namespace sirius

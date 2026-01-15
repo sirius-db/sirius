@@ -61,8 +61,10 @@ std::pair<std::shared_ptr<data_batch>, data_batch_processing_handle> create_batc
     num_rows, column_types, ranges, cudf::get_default_stream(), mem_space.get_default_allocator());
   auto batch = sirius::make_data_batch(std::move(table), mem_space);
 
-  REQUIRE(batch->try_to_lock_for_processing());
-  data_batch_processing_handle handle(batch.get());
+  REQUIRE(batch->try_to_create_task());
+  auto lock_result = batch->try_to_lock_for_processing(mem_space.get_id());
+  REQUIRE(lock_result.success);
+  data_batch_processing_handle handle = std::move(lock_result.handle);
 
   return {std::move(batch), std::move(handle)};
 }
