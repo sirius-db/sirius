@@ -176,9 +176,9 @@ Note that if building the extension consumes too much memory, try reducing the `
 
 Optionally, to use the Python API in Sirius, we also need to build the duckdb-python package with the following commands:
 ```
-cd duckdb/tools/pythonpkg/
+pushd duckdb-python
 pip install .
-cd $SIRIUS_HOME_PATH
+popd
 ```
 Common issues: If `pip install .` only works inside an environment, then do the following from the Sirius home directory before the installation:
 ```

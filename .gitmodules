@@ -14,3 +14,6 @@
 	path = cucascade
 	url = https://github.com/NVIDIA/cuCascade.git
 	branch = main
+[submodule "duckdb-python"]
+	path = duckdb-python
+	url = git@github.com:duckdb/duckdb-python.git
