@@ -174,7 +174,7 @@ sirius_physical_operator::port* sirius_physical_operator::get_port(std::string_v
 ::std::vector<::std::shared_ptr<::cucascade::data_batch>> sirius_physical_operator::sink_execute(
   const ::std::vector<::std::shared_ptr<::cucascade::data_batch>>& input_batches)
 {
-  // submit data batches to the repositories of the next operators
+  // submit data batches to the repositories of the next operators :test change
   // check if the pipeline is finished
   // if (!creator) {
   //   throw duckdb::InternalException("sirius_physical_operator creator is null in sink_execute for
