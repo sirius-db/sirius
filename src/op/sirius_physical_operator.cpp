@@ -26,6 +26,51 @@
 namespace sirius {
 namespace op {
 
+//===--------------------------------------------------------------------===//
+// Operator
+//===--------------------------------------------------------------------===//
+// LCOV_EXCL_START
+duckdb::unique_ptr<duckdb::OperatorState> sirius_physical_operator::get_operator_state(
+  duckdb::ExecutionContext& context) const
+{
+  return duckdb::make_uniq<duckdb::OperatorState>();
+}
+
+duckdb::unique_ptr<duckdb::GlobalOperatorState> sirius_physical_operator::get_global_operator_state(
+  duckdb::ClientContext& context) const
+{
+  return duckdb::make_uniq<duckdb::GlobalOperatorState>();
+}
+
+//===--------------------------------------------------------------------===//
+// Source
+//===--------------------------------------------------------------------===//
+duckdb::unique_ptr<duckdb::LocalSourceState> sirius_physical_operator::get_local_source_state(
+  duckdb::ExecutionContext& context, duckdb::GlobalSourceState& gstate) const
+{
+  return duckdb::make_uniq<duckdb::LocalSourceState>();
+}
+
+duckdb::unique_ptr<duckdb::GlobalSourceState> sirius_physical_operator::get_global_source_state(
+  duckdb::ClientContext& context) const
+{
+  return duckdb::make_uniq<duckdb::GlobalSourceState>();
+}
+//===--------------------------------------------------------------------===//
+// Sink
+//===--------------------------------------------------------------------===//
+duckdb::unique_ptr<duckdb::LocalSinkState> sirius_physical_operator::get_local_sink_state(
+  duckdb::ExecutionContext& context) const
+{
+  return duckdb::make_uniq<duckdb::LocalSinkState>();
+}
+
+duckdb::unique_ptr<duckdb::GlobalSinkState> sirius_physical_operator::get_global_sink_state(
+  duckdb::ClientContext& context) const
+{
+  return duckdb::make_uniq<duckdb::GlobalSinkState>();
+}
+
 std::string sirius_physical_operator::get_name() const
 {
   return duckdb::PhysicalOperatorToString(type);

@@ -55,6 +55,7 @@ class GPUExecutor {
   GPUContext& gpu_context;
   optional_ptr<GPUPhysicalOperator> gpu_physical_plan;
   unique_ptr<GPUPhysicalOperator> gpu_owned_plan;
+  unique_ptr<::sirius::op::sirius_physical_operator> sirius_owned_plan;
   optional_ptr<::sirius::op::sirius_physical_operator> sirius_physical_plan;
 
   //! All pipelines of the query plan
@@ -106,6 +107,7 @@ class GPUExecutor {
 
   void Initialize(unique_ptr<GPUPhysicalOperator> physical_plan);
   void InitializeInternal(GPUPhysicalOperator& physical_result_collector);
+  void initialize(unique_ptr<::sirius::op::sirius_physical_operator> physical_plan);
   void initialize_internal(::sirius::op::sirius_physical_operator& physical_result_collector);
   void Execute();
   void Reset();

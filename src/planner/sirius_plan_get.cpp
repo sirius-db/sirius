@@ -84,7 +84,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
 
     // if (any_cast_required) {
     // 	auto &proj = Make<sirius::op::sirius_physical_operator>(std::move(return_types),
-    // std::move(expressions), 	                                      child.get().estimated_cardinality); 	proj.children.push_back(child);
+    // std::move(expressions), child.get().estimated_cardinality); 	proj.children.push_back(child);
     // 	child = proj;
     // }
 

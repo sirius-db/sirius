@@ -110,10 +110,15 @@ class sirius_physical_operator {
   virtual void verify();
 
  public:
+  // Operator interface
+  virtual duckdb::unique_ptr<duckdb::OperatorState> get_operator_state(
+    duckdb::ExecutionContext& context) const;
+
+  virtual duckdb::unique_ptr<duckdb::GlobalOperatorState> get_global_operator_state(
+    duckdb::ClientContext& context) const;
+
   virtual std::vector<std::shared_ptr<::cucascade::data_batch>> execute(
     const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches);
-
-  virtual void sink(const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches);
 
   //! The influence the operator has on order (insertion order means no influence)
   virtual duckdb::OrderPreservationType operator_order() const
@@ -122,20 +127,36 @@ class sirius_physical_operator {
   }
 
  public:
+  // Source interface
+  virtual duckdb::unique_ptr<duckdb::LocalSourceState> get_local_source_state(
+    duckdb::ExecutionContext& context, duckdb::GlobalSourceState& gstate) const;
+
+  virtual duckdb::unique_ptr<duckdb::GlobalSourceState> get_global_source_state(
+    duckdb::ClientContext& context) const;
+
   virtual bool is_source() const { return false; }
-
- public:
-  virtual bool is_sink() const { return false; }
-
-  //! Whether or not the sink operator depends on the order of the input chunks
-  //! If this is set to true, we cannot do things like caching intermediate vectors
-  virtual bool sink_order_dependent() const { return false; }
 
   //! The type of order emitted by the operator (as a source)
   virtual duckdb::OrderPreservationType source_order() const
   {
     return duckdb::OrderPreservationType::INSERTION_ORDER;
   }
+
+ public:
+  // Sink interface
+  virtual duckdb::unique_ptr<duckdb::LocalSinkState> get_local_sink_state(
+    duckdb::ExecutionContext& context) const;
+
+  virtual duckdb::unique_ptr<duckdb::GlobalSinkState> get_global_sink_state(
+    duckdb::ClientContext& context) const;
+
+  virtual void sink(const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches);
+
+  virtual bool is_sink() const { return false; }
+
+  //! Whether or not the sink operator depends on the order of the input chunks
+  //! If this is set to true, we cannot do things like caching intermediate vectors
+  virtual bool sink_order_dependent() const { return false; }
 
  public:
   // Pipeline construction

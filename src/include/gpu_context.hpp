@@ -33,6 +33,18 @@ class GPUPreparedStatementData {
   shared_ptr<PreparedStatementData> prepared;
 };
 
+class SiriusPreparedStatementData {
+ public:
+  SiriusPreparedStatementData(
+    shared_ptr<PreparedStatementData> _prepared,
+    unique_ptr<::sirius::op::sirius_physical_operator> _sirius_physical_plan)
+    : prepared(_prepared), sirius_physical_plan(move(_sirius_physical_plan))
+  {
+  }
+  unique_ptr<::sirius::op::sirius_physical_operator> sirius_physical_plan;
+  shared_ptr<PreparedStatementData> prepared;
+};
+
 struct GPUActiveQueryContext {
  public:
   //! The query that is currently being executed

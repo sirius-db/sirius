@@ -18,7 +18,7 @@
 #include "creator/task_creator.hpp"
 #include "gpu_context.hpp"
 #include "op/scan/duckdb_scan_executor.hpp"
-#include "op/sirius_physical_table_scan.hpp"
+#include "op/sirius_physical_operator.hpp"
 #include "parallel/task_executor.hpp"
 #include "pipeline/pipeline_executor.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -52,11 +52,11 @@ using sirius::sirius_pipeline_hashmap;
  * This mock allows configuring the hint that get_next_task_hint() returns,
  * enabling controlled testing of different scheduling scenarios.
  */
-class mock_sirius_physical_operator : public sirius_physical_table_scan {
+class mock_sirius_physical_operator : public sirius_physical_operator {
  public:
   mock_sirius_physical_operator(
     duckdb::PhysicalOperatorType op_type = duckdb::PhysicalOperatorType::PROJECTION)
-    : sirius_physical_table_scan(op_type, {}, 0),
+    : sirius_physical_operator(op_type, {}, 0),
       _use_custom_hint(false),
       _custom_hint(std::monostate{})
   {
@@ -86,7 +86,7 @@ class mock_sirius_physical_operator : public sirius_physical_table_scan {
   {
     if (_use_custom_hint) { return _custom_hint; }
     // Fall back to parent implementation
-    return sirius_physical_table_scan::get_next_task_hint();
+    return sirius_physical_operator::get_next_task_hint();
   }
 
  private:
@@ -131,12 +131,12 @@ class mock_pipeline_builder {
    */
   static void setup_operator_with_pipeline_port(mock_sirius_physical_operator& op,
                                                 const std::string& port_id,
-                                                duckdb::MemoryBarrierType barrier_type,
+                                                MemoryBarrierType barrier_type,
                                                 cucascade::shared_data_repository* repo,
                                                 duckdb::shared_ptr<sirius_pipeline> src_pipeline,
                                                 duckdb::shared_ptr<sirius_pipeline> dest_pipeline)
   {
-    auto port           = std::make_unique<sirius_physical_table_scan::port>();
+    auto port           = std::make_unique<sirius_physical_operator::port>();
     port->type          = barrier_type;
     port->repo          = repo;
     port->src_pipeline  = src_pipeline;
@@ -158,7 +158,7 @@ class mock_pipeline_builder {
 class testable_task_creator : public task_creator {
  public:
   testable_task_creator(size_t num_threads,
-                        gpu_pipeline_hashmap& gpu_pipeline_map,
+                        sirius_pipeline_hashmap& gpu_pipeline_map,
                         duckdb::ClientContext& client_context,
                         pipeline_executor& pipeline_executor,
                         duckdb_scan_executor& duckdb_scan_executor)
@@ -179,7 +179,7 @@ class testable_task_creator : public task_creator {
 
   size_t get_schedule_count() const { return _schedule_count.load(); }
 
-  std::vector<sirius_physical_table_scan*> get_scheduled_nodes()
+  std::vector<sirius_physical_operator*> get_scheduled_nodes()
   {
     std::lock_guard<std::mutex> lock(_scheduled_mutex);
     return _scheduled_nodes;
@@ -210,7 +210,7 @@ class testable_task_creator : public task_creator {
 
  private:
   std::atomic<size_t> _schedule_count{0};
-  std::vector<sirius_physical_table_scan*> _scheduled_nodes;
+  std::vector<sirius_physical_operator*> _scheduled_nodes;
   std::vector<duckdb::shared_ptr<sirius_pipeline>> _scheduled_pipelines;
   std::mutex _scheduled_mutex;
 };
@@ -255,7 +255,7 @@ class test_fixture {
   pipeline_executor pipeline_exec;
   duckdb_scan_executor scan_exec;
   duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> empty_pipelines;
-  sirius::gpu_pipeline_hashmap pipeline_map;
+  sirius::sirius_pipeline_hashmap pipeline_map;
 };
 
 //===----------------------------------------------------------------------===//
@@ -536,7 +536,7 @@ TEST_CASE("process_next_task with operator hint schedules the hint node", "[task
   mock_pipeline_builder::setup_operator_with_pipeline_port(
     *hint_op,
     "default",
-    duckdb::MemoryBarrierType::PIPELINE,
+    MemoryBarrierType::PIPELINE,
     data_repo.get(),
     nullptr,  // src_pipeline
     nullptr   // dest_pipeline - will be captured by schedule()
@@ -587,7 +587,7 @@ TEST_CASE("process_next_task with pipeline hint recurses to inner operator", "[t
 
   // Set up the port so get_port("default") works
   mock_pipeline_builder::setup_operator_with_pipeline_port(
-    *ready_op, "default", duckdb::MemoryBarrierType::PIPELINE, data_repo.get(), nullptr, nullptr);
+    *ready_op, "default", MemoryBarrierType::PIPELINE, data_repo.get(), nullptr, nullptr);
 
   // Configure ready_op to return itself as hint (all ports ready)
   ready_op->set_custom_hint(sirius::creator::task_creation_hint(ready_op.get()));
@@ -618,7 +618,7 @@ TEST_CASE("process_next_task operator hint follows dest_pipeline", "[task_creato
 
   // Set up target_op with a default port
   mock_pipeline_builder::setup_operator_with_pipeline_port(
-    *target_op, "default", duckdb::MemoryBarrierType::PIPELINE, data_repo.get(), nullptr, nullptr);
+    *target_op, "default", MemoryBarrierType::PIPELINE, data_repo.get(), nullptr, nullptr);
 
   // Source returns target as hint
   source_op->set_custom_hint(sirius::creator::task_creation_hint(target_op.get()));
@@ -648,7 +648,7 @@ TEST_CASE("process_next_task hint traversal chain", "[task_creator]")
 
   // Set up op2 with default port
   mock_pipeline_builder::setup_operator_with_pipeline_port(
-    *op2, "default", duckdb::MemoryBarrierType::PIPELINE, data_repo.get(), nullptr, nullptr);
+    *op2, "default", MemoryBarrierType::PIPELINE, data_repo.get(), nullptr, nullptr);
 
   // op1 returns op2 as hint
   op1->set_custom_hint(sirius::creator::task_creation_hint(op2.get()));
@@ -755,7 +755,7 @@ TEST_CASE("get_next_task_hint PIPELINE barrier with empty repo returns src_pipel
   // where src_pipeline is nullptr (returns monostate)
   mock_pipeline_builder::setup_operator_with_pipeline_port(op,
                                                            "input",
-                                                           duckdb::MemoryBarrierType::PIPELINE,
+                                                           MemoryBarrierType::PIPELINE,
                                                            data_repo.get(),
                                                            nullptr,  // src_pipeline is nullptr
                                                            nullptr   // dest_pipeline
@@ -776,12 +776,12 @@ TEST_CASE("get_next_task_hint PIPELINE barrier with data returns this", "[get_ne
   data_repo->add_data_batch(batch);
 
   mock_pipeline_builder::setup_operator_with_pipeline_port(
-    op, "input", duckdb::MemoryBarrierType::PIPELINE, data_repo.get(), nullptr, nullptr);
+    op, "input", MemoryBarrierType::PIPELINE, data_repo.get(), nullptr, nullptr);
 
   // repo has data → all ports ready → should return this operator
   auto hint = op.get_next_task_hint();
-  REQUIRE(std::holds_alternative<sirius_physical_table_scan*>(hint));
-  REQUIRE(std::get<sirius_physical_table_scan*>(hint) == &op);
+  REQUIRE(std::holds_alternative<sirius_physical_operator*>(hint));
+  REQUIRE(std::get<sirius_physical_operator*>(hint) == &op);
 }
 
 TEST_CASE("get_next_task_hint multiple PIPELINE ports all ready returns this",
@@ -796,15 +796,15 @@ TEST_CASE("get_next_task_hint multiple PIPELINE ports all ready returns this",
   data_repo2->add_data_batch(std::make_shared<cucascade::data_batch>(1, nullptr));
 
   mock_pipeline_builder::setup_operator_with_pipeline_port(
-    op, "input1", duckdb::MemoryBarrierType::PIPELINE, data_repo1.get(), nullptr, nullptr);
+    op, "input1", MemoryBarrierType::PIPELINE, data_repo1.get(), nullptr, nullptr);
 
   mock_pipeline_builder::setup_operator_with_pipeline_port(
-    op, "input2", duckdb::MemoryBarrierType::PIPELINE, data_repo2.get(), nullptr, nullptr);
+    op, "input2", MemoryBarrierType::PIPELINE, data_repo2.get(), nullptr, nullptr);
 
   // Both repos have data → all ports ready → should return this operator
   auto hint = op.get_next_task_hint();
-  REQUIRE(std::holds_alternative<sirius_physical_table_scan*>(hint));
-  REQUIRE(std::get<sirius_physical_table_scan*>(hint) == &op);
+  REQUIRE(std::holds_alternative<sirius_physical_operator*>(hint));
+  REQUIRE(std::get<sirius_physical_operator*>(hint) == &op);
 }
 
 TEST_CASE("get_next_task_hint multiple PIPELINE ports one empty returns monostate",
@@ -819,11 +819,11 @@ TEST_CASE("get_next_task_hint multiple PIPELINE ports one empty returns monostat
   // data_repo2 is empty
 
   mock_pipeline_builder::setup_operator_with_pipeline_port(
-    op, "input1", duckdb::MemoryBarrierType::PIPELINE, data_repo1.get(), nullptr, nullptr);
+    op, "input1", MemoryBarrierType::PIPELINE, data_repo1.get(), nullptr, nullptr);
 
   mock_pipeline_builder::setup_operator_with_pipeline_port(op,
                                                            "input2",
-                                                           duckdb::MemoryBarrierType::PIPELINE,
+                                                           MemoryBarrierType::PIPELINE,
                                                            data_repo2.get(),
                                                            nullptr,  // no src_pipeline
                                                            nullptr);
@@ -842,8 +842,8 @@ TEST_CASE("get_next_task_hint uses custom hint when set on mock", "[get_next_tas
   source_op.set_custom_hint(sirius::creator::task_creation_hint(&target_op));
 
   auto hint = source_op.get_next_task_hint();
-  REQUIRE(std::holds_alternative<sirius_physical_table_scan*>(hint));
-  REQUIRE(std::get<sirius_physical_table_scan*>(hint) == &target_op);
+  REQUIRE(std::holds_alternative<sirius_physical_operator*>(hint));
+  REQUIRE(std::get<sirius_physical_operator*>(hint) == &target_op);
 }
 
 TEST_CASE("get_next_task_hint custom hint monostate", "[get_next_task_hint]")
@@ -888,7 +888,7 @@ TEST_CASE("get_next_task_hint FULL barrier with unfinished pipeline returns src_
   mock_pipeline_builder::setup_operator_with_pipeline_port(
     op,
     "input",
-    duckdb::MemoryBarrierType::FULL,
+    MemoryBarrierType::FULL,
     data_repo.get(),
     mock_pipeline,  // src_pipeline is not finished
     nullptr);
@@ -913,15 +913,15 @@ TEST_CASE("get_next_task_hint FULL barrier with finished pipeline returns this",
   mock_pipeline_builder::setup_operator_with_pipeline_port(
     op,
     "input",
-    duckdb::MemoryBarrierType::FULL,
+    MemoryBarrierType::FULL,
     data_repo.get(),
     mock_pipeline,  // src_pipeline is finished
     nullptr);
 
   // src_pipeline is finished → all ports ready → should return this operator
   auto hint = op.get_next_task_hint();
-  REQUIRE(std::holds_alternative<sirius_physical_table_scan*>(hint));
-  REQUIRE(std::get<sirius_physical_table_scan*>(hint) == &op);
+  REQUIRE(std::holds_alternative<sirius_physical_operator*>(hint));
+  REQUIRE(std::get<sirius_physical_operator*>(hint) == &op);
 }
 
 TEST_CASE("get_next_task_hint multiple FULL barriers all finished returns this",
@@ -939,15 +939,15 @@ TEST_CASE("get_next_task_hint multiple FULL barriers all finished returns this",
   mock_pipeline2->set_finished(true);
 
   mock_pipeline_builder::setup_operator_with_pipeline_port(
-    op, "input1", duckdb::MemoryBarrierType::FULL, data_repo1.get(), mock_pipeline1, nullptr);
+    op, "input1", MemoryBarrierType::FULL, data_repo1.get(), mock_pipeline1, nullptr);
 
   mock_pipeline_builder::setup_operator_with_pipeline_port(
-    op, "input2", duckdb::MemoryBarrierType::FULL, data_repo2.get(), mock_pipeline2, nullptr);
+    op, "input2", MemoryBarrierType::FULL, data_repo2.get(), mock_pipeline2, nullptr);
 
   // Both pipelines finished → all ports ready → should return this operator
   auto hint = op.get_next_task_hint();
-  REQUIRE(std::holds_alternative<sirius_physical_table_scan*>(hint));
-  REQUIRE(std::get<sirius_physical_table_scan*>(hint) == &op);
+  REQUIRE(std::holds_alternative<sirius_physical_operator*>(hint));
+  REQUIRE(std::get<sirius_physical_operator*>(hint) == &op);
 }
 
 TEST_CASE("get_next_task_hint multiple FULL barriers one unfinished returns src_pipeline",
@@ -965,10 +965,10 @@ TEST_CASE("get_next_task_hint multiple FULL barriers one unfinished returns src_
   mock_pipeline2->set_finished(false);  // This one is not finished
 
   mock_pipeline_builder::setup_operator_with_pipeline_port(
-    op, "input1", duckdb::MemoryBarrierType::FULL, data_repo1.get(), mock_pipeline1, nullptr);
+    op, "input1", MemoryBarrierType::FULL, data_repo1.get(), mock_pipeline1, nullptr);
 
   mock_pipeline_builder::setup_operator_with_pipeline_port(
-    op, "input2", duckdb::MemoryBarrierType::FULL, data_repo2.get(), mock_pipeline2, nullptr);
+    op, "input2", MemoryBarrierType::FULL, data_repo2.get(), mock_pipeline2, nullptr);
 
   // One pipeline is not finished → should return that unfinished pipeline
   auto hint = op.get_next_task_hint();
@@ -992,16 +992,16 @@ TEST_CASE("get_next_task_hint mixed PIPELINE and FULL barriers", "[get_next_task
 
   // PIPELINE barrier with data
   mock_pipeline_builder::setup_operator_with_pipeline_port(
-    op, "pipeline_input", duckdb::MemoryBarrierType::PIPELINE, data_repo1.get(), nullptr, nullptr);
+    op, "pipeline_input", MemoryBarrierType::PIPELINE, data_repo1.get(), nullptr, nullptr);
 
   // FULL barrier with finished pipeline
   mock_pipeline_builder::setup_operator_with_pipeline_port(
-    op, "full_input", duckdb::MemoryBarrierType::FULL, data_repo2.get(), mock_pipeline, nullptr);
+    op, "full_input", MemoryBarrierType::FULL, data_repo2.get(), mock_pipeline, nullptr);
 
   // Both ports are ready (PIPELINE has data, FULL is finished) → return this
   auto hint = op.get_next_task_hint();
-  REQUIRE(std::holds_alternative<sirius_physical_table_scan*>(hint));
-  REQUIRE(std::get<sirius_physical_table_scan*>(hint) == &op);
+  REQUIRE(std::holds_alternative<sirius_physical_operator*>(hint));
+  REQUIRE(std::get<sirius_physical_operator*>(hint) == &op);
 }
 
 TEST_CASE("get_next_task_hint mixed barriers with FULL unfinished", "[get_next_task_hint]")
@@ -1020,11 +1020,11 @@ TEST_CASE("get_next_task_hint mixed barriers with FULL unfinished", "[get_next_t
 
   // PIPELINE barrier with data (ready)
   mock_pipeline_builder::setup_operator_with_pipeline_port(
-    op, "pipeline_input", duckdb::MemoryBarrierType::PIPELINE, data_repo1.get(), nullptr, nullptr);
+    op, "pipeline_input", MemoryBarrierType::PIPELINE, data_repo1.get(), nullptr, nullptr);
 
   // FULL barrier with unfinished pipeline (not ready)
   mock_pipeline_builder::setup_operator_with_pipeline_port(
-    op, "full_input", duckdb::MemoryBarrierType::FULL, data_repo2.get(), mock_pipeline, nullptr);
+    op, "full_input", MemoryBarrierType::FULL, data_repo2.get(), mock_pipeline, nullptr);
 
   // FULL port is not ready → should return the unfinished src_pipeline
   auto hint = op.get_next_task_hint();
@@ -1052,14 +1052,14 @@ TEST_CASE("get_next_task_hint mixed barriers with PIPELINE empty", "[get_next_ta
   mock_pipeline_builder::setup_operator_with_pipeline_port(
     op,
     "pipeline_input",
-    duckdb::MemoryBarrierType::PIPELINE,
+    MemoryBarrierType::PIPELINE,
     data_repo1.get(),
     pipeline_src,  // src_pipeline to return when empty
     nullptr);
 
   // FULL barrier with finished pipeline (ready)
   mock_pipeline_builder::setup_operator_with_pipeline_port(
-    op, "full_input", duckdb::MemoryBarrierType::FULL, data_repo2.get(), full_src, nullptr);
+    op, "full_input", MemoryBarrierType::FULL, data_repo2.get(), full_src, nullptr);
 
   // PIPELINE port is empty → should return its src_pipeline
   auto hint = op.get_next_task_hint();

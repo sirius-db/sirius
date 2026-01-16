@@ -22,7 +22,7 @@
 #include "op/sirius_physical_operator.hpp"
 
 namespace duckdb {
-class GPUPreparedStatementData;
+class SiriusPreparedStatementData;
 }  // namespace duckdb
 
 namespace sirius {
@@ -40,7 +40,7 @@ class sirius_physical_result_collector : public sirius_physical_operator {
     duckdb::PhysicalOperatorType::RESULT_COLLECTOR;
 
  public:
-  explicit sirius_physical_result_collector(duckdb::GPUPreparedStatementData& data);
+  explicit sirius_physical_result_collector(duckdb::SiriusPreparedStatementData& data);
 
   duckdb::StatementType statement_type;
   duckdb::StatementProperties properties;
@@ -63,7 +63,7 @@ class sirius_physical_result_collector : public sirius_physical_operator {
 
 class sirius_physical_materialized_collector : public sirius_physical_result_collector {
  public:
-  sirius_physical_materialized_collector(duckdb::GPUPreparedStatementData& data);
+  sirius_physical_materialized_collector(duckdb::SiriusPreparedStatementData& data);
   duckdb::unique_ptr<duckdb::GPUResultCollection> result_collection;
 
  public:

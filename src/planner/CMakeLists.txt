@@ -16,6 +16,7 @@
 
 set(EXTENSION_SOURCES
     ${EXTENSION_SOURCES}
+    ${CMAKE_CURRENT_SOURCE_DIR}/sirius_physical_plan_generator.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/sirius_plan_aggregate.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/sirius_plan_column_data_get.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/sirius_plan_comparison_join.cpp

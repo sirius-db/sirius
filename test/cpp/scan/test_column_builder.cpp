@@ -19,7 +19,7 @@
 
 // sirius
 #include <helper/utils.hpp>
-#include <scan/duckdb_scan_task.hpp>
+#include <op/scan/duckdb_scan_task.hpp>
 
 // duckdb
 #include <duckdb/common/types/validity_mask.hpp>

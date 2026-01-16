@@ -52,16 +52,20 @@ namespace duckdb {
 void GPUExecutor::Reset()
 {
   // lock_guard<mutex> elock(executor_lock);
-  gpu_physical_plan = nullptr;
+  gpu_physical_plan    = nullptr;
+  sirius_physical_plan = nullptr;
   // cancelled = false;
   gpu_owned_plan.reset();
+  sirius_owned_plan.reset();
   // root_executor.reset();
   root_pipelines.clear();
+  sirius_root_pipelines.clear();
   root_pipeline_idx   = 0;
   completed_pipelines = 0;
   total_pipelines     = 0;
   // error_manager.Reset();
   pipelines.clear();
+  sirius_pipelines.clear();
   new_pipeline_breakers.clear();
   concat_ops.clear();
   operator_to_id.clear();
@@ -429,6 +433,14 @@ unique_ptr<QueryResult> GPUExecutor::GetResult()
   result_collector.sink_state = result_collector.GetGlobalSinkState(context);
   unique_ptr<QueryResult> res = result_collector.GetResult(*(result_collector.sink_state));
   return res;
+}
+
+void GPUExecutor::initialize(unique_ptr<::sirius::op::sirius_physical_operator> plan)
+{
+  SIRIUS_LOG_DEBUG("Initializing GPUExecutor");
+  Reset();
+  sirius_owned_plan = std::move(plan);
+  initialize_internal(*sirius_owned_plan);
 }
 
 void GPUExecutor::initialize_internal(::sirius::op::sirius_physical_operator& plan)
