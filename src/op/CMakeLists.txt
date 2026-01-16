@@ -32,7 +32,7 @@ set(EXTENSION_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/sirius_physical_order.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/sirius_physical_projection.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/sirius_physical_ungrouped_aggregate.cpp
-    # ${CMAKE_CURRENT_SOURCE_DIR}/sirius_physical_result_collector.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/sirius_physical_result_collector.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/sirius_physical_table_scan.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/sirius_physical_nested_loop_join.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/sirius_physical_cte.cpp

@@ -17,13 +17,13 @@
 #pragma once
 
 #include "duckdb/main/client_context.hpp"
-#include "gpu_physical_operator.hpp"
-#include "gpu_pipeline.hpp"
-#include "gpu_pipeline_hashmap.hpp"
 #include "helper/helper.hpp"
-#include "operator/scan/duckdb_scan_executor.hpp"
+#include "op/scan/duckdb_scan_executor.hpp"
+#include "op/sirius_physical_operator.hpp"
 #include "parallel/task_executor.hpp"
 #include "pipeline/pipeline_executor.hpp"
+#include "pipeline/sirius_pipeline.hpp"
+#include "sirius_pipeline_hashmap.hpp"
 
 #include <blockingconcurrentqueue.h>
 #include <data/data_batch.hpp>
@@ -41,35 +41,35 @@ namespace sirius::creator {
 /**
  * @brief Contains information needed to create a task.
  *
- * This class holds a reference to a GPU physical operator node and its associated
+ * This class holds a reference to a sirius physical operator node and its associated
  * pipeline, which together provide the context needed for task creation.
  */
 class task_creation_info {
  public:
-  task_creation_info(::duckdb::GPUPhysicalOperator* node,
-                     ::duckdb::shared_ptr<::duckdb::GPUPipeline> pipeline)
+  task_creation_info(sirius::op::sirius_physical_operator* node,
+                     duckdb::shared_ptr<sirius::pipeline::sirius_pipeline> pipeline)
     : _node(node), _pipeline(std::move(pipeline))
   {
     if (!_pipeline) {
       return;  // Skip port setup if no pipeline provided
     }
     // get next port after sink and then get the data repository from the port
-    auto next_port_after_sink = _pipeline->GetSink()->get_next_port_after_sink();
+    auto next_port_after_sink = _pipeline->get_sink()->get_next_port_after_sink();
     for (auto& [next_op, port_id] : next_port_after_sink) {
       destination_data_repositories.push_back(next_op->get_port(port_id)->repo);
     }
     if (_node->type == ::duckdb::PhysicalOperatorType::TABLE_SCAN) {
-      auto& first_operator = _pipeline->GetInnerOperators()[0].get();
+      auto& first_operator = _pipeline->get_inner_operators()[0].get();
       destination_data_repositories.push_back(first_operator.get_port("scan")->repo);
     }
-    if (_pipeline->GetSink()->type == ::duckdb::PhysicalOperatorType::RESULT_COLLECTOR) {
+    if (_pipeline->get_sink()->type == ::duckdb::PhysicalOperatorType::RESULT_COLLECTOR) {
       destination_data_repositories.push_back(_node->get_port("final")->repo);
     }
   };
   ~task_creation_info() = default;
-  ::duckdb::GPUPhysicalOperator* _node;
+  sirius::op::sirius_physical_operator* _node;
   std::vector<cucascade::shared_data_repository*> destination_data_repositories;
-  ::duckdb::shared_ptr<::duckdb::GPUPipeline> _pipeline;
+  duckdb::shared_ptr<sirius::pipeline::sirius_pipeline> _pipeline;
 };
 
 /**
@@ -158,8 +158,8 @@ class task_creator {
    * @param duckdb_scan_executor Reference to the duckdb scan executor.
    */
   task_creator(size_t num_threads,
-               gpu_pipeline_hashmap& gpu_pipeline_map,
-               ::duckdb::ClientContext& client_context,
+               sirius_pipeline_hashmap& sirius_pipeline_map,
+               duckdb::ClientContext& client_context,
                sirius::pipeline::pipeline_executor& pipeline_executor,
                sirius::op::scan::duckdb_scan_executor& duckdb_scan_executor);
 
@@ -183,7 +183,7 @@ class task_creator {
    *
    * @param node The operator node to get the next task hint from.
    */
-  void process_next_task(::duckdb::GPUPhysicalOperator* node);
+  void process_next_task(op::sirius_physical_operator* node);
 
   /**
    * @brief Start scheduling initial scan pipelines.
@@ -256,13 +256,13 @@ class task_creator {
   size_t _num_threads;
   std::atomic<bool> _running;
   std::vector<std::unique_ptr<std::thread>> _threads;
-  std::queue<::duckdb::shared_ptr<::duckdb::GPUPipeline>> priority_scans;
+  std::queue<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>> priority_scans;
   std::unique_ptr<task_creation_queue> _task_creation_queue;
-  gpu_pipeline_hashmap& _gpu_pipeline_map;
-  ::duckdb::ClientContext& _client_context;
+  sirius_pipeline_hashmap& _sirius_pipeline_map;
+  duckdb::ClientContext& _client_context;
   sirius::pipeline::pipeline_executor& _pipeline_executor;
   sirius::op::scan::duckdb_scan_executor& _duckdb_scan_executor;
-  atomic<uint64_t> _task_id{0};
+  std::atomic<uint64_t> _task_id{0};
 };
 
 }  // namespace sirius::creator

@@ -18,7 +18,7 @@
 #include <helper/utils.hpp>
 #include <memory/memory_reservation.hpp>
 #include <memory/sirius_memory_manager.hpp>
-#include <scan/duckdb_scan_task.hpp>
+#include <op/scan/duckdb_scan_task.hpp>
 
 // duckdb
 #include <duckdb/common/types.hpp>
@@ -33,10 +33,10 @@ namespace sirius::op::scan {
 // duckdb_scan_task_global_state
 //===----------------------------------------------------------------------===//
 duckdb_scan_task_global_state::duckdb_scan_task_global_state(
-  duckdb::shared_ptr<duckdb::GPUPipeline> pipeline,
+  duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
   duckdb_scan_executor& scan_exec,
   duckdb::ClientContext& client_ctx,
-  duckdb::GPUPhysicalTableScan* scan_op)
+  op::sirius_physical_table_scan* scan_op)
   : pipeline(std::move(pipeline)),
     max_threads(scan_exec.get_num_threads()),
     scan_executor(scan_exec),
@@ -75,7 +75,9 @@ duckdb_scan_task_local_state::column_builder::column_builder(duckdb::LogicalType
 }
 
 void duckdb_scan_task_local_state::column_builder::initialize_accessors(
-  size_t estimated_num_rows, size_t byte_offset, unique_ptr<multiple_blocks_allocation>& allocation)
+  size_t estimated_num_rows,
+  size_t byte_offset,
+  std::unique_ptr<multiple_blocks_allocation>& allocation)
 {
   assert(allocation != nullptr);
   assert(!allocation->get_blocks().empty());
@@ -121,7 +123,7 @@ void duckdb_scan_task_local_state::column_builder::process_mask_for_column(
   duckdb::ValidityMask const& validity,
   size_t num_rows,
   size_t row_offset,
-  unique_ptr<multiple_blocks_allocation>& allocation)
+  std::unique_ptr<multiple_blocks_allocation>& allocation)
 {
   auto const* src_valid = reinterpret_cast<uint8_t const*>(validity.GetData());
   auto const cur_bit    = utils::mod_8(row_offset);  //< bit offset in current byte
@@ -229,7 +231,7 @@ void duckdb_scan_task_local_state::column_builder::process_column(
   duckdb::ValidityMask const& validity,
   size_t num_rows,
   size_t row_offset,
-  unique_ptr<multiple_blocks_allocation>& allocation)
+  std::unique_ptr<multiple_blocks_allocation>& allocation)
 {
   // PRECONDITION: Vector must be flattened
   if (type.InternalType() == duckdb::PhysicalType::VARCHAR) {
@@ -272,7 +274,7 @@ duckdb_scan_task_local_state::duckdb_scan_task_local_state(
   duckdb::ExecutionContext& exec_ctx,
   size_t approximate_batch_size,
   size_t default_varchar_size,
-  unique_ptr<duckdb::LocalTableFunctionState> existing_local_tf_state)
+  duckdb::unique_ptr<duckdb::LocalTableFunctionState> existing_local_tf_state)
   : approximate_batch_size(approximate_batch_size),
     default_varchar_size(default_varchar_size),
     exec_ctx(exec_ctx),
@@ -313,7 +315,7 @@ duckdb_scan_task_local_state::duckdb_scan_task_local_state(
   initialize_local_table_function_state(op, exec_ctx, g_state.global_tf_state.get());
 }
 
-void duckdb_scan_task_local_state::estimate_rows_per_batch(duckdb::GPUPhysicalTableScan const& op)
+void duckdb_scan_task_local_state::estimate_rows_per_batch(op::sirius_physical_table_scan const& op)
 {
   assert(num_columns <= op.column_ids.size());
 
@@ -366,7 +368,7 @@ void duckdb_scan_task_local_state::initialize_builders()
 }
 
 void duckdb_scan_task_local_state::initialize_local_table_function_state(
-  duckdb::GPUPhysicalTableScan const& op,
+  op::sirius_physical_table_scan const& op,
   duckdb::ExecutionContext& exec_ctx,
   duckdb::GlobalTableFunctionState* global_tf_state)
 {

@@ -39,13 +39,13 @@
 #include <gpu_buffer_manager.hpp>
 #include <gpu_context.hpp>
 #include <gpu_executor.hpp>
-#include <gpu_physical_plan_generator.hpp>
-#include <gpu_pipeline.hpp>
-#include <operator/gpu_physical_concat.hpp>
-#include <operator/gpu_physical_cte.hpp>
-#include <operator/gpu_physical_delim_join.hpp>
-#include <operator/gpu_physical_partition.hpp>
-#include <operator/gpu_physical_result_collector.hpp>
+#include <op/sirius_physical_concat.hpp>
+#include <op/sirius_physical_cte.hpp>
+#include <op/sirius_physical_delim_join.hpp>
+#include <op/sirius_physical_partition.hpp>
+#include <op/sirius_physical_result_collector.hpp>
+#include <pipeline/sirius_pipeline.hpp>
+#include <planner/sirius_physical_plan_generator.hpp>
 #include <sirius_extension.hpp>
 
 // duckdb
@@ -66,6 +66,16 @@
 #include <unordered_set>
 
 using namespace duckdb;
+
+// sirius types
+using sirius::op::sirius_physical_cte;
+using sirius::op::sirius_physical_delim_join;
+using sirius::op::sirius_physical_materialized_collector;
+using sirius::op::sirius_physical_operator;
+using sirius::op::sirius_physical_partition;
+using sirius::op::sirius_physical_result_collector;
+using sirius::pipeline::sirius_pipeline;
+using sirius::planner::sirius_physical_plan_generator;
 
 //===----------------------------------------------------------------------===//
 // Test Fixture and Helper Functions
@@ -322,23 +332,23 @@ void create_tpch_schema(Connection& con)
   )");
 }
 
-// Static storage to keep GPUPreparedStatementData alive during test execution
+// Static storage to keep SiriusPreparedStatementData alive during test execution
 // (GPUPhysicalResultCollector holds a reference to it)
-static duckdb::shared_ptr<GPUPreparedStatementData> g_gpu_prepared;
+static duckdb::shared_ptr<SiriusPreparedStatementData> g_gpu_prepared;
 
 /**
  * @brief Generate GPU physical plan wrapped in a result collector
  *
  * This mirrors the actual Sirius extension execution:
  * 1. A separate connection extracts the logical plan
- * 2. GPUPhysicalPlanGenerator creates the raw GPU plan
- * 3. GPUPhysicalMaterializedCollector wraps the plan (like GPUPendingStatementOrPreparedStatement
- * does)
+ * 2. SiriusPhysicalPlanGenerator creates the raw GPU plan
+ * 3. sirius_physical_materialized_collector wraps the plan (like
+ * GPUPendingStatementOrPreparedStatement does)
  * 4. The result collector is passed to the executor
  */
-duckdb::unique_ptr<GPUPhysicalOperator> generate_gpu_plan(Connection& con,
-                                                          GPUContext& gpu_context,
-                                                          const std::string& query)
+duckdb::unique_ptr<sirius_physical_operator> generate_gpu_plan(Connection& con,
+                                                               GPUContext& gpu_context,
+                                                               const std::string& query)
 {
   // Create a separate connection for extracting the logical plan (like SiriusInitPlanExtractor)
   // Connection plan_conn(*con.context->db);
@@ -383,18 +393,19 @@ duckdb::unique_ptr<GPUPhysicalOperator> generate_gpu_plan(Connection& con,
   resolver.VisitOperator(*logical_plan);
 
   // Create the raw GPU physical plan
-  GPUPhysicalPlanGenerator physical_planner(*con.context, gpu_context);
-  auto gpu_physical_plan = physical_planner.CreatePlan(std::move(logical_plan));
+  sirius_physical_plan_generator physical_planner(*con.context, gpu_context);
+  auto sirius_physical_plan = physical_planner.create_plan(std::move(logical_plan));
 
-  // Create GPUPreparedStatementData (like GPUProcessingBind does)
+  // Create SiriusPreparedStatementData (like GPUProcessingBind does)
   // Store in static variable to keep it alive (GPUPhysicalResultCollector holds a reference)
   g_gpu_prepared =
-    make_shared_ptr<GPUPreparedStatementData>(prepared, std::move(gpu_physical_plan));
+    make_shared_ptr<SiriusPreparedStatementData>(prepared, std::move(sirius_physical_plan));
 
   // Create the result collector that wraps the GPU plan (like
   // GPUPendingStatementOrPreparedStatement does)
   auto gpu_collector =
-    make_uniq_base<GPUPhysicalResultCollector, GPUPhysicalMaterializedCollector>(*g_gpu_prepared);
+    make_uniq_base<sirius_physical_result_collector, sirius_physical_materialized_collector>(
+      *g_gpu_prepared);
 
   con.Query("COMMIT TRANSACTION");
 
@@ -404,7 +415,7 @@ duckdb::unique_ptr<GPUPhysicalOperator> generate_gpu_plan(Connection& con,
 /**
  * @brief Validate that a port has a non-null repository
  */
-void validate_port_repository(GPUPhysicalOperator::port* port, const std::string& context_msg)
+void validate_port_repository(sirius_physical_operator::port* port, const std::string& context_msg)
 {
   INFO("Context: " << context_msg);
   REQUIRE(port != nullptr);
@@ -414,13 +425,15 @@ void validate_port_repository(GPUPhysicalOperator::port* port, const std::string
 /**
  * @brief Build a map from source operator to pipelines that use it as source
  */
-std::unordered_map<const GPUPhysicalOperator*, duckdb::vector<duckdb::shared_ptr<GPUPipeline>>>
-build_source_to_pipelines_map(const duckdb::vector<duckdb::shared_ptr<GPUPipeline>>& pipelines)
+std::unordered_map<const sirius_physical_operator*,
+                   duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>>
+build_source_to_pipelines_map(const duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines)
 {
-  std::unordered_map<const GPUPhysicalOperator*, duckdb::vector<duckdb::shared_ptr<GPUPipeline>>>
+  std::unordered_map<const sirius_physical_operator*,
+                     duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>>
     result;
   for (const auto& pipeline : pipelines) {
-    result[pipeline->GetSource().get()].push_back(pipeline);
+    result[pipeline->get_source().get()].push_back(pipeline);
   }
   return result;
 }
@@ -428,11 +441,11 @@ build_source_to_pipelines_map(const duckdb::vector<duckdb::shared_ptr<GPUPipelin
 /**
  * @brief Count pipelines with PARTITION sinks (type=INVALID)
  */
-size_t count_partition_sinks(const duckdb::vector<duckdb::shared_ptr<GPUPipeline>>& pipelines)
+size_t count_partition_sinks(const duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines)
 {
   size_t count = 0;
   for (const auto& pipeline : pipelines) {
-    if (pipeline->GetSink()->type == PhysicalOperatorType::INVALID) { count++; }
+    if (pipeline->get_sink()->type == PhysicalOperatorType::INVALID) { count++; }
   }
   return count;
 }
@@ -440,12 +453,12 @@ size_t count_partition_sinks(const duckdb::vector<duckdb::shared_ptr<GPUPipeline
 /**
  * @brief Check if any pipeline contains a CONCAT operator
  */
-bool has_concat_operator(const duckdb::vector<duckdb::shared_ptr<GPUPipeline>>& pipelines)
+bool has_concat_operator(const duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines)
 {
   for (const auto& pipeline : pipelines) {
-    auto ops = pipeline->GetInnerOperators();
+    auto ops = pipeline->get_inner_operators();
     for (auto& op : ops) {
-      if (op.get().GetName() == "CONCAT") { return true; }
+      if (op.get().get_name() == "CONCAT") { return true; }
     }
   }
   return false;
@@ -454,12 +467,12 @@ bool has_concat_operator(const duckdb::vector<duckdb::shared_ptr<GPUPipeline>>& 
 /**
  * @brief Count pipelines with a specific sink type
  */
-size_t count_sink_type(const duckdb::vector<duckdb::shared_ptr<GPUPipeline>>& pipelines,
+size_t count_sink_type(const duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines,
                        PhysicalOperatorType type)
 {
   size_t count = 0;
   for (const auto& pipeline : pipelines) {
-    if (pipeline->GetSink()->type == type) { count++; }
+    if (pipeline->get_sink()->type == type) { count++; }
   }
   return count;
 }
@@ -479,13 +492,13 @@ struct PipelineBreakdownInfo {
 };
 
 PipelineBreakdownInfo analyze_pipeline_breakdown(
-  const duckdb::vector<duckdb::shared_ptr<GPUPipeline>>& pipelines)
+  const duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines)
 {
   PipelineBreakdownInfo info;
   auto source_to_pipelines = build_source_to_pipelines_map(pipelines);
 
   for (const auto& pipeline : pipelines) {
-    auto sink = pipeline->GetSink();
+    auto sink = pipeline->get_sink();
 
     // Count PARTITION sinks
     if (sink->type == PhysicalOperatorType::INVALID) {
@@ -496,9 +509,9 @@ PipelineBreakdownInfo analyze_pipeline_breakdown(
       auto it = source_to_pipelines.find(sink.get());
       if (it != source_to_pipelines.end()) {
         for (auto& dep_pipeline : it->second) {
-          auto ops = dep_pipeline->GetInnerOperators();
+          auto ops = dep_pipeline->get_inner_operators();
           for (auto& op : ops) {
-            if (op.get().GetName() == "CONCAT") {
+            if (op.get().get_name() == "CONCAT") {
               info.has_concat_after_partition   = true;
               info.partition_connects_to_concat = true;
               info.concat_count++;
@@ -516,8 +529,9 @@ PipelineBreakdownInfo analyze_pipeline_breakdown(
  * @brief Validate pipeline breakdown for GROUP_BY:
  * Expected: local_group → PARTITION → CONCAT → global_group
  */
-void validate_groupby_breakdown(const duckdb::vector<duckdb::shared_ptr<GPUPipeline>>& pipelines,
-                                const std::string& query_name)
+void validate_groupby_breakdown(
+  const duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines,
+  const std::string& query_name)
 {
   auto info = analyze_pipeline_breakdown(pipelines);
 
@@ -563,19 +577,19 @@ struct HashJoinBreakdownInfo {
  *   - Pipeline 2: PARTITION (source) → HASH_JOIN → ... → sink
  */
 HashJoinBreakdownInfo analyze_hash_join_breakdown(
-  const duckdb::vector<duckdb::shared_ptr<GPUPipeline>>& pipelines)
+  const duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines)
 {
   HashJoinBreakdownInfo info;
   auto source_to_pipelines = build_source_to_pipelines_map(pipelines);
 
   for (const auto& pipeline : pipelines) {
-    auto sink = pipeline->GetSink();
+    auto sink = pipeline->get_sink();
 
     // Check PARTITION sinks
     if (sink->type == PhysicalOperatorType::INVALID) {
-      auto& partition = sink->Cast<GPUPhysicalPartition>();
+      auto& partition = sink->Cast<sirius_physical_partition>();
 
-      if (partition.isBuildPartition()) {
+      if (partition.is_build_partition()) {
         // Build side partition
         info.build_partition_count++;
 
@@ -596,11 +610,11 @@ HashJoinBreakdownInfo analyze_hash_join_breakdown(
       }
 
       // Check if this partition connects to a pipeline with HASH_JOIN
-      if (partition.isBuildPartition()) {
+      if (partition.is_build_partition()) {
         // For build partitions: find pipeline where HASH_JOIN is the first operator
-        GPUPhysicalOperator* hash_join_op = partition.getParentOp();
+        sirius_physical_operator* hash_join_op = partition.get_parent_op();
         for (const auto& dep_pipeline : pipelines) {
-          auto inner_ops = dep_pipeline->GetInnerOperators();
+          auto inner_ops = dep_pipeline->get_inner_operators();
           if (inner_ops.size() > 0 && &inner_ops[0].get() == hash_join_op) {
             info.partition_connects_to_join = true;
             info.join_pipelines_from_partition++;
@@ -624,7 +638,7 @@ HashJoinBreakdownInfo analyze_hash_join_breakdown(
         if (it != source_to_pipelines.end()) {
           for (auto& dep_pipeline : it->second) {
             // Check if dependent pipeline has HASH_JOIN in operators
-            auto ops = dep_pipeline->GetInnerOperators();
+            auto ops = dep_pipeline->get_inner_operators();
             for (auto& op : ops) {
               if (op.get().type == PhysicalOperatorType::HASH_JOIN ||
                   op.get().type == PhysicalOperatorType::NESTED_LOOP_JOIN) {
@@ -634,9 +648,9 @@ HashJoinBreakdownInfo analyze_hash_join_breakdown(
             }
 
             // Validate port connections - next_op is first inner operator or sink
-            auto inner_ops = dep_pipeline->GetInnerOperators();
-            GPUPhysicalOperator* next_op =
-              inner_ops.size() > 0 ? &inner_ops[0].get() : dep_pipeline->GetSink().get();
+            auto inner_ops = dep_pipeline->get_inner_operators();
+            sirius_physical_operator* next_op =
+              inner_ops.size() > 0 ? &inner_ops[0].get() : dep_pipeline->get_sink().get();
 
             auto* port = next_op->get_port("default");
             if (port == nullptr || port->repo == nullptr) {
@@ -653,8 +667,8 @@ HashJoinBreakdownInfo analyze_hash_join_breakdown(
     }
 
     // Check for pipelines that have PARTITION source and contain HASH_JOIN
-    if (pipeline->GetSource()->type == PhysicalOperatorType::INVALID) {
-      auto ops = pipeline->GetInnerOperators();
+    if (pipeline->get_source()->type == PhysicalOperatorType::INVALID) {
+      auto ops = pipeline->get_inner_operators();
       for (auto& op : ops) {
         if (op.get().type == PhysicalOperatorType::HASH_JOIN ||
             op.get().type == PhysicalOperatorType::NESTED_LOOP_JOIN) {
@@ -718,27 +732,27 @@ void validate_modified_pipeline_structure(GPUExecutor& executor, const std::stri
 
   for (size_t i = 0; i < new_scheduled.size(); i++) {
     auto& pipeline = new_scheduled[i];
-    auto sink      = pipeline->GetSink();
-    auto source    = pipeline->GetSource();
+    auto sink      = pipeline->get_sink();
+    auto source    = pipeline->get_source();
 
     REQUIRE(sink.get() != nullptr);
     REQUIRE(source.get() != nullptr);
 
     std::string pipeline_context = "Pipeline " + std::to_string(i) +
-                                   " (source=" + source->GetName() + ", sink=" + sink->GetName() +
+                                   " (source=" + source->get_name() + ", sink=" + sink->get_name() +
                                    ")";
 
     // Validate based on sink type
     if (sink->type == PhysicalOperatorType::INVALID) {
       // This is a PARTITION operator
-      auto& partition     = sink->Cast<GPUPhysicalPartition>();
-      std::string port_id = partition.isBuildPartition() ? "build" : "default";
+      auto& partition     = sink->Cast<sirius_physical_partition>();
+      std::string port_id = partition.is_build_partition() ? "build" : "default";
 
-      if (partition.isBuildPartition()) {
+      if (partition.is_build_partition()) {
         // For build partitions: find pipeline where HASH_JOIN is the first operator
-        GPUPhysicalOperator* hash_join_op = partition.getParentOp();
+        sirius_physical_operator* hash_join_op = partition.get_parent_op();
         for (const auto& dep_pipeline : new_scheduled) {
-          auto inner_ops = dep_pipeline->GetInnerOperators();
+          auto inner_ops = dep_pipeline->get_inner_operators();
           if (inner_ops.size() > 0 && &inner_ops[0].get() == hash_join_op) {
             auto* port          = hash_join_op->get_port(port_id);
             std::string context = pipeline_context + " -> PARTITION with port '" + port_id + "'";
@@ -756,9 +770,9 @@ void validate_modified_pipeline_structure(GPUExecutor& executor, const std::stri
         if (it != source_to_pipelines.end()) {
           for (auto& dep_pipeline : it->second) {
             // next_op is first inner operator or sink
-            auto inner_ops = dep_pipeline->GetInnerOperators();
-            GPUPhysicalOperator* next_op =
-              inner_ops.size() > 0 ? &inner_ops[0].get() : dep_pipeline->GetSink().get();
+            auto inner_ops = dep_pipeline->get_inner_operators();
+            sirius_physical_operator* next_op =
+              inner_ops.size() > 0 ? &inner_ops[0].get() : dep_pipeline->get_sink().get();
 
             auto* port          = next_op->get_port(port_id);
             std::string context = pipeline_context + " -> PARTITION with port '" + port_id + "'";
@@ -787,13 +801,13 @@ void validate_modified_pipeline_structure(GPUExecutor& executor, const std::stri
       if (it != source_to_pipelines.end()) {
         for (auto& dep_pipeline : it->second) {
           // next_op is first inner operator or sink
-          auto inner_ops = dep_pipeline->GetInnerOperators();
-          GPUPhysicalOperator* next_op =
-            inner_ops.size() > 0 ? &inner_ops[0].get() : dep_pipeline->GetSink().get();
+          auto inner_ops = dep_pipeline->get_inner_operators();
+          sirius_physical_operator* next_op =
+            inner_ops.size() > 0 ? &inner_ops[0].get() : dep_pipeline->get_sink().get();
 
           auto* port = next_op->get_port("default");
           std::string context =
-            pipeline_context + " -> " + sink->GetName() + " with port 'default'";
+            pipeline_context + " -> " + sink->get_name() + " with port 'default'";
           validate_port_repository(port, context);
 
           // Validate pipeline connections
@@ -816,7 +830,7 @@ void validate_modified_pipeline_structure(GPUExecutor& executor, const std::stri
 
     } else if (sink->type == PhysicalOperatorType::RIGHT_DELIM_JOIN) {
       // Validate partition_join and partition_distinct ports
-      auto& delim_join         = sink->Cast<GPUPhysicalDelimJoin>();
+      auto& delim_join         = sink->Cast<sirius_physical_delim_join>();
       auto* partition_join     = delim_join.partition_join;
       auto* partition_distinct = delim_join.partition_distinct;
 
@@ -824,9 +838,9 @@ void validate_modified_pipeline_structure(GPUExecutor& executor, const std::stri
       REQUIRE(partition_distinct != nullptr);
 
       // partition_join should use "build" port - find pipeline where join is first operator
-      GPUPhysicalOperator* join_op = partition_join->getParentOp();
+      sirius_physical_operator* join_op = partition_join->get_parent_op();
       for (const auto& dep_pipeline : new_scheduled) {
-        auto inner_ops = dep_pipeline->GetInnerOperators();
+        auto inner_ops = dep_pipeline->get_inner_operators();
         if (inner_ops.size() > 0 && &inner_ops[0].get() == join_op) {
           auto* port = join_op->get_port("build");
           std::string context =
@@ -841,9 +855,9 @@ void validate_modified_pipeline_structure(GPUExecutor& executor, const std::stri
       if (it_distinct != source_to_pipelines.end()) {
         for (auto& dep_pipeline : it_distinct->second) {
           // next_op is first inner operator or sink
-          auto inner_ops = dep_pipeline->GetInnerOperators();
-          GPUPhysicalOperator* next_op =
-            inner_ops.size() > 0 ? &inner_ops[0].get() : dep_pipeline->GetSink().get();
+          auto inner_ops = dep_pipeline->get_inner_operators();
+          sirius_physical_operator* next_op =
+            inner_ops.size() > 0 ? &inner_ops[0].get() : dep_pipeline->get_sink().get();
 
           auto* port = next_op->get_port("default");
           std::string context =
@@ -854,7 +868,7 @@ void validate_modified_pipeline_structure(GPUExecutor& executor, const std::stri
 
     } else if (sink->type == PhysicalOperatorType::LEFT_DELIM_JOIN) {
       // Validate partition_distinct and column_data_scan ports
-      auto& delim_join         = sink->Cast<GPUPhysicalDelimJoin>();
+      auto& delim_join         = sink->Cast<sirius_physical_delim_join>();
       auto* partition_distinct = delim_join.partition_distinct;
       auto* column_data_scan   = delim_join.join->children[0].get();
 
@@ -866,9 +880,9 @@ void validate_modified_pipeline_structure(GPUExecutor& executor, const std::stri
       if (it_distinct != source_to_pipelines.end()) {
         for (auto& dep_pipeline : it_distinct->second) {
           // next_op is first inner operator or sink
-          auto inner_ops = dep_pipeline->GetInnerOperators();
-          GPUPhysicalOperator* next_op =
-            inner_ops.size() > 0 ? &inner_ops[0].get() : dep_pipeline->GetSink().get();
+          auto inner_ops = dep_pipeline->get_inner_operators();
+          sirius_physical_operator* next_op =
+            inner_ops.size() > 0 ? &inner_ops[0].get() : dep_pipeline->get_sink().get();
 
           auto* port = next_op->get_port("default");
           std::string context =
@@ -882,9 +896,9 @@ void validate_modified_pipeline_structure(GPUExecutor& executor, const std::stri
       if (it_scan != source_to_pipelines.end()) {
         for (auto& dep_pipeline : it_scan->second) {
           // next_op is first inner operator or sink
-          auto inner_ops = dep_pipeline->GetInnerOperators();
-          GPUPhysicalOperator* next_op =
-            inner_ops.size() > 0 ? &inner_ops[0].get() : dep_pipeline->GetSink().get();
+          auto inner_ops = dep_pipeline->get_inner_operators();
+          sirius_physical_operator* next_op =
+            inner_ops.size() > 0 ? &inner_ops[0].get() : dep_pipeline->get_sink().get();
 
           auto* port = next_op->get_port("default");
           std::string context =
@@ -895,16 +909,16 @@ void validate_modified_pipeline_structure(GPUExecutor& executor, const std::stri
 
     } else if (sink->type == PhysicalOperatorType::CTE) {
       // CTE should have "default" port connections to CTE scans
-      auto& cte_op = sink->Cast<GPUPhysicalCTE>();
+      auto& cte_op = sink->Cast<sirius_physical_cte>();
       for (auto& cte_scan_ref : cte_op.cte_scans) {
         auto& cte_scan = cte_scan_ref.get();
         auto it        = source_to_pipelines.find(&cte_scan);
         if (it != source_to_pipelines.end()) {
           for (auto& dep_pipeline : it->second) {
             // next_op is first inner operator or sink
-            auto inner_ops = dep_pipeline->GetInnerOperators();
-            GPUPhysicalOperator* next_op =
-              inner_ops.size() > 0 ? &inner_ops[0].get() : dep_pipeline->GetSink().get();
+            auto inner_ops = dep_pipeline->get_inner_operators();
+            sirius_physical_operator* next_op =
+              inner_ops.size() > 0 ? &inner_ops[0].get() : dep_pipeline->get_sink().get();
 
             auto* port          = next_op->get_port("default");
             std::string context = pipeline_context + " -> CTE with port 'default'";
@@ -921,9 +935,9 @@ void validate_modified_pipeline_structure(GPUExecutor& executor, const std::stri
     // Validate TABLE_SCAN source ports
     if (source->type == PhysicalOperatorType::TABLE_SCAN) {
       // next_op is first inner operator or sink
-      auto inner_ops = pipeline->GetInnerOperators();
-      GPUPhysicalOperator* next_op =
-        inner_ops.size() > 0 ? &inner_ops[0].get() : pipeline->GetSink().get();
+      auto inner_ops = pipeline->get_inner_operators();
+      sirius_physical_operator* next_op =
+        inner_ops.size() > 0 ? &inner_ops[0].get() : pipeline->get_sink().get();
 
       auto* port          = next_op->get_port("scan");
       std::string context = pipeline_context + " -> TABLE_SCAN source with port 'scan'";
@@ -951,7 +965,7 @@ void run_tpch_query_test(Connection& con, const std::string& query, const std::s
 
   // Initialize executor
   GPUExecutor executor(*con.context, gpu_context);
-  executor.Initialize(std::move(gpu_plan));
+  executor.initialize(std::move(gpu_plan));
 
   // Validate pipeline structure
   validate_modified_pipeline_structure(executor, query_name);
@@ -988,7 +1002,7 @@ TEST_CASE("Pipeline breakdown - GROUP_BY pattern", "[modified_pipeline][breakdow
   REQUIRE(gpu_plan != nullptr);
 
   GPUExecutor executor(*con.context, gpu_context);
-  executor.Initialize(std::move(gpu_plan));
+  executor.initialize(std::move(gpu_plan));
 
   // Validate breakdown: should have PARTITION → CONCAT → GROUP_BY
   auto info = analyze_pipeline_breakdown(executor.new_scheduled);
@@ -1023,7 +1037,7 @@ TEST_CASE("Pipeline breakdown - ORDER_BY pattern", "[modified_pipeline][breakdow
   REQUIRE(gpu_plan != nullptr);
 
   GPUExecutor executor(*con.context, gpu_context);
-  executor.Initialize(std::move(gpu_plan));
+  executor.initialize(std::move(gpu_plan));
 
   // Validate breakdown
   auto info = analyze_pipeline_breakdown(executor.new_scheduled);
@@ -1056,7 +1070,7 @@ TEST_CASE("Pipeline breakdown - TOP_N pattern", "[modified_pipeline][breakdown]"
   REQUIRE(gpu_plan != nullptr);
 
   GPUExecutor executor(*con.context, gpu_context);
-  executor.Initialize(std::move(gpu_plan));
+  executor.initialize(std::move(gpu_plan));
 
   // TOP_N should have PARTITION
   REQUIRE(count_partition_sinks(executor.new_scheduled) >= 1);
@@ -1085,7 +1099,7 @@ TEST_CASE("Pipeline breakdown - UNGROUPED_AGGREGATE pattern", "[modified_pipelin
   REQUIRE(gpu_plan != nullptr);
 
   GPUExecutor executor(*con.context, gpu_context);
-  executor.Initialize(std::move(gpu_plan));
+  executor.initialize(std::move(gpu_plan));
 
   // UNGROUPED_AGGREGATE should have PARTITION
   REQUIRE(count_partition_sinks(executor.new_scheduled) >= 1);
@@ -1115,7 +1129,7 @@ TEST_CASE("Pipeline breakdown - HASH_JOIN pattern", "[modified_pipeline][breakdo
   REQUIRE(gpu_plan != nullptr);
 
   GPUExecutor executor(*con.context, gpu_context);
-  executor.Initialize(std::move(gpu_plan));
+  executor.initialize(std::move(gpu_plan));
 
   // Validate HASH_JOIN modification pattern
   validate_hash_join_modification(executor, "HASH_JOIN pattern");
@@ -1148,7 +1162,7 @@ TEST_CASE("Pipeline breakdown - HASH_JOIN build side validation",
   REQUIRE(gpu_plan != nullptr);
 
   GPUExecutor executor(*con.context, gpu_context);
-  executor.Initialize(std::move(gpu_plan));
+  executor.initialize(std::move(gpu_plan));
 
   auto info = analyze_hash_join_breakdown(executor.new_scheduled);
 
@@ -1159,21 +1173,21 @@ TEST_CASE("Pipeline breakdown - HASH_JOIN build side validation",
 
   // Verify the build partition connects to a pipeline where HASH_JOIN is the first operator.
   // Build partitions are NOT used as sources - instead, we find pipelines where the
-  // HASH_JOIN (stored in partition.getParentOp()) is the first operator.
+  // HASH_JOIN (stored in partition.get_parent_op()) is the first operator.
   bool found_build_partition_with_port = false;
   for (const auto& pipeline : executor.new_scheduled) {
-    auto sink = pipeline->GetSink();
+    auto sink = pipeline->get_sink();
     if (sink->type == PhysicalOperatorType::INVALID) {
-      auto& partition = sink->Cast<GPUPhysicalPartition>();
-      if (partition.isBuildPartition()) {
+      auto& partition = sink->Cast<sirius_physical_partition>();
+      if (partition.is_build_partition()) {
         // The partition's parent_op is the HASH_JOIN
-        GPUPhysicalOperator* hash_join_op = partition.getParentOp();
+        sirius_physical_operator* hash_join_op = partition.get_parent_op();
         REQUIRE(hash_join_op != nullptr);
         REQUIRE(hash_join_op->type == PhysicalOperatorType::HASH_JOIN);
 
         // Find the pipeline where HASH_JOIN is the first operator
         for (const auto& dep_pipeline : executor.new_scheduled) {
-          auto inner_ops = dep_pipeline->GetInnerOperators();
+          auto inner_ops = dep_pipeline->get_inner_operators();
           if (inner_ops.size() > 0 && &inner_ops[0].get() == hash_join_op) {
             // The port should be on the HASH_JOIN (the first operator)
             auto* port = hash_join_op->get_port("build");
@@ -1222,7 +1236,7 @@ TEST_CASE("Pipeline breakdown - HASH_JOIN probe side validation",
   REQUIRE(gpu_plan != nullptr);
 
   GPUExecutor executor(*con.context, gpu_context);
-  executor.Initialize(std::move(gpu_plan));
+  executor.initialize(std::move(gpu_plan));
 
   auto info                = analyze_hash_join_breakdown(executor.new_scheduled);
   auto source_to_pipelines = build_source_to_pipelines_map(executor.new_scheduled);
@@ -1235,10 +1249,10 @@ TEST_CASE("Pipeline breakdown - HASH_JOIN probe side validation",
   // Verify probe partitions (isBuildPartition=false) connect to HASH_JOIN
   bool found_join_after_probe_partition = false;
   for (const auto& pipeline : executor.new_scheduled) {
-    auto sink = pipeline->GetSink();
+    auto sink = pipeline->get_sink();
     if (sink->type == PhysicalOperatorType::INVALID) {
-      auto& partition = sink->Cast<GPUPhysicalPartition>();
-      if (!partition.isBuildPartition()) {
+      auto& partition = sink->Cast<sirius_physical_partition>();
+      if (!partition.is_build_partition()) {
         // This is a probe partition - check it uses "default" port
         auto& next_ports = sink->get_next_port_after_sink();
         for (auto& [next_op, port_id] : next_ports) {
@@ -1250,7 +1264,7 @@ TEST_CASE("Pipeline breakdown - HASH_JOIN probe side validation",
         auto it = source_to_pipelines.find(sink.get());
         if (it != source_to_pipelines.end()) {
           for (auto& dep_pipeline : it->second) {
-            auto ops = dep_pipeline->GetInnerOperators();
+            auto ops = dep_pipeline->get_inner_operators();
             for (auto& op : ops) {
               if (op.get().type == PhysicalOperatorType::HASH_JOIN) {
                 found_join_after_probe_partition = true;
@@ -1301,7 +1315,7 @@ TEST_CASE("Pipeline breakdown - Multi-way HASH_JOIN", "[modified_pipeline][break
   REQUIRE(gpu_plan != nullptr);
 
   GPUExecutor executor(*con.context, gpu_context);
-  executor.Initialize(std::move(gpu_plan));
+  executor.initialize(std::move(gpu_plan));
 
   auto info = analyze_hash_join_breakdown(executor.new_scheduled);
 
@@ -1365,7 +1379,7 @@ TEST_CASE("Pipeline breakdown - CTE pattern", "[modified_pipeline][cte]")
   REQUIRE(gpu_plan != nullptr);
 
   GPUExecutor executor(*con.context, gpu_context);
-  executor.Initialize(std::move(gpu_plan));
+  executor.initialize(std::move(gpu_plan));
 
   // CTE queries should have proper pipeline structure
   REQUIRE(executor.new_scheduled.size() > 0);
@@ -1373,7 +1387,7 @@ TEST_CASE("Pipeline breakdown - CTE pattern", "[modified_pipeline][cte]")
   // Check for CTE sink
   bool has_cte = false;
   for (const auto& pipeline : executor.new_scheduled) {
-    if (pipeline->GetSink()->type == PhysicalOperatorType::CTE) {
+    if (pipeline->get_sink()->type == PhysicalOperatorType::CTE) {
       has_cte = true;
       break;
     }

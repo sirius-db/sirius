@@ -23,9 +23,9 @@
 // sirius
 #include <data/data_batch.hpp>
 #include <data/data_repository.hpp>
-#include <operator/gpu_physical_table_scan.hpp>
-#include <scan/duckdb_scan_executor.hpp>
-#include <scan/duckdb_scan_task.hpp>
+#include <op/scan/duckdb_scan_executor.hpp>
+#include <op/scan/duckdb_scan_task.hpp>
+#include <op/sirius_physical_table_scan.hpp>
 
 // duckdb
 #include <duckdb.hpp>
@@ -414,7 +414,7 @@ static void validate_tables_equal(duckdb::Connection& con,
 /**
  * @brief Create a PhysicalTableScan for the given table
  */
-static std::unique_ptr<duckdb::GPUPhysicalTableScan> make_physical_table_scan(
+static std::unique_ptr<sirius::op::sirius_physical_table_scan> make_physical_table_scan(
   duckdb::ClientContext& ctx, std::string const& table_name)
 {
   auto& catalog = duckdb::Catalog::GetCatalog(ctx, "");
@@ -449,8 +449,8 @@ static std::unique_ptr<duckdb::GPUPhysicalTableScan> make_physical_table_scan(
   // Create extra operator info (must be a variable, not a temporary)
   duckdb::ExtraOperatorInfo extra_info;
 
-  // Create GPUPhysicalTableScan with all required parameters
-  auto physical_scan = std::make_unique<duckdb::GPUPhysicalTableScan>(
+  // Create SiriusPhysicalTableScan with all required parameters
+  auto physical_scan = std::make_unique<sirius::op::sirius_physical_table_scan>(
     table_catalog_entry.GetTypes(),   // types
     table_scan_function,              // function
     std::move(bind_data),             // bind_data

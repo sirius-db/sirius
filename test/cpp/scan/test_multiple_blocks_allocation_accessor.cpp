@@ -20,7 +20,7 @@
 #include <memory/fixed_size_host_memory_resource.hpp>
 #include <memory/memory_reservation_manager.hpp>
 #include <memory/numa_region_pinned_host_allocator.hpp>
-#include <scan/duckdb_scan_task.hpp>
+#include <op/scan/duckdb_scan_task.hpp>
 
 using namespace sirius::op::scan;
 using namespace cucascade::memory;

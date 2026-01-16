@@ -26,21 +26,6 @@
 namespace sirius {
 namespace op {
 
-std::string sirius_physical_operator::get_name() const
-{
-  return duckdb::PhysicalOperatorToString(type);
-}
-
-duckdb::vector<duckdb::const_reference<sirius_physical_operator>>
-sirius_physical_operator::get_children() const
-{
-  duckdb::vector<duckdb::const_reference<sirius_physical_operator>> result;
-  for (auto& child : children) {
-    result.push_back(*child);
-  }
-  return result;
-}
-
 //===--------------------------------------------------------------------===//
 // Operator
 //===--------------------------------------------------------------------===//
@@ -86,7 +71,24 @@ duckdb::unique_ptr<duckdb::GlobalSinkState> sirius_physical_operator::get_global
   return duckdb::make_uniq<duckdb::GlobalSinkState>();
 }
 
-// TODO: Implement sirius_physical_operator::sink_execute if required in the future.
+std::string sirius_physical_operator::get_name() const
+{
+  return duckdb::PhysicalOperatorToString(type);
+}
+
+std::string sirius_physical_operator::to_string() const { return get_name() + params_to_string(); }
+
+void sirius_physical_operator::print() const { std::cout << to_string() << std::endl; }
+
+duckdb::vector<duckdb::const_reference<sirius_physical_operator>>
+sirius_physical_operator::get_children() const
+{
+  duckdb::vector<duckdb::const_reference<sirius_physical_operator>> result;
+  for (auto& child : children) {
+    result.push_back(*child);
+  }
+  return result;
+}
 
 //===--------------------------------------------------------------------===//
 // Pipeline Construction
@@ -156,7 +158,7 @@ void sirius_physical_operator::verify()
 #endif
 }
 
-void sirius_physical_operator::add_port(std::string_view port_id, duckdb::unique_ptr<port> p)
+void sirius_physical_operator::add_port(std::string_view port_id, std::unique_ptr<port> p)
 {
   ports[std::string(port_id)] = std::move(p);
 }
@@ -171,26 +173,28 @@ sirius_physical_operator::port* sirius_physical_operator::get_port(std::string_v
   return it->second.get();
 }
 
-::std::vector<::std::shared_ptr<::cucascade::data_batch>> sirius_physical_operator::sink_execute(
+void sirius_physical_operator::sink(
   const ::std::vector<::std::shared_ptr<::cucascade::data_batch>>& input_batches)
 {
-  // submit data batches to the repositories of the next operators :test change
-  // check if the pipeline is finished
-  // if (!creator) {
-  //   throw duckdb::InternalException("sirius_physical_operator creator is null in sink_execute for
-  //   operator " +
-  //                           get_name());
-  // }
-  // if (next_port_after_sink.size() > 0) {
-  //   auto current_pipeline =
-  //     next_port_after_sink[0].first->get_port(next_port_after_sink[0].second)->src_pipeline;
-  //   current_pipeline->update_pipeline_status();
-  // }
-  // for (auto& [next_op, port_id] : next_port_after_sink) {
-  //   if (next_op) { creator->process_next_task(next_op); }
-  // }
-  // not doing anything for now
-  return ::std::vector<::std::shared_ptr<::cucascade::data_batch>>{};
+  auto output_batches = execute(input_batches);
+  for (auto& batch : output_batches) {
+    for (auto& [next_op, port_id] : next_port_after_sink) {
+      next_op->push_data_batch(port_id, batch);
+    }
+  }
+
+  if (!creator) {
+    throw std::runtime_error(
+      "sirius_physical_operator creator is null in sink_execute for operator " + get_name());
+  }
+  if (next_port_after_sink.size() > 0) {
+    auto current_pipeline =
+      next_port_after_sink[0].first->get_port(next_port_after_sink[0].second)->src_pipeline;
+    current_pipeline->update_pipeline_status();
+  }
+  for (auto& [next_op, port_id] : next_port_after_sink) {
+    if (next_op) { creator->process_next_task(next_op); }
+  }
 }
 
 ::std::vector<::std::shared_ptr<::cucascade::data_batch>> sirius_physical_operator::execute(
@@ -213,38 +217,36 @@ void sirius_physical_operator::add_next_port_after_sink(
   next_port_after_sink.push_back(port_locator);
 }
 
-duckdb::vector<std::pair<sirius_physical_operator*, std::string_view>>&
+std::vector<std::pair<sirius_physical_operator*, std::string_view>>&
 sirius_physical_operator::get_next_port_after_sink()
 {
   return next_port_after_sink;
 }
 
-// ::sirius::creator::task_hint sirius_physical_operator::get_next_task_hint()
-// {
-//   for (auto& [port_name, port_ptr] : ports) {
-//     if (port_ptr->type == MemoryBarrierType::PIPELINE) {
-//       // For pipeline barrier: check if there is a data batch available
-//       if (port_ptr->repo->size() == 0) {
-//         // No data batch available, return src pipeline or monostate
-//         if (port_ptr->src_pipeline) {
-//           return ::sirius::creator::task_creation_hint(port_ptr->src_pipeline);
-//         }
-//         return ::sirius::creator::task_creation_hint(std::monostate{});
-//       }
-//     } else if (port_ptr->type == MemoryBarrierType::FULL) {
-//       // For full barrier: src pipeline must be finished and have data
-//       // We assume that there will be a data batch if the src pipeline is finished
-//       if (!port_ptr->src_pipeline->is_pipeline_finished()) {
-//         // Src pipeline not finished, return it to continue processing
-//         return ::sirius::creator::task_creation_hint(port_ptr->src_pipeline);
-//       }
-//     }
-//   }
+creator::task_creation_hint sirius_physical_operator::get_next_task_hint()
+{
+  for (auto& [port_name, port_ptr] : ports) {
+    if (port_ptr->type == MemoryBarrierType::PIPELINE) {
+      // For pipeline barrier: check if there is a data batch available
+      if (port_ptr->repo->size() == 0) {
+        // No data batch available, return src pipeline or monostate
+        if (port_ptr->src_pipeline) { return creator::task_creation_hint(port_ptr->src_pipeline); }
+        return creator::task_creation_hint(std::monostate{});
+      }
+    } else if (port_ptr->type == MemoryBarrierType::FULL) {
+      // For full barrier: src pipeline must be finished and have data
+      // We assume that there will be a data batch if the src pipeline is finished
+      if (!port_ptr->src_pipeline->is_pipeline_finished()) {
+        // Src pipeline not finished, return it to continue processing
+        return creator::task_creation_hint(port_ptr->src_pipeline);
+      }
+    }
+  }
 
-//   // All ports are ready (either PIPELINE with data, or FULL with finished pipeline)
-//   if (!ports.empty()) { return ::sirius::creator::task_creation_hint(this); }
-//   return ::sirius::creator::task_creation_hint(std::monostate{});
-// }
+  // All ports are ready (either PIPELINE with data, or FULL with finished pipeline)
+  if (!ports.empty()) { return creator::task_creation_hint(this); }
+  return creator::task_creation_hint(std::monostate{});
+}
 
 std::vector<::std::shared_ptr<::cucascade::data_batch>> sirius_physical_operator::get_input_batch()
 {

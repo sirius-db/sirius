@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "operator/merge/gpu_merge_impl.hpp"
+#include "op/merge/gpu_merge_impl.hpp"
 
 #include "data/data_batch_utils.hpp"
 

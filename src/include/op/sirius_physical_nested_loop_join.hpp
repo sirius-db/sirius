@@ -92,12 +92,10 @@ class sirius_physical_nested_loop_join : public sirius_physical_operator {
  public:
   // Source interface
   bool is_source() const override { return duckdb::PropagatesBuildSide(join_type); }
-  bool parallel_source() const override { return true; }
 
  public:
   // Sink Interface
   bool is_sink() const override { return true; }
-  bool parallel_sink() const override { return true; }
 
   static bool is_supported(const duckdb::vector<duckdb::JoinCondition>& conditions,
                            duckdb::JoinType join_type);
@@ -105,14 +103,6 @@ class sirius_physical_nested_loop_join : public sirius_physical_operator {
  public:
   //! Returns a list of the types of the join conditions
   duckdb::vector<duckdb::LogicalType> get_join_types() const;
-
- private:
-  // // resolve joins that output max N elements (SEMI, ANTI, MARK)
-  //   void resolve_simple_join(sirius_intermediate_relation& input_relation,
-  //                          sirius_intermediate_relation& output_relation) const;
-  // // resolve joins that can potentially output N*M elements (INNER, LEFT, FULL)
-  //   duckdb::OperatorResultType resolve_complex_join(sirius_intermediate_relation& input_relation,
-  //                                         sirius_intermediate_relation& output_relation) const;
 };
 
 }  // namespace op

@@ -22,8 +22,8 @@
 #include <memory/fixed_size_host_memory_resource.hpp>
 #include <memory/memory_reservation.hpp>
 #include <memory/memory_reservation_manager.hpp>
-#include <op/gpu_physical_table_scan.hpp>
 #include <op/scan/duckdb_scan_executor.hpp>
+#include <op/sirius_physical_table_scan.hpp>
 #include <parallel/task.hpp>
 
 // duckdb
@@ -60,10 +60,10 @@ class duckdb_scan_task_global_state : public sirius::parallel::itask_global_stat
    * @param[in] client_ctx The DuckDB client context
    * @param[in] gpu_pts The GPU physical table scan being executed
    */
-  duckdb_scan_task_global_state(duckdb::shared_ptr<duckdb::GPUPipeline> pipeline,
+  duckdb_scan_task_global_state(duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
                                 duckdb_scan_executor& scan_exec,
                                 duckdb::ClientContext& client_ctx,
-                                duckdb::GPUPhysicalTableScan* scan_op);
+                                op::sirius_physical_table_scan* scan_op);
 
   //===----------Methods----------===//
   /**
@@ -88,14 +88,14 @@ class duckdb_scan_task_global_state : public sirius::parallel::itask_global_stat
 
   //===----------Fields----------===//
   std::atomic<bool> source_drained{false};  ///< Whether the table scan source is fully drained
-  duckdb::shared_ptr<duckdb::GPUPipeline>
+  duckdb::shared_ptr<pipeline::sirius_pipeline>
     pipeline;            ///< The pipeline to which this table scan belongs
   uint64_t max_threads;  ///< Maximum number of threads for this scan task
 
-  unique_ptr<duckdb::GlobalTableFunctionState>
+  duckdb::unique_ptr<duckdb::GlobalTableFunctionState>
     global_tf_state;                    ///< Global state for the table function
   duckdb_scan_executor& scan_executor;  ///< The scan executor executing this scan task
-  duckdb::GPUPhysicalTableScan& op;     ///< The physical table scan being executed
+  op::sirius_physical_table_scan& op;   ///< The physical table scan being executed
 
   std::mutex scan_mutex;  ///< Mutex to protect table function calls
 };
@@ -135,7 +135,7 @@ struct multiple_blocks_allocation_accessor {
    *
    * @throws std::runtime_error if the block size is not a multiple of the size of T.
    */
-  void initialize(size_t byte_offset, const unique_ptr<multiple_blocks_allocation>& allocation)
+  void initialize(size_t byte_offset, const std::unique_ptr<multiple_blocks_allocation>& allocation)
   {
     assert(allocation != nullptr);
 
@@ -174,7 +174,7 @@ struct multiple_blocks_allocation_accessor {
    * @param[in] value The value to set.
    * @param[in] allocation The allocation.
    */
-  void set_current(T value, unique_ptr<multiple_blocks_allocation>& allocation)
+  void set_current(T value, std::unique_ptr<multiple_blocks_allocation>& allocation)
   {
     assert(block_index < num_blocks);
     assert(allocation != nullptr);
@@ -191,7 +191,8 @@ struct multiple_blocks_allocation_accessor {
    * @param[in] allocation The allocation.
    */
   template <typename S>
-  [[nodiscard]] S get_current_as(const unique_ptr<multiple_blocks_allocation>& allocation) const
+  [[nodiscard]] S get_current_as(
+    const std::unique_ptr<multiple_blocks_allocation>& allocation) const
   {
     assert(block_index < num_blocks);
     assert(allocation != nullptr);
@@ -206,7 +207,7 @@ struct multiple_blocks_allocation_accessor {
    *
    * @param[in] allocation The allocation.
    */
-  [[nodiscard]] T get_current(const unique_ptr<multiple_blocks_allocation>& allocation) const
+  [[nodiscard]] T get_current(const std::unique_ptr<multiple_blocks_allocation>& allocation) const
   {
     return get_current_as<underlying_type>(allocation);
   }
@@ -240,7 +241,7 @@ struct multiple_blocks_allocation_accessor {
    */
   void memcpy_from(void const* src,
                    size_t bytes,
-                   unique_ptr<multiple_blocks_allocation>& allocation)
+                   std::unique_ptr<multiple_blocks_allocation>& allocation)
   {
     size_t bytes_copied = 0;
     // Loop over blocks into which to copy the src
@@ -270,7 +271,9 @@ struct multiple_blocks_allocation_accessor {
    * @param[in] dest Pointer to the destination buffer.
    * @param[in] bytes Number of bytes to copy to the destination buffer.
    */
-  void memcpy_to(const unique_ptr<multiple_blocks_allocation>& allocation, void* dest, size_t bytes)
+  void memcpy_to(const std::unique_ptr<multiple_blocks_allocation>& allocation,
+                 void* dest,
+                 size_t bytes)
   {
     size_t bytes_copied = 0;
     // Loop over blocks from which to copy the data
@@ -369,7 +372,7 @@ class duckdb_scan_task_local_state : public sirius::parallel::itask_local_state 
      */
     void initialize_accessors(size_t estimated_num_rows,
                               size_t byte_offset,
-                              unique_ptr<multiple_blocks_allocation>& allocation);
+                              std::unique_ptr<multiple_blocks_allocation>& allocation);
 
     /**
      * @brief Checks if there is enough space allocated to hold the data for the given vector.
@@ -393,7 +396,7 @@ class duckdb_scan_task_local_state : public sirius::parallel::itask_local_state 
     void process_mask_for_column(duckdb::ValidityMask const& validity,
                                  size_t num_rows,
                                  size_t row_offset,
-                                 unique_ptr<multiple_blocks_allocation>& allocation);
+                                 std::unique_ptr<multiple_blocks_allocation>& allocation);
 
     /**
      * @brief Process the given DuckDB vector and copy its data into the allocation.
@@ -408,7 +411,7 @@ class duckdb_scan_task_local_state : public sirius::parallel::itask_local_state 
                         duckdb::ValidityMask const& validity,
                         size_t num_rows,
                         size_t row_offset,
-                        unique_ptr<multiple_blocks_allocation>& allocation);
+                        std::unique_ptr<multiple_blocks_allocation>& allocation);
   };
 
   //===----------Constructor & Destructor----------===//
@@ -428,15 +431,15 @@ class duckdb_scan_task_local_state : public sirius::parallel::itask_local_state 
     duckdb::ExecutionContext& exec_ctx,
     size_t approximate_batch_size = duckdb::Config::DEFAULT_SCAN_TASK_BATCH_SIZE,
     size_t default_varchar_size   = duckdb::Config::DEFAULT_SCAN_TASK_VARCHAR_SIZE,
-    unique_ptr<duckdb::LocalTableFunctionState> existing_local_tf_state = nullptr);
+    duckdb::unique_ptr<duckdb::LocalTableFunctionState> existing_local_tf_state = nullptr);
 
   //===----------Fields----------===//
-  size_t approximate_batch_size;           ///< Approximate target batch size in bytes
-  size_t default_varchar_size;             ///< Default size for VARCHAR columns in bytes
-  size_t num_columns;                      ///< Number of columns to be scanned
-  size_t estimated_rows_per_batch;         ///< Estimated number of rows per batch
-  vector<column_builder> column_builders;  ///< Column builders for each column
-  vector<size_t> varchar_indices;          ///< Indices of VARCHAR columns
+  size_t approximate_batch_size;                ///< Approximate target batch size in bytes
+  size_t default_varchar_size;                  ///< Default size for VARCHAR columns in bytes
+  size_t num_columns;                           ///< Number of columns to be scanned
+  size_t estimated_rows_per_batch;              ///< Estimated number of rows per batch
+  std::vector<column_builder> column_builders;  ///< Column builders for each column
+  std::vector<size_t> varchar_indices;          ///< Indices of VARCHAR columns
 
   cucascade::memory::any_memory_space_in_tier res_request =
     cucascade::memory::any_memory_space_in_tier(cucascade::memory::Tier::HOST);
@@ -448,7 +451,7 @@ class duckdb_scan_task_local_state : public sirius::parallel::itask_local_state 
   duckdb::DataChunk chunk;  ///< DataChunk buffer
   size_t row_offset = 0;    ///< Current row offset in buffers
 
-  std::unique_ptr<duckdb::LocalTableFunctionState>
+  duckdb::unique_ptr<duckdb::LocalTableFunctionState>
     local_tf_state;                    ///< Local state for the table function.
   duckdb::ExecutionContext& exec_ctx;  ///< The duckdb execution context, needed for initializing
                                        ///< the local table function state
@@ -461,7 +464,7 @@ class duckdb_scan_task_local_state : public sirius::parallel::itask_local_state 
    *
    * @param[in] op The physical table scan operator being executed.
    */
-  void estimate_rows_per_batch(duckdb::GPUPhysicalTableScan const& op);
+  void estimate_rows_per_batch(sirius_physical_table_scan const& op);
 
   /**
    * @brief Initializes the column builders.
@@ -475,7 +478,7 @@ class duckdb_scan_task_local_state : public sirius::parallel::itask_local_state 
    * @param[in] exec_ctx The duckdb execution context.
    * @param[in] global_tf_state The duckdb table function global state.
    */
-  void initialize_local_table_function_state(duckdb::GPUPhysicalTableScan const& op,
+  void initialize_local_table_function_state(sirius_physical_table_scan const& op,
                                              duckdb::ExecutionContext& exec_ctx,
                                              duckdb::GlobalTableFunctionState* global_tf_state);
 };
@@ -509,11 +512,13 @@ class duckdb_scan_task : public sirius::parallel::itask {
    */
   duckdb_scan_task(uint64_t task_id,
                    shared_data_repository* data_repo,
-                   unique_ptr<duckdb_scan_task_local_state> l_state,
-                   shared_ptr<duckdb_scan_task_global_state> g_state)
+                   std::unique_ptr<duckdb_scan_task_local_state> l_state,
+                   std::shared_ptr<duckdb_scan_task_global_state> g_state)
     : task_id(task_id),
       _data_repo(data_repo),
       sirius::parallel::itask(std::move(l_state), g_state) {};
+
+  void execute() override;
 
   /// TODO: change protected to private when data can be tested against data in the data repository
  protected:

@@ -42,8 +42,6 @@ class sirius_physical_order : public sirius_physical_operator {
   // Source interface
   bool is_source() const override { return true; }
 
-  bool parallel_source() const override { return true; }
-
   duckdb::OrderPreservationType source_order() const override
   {
     return duckdb::OrderPreservationType::FIXED_ORDER;
@@ -52,7 +50,6 @@ class sirius_physical_order : public sirius_physical_operator {
  public:
   // Sink interface
   bool is_sink() const override { return true; }
-  bool parallel_sink() const override { return true; }
   bool sink_order_dependent() const override { return false; }
 };
 

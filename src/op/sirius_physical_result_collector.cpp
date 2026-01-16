@@ -30,12 +30,12 @@ namespace sirius {
 namespace op {
 
 sirius_physical_result_collector::sirius_physical_result_collector(
-  duckdb::GPUPreparedStatementData& data)
+  duckdb::SiriusPreparedStatementData& data)
   : sirius_physical_operator(
       duckdb::PhysicalOperatorType::RESULT_COLLECTOR, {duckdb::LogicalType::BOOLEAN}, 0),
     statement_type(data.prepared->statement_type),
     properties(data.prepared->properties),
-    plan(*data.gpu_physical_plan),
+    plan(*data.sirius_physical_plan),
     names(data.prepared->names)
 {
   this->types = data.prepared->types;
@@ -65,10 +65,17 @@ void sirius_physical_result_collector::build_pipelines(
 }
 
 sirius_physical_materialized_collector::sirius_physical_materialized_collector(
-  duckdb::GPUPreparedStatementData& data)
+  duckdb::SiriusPreparedStatementData& data)
   : sirius_physical_result_collector(data),
     result_collection(duckdb::make_uniq<duckdb::GPUResultCollection>())
 {
+}
+
+duckdb::unique_ptr<duckdb::QueryResult> sirius_physical_materialized_collector::get_result(
+  duckdb::GlobalSinkState& state)
+{
+  // TODO: Implement this method
+  throw duckdb::NotImplementedException("sirius_physical_materialized_collector::get_result");
 }
 
 }  // namespace op

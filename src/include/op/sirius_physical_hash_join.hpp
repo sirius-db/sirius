@@ -108,12 +108,9 @@ class sirius_physical_hash_join : public sirius_physical_operator {
   //! Becomes a source when it is an external join
   bool is_source() const override { return true; }
 
-  bool parallel_source() const override { return true; }
-
  public:
   // Sink Interface
   bool is_sink() const override { return true; }
-  bool parallel_sink() const override { return true; }
 };
 
 }  // namespace op

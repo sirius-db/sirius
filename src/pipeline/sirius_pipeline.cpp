@@ -70,7 +70,8 @@ void sirius_pipeline::reset_sink()
       throw duckdb::InternalException("Sink of pipeline does not have is_sink set");
     }
     std::lock_guard<std::mutex> guard(sink->lock);
-    if (!sink->sink_state) { sink->sink_state = sink->get_global_sink_state(get_client_context()); }
+    // if (!sink->sink_state) { sink->sink_state =
+    // sink->get_global_sink_state(get_client_context()); }
   }
 }
 
@@ -80,7 +81,7 @@ void sirius_pipeline::reset()
   for (auto& op_ref : operators) {
     auto& op = op_ref.get();
     std::lock_guard<std::mutex> guard(op.lock);
-    if (!op.op_state) { op.op_state = op.get_global_operator_state(get_client_context()); }
+    // if (!op.op_state) { op.op_state = op.get_global_operator_state(get_client_context()); }
   }
   reset_source(false);
   // we no longer reset source here because this function is no longer guaranteed to be called by
@@ -95,7 +96,7 @@ void sirius_pipeline::reset_source(bool force)
     throw duckdb::InternalException("Source of pipeline does not have is_source set");
   }
   if (force || !source_state) {
-    source_state = source->get_global_source_state(get_client_context());
+    // source_state = source->get_global_source_state(get_client_context());
   }
 }
 

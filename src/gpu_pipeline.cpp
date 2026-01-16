@@ -243,22 +243,22 @@ vector<reference<GPUPhysicalOperator>> GPUPipelineBuildState::GetPipelineOperato
   return pipeline.operators;
 }
 
-bool GPUPipeline::is_pipeline_finished() { return pipeline_finished; }
+// bool GPUPipeline::is_pipeline_finished() { return pipeline_finished; }
 
-void GPUPipeline::update_pipeline_status()
-{
-  if (GetSource()->type == PhysicalOperatorType::TABLE_SCAN) {
-    auto& table_scan = GetSource()->Cast<GPUPhysicalTableScan>();
-    if (!table_scan.exhausted) {
-      pipeline_finished = false;
-      return;
-    }
-    auto& first_node  = operators[0].get();
-    pipeline_finished = first_node.all_ports_empty();
-  } else {
-    auto& first_node  = operators[0].get();
-    pipeline_finished = first_node.is_source_pipeline_finished() && first_node.all_ports_empty();
-  }
-}
+// void GPUPipeline::update_pipeline_status()
+// {
+//   if (GetSource()->type == PhysicalOperatorType::TABLE_SCAN) {
+//     auto& table_scan = GetSource()->Cast<GPUPhysicalTableScan>();
+//     if (!table_scan.exhausted) {
+//       pipeline_finished = false;
+//       return;
+//     }
+//     auto& first_node  = operators[0].get();
+//     pipeline_finished = first_node.all_ports_empty();
+//   } else {
+//     auto& first_node  = operators[0].get();
+//     pipeline_finished = first_node.is_source_pipeline_finished() && first_node.all_ports_empty();
+//   }
+// }
 
 }  // namespace duckdb
