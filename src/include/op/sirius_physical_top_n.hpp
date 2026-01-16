@@ -18,6 +18,12 @@
 
 #include "duckdb/planner/bound_query_node.hpp"
 #include "op/sirius_physical_operator.hpp"
+
+#include <cudf/table/table.hpp>
+
+#include <memory>
+#include <mutex>
+
 namespace duckdb {
 struct DynamicFilterData;
 }  // namespace duckdb
@@ -37,7 +43,8 @@ class sirius_physical_top_n : public sirius_physical_operator {
                         duckdb::idx_t limit,
                         duckdb::idx_t offset,
                         duckdb::shared_ptr<duckdb::DynamicFilterData> dynamic_filter,
-                        duckdb::idx_t estimated_cardinality);
+                        duckdb::idx_t estimated_cardinality,
+                        ::cucascade::shared_data_repository_manager* data_repo_mgr = nullptr);
   ~sirius_physical_top_n() override;
 
   duckdb::vector<duckdb::BoundOrderByNode> orders;

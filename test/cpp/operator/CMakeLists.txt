@@ -22,4 +22,6 @@ set(TEST_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/test_sirius_physical_result_collector.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/test_physical_filter.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/test_physical_limit.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_physical_top_n.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_physical_projection.cpp
     PARENT_SCOPE)
