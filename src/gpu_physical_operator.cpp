@@ -181,10 +181,18 @@ GPUPhysicalOperator::port* GPUPhysicalOperator::get_port(std::string_view port_i
   return it->second.get();
 }
 
+// op (sink) -> repo -> next_op
+//           -> repo -> next_op
+
+// input batches -> op (execute) -> output batches -> repo -> next_op
+//  current_pipeline -> port -> next_pipeline
+
 ::std::vector<::std::shared_ptr<::cucascade::data_batch>> GPUPhysicalOperator::sink_execute(
   const ::std::vector<::std::shared_ptr<::cucascade::data_batch>>& input_batches)
 {
-  // submit data batches to the repositories of the next operators
+  // take input batches
+  // execute the operators
+  // submit output batches to the repositories of the next operators
   // check if the pipeline is finished
   if (!creator) {
     throw InternalException("GPUPhysicalOperator creator is null in sink_execute for operator " +
@@ -198,8 +206,6 @@ GPUPhysicalOperator::port* GPUPhysicalOperator::get_port(std::string_view port_i
   for (auto& [next_op, port_id] : next_port_after_sink) {
     if (next_op) { creator->process_next_task(next_op); }
   }
-  // not doing anything for now
-  return ::std::vector<::std::shared_ptr<::cucascade::data_batch>>{};
 }
 
 ::std::vector<::std::shared_ptr<::cucascade::data_batch>> GPUPhysicalOperator::execute(

@@ -43,12 +43,14 @@ class GPUPhysicalOrder : public GPUPhysicalOperator {
   GPUPhysicalOrder(vector<LogicalType> types,
                    vector<BoundOrderByNode> orders,
                    vector<idx_t> projections_p,
-                   idx_t estimated_cardinality);
+                   idx_t estimated_cardinality,
+                   bool is_index_sort_p = false);
 
   //! Input data
   vector<BoundOrderByNode> orders;
   vector<idx_t> projections;
   shared_ptr<GPUIntermediateRelation> sort_result;
+  bool is_index_sort;
 
  public:
   // Source interface

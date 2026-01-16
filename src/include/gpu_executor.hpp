@@ -26,7 +26,10 @@
 #include "gpu_buffer_manager.hpp"
 #include "gpu_meta_pipeline.hpp"
 #include "gpu_pipeline.hpp"
+#include "op/sirius_physical_operator.hpp"
 #include "operator/gpu_physical_result_collector.hpp"
+#include "pipeline/sirius_meta_pipeline.hpp"
+#include "pipeline/sirius_pipeline.hpp"
 namespace duckdb {
 
 class ClientContext;
@@ -79,6 +82,10 @@ class GPUExecutor {
   void insert_repository(std::string_view port_id,
                          shared_ptr<GPUPipeline> input_pipeline,
                          shared_ptr<GPUPipeline> dependent_pipeline);
+  void insert_repository(std::string_view port_id,
+                         GPUPhysicalOperator* cur_op,
+                         shared_ptr<GPUPipeline> input_pipeline,
+                         shared_ptr<GPUPipeline> dependent_pipeline);
 
   //! Whether or not the root of the pipeline is a result collector object
   bool HasResultCollector();
@@ -92,7 +99,8 @@ class GPUExecutor {
   void execute();
   void Reset();
   shared_ptr<GPUPipeline> CreateChildPipeline(GPUPipeline& current, GPUPhysicalOperator& op);
-
+  shared_ptr<::sirius::pipeline::sirius_pipeline> create_child_pipeline(
+    ::sirius::pipeline::sirius_pipeline& current, ::sirius::op::sirius_physical_operator& op);
   Executor* executor;
   vector<shared_ptr<GPUPipeline>> new_scheduled;
   std::unique_ptr<::cucascade::shared_data_repository_manager> data_repo_manager;

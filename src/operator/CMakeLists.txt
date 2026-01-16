@@ -14,8 +14,6 @@
 # the License.
 # =============================================================================
 
-add_subdirectory(scan)
-
 set(EXTENSION_SOURCES
     ${EXTENSION_SOURCES}
     ${CMAKE_CURRENT_SOURCE_DIR}/gpu_physical_column_data_scan.cpp
@@ -41,8 +39,4 @@ set(EXTENSION_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/gpu_physical_top_n.cpp
     # Below is for the new execution model, and we are gradually migrating
     # operators above to the new execution model.
-    ${CMAKE_CURRENT_SOURCE_DIR}/aggregate/gpu_aggregate_impl.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/order/gpu_order_impl.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/merge/gpu_merge_impl.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/partition/gpu_partition_impl.cpp
     PARENT_SCOPE)

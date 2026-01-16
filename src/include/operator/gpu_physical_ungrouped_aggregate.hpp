@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "duckdb/common/enums/tuple_data_layout_enums.hpp"
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/execution/operator/aggregate/distinct_aggregate_data.hpp"
 #include "duckdb/execution/operator/aggregate/grouped_aggregate_data.hpp"
@@ -35,7 +36,8 @@ class GPUPhysicalUngroupedAggregate : public GPUPhysicalOperator {
  public:
   GPUPhysicalUngroupedAggregate(vector<LogicalType> types,
                                 vector<unique_ptr<Expression>> select_list,
-                                idx_t estimated_cardinality);
+                                idx_t estimated_cardinality,
+                                TupleDataValidityType distinct_validity);
 
   //! The aggregates that have to be computed
   vector<unique_ptr<Expression>> aggregates;

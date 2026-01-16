@@ -258,7 +258,8 @@ void ResolveTypeBuildExpression(vector<shared_ptr<GPUColumn>>& build_keys,
     }
   }
 
-  if (join_type == JoinType::INNER || join_type == JoinType::SEMI || join_type == JoinType::MARK) {
+  if (join_type == JoinType::INNER || join_type == JoinType::SEMI || join_type == JoinType::MARK ||
+      join_type == JoinType::ANTI) {
     buildHashTable<T>(build_data, ht, ht_len, size, condition_mode, num_keys, 0);
   } else if (join_type == JoinType::RIGHT || join_type == JoinType::RIGHT_SEMI ||
              join_type == JoinType::RIGHT_ANTI) {
@@ -308,7 +309,7 @@ void HandleScanHTExpression(unsigned long long* ht,
   }
 }
 
-void ReorderConditions(vector<JoinCondition>& conditions)
+void ReorderJoinConditions(vector<JoinCondition>& conditions)
 {
   // we reorder conditions so the ones with COMPARE_EQUAL occur first
   // check if this is already the case
@@ -362,9 +363,10 @@ GPUPhysicalHashJoin::GPUPhysicalHashJoin(LogicalOperator& op,
                                          unique_ptr<JoinFilterPushdownInfo> pushdown_info_p)
   : GPUPhysicalOperator(PhysicalOperatorType::HASH_JOIN, op.types, estimated_cardinality),
     join_type(join_type),
-    conditions(std::move(cond))
+    conditions(std::move(cond)),
+    delim_types(std::move(delim_types))
 {
-  ReorderConditions(conditions);
+  ReorderJoinConditions(conditions);
 
   filter_pushdown = std::move(pushdown_info_p);
 
@@ -581,7 +583,7 @@ OperatorResultType GPUPhysicalHashJoin::Execute(GPUIntermediateRelation& input_r
 
   // probing hash table
   SIRIUS_LOG_DEBUG("Probing hash table");
-  if (join_type == JoinType::INNER) {
+  if (join_type == JoinType::INNER || join_type == JoinType::LEFT) {
     // check if there is a non-equality condition
     vector<shared_ptr<GPUColumn>> build_key(conditions.size());
     for (int cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
@@ -599,21 +601,34 @@ OperatorResultType GPUPhysicalHashJoin::Execute(GPUIntermediateRelation& input_r
         }
       }
       if (!has_non_equality_condition) {
-        cudf_hash_inner_join(probe_key,
-                             build_key,
-                             conditions.size(),
-                             row_ids_left,
-                             row_ids_right,
-                             count,
-                             unique_build_keys);
+        if (join_type == JoinType::LEFT) {
+          cudf_hash_left_join(probe_key,
+                              build_key,
+                              conditions.size(),
+                              row_ids_left,
+                              row_ids_right,
+                              count,
+                              unique_build_keys);
+        } else {
+          cudf_hash_inner_join(probe_key,
+                               build_key,
+                               conditions.size(),
+                               row_ids_left,
+                               row_ids_right,
+                               count,
+                               unique_build_keys);
+        }
       } else {
+        if (join_type == JoinType::LEFT) {
+          throw NotImplementedException(
+            "Left join with non-equality condition is not supported yet");
+        }
         cudf_mixed_or_conditional_inner_join(
           probe_key, build_key, conditions, join_type, row_ids_left, row_ids_right, count);
       }
     }
-  } else if (join_type == JoinType::SEMI || join_type == JoinType::ANTI ||
-             join_type == JoinType::OUTER || join_type == JoinType::RIGHT ||
-             join_type == JoinType::LEFT) {
+  } else if (join_type == JoinType::SEMI || join_type == JoinType::OUTER ||
+             join_type == JoinType::RIGHT || join_type == JoinType::ANTI) {
     HandleProbeExpression(probe_key,
                           count,
                           row_ids_left,
@@ -824,7 +839,8 @@ SinkResultType GPUPhysicalHashJoin::Sink(GPUIntermediateRelation& input_relation
 
   SIRIUS_LOG_DEBUG("Building hash table");
   ht_len = build_keys[0]->column_length * 2;
-  if (join_type == JoinType::INNER || join_type == JoinType::SEMI || join_type == JoinType::MARK) {
+  if (join_type == JoinType::INNER || join_type == JoinType::SEMI || join_type == JoinType::MARK ||
+      join_type == JoinType::ANTI) {
     if (ht_len == 0)
       gpu_hash_table = nullptr;
     else
@@ -839,7 +855,7 @@ SinkResultType GPUPhysicalHashJoin::Sink(GPUIntermediateRelation& input_relation
         ht_len * (conditions.size() + 2), 0, 0);
   }
 
-  if (join_type == JoinType::INNER) {
+  if (join_type == JoinType::INNER || join_type == JoinType::LEFT) {
     // check if there is a non-equality condition
     // bool has_non_equality_condition = false;
     // for (idx_t i = 0; i < conditions.size(); i++) {
@@ -906,14 +922,29 @@ void GPUPhysicalHashJoin::BuildJoinPipelines(GPUPipeline& current,
   meta_pipeline.GetPipelines(pipelines_so_far, false);
   auto& last_pipeline = *pipelines_so_far.back();
 
+  vector<shared_ptr<GPUPipeline>> dependencies;
+  optional_ptr<GPUMetaPipeline> last_child_ptr;
   if (build_rhs) {
     // on the RHS (build side), we construct a child MetaPipeline with this operator as its sink
     auto& child_meta_pipeline = meta_pipeline.CreateChildMetaPipeline(current, op);
     child_meta_pipeline.Build(*op.children[1]);
+    // if (op.children[1].get().CanSaturateThreads(current.GetClientContext())) {
+    // 	// if the build side can saturate all available threads,
+    // 	// we don't just make the LHS pipeline depend on the RHS, but recursively all LHS children
+    // too.
+    // 	// this prevents breadth-first plan evaluation
+    // 	child_meta_pipeline.GetPipelines(dependencies, false);
+    // 	last_child_ptr = meta_pipeline.GetLastChild();
+    // }
   }
 
   // continue building the current pipeline on the LHS (probe side)
   op.children[0]->BuildPipelines(current, meta_pipeline);
+
+  // if (last_child_ptr) {
+  // 	// the pointer was set, set up the dependencies
+  // 	meta_pipeline.AddRecursiveDependencies(dependencies, *last_child_ptr);
+  // }
 
   switch (op.type) {
     case PhysicalOperatorType::POSITIONAL_JOIN:

@@ -19,7 +19,7 @@
 #include "data/gpu_data_representation.hpp"
 #include "memory/memory_space.hpp"
 #include "memory/sirius_memory_manager.hpp"
-#include "partition/gpu_partition_impl.hpp"
+#include "op/partition/gpu_partition_impl.hpp"
 #include "scan/test_utils.hpp"
 #include "utils/utils.hpp"
 

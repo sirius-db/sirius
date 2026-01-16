@@ -75,7 +75,9 @@ class GPUPhysicalGroupedAggregate : public GPUPhysicalOperator {
                               vector<unique_ptr<Expression>> groups,
                               vector<GroupingSet> grouping_sets,
                               vector<unsafe_vector<idx_t>> grouping_functions,
-                              idx_t estimated_cardinality);
+                              idx_t estimated_cardinality,
+                              TupleDataValidityType group_validity,
+                              TupleDataValidityType distinct_validity);
 
   //! The grouping sets
   GroupedAggregateData grouped_aggregate_data;

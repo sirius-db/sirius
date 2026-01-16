@@ -75,9 +75,9 @@ include(third_party/cucascade.cmake)
 # Include directories - cuCascade headers first for memory module
 include_directories(${CUCASCADE_INCLUDE_DIR})
 include_directories(src/include src/include/operator)
-include_directories(substrait/src/include)
-include_directories(${TARGET_NAME} substrait/third_party/substrait)
-include_directories(${TARGET_NAME} substrait/third_party)
+# include_directories(substrait/src/include) include_directories(${TARGET_NAME}
+# substrait/third_party/substrait) include_directories(${TARGET_NAME}
+# substrait/third_party)
 
 set(EXTENSION_SOURCES
     src/sirius_extension.cpp
@@ -101,6 +101,7 @@ add_subdirectory(src/data)
 add_subdirectory(src/pipeline)
 add_subdirectory(src/downgrade)
 add_subdirectory(src/creator)
+add_subdirectory(src/op)
 
 set(CUDA_SOURCES src/cuda/communication.cu src/cuda/allocator.cu
                  src/cuda/print.cu src/cuda/utils.cu)
@@ -142,10 +143,11 @@ set_target_properties(${LOADABLE_EXTENSION_NAME} PROPERTIES LINKER_LANGUAGE
 set_target_properties(${LOADABLE_EXTENSION_NAME}
                       PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
-target_link_libraries(${EXTENSION_NAME} substrait_extension cudf::cudf rmm::rmm
-                      ${NUMA_LIB})
-target_link_libraries(${LOADABLE_EXTENSION_NAME} substrait_extension cudf::cudf
-                      rmm::rmm)
+# target_link_libraries(${EXTENSION_NAME} substrait_extension cudf::cudf
+# rmm::rmm ${NUMA_LIB}) target_link_libraries(${LOADABLE_EXTENSION_NAME}
+# substrait_extension cudf::cudf rmm::rmm)
+target_link_libraries(${EXTENSION_NAME} cudf::cudf rmm::rmm ${NUMA_LIB})
+target_link_libraries(${LOADABLE_EXTENSION_NAME} cudf::cudf rmm::rmm)
 
 # Link third-party libraries
 target_link_libraries(${EXTENSION_NAME} spdlog::spdlog cuCascade::cucascade)

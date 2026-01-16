@@ -22,8 +22,13 @@
 #include "duckdb/parallel/task_executor.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/parallel/thread_context.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
+#include "expression_executor/gpu_dispatcher.hpp"
+#include "expression_executor/gpu_expression_executor.hpp"
 #include "gpu_buffer_manager.hpp"
 #include "gpu_columns.hpp"
 #include "gpu_materialize.hpp"
@@ -48,7 +53,8 @@ GPUPhysicalTableScan::GPUPhysicalTableScan(vector<LogicalType> types,
                                            unique_ptr<TableFilterSet> table_filters_p,
                                            idx_t estimated_cardinality,
                                            ExtraOperatorInfo extra_info,
-                                           vector<Value> parameters_p)
+                                           vector<Value> parameters_p,
+                                           virtual_column_map_t virtual_columns_p)
   : GPUPhysicalOperator(PhysicalOperatorType::TABLE_SCAN, std::move(types), estimated_cardinality),
     function(std::move(function_p)),
     bind_data(std::move(bind_data_p)),
@@ -57,8 +63,9 @@ GPUPhysicalTableScan::GPUPhysicalTableScan(vector<LogicalType> types,
     projection_ids(std::move(projection_ids_p)),
     names(std::move(names_p)),
     table_filters(std::move(table_filters_p)),
-    extra_info(extra_info),
+    extra_info(std::move(extra_info)),
     parameters(std::move(parameters_p)),
+    virtual_columns(std::move(virtual_columns_p)),
     gen_row_id_column(column_ids.back().GetPrimaryIndex() == DConstants::INVALID_INDEX)
 {
   auto num_cols                      = column_ids.size() - gen_row_id_column;
@@ -1649,6 +1656,41 @@ void GPUPhysicalTableScan::ScanDataDuckDB(GPUBufferManager* gpuBufferManager,
   }
 }
 
+unique_ptr<Expression> ConvertTableFiltersToExpression(const TableFilterSet& filters,
+                                                       const vector<ColumnIndex>& column_ids,
+                                                       const vector<LogicalType>& returned_types)
+{
+  vector<unique_ptr<Expression>> filter_expressions;
+
+  for (auto& [column_index, filter] : filters.filters) {
+    // Skip optional and IS_NOT_NULL filters
+    if (filter->filter_type == TableFilterType::OPTIONAL_FILTER ||
+        filter->filter_type == TableFilterType::IS_NOT_NULL) {
+      continue;
+    }
+
+    // Create column reference for this filter
+    auto col_type   = returned_types[column_ids[column_index].GetPrimaryIndex()];
+    auto column_ref = make_uniq<BoundReferenceExpression>(col_type, column_index);
+
+    // Convert filter to expression
+    filter_expressions.push_back(filter->ToExpression(*column_ref));
+  }
+
+  // No filters to apply
+  if (filter_expressions.empty()) { return nullptr; }
+
+  // Single filter - return directly without conjunction wrapper
+  if (filter_expressions.size() == 1) { return std::move(filter_expressions[0]); }
+
+  // Multiple filters - wrap in CONJUNCTION_AND
+  auto conjunction = make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);
+  for (auto& expr : filter_expressions) {
+    conjunction->children.push_back(std::move(expr));
+  }
+  return conjunction;
+}
+
 SourceResultType GPUPhysicalTableScan::GetData(GPUIntermediateRelation& output_relation) const
 {
   SIRIUS_LOG_DEBUG("GPUPhysicalTableScan GetData invoked");
@@ -1705,96 +1747,45 @@ SourceResultType GPUPhysicalTableScan::GetData(GPUIntermediateRelation& output_r
   uint64_t* row_ids = nullptr;
   uint64_t* count   = nullptr;
   if (table_filters) {
-    int num_expr = 0;
-    for (auto& f : table_filters->filters) {
-      auto& column_index                                                       = f.first;
-      auto& filter                                                             = f.second;
+    // Reset row_ids for columns involved in filtering
+    for (auto& [column_index, filter] : table_filters->filters) {
       table->columns[column_ids[column_index].GetPrimaryIndex()]->row_ids      = nullptr;
       table->columns[column_ids[column_index].GetPrimaryIndex()]->row_id_count = 0;
-
-      if (filter->filter_type == TableFilterType::OPTIONAL_FILTER) { continue; }
-
-      if (column_index < names.size()) {
-        if (filter->filter_type == TableFilterType::CONJUNCTION_AND) {
-          auto filter_pointer          = filter.get();
-          auto& filter_conjunction_and = filter_pointer->Cast<ConjunctionAndFilter>();
-          for (int expr = 0; expr < filter_conjunction_and.child_filters.size(); expr++) {
-            auto& filter_inside = filter_conjunction_and.child_filters[expr];
-            if (filter_inside->filter_type == TableFilterType::CONSTANT_COMPARISON) {
-              num_expr++;
-            } else if (filter_inside->filter_type == TableFilterType::IS_NOT_NULL ||
-                       filter_inside->filter_type == TableFilterType::OPTIONAL_FILTER) {
-              continue;
-            } else {
-              throw NotImplementedException("Filter type not supported: %d",
-                                            static_cast<int>(filter_inside->filter_type));
-            }
-          }
-        } else {
-          // count how many filters in table_filters->filters that are not optional filters
-          if (filter->filter_type == TableFilterType::CONSTANT_COMPARISON) {
-            num_expr++;
-          } else {
-            throw NotImplementedException("Filter aside from constant comparison not supported");
-          }
-        }
-      }
     }
 
-    ConstantFilter** filter_constants =
-      gpuBufferManager->customCudaHostAlloc<ConstantFilter*>(num_expr);
-    vector<shared_ptr<GPUColumn>> expression_columns(num_expr);
+    // Convert TableFilters to Expression
+    auto filter_expr = ConvertTableFiltersToExpression(*table_filters, column_ids, returned_types);
 
-    int expr_idx = 0;
-    for (auto& f : table_filters->filters) {
-      auto& column_index = f.first;
-      auto& filter       = f.second;
+    if (filter_expr) {
+      SIRIUS_LOG_DEBUG("Converted table filters to expression: {}", filter_expr->ToString());
 
-      if (filter->filter_type == TableFilterType::OPTIONAL_FILTER) { continue; }
-
-      if (column_index < names.size()) {
-        SIRIUS_LOG_DEBUG("Reading filter column from index {}",
-                         column_ids[column_index].GetPrimaryIndex());
-
-        if (filter->filter_type == TableFilterType::CONJUNCTION_AND) {
-          auto filter_pointer          = filter.get();
-          auto& filter_conjunction_and = filter_pointer->Cast<ConjunctionAndFilter>();
-
-          for (int expr = 0; expr < filter_conjunction_and.child_filters.size(); expr++) {
-            auto& filter_inside = filter_conjunction_and.child_filters[expr];
-            if (filter_inside->filter_type == TableFilterType::CONSTANT_COMPARISON) {
-              SIRIUS_LOG_DEBUG("Reading constant comparison filter");
-              filter_constants[expr_idx] = &(filter_inside->Cast<ConstantFilter>());
-              expression_columns[expr_idx] =
-                table->columns[column_ids[column_index].GetPrimaryIndex()];
-              expr_idx++;
-            } else if (filter_inside->filter_type == TableFilterType::IS_NOT_NULL ||
-                       filter_inside->filter_type == TableFilterType::OPTIONAL_FILTER) {
-              continue;
-            } else {
-              throw NotImplementedException("Filter type not supported: %d",
-                                            static_cast<int>(filter_inside->filter_type));
-            }
-          }
-
-        } else {
-          // count how many filters in table_filters->filters
-          if (filter->filter_type == TableFilterType::CONSTANT_COMPARISON) {
-            filter_constants[expr_idx] = &(filter->Cast<ConstantFilter>());
-            expression_columns[expr_idx] =
-              table->columns[column_ids[column_index].GetPrimaryIndex()];
-            expr_idx++;
-          } else {
-            throw NotImplementedException("Filter aside from conjunction and not supported");
-          }
-        }
+      // Set up input columns for GpuExpressionExecutor
+      // The BoundReferenceExpression uses column_index as index into input_columns
+      GPUIntermediateRelation filter_input_relation(column_ids.size());
+      for (auto& [column_index, filter] : table_filters->filters) {
+        filter_input_relation.columns[column_index] =
+          table->columns[column_ids[column_index].GetPrimaryIndex()];
       }
-    }
 
-    if (num_expr > 0) {
-      HandleArbitraryConstantExpression(
-        expression_columns, count, row_ids, filter_constants, num_expr);
-      // if (count[0] == 0) throw NotImplementedException("No match found");
+      // Create and execute the expression
+      sirius::GpuExpressionExecutor executor(*filter_expr, gpuBufferManager->mr);
+      executor.SetInputColumns(filter_input_relation);
+
+      // Execute the boolean filter expression
+      auto bitmap = executor.ExecuteExpression(0);
+
+      // Handle null values in bitmap - convert to false for SQL WHERE semantics
+      if (bitmap->null_count() > 0) {
+        cudf::numeric_scalar<bool> false_scalar(false);
+        bitmap = cudf::replace_nulls(bitmap->view(), false_scalar);
+      }
+
+      // Convert boolean bitmap to row_ids using DispatchSelect
+      auto [selected_row_ids, selected_count] =
+        sirius::GpuDispatcher::DispatchSelect(bitmap->view(), gpuBufferManager->mr);
+      row_ids  = selected_row_ids;
+      count    = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
+      count[0] = selected_count;
     }
   }
   SIRIUS_LOG_DEBUG("Finished processing table filters");
@@ -1817,16 +1808,6 @@ SourceResultType GPUPhysicalTableScan::GetData(GPUIntermediateRelation& output_r
           column_id.GetPrimaryIndex(),
           index);
         SIRIUS_LOG_DEBUG("Writing row IDs to output relation in index {}", index);
-        // output_relation.columns[index] =
-        // make_shared_ptr<GPUColumn>(table->columns[column_id.GetPrimaryIndex()]->column_length,
-        // table->columns[column_id.GetPrimaryIndex()]->data_wrapper.type,
-        // table->columns[column_id.GetPrimaryIndex()]->data_wrapper.data,
-        //                 table->columns[column_id.GetPrimaryIndex()]->data_wrapper.offset,
-        //                 table->columns[column_id.GetPrimaryIndex()]->data_wrapper.num_bytes,
-        //                 table->columns[column_id.GetPrimaryIndex()]->data_wrapper.is_string_data,
-        //                 table->columns[column_id.GetPrimaryIndex()]->data_wrapper.validity_mask);
-        // output_relation.columns[index]->is_unique =
-        // table->columns[column_id.GetPrimaryIndex()]->is_unique;
         output_relation.columns[index] =
           make_shared_ptr<GPUColumn>(table->columns[column_id.GetPrimaryIndex()]);
         if (row_ids) { output_relation.columns[index]->row_ids = row_ids; }
@@ -1842,16 +1823,6 @@ SourceResultType GPUPhysicalTableScan::GetData(GPUIntermediateRelation& output_r
           column_ids[projection_id].GetPrimaryIndex(),
           index);
         SIRIUS_LOG_DEBUG("Writing row IDs to output relation in index {}", index);
-        // output_relation.columns[index] =
-        // make_shared_ptr<GPUColumn>(table->columns[column_ids[projection_id].GetPrimaryIndex()]->column_length,
-        // table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.type,
-        // table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.data,
-        //                 table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.offset,
-        //                 table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.num_bytes,
-        //                 table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.is_string_data,
-        //                 table->columns[column_ids[projection_id].GetPrimaryIndex()]->data_wrapper.validity_mask);
-        // output_relation.columns[index]->is_unique =
-        // table->columns[column_ids[projection_id].GetPrimaryIndex()]->is_unique;
         output_relation.columns[index] =
           make_shared_ptr<GPUColumn>(table->columns[column_ids[projection_id].GetPrimaryIndex()]);
         if (row_ids) { output_relation.columns[index]->row_ids = row_ids; }
@@ -1869,16 +1840,6 @@ SourceResultType GPUPhysicalTableScan::GetData(GPUIntermediateRelation& output_r
         column_id.GetPrimaryIndex(),
         index);
       SIRIUS_LOG_DEBUG("Writing row IDs to output relation in index {}", index);
-      // output_relation.columns[index] =
-      // make_shared_ptr<GPUColumn>(table->columns[column_id.GetPrimaryIndex()]->column_length,
-      // table->columns[column_id.GetPrimaryIndex()]->data_wrapper.type,
-      // table->columns[column_id.GetPrimaryIndex()]->data_wrapper.data,
-      //                 table->columns[column_id.GetPrimaryIndex()]->data_wrapper.offset,
-      //                 table->columns[column_id.GetPrimaryIndex()]->data_wrapper.num_bytes,
-      //                 table->columns[column_id.GetPrimaryIndex()]->data_wrapper.is_string_data,
-      //                 table->columns[column_id.GetPrimaryIndex()]->data_wrapper.validity_mask);
-      // output_relation.columns[index]->is_unique =
-      // table->columns[column_id.GetPrimaryIndex()]->is_unique;
       output_relation.columns[index] =
         make_shared_ptr<GPUColumn>(table->columns[column_id.GetPrimaryIndex()]);
       if (row_ids) { output_relation.columns[index]->row_ids = row_ids; }

@@ -20,6 +20,7 @@
 #include "duckdb/common/common.hpp"
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/common/unordered_set.hpp"
+#include "duckdb/parser/group_by_node.hpp"
 #include "duckdb/planner/joinside.hpp"
 #include "duckdb/planner/logical_operator.hpp"
 #include "duckdb/planner/logical_tokens.hpp"
@@ -41,6 +42,8 @@ class GPUPhysicalPlanGenerator {
   //! Recursive CTEs require at least one ChunkScan, referencing the working_table.
   //! This data structure is used to establish it.
   unordered_map<idx_t, shared_ptr<ColumnDataCollection>> recursive_cte_tables;
+  //! Used to reference the recurring tables
+  unordered_map<idx_t, shared_ptr<ColumnDataCollection>> recurring_cte_tables;
   //! Materialized CTE ids must be collected.
   unordered_map<idx_t, vector<const_reference<GPUPhysicalOperator>>> materialized_ctes;
   unordered_map<idx_t, shared_ptr<GPUIntermediateRelation>> gpu_recursive_cte_tables;
@@ -55,6 +58,9 @@ class GPUPhysicalPlanGenerator {
   static bool UseBatchIndex(ClientContext& context, GPUPhysicalOperator& plan);
   //! Whether or not we should preserve insertion order for executing the given sink
   static bool PreserveInsertionOrder(ClientContext& context, GPUPhysicalOperator& plan);
+  //! The order preservation type of the given operator decided by recursively looking at its
+  //! children
+  static OrderPreservationType OrderPreservationRecursive(GPUPhysicalOperator& op);
 
   static bool HasEquality(vector<JoinCondition>& conds, idx_t& range_count);
 
@@ -111,10 +117,11 @@ class GPUPhysicalPlanGenerator {
   unique_ptr<GPUPhysicalOperator> ExtractAggregateExpressions(
     unique_ptr<GPUPhysicalOperator> child,
     vector<unique_ptr<Expression>>& expressions,
-    vector<unique_ptr<Expression>>& groups);
+    vector<unique_ptr<Expression>>& groups,
+    optional_ptr<vector<GroupingSet>> grouping_sets);
 
   // private:
-  // bool PreserveInsertionOrder(GPUPhysicalOperator &plan);
+  bool PreserveInsertionOrder(GPUPhysicalOperator& plan);
   // bool UseBatchIndex(GPUPhysicalOperator &plan);
  public:
   idx_t delim_index = 0;

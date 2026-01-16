@@ -14,14 +14,14 @@
  * limitations under the License.
  */
 
-#include "aggregate/gpu_aggregate_impl.hpp"
 #include "catch.hpp"
 #include "data/data_batch_utils.hpp"
 #include "data/gpu_data_representation.hpp"
 #include "memory/memory_space.hpp"
 #include "memory/sirius_memory_manager.hpp"
-#include "merge/gpu_merge_impl.hpp"
-#include "order/gpu_order_impl.hpp"
+#include "op/aggregate/gpu_aggregate_impl.hpp"
+#include "op/merge/gpu_merge_impl.hpp"
+#include "op/order/gpu_order_impl.hpp"
 #include "scan/test_utils.hpp"
 #include "utils/utils.hpp"
 
