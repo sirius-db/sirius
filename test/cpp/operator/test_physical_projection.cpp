@@ -64,8 +64,13 @@ TEMPLATE_TEST_CASE("sirius_physical_projection executes on data_batch for multip
     input_batch = make_two_column_batch<int64_t, typename Traits::type>(
       repo_mgr, *space, key_vals, data_vals, Traits::cudf_type, std::nullopt);
   } else if constexpr (Traits::is_decimal) {
-    input_batch = make_two_column_batch<int64_t, typename Traits::type>(
-      repo_mgr, *space, key_vals, data_vals, Traits::cudf_type, Traits::scale);
+    input_batch = make_two_column_batch<int64_t, typename Traits::type>(repo_mgr,
+                                                                        *space,
+                                                                        key_vals,
+                                                                        data_vals,
+                                                                        Traits::cudf_type,
+                                                                        Traits::scale,
+                                                                        cudf::type_id::INT64);
   } else if constexpr (Traits::is_ts) {
     input_batch = make_two_column_batch<int64_t, typename Traits::type>(
       repo_mgr, *space, key_vals, data_vals, Traits::cudf_type, std::nullopt);
@@ -95,24 +100,9 @@ TEMPLATE_TEST_CASE("sirius_physical_projection executes on data_batch for multip
   auto host_data = copy_column_to_host<typename Traits::type>(out_view.column(0));
   auto host_keys = copy_column_to_host<int64_t>(out_view.column(1));
 
-  auto logical          = Traits::logical_type();
-  constexpr bool is_dec = Traits::is_decimal || std::is_same_v<TestType, decimal64_tag>;
-  if constexpr (is_dec) {
-    auto scale  = duckdb::DecimalType::GetScale(logical);
-    int64_t mul = 1;
-    for (int i = 0; i < scale; ++i) {
-      mul *= 10;
-    }
-
-    std::vector<int64_t> expected_scaled;
-    expected_scaled.reserve(data_vals.size());
-    for (auto v : data_vals) {
-      expected_scaled.push_back(static_cast<int64_t>(v) * mul);
-    }
-    REQUIRE(host_data == expected_scaled);
-  } else {
-    REQUIRE(host_data == data_vals);
-  }
+  auto logical = Traits::logical_type();
+  // Projection should pass through values unchanged
+  REQUIRE(host_data == data_vals);
   REQUIRE(host_keys == key_vals);
 }
 

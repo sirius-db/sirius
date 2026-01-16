@@ -71,8 +71,13 @@ TEMPLATE_TEST_CASE("sirius_physical_filter executes on data_batch for multiple n
     input_batch = make_two_column_batch<int64_t, typename Traits::type>(
       repo_mgr, *space, filter_vals, data_vals, Traits::cudf_type, std::nullopt);
   } else if constexpr (Traits::is_decimal) {
-    input_batch = make_two_column_batch<int64_t, typename Traits::type>(
-      repo_mgr, *space, filter_vals, data_vals, Traits::cudf_type, Traits::scale);
+    input_batch = make_two_column_batch<int64_t, typename Traits::type>(repo_mgr,
+                                                                        *space,
+                                                                        filter_vals,
+                                                                        data_vals,
+                                                                        Traits::cudf_type,
+                                                                        Traits::scale,
+                                                                        cudf::type_id::INT64);
   } else if constexpr (Traits::is_ts) {
     input_batch = make_two_column_batch<int64_t, typename Traits::type>(
       repo_mgr, *space, filter_vals, data_vals, Traits::cudf_type, std::nullopt);

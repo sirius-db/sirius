@@ -123,10 +123,9 @@ template <>
 struct gpu_type_traits<decimal64_tag> {
   using type = int64_t;  // underlying storage
   static duckdb::LogicalType logical_type() { return duckdb::LogicalType::DECIMAL(18, 2); }
-  // Use INT64 physical column for tests to avoid cudf fixed-point factory limitations in mask paths
-  static constexpr cudf::type_id cudf_type = cudf::type_id::INT64;
-  static constexpr int32_t scale           = -2;  // retained for reference
-  static constexpr bool is_decimal         = false;
+  static constexpr cudf::type_id cudf_type = cudf::type_id::DECIMAL64;
+  static constexpr int32_t scale           = -2;
+  static constexpr bool is_decimal         = true;
   static constexpr bool is_string          = false;
   static constexpr bool is_ts              = false;
   static std::vector<type> sample_values() { return {100, 250, 350}; }  // 1.00, 2.50, 3.50

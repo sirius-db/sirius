@@ -342,16 +342,6 @@ inline std::shared_ptr<cucascade::data_batch> make_two_column_batch(
                cudaMemcpyHostToDevice);
   } else if constexpr (std::is_same_v<TSecond, std::string>) {
     col1 = make_string_column(col1_values, stream, mr);
-  } else if (col1_type_id == cudf::type_id::DECIMAL64 && decimal_scale.has_value()) {
-    col1 = cudf::make_numeric_column(cudf::data_type{col1_type_id, *decimal_scale},
-                                     static_cast<cudf::size_type>(col1_values.size()),
-                                     cudf::mask_state::UNALLOCATED,
-                                     stream,
-                                     mr);
-    cudaMemcpy(col1->mutable_view().data<int64_t>(),
-               col1_values.data(),
-               sizeof(int64_t) * col1_values.size(),
-               cudaMemcpyHostToDevice);
   } else if (col1_type_id == cudf::type_id::TIMESTAMP_DAYS ||
              col1_type_id == cudf::type_id::TIMESTAMP_MICROSECONDS ||
              col1_type_id == cudf::type_id::TIMESTAMP_MILLISECONDS ||

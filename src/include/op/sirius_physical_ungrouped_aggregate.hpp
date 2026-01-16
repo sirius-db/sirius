@@ -36,7 +36,8 @@ class sirius_physical_ungrouped_aggregate : public sirius_physical_operator {
     duckdb::vector<duckdb::LogicalType> types,
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> select_list,
     duckdb::idx_t estimated_cardinality,
-    duckdb::TupleDataValidityType distinct_validity);
+    duckdb::TupleDataValidityType distinct_validity,
+    ::cucascade::shared_data_repository_manager* data_repo_mgr = nullptr);
 
   //! The aggregates that have to be computed
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> aggregates;
@@ -47,6 +48,19 @@ class sirius_physical_ungrouped_aggregate : public sirius_physical_operator {
 
  public:
   bool is_sink() const override { return true; }
+  std::vector<std::shared_ptr<cucascade::data_batch>> execute(
+    const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches) override;
+
+
+ private:
+  struct agg_state {
+    std::mutex _mutex;
+    bool _initialized = false;
+    std::vector<std::unique_ptr<cudf::scalar>> _running_values;  // one per aggregate
+    std::vector<int64_t> _running_counts;                        // for AVG/COUNT
+  };
+  std::shared_ptr<agg_state> _state = std::make_shared<agg_state>();
+
 };
 
 }  // namespace op

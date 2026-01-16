@@ -55,7 +55,7 @@ sirius_physical_top_n::sirius_physical_top_n(
     limit(limit),
     offset(offset),
     dynamic_filter(std::move(dynamic_filter_p)),
-    state(std::make_shared<topn_state>())
+    _state(std::make_shared<topn_state>())
 {
 }
 
@@ -83,11 +83,11 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_top_n::execu
   }
   if (space == nullptr) { return {}; }
 
-  std::unique_lock<std::mutex> lk(state->mutex);
+  std::unique_lock<std::mutex> lk(_state->_mutex);
 
   std::vector<std::unique_ptr<cudf::table>> owned_tables;
   std::vector<cudf::table_view> concat_views;
-  if (state->top_table) { concat_views.push_back(state->top_table->view()); }
+  if (_state->_top_table) { concat_views.push_back(_state->_top_table->view()); }
 
   for (auto const& batch : input_batches) {
     if (!batch) { continue; }
@@ -168,7 +168,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_top_n::execu
   // Prepare output slice applying offset
   std::vector<std::shared_ptr<cucascade::data_batch>> outputs;
   if (keep_rows <= static_cast<cudf::size_type>(offset)) {
-    state->top_table = std::move(kept);
+    _state->_top_table = std::move(kept);
     return outputs;
   }
 
@@ -185,7 +185,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_top_n::execu
   auto output_batch   = std::make_shared<cucascade::data_batch>(batch_id, std::move(output_data));
   outputs.push_back(std::move(output_batch));
 
-  state->top_table = std::move(kept);
+  _state->_top_table = std::move(kept);
   return outputs;
 }
 
