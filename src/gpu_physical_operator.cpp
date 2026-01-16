@@ -167,4 +167,4 @@ void GPUPhysicalOperator::Verify()
 #endif
 }
 
-} // namespace duckdb;
+}  // namespace duckdb
