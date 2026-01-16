@@ -107,7 +107,7 @@ gpu_pipeline_task::gpu_pipeline_task(
 
 uint64_t gpu_pipeline_task::get_task_id() const { return _task_id; }
 
-const duckdb::GPUPipeline* gpu_pipeline_task::get_pipeline() const
+const sirius_pipeline* gpu_pipeline_task::get_pipeline() const
 {
   return _global_state->cast<gpu_pipeline_task_global_state>()._pipeline.get();
 }

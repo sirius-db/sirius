@@ -55,8 +55,6 @@ class sirius_physical_cte : public sirius_physical_operator {
   // Sink interface
   bool is_sink() const override { return true; }
 
-  bool parallel_sink() const override { return true; }
-
   bool sink_order_dependent() const override { return false; }
 
  public:

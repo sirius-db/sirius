@@ -47,8 +47,6 @@ class sirius_physical_ungrouped_aggregate : public sirius_physical_operator {
 
  public:
   bool is_sink() const override { return true; }
-
-  bool parallel_sink() const override { return true; }
 };
 
 }  // namespace op

@@ -102,6 +102,7 @@ add_subdirectory(src/pipeline)
 add_subdirectory(src/downgrade)
 add_subdirectory(src/creator)
 add_subdirectory(src/op)
+add_subdirectory(src/planner)
 
 set(CUDA_SOURCES src/cuda/communication.cu src/cuda/allocator.cu
                  src/cuda/print.cu src/cuda/utils.cu)

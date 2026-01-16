@@ -25,7 +25,7 @@ void task_request_queue::open()
 {
   _is_open.store(true, std::memory_order_release);
   // Drain any remaining items (including nullptr sentinels) from previous close()
-  unique_ptr<task_request> request;
+  std::unique_ptr<task_request> request;
   while (_request_queue.try_dequeue(request)) {
     // Discard old items
   }
@@ -40,14 +40,14 @@ void task_request_queue::close()
   }
 }
 
-void task_request_queue::push(unique_ptr<task_request> request)
+void task_request_queue::push(std::unique_ptr<task_request> request)
 {
   _request_queue.enqueue(std::move(request));
 }
 
-unique_ptr<task_request> task_request_queue::pull()
+std::unique_ptr<task_request> task_request_queue::pull()
 {
-  unique_ptr<task_request> request;
+  std::unique_ptr<task_request> request;
   while (true) {
     if (_request_queue.try_dequeue(request)) { return request; }
 

@@ -226,55 +226,6 @@ void GPUExecutor::Execute()
   }
 }
 
-// ONLY FOR TESTING PURPOSES, WILL BE REMOVED LATER
-void GPUExecutor::execute()
-{
-  printf("Starting GPUExecutor::execute()\n");
-  // Check if we should fall back to duckdb execution.
-  if (Config::ENABLE_FALLBACK_CHECK) {
-    FallbackChecker fallback_checker(new_scheduled);
-    fallback_checker.Check();
-  }
-
-  printf("Creating gpu_pipeline_hashmap\n");
-  ::sirius::gpu_pipeline_hashmap pipeline_map = ::sirius::gpu_pipeline_hashmap(new_scheduled);
-  ::sirius::parallel::task_executor_config scan_executor_config =
-    ::sirius::parallel::task_executor_config(::sirius::Config::NUM_DUCKDB_SCAN_EXECUTOR_THREADS,
-                                             false);
-  ::sirius::parallel::task_executor_config global_executor_config =
-    ::sirius::parallel::task_executor_config(::sirius::Config::NUM_PIPELINE_EXECUTOR_THREADS,
-                                             false);
-  ::sirius::parallel::task_executor_config gpu_executor_config =
-    ::sirius::parallel::task_executor_config(::sirius::Config::NUM_GPU_EXECUTOR_THREADS, false);
-
-  printf("Creating scan executor\n");
-  ::sirius::op::scan::duckdb_scan_executor scan_executor =
-    ::sirius::op::scan::duckdb_scan_executor(scan_executor_config);
-  printf("Creating pipeline executor\n");
-  ::sirius::pipeline::pipeline_executor pipeline_executor = ::sirius::pipeline::pipeline_executor(
-    global_executor_config, gpu_executor_config, ::sirius::Config::NUM_GPU);
-
-  // Currently we will start the components after the query start instead of during database
-  // initialization because it is easier for development.
-  printf("Creating task creator\n");
-  ::sirius::creator::task_creator creator(
-    1, pipeline_map, context, pipeline_executor, scan_executor);
-
-  std::cout << "Starting task creator" << std::endl;
-  creator.start();
-  std::cout << "Starting scan executor" << std::endl;
-  scan_executor.start();
-  std::cout << "Starting pipeline executor" << std::endl;
-  pipeline_executor.start();
-
-  std::cout << "Stopping pipeline executor" << std::endl;
-  pipeline_executor.stop();
-  std::cout << "Stopping scan executor" << std::endl;
-  scan_executor.stop();
-  std::cout << "Stopping task creator" << std::endl;
-  creator.stop();
-}
-
 void GPUExecutor::insert_repository(std::string_view port_id,
                                     shared_ptr<GPUPipeline> input_pipeline,
                                     shared_ptr<GPUPipeline> dependent_pipeline)

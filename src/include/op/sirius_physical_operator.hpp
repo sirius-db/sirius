@@ -56,7 +56,7 @@ using task_hint = std::variant<std::monostate,
 }  // namespace creator
 
 namespace op {
-enum class memory_barrier_type { PIPELINE, PARTIAL, FULL };
+enum class MemoryBarrierType { PIPELINE, PARTIAL, FULL };
 
 //! sirius_physical_operator is the base class of the physical operators present in the
 //! execution plan
@@ -93,11 +93,15 @@ class sirius_physical_operator {
 
  public:
   virtual std::string get_name() const;
-  // virtual std::string params_to_string() const {
-  // 	return "";
-  // }
-  // virtual std::string to_string() const;
-  // void print() const;
+
+  virtual std::string params_to_string() const {
+  	return "";
+  }
+
+  virtual std::string to_string() const;
+
+  void print() const;
+
   virtual duckdb::vector<duckdb::const_reference<sirius_physical_operator>> get_children() const;
 
   //! Return a vector of the types that will be returned by this operator
@@ -108,22 +112,10 @@ class sirius_physical_operator {
   virtual void verify();
 
  public:
-  // Operator interface
-  virtual duckdb::unique_ptr<duckdb::OperatorState> get_operator_state(
-    duckdb::ExecutionContext& context) const;
+  virtual std::vector<std::shared_ptr<::cucascade::data_batch>> execute(
+    const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches);
 
-  virtual duckdb::unique_ptr<duckdb::GlobalOperatorState> get_global_operator_state(
-    duckdb::ClientContext& context) const;
-
-  virtual ::std::vector<::std::shared_ptr<::cucascade::data_batch>> execute(
-    const ::std::vector<::std::shared_ptr<::cucascade::data_batch>>& input_batches);
-
-  virtual ::std::vector<::std::shared_ptr<::cucascade::data_batch>> sink_execute(
-    const ::std::vector<::std::shared_ptr<::cucascade::data_batch>>& input_batches);
-
-  virtual bool parallel_operator() const { return false; }
-
-  virtual bool requires_final_execute() const { return false; }
+  virtual void sink(const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches);
 
   //! The influence the operator has on order (insertion order means no influence)
   virtual duckdb::OrderPreservationType operator_order() const
@@ -132,37 +124,20 @@ class sirius_physical_operator {
   }
 
  public:
-  virtual duckdb::unique_ptr<duckdb::LocalSourceState> get_local_source_state(
-    duckdb::ExecutionContext& context, duckdb::GlobalSourceState& gstate) const;
-  virtual duckdb::unique_ptr<duckdb::GlobalSourceState> get_global_source_state(
-    duckdb::ClientContext& context) const;
-
   virtual bool is_source() const { return false; }
 
-  virtual bool parallel_source() const { return false; }
+ public:
+  virtual bool is_sink() const { return false; }
+  
+ //! Whether or not the sink operator depends on the order of the input chunks
+ //! If this is set to true, we cannot do things like caching intermediate vectors
+  virtual bool sink_order_dependent() const { return false; }
 
   //! The type of order emitted by the operator (as a source)
   virtual duckdb::OrderPreservationType source_order() const
   {
     return duckdb::OrderPreservationType::INSERTION_ORDER;
   }
-
- public:
-  virtual duckdb::unique_ptr<duckdb::LocalSinkState> get_local_sink_state(
-    duckdb::ExecutionContext& context) const;
-
-  virtual duckdb::unique_ptr<duckdb::GlobalSinkState> get_global_sink_state(
-    duckdb::ClientContext& context) const;
-
-  virtual bool is_sink() const { return false; }
-
-  virtual bool parallel_sink() const { return false; }
-
-  virtual bool requires_batch_index() const { return false; }
-
-  //! Whether or not the sink operator depends on the order of the input chunks
-  //! If this is set to true, we cannot do things like caching intermediate vectors
-  virtual bool sink_order_dependent() const { return false; }
 
  public:
   // Pipeline construction
@@ -194,7 +169,7 @@ class sirius_physical_operator {
   }
 
   struct port {
-    memory_barrier_type type;
+    MemoryBarrierType type;
     ::cucascade::shared_data_repository* repo;
     duckdb::shared_ptr<pipeline::sirius_pipeline> src_pipeline;
     duckdb::shared_ptr<pipeline::sirius_pipeline> dest_pipeline;
@@ -215,15 +190,15 @@ class sirius_physical_operator {
   duckdb::vector<std::pair<sirius_physical_operator*, std::string_view>>&
   get_next_port_after_sink();
   //! Get the next task hint
-  // virtual ::sirius::creator::task_hint get_next_task_hint();
+  virtual creator::task_hint get_next_task_hint();
   //! Get the input batch
-  std::vector<::std::shared_ptr<::cucascade::data_batch>> get_input_batch();
+  std::vector<std::shared_ptr<::cucascade::data_batch>> get_input_batch();
   //! Check if all ports are empty
   bool all_ports_empty();
   //! Check if the pipeline is finished
   bool check_pipeline_finished();
   //! Set the creator of the task
-  void set_creator(::sirius::creator::task_creator* creator);
+  void set_creator(creator::task_creator* creator);
 
  private:
   //! The ports of the operator
@@ -231,7 +206,7 @@ class sirius_physical_operator {
   //! The next operators to be executed after this operator when it is used as a sink
   duckdb::vector<std::pair<sirius_physical_operator*, std::string_view>> next_port_after_sink;
   //! The creator of the task
-  ::sirius::creator::task_creator* creator;
+  creator::task_creator* creator;
 };
 
 }  // namespace op
