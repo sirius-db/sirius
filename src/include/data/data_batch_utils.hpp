@@ -88,60 +88,6 @@ inline std::shared_ptr<cucascade::data_batch> make_data_batch(
 }
 
 /**
- * @brief Acquire processing handles for a collection of data batches.
- *
- * This function attempts to acquire processing locks on all provided batches.
- * If any batch cannot be locked (e.g., it's being downgraded), the function
- * returns an empty optional and releases any previously acquired locks.
- *
- * Usage pattern:
- * @code
- *   auto handles = acquire_processing_handles(batches);
- *   if (!handles) {
- *     // Some batch is being downgraded, retry later
- *     return;
- *   }
- *   // Process batches safely - handles prevent downgrade
- *   do_processing(batches);
- *   // Handles automatically release when going out of scope
- * @endcode
- *
- * @param batches Vector of data batch shared pointers to lock.
- * @return std::optional<std::vector<cucascade::data_batch_processing_handle>>
- *         Vector of handles if all locks acquired, empty optional otherwise.
- */
-inline std::optional<std::vector<cucascade::data_batch_processing_handle>>
-acquire_processing_handles(const std::vector<std::shared_ptr<cucascade::data_batch>>& batches)
-{
-  std::vector<cucascade::data_batch_processing_handle> handles;
-  handles.reserve(batches.size());
-
-  for (const auto& batch : batches) {
-    auto* mem_space = batch->get_memory_space();
-    if (mem_space == nullptr) { return std::nullopt; }
-
-    bool created_task = false;
-    auto lock_result  = batch->try_to_lock_for_processing(mem_space->get_id());
-
-    if (!lock_result.success &&
-        lock_result.status == cucascade::lock_for_processing_status::task_not_created) {
-      created_task = batch->try_to_create_task();
-      if (!created_task) { return std::nullopt; }
-      lock_result = batch->try_to_lock_for_processing(mem_space->get_id());
-    }
-
-    if (!lock_result.success) {
-      if (created_task) { batch->try_to_cancel_task(); }
-      return std::nullopt;
-    }
-
-    handles.emplace_back(std::move(lock_result.handle));
-  }
-
-  return handles;
-}
-
-/**
  * @brief Acquire a processing handle for a single data batch.
  *
  * @param batch The data batch to lock for processing.
