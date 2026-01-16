@@ -317,7 +317,6 @@ std::shared_ptr<cucascade::data_batch> GpuExpressionExecutor::select(
   // Apply the bitmap
   auto output_table =
     cudf::apply_boolean_mask(input_table, bitmap->view(), execution_stream, resource_ref);
-  // Create the data representation
   std::unique_ptr<cucascade::idata_representation> output_data_rep =
     std::make_unique<cucascade::gpu_table_representation>(*output_table,
                                                           *input_batch->get_memory_space());
