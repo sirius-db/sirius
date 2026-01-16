@@ -71,8 +71,10 @@ batches_with_handles create_batches_with_random_data(
     auto batch = sirius::make_data_batch(std::move(table), mem_space);
 
     // Acquire processing handle (like the old pin() call)
-    REQUIRE(batch->try_to_lock_for_processing());
-    result.handles.emplace_back(batch.get());
+    REQUIRE(batch->try_to_create_task());
+    auto lock_result = batch->try_to_lock_for_processing(mem_space.get_id());
+    REQUIRE(lock_result.success);
+    result.handles.emplace_back(std::move(lock_result.handle));
     result.batches.push_back(std::move(batch));
   }
   return result;
@@ -269,8 +271,10 @@ batches_with_handles create_batches_with_local_ungrouped_agg_result(
     auto batch = gpu_aggregate_impl::local_ungrouped_aggregate(
       base_input.batches[i], aggregates, aggregate_idx, cudf::get_default_stream(), mem_space);
     // Acquire processing handle for the output batch
-    REQUIRE(batch->try_to_lock_for_processing());
-    result.handles.emplace_back(batch.get());
+    REQUIRE(batch->try_to_create_task());
+    auto lock_result = batch->try_to_lock_for_processing(mem_space.get_id());
+    REQUIRE(lock_result.success);
+    result.handles.emplace_back(std::move(lock_result.handle));
     result.batches.push_back(std::move(batch));
   }
   // base_input.handles will release when going out of scope (base batches no longer needed)
@@ -511,8 +515,10 @@ batches_with_handles create_batches_with_local_grouped_agg_result(
                                                              aggregate_idx,
                                                              cudf::get_default_stream(),
                                                              mem_space);
-    REQUIRE(batch->try_to_lock_for_processing());
-    result.handles.emplace_back(batch.get());
+    REQUIRE(batch->try_to_create_task());
+    auto lock_result = batch->try_to_lock_for_processing(mem_space.get_id());
+    REQUIRE(lock_result.success);
+    result.handles.emplace_back(std::move(lock_result.handle));
     result.batches.push_back(std::move(batch));
   }
 
@@ -806,8 +812,10 @@ batches_with_handles create_batches_with_local_orderby_or_topn_result(
                                                     projections,
                                                     cudf::get_default_stream(),
                                                     mem_space);
-    REQUIRE(batch->try_to_lock_for_processing());
-    result.handles.emplace_back(batch.get());
+    REQUIRE(batch->try_to_create_task());
+    auto lock_result = batch->try_to_lock_for_processing(mem_space.get_id());
+    REQUIRE(lock_result.success);
+    result.handles.emplace_back(std::move(lock_result.handle));
     result.batches.push_back(std::move(batch));
   }
   return result;

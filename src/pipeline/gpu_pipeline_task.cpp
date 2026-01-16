@@ -16,12 +16,83 @@
 
 #include "pipeline/gpu_pipeline_task.hpp"
 
+#include <data/cpu_data_representation.hpp>
 #include <data/data_batch_utils.hpp>
 #include <data/data_repository.hpp>
 #include <data/data_repository_manager.hpp>
+#include <data/gpu_data_representation.hpp>
+#include <data/sirius_converter_registry.hpp>
+#include <memory/memory_space.hpp>
+
+#include <optional>
 
 namespace sirius {
 namespace pipeline {
+
+namespace {
+
+std::optional<cucascade::data_batch_processing_handle> lock_or_prepare_batch(
+  const std::shared_ptr<cucascade::data_batch>& batch,
+  const cucascade::memory::memory_space* requested_memory_space)
+{
+  const auto* target_space =
+    requested_memory_space != nullptr ? requested_memory_space : batch->get_memory_space();
+  if (target_space == nullptr) { return std::nullopt; }
+
+  auto lock_result = batch->try_to_lock_for_processing(target_space->get_id());
+
+  auto cancel_task_if_needed = []() {};
+
+  const bool needs_conversion =
+    requested_memory_space != nullptr &&
+    lock_result.status == cucascade::lock_for_processing_status::memory_space_mismatch;
+
+  if (!lock_result.success && needs_conversion) {
+    try {
+      auto& registry = sirius::converter_registry::get();
+      auto stream    = requested_memory_space->acquire_stream();
+      switch (requested_memory_space->get_tier()) {
+        case cucascade::memory::Tier::GPU: {
+          auto prev_state = batch->get_state();
+          if (!batch->try_to_lock_for_in_transit()) {
+            cancel_task_if_needed();
+            return std::nullopt;
+          }
+          batch->convert_to<cucascade::gpu_table_representation>(
+            registry, requested_memory_space, stream);
+          batch->try_to_release_in_transit(std::optional<cucascade::batch_state>{prev_state});
+          break;
+        }
+        case cucascade::memory::Tier::HOST: {
+          auto prev_state = batch->get_state();
+          if (!batch->try_to_lock_for_in_transit()) {
+            cancel_task_if_needed();
+            return std::nullopt;
+          }
+          batch->convert_to<cucascade::host_table_representation>(
+            registry, requested_memory_space, stream);
+          batch->try_to_release_in_transit(std::optional<cucascade::batch_state>{prev_state});
+          break;
+        }
+        default: cancel_task_if_needed(); return std::nullopt;
+      }
+
+      lock_result = batch->try_to_lock_for_processing(requested_memory_space->get_id());
+    } catch (...) {
+      cancel_task_if_needed();
+      throw;
+    }
+  }
+
+  if (!lock_result.success) {
+    cancel_task_if_needed();
+    return std::nullopt;
+  }
+
+  return std::move(lock_result.handle);
+}
+
+}  // namespace
 
 gpu_pipeline_task::gpu_pipeline_task(
   uint64_t task_id,
@@ -45,14 +116,19 @@ void gpu_pipeline_task::execute()
 {
   auto& local_state = _local_state->cast<gpu_pipeline_task_local_state>();
 
-  // Acquire processing handles for all input batches.
-  // This prevents the batches from being downgraded while we're processing them.
-  // The handles will automatically release when they go out of scope.
-  auto processing_handles = sirius::acquire_processing_handles(local_state._batches);
-  if (!processing_handles) {
-    // Some batch is being downgraded - cannot process right now
-    // TODO: Add retry logic or re-queue the task
-    return;
+  const auto* reservation = local_state.get_reservation();
+  const auto* requested_memory_space =
+    reservation != nullptr ? &reservation->get_memory_space() : nullptr;
+  std::vector<cucascade::data_batch_processing_handle> processing_handles;
+  processing_handles.reserve(local_state._batches.size());
+
+  for (const auto& batch : local_state._batches) {
+    auto handle = lock_or_prepare_batch(batch, requested_memory_space);
+    if (!handle) {
+      // Failed to lock (or convert) one of the batches. Caller can retry later.
+      return;
+    }
+    processing_handles.emplace_back(std::move(*handle));
   }
 
   // At this point, all input batches are locked for processing.
