@@ -26,18 +26,22 @@
 
 namespace sirius::planner {
 
-duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_generator::create_plan(duckdb::LogicalMaterializedCTE& op)
+duckdb::unique_ptr<sirius::op::sirius_physical_operator>
+sirius_physical_plan_generator::create_plan(duckdb::LogicalMaterializedCTE& op)
 {
   D_ASSERT(op.children.size() == 2);
 
   // Create the working_table that the PhysicalCTE will use for evaluation.
-  auto working_table     = duckdb::make_shared_ptr<duckdb::ColumnDataCollection>(context, op.children[0]->types);
-  // auto working_table_gpu = duckdb::make_shared_ptr<duckdb::GPUIntermediateRelation>(op.children[0]->types.size());
+  auto working_table =
+    duckdb::make_shared_ptr<duckdb::ColumnDataCollection>(context, op.children[0]->types);
+  // auto working_table_gpu =
+  // duckdb::make_shared_ptr<duckdb::GPUIntermediateRelation>(op.children[0]->types.size());
 
   // Add the ColumnDataCollection to the context of this PhysicalPlanGenerator
-  recursive_cte_tables[op.table_index]     = working_table;
+  recursive_cte_tables[op.table_index] = working_table;
   // gpu_recursive_cte_tables[op.table_index] = working_table_gpu;
-  materialized_ctes[op.table_index]        = duckdb::vector<duckdb::const_reference<sirius::op::sirius_physical_operator>>();
+  materialized_ctes[op.table_index] =
+    duckdb::vector<duckdb::const_reference<sirius::op::sirius_physical_operator>>();
 
   // Create the plan for the left side. This is the materialization.
   auto left = create_plan(*op.children[0]);
@@ -45,15 +49,15 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_ge
   auto right = create_plan(*op.children[1]);
 
   duckdb::unique_ptr<sirius::op::sirius_physical_cte> cte;
-  cte                    = duckdb::make_uniq<sirius::op::sirius_physical_cte>(op.ctename,
-                                  op.table_index,
-                                  right->types,
-                                  std::move(left),
-                                  std::move(right),
-                                  op.estimated_cardinality);
-  cte->working_table     = working_table;
+  cte                = duckdb::make_uniq<sirius::op::sirius_physical_cte>(op.ctename,
+                                                           op.table_index,
+                                                           right->types,
+                                                           std::move(left),
+                                                           std::move(right),
+                                                           op.estimated_cardinality);
+  cte->working_table = working_table;
   // cte->working_table_gpu = working_table_gpu;
-  cte->cte_scans         = materialized_ctes[op.table_index];
+  cte->cte_scans = materialized_ctes[op.table_index];
 
   return std::move(cte);
 }

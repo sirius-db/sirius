@@ -50,9 +50,9 @@ class sirius_meta_pipeline;
 
 namespace creator {
 class task_creator;
-using task_hint = std::variant<std::monostate,
-                               op::sirius_physical_operator*,
-                               duckdb::shared_ptr<pipeline::sirius_pipeline>>;
+using task_creation_hint = std::variant<std::monostate,
+                                        op::sirius_physical_operator*,
+                                        duckdb::shared_ptr<pipeline::sirius_pipeline>>;
 }  // namespace creator
 
 namespace op {
@@ -94,9 +94,7 @@ class sirius_physical_operator {
  public:
   virtual std::string get_name() const;
 
-  virtual std::string params_to_string() const {
-  	return "";
-  }
+  virtual std::string params_to_string() const { return ""; }
 
   virtual std::string to_string() const;
 
@@ -128,9 +126,9 @@ class sirius_physical_operator {
 
  public:
   virtual bool is_sink() const { return false; }
-  
- //! Whether or not the sink operator depends on the order of the input chunks
- //! If this is set to true, we cannot do things like caching intermediate vectors
+
+  //! Whether or not the sink operator depends on the order of the input chunks
+  //! If this is set to true, we cannot do things like caching intermediate vectors
   virtual bool sink_order_dependent() const { return false; }
 
   //! The type of order emitted by the operator (as a source)
@@ -178,7 +176,7 @@ class sirius_physical_operator {
   // source pipeline pushed to repo of the ports
   void push_data_batch(std::string_view port_id, std::shared_ptr<::cucascade::data_batch> batch);
   //! Add a port to the operator
-  void add_port(std::string_view port_id, duckdb::unique_ptr<port> p);
+  void add_port(std::string_view port_id, std::unique_ptr<port> p);
   //! Get a port from the operator
   port* get_port(std::string_view port_id);
   //! Check if the source pipeline is finished
@@ -187,10 +185,9 @@ class sirius_physical_operator {
   void add_next_port_after_sink(
     std::pair<sirius_physical_operator*, std::string_view> port_locator);
   //! Get the next ports after sink
-  duckdb::vector<std::pair<sirius_physical_operator*, std::string_view>>&
-  get_next_port_after_sink();
+  std::vector<std::pair<sirius_physical_operator*, std::string_view>>& get_next_port_after_sink();
   //! Get the next task hint
-  virtual creator::task_hint get_next_task_hint();
+  virtual creator::task_creation_hint get_next_task_hint();
   //! Get the input batch
   std::vector<std::shared_ptr<::cucascade::data_batch>> get_input_batch();
   //! Check if all ports are empty
@@ -202,9 +199,9 @@ class sirius_physical_operator {
 
  private:
   //! The ports of the operator
-  duckdb::unordered_map<std::string, duckdb::unique_ptr<port>> ports;
+  std::unordered_map<std::string, std::unique_ptr<port>> ports;
   //! The next operators to be executed after this operator when it is used as a sink
-  duckdb::vector<std::pair<sirius_physical_operator*, std::string_view>> next_port_after_sink;
+  std::vector<std::pair<sirius_physical_operator*, std::string_view>> next_port_after_sink;
   //! The creator of the task
   creator::task_creator* creator;
 };

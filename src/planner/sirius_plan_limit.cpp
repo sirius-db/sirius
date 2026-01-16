@@ -47,7 +47,8 @@ namespace sirius::planner {
 // #endif
 // }
 
-duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_generator::create_plan(duckdb::LogicalLimit& op)
+duckdb::unique_ptr<sirius::op::sirius_physical_operator>
+sirius_physical_plan_generator::create_plan(duckdb::LogicalLimit& op)
 {
   D_ASSERT(op.children.size() == 1);
 
@@ -65,11 +66,12 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_ge
     default:
       if (!preserve_insertion_order(*plan)) {
         // use parallel streaming limit if insertion order is not important
-        limit = duckdb::make_uniq<sirius::op::sirius_physical_streaming_limit>(op.types,
-                                                     std::move(op.limit_val),
-                                                     std::move(op.offset_val),
-                                                     op.estimated_cardinality,
-                                                     true);
+        limit =
+          duckdb::make_uniq<sirius::op::sirius_physical_streaming_limit>(op.types,
+                                                                         std::move(op.limit_val),
+                                                                         std::move(op.offset_val),
+                                                                         op.estimated_cardinality,
+                                                                         true);
       } else {
         throw duckdb::NotImplementedException(
           "Streaming limit with insertion order preservation not supported in GPU");
@@ -82,8 +84,8 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_ge
         // 		//                                  op.estimated_cardinality);
         // 	} else {
         // 		// source does not support batch index: use a non-parallel streaming limit
-        // 		limit = duckdb::make_uniq<sirius::op::sirius_physical_streaming_limit>(op.types, std::move(op.limit_val),
-        // std::move(op.offset_val), op.estimated_cardinality, false);
+        // 		limit = duckdb::make_uniq<sirius::op::sirius_physical_streaming_limit>(op.types,
+        // std::move(op.limit_val), std::move(op.offset_val), op.estimated_cardinality, false);
         // 	}
       }
       break;

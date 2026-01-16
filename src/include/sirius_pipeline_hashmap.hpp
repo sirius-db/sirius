@@ -15,8 +15,8 @@
  */
 
 #pragma once
-#include "pipeline/sirius_pipeline.hpp"
 #include "helper/helper.hpp"
+#include "pipeline/sirius_pipeline.hpp"
 
 namespace sirius {
 

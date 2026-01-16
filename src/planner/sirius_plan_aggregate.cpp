@@ -29,10 +29,10 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
-#include "planner/sirius_physical_plan_generator.hpp"
 #include "op/sirius_physical_projection.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "op/sirius_physical_ungrouped_aggregate.hpp"
+#include "planner/sirius_physical_plan_generator.hpp"
 
 namespace sirius::planner {
 
@@ -197,7 +197,8 @@ static bool can_use_perfect_hash_aggregate(duckdb::ClientContext& context,
       case duckdb::PhysicalType::UINT32: range_h = get_range_hugeint<uint32_t>(nstats); break;
       case duckdb::PhysicalType::UINT64: range_h = get_range_hugeint<uint64_t>(nstats); break;
       default:
-        throw duckdb::InternalException("Unsupported type for perfect hash (should be caught before)");
+        throw duckdb::InternalException(
+          "Unsupported type for perfect hash (should be caught before)");
     }
 
     uint64_t range;
@@ -208,11 +209,13 @@ static bool can_use_perfect_hash_aggregate(duckdb::ClientContext& context,
 
     range += 2;
     // figure out how many bits we need
-    duckdb::idx_t required_bits = required_bits_for_value(duckdb::UnsafeNumericCast<uint32_t>(range));
+    duckdb::idx_t required_bits =
+      required_bits_for_value(duckdb::UnsafeNumericCast<uint32_t>(range));
     bits_per_group.push_back(required_bits);
     perfect_hash_bits += required_bits;
     // check if we have exceeded the bits for the hash
-    if (perfect_hash_bits > duckdb::DBConfig::GetSetting<duckdb::PerfectHtThresholdSetting>(context)) {
+    if (perfect_hash_bits >
+        duckdb::DBConfig::GetSetting<duckdb::PerfectHtThresholdSetting>(context)) {
       // too many bits for perfect hash
       return false;
     }
@@ -227,13 +230,15 @@ static bool can_use_perfect_hash_aggregate(duckdb::ClientContext& context,
   return true;
 }
 
-duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
+duckdb::unique_ptr<sirius::op::sirius_physical_operator>
+sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
 {
   D_ASSERT(op.children.size() == 1);
 
   auto plan = create_plan(*op.children[0]);
 
-  plan = extract_aggregate_expressions(std::move(plan), op.expressions, op.groups, op.grouping_sets);
+  plan =
+    extract_aggregate_expressions(std::move(plan), op.expressions, op.groups, op.grouping_sets);
   bool can_use_simple_aggregation = true;
   for (auto& expression : op.expressions) {
     auto& aggregate = expression->Cast<duckdb::BoundAggregateExpression>();
@@ -257,15 +262,16 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_ge
     // no groups, check if we can use a simple aggregation
     // special case: aggregate entire columns together
     if (can_use_simple_aggregation) {
-      auto group_by = duckdb::make_uniq_base<sirius::op::sirius_physical_operator, sirius::op::sirius_physical_ungrouped_aggregate>(
+      auto group_by = duckdb::make_uniq_base<sirius::op::sirius_physical_operator,
+                                             sirius::op::sirius_physical_ungrouped_aggregate>(
         op.types, std::move(op.expressions), op.estimated_cardinality, op.distinct_validity);
       group_by->children.push_back(std::move(plan));
       return group_by;
     }
     throw duckdb::NotImplementedException("Non simple aggregation is not supported");
     // auto &group_by =
-    //     Make<sirius::op::sirius_physical_grouped_aggregate>(context, op.types, std::move(op.expressions),
-    //     op.estimated_cardinality);
+    //     Make<sirius::op::sirius_physical_grouped_aggregate>(context, op.types,
+    //     std::move(op.expressions), op.estimated_cardinality);
     // group_by.children.push_back(plan);
     // return group_by;
   }
@@ -281,7 +287,8 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_ge
     //     std::move(op.groups),
     //                                        std::move(partition_columns),
     //                                        op.estimated_cardinality);
-    auto group_by = duckdb::make_uniq_base<sirius::op::sirius_physical_operator, sirius::op::sirius_physical_grouped_aggregate>(
+    auto group_by = duckdb::make_uniq_base<sirius::op::sirius_physical_operator,
+                                           sirius::op::sirius_physical_grouped_aggregate>(
       context,
       op.types,
       std::move(op.expressions),
@@ -302,7 +309,8 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_ge
     //                                                     std::move(op.group_stats),
     //                                                     std::move(required_bits),
     //                                                     op.estimated_cardinality);
-    auto group_by = duckdb::make_uniq_base<sirius::op::sirius_physical_operator, sirius::op::sirius_physical_grouped_aggregate>(
+    auto group_by = duckdb::make_uniq_base<sirius::op::sirius_physical_operator,
+                                           sirius::op::sirius_physical_grouped_aggregate>(
       context,
       op.types,
       std::move(op.expressions),
@@ -316,7 +324,8 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_ge
     return group_by;
   }
 
-  auto group_by = duckdb::make_uniq_base<sirius::op::sirius_physical_operator, sirius::op::sirius_physical_grouped_aggregate>(
+  auto group_by = duckdb::make_uniq_base<sirius::op::sirius_physical_operator,
+                                         sirius::op::sirius_physical_grouped_aggregate>(
     context,
     op.types,
     std::move(op.expressions),
@@ -330,7 +339,8 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_ge
   return group_by;
 }
 
-duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_generator::extract_aggregate_expressions(
+duckdb::unique_ptr<sirius::op::sirius_physical_operator>
+sirius_physical_plan_generator::extract_aggregate_expressions(
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> child,
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>& aggregates,
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>& groups,
@@ -348,7 +358,8 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_ge
     }
   }
   for (auto& group : groups) {
-    auto ref = duckdb::make_uniq<duckdb::BoundReferenceExpression>(group->return_type, expressions.size());
+    auto ref =
+      duckdb::make_uniq<duckdb::BoundReferenceExpression>(group->return_type, expressions.size());
     types.push_back(group->return_type);
     expressions.push_back(std::move(group));
     group = std::move(ref);
@@ -356,14 +367,16 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_ge
   for (auto& aggr : aggregates) {
     auto& bound_aggr = aggr->Cast<duckdb::BoundAggregateExpression>();
     for (auto& child_expr : bound_aggr.children) {
-      auto ref = duckdb::make_uniq<duckdb::BoundReferenceExpression>(child_expr->return_type, expressions.size());
+      auto ref = duckdb::make_uniq<duckdb::BoundReferenceExpression>(child_expr->return_type,
+                                                                     expressions.size());
       types.push_back(child_expr->return_type);
       expressions.push_back(std::move(child_expr));
       child_expr = std::move(ref);
     }
     if (bound_aggr.filter) {
       auto& filter = bound_aggr.filter;
-      auto ref     = duckdb::make_uniq<duckdb::BoundReferenceExpression>(filter->return_type, expressions.size());
+      auto ref     = duckdb::make_uniq<duckdb::BoundReferenceExpression>(filter->return_type,
+                                                                     expressions.size());
       types.push_back(filter->return_type);
       expressions.push_back(std::move(filter));
       bound_aggr.filter = std::move(ref);

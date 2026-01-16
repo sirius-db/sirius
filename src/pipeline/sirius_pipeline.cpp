@@ -70,7 +70,8 @@ void sirius_pipeline::reset_sink()
       throw duckdb::InternalException("Sink of pipeline does not have is_sink set");
     }
     std::lock_guard<std::mutex> guard(sink->lock);
-    // if (!sink->sink_state) { sink->sink_state = sink->get_global_sink_state(get_client_context()); }
+    // if (!sink->sink_state) { sink->sink_state =
+    // sink->get_global_sink_state(get_client_context()); }
   }
 }
 

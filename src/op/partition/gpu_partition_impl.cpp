@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "operator/partition/gpu_partition_impl.hpp"
+#include "op/partition/gpu_partition_impl.hpp"
 
 #include "data/data_batch_utils.hpp"
 

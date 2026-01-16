@@ -22,17 +22,18 @@
 #include "duckdb/execution/operator/projection/physical_projection.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "log/logging.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
-#include "log/logging.hpp"
 
 namespace sirius::planner {
 
-static void gather_delim_scans(sirius::op::sirius_physical_operator& op,
-                               duckdb::vector<duckdb::const_reference<sirius::op::sirius_physical_operator>>& delim_scans,
-                               duckdb::idx_t delim_index)
+static void gather_delim_scans(
+  sirius::op::sirius_physical_operator& op,
+  duckdb::vector<duckdb::const_reference<sirius::op::sirius_physical_operator>>& delim_scans,
+  duckdb::idx_t delim_index)
 {
   if (op.type == duckdb::PhysicalOperatorType::DELIM_SCAN) {
     SIRIUS_LOG_DEBUG("Found a delim scan");
@@ -51,7 +52,8 @@ static void gather_delim_scans(sirius::op::sirius_physical_operator& op,
   }
 }
 
-duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_generator::plan_delim_join(duckdb::LogicalComparisonJoin& op)
+duckdb::unique_ptr<sirius::op::sirius_physical_operator>
+sirius_physical_plan_generator::plan_delim_join(duckdb::LogicalComparisonJoin& op)
 {
   // first create the underlying join
   auto plan = plan_comparison_join(op);
@@ -80,25 +82,28 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_ge
   // now create the duplicate eliminated join
   duckdb::unique_ptr<sirius::op::sirius_physical_delim_join> delim_join;
   if (op.delim_flipped) {
-    delim_join = duckdb::make_uniq<sirius::op::sirius_physical_right_delim_join>(op.types,
-                                                      std::move(plan),
-                                                      delim_scans,
-                                                      op.estimated_cardinality,
-                                                      duckdb::optional_idx(this->delim_index));
+    delim_join = duckdb::make_uniq<sirius::op::sirius_physical_right_delim_join>(
+      op.types,
+      std::move(plan),
+      delim_scans,
+      op.estimated_cardinality,
+      duckdb::optional_idx(this->delim_index));
   } else {
-    delim_join = duckdb::make_uniq<sirius::op::sirius_physical_left_delim_join>(op.types,
-                                                     std::move(plan),
-                                                     delim_scans,
-                                                     op.estimated_cardinality,
-                                                     duckdb::optional_idx(this->delim_index));
+    delim_join = duckdb::make_uniq<sirius::op::sirius_physical_left_delim_join>(
+      op.types,
+      std::move(plan),
+      delim_scans,
+      op.estimated_cardinality,
+      duckdb::optional_idx(this->delim_index));
   }
   // we still have to create the DISTINCT clause that is used to generate the duplicate eliminated
   // chunk
-  delim_join->distinct = duckdb::make_uniq<sirius::op::sirius_physical_grouped_aggregate>(context,
-                                                                delim_types,
-                                                                std::move(distinct_expressions),
-                                                                std::move(distinct_groups),
-                                                                op.estimated_cardinality);
+  delim_join->distinct = duckdb::make_uniq<sirius::op::sirius_physical_grouped_aggregate>(
+    context,
+    delim_types,
+    std::move(distinct_expressions),
+    std::move(distinct_groups),
+    op.estimated_cardinality);
 
   return std::move(delim_join);
 }

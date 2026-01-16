@@ -15,23 +15,25 @@
  */
 
 #include "duckdb/planner/operator/logical_top_n.hpp"
-#include "planner/sirius_physical_plan_generator.hpp"
 #include "op/sirius_physical_top_n.hpp"
+#include "planner/sirius_physical_plan_generator.hpp"
 
 namespace sirius::planner {
 
-duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_generator::create_plan(duckdb::LogicalTopN& op)
+duckdb::unique_ptr<sirius::op::sirius_physical_operator>
+sirius_physical_plan_generator::create_plan(duckdb::LogicalTopN& op)
 {
   D_ASSERT(op.children.size() == 1);
 
   auto plan = create_plan(*op.children[0]);
 
-  auto top_n = duckdb::make_uniq<sirius::op::sirius_physical_top_n>(op.types,
-                                          std::move(op.orders),
-                                          duckdb::NumericCast<duckdb::idx_t>(op.limit),
-                                          duckdb::NumericCast<duckdb::idx_t>(op.offset),
-                                          std::move(op.dynamic_filter),
-                                          op.estimated_cardinality);
+  auto top_n = duckdb::make_uniq<sirius::op::sirius_physical_top_n>(
+    op.types,
+    std::move(op.orders),
+    duckdb::NumericCast<duckdb::idx_t>(op.limit),
+    duckdb::NumericCast<duckdb::idx_t>(op.offset),
+    std::move(op.dynamic_filter),
+    op.estimated_cardinality);
   top_n->children.push_back(std::move(plan));
   return std::move(top_n);
 }

@@ -15,7 +15,7 @@
  */
 
 // sirius
-#include <scan/duckdb_scan_executor.hpp>
+#include <op/scan/duckdb_scan_executor.hpp>
 
 // standard library
 #include <mutex>

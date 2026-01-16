@@ -22,7 +22,8 @@
 
 namespace sirius::planner {
 
-duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_generator::create_plan(duckdb::LogicalOrder& op)
+duckdb::unique_ptr<sirius::op::sirius_physical_operator>
+sirius_physical_plan_generator::create_plan(duckdb::LogicalOrder& op)
 {
   D_ASSERT(op.children.size() == 1);
 

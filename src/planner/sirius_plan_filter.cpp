@@ -24,12 +24,13 @@
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "op/sirius_physical_filter.hpp"
-#include "planner/sirius_physical_plan_generator.hpp"
 #include "op/sirius_physical_projection.hpp"
+#include "planner/sirius_physical_plan_generator.hpp"
 
 namespace sirius::planner {
 
-duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_generator::create_plan(duckdb::LogicalFilter& op)
+duckdb::unique_ptr<sirius::op::sirius_physical_operator>
+sirius_physical_plan_generator::create_plan(duckdb::LogicalFilter& op)
 {
   D_ASSERT(op.children.size() == 1);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan = create_plan(*op.children[0]);
@@ -45,10 +46,11 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_ge
     // there is a projection map, generate a physical projection
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> select_list;
     for (duckdb::idx_t i = 0; i < op.projection_map.size(); i++) {
-      select_list.push_back(duckdb::make_uniq<duckdb::BoundReferenceExpression>(op.types[i], op.projection_map[i]));
+      select_list.push_back(
+        duckdb::make_uniq<duckdb::BoundReferenceExpression>(op.types[i], op.projection_map[i]));
     }
-    auto proj =
-      duckdb::make_uniq<sirius::op::sirius_physical_projection>(op.types, std::move(select_list), op.estimated_cardinality);
+    auto proj = duckdb::make_uniq<sirius::op::sirius_physical_projection>(
+      op.types, std::move(select_list), op.estimated_cardinality);
     proj->children.push_back(std::move(plan));
     plan = std::move(proj);
   }

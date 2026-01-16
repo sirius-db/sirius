@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "operator/order/gpu_order_impl.hpp"
+#include "op/order/gpu_order_impl.hpp"
 
 #include "data/data_batch_utils.hpp"
 

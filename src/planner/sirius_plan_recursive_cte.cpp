@@ -31,7 +31,8 @@
 
 namespace sirius::planner {
 
-duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_generator::create_plan(duckdb::LogicalCTERef& op)
+duckdb::unique_ptr<sirius::op::sirius_physical_operator>
+sirius_physical_plan_generator::create_plan(duckdb::LogicalCTERef& op)
 {
   D_ASSERT(op.children.empty());
 
@@ -42,7 +43,10 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_ge
   // If this check fails, this is a reference to a materialized recursive CTE.
   if (materialized_cte != materialized_ctes.end()) {
     auto chunk_scan = duckdb::make_uniq<sirius::op::sirius_physical_column_data_scan>(
-      op.chunk_types, duckdb::PhysicalOperatorType::CTE_SCAN, op.estimated_cardinality, op.cte_index);
+      op.chunk_types,
+      duckdb::PhysicalOperatorType::CTE_SCAN,
+      op.estimated_cardinality,
+      op.cte_index);
 
     auto cte = recursive_cte_tables.find(op.cte_index);
     if (cte == recursive_cte_tables.end()) {
@@ -74,17 +78,19 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_ge
   if (op.is_recurring) {
     cte = recurring_cte_tables.find(op.cte_index);
     if (cte == recurring_cte_tables.end()) {
-      throw duckdb::InvalidInputException("RECURRING can only be used with USING KEY in recursive CTE.");
+      throw duckdb::InvalidInputException(
+        "RECURRING can only be used with USING KEY in recursive CTE.");
     }
   }
 
   auto& types     = cte->second.get()->Types();
   auto op_type    = op.is_recurring ? duckdb::PhysicalOperatorType::RECURSIVE_RECURRING_CTE_SCAN
                                     : duckdb::PhysicalOperatorType::RECURSIVE_CTE_SCAN;
-  auto chunk_scan = duckdb::make_uniq<sirius::op::sirius_physical_column_data_scan>(cte->second.get()->Types(),
-                                                         duckdb::PhysicalOperatorType::RECURSIVE_CTE_SCAN,
-                                                         op.estimated_cardinality,
-                                                         op.cte_index);
+  auto chunk_scan = duckdb::make_uniq<sirius::op::sirius_physical_column_data_scan>(
+    cte->second.get()->Types(),
+    duckdb::PhysicalOperatorType::RECURSIVE_CTE_SCAN,
+    op.estimated_cardinality,
+    op.cte_index);
 
   chunk_scan->collection = cte->second.get();
   return std::move(chunk_scan);

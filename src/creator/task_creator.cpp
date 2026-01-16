@@ -16,8 +16,8 @@
 
 #include "creator/task_creator.hpp"
 
+#include "op/scan/duckdb_scan_task.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
-#include "scan/duckdb_scan_task.hpp"
 
 #include <duckdb/parallel/thread_context.hpp>
 
@@ -78,7 +78,8 @@ task_creator::task_creator(size_t num_threads,
 {
   _task_creation_queue = std::make_unique<task_creation_queue>(num_threads);
   for (size_t i = 0; i < sirius_pipeline_map._vec.size(); ++i) {
-    if (sirius_pipeline_map._vec[i]->get_source()->type == ::duckdb::PhysicalOperatorType::TABLE_SCAN) {
+    if (sirius_pipeline_map._vec[i]->get_source()->type ==
+        ::duckdb::PhysicalOperatorType::TABLE_SCAN) {
       priority_scans.push(sirius_pipeline_map._vec[i]);
     }
   }
@@ -101,7 +102,7 @@ void task_creator::process_next_task(op::sirius_physical_operator* node)
   } else {
     if (!priority_scans.empty()) {
       duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline = priority_scans.front();
-      auto* scan_node                                      = pipeline->get_source().get();
+      auto* scan_node                                        = pipeline->get_source().get();
       schedule(std::make_unique<task_creation_info>(scan_node, pipeline));
       priority_scans.pop();
     }
@@ -113,7 +114,7 @@ void task_creator::start()
   start_thread_pool();
   while (!priority_scans.empty()) {
     duckdb::shared_ptr<sirius::pipeline::sirius_pipeline> pipeline = priority_scans.front();
-    auto* scan_node                                      = pipeline->get_source().get();
+    auto* scan_node                                                = pipeline->get_source().get();
     schedule(std::make_unique<task_creation_info>(scan_node, pipeline));
     priority_scans.pop();
   }

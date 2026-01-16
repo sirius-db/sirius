@@ -18,8 +18,8 @@
 
 #include "config.hpp"
 #include "creator/task_completion.hpp"
-#include "pipeline/sirius_pipeline.hpp"
 #include "parallel/task_executor.hpp"
+#include "pipeline/sirius_pipeline.hpp"
 
 #include <data/data_batch.hpp>
 #include <data/data_repository.hpp>
@@ -52,8 +52,7 @@ class gpu_pipeline_task_global_state : public sirius::parallel::itask_global_sta
     : _pipeline(std::move(pipeline))
   {
   }
-  duckdb::shared_ptr<sirius_pipeline>
-    _pipeline;  ///< Shared pointer to the GPU pipeline to execute
+  duckdb::shared_ptr<sirius_pipeline> _pipeline;  ///< Shared pointer to the GPU pipeline to execute
 };
 
 /**

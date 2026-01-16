@@ -30,14 +30,16 @@
 
 namespace sirius::planner {
 
-sirius_physical_plan_generator::sirius_physical_plan_generator(duckdb::ClientContext& context, duckdb::GPUContext& gpu_context)
+sirius_physical_plan_generator::sirius_physical_plan_generator(duckdb::ClientContext& context,
+                                                               duckdb::GPUContext& gpu_context)
   : context(context), gpu_context(gpu_context)
 {
 }
 
 sirius_physical_plan_generator::~sirius_physical_plan_generator() {}
 
-duckdb::OrderPreservationType sirius_physical_plan_generator::order_preservation_recursive(sirius::op::sirius_physical_operator& op)
+duckdb::OrderPreservationType sirius_physical_plan_generator::order_preservation_recursive(
+  sirius::op::sirius_physical_operator& op)
 {
   if (op.is_source()) { return op.source_order(); }
 
@@ -49,14 +51,16 @@ duckdb::OrderPreservationType sirius_physical_plan_generator::order_preservation
       continue;
     }
     auto child_preservation = order_preservation_recursive(*child);
-    if (child_preservation != duckdb::OrderPreservationType::INSERTION_ORDER) { return child_preservation; }
+    if (child_preservation != duckdb::OrderPreservationType::INSERTION_ORDER) {
+      return child_preservation;
+    }
     child_idx++;
   }
   return duckdb::OrderPreservationType::INSERTION_ORDER;
 }
 
-bool sirius_physical_plan_generator::preserve_insertion_order(duckdb::ClientContext& context,
-                                                              sirius::op::sirius_physical_operator& plan)
+bool sirius_physical_plan_generator::preserve_insertion_order(
+  duckdb::ClientContext& context, sirius::op::sirius_physical_operator& plan)
 {
   auto preservation_type = order_preservation_recursive(plan);
   if (preservation_type == duckdb::OrderPreservationType::FIXED_ORDER) {
@@ -75,12 +79,14 @@ bool sirius_physical_plan_generator::preserve_insertion_order(duckdb::ClientCont
   return true;
 }
 
-bool sirius_physical_plan_generator::preserve_insertion_order(sirius::op::sirius_physical_operator& plan)
+bool sirius_physical_plan_generator::preserve_insertion_order(
+  sirius::op::sirius_physical_operator& plan)
 {
   return preserve_insertion_order(context, plan);
 }
 
-duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOperator> op)
+duckdb::unique_ptr<sirius::op::sirius_physical_operator>
+sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOperator> op)
 {
   auto& profiler = duckdb::QueryProfiler::Get(context);
 
@@ -104,20 +110,25 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_ge
   return plan;
 }
 
-duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_generator::create_plan(duckdb::LogicalOperator& op)
+duckdb::unique_ptr<sirius::op::sirius_physical_operator>
+sirius_physical_plan_generator::create_plan(duckdb::LogicalOperator& op)
 {
-  op.estimated_cardinality             = op.EstimateCardinality(context);
+  op.estimated_cardinality                                      = op.EstimateCardinality(context);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan = nullptr;
 
   switch (op.type) {
-    case duckdb::LogicalOperatorType::LOGICAL_GET: plan = create_plan(op.Cast<duckdb::LogicalGet>()); break;
+    case duckdb::LogicalOperatorType::LOGICAL_GET:
+      plan = create_plan(op.Cast<duckdb::LogicalGet>());
+      break;
     case duckdb::LogicalOperatorType::LOGICAL_PROJECTION:
       plan = create_plan(op.Cast<duckdb::LogicalProjection>());
       break;
     case duckdb::LogicalOperatorType::LOGICAL_EMPTY_RESULT:
       plan = create_plan(op.Cast<duckdb::LogicalEmptyResult>());
       break;
-    case duckdb::LogicalOperatorType::LOGICAL_FILTER: plan = create_plan(op.Cast<duckdb::LogicalFilter>()); break;
+    case duckdb::LogicalOperatorType::LOGICAL_FILTER:
+      plan = create_plan(op.Cast<duckdb::LogicalFilter>());
+      break;
     case duckdb::LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
       plan = create_plan(op.Cast<duckdb::LogicalAggregate>());
       break;
@@ -129,13 +140,19 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_ge
       throw duckdb::NotImplementedException("Unnest not supported");
       // plan = create_plan(op.Cast<duckdb::LogicalUnnest>());
       break;
-    case duckdb::LogicalOperatorType::LOGICAL_LIMIT: plan = create_plan(op.Cast<duckdb::LogicalLimit>()); break;
+    case duckdb::LogicalOperatorType::LOGICAL_LIMIT:
+      plan = create_plan(op.Cast<duckdb::LogicalLimit>());
+      break;
     case duckdb::LogicalOperatorType::LOGICAL_SAMPLE:
       throw duckdb::NotImplementedException("Sample not supported");
       // plan = create_plan(op.Cast<duckdb::LogicalSample>());
       break;
-    case duckdb::LogicalOperatorType::LOGICAL_ORDER_BY: plan = create_plan(op.Cast<duckdb::LogicalOrder>()); break;
-    case duckdb::LogicalOperatorType::LOGICAL_TOP_N: plan = create_plan(op.Cast<duckdb::LogicalTopN>()); break;
+    case duckdb::LogicalOperatorType::LOGICAL_ORDER_BY:
+      plan = create_plan(op.Cast<duckdb::LogicalOrder>());
+      break;
+    case duckdb::LogicalOperatorType::LOGICAL_TOP_N:
+      plan = create_plan(op.Cast<duckdb::LogicalTopN>());
+      break;
     case duckdb::LogicalOperatorType::LOGICAL_COPY_TO_FILE:
       throw duckdb::NotImplementedException("Copy to file not supported");
       // plan = create_plan(op.Cast<duckdb::LogicalCopyToFile>());
@@ -249,7 +266,9 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_ge
     case duckdb::LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
       plan = create_plan(op.Cast<duckdb::LogicalMaterializedCTE>());
       break;
-    case duckdb::LogicalOperatorType::LOGICAL_CTE_REF: plan = create_plan(op.Cast<duckdb::LogicalCTERef>()); break;
+    case duckdb::LogicalOperatorType::LOGICAL_CTE_REF:
+      plan = create_plan(op.Cast<duckdb::LogicalCTERef>());
+      break;
     case duckdb::LogicalOperatorType::LOGICAL_EXPORT:
       throw duckdb::NotImplementedException("Export not supported");
       // plan = create_plan(op.Cast<duckdb::LogicalExport>());
@@ -279,7 +298,8 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_ge
       // plan = op.Cast<duckdb::LogicalExtensionOperator>().create_plan(context, *this);
 
       // if (!plan) {
-      // 	throw duckdb::InternalException("Missing sirius_physical_operator for Extension Operator");
+      // 	throw duckdb::InternalException("Missing sirius_physical_operator for Extension
+      // Operator");
       // }
       break;
     case duckdb::LogicalOperatorType::LOGICAL_JOIN:

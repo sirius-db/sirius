@@ -22,15 +22,17 @@
 
 namespace sirius::planner {
 
-duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_generator::create_plan(duckdb::LogicalColumnDataGet& op)
+duckdb::unique_ptr<sirius::op::sirius_physical_operator>
+sirius_physical_plan_generator::create_plan(duckdb::LogicalColumnDataGet& op)
 {
   D_ASSERT(op.children.size() == 0);
   D_ASSERT(op.collection);
 
-  return duckdb::make_uniq<sirius::op::sirius_physical_column_data_scan>(op.types,
-                                              duckdb::PhysicalOperatorType::COLUMN_DATA_SCAN,
-                                              op.estimated_cardinality,
-                                              std::move(op.collection));
+  return duckdb::make_uniq<sirius::op::sirius_physical_column_data_scan>(
+    op.types,
+    duckdb::PhysicalOperatorType::COLUMN_DATA_SCAN,
+    op.estimated_cardinality,
+    std::move(op.collection));
 }
 
 }  // namespace sirius::planner

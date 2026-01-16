@@ -103,7 +103,6 @@ class sirius_physical_nested_loop_join : public sirius_physical_operator {
  public:
   //! Returns a list of the types of the join conditions
   duckdb::vector<duckdb::LogicalType> get_join_types() const;
-
 };
 
 }  // namespace op

@@ -19,15 +19,15 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "op/sirius_physical_filter.hpp"
-#include "planner/sirius_physical_plan_generator.hpp"
 #include "op/sirius_physical_projection.hpp"
 #include "op/sirius_physical_table_scan.hpp"
+#include "planner/sirius_physical_plan_generator.hpp"
 // #include "duckdb/common/types.hpp"
 
 namespace sirius::planner {
 
-duckdb::unique_ptr<duckdb::TableFilterSet> create_table_filter_set(duckdb::TableFilterSet& table_filters,
-                                                   const duckdb::vector<duckdb::ColumnIndex>& column_ids)
+duckdb::unique_ptr<duckdb::TableFilterSet> create_table_filter_set(
+  duckdb::TableFilterSet& table_filters, const duckdb::vector<duckdb::ColumnIndex>& column_ids)
 {
   // create the table filter map
   auto table_filter_set = duckdb::make_uniq<duckdb::TableFilterSet>();
@@ -48,13 +48,14 @@ duckdb::unique_ptr<duckdb::TableFilterSet> create_table_filter_set(duckdb::Table
   return table_filter_set;
 }
 
-duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
+duckdb::unique_ptr<sirius::op::sirius_physical_operator>
+sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
 {
   auto column_ids = op.GetColumnIds();
   if (!op.children.empty()) {
     throw duckdb::NotImplementedException("Table Input Output functions are not supported yet");
-    // duckdb::reference<sirius::op::sirius_physical_operator> child = ResolveAndPlan(std::move(op.children[0]));
-    // auto &child_types = child.get().types;
+    // duckdb::reference<sirius::op::sirius_physical_operator> child =
+    // ResolveAndPlan(std::move(op.children[0])); auto &child_types = child.get().types;
 
     // // this is for table producing functions that consume subquery results
     // // push a projection node with casts if required
@@ -68,24 +69,22 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_ge
     // duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions;
     // bool any_cast_required = false;
     // for (duckdb::idx_t proj_idx = 0; proj_idx < child_types.size(); proj_idx++) {
-    // 	auto ref = duckdb::make_uniq<duckdb::BoundReferenceExpression>(child_types[proj_idx], proj_idx);
-    // 	auto &target_type =
-    // 	    proj_idx < op.input_table_types.size() ? op.input_table_types[proj_idx] :
-    // child_types[proj_idx]; 	if (child_types[proj_idx] != target_type) {
+    // 	auto ref = duckdb::make_uniq<duckdb::BoundReferenceExpression>(child_types[proj_idx],
+    // proj_idx); 	auto &target_type = 	    proj_idx < op.input_table_types.size() ?
+    // op.input_table_types[proj_idx] : child_types[proj_idx]; 	if (child_types[proj_idx] !=
+    // target_type) {
     // 		// cast is required - push a cast
     // 		any_cast_required = true;
-    // 		auto cast = duckdb::BoundCastExpression::AddCastToType(context, std::move(ref), target_type);
-    // 		expressions.push_back(std::move(cast));
-    // 	} else {
+    // 		auto cast = duckdb::BoundCastExpression::AddCastToType(context, std::move(ref),
+    // target_type); 		expressions.push_back(std::move(cast)); 	} else {
     // 		expressions.push_back(std::move(ref));
     // 	}
     // 	return_types.push_back(target_type);
     // }
 
     // if (any_cast_required) {
-    // 	auto &proj = Make<sirius::op::sirius_physical_operator>(std::move(return_types), std::move(expressions),
-    // 	                                      child.get().estimated_cardinality);
-    // 	proj.children.push_back(child);
+    // 	auto &proj = Make<sirius::op::sirius_physical_operator>(std::move(return_types),
+    // std::move(expressions), 	                                      child.get().estimated_cardinality); 	proj.children.push_back(child);
     // 	child = proj;
     // }
 
@@ -101,7 +100,8 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_ge
   }
 
   if (!op.projected_input.empty()) {
-    throw duckdb::InternalException("LogicalGet::project_input can only be set for table-in-out functions");
+    throw duckdb::InternalException(
+      "LogicalGet::project_input can only be set for table-in-out functions");
   }
 
   duckdb::unique_ptr<duckdb::TableFilterSet> table_filters;
@@ -123,7 +123,7 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_ge
       auto& type     = op.returned_types[column_id];
       if (!op.function.supports_pushdown_type(*op.bind_data, column_id)) {
         duckdb::idx_t column_id_filter = entry.first;
-        bool found_projection  = false;
+        bool found_projection          = false;
         for (duckdb::idx_t i = 0; i < projection_ids.size(); i++) {
           if (column_ids[projection_ids[i]] == column_ids[entry.first]) {
             column_id_filter = i;
@@ -160,21 +160,23 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_ge
     // function does not support projection pushdown
     // auto &table_scan = Make<sirius::op::sirius_physical_table_scan>(
     //     op.returned_types, op.function, std::move(op.bind_data), op.returned_types, column_ids,
-    //     duckdb::vector<duckdb::column_t>(), op.names, std::move(table_filters), op.estimated_cardinality,
-    //     std::move(op.extra_info), std::move(op.parameters), std::move(op.virtual_columns));
+    //     duckdb::vector<duckdb::column_t>(), op.names, std::move(table_filters),
+    //     op.estimated_cardinality, std::move(op.extra_info), std::move(op.parameters),
+    //     std::move(op.virtual_columns));
 
-    auto node = duckdb::make_uniq<sirius::op::sirius_physical_table_scan>(op.returned_types,
-                                                op.function,
-                                                std::move(op.bind_data),
-                                                op.returned_types,
-                                                column_ids,
-                                                duckdb::vector<duckdb::column_t>(),
-                                                op.names,
-                                                std::move(table_filters),
-                                                op.estimated_cardinality,
-                                                std::move(op.extra_info),
-                                                std::move(op.parameters),
-                                                std::move(op.virtual_columns));
+    auto node =
+      duckdb::make_uniq<sirius::op::sirius_physical_table_scan>(op.returned_types,
+                                                                op.function,
+                                                                std::move(op.bind_data),
+                                                                op.returned_types,
+                                                                column_ids,
+                                                                duckdb::vector<duckdb::column_t>(),
+                                                                op.names,
+                                                                std::move(table_filters),
+                                                                op.estimated_cardinality,
+                                                                std::move(op.extra_info),
+                                                                std::move(op.parameters),
+                                                                std::move(op.virtual_columns));
     // first check if an additional projection is necessary
     if (column_ids.size() == op.returned_types.size()) {
       bool projection_necessary = false;
@@ -207,8 +209,9 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_ge
         expressions.push_back(duckdb::make_uniq<duckdb::BoundReferenceExpression>(type, col_id));
       }
     }
-    duckdb::unique_ptr<sirius::op::sirius_physical_projection> projection = duckdb::make_uniq<sirius::op::sirius_physical_projection>(
-      std::move(types), std::move(expressions), op.estimated_cardinality);
+    duckdb::unique_ptr<sirius::op::sirius_physical_projection> projection =
+      duckdb::make_uniq<sirius::op::sirius_physical_projection>(
+        std::move(types), std::move(expressions), op.estimated_cardinality);
     if (filter) {
       filter->children.push_back(std::move(node));
       projection->children.push_back(std::move(filter));
@@ -218,18 +221,19 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_ge
     return std::move(projection);
   }
 
-  auto node             = duckdb::make_uniq<sirius::op::sirius_physical_table_scan>(op.types,
-                                              op.function,
-                                              std::move(op.bind_data),
-                                              op.returned_types,
-                                              column_ids,
-                                              op.projection_ids,
-                                              op.names,
-                                              std::move(table_filters),
-                                              op.estimated_cardinality,
-                                              std::move(op.extra_info),
-                                              std::move(op.parameters),
-                                              std::move(op.virtual_columns));
+  auto node =
+    duckdb::make_uniq<sirius::op::sirius_physical_table_scan>(op.types,
+                                                              op.function,
+                                                              std::move(op.bind_data),
+                                                              op.returned_types,
+                                                              column_ids,
+                                                              op.projection_ids,
+                                                              op.names,
+                                                              std::move(table_filters),
+                                                              op.estimated_cardinality,
+                                                              std::move(op.extra_info),
+                                                              std::move(op.parameters),
+                                                              std::move(op.virtual_columns));
   node->dynamic_filters = op.dynamic_filters;
   if (filter) {
     filter->children.push_back(std::move(node));

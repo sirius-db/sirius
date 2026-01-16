@@ -17,13 +17,13 @@
 #pragma once
 
 #include "duckdb/main/client_context.hpp"
-#include "op/sirius_physical_operator.hpp"
-#include "pipeline/sirius_pipeline.hpp"
-#include "sirius_pipeline_hashmap.hpp"
 #include "helper/helper.hpp"
-#include "operator/scan/duckdb_scan_executor.hpp"
+#include "op/scan/duckdb_scan_executor.hpp"
+#include "op/sirius_physical_operator.hpp"
 #include "parallel/task_executor.hpp"
 #include "pipeline/pipeline_executor.hpp"
+#include "pipeline/sirius_pipeline.hpp"
+#include "sirius_pipeline_hashmap.hpp"
 
 #include <blockingconcurrentqueue.h>
 #include <data/data_batch.hpp>

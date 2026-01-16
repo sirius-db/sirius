@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "operator/aggregate/gpu_aggregate_impl.hpp"
+#include "op/aggregate/gpu_aggregate_impl.hpp"
 
 #include "data/data_batch_utils.hpp"
 

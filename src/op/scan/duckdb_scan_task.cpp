@@ -18,7 +18,7 @@
 #include <helper/utils.hpp>
 #include <memory/memory_reservation.hpp>
 #include <memory/sirius_memory_manager.hpp>
-#include <scan/duckdb_scan_task.hpp>
+#include <op/scan/duckdb_scan_task.hpp>
 
 // duckdb
 #include <duckdb/common/types.hpp>
@@ -75,7 +75,9 @@ duckdb_scan_task_local_state::column_builder::column_builder(duckdb::LogicalType
 }
 
 void duckdb_scan_task_local_state::column_builder::initialize_accessors(
-  size_t estimated_num_rows, size_t byte_offset, std::unique_ptr<multiple_blocks_allocation>& allocation)
+  size_t estimated_num_rows,
+  size_t byte_offset,
+  std::unique_ptr<multiple_blocks_allocation>& allocation)
 {
   assert(allocation != nullptr);
   assert(!allocation->get_blocks().empty());

@@ -22,10 +22,12 @@
 
 namespace sirius::planner {
 
-duckdb::unique_ptr<sirius::op::sirius_physical_operator> sirius_physical_plan_generator::create_plan(duckdb::LogicalDummyScan& op)
+duckdb::unique_ptr<sirius::op::sirius_physical_operator>
+sirius_physical_plan_generator::create_plan(duckdb::LogicalDummyScan& op)
 {
   D_ASSERT(op.children.size() == 0);
-  return duckdb::make_uniq<sirius::op::sirius_physical_dummy_scan>(op.types, op.estimated_cardinality);
+  return duckdb::make_uniq<sirius::op::sirius_physical_dummy_scan>(op.types,
+                                                                   op.estimated_cardinality);
 }
 
 }  // namespace sirius::planner
