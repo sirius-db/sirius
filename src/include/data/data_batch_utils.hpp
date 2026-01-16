@@ -87,35 +87,4 @@ inline std::shared_ptr<cucascade::data_batch> make_data_batch(
   return std::make_shared<cucascade::data_batch>(get_next_batch_id(), std::move(gpu_repr));
 }
 
-/**
- * @brief Acquire a processing handle for a single data batch.
- *
- * @param batch The data batch to lock for processing.
- * @return std::optional<cucascade::data_batch_processing_handle>
- *         Handle if lock acquired, empty optional otherwise.
- */
-inline std::optional<cucascade::data_batch_processing_handle> acquire_processing_handle(
-  const std::shared_ptr<cucascade::data_batch>& batch)
-{
-  auto* mem_space = batch->get_memory_space();
-  if (mem_space == nullptr) { return std::nullopt; }
-
-  bool created_task = false;
-  auto lock_result  = batch->try_to_lock_for_processing(mem_space->get_id());
-
-  if (!lock_result.success &&
-      lock_result.status == cucascade::lock_for_processing_status::task_not_created) {
-    created_task = batch->try_to_create_task();
-    if (!created_task) { return std::nullopt; }
-    lock_result = batch->try_to_lock_for_processing(mem_space->get_id());
-  }
-
-  if (!lock_result.success) {
-    if (created_task) { batch->try_to_cancel_task(); }
-    return std::nullopt;
-  }
-
-  return std::move(lock_result.handle);
-}
-
 }  // namespace sirius
