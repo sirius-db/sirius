@@ -16,4 +16,4 @@
 	branch = main
 [submodule "duckdb-python"]
 	path = duckdb-python
-	url = git@github.com:duckdb/duckdb-python.git
+	url = https://github.com/duckdb/duckdb-python.git
