@@ -174,7 +174,7 @@ sirius_physical_operator::port* sirius_physical_operator::get_port(std::string_v
 ::std::vector<::std::shared_ptr<::cucascade::data_batch>> sirius_physical_operator::sink_execute(
   const ::std::vector<::std::shared_ptr<::cucascade::data_batch>>& input_batches)
 {
-  // submit data batches to the repositories of the next operators
+  // submit data batches to the repositories of the next operators :test change
   // check if the pipeline is finished
   // if (!creator) {
   //   throw duckdb::InternalException("sirius_physical_operator creator is null in sink_execute for
@@ -254,8 +254,8 @@ std::vector<::std::shared_ptr<::cucascade::data_batch>> sirius_physical_operator
   for (auto& [port_name, port_ptr] : ports) {
     // For Pipeline barrier: need at least one data batch in the port's repository
     // TODO: later on we will adjust to the new data repository interface in cuCascade
-    auto batch_and_handle = port_ptr->repo->pull_data_batch();
-    input_batch.push_back(std::move(batch_and_handle.first));
+    auto batch = port_ptr->repo->pull_data_batch(::cucascade::batch_state::task_created);
+    if (batch) { input_batch.push_back(std::move(batch)); }
   }
   if (input_batch.empty()) { return std::vector<::std::shared_ptr<::cucascade::data_batch>>{}; }
   return input_batch;
