@@ -56,9 +56,6 @@ class sirius_physical_delim_join : public sirius_physical_operator {
   // std::vector<duckdb::const_reference<sirius_physical_operator>> get_children() const override;
 
   bool is_sink() const override { return true; }
-  // bool parallel_sink() const override {
-  // 	return true;
-  // }
 
   duckdb::OrderPreservationType source_order() const override
   {
@@ -66,7 +63,6 @@ class sirius_physical_delim_join : public sirius_physical_operator {
   }
   bool sink_order_dependent() const override { return false; }
 
-  // InsertionOrderPreservingMap<std::string> params_to_string() const override;
 };
 
 //! sirius_physical_right_delim_join represents a join where the RHS will be duplicate eliminated

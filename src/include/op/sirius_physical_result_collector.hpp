@@ -68,13 +68,6 @@ class sirius_physical_materialized_collector : public sirius_physical_result_col
 
  public:
   duckdb::unique_ptr<duckdb::QueryResult> get_result(duckdb::GlobalSinkState& state) override;
-
- public:
-  // Sink interface
-  duckdb::unique_ptr<duckdb::LocalSinkState> get_local_sink_state(
-    duckdb::ExecutionContext& context) const override;
-  duckdb::unique_ptr<duckdb::GlobalSinkState> get_global_sink_state(
-    duckdb::ClientContext& context) const override;
 };
 
 }  // namespace op

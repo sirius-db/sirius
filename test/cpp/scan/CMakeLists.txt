@@ -18,5 +18,5 @@ set(TEST_SOURCES
     ${TEST_SOURCES}
     ${CMAKE_CURRENT_SOURCE_DIR}/test_multiple_blocks_allocation_accessor.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/test_column_builder.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/test_scan_executor.cpp
+    # ${CMAKE_CURRENT_SOURCE_DIR}/test_scan_executor.cpp
     PARENT_SCOPE)

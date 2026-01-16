@@ -36,7 +36,7 @@ class task_request_queue {
   void open();
   void close();
   void push(std::unique_ptr<task_request> request);
-  unique_ptr<task_request> pull();
+  std::unique_ptr<task_request> pull();
 
  private:
   size_t _num_threads;

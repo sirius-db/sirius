@@ -73,7 +73,6 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
  public:
   // Source interface
   bool is_source() const override { return true; }
-  bool parallel_source() const override { return true; }
 
   duckdb::OrderPreservationType source_order() const override
   {
@@ -83,8 +82,6 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
  public:
   // Sink interface
   bool is_sink() const override { return true; }
-
-  bool parallel_sink() const override { return true; }
 
   bool sink_order_dependent() const override { return false; }
 };

@@ -121,12 +121,6 @@ class sirius_physical_table_scan : public sirius_physical_operator {
 
  public:
   bool is_source() const override { return true; }
-  bool parallel_source() const override { return true; }
-
-  duckdb::unique_ptr<duckdb::LocalSourceState> get_local_source_state(
-    duckdb::ExecutionContext& context, duckdb::GlobalSourceState& gstate) const override;
-  duckdb::unique_ptr<duckdb::GlobalSourceState> get_global_source_state(
-    duckdb::ClientContext& context) const override;
 };
 
 }  // namespace op
