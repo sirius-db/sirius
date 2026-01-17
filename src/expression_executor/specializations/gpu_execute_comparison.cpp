@@ -24,8 +24,7 @@
 
 #include <memory>
 #include <type_traits>
-// BeforeCommit: remove this include
-#include <iostream>
+
 
 namespace duckdb {
 namespace sirius {
@@ -55,16 +54,10 @@ struct ComparisonDispatcher {
                                                    bool right_is_null,
                                                    const cudf::data_type& return_type)
   {
-    // BeforeCommit: remove this if statement
-    if (right_is_null) { std::cerr << "Right is null running" << std::endl; }
-
     if constexpr (std::is_same_v<T, std::string>) {
       // Create a string scalar from the constant value
       auto string_scalar = cudf::string_scalar(
         right_value, !right_is_null, executor.execution_stream, executor.resource_ref);
-
-      // BeforeCommit: remove this print
-      std::cerr << "Constant String Scalar: " << string_scalar.to_string() << std::endl;
 
       return cudf::binary_operation(left,
                                     string_scalar,
@@ -153,13 +146,6 @@ struct ComparisonDispatcher {
   std::unique_ptr<cudf::column> operator()(const BoundComparisonExpression& expr,
                                            GpuExpressionState* state)
   {
-   
-      spdlog::info("TypeA1:" + expr.right->return_type.ToString());
-      spdlog::info("TypeA2:" + expr.ToString());
-      spdlog::info("TypeA3:" + ExpressionClassToString(expr.right->GetExpressionClass()));
-      spdlog::info("TypeA4:" + ExpressionClassToString(expr.left->GetExpressionClass()));
-    
-
     auto return_type = GpuExpressionState::GetCudfType(expr.return_type);
 
     // Resolve the children 
@@ -180,10 +166,6 @@ struct ComparisonDispatcher {
     // If the right side is a constant, do not materialize in a column
     if (right_expr->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
       auto right_value = right_expr->Cast<BoundConstantExpression>().value;
-
-      // BeforeCommit: remove this print
-      spdlog::info("TypeB1:" + right_expr->return_type.ToString());
-      spdlog::info("TypeC1:" + right_value.ToString());
 
       switch (GpuExpressionState::GetCudfType(right_expr->return_type).id()) {
         case cudf::type_id::INT16:
@@ -284,9 +266,7 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundComparis
       return dispatcher(expr, state);
     }
     case ExpressionType::COMPARE_DISTINCT_FROM:
-      throw NotImplementedException(
-        "Execute[Comparison]: DISTINCT comparisons not yet "
-        "implemented!");
+      throw NotImplementedException("Execute[Comparison]: DISTINCT comparison not yet implemented!");
     case ExpressionType::COMPARE_NOT_DISTINCT_FROM: {
       ComparisonDispatcher<cudf::binary_operator::NULL_EQUALS> dispatcher(*this);
       return dispatcher(expr, state);
