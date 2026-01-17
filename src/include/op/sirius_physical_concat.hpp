@@ -1,0 +1,49 @@
+/*
+ * Copyright 2025, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include "duckdb/execution/physical_operator.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "op/sirius_physical_grouped_aggregate.hpp"
+#include "op/sirius_physical_hash_join.hpp"
+#include "op/sirius_physical_operator.hpp"
+#include "op/sirius_physical_order.hpp"
+#include "op/sirius_physical_top_n.hpp"
+
+namespace sirius {
+namespace op {
+
+class sirius_physical_concat : public sirius_physical_operator {
+ public:
+  static constexpr const duckdb::PhysicalOperatorType TYPE = duckdb::PhysicalOperatorType::INVALID;
+
+  explicit sirius_physical_concat(duckdb::vector<duckdb::LogicalType> types,
+                                  duckdb::idx_t estimated_cardinality);
+
+  std::string get_name() const override;
+
+  bool is_source() const override;
+
+  bool is_sink() const override;
+
+ private:
+  duckdb::vector<duckdb::idx_t> _partition_keys;
+  duckdb::idx_t _num_partitions;
+};
+
+}  // namespace op
+}  // namespace sirius

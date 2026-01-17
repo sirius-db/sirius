@@ -37,6 +37,9 @@ namespace duckdb {
 class GPUExecutor;
 class GPUPhysicalOperator;
 class GPUPipeline;
+}  // namespace duckdb
+
+namespace duckdb {
 class GPUPipelineBuildState;
 class GPUMetaPipeline;
 
@@ -98,8 +101,6 @@ class GPUPhysicalOperator {
 
   virtual OperatorResultType Execute(GPUIntermediateRelation& input_relation,
                                      GPUIntermediateRelation& output_relation) const;
-  virtual ::std::vector<::std::shared_ptr<::cucascade::data_batch>> execute(
-    const ::std::vector<::std::shared_ptr<::cucascade::data_batch>>& input_batches);
 
   virtual bool ParallelOperator() const { return false; }
 
@@ -176,25 +177,6 @@ class GPUPhysicalOperator {
     }
     return reinterpret_cast<const TARGET&>(*this);
   }
-
-  struct port {
-    MemoryBarrierType type;
-    ::cucascade::shared_data_repository* repo;
-    shared_ptr<GPUPipeline> src_pipeline;
-    bool src_pipeline_finished{false};
-  };
-
-  // source pipeline pushed to repo of the ports
-  void push_data_batch(std::string_view port_id, std::shared_ptr<::cucascade::data_batch> batch);
-  void add_port(std::string_view port_id, std::unique_ptr<port> p);
-  port* get_port(std::string_view port_id);
-  void add_next_port_after_sink(std::pair<GPUPhysicalOperator*, std::string_view> port_locator);
-  vector<std::pair<GPUPhysicalOperator*, std::string_view>>& get_next_port_after_sink();
-
- private:
-  std::unordered_map<std::string, std::unique_ptr<port>> ports;
-  //! The next operators to be executed after this operator when it is used as a sink
-  vector<std::pair<GPUPhysicalOperator*, std::string_view>> next_port_after_sink;
 };
 
 }  // namespace duckdb

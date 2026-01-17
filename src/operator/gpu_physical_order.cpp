@@ -45,10 +45,12 @@ void HandleOrderBy(vector<shared_ptr<GPUColumn>>& order_by_keys,
 GPUPhysicalOrder::GPUPhysicalOrder(vector<LogicalType> types,
                                    vector<BoundOrderByNode> orders,
                                    vector<idx_t> projections_p,
-                                   idx_t estimated_cardinality)
+                                   idx_t estimated_cardinality,
+                                   bool is_index_sort_p)
   : GPUPhysicalOperator(PhysicalOperatorType::ORDER_BY, std::move(types), estimated_cardinality),
     orders(std::move(orders)),
-    projections(std::move(projections_p))
+    projections(std::move(projections_p)),
+    is_index_sort(is_index_sort_p)
 {
   sort_result = make_shared_ptr<GPUIntermediateRelation>(projections.size());
   for (int col = 0; col < projections.size(); col++) {

@@ -117,7 +117,8 @@ void HandleAggregateExpressionCuDF(vector<shared_ptr<GPUColumn>>& aggregate_keys
 GPUPhysicalUngroupedAggregate::GPUPhysicalUngroupedAggregate(
   vector<LogicalType> types,
   vector<unique_ptr<Expression>> expressions,
-  idx_t estimated_cardinality)
+  idx_t estimated_cardinality,
+  TupleDataValidityType distinct_validity)
   : GPUPhysicalOperator(
       PhysicalOperatorType::UNGROUPED_AGGREGATE, std::move(types), estimated_cardinality),
     aggregates(std::move(expressions))
@@ -125,7 +126,7 @@ GPUPhysicalUngroupedAggregate::GPUPhysicalUngroupedAggregate(
   distinct_collection_info = DistinctAggregateCollectionInfo::Create(aggregates);
   aggregation_result       = make_shared_ptr<GPUIntermediateRelation>(aggregates.size());
   if (!distinct_collection_info) { return; }
-  distinct_data = make_uniq<DistinctAggregateData>(*distinct_collection_info);
+  distinct_data = make_uniq<DistinctAggregateData>(*distinct_collection_info, distinct_validity);
 }
 
 SinkResultType GPUPhysicalUngroupedAggregate::Sink(GPUIntermediateRelation& input_relation) const

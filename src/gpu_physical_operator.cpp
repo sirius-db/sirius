@@ -16,6 +16,7 @@
 
 #include "gpu_physical_operator.hpp"
 
+// #include "creator/task_creator.hpp"
 #include "gpu_executor.hpp"
 #include "gpu_meta_pipeline.hpp"
 #include "gpu_pipeline.hpp"
@@ -55,9 +56,6 @@ OperatorResultType GPUPhysicalOperator::Execute(GPUIntermediateRelation& input_r
 {
   throw InternalException("Calling Execute on a node that is not an operator!");
 }
-
-// TODO: Implement Execute for std::vector<std::unique_ptr<cucascade::data_batch_view>>
-// input_batch if needed.
 
 //===--------------------------------------------------------------------===//
 // Source
@@ -167,46 +165,6 @@ void GPUPhysicalOperator::Verify()
     child->Verify();
   }
 #endif
-}
-
-void GPUPhysicalOperator::add_port(std::string_view port_id, std::unique_ptr<port> p)
-{
-  ports[std::string(port_id)] = std::move(p);
-}
-
-GPUPhysicalOperator::port* GPUPhysicalOperator::get_port(std::string_view port_id)
-{
-  auto it = ports.find(std::string(port_id));
-  if (it == ports.end()) {
-    throw InternalException("Port " + std::string(port_id) + " not found in operator " + GetName());
-  }
-  return it->second.get();
-}
-
-::std::vector<::std::shared_ptr<::cucascade::data_batch>> GPUPhysicalOperator::execute(
-  const ::std::vector<::std::shared_ptr<::cucascade::data_batch>>& input_batches)
-{
-  // not doing anything for now
-  return ::std::vector<::std::shared_ptr<::cucascade::data_batch>>{};
-}
-
-void GPUPhysicalOperator::push_data_batch(std::string_view port_id,
-                                          std::shared_ptr<::cucascade::data_batch> batch)
-{
-  auto* p = get_port(port_id);
-  if (p && p->repo) { p->repo->add_data_batch(std::move(batch)); }
-}
-
-void GPUPhysicalOperator::add_next_port_after_sink(
-  std::pair<GPUPhysicalOperator*, std::string_view> port_locator)
-{
-  next_port_after_sink.push_back(port_locator);
-}
-
-vector<std::pair<GPUPhysicalOperator*, std::string_view>>&
-GPUPhysicalOperator::get_next_port_after_sink()
-{
-  return next_port_after_sink;
 }
 
 }  // namespace duckdb

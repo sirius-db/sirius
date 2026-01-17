@@ -14,14 +14,14 @@
  * limitations under the License.
  */
 
-#include "aggregate/gpu_aggregate_impl.hpp"
 #include "catch.hpp"
 #include "data/data_batch_utils.hpp"
 #include "data/gpu_data_representation.hpp"
 #include "memory/memory_space.hpp"
 #include "memory/sirius_memory_manager.hpp"
-#include "merge/gpu_merge_impl.hpp"
-#include "order/gpu_order_impl.hpp"
+#include "op/aggregate/gpu_aggregate_impl.hpp"
+#include "op/merge/gpu_merge_impl.hpp"
+#include "op/order/gpu_order_impl.hpp"
 #include "scan/test_utils.hpp"
 #include "utils/utils.hpp"
 
@@ -71,8 +71,10 @@ batches_with_handles create_batches_with_random_data(
     auto batch = sirius::make_data_batch(std::move(table), mem_space);
 
     // Acquire processing handle (like the old pin() call)
-    REQUIRE(batch->try_to_lock_for_processing());
-    result.handles.emplace_back(batch.get());
+    REQUIRE(batch->try_to_create_task());
+    auto lock_result = batch->try_to_lock_for_processing(mem_space.get_id());
+    REQUIRE(lock_result.success);
+    result.handles.emplace_back(std::move(lock_result.handle));
     result.batches.push_back(std::move(batch));
   }
   return result;
@@ -269,8 +271,10 @@ batches_with_handles create_batches_with_local_ungrouped_agg_result(
     auto batch = gpu_aggregate_impl::local_ungrouped_aggregate(
       base_input.batches[i], aggregates, aggregate_idx, cudf::get_default_stream(), mem_space);
     // Acquire processing handle for the output batch
-    REQUIRE(batch->try_to_lock_for_processing());
-    result.handles.emplace_back(batch.get());
+    REQUIRE(batch->try_to_create_task());
+    auto lock_result = batch->try_to_lock_for_processing(mem_space.get_id());
+    REQUIRE(lock_result.success);
+    result.handles.emplace_back(std::move(lock_result.handle));
     result.batches.push_back(std::move(batch));
   }
   // base_input.handles will release when going out of scope (base batches no longer needed)
@@ -511,8 +515,10 @@ batches_with_handles create_batches_with_local_grouped_agg_result(
                                                              aggregate_idx,
                                                              cudf::get_default_stream(),
                                                              mem_space);
-    REQUIRE(batch->try_to_lock_for_processing());
-    result.handles.emplace_back(batch.get());
+    REQUIRE(batch->try_to_create_task());
+    auto lock_result = batch->try_to_lock_for_processing(mem_space.get_id());
+    REQUIRE(lock_result.success);
+    result.handles.emplace_back(std::move(lock_result.handle));
     result.batches.push_back(std::move(batch));
   }
 
@@ -806,8 +812,10 @@ batches_with_handles create_batches_with_local_orderby_or_topn_result(
                                                     projections,
                                                     cudf::get_default_stream(),
                                                     mem_space);
-    REQUIRE(batch->try_to_lock_for_processing());
-    result.handles.emplace_back(batch.get());
+    REQUIRE(batch->try_to_create_task());
+    auto lock_result = batch->try_to_lock_for_processing(mem_space.get_id());
+    REQUIRE(lock_result.success);
+    result.handles.emplace_back(std::move(lock_result.handle));
     result.batches.push_back(std::move(batch));
   }
   return result;
