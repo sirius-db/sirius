@@ -32,41 +32,100 @@ statement ok
 CREATE TABLE issue_56
 (
     rowID INTEGER,
-    dataOne VARCHAR(20),
-    dataTwo VARCHAR(20)
+    dataStringOne VARCHAR(20),
+    dataStringTwo VARCHAR(20),
+    dataIntOne INTEGER,
+    dataIntTwo INTEGER
 );
 
 statement ok
-INSERT INTO issue_56 VALUES (1, NULL, NULL);
+INSERT INTO issue_56 VALUES (1, NULL, NULL, NULL, NULL);
 
 statement ok
-INSERT INTO issue_56 VALUES (2, 'ABC', 'ABC');
+INSERT INTO issue_56 VALUES (2, 'ABC', 'ABC', 100, 100);
 
 statement ok
-INSERT INTO issue_56 VALUES (3, 'ABC', 'DEF');
+INSERT INTO issue_56 VALUES (3, 'ABC', 'DEF', 100, 200);
 
 statement ok
-INSERT INTO issue_56 VALUES (4, 'ABC', NULL);
+INSERT INTO issue_56 VALUES (4, 'ABC', NULL, 100, NULL);
 
 statement ok
-INSERT INTO issue_56 VALUES (5, NULL, 'ABC');
+INSERT INTO issue_56 VALUES (5, NULL, 'ABC', NULL, 100);
 
-# Test IS NOT DISTINCT with data
+# Test IS NOT DISTINCT with string data
 query I
-call gpu_processing("SELECT rowID FROM issue_56 WHERE dataOne IS NOT DISTINCT FROM dataTwo;");
+call gpu_processing("SELECT rowID FROM issue_56 WHERE dataStringOne IS NOT DISTINCT FROM dataStringTwo;");
 ----
 1
 2
 
-# Test IS NOT DISTINCT with non-NULL constant
+# Test IS NOT DISTINCT with non-NULL constant string
 query I
-call gpu_processing("SELECT rowID FROM issue_56 WHERE 'DEF' IS NOT DISTINCT FROM dataTwo;");
+call gpu_processing("SELECT rowID FROM issue_56 WHERE 'DEF' IS NOT DISTINCT FROM dataStringTwo;");
 ----
 3
 
-# Test IS NOT DISTINCT with NULL
+# Test IS NOT DISTINCT with NULL compared to string
 query I
-call gpu_processing("SELECT rowID FROM issue_56 WHERE NULL IS NOT DISTINCT FROM dataTwo;");
+call gpu_processing("SELECT rowID FROM issue_56 WHERE NULL IS NOT DISTINCT FROM dataStringTwo;");
 ----
 1
 4
+
+# Test IS NOT DISTINCT with int data
+query I
+call gpu_processing("SELECT rowID FROM issue_56 WHERE dataIntOne IS NOT DISTINCT FROM dataIntTwo;");
+----
+1
+2
+
+# Test IS NOT DISTINCT with non-NULL constant int
+query I
+call gpu_processing("SELECT rowID FROM issue_56 WHERE 200 IS NOT DISTINCT FROM dataIntTwo;");
+----
+3
+
+# Test IS NOT DISTINCT with NULL compared to int
+query I
+call gpu_processing("SELECT rowID FROM issue_56 WHERE NULL IS NOT DISTINCT FROM dataIntTwo;");
+----
+1
+4
+
+
+
+# Test IS NOT DISTINCT with non-NULL constant string [constant on right]
+query I
+call gpu_processing("SELECT rowID FROM issue_56 WHERE dataStringTwo IS NOT DISTINCT FROM 'DEF';");
+----
+3
+
+# Test IS NOT DISTINCT with NULL compared to string [constant on right] 
+query I
+call gpu_processing("SELECT rowID FROM issue_56 WHERE dataStringTwo IS NOT DISTINCT FROM NULL;");
+----
+1
+4
+
+# Test IS NOT DISTINCT with int data
+query I
+call gpu_processing("SELECT rowID FROM issue_56 WHERE dataIntOne IS NOT DISTINCT FROM dataIntTwo;");
+----
+1
+2
+
+# Test IS NOT DISTINCT with non-NULL constant int [constant on right]
+query I
+call gpu_processing("SELECT rowID FROM issue_56 WHERE dataIntTwo IS NOT DISTINCT FROM 200;");
+----
+3
+
+# Test IS NOT DISTINCT with NULL compared to int [constant on right]
+query I
+call gpu_processing("SELECT rowID FROM issue_56 WHERE dataIntTwo IS NOT DISTINCT FROM NULL;");
+----
+1
+4
+
+#TODO: add decimal tests for issue 56

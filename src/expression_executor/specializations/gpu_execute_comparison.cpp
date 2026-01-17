@@ -24,6 +24,8 @@
 
 #include <memory>
 #include <type_traits>
+// BeforeCommit: remove this include
+#include <iostream>
 
 namespace duckdb {
 namespace sirius {
@@ -50,12 +52,20 @@ struct ComparisonDispatcher {
   template <typename T>
   std::unique_ptr<cudf::column> DoScalarComparison(const cudf::column_view& left,
                                                    const T& right_value,
+                                                   bool right_is_null,
                                                    const cudf::data_type& return_type)
   {
+    // BeforeCommit: remove this if statement
+    if (right_is_null) { std::cerr << "Right is null running" << std::endl; }
+
     if constexpr (std::is_same_v<T, std::string>) {
       // Create a string scalar from the constant value
-      auto string_scalar =
-        cudf::string_scalar(right_value, true, executor.execution_stream, executor.resource_ref);
+      auto string_scalar = cudf::string_scalar(
+        right_value, !right_is_null, executor.execution_stream, executor.resource_ref);
+
+      // BeforeCommit: remove this print
+      std::cerr << "Constant String Scalar: " << string_scalar.to_string() << std::endl;
+
       return cudf::binary_operation(left,
                                     string_scalar,
                                     ComparisonOp,
@@ -64,8 +74,8 @@ struct ComparisonDispatcher {
                                     executor.resource_ref);
     } else {
       // Create a numeric scalar from the constant value
-      auto numeric_scalar =
-        cudf::numeric_scalar(right_value, true, executor.execution_stream, executor.resource_ref);
+      auto numeric_scalar = cudf::numeric_scalar(
+        right_value, !right_is_null, executor.execution_stream, executor.resource_ref);
       return cudf::binary_operation(left,
                                     numeric_scalar,
                                     ComparisonOp,
@@ -142,37 +152,60 @@ struct ComparisonDispatcher {
   std::unique_ptr<cudf::column> operator()(const BoundComparisonExpression& expr,
                                            GpuExpressionState* state)
   {
-    D_ASSERT(expr.children.size() == 2);
+   
+      spdlog::info("TypeA1:" + expr.right->return_type.ToString());
+      spdlog::info("TypeA2:" + expr.ToString());
+      spdlog::info("TypeA3:" + ExpressionClassToString(expr.right->GetExpressionClass()));
+      spdlog::info("TypeA4:" + ExpressionClassToString(expr.left->GetExpressionClass()));
+    
+
     auto return_type = GpuExpressionState::GetCudfType(expr.return_type);
 
-    // Resolve the children (DuckDB moves constants to the right comparator)
-    auto left = executor.Execute(*expr.left, state->child_states[0].get());
+    // Resolve the children 
+    // DuckDB sometimes moves constants to the right comparator. 
+    // Even though this does not always happen, this file is based on the priciple that DuckDB always
+    // puts the constant on the right side. Therefore, if the left side is a constant, we swap the 
+    // children.
+
+    const Expression* left_expr = expr.left.get();
+    const Expression* right_expr = expr.right.get();
+    if(expr.left->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
+      left_expr = expr.right.get();
+      right_expr = expr.left.get();
+    }
+    
+    auto left = executor.Execute(*left_expr, state->child_states[0].get());
 
     // If the right side is a constant, do not materialize in a column
-    if (expr.right->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
-      auto right_value = expr.right->Cast<BoundConstantExpression>().value;
+    if (right_expr->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
+      auto right_value = right_expr->Cast<BoundConstantExpression>().value;
 
-      switch (GpuExpressionState::GetCudfType(expr.right->return_type).id()) {
+      // BeforeCommit: remove this print
+      spdlog::info("TypeB1:" + right_expr->return_type.ToString());
+      spdlog::info("TypeC1:" + right_value.ToString());
+
+      switch (GpuExpressionState::GetCudfType(right_expr->return_type).id()) {
         case cudf::type_id::INT16:
           return DoScalarComparison<int16_t>(
-            left->view(), right_value.GetValue<int16_t>(), return_type);
+            left->view(), right_value.GetValue<int16_t>(), right_value.IsNull(), return_type);
         case cudf::type_id::INT32:
           return DoScalarComparison<int32_t>(
-            left->view(), right_value.GetValue<int32_t>(), return_type);
+            left->view(), right_value.GetValue<int32_t>(), right_value.IsNull(), return_type);
         case cudf::type_id::INT64:
           return DoScalarComparison<int64_t>(
-            left->view(), right_value.GetValue<int64_t>(), return_type);
+            left->view(), right_value.GetValue<int64_t>(), right_value.IsNull(), return_type);
         case cudf::type_id::FLOAT32:
           return DoScalarComparison<float_t>(
-            left->view(), right_value.GetValue<float_t>(), return_type);
+            left->view(), right_value.GetValue<float_t>(), right_value.IsNull(), return_type);
         case cudf::type_id::FLOAT64:
           return DoScalarComparison<double_t>(
-            left->view(), right_value.GetValue<double_t>(), return_type);
+            left->view(), right_value.GetValue<double_t>(), right_value.IsNull(), return_type);
         case cudf::type_id::BOOL8:
-          return DoScalarComparison<bool>(left->view(), right_value.GetValue<bool>(), return_type);
+          return DoScalarComparison<bool>(
+            left->view(), right_value.GetValue<bool>(), right_value.IsNull(), return_type);
         case cudf::type_id::STRING:
           return DoScalarComparison<std::string>(
-            left->view(), right_value.GetValue<std::string>(), return_type);
+            left->view(), right_value.GetValue<std::string>(), right_value.IsNull(), return_type);
         case cudf::type_id::DECIMAL32:
           // cudf decimal type uses negative scale, same for below
           return DoScalarComparison<numeric::decimal32>(
@@ -247,10 +280,14 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundComparis
       return dispatcher(expr, state);
     }
     case ExpressionType::COMPARE_DISTINCT_FROM:
-    case ExpressionType::COMPARE_NOT_DISTINCT_FROM:
       throw NotImplementedException(
         "Execute[Comparison]: DISTINCT comparisons not yet "
         "implemented!");
+    case ExpressionType::COMPARE_NOT_DISTINCT_FROM: {
+      ComparisonDispatcher<cudf::binary_operator::NULL_EQUALS> dispatcher(*this);
+      return dispatcher(expr, state);
+    }
+
     default: throw InternalException("Execute[Comparison]: Unknown comparison type!");
   }
 }
