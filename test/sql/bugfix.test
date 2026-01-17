@@ -35,23 +35,25 @@ CREATE TABLE issue_56
     dataStringOne VARCHAR(20),
     dataStringTwo VARCHAR(20),
     dataIntOne INTEGER,
-    dataIntTwo INTEGER
+    dataIntTwo INTEGER,
+    dataDecOne DECIMAL(10, 2),
+    dataDecTwo DECIMAL(10, 2)
 );
 
 statement ok
-INSERT INTO issue_56 VALUES (1, NULL, NULL, NULL, NULL);
+INSERT INTO issue_56 VALUES (1, NULL, NULL, NULL, NULL, NULL, NULL);
 
 statement ok
-INSERT INTO issue_56 VALUES (2, 'ABC', 'ABC', 100, 100);
+INSERT INTO issue_56 VALUES (2, 'ABC', 'ABC', 100, 100, 100.00, 100.00);
 
 statement ok
-INSERT INTO issue_56 VALUES (3, 'ABC', 'DEF', 100, 200);
+INSERT INTO issue_56 VALUES (3, 'ABC', 'DEF', 100, 200, 100.00, 200.00);
 
 statement ok
-INSERT INTO issue_56 VALUES (4, 'ABC', NULL, 100, NULL);
+INSERT INTO issue_56 VALUES (4, 'ABC', NULL, 100, NULL, 100.00, NULL);
 
 statement ok
-INSERT INTO issue_56 VALUES (5, NULL, 'ABC', NULL, 100);
+INSERT INTO issue_56 VALUES (5, NULL, 'ABC', NULL, 100, NULL, 100.00);
 
 # Test IS NOT DISTINCT with string data
 query I
@@ -128,4 +130,35 @@ call gpu_processing("SELECT rowID FROM issue_56 WHERE dataIntTwo IS NOT DISTINCT
 1
 4
 
-#TODO: add decimal tests for issue 56
+# Test IS NOT DISTINCT with decimal data
+query I
+call gpu_processing("SELECT rowID FROM issue_56 WHERE dataDecOne IS NOT DISTINCT FROM dataDecTwo;");
+----
+1
+2
+
+# Test IS NOT DISTINCT with non-NULL constant decimal
+query I
+call gpu_processing("SELECT rowID FROM issue_56 WHERE 200.00 IS NOT DISTINCT FROM dataDecTwo;");
+----
+3
+
+# Test IS NOT DISTINCT with NULL compared to decimal
+query I
+call gpu_processing("SELECT rowID FROM issue_56 WHERE NULL IS NOT DISTINCT FROM dataDecTwo;");
+----
+1
+4
+
+# Test IS NOT DISTINCT with non-NULL constant decimal [constant on right]
+query I
+call gpu_processing("SELECT rowID FROM issue_56 WHERE dataDecTwo IS NOT DISTINCT FROM 200.00;");
+----
+3
+
+# Test IS NOT DISTINCT with NULL compared to decimal [constant on right]
+query I
+call gpu_processing("SELECT rowID FROM issue_56 WHERE dataDecTwo IS NOT DISTINCT FROM NULL;");
+----
+1
+4   
