@@ -1000,8 +1000,7 @@ void cudf_orderby(vector<shared_ptr<GPUColumn>>& keys,
     }
     return;
   }
-  SIRIUS_LOG_DEBUG(
-    "Cudf order using custom top n of {} has val {}", num_results, use_customed_implementation);
+  SIRIUS_LOG_DEBUG("Cudf order using custom top n of {} has val {}", num_results, false);
 
   // 3. Fallback: libcudf full sorting
   // Applicable for: multi-column with Limit > 32, or unsupported types, or complex Offset handling
