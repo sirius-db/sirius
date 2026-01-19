@@ -18,12 +18,14 @@ import sys
 import threading
 import subprocess
 
+
 def generate_table(table_type, sf, dbgen_dir):
     """Generate a subset of the TPC-H tables using dbgen -T option"""
     command = f"cd {dbgen_dir} && ./dbgen -f -s {sf} -T {table_type}"
     result = subprocess.run(command, shell=True, capture_output=True, text=True)
     if result.returncode != 0:
         print(f"Error running {command}: {result.stderr}")
+
 
 if __name__ == "__main__":
     con = duckdb.connect(
@@ -37,39 +39,50 @@ if __name__ == "__main__":
     con.execute("load '{}'".format(extension_path))
 
     SF = sys.argv[1]
-    
+
     # Create SF-specific subdirectory
     sf_data_dir = f"test_datasets/tpch-dbgen/sf{SF}"
     dbgen_dir = "test_datasets/tpch-dbgen"
-    
+
     # Check if data already exists
-    required_files = ['customer.tbl', 'lineitem.tbl', 'orders.tbl', 'part.tbl', 
-                      'supplier.tbl', 'partsupp.tbl', 'nation.tbl', 'region.tbl']
+    required_files = [
+        "customer.tbl",
+        "lineitem.tbl",
+        "orders.tbl",
+        "part.tbl",
+        "supplier.tbl",
+        "partsupp.tbl",
+        "nation.tbl",
+        "region.tbl",
+    ]
     data_exists = os.path.exists(sf_data_dir) and all(
         os.path.exists(os.path.join(sf_data_dir, f)) for f in required_files
     )
-    
+
     if data_exists:
-        print(f"Data for SF={SF} already exists in {sf_data_dir}, skipping generation...")
+        print(
+            f"Data for SF={SF} already exists in {sf_data_dir}, skipping generation..."
+        )
     else:
         print(f"Generating TPC-H data for SF={SF}...")
         os.makedirs(sf_data_dir, exist_ok=True)
-        
+
         # Generate different parts of the data concurrently
-        dbgen_options = ['c', 'l', 'L', 'O', 'p', 's']
+        dbgen_options = ["c", "l", "L", "O", "p", "s"]
         threads = []
-        
+
         for dbgen_option in dbgen_options:
-            thread = threading.Thread(target=generate_table, 
-                                     args=(dbgen_option, SF, dbgen_dir))
+            thread = threading.Thread(
+                target=generate_table, args=(dbgen_option, SF, dbgen_dir)
+            )
             thread.start()
             threads.append(thread)
-        
+
         for thread in threads:
             thread.join()
-        
+
         subprocess.run(f"mv {dbgen_dir}/*.tbl {sf_data_dir}/", shell=True)
-        
+
         print(f"Data generation complete for SF={SF}")
 
     print(
