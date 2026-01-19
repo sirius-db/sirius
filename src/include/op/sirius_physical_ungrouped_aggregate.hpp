@@ -23,6 +23,8 @@
 #include "duckdb/parser/group_by_node.hpp"
 #include "op/sirius_physical_operator.hpp"
 
+#include <cudf/scalar/scalar.hpp>
+
 namespace sirius {
 namespace op {
 
@@ -51,7 +53,6 @@ class sirius_physical_ungrouped_aggregate : public sirius_physical_operator {
   std::vector<std::shared_ptr<cucascade::data_batch>> execute(
     const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches) override;
 
-
  private:
   struct agg_state {
     std::mutex _mutex;
@@ -60,7 +61,6 @@ class sirius_physical_ungrouped_aggregate : public sirius_physical_operator {
     std::vector<int64_t> _running_counts;                        // for AVG/COUNT
   };
   std::shared_ptr<agg_state> _state = std::make_shared<agg_state>();
-
 };
 
 }  // namespace op
