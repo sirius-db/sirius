@@ -18,14 +18,15 @@ jobs:
         with:
           submodules: recursive
           fetch-depth: 0
+      - name: Setup Pixi
+        uses: prefix-dev/setup-pixi@82d477f15f3a381dbcc8adc1206ce643fe110fb7 # v0.9.3
+        with:
+          pixi-version: v0.59.0
+          activate-environment: true
       - name: Build
         env:
           CUDAARCHS: native
         run: |
-          export LIBCUDF_ENV_PREFIX=~/miniconda3/envs/libcudf-env
-          source ~/miniconda3/etc/profile.d/conda.sh
-          conda activate libcudf-env
-          source setup_sirius.sh
           make -j$(nproc)
       - name: Run C++ unit tests
         run: |
