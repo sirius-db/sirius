@@ -22,6 +22,7 @@
 #include <memory/fixed_size_host_memory_resource.hpp>
 #include <memory/memory_reservation.hpp>
 #include <memory/memory_reservation_manager.hpp>
+#include <memory/sirius_memory_reservation_manager.hpp>
 #include <op/scan/duckdb_scan_executor.hpp>
 #include <op/sirius_physical_table_scan.hpp>
 #include <parallel/task.hpp>
@@ -63,7 +64,8 @@ class duckdb_scan_task_global_state : public sirius::parallel::itask_global_stat
   duckdb_scan_task_global_state(duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
                                 duckdb_scan_executor& scan_exec,
                                 duckdb::ClientContext& client_ctx,
-                                op::sirius_physical_table_scan* scan_op);
+                                op::sirius_physical_table_scan* scan_op,
+                                sirius::memory::sirius_memory_reservation_manager& mem_res_mgr);
 
   //===----------Methods----------===//
   /**
@@ -96,7 +98,7 @@ class duckdb_scan_task_global_state : public sirius::parallel::itask_global_stat
     global_tf_state;                    ///< Global state for the table function
   duckdb_scan_executor& scan_executor;  ///< The scan executor executing this scan task
   op::sirius_physical_table_scan& op;   ///< The physical table scan being executed
-
+  sirius::memory::sirius_memory_reservation_manager& mem_res_mgr;
   std::mutex scan_mutex;  ///< Mutex to protect table function calls
 };
 

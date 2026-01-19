@@ -24,6 +24,8 @@
 #include <blockingconcurrentqueue.h>
 #include <data/data_repository.hpp>
 
+#include <queue>
+
 namespace sirius {
 namespace pipeline {
 
@@ -70,8 +72,8 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
   // Non-copyable but movable
   gpu_pipeline_executor(const gpu_pipeline_executor&)            = delete;
   gpu_pipeline_executor& operator=(const gpu_pipeline_executor&) = delete;
-  gpu_pipeline_executor(gpu_pipeline_executor&&)                 = default;
-  gpu_pipeline_executor& operator=(gpu_pipeline_executor&&)      = default;
+  gpu_pipeline_executor(gpu_pipeline_executor&&)                 = delete;
+  gpu_pipeline_executor& operator=(gpu_pipeline_executor&&)      = delete;
 
   /**
    * @brief Schedules a task for execution with GPU-specific logic

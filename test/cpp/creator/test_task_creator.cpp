@@ -17,6 +17,7 @@
 #include "catch.hpp"
 #include "creator/task_creator.hpp"
 #include "gpu_context.hpp"
+#include "memory/reservation_manager_configurator.hpp"
 #include "op/scan/duckdb_scan_executor.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "parallel/task_executor.hpp"
@@ -161,10 +162,12 @@ class testable_task_creator : public task_creator {
                         sirius_pipeline_hashmap& gpu_pipeline_map,
                         duckdb::ClientContext& client_context,
                         pipeline_executor& pipeline_executor,
-                        duckdb_scan_executor& duckdb_scan_executor)
-    : task_creator(
-        num_threads, gpu_pipeline_map, client_context, pipeline_executor, duckdb_scan_executor)
+                        duckdb_scan_executor& duckdb_scan_executor,
+                        sirius::memory::sirius_memory_reservation_manager& mem_res_mgr)
+    : task_creator(num_threads, pipeline_executor, duckdb_scan_executor, mem_res_mgr)
   {
+    this->set_client_context(client_context);
+    this->set_pipeline_hashmap(gpu_pipeline_map);
   }
 
   void schedule(std::unique_ptr<task_creation_info> info) override
@@ -202,9 +205,9 @@ class testable_task_creator : public task_creator {
   // Expose protected members for testing
   task_creation_queue* get_queue() { return _task_creation_queue.get(); }
 
-  std::queue<duckdb::shared_ptr<sirius_pipeline>>& get_priority_scans() { return priority_scans; }
+  std::queue<duckdb::shared_ptr<sirius_pipeline>>& get_priority_scans() { return _priority_scans; }
 
-  bool is_running() const { return _running.load(); }
+  [[nodiscard]] bool is_running() const { return _running.load(); }
 
   size_t get_thread_count() const { return _threads.size(); }
 
@@ -229,9 +232,26 @@ class test_fixture {
       con(db),
       gpu_context(*con.context),
       gpu_executor(*con.context, gpu_context),
-      pipeline_config{2, false},
+      memory_manager([] {
+        cucascade::memory::reservation_manager_configurator builder;
+        const size_t gpu_capacity  = 2ull << 30;  // 2GB
+        const double limit_ratio   = 0.75;
+        const size_t host_capacity = 4ull << 30;  // 4GB
+
+        builder.set_number_of_gpus(1)
+          .set_gpu_usage_limit(gpu_capacity)
+          .set_reservation_fraction_per_gpu(limit_ratio)
+          .set_per_host_capacity(host_capacity)
+          .use_host_per_gpu()
+          .set_reservation_fraction_per_host(limit_ratio);
+
+        // Build configuration with topology detection
+        auto space_configs = builder.build();
+        return std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
+          std::move(space_configs));
+      }()),
       gpu_executor_config{1, false},
-      pipeline_exec(pipeline_config, gpu_executor_config, 1),
+      pipeline_exec(gpu_executor_config, *memory_manager),
       scan_exec(task_executor_config{2, false}),
       empty_pipelines(),
       pipeline_map(empty_pipelines)
@@ -249,8 +269,8 @@ class test_fixture {
   duckdb::DuckDB db;
   duckdb::Connection con;
   duckdb::GPUContext gpu_context;
+  std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory_manager;
   duckdb::GPUExecutor gpu_executor;
-  task_executor_config pipeline_config;
   task_executor_config gpu_executor_config;
   pipeline_executor pipeline_exec;
   duckdb_scan_executor scan_exec;
@@ -379,8 +399,12 @@ TEST_CASE("task_creator thread pool starts and stops", "[task_creator]")
 {
   test_fixture fixture;
 
-  testable_task_creator creator(
-    2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, fixture.scan_exec);
+  testable_task_creator creator(2,
+                                fixture.pipeline_map,
+                                *fixture.con.context,
+                                fixture.pipeline_exec,
+                                fixture.scan_exec,
+                                *fixture.memory_manager);
 
   SECTION("Creator starts not running") { REQUIRE_FALSE(creator.is_running()); }
 
@@ -414,8 +438,12 @@ TEST_CASE("task_creator thread pool is idempotent", "[task_creator]")
 {
   test_fixture fixture;
 
-  testable_task_creator creator(
-    2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, fixture.scan_exec);
+  testable_task_creator creator(2,
+                                fixture.pipeline_map,
+                                *fixture.con.context,
+                                fixture.pipeline_exec,
+                                fixture.scan_exec,
+                                *fixture.memory_manager);
 
   SECTION("Multiple start_thread_pool calls don't create extra threads")
   {
@@ -455,8 +483,12 @@ TEST_CASE("task_creator destructor stops thread pool", "[task_creator]")
   test_fixture fixture;
 
   {
-    testable_task_creator creator(
-      2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, fixture.scan_exec);
+    testable_task_creator creator(2,
+                                  fixture.pipeline_map,
+                                  *fixture.con.context,
+                                  fixture.pipeline_exec,
+                                  fixture.scan_exec,
+                                  *fixture.memory_manager);
     creator.start_thread_pool();
     // Destructor should stop threads
   }
@@ -473,8 +505,12 @@ TEST_CASE("process_next_task with monostate hint and empty priority_scans", "[ta
 {
   test_fixture fixture;
 
-  testable_task_creator creator(
-    2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, fixture.scan_exec);
+  testable_task_creator creator(2,
+                                fixture.pipeline_map,
+                                *fixture.con.context,
+                                fixture.pipeline_exec,
+                                fixture.scan_exec,
+                                *fixture.memory_manager);
 
   // Create a mock operator with no ports (will return monostate)
   auto mock_op = std::make_unique<mock_sirius_physical_operator>();
@@ -500,8 +536,12 @@ TEST_CASE("process_next_task with monostate hint uses priority_scans", "[task_cr
 
   // Create pipelines with the scan as source - this requires integration test setup
   // For unit testing purposes, we verify the code path via the testable interface
-  testable_task_creator creator(
-    2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, fixture.scan_exec);
+  testable_task_creator creator(2,
+                                fixture.pipeline_map,
+                                *fixture.con.context,
+                                fixture.pipeline_exec,
+                                fixture.scan_exec,
+                                *fixture.memory_manager);
 
   // Initially priority_scans should be empty (no TABLE_SCAN sources in empty pipeline map)
   REQUIRE(creator.get_priority_scans().empty());
@@ -518,8 +558,12 @@ TEST_CASE("process_next_task with operator hint schedules the hint node", "[task
 {
   test_fixture fixture;
 
-  testable_task_creator creator(
-    2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, fixture.scan_exec);
+  testable_task_creator creator(2,
+                                fixture.pipeline_map,
+                                *fixture.con.context,
+                                fixture.pipeline_exec,
+                                fixture.scan_exec,
+                                *fixture.memory_manager);
 
   // Create the source operator that we will call process_next_task on
   auto source_op = std::make_unique<mock_sirius_physical_operator>();
@@ -569,8 +613,12 @@ TEST_CASE("process_next_task with pipeline hint recurses to inner operator", "[t
   // behavior indirectly by verifying that the source operator's
   // get_next_task_hint() is called and the scheduling logic follows through.
 
-  testable_task_creator creator(
-    2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, fixture.scan_exec);
+  testable_task_creator creator(2,
+                                fixture.pipeline_map,
+                                *fixture.con.context,
+                                fixture.pipeline_exec,
+                                fixture.scan_exec,
+                                *fixture.memory_manager);
 
   // Create an operator chain: source_op returns a custom hint that is monostate
   // (simulating the end of recursion)
@@ -606,8 +654,12 @@ TEST_CASE("process_next_task operator hint follows dest_pipeline", "[task_creato
 {
   test_fixture fixture;
 
-  testable_task_creator creator(
-    2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, fixture.scan_exec);
+  testable_task_creator creator(2,
+                                fixture.pipeline_map,
+                                *fixture.con.context,
+                                fixture.pipeline_exec,
+                                fixture.scan_exec,
+                                *fixture.memory_manager);
 
   // Create operators
   auto source_op = std::make_unique<mock_sirius_physical_operator>();
@@ -635,8 +687,12 @@ TEST_CASE("process_next_task hint traversal chain", "[task_creator]")
 {
   test_fixture fixture;
 
-  testable_task_creator creator(
-    2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, fixture.scan_exec);
+  testable_task_creator creator(2,
+                                fixture.pipeline_map,
+                                *fixture.con.context,
+                                fixture.pipeline_exec,
+                                fixture.scan_exec,
+                                *fixture.memory_manager);
 
   // Test a chain where:
   // op1 returns hint pointing to op2
@@ -665,8 +721,12 @@ TEST_CASE("task_creator start/stop lifecycle", "[task_creator]")
 {
   test_fixture fixture;
 
-  testable_task_creator creator(
-    2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, fixture.scan_exec);
+  testable_task_creator creator(2,
+                                fixture.pipeline_map,
+                                *fixture.con.context,
+                                fixture.pipeline_exec,
+                                fixture.scan_exec,
+                                *fixture.memory_manager);
 
   SECTION("start() calls start_thread_pool()")
   {
@@ -688,8 +748,12 @@ TEST_CASE("task_creator get_next_task_id increments", "[task_creator]")
 {
   test_fixture fixture;
 
-  testable_task_creator creator(
-    1, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, fixture.scan_exec);
+  testable_task_creator creator(1,
+                                fixture.pipeline_map,
+                                *fixture.con.context,
+                                fixture.pipeline_exec,
+                                fixture.scan_exec,
+                                *fixture.memory_manager);
 
   // The task_id is protected, but we can verify behavior indirectly
   // by checking that the creator can be constructed and used
@@ -704,8 +768,12 @@ TEST_CASE("task_creator queue integration", "[task_creator]")
 {
   test_fixture fixture;
 
-  testable_task_creator creator(
-    2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, fixture.scan_exec);
+  testable_task_creator creator(2,
+                                fixture.pipeline_map,
+                                *fixture.con.context,
+                                fixture.pipeline_exec,
+                                fixture.scan_exec,
+                                *fixture.memory_manager);
 
   SECTION("Queue is accessible")
   {
@@ -1075,8 +1143,12 @@ TEST_CASE("task_creator handles concurrent schedule calls", "[task_creator]")
 {
   test_fixture fixture;
 
-  testable_task_creator creator(
-    4, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, fixture.scan_exec);
+  testable_task_creator creator(4,
+                                fixture.pipeline_map,
+                                *fixture.con.context,
+                                fixture.pipeline_exec,
+                                fixture.scan_exec,
+                                *fixture.memory_manager);
 
   const int num_calls = 100;
   std::atomic<int> completed{0};
