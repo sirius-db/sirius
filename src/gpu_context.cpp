@@ -32,6 +32,7 @@
 #include "duckdb/parser/statement/relation_statement.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "log/logging.hpp"
+#include "op/sirius_physical_result_collector.hpp"
 #include "sirius_extension.hpp"
 
 #include <stdio.h>
@@ -115,13 +116,17 @@ unique_ptr<PendingQueryResult> GPUContext::GPUPendingStatementInternal(
   // statement.properties.allow_stream_result;
   bool stream_result = false;
 
-  if (statement_p->sirius_physical_plan->type != sirius::op::sirius_physical_operator::TYPE) {
+  // Wrap the physical plan in a result collector
+  unique_ptr<sirius::op::sirius_physical_result_collector> result_collector =
+    make_uniq<sirius::op::sirius_physical_materialized_collector>(*statement_p);
+
+  if (result_collector->type != PhysicalOperatorType::RESULT_COLLECTOR) {
     return GPUErrorResult<PendingQueryResult>(ErrorData("Error in GPUPendingStatementInternal"));
   }
-  D_ASSERT(statement_p->sirius_physical_plan->type == sirius::op::sirius_physical_operator::TYPE);
-  auto types = statement_p->sirius_physical_plan->types;
+  D_ASSERT(result_collector->type == PhysicalOperatorType::RESULT_COLLECTOR);
+  auto types = result_collector->types;
   D_ASSERT(types == statement.types);
-  gpu_executor.initialize(std::move(statement_p->sirius_physical_plan));
+  gpu_executor.initialize(std::move(result_collector));
   // SIRIUS_LOG_DEBUG("type {}", gpu_executor.gpu_physical_plan.get()->type);
 
   D_ASSERT(!gpu_active_query->HasOpenResult());

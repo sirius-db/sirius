@@ -225,17 +225,19 @@ void SiriusExtension::GPUProcessingFunction(ClientContext& context,
       printf("GPUBufferManager not initialized, please call gpu_buffer_init first\n");
       printf("\033[0m");
       printf(
-        "=============================================\nError in GPUExecuteQuery, fallback to "
+        "=============================================\nFallback to "
         "DuckDB\n=============================================\n");
       data.res = data.conn->Query(data.query);
     } else if (data.plan_error) {
       printf(
-        "=============================================\nError in GPUExecuteQuery, fallback to "
+        "=============================================\nError during planning, fallback to "
         "DuckDB\n=============================================\n");
       data.res = data.conn->Query(data.query);
     } else {
       data.res = data.gpu_context->GPUExecuteQuery(context, data.query, data.gpu_prepared, {});
       if (data.res->HasError()) {
+        ErrorData error = data.res->GetErrorObject();
+        SIRIUS_LOG_ERROR("Error in GPUExecuteQuery: {}", error.RawMessage());
         printf(
           "=============================================\nError in GPUExecuteQuery, fallback to "
           "DuckDB\n=============================================\n");

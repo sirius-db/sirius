@@ -29,6 +29,12 @@
 namespace sirius {
 namespace op {
 
+class sirius_materialized_collector_global_state : public duckdb::GlobalSinkState {
+ public:
+  duckdb::mutex glock;
+  duckdb::shared_ptr<duckdb::ClientContext> context;
+};
+
 sirius_physical_result_collector::sirius_physical_result_collector(
   duckdb::SiriusPreparedStatementData& data)
   : sirius_physical_operator(
@@ -71,11 +77,25 @@ sirius_physical_materialized_collector::sirius_physical_materialized_collector(
 {
 }
 
+duckdb::unique_ptr<duckdb::GlobalSinkState>
+sirius_physical_materialized_collector::get_global_sink_state(duckdb::ClientContext& context) const
+{
+  auto state     = duckdb::make_uniq<sirius_materialized_collector_global_state>();
+  state->context = context.shared_from_this();
+  return std::move(state);
+}
+
 duckdb::unique_ptr<duckdb::QueryResult> sirius_physical_materialized_collector::get_result(
   duckdb::GlobalSinkState& state)
 {
-  // TODO: Implement this method
-  throw duckdb::NotImplementedException("sirius_physical_materialized_collector::get_result");
+  auto& gstate = state.Cast<sirius_materialized_collector_global_state>();
+  if (!gstate.context)
+    throw duckdb::InvalidInputException(
+      "No context set in sirius_materialized_collector_global_state");
+  auto prop   = gstate.context->GetClientProperties();
+  auto result = duckdb::make_uniq<duckdb::GPUQueryResult>(
+    statement_type, properties, names, types, prop, std::move(result_collection));
+  return std::move(result);
 }
 
 }  // namespace op

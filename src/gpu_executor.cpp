@@ -421,18 +421,22 @@ shared_ptr<::sirius::pipeline::sirius_pipeline> GPUExecutor::create_child_pipeli
 
 bool GPUExecutor::HasResultCollector()
 {
-  return gpu_physical_plan->type == PhysicalOperatorType::RESULT_COLLECTOR;
+  return sirius_physical_plan->type == PhysicalOperatorType::RESULT_COLLECTOR;
 }
 
 unique_ptr<QueryResult> GPUExecutor::GetResult()
 {
   D_ASSERT(HasResultCollector());
-  if (!gpu_physical_plan) throw InvalidInputException("gpu_physical_plan is NULL");
-  if (gpu_physical_plan.get() == NULL) throw InvalidInputException("gpu_physical_plan is NULL");
-  auto& result_collector = gpu_physical_plan.get()->Cast<GPUPhysicalMaterializedCollector>();
+  if (!sirius_physical_plan) throw InvalidInputException("sirius_physical_plan is NULL");
+  if (sirius_physical_plan.get() == NULL)
+    throw InvalidInputException("sirius_physical_plan is NULL");
+  SIRIUS_LOG_DEBUG("sirius_physical_plan type: {}", sirius_physical_plan->type);
+  auto& result_collector =
+    sirius_physical_plan.get()->Cast<sirius::op::sirius_physical_materialized_collector>();
+  SIRIUS_LOG_DEBUG("result_collector type: {}", result_collector.type);
   D_ASSERT(result_collector.sink_state);
-  result_collector.sink_state = result_collector.GetGlobalSinkState(context);
-  unique_ptr<QueryResult> res = result_collector.GetResult(*(result_collector.sink_state));
+  result_collector.sink_state = result_collector.get_global_sink_state(context);
+  unique_ptr<QueryResult> res = result_collector.get_result(*(result_collector.sink_state));
   return res;
 }
 
@@ -446,14 +450,11 @@ void GPUExecutor::initialize(unique_ptr<::sirius::op::sirius_physical_operator> 
 
 void GPUExecutor::execute()
 {
-  SIRIUS_LOG_DEBUG("Total meta pipelines {}", scheduled.size());
+  SIRIUS_LOG_DEBUG("sirius_pipelines size: {}", sirius_pipelines.size());
 
-  // Create sirius_pipeline_hashmap and set it on task_creator
   if (!sirius_pipelines.empty()) {
     auto sirius_pipeline_map = sirius::sirius_pipeline_hashmap(sirius_pipelines);
-
-    // Get SiriusContext from the client context
-    auto sirius_context = context.registered_state->Get<SiriusContext>("sirius_state");
+    auto sirius_context      = context.registered_state->Get<SiriusContext>("sirius_state");
     if (sirius_context) {
       auto& task_creator = sirius_context->get_task_creator();
       task_creator.set_pipeline_hashmap(sirius_pipeline_map);

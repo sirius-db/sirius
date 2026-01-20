@@ -67,6 +67,8 @@ class sirius_physical_materialized_collector : public sirius_physical_result_col
   duckdb::unique_ptr<duckdb::GPUResultCollection> result_collection;
 
  public:
+  duckdb::unique_ptr<duckdb::GlobalSinkState> get_global_sink_state(
+    duckdb::ClientContext& context) const override;
   duckdb::unique_ptr<duckdb::QueryResult> get_result(duckdb::GlobalSinkState& state) override;
 };
 
