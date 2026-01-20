@@ -33,6 +33,8 @@
 #include <data/data_batch.hpp>
 #include <data/data_repository.hpp>
 
+#include <atomic>
+
 namespace duckdb {
 class GPUExecutor;
 class GPUPhysicalOperator;
@@ -51,11 +53,18 @@ class GPUPhysicalOperator {
  public:
   static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::INVALID;
 
+ private:
+  //! Global counter for generating unique operator IDs
+  static std::atomic<idx_t> global_operator_id_counter;
+
  public:
   GPUPhysicalOperator(PhysicalOperatorType type,
                       vector<LogicalType> types,
                       idx_t estimated_cardinality)
-    : type(type), types(std::move(types)), estimated_cardinality(estimated_cardinality)
+    : type(type),
+      types(std::move(types)),
+      estimated_cardinality(estimated_cardinality),
+      operator_id(global_operator_id_counter.fetch_add(1, std::memory_order_relaxed))
   {
   }
   GPUPhysicalOperator() = default;
@@ -70,6 +79,8 @@ class GPUPhysicalOperator {
   vector<LogicalType> types;
   //! The estimated cardinality of this physical operator
   idx_t estimated_cardinality;
+  //! The unique ID of this operator in the plan
+  idx_t operator_id;
 
   //! The global sink state of this operator
   unique_ptr<GlobalSinkState> sink_state;

@@ -25,6 +25,9 @@
 
 namespace duckdb {
 
+// Initialize the global operator ID counter
+std::atomic<idx_t> GPUPhysicalOperator::global_operator_id_counter(0);
+
 string GPUPhysicalOperator::GetName() const { return PhysicalOperatorToString(type); }
 
 vector<const_reference<GPUPhysicalOperator>> GPUPhysicalOperator::GetChildren() const
