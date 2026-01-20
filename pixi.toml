@@ -4,21 +4,13 @@ name = "sirius"
 platforms = ["linux-64", "linux-aarch64"]
 requires-pixi = ">=0.59"
 
-[system-requirements]
-cuda = "13"
-
 [activation]
 scripts = ["setup_test_datasets.sh"]
-
-[activation.env]
-# Following https://github.com/rapidsai/rapids-cmake/blob/84f8cf8386ac56e3f4f9400f44e752345d8c2997/rapids-cmake/cuda/set_architectures.cmake#L62
-CUDAARCHS = "75-real;80-real;86-real;90a-real;100f-real;120a-real;120"
 
 [dependencies]
 cmake = "4.1.*"
 cuda-nvcc = "*"
 cuda-nvml-dev = "*"
-cuda-version = "13.*"
 cxx-compiler = "*"
 make = "*"
 ninja = "*"
@@ -30,3 +22,28 @@ libcurand-dev = "*"
 pre-commit = "*"
 
 [tasks]
+
+# CUDA version features: use `pixi run -e cuda12` for CUDA 12.x systems
+[feature.cuda13.system-requirements]
+cuda = "13"
+
+[feature.cuda13.dependencies]
+cuda-version = "13.*"
+
+[feature.cuda13.activation.env]
+# GPU architectures: Turing through Blackwell (75, 80, 86, 90a, 100f, 120a, 120)
+CUDAARCHS = "75-real;80-real;86-real;90a-real;100f-real;120a-real;120"
+
+[feature.cuda12.system-requirements]
+cuda = "12"
+
+[feature.cuda12.dependencies]
+cuda-version = "12.*"
+
+[feature.cuda12.activation.env]
+# GPU architectures: Turing through Hopper (75, 80, 86, 90a)
+CUDAARCHS = "75-real;80-real;86-real;90a-real"
+
+[environments]
+default = ["cuda13"]
+cuda12 = ["cuda12"]
