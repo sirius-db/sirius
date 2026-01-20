@@ -186,7 +186,7 @@ if __name__ == "__main__":
     nation_file = f"{data_dir}/nation/nation.*.{format}"
     region_file = f"{data_dir}/region/region.*.{format}"
 
-    format_options = f"WITH (HEADER false, DELIMITER '|')" if format == "csv" else ""
+    format_options = "WITH (HEADER true, DELIMITER ',')" if format == "csv" else ""
 
     con.execute(
         f"""
