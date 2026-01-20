@@ -17,6 +17,7 @@
 #pragma once
 
 #include "config.hpp"
+#include "memory/sirius_memory_reservation_manager.hpp"
 #include "parallel/task_executor.hpp"
 #include "task_completion.hpp"
 
@@ -46,12 +47,17 @@ class downgrade_task_global_state : public itask_global_state {
    * @param data_repo_mgr Reference to the data repository manager for storing task outputs
    * @param message_queue Reference to the message queue for task completion notifications
    */
-  explicit downgrade_task_global_state(cucascade::shared_data_repository_manager& data_repo_mgr,
-                                       task_completion_message_queue& message_queue)
-    : _data_repo_mgr(data_repo_mgr), _message_queue(message_queue)
+  explicit downgrade_task_global_state(
+    sirius::memory::sirius_memory_reservation_manager& reservation_manager,
+    cucascade::shared_data_repository_manager& data_repo_mgr,
+    task_completion_message_queue& message_queue)
+    : _reservation_manager(reservation_manager),
+      _data_repo_mgr(data_repo_mgr),
+      _message_queue(message_queue)
   {
   }
 
+  sirius::memory::sirius_memory_reservation_manager& _reservation_manager;
   cucascade::shared_data_repository_manager&
     _data_repo_mgr;  ///< Repository for storing and retrieving data batches
   task_completion_message_queue&
@@ -92,8 +98,8 @@ class downgrade_task : public itask {
    * @param local_state The local state specific to this task
    * @param global_state The global state shared across multiple tasks
    */
-  downgrade_task(std::unique_ptr<itask_local_state> local_state,
-                 std::shared_ptr<itask_global_state> global_state)
+  downgrade_task(std::unique_ptr<downgrade_task_local_state> local_state,
+                 std::shared_ptr<downgrade_task_global_state> global_state)
     : itask(std::move(local_state), std::move(global_state))
   {
   }

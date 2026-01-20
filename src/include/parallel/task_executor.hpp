@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "config.hpp"
 #include "task_queue.hpp"
 
 #include <atomic>
@@ -36,11 +37,6 @@ struct task_executor_thread {
   std::unique_ptr<std::thread> _internal_thread;
 };
 
-struct task_executor_config {
-  int num_threads;
-  bool retry_on_error;
-};
-
 /**
  * Interface for a thread pool used by different concrete executors like `gpu_pipeline_executor`,
  * can be extended to support various kinds of tasks and scheduling policies.
@@ -57,8 +53,8 @@ class itask_executor {
   // Non-copyable and movable
   itask_executor(const itask_executor&)            = delete;
   itask_executor& operator=(const itask_executor&) = delete;
-  itask_executor(itask_executor&&)                 = default;
-  itask_executor& operator=(itask_executor&&)      = default;
+  itask_executor(itask_executor&&)                 = delete;
+  itask_executor& operator=(itask_executor&&)      = delete;
 
   // Start worker threads
   virtual void start();

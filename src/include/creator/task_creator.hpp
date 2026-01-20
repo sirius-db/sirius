@@ -31,6 +31,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -158,10 +159,9 @@ class task_creator {
    * @param duckdb_scan_executor Reference to the duckdb scan executor.
    */
   task_creator(size_t num_threads,
-               sirius_pipeline_hashmap& sirius_pipeline_map,
-               duckdb::ClientContext& client_context,
                sirius::pipeline::pipeline_executor& pipeline_executor,
-               sirius::op::scan::duckdb_scan_executor& duckdb_scan_executor);
+               sirius::op::scan::duckdb_scan_executor& duckdb_scan_executor,
+               sirius::memory::sirius_memory_reservation_manager& mem_res_mgr);
 
   /**
    * @brief Destructor that ensures the thread pool is stopped.
@@ -171,8 +171,17 @@ class task_creator {
   // Non-copyable and movable
   task_creator(const task_creator&)            = delete;
   task_creator& operator=(const task_creator&) = delete;
-  task_creator(task_creator&&)                 = default;
-  task_creator& operator=(task_creator&&)      = default;
+  task_creator(task_creator&&)                 = delete;
+  task_creator& operator=(task_creator&&)      = delete;
+
+  /// \brief sets client context needed for task creation
+  void set_client_context(::duckdb::ClientContext& client_context);
+
+  /// \brief sets gpu pipeline hash map needed for task creation
+  void set_pipeline_hashmap(sirius_pipeline_hashmap& sirius_pipeline_map);
+
+  /// \brief clean-up query bound resources and prepare the task creator for next query
+  void reset();
 
   /**
    * @brief Process and schedule the next task based on operator hints.
@@ -256,12 +265,13 @@ class task_creator {
   size_t _num_threads;
   std::atomic<bool> _running;
   std::vector<std::unique_ptr<std::thread>> _threads;
-  std::queue<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>> priority_scans;
+  std::queue<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>> _priority_scans;
   std::unique_ptr<task_creation_queue> _task_creation_queue;
-  sirius_pipeline_hashmap& _sirius_pipeline_map;
-  duckdb::ClientContext& _client_context;
+  sirius_pipeline_hashmap* _sirius_pipeline_map;
+  ::duckdb::ClientContext* _client_context;
   sirius::pipeline::pipeline_executor& _pipeline_executor;
   sirius::op::scan::duckdb_scan_executor& _duckdb_scan_executor;
+  sirius::memory::sirius_memory_reservation_manager& _mem_res_mgr;
   std::atomic<uint64_t> _task_id{0};
 };
 

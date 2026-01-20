@@ -17,10 +17,11 @@
 #pragma once
 
 // sirius
+#include "memory/sirius_memory_reservation_manager.hpp"
+
 #include <data/sirius_converter_registry.hpp>
 #include <helper/helper.hpp>
 #include <memory/reservation_manager_configurator.hpp>
-#include <memory/sirius_memory_manager.hpp>
 
 // standard library
 #include <vector>
@@ -38,32 +39,24 @@ using namespace cucascade::memory;
  * Only initializes once per test run.
  *
  */
-inline void initialize_memory_manager()
+inline std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> initialize_memory_manager(
+  std::size_t n_gpus = 1)
 {
-  static bool initialized = false;
-  if (!initialized) {
-    // Use the configurator to properly set up memory spaces
-    reservation_manager_configurator builder;
+  reservation_manager_configurator builder;
 
-    // Configure GPU (2GB limit, 75% reservation ratio)
-    const size_t gpu_capacity = 2ull << 30;  // 2GB
-    const double limit_ratio  = 0.75;
-    builder.set_gpu_usage_limit(gpu_capacity);
-    builder.set_reservation_limit_ratio_per_gpu(limit_ratio);
+  // Configure GPU (2GB limit, 75% reservation ratio)
+  const size_t gpu_capacity  = 2ull << 30;  // 2GB
+  const double limit_ratio   = 0.75;
+  const size_t host_capacity = 4ull << 30;  // 4GB
 
-    // Configure HOST (4GB capacity, 75% reservation ratio)
-    const size_t host_capacity = 4ull << 30;  // 4GB
-    builder.set_capacity_per_numa_node(host_capacity);
-    builder.use_gpu_ids_as_host();
-    builder.set_reservation_limit_ratio_per_numa_node(limit_ratio);
+  builder.set_number_of_gpus(n_gpus)
+    .set_gpu_usage_limit(gpu_capacity / n_gpus)
+    .set_reservation_fraction_per_gpu(limit_ratio)
+    .set_per_host_capacity(host_capacity / n_gpus)
+    .use_host_per_gpu()
+    .set_reservation_fraction_per_host(limit_ratio);
 
-    // Build configuration with topology detection
-    auto space_configs = builder.build_with_topology();
-    sirius::memory_manager::initialize(std::move(space_configs));
-
-    // Initialize the converter registry for representation conversions
-    sirius::converter_registry::initialize();
-
-    initialized = true;
-  }
+  auto space_configs = builder.build();
+  return std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
+    std::move(space_configs));
 }

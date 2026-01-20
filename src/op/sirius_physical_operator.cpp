@@ -256,8 +256,8 @@ std::vector<::std::shared_ptr<::cucascade::data_batch>> sirius_physical_operator
   for (auto& [port_name, port_ptr] : ports) {
     // For Pipeline barrier: need at least one data batch in the port's repository
     // TODO: later on we will adjust to the new data repository interface in cuCascade
-    auto batch = port_ptr->repo->pull_data_batch(::cucascade::batch_state::task_created);
-    if (batch) { input_batch.push_back(std::move(batch)); }
+    auto batch_and_handle = port_ptr->repo->pull_data_batch(cucascade::batch_state::task_created);
+    input_batch.push_back(std::move(batch_and_handle));
   }
   if (input_batch.empty()) { return std::vector<::std::shared_ptr<::cucascade::data_batch>>{}; }
   return input_batch;

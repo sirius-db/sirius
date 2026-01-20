@@ -20,6 +20,7 @@ unzip = "*"
 libcudf = "25.10.*"
 libcurand-dev = "*"
 pre-commit = "*"
+libconfig = "*"
 
 [tasks]
 

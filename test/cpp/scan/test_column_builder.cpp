@@ -22,6 +22,8 @@
 #include <op/scan/duckdb_scan_task.hpp>
 
 // duckdb
+#include "memory/sirius_memory_reservation_manager.hpp"
+
 #include <duckdb/common/types/validity_mask.hpp>
 #include <duckdb/common/types/vector.hpp>
 
@@ -42,12 +44,12 @@ using namespace cucascade::memory;
  * @return unique_ptr to the allocation
  */
 static std::unique_ptr<fixed_size_host_memory_resource::multiple_blocks_allocation>
-create_test_allocation(size_t total_size)
+create_test_allocation(size_t total_size,
+                       sirius::memory::sirius_memory_reservation_manager& manager)
 {
-  auto& mem_mgr   = sirius::memory_manager::get();
-  auto* mem_space = mem_mgr.get_memory_space(Tier::HOST, 0);
+  auto* mem_space = manager.get_memory_space(Tier::HOST, 0);
   REQUIRE(mem_space != nullptr);
-  auto* allocator = mem_space->template get_memory_resource_as<fixed_size_host_memory_resource>();
+  auto* allocator = mem_space->get_memory_resource_of<Tier::HOST>();
   REQUIRE(allocator != nullptr);
 
   // Use the public allocate_multiple_blocks method instead of manually creating blocks
@@ -60,7 +62,7 @@ create_test_allocation(size_t total_size)
 TEST_CASE("column_builder - construction", "[duckdb_scan_task][column_builder]")
 {
   // Initialize memory reservation manager for these tests
-  initialize_memory_manager();
+  auto manager                          = initialize_memory_manager();
   constexpr size_t DEFAULT_VARCHAR_SIZE = 256;
 
   SECTION("construct with INTEGER type")
@@ -111,11 +113,10 @@ TEST_CASE("column_builder - construction", "[duckdb_scan_task][column_builder]")
 TEST_CASE("column_builder - accessor initialization", "[duckdb_scan_task][column_builder]")
 {
   // Initialize memory reservation manager for these tests
-  initialize_memory_manager();
   constexpr size_t DEFAULT_VARCHAR_SIZE = 256;
 
-  auto& mem_mgr   = sirius::memory_manager::get();
-  auto* mem_space = mem_mgr.get_memory_space(Tier::HOST, 0);
+  auto manager    = initialize_memory_manager();
+  auto* mem_space = manager->get_memory_space(Tier::HOST, 0);
   REQUIRE(mem_space != nullptr);
   auto* allocator = mem_space->template get_memory_resource_as<fixed_size_host_memory_resource>();
   REQUIRE(allocator != nullptr);
@@ -129,7 +130,7 @@ TEST_CASE("column_builder - accessor initialization", "[duckdb_scan_task][column
     // Calculate total size needed: data + mask
     size_t total_size = sizeof(int32_t) * num_rows + sirius::utils::ceil_div_8(num_rows);
 
-    auto allocation = create_test_allocation(total_size);
+    auto allocation = create_test_allocation(total_size, *manager);
 
     // Initialize the accessors at byte offset 0
     builder.initialize_accessors(num_rows, 0, allocation);
@@ -156,7 +157,7 @@ TEST_CASE("column_builder - accessor initialization", "[duckdb_scan_task][column
                         sirius::utils::ceil_div_8(num_rows);  // mask
 
     // Use the helper to create the allocation
-    auto allocation = create_test_allocation(total_size);
+    auto allocation = create_test_allocation(total_size, *manager);
 
     // Initialize the accessors at byte offset 0
     builder.initialize_accessors(num_rows, 0, allocation);
@@ -176,11 +177,10 @@ TEST_CASE("column_builder - accessor initialization", "[duckdb_scan_task][column
 //===----------------------------------------------------------------------===//
 TEST_CASE("column_builder - sufficient_space_for_column", "[duckdb_scan_task][column_builder]")
 {
-  initialize_memory_manager();
   constexpr size_t DEFAULT_VARCHAR_SIZE = 256;
 
-  auto& mem_mgr   = sirius::memory_manager::get();
-  auto* mem_space = mem_mgr.get_memory_space(Tier::HOST, 0);
+  auto manager    = initialize_memory_manager();
+  auto* mem_space = manager->get_memory_space(Tier::HOST, 0);
   REQUIRE(mem_space != nullptr);
   auto* allocator = mem_space->template get_memory_resource_as<fixed_size_host_memory_resource>();
   REQUIRE(allocator != nullptr);
@@ -197,7 +197,7 @@ TEST_CASE("column_builder - sufficient_space_for_column", "[duckdb_scan_task][co
                         sirius::utils::ceil_div_8(num_rows);  // mask
 
     // Use the helper to create the allocation
-    auto allocation = create_test_allocation(total_size);
+    auto allocation = create_test_allocation(total_size, *manager);
 
     builder.initialize_accessors(num_rows, 0, allocation);
 
@@ -230,7 +230,7 @@ TEST_CASE("column_builder - sufficient_space_for_column", "[duckdb_scan_task][co
                         sirius::utils::ceil_div_8(num_rows);  // mask
 
     // Use the helper to create the allocation
-    auto allocation = create_test_allocation(total_size);
+    auto allocation = create_test_allocation(total_size, *manager);
 
     builder.initialize_accessors(num_rows, 0, allocation);
 
@@ -258,7 +258,7 @@ TEST_CASE("column_builder - sufficient_space_for_column", "[duckdb_scan_task][co
 //===----------------------------------------------------------------------===//
 TEST_CASE("column_builder - process_mask_for_column", "[duckdb_scan_task][column_builder]")
 {
-  initialize_memory_manager();
+  auto manager = initialize_memory_manager();
 
   SECTION("byte-aligned mask processing")
   {
@@ -267,7 +267,7 @@ TEST_CASE("column_builder - process_mask_for_column", "[duckdb_scan_task][column
 
     size_t num_rows   = 100;
     size_t total_size = sizeof(int32_t) * num_rows + sirius::utils::ceil_div_8(num_rows);
-    auto allocation   = create_test_allocation(total_size);
+    auto allocation   = create_test_allocation(total_size, *manager);
     builder.initialize_accessors(num_rows, 0, allocation);
 
     // Create a validity mask with some NULLs
@@ -302,7 +302,7 @@ TEST_CASE("column_builder - process_mask_for_column", "[duckdb_scan_task][column
 
     size_t num_rows   = 100;
     size_t total_size = sizeof(int32_t) * num_rows + sirius::utils::ceil_div_8(num_rows);
-    auto allocation   = create_test_allocation(total_size);
+    auto allocation   = create_test_allocation(total_size, *manager);
     builder.initialize_accessors(num_rows, 0, allocation);
 
     // First, add 3 rows (to create a 3-bit offset)
@@ -333,7 +333,7 @@ TEST_CASE("column_builder - process_mask_for_column", "[duckdb_scan_task][column
 
     size_t num_rows   = 100;
     size_t total_size = sizeof(int32_t) * num_rows + sirius::utils::ceil_div_8(num_rows);
-    auto allocation   = create_test_allocation(total_size);
+    auto allocation   = create_test_allocation(total_size, *manager);
     builder.initialize_accessors(num_rows, 0, allocation);
 
     // Initially, has_nulls should be false
@@ -357,7 +357,7 @@ TEST_CASE("column_builder - process_mask_for_column", "[duckdb_scan_task][column
 
     size_t num_rows   = 100;
     size_t total_size = sizeof(int32_t) * num_rows + sirius::utils::ceil_div_8(num_rows);
-    auto allocation   = create_test_allocation(total_size);
+    auto allocation   = create_test_allocation(total_size, *manager);
     builder.initialize_accessors(num_rows, 0, allocation);
 
     // Initially, has_nulls should be false
@@ -381,7 +381,7 @@ TEST_CASE("column_builder - process_mask_for_column", "[duckdb_scan_task][column
 
     size_t num_rows   = 100;
     size_t total_size = sizeof(int32_t) * num_rows + sirius::utils::ceil_div_8(num_rows);
-    auto allocation   = create_test_allocation(total_size);
+    auto allocation   = create_test_allocation(total_size, *manager);
     builder.initialize_accessors(num_rows, 0, allocation);
 
     // Initially, has_nulls should be false
@@ -403,7 +403,7 @@ TEST_CASE("column_builder - process_mask_for_column", "[duckdb_scan_task][column
 TEST_CASE("column_builder - process_column for fixed-width types",
           "[duckdb_scan_task][column_builder]")
 {
-  initialize_memory_manager();
+  auto manager = initialize_memory_manager();
 
   SECTION("INTEGER column processing")
   {
@@ -412,7 +412,7 @@ TEST_CASE("column_builder - process_column for fixed-width types",
 
     size_t num_rows   = 100;
     size_t total_size = sizeof(int32_t) * num_rows + sirius::utils::ceil_div_8(num_rows);
-    auto allocation   = create_test_allocation(total_size);
+    auto allocation   = create_test_allocation(total_size, *manager);
     builder.initialize_accessors(num_rows, 0, allocation);
 
     // Create a DuckDB vector with integer data
@@ -451,7 +451,7 @@ TEST_CASE("column_builder - process_column for fixed-width types",
 
     size_t num_rows   = 100;
     size_t total_size = sizeof(int64_t) * num_rows + sirius::utils::ceil_div_8(num_rows);
-    auto allocation   = create_test_allocation(total_size);
+    auto allocation   = create_test_allocation(total_size, *manager);
     builder.initialize_accessors(num_rows, 0, allocation);
 
     // Create a DuckDB vector with bigint data
@@ -488,7 +488,7 @@ TEST_CASE("column_builder - process_column for fixed-width types",
 
     size_t num_rows   = 100;
     size_t total_size = sizeof(double) * num_rows + sirius::utils::ceil_div_8(num_rows);
-    auto allocation   = create_test_allocation(total_size);
+    auto allocation   = create_test_allocation(total_size, *manager);
     builder.initialize_accessors(num_rows, 0, allocation);
 
     // Create a DuckDB vector with double data
@@ -517,7 +517,7 @@ TEST_CASE("column_builder - process_column for fixed-width types",
 
 TEST_CASE("column_builder - process_column for VARCHAR", "[duckdb_scan_task][column_builder]")
 {
-  initialize_memory_manager();
+  auto manager                          = initialize_memory_manager();
   constexpr size_t DEFAULT_VARCHAR_SIZE = 256;
 
   SECTION("VARCHAR column processing with all valid rows")
@@ -529,7 +529,7 @@ TEST_CASE("column_builder - process_column for VARCHAR", "[duckdb_scan_task][col
     size_t total_size = sizeof(int64_t) * (num_rows + 1) +    // offsets
                         DEFAULT_VARCHAR_SIZE * num_rows +     // data
                         sirius::utils::ceil_div_8(num_rows);  // mask
-    auto allocation = create_test_allocation(total_size);
+    auto allocation = create_test_allocation(total_size, *manager);
     builder.initialize_accessors(num_rows, 0, allocation);
 
     // Create a DuckDB vector with string data
@@ -575,7 +575,7 @@ TEST_CASE("column_builder - process_column for VARCHAR", "[duckdb_scan_task][col
     size_t total_size = sizeof(int64_t) * (num_rows + 1) +    // offsets
                         DEFAULT_VARCHAR_SIZE * num_rows +     // data
                         sirius::utils::ceil_div_8(num_rows);  // mask
-    auto allocation = create_test_allocation(total_size);
+    auto allocation = create_test_allocation(total_size, *manager);
     builder.initialize_accessors(num_rows, 0, allocation);
 
     // Create a DuckDB vector with string data
@@ -620,7 +620,7 @@ TEST_CASE("column_builder - process_column for VARCHAR", "[duckdb_scan_task][col
 
 TEST_CASE("column_builder - multiple batch processing", "[duckdb_scan_task][column_builder]")
 {
-  initialize_memory_manager();
+  auto manager = initialize_memory_manager();
 
   SECTION("process multiple batches of INTEGER data")
   {
@@ -629,7 +629,7 @@ TEST_CASE("column_builder - multiple batch processing", "[duckdb_scan_task][colu
 
     size_t num_rows   = 100;
     size_t total_size = sizeof(int32_t) * num_rows + sirius::utils::ceil_div_8(num_rows);
-    auto allocation   = create_test_allocation(total_size);
+    auto allocation   = create_test_allocation(total_size, *manager);
     builder.initialize_accessors(num_rows, 0, allocation);
 
     // Process first batch
@@ -667,7 +667,7 @@ TEST_CASE("column_builder - multiple batch processing", "[duckdb_scan_task][colu
     size_t total_size = sizeof(int64_t) * (num_rows + 1) +    // offsets
                         256 * num_rows +                      // data
                         sirius::utils::ceil_div_8(num_rows);  // mask
-    auto allocation = create_test_allocation(total_size);
+    auto allocation = create_test_allocation(total_size, *manager);
     builder.initialize_accessors(num_rows, 0, allocation);
 
     // Process first batch
@@ -710,7 +710,7 @@ TEST_CASE("column_builder - multiple batch processing", "[duckdb_scan_task][colu
 
     size_t num_rows   = 100;
     size_t total_size = sizeof(int32_t) * num_rows + sirius::utils::ceil_div_8(num_rows);
-    auto allocation   = create_test_allocation(total_size);
+    auto allocation   = create_test_allocation(total_size, *manager);
     builder.initialize_accessors(num_rows, 0, allocation);
 
     // First batch: some NULLs
@@ -763,7 +763,7 @@ TEST_CASE("column_builder - multiple batch processing", "[duckdb_scan_task][colu
 
 TEST_CASE("column_builder - edge cases", "[duckdb_scan_task][column_builder]")
 {
-  initialize_memory_manager();
+  auto manager = initialize_memory_manager();
 
   SECTION("empty vector (0 rows)")
   {
@@ -772,7 +772,7 @@ TEST_CASE("column_builder - edge cases", "[duckdb_scan_task][column_builder]")
 
     size_t num_rows   = 100;
     size_t total_size = sizeof(int32_t) * num_rows + sirius::utils::ceil_div_8(num_rows);
-    auto allocation   = create_test_allocation(total_size);
+    auto allocation   = create_test_allocation(total_size, *manager);
     builder.initialize_accessors(num_rows, 0, allocation);
 
     // Process empty vector
@@ -793,7 +793,7 @@ TEST_CASE("column_builder - edge cases", "[duckdb_scan_task][column_builder]")
 
     size_t num_rows   = 100;
     size_t total_size = sizeof(int32_t) * num_rows + sirius::utils::ceil_div_8(num_rows);
-    auto allocation   = create_test_allocation(total_size);
+    auto allocation   = create_test_allocation(total_size, *manager);
     builder.initialize_accessors(num_rows, 0, allocation);
 
     // Create vector with all NULLs
@@ -830,7 +830,7 @@ TEST_CASE("column_builder - edge cases", "[duckdb_scan_task][column_builder]")
     size_t max_data_size = 1024;
     size_t total_size =
       max_data_size + (num_rows + 1) * sizeof(int64_t) + sirius::utils::ceil_div_8(num_rows);
-    auto allocation = create_test_allocation(total_size);
+    auto allocation = create_test_allocation(total_size, *manager);
     builder.initialize_accessors(num_rows, 0, allocation);
 
     // Create vector with empty strings
@@ -874,7 +874,7 @@ TEST_CASE("column_builder - edge cases", "[duckdb_scan_task][column_builder]")
     size_t max_data_size = 1024;
     size_t total_size =
       max_data_size + (num_rows + 1) * sizeof(int64_t) + sirius::utils::ceil_div_8(num_rows);
-    auto allocation = create_test_allocation(total_size);
+    auto allocation = create_test_allocation(total_size, *manager);
     builder.initialize_accessors(num_rows, 0, allocation);
 
     // Mix of empty and non-empty strings
@@ -921,7 +921,7 @@ TEST_CASE("column_builder - edge cases", "[duckdb_scan_task][column_builder]")
 
     size_t num_rows   = 10;
     size_t total_size = sizeof(int32_t) * num_rows + sirius::utils::ceil_div_8(num_rows);
-    auto allocation   = create_test_allocation(total_size);
+    auto allocation   = create_test_allocation(total_size, *manager);
     builder.initialize_accessors(num_rows, 0, allocation);
 
     // Process single row
@@ -953,7 +953,7 @@ TEST_CASE("column_builder - edge cases", "[duckdb_scan_task][column_builder]")
 TEST_CASE("column_builder - packed allocation multiple columns",
           "[duckdb_scan_task][column_builder]")
 {
-  initialize_memory_manager();
+  auto manager = initialize_memory_manager();
 
   SECTION("two fixed-width columns in packed allocation")
   {
@@ -971,7 +971,7 @@ TEST_CASE("column_builder - packed allocation multiple columns",
     size_t bigint_mask_size = sirius::utils::ceil_div_8(num_rows);
     size_t total_size       = int_data_size + int_mask_size + bigint_data_size + bigint_mask_size;
 
-    auto allocation = create_test_allocation(total_size);
+    auto allocation = create_test_allocation(total_size, *manager);
 
     // Initialize INT column at offset 0
     size_t int_byte_offset = 0;
@@ -1038,7 +1038,7 @@ TEST_CASE("column_builder - packed allocation multiple columns",
     size_t total_size =
       int_data_size + int_mask_size + varchar_offset_size + varchar_data_size + varchar_mask_size;
 
-    auto allocation = create_test_allocation(total_size);
+    auto allocation = create_test_allocation(total_size, *manager);
 
     // Initialize INT column at offset 0
     size_t int_byte_offset = 0;
@@ -1117,7 +1117,7 @@ TEST_CASE("column_builder - packed allocation multiple columns",
       (num_rows + 1) * sizeof(int64_t) + 256 * num_rows + sirius::utils::ceil_div_8(num_rows);
     size_t total_size = int_size + double_size + varchar_size;
 
-    auto allocation = create_test_allocation(total_size);
+    auto allocation = create_test_allocation(total_size, *manager);
 
     int_builder.initialize_accessors(num_rows, 0, allocation);
     double_builder.initialize_accessors(num_rows, int_size, allocation);
@@ -1203,7 +1203,7 @@ TEST_CASE("column_builder - packed allocation multiple columns",
 TEST_CASE("column_builder - VARCHAR space checking edge cases",
           "[duckdb_scan_task][column_builder]")
 {
-  initialize_memory_manager();
+  auto manager = initialize_memory_manager();
 
   SECTION("sufficient_space_for_column returns false when space exceeded")
   {
@@ -1215,7 +1215,7 @@ TEST_CASE("column_builder - VARCHAR space checking edge cases",
     size_t max_data_size = 20;  // Only 20 bytes of data space
     size_t total_size =
       max_data_size + (num_rows + 1) * sizeof(int64_t) + sirius::utils::ceil_div_8(num_rows);
-    auto allocation = create_test_allocation(total_size);
+    auto allocation = create_test_allocation(total_size, *manager);
     builder.initialize_accessors(num_rows, 0, allocation);
 
     // Create vector with strings that exceed allocated space
@@ -1251,7 +1251,7 @@ TEST_CASE("column_builder - VARCHAR space checking edge cases",
     size_t max_data_size = 1024;
     size_t total_size =
       max_data_size + (num_rows + 1) * sizeof(int64_t) + sirius::utils::ceil_div_8(num_rows);
-    auto allocation = create_test_allocation(total_size);
+    auto allocation = create_test_allocation(total_size, *manager);
     builder.initialize_accessors(num_rows, 0, allocation);
 
     // All NULLs - strings don't matter
@@ -1288,7 +1288,7 @@ TEST_CASE("column_builder - VARCHAR space checking edge cases",
     size_t max_data_size = 1024;
     size_t total_size =
       max_data_size + (num_rows + 1) * sizeof(int64_t) + sirius::utils::ceil_div_8(num_rows);
-    auto allocation = create_test_allocation(total_size);
+    auto allocation = create_test_allocation(total_size, *manager);
     builder.initialize_accessors(num_rows, 0, allocation);
 
     duckdb::Vector vec(varchar_type, 10);
@@ -1331,7 +1331,7 @@ TEST_CASE("column_builder - VARCHAR space checking edge cases",
 
 TEST_CASE("column_builder - NULL handling at boundaries", "[duckdb_scan_task][column_builder]")
 {
-  initialize_memory_manager();
+  auto manager = initialize_memory_manager();
 
   SECTION("NULLs at byte boundaries in mask")
   {
@@ -1341,7 +1341,7 @@ TEST_CASE("column_builder - NULL handling at boundaries", "[duckdb_scan_task][co
     // Test with exactly 16 rows (2 mask bytes)
     size_t num_rows   = 16;
     size_t total_size = sizeof(int32_t) * num_rows + sirius::utils::ceil_div_8(num_rows);
-    auto allocation   = create_test_allocation(total_size);
+    auto allocation   = create_test_allocation(total_size, *manager);
     builder.initialize_accessors(num_rows, 0, allocation);
 
     duckdb::Vector vec(int_type, 16);
@@ -1386,7 +1386,7 @@ TEST_CASE("column_builder - NULL handling at boundaries", "[duckdb_scan_task][co
     // Test with 24 rows (3 mask bytes)
     size_t num_rows   = 24;
     size_t total_size = sizeof(int32_t) * num_rows + sirius::utils::ceil_div_8(num_rows);
-    auto allocation   = create_test_allocation(total_size);
+    auto allocation   = create_test_allocation(total_size, *manager);
     builder.initialize_accessors(num_rows, 0, allocation);
 
     duckdb::Vector vec(int_type, 24);
@@ -1415,7 +1415,7 @@ TEST_CASE("column_builder - NULL handling at boundaries", "[duckdb_scan_task][co
     // Test with 20 rows (3 mask bytes, last one partial)
     size_t num_rows   = 20;
     size_t total_size = sizeof(int32_t) * num_rows + sirius::utils::ceil_div_8(num_rows);
-    auto allocation   = create_test_allocation(total_size);
+    auto allocation   = create_test_allocation(total_size, *manager);
     builder.initialize_accessors(num_rows, 0, allocation);
 
     duckdb::Vector vec(int_type, 20);

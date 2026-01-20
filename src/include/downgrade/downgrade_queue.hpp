@@ -84,9 +84,8 @@ class downgrade_task_queue : public itask_queue {
   void push(std::unique_ptr<itask> task) override
   {
     // Convert itask to downgrade_task - since we know it's a downgrade_task
-    auto downgrade_task =
-      std::unique_ptr<downgrade_task>(static_cast<downgrade_task*>(task.release()));
-    push(std::move(downgrade_task));
+    auto dtask = std::unique_ptr<downgrade_task>(static_cast<downgrade_task*>(task.release()));
+    push(std::move(dtask));
   }
 
   /**

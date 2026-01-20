@@ -17,7 +17,6 @@
 #pragma once
 
 #include "config.hpp"
-#include "creator/task_completion.hpp"
 #include "parallel/task_executor.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 

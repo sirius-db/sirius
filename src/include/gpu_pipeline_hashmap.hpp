@@ -41,7 +41,7 @@ namespace sirius {
  */
 class gpu_pipeline_hashmap {
  public:
-  gpu_pipeline_hashmap(duckdb::vector<duckdb::shared_ptr<duckdb::GPUPipeline>> vec)
+  explicit gpu_pipeline_hashmap(duckdb::vector<duckdb::shared_ptr<duckdb::GPUPipeline>> vec)
     : _vec(std::move(vec)) {};
   ~gpu_pipeline_hashmap() = default;
   duckdb::vector<duckdb::shared_ptr<duckdb::GPUPipeline>> _vec;
