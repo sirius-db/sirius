@@ -15,13 +15,14 @@
  */
 
 #pragma once
+
 #include "downgrade/downgrade_queue.hpp"
 #include "downgrade/downgrade_task.hpp"
-#include "memory/memory_reservation.hpp"
 #include "parallel/task_executor.hpp"
 
 #include <data/data_repository.hpp>
 #include <data/data_repository_manager.hpp>
+#include <memory/memory_reservation.hpp>
 
 namespace sirius {
 namespace parallel {
@@ -56,11 +57,11 @@ class downgrade_executor : public itask_executor {
    */
   ~downgrade_executor() override = default;
 
-  // Non-copyable but movable
+  // Non-copyable and non-movable
   downgrade_executor(const downgrade_executor&)            = delete;
   downgrade_executor& operator=(const downgrade_executor&) = delete;
-  downgrade_executor(downgrade_executor&&)                 = default;
-  downgrade_executor& operator=(downgrade_executor&&)      = default;
+  downgrade_executor(downgrade_executor&&)                 = delete;
+  downgrade_executor& operator=(downgrade_executor&&)      = delete;
 
   /**
    * @brief Schedules a downgrade task for execution
@@ -73,7 +74,7 @@ class downgrade_executor : public itask_executor {
   void schedule_downgrade_task(std::unique_ptr<downgrade_task> downgrade_task)
   {
     // Convert to itask and use parent's schedule method
-    schedule(std::move(downgrade_task));
+    this->schedule(std::move(downgrade_task));
   }
 
   /**

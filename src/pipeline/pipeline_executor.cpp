@@ -17,27 +17,28 @@
 #include "pipeline/pipeline_executor.hpp"
 
 #include "config.hpp"
+#include "memory/common.hpp"
 #include "memory/memory_reservation.hpp"
-#include "memory/sirius_memory_manager.hpp"
+#include "memory/sirius_memory_reservation_manager.hpp"
 #include "pipeline/pipeline_queue.hpp"
 
 namespace sirius {
 namespace pipeline {
 
-pipeline_executor::pipeline_executor(sirius::parallel::task_executor_config pipeline_config,
-                                     sirius::parallel::task_executor_config gpu_executor_config,
-                                     size_t num_gpus)
-  : sirius::parallel::itask_executor(std::make_unique<pipeline_queue>(pipeline_config.num_threads),
-                                     pipeline_config)
+pipeline_executor::pipeline_executor(const parallel::task_executor_config& gpu_task_executor_config,
+                                     sirius::memory::sirius_memory_reservation_manager& mem_mgr)
+  : sirius::parallel::itask_executor(std::make_unique<pipeline_queue>(1),
+                                     {.num_threads = 1, .retry_on_error = false})
 {
+  auto gpu_spaces = mem_mgr.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+  auto num_gpus   = gpu_spaces.size();
   // Initialize GPU pipeline executors for each available GPU
   _gpu_executors.reserve(num_gpus);
-  for (int i = 0; i < num_gpus; ++i) {
-    const cucascade::memory::memory_space* gpu_mem_space = nullptr;  // Placeholder
+  for (auto* space : gpu_spaces) {
     _gpu_executors.push_back(
-      std::make_unique<gpu_pipeline_executor>(gpu_executor_config, gpu_mem_space, this));
+      std::make_unique<gpu_pipeline_executor>(gpu_task_executor_config, space, this));
   }
-  _task_request_queue = std::make_unique<task_request_queue>(pipeline_config.num_threads);
+  _task_request_queue = std::make_unique<task_request_queue>(1);
 }
 
 void pipeline_executor::schedule(std::unique_ptr<sirius::parallel::itask> task)

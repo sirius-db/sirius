@@ -14,9 +14,8 @@
  * limitations under the License.
  */
 
+#include "duckdb/main/database.hpp"
 #define DUCKDB_EXTENSION_MAIN
-
-#include "sirius_extension.hpp"
 
 #include "config.hpp"
 #include "data/sirius_converter_registry.hpp"
@@ -43,15 +42,15 @@
 #include "gpu_context.hpp"
 #include "gpu_physical_plan_generator.hpp"
 #include "log/logging.hpp"
-// #include "substrait_extension.hpp"
-// #include "to_substrait.hpp"
+#include "sirius_context.hpp"
+#include "sirius_extension.hpp"
 
 #include <cstdlib>
 
 namespace duckdb {
 
-const std::string PINNED_MEMORY_PARAM_KEY = "pinned_memory_size";
-bool buffer_is_initialized                = false;
+const std::string PINNED_MEMORY_PARAM_KEY   = "pinned_memory_size";
+bool SiriusExtension::buffer_is_initialized = false;
 
 struct GPUTableFunctionData : public TableFunctionData {
   GPUTableFunctionData() = default;
@@ -153,10 +152,10 @@ static unique_ptr<GPUPhysicalOperator> GPUGeneratePhysicalPlan(
 // The result of the GPUProcessingBind function is a unique pointer to a FunctionData object.
 // This result of this function is used as an argument to the GPUProcessingFunction function (data_p
 // argument), which is called to execute the table function.
-static unique_ptr<FunctionData> GPUProcessingBind(ClientContext& context,
-                                                  TableFunctionBindInput& input,
-                                                  vector<LogicalType>& return_types,
-                                                  vector<string>& names)
+unique_ptr<FunctionData> SiriusExtension::GPUProcessingBind(ClientContext& context,
+                                                            TableFunctionBindInput& input,
+                                                            vector<LogicalType>& return_types,
+                                                            vector<string>& names)
 {
   auto result              = make_uniq<GPUTableFunctionData>();
   result->conn             = make_uniq<Connection>(*context.db);
@@ -210,9 +209,9 @@ static unique_ptr<FunctionData> GPUProcessingBind(ClientContext& context,
   return std::move(result);
 }
 
-static void GPUProcessingFunction(ClientContext& context,
-                                  TableFunctionInput& data_p,
-                                  DataChunk& output)
+void SiriusExtension::GPUProcessingFunction(ClientContext& context,
+                                            TableFunctionInput& data_p,
+                                            DataChunk& output)
 {
   auto& data = (GPUTableFunctionData&)*data_p.bind_data;
   if (data.finished) { return; }
@@ -398,10 +397,10 @@ struct GPUBufferInitFunctionData : public TableFunctionData {
   size_t pinned_memory_size;
 };
 
-static unique_ptr<FunctionData> GPUBufferInitBind(ClientContext& context,
-                                                  TableFunctionBindInput& input,
-                                                  vector<LogicalType>& return_types,
-                                                  vector<string>& names)
+unique_ptr<FunctionData> SiriusExtension::GPUBufferInitBind(ClientContext& context,
+                                                            TableFunctionBindInput& input,
+                                                            vector<LogicalType>& return_types,
+                                                            vector<string>& names)
 {
   auto result = make_uniq<GPUBufferInitFunctionData>();
 
@@ -474,9 +473,9 @@ static unique_ptr<FunctionData> GPUBufferInitBind(ClientContext& context,
   return std::move(result);
 }
 
-static void GPUBufferInitFunction(ClientContext& context,
-                                  TableFunctionInput& data_p,
-                                  DataChunk& output)
+void SiriusExtension::GPUBufferInitFunction(ClientContext& context,
+                                            TableFunctionInput& data_p,
+                                            DataChunk& output)
 {
   auto& data = data_p.bind_data->CastNoConst<GPUBufferInitFunctionData>();
   if (data.finished) { return; }
@@ -502,9 +501,9 @@ static void GPUBufferInitFunction(ClientContext& context,
   data.finished = true;
 }
 
-static void InitializeGPUExtension(Connection& con)
+void SiriusExtension::RegisterGPUFunctions(ClientContext& context)
 {
-  auto& catalog = Catalog::GetSystemCatalog(*con.context);
+  auto& catalog = Catalog::GetSystemCatalog(context);
 
   TableFunction gpu_buffer_init("gpu_buffer_init",
                                 {LogicalType::VARCHAR, LogicalType::VARCHAR},
@@ -512,25 +511,15 @@ static void InitializeGPUExtension(Connection& con)
                                 GPUBufferInitBind);
   gpu_buffer_init.named_parameters[PINNED_MEMORY_PARAM_KEY] = LogicalType::VARCHAR;
   CreateTableFunctionInfo gpu_buffer_init_info(gpu_buffer_init);
-  catalog.CreateTableFunction(*con.context, gpu_buffer_init_info);
+  catalog.CreateTableFunction(context, gpu_buffer_init_info);
 
-  // TableFunction gpu_caching("gpu_caching", {LogicalType::VARCHAR}, GPUCachingFunction,
-  // GPUCachingBind); CreateTableFunctionInfo gpu_caching_info(gpu_caching);
-  // catalog.CreateTableFunction(*con.context, gpu_caching_info);
-
-  TableFunction gpu_processing(
-    "gpu_processing", {LogicalType::VARCHAR}, GPUProcessingFunction, GPUProcessingBind);
+  TableFunction gpu_processing("gpu_processing",
+                               {LogicalType::VARCHAR},
+                               GPUProcessingFunction,
+                               SiriusExtension::GPUProcessingBind);
   gpu_processing.named_parameters["enable_optimizer"] = LogicalType::BOOLEAN;
   CreateTableFunctionInfo gpu_processing_info(gpu_processing);
-  catalog.CreateTableFunction(*con.context, gpu_processing_info);
-
-  // TableFunction gpu_processing_substrait("gpu_processing_substrait",
-  //                                        {LogicalType::BLOB},
-  //                                        GPUProcessingSubstraitFunction,
-  //                                        GPUProcessingSubstraitBind);
-  // // gpu_processing.named_parameters["enable_optimizer"] = LogicalType::BOOLEAN;
-  // CreateTableFunctionInfo gpu_processing_substrait_info(gpu_processing_substrait);
-  // catalog.CreateTableFunction(*con.context, gpu_processing_substrait_info);
+  catalog.CreateTableFunction(context, gpu_processing_info);
 }
 
 static void SetUsePinMemory(ClientContext& context, SetScope scope, Value& parameter)
@@ -611,10 +600,8 @@ static void SetDefaultScanTaskVarcharSize(ClientContext& context, SetScope scope
                    Config::DEFAULT_SCAN_TASK_VARCHAR_SIZE);
 }
 
-static void InitialGPUConfigs(DuckDB& db)
+void SiriusExtension::InitialGPUConfigs(DBConfig& config)
 {
-  auto& config = DBConfig::GetConfig(*db.instance);
-
   // Add in config option for gpu buffer manager
   config.AddExtensionOption("use_pin_memory",
                             "Whether or not the buffer manager is initialized with pinned memory",
@@ -721,20 +708,14 @@ static void InitialGPUConfigs(DuckDB& db)
 static void LoadInternal(ExtensionLoader& loader)
 {
   DuckDB db(loader.GetDatabaseInstance());
-  // First initialize the config before acquiring a connection the database
-  InitialGPUConfigs(db);
+  auto& config = DBConfig::GetConfig(loader.GetDatabaseInstance());
+  config.extension_callbacks.push_back(make_uniq<duckdb::SiriusContextExtensionCallback>());
+  sirius::converter_registry::initialize();
+  SiriusExtension::InitialGPUConfigs(config);
 
   Connection con(db);
   con.BeginTransaction();
-
-  InitGlobalLogger();
-
-  // Initialize the representation converter registry with builtin converters
-  // This is used for converting data between GPU and HOST representations
-  sirius::converter_registry::initialize();
-
-  InitializeGPUExtension(con);
-
+  SiriusExtension::RegisterGPUFunctions(*con.context);
   con.Commit();
 }
 

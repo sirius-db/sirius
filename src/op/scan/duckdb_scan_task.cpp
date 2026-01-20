@@ -17,7 +17,6 @@
 // sirius
 #include <helper/utils.hpp>
 #include <memory/memory_reservation.hpp>
-#include <memory/sirius_memory_manager.hpp>
 #include <op/scan/duckdb_scan_task.hpp>
 
 // duckdb
@@ -36,11 +35,13 @@ duckdb_scan_task_global_state::duckdb_scan_task_global_state(
   duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
   duckdb_scan_executor& scan_exec,
   duckdb::ClientContext& client_ctx,
-  op::sirius_physical_table_scan* scan_op)
+  sirius_physical_table_scan* scan_op,
+  sirius::memory::sirius_memory_reservation_manager& mem_res_mgr)
   : pipeline(std::move(pipeline)),
     max_threads(scan_exec.get_num_threads()),
     scan_executor(scan_exec),
-    op(*scan_op)
+    op(*scan_op),
+    mem_res_mgr(mem_res_mgr)
 {
   // Initialize global table function state
   if (op.function.init_global) {
@@ -283,7 +284,7 @@ duckdb_scan_task_local_state::duckdb_scan_task_local_state(
   auto const& op = g_state.op;
   num_columns    = op.projection_ids.size();
 
-  auto& mem_res_mgr = sirius::memory_manager::get();
+  auto& mem_res_mgr = g_state.mem_res_mgr;
 
   // Make the memory reservation request
   reservation = mem_res_mgr.request_reservation(res_request, approximate_batch_size);

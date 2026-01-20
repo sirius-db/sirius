@@ -19,6 +19,7 @@
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/pipeline_executor.hpp"
 #include "pipeline/task_request.hpp"
+#include "scan/test_utils.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -92,8 +93,9 @@ class mock_gpu_pipeline_task : public gpu_pipeline_task {
 
 TEST_CASE("Pipeline executor can start and stop gracefully", "[pipeline_executor]")
 {
+  auto manager = initialize_memory_manager(1);
   task_executor_config config{2, false};
-  pipeline_executor executor(config, config, 1);
+  pipeline_executor executor(config, *manager);
 
   REQUIRE_NOTHROW(executor.start());
   REQUIRE_NOTHROW(executor.stop());
@@ -101,8 +103,9 @@ TEST_CASE("Pipeline executor can start and stop gracefully", "[pipeline_executor
 
 TEST_CASE("Pipeline executor executes tasks through pipeline_queue", "[pipeline_executor]")
 {
+  auto manager = initialize_memory_manager(1);
   task_executor_config config{2, false};
-  pipeline_executor executor(config, config, 1);
+  pipeline_executor executor(config, *manager);
 
   auto global_state = std::make_shared<mock_gpu_pipeline_task_global_state>();
 
@@ -140,8 +143,16 @@ TEST_CASE("Pipeline executor executes tasks through pipeline_queue", "[pipeline_
 
 TEST_CASE("Pipeline executor dispatches tasks to multiple GPU executors", "[pipeline_executor]")
 {
+  std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> manager;
+
+  try {
+    manager = initialize_memory_manager(2);
+  } catch (const std::exception& e) {
+    WARN("Skipping test due to insufficient GPUs: " << e.what());
+    return;
+  }
   task_executor_config config{2, false};
-  pipeline_executor executor(config, config, 2);
+  pipeline_executor executor(config, *manager);
 
   auto global_state = std::make_shared<mock_gpu_pipeline_task_global_state>();
 
@@ -186,8 +197,9 @@ TEST_CASE("Pipeline executor dispatches tasks to multiple GPU executors", "[pipe
 
 TEST_CASE("GPU pipeline executor can start and stop independently", "[gpu_pipeline_executor]")
 {
+  auto manager = initialize_memory_manager(1);
   task_executor_config config{2, false};
-  pipeline_executor main_executor(config, config, 1);
+  pipeline_executor main_executor(config, *manager);
 
   // GPU pipeline executor is created internally by pipeline_executor
   // but we can test its lifecycle through the main executor
@@ -197,8 +209,9 @@ TEST_CASE("GPU pipeline executor can start and stop independently", "[gpu_pipeli
 
 TEST_CASE("Task queue handles empty queue gracefully", "[pipeline_queue]")
 {
+  auto manager = initialize_memory_manager(1);
   task_executor_config config{1, false};
-  pipeline_executor executor(config, config, 1);
+  pipeline_executor executor(config, *manager);
 
   auto global_state = std::make_shared<mock_gpu_pipeline_task_global_state>();
 
@@ -214,8 +227,16 @@ TEST_CASE("Task queue handles empty queue gracefully", "[pipeline_queue]")
 
 TEST_CASE("Pipeline executor handles rapid task submission", "[pipeline_executor]")
 {
+  std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> manager;
+
+  try {
+    manager = initialize_memory_manager(2);
+  } catch (const std::exception& e) {
+    WARN("Skipping test due to insufficient GPUs: " << e.what());
+    return;
+  }
   task_executor_config config{4, false};
-  pipeline_executor executor(config, config, 2);
+  pipeline_executor executor(config, *manager);
 
   auto global_state = std::make_shared<mock_gpu_pipeline_task_global_state>();
 
@@ -250,8 +271,16 @@ TEST_CASE("Pipeline executor handles rapid task submission", "[pipeline_executor
 
 TEST_CASE("Pipeline executor task and request queue synchronization", "[pipeline_executor]")
 {
+  std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> manager;
+
+  try {
+    manager = initialize_memory_manager(2);
+  } catch (const std::exception& e) {
+    WARN("Skipping test due to insufficient GPUs: " << e.what());
+    return;
+  }
   task_executor_config config{2, false};
-  pipeline_executor executor(config, config, 2);
+  pipeline_executor executor(config, *manager);
 
   auto global_state = std::make_shared<mock_gpu_pipeline_task_global_state>();
 
@@ -288,8 +317,9 @@ TEST_CASE("Pipeline executor task and request queue synchronization", "[pipeline
 
 TEST_CASE("Multiple start/stop cycles work correctly", "[pipeline_executor]")
 {
+  auto manager = initialize_memory_manager(1);
   task_executor_config config{2, false};
-  pipeline_executor executor(config, config, 1);
+  pipeline_executor executor(config, *manager);
 
   auto global_state = std::make_shared<mock_gpu_pipeline_task_global_state>();
 

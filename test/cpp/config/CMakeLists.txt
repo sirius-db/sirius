@@ -14,8 +14,7 @@
 # the License.
 # =============================================================================
 
-set(EXTENSION_SOURCES
-    ${EXTENSION_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/downgrade_task.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/downgrade_queue.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/downgrade_executor.cpp
+set(TEST_SOURCES
+    ${TEST_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/test_config.cpp ${TEST_SOURCES}
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_context.cpp
     PARENT_SCOPE)

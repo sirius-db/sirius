@@ -61,6 +61,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/krb5-1.21.3-h659f571_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/ld_impl_linux-64-2.45-default_hbd61a6d_105.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/libcap-2.77-h3ff7636_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/libconfig-1.7.3-h59595ed_0.conda
       - conda: https://conda.anaconda.org/rapidsai/linux-64/libcudf-25.10.00-cuda12_251008_f4e35ca0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/libcufile-1.14.1.1-hbc026e6_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/libcufile-dev-1.14.1.1-hecca717_1.conda
@@ -177,6 +178,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/krb5-1.21.3-h50a48e9_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/ld_impl_linux-aarch64-2.45-default_h1979696_105.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/libcap-2.77-h68e9139_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/libconfig-1.7.3-h2f0025b_0.conda
       - conda: https://conda.anaconda.org/rapidsai/linux-aarch64/libcudf-25.10.00-cuda12_251008_f4e35ca0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/libcufile-1.14.1.1-had8bf56_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/libcufile-dev-1.14.1.1-he38c790_1.conda
@@ -300,6 +302,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/krb5-1.21.3-h659f571_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/ld_impl_linux-64-2.45-default_hbd61a6d_104.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/libcap-2.77-h3ff7636_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/libconfig-1.7.3-h59595ed_0.conda
       - conda: https://conda.anaconda.org/rapidsai/linux-64/libcudf-25.10.00-cuda13_251008_f4e35ca0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/libcufile-1.15.1.6-hbc026e6_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/libcufile-dev-1.15.1.6-hecca717_0.conda
@@ -415,6 +418,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/krb5-1.21.3-h50a48e9_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/ld_impl_linux-aarch64-2.45-default_h1979696_104.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/libcap-2.77-h68e9139_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/libconfig-1.7.3-h2f0025b_0.conda
       - conda: https://conda.anaconda.org/rapidsai/linux-aarch64/libcudf-25.10.00-cuda13_251008_f4e35ca0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/libcufile-1.15.1.6-had8bf56_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/libcufile-dev-1.15.1.6-he38c790_0.conda
@@ -2290,6 +2294,24 @@ packages:
   license_family: BSD
   size: 108542
   timestamp: 1762350753349
+- conda: https://conda.anaconda.org/conda-forge/linux-64/libconfig-1.7.3-h59595ed_0.conda
+  sha256: 5ff3a5406dc4d4ff330f85c06017045f137c82a101a7d39bdc1c4d1790b4b00b
+  md5: c97f8fcf2b4314c9718efaab6bbdd2cf
+  depends:
+  - libgcc-ng >=12
+  - libstdcxx-ng >=12
+  license: LGPL-2.1-only
+  size: 112719
+  timestamp: 1711717205031
+- conda: https://conda.anaconda.org/conda-forge/linux-aarch64/libconfig-1.7.3-h2f0025b_0.conda
+  sha256: 131f3f6f2fd1f26cb69b929c68476d4bef0fde0deb3f7e1d28dc9e75951199d9
+  md5: 6ced5549c3ad2c3a6c666b35ecb24b9c
+  depends:
+  - libgcc-ng >=12
+  - libstdcxx-ng >=12
+  license: LGPL-2.1-only
+  size: 107929
+  timestamp: 1711802451678
 - conda: https://conda.anaconda.org/rapidsai/linux-64/libcudf-25.10.00-cuda12_251008_f4e35ca0.conda
   sha256: 6d47ec99df220ac53c184e30c24e03c6c1f7610eeb22ab8ffcd7fcce900a4ace
   md5: 317192f50f3bda357e7640bc03310c3c
