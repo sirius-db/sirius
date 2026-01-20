@@ -50,7 +50,7 @@ struct GPUActiveQueryContext {
   //! The query that is currently being executed
   string query;
   //! Prepared statement data
-  shared_ptr<GPUPreparedStatementData> gpu_prepared;
+  shared_ptr<SiriusPreparedStatementData> gpu_prepared;
   //! The query executor
   unique_ptr<GPUExecutor> gpu_executor;
   //! The progress bar
@@ -82,18 +82,18 @@ class GPUContext {
 
   unique_ptr<PendingQueryResult> GPUPendingStatementInternal(
     ClientContext& context,
-    shared_ptr<GPUPreparedStatementData>& statement_p,
+    shared_ptr<SiriusPreparedStatementData>& statement_p,
     const PendingQueryParameters& parameters);
 
   unique_ptr<PendingQueryResult> GPUPendingStatementOrPreparedStatement(
     ClientContext& context,
     const string& query,
-    shared_ptr<GPUPreparedStatementData>& statement_p,
+    shared_ptr<SiriusPreparedStatementData>& statement_p,
     const PendingQueryParameters& parameters);
 
   unique_ptr<QueryResult> GPUExecuteQuery(ClientContext& context,
                                           const string& query,
-                                          shared_ptr<GPUPreparedStatementData>& statement_p,
+                                          shared_ptr<SiriusPreparedStatementData>& statement_p,
                                           const PendingQueryParameters& parameters);
 
   unique_ptr<QueryResult> GPUExecutePendingQueryResult(PendingQueryResult& pending);

@@ -110,6 +110,7 @@ class GPUExecutor {
   void initialize(unique_ptr<::sirius::op::sirius_physical_operator> physical_plan);
   void initialize_internal(::sirius::op::sirius_physical_operator& physical_result_collector);
   void Execute();
+  void execute();
   void Reset();
   shared_ptr<GPUPipeline> CreateChildPipeline(GPUPipeline& current, GPUPhysicalOperator& op);
   shared_ptr<::sirius::pipeline::sirius_pipeline> create_child_pipeline(

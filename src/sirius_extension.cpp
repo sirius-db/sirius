@@ -42,6 +42,7 @@
 #include "gpu_context.hpp"
 #include "gpu_physical_plan_generator.hpp"
 #include "log/logging.hpp"
+#include "planner/sirius_physical_plan_generator.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
 
@@ -55,7 +56,7 @@ bool SiriusExtension::buffer_is_initialized = false;
 struct GPUTableFunctionData : public TableFunctionData {
   GPUTableFunctionData() = default;
   shared_ptr<Relation> plan;
-  shared_ptr<GPUPreparedStatementData> gpu_prepared;
+  shared_ptr<SiriusPreparedStatementData> gpu_prepared;
   unique_ptr<QueryResult> res;
   unique_ptr<Connection> conn;
   unique_ptr<GPUContext> gpu_context;
@@ -138,14 +139,15 @@ struct GPUTableFunctionData : public TableFunctionData {
 
 void do_nothing_context(ClientContext*) {}
 
-static unique_ptr<GPUPhysicalOperator> GPUGeneratePhysicalPlan(
+static unique_ptr<sirius::op::sirius_physical_operator> GPUGeneratePhysicalPlan(
   ClientContext& context,
   GPUContext& gpu_context,
   unique_ptr<LogicalOperator>& logical_plan,
   Connection& new_conn)
 {
-  GPUPhysicalPlanGenerator physical_planner = GPUPhysicalPlanGenerator(context, gpu_context);
-  auto physical_plan                        = physical_planner.CreatePlan(std::move(logical_plan));
+  sirius::planner::sirius_physical_plan_generator physical_planner =
+    sirius::planner::sirius_physical_plan_generator(context, gpu_context);
+  auto physical_plan = physical_planner.create_plan(std::move(logical_plan));
   return physical_plan;
 }
 
@@ -187,8 +189,8 @@ unique_ptr<FunctionData> SiriusExtension::GPUProcessingBind(ClientContext& conte
     try {
       auto gpu_physical_plan =
         GPUGeneratePhysicalPlan(context, *result->gpu_context, query_plan, *result->conn);
-      auto gpu_prepared    = make_shared_ptr<GPUPreparedStatementData>(std::move(prepared),
-                                                                    std::move(gpu_physical_plan));
+      auto gpu_prepared = make_shared_ptr<SiriusPreparedStatementData>(
+        std::move(prepared), std::move(gpu_physical_plan));
       result->gpu_prepared = gpu_prepared;
     } catch (std::exception& e) {
       ErrorData error(e);

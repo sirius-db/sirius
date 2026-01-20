@@ -41,6 +41,8 @@
 #include "operator/gpu_physical_partition.hpp"
 #include "operator/gpu_physical_result_collector.hpp"
 #include "operator/gpu_physical_table_scan.hpp"
+#include "sirius_context.hpp"
+#include "sirius_pipeline_hashmap.hpp"
 
 #include <data/data_repository_manager.hpp>
 #include <stdio.h>
@@ -440,6 +442,24 @@ void GPUExecutor::initialize(unique_ptr<::sirius::op::sirius_physical_operator> 
   Reset();
   sirius_owned_plan = std::move(plan);
   initialize_internal(*sirius_owned_plan);
+}
+
+void GPUExecutor::execute()
+{
+  SIRIUS_LOG_DEBUG("Total meta pipelines {}", scheduled.size());
+
+  // Create sirius_pipeline_hashmap and set it on task_creator
+  if (!sirius_pipelines.empty()) {
+    auto sirius_pipeline_map = sirius::sirius_pipeline_hashmap(sirius_pipelines);
+
+    // Get SiriusContext from the client context
+    auto sirius_context = context.registered_state->Get<SiriusContext>("sirius_state");
+    if (sirius_context) {
+      auto& task_creator = sirius_context->get_task_creator();
+      task_creator.set_pipeline_hashmap(sirius_pipeline_map);
+      task_creator.start();
+    }
+  }
 }
 
 void GPUExecutor::initialize_internal(::sirius::op::sirius_physical_operator& plan)
@@ -999,4 +1019,4 @@ void GPUExecutor::initialize_internal(::sirius::op::sirius_physical_operator& pl
   }
 }
 
-};  // namespace duckdb
+}  // namespace duckdb
