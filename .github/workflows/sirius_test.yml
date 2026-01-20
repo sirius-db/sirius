@@ -35,7 +35,7 @@ jobs:
       - name: Prepare SQL test datasets
         run: |
           cd test_datasets
-          unzip tpch-dbgen.zip
+          unzip -o tpch-dbgen.zip
           cd tpch-dbgen
           ./dbgen -s 1 -f && mkdir s1 && mv *.tbl s1
           cd ../../
