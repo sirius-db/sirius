@@ -19,6 +19,7 @@
 #include "config.hpp"
 #include "memory/memory_reservation.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
+#include "memory/topology_discovery.hpp"
 #include "parallel/task_executor.hpp"
 #include "pipeline/gpu_pipeline_executor.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
@@ -48,7 +49,8 @@ class pipeline_executor : public sirius::parallel::itask_executor {
    * @param num_gpus Number of GPU executors to create
    */
   explicit pipeline_executor(const parallel::task_executor_config& gpu_task_executor_config,
-                             sirius::memory::sirius_memory_reservation_manager& mem_mgr);
+                             sirius::memory::sirius_memory_reservation_manager& mem_mgr,
+                             cucascade::memory::system_topology_info* sys_topology = nullptr);
 
   /**
    * @brief Destructor for the gpu_pipeline_executor.

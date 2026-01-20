@@ -21,6 +21,7 @@
 #include "extension_lock.hpp"
 #include "log/logging.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
+#include "memory/topology_discovery.hpp"
 
 #include <spdlog/sinks/basic_file_sink.h>
 #include <spdlog/spdlog.h>

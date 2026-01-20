@@ -28,15 +28,6 @@
 namespace sirius {
 namespace parallel {
 
-struct task_executor_thread {
-  explicit task_executor_thread(std::unique_ptr<std::thread> thread)
-    : _internal_thread(std::move(thread))
-  {
-  }
-
-  std::unique_ptr<std::thread> _internal_thread;
-};
-
 /**
  * Interface for a thread pool used by different concrete executors like `gpu_pipeline_executor`,
  * can be extended to support various kinds of tasks and scheduling policies.
@@ -44,7 +35,7 @@ struct task_executor_thread {
 class itask_executor {
  public:
   itask_executor(std::unique_ptr<itask_queue> task_queue, task_executor_config config)
-    : _task_queue(std::move(task_queue)), _config(config), _running(false)
+    : _task_queue(std::move(task_queue)), _config(std::move(config)), _running(false)
   {
   }
 
@@ -78,7 +69,7 @@ class itask_executor {
   std::unique_ptr<itask_queue> _task_queue;
   task_executor_config _config;
   std::atomic<bool> _running;
-  std::vector<std::unique_ptr<task_executor_thread>> _threads;
+  std::vector<std::thread> _threads;
 };
 
 }  // namespace parallel
