@@ -62,33 +62,34 @@ class SiriusContext : public ClientContextState {
   void QueryEnd(ClientContext& context, optional_ptr<ErrorData> error) final;
 
   /// \brief Initialize the Sirius context with the given configuration.
-  void initialize(const sirius::sirius_config& config);
+  void initialize(const ::sirius::sirius_config& config);
 
   /// \brief Terminate the Sirius context, releasing all resources.
   void terminate();
 
   /// \brief Get the memory reservation manager.
-  [[nodiscard]] sirius::memory::sirius_memory_reservation_manager& get_memory_manager();
-  [[nodiscard]] const sirius::memory::sirius_memory_reservation_manager& get_memory_manager() const;
+  [[nodiscard]] ::sirius::memory::sirius_memory_reservation_manager& get_memory_manager();
+  [[nodiscard]] const ::sirius::memory::sirius_memory_reservation_manager& get_memory_manager()
+    const;
 
   [[nodiscard]] cucascade::shared_data_repository_manager& get_data_repository_manager();
   [[nodiscard]] const cucascade::shared_data_repository_manager& get_data_repository_manager()
     const;
 
-  [[nodiscard]] sirius::pipeline::pipeline_executor& get_pipeline_executor();
-  [[nodiscard]] const sirius::pipeline::pipeline_executor& get_pipeline_executor() const;
+  [[nodiscard]] ::sirius::pipeline::pipeline_executor& get_pipeline_executor();
+  [[nodiscard]] const ::sirius::pipeline::pipeline_executor& get_pipeline_executor() const;
 
-  [[nodiscard]] sirius::parallel::downgrade_executor& get_downgrade_executor();
-  [[nodiscard]] const sirius::parallel::downgrade_executor& get_downgrade_executor() const;
+  [[nodiscard]] ::sirius::parallel::downgrade_executor& get_downgrade_executor();
+  [[nodiscard]] const ::sirius::parallel::downgrade_executor& get_downgrade_executor() const;
 
-  [[nodiscard]] sirius::op::scan::duckdb_scan_executor& get_duckdb_scan_executor();
-  [[nodiscard]] const sirius::op::scan::duckdb_scan_executor& get_duckdb_scan_executor() const;
+  [[nodiscard]] ::sirius::op::scan::duckdb_scan_executor& get_duckdb_scan_executor();
+  [[nodiscard]] const ::sirius::op::scan::duckdb_scan_executor& get_duckdb_scan_executor() const;
 
-  [[nodiscard]] sirius::creator::task_creator& get_task_creator();
-  [[nodiscard]] const sirius::creator::task_creator& get_task_creator() const;
+  [[nodiscard]] ::sirius::creator::task_creator& get_task_creator();
+  [[nodiscard]] const ::sirius::creator::task_creator& get_task_creator() const;
 
   /// \brief Get the current Sirius configuration.
-  [[nodiscard]] const sirius::sirius_config& get_config() const noexcept { return config_; }
+  [[nodiscard]] const ::sirius::sirius_config& get_config() const noexcept { return config_; }
 
  private:
   // friend sirius_context& get_sirius_context();
@@ -97,13 +98,13 @@ class SiriusContext : public ClientContextState {
 
   mutable std::mutex mutex_;
   bool is_initialized_ = false;
-  sirius::sirius_config config_;
-  std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory_manager_;
+  ::sirius::sirius_config config_;
+  std::unique_ptr<::sirius::memory::sirius_memory_reservation_manager> memory_manager_;
   std::unique_ptr<cucascade::shared_data_repository_manager> data_repository_manager_;
-  std::unique_ptr<sirius::pipeline::pipeline_executor> pipeline_executor_;
-  std::unique_ptr<sirius::parallel::downgrade_executor> downgrade_executor_;
-  std::unique_ptr<sirius::op::scan::duckdb_scan_executor> duckdb_scan_executor_;
-  std::unique_ptr<sirius::creator::task_creator> task_creator_;
+  std::unique_ptr<::sirius::pipeline::pipeline_executor> pipeline_executor_;
+  std::unique_ptr<::sirius::parallel::downgrade_executor> downgrade_executor_;
+  std::unique_ptr<::sirius::op::scan::duckdb_scan_executor> duckdb_scan_executor_;
+  std::unique_ptr<::sirius::creator::task_creator> task_creator_;
 };
 
 /// todo(amin): when duckdb is updated, we need to enable OnExtensionLoaded to support sirius
@@ -133,8 +134,8 @@ class SiriusContextExtensionCallback : public ExtensionCallback {
  private:
   void read_config_file_if_exists();
 
-  std::unique_ptr<sirius::extension_lock> extension_lock_;
-  sirius::sirius_config config_;
+  std::unique_ptr<::sirius::extension_lock> extension_lock_;
+  ::sirius::sirius_config config_;
   duckdb::shared_ptr<SiriusContext> context_;
 };
 

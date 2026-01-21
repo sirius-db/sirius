@@ -18,14 +18,19 @@
 
 // sirius
 #include <config.hpp>
+#include <memory/host_table_utils.hpp>
+#include <op/scan/duckdb_scan_executor.hpp>
+#include <op/sirius_physical_table_scan.hpp>
+#include <parallel/task.hpp>
+#include <pipeline/sirius_pipeline.hpp>
+#include <sirius_context.hpp>
+
+// cucascade
+#include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
-#include <memory/sirius_memory_reservation_manager.hpp>
-#include <op/scan/duckdb_scan_executor.hpp>
-#include <op/sirius_physical_table_scan.hpp>
-#include <parallel/task.hpp>
 
 // duckdb
 #include <duckdb/common/types.hpp>
@@ -64,8 +69,7 @@ class duckdb_scan_task_global_state : public sirius::parallel::itask_global_stat
   duckdb_scan_task_global_state(duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
                                 duckdb_scan_executor& scan_exec,
                                 duckdb::ClientContext& client_ctx,
-                                op::sirius_physical_table_scan* scan_op,
-                                sirius::memory::sirius_memory_reservation_manager& mem_res_mgr);
+                                sirius_physical_table_scan* scan_op);
 
   //===----------Methods----------===//
   /**
@@ -88,18 +92,32 @@ class duckdb_scan_task_global_state : public sirius::parallel::itask_global_stat
    */
   void set_source_drained() { source_drained.store(true, std::memory_order_release); }
 
-  //===----------Fields----------===//
-  std::atomic<bool> source_drained{false};  ///< Whether the table scan source is fully drained
-  duckdb::shared_ptr<pipeline::sirius_pipeline>
-    pipeline;            ///< The pipeline to which this table scan belongs
-  uint64_t max_threads;  ///< Maximum number of threads for this scan task
+  /**
+   * @brief Register a new local table function state.
+   */
+  void register_local_state() { active_local_states.fetch_add(1, std::memory_order_relaxed); }
 
-  duckdb::unique_ptr<duckdb::GlobalTableFunctionState>
+  /**
+   * @brief Release a local table function state and mark source drained if none remain.
+   */
+  void release_local_state()
+  {
+    auto const remaining = active_local_states.fetch_sub(1, std::memory_order_acq_rel) - 1;
+    if (remaining == 0) { set_source_drained(); }
+  }
+
+  //===----------Fields----------===//
+  std::atomic<bool> source_drained{false};      ///< Whether the table scan source is fully drained
+  std::atomic<int64_t> active_local_states{0};  ///< Number of active local table function states
+  uint64_t max_threads;                         ///< Maximum number of threads for this scan task
+
+  duckdb::shared_ptr<pipeline::sirius_pipeline>
+    pipeline;  ///< The pipeline to which this table scan belongs
+  duckdb::shared_ptr<duckdb::SiriusContext> sirius_ctx;  ///< The Sirius context
+  std::unique_ptr<duckdb::GlobalTableFunctionState>
     global_tf_state;                    ///< Global state for the table function
   duckdb_scan_executor& scan_executor;  ///< The scan executor executing this scan task
-  op::sirius_physical_table_scan& op;   ///< The physical table scan being executed
-  sirius::memory::sirius_memory_reservation_manager& mem_res_mgr;
-  std::mutex scan_mutex;  ///< Mutex to protect table function calls
+  sirius_physical_table_scan& op;       ///< The physical table scan being executed
 };
 
 //===----------------------------------------------------------------------===//
@@ -312,10 +330,11 @@ struct multiple_blocks_allocation_accessor {
  *
  */
 class duckdb_scan_task_local_state : public sirius::parallel::itask_local_state {
+  using data_batch = cucascade::data_batch;
+
  public:
   using multiple_blocks_allocation =
     cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation;
-  static constexpr size_t HOST_SPACE_DEVICE_ID = 0;  ///< There is currently only one HOST device
 
   //===----------------------------------------------------------------------===//
   // Column Builder
@@ -326,7 +345,7 @@ class duckdb_scan_task_local_state : public sirius::parallel::itask_local_state 
    * vector.
    */
   struct column_builder {
-    static constexpr size_t FULL_MASK = 0xFF;  ///< Mask with all bits set
+    static constexpr uint8_t FULL_MASK = 0xFF;  ///< Byte mask with all bits set
 
     //===----------Fields----------===//
     duckdb::LogicalType type;  ///< DuckDB logical type of the column
@@ -335,7 +354,7 @@ class duckdb_scan_task_local_state : public sirius::parallel::itask_local_state 
       0;  ///< Total number of data bytes written for this column (only needed for VARCHAR)
     size_t total_data_bytes_allocated =
       0;  ///< Total number of data bytes allocated for this column (only needed for VARCHAR)
-    bool has_nulls = false;  ///< Whether the column has NULL values
+    size_t null_count = 0;  ///< Number of NULL values in the column
 
     // The allocation accessors for the column data, mask, and offsets
     multiple_blocks_allocation_accessor<uint8_t> data_blocks_accessor;
@@ -414,6 +433,14 @@ class duckdb_scan_task_local_state : public sirius::parallel::itask_local_state 
                         size_t num_rows,
                         size_t row_offset,
                         std::unique_ptr<multiple_blocks_allocation>& allocation);
+
+    /**
+     * @brief Create a metadata node for this column for building a host_table_allocation.
+     *
+     * @param[in] num_rows The number of rows in the column.
+     * @return metadata_node The constructed metadata node.
+     */
+    [[nodiscard]] metadata_node make_metadata_node(size_t num_rows) const;
   };
 
   //===----------Constructor & Destructor----------===//
@@ -433,7 +460,15 @@ class duckdb_scan_task_local_state : public sirius::parallel::itask_local_state 
     duckdb::ExecutionContext& exec_ctx,
     size_t approximate_batch_size = duckdb::Config::DEFAULT_SCAN_TASK_BATCH_SIZE,
     size_t default_varchar_size   = duckdb::Config::DEFAULT_SCAN_TASK_VARCHAR_SIZE,
-    duckdb::unique_ptr<duckdb::LocalTableFunctionState> existing_local_tf_state = nullptr);
+    std::unique_ptr<duckdb::LocalTableFunctionState> existing_local_tf_state = nullptr);
+
+  //===----------Methods----------===//
+  /**
+   * @brief Creates a data batch from the current state of the column builders.
+   *
+   * @return A shared pointer to the created data batch.
+   */
+  std::shared_ptr<data_batch> make_data_batch();
 
   //===----------Fields----------===//
   size_t approximate_batch_size;                ///< Approximate target batch size in bytes
@@ -449,11 +484,13 @@ class duckdb_scan_task_local_state : public sirius::parallel::itask_local_state 
     reservation;  ///< Memory reservation for all column data
   std::unique_ptr<cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation>
     allocation;  ///< Memory allocation for all column data
+  cucascade::memory::memory_space* host_space = nullptr;
 
-  duckdb::DataChunk chunk;  ///< DataChunk buffer
-  size_t row_offset = 0;    ///< Current row offset in buffers
+  duckdb::DataChunk chunk;           ///< DataChunk buffer
+  size_t row_offset        = 0;      ///< Current row offset in buffers
+  bool local_state_drained = false;  ///< Whether this local state has fully drained
 
-  duckdb::unique_ptr<duckdb::LocalTableFunctionState>
+  std::unique_ptr<duckdb::LocalTableFunctionState>
     local_tf_state;                    ///< Local state for the table function.
   duckdb::ExecutionContext& exec_ctx;  ///< The duckdb execution context, needed for initializing
                                        ///< the local table function state
@@ -522,8 +559,7 @@ class duckdb_scan_task : public sirius::parallel::itask {
 
   void execute() override;
 
-  /// TODO: change protected to private when data can be tested against data in the data repository
- protected:
+ private:
   //===----------Methods----------===//
   /**
    * @brief Fetches the next data chunk from the DuckDB table function into the local state's data

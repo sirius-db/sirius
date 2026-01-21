@@ -17,6 +17,7 @@
 #include "creator/task_creator.hpp"
 
 #include "op/scan/duckdb_scan_task.hpp"
+#include "op/sirius_physical_table_scan.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 
 #include <duckdb/parallel/thread_context.hpp>
@@ -179,8 +180,7 @@ void task_creator::worker_function(int worker_id)
           info->_pipeline,
           _duckdb_scan_executor,
           *_client_context,
-          &info->_node->Cast<op::sirius_physical_table_scan>(),
-          _mem_res_mgr);
+          &info->_node->Cast<op::sirius_physical_table_scan>());
         duckdb::ThreadContext thread_ctx(*_client_context);
         duckdb::ExecutionContext exec_ctx(*_client_context, thread_ctx, nullptr);
         auto scan_task_local_state = std::make_unique<op::scan::duckdb_scan_task_local_state>(

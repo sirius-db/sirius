@@ -15,16 +15,19 @@
  */
 
 // sirius
-#include <cucascade/memory/memory_reservation.hpp>
+#include <data/data_batch_utils.hpp>
 #include <helper/utils.hpp>
+#include <memory/sirius_memory_reservation_manager.hpp>
 #include <op/scan/duckdb_scan_task.hpp>
+
+// cucascade
+#include <cucascade/data/cpu_data_representation.hpp>
+#include <cucascade/memory/host_table.hpp>
+#include <cucascade/memory/memory_reservation.hpp>
 
 // duckdb
 #include <duckdb/common/types.hpp>
 #include <duckdb/function/table_function.hpp>
-
-// standard library
-#include <cstddef>
 
 namespace sirius::op::scan {
 
@@ -35,13 +38,12 @@ duckdb_scan_task_global_state::duckdb_scan_task_global_state(
   duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
   duckdb_scan_executor& scan_exec,
   duckdb::ClientContext& client_ctx,
-  sirius_physical_table_scan* scan_op,
-  sirius::memory::sirius_memory_reservation_manager& mem_res_mgr)
+  sirius_physical_table_scan* scan_op)
   : pipeline(std::move(pipeline)),
+    sirius_ctx(client_ctx.registered_state->Get<duckdb::SiriusContext>("sirius_state")),
     max_threads(scan_exec.get_num_threads()),
     scan_executor(scan_exec),
-    op(*scan_op),
-    mem_res_mgr(mem_res_mgr)
+    op(*scan_op)
 {
   // Initialize global table function state
   if (op.function.init_global) {
@@ -177,7 +179,11 @@ void duckdb_scan_task_local_state::column_builder::process_mask_for_column(
     return;
   }
   // condition: src_valid != nullptr
-  has_nulls = true;
+
+  // Update the null count
+  null_count += num_rows - validity.CountValid(num_rows);
+
+  // Process the mask
   if (cur_bit == 0) {
     // Byte aligned case
     auto const full_bytes = utils::div_8(num_bits);
@@ -266,6 +272,26 @@ void duckdb_scan_task_local_state::column_builder::process_column(
   process_mask_for_column(validity, num_rows, row_offset, allocation);
 }
 
+metadata_node duckdb_scan_task_local_state::column_builder::make_metadata_node(
+  size_t num_rows) const
+{
+  if (type.InternalType() == duckdb::PhysicalType::VARCHAR) {
+    // VARCHAR column
+    return make_string_metadata_node(
+      static_cast<cudf::size_type>(num_rows),
+      static_cast<cudf::size_type>(null_count),
+      static_cast<int64_t>(data_blocks_accessor.initial_byte_offset),
+      static_cast<int64_t>(mask_blocks_accessor.initial_byte_offset),
+      static_cast<int64_t>(offset_blocks_accessor.initial_byte_offset));
+  } else {
+    return make_flat_metadata_node(type,
+                                   static_cast<cudf::size_type>(num_rows),
+                                   static_cast<cudf::size_type>(null_count),
+                                   static_cast<int64_t>(data_blocks_accessor.initial_byte_offset),
+                                   static_cast<int64_t>(mask_blocks_accessor.initial_byte_offset));
+  }
+}
+
 //===----------------------------------------------------------------------===//
 // duckdb_scan_task_local_state
 //===----------------------------------------------------------------------===//
@@ -275,34 +301,31 @@ duckdb_scan_task_local_state::duckdb_scan_task_local_state(
   duckdb::ExecutionContext& exec_ctx,
   size_t approximate_batch_size,
   size_t default_varchar_size,
-  duckdb::unique_ptr<duckdb::LocalTableFunctionState> existing_local_tf_state)
+  std::unique_ptr<duckdb::LocalTableFunctionState> existing_local_tf_state)
   : approximate_batch_size(approximate_batch_size),
     default_varchar_size(default_varchar_size),
-    exec_ctx(exec_ctx),
-    local_tf_state(std::move(existing_local_tf_state))  // Move the existing state if provided
+    exec_ctx(exec_ctx)
 {
   auto const& op = g_state.op;
   num_columns    = op.projection_ids.size();
 
-  auto& mem_res_mgr = g_state.mem_res_mgr;
+  bool const has_existing_state = static_cast<bool>(existing_local_tf_state);
+  local_tf_state                = std::move(existing_local_tf_state);
+  if (!has_existing_state) { g_state.register_local_state(); }
 
   // Make the memory reservation request
-  reservation = mem_res_mgr.request_reservation(res_request, approximate_batch_size);
+  auto& mem_res_mgr = g_state.sirius_ctx->get_memory_manager();
+  reservation       = mem_res_mgr.request_reservation(res_request, approximate_batch_size);
 
   // Make the allocation
-  auto const* mem_space =
-    mem_res_mgr.get_memory_space(cucascade::memory::Tier::HOST, HOST_SPACE_DEVICE_ID);
-  if (mem_space == nullptr) {
-    throw std::runtime_error(
-      "[duckdb_scan_task_local_state] Failed to get HOST memory space with device id " +
-      std::to_string(HOST_SPACE_DEVICE_ID));
-  }
+  auto& mem_space = reservation->get_memory_space();
   auto* allocator =
-    mem_space->get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>();
+    mem_space.get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>();
   if (allocator == nullptr) {
     throw std::runtime_error(
       "[duckdb_scan_task_local_state] Failed to get fixed_size_host_memory_resource allocator for "
-      "HOST memory space.");
+      "HOST memory space with device id " +
+      std::to_string(reservation->device_id()) + ".");
   }
   allocation = allocator->allocate_multiple_blocks(approximate_batch_size);
 
@@ -316,7 +339,7 @@ duckdb_scan_task_local_state::duckdb_scan_task_local_state(
   initialize_local_table_function_state(op, exec_ctx, g_state.global_tf_state.get());
 }
 
-void duckdb_scan_task_local_state::estimate_rows_per_batch(op::sirius_physical_table_scan const& op)
+void duckdb_scan_task_local_state::estimate_rows_per_batch(sirius_physical_table_scan const& op)
 {
   assert(num_columns <= op.column_ids.size());
 
@@ -335,7 +358,7 @@ void duckdb_scan_task_local_state::estimate_rows_per_batch(op::sirius_physical_t
 
   // We must make space for the mask bytes (1 bit per row, rounded up to bytes)
   // Add mask bytes to the estimated row size
-  size_t mask_bytes_per_row = num_columns / CHAR_BIT + (num_columns % CHAR_BIT != 0 ? 1 : 0);
+  size_t mask_bytes_per_row = utils::ceil_div_8(num_columns);
   estimated_row_bytes += mask_bytes_per_row;
 
   // For VARCHAR columns, add space for the extra offset at the end
@@ -369,7 +392,7 @@ void duckdb_scan_task_local_state::initialize_builders()
 }
 
 void duckdb_scan_task_local_state::initialize_local_table_function_state(
-  op::sirius_physical_table_scan const& op,
+  sirius_physical_table_scan const& op,
   duckdb::ExecutionContext& exec_ctx,
   duckdb::GlobalTableFunctionState* global_tf_state)
 {
@@ -382,6 +405,32 @@ void duckdb_scan_task_local_state::initialize_local_table_function_state(
   }
 }
 
+std::shared_ptr<cucascade::data_batch> duckdb_scan_task_local_state::make_data_batch()
+{
+  using data_batch                = cucascade::data_batch;
+  using host_table_allocation     = cucascade::memory::host_table_allocation;
+  using host_table_representation = cucascade::host_table_representation;
+
+  // Create metadata nodes for each column and assemble metadata buffer
+  std::vector<metadata_node> column_metadata;
+  column_metadata.reserve(num_columns);
+  for (auto const& builder : column_builders) {
+    column_metadata.push_back(builder.make_metadata_node(row_offset));
+  }
+  auto metadata = std::make_unique<std::vector<uint8_t>>(pack_metadata_from_nodes(column_metadata));
+
+  // Make the host table allocation
+  auto const sz = allocation->size_bytes();  /// TODO: change to actual used tail byte
+  auto table_allocation =
+    std::make_unique<host_table_allocation>(std::move(allocation), std::move(metadata), sz);
+
+  // Make the host table representation
+  auto table = std::make_unique<host_table_representation>(std::move(table_allocation), host_space);
+
+  // Create the data batch and return
+  return std::make_shared<data_batch>(get_next_batch_id(), std::move(table));
+}
+
 //===----------------------------------------------------------------------===//
 // DuckDB Scan Task
 //===----------------------------------------------------------------------===//
@@ -391,16 +440,16 @@ bool duckdb_scan_task::get_next_chunk(duckdb_scan_task_local_state& l_state,
   // Reset the chunk before calling the table function to ensure it starts empty
   l_state.chunk.Reset();
 
-  // Lock the global state during table function call to ensure thread-safe access
-  {
-    std::lock_guard<std::mutex> lock(g_state.scan_mutex);
+  duckdb::TableFunctionInput tf_input(
+    g_state.op.bind_data.get(), l_state.local_tf_state.get(), g_state.global_tf_state.get());
 
-    duckdb::TableFunctionInput tf_input(
-      g_state.op.bind_data.get(), l_state.local_tf_state.get(), g_state.global_tf_state.get());
-    g_state.op.function.function(l_state.exec_ctx.client, tf_input, l_state.chunk);
-  }
+  g_state.op.function.function(l_state.exec_ctx.client, tf_input, l_state.chunk);
+
   if (l_state.chunk.size() == 0) {
-    g_state.set_source_drained();
+    if (!l_state.local_state_drained) {
+      l_state.local_state_drained = true;
+      g_state.release_local_state();
+    }
     return false;
   }
   return true;
@@ -462,12 +511,8 @@ void duckdb_scan_task::execute()
     if (STANDARD_VECTOR_SIZE + l_state.row_offset >= l_state.estimated_rows_per_batch) { break; }
   }
 
-  // Add tasks back to the queue if the scan is not finished
-  if (!g_state.is_source_drained()) {
-    /// FUTURE WORK: we need the task_creator to get the next task id. For now, we just increment
-    /// the task id by the number of workers.
-    auto const new_task_id = this->task_id + g_state.max_threads;
-
+  // Add tasks back to the queue if the local scan state is not finished
+  if (!l_state.local_state_drained) {
     // Create a new local state, passing the existing local_tf_state to continue the scan
     // This ensures DuckDB continues scanning from the current position rather than starting over
     auto new_local_state =
@@ -478,6 +523,7 @@ void duckdb_scan_task::execute()
                                                      std::move(l_state.local_tf_state));
 
     // Create a new reference to the global state
+    auto const new_task_id = g_state.sirius_ctx->get_task_creator().get_next_task_id();
     auto shared_global_state =
       std::static_pointer_cast<duckdb_scan_task_global_state>(this->_global_state);
     auto next_task = std::make_unique<duckdb_scan_task>(
@@ -485,9 +531,8 @@ void duckdb_scan_task::execute()
     g_state.scan_executor.schedule(std::move(next_task));
   }
 
-  /// FUTURE WORK: Create the data batch and push it to the data repository.
-
-  /// FUTURE WORK: Notify task_creator of completion by sending a message to the message queue
+  // Make data batch and push to repository
+  if (l_state.row_offset > 0) { _data_repo->add_data_batch(l_state.make_data_batch()); }
 }
 
 }  // namespace sirius::op::scan
