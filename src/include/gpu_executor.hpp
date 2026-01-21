@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include "data/data_repository_manager.hpp"
+#include <cucascade/data/data_repository_manager.hpp>
 #include "duckdb/common/common.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/pair.hpp"

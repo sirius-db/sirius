@@ -30,8 +30,8 @@
 #include "gpu_columns.hpp"
 #include "helper/types.hpp"
 
-#include <data/data_batch.hpp>
-#include <data/data_repository.hpp>
+#include <cucascade/data/data_batch.hpp>
+#include <cucascade/data/data_repository.hpp>
 
 namespace duckdb {
 class GPUExecutor;

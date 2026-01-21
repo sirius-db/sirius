@@ -26,8 +26,8 @@
 #include "sirius_pipeline_hashmap.hpp"
 
 #include <blockingconcurrentqueue.h>
-#include <data/data_batch.hpp>
-#include <data/data_repository.hpp>
+#include <cucascade/data/data_batch.hpp>
+#include <cucascade/data/data_repository.hpp>
 
 #include <atomic>
 #include <condition_variable>

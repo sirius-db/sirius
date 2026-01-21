@@ -17,8 +17,8 @@
 #include "sirius_config.hpp"
 
 #include "config_option.hpp"
-#include "memory/config.hpp"
-#include "memory/reservation_manager_configurator.hpp"
+#include <cucascade/memory/config.hpp>
+#include <cucascade/memory/reservation_manager_configurator.hpp>
 #include "parallel/config.hpp"
 
 #include <exception>

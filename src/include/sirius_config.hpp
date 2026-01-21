@@ -17,7 +17,7 @@
 #pragma once
 
 #include "config.hpp"
-#include "memory/config.hpp"
+#include <cucascade/memory/config.hpp>
 #include "parallel/config.hpp"
 
 #include <filesystem>

@@ -21,7 +21,7 @@
 
 #include <data/sirius_converter_registry.hpp>
 #include <helper/helper.hpp>
-#include <memory/reservation_manager_configurator.hpp>
+#include <cucascade/memory/reservation_manager_configurator.hpp>
 
 // standard library
 #include <vector>
