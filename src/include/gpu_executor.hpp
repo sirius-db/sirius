@@ -16,7 +16,6 @@
 
 #pragma once
 
-#include "data/data_repository_manager.hpp"
 #include "duckdb/common/common.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/pair.hpp"
@@ -30,6 +29,8 @@
 #include "operator/gpu_physical_result_collector.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
+
+#include <cucascade/data/data_repository_manager.hpp>
 namespace duckdb {
 
 class ClientContext;

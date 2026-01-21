@@ -15,14 +15,14 @@
  */
 
 #pragma once
-#include "memory/memory_reservation.hpp"
-#include "memory/memory_space.hpp"
 #include "parallel/task_executor.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/task_request.hpp"
 
 #include <blockingconcurrentqueue.h>
-#include <data/data_repository.hpp>
+#include <cucascade/data/data_repository.hpp>
+#include <cucascade/memory/memory_reservation.hpp>
+#include <cucascade/memory/memory_space.hpp>
 
 #include <queue>
 

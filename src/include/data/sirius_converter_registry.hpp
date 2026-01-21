@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include <data/representation_converter.hpp>
+#include <cucascade/data/representation_converter.hpp>
 
 #include <memory>
 #include <mutex>

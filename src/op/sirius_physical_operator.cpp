@@ -21,7 +21,7 @@
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 
-#include <data/data_batch.hpp>
+#include <cucascade/data/data_batch.hpp>
 
 namespace sirius {
 namespace op {

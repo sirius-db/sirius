@@ -16,12 +16,13 @@
 
 #include "catch.hpp"
 #include "data/data_batch_utils.hpp"
-#include "data/gpu_data_representation.hpp"
-#include "memory/memory_space.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/partition/gpu_partition_impl.hpp"
 #include "scan/test_utils.hpp"
 #include "utils/utils.hpp"
+
+#include <cucascade/data/gpu_data_representation.hpp>
+#include <cucascade/memory/memory_space.hpp>
 
 using namespace sirius;
 using namespace cucascade;

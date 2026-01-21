@@ -18,10 +18,10 @@
 
 // sirius
 #include <config.hpp>
-#include <data/data_repository.hpp>
-#include <memory/fixed_size_host_memory_resource.hpp>
-#include <memory/memory_reservation.hpp>
-#include <memory/memory_reservation_manager.hpp>
+#include <cucascade/data/data_repository.hpp>
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/memory/memory_reservation.hpp>
+#include <cucascade/memory/memory_reservation_manager.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
 #include <op/scan/duckdb_scan_executor.hpp>
 #include <op/sirius_physical_table_scan.hpp>

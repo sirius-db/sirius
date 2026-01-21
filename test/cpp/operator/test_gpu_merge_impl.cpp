@@ -16,8 +16,6 @@
 
 #include "catch.hpp"
 #include "data/data_batch_utils.hpp"
-#include "data/gpu_data_representation.hpp"
-#include "memory/memory_space.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/aggregate/gpu_aggregate_impl.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
@@ -26,6 +24,9 @@
 #include "utils/utils.hpp"
 
 #include <cudf/utilities/bit.hpp>
+
+#include <cucascade/data/gpu_data_representation.hpp>
+#include <cucascade/memory/memory_space.hpp>
 
 using namespace sirius;
 using namespace cucascade;

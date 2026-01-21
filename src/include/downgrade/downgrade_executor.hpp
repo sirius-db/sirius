@@ -20,9 +20,9 @@
 #include "downgrade/downgrade_task.hpp"
 #include "parallel/task_executor.hpp"
 
-#include <data/data_repository.hpp>
-#include <data/data_repository_manager.hpp>
-#include <memory/memory_reservation.hpp>
+#include <cucascade/data/data_repository.hpp>
+#include <cucascade/data/data_repository_manager.hpp>
+#include <cucascade/memory/memory_reservation.hpp>
 
 namespace sirius {
 namespace parallel {

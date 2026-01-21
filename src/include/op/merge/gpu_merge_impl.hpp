@@ -18,8 +18,8 @@
 
 #include <cudf/cudf_utils.hpp>
 
-#include <data/data_batch.hpp>
-#include <memory/memory_space.hpp>
+#include <cucascade/data/data_batch.hpp>
+#include <cucascade/memory/memory_space.hpp>
 
 #include <memory>
 #include <vector>

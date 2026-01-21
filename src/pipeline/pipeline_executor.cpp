@@ -17,10 +17,11 @@
 #include "pipeline/pipeline_executor.hpp"
 
 #include "config.hpp"
-#include "memory/common.hpp"
-#include "memory/memory_reservation.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "pipeline/pipeline_queue.hpp"
+
+#include <cucascade/memory/common.hpp>
+#include <cucascade/memory/memory_reservation.hpp>
 
 namespace sirius {
 namespace pipeline {

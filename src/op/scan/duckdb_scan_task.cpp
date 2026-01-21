@@ -15,8 +15,8 @@
  */
 
 // sirius
+#include <cucascade/memory/memory_reservation.hpp>
 #include <helper/utils.hpp>
-#include <memory/memory_reservation.hpp>
 #include <op/scan/duckdb_scan_task.hpp>
 
 // duckdb

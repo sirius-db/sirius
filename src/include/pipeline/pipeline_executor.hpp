@@ -17,7 +17,6 @@
 #pragma once
 
 #include "config.hpp"
-#include "memory/memory_reservation.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "parallel/task_executor.hpp"
 #include "pipeline/gpu_pipeline_executor.hpp"
@@ -25,7 +24,8 @@
 #include "pipeline/task_request.hpp"
 
 #include <blockingconcurrentqueue.h>
-#include <data/data_repository.hpp>
+#include <cucascade/data/data_repository.hpp>
+#include <cucascade/memory/memory_reservation.hpp>
 
 namespace sirius {
 namespace pipeline {

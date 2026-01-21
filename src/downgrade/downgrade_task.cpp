@@ -21,10 +21,10 @@
 
 #include <rmm/cuda_stream_view.hpp>
 
-#include <data/cpu_data_representation.hpp>
-#include <data/gpu_data_representation.hpp>
-#include <memory/common.hpp>
-#include <memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/data/cpu_data_representation.hpp>
+#include <cucascade/data/gpu_data_representation.hpp>
+#include <cucascade/memory/common.hpp>
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 
 namespace sirius {
 namespace parallel {

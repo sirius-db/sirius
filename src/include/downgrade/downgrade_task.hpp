@@ -21,10 +21,10 @@
 #include "parallel/task_executor.hpp"
 #include "task_completion.hpp"
 
-#include <data/data_batch.hpp>
-#include <data/data_repository.hpp>
-#include <data/data_repository_manager.hpp>
-#include <memory/common.hpp>
+#include <cucascade/data/data_batch.hpp>
+#include <cucascade/data/data_repository.hpp>
+#include <cucascade/data/data_repository_manager.hpp>
+#include <cucascade/memory/common.hpp>
 
 #include <cstdint>
 #include <memory>
