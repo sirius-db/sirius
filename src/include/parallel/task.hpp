@@ -17,6 +17,7 @@
 #pragma once
 
 #include "helper/helper.hpp"
+
 #include <cucascade/memory/memory_reservation.hpp>
 
 #include <memory>

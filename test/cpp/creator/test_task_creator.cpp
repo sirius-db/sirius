@@ -17,7 +17,6 @@
 #include "catch.hpp"
 #include "creator/task_creator.hpp"
 #include "gpu_context.hpp"
-#include <cucascade/memory/reservation_manager_configurator.hpp>
 #include "op/scan/duckdb_scan_executor.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "parallel/task_executor.hpp"
@@ -26,6 +25,7 @@
 #include "sirius_pipeline_hashmap.hpp"
 
 #include <cucascade/data/data_repository.hpp>
+#include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <duckdb.hpp>
 #include <duckdb/main/connection.hpp>
 
