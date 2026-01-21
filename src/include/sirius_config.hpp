@@ -17,10 +17,10 @@
 #pragma once
 
 #include "config.hpp"
-#include "memory/config.hpp"
 #include "parallel/config.hpp"
 
-#include <memory/topology_discovery.hpp>
+#include <cucascade/memory/topology_discovery.hpp>
+#include <cucascade/memory/config.hpp>
 
 #include <filesystem>
 

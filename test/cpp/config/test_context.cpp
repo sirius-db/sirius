@@ -15,9 +15,9 @@
  */
 
 #include "catch.hpp"
-#include "memory/common.hpp"
 #include "sirius_context.hpp"
 
+#include <cucascade/memory/common.hpp>
 #include <duckdb.hpp>
 #include <duckdb/execution/execution_context.hpp>
 #include <libconfig.h++>

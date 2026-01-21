@@ -15,8 +15,8 @@
  */
 
 // sirius
-#include <data/data_repository_manager.hpp>
-#include <data/gpu_data_representation.hpp>
+#include <cucascade/data/data_repository_manager.hpp>
+#include <cucascade/data/gpu_data_representation.hpp>
 #include <expression_executor/gpu_dispatcher.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
 #include <expression_executor/gpu_expression_executor_state.hpp>
