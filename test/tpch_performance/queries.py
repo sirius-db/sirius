@@ -12,11 +12,10 @@
 # the License.
 # =============================================================================
 
+"""TPC-H query definitions (base SQL without gpu_processing wrapper)."""
 
-def q1(con):
-    con.execute(
-        """
-call gpu_processing("select
+QUERIES = {
+    "q1": """select
     l_returnflag,
     l_linestatus,
     sum(l_quantity) as sum_qty,
@@ -36,15 +35,8 @@ group by
     l_linestatus
 order by
     l_returnflag,
-    l_linestatus;");
-                """
-    )
-
-
-def q2(con):
-    con.execute(
-        """
-call gpu_processing("select
+    l_linestatus""",
+    "q2": """select
   s.s_acctbal,
   s.s_name,
   n.n_name,
@@ -87,15 +79,8 @@ order by
   n.n_name,
   s.s_name,
   p.p_partkey
-limit 100;");
-                """
-    )
-
-
-def q3(con):
-    con.execute(
-        """
-call gpu_processing("select
+limit 100""",
+    "q3": """select
   l.l_orderkey,
   sum(l.l_extendedprice * (1 - l.l_discount)) as revenue,
   o.o_orderdate,
@@ -117,15 +102,8 @@ group by
 order by
   revenue desc,
   o.o_orderdate
-limit 10;");
-                """
-    )
-
-
-def q4(con):
-    con.execute(
-        """
-call gpu_processing("select
+limit 10""",
+    "q4": """select
   o.o_orderpriority,
   count(*) as order_count
 from
@@ -146,15 +124,8 @@ where
 group by
   o.o_orderpriority
 order by
-  o.o_orderpriority;");
-                """
-    )
-
-
-def q5(con):
-    con.execute(
-        """
-call gpu_processing("select
+  o.o_orderpriority""",
+    "q5": """select
   n.n_name,
   sum(l.l_extendedprice * (1 - l.l_discount)) as revenue
 from
@@ -177,15 +148,8 @@ where
 group by
   n.n_name
 order by
-  revenue desc;");
-                """
-    )
-
-
-def q6(con):
-    con.execute(
-        """
-call gpu_processing("select
+  revenue desc""",
+    "q6": """select
   sum(l_extendedprice * l_discount) as revenue
 from
   lineitem
@@ -193,15 +157,8 @@ where
   l_shipdate >= date '1997-01-01'
   and l_shipdate < date '1998-01-01'
   and l_discount between 0.03 - 0.01 and 0.03 + 0.01
-  and l_quantity < 24;");
-                """
-    )
-
-
-def q7(con):
-    con.execute(
-        """
-call gpu_processing("select
+  and l_quantity < 24""",
+    "q7": """select
   supp_nation,
   cust_nation,
   l_year,
@@ -239,15 +196,8 @@ group by
 order by
   supp_nation,
   cust_nation,
-  l_year;");
-                """
-    )
-
-
-def q8(con):
-    con.execute(
-        """
-call gpu_processing("select
+  l_year""",
+    "q8": """select
   o_year,
   sum(case
     when nation = 'EGYPT' then volume
@@ -283,15 +233,8 @@ from
 group by
   o_year
 order by
-  o_year;");
-                """
-    )
-
-
-def q9(con):
-    con.execute(
-        """
-call gpu_processing("select
+  o_year""",
+    "q9": """select
   nation,
   o_year,
   sum(amount) as sum_profit
@@ -322,15 +265,8 @@ group by
   o_year
 order by
   nation,
-  o_year desc;");
-                """
-    )
-
-
-def q10(con):
-    con.execute(
-        """
-call gpu_processing("select
+  o_year desc""",
+    "q10": """select
   c.c_custkey,
   c.c_name,
   sum(l.l_extendedprice * (1 - l.l_discount)) as revenue,
@@ -361,15 +297,8 @@ group by
   c.c_comment
 order by
   revenue desc
-limit 20;");
-                """
-    )
-
-
-def q11(con):
-    con.execute(
-        """
-call gpu_processing("select
+limit 20""",
+    "q11": """select
   ps.ps_partkey,
   sum(ps.ps_supplycost * ps.ps_availqty) as value
 from
@@ -395,15 +324,8 @@ group by
         and n.n_name = 'JAPAN'
     )
 order by
-  value desc;");
-                """
-    )
-
-
-def q12(con):
-    con.execute(
-        """
-call gpu_processing("select
+  value desc""",
+    "q12": """select
   l.l_shipmode,
   sum(case
     when o.o_orderpriority = '1-URGENT'
@@ -430,15 +352,8 @@ where
 group by
   l.l_shipmode
 order by
-  l.l_shipmode;");
-                """
-    )
-
-
-def q13(con):
-    con.execute(
-        """
-call gpu_processing("select
+  l.l_shipmode""",
+    "q13": """select
   c_count,
   count(*) as custdist
 from
@@ -458,15 +373,8 @@ group by
   c_count
 order by
   custdist desc,
-  c_count desc;");
-                """
-    )
-
-
-def q14(con):
-    con.execute(
-        """
-call gpu_processing("select
+  c_count desc""",
+    "q14": """select
   100.00 * sum(case
     when p.p_type like 'PROMO%'
       then l.l_extendedprice * (1 - l.l_discount)
@@ -478,15 +386,8 @@ from
 where
   l.l_partkey = p.p_partkey
   and l.l_shipdate >= date '1994-08-01'
-  and l.l_shipdate < date '1994-09-01';");
-                """
-    )
-
-
-def q15(con):
-    con.execute(
-        """
-call gpu_processing("with revenue_view as (
+  and l.l_shipdate < date '1994-09-01'""",
+    "q15": """with revenue_view as (
   select
     l_suppkey as supplier_no,
     sum(l_extendedprice * (1 - l_discount)) as total_revenue
@@ -517,15 +418,8 @@ where
       revenue_view
   )
 order by
-  s.s_suppkey;");
-                """
-    )
-
-
-def q16(con):
-    con.execute(
-        """
-call gpu_processing("select
+  s.s_suppkey""",
+    "q16": """select
   p.p_brand,
   p.p_type,
   p.p_size,
@@ -554,15 +448,8 @@ order by
   supplier_cnt desc,
   p.p_brand,
   p.p_type,
-  p.p_size;");
-                """
-    )
-
-
-def q17(con):
-    con.execute(
-        """
-call gpu_processing("select
+  p.p_size""",
+    "q17": """select
   sum(l.l_extendedprice) / 7.0 as avg_yearly
 from
   lineitem l,
@@ -578,15 +465,8 @@ where
       lineitem l2
     where
       l2.l_partkey = p.p_partkey
-  );");
-                """
-    )
-
-
-def q18(con):
-    con.execute(
-        """
-call gpu_processing("select
+  )""",
+    "q18": """select
   c.c_name,
   c.c_custkey,
   o.o_orderkey,
@@ -618,15 +498,8 @@ group by
 order by
   o.o_totalprice desc,
   o.o_orderdate
-limit 100;");
-                """
-    )
-
-
-def q19(con):
-    con.execute(
-        """
-call gpu_processing("select
+limit 100""",
+    "q19": """select
   sum(l.l_extendedprice* (1 - l.l_discount)) as revenue
 from
   lineitem l,
@@ -660,15 +533,8 @@ where
     and p.p_size between 1 and 15
     and l.l_shipmode in ('AIR', 'AIR REG')
     and l.l_shipinstruct = 'DELIVER IN PERSON'
-  );");
-                """
-    )
-
-
-def q20(con):
-    con.execute(
-        """
-call gpu_processing("select
+  )""",
+    "q20": """select
   s.s_name,
   s.s_address
 from
@@ -704,15 +570,8 @@ where
   and s.s_nationkey = n.n_nationkey
   and n.n_name = 'KENYA'
 order by
-  s.s_name;");
-                """
-    )
-
-
-def q21(con):
-    con.execute(
-        """
-call gpu_processing("select
+  s.s_name""",
+    "q21": """select
   s.s_name,
   count(*) as numwait
 from
@@ -751,15 +610,8 @@ group by
 order by
   numwait desc,
   s.s_name
-limit 100;");
-                """
-    )
-
-
-def q22(con):
-    con.execute(
-        """
-call gpu_processing("select
+limit 100""",
+    "q22": """select
   cntrycode,
   count(*) as numcust,
   sum(c_acctbal) as totacctbal
@@ -795,53 +647,5 @@ from
 group by
   cntrycode
 order by
-  cntrycode;");
-                """
-    )
-
-
-def run_sirius(con, warmup=False):
-    q1(con)
-    print("Q1 done") if (not warmup) else None
-    q2(con)
-    print("Q2 done") if (not warmup) else None
-    q3(con)
-    print("Q3 done") if (not warmup) else None
-    q4(con)
-    print("Q4 done") if (not warmup) else None
-    q5(con)
-    print("Q5 done") if (not warmup) else None
-    q6(con)
-    print("Q6 done") if (not warmup) else None
-    q7(con)
-    print("Q7 done") if (not warmup) else None
-    q8(con)
-    print("Q8 done") if (not warmup) else None
-    q9(con)
-    print("Q9 done") if (not warmup) else None
-    q10(con)
-    print("Q10 done") if (not warmup) else None
-    q11(con)
-    print("Q11 done") if (not warmup) else None
-    q12(con)
-    print("Q12 done") if (not warmup) else None
-    q13(con)
-    print("Q13 done") if (not warmup) else None
-    q14(con)
-    print("Q14 done") if (not warmup) else None
-    q15(con)
-    print("Q15 done") if (not warmup) else None
-    q16(con)
-    print("Q16 done") if (not warmup) else None
-    q17(con)
-    print("Q17 done") if (not warmup) else None
-    q18(con)
-    print("Q18 done") if (not warmup) else None
-    q19(con)
-    print("Q19 done") if (not warmup) else None
-    q20(con)
-    print("Q20 done") if (not warmup) else None
-    q21(con)
-    print("Q21 done") if (not warmup) else None
-    q22(con)
-    print("Q22 done") if (not warmup) else None
+  cntrycode""",
+}
