@@ -28,5 +28,5 @@ add_subdirectory(creator)
 add_subdirectory(config)
 
 set(TEST_SOURCES
-  ${TEST_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/unittest.cpp
-  PARENT_SCOPE)
+    ${TEST_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/unittest.cpp
+    PARENT_SCOPE)

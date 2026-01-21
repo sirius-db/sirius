@@ -24,9 +24,9 @@
 #include <op/scan/duckdb_scan_task.hpp>
 
 // cucascade
-#include <data/cpu_data_representation.hpp>
-#include <data/gpu_data_representation.hpp>
-#include <memory/host_table.hpp>
+#include <cucascade/data/cpu_data_representation.hpp>
+#include <cucascade/data/gpu_data_representation.hpp>
+#include <cucascade/memory/host_table.hpp>
 
 // cudf
 #include <cudf/strings/strings_column_view.hpp>

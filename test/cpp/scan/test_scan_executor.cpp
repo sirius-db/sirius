@@ -18,6 +18,8 @@
 #include <catch.hpp>
 
 // sirius
+#include <data/data_batch_utils.hpp>
+#include <data/sirius_converter_registry.hpp>
 #include <op/scan/duckdb_scan_executor.hpp>
 #include <op/scan/duckdb_scan_task.hpp>
 #include <op/sirius_physical_table_scan.hpp>
@@ -25,6 +27,7 @@
 // cucascade
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
+#include <cucascade/data/gpu_data_representation.hpp>
 
 // cudf
 #include <cudf/strings/strings_column_view.hpp>
