@@ -12,8 +12,10 @@
 	branch = main
 [submodule "cucascade"]
 	path = cucascade
-	url = https://github.com/NVIDIA/cuCascade.git
-	branch = main
+	# url = https://github.com/NVIDIA/cuCascade.git
+	# branch = main
+	url = https://github.com/wmalpica/cuCascade.git
+	branch = improvement/add_partitioned_data_repo
 [submodule "duckdb-python"]
 	path = duckdb-python
 	url = https://github.com/duckdb/duckdb-python.git
