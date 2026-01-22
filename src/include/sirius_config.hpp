@@ -19,8 +19,8 @@
 #include "config.hpp"
 #include "parallel/config.hpp"
 
-#include <cucascade/memory/topology_discovery.hpp>
 #include <cucascade/memory/config.hpp>
+#include <cucascade/memory/topology_discovery.hpp>
 
 #include <filesystem>
 
