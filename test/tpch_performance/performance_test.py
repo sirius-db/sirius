@@ -32,13 +32,9 @@ def _wrap_gpu_processing(sql):
     return f'call gpu_processing("{escaped_sql}");'
 
 
-def _verify_results(duckdb_result, sirius_result, query_name):
+def _verify_results(duckdb_rows, sirius_rows, query_name):
     """Verify that DuckDB and Sirius results match."""
     try:
-        # Fetch all rows from both results
-        duckdb_rows = duckdb_result.fetchall()
-        sirius_rows = sirius_result.fetchall()
-
         # Check row counts
         if len(duckdb_rows) != len(sirius_rows):
             print(
@@ -135,10 +131,14 @@ def verify_all(con):
 
         try:
             # Run with DuckDB
-            duckdb_result = execute_query(con, i, use_gpu=False, verify_mode=True)
+            duckdb_result = execute_query(
+                con, i, use_gpu=False, verify_mode=True
+            ).fetchall()
 
             # Run with Sirius
-            sirius_result = execute_query(con, i, use_gpu=True, verify_mode=True)
+            sirius_result = execute_query(
+                con, i, use_gpu=True, verify_mode=True
+            ).fetchall()
 
             # Verify results match
             match = _verify_results(duckdb_result, sirius_result, query_name)
