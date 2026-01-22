@@ -17,8 +17,10 @@
 #pragma once
 
 #include "config.hpp"
-#include "memory/config.hpp"
 #include "parallel/config.hpp"
+
+#include <cucascade/memory/config.hpp>
+#include <cucascade/memory/topology_discovery.hpp>
 
 #include <filesystem>
 
@@ -29,10 +31,15 @@ struct configuration_setter;
 }  // namespace config
 
 struct sirius_config {
-  sirius_config()  = default;
+  sirius_config();
   ~sirius_config() = default;
 
   void load_from_file(const std::filesystem::path& config_path);
+
+  [[nodiscard]] const cucascade::memory::system_topology_info& get_hw_topology() const noexcept
+  {
+    return hw_topology_;
+  }
 
   [[nodiscard]] size_t get_task_creator_thread_count() const noexcept
   {
@@ -52,22 +59,8 @@ struct sirius_config {
     const noexcept;
 
  private:
-  std::vector<cucascade::memory::memory_space_config> _memory_space_configs = {
-    cucascade::memory::gpu_memory_space_config{
-      .device_id                  = 0,
-      .reservation_limit_fraction = 0.9,
-      .downgrade_trigger_fraction = 0.75,
-      .downgrade_stop_fraction    = 0.65,
-      .memory_capacity            = 4ULL << 30,  // 4GB
-      .per_stream_reservation     = false,
-    },
-    cucascade::memory::host_memory_space_config{
-      .numa_id                    = 0,
-      .reservation_limit_fraction = 0.9,
-      .downgrade_trigger_fraction = 0.75,
-      .downgrade_stop_fraction    = 0.65,
-      .memory_capacity            = 8ULL << 30,  // 8GB
-    }};
+  cucascade::memory::system_topology_info hw_topology_;
+  std::vector<cucascade::memory::memory_space_config> _memory_space_configs;
   parallel::task_executor_config _gpu_pipeline_executor_config{.num_threads    = 4,
                                                                .retry_on_error = true};
   parallel::task_executor_config _downgrade_executor_config{.num_threads    = 4,

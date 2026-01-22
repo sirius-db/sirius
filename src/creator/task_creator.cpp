@@ -143,7 +143,7 @@ void task_creator::start_thread_pool()
   on_start();
   _threads.reserve(_num_threads);
   for (size_t i = 0; i < _num_threads; ++i) {
-    _threads.push_back(std::make_unique<std::thread>(&task_creator::worker_function, this, i));
+    _threads.emplace_back(&task_creator::worker_function, this, i);
   }
 }
 
@@ -153,7 +153,7 @@ void task_creator::stop_thread_pool()
   if (!_running.compare_exchange_strong(expected, false)) { return; }
   on_stop();
   for (auto& thread : _threads) {
-    if (thread->joinable()) { thread->join(); }
+    if (thread.joinable()) { thread.join(); }
   }
   _threads.clear();
 }

@@ -20,10 +20,10 @@
 #include "parallel/task_executor.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 
-#include <data/data_batch.hpp>
-#include <data/data_repository.hpp>
-#include <data/data_repository_manager.hpp>
-#include <memory/memory_reservation.hpp>
+#include <cucascade/data/data_batch.hpp>
+#include <cucascade/data/data_repository.hpp>
+#include <cucascade/data/data_repository_manager.hpp>
+#include <cucascade/memory/memory_reservation.hpp>
 
 #include <cstdint>
 #include <memory>

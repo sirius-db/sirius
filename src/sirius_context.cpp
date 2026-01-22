@@ -91,12 +91,12 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   data_repository_manager_ = std::make_unique<cucascade::shared_data_repository_manager>();
 
   pipeline_executor_ = std::make_unique<sirius::pipeline::pipeline_executor>(
-    config_.get_gpu_pipeline_executor_config(), *memory_manager_);
+    config_.get_gpu_pipeline_executor_config(), *memory_manager_, &config_.get_hw_topology());
 
   downgrade_executor_ = std::make_unique<sirius::parallel::downgrade_executor>(
     config_.get_downgrade_executor_config(), *data_repository_manager_);
-
   duckdb_scan_executor_ = std::make_unique<sirius::op::scan::duckdb_scan_executor>(
+
     config_.get_duckdb_scan_executor_config());
 
   task_creator_ =

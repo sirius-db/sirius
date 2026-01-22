@@ -17,9 +17,10 @@
 #include "sirius_config.hpp"
 
 #include "config_option.hpp"
-#include "memory/config.hpp"
-#include "memory/reservation_manager_configurator.hpp"
 #include "parallel/config.hpp"
+
+#include <cucascade/memory/config.hpp>
+#include <cucascade/memory/reservation_manager_configurator.hpp>
 
 #include <exception>
 #include <vector>
@@ -204,6 +205,12 @@ struct sirius::config::custom_config_registrar<sirius::disk_mem_config> {
   }
 };
 
+sirius_config::sirius_config()
+{
+  cucascade::memory::topology_discovery discovery;
+  if (discovery.discover()) { hw_topology_ = discovery.get_topology(); }
+}
+
 void sirius_config::load_from_file(const std::filesystem::path& config_path)
 {
   libconfig::Config config;
@@ -260,7 +267,7 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
     gpu_memory_config_instance.setup_configurator(builder);
     host_memory_config_instance.setup_configurator(builder);
     disk_memory_config_instance.setup_configurator(builder);
-    _memory_space_configs = builder.build();
+    _memory_space_configs = builder.build(hw_topology_);
   }
 }
 

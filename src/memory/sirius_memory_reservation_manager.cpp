@@ -21,7 +21,7 @@
 
 #include <rmm/mr/device/device_memory_resource.hpp>
 
-#include <memory/memory_reservation_manager.hpp>
+#include <cucascade/memory/memory_reservation_manager.hpp>
 
 #include <unordered_map>
 

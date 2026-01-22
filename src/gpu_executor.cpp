@@ -44,7 +44,7 @@
 #include "sirius_context.hpp"
 #include "sirius_pipeline_hashmap.hpp"
 
-#include <data/data_repository_manager.hpp>
+#include <cucascade/data/data_repository_manager.hpp>
 #include <stdio.h>
 
 #include <iostream>
