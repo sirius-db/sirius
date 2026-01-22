@@ -18,7 +18,7 @@
 
 #include "config.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
-#include "memory/topology_discovery.hpp"
+#include <cucascade/memory/topology_discovery.hpp>
 #include "parallel/task_executor.hpp"
 #include "pipeline/gpu_pipeline_executor.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"

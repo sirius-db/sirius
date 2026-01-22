@@ -18,7 +18,6 @@
 
 #include "config.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
-#include "memory/topology_discovery.hpp"
 #include "pipeline/pipeline_queue.hpp"
 
 #include <cucascade/memory/common.hpp>

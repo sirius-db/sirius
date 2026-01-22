@@ -20,7 +20,6 @@
 #include "downgrade/downgrade_executor.hpp"
 #include "extension_lock.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
-#include "memory/topology_discovery.hpp"
 #include "pipeline/pipeline_executor.hpp"
 #include "sirius_config.hpp"
 
