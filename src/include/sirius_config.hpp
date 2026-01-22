@@ -52,7 +52,22 @@ struct sirius_config {
     const noexcept;
 
  private:
-  std::vector<cucascade::memory::memory_space_config> _memory_space_configs;
+  std::vector<cucascade::memory::memory_space_config> _memory_space_configs = {
+    cucascade::memory::gpu_memory_space_config{
+      .device_id                  = 0,
+      .reservation_limit_fraction = 0.9,
+      .downgrade_trigger_fraction = 0.75,
+      .downgrade_stop_fraction    = 0.65,
+      .memory_capacity            = 4ULL << 30,  // 4GB
+      .per_stream_reservation     = false,
+    },
+    cucascade::memory::host_memory_space_config{
+      .numa_id                    = 0,
+      .reservation_limit_fraction = 0.9,
+      .downgrade_trigger_fraction = 0.75,
+      .downgrade_stop_fraction    = 0.65,
+      .memory_capacity            = 8ULL << 30,  // 8GB
+    }};
   parallel::task_executor_config _gpu_pipeline_executor_config{.num_threads    = 4,
                                                                .retry_on_error = true};
   parallel::task_executor_config _downgrade_executor_config{.num_threads    = 4,

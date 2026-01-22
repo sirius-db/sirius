@@ -235,12 +235,14 @@ void SiriusContextExtensionCallback::read_config_file_if_exists()
 {
   auto config_path = get_config_file_path();
   if (!std::filesystem::exists(config_path)) {
-    spdlog::info("Sirius configuration file does not exist at path: {}. Skipping loading.",
-                 config_path);
-    return;
+    spdlog::info(
+      "Sirius configuration file does not exist at path: {}. Loading default configuration.",
+      config_path);
+    config_ = sirius::sirius_config();
+  } else {
+    config_.load_from_file(config_path);
+    spdlog::info("Loaded Sirius configuration from file: {}", config_path);
   }
-  config_.load_from_file(config_path);
-  spdlog::info("Loaded Sirius configuration from file: {}", config_path);
   extension_lock_ = std::make_unique<sirius::extension_lock>("sirius");
   context_        = duckdb::make_shared_ptr<SiriusContext>();
   context_->initialize(config_);
