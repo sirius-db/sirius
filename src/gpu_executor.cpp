@@ -454,8 +454,11 @@ void GPUExecutor::execute()
 
   if (!sirius_pipelines.empty()) {
     auto sirius_pipeline_map = sirius::sirius_pipeline_hashmap(sirius_pipelines);
-    auto sirius_context      = context.registered_state->Get<SiriusContext>("sirius_state");
-    if (sirius_context) {
+    auto sirius_context      = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+    D_ASSERT(sirius_context);
+    if (!sirius_context) {
+      SIRIUS_LOG_DEBUG("Sirius context not found, skipping task creation");
+    } else {
       auto& task_creator = sirius_context->get_task_creator();
       task_creator.set_pipeline_hashmap(sirius_pipeline_map);
       task_creator.start();
