@@ -59,6 +59,9 @@ def _verify_results(duckdb_result, sirius_result, query_name):
                 print(f"   DuckDB:  {duck_row}")
                 print(f"   Sirius:  {sirius_row}")
                 return False
+            if duck_row == 0:
+                print(f"❌ {query_name}: Results are empty")
+                return False
 
         print(f"✓ {query_name}: Results match ({len(duckdb_rows)} rows)")
         return True
