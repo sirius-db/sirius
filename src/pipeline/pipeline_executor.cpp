@@ -28,7 +28,7 @@ namespace pipeline {
 
 pipeline_executor::pipeline_executor(const parallel::task_executor_config& gpu_task_executor_config,
                                      sirius::memory::sirius_memory_reservation_manager& mem_mgr,
-                                     cucascade::memory::system_topology_info* sys_topology)
+                                     const cucascade::memory::system_topology_info* sys_topology)
   : sirius::parallel::itask_executor(std::make_unique<pipeline_queue>(1),
                                      {.num_threads = 1, .retry_on_error = false})
 {

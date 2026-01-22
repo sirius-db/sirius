@@ -50,7 +50,7 @@ class pipeline_executor : public sirius::parallel::itask_executor {
    */
   explicit pipeline_executor(const parallel::task_executor_config& gpu_task_executor_config,
                              sirius::memory::sirius_memory_reservation_manager& mem_mgr,
-                             cucascade::memory::system_topology_info* sys_topology = nullptr);
+                             const cucascade::memory::system_topology_info* sys_topology = nullptr);
 
   /**
    * @brief Destructor for the gpu_pipeline_executor.
