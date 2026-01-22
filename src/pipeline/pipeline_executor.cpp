@@ -27,7 +27,8 @@ namespace sirius {
 namespace pipeline {
 
 pipeline_executor::pipeline_executor(const parallel::task_executor_config& gpu_task_executor_config,
-                                     sirius::memory::sirius_memory_reservation_manager& mem_mgr)
+                                     sirius::memory::sirius_memory_reservation_manager& mem_mgr,
+                                     const cucascade::memory::system_topology_info* sys_topology)
   : sirius::parallel::itask_executor(std::make_unique<pipeline_queue>(1),
                                      {.num_threads = 1, .retry_on_error = false})
 {
@@ -36,8 +37,17 @@ pipeline_executor::pipeline_executor(const parallel::task_executor_config& gpu_t
   // Initialize GPU pipeline executors for each available GPU
   _gpu_executors.reserve(num_gpus);
   for (auto* space : gpu_spaces) {
-    _gpu_executors.push_back(
-      std::make_unique<gpu_pipeline_executor>(gpu_task_executor_config, space, this));
+    auto config = gpu_task_executor_config;
+    if (sys_topology) {
+      auto it = std::find_if(sys_topology->gpus.begin(),
+                             sys_topology->gpus.end(),
+                             [space](const cucascade::memory::gpu_topology_info& dev) {
+                               return dev.id == space->get_device_id();
+                             });
+
+      if (it != sys_topology->gpus.end()) { config.cpu_affinity_list = it->cpu_cores; }
+    }
+    _gpu_executors.push_back(std::make_unique<gpu_pipeline_executor>(config, space, this));
   }
   _task_request_queue = std::make_unique<task_request_queue>(1);
 }
@@ -66,8 +76,7 @@ void pipeline_executor::start()
   on_start();
   _threads.reserve(_config.num_threads);
   for (int i = 0; i < _config.num_threads; ++i) {
-    _threads.push_back(std::make_unique<sirius::parallel::task_executor_thread>(
-      std::make_unique<std::thread>(&pipeline_executor::worker_loop, this, i)));
+    _threads.emplace_back(&pipeline_executor::worker_loop, this, i);
   }
   // Start all GPU executors
   for (auto& gpu_exec : _gpu_executors) {
@@ -85,7 +94,7 @@ void pipeline_executor::stop()
   }
   on_stop();
   for (auto& thread : _threads) {
-    if (thread->_internal_thread->joinable()) { thread->_internal_thread->join(); }
+    if (thread.joinable()) { thread.join(); }
   }
   _threads.clear();
 }

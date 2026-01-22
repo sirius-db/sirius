@@ -62,7 +62,7 @@ void local_task_buffer::close()
 gpu_pipeline_executor::gpu_pipeline_executor(sirius::parallel::task_executor_config config,
                                              const cucascade::memory::memory_space* mem_space,
                                              pipeline_executor* pipeline_exec)
-  : itask_executor(std::make_unique<gpu_pipeline_queue>(config.num_threads), config),
+  : itask_executor(std::make_unique<gpu_pipeline_queue>(config.num_threads), std::move(config)),
     _local_task_buffer(std::make_unique<local_task_buffer>()),
     _memory_space_view(mem_space),
     _pipeline_exec(pipeline_exec)
@@ -93,8 +93,15 @@ void gpu_pipeline_executor::start()
   on_start();
   _threads.reserve(_config.num_threads);
   for (int i = 0; i < _config.num_threads; ++i) {
-    _threads.push_back(std::make_unique<sirius::parallel::task_executor_thread>(
-      std::make_unique<std::thread>(&gpu_pipeline_executor::worker_loop, this, i)));
+    auto& t = _threads.emplace_back(&gpu_pipeline_executor::worker_loop, this, i);
+    if (!_config.cpu_affinity_list.empty()) {
+      cpu_set_t cpuset;
+      CPU_ZERO(&cpuset);
+      for (int core_id : _config.cpu_affinity_list) {
+        CPU_SET(core_id, &cpuset);
+      }
+      pthread_setaffinity_np(t.native_handle(), sizeof(cpu_set_t), &cpuset);
+    }
   }
   _gpu_pipeline_executor_manager_thread =
     std::make_unique<std::thread>(&gpu_pipeline_executor::manager_loop, this);
@@ -106,7 +113,7 @@ void gpu_pipeline_executor::stop()
   if (!_running.compare_exchange_strong(expected, false)) { return; }
   on_stop();
   for (auto& thread : _threads) {
-    if (thread->_internal_thread->joinable()) { thread->_internal_thread->join(); }
+    if (thread.joinable()) { thread.join(); }
   }
   if (_gpu_pipeline_executor_manager_thread->joinable()) {
     _gpu_pipeline_executor_manager_thread->join();

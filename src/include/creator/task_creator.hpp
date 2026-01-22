@@ -264,7 +264,7 @@ class task_creator {
 
   size_t _num_threads;
   std::atomic<bool> _running;
-  std::vector<std::unique_ptr<std::thread>> _threads;
+  std::vector<std::thread> _threads;
   std::queue<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>> _priority_scans;
   std::unique_ptr<task_creation_queue> _task_creation_queue;
   sirius_pipeline_hashmap* _sirius_pipeline_map;

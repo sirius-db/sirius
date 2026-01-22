@@ -46,8 +46,7 @@ void downgrade_executor::start()
   on_start();
   _threads.reserve(_config.num_threads);
   for (int i = 0; i < _config.num_threads; ++i) {
-    _threads.push_back(std::make_unique<task_executor_thread>(
-      std::make_unique<std::thread>(&downgrade_executor::worker_loop, this, i)));
+    _threads.emplace_back(&downgrade_executor::worker_loop, this, i);
   }
 }
 
@@ -57,7 +56,7 @@ void downgrade_executor::stop()
   if (!_running.compare_exchange_strong(expected, false)) { return; }
   on_stop();
   for (auto& thread : _threads) {
-    if (thread->_internal_thread->joinable()) { thread->_internal_thread->join(); }
+    if (thread.joinable()) { thread.join(); }
   }
   _threads.clear();
 }

@@ -15,6 +15,7 @@
  */
 
 #pragma once
+
 #include "parallel/task_executor.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/task_request.hpp"

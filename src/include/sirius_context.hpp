@@ -67,6 +67,11 @@ class SiriusContext : public ClientContextState {
   /// \brief Terminate the Sirius context, releasing all resources.
   void terminate();
 
+  [[nodiscard]] const cucascade::memory::system_topology_info& get_hw_topology() const noexcept
+  {
+    return config_.get_hw_topology();
+  }
+
   /// \brief Get the memory reservation manager.
   [[nodiscard]] sirius::memory::sirius_memory_reservation_manager& get_memory_manager();
   [[nodiscard]] const sirius::memory::sirius_memory_reservation_manager& get_memory_manager() const;

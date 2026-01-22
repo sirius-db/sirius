@@ -20,6 +20,7 @@
 #include "parallel/config.hpp"
 
 #include <cucascade/memory/config.hpp>
+#include <cucascade/memory/topology_discovery.hpp>
 
 #include <filesystem>
 
@@ -30,10 +31,15 @@ struct configuration_setter;
 }  // namespace config
 
 struct sirius_config {
-  sirius_config()  = default;
+  sirius_config();
   ~sirius_config() = default;
 
   void load_from_file(const std::filesystem::path& config_path);
+
+  [[nodiscard]] const cucascade::memory::system_topology_info& get_hw_topology() const noexcept
+  {
+    return hw_topology_;
+  }
 
   [[nodiscard]] size_t get_task_creator_thread_count() const noexcept
   {
@@ -53,6 +59,7 @@ struct sirius_config {
     const noexcept;
 
  private:
+  cucascade::memory::system_topology_info hw_topology_;
   std::vector<cucascade::memory::memory_space_config> _memory_space_configs;
   parallel::task_executor_config _gpu_pipeline_executor_config{.num_threads    = 4,
                                                                .retry_on_error = true};
