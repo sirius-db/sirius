@@ -23,21 +23,46 @@
 #include "duckdb/execution/radix_partitioned_hashtable.hpp"
 #include "duckdb/parser/group_by_node.hpp"
 #include "duckdb/storage/data_table.hpp"
+#include "op/sirius_physical_partition_consumer_operator.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_operator.hpp"
+#include "cudf/types.hpp"
+#include "cudf/aggregation.hpp"
 
 namespace sirius {
 namespace op {
 
-class sirius_physical_grouped_aggregate_merge : public sirius_physical_operator {
+class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition_consumer_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE =
     SiriusPhysicalOperatorType::MERGE_GROUP_BY;
 
  public:
+// WSM TODO: do we need all these constructors?
+
   sirius_physical_grouped_aggregate_merge(sirius_physical_grouped_aggregate* grouped_aggregate);
 
+  sirius_physical_grouped_aggregate_merge(duckdb::vector<duckdb::LogicalType> types,
+    std::vector<int> group_idx,
+    std::vector<cudf::aggregation::Kind> cudf_aggregates,
+    std::vector<int> cudf_aggregate_idx,
+    duckdb::idx_t estimated_cardinality);
+  
   sirius_physical_grouped_aggregate_merge(
+    duckdb::ClientContext& context,
+    duckdb::vector<duckdb::LogicalType> types,
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
+    duckdb::idx_t estimated_cardinality);
+
+  sirius_physical_grouped_aggregate_merge(
+    duckdb::ClientContext& context,
+    duckdb::vector<duckdb::LogicalType> types,
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups,
+    duckdb::idx_t estimated_cardinality);
+
+  sirius_physical_grouped_aggregate_merge(
+    duckdb::ClientContext& context,
     duckdb::vector<duckdb::LogicalType> types,
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups,
@@ -66,6 +91,14 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_operator 
   sirius_physical_operator* child_op;
   sirius_physical_operator* get_child_op() const { return child_op; }
 
+  // Grouped aggregatge definitions for cudf compute
+  std::vector<int> group_idx;
+  std::vector<cudf::aggregation::Kind> cudf_aggregates;
+  std::vector<int> cudf_aggregate_idx;
+
+
+  std::size_t current_partition_index = 0;
+
  public:
   // Source interface
   bool is_source() const override { return true; }
@@ -75,11 +108,15 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_operator 
     return duckdb::OrderPreservationType::NO_ORDER;
   }
 
- public:
   // Sink interface
   bool is_sink() const override { return true; }
 
   bool sink_order_dependent() const override { return false; }
+
+  std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>> get_next_task_input_batch() override;
+
+  std::vector<std::shared_ptr<::cucascade::data_batch>> execute(
+    const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches) override;
 };
 
 }  // namespace op

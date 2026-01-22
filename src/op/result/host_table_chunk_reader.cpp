@@ -193,14 +193,20 @@ host_table_chunk_reader::host_table_chunk_reader(
   duckdb::vector<duckdb::LogicalType> const& types_p)
   : _client_ctx(client_ctx), _allocation(host_table.get_host_table()->allocation), _types(types_p)
 {
+  if (!host_table.get_host_table().get()) {
+    throw std::runtime_error(
+      "[host_table_chunk_reader] get_host_table() is null (unique_ptr not set)");
+  }
+  if (!_allocation) {
+    throw std::runtime_error(
+      "[host_table_chunk_reader] host_table allocation is null (cannot read column data)");
+  }
   // Unpack metadata
   auto metadata_nodes = sirius::unpack_metadata_to_nodes(host_table.get_host_table()->metadata);
-
   if (metadata_nodes.size() != _types.size()) {
     throw std::runtime_error(
       "[host_table_chunk_reader] Metadata column count does not match expected column count.");
   }
-
   // Initialize column readers
   for (size_t col_idx = 0; col_idx < metadata_nodes.size(); ++col_idx) {
     if (col_idx == 0) {
@@ -218,7 +224,6 @@ host_table_chunk_reader::host_table_chunk_reader(
       throw std::runtime_error(
         "[host_table_chunk_reader] HUGEINT type is not currently supported.");
     }
-
     _column_readers.emplace_back(metadata_nodes[col_idx], _allocation);
   }
 }

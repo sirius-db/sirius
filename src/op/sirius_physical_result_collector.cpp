@@ -162,6 +162,17 @@ void sirius_physical_materialized_collector::sink(
 
     // Push chunks to result collection
     auto const& host_table = data->cast<cucascade::host_table_representation>();
+    // host_table_chunk_reader expects get_host_table() and ->allocation to be non-null;
+    // otherwise it will dereference a null unique_ptr (e.g. in column_reader::initialize).
+    auto const* ht = host_table.get_host_table().get();
+    if (!ht) {
+      throw duckdb::InvalidInputException(
+        "[GPUPhysicalMaterializedCollector] host_table_representation has null get_host_table()");
+    }
+    if (!ht->allocation) {
+      throw duckdb::InvalidInputException(
+        "[GPUPhysicalMaterializedCollector] host_table allocation is null (cannot read chunks)");
+    }
     host_table_chunk_reader chunk_reader(_client_ctx, host_table, types);
 
     // Push chunks to result collection

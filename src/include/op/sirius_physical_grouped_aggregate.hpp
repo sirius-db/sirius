@@ -24,6 +24,8 @@
 #include "duckdb/parser/group_by_node.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "op/sirius_physical_operator.hpp"
+#include "cudf/types.hpp"
+#include "cudf/aggregation.hpp"
 
 namespace sirius {
 namespace op {
@@ -58,21 +60,30 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
     duckdb::TupleDataValidityType group_validity,
     duckdb::TupleDataValidityType distinct_validity);
 
-  //! The grouping sets
-  duckdb::GroupedAggregateData grouped_aggregate_data;
-
   duckdb::vector<duckdb::GroupingSet> grouping_sets;
-  //! The radix partitioned hash tables (one per grouping set)
-  duckdb::vector<duckdb::HashAggregateGroupingData> groupings;
-  duckdb::unique_ptr<duckdb::DistinctAggregateCollectionInfo> distinct_collection_info;
-  //! A recreation of the input chunk, with nulls for everything that isn't a group
-  duckdb::vector<duckdb::LogicalType> input_group_types;
 
-  // Filters given to sink and friends
-  duckdb::unsafe_vector<duckdb::idx_t> non_distinct_filter;
-  duckdb::unsafe_vector<duckdb::idx_t> distinct_filter;
+// TODO: we may need some of these variables later when we implement grouping sets
 
-  duckdb::unordered_map<duckdb::Expression*, size_t> filter_indexes;
+    // //! The grouping sets
+  // duckdb::GroupedAggregateData grouped_aggregate_data;
+
+  // //! The radix partitioned hash tables (one per grouping set)
+  // duckdb::vector<duckdb::HashAggregateGroupingData> groupings;
+  // duckdb::unique_ptr<duckdb::DistinctAggregateCollectionInfo> distinct_collection_info;
+  // //! A recreation of the input chunk, with nulls for everything that isn't a group
+  // duckdb::vector<duckdb::LogicalType> input_group_types;
+
+  // // Filters given to sink and friends
+  // duckdb::unsafe_vector<duckdb::idx_t> non_distinct_filter;
+  // duckdb::unsafe_vector<duckdb::idx_t> distinct_filter;
+
+  // duckdb::unordered_map<duckdb::Expression*, size_t> filter_indexes;
+
+// Grouped aggregatge definitions for cudf compute
+std::vector<int> group_idx;
+std::vector<cudf::aggregation::Kind> cudf_aggregates;
+std::vector<int> cudf_aggregate_idx;
+
 
  public:
   // Source interface
@@ -83,11 +94,13 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
     return duckdb::OrderPreservationType::NO_ORDER;
   }
 
- public:
   // Sink interface
   bool is_sink() const override { return true; }
 
   bool sink_order_dependent() const override { return false; }
+
+  std::vector<std::shared_ptr<::cucascade::data_batch>> execute(
+    const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches) override;
 };
 
 }  // namespace op
