@@ -14,7 +14,9 @@
  * limitations under the License.
  */
 
-#include "catch.hpp"
+// test
+#include <catch.hpp>
+#include <utils/utils.hpp>
 
 // sirius
 #include <data/data_batch_utils.hpp>
@@ -58,29 +60,9 @@ std::filesystem::path get_test_config_path()
   return std::filesystem::path(__FILE__).parent_path() / "memory.cfg";
 }
 
-duckdb::shared_ptr<duckdb::SiriusContext> get_sirius_context()
-{
-  static duckdb::DuckDB db(nullptr);
-  static duckdb::Connection con(db);
-
-  auto& client_ctx = *con.context;
-  auto sirius_ctx  = client_ctx.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  if (!sirius_ctx) {
-    sirius::converter_registry::initialize();
-    ::sirius::sirius_config config;
-    config.load_from_file(get_test_config_path());
-    auto new_ctx = duckdb::make_shared_ptr<duckdb::SiriusContext>();
-    new_ctx->initialize(config);
-    client_ctx.registered_state->Insert("sirius_state", new_ctx);
-    sirius_ctx = std::move(new_ctx);
-  }
-  REQUIRE(sirius_ctx != nullptr);
-  return sirius_ctx;
-}
-
 memory_space* get_memory_space(cucascade::memory::Tier tier, int device_id)
 {
-  auto sirius_ctx = get_sirius_context();
+  auto sirius_ctx = sirius::get_sirius_context(get_test_config_path());
   auto& manager   = sirius_ctx->get_memory_manager();
   auto* space     = manager.get_memory_space(tier, device_id);
   if (space) { return space; }

@@ -14,10 +14,11 @@
  * limitations under the License.
  */
 
-#include "catch.hpp"
+// test
+#include <catch.hpp>
+#include <utils/utils.hpp>
 
 // sirius
-#include <data/sirius_converter_registry.hpp>
 #include <helper/utils.hpp>
 #include <op/scan/duckdb_scan_task.hpp>
 
@@ -40,26 +41,6 @@ using namespace cucascade::memory;
 static std::filesystem::path get_test_config_path()
 {
   return std::filesystem::path(__FILE__).parent_path() / "memory.cfg";
-}
-
-static duckdb::shared_ptr<duckdb::SiriusContext> get_sirius_context()
-{
-  static duckdb::DuckDB db(nullptr);
-  static duckdb::Connection con(db);
-
-  auto& client_ctx = *con.context;
-  auto sirius_ctx  = client_ctx.registered_state->Get<duckdb::SiriusContext>("sirius_state");
-  if (!sirius_ctx) {
-    sirius::converter_registry::initialize();
-    ::sirius::sirius_config config;
-    config.load_from_file(get_test_config_path());
-    auto new_ctx = duckdb::make_shared_ptr<duckdb::SiriusContext>();
-    new_ctx->initialize(config);
-    client_ctx.registered_state->Insert("sirius_state", new_ctx);
-    sirius_ctx = std::move(new_ctx);
-  }
-  REQUIRE(sirius_ctx != nullptr);
-  return sirius_ctx;
 }
 
 static memory_space* get_host_space(duckdb::SiriusContext& sirius_ctx)
@@ -85,7 +66,7 @@ static memory_space* get_host_space(duckdb::SiriusContext& sirius_ctx)
 static std::unique_ptr<fixed_size_host_memory_resource::multiple_blocks_allocation>
 create_test_allocation(size_t total_size)
 {
-  auto sirius_ctx = get_sirius_context();
+  auto sirius_ctx = sirius::get_sirius_context(get_test_config_path());
   auto* mem_space = get_host_space(*sirius_ctx);
   REQUIRE(mem_space != nullptr);
   auto* allocator = mem_space->template get_memory_resource_as<fixed_size_host_memory_resource>();
@@ -151,7 +132,7 @@ TEST_CASE("column_builder - accessor initialization", "[duckdb_scan_task][column
 {
   constexpr size_t DEFAULT_VARCHAR_SIZE = 256;
 
-  auto sirius_ctx = get_sirius_context();
+  auto sirius_ctx = sirius::get_sirius_context(get_test_config_path());
   auto* mem_space = get_host_space(*sirius_ctx);
   REQUIRE(mem_space != nullptr);
   auto* allocator = mem_space->template get_memory_resource_as<fixed_size_host_memory_resource>();
@@ -215,7 +196,7 @@ TEST_CASE("column_builder - sufficient_space_for_column", "[duckdb_scan_task][co
 {
   constexpr size_t DEFAULT_VARCHAR_SIZE = 256;
 
-  auto sirius_ctx = get_sirius_context();
+  auto sirius_ctx = sirius::get_sirius_context(get_test_config_path());
   auto* mem_space = get_host_space(*sirius_ctx);
   REQUIRE(mem_space != nullptr);
   auto* allocator = mem_space->template get_memory_resource_as<fixed_size_host_memory_resource>();

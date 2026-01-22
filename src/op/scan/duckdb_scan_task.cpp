@@ -309,9 +309,11 @@ duckdb_scan_task_local_state::duckdb_scan_task_local_state(
   auto const& op = g_state.op;
   num_columns    = op.projection_ids.size();
 
-  bool const has_existing_state = static_cast<bool>(existing_local_tf_state);
-  local_tf_state                = std::move(existing_local_tf_state);
-  if (!has_existing_state) { g_state.register_local_state(); }
+  if (existing_local_tf_state) {
+    local_tf_state = std::move(existing_local_tf_state);
+  } else {
+    g_state.register_local_state();
+  }
 
   // Make the memory reservation request
   auto& mem_res_mgr = g_state.sirius_ctx->get_memory_manager();
@@ -327,7 +329,7 @@ duckdb_scan_task_local_state::duckdb_scan_task_local_state(
       "HOST memory space with device id " +
       std::to_string(reservation->device_id()) + ".");
   }
-  allocation = allocator->allocate_multiple_blocks(approximate_batch_size);
+  allocation = allocator->allocate_multiple_blocks(approximate_batch_size, reservation.get());
 
   // Estimate number of rows per batch
   estimate_rows_per_batch(op);
@@ -420,7 +422,11 @@ std::shared_ptr<cucascade::data_batch> duckdb_scan_task_local_state::make_data_b
   auto metadata = std::make_unique<std::vector<uint8_t>>(pack_metadata_from_nodes(column_metadata));
 
   // Make the host table allocation
-  auto const sz = allocation->size_bytes();  /// TODO: change to actual used tail byte
+  // auto const sz =
+  //   column_builders.back()
+  //     .mask_blocks_accessor
+  //     .get_current_global_byte_offset();  // +1 in case the mask byte is partially filled
+  auto const sz = allocation->size_bytes();
   auto table_allocation =
     std::make_unique<host_table_allocation>(std::move(allocation), std::move(metadata), sz);
 

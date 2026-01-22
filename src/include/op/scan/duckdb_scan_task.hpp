@@ -171,6 +171,16 @@ struct multiple_blocks_allocation_accessor {
   }
 
   /**
+   * @brief Get the current global byte offset within the allocation.
+   *
+   * @return The current global byte offset.
+   */
+  [[nodiscard]] size_t get_current_global_byte_offset() const
+  {
+    return initial_byte_offset + block_index * block_size + offset_in_block;
+  }
+
+  /**
    * @brief Set the cursor to a specific byte offset within the allocation.
    *
    * @param[in] byte_offset The global byte offset within the allocation.
@@ -606,7 +616,6 @@ class duckdb_scan_task : public sirius::parallel::itask {
     return &this->_local_state->cast<duckdb_scan_task_local_state>();
   }
 
- protected:
   //===----------Fields----------===//
   shared_data_repository* _data_repo;  ///< Data repository to which to push batches
   uint64_t task_id;                    ///< The unique id of this scan task
