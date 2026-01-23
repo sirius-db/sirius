@@ -423,8 +423,8 @@ OperatorResultType GPUPhysicalNestedLoopJoin::ResolveComplexJoin(
         HandleMaterializeExpression(right_temp_data->columns[join_key_index], gpuBufferManager);
       // Perform cast
       auto from_cudf_column_view = right_keys[cond_idx]->convertToCudfColumn();
-      auto to_cudf_type   = GetCudfType(condition.right->return_type);
-      auto to_cudf_column = cudf::cast(from_cudf_column_view,
+      auto to_cudf_type          = GetCudfType(condition.right->return_type);
+      auto to_cudf_column        = cudf::cast(from_cudf_column_view,
                                        to_cudf_type,
                                        rmm::cuda_stream_default,
                                        GPUBufferManager::GetInstance().mr);

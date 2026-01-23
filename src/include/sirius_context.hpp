@@ -69,8 +69,7 @@ class SiriusContext : public ClientContextState {
 
   /// \brief Get the memory reservation manager.
   [[nodiscard]] sirius::memory::sirius_memory_reservation_manager& get_memory_manager();
-  [[nodiscard]] const sirius::memory::sirius_memory_reservation_manager& get_memory_manager()
-    const;
+  [[nodiscard]] const sirius::memory::sirius_memory_reservation_manager& get_memory_manager() const;
 
   [[nodiscard]] cucascade::shared_data_repository_manager& get_data_repository_manager();
   [[nodiscard]] const cucascade::shared_data_repository_manager& get_data_repository_manager()
