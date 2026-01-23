@@ -30,7 +30,7 @@
 #include <cudf/copying.hpp>
 #include <cudf/sorting.hpp>
 
-#include <data/gpu_data_representation.hpp>
+#include <cucascade/data/gpu_data_representation.hpp>
 
 #include <algorithm>
 #include <memory>

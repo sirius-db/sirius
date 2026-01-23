@@ -30,8 +30,8 @@
 
 #include <cuda_runtime.h>
 
-#include <data/data_batch.hpp>
-#include <data/gpu_data_representation.hpp>
+#include <cucascade/data/data_batch.hpp>
+#include <cucascade/data/gpu_data_representation.hpp>
 
 #include <algorithm>
 #include <mutex>

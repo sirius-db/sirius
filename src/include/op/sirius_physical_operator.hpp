@@ -70,7 +70,7 @@ class sirius_physical_operator {
   sirius_physical_operator(duckdb::PhysicalOperatorType type,
                            duckdb::vector<duckdb::LogicalType> types,
                            duckdb::idx_t estimated_cardinality,
-                           ::cucascade::shared_data_repository_manager* data_repo_mgr = nullptr)
+                           cucascade::shared_data_repository_manager* data_repo_mgr = nullptr)
     : type(type),
       types(std::move(types)),
       estimated_cardinality(estimated_cardinality),
@@ -237,10 +237,10 @@ class sirius_physical_operator {
   creator::task_creator* creator;
 
   //! Shared data repository manager (owned upstream, propagated to operators)
-  ::cucascade::shared_data_repository_manager* data_repo_mgr = nullptr;
+  cucascade::shared_data_repository_manager* data_repo_mgr = nullptr;
 
  public:
-  ::cucascade::shared_data_repository_manager* get_data_repository_manager() const
+  cucascade::shared_data_repository_manager* get_data_repository_manager() const
   {
     return data_repo_mgr;
   }

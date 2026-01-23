@@ -33,8 +33,8 @@
 #include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <data/sirius_converter_registry.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
-
 #include <utils/utils.hpp>
+#include "scan/test_utils.hpp"
 
 #include <optional>
 #include <type_traits>
