@@ -56,6 +56,9 @@ namespace sirius::op::scan {
  */
 class duckdb_scan_task_global_state : public sirius::parallel::itask_global_state,
                                       public duckdb::GlobalSourceState {
+  friend class duckdb_scan_task;
+  friend class duckdb_scan_task_local_state;
+
  public:
   //===----------Constructor----------===//
   /**
@@ -78,39 +81,41 @@ class duckdb_scan_task_global_state : public sirius::parallel::itask_global_stat
    *
    * @return The maximum number of threads for the table scan
    */
-  uint64_t MaxThreads() override { return max_threads; }
+  uint64_t MaxThreads() override { return _max_threads; }
 
   /**
    * @brief Check if the table scan source is fully drained
    *
    * @return true if the source is fully drained, false otherwise
    */
-  bool is_source_drained() const { return source_drained.load(std::memory_order_acquire); }
+  bool is_source_drained() const { return _source_drained.load(std::memory_order_acquire); }
 
   /**
    * @brief Set the table scan source as fully drained
    */
-  void set_source_drained() { source_drained.store(true, std::memory_order_release); }
+  void set_source_drained() { _source_drained.store(true, std::memory_order_release); }
 
   /**
-   * @brief Register a new local table function state.
+   * @brief Increment the number of active local table function states
+   *
+   * We keep track of the number of active local states to determine when the table source is fully
+   * drained. Only when all local states have exhausted their scan range is the table fully read.
    */
-  void register_local_state() { active_local_states.fetch_add(1, std::memory_order_relaxed); }
+  void increment_local_states() { _active_local_states.fetch_add(1, std::memory_order_relaxed); }
 
   /**
-   * @brief Release a local table function state and mark source drained if none remain.
+   * @brief Decrement the number of active local table function states
+   *
+   * See increment_local_states for more details.
    */
-  void release_local_state()
+  void decrement_local_states()
   {
-    auto const remaining = active_local_states.fetch_sub(1, std::memory_order_acq_rel) - 1;
+    auto const remaining = _active_local_states.fetch_sub(1, std::memory_order_acq_rel) - 1;
     if (remaining == 0) { set_source_drained(); }
   }
 
+ private:
   //===----------Fields----------===//
-  std::atomic<bool> source_drained{false};      ///< Whether the table scan source is fully drained
-  std::atomic<int64_t> active_local_states{0};  ///< Number of active local table function states
-  uint64_t max_threads;                         ///< Maximum number of threads for this scan task
-
   duckdb::shared_ptr<pipeline::sirius_pipeline>
     pipeline;  ///< The pipeline to which this table scan belongs
   duckdb::shared_ptr<duckdb::SiriusContext> sirius_ctx;  ///< The Sirius context
@@ -118,6 +123,9 @@ class duckdb_scan_task_global_state : public sirius::parallel::itask_global_stat
     global_tf_state;                    ///< Global state for the table function
   duckdb_scan_executor& scan_executor;  ///< The scan executor executing this scan task
   sirius_physical_table_scan& op;       ///< The physical table scan being executed
+  std::atomic<bool> _source_drained{false};      ///< Whether the table scan source is fully drained
+  std::atomic<int64_t> _active_local_states{0};  ///< Number of active local table function states
+  uint64_t _max_threads;                         ///< Maximum number of threads for this scan task
 };
 
 //===----------------------------------------------------------------------===//
@@ -343,6 +351,8 @@ class duckdb_scan_task_local_state : public sirius::parallel::itask_local_state 
   using data_batch = cucascade::data_batch;
 
  public:
+  friend class duckdb_scan_task;
+
   using multiple_blocks_allocation =
     cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation;
 
@@ -480,6 +490,7 @@ class duckdb_scan_task_local_state : public sirius::parallel::itask_local_state 
    */
   std::shared_ptr<data_batch> make_data_batch();
 
+ private:
   //===----------Fields----------===//
   size_t approximate_batch_size;                ///< Approximate target batch size in bytes
   size_t default_varchar_size;                  ///< Default size for VARCHAR columns in bytes
@@ -505,14 +516,13 @@ class duckdb_scan_task_local_state : public sirius::parallel::itask_local_state 
   duckdb::ExecutionContext& exec_ctx;  ///< The duckdb execution context, needed for initializing
                                        ///< the local table function state
 
- private:
   /**
    * @brief Get the byte offset within the allocation where the column data ends.
    *
    * @return The byte offset within the allocation where the column data ends.
    */
   [[nodiscard]] size_t get_tail_byte_offset() const;
-  
+
   /**
    * @brief Estimate the maximum number of rows to process for a batch given the target batch size.
    *
@@ -570,7 +580,7 @@ class duckdb_scan_task : public sirius::parallel::itask {
                    shared_data_repository* data_repo,
                    std::unique_ptr<duckdb_scan_task_local_state> l_state,
                    std::shared_ptr<duckdb_scan_task_global_state> g_state)
-    : task_id(task_id),
+    : _task_id(task_id),
       _data_repo(data_repo),
       sirius::parallel::itask(std::move(l_state), g_state) {};
 
@@ -625,7 +635,7 @@ class duckdb_scan_task : public sirius::parallel::itask {
 
   //===----------Fields----------===//
   shared_data_repository* _data_repo;  ///< Data repository to which to push batches
-  uint64_t task_id;                    ///< The unique id of this scan task
+  uint64_t _task_id;                   ///< The unique id of this scan task
 };
 
 }  // namespace sirius::op::scan

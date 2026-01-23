@@ -41,7 +41,7 @@ duckdb_scan_task_global_state::duckdb_scan_task_global_state(
   sirius_physical_table_scan* scan_op)
   : pipeline(std::move(pipeline)),
     sirius_ctx(client_ctx.registered_state->Get<duckdb::SiriusContext>("sirius_state")),
-    max_threads(scan_exec.get_num_threads()),
+    _max_threads(scan_exec.get_num_threads()),
     scan_executor(scan_exec),
     op(*scan_op)
 {
@@ -312,7 +312,7 @@ duckdb_scan_task_local_state::duckdb_scan_task_local_state(
   if (existing_local_tf_state) {
     local_tf_state = std::move(existing_local_tf_state);
   } else {
-    g_state.register_local_state();
+    g_state.increment_local_states();
   }
 
   // Make the memory reservation request
@@ -461,7 +461,7 @@ bool duckdb_scan_task::get_next_chunk(duckdb_scan_task_local_state& l_state,
   if (l_state.chunk.size() == 0) {
     if (!l_state.local_state_drained) {
       l_state.local_state_drained = true;
-      g_state.release_local_state();
+      g_state.decrement_local_states();
     }
     return false;
   }
