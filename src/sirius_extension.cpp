@@ -711,6 +711,7 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
 
 static void LoadInternal(ExtensionLoader& loader)
 {
+  InitGlobalLogger();
   DuckDB db(loader.GetDatabaseInstance());
   auto& config = DBConfig::GetConfig(loader.GetDatabaseInstance());
   config.extension_callbacks.push_back(make_uniq<duckdb::SiriusContextExtensionCallback>());

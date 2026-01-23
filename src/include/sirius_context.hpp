@@ -143,6 +143,13 @@ class SiriusContextExtensionCallback : public ExtensionCallback {
   duckdb::shared_ptr<SiriusContext> context_;
 };
 
+/// \brief Get or create the SiriusContext for a given ClientContext.
+/// If the SiriusContext doesn't exist in the ClientContext's registered_state, it will be created
+/// and inserted.
+/// \param context The client context.
+/// \return The SiriusContext for the given ClientContext, or nullptr if it cannot be created.
+duckdb::shared_ptr<SiriusContext> GetOrCreateSiriusContext(ClientContext& context);
+
 // [[nodiscard]] sirius_context& get_sirius_context();
 
 }  // namespace duckdb

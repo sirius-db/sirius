@@ -197,16 +197,11 @@ void SiriusContext::thorw_if_not_initialized() const
 
 // ================= Free Functions ================= //
 
-SiriusContextExtensionCallback::SiriusContextExtensionCallback()
-{
-  InitGlobalLogger();
-  read_config_file_if_exists();
-}
+SiriusContextExtensionCallback::SiriusContextExtensionCallback() = default;
 
 void SiriusContextExtensionCallback::OnConnectionOpened(ClientContext& context)
 {
   spdlog::info("Connection opened.");
-  if (context_) { context.registered_state->Insert("sirius_state", context_); }
 }
 
 void SiriusContextExtensionCallback::OnConnectionClosed(ClientContext& context)
@@ -248,4 +243,31 @@ void SiriusContextExtensionCallback::read_config_file_if_exists()
   context_->initialize(config_);
 }
 
+duckdb::shared_ptr<SiriusContext> GetOrCreateSiriusContext(ClientContext& context)
+{
+  auto existing = context.registered_state->Get<SiriusContext>("sirius_state");
+  if (existing) {
+    spdlog::debug("Found existing SiriusContext for ClientContext pointer: {}",
+                  static_cast<void*>(&context));
+    return existing;
+  }
+
+  auto new_context = duckdb::make_shared_ptr<SiriusContext>();
+  auto config_path = get_config_file_path();
+  sirius::sirius_config config;
+  if (std::filesystem::exists(config_path)) {
+    config.load_from_file(config_path);
+    spdlog::info("Loaded Sirius configuration from file: {}", config_path);
+  } else {
+    spdlog::info(
+      "Sirius configuration file does not exist at path: {}. Using default configuration.",
+      config_path);
+  }
+
+  new_context->initialize(config);
+  context.registered_state->Insert("sirius_state", new_context);
+  spdlog::debug("Inserted new sirius_state into registered state");
+
+  return new_context;
+}
 }  // namespace duckdb
