@@ -341,6 +341,16 @@ duckdb_scan_task_local_state::duckdb_scan_task_local_state(
   initialize_local_table_function_state(op, exec_ctx, g_state.global_tf_state.get());
 }
 
+size_t duckdb_scan_task_local_state::get_tail_byte_offset() const
+{
+  auto const& last_builder = column_builders.back();
+  auto last_byte_offset    = last_builder.mask_blocks_accessor.get_current_global_byte_offset();
+  if (utils::mod_8(last_byte_offset) != 0) {
+    last_byte_offset++;  // Round up to next byte if partially filled
+  }
+  return std::min(last_byte_offset, allocation->size_bytes());
+}
+
 void duckdb_scan_task_local_state::estimate_rows_per_batch(sirius_physical_table_scan const& op)
 {
   assert(num_columns <= op.column_ids.size());
@@ -422,11 +432,8 @@ std::shared_ptr<cucascade::data_batch> duckdb_scan_task_local_state::make_data_b
   auto metadata = std::make_unique<std::vector<uint8_t>>(pack_metadata_from_nodes(column_metadata));
 
   // Make the host table allocation
-  // auto const sz =
-  //   column_builders.back()
-  //     .mask_blocks_accessor
-  //     .get_current_global_byte_offset();  // +1 in case the mask byte is partially filled
-  auto const sz = allocation->size_bytes();
+  auto const sz = get_tail_byte_offset();
+  // auto const sz = allocation->size_bytes();
   auto table_allocation =
     std::make_unique<host_table_allocation>(std::move(allocation), std::move(metadata), sz);
 

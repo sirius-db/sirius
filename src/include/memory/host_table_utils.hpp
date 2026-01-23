@@ -17,7 +17,7 @@
 #pragma once
 
 // sirius
-#include <expression_executor/gpu_expression_executor_state.hpp>  /// FIXME: remove type conversion from expression executor
+#include <cudf_utils.hpp>
 
 // duckdb
 #include <duckdb/common/types.hpp>
@@ -65,12 +65,8 @@ inline metadata_node make_flat_metadata_node(duckdb::LogicalType type,
                                              int64_t data_offset,
                                              int64_t null_mask_offset)
 {
-  return metadata_node{duckdb::sirius::GpuExpressionState::GetCudfType(type),
-                       size,
-                       null_count,
-                       data_offset,
-                       null_mask_offset,
-                       {}};
+  return metadata_node{
+    duckdb::GetCudfType(type), size, null_count, data_offset, null_mask_offset, {}};
 }
 
 /**

@@ -507,6 +507,13 @@ class duckdb_scan_task_local_state : public sirius::parallel::itask_local_state 
 
  private:
   /**
+   * @brief Get the byte offset within the allocation where the column data ends.
+   *
+   * @return The byte offset within the allocation where the column data ends.
+   */
+  [[nodiscard]] size_t get_tail_byte_offset() const;
+  
+  /**
    * @brief Estimate the maximum number of rows to process for a batch given the target batch size.
    *
    * Uses the actual width of fixed-width types, and a default VARCHAR width, for estimation.
