@@ -50,8 +50,6 @@ TEMPLATE_TEST_CASE("sirius_physical_streaming_limit limits rows in data_batch",
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
 
-  data_repository_mgr repo_mgr;
-
   std::vector<typename Traits::type> values(10);
   if constexpr (Traits::is_string) {
     values = {"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"};
@@ -80,14 +78,13 @@ TEMPLATE_TEST_CASE("sirius_physical_streaming_limit limits rows in data_batch",
 
   std::shared_ptr<data_batch> input_batch;
   if constexpr (Traits::is_string) {
-    input_batch = make_string_batch(repo_mgr, *space, values);
+    input_batch = make_string_batch(*space, values);
   } else if constexpr (Traits::is_decimal) {
-    input_batch = make_decimal64_batch(repo_mgr, *space, values, Traits::scale);
+    input_batch = make_decimal64_batch(*space, values, Traits::scale);
   } else if constexpr (Traits::is_ts) {
-    input_batch = make_timestamp_batch(repo_mgr, *space, values, Traits::cudf_type);
+    input_batch = make_timestamp_batch(*space, values, Traits::cudf_type);
   } else {
-    input_batch =
-      make_numeric_batch<typename Traits::type>(repo_mgr, *space, values, Traits::cudf_type);
+    input_batch = make_numeric_batch<typename Traits::type>(*space, values, Traits::cudf_type);
   }
 
   auto limit_node  = duckdb::BoundLimitNode::ConstantValue(3);
@@ -100,8 +97,7 @@ TEMPLATE_TEST_CASE("sirius_physical_streaming_limit limits rows in data_batch",
                                           std::move(limit_node),
                                           std::move(offset_node),
                                           values.size(),
-                                          false,
-                                          &repo_mgr);
+                                          false);
 
   auto outputs = limiter.execute({input_batch});
   REQUIRE(outputs.size() == 1);

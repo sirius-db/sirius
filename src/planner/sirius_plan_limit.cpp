@@ -72,8 +72,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalLimit& op)
                                                                          std::move(op.limit_val),
                                                                          std::move(op.offset_val),
                                                                          op.estimated_cardinality,
-                                                                         true,
-                                                                         gpu_context.GetGPUExecutor().data_repo_manager.get());
+                                                                         true);
       } else {
         throw duckdb::NotImplementedException(
           "Streaming limit with insertion order preservation not supported in GPU");

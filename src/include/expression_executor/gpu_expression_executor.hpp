@@ -135,7 +135,6 @@ struct GpuExpressionExecutor {
    * output batch holding the results.
    *
    * @param input_batch The input batch against which to evaluate expressions
-   * @param data_repo_mgr The data repository manager (for constructing a new output data batch)
    * @param stream The stream in which to execute the operations in the expression tree
    *
    * @return std::shared_ptr<cucascade::data_batch> The result of the evaluated expressions
@@ -143,14 +142,12 @@ struct GpuExpressionExecutor {
    * @note It is required that there is only one boolean expression in the current expression set.
    */
   std::shared_ptr<data_batch> execute(std::shared_ptr<data_batch> input_batch,
-                                      data_repository_manager& data_repo_mgr,
                                       rmm::cuda_stream_view stream = rmm::cuda_stream_default);
 
   /**
    * @brief Evaluates a boolean expression and filters the input batch according to the result.
    *
    * @param input_batch The input batch against which to evaluate the expression
-   * @param data_repo_mgr The data repository manager (for constructing a new output data batch)
    * @param stream The stream in which to execute the operations in the expression tree
    *
    * @return std::shared_ptr<cucascade::data_batch> The input batch filtered by the boolean
@@ -158,7 +155,6 @@ struct GpuExpressionExecutor {
    */
   std::shared_ptr<cucascade::data_batch> select(
     std::shared_ptr<data_batch> input_batch,
-    data_repository_manager& data_repo_mgr,
     rmm::cuda_stream_view stream = rmm::cuda_stream_default);
 
   // Execute the expression at the given index and return the result

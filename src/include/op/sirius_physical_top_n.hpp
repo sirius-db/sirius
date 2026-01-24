@@ -43,8 +43,7 @@ class sirius_physical_top_n : public sirius_physical_operator {
                         duckdb::idx_t limit,
                         duckdb::idx_t offset,
                         duckdb::shared_ptr<duckdb::DynamicFilterData> dynamic_filter,
-                        duckdb::idx_t estimated_cardinality,
-                        ::cucascade::shared_data_repository_manager* data_repo_mgr = nullptr);
+                        duckdb::idx_t estimated_cardinality);
   ~sirius_physical_top_n() override;
 
   duckdb::vector<duckdb::BoundOrderByNode> orders;

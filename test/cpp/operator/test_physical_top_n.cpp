@@ -38,13 +38,12 @@ BoundOrderByNode make_order(idx_t col_idx, OrderType dir = OrderType::DESCENDING
                           make_uniq<BoundReferenceExpression>(LogicalType::BIGINT, col_idx));
 }
 
-std::shared_ptr<data_batch> make_batch(data_repository_mgr& repo_mgr,
-                                       memory_space& space,
+std::shared_ptr<data_batch> make_batch(memory_space& space,
                                        const std::vector<int64_t>& order_vals,
                                        const std::vector<int64_t>& payload_vals)
 {
   return make_two_column_batch<int64_t, int64_t>(
-    repo_mgr, space, order_vals, payload_vals, cudf::type_id::INT64, std::nullopt);
+    space, order_vals, payload_vals, cudf::type_id::INT64, std::nullopt);
 }
 
 }  // namespace
@@ -54,13 +53,11 @@ TEST_CASE("sirius_physical_top_n single-key uses top_k across multiple batches",
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
 
-  data_repository_mgr repo_mgr;
-
   std::vector<std::shared_ptr<data_batch>> batches;
-  batches.push_back(make_batch(repo_mgr, *space, {5, 1}, {50, 10}));
-  batches.push_back(make_batch(repo_mgr, *space, {7, 3}, {70, 30}));
-  batches.push_back(make_batch(repo_mgr, *space, {9}, {90}));
-  batches.push_back(make_batch(repo_mgr, *space, {2, 8}, {20, 80}));
+  batches.push_back(make_batch(*space, {5, 1}, {50, 10}));
+  batches.push_back(make_batch(*space, {7, 3}, {70, 30}));
+  batches.push_back(make_batch(*space, {9}, {90}));
+  batches.push_back(make_batch(*space, {2, 8}, {20, 80}));
 
   duckdb::vector<duckdb::LogicalType> types;
   types.push_back(duckdb::LogicalType::BIGINT);  // order column
@@ -74,8 +71,7 @@ TEST_CASE("sirius_physical_top_n single-key uses top_k across multiple batches",
                              /*limit=*/3,
                              /*offset=*/0,
                              nullptr,
-                             0,
-                             &repo_mgr);
+                             0);
 
   // Feed in two batches, then two more, ensuring accumulation via internal state.
   auto out1 = topn.execute({batches[0], batches[1]});
@@ -100,14 +96,12 @@ TEST_CASE("sirius_physical_top_n multi-key falls back to sort_by_key", "[physica
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
 
-  data_repository_mgr repo_mgr;
-
   // order by col0 desc, then col1 asc
   std::vector<std::shared_ptr<data_batch>> batches;
-  batches.push_back(make_batch(repo_mgr, *space, {5, 5}, {2, 1}));
-  batches.push_back(make_batch(repo_mgr, *space, {7, 7}, {3, 4}));
-  batches.push_back(make_batch(repo_mgr, *space, {7, 6}, {1, 9}));
-  batches.push_back(make_batch(repo_mgr, *space, {4, 8}, {5, 0}));
+  batches.push_back(make_batch(*space, {5, 5}, {2, 1}));
+  batches.push_back(make_batch(*space, {7, 7}, {3, 4}));
+  batches.push_back(make_batch(*space, {7, 6}, {1, 9}));
+  batches.push_back(make_batch(*space, {4, 8}, {5, 0}));
 
   duckdb::vector<duckdb::LogicalType> types;
   types.push_back(duckdb::LogicalType::BIGINT);  // order
@@ -122,8 +116,7 @@ TEST_CASE("sirius_physical_top_n multi-key falls back to sort_by_key", "[physica
                              /*limit=*/4,
                              /*offset=*/0,
                              nullptr,
-                             0,
-                             &repo_mgr);
+                             0);
 
   auto out1 = topn.execute({batches[0], batches[1]});
   REQUIRE(out1.size() == 1);

@@ -50,8 +50,6 @@ TEMPLATE_TEST_CASE("sirius_physical_projection executes on data_batch for multip
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
 
-  data_repository_mgr repo_mgr;
-
   std::vector<int64_t> key_vals{10, 20, 30, 40};
   auto data_vals = Traits::sample_values();
   while (data_vals.size() < key_vals.size()) {
@@ -62,10 +60,9 @@ TEMPLATE_TEST_CASE("sirius_physical_projection executes on data_batch for multip
   std::shared_ptr<data_batch> input_batch;
   if constexpr (Traits::is_string) {
     input_batch = make_two_column_batch<int64_t, typename Traits::type>(
-      repo_mgr, *space, key_vals, data_vals, Traits::cudf_type, std::nullopt);
+      *space, key_vals, data_vals, Traits::cudf_type, std::nullopt);
   } else if constexpr (Traits::is_decimal) {
-    input_batch = make_two_column_batch<int64_t, typename Traits::type>(repo_mgr,
-                                                                        *space,
+    input_batch = make_two_column_batch<int64_t, typename Traits::type>(*space,
                                                                         key_vals,
                                                                         data_vals,
                                                                         Traits::cudf_type,
@@ -73,10 +70,10 @@ TEMPLATE_TEST_CASE("sirius_physical_projection executes on data_batch for multip
                                                                         cudf::type_id::INT64);
   } else if constexpr (Traits::is_ts) {
     input_batch = make_two_column_batch<int64_t, typename Traits::type>(
-      repo_mgr, *space, key_vals, data_vals, Traits::cudf_type, std::nullopt);
+      *space, key_vals, data_vals, Traits::cudf_type, std::nullopt);
   } else {
     input_batch = make_two_column_batch<int64_t, typename Traits::type>(
-      repo_mgr, *space, key_vals, data_vals, Traits::cudf_type, std::nullopt);
+      *space, key_vals, data_vals, Traits::cudf_type, std::nullopt);
   }
 
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> exprs;
@@ -90,7 +87,7 @@ TEMPLATE_TEST_CASE("sirius_physical_projection executes on data_batch for multip
   types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));
 
   sirius_physical_projection projection(
-    std::move(types), std::move(exprs), key_vals.size(), &repo_mgr);
+    std::move(types), std::move(exprs), key_vals.size());
 
   auto outputs = projection.execute({input_batch});
   REQUIRE(outputs.size() == 1);
@@ -115,8 +112,6 @@ TEMPLATE_TEST_CASE("sirius_physical_projection can drop columns",
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
 
-  data_repository_mgr repo_mgr;
-
   std::vector<int64_t> key_vals{10, 20, 30};
   auto data_vals = Traits::sample_values();
   while (data_vals.size() < key_vals.size()) {
@@ -125,7 +120,7 @@ TEMPLATE_TEST_CASE("sirius_physical_projection can drop columns",
   data_vals.resize(key_vals.size());
 
   auto input_batch = make_two_column_batch<int64_t, typename Traits::type>(
-    repo_mgr, *space, key_vals, data_vals, Traits::cudf_type, std::nullopt);
+    *space, key_vals, data_vals, Traits::cudf_type, std::nullopt);
 
   // Select only the data column
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> exprs;
@@ -135,7 +130,7 @@ TEMPLATE_TEST_CASE("sirius_physical_projection can drop columns",
   types.push_back(Traits::logical_type());
 
   sirius_physical_projection projection(
-    std::move(types), std::move(exprs), key_vals.size(), &repo_mgr);
+    std::move(types), std::move(exprs), key_vals.size());
 
   auto outputs = projection.execute({input_batch});
   REQUIRE(outputs.size() == 1);
@@ -155,8 +150,6 @@ TEMPLATE_TEST_CASE("sirius_physical_projection can duplicate/reorder columns",
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
 
-  data_repository_mgr repo_mgr;
-
   std::vector<int64_t> key_vals{100, 200, 300};
   auto data_vals = Traits::sample_values();
   while (data_vals.size() < key_vals.size()) {
@@ -165,7 +158,7 @@ TEMPLATE_TEST_CASE("sirius_physical_projection can duplicate/reorder columns",
   data_vals.resize(key_vals.size());
 
   auto input_batch = make_two_column_batch<int64_t, typename Traits::type>(
-    repo_mgr, *space, key_vals, data_vals, Traits::cudf_type, std::nullopt);
+    *space, key_vals, data_vals, Traits::cudf_type, std::nullopt);
 
   // Output order: key, data, key (duplicate)
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> exprs;
@@ -181,7 +174,7 @@ TEMPLATE_TEST_CASE("sirius_physical_projection can duplicate/reorder columns",
   types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));
 
   sirius_physical_projection projection(
-    std::move(types), std::move(exprs), key_vals.size(), &repo_mgr);
+    std::move(types), std::move(exprs), key_vals.size());
 
   auto outputs = projection.execute({input_batch});
   REQUIRE(outputs.size() == 1);

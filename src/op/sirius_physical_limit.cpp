@@ -19,7 +19,7 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "log/logging.hpp"
 #include "operator/gpu_materialize.hpp"
-
+#include "data/data_batch_utils.hpp"
 #include <cudf/copying.hpp>
 
 #include <cucascade/data/gpu_data_representation.hpp>
@@ -32,12 +32,10 @@ sirius_physical_streaming_limit::sirius_physical_streaming_limit(
   duckdb::BoundLimitNode limit_val_p,
   duckdb::BoundLimitNode offset_val_p,
   duckdb::idx_t estimated_cardinality,
-  bool parallel,
-  ::cucascade::shared_data_repository_manager* data_repo_mgr)
+  bool parallel)
   : sirius_physical_operator(duckdb::PhysicalOperatorType::STREAMING_LIMIT,
                              std::move(types),
-                             estimated_cardinality,
-                             data_repo_mgr),
+                             estimated_cardinality),
     limit_val(std::move(limit_val_p)),
     offset_val(std::move(offset_val_p)),
     parallel(parallel)
@@ -56,12 +54,6 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_streaming_li
 
   auto limit_const  = static_cast<cudf::size_type>(limit_val.GetConstantValue());
   auto offset_const = static_cast<cudf::size_type>(offset_val.GetConstantValue());
-
-  auto* data_repo_mgr = get_data_repository_manager();
-  if (data_repo_mgr == nullptr) {
-    throw duckdb::InternalException(
-      "sirius_physical_streaming_limit::execute requires a data_repository_manager to be set");
-  }
 
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
   output_batches.reserve(input_batches.size());
@@ -87,7 +79,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_streaming_li
       std::make_unique<cucascade::gpu_table_representation>(std::move(*sliced_table),
                                                             *batch->get_memory_space());
 
-    auto const batch_id = data_repo_mgr->get_next_data_batch_id();
+    auto const batch_id = ::sirius::get_next_batch_id();
     auto output_batch   = std::make_shared<cucascade::data_batch>(batch_id, std::move(output_data));
     output_batches.push_back(std::move(output_batch));
 

@@ -36,10 +36,9 @@ namespace op {
 sirius_physical_filter::sirius_physical_filter(
   duckdb::vector<duckdb::LogicalType> types,
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> select_list,
-  duckdb::idx_t estimated_cardinality,
-  ::cucascade::shared_data_repository_manager* data_repo_mgr)
+  duckdb::idx_t estimated_cardinality)
   : sirius_physical_operator(
-      duckdb::PhysicalOperatorType::FILTER, std::move(types), estimated_cardinality, data_repo_mgr)
+      duckdb::PhysicalOperatorType::FILTER, std::move(types), estimated_cardinality)
 {
   D_ASSERT(select_list.size() > 0);
   if (select_list.size() > 1) {
@@ -64,18 +63,13 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_filter::exec
 
   // The executor uses the data_batch API to filter rows according to `expression`.
   duckdb::sirius::GpuExpressionExecutor gpu_expression_executor(*expression.get());
-  auto* data_repo_mgr = get_data_repository_manager();
-  if (data_repo_mgr == nullptr) {
-    throw duckdb::InternalException(
-      "sirius_physical_filter::execute requires a data_repository_manager to be set");
-  }
 
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
   output_batches.reserve(input_batches.size());
 
   for (auto const& batch : input_batches) {
     if (!batch) { continue; }
-    auto filtered_batch = gpu_expression_executor.select(batch, *data_repo_mgr);
+    auto filtered_batch = gpu_expression_executor.select(batch);
     if (filtered_batch) { output_batches.push_back(std::move(filtered_batch)); }
   }
 

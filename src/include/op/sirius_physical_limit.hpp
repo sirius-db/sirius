@@ -34,8 +34,7 @@ class sirius_physical_streaming_limit : public sirius_physical_operator {
                                   duckdb::BoundLimitNode limit_val_p,
                                   duckdb::BoundLimitNode offset_val_p,
                                   duckdb::idx_t estimated_cardinality,
-                                  bool parallel,
-                                  ::cucascade::shared_data_repository_manager* data_repo_mgr);
+                                  bool parallel);
 
   duckdb::BoundLimitNode limit_val;
   duckdb::BoundLimitNode offset_val;

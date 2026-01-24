@@ -55,8 +55,6 @@ TEMPLATE_TEST_CASE("sirius_physical_filter executes on data_batch for multiple n
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
 
-  data_repository_mgr repo_mgr;
-
   // Build filter column (int64) and data column (TestType)
   std::vector<int64_t> filter_vals{1, 2, 3, 5, 7};
   auto data_vals = Traits::sample_values();
@@ -69,10 +67,9 @@ TEMPLATE_TEST_CASE("sirius_physical_filter executes on data_batch for multiple n
   std::shared_ptr<data_batch> input_batch;
   if constexpr (Traits::is_string) {
     input_batch = make_two_column_batch<int64_t, typename Traits::type>(
-      repo_mgr, *space, filter_vals, data_vals, Traits::cudf_type, std::nullopt);
+      *space, filter_vals, data_vals, Traits::cudf_type, std::nullopt);
   } else if constexpr (Traits::is_decimal) {
-    input_batch = make_two_column_batch<int64_t, typename Traits::type>(repo_mgr,
-                                                                        *space,
+    input_batch = make_two_column_batch<int64_t, typename Traits::type>(*space,
                                                                         filter_vals,
                                                                         data_vals,
                                                                         Traits::cudf_type,
@@ -80,10 +77,10 @@ TEMPLATE_TEST_CASE("sirius_physical_filter executes on data_batch for multiple n
                                                                         cudf::type_id::INT64);
   } else if constexpr (Traits::is_ts) {
     input_batch = make_two_column_batch<int64_t, typename Traits::type>(
-      repo_mgr, *space, filter_vals, data_vals, Traits::cudf_type, std::nullopt);
+      *space, filter_vals, data_vals, Traits::cudf_type, std::nullopt);
   } else {
     input_batch = make_two_column_batch<int64_t, typename Traits::type>(
-      repo_mgr, *space, filter_vals, data_vals, Traits::cudf_type, std::nullopt);
+      *space, filter_vals, data_vals, Traits::cudf_type, std::nullopt);
   }
 
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> exprs;
@@ -97,7 +94,7 @@ TEMPLATE_TEST_CASE("sirius_physical_filter executes on data_batch for multiple n
   types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));  // filter column
   types.push_back(Traits::logical_type());
 
-  sirius_physical_filter filter(std::move(types), std::move(exprs), filter_vals.size(), &repo_mgr);
+  sirius_physical_filter filter(std::move(types), std::move(exprs), filter_vals.size());
 
   auto outputs = filter.execute({input_batch});
   REQUIRE(outputs.size() == 1);

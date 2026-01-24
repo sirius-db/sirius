@@ -34,12 +34,10 @@ namespace op {
 sirius_physical_projection::sirius_physical_projection(
   duckdb::vector<duckdb::LogicalType> types,
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> select_list,
-  duckdb::idx_t estimated_cardinality,
-  ::cucascade::shared_data_repository_manager* data_repo_mgr)
+  duckdb::idx_t estimated_cardinality)
   : sirius_physical_operator(duckdb::PhysicalOperatorType::PROJECTION,
                              std::move(types),
-                             estimated_cardinality,
-                             data_repo_mgr),
+                             estimated_cardinality),
     select_list(std::move(select_list))
 {
 }
@@ -50,12 +48,6 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_projection::
   SIRIUS_LOG_DEBUG("Executing projection");
   auto start = std::chrono::high_resolution_clock::now();
 
-  auto* data_repo_mgr = get_data_repository_manager();
-  if (data_repo_mgr == nullptr) {
-    throw duckdb::InternalException(
-      "sirius_physical_projection::execute requires a data_repository_manager to be set");
-  }
-
   duckdb::sirius::GpuExpressionExecutor gpu_expression_executor(select_list);
 
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
@@ -63,7 +55,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_projection::
 
   for (auto const& batch : input_batches) {
     if (!batch) { continue; }
-    auto projected_batch = gpu_expression_executor.execute(batch, *data_repo_mgr);
+    auto projected_batch = gpu_expression_executor.execute(batch);
     if (projected_batch) { output_batches.push_back(std::move(projected_batch)); }
   }
 

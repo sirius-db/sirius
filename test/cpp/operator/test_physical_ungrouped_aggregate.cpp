@@ -51,7 +51,6 @@ TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate computes SUM/MIN/MAX/COU
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
 
-  data_repository_mgr repo_mgr;
 
   // Create values for batches
   auto vals = Traits::sample_values();
@@ -67,13 +66,11 @@ TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate computes SUM/MIN/MAX/COU
   std::shared_ptr<data_batch> b1, b2;
 
   if constexpr (Traits::is_decimal) {
-    b1 = make_decimal64_batch(repo_mgr, *space, batch1_vals, Traits::scale);
-    b2 = make_decimal64_batch(repo_mgr, *space, batch2_vals, Traits::scale);
+    b1 = make_decimal64_batch(*space, batch1_vals, Traits::scale);
+    b2 = make_decimal64_batch(*space, batch2_vals, Traits::scale);
   } else {
-    b1 =
-      make_numeric_batch<typename Traits::type>(repo_mgr, *space, batch1_vals, Traits::cudf_type);
-    b2 =
-      make_numeric_batch<typename Traits::type>(repo_mgr, *space, batch2_vals, Traits::cudf_type);
+    b1 = make_numeric_batch<typename Traits::type>(*space, batch1_vals, Traits::cudf_type);
+    b2 = make_numeric_batch<typename Traits::type>(*space, batch2_vals, Traits::cudf_type);
   }
 
   // 1. SUM(col0)
@@ -151,8 +148,7 @@ TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate computes SUM/MIN/MAX/COU
   sirius_physical_ungrouped_aggregate agg_op(std::move(ret_types),
                                              std::move(aggregates),
                                              0,
-                                             duckdb::TupleDataValidityType::CANNOT_HAVE_NULL_VALUES,
-                                             &repo_mgr);
+                                             duckdb::TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
 
   // Execute with multiple batches to test state accumulation
   auto out = agg_op.execute({b1, b2});

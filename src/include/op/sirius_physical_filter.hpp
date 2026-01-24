@@ -31,8 +31,7 @@ class sirius_physical_filter : public sirius_physical_operator {
  public:
   sirius_physical_filter(duckdb::vector<duckdb::LogicalType> types,
                          duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> select_list,
-                         duckdb::idx_t estimated_cardinality,
-                         cucascade::shared_data_repository_manager* data_repo_mgr = nullptr);
+                         duckdb::idx_t estimated_cardinality);
 
   //! The filter expression
   duckdb::unique_ptr<duckdb::Expression> expression;

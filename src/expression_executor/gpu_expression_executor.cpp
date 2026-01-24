@@ -17,7 +17,7 @@
 // sirius
 #include <cucascade/data/data_repository_manager.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
-#include <cudf_utils.hpp>
+#include <data/data_batch_utils.hpp>
 #include <expression_executor/gpu_dispatcher.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
 #include <expression_executor/gpu_expression_executor_state.hpp>
@@ -220,7 +220,6 @@ void GpuExpressionExecutor::Execute(const GPUIntermediateRelation& input_relatio
 
 std::shared_ptr<cucascade::data_batch> GpuExpressionExecutor::execute(
   std::shared_ptr<cucascade::data_batch> input_batch,
-  cucascade::data_repository_manager<std::shared_ptr<cucascade::data_batch>>& data_repo_mgr,
   rmm::cuda_stream_view stream)
 {
   assert(!expressions.empty());
@@ -256,7 +255,7 @@ std::shared_ptr<cucascade::data_batch> GpuExpressionExecutor::execute(
                                                           *input_batch->get_memory_space());
 
   // Create the data batch and return
-  auto const batch_id = data_repo_mgr.get_next_data_batch_id();
+  auto const batch_id = ::sirius::get_next_batch_id();
   return std::make_shared<cucascade::data_batch>(batch_id, std::move(output_data_rep));
 }
 
@@ -296,7 +295,6 @@ void GpuExpressionExecutor::Select(GPUIntermediateRelation& input_relation,
 
 std::shared_ptr<cucascade::data_batch> GpuExpressionExecutor::select(
   std::shared_ptr<cucascade::data_batch> input_batch,
-  cucascade::data_repository_manager<std::shared_ptr<cucascade::data_batch>>& data_repo_mgr,
   rmm::cuda_stream_view stream)
 {
   assert(expressions.size() == 1);
@@ -322,7 +320,7 @@ std::shared_ptr<cucascade::data_batch> GpuExpressionExecutor::select(
                                                           *input_batch->get_memory_space());
 
   // Create the data batch and return
-  auto const batch_id = data_repo_mgr.get_next_data_batch_id();
+  auto const batch_id = ::sirius::get_next_batch_id();
   return std::make_shared<cucascade::data_batch>(batch_id, std::move(output_data_rep));
 }
 

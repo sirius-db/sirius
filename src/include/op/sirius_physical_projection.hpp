@@ -30,8 +30,7 @@ class sirius_physical_projection : public sirius_physical_operator {
  public:
   sirius_physical_projection(duckdb::vector<duckdb::LogicalType> types,
                              duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> select_list,
-                             duckdb::idx_t estimated_cardinality,
-                             ::cucascade::shared_data_repository_manager* data_repo_mgr = nullptr);
+                             duckdb::idx_t estimated_cardinality);
 
   std::vector<std::shared_ptr<cucascade::data_batch>> execute(
     const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches) override;

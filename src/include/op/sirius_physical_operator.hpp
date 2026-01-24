@@ -32,7 +32,6 @@
 
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
-#include <cucascade/data/data_repository_manager.hpp>
 
 namespace duckdb {
 class GPUExecutor;
@@ -69,17 +68,9 @@ class sirius_physical_operator {
  public:
   sirius_physical_operator(duckdb::PhysicalOperatorType type,
                            duckdb::vector<duckdb::LogicalType> types,
-                           duckdb::idx_t estimated_cardinality,
-                           cucascade::shared_data_repository_manager* data_repo_mgr = nullptr)
-    : type(type),
-      types(std::move(types)),
-      estimated_cardinality(estimated_cardinality),
-      data_repo_mgr(data_repo_mgr)
+                           duckdb::idx_t estimated_cardinality)
+    : type(type), types(std::move(types)), estimated_cardinality(estimated_cardinality)
   {
-    if (data_repo_mgr == nullptr) {
-      throw duckdb::InternalException(
-        "sirius_physical_operator requires a non-null data_repository_manager");
-    }
   }
   sirius_physical_operator() = default;
 
@@ -235,16 +226,6 @@ class sirius_physical_operator {
   std::vector<std::pair<sirius_physical_operator*, std::string_view>> next_port_after_sink;
   //! The creator of the task
   creator::task_creator* creator;
-
-  //! Shared data repository manager (owned upstream, propagated to operators)
-  cucascade::shared_data_repository_manager* data_repo_mgr = nullptr;
-
- public:
-  cucascade::shared_data_repository_manager* get_data_repository_manager() const
-  {
-    return data_repo_mgr;
-  }
-
 };
 
 }  // namespace op

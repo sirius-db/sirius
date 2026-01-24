@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "data/data_batch_utils.hpp"
 #include "op/sirius_physical_top_n.hpp"
 
 #include "duckdb/common/assert.hpp"
@@ -45,12 +46,10 @@ sirius_physical_top_n::sirius_physical_top_n(
   duckdb::idx_t limit,
   duckdb::idx_t offset,
   duckdb::shared_ptr<duckdb::DynamicFilterData> dynamic_filter_p,
-  duckdb::idx_t estimated_cardinality,
-  ::cucascade::shared_data_repository_manager* data_repo_mgr)
+  duckdb::idx_t estimated_cardinality)
   : sirius_physical_operator(duckdb::PhysicalOperatorType::TOP_N,
                              std::move(types_p),
-                             estimated_cardinality,
-                             data_repo_mgr),
+                             estimated_cardinality),
     orders(std::move(orders)),
     limit(limit),
     offset(offset),
@@ -65,12 +64,6 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_top_n::execu
   const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches)
 {
   if (limit == 0) { return {}; }
-
-  auto* data_repo_mgr = get_data_repository_manager();
-  if (data_repo_mgr == nullptr) {
-    throw duckdb::InternalException(
-      "sirius_physical_top_n::execute requires a data_repository_manager to be set");
-  }
 
   // Use the memory space from the first valid batch (all batches are expected to share the same
   // space in practice).
@@ -181,7 +174,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_top_n::execu
   std::unique_ptr<cucascade::idata_representation> output_data =
     std::make_unique<cucascade::gpu_table_representation>(*out_table, *space);
 
-  auto const batch_id = data_repo_mgr->get_next_data_batch_id();
+  auto const batch_id = ::sirius::get_next_batch_id();
   auto output_batch   = std::make_shared<cucascade::data_batch>(batch_id, std::move(output_data));
   outputs.push_back(std::move(output_batch));
 

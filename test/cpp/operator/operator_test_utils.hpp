@@ -28,9 +28,9 @@
 
 #include <cuda_runtime_api.h>
 
-#include <cucascade/data/data_repository_manager.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
+#include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
 #include <utils/utils.hpp>
@@ -132,7 +132,6 @@ inline std::vector<T> copy_column_to_host(const cudf::column_view& col)
 
 template <typename T>
 inline std::shared_ptr<cucascade::data_batch> make_numeric_batch(
-  data_repository_mgr& repo_mgr,
   cucascade::memory::memory_space& space,
   const std::vector<T>& values,
   cudf::type_id type_id)
@@ -164,7 +163,7 @@ inline std::shared_ptr<cucascade::data_batch> make_numeric_batch(
   auto table = std::make_unique<cudf::table>(std::move(cols));
 
   auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(*table, space);
-  auto batch_id = repo_mgr.get_next_data_batch_id();
+  auto batch_id = ::sirius::get_next_batch_id();
   return std::make_shared<cucascade::data_batch>(batch_id, std::move(gpu_repr));
 }
 
@@ -219,7 +218,6 @@ inline std::unique_ptr<cudf::column> make_string_column(const std::vector<std::s
 }
 
 inline std::shared_ptr<cucascade::data_batch> make_string_batch(
-  data_repository_mgr& repo_mgr,
   cucascade::memory::memory_space& space,
   const std::vector<std::string>& values)
 {
@@ -231,12 +229,11 @@ inline std::shared_ptr<cucascade::data_batch> make_string_batch(
   auto table = std::make_unique<cudf::table>(std::move(cols));
 
   auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(*table, space);
-  auto batch_id = repo_mgr.get_next_data_batch_id();
+  auto batch_id = ::sirius::get_next_batch_id();
   return std::make_shared<cucascade::data_batch>(batch_id, std::move(gpu_repr));
 }
 
 inline std::shared_ptr<cucascade::data_batch> make_decimal64_batch(
-  data_repository_mgr& repo_mgr,
   cucascade::memory::memory_space& space,
   const std::vector<int64_t>& values,
   int32_t scale)
@@ -260,13 +257,12 @@ inline std::shared_ptr<cucascade::data_batch> make_decimal64_batch(
   auto table = std::make_unique<cudf::table>(std::move(cols));
 
   auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(*table, space);
-  auto batch_id = repo_mgr.get_next_data_batch_id();
+  auto batch_id = ::sirius::get_next_batch_id();
   return std::make_shared<cucascade::data_batch>(batch_id, std::move(gpu_repr));
 }
 
 template <typename T>
 inline std::shared_ptr<cucascade::data_batch> make_timestamp_batch(
-  data_repository_mgr& repo_mgr,
   cucascade::memory::memory_space& space,
   const std::vector<T>& values,
   cudf::type_id ts_type_id)
@@ -296,13 +292,12 @@ inline std::shared_ptr<cucascade::data_batch> make_timestamp_batch(
   auto table = std::make_unique<cudf::table>(std::move(cols));
 
   auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(*table, space);
-  auto batch_id = repo_mgr.get_next_data_batch_id();
+  auto batch_id = ::sirius::get_next_batch_id();
   return std::make_shared<cucascade::data_batch>(batch_id, std::move(gpu_repr));
 }
 
 template <typename TFirst, typename TSecond>
 inline std::shared_ptr<cucascade::data_batch> make_two_column_batch(
-  data_repository_mgr& repo_mgr,
   cucascade::memory::memory_space& space,
   const std::vector<TFirst>& col0_values,
   const std::vector<TSecond>& col1_values,
@@ -393,7 +388,7 @@ inline std::shared_ptr<cucascade::data_batch> make_two_column_batch(
   auto table = std::make_unique<cudf::table>(std::move(cols));
 
   auto gpu_repr = std::make_unique<cucascade::gpu_table_representation>(*table, space);
-  auto batch_id = repo_mgr.get_next_data_batch_id();
+  auto batch_id = ::sirius::get_next_batch_id();
   return std::make_shared<cucascade::data_batch>(batch_id, std::move(gpu_repr));
 }
 
