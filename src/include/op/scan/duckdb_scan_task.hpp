@@ -117,12 +117,12 @@ class duckdb_scan_task_global_state : public sirius::parallel::itask_global_stat
  private:
   //===----------Fields----------===//
   duckdb::shared_ptr<pipeline::sirius_pipeline>
-    pipeline;  ///< The pipeline to which this table scan belongs
-  duckdb::shared_ptr<duckdb::SiriusContext> sirius_ctx;  ///< The Sirius context
+    _pipeline;  ///< The pipeline to which this table scan belongs
+  duckdb::shared_ptr<duckdb::SiriusContext> _sirius_ctx;  ///< The Sirius context
   std::unique_ptr<duckdb::GlobalTableFunctionState>
-    global_tf_state;                             ///< Global state for the table function
-  duckdb_scan_executor& scan_executor;           ///< The scan executor executing this scan task
-  sirius_physical_table_scan& op;                ///< The physical table scan being executed
+    _global_tf_state;                             ///< Global state for the table function
+  duckdb_scan_executor& _scan_executor;           ///< The scan executor executing this scan task
+  sirius_physical_table_scan& _op;                ///< The physical table scan being executed
   std::atomic<bool> _source_drained{false};      ///< Whether the table scan source is fully drained
   std::atomic<int64_t> _active_local_states{0};  ///< Number of active local table function states
   uint64_t _max_threads;                         ///< Maximum number of threads for this scan task
@@ -492,29 +492,29 @@ class duckdb_scan_task_local_state : public sirius::parallel::itask_local_state 
 
  private:
   //===----------Fields----------===//
-  size_t approximate_batch_size;                ///< Approximate target batch size in bytes
-  size_t default_varchar_size;                  ///< Default size for VARCHAR columns in bytes
-  size_t num_columns;                           ///< Number of columns to be scanned
-  size_t estimated_rows_per_batch;              ///< Estimated number of rows per batch
-  std::vector<column_builder> column_builders;  ///< Column builders for each column
-  std::vector<size_t> varchar_indices;          ///< Indices of VARCHAR columns
+  size_t _approximate_batch_size;                ///< Approximate target batch size in bytes
+  size_t _default_varchar_size;                  ///< Default size for VARCHAR columns in bytes
+  size_t _num_columns;                           ///< Number of columns to be scanned
+  size_t _estimated_rows_per_batch;              ///< Estimated number of rows per batch
+  std::vector<column_builder> _column_builders;  ///< Column builders for each column
+  std::vector<size_t> _varchar_indices;          ///< Indices of VARCHAR columns
 
-  cucascade::memory::any_memory_space_in_tier res_request =
+  cucascade::memory::any_memory_space_in_tier _res_request =
     cucascade::memory::any_memory_space_in_tier(cucascade::memory::Tier::HOST);
   std::unique_ptr<cucascade::memory::reservation>
-    reservation;  ///< Memory reservation for all column data
+    _reservation;  ///< Memory reservation for all column data
   std::unique_ptr<cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation>
-    allocation;  ///< Memory allocation for all column data
-  cucascade::memory::memory_space* host_space = nullptr;
+    _allocation;  ///< Memory allocation for all column data
+  cucascade::memory::memory_space* _host_space = nullptr;
 
-  duckdb::DataChunk chunk;           ///< DataChunk buffer
-  size_t row_offset        = 0;      ///< Current row offset in buffers
-  bool local_state_drained = false;  ///< Whether this local state has fully drained
+  duckdb::DataChunk _chunk;           ///< DataChunk buffer
+  size_t _row_offset        = 0;      ///< Current row offset in buffers
+  bool _local_state_drained = false;  ///< Whether this local state has fully drained
 
   std::unique_ptr<duckdb::LocalTableFunctionState>
-    local_tf_state;                    ///< Local state for the table function.
-  duckdb::ExecutionContext& exec_ctx;  ///< The duckdb execution context, needed for initializing
-                                       ///< the local table function state
+    _local_tf_state;                    ///< Local state for the table function.
+  duckdb::ExecutionContext& _exec_ctx;  ///< The duckdb execution context, needed for initializing
+                                        ///< the local table function state
 
   /**
    * @brief Get the byte offset within the allocation where the column data ends.
