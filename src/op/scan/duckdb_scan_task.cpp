@@ -47,8 +47,11 @@ duckdb_scan_task_global_state::duckdb_scan_task_global_state(
 {
   // Initialize global table function state
   if (_op.function.init_global) {
-    duckdb::TableFunctionInitInput tf_input(
-      _op.bind_data.get(), _op.column_ids, _op.projection_ids, nullptr, _op.extra_info.sample_options);
+    duckdb::TableFunctionInitInput tf_input(_op.bind_data.get(),
+                                            _op.column_ids,
+                                            _op.projection_ids,
+                                            nullptr,
+                                            _op.extra_info.sample_options);
     _global_tf_state = _op.function.init_global(client_ctx, tf_input);
   }
 
@@ -307,7 +310,7 @@ duckdb_scan_task_local_state::duckdb_scan_task_local_state(
     _exec_ctx(exec_ctx)
 {
   auto const& op = g_state._op;
-  _num_columns    = op.projection_ids.size();
+  _num_columns   = op.projection_ids.size();
 
   if (existing_local_tf_state) {
     _local_tf_state = std::move(existing_local_tf_state);
@@ -317,7 +320,7 @@ duckdb_scan_task_local_state::duckdb_scan_task_local_state(
 
   // Make the memory reservation request
   auto& mem_res_mgr = g_state._sirius_ctx->get_memory_manager();
-  _reservation       = mem_res_mgr.request_reservation(_res_request, approximate_batch_size);
+  _reservation      = mem_res_mgr.request_reservation(_res_request, approximate_batch_size);
 
   // Make the allocation
   auto& mem_space = _reservation->get_memory_space();
@@ -438,7 +441,8 @@ std::shared_ptr<cucascade::data_batch> duckdb_scan_task_local_state::make_data_b
     std::make_unique<host_table_allocation>(std::move(_allocation), std::move(metadata), sz);
 
   // Make the host table representation
-  auto table = std::make_unique<host_table_representation>(std::move(table_allocation), _host_space);
+  auto table =
+    std::make_unique<host_table_representation>(std::move(table_allocation), _host_space);
 
   // Create the data batch and return
   return std::make_shared<data_batch>(get_next_batch_id(), std::move(table));
@@ -503,7 +507,7 @@ void duckdb_scan_task::execute()
 
   // Initialize the data chunk
   l_state._chunk.Initialize(duckdb::Allocator::Get(l_state._exec_ctx.client),
-                           g_state._op.returned_types);
+                            g_state._op.returned_types);
 
   // Enter the scan loop to accumulate a data batch
   while (get_next_chunk(l_state, g_state)) {
