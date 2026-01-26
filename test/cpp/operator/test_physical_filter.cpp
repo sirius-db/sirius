@@ -52,7 +52,8 @@ TEMPLATE_TEST_CASE("sirius_physical_filter executes on data_batch for multiple n
 {
   using Traits = gpu_type_traits<TestType>;
 
-  auto* space = get_default_gpu_space();
+  auto memory_manager = initialize_memory_manager();
+  auto* space = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space != nullptr);
 
   // Build filter column (int64) and data column (TestType)

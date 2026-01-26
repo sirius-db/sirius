@@ -78,7 +78,6 @@ inline cucascade::memory::memory_space* get_default_gpu_space()
   return const_cast<cucascade::memory::memory_space*>(
     manager->get_memory_space(cucascade::memory::Tier::GPU, 0));
 }
-
 inline rmm::device_async_resource_ref get_resource_ref(cucascade::memory::memory_space& space)
 {
   return rmm::to_device_async_resource_ref_checked(space.get_default_allocator());
