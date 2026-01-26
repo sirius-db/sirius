@@ -1,6 +1,17 @@
 /*
  * Copyright 2025, Sirius Contributors.
- * Licensed under the Apache License, Version 2.0.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #pragma once
@@ -47,7 +58,7 @@ cudf::bitmask_type* createNullMask(size_t size,
 
 enum class GPUColumnTypeId {
   INVALID = 0,
-  INT16,  // [Reserved] Support SMALLINT
+  INT16,  
   INT32,
   INT64,
   FLOAT32,
@@ -169,12 +180,12 @@ class DataWrapper {
               cudf::bitmask_type* validity_mask);
   GPUColumnType type;
   uint8_t* data;
-  size_t size;
+  size_t size; // number of rows in the column (currently equals to column_length)
   uint64_t* offset{nullptr};
-  size_t num_bytes;
+  size_t num_bytes; // number of bytes in the column
   size_t getColumnTypeSize() const;
   bool is_string_data{false};
-  cudf::bitmask_type* validity_mask{nullptr};
+  cudf::bitmask_type* validity_mask{nullptr}; // validity mask for the column, used to represent NULL values
   size_t mask_bytes{0};
 };
 
@@ -208,9 +219,9 @@ class GPUColumn {
 
   DataWrapper data_wrapper;
   uint64_t* row_ids;
-  size_t row_id_count;
-  size_t column_length;
-  bool is_unique;
+  size_t row_id_count; // number of rows in the row_ids array
+  size_t column_length; // number of rows in the column (currently equals to column_length)
+  bool is_unique; // indicator whether the column has unique values
 
   uint8_t* segment_start_ptr{nullptr};
   int segment_id{-1};
