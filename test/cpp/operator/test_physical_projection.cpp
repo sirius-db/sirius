@@ -47,8 +47,9 @@ TEMPLATE_TEST_CASE("sirius_physical_projection executes on data_batch for multip
 {
   using Traits = gpu_type_traits<TestType>;
 
-  auto* space = get_default_gpu_space();
-  REQUIRE(space != nullptr);
+  auto memory_manager = initialize_memory_manager();
+  auto* space = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space);
 
   std::vector<int64_t> key_vals{10, 20, 30, 40};
   auto data_vals = Traits::sample_values();
@@ -109,8 +110,9 @@ TEMPLATE_TEST_CASE("sirius_physical_projection can drop columns",
 {
   using Traits = gpu_type_traits<TestType>;
 
-  auto* space = get_default_gpu_space();
-  REQUIRE(space != nullptr);
+  auto memory_manager = initialize_memory_manager();
+  auto* space = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space);
 
   std::vector<int64_t> key_vals{10, 20, 30};
   auto data_vals = Traits::sample_values();
@@ -147,8 +149,9 @@ TEMPLATE_TEST_CASE("sirius_physical_projection can duplicate/reorder columns",
 {
   using Traits = gpu_type_traits<TestType>;
 
-  auto* space = get_default_gpu_space();
-  REQUIRE(space != nullptr);
+  auto memory_manager = initialize_memory_manager();
+  auto* space = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space);
 
   std::vector<int64_t> key_vals{100, 200, 300};
   auto data_vals = Traits::sample_values();

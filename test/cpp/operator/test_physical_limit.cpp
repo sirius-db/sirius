@@ -47,8 +47,9 @@ TEMPLATE_TEST_CASE("sirius_physical_streaming_limit limits rows in data_batch",
 {
   using Traits = gpu_type_traits<TestType>;
 
-  auto* space = get_default_gpu_space();
-  REQUIRE(space != nullptr);
+  auto memory_manager = initialize_memory_manager();
+  auto* space = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space);
 
   std::vector<typename Traits::type> values(10);
   if constexpr (Traits::is_string) {

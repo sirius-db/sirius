@@ -14,8 +14,7 @@
  * limitations under the License.
  */
 
-#include "operator_test_utils.hpp"
-#include "operator_type_traits.hpp"
+
 
 #include <catch.hpp>
 #include <duckdb/common/types/date.hpp>
@@ -23,7 +22,14 @@
 #include <duckdb/planner/expression/bound_comparison_expression.hpp>
 #include <duckdb/planner/expression/bound_constant_expression.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
+#include "memory/sirius_memory_reservation_manager.hpp"
 #include <op/sirius_physical_filter.hpp>
+
+#include "operator_test_utils.hpp"
+#include "operator_type_traits.hpp"
+
+#include <cucascade/data/gpu_data_representation.hpp>
+#include <cucascade/memory/memory_space.hpp>
 
 #include <variant>
 
@@ -54,7 +60,7 @@ TEMPLATE_TEST_CASE("sirius_physical_filter executes on data_batch for multiple n
 
   auto memory_manager = initialize_memory_manager();
   auto* space = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
-  REQUIRE(space != nullptr);
+  REQUIRE(space);
 
   // Build filter column (int64) and data column (TestType)
   std::vector<int64_t> filter_vals{1, 2, 3, 5, 7};
