@@ -1,6 +1,17 @@
 /*
  * Copyright 2025, Sirius Contributors.
- * Licensed under the Apache License, Version 2.0.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #include "gpu_columns.hpp"
@@ -14,7 +25,7 @@ namespace duckdb {
 size_t getMaskBytesSize(uint64_t column_length)
 {
   uint64_t necessary_bytes = (column_length + 7) / 8;
-  uint64_t padded_bytes    = 64 * ((necessary_bytes + 63) / 64);
+  uint64_t padded_bytes    = 64 * ((necessary_bytes + 63) / 64); // Pad to the nearest 64 bytes
   return padded_bytes;
 }
 
@@ -80,11 +91,13 @@ size_t DataWrapper::getColumnTypeSize() const
     case GPUColumnTypeId::VARCHAR: return 128;
     case GPUColumnTypeId::DECIMAL: {
       GPUDecimalTypeInfo* decimal_type_info = type.GetDecimalTypeInfo();
-      if (decimal_type_info == nullptr) throw InternalException("Decimal info null");
+      if (decimal_type_info == nullptr) throw InternalException(
+          "`decimal_type_info` not set for DECIMAL type in `getColumnTypeSize`");
+      }
       return decimal_type_info->GetDecimalTypeSize();
     }
     default:
-      throw duckdb::InternalException("Unsupported sirius column type size: %d",
+      throw duckdb::InternalException("Unsupported sirius column type in `getColumnTypeSize()`: %d",
                                       static_cast<int>(type.id()));
   }
 }
@@ -154,7 +167,6 @@ cudf::column_view GPUColumn::convertToCudfColumn()
                              data_wrapper.validity_mask,
                              null_count);
   } else if (data_wrapper.type.id() == GPUColumnTypeId::INT16) {
-    // [Critical Fix] Previously missing this branch, causing SMALLINT conversion failure
     return cudf::column_view(cudf::data_type(cudf::type_id::INT16),
                              size,
                              data_wrapper.data,
@@ -235,12 +247,15 @@ cudf::column_view GPUColumn::convertToCudfColumn()
         cudf_type = cudf::data_type(cudf::type_id::DECIMAL128,
                                     -data_wrapper.type.GetDecimalTypeInfo()->scale_);
         break;
-      default: throw duckdb::InternalException("Unsupported decimal size");
+      default: throw duckdb::InternalException(
+          "Unsupported sirius DECIMAL column type size in `convertToCudfColumn()`: %zu",
+          data_wrapper.getColumnTypeSize());
     }
     return cudf::column_view(
       cudf_type, size, data_wrapper.data, data_wrapper.validity_mask, null_count);
   }
-  throw duckdb::InternalException("Unsupported sirius column type: %d", data_wrapper.type.id());
+   throw duckdb::InternalException("Unsupported sirius column type in `convertToCudfColumn()`: %d",
+                                  data_wrapper.type.id());
 }
 
 void GPUColumn::setFromCudfColumn(cudf::column& cudf_column,
@@ -296,50 +311,79 @@ void GPUColumn::setFromCudfColumn(cudf::column& cudf_column,
       data_wrapper.num_bytes = temp_num_bytes[0];
     }
   } else if (col_type == cudf::data_type(cudf::type_id::INT64)) {
-    data_wrapper.type      = GPUColumnType(GPUColumnTypeId::INT64);
-    data_wrapper.num_bytes = col_size * 8;
+    data_wrapper.is_string_data = false;
+    data_wrapper.type           = GPUColumnType(GPUColumnTypeId::INT64);
+    data_wrapper.num_bytes      = col_size * data_wrapper.getColumnTypeSize();
+    data_wrapper.offset         = nullptr;
   } else if (col_type == cudf::data_type(cudf::type_id::INT32)) {
-    data_wrapper.type      = GPUColumnType(GPUColumnTypeId::INT32);
-    data_wrapper.num_bytes = col_size * 4;
+    data_wrapper.is_string_data = false;
+    data_wrapper.type           = GPUColumnType(GPUColumnTypeId::INT32);
+    data_wrapper.num_bytes      = col_size * data_wrapper.getColumnTypeSize();
+    data_wrapper.offset         = nullptr;
   } else if (col_type == cudf::data_type(cudf::type_id::INT16)) {
-    data_wrapper.type      = GPUColumnType(GPUColumnTypeId::INT16);
-    data_wrapper.num_bytes = col_size * 2;
+    data_wrapper.is_string_data = false;
+    data_wrapper.type           = GPUColumnType(GPUColumnTypeId::INT16);
+    data_wrapper.num_bytes      = col_size * data_wrapper.getColumnTypeSize();
+    data_wrapper.offset         = nullptr;
   } else if (col_type == cudf::data_type(cudf::type_id::FLOAT32)) {
-    data_wrapper.type      = GPUColumnType(GPUColumnTypeId::FLOAT32);
-    data_wrapper.num_bytes = col_size * 4;
+    data_wrapper.is_string_data = false;
+    data_wrapper.type           = GPUColumnType(GPUColumnTypeId::FLOAT32);
+    data_wrapper.num_bytes      = col_size * data_wrapper.getColumnTypeSize();
+    data_wrapper.offset         = nullptr;
   } else if (col_type == cudf::data_type(cudf::type_id::FLOAT64)) {
-    data_wrapper.type      = GPUColumnType(GPUColumnTypeId::FLOAT64);
-    data_wrapper.num_bytes = col_size * 8;
+    data_wrapper.is_string_data = false;
+    data_wrapper.type           = GPUColumnType(GPUColumnTypeId::FLOAT64);
+    data_wrapper.num_bytes      = col_size * data_wrapper.getColumnTypeSize();
+    data_wrapper.offset         = nullptr;
   } else if (col_type == cudf::data_type(cudf::type_id::BOOL8)) {
-    data_wrapper.type      = GPUColumnType(GPUColumnTypeId::BOOLEAN);
-    data_wrapper.num_bytes = col_size * 1;
+    data_wrapper.is_string_data = false;
+    data_wrapper.type           = GPUColumnType(GPUColumnTypeId::BOOLEAN);
+    data_wrapper.num_bytes      = col_size * data_wrapper.getColumnTypeSize();
+    data_wrapper.offset         = nullptr;
   } else if (col_type == cudf::data_type(cudf::type_id::TIMESTAMP_DAYS)) {
-    data_wrapper.type      = GPUColumnType(GPUColumnTypeId::DATE);
-    data_wrapper.num_bytes = col_size * 4;
+    data_wrapper.is_string_data = false;
+    data_wrapper.type           = GPUColumnType(GPUColumnTypeId::DATE);
+    data_wrapper.num_bytes      = col_size * data_wrapper.getColumnTypeSize();
+    data_wrapper.offset         = nullptr;
   } else if (col_type == cudf::data_type(cudf::type_id::TIMESTAMP_SECONDS)) {
-    data_wrapper.type      = GPUColumnType(GPUColumnTypeId::TIMESTAMP_SEC);
-    data_wrapper.num_bytes = col_size * 8;
+    data_wrapper.is_string_data = false;
+    data_wrapper.type           = GPUColumnType(GPUColumnTypeId::TIMESTAMP_SEC);
+    data_wrapper.num_bytes      = col_size * data_wrapper.getColumnTypeSize();
+    data_wrapper.offset         = nullptr;
   } else if (col_type == cudf::data_type(cudf::type_id::TIMESTAMP_MILLISECONDS)) {
-    data_wrapper.type      = GPUColumnType(GPUColumnTypeId::TIMESTAMP_MS);
-    data_wrapper.num_bytes = col_size * 8;
+    data_wrapper.is_string_data = false;
+    data_wrapper.type           = GPUColumnType(GPUColumnTypeId::TIMESTAMP_MS);
+    data_wrapper.num_bytes      = col_size * data_wrapper.getColumnTypeSize();
+    data_wrapper.offset         = nullptr;
   } else if (col_type == cudf::data_type(cudf::type_id::TIMESTAMP_MICROSECONDS)) {
-    data_wrapper.type      = GPUColumnType(GPUColumnTypeId::TIMESTAMP_US);
-    data_wrapper.num_bytes = col_size * 8;
+    data_wrapper.is_string_data = false;
+    data_wrapper.type           = GPUColumnType(GPUColumnTypeId::TIMESTAMP_US);
+    data_wrapper.num_bytes      = col_size * data_wrapper.getColumnTypeSize();
+    data_wrapper.offset         = nullptr;
   } else if (col_type == cudf::data_type(cudf::type_id::TIMESTAMP_NANOSECONDS)) {
-    data_wrapper.type      = GPUColumnType(GPUColumnTypeId::TIMESTAMP_NS);
-    data_wrapper.num_bytes = col_size * 8;
+    data_wrapper.is_string_data = false;
+    data_wrapper.type           = GPUColumnType(GPUColumnTypeId::TIMESTAMP_NS);
+    data_wrapper.num_bytes      = col_size * data_wrapper.getColumnTypeSize();
+    data_wrapper.offset         = nullptr;
   } else if (col_type.id() == cudf::type_id::DECIMAL32) {
-    data_wrapper.type = GPUColumnType(GPUColumnTypeId::DECIMAL);
+    data_wrapper.is_string_data = false;
+    data_wrapper.type           = GPUColumnType(GPUColumnTypeId::DECIMAL);
+    // cudf decimal type uses negative scale, same for below
     data_wrapper.type.SetDecimalTypeInfo(Decimal::MAX_WIDTH_INT32, -col_type.scale());
-    data_wrapper.num_bytes = col_size * 4;
+    data_wrapper.num_bytes = col_size * data_wrapper.getColumnTypeSize();
+    data_wrapper.offset    = nullptr;
   } else if (col_type.id() == cudf::type_id::DECIMAL64) {
-    data_wrapper.type = GPUColumnType(GPUColumnTypeId::DECIMAL);
+    data_wrapper.is_string_data = false;
+    data_wrapper.type           = GPUColumnType(GPUColumnTypeId::DECIMAL);
     data_wrapper.type.SetDecimalTypeInfo(Decimal::MAX_WIDTH_INT64, -col_type.scale());
-    data_wrapper.num_bytes = col_size * 8;
+    data_wrapper.num_bytes = col_size * data_wrapper.getColumnTypeSize();
+    data_wrapper.offset    = nullptr;
   } else if (col_type.id() == cudf::type_id::DECIMAL128) {
-    data_wrapper.type = GPUColumnType(GPUColumnTypeId::DECIMAL);
+    data_wrapper.is_string_data = false;
+    data_wrapper.type           = GPUColumnType(GPUColumnTypeId::DECIMAL);
     data_wrapper.type.SetDecimalTypeInfo(Decimal::MAX_WIDTH_INT128, -col_type.scale());
-    data_wrapper.num_bytes = col_size * 16;
+    data_wrapper.num_bytes = col_size * data_wrapper.getColumnTypeSize();
+    data_wrapper.offset    = nullptr;
   } else {
     throw NotImplementedException("Unsupported cudf data type in `setFromCudfColumn`: %d",
                                   static_cast<int>(col_type.id()));
