@@ -24,10 +24,7 @@ namespace sirius::op::scan {
 
 void duckdb_scan_executor::schedule(std::unique_ptr<sirius::parallel::itask> task)
 {
-  {
-    std::unique_lock<std::mutex> lock(_finish_mutex);
-    _total_tasks.fetch_add(1, std::memory_order_relaxed);
-  }
+  _total_tasks.fetch_add(1, std::memory_order_relaxed);
   _task_queue->push(std::move(task));
 }
 

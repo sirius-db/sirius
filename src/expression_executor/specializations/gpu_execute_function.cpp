@@ -359,7 +359,7 @@ struct NumericBinaryFunctionDispatcher {
                                            GpuExpressionState* state)
   {
     D_ASSERT(expr.children.size() == 2);
-    const auto& return_type = GpuExpressionState::GetCudfType(expr.return_type);
+    const auto& return_type = GetCudfType(expr.return_type);
 
     // Resolve children
     if (expr.children[0]->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
@@ -367,7 +367,7 @@ struct NumericBinaryFunctionDispatcher {
       const auto& left_value = expr.children[0]->Cast<BoundConstantExpression>().value;
       const auto& right      = executor.Execute(*expr.children[1], state->child_states[1].get());
 
-      auto cudf_type = GpuExpressionState::GetCudfType(expr.children[0]->return_type);
+      auto cudf_type = GetCudfType(expr.children[0]->return_type);
       switch (cudf_type.id()) {
         case cudf::type_id::INT16:
           return DoLeftScalarBinaryOp(left_value.GetValue<int16_t>(), right->view(), return_type);
@@ -414,7 +414,7 @@ struct NumericBinaryFunctionDispatcher {
       const auto& right_value = expr.children[1]->Cast<BoundConstantExpression>().value;
       const auto& left        = executor.Execute(*expr.children[0], state->child_states[0].get());
 
-      auto cudf_type = GpuExpressionState::GetCudfType(expr.children[1]->return_type);
+      auto cudf_type = GetCudfType(expr.children[1]->return_type);
       switch (cudf_type.id()) {
         case cudf::type_id::INT16:
           return DoRightScalarBinaryOp(left->view(), right_value.GetValue<int16_t>(), return_type);
@@ -466,7 +466,7 @@ struct NumericBinaryFunctionDispatcher {
     return cudf::binary_operation(left->view(),
                                   right->view(),
                                   BinOp,
-                                  GpuExpressionState::GetCudfType(expr.return_type),
+                                  GetCudfType(expr.return_type),
                                   executor.execution_stream,
                                   executor.resource_ref);
   }

@@ -34,7 +34,7 @@ std::unique_ptr<GpuExpressionState> GpuExpressionExecutor::InitializeState(
 std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundCastExpression& expr,
                                                              GpuExpressionState* state)
 {
-  auto return_type_id = GpuExpressionState::GetCudfType(expr.return_type).id();
+  auto return_type_id = GetCudfType(expr.return_type).id();
 
   // Resolve the child
   auto* child_state = state->child_states[0].get();

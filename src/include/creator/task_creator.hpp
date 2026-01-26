@@ -230,6 +230,13 @@ class task_creator {
    */
   virtual void schedule(std::unique_ptr<task_creation_info> info);
 
+  /**
+   * @brief Get the next task id.
+   *
+   * @return uint64_t The next task id.
+   */
+  uint64_t get_next_task_id();
+
  protected:
   /**
    * @brief Worker function executed by each thread in the pool.
@@ -254,13 +261,6 @@ class task_creator {
    * Closes the task creation queue to signal workers to exit.
    */
   void on_stop();
-
-  /**
-   * @brief Get the next task id.
-   *
-   * @return uint64_t The next task id.
-   */
-  uint64_t get_next_task_id();
 
   size_t _num_threads;
   std::atomic<bool> _running;

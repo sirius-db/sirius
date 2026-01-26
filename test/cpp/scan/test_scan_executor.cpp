@@ -14,18 +14,24 @@
  * limitations under the License.
  */
 
-// catch2
+// test
 #include <catch.hpp>
-
-// test utilities
-#include "test_utils.hpp"
+#include <utils/utils.hpp>
 
 // sirius
-#include <cucascade/data/data_batch.hpp>
-#include <cucascade/data/data_repository.hpp>
+#include <data/data_batch_utils.hpp>
+#include <data/sirius_converter_registry.hpp>
 #include <op/scan/duckdb_scan_executor.hpp>
 #include <op/scan/duckdb_scan_task.hpp>
 #include <op/sirius_physical_table_scan.hpp>
+
+// cucascade
+#include <cucascade/data/data_batch.hpp>
+#include <cucascade/data/data_repository.hpp>
+#include <cucascade/data/gpu_data_representation.hpp>
+
+// cudf
+#include <cudf/strings/strings_column_view.hpp>
 
 // duckdb
 #include <duckdb.hpp>
@@ -38,265 +44,33 @@
 #include <duckdb/parallel/thread_context.hpp>
 
 // standard library
+#include <chrono>
 #include <cstdint>
+#include <filesystem>
 #include <iostream>
 #include <memory>
-#include <mutex>
-#include <stdexcept>
 #include <string>
 
-using idx_t = duckdb::idx_t;
 using namespace sirius;
-
-//===----------------------------------------------------------------------===//
-// Test Scan Task - Custom task that appends column_builder data to table
-//===----------------------------------------------------------------------===//
-
-/**
- * @brief Test version of duckdb_scan_task that appends scanned data to a DuckDB table
- *
- * This task executes the full scan pipeline (get_next_chunk -> process_chunk)
- * and then reads data from the column_builders to append to a staging table. It is essentially a
- * replica of duckdb_scan_task that adds an append() hook at the end for validation.
- */
-class test_scan_task : public op::scan::duckdb_scan_task {
- public:
-  test_scan_task(uint64_t task_id,
-                 cucascade::shared_data_repository* data_repo,
-                 duckdb::Connection& con,
-                 std::string const& table_name,
-                 std::unique_ptr<op::scan::duckdb_scan_task_local_state> l_state,
-                 std::shared_ptr<op::scan::duckdb_scan_task_global_state> g_state)
-    : duckdb_scan_task(task_id, data_repo, std::move(l_state), g_state),
-      con_(con),
-      table_name_(table_name)
-  {
-  }
-
-  void execute() override
-  {
-    auto& l_state = this->_local_state->cast<op::scan::duckdb_scan_task_local_state>();
-    auto& g_state = this->_global_state->cast<op::scan::duckdb_scan_task_global_state>();
-
-    // Initialize the data chunk
-    l_state.chunk.Initialize(duckdb::Allocator::Get(l_state.exec_ctx.client),
-                             g_state.op.returned_types);
-
-    // Scan loop - process chunks into column builders
-    while (get_next_chunk(l_state, g_state)) {
-      if (!chunk_fits(l_state)) {
-        throw std::runtime_error("Chunk does not fit in allocated buffers");
-      }
-
-      // Process the chunk into column builders
-      process_chunk(l_state);
-
-      // Termination condition
-      if (STANDARD_VECTOR_SIZE + l_state.row_offset >= l_state.estimated_rows_per_batch) { break; }
-    }
-
-    // Add tasks back to the queue if the scan is not finished
-    if (!g_state.is_source_drained()) {
-      auto const new_task_id = this->task_id + g_state.max_threads;
-
-      // Create a new local state, passing the existing local_tf_state to continue the scan
-      // This ensures DuckDB continues scanning from the current position rather than starting over
-      auto new_local_state = std::make_unique<op::scan::duckdb_scan_task_local_state>(
-        g_state,
-        l_state.exec_ctx,
-        l_state.approximate_batch_size,
-        l_state.default_varchar_size,
-        std::move(l_state.local_tf_state));  // Pass the moved state to constructor
-
-      // Create a new reference to the global state
-      auto shared_global_state =
-        std::static_pointer_cast<op::scan::duckdb_scan_task_global_state>(this->_global_state);
-      auto next_task = std::make_unique<test_scan_task>(new_task_id,
-                                                        _data_repo,
-                                                        con_,
-                                                        table_name_,
-                                                        std::move(new_local_state),
-                                                        shared_global_state);
-      g_state.scan_executor.schedule(std::move(next_task));
-    }
-
-    // Append data from column_builders to staging table
-    // NOTE: this makes the scan slow due to mutex and row-wise appends
-    append_to_table(l_state);
-  }
-
- private:
-  /**
-   * @brief Helper to check if a bit in a validity mask is set (1 = valid, 0 = invalid)
-   */
-  static inline bool is_valid(uint8_t current_mask, idx_t row_idx)
-  {
-    auto const bit_idx = row_idx % 8;
-    return (current_mask & (1 << bit_idx)) != 0;
-  }
-
-  /**
-   * @brief Append data from column_builders to the staging table
-   *
-   * Reads data directly from the column_builder buffers (data_blocks_accessor,
-   * mask_blocks_accessor, offset_blocks_accessor) and appends to DuckDB table.
-   *
-   * NOTE: Uses a mutex to protect DuckDB connection access since DuckDB connections
-   * are not thread-safe for concurrent writes.
-   */
-  void append_to_table(op::scan::duckdb_scan_task_local_state& l_state)
-  {
-    auto const num_rows = l_state.row_offset;
-    if (num_rows == 0) {
-      return;  // Nothing to append
-    }
-
-    // Lock the mutex to protect DuckDB connection access
-    // DuckDB connections are not thread-safe for concurrent writes
-    std::lock_guard<std::mutex> lock(append_mutex_);
-
-    duckdb::Appender app(con_, table_name_);
-    auto& column_builders = l_state.column_builders;
-    auto& allocation      = l_state.allocation;
-
-    // Ensure allocation exists
-    if (!allocation) { throw std::runtime_error("Allocation is null in append_to_table"); }
-
-    // First, reset the cursors of all column builders to their initial positions
-    for (auto& builder : column_builders) {
-      // Reset accessors to their starting byte offsets in the packed allocation
-      builder.data_blocks_accessor.reset_cursor();
-      builder.mask_blocks_accessor.reset_cursor();
-
-      // Only reset offset accessor for VARCHAR columns (it's only initialized for VARCHAR)
-      if (builder.type.InternalType() == duckdb::PhysicalType::VARCHAR) {
-        builder.offset_blocks_accessor.reset_cursor();
-      }
-    }
-
-    for (size_t i = 0; i < num_rows; ++i) {
-      app.BeginRow();
-
-      for (auto& builder : column_builders) {
-        auto const& type = builder.type;
-
-        // Check validity - advance mask accessor every 8 rows
-        if (i > 0 && i % 8 == 0) { builder.mask_blocks_accessor.advance(); }
-        bool valid = is_valid(builder.mask_blocks_accessor.get_current(allocation), i);
-
-        if (!valid) {
-          app.Append(duckdb::Value());  // NULL value
-          continue;
-        }
-
-        // Type switch
-        switch (type.id()) {
-          case duckdb::LogicalTypeId::CHAR:  // Fallthrough
-          case duckdb::LogicalTypeId::VARCHAR: {
-            auto const beg = builder.offset_blocks_accessor.get_current(allocation);
-            builder.offset_blocks_accessor.advance();
-            auto const end = builder.offset_blocks_accessor.get_current(allocation);
-            auto const len = end - beg;
-            // We need to copy the string data from the multiple blocks allocation to a contiguous
-            // buffer.
-            std::string str(len, '\0');
-            builder.data_blocks_accessor.memcpy_to(allocation, str.data(), len);
-            app.Append<duckdb::string_t>(str);
-            break;
-          }
-          case duckdb::LogicalTypeId::INTEGER: {
-            auto const int_val = builder.data_blocks_accessor.get_current_as<int32_t>(allocation);
-            app.Append<int32_t>(int_val);
-            builder.data_blocks_accessor.advance_as<int32_t>();
-            break;
-          }
-          case duckdb::LogicalTypeId::BIGINT: {
-            auto const bigint_val =
-              builder.data_blocks_accessor.get_current_as<int64_t>(allocation);
-            app.Append<int64_t>(bigint_val);
-            builder.data_blocks_accessor.advance_as<int64_t>();
-            break;
-          }
-          case duckdb::LogicalTypeId::DOUBLE: {
-            auto const double_val = builder.data_blocks_accessor.get_current_as<double>(allocation);
-            app.Append<double>(double_val);
-            builder.data_blocks_accessor.advance_as<double>();
-            break;
-          }
-          case duckdb::LogicalTypeId::FLOAT: {
-            auto const float_val = builder.data_blocks_accessor.get_current_as<float>(allocation);
-            app.Append<float>(float_val);
-            builder.data_blocks_accessor.advance_as<float>();
-            break;
-          }
-          case duckdb::LogicalTypeId::DECIMAL: {
-            auto width = duckdb::DecimalType::GetWidth(type);
-            auto scale = duckdb::DecimalType::GetScale(type);
-
-            switch (type.InternalType()) {
-              case duckdb::PhysicalType::INT16: {
-                auto const dec_val =
-                  builder.data_blocks_accessor.get_current_as<int16_t>(allocation);
-                app.Append(duckdb::Value::DECIMAL(dec_val, width, scale));
-                builder.data_blocks_accessor.advance_as<int16_t>();
-                break;
-              }
-              case duckdb::PhysicalType::INT32: {
-                auto const dec_val =
-                  builder.data_blocks_accessor.get_current_as<int32_t>(allocation);
-                app.Append(duckdb::Value::DECIMAL(dec_val, width, scale));
-                builder.data_blocks_accessor.advance_as<int32_t>();
-                break;
-              }
-              case duckdb::PhysicalType::INT64: {
-                auto const dec_val =
-                  builder.data_blocks_accessor.get_current_as<int64_t>(allocation);
-                app.Append(duckdb::Value::DECIMAL(dec_val, width, scale));
-                builder.data_blocks_accessor.advance_as<int64_t>();
-                break;
-              }
-              case duckdb::PhysicalType::INT128: {
-                auto const dec_val =
-                  builder.data_blocks_accessor.get_current_as<duckdb::hugeint_t>(allocation);
-                app.Append(duckdb::Value::DECIMAL(dec_val, width, scale));
-                builder.data_blocks_accessor.advance_as<duckdb::hugeint_t>();
-                break;
-              }
-              default: FAIL("Unsupported decimal internal type");
-            }
-            break;
-          }
-          case duckdb::LogicalTypeId::DATE: {
-            auto const date_val =
-              builder.data_blocks_accessor.get_current_as<duckdb::date_t>(allocation);
-            app.Append<duckdb::date_t>(date_val);
-            builder.data_blocks_accessor.advance_as<duckdb::date_t>();
-            break;
-          }
-          default: FAIL("Type not handled in test scan task appender");
-        }
-      }
-
-      app.EndRow();
-    }
-
-    app.Close();
-  }
-
-  duckdb::Connection& con_;
-  std::string table_name_;
-
-  // Static mutex to protect DuckDB connection access across all task instances
-  // DuckDB connections are not thread-safe for concurrent writes
-  static std::mutex append_mutex_;
-};
-
-// Define the static mutex
-std::mutex test_scan_task::append_mutex_;
+using namespace cucascade::memory;
 
 //===----------------------------------------------------------------------===//
 // Helper Functions
 //===----------------------------------------------------------------------===//
+
+static std::filesystem::path get_test_config_path()
+{
+  return std::filesystem::path(__FILE__).parent_path() / "memory.cfg";
+}
+
+static memory_space* get_space(cucascade::memory::memory_reservation_manager& mem_mgr, Tier tier)
+{
+  auto* space = mem_mgr.get_memory_space(tier, 0);
+  if (space) { return space; }
+  auto spaces = mem_mgr.get_memory_spaces_for_tier(tier);
+  if (!spaces.empty()) { return const_cast<memory_space*>(spaces.front()); }
+  return nullptr;
+}
 
 /**
  * @brief Create a simple synthetic table with multiple columns and rows
@@ -344,71 +118,129 @@ static void create_synthetic_table(duckdb::Connection& con,
 }
 
 /**
- * @brief Validate that two tables have identical content
+ * @brief Drain all batches from a shared data repository.
  */
-static void validate_tables_equal(duckdb::Connection& con,
-                                  std::string const& ref_table,
-                                  std::string const& stage_table)
+static std::vector<std::shared_ptr<cucascade::data_batch>> drain_data_repo(
+  cucascade::shared_data_repository& data_repo)
 {
-  auto cnt_ref = con.Query("SELECT COUNT(*) FROM " + ref_table + ";");
-  auto cnt_stg = con.Query("SELECT COUNT(*) FROM " + stage_table + ";");
-  REQUIRE(cnt_ref);
-  REQUIRE(!cnt_ref->HasError());
-  REQUIRE(cnt_stg);
-  REQUIRE(!cnt_stg->HasError());
-
-  auto ref_n = cnt_ref->GetValue<int64_t>(0, 0);
-  auto stg_n = cnt_stg->GetValue<int64_t>(0, 0);
-  REQUIRE(ref_n == stg_n);
-
-  // Differences present in ref but not in stage
-  // clang-format off
-  auto missing = con.Query(
-    "SELECT COUNT(*) \
-       FROM ( SELECT * \
-                FROM " + ref_table + " \
-                  EXCEPT ALL SELECT * \
-                               FROM " + stage_table + ");");
-  // clang-format on
-  REQUIRE(missing);
-  REQUIRE(!missing->HasError());
-  auto missing_n = missing->GetValue<int64_t>(0, 0);
-
-  // Differences present in stage but not in ref
-  // clang-format off
-  auto extra = con.Query(
-    "SELECT COUNT(*) \
-       FROM ( SELECT * \
-                FROM " + stage_table + " \
-                  EXCEPT ALL SELECT * \
-                               FROM " + ref_table + ");");
-  // clang-format on
-  REQUIRE(extra);
-  REQUIRE(!extra->HasError());
-  auto extra_n = extra->GetValue<int64_t>(0, 0);
-
-  if (missing_n != 0 || extra_n != 0) {
-    // Dump a few rows to help debugging
-    // clang-format off
-    auto diff1 = con.Query("SELECT * \
-                              FROM " + ref_table + " \
-                                EXCEPT ALL SELECT * \
-                                             FROM " + stage_table + " \
-                                             LIMIT 10;");
-    auto diff2 = con.Query("SELECT * \
-                              FROM " + stage_table + " \
-                                EXCEPT ALL SELECT * \
-                                             FROM " + ref_table + " \
-                                             LIMIT 10;");
-    // clang-format on
-    std::cout << "REFERENCE TABLE: " + ref_table << "\n";
-    std::cout << "MISSING:\n";
-    diff1->Print();
-    std::cout << "EXTRA:\n";
-    diff2->Print();
+  std::vector<std::shared_ptr<cucascade::data_batch>> batches;
+  while (true) {
+    auto batch = data_repo.pop_data_batch(cucascade::batch_state::task_created);
+    if (!batch) { break; }
+    batches.push_back(std::move(batch));
   }
-  REQUIRE(missing_n == 0);
-  REQUIRE(extra_n == 0);
+  return batches;
+}
+
+static std::vector<int64_t> copy_string_offsets(const cudf::column_view& offsets_col)
+{
+  auto num_offsets = offsets_col.size();
+  std::vector<int64_t> offsets(num_offsets, 0);
+  if (num_offsets == 0) { return offsets; }
+  if (offsets_col.type().id() == cudf::type_id::INT64) {
+    cudaMemcpy(offsets.data(),
+               offsets_col.data<int64_t>(),
+               sizeof(int64_t) * offsets.size(),
+               cudaMemcpyDeviceToHost);
+  } else if (offsets_col.type().id() == cudf::type_id::INT32) {
+    std::vector<cudf::size_type> offsets32(num_offsets, 0);
+    cudaMemcpy(offsets32.data(),
+               offsets_col.data<cudf::size_type>(),
+               sizeof(cudf::size_type) * offsets32.size(),
+               cudaMemcpyDeviceToHost);
+    for (size_t i = 0; i < offsets.size(); ++i) {
+      offsets[i] = offsets32[i];
+    }
+  } else {
+    FAIL("Unsupported offsets type in string column");
+  }
+  return offsets;
+}
+
+static void validate_scanned_batches(
+  const std::vector<std::shared_ptr<cucascade::data_batch>>& batches,
+  size_t expected_rows,
+  cucascade::memory::memory_reservation_manager& mem_mgr)
+{
+  auto* gpu_space = get_space(mem_mgr, Tier::GPU);
+  REQUIRE(gpu_space != nullptr);
+  auto& registry = sirius::converter_registry::get();
+
+  if (expected_rows > 0) { REQUIRE_FALSE(batches.empty()); }
+
+  std::vector<bool> seen(expected_rows, false);
+  size_t total_rows = 0;
+
+  for (auto const& batch : batches) {
+    REQUIRE(batch != nullptr);
+    batch->convert_to<cucascade::gpu_table_representation>(
+      registry, gpu_space, cudf::get_default_stream());
+    auto table_view = sirius::get_cudf_table_view(*batch);
+
+    REQUIRE(table_view.num_columns() == 4);
+    REQUIRE(table_view.column(0).type().id() == cudf::type_id::INT32);
+    REQUIRE(table_view.column(1).type().id() == cudf::type_id::INT64);
+    REQUIRE(table_view.column(2).type().id() == cudf::type_id::FLOAT64);
+    REQUIRE(table_view.column(3).type().id() == cudf::type_id::STRING);
+
+    auto const num_rows = table_view.num_rows();
+    total_rows += num_rows;
+    if (num_rows == 0) { continue; }
+
+    std::vector<int32_t> ids(num_rows);
+    std::vector<int64_t> values(num_rows);
+    std::vector<double> prices(num_rows);
+    cudaMemcpy(ids.data(),
+               table_view.column(0).data<int32_t>(),
+               sizeof(int32_t) * num_rows,
+               cudaMemcpyDeviceToHost);
+    cudaMemcpy(values.data(),
+               table_view.column(1).data<int64_t>(),
+               sizeof(int64_t) * num_rows,
+               cudaMemcpyDeviceToHost);
+    cudaMemcpy(prices.data(),
+               table_view.column(2).data<double>(),
+               sizeof(double) * num_rows,
+               cudaMemcpyDeviceToHost);
+
+    cudf::strings_column_view name_col(table_view.column(3));
+    auto offsets = copy_string_offsets(name_col.offsets());
+    REQUIRE(offsets.size() == static_cast<size_t>(num_rows + 1));
+    std::vector<char> chars;
+    if (!offsets.empty() && offsets.back() > 0) {
+      chars.resize(static_cast<size_t>(offsets.back()));
+      cudaMemcpy(chars.data(),
+                 name_col.chars_begin(cudf::get_default_stream()),
+                 chars.size(),
+                 cudaMemcpyDeviceToHost);
+    }
+
+    for (cudf::size_type i = 0; i < num_rows; ++i) {
+      auto id = ids[i];
+      REQUIRE(id >= 0);
+      REQUIRE(static_cast<size_t>(id) < expected_rows);
+      REQUIRE_FALSE(seen[id]);
+      seen[id] = true;
+
+      auto const expected_value = static_cast<int64_t>(id) * 100;
+      auto const expected_price = static_cast<double>(id) * 1.5;
+      auto const expected_name  = "item_" + std::to_string(id);
+
+      REQUIRE(values[i] == expected_value);
+      REQUIRE(prices[i] == expected_price);
+
+      auto const start = static_cast<size_t>(offsets[i]);
+      auto const end   = static_cast<size_t>(offsets[i + 1]);
+      std::string actual_name;
+      if (end > start) { actual_name.assign(chars.data() + start, chars.data() + end); }
+      REQUIRE(actual_name == expected_name);
+    }
+  }
+
+  REQUIRE(total_rows == expected_rows);
+  for (auto const& was_seen : seen) {
+    REQUIRE(was_seen);
+  }
 }
 
 /**
@@ -449,7 +281,9 @@ static std::unique_ptr<sirius::op::sirius_physical_table_scan> make_physical_tab
   // Create extra operator info (must be a variable, not a temporary)
   duckdb::ExtraOperatorInfo extra_info;
 
-  // Create SiriusPhysicalTableScan with all required parameters
+  auto virtual_columns = table_catalog_entry.GetVirtualColumns();
+
+  // Create sirius_physical_table_scan with all required parameters
   auto physical_scan = std::make_unique<sirius::op::sirius_physical_table_scan>(
     table_catalog_entry.GetTypes(),   // types
     table_scan_function,              // function
@@ -462,7 +296,8 @@ static std::unique_ptr<sirius::op::sirius_physical_table_scan> make_physical_tab
     0,                                // estimated_cardinality
     std::move(extra_info),            // extra_info
     duckdb::vector<duckdb::Value>(),  // parameters
-    duckdb::virtual_column_map_t());
+    std::move(virtual_columns)        // virtual_columns
+  );
 
   return physical_scan;
 }
@@ -475,14 +310,8 @@ static std::unique_ptr<sirius::op::sirius_physical_table_scan> make_physical_tab
 static void run_scan_test(std::string const& table_name,
                           size_t num_rows,
                           int num_threads,
-                          size_t batch_size,
-                          uint64_t pipeline_id)
+                          size_t batch_size)
 {
-  // Verify memory manager is initialized
-  auto manager    = initialize_memory_manager();
-  auto* mem_space = manager->get_memory_space(Tier::HOST, 0);
-  REQUIRE(mem_space != nullptr);
-
   // Setup DuckDB database
   duckdb::DuckDB db(nullptr);
   duckdb::Connection con(db);
@@ -492,6 +321,13 @@ static void run_scan_test(std::string const& table_name,
 
   // Get client context
   auto& client_ctx = *con.context;
+  auto sirius_ctx  = sirius::get_sirius_context(con, get_test_config_path());
+  ;
+
+  // Verify memory manager is initialized
+  auto& mem_mgr   = sirius_ctx->get_memory_manager();
+  auto* mem_space = get_space(mem_mgr, Tier::HOST);
+  REQUIRE(mem_space != nullptr);
 
   // Begin transaction for catalog access
   auto begin_result = con.Query("BEGIN TRANSACTION");
@@ -501,13 +337,6 @@ static void run_scan_test(std::string const& table_name,
   // Create physical table scan
   auto physical_scan = make_physical_table_scan(client_ctx, table_name);
   REQUIRE(physical_scan);
-
-  // Create staging table for scanned data
-  std::string staging_table = table_name + "_scanned";
-  auto create_result =
-    con.Query("CREATE TABLE " + staging_table + " AS SELECT * FROM " + table_name + " WHERE 1=0");
-  REQUIRE(create_result);
-  REQUIRE(!create_result->HasError());
 
   // Create scan executor (task scheduler)
   op::scan::duckdb_scan_executor scan_executor({num_threads, false});
@@ -521,39 +350,38 @@ static void run_scan_test(std::string const& table_name,
   REQUIRE(dummy_result);
   REQUIRE(!dummy_result->HasError());
 
-  duckdb::ThreadContext thread_ctx(client_ctx);
-  duckdb::ExecutionContext exec_ctx(client_ctx, thread_ctx, nullptr);
-
   // Create global state
   auto global_state = std::make_shared<op::scan::duckdb_scan_task_global_state>(
-    nullptr, scan_executor, client_ctx, physical_scan.get(), *manager);
+    nullptr, scan_executor, client_ctx, physical_scan.get());
 
   // Create data repository manager (empty, unused for this test)
   cucascade::shared_data_repository data_repo;
 
-  // Create local state
-  auto local_state =
-    std::make_unique<op::scan::duckdb_scan_task_local_state>(*global_state, exec_ctx, batch_size);
+  // Create a single execution context for all scan tasks.
+  auto thread_context = std::make_unique<duckdb::ThreadContext>(client_ctx);
+  auto execution_context =
+    std::make_unique<duckdb::ExecutionContext>(client_ctx, *thread_context, nullptr);
 
-  // Create and schedule test task
-  uint64_t task_id = 1;
-  auto task        = std::make_unique<test_scan_task>(
-    task_id, &data_repo, con, staging_table, std::move(local_state), global_state);
-
-  // Run task
+  // Run tasks
+  const auto scan_start = std::chrono::steady_clock::now();
   scan_executor.start();
-  scan_executor.schedule(std::move(task));
+  for (int i = 0; i < num_threads; ++i) {
+    auto local_state = std::make_unique<op::scan::duckdb_scan_task_local_state>(
+      *global_state, *execution_context, batch_size);
+    auto task = std::make_unique<op::scan::duckdb_scan_task>(
+      static_cast<uint64_t>(i + 1), &data_repo, std::move(local_state), global_state);
+    scan_executor.schedule(std::move(task));
+  }
   scan_executor.wait();
   scan_executor.stop();
+  const auto scan_end = std::chrono::steady_clock::now();
+  const auto elapsed_ms =
+    std::chrono::duration_cast<std::chrono::milliseconds>(scan_end - scan_start).count();
+  std::cout << "scan_executor elapsed: " << elapsed_ms << " ms\n";
 
-  // Validate tables are identical
-  validate_tables_equal(con, table_name, staging_table);
-
-  // Release DuckDB table function state before committing
-  // The global_tf_state holds a shared checkpoint lock on the source table
-  // (acquired via InitializeParallelScan -> SharedLockTable) that must be
-  // released before COMMIT can proceed
-  global_state.reset();
+  // Validate repository data batches
+  auto batches = drain_data_repo(data_repo);
+  validate_scanned_batches(batches, num_rows, mem_mgr);
 
   // End the transaction
   auto commit_result = con.Query("COMMIT");
@@ -561,7 +389,6 @@ static void run_scan_test(std::string const& table_name,
   REQUIRE(!commit_result->HasError());
 
   // Cleanup
-  con.Query("DROP TABLE " + staging_table);
   con.Query("DROP TABLE " + table_name);
 }
 
@@ -569,59 +396,49 @@ static void run_scan_test(std::string const& table_name,
 // Test: Single-threaded scan executor
 //===----------------------------------------------------------------------===//
 
-// todo(bobbi): enable after migrating to new operators
-TEST_CASE("scan_executor - single threaded small table", "[.][scan_executor][single_thread]")
+TEST_CASE("scan_executor - single threaded small table", "[scan_executor][single_thread]")
 {
   // Use 10MB batch size to ensure multiple 1MB blocks are allocated
-  run_scan_test("test_small", 100, 1, 10000000, 1);
+  run_scan_test("test_small", 100, 1, 10000000);
 }
 
-// todo(bobbi): enable after migrating to new operators
-TEST_CASE("scan_executor - single threaded with small batches", "[.][scan_executor][single_thread]")
+TEST_CASE("scan_executor - single threaded with small batches", "[scan_executor][single_thread]")
 {
   // Use a small batch size to force multiple batches
   // With 4 columns (INT + BIGINT + DOUBLE + VARCHAR(256)) = 4 + 8 + 8 + 256 = 276 bytes per row
   // So ~600000 bytes should fit about 2175 rows (1 vector)
-  run_scan_test("test_medium", 10000, 1, 600000, 2);
+  run_scan_test("test_medium", 10000, 1, 600000);
 }
 
 //===----------------------------------------------------------------------===//
 // Test: Multi-threaded scan executor
 //===----------------------------------------------------------------------===//
 
-// todo(bobbi): enable after migrating to new operators
-TEST_CASE("scan_executor - multi threaded small table", "[.][scan_executor][multi_thread]")
+TEST_CASE("scan_executor - multi threaded small table", "[scan_executor][multi_thread]")
 {
-  run_scan_test("test_mt_small", 1000, 4, 1000000, 3);
+  run_scan_test("test_mt_small", 1000, 4, 1000000);
 }
 
-// todo(bobbi): enable after migrating to new operators
-TEST_CASE("scan_executor - multi threaded medium table", "[.][scan_executor][multi_thread]")
+TEST_CASE("scan_executor - multi threaded medium table", "[scan_executor][multi_thread]")
 {
-  // Use a medium batch size to force multiple batches across multiple threads
-  // With 4 columns (INT + BIGINT + DOUBLE + VARCHAR(256)) = 4 + 8 + 8 + 256 = 276 bytes per row
-  // So ~1000000 bytes should fit about 3623 rows (~2 vectors)
-  run_scan_test("test_mt_medium", 100000, 4, 1000000, 4);
+  run_scan_test("test_mt_medium", 100000, 4, 1000000);
 }
 
-// todo(bobbi): enable after migrating to new operators
-TEST_CASE("scan_executor - multi threaded large table", "[.][scan_executor][multi_thread]")
+TEST_CASE("scan_executor - multi threaded large table", "[scan_executor][multi_thread]")
 {
-  run_scan_test("test_mt_large", 500000, 8, 1000000, 5);
+  run_scan_test("test_mt_large", 500000, 8, 10000000);
 }
 
 //===----------------------------------------------------------------------===//
 // Test: Edge cases
 //===----------------------------------------------------------------------===//
 
-// todo(bobbi): enable after migrating to new operators
-TEST_CASE("scan_executor - empty table", "[.][scan_executor][edge_case]")
+TEST_CASE("scan_executor - empty table", "[scan_executor][edge_case]")
 {
-  run_scan_test("test_empty", 0, 1, 1000000, 6);
+  run_scan_test("test_empty", 0, 1, 1000000);
 }
 
-// todo(bobbi): enable after migrating to new operators
 TEST_CASE("scan_executor - single row table", "[scan_executor][edge_case]")
 {
-  run_scan_test("test_single_row", 1, 1, 1000000, 7);
+  run_scan_test("test_single_row", 1, 1, 1000000);
 }

@@ -16,9 +16,9 @@
 
 #include "operator/gpu_physical_result_collector.hpp"
 
+#include "cudf_utils.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/prepared_statement_data.hpp"
-#include "expression_executor/gpu_expression_executor_state.hpp"
 #include "gpu_buffer_manager.hpp"
 #include "gpu_context.hpp"
 #include "gpu_materialize.hpp"
@@ -332,7 +332,7 @@ SinkResultType GPUPhysicalMaterializedCollector::ConvertGPUTableToCPUCollection(
           if (from_decimal_size != sizeof(__int128_t) || from_scale != to_scale) {
             // `from` and `to` decimal types are different, need to cast
             auto from_cudf_column_view = materialized_relation.columns[col]->convertToCudfColumn();
-            auto to_cudf_type          = sirius::GpuExpressionState::GetCudfType(types[col]);
+            auto to_cudf_type          = GetCudfType(types[col]);
             auto to_cudf_column        = cudf::cast(from_cudf_column_view,
                                              to_cudf_type,
                                              rmm::cuda_stream_default,

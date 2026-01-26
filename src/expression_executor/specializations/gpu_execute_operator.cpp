@@ -134,7 +134,7 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundOperator
                                                              GpuExpressionState* state)
 {
   auto expression_type = expr.GetExpressionType();
-  auto return_type     = GpuExpressionState::GetCudfType(expr.return_type);
+  auto return_type     = GetCudfType(expr.return_type);
 
   if (expression_type == ExpressionType::COMPARE_IN ||
       expression_type == ExpressionType::COMPARE_NOT_IN) {
