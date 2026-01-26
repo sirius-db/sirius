@@ -70,7 +70,7 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundConstant
   D_ASSERT(expr.value.type() == expr.return_type);
 
   // In many cases, this column materialization is pruned away
-  auto cudf_type = GpuExpressionState::GetCudfType(expr.return_type);
+  auto cudf_type = GetCudfType(expr.return_type);
   switch (cudf_type.id()) {
     case cudf::type_id::INT16:
       return MakeColumnFromConstant<int16_t>::Do(expr, input_count, resource_ref, execution_stream);

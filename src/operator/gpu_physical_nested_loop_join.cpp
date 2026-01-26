@@ -16,6 +16,7 @@
 
 #include "gpu_physical_nested_loop_join.hpp"
 
+#include "cudf_utils.hpp"
 #include "duckdb/common/enums/physical_operator_type.hpp"
 #include "duckdb/common/operator/comparison_operators.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
@@ -27,7 +28,6 @@
 #include "duckdb/parallel/thread_context.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
-#include "expression_executor/gpu_expression_executor_state.hpp"
 #include "gpu_buffer_manager.hpp"
 #include "gpu_materialize.hpp"
 #include "gpu_meta_pipeline.hpp"
@@ -390,8 +390,8 @@ OperatorResultType GPUPhysicalNestedLoopJoin::ResolveComplexJoin(
         HandleMaterializeExpression(input_relation.columns[join_key_index], gpuBufferManager);
       // Perform cast
       auto from_cudf_column_view = left_keys[cond_idx]->convertToCudfColumn();
-      auto to_cudf_type   = sirius::GpuExpressionState::GetCudfType(condition.left->return_type);
-      auto to_cudf_column = cudf::cast(from_cudf_column_view,
+      auto to_cudf_type          = GetCudfType(condition.left->return_type);
+      auto to_cudf_column        = cudf::cast(from_cudf_column_view,
                                        to_cudf_type,
                                        rmm::cuda_stream_default,
                                        GPUBufferManager::GetInstance().mr);
@@ -423,8 +423,8 @@ OperatorResultType GPUPhysicalNestedLoopJoin::ResolveComplexJoin(
         HandleMaterializeExpression(right_temp_data->columns[join_key_index], gpuBufferManager);
       // Perform cast
       auto from_cudf_column_view = right_keys[cond_idx]->convertToCudfColumn();
-      auto to_cudf_type   = sirius::GpuExpressionState::GetCudfType(condition.right->return_type);
-      auto to_cudf_column = cudf::cast(from_cudf_column_view,
+      auto to_cudf_type          = GetCudfType(condition.right->return_type);
+      auto to_cudf_column        = cudf::cast(from_cudf_column_view,
                                        to_cudf_type,
                                        rmm::cuda_stream_default,
                                        GPUBufferManager::GetInstance().mr);

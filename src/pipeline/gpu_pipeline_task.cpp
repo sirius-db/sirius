@@ -16,13 +16,13 @@
 
 #include "pipeline/gpu_pipeline_task.hpp"
 
-#include <data/cpu_data_representation.hpp>
+#include <cucascade/data/cpu_data_representation.hpp>
+#include <cucascade/data/data_repository.hpp>
+#include <cucascade/data/data_repository_manager.hpp>
+#include <cucascade/data/gpu_data_representation.hpp>
+#include <cucascade/memory/memory_space.hpp>
 #include <data/data_batch_utils.hpp>
-#include <data/data_repository.hpp>
-#include <data/data_repository_manager.hpp>
-#include <data/gpu_data_representation.hpp>
 #include <data/sirius_converter_registry.hpp>
-#include <memory/memory_space.hpp>
 
 #include <optional>
 

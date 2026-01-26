@@ -15,14 +15,17 @@
  */
 
 #pragma once
-#include "memory/memory_reservation.hpp"
-#include "memory/memory_space.hpp"
+
 #include "parallel/task_executor.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/task_request.hpp"
 
 #include <blockingconcurrentqueue.h>
-#include <data/data_repository.hpp>
+#include <cucascade/data/data_repository.hpp>
+#include <cucascade/memory/memory_reservation.hpp>
+#include <cucascade/memory/memory_space.hpp>
+
+#include <queue>
 
 namespace sirius {
 namespace pipeline {
@@ -70,8 +73,8 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
   // Non-copyable but movable
   gpu_pipeline_executor(const gpu_pipeline_executor&)            = delete;
   gpu_pipeline_executor& operator=(const gpu_pipeline_executor&) = delete;
-  gpu_pipeline_executor(gpu_pipeline_executor&&)                 = default;
-  gpu_pipeline_executor& operator=(gpu_pipeline_executor&&)      = default;
+  gpu_pipeline_executor(gpu_pipeline_executor&&)                 = delete;
+  gpu_pipeline_executor& operator=(gpu_pipeline_executor&&)      = delete;
 
   /**
    * @brief Schedules a task for execution with GPU-specific logic

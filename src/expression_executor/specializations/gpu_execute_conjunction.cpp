@@ -38,7 +38,7 @@ std::unique_ptr<GpuExpressionState> GpuExpressionExecutor::InitializeState(
 std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundConjunctionExpression& expr,
                                                              GpuExpressionState* state)
 {
-  auto return_type = GpuExpressionState::GetCudfType(expr.return_type);
+  auto return_type = GetCudfType(expr.return_type);
 
   // Resolve the children incrementally into the output
   std::unique_ptr<cudf::column> output_column;

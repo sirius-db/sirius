@@ -16,4 +16,6 @@
 
 set(EXTENSION_SOURCES
     ${EXTENSION_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/downgrade_task.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/downgrade_queue.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/downgrade_executor.cpp
     PARENT_SCOPE)

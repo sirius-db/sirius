@@ -18,14 +18,13 @@
 // #include "downgrade/downgrade_executor.hpp"
 #include "cudf/contiguous_split.hpp"
 #include "data/sirius_converter_registry.hpp"
-#include "memory/sirius_memory_manager.hpp"
 
 #include <rmm/cuda_stream_view.hpp>
 
-#include <data/cpu_data_representation.hpp>
-#include <data/gpu_data_representation.hpp>
-#include <memory/common.hpp>
-#include <memory/fixed_size_host_memory_resource.hpp>
+#include <cucascade/data/cpu_data_representation.hpp>
+#include <cucascade/data/gpu_data_representation.hpp>
+#include <cucascade/memory/common.hpp>
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 
 namespace sirius {
 namespace parallel {
@@ -54,7 +53,7 @@ void downgrade_task::execute()
   auto data_size = batch->get_data()->get_size_in_bytes();
 
   try {
-    auto& mr_manager = sirius::memory_manager::get();
+    auto& mr_manager = _global_state->cast<downgrade_task_global_state>()._reservation_manager;
     auto reservation = mr_manager.request_reservation(
       cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::HOST}, data_size);
     if (!reservation) {
@@ -74,10 +73,6 @@ void downgrade_task::execute()
 
     mark_task_completion();
     return;
-
-  } catch (const rmm::out_of_memory& e) {
-    batch->try_to_release_in_transit();
-    throw;
   } catch (...) {
     batch->try_to_release_in_transit();
     throw;

@@ -22,7 +22,7 @@
 #include "pipeline/gpu_pipeline_task.hpp"
 
 #include <blockingconcurrentqueue.h>
-#include <data/data_repository.hpp>
+#include <cucascade/data/data_repository.hpp>
 
 #include <atomic>
 #include <memory>

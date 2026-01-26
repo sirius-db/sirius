@@ -169,7 +169,8 @@ struct ComparisonDispatcher {
   std::unique_ptr<cudf::column> operator()(const BoundComparisonExpression& expr,
                                            GpuExpressionState* state)
   {
-    auto return_type = GpuExpressionState::GetCudfType(expr.return_type);
+    D_ASSERT(expr.children.size() == 2);
+    auto return_type = GetCudfType(expr.return_type);
 
     // Resolve the children 
     // DuckDB sometimes moves constants to the right comparator. 
@@ -190,7 +191,8 @@ struct ComparisonDispatcher {
     if (right_expr->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
       auto right_value = right_expr->Cast<BoundConstantExpression>().value;
 
-      switch (GpuExpressionState::GetCudfType(right_expr->return_type).id()) {
+
+      switch (GetCudfType(right_expr->return_type).id()) {
         case cudf::type_id::INT16:
           return DoScalarComparison<int16_t>(
             left->view(), !right_value.IsNull()? right_value.GetValue<int16_t>(): 0, right_value.IsNull(), return_type);
@@ -244,7 +246,7 @@ struct ComparisonDispatcher {
         default:
           throw InternalException(
             "Execute[Comparison]: Unsupported constant type for comparison: %d!",
-            static_cast<int>(GpuExpressionState::GetCudfType(expr.right->return_type).id()));
+            static_cast<int>(GetCudfType(expr.right->return_type).id()));
       }
     }
 
@@ -265,7 +267,7 @@ struct ComparisonDispatcher {
 std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundComparisonExpression& expr,
                                                              GpuExpressionState* state)
 {
-  auto return_type = GpuExpressionState::GetCudfType(expr.return_type);
+  auto return_type = GetCudfType(expr.return_type);
 
   // Execute the comparison
   switch (expr.GetExpressionType()) {

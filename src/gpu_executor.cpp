@@ -42,7 +42,7 @@
 #include "operator/gpu_physical_result_collector.hpp"
 #include "operator/gpu_physical_table_scan.hpp"
 
-#include <data/data_repository_manager.hpp>
+#include <cucascade/data/data_repository_manager.hpp>
 #include <stdio.h>
 
 #include <iostream>

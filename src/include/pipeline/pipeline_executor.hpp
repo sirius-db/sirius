@@ -15,14 +15,18 @@
  */
 
 #pragma once
-#include "memory/memory_reservation.hpp"
+
+#include "config.hpp"
+#include "memory/sirius_memory_reservation_manager.hpp"
 #include "parallel/task_executor.hpp"
 #include "pipeline/gpu_pipeline_executor.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/task_request.hpp"
 
 #include <blockingconcurrentqueue.h>
-#include <data/data_repository.hpp>
+#include <cucascade/data/data_repository.hpp>
+#include <cucascade/memory/memory_reservation.hpp>
+#include <cucascade/memory/topology_discovery.hpp>
 
 namespace sirius {
 namespace pipeline {
@@ -44,9 +48,9 @@ class pipeline_executor : public sirius::parallel::itask_executor {
    * @param gpu_executor_config Configuration for the GPU pipeline executor
    * @param num_gpus Number of GPU executors to create
    */
-  explicit pipeline_executor(sirius::parallel::task_executor_config pipeline_config,
-                             sirius::parallel::task_executor_config gpu_executor_config,
-                             size_t num_gpus);
+  explicit pipeline_executor(const parallel::task_executor_config& gpu_task_executor_config,
+                             sirius::memory::sirius_memory_reservation_manager& mem_mgr,
+                             const cucascade::memory::system_topology_info* sys_topology = nullptr);
 
   /**
    * @brief Destructor for the gpu_pipeline_executor.
@@ -56,8 +60,8 @@ class pipeline_executor : public sirius::parallel::itask_executor {
   // Non-copyable but movable
   pipeline_executor(const pipeline_executor&)            = delete;
   pipeline_executor& operator=(const pipeline_executor&) = delete;
-  pipeline_executor(pipeline_executor&&)                 = default;
-  pipeline_executor& operator=(pipeline_executor&&)      = default;
+  pipeline_executor(pipeline_executor&&)                 = delete;
+  pipeline_executor& operator=(pipeline_executor&&)      = delete;
 
   /**
    * @brief Schedules a task for execution with GPU-specific logic

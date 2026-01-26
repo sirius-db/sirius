@@ -17,9 +17,12 @@
 #include "creator/task_creator.hpp"
 
 #include "op/scan/duckdb_scan_task.hpp"
+#include "op/sirius_physical_table_scan.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 
 #include <duckdb/parallel/thread_context.hpp>
+
+#include <queue>
 
 namespace sirius::creator {
 
@@ -65,27 +68,39 @@ std::unique_ptr<task_creation_info> task_creation_queue::pull()
 //------------------------------------------------------------------------------
 
 task_creator::task_creator(size_t num_threads,
-                           sirius_pipeline_hashmap& sirius_pipeline_map,
-                           duckdb::ClientContext& client_context,
                            pipeline::pipeline_executor& pipeline_executor,
-                           op::scan::duckdb_scan_executor& duckdb_scan_executor)
+                           op::scan::duckdb_scan_executor& duckdb_scan_executor,
+                           sirius::memory::sirius_memory_reservation_manager& mem_res_mgr)
   : _num_threads(num_threads),
     _running(false),
-    _sirius_pipeline_map(sirius_pipeline_map),
-    _client_context(client_context),
     _pipeline_executor(pipeline_executor),
-    _duckdb_scan_executor(duckdb_scan_executor)
+    _duckdb_scan_executor(duckdb_scan_executor),
+    _mem_res_mgr(mem_res_mgr)
 {
   _task_creation_queue = std::make_unique<task_creation_queue>(num_threads);
-  for (size_t i = 0; i < sirius_pipeline_map._vec.size(); ++i) {
-    if (sirius_pipeline_map._vec[i]->get_source()->type ==
-        ::duckdb::PhysicalOperatorType::TABLE_SCAN) {
-      priority_scans.push(sirius_pipeline_map._vec[i]);
+}
+
+task_creator::~task_creator() { stop_thread_pool(); }
+
+void task_creator::set_client_context(::duckdb::ClientContext& client_context)
+{
+  _client_context = std::addressof(client_context);
+}
+
+void task_creator::set_pipeline_hashmap(sirius_pipeline_hashmap& sirius_pipeline_map)
+{
+  _sirius_pipeline_map = &sirius_pipeline_map;
+  for (const auto& i : _sirius_pipeline_map->_vec) {
+    if (i->get_source()->type == ::duckdb::PhysicalOperatorType::TABLE_SCAN) {
+      _priority_scans.push(i);
     }
   }
 }
 
-task_creator::~task_creator() { stop_thread_pool(); }
+void task_creator::reset()
+{
+  _priority_scans = std::queue<duckdb::shared_ptr<pipeline::sirius_pipeline>>{};
+}
 
 void task_creator::process_next_task(op::sirius_physical_operator* node)
 {
@@ -100,11 +115,11 @@ void task_creator::process_next_task(op::sirius_physical_operator* node)
     auto pipeline = std::get<duckdb::shared_ptr<pipeline::sirius_pipeline>>(hint);
     process_next_task(&pipeline->get_inner_operators()[0].get());
   } else {
-    if (!priority_scans.empty()) {
-      duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline = priority_scans.front();
+    if (!_priority_scans.empty()) {
+      duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline = _priority_scans.front();
       auto* scan_node                                        = pipeline->get_source().get();
       schedule(std::make_unique<task_creation_info>(scan_node, pipeline));
-      priority_scans.pop();
+      _priority_scans.pop();
     }
   }
 }
@@ -112,11 +127,11 @@ void task_creator::process_next_task(op::sirius_physical_operator* node)
 void task_creator::start()
 {
   start_thread_pool();
-  while (!priority_scans.empty()) {
-    duckdb::shared_ptr<sirius::pipeline::sirius_pipeline> pipeline = priority_scans.front();
-    auto* scan_node                                                = pipeline->get_source().get();
+  while (!_priority_scans.empty()) {
+    duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline = _priority_scans.front();
+    auto* scan_node                                        = pipeline->get_source().get();
     schedule(std::make_unique<task_creation_info>(scan_node, pipeline));
-    priority_scans.pop();
+    _priority_scans.pop();
   }
 }
 
@@ -129,7 +144,7 @@ void task_creator::start_thread_pool()
   on_start();
   _threads.reserve(_num_threads);
   for (size_t i = 0; i < _num_threads; ++i) {
-    _threads.push_back(std::make_unique<std::thread>(&task_creator::worker_function, this, i));
+    _threads.emplace_back(&task_creator::worker_function, this, i);
   }
 }
 
@@ -139,7 +154,7 @@ void task_creator::stop_thread_pool()
   if (!_running.compare_exchange_strong(expected, false)) { return; }
   on_stop();
   for (auto& thread : _threads) {
-    if (thread->joinable()) { thread->join(); }
+    if (thread.joinable()) { thread.join(); }
   }
   _threads.clear();
 }
@@ -151,11 +166,7 @@ void task_creator::schedule(std::unique_ptr<task_creation_info> info)
 
 void task_creator::worker_function(int worker_id)
 {
-  while (true) {
-    if (!_running.load()) {
-      // Executor is stopped.
-      break;
-    }
+  while (_running.load()) {
     std::unique_ptr<task_creation_info> info = _task_creation_queue->pull();
     if (info == nullptr) {
       // Task queue is closed.
@@ -168,10 +179,10 @@ void task_creator::worker_function(int worker_id)
         auto scan_task_global_state = std::make_shared<op::scan::duckdb_scan_task_global_state>(
           info->_pipeline,
           _duckdb_scan_executor,
-          _client_context,
+          *_client_context,
           &info->_node->Cast<op::sirius_physical_table_scan>());
-        duckdb::ThreadContext thread_ctx(_client_context);
-        duckdb::ExecutionContext exec_ctx(_client_context, thread_ctx, nullptr);
+        duckdb::ThreadContext thread_ctx(*_client_context);
+        duckdb::ExecutionContext exec_ctx(*_client_context, thread_ctx, nullptr);
         auto scan_task_local_state = std::make_unique<op::scan::duckdb_scan_task_local_state>(
           *scan_task_global_state, exec_ctx);
         if (info->destination_data_repositories.empty()) {
