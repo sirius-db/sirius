@@ -17,6 +17,7 @@
 // sirius
 #include <cucascade/data/data_repository_manager.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
+#include <cudf_utils.hpp>
 #include <expression_executor/gpu_dispatcher.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
 #include <expression_executor/gpu_expression_executor_state.hpp>
@@ -203,7 +204,7 @@ void GpuExpressionExecutor::Execute(const GPUIntermediateRelation& input_relatio
 
     // Cast the `result` from libcudf to `return_type` if `result` has different types.
     // E.g., `extract(year from col)` from libcudf returns int16_t but duckdb requires int64_t
-    auto cudf_return_type = GpuExpressionState::GetCudfType(expressions[i]->return_type);
+    auto cudf_return_type = GetCudfType(expressions[i]->return_type);
     if (result->type().id() != cudf_return_type.id()) {
       result = cudf::cast(result->view(), cudf_return_type, execution_stream, resource_ref);
     }
@@ -241,7 +242,7 @@ std::shared_ptr<cucascade::data_batch> GpuExpressionExecutor::execute(
 
     // Cast the `result` from libcudf to `return_type` if `result` has a different type.
     // E.g., `extract(year from col)` from libcudf returns int16_t but duckdb requires int64_t
-    auto cudf_return_type = GpuExpressionState::GetCudfType(expressions[i]->return_type);
+    auto cudf_return_type = GetCudfType(expressions[i]->return_type);
     if (result->type().id() != cudf_return_type.id()) {
       result = cudf::cast(result->view(), cudf_return_type, execution_stream, resource_ref);
     }
