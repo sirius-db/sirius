@@ -613,8 +613,7 @@ TEST_CASE("host_table_utils - underfilled varchar column truncates rows",
   verify_string_column(table_view.column(1), expected_str, expected_str_valid);
 }
 
-TEST_CASE("host_table_utils - metadata offsets match packed data",
-          "[memory][host_table_utils]")
+TEST_CASE("host_table_utils - metadata offsets match packed data", "[memory][host_table_utils]")
 {
   constexpr size_t num_rows = 257;
   auto* gpu_space           = get_memory_space(Tier::GPU, 0);

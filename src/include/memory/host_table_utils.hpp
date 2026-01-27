@@ -35,9 +35,9 @@
 #include <cudf/types.hpp>
 
 // standard library
-#include <stdexcept>
-#include <cstring>
 #include <cstdint>
+#include <cstring>
+#include <stdexcept>
 #include <vector>
 
 namespace sirius {

@@ -36,8 +36,8 @@
 
 // standard library
 #include <algorithm>
-#include <initializer_list>
 #include <filesystem>
+#include <initializer_list>
 #include <string>
 #include <vector>
 

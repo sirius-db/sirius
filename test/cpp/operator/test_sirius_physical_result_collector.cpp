@@ -250,7 +250,7 @@ TEST_CASE("sirius_physical_materialized_collector sink with host input",
     duckdb::make_shared_ptr<duckdb::PreparedStatementData>(duckdb::StatementType::SELECT_STATEMENT);
   prepared->types = types;
   prepared->names = {"c0", "c1", "c2"};
-  auto plan = duckdb::make_uniq<sirius::op::sirius_physical_dummy_scan>(types, 0);
+  auto plan       = duckdb::make_uniq<sirius::op::sirius_physical_dummy_scan>(types, 0);
   auto sirius_prepared =
     duckdb::make_shared_ptr<duckdb::SiriusPreparedStatementData>(prepared, std::move(plan));
   sirius::op::sirius_physical_materialized_collector collector(*sirius_prepared,
@@ -318,7 +318,7 @@ TEST_CASE("sirius_physical_materialized_collector sink converts GPU input",
     duckdb::make_shared_ptr<duckdb::PreparedStatementData>(duckdb::StatementType::SELECT_STATEMENT);
   prepared->types = types;
   prepared->names = {"c0", "c1"};
-  auto plan = duckdb::make_uniq<sirius::op::sirius_physical_dummy_scan>(types, 0);
+  auto plan       = duckdb::make_uniq<sirius::op::sirius_physical_dummy_scan>(types, 0);
   auto sirius_prepared =
     duckdb::make_shared_ptr<duckdb::SiriusPreparedStatementData>(prepared, std::move(plan));
   sirius::op::sirius_physical_materialized_collector collector(*sirius_prepared,
