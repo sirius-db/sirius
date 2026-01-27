@@ -25,7 +25,7 @@ namespace duckdb {
 size_t getMaskBytesSize(uint64_t column_length)
 {
   uint64_t necessary_bytes = (column_length + 7) / 8;
-  uint64_t padded_bytes    = 64 * ((necessary_bytes + 63) / 64); // Pad to the nearest 64 bytes
+  uint64_t padded_bytes    = 64 * ((necessary_bytes + 63) / 64);  // Pad to the nearest 64 bytes
   return padded_bytes;
 }
 
@@ -91,7 +91,8 @@ size_t DataWrapper::getColumnTypeSize() const
     case GPUColumnTypeId::VARCHAR: return 128;
     case GPUColumnTypeId::DECIMAL: {
       GPUDecimalTypeInfo* decimal_type_info = type.GetDecimalTypeInfo();
-      if (decimal_type_info == nullptr) throw InternalException(
+      if (decimal_type_info == nullptr)
+        throw InternalException(
           "`decimal_type_info` not set for DECIMAL type in `getColumnTypeSize`");
       return decimal_type_info->GetDecimalTypeSize();
     }
@@ -246,14 +247,15 @@ cudf::column_view GPUColumn::convertToCudfColumn()
         cudf_type = cudf::data_type(cudf::type_id::DECIMAL128,
                                     -data_wrapper.type.GetDecimalTypeInfo()->scale_);
         break;
-      default: throw duckdb::InternalException(
+      default:
+        throw duckdb::InternalException(
           "Unsupported sirius DECIMAL column type size in `convertToCudfColumn()`: %zu",
           data_wrapper.getColumnTypeSize());
     }
     return cudf::column_view(
       cudf_type, size, data_wrapper.data, data_wrapper.validity_mask, null_count);
   }
-   throw duckdb::InternalException("Unsupported sirius column type in `convertToCudfColumn()`: %d",
+  throw duckdb::InternalException("Unsupported sirius column type in `convertToCudfColumn()`: %d",
                                   data_wrapper.type.id());
 }
 
@@ -463,10 +465,10 @@ void GPUColumn::setFromCudfScalar(cudf::scalar& cudf_scalar, GPUBufferManager* g
     } else {
       data_wrapper.data = nullptr;
     }
-    data_wrapper.type           = GPUColumnType(GPUColumnTypeId::VARCHAR);
-    data_wrapper.num_bytes      = string_size;
-    data_wrapper.offset         = gpuBufferManager->customCudaMalloc<uint64_t>(2, 0, 0);
-    uint64_t offsets[]          = {0, string_size};
+    data_wrapper.type      = GPUColumnType(GPUColumnTypeId::VARCHAR);
+    data_wrapper.num_bytes = string_size;
+    data_wrapper.offset    = gpuBufferManager->customCudaMalloc<uint64_t>(2, 0, 0);
+    uint64_t offsets[]     = {0, string_size};
     callCudaMemcpyHostToDevice<uint64_t>(data_wrapper.offset, offsets, 2, 0);
     data_wrapper.is_string_data = true;
     data_wrapper.size           = 1;

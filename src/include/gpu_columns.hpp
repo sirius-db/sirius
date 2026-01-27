@@ -58,7 +58,7 @@ cudf::bitmask_type* createNullMask(size_t size,
 
 enum class GPUColumnTypeId {
   INVALID = 0,
-  INT16,  
+  INT16,
   INT32,
   INT64,
   FLOAT32,
@@ -180,12 +180,13 @@ class DataWrapper {
               cudf::bitmask_type* validity_mask);
   GPUColumnType type;
   uint8_t* data;
-  size_t size; // number of rows in the column (currently equals to column_length)
+  size_t size;  // number of rows in the column (currently equals to column_length)
   uint64_t* offset{nullptr};
-  size_t num_bytes; // number of bytes in the column
+  size_t num_bytes;  // number of bytes in the column
   size_t getColumnTypeSize() const;
   bool is_string_data{false};
-  cudf::bitmask_type* validity_mask{nullptr}; // validity mask for the column, used to represent NULL values
+  cudf::bitmask_type* validity_mask{
+    nullptr};  // validity mask for the column, used to represent NULL values
   size_t mask_bytes{0};
 };
 
@@ -219,9 +220,9 @@ class GPUColumn {
 
   DataWrapper data_wrapper;
   uint64_t* row_ids;
-  size_t row_id_count; // number of rows in the row_ids array
-  size_t column_length; // number of rows in the column (currently equals to column_length)
-  bool is_unique; // indicator whether the column has unique values
+  size_t row_id_count;   // number of rows in the row_ids array
+  size_t column_length;  // number of rows in the column (currently equals to column_length)
+  bool is_unique;        // indicator whether the column has unique values
 
   uint8_t* segment_start_ptr{nullptr};
   int segment_id{-1};
