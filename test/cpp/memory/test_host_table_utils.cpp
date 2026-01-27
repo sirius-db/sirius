@@ -640,6 +640,7 @@ TEST_CASE("host_table_utils - metadata offsets match packed data",
   std::vector<uint8_t> expected_int64_mask;
   std::vector<uint8_t> expected_string_mask;
   {
+    REQUIRE(batch->try_to_create_task());
     auto lock_result = batch->try_to_lock_for_processing(gpu_space->get_id());
     REQUIRE(lock_result.success);
     auto handle = std::move(lock_result.handle);

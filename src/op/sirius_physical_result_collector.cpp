@@ -14,17 +14,29 @@
  * limitations under the License.
  */
 
-#include "op/sirius_physical_result_collector.hpp"
+// sirius
 
-#include "duckdb/main/config.hpp"
-#include "duckdb/main/prepared_statement_data.hpp"
-#include "expression_executor/gpu_expression_executor_state.hpp"
-#include "gpu_context.hpp"
-#include "gpu_physical_plan_generator.hpp"
-#include "log/logging.hpp"
-#include "pipeline/sirius_meta_pipeline.hpp"
-#include "pipeline/sirius_pipeline.hpp"
-#include "utils.hpp"
+#include <data/sirius_converter_registry.hpp>
+#include <gpu_context.hpp>
+#include <op/result/host_table_chunk_reader.hpp>
+#include <op/sirius_physical_result_collector.hpp>
+#include <pipeline/sirius_meta_pipeline.hpp>
+#include <pipeline/sirius_pipeline.hpp>
+
+// cucascade
+#include <cucascade/data/cpu_data_representation.hpp>
+#include <cucascade/data/data_batch.hpp>
+#include <cucascade/memory/common.hpp>
+#include <cucascade/memory/memory_reservation_manager.hpp>
+
+// duckdb
+#include <duckdb/common/exception.hpp>
+#include <duckdb/main/materialized_query_result.hpp>
+#include <duckdb/main/prepared_statement_data.hpp>
+
+// standard library
+#include <algorithm>
+#include <cassert>
 
 namespace sirius {
 namespace op {
@@ -65,17 +77,91 @@ void sirius_physical_result_collector::build_pipelines(
 }
 
 sirius_physical_materialized_collector::sirius_physical_materialized_collector(
-  duckdb::SiriusPreparedStatementData& data)
+  duckdb::SiriusPreparedStatementData& data, duckdb::ClientContext& client_ctx)
   : sirius_physical_result_collector(data),
-    result_collection(duckdb::make_uniq<duckdb::GPUResultCollection>())
+    _client_ctx(client_ctx),
+    result_collection(duckdb::make_uniq<duckdb::ColumnDataCollection>(client_ctx, types))
 {
 }
 
 duckdb::unique_ptr<duckdb::QueryResult> sirius_physical_materialized_collector::get_result(
   duckdb::GlobalSinkState& state)
 {
-  // TODO: Implement this method
-  throw duckdb::NotImplementedException("sirius_physical_materialized_collector::get_result");
+  (void)state;  // Silence unused parameter warning
+
+  // Return an empty result collection if the result_collection is null (from a move)
+  if (!result_collection) {
+    result_collection = duckdb::make_uniq<duckdb::ColumnDataCollection>(_client_ctx, types);
+  }
+
+  auto props = _client_ctx.GetClientProperties();
+  return duckdb::make_uniq<duckdb::MaterializedQueryResult>(
+    statement_type, properties, names, std::move(result_collection), props);
+}
+
+void sirius_physical_materialized_collector::sink(
+  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches)
+{
+  using host_table_chunk_reader = ::sirius::op::result::host_table_chunk_reader;
+
+  // Initialize result collection if it is null (from a move)
+  if (!result_collection) {
+    result_collection = duckdb::make_uniq<duckdb::ColumnDataCollection>(_client_ctx, types);
+  }
+  if (input_batches.empty()) {
+    throw duckdb::InvalidInputException("[GPUPhysicalMaterializedCollector] input_batches is null");
+  }
+
+  auto sink_single_batch = [this](std::shared_ptr<cucascade::data_batch> const& input_batch) {
+    auto* data = input_batch->get_data();
+    if (!data) {
+      throw duckdb::InvalidInputException(
+        "[GPUPhysicalMaterializedCollector] data_batch has no data representation");
+    }
+
+    // If data is in GPU tier, convert to HOST tier first
+    if (data->get_current_tier() == cucascade::memory::Tier::GPU) {
+      // Make the HOST memory reservation
+      auto sirius_ctx  = _client_ctx.registered_state->Get<duckdb::SiriusContext>("sirius_state");
+      auto& memory_mgr = sirius_ctx->get_memory_manager();
+      /// TODO: Find the closest memory space, not just any memory space, in HOST tier
+      auto reservation = memory_mgr.request_reservation(
+        cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::HOST},
+        data->get_size_in_bytes());
+      if (!reservation) {
+        throw duckdb::InternalException(
+          "[GPUPhysicalMaterializedCollector] Failed to reserve host memory for result collection");
+      }
+
+      // Convert to host representation
+      auto& registry  = sirius::converter_registry::get();
+      auto& mem_space = reservation->get_memory_space();
+      input_batch->convert_to<cucascade::host_table_representation>(
+        registry, &mem_space, rmm::cuda_stream_default);
+      data = input_batch->get_data();
+    } else if (data->get_current_tier() != cucascade::memory::Tier::HOST) {
+      // Data must be in HOST tier (i.e., cannot currently reside in DISK tier)
+      throw duckdb::InvalidInputException(
+        "[GPUPhysicalMaterializedCollector] Expected host_table_representation in HOST tier");
+    }
+
+    // Only accepting host_table_representations for now
+    assert(dynamic_cast<cucascade::host_table_representation*>(data) != nullptr);
+
+    // Push chunks to result collection
+    auto const& host_table = data->cast<cucascade::host_table_representation>();
+    host_table_chunk_reader chunk_reader(_client_ctx, host_table, types);
+
+    // Push chunks to result collection
+    duckdb::DataChunk chunk;
+    duckdb::ColumnDataAppendState append_state;
+    result_collection->InitializeAppend(append_state);
+    while (chunk_reader.get_next_chunk(chunk)) {
+      result_collection->Append(append_state, chunk);
+    }
+  };
+
+  std::for_each(input_batches.begin(), input_batches.end(), sink_single_batch);
 }
 
 }  // namespace op

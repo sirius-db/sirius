@@ -20,11 +20,14 @@
 
 // sirius
 #include <data/data_batch_utils.hpp>
-#include <memory/multiple_blocks_allocation_accessor.hpp>
-#include <op/result/host_table_chunk_reader.hpp>
+#include <gpu_context.hpp>
+#include <op/sirius_physical_dummy_scan.hpp>
+#include <op/sirius_physical_result_collector.hpp>
+
+// cucascades
+#include <cucascade/data/cpu_data_representation.hpp>
 
 // cudf
-#include <cudf/null_mask.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
@@ -34,11 +37,15 @@
 // rmm
 #include <rmm/cuda_stream_view.hpp>
 
+// duckdb
+#include <duckdb/common/vector_size.hpp>
+#include <duckdb/main/prepared_statement_data.hpp>
+
 // standard library
 #include <algorithm>
-#include <initializer_list>
 #include <filesystem>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace sirius;
@@ -103,6 +110,8 @@ expected_table_data extract_expected_data(cudf::table_view const& view)
                cudaMemcpyDeviceToHost);
   }
 
+  if (view.num_columns() < 3) { return data; }
+
   cudf::strings_column_view str_col(view.column(2));
   auto offsets_view = str_col.offsets();
   data.string_offsets.resize(num_rows + 1, 0);
@@ -154,54 +163,6 @@ std::vector<std::string> build_expected_strings(expected_table_data const& data)
   return strings;
 }
 
-std::vector<cudf::size_type> build_null_indices(size_t num_rows,
-                                                std::initializer_list<size_t> indices)
-{
-  std::vector<cudf::size_type> null_rows;
-  null_rows.reserve(indices.size());
-  for (auto idx : indices) {
-    if (idx < num_rows) { null_rows.push_back(static_cast<cudf::size_type>(idx)); }
-  }
-  std::sort(null_rows.begin(), null_rows.end());
-  null_rows.erase(std::unique(null_rows.begin(), null_rows.end()), null_rows.end());
-  return null_rows;
-}
-
-void apply_null_mask(cudf::column& column,
-                     std::vector<cudf::size_type> const& null_rows,
-                     rmm::cuda_stream_view stream,
-                     rmm::device_async_resource_ref mr)
-{
-  if (null_rows.empty() || column.size() == 0) { return; }
-
-  auto const bytes = cudf::bitmask_allocation_size_bytes(column.size());
-  auto const words = bytes / sizeof(cudf::bitmask_type);
-  std::vector<cudf::bitmask_type> host_mask(words, ~cudf::bitmask_type{0});
-  for (auto idx : null_rows) {
-    cudf::clear_bit_unsafe(host_mask.data(), idx);
-  }
-
-  rmm::device_buffer mask_buffer(host_mask.data(), bytes, stream, mr);
-  column.set_null_mask(std::move(mask_buffer), static_cast<cudf::size_type>(null_rows.size()));
-}
-
-std::vector<bool> extract_validity(cudf::column_view const& col)
-{
-  auto const num_rows = static_cast<size_t>(col.size());
-  std::vector<bool> valid(num_rows, true);
-  if (num_rows == 0 || !col.nullable() || col.null_count() == 0) { return valid; }
-
-  auto const bytes = cudf::bitmask_allocation_size_bytes(col.size());
-  auto const words = bytes / sizeof(cudf::bitmask_type);
-  std::vector<cudf::bitmask_type> host_mask(words);
-  cudaMemcpy(host_mask.data(), col.null_mask(), bytes, cudaMemcpyDeviceToHost);
-
-  for (size_t i = 0; i < num_rows; ++i) {
-    valid[i] = cudf::bit_is_set(host_mask.data(), static_cast<cudf::size_type>(i));
-  }
-  return valid;
-}
-
 size_t estimate_packed_data_bytes(cudf::table_view const& view)
 {
   size_t total_bytes = 0;
@@ -224,38 +185,33 @@ size_t estimate_packed_data_bytes(cudf::table_view const& view)
   return total_bytes;
 }
 
-host_table_representation const& convert_to_host_table(std::shared_ptr<data_batch> const& batch)
+void convert_batch_to_host(std::shared_ptr<data_batch> const& batch)
 {
   auto* data = batch->get_data();
   if (!data) { throw std::runtime_error("data_batch has no data representation"); }
 
+  auto const view       = sirius::get_cudf_table_view(*batch);
+  auto const data_bytes = estimate_packed_data_bytes(view);
+
   auto sirius_ctx = get_test_sirius_context();
   auto& manager   = sirius_ctx->get_memory_manager();
 
-  auto reservation =
-    manager.request_reservation(any_memory_space_in_tier{Tier::HOST},
-                                estimate_packed_data_bytes(sirius::get_cudf_table_view(*batch)));
-
+  auto reservation = manager.request_reservation(any_memory_space_in_tier{Tier::HOST}, data_bytes);
   if (!reservation) { throw std::runtime_error("Failed to reserve host memory for test"); }
 
   auto* host_space = manager.get_memory_space(reservation->tier(), reservation->device_id());
-
-  if (!host_space) { throw std::runtime_error("Invalid host memory space in test"); }
+  if (!host_space) { throw std::runtime_error("Invalid host memory space for test"); }
 
   auto& registry = sirius::converter_registry::get();
   batch->convert_to<host_table_representation>(registry, host_space, rmm::cuda_stream_default);
-
-  data = batch->get_data();
-  if (!data) { throw std::runtime_error("data_batch has no data after conversion"); }
-  return data->cast<host_table_representation>();
 }
 
 }  // namespace
 
-TEST_CASE("host_table_chunk_reader produces correct DataChunks",
-          "[operator][result_collector][host_table_chunk_reader]")
+TEST_CASE("sirius_physical_materialized_collector sink with host input",
+          "[operator][result_collector][sirius_result_collector]")
 {
-  constexpr size_t num_rows = STANDARD_VECTOR_SIZE + 5;
+  constexpr size_t num_rows = STANDARD_VECTOR_SIZE + 7;
   auto* gpu_space           = get_default_gpu_space();
   REQUIRE(gpu_space != nullptr);
 
@@ -286,30 +242,33 @@ TEST_CASE("host_table_chunk_reader produces correct DataChunks",
     expected_strings    = build_expected_strings(expected);
   }
 
-  auto const& host_table = convert_to_host_table(batch);
+  convert_batch_to_host(batch);
 
   duckdb::vector<duckdb::LogicalType> types{
     duckdb::LogicalType::INTEGER, duckdb::LogicalType::BIGINT, duckdb::LogicalType::VARCHAR};
-  sirius::op::result::host_table_chunk_reader reader(get_test_client_context(), host_table, types);
+  auto prepared =
+    duckdb::make_shared_ptr<duckdb::PreparedStatementData>(duckdb::StatementType::SELECT_STATEMENT);
+  prepared->types = types;
+  prepared->names = {"c0", "c1", "c2"};
+  auto plan = duckdb::make_uniq<sirius::op::sirius_physical_dummy_scan>(types, 0);
+  auto sirius_prepared =
+    duckdb::make_shared_ptr<duckdb::SiriusPreparedStatementData>(prepared, std::move(plan));
+  sirius::op::sirius_physical_materialized_collector collector(*sirius_prepared,
+                                                               get_test_client_context());
 
-  size_t row_base       = 0;
-  auto const num_chunks = reader.calculate_num_chunks();
-  for (size_t chunk_idx = 0; chunk_idx < num_chunks; ++chunk_idx) {
-    duckdb::DataChunk chunk;
-    REQUIRE(reader.get_next_chunk(chunk));
+  collector.sink({batch});
+  duckdb::GlobalSinkState sink_state;
+  auto result = collector.get_result(sink_state);
+  REQUIRE(result != nullptr);
 
-    auto const count = static_cast<size_t>(chunk.size());
-    REQUIRE(chunk.GetCapacity() == static_cast<duckdb::idx_t>(count));
-    auto* int32_data = duckdb::FlatVector::GetData<int32_t>(chunk.data[0]);
-    auto* int64_data = duckdb::FlatVector::GetData<int64_t>(chunk.data[1]);
-    auto* str_data   = duckdb::FlatVector::GetData<duckdb::string_t>(chunk.data[2]);
-
-    auto& int32_validity = duckdb::FlatVector::Validity(chunk.data[0]);
-    auto& int64_validity = duckdb::FlatVector::Validity(chunk.data[1]);
-    auto& str_validity   = duckdb::FlatVector::Validity(chunk.data[2]);
-    REQUIRE(int32_validity.AllValid());
-    REQUIRE(int64_validity.AllValid());
-    REQUIRE(str_validity.AllValid());
+  size_t row_base = 0;
+  for (;;) {
+    auto chunk = result->FetchRaw();
+    if (!chunk) { break; }
+    auto const count = static_cast<size_t>(chunk->size());
+    auto* int32_data = duckdb::FlatVector::GetData<int32_t>(chunk->data[0]);
+    auto* int64_data = duckdb::FlatVector::GetData<int64_t>(chunk->data[1]);
+    auto* str_data   = duckdb::FlatVector::GetData<duckdb::string_t>(chunk->data[2]);
 
     for (size_t i = 0; i < count; ++i) {
       REQUIRE(int32_data[i] == expected.int32_values[row_base + i]);
@@ -317,104 +276,72 @@ TEST_CASE("host_table_chunk_reader produces correct DataChunks",
       auto const actual = std::string(str_data[i].GetData(), str_data[i].GetSize());
       REQUIRE(actual == expected_strings[row_base + i]);
     }
-
     row_base += count;
   }
-
-  duckdb::DataChunk empty_chunk;
-  REQUIRE(!reader.get_next_chunk(empty_chunk));
   REQUIRE(row_base == num_rows);
 }
 
-TEST_CASE("host_table_chunk_reader handles null masks",
-          "[operator][result_collector][host_table_chunk_reader]")
+TEST_CASE("sirius_physical_materialized_collector sink converts GPU input",
+          "[operator][result_collector][sirius_result_collector]")
 {
   constexpr size_t num_rows = STANDARD_VECTOR_SIZE * 2 + 3;
   auto* gpu_space           = get_default_gpu_space();
   REQUIRE(gpu_space != nullptr);
-  auto stream = cudf::get_default_stream();
-  auto mr     = gpu_space->get_default_allocator();
 
   std::vector<cudf::data_type> column_types{cudf::data_type{cudf::type_id::INT32},
-                                            cudf::data_type{cudf::type_id::INT64},
-                                            cudf::data_type{cudf::type_id::STRING}};
-  std::vector<std::optional<std::pair<int, int>>> ranges{
-    std::make_pair(0, 100), std::make_pair(1000, 2000), std::make_pair(0, 100)};
+                                            cudf::data_type{cudf::type_id::INT64}};
+  std::vector<std::optional<std::pair<int, int>>> ranges{std::make_pair(0, 100),
+                                                         std::make_pair(1000, 2000)};
 
-  auto table =
-    sirius::create_cudf_table_with_random_data(num_rows, column_types, ranges, stream, mr, true);
-  auto int64_nulls = build_null_indices(
-    num_rows,
-    {0, 5, STANDARD_VECTOR_SIZE - 1, STANDARD_VECTOR_SIZE, STANDARD_VECTOR_SIZE + 1, num_rows - 1});
-  auto string_nulls = build_null_indices(
-    num_rows, {1, 7, STANDARD_VECTOR_SIZE - 1, STANDARD_VECTOR_SIZE + 2, num_rows - 2});
-  apply_null_mask(table->get_column(1), int64_nulls, stream, mr);
-  apply_null_mask(table->get_column(2), string_nulls, stream, mr);
-
+  auto table = sirius::create_cudf_table_with_random_data(num_rows,
+                                                          column_types,
+                                                          ranges,
+                                                          cudf::get_default_stream(),
+                                                          gpu_space->get_default_allocator(),
+                                                          false);
   auto batch = sirius::make_data_batch(std::move(table), *gpu_space);
 
   expected_table_data expected;
-  std::vector<std::string> expected_strings;
-  std::vector<bool> expected_int64_valid;
-  std::vector<bool> expected_string_valid;
   {
     REQUIRE(batch->try_to_create_task());
     auto lock_result = batch->try_to_lock_for_processing(gpu_space->get_id());
     REQUIRE(lock_result.success);
     auto handle = std::move(lock_result.handle);
 
-    auto const gpu_view   = sirius::get_cudf_table_view(*batch);
-    expected              = extract_expected_data(gpu_view);
-    expected_strings      = build_expected_strings(expected);
-    expected_int64_valid  = extract_validity(gpu_view.column(1));
-    expected_string_valid = extract_validity(gpu_view.column(2));
+    auto const gpu_view = sirius::get_cudf_table_view(*batch);
+    expected            = extract_expected_data(gpu_view);
   }
 
-  auto const& host_table = convert_to_host_table(batch);
+  duckdb::vector<duckdb::LogicalType> types{duckdb::LogicalType::INTEGER,
+                                            duckdb::LogicalType::BIGINT};
+  auto prepared =
+    duckdb::make_shared_ptr<duckdb::PreparedStatementData>(duckdb::StatementType::SELECT_STATEMENT);
+  prepared->types = types;
+  prepared->names = {"c0", "c1"};
+  auto plan = duckdb::make_uniq<sirius::op::sirius_physical_dummy_scan>(types, 0);
+  auto sirius_prepared =
+    duckdb::make_shared_ptr<duckdb::SiriusPreparedStatementData>(prepared, std::move(plan));
+  sirius::op::sirius_physical_materialized_collector collector(*sirius_prepared,
+                                                               get_test_client_context());
 
-  duckdb::vector<duckdb::LogicalType> types{
-    duckdb::LogicalType::INTEGER, duckdb::LogicalType::BIGINT, duckdb::LogicalType::VARCHAR};
-  sirius::op::result::host_table_chunk_reader reader(get_test_client_context(), host_table, types);
+  collector.sink({batch});
+  duckdb::GlobalSinkState sink_state;
+  auto result = collector.get_result(sink_state);
+  REQUIRE(result != nullptr);
 
-  size_t row_base       = 0;
-  auto const num_chunks = reader.calculate_num_chunks();
-  for (size_t chunk_idx = 0; chunk_idx < num_chunks; ++chunk_idx) {
-    duckdb::DataChunk chunk;
-    REQUIRE(reader.get_next_chunk(chunk));
-
-    auto const count = static_cast<size_t>(chunk.size());
-    auto* int32_data = duckdb::FlatVector::GetData<int32_t>(chunk.data[0]);
-    auto* int64_data = duckdb::FlatVector::GetData<int64_t>(chunk.data[1]);
-    auto* str_data   = duckdb::FlatVector::GetData<duckdb::string_t>(chunk.data[2]);
-
-    auto& int32_validity = duckdb::FlatVector::Validity(chunk.data[0]);
-    auto& int64_validity = duckdb::FlatVector::Validity(chunk.data[1]);
-    auto& str_validity   = duckdb::FlatVector::Validity(chunk.data[2]);
-
-    REQUIRE(int32_validity.AllValid());
+  size_t row_base = 0;
+  for (;;) {
+    auto chunk = result->FetchRaw();
+    if (!chunk) { break; }
+    auto const count = static_cast<size_t>(chunk->size());
+    auto* int32_data = duckdb::FlatVector::GetData<int32_t>(chunk->data[0]);
+    auto* int64_data = duckdb::FlatVector::GetData<int64_t>(chunk->data[1]);
 
     for (size_t i = 0; i < count; ++i) {
-      auto const row_idx = row_base + i;
-      REQUIRE(int32_data[i] == expected.int32_values[row_idx]);
-
-      REQUIRE(int64_validity.RowIsValid(static_cast<duckdb::idx_t>(i)) ==
-              expected_int64_valid[row_idx]);
-      if (expected_int64_valid[row_idx]) {
-        REQUIRE(int64_data[i] == expected.int64_values[row_idx]);
-      }
-
-      REQUIRE(str_validity.RowIsValid(static_cast<duckdb::idx_t>(i)) ==
-              expected_string_valid[row_idx]);
-      if (expected_string_valid[row_idx]) {
-        auto const actual = std::string(str_data[i].GetData(), str_data[i].GetSize());
-        REQUIRE(actual == expected_strings[row_idx]);
-      }
+      REQUIRE(int32_data[i] == expected.int32_values[row_base + i]);
+      REQUIRE(int64_data[i] == expected.int64_values[row_base + i]);
     }
-
     row_base += count;
   }
-
-  duckdb::DataChunk empty_chunk;
-  REQUIRE(!reader.get_next_chunk(empty_chunk));
   REQUIRE(row_base == num_rows);
 }

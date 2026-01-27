@@ -15,14 +15,16 @@
  */
 
 // sirius
-#include "duckdb/main/client_context.hpp"
-
 #include <helper/utils.hpp>
 #include <memory/host_table_utils.hpp>
 #include <op/result/host_table_chunk_reader.hpp>
 
+// cucascade
+#include <cucascade/memory/fixed_size_host_memory_resource.hpp>
+
 // duckdb
 #include <duckdb/common/vector_size.hpp>
+#include <duckdb/main/client_context.hpp>
 
 // standard library
 #include <algorithm>
@@ -86,7 +88,7 @@ void host_table_chunk_reader::column_reader::copy_fixed_width(
   // Do the data copy
   auto const type_size =
     static_cast<size_t>(duckdb::GetTypeIdSize(vector.GetType().InternalType()));
-  auto* dest_ptr = duckdb::FlatVector::GetData<uint8_t>(vector);
+  auto* dest_ptr = duckdb::FlatVector::GetData(vector);
   data_accessor.memcpy_to(allocation, dest_ptr, count * type_size);
 
   // Do the validity mask copy, if necessary
@@ -96,6 +98,60 @@ void host_table_chunk_reader::column_reader::copy_fixed_width(
   }
 }
 
+namespace detail {
+// Helper template function for constructing duckdb strings from offsets
+template <bool HasNulls>
+void make_duckdb_strings(
+  memory::multiple_blocks_allocation_accessor<int64_t>& offset_accessor,
+  std::unique_ptr<
+    cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation> const&
+    allocation,
+  duckdb::Vector& vector,
+  size_t count,
+  size_t start_offset,
+  size_t end_offset,
+  duckdb::data_ptr_t str_buffer_ptr)
+{
+  auto* strings = duckdb::FlatVector::GetData<duckdb::string_t>(vector);
+  size_t start  = start_offset;
+  offset_accessor.advance();
+  size_t offset_counter = 0;
+  while (offset_counter < count) {
+    auto const offsets_in_block =
+      std::min(count - offset_counter,
+               (allocation->block_size() - offset_accessor.offset_in_block) / sizeof(int64_t));
+    auto* src = reinterpret_cast<int64_t*>(allocation->get_blocks()[offset_accessor.block_index] +
+                                           offset_accessor.offset_in_block);
+    for (size_t i = 0; i < offsets_in_block; ++i) {
+      auto const end = src[i];
+      if constexpr (HasNulls) {
+        if (!duckdb::FlatVector::IsNull(vector, offset_counter + i)) {
+          auto const d_ptr   = str_buffer_ptr + (start - start_offset);
+          auto const str_len = end - start;
+          strings[offset_counter + i] =
+            duckdb::string_t(reinterpret_cast<char const*>(d_ptr), str_len);
+        }
+      } else {
+        auto const d_ptr   = str_buffer_ptr + (start - start_offset);
+        auto const str_len = end - start;
+        strings[offset_counter + i] =
+          duckdb::string_t(reinterpret_cast<char const*>(d_ptr), str_len);
+      }
+      start = end;
+    }
+    offset_counter += offsets_in_block;
+    offset_accessor.offset_in_block += offsets_in_block * sizeof(int64_t);
+    if (offset_counter == count) { offset_accessor.offset_in_block -= sizeof(int64_t); }
+    if (offset_accessor.offset_in_block == allocation->block_size()) {
+      offset_accessor.block_index++;
+      offset_accessor.offset_in_block = 0;
+    }
+  }
+}
+}  // namespace detail
+
+// Please see how duckdb converts arrow to duckdb strings for reference:
+// https://github.com/duckdb/duckdb/blob/9612b5bea5a6df924daf5ce696d6992df2483bfe/src/function/table/arrow_conversion.cpp#L332
 void host_table_chunk_reader::column_reader::copy_string(
   duckdb::Vector& vector,
   size_t row_offset,
@@ -109,33 +165,25 @@ void host_table_chunk_reader::column_reader::copy_string(
   vector.SetVectorType(duckdb::VectorType::FLAT_VECTOR);
 
   // Allocate duckdb buffer and bulk copy data into it
-  auto const start_offset     = offset_accessor.get_current(allocation);
-  auto const end_offset       = offset_accessor.get(row_offset + count, allocation);
+  auto start_offset           = offset_accessor.get_current(allocation);
+  auto end_offset             = offset_accessor.get(row_offset + count, allocation);
   auto const total_data_bytes = end_offset - start_offset;
   auto str_buffer             = duckdb::make_buffer<duckdb::VectorBuffer>(total_data_bytes);
   auto str_buffer_ptr         = str_buffer->GetData();
   data_accessor.memcpy_to(allocation, str_buffer_ptr, total_data_bytes);
 
-  // Set the null mask, if necessary
   if (null_count != 0) {
+    // Set the null mask
     auto& validity = duckdb::FlatVector::Validity(vector);
     copy_mask_to_validity(validity, row_offset, count, allocation);
+    detail::make_duckdb_strings<false>(
+      offset_accessor, allocation, vector, count, start_offset, end_offset, str_buffer_ptr);
+  } else {
+    detail::make_duckdb_strings<false>(
+      offset_accessor, allocation, vector, count, start_offset, end_offset, str_buffer_ptr);
   }
 
-  // Construct each string
-  auto strings = duckdb::FlatVector::GetData<duckdb::string_t>(vector);
-  auto start   = start_offset;
-  for (size_t row = 0; row < count; ++row) {
-    offset_accessor.advance();
-    auto end = offset_accessor.get_current(allocation);
-    if (!duckdb::FlatVector::IsNull(vector, row)) {
-      auto d_ptr   = str_buffer_ptr + (start - start_offset);
-      auto str_len = end - start;
-      strings[row] = duckdb::string_t(reinterpret_cast<char*>(d_ptr), str_len);
-    }
-    start = end;
-  }
-
+  // Move the buffer into the string vector
   duckdb::StringVector::AddBuffer(vector, str_buffer);
 }
 
