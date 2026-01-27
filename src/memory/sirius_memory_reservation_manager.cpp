@@ -66,14 +66,11 @@ class sirius_device_memory_resource : public rmm::mr::device_memory_resource {
     return it->second->allocate(bytes, stream);
   }
 
-  void do_deallocate(void* ptr, std::size_t bytes, rmm::cuda_stream_view stream) override
+  void do_deallocate(void* ptr, std::size_t bytes, rmm::cuda_stream_view stream) noexcept override
   {
     auto dev_id = rmm::get_current_cuda_device();
     auto it     = per_device_device_memory_resource_map_.find(dev_id.value());
-    if (it == per_device_device_memory_resource_map_.end()) {
-      throw std::runtime_error("No device memory resource found for device id: " +
-                               std::to_string(dev_id.value()));
-    }
+    assert(it != per_device_device_memory_resource_map_.end());
     it->second->deallocate(ptr, bytes, stream);
   }
 
