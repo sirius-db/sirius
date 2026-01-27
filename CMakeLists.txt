@@ -94,6 +94,7 @@ set(EXTENSION_SOURCES
     src/config.cpp
     src/fallback.cpp
     src/parallel/task_executor.cpp)
+# Note: Memory module sources are now provided by cuCascade library
 add_subdirectory(src/operator)
 add_subdirectory(src/plan)
 add_subdirectory(src/data)
