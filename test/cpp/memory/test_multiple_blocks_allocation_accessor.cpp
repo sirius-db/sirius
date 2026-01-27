@@ -14,15 +14,21 @@
  * limitations under the License.
  */
 
-#include "catch.hpp"
+// test
+#include <catch.hpp>
 
 // sirius
+#include <memory/multiple_blocks_allocation_accessor.hpp>
+
+// cucascade
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 #include <cucascade/memory/memory_reservation_manager.hpp>
 #include <cucascade/memory/numa_region_pinned_host_allocator.hpp>
-#include <op/scan/duckdb_scan_task.hpp>
 
-using namespace sirius::op::scan;
+// standard library
+#include <memory>
+
+using namespace sirius::memory;
 using namespace cucascade::memory;
 
 // Standalone memory resource for testing with custom block size
@@ -64,7 +70,8 @@ create_test_allocation(size_t total_size)
 // Test: multiple_blocks_allocation_accessor - Basic Operations
 //===----------------------------------------------------------------------===//
 
-TEST_CASE("multiple_blocks_allocation_accessor - basic operations", "[duckdb_scan_task][accessor]")
+TEST_CASE("multiple_blocks_allocation_accessor - basic operations",
+          "[memory][multiple_blocks_allocation_accessor]")
 {
   using accessor_type = multiple_blocks_allocation_accessor<uint8_t>;
 
@@ -182,13 +189,79 @@ TEST_CASE("multiple_blocks_allocation_accessor - basic operations", "[duckdb_sca
     REQUIRE(block1_data[4] == 18);
     REQUIRE(block1_data[5] == 19);
   }
+
+  SECTION("memset across block boundary")
+  {
+    accessor_type accessor;
+
+    auto allocation = create_test_allocation(2048);
+
+    accessor.initialize(0, allocation);
+
+    auto const block_size   = allocation->block_size();
+    auto const start_offset = block_size - 8;
+
+    // Sentinel values to confirm memset stays within bounds.
+    accessor.set_cursor(start_offset - 1);
+    accessor.set_current(0x11, allocation);
+    accessor.set_cursor(block_size + 12);
+    accessor.set_current(0x22, allocation);
+
+    accessor.set_cursor(start_offset);
+    accessor.memset(0xAB, 20, allocation);
+
+    REQUIRE(accessor.block_index == 1);
+    REQUIRE(accessor.offset_in_block == 12);
+
+    auto* block0 = reinterpret_cast<uint8_t*>(allocation->get_blocks()[0]);
+    auto* block1 = reinterpret_cast<uint8_t*>(allocation->get_blocks()[1]);
+
+    for (size_t i = 0; i < 8; ++i) {
+      REQUIRE(block0[start_offset + i] == 0xAB);
+    }
+    for (size_t i = 0; i < 12; ++i) {
+      REQUIRE(block1[i] == 0xAB);
+    }
+    REQUIRE(block0[start_offset - 1] == 0x11);
+    REQUIRE(block1[12] == 0x22);
+  }
+
+  SECTION("get with non-zero initial offset across blocks")
+  {
+    accessor_type accessor;
+
+    auto allocation = create_test_allocation(2048);
+
+    accessor.initialize(1000, allocation);
+    accessor.set_cursor(1000);
+
+    for (uint8_t i = 0; i < 40; ++i) {
+      accessor.set_current(static_cast<uint8_t>(i + 1), allocation);
+      accessor.advance();
+    }
+
+    REQUIRE(accessor.block_index == 1);
+    REQUIRE(accessor.offset_in_block == 16);
+
+    accessor.set_cursor(1005);
+    auto const saved_block  = accessor.block_index;
+    auto const saved_offset = accessor.offset_in_block;
+
+    REQUIRE(accessor.get(0, allocation) == 1);
+    REQUIRE(accessor.get(23, allocation) == 24);
+    REQUIRE(accessor.get(24, allocation) == 25);
+    REQUIRE(accessor.get(39, allocation) == 40);
+    REQUIRE(accessor.block_index == saved_block);
+    REQUIRE(accessor.offset_in_block == saved_offset);
+  }
 }
 
 //===----------------------------------------------------------------------===//
 // Test: multiple_blocks_allocation_accessor - Typed Operations
 //===----------------------------------------------------------------------===//
 
-TEST_CASE("multiple_blocks_allocation_accessor - int64_t type", "[duckdb_scan_task][accessor]")
+TEST_CASE("multiple_blocks_allocation_accessor - int64_t type",
+          "[memory][multiple_blocks_allocation_accessor]")
 {
   using accessor_type = multiple_blocks_allocation_accessor<int64_t>;
 
@@ -240,7 +313,8 @@ TEST_CASE("multiple_blocks_allocation_accessor - int64_t type", "[duckdb_scan_ta
 // Test: multiple_blocks_allocation_accessor - Edge Cases
 //===----------------------------------------------------------------------===//
 
-TEST_CASE("multiple_blocks_allocation_accessor - edge cases", "[duckdb_scan_task][accessor]")
+TEST_CASE("multiple_blocks_allocation_accessor - edge cases",
+          "[memory][multiple_blocks_allocation_accessor]")
 {
   // Create an upstream pinned host resource on the stack
   numa_region_pinned_host_memory_resource upstream_mr(0);
@@ -364,7 +438,7 @@ TEST_CASE("multiple_blocks_allocation_accessor - edge cases", "[duckdb_scan_task
 //===----------------------------------------------------------------------===//
 
 TEST_CASE("multiple_blocks_allocation_accessor - multi-block traversal",
-          "[duckdb_scan_task][accessor]")
+          "[memory][multiple_blocks_allocation_accessor]")
 {
   // Use 32-byte blocks for easier testing
   numa_region_pinned_host_memory_resource upstream_mr(0);
@@ -476,7 +550,8 @@ TEST_CASE("multiple_blocks_allocation_accessor - multi-block traversal",
 // Test: multiple_blocks_allocation_accessor - Large Operations
 //===----------------------------------------------------------------------===//
 
-TEST_CASE("multiple_blocks_allocation_accessor - large operations", "[duckdb_scan_task][accessor]")
+TEST_CASE("multiple_blocks_allocation_accessor - large operations",
+          "[memory][multiple_blocks_allocation_accessor]")
 {
   SECTION("large memcpy_from across many blocks")
   {
@@ -562,7 +637,7 @@ TEST_CASE("multiple_blocks_allocation_accessor - large operations", "[duckdb_sca
 //===----------------------------------------------------------------------===//
 
 TEST_CASE("multiple_blocks_allocation_accessor - get_current_as and advance_as",
-          "[duckdb_scan_task][accessor]")
+          "[memory][multiple_blocks_allocation_accessor]")
 {
   numa_region_pinned_host_memory_resource upstream_mr(0);
   auto mr = std::make_unique<fixed_size_host_memory_resource>(
@@ -654,7 +729,8 @@ TEST_CASE("multiple_blocks_allocation_accessor - get_current_as and advance_as",
 // Test: multiple_blocks_allocation_accessor - memcpy_to
 //===----------------------------------------------------------------------===//
 
-TEST_CASE("multiple_blocks_allocation_accessor - memcpy_to", "[duckdb_scan_task][accessor]")
+TEST_CASE("multiple_blocks_allocation_accessor - memcpy_to",
+          "[memory][multiple_blocks_allocation_accessor]")
 {
   numa_region_pinned_host_memory_resource upstream_mr(0);
   auto mr = std::make_unique<fixed_size_host_memory_resource>(
@@ -791,7 +867,8 @@ TEST_CASE("multiple_blocks_allocation_accessor - memcpy_to", "[duckdb_scan_task]
 // Test: reset_cursor functionality
 //===----------------------------------------------------------------------===//
 
-TEST_CASE("multiple_blocks_allocation_accessor - reset_cursor", "[duckdb_scan_task][accessor]")
+TEST_CASE("multiple_blocks_allocation_accessor - reset_cursor",
+          "[memory][multiple_blocks_allocation_accessor]")
 {
   numa_region_pinned_host_memory_resource upstream_mr(0);
   auto mr = std::make_unique<fixed_size_host_memory_resource>(

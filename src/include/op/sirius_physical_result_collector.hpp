@@ -16,10 +16,15 @@
 
 #pragma once
 
-#include "duckdb/common/enums/statement_type.hpp"
-#include "duckdb/common/types/column/column_data_collection.hpp"
-#include "gpu_query_result.hpp"
-#include "op/sirius_physical_operator.hpp"
+// sirius
+#include <gpu_query_result.hpp>
+#include <op/sirius_physical_operator.hpp>
+#include <sirius_context.hpp>
+
+// duckdb
+#include <duckdb/common/enums/statement_type.hpp>
+#include <duckdb/common/types/column/column_data_collection.hpp>
+#include <duckdb/main/client_context.hpp>
 
 namespace duckdb {
 class SiriusPreparedStatementData;
@@ -63,11 +68,36 @@ class sirius_physical_result_collector : public sirius_physical_operator {
 
 class sirius_physical_materialized_collector : public sirius_physical_result_collector {
  public:
-  sirius_physical_materialized_collector(duckdb::SiriusPreparedStatementData& data);
-  duckdb::unique_ptr<duckdb::GPUResultCollection> result_collection;
+  sirius_physical_materialized_collector(duckdb::SiriusPreparedStatementData& data,
+                                         duckdb::ClientContext& client_ctx);
+  duckdb::unique_ptr<duckdb::ColumnDataCollection> result_collection;
 
  public:
+  /**
+   * @brief Fetch the final query result from the result collection
+   *
+   * @param[in] state The global sink state (currently unused)
+   * @return The query result
+   */
   duckdb::unique_ptr<duckdb::QueryResult> get_result(duckdb::GlobalSinkState& state) override;
+
+  /**
+   * @brief Sink a data batch into the result collection
+   *
+   * @param[in] input_batch The input data batch
+   * @throws InvalidInputException if input_batches is empty, if any data_batch has no data, or if
+   * any data_batch currently resides in the DISK tier
+   * @throws InternalException if the memory manager is not initialized, if the reservation fails,
+   * or if the memory space for the reservation is invalid
+   * @note For now, we assume that the input batch, if in the HOST tier, is always in the
+   * host_table_representation. If it is in the GPU tier, we convert it to the
+   * host_table_representation. In the future, we should register converters for other specialized
+   * data representations and invoke one such here.
+   */
+  void sink(const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches) override;
+
+ private:
+  duckdb::ClientContext& _client_ctx;
 };
 
 }  // namespace op

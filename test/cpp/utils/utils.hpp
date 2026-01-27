@@ -83,7 +83,8 @@ std::unique_ptr<cudf::table> create_cudf_table_with_random_data(
   const std::vector<cudf::data_type>& column_types,
   const std::vector<std::optional<std::pair<int, int>>>& ranges,
   rmm::cuda_stream_view stream,
-  rmm::device_async_resource_ref mr);
+  rmm::device_async_resource_ref mr,
+  bool use_int64_string_offsets = false);
 
 inline duckdb::shared_ptr<duckdb::SiriusContext> get_sirius_context(
   duckdb::Connection& con, const std::filesystem::path& config_path)

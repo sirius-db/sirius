@@ -15,6 +15,9 @@
 # =============================================================================
 
 set(TEST_SOURCES
-    ${TEST_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/test_gpu_merge_impl.cpp
+    ${TEST_SOURCES}
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_gpu_merge_impl.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/test_gpu_partition_impl.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_host_table_chunk_reader.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_sirius_physical_result_collector.cpp
     PARENT_SCOPE)

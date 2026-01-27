@@ -16,4 +16,5 @@
 
 set(TEST_SOURCES
     ${TEST_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/test_host_table_utils.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_multiple_blocks_allocation_accessor.cpp
     PARENT_SCOPE)

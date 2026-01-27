@@ -373,7 +373,8 @@ std::unique_ptr<cudf::table> create_cudf_table_with_random_data(
   const std::vector<cudf::data_type>& column_types,
   const std::vector<std::optional<std::pair<int, int>>>& ranges,
   rmm::cuda_stream_view stream,
-  rmm::device_async_resource_ref mr)
+  rmm::device_async_resource_ref mr,
+  bool use_int64_string_offsets)
 {
   auto& gen = global_rng();
   std::vector<std::unique_ptr<cudf::column>> cols;
@@ -397,22 +398,39 @@ std::unique_ptr<cudf::table> create_cudf_table_with_random_data(
                       ? std::uniform_int_distribution<int>(ranges[c]->first, ranges[c]->second)
                       : std::uniform_int_distribution<int>(0, 1000);
         std::vector<char> h_chars;
-        std::vector<cudf::size_type> h_offsets(num_rows + 1, 0);
+        std::vector<int64_t> h_offsets(num_rows + 1, 0);
         for (size_t r = 0; r < num_rows; ++r) {
           string h_str = "str_" + std::to_string(dist(gen));
           h_chars.insert(h_chars.end(), h_str.begin(), h_str.end());
-          h_offsets[r + 1] = h_offsets[r] + h_str.size();
+          h_offsets[r + 1] = h_offsets[r] + static_cast<int64_t>(h_str.size());
         }
 
-        auto offsets_col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
-                                                     h_offsets.size(),
-                                                     cudf::mask_state::UNALLOCATED,
-                                                     stream,
-                                                     mr);
-        cudaMemcpy(offsets_col->mutable_view().data<cudf::size_type>(),
-                   h_offsets.data(),
-                   sizeof(cudf::size_type) * h_offsets.size(),
-                   cudaMemcpyHostToDevice);
+        std::unique_ptr<cudf::column> offsets_col;
+        if (use_int64_string_offsets) {
+          offsets_col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT64},
+                                                  h_offsets.size(),
+                                                  cudf::mask_state::UNALLOCATED,
+                                                  stream,
+                                                  mr);
+          cudaMemcpy(offsets_col->mutable_view().data<int64_t>(),
+                     h_offsets.data(),
+                     sizeof(int64_t) * h_offsets.size(),
+                     cudaMemcpyHostToDevice);
+        } else {
+          std::vector<cudf::size_type> offsets32(h_offsets.size(), 0);
+          std::transform(h_offsets.begin(), h_offsets.end(), offsets32.begin(), [](int64_t value) {
+            return static_cast<cudf::size_type>(value);
+          });
+          offsets_col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                                  h_offsets.size(),
+                                                  cudf::mask_state::UNALLOCATED,
+                                                  stream,
+                                                  mr);
+          cudaMemcpy(offsets_col->mutable_view().data<cudf::size_type>(),
+                     offsets32.data(),
+                     sizeof(cudf::size_type) * offsets32.size(),
+                     cudaMemcpyHostToDevice);
+        }
 
         rmm::device_buffer d_chars(h_chars.data(), h_chars.size(), stream, mr);
 
