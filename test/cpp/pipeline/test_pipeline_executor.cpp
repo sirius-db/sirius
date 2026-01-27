@@ -15,6 +15,7 @@
  */
 
 #include "catch.hpp"
+#include "op/sirius_physical_operator.hpp"
 #include "pipeline/gpu_pipeline_executor.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/pipeline_executor.hpp"
@@ -51,7 +52,7 @@ class mock_gpu_pipeline_task_global_state : public gpu_pipeline_task_global_stat
 class mock_gpu_pipeline_task_local_state : public gpu_pipeline_task_local_state {
  public:
   mock_gpu_pipeline_task_local_state(int task_id, int expected_gpu_id)
-    : gpu_pipeline_task_local_state(std::vector<std::shared_ptr<cucascade::data_batch>>{}),
+    : gpu_pipeline_task_local_state(sirius::op::operator_data()),
       _task_id(task_id),
       _expected_gpu_id(expected_gpu_id)
   {

@@ -120,9 +120,10 @@ void gpu_pipeline_task::execute()
   const auto* requested_memory_space =
     reservation != nullptr ? &reservation->get_memory_space() : nullptr;
   std::vector<cucascade::data_batch_processing_handle> processing_handles;
-  processing_handles.reserve(local_state._batches.size());
+  auto batches = local_state._batches.get_data_batches();
+  processing_handles.reserve(batches.size());
 
-  for (const auto& batch : local_state._batches) {
+  for (const auto& batch : batches) {
     auto handle = lock_or_prepare_batch(batch, requested_memory_space);
     if (!handle) {
       // Failed to lock (or convert) one of the batches. Caller can retry later.

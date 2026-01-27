@@ -202,11 +202,11 @@ void task_creator::worker_function(int worker_id)
         info->_pipeline->get_sink()->set_creator(this);
         // need to exhaust input batches until all ports are empty
         while (!node.get().all_ports_empty()) {
-          auto input_batch = node.get().get_input_batch();
+          auto input_data = node.get().get_input_batch();
           auto global_state =
             std::make_shared<pipeline::gpu_pipeline_task_global_state>(info->_pipeline);
           auto local_state =
-            std::make_unique<pipeline::gpu_pipeline_task_local_state>(input_batch, nullptr);
+            std::make_unique<pipeline::gpu_pipeline_task_local_state>(std::move(input_data), nullptr);
           auto task =
             std::make_unique<pipeline::gpu_pipeline_task>(get_next_task_id(),
                                                           info->destination_data_repositories,

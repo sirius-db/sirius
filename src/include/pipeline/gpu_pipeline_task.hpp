@@ -30,6 +30,10 @@
 #include <vector>
 
 namespace sirius {
+namespace op {
+class operator_data;
+}
+
 namespace pipeline {
 
 /**
@@ -66,18 +70,17 @@ class gpu_pipeline_task_local_state : public sirius::parallel::itask_local_state
   /**
    * @brief Construct a new gpu_pipeline_task_local_state object
    *
-   * @param batch_views Vector of data batches serving as input to the pipeline
+   * @param input_data Operator data containing input data batches for the pipeline
    * @param res Memory reservation for GPU resources
    */
   explicit gpu_pipeline_task_local_state(
-    std::vector<std::shared_ptr<cucascade::data_batch>> batches,
+    sirius::op::operator_data input_data,
     std::unique_ptr<cucascade::memory::reservation> res = nullptr)
-    : _batches(std::move(batches)), _reservation(std::move(res))
+    : _batches(std::move(input_data)), _reservation(std::move(res))
   {
   }
 
-  std::vector<std::shared_ptr<cucascade::data_batch>>
-    _batches;  ///< Input data batches for the pipeline
+  sirius::op::operator_data _batches;  ///< Input data batches for the pipeline
 
   void set_reservation(std::unique_ptr<cucascade::memory::reservation> res)
   {
