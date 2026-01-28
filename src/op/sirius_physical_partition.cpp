@@ -86,14 +86,6 @@ void sirius_physical_partition::get_partition_keys(sirius_physical_operator* op,
         _partition_keys.push_back(expr->Cast<duckdb::BoundReferenceExpression>().index);
       }
     }
-  } else if (op->type == duckdb::PhysicalOperatorType::TOP_N) {
-    auto& top_n_op = op->Cast<sirius_physical_top_n>();
-    for (size_t order_idx = 0; order_idx < top_n_op.orders.size(); order_idx++) {
-      auto& expr = top_n_op.orders[order_idx].expression;
-      if (expr->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
-        _partition_keys.push_back(expr->Cast<duckdb::BoundReferenceExpression>().index);
-      }
-    }
   }
 }
 

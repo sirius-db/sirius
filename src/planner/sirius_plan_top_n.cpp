@@ -17,6 +17,7 @@
 #include "duckdb/planner/operator/logical_top_n.hpp"
 #include "op/sirius_physical_top_n.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
+#include "planner/sirius_plan_utils.hpp"
 
 namespace sirius::planner {
 
@@ -27,15 +28,28 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalTopN& op)
 
   auto plan = create_plan(*op.children[0]);
 
-  auto top_n = duckdb::make_uniq<sirius::op::sirius_physical_top_n>(
+  auto merge_orders   = std::move(op.orders);
+  auto local_orders   = copy_order_nodes(merge_orders);
+  auto dynamic_filter = op.dynamic_filter;
+
+  auto local_top_n = duckdb::make_uniq<sirius::op::sirius_physical_top_n>(
     op.types,
-    std::move(op.orders),
+    std::move(local_orders),
     duckdb::NumericCast<duckdb::idx_t>(op.limit),
     duckdb::NumericCast<duckdb::idx_t>(op.offset),
-    std::move(op.dynamic_filter),
+    dynamic_filter,
     op.estimated_cardinality);
-  top_n->children.push_back(std::move(plan));
-  return std::move(top_n);
+  local_top_n->children.push_back(std::move(plan));
+
+  auto merge_top_n = duckdb::make_uniq<sirius::op::sirius_physical_top_n_merge>(
+    op.types,
+    std::move(merge_orders),
+    duckdb::NumericCast<duckdb::idx_t>(op.limit),
+    duckdb::NumericCast<duckdb::idx_t>(op.offset),
+    dynamic_filter,
+    op.estimated_cardinality);
+  merge_top_n->children.push_back(std::move(local_top_n));
+  return std::move(merge_top_n);
 }
 
 }  // namespace sirius::planner

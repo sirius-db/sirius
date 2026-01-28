@@ -46,19 +46,33 @@ std::shared_ptr<data_batch> make_batch(memory_space& space,
     space, order_vals, payload_vals, cudf::type_id::INT64, std::nullopt);
 }
 
+std::shared_ptr<data_batch> make_range_batch(memory_space& space,
+                                             int64_t start,
+                                             int64_t count,
+                                             int64_t payload_scale)
+{
+  std::vector<int64_t> order_vals;
+  std::vector<int64_t> payload_vals;
+  order_vals.reserve(count);
+  payload_vals.reserve(count);
+  for (int64_t i = 0; i < count; ++i) {
+    auto value = start + i;
+    order_vals.push_back(value);
+    payload_vals.push_back(value * payload_scale);
+  }
+  return make_batch(space, order_vals, payload_vals);
+}
+
 }  // namespace
 
-TEST_CASE("sirius_physical_top_n single-key uses top_k across multiple batches", "[physical_top_n]")
+TEST_CASE("sirius_physical_top_n single-key uses top_k per batch", "[physical_top_n]")
 {
   auto memory_manager = initialize_memory_manager();
   auto* space = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space);
 
   std::vector<std::shared_ptr<data_batch>> batches;
-  batches.push_back(make_batch(*space, {5, 1}, {50, 10}));
-  batches.push_back(make_batch(*space, {7, 3}, {70, 30}));
-  batches.push_back(make_batch(*space, {9}, {90}));
-  batches.push_back(make_batch(*space, {2, 8}, {20, 80}));
+  batches.push_back(make_batch(*space, {5, 1, 7, 3, 9, 2, 8}, {50, 10, 70, 30, 90, 20, 80}));
 
   duckdb::vector<duckdb::LogicalType> types;
   types.push_back(duckdb::LogicalType::BIGINT);  // order column
@@ -74,13 +88,10 @@ TEST_CASE("sirius_physical_top_n single-key uses top_k across multiple batches",
                              nullptr,
                              0);
 
-  // Feed in two batches, then two more, ensuring accumulation via internal state.
-  auto out1 = topn.execute({batches[0], batches[1]});
-  REQUIRE(out1.size() == 1);
-  auto out2 = topn.execute({batches[2], batches[3]});
-  REQUIRE(out2.size() == 1);
+  auto out = topn.execute({batches[0]});
+  REQUIRE(out.size() == 1);
 
-  auto table       = out2[0]->get_data()->cast<gpu_table_representation>().get_table();
+  auto table       = out[0]->get_data()->cast<gpu_table_representation>().get_table();
   auto view        = table.view();
   auto orders_out  = copy_column_to_host<int64_t>(view.column(0));
   auto payload_out = copy_column_to_host<int64_t>(view.column(1));
@@ -100,10 +111,7 @@ TEST_CASE("sirius_physical_top_n multi-key falls back to sort_by_key", "[physica
 
   // order by col0 desc, then col1 asc
   std::vector<std::shared_ptr<data_batch>> batches;
-  batches.push_back(make_batch(*space, {5, 5}, {2, 1}));
-  batches.push_back(make_batch(*space, {7, 7}, {3, 4}));
-  batches.push_back(make_batch(*space, {7, 6}, {1, 9}));
-  batches.push_back(make_batch(*space, {4, 8}, {5, 0}));
+  batches.push_back(make_batch(*space, {5, 5, 7, 7, 7, 6, 4, 8}, {2, 1, 3, 4, 1, 9, 5, 0}));
 
   duckdb::vector<duckdb::LogicalType> types;
   types.push_back(duckdb::LogicalType::BIGINT);  // order
@@ -120,12 +128,10 @@ TEST_CASE("sirius_physical_top_n multi-key falls back to sort_by_key", "[physica
                              nullptr,
                              0);
 
-  auto out1 = topn.execute({batches[0], batches[1]});
-  REQUIRE(out1.size() == 1);
-  auto out2 = topn.execute({batches[2], batches[3]});
-  REQUIRE(out2.size() == 1);
+  auto out = topn.execute({batches[0]});
+  REQUIRE(out.size() == 1);
 
-  auto table       = out2[0]->get_data()->cast<gpu_table_representation>().get_table();
+  auto table       = out[0]->get_data()->cast<gpu_table_representation>().get_table();
   auto view        = table.view();
   auto orders_out  = copy_column_to_host<int64_t>(view.column(0));
   auto payload_out = copy_column_to_host<int64_t>(view.column(1));
@@ -136,4 +142,100 @@ TEST_CASE("sirius_physical_top_n multi-key falls back to sort_by_key", "[physica
 
   REQUIRE(orders_out == expected_order);
   REQUIRE(payload_out == expected_payload);
+}
+
+TEST_CASE("sirius_physical_top_n_merge applies offset and limit", "[physical_top_n_merge]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+
+  std::vector<std::shared_ptr<data_batch>> batches;
+  batches.push_back(make_range_batch(*space, 0, 10, 10));
+  batches.push_back(make_range_batch(*space, 10, 10, 10));
+  batches.push_back(make_range_batch(*space, 20, 10, 10));
+
+  duckdb::vector<duckdb::LogicalType> types;
+  types.push_back(duckdb::LogicalType::BIGINT);
+  types.push_back(duckdb::LogicalType::BIGINT);
+
+  duckdb::vector<duckdb::BoundOrderByNode> orders;
+  orders.push_back(make_order(0, OrderType::DESCENDING));
+
+  sirius_physical_top_n_merge topn_merge(std::move(types),
+                                         std::move(orders),
+                                         /*limit=*/5,
+                                         /*offset=*/3,
+                                         nullptr,
+                                         0);
+
+  auto out = topn_merge.execute(batches);
+  REQUIRE(out.size() == 1);
+
+  auto table       = out[0]->get_data()->cast<gpu_table_representation>().get_table();
+  auto view        = table.view();
+  auto orders_out  = copy_column_to_host<int64_t>(view.column(0));
+  auto payload_out = copy_column_to_host<int64_t>(view.column(1));
+
+  std::vector<int64_t> expected_order{26, 25, 24, 23, 22};
+  std::vector<int64_t> expected_payload{260, 250, 240, 230, 220};
+
+  REQUIRE(orders_out == expected_order);
+  REQUIRE(payload_out == expected_payload);
+}
+
+TEST_CASE("sirius_physical_top_n_merge returns empty for limit 0", "[physical_top_n_merge]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+
+  std::vector<std::shared_ptr<data_batch>> batches;
+  batches.push_back(make_range_batch(*space, 0, 5, 1));
+  batches.push_back(make_range_batch(*space, 5, 5, 1));
+
+  duckdb::vector<duckdb::LogicalType> types;
+  types.push_back(duckdb::LogicalType::BIGINT);
+  types.push_back(duckdb::LogicalType::BIGINT);
+
+  duckdb::vector<duckdb::BoundOrderByNode> orders;
+  orders.push_back(make_order(0, OrderType::DESCENDING));
+
+  sirius_physical_top_n_merge topn_merge(std::move(types),
+                                         std::move(orders),
+                                         /*limit=*/0,
+                                         /*offset=*/2,
+                                         nullptr,
+                                         0);
+
+  auto out = topn_merge.execute(batches);
+  REQUIRE(out.empty());
+}
+
+TEST_CASE("sirius_physical_top_n_merge handles empty batches", "[physical_top_n_merge]")
+{
+  auto* space = get_default_gpu_space();
+  REQUIRE(space != nullptr);
+
+  std::vector<std::shared_ptr<data_batch>> batches;
+  batches.push_back(make_batch(*space, {}, {}));
+  batches.push_back(make_batch(*space, {}, {}));
+
+  duckdb::vector<duckdb::LogicalType> types;
+  types.push_back(duckdb::LogicalType::BIGINT);
+  types.push_back(duckdb::LogicalType::BIGINT);
+
+  duckdb::vector<duckdb::BoundOrderByNode> orders;
+  orders.push_back(make_order(0, OrderType::DESCENDING));
+
+  sirius_physical_top_n_merge topn_merge(std::move(types),
+                                         std::move(orders),
+                                         /*limit=*/3,
+                                         /*offset=*/0,
+                                         nullptr,
+                                         0);
+
+  auto out = topn_merge.execute(batches);
+  REQUIRE(out.size() == 1);
+
+  auto table = out[0]->get_data()->cast<gpu_table_representation>().get_table();
+  REQUIRE(table.num_rows() == 0);
 }

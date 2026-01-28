@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "scan/test_utils.hpp"
+
 #include <cudf/column/column_factories.hpp>
 #include <cudf/fixed_point/fixed_point.hpp>
 #include <cudf/null_mask.hpp>
@@ -34,7 +36,6 @@
 #include <data/sirius_converter_registry.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
 #include <utils/utils.hpp>
-#include "scan/test_utils.hpp"
 
 #include <optional>
 #include <type_traits>
@@ -131,9 +132,7 @@ inline std::vector<T> copy_column_to_host(const cudf::column_view& col)
 
 template <typename T>
 inline std::shared_ptr<cucascade::data_batch> make_numeric_batch(
-  cucascade::memory::memory_space& space,
-  const std::vector<T>& values,
-  cudf::type_id type_id)
+  cucascade::memory::memory_space& space, const std::vector<T>& values, cudf::type_id type_id)
 {
   auto mr     = get_resource_ref(space);
   auto stream = default_stream();
@@ -217,8 +216,7 @@ inline std::unique_ptr<cudf::column> make_string_column(const std::vector<std::s
 }
 
 inline std::shared_ptr<cucascade::data_batch> make_string_batch(
-  cucascade::memory::memory_space& space,
-  const std::vector<std::string>& values)
+  cucascade::memory::memory_space& space, const std::vector<std::string>& values)
 {
   auto mr     = get_resource_ref(space);
   auto stream = default_stream();
@@ -233,9 +231,7 @@ inline std::shared_ptr<cucascade::data_batch> make_string_batch(
 }
 
 inline std::shared_ptr<cucascade::data_batch> make_decimal64_batch(
-  cucascade::memory::memory_space& space,
-  const std::vector<int64_t>& values,
-  int32_t scale)
+  cucascade::memory::memory_space& space, const std::vector<int64_t>& values, int32_t scale)
 {
   auto mr     = get_resource_ref(space);
   auto stream = default_stream();
@@ -262,9 +258,7 @@ inline std::shared_ptr<cucascade::data_batch> make_decimal64_batch(
 
 template <typename T>
 inline std::shared_ptr<cucascade::data_batch> make_timestamp_batch(
-  cucascade::memory::memory_space& space,
-  const std::vector<T>& values,
-  cudf::type_id ts_type_id)
+  cucascade::memory::memory_space& space, const std::vector<T>& values, cudf::type_id ts_type_id)
 {
   auto mr     = get_resource_ref(space);
   auto stream = default_stream();
