@@ -69,7 +69,7 @@ class mock_sirius_physical_operator : public sirius_physical_operator {
    * When custom hint mode is enabled, get_next_task_hint() returns the
    * configured hint instead of computing one from ports.
    */
-  void set_custom_hint(sirius::creator::task_creation_hint hint)
+  void set_custom_hint(sirius::op::task_creation_hint hint)
   {
     _use_custom_hint = true;
     _custom_hint     = std::move(hint);
@@ -83,7 +83,7 @@ class mock_sirius_physical_operator : public sirius_physical_operator {
   /**
    * @brief Override to return configured hint when in custom mode.
    */
-  sirius::creator::task_creation_hint get_next_task_hint() override
+  sirius::op::task_creation_hint get_next_task_hint() override
   {
     if (_use_custom_hint) { return _custom_hint; }
     // Fall back to parent implementation
@@ -92,7 +92,7 @@ class mock_sirius_physical_operator : public sirius_physical_operator {
 
  private:
   bool _use_custom_hint;
-  sirius::creator::task_creation_hint _custom_hint;
+  sirius::op::task_creation_hint _custom_hint;
 };
 
 /**

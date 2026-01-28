@@ -102,27 +102,7 @@ void task_creator::reset()
   _priority_scans = std::queue<duckdb::shared_ptr<pipeline::sirius_pipeline>>{};
 }
 
-void task_creator::process_next_task(op::sirius_physical_operator* node)
-{
-  auto hint = node->get_next_task_hint();
-  // printf("Node %p provided hint of type %zu\n", node, hint.index());
-  if (std::holds_alternative<op::sirius_physical_operator*>(hint)) {
-    // printf("Processing next task for hint node %p\n", node);
-    auto* hint_node = std::get<op::sirius_physical_operator*>(hint);
-    auto pipeline   = hint_node->get_port("default")->dest_pipeline;
-    schedule(std::make_unique<task_creation_info>(hint_node, pipeline));
-  } else if (std::holds_alternative<duckdb::shared_ptr<pipeline::sirius_pipeline>>(hint)) {
-    auto pipeline = std::get<duckdb::shared_ptr<pipeline::sirius_pipeline>>(hint);
-    process_next_task(&pipeline->get_inner_operators()[0].get());
-  } else {
-    if (!_priority_scans.empty()) {
-      duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline = _priority_scans.front();
-      auto* scan_node                                        = pipeline->get_source().get();
-      schedule(std::make_unique<task_creation_info>(scan_node, pipeline));
-      _priority_scans.pop();
-    }
-  }
-}
+void task_creator::process_next_task(op::sirius_physical_operator* node) {}
 
 void task_creator::start()
 {
