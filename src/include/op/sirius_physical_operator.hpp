@@ -49,13 +49,18 @@ class sirius_meta_pipeline;
 
 namespace creator {
 class task_creator;
-using task_creation_hint = std::variant<std::monostate,
-                                        op::sirius_physical_operator*,
-                                        duckdb::shared_ptr<pipeline::sirius_pipeline>>;
 }  // namespace creator
 
 namespace op {
+
+enum class TaskCreationHint { WAITING_FOR_INPUT_DATA, READY };
+
 enum class MemoryBarrierType { PIPELINE, PARTIAL, FULL };
+
+struct task_creation_hint {
+  TaskCreationHint hint{TaskCreationHint::WAITING_FOR_INPUT_DATA};
+  sirius_physical_operator* producer{nullptr};
+};
 
 //! sirius_physical_operator is the base class of the physical operators present in the
 //! execution plan
@@ -215,8 +220,26 @@ class sirius_physical_operator {
     std::pair<sirius_physical_operator*, std::string_view> port_locator);
   //! Get the next ports after sink
   std::vector<std::pair<sirius_physical_operator*, std::string_view>>& get_next_port_after_sink();
+
   //! Get the next task hint
-  virtual creator::task_creation_hint get_next_task_hint();
+  virtual std::optional<task_creation_hint> get_next_task_hint();
+
+  /// \brief check if there are more tasks to create
+  /// \note not necessarily ready to create at the moment
+  /// the function is called
+  virtual bool has_more_tasks() const
+  {
+    throw std::runtime_error("has_more_tasks not implemented for operator " + get_name());
+    return true;
+  }
+
+  /// \brief check if all tasks have been processed
+  virtual bool has_processed_all_tasks() const
+  {
+    throw std::runtime_error("has_processed_all_tasks not implemented for operator " + get_name());
+    return true;
+  }
+
   //! Get the input batch
   std::vector<std::shared_ptr<::cucascade::data_batch>> get_input_batch();
   //! Check if all ports are empty
