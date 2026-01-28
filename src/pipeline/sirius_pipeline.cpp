@@ -28,7 +28,7 @@
 #include "duckdb/parallel/pipeline_event.hpp"
 #include "duckdb/parallel/pipeline_executor.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
-#include "gpu_executor.hpp"
+#include "sirius_engine.hpp"
 #include "log/logging.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
@@ -36,32 +36,31 @@
 namespace sirius {
 namespace pipeline {
 
-sirius_pipeline::sirius_pipeline(duckdb::GPUExecutor& executor_p)
-  : executor(executor_p), ready(false), initialized(false), source(nullptr), sink(nullptr)
+sirius_pipeline::sirius_pipeline()
+  : ready(false), initialized(false), source(nullptr), sink(nullptr)
 {
 }
 
-duckdb::ClientContext& sirius_pipeline::get_client_context() { return executor.context; }
+// duckdb::ClientContext& sirius_pipeline::get_client_context() { return context; }
 
-bool sirius_pipeline::is_order_dependent() const
-{
-  auto& config = duckdb::DBConfig::GetConfig(executor.context);
-  if (source) {
-    auto source_order = source->source_order();
-    if (source_order == duckdb::OrderPreservationType::FIXED_ORDER) { return true; }
-    if (source_order == duckdb::OrderPreservationType::NO_ORDER) { return false; }
-  }
-  for (auto& op_ref : operators) {
-    auto& op = op_ref.get();
-    if (op.operator_order() == duckdb::OrderPreservationType::NO_ORDER) { return false; }
-    if (op.operator_order() == duckdb::OrderPreservationType::FIXED_ORDER) { return true; }
-  }
-  if (!duckdb::DBConfig::GetSetting<duckdb::PreserveInsertionOrderSetting>(executor.context)) {
-    return false;
-  }
-  if (sink && sink->sink_order_dependent()) { return true; }
-  return false;
-}
+// bool sirius_pipeline::is_order_dependent() const
+// {
+//   if (source) {
+//     auto source_order = source->source_order();
+//     if (source_order == duckdb::OrderPreservationType::FIXED_ORDER) { return true; }
+//     if (source_order == duckdb::OrderPreservationType::NO_ORDER) { return false; }
+//   }
+//   for (auto& op_ref : operators) {
+//     auto& op = op_ref.get();
+//     if (op.operator_order() == duckdb::OrderPreservationType::NO_ORDER) { return false; }
+//     if (op.operator_order() == duckdb::OrderPreservationType::FIXED_ORDER) { return true; }
+//   }
+//   if (!duckdb::DBConfig::GetSetting<duckdb::PreserveInsertionOrderSetting>(context)) {
+//     return false;
+//   }
+//   if (sink && sink->sink_order_dependent()) { return true; }
+//   return false;
+// }
 
 void sirius_pipeline::reset_sink()
 {
@@ -158,11 +157,7 @@ sirius_pipeline::get_all_operators() const
 duckdb::vector<duckdb::reference<op::sirius_physical_operator>>
 sirius_pipeline::get_inner_operators()
 {
-  duckdb::vector<duckdb::reference<op::sirius_physical_operator>> result;
-  for (auto& op : operators) {
-    result.push_back(op.get());
-  }
-  return result;
+  return operators;
 }
 
 void sirius_pipeline::clear_source()
@@ -249,9 +244,9 @@ void sirius_pipeline_build_state::set_pipeline_operators(
 }
 
 duckdb::shared_ptr<sirius_pipeline> sirius_pipeline_build_state::create_child_pipeline(
-  duckdb::GPUExecutor& executor, sirius_pipeline& pipeline, op::sirius_physical_operator& op)
+  sirius_engine& engine, sirius_pipeline& pipeline, op::sirius_physical_operator& op)
 {
-  return executor.create_child_pipeline(pipeline, op);
+  return engine.create_child_pipeline(pipeline, op);
 }
 
 duckdb::vector<duckdb::reference<op::sirius_physical_operator>>

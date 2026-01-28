@@ -26,11 +26,9 @@
 // #include "duckdb/parallel/executor_task.hpp"
 #include "duckdb/parallel/pipeline.hpp"
 
-namespace duckdb {
-class GPUExecutor;
-}  // namespace duckdb
-
 namespace sirius {
+
+class sirius_engine;
 
 namespace op {
 class sirius_physical_operator;
@@ -63,7 +61,7 @@ class sirius_pipeline_build_state {
     sirius_pipeline& pipeline,
     duckdb::vector<duckdb::reference<op::sirius_physical_operator>> operators);
   void add_pipeline_operator(sirius_pipeline& pipeline, op::sirius_physical_operator& op);
-  duckdb::shared_ptr<sirius_pipeline> create_child_pipeline(duckdb::GPUExecutor& executor,
+  duckdb::shared_ptr<sirius_pipeline> create_child_pipeline(sirius_engine& engine,
                                                             sirius_pipeline& pipeline,
                                                             op::sirius_physical_operator& op);
 
@@ -75,18 +73,16 @@ class sirius_pipeline_build_state {
 
 //! The sirius_pipeline class represents an execution pipeline starting at a
 class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> {
-  friend class duckdb::GPUExecutor;
+  friend class ::sirius::sirius_engine;
   friend class sirius_pipeline_build_state;
   friend class sirius_meta_pipeline;
 
  public:
-  explicit sirius_pipeline(duckdb::GPUExecutor& execution_context);
+  explicit sirius_pipeline();
   virtual ~sirius_pipeline() = default;
 
-  duckdb::GPUExecutor& executor;
-
  public:
-  duckdb::ClientContext& get_client_context();
+  // duckdb::ClientContext& get_client_context();
 
   void add_dependency(duckdb::shared_ptr<sirius_pipeline>& pipeline);
 
@@ -147,7 +143,6 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
 
   //! The global source state
   duckdb::unique_ptr<duckdb::GlobalSourceState> source_state;
-
   //! The parent pipelines (i.e. pipelines that are dependent on this pipeline to finish)
   duckdb::vector<duckdb::weak_ptr<sirius_pipeline>> parents;
 
