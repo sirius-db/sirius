@@ -405,7 +405,7 @@ duckdb::unique_ptr<sirius_physical_operator> generate_gpu_plan(Connection& con,
   // GPUPendingStatementOrPreparedStatement does)
   auto gpu_collector =
     make_uniq_base<sirius_physical_result_collector, sirius_physical_materialized_collector>(
-      *g_gpu_prepared);
+      *g_gpu_prepared, gpu_context.client_context);
 
   con.Query("COMMIT TRANSACTION");
 

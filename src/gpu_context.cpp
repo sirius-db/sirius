@@ -118,7 +118,7 @@ unique_ptr<PendingQueryResult> GPUContext::GPUPendingStatementInternal(
 
   // Wrap the physical plan in a result collector
   unique_ptr<sirius::op::sirius_physical_result_collector> result_collector =
-    make_uniq<sirius::op::sirius_physical_materialized_collector>(*statement_p);
+    make_uniq<sirius::op::sirius_physical_materialized_collector>(*statement_p, context);
 
   if (result_collector->type != PhysicalOperatorType::RESULT_COLLECTOR) {
     return GPUErrorResult<PendingQueryResult>(ErrorData("Error in GPUPendingStatementInternal"));
