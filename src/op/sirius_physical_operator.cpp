@@ -23,6 +23,8 @@
 
 #include <cucascade/data/data_batch.hpp>
 
+#include <optional>
+
 namespace sirius {
 namespace op {
 
@@ -223,29 +225,42 @@ sirius_physical_operator::get_next_port_after_sink()
   return next_port_after_sink;
 }
 
-creator::task_creation_hint sirius_physical_operator::get_next_task_hint()
+std::optional<task_creation_hint> sirius_physical_operator::get_next_task_hint()
 {
-  for (auto& [port_name, port_ptr] : ports) {
-    if (port_ptr->type == MemoryBarrierType::PIPELINE) {
-      // For pipeline barrier: check if there is a data batch available
-      if (port_ptr->repo->size() == 0) {
-        // No data batch available, return src pipeline or monostate
-        if (port_ptr->src_pipeline) { return creator::task_creation_hint(port_ptr->src_pipeline); }
-        return creator::task_creation_hint(std::monostate{});
-      }
-    } else if (port_ptr->type == MemoryBarrierType::FULL) {
-      // For full barrier: src pipeline must be finished and have data
-      // We assume that there will be a data batch if the src pipeline is finished
-      if (!port_ptr->src_pipeline->is_pipeline_finished()) {
-        // Src pipeline not finished, return it to continue processing
-        return creator::task_creation_hint(port_ptr->src_pipeline);
-      }
-    }
+  if (ports.empty()) { return std::nullopt; }
+
+  // satify hard barriers first
+  auto unfinished_barrier = std::find_if(ports.begin(), ports.end(), [](const auto& port_pair) {
+    return port_pair.second->type == MemoryBarrierType::FULL && port_pair.second->src_pipeline &&
+           !port_pair.second->src_pipeline->is_pipeline_finished();
+  });
+
+  if (unfinished_barrier != ports.end()) {
+    auto* producer = &(unfinished_barrier->second->src_pipeline->get_inner_operators()[0].get());
+    return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
   }
 
-  // All ports are ready (either PIPELINE with data, or FULL with finished pipeline)
-  if (!ports.empty()) { return creator::task_creation_hint(this); }
-  return creator::task_creation_hint(std::monostate{});
+  // if they are complete, create data if you can
+  if (std::any_of(ports.begin(), ports.end(), [](const auto& port_pair) {
+        return port_pair.second->type != MemoryBarrierType::FULL &&
+               port_pair.second->repo->size() > 0;
+      })) {
+    return task_creation_hint{TaskCreationHint::READY, this};
+  }
+
+  // if not scan from dependent pipelines
+  auto unfinished_pipeline = std::find_if(ports.begin(), ports.end(), [](const auto& port_pair) {
+    return port_pair.second->type != MemoryBarrierType::FULL && port_pair.second->src_pipeline &&
+           !port_pair.second->src_pipeline->is_pipeline_finished();
+  });
+
+  if (unfinished_pipeline != ports.end()) {
+    auto* producer = &(unfinished_pipeline->second->src_pipeline->get_inner_operators()[0].get());
+    return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
+  }
+
+  // nothing to do
+  return std::nullopt;
 }
 
 std::vector<::std::shared_ptr<::cucascade::data_batch>> sirius_physical_operator::get_input_batch()
