@@ -181,10 +181,18 @@ void task_creator::worker_function(int worker_id)
           _duckdb_scan_executor,
           *_client_context,
           &info->_node->Cast<op::sirius_physical_table_scan>());
-        duckdb::ThreadContext thread_ctx(*_client_context);
-        duckdb::ExecutionContext exec_ctx(*_client_context, thread_ctx, nullptr);
+        // Create owned thread and execution contexts that will be moved into the local state
+        auto thread_ctx = std::make_unique<duckdb::ThreadContext>(*_client_context);
+        auto exec_ctx =
+          std::make_unique<duckdb::ExecutionContext>(*_client_context, *thread_ctx, nullptr);
         auto scan_task_local_state = std::make_unique<op::scan::duckdb_scan_task_local_state>(
-          *scan_task_global_state, exec_ctx);
+          *scan_task_global_state,
+          *exec_ctx,
+          duckdb::Config::DEFAULT_SCAN_TASK_BATCH_SIZE,
+          duckdb::Config::DEFAULT_SCAN_TASK_VARCHAR_SIZE,
+          nullptr,
+          std::move(thread_ctx),
+          std::move(exec_ctx));
         if (info->destination_data_repositories.empty()) {
           throw std::runtime_error(
             "No destination data repositories provided for scan task creation.");

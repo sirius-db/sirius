@@ -277,9 +277,13 @@ duckdb_scan_task_local_state::duckdb_scan_task_local_state(
   duckdb::ExecutionContext& exec_ctx,
   size_t approximate_batch_size,
   size_t default_varchar_size,
-  std::unique_ptr<duckdb::LocalTableFunctionState> existing_local_tf_state)
+  std::unique_ptr<duckdb::LocalTableFunctionState> existing_local_tf_state,
+  std::unique_ptr<duckdb::ThreadContext> owned_thread_ctx,
+  std::unique_ptr<duckdb::ExecutionContext> owned_exec_ctx)
   : _approximate_batch_size(approximate_batch_size),
     _default_varchar_size(default_varchar_size),
+    _thread_ctx(std::move(owned_thread_ctx)),
+    _exec_ctx_ptr(std::move(owned_exec_ctx)),
     _exec_ctx(exec_ctx)
 {
   auto const& op = g_state._op;
