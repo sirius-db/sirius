@@ -266,6 +266,7 @@ class task_creator {
   std::atomic<bool> _running;
   std::vector<std::thread> _threads;
   std::queue<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>> _priority_scans;
+  std::mutex _priority_scans_mutex;  ///< Protects _priority_scans queue
   std::unique_ptr<task_creation_queue> _task_creation_queue;
   sirius_pipeline_hashmap* _sirius_pipeline_map;
   ::duckdb::ClientContext* _client_context;
