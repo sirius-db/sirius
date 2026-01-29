@@ -445,6 +445,19 @@ class duckdb_scan_task : public sirius::pipeline::sirius_pipeline_itask {
    */
   void publish_output(std::vector<std::shared_ptr<cucascade::data_batch>> output_batches) override;
 
+  std::size_t get_estimated_reservation_size() override
+  {
+    /// TODO(amin)
+    return 0;
+  }
+
+  /// @brief Get the output consumer operators for this task.
+  std::vector<op::sirius_physical_operator*> get_output_consumers() override
+  {
+    /// TODO(amin)
+    return {};
+  }
+
   //===----------Fields----------===//
   shared_data_repository* _data_repo;  ///< Data repository to which to push batches
   uint64_t _task_id;                   ///< The unique id of this scan task

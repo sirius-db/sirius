@@ -106,13 +106,13 @@ void task_creator::process_next_task(op::sirius_physical_operator* node) {}
 
 void task_creator::start()
 {
-  start_thread_pool();
-  while (!_priority_scans.empty()) {
-    duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline = _priority_scans.front();
-    auto* scan_node                                        = pipeline->get_source().get();
-    schedule(std::make_unique<task_creation_info>(scan_node, pipeline));
-    _priority_scans.pop();
-  }
+  // start_thread_pool();
+  // while (!_priority_scans.empty()) {
+  //   duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline = _priority_scans.front();
+  //   auto* scan_node                                        = pipeline->get_source().get();
+  //   schedule(std::make_unique<task_creation_info>(scan_node, pipeline));
+  //   _priority_scans.pop();
+  // }
 }
 
 void task_creator::stop() { stop_thread_pool(); }
@@ -139,67 +139,67 @@ void task_creator::stop_thread_pool()
   _threads.clear();
 }
 
-void task_creator::schedule(std::unique_ptr<task_creation_info> info)
+void task_creator::schedule(op::sirius_physical_operator* node)
 {
-  _task_creation_queue->push(std::move(info));
+  // _task_creation_queue->push(std::move(info));
 }
 
 void task_creator::worker_function(int worker_id)
 {
-  while (_running.load()) {
-    std::unique_ptr<task_creation_info> info = _task_creation_queue->pull();
-    if (info == nullptr) {
-      // Task queue is closed.
-      break;
-    }
-    try {
-      // scheduling scan task
-      if (info->_node->type == ::duckdb::PhysicalOperatorType::TABLE_SCAN) {
-        info->_pipeline->get_source()->set_creator(this);
-        auto scan_task_global_state = std::make_shared<op::scan::duckdb_scan_task_global_state>(
-          info->_pipeline,
-          _duckdb_scan_executor,
-          *_client_context,
-          &info->_node->Cast<op::sirius_physical_table_scan>());
-        duckdb::ThreadContext thread_ctx(*_client_context);
-        duckdb::ExecutionContext exec_ctx(*_client_context, thread_ctx, nullptr);
-        auto scan_task_local_state = std::make_unique<op::scan::duckdb_scan_task_local_state>(
-          *scan_task_global_state, exec_ctx);
-        if (info->destination_data_repositories.empty()) {
-          throw std::runtime_error(
-            "No destination data repositories provided for scan task creation.");
-        }
-        auto scan_task =
-          std::make_unique<op::scan::duckdb_scan_task>(get_next_task_id(),
-                                                       info->destination_data_repositories[0],
-                                                       std::move(scan_task_local_state),
-                                                       std::move(scan_task_global_state));
-        _duckdb_scan_executor.schedule(std::move(scan_task));
-        // scheduling pipeline task
-      } else {
-        duckdb::reference<sirius::op::sirius_physical_operator> node =
-          info->_pipeline->get_inner_operators()[0];
-        info->_pipeline->get_sink()->set_creator(this);
-        // need to exhaust input batches until all ports are empty
-        while (!node.get().all_ports_empty()) {
-          auto input_batch = node.get().get_input_batch();
-          auto global_state =
-            std::make_shared<pipeline::gpu_pipeline_task_global_state>(info->_pipeline);
-          auto local_state =
-            std::make_unique<pipeline::gpu_pipeline_task_local_state>(input_batch, nullptr);
-          auto task =
-            std::make_unique<pipeline::gpu_pipeline_task>(get_next_task_id(),
-                                                          info->destination_data_repositories,
-                                                          std::move(local_state),
-                                                          std::move(global_state));
-          _pipeline_executor.schedule(std::move(task));
-        }
-      }
+  // while (_running.load()) {
+  //   std::unique_ptr<task_creation_info> info = _task_creation_queue->pull();
+  //   if (info == nullptr) {
+  //     // Task queue is closed.
+  //     break;
+  //   }
+  //   try {
+  //     // scheduling scan task
+  //     if (info->_node->type == ::duckdb::PhysicalOperatorType::TABLE_SCAN) {
+  //       info->_pipeline->get_source()->set_creator(this);
+  //       auto scan_task_global_state = std::make_shared<op::scan::duckdb_scan_task_global_state>(
+  //         info->_pipeline,
+  //         _duckdb_scan_executor,
+  //         *_client_context,
+  //         &info->_node->Cast<op::sirius_physical_table_scan>());
+  //       duckdb::ThreadContext thread_ctx(*_client_context);
+  //       duckdb::ExecutionContext exec_ctx(*_client_context, thread_ctx, nullptr);
+  //       auto scan_task_local_state = std::make_unique<op::scan::duckdb_scan_task_local_state>(
+  //         *scan_task_global_state, exec_ctx);
+  //       if (info->destination_data_repositories.empty()) {
+  //         throw std::runtime_error(
+  //           "No destination data repositories provided for scan task creation.");
+  //       }
+  //       auto scan_task =
+  //         std::make_unique<op::scan::duckdb_scan_task>(get_next_task_id(),
+  //                                                      info->destination_data_repositories[0],
+  //                                                      std::move(scan_task_local_state),
+  //                                                      std::move(scan_task_global_state));
+  //       _duckdb_scan_executor.schedule(std::move(scan_task));
+  //       // scheduling pipeline task
+  //     } else {
+  //       duckdb::reference<sirius::op::sirius_physical_operator> node =
+  //         info->_pipeline->get_inner_operators()[0];
+  //       info->_pipeline->get_sink()->set_creator(this);
+  //       // need to exhaust input batches until all ports are empty
+  //       while (!node.get().all_ports_empty()) {
+  //         auto input_batch = node.get().get_input_batch();
+  //         auto global_state =
+  //           std::make_shared<pipeline::gpu_pipeline_task_global_state>(info->_pipeline);
+  //         auto local_state =
+  //           std::make_unique<pipeline::gpu_pipeline_task_local_state>(input_batch, nullptr);
+  //         auto task =
+  //           std::make_unique<pipeline::gpu_pipeline_task>(get_next_task_id(),
+  //                                                         info->destination_data_repositories,
+  //                                                         std::move(local_state),
+  //                                                         std::move(global_state));
+  //         _pipeline_executor.schedule(std::move(task));
+  //       }
+  //     }
 
-    } catch (const std::exception& e) {
-      stop();
-    }
-  }
+  //   } catch (const std::exception& e) {
+  //     stop();
+  //   }
+  // }
 }
 
 void task_creator::on_start() { _task_creation_queue->open(); }
