@@ -461,7 +461,10 @@ void GPUExecutor::execute()
     } else {
       auto& task_creator = sirius_context->get_task_creator();
       task_creator.set_pipeline_hashmap(sirius_pipeline_map);
+      task_creator.set_client_context(context);
       task_creator.start();
+      auto& duckdb_scan_executor = sirius_context->get_duckdb_scan_executor();
+      duckdb_scan_executor.start();
     }
   }
 }
