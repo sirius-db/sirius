@@ -91,7 +91,7 @@ class itask {
   // Execution function.
   virtual void execute() = 0;
 
-  protected:
+ protected:
   std::unique_ptr<itask_local_state> _local_state;
   std::shared_ptr<itask_global_state> _global_state;
 };
