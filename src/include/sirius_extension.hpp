@@ -27,7 +27,7 @@ class SiriusExtension : public Extension {
   std::string Name() override;
   std::string Version() const override;
   static void InitialGPUConfigs(DBConfig& db);
-  static void RegisterGPUFunctions(ClientContext& context);
+  static void RegisterGPUFunctions(DatabaseInstance& catalog);
   static void GPUProcessingSubstraitFunction(ClientContext& context,
                                              TableFunctionInput& data_p,
                                              DataChunk& output);

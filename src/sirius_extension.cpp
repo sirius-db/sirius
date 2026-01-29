@@ -571,25 +571,23 @@ void SiriusExtension::GPUBufferInitFunction(ClientContext& context,
   data.finished = true;
 }
 
-void SiriusExtension::RegisterGPUFunctions(ClientContext& context)
+void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
 {
-  auto& catalog = Catalog::GetSystemCatalog(context);
-
+  auto transaction = CatalogTransaction::GetSystemTransaction(instance);
+  auto& catalog    = Catalog::GetSystemCatalog(instance);
   TableFunction gpu_buffer_init("gpu_buffer_init",
                                 {LogicalType::VARCHAR, LogicalType::VARCHAR},
                                 GPUBufferInitFunction,
                                 GPUBufferInitBind);
   gpu_buffer_init.named_parameters[PINNED_MEMORY_PARAM_KEY] = LogicalType::VARCHAR;
   CreateTableFunctionInfo gpu_buffer_init_info(gpu_buffer_init);
-  catalog.CreateTableFunction(context, gpu_buffer_init_info);
+  catalog.CreateTableFunction(transaction, gpu_buffer_init_info);
 
-  TableFunction gpu_processing("gpu_processing",
-                               {LogicalType::VARCHAR},
-                               GPUProcessingFunction,
-                               SiriusExtension::GPUProcessingBind);
+  TableFunction gpu_processing(
+    "gpu_processing", {LogicalType::VARCHAR}, GPUProcessingFunction, GPUProcessingBind);
   gpu_processing.named_parameters["enable_optimizer"] = LogicalType::BOOLEAN;
   CreateTableFunctionInfo gpu_processing_info(gpu_processing);
-  catalog.CreateTableFunction(context, gpu_processing_info);
+  catalog.CreateTableFunction(transaction, gpu_processing_info);
 
   TableFunction gpu_execution("gpu_execution",
                                {LogicalType::VARCHAR},
@@ -597,7 +595,7 @@ void SiriusExtension::RegisterGPUFunctions(ClientContext& context)
                                SiriusExtension::GPUExecutionBind);
   gpu_execution.named_parameters["enable_optimizer"] = LogicalType::BOOLEAN;
   CreateTableFunctionInfo gpu_execution_info(gpu_execution);
-  catalog.CreateTableFunction(context, gpu_execution_info);
+  catalog.CreateTableFunction(transaction, gpu_execution_info);
 }
 
 static void SetUsePinMemory(ClientContext& context, SetScope scope, Value& parameter)
@@ -765,16 +763,12 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
 
 static void LoadInternal(ExtensionLoader& loader)
 {
-  DuckDB db(loader.GetDatabaseInstance());
-  auto& config = DBConfig::GetConfig(loader.GetDatabaseInstance());
+  auto& db     = loader.GetDatabaseInstance();
+  auto& config = DBConfig::GetConfig(db);
   config.extension_callbacks.push_back(make_uniq<duckdb::SiriusContextExtensionCallback>());
   sirius::converter_registry::initialize();
   SiriusExtension::InitialGPUConfigs(config);
-
-  Connection con(db);
-  con.BeginTransaction();
-  SiriusExtension::RegisterGPUFunctions(*con.context);
-  con.Commit();
+  SiriusExtension::RegisterGPUFunctions(db);
 }
 
 void SiriusExtension::Load(ExtensionLoader& loader) { LoadInternal(loader); }
