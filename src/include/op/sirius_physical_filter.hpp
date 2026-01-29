@@ -26,7 +26,7 @@ namespace op {
 //! adds a selection vector to the chunk.
 class sirius_physical_filter : public sirius_physical_operator {
  public:
-  static constexpr const duckdb::PhysicalOperatorType TYPE = duckdb::PhysicalOperatorType::FILTER;
+  static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::FILTER;
 
  public:
   sirius_physical_filter(duckdb::vector<duckdb::LogicalType> types,

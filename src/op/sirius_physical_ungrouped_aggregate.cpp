@@ -49,7 +49,7 @@ sirius_physical_ungrouped_aggregate::sirius_physical_ungrouped_aggregate(
   duckdb::idx_t estimated_cardinality,
   duckdb::TupleDataValidityType distinct_validity)
   : sirius_physical_operator(
-      duckdb::PhysicalOperatorType::UNGROUPED_AGGREGATE, std::move(types), estimated_cardinality),
+      SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE, std::move(types), estimated_cardinality),
     aggregates(std::move(expressions))
 {
   distinct_collection_info = duckdb::DistinctAggregateCollectionInfo::Create(aggregates);

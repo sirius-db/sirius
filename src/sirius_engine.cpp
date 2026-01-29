@@ -132,7 +132,7 @@ duckdb::shared_ptr<pipeline::sirius_pipeline> sirius_engine::create_child_pipeli
 
 bool sirius_engine::has_result_collector()
 {
-  return sirius_physical_plan->type == duckdb::PhysicalOperatorType::RESULT_COLLECTOR;
+  return sirius_physical_plan->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR;
 }
 
 duckdb::unique_ptr<duckdb::QueryResult> sirius_engine::get_result()
@@ -240,7 +240,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
         to_schedule[to_schedule.size() - 1 - meta]->get_pipelines(pipeline_inside, false);
         for (int pipeline_idx = 0; pipeline_idx < pipeline_inside.size(); pipeline_idx++) {
           auto& pipeline = pipeline_inside[pipeline_idx];
-          if (pipeline_inside[pipeline_idx]->source->type == duckdb::PhysicalOperatorType::HASH_JOIN) {
+          if (pipeline_inside[pipeline_idx]->source->type == op::SiriusPhysicalOperatorType::HASH_JOIN) {
             auto& temp = pipeline_inside[pipeline_idx]
                            ->source.get()
                            ->Cast<op::sirius_physical_hash_join>();
@@ -299,30 +299,30 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
         duckdb::vector<duckdb::idx_t> join_positions;
 
         for (duckdb::idx_t op_idx = 0; op_idx < current_pipeline->operators.size(); op_idx++) {
-          if (current_pipeline->operators[op_idx].get().type == duckdb::PhysicalOperatorType::HASH_JOIN ||
+          if (current_pipeline->operators[op_idx].get().type == op::SiriusPhysicalOperatorType::HASH_JOIN ||
               current_pipeline->operators[op_idx].get().type ==
-                duckdb::PhysicalOperatorType::NESTED_LOOP_JOIN) {
+                op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
             join_positions.push_back(op_idx);
           }
         }
 
         bool group_agg_sort_topn_sink = false;
-        if (current_pipeline->sink->type == duckdb::PhysicalOperatorType::HASH_GROUP_BY ||
-            current_pipeline->sink->type == duckdb::PhysicalOperatorType::ORDER_BY ||
-            current_pipeline->sink->type == duckdb::PhysicalOperatorType::TOP_N ||
-            current_pipeline->sink->type == duckdb::PhysicalOperatorType::UNGROUPED_AGGREGATE) {
+        if (current_pipeline->sink->type == op::SiriusPhysicalOperatorType::HASH_GROUP_BY ||
+            current_pipeline->sink->type == op::SiriusPhysicalOperatorType::ORDER_BY ||
+            current_pipeline->sink->type == op::SiriusPhysicalOperatorType::TOP_N ||
+            current_pipeline->sink->type == op::SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE) {
           group_agg_sort_topn_sink = true;
         }
 
         bool join_sink = false;
-        if (current_pipeline->sink->type == duckdb::PhysicalOperatorType::HASH_JOIN ||
-            current_pipeline->sink->type == duckdb::PhysicalOperatorType::NESTED_LOOP_JOIN) {
+        if (current_pipeline->sink->type == op::SiriusPhysicalOperatorType::HASH_JOIN ||
+            current_pipeline->sink->type == op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
           join_sink = true;
         }
 
         bool right_left_delim_join_sink = false;
-        if (current_pipeline->sink->type == duckdb::PhysicalOperatorType::LEFT_DELIM_JOIN ||
-            current_pipeline->sink->type == duckdb::PhysicalOperatorType::RIGHT_DELIM_JOIN) {
+        if (current_pipeline->sink->type == op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN ||
+            current_pipeline->sink->type == op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
           right_left_delim_join_sink = true;
         }
 
@@ -463,14 +463,14 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
           auto& distinct_op = delim_join->Cast<op::sirius_physical_delim_join>().distinct;
 
           duckdb::unique_ptr<op::sirius_physical_partition> partition_join;
-          if (delim_join->type == duckdb::PhysicalOperatorType::RIGHT_DELIM_JOIN) {
+          if (delim_join->type == op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
             if (current_pipeline->operators.size() == 0) {
               // source -> partition -> hash join
               partition_join = make_uniq<op::sirius_physical_partition>(
                 current_pipeline->get_source()->types,
                 current_pipeline->get_source()->estimated_cardinality,
                 join_op.get(),
-                delim_join->type == duckdb::PhysicalOperatorType::RIGHT_DELIM_JOIN);
+                delim_join->type == op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN);
             } else {
               partition_join = make_uniq<op::sirius_physical_partition>(
                 current_pipeline->operators[current_pipeline->operators.size() - 1].get().types,
@@ -478,7 +478,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
                   .get()
                   .estimated_cardinality,
                 join_op.get(),
-                delim_join->type == duckdb::PhysicalOperatorType::RIGHT_DELIM_JOIN);
+                delim_join->type == op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN);
             }
             delim_join->Cast<op::sirius_physical_delim_join>().partition_join =
               static_cast<op::sirius_physical_partition*>(partition_join.get());
@@ -527,16 +527,16 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
 
       // add data repositories and ports
       for (size_t i = 0; i < new_scheduled.size(); i++) {
-        if (new_scheduled[i]->sink->type == duckdb::PhysicalOperatorType::HASH_GROUP_BY ||
-            new_scheduled[i]->sink->type == duckdb::PhysicalOperatorType::ORDER_BY ||
-            new_scheduled[i]->sink->type == duckdb::PhysicalOperatorType::TOP_N ||
-            new_scheduled[i]->sink->type == duckdb::PhysicalOperatorType::UNGROUPED_AGGREGATE) {
+        if (new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::HASH_GROUP_BY ||
+            new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::ORDER_BY ||
+            new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::TOP_N ||
+            new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE) {
           auto sink_op             = new_scheduled[i]->get_sink().get();
           std::string_view port_id = "default";
           for (auto dependent_pipeline : source_to_pipelines[sink_op]) {
             insert_repository(port_id, new_scheduled[i], dependent_pipeline);
           }
-        } else if (new_scheduled[i]->sink->type == duckdb::PhysicalOperatorType::CTE) {
+        } else if (new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::CTE) {
           auto& cte_op = new_scheduled[i]->get_sink()->Cast<op::sirius_physical_cte>();
           std::string_view port_id = "default";
           for (auto cte_scan : cte_op.cte_scans) {
@@ -544,7 +544,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
               insert_repository(port_id, new_scheduled[i], dependent_pipeline);
             }
           }
-        } else if (new_scheduled[i]->sink->type == duckdb::PhysicalOperatorType::RIGHT_DELIM_JOIN) {
+        } else if (new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
           auto delim_join = new_scheduled[i]->get_sink();
           auto partition_join =
             delim_join->Cast<op::sirius_physical_delim_join>().partition_join;
@@ -568,7 +568,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
           for (auto dependent_pipeline : source_to_pipelines[partition_distinct]) {
             insert_repository("default", partition_distinct, new_scheduled[i], dependent_pipeline);
           }
-        } else if (new_scheduled[i]->sink->type == duckdb::PhysicalOperatorType::LEFT_DELIM_JOIN) {
+        } else if (new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN) {
           auto delim_join = new_scheduled[i]->get_sink();
           auto partition_distinct =
             delim_join->Cast<op::sirius_physical_delim_join>().partition_distinct;
@@ -580,7 +580,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
           for (auto dependent_pipeline : source_to_pipelines[column_data_scan]) {
             insert_repository("default", column_data_scan, new_scheduled[i], dependent_pipeline);
           }
-        } else if (new_scheduled[i]->sink->type == duckdb::PhysicalOperatorType::INVALID) {
+        } else if (new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::INVALID) {
           auto& partition =
             new_scheduled[i]->get_sink()->Cast<op::sirius_physical_partition>();
           std::string_view port_id = partition.is_build_partition() ? "build" : "default";
@@ -611,7 +611,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
               insert_repository(port_id, new_scheduled[i], dependent_pipeline);
             }
           }
-        } else if (new_scheduled[i]->sink->type == duckdb::PhysicalOperatorType::RESULT_COLLECTOR) {
+        } else if (new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
           std::string_view port_id = "final";
           size_t sink_op_id        = get_operator_id(new_scheduled[i]->get_sink().get());
           data_repo_manager->add_new_repository(
@@ -627,7 +627,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
           throw std::runtime_error("Unsupported sink type for modified pipeline");
         }
 
-        if (new_scheduled[i]->source->type == duckdb::PhysicalOperatorType::TABLE_SCAN) {
+        if (new_scheduled[i]->source->type == op::SiriusPhysicalOperatorType::TABLE_SCAN) {
           std::unique_ptr<::cucascade::shared_data_repository> repo =
             std::make_unique<::cucascade::shared_data_repository>();
           std::string port_id = "scan";
@@ -652,7 +652,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
         for (size_t j = 0; j < pipeline->operators.size(); j++) {
           SIRIUS_LOG_DEBUG(" Op {}", pipeline->operators[j].get().get_name());
         }
-        if (pipeline->sink->type == duckdb::PhysicalOperatorType::RIGHT_DELIM_JOIN) {
+        if (pipeline->sink->type == op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
           auto delim_join = pipeline->get_sink();
           auto partition_join =
             delim_join->Cast<op::sirius_physical_delim_join>().partition_join;
@@ -674,7 +674,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
             }
             SIRIUS_LOG_DEBUG("{}", msg);
           }
-        } else if (pipeline->sink->type == duckdb::PhysicalOperatorType::LEFT_DELIM_JOIN) {
+        } else if (pipeline->sink->type == op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN) {
           auto delim_join = pipeline->get_sink();
           auto column_data_scan =
             delim_join->Cast<op::sirius_physical_delim_join>().join->children[0].get();
@@ -696,12 +696,12 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
             }
             SIRIUS_LOG_DEBUG("{}", msg);
           }
-        } else if (pipeline->sink->type == duckdb::PhysicalOperatorType::HASH_GROUP_BY ||
-                   pipeline->sink->type == duckdb::PhysicalOperatorType::ORDER_BY ||
-                   pipeline->sink->type == duckdb::PhysicalOperatorType::TOP_N ||
-                   pipeline->sink->type == duckdb::PhysicalOperatorType::UNGROUPED_AGGREGATE ||
-                   pipeline->sink->type == duckdb::PhysicalOperatorType::INVALID ||
-                   pipeline->sink->type == duckdb::PhysicalOperatorType::CTE) {
+        } else if (pipeline->sink->type == op::SiriusPhysicalOperatorType::HASH_GROUP_BY ||
+                   pipeline->sink->type == op::SiriusPhysicalOperatorType::ORDER_BY ||
+                   pipeline->sink->type == op::SiriusPhysicalOperatorType::TOP_N ||
+                   pipeline->sink->type == op::SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE ||
+                   pipeline->sink->type == op::SiriusPhysicalOperatorType::INVALID ||
+                   pipeline->sink->type == op::SiriusPhysicalOperatorType::CTE) {
           std::string msg = "Sink " + pipeline->sink->get_name() + " next op after sink: ";
           for (auto next_port : pipeline->sink->get_next_port_after_sink()) {
             msg += next_port.first->get_name() + " ";

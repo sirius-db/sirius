@@ -38,7 +38,7 @@ sirius_physical_filter::sirius_physical_filter(
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> select_list,
   duckdb::idx_t estimated_cardinality)
   : sirius_physical_operator(
-      duckdb::PhysicalOperatorType::FILTER, std::move(types), estimated_cardinality)
+      SiriusPhysicalOperatorType::FILTER, std::move(types), estimated_cardinality)
 {
   D_ASSERT(select_list.size() > 0);
   if (select_list.size() > 1) {

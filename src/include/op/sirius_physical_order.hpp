@@ -24,7 +24,7 @@ namespace op {
 
 class sirius_physical_order : public sirius_physical_operator {
  public:
-  static constexpr const duckdb::PhysicalOperatorType TYPE = duckdb::PhysicalOperatorType::ORDER_BY;
+  static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::ORDER_BY;
 
  public:
   sirius_physical_order(duckdb::vector<duckdb::LogicalType> types,

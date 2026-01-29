@@ -30,7 +30,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalColumnDataGet& op)
 
   return duckdb::make_uniq<sirius::op::sirius_physical_column_data_scan>(
     op.types,
-    duckdb::PhysicalOperatorType::COLUMN_DATA_SCAN,
+    sirius::op::SiriusPhysicalOperatorType::COLUMN_DATA_SCAN,
     op.estimated_cardinality,
     std::move(op.collection));
 }

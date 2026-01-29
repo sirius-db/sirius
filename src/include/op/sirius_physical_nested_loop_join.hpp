@@ -38,8 +38,8 @@ namespace op {
 //! sirius_physical_nested_loop_join represents a nested loop join between two tables
 class sirius_physical_nested_loop_join : public sirius_physical_operator {
  public:
-  static constexpr const duckdb::PhysicalOperatorType TYPE =
-    duckdb::PhysicalOperatorType::NESTED_LOOP_JOIN;
+  static constexpr const SiriusPhysicalOperatorType TYPE =
+    SiriusPhysicalOperatorType::NESTED_LOOP_JOIN;
 
  public:
   sirius_physical_nested_loop_join(

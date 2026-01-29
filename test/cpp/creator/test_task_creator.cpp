@@ -57,7 +57,7 @@ using sirius::sirius_pipeline_hashmap;
 class mock_sirius_physical_operator : public sirius_physical_operator {
  public:
   mock_sirius_physical_operator(
-    duckdb::PhysicalOperatorType op_type = duckdb::PhysicalOperatorType::PROJECTION)
+    SiriusPhysicalOperatorType op_type = SiriusPhysicalOperatorType::PROJECTION)
     : sirius_physical_operator(op_type, {}, 0),
       _use_custom_hint(false),
       _custom_hint(std::monostate{})
@@ -529,7 +529,7 @@ TEST_CASE("process_next_task with monostate hint uses priority_scans", "[task_cr
 
   // Create a mock scan operator
   auto scan_op =
-    std::make_unique<mock_sirius_physical_operator>(duckdb::PhysicalOperatorType::TABLE_SCAN);
+    std::make_unique<mock_sirius_physical_operator>(SiriusPhysicalOperatorType::TABLE_SCAN);
 
   // We need to create a pipeline that has this as a source
   // This is complex because sirius_pipeline requires sirius_engine

@@ -35,7 +35,7 @@ sirius_physical_streaming_limit::sirius_physical_streaming_limit(
   duckdb::idx_t estimated_cardinality,
   bool parallel)
   : sirius_physical_operator(
-      duckdb::PhysicalOperatorType::STREAMING_LIMIT, std::move(types), estimated_cardinality),
+      SiriusPhysicalOperatorType::STREAMING_LIMIT, std::move(types), estimated_cardinality),
     limit_val(std::move(limit_val_p)),
     offset_val(std::move(offset_val_p)),
     parallel(parallel)

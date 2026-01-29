@@ -94,7 +94,7 @@ void task_creator::set_pipeline_hashmap(sirius_pipeline_hashmap& sirius_pipeline
 {
   _sirius_pipeline_map = &sirius_pipeline_map;
   for (const auto& i : _sirius_pipeline_map->_vec) {
-    if (i->get_source()->type == ::duckdb::PhysicalOperatorType::TABLE_SCAN) {
+    if (i->get_source()->type == op::SiriusPhysicalOperatorType::TABLE_SCAN) {
       _priority_scans.push(i);
     }
   }
@@ -177,7 +177,7 @@ void task_creator::worker_function(int worker_id)
     }
     try {
       // scheduling scan task
-      if (info->_node->type == ::duckdb::PhysicalOperatorType::TABLE_SCAN) {
+      if (info->_node->type == op::SiriusPhysicalOperatorType::TABLE_SCAN) {
         info->_pipeline->get_source()->set_creator(this);
         auto scan_task_global_state = std::make_shared<op::scan::duckdb_scan_task_global_state>(
           info->_pipeline,

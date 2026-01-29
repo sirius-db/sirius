@@ -89,7 +89,7 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
   duckdb::TupleDataValidityType group_validity,
   duckdb::TupleDataValidityType distinct_validity)
   : sirius_physical_operator(
-      duckdb::PhysicalOperatorType::HASH_GROUP_BY, std::move(types), estimated_cardinality),
+      SiriusPhysicalOperatorType::HASH_GROUP_BY, std::move(types), estimated_cardinality),
     grouping_sets(std::move(grouping_sets_p))
 {
   // get a list of all aggregates to be computed

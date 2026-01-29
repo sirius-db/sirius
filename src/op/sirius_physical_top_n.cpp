@@ -130,7 +130,7 @@ sirius_physical_top_n::sirius_physical_top_n(
   duckdb::shared_ptr<duckdb::DynamicFilterData> dynamic_filter_p,
   duckdb::idx_t estimated_cardinality)
   : sirius_physical_operator(
-      duckdb::PhysicalOperatorType::TOP_N, std::move(types_p), estimated_cardinality),
+      SiriusPhysicalOperatorType::TOP_N, std::move(types_p), estimated_cardinality),
     orders(std::move(orders)),
     limit(limit),
     offset(offset),

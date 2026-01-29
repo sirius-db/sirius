@@ -37,7 +37,7 @@ sirius_physical_cte::sirius_physical_cte(std::string ctename,
                                          duckdb::unique_ptr<sirius_physical_operator> bottom,
                                          duckdb::idx_t estimated_cardinality)
   : sirius_physical_operator(
-      duckdb::PhysicalOperatorType::CTE, std::move(types), estimated_cardinality),
+      SiriusPhysicalOperatorType::CTE, std::move(types), estimated_cardinality),
     table_index(table_index),
     ctename(std::move(ctename))
 {

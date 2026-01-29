@@ -37,7 +37,7 @@ class sirius_physical_grouped_aggregate;
 class sirius_physical_delim_join : public sirius_physical_operator {
  public:
   sirius_physical_delim_join(
-    duckdb::PhysicalOperatorType type,
+    SiriusPhysicalOperatorType type,
     duckdb::vector<duckdb::LogicalType> types,
     duckdb::unique_ptr<sirius_physical_operator> original_join,
     duckdb::vector<duckdb::const_reference<sirius_physical_operator>> delim_scans,
@@ -68,8 +68,8 @@ class sirius_physical_delim_join : public sirius_physical_operator {
 //! and pushed into a PhysicalColumnDataScan in the LHS.
 class sirius_physical_right_delim_join : public sirius_physical_delim_join {
  public:
-  static constexpr const duckdb::PhysicalOperatorType TYPE =
-    duckdb::PhysicalOperatorType::RIGHT_DELIM_JOIN;
+  static constexpr const SiriusPhysicalOperatorType TYPE =
+    SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN;
 
  public:
   sirius_physical_right_delim_join(
@@ -86,8 +86,8 @@ class sirius_physical_right_delim_join : public sirius_physical_delim_join {
 
 class sirius_physical_left_delim_join : public sirius_physical_delim_join {
  public:
-  static constexpr const duckdb::PhysicalOperatorType TYPE =
-    duckdb::PhysicalOperatorType::LEFT_DELIM_JOIN;
+  static constexpr const SiriusPhysicalOperatorType TYPE =
+    SiriusPhysicalOperatorType::LEFT_DELIM_JOIN;
 
  public:
   sirius_physical_left_delim_join(

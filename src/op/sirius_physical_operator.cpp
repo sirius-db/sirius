@@ -73,7 +73,7 @@ duckdb::unique_ptr<duckdb::GlobalSinkState> sirius_physical_operator::get_global
 
 std::string sirius_physical_operator::get_name() const
 {
-  return duckdb::PhysicalOperatorToString(type);
+  return SiriusPhysicalOperatorToString(type);
 }
 
 std::string sirius_physical_operator::to_string() const { return get_name() + params_to_string(); }

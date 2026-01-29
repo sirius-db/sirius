@@ -199,7 +199,7 @@ duckdb::idx_t sirius_pipeline::update_batch_index(duckdb::idx_t old_index, duckd
 void sirius_pipeline_build_state::set_pipeline_source(sirius_pipeline& pipeline,
                                                       op::sirius_physical_operator& op)
 {
-  SIRIUS_LOG_DEBUG("Setting pipeline source {}", duckdb::PhysicalOperatorToString(op.type));
+  SIRIUS_LOG_DEBUG("Setting pipeline source {}", op::SiriusPhysicalOperatorToString(op.type));
   pipeline.source = &op;
 }
 
@@ -211,7 +211,7 @@ void sirius_pipeline_build_state::set_pipeline_sink(
   pipeline.sink = op;
   if (pipeline.sink)
     SIRIUS_LOG_DEBUG("Setting pipeline sink {}",
-                     duckdb::PhysicalOperatorToString((*pipeline.sink).type));
+                     op::SiriusPhysicalOperatorToString((*pipeline.sink).type));
   // set the base batch index of this pipeline based on how many other pipelines have this node as
   // their sink
   pipeline.base_batch_index = BATCH_INCREMENT * sink_pipeline_count;
@@ -220,7 +220,7 @@ void sirius_pipeline_build_state::set_pipeline_sink(
 void sirius_pipeline_build_state::add_pipeline_operator(sirius_pipeline& pipeline,
                                                         op::sirius_physical_operator& op)
 {
-  SIRIUS_LOG_DEBUG("Adding operator to pipeline {}", duckdb::PhysicalOperatorToString(op.type));
+  SIRIUS_LOG_DEBUG("Adding operator to pipeline {}", op::SiriusPhysicalOperatorToString(op.type));
   pipeline.operators.push_back(op);
 }
 
@@ -259,7 +259,7 @@ bool sirius_pipeline::is_pipeline_finished() { return pipeline_finished; }
 
 void sirius_pipeline::update_pipeline_status()
 {
-  if (get_source()->type == duckdb::PhysicalOperatorType::TABLE_SCAN) {
+  if (get_source()->type == op::SiriusPhysicalOperatorType::TABLE_SCAN) {
     auto& table_scan = get_source()->Cast<op::sirius_physical_table_scan>();
     if (!table_scan.exhausted) {
       pipeline_finished = false;

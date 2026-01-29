@@ -44,7 +44,7 @@ namespace op {
 sirius_physical_result_collector::sirius_physical_result_collector(
   duckdb::SiriusPreparedStatementData& data)
   : sirius_physical_operator(
-      duckdb::PhysicalOperatorType::RESULT_COLLECTOR, {duckdb::LogicalType::BOOLEAN}, 0),
+      SiriusPhysicalOperatorType::RESULT_COLLECTOR, {duckdb::LogicalType::BOOLEAN}, 0),
     statement_type(data.prepared->statement_type),
     properties(data.prepared->properties),
     plan(*data.sirius_physical_plan),

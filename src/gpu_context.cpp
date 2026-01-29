@@ -355,10 +355,10 @@ unique_ptr<PendingQueryResult> GPUContext::SiriusPendingStatementInternal(
 
   unique_ptr<::sirius::op::sirius_physical_result_collector> sirius_collector =
     make_uniq_base<::sirius::op::sirius_physical_result_collector, ::sirius::op::sirius_physical_materialized_collector>(*statement_p, client_context);
-  if (sirius_collector->type != PhysicalOperatorType::RESULT_COLLECTOR) {
+  if (sirius_collector->type != ::sirius::op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
     return GPUErrorResult<PendingQueryResult>(ErrorData("Error in SiriusPendingStatementInternal"));
   }
-  D_ASSERT(sirius_collector->type == PhysicalOperatorType::RESULT_COLLECTOR);
+  D_ASSERT(sirius_collector->type == ::sirius::op::SiriusPhysicalOperatorType::RESULT_COLLECTOR);
   auto types = sirius_collector->get_types();
   D_ASSERT(types == statement.types);
   engine.initialize(std::move(sirius_collector));

@@ -43,7 +43,7 @@ class sirius_right_delim_join_local_state : public duckdb::LocalSinkState {
 };
 
 sirius_physical_delim_join::sirius_physical_delim_join(
-  duckdb::PhysicalOperatorType type,
+  SiriusPhysicalOperatorType type,
   duckdb::vector<duckdb::LogicalType> types,
   duckdb::unique_ptr<sirius_physical_operator> original_join,
   duckdb::vector<duckdb::const_reference<sirius_physical_operator>> delim_scans,
@@ -53,8 +53,8 @@ sirius_physical_delim_join::sirius_physical_delim_join(
     join(std::move(original_join)),
     delim_scans(std::move(delim_scans))
 {
-  D_ASSERT(type == duckdb::PhysicalOperatorType::LEFT_DELIM_JOIN ||
-           type == duckdb::PhysicalOperatorType::RIGHT_DELIM_JOIN);
+  D_ASSERT(type == SiriusPhysicalOperatorType::LEFT_DELIM_JOIN ||
+           type == SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN);
 }
 
 sirius_physical_right_delim_join::sirius_physical_right_delim_join(
@@ -63,7 +63,7 @@ sirius_physical_right_delim_join::sirius_physical_right_delim_join(
   duckdb::vector<duckdb::const_reference<sirius_physical_operator>> delim_scans,
   duckdb::idx_t estimated_cardinality,
   duckdb::optional_idx delim_idx)
-  : sirius_physical_delim_join(duckdb::PhysicalOperatorType::RIGHT_DELIM_JOIN,
+  : sirius_physical_delim_join(SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN,
                                std::move(types),
                                std::move(original_join),
                                std::move(delim_scans),
@@ -83,7 +83,7 @@ sirius_physical_left_delim_join::sirius_physical_left_delim_join(
   duckdb::vector<duckdb::const_reference<sirius_physical_operator>> delim_scans,
   duckdb::idx_t estimated_cardinality,
   duckdb::optional_idx delim_idx)
-  : sirius_physical_delim_join(duckdb::PhysicalOperatorType::LEFT_DELIM_JOIN,
+  : sirius_physical_delim_join(SiriusPhysicalOperatorType::LEFT_DELIM_JOIN,
                                std::move(types),
                                std::move(original_join),
                                std::move(delim_scans),
@@ -95,7 +95,7 @@ sirius_physical_left_delim_join::sirius_physical_left_delim_join(
 
   auto cached_chunk_scan = duckdb::make_uniq<sirius_physical_column_data_scan>(
     children[0]->get_types(),
-    duckdb::PhysicalOperatorType::COLUMN_DATA_SCAN,
+    SiriusPhysicalOperatorType::COLUMN_DATA_SCAN,
     estimated_cardinality,
     nullptr);
   if (delim_idx.IsValid()) { cached_chunk_scan->cte_index = delim_idx.GetIndex(); }
@@ -114,7 +114,7 @@ void sirius_physical_left_delim_join::build_pipelines(pipeline::sirius_pipeline&
   auto& child_meta_pipeline = meta_pipeline.create_child_meta_pipeline(current, *this);
   child_meta_pipeline.build(*children[0]);
 
-  D_ASSERT(type == duckdb::PhysicalOperatorType::LEFT_DELIM_JOIN);
+  D_ASSERT(type == SiriusPhysicalOperatorType::LEFT_DELIM_JOIN);
   // recurse into the actual join
   // any pipelines in there depend on the main pipeline
   // any scan of the duplicate eliminated data on the RHS depends on this pipeline
@@ -137,7 +137,7 @@ void sirius_physical_right_delim_join::build_pipelines(
   auto& child_meta_pipeline = meta_pipeline.create_child_meta_pipeline(current, *this);
   child_meta_pipeline.build(*children[0]);
 
-  D_ASSERT(type == duckdb::PhysicalOperatorType::RIGHT_DELIM_JOIN);
+  D_ASSERT(type == SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN);
   // recurse into the actual join
   // any pipelines in there depend on the main pipeline
   // any scan of the duplicate eliminated data on the LHS depends on this pipeline

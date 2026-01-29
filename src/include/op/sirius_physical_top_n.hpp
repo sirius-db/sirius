@@ -34,7 +34,7 @@ namespace op {
 //! the data but only add a selection vector.
 class sirius_physical_top_n : public sirius_physical_operator {
  public:
-  static constexpr const duckdb::PhysicalOperatorType TYPE = duckdb::PhysicalOperatorType::TOP_N;
+  static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::TOP_N;
 
  public:
   sirius_physical_top_n(duckdb::vector<duckdb::LogicalType> types_p,
