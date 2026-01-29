@@ -185,7 +185,8 @@ void sirius_physical_operator::sink(
     }
   }
 
-  // WSM TODO: sink should not create a task. The task should be created by gpu_pipeline_executor after the task is completed
+  // WSM TODO: sink should not create a task. The task should be created by gpu_pipeline_executor
+  // after the task is completed
 
   // if (!creator) {
   //   throw std::runtime_error(
@@ -231,7 +232,7 @@ std::optional<task_creation_hint> sirius_physical_operator::get_next_task_hint()
 {
   if (ports.empty()) { return std::nullopt; }
 
-  // satify hard barriers first
+  // satisfy hard barriers first
   auto unfinished_barrier = std::find_if(ports.begin(), ports.end(), [](const auto& port_pair) {
     return port_pair.second->type == MemoryBarrierType::FULL && port_pair.second->src_pipeline &&
            !port_pair.second->src_pipeline->is_pipeline_finished();

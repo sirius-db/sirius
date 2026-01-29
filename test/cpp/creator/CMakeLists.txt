@@ -14,6 +14,6 @@
 # the License.
 # =============================================================================
 
-set(TEST_SOURCES
-    # ${TEST_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/test_task_creator.cpp
+set(TEST_SOURCES # ${TEST_SOURCES}
+                 # ${CMAKE_CURRENT_SOURCE_DIR}/test_task_creator.cpp
     PARENT_SCOPE)

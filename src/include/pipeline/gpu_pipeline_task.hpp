@@ -107,7 +107,7 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_itask_local_state {
    *
    * @return const cucascade::memory::reservation* Pointer to the reservation, or nullptr
    */
-   // WSM TODO: remove this method?
+  // WSM TODO: remove this method?
   const cucascade::memory::reservation* get_reservation() const { return _reservation.get(); }
 
  private:
