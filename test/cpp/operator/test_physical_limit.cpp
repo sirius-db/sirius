@@ -48,7 +48,7 @@ TEMPLATE_TEST_CASE("sirius_physical_streaming_limit limits rows in data_batch",
   using Traits = gpu_type_traits<TestType>;
 
   auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
-  auto* space = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space);
 
   std::vector<typename Traits::type> values(10);
@@ -94,11 +94,8 @@ TEMPLATE_TEST_CASE("sirius_physical_streaming_limit limits rows in data_batch",
   duckdb::vector<duckdb::LogicalType> types;
   types.push_back(Traits::logical_type());
 
-  sirius_physical_streaming_limit limiter(std::move(types),
-                                          std::move(limit_node),
-                                          std::move(offset_node),
-                                          values.size(),
-                                          false);
+  sirius_physical_streaming_limit limiter(
+    std::move(types), std::move(limit_node), std::move(offset_node), values.size(), false);
 
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
   auto outputs = limiter.execute(inputs);

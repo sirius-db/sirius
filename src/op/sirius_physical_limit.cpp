@@ -16,10 +16,11 @@
 
 #include "op/sirius_physical_limit.hpp"
 
+#include "data/data_batch_utils.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "log/logging.hpp"
 #include "operator/gpu_materialize.hpp"
-#include "data/data_batch_utils.hpp"
+
 #include <cudf/copying.hpp>
 
 #include <cucascade/data/gpu_data_representation.hpp>
@@ -33,9 +34,8 @@ sirius_physical_streaming_limit::sirius_physical_streaming_limit(
   duckdb::BoundLimitNode offset_val_p,
   duckdb::idx_t estimated_cardinality,
   bool parallel)
-  : sirius_physical_operator(duckdb::PhysicalOperatorType::STREAMING_LIMIT,
-                             std::move(types),
-                             estimated_cardinality),
+  : sirius_physical_operator(
+      duckdb::PhysicalOperatorType::STREAMING_LIMIT, std::move(types), estimated_cardinality),
     limit_val(std::move(limit_val_p)),
     offset_val(std::move(offset_val_p)),
     parallel(parallel)

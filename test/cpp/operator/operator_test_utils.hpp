@@ -53,8 +53,8 @@ inline std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> initia
   cucascade::memory::reservation_manager_configurator builder;
 
   // Configure a modest GPU space
-  const size_t gpu_capacity = 512ull << 20;  // 512MB
-  const double limit_ratio  = 0.75;
+  const size_t gpu_capacity  = 512ull << 20;  // 512MB
+  const double limit_ratio   = 0.75;
   const size_t host_capacity = 1ull << 30;  // 1GB
 
   builder.set_number_of_gpus(n_gpus)
@@ -65,8 +65,8 @@ inline std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> initia
     .set_reservation_fraction_per_host(limit_ratio);
 
   auto space_configs = builder.build();
-  auto manager = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
-    std::move(space_configs));
+  auto manager =
+    std::make_unique<sirius::memory::sirius_memory_reservation_manager>(std::move(space_configs));
 
   // Initialize converters used by data representations
   sirius::converter_registry::initialize();

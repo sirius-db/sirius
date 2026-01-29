@@ -48,7 +48,7 @@ TEMPLATE_TEST_CASE("sirius_physical_projection executes on data_batch for multip
   using Traits = gpu_type_traits<TestType>;
 
   auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
-  auto* space = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space);
 
   std::vector<int64_t> key_vals{10, 20, 30, 40};
@@ -63,12 +63,8 @@ TEMPLATE_TEST_CASE("sirius_physical_projection executes on data_batch for multip
     input_batch = make_two_column_batch<int64_t, typename Traits::type>(
       *space, key_vals, data_vals, Traits::cudf_type, std::nullopt);
   } else if constexpr (Traits::is_decimal) {
-    input_batch = make_two_column_batch<int64_t, typename Traits::type>(*space,
-                                                                        key_vals,
-                                                                        data_vals,
-                                                                        Traits::cudf_type,
-                                                                        Traits::scale,
-                                                                        cudf::type_id::INT64);
+    input_batch = make_two_column_batch<int64_t, typename Traits::type>(
+      *space, key_vals, data_vals, Traits::cudf_type, Traits::scale, cudf::type_id::INT64);
   } else if constexpr (Traits::is_ts) {
     input_batch = make_two_column_batch<int64_t, typename Traits::type>(
       *space, key_vals, data_vals, Traits::cudf_type, std::nullopt);
@@ -87,8 +83,7 @@ TEMPLATE_TEST_CASE("sirius_physical_projection executes on data_batch for multip
   types.push_back(Traits::logical_type());
   types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));
 
-  sirius_physical_projection projection(
-    std::move(types), std::move(exprs), key_vals.size());
+  sirius_physical_projection projection(std::move(types), std::move(exprs), key_vals.size());
 
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
   auto outputs = projection.execute(inputs);
@@ -112,7 +107,7 @@ TEMPLATE_TEST_CASE("sirius_physical_projection can drop columns",
   using Traits = gpu_type_traits<TestType>;
 
   auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
-  auto* space = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space);
 
   std::vector<int64_t> key_vals{10, 20, 30};
@@ -132,8 +127,7 @@ TEMPLATE_TEST_CASE("sirius_physical_projection can drop columns",
   duckdb::vector<duckdb::LogicalType> types;
   types.push_back(Traits::logical_type());
 
-  sirius_physical_projection projection(
-    std::move(types), std::move(exprs), key_vals.size());
+  sirius_physical_projection projection(std::move(types), std::move(exprs), key_vals.size());
 
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
   auto outputs = projection.execute(inputs);
@@ -152,7 +146,7 @@ TEMPLATE_TEST_CASE("sirius_physical_projection can duplicate/reorder columns",
   using Traits = gpu_type_traits<TestType>;
 
   auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
-  auto* space = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space);
 
   std::vector<int64_t> key_vals{100, 200, 300};
@@ -178,8 +172,7 @@ TEMPLATE_TEST_CASE("sirius_physical_projection can duplicate/reorder columns",
   types.push_back(Traits::logical_type());
   types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));
 
-  sirius_physical_projection projection(
-    std::move(types), std::move(exprs), key_vals.size());
+  sirius_physical_projection projection(std::move(types), std::move(exprs), key_vals.size());
 
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
   auto outputs = projection.execute(inputs);

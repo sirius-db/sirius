@@ -219,8 +219,7 @@ void GpuExpressionExecutor::Execute(const GPUIntermediateRelation& input_relatio
 }
 
 std::shared_ptr<cucascade::data_batch> GpuExpressionExecutor::execute(
-  std::shared_ptr<cucascade::data_batch> input_batch,
-  rmm::cuda_stream_view stream)
+  std::shared_ptr<cucascade::data_batch> input_batch, rmm::cuda_stream_view stream)
 {
   assert(!expressions.empty());
 
@@ -294,8 +293,7 @@ void GpuExpressionExecutor::Select(GPUIntermediateRelation& input_relation,
 }
 
 std::shared_ptr<cucascade::data_batch> GpuExpressionExecutor::select(
-  std::shared_ptr<cucascade::data_batch> input_batch,
-  rmm::cuda_stream_view stream)
+  std::shared_ptr<cucascade::data_batch> input_batch, rmm::cuda_stream_view stream)
 {
   assert(expressions.size() == 1);
   assert(expressions[0]->return_type == LogicalType::BOOLEAN);

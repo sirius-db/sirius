@@ -14,22 +14,19 @@
  * limitations under the License.
  */
 
-
+#include "memory/sirius_memory_reservation_manager.hpp"
+#include "operator_test_utils.hpp"
+#include "operator_type_traits.hpp"
 
 #include <catch.hpp>
+#include <cucascade/data/gpu_data_representation.hpp>
+#include <cucascade/memory/memory_space.hpp>
 #include <duckdb/common/types/date.hpp>
 #include <duckdb/common/types/timestamp.hpp>
 #include <duckdb/planner/expression/bound_comparison_expression.hpp>
 #include <duckdb/planner/expression/bound_constant_expression.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
-#include "memory/sirius_memory_reservation_manager.hpp"
 #include <op/sirius_physical_filter.hpp>
-
-#include "operator_test_utils.hpp"
-#include "operator_type_traits.hpp"
-
-#include <cucascade/data/gpu_data_representation.hpp>
-#include <cucascade/memory/memory_space.hpp>
 
 #include <variant>
 
@@ -59,7 +56,7 @@ TEMPLATE_TEST_CASE("sirius_physical_filter executes on data_batch for multiple n
   using Traits = gpu_type_traits<TestType>;
 
   auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
-  auto* space = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space);
 
   // Build filter column (int64) and data column (TestType)
@@ -76,12 +73,8 @@ TEMPLATE_TEST_CASE("sirius_physical_filter executes on data_batch for multiple n
     input_batch = make_two_column_batch<int64_t, typename Traits::type>(
       *space, filter_vals, data_vals, Traits::cudf_type, std::nullopt);
   } else if constexpr (Traits::is_decimal) {
-    input_batch = make_two_column_batch<int64_t, typename Traits::type>(*space,
-                                                                        filter_vals,
-                                                                        data_vals,
-                                                                        Traits::cudf_type,
-                                                                        Traits::scale,
-                                                                        cudf::type_id::INT64);
+    input_batch = make_two_column_batch<int64_t, typename Traits::type>(
+      *space, filter_vals, data_vals, Traits::cudf_type, Traits::scale, cudf::type_id::INT64);
   } else if constexpr (Traits::is_ts) {
     input_batch = make_two_column_batch<int64_t, typename Traits::type>(
       *space, filter_vals, data_vals, Traits::cudf_type, std::nullopt);

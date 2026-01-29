@@ -68,7 +68,7 @@ std::shared_ptr<data_batch> make_range_batch(memory_space& space,
 TEST_CASE("sirius_physical_top_n single-key uses top_k per batch", "[physical_top_n]")
 {
   auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
-  auto* space = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space);
 
   std::vector<std::shared_ptr<data_batch>> batches;
@@ -106,7 +106,7 @@ TEST_CASE("sirius_physical_top_n single-key uses top_k per batch", "[physical_to
 TEST_CASE("sirius_physical_top_n multi-key falls back to sort_by_key", "[physical_top_n]")
 {
   auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
-  auto* space = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space);
 
   // order by col0 desc, then col1 asc
