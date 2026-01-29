@@ -129,6 +129,8 @@ class GPUContext {
     shared_ptr<SiriusPreparedStatementData>& statement_p,
     const PendingQueryParameters& parameters);
 
+  unique_ptr<QueryResult> SiriusFetchResultInternal(PendingQueryResult& pending);
+
   unique_ptr<QueryResult> SiriusExecuteQuery(ClientContext& context,
                                              const string& query,
                                              shared_ptr<SiriusPreparedStatementData>& statement_p,

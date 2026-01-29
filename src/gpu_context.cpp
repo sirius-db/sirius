@@ -374,6 +374,29 @@ unique_ptr<PendingQueryResult> GPUContext::SiriusPendingStatementInternal(
   return pending_result;
 }
 
+unique_ptr<QueryResult> GPUContext::SiriusFetchResultInternal(PendingQueryResult& pending)
+{
+  D_ASSERT(gpu_active_query);
+  D_ASSERT(gpu_active_query->IsOpenResult(pending));
+  D_ASSERT(gpu_active_query->sirius_prepared->prepared);
+  auto& engine   = GetSiriusEngine();
+  auto& prepared = *gpu_active_query->sirius_prepared->prepared;
+  // bool create_stream_result = prepared.properties.allow_stream_result &&
+  // pending->allow_stream_result;
+  unique_ptr<QueryResult> result;
+  D_ASSERT(engine.HasResultCollector());
+  // we have a result collector - fetch the result directly from the result collector
+  // SIRIUS_LOG_DEBUG("Getting result");
+  result = engine.get_result();
+  // SIRIUS_LOG_DEBUG("Fetching result");
+  // if (!create_stream_result) {
+  CleanupInternal(result.get(), false);
+  // } else {
+  // 	active_query->SetOpenResult(*result);
+  // }
+  return result;
+}
+
 // This function is based on PendingQueryResult::ExecuteInternal
 unique_ptr<QueryResult> GPUContext::SiriusExecutePendingQueryResult(PendingQueryResult& pending)
 {
@@ -392,7 +415,7 @@ unique_ptr<QueryResult> GPUContext::SiriusExecutePendingQueryResult(PendingQuery
     return make_uniq<MaterializedQueryResult>(error);
   }
   SIRIUS_LOG_DEBUG("Done ExecutePendingQueryResult");
-  auto result = FetchResultInternal(pending);
+  auto result = SiriusFetchResultInternal(pending);
   return result;
 }
 
