@@ -142,7 +142,11 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
    *
    * @return std::vector<std::shared_ptr<cucascade::data_batch>> The computed output batches
    */
-  std::vector<std::shared_ptr<cucascade::data_batch>> compute_task() override;
+  std::vector<std::shared_ptr<cucascade::data_batch>> compute_task() override
+  {
+    /// todo(WSM)
+    return {};
+  }
 
   /**
    * @brief Publish the computed output batches to data repositories.
@@ -151,7 +155,23 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
    *
    * @param output_batches The data batches to publish
    */
-  void publish_output(std::vector<std::shared_ptr<cucascade::data_batch>> output_batches) override;
+  void publish_output(std::vector<std::shared_ptr<cucascade::data_batch>> output_batches) override
+  {
+    /// todo(WSM)
+  }
+
+  std::size_t get_estimated_reservation_size() override
+  {
+    return 0;
+    /// TODO(WSM)
+  }
+
+  /// @brief Get the output consumer operators for this task.
+  std::vector<op::sirius_physical_operator*> get_output_consumers() override
+  {
+    return {};
+    /// TODO(WSM)
+  }
 
   std::size_t get_estimated_reservation_size() override
   {
