@@ -144,5 +144,27 @@ void gpu_pipeline_task::execute()
   // Processing handles are automatically released here when they go out of scope
 }
 
+std::vector<std::shared_ptr<cucascade::data_batch>> gpu_pipeline_task::compute_task()
+{
+  // TODO: Implement compute_task
+  // This should contain the computation logic from execute()
+  // For now, return empty vector as placeholder
+  return std::vector<std::shared_ptr<cucascade::data_batch>>{};
+}
+
+void gpu_pipeline_task::publish_output(
+  std::vector<std::shared_ptr<cucascade::data_batch>> output_batches)
+{
+  // TODO: Implement publish_output
+  // This should push the output batches to _data_repos
+  for (auto& batch : output_batches) {
+    for (auto* repo : _data_repos) {
+      if (repo) {
+        repo->add_data_batch(batch);
+      }
+    }
+  }
+}
+
 }  // namespace pipeline
 }  // namespace sirius

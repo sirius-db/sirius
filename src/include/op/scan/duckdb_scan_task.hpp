@@ -304,6 +304,7 @@ class duckdb_scan_task_local_state : public sirius::pipeline::sirius_pipeline_it
    */
   std::shared_ptr<data_batch> make_data_batch();
 
+  
  private:
   //===----------Fields----------===//
   size_t _approximate_batch_size;                ///< Approximate target batch size in bytes

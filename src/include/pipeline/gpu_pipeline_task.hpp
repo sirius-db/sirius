@@ -142,11 +142,7 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
    *
    * @return std::vector<std::shared_ptr<cucascade::data_batch>> The computed output batches
    */
-  std::vector<std::shared_ptr<cucascade::data_batch>> compute_task() override
-  {
-    /// todo(WSM)
-    return {};
-  }
+  std::vector<std::shared_ptr<cucascade::data_batch>> compute_task() override;
 
   /**
    * @brief Publish the computed output batches to data repositories.
@@ -155,10 +151,7 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
    *
    * @param output_batches The data batches to publish
    */
-  void publish_output(std::vector<std::shared_ptr<cucascade::data_batch>> output_batches) override
-  {
-    /// todo(WSM)
-  }
+  void publish_output(std::vector<std::shared_ptr<cucascade::data_batch>> output_batches) override;
 
   std::size_t get_estimated_reservation_size() override
   {
