@@ -159,9 +159,7 @@ void gpu_pipeline_task::publish_output(
   // This should push the output batches to _data_repos
   for (auto& batch : output_batches) {
     for (auto* repo : _data_repos) {
-      if (repo) {
-        repo->add_data_batch(batch);
-      }
+      if (repo) { repo->add_data_batch(batch); }
     }
   }
 }

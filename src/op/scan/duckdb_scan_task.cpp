@@ -539,9 +539,7 @@ void duckdb_scan_task::publish_output(
   // TODO: Implement publish_output
   // This should push the output batches to _data_repo
   for (auto& batch : output_batches) {
-    if (_data_repo) {
-      _data_repo->add_data_batch(std::move(batch));
-    }
+    if (_data_repo) { _data_repo->add_data_batch(std::move(batch)); }
   }
 }
 
