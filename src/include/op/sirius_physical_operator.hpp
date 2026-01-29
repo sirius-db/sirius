@@ -229,9 +229,9 @@ class sirius_physical_operator {
   /// \brief check if there are more tasks to create
   /// \note not necessarily ready to create at the moment
   /// the function is called
-  virtual bool has_more_tasks() const
+  virtual bool can_create_more_tasks() const
   {
-    throw std::runtime_error("has_more_tasks not implemented for operator " + get_name());
+    throw std::runtime_error("can_create_more_tasks not implemented for operator " + get_name());
     return true;
   }
 
