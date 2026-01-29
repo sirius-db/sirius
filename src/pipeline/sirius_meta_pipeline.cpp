@@ -137,7 +137,7 @@ sirius_meta_pipeline& sirius_meta_pipeline::create_child_meta_pipeline(
 
 sirius_pipeline& sirius_meta_pipeline::create_pipeline()
 {
-  pipelines.emplace_back(duckdb::make_shared_ptr<sirius_pipeline>());
+  pipelines.emplace_back(duckdb::make_shared_ptr<sirius_pipeline>(engine));
   state.set_pipeline_sink(*pipelines.back(), sink, next_batch_index++);
   return *pipelines.back();
 }

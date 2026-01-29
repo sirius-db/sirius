@@ -103,8 +103,6 @@ class GPUContext {
 
   unique_ptr<QueryResult> GPUExecutePendingQueryResult(PendingQueryResult& pending);
 
-  unique_ptr<QueryResult> GPUExecuteRelation(ClientContext& context, shared_ptr<Relation> relation);
-
   void CheckExecutableInternal(PendingQueryResult& pending);
 
   unique_ptr<QueryResult> FetchResultInternal(PendingQueryResult& pending);
@@ -112,6 +110,7 @@ class GPUContext {
   void CleanupInternal(BaseQueryResult* result, bool invalidate_transaction);
 
   void BeginQueryInternal(const string& query);
+
   ErrorData EndQueryInternal(bool success, bool invalidate_transaction);
 
   void GPUProcessError(ErrorData& error, const string& query) const;

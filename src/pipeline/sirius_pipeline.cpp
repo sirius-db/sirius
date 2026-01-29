@@ -36,31 +36,31 @@
 namespace sirius {
 namespace pipeline {
 
-sirius_pipeline::sirius_pipeline()
-  : ready(false), initialized(false), source(nullptr), sink(nullptr)
+sirius_pipeline::sirius_pipeline(sirius_engine& engine)
+  : engine(engine), ready(false), initialized(false), source(nullptr), sink(nullptr)
 {
 }
 
-// duckdb::ClientContext& sirius_pipeline::get_client_context() { return context; }
+duckdb::ClientContext& sirius_pipeline::get_client_context() { return engine.context; }
 
-// bool sirius_pipeline::is_order_dependent() const
-// {
-//   if (source) {
-//     auto source_order = source->source_order();
-//     if (source_order == duckdb::OrderPreservationType::FIXED_ORDER) { return true; }
-//     if (source_order == duckdb::OrderPreservationType::NO_ORDER) { return false; }
-//   }
-//   for (auto& op_ref : operators) {
-//     auto& op = op_ref.get();
-//     if (op.operator_order() == duckdb::OrderPreservationType::NO_ORDER) { return false; }
-//     if (op.operator_order() == duckdb::OrderPreservationType::FIXED_ORDER) { return true; }
-//   }
-//   if (!duckdb::DBConfig::GetSetting<duckdb::PreserveInsertionOrderSetting>(context)) {
-//     return false;
-//   }
-//   if (sink && sink->sink_order_dependent()) { return true; }
-//   return false;
-// }
+bool sirius_pipeline::is_order_dependent() const
+{
+  if (source) {
+    auto source_order = source->source_order();
+    if (source_order == duckdb::OrderPreservationType::FIXED_ORDER) { return true; }
+    if (source_order == duckdb::OrderPreservationType::NO_ORDER) { return false; }
+  }
+  for (auto& op_ref : operators) {
+    auto& op = op_ref.get();
+    if (op.operator_order() == duckdb::OrderPreservationType::NO_ORDER) { return false; }
+    if (op.operator_order() == duckdb::OrderPreservationType::FIXED_ORDER) { return true; }
+  }
+  if (!duckdb::DBConfig::GetSetting<duckdb::PreserveInsertionOrderSetting>(engine.context)) {
+    return false;
+  }
+  if (sink && sink->sink_order_dependent()) { return true; }
+  return false;
+}
 
 void sirius_pipeline::reset_sink()
 {

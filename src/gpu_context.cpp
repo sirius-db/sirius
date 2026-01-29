@@ -313,51 +313,6 @@ ErrorData GPUContext::EndQueryInternal(bool success, bool invalidate_transaction
   return error;
 }
 
-unique_ptr<QueryResult> GPUContext::GPUExecuteRelation(ClientContext& context,
-                                                       shared_ptr<Relation> relation)
-{
-  // auto &expected_columns = relation->Columns();
-  // auto pending = GPUPendingQueryInternal(relation, false);
-  // if (!pending->success) {
-  // 	return ErrorResult<MaterializedQueryResult>(pending->GetErrorObject());
-  // }
-
-  // unique_ptr<QueryResult> result;
-  // result = GPUExecutePendingQueryResult(*pending);
-
-  // if (result->HasError()) {
-  // 	return result;
-  // }
-  // // verify that the result types and result names of the query match the expected result
-  // types/names if (result->types.size() == expected_columns.size()) { 	bool mismatch = false; for
-  // (idx_t i = 0; i < result->types.size(); i++) { 		if (result->types[i] !=
-  // expected_columns[i].Type() || result->names[i] != expected_columns[i].Name()) { 			mismatch =
-  // true; 			break;
-  // 		}
-  // 	}
-  // 	if (!mismatch) {
-  // 		// all is as expected: return the result
-  // 		return result;
-  // 	}
-  // }
-  // 	// result mismatch
-  // 	string err_str = "Result mismatch in query!\nExpected the following columns: [";
-  // 	for (idx_t i = 0; i < expected_columns.size(); i++) {
-  // 		if (i > 0) {
-  // 			err_str += ", ";
-  // 		}
-  // 		err_str += expected_columns[i].Name() + " " + expected_columns[i].Type().ToString();
-  // 	}
-  // 	err_str += "]\nBut result contained the following: ";
-  // 	for (idx_t i = 0; i < result->types.size(); i++) {
-  // 		err_str += i == 0 ? "[" : ", ";
-  // 		err_str += result->names[i] + " " + result->types[i].ToString();
-  // 	}
-  // 	err_str += "]";
-  // 	return GPUErrorResult<MaterializedQueryResult>(context, ErrorData(err_str));
-  throw duckdb::InternalException("`GPUExecuteRelation` is unimplemented");
-}
-
 // This function is based on ClientContext::PendingStatementOrPreparedStatement
 unique_ptr<PendingQueryResult> GPUContext::SiriusPendingStatementOrPreparedStatement(
   ClientContext& context,
@@ -399,7 +354,7 @@ unique_ptr<PendingQueryResult> GPUContext::SiriusPendingStatementInternal(
   bool stream_result = false;
 
   unique_ptr<::sirius::op::sirius_physical_result_collector> sirius_collector =
-    make_uniq_base<::sirius::op::sirius_physical_result_collector, ::sirius::op::sirius_physical_materialized_collector>(*statement_p);
+    make_uniq_base<::sirius::op::sirius_physical_result_collector, ::sirius::op::sirius_physical_materialized_collector>(*statement_p, client_context);
   if (sirius_collector->type != PhysicalOperatorType::RESULT_COLLECTOR) {
     return GPUErrorResult<PendingQueryResult>(ErrorData("Error in SiriusPendingStatementInternal"));
   }

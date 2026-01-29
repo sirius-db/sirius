@@ -78,11 +78,11 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   friend class sirius_meta_pipeline;
 
  public:
-  explicit sirius_pipeline();
+  explicit sirius_pipeline(sirius_engine& engine);
   virtual ~sirius_pipeline() = default;
 
  public:
-  // duckdb::ClientContext& get_client_context();
+  duckdb::ClientContext& get_client_context();
 
   void add_dependency(duckdb::shared_ptr<sirius_pipeline>& pipeline);
 
@@ -102,6 +102,7 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
 
   //! Returns a list of all operators (including source and sink) involved in this pipeline
   duckdb::vector<duckdb::reference<op::sirius_physical_operator>> get_all_operators();
+
   duckdb::vector<duckdb::const_reference<op::sirius_physical_operator>> get_all_operators() const;
 
   //! Returns a list of all inner operators (excluding source and sink) involved in this pipeline
@@ -163,6 +164,7 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   bool schedule_parallel(duckdb::shared_ptr<duckdb::Event>& event);
   //! Whether the pipeline has been finished
   bool pipeline_finished = false;
+  sirius_engine& engine;
 };
 
 }  // namespace pipeline
