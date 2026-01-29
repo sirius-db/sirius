@@ -20,12 +20,14 @@
 
 namespace duckdb {
 class GPUBufferManager;
+struct DBConfig;
 class SiriusExtension : public Extension {
  public:
-  void Load(DuckDB& db) override;
+  void Load(ExtensionLoader& loader) override;
   std::string Name() override;
-  void InitialGPUConfigs(DuckDB& db);
-  void InitializeGPUExtension(Connection& con);
+  std::string Version() const override;
+  static void InitialGPUConfigs(DBConfig& db);
+  static void RegisterGPUFunctions(ClientContext& context);
   static void GPUProcessingSubstraitFunction(ClientContext& context,
                                              TableFunctionInput& data_p,
                                              DataChunk& output);

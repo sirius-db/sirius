@@ -22,4 +22,6 @@ set(EXTENSION_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/pipeline_queue.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/pipeline_executor.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/task_request.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/sirius_pipeline.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/sirius_meta_pipeline.cpp
     PARENT_SCOPE)

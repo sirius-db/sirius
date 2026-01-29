@@ -17,13 +17,13 @@
 #pragma once
 
 #include "config.hpp"
-#include "creator/task_completion.hpp"
-#include "gpu_pipeline.hpp"
 #include "parallel/task_executor.hpp"
+#include "pipeline/sirius_pipeline.hpp"
 
-#include <data/data_batch.hpp>
-#include <data/data_repository.hpp>
-#include <data/data_repository_manager.hpp>
+#include <cucascade/data/data_batch.hpp>
+#include <cucascade/data/data_repository.hpp>
+#include <cucascade/data/data_repository_manager.hpp>
+#include <cucascade/memory/memory_reservation.hpp>
 
 #include <cstdint>
 #include <memory>
@@ -47,12 +47,11 @@ class gpu_pipeline_task_global_state : public sirius::parallel::itask_global_sta
    *
    * @param pipeline Shared pointer to the GPU pipeline to execute
    */
-  explicit gpu_pipeline_task_global_state(duckdb::shared_ptr<duckdb::GPUPipeline> pipeline)
+  explicit gpu_pipeline_task_global_state(duckdb::shared_ptr<sirius_pipeline> pipeline)
     : _pipeline(std::move(pipeline))
   {
   }
-  duckdb::shared_ptr<duckdb::GPUPipeline>
-    _pipeline;  ///< Shared pointer to the GPU pipeline to execute
+  duckdb::shared_ptr<sirius_pipeline> _pipeline;  ///< Shared pointer to the GPU pipeline to execute
 };
 
 /**
@@ -84,6 +83,8 @@ class gpu_pipeline_task_local_state : public sirius::parallel::itask_local_state
   {
     _reservation = std::move(res);
   }
+
+  const cucascade::memory::reservation* get_reservation() const { return _reservation.get(); }
 
  private:
   std::unique_ptr<cucascade::memory::reservation>
@@ -132,9 +133,9 @@ class gpu_pipeline_task : public sirius::parallel::itask {
   /**
    * @brief Get the GPU pipeline associated with this task
    *
-   * @return const duckdb::GPUPipeline* Pointer to the GPU pipeline
+   * @return const duckdb::sirius_pipeline* Pointer to the GPU pipeline
    */
-  const duckdb::GPUPipeline* get_pipeline() const;
+  const sirius_pipeline* get_pipeline() const;
 
  private:
   uint64_t _task_id;

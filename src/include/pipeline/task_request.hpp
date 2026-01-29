@@ -15,13 +15,13 @@
  */
 
 #pragma once
-#include "memory/memory_reservation.hpp"
-#include "memory/memory_space.hpp"
 #include "parallel/task_executor.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 
 #include <blockingconcurrentqueue.h>
-#include <data/data_repository.hpp>
+#include <cucascade/data/data_repository.hpp>
+#include <cucascade/memory/memory_reservation.hpp>
+#include <cucascade/memory/memory_space.hpp>
 
 namespace sirius {
 namespace pipeline {
@@ -36,7 +36,7 @@ class task_request_queue {
   void open();
   void close();
   void push(std::unique_ptr<task_request> request);
-  unique_ptr<task_request> pull();
+  std::unique_ptr<task_request> pull();
 
  private:
   size_t _num_threads;

@@ -15,6 +15,17 @@
 import duckdb
 import os
 import sys
+import threading
+import subprocess
+
+
+def generate_table(table_type, sf, dbgen_dir):
+    """Generate a subset of the TPC-H tables using dbgen -T option"""
+    command = f"cd {dbgen_dir} && ./dbgen -f -s {sf} -T {table_type}"
+    result = subprocess.run(command, shell=True, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"Error running {command}: {result.stderr}")
+
 
 if __name__ == "__main__":
     con = duckdb.connect(
@@ -28,14 +39,51 @@ if __name__ == "__main__":
     con.execute("load '{}'".format(extension_path))
 
     SF = sys.argv[1]
-    command = (
-        f"cd test_datasets/tpch-dbgen && ./dbgen -f -s {SF} && mv *.tbl perf_test/"
+
+    # Create SF-specific subdirectory
+    sf_data_dir = f"test_datasets/tpch-dbgen/sf{SF}"
+    dbgen_dir = "test_datasets/tpch-dbgen"
+
+    # Check if data already exists
+    required_files = [
+        "customer.tbl",
+        "lineitem.tbl",
+        "orders.tbl",
+        "part.tbl",
+        "supplier.tbl",
+        "partsupp.tbl",
+        "nation.tbl",
+        "region.tbl",
+    ]
+    data_exists = os.path.exists(sf_data_dir) and all(
+        os.path.exists(os.path.join(sf_data_dir, f)) for f in required_files
     )
 
-    print("Generating TPC-H data...")
-    os.system("mkdir -p test_datasets/tpch-dbgen/perf_test")
-    os.system("rm -f test_datasets/tpch-dbgen/perf_test/*")
-    os.system(command)
+    if data_exists:
+        print(
+            f"Data for SF={SF} already exists in {sf_data_dir}, skipping generation..."
+        )
+    else:
+        print(f"Generating TPC-H data for SF={SF}...")
+        os.makedirs(sf_data_dir, exist_ok=True)
+
+        # Generate different parts of the data concurrently
+        dbgen_options = ["c", "l", "L", "O", "p", "s"]
+        threads = []
+
+        for dbgen_option in dbgen_options:
+            thread = threading.Thread(
+                target=generate_table, args=(dbgen_option, SF, dbgen_dir)
+            )
+            thread.start()
+            threads.append(thread)
+
+        for thread in threads:
+            thread.join()
+
+        subprocess.run(f"mv {dbgen_dir}/*.tbl {sf_data_dir}/", shell=True)
+
+        print(f"Data generation complete for SF={SF}")
 
     print(
         "Creating Region, Nation, Part, Supplier, Partsupp, Customer, Orders, Lineitem tables..."
@@ -162,50 +210,50 @@ if __name__ == "__main__":
     print("Copying data into tables...")
 
     con.execute(
-        """
-    COPY lineitem FROM 'test_datasets/tpch-dbgen/perf_test/lineitem.tbl' WITH (HEADER false, DELIMITER '|')
+        f"""
+    COPY lineitem FROM '{sf_data_dir}/lineitem.tbl' WITH (HEADER false, DELIMITER '|')
     """
     )
 
     con.execute(
-        """
-    COPY orders FROM 'test_datasets/tpch-dbgen/perf_test/orders.tbl' WITH (HEADER false, DELIMITER '|')
+        f"""
+    COPY orders FROM '{sf_data_dir}/orders.tbl' WITH (HEADER false, DELIMITER '|')
     """
     )
 
     con.execute(
-        """
-    COPY supplier FROM 'test_datasets/tpch-dbgen/perf_test/supplier.tbl' WITH (HEADER false, DELIMITER '|')
+        f"""
+    COPY supplier FROM '{sf_data_dir}/supplier.tbl' WITH (HEADER false, DELIMITER '|')
     """
     )
 
     con.execute(
-        """
-    COPY part FROM 'test_datasets/tpch-dbgen/perf_test/part.tbl' WITH (HEADER false, DELIMITER '|')
+        f"""
+    COPY part FROM '{sf_data_dir}/part.tbl' WITH (HEADER false, DELIMITER '|')
     """
     )
 
     con.execute(
-        """
-    COPY customer FROM 'test_datasets/tpch-dbgen/perf_test/customer.tbl' WITH (HEADER false, DELIMITER '|')
+        f"""
+    COPY customer FROM '{sf_data_dir}/customer.tbl' WITH (HEADER false, DELIMITER '|')
     """
     )
 
     con.execute(
-        """
-    COPY partsupp FROM 'test_datasets/tpch-dbgen/perf_test/partsupp.tbl' WITH (HEADER false, DELIMITER '|')
+        f"""
+    COPY partsupp FROM '{sf_data_dir}/partsupp.tbl' WITH (HEADER false, DELIMITER '|')
     """
     )
 
     con.execute(
-        """
-    COPY nation FROM 'test_datasets/tpch-dbgen/perf_test/nation.tbl' WITH (HEADER false, DELIMITER '|')
+        f"""
+    COPY nation FROM '{sf_data_dir}/nation.tbl' WITH (HEADER false, DELIMITER '|')
     """
     )
 
     con.execute(
-        """
-    COPY region FROM 'test_datasets/tpch-dbgen/perf_test/region.tbl' WITH (HEADER false, DELIMITER '|')
+        f"""
+    COPY region FROM '{sf_data_dir}/region.tbl' WITH (HEADER false, DELIMITER '|')
     """
     )
 

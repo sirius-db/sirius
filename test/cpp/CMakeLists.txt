@@ -17,6 +17,7 @@
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 
 add_subdirectory(utils)
+add_subdirectory(memory)
 add_subdirectory(memory_management)
 add_subdirectory(parallel)
 add_subdirectory(data)
@@ -24,6 +25,8 @@ add_subdirectory(operator)
 add_subdirectory(scan)
 add_subdirectory(pipeline)
 add_subdirectory(creator)
+add_subdirectory(config)
+
 set(TEST_SOURCES
     ${TEST_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/unittest.cpp
     PARENT_SCOPE)

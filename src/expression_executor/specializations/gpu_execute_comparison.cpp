@@ -62,6 +62,29 @@ struct ComparisonDispatcher {
                                     return_type,
                                     executor.execution_stream,
                                     executor.resource_ref);
+    } else if constexpr (std::is_same_v<T, int32_t>) {
+      // For int32_t, check at runtime if this is a TIMESTAMP_DAYS comparison
+      if (left.type().id() == cudf::type_id::TIMESTAMP_DAYS) {
+        auto date_scalar = cudf::timestamp_scalar<cudf::timestamp_D>(
+          cudf::duration_D{right_value}, true, executor.execution_stream, executor.resource_ref);
+        auto result = cudf::binary_operation(left,
+                                             date_scalar,
+                                             ComparisonOp,
+                                             return_type,
+                                             executor.execution_stream,
+                                             executor.resource_ref);
+        return result;
+      } else {
+        // Regular int32_t comparison
+        auto numeric_scalar =
+          cudf::numeric_scalar(right_value, true, executor.execution_stream, executor.resource_ref);
+        return cudf::binary_operation(left,
+                                      numeric_scalar,
+                                      ComparisonOp,
+                                      return_type,
+                                      executor.execution_stream,
+                                      executor.resource_ref);
+      }
     } else {
       // Create a numeric scalar from the constant value
       auto numeric_scalar =
@@ -143,7 +166,7 @@ struct ComparisonDispatcher {
                                            GpuExpressionState* state)
   {
     D_ASSERT(expr.children.size() == 2);
-    auto return_type = GpuExpressionState::GetCudfType(expr.return_type);
+    auto return_type = GetCudfType(expr.return_type);
 
     // Resolve the children (DuckDB moves constants to the right comparator)
     auto left = executor.Execute(*expr.left, state->child_states[0].get());
@@ -152,7 +175,7 @@ struct ComparisonDispatcher {
     if (expr.right->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
       auto right_value = expr.right->Cast<BoundConstantExpression>().value;
 
-      switch (GpuExpressionState::GetCudfType(expr.right->return_type).id()) {
+      switch (GetCudfType(expr.right->return_type).id()) {
         case cudf::type_id::INT16:
           return DoScalarComparison<int16_t>(
             left->view(), right_value.GetValue<int16_t>(), return_type);
@@ -173,6 +196,11 @@ struct ComparisonDispatcher {
         case cudf::type_id::STRING:
           return DoScalarComparison<std::string>(
             left->view(), right_value.GetValue<std::string>(), return_type);
+        case cudf::type_id::TIMESTAMP_DAYS:
+          // DuckDB DATE is int32_t (days since epoch), same as cuDF TIMESTAMP_DAYS
+          // Use numeric_scalar<int32_t> for the comparison
+          return DoScalarComparison<int32_t>(
+            left->view(), right_value.GetValue<int32_t>(), return_type);
         case cudf::type_id::DECIMAL32:
           // cudf decimal type uses negative scale, same for below
           return DoScalarComparison<numeric::decimal32>(
@@ -197,7 +225,7 @@ struct ComparisonDispatcher {
         default:
           throw InternalException(
             "Execute[Comparison]: Unsupported constant type for comparison: %d!",
-            static_cast<int>(GpuExpressionState::GetCudfType(expr.right->return_type).id()));
+            static_cast<int>(GetCudfType(expr.right->return_type).id()));
       }
     }
 
@@ -218,7 +246,7 @@ struct ComparisonDispatcher {
 std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundComparisonExpression& expr,
                                                              GpuExpressionState* state)
 {
-  auto return_type = GpuExpressionState::GetCudfType(expr.return_type);
+  auto return_type = GetCudfType(expr.return_type);
 
   // Execute the comparison
   switch (expr.GetExpressionType()) {

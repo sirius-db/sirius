@@ -51,6 +51,14 @@ class GPUPhysicalNestedLoopJoin : public GPUPhysicalOperator {
                             unique_ptr<GPUPhysicalOperator> right,
                             vector<JoinCondition> cond,
                             JoinType join_type,
+                            idx_t estimated_cardinality,
+                            unique_ptr<JoinFilterPushdownInfo> pushdown_info_p);
+
+  GPUPhysicalNestedLoopJoin(LogicalOperator& op,
+                            unique_ptr<GPUPhysicalOperator> left,
+                            unique_ptr<GPUPhysicalOperator> right,
+                            vector<JoinCondition> cond,
+                            JoinType join_type,
                             idx_t estimated_cardinality);
 
   vector<JoinCondition> conditions;
@@ -73,6 +81,8 @@ class GPUPhysicalNestedLoopJoin : public GPUPhysicalOperator {
   vector<LogicalType> delim_types;
 
   shared_ptr<GPUIntermediateRelation> right_temp_data;
+
+  unique_ptr<JoinFilterPushdownInfo> filter_pushdown;
 
  protected:
   // CachingOperator Interface

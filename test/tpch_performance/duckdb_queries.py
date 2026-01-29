@@ -30,7 +30,7 @@ select
 from
     lineitem
 where
-    l_shipdate <= date '1998-12-01' - interval '1200' day
+    l_shipdate <= date '1995-08-19'
 group by
     l_returnflag,
     l_linestatus
@@ -130,7 +130,7 @@ from
   orders o
 where
   o.o_orderdate >= date '1996-10-01'
-  and o.o_orderdate < date '1996-10-01' + interval '3' month
+  and o.o_orderdate < date '1997-01-01'
   and
   exists (
     select
@@ -171,7 +171,7 @@ where
   and n.n_regionkey = r.r_regionkey
   and r.r_name = 'EUROPE'
   and o.o_orderdate >= date '1997-01-01'
-  and o.o_orderdate < date '1997-01-01' + interval '1' year
+  and o.o_orderdate < date '1998-01-01'
 group by
   n.n_name
 order by
@@ -189,7 +189,7 @@ from
   lineitem
 where
   l_shipdate >= date '1997-01-01'
-  and l_shipdate < date '1997-01-01' + interval '1' year
+  and l_shipdate < date '1998-01-01'
   and l_discount between 0.03 - 0.01 and 0.03 + 0.01
   and l_quantity < 24
                 """
@@ -346,7 +346,7 @@ where
   c.c_custkey = o.o_custkey
   and l.l_orderkey = o.o_orderkey
   and o.o_orderdate >= date '1994-03-01'
-  and o.o_orderdate < date '1994-03-01' + interval '3' month
+  and o.o_orderdate < date '1994-06-01'
   and l.l_returnflag = 'R'
   and c.c_nationkey = n.n_nationkey
 group by
@@ -425,7 +425,7 @@ where
   and l.l_commitdate < l.l_receiptdate
   and l.l_shipdate < l.l_commitdate
   and l.l_receiptdate >= date '1994-01-01'
-  and l.l_receiptdate < date '1994-01-01' + interval '1' year
+  and l.l_receiptdate < date '1995-01-01'
 group by
   l.l_shipmode
 order by
@@ -477,7 +477,7 @@ from
 where
   l.l_partkey = p.p_partkey
   and l.l_shipdate >= date '1994-08-01'
-  and l.l_shipdate < date '1994-08-01' + interval '1' month
+  and l.l_shipdate < date '1994-09-01'
                 """
     )
 
@@ -493,7 +493,7 @@ with revenue_view as (
     lineitem
   where
     l_shipdate >= date '1993-05-01'
-    and l_shipdate < date '1993-05-01' + interval '3' month
+    and l_shipdate < date '1993-08-01'
   group by
     l_suppkey
 )
@@ -697,7 +697,7 @@ where
           l.l_partkey = ps.ps_partkey
           and l.l_suppkey = ps.ps_suppkey
           and l.l_shipdate >= date '1993-01-01'
-          and l.l_shipdate < date '1993-01-01' + interval '1' year
+          and l.l_shipdate < date '1994-01-01'
       )
   )
   and s.s_nationkey = n.n_nationkey

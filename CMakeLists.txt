@@ -32,6 +32,7 @@ endif()
 
 project(${TARGET_NAME} LANGUAGES CXX CUDA)
 find_package(cudf REQUIRED CONFIG)
+find_package(libconfig++ REQUIRED)
 
 # Derive the environment prefix from where cudf was found cudf_DIR is typically:
 # <prefix>/lib/cmake/cudf
@@ -75,9 +76,9 @@ include(third_party/cucascade.cmake)
 # Include directories - cuCascade headers first for memory module
 include_directories(${CUCASCADE_INCLUDE_DIR})
 include_directories(src/include src/include/operator)
-include_directories(substrait/src/include)
-include_directories(${TARGET_NAME} substrait/third_party/substrait)
-include_directories(${TARGET_NAME} substrait/third_party)
+# include_directories(substrait/src/include) include_directories(${TARGET_NAME}
+# substrait/third_party/substrait) include_directories(${TARGET_NAME}
+# substrait/third_party)
 
 set(EXTENSION_SOURCES
     src/sirius_extension.cpp
@@ -93,6 +94,9 @@ set(EXTENSION_SOURCES
     src/gpu_query_result.cpp
     src/config.cpp
     src/fallback.cpp
+    src/sirius_config.cpp
+    src/sirius_context.cpp
+    src/extension_lock.cpp
     src/parallel/task_executor.cpp)
 # Note: Memory module sources are now provided by cuCascade library
 add_subdirectory(src/operator)
@@ -101,6 +105,9 @@ add_subdirectory(src/data)
 add_subdirectory(src/pipeline)
 add_subdirectory(src/downgrade)
 add_subdirectory(src/creator)
+add_subdirectory(src/op)
+add_subdirectory(src/planner)
+add_subdirectory(src/memory)
 
 set(CUDA_SOURCES src/cuda/communication.cu src/cuda/allocator.cu
                  src/cuda/print.cu src/cuda/utils.cu)
@@ -142,10 +149,12 @@ set_target_properties(${LOADABLE_EXTENSION_NAME} PROPERTIES LINKER_LANGUAGE
 set_target_properties(${LOADABLE_EXTENSION_NAME}
                       PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
-target_link_libraries(${EXTENSION_NAME} substrait_extension cudf::cudf rmm::rmm
-                      ${NUMA_LIB})
-target_link_libraries(${LOADABLE_EXTENSION_NAME} substrait_extension cudf::cudf
-                      rmm::rmm)
+# target_link_libraries(${EXTENSION_NAME} substrait_extension cudf::cudf
+# rmm::rmm ${NUMA_LIB}) target_link_libraries(${LOADABLE_EXTENSION_NAME}
+# substrait_extension cudf::cudf rmm::rmm)
+target_link_libraries(${EXTENSION_NAME} cudf::cudf rmm::rmm ${NUMA_LIB}
+                      ${LIBCONFIG++_LIBRARIES})
+target_link_libraries(${LOADABLE_EXTENSION_NAME} cudf::cudf rmm::rmm)
 
 # Link third-party libraries
 target_link_libraries(${EXTENSION_NAME} spdlog::spdlog cuCascade::cucascade)

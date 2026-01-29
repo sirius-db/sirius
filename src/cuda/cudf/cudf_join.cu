@@ -262,4 +262,93 @@ void cudf_mixed_or_conditional_inner_join(vector<shared_ptr<GPUColumn>>& probe_c
   SIRIUS_LOG_DEBUG("CUDF Mixed join result count: {}", count[0]);
 }
 
+void cudf_hash_left_join(vector<shared_ptr<GPUColumn>>& probe_keys,
+                         vector<shared_ptr<GPUColumn>>& build_keys,
+                         int num_keys,
+                         uint64_t*& row_ids_left,
+                         uint64_t*& row_ids_right,
+                         uint64_t*& count,
+                         bool unique_build_keys)
+{
+  GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+  if (build_keys[0]->column_length == 0 || probe_keys[0]->column_length == 0) {
+    SIRIUS_LOG_DEBUG("Input size is 0");
+    count    = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
+    count[0] = 0;
+    return;
+  }
+
+  SIRIUS_LOG_DEBUG("CUDF hash left join");
+  SIRIUS_LOG_DEBUG("Build Input size: {}", build_keys[0]->column_length);
+  SIRIUS_LOG_DEBUG("Probe Input size: {}", probe_keys[0]->column_length);
+  SETUP_TIMING();
+  START_TIMER();
+
+  cudf::set_current_device_resource(gpuBufferManager->mr);
+
+  std::vector<cudf::column_view> build_keys_cudf, probe_keys_cudf;
+  std::vector<std::unique_ptr<cudf::column>> keys_cast;
+  for (int key = 0; key < num_keys; key++) {
+    auto build_key_cudf = build_keys[key]->convertToCudfColumn();
+    auto probe_key_cudf = probe_keys[key]->convertToCudfColumn();
+    if (build_key_cudf.type().id() == probe_key_cudf.type().id()) {
+      build_keys_cudf.push_back(build_key_cudf);
+      probe_keys_cudf.push_back(probe_key_cudf);
+    } else if (IsCudfTypeDecimal(build_key_cudf.type()) &&
+               IsCudfTypeDecimal(probe_key_cudf.type())) {
+      // Cast for decimal join key
+      int build_decimal_size = GetCudfDecimalTypeSize(build_key_cudf.type());
+      int probe_decimal_size = GetCudfDecimalTypeSize(probe_key_cudf.type());
+      if (build_decimal_size < probe_decimal_size) {
+        // Cast for build side to probe side
+        keys_cast.push_back(cudf::cast(build_key_cudf,
+                                       probe_key_cudf.type(),
+                                       rmm::cuda_stream_default,
+                                       GPUBufferManager::GetInstance().mr));
+        build_keys_cudf.push_back(keys_cast.back()->view());
+        probe_keys_cudf.push_back(probe_key_cudf);
+      } else {
+        // Cast for probe side to build side
+        keys_cast.push_back(cudf::cast(probe_key_cudf,
+                                       build_key_cudf.type(),
+                                       rmm::cuda_stream_default,
+                                       GPUBufferManager::GetInstance().mr));
+        build_keys_cudf.push_back(build_key_cudf);
+        probe_keys_cudf.push_back(keys_cast.back()->view());
+      }
+    } else {
+      throw InternalException(
+        "Build and probe key type mismatch in `cudf_hash_left_join`: %d vs %d",
+        static_cast<int>(build_key_cudf.type().id()),
+        static_cast<int>(probe_key_cudf.type().id()));
+    }
+  }
+  auto build_table = cudf::table_view(build_keys_cudf);
+  auto probe_table = cudf::table_view(probe_keys_cudf);
+
+  // TODO: We can optimize this by using distinct hash join for unique build keys
+  auto hash_table = cudf::hash_join(build_table, cudf::null_equality::EQUAL);
+  auto result     = hash_table.left_join(probe_table);
+
+  auto result_count                       = result.first->size();
+  rmm::device_buffer row_ids_left_buffer  = result.first->release();
+  rmm::device_buffer row_ids_right_buffer = result.second->release();
+
+  row_ids_left =
+    convertInt32ToUInt64(reinterpret_cast<int32_t*>(row_ids_left_buffer.data()), result_count);
+  row_ids_right =
+    convertInt32ToUInt64(reinterpret_cast<int32_t*>(row_ids_right_buffer.data()), result_count);
+
+  gpuBufferManager->rmm_stored_buffers.push_back(
+    std::make_unique<rmm::device_buffer>(std::move(row_ids_left_buffer)));
+  gpuBufferManager->rmm_stored_buffers.push_back(
+    std::make_unique<rmm::device_buffer>(std::move(row_ids_right_buffer)));
+
+  count    = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
+  count[0] = result_count;
+
+  STOP_TIMER();
+  SIRIUS_LOG_DEBUG("CUDF Inner join result count: {}", count[0]);
+}
+
 }  // namespace duckdb

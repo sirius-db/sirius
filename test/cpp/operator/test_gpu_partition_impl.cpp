@@ -16,12 +16,13 @@
 
 #include "catch.hpp"
 #include "data/data_batch_utils.hpp"
-#include "data/gpu_data_representation.hpp"
-#include "memory/memory_space.hpp"
-#include "memory/sirius_memory_manager.hpp"
-#include "partition/gpu_partition_impl.hpp"
+#include "memory/sirius_memory_reservation_manager.hpp"
+#include "op/partition/gpu_partition_impl.hpp"
 #include "scan/test_utils.hpp"
 #include "utils/utils.hpp"
+
+#include <cucascade/data/gpu_data_representation.hpp>
+#include <cucascade/memory/memory_space.hpp>
 
 using namespace sirius;
 using namespace cucascade;
@@ -29,14 +30,6 @@ using namespace cucascade::memory;
 using namespace sirius::op;
 
 namespace {
-
-// Helper function to get the default GPU memory space
-memory_space* get_default_memory_space()
-{
-  initialize_memory_manager();
-  auto& manager = sirius::memory_manager::get();
-  return const_cast<memory_space*>(manager.get_memory_space(Tier::GPU, 0));
-}
 
 /**
  * @brief Create a batch with random data and acquire a processing handle.
@@ -61,8 +54,10 @@ std::pair<std::shared_ptr<data_batch>, data_batch_processing_handle> create_batc
     num_rows, column_types, ranges, cudf::get_default_stream(), mem_space.get_default_allocator());
   auto batch = sirius::make_data_batch(std::move(table), mem_space);
 
-  REQUIRE(batch->try_to_lock_for_processing());
-  data_batch_processing_handle handle(batch.get());
+  REQUIRE(batch->try_to_create_task());
+  auto lock_result = batch->try_to_lock_for_processing(mem_space.get_id());
+  REQUIRE(lock_result.success);
+  data_batch_processing_handle handle = std::move(lock_result.handle);
 
   return {std::move(batch), std::move(handle)};
 }
@@ -154,7 +149,8 @@ void validate_hash_partition(const data_batch& input_batch,
 
 TEST_CASE("Hash partition basic", "[operator][hash_partition]")
 {
-  auto* mem_space                           = get_default_memory_space();
+  auto manager                              = initialize_memory_manager();
+  auto* mem_space                           = manager->get_memory_space(Tier::GPU, 0);
   constexpr size_t num_input_rows           = 100;
   constexpr size_t num_partitions           = 4;
   std::vector<cudf::data_type> column_types = {cudf::data_type{cudf::type_id::INT32},
@@ -175,7 +171,8 @@ TEST_CASE("Hash partition basic", "[operator][hash_partition]")
 
 TEST_CASE("Hash partition with invalid input", "[operator][hash_partition]")
 {
-  auto* mem_space                           = get_default_memory_space();
+  auto manager                              = initialize_memory_manager();
+  auto* mem_space                           = manager->get_memory_space(Tier::GPU, 0);
   constexpr size_t num_input_rows           = 100;
   constexpr size_t num_partitions           = 1;
   std::vector<cudf::data_type> column_types = {cudf::data_type{cudf::type_id::INT32},
@@ -195,7 +192,8 @@ TEST_CASE("Hash partition with invalid input", "[operator][hash_partition]")
 
 TEST_CASE("Hash partition with empty input", "[operator][hash_partition]")
 {
-  auto* mem_space                           = get_default_memory_space();
+  auto manager                              = initialize_memory_manager();
+  auto* mem_space                           = manager->get_memory_space(Tier::GPU, 0);
   constexpr size_t num_input_rows           = 0;
   constexpr size_t num_partitions           = 4;
   std::vector<cudf::data_type> column_types = {cudf::data_type{cudf::type_id::INT32},
@@ -214,7 +212,8 @@ TEST_CASE("Hash partition with empty input", "[operator][hash_partition]")
 
 TEST_CASE("Hash partition with all the same partitioning keys", "[operator][hash_partition]")
 {
-  auto* mem_space                                        = get_default_memory_space();
+  auto manager                                           = initialize_memory_manager();
+  auto* mem_space                                        = manager->get_memory_space(Tier::GPU, 0);
   constexpr size_t num_input_rows                        = 100;
   constexpr size_t num_partitions                        = 4;
   std::vector<cudf::data_type> column_types              = {cudf::data_type{cudf::type_id::INT32},
@@ -237,7 +236,8 @@ TEST_CASE("Hash partition with all the same partitioning keys", "[operator][hash
 
 TEST_CASE("Hash partition with num partitions larger than input size", "[operator][hash_partition]")
 {
-  auto* mem_space                           = get_default_memory_space();
+  auto manager                              = initialize_memory_manager();
+  auto* mem_space                           = manager->get_memory_space(Tier::GPU, 0);
   constexpr size_t num_input_rows           = 10;
   constexpr size_t num_partitions           = 20;
   std::vector<cudf::data_type> column_types = {cudf::data_type{cudf::type_id::INT32},
@@ -304,7 +304,8 @@ void validate_evenly_partition(const data_batch& input_batch,
 
 TEST_CASE("Evenly partition basic", "[operator][evenly_partition]")
 {
-  auto* mem_space                           = get_default_memory_space();
+  auto manager                              = initialize_memory_manager();
+  auto* mem_space                           = manager->get_memory_space(Tier::GPU, 0);
   constexpr size_t num_input_rows           = 100;
   constexpr size_t num_partitions           = 4;
   std::vector<cudf::data_type> column_types = {cudf::data_type{cudf::type_id::INT32},
@@ -322,7 +323,8 @@ TEST_CASE("Evenly partition basic", "[operator][evenly_partition]")
 
 TEST_CASE("Evenly partition basic with empty input", "[operator][evenly_partition]")
 {
-  auto* mem_space                           = get_default_memory_space();
+  auto manager                              = initialize_memory_manager();
+  auto* mem_space                           = manager->get_memory_space(Tier::GPU, 0);
   constexpr size_t num_input_rows           = 0;
   constexpr size_t num_partitions           = 4;
   std::vector<cudf::data_type> column_types = {cudf::data_type{cudf::type_id::INT32},
@@ -341,7 +343,8 @@ TEST_CASE("Evenly partition basic with empty input", "[operator][evenly_partitio
 TEST_CASE("Evenly partition basic with num partitions larger than input size",
           "[operator][evenly_partition]")
 {
-  auto* mem_space                           = get_default_memory_space();
+  auto manager                              = initialize_memory_manager();
+  auto* mem_space                           = manager->get_memory_space(Tier::GPU, 0);
   constexpr size_t num_input_rows           = 10;
   constexpr size_t num_partitions           = 20;
   std::vector<cudf::data_type> column_types = {cudf::data_type{cudf::type_id::INT32},

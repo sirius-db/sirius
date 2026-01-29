@@ -34,8 +34,8 @@
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 
 // cucascades
-#include <data/data_batch.hpp>
-#include <data/data_repository_manager.hpp>
+#include <cucascade/data/data_batch.hpp>
+#include <cucascade/data/data_repository_manager.hpp>
 
 // cudf
 #include <cudf/types.hpp>

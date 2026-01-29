@@ -24,6 +24,7 @@
 #include "duckdb/execution/operator/set/physical_recursive_cte.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/parallel/pipeline_event.hpp"
 #include "duckdb/parallel/pipeline_executor.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
@@ -54,7 +55,7 @@ bool GPUPipeline::IsOrderDependent() const
     if (op.OperatorOrder() == OrderPreservationType::NO_ORDER) { return false; }
     if (op.OperatorOrder() == OrderPreservationType::FIXED_ORDER) { return true; }
   }
-  if (!config.options.preserve_insertion_order) { return false; }
+  if (!DBConfig::GetSetting<PreserveInsertionOrderSetting>(executor.context)) { return false; }
   if (sink && sink->SinkOrderDependent()) { return true; }
   return false;
 }
@@ -242,22 +243,22 @@ vector<reference<GPUPhysicalOperator>> GPUPipelineBuildState::GetPipelineOperato
   return pipeline.operators;
 }
 
-bool GPUPipeline::is_pipeline_finished() { return pipeline_finished; }
+// bool GPUPipeline::is_pipeline_finished() { return pipeline_finished; }
 
-void GPUPipeline::update_pipeline_status()
-{
-  if (GetSource()->type == PhysicalOperatorType::TABLE_SCAN) {
-    auto& table_scan = GetSource()->Cast<GPUPhysicalTableScan>();
-    if (!table_scan.exhausted) {
-      pipeline_finished = false;
-      return;
-    }
-    auto& first_node  = operators[0].get();
-    pipeline_finished = first_node.all_ports_empty();
-  } else {
-    auto& first_node  = operators[0].get();
-    pipeline_finished = first_node.is_source_pipeline_finished() && first_node.all_ports_empty();
-  }
-}
+// void GPUPipeline::update_pipeline_status()
+// {
+//   if (GetSource()->type == PhysicalOperatorType::TABLE_SCAN) {
+//     auto& table_scan = GetSource()->Cast<GPUPhysicalTableScan>();
+//     if (!table_scan.exhausted) {
+//       pipeline_finished = false;
+//       return;
+//     }
+//     auto& first_node  = operators[0].get();
+//     pipeline_finished = first_node.all_ports_empty();
+//   } else {
+//     auto& first_node  = operators[0].get();
+//     pipeline_finished = first_node.is_source_pipeline_finished() && first_node.all_ports_empty();
+//   }
+// }
 
 }  // namespace duckdb

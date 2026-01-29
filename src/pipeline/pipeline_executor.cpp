@@ -17,27 +17,39 @@
 #include "pipeline/pipeline_executor.hpp"
 
 #include "config.hpp"
-#include "memory/memory_reservation.hpp"
-#include "memory/sirius_memory_manager.hpp"
+#include "memory/sirius_memory_reservation_manager.hpp"
 #include "pipeline/pipeline_queue.hpp"
+
+#include <cucascade/memory/common.hpp>
+#include <cucascade/memory/memory_reservation.hpp>
 
 namespace sirius {
 namespace pipeline {
 
-pipeline_executor::pipeline_executor(sirius::parallel::task_executor_config pipeline_config,
-                                     sirius::parallel::task_executor_config gpu_executor_config,
-                                     size_t num_gpus)
-  : sirius::parallel::itask_executor(std::make_unique<pipeline_queue>(pipeline_config.num_threads),
-                                     pipeline_config)
+pipeline_executor::pipeline_executor(const parallel::task_executor_config& gpu_task_executor_config,
+                                     sirius::memory::sirius_memory_reservation_manager& mem_mgr,
+                                     const cucascade::memory::system_topology_info* sys_topology)
+  : sirius::parallel::itask_executor(std::make_unique<pipeline_queue>(1),
+                                     {.num_threads = 1, .retry_on_error = false})
 {
+  auto gpu_spaces = mem_mgr.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
+  auto num_gpus   = gpu_spaces.size();
   // Initialize GPU pipeline executors for each available GPU
   _gpu_executors.reserve(num_gpus);
-  for (int i = 0; i < num_gpus; ++i) {
-    const cucascade::memory::memory_space* gpu_mem_space = nullptr;  // Placeholder
-    _gpu_executors.push_back(
-      std::make_unique<gpu_pipeline_executor>(gpu_executor_config, gpu_mem_space, this));
+  for (auto* space : gpu_spaces) {
+    auto config = gpu_task_executor_config;
+    if (sys_topology) {
+      auto it = std::find_if(sys_topology->gpus.begin(),
+                             sys_topology->gpus.end(),
+                             [space](const cucascade::memory::gpu_topology_info& dev) {
+                               return dev.id == space->get_device_id();
+                             });
+
+      if (it != sys_topology->gpus.end()) { config.cpu_affinity_list = it->cpu_cores; }
+    }
+    _gpu_executors.push_back(std::make_unique<gpu_pipeline_executor>(config, space, this));
   }
-  _task_request_queue = std::make_unique<task_request_queue>(pipeline_config.num_threads);
+  _task_request_queue = std::make_unique<task_request_queue>(1);
 }
 
 void pipeline_executor::schedule(std::unique_ptr<sirius::parallel::itask> task)
@@ -64,8 +76,7 @@ void pipeline_executor::start()
   on_start();
   _threads.reserve(_config.num_threads);
   for (int i = 0; i < _config.num_threads; ++i) {
-    _threads.push_back(std::make_unique<sirius::parallel::task_executor_thread>(
-      std::make_unique<std::thread>(&pipeline_executor::worker_loop, this, i)));
+    _threads.emplace_back(&pipeline_executor::worker_loop, this, i);
   }
   // Start all GPU executors
   for (auto& gpu_exec : _gpu_executors) {
@@ -83,7 +94,7 @@ void pipeline_executor::stop()
   }
   on_stop();
   for (auto& thread : _threads) {
-    if (thread->_internal_thread->joinable()) { thread->_internal_thread->join(); }
+    if (thread.joinable()) { thread.join(); }
   }
   _threads.clear();
 }

@@ -16,6 +16,7 @@
 
 #include "gpu_physical_nested_loop_join.hpp"
 
+#include "cudf_utils.hpp"
 #include "duckdb/common/enums/physical_operator_type.hpp"
 #include "duckdb/common/operator/comparison_operators.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
@@ -27,7 +28,6 @@
 #include "duckdb/parallel/thread_context.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
-#include "expression_executor/gpu_expression_executor_state.hpp"
 #include "gpu_buffer_manager.hpp"
 #include "gpu_materialize.hpp"
 #include "gpu_meta_pipeline.hpp"
@@ -128,33 +128,76 @@ void HandleNestedLoopJoin(vector<shared_ptr<GPUColumn>>& left_keys,
   }
 }
 
-GPUPhysicalNestedLoopJoin::GPUPhysicalNestedLoopJoin(LogicalOperator& op,
-                                                     unique_ptr<GPUPhysicalOperator> left,
-                                                     unique_ptr<GPUPhysicalOperator> right,
-                                                     vector<JoinCondition> cond,
-                                                     JoinType join_type,
-                                                     idx_t estimated_cardinality)
-  // : PhysicalComparisonJoin(op, PhysicalOperatorType::NESTED_LOOP_JOIN, std::move(cond),
-  // join_type,
-  //                          estimated_cardinality) {
-  : GPUPhysicalOperator(PhysicalOperatorType::NESTED_LOOP_JOIN, op.types, estimated_cardinality),
-    join_type(join_type)
+void ReorderConditions(vector<JoinCondition>& conditions)
 {
-  conditions.resize(cond.size());
   // we reorder conditions so the ones with COMPARE_EQUAL occur first
-  idx_t equal_position = 0;
-  idx_t other_position = cond.size() - 1;
-  for (idx_t i = 0; i < cond.size(); i++) {
-    if (cond[i].comparison == ExpressionType::COMPARE_EQUAL ||
-        cond[i].comparison == ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
-      // COMPARE_EQUAL and COMPARE_NOT_DISTINCT_FROM, move to the start
-      conditions[equal_position++] = std::move(cond[i]);
+  // check if this is already the case
+  bool is_ordered     = true;
+  bool seen_non_equal = false;
+  for (auto& cond : conditions) {
+    if (cond.comparison == ExpressionType::COMPARE_EQUAL ||
+        cond.comparison == ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+      if (seen_non_equal) {
+        is_ordered = false;
+        break;
+      }
     } else {
-      // other expression, move to the end
-      conditions[other_position--] = std::move(cond[i]);
+      seen_non_equal = true;
     }
   }
+  if (is_ordered) {
+    // no need to re-order
+    return;
+  }
+  // gather lists of equal/other conditions
+  vector<JoinCondition> equal_conditions;
+  vector<JoinCondition> other_conditions;
+  for (auto& cond : conditions) {
+    if (cond.comparison == ExpressionType::COMPARE_EQUAL ||
+        cond.comparison == ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+      equal_conditions.push_back(std::move(cond));
+    } else {
+      other_conditions.push_back(std::move(cond));
+    }
+  }
+  conditions.clear();
+  // reconstruct the sorted conditions
+  for (auto& cond : equal_conditions) {
+    conditions.push_back(std::move(cond));
+  }
+  for (auto& cond : other_conditions) {
+    conditions.push_back(std::move(cond));
+  }
+}
 
+GPUPhysicalNestedLoopJoin::GPUPhysicalNestedLoopJoin(
+  LogicalOperator& op,
+  unique_ptr<GPUPhysicalOperator> left,
+  unique_ptr<GPUPhysicalOperator> right,
+  vector<JoinCondition> cond,
+  JoinType join_type,
+  idx_t estimated_cardinality,
+  unique_ptr<JoinFilterPushdownInfo> pushdown_info_p)
+  : GPUPhysicalOperator(PhysicalOperatorType::NESTED_LOOP_JOIN, op.types, estimated_cardinality),
+    join_type(join_type),
+    conditions(std::move(cond))
+{
+  // conditions.resize(cond.size());
+  // // we reorder conditions so the ones with COMPARE_EQUAL occur first
+  // idx_t equal_position = 0;
+  // idx_t other_position = cond.size() - 1;
+  // for (idx_t i = 0; i < cond.size(); i++) {
+  //   if (cond[i].comparison == ExpressionType::COMPARE_EQUAL ||
+  //       cond[i].comparison == ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+  //     // COMPARE_EQUAL and COMPARE_NOT_DISTINCT_FROM, move to the start
+  //     conditions[equal_position++] = std::move(cond[i]);
+  //   } else {
+  //     // other expression, move to the end
+  //     conditions[other_position--] = std::move(cond[i]);
+  //   }
+  // }
+  ReorderConditions(conditions);
+  filter_pushdown = std::move(pushdown_info_p);
   children.push_back(std::move(left));
   children.push_back(std::move(right));
 
@@ -163,7 +206,42 @@ GPUPhysicalNestedLoopJoin::GPUPhysicalNestedLoopJoin(LogicalOperator& op,
   //         condition_types.push_back(type);
   //     }
   // }
+  right_temp_data = make_shared_ptr<GPUIntermediateRelation>(children[1]->GetTypes().size());
+}
 
+GPUPhysicalNestedLoopJoin::GPUPhysicalNestedLoopJoin(LogicalOperator& op,
+                                                     unique_ptr<GPUPhysicalOperator> left,
+                                                     unique_ptr<GPUPhysicalOperator> right,
+                                                     vector<JoinCondition> cond,
+                                                     JoinType join_type,
+                                                     idx_t estimated_cardinality)
+  : GPUPhysicalOperator(PhysicalOperatorType::NESTED_LOOP_JOIN, op.types, estimated_cardinality),
+    join_type(join_type),
+    conditions(std::move(cond))
+{
+  // conditions.resize(cond.size());
+  // // we reorder conditions so the ones with COMPARE_EQUAL occur first
+  // idx_t equal_position = 0;
+  // idx_t other_position = cond.size() - 1;
+  // for (idx_t i = 0; i < cond.size(); i++) {
+  //   if (cond[i].comparison == ExpressionType::COMPARE_EQUAL ||
+  //       cond[i].comparison == ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+  //     // COMPARE_EQUAL and COMPARE_NOT_DISTINCT_FROM, move to the start
+  //     conditions[equal_position++] = std::move(cond[i]);
+  //   } else {
+  //     // other expression, move to the end
+  //     conditions[other_position--] = std::move(cond[i]);
+  //   }
+  // }
+  ReorderConditions(conditions);
+  children.push_back(std::move(left));
+  children.push_back(std::move(right));
+
+  // for (auto &child : children) {
+  //     for (auto &type : child->GetTypes()) {
+  //         condition_types.push_back(type);
+  //     }
+  // }
   right_temp_data = make_shared_ptr<GPUIntermediateRelation>(children[1]->GetTypes().size());
 }
 
@@ -312,8 +390,8 @@ OperatorResultType GPUPhysicalNestedLoopJoin::ResolveComplexJoin(
         HandleMaterializeExpression(input_relation.columns[join_key_index], gpuBufferManager);
       // Perform cast
       auto from_cudf_column_view = left_keys[cond_idx]->convertToCudfColumn();
-      auto to_cudf_type   = sirius::GpuExpressionState::GetCudfType(condition.left->return_type);
-      auto to_cudf_column = cudf::cast(from_cudf_column_view,
+      auto to_cudf_type          = GetCudfType(condition.left->return_type);
+      auto to_cudf_column        = cudf::cast(from_cudf_column_view,
                                        to_cudf_type,
                                        rmm::cuda_stream_default,
                                        GPUBufferManager::GetInstance().mr);
@@ -345,8 +423,8 @@ OperatorResultType GPUPhysicalNestedLoopJoin::ResolveComplexJoin(
         HandleMaterializeExpression(right_temp_data->columns[join_key_index], gpuBufferManager);
       // Perform cast
       auto from_cudf_column_view = right_keys[cond_idx]->convertToCudfColumn();
-      auto to_cudf_type   = sirius::GpuExpressionState::GetCudfType(condition.right->return_type);
-      auto to_cudf_column = cudf::cast(from_cudf_column_view,
+      auto to_cudf_type          = GetCudfType(condition.right->return_type);
+      auto to_cudf_column        = cudf::cast(from_cudf_column_view,
                                        to_cudf_type,
                                        rmm::cuda_stream_default,
                                        GPUBufferManager::GetInstance().mr);
@@ -469,14 +547,29 @@ void GPUPhysicalNestedLoopJoin::BuildJoinPipelines(GPUPipeline& current,
   meta_pipeline.GetPipelines(pipelines_so_far, false);
   auto& last_pipeline = *pipelines_so_far.back();
 
+  vector<shared_ptr<GPUPipeline>> dependencies;
+  optional_ptr<GPUMetaPipeline> last_child_ptr;
   if (build_rhs) {
     // on the RHS (build side), we construct a child MetaPipeline with this operator as its sink
     auto& child_meta_pipeline = meta_pipeline.CreateChildMetaPipeline(current, op);
     child_meta_pipeline.Build(*op.children[1]);
+    // if (op.children[1].get().CanSaturateThreads(current.GetClientContext())) {
+    // 	// if the build side can saturate all available threads,
+    // 	// we don't just make the LHS pipeline depend on the RHS, but recursively all LHS children
+    // too.
+    // 	// this prevents breadth-first plan evaluation
+    // 	child_meta_pipeline.GetPipelines(dependencies, false);
+    // 	last_child_ptr = meta_pipeline.GetLastChild();
+    // }
   }
 
   // continue building the current pipeline on the LHS (probe side)
   op.children[0]->BuildPipelines(current, meta_pipeline);
+
+  // if (last_child_ptr) {
+  // 	// the pointer was set, set up the dependencies
+  // 	meta_pipeline.AddRecursiveDependencies(dependencies, *last_child_ptr);
+  // }
 
   switch (op.type) {
     case PhysicalOperatorType::POSITIONAL_JOIN:

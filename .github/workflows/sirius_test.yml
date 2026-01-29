@@ -11,36 +11,26 @@ jobs:
     runs-on: [self-hosted, Linux, X64]
     steps:
       - name: Cleanup
-        run: |
-          rm -rf -- * .[^.]* ..?*
+        run: rm -rf -- * .[^.]* ..?*
       - name: Checkout repository
         uses: actions/checkout@v6
         with:
           submodules: recursive
           fetch-depth: 0
+      - name: Setup Pixi
+        uses: prefix-dev/setup-pixi@82d477f15f3a381dbcc8adc1206ce643fe110fb7 # v0.9.3
+        with:
+          pixi-version: v0.59.0
+          activate-environment: true
+          environments: cuda12
       - name: Build
         env:
           CUDAARCHS: native
-        run: |
-          export LIBCUDF_ENV_PREFIX=~/miniconda3/envs/libcudf-env
-          source ~/miniconda3/etc/profile.d/conda.sh
-          conda activate libcudf-env
-          source setup_sirius.sh
-          make -j$(nproc)
+        run: make -j$(nproc)
       - name: Run C++ unit tests
-        run: |
-          ./build/release/extension/sirius/test/cpp/sirius_unittest --abort
+        run: ./build/release/extension/sirius/test/cpp/sirius_unittest --abort
       - name: Prepare SQL test datasets
-        run: |
-          cd test_datasets
-          unzip tpch-dbgen.zip
-          cd tpch-dbgen
-          ./dbgen -s 1 -f && mkdir s1 && mv *.tbl s1
-          cd ../../
-          cd test_datasets
-          wget https://pages.cs.wisc.edu/~yxy/sirius-datasets/test_hits.tsv.gz
-          gzip -d test_hits.tsv.gz
-          cd ..
+        run: ./setup_test_datasets.sh
       - name: Run sqllogic tests
         run: |
           make test | tee test.log

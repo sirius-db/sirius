@@ -122,49 +122,57 @@ unique_ptr<GPUPhysicalOperator> GPUPhysicalPlanGenerator::CreatePlan(LogicalCTER
   D_ASSERT(op.children.empty());
 
   // Check if this LogicalCTERef is supposed to scan a materialized CTE.
-  if (op.materialized_cte == CTEMaterialize::CTE_MATERIALIZE_ALWAYS) {
-    // Lookup if there is a materialized CTE for the cte_index.
-    auto materialized_cte = materialized_ctes.find(op.cte_index);
+  // Lookup if there is a materialized CTE for the cte_index.
+  auto materialized_cte = materialized_ctes.find(op.cte_index);
 
-    // If this check fails, this is a reference to a materialized recursive CTE.
-    if (materialized_cte != materialized_ctes.end()) {
-      auto chunk_scan = make_uniq<GPUPhysicalColumnDataScan>(
-        op.chunk_types, PhysicalOperatorType::CTE_SCAN, op.estimated_cardinality, op.cte_index);
+  // If this check fails, this is a reference to a materialized recursive CTE.
+  if (materialized_cte != materialized_ctes.end()) {
+    auto chunk_scan = make_uniq<GPUPhysicalColumnDataScan>(
+      op.chunk_types, PhysicalOperatorType::CTE_SCAN, op.estimated_cardinality, op.cte_index);
 
-      auto cte = recursive_cte_tables.find(op.cte_index);
-      if (cte == recursive_cte_tables.end()) {
-        throw InvalidInputException("Referenced materialized CTE does not exist.");
-      }
-      chunk_scan->collection = cte->second.get();
-      // materialized_cte->second.push_back(*chunk_scan.get());
-
-      auto gpu_cte = gpu_recursive_cte_tables.find(op.cte_index);
-      if (gpu_cte == gpu_recursive_cte_tables.end()) {
-        throw InvalidInputException("Referenced materialized CTE does not exist.");
-      }
-      chunk_scan->intermediate_relation = gpu_cte->second;
-
-      materialized_cte->second.push_back(*chunk_scan.get());
-
-      return std::move(chunk_scan);
+    auto cte = recursive_cte_tables.find(op.cte_index);
+    if (cte == recursive_cte_tables.end()) {
+      throw InvalidInputException("Referenced materialized CTE does not exist.");
     }
+
+    chunk_scan->collection = cte->second.get();
+    // materialized_cte->second.push_back(*chunk_scan.get())
+
+    auto gpu_cte = gpu_recursive_cte_tables.find(op.cte_index);
+    if (gpu_cte == gpu_recursive_cte_tables.end()) {
+      throw InvalidInputException("Referenced materialized CTE does not exist.");
+    }
+    chunk_scan->intermediate_relation = gpu_cte->second;
+
+    materialized_cte->second.push_back(*chunk_scan.get());
+
+    return std::move(chunk_scan);
   }
 
   throw NotImplementedException("Recursive CTE is not implemented");
 
-  // CreatePlan of a LogicalRecursiveCTE must have happened before.
   auto cte = recursive_cte_tables.find(op.cte_index);
   if (cte == recursive_cte_tables.end()) {
     throw InvalidInputException("Referenced recursive CTE does not exist.");
   }
 
+  // If we found a recursive CTE and we want to scan the recurring table, we search for it,
+  if (op.is_recurring) {
+    cte = recurring_cte_tables.find(op.cte_index);
+    if (cte == recurring_cte_tables.end()) {
+      throw InvalidInputException("RECURRING can only be used with USING KEY in recursive CTE.");
+    }
+  }
+
+  auto& types     = cte->second.get()->Types();
+  auto op_type    = op.is_recurring ? PhysicalOperatorType::RECURSIVE_RECURRING_CTE_SCAN
+                                    : PhysicalOperatorType::RECURSIVE_CTE_SCAN;
   auto chunk_scan = make_uniq<GPUPhysicalColumnDataScan>(cte->second.get()->Types(),
                                                          PhysicalOperatorType::RECURSIVE_CTE_SCAN,
                                                          op.estimated_cardinality,
                                                          op.cte_index);
 
   chunk_scan->collection = cte->second.get();
-
   return std::move(chunk_scan);
 }
 
