@@ -912,4 +912,4 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
   }
 }
 
-};  // namespace sirius
+}  // namespace sirius

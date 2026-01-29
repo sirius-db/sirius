@@ -334,7 +334,7 @@ T* GPUBufferManager::customCudaMalloc(size_t size, int gpu, bool caching)
     allocation_table[gpu][ptr] = alloc;
     return reinterpret_cast<T*>(ptr);
   }
-};
+}
 
 void GPUBufferManager::lockAllocation(void* ptr, int gpu)
 {
@@ -391,7 +391,7 @@ T* GPUBufferManager::customCudaHostAlloc(size_t size)
     throw InvalidInputException("Out of CPU memory");
   }
   return reinterpret_cast<T*>(cpuProcessing + start);
-};
+}
 
 void GPUBufferManager::createTableAndColumnInGPU(Catalog& catalog,
                                                  ClientContext& context,
@@ -488,4 +488,4 @@ void GPUBufferManager::createColumn(string up_table_name,
   }
 }
 
-};  // namespace duckdb
+}  // namespace duckdb

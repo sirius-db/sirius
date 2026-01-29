@@ -357,4 +357,4 @@ unique_ptr<QueryResult> GPUExecutor::GetResult()
   return res;
 }
 
-};  // namespace duckdb
+}  // namespace duckdb
