@@ -181,7 +181,7 @@ sirius_physical_top_n_merge::sirius_physical_top_n_merge(
   duckdb::shared_ptr<duckdb::DynamicFilterData> dynamic_filter_p,
   duckdb::idx_t estimated_cardinality)
   : sirius_physical_operator(
-      duckdb::PhysicalOperatorType::INVALID, std::move(types_p), estimated_cardinality),
+      duckdb::PhysicalOperatorType::EXTENSION, std::move(types_p), estimated_cardinality),
     orders(std::move(orders)),
     limit(limit),
     offset(offset),

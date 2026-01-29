@@ -23,8 +23,6 @@
 #include "duckdb/parser/group_by_node.hpp"
 #include "op/sirius_physical_operator.hpp"
 
-#include <cudf/scalar/scalar.hpp>
-
 namespace sirius {
 namespace op {
 
@@ -51,15 +49,28 @@ class sirius_physical_ungrouped_aggregate : public sirius_physical_operator {
   bool is_sink() const override { return true; }
   std::vector<std::shared_ptr<cucascade::data_batch>> execute(
     const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches) override;
+};
 
- private:
-  struct agg_state {
-    std::mutex _mutex;
-    bool _initialized = false;
-    std::vector<std::unique_ptr<cudf::scalar>> _running_values;  // one per aggregate
-    std::vector<int64_t> _running_counts;                        // for AVG/COUNT
-  };
-  std::shared_ptr<agg_state> _state = std::make_shared<agg_state>();
+class sirius_physical_ungrouped_aggregate_merge : public sirius_physical_operator {
+ public:
+  static constexpr const duckdb::PhysicalOperatorType TYPE =
+    duckdb::PhysicalOperatorType::EXTENSION;
+
+ public:
+  sirius_physical_ungrouped_aggregate_merge(
+    duckdb::vector<duckdb::LogicalType> types,
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> select_list,
+    duckdb::idx_t estimated_cardinality);
+
+  //! The aggregates that have to be computed
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> aggregates;
+
+  bool is_source() const override { return true; }
+
+ public:
+  bool is_sink() const override { return true; }
+  std::vector<std::shared_ptr<cucascade::data_batch>> execute(
+    const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches) override;
 };
 
 }  // namespace op

@@ -14,12 +14,14 @@
  * limitations under the License.
  */
 
-#include "data/data_batch_utils.hpp"
 #include "op/sirius_physical_ungrouped_aggregate.hpp"
 
+#include "data/data_batch_utils.hpp"
+#include "duckdb/common/types/decimal.hpp"
+#include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "expression_executor/gpu_expression_executor_state.hpp"
-#include "log/logging.hpp"
+#include "op/merge/gpu_merge_impl.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/fixed_point/fixed_point.hpp>
@@ -29,13 +31,14 @@
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
-#include <cuda_runtime.h>
+#include <rmm/resource_ref.hpp>
 
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
 
 #include <algorithm>
-#include <mutex>
+#include <cmath>
+#include <limits>
 
 namespace sirius {
 namespace op {
@@ -45,9 +48,8 @@ sirius_physical_ungrouped_aggregate::sirius_physical_ungrouped_aggregate(
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
   duckdb::idx_t estimated_cardinality,
   duckdb::TupleDataValidityType distinct_validity)
-  : sirius_physical_operator(duckdb::PhysicalOperatorType::UNGROUPED_AGGREGATE,
-                             std::move(types),
-                             estimated_cardinality),
+  : sirius_physical_operator(
+      duckdb::PhysicalOperatorType::UNGROUPED_AGGREGATE, std::move(types), estimated_cardinality),
     aggregates(std::move(expressions))
 {
   distinct_collection_info = duckdb::DistinctAggregateCollectionInfo::Create(aggregates);
@@ -78,13 +80,6 @@ ScalarType& scalar_cast(cudf::scalar& s)
 }
 
 template <typename T>
-void set_fixed_point_value(cudf::fixed_point_scalar<T>& s, typename T::rep value)
-{
-  cudaMemcpyAsync(
-    s.data(), &value, sizeof(value), cudaMemcpyHostToDevice, cudf::get_default_stream().value());
-}
-
-template <typename T>
 std::unique_ptr<cudf::scalar> make_numeric_scalar_with_value(cudf::data_type type, T value)
 {
   auto out = cudf::make_numeric_scalar(type);
@@ -92,209 +87,212 @@ std::unique_ptr<cudf::scalar> make_numeric_scalar_with_value(cudf::data_type typ
   return out;
 }
 
-template <typename Rep>
-std::unique_ptr<cudf::scalar> make_fixed_point_scalar_with_value(cudf::data_type type, Rep value)
+enum class aggregate_kind { SUM, MIN, MAX, COUNT, COUNT_STAR, AVG };
+
+struct aggregate_spec {
+  aggregate_kind kind;
+  int input_idx;
+  duckdb::LogicalType return_type;
+  size_t local_sum_idx;
+  size_t local_count_idx;
+};
+
+struct aggregate_layout {
+  std::vector<aggregate_spec> aggregates;
+  std::vector<duckdb::LogicalType> local_types;
+  std::vector<cudf::aggregation::Kind> merge_kinds;
+  bool has_avg = false;
+};
+
+aggregate_layout build_aggregate_layout(
+  const duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>& aggregates)
 {
-  auto out = cudf::make_fixed_point_scalar(type, value);
-  return out;
+  aggregate_layout layout;
+  size_t local_idx = 0;
+  layout.aggregates.reserve(aggregates.size());
+
+  for (size_t i = 0; i < aggregates.size(); ++i) {
+    auto& agg = aggregates[i]->Cast<duckdb::BoundAggregateExpression>();
+    if (agg.IsDistinct()) {
+      throw duckdb::NotImplementedException("Distinct aggregates not supported in GPU path yet");
+    }
+    if (agg.children.size() > 1) {
+      throw duckdb::NotImplementedException("Aggregates with multiple children not supported yet");
+    }
+
+    aggregate_spec spec;
+    spec.input_idx       = -1;
+    spec.return_type     = agg.return_type;
+    spec.local_sum_idx   = std::numeric_limits<size_t>::max();
+    spec.local_count_idx = std::numeric_limits<size_t>::max();
+
+    const auto& fname = agg.function.name;
+    if (fname == "count_star") {
+      spec.kind          = aggregate_kind::COUNT_STAR;
+      spec.return_type   = duckdb::LogicalType::BIGINT;
+      spec.local_sum_idx = local_idx++;
+      layout.local_types.push_back(duckdb::LogicalType::BIGINT);
+      layout.merge_kinds.push_back(cudf::aggregation::Kind::SUM);
+    } else if (fname == "count") {
+      if (agg.children.empty()) {
+        throw duckdb::NotImplementedException("count() without arguments not supported");
+      }
+      spec.kind          = aggregate_kind::COUNT;
+      spec.return_type   = duckdb::LogicalType::BIGINT;
+      spec.input_idx     = agg.children[0]->Cast<duckdb::BoundReferenceExpression>().index;
+      spec.local_sum_idx = local_idx++;
+      layout.local_types.push_back(duckdb::LogicalType::BIGINT);
+      layout.merge_kinds.push_back(cudf::aggregation::Kind::SUM);
+    } else if (fname == "sum" || fname == "sum_no_overflow") {
+      if (agg.children.empty()) {
+        throw duckdb::NotImplementedException("sum() without arguments not supported");
+      }
+      spec.kind          = aggregate_kind::SUM;
+      spec.input_idx     = agg.children[0]->Cast<duckdb::BoundReferenceExpression>().index;
+      spec.local_sum_idx = local_idx++;
+      layout.local_types.push_back(agg.return_type);
+      layout.merge_kinds.push_back(cudf::aggregation::Kind::SUM);
+    } else if (fname == "min") {
+      if (agg.children.empty()) {
+        throw duckdb::NotImplementedException("min() without arguments not supported");
+      }
+      spec.kind          = aggregate_kind::MIN;
+      spec.input_idx     = agg.children[0]->Cast<duckdb::BoundReferenceExpression>().index;
+      spec.local_sum_idx = local_idx++;
+      layout.local_types.push_back(agg.return_type);
+      layout.merge_kinds.push_back(cudf::aggregation::Kind::MIN);
+    } else if (fname == "max") {
+      if (agg.children.empty()) {
+        throw duckdb::NotImplementedException("max() without arguments not supported");
+      }
+      spec.kind          = aggregate_kind::MAX;
+      spec.input_idx     = agg.children[0]->Cast<duckdb::BoundReferenceExpression>().index;
+      spec.local_sum_idx = local_idx++;
+      layout.local_types.push_back(agg.return_type);
+      layout.merge_kinds.push_back(cudf::aggregation::Kind::MAX);
+    } else if (fname == "avg") {
+      if (agg.children.empty()) {
+        throw duckdb::NotImplementedException("avg() without arguments not supported");
+      }
+      spec.kind          = aggregate_kind::AVG;
+      spec.input_idx     = agg.children[0]->Cast<duckdb::BoundReferenceExpression>().index;
+      spec.local_sum_idx = local_idx++;
+      layout.local_types.push_back(agg.return_type);
+      layout.merge_kinds.push_back(cudf::aggregation::Kind::SUM);
+      spec.local_count_idx = local_idx++;
+      layout.local_types.push_back(duckdb::LogicalType::BIGINT);
+      layout.merge_kinds.push_back(cudf::aggregation::Kind::SUM);
+      layout.has_avg = true;
+    } else {
+      throw duckdb::NotImplementedException("Aggregate not supported: " + fname);
+    }
+
+    layout.aggregates.push_back(std::move(spec));
+  }
+
+  return layout;
 }
 
-// Sum two scalars of same type_id, returning updated accumulator (in-place)
-void accumulate_sum(cudf::scalar& acc, const cudf::scalar& incoming)
+std::unique_ptr<cudf::column> make_avg_column(const cudf::column_view& sum_view,
+                                              const cudf::column_view& count_view,
+                                              const duckdb::LogicalType& return_type,
+                                              rmm::cuda_stream_view stream,
+                                              rmm::device_async_resource_ref memory_resource)
 {
-  auto id = acc.type().id();
-  switch (id) {
-    case cudf::type_id::INT8: {
-      auto v = scalar_cast<cudf::numeric_scalar<int8_t>>(acc).value() +
-               scalar_cast<cudf::numeric_scalar<int8_t>>(incoming).value();
-      scalar_cast<cudf::numeric_scalar<int8_t>>(acc).set_value(v, cudf::get_default_stream());
-      break;
-    }
-    case cudf::type_id::INT16: {
-      auto v = scalar_cast<cudf::numeric_scalar<int16_t>>(acc).value() +
-               scalar_cast<cudf::numeric_scalar<int16_t>>(incoming).value();
-      scalar_cast<cudf::numeric_scalar<int16_t>>(acc).set_value(v, cudf::get_default_stream());
-      break;
-    }
-    case cudf::type_id::INT32: {
-      auto v = scalar_cast<cudf::numeric_scalar<int32_t>>(acc).value() +
-               scalar_cast<cudf::numeric_scalar<int32_t>>(incoming).value();
-      scalar_cast<cudf::numeric_scalar<int32_t>>(acc).set_value(v, cudf::get_default_stream());
-      break;
-    }
-    case cudf::type_id::INT64: {
-      auto v = scalar_cast<cudf::numeric_scalar<int64_t>>(acc).value() +
-               scalar_cast<cudf::numeric_scalar<int64_t>>(incoming).value();
-      scalar_cast<cudf::numeric_scalar<int64_t>>(acc).set_value(v, cudf::get_default_stream());
-      break;
-    }
-    case cudf::type_id::UINT8: {
-      auto v = scalar_cast<cudf::numeric_scalar<uint8_t>>(acc).value() +
-               scalar_cast<cudf::numeric_scalar<uint8_t>>(incoming).value();
-      scalar_cast<cudf::numeric_scalar<uint8_t>>(acc).set_value(v, cudf::get_default_stream());
-      break;
-    }
-    case cudf::type_id::UINT16: {
-      auto v = scalar_cast<cudf::numeric_scalar<uint16_t>>(acc).value() +
-               scalar_cast<cudf::numeric_scalar<uint16_t>>(incoming).value();
-      scalar_cast<cudf::numeric_scalar<uint16_t>>(acc).set_value(v, cudf::get_default_stream());
-      break;
-    }
-    case cudf::type_id::UINT32: {
-      auto v = scalar_cast<cudf::numeric_scalar<uint32_t>>(acc).value() +
-               scalar_cast<cudf::numeric_scalar<uint32_t>>(incoming).value();
-      scalar_cast<cudf::numeric_scalar<uint32_t>>(acc).set_value(v, cudf::get_default_stream());
-      break;
-    }
-    case cudf::type_id::UINT64: {
-      auto v = scalar_cast<cudf::numeric_scalar<uint64_t>>(acc).value() +
-               scalar_cast<cudf::numeric_scalar<uint64_t>>(incoming).value();
-      scalar_cast<cudf::numeric_scalar<uint64_t>>(acc).set_value(v, cudf::get_default_stream());
-      break;
-    }
-    case cudf::type_id::FLOAT32: {
-      auto v = scalar_cast<cudf::numeric_scalar<float>>(acc).value() +
-               scalar_cast<cudf::numeric_scalar<float>>(incoming).value();
-      scalar_cast<cudf::numeric_scalar<float>>(acc).set_value(v, cudf::get_default_stream());
-      break;
-    }
-    case cudf::type_id::FLOAT64: {
-      auto v = scalar_cast<cudf::numeric_scalar<double>>(acc).value() +
-               scalar_cast<cudf::numeric_scalar<double>>(incoming).value();
-      scalar_cast<cudf::numeric_scalar<double>>(acc).set_value(v, cudf::get_default_stream());
-      break;
-    }
-    case cudf::type_id::DECIMAL32: {
-      using dec_t = numeric::decimal32;
-      auto v      = scalar_cast<cudf::fixed_point_scalar<dec_t>>(acc).value() +
-               scalar_cast<cudf::fixed_point_scalar<dec_t>>(incoming).value();
-      set_fixed_point_value(scalar_cast<cudf::fixed_point_scalar<dec_t>>(acc), v);
-      break;
-    }
-    case cudf::type_id::DECIMAL64: {
-      using dec_t = numeric::decimal64;
-      auto v      = scalar_cast<cudf::fixed_point_scalar<dec_t>>(acc).value() +
-               scalar_cast<cudf::fixed_point_scalar<dec_t>>(incoming).value();
-      set_fixed_point_value(scalar_cast<cudf::fixed_point_scalar<dec_t>>(acc), v);
-      break;
-    }
-    case cudf::type_id::DECIMAL128: {
-      using dec_t = numeric::decimal128;
-      auto v      = scalar_cast<cudf::fixed_point_scalar<dec_t>>(acc).value() +
-               scalar_cast<cudf::fixed_point_scalar<dec_t>>(incoming).value();
-      set_fixed_point_value(scalar_cast<cudf::fixed_point_scalar<dec_t>>(acc), v);
-      break;
-    }
-    default:
-      throw duckdb::NotImplementedException("Unsupported type for sum in GPU ungrouped aggregate");
-  }
-}
+  auto sum_agg     = cudf::make_sum_aggregation<cudf::reduce_aggregation>();
+  auto sum_type    = ToCudfType(return_type);
+  auto sum_value   = cudf::reduce(sum_view, *sum_agg, sum_type, stream, memory_resource);
+  auto count_value = cudf::reduce(
+    count_view, *sum_agg, cudf::data_type(cudf::type_id::INT64), stream, memory_resource);
 
-// update min/max
-enum class minmax_op { MIN, MAX };
-void accumulate_minmax(cudf::scalar& acc, const cudf::scalar& incoming, minmax_op op)
-{
-  auto id         = acc.type().id();
-  auto choose_min = op == minmax_op::MIN;
-  switch (id) {
-    case cudf::type_id::INT8: {
-      auto a = scalar_cast<cudf::numeric_scalar<int8_t>>(acc).value();
-      auto b = scalar_cast<cudf::numeric_scalar<int8_t>>(incoming).value();
-      auto v = choose_min ? std::min(a, b) : std::max(a, b);
-      scalar_cast<cudf::numeric_scalar<int8_t>>(acc).set_value(v, cudf::get_default_stream());
-      break;
+  auto const count_host = scalar_cast<cudf::numeric_scalar<int64_t>>(*count_value).value();
+  std::unique_ptr<cudf::scalar> out_scalar;
+  if (return_type.id() == duckdb::LogicalTypeId::DECIMAL) {
+    auto scale           = duckdb::DecimalType::GetScale(return_type);
+    auto width           = duckdb::DecimalType::GetWidth(return_type);
+    auto scale_type      = numeric::scale_type{-scale};
+    auto denom           = std::pow(10.0L, static_cast<long double>(scale));
+    long double sum_host = 0.0L;
+    switch (sum_type.id()) {
+      case cudf::type_id::DECIMAL32: {
+        auto& sum_scalar = static_cast<cudf::fixed_point_scalar<numeric::decimal32>&>(*sum_value);
+        sum_host         = static_cast<long double>(sum_scalar.value(stream)) / denom;
+        break;
+      }
+      case cudf::type_id::DECIMAL64: {
+        auto& sum_scalar = static_cast<cudf::fixed_point_scalar<numeric::decimal64>&>(*sum_value);
+        sum_host         = static_cast<long double>(sum_scalar.value(stream)) / denom;
+        break;
+      }
+      case cudf::type_id::DECIMAL128: {
+        auto& sum_scalar = static_cast<cudf::fixed_point_scalar<numeric::decimal128>&>(*sum_value);
+        sum_host         = static_cast<long double>(sum_scalar.value(stream)) / denom;
+        break;
+      }
+      default: throw duckdb::NotImplementedException("AVG decimal sum type not supported");
     }
-    case cudf::type_id::INT16: {
-      auto a = scalar_cast<cudf::numeric_scalar<int16_t>>(acc).value();
-      auto b = scalar_cast<cudf::numeric_scalar<int16_t>>(incoming).value();
-      auto v = choose_min ? std::min(a, b) : std::max(a, b);
-      scalar_cast<cudf::numeric_scalar<int16_t>>(acc).set_value(v, cudf::get_default_stream());
-      break;
+    long double avg_host = (count_host == 0) ? 0.0L : (sum_host / count_host);
+    long double scaled   = avg_host * denom;
+    if (width <= duckdb::Decimal::MAX_WIDTH_INT32) {
+      auto rep   = static_cast<int32_t>(std::llround(scaled));
+      out_scalar = std::make_unique<cudf::fixed_point_scalar<numeric::decimal32>>(
+        rep, scale_type, true, stream, memory_resource);
+    } else if (width <= duckdb::Decimal::MAX_WIDTH_INT64) {
+      auto rep   = static_cast<int64_t>(std::llround(scaled));
+      out_scalar = std::make_unique<cudf::fixed_point_scalar<numeric::decimal64>>(
+        rep, scale_type, true, stream, memory_resource);
+    } else {
+      auto rep   = static_cast<__int128_t>(std::llround(scaled));
+      out_scalar = std::make_unique<cudf::fixed_point_scalar<numeric::decimal128>>(
+        rep, scale_type, true, stream, memory_resource);
     }
-    case cudf::type_id::INT32: {
-      auto a = scalar_cast<cudf::numeric_scalar<int32_t>>(acc).value();
-      auto b = scalar_cast<cudf::numeric_scalar<int32_t>>(incoming).value();
-      auto v = choose_min ? std::min(a, b) : std::max(a, b);
-      scalar_cast<cudf::numeric_scalar<int32_t>>(acc).set_value(v, cudf::get_default_stream());
-      break;
+  } else {
+    if (count_host == 0) {
+      switch (sum_type.id()) {
+        case cudf::type_id::FLOAT32:
+          out_scalar = make_numeric_scalar_with_value<float>(sum_type, 0.0f);
+          break;
+        case cudf::type_id::FLOAT64:
+          out_scalar = make_numeric_scalar_with_value<double>(sum_type, 0.0);
+          break;
+        case cudf::type_id::INT32:
+          out_scalar = make_numeric_scalar_with_value<int32_t>(sum_type, 0);
+          break;
+        case cudf::type_id::INT64:
+          out_scalar = make_numeric_scalar_with_value<int64_t>(sum_type, 0);
+          break;
+        default: throw duckdb::NotImplementedException("AVG output type not supported");
+      }
+    } else {
+      switch (sum_type.id()) {
+        case cudf::type_id::FLOAT32: {
+          auto sum_host = scalar_cast<cudf::numeric_scalar<float>>(*sum_value).value();
+          out_scalar    = make_numeric_scalar_with_value<float>(sum_type, sum_host / count_host);
+          break;
+        }
+        case cudf::type_id::FLOAT64: {
+          auto sum_host = scalar_cast<cudf::numeric_scalar<double>>(*sum_value).value();
+          out_scalar    = make_numeric_scalar_with_value<double>(sum_type, sum_host / count_host);
+          break;
+        }
+        case cudf::type_id::INT32: {
+          auto sum_host = scalar_cast<cudf::numeric_scalar<int32_t>>(*sum_value).value();
+          out_scalar    = make_numeric_scalar_with_value<int32_t>(
+            sum_type, static_cast<int32_t>(sum_host / count_host));
+          break;
+        }
+        case cudf::type_id::INT64: {
+          auto sum_host = scalar_cast<cudf::numeric_scalar<int64_t>>(*sum_value).value();
+          out_scalar    = make_numeric_scalar_with_value<int64_t>(
+            sum_type, static_cast<int64_t>(sum_host / count_host));
+          break;
+        }
+        default: throw duckdb::NotImplementedException("AVG output type not supported");
+      }
     }
-    case cudf::type_id::INT64: {
-      auto a = scalar_cast<cudf::numeric_scalar<int64_t>>(acc).value();
-      auto b = scalar_cast<cudf::numeric_scalar<int64_t>>(incoming).value();
-      auto v = choose_min ? std::min(a, b) : std::max(a, b);
-      scalar_cast<cudf::numeric_scalar<int64_t>>(acc).set_value(v, cudf::get_default_stream());
-      break;
-    }
-    case cudf::type_id::UINT8: {
-      auto a = scalar_cast<cudf::numeric_scalar<uint8_t>>(acc).value();
-      auto b = scalar_cast<cudf::numeric_scalar<uint8_t>>(incoming).value();
-      auto v = choose_min ? std::min(a, b) : std::max(a, b);
-      scalar_cast<cudf::numeric_scalar<uint8_t>>(acc).set_value(v, cudf::get_default_stream());
-      break;
-    }
-    case cudf::type_id::UINT16: {
-      auto a = scalar_cast<cudf::numeric_scalar<uint16_t>>(acc).value();
-      auto b = scalar_cast<cudf::numeric_scalar<uint16_t>>(incoming).value();
-      auto v = choose_min ? std::min(a, b) : std::max(a, b);
-      scalar_cast<cudf::numeric_scalar<uint16_t>>(acc).set_value(v, cudf::get_default_stream());
-      break;
-    }
-    case cudf::type_id::UINT32: {
-      auto a = scalar_cast<cudf::numeric_scalar<uint32_t>>(acc).value();
-      auto b = scalar_cast<cudf::numeric_scalar<uint32_t>>(incoming).value();
-      auto v = choose_min ? std::min(a, b) : std::max(a, b);
-      scalar_cast<cudf::numeric_scalar<uint32_t>>(acc).set_value(v, cudf::get_default_stream());
-      break;
-    }
-    case cudf::type_id::UINT64: {
-      auto a = scalar_cast<cudf::numeric_scalar<uint64_t>>(acc).value();
-      auto b = scalar_cast<cudf::numeric_scalar<uint64_t>>(incoming).value();
-      auto v = choose_min ? std::min(a, b) : std::max(a, b);
-      scalar_cast<cudf::numeric_scalar<uint64_t>>(acc).set_value(v, cudf::get_default_stream());
-      break;
-    }
-    case cudf::type_id::FLOAT32: {
-      auto a = scalar_cast<cudf::numeric_scalar<float>>(acc).value();
-      auto b = scalar_cast<cudf::numeric_scalar<float>>(incoming).value();
-      auto v = choose_min ? std::min(a, b) : std::max(a, b);
-      scalar_cast<cudf::numeric_scalar<float>>(acc).set_value(v, cudf::get_default_stream());
-      break;
-    }
-    case cudf::type_id::FLOAT64: {
-      auto a = scalar_cast<cudf::numeric_scalar<double>>(acc).value();
-      auto b = scalar_cast<cudf::numeric_scalar<double>>(incoming).value();
-      auto v = choose_min ? std::min(a, b) : std::max(a, b);
-      scalar_cast<cudf::numeric_scalar<double>>(acc).set_value(v, cudf::get_default_stream());
-      break;
-    }
-    case cudf::type_id::DECIMAL32: {
-      using dec_t = numeric::decimal32;
-      auto a      = scalar_cast<cudf::fixed_point_scalar<dec_t>>(acc).value();
-      auto b      = scalar_cast<cudf::fixed_point_scalar<dec_t>>(incoming).value();
-      auto v      = choose_min ? std::min(a, b) : std::max(a, b);
-      set_fixed_point_value(scalar_cast<cudf::fixed_point_scalar<dec_t>>(acc), v);
-      break;
-    }
-    case cudf::type_id::DECIMAL64: {
-      using dec_t = numeric::decimal64;
-      auto a      = scalar_cast<cudf::fixed_point_scalar<dec_t>>(acc).value();
-      auto b      = scalar_cast<cudf::fixed_point_scalar<dec_t>>(incoming).value();
-      auto v      = choose_min ? std::min(a, b) : std::max(a, b);
-      set_fixed_point_value(scalar_cast<cudf::fixed_point_scalar<dec_t>>(acc), v);
-      break;
-    }
-    case cudf::type_id::DECIMAL128: {
-      using dec_t = numeric::decimal128;
-      auto a      = scalar_cast<cudf::fixed_point_scalar<dec_t>>(acc).value();
-      auto b      = scalar_cast<cudf::fixed_point_scalar<dec_t>>(incoming).value();
-      auto v      = choose_min ? std::min(a, b) : std::max(a, b);
-      set_fixed_point_value(scalar_cast<cudf::fixed_point_scalar<dec_t>>(acc), v);
-      break;
-    }
-    default:
-      throw duckdb::NotImplementedException(
-        "Unsupported type for min/max in GPU ungrouped aggregate");
   }
+
+  return cudf::make_column_from_scalar(*out_scalar, 1, stream, memory_resource);
 }
 
 }  // namespace
@@ -304,198 +302,141 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_ungrouped_ag
 {
   if (aggregates.empty()) { return {}; }
 
-  cucascade::memory::memory_space* space = nullptr;
-  for (auto const& batch : input_batches) {
-    if (batch) {
-      space = batch->get_memory_space();
-      break;
-    }
-  }
-  if (space == nullptr) { return {}; }
-
-  std::unique_lock<std::mutex> lk(_state->_mutex);
-  if (!_state->_initialized) {
-    _state->_running_values.resize(aggregates.size());
-    _state->_running_counts.resize(aggregates.size(), 0);
-    _state->_initialized = true;
-  }
+  auto layout = build_aggregate_layout(aggregates);
+  std::vector<std::shared_ptr<cucascade::data_batch>> outputs;
+  outputs.reserve(input_batches.size());
 
   for (auto const& batch : input_batches) {
     if (!batch) { continue; }
-    auto table = batch->get_data()->cast<cucascade::gpu_table_representation>().get_table();
-    auto view  = table.view();
+    auto* space = batch->get_memory_space();
+    if (!space) { continue; }
 
-    for (idx_t i = 0; i < aggregates.size(); ++i) {
-      auto& agg = aggregates[i]->Cast<duckdb::BoundAggregateExpression>();
-      if (agg.IsDistinct()) {
-        throw duckdb::NotImplementedException("Distinct aggregates not supported in GPU path yet");
-      }
-      auto fname = agg.function.name;
+    auto stream = space->acquire_stream();
+    auto table  = batch->get_data()->cast<cucascade::gpu_table_representation>().get_table();
+    auto view   = table.view();
 
-      if (fname == "count_star") {
-        _state->_running_counts[i] += static_cast<int64_t>(view.num_rows());
-      } else if (fname == "count") {
-        D_ASSERT(agg.children.size() == 1);
-        auto idx    = agg.children[0]->Cast<duckdb::BoundReferenceExpression>().index;
-        auto col    = view.column(static_cast<cudf::size_type>(idx));
-        auto agg_op = cudf::make_count_aggregation<cudf::reduce_aggregation>();
-        auto s      = cudf::reduce(col,
-                              *agg_op,
-                              cudf::data_type(cudf::type_id::INT64),
-                              std::nullopt,
-                              cudf::get_default_stream(),
-                              rmm::mr::get_current_device_resource());
-        _state->_running_counts[i] += static_cast<const cudf::numeric_scalar<int64_t>&>(*s).value();
-      } else {
-        D_ASSERT(agg.children.size() == 1);
-        auto idx      = agg.children[0]->Cast<duckdb::BoundReferenceExpression>().index;
-        auto col      = view.column(static_cast<cudf::size_type>(idx));
-        auto out_type = ToCudfType(agg.return_type);
-        std::unique_ptr<cudf::scalar> s;
-        if (fname == "sum" || fname == "sum_no_overflow") {
-          auto agg_op = cudf::make_sum_aggregation<cudf::reduce_aggregation>();
-          s           = cudf::reduce(col,
-                           *agg_op,
-                           out_type,
-                           std::nullopt,
-                           cudf::get_default_stream(),
-                           rmm::mr::get_current_device_resource());
-          if (!_state->_running_values[i]) {
-            _state->_running_values[i] = std::move(s);
+    std::vector<std::unique_ptr<cudf::column>> cols;
+    cols.reserve(layout.local_types.size());
+
+    for (auto const& spec : layout.aggregates) {
+      switch (spec.kind) {
+        case aggregate_kind::COUNT_STAR: {
+          auto scalar = make_numeric_scalar_with_value<int64_t>(
+            cudf::data_type{cudf::type_id::INT64}, static_cast<int64_t>(view.num_rows()));
+          cols.push_back(
+            cudf::make_column_from_scalar(*scalar, 1, stream, space->get_default_allocator()));
+          break;
+        }
+        case aggregate_kind::COUNT: {
+          auto col    = view.column(static_cast<cudf::size_type>(spec.input_idx));
+          auto agg_op = cudf::make_count_aggregation<cudf::reduce_aggregation>();
+          auto scalar = cudf::reduce(col,
+                                     *agg_op,
+                                     cudf::data_type(cudf::type_id::INT64),
+                                     std::nullopt,
+                                     stream,
+                                     space->get_default_allocator());
+          cols.push_back(
+            cudf::make_column_from_scalar(*scalar, 1, stream, space->get_default_allocator()));
+          break;
+        }
+        case aggregate_kind::SUM:
+        case aggregate_kind::MIN:
+        case aggregate_kind::MAX:
+        case aggregate_kind::AVG: {
+          auto col      = view.column(static_cast<cudf::size_type>(spec.input_idx));
+          auto out_type = ToCudfType(spec.return_type);
+          std::unique_ptr<cudf::reduce_aggregation> agg_op;
+          if (spec.kind == aggregate_kind::MIN) {
+            agg_op = cudf::make_min_aggregation<cudf::reduce_aggregation>();
+          } else if (spec.kind == aggregate_kind::MAX) {
+            agg_op = cudf::make_max_aggregation<cudf::reduce_aggregation>();
           } else {
-            accumulate_sum(*_state->_running_values[i], *s);
+            agg_op = cudf::make_sum_aggregation<cudf::reduce_aggregation>();
           }
-        } else if (fname == "min") {
-          auto agg_op = cudf::make_min_aggregation<cudf::reduce_aggregation>();
-          s           = cudf::reduce(col,
-                           *agg_op,
-                           out_type,
-                           std::nullopt,
-                           cudf::get_default_stream(),
-                           rmm::mr::get_current_device_resource());
-          if (!_state->_running_values[i]) {
-            _state->_running_values[i] = std::move(s);
-          } else {
-            accumulate_minmax(*_state->_running_values[i], *s, minmax_op::MIN);
+          auto scalar = cudf::reduce(
+            col, *agg_op, out_type, std::nullopt, stream, space->get_default_allocator());
+          cols.push_back(
+            cudf::make_column_from_scalar(*scalar, 1, stream, space->get_default_allocator()));
+          if (spec.kind == aggregate_kind::AVG) {
+            auto count_scalar = make_numeric_scalar_with_value<int64_t>(
+              cudf::data_type{cudf::type_id::INT64}, static_cast<int64_t>(view.num_rows()));
+            cols.push_back(cudf::make_column_from_scalar(
+              *count_scalar, 1, stream, space->get_default_allocator()));
           }
-        } else if (fname == "max") {
-          auto agg_op = cudf::make_max_aggregation<cudf::reduce_aggregation>();
-          s           = cudf::reduce(col,
-                           *agg_op,
-                           out_type,
-                           std::nullopt,
-                           cudf::get_default_stream(),
-                           rmm::mr::get_current_device_resource());
-          if (!_state->_running_values[i]) {
-            _state->_running_values[i] = std::move(s);
-          } else {
-            accumulate_minmax(*_state->_running_values[i], *s, minmax_op::MAX);
-          }
-        } else if (fname == "avg") {
-          auto agg_op = cudf::make_sum_aggregation<cudf::reduce_aggregation>();
-          s           = cudf::reduce(col,
-                           *agg_op,
-                           out_type,
-                           std::nullopt,
-                           cudf::get_default_stream(),
-                           rmm::mr::get_current_device_resource());
-          if (!_state->_running_values[i]) {
-            _state->_running_values[i] = std::move(s);
-          } else {
-            accumulate_sum(*_state->_running_values[i], *s);
-          }
-          _state->_running_counts[i] += static_cast<int64_t>(view.num_rows());
-        } else {
-          throw duckdb::NotImplementedException("Aggregate not supported: " + fname);
+          break;
         }
       }
     }
+
+    auto out_table = std::make_unique<cudf::table>(std::move(cols));
+    std::unique_ptr<cucascade::idata_representation> output_data =
+      std::make_unique<cucascade::gpu_table_representation>(*out_table, *space);
+    auto const batch_id = ::sirius::get_next_batch_id();
+    outputs.push_back(std::make_shared<cucascade::data_batch>(batch_id, std::move(output_data)));
   }
 
-  // Build output row
-  std::vector<std::unique_ptr<cudf::column>> cols;
-  cols.reserve(aggregates.size());
-  auto stream = cudf::get_default_stream();
+  return outputs;
+}
 
-  for (idx_t i = 0; i < aggregates.size(); ++i) {
-    auto& agg = aggregates[i]->Cast<duckdb::BoundAggregateExpression>();
-    auto tid  = ToCudfType(agg.return_type);
+sirius_physical_ungrouped_aggregate_merge::sirius_physical_ungrouped_aggregate_merge(
+  duckdb::vector<duckdb::LogicalType> types,
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
+  duckdb::idx_t estimated_cardinality)
+  : sirius_physical_operator(
+      duckdb::PhysicalOperatorType::EXTENSION, std::move(types), estimated_cardinality),
+    aggregates(std::move(expressions))
+{
+}
 
-    std::unique_ptr<cudf::scalar> tmp_scalar;
-    const cudf::scalar* out_scalar = nullptr;
-    if (agg.function.name == "avg") {
-      auto const cnt = _state->_running_counts[i];
-      if (cnt == 0) {
-        // produce zero of target type
-        switch (tid.id()) {
-          case cudf::type_id::FLOAT32: {
-            tmp_scalar = make_numeric_scalar_with_value<float>(tid, 0.0f);
-            out_scalar = tmp_scalar.get();
-            break;
-          }
-          case cudf::type_id::FLOAT64: {
-            tmp_scalar = make_numeric_scalar_with_value<double>(tid, 0.0);
-            out_scalar = tmp_scalar.get();
-            break;
-          }
-          case cudf::type_id::INT32: {
-            tmp_scalar = make_numeric_scalar_with_value<int32_t>(tid, 0);
-            out_scalar = tmp_scalar.get();
-            break;
-          }
-          case cudf::type_id::INT64: {
-            tmp_scalar = make_numeric_scalar_with_value<int64_t>(tid, 0);
-            out_scalar = tmp_scalar.get();
-            break;
-          }
-          default: throw duckdb::NotImplementedException("AVG output type not supported");
-        }
-      } else {
-        // compute avg in double then cast to target type
-        double sum_host = 0.0;
-        switch (tid.id()) {
-          case cudf::type_id::FLOAT32:
-            sum_host =
-              scalar_cast<cudf::numeric_scalar<float>>(*_state->_running_values[i]).value();
-            _state->_running_values[i] =
-              make_numeric_scalar_with_value<float>(tid, static_cast<float>(sum_host / cnt));
-            break;
-          case cudf::type_id::FLOAT64:
-            sum_host =
-              scalar_cast<cudf::numeric_scalar<double>>(*_state->_running_values[i]).value();
-            _state->_running_values[i] =
-              make_numeric_scalar_with_value<double>(tid, sum_host / cnt);
-            break;
-          case cudf::type_id::INT32:
-            sum_host =
-              scalar_cast<cudf::numeric_scalar<int32_t>>(*_state->_running_values[i]).value();
-            _state->_running_values[i] =
-              make_numeric_scalar_with_value<int32_t>(tid, static_cast<int32_t>(sum_host / cnt));
-            break;
-          case cudf::type_id::INT64:
-            sum_host =
-              scalar_cast<cudf::numeric_scalar<int64_t>>(*_state->_running_values[i]).value();
-            _state->_running_values[i] =
-              make_numeric_scalar_with_value<int64_t>(tid, static_cast<int64_t>(sum_host / cnt));
-            break;
-          default: throw duckdb::NotImplementedException("AVG output type not supported");
-        }
-        out_scalar = _state->_running_values[i].get();
-      }
-    } else if (agg.function.name == "count" || agg.function.name == "count_star") {
-      tmp_scalar = make_numeric_scalar_with_value<int64_t>(cudf::data_type{cudf::type_id::INT64},
-                                                           _state->_running_counts[i]);
-      out_scalar = tmp_scalar.get();
+std::vector<std::shared_ptr<cucascade::data_batch>>
+sirius_physical_ungrouped_aggregate_merge::execute(
+  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches)
+{
+  if (aggregates.empty()) { return {}; }
+
+  std::vector<std::shared_ptr<cucascade::data_batch>> valid_batches;
+  valid_batches.reserve(input_batches.size());
+  for (auto const& batch : input_batches) {
+    if (batch) { valid_batches.push_back(batch); }
+  }
+  if (valid_batches.empty()) { return {}; }
+
+  cucascade::memory::memory_space* space = valid_batches[0]->get_memory_space();
+  if (space == nullptr) { return {}; }
+
+  auto layout = build_aggregate_layout(aggregates);
+  auto stream = space->acquire_stream();
+  std::shared_ptr<cucascade::data_batch> merged_batch;
+  if (valid_batches.size() == 1) {
+    merged_batch = valid_batches[0];
+  } else {
+    merged_batch =
+      gpu_merge_impl::merge_ungrouped_aggregate(valid_batches, layout.merge_kinds, stream, *space);
+  }
+
+  if (!layout.has_avg) { return {std::move(merged_batch)}; }
+
+  auto merged_table =
+    merged_batch->get_data()->cast<cucascade::gpu_table_representation>().get_table();
+  auto merged_view = merged_table.view();
+
+  std::vector<std::unique_ptr<cudf::column>> output_cols;
+  output_cols.reserve(layout.aggregates.size());
+  for (auto const& spec : layout.aggregates) {
+    if (spec.kind == aggregate_kind::AVG) {
+      auto sum_view   = merged_view.column(static_cast<cudf::size_type>(spec.local_sum_idx));
+      auto count_view = merged_view.column(static_cast<cudf::size_type>(spec.local_count_idx));
+      output_cols.push_back(make_avg_column(
+        sum_view, count_view, spec.return_type, stream, space->get_default_allocator()));
     } else {
-      // sum/min/max already accumulated in _running_values
-      out_scalar = _state->_running_values[i].get();  // non-owning
+      auto col_view = merged_view.column(static_cast<cudf::size_type>(spec.local_sum_idx));
+      output_cols.push_back(
+        std::make_unique<cudf::column>(col_view, stream, space->get_default_allocator()));
     }
-
-    cols.push_back(cudf::make_column_from_scalar(
-      *out_scalar, 1, stream, rmm::mr::get_current_device_resource()));
   }
 
-  auto out_table = std::make_unique<cudf::table>(std::move(cols));
+  auto out_table = std::make_unique<cudf::table>(std::move(output_cols));
   std::unique_ptr<cucascade::idata_representation> output_data =
     std::make_unique<cucascade::gpu_table_representation>(*out_table, *space);
   auto const batch_id = ::sirius::get_next_batch_id();

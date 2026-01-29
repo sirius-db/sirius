@@ -34,6 +34,7 @@
 #include "op/sirius_physical_result_collector.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "op/sirius_physical_top_n.hpp"
+#include "op/sirius_physical_ungrouped_aggregate.hpp"
 #include "operator/gpu_physical_concat.hpp"
 #include "operator/gpu_physical_cte.hpp"
 #include "operator/gpu_physical_delim_join.hpp"
@@ -808,9 +809,13 @@ void GPUExecutor::initialize_internal(::sirius::op::sirius_physical_operator& pl
       for (size_t i = 0; i < new_scheduled.size(); i++) {
         const bool is_top_n_merge_sink = dynamic_cast<sirius::op::sirius_physical_top_n_merge*>(
                                            new_scheduled[i]->sink.get()) != nullptr;
+        const bool is_ungrouped_agg_merge_sink =
+          dynamic_cast<sirius::op::sirius_physical_ungrouped_aggregate_merge*>(
+            new_scheduled[i]->sink.get()) != nullptr;
         if (new_scheduled[i]->sink->type == PhysicalOperatorType::HASH_GROUP_BY ||
             new_scheduled[i]->sink->type == PhysicalOperatorType::ORDER_BY ||
             new_scheduled[i]->sink->type == PhysicalOperatorType::TOP_N || is_top_n_merge_sink ||
+            is_ungrouped_agg_merge_sink ||
             new_scheduled[i]->sink->type == PhysicalOperatorType::UNGROUPED_AGGREGATE) {
           auto sink_op             = new_scheduled[i]->get_sink().get();
           std::string_view port_id = "default";
@@ -861,16 +866,15 @@ void GPUExecutor::initialize_internal(::sirius::op::sirius_physical_operator& pl
           for (auto dependent_pipeline : source_to_pipelines[column_data_scan]) {
             insert_repository("default", column_data_scan, new_scheduled[i], dependent_pipeline);
           }
-        } else if (new_scheduled[i]->sink->type == PhysicalOperatorType::INVALID) {
-          auto& partition =
-            new_scheduled[i]->get_sink()->Cast<sirius::op::sirius_physical_partition>();
-          std::string_view port_id = partition.is_build_partition() ? "build" : "default";
+        } else if (auto* partition = dynamic_cast<sirius::op::sirius_physical_partition*>(
+                     new_scheduled[i]->sink.get())) {
+          std::string_view port_id = partition->is_build_partition() ? "build" : "default";
 
-          if (partition.is_build_partition()) {
+          if (partition->is_build_partition()) {
             // For build partitions, no pipeline uses it as source.
             // Instead, connect directly to the HASH_JOIN operator stored in parent_op.
             // Find the pipeline containing this HASH_JOIN as the first operator.
-            sirius::op::sirius_physical_operator* hash_join_op = partition.get_parent_op();
+            sirius::op::sirius_physical_operator* hash_join_op = partition->get_parent_op();
             bool found                                         = false;
             for (size_t j = 0; j < new_scheduled.size(); j++) {
               // The join is guaranteed to be the first operator in the pipeline
@@ -983,7 +987,7 @@ void GPUExecutor::initialize_internal(::sirius::op::sirius_physical_operator& pl
                    dynamic_cast<sirius::op::sirius_physical_top_n_merge*>(pipeline->sink.get()) !=
                      nullptr ||
                    pipeline->sink->type == PhysicalOperatorType::UNGROUPED_AGGREGATE ||
-                   pipeline->sink->type == PhysicalOperatorType::INVALID ||
+                   pipeline->sink->type == PhysicalOperatorType::EXTENSION ||
                    pipeline->sink->type == PhysicalOperatorType::CTE) {
           std::string msg = "Sink " + pipeline->sink->get_name() + " next op after sink: ";
           for (auto next_port : pipeline->sink->get_next_port_after_sink()) {

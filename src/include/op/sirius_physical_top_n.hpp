@@ -66,7 +66,8 @@ class sirius_physical_top_n : public sirius_physical_operator {
 
 class sirius_physical_top_n_merge : public sirius_physical_operator {
  public:
-  static constexpr const duckdb::PhysicalOperatorType TYPE = duckdb::PhysicalOperatorType::INVALID;
+  static constexpr const duckdb::PhysicalOperatorType TYPE =
+    duckdb::PhysicalOperatorType::EXTENSION;
 
  public:
   sirius_physical_top_n_merge(duckdb::vector<duckdb::LogicalType> types_p,

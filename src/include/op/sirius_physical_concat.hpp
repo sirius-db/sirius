@@ -29,7 +29,8 @@ namespace op {
 
 class sirius_physical_concat : public sirius_physical_operator {
  public:
-  static constexpr const duckdb::PhysicalOperatorType TYPE = duckdb::PhysicalOperatorType::INVALID;
+  static constexpr const duckdb::PhysicalOperatorType TYPE =
+    duckdb::PhysicalOperatorType::EXTENSION;
 
   explicit sirius_physical_concat(duckdb::vector<duckdb::LogicalType> types,
                                   duckdb::idx_t estimated_cardinality);
