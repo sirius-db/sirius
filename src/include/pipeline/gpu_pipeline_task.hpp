@@ -83,26 +83,6 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_itask_local_state {
     _batches;  ///< Input data batches for the pipeline
 
   /**
-   * @brief Set a memory reservation for this task.
-   *
-   * @param res The memory reservation to set (ownership transferred)
-   */
-  void set_reservation(std::unique_ptr<cucascade::memory::reservation> res) override
-  {
-    _reservation = std::move(res);
-  }
-
-  /**
-   * @brief Release and return the memory reservation.
-   *
-   * @return std::unique_ptr<cucascade::memory::reservation> The released reservation
-   */
-  std::unique_ptr<cucascade::memory::reservation> release_reservation() override
-  {
-    return std::move(_reservation);
-  }
-
-  /**
    * @brief Get a const pointer to the reservation (non-owning).
    *
    * @return const cucascade::memory::reservation* Pointer to the reservation, or nullptr
@@ -110,11 +90,7 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_itask_local_state {
   // WSM TODO: remove this method?
   const cucascade::memory::reservation* get_reservation() const { return _reservation.get(); }
 
- private:
-  std::unique_ptr<cucascade::memory::reservation>
-    _reservation;  ///< Memory reservation for GPU resources
-  // TODO: for now, reservation is passed as a local state, will be null when the task is first
-  // created, and will be set when reservation is made
+ 
 };
 
 /**
