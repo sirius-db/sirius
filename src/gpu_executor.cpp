@@ -430,10 +430,8 @@ unique_ptr<QueryResult> GPUExecutor::GetResult()
   if (!sirius_physical_plan) throw InvalidInputException("sirius_physical_plan is NULL");
   if (sirius_physical_plan.get() == NULL)
     throw InvalidInputException("sirius_physical_plan is NULL");
-  SIRIUS_LOG_DEBUG("sirius_physical_plan type: {}", sirius_physical_plan->type);
   auto& result_collector =
     sirius_physical_plan.get()->Cast<sirius::op::sirius_physical_materialized_collector>();
-  SIRIUS_LOG_DEBUG("result_collector type: {}", result_collector.type);
   D_ASSERT(result_collector.sink_state);
   result_collector.sink_state = result_collector.get_global_sink_state(context);
   unique_ptr<QueryResult> res = result_collector.get_result(*(result_collector.sink_state));
@@ -465,6 +463,7 @@ void GPUExecutor::execute()
       task_creator.start();
       auto& duckdb_scan_executor = sirius_context->get_duckdb_scan_executor();
       duckdb_scan_executor.start();
+      while (!sirius_root_pipelines.front().get()->is_pipeline_finished()) {}
     }
   }
 }
