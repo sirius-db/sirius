@@ -33,6 +33,7 @@ endif()
 project(${TARGET_NAME} LANGUAGES CXX CUDA)
 find_package(cudf REQUIRED CONFIG)
 find_package(libconfig++ REQUIRED)
+find_package(absl REQUIRED)
 
 # Derive the environment prefix from where cudf was found cudf_DIR is typically:
 # <prefix>/lib/cmake/cudf
@@ -154,7 +155,7 @@ set_target_properties(${LOADABLE_EXTENSION_NAME}
 # rmm::rmm ${NUMA_LIB}) target_link_libraries(${LOADABLE_EXTENSION_NAME}
 # substrait_extension cudf::cudf rmm::rmm)
 target_link_libraries(${EXTENSION_NAME} cudf::cudf rmm::rmm ${NUMA_LIB}
-                      ${LIBCONFIG++_LIBRARIES})
+                      ${LIBCONFIG++_LIBRARIES} absl::any_invocable)
 target_link_libraries(${LOADABLE_EXTENSION_NAME} cudf::cudf rmm::rmm)
 
 # Link third-party libraries
