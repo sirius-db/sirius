@@ -16,10 +16,11 @@
 
 #pragma once
 
+#include "op/sirius_physical_operator.hpp"
 #include "parallel/task.hpp"
+#include "pipeline/sirius_pipeline_itask_local_state.hpp"
 
 #include <cucascade/data/data_batch.hpp>
-#include "pipeline/sirius_pipeline_itask_local_state.hpp"
 
 #include <memory>
 #include <vector>
@@ -35,9 +36,9 @@ namespace pipeline {
  * tasks and DuckDB scan tasks, separating the computation logic from the
  * output publishing logic.
  */
- // WSM TODO: consider merging this with itask
+// WSM TODO: consider merging this with itask
 class sirius_pipeline_itask : public parallel::itask {
-public:
+ public:
   /**
    * @brief Destructor for proper cleanup of derived classes.
    */
@@ -64,7 +65,8 @@ public:
    *
    * @param output_batches The data batches to publish (typically the result of compute_task())
    */
-  virtual void publish_output(std::vector<std::shared_ptr<cucascade::data_batch>> output_batches) = 0;
+  virtual void publish_output(
+    std::vector<std::shared_ptr<cucascade::data_batch>> output_batches) = 0;
 
   /**
    * @brief Get the estimated reservation memory size needed for this task.
@@ -75,13 +77,16 @@ public:
    */
   virtual std::size_t get_estimated_reservation_size() = 0;
 
+  /// @brief Get the output consumer operators for this task.
+  virtual std::vector<op::sirius_physical_operator*> get_output_consumers() = 0;
 
-  void execute() override {
+  void execute() override
+  {
     auto output_batches = compute_task();
     publish_output(output_batches);
   }
 
-protected:
+ protected:
   /**
    * @brief Protected constructor for derived classes.
    *

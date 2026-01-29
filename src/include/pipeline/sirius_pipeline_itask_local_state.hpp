@@ -32,9 +32,9 @@ namespace pipeline {
  * capabilities for pipeline tasks. It serves as a common base for both GPU pipeline
  * tasks and DuckDB scan tasks that need to manage memory reservations.
  */
- // WSM TODO: consider merging this with itask_local_state
+// WSM TODO: consider merging this with itask_local_state
 class sirius_pipeline_itask_local_state : public parallel::itask_local_state {
-public:
+ public:
   /**
    * @brief Destructor for proper cleanup of derived classes.
    */
@@ -67,7 +67,7 @@ public:
     _reservation = std::move(res);
   }
 
-protected:
+ protected:
   /**
    * @brief Protected default constructor.
    *
