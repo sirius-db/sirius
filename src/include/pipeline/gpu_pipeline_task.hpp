@@ -75,7 +75,7 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_itask_local_state {
     std::vector<std::shared_ptr<cucascade::data_batch>> batches,
     // TODO remove this parameter for the reservation
     std::unique_ptr<cucascade::memory::reservation> res = nullptr)
-    : _batches(std::move(batches)), _reservation(std::move(res))
+    : _batches(std::move(batches))
   {
   }
 
@@ -89,8 +89,6 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_itask_local_state {
    */
   // WSM TODO: remove this method?
   const cucascade::memory::reservation* get_reservation() const { return _reservation.get(); }
-
- 
 };
 
 /**
@@ -115,7 +113,7 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
    */
   gpu_pipeline_task(uint64_t task_id,
                     std::vector<cucascade::shared_data_repository*> data_repos,
-                    std::unique_ptr<sirius::parallel::itask_local_state> local_state,
+                    std::unique_ptr<sirius_pipeline_itask_local_state> local_state,
                     std::shared_ptr<sirius::parallel::itask_global_state> global_state);
 
   /**
@@ -144,7 +142,11 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
    *
    * @return std::vector<std::shared_ptr<cucascade::data_batch>> The computed output batches
    */
-  std::vector<std::shared_ptr<cucascade::data_batch>> compute_task() override;
+  std::vector<std::shared_ptr<cucascade::data_batch>> compute_task() override
+  {
+    /// todo(WSM)
+    return {};
+  }
 
   /**
    * @brief Publish the computed output batches to data repositories.
@@ -153,7 +155,23 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
    *
    * @param output_batches The data batches to publish
    */
-  void publish_output(std::vector<std::shared_ptr<cucascade::data_batch>> output_batches) override;
+  void publish_output(std::vector<std::shared_ptr<cucascade::data_batch>> output_batches) override
+  {
+    /// todo(WSM)
+  }
+
+  std::size_t get_estimated_reservation_size() override
+  {
+    return 0;
+    /// TODO(WSM)
+  }
+
+  /// @brief Get the output consumer operators for this task.
+  std::vector<op::sirius_physical_operator*> get_output_consumers() override
+  {
+    return {};
+    /// TODO(WSM)
+  }
 
  private:
   uint64_t _task_id;

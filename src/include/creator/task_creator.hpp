@@ -184,17 +184,6 @@ class task_creator {
   void reset();
 
   /**
-   * @brief Process and schedule the next task based on operator hints.
-   *
-   * This method queries the given node for a hint about what task to create next.
-   * The hint can be another operator, a pipeline, or empty (in which case a
-   * priority scan is scheduled if available).
-   *
-   * @param node The operator node to get the next task hint from.
-   */
-  void process_next_task(op::sirius_physical_operator* node);
-
-  /**
    * @brief Start scheduling initial scan pipelines.
    *
    * This method schedules all priority scan pipelines that were identified
@@ -228,7 +217,7 @@ class task_creator {
    *
    * @param info The task creation info to schedule.
    */
-  virtual void schedule(std::unique_ptr<task_creation_info> info);
+  virtual void schedule(op::sirius_physical_operator* request);
 
   /**
    * @brief Get the next task id.
@@ -238,6 +227,17 @@ class task_creator {
   uint64_t get_next_task_id();
 
  protected:
+  /**
+   * @brief Process and schedule the next task based on operator hints.
+   *
+   * This method queries the given node for a hint about what task to create next.
+   * The hint can be another operator, a pipeline, or empty (in which case a
+   * priority scan is scheduled if available).
+   *
+   * @param node The operator node to get the next task hint from.
+   */
+  void process_next_task(op::sirius_physical_operator* node);
+
   /**
    * @brief Worker function executed by each thread in the pool.
    *
@@ -270,7 +270,8 @@ class task_creator {
   sirius_pipeline_hashmap* _sirius_pipeline_map;
   ::duckdb::ClientContext* _client_context;
   sirius::pipeline::pipeline_executor& _pipeline_executor;
-  sirius::op::scan::duckdb_scan_executor& _duckdb_scan_executor;
+  sirius::op::scan::duckdb_scan_executor&
+    _duckdb_scan_executor;  // WSM: schedule on pipeline executor
   sirius::memory::sirius_memory_reservation_manager& _mem_res_mgr;
   std::atomic<uint64_t> _task_id{0};
 };
