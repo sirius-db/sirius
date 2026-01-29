@@ -24,18 +24,12 @@ CompileFlags:
 
 # Tweak the clangd parse settings for all files
 CompileFlags:
-  Compiler: clang++-18
   CompilationDatabase: ./build/release
-  Add:
-    - -x
-    - cuda
-    - -Wno-unknown-cuda-version
-    - --no-cuda-version-check
-    # report all errors
-    - "-ferror-limit=0"
-    - "-ftemplate-backtrace-limit=0"
   Remove:
     - -stdpar
+    - -fmodules-ts
+    - "-fmodule-mapper*"
+    - -fdeps-format=p1689r5
     # strip CUDA fatbin args
     - "-Xfatbin*"
     - "-Xcompiler*"
