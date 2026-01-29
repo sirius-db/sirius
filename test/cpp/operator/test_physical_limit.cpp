@@ -47,7 +47,7 @@ TEMPLATE_TEST_CASE("sirius_physical_streaming_limit limits rows in data_batch",
 {
   using Traits = gpu_type_traits<TestType>;
 
-  auto memory_manager = initialize_memory_manager();
+  auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
   auto* space = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
   REQUIRE(space);
 
@@ -100,7 +100,8 @@ TEMPLATE_TEST_CASE("sirius_physical_streaming_limit limits rows in data_batch",
                                           values.size(),
                                           false);
 
-  auto outputs = limiter.execute({input_batch});
+  std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
+  auto outputs = limiter.execute(inputs);
   REQUIRE(outputs.size() == 1);
   auto output_table = outputs[0]->get_data()->cast<gpu_table_representation>().get_table();
   auto host_vals    = copy_column_to_host<typename Traits::type>(output_table.view().column(0));

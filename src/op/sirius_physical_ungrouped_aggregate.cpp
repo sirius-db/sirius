@@ -16,11 +16,11 @@
 
 #include "op/sirius_physical_ungrouped_aggregate.hpp"
 
+#include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
 #include "duckdb/common/types/decimal.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
-#include "expression_executor/gpu_expression_executor_state.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
 
 #include <cudf/column/column_factories.hpp>
@@ -62,10 +62,7 @@ sirius_physical_ungrouped_aggregate::sirius_physical_ungrouped_aggregate(
 namespace {
 
 // Map LogicalType to cudf::data_type using existing utility
-cudf::data_type ToCudfType(const duckdb::LogicalType& t)
-{
-  return duckdb::sirius::GpuExpressionState::GetCudfType(t);
-}
+cudf::data_type ToCudfType(const duckdb::LogicalType& t) { return duckdb::GetCudfType(t); }
 
 template <typename ScalarType>
 ScalarType const& scalar_cast(const cudf::scalar& s)
