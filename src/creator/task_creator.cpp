@@ -225,7 +225,10 @@ void task_creator::worker_function(int worker_id)
       }
 
     } catch (const std::exception& e) {
+      SIRIUS_LOG_ERROR(
+        "task_creator::worker_function: worker {} encountered exception: {}", worker_id, e.what());
       stop();
+      throw;
     }
   }
 }
