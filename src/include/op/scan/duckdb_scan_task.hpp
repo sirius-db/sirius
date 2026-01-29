@@ -24,6 +24,8 @@
 #include <op/sirius_physical_table_scan.hpp>
 #include <parallel/task.hpp>
 #include <pipeline/sirius_pipeline.hpp>
+#include <pipeline/sirius_pipeline_itask.hpp>
+#include <pipeline/sirius_pipeline_itask_local_state.hpp>
 #include <sirius_context.hpp>
 
 // cucascade
@@ -140,7 +142,7 @@ class duckdb_scan_task_global_state : public sirius::parallel::itask_global_stat
  * chunks into those buffers.
  *
  */
-class duckdb_scan_task_local_state : public sirius::parallel::itask_local_state {
+class duckdb_scan_task_local_state : public sirius::pipeline::sirius_pipeline_itask_local_state {
   using data_batch = cucascade::data_batch;
 
  public:
@@ -283,6 +285,7 @@ class duckdb_scan_task_local_state : public sirius::parallel::itask_local_state 
    */
   std::shared_ptr<data_batch> make_data_batch();
 
+  
  private:
   //===----------Fields----------===//
   size_t _approximate_batch_size;                ///< Approximate target batch size in bytes
@@ -294,8 +297,6 @@ class duckdb_scan_task_local_state : public sirius::parallel::itask_local_state 
 
   cucascade::memory::any_memory_space_in_tier _res_request =
     cucascade::memory::any_memory_space_in_tier(cucascade::memory::Tier::HOST);
-  std::unique_ptr<cucascade::memory::reservation>
-    _reservation;  ///< Memory reservation for all column data
   std::unique_ptr<cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation>
     _allocation;  ///< Memory allocation for all column data
   cucascade::memory::memory_space* _host_space = nullptr;
@@ -354,7 +355,7 @@ class duckdb_scan_task_local_state : public sirius::parallel::itask_local_state 
  * the batch to the data repository and notifying the task creator. If the table scan is
  * incomplete upon task completion, the task will push a new scan_task onto the task queue.
  */
-class duckdb_scan_task : public sirius::parallel::itask {
+class duckdb_scan_task : public sirius::pipeline::sirius_pipeline_itask {
   using shared_data_repository = cucascade::shared_data_repository;
   // Friend declaration for test access
   friend class test_scan_task;
@@ -373,9 +374,9 @@ class duckdb_scan_task : public sirius::parallel::itask {
                    shared_data_repository* data_repo,
                    std::unique_ptr<duckdb_scan_task_local_state> l_state,
                    std::shared_ptr<duckdb_scan_task_global_state> g_state)
-    : _task_id(task_id),
-      _data_repo(data_repo),
-      sirius::parallel::itask(std::move(l_state), g_state) {};
+    : sirius::pipeline::sirius_pipeline_itask(std::move(l_state), g_state),
+      _task_id(task_id),
+      _data_repo(data_repo) {};
 
   void execute() override;
 
@@ -425,6 +426,25 @@ class duckdb_scan_task : public sirius::parallel::itask {
   {
     return &this->_local_state->cast<duckdb_scan_task_local_state>();
   }
+
+  /**
+   * @brief Compute and return the output data batches for this task.
+   *
+   * Scans data from the DuckDB table function and accumulates it into data batches.
+   *
+   * @return std::vector<std::shared_ptr<cucascade::data_batch>> The computed output batches
+   */
+  std::vector<std::shared_ptr<cucascade::data_batch>> compute_task() override;
+
+  /**
+   * @brief Publish the computed output batches to the data repository.
+   *
+   * Pushes the output batches to the configured data repository and schedules
+   * new scan tasks if the table scan is incomplete.
+   *
+   * @param output_batches The data batches to publish
+   */
+  void publish_output(std::vector<std::shared_ptr<cucascade::data_batch>> output_batches) override;
 
   //===----------Fields----------===//
   shared_data_repository* _data_repo;  ///< Data repository to which to push batches

@@ -185,18 +185,20 @@ void sirius_physical_operator::sink(
     }
   }
 
-  if (!creator) {
-    throw std::runtime_error(
-      "sirius_physical_operator creator is null in sink_execute for operator " + get_name());
-  }
-  if (next_port_after_sink.size() > 0) {
-    auto current_pipeline =
-      next_port_after_sink[0].first->get_port(next_port_after_sink[0].second)->src_pipeline;
-    current_pipeline->update_pipeline_status();
-  }
-  for (auto& [next_op, port_id] : next_port_after_sink) {
-    if (next_op) { creator->process_next_task(next_op); }
-  }
+  // WSM TODO: sink should not create a task. The task should be created by gpu_pipeline_executor after the task is completed
+
+  // if (!creator) {
+  //   throw std::runtime_error(
+  //     "sirius_physical_operator creator is null in sink_execute for operator " + get_name());
+  // }
+  // if (next_port_after_sink.size() > 0) {
+  //   auto current_pipeline =
+  //     next_port_after_sink[0].first->get_port(next_port_after_sink[0].second)->src_pipeline;
+  //   current_pipeline->update_pipeline_status();
+  // }
+  // for (auto& [next_op, port_id] : next_port_after_sink) {
+  //   if (next_op) { creator->process_next_task(next_op); }
+  // }
 }
 
 ::std::vector<::std::shared_ptr<::cucascade::data_batch>> sirius_physical_operator::execute(

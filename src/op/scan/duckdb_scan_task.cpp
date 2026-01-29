@@ -525,4 +525,24 @@ void duckdb_scan_task::execute()
   if (l_state._row_offset > 0) { _data_repo->add_data_batch(l_state.make_data_batch()); }
 }
 
+std::vector<std::shared_ptr<cucascade::data_batch>> duckdb_scan_task::compute_task()
+{
+  // TODO: Implement compute_task
+  // This should contain the computation logic from execute()
+  // For now, return empty vector as placeholder
+  return std::vector<std::shared_ptr<cucascade::data_batch>>{};
+}
+
+void duckdb_scan_task::publish_output(
+  std::vector<std::shared_ptr<cucascade::data_batch>> output_batches)
+{
+  // TODO: Implement publish_output
+  // This should push the output batches to _data_repo
+  for (auto& batch : output_batches) {
+    if (_data_repo) {
+      _data_repo->add_data_batch(std::move(batch));
+    }
+  }
+}
+
 }  // namespace sirius::op::scan

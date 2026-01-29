@@ -99,7 +99,7 @@ gpu_pipeline_task::gpu_pipeline_task(
   std::vector<cucascade::shared_data_repository*> data_repos,
   std::unique_ptr<sirius::parallel::itask_local_state> local_state,
   std::shared_ptr<sirius::parallel::itask_global_state> global_state)
-  : itask(std::move(local_state), std::move(global_state)),
+  : sirius_pipeline_itask(std::move(local_state), std::move(global_state)),
     _task_id(task_id),
     _data_repos(std::move(data_repos))
 {
@@ -142,6 +142,28 @@ void gpu_pipeline_task::execute()
   // 5. Push output batches to the data repository
 
   // Processing handles are automatically released here when they go out of scope
+}
+
+std::vector<std::shared_ptr<cucascade::data_batch>> gpu_pipeline_task::compute_task()
+{
+  // TODO: Implement compute_task
+  // This should contain the computation logic from execute()
+  // For now, return empty vector as placeholder
+  return std::vector<std::shared_ptr<cucascade::data_batch>>{};
+}
+
+void gpu_pipeline_task::publish_output(
+  std::vector<std::shared_ptr<cucascade::data_batch>> output_batches)
+{
+  // TODO: Implement publish_output
+  // This should push the output batches to _data_repos
+  for (auto& batch : output_batches) {
+    for (auto* repo : _data_repos) {
+      if (repo) {
+        repo->add_data_batch(batch);
+      }
+    }
+  }
 }
 
 }  // namespace pipeline
