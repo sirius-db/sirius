@@ -144,5 +144,12 @@ void pipeline_executor::dispatch_to_gpu_executor(std::unique_ptr<sirius::paralle
   _gpu_executors[gpu_id]->schedule(std::move(task));
 }
 
+void pipeline_executor::set_task_creator(creator::task_creator* creator)
+{
+  for (auto& gpu_exec : _gpu_executors) {
+    gpu_exec->set_task_creator(creator);
+  }
+}
+
 }  // namespace pipeline
 }  // namespace sirius

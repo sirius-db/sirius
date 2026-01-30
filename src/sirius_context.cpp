@@ -105,6 +105,9 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
                                                     *duckdb_scan_executor_,
                                                     *memory_manager_);
 
+  // Set the task creator pointer in the pipeline executor
+  pipeline_executor_->set_task_creator(task_creator_.get());
+
   is_initialized_ = true;
 }
 

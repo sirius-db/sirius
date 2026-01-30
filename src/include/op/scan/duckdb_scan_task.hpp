@@ -445,7 +445,7 @@ class duckdb_scan_task : public sirius::pipeline::sirius_pipeline_itask {
    */
   void publish_output(std::vector<std::shared_ptr<cucascade::data_batch>> output_batches) override;
 
-  std::size_t get_estimated_reservation_size() override
+  std::size_t get_estimated_reservation_size() const override
   {
     /// TODO(amin)
     return 0;

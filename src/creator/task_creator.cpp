@@ -155,7 +155,6 @@ void task_creator::worker_function(int worker_id)
   //   try {
   //     // scheduling scan task
   //     if (info->_node->type == ::duckdb::PhysicalOperatorType::TABLE_SCAN) {
-  //       info->_pipeline->get_source()->set_creator(this);
   //       auto scan_task_global_state = std::make_shared<op::scan::duckdb_scan_task_global_state>(
   //         info->_pipeline,
   //         _duckdb_scan_executor,
@@ -179,7 +178,6 @@ void task_creator::worker_function(int worker_id)
   //     } else {
   //       duckdb::reference<sirius::op::sirius_physical_operator> node =
   //         info->_pipeline->get_inner_operators()[0];
-  //       info->_pipeline->get_sink()->set_creator(this);
   //       // need to exhaust input batches until all ports are empty
   //       while (!node.get().all_ports_empty()) {
   //         auto input_batch = node.get().get_input_batch();

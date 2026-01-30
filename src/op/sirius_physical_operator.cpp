@@ -16,7 +16,6 @@
 
 #include "op/sirius_physical_operator.hpp"
 
-#include "creator/task_creator.hpp"
 #include "gpu_executor.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -286,11 +285,6 @@ bool sirius_physical_operator::all_ports_empty()
     if (port_ptr->repo->size() != 0) { return false; }
   }
   return true;
-}
-
-void sirius_physical_operator::set_creator(::sirius::creator::task_creator* creator)
-{
-  this->creator = creator;
 }
 
 bool sirius_physical_operator::is_source_pipeline_finished()

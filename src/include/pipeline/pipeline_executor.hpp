@@ -29,6 +29,11 @@
 #include <cucascade/memory/topology_discovery.hpp>
 
 namespace sirius {
+
+namespace creator {
+class task_creator;
+}
+
 namespace pipeline {
 
 /**
@@ -115,6 +120,13 @@ class pipeline_executor : public sirius::parallel::itask_executor {
    * @brief Submit a task request to task_request_queue
    */
   void submit_task_request(std::unique_ptr<task_request> request);
+
+  /**
+   * @brief Set the task creator pointer for all GPU executors
+   *
+   * @param creator Pointer to the task creator
+   */
+  void set_task_creator(creator::task_creator* creator);
 
  private:
   std::vector<std::unique_ptr<gpu_pipeline_executor>> _gpu_executors;  ///< Vector of GPU executors

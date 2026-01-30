@@ -75,7 +75,7 @@ class sirius_pipeline_itask : public parallel::itask {
    *
    * @return std::size_t The estimated reservation size
    */
-  virtual std::size_t get_estimated_reservation_size() = 0;
+  virtual std::size_t get_estimated_reservation_size() const = 0;
 
   /// @brief Get the output consumer operators for this task.
   virtual std::vector<op::sirius_physical_operator*> get_output_consumers() = 0;

@@ -160,7 +160,7 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
   std::size_t get_input_size() const;
 
   
-  std::size_t get_estimated_reservation_size() override;
+  std::size_t get_estimated_reservation_size() const override;
 
   /// @brief Get the output consumer operators for this task.
   std::vector<op::sirius_physical_operator*> get_output_consumers() override;

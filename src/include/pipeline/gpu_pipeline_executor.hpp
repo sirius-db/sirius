@@ -28,6 +28,11 @@
 #include <queue>
 
 namespace sirius {
+
+namespace creator {
+class task_creator;
+}
+
 namespace pipeline {
 
 class pipeline_executor;
@@ -133,6 +138,13 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
    */
   void submit_task_request(std::unique_ptr<task_request> request);
 
+  /**
+   * @brief Set the task creator pointer for this executor
+   *
+   * @param creator Pointer to the task creator
+   */
+  void set_task_creator(creator::task_creator* creator);
+
  private:
   /**
    * @brief Safely casts itask to gpu_pipeline_task with type validation
@@ -149,6 +161,7 @@ class gpu_pipeline_executor : public sirius::parallel::itask_executor {
   const cucascade::memory::memory_space*
     _memory_space_view;  // this is supposed to be the memory space
                          // associated with this pipeline executor
+  creator::task_creator* _task_creator;  ///< Pointer to the task creator
 };
 
 }  // namespace pipeline

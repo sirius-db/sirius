@@ -165,6 +165,17 @@ sirius_pipeline::get_inner_operators()
   return result;
 }
 
+std::vector<sirius_pipeline*> sirius_pipeline::get_parents()
+{
+  std::vector<sirius_pipeline*> result;
+  for (auto& weak_parent : parents) {
+    if (auto parent = weak_parent.lock()) {
+      result.push_back(parent.get());
+    }
+  }
+  return result;
+}
+
 void sirius_pipeline::clear_source()
 {
   source_state.reset();

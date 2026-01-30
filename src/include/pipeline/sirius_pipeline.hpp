@@ -115,6 +115,9 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
 
   duckdb::optional_ptr<op::sirius_physical_operator> get_source() { return source; }
 
+  //! Returns the parent pipelines (pipelines that depend on this pipeline)
+  std::vector<sirius_pipeline*> get_parents();
+
   //! Returns whether any of the operators in the pipeline care about preserving order
   bool is_order_dependent() const;
 

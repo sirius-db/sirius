@@ -238,9 +238,7 @@ class sirius_physical_operator {
   bool all_ports_empty();
   //! Check if the pipeline is finished
   bool check_pipeline_finished();
-  //! Set the creator of the task
-  void set_creator(creator::task_creator* creator);
-
+ 
  private:
   //! The ports of the operator
   std::unordered_map<std::string, std::unique_ptr<port>> ports;
