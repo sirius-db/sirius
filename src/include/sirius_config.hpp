@@ -67,7 +67,7 @@ struct sirius_config {
   exec::thread_pool_config _duckdb_scan_executor_config{.num_threads        = 4,
                                                         .thread_name_prefix = "duckdb_scan"};
   bool enable_scan_caching_         = false;
-  size_t _task_creator_thread_count = 4;
+  size_t _task_creator_thread_count = 2;
 };
 
 }  // namespace sirius

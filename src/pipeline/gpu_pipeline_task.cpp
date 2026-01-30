@@ -169,27 +169,25 @@ void gpu_pipeline_task::execute()
   // Processing handles are automatically released here when they go out of scope
 }
 
-std::vector<std::shared_ptr<cucascade::data_batch>> gpu_pipeline_task::compute_task()
-{
-  // TODO: Implement compute_task
-  // This should contain the computation logic from execute()
-  // For now, return empty vector as placeholder
-  return std::vector<std::shared_ptr<cucascade::data_batch>>{};
-}
 
-void gpu_pipeline_task::publish_output(
-  std::vector<std::shared_ptr<cucascade::data_batch>> output_batches)
+std::size_t gpu_pipeline_task::get_input_size() const
 {
-  // TODO: Implement publish_output
-  // This should push the output batches to _data_repos
-  for (auto& batch : output_batches) {
-    for (auto* repo : _data_repos) {
-      if (repo) {
-        repo->add_data_batch(batch);
-      }
-    }
+  auto& local_state = _local_state->cast<gpu_pipeline_task_local_state>();
+  std::size_t input_size = 0;
+  for (const auto& batch : local_state._batches) {
+    input_size += batch->get_data()->get_size_in_bytes();
   }
+  return input_size;
 }
 
+std::size_t gpu_pipeline_task::get_estimated_reservation_size() const
+{
+  // WSM TODO: this is a placeholder for the actual reservation size
+  return get_input_size() * 3;
+}
+
+std::vector<op::sirius_physical_operator*> gpu_pipeline_task::get_output_consumers()
+{
+  return get_pipeline()->get_sink();
 }  // namespace pipeline
 }  // namespace sirius
