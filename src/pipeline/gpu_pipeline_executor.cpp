@@ -16,6 +16,7 @@
 
 #include "pipeline/gpu_pipeline_executor.hpp"
 
+#include "creator/task_creator.hpp"
 #include "pipeline/gpu_pipeline_queue.hpp"
 #include "pipeline/pipeline_executor.hpp"
 
@@ -141,6 +142,14 @@ void gpu_pipeline_executor::worker_loop(int worker_id)
       // set stream reservation
       task->execute();
       // reset memory resource
+
+      // Now that the task has been completed, schedule some task creation attempts for the output consumers of the task's output
+      // cast task to gpu_pipeline_task and get the output consumers
+      auto gpu_pipeline_task = cast_to_gpu_pipeline_task(task.get());
+      auto output_consumers = gpu_pipeline_task->get_output_consumers();
+      for (auto& consumer : output_consumers) {
+        _task_creator->schedule(consumer);
+      }
     } catch (const std::exception& e) {
       on_task_error(worker_id, std::move(task), e);
     }
