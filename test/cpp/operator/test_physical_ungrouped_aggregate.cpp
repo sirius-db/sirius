@@ -21,6 +21,7 @@
 #include <duckdb/planner/expression/bound_aggregate_expression.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <op/sirius_physical_ungrouped_aggregate.hpp>
+#include <op/sirius_physical_ungrouped_aggregate_merge.hpp>
 
 #include <iterator>
 
@@ -161,7 +162,10 @@ TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate computes SUM/MIN/MAX/COU
     0,
     duckdb::TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
   sirius_physical_ungrouped_aggregate_merge merge_op(
-    std::move(merge_types), std::move(merge_aggregates), 0);
+    std::move(merge_types),
+    std::move(merge_aggregates),
+    0,
+    duckdb::TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
 
   auto local_out1 = local_op.execute({b1});
   auto local_out2 = local_op.execute({b2});
@@ -265,7 +269,10 @@ TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate resolves AVG in merge",
     0,
     duckdb::TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
   sirius_physical_ungrouped_aggregate_merge merge_op(
-    std::move(merge_types), std::move(merge_aggregates), 0);
+    std::move(merge_types),
+    std::move(merge_aggregates),
+    0,
+    duckdb::TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
 
   auto local_out1 = local_op.execute({b1});
   auto local_out2 = local_op.execute({b2});

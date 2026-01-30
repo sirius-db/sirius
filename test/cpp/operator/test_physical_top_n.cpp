@@ -22,6 +22,7 @@
 #include <duckdb/planner/bound_result_modifier.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <op/sirius_physical_top_n.hpp>
+#include <op/sirius_physical_top_n_merge.hpp>
 
 using namespace duckdb;
 using namespace sirius::op;
