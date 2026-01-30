@@ -367,11 +367,7 @@ static void run_scan_test(std::string const& table_name,
   scan_executor.start();
   for (int i = 0; i < num_threads; ++i) {
     auto local_state = std::make_unique<op::scan::duckdb_scan_task_local_state>(
-      *global_state,
-      batch_size,
-      duckdb::Config::DEFAULT_SCAN_TASK_VARCHAR_SIZE,
-      nullptr,
-      std::move(execution_context));
+      *global_state, std::move(execution_context), batch_size);
     auto task = std::make_unique<op::scan::duckdb_scan_task>(
       static_cast<uint64_t>(i + 1), &data_repo, std::move(local_state), global_state);
     scan_executor.schedule(std::move(task));

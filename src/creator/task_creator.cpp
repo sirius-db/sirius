@@ -195,10 +195,10 @@ void task_creator::worker_function(int worker_id)
           std::make_unique<duckdb::ExecutionContext>(*_client_context, *_thread_context, nullptr);
         auto scan_task_local_state = std::make_unique<op::scan::duckdb_scan_task_local_state>(
           *scan_task_global_state,
+          std::move(exec_ctx),
           duckdb::Config::DEFAULT_SCAN_TASK_BATCH_SIZE,
           duckdb::Config::DEFAULT_SCAN_TASK_VARCHAR_SIZE,
-          nullptr,
-          std::move(exec_ctx));
+          nullptr);
         if (info->destination_data_repositories.empty()) {
           throw std::runtime_error(
             "No destination data repositories provided for scan task creation.");

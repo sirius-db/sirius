@@ -277,7 +277,7 @@ duckdb_scan_task_local_state::duckdb_scan_task_local_state(
   std::unique_ptr<duckdb::LocalTableFunctionState> existing_local_tf_state)
   : _approximate_batch_size(approximate_batch_size),
     _default_varchar_size(default_varchar_size),
-    _exec_ctx_ptr(std::move(owned_exec_ctx)))
+    _exec_ctx_ptr(std::move(owned_exec_ctx))
 {
   auto const& op = g_state._op;
   _num_columns   = op.projection_ids.size();
@@ -505,10 +505,10 @@ void duckdb_scan_task::execute()
     // This ensures DuckDB continues scanning from the current position rather than starting over
     auto new_local_state =
       std::make_unique<duckdb_scan_task_local_state>(g_state,
+                                                     std::move(l_state._exec_ctx_ptr),
                                                      l_state._approximate_batch_size,
                                                      l_state._default_varchar_size,
-                                                     std::move(l_state._local_tf_state),
-                                                     std::move(l_state._exec_ctx_ptr));
+                                                     std::move(l_state._local_tf_state));
 
     // Create a new reference to the global state
     auto const new_task_id = g_state._sirius_ctx->get_task_creator().get_next_task_id();
