@@ -116,6 +116,8 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   void set_pipeline_id(size_t id) { pipeline_id = id; }
   //! Get the pipeline ID
   size_t get_pipeline_id() const { return pipeline_id; }
+  //! Returns the parent pipelines (pipelines that depend on this pipeline)
+  std::vector<sirius_pipeline*> get_parents();
 
   //! Returns whether any of the operators in the pipeline care about preserving order
   bool is_order_dependent() const;

@@ -36,6 +36,11 @@ class sirius_physical_operator;
 }  // namespace sirius::op
 
 namespace sirius {
+
+namespace creator {
+class task_creator;
+}
+
 namespace pipeline {
 
 /**
@@ -111,6 +116,15 @@ class gpu_pipeline_executor {
   void manager_loop();
 
   /**
+  /**
+   * @brief Set the task creator pointer for this executor
+   *
+   * @param creator Pointer to the task creator
+   */
+  void set_task_creator(creator::task_creator* creator);
+
+ private:
+  /**
    * @brief Safely casts itask to gpu_pipeline_task with type validation
    *
    * @param task The itask pointer to cast
@@ -128,6 +142,7 @@ class gpu_pipeline_executor {
   exec::publisher<std::unique_ptr<task_request>> _task_request_publisher;
   cucascade::memory::memory_space* _memory_space;
   std::function<void(sirius::op::sirius_physical_operator*)> _schedule_callback;
+  creator::task_creator* _task_creator;  ///< Pointer to the task creator
 };
 
 }  // namespace pipeline

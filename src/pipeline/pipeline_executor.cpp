@@ -175,5 +175,28 @@ void pipeline_executor::management_eventloop()
   }
 }
 
+// WSM TODO: delete this?
+void pipeline_executor::submit_task_request(std::unique_ptr<task_request> request)
+{
+  _task_request_queue->push(std::move(request));
+}
+
+// WSM TODO: delete this?
+void pipeline_executor::dispatch_to_gpu_executor(std::unique_ptr<sirius::parallel::itask> task,
+                                                 int gpu_id)
+{
+  if (gpu_id < 0 || gpu_id >= static_cast<int>(_gpu_executors.size())) {
+    throw std::runtime_error("Invalid GPU ID: " + std::to_string(gpu_id));
+  }
+  _gpu_executors[gpu_id]->schedule(std::move(task));
+}
+
+void pipeline_executor::set_task_creator(creator::task_creator* creator)
+{
+  for (auto& gpu_exec : _gpu_executors) {
+    gpu_exec->set_task_creator(creator);
+  }
+}
+
 }  // namespace pipeline
 }  // namespace sirius

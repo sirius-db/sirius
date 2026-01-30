@@ -115,6 +115,9 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   // Configure scan caching based on config
   pipeline_executor_->set_scan_caching_enabled(config_.is_scan_caching_enabled());
 
+  // Set the task creator pointer in the pipeline executor
+  pipeline_executor_->set_task_creator(task_creator_.get());
+
   is_initialized_ = true;
 }
 

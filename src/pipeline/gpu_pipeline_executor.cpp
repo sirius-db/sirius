@@ -29,7 +29,8 @@ gpu_pipeline_executor::gpu_pipeline_executor(
   exec::publisher<std::unique_ptr<task_request>> task_request_publisher)
   : _config(config),
     _task_request_publisher(std::move(task_request_publisher)),
-    _memory_space(mem_space)
+    _memory_space(mem_space),
+    _task_creator(nullptr)
 {
 }
 
@@ -114,6 +115,11 @@ void gpu_pipeline_executor::set_schedule_callback(
   std::function<void(sirius::op::sirius_physical_operator*)> schedule_fn)
 {
   _schedule_callback = std::move(schedule_fn);
+}
+
+void gpu_pipeline_executor::set_task_creator(creator::task_creator* creator)
+{
+  _task_creator = creator;
 }
 
 }  // namespace pipeline

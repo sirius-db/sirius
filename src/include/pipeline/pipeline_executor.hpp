@@ -40,6 +40,11 @@ class duckdb_scan_executor;
 }  // namespace sirius::op::scan
 
 namespace sirius {
+
+namespace creator {
+class task_creator;
+}
+
 namespace pipeline {
 
 class gpu_pipeline_executor;
@@ -138,6 +143,13 @@ class pipeline_executor {
    * @param scans Vector of scan operators (first in vector = first out of queue)
    */
   void set_priority_scans(const std::vector<op::sirius_physical_operator*>& scans);
+
+  /**
+   * @brief Set the task creator pointer for all GPU executors
+   *
+   * @param creator Pointer to the task creator
+   */
+  void set_task_creator(creator::task_creator* creator);
 
  private:
   void management_eventloop();
