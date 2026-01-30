@@ -189,7 +189,7 @@ std::size_t gpu_pipeline_task::get_input_size() const
 std::size_t gpu_pipeline_task::get_estimated_reservation_size() const
 {
   // WSM TODO: this is a placeholder for the actual reservation size
-  return get_input_size() * 3;
+  return get_input_size() * 1;
 }
 
 std::vector<op::sirius_physical_operator*> gpu_pipeline_task::get_output_consumers()

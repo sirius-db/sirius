@@ -266,22 +266,34 @@ sirius_pipeline_build_state::get_pipeline_operators(sirius_pipeline& pipeline)
   return pipeline.operators;
 }
 
-bool sirius_pipeline::is_pipeline_finished() { return pipeline_finished; }
+bool sirius_pipeline::is_pipeline_finished() { return pipeline_finished.load(); }
 
 void sirius_pipeline::update_pipeline_status()
 {
   if (get_source()->type == op::SiriusPhysicalOperatorType::TABLE_SCAN) {
     auto& table_scan = get_source()->Cast<op::sirius_physical_table_scan>();
-    if (!table_scan.exhausted) {
-      pipeline_finished = false;
+    if (table_scan.exhausted) {
+      pipeline_finished = true;
       return;
-    }
-    auto& first_node  = operators[0].get();
-    pipeline_finished = first_node.all_ports_empty();
+    }    
   } else {
-    auto& first_node  = operators[0].get();
-    pipeline_finished = first_node.is_source_pipeline_finished() && first_node.all_ports_empty();
+    op::sirius_physical_operator* first_node  = operators.size() > 0 ? &operators[0].get() : (sink ? sink.get() : nullptr);
+    if (first_node == nullptr) {
+      throw duckdb::InternalException("First node of pipeline is nullptr");
+    }
+    if(first_node->is_source_pipeline_finished() && first_node->all_ports_empty()){
+      pipeline_finished = tasks_created.load() == tasks_completed.load();
+    }
   }
+}
+// WSM TODO: use these two functions in the right place
+void sirius_pipeline::mark_task_created(){
+  tasks_created++;
+}
+
+void sirius_pipeline::mark_task_completed(){
+  tasks_completed++;
+  update_pipeline_status();
 }
 
 }  // namespace pipeline
