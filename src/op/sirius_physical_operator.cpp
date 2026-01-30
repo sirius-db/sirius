@@ -230,15 +230,24 @@ std::optional<task_creation_hint> sirius_physical_operator::get_next_task_hint()
 {
   if (ports.empty()) { return std::nullopt; }
 
-  // satisfy hard barriers first
+  // first look at the input ports and see if there are any unfinished hard barriers
   auto unfinished_barrier = std::find_if(ports.begin(), ports.end(), [](const auto& port_pair) {
     return port_pair.second->type == MemoryBarrierType::FULL && port_pair.second->src_pipeline &&
            !port_pair.second->src_pipeline->is_pipeline_finished();
   });
 
   if (unfinished_barrier != ports.end()) {
-    auto* producer = &(unfinished_barrier->second->src_pipeline->get_inner_operators()[0].get());
-    return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
+    if (unfinished_barrier->second->src_pipeline->get_inner_operators().empty()) {
+      auto sink = unfinished_barrier->second->src_pipeline->get_sink();
+      if (sink){
+        return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, sink.get()};
+      } else {
+        return std::nullopt;
+      }
+    } else {
+      auto* producer = &(unfinished_barrier->second->src_pipeline->get_inner_operators()[0].get());
+      return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
+    }
   }
 
   // if they are complete, create data if you can
@@ -256,8 +265,17 @@ std::optional<task_creation_hint> sirius_physical_operator::get_next_task_hint()
   });
 
   if (unfinished_pipeline != ports.end()) {
-    auto* producer = &(unfinished_pipeline->second->src_pipeline->get_inner_operators()[0].get());
-    return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
+    if (unfinished_pipeline->second->src_pipeline->get_inner_operators().empty()) {
+      auto sink = unfinished_pipeline->second->src_pipeline->get_sink();
+      if (sink){
+        return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, sink.get()};
+      } else {
+        return std::nullopt;
+      }
+    } else {
+      auto* producer = &(unfinished_pipeline->second->src_pipeline->get_inner_operators()[0].get());
+      return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
+    }
   }
 
   // nothing to do

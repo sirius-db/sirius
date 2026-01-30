@@ -102,7 +102,23 @@ void task_creator::reset()
   _priority_scans = std::queue<duckdb::shared_ptr<pipeline::sirius_pipeline>>{};
 }
 
-void task_creator::process_next_task(op::sirius_physical_operator* node) {}
+void task_creator::process_next_task(op::sirius_physical_operator* node) {
+  auto hint = node->get_next_task_hint();
+  
+  if (hint.has_value() && hint.value().hint == op::TaskCreationHint::READY) {
+    // WSM TODO: how do we handle other ports that are not default?
+    schedule(hint.value().producer);
+  } else if (hint.has_value() && hint.value().hint == op::TaskCreationHint::WAITING_FOR_INPUT_DATA) {
+    process_next_task(hint.value().producer);
+  } else {
+    if (!_priority_scans.empty()) {
+      duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline = _priority_scans.front();
+      auto* scan_node                                        = pipeline->get_source().get();
+      schedule(scan_node);
+      _priority_scans.pop();
+    }
+  }
+}
 
 void task_creator::start()
 {

@@ -245,6 +245,7 @@ class sirius_physical_operator {
   //! The next operators to be executed after this operator when it is used as a sink
   std::vector<std::pair<sirius_physical_operator*, std::string_view>> next_port_after_sink;
   //! The creator of the task
+  // WSM TODO: remove this
   creator::task_creator* creator;
 };
 
