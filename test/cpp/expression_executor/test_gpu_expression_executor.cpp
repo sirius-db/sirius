@@ -19,8 +19,8 @@
 #include <utils/utils.hpp>
 
 // sirius
-#include <cucascade/data/data_repository_manager.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
+#include <data/data_batch_utils.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
 #include <memory/sirius_memory_manager.hpp>
 
@@ -41,8 +41,7 @@ using namespace duckdb;
 using namespace duckdb::sirius;
 using namespace cucascade;
 using namespace cucascade::memory;
-using data_repository_mgr = data_repository_manager<std::shared_ptr<data_batch>>;
-using memory_mgr          = ::sirius::memory_manager;
+using memory_mgr = ::sirius::memory_manager;
 
 namespace {
 
@@ -119,7 +118,6 @@ std::vector<std::string> copy_string_column_to_host(const cudf::column_view& col
 }
 
 std::shared_ptr<data_batch> make_input_batch(
-  data_repository_mgr& repo_mgr,
   memory_space& space,
   const std::vector<cudf::data_type>& column_types,
   const std::vector<std::optional<std::pair<int, int>>>& ranges)
@@ -128,12 +126,11 @@ std::shared_ptr<data_batch> make_input_batch(
   auto table = ::sirius::create_cudf_table_with_random_data(
     128, column_types, ranges, cudf::get_default_stream(), mr);
   auto gpu_repr = std::make_unique<gpu_table_representation>(*table, space);
-  auto batch_id = repo_mgr.get_next_data_batch_id();
-  return std::make_shared<data_batch>(batch_id, repo_mgr, std::move(gpu_repr));
+  auto batch_id = ::sirius::get_next_batch_id();
+  return std::make_shared<data_batch>(batch_id, std::move(gpu_repr));
 }
 
-std::shared_ptr<data_batch> make_int32_batch_with_nulls(data_repository_mgr& repo_mgr,
-                                                        memory_space& space,
+std::shared_ptr<data_batch> make_int32_batch_with_nulls(memory_space& space,
                                                         const std::vector<int32_t>& values,
                                                         const std::vector<bool>& valids)
 {
@@ -164,8 +161,8 @@ std::shared_ptr<data_batch> make_int32_batch_with_nulls(data_repository_mgr& rep
   auto table = std::make_unique<cudf::table>(std::move(cols));
 
   auto gpu_repr = std::make_unique<gpu_table_representation>(*table, space);
-  auto batch_id = repo_mgr.get_next_data_batch_id();
-  return std::make_shared<data_batch>(batch_id, repo_mgr, std::move(gpu_repr));
+  auto batch_id = ::sirius::get_next_batch_id();
+  return std::make_shared<data_batch>(batch_id, std::move(gpu_repr));
 }
 
 }  // namespace
@@ -176,15 +173,13 @@ TEST_CASE("gpu_expression_executor execute(data_batch) projects references",
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
 
-  data_repository_mgr repo_mgr;
-
   std::vector<cudf::data_type> column_types              = {cudf::data_type{cudf::type_id::INT32},
                                                             cudf::data_type{cudf::type_id::INT64}};
   std::vector<std::optional<std::pair<int, int>>> ranges = {
     std::optional<std::pair<int, int>>{std::pair<int, int>{0, 100}},
     std::optional<std::pair<int, int>>{std::pair<int, int>{0, 1000}}};
 
-  auto input_batch = make_input_batch(repo_mgr, *space, column_types, ranges);
+  auto input_batch = make_input_batch(*space, column_types, ranges);
 
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> exprs;
   exprs.push_back(
@@ -193,7 +188,7 @@ TEST_CASE("gpu_expression_executor execute(data_batch) projects references",
     duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::BIGINT}, 1));
 
   GpuExpressionExecutor executor(exprs, get_resource_ref(*space));
-  auto output_batch = executor.execute(input_batch, repo_mgr, cudf::get_default_stream());
+  auto output_batch = executor.execute(input_batch, cudf::get_default_stream());
 
   REQUIRE(output_batch != nullptr);
   REQUIRE(output_batch->get_memory_space() == input_batch->get_memory_space());
@@ -222,15 +217,13 @@ TEST_CASE("gpu_expression_executor execute(data_batch) handles constants and com
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
 
-  data_repository_mgr repo_mgr;
-
   std::vector<cudf::data_type> column_types              = {cudf::data_type{cudf::type_id::INT32},
                                                             cudf::data_type{cudf::type_id::INT64}};
   std::vector<std::optional<std::pair<int, int>>> ranges = {
     std::optional<std::pair<int, int>>{std::pair<int, int>{0, 100}},
     std::optional<std::pair<int, int>>{std::pair<int, int>{0, 1000}}};
 
-  auto input_batch = make_input_batch(repo_mgr, *space, column_types, ranges);
+  auto input_batch = make_input_batch(*space, column_types, ranges);
 
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> exprs;
   exprs.push_back(
@@ -244,7 +237,7 @@ TEST_CASE("gpu_expression_executor execute(data_batch) handles constants and com
     ExpressionType::COMPARE_LESSTHAN, std::move(left_expr), std::move(right_expr)));
 
   GpuExpressionExecutor executor(exprs, get_resource_ref(*space));
-  auto output_batch = executor.execute(input_batch, repo_mgr, cudf::get_default_stream());
+  auto output_batch = executor.execute(input_batch, cudf::get_default_stream());
 
   REQUIRE(output_batch != nullptr);
 
@@ -279,13 +272,11 @@ TEST_CASE("gpu_expression_executor select(data_batch) filters rows", "[expressio
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
 
-  data_repository_mgr repo_mgr;
-
   std::vector<cudf::data_type> column_types              = {cudf::data_type{cudf::type_id::INT32}};
   std::vector<std::optional<std::pair<int, int>>> ranges = {
     std::optional<std::pair<int, int>>{std::pair<int, int>{0, 9}}};
 
-  auto input_batch = make_input_batch(repo_mgr, *space, column_types, ranges);
+  auto input_batch = make_input_batch(*space, column_types, ranges);
 
   auto left_expr =
     duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0);
@@ -295,7 +286,7 @@ TEST_CASE("gpu_expression_executor select(data_batch) filters rows", "[expressio
     ExpressionType::COMPARE_GREATERTHAN, std::move(left_expr), std::move(right_expr)));
 
   GpuExpressionExecutor executor(exprs, get_resource_ref(*space));
-  auto output_batch = executor.select(input_batch, repo_mgr, cudf::get_default_stream());
+  auto output_batch = executor.select(input_batch, cudf::get_default_stream());
 
   REQUIRE(output_batch != nullptr);
   REQUIRE(output_batch->get_memory_space() == input_batch->get_memory_space());
@@ -326,15 +317,13 @@ TEST_CASE("gpu_expression_executor select(data_batch) handles conjunction and IN
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
 
-  data_repository_mgr repo_mgr;
-
   std::vector<cudf::data_type> column_types              = {cudf::data_type{cudf::type_id::INT32},
                                                             cudf::data_type{cudf::type_id::INT64}};
   std::vector<std::optional<std::pair<int, int>>> ranges = {
     std::optional<std::pair<int, int>>{std::pair<int, int>{0, 9}},
     std::optional<std::pair<int, int>>{std::pair<int, int>{0, 50}}};
 
-  auto input_batch = make_input_batch(repo_mgr, *space, column_types, ranges);
+  auto input_batch = make_input_batch(*space, column_types, ranges);
 
   auto in_expr = duckdb::make_uniq<BoundOperatorExpression>(ExpressionType::COMPARE_IN,
                                                             LogicalType{LogicalTypeId::BOOLEAN});
@@ -359,7 +348,7 @@ TEST_CASE("gpu_expression_executor select(data_batch) handles conjunction and IN
   exprs.push_back(std::move(conjunction));
 
   GpuExpressionExecutor executor(exprs, get_resource_ref(*space));
-  auto output_batch = executor.select(input_batch, repo_mgr, cudf::get_default_stream());
+  auto output_batch = executor.select(input_batch, cudf::get_default_stream());
 
   REQUIRE(output_batch != nullptr);
   REQUIRE(output_batch->get_memory_space() == input_batch->get_memory_space());
@@ -401,13 +390,11 @@ TEST_CASE("gpu_expression_executor select(data_batch) handles empty result",
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
 
-  data_repository_mgr repo_mgr;
-
   std::vector<cudf::data_type> column_types              = {cudf::data_type{cudf::type_id::INT32}};
   std::vector<std::optional<std::pair<int, int>>> ranges = {
     std::optional<std::pair<int, int>>{std::pair<int, int>{0, 9}}};
 
-  auto input_batch = make_input_batch(repo_mgr, *space, column_types, ranges);
+  auto input_batch = make_input_batch(*space, column_types, ranges);
 
   auto left_expr =
     duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0);
@@ -417,7 +404,7 @@ TEST_CASE("gpu_expression_executor select(data_batch) handles empty result",
     ExpressionType::COMPARE_GREATERTHAN, std::move(left_expr), std::move(right_expr)));
 
   GpuExpressionExecutor executor(exprs, get_resource_ref(*space));
-  auto output_batch = executor.select(input_batch, repo_mgr, cudf::get_default_stream());
+  auto output_batch = executor.select(input_batch, cudf::get_default_stream());
 
   REQUIRE(output_batch != nullptr);
   REQUIRE(output_batch->get_memory_space() == input_batch->get_memory_space());
@@ -438,12 +425,10 @@ TEST_CASE("gpu_expression_executor select(data_batch) respects null mask behavio
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
 
-  data_repository_mgr repo_mgr;
-
   std::vector<int32_t> values = {1, 2, 3, 4, 5};
   std::vector<bool> valids    = {true, false, true, false, true};
 
-  auto input_batch = make_int32_batch_with_nulls(repo_mgr, *space, values, valids);
+  auto input_batch = make_int32_batch_with_nulls(*space, values, valids);
 
   auto left_expr =
     duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::INTEGER}, 0);
@@ -453,7 +438,7 @@ TEST_CASE("gpu_expression_executor select(data_batch) respects null mask behavio
     ExpressionType::COMPARE_GREATERTHAN, std::move(left_expr), std::move(right_expr)));
 
   GpuExpressionExecutor executor(exprs, get_resource_ref(*space));
-  auto output_batch = executor.select(input_batch, repo_mgr, cudf::get_default_stream());
+  auto output_batch = executor.select(input_batch, cudf::get_default_stream());
 
   REQUIRE(output_batch != nullptr);
   REQUIRE(output_batch->get_memory_space() == input_batch->get_memory_space());
@@ -478,13 +463,11 @@ TEST_CASE("gpu_expression_executor select(data_batch) filters strings", "[expres
   auto* space = get_default_gpu_space();
   REQUIRE(space != nullptr);
 
-  data_repository_mgr repo_mgr;
-
   std::vector<cudf::data_type> column_types              = {cudf::data_type{cudf::type_id::STRING}};
   std::vector<std::optional<std::pair<int, int>>> ranges = {
     std::optional<std::pair<int, int>>{std::pair<int, int>{1, 3}}};
 
-  auto input_batch = make_input_batch(repo_mgr, *space, column_types, ranges);
+  auto input_batch = make_input_batch(*space, column_types, ranges);
 
   auto left_expr =
     duckdb::make_uniq<BoundReferenceExpression>(LogicalType{LogicalTypeId::VARCHAR}, 0);
@@ -494,7 +477,7 @@ TEST_CASE("gpu_expression_executor select(data_batch) filters strings", "[expres
     ExpressionType::COMPARE_EQUAL, std::move(left_expr), std::move(right_expr)));
 
   GpuExpressionExecutor executor(exprs, get_resource_ref(*space));
-  auto output_batch = executor.select(input_batch, repo_mgr, cudf::get_default_stream());
+  auto output_batch = executor.select(input_batch, cudf::get_default_stream());
 
   REQUIRE(output_batch != nullptr);
   REQUIRE(output_batch->get_memory_space() == input_batch->get_memory_space());

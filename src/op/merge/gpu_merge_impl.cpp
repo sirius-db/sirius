@@ -16,6 +16,7 @@
 
 #include "op/merge/gpu_merge_impl.hpp"
 
+#include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
 
 #include <cudf/concatenate.hpp>
@@ -235,64 +236,6 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_order_by(
                                   null_precedence,
                                   stream,
                                   memory_space.get_default_allocator());
-
-  // Create the output data batch
-  return make_data_batch(std::move(output_table), memory_space);
-}
-
-std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_top_n(
-  const std::vector<std::shared_ptr<cucascade::data_batch>>& input,
-  const int limit,
-  const int offset,
-  const std::vector<int>& order_key_idx,
-  const std::vector<cudf::order>& column_order,
-  const std::vector<cudf::null_order>& null_precedence,
-  rmm::cuda_stream_view stream,
-  cucascade::memory::memory_space& memory_space)
-{
-  // Sanity check.
-  if (input.size() < 2) {
-    throw std::runtime_error("`input` in `merge_top_n()` should at least contain two data batches");
-  }
-  if (order_key_idx.size() != column_order.size() ||
-      order_key_idx.size() != null_precedence.size()) {
-    throw std::runtime_error(
-      "mismatch between the sizes of `order_key_idx`, `column_order`, and "
-      "`null_precedence` in `merge_top_n()`");
-  }
-
-  // Pull input cudf tables and merge.
-  std::vector<cudf::table_view> input_tables;
-  input_tables.reserve(input.size());
-  for (const auto& batch : input) {
-    input_tables.push_back(get_cudf_table_view(*batch));
-  }
-  auto merged_table = cudf::merge(input_tables,
-                                  order_key_idx,
-                                  column_order,
-                                  null_precedence,
-                                  stream,
-                                  memory_space.get_default_allocator());
-
-  // Process limit and offset
-  std::unique_ptr<cudf::table> output_table = nullptr;
-  if (offset >= merged_table->num_rows()) {
-    std::vector<std::unique_ptr<cudf::column>> empty_cols;
-    for (cudf::size_type c = 0; c < merged_table->num_columns(); ++c) {
-      empty_cols.push_back(cudf::make_empty_column(merged_table->get_column(c).type()));
-    }
-    output_table = std::make_unique<cudf::table>(std::move(empty_cols));
-  } else if (offset == 0 && limit >= merged_table->num_rows()) {
-    output_table = std::move(merged_table);
-  } else {
-    output_table = std::make_unique<cudf::table>(
-      cudf::slice(
-        merged_table->view(),
-        {offset, std::min(merged_table->num_rows(), static_cast<cudf::size_type>(offset + limit))},
-        stream)[0],
-      stream,
-      memory_space.get_default_allocator());
-  }
 
   // Create the output data batch
   return make_data_batch(std::move(output_table), memory_space);

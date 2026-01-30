@@ -18,6 +18,11 @@
 
 #include "duckdb/planner/bound_query_node.hpp"
 #include "op/sirius_physical_operator.hpp"
+
+#include <cudf/table/table.hpp>
+
+#include <memory>
+
 namespace duckdb {
 struct DynamicFilterData;
 }  // namespace duckdb
@@ -55,6 +60,41 @@ class sirius_physical_top_n : public sirius_physical_operator {
 
  public:
   bool is_sink() const override { return true; }
+  std::vector<std::shared_ptr<cucascade::data_batch>> execute(
+    const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches) override;
+};
+
+class sirius_physical_top_n_merge : public sirius_physical_operator {
+ public:
+  static constexpr const duckdb::PhysicalOperatorType TYPE =
+    duckdb::PhysicalOperatorType::EXTENSION;
+
+ public:
+  sirius_physical_top_n_merge(duckdb::vector<duckdb::LogicalType> types_p,
+                              duckdb::vector<duckdb::BoundOrderByNode> orders,
+                              duckdb::idx_t limit,
+                              duckdb::idx_t offset,
+                              duckdb::shared_ptr<duckdb::DynamicFilterData> dynamic_filter,
+                              duckdb::idx_t estimated_cardinality);
+  ~sirius_physical_top_n_merge() override;
+
+  duckdb::vector<duckdb::BoundOrderByNode> orders;
+  duckdb::idx_t limit;
+  duckdb::idx_t offset;
+  //! Dynamic table filter (if any)
+  duckdb::shared_ptr<duckdb::DynamicFilterData> dynamic_filter;
+
+ public:
+  bool is_source() const override { return true; }
+  duckdb::OrderPreservationType source_order() const override
+  {
+    return duckdb::OrderPreservationType::FIXED_ORDER;
+  }
+
+ public:
+  bool is_sink() const override { return true; }
+  std::vector<std::shared_ptr<cucascade::data_batch>> execute(
+    const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches) override;
 };
 
 }  // namespace op

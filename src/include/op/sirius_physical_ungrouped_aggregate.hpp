@@ -47,6 +47,30 @@ class sirius_physical_ungrouped_aggregate : public sirius_physical_operator {
 
  public:
   bool is_sink() const override { return true; }
+  std::vector<std::shared_ptr<cucascade::data_batch>> execute(
+    const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches) override;
+};
+
+class sirius_physical_ungrouped_aggregate_merge : public sirius_physical_operator {
+ public:
+  static constexpr const duckdb::PhysicalOperatorType TYPE =
+    duckdb::PhysicalOperatorType::EXTENSION;
+
+ public:
+  sirius_physical_ungrouped_aggregate_merge(
+    duckdb::vector<duckdb::LogicalType> types,
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> select_list,
+    duckdb::idx_t estimated_cardinality);
+
+  //! The aggregates that have to be computed
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> aggregates;
+
+  bool is_source() const override { return true; }
+
+ public:
+  bool is_sink() const override { return true; }
+  std::vector<std::shared_ptr<cucascade::data_batch>> execute(
+    const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches) override;
 };
 
 }  // namespace op

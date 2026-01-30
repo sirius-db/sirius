@@ -18,10 +18,13 @@
 
 #include "op/scan/duckdb_scan_task.hpp"
 #include "op/sirius_physical_table_scan.hpp"
+#include "op/sirius_physical_top_n.hpp"
+#include "op/sirius_physical_ungrouped_aggregate.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 
 #include <duckdb/parallel/thread_context.hpp>
 
+#include <iterator>
 #include <queue>
 
 namespace sirius::creator {
@@ -197,12 +200,31 @@ void task_creator::worker_function(int worker_id)
         _duckdb_scan_executor.schedule(std::move(scan_task));
         // scheduling pipeline task
       } else {
+        auto inner_ops = info->_pipeline->get_inner_operators();
+        auto* sink_op  = info->_pipeline->get_sink().get();
+        if (inner_ops.empty() && sink_op == nullptr) {
+          throw std::runtime_error("Pipeline has no operators to execute");
+        }
         duckdb::reference<sirius::op::sirius_physical_operator> node =
-          info->_pipeline->get_inner_operators()[0];
+          inner_ops.empty() ? duckdb::reference<sirius::op::sirius_physical_operator>(*sink_op)
+                            : inner_ops[0];
         info->_pipeline->get_sink()->set_creator(this);
         // need to exhaust input batches until all ports are empty
         while (!node.get().all_ports_empty()) {
-          auto input_batch = node.get().get_input_batch();
+          std::vector<std::shared_ptr<cucascade::data_batch>> input_batch;
+          if (sink_op &&
+              (dynamic_cast<sirius::op::sirius_physical_top_n_merge*>(sink_op) ||
+               dynamic_cast<sirius::op::sirius_physical_ungrouped_aggregate_merge*>(sink_op))) {
+            while (!node.get().all_ports_empty()) {
+              auto next_batch = node.get().get_input_batch();
+              if (next_batch.empty()) { break; }
+              input_batch.insert(input_batch.end(),
+                                 std::make_move_iterator(next_batch.begin()),
+                                 std::make_move_iterator(next_batch.end()));
+            }
+          } else {
+            input_batch = node.get().get_input_batch();
+          }
           auto global_state =
             std::make_shared<pipeline::gpu_pipeline_task_global_state>(info->_pipeline);
           auto local_state =

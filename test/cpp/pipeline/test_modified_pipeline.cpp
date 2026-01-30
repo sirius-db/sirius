@@ -439,13 +439,13 @@ build_source_to_pipelines_map(const duckdb::vector<duckdb::shared_ptr<sirius_pip
 }
 
 /**
- * @brief Count pipelines with PARTITION sinks (type=INVALID)
+ * @brief Count pipelines with PARTITION sinks
  */
 size_t count_partition_sinks(const duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines)
 {
   size_t count = 0;
   for (const auto& pipeline : pipelines) {
-    if (pipeline->get_sink()->type == PhysicalOperatorType::INVALID) { count++; }
+    if (dynamic_cast<sirius_physical_partition*>(pipeline->get_sink().get())) { count++; }
   }
   return count;
 }
@@ -501,7 +501,7 @@ PipelineBreakdownInfo analyze_pipeline_breakdown(
     auto sink = pipeline->get_sink();
 
     // Count PARTITION sinks
-    if (sink->type == PhysicalOperatorType::INVALID) {
+    if (dynamic_cast<sirius_physical_partition*>(sink.get())) {
       info.partition_count++;
       info.has_partition_before_agg = true;
 
@@ -586,10 +586,8 @@ HashJoinBreakdownInfo analyze_hash_join_breakdown(
     auto sink = pipeline->get_sink();
 
     // Check PARTITION sinks
-    if (sink->type == PhysicalOperatorType::INVALID) {
-      auto& partition = sink->Cast<sirius_physical_partition>();
-
-      if (partition.is_build_partition()) {
+    if (auto* partition = dynamic_cast<sirius_physical_partition*>(sink.get())) {
+      if (partition->is_build_partition()) {
         // Build side partition
         info.build_partition_count++;
 
@@ -610,9 +608,9 @@ HashJoinBreakdownInfo analyze_hash_join_breakdown(
       }
 
       // Check if this partition connects to a pipeline with HASH_JOIN
-      if (partition.is_build_partition()) {
+      if (partition->is_build_partition()) {
         // For build partitions: find pipeline where HASH_JOIN is the first operator
-        sirius_physical_operator* hash_join_op = partition.get_parent_op();
+        sirius_physical_operator* hash_join_op = partition->get_parent_op();
         for (const auto& dep_pipeline : pipelines) {
           auto inner_ops = dep_pipeline->get_inner_operators();
           if (inner_ops.size() > 0 && &inner_ops[0].get() == hash_join_op) {
@@ -667,7 +665,7 @@ HashJoinBreakdownInfo analyze_hash_join_breakdown(
     }
 
     // Check for pipelines that have PARTITION source and contain HASH_JOIN
-    if (pipeline->get_source()->type == PhysicalOperatorType::INVALID) {
+    if (dynamic_cast<sirius_physical_partition*>(pipeline->get_source().get())) {
       auto ops = pipeline->get_inner_operators();
       for (auto& op : ops) {
         if (op.get().type == PhysicalOperatorType::HASH_JOIN ||
@@ -743,14 +741,12 @@ void validate_modified_pipeline_structure(GPUExecutor& executor, const std::stri
                                    ")";
 
     // Validate based on sink type
-    if (sink->type == PhysicalOperatorType::INVALID) {
-      // This is a PARTITION operator
-      auto& partition     = sink->Cast<sirius_physical_partition>();
-      std::string port_id = partition.is_build_partition() ? "build" : "default";
+    if (auto* partition = dynamic_cast<sirius_physical_partition*>(sink.get())) {
+      std::string port_id = partition->is_build_partition() ? "build" : "default";
 
-      if (partition.is_build_partition()) {
+      if (partition->is_build_partition()) {
         // For build partitions: find pipeline where HASH_JOIN is the first operator
-        sirius_physical_operator* hash_join_op = partition.get_parent_op();
+        sirius_physical_operator* hash_join_op = partition->get_parent_op();
         for (const auto& dep_pipeline : new_scheduled) {
           auto inner_ops = dep_pipeline->get_inner_operators();
           if (inner_ops.size() > 0 && &inner_ops[0].get() == hash_join_op) {
@@ -791,7 +787,23 @@ void validate_modified_pipeline_structure(GPUExecutor& executor, const std::stri
         REQUIRE(next_op != nullptr);
         REQUIRE(std::string(next_port_id) == port_id);
       }
-
+    } else if (sink->type == PhysicalOperatorType::EXTENSION) {
+      // Extension sinks should use "default"
+      auto it = source_to_pipelines.find(sink.get());
+      if (it != source_to_pipelines.end()) {
+        for (auto& dep_pipeline : it->second) {
+          auto inner_ops = dep_pipeline->get_inner_operators();
+          sirius_physical_operator* next_op =
+            inner_ops.size() > 0 ? &inner_ops[0].get() : dep_pipeline->get_sink().get();
+          auto* port = next_op->get_port("default");
+          std::string context =
+            pipeline_context + " -> " + sink->get_name() + " with port 'default'";
+          validate_port_repository(port, context);
+          INFO("EXTENSION sink port validation: " << context);
+          REQUIRE(port->src_pipeline == pipeline);
+          REQUIRE(port->dest_pipeline == dep_pipeline);
+        }
+      }
     } else if (sink->type == PhysicalOperatorType::HASH_GROUP_BY ||
                sink->type == PhysicalOperatorType::ORDER_BY ||
                sink->type == PhysicalOperatorType::TOP_N ||
@@ -1177,11 +1189,10 @@ TEST_CASE("Pipeline breakdown - HASH_JOIN build side validation",
   bool found_build_partition_with_port = false;
   for (const auto& pipeline : executor.new_scheduled) {
     auto sink = pipeline->get_sink();
-    if (sink->type == PhysicalOperatorType::INVALID) {
-      auto& partition = sink->Cast<sirius_physical_partition>();
-      if (partition.is_build_partition()) {
+    if (auto* partition = dynamic_cast<sirius_physical_partition*>(sink.get())) {
+      if (partition->is_build_partition()) {
         // The partition's parent_op is the HASH_JOIN
-        sirius_physical_operator* hash_join_op = partition.get_parent_op();
+        sirius_physical_operator* hash_join_op = partition->get_parent_op();
         REQUIRE(hash_join_op != nullptr);
         REQUIRE(hash_join_op->type == PhysicalOperatorType::HASH_JOIN);
 
@@ -1250,9 +1261,8 @@ TEST_CASE("Pipeline breakdown - HASH_JOIN probe side validation",
   bool found_join_after_probe_partition = false;
   for (const auto& pipeline : executor.new_scheduled) {
     auto sink = pipeline->get_sink();
-    if (sink->type == PhysicalOperatorType::INVALID) {
-      auto& partition = sink->Cast<sirius_physical_partition>();
-      if (!partition.is_build_partition()) {
+    if (auto* partition = dynamic_cast<sirius_physical_partition*>(sink.get())) {
+      if (!partition->is_build_partition()) {
         // This is a probe partition - check it uses "default" port
         auto& next_ports = sink->get_next_port_after_sink();
         for (auto& [next_op, port_id] : next_ports) {

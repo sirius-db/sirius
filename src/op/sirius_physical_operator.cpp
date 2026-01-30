@@ -197,11 +197,11 @@ void sirius_physical_operator::sink(
   }
 }
 
-::std::vector<::std::shared_ptr<::cucascade::data_batch>> sirius_physical_operator::execute(
-  const ::std::vector<::std::shared_ptr<::cucascade::data_batch>>& input_batches)
+std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_operator::execute(
+  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches)
 {
   // not doing anything for now
-  return ::std::vector<::std::shared_ptr<::cucascade::data_batch>>{};
+  return std::vector<std::shared_ptr<cucascade::data_batch>>{};
 }
 
 void sirius_physical_operator::push_data_batch(std::string_view port_id,

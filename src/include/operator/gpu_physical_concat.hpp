@@ -28,7 +28,7 @@ namespace duckdb {
 
 class GPUPhysicalConcat : public GPUPhysicalOperator {
  public:
-  static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::INVALID;
+  static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::EXTENSION;
 
   explicit GPUPhysicalConcat(vector<LogicalType> types, idx_t estimated_cardinality);
 

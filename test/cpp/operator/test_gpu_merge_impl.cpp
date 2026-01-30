@@ -777,10 +777,9 @@ TEST_CASE("Grouped merge aggregate with mixed empty and non-empty local aggregat
 
 namespace {
 
-batches_with_handles create_batches_with_local_orderby_or_topn_result(
+batches_with_handles create_batches_with_local_orderby_result(
   const int num_batches,
   const std::vector<int>& num_base_input_rows,
-  const std::optional<std::pair<int, int>>& limit_offset,
   const std::vector<cudf::data_type>& column_types,
   const std::vector<int>& order_key_idx,
   const std::vector<cudf::order>& column_order,
@@ -802,23 +801,13 @@ batches_with_handles create_batches_with_local_orderby_or_topn_result(
     projections[i] = i;
   }
   for (int i = 0; i < num_batches; ++i) {
-    auto batch = limit_offset.has_value()
-                   ? gpu_order_impl::local_top_n(base_input.batches[i],
-                                                 limit_offset->first,
-                                                 limit_offset->second,
-                                                 order_key_idx,
-                                                 column_order,
-                                                 null_precedence,
-                                                 projections,
-                                                 cudf::get_default_stream(),
-                                                 mem_space)
-                   : gpu_order_impl::local_order_by(base_input.batches[i],
-                                                    order_key_idx,
-                                                    column_order,
-                                                    null_precedence,
-                                                    projections,
-                                                    cudf::get_default_stream(),
-                                                    mem_space);
+    auto batch = gpu_order_impl::local_order_by(base_input.batches[i],
+                                                order_key_idx,
+                                                column_order,
+                                                null_precedence,
+                                                projections,
+                                                cudf::get_default_stream(),
+                                                mem_space);
     REQUIRE(batch->try_to_create_task());
     auto lock_result = batch->try_to_lock_for_processing(mem_space.get_id());
     REQUIRE(lock_result.success);
@@ -882,14 +871,13 @@ TEST_CASE("Merge order-by basic", "[operator][merge_order_by]")
   std::vector<cudf::null_order> null_precedence = {
     cudf::null_order::AFTER, cudf::null_order::BEFORE, cudf::null_order::AFTER};
 
-  auto input        = create_batches_with_local_orderby_or_topn_result(num_batches,
-                                                                num_base_input_rows,
-                                                                std::nullopt,
-                                                                column_types,
-                                                                order_key_idx,
-                                                                column_order,
-                                                                null_precedence,
-                                                                *mem_space);
+  auto input        = create_batches_with_local_orderby_result(num_batches,
+                                                        num_base_input_rows,
+                                                        column_types,
+                                                        order_key_idx,
+                                                        column_order,
+                                                        null_precedence,
+                                                        *mem_space);
   auto output_batch = gpu_merge_impl::merge_order_by(input.batches,
                                                      order_key_idx,
                                                      column_order,
@@ -917,14 +905,13 @@ TEST_CASE("Merge order-by with invalid input", "[operator][merge_order_by]")
     cudf::null_order::AFTER, cudf::null_order::BEFORE, cudf::null_order::AFTER};
 
   // Invalid input: less than two input batches
-  auto input = create_batches_with_local_orderby_or_topn_result(num_batches,
-                                                                num_base_input_rows,
-                                                                std::nullopt,
-                                                                column_types,
-                                                                order_key_idx,
-                                                                column_order,
-                                                                null_precedence,
-                                                                *mem_space);
+  auto input = create_batches_with_local_orderby_result(num_batches,
+                                                        num_base_input_rows,
+                                                        column_types,
+                                                        order_key_idx,
+                                                        column_order,
+                                                        null_precedence,
+                                                        *mem_space);
   REQUIRE_THROWS_AS(gpu_merge_impl::merge_order_by(input.batches,
                                                    order_key_idx,
                                                    column_order,
@@ -936,14 +923,13 @@ TEST_CASE("Merge order-by with invalid input", "[operator][merge_order_by]")
   // Invalid input: mismatch between sizes of `order_key_idx`, `column_order`, and `null_precedence`
   num_batches         = 10;
   num_base_input_rows = std::vector<int>(num_batches, num_base_input_rows_per_batch);
-  auto input2         = create_batches_with_local_orderby_or_topn_result(num_batches,
-                                                                 num_base_input_rows,
-                                                                 std::nullopt,
-                                                                 column_types,
-                                                                 order_key_idx,
-                                                                 column_order,
-                                                                 null_precedence,
-                                                                 *mem_space);
+  auto input2         = create_batches_with_local_orderby_result(num_batches,
+                                                         num_base_input_rows,
+                                                         column_types,
+                                                         order_key_idx,
+                                                         column_order,
+                                                         null_precedence,
+                                                         *mem_space);
   order_key_idx.push_back(3);
   REQUIRE_THROWS_AS(gpu_merge_impl::merge_order_by(input2.batches,
                                                    order_key_idx,
@@ -971,14 +957,13 @@ TEST_CASE("Merge order-by with empty local order-by results", "[operator][merge_
   std::vector<cudf::null_order> null_precedence = {
     cudf::null_order::AFTER, cudf::null_order::BEFORE, cudf::null_order::AFTER};
 
-  auto input        = create_batches_with_local_orderby_or_topn_result(num_batches,
-                                                                num_base_input_rows,
-                                                                std::nullopt,
-                                                                column_types,
-                                                                order_key_idx,
-                                                                column_order,
-                                                                null_precedence,
-                                                                *mem_space);
+  auto input        = create_batches_with_local_orderby_result(num_batches,
+                                                        num_base_input_rows,
+                                                        column_types,
+                                                        order_key_idx,
+                                                        column_order,
+                                                        null_precedence,
+                                                        *mem_space);
   auto output_batch = gpu_merge_impl::merge_order_by(input.batches,
                                                      order_key_idx,
                                                      column_order,
@@ -1008,14 +993,13 @@ TEST_CASE("Merge order-by with mixed empty and non-empty local order-by results"
   std::vector<cudf::null_order> null_precedence = {
     cudf::null_order::AFTER, cudf::null_order::BEFORE, cudf::null_order::AFTER};
 
-  auto input        = create_batches_with_local_orderby_or_topn_result(num_batches,
-                                                                num_base_input_rows,
-                                                                std::nullopt,
-                                                                column_types,
-                                                                order_key_idx,
-                                                                column_order,
-                                                                null_precedence,
-                                                                *mem_space);
+  auto input        = create_batches_with_local_orderby_result(num_batches,
+                                                        num_base_input_rows,
+                                                        column_types,
+                                                        order_key_idx,
+                                                        column_order,
+                                                        null_precedence,
+                                                        *mem_space);
   auto output_batch = gpu_merge_impl::merge_order_by(input.batches,
                                                      order_key_idx,
                                                      column_order,
@@ -1023,275 +1007,4 @@ TEST_CASE("Merge order-by with mixed empty and non-empty local order-by results"
                                                      cudf::get_default_stream(),
                                                      *mem_space);
   validate_order_by(input.batches, *output_batch, order_key_idx, column_order);
-}
-
-namespace {
-
-void validate_top_n(const std::vector<std::shared_ptr<data_batch>>& input_batches,
-                    const data_batch& output,
-                    const std::pair<int, int>& limit_offset,
-                    const std::vector<int>& order_key_idx,
-                    const std::vector<cudf::order>& column_order)
-{
-  std::vector<cudf::table_view> input_table_views;
-  int num_input_rows = 0;
-  for (const auto& input_batch : input_batches) {
-    input_table_views.push_back(sirius::get_cudf_table_view(*input_batch));
-    num_input_rows += input_table_views.back().num_rows();
-  }
-  int limit = limit_offset.first, offset = limit_offset.second;
-  cudf::table_view output_table_view = sirius::get_cudf_table_view(output);
-  int expected_num_rows =
-    (limit + offset <= num_input_rows) ? limit : std::max(0, num_input_rows - offset);
-
-  // Compute sorted input
-  std::vector<std::vector<int64_t>> h_input_data(input_table_views[0].num_columns());
-  for (const auto& table : input_table_views) {
-    copy_data_to_host(table, h_input_data);
-  }
-  std::vector<std::vector<int64_t>> h_input_data_rows(h_input_data[0].size(),
-                                                      std::vector<int64_t>(h_input_data.size()));
-  for (size_t r = 0; r < h_input_data_rows.size(); ++r) {
-    for (size_t c = 0; c < h_input_data_rows[0].size(); ++c) {
-      h_input_data_rows[r][c] = h_input_data[c][r];
-    }
-  }
-  std::sort(h_input_data_rows.begin(),
-            h_input_data_rows.end(),
-            [&](const std::vector<int64_t>& r1, const std::vector<int64_t>& r2) {
-              for (size_t i = 0; i < order_key_idx.size(); ++i) {
-                int col = order_key_idx[i];
-                if (r1[col] == r2[col]) { continue; }
-                return (column_order[i] == cudf::order::ASCENDING && r1[col] < r2[col]) ||
-                       (column_order[i] == cudf::order::DESCENDING && r1[col] > r2[col]);
-              }
-              return false;
-            });
-
-  // Check
-  REQUIRE(output_table_view.num_rows() == expected_num_rows);
-  REQUIRE(output_table_view.num_columns() == input_table_views[0].num_columns());
-  for (int c = 0; c < output_table_view.num_columns(); ++c) {
-    REQUIRE(output_table_view.column(c).type().id() == input_table_views[0].column(c).type().id());
-  }
-
-  std::vector<std::vector<int64_t>> actual(output_table_view.num_columns());
-  copy_data_to_host(output_table_view, actual);
-  auto comp_lower = [&](int r) {
-    if (offset == 0) { return true; }
-    const auto& lower = h_input_data_rows[offset - 1];
-    for (size_t i = 0; i < order_key_idx.size(); ++i) {
-      int col = order_key_idx[i];
-      if (actual[col][r] == lower[col]) { continue; }
-      return (column_order[i] == cudf::order::ASCENDING && actual[col][r] > lower[col]) ||
-             (column_order[i] == cudf::order::DESCENDING && actual[col][r] < lower[col]);
-    }
-    return true;
-  };
-  auto comp_upper = [&](int r) {
-    if (offset + limit >= num_input_rows) { return true; }
-    const auto& upper = h_input_data_rows[offset + limit];
-    for (size_t i = 0; i < order_key_idx.size(); ++i) {
-      int col = order_key_idx[i];
-      if (actual[col][r] == upper[col]) { continue; }
-      return (column_order[i] == cudf::order::ASCENDING && actual[col][r] < upper[col]) ||
-             (column_order[i] == cudf::order::DESCENDING && actual[col][r] > upper[col]);
-    }
-    return true;
-  };
-  for (int r = 0; r < output_table_view.num_rows(); ++r) {
-    REQUIRE(comp_lower(r));
-    REQUIRE(comp_upper(r));
-  }
-}
-
-}  // namespace
-
-TEST_CASE("Merge top-n basic", "[operator][merge_top_n]")
-{
-  auto manager                                   = initialize_memory_manager();
-  auto* mem_space                                = manager->get_memory_space(Tier::GPU, 0);
-  constexpr int num_batches                      = 10;
-  constexpr size_t num_base_input_rows_per_batch = 100;
-  std::vector<int> num_base_input_rows(num_batches, num_base_input_rows_per_batch);
-  std::vector<cudf::data_type> column_types = {cudf::data_type{cudf::type_id::INT32},
-                                               cudf::data_type{cudf::type_id::INT64},
-                                               cudf::data_type{cudf::type_id::INT32},
-                                               cudf::data_type{cudf::type_id::INT64}};
-  std::pair<int, int> limit_offset          = {10, 20};
-  std::vector<int> order_key_idx            = {0, 1, 2};
-  std::vector<cudf::order> column_order     = {
-    cudf::order::ASCENDING, cudf::order::DESCENDING, cudf::order::ASCENDING};
-  std::vector<cudf::null_order> null_precedence = {
-    cudf::null_order::AFTER, cudf::null_order::BEFORE, cudf::null_order::AFTER};
-
-  auto input        = create_batches_with_local_orderby_or_topn_result(num_batches,
-                                                                num_base_input_rows,
-                                                                limit_offset,
-                                                                column_types,
-                                                                order_key_idx,
-                                                                column_order,
-                                                                null_precedence,
-                                                                *mem_space);
-  auto output_batch = gpu_merge_impl::merge_top_n(input.batches,
-                                                  limit_offset.first,
-                                                  limit_offset.second,
-                                                  order_key_idx,
-                                                  column_order,
-                                                  null_precedence,
-                                                  cudf::get_default_stream(),
-                                                  *mem_space);
-  validate_top_n(input.batches, *output_batch, limit_offset, order_key_idx, column_order);
-}
-
-TEST_CASE("Merge top-n with empty local top-n results", "[operator][merge_top_n]")
-{
-  auto manager                                   = initialize_memory_manager();
-  auto* mem_space                                = manager->get_memory_space(Tier::GPU, 0);
-  constexpr int num_batches                      = 10;
-  constexpr size_t num_base_input_rows_per_batch = 0;
-  std::vector<int> num_base_input_rows(num_batches, num_base_input_rows_per_batch);
-  std::vector<cudf::data_type> column_types = {cudf::data_type{cudf::type_id::INT32},
-                                               cudf::data_type{cudf::type_id::INT64},
-                                               cudf::data_type{cudf::type_id::INT32},
-                                               cudf::data_type{cudf::type_id::INT64}};
-  std::pair<int, int> limit_offset          = {10, 20};
-  std::vector<int> order_key_idx            = {0, 1, 2};
-  std::vector<cudf::order> column_order     = {
-    cudf::order::ASCENDING, cudf::order::DESCENDING, cudf::order::ASCENDING};
-  std::vector<cudf::null_order> null_precedence = {
-    cudf::null_order::AFTER, cudf::null_order::BEFORE, cudf::null_order::AFTER};
-
-  auto input        = create_batches_with_local_orderby_or_topn_result(num_batches,
-                                                                num_base_input_rows,
-                                                                limit_offset,
-                                                                column_types,
-                                                                order_key_idx,
-                                                                column_order,
-                                                                null_precedence,
-                                                                *mem_space);
-  auto output_batch = gpu_merge_impl::merge_top_n(input.batches,
-                                                  limit_offset.first,
-                                                  limit_offset.second,
-                                                  order_key_idx,
-                                                  column_order,
-                                                  null_precedence,
-                                                  cudf::get_default_stream(),
-                                                  *mem_space);
-  validate_top_n(input.batches, *output_batch, limit_offset, order_key_idx, column_order);
-}
-
-TEST_CASE("Merge top-n with mixed empty and non-empty local top-n results",
-          "[operator][merge_top_n]")
-{
-  auto manager              = initialize_memory_manager();
-  auto* mem_space           = manager->get_memory_space(Tier::GPU, 0);
-  constexpr int num_batches = 10;
-  std::vector<int> num_base_input_rows;
-  for (int i = 0; i < num_batches; ++i) {
-    num_base_input_rows.push_back(i % 2 == 1 ? 0 : (i + 1) * 10);
-  }
-  std::vector<cudf::data_type> column_types = {cudf::data_type{cudf::type_id::INT32},
-                                               cudf::data_type{cudf::type_id::INT64},
-                                               cudf::data_type{cudf::type_id::INT32},
-                                               cudf::data_type{cudf::type_id::INT64}};
-  std::pair<int, int> limit_offset          = {10, 20};
-  std::vector<int> order_key_idx            = {0, 1, 2};
-  std::vector<cudf::order> column_order     = {
-    cudf::order::ASCENDING, cudf::order::DESCENDING, cudf::order::ASCENDING};
-  std::vector<cudf::null_order> null_precedence = {
-    cudf::null_order::AFTER, cudf::null_order::BEFORE, cudf::null_order::AFTER};
-
-  auto input        = create_batches_with_local_orderby_or_topn_result(num_batches,
-                                                                num_base_input_rows,
-                                                                limit_offset,
-                                                                column_types,
-                                                                order_key_idx,
-                                                                column_order,
-                                                                null_precedence,
-                                                                *mem_space);
-  auto output_batch = gpu_merge_impl::merge_top_n(input.batches,
-                                                  limit_offset.first,
-                                                  limit_offset.second,
-                                                  order_key_idx,
-                                                  column_order,
-                                                  null_precedence,
-                                                  cudf::get_default_stream(),
-                                                  *mem_space);
-  validate_top_n(input.batches, *output_batch, limit_offset, order_key_idx, column_order);
-}
-
-TEST_CASE("Merge top-n with `limit = 0`", "[operator][merge_top_n]")
-{
-  auto manager                                   = initialize_memory_manager();
-  auto* mem_space                                = manager->get_memory_space(Tier::GPU, 0);
-  constexpr int num_batches                      = 10;
-  constexpr size_t num_base_input_rows_per_batch = 100;
-  std::vector<int> num_base_input_rows(num_batches, num_base_input_rows_per_batch);
-  std::vector<cudf::data_type> column_types = {cudf::data_type{cudf::type_id::INT32},
-                                               cudf::data_type{cudf::type_id::INT64},
-                                               cudf::data_type{cudf::type_id::INT32},
-                                               cudf::data_type{cudf::type_id::INT64}};
-  std::pair<int, int> limit_offset          = {0, 20};
-  std::vector<int> order_key_idx            = {0, 1, 2};
-  std::vector<cudf::order> column_order     = {
-    cudf::order::ASCENDING, cudf::order::DESCENDING, cudf::order::ASCENDING};
-  std::vector<cudf::null_order> null_precedence = {
-    cudf::null_order::AFTER, cudf::null_order::BEFORE, cudf::null_order::AFTER};
-
-  auto input        = create_batches_with_local_orderby_or_topn_result(num_batches,
-                                                                num_base_input_rows,
-                                                                limit_offset,
-                                                                column_types,
-                                                                order_key_idx,
-                                                                column_order,
-                                                                null_precedence,
-                                                                *mem_space);
-  auto output_batch = gpu_merge_impl::merge_top_n(input.batches,
-                                                  limit_offset.first,
-                                                  limit_offset.second,
-                                                  order_key_idx,
-                                                  column_order,
-                                                  null_precedence,
-                                                  cudf::get_default_stream(),
-                                                  *mem_space);
-  validate_top_n(input.batches, *output_batch, limit_offset, order_key_idx, column_order);
-}
-
-TEST_CASE("Merge top-n with `num_input_rows - limit <= offset < num_input-rows`",
-          "[operator][merge_top_n]")
-{
-  auto manager                                   = initialize_memory_manager();
-  auto* mem_space                                = manager->get_memory_space(Tier::GPU, 0);
-  constexpr int num_batches                      = 10;
-  constexpr size_t num_base_input_rows_per_batch = 100;
-  std::vector<int> num_base_input_rows(num_batches, num_base_input_rows_per_batch);
-  std::vector<cudf::data_type> column_types = {cudf::data_type{cudf::type_id::INT32},
-                                               cudf::data_type{cudf::type_id::INT64},
-                                               cudf::data_type{cudf::type_id::INT32},
-                                               cudf::data_type{cudf::type_id::INT64}};
-  std::pair<int, int> limit_offset          = {200, 900};
-  std::vector<int> order_key_idx            = {0, 1, 2};
-  std::vector<cudf::order> column_order     = {
-    cudf::order::ASCENDING, cudf::order::DESCENDING, cudf::order::ASCENDING};
-  std::vector<cudf::null_order> null_precedence = {
-    cudf::null_order::AFTER, cudf::null_order::BEFORE, cudf::null_order::AFTER};
-
-  auto input        = create_batches_with_local_orderby_or_topn_result(num_batches,
-                                                                num_base_input_rows,
-                                                                limit_offset,
-                                                                column_types,
-                                                                order_key_idx,
-                                                                column_order,
-                                                                null_precedence,
-                                                                *mem_space);
-  auto output_batch = gpu_merge_impl::merge_top_n(input.batches,
-                                                  limit_offset.first,
-                                                  limit_offset.second,
-                                                  order_key_idx,
-                                                  column_order,
-                                                  null_precedence,
-                                                  cudf::get_default_stream(),
-                                                  *mem_space);
-  validate_top_n(input.batches, *output_batch, limit_offset, order_key_idx, column_order);
 }

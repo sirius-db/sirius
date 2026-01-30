@@ -30,7 +30,7 @@ GPUPhysicalPartition::GPUPhysicalPartition(vector<LogicalType> types,
                                            idx_t estimated_cardinality,
                                            GPUPhysicalOperator* parent_op,
                                            bool is_build)
-  : GPUPhysicalOperator(PhysicalOperatorType::INVALID, std::move(types), estimated_cardinality)
+  : GPUPhysicalOperator(PhysicalOperatorType::EXTENSION, std::move(types), estimated_cardinality)
 {
   _num_partitions = (estimated_cardinality + PARTITION_SIZE - 1) / PARTITION_SIZE;
   _parent_op      = parent_op;

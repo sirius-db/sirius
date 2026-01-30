@@ -56,33 +56,6 @@ class gpu_order_impl {
     const std::vector<int>& projections,
     rmm::cuda_stream_view stream,
     cucascade::memory::memory_space& memory_space);
-
-  /**
-   * @brief Perform local top-n (with offset) on the input data batch.
-   *
-   * @param input The input data batch.
-   * @param limit The number of top rows to output in the final global result.
-   * @param offset The number of rows to skip in the final global result.
-   * @param order_key_idx The columns to sort on.
-   * @param column_order The desired sort order for each column.
-   * @param null_precedence The desired order of null compared to other elements for each column.
-   * Should have `order_idx.size() = column_order.size() = null_precedence.size()`.
-   * @param projections The columns to construct output based on the sorted order.
-   * @param stream CUDA stream used for device memory operations and kernel launches.
-   * @param memory_space The memory space used to allocate memory for the output data batch.
-   *
-   * @return The output data batch.
-   */
-  static std::shared_ptr<cucascade::data_batch> local_top_n(
-    std::shared_ptr<cucascade::data_batch> input,
-    const int limit,
-    const int offset,
-    const std::vector<int>& order_key_idx,
-    const std::vector<cudf::order>& column_order,
-    const std::vector<cudf::null_order>& null_precedence,
-    const std::vector<int>& projections,
-    rmm::cuda_stream_view stream,
-    cucascade::memory::memory_space& memory_space);
 };
 
 }  // namespace op

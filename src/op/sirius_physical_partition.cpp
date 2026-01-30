@@ -32,7 +32,7 @@ sirius_physical_partition::sirius_physical_partition(duckdb::vector<duckdb::Logi
                                                      sirius_physical_operator* parent_op,
                                                      bool is_build)
   : sirius_physical_operator(
-      duckdb::PhysicalOperatorType::INVALID, std::move(types), estimated_cardinality)
+      duckdb::PhysicalOperatorType::EXTENSION, std::move(types), estimated_cardinality)
 {
   _num_partitions = (estimated_cardinality + PARTITION_SIZE - 1) / PARTITION_SIZE;
   _parent_op      = parent_op;
@@ -82,14 +82,6 @@ void sirius_physical_partition::get_partition_keys(sirius_physical_operator* op,
     auto& order_by_op = op->Cast<sirius_physical_order>();
     for (size_t order_idx = 0; order_idx < order_by_op.orders.size(); order_idx++) {
       auto& expr = order_by_op.orders[order_idx].expression;
-      if (expr->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
-        _partition_keys.push_back(expr->Cast<duckdb::BoundReferenceExpression>().index);
-      }
-    }
-  } else if (op->type == duckdb::PhysicalOperatorType::TOP_N) {
-    auto& top_n_op = op->Cast<sirius_physical_top_n>();
-    for (size_t order_idx = 0; order_idx < top_n_op.orders.size(); order_idx++) {
-      auto& expr = top_n_op.orders[order_idx].expression;
       if (expr->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
         _partition_keys.push_back(expr->Cast<duckdb::BoundReferenceExpression>().index);
       }

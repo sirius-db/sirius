@@ -54,6 +54,9 @@
 #include <duckdb/common/exception.hpp>
 #include <duckdb/common/types.hpp>
 
+#include <memory>
+#include <vector>
+
 namespace duckdb {
 
 inline bool IsCudfTypeDecimal(const cudf::data_type& type)
@@ -114,6 +117,16 @@ inline cudf::data_type GetCudfType(const LogicalType& logical_type)
       throw InvalidInputException("GetCudfType: Unsupported duckdb type: %d",
                                   static_cast<int>(logical_type.id()));
   }
+}
+
+inline std::unique_ptr<cudf::table> make_empty_like(cudf::table_view input)
+{
+  std::vector<std::unique_ptr<cudf::column>> empty_cols;
+  empty_cols.reserve(input.num_columns());
+  for (cudf::size_type col_idx = 0; col_idx < input.num_columns(); ++col_idx) {
+    empty_cols.push_back(cudf::make_empty_column(input.column(col_idx).type()));
+  }
+  return std::make_unique<cudf::table>(std::move(empty_cols));
 }
 
 }  // namespace duckdb

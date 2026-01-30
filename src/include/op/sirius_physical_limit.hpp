@@ -39,6 +39,9 @@ class sirius_physical_streaming_limit : public sirius_physical_operator {
   duckdb::BoundLimitNode limit_val;
   duckdb::BoundLimitNode offset_val;
   bool parallel;
+
+  std::vector<std::shared_ptr<cucascade::data_batch>> execute(
+    const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches) override;
 };
 
 }  // namespace op

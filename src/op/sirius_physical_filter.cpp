@@ -27,6 +27,9 @@
 #include "expression_executor/gpu_expression_executor.hpp"
 #include "log/logging.hpp"
 
+#include <chrono>
+#include <stdexcept>
+
 namespace sirius {
 namespace op {
 
@@ -50,6 +53,31 @@ sirius_physical_filter::sirius_physical_filter(
   } else {
     expression = std::move(select_list[0]);
   }
+}
+
+std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_filter::execute(
+  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches)
+{
+  SIRIUS_LOG_DEBUG("Executing expression {}", expression->ToString());
+  auto start = std::chrono::high_resolution_clock::now();
+
+  // The executor uses the data_batch API to filter rows according to `expression`.
+  duckdb::sirius::GpuExpressionExecutor gpu_expression_executor(*expression.get());
+
+  std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
+  output_batches.reserve(input_batches.size());
+
+  for (auto const& batch : input_batches) {
+    if (!batch) { continue; }
+    auto filtered_batch = gpu_expression_executor.select(batch);
+    if (filtered_batch) { output_batches.push_back(std::move(filtered_batch)); }
+  }
+
+  auto end      = std::chrono::high_resolution_clock::now();
+  auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+  SIRIUS_LOG_DEBUG("Filter time: {:.2f} ms", duration.count() / 1000.0);
+
+  return output_batches;
 }
 
 }  // namespace op

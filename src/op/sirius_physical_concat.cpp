@@ -31,7 +31,7 @@ namespace op {
 sirius_physical_concat::sirius_physical_concat(duckdb::vector<duckdb::LogicalType> types,
                                                duckdb::idx_t estimated_cardinality)
   : sirius_physical_operator(
-      duckdb::PhysicalOperatorType::INVALID, std::move(types), estimated_cardinality)
+      duckdb::PhysicalOperatorType::EXTENSION, std::move(types), estimated_cardinality)
 {
   _num_partitions = (estimated_cardinality + PARTITION_SIZE - 1) / PARTITION_SIZE;
 }

@@ -112,32 +112,6 @@ class gpu_merge_impl {
     const std::vector<cudf::null_order>& null_precedence,
     rmm::cuda_stream_view stream,
     cucascade::memory::memory_space& memory_space);
-
-  /**
-   * @brief Perform merge top-n on multiple data batches.
-   *
-   * @param input The input batches to be merged.
-   * @param limit The number of top rows to output in the final global result.
-   * @param offset The number of rows to skip in the final global result.
-   * @param order_key_idx The columns to sort on.
-   * @param column_order The desired sort order for each column.
-   * @param null_precedence The desired order of null compared to other elements for each column.
-   * Should have `order_idx.size() = column_order.size() = null_precedence.size()`, and the three
-   * parameters should be consistent to the top-n order of each input batch.
-   * @param stream CUDA stream used for device memory operations and kernel launches.
-   * @param memory_space The memory space used to allocate memory for the output data batch.
-   *
-   * @return The output data batch.
-   */
-  static std::shared_ptr<cucascade::data_batch> merge_top_n(
-    const std::vector<std::shared_ptr<cucascade::data_batch>>& input,
-    const int limit,
-    const int offset,
-    const std::vector<int>& order_key_idx,
-    const std::vector<cudf::order>& column_order,
-    const std::vector<cudf::null_order>& null_precedence,
-    rmm::cuda_stream_view stream,
-    cucascade::memory::memory_space& memory_space);
 };
 
 }  // namespace op

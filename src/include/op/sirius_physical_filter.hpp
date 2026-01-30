@@ -36,6 +36,9 @@ class sirius_physical_filter : public sirius_physical_operator {
   //! The filter expression
   duckdb::unique_ptr<duckdb::Expression> expression;
 
+  std::vector<std::shared_ptr<cucascade::data_batch>> execute(
+    const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches) override;
+
   // sirius_expression_executor* sirius_expression_executor;
 
   // public:
