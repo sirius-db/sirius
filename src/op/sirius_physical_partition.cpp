@@ -32,11 +32,7 @@ sirius_physical_partition::sirius_physical_partition(duckdb::vector<duckdb::Logi
                                                      sirius_physical_operator* parent_op,
                                                      bool is_build)
   : sirius_physical_operator(
-<<<<<<< HEAD
-      duckdb::PhysicalOperatorType::EXTENSION, std::move(types), estimated_cardinality)
-=======
-      SiriusPhysicalOperatorType::INVALID, std::move(types), estimated_cardinality)
->>>>>>> 4a52deb (Switch DuckDB PhysicalOperator to Sirius PhysicalOperator)
+      SiriusPhysicalOperatorType::PARTITION, std::move(types), estimated_cardinality)
 {
   _num_partitions = (estimated_cardinality + PARTITION_SIZE - 1) / PARTITION_SIZE;
   _parent_op      = parent_op;

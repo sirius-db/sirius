@@ -90,6 +90,7 @@ class sirius_engine {
   void execute();
   void reset();
   void cancel_tasks();
+  duckdb::unique_ptr<op::sirius_physical_operator> construct_sirius_specific_operator(op::sirius_physical_operator* op);
   duckdb::shared_ptr<pipeline::sirius_pipeline> create_child_pipeline(
     pipeline::sirius_pipeline& current, op::sirius_physical_operator& op);
   duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> new_scheduled;

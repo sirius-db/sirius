@@ -195,6 +195,8 @@ std::string SiriusPhysicalOperatorToString(SiriusPhysicalOperatorType type) {
         return "MERGE_TOP_N";
     case SiriusPhysicalOperatorType::MERGE_AGGREGATE:   
         return "MERGE_AGGREGATE";
+	case SiriusPhysicalOperatorType::DUCKDB_SCAN:
+		return "DUCKDB_SCAN";
 	case SiriusPhysicalOperatorType::INVALID:
 		break;
 	}

@@ -69,7 +69,6 @@ class sirius_physical_operator {
   {
   }
   sirius_physical_operator() = default;
-
   virtual ~sirius_physical_operator() {}
 
   //! The physical operator type
