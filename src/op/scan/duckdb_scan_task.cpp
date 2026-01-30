@@ -38,7 +38,7 @@ duckdb_scan_task_global_state::duckdb_scan_task_global_state(
   duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
   duckdb_scan_executor& scan_exec,
   duckdb::ClientContext& client_ctx,
-  sirius_physical_table_scan* scan_op)
+  sirius_physical_duckdb_scan* scan_op)
   : _pipeline(std::move(pipeline)),
     _sirius_ctx(client_ctx.registered_state->Get<duckdb::SiriusContext>("sirius_state")),
     _max_threads(scan_exec.get_num_threads()),
@@ -327,7 +327,7 @@ size_t duckdb_scan_task_local_state::get_tail_byte_offset() const
   return std::min(last_byte_offset, _allocation->size_bytes());
 }
 
-void duckdb_scan_task_local_state::estimate_rows_per_batch(sirius_physical_table_scan const& op)
+void duckdb_scan_task_local_state::estimate_rows_per_batch(sirius_physical_duckdb_scan const& op)
 {
   assert(num_columns <= op.column_ids.size());
 
@@ -380,7 +380,7 @@ void duckdb_scan_task_local_state::initialize_builders()
 }
 
 void duckdb_scan_task_local_state::initialize_local_table_function_state(
-  sirius_physical_table_scan const& op,
+  sirius_physical_duckdb_scan const& op,
   duckdb::ExecutionContext& exec_ctx,
   duckdb::GlobalTableFunctionState* global_tf_state)
 {

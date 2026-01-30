@@ -17,9 +17,9 @@
 #include "creator/task_creator.hpp"
 
 #include "op/scan/duckdb_scan_task.hpp"
-#include "op/sirius_physical_table_scan.hpp"
 #include "op/sirius_physical_top_n.hpp"
 #include "op/sirius_physical_ungrouped_aggregate.hpp"
+#include "op/sirius_physical_duckdb_scan.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 
 #include <duckdb/parallel/thread_context.hpp>
@@ -177,13 +177,13 @@ void task_creator::worker_function(int worker_id)
     }
     try {
       // scheduling scan task
-      if (info->_node->type == op::SiriusPhysicalOperatorType::TABLE_SCAN) {
+      if (info->_node->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
         info->_pipeline->get_source()->set_creator(this);
         auto scan_task_global_state = std::make_shared<op::scan::duckdb_scan_task_global_state>(
           info->_pipeline,
           _duckdb_scan_executor,
           *_client_context,
-          &info->_node->Cast<op::sirius_physical_table_scan>());
+          &info->_node->Cast<op::sirius_physical_duckdb_scan>());
         duckdb::ThreadContext thread_ctx(*_client_context);
         duckdb::ExecutionContext exec_ctx(*_client_context, thread_ctx, nullptr);
         auto scan_task_local_state = std::make_unique<op::scan::duckdb_scan_task_local_state>(

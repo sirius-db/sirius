@@ -23,7 +23,7 @@
 #include <data/sirius_converter_registry.hpp>
 #include <op/scan/duckdb_scan_executor.hpp>
 #include <op/scan/duckdb_scan_task.hpp>
-#include <op/sirius_physical_table_scan.hpp>
+#include <op/sirius_physical_duckdb_scan.hpp>
 
 // cucascade
 #include <cucascade/data/data_batch.hpp>
@@ -246,7 +246,7 @@ static void validate_scanned_batches(
 /**
  * @brief Create a PhysicalTableScan for the given table
  */
-static std::unique_ptr<sirius::op::sirius_physical_table_scan> make_physical_table_scan(
+static std::unique_ptr<sirius::op::sirius_physical_duckdb_scan> make_physical_table_scan(
   duckdb::ClientContext& ctx, std::string const& table_name)
 {
   auto& catalog = duckdb::Catalog::GetCatalog(ctx, "");
@@ -283,8 +283,8 @@ static std::unique_ptr<sirius::op::sirius_physical_table_scan> make_physical_tab
 
   auto virtual_columns = table_catalog_entry.GetVirtualColumns();
 
-  // Create sirius_physical_table_scan with all required parameters
-  auto physical_scan = std::make_unique<sirius::op::sirius_physical_table_scan>(
+  // Create sirius_physical_duckdb_scan with all required parameters
+  auto physical_scan = std::make_unique<sirius::op::sirius_physical_duckdb_scan>(
     table_catalog_entry.GetTypes(),   // types
     table_scan_function,              // function
     std::move(bind_data),             // bind_data
