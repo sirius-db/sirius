@@ -24,8 +24,7 @@ namespace op {
 
 class sirius_physical_empty_result : public sirius_physical_operator {
  public:
-  static constexpr const SiriusPhysicalOperatorType TYPE =
-    SiriusPhysicalOperatorType::EMPTY_RESULT;
+  static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::EMPTY_RESULT;
 
  public:
   explicit sirius_physical_empty_result(duckdb::vector<duckdb::LogicalType> types,

@@ -338,12 +338,11 @@ void SiriusExtension::GPUProcessingFunction(ClientContext& context,
 }
 
 static unique_ptr<sirius::op::sirius_physical_operator> SiriusGeneratePhysicalPlan(
-  ClientContext& context,
-  GPUContext& gpu_context,
-  unique_ptr<LogicalOperator>& logical_plan)
+  ClientContext& context, GPUContext& gpu_context, unique_ptr<LogicalOperator>& logical_plan)
 {
-  sirius::planner::sirius_physical_plan_generator physical_planner = sirius::planner::sirius_physical_plan_generator(context, gpu_context);
-  auto physical_plan                        = physical_planner.create_plan(std::move(logical_plan));
+  sirius::planner::sirius_physical_plan_generator physical_planner =
+    sirius::planner::sirius_physical_plan_generator(context, gpu_context);
+  auto physical_plan = physical_planner.create_plan(std::move(logical_plan));
   return physical_plan;
 }
 
@@ -351,9 +350,9 @@ static unique_ptr<sirius::op::sirius_physical_operator> SiriusGeneratePhysicalPl
 // This result of this function is used as an argument to the GPUExecutionFunction function (data_p
 // argument), which is called to execute the table function.
 unique_ptr<FunctionData> SiriusExtension::GPUExecutionBind(ClientContext& context,
-                                                            TableFunctionBindInput& input,
-                                                            vector<LogicalType>& return_types,
-                                                            vector<string>& names)
+                                                           TableFunctionBindInput& input,
+                                                           vector<LogicalType>& return_types,
+                                                           vector<string>& names)
 {
   auto result              = make_uniq<SiriusTableFunctionData>();
   result->query            = input.inputs[0].ToString();
@@ -382,8 +381,8 @@ unique_ptr<FunctionData> SiriusExtension::GPUExecutionBind(ClientContext& contex
   try {
     auto sirius_physical_plan =
       SiriusGeneratePhysicalPlan(context, *result->gpu_context, query_plan);
-    auto gpu_prepared    = make_shared_ptr<SiriusPreparedStatementData>(std::move(prepared),
-                                                                  std::move(sirius_physical_plan));
+    auto gpu_prepared = make_shared_ptr<SiriusPreparedStatementData>(
+      std::move(prepared), std::move(sirius_physical_plan));
     result->gpu_prepared = gpu_prepared;
   } catch (std::exception& e) {
     ErrorData error(e);
@@ -402,8 +401,8 @@ unique_ptr<FunctionData> SiriusExtension::GPUExecutionBind(ClientContext& contex
 }
 
 void SiriusExtension::GPUExecutionFunction(ClientContext& context,
-                                            TableFunctionInput& data_p,
-                                            DataChunk& output)
+                                           TableFunctionInput& data_p,
+                                           DataChunk& output)
 {
   auto& data = (SiriusTableFunctionData&)*data_p.bind_data;
   if (data.finished) { return; }
@@ -590,9 +589,9 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
   catalog.CreateTableFunction(transaction, gpu_processing_info);
 
   TableFunction gpu_execution("gpu_execution",
-                               {LogicalType::VARCHAR},
-                               GPUExecutionFunction,
-                               SiriusExtension::GPUExecutionBind);
+                              {LogicalType::VARCHAR},
+                              GPUExecutionFunction,
+                              SiriusExtension::GPUExecutionBind);
   gpu_execution.named_parameters["enable_optimizer"] = LogicalType::BOOLEAN;
   CreateTableFunctionInfo gpu_execution_info(gpu_execution);
   catalog.CreateTableFunction(transaction, gpu_execution_info);
@@ -789,7 +788,6 @@ std::string SiriusExtension::Version() const
 extern "C" {
 
 DUCKDB_CPP_EXTENSION_ENTRY(sirius, loader) { duckdb::LoadInternal(loader); }
-
 }
 
 #ifndef DUCKDB_EXTENSION_MAIN

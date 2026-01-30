@@ -40,15 +40,15 @@ static duckdb::vector<duckdb::BoundOrderByNode> copy_orders(
 }
 
 sirius_physical_merge_top_n::sirius_physical_merge_top_n(sirius_physical_top_n* top_n)
-: sirius_physical_merge_top_n(
-    top_n->types,                // copied by value
-    copy_orders(top_n->orders),  // deep copy
-    top_n->limit,                // primitive
-    top_n->offset,               // primitive
-    top_n->dynamic_filter,       // shared_ptr - shares ownership (reference count increases)
-    top_n->estimated_cardinality)
+  : sirius_physical_merge_top_n(
+      top_n->types,                // copied by value
+      copy_orders(top_n->orders),  // deep copy
+      top_n->limit,                // primitive
+      top_n->offset,               // primitive
+      top_n->dynamic_filter,       // shared_ptr - shares ownership (reference count increases)
+      top_n->estimated_cardinality)
 {
-    child_op = top_n;
+  child_op = top_n;
 }
 
 sirius_physical_merge_top_n::sirius_physical_merge_top_n(

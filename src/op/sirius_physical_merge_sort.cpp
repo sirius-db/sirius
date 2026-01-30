@@ -37,20 +37,21 @@ static duckdb::vector<duckdb::BoundOrderByNode> copy_orders(
 
 sirius_physical_merge_sort::sirius_physical_merge_sort(sirius_physical_order* order_by)
   : sirius_physical_merge_sort(
-      order_by->types,               // copied by value
-      copy_orders(order_by->orders), // deep copy (contains unique_ptr<Expression>)
-      order_by->projections,         // copied by value
+      order_by->types,                // copied by value
+      copy_orders(order_by->orders),  // deep copy (contains unique_ptr<Expression>)
+      order_by->projections,          // copied by value
       order_by->estimated_cardinality,
       order_by->is_index_sort)
 {
-    child_op = order_by;
+  child_op = order_by;
 }
 
-sirius_physical_merge_sort::sirius_physical_merge_sort(duckdb::vector<duckdb::LogicalType> types,
-                                             duckdb::vector<duckdb::BoundOrderByNode> orders,
-                                             duckdb::vector<duckdb::idx_t> projections_p,
-                                             duckdb::idx_t estimated_cardinality,
-                                             bool is_index_sort_p)
+sirius_physical_merge_sort::sirius_physical_merge_sort(
+  duckdb::vector<duckdb::LogicalType> types,
+  duckdb::vector<duckdb::BoundOrderByNode> orders,
+  duckdb::vector<duckdb::idx_t> projections_p,
+  duckdb::idx_t estimated_cardinality,
+  bool is_index_sort_p)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::MERGE_SORT, std::move(types), estimated_cardinality),
     orders(std::move(orders)),

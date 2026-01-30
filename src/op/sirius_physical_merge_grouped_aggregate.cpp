@@ -83,7 +83,7 @@ sirius_physical_merge_grouped_aggregate::sirius_physical_merge_grouped_aggregate
       duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES,  // default
       duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES)  // default
 {
-    child_op = grouped_aggregate;
+  child_op = grouped_aggregate;
 }
 
 // expressions is the list of aggregates to be computed. Each aggregates has a bound_ref expression

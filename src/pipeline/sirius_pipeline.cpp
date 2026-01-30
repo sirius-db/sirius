@@ -28,10 +28,10 @@
 #include "duckdb/parallel/pipeline_event.hpp"
 #include "duckdb/parallel/pipeline_executor.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
-#include "sirius_engine.hpp"
 #include "log/logging.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
+#include "sirius_engine.hpp"
 
 namespace sirius {
 namespace pipeline {

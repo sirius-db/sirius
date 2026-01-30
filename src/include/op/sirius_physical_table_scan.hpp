@@ -53,8 +53,7 @@ enum compare_type {
 
 class sirius_physical_table_scan : public sirius_physical_operator {
  public:
-  static constexpr const SiriusPhysicalOperatorType TYPE =
-    SiriusPhysicalOperatorType::TABLE_SCAN;
+  static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::TABLE_SCAN;
 
  public:
   //! Table scan that immediately projects out filter columns that are unused in the remainder of

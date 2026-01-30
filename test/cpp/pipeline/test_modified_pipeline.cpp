@@ -37,7 +37,6 @@
 // sirius
 #include <config.hpp>
 #include <gpu_context.hpp>
-#include <sirius_engine.hpp>
 #include <op/sirius_physical_concat.hpp>
 #include <op/sirius_physical_cte.hpp>
 #include <op/sirius_physical_delim_join.hpp>
@@ -45,6 +44,7 @@
 #include <op/sirius_physical_result_collector.hpp>
 #include <pipeline/sirius_pipeline.hpp>
 #include <planner/sirius_physical_plan_generator.hpp>
+#include <sirius_engine.hpp>
 #include <sirius_extension.hpp>
 
 // duckdb
@@ -67,6 +67,7 @@
 using namespace duckdb;
 
 // sirius types
+using sirius::sirius_engine;
 using sirius::op::sirius_physical_cte;
 using sirius::op::sirius_physical_delim_join;
 using sirius::op::sirius_physical_materialized_collector;
@@ -76,7 +77,6 @@ using sirius::op::sirius_physical_result_collector;
 using sirius::op::SiriusPhysicalOperatorType;
 using sirius::pipeline::sirius_pipeline;
 using sirius::planner::sirius_physical_plan_generator;
-using sirius::sirius_engine;
 
 //===----------------------------------------------------------------------===//
 // Test Fixture and Helper Functions

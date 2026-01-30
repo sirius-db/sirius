@@ -37,11 +37,11 @@ class sirius_physical_merge_top_n : public sirius_physical_operator {
   sirius_physical_merge_top_n(sirius_physical_top_n* top_n);
 
   sirius_physical_merge_top_n(duckdb::vector<duckdb::LogicalType> types_p,
-                        duckdb::vector<duckdb::BoundOrderByNode> orders,
-                        duckdb::idx_t limit,
-                        duckdb::idx_t offset,
-                        duckdb::shared_ptr<duckdb::DynamicFilterData> dynamic_filter,
-                        duckdb::idx_t estimated_cardinality);
+                              duckdb::vector<duckdb::BoundOrderByNode> orders,
+                              duckdb::idx_t limit,
+                              duckdb::idx_t offset,
+                              duckdb::shared_ptr<duckdb::DynamicFilterData> dynamic_filter,
+                              duckdb::idx_t estimated_cardinality);
 
   duckdb::vector<duckdb::BoundOrderByNode> orders;
   duckdb::idx_t limit;

@@ -348,13 +348,15 @@ unique_ptr<PendingQueryResult> GPUContext::SiriusPendingStatementInternal(
   GPUBindPreparedStatementParameters(statement, parameters);
 
   unique_ptr<::sirius::sirius_engine> temp = make_uniq<::sirius::sirius_engine>(context, *this);
-  auto prop                    = temp->context.GetClientProperties();
-  gpu_active_query->engine = std::move(temp);
-  auto& engine             = GetSiriusEngine();
-  bool stream_result = false;
+  auto prop                                = temp->context.GetClientProperties();
+  gpu_active_query->engine                 = std::move(temp);
+  auto& engine                             = GetSiriusEngine();
+  bool stream_result                       = false;
 
   unique_ptr<::sirius::op::sirius_physical_result_collector> sirius_collector =
-    make_uniq_base<::sirius::op::sirius_physical_result_collector, ::sirius::op::sirius_physical_materialized_collector>(*statement_p, client_context);
+    make_uniq_base<::sirius::op::sirius_physical_result_collector,
+                   ::sirius::op::sirius_physical_materialized_collector>(*statement_p,
+                                                                         client_context);
   if (sirius_collector->type != ::sirius::op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
     return GPUErrorResult<PendingQueryResult>(ErrorData("Error in SiriusPendingStatementInternal"));
   }

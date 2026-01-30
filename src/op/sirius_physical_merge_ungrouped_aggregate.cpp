@@ -37,12 +37,12 @@ static duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> copy_expressions(
 sirius_physical_merge_ungrouped_aggregate::sirius_physical_merge_ungrouped_aggregate(
   sirius_physical_ungrouped_aggregate* ungrouped_aggregate)
   : sirius_physical_merge_ungrouped_aggregate(
-      ungrouped_aggregate->types,                       // copied by value
-      copy_expressions(ungrouped_aggregate->aggregates), // deep copy
+      ungrouped_aggregate->types,                         // copied by value
+      copy_expressions(ungrouped_aggregate->aggregates),  // deep copy
       ungrouped_aggregate->estimated_cardinality,
       duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES)  // default - not stored in source
 {
-    child_op = ungrouped_aggregate;
+  child_op = ungrouped_aggregate;
 }
 
 sirius_physical_merge_ungrouped_aggregate::sirius_physical_merge_ungrouped_aggregate(

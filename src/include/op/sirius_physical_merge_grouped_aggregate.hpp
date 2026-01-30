@@ -23,15 +23,17 @@
 #include "duckdb/execution/radix_partitioned_hashtable.hpp"
 #include "duckdb/parser/group_by_node.hpp"
 #include "duckdb/storage/data_table.hpp"
-#include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
+#include "op/sirius_physical_operator.hpp"
 
 namespace sirius {
 namespace op {
 
 class sirius_physical_merge_grouped_aggregate : public sirius_physical_operator {
  public:
-  static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::MERGE_GROUP_BY;
+  static constexpr const SiriusPhysicalOperatorType TYPE =
+    SiriusPhysicalOperatorType::MERGE_GROUP_BY;
+
  public:
   sirius_physical_merge_grouped_aggregate(sirius_physical_grouped_aggregate* grouped_aggregate);
 

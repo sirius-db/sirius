@@ -17,9 +17,9 @@
 #include "creator/task_creator.hpp"
 
 #include "op/scan/duckdb_scan_task.hpp"
+#include "op/sirius_physical_duckdb_scan.hpp"
 #include "op/sirius_physical_top_n.hpp"
 #include "op/sirius_physical_ungrouped_aggregate.hpp"
-#include "op/sirius_physical_duckdb_scan.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 
 #include <duckdb/parallel/thread_context.hpp>

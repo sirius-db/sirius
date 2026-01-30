@@ -31,23 +31,17 @@ namespace sirius {
 namespace op {
 
 // Helper function to deep copy ExtraOperatorInfo
-duckdb::ExtraOperatorInfo copy_extra_info(const duckdb::ExtraOperatorInfo& src) {
+duckdb::ExtraOperatorInfo copy_extra_info(const duckdb::ExtraOperatorInfo& src)
+{
   duckdb::ExtraOperatorInfo copy;
   copy.file_filters = src.file_filters;
-  if (src.total_files.IsValid()) {
-    copy.total_files = src.total_files.GetIndex();
-  }
-  if (src.filtered_files.IsValid()) {
-    copy.filtered_files = src.filtered_files.GetIndex();
-  }
-  if (src.sample_options) {
-    copy.sample_options = src.sample_options->Copy();
-  }
+  if (src.total_files.IsValid()) { copy.total_files = src.total_files.GetIndex(); }
+  if (src.filtered_files.IsValid()) { copy.filtered_files = src.filtered_files.GetIndex(); }
+  if (src.sample_options) { copy.sample_options = src.sample_options->Copy(); }
   return copy;
 }
 
-sirius_physical_duckdb_scan::sirius_physical_duckdb_scan(
-  sirius_physical_table_scan* table_scan)
+sirius_physical_duckdb_scan::sirius_physical_duckdb_scan(sirius_physical_table_scan* table_scan)
   : sirius_physical_duckdb_scan(
       table_scan->types,
       table_scan->function,

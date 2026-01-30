@@ -31,10 +31,10 @@ class sirius_physical_merge_sort : public sirius_physical_operator {
   sirius_physical_merge_sort(sirius_physical_order* order_by);
 
   sirius_physical_merge_sort(duckdb::vector<duckdb::LogicalType> types,
-                        duckdb::vector<duckdb::BoundOrderByNode> orders,
-                        duckdb::vector<duckdb::idx_t> projections_p,
-                        duckdb::idx_t estimated_cardinality,
-                        bool is_index_sort_p = false);
+                             duckdb::vector<duckdb::BoundOrderByNode> orders,
+                             duckdb::vector<duckdb::idx_t> projections_p,
+                             duckdb::idx_t estimated_cardinality,
+                             bool is_index_sort_p = false);
 
   //! Input data
   duckdb::vector<duckdb::BoundOrderByNode> orders;

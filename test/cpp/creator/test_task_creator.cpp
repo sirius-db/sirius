@@ -104,10 +104,7 @@ class mock_sirius_physical_operator : public sirius_physical_operator {
  */
 class mock_gpu_pipeline : public sirius_pipeline {
  public:
-  explicit mock_gpu_pipeline(sirius_engine& engine)
-    : sirius_pipeline(engine), _finished(false)
-  {
-  }
+  explicit mock_gpu_pipeline(sirius_engine& engine) : sirius_pipeline(engine), _finished(false) {}
 
   void set_finished(bool finished) { _finished = finished; }
 

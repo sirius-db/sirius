@@ -24,8 +24,7 @@ namespace op {
 
 class sirius_physical_dummy_scan : public sirius_physical_operator {
  public:
-  static constexpr const SiriusPhysicalOperatorType TYPE =
-    SiriusPhysicalOperatorType::DUMMY_SCAN;
+  static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::DUMMY_SCAN;
 
  public:
   explicit sirius_physical_dummy_scan(duckdb::vector<duckdb::LogicalType> types,
