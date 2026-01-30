@@ -47,11 +47,8 @@ duckdb_scan_task_global_state::duckdb_scan_task_global_state(
 {
   // Initialize global table function state
   if (_op.function.init_global) {
-    duckdb::TableFunctionInitInput tf_input(_op.bind_data.get(),
-                                            _op.column_ids,
-                                            _op.projection_ids,
-                                            nullptr,
-                                            _op.extra_info.sample_options);
+    duckdb::TableFunctionInitInput tf_input(
+      _op.bind_data.get(), _op.column_ids, _op.scanned_ids, nullptr, _op.extra_info.sample_options);
     _global_tf_state = _op.function.init_global(client_ctx, tf_input);
   }
 
@@ -286,6 +283,9 @@ duckdb_scan_task_local_state::duckdb_scan_task_local_state(
   _num_columns   = op.projection_ids.size();
 
   if (existing_local_tf_state) {
+    printf(
+      "duckdb_scan_task_local_state::duckdb_scan_task_local_state: existing_local_tf_state: %p\n",
+      static_cast<void*>(existing_local_tf_state.get()));
     _local_tf_state = std::move(existing_local_tf_state);
   } else {
     g_state.increment_local_states();
@@ -433,7 +433,7 @@ bool duckdb_scan_task::get_next_chunk(duckdb_scan_task_local_state& l_state,
   duckdb::TableFunctionInput tf_input(
     g_state._op.bind_data.get(), l_state._local_tf_state.get(), g_state._global_tf_state.get());
 
-  g_state._op.function.function(l_state._exec_ctx.client, tf_input, l_state._chunk);
+  g_state._op.function.function(l_state._exec_ctx_ptr->client, tf_input, l_state._chunk);
 
   if (l_state._chunk.size() == 0) {
     if (!l_state._local_state_drained) {
@@ -479,8 +479,8 @@ void duckdb_scan_task::execute()
   auto& g_state = this->_global_state->cast<duckdb_scan_task_global_state>();
 
   // Initialize the data chunk
-  l_state._chunk.Initialize(duckdb::Allocator::Get(l_state._exec_ctx.client),
-                            g_state._op.returned_types);
+  l_state._chunk.Initialize(duckdb::Allocator::Get(l_state._exec_ctx_ptr->client),
+                            g_state._op.scanned_types);
 
   // Enter the scan loop to accumulate a data batch
   while (get_next_chunk(l_state, g_state)) {
@@ -507,7 +507,6 @@ void duckdb_scan_task::execute()
     // This ensures DuckDB continues scanning from the current position rather than starting over
     auto new_local_state =
       std::make_unique<duckdb_scan_task_local_state>(g_state,
-                                                     l_state._exec_ctx,
                                                      l_state._approximate_batch_size,
                                                      l_state._default_varchar_size,
                                                      std::move(l_state._local_tf_state));
@@ -522,7 +521,24 @@ void duckdb_scan_task::execute()
   }
 
   // Make data batch and push to repository
-  if (l_state._row_offset > 0) { _data_repo->add_data_batch(l_state.make_data_batch()); }
+  if (l_state._row_offset > 0) {
+    printf("Adding data batch to repository\n");
+    _data_repo->add_data_batch(l_state.make_data_batch());
+
+    // Schedule next task for the pipeline that consumes this scan's output
+    // The pipeline's inner operators (between source and sink) should process this data
+    auto inner_operators = g_state._pipeline->get_inner_operators();
+    if (!inner_operators.empty()) {
+      // Schedule a task creation for the first inner operator in the pipeline
+      auto* first_inner_op = &inner_operators[0].get();
+      auto task_info =
+        std::make_unique<creator::task_creation_info>(first_inner_op, g_state._pipeline);
+      printf("Scheduling task_creation_info for inner operator %s\n",
+             first_inner_op->get_name().c_str());
+      g_state._sirius_ctx->get_task_creator().schedule(std::move(task_info));
+    }
+  }
+  printf("Scan task finished\n");
 }
 
 }  // namespace sirius::op::scan
