@@ -72,9 +72,7 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_itask_local_state {
    * @param res Memory reservation for GPU resources
    */
   explicit gpu_pipeline_task_local_state(
-    std::vector<std::shared_ptr<cucascade::data_batch>> batches,
-    // TODO remove this parameter for the reservation
-    std::unique_ptr<cucascade::memory::reservation> res = nullptr)
+    std::vector<std::shared_ptr<cucascade::data_batch>> batches)
     : _batches(std::move(batches))
   {
   }
@@ -153,18 +151,19 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
    */
   void publish_output(std::vector<std::shared_ptr<cucascade::data_batch>> output_batches) override;
 
-  std::size_t get_estimated_reservation_size() override
-  {
-    return 0;
-    /// TODO(WSM)
-  }
+  
+  /**
+   * @brief Get the input size for this task
+   *
+   * @return std::size_t The input size
+   */
+  std::size_t get_input_size() const;
+
+  
+  std::size_t get_estimated_reservation_size() override;
 
   /// @brief Get the output consumer operators for this task.
-  std::vector<op::sirius_physical_operator*> get_output_consumers() override
-  {
-    return {};
-    /// TODO(WSM)
-  }
+  std::vector<op::sirius_physical_operator*> get_output_consumers() override;
 
  private:
   uint64_t _task_id;

@@ -67,7 +67,8 @@ struct sirius_config {
                                                             .retry_on_error = false};
   parallel::task_executor_config _duckdb_scan_executor_config{.num_threads    = 4,
                                                               .retry_on_error = false};
-  size_t _task_creator_thread_count = 4;
+  
+  size_t _task_creator_thread_count = 2;
 };
 
 }  // namespace sirius
