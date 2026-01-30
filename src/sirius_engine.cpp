@@ -29,17 +29,17 @@
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_duckdb_scan.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
+#include "op/sirius_physical_grouped_aggregate_merge.hpp"
 #include "op/sirius_physical_hash_join.hpp"
-#include "op/sirius_physical_merge_grouped_aggregate.hpp"
 #include "op/sirius_physical_merge_sort.hpp"
-#include "op/sirius_physical_merge_top_n.hpp"
-#include "op/sirius_physical_merge_ungrouped_aggregate.hpp"
 #include "op/sirius_physical_order.hpp"
 #include "op/sirius_physical_partition.hpp"
 #include "op/sirius_physical_result_collector.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "op/sirius_physical_top_n.hpp"
+#include "op/sirius_physical_top_n_merge.hpp"
 #include "op/sirius_physical_ungrouped_aggregate.hpp"
+#include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
 
 #include <cucascade/data/data_repository_manager.hpp>
 #include <stdio.h>
@@ -192,16 +192,16 @@ duckdb::unique_ptr<op::sirius_physical_operator> sirius_engine::construct_sirius
     return duckdb::make_uniq<op::sirius_physical_duckdb_scan>(&scan_physical_op);
   } else if (op->type == op::SiriusPhysicalOperatorType::HASH_GROUP_BY) {
     auto& group_by_physical_op = op->Cast<op::sirius_physical_grouped_aggregate>();
-    return duckdb::make_uniq<op::sirius_physical_merge_grouped_aggregate>(&group_by_physical_op);
+    return duckdb::make_uniq<op::sirius_physical_grouped_aggregate_merge>(&group_by_physical_op);
   } else if (op->type == op::SiriusPhysicalOperatorType::ORDER_BY) {
     auto& order_by_physical_op = op->Cast<op::sirius_physical_order>();
     return duckdb::make_uniq<op::sirius_physical_merge_sort>(&order_by_physical_op);
   } else if (op->type == op::SiriusPhysicalOperatorType::TOP_N) {
     auto& topn_physical_op = op->Cast<op::sirius_physical_top_n>();
-    return duckdb::make_uniq<op::sirius_physical_merge_top_n>(&topn_physical_op);
+    return duckdb::make_uniq<op::sirius_physical_top_n_merge>(&topn_physical_op);
   } else if (op->type == op::SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE) {
     auto& ungrouped_agg_physical_op = op->Cast<op::sirius_physical_ungrouped_aggregate>();
-    return duckdb::make_uniq<op::sirius_physical_merge_ungrouped_aggregate>(
+    return duckdb::make_uniq<op::sirius_physical_ungrouped_aggregate_merge>(
       &ungrouped_agg_physical_op);
   } else {
     throw duckdb::InternalException("Unsupported operator type" +

@@ -29,15 +29,15 @@
 namespace sirius {
 namespace op {
 
-class sirius_physical_merge_grouped_aggregate : public sirius_physical_operator {
+class sirius_physical_grouped_aggregate_merge : public sirius_physical_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE =
     SiriusPhysicalOperatorType::MERGE_GROUP_BY;
 
  public:
-  sirius_physical_merge_grouped_aggregate(sirius_physical_grouped_aggregate* grouped_aggregate);
+  sirius_physical_grouped_aggregate_merge(sirius_physical_grouped_aggregate* grouped_aggregate);
 
-  sirius_physical_merge_grouped_aggregate(
+  sirius_physical_grouped_aggregate_merge(
     duckdb::vector<duckdb::LogicalType> types,
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups,

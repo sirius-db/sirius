@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "op/sirius_physical_merge_grouped_aggregate.hpp"
+#include "op/sirius_physical_grouped_aggregate_merge.hpp"
 
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "log/logging.hpp"
@@ -71,9 +71,9 @@ static duckdb::vector<duckdb::unsafe_vector<duckdb::idx_t>> convert_grouping_fun
   return result;
 }
 
-sirius_physical_merge_grouped_aggregate::sirius_physical_merge_grouped_aggregate(
+sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge(
   sirius_physical_grouped_aggregate* grouped_aggregate)
-  : sirius_physical_merge_grouped_aggregate(
+  : sirius_physical_grouped_aggregate_merge(
       grouped_aggregate->types,  // copied by value
       copy_expressions(grouped_aggregate->grouped_aggregate_data.aggregates),
       copy_expressions(grouped_aggregate->grouped_aggregate_data.groups),
@@ -93,7 +93,7 @@ sirius_physical_merge_grouped_aggregate::sirius_physical_merge_grouped_aggregate
 // and for every grouping set there is one radix_table grouping_functions_p is a list of indexes to
 // the groupby expressions (groups_p) for each grouping_sets. The first level of the vector is the
 // grouping set and the second level is the indexes to the groupby expression for that set.
-sirius_physical_merge_grouped_aggregate::sirius_physical_merge_grouped_aggregate(
+sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge(
   duckdb::vector<duckdb::LogicalType> types,
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups_p,

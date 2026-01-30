@@ -39,10 +39,8 @@ set(EXTENSION_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/sirius_physical_top_n.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/sirius_physical_operator_type.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/sirius_physical_duckdb_scan.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/sirius_physical_merge_grouped_aggregate.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/sirius_physical_merge_ungrouped_aggregate.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/sirius_physical_grouped_aggregate_merge.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/sirius_physical_merge_sort.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/sirius_physical_merge_top_n.cpp
     # # Below is for the new execution model, and we are gradually migrating #
     # operators above to the new execution model.
     ${CMAKE_CURRENT_SOURCE_DIR}/aggregate/gpu_aggregate_impl.cpp

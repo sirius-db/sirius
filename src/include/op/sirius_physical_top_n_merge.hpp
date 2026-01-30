@@ -29,14 +29,14 @@ namespace op {
 
 //! Represents a physical ordering of the data. Note that this will not change
 //! the data but only add a selection vector.
-class sirius_physical_merge_top_n : public sirius_physical_operator {
+class sirius_physical_top_n_merge : public sirius_physical_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::MERGE_TOP_N;
 
  public:
-  sirius_physical_merge_top_n(sirius_physical_top_n* top_n);
+  sirius_physical_top_n_merge(sirius_physical_top_n* top_n);
 
-  sirius_physical_merge_top_n(duckdb::vector<duckdb::LogicalType> types_p,
+  sirius_physical_top_n_merge(duckdb::vector<duckdb::LogicalType> types_p,
                               duckdb::vector<duckdb::BoundOrderByNode> orders,
                               duckdb::idx_t limit,
                               duckdb::idx_t offset,
@@ -61,6 +61,9 @@ class sirius_physical_merge_top_n : public sirius_physical_operator {
 
  public:
   bool is_sink() const override { return true; }
+
+ std::vector<std::shared_ptr<cucascade::data_batch>> execute(
+    const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches) override;
 };
 
 }  // namespace op

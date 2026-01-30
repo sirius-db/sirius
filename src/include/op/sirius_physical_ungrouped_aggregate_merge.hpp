@@ -27,16 +27,16 @@
 namespace sirius {
 namespace op {
 
-class sirius_physical_merge_ungrouped_aggregate : public sirius_physical_operator {
+class sirius_physical_ungrouped_aggregate_merge : public sirius_physical_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE =
     SiriusPhysicalOperatorType::MERGE_AGGREGATE;
 
  public:
-  sirius_physical_merge_ungrouped_aggregate(
+  sirius_physical_ungrouped_aggregate_merge(
     sirius_physical_ungrouped_aggregate* ungrouped_aggregate);
 
-  sirius_physical_merge_ungrouped_aggregate(
+  sirius_physical_ungrouped_aggregate_merge(
     duckdb::vector<duckdb::LogicalType> types,
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> select_list,
     duckdb::idx_t estimated_cardinality,
@@ -54,6 +54,9 @@ class sirius_physical_merge_ungrouped_aggregate : public sirius_physical_operato
 
  public:
   bool is_sink() const override { return true; }
+
+  std::vector<std::shared_ptr<cucascade::data_batch>> execute(
+    const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches) override;
 };
 
 }  // namespace op
