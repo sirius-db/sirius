@@ -17,6 +17,7 @@
 #include "pipeline/gpu_pipeline_executor.hpp"
 
 #include "op/sirius_physical_operator.hpp"
+#include "creator/task_creator.hpp"
 #include "pipeline/gpu_pipeline_queue.hpp"
 #include "pipeline/task_request.hpp"
 
