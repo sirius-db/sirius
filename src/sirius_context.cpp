@@ -206,7 +206,6 @@ SiriusContextExtensionCallback::SiriusContextExtensionCallback()
 void SiriusContextExtensionCallback::OnConnectionOpened(ClientContext& context)
 {
   spdlog::info("Connection opened.");
-  printf("Client Context Pointer OnConnectionOpened: %p\n", (void*)&context);
   if (context_) { context.registered_state->Insert("sirius_state", context_); }
 }
 

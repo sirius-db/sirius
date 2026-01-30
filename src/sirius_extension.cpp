@@ -408,7 +408,6 @@ void SiriusExtension::GPUExecutionFunction(ClientContext& context,
   auto& data = (SiriusTableFunctionData&)*data_p.bind_data;
   if (data.finished) { return; }
 
-  printf("client context ptr in GPUExecutionFunction: %p\n", (void*)&context);
   if (!data.res) {
     auto start = std::chrono::high_resolution_clock::now();
     if (data.plan_error) {
