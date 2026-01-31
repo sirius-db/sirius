@@ -33,21 +33,21 @@ pipeline_executor::pipeline_executor(const parallel::task_executor_config& gpu_t
                                      {.num_threads = 1, .retry_on_error = false})
 {
   auto gpu_spaces = mem_mgr.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
-  auto num_gpus   = gpu_spaces.size();
   // Initialize GPU pipeline executors for each available GPU
-  _gpu_executors.reserve(num_gpus);
   for (auto* space : gpu_spaces) {
-    auto config = gpu_task_executor_config;
+    auto config    = gpu_task_executor_config;
+    int device_id  = space->get_device_id();
     if (sys_topology) {
       auto it = std::find_if(sys_topology->gpus.begin(),
                              sys_topology->gpus.end(),
-                             [space](const cucascade::memory::gpu_topology_info& dev) {
-                               return dev.id == space->get_device_id();
+                             [device_id](const cucascade::memory::gpu_topology_info& dev) {
+                               return dev.id == device_id;
                              });
 
       if (it != sys_topology->gpus.end()) { config.cpu_affinity_list = it->cpu_cores; }
     }
-    _gpu_executors.push_back(std::make_unique<gpu_pipeline_executor>(config, space, this));
+    _gpu_executors.emplace(device_id,
+                           std::make_unique<gpu_pipeline_executor>(config, space, this));
   }
   _task_request_queue = std::make_unique<task_request_queue>(1);
 }
@@ -79,7 +79,7 @@ void pipeline_executor::start()
     _threads.emplace_back(&pipeline_executor::worker_loop, this, i);
   }
   // Start all GPU executors
-  for (auto& gpu_exec : _gpu_executors) {
+  for (auto& [device_id, gpu_exec] : _gpu_executors) {
     gpu_exec->start();
   }
 }
@@ -89,7 +89,7 @@ void pipeline_executor::stop()
   bool expected = true;
   if (!_running.compare_exchange_strong(expected, false)) { return; }
   // Stop all GPU executors
-  for (auto& gpu_exec : _gpu_executors) {
+  for (auto& [device_id, gpu_exec] : _gpu_executors) {
     gpu_exec->stop();
   }
   on_stop();
@@ -138,10 +138,11 @@ void pipeline_executor::submit_task_request(std::unique_ptr<task_request> reques
 void pipeline_executor::dispatch_to_gpu_executor(std::unique_ptr<sirius::parallel::itask> task,
                                                  int gpu_id)
 {
-  if (gpu_id < 0 || gpu_id >= static_cast<int>(_gpu_executors.size())) {
+  auto it = _gpu_executors.find(gpu_id);
+  if (it == _gpu_executors.end()) {
     throw std::runtime_error("Invalid GPU ID: " + std::to_string(gpu_id));
   }
-  _gpu_executors[gpu_id]->schedule(std::move(task));
+  it->second->schedule(std::move(task));
 }
 
 }  // namespace pipeline
