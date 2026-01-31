@@ -18,11 +18,19 @@
 
 #include "log/logging.hpp"
 #include "pipeline/pipeline_executor.hpp"
+#include "op/scan/duckdb_scan_task.hpp"
+#include "pipeline/sirius_pipeline_itask_local_state.hpp"
 #include "pipeline/task_request.hpp"
+
+#include <cucascade/memory/common.hpp>
 
 namespace sirius::op::scan {
 
-duckdb_scan_executor::duckdb_scan_executor(exec::thread_pool_config config) : _config(config), _kiosk(config.num_threads) {}
+duckdb_scan_executor::duckdb_scan_executor(exec::thread_pool_config config,
+                                           cucascade::memory::memory_reservation_manager* mem_mgr)
+  : _config(config), _kiosk(config.num_threads), _mem_mgr(mem_mgr)
+{
+}
 
 void duckdb_scan_executor::schedule(std::unique_ptr<sirius::parallel::itask> task)
 {
@@ -77,6 +85,27 @@ void duckdb_scan_executor::manager_loop()
       SIRIUS_LOG_INFO("DuckDB Scan Executor: task queue interrupted, stopping manager loop");
       break;
     }
+
+    // Make host memory reservation and set it on the local state
+    if (auto* pipeline_task =
+          dynamic_cast<sirius::op::scan::duckdb_scan_task*>(scan_task.get())) {
+      auto bytes_needed = pipeline_task->get_estimated_reservation_size();
+      auto reservation  = _mem_mgr->request_reservation(
+        cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::HOST}, bytes_needed);
+      if (!reservation) {
+        SIRIUS_LOG_ERROR("DuckDB Scan Executor: Failed to acquire host memory reservation");
+        break;
+      }
+      if (auto* local_state =
+            dynamic_cast<sirius::pipeline::sirius_pipeline_itask_local_state*>(
+              pipeline_task->local_state())) {
+        local_state->set_reservation(std::move(reservation));
+      } else {
+        SIRIUS_LOG_ERROR("DuckDB Scan Executor: Failed to cast local state for task");
+        break;
+      }
+    }
+
     _thread_pool->schedule(
       [task = std::move(scan_task), ticket = std::move(ticket)]() mutable { task->execute(); });
   }
