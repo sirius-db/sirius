@@ -33,6 +33,9 @@ endif()
 # Add conda prefix to CMAKE_PREFIX_PATH so find_package can locate cugraph
 #list(APPEND CMAKE_PREFIX_PATH "${CONDA_PREFIX}")
 #list(APPEND CMAKE_PREFIX_PATH "${CONDA_PREFIX}/lib/cmake")
+list(APPEND CMAKE_PREFIX_PATH "${CONDA_PREFIX}")
+list(APPEND CMAKE_PREFIX_PATH "${CONDA_PREFIX}/lib/cmake")
+list(APPEND CMAKE_PREFIX_PATH "${CONDA_PREFIX}/lib/cmake/cugraph")
 
 find_package(cugraph CONFIG REQUIRED)
 
