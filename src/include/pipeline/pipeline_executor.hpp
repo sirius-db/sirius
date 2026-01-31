@@ -35,6 +35,10 @@ namespace sirius::creator {
 class task_creator;
 }  // namespace sirius::creator
 
+namespace sirius::op::scan {
+class duckdb_scan_executor;
+}  // namespace sirius::op::scan
+
 namespace sirius {
 namespace pipeline {
 
@@ -118,6 +122,13 @@ class pipeline_executor {
    */
   void set_task_creator(sirius::creator::task_creator& task_creator);
 
+  /**
+   * @brief Set the scan executor reference
+   *
+   * @param scan_executor Reference to the duckdb scan executor
+   */
+  void set_scan_executor(sirius::op::scan::duckdb_scan_executor& scan_executor);
+
  private:
   void management_eventloop();
 
@@ -131,6 +142,7 @@ class pipeline_executor {
     _gpu_executors;  ///< Map of device_id to GPU executor
 
   sirius::creator::task_creator* _task_creator{nullptr};
+  sirius::op::scan::duckdb_scan_executor* _scan_executor{nullptr};
 };
 
 }  // namespace pipeline

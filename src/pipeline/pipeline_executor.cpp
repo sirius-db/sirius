@@ -21,6 +21,7 @@
 #include "exec/config.hpp"
 #include "log/logging.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
+#include "op/scan/duckdb_scan_executor.hpp"
 #include "pipeline/pipeline_queue.hpp"
 
 #include <cucascade/memory/common.hpp>
@@ -104,6 +105,11 @@ void pipeline_executor::set_task_creator(sirius::creator::task_creator& task_cre
   }
 }
 
+void pipeline_executor::set_scan_executor(sirius::op::scan::duckdb_scan_executor& scan_executor)
+{
+  _scan_executor = &scan_executor;
+}
+
 void pipeline_executor::management_eventloop()
 {
   while (_running.load()) {
@@ -112,15 +118,21 @@ void pipeline_executor::management_eventloop()
       SIRIUS_LOG_INFO("Task request queue closed, exiting management event loop.");
       break;
     }
-    if (!request->is_scan) {
-      auto task = _task_queue.pop();
-      if (task == nullptr) {
-        SIRIUS_LOG_INFO("Task queue closed, exiting management event loop.");
-        break;
+    auto task = _task_queue.pop();
+    if (task == nullptr) {
+      SIRIUS_LOG_INFO("Task queue closed, exiting management event loop.");
+      break;
+    }
+    if (request->is_scan) {
+      // Dispatch scan task to the scan executor
+      if (_scan_executor) {
+        _scan_executor->schedule(std::move(task));
+      } else {
+        SIRIUS_LOG_ERROR("Scan executor not set, cannot dispatch scan task.");
       }
-      dispatch_to_gpu_executor(std::move(task), request->device_id);
     } else {
-      SIRIUS_LOG_INFO("Received scan task request for device {}", request->device_id);
+      // Dispatch GPU pipeline task to the appropriate GPU executor
+      dispatch_to_gpu_executor(std::move(task), request->device_id);
     }
   }
 }

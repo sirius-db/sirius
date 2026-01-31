@@ -60,12 +60,12 @@ void gpu_pipeline_executor::submit_task_request()
 void gpu_pipeline_executor::manager_loop()
 {
   while (_running.load()) {
-    auto ticket = _kiosk.acquire();
+    auto ticket = _kiosk.acquire();  // block till a thread is available
     if (!ticket.is_valid()) {
       SIRIUS_LOG_INFO("GPU Pipeline Executor: Kiosk interrupted, stopping manager loop");
       break;
     }
-    auto pipeline_task = _task_queue.pop();
+    auto pipeline_task = _task_queue.pop();  // block till a task is available
     if (!pipeline_task) {
       SIRIUS_LOG_INFO("GPU Pipeline Executor: task queue interrupted, stopping manager loop");
       break;
