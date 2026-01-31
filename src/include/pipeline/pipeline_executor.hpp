@@ -21,7 +21,7 @@
 #include "exec/interruptible_mpmc.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/scan/duckdb_scan_executor.hpp"
-#include "parallel/task_executor.hpp"
+#include "parallel/task.hpp"
 #include "pipeline/gpu_pipeline_executor.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/task_request.hpp"
@@ -52,12 +52,12 @@ class pipeline_executor {
   /**
    * @brief Constructs a new pipeline_executor with task execution configuration
    *
-   * @param gpu_task_executor_config Configuration for the GPU pipeline executor
-   * @param scan_executor_config Configuration for the scan executor
+   * @param gpu_executor_config Configuration for the GPU pipeline executor thread pool
+   * @param scan_executor_config Configuration for the scan executor thread pool
    * @param mem_mgr Reference to the memory reservation manager
    * @param sys_topology Optional system topology info for CPU affinity
    */
-  explicit pipeline_executor(const parallel::task_executor_config& gpu_task_executor_config,
+  explicit pipeline_executor(const exec::thread_pool_config& gpu_executor_config,
                              const exec::thread_pool_config& scan_executor_config,
                              sirius::memory::sirius_memory_reservation_manager& mem_mgr,
                              const cucascade::memory::system_topology_info* sys_topology = nullptr);
