@@ -18,6 +18,7 @@
 
 #include "creator/task_creator.hpp"
 #include "pipeline/gpu_pipeline_queue.hpp"
+#include "pipeline/task_request.hpp"
 
 namespace sirius {
 namespace pipeline {
@@ -53,7 +54,6 @@ void gpu_pipeline_executor::stop()
   _kiosk.wait_all();
 }
 
-
 void gpu_pipeline_executor::manager_loop()
 {
   while (_running.load()) {
@@ -63,8 +63,8 @@ void gpu_pipeline_executor::manager_loop()
       break;
     }
     if (!_task_request_publisher.send(
-      std::make_unique<task_request>(_memory_space->get_device_id(), false))) {
-      SIRIUS_LOG_ERROR("GPU Pipeline Executor: Failed to send task request, channel is closed");
+          std::make_unique<pipeline::task_request>(_memory_space->get_device_id(), false))) {
+      SIRIUS_LOG_INFO("GPU Pipeline Executor: Failed to send task request, channel is closed");
       break;
     }
     auto pipeline_task = _task_queue.pop();  // block till a task is available
@@ -88,8 +88,17 @@ void gpu_pipeline_executor::manager_loop()
                        gpu_task->get_task_id());
       break;
     }
-    _thread_pool->schedule(
-      [task = std::move(pipeline_task), ticket = std::move(ticket)]() mutable { task->execute(); });
+    auto output_consumers = gpu_task->get_output_consumers();
+    _thread_pool->schedule([this,
+                            task      = std::move(pipeline_task),
+                            ticket    = std::move(ticket),
+                            consumers = std::move(output_consumers)]() mutable {
+      task->execute();
+      task.reset();
+      for (auto* consumer : consumers) {
+        _task_creator->schedule(consumer);
+      }
+    });
   }
 }
 

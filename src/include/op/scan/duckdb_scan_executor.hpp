@@ -30,6 +30,10 @@
 #include <memory>
 #include <thread>
 
+namespace sirius::creator {
+class task_creator;
+}  // namespace sirius::creator
+
 namespace sirius::op::scan {
 
 //===----------------------------------------------------------------------===//
@@ -101,6 +105,13 @@ class duckdb_scan_executor {
    */
   [[nodiscard]] int32_t get_num_threads() const { return _config.num_threads; }
 
+  /**
+   * @brief Set the task creator reference
+   *
+   * @param task_creator Reference to the task creator
+   */
+  void set_task_creator(sirius::creator::task_creator& task_creator);
+
  private:
   /**
    * @brief Manager loop to consume tasks from queue and dispatch to the thread pool
@@ -120,6 +131,7 @@ class duckdb_scan_executor {
   std::thread _manager_thread;
   exec::publisher<std::unique_ptr<sirius::pipeline::task_request>> _task_request_publisher;
   cucascade::memory::memory_reservation_manager* _mem_mgr{nullptr};
+  sirius::creator::task_creator* _task_creator{nullptr};
 };
 
 }  // namespace sirius::op::scan

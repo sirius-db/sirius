@@ -102,6 +102,7 @@ void pipeline_executor::stop()
 void pipeline_executor::set_task_creator(sirius::creator::task_creator& task_creator)
 {
   _task_creator = &task_creator;
+  _scan_executor->set_task_creator(task_creator);
   for (auto& [device_id, gpu_exec] : _gpu_executors) {
     gpu_exec->set_task_creator(task_creator);
   }
