@@ -250,7 +250,8 @@ class test_fixture {
           std::move(space_configs));
       }()),
       gpu_executor_config{1, false},
-      pipeline_exec(gpu_executor_config, exec::thread_pool_config{.num_threads = 2}, *memory_manager),
+      pipeline_exec(
+        gpu_executor_config, exec::thread_pool_config{.num_threads = 2}, *memory_manager),
       empty_pipelines(),
       pipeline_map(empty_pipelines)
   {
@@ -396,11 +397,8 @@ TEST_CASE("task_creator thread pool starts and stops", "[task_creator]")
 {
   test_fixture fixture;
 
-  testable_task_creator creator(2,
-                                fixture.pipeline_map,
-                                *fixture.con.context,
-                                fixture.pipeline_exec,
-                                *fixture.memory_manager);
+  testable_task_creator creator(
+    2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
 
   SECTION("Creator starts not running") { REQUIRE_FALSE(creator.is_running()); }
 
@@ -434,11 +432,8 @@ TEST_CASE("task_creator thread pool is idempotent", "[task_creator]")
 {
   test_fixture fixture;
 
-  testable_task_creator creator(2,
-                                fixture.pipeline_map,
-                                *fixture.con.context,
-                                fixture.pipeline_exec,
-                                *fixture.memory_manager);
+  testable_task_creator creator(
+    2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
 
   SECTION("Multiple start_thread_pool calls don't create extra threads")
   {
@@ -499,11 +494,8 @@ TEST_CASE("process_next_task with monostate hint and empty priority_scans", "[ta
 {
   test_fixture fixture;
 
-  testable_task_creator creator(2,
-                                fixture.pipeline_map,
-                                *fixture.con.context,
-                                fixture.pipeline_exec,
-                                *fixture.memory_manager);
+  testable_task_creator creator(
+    2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
 
   // Create a mock operator with no ports (will return monostate)
   auto mock_op = std::make_unique<mock_sirius_physical_operator>();
@@ -529,11 +521,8 @@ TEST_CASE("process_next_task with monostate hint uses priority_scans", "[task_cr
 
   // Create pipelines with the scan as source - this requires integration test setup
   // For unit testing purposes, we verify the code path via the testable interface
-  testable_task_creator creator(2,
-                                fixture.pipeline_map,
-                                *fixture.con.context,
-                                fixture.pipeline_exec,
-                                *fixture.memory_manager);
+  testable_task_creator creator(
+    2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
 
   // Initially priority_scans should be empty (no TABLE_SCAN sources in empty pipeline map)
   REQUIRE(creator.get_priority_scans().empty());
@@ -550,11 +539,8 @@ TEST_CASE("process_next_task with operator hint schedules the hint node", "[task
 {
   test_fixture fixture;
 
-  testable_task_creator creator(2,
-                                fixture.pipeline_map,
-                                *fixture.con.context,
-                                fixture.pipeline_exec,
-                                *fixture.memory_manager);
+  testable_task_creator creator(
+    2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
 
   // Create the source operator that we will call process_next_task on
   auto source_op = std::make_unique<mock_sirius_physical_operator>();
@@ -604,11 +590,8 @@ TEST_CASE("process_next_task with pipeline hint recurses to inner operator", "[t
   // behavior indirectly by verifying that the source operator's
   // get_next_task_hint() is called and the scheduling logic follows through.
 
-  testable_task_creator creator(2,
-                                fixture.pipeline_map,
-                                *fixture.con.context,
-                                fixture.pipeline_exec,
-                                *fixture.memory_manager);
+  testable_task_creator creator(
+    2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
 
   // Create an operator chain: source_op returns a custom hint that is monostate
   // (simulating the end of recursion)
@@ -644,11 +627,8 @@ TEST_CASE("process_next_task operator hint follows dest_pipeline", "[task_creato
 {
   test_fixture fixture;
 
-  testable_task_creator creator(2,
-                                fixture.pipeline_map,
-                                *fixture.con.context,
-                                fixture.pipeline_exec,
-                                *fixture.memory_manager);
+  testable_task_creator creator(
+    2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
 
   // Create operators
   auto source_op = std::make_unique<mock_sirius_physical_operator>();
@@ -676,11 +656,8 @@ TEST_CASE("process_next_task hint traversal chain", "[task_creator]")
 {
   test_fixture fixture;
 
-  testable_task_creator creator(2,
-                                fixture.pipeline_map,
-                                *fixture.con.context,
-                                fixture.pipeline_exec,
-                                *fixture.memory_manager);
+  testable_task_creator creator(
+    2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
 
   // Test a chain where:
   // op1 returns hint pointing to op2
@@ -709,11 +686,8 @@ TEST_CASE("task_creator start/stop lifecycle", "[task_creator]")
 {
   test_fixture fixture;
 
-  testable_task_creator creator(2,
-                                fixture.pipeline_map,
-                                *fixture.con.context,
-                                fixture.pipeline_exec,
-                                *fixture.memory_manager);
+  testable_task_creator creator(
+    2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
 
   SECTION("start() calls start_thread_pool()")
   {
@@ -735,11 +709,8 @@ TEST_CASE("task_creator get_next_task_id increments", "[task_creator]")
 {
   test_fixture fixture;
 
-  testable_task_creator creator(1,
-                                fixture.pipeline_map,
-                                *fixture.con.context,
-                                fixture.pipeline_exec,
-                                *fixture.memory_manager);
+  testable_task_creator creator(
+    1, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
 
   // The task_id is protected, but we can verify behavior indirectly
   // by checking that the creator can be constructed and used
@@ -754,11 +725,8 @@ TEST_CASE("task_creator queue integration", "[task_creator]")
 {
   test_fixture fixture;
 
-  testable_task_creator creator(2,
-                                fixture.pipeline_map,
-                                *fixture.con.context,
-                                fixture.pipeline_exec,
-                                *fixture.memory_manager);
+  testable_task_creator creator(
+    2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
 
   SECTION("Queue is accessible")
   {
@@ -1128,11 +1096,8 @@ TEST_CASE("task_creator handles concurrent schedule calls", "[task_creator]")
 {
   test_fixture fixture;
 
-  testable_task_creator creator(4,
-                                fixture.pipeline_map,
-                                *fixture.con.context,
-                                fixture.pipeline_exec,
-                                *fixture.memory_manager);
+  testable_task_creator creator(
+    4, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
 
   const int num_calls = 100;
   std::atomic<int> completed{0};

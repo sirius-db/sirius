@@ -16,21 +16,19 @@
 
 #pragma once
 
+#include "exec/channel.hpp"
 #include "exec/config.hpp"
 #include "exec/interruptible_mpmc.hpp"
 #include "exec/kiosk.hpp"
 #include "exec/thread_pool.hpp"
 #include "parallel/task.hpp"
+#include "pipeline/task_request.hpp"
 
 #include <cucascade/memory/memory_reservation_manager.hpp>
 
 #include <atomic>
 #include <memory>
 #include <thread>
-
-namespace sirius::pipeline {
-class pipeline_executor;
-}  // namespace sirius::pipeline
 
 namespace sirius::op::scan {
 
@@ -51,9 +49,12 @@ class duckdb_scan_executor {
    *
    * @param config Configuration for the thread pool (thread count, etc.)
    * @param mem_mgr Pointer to the memory reservation manager for host allocations
+   * @param task_request_publisher Publisher to submit task requests
    */
-  explicit duckdb_scan_executor(exec::thread_pool_config config,
-                                cucascade::memory::memory_reservation_manager* mem_mgr);
+  explicit duckdb_scan_executor(
+    exec::thread_pool_config config,
+    cucascade::memory::memory_reservation_manager* mem_mgr,
+    exec::publisher<std::unique_ptr<sirius::pipeline::task_request>> task_request_publisher);
 
   /**
    * @brief Destructor for the duckdb_scan_executor.
@@ -94,13 +95,6 @@ class duckdb_scan_executor {
   void wait_all();
 
   /**
-   * @brief Set the pipeline executor reference
-   *
-   * @param pipeline_exec Reference to the pipeline executor
-   */
-  void set_pipeline_executor(sirius::pipeline::pipeline_executor& pipeline_exec);
-
-  /**
    * @brief Get the number of threads in the thread pool for this executor.
    *
    * @return The number of threads in the thread pool for this executor.
@@ -124,7 +118,7 @@ class duckdb_scan_executor {
   std::unique_ptr<exec::thread_pool> _thread_pool;
   exec::interruptible_mpmc<std::unique_ptr<sirius::parallel::itask>> _task_queue;
   std::thread _manager_thread;
-  sirius::pipeline::pipeline_executor* _pipeline_exec{nullptr};
+  exec::publisher<std::unique_ptr<sirius::pipeline::task_request>> _task_request_publisher;
   cucascade::memory::memory_reservation_manager* _mem_mgr{nullptr};
 };
 

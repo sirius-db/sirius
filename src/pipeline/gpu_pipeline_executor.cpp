@@ -18,15 +18,17 @@
 
 #include "creator/task_creator.hpp"
 #include "pipeline/gpu_pipeline_queue.hpp"
-#include "pipeline/pipeline_executor.hpp"
 
 namespace sirius {
 namespace pipeline {
 
-gpu_pipeline_executor::gpu_pipeline_executor(exec::thread_pool_config config,
-                                             cucascade::memory::memory_space* mem_space,
-                                             pipeline_executor* pipeline_exec)
-  : _config(config), _memory_space(mem_space), _pipeline_exec(pipeline_exec)
+gpu_pipeline_executor::gpu_pipeline_executor(
+  exec::thread_pool_config config,
+  cucascade::memory::memory_space* mem_space,
+  exec::publisher<std::unique_ptr<task_request>> task_request_publisher)
+  : _config(config),
+    _task_request_publisher(std::move(task_request_publisher)),
+    _memory_space(mem_space)
 {
 }
 
@@ -51,11 +53,6 @@ void gpu_pipeline_executor::stop()
   _kiosk.wait_all();
 }
 
-void gpu_pipeline_executor::submit_task_request()
-{
-  _pipeline_exec->submit_task_request(
-    std::make_unique<task_request>(_memory_space->get_device_id(), false));
-}
 
 void gpu_pipeline_executor::manager_loop()
 {
@@ -63,6 +60,11 @@ void gpu_pipeline_executor::manager_loop()
     auto ticket = _kiosk.acquire();  // block till a thread is available
     if (!ticket.is_valid()) {
       SIRIUS_LOG_INFO("GPU Pipeline Executor: Kiosk interrupted, stopping manager loop");
+      break;
+    }
+    if (!_task_request_publisher.send(
+      std::make_unique<task_request>(_memory_space->get_device_id(), false))) {
+      SIRIUS_LOG_ERROR("GPU Pipeline Executor: Failed to send task request, channel is closed");
       break;
     }
     auto pipeline_task = _task_queue.pop();  // block till a task is available

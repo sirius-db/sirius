@@ -18,9 +18,9 @@
 
 #include "duckdb/main/client_context.hpp"
 #include "helper/helper.hpp"
+#include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "parallel/task_executor.hpp"
-#include "memory/sirius_memory_reservation_manager.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius_pipeline_hashmap.hpp"
 
@@ -159,8 +159,7 @@ class task_creator {
    * @param num_threads The number of worker threads to use.
    * @param mem_res_mgr Reference to the memory reservation manager.
    */
-  task_creator(size_t num_threads,
-               sirius::memory::sirius_memory_reservation_manager& mem_res_mgr);
+  task_creator(size_t num_threads, sirius::memory::sirius_memory_reservation_manager& mem_res_mgr);
 
   /**
    * @brief Destructor that ensures the thread pool is stopped.

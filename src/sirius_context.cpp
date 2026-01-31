@@ -109,9 +109,8 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   downgrade_executor_ = std::make_unique<sirius::parallel::downgrade_executor>(
     sirius::parallel::task_executor_config{}, *data_repository_manager_);
 
-  task_creator_ =
-    std::make_unique<sirius::creator::task_creator>(config_.get_task_creator_thread_count(),
-                                                    *memory_manager_);
+  task_creator_ = std::make_unique<sirius::creator::task_creator>(
+    config_.get_task_creator_thread_count(), *memory_manager_);
   task_creator_->set_pipeline_executor(*pipeline_executor_);
   pipeline_executor_->set_task_creator(*task_creator_);
 
