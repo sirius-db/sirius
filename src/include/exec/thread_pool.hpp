@@ -64,11 +64,18 @@ class thread_pool {
     }
   }
 
-  void schedule(absl::AnyInvocable<void() noexcept> fn)
+  void schedule(absl::AnyInvocable<void()> fn)
   {
     assert(fn != nullptr);
     std::lock_guard l(mu_);
-    queue_.push(std::move(fn));
+    queue_.emplace([this, fn = std::move(fn)]() mutable noexcept {
+      try {
+        fn();
+      } catch (...) {
+        SIRIUS_LOG_ERROR("Exception in thread pool task, closing thread pool");
+        stop();
+      }
+    });
     cv_.notify_one();
   }
 

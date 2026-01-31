@@ -91,6 +91,9 @@ class itask {
   // Execution function.
   virtual void execute() = 0;
 
+  itask_local_state* local_state() noexcept { return _local_state.get(); }
+  itask_global_state* global_state() noexcept { return _global_state.get(); }
+
  protected:
   std::unique_ptr<itask_local_state> _local_state;
   std::shared_ptr<itask_global_state> _global_state;
