@@ -32,7 +32,7 @@
 namespace sirius {
 namespace pipeline {
 
-pipeline_executor::pipeline_executor(const parallel::task_executor_config& gpu_task_executor_config,
+pipeline_executor::pipeline_executor(const exec::thread_pool_config& gpu_executor_config,
                                      const exec::thread_pool_config& scan_executor_config,
                                      sirius::memory::sirius_memory_reservation_manager& mem_mgr,
                                      const cucascade::memory::system_topology_info* sys_topology)
@@ -44,7 +44,7 @@ pipeline_executor::pipeline_executor(const parallel::task_executor_config& gpu_t
   auto gpu_spaces = mem_mgr.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
   // Initialize GPU pipeline executors for each available GPU
   for (auto* space : gpu_spaces) {
-    auto config   = gpu_task_executor_config;
+    auto config   = gpu_executor_config;
     int device_id = space->get_device_id();
     if (sys_topology) {
       auto it = std::find_if(sys_topology->gpus.begin(),
@@ -57,8 +57,7 @@ pipeline_executor::pipeline_executor(const parallel::task_executor_config& gpu_t
     }
     _gpu_executors.emplace(
       device_id,
-      std::make_unique<gpu_pipeline_executor>(
-        exec::thread_pool_config{}, const_cast<cucascade::memory::memory_space*>(space), this));
+      std::make_unique<gpu_pipeline_executor>(config, const_cast<cucascade::memory::memory_space*>(space), this));
   }
 }
 

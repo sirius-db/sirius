@@ -18,6 +18,7 @@
 
 #include "duckdb/common/helper.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "exec/config.hpp"
 #include "extension_lock.hpp"
 #include "log/logging.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
@@ -100,7 +101,7 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   data_repository_manager_ = std::make_unique<cucascade::shared_data_repository_manager>();
 
   pipeline_executor_ = std::make_unique<sirius::pipeline::pipeline_executor>(
-    sirius::parallel::task_executor_config{},
+    config_.get_gpu_pipeline_executor_config(),
     config_.get_duckdb_scan_executor_config(),
     *memory_manager_,
     &config_.get_hw_topology());
