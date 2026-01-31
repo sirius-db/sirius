@@ -36,13 +36,13 @@ namespace sirius::op::scan {
 //===----------------------------------------------------------------------===//
 duckdb_scan_task_global_state::duckdb_scan_task_global_state(
   duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
-  duckdb_scan_executor& scan_exec,
+  pipeline::pipeline_executor& pipeline_exec,
   duckdb::ClientContext& client_ctx,
   sirius_physical_duckdb_scan* scan_op)
   : _pipeline(std::move(pipeline)),
     _sirius_ctx(client_ctx.registered_state->Get<duckdb::SiriusContext>("sirius_state")),
-    _max_threads(scan_exec.get_num_threads()),
-    _scan_executor(scan_exec),
+    _max_threads(pipeline_exec.get_scan_executor().get_num_threads()),
+    _pipeline_executor(pipeline_exec),
     _op(*scan_op)
 {
   // Initialize global table function state
@@ -518,7 +518,7 @@ void duckdb_scan_task::execute()
       std::static_pointer_cast<duckdb_scan_task_global_state>(this->_global_state);
     auto next_task = std::make_unique<duckdb_scan_task>(
       new_task_id, _data_repo, std::move(new_local_state), shared_global_state);
-    g_state._scan_executor.schedule(std::move(next_task));
+    g_state._pipeline_executor.schedule(std::move(next_task));
   }
 
   // Make data batch and push to repository

@@ -33,9 +33,14 @@ namespace sirius {
 namespace pipeline {
 
 pipeline_executor::pipeline_executor(const parallel::task_executor_config& gpu_task_executor_config,
+                                     const exec::thread_pool_config& scan_executor_config,
                                      sirius::memory::sirius_memory_reservation_manager& mem_mgr,
                                      const cucascade::memory::system_topology_info* sys_topology)
 {
+  // Create the scan executor
+  _scan_executor = std::make_unique<sirius::op::scan::duckdb_scan_executor>(scan_executor_config);
+  _scan_executor->set_pipeline_executor(*this);
+
   auto gpu_spaces = mem_mgr.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
   // Initialize GPU pipeline executors for each available GPU
   for (auto* space : gpu_spaces) {
@@ -70,6 +75,7 @@ void pipeline_executor::start()
 {
   bool expected = false;
   if (!_running.compare_exchange_strong(expected, true)) { return; }
+  _scan_executor->start();
   for (auto& [device_id, gpu_exec] : _gpu_executors) {
     gpu_exec->start();
   }
@@ -82,6 +88,8 @@ void pipeline_executor::stop()
   _task_queue.interrupt();
   _scan_queue.interrupt();
   _task_request_queue.interrupt();
+  // Stop scan executor
+  _scan_executor->stop();
   // Stop all GPU executors
   for (auto& [device_id, gpu_exec] : _gpu_executors) {
     gpu_exec->stop();
@@ -111,11 +119,6 @@ void pipeline_executor::set_task_creator(sirius::creator::task_creator& task_cre
   }
 }
 
-void pipeline_executor::set_scan_executor(sirius::op::scan::duckdb_scan_executor& scan_executor)
-{
-  _scan_executor = &scan_executor;
-}
-
 void pipeline_executor::management_eventloop()
 {
   while (_running.load()) {
@@ -131,11 +134,7 @@ void pipeline_executor::management_eventloop()
         SIRIUS_LOG_INFO("Scan queue closed, exiting management event loop.");
         break;
       }
-      if (_scan_executor) {
-        _scan_executor->schedule(std::move(task));
-      } else {
-        SIRIUS_LOG_ERROR("Scan executor not set, cannot dispatch scan task.");
-      }
+      _scan_executor->schedule(std::move(task));
     } else {
       // Pop from task queue and dispatch to GPU executor
       auto task = _task_queue.pop();

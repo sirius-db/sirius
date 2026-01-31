@@ -74,12 +74,8 @@ std::unique_ptr<task_creation_info> task_creation_queue::pull()
 //------------------------------------------------------------------------------
 
 task_creator::task_creator(size_t num_threads,
-                           op::scan::duckdb_scan_executor& duckdb_scan_executor,
                            sirius::memory::sirius_memory_reservation_manager& mem_res_mgr)
-  : _num_threads(num_threads),
-    _running(false),
-    _duckdb_scan_executor(duckdb_scan_executor),
-    _mem_res_mgr(mem_res_mgr)
+  : _num_threads(num_threads), _running(false), _mem_res_mgr(mem_res_mgr)
 {
   _task_creation_queue = std::make_unique<task_creation_queue>(num_threads);
 }

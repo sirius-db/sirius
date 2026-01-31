@@ -85,9 +85,6 @@ class SiriusContext : public ClientContextState {
   [[nodiscard]] sirius::parallel::downgrade_executor& get_downgrade_executor();
   [[nodiscard]] const sirius::parallel::downgrade_executor& get_downgrade_executor() const;
 
-  [[nodiscard]] sirius::op::scan::duckdb_scan_executor& get_duckdb_scan_executor();
-  [[nodiscard]] const sirius::op::scan::duckdb_scan_executor& get_duckdb_scan_executor() const;
-
   [[nodiscard]] sirius::creator::task_creator& get_task_creator();
   [[nodiscard]] const sirius::creator::task_creator& get_task_creator() const;
 
@@ -106,7 +103,6 @@ class SiriusContext : public ClientContextState {
   std::unique_ptr<cucascade::shared_data_repository_manager> data_repository_manager_;
   std::unique_ptr<sirius::pipeline::pipeline_executor> pipeline_executor_;
   std::unique_ptr<sirius::parallel::downgrade_executor> downgrade_executor_;
-  std::unique_ptr<sirius::op::scan::duckdb_scan_executor> duckdb_scan_executor_;
   std::unique_ptr<sirius::creator::task_creator> task_creator_;
 };
 

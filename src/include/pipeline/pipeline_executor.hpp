@@ -17,8 +17,10 @@
 #pragma once
 
 #include "config.hpp"
+#include "exec/config.hpp"
 #include "exec/interruptible_mpmc.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
+#include "op/scan/duckdb_scan_executor.hpp"
 #include "parallel/task_executor.hpp"
 #include "pipeline/gpu_pipeline_executor.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
@@ -35,10 +37,6 @@ namespace sirius::creator {
 class task_creator;
 }  // namespace sirius::creator
 
-namespace sirius::op::scan {
-class duckdb_scan_executor;
-}  // namespace sirius::op::scan
-
 namespace sirius {
 namespace pipeline {
 
@@ -54,12 +52,13 @@ class pipeline_executor {
   /**
    * @brief Constructs a new pipeline_executor with task execution configuration
    *
-   * @param pipeline_config Configuration for the pipeline executor (thread count, retry policy,
-   * etc.)
-   * @param gpu_executor_config Configuration for the GPU pipeline executor
-   * @param num_gpus Number of GPU executors to create
+   * @param gpu_task_executor_config Configuration for the GPU pipeline executor
+   * @param scan_executor_config Configuration for the scan executor
+   * @param mem_mgr Reference to the memory reservation manager
+   * @param sys_topology Optional system topology info for CPU affinity
    */
   explicit pipeline_executor(const parallel::task_executor_config& gpu_task_executor_config,
+                             const exec::thread_pool_config& scan_executor_config,
                              sirius::memory::sirius_memory_reservation_manager& mem_mgr,
                              const cucascade::memory::system_topology_info* sys_topology = nullptr);
 
@@ -123,11 +122,19 @@ class pipeline_executor {
   void set_task_creator(sirius::creator::task_creator& task_creator);
 
   /**
-   * @brief Set the scan executor reference
+   * @brief Get the scan executor reference
    *
-   * @param scan_executor Reference to the duckdb scan executor
+   * @return Reference to the duckdb scan executor
    */
-  void set_scan_executor(sirius::op::scan::duckdb_scan_executor& scan_executor);
+  [[nodiscard]] sirius::op::scan::duckdb_scan_executor& get_scan_executor() noexcept
+  {
+    return *_scan_executor;
+  }
+
+  [[nodiscard]] const sirius::op::scan::duckdb_scan_executor& get_scan_executor() const noexcept
+  {
+    return *_scan_executor;
+  }
 
  private:
   void management_eventloop();
@@ -143,7 +150,7 @@ class pipeline_executor {
     _gpu_executors;  ///< Map of device_id to GPU executor
 
   sirius::creator::task_creator* _task_creator{nullptr};
-  sirius::op::scan::duckdb_scan_executor* _scan_executor{nullptr};
+  std::unique_ptr<sirius::op::scan::duckdb_scan_executor> _scan_executor;
 };
 
 }  // namespace pipeline

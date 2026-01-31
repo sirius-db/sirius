@@ -18,7 +18,6 @@
 
 #include "duckdb/main/client_context.hpp"
 #include "helper/helper.hpp"
-#include "op/scan/duckdb_scan_executor.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "parallel/task_executor.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
@@ -158,11 +157,9 @@ class task_creator {
    * @brief Construct a new task_creator.
    *
    * @param num_threads The number of worker threads to use.
-   * @param duckdb_scan_executor Reference to the duckdb scan executor.
    * @param mem_res_mgr Reference to the memory reservation manager.
    */
   task_creator(size_t num_threads,
-               sirius::op::scan::duckdb_scan_executor& duckdb_scan_executor,
                sirius::memory::sirius_memory_reservation_manager& mem_res_mgr);
 
   /**
@@ -275,8 +272,6 @@ class task_creator {
   sirius_pipeline_hashmap* _sirius_pipeline_map;
   ::duckdb::ClientContext* _client_context;
   sirius::pipeline::pipeline_executor* _pipeline_executor{nullptr};
-  sirius::op::scan::duckdb_scan_executor&
-    _duckdb_scan_executor;  // WSM: schedule on pipeline executor
   sirius::memory::sirius_memory_reservation_manager& _mem_res_mgr;
   std::atomic<uint64_t> _task_id{0};
 };

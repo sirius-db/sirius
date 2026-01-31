@@ -99,20 +99,17 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
 
   data_repository_manager_ = std::make_unique<cucascade::shared_data_repository_manager>();
 
-  duckdb_scan_executor_ = std::make_unique<sirius::op::scan::duckdb_scan_executor>(
-    config_.get_duckdb_scan_executor_config());
-
   pipeline_executor_ = std::make_unique<sirius::pipeline::pipeline_executor>(
-    sirius::parallel::task_executor_config{}, *memory_manager_, &config_.get_hw_topology());
-  pipeline_executor_->set_scan_executor(*duckdb_scan_executor_);
-  duckdb_scan_executor_->set_pipeline_executor(*pipeline_executor_);
+    sirius::parallel::task_executor_config{},
+    config_.get_duckdb_scan_executor_config(),
+    *memory_manager_,
+    &config_.get_hw_topology());
 
   downgrade_executor_ = std::make_unique<sirius::parallel::downgrade_executor>(
     sirius::parallel::task_executor_config{}, *data_repository_manager_);
 
   task_creator_ =
     std::make_unique<sirius::creator::task_creator>(config_.get_task_creator_thread_count(),
-                                                    *duckdb_scan_executor_,
                                                     *memory_manager_);
   task_creator_->set_pipeline_executor(*pipeline_executor_);
   pipeline_executor_->set_task_creator(*task_creator_);
@@ -176,18 +173,6 @@ const sirius::parallel::downgrade_executor& SiriusContext::get_downgrade_executo
 {
   thorw_if_not_initialized();
   return *downgrade_executor_;
-}
-
-sirius::op::scan::duckdb_scan_executor& SiriusContext::get_duckdb_scan_executor()
-{
-  thorw_if_not_initialized();
-  return *duckdb_scan_executor_;
-}
-
-const sirius::op::scan::duckdb_scan_executor& SiriusContext::get_duckdb_scan_executor() const
-{
-  thorw_if_not_initialized();
-  return *duckdb_scan_executor_;
 }
 
 sirius::creator::task_creator& SiriusContext::get_task_creator()
