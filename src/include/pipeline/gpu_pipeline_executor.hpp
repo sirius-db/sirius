@@ -28,11 +28,12 @@
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
+#include <functional>
 #include <thread>
 
-namespace sirius::creator {
-class task_creator;
-}  // namespace sirius::creator
+namespace sirius::op {
+class sirius_physical_operator;
+}  // namespace sirius::op
 
 namespace sirius {
 namespace pipeline {
@@ -96,11 +97,12 @@ class gpu_pipeline_executor {
   void stop();
 
   /**
-   * @brief Set the task creator reference
+   * @brief Set the schedule callback for output consumers
    *
-   * @param task_creator Reference to the task creator
+   * @param schedule_fn Callback function to schedule operators
    */
-  void set_task_creator(sirius::creator::task_creator& task_creator);
+  void set_schedule_callback(
+    std::function<void(sirius::op::sirius_physical_operator*)> schedule_fn);
 
  private:
   /**
@@ -125,7 +127,7 @@ class gpu_pipeline_executor {
   std::thread _manager_thread;
   exec::publisher<std::unique_ptr<task_request>> _task_request_publisher;
   cucascade::memory::memory_space* _memory_space;
-  sirius::creator::task_creator* _task_creator{nullptr};
+  std::function<void(sirius::op::sirius_physical_operator*)> _schedule_callback;
 };
 
 }  // namespace pipeline

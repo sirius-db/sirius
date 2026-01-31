@@ -102,9 +102,15 @@ void pipeline_executor::stop()
 void pipeline_executor::set_task_creator(sirius::creator::task_creator& task_creator)
 {
   _task_creator = &task_creator;
-  _scan_executor->set_task_creator(task_creator);
+
+  // Create a callback that captures task_creator and schedules operators
+  auto schedule_callback = [&task_creator](sirius::op::sirius_physical_operator* op) {
+    task_creator.schedule(op);
+  };
+
+  _scan_executor->set_schedule_callback(schedule_callback);
   for (auto& [device_id, gpu_exec] : _gpu_executors) {
-    gpu_exec->set_task_creator(task_creator);
+    gpu_exec->set_schedule_callback(schedule_callback);
   }
 }
 
