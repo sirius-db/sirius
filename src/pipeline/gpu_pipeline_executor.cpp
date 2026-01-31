@@ -16,6 +16,7 @@
 
 #include "pipeline/gpu_pipeline_executor.hpp"
 
+#include "creator/task_creator.hpp"
 #include "pipeline/gpu_pipeline_queue.hpp"
 #include "pipeline/pipeline_executor.hpp"
 
@@ -94,6 +95,11 @@ gpu_pipeline_task* gpu_pipeline_executor::cast_to_gpu_pipeline_task(sirius::para
 {
   // Safely cast to gpu_pipeline_task
   return dynamic_cast<gpu_pipeline_task*>(task);
+}
+
+void gpu_pipeline_executor::set_task_creator(sirius::creator::task_creator& task_creator)
+{
+  _task_creator = &task_creator;
 }
 
 }  // namespace pipeline

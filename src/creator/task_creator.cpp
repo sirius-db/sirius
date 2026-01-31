@@ -23,6 +23,7 @@
 #include "op/sirius_physical_ungrouped_aggregate.hpp"
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
+#include "pipeline/pipeline_executor.hpp"
 
 #include <duckdb/parallel/thread_context.hpp>
 
@@ -73,12 +74,10 @@ std::unique_ptr<task_creation_info> task_creation_queue::pull()
 //------------------------------------------------------------------------------
 
 task_creator::task_creator(size_t num_threads,
-                           pipeline::pipeline_executor& pipeline_executor,
                            op::scan::duckdb_scan_executor& duckdb_scan_executor,
                            sirius::memory::sirius_memory_reservation_manager& mem_res_mgr)
   : _num_threads(num_threads),
     _running(false),
-    _pipeline_executor(pipeline_executor),
     _duckdb_scan_executor(duckdb_scan_executor),
     _mem_res_mgr(mem_res_mgr)
 {
@@ -100,6 +99,11 @@ void task_creator::set_pipeline_hashmap(sirius_pipeline_hashmap& sirius_pipeline
       _priority_scans.push(i);
     }
   }
+}
+
+void task_creator::set_pipeline_executor(sirius::pipeline::pipeline_executor& pipeline_executor)
+{
+  _pipeline_executor = &pipeline_executor;
 }
 
 void task_creator::reset()

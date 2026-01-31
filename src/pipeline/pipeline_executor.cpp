@@ -17,6 +17,7 @@
 #include "pipeline/pipeline_executor.hpp"
 
 #include "config.hpp"
+#include "creator/task_creator.hpp"
 #include "exec/config.hpp"
 #include "log/logging.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
@@ -93,6 +94,14 @@ void pipeline_executor::dispatch_to_gpu_executor(std::unique_ptr<sirius::paralle
     throw std::runtime_error("Invalid GPU ID: " + std::to_string(gpu_id));
   }
   it->second->schedule(std::move(task));
+}
+
+void pipeline_executor::set_task_creator(sirius::creator::task_creator& task_creator)
+{
+  _task_creator = &task_creator;
+  for (auto& [device_id, gpu_exec] : _gpu_executors) {
+    gpu_exec->set_task_creator(task_creator);
+  }
 }
 
 void pipeline_executor::management_eventloop()

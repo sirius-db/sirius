@@ -118,9 +118,10 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
 
   task_creator_ =
     std::make_unique<sirius::creator::task_creator>(config_.get_task_creator_thread_count(),
-                                                    *pipeline_executor_,
                                                     *duckdb_scan_executor_,
                                                     *memory_manager_);
+  task_creator_->set_pipeline_executor(*pipeline_executor_);
+  pipeline_executor_->set_task_creator(*task_creator_);
 
   is_initialized_ = true;
 }

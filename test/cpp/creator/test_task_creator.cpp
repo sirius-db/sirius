@@ -162,10 +162,11 @@ class testable_task_creator : public task_creator {
                         pipeline_executor& pipeline_executor,
                         duckdb_scan_executor& duckdb_scan_executor,
                         sirius::memory::sirius_memory_reservation_manager& mem_res_mgr)
-    : task_creator(num_threads, pipeline_executor, duckdb_scan_executor, mem_res_mgr)
+    : task_creator(num_threads, duckdb_scan_executor, mem_res_mgr)
   {
     this->set_client_context(client_context);
     this->set_pipeline_hashmap(gpu_pipeline_map);
+    this->set_pipeline_executor(pipeline_executor);
   }
 
   void schedule(std::unique_ptr<task_creation_info> info) override
