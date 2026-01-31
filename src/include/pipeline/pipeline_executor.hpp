@@ -121,6 +121,24 @@ class pipeline_executor {
 
   [[nodiscard]] const sirius::op::scan::duckdb_scan_executor& get_scan_executor() const noexcept;
 
+  /**
+   * @brief Enable or disable scan result caching
+   *
+   * @param enabled True to enable caching, false to disable
+   */
+  void set_scan_caching_enabled(bool enabled);
+
+  /**
+   * @brief Set the priority scan operators
+   *
+   * Sets the scan operators that should be executed with priority.
+   * First element in vector will be first out of the queue.
+   * Also prepares the scan executor cache for these operators.
+   *
+   * @param scans Vector of scan operators (first in vector = first out of queue)
+   */
+  void set_priority_scans(const std::vector<op::sirius_physical_operator*>& scans);
+
  private:
   void management_eventloop();
 

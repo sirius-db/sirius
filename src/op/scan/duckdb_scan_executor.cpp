@@ -69,11 +69,81 @@ void duckdb_scan_executor::set_schedule_callback(
   _schedule_callback = std::move(schedule_fn);
 }
 
+void duckdb_scan_executor::cache_scan_results_for_query(const std::string& query)
+{
+  if (!_caching_enabled) { return; }
+  std::hash<std::string> hash_fn;
+  auto new_query_hash = hash_fn(query);
+  if (new_query_hash == _query_hash) {
+    SIRIUS_LOG_INFO("Scan results for query already cached, preloading: {}", query);
+    return;
+  }
+  SIRIUS_LOG_INFO("Caching scan results for query: {}", query);
+  _query_hash = new_query_hash;
+  _cache.clear();
+}
+
+void duckdb_scan_executor::set_scan_caching_enabled(bool enabled)
+{
+  _caching_enabled = enabled;
+  SIRIUS_LOG_INFO("Scan caching {}", enabled ? "enabled" : "disabled");
+}
+
+void duckdb_scan_executor::prepare_cache_for_scan_operators(
+  const std::vector<sirius::op::sirius_physical_operator*>& scan_operators)
+{
+  if (!_caching_enabled) { return; }
+
+  std::lock_guard<std::mutex> lock(_cache_mutex);
+  _preload_mode = !_cache.empty();
+
+  if (!_preload_mode) {
+    for (auto* op : scan_operators) {
+      // todo (amin) : we need to use the pipeline id instead of the operator id
+      auto operator_id    = op->get_operator_id();
+      _cache[operator_id] = std::make_unique<cache_entry>();  // Create empty entry
+    }
+  } else {
+    // In PRELOAD mode: verify all operator IDs are present in the cache
+    for (auto* op : scan_operators) {
+      // todo (amin) : we need to use the pipeline id instead of the operator id
+      auto operator_id = op->get_operator_id();
+      if (_cache.find(operator_id) == _cache.end()) {
+        SIRIUS_LOG_ERROR("Cache entry not found for operator {} in PRELOAD mode", operator_id);
+      }
+    }
+  }
+}
+
 void duckdb_scan_executor::submit_scan_request()
 {
   // Device ID 0 for scan tasks (CPU-based), is_scan = true
   [[maybe_unused]] auto result =
     _task_request_publisher.send(std::make_unique<sirius::pipeline::task_request>(0, true));
+}
+
+std::vector<std::shared_ptr<cucascade::data_batch>> duckdb_scan_executor::get_scan_output(
+  op::scan::duckdb_scan_task* task)
+{
+  if (!_caching_enabled) {
+    return task->compute_task();
+  } else {
+    auto pipe_id = task->get_pipeline_id();
+    std::lock_guard<std::mutex> lock(_cache_mutex);
+    // todo (amin) : we need to clone the batches to avoid modifying the original batches
+    auto& entry = _cache.at(pipe_id);
+    if (!entry) { throw std::runtime_error("Scan results for query not cached"); }
+    if (_preload_mode) {
+      if (entry->batch_index >= entry->batches.size()) {
+        throw std::runtime_error("Scan results for query not cached");
+      }
+      return entry->batches[entry->batch_index++];
+    } else {
+      auto batches = task->compute_task();
+      entry->batches.push_back(batches);
+      return batches;
+    }
+  }
 }
 
 void duckdb_scan_executor::manager_loop()
@@ -96,9 +166,9 @@ void duckdb_scan_executor::manager_loop()
       break;
     }
 
-    std::vector<sirius_physical_operator*> output_consumers;
     // Make host memory reservation and set it on the local state
-    if (auto* scan_task = dynamic_cast<sirius::op::scan::duckdb_scan_task*>(task.get())) {
+    auto* scan_task = dynamic_cast<sirius::op::scan::duckdb_scan_task*>(task.get());
+    if (scan_task) {
       auto bytes_needed = scan_task->get_estimated_reservation_size();
       auto reservation  = _mem_mgr->request_reservation(
         cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::HOST}, bytes_needed);
@@ -113,14 +183,18 @@ void duckdb_scan_executor::manager_loop()
         SIRIUS_LOG_ERROR("DuckDB Scan Executor: Failed to cast local state for task");
         break;
       }
-      output_consumers = scan_task->get_output_consumers();
+    } else {
+      SIRIUS_LOG_ERROR("DuckDB Scan Executor: Failed to cast task to scan task");
+      break;
     }
 
     _thread_pool->schedule([this,
-                            t         = std::move(task),
                             ticket    = std::move(ticket),
-                            consumers = std::move(output_consumers)]() mutable {
-      t->execute();
+                            t         = std::move(task),
+                            scan_task = std::move(scan_task)]() mutable {
+      auto consumers = scan_task->get_output_consumers();
+      auto batches   = get_scan_output(scan_task);
+      scan_task->publish_output(std::move(batches));
       t.reset();
       if (_schedule_callback) {
         for (auto* consumer : consumers) {

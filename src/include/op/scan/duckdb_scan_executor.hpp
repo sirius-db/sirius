@@ -21,6 +21,7 @@
 #include "exec/interruptible_mpmc.hpp"
 #include "exec/kiosk.hpp"
 #include "exec/thread_pool.hpp"
+#include "op/scan/duckdb_scan_task.hpp"
 #include "parallel/task.hpp"
 #include "pipeline/task_request.hpp"
 
@@ -29,6 +30,7 @@
 #include <atomic>
 #include <functional>
 #include <memory>
+#include <string>
 #include <thread>
 
 namespace sirius::op {
@@ -114,6 +116,38 @@ class duckdb_scan_executor {
   void set_schedule_callback(
     std::function<void(sirius::op::sirius_physical_operator*)> schedule_fn);
 
+  /**
+   * @brief Cache scan results for the given query
+   *
+   * @param query The query string to cache results for
+   */
+  void cache_scan_results_for_query(const std::string& query);
+
+  /**
+   * @brief Enable or disable scan result caching
+   *
+   * @param enabled True to enable caching, false to disable
+   */
+  void set_scan_caching_enabled(bool enabled);
+
+  /**
+   * @brief Check if scan result caching is enabled
+   *
+   * @return True if caching is enabled, false otherwise
+   */
+  [[nodiscard]] bool is_scan_caching_enabled() const noexcept { return _caching_enabled; }
+
+  /**
+   * @brief Prepare cache for scan operators
+   *
+   * In CACHE mode: ensures cache is empty and creates entries for each operator's ID
+   * In PRELOAD mode: verifies all operator IDs are present in the cache
+   *
+   * @param scan_operators Vector of scan operators to prepare cache for
+   */
+  void prepare_cache_for_scan_operators(
+    const std::vector<sirius::op::sirius_physical_operator*>& scan_operators);
+
  private:
   /**
    * @brief Manager loop to consume tasks from queue and dispatch to the thread pool
@@ -124,6 +158,20 @@ class duckdb_scan_executor {
    * @brief Submit a scan task request to pipeline_executor
    */
   void submit_scan_request();
+
+  std::vector<std::shared_ptr<cucascade::data_batch>> get_scan_output(
+    op::scan::duckdb_scan_task* task);
+
+  struct cache_entry {
+    std::vector<std::vector<std::shared_ptr<cucascade::data_batch>>> batches;
+    std::size_t batch_index{0};
+  };
+
+  std::mutex _cache_mutex;
+  std::unordered_map<size_t, std::unique_ptr<cache_entry>> _cache;
+  std::size_t _query_hash{0};
+  bool _caching_enabled{false};
+  bool _preload_mode{false};
 
   std::atomic<bool> _running{false};
   exec::thread_pool_config _config;

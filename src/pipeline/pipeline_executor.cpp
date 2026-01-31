@@ -126,6 +126,24 @@ pipeline_executor::get_scan_executor() noexcept
   return *_scan_executor;
 }
 
+void pipeline_executor::set_scan_caching_enabled(bool enabled)
+{
+  _scan_executor->set_scan_caching_enabled(enabled);
+}
+
+void pipeline_executor::set_priority_scans(const std::vector<op::sirius_physical_operator*>& scans)
+{
+  _scan_executor->prepare_cache_for_scan_operators(scans);
+
+  std::lock_guard<std::mutex> lock(_priority_scans_mutex);
+  while (!_priority_scans.empty()) {
+    _priority_scans.pop();
+  }
+  for (auto* scan : scans) {
+    _priority_scans.push(scan);
+  }
+}
+
 void pipeline_executor::management_eventloop()
 {
   while (_running.load()) {
