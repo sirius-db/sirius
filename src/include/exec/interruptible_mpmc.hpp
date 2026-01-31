@@ -45,7 +45,7 @@ concept smart_pointer = is_shared_ptr<T>::value || is_unique_ptr<T>::value;
 
 template <smart_pointer T>
 class interruptible_mpmc {
-  using value_type = typename T::element_type;
+  using value_type   = typename T::element_type;
   using pointer_type = T;
 
  private:
@@ -67,21 +67,21 @@ class interruptible_mpmc {
    * \brief Pushes an item into the queue.
    * \return Returns false if the queue has been stopped/interrupted.
    */
-   template <typename... Args>
-   [[nodiscard]] bool emplace(Args&&... args)
-   {
-     if (!_is_active.load(std::memory_order_relaxed)) { return false; }
-     queue.enqueue(std::make_unique<value_type>(std::forward<Args>(args)...));
-     return true;
-   }
+  template <typename... Args>
+  [[nodiscard]] bool emplace(Args&&... args)
+  {
+    if (!_is_active.load(std::memory_order_relaxed)) { return false; }
+    queue.enqueue(std::make_unique<value_type>(std::forward<Args>(args)...));
+    return true;
+  }
 
-   bool push(pointer_type item)
-   {
+  bool push(pointer_type item)
+  {
     assert(item != nullptr);
-     if (!_is_active.load(std::memory_order_relaxed)) { return false; }
-     queue.enqueue(std::move(item));
-     return true;
-   }
+    if (!_is_active.load(std::memory_order_relaxed)) { return false; }
+    queue.enqueue(std::move(item));
+    return true;
+  }
 
   /**
    * \brief Blocks waiting for an item.

@@ -17,6 +17,7 @@
 #pragma once
 
 #include "config.hpp"
+#include "exec/interruptible_mpmc.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "parallel/task_executor.hpp"
 #include "pipeline/gpu_pipeline_executor.hpp"
@@ -40,7 +41,7 @@ namespace pipeline {
  * task scheduling. It manages a pool of threads dedicated to executing GPU pipeline
  * tasks with specialized GPU resource management.
  */
-class pipeline_executor : public sirius::parallel::itask_executor {
+class pipeline_executor {
  public:
   /**
    * @brief Constructs a new pipeline_executor with task execution configuration
@@ -57,7 +58,7 @@ class pipeline_executor : public sirius::parallel::itask_executor {
   /**
    * @brief Destructor for the gpu_pipeline_executor.
    */
-  ~pipeline_executor() override = default;
+  ~pipeline_executor() = default;
 
   // Non-copyable but movable
   pipeline_executor(const pipeline_executor&)            = delete;
@@ -74,28 +75,14 @@ class pipeline_executor : public sirius::parallel::itask_executor {
    *
    * @param task The task to schedule (must be a gpu_pipeline_task)
    */
-  void schedule(std::unique_ptr<sirius::parallel::itask> task) override;
-
-  /**
-   * @brief Main worker loop for executing GPU pipeline tasks
-   *
-   * Each worker thread runs this loop to continuously pull and execute GPU
-   * pipeline tasks from the queue. Handles GPU-specific operations including
-   * kernel launches, memory transfers, and synchronization.
-   *
-   * @param worker_id The unique identifier for this worker thread
-   */
-  void worker_loop(int worker_id) override;
-
-  void on_start() override;
-  void on_stop() override;
+  void schedule(std::unique_ptr<sirius::parallel::itask> task);
 
   /**
    * @brief Starts the executor and initializes worker threads
    *
    * Initializes the thread pool and begins accepting tasks for execution.
    */
-  void start() override;
+  void start();
 
   /**
    * @brief Stops the executor and cleanly shuts down worker threads
@@ -103,7 +90,7 @@ class pipeline_executor : public sirius::parallel::itask_executor {
    * Stops accepting new tasks and waits for all worker threads to complete
    * their current tasks before shutting down.
    */
-  void stop() override;
+  void stop();
 
   /**
    * @brief Dispatch a task to a specific GPU executor based on GPU ID
@@ -119,9 +106,16 @@ class pipeline_executor : public sirius::parallel::itask_executor {
   void submit_task_request(std::unique_ptr<task_request> request);
 
  private:
+  void management_eventloop();
+
+  exec::interruptible_mpmc<std::unique_ptr<sirius::parallel::itask>> _task_queue;
+
+  exec::interruptible_mpmc<std::unique_ptr<task_request>> _task_request_queue;
+  std::thread _management_thread;
+  std::atomic<bool> _running{false};
+
   std::unordered_map<int, std::unique_ptr<gpu_pipeline_executor>>
     _gpu_executors;  ///< Map of device_id to GPU executor
-  std::unique_ptr<task_request_queue> _task_request_queue;
 };
 
 }  // namespace pipeline

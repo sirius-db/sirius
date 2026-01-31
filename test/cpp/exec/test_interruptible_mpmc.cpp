@@ -227,7 +227,8 @@ TEST_CASE("interruptible_mpmc blocking pop returns nullptr after interrupt", "[i
   REQUIRE(pop_result == nullptr);
 }
 
-TEST_CASE("interruptible_mpmc interrupt wakes up multiple blocked consumers", "[interruptible_mpmc]")
+TEST_CASE("interruptible_mpmc interrupt wakes up multiple blocked consumers",
+          "[interruptible_mpmc]")
 {
   interruptible_mpmc<std::unique_ptr<int>> queue;
   constexpr int num_consumers = 4;
@@ -292,10 +293,10 @@ TEST_CASE("interruptible_mpmc reset after interrupt re-enables queue", "[interru
 TEST_CASE("interruptible_mpmc concurrent producers and consumers", "[interruptible_mpmc]")
 {
   interruptible_mpmc<std::unique_ptr<int>> queue;
-  constexpr int num_producers       = 4;
-  constexpr int num_consumers       = 4;
-  constexpr int items_per_producer  = 100;
-  constexpr int total_items         = num_producers * items_per_producer;
+  constexpr int num_producers      = 4;
+  constexpr int num_consumers      = 4;
+  constexpr int items_per_producer = 100;
+  constexpr int total_items        = num_producers * items_per_producer;
 
   std::atomic<int> produced_count{0};
   std::atomic<int> consumed_count{0};
