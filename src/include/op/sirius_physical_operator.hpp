@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include <atomic>
+
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/common.hpp"
 #include "duckdb/common/enums/operator_result_type.hpp"
@@ -60,15 +62,20 @@ enum class MemoryBarrierType { PIPELINE, PARTIAL, FULL };
 class sirius_physical_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::INVALID;
+  //! Static counter for generating unique operator IDs
+  static inline std::atomic<size_t> next_operator_id{0};
 
  public:
   sirius_physical_operator(SiriusPhysicalOperatorType type,
                            duckdb::vector<duckdb::LogicalType> types,
                            duckdb::idx_t estimated_cardinality)
-    : type(type), types(std::move(types)), estimated_cardinality(estimated_cardinality)
+    : type(type),
+      types(std::move(types)),
+      estimated_cardinality(estimated_cardinality),
+      operator_id(next_operator_id++)
   {
   }
-  sirius_physical_operator() = default;
+  sirius_physical_operator() : operator_id(next_operator_id++) {}
   virtual ~sirius_physical_operator() {}
 
   //! The physical operator type
@@ -79,6 +86,8 @@ class sirius_physical_operator {
   duckdb::vector<duckdb::LogicalType> types;
   //! The estimated cardinality of this physical operator
   duckdb::idx_t estimated_cardinality;
+  //! The unique ID of this operator (auto-incremented at creation)
+  size_t operator_id;
 
   //! The global sink state of this operator
   duckdb::unique_ptr<duckdb::GlobalSinkState> sink_state;
@@ -100,6 +109,9 @@ class sirius_physical_operator {
 
   //! Return a vector of the types that will be returned by this operator
   const duckdb::vector<duckdb::LogicalType>& get_types() const { return types; }
+
+  //! Get the unique operator ID
+  size_t get_operator_id() const { return operator_id; }
 
   virtual bool equals(const sirius_physical_operator& other) const { return false; }
 

@@ -112,6 +112,11 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
 
   duckdb::optional_ptr<op::sirius_physical_operator> get_source() { return source; }
 
+  //! Set the pipeline ID
+  void set_pipeline_id(size_t id) { pipeline_id = id; }
+  //! Get the pipeline ID
+  size_t get_pipeline_id() const { return pipeline_id; }
+
   //! Returns whether any of the operators in the pipeline care about preserving order
   bool is_order_dependent() const;
 
@@ -164,6 +169,8 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   bool schedule_parallel(duckdb::shared_ptr<duckdb::Event>& event);
   //! Whether the pipeline has been finished
   bool pipeline_finished = false;
+  //! The unique ID of this pipeline (assigned based on new_scheduled order)
+  size_t pipeline_id = 0;
   sirius_engine& engine;
 };
 

@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "log/logging.hpp"
 #include "gpu_context.hpp"
 
 #include "duckdb.hpp"
@@ -31,7 +32,7 @@
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/parser/statement/relation_statement.hpp"
 #include "duckdb/planner/planner.hpp"
-#include "log/logging.hpp"
+
 #include "sirius_extension.hpp"
 
 #include <stdio.h>

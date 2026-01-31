@@ -59,14 +59,6 @@ class sirius_engine {
   duckdb::vector<duckdb::unique_ptr<op::sirius_physical_operator>> new_pipeline_breakers;
   //! Storage for concatenated operators during pipeline splitting
   duckdb::vector<duckdb::unique_ptr<op::sirius_physical_operator>> concat_ops;
-  //! Map from operator pointer to unique ID for data_repository_manager
-  std::unordered_map<const op::sirius_physical_operator*, size_t> operator_to_id;
-  //! Mutex for thread-safe access to operator_to_id map
-  std::mutex operator_id_mutex;
-  //! Counter for generating unique operator IDs
-  std::atomic<size_t> next_operator_id{0};
-  //! Get or create a unique ID for an operator
-  size_t get_operator_id(const op::sirius_physical_operator* op);
   //! The current root pipeline index
   duckdb::idx_t root_pipeline_idx;
   //! The total amount of pipelines in the query
@@ -95,7 +87,6 @@ class sirius_engine {
   duckdb::shared_ptr<pipeline::sirius_pipeline> create_child_pipeline(
     pipeline::sirius_pipeline& current, op::sirius_physical_operator& op);
   duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>> new_scheduled;
-  std::unique_ptr<::cucascade::shared_data_repository_manager> data_repo_manager;
 
   //! Convert the DuckDB physical plan to a GPU physical plan
 };
