@@ -17,12 +17,14 @@
 #include "pipeline/pipeline_executor.hpp"
 
 #include "config.hpp"
+#include "exec/config.hpp"
 #include "log/logging.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "pipeline/pipeline_queue.hpp"
 
 #include <cucascade/memory/common.hpp>
 #include <cucascade/memory/memory_reservation.hpp>
+#include <cucascade/memory/memory_space.hpp>
 
 namespace sirius {
 namespace pipeline {
@@ -45,7 +47,10 @@ pipeline_executor::pipeline_executor(const parallel::task_executor_config& gpu_t
 
       if (it != sys_topology->gpus.end()) { config.cpu_affinity_list = it->cpu_cores; }
     }
-    _gpu_executors.emplace(device_id, std::make_unique<gpu_pipeline_executor>(config, space, this));
+    _gpu_executors.emplace(
+      device_id,
+      std::make_unique<gpu_pipeline_executor>(
+        exec::thread_pool_config{}, const_cast<cucascade::memory::memory_space*>(space), this));
   }
 }
 

@@ -1,8 +1,26 @@
+/*
+ * Copyright 2025, Sirius Contributors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include <optional>
-#include <utility>  // for std::exchange
+#include <utility>
 
 namespace sirius::exec {
 
@@ -113,11 +131,11 @@ class kiosk {
   size_t total_issued_{0};
 };
 
-ticket::ticket(kiosk& agent) : agent_(&agent) {}
+inline ticket::ticket(kiosk& agent) : agent_(&agent) {}
 
-ticket::ticket(ticket&& other) noexcept : agent_(other.agent_) { other.agent_ = nullptr; }
+inline ticket::ticket(ticket&& other) noexcept : agent_(other.agent_) { other.agent_ = nullptr; }
 
-ticket& ticket::operator=(ticket&& other) noexcept
+inline ticket& ticket::operator=(ticket&& other) noexcept
 {
   if (this != &other) {
     release();
@@ -127,20 +145,20 @@ ticket& ticket::operator=(ticket&& other) noexcept
   return *this;
 }
 
-ticket::~ticket() { release(); }
+inline ticket::~ticket() { release(); }
 
-void ticket::release()
+inline void ticket::release()
 {
   if (auto agent = std::exchange(this->agent_, nullptr); agent != nullptr) {
     agent->release_ticket();
   }
 }
 
-kiosk::kiosk() : max_tickets_(0) {}
+inline kiosk::kiosk() : max_tickets_(0) {}
 
-kiosk::kiosk(size_t max_tickets) : max_tickets_(max_tickets) {}
+inline kiosk::kiosk(size_t max_tickets) : max_tickets_(max_tickets) {}
 
-ticket kiosk::acquire()
+inline ticket kiosk::acquire()
 {
   std::unique_lock lock(mutex_);
   if (stopped_) return ticket();
@@ -161,7 +179,7 @@ ticket kiosk::acquire()
   return ticket(*this);
 }
 
-std::optional<ticket> kiosk::try_acquire()
+inline std::optional<ticket> kiosk::try_acquire()
 {
   std::unique_lock lock(mutex_);
 
@@ -182,29 +200,29 @@ std::optional<ticket> kiosk::try_acquire()
   return std::nullopt;
 }
 
-void kiosk::wait_all()
+inline void kiosk::wait_all()
 {
   std::unique_lock lock(mutex_);
   wait_cv_.wait(lock, [this] { return active_tickets_ == 0; });
 }
 
-size_t kiosk::active_count() const
+inline size_t kiosk::active_count() const
 {
   std::lock_guard lock(mutex_);
   return active_tickets_;
 }
 
-size_t kiosk::total_issued() const
+inline size_t kiosk::total_issued() const
 {
   std::lock_guard lock(mutex_);
   return total_issued_;
 }
 
-size_t kiosk::max_capacity() const { return max_tickets_; }
+inline size_t kiosk::max_capacity() const { return max_tickets_; }
 
-bool kiosk::is_bounded() const { return max_tickets_ > 0; }
+inline bool kiosk::is_bounded() const { return max_tickets_ > 0; }
 
-void kiosk::release_ticket()
+inline void kiosk::release_ticket()
 {
   std::unique_lock lock(mutex_);
 
