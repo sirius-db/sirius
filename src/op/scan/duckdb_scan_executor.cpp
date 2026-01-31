@@ -16,7 +16,6 @@
 
 #include "op/scan/duckdb_scan_executor.hpp"
 
-#include "creator/task_creator.hpp"
 #include "log/logging.hpp"
 #include "op/scan/duckdb_scan_task.hpp"
 #include "op/sirius_physical_operator.hpp"
@@ -64,9 +63,10 @@ void duckdb_scan_executor::stop()
 
 void duckdb_scan_executor::wait_all() { _kiosk.wait_all(); }
 
-void duckdb_scan_executor::set_task_creator(sirius::creator::task_creator& task_creator)
+void duckdb_scan_executor::set_schedule_callback(
+  std::function<void(sirius::op::sirius_physical_operator*)> schedule_fn)
 {
-  _task_creator = &task_creator;
+  _schedule_callback = std::move(schedule_fn);
 }
 
 void duckdb_scan_executor::submit_scan_request()
@@ -122,8 +122,10 @@ void duckdb_scan_executor::manager_loop()
                             consumers = std::move(output_consumers)]() mutable {
       t->execute();
       t.reset();
-      for (auto* consumer : consumers) {
-        _task_creator->schedule(consumer);
+      if (_schedule_callback) {
+        for (auto* consumer : consumers) {
+          _schedule_callback(consumer);
+        }
       }
     });
   }
