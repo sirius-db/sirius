@@ -22,7 +22,7 @@
 #include "extension_lock.hpp"
 #include "log/logging.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
-// #include "op/scan/caching_duckdb_scan_executor.hpp"
+#include "op/scan/duckdb_scan_executor.hpp"
 
 #include <spdlog/sinks/basic_file_sink.h>
 #include <spdlog/spdlog.h>
@@ -75,12 +75,10 @@ SiriusContext::~SiriusContext() noexcept
 
 void SiriusContext::QueryBegin(ClientContext& context)
 {
-  // auto query = context.GetCurrentQuery();
-  // if (config_.is_scan_caching_enabled()) {
-  //   auto caching_executor =
-  //     dynamic_cast<sirius::op::scan::caching_duckdb_scan_executor*>(duckdb_scan_executor_.get());
-  //   if (caching_executor) { caching_executor->cache_scan_results_for_query(query); }
-  // }
+  auto query = context.GetCurrentQuery();
+  if (config_.is_scan_caching_enabled()) {
+    pipeline_executor_->get_scan_executor().cache_scan_results_for_query(query);
+  }
 }
 
 void SiriusContext::QueryEnd() {}
@@ -113,6 +111,9 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     config_.get_task_creator_thread_count(), *memory_manager_);
   task_creator_->set_pipeline_executor(*pipeline_executor_);
   pipeline_executor_->set_task_creator(*task_creator_);
+
+  // Configure scan caching based on config
+  pipeline_executor_->set_scan_caching_enabled(config_.is_scan_caching_enabled());
 
   is_initialized_ = true;
 }
