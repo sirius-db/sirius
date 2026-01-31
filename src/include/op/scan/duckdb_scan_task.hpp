@@ -117,6 +117,18 @@ class duckdb_scan_task_global_state : public sirius::parallel::itask_global_stat
     if (remaining == 0) { set_source_drained(); }
   }
 
+  std::vector<sirius_physical_operator*> get_output_consumers() const noexcept
+  {
+    std::vector<sirius_physical_operator*> output_consumers;
+    auto ports = _op.get_next_port_after_sink();
+    for (auto& [child, port_id] : ports) {
+      output_consumers.push_back(child);
+    }
+    return output_consumers;
+  }
+
+  [[nodiscard]] size_t get_pipeline_id() const { return _pipeline->get_pipeline_id(); }
+
  private:
   //===----------Fields----------===//
   duckdb::shared_ptr<pipeline::sirius_pipeline>
@@ -278,6 +290,11 @@ class duckdb_scan_task_local_state : public sirius::pipeline::sirius_pipeline_it
     size_t approximate_batch_size = duckdb::Config::DEFAULT_SCAN_TASK_BATCH_SIZE,
     size_t default_varchar_size   = duckdb::Config::DEFAULT_SCAN_TASK_VARCHAR_SIZE,
     std::unique_ptr<duckdb::LocalTableFunctionState> existing_local_tf_state = nullptr);
+
+  [[nodiscard]] std::size_t get_estimated_reservation_size() const noexcept
+  {
+    return _approximate_batch_size;
+  }
 
   //===----------Methods----------===//
   /**
@@ -451,17 +468,22 @@ class duckdb_scan_task : public sirius::pipeline::sirius_pipeline_itask {
 
   std::size_t get_estimated_reservation_size() override
   {
-    /// TODO(amin)
-    return 0;
+    return this->_local_state->cast<duckdb_scan_task_local_state>()
+      .get_estimated_reservation_size();
   }
 
   /// @brief Get the output consumer operators for this task.
   std::vector<op::sirius_physical_operator*> get_output_consumers() override
   {
-    /// TODO(amin)
-    return {};
+    return this->_global_state->cast<duckdb_scan_task_global_state>().get_output_consumers();
   }
 
+  [[nodiscard]] size_t get_pipeline_id() const
+  {
+    return this->_global_state->cast<duckdb_scan_task_global_state>().get_pipeline_id();
+  }
+
+ private:
   //===----------Fields----------===//
   shared_data_repository* _data_repo;  ///< Data repository to which to push batches
   uint64_t _task_id;                   ///< The unique id of this scan task
