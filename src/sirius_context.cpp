@@ -109,12 +109,12 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   // }
 
   pipeline_executor_ = std::make_unique<sirius::pipeline::pipeline_executor>(
-    config_.get_gpu_pipeline_executor_config(), *memory_manager_, &config_.get_hw_topology());
+    sirius::parallel::task_executor_config{}, *memory_manager_, &config_.get_hw_topology());
   // pipeline_executor_->set_scan_executor(*duckdb_scan_executor_);
   // duckdb_scan_executor_->set_pipeline_executor(pipeline_executor_.get());
 
   downgrade_executor_ = std::make_unique<sirius::parallel::downgrade_executor>(
-    config_.get_downgrade_executor_config(), *data_repository_manager_);
+    sirius::parallel::task_executor_config{}, *data_repository_manager_);
 
   task_creator_ =
     std::make_unique<sirius::creator::task_creator>(config_.get_task_creator_thread_count(),
