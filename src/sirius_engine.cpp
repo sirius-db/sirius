@@ -40,6 +40,7 @@
 #include "op/sirius_physical_top_n_merge.hpp"
 #include "op/sirius_physical_ungrouped_aggregate.hpp"
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
+
 #include <cucascade/data/data_repository_manager.hpp>
 #include <stdio.h>
 
@@ -63,11 +64,12 @@ void sirius_engine::insert_repository(
   duckdb::shared_ptr<pipeline::sirius_pipeline> input_pipeline,
   duckdb::shared_ptr<pipeline::sirius_pipeline> dependent_pipeline)
 {
-  auto next_op = dependent_pipeline->get_inner_operators().size() == 0
-                   ? dependent_pipeline->get_sink().get()
-                   : &dependent_pipeline->get_inner_operators()[0].get();
-  size_t op_id = next_op->operator_id;
-  auto& data_repo_manager = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")->get_data_repository_manager();
+  auto next_op            = dependent_pipeline->get_inner_operators().size() == 0
+                              ? dependent_pipeline->get_sink().get()
+                              : &dependent_pipeline->get_inner_operators()[0].get();
+  size_t op_id            = next_op->operator_id;
+  auto& data_repo_manager = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
+                              ->get_data_repository_manager();
   data_repo_manager.add_new_repository(
     op_id, port_id, std::make_unique<::cucascade::shared_data_repository>());
   next_op->add_port(port_id,
@@ -85,7 +87,8 @@ void sirius_engine::insert_repository(
   duckdb::shared_ptr<pipeline::sirius_pipeline> input_pipeline,
   duckdb::shared_ptr<pipeline::sirius_pipeline> dependent_pipeline)
 {
-  auto& data_repo_manager = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")->get_data_repository_manager();
+  auto& data_repo_manager = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
+                              ->get_data_repository_manager();
   auto next_op = dependent_pipeline->get_inner_operators().size() == 0
                    ? dependent_pipeline->get_sink().get()
                    : &dependent_pipeline->get_inner_operators()[0].get();
@@ -310,7 +313,8 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
     }
 
     // get data_repo_manager from sirius context
-    auto& data_repo_manager = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")->get_data_repository_manager();
+    auto& data_repo_manager = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
+                                ->get_data_repository_manager();
     unordered_map<const op::sirius_physical_operator*,
                   duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>>>
       source_to_pipelines;
@@ -652,7 +656,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
         auto partition_distinct =
           delim_join->Cast<op::sirius_physical_delim_join>().partition_distinct;
         // Find the pipeline containing the join as the first operator
-        bool found                            = false;
+        bool found = false;
         for (auto dependent_pipeline : source_to_pipelines[partition_join]) {
           insert_repository("default", partition_join, new_scheduled[i], dependent_pipeline);
         }
@@ -743,42 +747,42 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
       auto pipeline = new_scheduled[i];
       SIRIUS_LOG_DEBUG("Pipeline #{}", i);
       SIRIUS_LOG_DEBUG("  Source: {}", pipeline->source->get_name());
-      
+
       // Print operators
       for (size_t j = 0; j < pipeline->operators.size(); j++) {
         SIRIUS_LOG_DEBUG("    Operator[{}]: {}", j, pipeline->operators[j].get().get_name());
       }
-      
+
       SIRIUS_LOG_DEBUG("  Sink: {}", pipeline->sink->get_name());
-      
+
       // Print ports at operator[0] (beginning of pipeline)
       if (pipeline->operators.size() > 0) {
         auto& first_op = pipeline->operators[0].get();
         SIRIUS_LOG_DEBUG("  Ports at Operator[0] ({}):", first_op.get_name());
-        
+
         // Check for different port types based on operator type
         if (first_op.type == op::SiriusPhysicalOperatorType::HASH_JOIN ||
             first_op.type == op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
           // Joins have "default" and "build" ports
           auto* default_port = first_op.get_port("default");
           if (default_port) {
-            SIRIUS_LOG_DEBUG("    Port 'default': barrier_type={}, repo={}", 
-              static_cast<int>(default_port->type),
-              static_cast<void*>(default_port->repo));
+            SIRIUS_LOG_DEBUG("    Port 'default': barrier_type={}, repo={}",
+                             static_cast<int>(default_port->type),
+                             static_cast<void*>(default_port->repo));
           }
           auto* build_port = first_op.get_port("build");
           if (build_port) {
-            SIRIUS_LOG_DEBUG("    Port 'build': barrier_type={}, repo={}", 
-              static_cast<int>(build_port->type),
-              static_cast<void*>(build_port->repo));
+            SIRIUS_LOG_DEBUG("    Port 'build': barrier_type={}, repo={}",
+                             static_cast<int>(build_port->type),
+                             static_cast<void*>(build_port->repo));
           }
         } else if (first_op.type == op::SiriusPhysicalOperatorType::TABLE_SCAN) {
           // Scans have "scan" port
           auto* scan_port = first_op.get_port("scan");
           if (scan_port) {
-            SIRIUS_LOG_DEBUG("    Port 'scan': barrier_type={}, repo={}", 
-              static_cast<int>(scan_port->type),
-              static_cast<void*>(scan_port->repo));
+            SIRIUS_LOG_DEBUG("    Port 'scan': barrier_type={}, repo={}",
+                             static_cast<int>(scan_port->type),
+                             static_cast<void*>(scan_port->repo));
           }
         } else if (first_op.type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
           // ignore DUCKDB_SCAN since it doesn't have port
@@ -786,105 +790,107 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
           // Most operators have "default" port
           auto* default_port = first_op.get_port("default");
           if (default_port) {
-            SIRIUS_LOG_DEBUG("    Port 'default': barrier_type={}, repo={}", 
-              static_cast<int>(default_port->type),
-              static_cast<void*>(default_port->repo));
+            SIRIUS_LOG_DEBUG("    Port 'default': barrier_type={}, repo={}",
+                             static_cast<int>(default_port->type),
+                             static_cast<void*>(default_port->repo));
           }
         }
       } else {
         SIRIUS_LOG_DEBUG("  No operators in pipeline - checking sink ports");
         auto* sink = pipeline->sink.get();
-        
+
         if (sink->type == op::SiriusPhysicalOperatorType::HASH_JOIN ||
             sink->type == op::SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
           auto* default_port = sink->get_port("default");
           if (default_port) {
-            SIRIUS_LOG_DEBUG("    Port 'default': barrier_type={}, repo={}", 
-              static_cast<int>(default_port->type),
-              static_cast<void*>(default_port->repo));
+            SIRIUS_LOG_DEBUG("    Port 'default': barrier_type={}, repo={}",
+                             static_cast<int>(default_port->type),
+                             static_cast<void*>(default_port->repo));
           }
           auto* build_port = sink->get_port("build");
           if (build_port) {
-            SIRIUS_LOG_DEBUG("    Port 'build': barrier_type={}, repo={}", 
-              static_cast<int>(build_port->type),
-              static_cast<void*>(build_port->repo));
+            SIRIUS_LOG_DEBUG("    Port 'build': barrier_type={}, repo={}",
+                             static_cast<int>(build_port->type),
+                             static_cast<void*>(build_port->repo));
           }
         } else if (sink->type == op::SiriusPhysicalOperatorType::TABLE_SCAN) {
           auto* scan_port = sink->get_port("scan");
           if (scan_port) {
-            SIRIUS_LOG_DEBUG("    Port 'scan': barrier_type={}, repo={}", 
-              static_cast<int>(scan_port->type),
-              static_cast<void*>(scan_port->repo));
+            SIRIUS_LOG_DEBUG("    Port 'scan': barrier_type={}, repo={}",
+                             static_cast<int>(scan_port->type),
+                             static_cast<void*>(scan_port->repo));
           }
         } else if (sink->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
           // ignore DUCKDB_SCAN since it doesn't have port
         } else {
           auto* default_port = sink->get_port("default");
           if (default_port) {
-            SIRIUS_LOG_DEBUG("    Port 'default': barrier_type={}, repo={}", 
-              static_cast<int>(default_port->type),
-              static_cast<void*>(default_port->repo));
+            SIRIUS_LOG_DEBUG("    Port 'default': barrier_type={}, repo={}",
+                             static_cast<int>(default_port->type),
+                             static_cast<void*>(default_port->repo));
           }
         }
       }
-      
+
       // Print ports and next operators after sink
       SIRIUS_LOG_DEBUG("  Sink next operators and ports:");
       for (auto& next_port : pipeline->sink->get_next_port_after_sink()) {
         auto next_op = next_port.first;
         auto port_id = next_port.second;
         SIRIUS_LOG_DEBUG("    Next Op: {}, Port: '{}'", next_op->get_name(), port_id.data());
-        
+
         // Print the port details if it exists
         auto* port = next_op->get_port(port_id);
         if (port) {
-          SIRIUS_LOG_DEBUG("      Port barrier_type={}, repo={}", 
-            static_cast<int>(port->type),
-            static_cast<void*>(port->repo));
+          SIRIUS_LOG_DEBUG("      Port barrier_type={}, repo={}",
+                           static_cast<int>(port->type),
+                           static_cast<void*>(port->repo));
         }
       }
-      
+
       // Special handling for delim joins
       if (pipeline->sink->type == op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN ||
           pipeline->sink->type == op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN) {
         auto delim_join = pipeline->get_sink();
-        
+
         if (pipeline->sink->type == op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
           auto partition_join = delim_join->Cast<op::sirius_physical_delim_join>().partition_join;
           SIRIUS_LOG_DEBUG("  Partition Join next operators:");
           for (auto& next_port : partition_join->get_next_port_after_sink()) {
-            SIRIUS_LOG_DEBUG("    Next Op: {}, Port: '{}' Repo:'{}'", 
-              next_port.first->get_name(), 
-              next_port.second.data(), 
-              static_cast<void*>(next_port.first->get_port(next_port.second)->repo));
+            SIRIUS_LOG_DEBUG("    Next Op: {}, Port: '{}' Repo:'{}'",
+                             next_port.first->get_name(),
+                             next_port.second.data(),
+                             static_cast<void*>(next_port.first->get_port(next_port.second)->repo));
           }
         }
-        
-        auto partition_distinct = delim_join->Cast<op::sirius_physical_delim_join>().partition_distinct;
+
+        auto partition_distinct =
+          delim_join->Cast<op::sirius_physical_delim_join>().partition_distinct;
         SIRIUS_LOG_DEBUG("  Partition Distinct next operators:");
         for (auto& next_port : partition_distinct->get_next_port_after_sink()) {
-          SIRIUS_LOG_DEBUG("    Next Op: {}, Port: '{}' Repo:'{}'", 
-            next_port.first->get_name(), 
-            next_port.second.data(), 
-            static_cast<void*>(next_port.first->get_port(next_port.second)->repo));
+          SIRIUS_LOG_DEBUG("    Next Op: {}, Port: '{}' Repo:'{}'",
+                           next_port.first->get_name(),
+                           next_port.second.data(),
+                           static_cast<void*>(next_port.first->get_port(next_port.second)->repo));
         }
-        
+
         if (pipeline->sink->type == op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN) {
-          auto column_data_scan = delim_join->Cast<op::sirius_physical_delim_join>().join->children[0].get();
+          auto column_data_scan =
+            delim_join->Cast<op::sirius_physical_delim_join>().join->children[0].get();
           SIRIUS_LOG_DEBUG("  Column Data Scan next operators:");
           for (auto& next_port : column_data_scan->get_next_port_after_sink()) {
-            SIRIUS_LOG_DEBUG("    Next Op: {}, Port: '{}' Repo:'{}'", 
-              next_port.first->get_name(), 
-              next_port.second.data(), 
-              static_cast<void*>(next_port.first->get_port(next_port.second)->repo));
+            SIRIUS_LOG_DEBUG("    Next Op: {}, Port: '{}' Repo:'{}'",
+                             next_port.first->get_name(),
+                             next_port.second.data(),
+                             static_cast<void*>(next_port.first->get_port(next_port.second)->repo));
           }
         }
       }
-      
+
       SIRIUS_LOG_DEBUG("");  // Blank line between pipelines
     }
     SIRIUS_LOG_DEBUG("=== END DETAILED PIPELINE DEBUG INFO ===\n");
-    
+
     // Flush immediately to ensure all debug output is written synchronously
     // spdlog::default_logger()->flush();
 

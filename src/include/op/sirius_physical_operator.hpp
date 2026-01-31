@@ -16,8 +16,6 @@
 
 #pragma once
 
-#include <atomic>
-
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/common.hpp"
 #include "duckdb/common/enums/operator_result_type.hpp"
@@ -34,6 +32,8 @@
 
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
+
+#include <atomic>
 
 namespace sirius {
 
