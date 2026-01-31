@@ -16,9 +16,19 @@
 
 #pragma once
 
-// sirius
-#include <op/scan/duckdb_scan_task_queue.hpp>
-#include <parallel/task_executor.hpp>
+#include "exec/config.hpp"
+#include "exec/interruptible_mpmc.hpp"
+#include "exec/kiosk.hpp"
+#include "exec/thread_pool.hpp"
+#include "parallel/task.hpp"
+
+#include <atomic>
+#include <memory>
+#include <thread>
+
+namespace sirius::pipeline {
+class pipeline_executor;
+}  // namespace sirius::pipeline
 
 namespace sirius::op::scan {
 
@@ -29,38 +39,62 @@ namespace sirius::op::scan {
 /**
  * @brief A task executor for duckdb scan tasks.
  *
- * This class extends the generic itask_executor simply by instantiating it with a
- * duckdb_scan_task_queue.
- *
+ * This class manages a pool of threads dedicated to executing DuckDB scan
+ * tasks with kiosk-based concurrency control.
  */
-class duckdb_scan_executor : public sirius::parallel::itask_executor {
+class duckdb_scan_executor {
  public:
-  //===----------Constructor----------===//
-  explicit duckdb_scan_executor(sirius::parallel::task_executor_config config)
-    : sirius::parallel::itask_executor(std::make_unique<duckdb_scan_task_queue>(config.num_threads),
-                                       config)
-  {
-  }
+  /**
+   * @brief Constructs a new duckdb_scan_executor with task execution configuration
+   *
+   * @param config Configuration for the thread pool (thread count, etc.)
+   */
+  explicit duckdb_scan_executor(exec::thread_pool_config config);
 
-  //===----------Methods----------===//
+  /**
+   * @brief Destructor for the duckdb_scan_executor.
+   */
+  ~duckdb_scan_executor() = default;
+
+  // Non-copyable and non-movable
+  duckdb_scan_executor(const duckdb_scan_executor&)            = delete;
+  duckdb_scan_executor& operator=(const duckdb_scan_executor&) = delete;
+  duckdb_scan_executor(duckdb_scan_executor&&)                 = delete;
+  duckdb_scan_executor& operator=(duckdb_scan_executor&&)      = delete;
+
   /**
    * @brief Schedule a new task for execution.
    *
    * @param task The task to be scheduled.
    */
-  void schedule(std::unique_ptr<sirius::parallel::itask> task) override;
+  void schedule(std::unique_ptr<sirius::parallel::itask> task);
+
+  /**
+   * @brief Starts the executor and initializes worker threads
+   *
+   * Initializes the thread pool and begins accepting tasks for execution.
+   */
+  void start();
+
+  /**
+   * @brief Stops the executor and cleanly shuts down worker threads
+   *
+   * Stops accepting new tasks and waits for all worker threads to complete
+   * their current tasks before shutting down.
+   */
+  void stop();
 
   /**
    * @brief Wait for all scheduled tasks to complete.
    */
-  void wait();
+  void wait_all();
 
   /**
-   * @brief Worker thread loop.
+   * @brief Set the pipeline executor reference
    *
-   * @param worker_id The ID of the worker thread.
+   * @param pipeline_exec Reference to the pipeline executor
    */
-  void worker_loop(int32_t worker_id) override;
+  void set_pipeline_executor(sirius::pipeline::pipeline_executor& pipeline_exec);
 
   /**
    * @brief Get the number of threads in the thread pool for this executor.
@@ -69,12 +103,24 @@ class duckdb_scan_executor : public sirius::parallel::itask_executor {
    */
   [[nodiscard]] int32_t get_num_threads() const { return _config.num_threads; }
 
-  //===----------Fields----------===//
  private:
-  std::atomic<uint64_t> _total_tasks    = 0;  ///< The total number of scheduled tasks
-  std::atomic<uint64_t> _finished_tasks = 0;  ///< The total number of finished tasks
-  std::mutex _finish_mutex;                   ///< Mutex to protect condition variable
-  std::condition_variable _finish_cv;         ///< Condition variable to signal task completion
+  /**
+   * @brief Manager loop to consume tasks from queue and dispatch to the thread pool
+   */
+  void manager_loop();
+
+  /**
+   * @brief Submit a scan task request to pipeline_executor
+   */
+  void submit_scan_request();
+
+  std::atomic<bool> _running{false};
+  exec::thread_pool_config _config;
+  exec::kiosk _kiosk;
+  std::unique_ptr<exec::thread_pool> _thread_pool;
+  exec::interruptible_mpmc<std::unique_ptr<sirius::parallel::itask>> _task_queue;
+  std::thread _manager_thread;
+  sirius::pipeline::pipeline_executor* _pipeline_exec{nullptr};
 };
 
 }  // namespace sirius::op::scan

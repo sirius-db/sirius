@@ -16,6 +16,7 @@
 
 #include "catch.hpp"
 #include "creator/task_creator.hpp"
+#include "exec/config.hpp"
 #include "gpu_context.hpp"
 #include "op/scan/duckdb_scan_executor.hpp"
 #include "op/sirius_physical_operator.hpp"
@@ -36,6 +37,7 @@
 #include <vector>
 
 using namespace sirius::creator;
+using namespace sirius::exec;
 using namespace sirius::parallel;
 using namespace sirius::pipeline;
 using namespace sirius::op::scan;
@@ -251,7 +253,7 @@ class test_fixture {
       }()),
       gpu_executor_config{1, false},
       pipeline_exec(gpu_executor_config, *memory_manager),
-      scan_exec(task_executor_config{2, false}),
+      scan_exec(exec::thread_pool_config{.num_threads = 2}),
       empty_pipelines(),
       pipeline_map(empty_pipelines)
   {

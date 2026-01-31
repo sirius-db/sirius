@@ -100,11 +100,12 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   data_repository_manager_ = std::make_unique<cucascade::shared_data_repository_manager>();
 
   duckdb_scan_executor_ = std::make_unique<sirius::op::scan::duckdb_scan_executor>(
-    sirius::parallel::task_executor_config{});
+    config_.get_duckdb_scan_executor_config());
 
   pipeline_executor_ = std::make_unique<sirius::pipeline::pipeline_executor>(
     sirius::parallel::task_executor_config{}, *memory_manager_, &config_.get_hw_topology());
   pipeline_executor_->set_scan_executor(*duckdb_scan_executor_);
+  duckdb_scan_executor_->set_pipeline_executor(*pipeline_executor_);
 
   downgrade_executor_ = std::make_unique<sirius::parallel::downgrade_executor>(
     sirius::parallel::task_executor_config{}, *data_repository_manager_);

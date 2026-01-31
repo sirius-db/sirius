@@ -21,6 +21,7 @@
 // sirius
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
+#include <exec/config.hpp>
 #include <op/scan/duckdb_scan_executor.hpp>
 #include <op/scan/duckdb_scan_task.hpp>
 #include <op/sirius_physical_duckdb_scan.hpp>
@@ -339,7 +340,7 @@ static void run_scan_test(std::string const& table_name,
   REQUIRE(physical_scan);
 
   // Create scan executor (task scheduler)
-  op::scan::duckdb_scan_executor scan_executor({num_threads, false});
+  op::scan::duckdb_scan_executor scan_executor({.num_threads = num_threads});
 
   // Create execution context using dummy query
   auto dummy_query = "SELECT * FROM " + table_name + " LIMIT 0";
@@ -372,7 +373,7 @@ static void run_scan_test(std::string const& table_name,
       static_cast<uint64_t>(i + 1), &data_repo, std::move(local_state), global_state);
     scan_executor.schedule(std::move(task));
   }
-  scan_executor.wait();
+  scan_executor.wait_all();
   scan_executor.stop();
   const auto scan_end = std::chrono::steady_clock::now();
   const auto elapsed_ms =
