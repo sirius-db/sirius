@@ -132,7 +132,8 @@ class pipeline_executor {
  private:
   void management_eventloop();
 
-  exec::interruptible_mpmc<std::unique_ptr<sirius::parallel::itask>> _task_queue;
+  exec::interruptible_mpmc<std::unique_ptr<sirius::parallel::itask>> _task_queue;      ///< Queue for GPU pipeline tasks
+  exec::interruptible_mpmc<std::unique_ptr<sirius::parallel::itask>> _scan_queue;      ///< Queue for scan tasks
 
   exec::interruptible_mpmc<std::unique_ptr<task_request>> _task_request_queue;
   std::thread _management_thread;

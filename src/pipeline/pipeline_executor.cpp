@@ -22,6 +22,7 @@
 #include "log/logging.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/scan/duckdb_scan_executor.hpp"
+#include "op/scan/duckdb_scan_task.hpp"
 #include "pipeline/pipeline_queue.hpp"
 
 #include <cucascade/memory/common.hpp>
@@ -58,7 +59,11 @@ pipeline_executor::pipeline_executor(const parallel::task_executor_config& gpu_t
 
 void pipeline_executor::schedule(std::unique_ptr<sirius::parallel::itask> task)
 {
-  _task_queue.push(std::move(task));
+  if (task->is<sirius::op::scan::duckdb_scan_task>()) {
+    _scan_queue.push(std::move(task));
+  } else {
+    _task_queue.push(std::move(task));
+  }
 }
 
 void pipeline_executor::start()
@@ -75,6 +80,7 @@ void pipeline_executor::stop()
   bool expected = true;
   if (!_running.compare_exchange_strong(expected, false)) { return; }
   _task_queue.interrupt();
+  _scan_queue.interrupt();
   _task_request_queue.interrupt();
   // Stop all GPU executors
   for (auto& [device_id, gpu_exec] : _gpu_executors) {
@@ -118,20 +124,25 @@ void pipeline_executor::management_eventloop()
       SIRIUS_LOG_INFO("Task request queue closed, exiting management event loop.");
       break;
     }
-    auto task = _task_queue.pop();
-    if (task == nullptr) {
-      SIRIUS_LOG_INFO("Task queue closed, exiting management event loop.");
-      break;
-    }
     if (request->is_scan) {
-      // Dispatch scan task to the scan executor
+      // Pop from scan queue and dispatch to scan executor
+      auto task = _scan_queue.pop();
+      if (task == nullptr) {
+        SIRIUS_LOG_INFO("Scan queue closed, exiting management event loop.");
+        break;
+      }
       if (_scan_executor) {
         _scan_executor->schedule(std::move(task));
       } else {
         SIRIUS_LOG_ERROR("Scan executor not set, cannot dispatch scan task.");
       }
     } else {
-      // Dispatch GPU pipeline task to the appropriate GPU executor
+      // Pop from task queue and dispatch to GPU executor
+      auto task = _task_queue.pop();
+      if (task == nullptr) {
+        SIRIUS_LOG_INFO("Task queue closed, exiting management event loop.");
+        break;
+      }
       dispatch_to_gpu_executor(std::move(task), request->device_id);
     }
   }
