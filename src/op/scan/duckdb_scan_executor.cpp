@@ -16,8 +16,10 @@
 
 #include "op/scan/duckdb_scan_executor.hpp"
 
+#include "creator/task_creator.hpp"
 #include "log/logging.hpp"
 #include "op/scan/duckdb_scan_task.hpp"
+#include "op/sirius_physical_operator.hpp"
 #include "pipeline/sirius_pipeline_itask_local_state.hpp"
 
 #include <cucascade/memory/common.hpp>
@@ -62,6 +64,11 @@ void duckdb_scan_executor::stop()
 
 void duckdb_scan_executor::wait_all() { _kiosk.wait_all(); }
 
+void duckdb_scan_executor::set_task_creator(sirius::creator::task_creator& task_creator)
+{
+  _task_creator = &task_creator;
+}
+
 void duckdb_scan_executor::submit_scan_request()
 {
   // Device ID 0 for scan tasks (CPU-based), is_scan = true
@@ -77,21 +84,22 @@ void duckdb_scan_executor::manager_loop()
       SIRIUS_LOG_INFO("DuckDB Scan Executor: Kiosk interrupted, stopping manager loop");
       break;
     }
-    auto scan_task = _task_queue.try_pop();
-    if (!scan_task && !_running) {
+    auto task = _task_queue.try_pop();
+    if (!task && !_running) {
       SIRIUS_LOG_INFO("DuckDB Scan Executor: task queue interrupted, stopping manager loop");
       break;
     }
     submit_scan_request();  // tell pipeline executor to submit a scan task request
-    scan_task = _task_queue.pop();
-    if (!scan_task) {
+    task = _task_queue.pop();
+    if (!task) {
       SIRIUS_LOG_INFO("DuckDB Scan Executor: task queue interrupted, stopping manager loop");
       break;
     }
 
+    std::vector<sirius_physical_operator*> output_consumers;
     // Make host memory reservation and set it on the local state
-    if (auto* pipeline_task = dynamic_cast<sirius::op::scan::duckdb_scan_task*>(scan_task.get())) {
-      auto bytes_needed = pipeline_task->get_estimated_reservation_size();
+    if (auto* scan_task = dynamic_cast<sirius::op::scan::duckdb_scan_task*>(task.get())) {
+      auto bytes_needed = scan_task->get_estimated_reservation_size();
       auto reservation  = _mem_mgr->request_reservation(
         cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::HOST}, bytes_needed);
       if (!reservation) {
@@ -99,16 +107,25 @@ void duckdb_scan_executor::manager_loop()
         break;
       }
       if (auto* local_state = dynamic_cast<sirius::pipeline::sirius_pipeline_itask_local_state*>(
-            pipeline_task->local_state())) {
+            scan_task->local_state())) {
         local_state->set_reservation(std::move(reservation));
       } else {
         SIRIUS_LOG_ERROR("DuckDB Scan Executor: Failed to cast local state for task");
         break;
       }
+      output_consumers = scan_task->get_output_consumers();
     }
 
-    _thread_pool->schedule(
-      [task = std::move(scan_task), ticket = std::move(ticket)]() mutable { task->execute(); });
+    _thread_pool->schedule([this,
+                            t         = std::move(task),
+                            ticket    = std::move(ticket),
+                            consumers = std::move(output_consumers)]() mutable {
+      t->execute();
+      t.reset();
+      for (auto* consumer : consumers) {
+        _task_creator->schedule(consumer);
+      }
+    });
   }
 }
 
