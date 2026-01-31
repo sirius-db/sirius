@@ -25,6 +25,7 @@
 #include "duckdb/storage/data_table.hpp"
 #include "log/logging.hpp"
 #include "op/sirius_physical_order.hpp"
+#include "op/sirius_physical_top_n_merge.hpp"
 #include "utils.hpp"
 
 #include <cudf/column/column_factories.hpp>
@@ -130,7 +131,7 @@ sirius_physical_top_n::sirius_physical_top_n(
   duckdb::shared_ptr<duckdb::DynamicFilterData> dynamic_filter_p,
   duckdb::idx_t estimated_cardinality)
   : sirius_physical_operator(
-      duckdb::PhysicalOperatorType::TOP_N, std::move(types_p), estimated_cardinality),
+      SiriusPhysicalOperatorType::TOP_N, std::move(types_p), estimated_cardinality),
     orders(std::move(orders)),
     limit(limit),
     offset(offset),
@@ -173,6 +174,29 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_top_n::execu
   return outputs;
 }
 
+static duckdb::vector<duckdb::BoundOrderByNode> copy_orders(
+  const duckdb::vector<duckdb::BoundOrderByNode>& src)
+{
+  duckdb::vector<duckdb::BoundOrderByNode> result;
+  result.reserve(src.size());
+  for (const auto& order : src) {
+    result.push_back(order.Copy());
+  }
+  return result;
+}
+
+sirius_physical_top_n_merge::sirius_physical_top_n_merge(sirius_physical_top_n* top_n)
+  : sirius_physical_top_n_merge(
+      top_n->types,                // copied by value
+      copy_orders(top_n->orders),  // deep copy
+      top_n->limit,                // primitive
+      top_n->offset,               // primitive
+      top_n->dynamic_filter,       // shared_ptr - shares ownership (reference count increases)
+      top_n->estimated_cardinality)
+{
+  child_op = top_n;
+}
+
 sirius_physical_top_n_merge::sirius_physical_top_n_merge(
   duckdb::vector<duckdb::LogicalType> types_p,
   duckdb::vector<duckdb::BoundOrderByNode> orders,
@@ -181,15 +205,13 @@ sirius_physical_top_n_merge::sirius_physical_top_n_merge(
   duckdb::shared_ptr<duckdb::DynamicFilterData> dynamic_filter_p,
   duckdb::idx_t estimated_cardinality)
   : sirius_physical_operator(
-      duckdb::PhysicalOperatorType::EXTENSION, std::move(types_p), estimated_cardinality),
+      SiriusPhysicalOperatorType::MERGE_TOP_N, std::move(types_p), estimated_cardinality),
     orders(std::move(orders)),
     limit(limit),
     offset(offset),
     dynamic_filter(std::move(dynamic_filter_p))
 {
 }
-
-sirius_physical_top_n_merge::~sirius_physical_top_n_merge() {}
 
 std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_top_n_merge::execute(
   const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches)

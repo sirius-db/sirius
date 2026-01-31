@@ -22,17 +22,21 @@
 #include "duckdb/execution/operator/aggregate/grouped_aggregate_data.hpp"
 #include "duckdb/parser/group_by_node.hpp"
 #include "op/sirius_physical_operator.hpp"
+#include "op/sirius_physical_ungrouped_aggregate.hpp"
 
 namespace sirius {
 namespace op {
 
-class sirius_physical_ungrouped_aggregate : public sirius_physical_operator {
+class sirius_physical_ungrouped_aggregate_merge : public sirius_physical_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE =
-    SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE;
+    SiriusPhysicalOperatorType::MERGE_AGGREGATE;
 
  public:
-  sirius_physical_ungrouped_aggregate(
+  sirius_physical_ungrouped_aggregate_merge(
+    sirius_physical_ungrouped_aggregate* ungrouped_aggregate);
+
+  sirius_physical_ungrouped_aggregate_merge(
     duckdb::vector<duckdb::LogicalType> types,
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> select_list,
     duckdb::idx_t estimated_cardinality,
@@ -43,10 +47,14 @@ class sirius_physical_ungrouped_aggregate : public sirius_physical_operator {
   duckdb::unique_ptr<duckdb::DistinctAggregateData> distinct_data;
   duckdb::unique_ptr<duckdb::DistinctAggregateCollectionInfo> distinct_collection_info;
 
+  sirius_physical_operator* child_op;
+  sirius_physical_operator* get_child_op() const { return child_op; }
+
   bool is_source() const override { return true; }
 
  public:
   bool is_sink() const override { return true; }
+
   std::vector<std::shared_ptr<cucascade::data_batch>> execute(
     const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches) override;
 };

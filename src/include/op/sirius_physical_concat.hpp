@@ -29,11 +29,12 @@ namespace op {
 
 class sirius_physical_concat : public sirius_physical_operator {
  public:
-  static constexpr const duckdb::PhysicalOperatorType TYPE =
-    duckdb::PhysicalOperatorType::EXTENSION;
+  static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::CONCAT;
 
   explicit sirius_physical_concat(duckdb::vector<duckdb::LogicalType> types,
-                                  duckdb::idx_t estimated_cardinality);
+                                  duckdb::idx_t estimated_cardinality,
+                                  sirius_physical_operator* parent_op,
+                                  bool is_build);
 
   std::string get_name() const override;
 
@@ -41,9 +42,16 @@ class sirius_physical_concat : public sirius_physical_operator {
 
   bool is_sink() const override;
 
+  bool is_build_concat();
+
+  //! Get the parent operator (e.g., HASH_JOIN for build concat)
+  sirius_physical_operator* get_parent_op() const { return _parent_op; }
+
  private:
   duckdb::vector<duckdb::idx_t> _partition_keys;
   duckdb::idx_t _num_partitions;
+  sirius_physical_operator* _parent_op;
+  bool _is_build;
 };
 
 }  // namespace op

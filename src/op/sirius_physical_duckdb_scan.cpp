@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "op/sirius_physical_table_scan.hpp"
+#include "op/sirius_physical_duckdb_scan.hpp"
 
 #include "config.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
@@ -30,13 +30,35 @@
 namespace sirius {
 namespace op {
 
-uint64_t get_chunk_data_byte_size(duckdb::LogicalType type, duckdb::idx_t cardinality)
+// Helper function to deep copy ExtraOperatorInfo
+duckdb::ExtraOperatorInfo copy_extra_info(const duckdb::ExtraOperatorInfo& src)
 {
-  auto physical_size = duckdb::GetTypeIdSize(type.InternalType());
-  return cardinality * physical_size;
+  duckdb::ExtraOperatorInfo copy;
+  copy.file_filters = src.file_filters;
+  if (src.total_files.IsValid()) { copy.total_files = src.total_files.GetIndex(); }
+  if (src.filtered_files.IsValid()) { copy.filtered_files = src.filtered_files.GetIndex(); }
+  if (src.sample_options) { copy.sample_options = src.sample_options->Copy(); }
+  return copy;
 }
 
-sirius_physical_table_scan::sirius_physical_table_scan(
+sirius_physical_duckdb_scan::sirius_physical_duckdb_scan(sirius_physical_table_scan* table_scan)
+  : sirius_physical_duckdb_scan(
+      table_scan->types,
+      table_scan->function,
+      table_scan->bind_data ? table_scan->bind_data->Copy() : nullptr,
+      table_scan->returned_types,
+      table_scan->column_ids,
+      table_scan->projection_ids,
+      table_scan->names,
+      table_scan->table_filters ? table_scan->table_filters->Copy() : nullptr,
+      table_scan->estimated_cardinality,
+      copy_extra_info(table_scan->extra_info),
+      table_scan->parameters,
+      table_scan->virtual_columns)
+{
+}
+
+sirius_physical_duckdb_scan::sirius_physical_duckdb_scan(
   duckdb::vector<duckdb::LogicalType> types,
   duckdb::TableFunction function_p,
   duckdb::unique_ptr<duckdb::FunctionData> bind_data_p,
@@ -50,7 +72,7 @@ sirius_physical_table_scan::sirius_physical_table_scan(
   duckdb::vector<duckdb::Value> parameters_p,
   duckdb::virtual_column_map_t virtual_columns_p)
   : sirius_physical_operator(
-      SiriusPhysicalOperatorType::TABLE_SCAN, std::move(types), estimated_cardinality),
+      SiriusPhysicalOperatorType::DUCKDB_SCAN, std::move(types), estimated_cardinality),
     function(std::move(function_p)),
     bind_data(std::move(bind_data_p)),
     returned_types(std::move(returned_types_p)),
@@ -64,12 +86,7 @@ sirius_physical_table_scan::sirius_physical_table_scan(
     gen_row_id_column(column_ids.back().GetPrimaryIndex() == duckdb::DConstants::INVALID_INDEX)
 {
   auto num_cols = column_ids.size() - gen_row_id_column;
-  // duckdb::GPUBufferManager* gpuBufferManager = &(duckdb::GPUBufferManager::GetInstance());
-  // column_size = gpuBufferManager->customCudaHostAlloc<uint64_t>(column_ids.size());
-  // mask_size   = gpuBufferManager->customCudaHostAlloc<uint64_t>(column_ids.size());
   for (int col = 0; col < num_cols; col++) {
-    // column_size[col] = 0;
-    // mask_size[col]   = 0;
     scanned_types.push_back(returned_types[column_ids[col].GetPrimaryIndex()]);
     scanned_ids.push_back(col);
   }
@@ -79,14 +96,6 @@ sirius_physical_table_scan::sirius_physical_table_scan(
   }
 
   fake_table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
-  // already_cached     = gpuBufferManager->customCudaHostAlloc<bool>(column_ids.size());
-  // if (Config::USE_OPT_TABLE_SCAN) {
-  //   num_rows = 0;
-  //   cuda_streams.resize(Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS);
-  //   for (int i = 0; i < Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS; i++) {
-  //     cudaStreamCreate(&cuda_streams[i]);
-  //   }
-  // }
   SIRIUS_LOG_DEBUG("Table scan column ids: {}", column_ids.size());
 }
 

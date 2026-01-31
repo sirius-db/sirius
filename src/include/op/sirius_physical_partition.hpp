@@ -31,8 +31,7 @@ namespace op {
 
 class sirius_physical_partition : public sirius_physical_operator {
  public:
-  static constexpr const duckdb::PhysicalOperatorType TYPE =
-    duckdb::PhysicalOperatorType::EXTENSION;
+  static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::PARTITION;
 
   explicit sirius_physical_partition(duckdb::vector<duckdb::LogicalType> types,
                                      duckdb::idx_t estimated_cardinality,

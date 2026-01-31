@@ -46,7 +46,7 @@ duckdb::OrderPreservationType sirius_physical_plan_generator::order_preservation
   duckdb::idx_t child_idx = 0;
   for (auto& child : op.children) {
     // Do not take the materialization phase of physical CTEs into account
-    if (op.type == duckdb::PhysicalOperatorType::CTE && child_idx == 0) {
+    if (op.type == sirius::op::SiriusPhysicalOperatorType::CTE && child_idx == 0) {
       child_idx++;
       continue;
     }

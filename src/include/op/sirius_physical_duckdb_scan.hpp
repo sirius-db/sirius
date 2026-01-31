@@ -22,54 +22,32 @@
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "op/sirius_physical_operator.hpp"
+#include "op/sirius_physical_table_scan.hpp"
 
 namespace sirius {
 namespace op {
 
-enum scan_data_type {
-  INT16,
-  INT32,
-  INT64,
-  FLOAT32,
-  FLOAT64,
-  BOOLEAN,
-  DATE,
-  VARCHAR,
-  DECIMAL32,
-  DECIMAL64,
-  SQLNULL
-};
-
-enum compare_type {
-  EQUAL,
-  NOTEQUAL,
-  GREATERTHAN,
-  GREATERTHANOREQUALTO,
-  LESSTHAN,
-  LESSTHANOREQUALTO,
-  IS_NULL,
-  IS_NOT_NULL
-};
-
-class sirius_physical_table_scan : public sirius_physical_operator {
+class sirius_physical_duckdb_scan : public sirius_physical_operator {
  public:
-  static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::TABLE_SCAN;
+  static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::DUCKDB_SCAN;
 
  public:
+  sirius_physical_duckdb_scan(sirius_physical_table_scan* table_scan);
+
   //! Table scan that immediately projects out filter columns that are unused in the remainder of
   //! the query plan
-  sirius_physical_table_scan(duckdb::vector<duckdb::LogicalType> types,
-                             duckdb::TableFunction function,
-                             duckdb::unique_ptr<duckdb::FunctionData> bind_data,
-                             duckdb::vector<duckdb::LogicalType> returned_types,
-                             duckdb::vector<duckdb::ColumnIndex> column_ids,
-                             duckdb::vector<duckdb::idx_t> projection_ids,
-                             duckdb::vector<std::string> names,
-                             duckdb::unique_ptr<duckdb::TableFilterSet> table_filters,
-                             duckdb::idx_t estimated_cardinality,
-                             duckdb::ExtraOperatorInfo extra_info,
-                             duckdb::vector<duckdb::Value> parameters,
-                             duckdb::virtual_column_map_t virtual_columns);
+  sirius_physical_duckdb_scan(duckdb::vector<duckdb::LogicalType> types,
+                              duckdb::TableFunction function,
+                              duckdb::unique_ptr<duckdb::FunctionData> bind_data,
+                              duckdb::vector<duckdb::LogicalType> returned_types,
+                              duckdb::vector<duckdb::ColumnIndex> column_ids,
+                              duckdb::vector<duckdb::idx_t> projection_ids,
+                              duckdb::vector<std::string> names,
+                              duckdb::unique_ptr<duckdb::TableFilterSet> table_filters,
+                              duckdb::idx_t estimated_cardinality,
+                              duckdb::ExtraOperatorInfo extra_info,
+                              duckdb::vector<duckdb::Value> parameters,
+                              duckdb::virtual_column_map_t virtual_columns);
 
   //! The table function
   duckdb::TableFunction function;

@@ -32,7 +32,7 @@ sirius_physical_partition::sirius_physical_partition(duckdb::vector<duckdb::Logi
                                                      sirius_physical_operator* parent_op,
                                                      bool is_build)
   : sirius_physical_operator(
-      duckdb::PhysicalOperatorType::EXTENSION, std::move(types), estimated_cardinality)
+      SiriusPhysicalOperatorType::PARTITION, std::move(types), estimated_cardinality)
 {
   _num_partitions = (estimated_cardinality + PARTITION_SIZE - 1) / PARTITION_SIZE;
   _parent_op      = parent_op;
@@ -49,7 +49,7 @@ bool sirius_physical_partition::is_sink() const { return true; }
 void sirius_physical_partition::get_partition_keys(sirius_physical_operator* op, bool is_build)
 {
   _partition_keys.clear();
-  if (op->type == duckdb::PhysicalOperatorType::HASH_JOIN) {
+  if (op->type == SiriusPhysicalOperatorType::HASH_JOIN) {
     auto& hash_join_op = op->Cast<sirius_physical_hash_join>();
     if (is_build) {
       for (duckdb::idx_t cond_idx = 0; cond_idx < hash_join_op.conditions.size(); cond_idx++) {
@@ -67,7 +67,7 @@ void sirius_physical_partition::get_partition_keys(sirius_physical_operator* op,
         }
       }
     }
-  } else if (op->type == duckdb::PhysicalOperatorType::HASH_GROUP_BY) {
+  } else if (op->type == SiriusPhysicalOperatorType::HASH_GROUP_BY) {
     auto& grouped_aggregate_op = op->Cast<sirius_physical_grouped_aggregate>();
     for (duckdb::idx_t i = 0; i < grouped_aggregate_op.groupings.size(); i++) {
       auto& grouping = grouped_aggregate_op.groupings[i];
@@ -78,7 +78,7 @@ void sirius_physical_partition::get_partition_keys(sirius_physical_operator* op,
         }
       }
     }
-  } else if (op->type == duckdb::PhysicalOperatorType::ORDER_BY) {
+  } else if (op->type == SiriusPhysicalOperatorType::ORDER_BY) {
     auto& order_by_op = op->Cast<sirius_physical_order>();
     for (size_t order_idx = 0; order_idx < order_by_op.orders.size(); order_idx++) {
       auto& expr = order_by_op.orders[order_idx].expression;

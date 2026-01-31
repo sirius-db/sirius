@@ -25,10 +25,7 @@
 #include "gpu_buffer_manager.hpp"
 #include "gpu_meta_pipeline.hpp"
 #include "gpu_pipeline.hpp"
-#include "op/sirius_physical_operator.hpp"
 #include "operator/gpu_physical_result_collector.hpp"
-#include "pipeline/sirius_meta_pipeline.hpp"
-#include "pipeline/sirius_pipeline.hpp"
 
 #include <cucascade/data/data_repository_manager.hpp>
 namespace duckdb {
@@ -39,8 +36,6 @@ class GPUContext;
 class GPUExecutor {
   friend class GPUPipeline;
   friend class GPUPipelineBuildState;
-  friend class ::sirius::pipeline::sirius_pipeline;
-  friend class ::sirius::pipeline::sirius_meta_pipeline;
 
  public:
   explicit GPUExecutor(ClientContext& context, GPUContext& gpu_context)
@@ -56,49 +51,25 @@ class GPUExecutor {
   GPUContext& gpu_context;
   optional_ptr<GPUPhysicalOperator> gpu_physical_plan;
   unique_ptr<GPUPhysicalOperator> gpu_owned_plan;
-  unique_ptr<::sirius::op::sirius_physical_operator> sirius_owned_plan;
-  optional_ptr<::sirius::op::sirius_physical_operator> sirius_physical_plan;
 
   //! All pipelines of the query plan
   vector<shared_ptr<GPUPipeline>> pipelines;
   //! The root pipelines of the query
   vector<shared_ptr<GPUPipeline>> root_pipelines;
-  //! All pipelines of the query plan
-  vector<shared_ptr<::sirius::pipeline::sirius_pipeline>> sirius_pipelines;
-  //! The root pipelines of the query
-  vector<shared_ptr<::sirius::pipeline::sirius_pipeline>> sirius_root_pipelines;
   //! The scheduled pipelines
   vector<shared_ptr<GPUPipeline>> scheduled;
-  //! The scheduled pipelines
-  vector<shared_ptr<::sirius::pipeline::sirius_pipeline>> sirius_scheduled;
   //! The recursive CTE's in this query plan
   vector<reference<GPUPhysicalOperator>> recursive_ctes;
-  //! Storage for pipeline breaker created during pipeline splitting
-  vector<unique_ptr<::sirius::op::sirius_physical_operator>> new_pipeline_breakers;
-  //! Storage for concatenated operators during pipeline splitting
-  vector<unique_ptr<::sirius::op::sirius_physical_operator>> concat_ops;
-  //! Map from operator pointer to unique ID for data_repository_manager
-  std::unordered_map<const ::sirius::op::sirius_physical_operator*, size_t> operator_to_id;
   //! Mutex for thread-safe access to operator_to_id map
   std::mutex operator_id_mutex;
   //! Counter for generating unique operator IDs
   std::atomic<size_t> next_operator_id{0};
-  //! Get or create a unique ID for an operator
-  size_t get_operator_id(const ::sirius::op::sirius_physical_operator* op);
   //! The current root pipeline index
   idx_t root_pipeline_idx;
   //! The amount of completed pipelines of the query
   atomic<idx_t> completed_pipelines;
   //! The total amount of pipelines in the query
   idx_t total_pipelines;
-  //! Inserting repository
-  void insert_repository(std::string_view port_id,
-                         shared_ptr<::sirius::pipeline::sirius_pipeline> input_pipeline,
-                         shared_ptr<::sirius::pipeline::sirius_pipeline> dependent_pipeline);
-  void insert_repository(std::string_view port_id,
-                         ::sirius::op::sirius_physical_operator* cur_op,
-                         shared_ptr<::sirius::pipeline::sirius_pipeline> input_pipeline,
-                         shared_ptr<::sirius::pipeline::sirius_pipeline> dependent_pipeline);
 
   //! Whether or not the root of the pipeline is a result collector object
   bool HasResultCollector();
@@ -108,16 +79,10 @@ class GPUExecutor {
 
   void Initialize(unique_ptr<GPUPhysicalOperator> physical_plan);
   void InitializeInternal(GPUPhysicalOperator& physical_result_collector);
-  void initialize(unique_ptr<::sirius::op::sirius_physical_operator> physical_plan);
-  void initialize_internal(::sirius::op::sirius_physical_operator& physical_result_collector);
   void Execute();
   void Reset();
   shared_ptr<GPUPipeline> CreateChildPipeline(GPUPipeline& current, GPUPhysicalOperator& op);
-  shared_ptr<::sirius::pipeline::sirius_pipeline> create_child_pipeline(
-    ::sirius::pipeline::sirius_pipeline& current, ::sirius::op::sirius_physical_operator& op);
   Executor* executor;
-  vector<shared_ptr<::sirius::pipeline::sirius_pipeline>> new_scheduled;
-  std::unique_ptr<::cucascade::shared_data_repository_manager> data_repo_manager;
 
   //! Convert the DuckDB physical plan to a GPU physical plan
 };

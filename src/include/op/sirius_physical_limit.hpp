@@ -26,8 +26,8 @@ namespace op {
 
 class sirius_physical_streaming_limit : public sirius_physical_operator {
  public:
-  static constexpr const duckdb::PhysicalOperatorType TYPE =
-    duckdb::PhysicalOperatorType::STREAMING_LIMIT;
+  static constexpr const SiriusPhysicalOperatorType TYPE =
+    SiriusPhysicalOperatorType::STREAMING_LIMIT;
 
  public:
   sirius_physical_streaming_limit(duckdb::vector<duckdb::LogicalType> types,

@@ -20,11 +20,9 @@
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 
-namespace duckdb {
-class GPUExecutor;
-}  // namespace duckdb
-
 namespace sirius {
+
+class sirius_engine;
 
 namespace op {
 class sirius_physical_operator;
@@ -55,13 +53,13 @@ class sirius_meta_pipeline : public duckdb::enable_shared_from_this<sirius_meta_
   //!         * And all pipelines that were added to the sirius_meta_pipeline after 'current'
  public:
   //! Create a sirius_meta_pipeline with the given sink
-  sirius_meta_pipeline(duckdb::GPUExecutor& gpu_executor,
+  sirius_meta_pipeline(sirius_engine& engine,
                        sirius_pipeline_build_state& state,
                        duckdb::optional_ptr<op::sirius_physical_operator> sink);
 
  public:
   //! Get the gpu_executor for this sirius_meta_pipeline
-  duckdb::GPUExecutor& get_executor() const;
+  sirius_engine& get_engine() const;
   //! Get the pipeline_build_state for this sirius_meta_pipeline
   sirius_pipeline_build_state& get_state() const;
   //! Get the sink operator for this sirius_meta_pipeline
@@ -128,7 +126,7 @@ class sirius_meta_pipeline : public duckdb::enable_shared_from_this<sirius_meta_
 
  private:
   //! The executor for all MetaPipelines in the query plan
-  duckdb::GPUExecutor& executor;
+  sirius_engine& engine;
   //! The pipeline_build_state for all MetaPipelines in the query plan
   sirius_pipeline_build_state& state;
   //! Parent pipeline (optional)

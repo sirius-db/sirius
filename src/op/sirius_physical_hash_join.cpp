@@ -72,7 +72,7 @@ sirius_physical_hash_join::sirius_physical_hash_join(
   duckdb::idx_t estimated_cardinality,
   duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> pushdown_info_p)
   : sirius_physical_operator(
-      duckdb::PhysicalOperatorType::HASH_JOIN, op.types, estimated_cardinality),
+      SiriusPhysicalOperatorType::HASH_JOIN, op.types, estimated_cardinality),
     join_type(join_type),
     conditions(std::move(cond)),
     delim_types(std::move(delim_types))
@@ -192,11 +192,11 @@ void sirius_physical_hash_join::build_join_pipelines(pipeline::sirius_pipeline& 
   // }
 
   switch (op.type) {
-    case duckdb::PhysicalOperatorType::POSITIONAL_JOIN:
+    case SiriusPhysicalOperatorType::POSITIONAL_JOIN:
       throw duckdb::NotImplementedException("POSITIONAL_JOIN is not implemented yet");
       meta_pipeline.create_child_pipeline(current, op, last_pipeline);
       return;
-    case duckdb::PhysicalOperatorType::CROSS_PRODUCT:
+    case SiriusPhysicalOperatorType::CROSS_PRODUCT:
       throw duckdb::NotImplementedException("CROSS_PRODUCT is not implemented yet");
       return;
     default: break;

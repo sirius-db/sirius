@@ -26,7 +26,6 @@
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/main/client_context_state.hpp>
 #include <duckdb/planner/extension_callback.hpp>
-#include <spdlog/logger.h>
 
 #include <memory>
 #include <mutex>

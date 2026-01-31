@@ -36,7 +36,7 @@ sirius_physical_projection::sirius_physical_projection(
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> select_list,
   duckdb::idx_t estimated_cardinality)
   : sirius_physical_operator(
-      duckdb::PhysicalOperatorType::PROJECTION, std::move(types), estimated_cardinality),
+      SiriusPhysicalOperatorType::PROJECTION, std::move(types), estimated_cardinality),
     select_list(std::move(select_list))
 {
 }

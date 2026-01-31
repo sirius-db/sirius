@@ -43,7 +43,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalExpressionGet& op)
   // we can evaluate all the expressions right now and turn this into a chunk collection scan
   auto chunk_scan = duckdb::make_uniq<sirius::op::sirius_physical_column_data_scan>(
     op.types,
-    duckdb::PhysicalOperatorType::COLUMN_DATA_SCAN,
+    sirius::op::SiriusPhysicalOperatorType::COLUMN_DATA_SCAN,
     op.expressions.size(),
     duckdb::make_uniq<duckdb::ColumnDataCollection>(context, op.types));
 

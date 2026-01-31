@@ -29,11 +29,15 @@ namespace sirius {
 namespace op {
 
 sirius_physical_concat::sirius_physical_concat(duckdb::vector<duckdb::LogicalType> types,
-                                               duckdb::idx_t estimated_cardinality)
+                                               duckdb::idx_t estimated_cardinality,
+                                               sirius_physical_operator* parent_op,
+                                               bool is_build)
   : sirius_physical_operator(
-      duckdb::PhysicalOperatorType::EXTENSION, std::move(types), estimated_cardinality)
+      SiriusPhysicalOperatorType::CONCAT, std::move(types), estimated_cardinality)
 {
   _num_partitions = (estimated_cardinality + PARTITION_SIZE - 1) / PARTITION_SIZE;
+  _parent_op      = parent_op;
+  _is_build       = is_build;
 }
 
 std::string sirius_physical_concat::get_name() const { return "CONCAT"; }
@@ -41,6 +45,8 @@ std::string sirius_physical_concat::get_name() const { return "CONCAT"; }
 bool sirius_physical_concat::is_source() const { return true; }
 
 bool sirius_physical_concat::is_sink() const { return true; }
+
+bool sirius_physical_concat::is_build_concat() { return _is_build; }
 
 }  // namespace op
 }  // namespace sirius

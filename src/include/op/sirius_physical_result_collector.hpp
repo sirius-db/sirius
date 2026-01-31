@@ -41,8 +41,8 @@ namespace op {
 
 class sirius_physical_result_collector : public sirius_physical_operator {
  public:
-  static constexpr const duckdb::PhysicalOperatorType TYPE =
-    duckdb::PhysicalOperatorType::RESULT_COLLECTOR;
+  static constexpr const SiriusPhysicalOperatorType TYPE =
+    SiriusPhysicalOperatorType::RESULT_COLLECTOR;
 
  public:
   explicit sirius_physical_result_collector(duckdb::SiriusPreparedStatementData& data);

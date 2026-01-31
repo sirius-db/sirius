@@ -24,8 +24,7 @@ namespace op {
 
 class sirius_physical_projection : public sirius_physical_operator {
  public:
-  static constexpr const duckdb::PhysicalOperatorType TYPE =
-    duckdb::PhysicalOperatorType::PROJECTION;
+  static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::PROJECTION;
 
  public:
   sirius_physical_projection(duckdb::vector<duckdb::LogicalType> types,

@@ -18,10 +18,7 @@
 
 #include "duckdb/planner/bound_query_node.hpp"
 #include "op/sirius_physical_operator.hpp"
-
-#include <cudf/table/table.hpp>
-
-#include <memory>
+#include "op/sirius_physical_top_n.hpp"
 
 namespace duckdb {
 struct DynamicFilterData;
@@ -32,24 +29,28 @@ namespace op {
 
 //! Represents a physical ordering of the data. Note that this will not change
 //! the data but only add a selection vector.
-class sirius_physical_top_n : public sirius_physical_operator {
+class sirius_physical_top_n_merge : public sirius_physical_operator {
  public:
-  static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::TOP_N;
+  static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::MERGE_TOP_N;
 
  public:
-  sirius_physical_top_n(duckdb::vector<duckdb::LogicalType> types_p,
-                        duckdb::vector<duckdb::BoundOrderByNode> orders,
-                        duckdb::idx_t limit,
-                        duckdb::idx_t offset,
-                        duckdb::shared_ptr<duckdb::DynamicFilterData> dynamic_filter,
-                        duckdb::idx_t estimated_cardinality);
-  ~sirius_physical_top_n() override;
+  sirius_physical_top_n_merge(sirius_physical_top_n* top_n);
+
+  sirius_physical_top_n_merge(duckdb::vector<duckdb::LogicalType> types_p,
+                              duckdb::vector<duckdb::BoundOrderByNode> orders,
+                              duckdb::idx_t limit,
+                              duckdb::idx_t offset,
+                              duckdb::shared_ptr<duckdb::DynamicFilterData> dynamic_filter,
+                              duckdb::idx_t estimated_cardinality);
 
   duckdb::vector<duckdb::BoundOrderByNode> orders;
   duckdb::idx_t limit;
   duckdb::idx_t offset;
   //! Dynamic table filter (if any)
   duckdb::shared_ptr<duckdb::DynamicFilterData> dynamic_filter;
+
+  sirius_physical_operator* child_op;
+  sirius_physical_operator* get_child_op() const { return child_op; }
 
  public:
   bool is_source() const override { return true; }
@@ -60,6 +61,7 @@ class sirius_physical_top_n : public sirius_physical_operator {
 
  public:
   bool is_sink() const override { return true; }
+
   std::vector<std::shared_ptr<cucascade::data_batch>> execute(
     const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches) override;
 };

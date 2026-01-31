@@ -18,25 +18,31 @@
 
 #include "duckdb/planner/bound_query_node.hpp"
 #include "op/sirius_physical_operator.hpp"
+#include "op/sirius_physical_order.hpp"
 
 namespace sirius {
 namespace op {
 
-class sirius_physical_order : public sirius_physical_operator {
+class sirius_physical_merge_sort : public sirius_physical_operator {
  public:
-  static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::ORDER_BY;
+  static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::MERGE_SORT;
 
  public:
-  sirius_physical_order(duckdb::vector<duckdb::LogicalType> types,
-                        duckdb::vector<duckdb::BoundOrderByNode> orders,
-                        duckdb::vector<duckdb::idx_t> projections_p,
-                        duckdb::idx_t estimated_cardinality,
-                        bool is_index_sort_p = false);
+  sirius_physical_merge_sort(sirius_physical_order* order_by);
+
+  sirius_physical_merge_sort(duckdb::vector<duckdb::LogicalType> types,
+                             duckdb::vector<duckdb::BoundOrderByNode> orders,
+                             duckdb::vector<duckdb::idx_t> projections_p,
+                             duckdb::idx_t estimated_cardinality,
+                             bool is_index_sort_p = false);
 
   //! Input data
   duckdb::vector<duckdb::BoundOrderByNode> orders;
   duckdb::vector<duckdb::idx_t> projections;
   bool is_index_sort;
+
+  sirius_physical_operator* child_op;
+  sirius_physical_operator* get_child_op() const { return child_op; }
 
  public:
   // Source interface

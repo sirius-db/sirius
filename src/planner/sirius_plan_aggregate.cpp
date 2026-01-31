@@ -76,10 +76,10 @@ static bool can_use_partitioned_aggregate(duckdb::ClientContext& context,
   }
   // traverse the children of the aggregate to find the source operator
   duckdb::reference<sirius::op::sirius_physical_operator> child_ref(child);
-  while (child_ref.get().type != duckdb::PhysicalOperatorType::TABLE_SCAN) {
+  while (child_ref.get().type != sirius::op::SiriusPhysicalOperatorType::TABLE_SCAN) {
     auto& child_op = child_ref.get();
     switch (child_op.type) {
-      case duckdb::PhysicalOperatorType::PROJECTION: {
+      case sirius::op::SiriusPhysicalOperatorType::PROJECTION: {
         // recompute partition columns
         auto& projection = child_op.Cast<sirius::op::sirius_physical_projection>();
         duckdb::vector<duckdb::column_t> new_columns;
@@ -95,7 +95,7 @@ static bool can_use_partitioned_aggregate(duckdb::ClientContext& context,
         child_ref         = *child_op.children[0];
         break;
       }
-      case duckdb::PhysicalOperatorType::FILTER:
+      case sirius::op::SiriusPhysicalOperatorType::FILTER:
         // continue into child operators
         child_ref = *child_op.children[0];
         break;
@@ -230,37 +230,6 @@ static bool can_use_perfect_hash_aggregate(duckdb::ClientContext& context,
   return true;
 }
 
-static duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> copy_expressions(
-  const duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>& input)
-{
-  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> result;
-  result.reserve(input.size());
-  for (auto& expr : input) {
-    result.push_back(expr->Copy());
-  }
-  return result;
-}
-
-static duckdb::vector<duckdb::LogicalType> build_local_ungrouped_types(
-  const duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>& aggregates)
-{
-  duckdb::vector<duckdb::LogicalType> local_types;
-  local_types.reserve(aggregates.size());
-  for (auto& expression : aggregates) {
-    auto& aggregate  = expression->Cast<duckdb::BoundAggregateExpression>();
-    const auto& name = aggregate.function.name;
-    if (name == "avg") {
-      local_types.push_back(aggregate.return_type);
-      local_types.push_back(duckdb::LogicalType::BIGINT);
-    } else if (name == "count" || name == "count_star") {
-      local_types.push_back(duckdb::LogicalType::BIGINT);
-    } else {
-      local_types.push_back(aggregate.return_type);
-    }
-  }
-  return local_types;
-}
-
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
 {
@@ -293,24 +262,11 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
     // no groups, check if we can use a simple aggregation
     // special case: aggregate entire columns together
     if (can_use_simple_aggregation) {
-      auto local_expressions = copy_expressions(op.expressions);
-      auto merge_expressions = std::move(op.expressions);
-      auto local_types       = build_local_ungrouped_types(local_expressions);
-
-      auto local_group_by = duckdb::make_uniq_base<sirius::op::sirius_physical_operator,
-                                                   sirius::op::sirius_physical_ungrouped_aggregate>(
-        std::move(local_types),
-        std::move(local_expressions),
-        op.estimated_cardinality,
-        op.distinct_validity);
-      local_group_by->children.push_back(std::move(plan));
-
-      auto merge_group_by =
-        duckdb::make_uniq_base<sirius::op::sirius_physical_operator,
-                               sirius::op::sirius_physical_ungrouped_aggregate_merge>(
-          op.types, std::move(merge_expressions), op.estimated_cardinality);
-      merge_group_by->children.push_back(std::move(local_group_by));
-      return merge_group_by;
+      auto group_by = duckdb::make_uniq_base<sirius::op::sirius_physical_operator,
+                                             sirius::op::sirius_physical_ungrouped_aggregate>(
+        op.types, std::move(op.expressions), op.estimated_cardinality, op.distinct_validity);
+      group_by->children.push_back(std::move(plan));
+      return group_by;
     }
     throw duckdb::NotImplementedException("Non simple aggregation is not supported");
     // auto &group_by =

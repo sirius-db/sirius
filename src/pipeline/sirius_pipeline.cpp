@@ -28,24 +28,23 @@
 #include "duckdb/parallel/pipeline_event.hpp"
 #include "duckdb/parallel/pipeline_executor.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
-#include "gpu_executor.hpp"
 #include "log/logging.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
+#include "sirius_engine.hpp"
 
 namespace sirius {
 namespace pipeline {
 
-sirius_pipeline::sirius_pipeline(duckdb::GPUExecutor& executor_p)
-  : executor(executor_p), ready(false), initialized(false), source(nullptr), sink(nullptr)
+sirius_pipeline::sirius_pipeline(sirius_engine& engine)
+  : engine(engine), ready(false), initialized(false), source(nullptr), sink(nullptr)
 {
 }
 
-duckdb::ClientContext& sirius_pipeline::get_client_context() { return executor.context; }
+duckdb::ClientContext& sirius_pipeline::get_client_context() { return engine.context; }
 
 bool sirius_pipeline::is_order_dependent() const
 {
-  auto& config = duckdb::DBConfig::GetConfig(executor.context);
   if (source) {
     auto source_order = source->source_order();
     if (source_order == duckdb::OrderPreservationType::FIXED_ORDER) { return true; }
@@ -56,7 +55,7 @@ bool sirius_pipeline::is_order_dependent() const
     if (op.operator_order() == duckdb::OrderPreservationType::NO_ORDER) { return false; }
     if (op.operator_order() == duckdb::OrderPreservationType::FIXED_ORDER) { return true; }
   }
-  if (!duckdb::DBConfig::GetSetting<duckdb::PreserveInsertionOrderSetting>(executor.context)) {
+  if (!duckdb::DBConfig::GetSetting<duckdb::PreserveInsertionOrderSetting>(engine.context)) {
     return false;
   }
   if (sink && sink->sink_order_dependent()) { return true; }
@@ -158,11 +157,7 @@ sirius_pipeline::get_all_operators() const
 duckdb::vector<duckdb::reference<op::sirius_physical_operator>>
 sirius_pipeline::get_inner_operators()
 {
-  duckdb::vector<duckdb::reference<op::sirius_physical_operator>> result;
-  for (auto& op : operators) {
-    result.push_back(op.get());
-  }
-  return result;
+  return operators;
 }
 
 void sirius_pipeline::clear_source()
@@ -204,7 +199,7 @@ duckdb::idx_t sirius_pipeline::update_batch_index(duckdb::idx_t old_index, duckd
 void sirius_pipeline_build_state::set_pipeline_source(sirius_pipeline& pipeline,
                                                       op::sirius_physical_operator& op)
 {
-  SIRIUS_LOG_DEBUG("Setting pipeline source {}", duckdb::PhysicalOperatorToString(op.type));
+  SIRIUS_LOG_DEBUG("Setting pipeline source {}", op::SiriusPhysicalOperatorToString(op.type));
   pipeline.source = &op;
 }
 
@@ -216,7 +211,7 @@ void sirius_pipeline_build_state::set_pipeline_sink(
   pipeline.sink = op;
   if (pipeline.sink)
     SIRIUS_LOG_DEBUG("Setting pipeline sink {}",
-                     duckdb::PhysicalOperatorToString((*pipeline.sink).type));
+                     op::SiriusPhysicalOperatorToString((*pipeline.sink).type));
   // set the base batch index of this pipeline based on how many other pipelines have this node as
   // their sink
   pipeline.base_batch_index = BATCH_INCREMENT * sink_pipeline_count;
@@ -225,7 +220,7 @@ void sirius_pipeline_build_state::set_pipeline_sink(
 void sirius_pipeline_build_state::add_pipeline_operator(sirius_pipeline& pipeline,
                                                         op::sirius_physical_operator& op)
 {
-  SIRIUS_LOG_DEBUG("Adding operator to pipeline {}", duckdb::PhysicalOperatorToString(op.type));
+  SIRIUS_LOG_DEBUG("Adding operator to pipeline {}", op::SiriusPhysicalOperatorToString(op.type));
   pipeline.operators.push_back(op);
 }
 
@@ -249,9 +244,9 @@ void sirius_pipeline_build_state::set_pipeline_operators(
 }
 
 duckdb::shared_ptr<sirius_pipeline> sirius_pipeline_build_state::create_child_pipeline(
-  duckdb::GPUExecutor& executor, sirius_pipeline& pipeline, op::sirius_physical_operator& op)
+  sirius_engine& engine, sirius_pipeline& pipeline, op::sirius_physical_operator& op)
 {
-  return executor.create_child_pipeline(pipeline, op);
+  return engine.create_child_pipeline(pipeline, op);
 }
 
 duckdb::vector<duckdb::reference<op::sirius_physical_operator>>
@@ -264,7 +259,7 @@ bool sirius_pipeline::is_pipeline_finished() { return pipeline_finished; }
 
 void sirius_pipeline::update_pipeline_status()
 {
-  if (get_source()->type == duckdb::PhysicalOperatorType::TABLE_SCAN) {
+  if (get_source()->type == op::SiriusPhysicalOperatorType::TABLE_SCAN) {
     auto& table_scan = get_source()->Cast<op::sirius_physical_table_scan>();
     if (!table_scan.exhausted) {
       pipeline_finished = false;

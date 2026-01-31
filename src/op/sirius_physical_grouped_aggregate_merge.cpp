@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "op/sirius_physical_grouped_aggregate.hpp"
+#include "op/sirius_physical_grouped_aggregate_merge.hpp"
 
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "log/logging.hpp"
@@ -43,32 +43,47 @@ static duckdb::vector<duckdb::LogicalType> create_group_chunk_types(
   return types;
 }
 
-sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
-  duckdb::ClientContext& context,
-  duckdb::vector<duckdb::LogicalType> types,
-  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
-  duckdb::idx_t estimated_cardinality)
-  : sirius_physical_grouped_aggregate(
-      context, std::move(types), std::move(expressions), {}, estimated_cardinality)
+// Helper to deep copy a vector of Expression unique_ptrs
+static duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> copy_expressions(
+  const duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>& src)
 {
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> result;
+  result.reserve(src.size());
+  for (const auto& expr : src) {
+    result.push_back(expr->Copy());
+  }
+  return result;
 }
 
-sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
-  duckdb::ClientContext& context,
-  duckdb::vector<duckdb::LogicalType> types,
-  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
-  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups_p,
-  duckdb::idx_t estimated_cardinality)
-  : sirius_physical_grouped_aggregate(context,
-                                      std::move(types),
-                                      std::move(expressions),
-                                      std::move(groups_p),
-                                      {},
-                                      {},
-                                      estimated_cardinality,
-                                      duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES,
-                                      duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES)
+// Helper to convert vector<vector<idx_t>> to vector<unsafe_vector<idx_t>>
+static duckdb::vector<duckdb::unsafe_vector<duckdb::idx_t>> convert_grouping_functions(
+  const duckdb::vector<duckdb::vector<duckdb::idx_t>>& src)
 {
+  duckdb::vector<duckdb::unsafe_vector<duckdb::idx_t>> result;
+  result.reserve(src.size());
+  for (const auto& inner : src) {
+    duckdb::unsafe_vector<duckdb::idx_t> converted;
+    for (auto val : inner) {
+      converted.push_back(val);
+    }
+    result.push_back(std::move(converted));
+  }
+  return result;
+}
+
+sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge(
+  sirius_physical_grouped_aggregate* grouped_aggregate)
+  : sirius_physical_grouped_aggregate_merge(
+      grouped_aggregate->types,  // copied by value
+      copy_expressions(grouped_aggregate->grouped_aggregate_data.aggregates),
+      copy_expressions(grouped_aggregate->grouped_aggregate_data.groups),
+      grouped_aggregate->grouping_sets,  // copied by value
+      convert_grouping_functions(grouped_aggregate->grouped_aggregate_data.GetGroupingFunctions()),
+      grouped_aggregate->estimated_cardinality,
+      duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES,  // default
+      duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES)  // default
+{
+  child_op = grouped_aggregate;
 }
 
 // expressions is the list of aggregates to be computed. Each aggregates has a bound_ref expression
@@ -78,8 +93,7 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
 // and for every grouping set there is one radix_table grouping_functions_p is a list of indexes to
 // the groupby expressions (groups_p) for each grouping_sets. The first level of the vector is the
 // grouping set and the second level is the indexes to the groupby expression for that set.
-sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
-  duckdb::ClientContext& context,
+sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge(
   duckdb::vector<duckdb::LogicalType> types,
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups_p,
@@ -89,7 +103,7 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
   duckdb::TupleDataValidityType group_validity,
   duckdb::TupleDataValidityType distinct_validity)
   : sirius_physical_operator(
-      SiriusPhysicalOperatorType::HASH_GROUP_BY, std::move(types), estimated_cardinality),
+      SiriusPhysicalOperatorType::MERGE_GROUP_BY, std::move(types), estimated_cardinality),
     grouping_sets(std::move(grouping_sets_p))
 {
   // get a list of all aggregates to be computed

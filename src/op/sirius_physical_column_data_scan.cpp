@@ -27,7 +27,7 @@ namespace op {
 
 sirius_physical_column_data_scan::sirius_physical_column_data_scan(
   duckdb::vector<duckdb::LogicalType> types,
-  duckdb::PhysicalOperatorType op_type,
+  SiriusPhysicalOperatorType op_type,
   duckdb::idx_t estimated_cardinality,
   duckdb::optionally_owned_ptr<duckdb::ColumnDataCollection> collection_p)
   : sirius_physical_operator(op_type, std::move(types), estimated_cardinality),
@@ -38,7 +38,7 @@ sirius_physical_column_data_scan::sirius_physical_column_data_scan(
 
 sirius_physical_column_data_scan::sirius_physical_column_data_scan(
   duckdb::vector<duckdb::LogicalType> types,
-  duckdb::PhysicalOperatorType op_type,
+  SiriusPhysicalOperatorType op_type,
   duckdb::idx_t estimated_cardinality,
   duckdb::idx_t cte_index)
   : sirius_physical_operator(op_type, std::move(types), estimated_cardinality),
@@ -56,7 +56,7 @@ void sirius_physical_column_data_scan::build_pipelines(
   // check if there is any additional action we need to do depending on the type
   auto& state = meta_pipeline.get_state();
   switch (type) {
-    case duckdb::PhysicalOperatorType::DELIM_SCAN: {
+    case SiriusPhysicalOperatorType::DELIM_SCAN: {
       auto entry = state.delim_join_dependencies.find(*this);
       D_ASSERT(entry != state.delim_join_dependencies.end());
       // this chunk scan introduces a dependency to the current pipeline
@@ -64,14 +64,14 @@ void sirius_physical_column_data_scan::build_pipelines(
       auto delim_dependency = entry->second.get().shared_from_this();
       auto delim_sink       = state.get_pipeline_sink(*delim_dependency);
       D_ASSERT(delim_sink);
-      D_ASSERT(delim_sink->type == duckdb::PhysicalOperatorType::LEFT_DELIM_JOIN ||
-               delim_sink->type == duckdb::PhysicalOperatorType::RIGHT_DELIM_JOIN);
+      D_ASSERT(delim_sink->type == SiriusPhysicalOperatorType::LEFT_DELIM_JOIN ||
+               delim_sink->type == SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN);
       auto& delim_join = delim_sink->Cast<sirius_physical_delim_join>();
       current.add_dependency(delim_dependency);
       state.set_pipeline_source(current, delim_join.distinct->Cast<sirius_physical_operator>());
       return;
     }
-    case duckdb::PhysicalOperatorType::CTE_SCAN: {
+    case SiriusPhysicalOperatorType::CTE_SCAN: {
       // throw NotImplementedException("CTE scan not implemented for GPU");
       auto entry = state.cte_dependencies.find(*this);
       D_ASSERT(entry != state.cte_dependencies.end());
@@ -81,13 +81,13 @@ void sirius_physical_column_data_scan::build_pipelines(
       auto cte_sink       = state.get_pipeline_sink(*cte_dependency);
       (void)cte_sink;
       D_ASSERT(cte_sink);
-      D_ASSERT(cte_sink->type == duckdb::PhysicalOperatorType::CTE);
+      D_ASSERT(cte_sink->type == SiriusPhysicalOperatorType::CTE);
       current.add_dependency(cte_dependency);
       state.set_pipeline_source(current, *this);
       return;
     }
-    case duckdb::PhysicalOperatorType::RECURSIVE_RECURRING_CTE_SCAN:
-    case duckdb::PhysicalOperatorType::RECURSIVE_CTE_SCAN:
+    case SiriusPhysicalOperatorType::RECURSIVE_RECURRING_CTE_SCAN:
+    case SiriusPhysicalOperatorType::RECURSIVE_CTE_SCAN:
       throw duckdb::NotImplementedException("Recursive CTE scan not implemented for GPU");
       if (!meta_pipeline.has_recursive_cte()) {
         throw duckdb::InternalException("Recursive CTE scan found without recursive CTE node");

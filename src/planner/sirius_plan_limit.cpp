@@ -20,7 +20,6 @@
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/planner/operator/logical_limit.hpp"
-#include "gpu_context.hpp"
 #include "op/sirius_physical_limit.hpp"
 #include "planner/sirius_physical_plan_generator.hpp"
 

@@ -21,7 +21,7 @@
 #include <memory/host_table_utils.hpp>
 #include <memory/multiple_blocks_allocation_accessor.hpp>
 #include <op/scan/duckdb_scan_executor.hpp>
-#include <op/sirius_physical_table_scan.hpp>
+#include <op/sirius_physical_duckdb_scan.hpp>
 #include <parallel/task.hpp>
 #include <pipeline/sirius_pipeline.hpp>
 #include <sirius_context.hpp>
@@ -72,7 +72,7 @@ class duckdb_scan_task_global_state : public sirius::parallel::itask_global_stat
   duckdb_scan_task_global_state(duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
                                 duckdb_scan_executor& scan_exec,
                                 duckdb::ClientContext& client_ctx,
-                                sirius_physical_table_scan* scan_op);
+                                sirius_physical_duckdb_scan* scan_op);
 
   //===----------Methods----------===//
   /**
@@ -122,7 +122,7 @@ class duckdb_scan_task_global_state : public sirius::parallel::itask_global_stat
   std::unique_ptr<duckdb::GlobalTableFunctionState>
     _global_tf_state;                            ///< Global state for the table function
   duckdb_scan_executor& _scan_executor;          ///< The scan executor executing this scan task
-  sirius_physical_table_scan& _op;               ///< The physical table scan being executed
+  sirius_physical_duckdb_scan& _op;              ///< The physical table scan being executed
   std::atomic<bool> _source_drained{false};      ///< Whether the table scan source is fully drained
   std::atomic<int64_t> _active_local_states{0};  ///< Number of active local table function states
   uint64_t _max_threads;                         ///< Maximum number of threads for this scan task
@@ -323,7 +323,7 @@ class duckdb_scan_task_local_state : public sirius::parallel::itask_local_state 
    *
    * @param[in] op The physical table scan operator being executed.
    */
-  void estimate_rows_per_batch(sirius_physical_table_scan const& op);
+  void estimate_rows_per_batch(sirius_physical_duckdb_scan const& op);
 
   /**
    * @brief Initializes the column builders.
@@ -337,7 +337,7 @@ class duckdb_scan_task_local_state : public sirius::parallel::itask_local_state 
    * @param[in] exec_ctx The duckdb execution context.
    * @param[in] global_tf_state The duckdb table function global state.
    */
-  void initialize_local_table_function_state(sirius_physical_table_scan const& op,
+  void initialize_local_table_function_state(sirius_physical_duckdb_scan const& op,
                                              duckdb::ExecutionContext& exec_ctx,
                                              duckdb::GlobalTableFunctionState* global_tf_state);
 };

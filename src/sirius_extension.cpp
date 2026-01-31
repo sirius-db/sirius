@@ -37,6 +37,7 @@
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/statement/relation_statement.hpp"
 #include "duckdb/planner/planner.hpp"
+#include "planner/sirius_physical_plan_generator.hpp"
 // #include "from_substrait.hpp"
 #include "gpu_buffer_manager.hpp"
 #include "gpu_context.hpp"
@@ -56,6 +57,89 @@ struct GPUTableFunctionData : public TableFunctionData {
   GPUTableFunctionData() = default;
   shared_ptr<Relation> plan;
   shared_ptr<GPUPreparedStatementData> gpu_prepared;
+  unique_ptr<QueryResult> res;
+  unique_ptr<Connection> conn;
+  unique_ptr<GPUContext> gpu_context;
+  string query;
+  bool enable_optimizer;
+  bool finished   = false;
+  bool plan_error = false;
+  //! Original options from the connection
+  ClientConfig original_config;
+  set<OptimizerType> original_disabled_optimizers;
+
+  void PrepareConnection(ClientContext& context)
+  {
+    // First collect original options
+    original_config              = context.config;
+    original_disabled_optimizers = DBConfig::GetConfig(context).options.disabled_optimizers;
+
+    // The user might want to disable the optimizer of the new connection
+    context.config.enable_optimizer      = enable_optimizer;
+    context.config.use_replacement_scans = false;
+    // We want for sure to disable the internal compression optimizations.
+    // These are DuckDB specific, no other system implements these. Also,
+    // respect the user's settings if they chose to disable any specific optimizers.
+    //
+    // The InClauseRewriter optimization converts large `IN` clauses to a
+    // "mark join" against a `ColumnDataCollection`, which may not make
+    // sense in other systems and would complicate the conversion to Substrait.
+    set<OptimizerType> disabled_optimizers =
+      DBConfig::GetConfig(context).options.disabled_optimizers;
+    disabled_optimizers.insert(OptimizerType::IN_CLAUSE);
+    disabled_optimizers.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
+    // disabled_optimizers.insert(OptimizerType::MATERIALIZED_CTE);
+    // If error(varchar) gets implemented in substrait this can be removed
+    // context.config.scalar_subquery_error_on_multiple_rows = false;
+    DBConfig::GetConfig(context).options.disabled_optimizers = disabled_optimizers;
+  }
+
+  // Reset configuration
+  void CleanupConnection(ClientContext& context) const
+  {
+    DBConfig::GetConfig(context).options.disabled_optimizers = original_disabled_optimizers;
+    context.config                                           = original_config;
+  }
+
+  unique_ptr<LogicalOperator> ExtractPlan(ClientContext& context)
+  {
+    PrepareConnection(context);
+    unique_ptr<LogicalOperator> plan;
+    try {
+      Parser parser(context.GetParserOptions());
+      parser.ParseQuery(query);
+
+      Planner planner(context);
+      planner.CreatePlan(std::move(parser.statements[0]));
+      D_ASSERT(planner.plan);
+
+      plan = std::move(planner.plan);
+
+      if (context.config.enable_optimizer) {
+        Optimizer optimizer(*planner.binder, context);
+        plan = optimizer.Optimize(std::move(plan));
+      }
+
+      // After optimization, refresh types before column binding resolution
+      // to ensure types are consistent (some optimizers may have set stale types)
+      plan->ResolveOperatorTypes();
+
+      ColumnBindingResolver resolver;
+      ColumnBindingResolver::Verify(*plan);
+      resolver.VisitOperator(*plan);
+    } catch (...) {
+      CleanupConnection(context);
+      throw;
+    }
+
+    CleanupConnection(context);
+    return plan;
+  }
+};
+
+struct SiriusTableFunctionData : public TableFunctionData {
+  SiriusTableFunctionData() = default;
+  shared_ptr<SiriusPreparedStatementData> gpu_prepared;
   unique_ptr<QueryResult> res;
   unique_ptr<Connection> conn;
   unique_ptr<GPUContext> gpu_context;
@@ -177,8 +261,6 @@ unique_ptr<FunctionData> SiriusExtension::GPUProcessingBind(ClientContext& conte
   prepared->names     = planner.names;
   prepared->types     = planner.types;
   prepared->value_map = std::move(planner.value_map);
-  // prepared->physical_plan      = make_uniq<PhysicalOperator>(
-  //   PhysicalOperatorType::DUMMY_SCAN, vector<LogicalType>{LogicalType::BOOLEAN}, 0);
 
   // generate physical plan from the logical plan
   unique_ptr<LogicalOperator> query_plan = result->ExtractPlan(context);
@@ -255,6 +337,107 @@ void SiriusExtension::GPUProcessingFunction(ClientContext& context,
   return;
 }
 
+static unique_ptr<sirius::op::sirius_physical_operator> SiriusGeneratePhysicalPlan(
+  ClientContext& context, GPUContext& gpu_context, unique_ptr<LogicalOperator>& logical_plan)
+{
+  sirius::planner::sirius_physical_plan_generator physical_planner =
+    sirius::planner::sirius_physical_plan_generator(context, gpu_context);
+  auto physical_plan = physical_planner.create_plan(std::move(logical_plan));
+  return physical_plan;
+}
+
+// The result of the GPUExecutionBind function is a unique pointer to a FunctionData object.
+// This result of this function is used as an argument to the GPUExecutionFunction function (data_p
+// argument), which is called to execute the table function.
+unique_ptr<FunctionData> SiriusExtension::GPUExecutionBind(ClientContext& context,
+                                                           TableFunctionBindInput& input,
+                                                           vector<LogicalType>& return_types,
+                                                           vector<string>& names)
+{
+  auto result              = make_uniq<SiriusTableFunctionData>();
+  result->query            = input.inputs[0].ToString();
+  result->enable_optimizer = true;
+  result->gpu_context      = make_uniq<GPUContext>(context);
+  if (input.inputs[0].IsNull()) {
+    throw BinderException("gpu_execution cannot be called with a NULL parameter");
+  }
+
+  // Parse the query just to get the result type information and to create preparedstatmement data
+  Parser parser(context.GetParserOptions());
+  parser.ParseQuery(result->query);
+  Planner planner(context);
+  auto statement_type = parser.statements[0]->type;
+  planner.CreatePlan(std::move(parser.statements[0]));
+  D_ASSERT(planner.plan);
+
+  auto prepared       = make_shared_ptr<PreparedStatementData>(statement_type);
+  prepared->names     = planner.names;
+  prepared->types     = planner.types;
+  prepared->value_map = std::move(planner.value_map);
+
+  // generate physical plan from the logical plan
+  unique_ptr<LogicalOperator> query_plan = result->ExtractPlan(context);
+  SIRIUS_LOG_DEBUG("Query plan:\n{}", query_plan->ToString());
+  try {
+    auto sirius_physical_plan =
+      SiriusGeneratePhysicalPlan(context, *result->gpu_context, query_plan);
+    auto gpu_prepared = make_shared_ptr<SiriusPreparedStatementData>(
+      std::move(prepared), std::move(sirius_physical_plan));
+    result->gpu_prepared = gpu_prepared;
+  } catch (std::exception& e) {
+    ErrorData error(e);
+    SIRIUS_LOG_ERROR("Error in SiriusGeneratePhysicalPlan: {}", error.RawMessage());
+    result->plan_error = true;
+  }
+
+  for (auto& column : planner.names) {
+    names.emplace_back(column);
+  }
+  for (auto& type : planner.types) {
+    return_types.emplace_back(type);
+  }
+
+  return std::move(result);
+}
+
+void SiriusExtension::GPUExecutionFunction(ClientContext& context,
+                                           TableFunctionInput& data_p,
+                                           DataChunk& output)
+{
+  auto& data = (SiriusTableFunctionData&)*data_p.bind_data;
+  if (data.finished) { return; }
+
+  if (!data.res) {
+    auto start = std::chrono::high_resolution_clock::now();
+    if (data.plan_error) {
+      printf(
+        "=============================================\nError in SiriusExecuteQuery, fallback to "
+        "DuckDB\n=============================================\n");
+      data.res = data.conn->Query(data.query);
+    } else {
+      data.res = data.gpu_context->SiriusExecuteQuery(context, data.query, data.gpu_prepared, {});
+      if (data.res->HasError()) {
+        printf(
+          "=============================================\nError in SiriusExecuteQuery, fallback to "
+          "DuckDB\n=============================================\n");
+        data.res = data.conn->Query(data.query);
+      }
+    }
+    auto end      = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    SIRIUS_LOG_INFO("Execute query time: {:.2f} ms", duration.count() / 1000.0);
+  }
+
+  auto result_chunk = data.res->Fetch();
+  if (result_chunk == nullptr) {
+    output.SetCardinality(0);
+    return;
+  }
+
+  output.Reference(*result_chunk);
+  return;
+}
+
 static unique_ptr<LogicalOperator> OptimizePlan(ClientContext& context,
                                                 Planner& planner,
                                                 Connection& new_conn)
@@ -274,120 +457,6 @@ static unique_ptr<LogicalOperator> OptimizePlan(ClientContext& context,
 
   return plan;
 }
-
-// unique_ptr<FunctionData> SiriusExtension::GPUProcessingSubstraitBind(
-//   ClientContext& context,
-//   TableFunctionBindInput& input,
-//   vector<LogicalType>& return_types,
-//   vector<string>& names)
-// {
-//   auto result              = make_uniq<GPUTableFunctionData>();
-//   result->conn             = make_uniq<Connection>(*context.db);
-//   result->query            = input.inputs[0].ToString();
-//   result->enable_optimizer = true;
-//   result->gpu_context      = make_uniq<GPUContext>(context);
-//   if (input.inputs[0].IsNull()) {
-//     throw BinderException("gpu_processing cannot be called with a NULL parameter");
-//   }
-//   string serialized = input.inputs[0].GetValueUnsafe<string>();
-//   // result->plan = GPUSubstraitPlanToDuckDBRel(*result->conn, serialized, false);
-//   bool is_json = false;
-//   shared_ptr<ClientContext> c_ptr(&context, do_nothing_context);
-//   SubstraitToDuckDB transformer_s2d(c_ptr, serialized, is_json, false);
-//   result->plan = transformer_s2d.TransformPlan();
-
-//   auto relation_stmt                  = make_uniq<RelationStatement>(result->plan);
-//   unique_ptr<SQLStatement> statements = std::move(relation_stmt);
-//   auto statement_type                 = statements->type;
-//   SIRIUS_LOG_DEBUG("{}", statements->query);
-
-//   set<OptimizerType> disabled_optimizers =
-//   DBConfig::GetConfig(context).options.disabled_optimizers;
-//   disabled_optimizers.insert(OptimizerType::IN_CLAUSE);
-//   disabled_optimizers.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
-//   DBConfig::GetConfig(context).options.disabled_optimizers = disabled_optimizers;
-
-//   Planner planner(context);
-//   planner.CreatePlan(std::move(statements));
-//   D_ASSERT(planner.plan);
-
-//   auto prepared       = make_shared_ptr<PreparedStatementData>(statement_type);
-//   prepared->names     = planner.names;
-//   prepared->types     = planner.types;
-//   prepared->value_map = std::move(planner.value_map);
-//   prepared->plan      = make_uniq<PhysicalOperator>(
-//     PhysicalOperatorType::DUMMY_SCAN, vector<LogicalType>{LogicalType::BOOLEAN}, 0);
-
-//   auto query_plan = OptimizePlan(context, planner, *result->conn);
-//   try {
-//     auto gpu_physical_plan =
-//       GPUGeneratePhysicalPlan(context, *result->gpu_context, query_plan, *result->conn);
-//     auto gpu_prepared =
-//       make_shared_ptr<GPUPreparedStatementData>(std::move(prepared),
-//       std::move(gpu_physical_plan));
-//     result->gpu_prepared = gpu_prepared;
-//   } catch (std::exception& e) {
-//     ErrorData error(e);
-//     SIRIUS_LOG_ERROR("Error in GPUGeneratePhysicalPlan: {}", error.RawMessage());
-//     result->plan_error = true;
-//   }
-
-//   for (auto& column : planner.names) {
-//     names.emplace_back(column);
-//   }
-//   for (auto& type : planner.types) {
-//     return_types.emplace_back(type);
-//   }
-
-//   return std::move(result);
-// }
-
-// void SiriusExtension::GPUProcessingSubstraitFunction(ClientContext& context,
-//                                                      TableFunctionInput& data_p,
-//                                                      DataChunk& output)
-// {
-//   auto& data = (GPUTableFunctionData&)*data_p.bind_data;
-//   if (data.finished) { return; }
-//   if (!data.res) {
-//     auto start = std::chrono::high_resolution_clock::now();
-//     if (!buffer_is_initialized) {
-//       printf("\033[1;31m");
-//       printf("GPUBufferManager not initialized, please call gpu_buffer_init first\n");
-//       printf("\033[0m");
-//       printf(
-//         "=============================================\nError in GPUExecuteQuery, fallback to "
-//         "DuckDB\n=============================================\n");
-//       auto con           = Connection(*context.db);
-//       data.plan->context = make_shared_ptr<ClientContextWrapper>(con.context);
-//       data.res           = data.plan->Execute();
-//     } else if (data.plan_error) {
-//       printf(
-//         "=============================================\nError in GPUExecuteQuery, fallback to "
-//         "DuckDB\n=============================================\n");
-//       auto con           = Connection(*context.db);
-//       data.plan->context = make_shared_ptr<ClientContextWrapper>(con.context);
-//       data.res           = data.plan->Execute();
-//     } else {
-//       data.res = data.gpu_context->GPUExecuteQuery(context, data.query, data.gpu_prepared, {});
-//       if (data.res->HasError()) {
-//         printf(
-//           "=============================================\nError in GPUExecuteQuery, fallback to "
-//           "DuckDB\n=============================================\n");
-//         auto con           = Connection(*context.db);
-//         data.plan->context = make_shared_ptr<ClientContextWrapper>(con.context);
-//         data.res           = data.plan->Execute();
-//       }
-//     }
-//     auto end      = std::chrono::high_resolution_clock::now();
-//     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-//     SIRIUS_LOG_INFO("GPU Execute query time: {:.2f} ms", duration.count() / 1000.0);
-//   }
-
-//   auto result_chunk = data.res->Fetch();
-//   if (!result_chunk) { return; }
-//   output.Move(*result_chunk);
-//   return;
-// }
 
 struct GPUBufferInitFunctionData : public TableFunctionData {
   GPUBufferInitFunctionData() {}
@@ -501,25 +570,31 @@ void SiriusExtension::GPUBufferInitFunction(ClientContext& context,
   data.finished = true;
 }
 
-void SiriusExtension::RegisterGPUFunctions(ClientContext& context)
+void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
 {
-  auto& catalog = Catalog::GetSystemCatalog(context);
-
+  auto transaction = CatalogTransaction::GetSystemTransaction(instance);
+  auto& catalog    = Catalog::GetSystemCatalog(instance);
   TableFunction gpu_buffer_init("gpu_buffer_init",
                                 {LogicalType::VARCHAR, LogicalType::VARCHAR},
                                 GPUBufferInitFunction,
                                 GPUBufferInitBind);
   gpu_buffer_init.named_parameters[PINNED_MEMORY_PARAM_KEY] = LogicalType::VARCHAR;
   CreateTableFunctionInfo gpu_buffer_init_info(gpu_buffer_init);
-  catalog.CreateTableFunction(context, gpu_buffer_init_info);
+  catalog.CreateTableFunction(transaction, gpu_buffer_init_info);
 
-  TableFunction gpu_processing("gpu_processing",
-                               {LogicalType::VARCHAR},
-                               GPUProcessingFunction,
-                               SiriusExtension::GPUProcessingBind);
+  TableFunction gpu_processing(
+    "gpu_processing", {LogicalType::VARCHAR}, GPUProcessingFunction, GPUProcessingBind);
   gpu_processing.named_parameters["enable_optimizer"] = LogicalType::BOOLEAN;
   CreateTableFunctionInfo gpu_processing_info(gpu_processing);
-  catalog.CreateTableFunction(context, gpu_processing_info);
+  catalog.CreateTableFunction(transaction, gpu_processing_info);
+
+  TableFunction gpu_execution("gpu_execution",
+                              {LogicalType::VARCHAR},
+                              GPUExecutionFunction,
+                              SiriusExtension::GPUExecutionBind);
+  gpu_execution.named_parameters["enable_optimizer"] = LogicalType::BOOLEAN;
+  CreateTableFunctionInfo gpu_execution_info(gpu_execution);
+  catalog.CreateTableFunction(transaction, gpu_execution_info);
 }
 
 static void SetUsePinMemory(ClientContext& context, SetScope scope, Value& parameter)
@@ -685,38 +760,14 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     SetDefaultScanTaskVarcharSize);
 }
 
-// void SiriusExtension::Load(DuckDB& db)
-// {
-//   DuckDB db(loader.GetDatabaseInstance());
-//   // First initialize the config before acquiring a connection the database
-//   InitialGPUConfigs(db);
-
-//   Connection con(db);
-//   con.BeginTransaction();
-
-//   InitGlobalLogger();
-
-//   // Initialize the representation converter registry with builtin converters
-//   // This is used for converting data between GPU and HOST representations
-//   sirius::converter_registry::initialize();
-
-//   InitializeGPUExtension(con);
-
-//   con.Commit();
-// }
-
 static void LoadInternal(ExtensionLoader& loader)
 {
-  DuckDB db(loader.GetDatabaseInstance());
-  auto& config = DBConfig::GetConfig(loader.GetDatabaseInstance());
+  auto& db     = loader.GetDatabaseInstance();
+  auto& config = DBConfig::GetConfig(db);
   config.extension_callbacks.push_back(make_uniq<duckdb::SiriusContextExtensionCallback>());
   sirius::converter_registry::initialize();
   SiriusExtension::InitialGPUConfigs(config);
-
-  Connection con(db);
-  con.BeginTransaction();
-  SiriusExtension::RegisterGPUFunctions(*con.context);
-  con.Commit();
+  SiriusExtension::RegisterGPUFunctions(db);
 }
 
 void SiriusExtension::Load(ExtensionLoader& loader) { LoadInternal(loader); }
@@ -737,14 +788,6 @@ std::string SiriusExtension::Version() const
 extern "C" {
 
 DUCKDB_CPP_EXTENSION_ENTRY(sirius, loader) { duckdb::LoadInternal(loader); }
-
-// DUCKDB_EXTENSION_API void sirius_init(duckdb::DatabaseInstance& db)
-// {
-//   duckdb::DuckDB db_wrapper(db);
-//   db_wrapper.LoadStaticExtension<duckdb::SiriusExtension>();
-// }
-
-// DUCKDB_EXTENSION_API const char* sirius_version() { return duckdb::DuckDB::LibraryVersion(); }
 }
 
 #ifndef DUCKDB_EXTENSION_MAIN

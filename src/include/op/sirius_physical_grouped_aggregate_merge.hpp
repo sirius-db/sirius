@@ -23,32 +23,21 @@
 #include "duckdb/execution/radix_partitioned_hashtable.hpp"
 #include "duckdb/parser/group_by_node.hpp"
 #include "duckdb/storage/data_table.hpp"
+#include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_operator.hpp"
 
 namespace sirius {
 namespace op {
 
-class sirius_physical_grouped_aggregate : public sirius_physical_operator {
+class sirius_physical_grouped_aggregate_merge : public sirius_physical_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE =
-    SiriusPhysicalOperatorType::HASH_GROUP_BY;
+    SiriusPhysicalOperatorType::MERGE_GROUP_BY;
 
  public:
-  sirius_physical_grouped_aggregate(
-    duckdb::ClientContext& context,
-    duckdb::vector<duckdb::LogicalType> types,
-    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
-    duckdb::idx_t estimated_cardinality);
+  sirius_physical_grouped_aggregate_merge(sirius_physical_grouped_aggregate* grouped_aggregate);
 
-  sirius_physical_grouped_aggregate(
-    duckdb::ClientContext& context,
-    duckdb::vector<duckdb::LogicalType> types,
-    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
-    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups,
-    duckdb::idx_t estimated_cardinality);
-
-  sirius_physical_grouped_aggregate(
-    duckdb::ClientContext& context,
+  sirius_physical_grouped_aggregate_merge(
     duckdb::vector<duckdb::LogicalType> types,
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups,
@@ -73,6 +62,9 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
   duckdb::unsafe_vector<duckdb::idx_t> distinct_filter;
 
   duckdb::unordered_map<duckdb::Expression*, size_t> filter_indexes;
+
+  sirius_physical_operator* child_op;
+  sirius_physical_operator* get_child_op() const { return child_op; }
 
  public:
   // Source interface

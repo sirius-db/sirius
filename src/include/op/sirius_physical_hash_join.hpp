@@ -39,8 +39,7 @@ namespace op {
 
 class sirius_physical_hash_join : public sirius_physical_operator {
  public:
-  static constexpr const duckdb::PhysicalOperatorType TYPE =
-    duckdb::PhysicalOperatorType::HASH_JOIN;
+  static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::HASH_JOIN;
 
   struct join_projection_columns {
     duckdb::vector<duckdb::idx_t> col_idxs;

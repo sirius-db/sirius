@@ -59,11 +59,11 @@ class task_creation_info {
     for (auto& [next_op, port_id] : next_port_after_sink) {
       destination_data_repositories.push_back(next_op->get_port(port_id)->repo);
     }
-    if (_node->type == ::duckdb::PhysicalOperatorType::TABLE_SCAN) {
+    if (_node->type == op::SiriusPhysicalOperatorType::TABLE_SCAN) {
       auto& first_operator = _pipeline->get_inner_operators()[0].get();
       destination_data_repositories.push_back(first_operator.get_port("scan")->repo);
     }
-    if (_pipeline->get_sink()->type == ::duckdb::PhysicalOperatorType::RESULT_COLLECTOR) {
+    if (_pipeline->get_sink()->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
       destination_data_repositories.push_back(_node->get_port("final")->repo);
     }
   };
