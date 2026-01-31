@@ -38,7 +38,8 @@ pipeline_executor::pipeline_executor(const exec::thread_pool_config& gpu_executo
                                      const cucascade::memory::system_topology_info* sys_topology)
 {
   // Create the scan executor with memory manager for host allocations
-  _scan_executor = std::make_unique<sirius::op::scan::duckdb_scan_executor>(scan_executor_config, &mem_mgr);
+  _scan_executor =
+    std::make_unique<sirius::op::scan::duckdb_scan_executor>(scan_executor_config, &mem_mgr);
   _scan_executor->set_pipeline_executor(*this);
 
   auto gpu_spaces = mem_mgr.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
@@ -55,16 +56,16 @@ pipeline_executor::pipeline_executor(const exec::thread_pool_config& gpu_executo
 
       if (it != sys_topology->gpus.end()) { config.cpu_affinity_list = it->cpu_cores; }
     }
-    _gpu_executors.emplace(
-      device_id,
-      std::make_unique<gpu_pipeline_executor>(config, const_cast<cucascade::memory::memory_space*>(space), this));
+    _gpu_executors.emplace(device_id,
+                           std::make_unique<gpu_pipeline_executor>(
+                             config, const_cast<cucascade::memory::memory_space*>(space), this));
   }
 }
 
 void pipeline_executor::schedule(std::unique_ptr<sirius::parallel::itask> task)
 {
   if (task->is<sirius::op::scan::duckdb_scan_task>()) {
-    _scan_queue.push(std::move(task));
+    _scan_executor->schedule(std::move(task));
   } else {
     _task_queue.push(std::move(task));
   }
@@ -85,11 +86,8 @@ void pipeline_executor::stop()
   bool expected = true;
   if (!_running.compare_exchange_strong(expected, false)) { return; }
   _task_queue.interrupt();
-  _scan_queue.interrupt();
   _task_request_queue.interrupt();
-  // Stop scan executor
   _scan_executor->stop();
-  // Stop all GPU executors
   for (auto& [device_id, gpu_exec] : _gpu_executors) {
     gpu_exec->stop();
   }
@@ -98,16 +96,6 @@ void pipeline_executor::stop()
 void pipeline_executor::submit_task_request(std::unique_ptr<task_request> request)
 {
   _task_request_queue.push(std::move(request));
-}
-
-void pipeline_executor::dispatch_to_gpu_executor(std::unique_ptr<sirius::parallel::itask> task,
-                                                 int gpu_id)
-{
-  auto it = _gpu_executors.find(gpu_id);
-  if (it == _gpu_executors.end()) {
-    throw std::runtime_error("Invalid GPU ID: " + std::to_string(gpu_id));
-  }
-  it->second->schedule(std::move(task));
 }
 
 void pipeline_executor::set_task_creator(sirius::creator::task_creator& task_creator)
@@ -126,22 +114,25 @@ void pipeline_executor::management_eventloop()
       SIRIUS_LOG_INFO("Task request queue closed, exiting management event loop.");
       break;
     }
-    if (request->is_scan) {
-      // Pop from scan queue and dispatch to scan executor
-      auto task = _scan_queue.pop();
-      if (task == nullptr) {
-        SIRIUS_LOG_INFO("Scan queue closed, exiting management event loop.");
-        break;
-      }
-      _scan_executor->schedule(std::move(task));
-    } else {
-      // Pop from task queue and dispatch to GPU executor
+    if (!request->is_scan) {
       auto task = _task_queue.pop();
       if (task == nullptr) {
         SIRIUS_LOG_INFO("Task queue closed, exiting management event loop.");
         break;
       }
-      dispatch_to_gpu_executor(std::move(task), request->device_id);
+      _gpu_executors.at(request->device_id)->schedule(std::move(task));
+    } else {
+      // if scan executor doesn't have more tasks to run, it sends a request
+      // pipeline executor will schedule more tasks from priority scans if available
+      std::lock_guard<std::mutex> lock(_priority_scans_mutex);
+      while (!_priority_scans.empty()) {
+        auto* scan = _priority_scans.front();
+        if (scan->can_create_more_tasks()) {
+          _task_creator->schedule(scan);
+        } else {
+          _priority_scans.pop();
+        }
+      }
     }
   }
 }

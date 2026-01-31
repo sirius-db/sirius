@@ -21,6 +21,7 @@
 #include "exec/interruptible_mpmc.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/scan/duckdb_scan_executor.hpp"
+#include "op/sirius_physical_operator.hpp"
 #include "parallel/task.hpp"
 #include "pipeline/gpu_pipeline_executor.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
@@ -100,14 +101,6 @@ class pipeline_executor {
   void stop();
 
   /**
-   * @brief Dispatch a task to a specific GPU executor based on GPU ID
-   *
-   * @param task The task to schedule
-   * @param gpu_id The GPU ID to which the task should be scheduled
-   */
-  void dispatch_to_gpu_executor(std::unique_ptr<sirius::parallel::itask> task, int gpu_id);
-
-  /**
    * @brief Submit a task request to task_request_queue
    */
   void submit_task_request(std::unique_ptr<task_request> request);
@@ -139,9 +132,10 @@ class pipeline_executor {
  private:
   void management_eventloop();
 
-  exec::interruptible_mpmc<std::unique_ptr<sirius::parallel::itask>> _task_queue;      ///< Queue for GPU pipeline tasks
-  exec::interruptible_mpmc<std::unique_ptr<sirius::parallel::itask>> _scan_queue;      ///< Queue for scan tasks
-
+  std::mutex _priority_scans_mutex;
+  std::queue<op::sirius_physical_operator*> _priority_scans;
+  exec::interruptible_mpmc<std::unique_ptr<sirius::parallel::itask>>
+    _task_queue;  ///< Queue for GPU pipeline tasks
   exec::interruptible_mpmc<std::unique_ptr<task_request>> _task_request_queue;
   std::thread _management_thread;
   std::atomic<bool> _running{false};
