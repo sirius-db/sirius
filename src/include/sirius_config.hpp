@@ -17,7 +17,7 @@
 #pragma once
 
 #include "config.hpp"
-#include "parallel/config.hpp"
+#include "exec/config.hpp"
 
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
@@ -49,24 +49,24 @@ struct sirius_config {
   [[nodiscard]] const std::vector<cucascade::memory::memory_space_config>&
   get_memory_space_configs() const noexcept;
 
-  [[nodiscard]] const parallel::task_executor_config& get_gpu_pipeline_executor_config()
-    const noexcept;
+  [[nodiscard]] const exec::thread_pool_config& get_gpu_pipeline_executor_config() const noexcept;
 
-  [[nodiscard]] const parallel::task_executor_config& get_downgrade_executor_config()
-    const noexcept;
+  [[nodiscard]] const exec::thread_pool_config& get_downgrade_executor_config() const noexcept;
 
-  [[nodiscard]] const parallel::task_executor_config& get_duckdb_scan_executor_config()
-    const noexcept;
+  [[nodiscard]] const exec::thread_pool_config& get_duckdb_scan_executor_config() const noexcept;
+
+  [[nodiscard]] bool is_scan_caching_enabled() const noexcept { return enable_scan_caching_; }
 
  private:
   cucascade::memory::system_topology_info hw_topology_;
   std::vector<cucascade::memory::memory_space_config> _memory_space_configs;
-  parallel::task_executor_config _gpu_pipeline_executor_config{.num_threads    = 4,
-                                                               .retry_on_error = true};
-  parallel::task_executor_config _downgrade_executor_config{.num_threads    = 4,
-                                                            .retry_on_error = false};
-  parallel::task_executor_config _duckdb_scan_executor_config{.num_threads    = 4,
-                                                              .retry_on_error = false};
+  exec::thread_pool_config _gpu_pipeline_executor_config{.num_threads        = 4,
+                                                         .thread_name_prefix = "gpu_pipeline"};
+  exec::thread_pool_config _downgrade_executor_config{.num_threads        = 4,
+                                                      .thread_name_prefix = "downgrade"};
+  exec::thread_pool_config _duckdb_scan_executor_config{.num_threads        = 4,
+                                                        .thread_name_prefix = "duckdb_scan"};
+  bool enable_scan_caching_         = false;
   size_t _task_creator_thread_count = 4;
 };
 

@@ -21,6 +21,7 @@
 #include "extension_lock.hpp"
 #include "log/logging.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
+// #include "op/scan/caching_duckdb_scan_executor.hpp"
 
 #include <spdlog/sinks/basic_file_sink.h>
 #include <spdlog/spdlog.h>
@@ -71,7 +72,15 @@ SiriusContext::~SiriusContext() noexcept
   if (is_initialized_) { terminate(); }
 }
 
-void SiriusContext::QueryBegin(ClientContext& context) {}
+void SiriusContext::QueryBegin(ClientContext& context)
+{
+  // auto query = context.GetCurrentQuery();
+  // if (config_.is_scan_caching_enabled()) {
+  //   auto caching_executor =
+  //     dynamic_cast<sirius::op::scan::caching_duckdb_scan_executor*>(duckdb_scan_executor_.get());
+  //   if (caching_executor) { caching_executor->cache_scan_results_for_query(query); }
+  // }
+}
 
 void SiriusContext::QueryEnd() {}
 
@@ -90,14 +99,22 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
 
   data_repository_manager_ = std::make_unique<cucascade::shared_data_repository_manager>();
 
+  // bool is_scan_caching_enabled = config_.is_scan_caching_enabled();
+  // if (is_scan_caching_enabled) {
+  //   duckdb_scan_executor_ = std::make_unique<sirius::op::scan::caching_duckdb_scan_executor>(
+  //     config_.get_duckdb_scan_executor_config());
+  // } else {
+  //   duckdb_scan_executor_ = std::make_unique<sirius::op::scan::duckdb_scan_executor>(
+  //     config_.get_duckdb_scan_executor_config());
+  // }
+
   pipeline_executor_ = std::make_unique<sirius::pipeline::pipeline_executor>(
     config_.get_gpu_pipeline_executor_config(), *memory_manager_, &config_.get_hw_topology());
+  // pipeline_executor_->set_scan_executor(*duckdb_scan_executor_);
+  // duckdb_scan_executor_->set_pipeline_executor(pipeline_executor_.get());
 
   downgrade_executor_ = std::make_unique<sirius::parallel::downgrade_executor>(
     config_.get_downgrade_executor_config(), *data_repository_manager_);
-  duckdb_scan_executor_ = std::make_unique<sirius::op::scan::duckdb_scan_executor>(
-
-    config_.get_duckdb_scan_executor_config());
 
   task_creator_ =
     std::make_unique<sirius::creator::task_creator>(config_.get_task_creator_thread_count(),
