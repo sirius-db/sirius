@@ -28,6 +28,8 @@
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
 
+#include <unordered_map>
+
 namespace sirius {
 namespace pipeline {
 
@@ -117,7 +119,8 @@ class pipeline_executor : public sirius::parallel::itask_executor {
   void submit_task_request(std::unique_ptr<task_request> request);
 
  private:
-  std::vector<std::unique_ptr<gpu_pipeline_executor>> _gpu_executors;  ///< Vector of GPU executors
+  std::unordered_map<int, std::unique_ptr<gpu_pipeline_executor>>
+    _gpu_executors;  ///< Map of device_id to GPU executor
   std::unique_ptr<task_request_queue> _task_request_queue;
 };
 
