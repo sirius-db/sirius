@@ -23,6 +23,7 @@
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/scan/duckdb_scan_executor.hpp"
 #include "op/scan/duckdb_scan_task.hpp"
+#include "pipeline/gpu_pipeline_executor.hpp"
 #include "pipeline/pipeline_queue.hpp"
 
 #include <cucascade/memory/common.hpp>
@@ -38,9 +39,9 @@ pipeline_executor::pipeline_executor(const exec::thread_pool_config& gpu_executo
                                      const cucascade::memory::system_topology_info* sys_topology)
 {
   // Create the scan executor with memory manager for host allocations
-  _scan_executor =
-    std::make_unique<sirius::op::scan::duckdb_scan_executor>(scan_executor_config, &mem_mgr);
-  _scan_executor->set_pipeline_executor(*this);
+  // Pass a publisher so it can submit task requests without depending on pipeline_executor
+  _scan_executor = std::make_unique<sirius::op::scan::duckdb_scan_executor>(
+    scan_executor_config, &mem_mgr, _task_request_channel.make_publisher());
 
   auto gpu_spaces = mem_mgr.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
   // Initialize GPU pipeline executors for each available GPU
@@ -56,11 +57,16 @@ pipeline_executor::pipeline_executor(const exec::thread_pool_config& gpu_executo
 
       if (it != sys_topology->gpus.end()) { config.cpu_affinity_list = it->cpu_cores; }
     }
-    _gpu_executors.emplace(device_id,
-                           std::make_unique<gpu_pipeline_executor>(
-                             config, const_cast<cucascade::memory::memory_space*>(space), this));
+    // Pass a publisher so gpu_pipeline_executor can submit task requests
+    _gpu_executors.emplace(
+      device_id,
+      std::make_unique<gpu_pipeline_executor>(config,
+                                              const_cast<cucascade::memory::memory_space*>(space),
+                                              _task_request_channel.make_publisher()));
   }
 }
+
+pipeline_executor::~pipeline_executor() = default;
 
 void pipeline_executor::schedule(std::unique_ptr<sirius::parallel::itask> task)
 {
@@ -86,16 +92,11 @@ void pipeline_executor::stop()
   bool expected = true;
   if (!_running.compare_exchange_strong(expected, false)) { return; }
   _task_queue.interrupt();
-  _task_request_queue.interrupt();
+  _task_request_channel.close();
   _scan_executor->stop();
   for (auto& [device_id, gpu_exec] : _gpu_executors) {
     gpu_exec->stop();
   }
-}
-
-void pipeline_executor::submit_task_request(std::unique_ptr<task_request> request)
-{
-  _task_request_queue.push(std::move(request));
 }
 
 void pipeline_executor::set_task_creator(sirius::creator::task_creator& task_creator)
@@ -106,12 +107,24 @@ void pipeline_executor::set_task_creator(sirius::creator::task_creator& task_cre
   }
 }
 
+[[nodiscard]] sirius::op::scan::duckdb_scan_executor&
+pipeline_executor::get_scan_executor() noexcept
+{
+  return *_scan_executor;
+}
+
+[[nodiscard]] const sirius::op::scan::duckdb_scan_executor& pipeline_executor::get_scan_executor()
+  const noexcept
+{
+  return *_scan_executor;
+}
+
 void pipeline_executor::management_eventloop()
 {
   while (_running.load()) {
-    auto request = _task_request_queue.pop();
+    auto request = _task_request_channel.get();
     if (request == nullptr) {
-      SIRIUS_LOG_INFO("Task request queue closed, exiting management event loop.");
+      SIRIUS_LOG_INFO("Task request channel closed, exiting management event loop.");
       break;
     }
     if (!request->is_scan) {

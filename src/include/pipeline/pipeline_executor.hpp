@@ -17,29 +17,32 @@
 #pragma once
 
 #include "config.hpp"
+#include "exec/channel.hpp"
 #include "exec/config.hpp"
 #include "exec/interruptible_mpmc.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
-#include "op/scan/duckdb_scan_executor.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "parallel/task.hpp"
-#include "pipeline/gpu_pipeline_executor.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/task_request.hpp"
 
-#include <blockingconcurrentqueue.h>
-#include <cucascade/data/data_repository.hpp>
-#include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/topology_discovery.hpp>
 
+#include <queue>
 #include <unordered_map>
 
 namespace sirius::creator {
 class task_creator;
 }  // namespace sirius::creator
 
+namespace sirius::op::scan {
+class duckdb_scan_executor;
+}  // namespace sirius::op::scan
+
 namespace sirius {
 namespace pipeline {
+
+class gpu_pipeline_executor;
 
 /**
  * @brief Executor specialized for executing GPU pipeline operations.
@@ -66,7 +69,7 @@ class pipeline_executor {
   /**
    * @brief Destructor for the gpu_pipeline_executor.
    */
-  ~pipeline_executor() = default;
+  ~pipeline_executor();
 
   // Non-copyable but movable
   pipeline_executor(const pipeline_executor&)            = delete;
@@ -101,11 +104,6 @@ class pipeline_executor {
   void stop();
 
   /**
-   * @brief Submit a task request to task_request_queue
-   */
-  void submit_task_request(std::unique_ptr<task_request> request);
-
-  /**
    * @brief Set the task creator reference
    *
    * Sets the task creator for this executor and propagates it to all GPU executors.
@@ -119,15 +117,9 @@ class pipeline_executor {
    *
    * @return Reference to the duckdb scan executor
    */
-  [[nodiscard]] sirius::op::scan::duckdb_scan_executor& get_scan_executor() noexcept
-  {
-    return *_scan_executor;
-  }
+  [[nodiscard]] sirius::op::scan::duckdb_scan_executor& get_scan_executor() noexcept;
 
-  [[nodiscard]] const sirius::op::scan::duckdb_scan_executor& get_scan_executor() const noexcept
-  {
-    return *_scan_executor;
-  }
+  [[nodiscard]] const sirius::op::scan::duckdb_scan_executor& get_scan_executor() const noexcept;
 
  private:
   void management_eventloop();
@@ -136,7 +128,7 @@ class pipeline_executor {
   std::queue<op::sirius_physical_operator*> _priority_scans;
   exec::interruptible_mpmc<std::unique_ptr<sirius::parallel::itask>>
     _task_queue;  ///< Queue for GPU pipeline tasks
-  exec::interruptible_mpmc<std::unique_ptr<task_request>> _task_request_queue;
+  exec::channel<std::unique_ptr<task_request>> _task_request_channel;
   std::thread _management_thread;
   std::atomic<bool> _running{false};
 

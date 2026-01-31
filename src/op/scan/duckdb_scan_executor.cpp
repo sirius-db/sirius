@@ -18,17 +18,20 @@
 
 #include "log/logging.hpp"
 #include "op/scan/duckdb_scan_task.hpp"
-#include "pipeline/pipeline_executor.hpp"
 #include "pipeline/sirius_pipeline_itask_local_state.hpp"
-#include "pipeline/task_request.hpp"
 
 #include <cucascade/memory/common.hpp>
 
 namespace sirius::op::scan {
 
-duckdb_scan_executor::duckdb_scan_executor(exec::thread_pool_config config,
-                                           cucascade::memory::memory_reservation_manager* mem_mgr)
-  : _config(config), _kiosk(config.num_threads), _mem_mgr(mem_mgr)
+duckdb_scan_executor::duckdb_scan_executor(
+  exec::thread_pool_config config,
+  cucascade::memory::memory_reservation_manager* mem_mgr,
+  exec::publisher<std::unique_ptr<sirius::pipeline::task_request>> task_request_publisher)
+  : _config(config),
+    _kiosk(config.num_threads),
+    _task_request_publisher(std::move(task_request_publisher)),
+    _mem_mgr(mem_mgr)
 {
 }
 
@@ -59,17 +62,11 @@ void duckdb_scan_executor::stop()
 
 void duckdb_scan_executor::wait_all() { _kiosk.wait_all(); }
 
-void duckdb_scan_executor::set_pipeline_executor(sirius::pipeline::pipeline_executor& pipeline_exec)
-{
-  _pipeline_exec = &pipeline_exec;
-}
-
 void duckdb_scan_executor::submit_scan_request()
 {
-  if (_pipeline_exec) {
-    // Device ID 0 for scan tasks (CPU-based), is_scan = true
-    _pipeline_exec->submit_task_request(std::make_unique<sirius::pipeline::task_request>(0, true));
-  }
+  // Device ID 0 for scan tasks (CPU-based), is_scan = true
+  [[maybe_unused]] auto result =
+    _task_request_publisher.send(std::make_unique<sirius::pipeline::task_request>(0, true));
 }
 
 void duckdb_scan_executor::manager_loop()

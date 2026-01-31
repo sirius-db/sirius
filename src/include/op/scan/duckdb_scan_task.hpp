@@ -21,6 +21,7 @@
 #include <memory/host_table_utils.hpp>
 #include <memory/multiple_blocks_allocation_accessor.hpp>
 #include <op/sirius_physical_duckdb_scan.hpp>
+#include <op/sirius_physical_table_scan.hpp>
 #include <parallel/task.hpp>
 #include <pipeline/pipeline_executor.hpp>
 #include <pipeline/sirius_pipeline.hpp>
@@ -48,7 +49,6 @@
 #include <cstdint>
 
 namespace sirius::op::scan {
-
 //===----------------------------------------------------------------------===//
 // DuckDB Scan Task Global State
 //===----------------------------------------------------------------------===//
@@ -100,8 +100,9 @@ class duckdb_scan_task_global_state : public sirius::parallel::itask_global_stat
   /**
    * @brief Increment the number of active local table function states
    *
-   * We keep track of the number of active local states to determine when the table source is fully
-   * drained. Only when all local states have exhausted their scan range is the table fully read.
+   * We keep track of the number of active local states to determine when the table source is
+   * fully drained. Only when all local states have exhausted their scan range is the table fully
+   * read.
    */
   void increment_local_states() { _active_local_states.fetch_add(1, std::memory_order_relaxed); }
 
@@ -138,9 +139,9 @@ class duckdb_scan_task_global_state : public sirius::parallel::itask_global_stat
 /**
  * @brief The local state for a duckdb scan task.
  *
- * This class manages the state specific to a single scan task, most importantly the memory buffers
- * into which to accumulate data from a DuckDB table scan and the logic for processing DuckDB data
- * chunks into those buffers.
+ * This class manages the state specific to a single scan task, most importantly the memory
+ * buffers into which to accumulate data from a DuckDB table scan and the logic for processing
+ * DuckDB data chunks into those buffers.
  *
  */
 class duckdb_scan_task_local_state : public sirius::pipeline::sirius_pipeline_itask_local_state {
@@ -318,7 +319,8 @@ class duckdb_scan_task_local_state : public sirius::pipeline::sirius_pipeline_it
   [[nodiscard]] size_t get_tail_byte_offset() const;
 
   /**
-   * @brief Estimate the maximum number of rows to process for a batch given the target batch size.
+   * @brief Estimate the maximum number of rows to process for a batch given the target batch
+   * size.
    *
    * Uses the actual width of fixed-width types, and a default VARCHAR width, for estimation.
    *
@@ -402,7 +404,8 @@ class duckdb_scan_task : public sirius::pipeline::sirius_pipeline_itask {
   static bool chunk_fits(duckdb_scan_task_local_state& l_state);
 
   /**
-   * @brief Processes the current data chunk and copies its data into the column builders' buffers.
+   * @brief Processes the current data chunk and copies its data into the column builders'
+   * buffers.
    */
   void process_chunk(duckdb_scan_task_local_state& l_state);
 
