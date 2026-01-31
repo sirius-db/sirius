@@ -273,8 +273,8 @@ TEST_CASE("kiosk stop causes acquire to return invalid ticket", "[kiosk][stop]")
   std::atomic<bool> got_invalid{false};
 
   std::thread waiter([&]() {
-    auto t2      = k.acquire();
-    got_invalid  = !t2.is_valid();
+    auto t2     = k.acquire();
+    got_invalid = !t2.is_valid();
   });
 
   // Give waiter time to block
@@ -573,7 +573,7 @@ TEST_CASE("ticket bool conversion", "[kiosk][ticket]")
 TEST_CASE("kiosk concurrent acquire and release stress test", "[kiosk][stress]")
 {
   kiosk k(10);
-  constexpr int num_threads   = 20;
+  constexpr int num_threads    = 20;
   constexpr int ops_per_thread = 100;
   std::atomic<int> successful_acquires{0};
 
@@ -609,7 +609,7 @@ TEST_CASE("bounded kiosk capacity of 1 serializes access", "[kiosk][bounded]")
   std::vector<std::thread> threads;
   for (int i = 0; i < num_threads; ++i) {
     threads.emplace_back([&]() {
-      auto t = k.acquire();
+      auto t      = k.acquire();
       int current = concurrent.fetch_add(1) + 1;
 
       // Track max concurrent
