@@ -22,6 +22,8 @@
 #include "exec/thread_pool.hpp"
 #include "parallel/task.hpp"
 
+#include <cucascade/memory/memory_reservation_manager.hpp>
+
 #include <atomic>
 #include <memory>
 #include <thread>
@@ -48,8 +50,10 @@ class duckdb_scan_executor {
    * @brief Constructs a new duckdb_scan_executor with task execution configuration
    *
    * @param config Configuration for the thread pool (thread count, etc.)
+   * @param mem_mgr Pointer to the memory reservation manager for host allocations
    */
-  explicit duckdb_scan_executor(exec::thread_pool_config config);
+  explicit duckdb_scan_executor(exec::thread_pool_config config,
+                                cucascade::memory::memory_reservation_manager* mem_mgr);
 
   /**
    * @brief Destructor for the duckdb_scan_executor.
@@ -121,6 +125,7 @@ class duckdb_scan_executor {
   exec::interruptible_mpmc<std::unique_ptr<sirius::parallel::itask>> _task_queue;
   std::thread _manager_thread;
   sirius::pipeline::pipeline_executor* _pipeline_exec{nullptr};
+  cucascade::memory::memory_reservation_manager* _mem_mgr{nullptr};
 };
 
 }  // namespace sirius::op::scan

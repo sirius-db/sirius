@@ -37,8 +37,8 @@ pipeline_executor::pipeline_executor(const parallel::task_executor_config& gpu_t
                                      sirius::memory::sirius_memory_reservation_manager& mem_mgr,
                                      const cucascade::memory::system_topology_info* sys_topology)
 {
-  // Create the scan executor
-  _scan_executor = std::make_unique<sirius::op::scan::duckdb_scan_executor>(scan_executor_config);
+  // Create the scan executor with memory manager for host allocations
+  _scan_executor = std::make_unique<sirius::op::scan::duckdb_scan_executor>(scan_executor_config, &mem_mgr);
   _scan_executor->set_pipeline_executor(*this);
 
   auto gpu_spaces = mem_mgr.get_memory_spaces_for_tier(cucascade::memory::Tier::GPU);
