@@ -75,10 +75,13 @@ TEST_CASE("unbounded kiosk try_acquire always succeeds", "[kiosk][unbounded]")
 {
   kiosk k;
 
+  std::vector<ticket> tickets;
+  tickets.reserve(50);
   for (int i = 0; i < 50; ++i) {
     auto t = k.try_acquire();
     REQUIRE(t.has_value());
     REQUIRE(t->is_valid());
+    tickets.push_back(std::move(*t));
   }
 
   REQUIRE(k.active_count() == 50);

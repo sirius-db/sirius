@@ -157,6 +157,7 @@ ticket kiosk::acquire()
 
   if (stopped_) return ticket();
   ++total_issued_;
+  ++active_tickets_;
   return ticket(*this);
 }
 
