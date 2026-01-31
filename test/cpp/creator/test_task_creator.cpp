@@ -18,7 +18,6 @@
 #include "creator/task_creator.hpp"
 #include "exec/config.hpp"
 #include "gpu_context.hpp"
-#include "op/scan/duckdb_scan_executor.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "parallel/task_executor.hpp"
 #include "pipeline/pipeline_executor.hpp"
@@ -162,9 +161,8 @@ class testable_task_creator : public task_creator {
                         sirius_pipeline_hashmap& gpu_pipeline_map,
                         duckdb::ClientContext& client_context,
                         pipeline_executor& pipeline_executor,
-                        duckdb_scan_executor& duckdb_scan_executor,
                         sirius::memory::sirius_memory_reservation_manager& mem_res_mgr)
-    : task_creator(num_threads, duckdb_scan_executor, mem_res_mgr)
+    : task_creator(num_threads, mem_res_mgr)
   {
     this->set_client_context(client_context);
     this->set_pipeline_hashmap(gpu_pipeline_map);
@@ -252,8 +250,7 @@ class test_fixture {
           std::move(space_configs));
       }()),
       gpu_executor_config{1, false},
-      pipeline_exec(gpu_executor_config, *memory_manager),
-      scan_exec(exec::thread_pool_config{.num_threads = 2}),
+      pipeline_exec(gpu_executor_config, exec::thread_pool_config{.num_threads = 2}, *memory_manager),
       empty_pipelines(),
       pipeline_map(empty_pipelines)
   {
@@ -274,7 +271,6 @@ class test_fixture {
   sirius_engine engine;
   task_executor_config gpu_executor_config;
   pipeline_executor pipeline_exec;
-  duckdb_scan_executor scan_exec;
   duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> empty_pipelines;
   sirius::sirius_pipeline_hashmap pipeline_map;
 };
@@ -404,7 +400,6 @@ TEST_CASE("task_creator thread pool starts and stops", "[task_creator]")
                                 fixture.pipeline_map,
                                 *fixture.con.context,
                                 fixture.pipeline_exec,
-                                fixture.scan_exec,
                                 *fixture.memory_manager);
 
   SECTION("Creator starts not running") { REQUIRE_FALSE(creator.is_running()); }
@@ -443,7 +438,6 @@ TEST_CASE("task_creator thread pool is idempotent", "[task_creator]")
                                 fixture.pipeline_map,
                                 *fixture.con.context,
                                 fixture.pipeline_exec,
-                                fixture.scan_exec,
                                 *fixture.memory_manager);
 
   SECTION("Multiple start_thread_pool calls don't create extra threads")
@@ -488,7 +482,6 @@ TEST_CASE("task_creator destructor stops thread pool", "[task_creator]")
                                   fixture.pipeline_map,
                                   *fixture.con.context,
                                   fixture.pipeline_exec,
-                                  fixture.scan_exec,
                                   *fixture.memory_manager);
     creator.start_thread_pool();
     // Destructor should stop threads
@@ -510,7 +503,6 @@ TEST_CASE("process_next_task with monostate hint and empty priority_scans", "[ta
                                 fixture.pipeline_map,
                                 *fixture.con.context,
                                 fixture.pipeline_exec,
-                                fixture.scan_exec,
                                 *fixture.memory_manager);
 
   // Create a mock operator with no ports (will return monostate)
@@ -541,7 +533,6 @@ TEST_CASE("process_next_task with monostate hint uses priority_scans", "[task_cr
                                 fixture.pipeline_map,
                                 *fixture.con.context,
                                 fixture.pipeline_exec,
-                                fixture.scan_exec,
                                 *fixture.memory_manager);
 
   // Initially priority_scans should be empty (no TABLE_SCAN sources in empty pipeline map)
@@ -563,7 +554,6 @@ TEST_CASE("process_next_task with operator hint schedules the hint node", "[task
                                 fixture.pipeline_map,
                                 *fixture.con.context,
                                 fixture.pipeline_exec,
-                                fixture.scan_exec,
                                 *fixture.memory_manager);
 
   // Create the source operator that we will call process_next_task on
@@ -618,7 +608,6 @@ TEST_CASE("process_next_task with pipeline hint recurses to inner operator", "[t
                                 fixture.pipeline_map,
                                 *fixture.con.context,
                                 fixture.pipeline_exec,
-                                fixture.scan_exec,
                                 *fixture.memory_manager);
 
   // Create an operator chain: source_op returns a custom hint that is monostate
@@ -659,7 +648,6 @@ TEST_CASE("process_next_task operator hint follows dest_pipeline", "[task_creato
                                 fixture.pipeline_map,
                                 *fixture.con.context,
                                 fixture.pipeline_exec,
-                                fixture.scan_exec,
                                 *fixture.memory_manager);
 
   // Create operators
@@ -692,7 +680,6 @@ TEST_CASE("process_next_task hint traversal chain", "[task_creator]")
                                 fixture.pipeline_map,
                                 *fixture.con.context,
                                 fixture.pipeline_exec,
-                                fixture.scan_exec,
                                 *fixture.memory_manager);
 
   // Test a chain where:
@@ -726,7 +713,6 @@ TEST_CASE("task_creator start/stop lifecycle", "[task_creator]")
                                 fixture.pipeline_map,
                                 *fixture.con.context,
                                 fixture.pipeline_exec,
-                                fixture.scan_exec,
                                 *fixture.memory_manager);
 
   SECTION("start() calls start_thread_pool()")
@@ -753,7 +739,6 @@ TEST_CASE("task_creator get_next_task_id increments", "[task_creator]")
                                 fixture.pipeline_map,
                                 *fixture.con.context,
                                 fixture.pipeline_exec,
-                                fixture.scan_exec,
                                 *fixture.memory_manager);
 
   // The task_id is protected, but we can verify behavior indirectly
@@ -773,7 +758,6 @@ TEST_CASE("task_creator queue integration", "[task_creator]")
                                 fixture.pipeline_map,
                                 *fixture.con.context,
                                 fixture.pipeline_exec,
-                                fixture.scan_exec,
                                 *fixture.memory_manager);
 
   SECTION("Queue is accessible")
@@ -1148,7 +1132,6 @@ TEST_CASE("task_creator handles concurrent schedule calls", "[task_creator]")
                                 fixture.pipeline_map,
                                 *fixture.con.context,
                                 fixture.pipeline_exec,
-                                fixture.scan_exec,
                                 *fixture.memory_manager);
 
   const int num_calls = 100;
