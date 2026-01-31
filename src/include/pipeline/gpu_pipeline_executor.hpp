@@ -32,6 +32,10 @@
 #include <queue>
 #include <thread>
 
+namespace sirius::creator {
+class task_creator;
+}  // namespace sirius::creator
+
 namespace sirius {
 namespace pipeline {
 
@@ -92,6 +96,13 @@ class gpu_pipeline_executor {
    */
   void stop();
 
+  /**
+   * @brief Set the task creator reference
+   *
+   * @param task_creator Reference to the task creator
+   */
+  void set_task_creator(sirius::creator::task_creator& task_creator);
+
  private:
   /**
    * @brief Manager loop to consume task from local buffer and dispatch to the thread pool
@@ -120,6 +131,7 @@ class gpu_pipeline_executor {
   std::thread _manager_thread;
   pipeline_executor* _pipeline_exec;
   cucascade::memory::memory_space* _memory_space;
+  sirius::creator::task_creator* _task_creator{nullptr};
 };
 
 }  // namespace pipeline

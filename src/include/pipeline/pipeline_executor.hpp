@@ -31,6 +31,10 @@
 
 #include <unordered_map>
 
+namespace sirius::creator {
+class task_creator;
+}  // namespace sirius::creator
+
 namespace sirius {
 namespace pipeline {
 
@@ -105,6 +109,15 @@ class pipeline_executor {
    */
   void submit_task_request(std::unique_ptr<task_request> request);
 
+  /**
+   * @brief Set the task creator reference
+   *
+   * Sets the task creator for this executor and propagates it to all GPU executors.
+   *
+   * @param task_creator Reference to the task creator
+   */
+  void set_task_creator(sirius::creator::task_creator& task_creator);
+
  private:
   void management_eventloop();
 
@@ -116,6 +129,8 @@ class pipeline_executor {
 
   std::unordered_map<int, std::unique_ptr<gpu_pipeline_executor>>
     _gpu_executors;  ///< Map of device_id to GPU executor
+
+  sirius::creator::task_creator* _task_creator{nullptr};
 };
 
 }  // namespace pipeline

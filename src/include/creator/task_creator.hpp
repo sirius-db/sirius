@@ -21,7 +21,7 @@
 #include "op/scan/duckdb_scan_executor.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "parallel/task_executor.hpp"
-#include "pipeline/pipeline_executor.hpp"
+#include "memory/sirius_memory_reservation_manager.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "sirius_pipeline_hashmap.hpp"
 
@@ -36,6 +36,10 @@
 #include <mutex>
 #include <thread>
 #include <variant>
+
+namespace sirius::pipeline {
+class pipeline_executor;
+}  // namespace sirius::pipeline
 
 namespace sirius::creator {
 
@@ -154,12 +158,10 @@ class task_creator {
    * @brief Construct a new task_creator.
    *
    * @param num_threads The number of worker threads to use.
-   * @param gpu_pipeline_map A mapping of operators to their pipelines.
-   * @param pipeline_executor Reference to the pipeline executor.
    * @param duckdb_scan_executor Reference to the duckdb scan executor.
+   * @param mem_res_mgr Reference to the memory reservation manager.
    */
   task_creator(size_t num_threads,
-               sirius::pipeline::pipeline_executor& pipeline_executor,
                sirius::op::scan::duckdb_scan_executor& duckdb_scan_executor,
                sirius::memory::sirius_memory_reservation_manager& mem_res_mgr);
 
@@ -179,6 +181,9 @@ class task_creator {
 
   /// \brief sets gpu pipeline hash map needed for task creation
   void set_pipeline_hashmap(sirius_pipeline_hashmap& sirius_pipeline_map);
+
+  /// \brief sets pipeline executor reference
+  void set_pipeline_executor(sirius::pipeline::pipeline_executor& pipeline_executor);
 
   /// \brief clean-up query bound resources and prepare the task creator for next query
   void reset();
@@ -269,7 +274,7 @@ class task_creator {
   std::unique_ptr<task_creation_queue> _task_creation_queue;
   sirius_pipeline_hashmap* _sirius_pipeline_map;
   ::duckdb::ClientContext* _client_context;
-  sirius::pipeline::pipeline_executor& _pipeline_executor;
+  sirius::pipeline::pipeline_executor* _pipeline_executor{nullptr};
   sirius::op::scan::duckdb_scan_executor&
     _duckdb_scan_executor;  // WSM: schedule on pipeline executor
   sirius::memory::sirius_memory_reservation_manager& _mem_res_mgr;
