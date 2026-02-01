@@ -165,19 +165,6 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
   /// @brief Get the output consumer operators for this task.
   std::vector<op::sirius_physical_operator*> get_output_consumers() override;
 
-  std::size_t get_estimated_reservation_size() override
-  {
-    return 0;
-    /// TODO(WSM)
-  }
-
-  /// @brief Get the output consumer operators for this task.
-  std::vector<op::sirius_physical_operator*> get_output_consumers() override
-  {
-    return {};
-    /// TODO(WSM)
-  }
-
  private:
   uint64_t _task_id;
   std::vector<cucascade::shared_data_repository*> _data_repos;

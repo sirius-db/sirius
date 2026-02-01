@@ -109,19 +109,18 @@ class gpu_pipeline_executor {
   void set_schedule_callback(
     std::function<void(sirius::op::sirius_physical_operator*)> schedule_fn);
 
- private:
-  /**
-   * @brief Manager loop to consume task from local buffer and dispatch to the thread pool
-   */
-  void manager_loop();
-
-  /**
   /**
    * @brief Set the task creator pointer for this executor
    *
    * @param creator Pointer to the task creator
    */
-  void set_task_creator(creator::task_creator* creator);
+   void set_task_creator(creator::task_creator* creator);
+
+ private:
+  /**
+   * @brief Manager loop to consume task from local buffer and dispatch to the thread pool
+   */
+  void manager_loop();
 
  private:
   /**
