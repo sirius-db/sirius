@@ -129,7 +129,8 @@ void sirius_pipeline::add_dependency(duckdb::shared_ptr<sirius_pipeline>& pipeli
 // 	}
 // }
 
-// duckdb::vector<duckdb::reference<op::sirius_physical_operator>> sirius_pipeline::get_all_operators()
+// duckdb::vector<duckdb::reference<op::sirius_physical_operator>>
+// sirius_pipeline::get_all_operators()
 // {
 //   duckdb::vector<duckdb::reference<op::sirius_physical_operator>> result;
 //   D_ASSERT(source);
@@ -154,8 +155,7 @@ void sirius_pipeline::add_dependency(duckdb::shared_ptr<sirius_pipeline>& pipeli
 //   return result;
 // }
 
-duckdb::vector<duckdb::reference<op::sirius_physical_operator>>
-sirius_pipeline::get_operators()
+duckdb::vector<duckdb::reference<op::sirius_physical_operator>> sirius_pipeline::get_operators()
 {
   return operators;
 }

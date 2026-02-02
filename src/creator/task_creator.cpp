@@ -203,18 +203,15 @@ void task_creator::worker_function(int worker_id)
         // scheduling pipeline task
       } else {
         auto inner_ops = info->_pipeline->get_operators();
-        if (inner_ops.empty()) {
-          throw std::runtime_error("Pipeline has no operators to execute");
-        }
+        if (inner_ops.empty()) { throw std::runtime_error("Pipeline has no operators to execute"); }
         duckdb::reference<sirius::op::sirius_physical_operator> node = inner_ops[0];
         info->_pipeline->get_sink()->set_creator(this);
         // need to exhaust input batches until all ports are empty
         while (!node.get().all_ports_empty()) {
           std::vector<std::shared_ptr<cucascade::data_batch>> input_batch;
           auto sink_op = info->_pipeline->get_sink().get();
-          if (sink_op &&
-              (sink_op->TYPE == op::SiriusPhysicalOperatorType::MERGE_TOP_N ||
-               sink_op->TYPE == op::SiriusPhysicalOperatorType::MERGE_AGGREGATE)) {
+          if (sink_op && (sink_op->TYPE == op::SiriusPhysicalOperatorType::MERGE_TOP_N ||
+                          sink_op->TYPE == op::SiriusPhysicalOperatorType::MERGE_AGGREGATE)) {
             while (!node.get().all_ports_empty()) {
               auto next_batch = node.get().get_input_batch();
               if (next_batch.empty()) { break; }

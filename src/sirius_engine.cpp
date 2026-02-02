@@ -171,9 +171,9 @@ void sirius_engine::execute()
   if (sirius_ctx == nullptr) {
     throw duckdb::InvalidInputException("Sirius context is not initialized.");
   }
-  
+
   // Convert vector to hashmap
-  sirius_pipeline_hashmap pipeline_map(new_scheduled);  
+  sirius_pipeline_hashmap pipeline_map(new_scheduled);
   auto& task_creator = sirius_ctx->get_task_creator();
   task_creator.set_pipeline_hashmap(pipeline_map);
 }
@@ -893,9 +893,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
 
     // create invalid operators
     auto invalid_op = make_uniq<op::sirius_physical_operator>(
-      op::SiriusPhysicalOperatorType::INVALID,
-      duckdb::vector<duckdb::LogicalType>{},
-      0);
+      op::SiriusPhysicalOperatorType::INVALID, duckdb::vector<duckdb::LogicalType>{}, 0);
 
     // Assign pipeline IDs based on new_scheduled order
     for (size_t i = 0; i < new_scheduled.size(); i++) {

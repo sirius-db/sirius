@@ -285,8 +285,7 @@ bool sirius_physical_operator::is_source_pipeline_finished()
 }
 
 // implement get_all_ports
-std::vector<std::string_view>
-sirius_physical_operator::get_port_ids()
+std::vector<std::string_view> sirius_physical_operator::get_port_ids()
 {
   std::vector<std::string_view> result;
   for (auto& [port_name, port_ptr] : ports) {
