@@ -174,6 +174,17 @@ void sirius_engine::execute()
   printf("Sirius Context Pointer on execute: %p\n", (void*)sirius_ctx.get());
   auto& task_creator = sirius_ctx->get_task_creator();
   printf("Task Creator get next task id: %lu\n", task_creator.get_next_task_id());
+  if (!sirius_pipelines.empty()) {
+    auto sirius_pipeline_map = sirius::sirius_pipeline_hashmap(sirius_pipelines);
+    task_creator.set_pipeline_hashmap(sirius_pipeline_map);
+    task_creator.set_client_context(context);
+    task_creator.start();
+    auto& duckdb_scan_executor = sirius_ctx->get_duckdb_scan_executor();
+    duckdb_scan_executor.start();
+    auto& pipeline_executor = sirius_ctx->get_pipeline_executor();
+    pipeline_executor.start();
+    while (!sirius_root_pipelines.front().get()->is_pipeline_finished()) {}
+  }
 }
 
 duckdb::unique_ptr<op::sirius_physical_operator> sirius_engine::construct_sirius_specific_operator(
