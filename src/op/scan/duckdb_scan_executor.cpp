@@ -195,7 +195,7 @@ void duckdb_scan_executor::manager_loop()
       auto consumers = scan_task->get_output_consumers();
       auto batches   = get_scan_output(scan_task);
       scan_task->publish_output(std::move(batches));
-      t.reset();
+      t.reset();      
       if (_schedule_callback) {
         for (auto* consumer : consumers) {
           _schedule_callback(consumer);

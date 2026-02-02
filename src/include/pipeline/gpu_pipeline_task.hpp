@@ -114,6 +114,8 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
                     std::unique_ptr<sirius_pipeline_itask_local_state> local_state,
                     std::shared_ptr<sirius::parallel::itask_global_state> global_state);
 
+// WSM TODO: put mark_task_completed in destructor
+
   /**
    * @brief Method to actually execute the task
    */

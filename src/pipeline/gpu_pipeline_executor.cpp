@@ -95,8 +95,10 @@ void gpu_pipeline_executor::manager_loop()
                             task      = std::move(pipeline_task),
                             ticket    = std::move(ticket),
                             consumers = std::move(output_consumers)]() mutable {
-      task->execute();
+      task->execute();      
       task.reset();
+
+
       if (_schedule_callback) {
         for (auto* consumer : consumers) {
           _schedule_callback(consumer);

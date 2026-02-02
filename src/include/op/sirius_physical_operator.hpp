@@ -241,6 +241,9 @@ class sirius_physical_operator {
   bool all_ports_empty();
   //! Check if the pipeline is finished
   bool check_pipeline_finished();
+
+  //! Get pipeline
+  pipeline::sirius_pipeline& get_pipeline();
  
  private:
   //! The ports of the operator

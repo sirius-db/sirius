@@ -272,7 +272,7 @@ void sirius_pipeline::update_pipeline_status()
 {
   if (get_source()->type == op::SiriusPhysicalOperatorType::TABLE_SCAN) {
     auto& table_scan = get_source()->Cast<op::sirius_physical_table_scan>();
-    if (table_scan.exhausted) {
+    if (table_scan.exhausted) {  // WSM TODO: can we use exhausted? how about we use get_next_task_hint() to check if the source is ready?
       pipeline_finished = true;
       return;
     }    
@@ -281,6 +281,8 @@ void sirius_pipeline::update_pipeline_status()
     if (first_node == nullptr) {
       throw duckdb::InternalException("First node of pipeline is nullptr");
     }
+    // WSM TODO need to increament task created before pulling data?
+    // Lets fix this by putting task creation as a method in the pipeline class so that it can be done atomically.
     if(first_node->is_source_pipeline_finished() && first_node->all_ports_empty()){
       pipeline_finished = tasks_created.load() == tasks_completed.load();
     }

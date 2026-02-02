@@ -296,5 +296,10 @@ bool sirius_physical_operator::is_source_pipeline_finished()
   }
   return true;
 }
+
+pipeline::sirius_pipeline& sirius_physical_operator::get_pipeline()
+{
+  return ports.begin()->second->dest_pipeline;
+}
 }  // namespace op
 }  // namespace sirius
