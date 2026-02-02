@@ -127,7 +127,10 @@ class duckdb_scan_task_global_state : public sirius::parallel::itask_global_stat
     return output_consumers;
   }
 
-  [[nodiscard]] size_t get_pipeline_id() const { return _pipeline->get_pipeline_id(); }
+  [[nodiscard]] size_t get_scan_op_id() const
+  {
+    return _pipeline->get_inner_operators().at(0).get().get_operator_id();
+  }
 
  private:
   //===----------Fields----------===//
@@ -478,9 +481,9 @@ class duckdb_scan_task : public sirius::pipeline::sirius_pipeline_itask {
     return this->_global_state->cast<duckdb_scan_task_global_state>().get_output_consumers();
   }
 
-  [[nodiscard]] size_t get_pipeline_id() const
+  [[nodiscard]] size_t get_scan_op_id() const
   {
-    return this->_global_state->cast<duckdb_scan_task_global_state>().get_pipeline_id();
+    return this->_global_state->cast<duckdb_scan_task_global_state>().get_scan_op_id();
   }
 
  private:

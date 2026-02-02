@@ -128,7 +128,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> duckdb_scan_executor::get_sc
   if (!_caching_enabled) {
     return task->compute_task();
   } else {
-    auto pipe_id = task->get_pipeline_id();
+    auto pipe_id = task->get_scan_op_id();
     std::lock_guard<std::mutex> lock(_cache_mutex);
     // todo (amin) : we need to clone the batches to avoid modifying the original batches
     auto& entry = _cache.at(pipe_id);
