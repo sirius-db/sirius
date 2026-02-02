@@ -26,10 +26,10 @@ def _log(msg, warmup=False):
 
 
 def _wrap_gpu_processing(sql):
-    """Wrap SQL in gpu_processing call."""
+    """Wrap SQL in gpu_execution call."""
     # Escape quotes in the SQL
     escaped_sql = sql.replace('"', '\\"')
-    return f'call gpu_processing("{escaped_sql}");'
+    return f'call gpu_execution("{escaped_sql}");'
 
 
 def _verify_results(duckdb_rows, sirius_rows, query_name):
