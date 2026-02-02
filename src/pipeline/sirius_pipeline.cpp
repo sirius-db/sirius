@@ -288,7 +288,7 @@ void sirius_pipeline::update_pipeline_status()
     }
   }  
 }
-// WSM TODO: use these two functions in the right place
+
 void sirius_pipeline::mark_task_created(){
   tasks_created++;
 }

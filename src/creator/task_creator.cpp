@@ -194,7 +194,7 @@ void task_creator::manager_loop()
           }
           auto scan_task =
             std::make_unique<op::scan::duckdb_scan_task>(get_next_task_id(),
-                                                         destination_data_repositories[0],  // WSM TODO: is this correct? there probably needs to be multiple possible destination data repositories
+                                                         destination_data_repositories[0],  // WSM amin TODO: is this correct? there probably needs to be multiple possible destination data repositories
                                                          std::move(scan_task_local_state),
                                                          std::move(scan_task_global_state));
           
