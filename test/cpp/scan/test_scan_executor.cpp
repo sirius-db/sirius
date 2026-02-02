@@ -22,6 +22,7 @@
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
 #include <exec/config.hpp>
+#include <op/scan/duckdb_scan_executor.hpp>
 #include <op/scan/duckdb_scan_task.hpp>
 #include <op/sirius_physical_table_scan.hpp>
 #include <pipeline/pipeline_executor.hpp>
