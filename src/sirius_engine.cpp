@@ -57,6 +57,7 @@ void sirius_engine::reset()
   total_pipelines   = 0;
   sirius_pipelines.clear();
   new_pipeline_breakers.clear();
+  new_scheduled.clear();
 }
 
 void sirius_engine::insert_repository(
@@ -64,9 +65,9 @@ void sirius_engine::insert_repository(
   duckdb::shared_ptr<pipeline::sirius_pipeline> input_pipeline,
   duckdb::shared_ptr<pipeline::sirius_pipeline> dependent_pipeline)
 {
-  auto next_op            = dependent_pipeline->get_inner_operators().size() == 0
+  auto next_op            = dependent_pipeline->get_operators().size() == 0
                               ? dependent_pipeline->get_sink().get()
-                              : &dependent_pipeline->get_inner_operators()[0].get();
+                              : &dependent_pipeline->get_operators()[0].get();
   size_t op_id            = next_op->operator_id;
   auto& data_repo_manager = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
                               ->get_data_repository_manager();
@@ -89,9 +90,9 @@ void sirius_engine::insert_repository(
 {
   auto& data_repo_manager = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
                               ->get_data_repository_manager();
-  auto next_op = dependent_pipeline->get_inner_operators().size() == 0
+  auto next_op = dependent_pipeline->get_operators().size() == 0
                    ? dependent_pipeline->get_sink().get()
-                   : &dependent_pipeline->get_inner_operators()[0].get();
+                   : &dependent_pipeline->get_operators()[0].get();
   size_t op_id = next_op->operator_id;
   data_repo_manager.add_new_repository(
     op_id, port_id, std::make_unique<::cucascade::shared_data_repository>());
@@ -122,7 +123,7 @@ duckdb::shared_ptr<pipeline::sirius_pipeline> sirius_engine::create_child_pipeli
   child_pipeline->source = &op;
 
   // the child pipeline has the same operators up until 'op'
-  for (auto current_op : current.get_inner_operators()) {
+  for (auto current_op : current.get_operators()) {
     if (&current_op.get() == &op) { break; }
     child_pipeline->operators.push_back(current_op);
   }
@@ -165,15 +166,16 @@ void sirius_engine::execute()
   // wait until the query finish
   // take the query result from sirius_physical_result_collector
   // return the result to duckdb
-  printf("Client Context Pointer on execute: %p\n", (void*)&context);
   // get sirius context
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (sirius_ctx == nullptr) {
     throw duckdb::InvalidInputException("Sirius context is not initialized.");
   }
-  printf("Sirius Context Pointer on execute: %p\n", (void*)sirius_ctx.get());
+
+  // Convert vector to hashmap
+  sirius_pipeline_hashmap pipeline_map(new_scheduled);
   auto& task_creator = sirius_ctx->get_task_creator();
-  printf("Task Creator get next task id: %lu\n", task_creator.get_next_task_id());
+  task_creator.set_pipeline_hashmap(pipeline_map);
 }
 
 duckdb::unique_ptr<op::sirius_physical_operator> sirius_engine::construct_sirius_specific_operator(
@@ -714,9 +716,9 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
         }
       } else if (new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
         for (auto dependent_pipeline : source_to_pipelines[new_scheduled[i]->get_sink().get()]) {
-          auto next_op             = dependent_pipeline->get_inner_operators().size() == 0
+          auto next_op             = dependent_pipeline->get_operators().size() == 0
                                        ? dependent_pipeline->get_sink().get()
-                                       : &dependent_pipeline->get_inner_operators()[0].get();
+                                       : &dependent_pipeline->get_operators()[0].get();
           size_t op_id             = next_op->operator_id;
           std::string_view port_id = "scan";
           data_repo_manager.add_new_repository(
@@ -734,11 +736,6 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
       } else {
         throw std::runtime_error("Unsupported sink type for modified pipeline");
       }
-    }
-
-    // Assign pipeline IDs based on new_scheduled order
-    for (size_t i = 0; i < new_scheduled.size(); i++) {
-      new_scheduled[i]->set_pipeline_id(i);
     }
 
     // Detailed pipeline debugging information
@@ -893,6 +890,23 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
 
     // Flush immediately to ensure all debug output is written synchronously
     // spdlog::default_logger()->flush();
+
+    // create invalid operators
+    auto invalid_op = make_uniq<op::sirius_physical_operator>(
+      op::SiriusPhysicalOperatorType::INVALID, duckdb::vector<duckdb::LogicalType>{}, 0);
+
+    // Assign pipeline IDs based on new_scheduled order
+    for (size_t i = 0; i < new_scheduled.size(); i++) {
+      new_scheduled[i]->set_pipeline_id(i);
+      new_scheduled[i]->operators.push_back(*new_scheduled[i]->sink);
+      new_scheduled[i]->source = &new_scheduled[i]->operators[0].get();
+      new_scheduled[i]->parents.clear();
+      auto& first_op = new_scheduled[i]->operators[0].get();
+      // iterate through ports at first_op
+      for (auto port_id : first_op.get_port_ids()) {
+        new_scheduled[i]->parents.push_back(first_op.get_port(port_id)->src_pipeline);
+      }
+    }
 
     // collect all pipelines from the root pipelines (recursively) for the progress bar and verify
     // them
