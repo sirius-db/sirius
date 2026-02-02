@@ -16,6 +16,7 @@
 
 #include "creator/task_creator.hpp"
 
+#include "log/logging.hpp"
 #include "op/scan/duckdb_scan_task.hpp"
 #include "op/sirius_physical_duckdb_scan.hpp"
 #include "op/sirius_physical_top_n.hpp"
@@ -36,9 +37,9 @@ namespace sirius::creator {
 // task_creator
 //------------------------------------------------------------------------------
 
-task_creator::task_creator(size_t num_threads,
+task_creator::task_creator(exec::thread_pool_config config,
                            sirius::memory::sirius_memory_reservation_manager& mem_res_mgr)
-  : _num_threads(num_threads), _running(false), _mem_res_mgr(mem_res_mgr)
+  : _running(false), _config(config), _mem_res_mgr(mem_res_mgr)
 {
   
 }
@@ -117,21 +118,20 @@ void task_creator::start_thread_pool()
 {
   bool expected = false;
   if (!_running.compare_exchange_strong(expected, true)) { return; }
-  _threads.reserve(_num_threads);
-  for (size_t i = 0; i < _num_threads; ++i) {
-    _threads.emplace_back(&task_creator::worker_function, this, i);
-  }
+  _thread_pool = std::make_unique<exec::thread_pool>(
+    _config.num_threads, _config.thread_name_prefix, _config.cpu_affinity_list);
+  _manager_thread = std::thread(&task_creator::manager_loop, this);
 }
 
 void task_creator::stop_thread_pool()
 {
   bool expected = true;
   if (!_running.compare_exchange_strong(expected, false)) { return; }
+  _kiosk.stop();
   on_stop();
-  for (auto& thread : _threads) {
-    if (thread.joinable()) { thread.join(); }
-  }
-  _threads.clear();
+  if (_manager_thread.joinable()) { _manager_thread.join(); }
+  _kiosk.wait_all();
+  if (_thread_pool) { _thread_pool->stop(); }
 }
 
 void task_creator::schedule(op::sirius_physical_operator* node)
@@ -139,77 +139,93 @@ void task_creator::schedule(op::sirius_physical_operator* node)
   _task_creation_queue.push(std::make_unique<task_creation_request>(node));
 }
 
-void task_creator::worker_function(int worker_id)
+void task_creator::manager_loop()
 {
   while (_running.load()) {
-    // WSM TODO: is this queue blocking? 
-    auto request = _task_creation_queue.pop();
-    auto node = request->node;
-
-    // WSM TODO: is this correct?
-    if (node == nullptr) {
-      // Task queue is closed.
+    auto ticket = _kiosk.acquire();  // block till a thread is available
+    if (!ticket.is_valid()) {
+      SIRIUS_LOG_INFO("Task Creator: Kiosk interrupted, stopping manager loop");
       break;
     }
 
-
-    node = get_operator_for_next_task(node);
-    if (node == nullptr) {
-      continue;
+    auto request = _task_creation_queue.pop();
+    if (!request) {
+      SIRIUS_LOG_INFO("Task Creator: task queue interrupted, stopping manager loop");
+      break;
     }
-    try {
-      // Get what we need to create the task
-      auto pipeline = node->get_pipeline();
-      std::vector<cucascade::shared_data_repository*> destination_data_repositories;
-      auto next_port_after_sink = pipeline->get_sink()->get_next_port_after_sink();
-      for (auto& [next_op, port_id] : next_port_after_sink) {
-        destination_data_repositories.push_back(next_op->get_port(port_id)->repo);
-      }
 
-      // scheduling scan task
-      if (node->type == ::sirius::op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
-        auto scan_task_global_state = std::make_shared<op::scan::duckdb_scan_task_global_state>(
-          pipeline,
-          *_pipeline_executor,
-          *_client_context,
-          &node->Cast<op::sirius_physical_duckdb_scan>());
-        duckdb::ThreadContext thread_ctx(*_client_context);
-        duckdb::ExecutionContext exec_ctx(*_client_context, thread_ctx, nullptr);
-        auto scan_task_local_state = std::make_unique<op::scan::duckdb_scan_task_local_state>(
-          *scan_task_global_state, exec_ctx);
-        if (destination_data_repositories.empty()) {
-          throw std::runtime_error(
-            "No destination data repositories provided for scan task creation.");
+    // Schedule the task creation work on the thread pool
+    _thread_pool->schedule([this, 
+                            request = std::move(request),
+                            ticket = std::move(ticket)]() mutable {
+      try {
+        auto node = request->node;
+        if (node == nullptr) {
+          return;
         }
-        auto scan_task =
-          std::make_unique<op::scan::duckdb_scan_task>(get_next_task_id(),
-                                                       destination_data_repositories[0],  // WSM TODO: is this correct? there probably needs to be multiple possible destination data repositories
-                                                       std::move(scan_task_local_state),
-                                                       std::move(scan_task_global_state));
-        
-                                                       // WSM todo we should be scheduling directly pipeline_executor, which in turn will schedule with the scan executor
-                                                       _pipeline_executor->schedule(std::move(scan_task));
-        // scheduling pipeline task
-      } else {
-        // need to exhaust input batches until all ports are empty
-        while (!node->all_ports_empty()) {
-          auto input_batch = node->get_input_batch(); // WSM TODO: rename this to get_next_task_input_batch
-          auto global_state =
-            std::make_shared<pipeline::gpu_pipeline_task_global_state>(pipeline);
-          auto local_state =
-            std::make_unique<pipeline::gpu_pipeline_task_local_state>(input_batch);
-          auto task =
-            std::make_unique<pipeline::gpu_pipeline_task>(get_next_task_id(),
-                                                          destination_data_repositories,
-                                                          std::move(local_state),
-                                                          std::move(global_state));
-          _pipeline_executor->schedule(std::move(task));
-        }
-      }
 
-    } catch (const std::exception& e) {
-      stop();
-    }
+        node = get_operator_for_next_task(node);
+        if (node == nullptr) {
+          return;
+        }
+
+        // Get what we need to create the task
+        auto pipeline = node->get_pipeline();
+        std::vector<cucascade::shared_data_repository*> destination_data_repositories;
+        auto next_port_after_sink = pipeline->get_sink()->get_next_port_after_sink();
+        for (auto& [next_op, port_id] : next_port_after_sink) {
+          destination_data_repositories.push_back(next_op->get_port(port_id)->repo);
+        }
+
+        // scheduling scan task
+        if (node->type == ::sirius::op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
+          auto scan_task_global_state = std::make_shared<op::scan::duckdb_scan_task_global_state>(
+            pipeline,
+            *_pipeline_executor,
+            *_client_context,
+            &node->Cast<op::sirius_physical_duckdb_scan>());
+          duckdb::ThreadContext thread_ctx(*_client_context);
+          duckdb::ExecutionContext exec_ctx(*_client_context, thread_ctx, nullptr);
+          auto scan_task_local_state = std::make_unique<op::scan::duckdb_scan_task_local_state>(
+            *scan_task_global_state, exec_ctx);
+          if (destination_data_repositories.empty()) {
+            throw std::runtime_error(
+              "No destination data repositories provided for scan task creation.");
+          }
+          auto scan_task =
+            std::make_unique<op::scan::duckdb_scan_task>(get_next_task_id(),
+                                                         destination_data_repositories[0],  // WSM TODO: is this correct? there probably needs to be multiple possible destination data repositories
+                                                         std::move(scan_task_local_state),
+                                                         std::move(scan_task_global_state));
+          
+           _pipeline_executor->schedule(std::move(scan_task));
+          // scheduling pipeline task
+        } else {
+          // need to exhaust input batches until all ports are empty
+          while (!node->all_ports_empty()) {
+            auto input_batch = node->get_next_task_input_batch(); 
+            if (!input_batch.has_value()) {
+              break;
+            }
+            pipeline->mark_task_created(); // WSM TODO: this needs to be done atomically with the task creation
+
+            auto global_state =
+              std::make_shared<pipeline::gpu_pipeline_task_global_state>(pipeline);
+            auto local_state =
+              std::make_unique<pipeline::gpu_pipeline_task_local_state>(input_batch.value());
+            auto task =
+              std::make_unique<pipeline::gpu_pipeline_task>(get_next_task_id(),
+                                                            destination_data_repositories,
+                                                            std::move(local_state),
+                                                            std::move(global_state));
+            _pipeline_executor->schedule(std::move(task));
+          }
+        }
+      } catch (const std::exception& e) {
+        SIRIUS_LOG_ERROR("Task Creator: Exception during task creation: {}", e.what());
+        stop();
+      }
+    });
   }
 }
 

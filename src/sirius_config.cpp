@@ -232,12 +232,12 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
   config_setter.add_config("sirius.memory.gpu", gpu_memory_config_instance);
   config_setter.add_config("sirius.memory.host", host_memory_config_instance);
   config_setter.add_config("sirius.memory.disk", disk_memory_config_instance);
+  config_setter.add_config("sirius.executor.task_creator", _task_creator_config);
   config_setter.add_config("sirius.executor.pipeline", _gpu_pipeline_executor_config);
   config_setter.add_config("sirius.executor.downgrade", _downgrade_executor_config);
   config_setter.add_config("sirius.executor.duckdb_scan", _duckdb_scan_executor_config);
   config_setter.add_config("sirius.executor.duckdb_scan.cache", enable_scan_caching_);
-  config_setter.add_config("sirius.executor.task_creator_num_threads", _task_creator_thread_count);
-
+  
   config_setter.add_config("sirius.space.gpu", gpu_memory_space_configs);
   config_setter.add_config("sirius.space.host", host_memory_space_configs);
   config_setter.add_config("sirius.space.disk", disk_memory_space_configs);
@@ -287,6 +287,11 @@ const exec::thread_pool_config& sirius_config::get_gpu_pipeline_executor_config(
 const exec::thread_pool_config& sirius_config::get_downgrade_executor_config() const noexcept
 {
   return _downgrade_executor_config;
+}
+
+const exec::thread_pool_config& sirius_config::get_task_creator_config() const noexcept
+{
+  return _task_creator_config;
 }
 
 const exec::thread_pool_config& sirius_config::get_duckdb_scan_executor_config() const noexcept

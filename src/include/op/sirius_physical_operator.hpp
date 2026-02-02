@@ -236,7 +236,7 @@ class sirius_physical_operator {
   }
 
   //! Get the input batch
-  std::vector<std::shared_ptr<::cucascade::data_batch>> get_input_batch();
+  std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>> get_next_task_input_batch();
   //! Check if all ports are empty
   bool all_ports_empty();
   //! Check if the pipeline is finished

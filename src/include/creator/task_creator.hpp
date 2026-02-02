@@ -18,7 +18,10 @@
 
 #include "duckdb/main/client_context.hpp"
 #include "helper/helper.hpp"
+#include "exec/config.hpp"
 #include "exec/interruptible_mpmc.hpp"
+#include "exec/kiosk.hpp"
+#include "exec/thread_pool.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "parallel/task_executor.hpp"
@@ -166,10 +169,10 @@ class task_creator {
   /**
    * @brief Construct a new task_creator.
    *
-   * @param num_threads The number of worker threads to use.
+   * @param config Configuration for the thread pool (thread count, name prefix, CPU affinity).
    * @param mem_res_mgr Reference to the memory reservation manager.
    */
-  task_creator(size_t num_threads, sirius::memory::sirius_memory_reservation_manager& mem_res_mgr);
+  task_creator(exec::thread_pool_config config, sirius::memory::sirius_memory_reservation_manager& mem_res_mgr);
 
   /**
    * @brief Destructor that ensures the thread pool is stopped.
@@ -249,14 +252,12 @@ class task_creator {
   op::sirius_physical_operator* get_operator_for_next_task(op::sirius_physical_operator* node);
 
   /**
-   * @brief Worker function executed by each thread in the pool.
+   * @brief Manager loop to consume task creation requests and dispatch to the thread pool.
    *
-   * Continuously pulls task creation requests from the queue and processes them
-   * until the thread pool is stopped or the queue is closed.
-   *
-   * @param worker_id The identifier of this worker thread.
+   * Acquires tickets from the kiosk (ensuring controlled concurrency), pulls task creation
+   * requests from the queue, and schedules work on the thread pool.
    */
-  void worker_function(int worker_id);
+  void manager_loop();
 
   /**
    * @brief Called when the thread pool stops.
@@ -265,9 +266,11 @@ class task_creator {
    */
   void on_stop();
 
-  size_t _num_threads;
   std::atomic<bool> _running;
-  std::vector<std::thread> _threads;
+  exec::thread_pool_config _config;
+  exec::kiosk _kiosk;
+  std::unique_ptr<exec::thread_pool> _thread_pool;
+  std::thread _manager_thread;
   std::queue<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>> _priority_scans;
   sirius_pipeline_hashmap* _sirius_pipeline_map;
   ::duckdb::ClientContext* _client_context;

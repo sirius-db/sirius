@@ -266,7 +266,7 @@ std::optional<task_creation_hint> sirius_physical_operator::get_next_task_hint()
   return std::nullopt;
 }
 
-std::vector<::std::shared_ptr<::cucascade::data_batch>> sirius_physical_operator::get_input_batch()
+std::optional<std::vector<::std::shared_ptr<::cucascade::data_batch>>> sirius_physical_operator::get_next_task_input_batch()
 {
   // take one data batch from each port and schedule a task (a task takes one data batch from each
   // port), do this repeatedly until all ports are empty

@@ -105,6 +105,11 @@ gpu_pipeline_task::gpu_pipeline_task(
 {
 }
 
+gpu_pipeline_task::~gpu_pipeline_task()
+{
+  _global_state->cast<gpu_pipeline_task_global_state>()._pipeline.get()->mark_task_completed();
+}
+
 uint64_t gpu_pipeline_task::get_task_id() const { return _task_id; }
 
 const sirius_pipeline* gpu_pipeline_task::get_pipeline() const

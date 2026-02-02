@@ -41,13 +41,10 @@ struct sirius_config {
     return hw_topology_;
   }
 
-  [[nodiscard]] size_t get_task_creator_thread_count() const noexcept
-  {
-    return _task_creator_thread_count;
-  }
-
   [[nodiscard]] const std::vector<cucascade::memory::memory_space_config>&
   get_memory_space_configs() const noexcept;
+
+  [[nodiscard]] const exec::thread_pool_config& get_task_creator_config() const noexcept;
 
   [[nodiscard]] const exec::thread_pool_config& get_gpu_pipeline_executor_config() const noexcept;
 
@@ -60,14 +57,15 @@ struct sirius_config {
  private:
   cucascade::memory::system_topology_info hw_topology_;
   std::vector<cucascade::memory::memory_space_config> _memory_space_configs;
+  exec::thread_pool_config _task_creator_config{.num_threads        = 2,
+                                                .thread_name_prefix = "task_creator"};
   exec::thread_pool_config _gpu_pipeline_executor_config{.num_threads        = 4,
                                                          .thread_name_prefix = "gpu_pipeline"};
   exec::thread_pool_config _downgrade_executor_config{.num_threads        = 4,
                                                       .thread_name_prefix = "downgrade"};
   exec::thread_pool_config _duckdb_scan_executor_config{.num_threads        = 4,
                                                         .thread_name_prefix = "duckdb_scan"};
-  bool enable_scan_caching_         = false;
-  size_t _task_creator_thread_count = 2;
+  bool enable_scan_caching_         = false;  
 };
 
 }  // namespace sirius

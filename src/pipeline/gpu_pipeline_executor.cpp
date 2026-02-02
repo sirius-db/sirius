@@ -44,6 +44,8 @@ void gpu_pipeline_executor::start()
 {
   bool expected = false;
   if (!_running.compare_exchange_strong(expected, true)) { return; }
+  _thread_pool = std::make_unique<exec::thread_pool>(
+    _config.num_threads, _config.thread_name_prefix, _config.cpu_affinity_list);
   _manager_thread = std::thread(&gpu_pipeline_executor::manager_loop, this);
 }
 
@@ -51,9 +53,11 @@ void gpu_pipeline_executor::stop()
 {
   bool expected = true;
   if (!_running.compare_exchange_strong(expected, false)) { return; }
+  _kiosk.stop();
   _task_queue.interrupt();
   if (_manager_thread.joinable()) { _manager_thread.join(); }
   _kiosk.wait_all();
+  if (_thread_pool) { _thread_pool->stop(); }
 }
 
 void gpu_pipeline_executor::manager_loop()
