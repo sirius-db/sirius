@@ -270,6 +270,7 @@ class task_creator {
   std::unique_ptr<task_creation_queue> _task_creation_queue;
   sirius_pipeline_hashmap* _sirius_pipeline_map;
   ::duckdb::ClientContext* _client_context;
+  std::unique_ptr<duckdb::ThreadContext> _thread_context;
   sirius::pipeline::pipeline_executor& _pipeline_executor;
   sirius::op::scan::duckdb_scan_executor& _duckdb_scan_executor;
   sirius::memory::sirius_memory_reservation_manager& _mem_res_mgr;

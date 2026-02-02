@@ -270,7 +270,7 @@ class duckdb_scan_task_local_state : public sirius::parallel::itask_local_state 
    */
   duckdb_scan_task_local_state(
     duckdb_scan_task_global_state& g_state,
-    duckdb::ExecutionContext& exec_ctx,
+    std::unique_ptr<duckdb::ExecutionContext> owned_exec_ctx = nullptr,
     size_t approximate_batch_size = duckdb::Config::DEFAULT_SCAN_TASK_BATCH_SIZE,
     size_t default_varchar_size   = duckdb::Config::DEFAULT_SCAN_TASK_VARCHAR_SIZE,
     std::unique_ptr<duckdb::LocalTableFunctionState> existing_local_tf_state = nullptr);
@@ -305,9 +305,10 @@ class duckdb_scan_task_local_state : public sirius::parallel::itask_local_state 
   bool _local_state_drained = false;  ///< Whether this local state has fully drained
 
   std::unique_ptr<duckdb::LocalTableFunctionState>
-    _local_tf_state;                    ///< Local state for the table function.
-  duckdb::ExecutionContext& _exec_ctx;  ///< The duckdb execution context, needed for initializing
-                                        ///< the local table function state
+    _local_tf_state;  ///< Local state for the table function.
+  std::unique_ptr<duckdb::ExecutionContext>
+    _exec_ctx_ptr;  ///< Owned execution context, needed for initializing the local table function
+                    ///< state
 
   /**
    * @brief Get the byte offset within the allocation where the column data ends.

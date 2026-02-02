@@ -271,21 +271,18 @@ metadata_node duckdb_scan_task_local_state::column_builder::make_metadata_node(
 //===----------Constructor----------===//
 duckdb_scan_task_local_state::duckdb_scan_task_local_state(
   duckdb_scan_task_global_state& g_state,
-  duckdb::ExecutionContext& exec_ctx,
+  std::unique_ptr<duckdb::ExecutionContext> owned_exec_ctx,
   size_t approximate_batch_size,
   size_t default_varchar_size,
   std::unique_ptr<duckdb::LocalTableFunctionState> existing_local_tf_state)
   : _approximate_batch_size(approximate_batch_size),
     _default_varchar_size(default_varchar_size),
-    _exec_ctx(exec_ctx)
+    _exec_ctx_ptr(std::move(owned_exec_ctx)))
 {
   auto const& op = g_state._op;
   _num_columns   = op.projection_ids.size();
 
   if (existing_local_tf_state) {
-    printf(
-      "duckdb_scan_task_local_state::duckdb_scan_task_local_state: existing_local_tf_state: %p\n",
-      static_cast<void*>(existing_local_tf_state.get()));
     _local_tf_state = std::move(existing_local_tf_state);
   } else {
     g_state.increment_local_states();
@@ -314,7 +311,7 @@ duckdb_scan_task_local_state::duckdb_scan_task_local_state(
   initialize_builders();
 
   // Initialize local table function state (will skip if local_tf_state already set)
-  initialize_local_table_function_state(op, exec_ctx, g_state._global_tf_state.get());
+  initialize_local_table_function_state(op, *_exec_ctx_ptr, g_state._global_tf_state.get());
 }
 
 size_t duckdb_scan_task_local_state::get_tail_byte_offset() const
@@ -478,7 +475,8 @@ void duckdb_scan_task::execute()
   auto& l_state = this->_local_state->cast<duckdb_scan_task_local_state>();
   auto& g_state = this->_global_state->cast<duckdb_scan_task_global_state>();
 
-  // Initialize the data chunk
+  // Initialize the data chunk with the SCANNED types (not all returned_types)
+  // The scanned_types correspond to the actual columns being projected
   l_state._chunk.Initialize(duckdb::Allocator::Get(l_state._exec_ctx_ptr->client),
                             g_state._op.scanned_types);
 
@@ -509,7 +507,8 @@ void duckdb_scan_task::execute()
       std::make_unique<duckdb_scan_task_local_state>(g_state,
                                                      l_state._approximate_batch_size,
                                                      l_state._default_varchar_size,
-                                                     std::move(l_state._local_tf_state));
+                                                     std::move(l_state._local_tf_state),
+                                                     std::move(l_state._exec_ctx_ptr));
 
     // Create a new reference to the global state
     auto const new_task_id = g_state._sirius_ctx->get_task_creator().get_next_task_id();
@@ -522,7 +521,6 @@ void duckdb_scan_task::execute()
 
   // Make data batch and push to repository
   if (l_state._row_offset > 0) {
-    printf("Adding data batch to repository\n");
     _data_repo->add_data_batch(l_state.make_data_batch());
 
     // Schedule next task for the pipeline that consumes this scan's output
@@ -533,12 +531,9 @@ void duckdb_scan_task::execute()
       auto* first_inner_op = &inner_operators[0].get();
       auto task_info =
         std::make_unique<creator::task_creation_info>(first_inner_op, g_state._pipeline);
-      printf("Scheduling task_creation_info for inner operator %s\n",
-             first_inner_op->get_name().c_str());
       g_state._sirius_ctx->get_task_creator().schedule(std::move(task_info));
     }
   }
-  printf("Scan task finished\n");
 }
 
 }  // namespace sirius::op::scan
