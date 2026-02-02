@@ -54,7 +54,7 @@ void task_creator::set_pipeline_hashmap(sirius_pipeline_hashmap& sirius_pipeline
 {
   _sirius_pipeline_map = &sirius_pipeline_map;
   for (const auto& i : _sirius_pipeline_map->_vec) {
-    if (i->get_source()->type == op::SiriusPhysicalOperatorType::TABLE_SCAN) {
+    if (i->get_source()->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
       _priority_scans.push(i);
     }
   }
@@ -136,14 +136,15 @@ void task_creator::stop_thread_pool()
 
 void task_creator::schedule(op::sirius_physical_operator* node)
 {
-  _task_creation_queue.push(std::move(node));
+  _task_creation_queue.push(std::make_unique<task_creation_request>(node));
 }
 
 void task_creator::worker_function(int worker_id)
 {
   while (_running.load()) {
     // WSM TODO: is this queue blocking? 
-    auto node = _task_creation_queue.pop();
+    auto request = _task_creation_queue.pop();
+    auto node = request->node;
 
     // WSM TODO: is this correct?
     if (node == nullptr) {
@@ -160,23 +161,23 @@ void task_creator::worker_function(int worker_id)
       // Get what we need to create the task
       auto pipeline = node->get_pipeline();
       std::vector<cucascade::shared_data_repository*> destination_data_repositories;
-      auto next_port_after_sink = _pipeline->get_sink()->get_next_port_after_sink();
+      auto next_port_after_sink = pipeline->get_sink()->get_next_port_after_sink();
       for (auto& [next_op, port_id] : next_port_after_sink) {
         destination_data_repositories.push_back(next_op->get_port(port_id)->repo);
       }
 
       // scheduling scan task
-      if (node->type == ::duckdb::PhysicalOperatorType::TABLE_SCAN) {
+      if (node->type == ::sirius::op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
         auto scan_task_global_state = std::make_shared<op::scan::duckdb_scan_task_global_state>(
           pipeline,
-          _duckdb_scan_executor, // WSM TODO: this should be the pipeline executor
+          *_pipeline_executor,
           *_client_context,
-          &node->Cast<op::sirius_physical_table_scan>());
+          &node->Cast<op::sirius_physical_duckdb_scan>());
         duckdb::ThreadContext thread_ctx(*_client_context);
         duckdb::ExecutionContext exec_ctx(*_client_context, thread_ctx, nullptr);
         auto scan_task_local_state = std::make_unique<op::scan::duckdb_scan_task_local_state>(
           *scan_task_global_state, exec_ctx);
-        if (info->destination_data_repositories.empty()) {
+        if (destination_data_repositories.empty()) {
           throw std::runtime_error(
             "No destination data repositories provided for scan task creation.");
         }
@@ -187,7 +188,7 @@ void task_creator::worker_function(int worker_id)
                                                        std::move(scan_task_global_state));
         
                                                        // WSM todo we should be scheduling directly pipeline_executor, which in turn will schedule with the scan executor
-                                                       _duckdb_scan_executor.schedule(std::move(scan_task));
+                                                       _pipeline_executor->schedule(std::move(scan_task));
         // scheduling pipeline task
       } else {
         // need to exhaust input batches until all ports are empty
@@ -196,13 +197,13 @@ void task_creator::worker_function(int worker_id)
           auto global_state =
             std::make_shared<pipeline::gpu_pipeline_task_global_state>(pipeline);
           auto local_state =
-            std::make_unique<pipeline::gpu_pipeline_task_local_state>(input_batch, nullptr);
+            std::make_unique<pipeline::gpu_pipeline_task_local_state>(input_batch);
           auto task =
             std::make_unique<pipeline::gpu_pipeline_task>(get_next_task_id(),
                                                           destination_data_repositories,
                                                           std::move(local_state),
                                                           std::move(global_state));
-          _pipeline_executor.schedule(std::move(task));
+          _pipeline_executor->schedule(std::move(task));
         }
       }
 
@@ -212,7 +213,7 @@ void task_creator::worker_function(int worker_id)
   }
 }
 
-void task_creator::on_stop() { _task_creation_queue->interrupt(); }
+void task_creator::on_stop() { _task_creation_queue.interrupt(); }
 
 uint64_t task_creator::get_next_task_id() { return _task_id.fetch_add(1); }
 

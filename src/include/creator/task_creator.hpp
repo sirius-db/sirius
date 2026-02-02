@@ -156,6 +156,11 @@ namespace sirius::creator {
  *   3. Call start() to schedule initial scan pipelines.
  *   4. Call stop_thread_pool() when done.
  */
+
+ struct task_creation_request {
+  op::sirius_physical_operator* node;  
+ };
+
 class task_creator {
  public:
   /**
@@ -271,7 +276,7 @@ class task_creator {
   std::atomic<uint64_t> _task_id{0};
 
   // Queue for creating tasks based on operators. The operator is the starting point to start looking which task should be created, not necessarily the operator for whose pipeline the task will be created
-  exec::interruptible_mpmc<sirius::op::sirius_physical_operator*>
+  exec::interruptible_mpmc<std::unique_ptr<task_creation_request>>
     _task_creation_queue;  
 };
 

@@ -286,7 +286,7 @@ void sirius_pipeline::update_pipeline_status()
     if(first_node->is_source_pipeline_finished() && first_node->all_ports_empty()){
       pipeline_finished = tasks_created.load() == tasks_completed.load();
     }
-  }
+  }  
 }
 // WSM TODO: use these two functions in the right place
 void sirius_pipeline::mark_task_created(){

@@ -234,10 +234,10 @@ std::optional<task_creation_hint> sirius_physical_operator::get_next_task_hint()
     }
   }
 
-  // if they are complete, create data if you can
-  if (std::any_of(ports.begin(), ports.end(), [](const auto& port_pair) {
-        return port_pair.second->type != MemoryBarrierType::FULL &&
-               port_pair.second->repo->size() > 0;
+  // if no unfinished barriers, then is this operator ready to create a task?
+  if (std::all_of(ports.begin(), ports.end(), [](const auto& port_pair) {
+        return (port_pair.second->type != MemoryBarrierType::FULL && port_pair.second->repo->size() > 0) ||
+        (port_pair.second->type == MemoryBarrierType::FULL && port_pair.second->repo->size() > 0 && port_pair.second->src_pipeline && port_pair.second->src_pipeline->is_pipeline_finished());
       })) {
     return task_creation_hint{TaskCreationHint::READY, this};
   }
@@ -297,8 +297,9 @@ bool sirius_physical_operator::is_source_pipeline_finished()
   return true;
 }
 
-pipeline::sirius_pipeline& sirius_physical_operator::get_pipeline()
+duckdb::shared_ptr<pipeline::sirius_pipeline> sirius_physical_operator::get_pipeline()
 {
+  if (ports.empty()) { return nullptr; }
   return ports.begin()->second->dest_pipeline;
 }
 }  // namespace op

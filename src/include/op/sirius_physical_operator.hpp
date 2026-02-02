@@ -243,7 +243,7 @@ class sirius_physical_operator {
   bool check_pipeline_finished();
 
   //! Get pipeline
-  pipeline::sirius_pipeline& get_pipeline();
+  duckdb::shared_ptr<pipeline::sirius_pipeline> get_pipeline();
  
  private:
   //! The ports of the operator
