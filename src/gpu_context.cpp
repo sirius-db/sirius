@@ -384,7 +384,7 @@ unique_ptr<QueryResult> GPUContext::SiriusFetchResultInternal(PendingQueryResult
   // bool create_stream_result = prepared.properties.allow_stream_result &&
   // pending->allow_stream_result;
   unique_ptr<QueryResult> result;
-  D_ASSERT(engine.HasResultCollector());
+  D_ASSERT(engine.has_result_collector());
   // we have a result collector - fetch the result directly from the result collector
   // SIRIUS_LOG_DEBUG("Getting result");
   result = engine.get_result();
