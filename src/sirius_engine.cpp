@@ -334,7 +334,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
       auto current_pipeline = copied_scheduled[i];  // Copy duckdb::shared_ptr to avoid invalidation
 
       // Store original dependencies to preserve them
-      auto original_dependencies = std::move(current_pipeline->dependencies);
+      auto original_dependencies = current_pipeline->dependencies;
 
       bool scan_source = false;
       if (current_pipeline->source->type == op::SiriusPhysicalOperatorType::TABLE_SCAN) {
