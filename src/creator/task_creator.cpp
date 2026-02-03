@@ -107,7 +107,7 @@ void task_creator::stop_thread_pool()
   bool expected = true;
   if (!_running.compare_exchange_strong(expected, false)) { return; }
   _kiosk.stop();
-  on_stop();
+  _task_creation_queue.interrupt();
   if (_manager_thread.joinable()) { _manager_thread.join(); }
   _kiosk.wait_all();
   if (_thread_pool) { _thread_pool->stop(); }
@@ -229,8 +229,6 @@ void task_creator::manager_loop()
     });
   }
 }
-
-void task_creator::on_stop() { _task_creation_queue.interrupt(); }
 
 uint64_t task_creator::get_next_task_id() { return _task_id.fetch_add(1); }
 

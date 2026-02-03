@@ -255,13 +255,7 @@ class task_creator {
    */
   void manager_loop();
 
-  /**
-   * @brief Called when the thread pool stops.
-   *
-   * Closes the task creation queue to signal workers to exit.
-   */
-  void on_stop();
-
+  
   std::atomic<bool> _running;
   exec::thread_pool_config _config;
   exec::kiosk _kiosk;
