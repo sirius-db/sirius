@@ -22,6 +22,7 @@
 #include "exec/kiosk.hpp"
 #include "exec/thread_pool.hpp"
 #include "parallel/task_executor.hpp"
+#include "pipeline/completion_handler.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/task_request.hpp"
 
@@ -114,6 +115,13 @@ class gpu_pipeline_executor {
    */
   void drain_leftover_tasks();
 
+  /**
+   * @brief Set the completion handler for query completion signaling
+   *
+   * @param handler Pointer to the completion handler
+   */
+  void set_completion_handler(completion_handler* handler) noexcept;
+
  private:
   /**
    * @brief Manager loop to consume task from local buffer and dispatch to the thread pool
@@ -138,6 +146,7 @@ class gpu_pipeline_executor {
   exec::publisher<std::unique_ptr<task_request>> _task_request_publisher;
   cucascade::memory::memory_space* _memory_space;
   sirius::creator::task_creator* _task_creator{nullptr};
+  completion_handler* _completion_handler{nullptr};
 };
 
 }  // namespace pipeline

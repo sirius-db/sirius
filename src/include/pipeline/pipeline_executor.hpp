@@ -24,6 +24,7 @@
 #include "op/sirius_physical_duckdb_scan.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "parallel/task.hpp"
+#include "pipeline/completion_handler.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/task_request.hpp"
 #include "planner/query.hpp"
@@ -144,12 +145,15 @@ class pipeline_executor {
   void prepare_for_query(duckdb::shared_ptr<planner::query> query);
 
   /**
-   * @brief Start query execution with a completion promise
+   * @brief Start query execution and return a future for completion.
    *
-   * @param query The query to execute.
-   * @param completion_promise Promise to signal when query execution completes.
+   * Sets up the completion handler and returns a future that will be satisfied
+   * when the query completes or errors. Note: prepare_for_query must be called
+   * before this method.
+   *
+   * @return A future that will be satisfied when the query completes.
    */
-  std::future<void> start_query(duckdb::shared_ptr<planner::query> query);
+  std::future<void> start_query();
 
  private:
   void management_eventloop();
@@ -168,7 +172,7 @@ class pipeline_executor {
 
   sirius::creator::task_creator* _task_creator{nullptr};
   std::unique_ptr<sirius::op::scan::duckdb_scan_executor> _scan_executor;
-  std::promise<void> _completion_promise;
+  std::unique_ptr<completion_handler> _completion_handler;
 };
 
 }  // namespace pipeline

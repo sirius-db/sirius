@@ -40,6 +40,10 @@ namespace sirius::creator {
 class task_creator;
 }  // namespace sirius::creator
 
+namespace sirius::pipeline {
+class completion_handler;
+}  // namespace sirius::pipeline
+
 namespace sirius::op::scan {
 
 //===----------------------------------------------------------------------===//
@@ -126,6 +130,13 @@ class duckdb_scan_executor {
   void drain_leftover_tasks();
 
   /**
+   * @brief Set the completion handler for query completion signaling
+   *
+   * @param handler Pointer to the completion handler
+   */
+  void set_completion_handler(sirius::pipeline::completion_handler* handler) noexcept;
+
+  /**
    * @brief Cache scan results for the given query
    *
    * @param query The query string to cache results for
@@ -191,6 +202,7 @@ class duckdb_scan_executor {
   exec::publisher<std::unique_ptr<sirius::pipeline::task_request>> _task_request_publisher;
   cucascade::memory::memory_reservation_manager* _mem_mgr{nullptr};
   sirius::creator::task_creator* _task_creator{nullptr};
+  sirius::pipeline::completion_handler* _completion_handler{nullptr};
 };
 
 }  // namespace sirius::op::scan

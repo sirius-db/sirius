@@ -20,6 +20,7 @@
 #include "log/logging.hpp"
 #include "op/scan/duckdb_scan_task.hpp"
 #include "op/sirius_physical_operator.hpp"
+#include "pipeline/completion_handler.hpp"
 #include "pipeline/sirius_pipeline_itask_local_state.hpp"
 
 #include <cucascade/memory/common.hpp>
@@ -72,6 +73,12 @@ void duckdb_scan_executor::set_task_creator(sirius::creator::task_creator* task_
 }
 
 void duckdb_scan_executor::drain_leftover_tasks() { _task_queue.drain(); }
+
+void duckdb_scan_executor::set_completion_handler(
+  sirius::pipeline::completion_handler* handler) noexcept
+{
+  _completion_handler = handler;
+}
 
 void duckdb_scan_executor::cache_scan_results_for_query(const std::string& query)
 {
@@ -199,14 +206,19 @@ void duckdb_scan_executor::manager_loop()
                             ticket    = std::move(ticket),
                             t         = std::move(task),
                             scan_task = std::move(scan_task)]() mutable {
-      auto consumers = scan_task->get_output_consumers();
-      auto batches   = get_scan_output(scan_task);
-      scan_task->publish_output(std::move(batches));
-      t.reset();
-      if (_task_creator) {
-        for (auto* consumer : consumers) {
-          _task_creator->schedule(consumer);
+      try {
+        auto consumers = scan_task->get_output_consumers();
+        auto batches   = get_scan_output(scan_task);
+        scan_task->publish_output(std::move(batches));
+        t.reset();
+        if (_task_creator) {
+          for (auto* consumer : consumers) {
+            _task_creator->schedule(consumer);
+          }
         }
+      } catch (...) {
+        /// this is fatal error
+        if (_completion_handler) { _completion_handler->report_error(std::current_exception()); }
       }
     });
   }

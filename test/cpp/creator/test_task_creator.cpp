@@ -59,9 +59,7 @@ class mock_sirius_physical_operator : public sirius_physical_operator {
  public:
   mock_sirius_physical_operator(
     SiriusPhysicalOperatorType op_type = SiriusPhysicalOperatorType::PROJECTION)
-    : sirius_physical_operator(op_type, {}, 0),
-      _use_custom_hint(false),
-      _custom_hint(std::nullopt)
+    : sirius_physical_operator(op_type, {}, 0), _use_custom_hint(false), _custom_hint(std::nullopt)
   {
   }
 
@@ -85,7 +83,7 @@ class mock_sirius_physical_operator : public sirius_physical_operator {
   /**
    * @brief Override to return configured hint when in custom mode.
    */
-   std::optional<task_creation_hint> get_next_task_hint() override
+  std::optional<task_creation_hint> get_next_task_hint() override
   {
     if (_use_custom_hint) { return _custom_hint; }
     // Fall back to parent implementation
@@ -109,7 +107,7 @@ class mock_gpu_pipeline : public sirius_pipeline {
 
   void set_finished(bool finished) { _finished = finished; }
 
-  bool is_pipeline_finished() override { return _finished; }
+  bool is_pipeline_finished() const override { return _finished; }
 
  private:
   bool _finished;
@@ -162,10 +160,10 @@ class testable_task_creator : public task_creator {
                         duckdb::ClientContext& client_context,
                         pipeline_executor& pipeline_executor,
                         sirius::memory::sirius_memory_reservation_manager& mem_res_mgr)
-    : task_creator(exec::thread_pool_config {.num_threads        = num_threads,
-      .thread_name_prefix = "task_creator"}, mem_res_mgr)
+    : task_creator(
+        exec::thread_pool_config{.num_threads = num_threads, .thread_name_prefix = "task_creator"},
+        mem_res_mgr)
   {
-
     this->set_client_context(client_context);
     this->set_pipeline_executor(pipeline_executor);
   }
@@ -203,10 +201,10 @@ class testable_task_creator : public task_creator {
   }
 
   [[nodiscard]] bool is_running() const { return _running.load(); }
-  
+
   // Expose protected method for testing
   using task_creator::get_operator_for_next_task;
-  
+
  private:
   std::atomic<size_t> _schedule_count{0};
   std::vector<sirius_physical_operator*> _scheduled_nodes;
@@ -246,8 +244,9 @@ class test_fixture {
         return std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
           std::move(space_configs));
       }()),
-      pipeline_exec(
-        exec::thread_pool_config{.num_threads = 1}, exec::thread_pool_config{.num_threads = 2}, *memory_manager),
+      pipeline_exec(exec::thread_pool_config{.num_threads = 1},
+                    exec::thread_pool_config{.num_threads = 2},
+                    *memory_manager),
       empty_pipelines(),
       pipeline_map(empty_pipelines)
   {
@@ -372,7 +371,8 @@ TEST_CASE("task_creator destructor stops thread pool", "[task_creator]")
 // get_operator_for_next_task Tests
 //===----------------------------------------------------------------------===//
 
-TEST_CASE("get_operator_for_next_task with monostate hint and empty priority_scans", "[task_creator]")
+TEST_CASE("get_operator_for_next_task with monostate hint and empty priority_scans",
+          "[task_creator]")
 {
   test_fixture fixture;
 
@@ -382,14 +382,16 @@ TEST_CASE("get_operator_for_next_task with monostate hint and empty priority_sca
   // Create a mock operator with no ports (will return monostate)
   auto mock_op = std::make_unique<mock_sirius_physical_operator>();
 
-  // process_next_task should just return nullptr because there its not really connected to anything and has no data
+  // process_next_task should just return nullptr because there its not really connected to anything
+  // and has no data
   auto next_op = creator.get_operator_for_next_task(mock_op.get());
 
   // Nothing should be scheduled
   REQUIRE(next_op == nullptr);
 }
 
-TEST_CASE("get_operator_for_next_task for operator with data returns the operator", "[task_creator]")
+TEST_CASE("get_operator_for_next_task for operator with data returns the operator",
+          "[task_creator]")
 {
   test_fixture fixture;
 
@@ -418,7 +420,8 @@ TEST_CASE("get_operator_for_next_task for operator with data returns the operato
   );
 
   // Configure source_op to return hint_op as the hint
-  source_op->set_custom_hint(task_creation_hint {.hint = TaskCreationHint::READY, .producer = hint_op.get()});
+  source_op->set_custom_hint(
+    task_creation_hint{.hint = TaskCreationHint::READY, .producer = hint_op.get()});
 
   // Call process_next_task - this should attempt to schedule with hint_op
   // Note: This will try to access hint_op->get_port("default")->dest_pipeline
@@ -447,7 +450,8 @@ TEST_CASE("get_operator_for_next_task for operator with data returns the operato
 //   // get_next_task_hint() is called and the scheduling logic follows through.
 
 //   testable_task_creator creator(
-//     2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
+//     2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec,
+//     *fixture.memory_manager);
 
 //   // Create an operator chain: source_op returns a custom hint that is monostate
 //   // (simulating the end of recursion)
@@ -484,7 +488,8 @@ TEST_CASE("get_operator_for_next_task for operator with data returns the operato
 //   test_fixture fixture;
 
 //   testable_task_creator creator(
-//     2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
+//     2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec,
+//     *fixture.memory_manager);
 
 //   // Create operators
 //   auto source_op = std::make_unique<mock_sirius_physical_operator>();
@@ -513,7 +518,8 @@ TEST_CASE("get_operator_for_next_task for operator with data returns the operato
 //   test_fixture fixture;
 
 //   testable_task_creator creator(
-//     2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
+//     2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec,
+//     *fixture.memory_manager);
 
 //   // Test a chain where:
 //   // op1 returns hint pointing to op2
@@ -543,7 +549,8 @@ TEST_CASE("get_operator_for_next_task for operator with data returns the operato
 //   test_fixture fixture;
 
 //   testable_task_creator creator(
-//     2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
+//     2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec,
+//     *fixture.memory_manager);
 
 //   SECTION("start() calls start_thread_pool()")
 //   {
@@ -566,13 +573,13 @@ TEST_CASE("get_operator_for_next_task for operator with data returns the operato
 //   test_fixture fixture;
 
 //   testable_task_creator creator(
-//     1, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
+//     1, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec,
+//     *fixture.memory_manager);
 
 //   // The task_id is protected, but we can verify behavior indirectly
 //   // by checking that the creator can be constructed and used
 //   REQUIRE_FALSE(creator.is_running());
 // }
-
 
 // //===----------------------------------------------------------------------===//
 // // sirius_physical_operator::get_next_task_hint() Tests
@@ -924,7 +931,8 @@ TEST_CASE("get_operator_for_next_task for operator with data returns the operato
 //   test_fixture fixture;
 
 //   testable_task_creator creator(
-//     4, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
+//     4, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec,
+//     *fixture.memory_manager);
 
 //   const int num_calls = 100;
 //   std::atomic<int> completed{0};

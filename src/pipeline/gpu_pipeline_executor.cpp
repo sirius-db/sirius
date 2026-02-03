@@ -18,6 +18,8 @@
 
 #include "creator/task_creator.hpp"
 #include "op/sirius_physical_operator.hpp"
+#include "op/sirius_physical_operator_type.hpp"
+#include "pipeline/completion_handler.hpp"
 #include "pipeline/gpu_pipeline_queue.hpp"
 #include "pipeline/task_request.hpp"
 
@@ -96,15 +98,31 @@ void gpu_pipeline_executor::manager_loop()
       break;
     }
     auto output_consumers = gpu_task->get_output_consumers();
+    auto* pipeline        = gpu_task->get_pipeline();
     _thread_pool->schedule([this,
                             task      = std::move(pipeline_task),
                             ticket    = std::move(ticket),
-                            consumers = std::move(output_consumers)]() mutable {
-      task->execute();
+                            consumers = std::move(output_consumers),
+                            pipeline]() mutable {
+      try {
+        task->execute();
+      } catch (...) {
+        if (_completion_handler) { _completion_handler->report_error(std::current_exception()); }
+        return;
+      }
       task.reset();
+
       if (_task_creator) {
         for (auto* consumer : consumers) {
           _task_creator->schedule(consumer);
+        }
+      }
+
+      // Check if query is complete (sink is RESULT_COLLECTOR and pipeline is finished)
+      if (_completion_handler && pipeline) {
+        auto sink = pipeline->get_sink();
+        if (sink && sink->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
+          if (pipeline->is_pipeline_finished()) { _completion_handler->mark_completed(); }
         }
       }
     });
@@ -123,6 +141,11 @@ void gpu_pipeline_executor::set_task_creator(sirius::creator::task_creator* task
 }
 
 void gpu_pipeline_executor::drain_leftover_tasks() { _task_queue.drain(); }
+
+void gpu_pipeline_executor::set_completion_handler(completion_handler* handler) noexcept
+{
+  _completion_handler = handler;
+}
 
 }  // namespace pipeline
 }  // namespace sirius

@@ -152,10 +152,18 @@ void pipeline_executor::prepare_for_query(duckdb::shared_ptr<planner::query> que
   if (!scans.empty()) { _task_creator->schedule(scans.front()); }
 }
 
-std::future<void> pipeline_executor::start_query(duckdb::shared_ptr<planner::query> query)
+std::future<void> pipeline_executor::start_query()
 {
-  std::future<void> future = _completion_promise.get_future();
-  prepare_for_query(std::move(query));
+  // Create a new completion handler for this query
+  _completion_handler      = std::make_unique<completion_handler>();
+  std::future<void> future = _completion_handler->get_awaitable();
+
+  // Set completion handler on all executors
+  _scan_executor->set_completion_handler(_completion_handler.get());
+  for (auto& [device_id, gpu_exec] : _gpu_executors) {
+    gpu_exec->set_completion_handler(_completion_handler.get());
+  }
+
   return future;
 }
 
