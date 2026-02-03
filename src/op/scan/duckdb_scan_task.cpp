@@ -520,20 +520,7 @@ void duckdb_scan_task::execute()
   }
 
   // Make data batch and push to repository
-  if (l_state._row_offset > 0) {
-    _data_repo->add_data_batch(l_state.make_data_batch());
-
-    // Schedule next task for the pipeline that consumes this scan's output
-    // The pipeline's inner operators (between source and sink) should process this data
-    auto inner_operators = g_state._pipeline->get_inner_operators();
-    if (!inner_operators.empty()) {
-      // Schedule a task creation for the first inner operator in the pipeline
-      auto* first_inner_op = &inner_operators[0].get();
-      auto task_info =
-        std::make_unique<creator::task_creation_info>(first_inner_op, g_state._pipeline);
-      g_state._sirius_ctx->get_task_creator().schedule(std::move(task_info));
-    }
-  }
+  if (l_state._row_offset > 0) { _data_repo->add_data_batch(l_state.make_data_batch()); }
 }
 
 }  // namespace sirius::op::scan
