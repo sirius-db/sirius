@@ -17,11 +17,16 @@
 #include "creator/task_creator.hpp"
 
 #include "op/scan/duckdb_scan_task.hpp"
-#include "op/sirius_physical_table_scan.hpp"
+#include "op/sirius_physical_duckdb_scan.hpp"
+#include "op/sirius_physical_top_n.hpp"
+#include "op/sirius_physical_top_n_merge.hpp"
+#include "op/sirius_physical_ungrouped_aggregate.hpp"
+#include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 
 #include <duckdb/parallel/thread_context.hpp>
 
+#include <iterator>
 #include <queue>
 
 namespace sirius::creator {
@@ -91,7 +96,7 @@ void task_creator::set_pipeline_hashmap(sirius_pipeline_hashmap& sirius_pipeline
 {
   _sirius_pipeline_map = &sirius_pipeline_map;
   for (const auto& i : _sirius_pipeline_map->_vec) {
-    if (i->get_source()->type == ::duckdb::PhysicalOperatorType::TABLE_SCAN) {
+    if (i->get_source()->type == op::SiriusPhysicalOperatorType::TABLE_SCAN) {
       _priority_scans.push(i);
     }
   }
@@ -113,7 +118,7 @@ void task_creator::process_next_task(op::sirius_physical_operator* node)
     schedule(std::make_unique<task_creation_info>(hint_node, pipeline));
   } else if (std::holds_alternative<duckdb::shared_ptr<pipeline::sirius_pipeline>>(hint)) {
     auto pipeline = std::get<duckdb::shared_ptr<pipeline::sirius_pipeline>>(hint);
-    process_next_task(&pipeline->get_inner_operators()[0].get());
+    process_next_task(&pipeline->get_operators()[0].get());
   } else {
     if (!_priority_scans.empty()) {
       duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline = _priority_scans.front();
@@ -174,13 +179,13 @@ void task_creator::worker_function(int worker_id)
     }
     try {
       // scheduling scan task
-      if (info->_node->type == ::duckdb::PhysicalOperatorType::TABLE_SCAN) {
+      if (info->_node->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
         info->_pipeline->get_source()->set_creator(this);
         auto scan_task_global_state = std::make_shared<op::scan::duckdb_scan_task_global_state>(
           info->_pipeline,
           _duckdb_scan_executor,
           *_client_context,
-          &info->_node->Cast<op::sirius_physical_table_scan>());
+          &info->_node->Cast<op::sirius_physical_duckdb_scan>());
         duckdb::ThreadContext thread_ctx(*_client_context);
         duckdb::ExecutionContext exec_ctx(*_client_context, thread_ctx, nullptr);
         auto scan_task_local_state = std::make_unique<op::scan::duckdb_scan_task_local_state>(
@@ -197,12 +202,26 @@ void task_creator::worker_function(int worker_id)
         _duckdb_scan_executor.schedule(std::move(scan_task));
         // scheduling pipeline task
       } else {
-        duckdb::reference<sirius::op::sirius_physical_operator> node =
-          info->_pipeline->get_inner_operators()[0];
+        auto inner_ops = info->_pipeline->get_operators();
+        if (inner_ops.empty()) { throw std::runtime_error("Pipeline has no operators to execute"); }
+        duckdb::reference<sirius::op::sirius_physical_operator> node = inner_ops[0];
         info->_pipeline->get_sink()->set_creator(this);
         // need to exhaust input batches until all ports are empty
         while (!node.get().all_ports_empty()) {
-          auto input_batch = node.get().get_input_batch();
+          std::vector<std::shared_ptr<cucascade::data_batch>> input_batch;
+          auto sink_op = info->_pipeline->get_sink().get();
+          if (sink_op && (sink_op->TYPE == op::SiriusPhysicalOperatorType::MERGE_TOP_N ||
+                          sink_op->TYPE == op::SiriusPhysicalOperatorType::MERGE_AGGREGATE)) {
+            while (!node.get().all_ports_empty()) {
+              auto next_batch = node.get().get_input_batch();
+              if (next_batch.empty()) { break; }
+              input_batch.insert(input_batch.end(),
+                                 std::make_move_iterator(next_batch.begin()),
+                                 std::make_move_iterator(next_batch.end()));
+            }
+          } else {
+            input_batch = node.get().get_input_batch();
+          }
           auto global_state =
             std::make_shared<pipeline::gpu_pipeline_task_global_state>(info->_pipeline);
           auto local_state =

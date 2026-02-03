@@ -28,8 +28,8 @@ namespace op {
 
 class sirius_physical_ungrouped_aggregate : public sirius_physical_operator {
  public:
-  static constexpr const duckdb::PhysicalOperatorType TYPE =
-    duckdb::PhysicalOperatorType::UNGROUPED_AGGREGATE;
+  static constexpr const SiriusPhysicalOperatorType TYPE =
+    SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE;
 
  public:
   sirius_physical_ungrouped_aggregate(
@@ -47,6 +47,8 @@ class sirius_physical_ungrouped_aggregate : public sirius_physical_operator {
 
  public:
   bool is_sink() const override { return true; }
+  std::vector<std::shared_ptr<cucascade::data_batch>> execute(
+    const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches) override;
 };
 
 }  // namespace op

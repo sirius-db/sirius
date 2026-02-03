@@ -28,6 +28,7 @@
 #include <duckdb/common/types/vector.hpp>
 
 // standard library
+#include <climits>
 #include <filesystem>
 #include <numbers>
 
@@ -805,12 +806,13 @@ TEST_CASE("column_builder - edge cases", "[duckdb_scan_task][column_builder]")
     builder.initialize_accessors(num_rows, 0, allocation);
 
     // Create vector with all NULLs
-    duckdb::Vector vec(int_type, 10);
-    duckdb::ValidityMask validity(10);
-    validity.Initialize(10);
-    validity.SetAllInvalid(10);
+    size_t processed_rows = 10;
+    duckdb::Vector vec(int_type, static_cast<idx_t>(processed_rows));
+    duckdb::ValidityMask validity(static_cast<idx_t>(processed_rows));
+    validity.Initialize(static_cast<idx_t>(processed_rows));
+    validity.SetAllInvalid(static_cast<idx_t>(processed_rows));
 
-    builder.process_column(vec, validity, 10, 0, allocation);
+    builder.process_column(vec, validity, processed_rows, 0, allocation);
 
     // Should still have data bytes (for fixed-width types, data is always copied)
     REQUIRE(builder.total_data_bytes == sizeof(int32_t) * 10);
@@ -826,7 +828,13 @@ TEST_CASE("column_builder - edge cases", "[duckdb_scan_task][column_builder]")
     auto mask_byte_1 = builder.mask_blocks_accessor.get_current(allocation);
 
     REQUIRE(mask_byte_0 == 0);
-    REQUIRE(mask_byte_1 == 0);
+    auto const tail_bits = static_cast<uint8_t>(processed_rows % CHAR_BIT);
+    if (tail_bits != 0) {
+      auto const tail_mask = static_cast<uint8_t>((1u << tail_bits) - 1u);
+      REQUIRE((mask_byte_1 & tail_mask) == 0);
+    } else {
+      REQUIRE(mask_byte_1 == 0);
+    }
   }
 
   SECTION("empty strings in VARCHAR")

@@ -38,7 +38,7 @@ duckdb_scan_task_global_state::duckdb_scan_task_global_state(
   duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
   duckdb_scan_executor& scan_exec,
   duckdb::ClientContext& client_ctx,
-  sirius_physical_table_scan* scan_op)
+  sirius_physical_duckdb_scan* scan_op)
   : _pipeline(std::move(pipeline)),
     _sirius_ctx(client_ctx.registered_state->Get<duckdb::SiriusContext>("sirius_state")),
     _max_threads(scan_exec.get_num_threads()),
@@ -136,48 +136,33 @@ void duckdb_scan_task_local_state::column_builder::process_mask_for_column(
   auto const num_bits   = num_rows;
 
   if (src_valid == nullptr) {
-    // All valid case
-    if (cur_bit == 0) {
-      // Byte aligned case
-      auto const full_bytes = utils::div_8(num_bits);
-      auto const tail_bits  = utils::mod_8(num_bits);
-      for (auto b = 0; b < full_bytes; ++b) {
-        mask_blocks_accessor.set_current(FULL_MASK, allocation);
-        mask_blocks_accessor.advance();
-      }
-      if (tail_bits > 0) {
-        auto const tail_mask = utils::make_mask<uint8_t>(tail_bits);
-        mask_blocks_accessor.set_current(tail_mask, allocation);
-        mask_blocks_accessor.advance();
-      }
-    } else {
-      // Byte unaligned case
+    //===----------All Valid----------===//
+    // Set all bits in the mask to valid
+    size_t full_bytes = 0;
+    size_t tail_bits  = 0;
+    if (cur_bit != 0) {
+      //===----------Byte Unaligned Case----------===//
       auto const bits_in_current_byte = std::min<uint32_t>(CHAR_BIT - cur_bit, num_bits);
       auto const remaining_bits =
         num_bits - bits_in_current_byte;  // Remaining bits after filling current byte
-      auto const remaining_bytes = utils::div_8(remaining_bits);
-      auto const tail_bits       = utils::mod_8(remaining_bits);
+      full_bytes = utils::div_8(remaining_bits);
+      tail_bits  = utils::mod_8(remaining_bits);
 
       // Set bits in the current byte
       auto const current_byte_mask =
         static_cast<uint8_t>(utils::make_mask<uint8_t>(bits_in_current_byte) << cur_bit);
-      mask_blocks_accessor.set_current(
-        (mask_blocks_accessor.get_current(allocation) & ~current_byte_mask) | current_byte_mask,
-        allocation);
-      mask_blocks_accessor.advance();
-
-      // Set full bytes
-      for (size_t b = 0; b < remaining_bytes; ++b) {
-        mask_blocks_accessor.set_current(FULL_MASK, allocation);
-        mask_blocks_accessor.advance();
-      }
-
-      // Set tail bits
-      if (tail_bits > 0) {
-        auto const tail_mask = utils::make_mask<uint8_t>(tail_bits);
-        mask_blocks_accessor.set_current(tail_mask, allocation);
-        mask_blocks_accessor.advance();
-      }
+      auto const current_byte = mask_blocks_accessor.get_current(allocation);
+      mask_blocks_accessor.set_current(current_byte | current_byte_mask, allocation);
+      if (bits_in_current_byte + cur_bit == CHAR_BIT) { mask_blocks_accessor.advance(); }
+    } else {
+      //===----------Byte Aligned Case----------===//
+      full_bytes = utils::div_8(num_bits);
+      tail_bits  = utils::mod_8(num_bits);
+    }
+    if (full_bytes != 0) { mask_blocks_accessor.memset(FULL_MASK, full_bytes, allocation); }
+    if (tail_bits != 0) {
+      auto const tail_mask = utils::make_mask<uint8_t>(tail_bits);
+      mask_blocks_accessor.set_current(tail_mask, allocation);
     }
     return;
   }
@@ -186,11 +171,10 @@ void duckdb_scan_task_local_state::column_builder::process_mask_for_column(
   // Update the null count
   null_count += num_rows - validity.CountValid(num_rows);
 
-  // Process the mask
+  auto const full_bytes = utils::div_8(num_bits);
+  auto const tail_bits  = utils::mod_8(num_bits);
   if (cur_bit == 0) {
-    // Byte aligned case
-    auto const full_bytes = utils::div_8(num_bits);
-    auto const tail_bits  = utils::mod_8(num_bits);
+    //===----------Byte Aligned Case----------===//
     mask_blocks_accessor.memcpy_from(src_valid, full_bytes, allocation);
     if (tail_bits > 0) {
       auto const tail_mask = utils::make_mask<uint8_t>(tail_bits);
@@ -198,39 +182,28 @@ void duckdb_scan_task_local_state::column_builder::process_mask_for_column(
       mask_blocks_accessor.set_current(tail, allocation);
     }
   } else {
-    // Byte unaligned case
-    auto const num_bytes = utils::ceil_div_8(num_bits);
-    for (size_t b = 0; b < num_bytes; ++b) {
-      auto src_byte = src_valid[b];
-      // The current number of bits we are copying from src_byte
-      auto const cur_bits = std::min<uint32_t>(CHAR_BIT, num_bits - utils::mul_8(b));
-      // Mask the source byte to only the bits we care about
-      src_byte = src_byte & utils::make_mask<uint8_t>(cur_bits);
-      // The number of bits that fit in the current destination byte (the lower bits from src_byte)
-      auto const num_lower_bits = std::min<uint32_t>(CHAR_BIT - cur_bit, cur_bits);
-      // The lower bits from the source byte to copy into the current destination byte, shifted into
-      // position for copying into the destination byte
-      auto const lower_bits =
-        static_cast<uint8_t>((src_byte & utils::make_mask<uint8_t>(num_lower_bits)) << cur_bit);
-      // The mask for the lower bits in the destination byte
-      auto const lower_mask =
-        static_cast<uint8_t>(utils::make_mask<uint8_t>(num_lower_bits) << cur_bit);
-      // Set the lower bits in the current destination byte
-      mask_blocks_accessor.set_current(
-        (mask_blocks_accessor.get_current(allocation) & ~lower_mask) | lower_bits, allocation);
+    //===----------Byte Unaligned Case----------===//
+    auto const cur_shift  = static_cast<uint8_t>(cur_bit);
+    auto const upper_mask = utils::make_mask<uint8_t>(cur_shift);
+    auto const next_shift = static_cast<uint8_t>(CHAR_BIT - cur_bit);
+    auto const lower_mask = utils::make_mask<uint8_t>(next_shift);
+    auto current_byte     = mask_blocks_accessor.get_current(allocation);
+    for (size_t b = 0; b < full_bytes; ++b) {
+      auto const src_byte   = src_valid[b];
+      auto const lower_bits = static_cast<uint8_t>((src_byte & lower_mask) << cur_shift);
+      mask_blocks_accessor.set_current(current_byte | lower_bits, allocation);
       mask_blocks_accessor.advance();
-
-      // There may be leftover bits (the upper bits from src_byte) to propagate to the next byte
-      auto const num_upper_bits = cur_bits - num_lower_bits;
-      if (num_upper_bits > 0) {
-        // The mask for the bits in the next destination byte
-        auto const upper_mask = utils::make_mask<uint8_t>(num_upper_bits);
-        // The upper bits from the source byte to copy into the next destination byte, shifted into
-        // position for copying into the destination byte
-        auto const upper_bits = static_cast<uint8_t>((src_byte >> num_lower_bits) & upper_mask);
-        // Set the bits in the next destination byte
-        mask_blocks_accessor.set_current(
-          (mask_blocks_accessor.get_current(allocation) & ~upper_mask) | upper_bits, allocation);
+      current_byte = static_cast<uint8_t>((src_byte >> next_shift) & upper_mask);
+    }
+    if (tail_bits != 0) {
+      auto const tail_mask  = utils::make_mask<uint8_t>(tail_bits);
+      auto const src_byte   = src_valid[full_bytes] & tail_mask;
+      auto const lower_bits = static_cast<uint8_t>((src_byte & lower_mask) << cur_shift);
+      mask_blocks_accessor.set_current(current_byte | lower_bits, allocation);
+      if (tail_bits >= next_shift) {
+        mask_blocks_accessor.advance();
+        auto const upper_bits = static_cast<uint8_t>((src_byte >> next_shift) & upper_mask);
+        mask_blocks_accessor.set_current(upper_bits, allocation);
       }
     }
   }
@@ -354,7 +327,7 @@ size_t duckdb_scan_task_local_state::get_tail_byte_offset() const
   return std::min(last_byte_offset, _allocation->size_bytes());
 }
 
-void duckdb_scan_task_local_state::estimate_rows_per_batch(sirius_physical_table_scan const& op)
+void duckdb_scan_task_local_state::estimate_rows_per_batch(sirius_physical_duckdb_scan const& op)
 {
   assert(num_columns <= op.column_ids.size());
 
@@ -407,7 +380,7 @@ void duckdb_scan_task_local_state::initialize_builders()
 }
 
 void duckdb_scan_task_local_state::initialize_local_table_function_state(
-  sirius_physical_table_scan const& op,
+  sirius_physical_duckdb_scan const& op,
   duckdb::ExecutionContext& exec_ctx,
   duckdb::GlobalTableFunctionState* global_tf_state)
 {

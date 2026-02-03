@@ -30,6 +30,10 @@ namespace op {
 
 class sirius_physical_grouped_aggregate : public sirius_physical_operator {
  public:
+  static constexpr const SiriusPhysicalOperatorType TYPE =
+    SiriusPhysicalOperatorType::HASH_GROUP_BY;
+
+ public:
   sirius_physical_grouped_aggregate(
     duckdb::ClientContext& context,
     duckdb::vector<duckdb::LogicalType> types,

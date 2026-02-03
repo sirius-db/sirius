@@ -76,10 +76,10 @@ static bool can_use_partitioned_aggregate(duckdb::ClientContext& context,
   }
   // traverse the children of the aggregate to find the source operator
   duckdb::reference<sirius::op::sirius_physical_operator> child_ref(child);
-  while (child_ref.get().type != duckdb::PhysicalOperatorType::TABLE_SCAN) {
+  while (child_ref.get().type != sirius::op::SiriusPhysicalOperatorType::TABLE_SCAN) {
     auto& child_op = child_ref.get();
     switch (child_op.type) {
-      case duckdb::PhysicalOperatorType::PROJECTION: {
+      case sirius::op::SiriusPhysicalOperatorType::PROJECTION: {
         // recompute partition columns
         auto& projection = child_op.Cast<sirius::op::sirius_physical_projection>();
         duckdb::vector<duckdb::column_t> new_columns;
@@ -95,7 +95,7 @@ static bool can_use_partitioned_aggregate(duckdb::ClientContext& context,
         child_ref         = *child_op.children[0];
         break;
       }
-      case duckdb::PhysicalOperatorType::FILTER:
+      case sirius::op::SiriusPhysicalOperatorType::FILTER:
         // continue into child operators
         child_ref = *child_op.children[0];
         break;

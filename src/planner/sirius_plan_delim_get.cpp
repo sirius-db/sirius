@@ -29,7 +29,10 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalDelimGet& op)
 
   // create a PhysicalChunkScan without an owned_collection, the collection will be added later
   auto chunk_scan = duckdb::make_uniq<sirius::op::sirius_physical_column_data_scan>(
-    op.types, duckdb::PhysicalOperatorType::DELIM_SCAN, op.estimated_cardinality, nullptr);
+    op.types,
+    sirius::op::SiriusPhysicalOperatorType::DELIM_SCAN,
+    op.estimated_cardinality,
+    nullptr);
   return std::move(chunk_scan);
 }
 

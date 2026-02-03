@@ -26,6 +26,8 @@
 #include "expression_executor/gpu_expression_executor.hpp"
 #include "log/logging.hpp"
 
+#include <chrono>
+
 namespace sirius {
 namespace op {
 
@@ -34,9 +36,33 @@ sirius_physical_projection::sirius_physical_projection(
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> select_list,
   duckdb::idx_t estimated_cardinality)
   : sirius_physical_operator(
-      duckdb::PhysicalOperatorType::PROJECTION, std::move(types), estimated_cardinality),
+      SiriusPhysicalOperatorType::PROJECTION, std::move(types), estimated_cardinality),
     select_list(std::move(select_list))
 {
+}
+
+std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_projection::execute(
+  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches)
+{
+  SIRIUS_LOG_DEBUG("Executing projection");
+  auto start = std::chrono::high_resolution_clock::now();
+
+  duckdb::sirius::GpuExpressionExecutor gpu_expression_executor(select_list);
+
+  std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
+  output_batches.reserve(input_batches.size());
+
+  for (auto const& batch : input_batches) {
+    if (!batch) { continue; }
+    auto projected_batch = gpu_expression_executor.execute(batch);
+    if (projected_batch) { output_batches.push_back(std::move(projected_batch)); }
+  }
+
+  auto end      = std::chrono::high_resolution_clock::now();
+  auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+  SIRIUS_LOG_DEBUG("Projection time: {:.2f} ms", duration.count() / 1000.0);
+
+  return output_batches;
 }
 
 }  // namespace op

@@ -73,7 +73,7 @@ duckdb::unique_ptr<duckdb::GlobalSinkState> sirius_physical_operator::get_global
 
 std::string sirius_physical_operator::get_name() const
 {
-  return duckdb::PhysicalOperatorToString(type);
+  return SiriusPhysicalOperatorToString(type);
 }
 
 std::string sirius_physical_operator::to_string() const { return get_name() + params_to_string(); }
@@ -197,11 +197,11 @@ void sirius_physical_operator::sink(
   }
 }
 
-::std::vector<::std::shared_ptr<::cucascade::data_batch>> sirius_physical_operator::execute(
-  const ::std::vector<::std::shared_ptr<::cucascade::data_batch>>& input_batches)
+std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_operator::execute(
+  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches)
 {
   // not doing anything for now
-  return ::std::vector<::std::shared_ptr<::cucascade::data_batch>>{};
+  return std::vector<std::shared_ptr<cucascade::data_batch>>{};
 }
 
 void sirius_physical_operator::push_data_batch(std::string_view port_id,
@@ -283,5 +283,16 @@ bool sirius_physical_operator::is_source_pipeline_finished()
   }
   return true;
 }
+
+// implement get_all_ports
+std::vector<std::string_view> sirius_physical_operator::get_port_ids()
+{
+  std::vector<std::string_view> result;
+  for (auto& [port_name, port_ptr] : ports) {
+    result.push_back(port_name);
+  }
+  return result;
+}
+
 }  // namespace op
 }  // namespace sirius

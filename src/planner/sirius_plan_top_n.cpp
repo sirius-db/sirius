@@ -34,6 +34,7 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalTopN& op)
     duckdb::NumericCast<duckdb::idx_t>(op.offset),
     std::move(op.dynamic_filter),
     op.estimated_cardinality);
+
   top_n->children.push_back(std::move(plan));
   return std::move(top_n);
 }

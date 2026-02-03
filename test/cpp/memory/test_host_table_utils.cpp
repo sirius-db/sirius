@@ -23,6 +23,7 @@
 #include <data/sirius_converter_registry.hpp>
 #include <helper/utils.hpp>
 #include <memory/host_table_utils.hpp>
+#include <memory/multiple_blocks_allocation_accessor.hpp>
 #include <op/scan/duckdb_scan_task.hpp>
 
 // cucascade
@@ -31,7 +32,10 @@
 #include <cucascade/memory/host_table.hpp>
 
 // cudf
+#include <cudf/null_mask.hpp>
 #include <cudf/strings/strings_column_view.hpp>
+#include <cudf/table/table.hpp>
+#include <cudf/table/table_view.hpp>
 #include <cudf/utilities/bit.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
@@ -43,8 +47,14 @@
 // cuda
 #include <cuda_runtime.h>
 
+// rmm
+#include <rmm/cuda_stream_view.hpp>
+#include <rmm/device_buffer.hpp>
+
 // standard library
+#include <algorithm>
 #include <filesystem>
+#include <initializer_list>
 #include <string>
 #include <vector>
 
@@ -179,6 +189,169 @@ void verify_string_column(const cudf::column_view& col,
   }
 
   verify_validity_mask(col, expected_valid);
+}
+
+struct expected_table_data {
+  std::vector<int32_t> int32_values;
+  std::vector<int64_t> int64_values;
+  std::vector<int64_t> string_offsets;
+  std::vector<char> string_chars;
+};
+
+expected_table_data extract_expected_data(cudf::table_view const& view)
+{
+  expected_table_data data;
+  auto const num_rows = static_cast<size_t>(view.num_rows());
+
+  data.int32_values.resize(num_rows);
+  data.int64_values.resize(num_rows);
+
+  if (num_rows > 0) {
+    cudaMemcpy(data.int32_values.data(),
+               view.column(0).data<int32_t>(),
+               sizeof(int32_t) * num_rows,
+               cudaMemcpyDeviceToHost);
+    cudaMemcpy(data.int64_values.data(),
+               view.column(1).data<int64_t>(),
+               sizeof(int64_t) * num_rows,
+               cudaMemcpyDeviceToHost);
+  }
+
+  cudf::strings_column_view str_col(view.column(2));
+  auto offsets_view = str_col.offsets();
+  data.string_offsets.resize(num_rows + 1, 0);
+  if (num_rows > 0) {
+    if (offsets_view.type().id() == cudf::type_id::INT64) {
+      cudaMemcpy(data.string_offsets.data(),
+                 offsets_view.data<int64_t>(),
+                 sizeof(int64_t) * (num_rows + 1),
+                 cudaMemcpyDeviceToHost);
+    } else {
+      std::vector<cudf::size_type> temp_offsets(num_rows + 1, 0);
+      cudaMemcpy(temp_offsets.data(),
+                 offsets_view.data<cudf::size_type>(),
+                 sizeof(cudf::size_type) * (num_rows + 1),
+                 cudaMemcpyDeviceToHost);
+      std::transform(temp_offsets.begin(),
+                     temp_offsets.end(),
+                     data.string_offsets.begin(),
+                     [](cudf::size_type value) { return static_cast<int64_t>(value); });
+    }
+  }
+
+  auto const chars_size = static_cast<size_t>(str_col.chars_size(cudf::get_default_stream()));
+  data.string_chars.resize(chars_size);
+  if (chars_size > 0) {
+    cudaMemcpy(data.string_chars.data(),
+               str_col.chars_begin(cudf::get_default_stream()),
+               chars_size,
+               cudaMemcpyDeviceToHost);
+  }
+
+  return data;
+}
+
+std::vector<cudf::size_type> build_null_indices(size_t num_rows,
+                                                std::initializer_list<size_t> indices)
+{
+  std::vector<cudf::size_type> null_rows;
+  null_rows.reserve(indices.size());
+  for (auto idx : indices) {
+    if (idx < num_rows) { null_rows.push_back(static_cast<cudf::size_type>(idx)); }
+  }
+  std::sort(null_rows.begin(), null_rows.end());
+  null_rows.erase(std::unique(null_rows.begin(), null_rows.end()), null_rows.end());
+  return null_rows;
+}
+
+void apply_null_mask(cudf::column& column,
+                     std::vector<cudf::size_type> const& null_rows,
+                     rmm::cuda_stream_view stream,
+                     rmm::device_async_resource_ref mr)
+{
+  if (null_rows.empty() || column.size() == 0) { return; }
+
+  auto const bytes = cudf::bitmask_allocation_size_bytes(column.size());
+  auto const words = bytes / sizeof(cudf::bitmask_type);
+  std::vector<cudf::bitmask_type> host_mask(words, ~cudf::bitmask_type{0});
+  for (auto idx : null_rows) {
+    cudf::clear_bit_unsafe(host_mask.data(), idx);
+  }
+
+  rmm::device_buffer mask_buffer(host_mask.data(), bytes, stream, mr);
+  column.set_null_mask(std::move(mask_buffer), static_cast<cudf::size_type>(null_rows.size()));
+}
+
+size_t mask_bytes_for_rows(size_t num_rows) { return (num_rows + 7) / 8; }
+
+void mask_unused_bits(std::vector<uint8_t>& mask, size_t num_rows)
+{
+  if (mask.empty()) { return; }
+  auto const tail_bits = num_rows % 8;
+  if (tail_bits == 0) { return; }
+  auto const keep_mask = static_cast<uint8_t>((1u << tail_bits) - 1u);
+  mask.back() &= keep_mask;
+}
+
+std::vector<uint8_t> extract_mask_bytes(cudf::column_view const& col)
+{
+  auto const num_rows = static_cast<size_t>(col.size());
+  auto const bytes    = mask_bytes_for_rows(num_rows);
+  std::vector<uint8_t> mask(bytes, 0);
+  if (bytes == 0 || !col.nullable() || col.null_count() == 0) { return mask; }
+  cudaMemcpy(mask.data(), col.null_mask(), bytes, cudaMemcpyDeviceToHost);
+  mask_unused_bits(mask, num_rows);
+  return mask;
+}
+
+size_t estimate_packed_data_bytes(cudf::table_view const& view)
+{
+  size_t total_bytes = 0;
+  for (auto const& col : view) {
+    if (col.type().id() == cudf::type_id::STRING) {
+      cudf::strings_column_view strings(col);
+      auto const offsets_view  = strings.offsets();
+      auto const offsets_bytes = static_cast<size_t>(offsets_view.size()) *
+                                 static_cast<size_t>(cudf::size_of(offsets_view.type()));
+      auto const chars_bytes = static_cast<size_t>(strings.chars_size(cudf::get_default_stream()));
+      total_bytes += offsets_bytes + chars_bytes;
+    } else {
+      total_bytes +=
+        static_cast<size_t>(col.size()) * static_cast<size_t>(cudf::size_of(col.type()));
+    }
+    if (col.nullable()) {
+      total_bytes += static_cast<size_t>(cudf::bitmask_allocation_size_bytes(col.size()));
+    }
+  }
+  return total_bytes;
+}
+
+cucascade::host_table_representation const& convert_to_host_table(
+  std::shared_ptr<cucascade::data_batch> const& batch)
+{
+  auto* data = batch->get_data();
+  if (!data) { throw std::runtime_error("data_batch has no data representation"); }
+
+  auto sirius_ctx = sirius::get_sirius_context(get_test_config_path());
+  auto& manager   = sirius_ctx->get_memory_manager();
+
+  auto reservation =
+    manager.request_reservation(any_memory_space_in_tier{Tier::HOST},
+                                estimate_packed_data_bytes(sirius::get_cudf_table_view(*batch)));
+
+  if (!reservation) { throw std::runtime_error("Failed to reserve host memory for test"); }
+
+  auto* host_space = manager.get_memory_space(reservation->tier(), reservation->device_id());
+
+  if (!host_space) { throw std::runtime_error("Invalid host memory space in test"); }
+
+  auto& registry = sirius::converter_registry::get();
+  batch->convert_to<cucascade::host_table_representation>(
+    registry, host_space, rmm::cuda_stream_default);
+
+  data = batch->get_data();
+  if (!data) { throw std::runtime_error("data_batch has no data after conversion"); }
+  return data->cast<cucascade::host_table_representation>();
 }
 
 }  // namespace
@@ -438,4 +611,109 @@ TEST_CASE("host_table_utils - underfilled varchar column truncates rows",
 
   verify_numeric_column<int32_t>(table_view.column(0), expected_int, expected_int_valid);
   verify_string_column(table_view.column(1), expected_str, expected_str_valid);
+}
+
+TEST_CASE("host_table_utils - metadata offsets match packed data", "[memory][host_table_utils]")
+{
+  constexpr size_t num_rows = 257;
+  auto* gpu_space           = get_memory_space(Tier::GPU, 0);
+  REQUIRE(gpu_space != nullptr);
+  auto stream = cudf::get_default_stream();
+  auto mr     = gpu_space->get_default_allocator();
+
+  std::vector<cudf::data_type> column_types{cudf::data_type{cudf::type_id::INT32},
+                                            cudf::data_type{cudf::type_id::INT64},
+                                            cudf::data_type{cudf::type_id::STRING}};
+  std::vector<std::optional<std::pair<int, int>>> ranges{
+    std::make_pair(0, 100), std::make_pair(1000, 2000), std::make_pair(0, 100)};
+
+  auto table =
+    sirius::create_cudf_table_with_random_data(num_rows, column_types, ranges, stream, mr, true);
+  auto int64_nulls  = build_null_indices(num_rows, {0, 7, 8, 63, 255});
+  auto string_nulls = build_null_indices(num_rows, {1, 9, 64, 128, 256});
+  apply_null_mask(table->get_column(1), int64_nulls, stream, mr);
+  apply_null_mask(table->get_column(2), string_nulls, stream, mr);
+  auto batch = sirius::make_data_batch(std::move(table), *gpu_space);
+
+  expected_table_data expected;
+  std::vector<uint8_t> expected_int64_mask;
+  std::vector<uint8_t> expected_string_mask;
+  {
+    REQUIRE(batch->try_to_create_task());
+    auto lock_result = batch->try_to_lock_for_processing(gpu_space->get_id());
+    REQUIRE(lock_result.success);
+    auto handle = std::move(lock_result.handle);
+
+    auto const gpu_view  = sirius::get_cudf_table_view(*batch);
+    expected             = extract_expected_data(gpu_view);
+    expected_int64_mask  = extract_mask_bytes(gpu_view.column(1));
+    expected_string_mask = extract_mask_bytes(gpu_view.column(2));
+  }
+
+  auto const& host_table = convert_to_host_table(batch);
+  auto const& host_alloc = host_table.get_host_table();
+  auto const& allocation = host_alloc->allocation;
+
+  auto metadata_nodes = sirius::unpack_metadata_to_nodes(host_alloc->metadata);
+  REQUIRE(metadata_nodes.size() == column_types.size());
+
+  REQUIRE(metadata_nodes[0].null_count == 0);
+  REQUIRE(metadata_nodes[0].null_mask_offset < 0);
+  REQUIRE(metadata_nodes[1].null_count == static_cast<cudf::size_type>(int64_nulls.size()));
+  REQUIRE(metadata_nodes[1].null_mask_offset >= 0);
+  REQUIRE(metadata_nodes[2].null_count == static_cast<cudf::size_type>(string_nulls.size()));
+  REQUIRE(metadata_nodes[2].null_mask_offset >= 0);
+
+  sirius::memory::multiple_blocks_allocation_accessor<int32_t> int32_accessor;
+  int32_accessor.initialize(static_cast<size_t>(metadata_nodes[0].data_offset), allocation);
+  std::vector<int32_t> actual_int32(num_rows);
+  if (num_rows > 0) {
+    int32_accessor.memcpy_to(allocation, actual_int32.data(), sizeof(int32_t) * num_rows);
+  }
+  REQUIRE(actual_int32 == expected.int32_values);
+
+  sirius::memory::multiple_blocks_allocation_accessor<int64_t> int64_accessor;
+  int64_accessor.initialize(static_cast<size_t>(metadata_nodes[1].data_offset), allocation);
+  std::vector<int64_t> actual_int64(num_rows);
+  if (num_rows > 0) {
+    int64_accessor.memcpy_to(allocation, actual_int64.data(), sizeof(int64_t) * num_rows);
+  }
+  REQUIRE(actual_int64 == expected.int64_values);
+
+  sirius::memory::multiple_blocks_allocation_accessor<uint8_t> mask_accessor;
+  if (!expected_int64_mask.empty()) {
+    std::vector<uint8_t> actual_int64_mask(expected_int64_mask.size(), 0);
+    mask_accessor.initialize(static_cast<size_t>(metadata_nodes[1].null_mask_offset), allocation);
+    mask_accessor.memcpy_to(allocation, actual_int64_mask.data(), actual_int64_mask.size());
+    mask_unused_bits(actual_int64_mask, num_rows);
+    REQUIRE(actual_int64_mask == expected_int64_mask);
+  }
+
+  auto const& string_node = metadata_nodes[2];
+  REQUIRE(string_node.children.size() == 1);
+  REQUIRE(string_node.children[0].type.id() == cudf::type_id::INT64);
+
+  sirius::memory::multiple_blocks_allocation_accessor<int64_t> offset_accessor;
+  offset_accessor.initialize(static_cast<size_t>(string_node.children[0].data_offset), allocation);
+  std::vector<int64_t> actual_offsets(num_rows + 1);
+  if (num_rows > 0) {
+    offset_accessor.memcpy_to(allocation, actual_offsets.data(), sizeof(int64_t) * (num_rows + 1));
+  }
+  REQUIRE(actual_offsets == expected.string_offsets);
+
+  sirius::memory::multiple_blocks_allocation_accessor<uint8_t> chars_accessor;
+  chars_accessor.initialize(static_cast<size_t>(string_node.data_offset), allocation);
+  std::vector<char> actual_chars(expected.string_chars.size());
+  if (!actual_chars.empty()) {
+    chars_accessor.memcpy_to(allocation, actual_chars.data(), actual_chars.size());
+  }
+  REQUIRE(actual_chars == expected.string_chars);
+
+  if (!expected_string_mask.empty()) {
+    std::vector<uint8_t> actual_string_mask(expected_string_mask.size(), 0);
+    mask_accessor.initialize(static_cast<size_t>(string_node.null_mask_offset), allocation);
+    mask_accessor.memcpy_to(allocation, actual_string_mask.data(), actual_string_mask.size());
+    mask_unused_bits(actual_string_mask, num_rows);
+    REQUIRE(actual_string_mask == expected_string_mask);
+  }
 }

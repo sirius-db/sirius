@@ -41,6 +41,7 @@ using namespace sirius::pipeline;
 using namespace sirius::op::scan;
 using namespace std::chrono_literals;
 using namespace sirius::op;
+using namespace sirius;
 using sirius::sirius_pipeline_hashmap;
 
 //===----------------------------------------------------------------------===//
@@ -56,7 +57,7 @@ using sirius::sirius_pipeline_hashmap;
 class mock_sirius_physical_operator : public sirius_physical_operator {
  public:
   mock_sirius_physical_operator(
-    duckdb::PhysicalOperatorType op_type = duckdb::PhysicalOperatorType::PROJECTION)
+    SiriusPhysicalOperatorType op_type = SiriusPhysicalOperatorType::PROJECTION)
     : sirius_physical_operator(op_type, {}, 0),
       _use_custom_hint(false),
       _custom_hint(std::monostate{})
@@ -103,10 +104,7 @@ class mock_sirius_physical_operator : public sirius_physical_operator {
  */
 class mock_gpu_pipeline : public sirius_pipeline {
  public:
-  explicit mock_gpu_pipeline(duckdb::GPUExecutor& executor)
-    : sirius_pipeline(executor), _finished(false)
-  {
-  }
+  explicit mock_gpu_pipeline(sirius_engine& engine) : sirius_pipeline(engine), _finished(false) {}
 
   void set_finished(bool finished) { _finished = finished; }
 
@@ -119,7 +117,7 @@ class mock_gpu_pipeline : public sirius_pipeline {
 /**
  * @brief A mock GPU pipeline for testing.
  *
- * This requires a GPUExecutor reference, so we use a factory pattern
+ * This requires a sirius_engine reference, so we use a factory pattern
  * to create test pipelines when we have the necessary context.
  */
 class mock_pipeline_builder {
@@ -127,7 +125,7 @@ class mock_pipeline_builder {
   /**
    * @brief Create a mock pipeline with specified source and operators.
    *
-   * Since sirius_pipeline requires GPUExecutor, we set up ports directly
+   * Since sirius_pipeline requires sirius_engine, we set up ports directly
    * on operators to control get_next_task_hint() behavior.
    */
   static void setup_operator_with_pipeline_port(mock_sirius_physical_operator& op,
@@ -231,7 +229,7 @@ class test_fixture {
     : db(nullptr),
       con(db),
       gpu_context(*con.context),
-      gpu_executor(*con.context, gpu_context),
+      engine(*con.context, gpu_context),
       memory_manager([] {
         cucascade::memory::reservation_manager_configurator builder;
         const size_t gpu_capacity  = 2ull << 30;  // 2GB
@@ -263,14 +261,14 @@ class test_fixture {
    */
   duckdb::shared_ptr<mock_gpu_pipeline> create_mock_pipeline()
   {
-    return duckdb::make_shared_ptr<mock_gpu_pipeline>(gpu_executor);
+    return duckdb::make_shared_ptr<mock_gpu_pipeline>(engine);
   }
 
   duckdb::DuckDB db;
   duckdb::Connection con;
   duckdb::GPUContext gpu_context;
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory_manager;
-  duckdb::GPUExecutor gpu_executor;
+  sirius_engine engine;
   task_executor_config gpu_executor_config;
   pipeline_executor pipeline_exec;
   duckdb_scan_executor scan_exec;
@@ -528,10 +526,10 @@ TEST_CASE("process_next_task with monostate hint uses priority_scans", "[task_cr
 
   // Create a mock scan operator
   auto scan_op =
-    std::make_unique<mock_sirius_physical_operator>(duckdb::PhysicalOperatorType::TABLE_SCAN);
+    std::make_unique<mock_sirius_physical_operator>(SiriusPhysicalOperatorType::TABLE_SCAN);
 
   // We need to create a pipeline that has this as a source
-  // This is complex because sirius_pipeline requires GPUExecutor
+  // This is complex because sirius_pipeline requires sirius_engine
   // For this test, we verify that the scheduling logic attempts to use priority_scans
 
   // Create pipelines with the scan as source - this requires integration test setup
@@ -609,7 +607,7 @@ TEST_CASE("process_next_task with pipeline hint recurses to inner operator", "[t
   // When hint is a pipeline, process_next_task should call itself with
   // pipeline->GetInnerOperators()[0]
   //
-  // Since sirius_pipeline requires GPUExecutor and complex setup, we test this
+  // Since sirius_pipeline requires sirius_engine and complex setup, we test this
   // behavior indirectly by verifying that the source operator's
   // get_next_task_hint() is called and the scheduling logic follows through.
 

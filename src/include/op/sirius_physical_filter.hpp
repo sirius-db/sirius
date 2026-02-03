@@ -26,7 +26,7 @@ namespace op {
 //! adds a selection vector to the chunk.
 class sirius_physical_filter : public sirius_physical_operator {
  public:
-  static constexpr const duckdb::PhysicalOperatorType TYPE = duckdb::PhysicalOperatorType::FILTER;
+  static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::FILTER;
 
  public:
   sirius_physical_filter(duckdb::vector<duckdb::LogicalType> types,
@@ -35,6 +35,9 @@ class sirius_physical_filter : public sirius_physical_operator {
 
   //! The filter expression
   duckdb::unique_ptr<duckdb::Expression> expression;
+
+  std::vector<std::shared_ptr<cucascade::data_batch>> execute(
+    const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches) override;
 
   // sirius_expression_executor* sirius_expression_executor;
 

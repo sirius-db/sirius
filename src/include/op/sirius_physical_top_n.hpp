@@ -18,6 +18,11 @@
 
 #include "duckdb/planner/bound_query_node.hpp"
 #include "op/sirius_physical_operator.hpp"
+
+#include <cudf/table/table.hpp>
+
+#include <memory>
+
 namespace duckdb {
 struct DynamicFilterData;
 }  // namespace duckdb
@@ -29,7 +34,7 @@ namespace op {
 //! the data but only add a selection vector.
 class sirius_physical_top_n : public sirius_physical_operator {
  public:
-  static constexpr const duckdb::PhysicalOperatorType TYPE = duckdb::PhysicalOperatorType::TOP_N;
+  static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::TOP_N;
 
  public:
   sirius_physical_top_n(duckdb::vector<duckdb::LogicalType> types_p,
@@ -55,6 +60,8 @@ class sirius_physical_top_n : public sirius_physical_operator {
 
  public:
   bool is_sink() const override { return true; }
+  std::vector<std::shared_ptr<cucascade::data_batch>> execute(
+    const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches) override;
 };
 
 }  // namespace op

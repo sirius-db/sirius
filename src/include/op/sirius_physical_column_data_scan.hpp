@@ -33,17 +33,17 @@ namespace op {
 //! The sirius_physical_column_data_scan scans a ColumnDataCollection
 class sirius_physical_column_data_scan : public sirius_physical_operator {
  public:
-  static constexpr const duckdb::PhysicalOperatorType TYPE = duckdb::PhysicalOperatorType::INVALID;
+  static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::INVALID;
 
  public:
   sirius_physical_column_data_scan(
     duckdb::vector<duckdb::LogicalType> types,
-    duckdb::PhysicalOperatorType op_type,
+    SiriusPhysicalOperatorType op_type,
     duckdb::idx_t estimated_cardinality,
     duckdb::optionally_owned_ptr<duckdb::ColumnDataCollection> collection);
 
   sirius_physical_column_data_scan(duckdb::vector<duckdb::LogicalType> types,
-                                   duckdb::PhysicalOperatorType op_type,
+                                   SiriusPhysicalOperatorType op_type,
                                    duckdb::idx_t estimated_cardinality,
                                    duckdb::idx_t cte_index);
 

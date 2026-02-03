@@ -33,7 +33,7 @@ namespace op {
 
 class sirius_physical_cte : public sirius_physical_operator {
  public:
-  static constexpr const duckdb::PhysicalOperatorType TYPE = duckdb::PhysicalOperatorType::CTE;
+  static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::CTE;
 
  public:
   sirius_physical_cte(std::string ctename,

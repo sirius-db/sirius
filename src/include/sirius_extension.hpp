@@ -27,13 +27,16 @@ class SiriusExtension : public Extension {
   std::string Name() override;
   std::string Version() const override;
   static void InitialGPUConfigs(DBConfig& db);
-  static void RegisterGPUFunctions(ClientContext& context);
+  static void RegisterGPUFunctions(DatabaseInstance& catalog);
   static void GPUProcessingSubstraitFunction(ClientContext& context,
                                              TableFunctionInput& data_p,
                                              DataChunk& output);
   static void GPUProcessingFunction(ClientContext& context,
                                     TableFunctionInput& data_p,
                                     DataChunk& output);
+  static void GPUExecutionFunction(ClientContext& context,
+                                   TableFunctionInput& data_p,
+                                   DataChunk& output);
   // static void GPUCachingFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk
   // &output);
   static unique_ptr<FunctionData> GPUProcessingSubstraitBind(ClientContext& context,
@@ -53,6 +56,10 @@ class SiriusExtension : public Extension {
                                                     TableFunctionBindInput& input,
                                                     vector<LogicalType>& return_types,
                                                     vector<string>& names);
+  static unique_ptr<FunctionData> GPUExecutionBind(ClientContext& context,
+                                                   TableFunctionBindInput& input,
+                                                   vector<LogicalType>& return_types,
+                                                   vector<string>& names);
 
   static bool buffer_is_initialized;
 };

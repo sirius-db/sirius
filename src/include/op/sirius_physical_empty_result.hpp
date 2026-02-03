@@ -24,14 +24,13 @@ namespace op {
 
 class sirius_physical_empty_result : public sirius_physical_operator {
  public:
-  static constexpr const duckdb::PhysicalOperatorType TYPE =
-    duckdb::PhysicalOperatorType::EMPTY_RESULT;
+  static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::EMPTY_RESULT;
 
  public:
   explicit sirius_physical_empty_result(duckdb::vector<duckdb::LogicalType> types,
                                         duckdb::idx_t estimated_cardinality)
     : sirius_physical_operator(
-        duckdb::PhysicalOperatorType::EMPTY_RESULT, std::move(types), estimated_cardinality)
+        SiriusPhysicalOperatorType::EMPTY_RESULT, std::move(types), estimated_cardinality)
   {
   }
 

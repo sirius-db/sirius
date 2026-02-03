@@ -19,6 +19,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "gpu_buffer_manager.hpp"
 #include "gpu_executor.hpp"
+#include "sirius_engine.hpp"
 
 namespace duckdb {
 
@@ -51,8 +52,12 @@ struct GPUActiveQueryContext {
   string query;
   //! Prepared statement data
   shared_ptr<GPUPreparedStatementData> gpu_prepared;
+  //! Prepared statement data
+  shared_ptr<SiriusPreparedStatementData> sirius_prepared;
   //! The query executor
   unique_ptr<GPUExecutor> gpu_executor;
+  //! The query executor
+  unique_ptr<::sirius::sirius_engine> engine;
   //! The progress bar
   unique_ptr<ProgressBar> progress_bar;
 
@@ -98,8 +103,6 @@ class GPUContext {
 
   unique_ptr<QueryResult> GPUExecutePendingQueryResult(PendingQueryResult& pending);
 
-  unique_ptr<QueryResult> GPUExecuteRelation(ClientContext& context, shared_ptr<Relation> relation);
-
   void CheckExecutableInternal(PendingQueryResult& pending);
 
   unique_ptr<QueryResult> FetchResultInternal(PendingQueryResult& pending);
@@ -107,12 +110,33 @@ class GPUContext {
   void CleanupInternal(BaseQueryResult* result, bool invalidate_transaction);
 
   void BeginQueryInternal(const string& query);
+
   ErrorData EndQueryInternal(bool success, bool invalidate_transaction);
 
   void GPUProcessError(ErrorData& error, const string& query) const;
 
   template <class T>
   unique_ptr<T> GPUErrorResult(ErrorData error, const string& query = string());
+
+  unique_ptr<PendingQueryResult> SiriusPendingStatementInternal(
+    ClientContext& context,
+    shared_ptr<SiriusPreparedStatementData>& statement_p,
+    const PendingQueryParameters& parameters);
+
+  unique_ptr<PendingQueryResult> SiriusPendingStatementOrPreparedStatement(
+    ClientContext& context,
+    const string& query,
+    shared_ptr<SiriusPreparedStatementData>& statement_p,
+    const PendingQueryParameters& parameters);
+
+  unique_ptr<QueryResult> SiriusExecuteQuery(ClientContext& context,
+                                             const string& query,
+                                             shared_ptr<SiriusPreparedStatementData>& statement_p,
+                                             const PendingQueryParameters& parameters);
+
+  unique_ptr<QueryResult> SiriusExecutePendingQueryResult(PendingQueryResult& pending);
+
+  ::sirius::sirius_engine& GetSiriusEngine();
 };
 
 }  // namespace duckdb

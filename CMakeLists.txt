@@ -97,6 +97,7 @@ set(EXTENSION_SOURCES
     src/sirius_config.cpp
     src/sirius_context.cpp
     src/extension_lock.cpp
+    src/sirius_engine.cpp
     src/parallel/task_executor.cpp)
 # Note: Memory module sources are now provided by cuCascade library
 add_subdirectory(src/operator)
