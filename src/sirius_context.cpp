@@ -31,6 +31,8 @@
 #include <filesystem>
 #include <iostream>
 #include <memory>
+#include <string>
+#include <string_view>
 
 namespace duckdb {
 
@@ -82,6 +84,7 @@ void SiriusContext::QueryBegin(ClientContext& context)
   
   // Reset task creator state (including scan operator global state map) for the new query
   task_creator_->reset();
+  task_creator_->set_client_context(context);
 }
 
 void SiriusContext::QueryEnd() {}

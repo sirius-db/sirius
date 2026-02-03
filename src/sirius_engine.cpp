@@ -45,6 +45,8 @@
 #include <stdio.h>
 
 #include <iostream>
+#include <string>
+#include <string_view>
 
 namespace sirius {
 
@@ -162,7 +164,6 @@ void sirius_engine::initialize(duckdb::unique_ptr<op::sirius_physical_operator> 
 void sirius_engine::execute()
 {
   // get the task creator from sirius context
-  // register sirius pipeline to the task creator (by calling task_creator::set_pipeline_hashmap)
   // wait until the query finish
   // take the query result from sirius_physical_result_collector
   // return the result to duckdb
@@ -171,11 +172,6 @@ void sirius_engine::execute()
   if (sirius_ctx == nullptr) {
     throw duckdb::InvalidInputException("Sirius context is not initialized.");
   }
-
-  // Convert vector to hashmap
-  sirius_pipeline_hashmap pipeline_map(new_scheduled);
-  auto& task_creator = sirius_ctx->get_task_creator();
-  task_creator.set_pipeline_hashmap(pipeline_map);
 }
 
 duckdb::unique_ptr<op::sirius_physical_operator> sirius_engine::construct_sirius_specific_operator(

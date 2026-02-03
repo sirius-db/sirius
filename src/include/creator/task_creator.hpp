@@ -43,6 +43,7 @@
 
 namespace sirius::pipeline {
 class pipeline_executor;
+class gpu_pipeline_task_global_state;
 }  // namespace sirius::pipeline
 
 namespace sirius::op::scan {
@@ -193,9 +194,6 @@ class task_creator {
   /// \brief sets client context needed for task creation
   void set_client_context(::duckdb::ClientContext& client_context);
 
-  /// \brief sets gpu pipeline hash map needed for task creation
-  void set_pipeline_hashmap(sirius_pipeline_hashmap& sirius_pipeline_map);
-
   /// \brief sets pipeline executor reference
   void set_pipeline_executor(sirius::pipeline::pipeline_executor& pipeline_executor);
 
@@ -269,7 +267,6 @@ class task_creator {
   exec::kiosk _kiosk;
   std::unique_ptr<exec::thread_pool> _thread_pool;
   std::thread _manager_thread;
-  sirius_pipeline_hashmap* _sirius_pipeline_map;
   ::duckdb::ClientContext* _client_context;
   sirius::pipeline::pipeline_executor* _pipeline_executor{nullptr};
   sirius::memory::sirius_memory_reservation_manager& _mem_res_mgr;
@@ -282,7 +279,10 @@ class task_creator {
 
   // Map of operator ID to global state for scan operators
   std::map<size_t, std::shared_ptr<op::scan::duckdb_scan_task_global_state>> _scan_operator_global_state_map;
-  std::mutex _scan_global_state_mutex;  // Protect concurrent access to the map
+  std::map<size_t, std::shared_ptr<pipeline::gpu_pipeline_task_global_state>> _gpu_operator_global_state_map;
+  std::unique_ptr<duckdb::ThreadContext> _thread_context;
+  std::unique_ptr<duckdb::ExecutionContext> _execution_context;
+  std::mutex _global_state_mutex;  // Protect concurrent access to the map
 };
 
 }  // namespace sirius::creator

@@ -157,7 +157,7 @@ class mock_pipeline_builder {
  */
 class testable_task_creator : public task_creator {
  public:
-  testable_task_creator(size_t num_threads,
+  testable_task_creator(int num_threads,
                         sirius_pipeline_hashmap& gpu_pipeline_map,
                         duckdb::ClientContext& client_context,
                         pipeline_executor& pipeline_executor,
@@ -167,7 +167,6 @@ class testable_task_creator : public task_creator {
   {
 
     this->set_client_context(client_context);
-    this->set_pipeline_hashmap(gpu_pipeline_map);
     this->set_pipeline_executor(pipeline_executor);
   }
 
@@ -247,9 +246,8 @@ class test_fixture {
         return std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
           std::move(space_configs));
       }()),
-      gpu_executor_config{1, false},
       pipeline_exec(
-        gpu_executor_config, exec::thread_pool_config{.num_threads = 2}, *memory_manager),
+        exec::thread_pool_config{.num_threads = 1}, exec::thread_pool_config{.num_threads = 2}, *memory_manager),
       empty_pipelines(),
       pipeline_map(empty_pipelines)
   {
@@ -268,7 +266,6 @@ class test_fixture {
   duckdb::GPUContext gpu_context;
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory_manager;
   sirius_engine engine;
-  task_executor_config gpu_executor_config;
   pipeline_executor pipeline_exec;
   duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> empty_pipelines;
   sirius::sirius_pipeline_hashmap pipeline_map;
@@ -428,7 +425,7 @@ TEST_CASE("get_operator_for_next_task for operator with data returns the operato
   // which we've set up above
   auto next_op = creator.get_operator_for_next_task(hint_op.get());
 
-  REQUIRE(next_op == source_op.get());
+  REQUIRE(next_op == hint_op.get());
 
   // // Verify that schedule was called with the hint_op
   // auto scheduled_nodes = creator.get_scheduled_nodes();
