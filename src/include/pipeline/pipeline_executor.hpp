@@ -21,6 +21,7 @@
 #include "exec/config.hpp"
 #include "exec/interruptible_mpmc.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
+#include "op/sirius_physical_duckdb_scan.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "parallel/task.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
@@ -143,7 +144,9 @@ class pipeline_executor {
   void management_eventloop();
 
   std::mutex _priority_scans_mutex;
-  std::queue<op::sirius_physical_operator*> _priority_scans;
+  std::queue<op::sirius_physical_duckdb_scan*> _priority_scans;
+  std::unordered_map<op::sirius_physical_duckdb_scan*, std::size_t> _priority_scan_counts;
+
   exec::interruptible_mpmc<std::unique_ptr<sirius::parallel::itask>>
     _task_queue;  ///< Queue for GPU pipeline tasks
   exec::channel<std::unique_ptr<task_request>> _task_request_channel;

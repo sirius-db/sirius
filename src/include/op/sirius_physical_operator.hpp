@@ -183,6 +183,7 @@ class sirius_physical_operator {
   template <class TARGET>
   TARGET& Cast()
   {
+    // TODO(amin) this is buggy code
     if (TARGET::TYPE != SiriusPhysicalOperatorType::INVALID && type != TARGET::TYPE) {
       throw duckdb::InternalException(
         "Failed to cast physical operator to type - physical operator type mismatch");

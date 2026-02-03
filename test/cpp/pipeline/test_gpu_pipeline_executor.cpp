@@ -169,7 +169,6 @@ TEST_CASE("GPU pipeline executor uses task requests to schedule GPU tasks",
   std::thread request_handler([&]() {
     while (dispatched.load(std::memory_order_relaxed) < num_tasks) {
       auto request = request_channel.get();
-      std::cerr << "request: " << request->device_id << std::endl;
       if (!request) { break; }
 
       auto local_state = std::make_unique<test_gpu_pipeline_task_local_state>(
@@ -179,8 +178,6 @@ TEST_CASE("GPU pipeline executor uses task requests to schedule GPU tasks",
         std::move(local_state),
         global_state);
       executor.schedule(std::move(task));
-      std::cerr << "scheduled task: "
-                << static_cast<uint64_t>(dispatched.load(std::memory_order_relaxed)) << std::endl;
       dispatched.fetch_add(1, std::memory_order_relaxed);
     }
   });

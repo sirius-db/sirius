@@ -36,6 +36,8 @@ duckdb_scan_executor::duckdb_scan_executor(
 {
 }
 
+duckdb_scan_executor::~duckdb_scan_executor() { stop(); }
+
 void duckdb_scan_executor::schedule(std::unique_ptr<sirius::parallel::itask> task)
 {
   _task_queue.push(std::move(task));
@@ -56,9 +58,9 @@ void duckdb_scan_executor::stop()
   if (!_running.compare_exchange_strong(expected, false)) { return; }
   _kiosk.stop();
   _task_queue.interrupt();
+  if (_thread_pool) { _thread_pool->stop(); }
   if (_manager_thread.joinable()) { _manager_thread.join(); }
   _kiosk.wait_all();
-  if (_thread_pool) { _thread_pool->stop(); }
 }
 
 void duckdb_scan_executor::wait_all() { _kiosk.wait_all(); }
@@ -155,15 +157,18 @@ void duckdb_scan_executor::manager_loop()
       break;
     }
     auto task = _task_queue.try_pop();
-    if (!task && !_running) {
-      SIRIUS_LOG_INFO("DuckDB Scan Executor: task queue interrupted, stopping manager loop");
-      break;
-    }
-    submit_scan_request();  // tell pipeline executor to submit a scan task request
-    task = _task_queue.pop();
     if (!task) {
-      SIRIUS_LOG_INFO("DuckDB Scan Executor: task queue interrupted, stopping manager loop");
-      break;
+      if (!_running) {
+        SIRIUS_LOG_INFO("DuckDB Scan Executor: task queue interrupted, stopping manager loop");
+        break;
+      } else {
+        submit_scan_request();  // tell pipeline executor to submit a scan task request
+        task = _task_queue.pop();
+        if (!task) {
+          SIRIUS_LOG_INFO("DuckDB Scan Executor: task queue interrupted, stopping manager loop");
+          break;
+        }
+      }
     }
 
     // Make host memory reservation and set it on the local state

@@ -33,6 +33,8 @@ gpu_pipeline_executor::gpu_pipeline_executor(
 {
 }
 
+gpu_pipeline_executor::~gpu_pipeline_executor() { stop(); }
+
 void gpu_pipeline_executor::schedule(std::unique_ptr<sirius::parallel::itask> task)
 {
   _task_queue.push(std::move(task));

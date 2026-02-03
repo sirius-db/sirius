@@ -93,8 +93,7 @@ class sirius_physical_duckdb_scan : public sirius_physical_operator {
   //! Whether it's required to generate a separate row id column (e.g., in some select *)
   bool gen_row_id_column;
 
-  //! Only used in optimized table scan
-  bool exhausted = false;
+  std::atomic<bool> exhausted{false};
 
  public:
   bool is_source() const override { return true; }

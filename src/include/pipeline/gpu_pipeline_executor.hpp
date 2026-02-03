@@ -62,7 +62,7 @@ class gpu_pipeline_executor {
   /**
    * @brief Destructor for the gpu_pipeline_executor.
    */
-  ~gpu_pipeline_executor() = default;
+  ~gpu_pipeline_executor();
 
   // Non-copyable but movable
   gpu_pipeline_executor(const gpu_pipeline_executor&)            = delete;

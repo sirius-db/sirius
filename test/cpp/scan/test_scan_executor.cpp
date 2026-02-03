@@ -324,7 +324,6 @@ static void run_scan_test(std::string const& table_name,
   // Get client context
   auto& client_ctx = *con.context;
   auto sirius_ctx  = sirius::get_sirius_context(con, get_test_config_path());
-  ;
 
   // Verify memory manager is initialized
   auto& mem_mgr   = sirius_ctx->get_memory_manager();
@@ -375,7 +374,12 @@ static void run_scan_test(std::string const& table_name,
       static_cast<uint64_t>(i + 1), &data_repo, std::move(local_state), global_state);
     pipeline_executor.schedule(std::move(task));
   }
-  scan_executor.wait_all();
+  while (!global_state->is_source_drained()) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+
+  REQUIRE(physical_scan->exhausted.load(std::memory_order_relaxed));
+
   pipeline_executor.stop();
   const auto scan_end = std::chrono::steady_clock::now();
   const auto elapsed_ms =
