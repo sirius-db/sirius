@@ -129,33 +129,33 @@ void sirius_pipeline::add_dependency(duckdb::shared_ptr<sirius_pipeline>& pipeli
 // 	}
 // }
 
-duckdb::vector<duckdb::reference<op::sirius_physical_operator>> sirius_pipeline::get_all_operators()
-{
-  duckdb::vector<duckdb::reference<op::sirius_physical_operator>> result;
-  D_ASSERT(source);
-  result.push_back(*source);
-  for (auto& op : operators) {
-    result.push_back(op.get());
-  }
-  if (sink) { result.push_back(*sink); }
-  return result;
-}
+// duckdb::vector<duckdb::reference<op::sirius_physical_operator>>
+// sirius_pipeline::get_all_operators()
+// {
+//   duckdb::vector<duckdb::reference<op::sirius_physical_operator>> result;
+//   D_ASSERT(source);
+//   result.push_back(*source);
+//   for (auto& op : operators) {
+//     result.push_back(op.get());
+//   }
+//   if (sink) { result.push_back(*sink); }
+//   return result;
+// }
 
-duckdb::vector<duckdb::const_reference<op::sirius_physical_operator>>
-sirius_pipeline::get_all_operators() const
-{
-  duckdb::vector<duckdb::const_reference<op::sirius_physical_operator>> result;
-  D_ASSERT(source);
-  result.push_back(*source);
-  for (auto& op : operators) {
-    result.push_back(op.get());
-  }
-  if (sink) { result.push_back(*sink); }
-  return result;
-}
+// duckdb::vector<duckdb::const_reference<op::sirius_physical_operator>>
+// sirius_pipeline::get_all_operators() const
+// {
+//   duckdb::vector<duckdb::const_reference<op::sirius_physical_operator>> result;
+//   D_ASSERT(source);
+//   result.push_back(*source);
+//   for (auto& op : operators) {
+//     result.push_back(op.get());
+//   }
+//   if (sink) { result.push_back(*sink); }
+//   return result;
+// }
 
-duckdb::vector<duckdb::reference<op::sirius_physical_operator>>
-sirius_pipeline::get_inner_operators()
+duckdb::vector<duckdb::reference<op::sirius_physical_operator>> sirius_pipeline::get_operators()
 {
   return operators;
 }

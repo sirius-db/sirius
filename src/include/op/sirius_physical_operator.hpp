@@ -208,6 +208,8 @@ class sirius_physical_operator {
   void add_port(std::string_view port_id, std::unique_ptr<port> p);
   //! Get a port from the operator
   port* get_port(std::string_view port_id);
+  //! Get all ports from the operator
+  std::vector<std::string_view> get_port_ids();
   //! Check if the source pipeline is finished
   bool is_source_pipeline_finished();
   //! Add a next port after sink
