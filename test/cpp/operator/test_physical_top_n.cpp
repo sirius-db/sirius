@@ -28,26 +28,29 @@ using namespace cucascade;
 using namespace cucascade::memory;
 using namespace sirius::test::operator_utils;
 
-// Helper functions - defined outside anonymous namespace to avoid ODR issues with LogicalType::BIGINT
-static duckdb::BoundOrderByNode make_order(duckdb::idx_t col_idx, duckdb::OrderType dir = duckdb::OrderType::DESCENDING)
+// Helper functions - defined outside anonymous namespace to avoid ODR issues with
+// LogicalType::BIGINT
+static duckdb::BoundOrderByNode make_order(duckdb::idx_t col_idx,
+                                           duckdb::OrderType dir = duckdb::OrderType::DESCENDING)
 {
   return duckdb::BoundOrderByNode(dir,
-                          duckdb::OrderByNullType::NULLS_LAST,
-                          duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT), col_idx));
+                                  duckdb::OrderByNullType::NULLS_LAST,
+                                  duckdb::make_uniq<duckdb::BoundReferenceExpression>(
+                                    duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT), col_idx));
 }
 
 static std::shared_ptr<data_batch> make_batch(memory_space& space,
-                                       const std::vector<int64_t>& order_vals,
-                                       const std::vector<int64_t>& payload_vals)
+                                              const std::vector<int64_t>& order_vals,
+                                              const std::vector<int64_t>& payload_vals)
 {
   return make_two_column_batch<int64_t, int64_t>(
     space, order_vals, payload_vals, cudf::type_id::INT64, std::nullopt);
 }
 
 static std::shared_ptr<data_batch> make_range_batch(memory_space& space,
-                                             int64_t start,
-                                             int64_t count,
-                                             int64_t payload_scale)
+                                                    int64_t start,
+                                                    int64_t count,
+                                                    int64_t payload_scale)
 {
   std::vector<int64_t> order_vals;
   std::vector<int64_t> payload_vals;
