@@ -71,6 +71,9 @@ class thread_pool {
     queue_.emplace([this, fn = std::move(fn)]() mutable noexcept {
       try {
         fn();
+      } catch (const std::exception& e) {
+        SIRIUS_LOG_ERROR("Exception in thread pool task: {}, {}", e.what(), "closing thread pool");
+        stop();
       } catch (...) {
         SIRIUS_LOG_ERROR("Exception in thread pool task, closing thread pool");
         stop();

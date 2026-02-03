@@ -147,6 +147,7 @@ void pipeline_executor::set_priority_scans(const std::vector<op::sirius_physical
       continue;
     }
   }
+  if (!scans.empty()) { _task_creator->schedule(scans.front()); }
 }
 
 void pipeline_executor::management_eventloop()
@@ -169,7 +170,10 @@ void pipeline_executor::management_eventloop()
       // pipeline executor will schedule more tasks from priority scans if available
       std::lock_guard<std::mutex> lock(_priority_scans_mutex);
       for (auto* scan : _priority_scans) {
-        if (auto hint = scan->get_next_task_hint()) { _task_creator->schedule(hint->producer); }
+        if (auto hint = scan->get_next_task_hint()) {
+          _task_creator->schedule(hint->producer);
+          break;
+        }
       }
     }
   }
