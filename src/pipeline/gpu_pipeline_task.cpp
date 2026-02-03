@@ -199,7 +199,6 @@ std::size_t gpu_pipeline_task::get_estimated_reservation_size() const
 
 std::vector<op::sirius_physical_operator*> gpu_pipeline_task::get_output_consumers()
 {
-  // WSM amin TODO: Also this function for the duckdb scan task is different. because its global state is very different
   std::vector<op::sirius_physical_operator*> output_consumers;
   auto parents = _global_state->cast<gpu_pipeline_task_global_state>()._pipeline.get()->get_parents();
   for (auto& parent : parents) {

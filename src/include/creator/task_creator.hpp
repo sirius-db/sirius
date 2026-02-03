@@ -35,6 +35,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -43,6 +44,10 @@
 namespace sirius::pipeline {
 class pipeline_executor;
 }  // namespace sirius::pipeline
+
+namespace sirius::op::scan {
+class duckdb_scan_task_global_state;
+}  // namespace sirius::op::scan
 
 namespace sirius::creator {
 
@@ -197,14 +202,7 @@ class task_creator {
   /// \brief clean-up query bound resources and prepare the task creator for next query
   void reset();
 
-  /**
-   * @brief Start scheduling initial scan pipelines.
-   *
-   * This method schedules all priority scan pipelines that were identified
-   * during construction.
-   */
-  void start();
-
+  
   /**
    * @brief Stop the task creator and its thread pool.
    */
@@ -271,16 +269,20 @@ class task_creator {
   exec::kiosk _kiosk;
   std::unique_ptr<exec::thread_pool> _thread_pool;
   std::thread _manager_thread;
-  std::queue<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>> _priority_scans;
   sirius_pipeline_hashmap* _sirius_pipeline_map;
   ::duckdb::ClientContext* _client_context;
   sirius::pipeline::pipeline_executor* _pipeline_executor{nullptr};
   sirius::memory::sirius_memory_reservation_manager& _mem_res_mgr;
   std::atomic<uint64_t> _task_id{0};
+  
 
   // Queue for creating tasks based on operators. The operator is the starting point to start looking which task should be created, not necessarily the operator for whose pipeline the task will be created
   exec::interruptible_mpmc<std::unique_ptr<task_creation_request>>
-    _task_creation_queue;  
+    _task_creation_queue;
+
+  // Map of operator ID to global state for scan operators
+  std::map<size_t, std::shared_ptr<op::scan::duckdb_scan_task_global_state>> _scan_operator_global_state_map;
+  std::mutex _scan_global_state_mutex;  // Protect concurrent access to the map
 };
 
 }  // namespace sirius::creator

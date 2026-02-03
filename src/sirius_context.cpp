@@ -79,6 +79,9 @@ void SiriusContext::QueryBegin(ClientContext& context)
   if (config_.is_scan_caching_enabled()) {
     pipeline_executor_->get_scan_executor().cache_scan_results_for_query(query);
   }
+  
+  // Reset task creator state (including scan operator global state map) for the new query
+  task_creator_->reset();
 }
 
 void SiriusContext::QueryEnd() {}

@@ -272,7 +272,7 @@ void sirius_pipeline::update_pipeline_status()
 {
   if (get_source()->type == op::SiriusPhysicalOperatorType::TABLE_SCAN) {
     auto& table_scan = get_source()->Cast<op::sirius_physical_table_scan>();
-    if (table_scan.exhausted) {  // WSM TODO: can we use exhausted? how about we use get_next_task_hint() to check if the source is ready?
+    if (table_scan.exhausted) {  // WSM amin TODO: can we use exhausted? how about we use get_next_task_hint() to check if the source is ready?
       pipeline_finished = true;
       return;
     }    

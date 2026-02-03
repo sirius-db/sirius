@@ -53,12 +53,7 @@ void task_creator::set_client_context(::duckdb::ClientContext& client_context)
 
 void task_creator::set_pipeline_hashmap(sirius_pipeline_hashmap& sirius_pipeline_map)
 {
-  _sirius_pipeline_map = &sirius_pipeline_map;
-  for (const auto& i : _sirius_pipeline_map->_vec) {
-    if (i->get_source()->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
-      _priority_scans.push(i);
-    }
-  }
+  _sirius_pipeline_map = &sirius_pipeline_map;  
 }
 
 void task_creator::set_pipeline_executor(sirius::pipeline::pipeline_executor& pipeline_executor)
@@ -68,7 +63,9 @@ void task_creator::set_pipeline_executor(sirius::pipeline::pipeline_executor& pi
 
 void task_creator::reset()
 {
-  _priority_scans = std::queue<duckdb::shared_ptr<pipeline::sirius_pipeline>>{};
+  // Clear the scan operator global state map for the new query
+  std::lock_guard<std::mutex> lock(_scan_global_state_mutex);
+  _scan_operator_global_state_map.clear();
 }
 
 op::sirius_physical_operator* task_creator::get_operator_for_next_task(op::sirius_physical_operator* node) {
@@ -79,34 +76,8 @@ op::sirius_physical_operator* task_creator::get_operator_for_next_task(op::siriu
     return hint.value().producer;
   } else if (hint.has_value() && hint.value().hint == op::TaskCreationHint::WAITING_FOR_INPUT_DATA) {
     return get_operator_for_next_task(hint.value().producer);
-  } else {
-    if (!_priority_scans.empty()) {
-      duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline = _priority_scans.front();
-      auto* scan_node = pipeline->get_source().get();
-      // TODO: amin or WSM. Need to implement get next task hint for scan node. 
-      // It should return ready if there are more scans tasks to be created.
-      auto scan_hint = scan_node->get_next_task_hint();
-      if (scan_hint.has_value() && scan_hint.value().hint == op::TaskCreationHint::READY) {
-        return scan_node;
-      } else {
-        // WSM TODO: this probably needs a lock guard or task creator needs to be single threaded.
-        _priority_scans.pop();
-        return nullptr;
-      }
-    }
-  }
+  } 
   return nullptr;
-}
-
-void task_creator::start()
-{
-  // start_thread_pool();
-  // while (!_priority_scans.empty()) {
-  //   duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline = _priority_scans.front();
-  //   auto* scan_node                                        = pipeline->get_source().get();
-  //   schedule(std::make_unique<task_creation_info>(scan_node, pipeline));
-  //   _priority_scans.pop();
-  // }
 }
 
 void task_creator::stop() { 
@@ -179,11 +150,27 @@ void task_creator::manager_loop()
 
         // scheduling scan task
         if (node->type == ::sirius::op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
-          auto scan_task_global_state = std::make_shared<op::scan::duckdb_scan_task_global_state>(
-            pipeline,
-            *_pipeline_executor,
-            *_client_context,
-            &node->Cast<op::sirius_physical_duckdb_scan>());
+          // Get or create the global state for this scan operator
+          std::shared_ptr<op::scan::duckdb_scan_task_global_state> scan_task_global_state;
+          size_t operator_id = node->get_operator_id();
+          
+          {
+            std::lock_guard<std::mutex> lock(_scan_global_state_mutex);
+            auto it = _scan_operator_global_state_map.find(operator_id);
+            if (it != _scan_operator_global_state_map.end()) {
+              // Reuse existing global state
+              scan_task_global_state = it->second;
+            } else {
+              // Create new global state and store it in the map
+              scan_task_global_state = std::make_shared<op::scan::duckdb_scan_task_global_state>(
+                pipeline,
+                *_pipeline_executor,
+                *_client_context,
+                &node->Cast<op::sirius_physical_duckdb_scan>());
+              _scan_operator_global_state_map[operator_id] = scan_task_global_state;
+            }
+          }
+          
           duckdb::ThreadContext thread_ctx(*_client_context);
           duckdb::ExecutionContext exec_ctx(*_client_context, thread_ctx, nullptr);
           auto scan_task_local_state = std::make_unique<op::scan::duckdb_scan_task_local_state>(
@@ -196,7 +183,7 @@ void task_creator::manager_loop()
             std::make_unique<op::scan::duckdb_scan_task>(get_next_task_id(),
                                                          destination_data_repositories[0],  // WSM amin TODO: is this correct? there probably needs to be multiple possible destination data repositories
                                                          std::move(scan_task_local_state),
-                                                         std::move(scan_task_global_state));
+                                                         scan_task_global_state);
           
            _pipeline_executor->schedule(std::move(scan_task));
           // scheduling pipeline task
