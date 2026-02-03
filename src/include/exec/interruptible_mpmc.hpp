@@ -114,6 +114,12 @@ class interruptible_mpmc {
    */
   void interrupt() { _is_active.store(false); }
 
+  void drain()
+  {
+    pointer_type item = nullptr;
+    while (queue.try_dequeue(item)) {}
+  }
+
   /**
    * Resets the queue state to active (useful for restarting workers).
    */

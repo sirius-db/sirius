@@ -21,7 +21,9 @@
 #include "extension_lock.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "pipeline/pipeline_executor.hpp"
+#include "planner/query.hpp"
 #include "sirius_config.hpp"
+#include "sirius_pipeline_hashmap.hpp"
 
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/main/client_context_state.hpp>
@@ -88,6 +90,14 @@ class SiriusContext : public ClientContextState {
   [[nodiscard]] sirius::creator::task_creator& get_task_creator();
   [[nodiscard]] const sirius::creator::task_creator& get_task_creator() const;
 
+  /// \brief Start a query with its pipeline hashmap.
+  /// \param pipeline_hashmap The pipeline hashmap for the query.
+  void create_query(sirius::sirius_pipeline_hashmap pipeline_hashmap);
+
+  /// \brief Get the current query.
+  [[nodiscard]] duckdb::shared_ptr<sirius::planner::query> get_query();
+  [[nodiscard]] duckdb::shared_ptr<const sirius::planner::query> get_query() const;
+
   /// \brief Get the current Sirius configuration.
   [[nodiscard]] const sirius::sirius_config& get_config() const noexcept { return config_; }
 
@@ -102,6 +112,7 @@ class SiriusContext : public ClientContextState {
   std::unique_ptr<sirius::pipeline::pipeline_executor> pipeline_executor_;
   std::unique_ptr<sirius::parallel::downgrade_executor> downgrade_executor_;
   std::unique_ptr<sirius::creator::task_creator> task_creator_;
+  duckdb::shared_ptr<sirius::planner::query> query_;
 };
 
 /// todo(amin): when duckdb is updated, we need to enable OnExtensionLoaded to support sirius
