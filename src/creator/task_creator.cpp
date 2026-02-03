@@ -98,7 +98,8 @@ void task_creator::set_pipeline_hashmap(sirius_pipeline_hashmap& sirius_pipeline
   _sirius_pipeline_map = &sirius_pipeline_map;
   std::lock_guard<std::mutex> lock(_priority_scans_mutex);
   for (const auto& i : _sirius_pipeline_map->_vec) {
-    if (i->get_source()->type == op::SiriusPhysicalOperatorType::TABLE_SCAN) {
+    // This runs the newly created pre-scan pipeline
+    if (i->get_source()->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
       _priority_scans.push(i);
     }
   }
@@ -185,12 +186,11 @@ void task_creator::worker_function(int worker_id)
     try {
       // scheduling scan task
       if (info->_node->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
+        auto scan_node =
+          &info->_pipeline->get_operators()[0].get().Cast<op::sirius_physical_duckdb_scan>();
         info->_pipeline->get_source()->set_creator(this);
         auto scan_task_global_state = std::make_shared<op::scan::duckdb_scan_task_global_state>(
-          info->_pipeline,
-          _duckdb_scan_executor,
-          *_client_context,
-          &info->_node->Cast<op::sirius_physical_duckdb_scan>());
+          info->_pipeline, _duckdb_scan_executor, *_client_context, scan_node);
         auto exec_ctx =
           std::make_unique<duckdb::ExecutionContext>(*_client_context, *_thread_context, nullptr);
         auto scan_task_local_state = std::make_unique<op::scan::duckdb_scan_task_local_state>(
