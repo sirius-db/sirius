@@ -121,11 +121,9 @@ std::vector<std::shared_ptr<cucascade::data_batch>> gpu_pipeline_task::compute_t
 {
   auto& local_state = _local_state->cast<gpu_pipeline_task_local_state>();
   auto data_batches = local_state._batches;
-  for (auto& op : _global_state->cast<gpu_pipeline_task_global_state>()._pipeline.get()->get_inner_operators()) {
+  for (auto& op : _global_state->cast<gpu_pipeline_task_global_state>()._pipeline.get()->get_operators()) {
     data_batches = op.get().execute(data_batches);
   }
-  auto sink_operator = _global_state->cast<gpu_pipeline_task_global_state>()._pipeline.get()->get_sink();
-  data_batches = sink_operator.get()->execute(data_batches);
   return std::move(data_batches);
 }
 
@@ -202,10 +200,7 @@ std::vector<op::sirius_physical_operator*> gpu_pipeline_task::get_output_consume
   std::vector<op::sirius_physical_operator*> output_consumers;
   auto parents = _global_state->cast<gpu_pipeline_task_global_state>()._pipeline.get()->get_parents();
   for (auto& parent : parents) {
-    auto parent_operators = parent->get_inner_operators();
-    if (parent_operators.size() > 0) {
-      output_consumers.push_back(&parent_operators[0].get());
-    } 
+    output_consumers.push_back(&parent->get_operators()[0].get());     
   }
   return output_consumers;
 }

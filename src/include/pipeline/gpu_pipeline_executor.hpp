@@ -67,7 +67,7 @@ class gpu_pipeline_executor {
   /**
    * @brief Destructor for the gpu_pipeline_executor.
    */
-  ~gpu_pipeline_executor() = default;
+  ~gpu_pipeline_executor();
 
   // Non-copyable but movable
   gpu_pipeline_executor(const gpu_pipeline_executor&)            = delete;
@@ -109,20 +109,12 @@ class gpu_pipeline_executor {
   void set_schedule_callback(
     std::function<void(sirius::op::sirius_physical_operator*)> schedule_fn);
 
-  /**
-   * @brief Set the task creator pointer for this executor
-   *
-   * @param creator Pointer to the task creator
-   */
-   void set_task_creator(creator::task_creator* creator);
-
- private:
+  private:
   /**
    * @brief Manager loop to consume task from local buffer and dispatch to the thread pool
    */
   void manager_loop();
 
- private:
   /**
    * @brief Safely casts itask to gpu_pipeline_task with type validation
    *
@@ -141,7 +133,6 @@ class gpu_pipeline_executor {
   exec::publisher<std::unique_ptr<task_request>> _task_request_publisher;
   cucascade::memory::memory_space* _memory_space;
   std::function<void(sirius::op::sirius_physical_operator*)> _schedule_callback;
-  creator::task_creator* _task_creator;  ///< Pointer to the task creator
 };
 
 }  // namespace pipeline

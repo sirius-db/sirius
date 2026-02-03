@@ -41,7 +41,7 @@ duckdb_scan_task_global_state::duckdb_scan_task_global_state(
   duckdb::ClientContext& client_ctx,
   sirius_physical_duckdb_scan* scan_op)
   : _pipeline(std::move(pipeline)),
-    _sirius_ctx(client_ctx.registered_state->Get<duckdb::SiriusContext>("sirius_state")),
+    _sirius_ctx(client_ctx.registered_state->Get<duckdb::SiriusContext>("sirius_state").get()),
     _max_threads(pipeline_exec.get_scan_executor().get_num_threads()),
     _pipeline_executor(pipeline_exec),
     _op(*scan_op)

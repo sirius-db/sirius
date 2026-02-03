@@ -29,6 +29,7 @@
 #include <duckdb/parallel/thread_context.hpp>
 
 #include <iterator>
+#include <optional>
 #include <queue>
 
 namespace sirius::creator {
@@ -107,7 +108,9 @@ void task_creator::stop_thread_pool()
 
 void task_creator::schedule(op::sirius_physical_operator* node)
 {
-  _task_creation_queue.push(std::make_unique<task_creation_request>(node));
+  auto request = std::make_unique<task_creation_request>();
+  request->node = node;
+  _task_creation_queue.push(std::move(request));
 }
 
 void task_creator::manager_loop()

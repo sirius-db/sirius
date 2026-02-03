@@ -95,7 +95,14 @@ class duckdb_scan_task_global_state : public sirius::parallel::itask_global_stat
   /**
    * @brief Set the table scan source as fully drained
    */
-  void set_source_drained() { _source_drained.store(true, std::memory_order_release); }
+  void set_source_drained()
+  {
+    _source_drained.store(true, std::memory_order_release);
+    auto* scan_op =
+      dynamic_cast<sirius_physical_duckdb_scan*>(&_pipeline->get_operators().at(0).get());
+
+    if (scan_op) { scan_op->exhausted.store(true, std::memory_order_release); }
+  }
 
   /**
    * @brief Increment the number of active local table function states
@@ -129,11 +136,16 @@ class duckdb_scan_task_global_state : public sirius::parallel::itask_global_stat
 
   [[nodiscard]] size_t get_pipeline_id() const { return _pipeline->get_pipeline_id(); }
 
+  [[nodiscard]] size_t get_scan_op_id() const
+  {
+    return _pipeline->get_operators().at(0).get().get_operator_id();
+  }
+
  private:
   //===----------Fields----------===//
   duckdb::shared_ptr<pipeline::sirius_pipeline>
-    _pipeline;  ///< The pipeline to which this table scan belongs
-  duckdb::shared_ptr<duckdb::SiriusContext> _sirius_ctx;  ///< The Sirius context
+    _pipeline;                         ///< The pipeline to which this table scan belongs
+  duckdb::SiriusContext* _sirius_ctx;  ///< The Sirius context
   std::unique_ptr<duckdb::GlobalTableFunctionState>
     _global_tf_state;  ///< Global state for the table function
   pipeline::pipeline_executor&
@@ -482,6 +494,11 @@ class duckdb_scan_task : public sirius::pipeline::sirius_pipeline_itask {
   [[nodiscard]] size_t get_pipeline_id() const
   {
     return this->_global_state->cast<duckdb_scan_task_global_state>().get_pipeline_id();
+  }
+
+  [[nodiscard]] size_t get_scan_op_id() const
+  {
+    return this->_global_state->cast<duckdb_scan_task_global_state>().get_scan_op_id();
   }
 
  private:

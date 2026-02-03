@@ -66,7 +66,7 @@ class duckdb_scan_executor {
   /**
    * @brief Destructor for the duckdb_scan_executor.
    */
-  ~duckdb_scan_executor() = default;
+  ~duckdb_scan_executor();
 
   // Non-copyable and non-movable
   duckdb_scan_executor(const duckdb_scan_executor&)            = delete;

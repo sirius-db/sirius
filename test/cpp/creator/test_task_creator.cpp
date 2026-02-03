@@ -145,7 +145,7 @@ class mock_pipeline_builder {
   }
 };
 
-// WSM TODO: fix these tests for removing task_creation_info
+// WSM: TODO fix these tests
 
 // //===----------------------------------------------------------------------===//
 // // Testable Task Creator
@@ -489,10 +489,10 @@ class mock_pipeline_builder {
 // }
 
 // //===----------------------------------------------------------------------===//
-// // get_operator_for_next_task Tests
+// // process_next_task Tests
 // //===----------------------------------------------------------------------===//
 
-// TEST_CASE("get_operator_for_next_task with monostate hint and empty priority_scans", "[task_creator]")
+// TEST_CASE("process_next_task with monostate hint and empty priority_scans", "[task_creator]")
 // {
 //   test_fixture fixture;
 
@@ -502,14 +502,14 @@ class mock_pipeline_builder {
 //   // Create a mock operator with no ports (will return monostate)
 //   auto mock_op = std::make_unique<mock_sirius_physical_operator>();
 
-//   // get_operator_for_next_task should do nothing when hint is monostate and no priority scans
-//   creator.get_operator_for_next_task(mock_op.get());
+//   // process_next_task should do nothing when hint is monostate and no priority scans
+//   creator.process_next_task(mock_op.get());
 
 //   // Nothing should be scheduled
 //   REQUIRE(creator.get_schedule_count() == 0);
 // }
 
-// TEST_CASE("get_operator_for_next_task with monostate hint uses priority_scans", "[task_creator]")
+// TEST_CASE("process_next_task with monostate hint uses priority_scans", "[task_creator]")
 // {
 //   test_fixture fixture;
 
@@ -533,18 +533,18 @@ class mock_pipeline_builder {
 //   auto mock_op = std::make_unique<mock_sirius_physical_operator>();
 
 //   // With empty priority scans, nothing should be scheduled
-//   creator.get_operator_for_next_task(mock_op.get());
+//   creator.process_next_task(mock_op.get());
 //   REQUIRE(creator.get_schedule_count() == 0);
 // }
 
-// TEST_CASE("get_operator_for_next_task with operator hint schedules the hint node", "[task_creator]")
+// TEST_CASE("process_next_task with operator hint schedules the hint node", "[task_creator]")
 // {
 //   test_fixture fixture;
 
 //   testable_task_creator creator(
 //     2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
 
-//   // Create the source operator that we will call get_operator_for_next_task on
+//   // Create the source operator that we will call process_next_task on
 //   auto source_op = std::make_unique<mock_sirius_physical_operator>();
 
 //   // Create the hint operator that should be scheduled
@@ -568,10 +568,10 @@ class mock_pipeline_builder {
 //   // Configure source_op to return hint_op as the hint
 //   source_op->set_custom_hint(sirius::creator::task_creation_hint(hint_op.get()));
 
-//   // Call get_operator_for_next_task - this should attempt to schedule with hint_op
+//   // Call process_next_task - this should attempt to schedule with hint_op
 //   // Note: This will try to access hint_op->get_port("default")->dest_pipeline
 //   // which we've set up above
-//   creator.get_operator_for_next_task(source_op.get());
+//   creator.process_next_task(source_op.get());
 
 //   // Verify that schedule was called with the hint_op
 //   auto scheduled_nodes = creator.get_scheduled_nodes();
@@ -580,12 +580,12 @@ class mock_pipeline_builder {
 //   REQUIRE(scheduled_nodes[0] == hint_op.get());
 // }
 
-// TEST_CASE("get_operator_for_next_task with pipeline hint recurses to inner operator", "[task_creator]")
+// TEST_CASE("process_next_task with pipeline hint recurses to inner operator", "[task_creator]")
 // {
 //   test_fixture fixture;
 
 //   // This test verifies the recursive behavior when the hint is a sirius_pipeline.
-//   // When hint is a pipeline, get_operator_for_next_task should call itself with
+//   // When hint is a pipeline, process_next_task should call itself with
 //   // pipeline->GetInnerOperators()[0]
 //   //
 //   // Since sirius_pipeline requires sirius_engine and complex setup, we test this
@@ -600,8 +600,8 @@ class mock_pipeline_builder {
 //   auto source_op = std::make_unique<mock_sirius_physical_operator>();
 //   source_op->set_custom_hint(sirius::creator::task_creation_hint(std::monostate{}));
 
-//   // Call get_operator_for_next_task - with monostate and no priority_scans, nothing scheduled
-//   creator.get_operator_for_next_task(source_op.get());
+//   // Call process_next_task - with monostate and no priority_scans, nothing scheduled
+//   creator.process_next_task(source_op.get());
 //   REQUIRE(creator.get_schedule_count() == 0);
 
 //   // Now test with an operator hint that returns itself (simulating ready operator)
@@ -616,7 +616,7 @@ class mock_pipeline_builder {
 //   ready_op->set_custom_hint(sirius::creator::task_creation_hint(ready_op.get()));
 
 //   creator.clear_scheduled();
-//   creator.get_operator_for_next_task(ready_op.get());
+//   creator.process_next_task(ready_op.get());
 
 //   // Should have scheduled the ready_op
 //   REQUIRE(creator.get_schedule_count() == 1);
@@ -625,7 +625,7 @@ class mock_pipeline_builder {
 //   REQUIRE(nodes[0] == ready_op.get());
 // }
 
-// TEST_CASE("get_operator_for_next_task operator hint follows dest_pipeline", "[task_creator]")
+// TEST_CASE("process_next_task operator hint follows dest_pipeline", "[task_creator]")
 // {
 //   test_fixture fixture;
 
@@ -646,7 +646,7 @@ class mock_pipeline_builder {
 //   // Source returns target as hint
 //   source_op->set_custom_hint(sirius::creator::task_creation_hint(target_op.get()));
 
-//   creator.get_operator_for_next_task(source_op.get());
+//   creator.process_next_task(source_op.get());
 
 //   // Verify target_op was scheduled
 //   auto nodes = creator.get_scheduled_nodes();
@@ -654,7 +654,7 @@ class mock_pipeline_builder {
 //   REQUIRE(nodes[0] == target_op.get());
 // }
 
-// TEST_CASE("get_operator_for_next_task hint traversal chain", "[task_creator]")
+// TEST_CASE("process_next_task hint traversal chain", "[task_creator]")
 // {
 //   test_fixture fixture;
 
@@ -676,7 +676,7 @@ class mock_pipeline_builder {
 //   // op1 returns op2 as hint
 //   op1->set_custom_hint(sirius::creator::task_creation_hint(op2.get()));
 
-//   creator.get_operator_for_next_task(op1.get());
+//   creator.process_next_task(op1.get());
 
 //   // op2 should be scheduled
 //   auto nodes = creator.get_scheduled_nodes();
@@ -1110,11 +1110,11 @@ class mock_pipeline_builder {
 //     operators.push_back(std::make_unique<mock_sirius_physical_operator>());
 //   }
 
-//   // Spawn threads to call get_operator_for_next_task concurrently
+//   // Spawn threads to call process_next_task concurrently
 //   std::vector<std::thread> threads;
 //   for (int i = 0; i < num_calls; ++i) {
 //     threads.emplace_back([&creator, &operators, i, &completed]() {
-//       creator.get_operator_for_next_task(operators[i].get());
+//       creator.process_next_task(operators[i].get());
 //       completed.fetch_add(1);
 //     });
 //   }

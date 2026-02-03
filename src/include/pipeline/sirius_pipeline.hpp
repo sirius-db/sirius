@@ -101,12 +101,13 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   // bool get_progress(double &current_percentage, duckdb::idx_t &estimated_cardinality);
 
   //! Returns a list of all operators (including source and sink) involved in this pipeline
-  duckdb::vector<duckdb::reference<op::sirius_physical_operator>> get_all_operators();
+  // duckdb::vector<duckdb::reference<op::sirius_physical_operator>> get_all_operators();
 
-  duckdb::vector<duckdb::const_reference<op::sirius_physical_operator>> get_all_operators() const;
+  // duckdb::vector<duckdb::const_reference<op::sirius_physical_operator>> get_all_operators()
+  // const;
 
   //! Returns a list of all inner operators (excluding source and sink) involved in this pipeline
-  duckdb::vector<duckdb::reference<op::sirius_physical_operator>> get_inner_operators();
+  duckdb::vector<duckdb::reference<op::sirius_physical_operator>> get_operators();
 
   duckdb::optional_ptr<op::sirius_physical_operator> get_sink() { return sink; }
 

@@ -66,7 +66,7 @@ pipeline_executor::pipeline_executor(const exec::thread_pool_config& gpu_executo
   }
 }
 
-pipeline_executor::~pipeline_executor() = default;
+pipeline_executor::~pipeline_executor() { stop(); }
 
 void pipeline_executor::schedule(std::unique_ptr<sirius::parallel::itask> task)
 {
@@ -85,6 +85,7 @@ void pipeline_executor::start()
   for (auto& [device_id, gpu_exec] : _gpu_executors) {
     gpu_exec->start();
   }
+  _management_thread = std::thread(&pipeline_executor::management_eventloop, this);
 }
 
 void pipeline_executor::stop()
@@ -97,6 +98,7 @@ void pipeline_executor::stop()
   for (auto& [device_id, gpu_exec] : _gpu_executors) {
     gpu_exec->stop();
   }
+  if (_management_thread.joinable()) { _management_thread.join(); }
 }
 
 void pipeline_executor::set_task_creator(sirius::creator::task_creator& task_creator)
@@ -136,11 +138,14 @@ void pipeline_executor::set_priority_scans(const std::vector<op::sirius_physical
   _scan_executor->prepare_cache_for_scan_operators(scans);
 
   std::lock_guard<std::mutex> lock(_priority_scans_mutex);
-  while (!_priority_scans.empty()) {
-    _priority_scans.pop();
-  }
+  _priority_scans.clear();
   for (auto* scan : scans) {
-    _priority_scans.push(scan);
+    if (auto* tscan = dynamic_cast<op::sirius_physical_duckdb_scan*>(scan)) {
+      _priority_scans.push_back(tscan);
+    } else {
+      SIRIUS_LOG_ERROR("Failed to cast scan to sirius_physical_duckdb_scan");
+      continue;
+    }
   }
 }
 
@@ -163,22 +168,11 @@ void pipeline_executor::management_eventloop()
       // if scan executor doesn't have more tasks to run, it sends a request
       // pipeline executor will schedule more tasks from priority scans if available
       std::lock_guard<std::mutex> lock(_priority_scans_mutex);
-      while (!_priority_scans.empty()) {
-        auto* scan = _priority_scans.front();
-        if (scan->can_create_more_tasks()) {
-          _task_creator->schedule(scan);
-        } else {
-          _priority_scans.pop();
-        }
+      // WSM amin: do we want to loop over all the priority scans? do we ever want to "pop" off any of them after they are complete?
+      for (auto* scan : _priority_scans) {
+        if (auto hint = scan->get_next_task_hint()) { _task_creator->schedule(hint->producer); }
       }
     }
-  }
-}
-
-void pipeline_executor::set_task_creator(creator::task_creator* creator)
-{
-  for (auto& [device_id, gpu_exec] : _gpu_executors) {
-    gpu_exec->set_task_creator(creator);
   }
 }
 

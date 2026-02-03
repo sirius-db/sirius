@@ -457,7 +457,7 @@ size_t count_partition_sinks(const duckdb::vector<duckdb::shared_ptr<sirius_pipe
 bool has_concat_operator(const duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines)
 {
   for (const auto& pipeline : pipelines) {
-    auto ops = pipeline->get_inner_operators();
+    auto ops = pipeline->get_operators();
     for (auto& op : ops) {
       if (op.get().get_name() == "CONCAT") { return true; }
     }
@@ -510,7 +510,7 @@ PipelineBreakdownInfo analyze_pipeline_breakdown(
       auto it = source_to_pipelines.find(sink.get());
       if (it != source_to_pipelines.end()) {
         for (auto& dep_pipeline : it->second) {
-          auto ops = dep_pipeline->get_inner_operators();
+          auto ops = dep_pipeline->get_operators();
           for (auto& op : ops) {
             if (op.get().get_name() == "CONCAT") {
               info.has_concat_after_partition   = true;
@@ -615,7 +615,7 @@ HashJoinBreakdownInfo analyze_hash_join_breakdown(
         // For build partitions: find pipeline where HASH_JOIN is the first operator
         sirius_physical_operator* hash_join_op = partition->get_parent_op();
         for (const auto& dep_pipeline : pipelines) {
-          auto inner_ops = dep_pipeline->get_inner_operators();
+          auto inner_ops = dep_pipeline->get_operators();
           if (inner_ops.size() > 0 && &inner_ops[0].get() == hash_join_op) {
             info.partition_connects_to_join = true;
             info.join_pipelines_from_partition++;
@@ -639,7 +639,7 @@ HashJoinBreakdownInfo analyze_hash_join_breakdown(
         if (it != source_to_pipelines.end()) {
           for (auto& dep_pipeline : it->second) {
             // Check if dependent pipeline has HASH_JOIN in operators
-            auto ops = dep_pipeline->get_inner_operators();
+            auto ops = dep_pipeline->get_operators();
             for (auto& op : ops) {
               if (op.get().type == SiriusPhysicalOperatorType::HASH_JOIN ||
                   op.get().type == SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
@@ -649,7 +649,7 @@ HashJoinBreakdownInfo analyze_hash_join_breakdown(
             }
 
             // Validate port connections - next_op is first inner operator or sink
-            auto inner_ops = dep_pipeline->get_inner_operators();
+            auto inner_ops = dep_pipeline->get_operators();
             sirius_physical_operator* next_op =
               inner_ops.size() > 0 ? &inner_ops[0].get() : dep_pipeline->get_sink().get();
 
@@ -669,7 +669,7 @@ HashJoinBreakdownInfo analyze_hash_join_breakdown(
 
     // Check for pipelines that have PARTITION source and contain HASH_JOIN
     if (pipeline->get_source()->type == SiriusPhysicalOperatorType::PARTITION) {
-      auto ops = pipeline->get_inner_operators();
+      auto ops = pipeline->get_operators();
       for (auto& op : ops) {
         if (op.get().type == SiriusPhysicalOperatorType::HASH_JOIN ||
             op.get().type == SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
@@ -753,7 +753,7 @@ void validate_modified_pipeline_structure(sirius_engine& engine, const std::stri
         // For build partitions: find pipeline where HASH_JOIN is the first operator
         sirius_physical_operator* hash_join_op = partition->get_parent_op();
         for (const auto& dep_pipeline : new_scheduled) {
-          auto inner_ops = dep_pipeline->get_inner_operators();
+          auto inner_ops = dep_pipeline->get_operators();
           if (inner_ops.size() > 0 && &inner_ops[0].get() == hash_join_op) {
             auto* port          = hash_join_op->get_port(port_id);
             std::string context = pipeline_context + " -> PARTITION with port '" + port_id + "'";
@@ -771,7 +771,7 @@ void validate_modified_pipeline_structure(sirius_engine& engine, const std::stri
         if (it != source_to_pipelines.end()) {
           for (auto& dep_pipeline : it->second) {
             // next_op is first inner operator or sink
-            auto inner_ops = dep_pipeline->get_inner_operators();
+            auto inner_ops = dep_pipeline->get_operators();
             sirius_physical_operator* next_op =
               inner_ops.size() > 0 ? &inner_ops[0].get() : dep_pipeline->get_sink().get();
 
@@ -802,7 +802,7 @@ void validate_modified_pipeline_structure(sirius_engine& engine, const std::stri
       if (it != source_to_pipelines.end()) {
         for (auto& dep_pipeline : it->second) {
           // next_op is first inner operator or sink
-          auto inner_ops = dep_pipeline->get_inner_operators();
+          auto inner_ops = dep_pipeline->get_operators();
           sirius_physical_operator* next_op =
             inner_ops.size() > 0 ? &inner_ops[0].get() : dep_pipeline->get_sink().get();
 
@@ -841,7 +841,7 @@ void validate_modified_pipeline_structure(sirius_engine& engine, const std::stri
       // partition_join should use "build" port - find pipeline where join is first operator
       sirius_physical_operator* join_op = partition_join->get_parent_op();
       for (const auto& dep_pipeline : new_scheduled) {
-        auto inner_ops = dep_pipeline->get_inner_operators();
+        auto inner_ops = dep_pipeline->get_operators();
         if (inner_ops.size() > 0 && &inner_ops[0].get() == join_op) {
           auto* port = join_op->get_port("build");
           std::string context =
@@ -856,7 +856,7 @@ void validate_modified_pipeline_structure(sirius_engine& engine, const std::stri
       if (it_distinct != source_to_pipelines.end()) {
         for (auto& dep_pipeline : it_distinct->second) {
           // next_op is first inner operator or sink
-          auto inner_ops = dep_pipeline->get_inner_operators();
+          auto inner_ops = dep_pipeline->get_operators();
           sirius_physical_operator* next_op =
             inner_ops.size() > 0 ? &inner_ops[0].get() : dep_pipeline->get_sink().get();
 
@@ -881,7 +881,7 @@ void validate_modified_pipeline_structure(sirius_engine& engine, const std::stri
       if (it_distinct != source_to_pipelines.end()) {
         for (auto& dep_pipeline : it_distinct->second) {
           // next_op is first inner operator or sink
-          auto inner_ops = dep_pipeline->get_inner_operators();
+          auto inner_ops = dep_pipeline->get_operators();
           sirius_physical_operator* next_op =
             inner_ops.size() > 0 ? &inner_ops[0].get() : dep_pipeline->get_sink().get();
 
@@ -897,7 +897,7 @@ void validate_modified_pipeline_structure(sirius_engine& engine, const std::stri
       if (it_scan != source_to_pipelines.end()) {
         for (auto& dep_pipeline : it_scan->second) {
           // next_op is first inner operator or sink
-          auto inner_ops = dep_pipeline->get_inner_operators();
+          auto inner_ops = dep_pipeline->get_operators();
           sirius_physical_operator* next_op =
             inner_ops.size() > 0 ? &inner_ops[0].get() : dep_pipeline->get_sink().get();
 
@@ -917,7 +917,7 @@ void validate_modified_pipeline_structure(sirius_engine& engine, const std::stri
         if (it != source_to_pipelines.end()) {
           for (auto& dep_pipeline : it->second) {
             // next_op is first inner operator or sink
-            auto inner_ops = dep_pipeline->get_inner_operators();
+            auto inner_ops = dep_pipeline->get_operators();
             sirius_physical_operator* next_op =
               inner_ops.size() > 0 ? &inner_ops[0].get() : dep_pipeline->get_sink().get();
 
@@ -936,7 +936,7 @@ void validate_modified_pipeline_structure(sirius_engine& engine, const std::stri
     // Validate TABLE_SCAN source ports
     if (source->type == SiriusPhysicalOperatorType::TABLE_SCAN) {
       // next_op is first inner operator or sink
-      auto inner_ops = pipeline->get_inner_operators();
+      auto inner_ops = pipeline->get_operators();
       sirius_physical_operator* next_op =
         inner_ops.size() > 0 ? &inner_ops[0].get() : pipeline->get_sink().get();
 
@@ -1190,7 +1190,7 @@ TEST_CASE("Pipeline breakdown - HASH_JOIN build side validation",
 
         // Find the pipeline where HASH_JOIN is the first operator
         for (const auto& dep_pipeline : engine.new_scheduled) {
-          auto inner_ops = dep_pipeline->get_inner_operators();
+          auto inner_ops = dep_pipeline->get_operators();
           if (inner_ops.size() > 0 && &inner_ops[0].get() == hash_join_op) {
             // The port should be on the HASH_JOIN (the first operator)
             auto* port = hash_join_op->get_port("build");
@@ -1267,7 +1267,7 @@ TEST_CASE("Pipeline breakdown - HASH_JOIN probe side validation",
         auto it = source_to_pipelines.find(sink.get());
         if (it != source_to_pipelines.end()) {
           for (auto& dep_pipeline : it->second) {
-            auto ops = dep_pipeline->get_inner_operators();
+            auto ops = dep_pipeline->get_operators();
             for (auto& op : ops) {
               if (op.get().type == SiriusPhysicalOperatorType::HASH_JOIN) {
                 found_join_after_probe_partition = true;

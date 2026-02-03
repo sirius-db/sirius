@@ -36,6 +36,8 @@ duckdb_scan_executor::duckdb_scan_executor(
 {
 }
 
+duckdb_scan_executor::~duckdb_scan_executor() { stop(); }
+
 void duckdb_scan_executor::schedule(std::unique_ptr<sirius::parallel::itask> task)
 {
   _task_queue.push(std::move(task));
@@ -56,9 +58,9 @@ void duckdb_scan_executor::stop()
   if (!_running.compare_exchange_strong(expected, false)) { return; }
   _kiosk.stop();
   _task_queue.interrupt();
+  if (_thread_pool) { _thread_pool->stop(); }
   if (_manager_thread.joinable()) { _manager_thread.join(); }
   _kiosk.wait_all();
-  if (_thread_pool) { _thread_pool->stop(); }
 }
 
 void duckdb_scan_executor::wait_all() { _kiosk.wait_all(); }
@@ -128,7 +130,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> duckdb_scan_executor::get_sc
   if (!_caching_enabled) {
     return task->compute_task();
   } else {
-    auto pipe_id = task->get_pipeline_id();
+    auto pipe_id = task->get_scan_op_id();
     std::lock_guard<std::mutex> lock(_cache_mutex);
     // todo (amin) : we need to clone the batches to avoid modifying the original batches
     auto& entry = _cache.at(pipe_id);
@@ -155,15 +157,18 @@ void duckdb_scan_executor::manager_loop()
       break;
     }
     auto task = _task_queue.try_pop();
-    if (!task && !_running) {
-      SIRIUS_LOG_INFO("DuckDB Scan Executor: task queue interrupted, stopping manager loop");
-      break;
-    }
-    submit_scan_request();  // tell pipeline executor to submit a scan task request
-    task = _task_queue.pop();
     if (!task) {
-      SIRIUS_LOG_INFO("DuckDB Scan Executor: task queue interrupted, stopping manager loop");
-      break;
+      if (!_running) {
+        SIRIUS_LOG_INFO("DuckDB Scan Executor: task queue interrupted, stopping manager loop");
+        break;
+      } else {
+        submit_scan_request();  // tell pipeline executor to submit a scan task request
+        task = _task_queue.pop();
+        if (!task) {
+          SIRIUS_LOG_INFO("DuckDB Scan Executor: task queue interrupted, stopping manager loop");
+          break;
+        }
+      }
     }
 
     // Make host memory reservation and set it on the local state
@@ -195,7 +200,7 @@ void duckdb_scan_executor::manager_loop()
       auto consumers = scan_task->get_output_consumers();
       auto batches   = get_scan_output(scan_task);
       scan_task->publish_output(std::move(batches));
-      t.reset();      
+      t.reset();
       if (_schedule_callback) {
         for (auto* consumer : consumers) {
           _schedule_callback(consumer);

@@ -34,6 +34,7 @@
 #include <cucascade/data/data_repository.hpp>
 
 #include <atomic>
+#include <optional>
 
 namespace sirius {
 
@@ -178,6 +179,7 @@ class sirius_physical_operator {
   template <class TARGET>
   TARGET& Cast()
   {
+    // TODO(amin) this is buggy code
     if (TARGET::TYPE != SiriusPhysicalOperatorType::INVALID && type != TARGET::TYPE) {
       throw duckdb::InternalException(
         "Failed to cast physical operator to type - physical operator type mismatch");
@@ -208,6 +210,8 @@ class sirius_physical_operator {
   void add_port(std::string_view port_id, std::unique_ptr<port> p);
   //! Get a port from the operator
   port* get_port(std::string_view port_id);
+  //! Get all ports from the operator
+  std::vector<std::string_view> get_port_ids();
   //! Check if the source pipeline is finished
   bool is_source_pipeline_finished();
   //! Add a next port after sink
@@ -224,6 +228,7 @@ class sirius_physical_operator {
   /// the function is called
   virtual bool can_create_more_tasks() const
   {
+    //WSM TODO implement this
     throw std::runtime_error("can_create_more_tasks not implemented for operator " + get_name());
     return true;
   }
@@ -231,6 +236,7 @@ class sirius_physical_operator {
   /// \brief check if all tasks have been processed
   virtual bool has_processed_all_tasks() const
   {
+    //WSM TODO implement this
     throw std::runtime_error("has_processed_all_tasks not implemented for operator " + get_name());
     return true;
   }

@@ -214,24 +214,15 @@ std::optional<task_creation_hint> sirius_physical_operator::get_next_task_hint()
 {
   if (ports.empty()) { return std::nullopt; }
 
-  // first look at the input ports and see if there are any unfinished hard barriers
+// WSM TODO: look at the input ports and see if there are any unfinished hard barriers
   auto unfinished_barrier = std::find_if(ports.begin(), ports.end(), [](const auto& port_pair) {
     return port_pair.second->type == MemoryBarrierType::FULL && port_pair.second->src_pipeline &&
            !port_pair.second->src_pipeline->is_pipeline_finished();
   });
 
   if (unfinished_barrier != ports.end()) {
-    if (unfinished_barrier->second->src_pipeline->get_inner_operators().empty()) {
-      auto sink = unfinished_barrier->second->src_pipeline->get_sink();
-      if (sink){
-        return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, sink.get()};
-      } else {
-        return std::nullopt;
-      }
-    } else {
-      auto* producer = &(unfinished_barrier->second->src_pipeline->get_inner_operators()[0].get());
-      return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
-    }
+    auto* producer = &(unfinished_barrier->second->src_pipeline->get_operators()[0].get());
+    return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};    
   }
 
   // if no unfinished barriers, then is this operator ready to create a task?
@@ -249,17 +240,8 @@ std::optional<task_creation_hint> sirius_physical_operator::get_next_task_hint()
   });
 
   if (unfinished_pipeline != ports.end()) {
-    if (unfinished_pipeline->second->src_pipeline->get_inner_operators().empty()) {
-      auto sink = unfinished_pipeline->second->src_pipeline->get_sink();
-      if (sink){
-        return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, sink.get()};
-      } else {
-        return std::nullopt;
-      }
-    } else {
-      auto* producer = &(unfinished_pipeline->second->src_pipeline->get_inner_operators()[0].get());
-      return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
-    }
+    auto* producer = &(unfinished_pipeline->second->src_pipeline->get_operators()[0].get());
+    return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};   
   }
 
   // nothing to do
@@ -302,5 +284,15 @@ duckdb::shared_ptr<pipeline::sirius_pipeline> sirius_physical_operator::get_pipe
   if (ports.empty()) { return nullptr; }
   return ports.begin()->second->dest_pipeline;
 }
+// implement get_all_ports
+std::vector<std::string_view> sirius_physical_operator::get_port_ids()
+{
+  std::vector<std::string_view> result;
+  for (auto& [port_name, port_ptr] : ports) {
+    result.push_back(port_name);
+  }
+  return result;
+}
+
 }  // namespace op
 }  // namespace sirius

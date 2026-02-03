@@ -92,8 +92,6 @@ class SiriusContext : public ClientContextState {
   [[nodiscard]] const sirius::sirius_config& get_config() const noexcept { return config_; }
 
  private:
-  // friend sirius_context& get_sirius_context();
-
   void thorw_if_not_initialized() const;
 
   mutable std::mutex mutex_;
@@ -137,7 +135,5 @@ class SiriusContextExtensionCallback : public ExtensionCallback {
   sirius::sirius_config config_;
   duckdb::shared_ptr<SiriusContext> context_;
 };
-
-// [[nodiscard]] sirius_context& get_sirius_context();
 
 }  // namespace duckdb
