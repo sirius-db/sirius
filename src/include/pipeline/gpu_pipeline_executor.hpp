@@ -36,6 +36,11 @@ class sirius_physical_operator;
 }  // namespace sirius::op
 
 namespace sirius {
+
+namespace creator {
+class task_creator;
+}
+
 namespace pipeline {
 
 /**
@@ -104,7 +109,7 @@ class gpu_pipeline_executor {
   void set_schedule_callback(
     std::function<void(sirius::op::sirius_physical_operator*)> schedule_fn);
 
- private:
+  private:
   /**
    * @brief Manager loop to consume task from local buffer and dispatch to the thread pool
    */

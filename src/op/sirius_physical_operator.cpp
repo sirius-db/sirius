@@ -16,7 +16,6 @@
 
 #include "op/sirius_physical_operator.hpp"
 
-#include "creator/task_creator.hpp"
 #include "gpu_executor.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -176,30 +175,13 @@ sirius_physical_operator::port* sirius_physical_operator::get_port(std::string_v
 }
 
 void sirius_physical_operator::sink(
-  const ::std::vector<::std::shared_ptr<::cucascade::data_batch>>& input_batches)
+  const ::std::vector<::std::shared_ptr<::cucascade::data_batch>>& output_batches)
 {
-  auto output_batches = execute(input_batches);
   for (auto& batch : output_batches) {
     for (auto& [next_op, port_id] : next_port_after_sink) {
       next_op->push_data_batch(port_id, batch);
     }
   }
-
-  // WSM TODO: sink should not create a task. The task should be created by gpu_pipeline_executor
-  // after the task is completed
-
-  // if (!creator) {
-  //   throw std::runtime_error(
-  //     "sirius_physical_operator creator is null in sink_execute for operator " + get_name());
-  // }
-  // if (next_port_after_sink.size() > 0) {
-  //   auto current_pipeline =
-  //     next_port_after_sink[0].first->get_port(next_port_after_sink[0].second)->src_pipeline;
-  //   current_pipeline->update_pipeline_status();
-  // }
-  // for (auto& [next_op, port_id] : next_port_after_sink) {
-  //   if (next_op) { creator->process_next_task(next_op); }
-  // }
 }
 
 std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_operator::execute(
@@ -232,7 +214,7 @@ std::optional<task_creation_hint> sirius_physical_operator::get_next_task_hint()
 {
   if (ports.empty()) { return std::nullopt; }
 
-  // satisfy hard barriers first
+// look at the input ports and see if there are any unfinished hard barriers
   auto unfinished_barrier = std::find_if(ports.begin(), ports.end(), [](const auto& port_pair) {
     return port_pair.second->type == MemoryBarrierType::FULL && port_pair.second->src_pipeline &&
            !port_pair.second->src_pipeline->is_pipeline_finished();
@@ -240,13 +222,13 @@ std::optional<task_creation_hint> sirius_physical_operator::get_next_task_hint()
 
   if (unfinished_barrier != ports.end()) {
     auto* producer = &(unfinished_barrier->second->src_pipeline->get_operators()[0].get());
-    return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
+    return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};    
   }
 
-  // if they are complete, create data if you can
-  if (std::any_of(ports.begin(), ports.end(), [](const auto& port_pair) {
-        return port_pair.second->type != MemoryBarrierType::FULL &&
-               port_pair.second->repo->size() > 0;
+  // if no unfinished barriers, then is this operator ready to create a task?
+  if (std::all_of(ports.begin(), ports.end(), [](const auto& port_pair) {
+        return (port_pair.second->type != MemoryBarrierType::FULL && port_pair.second->repo->size() > 0) ||
+        (port_pair.second->type == MemoryBarrierType::FULL && port_pair.second->repo->size() > 0 && port_pair.second->src_pipeline && port_pair.second->src_pipeline->is_pipeline_finished());
       })) {
     return task_creation_hint{TaskCreationHint::READY, this};
   }
@@ -259,14 +241,14 @@ std::optional<task_creation_hint> sirius_physical_operator::get_next_task_hint()
 
   if (unfinished_pipeline != ports.end()) {
     auto* producer = &(unfinished_pipeline->second->src_pipeline->get_operators()[0].get());
-    return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
+    return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};   
   }
 
   // nothing to do
   return std::nullopt;
 }
 
-std::vector<::std::shared_ptr<::cucascade::data_batch>> sirius_physical_operator::get_input_batch()
+std::optional<std::vector<::std::shared_ptr<::cucascade::data_batch>>> sirius_physical_operator::get_next_task_input_batch()
 {
   // take one data batch from each port and schedule a task (a task takes one data batch from each
   // port), do this repeatedly until all ports are empty
@@ -289,11 +271,6 @@ bool sirius_physical_operator::all_ports_empty()
   return true;
 }
 
-void sirius_physical_operator::set_creator(::sirius::creator::task_creator* creator)
-{
-  this->creator = creator;
-}
-
 bool sirius_physical_operator::is_source_pipeline_finished()
 {
   for (auto& [port_name, port_ptr] : ports) {
@@ -302,6 +279,11 @@ bool sirius_physical_operator::is_source_pipeline_finished()
   return true;
 }
 
+duckdb::shared_ptr<pipeline::sirius_pipeline> sirius_physical_operator::get_pipeline()
+{
+  if (ports.empty()) { return nullptr; }
+  return ports.begin()->second->dest_pipeline;
+}
 // implement get_all_ports
 std::vector<std::string_view> sirius_physical_operator::get_port_ids()
 {

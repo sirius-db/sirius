@@ -169,6 +169,7 @@ void pipeline_executor::management_eventloop()
       // if scan executor doesn't have more tasks to run, it sends a request
       // pipeline executor will schedule more tasks from priority scans if available
       std::lock_guard<std::mutex> lock(_priority_scans_mutex);
+      // WSM amin: do we want to loop over all the priority scans? do we ever want to "pop" off any of them after they are complete?
       for (auto* scan : _priority_scans) {
         if (auto hint = scan->get_next_task_hint()) {
           _task_creator->schedule(hint->producer);

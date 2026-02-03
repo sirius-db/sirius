@@ -105,11 +105,36 @@ gpu_pipeline_task::gpu_pipeline_task(
 {
 }
 
+gpu_pipeline_task::~gpu_pipeline_task()
+{
+  _global_state->cast<gpu_pipeline_task_global_state>()._pipeline.get()->mark_task_completed();
+}
+
 uint64_t gpu_pipeline_task::get_task_id() const { return _task_id; }
 
 const sirius_pipeline* gpu_pipeline_task::get_pipeline() const
 {
   return _global_state->cast<gpu_pipeline_task_global_state>()._pipeline.get();
+}
+
+std::vector<std::shared_ptr<cucascade::data_batch>> gpu_pipeline_task::compute_task()
+{
+  auto& local_state = _local_state->cast<gpu_pipeline_task_local_state>();
+  auto data_batches = local_state._batches;
+  for (auto& op : _global_state->cast<gpu_pipeline_task_global_state>()._pipeline.get()->get_operators()) {
+    data_batches = op.get().execute(data_batches);
+  }
+  return std::move(data_batches);
+}
+
+void gpu_pipeline_task::publish_output(std::vector<std::shared_ptr<cucascade::data_batch>> output_batches)
+{
+  auto sink_operators = _global_state->cast<gpu_pipeline_task_global_state>()._pipeline.get()->get_sink();
+  if (sink_operators) {
+    sink_operators.get()->sink(output_batches);
+  } else {
+    throw std::runtime_error("Sink operator not found");
+  }
 }
 
 void gpu_pipeline_task::execute()
@@ -136,12 +161,48 @@ void gpu_pipeline_task::execute()
 
   // TODO: Implement actual pipeline execution:
   // 1. Transfer data batch to GPU memory if not already there
+  for (auto& batch : local_state._batches) {
+    // 1. Transfer data batch to GPU memory if not already there
+    // for now assuming that local_state._batches will continue to hold the data and now in GPU memory
+  }
+
+
+
   // 2. Set reservation_aware_memory_resource_ref as the default cudf allocator
   // 3. Execute cudf operators on the pipeline
+  auto output_batches = compute_task();
+  publish_output(output_batches);
   // 4. After each cudf operator, get peak total bytes to collect statistics
   // 5. Push output batches to the data repository
 
   // Processing handles are automatically released here when they go out of scope
+}
+
+
+std::size_t gpu_pipeline_task::get_input_size() const
+{
+  auto& local_state = _local_state->cast<gpu_pipeline_task_local_state>();
+  std::size_t input_size = 0;
+  for (const auto& batch : local_state._batches) {
+    input_size += batch->get_data()->get_size_in_bytes();
+  }
+  return input_size;
+}
+
+std::size_t gpu_pipeline_task::get_estimated_reservation_size() const
+{
+  // WSM TODO: this is a placeholder for the actual reservation size
+  return get_input_size() * 1;
+}
+
+std::vector<op::sirius_physical_operator*> gpu_pipeline_task::get_output_consumers()
+{
+  std::vector<op::sirius_physical_operator*> output_consumers;
+  auto parents = _global_state->cast<gpu_pipeline_task_global_state>()._pipeline.get()->get_parents();
+  for (auto& parent : parents) {
+    output_consumers.push_back(&parent->get_operators()[0].get());     
+  }
+  return output_consumers;
 }
 
 }  // namespace pipeline

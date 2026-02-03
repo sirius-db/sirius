@@ -136,6 +136,8 @@ class duckdb_scan_task_global_state : public sirius::parallel::itask_global_stat
     return output_consumers;
   }
 
+  [[nodiscard]] size_t get_pipeline_id() const { return _pipeline->get_pipeline_id(); }
+
   [[nodiscard]] size_t get_scan_op_id() const
   {
     return _pipeline->get_operators().at(0).get().get_operator_id();
@@ -316,6 +318,7 @@ class duckdb_scan_task_local_state : public sirius::pipeline::sirius_pipeline_it
    */
   std::shared_ptr<data_batch> make_data_batch();
 
+  
  private:
   //===----------Fields----------===//
   size_t _approximate_batch_size;                ///< Approximate target batch size in bytes
@@ -478,7 +481,7 @@ class duckdb_scan_task : public sirius::pipeline::sirius_pipeline_itask {
    */
   void publish_output(std::vector<std::shared_ptr<cucascade::data_batch>> output_batches) override;
 
-  std::size_t get_estimated_reservation_size() override
+  std::size_t get_estimated_reservation_size() const override
   {
     return this->_local_state->cast<duckdb_scan_task_local_state>()
       .get_estimated_reservation_size();
@@ -488,6 +491,11 @@ class duckdb_scan_task : public sirius::pipeline::sirius_pipeline_itask {
   std::vector<op::sirius_physical_operator*> get_output_consumers() override
   {
     return this->_global_state->cast<duckdb_scan_task_global_state>().get_output_consumers();
+  }
+
+  [[nodiscard]] size_t get_pipeline_id() const
+  {
+    return this->_global_state->cast<duckdb_scan_task_global_state>().get_pipeline_id();
   }
 
   [[nodiscard]] size_t get_scan_op_id() const

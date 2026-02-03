@@ -31,6 +31,8 @@
 #include <filesystem>
 #include <iostream>
 #include <memory>
+#include <string>
+#include <string_view>
 
 namespace duckdb {
 
@@ -79,6 +81,10 @@ void SiriusContext::QueryBegin(ClientContext& context)
   if (config_.is_scan_caching_enabled()) {
     pipeline_executor_->get_scan_executor().cache_scan_results_for_query(query);
   }
+  
+  // Reset task creator state (including scan operator global state map) for the new query
+  task_creator_->reset();
+  task_creator_->set_client_context(context);
 }
 
 void SiriusContext::QueryEnd() {}
@@ -108,7 +114,7 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
     sirius::parallel::task_executor_config{}, *data_repository_manager_);
 
   task_creator_ = std::make_unique<sirius::creator::task_creator>(
-    config_.get_task_creator_thread_count(), *memory_manager_);
+    config_.get_task_creator_config(), *memory_manager_);
   task_creator_->set_pipeline_executor(*pipeline_executor_);
   pipeline_executor_->set_task_creator(*task_creator_);
 

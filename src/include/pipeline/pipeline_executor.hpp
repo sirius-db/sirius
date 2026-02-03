@@ -41,6 +41,11 @@ class duckdb_scan_executor;
 }  // namespace sirius::op::scan
 
 namespace sirius {
+
+namespace creator {
+class task_creator;
+}
+
 namespace pipeline {
 
 class gpu_pipeline_executor;

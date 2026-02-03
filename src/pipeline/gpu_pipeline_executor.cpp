@@ -53,9 +53,11 @@ void gpu_pipeline_executor::stop()
 {
   bool expected = true;
   if (!_running.compare_exchange_strong(expected, false)) { return; }
+  _kiosk.stop();
   _task_queue.interrupt();
   if (_manager_thread.joinable()) { _manager_thread.join(); }
   _kiosk.wait_all();
+  if (_thread_pool) { _thread_pool->stop(); }
 }
 
 void gpu_pipeline_executor::manager_loop()
