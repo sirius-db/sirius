@@ -228,9 +228,9 @@ class test_fixture {
       engine(*con.context, gpu_context),
       memory_manager([] {
         cucascade::memory::reservation_manager_configurator builder;
-        const size_t gpu_capacity  = 2ull << 30;  // 2GB
+        const size_t gpu_capacity  = 2ull << 27;
         const double limit_ratio   = 0.75;
-        const size_t host_capacity = 4ull << 30;  // 4GB
+        const size_t host_capacity = 4ull << 27;
 
         builder.set_number_of_gpus(1)
           .set_gpu_usage_limit(gpu_capacity)

@@ -330,7 +330,7 @@ size_t duckdb_scan_task_local_state::get_tail_byte_offset() const
 
 void duckdb_scan_task_local_state::estimate_rows_per_batch(sirius_physical_duckdb_scan const& op)
 {
-  assert(num_columns <= op.column_ids.size());
+  assert(_num_columns <= op.column_ids.size());
 
   size_t estimated_row_bytes = 0;
   _column_builders.reserve(_num_columns);
