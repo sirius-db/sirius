@@ -107,7 +107,14 @@ class gpu_pipeline_executor {
    */
   void set_task_creator(sirius::creator::task_creator* task_creator);
 
-  private:
+  /**
+   * @brief Drain any leftover tasks from the queue
+   *
+   * Clears the task queue of any remaining tasks from a previous query.
+   */
+  void drain_leftover_tasks();
+
+ private:
   /**
    * @brief Manager loop to consume task from local buffer and dispatch to the thread pool
    */

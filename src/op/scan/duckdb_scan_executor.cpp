@@ -71,6 +71,8 @@ void duckdb_scan_executor::set_task_creator(sirius::creator::task_creator* task_
   _task_creator = task_creator;
 }
 
+void duckdb_scan_executor::drain_leftover_tasks() { _task_queue.drain(); }
+
 void duckdb_scan_executor::cache_scan_results_for_query(const std::string& query)
 {
   if (!_caching_enabled) { return; }

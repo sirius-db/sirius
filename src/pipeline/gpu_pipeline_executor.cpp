@@ -122,5 +122,7 @@ void gpu_pipeline_executor::set_task_creator(sirius::creator::task_creator* task
   _task_creator = task_creator;
 }
 
+void gpu_pipeline_executor::drain_leftover_tasks() { _task_queue.drain(); }
+
 }  // namespace pipeline
 }  // namespace sirius

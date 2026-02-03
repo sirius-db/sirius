@@ -130,6 +130,12 @@ void pipeline_executor::set_scan_caching_enabled(bool enabled)
 
 void pipeline_executor::prepare_for_query(duckdb::shared_ptr<planner::query> query)
 {
+  // Drain leftover tasks from previous query
+  _scan_executor->drain_leftover_tasks();
+  for (auto& [device_id, gpu_exec] : _gpu_executors) {
+    gpu_exec->drain_leftover_tasks();
+  }
+
   auto scans = query->get_scan_operators();
   _scan_executor->prepare_cache_for_scan_operators(scans);
 
@@ -172,7 +178,8 @@ void pipeline_executor::management_eventloop()
       // if scan executor doesn't have more tasks to run, it sends a request
       // pipeline executor will schedule more tasks from priority scans if available
       std::lock_guard<std::mutex> lock(_priority_scans_mutex);
-      // WSM amin: do we want to loop over all the priority scans? do we ever want to "pop" off any of them after they are complete?
+      // WSM amin: do we want to loop over all the priority scans? do we ever want to "pop" off any
+      // of them after they are complete?
       for (auto* scan : _priority_scans) {
         if (auto hint = scan->get_next_task_hint()) {
           _task_creator->schedule(hint->producer);

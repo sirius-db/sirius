@@ -119,6 +119,13 @@ class duckdb_scan_executor {
   void set_task_creator(sirius::creator::task_creator* task_creator);
 
   /**
+   * @brief Drain any leftover tasks from the queue
+   *
+   * Clears the task queue of any remaining tasks from a previous query.
+   */
+  void drain_leftover_tasks();
+
+  /**
    * @brief Cache scan results for the given query
    *
    * @param query The query string to cache results for
