@@ -49,6 +49,12 @@ class sirius_physical_duckdb_scan : public sirius_physical_operator {
                               duckdb::vector<duckdb::Value> parameters,
                               duckdb::virtual_column_map_t virtual_columns);
 
+  std::optional<task_creation_hint> get_next_task_hint() override
+  {
+    if (exhausted.load()) { return std::nullopt; }
+    return task_creation_hint{TaskCreationHint::READY, this};
+  }
+
   //! The table function
   duckdb::TableFunction function;
   //! Bind data of the function

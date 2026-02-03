@@ -239,7 +239,7 @@ std::optional<task_creation_hint> sirius_physical_operator::get_next_task_hint()
   });
 
   if (unfinished_barrier != ports.end()) {
-    auto* producer = &(unfinished_barrier->second->src_pipeline->get_inner_operators()[0].get());
+    auto* producer = &(unfinished_barrier->second->src_pipeline->get_operators()[0].get());
     return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
   }
 
@@ -258,7 +258,7 @@ std::optional<task_creation_hint> sirius_physical_operator::get_next_task_hint()
   });
 
   if (unfinished_pipeline != ports.end()) {
-    auto* producer = &(unfinished_pipeline->second->src_pipeline->get_inner_operators()[0].get());
+    auto* producer = &(unfinished_pipeline->second->src_pipeline->get_operators()[0].get());
     return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
   }
 

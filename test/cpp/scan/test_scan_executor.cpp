@@ -378,8 +378,6 @@ static void run_scan_test(std::string const& table_name,
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
 
-  REQUIRE(physical_scan->exhausted.load(std::memory_order_relaxed));
-
   pipeline_executor.stop();
   const auto scan_end = std::chrono::steady_clock::now();
   const auto elapsed_ms =

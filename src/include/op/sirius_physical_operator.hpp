@@ -227,22 +227,6 @@ class sirius_physical_operator {
   //! Get the next task hint
   virtual std::optional<task_creation_hint> get_next_task_hint();
 
-  /// \brief check if there are more tasks to create
-  /// \note not necessarily ready to create at the moment
-  /// the function is called
-  virtual bool can_create_more_tasks() const
-  {
-    throw std::runtime_error("can_create_more_tasks not implemented for operator " + get_name());
-    return true;
-  }
-
-  /// \brief check if all tasks have been processed
-  virtual bool has_processed_all_tasks() const
-  {
-    throw std::runtime_error("has_processed_all_tasks not implemented for operator " + get_name());
-    return true;
-  }
-
   //! Get the input batch
   std::vector<std::shared_ptr<::cucascade::data_batch>> get_input_batch();
   //! Check if all ports are empty

@@ -98,7 +98,8 @@ class duckdb_scan_task_global_state : public sirius::parallel::itask_global_stat
   void set_source_drained()
   {
     _source_drained.store(true, std::memory_order_release);
-    auto* scan_op = dynamic_cast<sirius_physical_duckdb_scan*>(_pipeline->get_source().get());
+    auto* scan_op =
+      dynamic_cast<sirius_physical_duckdb_scan*>(&_pipeline->get_operators().at(0).get());
 
     if (scan_op) { scan_op->exhausted.store(true, std::memory_order_release); }
   }
@@ -135,7 +136,7 @@ class duckdb_scan_task_global_state : public sirius::parallel::itask_global_stat
 
   [[nodiscard]] size_t get_scan_op_id() const
   {
-    return _pipeline->get_inner_operators().at(0).get().get_operator_id();
+    return _pipeline->get_operators().at(0).get().get_operator_id();
   }
 
  private:

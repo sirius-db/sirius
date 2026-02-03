@@ -144,8 +144,7 @@ class pipeline_executor {
   void management_eventloop();
 
   std::mutex _priority_scans_mutex;
-  std::queue<op::sirius_physical_duckdb_scan*> _priority_scans;
-  std::unordered_map<op::sirius_physical_duckdb_scan*, std::size_t> _priority_scan_counts;
+  std::vector<op::sirius_physical_duckdb_scan*> _priority_scans;
 
   exec::interruptible_mpmc<std::unique_ptr<sirius::parallel::itask>>
     _task_queue;  ///< Queue for GPU pipeline tasks
