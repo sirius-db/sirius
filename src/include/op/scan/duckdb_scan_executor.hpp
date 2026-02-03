@@ -28,7 +28,6 @@
 #include <cucascade/memory/memory_reservation_manager.hpp>
 
 #include <atomic>
-#include <functional>
 #include <memory>
 #include <string>
 #include <thread>
@@ -36,6 +35,10 @@
 namespace sirius::op {
 class sirius_physical_operator;
 }  // namespace sirius::op
+
+namespace sirius::creator {
+class task_creator;
+}  // namespace sirius::creator
 
 namespace sirius::op::scan {
 
@@ -109,12 +112,11 @@ class duckdb_scan_executor {
   [[nodiscard]] int32_t get_num_threads() const { return _config.num_threads; }
 
   /**
-   * @brief Set the schedule callback for output consumers
+   * @brief Set the task creator for scheduling output consumers
    *
-   * @param schedule_fn Callback function to schedule operators
+   * @param task_creator Pointer to the task creator
    */
-  void set_schedule_callback(
-    std::function<void(sirius::op::sirius_physical_operator*)> schedule_fn);
+  void set_task_creator(sirius::creator::task_creator* task_creator);
 
   /**
    * @brief Cache scan results for the given query
@@ -181,7 +183,7 @@ class duckdb_scan_executor {
   std::thread _manager_thread;
   exec::publisher<std::unique_ptr<sirius::pipeline::task_request>> _task_request_publisher;
   cucascade::memory::memory_reservation_manager* _mem_mgr{nullptr};
-  std::function<void(sirius::op::sirius_physical_operator*)> _schedule_callback;
+  sirius::creator::task_creator* _task_creator{nullptr};
 };
 
 }  // namespace sirius::op::scan

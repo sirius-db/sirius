@@ -26,15 +26,13 @@
 #include "parallel/task.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/task_request.hpp"
+#include "planner/query.hpp"
 
 #include <cucascade/memory/topology_discovery.hpp>
 
+#include <future>
 #include <queue>
 #include <unordered_map>
-
-namespace sirius::creator {
-class task_creator;
-}  // namespace sirius::creator
 
 namespace sirius::op::scan {
 class duckdb_scan_executor;
@@ -143,7 +141,15 @@ class pipeline_executor {
    *
    * @param scans Vector of scan operators (first in vector = first out of queue)
    */
-  void set_priority_scans(const std::vector<op::sirius_physical_operator*>& scans);
+  void prepare_for_query(duckdb::shared_ptr<planner::query> query);
+
+  /**
+   * @brief Start query execution with a completion promise
+   *
+   * @param query The query to execute.
+   * @param completion_promise Promise to signal when query execution completes.
+   */
+  std::future<void> start_query(duckdb::shared_ptr<planner::query> query);
 
  private:
   void management_eventloop();
@@ -162,6 +168,7 @@ class pipeline_executor {
 
   sirius::creator::task_creator* _task_creator{nullptr};
   std::unique_ptr<sirius::op::scan::duckdb_scan_executor> _scan_executor;
+  std::promise<void> _completion_promise;
 };
 
 }  // namespace pipeline

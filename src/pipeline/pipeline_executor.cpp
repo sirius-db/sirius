@@ -105,14 +105,9 @@ void pipeline_executor::set_task_creator(sirius::creator::task_creator& task_cre
 {
   _task_creator = &task_creator;
 
-  // Create a callback that captures task_creator and schedules operators
-  auto schedule_callback = [&task_creator](sirius::op::sirius_physical_operator* op) {
-    task_creator.schedule(op);
-  };
-
-  _scan_executor->set_schedule_callback(schedule_callback);
+  _scan_executor->set_task_creator(_task_creator);
   for (auto& [device_id, gpu_exec] : _gpu_executors) {
-    gpu_exec->set_schedule_callback(schedule_callback);
+    gpu_exec->set_task_creator(_task_creator);
   }
 }
 
@@ -133,8 +128,9 @@ void pipeline_executor::set_scan_caching_enabled(bool enabled)
   _scan_executor->set_scan_caching_enabled(enabled);
 }
 
-void pipeline_executor::set_priority_scans(const std::vector<op::sirius_physical_operator*>& scans)
+void pipeline_executor::prepare_for_query(duckdb::shared_ptr<planner::query> query)
 {
+  auto scans = query->get_scan_operators();
   _scan_executor->prepare_cache_for_scan_operators(scans);
 
   std::lock_guard<std::mutex> lock(_priority_scans_mutex);
@@ -148,6 +144,13 @@ void pipeline_executor::set_priority_scans(const std::vector<op::sirius_physical
     }
   }
   if (!scans.empty()) { _task_creator->schedule(scans.front()); }
+}
+
+std::future<void> pipeline_executor::start_query(duckdb::shared_ptr<planner::query> query)
+{
+  std::future<void> future = _completion_promise.get_future();
+  prepare_for_query(std::move(query));
+  return future;
 }
 
 void pipeline_executor::management_eventloop()

@@ -16,6 +16,7 @@
 
 #include "pipeline/gpu_pipeline_executor.hpp"
 
+#include "creator/task_creator.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/gpu_pipeline_queue.hpp"
 #include "pipeline/task_request.hpp"
@@ -101,9 +102,9 @@ void gpu_pipeline_executor::manager_loop()
                             consumers = std::move(output_consumers)]() mutable {
       task->execute();
       task.reset();
-      if (_schedule_callback) {
+      if (_task_creator) {
         for (auto* consumer : consumers) {
-          _schedule_callback(consumer);
+          _task_creator->schedule(consumer);
         }
       }
     });
@@ -116,10 +117,9 @@ gpu_pipeline_task* gpu_pipeline_executor::cast_to_gpu_pipeline_task(sirius::para
   return dynamic_cast<gpu_pipeline_task*>(task);
 }
 
-void gpu_pipeline_executor::set_schedule_callback(
-  std::function<void(sirius::op::sirius_physical_operator*)> schedule_fn)
+void gpu_pipeline_executor::set_task_creator(sirius::creator::task_creator* task_creator)
 {
-  _schedule_callback = std::move(schedule_fn);
+  _task_creator = task_creator;
 }
 
 }  // namespace pipeline

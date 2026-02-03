@@ -28,7 +28,6 @@
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
-#include <functional>
 #include <thread>
 
 namespace sirius::op {
@@ -102,12 +101,11 @@ class gpu_pipeline_executor {
   void stop();
 
   /**
-   * @brief Set the schedule callback for output consumers
+   * @brief Set the task creator for scheduling output consumers
    *
-   * @param schedule_fn Callback function to schedule operators
+   * @param task_creator Pointer to the task creator
    */
-  void set_schedule_callback(
-    std::function<void(sirius::op::sirius_physical_operator*)> schedule_fn);
+  void set_task_creator(sirius::creator::task_creator* task_creator);
 
   private:
   /**
@@ -132,7 +130,7 @@ class gpu_pipeline_executor {
   std::thread _manager_thread;
   exec::publisher<std::unique_ptr<task_request>> _task_request_publisher;
   cucascade::memory::memory_space* _memory_space;
-  std::function<void(sirius::op::sirius_physical_operator*)> _schedule_callback;
+  sirius::creator::task_creator* _task_creator{nullptr};
 };
 
 }  // namespace pipeline
