@@ -107,6 +107,10 @@ gpu_pipeline_task::gpu_pipeline_task(
 
 gpu_pipeline_task::~gpu_pipeline_task()
 {
+  if (_global_state == nullptr ||
+      _global_state->cast<gpu_pipeline_task_global_state>()._pipeline.get() == nullptr) {
+    return;
+  }
   _global_state->cast<gpu_pipeline_task_global_state>()._pipeline.get()->mark_task_completed();
 }
 
@@ -199,6 +203,10 @@ std::size_t gpu_pipeline_task::get_estimated_reservation_size() const
 std::vector<op::sirius_physical_operator*> gpu_pipeline_task::get_output_consumers()
 {
   std::vector<op::sirius_physical_operator*> output_consumers;
+  if (_global_state == nullptr ||
+      _global_state->cast<gpu_pipeline_task_global_state>()._pipeline.get() == nullptr) {
+    return output_consumers;
+  }
   auto parents =
     _global_state->cast<gpu_pipeline_task_global_state>()._pipeline.get()->get_parents();
   for (auto& parent : parents) {
