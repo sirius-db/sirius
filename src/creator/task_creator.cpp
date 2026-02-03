@@ -45,7 +45,7 @@ task_creator::task_creator(exec::thread_pool_config config,
   
 }
 
-task_creator::~task_creator() { stop_thread_pool(); }
+task_creator::~task_creator() { stop(); }
 
 void task_creator::set_client_context(::duckdb::ClientContext& client_context)
 {

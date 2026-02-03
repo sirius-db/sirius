@@ -35,6 +35,7 @@
 
 #include <atomic>
 #include <optional>
+#include <string_view>
 
 namespace sirius {
 

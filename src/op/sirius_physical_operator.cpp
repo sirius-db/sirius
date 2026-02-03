@@ -214,7 +214,7 @@ std::optional<task_creation_hint> sirius_physical_operator::get_next_task_hint()
 {
   if (ports.empty()) { return std::nullopt; }
 
-// WSM TODO: look at the input ports and see if there are any unfinished hard barriers
+// look at the input ports and see if there are any unfinished hard barriers
   auto unfinished_barrier = std::find_if(ports.begin(), ports.end(), [](const auto& port_pair) {
     return port_pair.second->type == MemoryBarrierType::FULL && port_pair.second->src_pipeline &&
            !port_pair.second->src_pipeline->is_pipeline_finished();

@@ -61,7 +61,7 @@ class mock_sirius_physical_operator : public sirius_physical_operator {
     SiriusPhysicalOperatorType op_type = SiriusPhysicalOperatorType::PROJECTION)
     : sirius_physical_operator(op_type, {}, 0),
       _use_custom_hint(false),
-      _custom_hint(std::monostate{})
+      _custom_hint(std::nullopt)
   {
   }
 
@@ -71,7 +71,7 @@ class mock_sirius_physical_operator : public sirius_physical_operator {
    * When custom hint mode is enabled, get_next_task_hint() returns the
    * configured hint instead of computing one from ports.
    */
-  void set_custom_hint(sirius::op::task_creation_hint hint)
+  void set_custom_hint(std::optional<sirius::op::task_creation_hint> hint)
   {
     _use_custom_hint = true;
     _custom_hint     = std::move(hint);
@@ -85,7 +85,7 @@ class mock_sirius_physical_operator : public sirius_physical_operator {
   /**
    * @brief Override to return configured hint when in custom mode.
    */
-  sirius::op::task_creation_hint get_next_task_hint() override
+   std::optional<task_creation_hint> get_next_task_hint() override
   {
     if (_use_custom_hint) { return _custom_hint; }
     // Fall back to parent implementation
@@ -94,7 +94,7 @@ class mock_sirius_physical_operator : public sirius_physical_operator {
 
  private:
   bool _use_custom_hint;
-  sirius::op::task_creation_hint _custom_hint;
+  std::optional<sirius::op::task_creation_hint> _custom_hint;
 };
 
 /**
@@ -145,441 +145,298 @@ class mock_pipeline_builder {
   }
 };
 
-// WSM: TODO fix these tests
-
-// //===----------------------------------------------------------------------===//
-// // Testable Task Creator
-// //===----------------------------------------------------------------------===//
-
-// /**
-//  * @brief A testable subclass of task_creator that tracks scheduled tasks.
-//  *
-//  * This class overrides schedule() to record what task_creation_info objects
-//  * were scheduled, allowing tests to verify correct scheduling behavior.
-//  */
-// class testable_task_creator : public task_creator {
-//  public:
-//   testable_task_creator(size_t num_threads,
-//                         sirius_pipeline_hashmap& gpu_pipeline_map,
-//                         duckdb::ClientContext& client_context,
-//                         pipeline_executor& pipeline_executor,
-//                         sirius::memory::sirius_memory_reservation_manager& mem_res_mgr)
-//     : task_creator(num_threads, mem_res_mgr)
-//   {
-//     this->set_client_context(client_context);
-//     this->set_pipeline_hashmap(gpu_pipeline_map);
-//     this->set_pipeline_executor(pipeline_executor);
-//   }
-
-//   void schedule(std::unique_ptr<task_creation_info> info) override
-//   {
-//     std::lock_guard<std::mutex> lock(_scheduled_mutex);
-//     if (info) {
-//       _scheduled_nodes.push_back(info->_node);
-//       _scheduled_pipelines.push_back(info->_pipeline);
-//     }
-//     _schedule_count++;
-//   }
-
-//   size_t get_schedule_count() const { return _schedule_count.load(); }
-
-//   std::vector<sirius_physical_operator*> get_scheduled_nodes()
-//   {
-//     std::lock_guard<std::mutex> lock(_scheduled_mutex);
-//     return _scheduled_nodes;
-//   }
-
-//   std::vector<duckdb::shared_ptr<sirius_pipeline>> get_scheduled_pipelines()
-//   {
-//     std::lock_guard<std::mutex> lock(_scheduled_mutex);
-//     return _scheduled_pipelines;
-//   }
-
-//   void clear_scheduled()
-//   {
-//     std::lock_guard<std::mutex> lock(_scheduled_mutex);
-//     _scheduled_nodes.clear();
-//     _scheduled_pipelines.clear();
-//     _schedule_count.store(0);
-//   }
-
-//   // Expose protected members for testing
-//   task_creation_queue* get_queue() { return _task_creation_queue.get(); }
-
-//   std::queue<duckdb::shared_ptr<sirius_pipeline>>& get_priority_scans() { return _priority_scans; }
-
-//   [[nodiscard]] bool is_running() const { return _running.load(); }
-
-//   size_t get_thread_count() const { return _threads.size(); }
-
-//  private:
-//   std::atomic<size_t> _schedule_count{0};
-//   std::vector<sirius_physical_operator*> _scheduled_nodes;
-//   std::vector<duckdb::shared_ptr<sirius_pipeline>> _scheduled_pipelines;
-//   std::mutex _scheduled_mutex;
-// };
-
-// //===----------------------------------------------------------------------===//
-// // Test Fixture Helper
-// //===----------------------------------------------------------------------===//
-
-// /**
-//  * @brief Helper class to set up minimal test infrastructure.
-//  */
-// class test_fixture {
-//  public:
-//   test_fixture()
-//     : db(nullptr),
-//       con(db),
-//       gpu_context(*con.context),
-//       engine(*con.context, gpu_context),
-//       memory_manager([] {
-//         cucascade::memory::reservation_manager_configurator builder;
-//         const size_t gpu_capacity  = 2ull << 30;  // 2GB
-//         const double limit_ratio   = 0.75;
-//         const size_t host_capacity = 4ull << 30;  // 4GB
-
-//         builder.set_number_of_gpus(1)
-//           .set_gpu_usage_limit(gpu_capacity)
-//           .set_reservation_fraction_per_gpu(limit_ratio)
-//           .set_per_host_capacity(host_capacity)
-//           .use_host_per_gpu()
-//           .set_reservation_fraction_per_host(limit_ratio);
-
-//         // Build configuration with topology detection
-//         auto space_configs = builder.build();
-//         return std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
-//           std::move(space_configs));
-//       }()),
-//       gpu_executor_config{1, false},
-//       pipeline_exec(
-//         gpu_executor_config, exec::thread_pool_config{.num_threads = 2}, *memory_manager),
-//       empty_pipelines(),
-//       pipeline_map(empty_pipelines)
-//   {
-//   }
-
-//   /**
-//    * @brief Create a mock GPU pipeline with controllable finished state.
-//    */
-//   duckdb::shared_ptr<mock_gpu_pipeline> create_mock_pipeline()
-//   {
-//     return duckdb::make_shared_ptr<mock_gpu_pipeline>(engine);
-//   }
-
-//   duckdb::DuckDB db;
-//   duckdb::Connection con;
-//   duckdb::GPUContext gpu_context;
-//   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory_manager;
-//   sirius_engine engine;
-//   task_executor_config gpu_executor_config;
-//   pipeline_executor pipeline_exec;
-//   duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> empty_pipelines;
-//   sirius::sirius_pipeline_hashmap pipeline_map;
-// };
-
-// //===----------------------------------------------------------------------===//
-// // task_creation_queue Tests
-// //===----------------------------------------------------------------------===//
-
-// TEST_CASE("task_creation_queue open/close lifecycle", "[task_creation_queue]")
-// {
-//   task_creation_queue queue(2);
-
-//   SECTION("Queue starts closed") { REQUIRE_FALSE(queue.is_open()); }
-
-//   SECTION("Queue can be opened")
-//   {
-//     queue.open();
-//     REQUIRE(queue.is_open());
-//   }
-
-//   SECTION("Queue can be closed after opening")
-//   {
-//     queue.open();
-//     REQUIRE(queue.is_open());
-//     queue.close();
-//     REQUIRE_FALSE(queue.is_open());
-//   }
-
-//   SECTION("Multiple open calls are idempotent")
-//   {
-//     queue.open();
-//     queue.open();
-//     REQUIRE(queue.is_open());
-//   }
-
-//   SECTION("Multiple close calls are safe")
-//   {
-//     queue.open();
-//     queue.close();
-//     REQUIRE_NOTHROW(queue.close());
-//   }
-// }
-
-// TEST_CASE("task_creation_queue push and pull", "[task_creation_queue]")
-// {
-//   task_creation_queue queue(1);
-//   queue.open();
-
-//   // Create a mock operator for task_creation_info
-//   // Note: task_creation_info requires a valid pipeline, so we'll test with nullptr checks
-//   auto mock_op = std::make_unique<mock_sirius_physical_operator>();
-
-//   SECTION("Push and pull single item")
-//   {
-//     // We can't easily create task_creation_info without a valid pipeline,
-//     // but we can test the queue mechanics with nullptr
-//     queue.push(nullptr);
-
-//     auto result = queue.pull();
-//     REQUIRE(result == nullptr);
-//   }
-
-//   queue.close();
-// }
-
-// TEST_CASE("task_creation_queue pull returns nullptr when closed", "[task_creation_queue]")
-// {
-//   task_creation_queue queue(1);
-
-//   SECTION("Pull from closed empty queue returns nullptr")
-//   {
-//     // Queue is closed by default, but we need to ensure it returns nullptr
-//     queue.open();
-//     queue.close();
-
-//     auto result = queue.pull();
-//     REQUIRE(result == nullptr);
-//   }
-// }
-
-// TEST_CASE("task_creation_queue close wakes blocked threads", "[task_creation_queue]")
-// {
-//   task_creation_queue queue(2);
-//   queue.open();
-
-//   std::atomic<int> threads_woken{0};
-//   std::vector<std::thread> threads;
-
-//   // Start threads that will block on pull
-//   for (int i = 0; i < 2; ++i) {
-//     threads.emplace_back([&queue, &threads_woken]() {
-//       auto result = queue.pull();
-//       // Should receive nullptr sentinel when queue closes
-//       if (result == nullptr) { threads_woken.fetch_add(1); }
-//     });
-//   }
-
-//   // Give threads time to block
-//   std::this_thread::sleep_for(50ms);
-
-//   // Close queue should wake all threads
-//   queue.close();
-
-//   // Wait for threads with timeout
-//   auto start_time = std::chrono::steady_clock::now();
-//   auto timeout    = std::chrono::seconds(5);
-
-//   for (auto& t : threads) {
-//     if (t.joinable()) { t.join(); }
-//     if (std::chrono::steady_clock::now() - start_time > timeout) {
-//       FAIL("Test timed out waiting for threads to wake");
-//     }
-//   }
-
-//   REQUIRE(threads_woken.load() == 2);
-// }
-
-// //===----------------------------------------------------------------------===//
-// // task_creator Thread Pool Tests
-// //===----------------------------------------------------------------------===//
-
-// TEST_CASE("task_creator thread pool starts and stops", "[task_creator]")
-// {
-//   test_fixture fixture;
-
-//   testable_task_creator creator(
-//     2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
-
-//   SECTION("Creator starts not running") { REQUIRE_FALSE(creator.is_running()); }
-
-//   SECTION("start_thread_pool creates threads")
-//   {
-//     creator.start_thread_pool();
-//     REQUIRE(creator.is_running());
-
-//     // Give threads time to start
-//     std::this_thread::sleep_for(10ms);
-
-//     creator.stop_thread_pool();
-//     REQUIRE_FALSE(creator.is_running());
-//   }
-
-//   SECTION("stop_thread_pool joins threads gracefully")
-//   {
-//     creator.start_thread_pool();
-
-//     // Stop should complete without hanging
-//     auto start_time = std::chrono::steady_clock::now();
-//     creator.stop_thread_pool();
-//     auto duration = std::chrono::steady_clock::now() - start_time;
-
-//     REQUIRE(duration < std::chrono::seconds(5));
-//     REQUIRE_FALSE(creator.is_running());
-//   }
-// }
-
-// TEST_CASE("task_creator thread pool is idempotent", "[task_creator]")
-// {
-//   test_fixture fixture;
-
-//   testable_task_creator creator(
-//     2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
-
-//   SECTION("Multiple start_thread_pool calls don't create extra threads")
-//   {
-//     creator.start_thread_pool();
-//     creator.start_thread_pool();
-//     creator.start_thread_pool();
-
-//     REQUIRE(creator.is_running());
-
-//     creator.stop_thread_pool();
-//   }
-
-//   SECTION("Multiple stop_thread_pool calls don't crash")
-//   {
-//     creator.start_thread_pool();
-
-//     REQUIRE_NOTHROW(creator.stop_thread_pool());
-//     REQUIRE_NOTHROW(creator.stop_thread_pool());
-//     REQUIRE_NOTHROW(creator.stop_thread_pool());
-//   }
-
-//   SECTION("Can restart after stop")
-//   {
-//     creator.start_thread_pool();
-//     creator.stop_thread_pool();
-//     REQUIRE_FALSE(creator.is_running());
-
-//     creator.start_thread_pool();
-//     REQUIRE(creator.is_running());
-
-//     creator.stop_thread_pool();
-//   }
-// }
-
-// TEST_CASE("task_creator destructor stops thread pool", "[task_creator]")
-// {
-//   test_fixture fixture;
-
-//   {
-//     testable_task_creator creator(2,
-//                                   fixture.pipeline_map,
-//                                   *fixture.con.context,
-//                                   fixture.pipeline_exec,
-//                                   *fixture.memory_manager);
-//     creator.start_thread_pool();
-//     // Destructor should stop threads
-//   }
-
-//   // If we get here without hanging, the destructor worked
-//   SUCCEED("Destructor completed without hanging");
-// }
-
-// //===----------------------------------------------------------------------===//
-// // process_next_task Tests
-// //===----------------------------------------------------------------------===//
-
-// TEST_CASE("process_next_task with monostate hint and empty priority_scans", "[task_creator]")
-// {
-//   test_fixture fixture;
-
-//   testable_task_creator creator(
-//     2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
-
-//   // Create a mock operator with no ports (will return monostate)
-//   auto mock_op = std::make_unique<mock_sirius_physical_operator>();
-
-//   // process_next_task should do nothing when hint is monostate and no priority scans
-//   creator.process_next_task(mock_op.get());
-
-//   // Nothing should be scheduled
-//   REQUIRE(creator.get_schedule_count() == 0);
-// }
-
-// TEST_CASE("process_next_task with monostate hint uses priority_scans", "[task_creator]")
-// {
-//   test_fixture fixture;
-
-//   // Create a mock scan operator
-//   auto scan_op =
-//     std::make_unique<mock_sirius_physical_operator>(SiriusPhysicalOperatorType::TABLE_SCAN);
-
-//   // We need to create a pipeline that has this as a source
-//   // This is complex because sirius_pipeline requires sirius_engine
-//   // For this test, we verify that the scheduling logic attempts to use priority_scans
-
-//   // Create pipelines with the scan as source - this requires integration test setup
-//   // For unit testing purposes, we verify the code path via the testable interface
-//   testable_task_creator creator(
-//     2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
-
-//   // Initially priority_scans should be empty (no TABLE_SCAN sources in empty pipeline map)
-//   REQUIRE(creator.get_priority_scans().empty());
-
-//   // Create a mock operator that returns monostate
-//   auto mock_op = std::make_unique<mock_sirius_physical_operator>();
-
-//   // With empty priority scans, nothing should be scheduled
-//   creator.process_next_task(mock_op.get());
-//   REQUIRE(creator.get_schedule_count() == 0);
-// }
-
-// TEST_CASE("process_next_task with operator hint schedules the hint node", "[task_creator]")
-// {
-//   test_fixture fixture;
-
-//   testable_task_creator creator(
-//     2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
-
-//   // Create the source operator that we will call process_next_task on
-//   auto source_op = std::make_unique<mock_sirius_physical_operator>();
-
-//   // Create the hint operator that should be scheduled
-//   auto hint_op = std::make_unique<mock_sirius_physical_operator>();
-
-//   // Create a data repository for the port
-//   auto data_repo = std::make_unique<cucascade::shared_data_repository>();
-
-//   // Set up the hint operator with a "default" port that has a dest_pipeline
-//   // For this test, we'll set the dest_pipeline to nullptr since we're testing
-//   // through the testable_task_creator which captures what gets scheduled
-//   mock_pipeline_builder::setup_operator_with_pipeline_port(
-//     *hint_op,
-//     "default",
-//     MemoryBarrierType::PIPELINE,
-//     data_repo.get(),
-//     nullptr,  // src_pipeline
-//     nullptr   // dest_pipeline - will be captured by schedule()
-//   );
-
-//   // Configure source_op to return hint_op as the hint
-//   source_op->set_custom_hint(sirius::creator::task_creation_hint(hint_op.get()));
-
-//   // Call process_next_task - this should attempt to schedule with hint_op
-//   // Note: This will try to access hint_op->get_port("default")->dest_pipeline
-//   // which we've set up above
-//   creator.process_next_task(source_op.get());
-
-//   // Verify that schedule was called with the hint_op
-//   auto scheduled_nodes = creator.get_scheduled_nodes();
-//   REQUIRE(creator.get_schedule_count() == 1);
-//   REQUIRE(scheduled_nodes.size() == 1);
-//   REQUIRE(scheduled_nodes[0] == hint_op.get());
-// }
-
+//===----------------------------------------------------------------------===//
+// Testable Task Creator
+//===----------------------------------------------------------------------===//
+
+/**
+ * @brief A testable subclass of task_creator that tracks scheduled tasks.
+ *
+ * This class overrides schedule() to record what operators objects
+ * were scheduled, allowing tests to verify correct scheduling behavior.
+ */
+class testable_task_creator : public task_creator {
+ public:
+  testable_task_creator(size_t num_threads,
+                        sirius_pipeline_hashmap& gpu_pipeline_map,
+                        duckdb::ClientContext& client_context,
+                        pipeline_executor& pipeline_executor,
+                        sirius::memory::sirius_memory_reservation_manager& mem_res_mgr)
+    : task_creator(exec::thread_pool_config {.num_threads        = num_threads,
+      .thread_name_prefix = "task_creator"}, mem_res_mgr)
+  {
+
+    this->set_client_context(client_context);
+    this->set_pipeline_hashmap(gpu_pipeline_map);
+    this->set_pipeline_executor(pipeline_executor);
+  }
+
+  void schedule(op::sirius_physical_operator* request) override
+  {
+    std::lock_guard<std::mutex> lock(_scheduled_mutex);
+    if (request) {
+      _scheduled_nodes.push_back(request);
+      _scheduled_pipelines.push_back(request->get_pipeline());
+    }
+    _schedule_count++;
+  }
+
+  size_t get_schedule_count() const { return _schedule_count.load(); }
+
+  std::vector<sirius_physical_operator*> get_scheduled_nodes()
+  {
+    std::lock_guard<std::mutex> lock(_scheduled_mutex);
+    return _scheduled_nodes;
+  }
+
+  std::vector<duckdb::shared_ptr<sirius_pipeline>> get_scheduled_pipelines()
+  {
+    std::lock_guard<std::mutex> lock(_scheduled_mutex);
+    return _scheduled_pipelines;
+  }
+
+  void clear_scheduled()
+  {
+    std::lock_guard<std::mutex> lock(_scheduled_mutex);
+    _scheduled_nodes.clear();
+    _scheduled_pipelines.clear();
+    _schedule_count.store(0);
+  }
+
+  [[nodiscard]] bool is_running() const { return _running.load(); }
+  
+  // Expose protected method for testing
+  using task_creator::get_operator_for_next_task;
+  
+ private:
+  std::atomic<size_t> _schedule_count{0};
+  std::vector<sirius_physical_operator*> _scheduled_nodes;
+  std::vector<duckdb::shared_ptr<sirius_pipeline>> _scheduled_pipelines;
+  std::mutex _scheduled_mutex;
+};
+
+//===----------------------------------------------------------------------===//
+// Test Fixture Helper
+//===----------------------------------------------------------------------===//
+
+/**
+ * @brief Helper class to set up minimal test infrastructure.
+ */
+class test_fixture {
+ public:
+  test_fixture()
+    : db(nullptr),
+      con(db),
+      gpu_context(*con.context),
+      engine(*con.context, gpu_context),
+      memory_manager([] {
+        cucascade::memory::reservation_manager_configurator builder;
+        const size_t gpu_capacity  = 2ull << 30;  // 2GB
+        const double limit_ratio   = 0.75;
+        const size_t host_capacity = 4ull << 30;  // 4GB
+
+        builder.set_number_of_gpus(1)
+          .set_gpu_usage_limit(gpu_capacity)
+          .set_reservation_fraction_per_gpu(limit_ratio)
+          .set_per_host_capacity(host_capacity)
+          .use_host_per_gpu()
+          .set_reservation_fraction_per_host(limit_ratio);
+
+        // Build configuration with topology detection
+        auto space_configs = builder.build();
+        return std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
+          std::move(space_configs));
+      }()),
+      gpu_executor_config{1, false},
+      pipeline_exec(
+        gpu_executor_config, exec::thread_pool_config{.num_threads = 2}, *memory_manager),
+      empty_pipelines(),
+      pipeline_map(empty_pipelines)
+  {
+  }
+
+  /**
+   * @brief Create a mock GPU pipeline with controllable finished state.
+   */
+  duckdb::shared_ptr<mock_gpu_pipeline> create_mock_pipeline()
+  {
+    return duckdb::make_shared_ptr<mock_gpu_pipeline>(engine);
+  }
+
+  duckdb::DuckDB db;
+  duckdb::Connection con;
+  duckdb::GPUContext gpu_context;
+  std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory_manager;
+  sirius_engine engine;
+  task_executor_config gpu_executor_config;
+  pipeline_executor pipeline_exec;
+  duckdb::vector<duckdb::shared_ptr<sirius_pipeline>> empty_pipelines;
+  sirius::sirius_pipeline_hashmap pipeline_map;
+};
+
+//===----------------------------------------------------------------------===//
+// task_creator Thread Pool Tests
+//===----------------------------------------------------------------------===//
+
+TEST_CASE("task_creator thread pool starts and stops", "[task_creator]")
+{
+  test_fixture fixture;
+
+  testable_task_creator creator(
+    2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
+
+  SECTION("Creator starts not running") { REQUIRE_FALSE(creator.is_running()); }
+
+  SECTION("start_thread_pool creates threads")
+  {
+    creator.start_thread_pool();
+    REQUIRE(creator.is_running());
+
+    // Give threads time to start
+    std::this_thread::sleep_for(10ms);
+
+    creator.stop_thread_pool();
+    REQUIRE_FALSE(creator.is_running());
+  }
+
+  SECTION("stop_thread_pool joins threads gracefully")
+  {
+    creator.start_thread_pool();
+
+    // Stop should complete without hanging
+    auto start_time = std::chrono::steady_clock::now();
+    creator.stop_thread_pool();
+    auto duration = std::chrono::steady_clock::now() - start_time;
+
+    REQUIRE(duration < std::chrono::seconds(5));
+    REQUIRE_FALSE(creator.is_running());
+  }
+}
+
+TEST_CASE("task_creator thread pool is idempotent", "[task_creator]")
+{
+  test_fixture fixture;
+
+  testable_task_creator creator(
+    2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
+
+  SECTION("Multiple start_thread_pool calls don't create extra threads")
+  {
+    creator.start_thread_pool();
+    creator.start_thread_pool();
+    creator.start_thread_pool();
+
+    REQUIRE(creator.is_running());
+
+    creator.stop_thread_pool();
+  }
+
+  SECTION("Multiple stop_thread_pool calls don't crash")
+  {
+    creator.start_thread_pool();
+
+    REQUIRE_NOTHROW(creator.stop_thread_pool());
+    REQUIRE_NOTHROW(creator.stop_thread_pool());
+    REQUIRE_NOTHROW(creator.stop_thread_pool());
+  }
+
+  SECTION("Can restart after stop")
+  {
+    creator.start_thread_pool();
+    creator.stop_thread_pool();
+    REQUIRE_FALSE(creator.is_running());
+
+    creator.start_thread_pool();
+    REQUIRE(creator.is_running());
+
+    creator.stop_thread_pool();
+  }
+}
+
+TEST_CASE("task_creator destructor stops thread pool", "[task_creator]")
+{
+  test_fixture fixture;
+
+  {
+    testable_task_creator creator(2,
+                                  fixture.pipeline_map,
+                                  *fixture.con.context,
+                                  fixture.pipeline_exec,
+                                  *fixture.memory_manager);
+    creator.start_thread_pool();
+    // Destructor should stop threads
+  }
+
+  // If we get here without hanging, the destructor worked
+  SUCCEED("Destructor completed without hanging");
+}
+
+//===----------------------------------------------------------------------===//
+// get_operator_for_next_task Tests
+//===----------------------------------------------------------------------===//
+
+TEST_CASE("get_operator_for_next_task with monostate hint and empty priority_scans", "[task_creator]")
+{
+  test_fixture fixture;
+
+  testable_task_creator creator(
+    2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
+
+  // Create a mock operator with no ports (will return monostate)
+  auto mock_op = std::make_unique<mock_sirius_physical_operator>();
+
+  // process_next_task should just return nullptr because there its not really connected to anything and has no data
+  auto next_op = creator.get_operator_for_next_task(mock_op.get());
+
+  // Nothing should be scheduled
+  REQUIRE(next_op == nullptr);
+}
+
+TEST_CASE("get_operator_for_next_task for operator with data returns the operator", "[task_creator]")
+{
+  test_fixture fixture;
+
+  testable_task_creator creator(
+    2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
+
+  // Create the source operator that we will call process_next_task on
+  auto source_op = std::make_unique<mock_sirius_physical_operator>();
+
+  // Create the hint operator that should be scheduled
+  auto hint_op = std::make_unique<mock_sirius_physical_operator>();
+
+  // Create a data repository for the port
+  auto data_repo = std::make_unique<cucascade::shared_data_repository>();
+
+  // Set up the hint operator with a "default" port that has a dest_pipeline
+  // For this test, we'll set the dest_pipeline to nullptr since we're testing
+  // through the testable_task_creator which captures what gets scheduled
+  mock_pipeline_builder::setup_operator_with_pipeline_port(
+    *hint_op,
+    "default",
+    MemoryBarrierType::PIPELINE,
+    data_repo.get(),
+    nullptr,  // src_pipeline
+    nullptr   // dest_pipeline - will be captured by schedule()
+  );
+
+  // Configure source_op to return hint_op as the hint
+  source_op->set_custom_hint(task_creation_hint {.hint = TaskCreationHint::READY, .producer = hint_op.get()});
+
+  // Call process_next_task - this should attempt to schedule with hint_op
+  // Note: This will try to access hint_op->get_port("default")->dest_pipeline
+  // which we've set up above
+  auto next_op = creator.get_operator_for_next_task(hint_op.get());
+
+  REQUIRE(next_op == source_op.get());
+
+  // // Verify that schedule was called with the hint_op
+  // auto scheduled_nodes = creator.get_scheduled_nodes();
+  // REQUIRE(creator.get_schedule_count() == 1);
+  // REQUIRE(scheduled_nodes.size() == 1);
+  // REQUIRE(scheduled_nodes[0] == hint_op.get());
+}
+// WSM TODO continue to fix tests
 // TEST_CASE("process_next_task with pipeline hint recurses to inner operator", "[task_creator]")
 // {
 //   test_fixture fixture;
@@ -719,35 +576,6 @@ class mock_pipeline_builder {
 //   REQUIRE_FALSE(creator.is_running());
 // }
 
-// //===----------------------------------------------------------------------===//
-// // Queue Integration with Task Creator
-// //===----------------------------------------------------------------------===//
-
-// TEST_CASE("task_creator queue integration", "[task_creator]")
-// {
-//   test_fixture fixture;
-
-//   testable_task_creator creator(
-//     2, fixture.pipeline_map, *fixture.con.context, fixture.pipeline_exec, *fixture.memory_manager);
-
-//   SECTION("Queue is accessible")
-//   {
-//     auto* queue = creator.get_queue();
-//     REQUIRE(queue != nullptr);
-//   }
-
-//   SECTION("Queue opens when thread pool starts")
-//   {
-//     auto* queue = creator.get_queue();
-//     REQUIRE_FALSE(queue->is_open());
-
-//     creator.start_thread_pool();
-//     REQUIRE(queue->is_open());
-
-//     creator.stop_thread_pool();
-//     REQUIRE_FALSE(queue->is_open());
-//   }
-// }
 
 // //===----------------------------------------------------------------------===//
 // // sirius_physical_operator::get_next_task_hint() Tests

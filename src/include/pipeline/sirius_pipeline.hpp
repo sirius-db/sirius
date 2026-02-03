@@ -136,7 +136,7 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   //! Updates the pipeline status
   void update_pipeline_status();
   //! Checks if the pipeline has been finished
-  bool is_pipeline_finished();
+  virtual bool is_pipeline_finished();
 
   void mark_task_created();
   void mark_task_completed();
