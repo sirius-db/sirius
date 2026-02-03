@@ -121,15 +121,18 @@ std::vector<std::shared_ptr<cucascade::data_batch>> gpu_pipeline_task::compute_t
 {
   auto& local_state = _local_state->cast<gpu_pipeline_task_local_state>();
   auto data_batches = local_state._batches;
-  for (auto& op : _global_state->cast<gpu_pipeline_task_global_state>()._pipeline.get()->get_operators()) {
+  for (auto& op :
+       _global_state->cast<gpu_pipeline_task_global_state>()._pipeline.get()->get_operators()) {
     data_batches = op.get().execute(data_batches);
   }
   return std::move(data_batches);
 }
 
-void gpu_pipeline_task::publish_output(std::vector<std::shared_ptr<cucascade::data_batch>> output_batches)
+void gpu_pipeline_task::publish_output(
+  std::vector<std::shared_ptr<cucascade::data_batch>> output_batches)
 {
-  auto sink_operators = _global_state->cast<gpu_pipeline_task_global_state>()._pipeline.get()->get_sink();
+  auto sink_operators =
+    _global_state->cast<gpu_pipeline_task_global_state>()._pipeline.get()->get_sink();
   if (sink_operators) {
     sink_operators.get()->sink(output_batches);
   } else {
@@ -163,10 +166,9 @@ void gpu_pipeline_task::execute()
   // 1. Transfer data batch to GPU memory if not already there
   for (auto& batch : local_state._batches) {
     // 1. Transfer data batch to GPU memory if not already there
-    // for now assuming that local_state._batches will continue to hold the data and now in GPU memory
+    // for now assuming that local_state._batches will continue to hold the data and now in GPU
+    // memory
   }
-
-
 
   // 2. Set reservation_aware_memory_resource_ref as the default cudf allocator
   // 3. Execute cudf operators on the pipeline
@@ -178,10 +180,9 @@ void gpu_pipeline_task::execute()
   // Processing handles are automatically released here when they go out of scope
 }
 
-
 std::size_t gpu_pipeline_task::get_input_size() const
 {
-  auto& local_state = _local_state->cast<gpu_pipeline_task_local_state>();
+  auto& local_state      = _local_state->cast<gpu_pipeline_task_local_state>();
   std::size_t input_size = 0;
   for (const auto& batch : local_state._batches) {
     input_size += batch->get_data()->get_size_in_bytes();
@@ -198,9 +199,10 @@ std::size_t gpu_pipeline_task::get_estimated_reservation_size() const
 std::vector<op::sirius_physical_operator*> gpu_pipeline_task::get_output_consumers()
 {
   std::vector<op::sirius_physical_operator*> output_consumers;
-  auto parents = _global_state->cast<gpu_pipeline_task_global_state>()._pipeline.get()->get_parents();
+  auto parents =
+    _global_state->cast<gpu_pipeline_task_global_state>()._pipeline.get()->get_parents();
   for (auto& parent : parents) {
-    output_consumers.push_back(&parent->get_operators()[0].get());     
+    output_consumers.push_back(&parent->get_operators()[0].get());
   }
   return output_consumers;
 }

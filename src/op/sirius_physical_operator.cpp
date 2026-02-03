@@ -214,7 +214,7 @@ std::optional<task_creation_hint> sirius_physical_operator::get_next_task_hint()
 {
   if (ports.empty()) { return std::nullopt; }
 
-// look at the input ports and see if there are any unfinished hard barriers
+  // look at the input ports and see if there are any unfinished hard barriers
   auto unfinished_barrier = std::find_if(ports.begin(), ports.end(), [](const auto& port_pair) {
     return port_pair.second->type == MemoryBarrierType::FULL && port_pair.second->src_pipeline &&
            !port_pair.second->src_pipeline->is_pipeline_finished();
@@ -222,13 +222,16 @@ std::optional<task_creation_hint> sirius_physical_operator::get_next_task_hint()
 
   if (unfinished_barrier != ports.end()) {
     auto* producer = &(unfinished_barrier->second->src_pipeline->get_operators()[0].get());
-    return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};    
+    return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
   }
 
   // if no unfinished barriers, then is this operator ready to create a task?
   if (std::all_of(ports.begin(), ports.end(), [](const auto& port_pair) {
-        return (port_pair.second->type != MemoryBarrierType::FULL && port_pair.second->repo->size() > 0) ||
-        (port_pair.second->type == MemoryBarrierType::FULL && port_pair.second->repo->size() > 0 && port_pair.second->src_pipeline && port_pair.second->src_pipeline->is_pipeline_finished());
+        return (port_pair.second->type != MemoryBarrierType::FULL &&
+                port_pair.second->repo->size() > 0) ||
+               (port_pair.second->type == MemoryBarrierType::FULL &&
+                port_pair.second->repo->size() > 0 && port_pair.second->src_pipeline &&
+                port_pair.second->src_pipeline->is_pipeline_finished());
       })) {
     return task_creation_hint{TaskCreationHint::READY, this};
   }
@@ -241,14 +244,15 @@ std::optional<task_creation_hint> sirius_physical_operator::get_next_task_hint()
 
   if (unfinished_pipeline != ports.end()) {
     auto* producer = &(unfinished_pipeline->second->src_pipeline->get_operators()[0].get());
-    return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};   
+    return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
   }
 
   // nothing to do
   return std::nullopt;
 }
 
-std::optional<std::vector<::std::shared_ptr<::cucascade::data_batch>>> sirius_physical_operator::get_next_task_input_batch()
+std::optional<std::vector<::std::shared_ptr<::cucascade::data_batch>>>
+sirius_physical_operator::get_next_task_input_batch()
 {
   // take one data batch from each port and schedule a task (a task takes one data batch from each
   // port), do this repeatedly until all ports are empty

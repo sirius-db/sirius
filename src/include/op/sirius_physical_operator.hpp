@@ -229,7 +229,7 @@ class sirius_physical_operator {
   /// the function is called
   virtual bool can_create_more_tasks() const
   {
-    //WSM TODO implement this
+    // WSM TODO implement this
     throw std::runtime_error("can_create_more_tasks not implemented for operator " + get_name());
     return true;
   }
@@ -237,7 +237,7 @@ class sirius_physical_operator {
   /// \brief check if all tasks have been processed
   virtual bool has_processed_all_tasks() const
   {
-    //WSM TODO implement this
+    // WSM TODO implement this
     throw std::runtime_error("has_processed_all_tasks not implemented for operator " + get_name());
     return true;
   }
@@ -251,7 +251,7 @@ class sirius_physical_operator {
 
   //! Get pipeline
   duckdb::shared_ptr<pipeline::sirius_pipeline> get_pipeline();
- 
+
  private:
   //! The ports of the operator
   std::unordered_map<std::string, std::unique_ptr<port>> ports;

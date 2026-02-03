@@ -114,7 +114,7 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
                     std::unique_ptr<sirius_pipeline_itask_local_state> local_state,
                     std::shared_ptr<sirius::parallel::itask_global_state> global_state);
 
- ~gpu_pipeline_task() override;
+  ~gpu_pipeline_task() override;
 
   /**
    * @brief Method to actually execute the task
@@ -153,7 +153,6 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
    */
   void publish_output(std::vector<std::shared_ptr<cucascade::data_batch>> output_batches) override;
 
-  
   /**
    * @brief Get the input size for this task
    *
@@ -161,7 +160,6 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
    */
   std::size_t get_input_size() const;
 
-  
   std::size_t get_estimated_reservation_size() const override;
 
   /// @brief Get the output consumer operators for this task.

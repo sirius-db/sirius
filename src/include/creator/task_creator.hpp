@@ -17,11 +17,11 @@
 #pragma once
 
 #include "duckdb/main/client_context.hpp"
-#include "helper/helper.hpp"
 #include "exec/config.hpp"
 #include "exec/interruptible_mpmc.hpp"
 #include "exec/kiosk.hpp"
 #include "exec/thread_pool.hpp"
+#include "helper/helper.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "parallel/task_executor.hpp"
@@ -52,7 +52,7 @@ class duckdb_scan_task_global_state;
 
 namespace sirius::creator {
 
-  // WSM TODO: remove this once task_creation_info is removed
+// WSM TODO: remove this once task_creation_info is removed
 // /**
 //  * @brief Contains information needed to create a task.
 //  *
@@ -148,7 +148,6 @@ namespace sirius::creator {
 //   std::atomic<bool> _is_open{false};  ///< Whether the queue is open for pushing/pulling tasks
 // };
 
-
 // WSM TODO: update these comments
 
 /**
@@ -166,9 +165,9 @@ namespace sirius::creator {
  *   4. Call stop_thread_pool() when done.
  */
 
- struct task_creation_request {
-  op::sirius_physical_operator* node;  
- };
+struct task_creation_request {
+  op::sirius_physical_operator* node;
+};
 
 class task_creator {
  public:
@@ -178,7 +177,8 @@ class task_creator {
    * @param config Configuration for the thread pool (thread count, name prefix, CPU affinity).
    * @param mem_res_mgr Reference to the memory reservation manager.
    */
-  task_creator(exec::thread_pool_config config, sirius::memory::sirius_memory_reservation_manager& mem_res_mgr);
+  task_creator(exec::thread_pool_config config,
+               sirius::memory::sirius_memory_reservation_manager& mem_res_mgr);
 
   /**
    * @brief Destructor that ensures the thread pool is stopped.
@@ -200,7 +200,6 @@ class task_creator {
   /// \brief clean-up query bound resources and prepare the task creator for next query
   void reset();
 
-  
   /**
    * @brief Stop the task creator and its thread pool.
    */
@@ -243,7 +242,8 @@ class task_creator {
    * This method queries the given node for a hint about what task to create next.
    *
    * @param node The operator node to get the next task hint from.
-   * @return The operator node that should be scheduled next, or nullptr if no task should be scheduled.
+   * @return The operator node that should be scheduled next, or nullptr if no task should be
+   * scheduled.
    */
   op::sirius_physical_operator* get_operator_for_next_task(op::sirius_physical_operator* node);
 
@@ -255,7 +255,6 @@ class task_creator {
    */
   void manager_loop();
 
-  
   std::atomic<bool> _running;
   exec::thread_pool_config _config;
   exec::kiosk _kiosk;
@@ -265,15 +264,17 @@ class task_creator {
   sirius::pipeline::pipeline_executor* _pipeline_executor{nullptr};
   sirius::memory::sirius_memory_reservation_manager& _mem_res_mgr;
   std::atomic<uint64_t> _task_id{0};
-  
 
-  // Queue for creating tasks based on operators. The operator is the starting point to start looking which task should be created, not necessarily the operator for whose pipeline the task will be created
-  exec::interruptible_mpmc<std::unique_ptr<task_creation_request>>
-    _task_creation_queue;
+  // Queue for creating tasks based on operators. The operator is the starting point to start
+  // looking which task should be created, not necessarily the operator for whose pipeline the task
+  // will be created
+  exec::interruptible_mpmc<std::unique_ptr<task_creation_request>> _task_creation_queue;
 
   // Map of operator ID to global state for scan operators
-  std::map<size_t, std::shared_ptr<op::scan::duckdb_scan_task_global_state>> _scan_operator_global_state_map;
-  std::map<size_t, std::shared_ptr<pipeline::gpu_pipeline_task_global_state>> _gpu_operator_global_state_map;
+  std::map<size_t, std::shared_ptr<op::scan::duckdb_scan_task_global_state>>
+    _scan_operator_global_state_map;
+  std::map<size_t, std::shared_ptr<pipeline::gpu_pipeline_task_global_state>>
+    _gpu_operator_global_state_map;
   std::unique_ptr<duckdb::ThreadContext> _thread_context;
   std::unique_ptr<duckdb::ExecutionContext> _execution_context;
   std::mutex _global_state_mutex;  // Protect concurrent access to the map

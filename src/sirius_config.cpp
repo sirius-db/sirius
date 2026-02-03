@@ -237,7 +237,7 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
   config_setter.add_config("sirius.executor.downgrade", _downgrade_executor_config);
   config_setter.add_config("sirius.executor.duckdb_scan", _duckdb_scan_executor_config);
   config_setter.add_config("sirius.executor.duckdb_scan.cache", enable_scan_caching_);
-  
+
   config_setter.add_config("sirius.space.gpu", gpu_memory_space_configs);
   config_setter.add_config("sirius.space.host", host_memory_space_configs);
   config_setter.add_config("sirius.space.disk", disk_memory_space_configs);
