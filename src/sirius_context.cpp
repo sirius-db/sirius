@@ -89,11 +89,11 @@ void SiriusContext::QueryBegin(ClientContext& context)
 
 void SiriusContext::QueryEnd() { query_.reset(); }
 
-void SiriusContext::QueryEnd(ClientContext& context) { query_.reset(); }
+void SiriusContext::QueryEnd(ClientContext& context) { QueryEnd(); }
 
 void SiriusContext::QueryEnd(ClientContext& context, optional_ptr<ErrorData> error)
 {
-  query_.reset();
+  QueryEnd(context);
 }
 
 void SiriusContext::initialize(const sirius::sirius_config& config)
