@@ -34,7 +34,7 @@ void query::build_indices()
       _operator_to_pipeline[source.get()] = pipeline;
 
       // If it's a table scan, add to scan operators vector
-      if (source->type == op::SiriusPhysicalOperatorType::TABLE_SCAN) {
+      if (source->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
         _scan_operators.push_back(source.get());
       }
     }
