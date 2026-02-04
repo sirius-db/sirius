@@ -250,9 +250,12 @@ class sirius_physical_operator {
   bool check_pipeline_finished();
 
   //! Get pipeline
-  duckdb::shared_ptr<pipeline::sirius_pipeline> get_pipeline();
+  duckdb::shared_ptr<pipeline::sirius_pipeline> get_pipeline() const noexcept;
+
+  void set_pipeline(duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline);
 
  private:
+  duckdb::shared_ptr<pipeline::sirius_pipeline> _pipeline;
   //! The ports of the operator
   std::unordered_map<std::string, std::unique_ptr<port>> ports;
   //! The next operators to be executed after this operator when it is used as a sink

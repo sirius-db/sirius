@@ -110,15 +110,13 @@ void duckdb_scan_executor::prepare_cache_for_scan_operators(
 
   if (!_preload_mode) {
     for (auto* op : scan_operators) {
-      // todo (amin) : we need to use the pipeline id instead of the operator id
-      auto operator_id    = op->get_operator_id();
+      auto operator_id    = op->get_pipeline()->get_pipeline_id();
       _cache[operator_id] = std::make_unique<cache_entry>();  // Create empty entry
     }
   } else {
     // In PRELOAD mode: verify all operator IDs are present in the cache
     for (auto* op : scan_operators) {
-      // todo (amin) : we need to use the pipeline id instead of the operator id
-      auto operator_id = op->get_operator_id();
+      auto operator_id = op->get_pipeline()->get_pipeline_id();
       if (_cache.find(operator_id) == _cache.end()) {
         SIRIUS_LOG_ERROR("Cache entry not found for operator {} in PRELOAD mode", operator_id);
       }
@@ -139,7 +137,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> duckdb_scan_executor::get_sc
   if (!_caching_enabled) {
     return task->compute_task();
   } else {
-    auto pipe_id = task->get_scan_op_id();
+    auto pipe_id = task->get_pipeline_id();
     std::lock_guard<std::mutex> lock(_cache_mutex);
     // todo (amin) : we need to clone the batches to avoid modifying the original batches
     auto& entry = _cache.at(pipe_id);
