@@ -20,9 +20,9 @@
 
 // sirius
 #include <data/data_batch_utils.hpp>
-#include <gpu_context.hpp>
 #include <op/sirius_physical_dummy_scan.hpp>
 #include <op/sirius_physical_result_collector.hpp>
+#include <sirius_interface.hpp>
 
 // cucascades
 #include <cucascade/data/cpu_data_representation.hpp>
@@ -252,7 +252,7 @@ TEST_CASE("sirius_physical_materialized_collector sink with host input",
   prepared->names = {"c0", "c1", "c2"};
   auto plan       = duckdb::make_uniq<sirius::op::sirius_physical_dummy_scan>(types, 0);
   auto sirius_prepared =
-    duckdb::make_shared_ptr<duckdb::SiriusPreparedStatementData>(prepared, std::move(plan));
+    duckdb::make_shared_ptr<sirius_prepared_statement_data>(prepared, std::move(plan));
   sirius::op::sirius_physical_materialized_collector collector(*sirius_prepared,
                                                                get_test_client_context());
 
@@ -320,7 +320,7 @@ TEST_CASE("sirius_physical_materialized_collector sink converts GPU input",
   prepared->names = {"c0", "c1"};
   auto plan       = duckdb::make_uniq<sirius::op::sirius_physical_dummy_scan>(types, 0);
   auto sirius_prepared =
-    duckdb::make_shared_ptr<duckdb::SiriusPreparedStatementData>(prepared, std::move(plan));
+    duckdb::make_shared_ptr<sirius_prepared_statement_data>(prepared, std::move(plan));
   sirius::op::sirius_physical_materialized_collector collector(*sirius_prepared,
                                                                get_test_client_context());
 

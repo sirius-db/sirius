@@ -118,6 +118,9 @@ class sirius_physical_table_scan : public sirius_physical_operator {
   //! Only used in optimized table scan
   bool exhausted = false;
 
+  std::vector<std::shared_ptr<cucascade::data_batch>> execute(
+    const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches) override;
+
  public:
   bool is_source() const override { return true; }
 };

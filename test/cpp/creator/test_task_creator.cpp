@@ -17,11 +17,11 @@
 #include "catch.hpp"
 #include "creator/task_creator.hpp"
 #include "exec/config.hpp"
-#include "gpu_context.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "parallel/task_executor.hpp"
 #include "pipeline/pipeline_executor.hpp"
 #include "pipeline/sirius_pipeline.hpp"
+#include "sirius_interface.hpp"
 #include "sirius_pipeline_hashmap.hpp"
 
 #include <cucascade/data/data_repository.hpp>
@@ -224,8 +224,8 @@ class test_fixture {
   test_fixture()
     : db(nullptr),
       con(db),
-      gpu_context(*con.context),
-      engine(*con.context, gpu_context),
+      sirius_iface(*con.context),
+      engine(*con.context, sirius_iface),
       memory_manager([] {
         cucascade::memory::reservation_manager_configurator builder;
         const size_t gpu_capacity  = 2ull << 27;
@@ -262,7 +262,7 @@ class test_fixture {
 
   duckdb::DuckDB db;
   duckdb::Connection con;
-  duckdb::GPUContext gpu_context;
+  sirius_interface sirius_iface;
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> memory_manager;
   sirius_engine engine;
   pipeline_executor pipeline_exec;

@@ -55,6 +55,7 @@ void sirius_engine::reset()
   total_pipelines   = 0;
   sirius_pipelines.clear();
   new_pipeline_breakers.clear();
+  sirius_scheduled.clear();
   new_scheduled.clear();
 }
 
@@ -159,12 +160,6 @@ void sirius_engine::initialize(duckdb::unique_ptr<op::sirius_physical_operator> 
 
 void sirius_engine::execute()
 {
-  // get the task creator from sirius context
-  // register sirius pipeline to the task creator (by calling task_creator::set_pipeline_hashmap)
-  // wait until the query finish
-  // take the query result from sirius_physical_result_collector
-  // return the result to duckdb
-  // get sirius context
   auto sirius_ctx = context.registered_state->Get<duckdb::SiriusContext>("sirius_state");
   if (sirius_ctx == nullptr) {
     throw duckdb::InvalidInputException("Sirius context is not initialized.");

@@ -38,8 +38,7 @@ namespace sirius::planner {
 //! logical query plan
 class sirius_physical_plan_generator {
  public:
-  explicit sirius_physical_plan_generator(duckdb::ClientContext& context,
-                                          duckdb::GPUContext& gpu_context);
+  explicit sirius_physical_plan_generator(duckdb::ClientContext& context);
   ~sirius_physical_plan_generator();
 
   duckdb::LogicalDependencyList dependencies;
@@ -170,6 +169,6 @@ class sirius_physical_plan_generator {
 
  public:
   duckdb::ClientContext& context;
-  duckdb::GPUContext& gpu_context;
+  // duckdb::GPUContext& gpu_context;
 };
 }  // namespace sirius::planner

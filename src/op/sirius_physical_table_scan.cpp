@@ -24,6 +24,7 @@
 #include "duckdb/parallel/thread_context.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
+#include "expression_executor/gpu_expression_executor.hpp"
 #include "log/logging.hpp"
 #include "utils.hpp"
 
@@ -88,6 +89,77 @@ sirius_physical_table_scan::sirius_physical_table_scan(
   //   }
   // }
   SIRIUS_LOG_DEBUG("Table scan column ids: {}", column_ids.size());
+}
+
+duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
+  const duckdb::TableFilterSet& filters,
+  const duckdb::vector<duckdb::ColumnIndex>& column_ids,
+  const duckdb::vector<duckdb::LogicalType>& returned_types)
+{
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> filter_expressions;
+
+  for (auto& [column_index, filter] : filters.filters) {
+    // Skip optional and IS_NOT_NULL filters
+    if (filter->filter_type == duckdb::TableFilterType::OPTIONAL_FILTER ||
+        filter->filter_type == duckdb::TableFilterType::IS_NOT_NULL) {
+      continue;
+    }
+
+    // Create column reference for this filter
+    auto col_type   = returned_types[column_ids[column_index].GetPrimaryIndex()];
+    auto column_ref = duckdb::make_uniq<duckdb::BoundReferenceExpression>(col_type, column_index);
+
+    // Convert filter to expression
+    filter_expressions.push_back(filter->ToExpression(*column_ref));
+  }
+
+  // No filters to apply
+  if (filter_expressions.empty()) { return nullptr; }
+
+  // Single filter - return directly without conjunction wrapper
+  if (filter_expressions.size() == 1) { return std::move(filter_expressions[0]); }
+
+  // Multiple filters - wrap in CONJUNCTION_AND
+  auto conjunction =
+    duckdb::make_uniq<duckdb::BoundConjunctionExpression>(duckdb::ExpressionType::CONJUNCTION_AND);
+  for (auto& expr : filter_expressions) {
+    conjunction->children.push_back(std::move(expr));
+  }
+  return conjunction;
+}
+
+std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_table_scan::execute(
+  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches)
+{
+  auto start = std::chrono::high_resolution_clock::now();
+  SIRIUS_LOG_DEBUG("Executing table scan");
+  auto filter_expr =
+    convert_table_filters_to_expression(*table_filters, column_ids, returned_types);
+
+  std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
+  output_batches.reserve(input_batches.size());
+
+  if (filter_expr) {
+    SIRIUS_LOG_DEBUG("Converted table filters to expression: {}", filter_expr->ToString());
+
+    // The executor uses the data_batch API to filter rows according to `expression`.
+
+    duckdb::sirius::GpuExpressionExecutor gpu_expression_executor(*filter_expr);
+    for (auto const& batch : input_batches) {
+      if (!batch) { continue; }
+      auto filtered_batch = gpu_expression_executor.select(batch);
+      if (filtered_batch) { output_batches.push_back(std::move(filtered_batch)); }
+    }
+  } else {
+    for (auto const& batch : input_batches) {
+      if (batch) { output_batches.push_back(batch); }
+    }
+  }
+
+  auto end      = std::chrono::high_resolution_clock::now();
+  auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+  SIRIUS_LOG_DEBUG("Filter time: {:.2f} ms", duration.count() / 1000.0);
+  return output_batches;
 }
 
 }  // namespace op

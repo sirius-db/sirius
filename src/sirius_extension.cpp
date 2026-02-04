@@ -45,6 +45,7 @@
 #include "log/logging.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
+#include "sirius_interface.hpp"
 
 #include <cstdlib>
 
@@ -139,10 +140,10 @@ struct GPUTableFunctionData : public TableFunctionData {
 
 struct SiriusTableFunctionData : public TableFunctionData {
   SiriusTableFunctionData() = default;
-  shared_ptr<SiriusPreparedStatementData> gpu_prepared;
+  shared_ptr<::sirius::sirius_prepared_statement_data> gpu_prepared;
   unique_ptr<QueryResult> res;
   unique_ptr<Connection> conn;
-  unique_ptr<GPUContext> gpu_context;
+  unique_ptr<::sirius::sirius_interface> sirius_iface;
   string query;
   bool enable_optimizer;
   bool finished   = false;
@@ -338,10 +339,10 @@ void SiriusExtension::GPUProcessingFunction(ClientContext& context,
 }
 
 static unique_ptr<sirius::op::sirius_physical_operator> SiriusGeneratePhysicalPlan(
-  ClientContext& context, GPUContext& gpu_context, unique_ptr<LogicalOperator>& logical_plan)
+  ClientContext& context, unique_ptr<LogicalOperator>& logical_plan)
 {
   sirius::planner::sirius_physical_plan_generator physical_planner =
-    sirius::planner::sirius_physical_plan_generator(context, gpu_context);
+    sirius::planner::sirius_physical_plan_generator(context);
   auto physical_plan = physical_planner.create_plan(std::move(logical_plan));
   return physical_plan;
 }
@@ -357,7 +358,7 @@ unique_ptr<FunctionData> SiriusExtension::GPUExecutionBind(ClientContext& contex
   auto result              = make_uniq<SiriusTableFunctionData>();
   result->query            = input.inputs[0].ToString();
   result->enable_optimizer = true;
-  result->gpu_context      = make_uniq<GPUContext>(context);
+  result->sirius_iface     = make_uniq<::sirius::sirius_interface>(context);
   if (input.inputs[0].IsNull()) {
     throw BinderException("gpu_execution cannot be called with a NULL parameter");
   }
@@ -379,9 +380,9 @@ unique_ptr<FunctionData> SiriusExtension::GPUExecutionBind(ClientContext& contex
   unique_ptr<LogicalOperator> query_plan = result->ExtractPlan(context);
   SIRIUS_LOG_DEBUG("Query plan:\n{}", query_plan->ToString());
   try {
-    auto sirius_physical_plan =
-      SiriusGeneratePhysicalPlan(context, *result->gpu_context, query_plan);
-    auto gpu_prepared = make_shared_ptr<SiriusPreparedStatementData>(
+    auto sirius_physical_plan = SiriusGeneratePhysicalPlan(context, query_plan);
+    SIRIUS_LOG_DEBUG("Done generating sirius physical plan");
+    auto gpu_prepared = make_shared_ptr<::sirius::sirius_prepared_statement_data>(
       std::move(prepared), std::move(sirius_physical_plan));
     result->gpu_prepared = gpu_prepared;
   } catch (std::exception& e) {
@@ -415,7 +416,8 @@ void SiriusExtension::GPUExecutionFunction(ClientContext& context,
         "DuckDB\n=============================================\n");
       data.res = data.conn->Query(data.query);
     } else {
-      data.res = data.gpu_context->SiriusExecuteQuery(context, data.query, data.gpu_prepared, {});
+      data.res =
+        data.sirius_iface->sirius_execute_query(context, data.query, data.gpu_prepared, {});
       if (data.res->HasError()) {
         printf(
           "=============================================\nError in SiriusExecuteQuery, fallback to "

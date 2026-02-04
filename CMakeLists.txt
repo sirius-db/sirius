@@ -97,6 +97,7 @@ set(EXTENSION_SOURCES
     src/fallback.cpp
     src/sirius_config.cpp
     src/sirius_context.cpp
+    src/sirius_interface.cpp
     src/extension_lock.cpp
     src/sirius_engine.cpp
     src/parallel/task_executor.cpp)

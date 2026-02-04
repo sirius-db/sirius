@@ -26,11 +26,8 @@
 #include <duckdb/common/types/column/column_data_collection.hpp>
 #include <duckdb/main/client_context.hpp>
 
-namespace duckdb {
-class SiriusPreparedStatementData;
-}  // namespace duckdb
-
 namespace sirius {
+class sirius_prepared_statement_data;
 
 namespace pipeline {
 class sirius_pipeline;
@@ -45,7 +42,7 @@ class sirius_physical_result_collector : public sirius_physical_operator {
     SiriusPhysicalOperatorType::RESULT_COLLECTOR;
 
  public:
-  explicit sirius_physical_result_collector(duckdb::SiriusPreparedStatementData& data);
+  explicit sirius_physical_result_collector(::sirius::sirius_prepared_statement_data& data);
 
   duckdb::StatementType statement_type;
   duckdb::StatementProperties properties;
@@ -68,7 +65,7 @@ class sirius_physical_result_collector : public sirius_physical_operator {
 
 class sirius_physical_materialized_collector : public sirius_physical_result_collector {
  public:
-  sirius_physical_materialized_collector(duckdb::SiriusPreparedStatementData& data,
+  sirius_physical_materialized_collector(::sirius::sirius_prepared_statement_data& data,
                                          duckdb::ClientContext& client_ctx);
   duckdb::unique_ptr<duckdb::ColumnDataCollection> result_collection;
 

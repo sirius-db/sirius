@@ -314,113 +314,114 @@ ErrorData GPUContext::EndQueryInternal(bool success, bool invalidate_transaction
 }
 
 // This function is based on ClientContext::PendingStatementOrPreparedStatement
-unique_ptr<PendingQueryResult> GPUContext::SiriusPendingStatementOrPreparedStatement(
-  ClientContext& context,
-  const string& query,
-  shared_ptr<SiriusPreparedStatementData>& statement_p,
-  const PendingQueryParameters& parameters)
-{
-  BeginQueryInternal(query);
+// unique_ptr<PendingQueryResult> GPUContext::SiriusPendingStatementOrPreparedStatement(
+//   ClientContext& context,
+//   const string& query,
+//   shared_ptr<SiriusPreparedStatementData>& statement_p,
+//   const PendingQueryParameters& parameters)
+// {
+//   BeginQueryInternal(query);
 
-  bool invalidate_query = true;
-  unique_ptr<PendingQueryResult> pending =
-    SiriusPendingStatementInternal(context, statement_p, parameters);
+//   bool invalidate_query = true;
+//   unique_ptr<PendingQueryResult> pending =
+//     SiriusPendingStatementInternal(context, statement_p, parameters);
 
-  if (pending->HasError()) {
-    // query failed: abort now
-    // throw InvalidInputException("Error in SiriusPendingStatementOrPreparedStatement");
-    // EndQueryInternal(false, invalidate_query);
-    return pending;
-  }
-  D_ASSERT(gpu_active_query->IsOpenResult(*pending));
-  return pending;
-};
+//   if (pending->HasError()) {
+//     // query failed: abort now
+//     // throw InvalidInputException("Error in SiriusPendingStatementOrPreparedStatement");
+//     // EndQueryInternal(false, invalidate_query);
+//     return pending;
+//   }
+//   D_ASSERT(gpu_active_query->IsOpenResult(*pending));
+//   return pending;
+// };
 
 // This function is based on ClientContext::PendingPreparedStatementInternal
-unique_ptr<PendingQueryResult> GPUContext::SiriusPendingStatementInternal(
-  ClientContext& context,
-  shared_ptr<SiriusPreparedStatementData>& statement_p,
-  const PendingQueryParameters& parameters)
-{
-  D_ASSERT(gpu_active_query);
-  auto& statement = *(statement_p->prepared);
+// unique_ptr<PendingQueryResult> GPUContext::SiriusPendingStatementInternal(
+//   ClientContext& context,
+//   shared_ptr<SiriusPreparedStatementData>& statement_p,
+//   const PendingQueryParameters& parameters)
+// {
+//   D_ASSERT(gpu_active_query);
+//   auto& statement = *(statement_p->prepared);
 
-  GPUBindPreparedStatementParameters(statement, parameters);
+//   GPUBindPreparedStatementParameters(statement, parameters);
 
-  unique_ptr<::sirius::sirius_engine> temp = make_uniq<::sirius::sirius_engine>(context, *this);
-  auto prop                                = temp->context.GetClientProperties();
-  gpu_active_query->engine                 = std::move(temp);
-  auto& engine                             = GetSiriusEngine();
-  bool stream_result                       = false;
+//   unique_ptr<::sirius::sirius_engine> temp = make_uniq<::sirius::sirius_engine>(context, *this);
+//   auto prop                                = temp->context.GetClientProperties();
+//   gpu_active_query->engine                 = std::move(temp);
+//   auto& engine                             = GetSiriusEngine();
+//   bool stream_result                       = false;
 
-  unique_ptr<::sirius::op::sirius_physical_result_collector> sirius_collector =
-    make_uniq_base<::sirius::op::sirius_physical_result_collector,
-                   ::sirius::op::sirius_physical_materialized_collector>(*statement_p,
-                                                                         client_context);
-  if (sirius_collector->type != ::sirius::op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
-    return GPUErrorResult<PendingQueryResult>(ErrorData("Error in SiriusPendingStatementInternal"));
-  }
-  D_ASSERT(sirius_collector->type == ::sirius::op::SiriusPhysicalOperatorType::RESULT_COLLECTOR);
-  auto types = sirius_collector->get_types();
-  D_ASSERT(types == statement.types);
-  engine.initialize(std::move(sirius_collector));
+//   unique_ptr<::sirius::op::sirius_physical_result_collector> sirius_collector =
+//     make_uniq_base<::sirius::op::sirius_physical_result_collector,
+//                    ::sirius::op::sirius_physical_materialized_collector>(*statement_p,
+//                                                                          client_context);
+//   if (sirius_collector->type != ::sirius::op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
+//     return GPUErrorResult<PendingQueryResult>(ErrorData("Error in
+//     SiriusPendingStatementInternal"));
+//   }
+//   D_ASSERT(sirius_collector->type == ::sirius::op::SiriusPhysicalOperatorType::RESULT_COLLECTOR);
+//   auto types = sirius_collector->get_types();
+//   D_ASSERT(types == statement.types);
+//   engine.initialize(std::move(sirius_collector));
 
-  D_ASSERT(!gpu_active_query->HasOpenResult());
+//   D_ASSERT(!gpu_active_query->HasOpenResult());
 
-  auto pending_result = make_uniq<PendingQueryResult>(
-    context.shared_from_this(), *(statement_p->prepared), std::move(types), stream_result);
-  gpu_active_query->sirius_prepared = std::move(statement_p);
-  gpu_active_query->SetOpenResult(*pending_result);
-  return pending_result;
-};
+//   auto pending_result = make_uniq<PendingQueryResult>(
+//     context.shared_from_this(), *(statement_p->prepared), std::move(types), stream_result);
+//   gpu_active_query->sirius_prepared = std::move(statement_p);
+//   gpu_active_query->SetOpenResult(*pending_result);
+//   return pending_result;
+// };
 
-// This function is based on PendingQueryResult::ExecuteInternal
-unique_ptr<QueryResult> GPUContext::SiriusExecutePendingQueryResult(PendingQueryResult& pending)
-{
-  D_ASSERT(gpu_active_query->IsOpenResult(pending));
-  CheckExecutableInternal(pending);
-  auto& engine = GetSiriusEngine();
-  try {
-    engine.execute();
-  } catch (std::exception& e) {
-    ErrorData error(e);
-    SIRIUS_LOG_ERROR("Error in SiriusExecutePendingQueryResult: {}", error.RawMessage());
-    return GPUErrorResult<MaterializedQueryResult>(error);
-  }
-  if (pending.HasError()) {
-    ErrorData error = pending.GetErrorObject();
-    return make_uniq<MaterializedQueryResult>(error);
-  }
-  SIRIUS_LOG_DEBUG("Done ExecutePendingQueryResult");
-  auto result = FetchResultInternal(pending);
-  return result;
-}
+// // This function is based on PendingQueryResult::ExecuteInternal
+// unique_ptr<QueryResult> GPUContext::SiriusExecutePendingQueryResult(PendingQueryResult& pending)
+// {
+//   D_ASSERT(gpu_active_query->IsOpenResult(pending));
+//   CheckExecutableInternal(pending);
+//   auto& engine = GetSiriusEngine();
+//   try {
+//     engine.execute();
+//   } catch (std::exception& e) {
+//     ErrorData error(e);
+//     SIRIUS_LOG_ERROR("Error in SiriusExecutePendingQueryResult: {}", error.RawMessage());
+//     return GPUErrorResult<MaterializedQueryResult>(error);
+//   }
+//   if (pending.HasError()) {
+//     ErrorData error = pending.GetErrorObject();
+//     return make_uniq<MaterializedQueryResult>(error);
+//   }
+//   SIRIUS_LOG_DEBUG("Done ExecutePendingQueryResult");
+//   auto result = FetchResultInternal(pending);
+//   return result;
+// }
 
-// This function is based on ClientContext::Query
-unique_ptr<QueryResult> GPUContext::SiriusExecuteQuery(
-  ClientContext& context,
-  const string& query,
-  shared_ptr<SiriusPreparedStatementData>& statement_p,
-  const PendingQueryParameters& parameters)
-{
-  auto pending_query =
-    SiriusPendingStatementOrPreparedStatement(context, query, statement_p, parameters);
-  D_ASSERT(gpu_active_query->IsOpenResult(*pending_query));
-  unique_ptr<QueryResult> current_result;
-  if (pending_query->HasError()) {
-    current_result = GPUErrorResult<MaterializedQueryResult>(pending_query->GetErrorObject());
-  } else {
-    current_result = SiriusExecutePendingQueryResult(*pending_query);
-  }
-  SIRIUS_LOG_DEBUG("Done SiriusExecuteQuery");
-  return current_result;
-};
+// // This function is based on ClientContext::Query
+// unique_ptr<QueryResult> GPUContext::SiriusExecuteQuery(
+//   ClientContext& context,
+//   const string& query,
+//   shared_ptr<SiriusPreparedStatementData>& statement_p,
+//   const PendingQueryParameters& parameters)
+// {
+//   auto pending_query =
+//     SiriusPendingStatementOrPreparedStatement(context, query, statement_p, parameters);
+//   D_ASSERT(gpu_active_query->IsOpenResult(*pending_query));
+//   unique_ptr<QueryResult> current_result;
+//   if (pending_query->HasError()) {
+//     current_result = GPUErrorResult<MaterializedQueryResult>(pending_query->GetErrorObject());
+//   } else {
+//     current_result = SiriusExecutePendingQueryResult(*pending_query);
+//   }
+//   SIRIUS_LOG_DEBUG("Done SiriusExecuteQuery");
+//   return current_result;
+// };
 
-sirius::sirius_engine& GPUContext::GetSiriusEngine()
-{
-  D_ASSERT(gpu_active_query);
-  D_ASSERT(gpu_active_query->engine);
-  return *gpu_active_query->engine;
-}
+// sirius::sirius_engine& GPUContext::GetSiriusEngine()
+// {
+//   D_ASSERT(gpu_active_query);
+//   D_ASSERT(gpu_active_query->engine);
+//   return *gpu_active_query->engine;
+// }
 
 };  // namespace duckdb

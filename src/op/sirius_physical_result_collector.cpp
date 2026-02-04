@@ -17,11 +17,11 @@
 // sirius
 
 #include <data/sirius_converter_registry.hpp>
-#include <gpu_context.hpp>
 #include <op/result/host_table_chunk_reader.hpp>
 #include <op/sirius_physical_result_collector.hpp>
 #include <pipeline/sirius_meta_pipeline.hpp>
 #include <pipeline/sirius_pipeline.hpp>
+#include <sirius_interface.hpp>
 
 // cucascade
 #include <cucascade/data/cpu_data_representation.hpp>
@@ -42,7 +42,7 @@ namespace sirius {
 namespace op {
 
 sirius_physical_result_collector::sirius_physical_result_collector(
-  duckdb::SiriusPreparedStatementData& data)
+  ::sirius::sirius_prepared_statement_data& data)
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::RESULT_COLLECTOR, {duckdb::LogicalType::BOOLEAN}, 0),
     statement_type(data.prepared->statement_type),
@@ -77,7 +77,7 @@ void sirius_physical_result_collector::build_pipelines(
 }
 
 sirius_physical_materialized_collector::sirius_physical_materialized_collector(
-  duckdb::SiriusPreparedStatementData& data, duckdb::ClientContext& client_ctx)
+  ::sirius::sirius_prepared_statement_data& data, duckdb::ClientContext& client_ctx)
   : sirius_physical_result_collector(data),
     _client_ctx(client_ctx),
     result_collection(duckdb::make_uniq<duckdb::ColumnDataCollection>(client_ctx, types))
