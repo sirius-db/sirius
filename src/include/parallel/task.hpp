@@ -91,6 +91,27 @@ class itask {
   // Execution function.
   virtual void execute() = 0;
 
+  template <typename T>
+  T* as() noexcept
+  {
+    return dynamic_cast<T*>(this);
+  }
+
+  template <typename T>
+  const T* as() const noexcept
+  {
+    return dynamic_cast<const T*>(this);
+  }
+
+  template <typename T>
+  bool is() const noexcept
+  {
+    return dynamic_cast<const T*>(this) != nullptr;
+  }
+
+  itask_local_state* local_state() noexcept { return _local_state.get(); }
+  itask_global_state* global_state() noexcept { return _global_state.get(); }
+
  protected:
   std::unique_ptr<itask_local_state> _local_state;
   std::shared_ptr<itask_global_state> _global_state;

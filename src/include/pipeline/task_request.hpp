@@ -28,6 +28,7 @@ namespace pipeline {
 
 struct task_request {
   int device_id;
+  bool is_scan{false};
 };
 
 class task_request_queue {

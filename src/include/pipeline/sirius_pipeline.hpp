@@ -111,12 +111,18 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
 
   duckdb::optional_ptr<op::sirius_physical_operator> get_sink() { return sink; }
 
+  duckdb::optional_ptr<op::sirius_physical_operator> get_sink() const noexcept { return sink; }
+
   duckdb::optional_ptr<op::sirius_physical_operator> get_source() { return source; }
+
+  duckdb::optional_ptr<op::sirius_physical_operator> get_source() const noexcept { return source; }
 
   //! Set the pipeline ID
   void set_pipeline_id(size_t id) { pipeline_id = id; }
   //! Get the pipeline ID
   size_t get_pipeline_id() const { return pipeline_id; }
+  //! Returns the parent pipelines (pipelines that depend on this pipeline)
+  std::vector<sirius_pipeline*> get_parents();
 
   //! Returns whether any of the operators in the pipeline care about preserving order
   bool is_order_dependent() const;
@@ -134,7 +140,10 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   //! Updates the pipeline status
   void update_pipeline_status();
   //! Checks if the pipeline has been finished
-  virtual bool is_pipeline_finished();
+  virtual bool is_pipeline_finished() const;
+
+  void mark_task_created();
+  void mark_task_completed();
 
  private:
   //! Whether or not the pipeline has been readied
@@ -163,16 +172,20 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   //! placeholder Which leads to duplicate entries in the set of active batch indexes
   std::multiset<duckdb::idx_t> batch_indexes;
 
- private:
   void schedule_sequential_task(duckdb::shared_ptr<duckdb::Event>& event);
   bool launch_scan_tasks(duckdb::shared_ptr<duckdb::Event>& event, duckdb::idx_t max_threads);
 
   bool schedule_parallel(duckdb::shared_ptr<duckdb::Event>& event);
-  //! Whether the pipeline has been finished
-  bool pipeline_finished = false;
+
   //! The unique ID of this pipeline (assigned based on new_scheduled order)
   size_t pipeline_id = 0;
   sirius_engine& engine;
+
+  //! Whether the pipeline has been finished
+  std::atomic<bool> pipeline_finished = false;
+
+  std::atomic<std::size_t> tasks_created   = 0;
+  std::atomic<std::size_t> tasks_completed = 0;
 };
 
 }  // namespace pipeline

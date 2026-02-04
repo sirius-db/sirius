@@ -18,9 +18,11 @@
 
 #include "duckdb/common/helper.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "exec/config.hpp"
 #include "extension_lock.hpp"
 #include "log/logging.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
+#include "op/scan/duckdb_scan_executor.hpp"
 
 #include <spdlog/sinks/basic_file_sink.h>
 #include <spdlog/spdlog.h>
@@ -29,6 +31,8 @@
 #include <filesystem>
 #include <iostream>
 #include <memory>
+#include <string>
+#include <string_view>
 
 namespace duckdb {
 
@@ -71,13 +75,26 @@ SiriusContext::~SiriusContext() noexcept
   if (is_initialized_) { terminate(); }
 }
 
-void SiriusContext::QueryBegin(ClientContext& context) {}
+void SiriusContext::QueryBegin(ClientContext& context)
+{
+  auto query = context.GetCurrentQuery();
+  if (config_.is_scan_caching_enabled()) {
+    pipeline_executor_->get_scan_executor().cache_scan_results_for_query(query);
+  }
 
-void SiriusContext::QueryEnd() {}
+  // Reset task creator state (including scan operator global state map) for the new query
+  task_creator_->reset();
+  task_creator_->set_client_context(context);
+}
 
-void SiriusContext::QueryEnd(ClientContext& context) {}
+void SiriusContext::QueryEnd() { query_.reset(); }
 
-void SiriusContext::QueryEnd(ClientContext& context, optional_ptr<ErrorData> error) {}
+void SiriusContext::QueryEnd(ClientContext& context) { QueryEnd(); }
+
+void SiriusContext::QueryEnd(ClientContext& context, optional_ptr<ErrorData> error)
+{
+  QueryEnd(context);
+}
 
 void SiriusContext::initialize(const sirius::sirius_config& config)
 {
@@ -91,19 +108,21 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
   data_repository_manager_ = std::make_unique<cucascade::shared_data_repository_manager>();
 
   pipeline_executor_ = std::make_unique<sirius::pipeline::pipeline_executor>(
-    config_.get_gpu_pipeline_executor_config(), *memory_manager_, &config_.get_hw_topology());
+    config_.get_gpu_pipeline_executor_config(),
+    config_.get_duckdb_scan_executor_config(),
+    *memory_manager_,
+    &config_.get_hw_topology());
 
   downgrade_executor_ = std::make_unique<sirius::parallel::downgrade_executor>(
-    config_.get_downgrade_executor_config(), *data_repository_manager_);
-  duckdb_scan_executor_ = std::make_unique<sirius::op::scan::duckdb_scan_executor>(
+    sirius::parallel::task_executor_config{}, *data_repository_manager_);
 
-    config_.get_duckdb_scan_executor_config());
+  task_creator_ = std::make_unique<sirius::creator::task_creator>(config_.get_task_creator_config(),
+                                                                  *memory_manager_);
+  task_creator_->set_pipeline_executor(*pipeline_executor_);
+  pipeline_executor_->set_task_creator(*task_creator_);
 
-  task_creator_ =
-    std::make_unique<sirius::creator::task_creator>(config_.get_task_creator_thread_count(),
-                                                    *pipeline_executor_,
-                                                    *duckdb_scan_executor_,
-                                                    *memory_manager_);
+  // Configure scan caching based on config
+  pipeline_executor_->set_scan_caching_enabled(config_.is_scan_caching_enabled());
 
   is_initialized_ = true;
 }
@@ -166,18 +185,6 @@ const sirius::parallel::downgrade_executor& SiriusContext::get_downgrade_executo
   return *downgrade_executor_;
 }
 
-sirius::op::scan::duckdb_scan_executor& SiriusContext::get_duckdb_scan_executor()
-{
-  thorw_if_not_initialized();
-  return *duckdb_scan_executor_;
-}
-
-const sirius::op::scan::duckdb_scan_executor& SiriusContext::get_duckdb_scan_executor() const
-{
-  thorw_if_not_initialized();
-  return *duckdb_scan_executor_;
-}
-
 sirius::creator::task_creator& SiriusContext::get_task_creator()
 {
   thorw_if_not_initialized();
@@ -188,6 +195,25 @@ const sirius::creator::task_creator& SiriusContext::get_task_creator() const
 {
   thorw_if_not_initialized();
   return *task_creator_;
+}
+
+void SiriusContext::create_query(sirius::sirius_pipeline_hashmap pipeline_hashmap)
+{
+  thorw_if_not_initialized();
+  query_ = duckdb::make_shared_ptr<sirius::planner::query>(std::move(pipeline_hashmap));
+  pipeline_executor_->prepare_for_query(query_);
+}
+
+duckdb::shared_ptr<sirius::planner::query> SiriusContext::get_query()
+{
+  thorw_if_not_initialized();
+  return query_;
+}
+
+duckdb::shared_ptr<const sirius::planner::query> SiriusContext::get_query() const
+{
+  thorw_if_not_initialized();
+  return query_;
 }
 
 void SiriusContext::thorw_if_not_initialized() const

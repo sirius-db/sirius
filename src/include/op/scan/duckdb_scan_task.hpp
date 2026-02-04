@@ -20,10 +20,13 @@
 #include <config.hpp>
 #include <memory/host_table_utils.hpp>
 #include <memory/multiple_blocks_allocation_accessor.hpp>
-#include <op/scan/duckdb_scan_executor.hpp>
 #include <op/sirius_physical_duckdb_scan.hpp>
+#include <op/sirius_physical_table_scan.hpp>
 #include <parallel/task.hpp>
+#include <pipeline/pipeline_executor.hpp>
 #include <pipeline/sirius_pipeline.hpp>
+#include <pipeline/sirius_pipeline_itask.hpp>
+#include <pipeline/sirius_pipeline_itask_local_state.hpp>
 #include <sirius_context.hpp>
 
 // cucascade
@@ -46,7 +49,6 @@
 #include <cstdint>
 
 namespace sirius::op::scan {
-
 //===----------------------------------------------------------------------===//
 // DuckDB Scan Task Global State
 //===----------------------------------------------------------------------===//
@@ -65,12 +67,12 @@ class duckdb_scan_task_global_state : public sirius::parallel::itask_global_stat
    * @brief Construct a new duckdb_scan_task_global_state object
    *
    * @param[in] pipeline The GPU pipeline to which this table scan belongs
-   * @param[in] scan_exec The scan executor with which to schedule new scan tasks
+   * @param[in] pipeline_exec The pipeline executor with which to schedule new scan tasks
    * @param[in] client_ctx The DuckDB client context
    * @param[in] gpu_pts The GPU physical table scan being executed
    */
   duckdb_scan_task_global_state(duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
-                                duckdb_scan_executor& scan_exec,
+                                pipeline::pipeline_executor& pipeline_exec,
                                 duckdb::ClientContext& client_ctx,
                                 sirius_physical_duckdb_scan* scan_op);
 
@@ -93,13 +95,23 @@ class duckdb_scan_task_global_state : public sirius::parallel::itask_global_stat
   /**
    * @brief Set the table scan source as fully drained
    */
-  void set_source_drained() { _source_drained.store(true, std::memory_order_release); }
+  void set_source_drained()
+  {
+    _source_drained.store(true, std::memory_order_release);
+    if (_pipeline) {
+      auto* scan_op =
+        dynamic_cast<sirius_physical_duckdb_scan*>(&_pipeline->get_operators().at(0).get());
+
+      if (scan_op) { scan_op->exhausted.store(true, std::memory_order_release); }
+    }
+  }
 
   /**
    * @brief Increment the number of active local table function states
    *
-   * We keep track of the number of active local states to determine when the table source is fully
-   * drained. Only when all local states have exhausted their scan range is the table fully read.
+   * We keep track of the number of active local states to determine when the table source is
+   * fully drained. Only when all local states have exhausted their scan range is the table fully
+   * read.
    */
   void increment_local_states() { _active_local_states.fetch_add(1, std::memory_order_relaxed); }
 
@@ -114,16 +126,34 @@ class duckdb_scan_task_global_state : public sirius::parallel::itask_global_stat
     if (remaining == 0) { set_source_drained(); }
   }
 
+  std::vector<sirius_physical_operator*> get_output_consumers() const noexcept
+  {
+    std::vector<sirius_physical_operator*> output_consumers;
+    auto ports = _op.get_next_port_after_sink();
+    for (auto& [child, port_id] : ports) {
+      output_consumers.push_back(child);
+    }
+    return output_consumers;
+  }
+
+  [[nodiscard]] size_t get_pipeline_id() const { return _pipeline->get_pipeline_id(); }
+
+  [[nodiscard]] size_t get_scan_op_id() const
+  {
+    return _pipeline->get_operators().at(0).get().get_operator_id();
+  }
+
  private:
   //===----------Fields----------===//
   duckdb::shared_ptr<pipeline::sirius_pipeline>
-    _pipeline;  ///< The pipeline to which this table scan belongs
-  duckdb::shared_ptr<duckdb::SiriusContext> _sirius_ctx;  ///< The Sirius context
+    _pipeline;                         ///< The pipeline to which this table scan belongs
+  duckdb::SiriusContext* _sirius_ctx;  ///< The Sirius context
   std::unique_ptr<duckdb::GlobalTableFunctionState>
-    _global_tf_state;                            ///< Global state for the table function
-  duckdb_scan_executor& _scan_executor;          ///< The scan executor executing this scan task
-  sirius_physical_duckdb_scan& _op;              ///< The physical table scan being executed
-  std::atomic<bool> _source_drained{false};      ///< Whether the table scan source is fully drained
+    _global_tf_state;  ///< Global state for the table function
+  pipeline::pipeline_executor&
+    _pipeline_executor;                      ///< The pipeline executor for scheduling scan tasks
+  sirius_physical_duckdb_scan& _op;          ///< The physical table scan being executed
+  std::atomic<bool> _source_drained{false};  ///< Whether the table scan source is fully drained
   std::atomic<int64_t> _active_local_states{0};  ///< Number of active local table function states
   uint64_t _max_threads;                         ///< Maximum number of threads for this scan task
 };
@@ -135,12 +165,12 @@ class duckdb_scan_task_global_state : public sirius::parallel::itask_global_stat
 /**
  * @brief The local state for a duckdb scan task.
  *
- * This class manages the state specific to a single scan task, most importantly the memory buffers
- * into which to accumulate data from a DuckDB table scan and the logic for processing DuckDB data
- * chunks into those buffers.
+ * This class manages the state specific to a single scan task, most importantly the memory
+ * buffers into which to accumulate data from a DuckDB table scan and the logic for processing
+ * DuckDB data chunks into those buffers.
  *
  */
-class duckdb_scan_task_local_state : public sirius::parallel::itask_local_state {
+class duckdb_scan_task_local_state : public sirius::pipeline::sirius_pipeline_itask_local_state {
   using data_batch = cucascade::data_batch;
 
  public:
@@ -275,6 +305,11 @@ class duckdb_scan_task_local_state : public sirius::parallel::itask_local_state 
     size_t default_varchar_size   = duckdb::Config::DEFAULT_SCAN_TASK_VARCHAR_SIZE,
     std::unique_ptr<duckdb::LocalTableFunctionState> existing_local_tf_state = nullptr);
 
+  [[nodiscard]] std::size_t get_estimated_reservation_size() const noexcept
+  {
+    return _approximate_batch_size;
+  }
+
   //===----------Methods----------===//
   /**
    * @brief Creates a data batch from the current state of the column builders.
@@ -294,8 +329,6 @@ class duckdb_scan_task_local_state : public sirius::parallel::itask_local_state 
 
   cucascade::memory::any_memory_space_in_tier _res_request =
     cucascade::memory::any_memory_space_in_tier(cucascade::memory::Tier::HOST);
-  std::unique_ptr<cucascade::memory::reservation>
-    _reservation;  ///< Memory reservation for all column data
   std::unique_ptr<cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation>
     _allocation;  ///< Memory allocation for all column data
   cucascade::memory::memory_space* _host_space = nullptr;
@@ -317,7 +350,8 @@ class duckdb_scan_task_local_state : public sirius::parallel::itask_local_state 
   [[nodiscard]] size_t get_tail_byte_offset() const;
 
   /**
-   * @brief Estimate the maximum number of rows to process for a batch given the target batch size.
+   * @brief Estimate the maximum number of rows to process for a batch given the target batch
+   * size.
    *
    * Uses the actual width of fixed-width types, and a default VARCHAR width, for estimation.
    *
@@ -354,7 +388,7 @@ class duckdb_scan_task_local_state : public sirius::parallel::itask_local_state 
  * the batch to the data repository and notifying the task creator. If the table scan is
  * incomplete upon task completion, the task will push a new scan_task onto the task queue.
  */
-class duckdb_scan_task : public sirius::parallel::itask {
+class duckdb_scan_task : public sirius::pipeline::sirius_pipeline_itask {
   using shared_data_repository = cucascade::shared_data_repository;
   // Friend declaration for test access
   friend class test_scan_task;
@@ -373,9 +407,9 @@ class duckdb_scan_task : public sirius::parallel::itask {
                    shared_data_repository* data_repo,
                    std::unique_ptr<duckdb_scan_task_local_state> l_state,
                    std::shared_ptr<duckdb_scan_task_global_state> g_state)
-    : _task_id(task_id),
-      _data_repo(data_repo),
-      sirius::parallel::itask(std::move(l_state), g_state) {};
+    : sirius::pipeline::sirius_pipeline_itask(std::move(l_state), g_state),
+      _task_id(task_id),
+      _data_repo(data_repo) {};
 
   void execute() override;
 
@@ -401,7 +435,8 @@ class duckdb_scan_task : public sirius::parallel::itask {
   static bool chunk_fits(duckdb_scan_task_local_state& l_state);
 
   /**
-   * @brief Processes the current data chunk and copies its data into the column builders' buffers.
+   * @brief Processes the current data chunk and copies its data into the column builders'
+   * buffers.
    */
   void process_chunk(duckdb_scan_task_local_state& l_state);
 
@@ -426,6 +461,48 @@ class duckdb_scan_task : public sirius::parallel::itask {
     return &this->_local_state->cast<duckdb_scan_task_local_state>();
   }
 
+  /**
+   * @brief Compute and return the output data batches for this task.
+   *
+   * Scans data from the DuckDB table function and accumulates it into data batches.
+   *
+   * @return std::vector<std::shared_ptr<cucascade::data_batch>> The computed output batches
+   */
+  std::vector<std::shared_ptr<cucascade::data_batch>> compute_task() override;
+
+  /**
+   * @brief Publish the computed output batches to the data repository.
+   *
+   * Pushes the output batches to the configured data repository and schedules
+   * new scan tasks if the table scan is incomplete.
+   *
+   * @param output_batches The data batches to publish
+   */
+  void publish_output(std::vector<std::shared_ptr<cucascade::data_batch>> output_batches) override;
+
+  std::size_t get_estimated_reservation_size() const override
+  {
+    return this->_local_state->cast<duckdb_scan_task_local_state>()
+      .get_estimated_reservation_size();
+  }
+
+  /// @brief Get the output consumer operators for this task.
+  std::vector<op::sirius_physical_operator*> get_output_consumers() override
+  {
+    return this->_global_state->cast<duckdb_scan_task_global_state>().get_output_consumers();
+  }
+
+  [[nodiscard]] size_t get_pipeline_id() const
+  {
+    return this->_global_state->cast<duckdb_scan_task_global_state>().get_pipeline_id();
+  }
+
+  [[nodiscard]] size_t get_scan_op_id() const
+  {
+    return this->_global_state->cast<duckdb_scan_task_global_state>().get_scan_op_id();
+  }
+
+ private:
   //===----------Fields----------===//
   shared_data_repository* _data_repo;  ///< Data repository to which to push batches
   uint64_t _task_id;                   ///< The unique id of this scan task

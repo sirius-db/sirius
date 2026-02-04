@@ -33,4 +33,5 @@ set(EXTENSION_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/sirius_plan_recursive_cte.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/sirius_plan_top_n.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/sirius_plan_expression_get.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/query.cpp
     PARENT_SCOPE)

@@ -34,6 +34,8 @@
 #include <cucascade/data/data_repository.hpp>
 
 #include <atomic>
+#include <optional>
+#include <string_view>
 
 namespace sirius {
 
@@ -46,16 +48,16 @@ class sirius_pipeline;
 class sirius_pipeline_build_state;
 class sirius_meta_pipeline;
 }  // namespace pipeline
-
-namespace creator {
-class task_creator;
-using task_creation_hint = std::variant<std::monostate,
-                                        op::sirius_physical_operator*,
-                                        duckdb::shared_ptr<pipeline::sirius_pipeline>>;
-}  // namespace creator
-
 namespace op {
+
+enum class TaskCreationHint { WAITING_FOR_INPUT_DATA, READY };
+
 enum class MemoryBarrierType { PIPELINE, PARTIAL, FULL };
+
+struct task_creation_hint {
+  TaskCreationHint hint{TaskCreationHint::WAITING_FOR_INPUT_DATA};
+  sirius_physical_operator* producer{nullptr};
+};
 
 //! sirius_physical_operator is the base class of the physical operators present in the
 //! execution plan
@@ -178,6 +180,7 @@ class sirius_physical_operator {
   template <class TARGET>
   TARGET& Cast()
   {
+    // TODO(amin) this is buggy code
     if (TARGET::TYPE != SiriusPhysicalOperatorType::INVALID && type != TARGET::TYPE) {
       throw duckdb::InternalException(
         "Failed to cast physical operator to type - physical operator type mismatch");
@@ -217,24 +220,43 @@ class sirius_physical_operator {
     std::pair<sirius_physical_operator*, std::string_view> port_locator);
   //! Get the next ports after sink
   std::vector<std::pair<sirius_physical_operator*, std::string_view>>& get_next_port_after_sink();
+
   //! Get the next task hint
-  virtual creator::task_creation_hint get_next_task_hint();
+  virtual std::optional<task_creation_hint> get_next_task_hint();
+
+  /// \brief check if there are more tasks to create
+  /// \note not necessarily ready to create at the moment
+  /// the function is called
+  virtual bool can_create_more_tasks() const
+  {
+    // WSM TODO implement this
+    throw std::runtime_error("can_create_more_tasks not implemented for operator " + get_name());
+    return true;
+  }
+
+  /// \brief check if all tasks have been processed
+  virtual bool has_processed_all_tasks() const
+  {
+    // WSM TODO implement this
+    throw std::runtime_error("has_processed_all_tasks not implemented for operator " + get_name());
+    return true;
+  }
+
   //! Get the input batch
-  std::vector<std::shared_ptr<::cucascade::data_batch>> get_input_batch();
+  std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>> get_next_task_input_batch();
   //! Check if all ports are empty
   bool all_ports_empty();
   //! Check if the pipeline is finished
   bool check_pipeline_finished();
-  //! Set the creator of the task
-  void set_creator(creator::task_creator* creator);
+
+  //! Get pipeline
+  duckdb::shared_ptr<pipeline::sirius_pipeline> get_pipeline();
 
  private:
   //! The ports of the operator
   std::unordered_map<std::string, std::unique_ptr<port>> ports;
   //! The next operators to be executed after this operator when it is used as a sink
   std::vector<std::pair<sirius_physical_operator*, std::string_view>> next_port_after_sink;
-  //! The creator of the task
-  creator::task_creator* creator;
 };
 
 }  // namespace op

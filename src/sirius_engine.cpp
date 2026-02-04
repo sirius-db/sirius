@@ -44,8 +44,6 @@
 #include <cucascade/data/data_repository_manager.hpp>
 #include <stdio.h>
 
-#include <iostream>
-
 namespace sirius {
 
 void sirius_engine::reset()
@@ -172,10 +170,21 @@ void sirius_engine::execute()
     throw duckdb::InvalidInputException("Sirius context is not initialized.");
   }
 
-  // Convert vector to hashmap
+  // Create the query with the pipeline hashmap
   sirius_pipeline_hashmap pipeline_map(new_scheduled);
-  auto& task_creator = sirius_ctx->get_task_creator();
-  task_creator.set_pipeline_hashmap(pipeline_map);
+  sirius_ctx->create_query(std::move(pipeline_map));
+  auto future = sirius_ctx->get_pipeline_executor().start_query();
+  try {
+    future.get();
+  } catch (const std::exception& e) {
+    /// todo(bobbi) we should handle the error properly, clean the query context and then return the
+    /// error to duckdb
+    SIRIUS_LOG_ERROR("Error executing query: {}", e.what());
+    throw;
+  } catch (...) {
+    SIRIUS_LOG_ERROR("Unknown error executing query");
+    throw;
+  }
 }
 
 duckdb::unique_ptr<op::sirius_physical_operator> sirius_engine::construct_sirius_specific_operator(

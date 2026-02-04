@@ -21,6 +21,7 @@ libcudf = "25.10.*"
 libcurand-dev = "*"
 pre-commit = "*"
 libconfig = "*"
+libabseil = ">=20260107.0"
 
 [tasks]
 

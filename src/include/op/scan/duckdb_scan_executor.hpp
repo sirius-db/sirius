@@ -16,9 +16,33 @@
 
 #pragma once
 
-// sirius
-#include <op/scan/duckdb_scan_task_queue.hpp>
-#include <parallel/task_executor.hpp>
+#include "exec/channel.hpp"
+#include "exec/config.hpp"
+#include "exec/interruptible_mpmc.hpp"
+#include "exec/kiosk.hpp"
+#include "exec/thread_pool.hpp"
+#include "op/scan/duckdb_scan_task.hpp"
+#include "parallel/task.hpp"
+#include "pipeline/task_request.hpp"
+
+#include <cucascade/memory/memory_reservation_manager.hpp>
+
+#include <atomic>
+#include <memory>
+#include <string>
+#include <thread>
+
+namespace sirius::op {
+class sirius_physical_operator;
+}  // namespace sirius::op
+
+namespace sirius::creator {
+class task_creator;
+}  // namespace sirius::creator
+
+namespace sirius::pipeline {
+class completion_handler;
+}  // namespace sirius::pipeline
 
 namespace sirius::op::scan {
 
@@ -29,38 +53,60 @@ namespace sirius::op::scan {
 /**
  * @brief A task executor for duckdb scan tasks.
  *
- * This class extends the generic itask_executor simply by instantiating it with a
- * duckdb_scan_task_queue.
- *
+ * This class manages a pool of threads dedicated to executing DuckDB scan
+ * tasks with kiosk-based concurrency control.
  */
-class duckdb_scan_executor : public sirius::parallel::itask_executor {
+class duckdb_scan_executor {
  public:
-  //===----------Constructor----------===//
-  explicit duckdb_scan_executor(sirius::parallel::task_executor_config config)
-    : sirius::parallel::itask_executor(std::make_unique<duckdb_scan_task_queue>(config.num_threads),
-                                       config)
-  {
-  }
+  /**
+   * @brief Constructs a new duckdb_scan_executor with task execution configuration
+   *
+   * @param config Configuration for the thread pool (thread count, etc.)
+   * @param mem_mgr Pointer to the memory reservation manager for host allocations
+   * @param task_request_publisher Publisher to submit task requests
+   */
+  explicit duckdb_scan_executor(
+    exec::thread_pool_config config,
+    cucascade::memory::memory_reservation_manager* mem_mgr,
+    exec::publisher<std::unique_ptr<sirius::pipeline::task_request>> task_request_publisher);
 
-  //===----------Methods----------===//
+  /**
+   * @brief Destructor for the duckdb_scan_executor.
+   */
+  ~duckdb_scan_executor();
+
+  // Non-copyable and non-movable
+  duckdb_scan_executor(const duckdb_scan_executor&)            = delete;
+  duckdb_scan_executor& operator=(const duckdb_scan_executor&) = delete;
+  duckdb_scan_executor(duckdb_scan_executor&&)                 = delete;
+  duckdb_scan_executor& operator=(duckdb_scan_executor&&)      = delete;
+
   /**
    * @brief Schedule a new task for execution.
    *
    * @param task The task to be scheduled.
    */
-  void schedule(std::unique_ptr<sirius::parallel::itask> task) override;
+  void schedule(std::unique_ptr<sirius::parallel::itask> task);
+
+  /**
+   * @brief Starts the executor and initializes worker threads
+   *
+   * Initializes the thread pool and begins accepting tasks for execution.
+   */
+  void start();
+
+  /**
+   * @brief Stops the executor and cleanly shuts down worker threads
+   *
+   * Stops accepting new tasks and waits for all worker threads to complete
+   * their current tasks before shutting down.
+   */
+  void stop();
 
   /**
    * @brief Wait for all scheduled tasks to complete.
    */
-  void wait();
-
-  /**
-   * @brief Worker thread loop.
-   *
-   * @param worker_id The ID of the worker thread.
-   */
-  void worker_loop(int32_t worker_id) override;
+  void wait_all();
 
   /**
    * @brief Get the number of threads in the thread pool for this executor.
@@ -69,12 +115,94 @@ class duckdb_scan_executor : public sirius::parallel::itask_executor {
    */
   [[nodiscard]] int32_t get_num_threads() const { return _config.num_threads; }
 
-  //===----------Fields----------===//
+  /**
+   * @brief Set the task creator for scheduling output consumers
+   *
+   * @param task_creator Pointer to the task creator
+   */
+  void set_task_creator(sirius::creator::task_creator* task_creator);
+
+  /**
+   * @brief Drain any leftover tasks from the queue
+   *
+   * Clears the task queue of any remaining tasks from a previous query.
+   */
+  void drain_leftover_tasks();
+
+  /**
+   * @brief Set the completion handler for query completion signaling
+   *
+   * @param handler Pointer to the completion handler
+   */
+  void set_completion_handler(sirius::pipeline::completion_handler* handler) noexcept;
+
+  /**
+   * @brief Cache scan results for the given query
+   *
+   * @param query The query string to cache results for
+   */
+  void cache_scan_results_for_query(const std::string& query);
+
+  /**
+   * @brief Enable or disable scan result caching
+   *
+   * @param enabled True to enable caching, false to disable
+   */
+  void set_scan_caching_enabled(bool enabled);
+
+  /**
+   * @brief Check if scan result caching is enabled
+   *
+   * @return True if caching is enabled, false otherwise
+   */
+  [[nodiscard]] bool is_scan_caching_enabled() const noexcept { return _caching_enabled; }
+
+  /**
+   * @brief Prepare cache for scan operators
+   *
+   * In CACHE mode: ensures cache is empty and creates entries for each operator's ID
+   * In PRELOAD mode: verifies all operator IDs are present in the cache
+   *
+   * @param scan_operators Vector of scan operators to prepare cache for
+   */
+  void prepare_cache_for_scan_operators(
+    const std::vector<sirius::op::sirius_physical_operator*>& scan_operators);
+
  private:
-  std::atomic<uint64_t> _total_tasks    = 0;  ///< The total number of scheduled tasks
-  std::atomic<uint64_t> _finished_tasks = 0;  ///< The total number of finished tasks
-  std::mutex _finish_mutex;                   ///< Mutex to protect condition variable
-  std::condition_variable _finish_cv;         ///< Condition variable to signal task completion
+  /**
+   * @brief Manager loop to consume tasks from queue and dispatch to the thread pool
+   */
+  void manager_loop();
+
+  /**
+   * @brief Submit a scan task request to pipeline_executor
+   */
+  void submit_scan_request();
+
+  std::vector<std::shared_ptr<cucascade::data_batch>> get_scan_output(
+    op::scan::duckdb_scan_task* task);
+
+  struct cache_entry {
+    std::vector<std::vector<std::shared_ptr<cucascade::data_batch>>> batches;
+    std::size_t batch_index{0};
+  };
+
+  std::mutex _cache_mutex;
+  std::unordered_map<size_t, std::unique_ptr<cache_entry>> _cache;
+  std::size_t _query_hash{0};
+  bool _caching_enabled{false};
+  bool _preload_mode{false};
+
+  std::atomic<bool> _running{false};
+  exec::thread_pool_config _config;
+  exec::kiosk _kiosk;
+  std::unique_ptr<exec::thread_pool> _thread_pool;
+  exec::interruptible_mpmc<std::unique_ptr<sirius::parallel::itask>> _task_queue;
+  std::thread _manager_thread;
+  exec::publisher<std::unique_ptr<sirius::pipeline::task_request>> _task_request_publisher;
+  cucascade::memory::memory_reservation_manager* _mem_mgr{nullptr};
+  sirius::creator::task_creator* _task_creator{nullptr};
+  sirius::pipeline::completion_handler* _completion_handler{nullptr};
 };
 
 }  // namespace sirius::op::scan

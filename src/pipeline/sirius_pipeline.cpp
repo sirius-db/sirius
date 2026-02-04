@@ -160,6 +160,15 @@ duckdb::vector<duckdb::reference<op::sirius_physical_operator>> sirius_pipeline:
   return operators;
 }
 
+std::vector<sirius_pipeline*> sirius_pipeline::get_parents()
+{
+  std::vector<sirius_pipeline*> result;
+  for (auto& weak_parent : parents) {
+    if (auto parent = weak_parent.lock()) { result.push_back(parent.get()); }
+  }
+  return result;
+}
+
 void sirius_pipeline::clear_source()
 {
   source_state.reset();
@@ -255,22 +264,38 @@ sirius_pipeline_build_state::get_pipeline_operators(sirius_pipeline& pipeline)
   return pipeline.operators;
 }
 
-bool sirius_pipeline::is_pipeline_finished() { return pipeline_finished; }
+bool sirius_pipeline::is_pipeline_finished() const { return pipeline_finished.load(); }
 
 void sirius_pipeline::update_pipeline_status()
 {
   if (get_source()->type == op::SiriusPhysicalOperatorType::TABLE_SCAN) {
     auto& table_scan = get_source()->Cast<op::sirius_physical_table_scan>();
-    if (!table_scan.exhausted) {
-      pipeline_finished = false;
+    if (table_scan.exhausted) {  // WSM amin TODO: can we use exhausted? how about we use
+                                 // get_next_task_hint() to check if the source is ready?
+      pipeline_finished = true;
       return;
     }
-    auto& first_node  = operators[0].get();
-    pipeline_finished = first_node.all_ports_empty();
   } else {
-    auto& first_node  = operators[0].get();
-    pipeline_finished = first_node.is_source_pipeline_finished() && first_node.all_ports_empty();
+    op::sirius_physical_operator* first_node =
+      operators.size() > 0 ? &operators[0].get() : (sink ? sink.get() : nullptr);
+    if (first_node == nullptr) {
+      throw duckdb::InternalException("First node of pipeline is nullptr");
+    }
+    // WSM TODO need to increment task created before pulling data?
+    // Lets fix this by putting task creation as a method in the pipeline class so that it can be
+    // done atomically.
+    if (first_node->is_source_pipeline_finished() && first_node->all_ports_empty()) {
+      pipeline_finished = tasks_created.load() == tasks_completed.load();
+    }
   }
+}
+
+void sirius_pipeline::mark_task_created() { tasks_created++; }
+
+void sirius_pipeline::mark_task_completed()
+{
+  tasks_completed++;
+  update_pipeline_status();
 }
 
 }  // namespace pipeline

@@ -17,40 +17,40 @@
 #include "operator_test_utils.hpp"
 
 #include <catch.hpp>
-#include <duckdb/common/types.hpp>
 #include <duckdb/planner/bound_query_node.hpp>
 #include <duckdb/planner/bound_result_modifier.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <op/sirius_physical_top_n.hpp>
 #include <op/sirius_physical_top_n_merge.hpp>
 
-using namespace duckdb;
 using namespace sirius::op;
 using namespace cucascade;
 using namespace cucascade::memory;
 using namespace sirius::test::operator_utils;
 
-namespace {
-
-BoundOrderByNode make_order(idx_t col_idx, OrderType dir = OrderType::DESCENDING)
+// Helper functions - defined outside anonymous namespace to avoid ODR issues with
+// LogicalType::BIGINT
+static duckdb::BoundOrderByNode make_order(duckdb::idx_t col_idx,
+                                           duckdb::OrderType dir = duckdb::OrderType::DESCENDING)
 {
-  return BoundOrderByNode(dir,
-                          OrderByNullType::NULLS_LAST,
-                          make_uniq<BoundReferenceExpression>(LogicalType::BIGINT, col_idx));
+  return duckdb::BoundOrderByNode(dir,
+                                  duckdb::OrderByNullType::NULLS_LAST,
+                                  duckdb::make_uniq<duckdb::BoundReferenceExpression>(
+                                    duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT), col_idx));
 }
 
-std::shared_ptr<data_batch> make_batch(memory_space& space,
-                                       const std::vector<int64_t>& order_vals,
-                                       const std::vector<int64_t>& payload_vals)
+static std::shared_ptr<data_batch> make_batch(memory_space& space,
+                                              const std::vector<int64_t>& order_vals,
+                                              const std::vector<int64_t>& payload_vals)
 {
   return make_two_column_batch<int64_t, int64_t>(
     space, order_vals, payload_vals, cudf::type_id::INT64, std::nullopt);
 }
 
-std::shared_ptr<data_batch> make_range_batch(memory_space& space,
-                                             int64_t start,
-                                             int64_t count,
-                                             int64_t payload_scale)
+static std::shared_ptr<data_batch> make_range_batch(memory_space& space,
+                                                    int64_t start,
+                                                    int64_t count,
+                                                    int64_t payload_scale)
 {
   std::vector<int64_t> order_vals;
   std::vector<int64_t> payload_vals;
@@ -63,8 +63,6 @@ std::shared_ptr<data_batch> make_range_batch(memory_space& space,
   }
   return make_batch(space, order_vals, payload_vals);
 }
-
-}  // namespace
 
 TEST_CASE("sirius_physical_top_n single-key uses top_k per batch", "[physical_top_n]")
 {
@@ -80,7 +78,7 @@ TEST_CASE("sirius_physical_top_n single-key uses top_k per batch", "[physical_to
   types.push_back(duckdb::LogicalType::BIGINT);  // payload
 
   duckdb::vector<duckdb::BoundOrderByNode> orders;
-  orders.push_back(make_order(0, OrderType::DESCENDING));
+  orders.push_back(make_order(0, duckdb::OrderType::DESCENDING));
 
   sirius_physical_top_n topn(std::move(types),
                              std::move(orders),
@@ -119,8 +117,8 @@ TEST_CASE("sirius_physical_top_n multi-key falls back to sort_by_key", "[physica
   types.push_back(duckdb::LogicalType::BIGINT);  // payload
 
   duckdb::vector<duckdb::BoundOrderByNode> orders;
-  orders.push_back(make_order(0, OrderType::DESCENDING));
-  orders.push_back(make_order(1, OrderType::ASCENDING));
+  orders.push_back(make_order(0, duckdb::OrderType::DESCENDING));
+  orders.push_back(make_order(1, duckdb::OrderType::ASCENDING));
 
   sirius_physical_top_n topn(std::move(types),
                              std::move(orders),
@@ -160,7 +158,7 @@ TEST_CASE("sirius_physical_top_n_merge applies offset and limit", "[physical_top
   types.push_back(duckdb::LogicalType::BIGINT);
 
   duckdb::vector<duckdb::BoundOrderByNode> orders;
-  orders.push_back(make_order(0, OrderType::DESCENDING));
+  orders.push_back(make_order(0, duckdb::OrderType::DESCENDING));
 
   sirius_physical_top_n_merge topn_merge(std::move(types),
                                          std::move(orders),
@@ -198,7 +196,7 @@ TEST_CASE("sirius_physical_top_n_merge returns empty for limit 0", "[physical_to
   types.push_back(duckdb::LogicalType::BIGINT);
 
   duckdb::vector<duckdb::BoundOrderByNode> orders;
-  orders.push_back(make_order(0, OrderType::DESCENDING));
+  orders.push_back(make_order(0, duckdb::OrderType::DESCENDING));
 
   sirius_physical_top_n_merge topn_merge(std::move(types),
                                          std::move(orders),
@@ -225,7 +223,7 @@ TEST_CASE("sirius_physical_top_n_merge handles empty batches", "[physical_top_n_
   types.push_back(duckdb::LogicalType::BIGINT);
 
   duckdb::vector<duckdb::BoundOrderByNode> orders;
-  orders.push_back(make_order(0, OrderType::DESCENDING));
+  orders.push_back(make_order(0, duckdb::OrderType::DESCENDING));
 
   sirius_physical_top_n_merge topn_merge(std::move(types),
                                          std::move(orders),

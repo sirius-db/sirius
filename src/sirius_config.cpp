@@ -17,7 +17,7 @@
 #include "sirius_config.hpp"
 
 #include "config_option.hpp"
-#include "parallel/config.hpp"
+#include "exec/config.hpp"
 
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
@@ -73,12 +73,13 @@ struct sirius::config::custom_config_registrar<cucascade::memory::disk_memory_sp
 };
 
 template <>
-struct sirius::config::custom_config_registrar<sirius::parallel::task_executor_config> {
+struct sirius::config::custom_config_registrar<sirius::exec::thread_pool_config> {
   static void config(sirius::config::configuration_setter& setter,
-                     sirius::parallel::task_executor_config& opt)
+                     sirius::exec::thread_pool_config& opt)
   {
     setter.add_config("num_threads", opt.num_threads);
-    setter.add_config("retry_on_error", opt.retry_on_error);
+    setter.add_config("thread_name_prefix", opt.thread_name_prefix);
+    setter.add_config("cpu_affinity", opt.cpu_affinity_list);
   }
 };
 
@@ -231,10 +232,11 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
   config_setter.add_config("sirius.memory.gpu", gpu_memory_config_instance);
   config_setter.add_config("sirius.memory.host", host_memory_config_instance);
   config_setter.add_config("sirius.memory.disk", disk_memory_config_instance);
+  config_setter.add_config("sirius.executor.task_creator", _task_creator_config);
   config_setter.add_config("sirius.executor.pipeline", _gpu_pipeline_executor_config);
   config_setter.add_config("sirius.executor.downgrade", _downgrade_executor_config);
   config_setter.add_config("sirius.executor.duckdb_scan", _duckdb_scan_executor_config);
-  config_setter.add_config("sirius.executor.task_creator_num_threads", _task_creator_thread_count);
+  config_setter.add_config("sirius.executor.duckdb_scan.cache", enable_scan_caching_);
 
   config_setter.add_config("sirius.space.gpu", gpu_memory_space_configs);
   config_setter.add_config("sirius.space.host", host_memory_space_configs);
@@ -277,19 +279,22 @@ const std::vector<cucascade::memory::memory_space_config>& sirius_config::get_me
   return _memory_space_configs;
 }
 
-const parallel::task_executor_config& sirius_config::get_gpu_pipeline_executor_config()
-  const noexcept
+const exec::thread_pool_config& sirius_config::get_gpu_pipeline_executor_config() const noexcept
 {
   return _gpu_pipeline_executor_config;
 }
 
-const parallel::task_executor_config& sirius_config::get_downgrade_executor_config() const noexcept
+const exec::thread_pool_config& sirius_config::get_downgrade_executor_config() const noexcept
 {
   return _downgrade_executor_config;
 }
 
-const parallel::task_executor_config& sirius_config::get_duckdb_scan_executor_config()
-  const noexcept
+const exec::thread_pool_config& sirius_config::get_task_creator_config() const noexcept
+{
+  return _task_creator_config;
+}
+
+const exec::thread_pool_config& sirius_config::get_duckdb_scan_executor_config() const noexcept
 {
   return _duckdb_scan_executor_config;
 }

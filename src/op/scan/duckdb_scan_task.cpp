@@ -18,6 +18,7 @@
 #include <data/data_batch_utils.hpp>
 #include <helper/utils.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
+#include <op/scan/duckdb_scan_executor.hpp>
 #include <op/scan/duckdb_scan_task.hpp>
 
 // cucascade
@@ -36,13 +37,13 @@ namespace sirius::op::scan {
 //===----------------------------------------------------------------------===//
 duckdb_scan_task_global_state::duckdb_scan_task_global_state(
   duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
-  duckdb_scan_executor& scan_exec,
+  pipeline::pipeline_executor& pipeline_exec,
   duckdb::ClientContext& client_ctx,
   sirius_physical_duckdb_scan* scan_op)
   : _pipeline(std::move(pipeline)),
-    _sirius_ctx(client_ctx.registered_state->Get<duckdb::SiriusContext>("sirius_state")),
-    _max_threads(scan_exec.get_num_threads()),
-    _scan_executor(scan_exec),
+    _sirius_ctx(client_ctx.registered_state->Get<duckdb::SiriusContext>("sirius_state").get()),
+    _max_threads(pipeline_exec.get_scan_executor().get_num_threads()),
+    _pipeline_executor(pipeline_exec),
     _op(*scan_op)
 {
   // Initialize global table function state
@@ -329,7 +330,7 @@ size_t duckdb_scan_task_local_state::get_tail_byte_offset() const
 
 void duckdb_scan_task_local_state::estimate_rows_per_batch(sirius_physical_duckdb_scan const& op)
 {
-  assert(num_columns <= op.column_ids.size());
+  assert(_num_columns <= op.column_ids.size());
 
   size_t estimated_row_bytes = 0;
   _column_builders.reserve(_num_columns);
@@ -474,6 +475,12 @@ void duckdb_scan_task::process_chunk(duckdb_scan_task_local_state& l_state)
 
 void duckdb_scan_task::execute()
 {
+  auto output_batches = compute_task();
+  publish_output(output_batches);
+}
+
+std::vector<std::shared_ptr<cucascade::data_batch>> duckdb_scan_task::compute_task()
+{
   // Cast base task states to DuckDB scan task states
   auto& l_state = this->_local_state->cast<duckdb_scan_task_local_state>();
   auto& g_state = this->_global_state->cast<duckdb_scan_task_global_state>();
@@ -518,11 +525,23 @@ void duckdb_scan_task::execute()
       std::static_pointer_cast<duckdb_scan_task_global_state>(this->_global_state);
     auto next_task = std::make_unique<duckdb_scan_task>(
       new_task_id, _data_repo, std::move(new_local_state), shared_global_state);
-    g_state._scan_executor.schedule(std::move(next_task));
+    g_state._pipeline_executor.schedule(std::move(next_task));
   }
 
   // Make data batch and push to repository
-  if (l_state._row_offset > 0) { _data_repo->add_data_batch(l_state.make_data_batch()); }
+  if (l_state._row_offset > 0) {
+    return std::vector<std::shared_ptr<cucascade::data_batch>>{l_state.make_data_batch()};
+  }
+
+  return std::vector<std::shared_ptr<cucascade::data_batch>>{};
+}
+
+void duckdb_scan_task::publish_output(
+  std::vector<std::shared_ptr<cucascade::data_batch>> output_batches)
+{
+  std::for_each(std::make_move_iterator(output_batches.begin()),
+                std::make_move_iterator(output_batches.end()),
+                [this](auto batch) { this->_data_repo->add_data_batch(std::move(batch)); });
 }
 
 }  // namespace sirius::op::scan

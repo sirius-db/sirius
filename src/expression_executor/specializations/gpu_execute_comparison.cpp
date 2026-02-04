@@ -165,7 +165,6 @@ struct ComparisonDispatcher {
   std::unique_ptr<cudf::column> operator()(const BoundComparisonExpression& expr,
                                            GpuExpressionState* state)
   {
-    D_ASSERT(expr.children.size() == 2);
     auto return_type = GetCudfType(expr.return_type);
 
     // Resolve the children (DuckDB moves constants to the right comparator)
