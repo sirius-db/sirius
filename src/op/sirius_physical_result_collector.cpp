@@ -89,12 +89,14 @@ duckdb::unique_ptr<duckdb::QueryResult> sirius_physical_materialized_collector::
 {
   (void)state;  // Silence unused parameter warning
 
+  auto props = _client_ctx.GetClientProperties();
+
+  std::lock_guard<std::mutex> guard(lock);
   // Return an empty result collection if the result_collection is null (from a move)
   if (!result_collection) {
     result_collection = duckdb::make_uniq<duckdb::ColumnDataCollection>(_client_ctx, types);
   }
 
-  auto props = _client_ctx.GetClientProperties();
   return duckdb::make_uniq<duckdb::MaterializedQueryResult>(
     statement_type, properties, names, std::move(result_collection), props);
 }
@@ -104,10 +106,6 @@ void sirius_physical_materialized_collector::sink(
 {
   using host_table_chunk_reader = ::sirius::op::result::host_table_chunk_reader;
 
-  // Initialize result collection if it is null (from a move)
-  if (!result_collection) {
-    result_collection = duckdb::make_uniq<duckdb::ColumnDataCollection>(_client_ctx, types);
-  }
   if (input_batches.empty()) {
     throw duckdb::InvalidInputException("[GPUPhysicalMaterializedCollector] input_batches is null");
   }
@@ -154,10 +152,13 @@ void sirius_physical_materialized_collector::sink(
 
     // Push chunks to result collection
     duckdb::DataChunk chunk;
-    duckdb::ColumnDataAppendState append_state;
-    result_collection->InitializeAppend(append_state);
     while (chunk_reader.get_next_chunk(chunk)) {
-      result_collection->Append(append_state, chunk);
+      std::lock_guard<std::mutex> guard(lock);
+      // Initialize result collection if it is null (from a move)
+      if (!result_collection) {
+        result_collection = duckdb::make_uniq<duckdb::ColumnDataCollection>(_client_ctx, types);
+      }
+      result_collection->Append(chunk);
     }
   };
 
