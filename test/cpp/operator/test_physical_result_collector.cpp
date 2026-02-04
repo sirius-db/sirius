@@ -28,6 +28,8 @@
 #include <cucascade/data/cpu_data_representation.hpp>
 
 // cudf
+#include <cudf/column/column_factories.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
@@ -43,8 +45,11 @@
 
 // standard library
 #include <algorithm>
+#include <atomic>
+#include <exception>
 #include <filesystem>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -209,7 +214,7 @@ void convert_batch_to_host(std::shared_ptr<data_batch> const& batch)
 }  // namespace
 
 TEST_CASE("sirius_physical_materialized_collector sink with host input",
-          "[operator][result_collector][sirius_result_collector]")
+          "[operator][physical_result_collector]")
 {
   constexpr size_t num_rows = STANDARD_VECTOR_SIZE + 7;
   auto* gpu_space           = get_default_gpu_space();
@@ -282,7 +287,7 @@ TEST_CASE("sirius_physical_materialized_collector sink with host input",
 }
 
 TEST_CASE("sirius_physical_materialized_collector sink converts GPU input",
-          "[operator][result_collector][sirius_result_collector]")
+          "[operator][physical_result_collector]")
 {
   constexpr size_t num_rows = STANDARD_VECTOR_SIZE * 2 + 3;
   auto* gpu_space           = get_default_gpu_space();
@@ -344,4 +349,141 @@ TEST_CASE("sirius_physical_materialized_collector sink converts GPU input",
     row_base += count;
   }
   REQUIRE(row_base == num_rows);
+}
+
+TEST_CASE("sirius_physical_materialized_collector sink supports concurrent append",
+          "[operator][physical_result_collector][concurrent]")
+{
+  constexpr int num_threads       = 4;
+  constexpr size_t rows_per_batch = STANDARD_VECTOR_SIZE * 3 + 13;
+
+  auto* gpu_space = get_default_gpu_space();
+  REQUIRE(gpu_space != nullptr);
+
+  using row_t = std::pair<int32_t, int64_t>;
+  std::vector<row_t> expected_rows;
+  expected_rows.reserve(static_cast<size_t>(num_threads) * rows_per_batch);
+
+  std::vector<std::shared_ptr<data_batch>> batches;
+  batches.reserve(num_threads);
+
+  auto stream = cudf::get_default_stream();
+  auto mr     = gpu_space->get_default_allocator();
+
+  for (int thread_idx = 0; thread_idx < num_threads; ++thread_idx) {
+    std::vector<int32_t> col0_values(rows_per_batch, thread_idx);
+    std::vector<int64_t> col1_values(rows_per_batch);
+    for (size_t row_idx = 0; row_idx < rows_per_batch; ++row_idx) {
+      col1_values[row_idx] =
+        static_cast<int64_t>(thread_idx) * static_cast<int64_t>(rows_per_batch) +
+        static_cast<int64_t>(row_idx);
+      expected_rows.emplace_back(col0_values[row_idx], col1_values[row_idx]);
+    }
+
+    std::vector<std::unique_ptr<cudf::column>> cols;
+    cols.reserve(2);
+
+    auto col0 = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                          static_cast<cudf::size_type>(rows_per_batch),
+                                          cudf::mask_state::UNALLOCATED,
+                                          stream,
+                                          mr);
+    cudaMemcpy(col0->mutable_view().data<int32_t>(),
+               col0_values.data(),
+               sizeof(int32_t) * rows_per_batch,
+               cudaMemcpyHostToDevice);
+    cols.push_back(std::move(col0));
+
+    auto col1 = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT64},
+                                          static_cast<cudf::size_type>(rows_per_batch),
+                                          cudf::mask_state::UNALLOCATED,
+                                          stream,
+                                          mr);
+    cudaMemcpy(col1->mutable_view().data<int64_t>(),
+               col1_values.data(),
+               sizeof(int64_t) * rows_per_batch,
+               cudaMemcpyHostToDevice);
+    cols.push_back(std::move(col1));
+
+    auto table = std::make_unique<cudf::table>(std::move(cols));
+    auto batch = sirius::make_data_batch(std::move(table), *gpu_space);
+    convert_batch_to_host(batch);
+    batches.emplace_back(std::move(batch));
+  }
+
+  duckdb::vector<duckdb::LogicalType> types{duckdb::LogicalType::INTEGER,
+                                            duckdb::LogicalType::BIGINT};
+  auto prepared =
+    duckdb::make_shared_ptr<duckdb::PreparedStatementData>(duckdb::StatementType::SELECT_STATEMENT);
+  prepared->types = types;
+  prepared->names = {"c0", "c1"};
+  auto plan       = duckdb::make_uniq<sirius::op::sirius_physical_dummy_scan>(types, 0);
+  auto sirius_prepared =
+    duckdb::make_shared_ptr<sirius_prepared_statement_data>(prepared, std::move(plan));
+  sirius::op::sirius_physical_materialized_collector collector(*sirius_prepared,
+                                                               get_test_client_context());
+
+  std::atomic<int> ready{0};
+  std::atomic<bool> go{false};
+  std::vector<std::exception_ptr> exceptions(static_cast<size_t>(num_threads));
+  std::vector<std::thread> threads;
+  threads.reserve(num_threads);
+
+  for (int thread_idx = 0; thread_idx < num_threads; ++thread_idx) {
+    threads.emplace_back([&, thread_idx]() {
+      ready.fetch_add(1, std::memory_order_relaxed);
+      while (!go.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+      try {
+        collector.sink({batches[static_cast<size_t>(thread_idx)]});
+      } catch (...) {
+        exceptions[static_cast<size_t>(thread_idx)] = std::current_exception();
+      }
+    });
+  }
+
+  while (ready.load(std::memory_order_acquire) != num_threads) {
+    std::this_thread::yield();
+  }
+  // All spawned threads are ready, let them go
+  go.store(true, std::memory_order_release);
+
+  // Wait for all threads to finish
+  for (auto& t : threads) {
+    t.join();
+  }
+
+  // Check for exceptions
+  for (auto const& ex : exceptions) {
+    if (!ex) { continue; }
+    try {
+      std::rethrow_exception(ex);
+    } catch (std::exception const& e) {
+      FAIL(e.what());
+    } catch (...) {
+      FAIL("Unknown exception in concurrent sink.");
+    }
+  }
+
+  duckdb::GlobalSinkState sink_state;
+  auto result = collector.get_result(sink_state);
+  REQUIRE(result != nullptr);
+
+  std::vector<row_t> actual_rows;
+  actual_rows.reserve(expected_rows.size());
+  for (;;) {
+    auto chunk = result->FetchRaw();
+    if (!chunk) { break; }
+    auto const count = static_cast<size_t>(chunk->size());
+    auto* int32_data = duckdb::FlatVector::GetData<int32_t>(chunk->data[0]);
+    auto* int64_data = duckdb::FlatVector::GetData<int64_t>(chunk->data[1]);
+    for (size_t i = 0; i < count; ++i) {
+      actual_rows.emplace_back(int32_data[i], int64_data[i]);
+    }
+  }
+
+  std::sort(actual_rows.begin(), actual_rows.end());
+  std::sort(expected_rows.begin(), expected_rows.end());
+  REQUIRE(actual_rows == expected_rows);
 }
