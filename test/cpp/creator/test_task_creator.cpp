@@ -17,7 +17,6 @@
 #include "catch.hpp"
 #include "creator/task_creator.hpp"
 #include "exec/config.hpp"
-#include "sirius_interface.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "parallel/task_executor.hpp"
 #include "pipeline/pipeline_executor.hpp"

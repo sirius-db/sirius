@@ -47,9 +47,11 @@ void bind_prepared_statement_parameters(duckdb::PreparedStatementData& statement
   statement.Bind(std::move(owned_values));
 }
 
-sirius_interface::sirius_interface(duckdb::ClientContext& client_context) : client_context(client_context) {};
+sirius_interface::sirius_interface(duckdb::ClientContext& client_context)
+  : client_context(client_context) {};
 
-void sirius_interface::sirius_process_error(duckdb::ErrorData& error, const duckdb::string& query) const
+void sirius_interface::sirius_process_error(duckdb::ErrorData& error,
+                                            const duckdb::string& query) const
 {
   error.FinalizeError();
   if (client_context.config.errors_as_json) {
@@ -60,7 +62,8 @@ void sirius_interface::sirius_process_error(duckdb::ErrorData& error, const duck
 }
 
 template <class T>
-duckdb::unique_ptr<T> sirius_interface::sirius_error_result(duckdb::ErrorData error, const duckdb::string& query)
+duckdb::unique_ptr<T> sirius_interface::sirius_error_result(duckdb::ErrorData error,
+                                                            const duckdb::string& query)
 {
   sirius_process_error(error, query);
   return duckdb::make_uniq<T>(std::move(error));
@@ -77,7 +80,8 @@ void sirius_interface::check_executable_internal(duckdb::PendingQueryResult& pen
   }
   if (invalidated) {
     if (pending.HasError()) {
-      throw duckdb::InvalidInputException("Attempting to execute an unsuccessful pending query result\n");
+      throw duckdb::InvalidInputException(
+        "Attempting to execute an unsuccessful pending query result\n");
     }
     throw duckdb::InvalidInputException("Attempting to execute a closed pending query result");
   }
@@ -87,11 +91,12 @@ void sirius_interface::begin_query_internal(const duckdb::string& query)
 {
   // check if we are on AutoCommit. In this case we should start a transaction
   D_ASSERT(!sirius_active_query);
-  sirius_active_query = duckdb::make_uniq<sirius_active_query_context>();
+  sirius_active_query        = duckdb::make_uniq<sirius_active_query_context>();
   sirius_active_query->query = query;
 }
 
-duckdb::unique_ptr<duckdb::QueryResult> sirius_interface::fetch_result_internal(duckdb::PendingQueryResult& pending)
+duckdb::unique_ptr<duckdb::QueryResult> sirius_interface::fetch_result_internal(
+  duckdb::PendingQueryResult& pending)
 {
   D_ASSERT(sirius_active_query);
   D_ASSERT(sirius_active_query->is_open_result(pending));
@@ -106,7 +111,8 @@ duckdb::unique_ptr<duckdb::QueryResult> sirius_interface::fetch_result_internal(
   return result;
 }
 
-void sirius_interface::cleanup_internal(duckdb::BaseQueryResult* result, bool invalidate_transaction)
+void sirius_interface::cleanup_internal(duckdb::BaseQueryResult* result,
+                                        bool invalidate_transaction)
 {
   if (!sirius_active_query) {
     // no query currently active
@@ -129,7 +135,8 @@ duckdb::ErrorData sirius_interface::end_query_internal(bool success, bool invali
 }
 
 // This function is based on ClientContext::PendingStatementOrPreparedStatement
-duckdb::unique_ptr<duckdb::PendingQueryResult> sirius_interface::sirius_pending_statement_or_prepared_statement(
+duckdb::unique_ptr<duckdb::PendingQueryResult>
+sirius_interface::sirius_pending_statement_or_prepared_statement(
   duckdb::ClientContext& context,
   const duckdb::string& query,
   duckdb::shared_ptr<sirius_prepared_statement_data>& statement_p,
@@ -141,9 +148,7 @@ duckdb::unique_ptr<duckdb::PendingQueryResult> sirius_interface::sirius_pending_
   duckdb::unique_ptr<duckdb::PendingQueryResult> pending =
     sirius_pending_statement_internal(context, statement_p, parameters);
 
-  if (pending->HasError()) {
-    return pending;
-  }
+  if (pending->HasError()) { return pending; }
   D_ASSERT(sirius_active_query->is_open_result(*pending));
   return pending;
 };
@@ -160,17 +165,18 @@ duckdb::unique_ptr<duckdb::PendingQueryResult> sirius_interface::sirius_pending_
   bind_prepared_statement_parameters(statement, parameters);
 
   duckdb::unique_ptr<sirius_engine> temp = duckdb::make_uniq<sirius_engine>(context, *this);
-  auto prop                                     = temp->context.GetClientProperties();
-  sirius_active_query->engine                   = std::move(temp);
-  auto& engine                                  = get_sirius_engine();
-  bool stream_result                            = false;
+  auto prop                              = temp->context.GetClientProperties();
+  sirius_active_query->engine            = std::move(temp);
+  auto& engine                           = get_sirius_engine();
+  bool stream_result                     = false;
 
   duckdb::unique_ptr<op::sirius_physical_result_collector> sirius_collector =
     duckdb::make_uniq_base<op::sirius_physical_result_collector,
-                   op::sirius_physical_materialized_collector>(*statement_p,
-                                                                         client_context);
+                           op::sirius_physical_materialized_collector>(*statement_p,
+                                                                       client_context);
   if (sirius_collector->type != op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
-    return sirius_error_result<duckdb::PendingQueryResult>(duckdb::ErrorData("Error in sirius_pending_statement_internal"));
+    return sirius_error_result<duckdb::PendingQueryResult>(
+      duckdb::ErrorData("Error in sirius_pending_statement_internal"));
   }
   D_ASSERT(sirius_collector->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR);
   auto types = sirius_collector->get_types();
@@ -187,7 +193,8 @@ duckdb::unique_ptr<duckdb::PendingQueryResult> sirius_interface::sirius_pending_
 };
 
 // This function is based on PendingQueryResult::ExecuteInternal
-duckdb::unique_ptr<duckdb::QueryResult> sirius_interface::sirius_execute_pending_query_result(duckdb::PendingQueryResult& pending)
+duckdb::unique_ptr<duckdb::QueryResult> sirius_interface::sirius_execute_pending_query_result(
+  duckdb::PendingQueryResult& pending)
 {
   D_ASSERT(sirius_active_query->is_open_result(pending));
   check_executable_internal(pending);
@@ -222,7 +229,8 @@ duckdb::unique_ptr<duckdb::QueryResult> sirius_interface::sirius_execute_query(
   D_ASSERT(sirius_active_query->is_open_result(*pending_query));
   duckdb::unique_ptr<duckdb::QueryResult> current_result;
   if (pending_query->HasError()) {
-    current_result = sirius_error_result<duckdb::MaterializedQueryResult>(pending_query->GetErrorObject());
+    current_result =
+      sirius_error_result<duckdb::MaterializedQueryResult>(pending_query->GetErrorObject());
   } else {
     current_result = sirius_execute_pending_query_result(*pending_query);
   }

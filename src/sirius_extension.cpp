@@ -140,10 +140,10 @@ struct GPUTableFunctionData : public TableFunctionData {
 
 struct SiriusTableFunctionData : public TableFunctionData {
   SiriusTableFunctionData() = default;
-  shared_ptr<sirius::sirius_prepared_statement_data> gpu_prepared;
+  shared_ptr<::sirius::sirius_prepared_statement_data> gpu_prepared;
   unique_ptr<QueryResult> res;
   unique_ptr<Connection> conn;
-  unique_ptr<sirius::sirius_interface> sirius_iface;
+  unique_ptr<::sirius::sirius_interface> sirius_iface;
   string query;
   bool enable_optimizer;
   bool finished   = false;
@@ -358,7 +358,7 @@ unique_ptr<FunctionData> SiriusExtension::GPUExecutionBind(ClientContext& contex
   auto result              = make_uniq<SiriusTableFunctionData>();
   result->query            = input.inputs[0].ToString();
   result->enable_optimizer = true;
-  result->sirius_iface     = make_uniq<sirius::sirius_interface>(context);
+  result->sirius_iface     = make_uniq<::sirius::sirius_interface>(context);
   if (input.inputs[0].IsNull()) {
     throw BinderException("gpu_execution cannot be called with a NULL parameter");
   }
@@ -382,7 +382,7 @@ unique_ptr<FunctionData> SiriusExtension::GPUExecutionBind(ClientContext& contex
   try {
     auto sirius_physical_plan = SiriusGeneratePhysicalPlan(context, query_plan);
     SIRIUS_LOG_DEBUG("Done generating sirius physical plan");
-    auto gpu_prepared = make_shared_ptr<sirius::sirius_prepared_statement_data>(
+    auto gpu_prepared = make_shared_ptr<::sirius::sirius_prepared_statement_data>(
       std::move(prepared), std::move(sirius_physical_plan));
     result->gpu_prepared = gpu_prepared;
   } catch (std::exception& e) {

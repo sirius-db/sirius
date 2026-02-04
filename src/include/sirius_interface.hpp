@@ -47,7 +47,7 @@ struct sirius_active_query_context {
   duckdb::unique_ptr<duckdb::ProgressBar> progress_bar;
 
  public:
-  //! Set the open result 
+  //! Set the open result
   void set_open_result(duckdb::BaseQueryResult& result) { open_result = &result; }
   //! Check if the result is open
   bool is_open_result(duckdb::BaseQueryResult& result) { return open_result == &result; }
@@ -71,7 +71,8 @@ class sirius_interface {
   //! Check if the pending query result is executable
   void check_executable_internal(duckdb::PendingQueryResult& pending);
   //! Fetch the result from the pending query result
-  duckdb::unique_ptr<duckdb::QueryResult> fetch_result_internal(duckdb::PendingQueryResult& pending);
+  duckdb::unique_ptr<duckdb::QueryResult> fetch_result_internal(
+    duckdb::PendingQueryResult& pending);
   //! Cleanup the query result
   void cleanup_internal(duckdb::BaseQueryResult* result, bool invalidate_transaction);
   //! Begin the query
@@ -82,7 +83,8 @@ class sirius_interface {
   void sirius_process_error(duckdb::ErrorData& error, const duckdb::string& query) const;
   //! Create the error result
   template <class T>
-  duckdb::unique_ptr<T> sirius_error_result(duckdb::ErrorData error, const duckdb::string& query = duckdb::string());
+  duckdb::unique_ptr<T> sirius_error_result(duckdb::ErrorData error,
+                                            const duckdb::string& query = duckdb::string());
   //! Create the pending statement internal
   duckdb::unique_ptr<duckdb::PendingQueryResult> sirius_pending_statement_internal(
     duckdb::ClientContext& context,
@@ -95,12 +97,14 @@ class sirius_interface {
     duckdb::shared_ptr<sirius_prepared_statement_data>& statement_p,
     const duckdb::PendingQueryParameters& parameters);
   //! Execute the query
-  duckdb::unique_ptr<duckdb::QueryResult> sirius_execute_query(duckdb::ClientContext& context,
-                                             const duckdb::string& query,
-                                             duckdb::shared_ptr<sirius_prepared_statement_data>& statement_p,
-                                             const duckdb::PendingQueryParameters& parameters);
+  duckdb::unique_ptr<duckdb::QueryResult> sirius_execute_query(
+    duckdb::ClientContext& context,
+    const duckdb::string& query,
+    duckdb::shared_ptr<sirius_prepared_statement_data>& statement_p,
+    const duckdb::PendingQueryParameters& parameters);
   //! Execute the pending query result
-  duckdb::unique_ptr<duckdb::QueryResult> sirius_execute_pending_query_result(duckdb::PendingQueryResult& pending);
+  duckdb::unique_ptr<duckdb::QueryResult> sirius_execute_pending_query_result(
+    duckdb::PendingQueryResult& pending);
   //! Get the sirius engine
   sirius_engine& get_sirius_engine();
 };
