@@ -41,18 +41,19 @@ namespace {
 using namespace sirius::test::operator_utils;
 }  // namespace
 
-TEMPLATE_TEST_CASE("sirius_physical_table_scan applies filters on data_batch for multiple numeric types",
-                   "[physical_table_scan]",
-                   int32_t,
-                   int64_t,
-                   float,
-                   double,
-                   int16_t,
-                   bool,
-                   decimal64_tag,
-                   string_tag,
-                   timestamp_us_tag,
-                   date32_tag)
+TEMPLATE_TEST_CASE(
+  "sirius_physical_table_scan applies filters on data_batch for multiple numeric types",
+  "[physical_table_scan]",
+  int32_t,
+  int64_t,
+  float,
+  double,
+  int16_t,
+  bool,
+  decimal64_tag,
+  string_tag,
+  timestamp_us_tag,
+  date32_tag)
 {
   using Traits = gpu_type_traits<TestType>;
 
@@ -85,19 +86,18 @@ TEMPLATE_TEST_CASE("sirius_physical_table_scan applies filters on data_batch for
   }
 
   // Create table filter set with a filter on first column (filter_vals > 3)
-  auto table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
+  auto table_filters   = duckdb::make_uniq<duckdb::TableFilterSet>();
   auto constant_filter = duckdb::make_uniq<duckdb::ConstantFilter>(
-    duckdb::ExpressionType::COMPARE_GREATERTHAN,
-    duckdb::Value::BIGINT(3));
+    duckdb::ExpressionType::COMPARE_GREATERTHAN, duckdb::Value::BIGINT(3));
   table_filters->PushFilter(duckdb::ColumnIndex(0), std::move(constant_filter));
 
   // Setup types for the table scan
   duckdb::vector<duckdb::LogicalType> types;
   types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));  // filter column
-  types.push_back(Traits::logical_type());                               // data column
+  types.push_back(Traits::logical_type());                              // data column
 
   duckdb::vector<duckdb::LogicalType> returned_types = types;
-  
+
   duckdb::vector<duckdb::ColumnIndex> column_ids;
   column_ids.push_back(duckdb::ColumnIndex(0));
   column_ids.push_back(duckdb::ColumnIndex(1));
@@ -112,20 +112,19 @@ TEMPLATE_TEST_CASE("sirius_physical_table_scan applies filters on data_batch for
 
   // Create a minimal table function (not used in this test but required by constructor)
   duckdb::TableFunction table_function("test_scan", {}, nullptr, nullptr);
-  
-  sirius_physical_table_scan table_scan(
-    std::move(types),
-    std::move(table_function),
-    nullptr,  // bind_data
-    std::move(returned_types),
-    std::move(column_ids),
-    std::move(projection_ids),
-    std::move(names),
-    std::move(table_filters),
-    filter_vals.size(),
-    duckdb::ExtraOperatorInfo(),
-    std::move(parameters),
-    std::move(virtual_columns));
+
+  sirius_physical_table_scan table_scan(std::move(types),
+                                        std::move(table_function),
+                                        nullptr,  // bind_data
+                                        std::move(returned_types),
+                                        std::move(column_ids),
+                                        std::move(projection_ids),
+                                        std::move(names),
+                                        std::move(table_filters),
+                                        filter_vals.size(),
+                                        duckdb::ExtraOperatorInfo(),
+                                        std::move(parameters),
+                                        std::move(virtual_columns));
 
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
   auto outputs = table_scan.execute(inputs);
@@ -171,7 +170,7 @@ TEST_CASE("sirius_physical_table_scan with no filters passes through data", "[ph
   types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER));
 
   duckdb::vector<duckdb::LogicalType> returned_types = types;
-  
+
   duckdb::vector<duckdb::ColumnIndex> column_ids;
   column_ids.push_back(duckdb::ColumnIndex(0));
   column_ids.push_back(duckdb::ColumnIndex(1));
@@ -182,28 +181,27 @@ TEST_CASE("sirius_physical_table_scan with no filters passes through data", "[ph
   duckdb::virtual_column_map_t virtual_columns;
 
   duckdb::TableFunction table_function("test_scan", {}, nullptr, nullptr);
-  
-  sirius_physical_table_scan table_scan(
-    std::move(types),
-    std::move(table_function),
-    nullptr,
-    std::move(returned_types),
-    std::move(column_ids),
-    std::move(projection_ids),
-    std::move(names),
-    std::move(table_filters),
-    col0_vals.size(),
-    duckdb::ExtraOperatorInfo(),
-    std::move(parameters),
-    std::move(virtual_columns));
+
+  sirius_physical_table_scan table_scan(std::move(types),
+                                        std::move(table_function),
+                                        nullptr,
+                                        std::move(returned_types),
+                                        std::move(column_ids),
+                                        std::move(projection_ids),
+                                        std::move(names),
+                                        std::move(table_filters),
+                                        col0_vals.size(),
+                                        duckdb::ExtraOperatorInfo(),
+                                        std::move(parameters),
+                                        std::move(virtual_columns));
 
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
   auto outputs = table_scan.execute(inputs);
-  
+
   REQUIRE(outputs.size() == 1);
   auto output_table = outputs[0]->get_data()->cast<gpu_table_representation>().get_table();
   auto out_view     = output_table.view();
-  
+
   // Verify all data passes through unchanged
   auto host_col0 = copy_column_to_host<int64_t>(out_view.column(0));
   auto host_col1 = copy_column_to_host<int32_t>(out_view.column(1));
@@ -228,15 +226,13 @@ TEST_CASE("sirius_physical_table_scan with multiple filters", "[physical_table_s
   // Create table filter set with filters on both columns
   // col0 > 2 AND col1 <= 30
   auto table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
-  
+
   auto filter0 = duckdb::make_uniq<duckdb::ConstantFilter>(
-    duckdb::ExpressionType::COMPARE_GREATERTHAN,
-    duckdb::Value::BIGINT(2));
+    duckdb::ExpressionType::COMPARE_GREATERTHAN, duckdb::Value::BIGINT(2));
   table_filters->PushFilter(duckdb::ColumnIndex(0), std::move(filter0));
 
   auto filter1 = duckdb::make_uniq<duckdb::ConstantFilter>(
-    duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO,
-    duckdb::Value::INTEGER(30));
+    duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO, duckdb::Value::INTEGER(30));
   table_filters->PushFilter(duckdb::ColumnIndex(1), std::move(filter1));
 
   // Setup types
@@ -245,7 +241,7 @@ TEST_CASE("sirius_physical_table_scan with multiple filters", "[physical_table_s
   types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER));
 
   duckdb::vector<duckdb::LogicalType> returned_types = types;
-  
+
   duckdb::vector<duckdb::ColumnIndex> column_ids;
   column_ids.push_back(duckdb::ColumnIndex(0));
   column_ids.push_back(duckdb::ColumnIndex(1));
@@ -256,28 +252,27 @@ TEST_CASE("sirius_physical_table_scan with multiple filters", "[physical_table_s
   duckdb::virtual_column_map_t virtual_columns;
 
   duckdb::TableFunction table_function("test_scan", {}, nullptr, nullptr);
-  
-  sirius_physical_table_scan table_scan(
-    std::move(types),
-    std::move(table_function),
-    nullptr,
-    std::move(returned_types),
-    std::move(column_ids),
-    std::move(projection_ids),
-    std::move(names),
-    std::move(table_filters),
-    col0_vals.size(),
-    duckdb::ExtraOperatorInfo(),
-    std::move(parameters),
-    std::move(virtual_columns));
+
+  sirius_physical_table_scan table_scan(std::move(types),
+                                        std::move(table_function),
+                                        nullptr,
+                                        std::move(returned_types),
+                                        std::move(column_ids),
+                                        std::move(projection_ids),
+                                        std::move(names),
+                                        std::move(table_filters),
+                                        col0_vals.size(),
+                                        duckdb::ExtraOperatorInfo(),
+                                        std::move(parameters),
+                                        std::move(virtual_columns));
 
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
   auto outputs = table_scan.execute(inputs);
-  
+
   REQUIRE(outputs.size() == 1);
   auto output_table = outputs[0]->get_data()->cast<gpu_table_representation>().get_table();
   auto out_view     = output_table.view();
-  
+
   auto host_col0 = copy_column_to_host<int64_t>(out_view.column(0));
   auto host_col1 = copy_column_to_host<int32_t>(out_view.column(1));
 
@@ -290,64 +285,62 @@ TEST_CASE("sirius_physical_table_scan with multiple filters", "[physical_table_s
   REQUIRE(host_col1 == expected_col1);
 }
 
-// TEST_CASE("sirius_physical_table_scan filters all rows", "[physical_table_scan]")
-// {
-//   auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
-//   auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
-//   REQUIRE(space);
+TEST_CASE("sirius_physical_table_scan filters all rows", "[physical_table_scan]")
+{
+  auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space);
 
-//   // Create a batch
-//   std::vector<int64_t> col0_vals{1, 2, 3};
-//   std::vector<int32_t> col1_vals{10, 20, 30};
+  // Create a batch
+  std::vector<int64_t> col0_vals{1, 2, 3};
+  std::vector<int32_t> col1_vals{10, 20, 30};
 
-//   auto input_batch = make_two_column_batch<int64_t, int32_t>(
-//     *space, col0_vals, col1_vals, cudf::type_id::INT32, std::nullopt);
+  auto input_batch = make_two_column_batch<int64_t, int32_t>(
+    *space, col0_vals, col1_vals, cudf::type_id::INT32, std::nullopt);
 
-//   // Filter that excludes all rows: col0 > 100
-//   auto table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
-//   auto filter = duckdb::make_uniq<duckdb::ConstantFilter>(
-//     duckdb::ExpressionType::COMPARE_GREATERTHAN,
-//     duckdb::Value::BIGINT(100));
-//   table_filters->PushFilter(duckdb::ColumnIndex(0), std::move(filter));
+  // Filter that excludes all rows: col0 > 100
+  auto table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
+  auto filter        = duckdb::make_uniq<duckdb::ConstantFilter>(
+    duckdb::ExpressionType::COMPARE_GREATERTHAN, duckdb::Value::BIGINT(100));
+  table_filters->PushFilter(duckdb::ColumnIndex(0), std::move(filter));
 
-//   // Setup types
-//   duckdb::vector<duckdb::LogicalType> types;
-//   types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));
-//   types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER));
+  // Setup types
+  duckdb::vector<duckdb::LogicalType> types;
+  types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));
+  types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER));
 
-//   duckdb::vector<duckdb::LogicalType> returned_types = types;
-  
-//   duckdb::vector<duckdb::ColumnIndex> column_ids;
-//   column_ids.push_back(duckdb::ColumnIndex(0));
-//   column_ids.push_back(duckdb::ColumnIndex(1));
+  duckdb::vector<duckdb::LogicalType> returned_types = types;
 
-//   duckdb::vector<duckdb::idx_t> projection_ids{0, 1};
-//   duckdb::vector<std::string> names{"col0", "col1"};
-//   duckdb::vector<duckdb::Value> parameters;
-//   duckdb::virtual_column_map_t virtual_columns;
+  duckdb::vector<duckdb::ColumnIndex> column_ids;
+  column_ids.push_back(duckdb::ColumnIndex(0));
+  column_ids.push_back(duckdb::ColumnIndex(1));
 
-//   duckdb::TableFunction table_function("test_scan", {}, nullptr, nullptr);
-  
-//   sirius_physical_table_scan table_scan(
-//     std::move(types),
-//     std::move(table_function),
-//     nullptr,
-//     std::move(returned_types),
-//     std::move(column_ids),
-//     std::move(projection_ids),
-//     std::move(names),
-//     std::move(table_filters),
-//     col0_vals.size(),
-//     duckdb::ExtraOperatorInfo(),
-//     std::move(parameters),
-//     std::move(virtual_columns));
+  duckdb::vector<duckdb::idx_t> projection_ids{0, 1};
+  duckdb::vector<std::string> names{"col0", "col1"};
+  duckdb::vector<duckdb::Value> parameters;
+  duckdb::virtual_column_map_t virtual_columns;
 
-//   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
-//   auto outputs = table_scan.execute(inputs);
-  
-//   REQUIRE(outputs.size() == 1);
-//   auto table = outputs[0]->get_data()->cast<gpu_table_representation>().get_table();
-//   auto view  = table.view();
-//   REQUIRE(view.num_columns() == 2);
-//   REQUIRE(view.num_rows() == 0);
-// }
+  duckdb::TableFunction table_function("test_scan", {}, nullptr, nullptr);
+
+  sirius_physical_table_scan table_scan(std::move(types),
+                                        std::move(table_function),
+                                        nullptr,
+                                        std::move(returned_types),
+                                        std::move(column_ids),
+                                        std::move(projection_ids),
+                                        std::move(names),
+                                        std::move(table_filters),
+                                        col0_vals.size(),
+                                        duckdb::ExtraOperatorInfo(),
+                                        std::move(parameters),
+                                        std::move(virtual_columns));
+
+  std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
+  auto outputs = table_scan.execute(inputs);
+
+  REQUIRE(outputs.size() == 1);
+  auto table = outputs[0]->get_data()->cast<gpu_table_representation>().get_table();
+  auto view  = table.view();
+  REQUIRE(view.num_columns() == 2);
+  REQUIRE(view.num_rows() == 0);
+}

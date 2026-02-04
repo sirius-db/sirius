@@ -91,9 +91,10 @@ sirius_physical_table_scan::sirius_physical_table_scan(
   SIRIUS_LOG_DEBUG("Table scan column ids: {}", column_ids.size());
 }
 
-duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(const duckdb::TableFilterSet& filters,
-                                                       const duckdb::vector<duckdb::ColumnIndex>& column_ids,
-                                                       const duckdb::vector<duckdb::LogicalType>& returned_types)
+duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
+  const duckdb::TableFilterSet& filters,
+  const duckdb::vector<duckdb::ColumnIndex>& column_ids,
+  const duckdb::vector<duckdb::LogicalType>& returned_types)
 {
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> filter_expressions;
 
@@ -119,7 +120,8 @@ duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(const
   if (filter_expressions.size() == 1) { return std::move(filter_expressions[0]); }
 
   // Multiple filters - wrap in CONJUNCTION_AND
-  auto conjunction = duckdb::make_uniq<duckdb::BoundConjunctionExpression>(duckdb::ExpressionType::CONJUNCTION_AND);
+  auto conjunction =
+    duckdb::make_uniq<duckdb::BoundConjunctionExpression>(duckdb::ExpressionType::CONJUNCTION_AND);
   for (auto& expr : filter_expressions) {
     conjunction->children.push_back(std::move(expr));
   }
@@ -131,7 +133,8 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_table_scan::
 {
   auto start = std::chrono::high_resolution_clock::now();
   SIRIUS_LOG_DEBUG("Executing table scan");
-  auto filter_expr = convert_table_filters_to_expression(*table_filters, column_ids, returned_types);
+  auto filter_expr =
+    convert_table_filters_to_expression(*table_filters, column_ids, returned_types);
 
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
   output_batches.reserve(input_batches.size());
@@ -140,6 +143,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_table_scan::
     SIRIUS_LOG_DEBUG("Converted table filters to expression: {}", filter_expr->ToString());
 
     // The executor uses the data_batch API to filter rows according to `expression`.
+
     duckdb::sirius::GpuExpressionExecutor gpu_expression_executor(*filter_expr);
     for (auto const& batch : input_batches) {
       if (!batch) { continue; }
