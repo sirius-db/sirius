@@ -84,7 +84,8 @@ inline void InitGlobalLogger(std::string log_file = "")
   file_sink->set_pattern("[%Y-%m-%d %T.%e] [%l] [%s:%#] %v");
 
   // Logger
-  auto logger    = std::make_shared<spdlog::logger>("", spdlog::sinks_init_list{file_sink});
+  auto logger = std::make_shared<spdlog::logger>("", spdlog::sinks_init_list{file_sink});
+  spdlog::set_default_logger(logger);
   auto log_level = GetLogLevel();
   logger->set_level(log_level);
   auto log_level_str = GetEnvVar("SIRIUS_LOG_LEVEL");
@@ -93,7 +94,6 @@ inline void InitGlobalLogger(std::string log_file = "")
   } else {
     spdlog::flush_every(std::chrono::seconds(SIRIUS_LOG_FLUSH_SEC));
   }
-  spdlog::set_default_logger(logger);
 }
 
 }  // namespace duckdb
