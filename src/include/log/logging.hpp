@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <spdlog/common.h>
 #ifndef SPDLOG_ACTIVE_LEVEL
 #define SPDLOG_ACTIVE_LEVEL SPDLOG_LEVEL_TRACE
 #endif
@@ -86,7 +87,12 @@ inline void InitGlobalLogger(std::string log_file = "")
   auto logger    = std::make_shared<spdlog::logger>("", spdlog::sinks_init_list{file_sink});
   auto log_level = GetLogLevel();
   logger->set_level(log_level);
-  spdlog::flush_every(std::chrono::seconds(SIRIUS_LOG_FLUSH_SEC));
+  auto log_level_str = GetEnvVar("SIRIUS_LOG_LEVEL");
+  if (log_level_str.has_value()) {
+    spdlog::flush_on(log_level);
+  } else {
+    spdlog::flush_every(std::chrono::seconds(SIRIUS_LOG_FLUSH_SEC));
+  }
   spdlog::set_default_logger(logger);
 }
 

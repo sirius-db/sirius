@@ -16,158 +16,116 @@
 
 #include "pipeline/gpu_pipeline_executor.hpp"
 
+#include "creator/task_creator.hpp"
+#include "op/sirius_physical_operator.hpp"
+#include "op/sirius_physical_operator_type.hpp"
+#include "pipeline/completion_handler.hpp"
 #include "pipeline/gpu_pipeline_queue.hpp"
-#include "pipeline/pipeline_executor.hpp"
+#include "pipeline/task_request.hpp"
 
 namespace sirius {
 namespace pipeline {
 
-void local_task_buffer::produce(std::unique_ptr<sirius::parallel::itask> task)
-{
-  {
-    std::lock_guard<std::mutex> lock(_mtx);
-    _queue.push(std::move(task));
-  }
-  _cv.notify_one();  // wake consumer
-}
-
-std::unique_ptr<sirius::parallel::itask> local_task_buffer::consume()
-{
-  std::unique_lock<std::mutex> lock(_mtx);
-  _cv.wait(lock, [&] { return (!_queue.empty()) || !_is_open.load(std::memory_order_acquire); });
-
-  // Check if queue is empty after waking up (happens when closed)
-  if (_queue.empty()) { return nullptr; }
-
-  auto task = std::move(_queue.front());
-  _queue.pop();
-  return std::move(task);
-}
-
-void local_task_buffer::open() { _is_open.store(true, std::memory_order_release); }
-
-void local_task_buffer::close()
-{
-  {
-    std::lock_guard<std::mutex> lock(_mtx);
-    _is_open.store(false, std::memory_order_release);
-    // Clear any remaining tasks in the queue to reset state
-    while (!_queue.empty()) {
-      _queue.pop();
-    }
-  }
-  _cv.notify_all();
-}
-
-gpu_pipeline_executor::gpu_pipeline_executor(sirius::parallel::task_executor_config config,
-                                             const cucascade::memory::memory_space* mem_space,
-                                             pipeline_executor* pipeline_exec)
-  : itask_executor(std::make_unique<gpu_pipeline_queue>(config.num_threads), std::move(config)),
-    _local_task_buffer(std::make_unique<local_task_buffer>()),
-    _memory_space_view(mem_space),
-    _pipeline_exec(pipeline_exec)
+gpu_pipeline_executor::gpu_pipeline_executor(
+  exec::thread_pool_config config,
+  cucascade::memory::memory_space* mem_space,
+  exec::publisher<std::unique_ptr<task_request>> task_request_publisher)
+  : _config(config),
+    _task_request_publisher(std::move(task_request_publisher)),
+    _memory_space(mem_space)
 {
 }
+
+gpu_pipeline_executor::~gpu_pipeline_executor() { stop(); }
 
 void gpu_pipeline_executor::schedule(std::unique_ptr<sirius::parallel::itask> task)
 {
-  _task_queue->push(std::move(task));
-}
-
-void gpu_pipeline_executor::on_start()
-{
-  _task_queue->open();
-  _local_task_buffer->open();
-}
-
-void gpu_pipeline_executor::on_stop()
-{
-  _task_queue->close();
-  _local_task_buffer->close();
+  _task_queue.push(std::move(task));
 }
 
 void gpu_pipeline_executor::start()
 {
   bool expected = false;
   if (!_running.compare_exchange_strong(expected, true)) { return; }
-  on_start();
-  _threads.reserve(_config.num_threads);
-  for (int i = 0; i < _config.num_threads; ++i) {
-    auto& t = _threads.emplace_back(&gpu_pipeline_executor::worker_loop, this, i);
-    if (!_config.cpu_affinity_list.empty()) {
-      cpu_set_t cpuset;
-      CPU_ZERO(&cpuset);
-      for (int core_id : _config.cpu_affinity_list) {
-        CPU_SET(core_id, &cpuset);
-      }
-      pthread_setaffinity_np(t.native_handle(), sizeof(cpu_set_t), &cpuset);
-    }
-  }
-  _gpu_pipeline_executor_manager_thread =
-    std::make_unique<std::thread>(&gpu_pipeline_executor::manager_loop, this);
+  _thread_pool = std::make_unique<exec::thread_pool>(
+    _config.num_threads, _config.thread_name_prefix, _config.cpu_affinity_list);
+  _manager_thread = std::thread(&gpu_pipeline_executor::manager_loop, this);
 }
 
 void gpu_pipeline_executor::stop()
 {
   bool expected = true;
   if (!_running.compare_exchange_strong(expected, false)) { return; }
-  on_stop();
-  for (auto& thread : _threads) {
-    if (thread.joinable()) { thread.join(); }
-  }
-  if (_gpu_pipeline_executor_manager_thread->joinable()) {
-    _gpu_pipeline_executor_manager_thread->join();
-  }
-  _gpu_pipeline_executor_manager_thread.reset();
-  _threads.clear();
-}
-
-void gpu_pipeline_executor::worker_loop(int worker_id)
-{
-  while (true) {
-    if (!_running.load()) {
-      // Executor is stopped.
-      break;
-    }
-    auto task = _task_queue->pull();
-    if (task == nullptr) {
-      // Task queue is closed.
-      break;
-    }
-    try {
-      // TODO:
-      // if reservation hasn't been made, request reservation (blocking)
-      // set stream reservation
-      task->execute();
-      // reset memory resource
-    } catch (const std::exception& e) {
-      on_task_error(worker_id, std::move(task), e);
-    }
-  }
-}
-
-void gpu_pipeline_executor::submit_task_request(std::unique_ptr<task_request> request)
-{
-  _pipeline_exec->submit_task_request(std::move(request));
+  _kiosk.stop();
+  _task_queue.interrupt();
+  if (_manager_thread.joinable()) { _manager_thread.join(); }
+  _kiosk.wait_all();
+  if (_thread_pool) { _thread_pool->stop(); }
 }
 
 void gpu_pipeline_executor::manager_loop()
 {
-  while (true) {
-    if (!_running.load()) {
-      // Executor is stopped.
+  while (_running.load()) {
+    auto ticket = _kiosk.acquire();  // block till a thread is available
+    if (!ticket.is_valid()) {
+      SIRIUS_LOG_INFO("GPU Pipeline Executor: Kiosk interrupted, stopping manager loop");
       break;
     }
-    auto task = _local_task_buffer->consume();
-    if (task == nullptr) {
-      // Task queue is closed.
+    if (!_task_request_publisher.send(
+          std::make_unique<pipeline::task_request>(_memory_space->get_device_id(), false))) {
+      SIRIUS_LOG_INFO("GPU Pipeline Executor: Failed to send task request, channel is closed");
       break;
     }
-    try {
-      schedule(std::move(task));
-    } catch (const std::exception& e) {
-      throw e;
+    auto pipeline_task = _task_queue.pop();  // block till a task is available
+    if (!pipeline_task) {
+      SIRIUS_LOG_INFO("GPU Pipeline Executor: task queue interrupted, stopping manager loop");
+      break;
     }
+    auto* gpu_task   = cast_to_gpu_pipeline_task(pipeline_task.get());
+    auto bytes_needs = gpu_task->get_estimated_reservation_size();
+    auto reservation = _memory_space->make_reservation(bytes_needs);
+    if (!reservation) {
+      SIRIUS_LOG_ERROR("GPU Pipeline Executor: Failed to acquire memory reservation for task {}",
+                       gpu_task->get_task_id());
+      break;
+    }
+    if (auto* local_state = dynamic_cast<sirius::pipeline::sirius_pipeline_itask_local_state*>(
+          gpu_task->local_state())) {
+      local_state->set_reservation(std::move(reservation));
+    } else {
+      SIRIUS_LOG_ERROR("GPU Pipeline Executor: Failed to cast local state for task {}",
+                       gpu_task->get_task_id());
+      break;
+    }
+    auto output_consumers = gpu_task->get_output_consumers();
+    auto* pipeline        = gpu_task->get_pipeline();
+    _thread_pool->schedule([this,
+                            task      = std::move(pipeline_task),
+                            ticket    = std::move(ticket),
+                            consumers = std::move(output_consumers),
+                            pipeline]() mutable {
+      try {
+        task->execute();
+      } catch (...) {
+        if (_completion_handler) { _completion_handler->report_error(std::current_exception()); }
+        return;
+      }
+      task.reset();
+
+      if (_task_creator) {
+        for (auto* consumer : consumers) {
+          _task_creator->schedule(consumer);
+        }
+      }
+
+      // Check if query is complete (sink is RESULT_COLLECTOR and pipeline is finished)
+      if (_completion_handler && pipeline) {
+        auto sink = pipeline->get_sink();
+        if (sink && sink->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
+          if (pipeline->is_pipeline_finished()) { _completion_handler->mark_completed(); }
+        }
+      }
+    });
   }
 }
 
@@ -175,6 +133,18 @@ gpu_pipeline_task* gpu_pipeline_executor::cast_to_gpu_pipeline_task(sirius::para
 {
   // Safely cast to gpu_pipeline_task
   return dynamic_cast<gpu_pipeline_task*>(task);
+}
+
+void gpu_pipeline_executor::set_task_creator(sirius::creator::task_creator* task_creator)
+{
+  _task_creator = task_creator;
+}
+
+void gpu_pipeline_executor::drain_leftover_tasks() { _task_queue.drain(); }
+
+void gpu_pipeline_executor::set_completion_handler(completion_handler* handler) noexcept
+{
+  _completion_handler = handler;
 }
 
 }  // namespace pipeline

@@ -17,6 +17,7 @@
 # include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 
 set(TEST_SOURCES
-    ${TEST_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/test_pipeline_executor.cpp
+    ${TEST_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/test_gpu_pipeline_executor.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_pipeline_executor.cpp
     # ${CMAKE_CURRENT_SOURCE_DIR}/test_modified_pipeline.cpp
     PARENT_SCOPE)

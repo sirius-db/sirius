@@ -14,8 +14,17 @@
  * limitations under the License.
  */
 
-#include "creator/downgrade_task_creator.hpp"
+#pragma once
 
-namespace sirius {
+#include <string>
+#include <vector>
 
-}  // namespace sirius
+namespace sirius::exec {
+
+struct thread_pool_config {
+  int num_threads{0};
+  std::string thread_name_prefix{"thread"};
+  std::vector<int> cpu_affinity_list;
+};
+
+}  // namespace sirius::exec

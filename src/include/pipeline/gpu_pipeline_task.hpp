@@ -19,6 +19,8 @@
 #include "config.hpp"
 #include "parallel/task_executor.hpp"
 #include "pipeline/sirius_pipeline.hpp"
+#include "pipeline/sirius_pipeline_itask.hpp"
+#include "pipeline/sirius_pipeline_itask_local_state.hpp"
 
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
@@ -61,7 +63,7 @@ class gpu_pipeline_task_global_state : public sirius::parallel::itask_global_sta
  * execution. It holds the task and pipeline identifiers, the GPU pipeline to
  * execute, and the data batch views that serve as input to the pipeline.
  */
-class gpu_pipeline_task_local_state : public sirius::parallel::itask_local_state {
+class gpu_pipeline_task_local_state : public sirius_pipeline_itask_local_state {
  public:
   /**
    * @brief Construct a new gpu_pipeline_task_local_state object
@@ -70,27 +72,21 @@ class gpu_pipeline_task_local_state : public sirius::parallel::itask_local_state
    * @param res Memory reservation for GPU resources
    */
   explicit gpu_pipeline_task_local_state(
-    std::vector<std::shared_ptr<cucascade::data_batch>> batches,
-    std::unique_ptr<cucascade::memory::reservation> res = nullptr)
-    : _batches(std::move(batches)), _reservation(std::move(res))
+    std::vector<std::shared_ptr<cucascade::data_batch>> batches)
+    : _batches(std::move(batches))
   {
   }
 
   std::vector<std::shared_ptr<cucascade::data_batch>>
     _batches;  ///< Input data batches for the pipeline
 
-  void set_reservation(std::unique_ptr<cucascade::memory::reservation> res)
-  {
-    _reservation = std::move(res);
-  }
-
+  /**
+   * @brief Get a const pointer to the reservation (non-owning).
+   *
+   * @return const cucascade::memory::reservation* Pointer to the reservation, or nullptr
+   */
+  // WSM TODO: remove this method?
   const cucascade::memory::reservation* get_reservation() const { return _reservation.get(); }
-
- private:
-  std::unique_ptr<cucascade::memory::reservation>
-    _reservation;  ///< Memory reservation for GPU resources
-  // TODO: for now, reservation is passed as a local state, will be null when the task is first
-  // created, and will be set when reservation is made
 };
 
 /**
@@ -103,7 +99,7 @@ class gpu_pipeline_task_local_state : public sirius::parallel::itask_local_state
  * Note that this class will be further derived to represent specific types of tasks such as build,
  * aggregation, etc..
  */
-class gpu_pipeline_task : public sirius::parallel::itask {
+class gpu_pipeline_task : public sirius_pipeline_itask {
  public:
   /**
    * @brief Construct a new gpu_pipeline_task object
@@ -115,8 +111,10 @@ class gpu_pipeline_task : public sirius::parallel::itask {
    */
   gpu_pipeline_task(uint64_t task_id,
                     std::vector<cucascade::shared_data_repository*> data_repos,
-                    std::unique_ptr<sirius::parallel::itask_local_state> local_state,
+                    std::unique_ptr<sirius_pipeline_itask_local_state> local_state,
                     std::shared_ptr<sirius::parallel::itask_global_state> global_state);
+
+  ~gpu_pipeline_task() override;
 
   /**
    * @brief Method to actually execute the task
@@ -136,6 +134,36 @@ class gpu_pipeline_task : public sirius::parallel::itask {
    * @return const duckdb::sirius_pipeline* Pointer to the GPU pipeline
    */
   const sirius_pipeline* get_pipeline() const;
+
+  /**
+   * @brief Compute and return the output data batches for this task.
+   *
+   * Executes the GPU pipeline on the input batches and returns the computed results.
+   *
+   * @return std::vector<std::shared_ptr<cucascade::data_batch>> The computed output batches
+   */
+  std::vector<std::shared_ptr<cucascade::data_batch>> compute_task() override;
+
+  /**
+   * @brief Publish the computed output batches to data repositories.
+   *
+   * Pushes the output batches to the configured data repositories.
+   *
+   * @param output_batches The data batches to publish
+   */
+  void publish_output(std::vector<std::shared_ptr<cucascade::data_batch>> output_batches) override;
+
+  /**
+   * @brief Get the input size for this task
+   *
+   * @return std::size_t The input size
+   */
+  std::size_t get_input_size() const;
+
+  std::size_t get_estimated_reservation_size() const override;
+
+  /// @brief Get the output consumer operators for this task.
+  std::vector<op::sirius_physical_operator*> get_output_consumers() override;
 
  private:
   uint64_t _task_id;

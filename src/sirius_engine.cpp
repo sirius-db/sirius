@@ -44,8 +44,6 @@
 #include <cucascade/data/data_repository_manager.hpp>
 #include <stdio.h>
 
-#include <iostream>
-
 namespace sirius {
 
 void sirius_engine::reset()
@@ -166,18 +164,20 @@ void sirius_engine::execute()
     throw duckdb::InvalidInputException("Sirius context is not initialized.");
   }
 
-  auto& task_creator = sirius_ctx->get_task_creator();
-  printf("Task Creator get next task id: %lu\n", task_creator.get_next_task_id());
-  if (!new_scheduled.empty()) {
-    sirius_pipeline_hashmap pipeline_map(new_scheduled);
-    task_creator.set_pipeline_hashmap(pipeline_map);
-    task_creator.set_client_context(context);
-    task_creator.start();
-    auto& duckdb_scan_executor = sirius_ctx->get_duckdb_scan_executor();
-    duckdb_scan_executor.start();
-    auto& pipeline_executor = sirius_ctx->get_pipeline_executor();
-    pipeline_executor.start();
-    while (!new_scheduled.front().get()->is_pipeline_finished()) {}
+  // Create the query with the pipeline hashmap
+  sirius_pipeline_hashmap pipeline_map(new_scheduled);
+  sirius_ctx->create_query(std::move(pipeline_map));
+  auto future = sirius_ctx->get_pipeline_executor().start_query();
+  try {
+    future.get();
+  } catch (const std::exception& e) {
+    /// todo(bobbi) we should handle the error properly, clean the query context and then return the
+    /// error to duckdb
+    SIRIUS_LOG_ERROR("Error executing query: {}", e.what());
+    throw;
+  } catch (...) {
+    SIRIUS_LOG_ERROR("Unknown error executing query");
+    throw;
   }
 }
 
