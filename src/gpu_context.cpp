@@ -381,19 +381,13 @@ unique_ptr<QueryResult> GPUContext::SiriusFetchResultInternal(PendingQueryResult
   D_ASSERT(gpu_active_query->sirius_prepared->prepared);
   auto& engine   = GetSiriusEngine();
   auto& prepared = *gpu_active_query->sirius_prepared->prepared;
-  // bool create_stream_result = prepared.properties.allow_stream_result &&
-  // pending->allow_stream_result;
   unique_ptr<QueryResult> result;
   D_ASSERT(engine.has_result_collector());
-  // we have a result collector - fetch the result directly from the result collector
-  // SIRIUS_LOG_DEBUG("Getting result");
+  if (!engine.has_result_collector()) {
+    throw InvalidInputException("Engine does not have a result collector");
+  }
   result = engine.get_result();
-  // SIRIUS_LOG_DEBUG("Fetching result");
-  // if (!create_stream_result) {
   CleanupInternal(result.get(), false);
-  // } else {
-  // 	active_query->SetOpenResult(*result);
-  // }
   return result;
 }
 

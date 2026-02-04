@@ -129,7 +129,7 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
 
 void SiriusContext::terminate()
 {
-  thorw_if_not_initialized();
+  throw_if_not_initialized();
 
   memory_manager_->shutdown();
   memory_manager_.reset();
@@ -139,84 +139,84 @@ void SiriusContext::terminate()
 
 sirius::memory::sirius_memory_reservation_manager& SiriusContext::get_memory_manager()
 {
-  thorw_if_not_initialized();
+  throw_if_not_initialized();
   return *memory_manager_;
 }
 
 const sirius::memory::sirius_memory_reservation_manager& SiriusContext::get_memory_manager() const
 {
-  thorw_if_not_initialized();
+  throw_if_not_initialized();
   return *memory_manager_;
 }
 
 cucascade::shared_data_repository_manager& SiriusContext::get_data_repository_manager()
 {
-  thorw_if_not_initialized();
+  throw_if_not_initialized();
   return *data_repository_manager_;
 }
 
 const cucascade::shared_data_repository_manager& SiriusContext::get_data_repository_manager() const
 {
-  thorw_if_not_initialized();
+  throw_if_not_initialized();
   return *data_repository_manager_;
 }
 
 sirius::pipeline::pipeline_executor& SiriusContext::get_pipeline_executor()
 {
-  thorw_if_not_initialized();
+  throw_if_not_initialized();
   return *pipeline_executor_;
 }
 
 const sirius::pipeline::pipeline_executor& SiriusContext::get_pipeline_executor() const
 {
-  thorw_if_not_initialized();
+  throw_if_not_initialized();
   return *pipeline_executor_;
 }
 
 sirius::parallel::downgrade_executor& SiriusContext::get_downgrade_executor()
 {
-  thorw_if_not_initialized();
+  throw_if_not_initialized();
   return *downgrade_executor_;
 }
 
 const sirius::parallel::downgrade_executor& SiriusContext::get_downgrade_executor() const
 {
-  thorw_if_not_initialized();
+  throw_if_not_initialized();
   return *downgrade_executor_;
 }
 
 sirius::creator::task_creator& SiriusContext::get_task_creator()
 {
-  thorw_if_not_initialized();
+  throw_if_not_initialized();
   return *task_creator_;
 }
 
 const sirius::creator::task_creator& SiriusContext::get_task_creator() const
 {
-  thorw_if_not_initialized();
+  throw_if_not_initialized();
   return *task_creator_;
 }
 
 void SiriusContext::create_query(sirius::sirius_pipeline_hashmap pipeline_hashmap)
 {
-  thorw_if_not_initialized();
+  throw_if_not_initialized();
   query_ = duckdb::make_shared_ptr<sirius::planner::query>(std::move(pipeline_hashmap));
   pipeline_executor_->prepare_for_query(query_);
 }
 
 duckdb::shared_ptr<sirius::planner::query> SiriusContext::get_query()
 {
-  thorw_if_not_initialized();
+  throw_if_not_initialized();
   return query_;
 }
 
 duckdb::shared_ptr<const sirius::planner::query> SiriusContext::get_query() const
 {
-  thorw_if_not_initialized();
+  throw_if_not_initialized();
   return query_;
 }
 
-void SiriusContext::thorw_if_not_initialized() const
+void SiriusContext::throw_if_not_initialized() const
 {
   if (!is_initialized_) { throw std::runtime_error("Sirius context is not initialized."); }
 }
