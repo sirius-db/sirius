@@ -27,12 +27,12 @@
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/operator/list.hpp"
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
+#include "log/logging.hpp"
 
 namespace sirius::planner {
 
-sirius_physical_plan_generator::sirius_physical_plan_generator(duckdb::ClientContext& context,
-                                                               duckdb::GPUContext& gpu_context)
-  : context(context), gpu_context(gpu_context)
+sirius_physical_plan_generator::sirius_physical_plan_generator(duckdb::ClientContext& context)
+  : context(context)
 {
 }
 
@@ -113,6 +113,8 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan(duckdb::LogicalOperator& op)
 {
+  SIRIUS_LOG_DEBUG("Creating sirius physical plan for logical operator type: {}",
+                   duckdb::LogicalOperatorToString(op.type));
   op.estimated_cardinality                                      = op.EstimateCardinality(context);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan = nullptr;
 

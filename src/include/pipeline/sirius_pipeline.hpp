@@ -106,7 +106,7 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   // duckdb::vector<duckdb::const_reference<op::sirius_physical_operator>> get_all_operators()
   // const;
 
-  //! Returns a list of all inner operators (excluding source and sink) involved in this pipeline
+  //! Returns a list of all operators (including source and sink) involved in this pipeline
   duckdb::vector<duckdb::reference<op::sirius_physical_operator>> get_operators();
 
   duckdb::optional_ptr<op::sirius_physical_operator> get_sink() { return sink; }
