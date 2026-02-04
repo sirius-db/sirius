@@ -180,7 +180,8 @@ void duckdb_scan_executor::manager_loop()
 
     // Make host memory reservation and set it on the local state
     auto* scan_task = dynamic_cast<sirius::op::scan::duckdb_scan_task*>(task.get());
-    if (scan_task) {
+    // todo (amin): fix this later, and make the reservation in the executor.
+    if (scan_task and false) {
       auto bytes_needed = scan_task->get_estimated_reservation_size();
       auto reservation  = _mem_mgr->request_reservation(
         cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::HOST}, bytes_needed);
