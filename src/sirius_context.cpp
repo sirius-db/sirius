@@ -120,6 +120,8 @@ void SiriusContext::initialize(const sirius::sirius_config& config)
                                                                   *memory_manager_);
   task_creator_->set_pipeline_executor(*pipeline_executor_);
   pipeline_executor_->set_task_creator(*task_creator_);
+  task_creator_->start_thread_pool();
+  pipeline_executor_->start();
 
   // Configure scan caching based on config
   pipeline_executor_->set_scan_caching_enabled(config_.is_scan_caching_enabled());
