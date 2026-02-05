@@ -44,6 +44,9 @@ class sirius_physical_result_collector : public sirius_physical_operator {
  public:
   explicit sirius_physical_result_collector(::sirius::sirius_prepared_statement_data& data);
 
+  std::vector<std::shared_ptr<cucascade::data_batch>> execute(
+    const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches) override;
+
   duckdb::StatementType statement_type;
   duckdb::StatementProperties properties;
   sirius_physical_operator& plan;

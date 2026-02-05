@@ -53,6 +53,12 @@ sirius_physical_result_collector::sirius_physical_result_collector(
   this->types = data.prepared->types;
 }
 
+std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_result_collector::execute(
+  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches)
+{
+  return input_batches;
+}
+
 duckdb::vector<duckdb::const_reference<sirius_physical_operator>>
 sirius_physical_result_collector::get_children() const
 {
