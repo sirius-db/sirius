@@ -12,8 +12,12 @@ import os
 from pathlib import Path
 
 
-def generate_tpch_data(scale_factor: float, output_dir: str = "tpch_data",
-                       format: str = "parquet", db_file: str = None):
+def generate_tpch_data(
+    scale_factor: float,
+    output_dir: str = "tpch_data",
+    format: str = "parquet",
+    db_file: str = None,
+):
     """
     Generate TPC-H data using DuckDB's built-in TPC-H extension.
 
@@ -26,14 +30,14 @@ def generate_tpch_data(scale_factor: float, output_dir: str = "tpch_data",
 
     # TPC-H table names
     tables = [
-        'customer',
-        'lineitem',
-        'nation',
-        'orders',
-        'part',
-        'partsupp',
-        'region',
-        'supplier'
+        "customer",
+        "lineitem",
+        "nation",
+        "orders",
+        "part",
+        "partsupp",
+        "region",
+        "supplier",
     ]
 
     if format == "parquet":
@@ -58,14 +62,18 @@ def generate_tpch_data(scale_factor: float, output_dir: str = "tpch_data",
             output_file = os.path.join(output_dir, f"{table}.parquet")
 
             # Export table to parquet
-            conn.execute(f"""
+            conn.execute(
+                f"""
                 COPY {table}
                 TO '{output_file}'
                 (FORMAT PARQUET, COMPRESSION 'SNAPPY')
-            """)
+            """
+            )
 
             # Get row count
-            result = conn.execute(f"SELECT COUNT(*) FROM read_parquet('{output_file}')").fetchone()
+            result = conn.execute(
+                f"SELECT COUNT(*) FROM read_parquet('{output_file}')"
+            ).fetchone()
             print(f"  → {result[0]:,} rows written to {output_file}")
 
         conn.close()
@@ -125,7 +133,7 @@ Common scale factors:
   1     - ~1GB
   10    - ~10GB
   100   - ~100GB
-        """
+        """,
     )
 
     parser.add_argument(
@@ -133,7 +141,7 @@ Common scale factors:
         "-sf",
         type=float,
         required=True,
-        help="TPC-H scale factor (e.g., 0.01, 0.1, 1, 10, 100)"
+        help="TPC-H scale factor (e.g., 0.01, 0.1, 1, 10, 100)",
     )
 
     parser.add_argument(
@@ -141,7 +149,7 @@ Common scale factors:
         "-o",
         type=str,
         default="tpch_data",
-        help="Output directory for Parquet files (default: tpch_data)"
+        help="Output directory for Parquet files (default: tpch_data)",
     )
 
     parser.add_argument(
@@ -150,13 +158,13 @@ Common scale factors:
         type=str,
         choices=["parquet", "database"],
         default="parquet",
-        help="Output format: 'parquet' for separate files or 'database' for DuckDB database (default: parquet)"
+        help="Output format: 'parquet' for separate files or 'database' for DuckDB database (default: parquet)",
     )
 
     parser.add_argument(
         "--db-file",
         type=str,
-        help="Database file path (only for database format, default: tpch_sf{scale_factor}.duckdb)"
+        help="Database file path (only for database format, default: tpch_sf{scale_factor}.duckdb)",
     )
 
     args = parser.parse_args()
@@ -165,7 +173,7 @@ Common scale factors:
         scale_factor=args.scale_factor,
         output_dir=args.output_dir,
         format=args.format,
-        db_file=args.db_file
+        db_file=args.db_file,
     )
 
 
