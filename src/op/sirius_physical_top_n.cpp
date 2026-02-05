@@ -168,7 +168,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_top_n::execu
 
   std::vector<std::shared_ptr<cucascade::data_batch>> outputs;
   std::unique_ptr<cucascade::idata_representation> output_data =
-    std::make_unique<cucascade::gpu_table_representation>(*output_table, *space);
+    std::make_unique<cucascade::gpu_table_representation>(std::move(output_table), *space);
   outputs.push_back(
     std::make_shared<cucascade::data_batch>(::sirius::get_next_batch_id(), std::move(output_data)));
   return outputs;
@@ -266,7 +266,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_top_n_merge:
 
   std::vector<std::shared_ptr<cucascade::data_batch>> outputs;
   std::unique_ptr<cucascade::idata_representation> output_data =
-    std::make_unique<cucascade::gpu_table_representation>(*output_table, *space);
+    std::make_unique<cucascade::gpu_table_representation>(std::move(output_table), *space);
   outputs.push_back(
     std::make_shared<cucascade::data_batch>(::sirius::get_next_batch_id(), std::move(output_data)));
   return outputs;

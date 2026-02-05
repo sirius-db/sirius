@@ -425,6 +425,15 @@ std::shared_ptr<cucascade::data_batch> duckdb_scan_task_local_state::make_data_b
 //===----------------------------------------------------------------------===//
 // DuckDB Scan Task
 //===----------------------------------------------------------------------===//
+duckdb_scan_task::~duckdb_scan_task()
+{
+  if (_global_state == nullptr ||
+      _global_state->cast<duckdb_scan_task_global_state>()._pipeline.get() == nullptr) {
+    return;
+  }
+  _global_state->cast<duckdb_scan_task_global_state>()._pipeline.get()->mark_task_completed();
+}
+
 bool duckdb_scan_task::get_next_chunk(duckdb_scan_task_local_state& l_state,
                                       duckdb_scan_task_global_state& g_state)
 {

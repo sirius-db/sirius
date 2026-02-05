@@ -102,7 +102,9 @@ class duckdb_scan_task_global_state : public sirius::parallel::itask_global_stat
       auto* scan_op =
         dynamic_cast<sirius_physical_duckdb_scan*>(&_pipeline->get_operators().at(0).get());
 
-      if (scan_op) { scan_op->exhausted.store(true, std::memory_order_release); }
+      if (scan_op) { 
+        scan_op->exhausted.store(true, std::memory_order_release); 
+      }
     }
   }
 
@@ -405,6 +407,9 @@ class duckdb_scan_task : public sirius::pipeline::sirius_pipeline_itask {
     : sirius::pipeline::sirius_pipeline_itask(std::move(l_state), g_state),
       _task_id(task_id),
       _data_repo(data_repo) {};
+
+  //===----------Destructor----------===//
+  ~duckdb_scan_task();
 
   void execute() override;
 

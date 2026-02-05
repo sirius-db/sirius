@@ -125,7 +125,7 @@ std::shared_ptr<data_batch> make_input_batch(
   auto mr    = get_resource_ref(space);
   auto table = ::sirius::create_cudf_table_with_random_data(
     128, column_types, ranges, cudf::get_default_stream(), mr);
-  auto gpu_repr = std::make_unique<gpu_table_representation>(*table, space);
+  auto gpu_repr = std::make_unique<gpu_table_representation>(std::move(table), space);
   auto batch_id = ::sirius::get_next_batch_id();
   return std::make_shared<data_batch>(batch_id, std::move(gpu_repr));
 }
@@ -160,7 +160,7 @@ std::shared_ptr<data_batch> make_int32_batch_with_nulls(memory_space& space,
   cols.push_back(std::move(col));
   auto table = std::make_unique<cudf::table>(std::move(cols));
 
-  auto gpu_repr = std::make_unique<gpu_table_representation>(*table, space);
+  auto gpu_repr = std::make_unique<gpu_table_representation>(std::move(table), space);
   auto batch_id = ::sirius::get_next_batch_id();
   return std::make_shared<data_batch>(batch_id, std::move(gpu_repr));
 }

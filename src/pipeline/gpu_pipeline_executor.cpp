@@ -126,7 +126,9 @@ void gpu_pipeline_executor::manager_loop()
       if (_completion_handler && pipeline) {
         auto sink = pipeline->get_sink();
         if (sink && sink->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
-          if (pipeline->is_pipeline_finished()) { _completion_handler->mark_completed(); }
+          if (pipeline->is_pipeline_finished()) { 
+            _completion_handler->mark_completed(); 
+          }
         }
       }
     });

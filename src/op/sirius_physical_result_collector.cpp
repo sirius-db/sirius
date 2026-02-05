@@ -119,6 +119,7 @@ void sirius_physical_materialized_collector::sink(
 
   auto sink_single_batch = [this](std::shared_ptr<cucascade::data_batch> const& input_batch) {
     auto* data = input_batch->get_data();
+    std::shared_ptr<cucascade::data_batch> clone_batch;
     if (!data) {
       throw duckdb::InvalidInputException(
         "[GPUPhysicalMaterializedCollector] data_batch has no data representation");
@@ -143,7 +144,7 @@ void sirius_physical_materialized_collector::sink(
       auto& mem_space = reservation->get_memory_space();
       auto& data_repo_mgr = sirius_ctx->get_data_repository_manager();
       auto next_batch_id = data_repo_mgr.get_next_data_batch_id();
-      auto clone_batch = input_batch->clone(next_batch_id);
+      clone_batch = input_batch->clone(next_batch_id);
       clone_batch->convert_to<cucascade::host_table_representation>(
         registry, &mem_space, rmm::cuda_stream_default);
       data = clone_batch->get_data();
