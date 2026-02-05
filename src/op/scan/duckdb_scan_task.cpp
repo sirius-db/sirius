@@ -15,6 +15,8 @@
  */
 
 // sirius
+#include "cucascade/memory/memory_space.hpp"
+
 #include <data/data_batch_utils.hpp>
 #include <helper/utils.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
@@ -298,6 +300,7 @@ duckdb_scan_task_local_state::duckdb_scan_task_local_state(
 
   // Make the allocation
   auto& mem_space = _reservation->get_memory_space();
+  _host_space     = const_cast<cucascade::memory::memory_space*>(&mem_space);
   auto* allocator =
     mem_space.get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>();
   if (allocator == nullptr) {

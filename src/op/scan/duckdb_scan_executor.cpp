@@ -196,9 +196,6 @@ void duckdb_scan_executor::manager_loop()
         SIRIUS_LOG_ERROR("DuckDB Scan Executor: Failed to cast local state for task");
         break;
       }
-    } else {
-      SIRIUS_LOG_ERROR("DuckDB Scan Executor: Failed to cast task to scan task");
-      break;
     }
 
     _thread_pool->schedule([this,

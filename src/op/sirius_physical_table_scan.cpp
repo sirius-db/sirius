@@ -133,13 +133,15 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_table_scan::
 {
   auto start = std::chrono::high_resolution_clock::now();
   SIRIUS_LOG_DEBUG("Executing table scan");
-  auto filter_expr =
-    convert_table_filters_to_expression(*table_filters, column_ids, returned_types);
+  duckdb::unique_ptr<duckdb::Expression> filter_expr;
+  if (table_filters) {
+    filter_expr = convert_table_filters_to_expression(*table_filters, column_ids, returned_types);
+  }
 
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
   output_batches.reserve(input_batches.size());
 
-  if (filter_expr) {
+  if (filter_expr != nullptr) {
     SIRIUS_LOG_DEBUG("Converted table filters to expression: {}", filter_expr->ToString());
 
     // The executor uses the data_batch API to filter rows according to `expression`.

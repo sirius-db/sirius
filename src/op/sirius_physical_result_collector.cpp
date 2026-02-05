@@ -107,6 +107,7 @@ void sirius_physical_materialized_collector::sink(
   using host_table_chunk_reader = ::sirius::op::result::host_table_chunk_reader;
 
   if (input_batches.empty()) {
+    return;  // todo(kevin) we should handle this case properly
     throw duckdb::InvalidInputException("[GPUPhysicalMaterializedCollector] input_batches is null");
   }
 
