@@ -553,19 +553,40 @@ struct configuration_setter {
       std::make_unique<registered_config<T, optional_value_holder<T>>>(name, opt));
   }
 
+  static const libconfig::Setting* safe_lookup(const libconfig::Setting& setting,
+                                               std::string_view path)
+  {
+    const libconfig::Setting* current = &setting;
+    std::string path_str(path);
+    size_t pos = 0;
+
+    while (pos < path_str.length()) {
+      size_t dot_pos = path_str.find('.', pos);
+      std::string component =
+        (dot_pos == std::string::npos) ? path_str.substr(pos) : path_str.substr(pos, dot_pos - pos);
+
+      if (!current->exists(component)) { return nullptr; }
+
+      current = &(*current)[component];
+
+      if (dot_pos == std::string::npos) { break; }
+      pos = dot_pos + 1;
+    }
+
+    return current;
+  }
+
   void apply(const libconfig::Setting& setting)
   {
     std::for_each(configs_.begin(), configs_.end(), [&](auto& setter) {
-      auto path = setter->path();
-      try {
-        const libconfig::Setting& cfg = setting.lookup(path.data());
-        setter->apply(cfg);
-      } catch (const libconfig::SettingNotFoundException&) {
-        if (setter->is_required()) {
-          throw std::invalid_argument(
-            fmt::format("Missing required configuration option: {}", path.data()));
-        }
-        return;
+      auto path                     = setter->path();
+      const libconfig::Setting* cfg = safe_lookup(setting, path);
+
+      if (cfg) {
+        setter->apply(*cfg);
+      } else if (setter->is_required()) {
+        throw std::invalid_argument(
+          fmt::format("Missing required configuration option: {}", path.data()));
       }
     });
   }
