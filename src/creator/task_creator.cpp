@@ -189,7 +189,7 @@ void task_creator::manager_loop()
               std::move(scan_task_local_state),
               _scan_operator_global_state_map[operator_id]);
             pipeline->mark_task_created();  // WSM TODO: this needs to be done atomically
-                                                    // with the task creation
+                                            // with the task creation
             _pipeline_executor->schedule(std::move(scan_task));
             // scheduling pipeline task
           } else {

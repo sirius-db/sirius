@@ -102,9 +102,7 @@ class duckdb_scan_task_global_state : public sirius::parallel::itask_global_stat
       auto* scan_op =
         dynamic_cast<sirius_physical_duckdb_scan*>(&_pipeline->get_operators().at(0).get());
 
-      if (scan_op) { 
-        scan_op->exhausted.store(true, std::memory_order_release); 
-      }
+      if (scan_op) { scan_op->exhausted.store(true, std::memory_order_release); }
     }
   }
 

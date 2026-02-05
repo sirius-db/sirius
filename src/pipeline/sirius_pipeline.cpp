@@ -264,9 +264,11 @@ sirius_pipeline_build_state::get_pipeline_operators(sirius_pipeline& pipeline)
   return pipeline.operators;
 }
 
-bool sirius_pipeline::is_pipeline_finished() const { 
-  // todo (amin): there is a potential race condition between scan executor and gpu pipeline executor
-  return pipeline_finished.load(); 
+bool sirius_pipeline::is_pipeline_finished() const
+{
+  // todo (amin): there is a potential race condition between scan executor and gpu pipeline
+  // executor
+  return pipeline_finished.load();
 }
 
 void sirius_pipeline::update_pipeline_status()
