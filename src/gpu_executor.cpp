@@ -91,9 +91,8 @@ void GPUExecutor::Execute()
 
   SIRIUS_LOG_DEBUG("Total meta pipelines {}", scheduled.size());
 
-  for (int pipeline_idx = 0; pipeline_idx < scheduled.size(); pipeline_idx++) {
-    auto pipeline = scheduled[pipeline_idx];
-    SIRIUS_LOG_DEBUG("Executing pipeline {}", pipeline_idx);
+  for (const auto& pipeline : scheduled) {
+    SIRIUS_LOG_DEBUG("Executing pipeline (Source Operator ID: {})", pipeline->source->operator_id);
 
     // TODO: This is temporary solution
     // if (pipeline->source->type == PhysicalOperatorType::HASH_JOIN || pipeline->source->type ==
@@ -138,8 +137,8 @@ void GPUExecutor::Execute()
     // pipeline->Reset();
     // auto prop = pipeline->executor.context.GetClientProperties();
     // SIRIUS_LOG_DEBUG("Properties: {}", prop.time_zone);
-    auto is_empty         = pipeline->operators.empty();
-    auto& source_relation = is_empty ? final_relation : intermediate_relations[0];
+    auto& source_relation =
+      pipeline->operators.empty() ? final_relation : intermediate_relations[0];
     // auto source_result = FetchFromSource(source_chunk);
 
     // StartOperator(*pipeline.source);
@@ -358,4 +357,4 @@ unique_ptr<QueryResult> GPUExecutor::GetResult()
   return res;
 }
 
-};  // namespace duckdb
+}  // namespace duckdb

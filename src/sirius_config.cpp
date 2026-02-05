@@ -209,7 +209,7 @@ struct sirius::config::custom_config_registrar<sirius::disk_mem_config> {
 sirius_config::sirius_config()
 {
   cucascade::memory::topology_discovery discovery;
-  if (discovery.discover()) { hw_topology_ = discovery.get_topology(); }
+  if (discovery.discover()) { _hw_topology = discovery.get_topology(); }
 }
 
 void sirius_config::load_from_file(const std::filesystem::path& config_path)
@@ -269,7 +269,7 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
     gpu_memory_config_instance.setup_configurator(builder);
     host_memory_config_instance.setup_configurator(builder);
     disk_memory_config_instance.setup_configurator(builder);
-    _memory_space_configs = builder.build(hw_topology_);
+    _memory_space_configs = builder.build(_hw_topology);
   }
 }
 

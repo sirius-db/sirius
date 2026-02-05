@@ -38,7 +38,7 @@ struct sirius_config {
 
   [[nodiscard]] const cucascade::memory::system_topology_info& get_hw_topology() const noexcept
   {
-    return hw_topology_;
+    return _hw_topology;
   }
 
   [[nodiscard]] const std::vector<cucascade::memory::memory_space_config>&
@@ -55,7 +55,7 @@ struct sirius_config {
   [[nodiscard]] bool is_scan_caching_enabled() const noexcept { return enable_scan_caching_; }
 
  private:
-  cucascade::memory::system_topology_info hw_topology_;
+  cucascade::memory::system_topology_info _hw_topology;
   std::vector<cucascade::memory::memory_space_config> _memory_space_configs;
   exec::thread_pool_config _task_creator_config{.num_threads        = 2,
                                                 .thread_name_prefix = "task_creator"};

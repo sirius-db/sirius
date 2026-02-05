@@ -331,12 +331,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
       // Store original dependencies to preserve them
       auto original_dependencies = current_pipeline->dependencies;
 
-      bool scan_source = false;
       if (current_pipeline->source->type == op::SiriusPhysicalOperatorType::TABLE_SCAN) {
-        scan_source = true;
-      }
-
-      if (scan_source) {
         auto new_pipeline = duckdb::make_shared_ptr<pipeline::sirius_pipeline>(*this);
         auto scan_op      = current_pipeline->get_source();
         auto new_scan_op  = construct_sirius_specific_operator(scan_op.get());
@@ -919,4 +914,4 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
   }
 }
 
-};  // namespace sirius
+}  // namespace sirius

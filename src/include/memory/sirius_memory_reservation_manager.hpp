@@ -39,5 +39,5 @@ class sirius_memory_reservation_manager : public cucascade::memory::memory_reser
   std::unique_ptr<rmm::mr::device_memory_resource> sirius_device_memory_resource_;
 };
 
-};  // namespace memory
+}  // namespace memory
 }  // namespace sirius
