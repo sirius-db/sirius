@@ -218,7 +218,7 @@ void task_creator::manager_loop()
                 get_next_task_id(),
                 destination_data_repositories,
                 std::move(local_state),
-                std::move(_gpu_operator_global_state_map[operator_id]));
+                _gpu_operator_global_state_map[operator_id]);
               _pipeline_executor->schedule(std::move(task));
             }
           }
