@@ -174,7 +174,7 @@ struct ComparisonDispatcher {
 
     // Resolve the children 
     // DuckDB sometimes moves constants to the right comparator. 
-    // Even though this does not always happen, this file is based on the priciple that DuckDB always
+    // Even though this does not always happen, this file is based on the principle that DuckDB always
     // puts the constant on the right side. Therefore, if the left side is a constant, we swap the 
     // children.
 
