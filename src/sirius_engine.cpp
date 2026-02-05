@@ -742,6 +742,19 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
       }
     }
 
+    // Assign pipeline IDs based on new_scheduled order
+    for (size_t i = 0; i < new_scheduled.size(); i++) {
+      new_scheduled[i]->set_pipeline_id(i);
+      new_scheduled[i]->operators.push_back(*new_scheduled[i]->sink);
+      new_scheduled[i]->source = &new_scheduled[i]->operators[0].get();
+      new_scheduled[i]->parents.clear();
+      auto& first_op = new_scheduled[i]->operators[0].get();
+      // iterate through ports at first_op
+      for (auto port_id : first_op.get_port_ids()) {
+        new_scheduled[i]->parents.push_back(first_op.get_port(port_id)->src_pipeline);
+      }
+    }
+
     // Detailed pipeline debugging information
     SIRIUS_LOG_DEBUG("\n=== DETAILED PIPELINE DEBUG INFO ===");
     for (size_t i = 0; i < new_scheduled.size(); i++) {
@@ -898,19 +911,6 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
     // create invalid operators
     auto invalid_op = make_uniq<op::sirius_physical_operator>(
       op::SiriusPhysicalOperatorType::INVALID, duckdb::vector<duckdb::LogicalType>{}, 0);
-
-    // Assign pipeline IDs based on new_scheduled order
-    for (size_t i = 0; i < new_scheduled.size(); i++) {
-      new_scheduled[i]->set_pipeline_id(i);
-      new_scheduled[i]->operators.push_back(*new_scheduled[i]->sink);
-      new_scheduled[i]->source = &new_scheduled[i]->operators[0].get();
-      new_scheduled[i]->parents.clear();
-      auto& first_op = new_scheduled[i]->operators[0].get();
-      // iterate through ports at first_op
-      for (auto port_id : first_op.get_port_ids()) {
-        new_scheduled[i]->parents.push_back(first_op.get_port(port_id)->src_pipeline);
-      }
-    }
 
     // collect all pipelines from the root pipelines (recursively) for the progress bar and verify
     // them
