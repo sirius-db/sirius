@@ -369,7 +369,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_ungrouped_ag
 
     auto out_table = std::make_unique<cudf::table>(std::move(cols));
     std::unique_ptr<cucascade::idata_representation> output_data =
-      std::make_unique<cucascade::gpu_table_representation>(*out_table, *space);
+      std::make_unique<cucascade::gpu_table_representation>(std::move(out_table), *space);
     auto const batch_id = ::sirius::get_next_batch_id();
     outputs.push_back(std::make_shared<cucascade::data_batch>(batch_id, std::move(output_data)));
   }
@@ -465,7 +465,7 @@ sirius_physical_ungrouped_aggregate_merge::execute(
 
   auto out_table = std::make_unique<cudf::table>(std::move(output_cols));
   std::unique_ptr<cucascade::idata_representation> output_data =
-    std::make_unique<cucascade::gpu_table_representation>(*out_table, *space);
+    std::make_unique<cucascade::gpu_table_representation>(std::move(out_table), *space);
   auto const batch_id = ::sirius::get_next_batch_id();
   auto output_batch   = std::make_shared<cucascade::data_batch>(batch_id, std::move(output_data));
 

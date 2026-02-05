@@ -74,8 +74,8 @@ TEST_CASE("sirius_physical_top_n single-key uses top_k per batch", "[physical_to
   batches.push_back(make_batch(*space, {5, 1, 7, 3, 9, 2, 8}, {50, 10, 70, 30, 90, 20, 80}));
 
   duckdb::vector<duckdb::LogicalType> types;
-  types.push_back(duckdb::LogicalType::BIGINT);  // order column
-  types.push_back(duckdb::LogicalType::BIGINT);  // payload
+  types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));  // order column
+  types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));  // payload
 
   duckdb::vector<duckdb::BoundOrderByNode> orders;
   orders.push_back(make_order(0, duckdb::OrderType::DESCENDING));
@@ -113,8 +113,8 @@ TEST_CASE("sirius_physical_top_n multi-key falls back to sort_by_key", "[physica
   batches.push_back(make_batch(*space, {5, 5, 7, 7, 7, 6, 4, 8}, {2, 1, 3, 4, 1, 9, 5, 0}));
 
   duckdb::vector<duckdb::LogicalType> types;
-  types.push_back(duckdb::LogicalType::BIGINT);  // order
-  types.push_back(duckdb::LogicalType::BIGINT);  // payload
+  types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));  // order
+  types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));  // payload
 
   duckdb::vector<duckdb::BoundOrderByNode> orders;
   orders.push_back(make_order(0, duckdb::OrderType::DESCENDING));
@@ -154,8 +154,8 @@ TEST_CASE("sirius_physical_top_n_merge applies offset and limit", "[physical_top
   batches.push_back(make_range_batch(*space, 20, 10, 10));
 
   duckdb::vector<duckdb::LogicalType> types;
-  types.push_back(duckdb::LogicalType::BIGINT);
-  types.push_back(duckdb::LogicalType::BIGINT);
+  types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));
+  types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));
 
   duckdb::vector<duckdb::BoundOrderByNode> orders;
   orders.push_back(make_order(0, duckdb::OrderType::DESCENDING));
@@ -192,8 +192,8 @@ TEST_CASE("sirius_physical_top_n_merge returns empty for limit 0", "[physical_to
   batches.push_back(make_range_batch(*space, 5, 5, 1));
 
   duckdb::vector<duckdb::LogicalType> types;
-  types.push_back(duckdb::LogicalType::BIGINT);
-  types.push_back(duckdb::LogicalType::BIGINT);
+  types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));
+  types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));
 
   duckdb::vector<duckdb::BoundOrderByNode> orders;
   orders.push_back(make_order(0, duckdb::OrderType::DESCENDING));
@@ -219,8 +219,8 @@ TEST_CASE("sirius_physical_top_n_merge handles empty batches", "[physical_top_n_
   batches.push_back(make_batch(*space, {}, {}));
 
   duckdb::vector<duckdb::LogicalType> types;
-  types.push_back(duckdb::LogicalType::BIGINT);
-  types.push_back(duckdb::LogicalType::BIGINT);
+  types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));
+  types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));
 
   duckdb::vector<duckdb::BoundOrderByNode> orders;
   orders.push_back(make_order(0, duckdb::OrderType::DESCENDING));

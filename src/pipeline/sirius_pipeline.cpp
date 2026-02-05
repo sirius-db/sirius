@@ -264,15 +264,20 @@ sirius_pipeline_build_state::get_pipeline_operators(sirius_pipeline& pipeline)
   return pipeline.operators;
 }
 
-bool sirius_pipeline::is_pipeline_finished() const { return pipeline_finished.load(); }
+bool sirius_pipeline::is_pipeline_finished() const
+{
+  // todo (amin): there is a potential race condition between scan executor and gpu pipeline
+  // executor
+  return pipeline_finished.load();
+}
 
 void sirius_pipeline::update_pipeline_status()
 {
-  if (get_source()->type == op::SiriusPhysicalOperatorType::TABLE_SCAN) {
-    auto& table_scan = get_source()->Cast<op::sirius_physical_table_scan>();
+  if (get_source()->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
+    auto& table_scan = get_source()->Cast<op::sirius_physical_duckdb_scan>();
     if (table_scan.exhausted) {  // WSM amin TODO: can we use exhausted? how about we use
                                  // get_next_task_hint() to check if the source is ready?
-      pipeline_finished = true;
+      pipeline_finished.store(true);
       return;
     }
   } else {

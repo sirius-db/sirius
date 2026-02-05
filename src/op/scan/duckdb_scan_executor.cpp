@@ -110,15 +110,13 @@ void duckdb_scan_executor::prepare_cache_for_scan_operators(
 
   if (!_preload_mode) {
     for (auto* op : scan_operators) {
-      // todo (amin) : we need to use the pipeline id instead of the operator id
-      auto operator_id    = op->get_operator_id();
+      auto operator_id    = op->get_pipeline()->get_pipeline_id();
       _cache[operator_id] = std::make_unique<cache_entry>();  // Create empty entry
     }
   } else {
     // In PRELOAD mode: verify all operator IDs are present in the cache
     for (auto* op : scan_operators) {
-      // todo (amin) : we need to use the pipeline id instead of the operator id
-      auto operator_id = op->get_operator_id();
+      auto operator_id = op->get_pipeline()->get_pipeline_id();
       if (_cache.find(operator_id) == _cache.end()) {
         SIRIUS_LOG_ERROR("Cache entry not found for operator {} in PRELOAD mode", operator_id);
       }
@@ -139,7 +137,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> duckdb_scan_executor::get_sc
   if (!_caching_enabled) {
     return task->compute_task();
   } else {
-    auto pipe_id = task->get_scan_op_id();
+    auto pipe_id = task->get_pipeline_id();
     std::lock_guard<std::mutex> lock(_cache_mutex);
     // todo (amin) : we need to clone the batches to avoid modifying the original batches
     auto& entry = _cache.at(pipe_id);
@@ -182,7 +180,8 @@ void duckdb_scan_executor::manager_loop()
 
     // Make host memory reservation and set it on the local state
     auto* scan_task = dynamic_cast<sirius::op::scan::duckdb_scan_task*>(task.get());
-    if (scan_task) {
+    // todo (amin): fix this later, and make the reservation in the executor.
+    if (scan_task and false) {
       auto bytes_needed = scan_task->get_estimated_reservation_size();
       auto reservation  = _mem_mgr->request_reservation(
         cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::HOST}, bytes_needed);
@@ -197,9 +196,6 @@ void duckdb_scan_executor::manager_loop()
         SIRIUS_LOG_ERROR("DuckDB Scan Executor: Failed to cast local state for task");
         break;
       }
-    } else {
-      SIRIUS_LOG_ERROR("DuckDB Scan Executor: Failed to cast task to scan task");
-      break;
     }
 
     _thread_pool->schedule([this,

@@ -76,7 +76,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_streaming_li
     auto sliced_table = std::make_unique<cudf::table>(slices.front());
 
     std::unique_ptr<cucascade::idata_representation> output_data =
-      std::make_unique<cucascade::gpu_table_representation>(std::move(*sliced_table),
+      std::make_unique<cucascade::gpu_table_representation>(std::move(sliced_table),
                                                             *batch->get_memory_space());
 
     auto const batch_id = ::sirius::get_next_batch_id();

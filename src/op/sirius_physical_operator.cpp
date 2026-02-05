@@ -287,10 +287,17 @@ bool sirius_physical_operator::is_source_pipeline_finished()
 }
 
 duckdb::shared_ptr<pipeline::sirius_pipeline> sirius_physical_operator::get_pipeline()
+  const noexcept
 {
-  if (ports.empty()) { return nullptr; }
-  return ports.begin()->second->dest_pipeline;
+  return _pipeline;
 }
+
+void sirius_physical_operator::set_pipeline(duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline)
+{
+  assert(pipeline != nullptr);
+  _pipeline = std::move(pipeline);
+}
+
 // implement get_all_ports
 std::vector<std::string_view> sirius_physical_operator::get_port_ids()
 {

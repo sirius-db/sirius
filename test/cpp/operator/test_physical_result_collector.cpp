@@ -249,8 +249,9 @@ TEST_CASE("sirius_physical_materialized_collector sink with host input",
 
   convert_batch_to_host(batch);
 
-  duckdb::vector<duckdb::LogicalType> types{
-    duckdb::LogicalType::INTEGER, duckdb::LogicalType::BIGINT, duckdb::LogicalType::VARCHAR};
+  duckdb::vector<duckdb::LogicalType> types{duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER),
+                                            duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT),
+                                            duckdb::LogicalType(duckdb::LogicalTypeId::VARCHAR)};
   auto prepared =
     duckdb::make_shared_ptr<duckdb::PreparedStatementData>(duckdb::StatementType::SELECT_STATEMENT);
   prepared->types = types;
@@ -317,8 +318,8 @@ TEST_CASE("sirius_physical_materialized_collector sink converts GPU input",
     expected            = extract_expected_data(gpu_view);
   }
 
-  duckdb::vector<duckdb::LogicalType> types{duckdb::LogicalType::INTEGER,
-                                            duckdb::LogicalType::BIGINT};
+  duckdb::vector<duckdb::LogicalType> types{duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER),
+                                            duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT)};
   auto prepared =
     duckdb::make_shared_ptr<duckdb::PreparedStatementData>(duckdb::StatementType::SELECT_STATEMENT);
   prepared->types = types;

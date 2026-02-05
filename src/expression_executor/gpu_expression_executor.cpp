@@ -229,9 +229,9 @@ std::shared_ptr<cucascade::data_batch> GpuExpressionExecutor::execute(
   output_columns.resize(expressions.size());
 
   // Retrieve the table_view from the data_batch
-  auto input_data_rep = input_batch->get_data()->cast<cucascade::gpu_table_representation>();
-  input_table         = input_data_rep.get_table().view();
-  input_count         = static_cast<cudf::size_type>(input_table.num_rows());
+  auto& input_data_rep = input_batch->get_data()->cast<cucascade::gpu_table_representation>();
+  input_table          = input_data_rep.get_table().view();
+  input_count          = static_cast<cudf::size_type>(input_table.num_rows());
 
   for (size_t i = 0; i < expressions.size(); ++i) {
     // Execute the expression
@@ -250,8 +250,9 @@ std::shared_ptr<cucascade::data_batch> GpuExpressionExecutor::execute(
 
   // Create the data representation
   std::unique_ptr<cucascade::idata_representation> output_data_rep =
-    std::make_unique<cucascade::gpu_table_representation>(cudf::table(std::move(output_columns)),
-                                                          *input_batch->get_memory_space());
+    std::make_unique<cucascade::gpu_table_representation>(
+      std::move(std::make_unique<cudf::table>(std::move(output_columns))),
+      *input_batch->get_memory_space());
 
   // Create the data batch and return
   auto const batch_id = ::sirius::get_next_batch_id();
@@ -303,9 +304,9 @@ std::shared_ptr<cucascade::data_batch> GpuExpressionExecutor::select(
   output_columns.clear();
 
   // Retrieve the table_view from the data_batch
-  auto input_data_rep = input_batch->get_data()->cast<cucascade::gpu_table_representation>();
-  input_table         = input_data_rep.get_table().view();
-  input_count         = static_cast<cudf::size_type>(input_table.num_rows());
+  auto& input_data_rep = input_batch->get_data()->cast<cucascade::gpu_table_representation>();
+  input_table          = input_data_rep.get_table().view();
+  input_count          = static_cast<cudf::size_type>(input_table.num_rows());
 
   // Get the bitmap
   auto bitmap = ExecuteExpression(0);
@@ -314,7 +315,7 @@ std::shared_ptr<cucascade::data_batch> GpuExpressionExecutor::select(
   auto output_table =
     cudf::apply_boolean_mask(input_table, bitmap->view(), execution_stream, resource_ref);
   std::unique_ptr<cucascade::idata_representation> output_data_rep =
-    std::make_unique<cucascade::gpu_table_representation>(*output_table,
+    std::make_unique<cucascade::gpu_table_representation>(std::move(output_table),
                                                           *input_batch->get_memory_space());
 
   // Create the data batch and return

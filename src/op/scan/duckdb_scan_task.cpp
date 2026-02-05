@@ -15,6 +15,8 @@
  */
 
 // sirius
+#include "cucascade/memory/memory_space.hpp"
+
 #include <data/data_batch_utils.hpp>
 #include <helper/utils.hpp>
 #include <memory/sirius_memory_reservation_manager.hpp>
@@ -48,11 +50,8 @@ duckdb_scan_task_global_state::duckdb_scan_task_global_state(
 {
   // Initialize global table function state
   if (_op.function.init_global) {
-    duckdb::TableFunctionInitInput tf_input(_op.bind_data.get(),
-                                            _op.column_ids,
-                                            _op.projection_ids,
-                                            nullptr,
-                                            _op.extra_info.sample_options);
+    duckdb::TableFunctionInitInput tf_input(
+      _op.bind_data.get(), _op.column_ids, _op.scanned_ids, nullptr, _op.extra_info.sample_options);
     _global_tf_state = _op.function.init_global(client_ctx, tf_input);
   }
 
@@ -298,6 +297,7 @@ duckdb_scan_task_local_state::duckdb_scan_task_local_state(
 
   // Make the allocation
   auto& mem_space = _reservation->get_memory_space();
+  _host_space     = const_cast<cucascade::memory::memory_space*>(&mem_space);
   auto* allocator =
     mem_space.get_memory_resource_as<cucascade::memory::fixed_size_host_memory_resource>();
   if (allocator == nullptr) {
@@ -425,6 +425,15 @@ std::shared_ptr<cucascade::data_batch> duckdb_scan_task_local_state::make_data_b
 //===----------------------------------------------------------------------===//
 // DuckDB Scan Task
 //===----------------------------------------------------------------------===//
+duckdb_scan_task::~duckdb_scan_task()
+{
+  if (_global_state == nullptr ||
+      _global_state->cast<duckdb_scan_task_global_state>()._pipeline.get() == nullptr) {
+    return;
+  }
+  _global_state->cast<duckdb_scan_task_global_state>()._pipeline.get()->mark_task_completed();
+}
+
 bool duckdb_scan_task::get_next_chunk(duckdb_scan_task_local_state& l_state,
                                       duckdb_scan_task_global_state& g_state)
 {
@@ -485,9 +494,10 @@ std::vector<std::shared_ptr<cucascade::data_batch>> duckdb_scan_task::compute_ta
   auto& l_state = this->_local_state->cast<duckdb_scan_task_local_state>();
   auto& g_state = this->_global_state->cast<duckdb_scan_task_global_state>();
 
-  // Initialize the data chunk
+  // Initialize the data chunk with the SCANNED types (not all returned_types)
+  // The scanned_types correspond to the actual columns being projected
   l_state._chunk.Initialize(duckdb::Allocator::Get(l_state._exec_ctx.client),
-                            g_state._op.returned_types);
+                            g_state._op.scanned_types);
 
   // Enter the scan loop to accumulate a data batch
   while (get_next_chunk(l_state, g_state)) {

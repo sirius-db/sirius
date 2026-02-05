@@ -102,7 +102,7 @@ class SiriusContext : public ClientContextState {
   [[nodiscard]] const sirius::sirius_config& get_config() const noexcept { return config_; }
 
  private:
-  void thorw_if_not_initialized() const;
+  void throw_if_not_initialized() const;
 
   mutable std::mutex mutex_;
   bool is_initialized_ = false;

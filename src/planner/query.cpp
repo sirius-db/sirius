@@ -27,6 +27,9 @@ query::query(sirius_pipeline_hashmap pipeline_hashmap)
 void query::build_indices()
 {
   for (auto& pipeline : _pipeline_hashmap._vec) {
+    for (auto& op : pipeline->get_operators()) {
+      op.get().set_pipeline(pipeline);
+    }
     // Get the source operator (first operator in the pipeline)
     auto source = pipeline->get_source();
     if (source) {
@@ -34,7 +37,7 @@ void query::build_indices()
       _operator_to_pipeline[source.get()] = pipeline;
 
       // If it's a table scan, add to scan operators vector
-      if (source->type == op::SiriusPhysicalOperatorType::TABLE_SCAN) {
+      if (source->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
         _scan_operators.push_back(source.get());
       }
     }

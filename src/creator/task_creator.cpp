@@ -188,7 +188,8 @@ void task_creator::manager_loop()
                                                  // repositories
               std::move(scan_task_local_state),
               _scan_operator_global_state_map[operator_id]);
-
+            pipeline->mark_task_created();  // WSM TODO: this needs to be done atomically
+                                            // with the task creation
             _pipeline_executor->schedule(std::move(scan_task));
             // scheduling pipeline task
           } else {
@@ -218,7 +219,7 @@ void task_creator::manager_loop()
                 get_next_task_id(),
                 destination_data_repositories,
                 std::move(local_state),
-                std::move(_gpu_operator_global_state_map[operator_id]));
+                _gpu_operator_global_state_map[operator_id]);
               _pipeline_executor->schedule(std::move(task));
             }
           }
