@@ -69,7 +69,7 @@ struct ComparisonDispatcher {
       // For int32_t, check at runtime if this is a TIMESTAMP_DAYS comparison
       if (left.type().id() == cudf::type_id::TIMESTAMP_DAYS) {
         auto date_scalar = cudf::timestamp_scalar<cudf::timestamp_D>(
-          cudf::duration_D{right_value}, true, executor.execution_stream, executor.resource_ref);
+          cudf::duration_D{right_value}, !right_is_null, executor.execution_stream, executor.resource_ref);
         auto result = cudf::binary_operation(left,
                                              date_scalar,
                                              ComparisonOp,
@@ -80,7 +80,7 @@ struct ComparisonDispatcher {
       } else {
         // Regular int32_t comparison
         auto numeric_scalar =
-          cudf::numeric_scalar(right_value, true, executor.execution_stream, executor.resource_ref);
+          cudf::numeric_scalar(right_value, !right_is_null, executor.execution_stream, executor.resource_ref);
         return cudf::binary_operation(left,
                                       numeric_scalar,
                                       ComparisonOp,
@@ -218,7 +218,7 @@ struct ComparisonDispatcher {
           // DuckDB DATE is int32_t (days since epoch), same as cuDF TIMESTAMP_DAYS
           // Use numeric_scalar<int32_t> for the comparison
           return DoScalarComparison<int32_t>(
-            left->view(), right_value.GetValue<int32_t>(), return_type);
+            left->view(),!right_value.IsNull()? right_value.GetValue<int32_t>(): 0, right_value.IsNull(), return_type);
         case cudf::type_id::DECIMAL32:
           // cudf decimal type uses negative scale, same for below
           return DoScalarComparison<numeric::decimal32>(
