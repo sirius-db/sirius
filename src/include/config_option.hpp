@@ -146,8 +146,9 @@ struct config_to_type_traits<std::string> {
 
 template <IsBackInsertableWithValue T>
 struct config_to_type_traits<T> {
-  static constexpr libconfig::Setting::Type type =
-    (IsBasicConfig<T>) ? libconfig::Setting::TypeArray : libconfig::Setting::TypeList;
+  static constexpr libconfig::Setting::Type type = (IsBasicConfig<typename T::value_type>)
+                                                     ? libconfig::Setting::TypeArray
+                                                     : libconfig::Setting::TypeList;
   static T parse_value(std::string_view str_value)
   {
     throw std::invalid_argument("No parse_value implementation for this type.");
@@ -395,19 +396,6 @@ struct variant_value_holder {
   std::reference_wrapper<std::variant<Args...>> var_;
 };
 
-inline std::string prepare_env_var_name(std::string_view path)
-{
-  std::string env_var = std::string(path);
-  for (char c : path) {
-    if (c == '.' || c == '-') {
-      env_var += '_';
-    } else {
-      env_var += std::toupper(c);
-    }
-  }
-  return env_var;
-}
-
 template <typename T, typename holder = value_holder<T>>
 struct registered_config : config_base {
   template <typename ConfigType>
@@ -465,6 +453,118 @@ struct registered_config : config_base {
   bool is_required_{false};
 };
 
+// Specialized registered_config for variant types with validation
+template <typename T, typename... Args>
+struct registered_config_variant : config_base {
+  explicit registered_config_variant(std::string_view name,
+                                     std::variant<Args...>& var,
+                                     std::function<bool(const T&)> validator,
+                                     bool is_required = false)
+    : path_(name.data()), var_(var), predicate_(std::move(validator)), is_required_(is_required)
+  {
+  }
+
+  void apply(const libconfig::Setting& cfg) override
+  {
+    if (predicate_) {
+      T temp_value{};
+      config_value_applicator<T>::assign(temp_value, cfg);
+      if (!predicate_(temp_value)) {
+        throw std::invalid_argument(
+          fmt::format("Invalid configuration value for variant option {}", path_.data()));
+      }
+      var_.get_or_create() = std::move(temp_value);
+    } else {
+      config_value_applicator<T>::assign(var_.get_or_create(), cfg);
+    }
+  }
+
+  void write(libconfig::Setting& setting) const override
+  {
+    auto* ptr = var_.get_or_null();
+    if (ptr) {
+      libconfig::Setting& cfg = setting.add(path_.data(), type());
+      config_value_exporter<T>::write(cfg, *ptr);
+    }
+  }
+
+  [[nodiscard]] std::string_view path() const noexcept override { return path_; }
+
+  [[nodiscard]] libconfig::Setting::Type type() const noexcept override
+  {
+    return config_to_type_traits<T>::type;
+  }
+
+  [[nodiscard]] bool is_required() const noexcept override { return is_required_; }
+
+ private:
+  std::string path_;
+  variant_value_holder<T, Args...> var_;
+  std::function<bool(const T&)> predicate_{nullptr};
+  bool is_required_{false};
+};
+
+// Specialized registered_config for iterable types with element validation
+template <IsBackInsertableWithValue T, typename holder>
+struct registered_config_iterable : config_base {
+  using value_type = typename T::value_type;
+
+  template <typename ConfigType>
+  explicit registered_config_iterable(std::string_view name,
+                                      ConfigType& var,
+                                      std::function<bool(const value_type&)> element_validator,
+                                      bool is_required = false)
+    : path_(name.data()),
+      var_(var),
+      element_predicate_(std::move(element_validator)),
+      is_required_(is_required)
+  {
+  }
+
+  void apply(const libconfig::Setting& cfg) override
+  {
+    T& container   = var_.get_or_create();
+    using assigner = config_value_applicator<value_type>;
+
+    for (const auto& item : cfg) {
+      value_type v{};
+      assigner::assign(v, item);
+
+      // Validate each element if predicate is provided
+      if (element_predicate_ && !element_predicate_(v)) {
+        throw std::invalid_argument(
+          fmt::format("Invalid element value in configuration array for option {}", path_.data()));
+      }
+
+      container.push_back(std::move(v));
+    }
+  }
+
+  void write(libconfig::Setting& setting) const override
+  {
+    auto* ptr = var_.get_or_null();
+    if (ptr) {
+      libconfig::Setting& cfg = setting.add(path_.data(), type());
+      config_value_exporter<T>::write(cfg, *ptr);
+    }
+  }
+
+  [[nodiscard]] std::string_view path() const noexcept override { return path_; }
+
+  [[nodiscard]] libconfig::Setting::Type type() const noexcept override
+  {
+    return config_to_type_traits<T>::type;
+  }
+
+  [[nodiscard]] bool is_required() const noexcept override { return is_required_; }
+
+ private:
+  std::string path_;
+  holder var_;
+  std::function<bool(const value_type&)> element_predicate_{nullptr};
+  bool is_required_{false};
+};
+
 // ================ validators ================= //
 
 template <typename T>
@@ -476,7 +576,7 @@ struct less_than {
 template <typename T>
 struct greater_than {
   T threshold;
-  bool operator()(const T& value) const noexcept { return value < threshold; }
+  bool operator()(const T& value) const noexcept { return value > threshold; }
 };
 
 template <typename T>
@@ -536,6 +636,30 @@ struct configuration_setter {
         name, instance));
   }
 
+  // Add variant config with validation
+  template <typename ConfigType, typename... Args>
+  void add_variant_config(std::string_view name,
+                          std::variant<Args...>& instance,
+                          std::predicate<const ConfigType&> auto validator,
+                          config_requirement requirement = config_requirement::optional)
+  {
+    bool is_required = (requirement == config_requirement::required);
+    configs_.emplace_back(std::make_unique<registered_config_variant<ConfigType, Args...>>(
+      name, instance, std::move(validator), is_required));
+  }
+
+  // Add iterable config with element-level validation
+  template <IsBackInsertableWithValue T>
+  void add_config(std::string_view name,
+                  T& container,
+                  std::predicate<const typename T::value_type&> auto element_validator,
+                  config_requirement requirement = config_requirement::optional)
+  {
+    bool is_required = (requirement == config_requirement::required);
+    configs_.emplace_back(std::make_unique<registered_config_iterable<T, value_holder<T>>>(
+      name, container, std::move(element_validator), is_required));
+  }
+
   template <typename T>
     requires IsBasicConfig<T>
   void add_optional_config(std::string_view name,
@@ -551,6 +675,16 @@ struct configuration_setter {
   {
     configs_.emplace_back(
       std::make_unique<registered_config<T, optional_value_holder<T>>>(name, opt));
+  }
+
+  // Add optional iterable config with element-level validation
+  template <IsBackInsertableWithValue T>
+  void add_optional_config(std::string_view name,
+                           std::optional<T>& container,
+                           std::predicate<const typename T::value_type&> auto element_validator)
+  {
+    configs_.emplace_back(std::make_unique<registered_config_iterable<T, optional_value_holder<T>>>(
+      name, container, std::move(element_validator)));
   }
 
   static const libconfig::Setting* safe_lookup(const libconfig::Setting& setting,
