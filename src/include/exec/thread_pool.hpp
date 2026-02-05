@@ -21,6 +21,7 @@
 #include <absl/functional/any_invocable.h>
 
 #include <condition_variable>
+#include <latch>
 #include <mutex>
 #include <queue>
 #include <string>
@@ -32,8 +33,9 @@ namespace sirius::exec {
 class thread_pool {
  public:
   explicit thread_pool(int num_threads,
-                       const std::string& name  = "thread_pool",
-                       std::vector<int> cpu_ids = {})
+                       const std::string& name                             = "thread_pool",
+                       std::vector<int> cpu_ids                            = {},
+                       absl::AnyInvocable<void() noexcept> per_thread_init = nullptr)
   {
     threads_.reserve(num_threads);
 
@@ -42,8 +44,20 @@ class thread_pool {
     std::for_each(
       cpu_ids.begin(), cpu_ids.end(), [&cpuset](int cpu_id) { CPU_SET(cpu_id, &cpuset); });
 
+    std::unique_ptr<std::latch> init_latch;
+    if (per_thread_init) { init_latch = std::make_unique<std::latch>(num_threads); }
+
+    auto* init_fn_ptr = per_thread_init ? &per_thread_init : nullptr;
+    auto* latch_ptr   = init_latch.get();
+
     for (int i = 0; i < num_threads; ++i) {
-      auto& t = threads_.emplace_back(&thread_pool::work_loop, this);
+      auto& t = threads_.emplace_back([this, init_fn_ptr, latch_ptr]() {
+        if (init_fn_ptr) {
+          (*init_fn_ptr)();
+          latch_ptr->count_down();
+        }
+        work_loop();
+      });
       if (!name.empty()) {
         pthread_setname_np(t.native_handle(), (name + "_" + std::to_string(i)).c_str());
       }
@@ -51,6 +65,8 @@ class thread_pool {
         pthread_setaffinity_np(t.native_handle(), sizeof(cpu_set_t), &cpuset);
       }
     }
+
+    if (init_latch) { init_latch->wait(); }
   }
 
   thread_pool(const thread_pool&)            = delete;

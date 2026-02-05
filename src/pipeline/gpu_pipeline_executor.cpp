@@ -17,6 +17,7 @@
 #include "pipeline/gpu_pipeline_executor.hpp"
 
 #include "creator/task_creator.hpp"
+#include "cuda_runtime_api.h"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "pipeline/completion_handler.hpp"
@@ -48,7 +49,10 @@ void gpu_pipeline_executor::start()
   bool expected = false;
   if (!_running.compare_exchange_strong(expected, true)) { return; }
   _thread_pool = std::make_unique<exec::thread_pool>(
-    _config.num_threads, _config.thread_name_prefix, _config.cpu_affinity_list);
+    _config.num_threads,
+    _config.thread_name_prefix,
+    _config.cpu_affinity_list,
+    [device_id = _memory_space->get_device_id()]() noexcept { cudaSetDevice(device_id); });
   _manager_thread = std::thread(&gpu_pipeline_executor::manager_loop, this);
 }
 
