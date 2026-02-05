@@ -129,23 +129,24 @@ TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate computes SUM/MIN/MAX/COU
       duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> children;
       children.push_back(make_uniq<BoundReferenceExpression>(Traits::logical_type(), 0));
       aggregates.push_back(make_uniq<BoundAggregateExpression>(
-        MakeDummyAggregate("count", {Traits::logical_type()}, LogicalType::BIGINT),
+        MakeDummyAggregate(
+          "count", {Traits::logical_type()}, LogicalType(duckdb::LogicalTypeId::BIGINT)),
         std::move(children),
         nullptr,
         nullptr,
         AggregateType::NON_DISTINCT));
-      ret_types.push_back(LogicalType::BIGINT);
+      ret_types.push_back(LogicalType(duckdb::LogicalTypeId::BIGINT));
     }
 
     // COUNT_STAR
     {
       aggregates.push_back(make_uniq<BoundAggregateExpression>(
-        MakeDummyAggregate("count_star", {}, LogicalType::BIGINT),
+        MakeDummyAggregate("count_star", {}, LogicalType(duckdb::LogicalTypeId::BIGINT)),
         duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>{},
         nullptr,
         nullptr,
         AggregateType::NON_DISTINCT));
-      ret_types.push_back(LogicalType::BIGINT);
+      ret_types.push_back(LogicalType(duckdb::LogicalTypeId::BIGINT));
     }
 
     return aggregates;
@@ -248,18 +249,19 @@ TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate resolves AVG in merge",
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> children;
     children.push_back(make_uniq<BoundReferenceExpression>(Traits::logical_type(), 0));
     aggregates.push_back(make_uniq<BoundAggregateExpression>(
-      MakeDummyAggregate("avg", {Traits::logical_type()}, LogicalType::DOUBLE),
+      MakeDummyAggregate(
+        "avg", {Traits::logical_type()}, LogicalType(duckdb::LogicalTypeId::DOUBLE)),
       std::move(children),
       nullptr,
       nullptr,
       AggregateType::NON_DISTINCT));
-    ret_types.push_back(LogicalType::DOUBLE);
+    ret_types.push_back(LogicalType(duckdb::LogicalTypeId::DOUBLE));
     return aggregates;
   };
 
   duckdb::vector<duckdb::LogicalType> local_types;
   auto local_aggregates = make_avg_aggregates(local_types);
-  local_types.push_back(LogicalType::BIGINT);
+  local_types.push_back(LogicalType(duckdb::LogicalTypeId::BIGINT));
   duckdb::vector<duckdb::LogicalType> merge_types;
   auto merge_aggregates = make_avg_aggregates(merge_types);
 
