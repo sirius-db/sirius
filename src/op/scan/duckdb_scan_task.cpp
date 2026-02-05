@@ -50,11 +50,8 @@ duckdb_scan_task_global_state::duckdb_scan_task_global_state(
 {
   // Initialize global table function state
   if (_op.function.init_global) {
-    duckdb::TableFunctionInitInput tf_input(_op.bind_data.get(),
-                                            _op.column_ids,
-                                            _op.projection_ids,
-                                            nullptr,
-                                            _op.extra_info.sample_options);
+    duckdb::TableFunctionInitInput tf_input(
+      _op.bind_data.get(), _op.column_ids, _op.scanned_ids, nullptr, _op.extra_info.sample_options);
     _global_tf_state = _op.function.init_global(client_ctx, tf_input);
   }
 
@@ -488,9 +485,10 @@ std::vector<std::shared_ptr<cucascade::data_batch>> duckdb_scan_task::compute_ta
   auto& l_state = this->_local_state->cast<duckdb_scan_task_local_state>();
   auto& g_state = this->_global_state->cast<duckdb_scan_task_global_state>();
 
-  // Initialize the data chunk
+  // Initialize the data chunk with the SCANNED types (not all returned_types)
+  // The scanned_types correspond to the actual columns being projected
   l_state._chunk.Initialize(duckdb::Allocator::Get(l_state._exec_ctx.client),
-                            g_state._op.returned_types);
+                            g_state._op.scanned_types);
 
   // Enter the scan loop to accumulate a data batch
   while (get_next_chunk(l_state, g_state)) {
