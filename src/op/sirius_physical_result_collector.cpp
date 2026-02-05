@@ -141,9 +141,12 @@ void sirius_physical_materialized_collector::sink(
       // Convert to host representation
       auto& registry  = sirius::converter_registry::get();
       auto& mem_space = reservation->get_memory_space();
-      input_batch->convert_to<cucascade::host_table_representation>(
+      auto& data_repo_mgr = sirius_ctx->get_data_repository_manager();
+      auto next_batch_id = data_repo_mgr.get_next_data_batch_id();
+      auto clone_batch = input_batch->clone(next_batch_id);
+      clone_batch->convert_to<cucascade::host_table_representation>(
         registry, &mem_space, rmm::cuda_stream_default);
-      data = input_batch->get_data();
+      data = clone_batch->get_data();
     } else if (data->get_current_tier() != cucascade::memory::Tier::HOST) {
       // Data must be in HOST tier (i.e., cannot currently reside in DISK tier)
       throw duckdb::InvalidInputException(
