@@ -19,7 +19,7 @@
 
 #include <cudf/utilities/memory_resource.hpp>
 
-#include <rmm/mr/device/device_memory_resource.hpp>
+#include <rmm/mr/device_memory_resource.hpp>
 
 #include <cucascade/memory/memory_reservation_manager.hpp>
 
@@ -63,7 +63,7 @@ class sirius_device_memory_resource : public rmm::mr::device_memory_resource {
       throw std::runtime_error("No device memory resource found for device id: " +
                                std::to_string(dev_id.value()));
     }
-    return it->second->allocate(bytes, stream);
+    return it->second->allocate(stream, bytes);
   }
 
   void do_deallocate(void* ptr, std::size_t bytes, rmm::cuda_stream_view stream) noexcept override
@@ -71,7 +71,7 @@ class sirius_device_memory_resource : public rmm::mr::device_memory_resource {
     auto dev_id = rmm::get_current_cuda_device();
     auto it     = per_device_device_memory_resource_map_.find(dev_id.value());
     assert(it != per_device_device_memory_resource_map_.end());
-    it->second->deallocate(ptr, bytes, stream);
+    it->second->deallocate(stream, ptr, bytes);
   }
 
   [[nodiscard]] bool do_is_equal(device_memory_resource const& other) const noexcept override

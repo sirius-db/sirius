@@ -400,7 +400,7 @@ std::unique_ptr<cudf::table> create_cudf_table_with_random_data(
         std::vector<char> h_chars;
         std::vector<int64_t> h_offsets(num_rows + 1, 0);
         for (size_t r = 0; r < num_rows; ++r) {
-          string h_str = "str_" + std::to_string(dist(gen));
+          std::string h_str = "str_" + std::to_string(dist(gen));
           h_chars.insert(h_chars.end(), h_str.begin(), h_str.end());
           h_offsets[r + 1] = h_offsets[r] + static_cast<int64_t>(h_str.size());
         }
