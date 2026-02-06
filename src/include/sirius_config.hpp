@@ -52,7 +52,7 @@ struct sirius_config {
 
   [[nodiscard]] const exec::thread_pool_config& get_duckdb_scan_executor_config() const noexcept;
 
-  [[nodiscard]] bool is_scan_caching_enabled() const noexcept { return enable_scan_caching_; }
+  [[nodiscard]] bool is_scan_caching_enabled() const noexcept { return _enable_scan_caching; }
 
  private:
   cucascade::memory::system_topology_info _hw_topology{.num_gpus = 1};
@@ -65,7 +65,7 @@ struct sirius_config {
                                                       .thread_name_prefix = "downgrade"};
   exec::thread_pool_config _duckdb_scan_executor_config{.num_threads        = 4,
                                                         .thread_name_prefix = "duckdb_scan"};
-  bool enable_scan_caching_ = false;
+  bool _enable_scan_caching = false;
 };
 
 }  // namespace sirius
