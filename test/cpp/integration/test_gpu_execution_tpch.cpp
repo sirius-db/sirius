@@ -35,7 +35,7 @@ static fs::path get_project_root()
 
 static fs::path get_tpch_db_path()
 {
-  auto db_path = get_project_root() / "tpch.duckdb";
+  auto db_path = fs::path(__FILE__).parent_path() / "integration.duckdb";
   REQUIRE(fs::exists(db_path));
   return db_path;
 }
