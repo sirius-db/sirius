@@ -310,8 +310,8 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_ungrouped_ag
     auto* space = batch->get_memory_space();
     if (!space) { continue; }
 
-    auto table  = batch->get_data()->cast<cucascade::gpu_table_representation>().get_table();
-    auto view   = table.view();
+    auto table = batch->get_data()->cast<cucascade::gpu_table_representation>().get_table();
+    auto view  = table.view();
 
     std::vector<std::unique_ptr<cudf::column>> cols;
     cols.reserve(layout.local_types.size());

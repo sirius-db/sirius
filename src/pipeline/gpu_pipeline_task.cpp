@@ -127,7 +127,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> gpu_pipeline_task::compute_t
   auto data_batches = local_state._batches;
   for (auto& op :
        _global_state->cast<gpu_pipeline_task_global_state>()._pipeline.get()->get_operators()) {
-    //todo (amin) pass stream to execute
+    // todo (amin) pass stream to execute
     data_batches = op.get().execute(data_batches);
   }
   return std::move(data_batches);
@@ -156,7 +156,8 @@ void gpu_pipeline_task::execute()
   // }
   // auto allocator = reservation->get_memory_resource_of<cucascade::memory::Tier::GPU>();
   // allocator->attach_reservation_to_tracker(stream, std::move(reservation), nullptr, nullptr);
-  // absl::Cleanup source_closer = [allocator, stream] { allocator->detach_reservation_from_tracker(); };
+  // absl::Cleanup source_closer = [allocator, stream] {
+  // allocator->detach_reservation_from_tracker(); };
   const auto* reservation = local_state.get_reservation();
   const auto* requested_memory_space =
     reservation != nullptr ? &reservation->get_memory_space() : nullptr;
