@@ -102,7 +102,7 @@ namespace detail {
 // Helper template function for constructing duckdb strings from offsets
 template <bool HasNulls>
 void make_duckdb_strings(
-  memory::multiple_blocks_allocation_accessor<int64_t>& offset_accessor,
+  memory::multiple_blocks_allocation_accessor<int32_t>& offset_accessor,
   std::unique_ptr<
     cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation> const&
     allocation,
@@ -119,8 +119,8 @@ void make_duckdb_strings(
   while (offset_counter < count) {
     auto const offsets_in_block =
       std::min(count - offset_counter,
-               (allocation->block_size() - offset_accessor.offset_in_block) / sizeof(int64_t));
-    auto* src = reinterpret_cast<int64_t*>(allocation->get_blocks()[offset_accessor.block_index] +
+               (allocation->block_size() - offset_accessor.offset_in_block) / sizeof(int32_t));
+    auto* src = reinterpret_cast<int32_t*>(allocation->get_blocks()[offset_accessor.block_index] +
                                            offset_accessor.offset_in_block);
     for (size_t i = 0; i < offsets_in_block; ++i) {
       auto const end = src[i];
@@ -140,8 +140,8 @@ void make_duckdb_strings(
       start = end;
     }
     offset_counter += offsets_in_block;
-    offset_accessor.offset_in_block += offsets_in_block * sizeof(int64_t);
-    if (offset_counter == count) { offset_accessor.offset_in_block -= sizeof(int64_t); }
+    offset_accessor.offset_in_block += offsets_in_block * sizeof(int32_t);
+    if (offset_counter == count) { offset_accessor.offset_in_block -= sizeof(int32_t); }
     if (offset_accessor.offset_in_block == allocation->block_size()) {
       offset_accessor.block_index++;
       offset_accessor.offset_in_block = 0;
@@ -202,6 +202,7 @@ host_table_chunk_reader::host_table_chunk_reader(
   }
 
   // Initialize column readers
+  _column_readers.reserve(metadata_nodes.size());
   for (size_t col_idx = 0; col_idx < metadata_nodes.size(); ++col_idx) {
     if (col_idx == 0) {
       _total_rows = static_cast<size_t>(metadata_nodes[col_idx].size);

@@ -66,7 +66,7 @@ class host_table_chunk_reader {
       data_accessor;  ///< Accessor to the column data in the multiple blocks allocation
     memory::multiple_blocks_allocation_accessor<uint8_t>
       mask_accessor;  ///< Accessor to the null mask data in the multiple blocks allocation
-    memory::multiple_blocks_allocation_accessor<int64_t>
+    memory::multiple_blocks_allocation_accessor<int32_t>
       offset_accessor;  ///< Accessor to the STRING offsets in the multiple blocks allocation
 
     /**
