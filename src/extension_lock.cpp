@@ -57,15 +57,8 @@ extension_lock::extension_lock(const std::string& extension_name, const std::str
 extension_lock::~extension_lock()
 {
   if (fd_ != -1) {
-    // Explicitly unlocking is optional; closing the FD releases it.
-    // However, being explicit is good practice.
     flock(fd_, LOCK_UN);
     close(fd_);
-
-    // Remove the file to keep the lock directory clean.
-    // Note: This creates a tiny race condition window if a new process
-    // creates the file just as we unlink it, but for locking logic
-    // it is generally safe as the lock is on the inode/fd.
     std::filesystem::remove(lock_path_);
   }
 }
