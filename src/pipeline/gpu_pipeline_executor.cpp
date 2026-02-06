@@ -118,8 +118,7 @@ void gpu_pipeline_executor::manager_loop()
                             consumers  = std::move(output_consumers),
                             pipeline]() mutable {
       try {
-        // todo(amin) pass stream to execute
-        task->execute();
+        task->execute(exc_stream);
       } catch (...) {
         if (_completion_handler) { _completion_handler->report_error(std::current_exception()); }
         return;

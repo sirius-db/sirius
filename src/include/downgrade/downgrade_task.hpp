@@ -109,8 +109,10 @@ class downgrade_task : public itask {
    *
    * This method performs the actual downgrading of data from a higher memory tier
    * to a lower memory tier.
+   *
+   * @param stream CUDA stream used for device memory operations and kernel launches
    */
-  void execute() override;
+  void execute(rmm::cuda_stream_view stream = cudf::get_default_stream()) override;
 
   /**
    * @brief Get the unique identifier for this task

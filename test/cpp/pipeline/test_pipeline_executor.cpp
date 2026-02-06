@@ -22,6 +22,8 @@
 #include "pipeline/task_request.hpp"
 #include "scan/test_utils.hpp"
 
+#include <rmm/cuda_stream_view.hpp>
+
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -73,7 +75,7 @@ class mock_gpu_pipeline_task : public gpu_pipeline_task {
   {
   }
 
-  void execute() override
+  void execute(rmm::cuda_stream_view stream) override
   {
     auto& global = _global_state->cast<mock_gpu_pipeline_task_global_state>();
     auto& local  = _local_state->cast<mock_gpu_pipeline_task_local_state>();

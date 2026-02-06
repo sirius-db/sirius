@@ -118,8 +118,10 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
 
   /**
    * @brief Method to actually execute the task
+   *
+   * @param stream CUDA stream used for device memory operations and kernel launches
    */
-  void execute() override;
+  void execute(rmm::cuda_stream_view stream = cudf::get_default_stream()) override;
 
   /**
    * @brief Get the unique identifier for this task
@@ -140,9 +142,11 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
    *
    * Executes the GPU pipeline on the input batches and returns the computed results.
    *
+   * @param stream CUDA stream used for device memory operations and kernel launches
    * @return std::vector<std::shared_ptr<cucascade::data_batch>> The computed output batches
    */
-  std::vector<std::shared_ptr<cucascade::data_batch>> compute_task() override;
+  std::vector<std::shared_ptr<cucascade::data_batch>> compute_task(
+    rmm::cuda_stream_view stream) override;
 
   /**
    * @brief Publish the computed output batches to data repositories.

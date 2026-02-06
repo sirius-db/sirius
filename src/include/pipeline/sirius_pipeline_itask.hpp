@@ -20,7 +20,11 @@
 #include "parallel/task.hpp"
 #include "pipeline/sirius_pipeline_itask_local_state.hpp"
 
+#include <cudf/utilities/default_stream.hpp>
+
 #include <cucascade/data/data_batch.hpp>
+
+#include <rmm/cuda_stream_view.hpp>
 
 #include <memory>
 #include <vector>
@@ -51,10 +55,12 @@ class sirius_pipeline_itask : public parallel::itask {
    * the resulting data batches. The computation may involve reading input batches,
    * executing GPU operators, scanning database tables, etc.
    *
+   * @param stream CUDA stream used for device memory operations and kernel launches
    * @return std::vector<std::shared_ptr<cucascade::data_batch>> The computed output
    *         data batches, which may be empty if no output is produced.
    */
-  virtual std::vector<std::shared_ptr<cucascade::data_batch>> compute_task() = 0;
+  virtual std::vector<std::shared_ptr<cucascade::data_batch>> compute_task(
+    rmm::cuda_stream_view stream) = 0;
 
   /**
    * @brief Publish the computed output batches to appropriate destinations.
@@ -80,9 +86,9 @@ class sirius_pipeline_itask : public parallel::itask {
   /// @brief Get the output consumer operators for this task.
   virtual std::vector<op::sirius_physical_operator*> get_output_consumers() = 0;
 
-  void execute() override
+  void execute(rmm::cuda_stream_view stream = cudf::get_default_stream()) override
   {
-    auto output_batches = compute_task();
+    auto output_batches = compute_task(stream);
     publish_output(output_batches);
   }
 

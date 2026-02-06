@@ -46,6 +46,7 @@ class test_gpu_pipeline_task_global_state
 
   void add_error(std::string message)
   {
+    std::cerr << message << std::endl;
     error_count.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(error_mutex);
     errors.push_back(std::move(message));
@@ -77,7 +78,7 @@ class sirius_pipeline_task : public sirius::pipeline::gpu_pipeline_task {
   {
   }
 
-  void execute() override
+  void execute(rmm::cuda_stream_view stream) override
   {
     auto& global = _global_state->cast<test_gpu_pipeline_task_global_state>();
     auto& local  = _local_state->cast<test_gpu_pipeline_task_local_state>();
@@ -98,7 +99,6 @@ class sirius_pipeline_task : public sirius::pipeline::gpu_pipeline_task {
       return;
     }
 
-    auto stream = mem_space.acquire_stream();
     if (!allocator->attach_reservation_to_tracker(stream, std::move(reservation))) {
       global.add_error("Failed to attach reservation to stream tracker.");
       global.executed_count.fetch_add(1, std::memory_order_relaxed);

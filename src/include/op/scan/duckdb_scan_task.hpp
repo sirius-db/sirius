@@ -409,7 +409,7 @@ class duckdb_scan_task : public sirius::pipeline::sirius_pipeline_itask {
   //===----------Destructor----------===//
   ~duckdb_scan_task();
 
-  void execute() override;
+  void execute([[maybe_unused]] rmm::cuda_stream_view stream = cudf::get_default_stream()) override;
 
  private:
   //===----------Methods----------===//
@@ -464,9 +464,11 @@ class duckdb_scan_task : public sirius::pipeline::sirius_pipeline_itask {
    *
    * Scans data from the DuckDB table function and accumulates it into data batches.
    *
+   * @param stream CUDA stream used for device memory operations and kernel launches
    * @return std::vector<std::shared_ptr<cucascade::data_batch>> The computed output batches
    */
-  std::vector<std::shared_ptr<cucascade::data_batch>> compute_task() override;
+  std::vector<std::shared_ptr<cucascade::data_batch>> compute_task(
+    rmm::cuda_stream_view stream = cudf::get_default_stream()) override;
 
   /**
    * @brief Publish the computed output batches to the data repository.
