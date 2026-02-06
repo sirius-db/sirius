@@ -30,25 +30,20 @@
 namespace sirius {
 namespace op {
 
-  enum class PartitionType {
-    HASH,
-    RANGE,
-    EVENLY,
-    CUSTOM,
-    NONE
-  };
+enum class PartitionType { HASH, RANGE, EVENLY, CUSTOM, NONE };
 
-  // PartitionType to string
-  inline std::string partition_type_to_string(PartitionType type) {
-    switch (type) {
-      case PartitionType::HASH: return "HASH";
-      case PartitionType::RANGE: return "RANGE";
-      case PartitionType::EVENLY: return "EVENLY";
-      case PartitionType::CUSTOM: return "CUSTOM";
-      case PartitionType::NONE: return "NONE";
-    }
-    return "UNKNOWN";
+// PartitionType to string
+inline std::string partition_type_to_string(PartitionType type)
+{
+  switch (type) {
+    case PartitionType::HASH: return "HASH";
+    case PartitionType::RANGE: return "RANGE";
+    case PartitionType::EVENLY: return "EVENLY";
+    case PartitionType::CUSTOM: return "CUSTOM";
+    case PartitionType::NONE: return "NONE";
   }
+  return "UNKNOWN";
+}
 
 class sirius_physical_partition : public sirius_physical_operator {
  public:

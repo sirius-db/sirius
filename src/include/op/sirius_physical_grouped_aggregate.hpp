@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "cudf/aggregation.hpp"
+#include "cudf/types.hpp"
 #include "duckdb/execution/operator/aggregate/distinct_aggregate_data.hpp"
 #include "duckdb/execution/operator/aggregate/grouped_aggregate_data.hpp"
 #include "duckdb/execution/operator/aggregate/physical_hash_aggregate.hpp"
@@ -24,8 +26,6 @@
 #include "duckdb/parser/group_by_node.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "op/sirius_physical_operator.hpp"
-#include "cudf/types.hpp"
-#include "cudf/aggregation.hpp"
 
 namespace sirius {
 namespace op {
@@ -56,9 +56,9 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
 
   duckdb::vector<duckdb::GroupingSet> grouping_sets;
 
-// TODO: we may need some of these variables later when we implement grouping sets
+  // TODO: we may need some of these variables later when we implement grouping sets
 
-    // //! The grouping sets
+  // //! The grouping sets
   // duckdb::GroupedAggregateData grouped_aggregate_data;
 
   // //! The radix partitioned hash tables (one per grouping set)
@@ -73,11 +73,10 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
 
   // duckdb::unordered_map<duckdb::Expression*, size_t> filter_indexes;
 
-// Grouped aggregatge definitions for cudf compute
-std::vector<int> group_idx;
-std::vector<cudf::aggregation::Kind> cudf_aggregates;
-std::vector<int> cudf_aggregate_idx;
-
+  // Grouped aggregatge definitions for cudf compute
+  std::vector<int> group_idx;
+  std::vector<cudf::aggregation::Kind> cudf_aggregates;
+  std::vector<int> cudf_aggregate_idx;
 
  public:
   // Source interface

@@ -13,13 +13,14 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <iostream>
 #include "op/sirius_physical_grouped_aggregate_merge.hpp"
 
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "log/logging.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
+
+#include <iostream>
 
 namespace sirius {
 namespace op {
@@ -75,12 +76,11 @@ static duckdb::vector<duckdb::unsafe_vector<duckdb::idx_t>> convert_grouping_fun
 
 sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge(
   sirius_physical_grouped_aggregate* grouped_aggregate)
-  : sirius_physical_grouped_aggregate_merge(
-    grouped_aggregate->types,  // copied by value
-    grouped_aggregate->group_idx,
-    grouped_aggregate->cudf_aggregates,
-    grouped_aggregate->cudf_aggregate_idx,
-    grouped_aggregate->estimated_cardinality)
+  : sirius_physical_grouped_aggregate_merge(grouped_aggregate->types,  // copied by value
+                                            grouped_aggregate->group_idx,
+                                            grouped_aggregate->cudf_aggregates,
+                                            grouped_aggregate->cudf_aggregate_idx,
+                                            grouped_aggregate->estimated_cardinality)
 {
   child_op = grouped_aggregate;
 }
@@ -92,7 +92,7 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
   std::vector<int> cudf_aggregate_idx,
   duckdb::idx_t estimated_cardinality)
   : sirius_physical_partition_consumer_operator(
-    SiriusPhysicalOperatorType::MERGE_GROUP_BY, std::move(types), estimated_cardinality),
+      SiriusPhysicalOperatorType::MERGE_GROUP_BY, std::move(types), estimated_cardinality),
     group_idx(std::move(group_idx)),
     cudf_aggregates(std::move(cudf_aggregates)),
     cudf_aggregate_idx(std::move(cudf_aggregate_idx))
@@ -106,14 +106,14 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups_p,
   duckdb::idx_t estimated_cardinality)
   : sirius_physical_grouped_aggregate_merge(context,
-                                      std::move(types),
-                                      std::move(expressions),
-                                      std::move(groups_p),
-                                      {},
-                                      {},
-                                      estimated_cardinality,
-                                      duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES,
-                                      duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES)
+                                            std::move(types),
+                                            std::move(expressions),
+                                            std::move(groups_p),
+                                            {},
+                                            {},
+                                            estimated_cardinality,
+                                            duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES,
+                                            duckdb::TupleDataValidityType::CAN_HAVE_NULL_VALUES)
 {
 }
 
@@ -138,38 +138,40 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
       SiriusPhysicalOperatorType::MERGE_GROUP_BY, std::move(types), estimated_cardinality),
     grouping_sets(std::move(grouping_sets_p))
 {
-
   // Convert input parameters to cudf compute definitions BEFORE moving them
-  auto cudf_defs = convert_duckdb_aggregates_to_cudf(groups_p, expressions);
-  group_idx = std::move(cudf_defs.group_idx);
-  cudf_aggregates = std::move(cudf_defs.cudf_aggregates);
+  auto cudf_defs     = convert_duckdb_aggregates_to_cudf(groups_p, expressions);
+  group_idx          = std::move(cudf_defs.group_idx);
+  cudf_aggregates    = std::move(cudf_defs.cudf_aggregates);
   cudf_aggregate_idx = std::move(cudf_defs.cudf_aggregate_idx);
 }
- 
-std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>> sirius_physical_grouped_aggregate_merge::get_next_task_input_batch()
+
+std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>>
+sirius_physical_grouped_aggregate_merge::get_next_task_input_batch()
 {
-  // we need to lock, then pull all the batches from one partition and return them, and increment the partition index
-    std::lock_guard<std::mutex> lg(lock);
-    if (current_partition_index < ports.begin()->second->repo->num_partitions()) {
-      std::vector<::std::shared_ptr<::cucascade::data_batch>> input_batch;
-      bool found_batch = true;
-      while (found_batch) {
-        auto batch = ports.begin()->second->repo->pop_data_batch(::cucascade::batch_state::task_created, current_partition_index);
-        if (batch) {
-          input_batch.push_back(std::move(batch));
-        } else {
-          found_batch = false;
-        }
+  // we need to lock, then pull all the batches from one partition and return them, and increment
+  // the partition index
+  std::lock_guard<std::mutex> lg(lock);
+  if (current_partition_index < ports.begin()->second->repo->num_partitions()) {
+    std::vector<::std::shared_ptr<::cucascade::data_batch>> input_batch;
+    bool found_batch = true;
+    while (found_batch) {
+      auto batch = ports.begin()->second->repo->pop_data_batch(
+        ::cucascade::batch_state::task_created, current_partition_index);
+      if (batch) {
+        input_batch.push_back(std::move(batch));
+      } else {
+        found_batch = false;
       }
-      current_partition_index++;
-      return input_batch; 
-    } else {
-      return std::nullopt;
     }
+    current_partition_index++;
+    return input_batch;
+  } else {
+    return std::nullopt;
+  }
 }
 
-
-std::vector<std::shared_ptr<::cucascade::data_batch>> sirius_physical_grouped_aggregate_merge::execute(
+std::vector<std::shared_ptr<::cucascade::data_batch>>
+sirius_physical_grouped_aggregate_merge::execute(
   const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches,
   rmm::cuda_stream_view stream)
 {
@@ -178,16 +180,13 @@ std::vector<std::shared_ptr<::cucascade::data_batch>> sirius_physical_grouped_ag
       "We expect at least one input batch for grouped aggregate merge operator");
   }
   // if there is only one batch, return it. We are assuming it was already aggregated.
-  if (input_batches.size() == 1) {
-    return input_batches;
-  }
+  if (input_batches.size() == 1) { return input_batches; }
 
-  auto result = gpu_merge_impl::merge_grouped_aggregate(
-    input_batches,
-    group_idx.size(),
-    cudf_aggregates,
-    stream,
-    *input_batches[0]->get_memory_space());
+  auto result = gpu_merge_impl::merge_grouped_aggregate(input_batches,
+                                                        group_idx.size(),
+                                                        cudf_aggregates,
+                                                        stream,
+                                                        *input_batches[0]->get_memory_space());
   return {result};
 }
 }  // namespace op

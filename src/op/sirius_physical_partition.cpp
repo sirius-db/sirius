@@ -20,11 +20,11 @@
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "expression_executor/gpu_expression_executor.hpp"
 #include "log/logging.hpp"
+#include "op/partition/gpu_partition_impl.hpp"
 #include "op/sirius_physical_grouped_aggregate_merge.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_order.hpp"
 #include "op/sirius_physical_top_n.hpp"
-#include "op/partition/gpu_partition_impl.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 
 namespace sirius {
@@ -49,12 +49,13 @@ bool sirius_physical_partition::is_source() const { return true; }
 
 bool sirius_physical_partition::is_sink() const { return true; }
 
-void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_operator* op, bool is_build)
+void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_operator* op,
+                                                            bool is_build)
 {
   _partition_keys.clear();
   _partition_type = PartitionType::NONE;
   if (op->type == SiriusPhysicalOperatorType::HASH_JOIN) {
-    _partition_type = PartitionType::HASH;
+    _partition_type    = PartitionType::HASH;
     auto& hash_join_op = op->Cast<sirius_physical_hash_join>();
     if (is_build) {
       for (duckdb::idx_t cond_idx = 0; cond_idx < hash_join_op.conditions.size(); cond_idx++) {
@@ -72,13 +73,14 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
         }
       }
     }
-} else if (op->type == SiriusPhysicalOperatorType::HASH_GROUP_BY) {
-    _partition_type = PartitionType::HASH;
+  } else if (op->type == SiriusPhysicalOperatorType::HASH_GROUP_BY) {
+    _partition_type            = PartitionType::HASH;
     auto& grouped_aggregate_op = op->Cast<sirius_physical_grouped_aggregate>();
-    _partition_keys = grouped_aggregate_op.group_idx;
+    _partition_keys            = grouped_aggregate_op.group_idx;
 
-    // WSM TODO: this is the original code for getting the partition keys from the grouped aggregate operator which may be what we want to use when we care about grouping sets
-    // for (duckdb::idx_t i = 0; i < grouped_aggregate_op.groupings.size(); i++) {
+    // WSM TODO: this is the original code for getting the partition keys from the grouped aggregate
+    // operator which may be what we want to use when we care about grouping sets for (duckdb::idx_t
+    // i = 0; i < grouped_aggregate_op.groupings.size(); i++) {
     //   auto& grouping = grouped_aggregate_op.groupings[i];
     //   for (auto& group_idx : grouped_aggregate_op.grouping_sets[i]) {
     //     auto& group = grouped_aggregate_op.grouped_aggregate_data.groups[group_idx];
@@ -88,12 +90,12 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
     //   }
     // }
   } else if (op->type == SiriusPhysicalOperatorType::MERGE_GROUP_BY) {
-    _partition_type = PartitionType::HASH;
+    _partition_type                  = PartitionType::HASH;
     auto& grouped_aggregate_merge_op = op->Cast<sirius_physical_grouped_aggregate_merge>();
-    _partition_keys = grouped_aggregate_merge_op.group_idx;
+    _partition_keys                  = grouped_aggregate_merge_op.group_idx;
 
   } else if (op->type == SiriusPhysicalOperatorType::ORDER_BY) {
-    _partition_type = PartitionType::RANGE;
+    _partition_type   = PartitionType::RANGE;
     auto& order_by_op = op->Cast<sirius_physical_order>();
     for (size_t order_idx = 0; order_idx < order_by_op.orders.size(); order_idx++) {
       auto& expr = order_by_op.orders[order_idx].expression;
@@ -103,7 +105,7 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
     }
   } else if (op->type == SiriusPhysicalOperatorType::TOP_N) {
     _partition_type = PartitionType::CUSTOM;
-    auto& top_n_op = op->Cast<sirius_physical_top_n>();
+    auto& top_n_op  = op->Cast<sirius_physical_top_n>();
     for (size_t order_idx = 0; order_idx < top_n_op.orders.size(); order_idx++) {
       auto& expr = top_n_op.orders[order_idx].expression;
       if (expr->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
@@ -115,7 +117,6 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
 
 bool sirius_physical_partition::is_build_partition() { return _is_build; }
 
-
 std::vector<std::shared_ptr<::cucascade::data_batch>> sirius_physical_partition::execute(
   const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches,
   rmm::cuda_stream_view stream)
@@ -124,9 +125,7 @@ std::vector<std::shared_ptr<::cucascade::data_batch>> sirius_physical_partition:
     throw std::runtime_error("We expect only one input batch for partition operator");
   }
 
-  if (_num_partitions < 2) {
-    return input_batches;
-  }
+  if (_num_partitions < 2) { return input_batches; }
 
   auto input_batch = input_batches[0];
   std::vector<std::shared_ptr<cucascade::data_batch>> partitioned_results;
@@ -158,8 +157,10 @@ void sirius_physical_partition::sink(
   int partition_id = 0;
   for (auto& batch : input_batches) {
     for (auto& [next_op, port_id] : next_port_after_sink) {
-      // the next operator is a partition consumer operator, so we need to push the batch into the specific partition
-      auto partition_consumer_op = dynamic_cast<sirius_physical_partition_consumer_operator*>(next_op);
+      // the next operator is a partition consumer operator, so we need to push the batch into the
+      // specific partition
+      auto partition_consumer_op =
+        dynamic_cast<sirius_physical_partition_consumer_operator*>(next_op);
       if (partition_consumer_op) {
         partition_consumer_op->push_data_batch_partitioned(port_id, batch, partition_id);
       } else {

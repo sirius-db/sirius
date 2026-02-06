@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "cudf/aggregation.hpp"
+#include "cudf/types.hpp"
 #include "duckdb/execution/operator/aggregate/distinct_aggregate_data.hpp"
 #include "duckdb/execution/operator/aggregate/grouped_aggregate_data.hpp"
 #include "duckdb/execution/operator/aggregate/physical_hash_aggregate.hpp"
@@ -23,11 +25,9 @@
 #include "duckdb/execution/radix_partitioned_hashtable.hpp"
 #include "duckdb/parser/group_by_node.hpp"
 #include "duckdb/storage/data_table.hpp"
-#include "op/sirius_physical_partition_consumer_operator.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_operator.hpp"
-#include "cudf/types.hpp"
-#include "cudf/aggregation.hpp"
+#include "op/sirius_physical_partition_consumer_operator.hpp"
 
 namespace sirius {
 namespace op {
@@ -41,10 +41,10 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
   sirius_physical_grouped_aggregate_merge(sirius_physical_grouped_aggregate* grouped_aggregate);
 
   sirius_physical_grouped_aggregate_merge(duckdb::vector<duckdb::LogicalType> types,
-    std::vector<int> group_idx,
-    std::vector<cudf::aggregation::Kind> cudf_aggregates,
-    std::vector<int> cudf_aggregate_idx,
-    duckdb::idx_t estimated_cardinality);
+                                          std::vector<int> group_idx,
+                                          std::vector<cudf::aggregation::Kind> cudf_aggregates,
+                                          std::vector<int> cudf_aggregate_idx,
+                                          duckdb::idx_t estimated_cardinality);
 
   sirius_physical_grouped_aggregate_merge(
     duckdb::ClientContext& context,
@@ -88,7 +88,6 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
   std::vector<cudf::aggregation::Kind> cudf_aggregates;
   std::vector<int> cudf_aggregate_idx;
 
-
   std::size_t current_partition_index = 0;
 
  public:
@@ -105,7 +104,8 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
 
   bool sink_order_dependent() const override { return false; }
 
-  std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>> get_next_task_input_batch() override;
+  std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>> get_next_task_input_batch()
+    override;
 
   std::vector<std::shared_ptr<::cucascade::data_batch>> execute(
     const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches,

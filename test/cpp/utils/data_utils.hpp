@@ -56,7 +56,7 @@ namespace test {
 template <typename Traits>
 inline std::unique_ptr<cudf::column> vector_to_cudf_column(
   const std::vector<typename Traits::type>& values,
-  rmm::cuda_stream_view stream = cudf::get_default_stream(),
+  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource())
 {
   auto size = static_cast<cudf::size_type>(values.size());
@@ -68,9 +68,9 @@ inline std::unique_ptr<cudf::column> vector_to_cudf_column(
     cudf::size_type total_chars = 0;
     for (cudf::size_type i = 0; i < size; ++i) {
       offsets[i + 1] = offsets[i] + static_cast<cudf::size_type>(values[i].size());
-      total_chars = offsets[i + 1];
+      total_chars    = offsets[i + 1];
     }
-    
+
     std::vector<char> chars(static_cast<std::size_t>(total_chars));
     cudf::size_type cursor = 0;
     for (cudf::size_type i = 0; i < size; ++i) {
@@ -80,12 +80,11 @@ inline std::unique_ptr<cudf::column> vector_to_cudf_column(
     }
 
     // Offsets column
-    auto offsets_col = cudf::make_numeric_column(
-      cudf::data_type{cudf::type_id::INT32},
-      static_cast<cudf::size_type>(offsets.size()),
-      cudf::mask_state::UNALLOCATED,
-      stream,
-      mr);
+    auto offsets_col = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                                 static_cast<cudf::size_type>(offsets.size()),
+                                                 cudf::mask_state::UNALLOCATED,
+                                                 stream,
+                                                 mr);
     cudaMemcpyAsync(offsets_col->mutable_view().data<cudf::size_type>(),
                     offsets.data(),
                     offsets.size() * sizeof(cudf::size_type),
@@ -102,20 +101,16 @@ inline std::unique_ptr<cudf::column> vector_to_cudf_column(
                       stream.value());
     }
 
-    return cudf::make_strings_column(size,
-                                     std::move(offsets_col),
-                                     std::move(chars_buf),
-                                     0,
-                                     rmm::device_buffer{0, stream, mr});
+    return cudf::make_strings_column(
+      size, std::move(offsets_col), std::move(chars_buf), 0, rmm::device_buffer{0, stream, mr});
   }
   // Handle decimal types
   else if constexpr (Traits::is_decimal) {
-    auto col = cudf::make_fixed_point_column(
-      cudf::data_type{Traits::cudf_type, Traits::scale},
-      size,
-      cudf::mask_state::UNALLOCATED,
-      stream,
-      mr);
+    auto col = cudf::make_fixed_point_column(cudf::data_type{Traits::cudf_type, Traits::scale},
+                                             size,
+                                             cudf::mask_state::UNALLOCATED,
+                                             stream,
+                                             mr);
     cudaMemcpy(col->mutable_view().data<int64_t>(),
                values.data(),
                sizeof(int64_t) * values.size(),
@@ -143,10 +138,10 @@ inline std::unique_ptr<cudf::column> vector_to_cudf_column(
   }
   // Handle numeric types (including bool)
   else {
-    using T = typename Traits::type;
+    using T  = typename Traits::type;
     auto col = cudf::make_numeric_column(
       cudf::data_type{Traits::cudf_type}, size, cudf::mask_state::UNALLOCATED, stream, mr);
-    
+
     // Special handling for bool (stored as int8_t in cuDF)
     if constexpr (std::is_same_v<T, bool>) {
       std::vector<int8_t> tmp(values.size());
@@ -184,76 +179,64 @@ inline std::unique_ptr<cudf::column> vector_to_cudf_column(
  * @note Uses a random shuffle to distribute rows, so results are non-deterministic
  */
 inline std::vector<std::unique_ptr<cudf::table>> make_random_striped_split(
-    std::unique_ptr<cudf::table> input,
-    std::size_t num_splits,
-    rmm::cuda_stream_view stream = cudf::get_default_stream(),
-    rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource())
+  std::unique_ptr<cudf::table> input,
+  std::size_t num_splits,
+  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource())
 {
-  if (num_splits == 0) {
-    return {};
-  }
-  
+  if (num_splits == 0) { return {}; }
+
   auto num_rows = input->num_rows();
-  if (num_rows == 0) {
-    return {};
-  }
-  
+  if (num_rows == 0) { return {}; }
+
   // Create a vector of all row indices
   std::vector<cudf::size_type> all_indices(num_rows);
   std::iota(all_indices.begin(), all_indices.end(), 0);
-  
+
   // Shuffle the indices randomly
   std::random_device rd;
   std::mt19937 gen(rd());
   std::shuffle(all_indices.begin(), all_indices.end(), gen);
-  
+
   // Calculate rows per split (distribute evenly with remainder going to last split)
   auto base_rows_per_split = num_rows / num_splits;
-  auto remainder = num_rows % num_splits;
-  
+  auto remainder           = num_rows % num_splits;
+
   std::vector<std::unique_ptr<cudf::table>> result;
   result.reserve(num_splits);
-  
+
   cudf::size_type offset = 0;
   for (std::size_t i = 0; i < num_splits; ++i) {
     // Calculate how many rows this split gets
     auto rows_in_split = base_rows_per_split + (i < remainder ? 1 : 0);
-    
-    if (rows_in_split == 0) {
-      continue;
-    }
-    
+
+    if (rows_in_split == 0) { continue; }
+
     // Create gather map for this split
-    std::vector<cudf::size_type> split_indices(
-        all_indices.begin() + offset,
-        all_indices.begin() + offset + rows_in_split);
-    
+    std::vector<cudf::size_type> split_indices(all_indices.begin() + offset,
+                                               all_indices.begin() + offset + rows_in_split);
+
     // Create cuDF column from indices for gather map
-    auto gather_map = cudf::make_numeric_column(
-        cudf::data_type{cudf::type_id::INT32},
-        static_cast<cudf::size_type>(split_indices.size()),
-        cudf::mask_state::UNALLOCATED,
-        stream,
-        mr);
-    
+    auto gather_map = cudf::make_numeric_column(cudf::data_type{cudf::type_id::INT32},
+                                                static_cast<cudf::size_type>(split_indices.size()),
+                                                cudf::mask_state::UNALLOCATED,
+                                                stream,
+                                                mr);
+
     cudaMemcpyAsync(gather_map->mutable_view().data<cudf::size_type>(),
                     split_indices.data(),
                     split_indices.size() * sizeof(cudf::size_type),
                     cudaMemcpyHostToDevice,
                     stream.value());
-    
+
     // Use cuDF gather to create the split table
     auto split_table = cudf::gather(
-        input->view(),
-        gather_map->view(),
-        cudf::out_of_bounds_policy::DONT_CHECK,
-        stream,
-        mr);
-    
+      input->view(), gather_map->view(), cudf::out_of_bounds_policy::DONT_CHECK, stream, mr);
+
     result.push_back(std::move(split_table));
     offset += rows_in_split;
   }
-  
+
   return result;
 }
 

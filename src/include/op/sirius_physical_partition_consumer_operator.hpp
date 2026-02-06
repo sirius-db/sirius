@@ -25,10 +25,9 @@ namespace op {
 //! that can consume partitioned data batches
 class sirius_physical_partition_consumer_operator : public sirius_physical_operator {
  public:
-  sirius_physical_partition_consumer_operator(
-    SiriusPhysicalOperatorType type,
-    duckdb::vector<duckdb::LogicalType> types,
-    duckdb::idx_t estimated_cardinality)
+  sirius_physical_partition_consumer_operator(SiriusPhysicalOperatorType type,
+                                              duckdb::vector<duckdb::LogicalType> types,
+                                              duckdb::idx_t estimated_cardinality)
     : sirius_physical_operator(type, std::move(types), estimated_cardinality)
   {
   }
@@ -39,10 +38,9 @@ class sirius_physical_partition_consumer_operator : public sirius_physical_opera
   //! @param port_id The port identifier
   //! @param batch The data batch to push
   //! @param partition_idx The partition index
-  virtual void push_data_batch_partitioned(
-    std::string_view port_id,
-    std::shared_ptr<::cucascade::data_batch> batch,
-    duckdb::idx_t partition_idx);
+  virtual void push_data_batch_partitioned(std::string_view port_id,
+                                           std::shared_ptr<::cucascade::data_batch> batch,
+                                           duckdb::idx_t partition_idx);
 };
 
 }  // namespace op

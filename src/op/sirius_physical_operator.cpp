@@ -172,7 +172,8 @@ sirius_physical_operator::port* sirius_physical_operator::get_port(std::string_v
     for (auto& [port_name, port_ptr] : ports) {
       ports_string += port_name + ", ";
     }
-    throw duckdb::InternalException("Port " + std::string(port_id) + " not found in operator " + get_name() + " existing ports are: " + ports_string);                                    
+    throw duckdb::InternalException("Port " + std::string(port_id) + " not found in operator " +
+                                    get_name() + " existing ports are: " + ports_string);
   }
   return it->second.get();
 }

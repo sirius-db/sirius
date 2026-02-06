@@ -30,9 +30,9 @@ namespace op {
  * @brief Result of converting DuckDB aggregate expressions to cuDF compute definitions.
  */
 struct CudfAggregateDefinitions {
-  std::vector<int> group_idx;              ///< Column indices for GROUP BY keys
+  std::vector<int> group_idx;                            ///< Column indices for GROUP BY keys
   std::vector<cudf::aggregation::Kind> cudf_aggregates;  ///< cuDF aggregation types
-  std::vector<int> cudf_aggregate_idx;     ///< Column indices for aggregation inputs
+  std::vector<int> cudf_aggregate_idx;                   ///< Column indices for aggregation inputs
 };
 
 /**

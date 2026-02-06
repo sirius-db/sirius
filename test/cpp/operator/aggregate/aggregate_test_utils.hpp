@@ -16,14 +16,14 @@
 
 #pragma once
 
-#include <duckdb.hpp>
-#include <duckdb/planner/expression/bound_aggregate_expression.hpp>
-#include <duckdb/planner/expression/bound_reference_expression.hpp>
+#include "../operator_test_utils.hpp"
+#include "utils/data_utils.hpp"
 
 #include <cudf/table/table.hpp>
 
-#include "../operator_test_utils.hpp"
-#include "utils/data_utils.hpp"
+#include <duckdb.hpp>
+#include <duckdb/planner/expression/bound_aggregate_expression.hpp>
+#include <duckdb/planner/expression/bound_reference_expression.hpp>
 
 #include <algorithm>
 #include <memory>
@@ -46,14 +46,13 @@ struct AggregateExpressionResult {
 
 /**
  * @brief Helper to create a dummy AggregateFunction for testing
- * 
+ *
  * Creates a minimal AggregateFunction with just name and types,
  * suitable for GPU operator testing where full aggregate logic isn't needed.
  */
-inline duckdb::AggregateFunction MakeDummyAggregate(
-  const std::string& name,
-  const duckdb::vector<duckdb::LogicalType>& args,
-  const duckdb::LogicalType& ret_type)
+inline duckdb::AggregateFunction MakeDummyAggregate(const std::string& name,
+                                                    const duckdb::vector<duckdb::LogicalType>& args,
+                                                    const duckdb::LogicalType& ret_type)
 {
   return duckdb::AggregateFunction(
     name, args, ret_type, 0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
@@ -69,7 +68,8 @@ inline duckdb::AggregateFunction MakeDummyAggregate(
  * @param group_indexes Column indices for GROUP BY expressions
  * @param aggregations Names of aggregation functions (e.g., "sum", "count", "avg")
  * @param agg_indexes Column indices for aggregation input expressions
- * @return AggregateExpressionResult containing output types, group expressions, and aggregate expressions
+ * @return AggregateExpressionResult containing output types, group expressions, and aggregate
+ * expressions
  */
 template <typename Traits>
 AggregateExpressionResult create_aggregate_expressions(
@@ -96,7 +96,7 @@ AggregateExpressionResult create_aggregate_expressions(
   // Create aggregate expressions
   for (std::size_t i = 0; i < aggregations.size(); ++i) {
     const std::string& agg_name = aggregations[i];
-    std::size_t agg_idx = agg_indexes[i];
+    std::size_t agg_idx         = agg_indexes[i];
 
     // Create children for the aggregate (the column to aggregate)
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> agg_children;
@@ -104,16 +104,16 @@ AggregateExpressionResult create_aggregate_expressions(
       duckdb::make_uniq<duckdb::BoundReferenceExpression>(Traits::logical_type(), agg_idx));
 
     // Create the dummy aggregate function
-    duckdb::AggregateFunction agg_function = 
+    duckdb::AggregateFunction agg_function =
       MakeDummyAggregate(agg_name, {Traits::logical_type()}, Traits::logical_type());
 
     // Create the BoundAggregateExpression
-    auto agg_expr = duckdb::make_uniq<duckdb::BoundAggregateExpression>(
-      agg_function,
-      std::move(agg_children),
-      nullptr, // filter
-      nullptr, // bind_info
-      duckdb::AggregateType::NON_DISTINCT);
+    auto agg_expr =
+      duckdb::make_uniq<duckdb::BoundAggregateExpression>(agg_function,
+                                                          std::move(agg_children),
+                                                          nullptr,  // filter
+                                                          nullptr,  // bind_info
+                                                          duckdb::AggregateType::NON_DISTINCT);
 
     result.aggregates.push_back(std::move(agg_expr));
   }
@@ -139,13 +139,13 @@ AggregateExpressionResult create_aggregate_expressions(
  * @note When num_group_key_columns == 2, the second group key column is always a string type
  * @note The expected table includes min, max, and count aggregations
  */
-template<typename Traits>
+template <typename Traits>
 std::pair<std::unique_ptr<cudf::table>, std::unique_ptr<cudf::table>>
-make_test_data_for_grouped_aggregate(
-    std::size_t num_groups,
-    std::size_t num_group_key_columns,
-    rmm::cuda_stream_view stream,
-    rmm::device_async_resource_ref mr) {
+make_test_data_for_grouped_aggregate(std::size_t num_groups,
+                                     std::size_t num_group_key_columns,
+                                     rmm::cuda_stream_view stream,
+                                     rmm::device_async_resource_ref mr)
+{
   std::vector<int32_t> group_sizes(num_groups);
   std::iota(group_sizes.begin(), group_sizes.end(), 1);
   std::size_t total_num_values = std::accumulate(group_sizes.begin(), group_sizes.end(), 0);
@@ -171,20 +171,30 @@ make_test_data_for_grouped_aggregate(
 
     // Set group keys
     if constexpr (Traits::is_string) {
-      std::fill(key_values0.begin() + offset, key_values0.begin() + offset + num_values, std::to_string(group_idx));
+      std::fill(key_values0.begin() + offset,
+                key_values0.begin() + offset + num_values,
+                std::to_string(group_idx));
     } else {
-      std::fill(key_values0.begin() + offset, key_values0.begin() + offset + num_values, static_cast<typename Traits::type>(group_idx));
+      std::fill(key_values0.begin() + offset,
+                key_values0.begin() + offset + num_values,
+                static_cast<typename Traits::type>(group_idx));
     }
 
     if (num_group_key_columns == 2) {
-      std::fill(key_values1.begin() + offset, key_values1.begin() + offset + num_values, std::to_string(group_idx));
+      std::fill(key_values1.begin() + offset,
+                key_values1.begin() + offset + num_values,
+                std::to_string(group_idx));
     }
 
     // Set values for aggregation
     if constexpr (Traits::is_string) {
-      std::fill(value_values.begin() + offset, value_values.begin() + offset + num_values, std::to_string(group_idx));
+      std::fill(value_values.begin() + offset,
+                value_values.begin() + offset + num_values,
+                std::to_string(group_idx));
     } else {
-      std::iota(value_values.begin() + offset, value_values.begin() + offset + num_values, static_cast<typename Traits::type>(-group_idx)/2);
+      std::iota(value_values.begin() + offset,
+                value_values.begin() + offset + num_values,
+                static_cast<typename Traits::type>(-group_idx) / 2);
     }
 
     // Set expected values
@@ -194,12 +204,12 @@ make_test_data_for_grouped_aggregate(
       expected_group_by0[group_idx] = group_idx;
     }
 
-    if (num_group_key_columns == 2) {
-      expected_group_by1[group_idx] = std::to_string(group_idx);
-    }
+    if (num_group_key_columns == 2) { expected_group_by1[group_idx] = std::to_string(group_idx); }
 
-    expected_min[group_idx] = *std::min_element(value_values.begin() + offset, value_values.begin() + offset + num_values);
-    expected_max[group_idx] = *std::max_element(value_values.begin() + offset, value_values.begin() + offset + num_values);
+    expected_min[group_idx] =
+      *std::min_element(value_values.begin() + offset, value_values.begin() + offset + num_values);
+    expected_max[group_idx] =
+      *std::max_element(value_values.begin() + offset, value_values.begin() + offset + num_values);
     expected_count[group_idx] = num_values;
 
     offset += num_values;
@@ -209,7 +219,9 @@ make_test_data_for_grouped_aggregate(
   std::vector<std::unique_ptr<cudf::column>> input_columns;
   input_columns.push_back(vector_to_cudf_column<Traits>(key_values0, stream, mr));
   if (num_group_key_columns == 2) {
-    input_columns.push_back(vector_to_cudf_column<operator_utils::gpu_type_traits<operator_utils::string_tag>>(key_values1, stream, mr));
+    input_columns.push_back(
+      vector_to_cudf_column<operator_utils::gpu_type_traits<operator_utils::string_tag>>(
+        key_values1, stream, mr));
   }
   input_columns.push_back(vector_to_cudf_column<Traits>(value_values, stream, mr));
   auto input_table = std::make_unique<cudf::table>(std::move(input_columns));
@@ -218,11 +230,14 @@ make_test_data_for_grouped_aggregate(
   std::vector<std::unique_ptr<cudf::column>> expected_cols;
   expected_cols.push_back(vector_to_cudf_column<Traits>(expected_group_by0, stream, mr));
   if (num_group_key_columns == 2) {
-    expected_cols.push_back(vector_to_cudf_column<operator_utils::gpu_type_traits<operator_utils::string_tag>>(expected_group_by1, stream, mr));
+    expected_cols.push_back(
+      vector_to_cudf_column<operator_utils::gpu_type_traits<operator_utils::string_tag>>(
+        expected_group_by1, stream, mr));
   }
   expected_cols.push_back(vector_to_cudf_column<Traits>(expected_min, stream, mr));
   expected_cols.push_back(vector_to_cudf_column<Traits>(expected_max, stream, mr));
-  expected_cols.push_back(vector_to_cudf_column<operator_utils::gpu_type_traits<int32_t>>(expected_count, stream, mr));
+  expected_cols.push_back(
+    vector_to_cudf_column<operator_utils::gpu_type_traits<int32_t>>(expected_count, stream, mr));
   auto expected_table = std::make_unique<cudf::table>(std::move(expected_cols));
 
   return {std::move(input_table), std::move(expected_table)};

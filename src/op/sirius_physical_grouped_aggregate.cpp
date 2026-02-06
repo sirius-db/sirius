@@ -24,7 +24,6 @@
 namespace sirius {
 namespace op {
 
-
 // TODO: we may need some of these functions later when we implement grouping sets
 // static duckdb::vector<duckdb::LogicalType> create_group_chunk_types(
 //   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>& groups)
@@ -86,8 +85,8 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
       SiriusPhysicalOperatorType::HASH_GROUP_BY, std::move(types), estimated_cardinality),
     grouping_sets(std::move(grouping_sets_p))
 {
-
-  // TODO: for now commenting out this code because we are not using grouping sets yet. Will add it back later when necessary.
+  // TODO: for now commenting out this code because we are not using grouping sets yet. Will add it
+  // back later when necessary.
 
   // // get a list of all aggregates to be computed
   // const duckdb::idx_t group_count = groups_p.size();
@@ -157,13 +156,10 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
   // }
   // total_output_columns += grouped_aggregate_data.GroupCount();
 
-
-  auto cudf_defs = convert_duckdb_aggregates_to_cudf(groups_p, expressions);
-  group_idx = std::move(cudf_defs.group_idx);
-  cudf_aggregates = std::move(cudf_defs.cudf_aggregates);
+  auto cudf_defs     = convert_duckdb_aggregates_to_cudf(groups_p, expressions);
+  group_idx          = std::move(cudf_defs.group_idx);
+  cudf_aggregates    = std::move(cudf_defs.cudf_aggregates);
   cudf_aggregate_idx = std::move(cudf_defs.cudf_aggregate_idx);
-
-
 }
 
 std::vector<std::shared_ptr<::cucascade::data_batch>> sirius_physical_grouped_aggregate::execute(
@@ -172,13 +168,12 @@ std::vector<std::shared_ptr<::cucascade::data_batch>> sirius_physical_grouped_ag
 {
   std::vector<std::shared_ptr<::cucascade::data_batch>> results;
   for (auto& input_batch : input_batches) {
-    auto result = gpu_aggregate_impl::local_grouped_aggregate(
-      input_batch,
-      group_idx,
-      cudf_aggregates,
-      cudf_aggregate_idx,
-      stream,
-      *input_batch->get_memory_space());
+    auto result = gpu_aggregate_impl::local_grouped_aggregate(input_batch,
+                                                              group_idx,
+                                                              cudf_aggregates,
+                                                              cudf_aggregate_idx,
+                                                              stream,
+                                                              *input_batch->get_memory_space());
     results.push_back(std::move(result));
   }
   return results;

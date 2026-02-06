@@ -160,8 +160,8 @@ duckdb::vector<duckdb::reference<op::sirius_physical_operator>> sirius_pipeline:
   return operators;
 }
 
-duckdb::vector<duckdb::const_reference<op::sirius_physical_operator>> sirius_pipeline::get_operators()
-  const
+duckdb::vector<duckdb::const_reference<op::sirius_physical_operator>>
+sirius_pipeline::get_operators() const
 {
   duckdb::vector<duckdb::const_reference<op::sirius_physical_operator>> result;
   result.reserve(operators.size());

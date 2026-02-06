@@ -42,7 +42,7 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
   // 2. Extract aggregates (cudf::aggregation::Kind) from expressions
   for (const auto& aggregate : expressions) {
     auto& aggr = aggregate->Cast<duckdb::BoundAggregateExpression>();
-    
+
     // Convert DuckDB aggregate function name to cudf::aggregation::Kind
     cudf::aggregation::Kind agg_kind;
     if (aggr.function.name == "sum" || aggr.function.name == "sum_no_overflow") {
@@ -59,14 +59,15 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
       throw std::runtime_error("Unsupported aggregate function: " + aggr.function.name);
     }
     result.cudf_aggregates.push_back(agg_kind);
-    
+
     // 3. Extract aggregate_idx from the children of the aggregate expression
     if (aggr.children.empty()) {
       // COUNT(*) has no children - use 0 as a placeholder (will be handled by COUNT_ALL)
       if (aggr.function.name == "count_star") {
         result.cudf_aggregate_idx.push_back(0);
       } else {
-        throw std::runtime_error("Unsupported aggregate function: " + aggr.function.name + " with no children");
+        throw std::runtime_error("Unsupported aggregate function: " + aggr.function.name +
+                                 " with no children");
       }
     } else {
       if (aggr.children.size() == 1) {
@@ -75,7 +76,8 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
         auto& bound_ref = aggr.children[0]->Cast<duckdb::BoundReferenceExpression>();
         result.cudf_aggregate_idx.push_back(static_cast<int>(bound_ref.index));
       } else {
-        throw std::runtime_error("Unsupported aggregate function: " + aggr.function.name + " with " + std::to_string(aggr.children.size()) + " children");
+        throw std::runtime_error("Unsupported aggregate function: " + aggr.function.name +
+                                 " with " + std::to_string(aggr.children.size()) + " children");
       }
     }
   }
