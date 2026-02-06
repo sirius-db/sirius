@@ -20,6 +20,8 @@
 #include "log/logging.hpp"
 #include "operator/gpu_materialize.hpp"
 
+#include <algorithm>
+
 namespace duckdb {
 
 GPUPhysicalStreamingLimit::GPUPhysicalStreamingLimit(vector<LogicalType> types,
@@ -55,7 +57,7 @@ OperatorResultType GPUPhysicalStreamingLimit::Execute(
     shared_ptr<GPUColumn> materialize_column =
       HandleMaterializeExpression(input_relation.columns[col_idx], gpuBufferManager);
 
-    limit_const = min(limit_const, materialize_column->column_length);
+    limit_const = std::min(limit_const, materialize_column->column_length);
     output_relation.columns[col_idx] =
       make_shared_ptr<GPUColumn>(limit_const,
                                  materialize_column->data_wrapper.type,

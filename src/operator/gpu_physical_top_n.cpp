@@ -27,6 +27,8 @@
 #include "log/logging.hpp"
 #include "utils.hpp"
 
+#include <algorithm>
+
 namespace duckdb {
 
 GPUPhysicalTopN::GPUPhysicalTopN(vector<LogicalType> types_p,
@@ -154,8 +156,8 @@ SourceResultType GPUPhysicalTopN::GetData(GPUIntermediateRelation& output_relati
                                    sort_result->columns[col]->data_wrapper.is_string_data,
                                    nullptr);
     } else {
-      auto limit_const              = min(limit, sort_result->columns[col]->column_length - offset);
-      uint8_t* output_col_data      = sort_result->columns[col]->data_wrapper.data;
+      auto limit_const         = std::min(limit, sort_result->columns[col]->column_length - offset);
+      uint8_t* output_col_data = sort_result->columns[col]->data_wrapper.data;
       uint64_t* output_col_offset   = sort_result->columns[col]->data_wrapper.offset;
       uint64_t output_col_num_bytes = sort_result->columns[col]->data_wrapper.num_bytes;
       if (sort_result->columns[col]->data_wrapper.type.id() == GPUColumnTypeId::VARCHAR) {

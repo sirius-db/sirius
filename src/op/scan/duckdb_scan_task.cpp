@@ -49,9 +49,15 @@ duckdb_scan_task_global_state::duckdb_scan_task_global_state(
     _op(*scan_op)
 {
   // Initialize global table function state
+  // Note: We pass nullptr for table_filters because filters are applied by the Sirius physical
+  // table scan operator, not by the DuckDB table function. This ensures consistent filtering
+  // behavior and allows GPU-accelerated filter execution.
   if (_op.function.init_global) {
-    duckdb::TableFunctionInitInput tf_input(
-      _op.bind_data.get(), _op.column_ids, _op.scanned_ids, nullptr, _op.extra_info.sample_options);
+    duckdb::TableFunctionInitInput tf_input(_op.bind_data.get(),
+                                            _op.column_ids,
+                                            _op.scanned_ids,
+                                            nullptr,  // Don't pass filters to DuckDB
+                                            _op.extra_info.sample_options);
     _global_tf_state = _op.function.init_global(client_ctx, tf_input);
   }
 
@@ -61,7 +67,8 @@ duckdb_scan_task_global_state::duckdb_scan_task_global_state(
       "In-out table functions are not supported in sirius table scans.");
   }
 
-  // For caching reasons, we do not push table filters into the scan
+  // Dynamic filters (from joins) are not supported. Regular table_filters (from WHERE clauses) are
+  // supported.
   if (_op.dynamic_filters) {
     throw duckdb::NotImplementedException(
       "Dynamic table filters are not supported in sirius table scans.");
@@ -387,9 +394,13 @@ void duckdb_scan_task_local_state::initialize_local_table_function_state(
 {
   // Note: local_tf_state might already be set if it was moved from a previous task
   // Only create a new one if it doesn't exist
+  // Don't pass filters to DuckDB - they're applied by Sirius physical table scan
   if (!_local_tf_state && op.function.init_local) {
-    duckdb::TableFunctionInitInput tf_input(
-      op.bind_data.get(), op.column_ids, op.projection_ids, nullptr, op.extra_info.sample_options);
+    duckdb::TableFunctionInitInput tf_input(op.bind_data.get(),
+                                            op.column_ids,
+                                            op.projection_ids,
+                                            nullptr,  // Don't pass filters to DuckDB
+                                            op.extra_info.sample_options);
     _local_tf_state = op.function.init_local(exec_ctx, tf_input, global_tf_state);
   }
 }

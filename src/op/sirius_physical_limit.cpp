@@ -47,13 +47,18 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_streaming_li
 {
   SIRIUS_LOG_DEBUG("Executing streaming limit");
 
-  if (limit_val.Type() != duckdb::LimitNodeType::CONSTANT_VALUE ||
-      offset_val.Type() != duckdb::LimitNodeType::CONSTANT_VALUE) {
-    throw duckdb::NotImplementedException("Streaming limit with non-constant limit/offset");
+  if (limit_val.Type() != duckdb::LimitNodeType::CONSTANT_VALUE) {
+    throw duckdb::NotImplementedException("Streaming limit with non-constant limit value");
+  }
+  if (offset_val.Type() != duckdb::LimitNodeType::CONSTANT_VALUE &&
+      offset_val.Type() != duckdb::LimitNodeType::UNSET) {
+    throw duckdb::NotImplementedException("Streaming limit with non-constant offset value");
   }
 
   auto limit_const  = static_cast<cudf::size_type>(limit_val.GetConstantValue());
-  auto offset_const = static_cast<cudf::size_type>(offset_val.GetConstantValue());
+  auto offset_const = offset_val.Type() == duckdb::LimitNodeType::CONSTANT_VALUE
+                        ? static_cast<cudf::size_type>(offset_val.GetConstantValue())
+                        : cudf::size_type{0};
 
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
   output_batches.reserve(input_batches.size());

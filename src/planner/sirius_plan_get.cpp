@@ -54,49 +54,6 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   auto column_ids = op.GetColumnIds();
   if (!op.children.empty()) {
     throw duckdb::NotImplementedException("Table Input Output functions are not supported yet");
-    // duckdb::reference<sirius::op::sirius_physical_operator> child =
-    // ResolveAndPlan(std::move(op.children[0])); auto &child_types = child.get().types;
-
-    // // this is for table producing functions that consume subquery results
-    // // push a projection node with casts if required
-    // if (child_types.size() < op.input_table_types.size()) {
-    // 	throw duckdb::InternalException(
-    // 	    "Mismatch between input table types and child node types - expected %llu but got %llu",
-    // 	    op.input_table_types.size(), child_types.size());
-    // }
-
-    // duckdb::vector<duckdb::LogicalType> return_types;
-    // duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions;
-    // bool any_cast_required = false;
-    // for (duckdb::idx_t proj_idx = 0; proj_idx < child_types.size(); proj_idx++) {
-    // 	auto ref = duckdb::make_uniq<duckdb::BoundReferenceExpression>(child_types[proj_idx],
-    // proj_idx); 	auto &target_type = 	    proj_idx < op.input_table_types.size() ?
-    // op.input_table_types[proj_idx] : child_types[proj_idx]; 	if (child_types[proj_idx] !=
-    // target_type) {
-    // 		// cast is required - push a cast
-    // 		any_cast_required = true;
-    // 		auto cast = duckdb::BoundCastExpression::AddCastToType(context, std::move(ref),
-    // target_type); 		expressions.push_back(std::move(cast)); 	} else {
-    // 		expressions.push_back(std::move(ref));
-    // 	}
-    // 	return_types.push_back(target_type);
-    // }
-
-    // if (any_cast_required) {
-    // 	auto &proj = Make<sirius::op::sirius_physical_operator>(std::move(return_types),
-    // std::move(expressions), child.get().estimated_cardinality); 	proj.children.push_back(child);
-    // 	child = proj;
-    // }
-
-    // auto &table_in_out =
-    //     Make<PhysicalTableInOutFunction>(op.types, op.function, std::move(op.bind_data),
-    //     column_ids,
-    //                                      op.estimated_cardinality,
-    //                                      std::move(op.projected_input));
-    // table_in_out.children.push_back(child);
-    // auto &cast_table_in_out = table_in_out.Cast<PhysicalTableInOutFunction>();
-    // cast_table_in_out.ordinality_idx = op.ordinality_idx;
-    // return table_in_out;
   }
 
   if (!op.projected_input.empty()) {
@@ -114,27 +71,46 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> filter;
   auto& projection_ids = op.projection_ids;
 
+  // With FILTER_PUSHDOWN enabled, filters from WHERE clauses are pushed into table_filters.
+  // Since we don't pass filters to the DuckDB table function (they're applied by Sirius),
+  // we need to ensure all filter columns are included in BOTH column_ids and projection_ids.
+  // We track the original projection_ids so we can project back after filtering.
+  duckdb::vector<duckdb::idx_t> original_projection_ids = projection_ids;
+
+  // Save the original types before we modify projection_ids, because modifying projection_ids
+  // might affect the types when we call ResolveOperatorTypes()
+  duckdb::vector<duckdb::LogicalType> original_types = op.types;
+
+  if (table_filters) {
+    for (auto& entry : table_filters->filters) {
+      // entry.first is the column index in the table_filters (after remapping by
+      // create_table_filter_set) We need to ensure this column is in projection_ids so it gets
+      // scanned by DuckDB
+
+      bool found_in_projection = false;
+      for (duckdb::idx_t j = 0; j < projection_ids.size(); j++) {
+        if (projection_ids[j] == entry.first) {
+          found_in_projection = true;
+          break;
+        }
+      }
+
+      if (!found_in_projection) { projection_ids.push_back(entry.first); }
+    }
+  }
+
+  // Handle cases where table function doesn't support pushdown for specific column types
   if (table_filters && op.function.supports_pushdown_type) {
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> select_list;
-    duckdb::unique_ptr<duckdb::Expression> unsupported_filter;
     duckdb::unordered_set<duckdb::idx_t> to_remove;
     for (auto& entry : table_filters->filters) {
       auto column_id = column_ids[entry.first].GetPrimaryIndex();
       auto& type     = op.returned_types[column_id];
+
+      // If the table function doesn't support pushdown for this column type,
+      // create a separate filter operator for it
       if (!op.function.supports_pushdown_type(*op.bind_data, column_id)) {
         duckdb::idx_t column_id_filter = entry.first;
-        bool found_projection          = false;
-        for (duckdb::idx_t i = 0; i < projection_ids.size(); i++) {
-          if (column_ids[projection_ids[i]] == column_ids[entry.first]) {
-            column_id_filter = i;
-            found_projection = true;
-            break;
-          }
-        }
-        if (!found_projection) {
-          projection_ids.push_back(entry.first);
-          column_id_filter = projection_ids.size() - 1;
-        }
         auto column = duckdb::make_uniq<duckdb::BoundReferenceExpression>(type, column_id_filter);
         select_list.push_back(entry.second->ToExpression(*column));
         to_remove.insert(entry.first);
@@ -158,12 +134,6 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   // create the table scan node
   if (!op.function.projection_pushdown) {
     // function does not support projection pushdown
-    // auto &table_scan = Make<sirius::op::sirius_physical_table_scan>(
-    //     op.returned_types, op.function, std::move(op.bind_data), op.returned_types, column_ids,
-    //     duckdb::vector<duckdb::column_t>(), op.names, std::move(table_filters),
-    //     op.estimated_cardinality, std::move(op.extra_info), std::move(op.parameters),
-    //     std::move(op.virtual_columns));
-
     auto node =
       duckdb::make_uniq<sirius::op::sirius_physical_table_scan>(op.returned_types,
                                                                 op.function,
@@ -221,19 +191,19 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
     return std::move(projection);
   }
 
-  auto node =
-    duckdb::make_uniq<sirius::op::sirius_physical_table_scan>(op.types,
-                                                              op.function,
-                                                              std::move(op.bind_data),
-                                                              op.returned_types,
-                                                              column_ids,
-                                                              op.projection_ids,
-                                                              op.names,
-                                                              std::move(table_filters),
-                                                              op.estimated_cardinality,
-                                                              std::move(op.extra_info),
-                                                              std::move(op.parameters),
-                                                              std::move(op.virtual_columns));
+  auto node = duckdb::make_uniq<sirius::op::sirius_physical_table_scan>(
+    original_types,  // Use original types, not modified
+    op.function,
+    std::move(op.bind_data),
+    op.returned_types,
+    column_ids,
+    op.projection_ids,
+    op.names,
+    std::move(table_filters),
+    op.estimated_cardinality,
+    std::move(op.extra_info),
+    std::move(op.parameters),
+    std::move(op.virtual_columns));
   node->dynamic_filters = op.dynamic_filters;
   if (filter) {
     filter->children.push_back(std::move(node));

@@ -28,6 +28,10 @@
 #include "log/logging.hpp"
 #include "utils.hpp"
 
+#include <cudf/table/table.hpp>
+
+#include <cucascade/data/gpu_data_representation.hpp>
+
 namespace sirius {
 namespace op {
 
@@ -65,12 +69,7 @@ sirius_physical_table_scan::sirius_physical_table_scan(
     gen_row_id_column(column_ids.back().GetPrimaryIndex() == duckdb::DConstants::INVALID_INDEX)
 {
   auto num_cols = column_ids.size() - gen_row_id_column;
-  // duckdb::GPUBufferManager* gpuBufferManager = &(duckdb::GPUBufferManager::GetInstance());
-  // column_size = gpuBufferManager->customCudaHostAlloc<uint64_t>(column_ids.size());
-  // mask_size   = gpuBufferManager->customCudaHostAlloc<uint64_t>(column_ids.size());
   for (int col = 0; col < num_cols; col++) {
-    // column_size[col] = 0;
-    // mask_size[col]   = 0;
     scanned_types.push_back(returned_types[column_ids[col].GetPrimaryIndex()]);
     scanned_ids.push_back(col);
   }
@@ -80,21 +79,14 @@ sirius_physical_table_scan::sirius_physical_table_scan(
   }
 
   fake_table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
-  // already_cached     = gpuBufferManager->customCudaHostAlloc<bool>(column_ids.size());
-  // if (Config::USE_OPT_TABLE_SCAN) {
-  //   num_rows = 0;
-  //   cuda_streams.resize(Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS);
-  //   for (int i = 0; i < Config::OPT_TABLE_SCAN_NUM_CUDA_STREAMS; i++) {
-  //     cudaStreamCreate(&cuda_streams[i]);
-  //   }
-  // }
   SIRIUS_LOG_DEBUG("Table scan column ids: {}", column_ids.size());
 }
 
 duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
   const duckdb::TableFilterSet& filters,
   const duckdb::vector<duckdb::ColumnIndex>& column_ids,
-  const duckdb::vector<duckdb::LogicalType>& returned_types)
+  const duckdb::vector<duckdb::LogicalType>& returned_types,
+  const duckdb::vector<duckdb::idx_t>& projection_ids)
 {
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> filter_expressions;
 
@@ -105,12 +97,20 @@ duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
       continue;
     }
 
-    // Create column reference for this filter
-    auto col_type   = returned_types[column_ids[column_index].GetPrimaryIndex()];
-    auto column_ref = duckdb::make_uniq<duckdb::BoundReferenceExpression>(col_type, column_index);
+    auto primary_idx = column_ids[column_index].GetPrimaryIndex();
+    auto col_type    = returned_types[primary_idx];
+
+    // The batch columns are produced by DuckDB scan in the same order as column_ids.
+    // So the batch column index is just the column_index itself.
+    duckdb::idx_t batch_column_index = column_index;
+
+    // Create column reference for this filter - uses the batch column index
+    auto column_ref =
+      duckdb::make_uniq<duckdb::BoundReferenceExpression>(col_type, batch_column_index);
 
     // Convert filter to expression
-    filter_expressions.push_back(filter->ToExpression(*column_ref));
+    auto expr = filter->ToExpression(*column_ref);
+    filter_expressions.push_back(std::move(expr));
   }
 
   // No filters to apply
@@ -132,23 +132,23 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_table_scan::
   const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches)
 {
   auto start = std::chrono::high_resolution_clock::now();
-  SIRIUS_LOG_DEBUG("Executing table scan");
+
   duckdb::unique_ptr<duckdb::Expression> filter_expr;
   if (table_filters) {
-    filter_expr = convert_table_filters_to_expression(*table_filters, column_ids, returned_types);
+    filter_expr = convert_table_filters_to_expression(
+      *table_filters, column_ids, returned_types, projection_ids);
   }
 
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
   output_batches.reserve(input_batches.size());
 
   if (filter_expr != nullptr) {
-    SIRIUS_LOG_DEBUG("Converted table filters to expression: {}", filter_expr->ToString());
-
     // The executor uses the data_batch API to filter rows according to `expression`.
-
     duckdb::sirius::GpuExpressionExecutor gpu_expression_executor(*filter_expr);
-    for (auto const& batch : input_batches) {
+    for (size_t batch_idx = 0; batch_idx < input_batches.size(); batch_idx++) {
+      auto const& batch = input_batches[batch_idx];
       if (!batch) { continue; }
+
       auto filtered_batch = gpu_expression_executor.select(batch);
       if (filtered_batch) { output_batches.push_back(std::move(filtered_batch)); }
     }
@@ -156,6 +156,54 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_table_scan::
     for (auto const& batch : input_batches) {
       if (batch) { output_batches.push_back(batch); }
     }
+  }
+
+  // After filtering, we may need to project away filter-only columns.
+  // The 'types' member indicates the expected output columns (not including filter-only columns).
+  // If we have more columns than expected output types, we need to project.
+  duckdb::idx_t expected_output_columns = types.size();
+  bool needs_projection                 = false;
+
+  if (!output_batches.empty() && output_batches[0]) {
+    auto& first_batch_rep =
+      output_batches[0]->get_data()->cast<cucascade::gpu_table_representation>();
+    auto& first_table = first_batch_rep.get_table();
+    if (first_table.num_columns() > expected_output_columns) { needs_projection = true; }
+  }
+
+  if (needs_projection) {
+    // The batch columns are in the same order as column_ids.
+    // projection_ids tells us which column_ids indices to select for output.
+    // We want the first expected_output_columns elements from projection_ids.
+    std::vector<std::shared_ptr<cucascade::data_batch>> projected_batches;
+    projected_batches.reserve(output_batches.size());
+
+    for (auto& batch : output_batches) {
+      if (!batch) { continue; }
+
+      // Release the table from the batch (zero-copy: we're the sole consumer)
+      auto& gpu_rep = batch->get_data()->cast<cucascade::gpu_table_representation>();
+      auto table    = gpu_rep.release_table();
+      auto columns  = table->release();
+
+      // Select only the output columns by moving ownership
+      std::vector<std::unique_ptr<cudf::column>> selected;
+      selected.reserve(expected_output_columns);
+      for (duckdb::idx_t i = 0; i < expected_output_columns; i++) {
+        selected.push_back(std::move(columns[projection_ids[i]]));
+      }
+
+      auto projected_table = std::make_unique<cudf::table>(std::move(selected));
+      auto* space          = batch->get_memory_space();
+      auto projected_rep =
+        std::make_unique<cucascade::gpu_table_representation>(std::move(projected_table), *space);
+      auto projected_batch =
+        std::make_shared<cucascade::data_batch>(batch->get_batch_id(), std::move(projected_rep));
+
+      projected_batches.push_back(std::move(projected_batch));
+    }
+
+    output_batches = std::move(projected_batches);
   }
 
   auto end      = std::chrono::high_resolution_clock::now();

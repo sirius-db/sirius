@@ -224,9 +224,6 @@ std::optional<task_creation_hint> sirius_physical_operator::get_next_task_hint()
     auto* producer = &(unfinished_barrier->second->src_pipeline->get_operators()[0].get());
     return task_creation_hint{TaskCreationHint::WAITING_FOR_INPUT_DATA, producer};
   }
-  // WSM TODO: we may want to implement the status of where it says that all tasks are scheduled but
-  // not complete yet. so that we dont return a waiting for input data which will result in no task
-  // getting created
 
   // if no unfinished barriers, then is this operator ready to create a task?
   if (std::all_of(ports.begin(), ports.end(), [](const auto& port_pair) {

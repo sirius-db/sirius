@@ -356,6 +356,7 @@ unique_ptr<FunctionData> SiriusExtension::GPUExecutionBind(ClientContext& contex
                                                            vector<string>& names)
 {
   auto result              = make_uniq<SiriusTableFunctionData>();
+  result->conn             = make_uniq<Connection>(*context.db);
   result->query            = input.inputs[0].ToString();
   result->enable_optimizer = true;
   result->sirius_iface     = make_uniq<::sirius::sirius_interface>(context);
@@ -370,6 +371,12 @@ unique_ptr<FunctionData> SiriusExtension::GPUExecutionBind(ClientContext& contex
   auto statement_type = parser.statements[0]->type;
   planner.CreatePlan(std::move(parser.statements[0]));
   D_ASSERT(planner.plan);
+
+  // cuDF does not support HUGEINT (int128). DuckDB widens aggregates like sum(int32) to HUGEINT.
+  // Downcast to BIGINT so all downstream operators and the result collector use a supported type.
+  for (auto& type : planner.types) {
+    if (type == LogicalType::HUGEINT) { type = LogicalType::BIGINT; }
+  }
 
   auto prepared       = make_shared_ptr<PreparedStatementData>(statement_type);
   prepared->names     = planner.names;
@@ -419,6 +426,7 @@ void SiriusExtension::GPUExecutionFunction(ClientContext& context,
       data.res =
         data.sirius_iface->sirius_execute_query(context, data.query, data.gpu_prepared, {});
       if (data.res->HasError()) {
+        SIRIUS_LOG_ERROR("SiriusExecuteQuery error: {}", data.res->GetError());
         printf(
           "=============================================\nError in SiriusExecuteQuery, fallback to "
           "DuckDB\n=============================================\n");

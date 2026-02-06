@@ -19,7 +19,6 @@
 #include "cudf_utils.hpp"
 #include "duckdb/common/types.hpp"
 #include "helper/common.h"
-using namespace std;
 
 namespace duckdb {
 

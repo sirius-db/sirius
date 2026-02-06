@@ -22,7 +22,7 @@
 #include "pipeline/task_request.hpp"
 #include "scan/test_utils.hpp"
 
-#include <rmm/mr/device/device_memory_resource.hpp>
+#include <rmm/mr/device_memory_resource.hpp>
 
 #include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 
@@ -107,7 +107,7 @@ class sirius_pipeline_task : public sirius::pipeline::gpu_pipeline_task {
 
     void* allocation = nullptr;
     try {
-      allocation = allocator->allocate(kAllocationBytes, stream);
+      allocation = allocator->allocate(stream, kAllocationBytes);
     } catch (const std::exception& e) {
       global.add_error(std::string("GPU allocation failed: ") + e.what());
       allocator->reset_stream_reservation(stream);
@@ -115,7 +115,7 @@ class sirius_pipeline_task : public sirius::pipeline::gpu_pipeline_task {
       return;
     }
 
-    allocator->deallocate(allocation, kAllocationBytes, stream);
+    allocator->deallocate(stream, allocation, kAllocationBytes);
 
     auto consumed_bytes = mem_space.get_total_reserved_memory();
     {

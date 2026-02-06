@@ -60,6 +60,14 @@ void task_creator::set_pipeline_executor(sirius::pipeline::pipeline_executor& pi
   _pipeline_executor = &pipeline_executor;
 }
 
+void task_creator::drain_pending_tasks()
+{
+  // Drain any queued task creation requests that haven't been picked up yet
+  _task_creation_queue.drain();
+  // Wait for any in-flight task creation lambdas to finish
+  _kiosk.wait_all();
+}
+
 void task_creator::reset()
 {
   // Clear the scan operator global state map for the new query

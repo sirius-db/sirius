@@ -116,19 +116,25 @@ void gpu_pipeline_executor::manager_loop()
       }
       task.reset();
 
-      if (_task_creator) {
+      // Check if query is complete BEFORE scheduling downstream tasks.
+      // mark_completed() signals the future that engine.execute() is waiting on,
+      // which may destroy the engine and its operators. We must not schedule
+      // tasks that reference those operators after signaling completion.
+      bool query_complete = false;
+      if (_completion_handler && pipeline) {
+        auto sink = pipeline->get_sink();
+        if (sink && sink->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
+          query_complete = pipeline->is_pipeline_finished();
+        }
+      }
+
+      if (!query_complete && _task_creator) {
         for (auto* consumer : consumers) {
           _task_creator->schedule(consumer);
         }
       }
 
-      // Check if query is complete (sink is RESULT_COLLECTOR and pipeline is finished)
-      if (_completion_handler && pipeline) {
-        auto sink = pipeline->get_sink();
-        if (sink && sink->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
-          if (pipeline->is_pipeline_finished()) { _completion_handler->mark_completed(); }
-        }
-      }
+      if (query_complete && _completion_handler) { _completion_handler->mark_completed(); }
     });
   }
 }

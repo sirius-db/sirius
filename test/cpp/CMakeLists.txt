@@ -27,6 +27,7 @@ add_subdirectory(pipeline)
 add_subdirectory(creator)
 add_subdirectory(config)
 add_subdirectory(exec)
+add_subdirectory(integration)
 
 set(TEST_SOURCES
     ${TEST_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/unittest.cpp

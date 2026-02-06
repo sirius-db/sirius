@@ -321,8 +321,8 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
     // get data_repo_manager from sirius context
     auto& data_repo_manager = context.registered_state->Get<duckdb::SiriusContext>("sirius_state")
                                 ->get_data_repository_manager();
-    unordered_map<const op::sirius_physical_operator*,
-                  duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>>>
+    std::unordered_map<const op::sirius_physical_operator*,
+                       duckdb::vector<duckdb::shared_ptr<pipeline::sirius_pipeline>>>
       source_to_pipelines;
 
     for (size_t i = 0; i < copied_scheduled.size(); i++) {
@@ -728,7 +728,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
                               data_repo_manager.get_repository(op_id, port_id).get(),
                               new_scheduled[i],
                               dependent_pipeline));
-          new_scheduled[i]->get_sink()->add_next_port_after_sink({next_op, port_id});
+          new_scheduled[i]->get_sink()->add_next_port_after_sink(std::make_pair(next_op, port_id));
         }
       } else if (new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
         // No action needed for RESULT_COLLECTOR sinks

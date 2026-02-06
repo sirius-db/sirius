@@ -194,5 +194,6 @@ set(TEST_EXEC_DIR "${CMAKE_CURRENT_BINARY_DIR}/test/cpp")
 set(TEST_LOG_DIR "${CMAKE_CURRENT_BINARY_DIR}/test/cpp/log")
 set_target_properties(${TEST_NAME} PROPERTIES RUNTIME_OUTPUT_DIRECTORY
                                               "${TEST_EXEC_DIR}")
-target_compile_definitions(${TEST_NAME}
-                           PRIVATE SIRIUS_UNITTEST_LOG_DIR="${TEST_LOG_DIR}")
+target_compile_definitions(
+  ${TEST_NAME} PRIVATE SIRIUS_UNITTEST_LOG_DIR="${TEST_LOG_DIR}"
+                       SIRIUS_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")

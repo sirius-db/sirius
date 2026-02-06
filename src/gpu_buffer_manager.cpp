@@ -27,6 +27,7 @@
 #include "utils.hpp"
 
 #include <rmm/aligned.hpp>
+#include <rmm/cuda_stream_view.hpp>
 
 #define NUM_GPUS 1
 
@@ -209,7 +210,7 @@ GPUBufferManager::~GPUBufferManager()
     callCudaFree<uint8_t>(gpuCache[gpu], gpu);
     if (cpuCache[gpu] != nullptr) { freePinnedCPUMemory(cpuCache[gpu]); }
     // callCudaFree<uint8_t>(gpuProcessing[gpu], gpu);
-    mr->deallocate((void*)gpuProcessing[gpu], processing_size_per_gpu);
+    mr->deallocate(rmm::cuda_stream_view{}, (void*)gpuProcessing[gpu], processing_size_per_gpu);
   }
   Config::USE_PIN_MEM_FOR_CPU_PROCESSING ? freePinnedCPUMemory(cpuProcessing)
                                          : freePageableCPUMemory(cpuProcessing);
@@ -236,7 +237,7 @@ void GPUBufferManager::ResetBuffer()
       auto size = it->second;
       if (ptr != nullptr) {
         // customCudaFree<uint8_t>(reinterpret_cast<uint8_t*>(ptr), size, 0);
-        mr->deallocate((void*)ptr, size);
+        mr->deallocate(rmm::cuda_stream_view{}, (void*)ptr, size);
         // SIRIUS_LOG_DEBUG("Deallocating Pointer {} size {}", static_cast<void*>(ptr), size);
         // allocation_table[gpu].erase(it);
       }
@@ -253,7 +254,7 @@ void GPUBufferManager::ResetBuffer()
       if (ptr != nullptr) {
         // SIRIUS_LOG_DEBUG("Deallocating Locked Pointer {} size {}", static_cast<void*>(ptr),
         // size);
-        mr->deallocate((void*)ptr, size);
+        mr->deallocate(rmm::cuda_stream_view{}, (void*)ptr, size);
       }
     }
     locked_allocation_table[gpu].clear();
@@ -325,7 +326,7 @@ T* GPUBufferManager::customCudaMalloc(size_t size, int gpu, bool caching)
     return ptr;
   } else {
     cudf::set_current_device_resource(mr);
-    void* ptr = mr->allocate(alloc);
+    void* ptr = mr->allocate(rmm::cuda_stream_view{}, alloc);
     // SIRIUS_LOG_DEBUG("Allocating Pointer {} size {}", static_cast<void*>(ptr), alloc);
     if (ptr == nullptr) throw InvalidInputException("Pointer is nullptr");
     if (allocation_table[gpu].find(ptr) != allocation_table[gpu].end()) {
@@ -360,7 +361,7 @@ void GPUBufferManager::customCudaFree(uint8_t* ptr, int gpu)
   auto it = allocation_table[gpu].find(reinterpret_cast<void*>(ptr));
   if (it != allocation_table[gpu].end()) {
     // SIRIUS_LOG_DEBUG("Deallocating Pointer {} size {}", static_cast<void*>(ptr), it->second);
-    mr->deallocate((void*)ptr, it->second);
+    mr->deallocate(rmm::cuda_stream_view{}, (void*)ptr, it->second);
     allocation_table[gpu].erase(it);
   } else {
     auto locked_it = locked_allocation_table[gpu].find(reinterpret_cast<void*>(ptr));

@@ -36,6 +36,19 @@ using namespace sirius::op;
 namespace {
 
 /**
+ * @brief Get a shared memory space that persists across all test cases.
+ *
+ * Uses static initialization to create the memory manager only once,
+ * avoiding repeated CUDA memory pool creation/destruction which can
+ * crash the CUDA driver.
+ */
+memory_space* get_shared_mem_space()
+{
+  static auto manager = initialize_memory_manager();
+  return manager->get_memory_space(Tier::GPU, 0);
+}
+
+/**
  * @brief Container for batches with their processing handles.
  *
  * In production, tasks hold processing handles while operating on batches
@@ -161,8 +174,7 @@ void validate_concat(const std::vector<std::shared_ptr<data_batch>>& input_batch
 
 TEST_CASE("Concatenate multiple data batches", "[operator][merge_concat]")
 {
-  auto manager    = initialize_memory_manager();
-  auto* mem_space = manager->get_memory_space(Tier::GPU, 0);
+  auto* mem_space = get_shared_mem_space();
   REQUIRE(mem_space);
 
   constexpr int num_batches           = 10;
@@ -180,8 +192,7 @@ TEST_CASE("Concatenate multiple data batches", "[operator][merge_concat]")
 
 TEST_CASE("Concatenate multiple data batches with different size", "[operator][merge_concat]")
 {
-  auto manager              = initialize_memory_manager();
-  auto* mem_space           = manager->get_memory_space(Tier::GPU, 0);
+  auto* mem_space           = get_shared_mem_space();
   constexpr int num_batches = 10;
   std::vector<int> num_input_rows;
   for (int i = 0; i < num_batches; ++i) {
@@ -198,8 +209,7 @@ TEST_CASE("Concatenate multiple data batches with different size", "[operator][m
 
 TEST_CASE("Concatenate with invalid input", "[operator][merge_concat]")
 {
-  auto manager                        = initialize_memory_manager();
-  auto* mem_space                     = manager->get_memory_space(Tier::GPU, 0);
+  auto* mem_space                     = get_shared_mem_space();
   constexpr int num_batches           = 1;
   constexpr size_t num_rows_per_batch = 100;
   std::vector<int> num_input_rows(num_batches, num_rows_per_batch);
@@ -215,8 +225,7 @@ TEST_CASE("Concatenate with invalid input", "[operator][merge_concat]")
 
 TEST_CASE("Concatenate multiple data batches but no input rows", "[operator][merge_concat]")
 {
-  auto manager                        = initialize_memory_manager();
-  auto* mem_space                     = manager->get_memory_space(Tier::GPU, 0);
+  auto* mem_space                     = get_shared_mem_space();
   constexpr int num_batches           = 10;
   constexpr size_t num_rows_per_batch = 0;
   std::vector<int> num_input_rows(num_batches, num_rows_per_batch);
@@ -231,8 +240,7 @@ TEST_CASE("Concatenate multiple data batches but no input rows", "[operator][mer
 
 TEST_CASE("Concatenate mixed empty and non-empty data batches", "[operator][merge_concat]")
 {
-  auto manager              = initialize_memory_manager();
-  auto* mem_space           = manager->get_memory_space(Tier::GPU, 0);
+  auto* mem_space           = get_shared_mem_space();
   constexpr int num_batches = 10;
   std::vector<int> num_input_rows;
   for (int i = 0; i < num_batches; ++i) {
@@ -391,8 +399,7 @@ void validate_ungrouped_aggregate(const std::vector<std::shared_ptr<data_batch>>
 
 TEST_CASE("Ungrouped merge aggregate of min/max/count/sum", "[operator][merge_ungrouped_agg]")
 {
-  auto manager                                   = initialize_memory_manager();
-  auto* mem_space                                = manager->get_memory_space(Tier::GPU, 0);
+  auto* mem_space                                = get_shared_mem_space();
   constexpr int num_batches                      = 10;
   constexpr size_t num_base_input_rows_per_batch = 100;
   std::vector<int> num_base_input_rows(num_batches, num_base_input_rows_per_batch);
@@ -414,8 +421,7 @@ TEST_CASE("Ungrouped merge aggregate of min/max/count/sum", "[operator][merge_un
 
 TEST_CASE("Ungrouped merge aggregate with invalid input", "[operator][merge_ungrouped_agg]")
 {
-  auto manager                                   = initialize_memory_manager();
-  auto* mem_space                                = manager->get_memory_space(Tier::GPU, 0);
+  auto* mem_space                                = get_shared_mem_space();
   int num_batches                                = 1;
   constexpr size_t num_base_input_rows_per_batch = 100;
   std::vector<int> num_base_input_rows(num_batches, num_base_input_rows_per_batch);
@@ -443,8 +449,7 @@ TEST_CASE("Ungrouped merge aggregate with invalid input", "[operator][merge_ungr
 TEST_CASE("Ungrouped merge aggregate with empty local aggregate results",
           "[operator][merge_ungrouped_agg]")
 {
-  auto manager                                   = initialize_memory_manager();
-  auto* mem_space                                = manager->get_memory_space(Tier::GPU, 0);
+  auto* mem_space                                = get_shared_mem_space();
   constexpr int num_batches                      = 10;
   constexpr size_t num_base_input_rows_per_batch = 0;
   std::vector<int> num_base_input_rows(num_batches, num_base_input_rows_per_batch);
@@ -467,8 +472,7 @@ TEST_CASE("Ungrouped merge aggregate with empty local aggregate results",
 TEST_CASE("Ungrouped merge aggregate with mixed empty and non-empty local aggregate results",
           "[operator][merge_ungrouped_agg]")
 {
-  auto manager              = initialize_memory_manager();
-  auto* mem_space           = manager->get_memory_space(Tier::GPU, 0);
+  auto* mem_space           = get_shared_mem_space();
   constexpr int num_batches = 10;
   std::vector<int> num_base_input_rows;
   for (int i = 0; i < num_batches; ++i) {
@@ -639,8 +643,7 @@ void validate_grouped_aggregate(const std::vector<std::shared_ptr<data_batch>>& 
 
 TEST_CASE("Grouped merge aggregate of min/max/count/sum", "[operator][merge_grouped_agg]")
 {
-  auto manager                                   = initialize_memory_manager();
-  auto* mem_space                                = manager->get_memory_space(Tier::GPU, 0);
+  auto* mem_space                                = get_shared_mem_space();
   constexpr int num_batches                      = 10;
   constexpr size_t num_base_input_rows_per_batch = 100;
   std::vector<int> num_base_input_rows(num_batches, num_base_input_rows_per_batch);
@@ -671,8 +674,7 @@ TEST_CASE("Grouped merge aggregate of min/max/count/sum", "[operator][merge_grou
 
 TEST_CASE("Grouped merge aggregate with invalid input", "[operator][merge_grouped_agg]")
 {
-  auto manager                                   = initialize_memory_manager();
-  auto* mem_space                                = manager->get_memory_space(Tier::GPU, 0);
+  auto* mem_space                                = get_shared_mem_space();
   int num_batches                                = 1;
   constexpr size_t num_base_input_rows_per_batch = 100;
   std::vector<int> num_base_input_rows(num_batches, num_base_input_rows_per_batch);
@@ -710,8 +712,7 @@ TEST_CASE("Grouped merge aggregate with invalid input", "[operator][merge_groupe
 TEST_CASE("Grouped merge aggregate with empty local aggregate results",
           "[operator][merge_grouped_agg]")
 {
-  auto manager                                   = initialize_memory_manager();
-  auto* mem_space                                = manager->get_memory_space(Tier::GPU, 0);
+  auto* mem_space                                = get_shared_mem_space();
   constexpr int num_batches                      = 10;
   constexpr size_t num_base_input_rows_per_batch = 0;
   std::vector<int> num_base_input_rows(num_batches, num_base_input_rows_per_batch);
@@ -743,8 +744,7 @@ TEST_CASE("Grouped merge aggregate with empty local aggregate results",
 TEST_CASE("Grouped merge aggregate with mixed empty and non-empty local aggregate results",
           "[operator][merge_grouped_agg]")
 {
-  auto manager              = initialize_memory_manager();
-  auto* mem_space           = manager->get_memory_space(Tier::GPU, 0);
+  auto* mem_space           = get_shared_mem_space();
   constexpr int num_batches = 10;
   std::vector<int> num_base_input_rows;
   for (int i = 0; i < num_batches; ++i) {
@@ -856,8 +856,7 @@ void validate_order_by(const std::vector<std::shared_ptr<data_batch>>& input_bat
 
 TEST_CASE("Merge order-by basic", "[operator][merge_order_by]")
 {
-  auto manager                                   = initialize_memory_manager();
-  auto* mem_space                                = manager->get_memory_space(Tier::GPU, 0);
+  auto* mem_space                                = get_shared_mem_space();
   constexpr int num_batches                      = 10;
   constexpr size_t num_base_input_rows_per_batch = 100;
   std::vector<int> num_base_input_rows(num_batches, num_base_input_rows_per_batch);
@@ -889,8 +888,7 @@ TEST_CASE("Merge order-by basic", "[operator][merge_order_by]")
 
 TEST_CASE("Merge order-by with invalid input", "[operator][merge_order_by]")
 {
-  auto manager                                   = initialize_memory_manager();
-  auto* mem_space                                = manager->get_memory_space(Tier::GPU, 0);
+  auto* mem_space                                = get_shared_mem_space();
   int num_batches                                = 1;
   constexpr size_t num_base_input_rows_per_batch = 100;
   std::vector<int> num_base_input_rows(num_batches, num_base_input_rows_per_batch);
@@ -942,8 +940,7 @@ TEST_CASE("Merge order-by with invalid input", "[operator][merge_order_by]")
 
 TEST_CASE("Merge order-by with empty local order-by results", "[operator][merge_order_by]")
 {
-  auto manager                                   = initialize_memory_manager();
-  auto* mem_space                                = manager->get_memory_space(Tier::GPU, 0);
+  auto* mem_space                                = get_shared_mem_space();
   constexpr int num_batches                      = 10;
   constexpr size_t num_base_input_rows_per_batch = 0;
   std::vector<int> num_base_input_rows(num_batches, num_base_input_rows_per_batch);
@@ -976,8 +973,7 @@ TEST_CASE("Merge order-by with empty local order-by results", "[operator][merge_
 TEST_CASE("Merge order-by with mixed empty and non-empty local order-by results",
           "[operator][merge_order_by]")
 {
-  auto manager              = initialize_memory_manager();
-  auto* mem_space           = manager->get_memory_space(Tier::GPU, 0);
+  auto* mem_space           = get_shared_mem_space();
   constexpr int num_batches = 10;
   std::vector<int> num_base_input_rows;
   for (int i = 0; i < num_batches; ++i) {

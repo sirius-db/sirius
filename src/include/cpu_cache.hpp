@@ -25,8 +25,6 @@
 #include <utility>
 #include <vector>
 
-using namespace std;
-
 namespace duckdb {
 
 class CPUCache {

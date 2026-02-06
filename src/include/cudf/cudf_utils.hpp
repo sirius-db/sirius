@@ -47,9 +47,9 @@
 #include <cudf/unary.hpp>
 
 #include <rmm/cuda_device.hpp>
-#include <rmm/mr/device/cuda_memory_resource.hpp>
-#include <rmm/mr/device/device_memory_resource.hpp>
-#include <rmm/mr/device/pool_memory_resource.hpp>
+#include <rmm/mr/cuda_memory_resource.hpp>
+#include <rmm/mr/device_memory_resource.hpp>
+#include <rmm/mr/pool_memory_resource.hpp>
 
 #include <duckdb/common/exception.hpp>
 #include <duckdb/common/types.hpp>

@@ -17,7 +17,7 @@
 
 #pragma once
 
-#include <rmm/mr/device/device_memory_resource.hpp>
+#include <rmm/mr/device_memory_resource.hpp>
 
 #include <cucascade/memory/memory_reservation_manager.hpp>
 

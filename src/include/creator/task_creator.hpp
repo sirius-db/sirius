@@ -222,6 +222,14 @@ class task_creator {
   void stop_thread_pool();
 
   /**
+   * @brief Drain all pending task creation requests and wait for in-flight tasks to complete.
+   *
+   * Call this after a query completes (future resolved) but before destroying the engine/operators
+   * to ensure no stale operator pointers are accessed by the task creator threads.
+   */
+  void drain_pending_tasks();
+
+  /**
    * @brief Schedule a task creation info for processing.
    *
    * @param info The task creation info to schedule.

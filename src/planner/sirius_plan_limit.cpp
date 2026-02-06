@@ -64,30 +64,14 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalLimit& op)
       //                                         op.estimated_cardinality);
       break;
     default:
-      if (!preserve_insertion_order(*plan)) {
-        // use parallel streaming limit if insertion order is not important
-        limit =
-          duckdb::make_uniq<sirius::op::sirius_physical_streaming_limit>(op.types,
-                                                                         std::move(op.limit_val),
-                                                                         std::move(op.offset_val),
-                                                                         op.estimated_cardinality,
-                                                                         true);
-      } else {
-        throw duckdb::NotImplementedException(
-          "Streaming limit with insertion order preservation not supported in GPU");
-        // maintaining insertion order is important
-        // 	if (use_batch_index(*plan) && use_batch_limit(op.limit_val, op.offset_val)) {
-        // 		// source supports batch index: use parallel batch limit
-        // 		throw duckdb::NotImplementedException("Batch limit not supported in GPU");
-        // 		// limit = duckdb::make_uniq<PhysicalLimit>(op.types, std::move(op.limit_val),
-        // std::move(op.offset_val),
-        // 		//                                  op.estimated_cardinality);
-        // 	} else {
-        // 		// source does not support batch index: use a non-parallel streaming limit
-        // 		limit = duckdb::make_uniq<sirius::op::sirius_physical_streaming_limit>(op.types,
-        // std::move(op.limit_val), std::move(op.offset_val), op.estimated_cardinality, false);
-        // 	}
-      }
+      // GPU pipeline compares all limits at the end, so insertion order does not matter.
+      // Always use parallel streaming limit.
+      limit =
+        duckdb::make_uniq<sirius::op::sirius_physical_streaming_limit>(op.types,
+                                                                       std::move(op.limit_val),
+                                                                       std::move(op.offset_val),
+                                                                       op.estimated_cardinality,
+                                                                       true);
       break;
   }
 
