@@ -50,8 +50,11 @@ duckdb_scan_task_global_state::duckdb_scan_task_global_state(
 {
   // Initialize global table function state
   if (_op.function.init_global) {
-    duckdb::TableFunctionInitInput tf_input(
-      _op.bind_data.get(), _op.column_ids, _op.scanned_ids, nullptr, _op.extra_info.sample_options);
+    duckdb::TableFunctionInitInput tf_input(_op.bind_data.get(),
+                                            _op.column_ids,
+                                            _op.scanned_ids,
+                                            _op.table_filters.get(),
+                                            _op.extra_info.sample_options);
     _global_tf_state = _op.function.init_global(client_ctx, tf_input);
   }
 
@@ -388,8 +391,11 @@ void duckdb_scan_task_local_state::initialize_local_table_function_state(
   // Note: local_tf_state might already be set if it was moved from a previous task
   // Only create a new one if it doesn't exist
   if (!_local_tf_state && op.function.init_local) {
-    duckdb::TableFunctionInitInput tf_input(
-      op.bind_data.get(), op.column_ids, op.projection_ids, nullptr, op.extra_info.sample_options);
+    duckdb::TableFunctionInitInput tf_input(op.bind_data.get(),
+                                            op.column_ids,
+                                            op.projection_ids,
+                                            op.table_filters.get(),
+                                            op.extra_info.sample_options);
     _local_tf_state = op.function.init_local(exec_ctx, tf_input, global_tf_state);
   }
 }

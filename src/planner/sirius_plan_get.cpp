@@ -114,9 +114,10 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> filter;
   auto& projection_ids = op.projection_ids;
 
+  // With FILTER_PUSHDOWN optimizer disabled, table_filters should always be empty.
+  // The filter is handled as a separate LogicalFilter operator in the plan.
   if (table_filters && op.function.supports_pushdown_type) {
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> select_list;
-    duckdb::unique_ptr<duckdb::Expression> unsupported_filter;
     duckdb::unordered_set<duckdb::idx_t> to_remove;
     for (auto& entry : table_filters->filters) {
       auto column_id = column_ids[entry.first].GetPrimaryIndex();

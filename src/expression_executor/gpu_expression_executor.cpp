@@ -311,6 +311,8 @@ std::shared_ptr<cucascade::data_batch> GpuExpressionExecutor::select(
   // Get the bitmap
   auto bitmap = ExecuteExpression(0);
 
+  // (debug traces removed)
+
   // Apply the bitmap
   auto output_table =
     cudf::apply_boolean_mask(input_table, bitmap->view(), execution_stream, resource_ref);

@@ -19,6 +19,7 @@
 
 #include <cstdlib>
 #include <filesystem>
+#include <set>
 #include <string>
 
 namespace fs = std::filesystem;
@@ -39,12 +40,6 @@ static fs::path get_tpch_db_path()
   return db_path;
 }
 
-/**
- * @brief RAII guard to set SIRIUS_CONFIG_FILE env var for the duration of a test.
- *
- * Points to the integration.cfg config which sets up GPU/host memory spaces
- * and the pipeline executor configuration needed by gpu_execution.
- */
 struct config_env_guard {
   config_env_guard()
   {
@@ -56,92 +51,117 @@ struct config_env_guard {
 };
 
 /**
- * @brief Run a query through gpu_execution and return the result.
+ * @brief Run a query through gpu_execution and through DuckDB CPU, then compare results.
+ *
+ * Values are compared as strings via Value::ToString() which normalizes type differences
+ * (e.g., HUGEINT vs BIGINT both render "50"). Row order is ignored by collecting rows
+ * as sorted sets of string tuples.
  */
-static duckdb::unique_ptr<duckdb::MaterializedQueryResult> run_gpu_execution(
-  duckdb::Connection& con, const std::string& query)
+static void compare_gpu_vs_cpu(duckdb::Connection& con, const std::string& query)
 {
-  auto sql    = "CALL gpu_execution('" + query + "')";
-  auto result = con.Query(sql);
-  REQUIRE(result);
-  if (result->HasError()) { UNSCOPED_INFO("gpu_execution error: " << result->GetError()); }
-  REQUIRE_FALSE(result->HasError());
-  return result;
+  // Run on GPU
+  auto gpu_sql    = "CALL gpu_execution('" + query + "')";
+  auto gpu_result = con.Query(gpu_sql);
+  REQUIRE(gpu_result);
+  if (gpu_result->HasError()) { UNSCOPED_INFO("gpu_execution error: " << gpu_result->GetError()); }
+  REQUIRE_FALSE(gpu_result->HasError());
+
+  // Run on CPU (plain DuckDB)
+  auto cpu_result = con.Query(query);
+  REQUIRE(cpu_result);
+  REQUIRE_FALSE(cpu_result->HasError());
+
+  // Compare dimensions
+  REQUIRE(gpu_result->ColumnCount() == cpu_result->ColumnCount());
+  REQUIRE(gpu_result->RowCount() == cpu_result->RowCount());
+
+  // Use DuckDB to sort both result sets by all columns for deterministic comparison.
+  // This avoids lexicographic vs numeric sort issues.
+  auto ncols               = gpu_result->ColumnCount();
+  std::string order_clause = " ORDER BY ";
+  for (duckdb::idx_t c = 0; c < ncols; c++) {
+    if (c > 0) order_clause += ", ";
+    order_clause += std::to_string(c + 1);
+  }
+
+  // Strip trailing semicolons from query for subquery wrapping
+  auto clean_query = query;
+  while (!clean_query.empty() && (clean_query.back() == ';' || clean_query.back() == ' '))
+    clean_query.pop_back();
+
+  auto gpu_sorted = con.Query("SELECT * FROM gpu_execution('" + clean_query + "')" + order_clause);
+  auto cpu_sorted = con.Query("SELECT * FROM (" + clean_query + ") t" + order_clause);
+  REQUIRE(gpu_sorted);
+  if (gpu_sorted->HasError()) { UNSCOPED_INFO("gpu sorted error: " << gpu_sorted->GetError()); }
+  REQUIRE_FALSE(gpu_sorted->HasError());
+  REQUIRE(cpu_sorted);
+  if (cpu_sorted->HasError()) { UNSCOPED_INFO("cpu sorted error: " << cpu_sorted->GetError()); }
+  REQUIRE_FALSE(cpu_sorted->HasError());
+
+  // Compare row by row using string values (handles type differences like HUGEINT vs BIGINT)
+  for (duckdb::idx_t r = 0; r < gpu_sorted->RowCount(); r++) {
+    for (duckdb::idx_t c = 0; c < gpu_sorted->ColumnCount(); c++) {
+      auto gpu_val = gpu_sorted->GetValue(c, r).ToString();
+      auto cpu_val = cpu_sorted->GetValue(c, r).ToString();
+      if (gpu_val != cpu_val) {
+        UNSCOPED_INFO("Row " << r << " Col " << c << " mismatch: GPU=[" << gpu_val << "] CPU=["
+                             << cpu_val << "]");
+      }
+      REQUIRE(gpu_val == cpu_val);
+    }
+  }
 }
 
 //===----------------------------------------------------------------------===//
-// Scan tests - basic table reads
+// Scan tests
 //===----------------------------------------------------------------------===//
 
-TEST_CASE("gpu_execution - scan single column from nation", "[integration][gpu_execution][scan]")
+TEST_CASE("gpu_execution - scan single column", "[integration][gpu_execution][scan]")
 {
   config_env_guard env;
   duckdb::DuckDB db(get_tpch_db_path().string());
   duckdb::Connection con(db);
-
-  auto result = run_gpu_execution(con, "select n_nationkey from nation;");
-
-  REQUIRE(result->RowCount() == 25);
-  REQUIRE(result->ColumnCount() == 1);
+  compare_gpu_vs_cpu(con, "select n_nationkey from nation;");
 }
 
-TEST_CASE("gpu_execution - scan multiple integer columns from nation",
-          "[integration][gpu_execution][scan]")
+TEST_CASE("gpu_execution - scan multiple columns", "[integration][gpu_execution][scan]")
 {
   config_env_guard env;
   duckdb::DuckDB db(get_tpch_db_path().string());
   duckdb::Connection con(db);
-
-  auto result = run_gpu_execution(con, "select n_nationkey, n_regionkey from nation;");
-
-  REQUIRE(result->RowCount() == 25);
-  REQUIRE(result->ColumnCount() == 2);
+  compare_gpu_vs_cpu(con, "select n_nationkey, n_regionkey from nation;");
 }
 
-TEST_CASE("gpu_execution - scan from region table", "[integration][gpu_execution][scan]")
+TEST_CASE("gpu_execution - scan region table", "[integration][gpu_execution][scan]")
 {
   config_env_guard env;
   duckdb::DuckDB db(get_tpch_db_path().string());
   duckdb::Connection con(db);
-
-  auto result = run_gpu_execution(con, "select r_regionkey from region;");
-
-  REQUIRE(result->RowCount() == 5);
-  REQUIRE(result->ColumnCount() == 1);
+  compare_gpu_vs_cpu(con, "select r_regionkey from region;");
 }
 
 //===----------------------------------------------------------------------===//
-// Projection tests - computed columns / expressions
+// Projection tests
 //===----------------------------------------------------------------------===//
 
-TEST_CASE("gpu_execution - projection with arithmetic expression",
-          "[integration][gpu_execution][projection]")
+TEST_CASE("gpu_execution - projection add", "[integration][gpu_execution][projection]")
 {
   config_env_guard env;
   duckdb::DuckDB db(get_tpch_db_path().string());
   duckdb::Connection con(db);
-
-  auto result = run_gpu_execution(con, "select n_nationkey + n_regionkey as total from nation;");
-
-  REQUIRE(result->RowCount() == 25);
-  REQUIRE(result->ColumnCount() == 1);
+  compare_gpu_vs_cpu(con, "select n_nationkey + n_regionkey as total from nation;");
 }
 
-TEST_CASE("gpu_execution - projection with multiply", "[integration][gpu_execution][projection]")
+TEST_CASE("gpu_execution - projection multiply", "[integration][gpu_execution][projection]")
 {
   config_env_guard env;
   duckdb::DuckDB db(get_tpch_db_path().string());
   duckdb::Connection con(db);
-
-  auto result =
-    run_gpu_execution(con, "select n_nationkey * 2 as doubled, n_regionkey from nation;");
-
-  REQUIRE(result->RowCount() == 25);
-  REQUIRE(result->ColumnCount() == 2);
+  compare_gpu_vs_cpu(con, "select n_nationkey * 2 as doubled, n_regionkey from nation;");
 }
 
 //===----------------------------------------------------------------------===//
-// Filter tests - WHERE clause predicates
+// Filter tests
 //===----------------------------------------------------------------------===//
 
 TEST_CASE("gpu_execution - filter equality", "[integration][gpu_execution][filter]")
@@ -149,12 +169,7 @@ TEST_CASE("gpu_execution - filter equality", "[integration][gpu_execution][filte
   config_env_guard env;
   duckdb::DuckDB db(get_tpch_db_path().string());
   duckdb::Connection con(db);
-
-  auto result = run_gpu_execution(con, "select n_nationkey from nation where n_regionkey = 1;");
-
-  REQUIRE(result->ColumnCount() == 1);
-  // TPCH has 5 nations in region 1: ARGENTINA, BRAZIL, CANADA, PERU, UNITED STATES
-  REQUIRE(result->RowCount() == 5);
+  compare_gpu_vs_cpu(con, "select n_nationkey from nation where n_regionkey = 1;");
 }
 
 TEST_CASE("gpu_execution - filter greater than", "[integration][gpu_execution][filter]")
@@ -162,11 +177,7 @@ TEST_CASE("gpu_execution - filter greater than", "[integration][gpu_execution][f
   config_env_guard env;
   duckdb::DuckDB db(get_tpch_db_path().string());
   duckdb::Connection con(db);
-
-  auto result = run_gpu_execution(con, "select n_nationkey from nation where n_regionkey > 2;");
-
-  REQUIRE(result->ColumnCount() == 1);
-  REQUIRE(result->RowCount() > 0);
+  compare_gpu_vs_cpu(con, "select n_nationkey from nation where n_regionkey > 2;");
 }
 
 TEST_CASE("gpu_execution - filter not equal", "[integration][gpu_execution][filter]")
@@ -174,11 +185,7 @@ TEST_CASE("gpu_execution - filter not equal", "[integration][gpu_execution][filt
   config_env_guard env;
   duckdb::DuckDB db(get_tpch_db_path().string());
   duckdb::Connection con(db);
-
-  auto result = run_gpu_execution(con, "select r_regionkey from region where r_regionkey != 3;");
-
-  REQUIRE(result->ColumnCount() == 1);
-  REQUIRE(result->RowCount() == 4);
+  compare_gpu_vs_cpu(con, "select r_regionkey from region where r_regionkey != 3;");
 }
 
 TEST_CASE("gpu_execution - filter with projection", "[integration][gpu_execution][filter]")
@@ -186,48 +193,88 @@ TEST_CASE("gpu_execution - filter with projection", "[integration][gpu_execution
   config_env_guard env;
   duckdb::DuckDB db(get_tpch_db_path().string());
   duckdb::Connection con(db);
-
-  auto result =
-    run_gpu_execution(con, "select n_nationkey, n_regionkey from nation where n_regionkey = 0;");
-
-  REQUIRE(result->ColumnCount() == 2);
-  // TPCH has 5 nations in region 0: ALGERIA, ETHIOPIA, KENYA, MOROCCO, MOZAMBIQUE
-  REQUIRE(result->RowCount() == 5);
+  compare_gpu_vs_cpu(con, "select n_nationkey, n_regionkey from nation where n_regionkey = 0;");
 }
 
-// Pre-existing issue: empty result set causes "Port default not found in operator RESULT_COLLECTOR"
+//===----------------------------------------------------------------------===//
+// Ungrouped aggregate tests
+//===----------------------------------------------------------------------===//
+
+TEST_CASE("gpu_execution - ungrouped min max", "[integration][gpu_execution][aggregate]")
+{
+  config_env_guard env;
+  duckdb::DuckDB db(get_tpch_db_path().string());
+  duckdb::Connection con(db);
+  compare_gpu_vs_cpu(con, "select min(n_regionkey), max(n_nationkey) from nation;");
+}
+
+TEST_CASE("gpu_execution - ungrouped min with filter", "[integration][gpu_execution][aggregate]")
+{
+  config_env_guard env;
+  duckdb::DuckDB db(get_tpch_db_path().string());
+  duckdb::Connection con(db);
+  compare_gpu_vs_cpu(con, "select min(n_nationkey) from nation where n_regionkey = 1;");
+}
+
+TEST_CASE("gpu_execution - ungrouped sum count", "[integration][gpu_execution][aggregate]")
+{
+  config_env_guard env;
+  duckdb::DuckDB db(get_tpch_db_path().string());
+  duckdb::Connection con(db);
+  compare_gpu_vs_cpu(con, "select sum(n_regionkey), count(n_nationkey) from nation;");
+}
+
+TEST_CASE("gpu_execution - ungrouped all agg functions", "[integration][gpu_execution][aggregate]")
+{
+  config_env_guard env;
+  duckdb::DuckDB db(get_tpch_db_path().string());
+  duckdb::Connection con(db);
+  compare_gpu_vs_cpu(
+    con,
+    "select sum(n_regionkey), min(n_nationkey), max(n_regionkey), count(n_nationkey) from nation;");
+}
+
+//===----------------------------------------------------------------------===//
+// Limit tests
+//===----------------------------------------------------------------------===//
+
+TEST_CASE("gpu_execution - limit", "[integration][gpu_execution][limit]")
+{
+  config_env_guard env;
+  duckdb::DuckDB db(get_tpch_db_path().string());
+  duckdb::Connection con(db);
+  compare_gpu_vs_cpu(con, "select n_nationkey from nation limit 10;");
+}
+
+TEST_CASE("gpu_execution - limit with filter", "[integration][gpu_execution][limit]")
+{
+  config_env_guard env;
+  duckdb::DuckDB db(get_tpch_db_path().string());
+  duckdb::Connection con(db);
+  compare_gpu_vs_cpu(con,
+                     "select n_nationkey, n_regionkey from nation where n_regionkey = 1 limit 3;");
+}
+
+//===----------------------------------------------------------------------===//
+// Disabled tests - known issues
+//===----------------------------------------------------------------------===//
+
+// Empty result set: "Port default not found in operator RESULT_COLLECTOR"
 TEST_CASE("gpu_execution - filter returns empty result", "[.][integration_disabled][gpu_execution]")
 {
   config_env_guard env;
   duckdb::DuckDB db(get_tpch_db_path().string());
   duckdb::Connection con(db);
-
-  auto result = run_gpu_execution(con, "select n_nationkey from nation where n_regionkey = 99;");
-
-  REQUIRE(result->ColumnCount() == 1);
-  REQUIRE(result->RowCount() == 0);
+  compare_gpu_vs_cpu(con, "select n_nationkey from nation where n_regionkey = 99;");
 }
 
-//===----------------------------------------------------------------------===//
-// Multi-pipeline queries (pre-existing hang issue - hidden by default)
-// These are hidden with [.] tag and only run when explicitly requested.
-//===----------------------------------------------------------------------===//
-
-// Pre-existing issue: multi-pipeline queries hang because completion is not
-// signaled across pipeline boundaries. Affects GROUP BY, ORDER BY, JOINs, etc.
-
-TEST_CASE("gpu_execution - aggregation count by regionkey",
-          "[.][integration_disabled][gpu_execution]")
+// Multi-pipeline queries hang (GROUP BY, ORDER BY, JOINs)
+TEST_CASE("gpu_execution - group by", "[.][integration_disabled][gpu_execution]")
 {
   config_env_guard env;
   duckdb::DuckDB db(get_tpch_db_path().string());
   duckdb::Connection con(db);
-
-  auto result =
-    run_gpu_execution(con, "select n_regionkey, count(*) from nation group by n_regionkey;");
-
-  REQUIRE(result->RowCount() == 5);
-  REQUIRE(result->ColumnCount() == 2);
+  compare_gpu_vs_cpu(con, "select n_regionkey, count(*) from nation group by n_regionkey;");
 }
 
 TEST_CASE("gpu_execution - order by", "[.][integration_disabled][gpu_execution]")
@@ -235,37 +282,24 @@ TEST_CASE("gpu_execution - order by", "[.][integration_disabled][gpu_execution]"
   config_env_guard env;
   duckdb::DuckDB db(get_tpch_db_path().string());
   duckdb::Connection con(db);
-
-  auto result = run_gpu_execution(con, "select n_nationkey from nation order by n_regionkey;");
-
-  REQUIRE(result->RowCount() == 25);
-  REQUIRE(result->ColumnCount() == 1);
+  compare_gpu_vs_cpu(con, "select n_nationkey from nation order by n_regionkey;");
 }
 
-TEST_CASE("gpu_execution - top n (order by + limit)", "[.][integration_disabled][gpu_execution]")
+TEST_CASE("gpu_execution - top n", "[.][integration_disabled][gpu_execution]")
 {
   config_env_guard env;
   duckdb::DuckDB db(get_tpch_db_path().string());
   duckdb::Connection con(db);
-
-  auto result =
-    run_gpu_execution(con, "select n_nationkey from nation order by n_regionkey desc limit 5;");
-
-  REQUIRE(result->RowCount() == 5);
-  REQUIRE(result->ColumnCount() == 1);
+  compare_gpu_vs_cpu(con, "select n_nationkey from nation order by n_regionkey desc limit 5;");
 }
 
-TEST_CASE("gpu_execution - join nation and region", "[.][integration_disabled][gpu_execution]")
+TEST_CASE("gpu_execution - join", "[.][integration_disabled][gpu_execution]")
 {
   config_env_guard env;
   duckdb::DuckDB db(get_tpch_db_path().string());
   duckdb::Connection con(db);
-
-  auto result = run_gpu_execution(
+  compare_gpu_vs_cpu(
     con,
     "select n.n_nationkey, r.r_regionkey from nation n join region r on n.n_regionkey = "
     "r.r_regionkey;");
-
-  REQUIRE(result->RowCount() == 25);
-  REQUIRE(result->ColumnCount() == 2);
 }

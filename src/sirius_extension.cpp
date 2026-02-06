@@ -89,6 +89,9 @@ struct GPUTableFunctionData : public TableFunctionData {
       DBConfig::GetConfig(context).options.disabled_optimizers;
     disabled_optimizers.insert(OptimizerType::IN_CLAUSE);
     disabled_optimizers.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
+    // The Sirius scan does not apply table_filters (for caching), so keep filters
+    // as explicit LogicalFilter operators rather than pushing them into the scan.
+    disabled_optimizers.insert(OptimizerType::FILTER_PUSHDOWN);
     // disabled_optimizers.insert(OptimizerType::MATERIALIZED_CTE);
     // If error(varchar) gets implemented in substrait this can be removed
     // context.config.scalar_subquery_error_on_multiple_rows = false;
@@ -172,6 +175,9 @@ struct SiriusTableFunctionData : public TableFunctionData {
       DBConfig::GetConfig(context).options.disabled_optimizers;
     disabled_optimizers.insert(OptimizerType::IN_CLAUSE);
     disabled_optimizers.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
+    // The Sirius scan does not apply table_filters (for caching), so keep filters
+    // as explicit LogicalFilter operators rather than pushing them into the scan.
+    disabled_optimizers.insert(OptimizerType::FILTER_PUSHDOWN);
     // disabled_optimizers.insert(OptimizerType::MATERIALIZED_CTE);
     // If error(varchar) gets implemented in substrait this can be removed
     // context.config.scalar_subquery_error_on_multiple_rows = false;
@@ -372,6 +378,12 @@ unique_ptr<FunctionData> SiriusExtension::GPUExecutionBind(ClientContext& contex
   planner.CreatePlan(std::move(parser.statements[0]));
   D_ASSERT(planner.plan);
 
+  // cuDF does not support HUGEINT (int128). DuckDB widens aggregates like sum(int32) to HUGEINT.
+  // Downcast to BIGINT so all downstream operators and the result collector use a supported type.
+  for (auto& type : planner.types) {
+    if (type == LogicalType::HUGEINT) { type = LogicalType::BIGINT; }
+  }
+
   auto prepared       = make_shared_ptr<PreparedStatementData>(statement_type);
   prepared->names     = planner.names;
   prepared->types     = planner.types;
@@ -420,7 +432,7 @@ void SiriusExtension::GPUExecutionFunction(ClientContext& context,
       data.res =
         data.sirius_iface->sirius_execute_query(context, data.query, data.gpu_prepared, {});
       if (data.res->HasError()) {
-        fprintf(stderr, "SiriusExecuteQuery error: %s\n", data.res->GetError().c_str());
+        SIRIUS_LOG_ERROR("SiriusExecuteQuery error: {}", data.res->GetError());
         printf(
           "=============================================\nError in SiriusExecuteQuery, fallback to "
           "DuckDB\n=============================================\n");
