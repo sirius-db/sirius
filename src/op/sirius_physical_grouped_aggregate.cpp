@@ -51,16 +51,6 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
   duckdb::ClientContext& context,
   duckdb::vector<duckdb::LogicalType> types,
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
-  duckdb::idx_t estimated_cardinality)
-  : sirius_physical_grouped_aggregate(
-      context, std::move(types), std::move(expressions), {}, estimated_cardinality)
-{
-}
-
-sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
-  duckdb::ClientContext& context,
-  duckdb::vector<duckdb::LogicalType> types,
-  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups_p,
   duckdb::idx_t estimated_cardinality)
   : sirius_physical_grouped_aggregate(context,

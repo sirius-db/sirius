@@ -99,16 +99,6 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
 {
 }
 
-  sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge(
-  duckdb::ClientContext& context,
-  duckdb::vector<duckdb::LogicalType> types,
-  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
-  duckdb::idx_t estimated_cardinality)
-  : sirius_physical_grouped_aggregate_merge(
-      context, std::move(types), std::move(expressions), {}, estimated_cardinality)
-{
-}
-
 sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge(
   duckdb::ClientContext& context,
   duckdb::vector<duckdb::LogicalType> types,
@@ -148,21 +138,6 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
       SiriusPhysicalOperatorType::MERGE_GROUP_BY, std::move(types), estimated_cardinality),
     grouping_sets(std::move(grouping_sets_p))
 {
-  // WSM TODO: refactor this so that its less redundant with sirius_physical_grouped_aggregate.cpp
-// Need to first figure out what we actually need and how things look when we run a real query
-
-
-  // // get a list of all aggregates to be computed
-  // const duckdb::idx_t group_count = groups_p.size();
-  // if (grouping_sets.empty()) {
-  //   duckdb::GroupingSet set;
-  //   for (duckdb::idx_t i = 0; i < group_count; i++) {
-  //     set.insert(i);
-  //   }
-  //   grouping_sets.push_back(std::move(set));
-  // }
-
-  // input_group_types = create_group_chunk_types(groups_p);
 
   // Convert input parameters to cudf compute definitions BEFORE moving them
   auto cudf_defs = convert_duckdb_aggregates_to_cudf(groups_p, expressions);

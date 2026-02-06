@@ -40,12 +40,6 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
     duckdb::ClientContext& context,
     duckdb::vector<duckdb::LogicalType> types,
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
-    duckdb::idx_t estimated_cardinality);
-
-  sirius_physical_grouped_aggregate(
-    duckdb::ClientContext& context,
-    duckdb::vector<duckdb::LogicalType> types,
-    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
     duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> groups,
     duckdb::idx_t estimated_cardinality);
 

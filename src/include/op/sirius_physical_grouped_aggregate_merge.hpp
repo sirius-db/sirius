@@ -38,20 +38,12 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
     SiriusPhysicalOperatorType::MERGE_GROUP_BY;
 
  public:
-// WSM TODO: do we need all these constructors?
-
   sirius_physical_grouped_aggregate_merge(sirius_physical_grouped_aggregate* grouped_aggregate);
 
   sirius_physical_grouped_aggregate_merge(duckdb::vector<duckdb::LogicalType> types,
     std::vector<int> group_idx,
     std::vector<cudf::aggregation::Kind> cudf_aggregates,
     std::vector<int> cudf_aggregate_idx,
-    duckdb::idx_t estimated_cardinality);
-  
-  sirius_physical_grouped_aggregate_merge(
-    duckdb::ClientContext& context,
-    duckdb::vector<duckdb::LogicalType> types,
-    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> expressions,
     duckdb::idx_t estimated_cardinality);
 
   sirius_physical_grouped_aggregate_merge(
