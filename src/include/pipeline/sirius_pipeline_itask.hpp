@@ -22,9 +22,9 @@
 
 #include <cudf/utilities/default_stream.hpp>
 
-#include <cucascade/data/data_batch.hpp>
-
 #include <rmm/cuda_stream_view.hpp>
+
+#include <cucascade/data/data_batch.hpp>
 
 #include <memory>
 #include <vector>
