@@ -62,11 +62,11 @@ extension_lock::~extension_lock()
     flock(fd_, LOCK_UN);
     close(fd_);
 
-    // Optional: Remove the file to keep /var/tmp clean.
+    // Remove the file to keep the lock directory clean.
     // Note: This creates a tiny race condition window if a new process
     // creates the file just as we unlink it, but for locking logic
     // it is generally safe as the lock is on the inode/fd.
-    // std::filesystem::remove(lock_path_);
+    std::filesystem::remove(lock_path_);
   }
 }
 
