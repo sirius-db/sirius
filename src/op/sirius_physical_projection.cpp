@@ -55,7 +55,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_projection::
 
   for (auto const& batch : input_batches) {
     if (!batch) { continue; }
-    auto projected_batch = gpu_expression_executor.execute(batch);
+    auto projected_batch = gpu_expression_executor.execute(batch, stream);
     if (projected_batch) { output_batches.push_back(std::move(projected_batch)); }
   }
 

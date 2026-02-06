@@ -251,7 +251,8 @@ std::shared_ptr<cucascade::data_batch> GpuExpressionExecutor::execute(
   // Create the data representation
   std::unique_ptr<cucascade::idata_representation> output_data_rep =
     std::make_unique<cucascade::gpu_table_representation>(
-      std::move(std::make_unique<cudf::table>(std::move(output_columns))),
+      std::move(
+        std::make_unique<cudf::table>(std::move(output_columns), execution_stream, resource_ref)),
       *input_batch->get_memory_space());
 
   // Create the data batch and return
@@ -281,8 +282,8 @@ void GpuExpressionExecutor::Select(GPUIntermediateRelation& input_relation,
 
   // Need to convert `null` values in bitmap to `false`, to be consistent with SQL `where` clause
   if (bitmap->null_count() > 0) {
-    cudf::numeric_scalar<bool> false_scalar(false);
-    bitmap = cudf::replace_nulls(bitmap->view(), false_scalar);
+    cudf::numeric_scalar<bool> false_scalar(false, execution_stream, resource_ref);
+    bitmap = cudf::replace_nulls(bitmap->view(), false_scalar, execution_stream, resource_ref);
   }
 
   // Generate the selection vector

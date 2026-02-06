@@ -119,7 +119,8 @@ void sirius_physical_materialized_collector::sink(
     throw duckdb::InvalidInputException("[GPUPhysicalMaterializedCollector] input_batches is null");
   }
 
-  auto sink_single_batch = [this](std::shared_ptr<cucascade::data_batch> const& input_batch) {
+  auto sink_single_batch = [this,
+                            stream](std::shared_ptr<cucascade::data_batch> const& input_batch) {
     auto* data = input_batch->get_data();
     std::shared_ptr<cucascade::data_batch> clone_batch;
     if (!data) {
@@ -148,8 +149,7 @@ void sirius_physical_materialized_collector::sink(
       auto next_batch_id  = data_repo_mgr.get_next_data_batch_id();
       clone_batch         = input_batch->clone(next_batch_id);
       // todo (bobbi) pass stream to sink
-      clone_batch->convert_to<cucascade::host_table_representation>(
-        registry, &mem_space, rmm::cuda_stream_default);
+      clone_batch->convert_to<cucascade::host_table_representation>(registry, &mem_space, stream);
       data = clone_batch->get_data();
     } else if (data->get_current_tier() != cucascade::memory::Tier::HOST) {
       // Data must be in HOST tier (i.e., cannot currently reside in DISK tier)

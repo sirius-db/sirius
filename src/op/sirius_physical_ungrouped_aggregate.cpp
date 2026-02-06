@@ -463,7 +463,8 @@ sirius_physical_ungrouped_aggregate_merge::execute(
     }
   }
 
-  auto out_table = std::make_unique<cudf::table>(std::move(output_cols));
+  auto out_table =
+    std::make_unique<cudf::table>(std::move(output_cols), stream, space->get_default_allocator());
   std::unique_ptr<cucascade::idata_representation> output_data =
     std::make_unique<cucascade::gpu_table_representation>(std::move(out_table), *space);
   auto const batch_id = ::sirius::get_next_batch_id();
