@@ -34,4 +34,4 @@ jobs:
           pixi-version: v0.59.0
           activate-environment: true
       - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
-      - run: make
+      - run: make -j$(nproc)
