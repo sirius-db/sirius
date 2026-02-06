@@ -17,6 +17,8 @@
 #pragma once
 
 // sirius
+#include <cudf/utilities/default_stream.hpp>
+
 #include <config.hpp>
 #include <memory/host_table_utils.hpp>
 #include <memory/multiple_blocks_allocation_accessor.hpp>
@@ -409,7 +411,7 @@ class duckdb_scan_task : public sirius::pipeline::sirius_pipeline_itask {
   //===----------Destructor----------===//
   ~duckdb_scan_task();
 
-  void execute([[maybe_unused]] rmm::cuda_stream_view stream = cudf::get_default_stream()) override;
+  void execute(rmm::cuda_stream_view stream = cudf::get_default_stream()) override;
 
  private:
   //===----------Methods----------===//
@@ -468,7 +470,7 @@ class duckdb_scan_task : public sirius::pipeline::sirius_pipeline_itask {
    * @return std::vector<std::shared_ptr<cucascade::data_batch>> The computed output batches
    */
   std::vector<std::shared_ptr<cucascade::data_batch>> compute_task(
-    rmm::cuda_stream_view stream = cudf::get_default_stream()) override;
+    [[maybe_unused]] rmm::cuda_stream_view stream = cudf::get_default_stream()) override;
 
   /**
    * @brief Publish the computed output batches to the data repository.

@@ -21,6 +21,7 @@
 
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
+#include <libconfig.h++>
 
 #include <exception>
 #include <vector>
@@ -266,7 +267,8 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
             disk_memory_space_configs.end(),
             std::back_inserter(_memory_space_configs));
 
-  if (_memory_space_configs.empty()) {
+  bool using_configurator = _memory_space_configs.empty();
+  if (using_configurator) {
     cucascade::memory::reservation_manager_configurator builder;
     builder.set_number_of_gpus(topology_instance.num_gpus);
     gpu_memory_config_instance.setup_configurator(builder);

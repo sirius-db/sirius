@@ -86,7 +86,7 @@ struct config_to_type_traits<T> : public config_to_type_traits<std::underlying_t
 
 template <HasStringToEnum T>
 struct config_to_type_traits<T> {
-  static constexpr libconfig::Setting::Type type = libconfig::Setting::TypeGroup;
+  static constexpr libconfig::Setting::Type type = libconfig::Setting::TypeString;
 
   static T parse_value(std::string_view str_value)
   {
@@ -396,6 +396,41 @@ struct variant_value_holder {
   std::reference_wrapper<std::variant<Args...>> var_;
 };
 
+// Helper function to create nested groups and return the parent setting
+// For path "server.network.port", creates "server" and "server.network" groups
+// and returns reference to "network" group along with final component "port"
+static std::pair<libconfig::Setting*, std::string> ensure_parent_path(libconfig::Setting& setting,
+                                                                      std::string_view path)
+{
+  libconfig::Setting* current = &setting;
+  std::string path_str(path);
+  size_t pos = 0;
+  std::string last_component;
+
+  while (pos < path_str.length()) {
+    size_t dot_pos = path_str.find('.', pos);
+    std::string component =
+      (dot_pos == std::string::npos) ? path_str.substr(pos) : path_str.substr(pos, dot_pos - pos);
+
+    // If this is the last component, save it and return
+    if (dot_pos == std::string::npos) {
+      last_component = component;
+      break;
+    }
+
+    // Create or get the group for this component
+    if (!current->exists(component)) {
+      current = &current->add(component, libconfig::Setting::TypeGroup);
+    } else {
+      current = &(*current)[component];
+    }
+
+    pos = dot_pos + 1;
+  }
+
+  return {current, last_component};
+}
+
 template <typename T, typename holder = value_holder<T>>
 struct registered_config : config_base {
   template <typename ConfigType>
@@ -432,7 +467,8 @@ struct registered_config : config_base {
   {
     auto* ptr = var_.get_or_null();
     if (ptr) {
-      libconfig::Setting& cfg = setting.add(path_.data(), type());
+      auto [parent, name]     = ensure_parent_path(setting, path_);
+      libconfig::Setting& cfg = parent->add(name, type());
       config_value_exporter<T>::write(cfg, *ptr);
     }
   }
@@ -483,7 +519,8 @@ struct registered_config_variant : config_base {
   {
     auto* ptr = var_.get_or_null();
     if (ptr) {
-      libconfig::Setting& cfg = setting.add(path_.data(), type());
+      auto [parent, name]     = ensure_parent_path(setting, path_);
+      libconfig::Setting& cfg = parent->add(name, type());
       config_value_exporter<T>::write(cfg, *ptr);
     }
   }
@@ -544,7 +581,8 @@ struct registered_config_iterable : config_base {
   {
     auto* ptr = var_.get_or_null();
     if (ptr) {
-      libconfig::Setting& cfg = setting.add(path_.data(), type());
+      auto [parent, name]     = ensure_parent_path(setting, path_);
+      libconfig::Setting& cfg = parent->add(name, type());
       config_value_exporter<T>::write(cfg, *ptr);
     }
   }
