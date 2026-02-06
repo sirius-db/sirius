@@ -269,7 +269,21 @@ void SiriusContextExtensionCallback::read_config_file_if_exists()
   }
   config_.load_from_file(config_path);
   spdlog::info("Loaded Sirius configuration from file: {}", config_path);
-  extension_lock_ = std::make_unique<sirius::extension_lock>("sirius");
+
+  // Determine lock prefix: check if $HOME/.sirius directory exists
+  std::string lock_prefix = "/var/tmp";
+  const char* home_dir    = std::getenv("HOME");
+  if (home_dir != nullptr) {
+    std::string sirius_dir = std::string(home_dir) + "/" + std::string(CONFIG_FILE_DIR);
+    if (!std::filesystem::exists(sirius_dir)) {
+      // Create the directory if it doesn't exist
+      std::filesystem::create_directories(sirius_dir);
+      spdlog::info("Created Sirius directory: {}", sirius_dir);
+    }
+    lock_prefix = sirius_dir;
+  }
+
+  extension_lock_ = std::make_unique<sirius::extension_lock>("sirius", lock_prefix);
   context_        = duckdb::make_shared_ptr<SiriusContext>();
   context_->initialize(config_);
 }

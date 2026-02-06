@@ -22,7 +22,8 @@ namespace sirius {
 
 class extension_lock {
  public:
-  explicit extension_lock(const std::string& extension_name);
+  explicit extension_lock(const std::string& extension_name,
+                          const std::string& lock_prefix = "/var/tmp");
 
   ~extension_lock();
 

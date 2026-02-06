@@ -30,8 +30,9 @@
 
 namespace sirius {
 
-extension_lock::extension_lock(const std::string& extension_name)
-  : lock_path_("/var/tmp/" + extension_name + ".lock")
+extension_lock::extension_lock(const std::string& extension_name,
+                               const std::string& lock_prefix)
+  : lock_path_(lock_prefix + "/" + extension_name + ".lock")
 {
   fd_ = open(lock_path_.c_str(), O_CREAT | O_RDWR, 0666);
   if (fd_ == -1) {
