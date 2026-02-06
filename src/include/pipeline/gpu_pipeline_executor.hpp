@@ -28,6 +28,7 @@
 
 #include <cucascade/memory/memory_reservation.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <cucascade/memory/stream_pool.hpp>
 
 #include <thread>
 
@@ -143,6 +144,7 @@ class gpu_pipeline_executor {
   std::unique_ptr<exec::thread_pool> _thread_pool;
   exec::interruptible_mpmc<std::unique_ptr<sirius::parallel::itask>> _task_queue;
   std::thread _manager_thread;
+  cucascade::memory::exclusive_stream_pool _stream_pool;
   exec::publisher<std::unique_ptr<task_request>> _task_request_publisher;
   cucascade::memory::memory_space* _memory_space;
   sirius::creator::task_creator* _task_creator{nullptr};

@@ -142,7 +142,7 @@ struct GpuExpressionExecutor {
    * @note It is required that there is only one boolean expression in the current expression set.
    */
   std::shared_ptr<data_batch> execute(std::shared_ptr<data_batch> input_batch,
-                                      rmm::cuda_stream_view stream = cudf::get_default_stream());
+                                      rmm::cuda_stream_view stream);
 
   /**
    * @brief Evaluates a boolean expression and filters the input batch according to the result.
@@ -153,9 +153,8 @@ struct GpuExpressionExecutor {
    * @return std::shared_ptr<cucascade::data_batch> The input batch filtered by the boolean
    * expression
    */
-  std::shared_ptr<cucascade::data_batch> select(
-    std::shared_ptr<data_batch> input_batch,
-    rmm::cuda_stream_view stream = cudf::get_default_stream());
+  std::shared_ptr<cucascade::data_batch> select(std::shared_ptr<data_batch> input_batch,
+                                                rmm::cuda_stream_view stream);
 
   // Execute the expression at the given index and return the result
   std::unique_ptr<cudf::column> ExecuteExpression(idx_t expression_idx);

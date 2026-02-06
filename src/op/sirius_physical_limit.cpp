@@ -43,7 +43,8 @@ sirius_physical_streaming_limit::sirius_physical_streaming_limit(
 }
 
 std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_streaming_limit::execute(
-  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches)
+  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches,
+  rmm::cuda_stream_view stream)
 {
   SIRIUS_LOG_DEBUG("Executing streaming limit");
 
@@ -74,12 +75,12 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_streaming_li
     }
 
     auto end_row = std::min<cudf::size_type>(view.num_rows(), offset_const + limit_const);
-    auto slices  = cudf::slice(view, {offset_const, end_row});
+    auto slices  = cudf::slice(view, {offset_const, end_row}, stream);
     if (slices.empty()) { continue; }
 
     // cudf::slice returns a vector of table_views; materialize into a table
-    auto sliced_table = std::make_unique<cudf::table>(slices.front());
-
+    auto sliced_table = std::make_unique<cudf::table>(
+      slices.front(), stream, *batch->get_memory_space()->get_default_allocator());
     std::unique_ptr<cucascade::idata_representation> output_data =
       std::make_unique<cucascade::gpu_table_representation>(std::move(sliced_table),
                                                             *batch->get_memory_space());

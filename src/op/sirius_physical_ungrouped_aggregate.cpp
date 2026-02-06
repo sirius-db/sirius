@@ -296,7 +296,8 @@ std::unique_ptr<cudf::column> make_avg_column(const cudf::column_view& sum_view,
 }  // namespace
 
 std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_ungrouped_aggregate::execute(
-  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches)
+  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches,
+  rmm::cuda_stream_view stream)
 {
   if (aggregates.empty()) { return {}; }
 
@@ -309,9 +310,8 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_ungrouped_ag
     auto* space = batch->get_memory_space();
     if (!space) { continue; }
 
-    auto stream = space->acquire_stream();
-    auto table  = batch->get_data()->cast<cucascade::gpu_table_representation>().get_table();
-    auto view   = table.view();
+    auto table = batch->get_data()->cast<cucascade::gpu_table_representation>().get_table();
+    auto view  = table.view();
 
     std::vector<std::unique_ptr<cudf::column>> cols;
     cols.reserve(layout.local_types.size());
@@ -418,7 +418,8 @@ sirius_physical_ungrouped_aggregate_merge::sirius_physical_ungrouped_aggregate_m
 
 std::vector<std::shared_ptr<cucascade::data_batch>>
 sirius_physical_ungrouped_aggregate_merge::execute(
-  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches)
+  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches,
+  rmm::cuda_stream_view stream)
 {
   if (aggregates.empty()) { return {}; }
 
@@ -433,7 +434,6 @@ sirius_physical_ungrouped_aggregate_merge::execute(
   if (space == nullptr) { return {}; }
 
   auto layout = build_aggregate_layout(aggregates);
-  auto stream = space->acquire_stream();
   std::shared_ptr<cucascade::data_batch> merged_batch;
   if (valid_batches.size() == 1) {
     merged_batch = valid_batches[0];
@@ -463,7 +463,8 @@ sirius_physical_ungrouped_aggregate_merge::execute(
     }
   }
 
-  auto out_table = std::make_unique<cudf::table>(std::move(output_cols));
+  auto out_table =
+    std::make_unique<cudf::table>(std::move(output_cols), stream, space->get_default_allocator());
   std::unique_ptr<cucascade::idata_representation> output_data =
     std::make_unique<cucascade::gpu_table_representation>(std::move(out_table), *space);
   auto const batch_id = ::sirius::get_next_batch_id();

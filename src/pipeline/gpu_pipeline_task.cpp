@@ -127,6 +127,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> gpu_pipeline_task::compute_t
   auto data_batches = local_state._batches;
   for (auto& op :
        _global_state->cast<gpu_pipeline_task_global_state>()._pipeline.get()->get_operators()) {
+    // todo (amin) pass stream to execute
     data_batches = op.get().execute(data_batches);
   }
   return std::move(data_batches);
@@ -148,6 +149,15 @@ void gpu_pipeline_task::execute()
 {
   auto& local_state = _local_state->cast<gpu_pipeline_task_local_state>();
 
+  // todo (amin)
+  // auto reservation = local_state.release_reservation();
+  // if (!reservation) {
+  //   throw std::runtime_error("GPU pipeline task requires a memory reservation");
+  // }
+  // auto allocator = reservation->get_memory_resource_of<cucascade::memory::Tier::GPU>();
+  // allocator->attach_reservation_to_tracker(stream, std::move(reservation), nullptr, nullptr);
+  // absl::Cleanup source_closer = [allocator, stream] {
+  // allocator->detach_reservation_from_tracker(); };
   const auto* reservation = local_state.get_reservation();
   const auto* requested_memory_space =
     reservation != nullptr ? &reservation->get_memory_space() : nullptr;
@@ -155,6 +165,7 @@ void gpu_pipeline_task::execute()
   processing_handles.reserve(local_state._batches.size());
 
   for (const auto& batch : local_state._batches) {
+    // todo (amin) pass stream to lock_or_prepare_batch
     auto handle = lock_or_prepare_batch(batch, requested_memory_space);
     if (!handle) {
       // Failed to lock (or convert) one of the batches. Caller can retry later.
@@ -176,7 +187,9 @@ void gpu_pipeline_task::execute()
 
   // 2. Set reservation_aware_memory_resource_ref as the default cudf allocator
   // 3. Execute cudf operators on the pipeline
+  // todo(amin) pass stream to compute_task
   auto output_batches = compute_task();
+  // todo (amin) synchronize stream before publishing output
   publish_output(output_batches);
   // 4. After each cudf operator, get peak total bytes to collect statistics
   // 5. Push output batches to the data repository

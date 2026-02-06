@@ -27,6 +27,7 @@
 namespace sirius {
 namespace pipeline {
 
+// todo (amin): add stream pool to constructor
 gpu_pipeline_executor::gpu_pipeline_executor(
   exec::thread_pool_config config,
   cucascade::memory::memory_space* mem_space,
@@ -103,12 +104,14 @@ void gpu_pipeline_executor::manager_loop()
     }
     auto output_consumers = gpu_task->get_output_consumers();
     auto* pipeline        = gpu_task->get_pipeline();
+    // todo(amin) acquire stream and pass stream to schedule
     _thread_pool->schedule([this,
                             task      = std::move(pipeline_task),
                             ticket    = std::move(ticket),
                             consumers = std::move(output_consumers),
                             pipeline]() mutable {
       try {
+        // todo(amin) pass stream to execute
         task->execute();
       } catch (...) {
         if (_completion_handler) { _completion_handler->report_error(std::current_exception()); }

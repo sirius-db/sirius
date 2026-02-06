@@ -56,7 +56,8 @@ sirius_physical_filter::sirius_physical_filter(
 }
 
 std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_filter::execute(
-  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches)
+  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches,
+  rmm::cuda_stream_view stream)
 {
   SIRIUS_LOG_DEBUG("Executing expression {}", expression->ToString());
   auto start = std::chrono::high_resolution_clock::now();
@@ -69,7 +70,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_filter::exec
 
   for (auto const& batch : input_batches) {
     if (!batch) { continue; }
-    auto filtered_batch = gpu_expression_executor.select(batch);
+    auto filtered_batch = gpu_expression_executor.select(batch, stream);
     if (filtered_batch) { output_batches.push_back(std::move(filtered_batch)); }
   }
 

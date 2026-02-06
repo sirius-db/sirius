@@ -42,7 +42,8 @@ sirius_physical_projection::sirius_physical_projection(
 }
 
 std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_projection::execute(
-  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches)
+  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches,
+  rmm::cuda_stream_view stream)
 {
   SIRIUS_LOG_DEBUG("Executing projection");
   auto start = std::chrono::high_resolution_clock::now();
@@ -54,7 +55,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_projection::
 
   for (auto const& batch : input_batches) {
     if (!batch) { continue; }
-    auto projected_batch = gpu_expression_executor.execute(batch);
+    auto projected_batch = gpu_expression_executor.execute(batch, stream);
     if (projected_batch) { output_batches.push_back(std::move(projected_batch)); }
   }
 

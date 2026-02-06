@@ -129,7 +129,8 @@ duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
 }
 
 std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_table_scan::execute(
-  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches)
+  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches,
+  rmm::cuda_stream_view stream)
 {
   auto start = std::chrono::high_resolution_clock::now();
 
@@ -148,8 +149,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_table_scan::
     for (size_t batch_idx = 0; batch_idx < input_batches.size(); batch_idx++) {
       auto const& batch = input_batches[batch_idx];
       if (!batch) { continue; }
-
-      auto filtered_batch = gpu_expression_executor.select(batch);
+      auto filtered_batch = gpu_expression_executor.select(batch, stream);
       if (filtered_batch) { output_batches.push_back(std::move(filtered_batch)); }
     }
   } else {

@@ -55,7 +55,8 @@ std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::hash_par
   }
   auto sliced_partition_views = cudf::slice(partition_result.first->view(), slice_indices, stream);
   for (int i = 0; i < num_partitions; ++i) {
-    auto output_partition = std::make_unique<cudf::table>(sliced_partition_views[i]);
+    auto output_partition = std::make_unique<cudf::table>(
+      sliced_partition_views[i], stream, memory_space.get_default_allocator());
     output_batches.push_back(make_data_batch(std::move(output_partition), memory_space));
   }
 
@@ -88,7 +89,8 @@ std::vector<std::shared_ptr<cucascade::data_batch>> gpu_partition_impl::evenly_p
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
   auto sliced_partition_views = cudf::slice(input_table, slice_indices, stream);
   for (int i = 0; i < num_partitions; ++i) {
-    auto output_partition = std::make_unique<cudf::table>(sliced_partition_views[i]);
+    auto output_partition = std::make_unique<cudf::table>(
+      sliced_partition_views[i], stream, memory_space.get_default_allocator());
     output_batches.push_back(make_data_batch(std::move(output_partition), memory_space));
   }
 
