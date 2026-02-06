@@ -17,12 +17,15 @@
 #include "pipeline/gpu_pipeline_executor.hpp"
 
 #include "creator/task_creator.hpp"
+#include "cucascade/memory/stream_pool.hpp"
 #include "cuda_runtime_api.h"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "pipeline/completion_handler.hpp"
 #include "pipeline/gpu_pipeline_queue.hpp"
 #include "pipeline/task_request.hpp"
+
+#include <rmm/cuda_device.hpp>
 
 namespace sirius {
 namespace pipeline {
@@ -33,6 +36,7 @@ gpu_pipeline_executor::gpu_pipeline_executor(
   cucascade::memory::memory_space* mem_space,
   exec::publisher<std::unique_ptr<task_request>> task_request_publisher)
   : _config(config),
+    _stream_pool(rmm::cuda_device_id{mem_space->get_device_id()}, _config.num_threads),
     _task_request_publisher(std::move(task_request_publisher)),
     _memory_space(mem_space)
 {
@@ -70,6 +74,7 @@ void gpu_pipeline_executor::stop()
 
 void gpu_pipeline_executor::manager_loop()
 {
+  rmm::cuda_set_device_raii set_device_guard(rmm::cuda_device_id{_memory_space->get_device_id()});
   while (_running.load()) {
     auto ticket = _kiosk.acquire();  // block till a thread is available
     if (!ticket.is_valid()) {
@@ -104,11 +109,13 @@ void gpu_pipeline_executor::manager_loop()
     }
     auto output_consumers = gpu_task->get_output_consumers();
     auto* pipeline        = gpu_task->get_pipeline();
-    // todo(amin) acquire stream and pass stream to schedule
+    auto exc_stream       = _stream_pool.acquire_stream(
+      cucascade::memory::exclusive_stream_pool::stream_acquire_policy::GROW);
     _thread_pool->schedule([this,
-                            task      = std::move(pipeline_task),
-                            ticket    = std::move(ticket),
-                            consumers = std::move(output_consumers),
+                            task       = std::move(pipeline_task),
+                            ticket     = std::move(ticket),
+                            exc_stream = std::move(exc_stream),
+                            consumers  = std::move(output_consumers),
                             pipeline]() mutable {
       try {
         // todo(amin) pass stream to execute
