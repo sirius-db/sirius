@@ -23,7 +23,7 @@ std::unique_ptr<cudf::column> regex_playground::jit_transform_clickbench_q28_reg
   const cudf::column_view& input)
 {
   auto udf = R"***(
-__device__ void extract_domain(cudf::string_view* out, cuda::std::optional<cudf::string_view> const url_opt) {
+__device__ void extract_domain(cuda::std::optional<cudf::string_view>* out, cuda::std::optional<cudf::string_view> const url_opt) {
     // Skip null
     if (!url_opt.has_value()) {
         return;
