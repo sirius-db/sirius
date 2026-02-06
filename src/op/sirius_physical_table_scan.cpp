@@ -129,7 +129,8 @@ duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
 }
 
 std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_table_scan::execute(
-  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches)
+  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches,
+  rmm::cuda_stream_view stream)
 {
   auto start = std::chrono::high_resolution_clock::now();
 

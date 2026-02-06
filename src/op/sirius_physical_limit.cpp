@@ -43,7 +43,8 @@ sirius_physical_streaming_limit::sirius_physical_streaming_limit(
 }
 
 std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_streaming_limit::execute(
-  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches)
+  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches,
+  rmm::cuda_stream_view stream)
 {
   SIRIUS_LOG_DEBUG("Executing streaming limit");
 

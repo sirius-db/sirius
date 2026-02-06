@@ -56,7 +56,8 @@ class sirius_physical_ungrouped_aggregate_merge : public sirius_physical_operato
   bool is_sink() const override { return true; }
 
   std::vector<std::shared_ptr<cucascade::data_batch>> execute(
-    const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches) override;
+    const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches,
+    rmm::cuda_stream_view stream = cudf::get_default_stream()) override;
 };
 
 }  // namespace op

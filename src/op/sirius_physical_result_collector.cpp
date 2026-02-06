@@ -54,7 +54,8 @@ sirius_physical_result_collector::sirius_physical_result_collector(
 }
 
 std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_result_collector::execute(
-  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches)
+  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches,
+  rmm::cuda_stream_view stream)
 {
   return input_batches;
 }
@@ -108,7 +109,8 @@ duckdb::unique_ptr<duckdb::QueryResult> sirius_physical_materialized_collector::
 }
 
 void sirius_physical_materialized_collector::sink(
-  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches)
+  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches,
+  rmm::cuda_stream_view stream)
 {
   using host_table_chunk_reader = ::sirius::op::result::host_table_chunk_reader;
 
@@ -145,6 +147,7 @@ void sirius_physical_materialized_collector::sink(
       auto& data_repo_mgr = sirius_ctx->get_data_repository_manager();
       auto next_batch_id  = data_repo_mgr.get_next_data_batch_id();
       clone_batch         = input_batch->clone(next_batch_id);
+      // todo (bobbi) pass stream to sink
       clone_batch->convert_to<cucascade::host_table_representation>(
         registry, &mem_space, rmm::cuda_stream_default);
       data = clone_batch->get_data();

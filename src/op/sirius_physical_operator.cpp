@@ -175,7 +175,8 @@ sirius_physical_operator::port* sirius_physical_operator::get_port(std::string_v
 }
 
 void sirius_physical_operator::sink(
-  const ::std::vector<::std::shared_ptr<::cucascade::data_batch>>& output_batches)
+  const ::std::vector<::std::shared_ptr<::cucascade::data_batch>>& output_batches,
+  rmm::cuda_stream_view stream)
 {
   for (auto& batch : output_batches) {
     for (auto& [next_op, port_id] : next_port_after_sink) {
@@ -185,7 +186,8 @@ void sirius_physical_operator::sink(
 }
 
 std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_operator::execute(
-  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches)
+  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches,
+  rmm::cuda_stream_view stream)
 {
   // not doing anything for now
   return std::vector<std::shared_ptr<cucascade::data_batch>>{};
