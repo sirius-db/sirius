@@ -92,8 +92,6 @@ void GPUExecutor::Execute()
   SIRIUS_LOG_DEBUG("Total meta pipelines {}", scheduled.size());
 
   for (const auto& pipeline : scheduled) {
-    SIRIUS_LOG_DEBUG("Executing pipeline (Source Operator ID: {})", pipeline->source->operator_id);
-
     // TODO: This is temporary solution
     // if (pipeline->source->type == PhysicalOperatorType::HASH_JOIN || pipeline->source->type ==
     // PhysicalOperatorType::RESULT_COLLECTOR) { 	continue;
