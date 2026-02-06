@@ -177,20 +177,19 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
 }
 
 std::vector<std::shared_ptr<::cucascade::data_batch>> sirius_physical_grouped_aggregate::execute(
-  const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches) {
-
-    std::vector<std::shared_ptr<::cucascade::data_batch>> results;
+  const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches,
+  rmm::cuda_stream_view stream)
+{
+  std::vector<std::shared_ptr<::cucascade::data_batch>> results;
   for (auto& input_batch : input_batches) {
     auto result = gpu_aggregate_impl::local_grouped_aggregate(
       input_batch,
       group_idx,
       cudf_aggregates,
       cudf_aggregate_idx,
-      cudf::get_default_stream(),
-      *input_batch->get_memory_space()
-    );
+      stream,
+      *input_batch->get_memory_space());
     results.push_back(std::move(result));
-  
   }
   return results;
 }

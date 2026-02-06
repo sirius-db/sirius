@@ -116,7 +116,8 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
   std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>> get_next_task_input_batch() override;
 
   std::vector<std::shared_ptr<::cucascade::data_batch>> execute(
-    const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches) override;
+    const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches,
+    rmm::cuda_stream_view stream = cudf::get_default_stream()) override;
 };
 
 }  // namespace op

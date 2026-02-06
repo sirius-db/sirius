@@ -117,44 +117,44 @@ bool sirius_physical_partition::is_build_partition() { return _is_build; }
 
 
 std::vector<std::shared_ptr<::cucascade::data_batch>> sirius_physical_partition::execute(
-  const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches) {
-
-    // assert that we have only one input batch
-    if (input_batches.size() != 1) {
-      throw std::runtime_error("We expect only one input batch for partition operator");
-    }
-
-    if (_num_partitions < 2) {
-      return input_batches;
-    }
-
-    auto input_batch = input_batches[0];
-
-    std::vector<std::shared_ptr<cucascade::data_batch>>  partitioned_results;
-    switch (_partition_type) {
-      case PartitionType::HASH:
-      partitioned_results = gpu_partition_impl::hash_partition(input_batch, _partition_keys, _num_partitions, cudf::get_default_stream(),
-      *input_batch->get_memory_space());
-      break;
-      case PartitionType::RANGE:
-        throw std::runtime_error("Range partitioning is not implemented yet");
-      case PartitionType::EVENLY: 
-      {
-          partitioned_results = gpu_partition_impl::evenly_partition(input_batch, _num_partitions, cudf::get_default_stream(),
-            *input_batch->get_memory_space());
-            break;
-      }
-      case PartitionType::CUSTOM:
-        throw std::runtime_error("Custom partitioning is not implemented yet");
-      default:
-        throw std::runtime_error("Unsupported partition type: " + partition_type_to_string(_partition_type));
+  const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches,
+  rmm::cuda_stream_view stream)
+{
+  if (input_batches.size() != 1) {
+    throw std::runtime_error("We expect only one input batch for partition operator");
   }
 
+  if (_num_partitions < 2) {
+    return input_batches;
+  }
+
+  auto input_batch = input_batches[0];
+  std::vector<std::shared_ptr<cucascade::data_batch>> partitioned_results;
+  switch (_partition_type) {
+    case PartitionType::HASH:
+      partitioned_results = gpu_partition_impl::hash_partition(
+        input_batch, _partition_keys, _num_partitions, stream, *input_batch->get_memory_space());
+      break;
+    case PartitionType::RANGE:
+      throw std::runtime_error("Range partitioning is not implemented yet");
+    case PartitionType::EVENLY:
+      partitioned_results = gpu_partition_impl::evenly_partition(
+        input_batch, _num_partitions, stream, *input_batch->get_memory_space());
+      break;
+    case PartitionType::CUSTOM:
+      throw std::runtime_error("Custom partitioning is not implemented yet");
+    default:
+      throw std::runtime_error("Unsupported partition type: " +
+                               partition_type_to_string(_partition_type));
+  }
   return partitioned_results;
 }
 
-void sirius_physical_partition::sink(const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches) {
-  
+void sirius_physical_partition::sink(
+  const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches,
+  rmm::cuda_stream_view stream)
+{
+  (void)stream;  // sink does not use stream for push_data_batch_partitioned
   int partition_id = 0;
   for (auto& batch : input_batches) {
     for (auto& [next_op, port_id] : next_port_after_sink) {

@@ -71,9 +71,11 @@ class sirius_physical_partition : public sirius_physical_operator {
   [[nodiscard]] sirius_physical_operator* get_parent_op() const { return _parent_op; }
 
   std::vector<std::shared_ptr<::cucascade::data_batch>> execute(
-    const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches) override;
+    const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches,
+    rmm::cuda_stream_view stream = cudf::get_default_stream()) override;
 
-  void sink(const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches) override;
+  void sink(const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches,
+            rmm::cuda_stream_view stream = cudf::get_default_stream()) override;
 
  private:
   void get_partition_keys_and_type(sirius_physical_operator* op, bool is_build = false);

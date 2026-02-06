@@ -100,7 +100,8 @@ std::vector<int> cudf_aggregate_idx;
   bool sink_order_dependent() const override { return false; }
 
   std::vector<std::shared_ptr<::cucascade::data_batch>> execute(
-    const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches) override;
+    const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches,
+    rmm::cuda_stream_view stream = cudf::get_default_stream()) override;
 };
 
 }  // namespace op

@@ -195,25 +195,25 @@ std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>> sirius_phys
 
 
 std::vector<std::shared_ptr<::cucascade::data_batch>> sirius_physical_grouped_aggregate_merge::execute(
-  const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches) {
+  const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches,
+  rmm::cuda_stream_view stream)
+{
+  if (input_batches.size() == 0) {
+    throw std::runtime_error(
+      "We expect at least one input batch for grouped aggregate merge operator");
+  }
+  // if there is only one batch, return it. We are assuming it was already aggregated.
+  if (input_batches.size() == 1) {
+    return input_batches;
+  }
 
-    if (input_batches.size() == 0) {
-      throw std::runtime_error("We expect at least one input batch for grouped aggregate merge operator");
-    }
-    // if there is only one batch, return it. We are assuming it was already aggregated.
-    if (input_batches.size() == 1) {
-      return input_batches;
-    }
-
-    auto result = gpu_merge_impl::merge_grouped_aggregate(
-      input_batches,
-      group_idx.size(),
-      cudf_aggregates,
-      cudf::get_default_stream(),
-      *input_batches[0]->get_memory_space()
-    );
-    
-    return {result};
+  auto result = gpu_merge_impl::merge_grouped_aggregate(
+    input_batches,
+    group_idx.size(),
+    cudf_aggregates,
+    stream,
+    *input_batches[0]->get_memory_space());
+  return {result};
 }
 }  // namespace op
 }  // namespace sirius
