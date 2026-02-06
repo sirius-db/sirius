@@ -138,7 +138,7 @@ struct CustomTopNMin {
   template <typename T>
   __device__ __forceinline__ T operator()(const T& a, const T& b) const
   {
-    return a < b;
+    return a < b ? a : b;
   }
 };
 
@@ -268,7 +268,7 @@ void CustomStringTopN(vector<shared_ptr<GPUColumn>>& keys,
                                    num_records,
                                    prefix_less_than_compartor);
   } else {
-    CustomTopNStringPrefixLessThan prefix_greater_than_compartor;
+    CustomTopNStringPrefixGreaterThan prefix_greater_than_compartor;
     cub::DeviceMergeSort::SortKeys(d_prefix_sort_temp_storage,
                                    prefix_sort_temp_storage_bytes,
                                    d_records,
