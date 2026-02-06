@@ -207,7 +207,7 @@ void duckdb_scan_executor::manager_loop()
         auto batches   = get_scan_output(scan_task);
         scan_task->publish_output(std::move(batches));
         t.reset();
-        if (_task_creator) {
+        if (_task_creator && !(_completion_handler && _completion_handler->is_completed())) {
           for (auto* consumer : consumers) {
             _task_creator->schedule(consumer);
           }

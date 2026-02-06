@@ -207,10 +207,12 @@ std::vector<op::sirius_physical_operator*> gpu_pipeline_task::get_output_consume
       _global_state->cast<gpu_pipeline_task_global_state>()._pipeline.get() == nullptr) {
     return output_consumers;
   }
-  auto parents =
-    _global_state->cast<gpu_pipeline_task_global_state>()._pipeline.get()->get_parents();
-  for (auto& parent : parents) {
-    output_consumers.push_back(&parent->get_operators()[0].get());
+  auto* pipeline = _global_state->cast<gpu_pipeline_task_global_state>()._pipeline.get();
+  auto sink      = pipeline->get_sink();
+  if (!sink) { return output_consumers; }
+  auto& ports = sink->get_next_port_after_sink();
+  for (auto& [child, port_id] : ports) {
+    output_consumers.push_back(child);
   }
   return output_consumers;
 }

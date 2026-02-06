@@ -356,6 +356,7 @@ unique_ptr<FunctionData> SiriusExtension::GPUExecutionBind(ClientContext& contex
                                                            vector<string>& names)
 {
   auto result              = make_uniq<SiriusTableFunctionData>();
+  result->conn             = make_uniq<Connection>(*context.db);
   result->query            = input.inputs[0].ToString();
   result->enable_optimizer = true;
   result->sirius_iface     = make_uniq<::sirius::sirius_interface>(context);
@@ -419,6 +420,7 @@ void SiriusExtension::GPUExecutionFunction(ClientContext& context,
       data.res =
         data.sirius_iface->sirius_execute_query(context, data.query, data.gpu_prepared, {});
       if (data.res->HasError()) {
+        fprintf(stderr, "SiriusExecuteQuery error: %s\n", data.res->GetError().c_str());
         printf(
           "=============================================\nError in SiriusExecuteQuery, fallback to "
           "DuckDB\n=============================================\n");
