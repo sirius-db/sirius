@@ -11,7 +11,7 @@ Sirius is a GPU-native SQL engine. It plugs into existing databases such as Duck
 </p>
 
 ## Performance
-Running TPC-H on SF=100, Sirius achieves ~10x speedup over existing CPU query engines at the same hardware rental cost, making it well-suited for interactive analytics, financial workloads, and ETL jobs.
+Running TPC-H on SF=100, Sirius achieves ~8x speedup over existing CPU query engines at the same hardware rental cost, making it well-suited for interactive analytics, financial workloads, and ETL jobs.
 
 Experiment Setup:
 - GPU instance: GH200@LambdaLabs ($1.5/hour)
@@ -20,69 +20,14 @@ Experiment Setup:
 ![Performance](sirius-perf.png)
 
 ## Supported OS/GPU/CUDA/CMake
-- Ubuntu >= 20.04
+- Ubuntu >= 22.04
 - NVIDIA Volta™ or higher with compute capability 7.0+
-- CUDA >= 11.2
+- CUDA >= 13.0
 - CMake >= 3.30.4 (follow this [instruction](https://medium.com/@yulin_li/how-to-update-cmake-on-ubuntu-9602521deecb) to upgrade CMake)
+- libcudf >= 26.04
 - We recommend building Sirius with at least **16 vCPUs** to ensure faster compilation.
 
-## Dependencies (Option 1): Use AWS Image
-For users who have access to AWS and want to launch AWS EC2 instances to run Sirius, the following images are prepared with dependencies fully installed.
-
-<table border="1" cellpadding="6" cellspacing="0">
-  <tr>
-    <td><b>AMI Name</b></td>
-    <td><b>AWS Region</b></td>
-    <td><b>AMI ID</b></td>
-  </tr>
-  <tr>
-    <td rowspan="3">Sirius Dependencies AMI (Ubuntu 24.04) 20250611</td>
-    <td>us-east-1</td>
-    <td>ami-06020f2b2161f5d62</td>
-  </tr>
-  <tr>
-    <td>us-east-2</td>
-    <td>ami-016b589f441fecc5d</td>
-  </tr>
-  <tr>
-    <td>us-west-2</td>
-    <td>ami-060043bae3f9b5eb4</td>
-  </tr>
-</table>
-
-Supported EC2 instances: G4dn, G5, G6, Gr6, G6e, P4, P5, P6.
-
-## Dependencies (Option 2): Use Docker Image
-To use the docker image with dependencies fully installed:
-
-For x86 machine:
-```
-sudo docker run --gpus all -it siriusdb/sirius_dependencies_x86_64:stable bash
-```
-For aarch64 machine:
-```
-sudo docker run --gpus all -it siriusdb/sirius_dependencies_aarch64:stable bash
-```
-
-If encountering errors like the following when running the docker image as above:
-```
-docker: Error response from daemon: could not select device driver "" with capabilities: [[gpu]].
-```
-This means `nvidia-driver` or `nvidia-container-toolkit` is not installed.
-
-To install `nvidia-driver`:
-```
-sudo apt install nvidia-driver-535
-```
-
-To install `nvidia-container-toolkit`, please follow the [instructions](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
-
-Finally restart docker by
-```
-sudo systemctl restart docker
-```
-
-## Dependencies (Option 3): Install Manually
+## Dependencies (Option 1): Install Manually
 
 ### Install duckdb dependencies
 ```
@@ -106,7 +51,7 @@ libcudf will be installed via conda/miniconda. Miniconda can be downloaded [here
 ```
 conda create --name libcudf-env
 conda activate libcudf-env
-conda install -c rapidsai -c conda-forge -c nvidia rapidsai::libcudf
+conda install -c rapidsai -c conda-forge -c nvidia rapidsai::libcudf=26.04
 ```
 Set the environment variables `LIBCUDF_ENV_PREFIX` to the conda environment's path. For example, if we installed miniconda in `~/miniconda3` and installed libcudf in the conda environment `libcudf-env`, then we would set the `LIBCUDF_ENV_PREFIX` to `~/miniconda3/envs/libcudf-env`.
 ```
@@ -114,7 +59,7 @@ export LIBCUDF_ENV_PREFIX={PATH to libcudf-env}
 ```
 It is recommended to add the environment variables to your `bashrc` to avoid repetition.
 
-## Dependencies (Option 4): Use Pixi
+## Dependencies (Option 2): Use Pixi
 
 There is a [Pixi](https://pixi.sh/) manifest available to set up an environment with all required dependencies installed.
 
