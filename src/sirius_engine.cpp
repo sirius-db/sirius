@@ -748,8 +748,8 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
       if (new_scheduled[i]->sink.get()) {
         for (auto& [next_op, port_id] : new_scheduled[i]->sink.get()->get_next_port_after_sink()) {
           if (next_op->get_port(port_id)->dest_pipeline) {
-            new_scheduled[i]->parents.push_back(
-              duckdb::weak_ptr<sirius::pipeline::sirius_pipeline>(next_op->get_port(port_id)->dest_pipeline));
+            new_scheduled[i]->parents.push_back(duckdb::weak_ptr<sirius::pipeline::sirius_pipeline>(
+              next_op->get_port(port_id)->dest_pipeline));
           }
         }
       }
