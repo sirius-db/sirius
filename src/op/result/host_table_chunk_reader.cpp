@@ -36,6 +36,10 @@ namespace sirius::op::result {
 host_table_chunk_reader::column_reader::column_reader(
   metadata_node const& node, std::unique_ptr<multiple_blocks_allocation> const& allocation)
 {
+  if (allocation == nullptr || allocation->block_size() == 0) {
+    throw std::runtime_error(
+      "[host_table_chunk_reader::column_reader::column_reader] Invalid allocation.");
+  }
   size       = static_cast<size_t>(node.size);
   null_count = static_cast<size_t>(node.null_count);
   if (node.null_mask_offset < 0) { null_count = 0; }
