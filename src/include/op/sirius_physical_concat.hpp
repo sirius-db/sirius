@@ -44,6 +44,8 @@ class sirius_physical_concat : public sirius_physical_operator {
 
   bool is_build_concat();
 
+  std::vector<std::shared_ptr<cucascade::data_batch>> execute(const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches, rmm::cuda_stream_view stream) override;
+
   //! Get the parent operator (e.g., HASH_JOIN for build concat)
   sirius_physical_operator* get_parent_op() const { return _parent_op; }
 

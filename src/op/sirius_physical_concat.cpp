@@ -24,6 +24,7 @@
 #include "op/sirius_physical_order.hpp"
 #include "op/sirius_physical_partition.hpp"
 #include "op/sirius_physical_top_n.hpp"
+#include "op/merge/gpu_merge_impl.hpp"
 
 namespace sirius {
 namespace op {
@@ -38,6 +39,32 @@ sirius_physical_concat::sirius_physical_concat(duckdb::vector<duckdb::LogicalTyp
   _num_partitions = (estimated_cardinality + PARTITION_SIZE - 1) / PARTITION_SIZE;
   _parent_op      = parent_op;
   _is_build       = is_build;
+}
+
+std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>> get_next_task_input_batch() {
+  
+}
+
+std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_concat::execute(const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches, rmm::cuda_stream_view stream) {
+  std::vector<std::shared_ptr<cucascade::data_batch>> valid_batches;
+  valid_batches.reserve(input_batches.size());
+  for (auto const& batch : input_batches) {
+    if (batch) { valid_batches.push_back(batch); }
+  }
+  if (valid_batches.empty()) { return {}; }
+
+  cucascade::memory::memory_space* space = valid_batches[0]->get_memory_space();
+  if (space == nullptr) { return {}; }
+
+  std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
+  output_batches.reserve(1);
+  if (valid_batches.size() == 1) {
+    output_batches.push_back(valid_batches[0]);
+  } else {
+    auto merged_batch = gpu_merge_impl::concat(valid_batches, stream, *space);
+    output_batches.push_back(std::move(merged_batch));
+  } 
+  return output_batches;
 }
 
 std::string sirius_physical_concat::get_name() const { return "CONCAT"; }

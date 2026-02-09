@@ -12,7 +12,6 @@ tpch-data/dbgen
 .vscode/
 *.duckdb
 !test/cpp/integration/integration.duckdb
-duckdb/*
 CMakeFiles/
 CMakeCache.txt
 cmake_install.cmake
