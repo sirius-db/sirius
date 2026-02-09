@@ -121,7 +121,7 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
    *
    * @param stream CUDA stream used for device memory operations and kernel launches
    */
-  void execute(rmm::cuda_stream_view stream = cudf::get_default_stream()) override;
+  void execute(rmm::cuda_stream_view stream) override;
 
   /**
    * @brief Get the unique identifier for this task
@@ -155,7 +155,8 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
    *
    * @param output_batches The data batches to publish
    */
-  void publish_output(std::vector<std::shared_ptr<cucascade::data_batch>> output_batches) override;
+  void publish_output(std::vector<std::shared_ptr<cucascade::data_batch>> output_batches,
+                      rmm::cuda_stream_view stream) override;
 
   /**
    * @brief Get the input size for this task

@@ -19,6 +19,7 @@
 #include "helper/helper.hpp"
 
 #include <cudf/utilities/default_stream.hpp>
+#include <rmm/cuda_stream_view.hpp>
 
 #include <cucascade/memory/memory_reservation.hpp>
 
@@ -91,7 +92,7 @@ class itask {
   itask& operator=(itask&&)      = default;
 
   // Execution function.
-  virtual void execute(rmm::cuda_stream_view stream = cudf::get_default_stream()) = 0;
+  virtual void execute(rmm::cuda_stream_view stream) = 0;
 
   template <typename T>
   T* as() noexcept

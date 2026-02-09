@@ -134,12 +134,12 @@ std::vector<std::shared_ptr<cucascade::data_batch>> gpu_pipeline_task::compute_t
 }
 
 void gpu_pipeline_task::publish_output(
-  std::vector<std::shared_ptr<cucascade::data_batch>> output_batches)
+  std::vector<std::shared_ptr<cucascade::data_batch>> output_batches, rmm::cuda_stream_view stream)
 {
   auto sink_operators =
     _global_state->cast<gpu_pipeline_task_global_state>()._pipeline.get()->get_sink();
   if (sink_operators) {
-    sink_operators.get()->sink(output_batches);
+    sink_operators.get()->sink(output_batches, stream);
   } else {
     throw std::runtime_error("Sink operator not found");
   }
@@ -188,7 +188,7 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
   // 3. Execute cudf operators on the pipeline
   auto output_batches = compute_task(stream);
   stream.synchronize();
-  publish_output(output_batches);
+  publish_output(output_batches, stream);
   // 4. After each cudf operator, get peak total bytes to collect statistics
   // 5. Push output batches to the data repository
 

@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include <cudf/utilities/default_stream.hpp>
+
 #include "parallel/task_executor.hpp"
 
 namespace sirius {
@@ -71,7 +73,7 @@ void itask_executor::worker_loop(int worker_id)
       break;
     }
     try {
-      task->execute();
+      task->execute(cudf::get_default_stream());
     } catch (const std::exception& e) {
       on_task_error(worker_id, std::move(task), e);
     }

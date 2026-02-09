@@ -83,7 +83,7 @@ std::unique_ptr<cudf::scalar> make_numeric_scalar_with_value(cudf::data_type typ
                                                              T value,
                                                              rmm::cuda_stream_view stream)
 {
-  auto out = cudf::make_numeric_scalar(type);
+  auto out = cudf::make_numeric_scalar(type, stream);
   scalar_cast<cudf::numeric_scalar<T>>(*out).set_value(value, stream);
   return out;
 }
@@ -458,7 +458,7 @@ sirius_physical_ungrouped_aggregate_merge::execute(
     }
   }
 
-  auto out_table = std::make_unique<cudf::table>(std::move(output_cols), stream);
+  auto out_table = std::make_unique<cudf::table>(std::move(output_cols), stream, cudf::get_current_device_resource_ref());
   std::unique_ptr<cucascade::idata_representation> output_data =
     std::make_unique<cucascade::gpu_table_representation>(std::move(out_table), *space);
   auto const batch_id = ::sirius::get_next_batch_id();

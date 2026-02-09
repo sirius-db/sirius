@@ -27,10 +27,13 @@
 
 #include <rmm/cuda_device.hpp>
 
+#ifdef ENABLE_STREAM_CHECK
+#include <stream_check.hpp>
+#endif
+
 namespace sirius {
 namespace pipeline {
 
-// todo (amin): add stream pool to constructor
 gpu_pipeline_executor::gpu_pipeline_executor(
   exec::thread_pool_config config,
   cucascade::memory::memory_space* mem_space,
@@ -53,11 +56,16 @@ void gpu_pipeline_executor::start()
 {
   bool expected = false;
   if (!_running.compare_exchange_strong(expected, true)) { return; }
-  _thread_pool = std::make_unique<exec::thread_pool>(
-    _config.num_threads,
-    _config.thread_name_prefix,
-    _config.cpu_affinity_list,
-    [device_id = _memory_space->get_device_id()]() noexcept { cudaSetDevice(device_id); });
+  _thread_pool =
+    std::make_unique<exec::thread_pool>(_config.num_threads,
+                                        _config.thread_name_prefix,
+                                        _config.cpu_affinity_list,
+                                        [device_id = _memory_space->get_device_id()]() noexcept {
+                                          cudaSetDevice(device_id);
+#ifdef ENABLE_STREAM_CHECK
+                                          enable_log_on_default_stream();
+#endif
+                                        });
   _manager_thread = std::thread(&gpu_pipeline_executor::manager_loop, this);
 }
 
@@ -75,6 +83,9 @@ void gpu_pipeline_executor::stop()
 void gpu_pipeline_executor::manager_loop()
 {
   rmm::cuda_set_device_raii set_device_guard(rmm::cuda_device_id{_memory_space->get_device_id()});
+#ifdef ENABLE_STREAM_CHECK
+  enable_log_on_default_stream();
+#endif
   while (_running.load()) {
     auto ticket = _kiosk.acquire();  // block till a thread is available
     if (!ticket.is_valid()) {

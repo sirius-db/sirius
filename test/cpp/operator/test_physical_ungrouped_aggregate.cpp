@@ -168,8 +168,8 @@ TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate computes SUM/MIN/MAX/COU
     0,
     duckdb::TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
 
-  auto local_out1 = local_op.execute({b1});
-  auto local_out2 = local_op.execute({b2});
+  auto local_out1 = local_op.execute({b1}, cudf::get_default_stream());
+  auto local_out2 = local_op.execute({b2}, cudf::get_default_stream());
   std::vector<std::shared_ptr<data_batch>> merge_inputs;
   merge_inputs.insert(merge_inputs.end(),
                       std::make_move_iterator(local_out1.begin()),
@@ -177,7 +177,7 @@ TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate computes SUM/MIN/MAX/COU
   merge_inputs.insert(merge_inputs.end(),
                       std::make_move_iterator(local_out2.begin()),
                       std::make_move_iterator(local_out2.end()));
-  auto out = merge_op.execute(merge_inputs);
+  auto out = merge_op.execute(merge_inputs, cudf::get_default_stream());
   REQUIRE(out.size() == 1);
 
   auto table = out[0]->get_data()->template cast<gpu_table_representation>().get_table();
@@ -276,8 +276,8 @@ TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate resolves AVG in merge",
     0,
     duckdb::TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
 
-  auto local_out1 = local_op.execute({b1});
-  auto local_out2 = local_op.execute({b2});
+  auto local_out1 = local_op.execute({b1}, cudf::get_default_stream());
+  auto local_out2 = local_op.execute({b2}, cudf::get_default_stream());
   std::vector<std::shared_ptr<data_batch>> merge_inputs;
   merge_inputs.insert(merge_inputs.end(),
                       std::make_move_iterator(local_out1.begin()),
@@ -286,7 +286,7 @@ TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate resolves AVG in merge",
                       std::make_move_iterator(local_out2.begin()),
                       std::make_move_iterator(local_out2.end()));
 
-  auto out = merge_op.execute(merge_inputs);
+  auto out = merge_op.execute(merge_inputs, cudf::get_default_stream());
   REQUIRE(out.size() == 1);
 
   auto table = out[0]->get_data()->template cast<gpu_table_representation>().get_table();

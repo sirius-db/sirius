@@ -139,7 +139,16 @@ TEST_CASE("GPU pipeline executor uses task requests to schedule GPU tasks",
 {
   std::unique_ptr<sirius::memory::sirius_memory_reservation_manager> manager;
   try {
-    manager = initialize_memory_manager(1);
+    cucascade::memory::reservation_manager_configurator builder;
+    builder.set_number_of_gpus(1)
+      .set_gpu_usage_limit(256 * 1024 * 1024)
+      .set_reservation_fraction_per_gpu(0.75)
+      .set_per_host_capacity(1 * 1024 * 1024 * 1024)
+      .use_host_per_gpu()
+      .track_reservation_per_stream(false)
+      .set_reservation_fraction_per_host(0.75);
+    auto space_configs = builder.build();
+    manager = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(std::move(space_configs));
   } catch (const std::exception& e) {
     WARN("Skipping test due to insufficient GPUs: " << e.what());
     return;

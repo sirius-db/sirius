@@ -71,8 +71,8 @@ class sirius_pipeline_itask : public parallel::itask {
    *
    * @param output_batches The data batches to publish (typically the result of compute_task())
    */
-  virtual void publish_output(
-    std::vector<std::shared_ptr<cucascade::data_batch>> output_batches) = 0;
+  virtual void publish_output(std::vector<std::shared_ptr<cucascade::data_batch>> output_batches,
+                              rmm::cuda_stream_view stream) = 0;
 
   /**
    * @brief Get the estimated reservation memory size needed for this task.
@@ -86,10 +86,10 @@ class sirius_pipeline_itask : public parallel::itask {
   /// @brief Get the output consumer operators for this task.
   virtual std::vector<op::sirius_physical_operator*> get_output_consumers() = 0;
 
-  void execute(rmm::cuda_stream_view stream = cudf::get_default_stream()) override
+  void execute(rmm::cuda_stream_view stream) override
   {
     auto output_batches = compute_task(stream);
-    publish_output(output_batches);
+    publish_output(output_batches, stream);
   }
 
  protected:
