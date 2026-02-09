@@ -39,18 +39,6 @@ duckdb::BoundOrderByNode make_order(
     dir, nulls, duckdb::make_uniq<duckdb::BoundReferenceExpression>(std::move(type), col_idx));
 }
 
-// Deep copy orders (contains unique_ptr<Expression>)
-duckdb::vector<duckdb::BoundOrderByNode> copy_orders(
-  const duckdb::vector<duckdb::BoundOrderByNode>& src)
-{
-  duckdb::vector<duckdb::BoundOrderByNode> result;
-  result.reserve(src.size());
-  for (const auto& order : src) {
-    result.push_back(order.Copy());
-  }
-  return result;
-}
-
 std::shared_ptr<data_batch> make_1col_batch(memory_space& space, const std::vector<int64_t>& vals)
 {
   return make_numeric_batch<int64_t>(space, vals, cudf::type_id::INT64);

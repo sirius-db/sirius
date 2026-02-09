@@ -22,6 +22,18 @@
 namespace sirius {
 namespace op {
 
+// Helper to deep copy BoundOrderByNode vector (contains unique_ptr<Expression>)
+inline duckdb::vector<duckdb::BoundOrderByNode> copy_orders(
+  const duckdb::vector<duckdb::BoundOrderByNode>& src)
+{
+  duckdb::vector<duckdb::BoundOrderByNode> result;
+  result.reserve(src.size());
+  for (const auto& order : src) {
+    result.push_back(order.Copy());
+  }
+  return result;
+}
+
 class sirius_physical_order : public sirius_physical_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::ORDER_BY;

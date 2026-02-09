@@ -26,18 +26,6 @@
 namespace sirius {
 namespace op {
 
-// Helper to deep copy BoundOrderByNode vector
-static duckdb::vector<duckdb::BoundOrderByNode> copy_orders(
-  const duckdb::vector<duckdb::BoundOrderByNode>& src)
-{
-  duckdb::vector<duckdb::BoundOrderByNode> result;
-  result.reserve(src.size());
-  for (const auto& order : src) {
-    result.push_back(order.Copy());
-  }
-  return result;
-}
-
 sirius_physical_merge_sort::sirius_physical_merge_sort(sirius_physical_order* order_by)
   : sirius_physical_merge_sort(
       order_by->types,                // copied by value
