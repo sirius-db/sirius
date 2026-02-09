@@ -18,7 +18,7 @@
 
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "log/logging.hpp"
-#include "operator/gpu_materialize.hpp"
+#include "op/order/gpu_order_impl.hpp"
 
 namespace sirius {
 namespace op {
@@ -34,10 +34,56 @@ sirius_physical_order::sirius_physical_order(duckdb::vector<duckdb::LogicalType>
     projections(std::move(projections_p)),
     is_index_sort(is_index_sort_p)
 {
-  // sort_result = duckdb::make_shared_ptr<GPUIntermediateRelation>(projections.size());
-  // for (int col = 0; col < projections.size(); col++) {
-  //   sort_result->columns[col] = nullptr;
-  // }
+}
+
+std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_order::execute(
+  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches,
+  rmm::cuda_stream_view stream)
+{
+  SIRIUS_LOG_DEBUG("Executing order by");
+  auto start = std::chrono::high_resolution_clock::now();
+
+  // Build cudf order vectors from BoundOrderByNode
+  std::vector<int> order_key_idx;
+  std::vector<cudf::order> column_order;
+  std::vector<cudf::null_order> null_precedence;
+  order_key_idx.reserve(orders.size());
+  column_order.reserve(orders.size());
+  null_precedence.reserve(orders.size());
+
+  for (auto const& ord : orders) {
+    if (ord.expression->expression_class != duckdb::ExpressionClass::BOUND_REF) {
+      throw duckdb::NotImplementedException("Order by only supports bound reference expressions");
+    }
+    auto idx = static_cast<int>(ord.expression->Cast<duckdb::BoundReferenceExpression>().index);
+    order_key_idx.push_back(idx);
+    column_order.push_back(ord.type == duckdb::OrderType::ASCENDING ? cudf::order::ASCENDING
+                                                                    : cudf::order::DESCENDING);
+    null_precedence.push_back(ord.null_order == duckdb::OrderByNullType::NULLS_FIRST
+                                ? cudf::null_order::BEFORE
+                                : cudf::null_order::AFTER);
+  }
+
+  std::vector<int> proj_idx(projections.begin(), projections.end());
+
+  std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
+  output_batches.reserve(input_batches.size());
+
+  for (auto const& batch : input_batches) {
+    if (!batch) { continue; }
+    auto* space = batch->get_memory_space();
+    if (!space) { continue; }
+
+    auto sorted_batch = gpu_order_impl::local_order_by(
+      batch, order_key_idx, column_order, null_precedence, proj_idx, stream, *space);
+    if (sorted_batch) { output_batches.push_back(std::move(sorted_batch)); }
+  }
+
+  auto end      = std::chrono::high_resolution_clock::now();
+  auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+  SIRIUS_LOG_DEBUG("Order by time: {:.2f} ms", duration.count() / 1000.0);
+
+  return output_batches;
 }
 
 }  // namespace op

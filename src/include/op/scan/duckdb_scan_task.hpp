@@ -199,7 +199,7 @@ class duckdb_scan_task_local_state : public sirius::pipeline::sirius_pipeline_it
     // The allocation accessors for the column data, mask, and offsets
     memory::multiple_blocks_allocation_accessor<uint8_t> data_blocks_accessor;
     memory::multiple_blocks_allocation_accessor<uint8_t> mask_blocks_accessor;
-    memory::multiple_blocks_allocation_accessor<int64_t> offset_blocks_accessor;
+    memory::multiple_blocks_allocation_accessor<int32_t> offset_blocks_accessor;
 
     //===----------Constructors & Destructor----------===//
     column_builder() = default;
