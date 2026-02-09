@@ -270,7 +270,7 @@ TEST_CASE("host_table_chunk_reader produces correct DataChunks",
                                                           ranges,
                                                           cudf::get_default_stream(),
                                                           gpu_space->get_default_allocator(),
-                                                          true);
+                                                          false);
   auto batch = sirius::make_data_batch(std::move(table), *gpu_space);
 
   expected_table_data expected;
@@ -343,7 +343,7 @@ TEST_CASE("host_table_chunk_reader handles null masks",
     std::make_pair(0, 100), std::make_pair(1000, 2000), std::make_pair(0, 100)};
 
   auto table =
-    sirius::create_cudf_table_with_random_data(num_rows, column_types, ranges, stream, mr, true);
+    sirius::create_cudf_table_with_random_data(num_rows, column_types, ranges, stream, mr, false);
   auto int64_nulls = build_null_indices(
     num_rows,
     {0, 5, STANDARD_VECTOR_SIZE - 1, STANDARD_VECTOR_SIZE, STANDARD_VECTOR_SIZE + 1, num_rows - 1});
