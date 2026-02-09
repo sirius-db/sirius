@@ -212,6 +212,7 @@ host_table_chunk_reader::host_table_chunk_reader(
       "[host_table_chunk_reader] Metadata column count does not match expected column count.");
   }
   // Initialize column readers
+  _column_readers.reserve(metadata_nodes.size());
   for (size_t col_idx = 0; col_idx < metadata_nodes.size(); ++col_idx) {
     if (col_idx == 0) {
       _total_rows = static_cast<size_t>(metadata_nodes[col_idx].size);
