@@ -26,10 +26,7 @@
 #include "pipeline/task_request.hpp"
 
 #include <rmm/cuda_device.hpp>
-
-#ifdef ENABLE_STREAM_CHECK
-#include <stream_check.hpp>
-#endif
+#include <util/stream_check_wrapper.hpp>
 
 namespace sirius {
 namespace pipeline {
@@ -62,9 +59,7 @@ void gpu_pipeline_executor::start()
                                         _config.cpu_affinity_list,
                                         [device_id = _memory_space->get_device_id()]() noexcept {
                                           cudaSetDevice(device_id);
-#ifdef ENABLE_STREAM_CHECK
-                                          enable_log_on_default_stream();
-#endif
+                                          sirius::util::enable_log_on_default_stream();
                                         });
   _manager_thread = std::thread(&gpu_pipeline_executor::manager_loop, this);
 }
@@ -83,9 +78,7 @@ void gpu_pipeline_executor::stop()
 void gpu_pipeline_executor::manager_loop()
 {
   rmm::cuda_set_device_raii set_device_guard(rmm::cuda_device_id{_memory_space->get_device_id()});
-#ifdef ENABLE_STREAM_CHECK
-  enable_log_on_default_stream();
-#endif
+  sirius::util::enable_log_on_default_stream();
   while (_running.load()) {
     auto ticket = _kiosk.acquire();  // block till a thread is available
     if (!ticket.is_valid()) {

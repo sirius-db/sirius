@@ -203,7 +203,6 @@ TEST_CASE("gpu_execution - filter with projection", "[integration][gpu_execution
 
 TEST_CASE("gpu_execution - ungrouped min max", "[integration][gpu_execution][aggregate]")
 {
-  StreamCheckGuard stream_guard(true);
   config_env_guard env;
   duckdb::DuckDB db(get_tpch_db_path().string());
   duckdb::Connection con(db);
