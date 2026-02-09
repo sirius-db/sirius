@@ -180,7 +180,7 @@ void host_table_chunk_reader::column_reader::copy_string(
     // Set the null mask
     auto& validity = duckdb::FlatVector::Validity(vector);
     copy_mask_to_validity(validity, row_offset, count, allocation);
-    detail::make_duckdb_strings<false>(
+    detail::make_duckdb_strings<true>(
       offset_accessor, allocation, vector, count, start_offset, end_offset, str_buffer_ptr);
   } else {
     detail::make_duckdb_strings<false>(
