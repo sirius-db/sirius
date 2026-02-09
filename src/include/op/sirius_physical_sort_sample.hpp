@@ -82,9 +82,6 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
   //! Whether boundaries have been computed
   bool boundaries_computed() const { return _boundaries_computed.load(); }
 
-  //! Set the total number of scan batches expected in this pipeline
-  void set_total_scan_batches(size_t n) { _total_scan_batches = n; }
-
   //! Override the maximum bytes per partition (0 = use default GPU memory-based calculation)
   void set_max_partition_bytes(size_t bytes) { _max_partition_bytes_override = bytes; }
 
@@ -97,9 +94,6 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
 
   //! Whether partition boundaries have been computed
   std::atomic<bool> _boundaries_computed{false};
-
-  //! Total number of scan batches expected (set by engine during init)
-  size_t _total_scan_batches = 0;
 
   //! Override for max partition bytes (0 = use default GPU memory-based calculation)
   size_t _max_partition_bytes_override = 0;

@@ -152,31 +152,44 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_sort_sample:
                                    space->get_default_allocator());
 
   // 5. Compute number of partitions
-  size_t total_rows        = static_cast<size_t>(sorted_table->num_rows());
-  size_t avg_batch_bytes   = valid_batches.empty() ? 0 : total_sample_bytes / valid_batches.size();
-  size_t total_batch_count = _total_scan_batches > 0 ? _total_scan_batches : valid_batches.size();
-  size_t estimated_total_bytes = avg_batch_bytes * total_batch_count;
-  size_t available_memory      = space->get_available_memory(stream);
-  size_t max_partition_bytes =
-    _max_partition_bytes_override > 0
-      ? _max_partition_bytes_override
-      : static_cast<size_t>(static_cast<double>(available_memory) * MAX_PARTITION_MEMORY_FRACTION);
+  size_t total_rows         = static_cast<size_t>(sorted_table->num_rows());
+  size_t avg_batch_bytes    = valid_batches.empty() ? 0 : total_sample_bytes / valid_batches.size();
+  size_t avg_rows_per_batch = valid_batches.empty() ? 0 : total_rows / valid_batches.size();
+  size_t num_parts          = 1;
+  if (estimated_cardinality == 0 || avg_rows_per_batch == 0) {
+    SIRIUS_LOG_WARN(
+      "Sort sample: estimated_cardinality={} or avg_rows_per_batch={} is zero, "
+      "defaulting to 1 partition",
+      estimated_cardinality,
+      avg_rows_per_batch);
+  } else {
+    size_t total_batch_count =
+      (estimated_cardinality + avg_rows_per_batch - 1) / avg_rows_per_batch;
+    size_t estimated_total_bytes = avg_batch_bytes * total_batch_count;
+    size_t available_memory      = space->get_available_memory(stream);
+    size_t max_partition_bytes   = _max_partition_bytes_override > 0
+                                     ? _max_partition_bytes_override
+                                     : static_cast<size_t>(static_cast<double>(available_memory) *
+                                                         MAX_PARTITION_MEMORY_FRACTION);
 
-  size_t num_parts = 1;
-  if (max_partition_bytes > 0 && estimated_total_bytes > max_partition_bytes) {
-    num_parts = (estimated_total_bytes + max_partition_bytes - 1) / max_partition_bytes;
+    if (max_partition_bytes > 0 && estimated_total_bytes > max_partition_bytes) {
+      num_parts = (estimated_total_bytes + max_partition_bytes - 1) / max_partition_bytes;
+    }
+
+    SIRIUS_LOG_DEBUG(
+      "Sort sample: estimated_cardinality={}, total_rows={}, avg_rows_per_batch={}, "
+      "avg_batch_bytes={}, total_batch_count={}, "
+      "estimated_total_bytes={}, available_memory={}, max_partition_bytes={}, num_partitions={}",
+      estimated_cardinality,
+      total_rows,
+      avg_rows_per_batch,
+      avg_batch_bytes,
+      total_batch_count,
+      estimated_total_bytes,
+      available_memory,
+      max_partition_bytes,
+      num_parts);
   }
-
-  SIRIUS_LOG_DEBUG(
-    "Sort sample: total_rows={}, avg_batch_bytes={}, total_batch_count={}, "
-    "estimated_total_bytes={}, available_memory={}, max_partition_bytes={}, num_partitions={}",
-    total_rows,
-    avg_batch_bytes,
-    total_batch_count,
-    estimated_total_bytes,
-    available_memory,
-    max_partition_bytes,
-    num_parts);
 
   // 6. Pick P-1 evenly-spaced boundary rows from the sorted sample (sort key columns only)
   if (num_parts <= 1 || total_rows == 0) {
