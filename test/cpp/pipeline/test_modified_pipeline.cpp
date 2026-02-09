@@ -1003,9 +1003,7 @@ TEST_CASE("Pipeline breakdown - GROUP_BY pattern", "[modified_pipeline][breakdow
   REQUIRE(gpu_plan != nullptr);
 
   sirius_engine engine(*con.context, gpu_context);
-  printf("Initializing engine for GROUP_BY pattern test...\n");
   engine.initialize(std::move(gpu_plan));
-  printf("Engine initialized.\n");
 
   // Validate breakdown: should have PARTITION → CONCAT → GROUP_BY
   auto info = analyze_pipeline_breakdown(engine.new_scheduled);

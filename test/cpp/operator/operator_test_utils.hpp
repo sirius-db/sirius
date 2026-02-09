@@ -18,10 +18,12 @@
 
 #include "scan/test_utils.hpp"
 
+#include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/fixed_point/fixed_point.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/strings/strings_column_view.hpp>
+#include <cudf/table/table.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
@@ -85,6 +87,49 @@ inline rmm::device_async_resource_ref get_resource_ref(cucascade::memory::memory
 }
 
 inline rmm::cuda_stream_view default_stream() { return cudf::get_default_stream(); }
+
+/**
+ * @brief Horizontally concatenate multiple data_batch objects into a single data_batch.
+ *
+ * Takes multiple data_batch objects and combines their columns horizontally (side by side)
+ * into a single data_batch with all columns.
+ *
+ * @param batches Vector of data_batch pointers to concatenate
+ * @param space Memory space for the new batch
+ * @return std::shared_ptr<cucascade::data_batch> New batch with all columns combined
+ */
+inline std::shared_ptr<cucascade::data_batch> concatenate_batches_horizontal(
+  const std::vector<std::shared_ptr<cucascade::data_batch>>& batches,
+  cucascade::memory::memory_space& space)
+{
+  if (batches.empty()) { throw std::runtime_error("Cannot concatenate empty batch list"); }
+
+  auto mr     = get_resource_ref(space);
+  auto stream = default_stream();
+
+  // Collect all columns from all batches
+  std::vector<std::unique_ptr<cudf::column>> all_columns;
+
+  for (const auto& batch : batches) {
+    auto& table     = batch->get_data()->cast<cucascade::gpu_table_representation>().get_table();
+    auto table_view = table.view();
+
+    // Release and collect each column from this table
+    for (cudf::size_type i = 0; i < table_view.num_columns(); ++i) {
+      // We need to make a copy of each column since we can't move from the const table_view
+      all_columns.push_back(std::make_unique<cudf::column>(table_view.column(i), stream, mr));
+    }
+  }
+
+  // Create new table from all collected columns
+  auto concatenated_table = std::make_unique<cudf::table>(std::move(all_columns));
+
+  // Create and return new data_batch
+  auto gpu_repr =
+    std::make_unique<cucascade::gpu_table_representation>(std::move(concatenated_table), space);
+  auto batch_id = ::sirius::get_next_batch_id();
+  return std::make_shared<cucascade::data_batch>(batch_id, std::move(gpu_repr));
+}
 
 template <typename T>
 inline std::vector<T> copy_column_to_host(const cudf::column_view& col)

@@ -168,8 +168,12 @@ sirius_physical_operator::port* sirius_physical_operator::get_port(std::string_v
 {
   auto it = ports.find(std::string(port_id));
   if (it == ports.end()) {
+    std::string ports_string = "";
+    for (auto& [port_name, port_ptr] : ports) {
+      ports_string += port_name + ", ";
+    }
     throw duckdb::InternalException("Port " + std::string(port_id) + " not found in operator " +
-                                    get_name());
+                                    get_name() + " existing ports are: " + ports_string);
   }
   return it->second.get();
 }
@@ -230,9 +234,9 @@ std::optional<task_creation_hint> sirius_physical_operator::get_next_task_hint()
   // if no unfinished barriers, then is this operator ready to create a task?
   if (std::all_of(ports.begin(), ports.end(), [](const auto& port_pair) {
         return (port_pair.second->type != MemoryBarrierType::FULL &&
-                port_pair.second->repo->size() > 0) ||
+                port_pair.second->repo->total_size() > 0) ||
                (port_pair.second->type == MemoryBarrierType::FULL &&
-                port_pair.second->repo->size() > 0 && port_pair.second->src_pipeline &&
+                port_pair.second->repo->total_size() > 0 && port_pair.second->src_pipeline &&
                 port_pair.second->src_pipeline->is_pipeline_finished());
       })) {
     return task_creation_hint{TaskCreationHint::READY, this};
@@ -272,7 +276,7 @@ sirius_physical_operator::get_next_task_input_batch()
 bool sirius_physical_operator::all_ports_empty()
 {
   for (auto& [port_name, port_ptr] : ports) {
-    if (port_ptr->repo->size() != 0) { return false; }
+    if (port_ptr->repo->total_size() != 0) { return false; }
   }
   return true;
 }

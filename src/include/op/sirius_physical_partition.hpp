@@ -22,12 +22,28 @@
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_order.hpp"
+#include "op/sirius_physical_partition_consumer_operator.hpp"
 #include "op/sirius_physical_top_n.hpp"
 
 #define PARTITION_SIZE 10000000
 
 namespace sirius {
 namespace op {
+
+enum class PartitionType { HASH, RANGE, EVENLY, CUSTOM, NONE };
+
+// PartitionType to string
+inline std::string partition_type_to_string(PartitionType type)
+{
+  switch (type) {
+    case PartitionType::HASH: return "HASH";
+    case PartitionType::RANGE: return "RANGE";
+    case PartitionType::EVENLY: return "EVENLY";
+    case PartitionType::CUSTOM: return "CUSTOM";
+    case PartitionType::NONE: return "NONE";
+  }
+  return "UNKNOWN";
+}
 
 class sirius_physical_partition : public sirius_physical_operator {
  public:
@@ -47,14 +63,22 @@ class sirius_physical_partition : public sirius_physical_operator {
   bool is_build_partition();
 
   //! Get the parent operator (e.g., HASH_JOIN for build partition)
-  sirius_physical_operator* get_parent_op() const { return _parent_op; }
+  [[nodiscard]] sirius_physical_operator* get_parent_op() const { return _parent_op; }
+
+  std::vector<std::shared_ptr<::cucascade::data_batch>> execute(
+    const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches,
+    rmm::cuda_stream_view stream = cudf::get_default_stream()) override;
+
+  void sink(const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches,
+            rmm::cuda_stream_view stream = cudf::get_default_stream()) override;
 
  private:
-  void get_partition_keys(sirius_physical_operator* op, bool is_build = false);
+  void get_partition_keys_and_type(sirius_physical_operator* op, bool is_build = false);
   sirius_physical_operator* _parent_op;
-  duckdb::vector<duckdb::idx_t> _partition_keys;
-  duckdb::idx_t _num_partitions;
+  std::vector<int> _partition_keys;
+  int _num_partitions;
   bool _is_build;
+  PartitionType _partition_type;
 };
 
 }  // namespace op

@@ -245,7 +245,8 @@ class sirius_physical_operator {
   }
 
   //! Get the input batch
-  std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>> get_next_task_input_batch();
+  virtual std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>>
+  get_next_task_input_batch();
   //! Check if all ports are empty
   bool all_ports_empty();
   //! Check if the pipeline is finished
@@ -256,7 +257,7 @@ class sirius_physical_operator {
 
   void set_pipeline(duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline);
 
- private:
+ protected:
   duckdb::shared_ptr<pipeline::sirius_pipeline> _pipeline;
   //! The ports of the operator
   std::unordered_map<std::string, std::unique_ptr<port>> ports;
