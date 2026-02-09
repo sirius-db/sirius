@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include "../operator_test_utils.hpp"
+#include "operator/operator_type_traits.hpp"
 #include "utils/data_utils.hpp"
 
 #include <cudf/table/table.hpp>
