@@ -85,6 +85,7 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
       SiriusPhysicalOperatorType::HASH_GROUP_BY, std::move(types), estimated_cardinality),
     grouping_sets(std::move(grouping_sets_p))
 {
+  
   // TODO: for now commenting out this code because we are not using grouping sets yet. Will add it
   // back later when necessary.
 
