@@ -24,6 +24,7 @@
 #include <libconfig.h++>
 
 #include <exception>
+#include <variant>
 #include <vector>
 
 namespace sirius {
@@ -86,7 +87,7 @@ struct sirius::config::custom_config_registrar<sirius::exec::thread_pool_config>
 
 namespace {
 struct topology {
-  size_t num_gpus{1};
+  std::variant<size_t, std::vector<int>> num_gpus_or_gpu_ids{size_t{1}};
 };
 
 struct gpu_mem_config {
@@ -159,7 +160,8 @@ template <>
 struct sirius::config::custom_config_registrar<sirius::topology> {
   static void config(sirius::config::configuration_setter& setter, sirius::topology& opt)
   {
-    setter.add_config("num_gpus", opt.num_gpus);
+    setter.add_variant_config<size_t>("num_gpus", opt.num_gpus_or_gpu_ids);
+    setter.add_variant_config<std::vector<int>>("gpu_ids", opt.num_gpus_or_gpu_ids);
   }
 };
 
@@ -270,7 +272,12 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
   bool using_configurator = _memory_space_configs.empty();
   if (using_configurator) {
     cucascade::memory::reservation_manager_configurator builder;
-    builder.set_number_of_gpus(topology_instance.num_gpus);
+    if (std::holds_alternative<size_t>(topology_instance.num_gpus_or_gpu_ids)) {
+      builder.set_number_of_gpus(std::get<size_t>(topology_instance.num_gpus_or_gpu_ids));
+    } else {
+      const auto& gpu_ids = std::get<std::vector<int>>(topology_instance.num_gpus_or_gpu_ids);
+      builder.set_gpu_ids(gpu_ids);
+    }
     gpu_memory_config_instance.setup_configurator(builder);
     host_memory_config_instance.setup_configurator(builder);
     disk_memory_config_instance.setup_configurator(builder);
