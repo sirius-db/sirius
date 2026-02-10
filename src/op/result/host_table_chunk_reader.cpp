@@ -211,6 +211,17 @@ host_table_chunk_reader::host_table_chunk_reader(
     throw std::runtime_error(
       "[host_table_chunk_reader] Metadata column count does not match expected column count.");
   }
+  if (_allocation->size_bytes() == 0) {
+    if (metadata_nodes[0].size == 0) {
+      // empty result host table, return without any column readers (creating them would fail).
+      // Because _row_offset and _total_rows are 0 by default, get_next_chunk() will immediately
+      // return false.
+      return;
+    } else {
+      throw duckdb::InvalidInputException(
+        "[GPUPhysicalMaterializedCollector] host_table has rows but a zero-sized allocation");
+    }
+  }
   // Initialize column readers
   _column_readers.reserve(metadata_nodes.size());
   for (size_t col_idx = 0; col_idx < metadata_nodes.size(); ++col_idx) {
