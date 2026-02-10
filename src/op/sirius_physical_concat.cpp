@@ -84,7 +84,7 @@ sirius_physical_concat::get_next_task_input_batch()
     size_t total_batch_size = 0;
     for (auto& batch_id : batch_ids) {
       auto batch =
-        port_ptr->repo->get_data_batch_by_id(batch_id, ::cucascade::batch_state::processing, i);
+        port_ptr->repo->get_data_batch_by_id(batch_id, ::cucascade::batch_state::task_created, i);
       auto batch_size = batch->get_data()->get_size_in_bytes();
       total_batch_size += batch_size;
       // Check if the batch size is already exceed the threshold
