@@ -27,12 +27,29 @@ namespace sirius {
 namespace op {
 
 /**
+ * @brief Mapping from one original DuckDB aggregate expression to its position(s) in the expanded
+ * cudf_aggregates vector. AVG is decomposed into SUM + COUNT_VALID (two slots), all others use one.
+ */
+struct AggregateSlot {
+  bool is_avg = false;
+  size_t cudf_idx;  ///< Index in cudf_aggregates. For AVG, this is the SUM slot; cudf_idx+1 is
+                    ///< COUNT_VALID.
+  cudf::data_type output_type{cudf::type_id::EMPTY};  ///< For AVG: the desired output cudf type
+                                                      ///< (FLOAT64 or DECIMAL).
+};
+
+/**
  * @brief Result of converting DuckDB aggregate expressions to cuDF compute definitions.
  */
 struct CudfAggregateDefinitions {
   std::vector<int> group_idx;                            ///< Column indices for GROUP BY keys
-  std::vector<cudf::aggregation::Kind> cudf_aggregates;  ///< cuDF aggregation types
-  std::vector<int> cudf_aggregate_idx;                   ///< Column indices for aggregation inputs
+  std::vector<cudf::aggregation::Kind> cudf_aggregates;  ///< cuDF aggregation types (expanded: 2
+                                                         ///< entries per AVG)
+  std::vector<int> cudf_aggregate_idx;  ///< Column indices for aggregation inputs (expanded)
+
+  /// One entry per original DuckDB aggregate expression, mapping to cudf_aggregates positions.
+  std::vector<AggregateSlot> aggregate_slots;
+  bool has_avg = false;  ///< True if any aggregate is AVG
 };
 
 /**

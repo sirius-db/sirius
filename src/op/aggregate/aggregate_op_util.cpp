@@ -16,6 +16,7 @@
 
 #include "op/aggregate/aggregate_op_util.hpp"
 
+#include "cudf/cudf_utils.hpp"
 #include "duckdb/common/assert.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
@@ -43,6 +44,24 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
   for (const auto& aggregate : expressions) {
     auto& aggr = aggregate->Cast<duckdb::BoundAggregateExpression>();
 
+    // Handle AVG specially: it expands into SUM + COUNT_VALID
+    if (aggr.function.name == "avg") {
+      D_ASSERT(aggr.children.size() == 1);
+      D_ASSERT(aggr.children[0]->type == duckdb::ExpressionType::BOUND_REF);
+      auto& bound_ref = aggr.children[0]->Cast<duckdb::BoundReferenceExpression>();
+      auto col_idx    = static_cast<int>(bound_ref.index);
+
+      size_t sum_position = result.cudf_aggregates.size();
+      result.cudf_aggregates.push_back(cudf::aggregation::Kind::SUM);
+      result.cudf_aggregate_idx.push_back(col_idx);
+      result.cudf_aggregates.push_back(cudf::aggregation::Kind::COUNT_VALID);
+      result.cudf_aggregate_idx.push_back(col_idx);
+      result.aggregate_slots.push_back(
+        AggregateSlot{true, sum_position, duckdb::GetCudfType(aggr.return_type)});
+      result.has_avg = true;
+      continue;
+    }
+
     // Convert DuckDB aggregate function name to cudf::aggregation::Kind
     cudf::aggregation::Kind agg_kind;
     if (aggr.function.name == "sum" || aggr.function.name == "sum_no_overflow") {
@@ -58,6 +77,7 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
     } else {
       throw std::runtime_error("Unsupported aggregate function: " + aggr.function.name);
     }
+    size_t current_position = result.cudf_aggregates.size();
     result.cudf_aggregates.push_back(agg_kind);
 
     // 3. Extract aggregate_idx from the children of the aggregate expression
@@ -80,6 +100,7 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
                                  " with " + std::to_string(aggr.children.size()) + " children");
       }
     }
+    result.aggregate_slots.push_back(AggregateSlot{false, current_position});
   }
 
   return result;

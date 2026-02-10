@@ -47,7 +47,8 @@ extension_lock::extension_lock(const std::string& extension_name, const std::str
 
     if (err == EWOULDBLOCK) {
       throw std::runtime_error("Extension '" + extension_name +
-                               "' is already loaded in another process.");
+                               "' is already loaded in another process." +
+                               std::string(" (Lock file: ") + lock_path_ + ")");
     } else {
       throw std::runtime_error("Failed to lock file: " + std::string(std::strerror(err)));
     }
