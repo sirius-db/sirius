@@ -18,13 +18,12 @@
 #include "operator_type_traits.hpp"
 
 #include <catch.hpp>
+#include <cucascade/data/data_repository.hpp>
 #include <duckdb.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 #include <duckdb/planner/operator/logical_comparison_join.hpp>
 #include <op/sirius_physical_concat.hpp>
 #include <op/sirius_physical_hash_join.hpp>
-
-#include <cucascade/data/data_repository.hpp>
 
 #include <atomic>
 #include <mutex>
@@ -69,7 +68,7 @@ hash_join_test_fixture create_test_hash_join(duckdb::JoinType join_type,
   hash_join_test_fixture fixture;
 
   // Create a LogicalComparisonJoin with the desired join type
-  fixture.logical_join = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(join_type);
+  fixture.logical_join        = duckdb::make_uniq<duckdb::LogicalComparisonJoin>(join_type);
   fixture.logical_join->types = output_types;
 
   // Create minimal child operators (need at least one type each for the hash join constructor)
@@ -85,10 +84,8 @@ hash_join_test_fixture create_test_hash_join(duckdb::JoinType join_type,
   // Create a single equality join condition (column 0 = column 0)
   duckdb::vector<duckdb::JoinCondition> conditions;
   duckdb::JoinCondition cond;
-  cond.left =
-    duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
-  cond.right =
-    duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
+  cond.left  = duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
+  cond.right = duckdb::make_uniq<duckdb::BoundReferenceExpression>(duckdb::LogicalType::INTEGER, 0);
   cond.comparison = duckdb::ExpressionType::COMPARE_EQUAL;
   conditions.push_back(std::move(cond));
 
@@ -99,11 +96,11 @@ hash_join_test_fixture create_test_hash_join(duckdb::JoinType join_type,
     std::move(right_child),
     std::move(conditions),
     join_type,
-    duckdb::vector<duckdb::idx_t>{},   // left_projection_map (empty = all)
-    duckdb::vector<duckdb::idx_t>{},   // right_projection_map (empty = all)
+    duckdb::vector<duckdb::idx_t>{},        // left_projection_map (empty = all)
+    duckdb::vector<duckdb::idx_t>{},        // right_projection_map (empty = all)
     duckdb::vector<duckdb::LogicalType>{},  // delim_types
-    1000,                               // estimated_cardinality
-    nullptr);                           // pushdown_info
+    1000,                                   // estimated_cardinality
+    nullptr);                               // pushdown_info
 
   return fixture;
 }
@@ -193,18 +190,15 @@ TEMPLATE_TEST_CASE("sirius_physical_concat concatenates multiple data_batches",
   }
 
   // Create hash join fixture and concat operator
-  auto fixture = create_test_hash_join(
-    duckdb::JoinType::INNER, {Traits::logical_type()});
-  sirius_physical_concat concat_op(
-    {Traits::logical_type()}, 1000, fixture.hash_join.get(), false);
+  auto fixture = create_test_hash_join(duckdb::JoinType::INNER, {Traits::logical_type()});
+  sirius_physical_concat concat_op({Traits::logical_type()}, 1000, fixture.hash_join.get(), false);
 
   // Execute
   auto outputs = concat_op.execute(input_batches, default_stream());
 
   // Verify: single output batch with correct total rows
   REQUIRE(outputs.size() == 1);
-  auto& out_table =
-    outputs[0]->get_data()->cast<cucascade::gpu_table_representation>().get_table();
+  auto& out_table = outputs[0]->get_data()->cast<cucascade::gpu_table_representation>().get_table();
   REQUIRE(static_cast<std::size_t>(out_table.num_rows()) == total_rows);
   REQUIRE(out_table.num_columns() == 1);
 
@@ -226,8 +220,7 @@ TEST_CASE("sirius_physical_concat returns single batch as-is", "[physical_concat
   std::iota(values.begin(), values.end(), 0);
   auto input_batch = make_numeric_batch<int32_t>(*space, values, cudf::type_id::INT32);
 
-  auto fixture = create_test_hash_join(
-    duckdb::JoinType::INNER, {duckdb::LogicalType::INTEGER});
+  auto fixture = create_test_hash_join(duckdb::JoinType::INNER, {duckdb::LogicalType::INTEGER});
   sirius_physical_concat concat_op(
     {duckdb::LogicalType::INTEGER}, 1000, fixture.hash_join.get(), false);
 
@@ -240,8 +233,7 @@ TEST_CASE("sirius_physical_concat returns single batch as-is", "[physical_concat
 
 TEST_CASE("sirius_physical_concat handles empty input", "[physical_concat]")
 {
-  auto fixture = create_test_hash_join(
-    duckdb::JoinType::INNER, {duckdb::LogicalType::INTEGER});
+  auto fixture = create_test_hash_join(duckdb::JoinType::INNER, {duckdb::LogicalType::INTEGER});
   sirius_physical_concat concat_op(
     {duckdb::LogicalType::INTEGER}, 1000, fixture.hash_join.get(), false);
 
@@ -257,24 +249,22 @@ TEST_CASE("sirius_physical_concat filters null batches", "[physical_concat]")
 
   std::vector<int32_t> values1 = {1, 2, 3};
   std::vector<int32_t> values2 = {4, 5, 6};
-  auto batch1 = make_numeric_batch<int32_t>(*space, values1, cudf::type_id::INT32);
-  auto batch2 = make_numeric_batch<int32_t>(*space, values2, cudf::type_id::INT32);
+  auto batch1                  = make_numeric_batch<int32_t>(*space, values1, cudf::type_id::INT32);
+  auto batch2                  = make_numeric_batch<int32_t>(*space, values2, cudf::type_id::INT32);
 
-  auto fixture = create_test_hash_join(
-    duckdb::JoinType::INNER, {duckdb::LogicalType::INTEGER});
+  auto fixture = create_test_hash_join(duckdb::JoinType::INNER, {duckdb::LogicalType::INTEGER});
   sirius_physical_concat concat_op(
     {duckdb::LogicalType::INTEGER}, 1000, fixture.hash_join.get(), false);
 
   // Mix valid and null batches
   std::vector<std::shared_ptr<data_batch>> input = {batch1, nullptr, batch2, nullptr};
-  auto outputs = concat_op.execute(input, default_stream());
+  auto outputs                                   = concat_op.execute(input, default_stream());
 
   REQUIRE(outputs.size() == 1);
-  auto& out_table =
-    outputs[0]->get_data()->cast<cucascade::gpu_table_representation>().get_table();
+  auto& out_table = outputs[0]->get_data()->cast<cucascade::gpu_table_representation>().get_table();
   REQUIRE(out_table.num_rows() == 6);
 
-  auto host_data = copy_column_to_host<int32_t>(out_table.view().column(0));
+  auto host_data                = copy_column_to_host<int32_t>(out_table.view().column(0));
   std::vector<int32_t> expected = {1, 2, 3, 4, 5, 6};
   REQUIRE(host_data == expected);
 }
@@ -290,11 +280,10 @@ TEST_CASE("sirius_physical_concat stops concatenating at DEFAULT_SCAN_TASK_BATCH
   REQUIRE(space != nullptr);
 
   // Save and set a small threshold so our test batches exceed it
-  auto original_threshold          = duckdb::Config::DEFAULT_SCAN_TASK_BATCH_SIZE;
+  auto original_threshold                      = duckdb::Config::DEFAULT_SCAN_TASK_BATCH_SIZE;
   duckdb::Config::DEFAULT_SCAN_TASK_BATCH_SIZE = 1024;  // 1 KB
 
-  auto fixture = create_test_hash_join(
-    duckdb::JoinType::INNER, {duckdb::LogicalType::INTEGER});
+  auto fixture = create_test_hash_join(duckdb::JoinType::INNER, {duckdb::LogicalType::INTEGER});
   sirius_physical_concat concat_op(
     {duckdb::LogicalType::INTEGER}, 1000, fixture.hash_join.get(), false);
 
@@ -302,7 +291,7 @@ TEST_CASE("sirius_physical_concat stops concatenating at DEFAULT_SCAN_TASK_BATCH
   auto repo = std::make_unique<cucascade::shared_data_repository>();
 
   // Create batches that are each bigger than 1 KB (1000 int32 values = 4000 bytes > 1 KB)
-  constexpr int num_batches         = 5;
+  constexpr int num_batches            = 5;
   constexpr std::size_t rows_per_batch = 1000;
   for (int b = 0; b < num_batches; ++b) {
     std::vector<int32_t> values(rows_per_batch);
@@ -340,19 +329,17 @@ TEST_CASE("sirius_physical_concat stops concatenating at DEFAULT_SCAN_TASK_BATCH
   duckdb::Config::DEFAULT_SCAN_TASK_BATCH_SIZE = original_threshold;
 }
 
-TEST_CASE("sirius_physical_concat with concat_all=true ignores threshold",
-          "[physical_concat]")
+TEST_CASE("sirius_physical_concat with concat_all=true ignores threshold", "[physical_concat]")
 {
   auto* space = get_shared_mem_space();
   REQUIRE(space != nullptr);
 
   // Save and set a small threshold
-  auto original_threshold          = duckdb::Config::DEFAULT_SCAN_TASK_BATCH_SIZE;
+  auto original_threshold                      = duckdb::Config::DEFAULT_SCAN_TASK_BATCH_SIZE;
   duckdb::Config::DEFAULT_SCAN_TASK_BATCH_SIZE = 1024;  // 1 KB
 
   // LEFT join + is_build=true -> _concat_all = true
-  auto fixture = create_test_hash_join(
-    duckdb::JoinType::LEFT, {duckdb::LogicalType::INTEGER});
+  auto fixture = create_test_hash_join(duckdb::JoinType::LEFT, {duckdb::LogicalType::INTEGER});
   sirius_physical_concat concat_op(
     {duckdb::LogicalType::INTEGER}, 1000, fixture.hash_join.get(), true);
 
@@ -360,7 +347,7 @@ TEST_CASE("sirius_physical_concat with concat_all=true ignores threshold",
   auto repo = std::make_unique<cucascade::shared_data_repository>();
 
   // Create batches that are each bigger than 1 KB
-  constexpr int num_batches         = 5;
+  constexpr int num_batches            = 5;
   constexpr std::size_t rows_per_batch = 1000;
   for (int b = 0; b < num_batches; ++b) {
     std::vector<int32_t> values(rows_per_batch);
@@ -398,8 +385,7 @@ TEST_CASE("sirius_physical_concat constructor sets concat_all for different join
 {
   SECTION("INNER join -> is_build_concat reflects is_build flag")
   {
-    auto fixture = create_test_hash_join(
-      duckdb::JoinType::INNER, {duckdb::LogicalType::INTEGER});
+    auto fixture = create_test_hash_join(duckdb::JoinType::INNER, {duckdb::LogicalType::INTEGER});
     sirius_physical_concat concat_build(
       {duckdb::LogicalType::INTEGER}, 1000, fixture.hash_join.get(), true);
     REQUIRE(concat_build.is_build_concat() == true);
@@ -411,8 +397,7 @@ TEST_CASE("sirius_physical_concat constructor sets concat_all for different join
 
   SECTION("LEFT join + is_build=true -> is_build_concat returns true")
   {
-    auto fixture = create_test_hash_join(
-      duckdb::JoinType::LEFT, {duckdb::LogicalType::INTEGER});
+    auto fixture = create_test_hash_join(duckdb::JoinType::LEFT, {duckdb::LogicalType::INTEGER});
     sirius_physical_concat concat_op(
       {duckdb::LogicalType::INTEGER}, 1000, fixture.hash_join.get(), true);
     REQUIRE(concat_op.is_build_concat() == true);
@@ -420,8 +405,7 @@ TEST_CASE("sirius_physical_concat constructor sets concat_all for different join
 
   SECTION("LEFT join + is_build=false -> is_build_concat returns false")
   {
-    auto fixture = create_test_hash_join(
-      duckdb::JoinType::LEFT, {duckdb::LogicalType::INTEGER});
+    auto fixture = create_test_hash_join(duckdb::JoinType::LEFT, {duckdb::LogicalType::INTEGER});
     sirius_physical_concat concat_op(
       {duckdb::LogicalType::INTEGER}, 1000, fixture.hash_join.get(), false);
     REQUIRE(concat_op.is_build_concat() == false);
@@ -429,39 +413,32 @@ TEST_CASE("sirius_physical_concat constructor sets concat_all for different join
 
   SECTION("RIGHT join constructs successfully")
   {
-    auto fixture = create_test_hash_join(
-      duckdb::JoinType::RIGHT, {duckdb::LogicalType::INTEGER});
-    REQUIRE_NOTHROW(sirius_physical_concat(
-      {duckdb::LogicalType::INTEGER}, 1000, fixture.hash_join.get(), true));
+    auto fixture = create_test_hash_join(duckdb::JoinType::RIGHT, {duckdb::LogicalType::INTEGER});
+    REQUIRE_NOTHROW(
+      sirius_physical_concat({duckdb::LogicalType::INTEGER}, 1000, fixture.hash_join.get(), true));
   }
 
   SECTION("SEMI join constructs successfully")
   {
-    auto fixture = create_test_hash_join(
-      duckdb::JoinType::SEMI, {duckdb::LogicalType::INTEGER});
-    REQUIRE_NOTHROW(sirius_physical_concat(
-      {duckdb::LogicalType::INTEGER}, 1000, fixture.hash_join.get(), false));
+    auto fixture = create_test_hash_join(duckdb::JoinType::SEMI, {duckdb::LogicalType::INTEGER});
+    REQUIRE_NOTHROW(
+      sirius_physical_concat({duckdb::LogicalType::INTEGER}, 1000, fixture.hash_join.get(), false));
   }
 
   SECTION("OUTER join throws unsupported join type")
   {
-    auto fixture = create_test_hash_join(
-      duckdb::JoinType::OUTER, {duckdb::LogicalType::INTEGER});
+    auto fixture = create_test_hash_join(duckdb::JoinType::OUTER, {duckdb::LogicalType::INTEGER});
     REQUIRE_THROWS_AS(
-      sirius_physical_concat(
-        {duckdb::LogicalType::INTEGER}, 1000, fixture.hash_join.get(), false),
+      sirius_physical_concat({duckdb::LogicalType::INTEGER}, 1000, fixture.hash_join.get(), false),
       std::runtime_error);
   }
 
   SECTION("Non-hash-join parent throws")
   {
     sirius_physical_operator non_join_op(
-      SiriusPhysicalOperatorType::PROJECTION,
-      {duckdb::LogicalType::INTEGER},
-      1000);
+      SiriusPhysicalOperatorType::PROJECTION, {duckdb::LogicalType::INTEGER}, 1000);
     REQUIRE_THROWS_AS(
-      sirius_physical_concat(
-        {duckdb::LogicalType::INTEGER}, 1000, &non_join_op, false),
+      sirius_physical_concat({duckdb::LogicalType::INTEGER}, 1000, &non_join_op, false),
       std::runtime_error);
   }
 }
@@ -470,18 +447,16 @@ TEST_CASE("sirius_physical_concat constructor sets concat_all for different join
 // 4. Multithreading tests
 //===----------------------------------------------------------------------===//
 
-TEST_CASE("sirius_physical_concat get_next_task_input_batch is thread-safe",
-          "[physical_concat]")
+TEST_CASE("sirius_physical_concat get_next_task_input_batch is thread-safe", "[physical_concat]")
 {
   auto* space = get_shared_mem_space();
   REQUIRE(space != nullptr);
 
   // Save and set a small threshold to force multiple get_next_task_input_batch calls
-  auto original_threshold          = duckdb::Config::DEFAULT_SCAN_TASK_BATCH_SIZE;
+  auto original_threshold                      = duckdb::Config::DEFAULT_SCAN_TASK_BATCH_SIZE;
   duckdb::Config::DEFAULT_SCAN_TASK_BATCH_SIZE = 1024;  // 1 KB
 
-  auto fixture = create_test_hash_join(
-    duckdb::JoinType::INNER, {duckdb::LogicalType::INTEGER});
+  auto fixture = create_test_hash_join(duckdb::JoinType::INNER, {duckdb::LogicalType::INTEGER});
   sirius_physical_concat concat_op(
     {duckdb::LogicalType::INTEGER}, 1000, fixture.hash_join.get(), false);
 
@@ -490,14 +465,15 @@ TEST_CASE("sirius_physical_concat get_next_task_input_batch is thread-safe",
 
   constexpr int num_batches_per_partition = 20;
   constexpr int num_partitions            = 5;
-  constexpr std::size_t rows_per_batch   = 500;
+  constexpr std::size_t rows_per_batch    = 500;
   int total_batches                       = num_batches_per_partition * num_partitions;
 
   std::set<uint64_t> expected_batch_ids;
   for (int p = 0; p < num_partitions; ++p) {
     for (int b = 0; b < num_batches_per_partition; ++b) {
       std::vector<int32_t> values(rows_per_batch);
-      std::iota(values.begin(), values.end(),
+      std::iota(values.begin(),
+                values.end(),
                 static_cast<int32_t>((p * num_batches_per_partition + b) * rows_per_batch));
       auto batch = make_numeric_batch<int32_t>(*space, values, cudf::type_id::INT32);
       expected_batch_ids.insert(batch->get_batch_id());
@@ -559,19 +535,19 @@ TEST_CASE("sirius_physical_concat execute is thread-safe with independent stream
   auto* space = get_shared_mem_space();
   REQUIRE(space != nullptr);
 
-  auto fixture = create_test_hash_join(
-    duckdb::JoinType::INNER, {duckdb::LogicalType::INTEGER});
+  auto fixture = create_test_hash_join(duckdb::JoinType::INNER, {duckdb::LogicalType::INTEGER});
 
-  constexpr int num_threads          = 4;
+  constexpr int num_threads            = 4;
   constexpr std::size_t rows_per_batch = 200;
-  constexpr int batches_per_thread   = 3;
+  constexpr int batches_per_thread     = 3;
 
   // Pre-create input batches for each thread
   std::vector<std::vector<std::shared_ptr<data_batch>>> thread_inputs(num_threads);
   for (int t = 0; t < num_threads; ++t) {
     for (int b = 0; b < batches_per_thread; ++b) {
       std::vector<int32_t> values(rows_per_batch);
-      std::iota(values.begin(), values.end(),
+      std::iota(values.begin(),
+                values.end(),
                 static_cast<int32_t>((t * batches_per_thread + b) * rows_per_batch));
       auto batch = make_numeric_batch<int32_t>(*space, values, cudf::type_id::INT32);
       thread_inputs[t].push_back(std::move(batch));
@@ -623,11 +599,7 @@ TEST_CASE("sirius_physical_concat execute is thread-safe with independent stream
   for (int t = 0; t < num_threads; ++t) {
     REQUIRE(thread_outputs[t].size() == 1);
     auto& out_table =
-      thread_outputs[t][0]
-        ->get_data()
-        ->cast<cucascade::gpu_table_representation>()
-        .get_table();
-    REQUIRE(static_cast<std::size_t>(out_table.num_rows()) ==
-            rows_per_batch * batches_per_thread);
+      thread_outputs[t][0]->get_data()->cast<cucascade::gpu_table_representation>().get_table();
+    REQUIRE(static_cast<std::size_t>(out_table.num_rows()) == rows_per_batch * batches_per_thread);
   }
 }
