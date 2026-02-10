@@ -66,8 +66,13 @@ class host_table_chunk_reader {
       data_accessor;  ///< Accessor to the column data in the multiple blocks allocation
     memory::multiple_blocks_allocation_accessor<uint8_t>
       mask_accessor;  ///< Accessor to the null mask data in the multiple blocks allocation
+    memory::multiple_blocks_allocation_accessor<int32_t>
+      offset_accessor_32;  ///< Accessor to the STRING offsets (INT32) in the multiple blocks
+                           ///< allocation
     memory::multiple_blocks_allocation_accessor<int64_t>
-      offset_accessor;  ///< Accessor to the STRING offsets in the multiple blocks allocation
+      offset_accessor_64;  ///< Accessor to the STRING offsets (INT64) in the multiple blocks
+                           ///< allocation
+    bool use_int64_offsets{false};  ///< Whether the offset column uses INT64 (from cudf::pack)
 
     /**
      * @brief Construct a new column reader object

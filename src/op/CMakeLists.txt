@@ -43,6 +43,8 @@ set(EXTENSION_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/sirius_physical_duckdb_scan.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/sirius_physical_grouped_aggregate_merge.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/sirius_physical_merge_sort.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/sirius_physical_sort_partition.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/sirius_physical_sort_sample.cpp
     # # Below is for the new execution model, and we are gradually migrating #
     # operators above to the new execution model.
     ${CMAKE_CURRENT_SOURCE_DIR}/aggregate/aggregate_op_util.cpp

@@ -174,17 +174,6 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_top_n::execu
   return outputs;
 }
 
-static duckdb::vector<duckdb::BoundOrderByNode> copy_orders(
-  const duckdb::vector<duckdb::BoundOrderByNode>& src)
-{
-  duckdb::vector<duckdb::BoundOrderByNode> result;
-  result.reserve(src.size());
-  for (const auto& order : src) {
-    result.push_back(order.Copy());
-  }
-  return result;
-}
-
 sirius_physical_top_n_merge::sirius_physical_top_n_merge(sirius_physical_top_n* top_n)
   : sirius_physical_top_n_merge(
       top_n->types,                // copied by value

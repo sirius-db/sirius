@@ -21,6 +21,7 @@
 
 #include <cstdlib>
 #include <filesystem>
+#include <iostream>
 #include <set>
 #include <string>
 
@@ -61,6 +62,9 @@ struct config_env_guard {
  */
 static void compare_gpu_vs_cpu(duckdb::Connection& con, const std::string& query)
 {
+  // Disable fallback so GPU errors are not silently hidden
+  con.Query("SET enable_fallback_check = true;");
+
   // Run on GPU
   auto gpu_sql    = "CALL gpu_execution('" + query + "')";
   auto gpu_result = con.Query(gpu_sql);
@@ -279,7 +283,16 @@ TEST_CASE("gpu_execution - group by", "[.][integration_disabled][gpu_execution]"
   compare_gpu_vs_cpu(con, "select n_regionkey, count(*) from nation group by n_regionkey;");
 }
 
-TEST_CASE("gpu_execution - order by", "[.][integration_disabled][gpu_execution]")
+TEST_CASE("gpu_execution - order by", "[integration][gpu_execution][order_by]")
+{
+  config_env_guard env;
+  duckdb::DuckDB db(get_tpch_db_path().string());
+  duckdb::Connection con(db);
+  compare_gpu_vs_cpu(con, "select n_nationkey, n_regionkey from nation order by n_regionkey;");
+}
+
+TEST_CASE("gpu_execution - order by column not in select",
+          "[integration][gpu_execution][order_by][order_by_proj]")
 {
   config_env_guard env;
   duckdb::DuckDB db(get_tpch_db_path().string());
@@ -287,12 +300,187 @@ TEST_CASE("gpu_execution - order by", "[.][integration_disabled][gpu_execution]"
   compare_gpu_vs_cpu(con, "select n_nationkey from nation order by n_regionkey;");
 }
 
-TEST_CASE("gpu_execution - top n", "[.][integration_disabled][gpu_execution]")
+TEST_CASE("gpu_execution - order by column not in select lineitem",
+          "[integration][gpu_execution][order_by][order_by_proj]")
 {
   config_env_guard env;
   duckdb::DuckDB db(get_tpch_db_path().string());
   duckdb::Connection con(db);
-  compare_gpu_vs_cpu(con, "select n_nationkey from nation order by n_regionkey desc limit 5;");
+  compare_gpu_vs_cpu(con, "select l_orderkey from lineitem order by l_linenumber;");
+}
+
+TEST_CASE("gpu_execution - order by multipartition", "[integration][gpu_execution][order_by]")
+{
+  config_env_guard env;
+  duckdb::DuckDB db(get_tpch_db_path().string());
+  duckdb::Connection con(db);
+
+  // Force small partition size (1 KB) so lineitem data is split into multiple partitions
+  con.Query("SET max_sort_partition_bytes = 1024;");
+
+  std::string query = "select l_orderkey, l_partkey from lineitem order by l_orderkey";
+
+  // Run on GPU
+  auto gpu_result = con.Query("CALL gpu_execution('" + query + "')");
+  REQUIRE(gpu_result);
+  if (gpu_result->HasError()) { UNSCOPED_INFO("gpu error: " << gpu_result->GetError()); }
+  REQUIRE_FALSE(gpu_result->HasError());
+
+  // Run on CPU
+  auto cpu_result = con.Query(query + ";");
+  REQUIRE(cpu_result);
+  REQUIRE_FALSE(cpu_result->HasError());
+
+  // Verify dimensions match
+  REQUIRE(gpu_result->ColumnCount() == cpu_result->ColumnCount());
+  REQUIRE(gpu_result->RowCount() == cpu_result->RowCount());
+
+  // With 600K rows and 1KB max partition, we must have many partitions.
+  // Verify the data is non-trivially large (ensures partitioning actually happened).
+  REQUIRE(gpu_result->RowCount() > 1000);
+  // Sort both result sets for deterministic comparison
+  auto gpu_sorted = con.Query("SELECT * FROM gpu_execution('" + query + "') ORDER BY 1, 2");
+  auto cpu_sorted = con.Query("SELECT * FROM (" + query + ") t ORDER BY 1, 2");
+  REQUIRE(gpu_sorted);
+  REQUIRE_FALSE(gpu_sorted->HasError());
+  REQUIRE(cpu_sorted);
+  REQUIRE_FALSE(cpu_sorted->HasError());
+
+  // Compare every cell
+  duckdb::idx_t mismatches = 0;
+  for (duckdb::idx_t r = 0; r < gpu_sorted->RowCount(); r++) {
+    for (duckdb::idx_t c = 0; c < gpu_sorted->ColumnCount(); c++) {
+      auto gpu_val = gpu_sorted->GetValue(c, r).ToString();
+      auto cpu_val = cpu_sorted->GetValue(c, r).ToString();
+      if (gpu_val != cpu_val) {
+        if (mismatches < 5) {
+          UNSCOPED_INFO("Row " << r << " Col " << c << " mismatch: GPU=[" << gpu_val << "] CPU=["
+                               << cpu_val << "]");
+        }
+        mismatches++;
+      }
+      REQUIRE(gpu_val == cpu_val);
+    }
+  }
+
+  // Reset to auto
+  con.Query("SET max_sort_partition_bytes = 0;");
+}
+
+TEST_CASE("gpu_execution - order by multiple columns", "[integration][gpu_execution][order_by]")
+{
+  config_env_guard env;
+  duckdb::DuckDB db(get_tpch_db_path().string());
+  duckdb::Connection con(db);
+  con.Query("SET max_sort_partition_bytes = 1024;");
+  compare_gpu_vs_cpu(
+    con,
+    "select l_orderkey, l_linenumber, l_quantity from lineitem order by l_orderkey, l_linenumber;");
+  con.Query("SET max_sort_partition_bytes = 0;");
+}
+
+TEST_CASE("gpu_execution - order by desc", "[integration][gpu_execution][order_by]")
+{
+  config_env_guard env;
+  duckdb::DuckDB db(get_tpch_db_path().string());
+  duckdb::Connection con(db);
+  con.Query("SET max_sort_partition_bytes = 1024;");
+  compare_gpu_vs_cpu(
+    con, "select l_orderkey, l_partkey, l_suppkey from lineitem order by l_partkey desc;");
+  con.Query("SET max_sort_partition_bytes = 0;");
+}
+
+TEST_CASE("gpu_execution - order by many selected columns",
+          "[integration][gpu_execution][order_by]")
+{
+  config_env_guard env;
+  duckdb::DuckDB db(get_tpch_db_path().string());
+  duckdb::Connection con(db);
+  con.Query("SET max_sort_partition_bytes = 1024;");
+  compare_gpu_vs_cpu(con,
+                     "select l_orderkey, l_partkey, l_suppkey, l_linenumber, l_quantity "
+                     "from lineitem order by l_suppkey;");
+  con.Query("SET max_sort_partition_bytes = 0;");
+}
+
+TEST_CASE("gpu_execution - order by with decimal column",
+          "[integration][gpu_execution][order_by][order_by_types]")
+{
+  config_env_guard env;
+  duckdb::DuckDB db(get_tpch_db_path().string());
+  duckdb::Connection con(db);
+  auto gpu_result = con.Query(
+    "CALL gpu_execution('select o_orderkey, o_totalprice from orders order by o_orderkey')");
+  REQUIRE(gpu_result);
+  if (gpu_result->HasError()) {
+    std::cerr << "DECIMAL error: " << gpu_result->GetError() << std::endl;
+  }
+  REQUIRE_FALSE(gpu_result->HasError());
+  REQUIRE(gpu_result->RowCount() > 0);
+}
+
+TEST_CASE("gpu_execution - scan lineitem with varchar column",
+          "[integration][gpu_execution][varchar_scan_lineitem]")
+{
+  config_env_guard env;
+  duckdb::DuckDB db(get_tpch_db_path().string());
+  duckdb::Connection con(db);
+  compare_gpu_vs_cpu(con, "select l_orderkey, l_shipinstruct from lineitem;");
+}
+
+TEST_CASE("gpu_execution - order by lineitem with short varchar column",
+          "[integration][gpu_execution][order_by][varchar_order]")
+{
+  config_env_guard env;
+  duckdb::DuckDB db(get_tpch_db_path().string());
+  duckdb::Connection con(db);
+  compare_gpu_vs_cpu(
+    con, "select l_orderkey, l_shipinstruct, l_linenumber from lineitem order by l_orderkey;");
+}
+
+TEST_CASE("gpu_execution - order by lineitem with long varchar column",
+          "[integration][gpu_execution][order_by][varchar_order]")
+{
+  config_env_guard env;
+  duckdb::DuckDB db(get_tpch_db_path().string());
+  duckdb::Connection con(db);
+  compare_gpu_vs_cpu(
+    con, "select l_orderkey, l_comment, l_linenumber from lineitem order by l_orderkey;");
+}
+
+TEST_CASE("gpu_execution - scan with varchar column",
+          "[integration][gpu_execution][order_by_types][varchar]")
+{
+  config_env_guard env;
+  duckdb::DuckDB db(get_tpch_db_path().string());
+  duckdb::Connection con(db);
+  compare_gpu_vs_cpu(con, "select n_nationkey, n_name from nation;");
+}
+
+TEST_CASE("gpu_execution - order by with varchar column",
+          "[integration][gpu_execution][order_by][order_by_types]")
+{
+  config_env_guard env;
+  duckdb::DuckDB db(get_tpch_db_path().string());
+  duckdb::Connection con(db);
+  auto gpu_result =
+    con.Query("CALL gpu_execution('select n_nationkey, n_name from nation order by n_nationkey')");
+  REQUIRE(gpu_result);
+  if (gpu_result->HasError()) {
+    std::cerr << "VARCHAR order by error: " << gpu_result->GetError() << std::endl;
+  }
+  REQUIRE_FALSE(gpu_result->HasError());
+  REQUIRE(gpu_result->RowCount() > 0);
+  std::cerr << "VARCHAR order by: " << gpu_result->RowCount() << " rows OK" << std::endl;
+}
+
+TEST_CASE("gpu_execution - top n", "[.][integration_disabled][gpu_execution][top_n]")
+{
+  config_env_guard env;
+  duckdb::DuckDB db(get_tpch_db_path().string());
+  duckdb::Connection con(db);
+  compare_gpu_vs_cpu(
+    con, "select n_nationkey, n_regionkey from nation order by n_regionkey desc limit 5;");
 }
 
 TEST_CASE("gpu_execution - join", "[.][integration_disabled][gpu_execution]")

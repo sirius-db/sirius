@@ -22,6 +22,18 @@
 namespace sirius {
 namespace op {
 
+// Helper to deep copy BoundOrderByNode vector (contains unique_ptr<Expression>)
+inline duckdb::vector<duckdb::BoundOrderByNode> copy_orders(
+  const duckdb::vector<duckdb::BoundOrderByNode>& src)
+{
+  duckdb::vector<duckdb::BoundOrderByNode> result;
+  result.reserve(src.size());
+  for (const auto& order : src) {
+    result.push_back(order.Copy());
+  }
+  return result;
+}
+
 class sirius_physical_order : public sirius_physical_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::ORDER_BY;
@@ -51,6 +63,11 @@ class sirius_physical_order : public sirius_physical_operator {
   // Sink interface
   bool is_sink() const override { return true; }
   bool sink_order_dependent() const override { return false; }
+
+ public:
+  std::vector<std::shared_ptr<cucascade::data_batch>> execute(
+    const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches,
+    rmm::cuda_stream_view stream = cudf::get_default_stream()) override;
 };
 
 }  // namespace op

@@ -1128,7 +1128,7 @@ TEST_CASE("column_builder - packed allocation multiple columns",
     size_t int_size    = sizeof(int32_t) * num_rows + sirius::utils::ceil_div_8(num_rows);
     size_t double_size = sizeof(double) * num_rows + sirius::utils::ceil_div_8(num_rows);
     size_t varchar_size =
-      (num_rows + 1) * sizeof(int64_t) + 256 * num_rows + sirius::utils::ceil_div_8(num_rows);
+      (num_rows + 1) * sizeof(int32_t) + 256 * num_rows + sirius::utils::ceil_div_8(num_rows);
     size_t total_size = int_size + double_size + varchar_size;
 
     auto allocation = create_test_allocation(total_size);
@@ -1199,7 +1199,7 @@ TEST_CASE("column_builder - packed allocation multiple columns",
     // Verify VARCHAR NULLs
     // For VARCHAR, the mask is initialized at: data_offset + total_data_bytes_allocated
     // Where total_data_bytes_allocated = num_rows * default_varchar_size = 8 * 256 = 2048
-    size_t varchar_data_offset = int_size + double_size + (num_rows + 1) * sizeof(int64_t);
+    size_t varchar_data_offset = int_size + double_size + (num_rows + 1) * sizeof(int32_t);
     size_t varchar_mask_offset =
       varchar_data_offset + (num_rows * 256);  // 256 is default_varchar_size
     varchar_builder.mask_blocks_accessor.set_cursor(varchar_mask_offset);

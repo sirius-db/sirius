@@ -56,6 +56,10 @@ struct Config {
   //  - the default varchar size for estimating rows per batch
   static uint64_t DEFAULT_SCAN_TASK_BATCH_SIZE;
   static uint64_t DEFAULT_SCAN_TASK_VARCHAR_SIZE;
+
+  // For sort partitioning:
+  //  - max bytes per sort partition (0 = auto based on 33% GPU memory)
+  static uint64_t MAX_SORT_PARTITION_BYTES;
 };
 
 }  // namespace duckdb
