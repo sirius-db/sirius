@@ -33,7 +33,8 @@ endif()
 project(${TARGET_NAME} LANGUAGES CXX CUDA)
 
 # Optional features
-option(ENABLE_STREAM_CHECK "Enable stream check library for debugging default stream usage" OFF)
+option(ENABLE_STREAM_CHECK
+       "Enable stream check library for debugging default stream usage" OFF)
 
 find_package(cudf REQUIRED CONFIG)
 find_package(libconfig++ REQUIRED)
@@ -188,20 +189,24 @@ install(
   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
 
-# Stream check utility library (optional, for debugging)
-# This is built separately and loaded dynamically at runtime via dlopen
-# No recompilation needed - just build or don't build the library
+# Stream check utility library (optional, for debugging) This is built
+# separately and loaded dynamically at runtime via dlopen No recompilation
+# needed - just build or don't build the library
 if(ENABLE_STREAM_CHECK)
-  message(STATUS "Stream check library will be built (loaded dynamically at runtime)")
+  message(
+    STATUS "Stream check library will be built (loaded dynamically at runtime)")
   add_subdirectory(utils/stream_check)
-  
+
   # Install stream_check library (optional runtime dependency)
   install(
     TARGETS stream_check
     LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
     ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
 else()
-  message(STATUS "Stream check library will not be built (runtime loading will gracefully fail)")
+  message(
+    STATUS
+      "Stream check library will not be built (runtime loading will gracefully fail)"
+  )
 endif()
 
 # Unit tests

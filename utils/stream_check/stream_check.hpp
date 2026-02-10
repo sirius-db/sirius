@@ -22,7 +22,7 @@ extern "C" {
 
 /**
  * @brief Enable logging on default stream access for the current thread
- * 
+ *
  * After calling this function, any call to cudf::get_default_stream() from
  * the current thread will log a stack trace to the configured file.
  */
@@ -30,7 +30,7 @@ void enable_log_on_default_stream();
 
 /**
  * @brief Disable logging on default stream access for the current thread
- * 
+ *
  * After calling this function, calls to cudf::get_default_stream() from
  * the current thread will not log stack traces.
  */
@@ -38,7 +38,7 @@ void disable_log_on_default_stream();
 
 /**
  * @brief Set the file path for logging default stream stack traces
- * 
+ *
  * @param path File path where stack traces will be logged. If NULL or empty,
  *             defaults to "default_stream_traces.log" in current directory.
  */

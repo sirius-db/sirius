@@ -23,40 +23,28 @@ find_package(cudf REQUIRED CONFIG)
 find_package(absl REQUIRED CONFIG)
 
 # Create shared library for LD_PRELOAD
-add_library(stream_check SHARED
-    stream_check.cpp
-)
+add_library(stream_check SHARED stream_check.cpp)
 
 # Set C++ standard
-set_target_properties(stream_check PROPERTIES
-    CXX_STANDARD 20
-    CXX_STANDARD_REQUIRED ON
-    POSITION_INDEPENDENT_CODE ON
-)
+set_target_properties(
+  stream_check
+  PROPERTIES CXX_STANDARD 20
+             CXX_STANDARD_REQUIRED ON
+             POSITION_INDEPENDENT_CODE ON)
 
 # Include directories
-target_include_directories(stream_check
-    PUBLIC
-        ${CMAKE_CURRENT_SOURCE_DIR}
-)
+target_include_directories(stream_check PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 # Link against RMM (cudf dependency) and absl for stack traces
-target_link_libraries(stream_check
-    PUBLIC
-        rmm::rmm
-        absl::stacktrace
-        absl::symbolize
-        absl::failure_signal_handler
-)
+target_link_libraries(
+  stream_check PUBLIC rmm::rmm absl::stacktrace absl::symbolize
+                      absl::failure_signal_handler)
 
 # Install library
-install(TARGETS stream_check
-    LIBRARY DESTINATION lib
-    ARCHIVE DESTINATION lib
-)
+install(
+  TARGETS stream_check
+  LIBRARY DESTINATION lib
+  ARCHIVE DESTINATION lib)
 
 # Install header
-install(FILES stream_check.hpp
-    DESTINATION include
-)
-
+install(FILES stream_check.hpp DESTINATION include)

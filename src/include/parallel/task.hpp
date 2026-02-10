@@ -19,6 +19,7 @@
 #include "helper/helper.hpp"
 
 #include <cudf/utilities/default_stream.hpp>
+
 #include <rmm/cuda_stream_view.hpp>
 
 #include <cucascade/memory/memory_reservation.hpp>

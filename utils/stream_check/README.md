@@ -47,21 +47,21 @@ int main() {
     // This works fine - returns rmm default stream (no logging)
     auto stream1 = cudf::get_default_stream();
     std::cout << "Got default stream (normal): " << stream1.value() << std::endl;
-    
+
     // Enable logging
     enable_log_on_default_stream();
-    
+
     // This will be logged to default_stream_traces.log
     auto stream2 = cudf::get_default_stream();
     std::cout << "Got default stream (logged): " << stream2.value() << std::endl;
-    
+
     // Disable logging
     disable_log_on_default_stream();
-    
+
     // This works again without logging
     auto stream3 = cudf::get_default_stream();
     std::cout << "Got default stream (normal): " << stream3.value() << std::endl;
-    
+
     return 0;
 }
 ```
@@ -147,4 +147,3 @@ The library uses the Linux dynamic linker's symbol resolution order:
 - ✅ **Atomic operations**: Lock-free reads/writes
 - ✅ **No synchronization**: No mutex overhead
 - ✅ **Concurrent safe**: Multiple threads can call simultaneously
-

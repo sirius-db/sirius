@@ -202,8 +202,8 @@ TEST_CASE("sirius_physical_top_n_merge returns empty for limit 0", "[physical_to
                                          std::move(orders),
                                          /*limit=*/0,
                                          /*offset=*/2,
-                         nullptr,
-                         0);
+                                         nullptr,
+                                         0);
 
   auto out = topn_merge.execute(batches, cudf::get_default_stream());
   REQUIRE(out.empty());

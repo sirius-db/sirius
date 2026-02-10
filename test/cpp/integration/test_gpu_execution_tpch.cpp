@@ -18,6 +18,7 @@
 
 #include <catch.hpp>
 #include <duckdb.hpp>
+
 #include <cstdlib>
 #include <filesystem>
 #include <set>

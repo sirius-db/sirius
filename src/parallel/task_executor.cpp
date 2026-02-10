@@ -14,9 +14,9 @@
  * limitations under the License.
  */
 
-#include <cudf/utilities/default_stream.hpp>
-
 #include "parallel/task_executor.hpp"
+
+#include <cudf/utilities/default_stream.hpp>
 
 namespace sirius {
 namespace parallel {

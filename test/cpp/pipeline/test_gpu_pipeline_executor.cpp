@@ -148,7 +148,8 @@ TEST_CASE("GPU pipeline executor uses task requests to schedule GPU tasks",
       .track_reservation_per_stream(false)
       .set_reservation_fraction_per_host(0.75);
     auto space_configs = builder.build();
-    manager = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(std::move(space_configs));
+    manager =
+      std::make_unique<sirius::memory::sirius_memory_reservation_manager>(std::move(space_configs));
   } catch (const std::exception& e) {
     WARN("Skipping test due to insufficient GPUs: " << e.what());
     return;

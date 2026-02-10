@@ -21,7 +21,7 @@ namespace util {
 
 /**
  * @brief Enable logging on default CUDA stream access (no-op if stream_check not available)
- * 
+ *
  * When ENABLE_STREAM_CHECK is defined at compile time, this will attempt to dynamically
  * load the stream_check library and enable logging. If the library is not found or
  * ENABLE_STREAM_CHECK is not defined, this is a no-op.
@@ -30,7 +30,7 @@ void enable_log_on_default_stream() noexcept;
 
 /**
  * @brief Disable logging on default CUDA stream access (no-op if stream_check not available)
- * 
+ *
  * When ENABLE_STREAM_CHECK is defined at compile time, this will attempt to dynamically
  * load the stream_check library and disable logging. If the library is not found or
  * ENABLE_STREAM_CHECK is not defined, this is a no-op.
@@ -39,7 +39,7 @@ void disable_log_on_default_stream() noexcept;
 
 /**
  * @brief Set the log file path for stream check (no-op if stream_check not available)
- * 
+ *
  * @param path Path to the log file where stack traces will be written
  */
 void set_stream_check_log_file(const char* path) noexcept;

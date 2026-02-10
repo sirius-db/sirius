@@ -24,6 +24,7 @@
 #include "pipeline/sirius_pipeline_itask_local_state.hpp"
 
 #include <cudf/utilities/default_stream.hpp>
+
 #include <cucascade/memory/common.hpp>
 
 namespace sirius::op::scan {

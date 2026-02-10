@@ -26,6 +26,7 @@
 #include "pipeline/task_request.hpp"
 
 #include <rmm/cuda_device.hpp>
+
 #include <util/stream_check_wrapper.hpp>
 
 namespace sirius {
