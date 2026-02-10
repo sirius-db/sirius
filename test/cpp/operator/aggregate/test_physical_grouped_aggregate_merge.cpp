@@ -90,7 +90,7 @@ TEST_CASE("sirius_physical_grouped_aggregate_merge grouped aggregates single dat
   auto input_table = std::make_unique<cudf::table>(expected_table->view());
   auto input_batch = sirius::make_data_batch(std::move(input_table), *space);
 
-  auto outputs = grouped_aggregate_merger.execute({std::move(input_batch)});
+  auto outputs = grouped_aggregate_merger.execute({std::move(input_batch)}, default_stream());
 
   // Verify we got one output batch
   REQUIRE(outputs.size() == 1);
@@ -173,14 +173,14 @@ TEMPLATE_TEST_CASE(
     std::shared_ptr<data_batch> input_batch =
       sirius::make_data_batch(std::move(input_table), *space);
 
-    auto outputs = grouped_aggregator.execute({input_batch});
+    auto outputs = grouped_aggregator.execute({input_batch}, default_stream());
 
     // Verify we got one output batch
     REQUIRE(outputs.size() == 1);
     agg_outputs.push_back(outputs[0]);
   }
 
-  auto outputs = grouped_aggregate_merger.execute(agg_outputs);
+  auto outputs = grouped_aggregate_merger.execute(agg_outputs, default_stream());
   REQUIRE(outputs.size() == 1);
 
   // need to cast the expected table column 4 (which is the count column) to int64_t since at the

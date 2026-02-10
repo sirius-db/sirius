@@ -90,7 +90,7 @@ TEMPLATE_TEST_CASE(
                                                        std::move(agg_result.groups),
                                                        num_groups);
 
-  auto outputs = grouped_aggregator.execute({input_batch});
+  auto outputs = grouped_aggregator.execute({input_batch}, default_stream());
 
   // Verify we got one output batch
   REQUIRE(outputs.size() == 1);
@@ -151,7 +151,7 @@ TEMPLATE_TEST_CASE(
                                                        std::move(agg_result.groups),
                                                        num_groups);
 
-  auto outputs = grouped_aggregator.execute({input_batch});
+  auto outputs = grouped_aggregator.execute({input_batch}, default_stream());
 
   // Verify we got one output batch
   REQUIRE(outputs.size() == 1);
