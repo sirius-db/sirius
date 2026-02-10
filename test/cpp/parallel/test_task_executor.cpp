@@ -46,7 +46,7 @@ class dummy_task : public itask {
   {
   }
 
-  void execute() override
+  void execute(rmm::cuda_stream_view stream) override
   {
     auto* g = static_cast<dummy_task_global_state*>(_global_state.get());
     auto* l = static_cast<dummy_task_local_state*>(_local_state.get());

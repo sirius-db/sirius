@@ -171,7 +171,7 @@ TEST_CASE("use configuration basic setters with condition", "[config_opt][condit
   using namespace sirius;
   config::configuration_setter setter;
   int int_value = 0;
-  setter.add_config("int_value", int_value, sirius::config::greater_than<int>{50});
+  setter.add_config("int_value", int_value, sirius::config::greater_than<int>{150});
 
   // Create a libconfig config object
   libconfig::Config libconfig;
@@ -494,4 +494,211 @@ TEST_CASE("use nested naming with config", "[config_opt][nested_naming]")
 
   REQUIRE(int_value == 100);
   REQUIRE(favorite_color == ee::color::green);
+}
+
+// Test iterable config with element-level validation
+TEST_CASE("Iterable config validates each element", "[config_opt][validation]")
+{
+  using namespace sirius;
+  SECTION("Valid elements pass validation")
+  {
+    // Create a simple config with a vector of positive integers
+    libconfig::Config cfg;
+    cfg.getRoot().add("numbers", libconfig::Setting::TypeArray);
+    auto& numbers_setting                            = cfg.getRoot()["numbers"];
+    numbers_setting.add(libconfig::Setting::TypeInt) = 1;
+    numbers_setting.add(libconfig::Setting::TypeInt) = 5;
+    numbers_setting.add(libconfig::Setting::TypeInt) = 10;
+
+    std::vector<int> numbers;
+    config::configuration_setter setter;
+
+    // Add config with predicate that requires positive numbers
+    setter.add_config("numbers", numbers, [](const int& val) { return val > 0; });
+
+    // This should succeed
+    REQUIRE_NOTHROW(setter.apply(cfg.getRoot()));
+    REQUIRE(numbers.size() == 3);
+    REQUIRE(numbers[0] == 1);
+    REQUIRE(numbers[1] == 5);
+    REQUIRE(numbers[2] == 10);
+  }
+
+  SECTION("Invalid element fails validation")
+  {
+    // Create a config with a vector containing a negative number
+    libconfig::Config cfg;
+    cfg.getRoot().add("numbers", libconfig::Setting::TypeArray);
+    auto& numbers_setting                            = cfg.getRoot()["numbers"];
+    numbers_setting.add(libconfig::Setting::TypeInt) = 1;
+    numbers_setting.add(libconfig::Setting::TypeInt) = -5;  // Invalid
+    numbers_setting.add(libconfig::Setting::TypeInt) = 10;
+
+    std::vector<int> numbers;
+    config::configuration_setter setter;
+
+    // Add config with predicate that requires positive numbers
+    setter.add_config("numbers", numbers, [](const int& val) { return val > 0; });
+
+    // This should throw because -5 fails validation
+    REQUIRE_THROWS_AS(setter.apply(cfg.getRoot()), std::invalid_argument);
+  }
+
+  SECTION("Element validation with custom predicate")
+  {
+    // Test with greater_than validator
+    libconfig::Config cfg;
+    cfg.getRoot().add("scores", libconfig::Setting::TypeArray);
+    auto& scores_setting                            = cfg.getRoot()["scores"];
+    scores_setting.add(libconfig::Setting::TypeInt) = 50;
+    scores_setting.add(libconfig::Setting::TypeInt) = 75;
+    scores_setting.add(libconfig::Setting::TypeInt) = 100;
+
+    std::vector<int> scores;
+    config::configuration_setter setter;
+
+    // Use greater_than validator
+    setter.add_config("scores", scores, sirius::config::greater_than<int>{40});
+
+    REQUIRE_NOTHROW(setter.apply(cfg.getRoot()));
+    REQUIRE(scores.size() == 3);
+  }
+
+  SECTION("Element validation with fraction predicate on doubles")
+  {
+    // Test with fraction validator (0.0 to 1.0)
+    libconfig::Config cfg;
+    cfg.getRoot().add("fractions", libconfig::Setting::TypeArray);
+    auto& fractions_setting                              = cfg.getRoot()["fractions"];
+    fractions_setting.add(libconfig::Setting::TypeFloat) = 0.0;
+    fractions_setting.add(libconfig::Setting::TypeFloat) = 0.5;
+    fractions_setting.add(libconfig::Setting::TypeFloat) = 1.0;
+
+    std::vector<double> fractions;
+    config::configuration_setter setter;
+
+    setter.add_config("fractions", fractions, sirius::config::fraction<double>{});
+
+    REQUIRE_NOTHROW(setter.apply(cfg.getRoot()));
+    REQUIRE(fractions.size() == 3);
+    REQUIRE(fractions[0] == 0.0);
+    REQUIRE(fractions[1] == 0.5);
+    REQUIRE(fractions[2] == 1.0);
+  }
+
+  SECTION("Element validation fails for out-of-range fraction")
+  {
+    libconfig::Config cfg;
+    cfg.getRoot().add("fractions", libconfig::Setting::TypeArray);
+    auto& fractions_setting                              = cfg.getRoot()["fractions"];
+    fractions_setting.add(libconfig::Setting::TypeFloat) = 0.5;
+    fractions_setting.add(libconfig::Setting::TypeFloat) = 1.5;  // Invalid > 1.0
+
+    std::vector<double> fractions;
+    config::configuration_setter setter;
+
+    setter.add_config("fractions", fractions, sirius::config::fraction<double>{});
+
+    REQUIRE_THROWS_AS(setter.apply(cfg.getRoot()), std::invalid_argument);
+  }
+}
+
+// Test variant config with validation
+TEST_CASE("Variant config validates the value", "[config_opt][validation][variant]")
+{
+  using namespace sirius;
+  SECTION("Valid variant value passes validation")
+  {
+    // Create a config with a port number (int)
+    libconfig::Config cfg;
+    cfg.getRoot().add("port", libconfig::Setting::TypeInt) = 8080;
+
+    std::variant<int, std::string> port_or_name;
+    config::configuration_setter setter;
+
+    // Add variant config with predicate that requires valid port range
+    setter.add_variant_config<int>(
+      "port", port_or_name, [](const int& val) { return val > 0 && val <= 65535; });
+
+    REQUIRE_NOTHROW(setter.apply(cfg.getRoot()));
+    REQUIRE(std::holds_alternative<int>(port_or_name));
+    REQUIRE(std::get<int>(port_or_name) == 8080);
+  }
+
+  SECTION("Invalid variant value fails validation")
+  {
+    // Create a config with an invalid port number
+    libconfig::Config cfg;
+    cfg.getRoot().add("port", libconfig::Setting::TypeInt) = 99999;  // Invalid port > 65535
+
+    std::variant<int, std::string> port_or_name;
+    config::configuration_setter setter;
+
+    // Add variant config with predicate that requires valid port range
+    setter.add_variant_config<int>(
+      "port", port_or_name, [](const int& val) { return val > 0 && val <= 65535; });
+
+    REQUIRE_THROWS_AS(setter.apply(cfg.getRoot()), std::invalid_argument);
+  }
+
+  SECTION("Variant with string alternative and validation")
+  {
+    // Create a config with a string that must be non-empty
+    libconfig::Config cfg;
+    cfg.getRoot().add("name", libconfig::Setting::TypeString) = "localhost";
+
+    std::variant<int, std::string> port_or_name;
+    config::configuration_setter setter;
+
+    // Add variant config with predicate that requires non-empty string
+    setter.add_variant_config<std::string>(
+      "name", port_or_name, [](const std::string& val) { return !val.empty(); });
+
+    REQUIRE_NOTHROW(setter.apply(cfg.getRoot()));
+    REQUIRE(std::holds_alternative<std::string>(port_or_name));
+    REQUIRE(std::get<std::string>(port_or_name) == "localhost");
+  }
+
+  SECTION("Variant with empty string fails validation")
+  {
+    libconfig::Config cfg;
+    cfg.getRoot().add("name", libconfig::Setting::TypeString) = "";
+
+    std::variant<int, std::string> port_or_name;
+    config::configuration_setter setter;
+
+    setter.add_variant_config<std::string>(
+      "name", port_or_name, [](const std::string& val) { return !val.empty(); });
+
+    REQUIRE_THROWS_AS(setter.apply(cfg.getRoot()), std::invalid_argument);
+  }
+
+  SECTION("Variant with between validator")
+  {
+    libconfig::Config cfg;
+    cfg.getRoot().add("percentage", libconfig::Setting::TypeInt) = 75;
+
+    std::variant<int, double, std::string> value;
+    config::configuration_setter setter;
+
+    // Use between validator for percentage (0-100)
+    setter.add_variant_config<int>("percentage", value, config::between<int>{0, 100});
+
+    REQUIRE_NOTHROW(setter.apply(cfg.getRoot()));
+    REQUIRE(std::holds_alternative<int>(value));
+    REQUIRE(std::get<int>(value) == 75);
+  }
+
+  SECTION("Variant with out-of-range value fails between validator")
+  {
+    libconfig::Config cfg;
+    cfg.getRoot().add("percentage", libconfig::Setting::TypeInt) = 150;  // Invalid > 100
+
+    std::variant<int, double, std::string> value;
+    config::configuration_setter setter;
+
+    setter.add_variant_config<int>("percentage", value, config::between<int>{0, 100});
+
+    REQUIRE_THROWS_AS(setter.apply(cfg.getRoot()), std::invalid_argument);
+  }
 }

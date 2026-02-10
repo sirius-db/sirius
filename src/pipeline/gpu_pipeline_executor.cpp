@@ -17,6 +17,7 @@
 #include "pipeline/gpu_pipeline_executor.hpp"
 
 #include "creator/task_creator.hpp"
+#include "cucascade/memory/stream_pool.hpp"
 #include "cuda_runtime_api.h"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_operator_type.hpp"
@@ -24,15 +25,19 @@
 #include "pipeline/gpu_pipeline_queue.hpp"
 #include "pipeline/task_request.hpp"
 
+#include <rmm/cuda_device.hpp>
+
+#include <util/stream_check_wrapper.hpp>
+
 namespace sirius {
 namespace pipeline {
 
-// todo (amin): add stream pool to constructor
 gpu_pipeline_executor::gpu_pipeline_executor(
   exec::thread_pool_config config,
   cucascade::memory::memory_space* mem_space,
   exec::publisher<std::unique_ptr<task_request>> task_request_publisher)
   : _config(config),
+    _stream_pool(rmm::cuda_device_id{mem_space->get_device_id()}, _config.num_threads),
     _task_request_publisher(std::move(task_request_publisher)),
     _memory_space(mem_space)
 {
@@ -49,11 +54,14 @@ void gpu_pipeline_executor::start()
 {
   bool expected = false;
   if (!_running.compare_exchange_strong(expected, true)) { return; }
-  _thread_pool = std::make_unique<exec::thread_pool>(
-    _config.num_threads,
-    _config.thread_name_prefix,
-    _config.cpu_affinity_list,
-    [device_id = _memory_space->get_device_id()]() noexcept { cudaSetDevice(device_id); });
+  _thread_pool =
+    std::make_unique<exec::thread_pool>(_config.num_threads,
+                                        _config.thread_name_prefix,
+                                        _config.cpu_affinity_list,
+                                        [device_id = _memory_space->get_device_id()]() noexcept {
+                                          cudaSetDevice(device_id);
+                                          sirius::util::enable_log_on_default_stream();
+                                        });
   _manager_thread = std::thread(&gpu_pipeline_executor::manager_loop, this);
 }
 
@@ -70,6 +78,8 @@ void gpu_pipeline_executor::stop()
 
 void gpu_pipeline_executor::manager_loop()
 {
+  rmm::cuda_set_device_raii set_device_guard(rmm::cuda_device_id{_memory_space->get_device_id()});
+  sirius::util::enable_log_on_default_stream();
   while (_running.load()) {
     auto ticket = _kiosk.acquire();  // block till a thread is available
     if (!ticket.is_valid()) {
@@ -104,15 +114,16 @@ void gpu_pipeline_executor::manager_loop()
     }
     auto output_consumers = gpu_task->get_output_consumers();
     auto* pipeline        = gpu_task->get_pipeline();
-    // todo(amin) acquire stream and pass stream to schedule
+    auto exc_stream       = _stream_pool.acquire_stream(
+      cucascade::memory::exclusive_stream_pool::stream_acquire_policy::GROW);
     _thread_pool->schedule([this,
-                            task      = std::move(pipeline_task),
-                            ticket    = std::move(ticket),
-                            consumers = std::move(output_consumers),
+                            task       = std::move(pipeline_task),
+                            ticket     = std::move(ticket),
+                            exc_stream = std::move(exc_stream),
+                            consumers  = std::move(output_consumers),
                             pipeline]() mutable {
       try {
-        // todo(amin) pass stream to execute
-        task->execute();
+        task->execute(exc_stream);
       } catch (...) {
         if (_completion_handler) { _completion_handler->report_error(std::current_exception()); }
         return;

@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include <cudf/utilities/default_stream.hpp>
+
 #include <catch.hpp>
 #include <duckdb.hpp>
 

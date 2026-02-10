@@ -493,13 +493,14 @@ void duckdb_scan_task::process_chunk(duckdb_scan_task_local_state& l_state)
   l_state._row_offset += l_state._chunk.size();
 }
 
-void duckdb_scan_task::execute()
+void duckdb_scan_task::execute(rmm::cuda_stream_view stream)
 {
-  auto output_batches = compute_task();
-  publish_output(output_batches);
+  auto output_batches = compute_task(stream);
+  publish_output(output_batches, stream);
 }
 
-std::vector<std::shared_ptr<cucascade::data_batch>> duckdb_scan_task::compute_task()
+std::vector<std::shared_ptr<cucascade::data_batch>> duckdb_scan_task::compute_task(
+  rmm::cuda_stream_view stream)
 {
   // Cast base task states to DuckDB scan task states
   auto& l_state = this->_local_state->cast<duckdb_scan_task_local_state>();
@@ -558,7 +559,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> duckdb_scan_task::compute_ta
 }
 
 void duckdb_scan_task::publish_output(
-  std::vector<std::shared_ptr<cucascade::data_batch>> output_batches)
+  std::vector<std::shared_ptr<cucascade::data_batch>> output_batches, rmm::cuda_stream_view stream)
 {
   std::for_each(std::make_move_iterator(output_batches.begin()),
                 std::make_move_iterator(output_batches.end()),

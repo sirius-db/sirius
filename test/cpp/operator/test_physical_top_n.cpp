@@ -87,7 +87,7 @@ TEST_CASE("sirius_physical_top_n single-key uses top_k per batch", "[physical_to
                              nullptr,
                              0);
 
-  auto out = topn.execute({batches[0]});
+  auto out = topn.execute({batches[0]}, cudf::get_default_stream());
   REQUIRE(out.size() == 1);
 
   auto table       = out[0]->get_data()->cast<gpu_table_representation>().get_table();
@@ -127,7 +127,7 @@ TEST_CASE("sirius_physical_top_n multi-key falls back to sort_by_key", "[physica
                              nullptr,
                              0);
 
-  auto out = topn.execute({batches[0]});
+  auto out = topn.execute({batches[0]}, cudf::get_default_stream());
   REQUIRE(out.size() == 1);
 
   auto table       = out[0]->get_data()->cast<gpu_table_representation>().get_table();
@@ -167,7 +167,7 @@ TEST_CASE("sirius_physical_top_n_merge applies offset and limit", "[physical_top
                                          nullptr,
                                          0);
 
-  auto out = topn_merge.execute(batches);
+  auto out = topn_merge.execute(batches, cudf::get_default_stream());
   REQUIRE(out.size() == 1);
 
   auto table       = out[0]->get_data()->cast<gpu_table_representation>().get_table();
@@ -205,7 +205,7 @@ TEST_CASE("sirius_physical_top_n_merge returns empty for limit 0", "[physical_to
                                          nullptr,
                                          0);
 
-  auto out = topn_merge.execute(batches);
+  auto out = topn_merge.execute(batches, cudf::get_default_stream());
   REQUIRE(out.empty());
 }
 
@@ -232,7 +232,7 @@ TEST_CASE("sirius_physical_top_n_merge handles empty batches", "[physical_top_n_
                                          nullptr,
                                          0);
 
-  auto out = topn_merge.execute(batches);
+  auto out = topn_merge.execute(batches, cudf::get_default_stream());
   REQUIRE(out.size() == 1);
 
   auto table = out[0]->get_data()->cast<gpu_table_representation>().get_table();

@@ -33,7 +33,7 @@ class sirius_physical_projection : public sirius_physical_operator {
 
   std::vector<std::shared_ptr<cucascade::data_batch>> execute(
     const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches,
-    rmm::cuda_stream_view stream = cudf::get_default_stream()) override;
+    rmm::cuda_stream_view stream) override;
 
   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> select_list;
 };

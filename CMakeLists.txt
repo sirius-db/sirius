@@ -31,6 +31,11 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
 endif()
 
 project(${TARGET_NAME} LANGUAGES CXX CUDA)
+
+# Optional features
+option(ENABLE_STREAM_CHECK
+       "Enable stream check library for debugging default stream usage" OFF)
+
 find_package(cudf REQUIRED CONFIG)
 find_package(libconfig++ REQUIRED)
 find_package(absl REQUIRED)
@@ -100,7 +105,8 @@ set(EXTENSION_SOURCES
     src/sirius_interface.cpp
     src/extension_lock.cpp
     src/sirius_engine.cpp
-    src/parallel/task_executor.cpp)
+    src/parallel/task_executor.cpp
+    src/util/stream_check_wrapper.cpp)
 # Note: Memory module sources are now provided by cuCascade library
 add_subdirectory(src/operator)
 add_subdirectory(src/plan)
@@ -182,6 +188,26 @@ install(
   EXPORT "${DUCKDB_EXPORT_SET}"
   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
+
+# Stream check utility library (optional, for debugging) This is built
+# separately and loaded dynamically at runtime via dlopen No recompilation
+# needed - just build or don't build the library
+if(ENABLE_STREAM_CHECK)
+  message(
+    STATUS "Stream check library will be built (loaded dynamically at runtime)")
+  add_subdirectory(utils/stream_check)
+
+  # Install stream_check library (optional runtime dependency)
+  install(
+    TARGETS stream_check
+    LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
+    ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
+else()
+  message(
+    STATUS
+      "Stream check library will not be built (runtime loading will gracefully fail)"
+  )
+endif()
 
 # Unit tests
 set(TEST_NAME ${TARGET_NAME}_unittest)

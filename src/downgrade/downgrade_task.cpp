@@ -29,10 +29,8 @@
 namespace sirius {
 namespace parallel {
 
-void downgrade_task::execute()
+void downgrade_task::execute(rmm::cuda_stream_view stream)
 {
-  rmm::cuda_stream_view stream = rmm::cuda_stream_default;
-
   auto& batch = _local_state->cast<downgrade_task_local_state>()._batch;
 
   // Check if already on host tier - nothing to do

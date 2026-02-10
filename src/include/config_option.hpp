@@ -86,7 +86,7 @@ struct config_to_type_traits<T> : public config_to_type_traits<std::underlying_t
 
 template <HasStringToEnum T>
 struct config_to_type_traits<T> {
-  static constexpr libconfig::Setting::Type type = libconfig::Setting::TypeGroup;
+  static constexpr libconfig::Setting::Type type = libconfig::Setting::TypeString;
 
   static T parse_value(std::string_view str_value)
   {
@@ -146,8 +146,9 @@ struct config_to_type_traits<std::string> {
 
 template <IsBackInsertableWithValue T>
 struct config_to_type_traits<T> {
-  static constexpr libconfig::Setting::Type type =
-    (IsBasicConfig<T>) ? libconfig::Setting::TypeArray : libconfig::Setting::TypeList;
+  static constexpr libconfig::Setting::Type type = (IsBasicConfig<typename T::value_type>)
+                                                     ? libconfig::Setting::TypeArray
+                                                     : libconfig::Setting::TypeList;
   static T parse_value(std::string_view str_value)
   {
     throw std::invalid_argument("No parse_value implementation for this type.");
@@ -395,17 +396,39 @@ struct variant_value_holder {
   std::reference_wrapper<std::variant<Args...>> var_;
 };
 
-inline std::string prepare_env_var_name(std::string_view path)
+// Helper function to create nested groups and return the parent setting
+// For path "server.network.port", creates "server" and "server.network" groups
+// and returns reference to "network" group along with final component "port"
+static std::pair<libconfig::Setting*, std::string> ensure_parent_path(libconfig::Setting& setting,
+                                                                      std::string_view path)
 {
-  std::string env_var = std::string(path);
-  for (char c : path) {
-    if (c == '.' || c == '-') {
-      env_var += '_';
-    } else {
-      env_var += std::toupper(c);
+  libconfig::Setting* current = &setting;
+  std::string path_str(path);
+  size_t pos = 0;
+  std::string last_component;
+
+  while (pos < path_str.length()) {
+    size_t dot_pos = path_str.find('.', pos);
+    std::string component =
+      (dot_pos == std::string::npos) ? path_str.substr(pos) : path_str.substr(pos, dot_pos - pos);
+
+    // If this is the last component, save it and return
+    if (dot_pos == std::string::npos) {
+      last_component = component;
+      break;
     }
+
+    // Create or get the group for this component
+    if (!current->exists(component)) {
+      current = &current->add(component, libconfig::Setting::TypeGroup);
+    } else {
+      current = &(*current)[component];
+    }
+
+    pos = dot_pos + 1;
   }
-  return env_var;
+
+  return {current, last_component};
 }
 
 template <typename T, typename holder = value_holder<T>>
@@ -444,7 +467,8 @@ struct registered_config : config_base {
   {
     auto* ptr = var_.get_or_null();
     if (ptr) {
-      libconfig::Setting& cfg = setting.add(path_.data(), type());
+      auto [parent, name]     = ensure_parent_path(setting, path_);
+      libconfig::Setting& cfg = parent->add(name, type());
       config_value_exporter<T>::write(cfg, *ptr);
     }
   }
@@ -465,6 +489,120 @@ struct registered_config : config_base {
   bool is_required_{false};
 };
 
+// Specialized registered_config for variant types with validation
+template <typename T, typename... Args>
+struct registered_config_variant : config_base {
+  explicit registered_config_variant(std::string_view name,
+                                     std::variant<Args...>& var,
+                                     std::function<bool(const T&)> validator,
+                                     bool is_required = false)
+    : path_(name.data()), var_(var), predicate_(std::move(validator)), is_required_(is_required)
+  {
+  }
+
+  void apply(const libconfig::Setting& cfg) override
+  {
+    if (predicate_) {
+      T temp_value{};
+      config_value_applicator<T>::assign(temp_value, cfg);
+      if (!predicate_(temp_value)) {
+        throw std::invalid_argument(
+          fmt::format("Invalid configuration value for variant option {}", path_.data()));
+      }
+      var_.get_or_create() = std::move(temp_value);
+    } else {
+      config_value_applicator<T>::assign(var_.get_or_create(), cfg);
+    }
+  }
+
+  void write(libconfig::Setting& setting) const override
+  {
+    auto* ptr = var_.get_or_null();
+    if (ptr) {
+      auto [parent, name]     = ensure_parent_path(setting, path_);
+      libconfig::Setting& cfg = parent->add(name, type());
+      config_value_exporter<T>::write(cfg, *ptr);
+    }
+  }
+
+  [[nodiscard]] std::string_view path() const noexcept override { return path_; }
+
+  [[nodiscard]] libconfig::Setting::Type type() const noexcept override
+  {
+    return config_to_type_traits<T>::type;
+  }
+
+  [[nodiscard]] bool is_required() const noexcept override { return is_required_; }
+
+ private:
+  std::string path_;
+  variant_value_holder<T, Args...> var_;
+  std::function<bool(const T&)> predicate_{nullptr};
+  bool is_required_{false};
+};
+
+// Specialized registered_config for iterable types with element validation
+template <IsBackInsertableWithValue T, typename holder>
+struct registered_config_iterable : config_base {
+  using value_type = typename T::value_type;
+
+  template <typename ConfigType>
+  explicit registered_config_iterable(std::string_view name,
+                                      ConfigType& var,
+                                      std::function<bool(const value_type&)> element_validator,
+                                      bool is_required = false)
+    : path_(name.data()),
+      var_(var),
+      element_predicate_(std::move(element_validator)),
+      is_required_(is_required)
+  {
+  }
+
+  void apply(const libconfig::Setting& cfg) override
+  {
+    T& container   = var_.get_or_create();
+    using assigner = config_value_applicator<value_type>;
+
+    for (const auto& item : cfg) {
+      value_type v{};
+      assigner::assign(v, item);
+
+      // Validate each element if predicate is provided
+      if (element_predicate_ && !element_predicate_(v)) {
+        throw std::invalid_argument(
+          fmt::format("Invalid element value in configuration array for option {}", path_.data()));
+      }
+
+      container.push_back(std::move(v));
+    }
+  }
+
+  void write(libconfig::Setting& setting) const override
+  {
+    auto* ptr = var_.get_or_null();
+    if (ptr) {
+      auto [parent, name]     = ensure_parent_path(setting, path_);
+      libconfig::Setting& cfg = parent->add(name, type());
+      config_value_exporter<T>::write(cfg, *ptr);
+    }
+  }
+
+  [[nodiscard]] std::string_view path() const noexcept override { return path_; }
+
+  [[nodiscard]] libconfig::Setting::Type type() const noexcept override
+  {
+    return config_to_type_traits<T>::type;
+  }
+
+  [[nodiscard]] bool is_required() const noexcept override { return is_required_; }
+
+ private:
+  std::string path_;
+  holder var_;
+  std::function<bool(const value_type&)> element_predicate_{nullptr};
+  bool is_required_{false};
+};
+
 // ================ validators ================= //
 
 template <typename T>
@@ -476,7 +614,7 @@ struct less_than {
 template <typename T>
 struct greater_than {
   T threshold;
-  bool operator()(const T& value) const noexcept { return value < threshold; }
+  bool operator()(const T& value) const noexcept { return value > threshold; }
 };
 
 template <typename T>
@@ -536,6 +674,30 @@ struct configuration_setter {
         name, instance));
   }
 
+  // Add variant config with validation
+  template <typename ConfigType, typename... Args>
+  void add_variant_config(std::string_view name,
+                          std::variant<Args...>& instance,
+                          std::predicate<const ConfigType&> auto validator,
+                          config_requirement requirement = config_requirement::optional)
+  {
+    bool is_required = (requirement == config_requirement::required);
+    configs_.emplace_back(std::make_unique<registered_config_variant<ConfigType, Args...>>(
+      name, instance, std::move(validator), is_required));
+  }
+
+  // Add iterable config with element-level validation
+  template <IsBackInsertableWithValue T>
+  void add_config(std::string_view name,
+                  T& container,
+                  std::predicate<const typename T::value_type&> auto element_validator,
+                  config_requirement requirement = config_requirement::optional)
+  {
+    bool is_required = (requirement == config_requirement::required);
+    configs_.emplace_back(std::make_unique<registered_config_iterable<T, value_holder<T>>>(
+      name, container, std::move(element_validator), is_required));
+  }
+
   template <typename T>
     requires IsBasicConfig<T>
   void add_optional_config(std::string_view name,
@@ -553,19 +715,50 @@ struct configuration_setter {
       std::make_unique<registered_config<T, optional_value_holder<T>>>(name, opt));
   }
 
+  // Add optional iterable config with element-level validation
+  template <IsBackInsertableWithValue T>
+  void add_optional_config(std::string_view name,
+                           std::optional<T>& container,
+                           std::predicate<const typename T::value_type&> auto element_validator)
+  {
+    configs_.emplace_back(std::make_unique<registered_config_iterable<T, optional_value_holder<T>>>(
+      name, container, std::move(element_validator)));
+  }
+
+  static const libconfig::Setting* safe_lookup(const libconfig::Setting& setting,
+                                               std::string_view path)
+  {
+    const libconfig::Setting* current = &setting;
+    std::string path_str(path);
+    size_t pos = 0;
+
+    while (pos < path_str.length()) {
+      size_t dot_pos = path_str.find('.', pos);
+      std::string component =
+        (dot_pos == std::string::npos) ? path_str.substr(pos) : path_str.substr(pos, dot_pos - pos);
+
+      if (!current->exists(component)) { return nullptr; }
+
+      current = &(*current)[component];
+
+      if (dot_pos == std::string::npos) { break; }
+      pos = dot_pos + 1;
+    }
+
+    return current;
+  }
+
   void apply(const libconfig::Setting& setting)
   {
     std::for_each(configs_.begin(), configs_.end(), [&](auto& setter) {
-      auto path = setter->path();
-      try {
-        const libconfig::Setting& cfg = setting.lookup(path.data());
-        setter->apply(cfg);
-      } catch (const libconfig::SettingNotFoundException&) {
-        if (setter->is_required()) {
-          throw std::invalid_argument(
-            fmt::format("Missing required configuration option: {}", path.data()));
-        }
-        return;
+      auto path                     = setter->path();
+      const libconfig::Setting* cfg = safe_lookup(setting, path);
+
+      if (cfg) {
+        setter->apply(*cfg);
+      } else if (setter->is_required()) {
+        throw std::invalid_argument(
+          fmt::format("Missing required configuration option: {}", path.data()));
       }
     });
   }

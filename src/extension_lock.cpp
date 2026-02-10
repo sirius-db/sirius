@@ -30,8 +30,8 @@
 
 namespace sirius {
 
-extension_lock::extension_lock(const std::string& extension_name)
-  : lock_path_("/var/tmp/" + extension_name + ".lock")
+extension_lock::extension_lock(const std::string& extension_name, const std::string& lock_prefix)
+  : lock_path_(lock_prefix + "/" + extension_name + ".lock")
 {
   fd_ = open(lock_path_.c_str(), O_CREAT | O_RDWR, 0666);
   if (fd_ == -1) {
@@ -57,16 +57,9 @@ extension_lock::extension_lock(const std::string& extension_name)
 extension_lock::~extension_lock()
 {
   if (fd_ != -1) {
-    // Explicitly unlocking is optional; closing the FD releases it.
-    // However, being explicit is good practice.
     flock(fd_, LOCK_UN);
     close(fd_);
-
-    // Optional: Remove the file to keep /var/tmp clean.
-    // Note: This creates a tiny race condition window if a new process
-    // creates the file just as we unlink it, but for locking logic
-    // it is generally safe as the lock is on the inode/fd.
-    // std::filesystem::remove(lock_path_);
+    std::filesystem::remove(lock_path_);
   }
 }
 

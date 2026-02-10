@@ -17,6 +17,7 @@
 #pragma once
 
 #include "config.hpp"
+#include "config_option.hpp"
 #include "exec/config.hpp"
 
 #include <cucascade/memory/config.hpp>
@@ -52,10 +53,10 @@ struct sirius_config {
 
   [[nodiscard]] const exec::thread_pool_config& get_duckdb_scan_executor_config() const noexcept;
 
-  [[nodiscard]] bool is_scan_caching_enabled() const noexcept { return enable_scan_caching_; }
+  [[nodiscard]] bool is_scan_caching_enabled() const noexcept { return _enable_scan_caching; }
 
  private:
-  cucascade::memory::system_topology_info _hw_topology;
+  cucascade::memory::system_topology_info _hw_topology{.num_gpus = 1};
   std::vector<cucascade::memory::memory_space_config> _memory_space_configs;
   exec::thread_pool_config _task_creator_config{.num_threads        = 2,
                                                 .thread_name_prefix = "task_creator"};
@@ -65,7 +66,7 @@ struct sirius_config {
                                                       .thread_name_prefix = "downgrade"};
   exec::thread_pool_config _duckdb_scan_executor_config{.num_threads        = 4,
                                                         .thread_name_prefix = "duckdb_scan"};
-  bool enable_scan_caching_ = false;
+  bool _enable_scan_caching = false;
 };
 
 }  // namespace sirius

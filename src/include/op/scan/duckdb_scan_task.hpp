@@ -17,6 +17,8 @@
 #pragma once
 
 // sirius
+#include <cudf/utilities/default_stream.hpp>
+
 #include <config.hpp>
 #include <memory/host_table_utils.hpp>
 #include <memory/multiple_blocks_allocation_accessor.hpp>
@@ -409,7 +411,7 @@ class duckdb_scan_task : public sirius::pipeline::sirius_pipeline_itask {
   //===----------Destructor----------===//
   ~duckdb_scan_task();
 
-  void execute() override;
+  void execute(rmm::cuda_stream_view stream) override;
 
  private:
   //===----------Methods----------===//
@@ -464,9 +466,11 @@ class duckdb_scan_task : public sirius::pipeline::sirius_pipeline_itask {
    *
    * Scans data from the DuckDB table function and accumulates it into data batches.
    *
+   * @param stream CUDA stream used for device memory operations and kernel launches
    * @return std::vector<std::shared_ptr<cucascade::data_batch>> The computed output batches
    */
-  std::vector<std::shared_ptr<cucascade::data_batch>> compute_task() override;
+  std::vector<std::shared_ptr<cucascade::data_batch>> compute_task(
+    [[maybe_unused]] rmm::cuda_stream_view stream) override;
 
   /**
    * @brief Publish the computed output batches to the data repository.
@@ -476,7 +480,8 @@ class duckdb_scan_task : public sirius::pipeline::sirius_pipeline_itask {
    *
    * @param output_batches The data batches to publish
    */
-  void publish_output(std::vector<std::shared_ptr<cucascade::data_batch>> output_batches) override;
+  void publish_output(std::vector<std::shared_ptr<cucascade::data_batch>> output_batches,
+                      rmm::cuda_stream_view stream) override;
 
   std::size_t get_estimated_reservation_size() const override
   {

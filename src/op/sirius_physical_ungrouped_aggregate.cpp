@@ -31,6 +31,7 @@
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/resource_ref.hpp>
 
@@ -78,10 +79,12 @@ ScalarType& scalar_cast(cudf::scalar& s)
 }
 
 template <typename T>
-std::unique_ptr<cudf::scalar> make_numeric_scalar_with_value(cudf::data_type type, T value)
+std::unique_ptr<cudf::scalar> make_numeric_scalar_with_value(cudf::data_type type,
+                                                             T value,
+                                                             rmm::cuda_stream_view stream)
 {
-  auto out = cudf::make_numeric_scalar(type);
-  scalar_cast<cudf::numeric_scalar<T>>(*out).set_value(value, cudf::get_default_stream());
+  auto out = cudf::make_numeric_scalar(type, stream);
+  scalar_cast<cudf::numeric_scalar<T>>(*out).set_value(value, stream);
   return out;
 }
 
@@ -248,16 +251,16 @@ std::unique_ptr<cudf::column> make_avg_column(const cudf::column_view& sum_view,
     if (count_host == 0) {
       switch (sum_type.id()) {
         case cudf::type_id::FLOAT32:
-          out_scalar = make_numeric_scalar_with_value<float>(sum_type, 0.0f);
+          out_scalar = make_numeric_scalar_with_value<float>(sum_type, 0.0f, stream);
           break;
         case cudf::type_id::FLOAT64:
-          out_scalar = make_numeric_scalar_with_value<double>(sum_type, 0.0);
+          out_scalar = make_numeric_scalar_with_value<double>(sum_type, 0.0, stream);
           break;
         case cudf::type_id::INT32:
-          out_scalar = make_numeric_scalar_with_value<int32_t>(sum_type, 0);
+          out_scalar = make_numeric_scalar_with_value<int32_t>(sum_type, 0, stream);
           break;
         case cudf::type_id::INT64:
-          out_scalar = make_numeric_scalar_with_value<int64_t>(sum_type, 0);
+          out_scalar = make_numeric_scalar_with_value<int64_t>(sum_type, 0, stream);
           break;
         default: throw duckdb::NotImplementedException("AVG output type not supported");
       }
@@ -265,24 +268,26 @@ std::unique_ptr<cudf::column> make_avg_column(const cudf::column_view& sum_view,
       switch (sum_type.id()) {
         case cudf::type_id::FLOAT32: {
           auto sum_host = scalar_cast<cudf::numeric_scalar<float>>(*sum_value).value();
-          out_scalar    = make_numeric_scalar_with_value<float>(sum_type, sum_host / count_host);
+          out_scalar =
+            make_numeric_scalar_with_value<float>(sum_type, sum_host / count_host, stream);
           break;
         }
         case cudf::type_id::FLOAT64: {
           auto sum_host = scalar_cast<cudf::numeric_scalar<double>>(*sum_value).value();
-          out_scalar    = make_numeric_scalar_with_value<double>(sum_type, sum_host / count_host);
+          out_scalar =
+            make_numeric_scalar_with_value<double>(sum_type, sum_host / count_host, stream);
           break;
         }
         case cudf::type_id::INT32: {
           auto sum_host = scalar_cast<cudf::numeric_scalar<int32_t>>(*sum_value).value();
           out_scalar    = make_numeric_scalar_with_value<int32_t>(
-            sum_type, static_cast<int32_t>(sum_host / count_host));
+            sum_type, static_cast<int32_t>(sum_host / count_host), stream);
           break;
         }
         case cudf::type_id::INT64: {
           auto sum_host = scalar_cast<cudf::numeric_scalar<int64_t>>(*sum_value).value();
           out_scalar    = make_numeric_scalar_with_value<int64_t>(
-            sum_type, static_cast<int64_t>(sum_host / count_host));
+            sum_type, static_cast<int64_t>(sum_host / count_host), stream);
           break;
         }
         default: throw duckdb::NotImplementedException("AVG output type not supported");
@@ -320,22 +325,16 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_ungrouped_ag
       switch (spec.kind) {
         case aggregate_kind::COUNT_STAR: {
           auto scalar = make_numeric_scalar_with_value<int64_t>(
-            cudf::data_type{cudf::type_id::INT64}, static_cast<int64_t>(view.num_rows()));
-          cols.push_back(
-            cudf::make_column_from_scalar(*scalar, 1, stream, space->get_default_allocator()));
+            cudf::data_type{cudf::type_id::INT64}, static_cast<int64_t>(view.num_rows()), stream);
+          cols.push_back(cudf::make_column_from_scalar(*scalar, 1, stream));
           break;
         }
         case aggregate_kind::COUNT: {
           auto col    = view.column(static_cast<cudf::size_type>(spec.input_idx));
           auto agg_op = cudf::make_count_aggregation<cudf::reduce_aggregation>();
-          auto scalar = cudf::reduce(col,
-                                     *agg_op,
-                                     cudf::data_type(cudf::type_id::INT64),
-                                     std::nullopt,
-                                     stream,
-                                     space->get_default_allocator());
-          cols.push_back(
-            cudf::make_column_from_scalar(*scalar, 1, stream, space->get_default_allocator()));
+          auto scalar =
+            cudf::reduce(col, *agg_op, cudf::data_type(cudf::type_id::INT64), std::nullopt, stream);
+          cols.push_back(cudf::make_column_from_scalar(*scalar, 1, stream));
           break;
         }
         case aggregate_kind::SUM:
@@ -352,22 +351,19 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_ungrouped_ag
           } else {
             agg_op = cudf::make_sum_aggregation<cudf::reduce_aggregation>();
           }
-          auto scalar = cudf::reduce(
-            col, *agg_op, out_type, std::nullopt, stream, space->get_default_allocator());
-          cols.push_back(
-            cudf::make_column_from_scalar(*scalar, 1, stream, space->get_default_allocator()));
+          auto scalar = cudf::reduce(col, *agg_op, out_type, std::nullopt, stream);
+          cols.push_back(cudf::make_column_from_scalar(*scalar, 1, stream));
           if (spec.kind == aggregate_kind::AVG) {
             auto count_scalar = make_numeric_scalar_with_value<int64_t>(
-              cudf::data_type{cudf::type_id::INT64}, static_cast<int64_t>(view.num_rows()));
-            cols.push_back(cudf::make_column_from_scalar(
-              *count_scalar, 1, stream, space->get_default_allocator()));
+              cudf::data_type{cudf::type_id::INT64}, static_cast<int64_t>(view.num_rows()), stream);
+            cols.push_back(cudf::make_column_from_scalar(*count_scalar, 1, stream));
           }
           break;
         }
       }
     }
 
-    auto out_table = std::make_unique<cudf::table>(std::move(cols));
+    auto out_table = std::make_unique<cudf::table>(std::move(cols), stream);
     std::unique_ptr<cucascade::idata_representation> output_data =
       std::make_unique<cucascade::gpu_table_representation>(std::move(out_table), *space);
     auto const batch_id = ::sirius::get_next_batch_id();
@@ -455,16 +451,15 @@ sirius_physical_ungrouped_aggregate_merge::execute(
       auto sum_view   = merged_view.column(static_cast<cudf::size_type>(spec.local_sum_idx));
       auto count_view = merged_view.column(static_cast<cudf::size_type>(spec.local_count_idx));
       output_cols.push_back(make_avg_column(
-        sum_view, count_view, spec.return_type, stream, space->get_default_allocator()));
+        sum_view, count_view, spec.return_type, stream, cudf::get_current_device_resource_ref()));
     } else {
       auto col_view = merged_view.column(static_cast<cudf::size_type>(spec.local_sum_idx));
-      output_cols.push_back(
-        std::make_unique<cudf::column>(col_view, stream, space->get_default_allocator()));
+      output_cols.push_back(std::make_unique<cudf::column>(col_view, stream));
     }
   }
 
-  auto out_table =
-    std::make_unique<cudf::table>(std::move(output_cols), stream, space->get_default_allocator());
+  auto out_table = std::make_unique<cudf::table>(
+    std::move(output_cols), stream, cudf::get_current_device_resource_ref());
   std::unique_ptr<cucascade::idata_representation> output_data =
     std::make_unique<cucascade::gpu_table_representation>(std::move(out_table), *space);
   auto const batch_id = ::sirius::get_next_batch_id();

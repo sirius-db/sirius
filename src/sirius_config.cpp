@@ -21,6 +21,7 @@
 
 #include <cucascade/memory/config.hpp>
 #include <cucascade/memory/reservation_manager_configurator.hpp>
+#include <libconfig.h++>
 
 #include <exception>
 #include <vector>
@@ -77,7 +78,7 @@ struct sirius::config::custom_config_registrar<sirius::exec::thread_pool_config>
   static void config(sirius::config::configuration_setter& setter,
                      sirius::exec::thread_pool_config& opt)
   {
-    setter.add_config("num_threads", opt.num_threads);
+    setter.add_config("num_threads", opt.num_threads, sirius::config::greater_than<size_t>{0});
     setter.add_config("thread_name_prefix", opt.thread_name_prefix);
     setter.add_config("cpu_affinity", opt.cpu_affinity_list);
   }
@@ -167,14 +168,16 @@ struct sirius::config::custom_config_registrar<sirius::gpu_mem_config> {
   static void config(sirius::config::configuration_setter& setter, sirius::gpu_mem_config& opt)
   {
     opt.track_per_stream_reservation = false;
-    setter.add_variant_config<double>("usage_limit_fraction", opt.usage_limit_fraction_or_bytes);
+    setter.add_variant_config<double>(
+      "usage_limit_fraction", opt.usage_limit_fraction_or_bytes, fraction<double>{});
     setter.add_variant_config<size_t>("usage_limit_bytes", opt.usage_limit_fraction_or_bytes);
-    setter.add_variant_config<double>("reservation_limit_fraction",
-                                      opt.reservation_limit_fraction_or_bytes);
+    setter.add_variant_config<double>(
+      "reservation_limit_fraction", opt.reservation_limit_fraction_or_bytes, fraction<double>{});
     setter.add_variant_config<size_t>("reservation_limit_bytes",
                                       opt.reservation_limit_fraction_or_bytes);
-    setter.add_config("downgrade_trigger_fraction", opt.downgrade_trigger_fraction_);
-    setter.add_config("downgrade_stop_fraction", opt.downgrade_stop_fraction_);
+    setter.add_config(
+      "downgrade_trigger_fraction", opt.downgrade_trigger_fraction_, fraction<double>{});
+    setter.add_config("downgrade_stop_fraction", opt.downgrade_stop_fraction_, fraction<double>{});
     setter.add_config("track_per_stream_reservation", opt.track_per_stream_reservation);
   }
 };
@@ -184,12 +187,13 @@ struct sirius::config::custom_config_registrar<sirius::host_mem_config> {
   static void config(sirius::config::configuration_setter& setter, sirius::host_mem_config& opt)
   {
     setter.add_config("capacity_bytes", opt.numa_region_capacity_bytes);
-    setter.add_variant_config<double>("reservation_limit_fraction",
-                                      opt.reservation_limit_fraction_or_bytes);
+    setter.add_variant_config<double>(
+      "reservation_limit_fraction", opt.reservation_limit_fraction_or_bytes, fraction<double>{});
     setter.add_variant_config<size_t>("reservation_limit_bytes",
                                       opt.reservation_limit_fraction_or_bytes);
-    setter.add_config("downgrade_trigger_fraction", opt.downgrade_trigger_fraction_);
-    setter.add_config("downgrade_stop_fraction", opt.downgrade_stop_fraction_);
+    setter.add_config(
+      "downgrade_trigger_fraction", opt.downgrade_trigger_fraction_, fraction<double>{});
+    setter.add_config("downgrade_stop_fraction", opt.downgrade_stop_fraction_, fraction<double>{});
     setter.add_config("block_size", opt.block_size);
     setter.add_config("pool_size", opt.pool_size);
     setter.add_config("initial_number_pools", opt.initial_number_pools);
@@ -236,7 +240,7 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
   config_setter.add_config("sirius.executor.pipeline", _gpu_pipeline_executor_config);
   config_setter.add_config("sirius.executor.downgrade", _downgrade_executor_config);
   config_setter.add_config("sirius.executor.duckdb_scan", _duckdb_scan_executor_config);
-  config_setter.add_config("sirius.executor.duckdb_scan.cache", enable_scan_caching_);
+  config_setter.add_config("sirius.executor.duckdb_scan.cache", _enable_scan_caching);
 
   config_setter.add_config("sirius.space.gpu", gpu_memory_space_configs);
   config_setter.add_config("sirius.space.host", host_memory_space_configs);
@@ -263,7 +267,8 @@ void sirius_config::load_from_file(const std::filesystem::path& config_path)
             disk_memory_space_configs.end(),
             std::back_inserter(_memory_space_configs));
 
-  if (_memory_space_configs.empty()) {
+  bool using_configurator = _memory_space_configs.empty();
+  if (using_configurator) {
     cucascade::memory::reservation_manager_configurator builder;
     builder.set_number_of_gpus(topology_instance.num_gpus);
     gpu_memory_config_instance.setup_configurator(builder);

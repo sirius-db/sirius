@@ -85,7 +85,7 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_ungrouped_aggre
     auto output_scalar = cudf::reduce(
       input_col, *reduce_aggregation, output_type, stream, memory_space.get_default_allocator());
     output_cols.push_back(cudf::make_column_from_scalar(
-      *output_scalar, 1, cudf::get_default_stream(), memory_space.get_default_allocator()));
+      *output_scalar, 1, stream, memory_space.get_default_allocator()));
   }
   auto output_table = std::make_unique<cudf::table>(
     std::move(output_cols), stream, memory_space.get_default_allocator());

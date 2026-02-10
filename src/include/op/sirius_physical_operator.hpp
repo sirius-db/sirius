@@ -129,7 +129,7 @@ class sirius_physical_operator {
 
   virtual std::vector<std::shared_ptr<::cucascade::data_batch>> execute(
     const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches,
-    rmm::cuda_stream_view stream = cudf::get_default_stream());
+    rmm::cuda_stream_view stream);
 
   //! The influence the operator has on order (insertion order means no influence)
   virtual duckdb::OrderPreservationType operator_order() const
@@ -162,7 +162,7 @@ class sirius_physical_operator {
     duckdb::ClientContext& context) const;
 
   virtual void sink(const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches,
-                    rmm::cuda_stream_view stream = cudf::get_default_stream());
+                    rmm::cuda_stream_view stream);
 
   virtual bool is_sink() const { return false; }
 
