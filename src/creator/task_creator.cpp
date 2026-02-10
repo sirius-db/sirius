@@ -41,7 +41,7 @@ namespace sirius::creator {
 
 task_creator::task_creator(exec::thread_pool_config config,
                            sirius::memory::sirius_memory_reservation_manager& mem_res_mgr)
-  : _running(false), _config(config), _mem_res_mgr(mem_res_mgr)
+  : _running(false), _config(config), _mem_res_mgr(mem_res_mgr), _kiosk(config.num_threads)
 {
 }
 
