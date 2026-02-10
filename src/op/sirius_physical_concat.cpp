@@ -64,7 +64,6 @@ sirius_physical_concat::get_next_task_input_batch()
   // iterate through all the partition and pull the 
   std::lock_guard<std::mutex> lg(lock);
 
-  std::vector<std::shared_ptr<::cucascade::data_batch>> input_batch;
   // assert that there is only one port
   if (ports.size() != 1) {
     throw std::runtime_error("sirius_physical_concat: there should be only one port");
@@ -72,6 +71,7 @@ sirius_physical_concat::get_next_task_input_batch()
 
   auto port_ptr = ports.begin()->second.get();
   for (size_t i = 0; i < port_ptr->repo->num_partitions(); i++) {
+    std::vector<std::shared_ptr<::cucascade::data_batch>> input_batch;
     // get all the batch ids from the partition
     auto batch_ids = port_ptr->repo->get_batch_ids(i);
     for (auto& batch_id : batch_ids) {
@@ -93,12 +93,11 @@ sirius_physical_concat::get_next_task_input_batch()
         input_batch.push_back(std::move(popped_batch));
       }
     }
+    if (input_batch.size() != 0) {
+      return std::move(input_batch);
+    }
   }
-
-  if (input_batch.size() == 0) {
-    return std::nullopt;
-  }
-  return std::move(input_batch);
+  return std::nullopt;
 }
 
 std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_concat::execute(const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches, rmm::cuda_stream_view stream) {
