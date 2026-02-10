@@ -185,11 +185,11 @@ void host_table_chunk_reader::column_reader::copy_string(
     if (null_count != 0) {
       auto& validity = duckdb::FlatVector::Validity(vector);
       copy_mask_to_validity(validity, row_offset, count, allocation);
-      detail::make_duckdb_strings<true>(
+      detail::make_duckdb_strings<true, int64_t>(
         offset_accessor_64, allocation, vector, count, start_offset, end_offset, str_buffer_ptr);
       duckdb::StringVector::AddBuffer(vector, str_buffer);
     } else {
-      detail::make_duckdb_strings<false>(
+      detail::make_duckdb_strings<false, int64_t>(
         offset_accessor_64, allocation, vector, count, start_offset, end_offset, str_buffer_ptr);
       duckdb::StringVector::AddBuffer(vector, str_buffer);
     }
@@ -205,11 +205,11 @@ void host_table_chunk_reader::column_reader::copy_string(
     if (null_count != 0) {
       auto& validity = duckdb::FlatVector::Validity(vector);
       copy_mask_to_validity(validity, row_offset, count, allocation);
-      detail::make_duckdb_strings<true>(
+      detail::make_duckdb_strings<true, int32_t>(
         offset_accessor_32, allocation, vector, count, start_offset, end_offset, str_buffer_ptr);
       duckdb::StringVector::AddBuffer(vector, str_buffer);
     } else {
-      detail::make_duckdb_strings<false>(
+      detail::make_duckdb_strings<false, int32_t>(
         offset_accessor_32, allocation, vector, count, start_offset, end_offset, str_buffer_ptr);
       duckdb::StringVector::AddBuffer(vector, str_buffer);
     }
