@@ -937,22 +937,22 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
           auto* default_port = first_op.get_port("default");
           if (default_port) {
             SIRIUS_LOG_INFO("    Port 'default': barrier_type={}, repo={}",
-                             static_cast<int>(default_port->type),
-                             static_cast<void*>(default_port->repo));
+                            static_cast<int>(default_port->type),
+                            static_cast<void*>(default_port->repo));
           }
           auto* build_port = first_op.get_port("build");
           if (build_port) {
             SIRIUS_LOG_INFO("    Port 'build': barrier_type={}, repo={}",
-                             static_cast<int>(build_port->type),
-                             static_cast<void*>(build_port->repo));
+                            static_cast<int>(build_port->type),
+                            static_cast<void*>(build_port->repo));
           }
         } else if (first_op.type == op::SiriusPhysicalOperatorType::TABLE_SCAN) {
           // Scans have "scan" port
           auto* scan_port = first_op.get_port("scan");
           if (scan_port) {
             SIRIUS_LOG_INFO("    Port 'scan': barrier_type={}, repo={}",
-                             static_cast<int>(scan_port->type),
-                             static_cast<void*>(scan_port->repo));
+                            static_cast<int>(scan_port->type),
+                            static_cast<void*>(scan_port->repo));
           }
         } else if (first_op.type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
           // ignore DUCKDB_SCAN since it doesn't have port
@@ -961,8 +961,8 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
           auto* default_port = first_op.get_port("default");
           if (default_port) {
             SIRIUS_LOG_INFO("    Port 'default': barrier_type={}, repo={}",
-                             static_cast<int>(default_port->type),
-                             static_cast<void*>(default_port->repo));
+                            static_cast<int>(default_port->type),
+                            static_cast<void*>(default_port->repo));
           }
         }
       } else {
@@ -974,21 +974,21 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
           auto* default_port = sink->get_port("default");
           if (default_port) {
             SIRIUS_LOG_INFO("    Port 'default': barrier_type={}, repo={}",
-                             static_cast<int>(default_port->type),
-                             static_cast<void*>(default_port->repo));
+                            static_cast<int>(default_port->type),
+                            static_cast<void*>(default_port->repo));
           }
           auto* build_port = sink->get_port("build");
           if (build_port) {
             SIRIUS_LOG_INFO("    Port 'build': barrier_type={}, repo={}",
-                             static_cast<int>(build_port->type),
-                             static_cast<void*>(build_port->repo));
+                            static_cast<int>(build_port->type),
+                            static_cast<void*>(build_port->repo));
           }
         } else if (sink->type == op::SiriusPhysicalOperatorType::TABLE_SCAN) {
           auto* scan_port = sink->get_port("scan");
           if (scan_port) {
             SIRIUS_LOG_INFO("    Port 'scan': barrier_type={}, repo={}",
-                             static_cast<int>(scan_port->type),
-                             static_cast<void*>(scan_port->repo));
+                            static_cast<int>(scan_port->type),
+                            static_cast<void*>(scan_port->repo));
           }
         } else if (sink->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
           // ignore DUCKDB_SCAN since it doesn't have port
@@ -996,8 +996,8 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
           auto* default_port = sink->get_port("default");
           if (default_port) {
             SIRIUS_LOG_INFO("    Port 'default': barrier_type={}, repo={}",
-                             static_cast<int>(default_port->type),
-                             static_cast<void*>(default_port->repo));
+                            static_cast<int>(default_port->type),
+                            static_cast<void*>(default_port->repo));
           }
         }
       }
@@ -1013,8 +1013,8 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
         auto* port = next_op->get_port(port_id);
         if (port) {
           SIRIUS_LOG_INFO("      Port barrier_type={}, repo={}",
-                           static_cast<int>(port->type),
-                           static_cast<void*>(port->repo));
+                          static_cast<int>(port->type),
+                          static_cast<void*>(port->repo));
         }
       }
 
@@ -1028,31 +1028,31 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
           SIRIUS_LOG_INFO("  Partition Join next operators:");
           for (auto& next_port : partition_join->get_next_port_after_sink()) {
             SIRIUS_LOG_INFO("    Next Op: {}, Port: '{}' Repo:'{}'",
-                             next_port.first->get_name(),
-                             next_port.second.data(),
-                             static_cast<void*>(next_port.first->get_port(next_port.second)->repo));
+                            next_port.first->get_name(),
+                            next_port.second.data(),
+                            static_cast<void*>(next_port.first->get_port(next_port.second)->repo));
           }
         }
 
         auto partition_distinct =
           delim_join->Cast<op::sirius_physical_delim_join>().partition_distinct;
-          SIRIUS_LOG_INFO("  Partition Distinct next operators:");
+        SIRIUS_LOG_INFO("  Partition Distinct next operators:");
         for (auto& next_port : partition_distinct->get_next_port_after_sink()) {
           SIRIUS_LOG_INFO("    Next Op: {}, Port: '{}' Repo:'{}'",
-                           next_port.first->get_name(),
-                           next_port.second.data(),
-                           static_cast<void*>(next_port.first->get_port(next_port.second)->repo));
+                          next_port.first->get_name(),
+                          next_port.second.data(),
+                          static_cast<void*>(next_port.first->get_port(next_port.second)->repo));
         }
 
         if (pipeline->sink->type == op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN) {
           auto column_data_scan =
             delim_join->Cast<op::sirius_physical_delim_join>().join->children[0].get();
-            SIRIUS_LOG_INFO("  Column Data Scan next operators:");
+          SIRIUS_LOG_INFO("  Column Data Scan next operators:");
           for (auto& next_port : column_data_scan->get_next_port_after_sink()) {
             SIRIUS_LOG_INFO("    Next Op: {}, Port: '{}' Repo:'{}'",
-                             next_port.first->get_name(),
-                             next_port.second.data(),
-                             static_cast<void*>(next_port.first->get_port(next_port.second)->repo));
+                            next_port.first->get_name(),
+                            next_port.second.data(),
+                            static_cast<void*>(next_port.first->get_port(next_port.second)->repo));
           }
         }
       }
