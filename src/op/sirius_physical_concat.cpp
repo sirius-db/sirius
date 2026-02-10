@@ -74,10 +74,13 @@ sirius_physical_concat::get_next_task_input_batch()
     std::vector<std::shared_ptr<::cucascade::data_batch>> input_batch;
     // get all the batch ids from the partition
     auto batch_ids = port_ptr->repo->get_batch_ids(i);
+    size_t total_batch_size = 0;
     for (auto& batch_id : batch_ids) {
       auto batch = port_ptr->repo->get_data_batch_by_id(batch_id, ::cucascade::batch_state::processing, i);
+      auto batch_size = batch->get_data()->get_size_in_bytes();
+      total_batch_size += batch_size;
       // Check if the batch size is already exceed the threshold
-      if (!_concat_all && batch->get_data()->get_size_in_bytes() > duckdb::Config::DEFAULT_SCAN_TASK_BATCH_SIZE) {
+      if (!_concat_all && total_batch_size > duckdb::Config::DEFAULT_SCAN_TASK_BATCH_SIZE) {
         // if the batch size is already exceed the threshold, then we need to return the batch right away
         if (input_batch.size() == 0) {
           // this mean that there is a batch that is bigger than the threshold, then we just output that batch right away
@@ -109,7 +112,9 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_concat::exec
   if (valid_batches.empty()) { return {}; }
 
   cucascade::memory::memory_space* space = valid_batches[0]->get_memory_space();
-  if (space == nullptr) { return {}; }
+  if (space == nullptr) { 
+    throw std::runtime_error("sirius_physical_concat: space is nullptr");
+  }
 
   std::vector<std::shared_ptr<cucascade::data_batch>> output_batches;
   output_batches.reserve(1);
