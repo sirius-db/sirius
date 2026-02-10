@@ -23,26 +23,24 @@
 namespace sirius {
 namespace op {
 
-class sirius_physical_merge_sort : public sirius_physical_operator {
+class sirius_physical_sort_sample;
+
+class sirius_physical_sort_partition : public sirius_physical_operator {
  public:
-  static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::MERGE_SORT;
+  static constexpr const SiriusPhysicalOperatorType TYPE =
+    SiriusPhysicalOperatorType::SORT_PARTITION;
 
  public:
-  sirius_physical_merge_sort(sirius_physical_order* order_by);
+  sirius_physical_sort_partition(sirius_physical_order* order_by);
 
-  sirius_physical_merge_sort(duckdb::vector<duckdb::LogicalType> types,
-                             duckdb::vector<duckdb::BoundOrderByNode> orders,
-                             duckdb::vector<duckdb::idx_t> projections_p,
-                             duckdb::idx_t estimated_cardinality,
-                             bool is_index_sort_p = false);
+  sirius_physical_sort_partition(duckdb::vector<duckdb::LogicalType> types,
+                                 duckdb::vector<duckdb::BoundOrderByNode> orders,
+                                 duckdb::vector<duckdb::idx_t> projections_p,
+                                 duckdb::idx_t estimated_cardinality);
 
-  //! Input data
+  //! Order specification (copied from ORDER_BY)
   duckdb::vector<duckdb::BoundOrderByNode> orders;
   duckdb::vector<duckdb::idx_t> projections;
-  bool is_index_sort;
-
-  sirius_physical_operator* child_op;
-  sirius_physical_operator* get_child_op() const { return child_op; }
 
  public:
   // Source interface
@@ -63,17 +61,14 @@ class sirius_physical_merge_sort : public sirius_physical_operator {
     const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches,
     rmm::cuda_stream_view stream = cudf::get_default_stream()) override;
 
-  //! Set the final output projection (applied after merge, to remove sort-key-only columns)
-  void set_final_projections(duckdb::vector<duckdb::idx_t> proj,
-                             duckdb::vector<duckdb::LogicalType> output_types)
-  {
-    _final_projections = std::move(proj);
-    types              = std::move(output_types);
-  }
+  //! Set the sample operator to read partition boundaries from
+  void set_sample_op(sirius_physical_sort_sample* sample) { _sample_op = sample; }
+
+  //! Get the sample operator
+  sirius_physical_sort_sample* get_sample_op() const { return _sample_op; }
 
  private:
-  //! Final projection to apply after merge (empty = no extra projection)
-  duckdb::vector<duckdb::idx_t> _final_projections;
+  sirius_physical_sort_sample* _sample_op = nullptr;
 };
 
 }  // namespace op

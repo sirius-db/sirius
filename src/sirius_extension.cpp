@@ -427,10 +427,13 @@ void SiriusExtension::GPUExecutionFunction(ClientContext& context,
         data.sirius_iface->sirius_execute_query(context, data.query, data.gpu_prepared, {});
       if (data.res->HasError()) {
         SIRIUS_LOG_ERROR("SiriusExecuteQuery error: {}", data.res->GetError());
-        printf(
-          "=============================================\nError in SiriusExecuteQuery, fallback to "
-          "DuckDB\n=============================================\n");
-        data.res = data.conn->Query(data.query);
+        if (!Config::ENABLE_FALLBACK_CHECK) {
+          printf(
+            "=============================================\nError in SiriusExecuteQuery, fallback "
+            "to DuckDB\n=============================================\n");
+          data.res = data.conn->Query(data.query);
+        }
+        // When ENABLE_FALLBACK_CHECK is true, the error propagates (no silent fallback)
       }
     }
     auto end      = std::chrono::high_resolution_clock::now();
@@ -685,6 +688,13 @@ static void SetDefaultScanTaskVarcharSize(ClientContext& context, SetScope scope
                    Config::DEFAULT_SCAN_TASK_VARCHAR_SIZE);
 }
 
+static void SetMaxSortPartitionBytes(ClientContext& context, SetScope scope, Value& parameter)
+{
+  Config::MAX_SORT_PARTITION_BYTES = UBigIntValue::Get(parameter);
+  SIRIUS_LOG_DEBUG("Updated config MAX_SORT_PARTITION_BYTES to {}",
+                   Config::MAX_SORT_PARTITION_BYTES);
+}
+
 void SiriusExtension::InitialGPUConfigs(DBConfig& config)
 {
   // Add in config option for gpu buffer manager
@@ -768,6 +778,13 @@ void SiriusExtension::InitialGPUConfigs(DBConfig& config)
     LogicalType::UBIGINT,
     Value::UBIGINT(Config::DEFAULT_SCAN_TASK_VARCHAR_SIZE),
     SetDefaultScanTaskVarcharSize);
+
+  // Add in config option for sort partition size
+  config.AddExtensionOption("max_sort_partition_bytes",
+                            "Maximum bytes per sort partition (0 = auto based on 33% GPU memory)",
+                            LogicalType::UBIGINT,
+                            Value::UBIGINT(Config::MAX_SORT_PARTITION_BYTES),
+                            SetMaxSortPartitionBytes);
 }
 
 static void LoadInternal(ExtensionLoader& loader)

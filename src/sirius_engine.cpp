@@ -35,6 +35,8 @@
 #include "op/sirius_physical_order.hpp"
 #include "op/sirius_physical_partition.hpp"
 #include "op/sirius_physical_result_collector.hpp"
+#include "op/sirius_physical_sort_partition.hpp"
+#include "op/sirius_physical_sort_sample.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "op/sirius_physical_top_n.hpp"
 #include "op/sirius_physical_top_n_merge.hpp"
@@ -365,11 +367,14 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
 
       bool group_agg_sort_topn_sink = false;
       if (current_pipeline->sink->type == op::SiriusPhysicalOperatorType::HASH_GROUP_BY ||
-          current_pipeline->sink->type == op::SiriusPhysicalOperatorType::ORDER_BY ||
-          current_pipeline->sink->type == op::SiriusPhysicalOperatorType::TOP_N ||
           current_pipeline->sink->type == op::SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE) {
         group_agg_sort_topn_sink = true;
       }
+
+      bool order_by_sink =
+        (current_pipeline->sink->type == op::SiriusPhysicalOperatorType::ORDER_BY);
+
+      bool top_n_sink = (current_pipeline->sink->type == op::SiriusPhysicalOperatorType::TOP_N);
 
       bool join_sink = false;
       if (current_pipeline->sink->type == op::SiriusPhysicalOperatorType::HASH_JOIN ||
@@ -548,6 +553,135 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
         new_pipeline_breakers.push_back(std::move(merge_op));
       }
 
+      if (order_by_sink) {
+        auto order_op   = current_pipeline->sink;
+        auto* order_ptr = static_cast<op::sirius_physical_order*>(order_op.get());
+
+        // Save the original projection and replace with identity so ORDER outputs all columns.
+        // Sort keys must remain in the output for SORT_SAMPLE and SORT_PARTITION to reference.
+        // MERGE_SORT will apply the final projection.
+        auto original_projections = order_ptr->projections;
+        {
+          auto& child_types = current_pipeline->operators.size() > 0
+                                ? current_pipeline->operators.back().get().types
+                                : current_pipeline->source->types;
+          duckdb::vector<duckdb::idx_t> identity_proj;
+          for (duckdb::idx_t i = 0; i < child_types.size(); i++) {
+            identity_proj.push_back(i);
+          }
+          order_ptr->projections = std::move(identity_proj);
+          order_ptr->types       = child_types;
+        }
+
+        // Pipeline A: current pipeline keeps ORDER as sink (local sort per batch)
+        new_scheduled.push_back(current_pipeline);
+
+        // Create SORT_SAMPLE operator
+        auto sample_op = duckdb::unique_ptr<op::sirius_physical_sort_sample>(
+          new op::sirius_physical_sort_sample(order_ptr));
+        auto* sample_ptr = sample_op.get();
+        if (duckdb::Config::MAX_SORT_PARTITION_BYTES > 0) {
+          sample_ptr->set_max_partition_bytes(duckdb::Config::MAX_SORT_PARTITION_BYTES);
+        }
+
+        // Pipeline B: ORDER (source) → SORT_SAMPLE (sink)
+        auto sample_pipeline    = duckdb::make_shared_ptr<pipeline::sirius_pipeline>(*this);
+        sample_pipeline->source = order_op.get();
+        sample_pipeline->sink   = sample_ptr;
+        sample_pipeline->dependencies.push_back(current_pipeline);
+        new_scheduled.push_back(sample_pipeline);
+
+        // Create SORT_PARTITION operator
+        auto partition_op = duckdb::unique_ptr<op::sirius_physical_sort_partition>(
+          new op::sirius_physical_sort_partition(order_ptr));
+        auto* partition_ptr = partition_op.get();
+
+        // Wire sort_partition to read boundaries from sort_sample
+        partition_ptr->set_sample_op(sample_ptr);
+
+        // Pipeline C: SORT_SAMPLE (source) → SORT_PARTITION (sink)
+        auto partition_pipeline    = duckdb::make_shared_ptr<pipeline::sirius_pipeline>(*this);
+        partition_pipeline->source = sample_ptr;
+        partition_pipeline->sink   = partition_ptr;
+        partition_pipeline->dependencies.push_back(sample_pipeline);
+        new_scheduled.push_back(partition_pipeline);
+
+        // Create MERGE_SORT operator
+        auto merge_op = duckdb::unique_ptr<op::sirius_physical_merge_sort>(
+          new op::sirius_physical_merge_sort(order_ptr));
+        auto* merge_ptr = merge_op.get();
+
+        // If ORDER had a non-identity projection, set it as MERGE_SORT's final projection
+        {
+          bool is_identity = (original_projections.size() == order_ptr->types.size());
+          if (is_identity) {
+            for (duckdb::idx_t i = 0; i < original_projections.size(); i++) {
+              if (original_projections[i] != i) {
+                is_identity = false;
+                break;
+              }
+            }
+          }
+          if (!is_identity) {
+            duckdb::vector<duckdb::LogicalType> output_types;
+            for (auto idx : original_projections) {
+              output_types.push_back(order_ptr->types[idx]);
+            }
+            merge_ptr->set_final_projections(std::move(original_projections),
+                                             std::move(output_types));
+          }
+        }
+
+        // Pipeline D: SORT_PARTITION (source) → MERGE_SORT (sink)
+        auto merge_pipeline    = duckdb::make_shared_ptr<pipeline::sirius_pipeline>(*this);
+        merge_pipeline->source = partition_ptr;
+        merge_pipeline->sink   = merge_ptr;
+        merge_pipeline->dependencies.push_back(partition_pipeline);
+        new_scheduled.push_back(merge_pipeline);
+
+        // Update downstream pipelines to use MERGE_SORT as source
+        for (size_t j = i + 1; j < copied_scheduled.size(); j++) {
+          if (copied_scheduled[j]->source.get() == order_op.get()) {
+            copied_scheduled[j]->source = merge_ptr;
+          }
+        }
+
+        // Store ownership
+        new_pipeline_breakers.push_back(std::move(sample_op));
+        new_pipeline_breakers.push_back(std::move(partition_op));
+        new_pipeline_breakers.push_back(std::move(merge_op));
+      }
+
+      if (top_n_sink) {
+        auto top_n_op  = current_pipeline->sink;
+        auto* topn_ptr = static_cast<op::sirius_physical_top_n*>(top_n_op.get());
+
+        // Pipeline A: current pipeline keeps TOP_N as sink
+        new_scheduled.push_back(current_pipeline);
+
+        // Create MERGE_TOP_N operator
+        auto merge_op = duckdb::unique_ptr<op::sirius_physical_top_n_merge>(
+          new op::sirius_physical_top_n_merge(topn_ptr));
+        auto* merge_ptr = merge_op.get();
+
+        // Pipeline B: TOP_N (source) → MERGE_TOP_N (sink)
+        auto merge_pipeline    = duckdb::make_shared_ptr<pipeline::sirius_pipeline>(*this);
+        merge_pipeline->source = top_n_op.get();
+        merge_pipeline->sink   = merge_ptr;
+        merge_pipeline->dependencies.push_back(current_pipeline);
+        new_scheduled.push_back(merge_pipeline);
+
+        // Update downstream pipelines to use MERGE_TOP_N as source
+        for (size_t j = i + 1; j < copied_scheduled.size(); j++) {
+          if (copied_scheduled[j]->source.get() == top_n_op.get()) {
+            copied_scheduled[j]->source = merge_ptr;
+          }
+        }
+
+        // Store ownership
+        new_pipeline_breakers.push_back(std::move(merge_op));
+      }
+
       if (right_left_delim_join_sink) {
         auto delim_join   = current_pipeline->get_sink();
         auto& join_op     = delim_join->Cast<op::sirius_physical_delim_join>().join;
@@ -621,7 +755,8 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
         new_scheduled.push_back(new_pipeline);
       }
 
-      if (!group_agg_sort_topn_sink && !right_left_delim_join_sink && !join_sink) {
+      if (!group_agg_sort_topn_sink && !right_left_delim_join_sink && !join_sink &&
+          !order_by_sink && !top_n_sink) {
         new_scheduled.push_back(current_pipeline);
       }
     }
@@ -707,10 +842,32 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
       } else if (new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::PARTITION ||
                  new_scheduled[i]->sink->type ==
                    op::SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE ||
-                 new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::TOP_N) {
-        // Partition operators have dependent pipelines in source_to_pipelines
+                 new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::TOP_N ||
+                 new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::MERGE_SORT) {
+        // Full barrier operators — wait for upstream to finish before processing
         for (auto dependent_pipeline : source_to_pipelines[new_scheduled[i]->get_sink().get()]) {
           insert_repository("default", new_scheduled[i], dependent_pipeline);
+        }
+      } else if (new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::ORDER_BY ||
+                 new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::SORT_SAMPLE ||
+                 new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::SORT_PARTITION) {
+        // Pipeline barrier — sort operators process batches as they arrive
+        // (sort_sample overrides get_next_task_hint to wait for N batches)
+        for (auto dependent_pipeline : source_to_pipelines[new_scheduled[i]->get_sink().get()]) {
+          auto next_op             = dependent_pipeline->get_operators().size() == 0
+                                       ? dependent_pipeline->get_sink().get()
+                                       : &dependent_pipeline->get_operators()[0].get();
+          size_t op_id             = next_op->operator_id;
+          std::string_view port_id = "default";
+          data_repo_manager.add_new_repository(
+            op_id, port_id, std::make_unique<::cucascade::shared_data_repository>());
+          next_op->add_port(port_id,
+                            std::make_unique<op::sirius_physical_operator::port>(
+                              op::MemoryBarrierType::PIPELINE,
+                              data_repo_manager.get_repository(op_id, port_id).get(),
+                              new_scheduled[i],
+                              dependent_pipeline));
+          new_scheduled[i]->get_sink()->add_next_port_after_sink(std::make_pair(next_op, port_id));
         }
       } else if (new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
         for (auto dependent_pipeline : source_to_pipelines[new_scheduled[i]->get_sink().get()]) {

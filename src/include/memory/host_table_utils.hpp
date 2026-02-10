@@ -101,7 +101,7 @@ inline metadata_node make_string_metadata_node(cudf::size_type size,
     null_count,
     data_offset,
     null_mask_offset,
-    {metadata_node{cudf::data_type(cudf::type_id::INT64), size + 1, 0, offsets_offset, -1, {}}}};
+    {metadata_node{cudf::data_type(cudf::type_id::INT32), size + 1, 0, offsets_offset, -1, {}}}};
 }
 
 namespace detail {

@@ -23,6 +23,8 @@ set(TEST_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/test_physical_filter.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/test_physical_limit.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/test_physical_top_n.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_physical_order.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_physical_merge_sort.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/test_physical_projection.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/test_physical_ungrouped_aggregate.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/test_physical_table_scan.cpp
