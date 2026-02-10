@@ -147,7 +147,7 @@ void sirius_physical_materialized_collector::sink(
       auto& mem_space     = reservation->get_memory_space();
       auto& data_repo_mgr = sirius_ctx->get_data_repository_manager();
       auto next_batch_id  = data_repo_mgr.get_next_data_batch_id();
-      clone_batch         = input_batch->clone(next_batch_id);
+      clone_batch         = input_batch->clone(next_batch_id, stream);
       // todo (bobbi) pass stream to sink
       clone_batch->convert_to<cucascade::host_table_representation>(registry, &mem_space, stream);
       data = clone_batch->get_data();
