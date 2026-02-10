@@ -39,7 +39,8 @@ gpu_pipeline_executor::gpu_pipeline_executor(
   : _config(config),
     _stream_pool(rmm::cuda_device_id{mem_space->get_device_id()}, _config.num_threads),
     _task_request_publisher(std::move(task_request_publisher)),
-    _memory_space(mem_space)
+    _memory_space(mem_space),
+    _kiosk(_config.num_threads)
 {
 }
 

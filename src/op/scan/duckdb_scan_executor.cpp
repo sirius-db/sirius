@@ -34,7 +34,7 @@ duckdb_scan_executor::duckdb_scan_executor(
   cucascade::memory::memory_reservation_manager* mem_mgr,
   exec::publisher<std::unique_ptr<sirius::pipeline::task_request>> task_request_publisher)
   : _config(config),
-    _kiosk(config.num_threads),
+    _kiosk(_config.num_threads),
     _task_request_publisher(std::move(task_request_publisher)),
     _mem_mgr(mem_mgr)
 {
