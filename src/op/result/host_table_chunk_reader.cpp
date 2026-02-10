@@ -238,7 +238,7 @@ host_table_chunk_reader::host_table_chunk_reader(
   }
   if (_allocation->size_bytes() == 0) {
     if (metadata_nodes[0].size == 0) {
-      // empty result host table, return without any column readers (creating them would fail).
+      // Empty result host table, return without any column readers (creating them would fail).
       // Because _row_offset and _total_rows are 0 by default, get_next_chunk() will immediately
       // return false.
       return;

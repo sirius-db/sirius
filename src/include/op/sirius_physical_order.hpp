@@ -38,7 +38,6 @@ class sirius_physical_order : public sirius_physical_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::ORDER_BY;
 
- public:
   sirius_physical_order(duckdb::vector<duckdb::LogicalType> types,
                         duckdb::vector<duckdb::BoundOrderByNode> orders,
                         duckdb::vector<duckdb::idx_t> projections_p,
@@ -50,21 +49,15 @@ class sirius_physical_order : public sirius_physical_operator {
   duckdb::vector<duckdb::idx_t> projections;
   bool is_index_sort;
 
- public:
-  // Source interface
   bool is_source() const override { return true; }
+  bool is_sink() const override { return true; }
+  bool sink_order_dependent() const override { return false; }
 
   duckdb::OrderPreservationType source_order() const override
   {
     return duckdb::OrderPreservationType::FIXED_ORDER;
   }
 
- public:
-  // Sink interface
-  bool is_sink() const override { return true; }
-  bool sink_order_dependent() const override { return false; }
-
- public:
   std::vector<std::shared_ptr<cucascade::data_batch>> execute(
     const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches,
     rmm::cuda_stream_view stream = cudf::get_default_stream()) override;
