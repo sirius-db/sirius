@@ -135,7 +135,7 @@ TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with single 
   sirius_physical_partition partitioner(
     std::move(partitioner_types), estimated_cardinality, &grouped_aggregator, false);
 
-  auto outputs = partitioner.execute({input_batch});
+  auto outputs = partitioner.execute({input_batch}, default_stream());
 
   std::size_t partition_size = 10000000;  // from sirius_physical_partition.hpp
 
@@ -258,7 +258,7 @@ TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with two par
   sirius_physical_partition partitioner(
     std::move(partitioner_types), estimated_cardinality, &grouped_aggregator, false);
 
-  auto outputs = partitioner.execute({input_batch});
+  auto outputs = partitioner.execute({input_batch}, default_stream());
 
   std::size_t partition_size = 10000000;  // from sirius_physical_partition.hpp
 
@@ -329,7 +329,7 @@ TEST_CASE(
   sirius_physical_partition partitioner(
     std::move(partitioner_types), estimated_cardinality, &grouped_aggregator, false);
 
-  auto outputs = partitioner.execute({input_batch});
+  auto outputs = partitioner.execute({input_batch}, default_stream());
   REQUIRE(outputs.size() == 1);
   REQUIRE(outputs[0]->get_data()->cast<gpu_table_representation>().get_table().num_rows() ==
           num_values);

@@ -112,7 +112,7 @@ class downgrade_task : public itask {
    *
    * @param stream CUDA stream used for device memory operations and kernel launches
    */
-  void execute(rmm::cuda_stream_view stream = cudf::get_default_stream()) override;
+  void execute(rmm::cuda_stream_view stream) override;
 
   /**
    * @brief Get the unique identifier for this task

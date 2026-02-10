@@ -113,7 +113,7 @@ hash_join_test_fixture create_test_hash_join(duckdb::JoinType join_type,
  */
 memory_space* get_shared_mem_space()
 {
-  static auto manager = initialize_memory_manager();
+  static auto manager = sirius::test::operator_utils::initialize_memory_manager();
   return manager->get_memory_space(Tier::GPU, 0);
 }
 
@@ -593,7 +593,7 @@ TEST_CASE("sirius_physical_concat execute is thread-safe with independent stream
       cudaStreamCreate(&raw_stream);
       rmm::cuda_stream_view stream(raw_stream);
 
-      auto outputs = concat_op.execute(thread_inputs[thread_id], stream);
+      auto outputs = concat_op.execute(thread_inputs[thread_id], default_stream());
 
       // Synchronize the stream before accessing results
       cudaStreamSynchronize(raw_stream);
