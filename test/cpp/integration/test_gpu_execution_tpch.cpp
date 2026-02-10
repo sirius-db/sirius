@@ -240,41 +240,50 @@ TEST_CASE("gpu_execution - ungrouped all agg functions", "[integration][gpu_exec
     "select sum(n_regionkey), min(n_nationkey), max(n_regionkey), count(n_nationkey) from nation;");
 }
 
-
 //===----------------------------------------------------------------------===//
 // Grouped aggregate tests
 //===----------------------------------------------------------------------===//
 
-TEST_CASE("gpu_execution - single group by key: min max, sum, count(*)", "[integration][gpu_execution][grouped_aggregate]")
+TEST_CASE("gpu_execution - single group by key: min max, sum, count(*)",
+          "[integration][gpu_execution][grouped_aggregate]")
 {
   config_env_guard env;
   duckdb::DuckDB db(get_tpch_db_path().string());
   duckdb::Connection con(db);
-  compare_gpu_vs_cpu(con, "select c_nationkey, min(c_custkey), max(c_custkey), sum(c_custkey), count(*) from customer group by c_nationkey;");
+  compare_gpu_vs_cpu(con,
+                     "select c_nationkey, min(c_custkey), max(c_custkey), sum(c_custkey), count(*) "
+                     "from customer group by c_nationkey;");
 }
 
-TEST_CASE("gpu_execution - single group by key: min max, count string ", "[integration][gpu_execution][grouped_aggregate]")
+TEST_CASE("gpu_execution - single group by key: min max, count string ",
+          "[integration][gpu_execution][grouped_aggregate]")
 {
   config_env_guard env;
   duckdb::DuckDB db(get_tpch_db_path().string());
   duckdb::Connection con(db);
-  compare_gpu_vs_cpu(con, "select c_nationkey, min(C_NAME), max(C_NAME), count(C_NAME) from customer group by c_nationkey;");
+  compare_gpu_vs_cpu(con,
+                     "select c_nationkey, min(C_NAME), max(C_NAME), count(C_NAME) from customer "
+                     "group by c_nationkey;");
 }
 
-TEST_CASE("gpu_execution - two group by key: min max, but not showing the group by keys", "[integration][gpu_execution][grouped_aggregate]")
+TEST_CASE("gpu_execution - two group by key: min max, but not showing the group by keys",
+          "[integration][gpu_execution][grouped_aggregate]")
 {
   config_env_guard env;
   duckdb::DuckDB db(get_tpch_db_path().string());
   duckdb::Connection con(db);
-  compare_gpu_vs_cpu(con, "select min(c_custkey), max(c_custkey) from customer group by c_nationkey, c_mktsegment;");
+  compare_gpu_vs_cpu(
+    con, "select min(c_custkey), max(c_custkey) from customer group by c_nationkey, c_mktsegment;");
 }
 
-TEST_CASE("gpu_execution - two group keys and noaggregations", "[integration][gpu_execution][grouped_aggregate]")
+TEST_CASE("gpu_execution - two group keys and noaggregations",
+          "[integration][gpu_execution][grouped_aggregate]")
 {
   config_env_guard env;
   duckdb::DuckDB db(get_tpch_db_path().string());
   duckdb::Connection con(db);
-  compare_gpu_vs_cpu(con, "select c_nationkey, c_mktsegment from customer group by c_mktsegment, c_nationkey;");
+  compare_gpu_vs_cpu(
+    con, "select c_nationkey, c_mktsegment from customer group by c_mktsegment, c_nationkey;");
 }
 
 //===----------------------------------------------------------------------===//
@@ -302,12 +311,16 @@ TEST_CASE("gpu_execution - limit with filter", "[integration][gpu_execution][lim
 // Disabled tests - known issues
 //===----------------------------------------------------------------------===//
 
-TEST_CASE("gpu_execution - two group by key: min max, sum, count of doubles", "[integration_disabled][gpu_execution][aggregate]")
+TEST_CASE("gpu_execution - two group by key: min max, sum, count of doubles",
+          "[integration_disabled][gpu_execution][aggregate]")
 {
   config_env_guard env;
   duckdb::DuckDB db(get_tpch_db_path().string());
   duckdb::Connection con(db);
-  compare_gpu_vs_cpu(con, "select c_nationkey, c_mktsegment, min(C_ACCTBAL), max(C_ACCTBAL), sum(C_ACCTBAL), count(C_ACCTBAL) from customer group by c_nationkey, c_mktsegment;");
+  compare_gpu_vs_cpu(
+    con,
+    "select c_nationkey, c_mktsegment, min(C_ACCTBAL), max(C_ACCTBAL), sum(C_ACCTBAL), "
+    "count(C_ACCTBAL) from customer group by c_nationkey, c_mktsegment;");
 }
 
 // Empty result set: "Port default not found in operator RESULT_COLLECTOR"

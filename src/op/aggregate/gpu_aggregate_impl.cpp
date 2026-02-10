@@ -146,19 +146,25 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
   for (size_t i = 0; i < input_col_order.size(); ++i) {
     int aggregate_col_id     = input_col_order[i];
     auto& aggregation_result = groupby_result.second[i];
-    
+
     // need to cast count aggregation result to int64
-    if (requests[i].aggregations.size() == 1 && (requests[i].aggregations[0]->kind == cudf::aggregation::Kind::COUNT_VALID || requests[i].aggregations[0]->kind == cudf::aggregation::Kind::COUNT_ALL)) {
+    if (requests[i].aggregations.size() == 1 &&
+        (requests[i].aggregations[0]->kind == cudf::aggregation::Kind::COUNT_VALID ||
+         requests[i].aggregations[0]->kind == cudf::aggregation::Kind::COUNT_ALL)) {
       if (aggregation_result.results.size() != 1) {
-        throw std::runtime_error("Expected 1 result for count aggregation, got " + std::to_string(aggregation_result.results.size()));
+        throw std::runtime_error("Expected 1 result for count aggregation, got " +
+                                 std::to_string(aggregation_result.results.size()));
       }
       auto result_view = aggregation_result.results[0]->view();
       if (result_view.type().id() != cudf::type_id::INT64) {
-        aggregation_result.results[0] = cudf::cast(result_view, cudf::data_type(cudf::type_id::INT64), stream, memory_space.get_default_allocator());
-      }      
+        aggregation_result.results[0] = cudf::cast(result_view,
+                                                   cudf::data_type(cudf::type_id::INT64),
+                                                   stream,
+                                                   memory_space.get_default_allocator());
+      }
     }
 
-    const auto& output_idx   = input_col_to_output_idx[aggregate_col_id];
+    const auto& output_idx = input_col_to_output_idx[aggregate_col_id];
     for (size_t j = 0; j < output_idx.size(); ++j) {
       size_t output_col_id       = group_idx.size() + output_idx[j];
       output_cols[output_col_id] = std::move(aggregation_result.results[j]);
@@ -168,7 +174,7 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
   // Create the output data batch
   auto output_table = std::make_unique<cudf::table>(
     std::move(output_cols), stream, memory_space.get_default_allocator());
-  return make_data_batch(std::move(output_table), memory_space);  
+  return make_data_batch(std::move(output_table), memory_space);
 }
 
 }  // namespace op
