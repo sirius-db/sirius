@@ -36,6 +36,10 @@ namespace sirius::op::result {
 host_table_chunk_reader::column_reader::column_reader(
   metadata_node const& node, std::unique_ptr<multiple_blocks_allocation> const& allocation)
 {
+  if (allocation == nullptr || allocation->block_size() == 0) {
+    throw std::runtime_error(
+      "[host_table_chunk_reader::column_reader::column_reader] Invalid allocation.");
+  }
   size       = static_cast<size_t>(node.size);
   null_count = static_cast<size_t>(node.null_count);
   if (node.null_mask_offset < 0) { null_count = 0; }
@@ -181,10 +185,14 @@ void host_table_chunk_reader::column_reader::copy_string(
     if (null_count != 0) {
       auto& validity = duckdb::FlatVector::Validity(vector);
       copy_mask_to_validity(validity, row_offset, count, allocation);
+      detail::make_duckdb_strings<true, int64_t>(
+        offset_accessor_64, allocation, vector, count, start_offset, end_offset, str_buffer_ptr);
+      duckdb::StringVector::AddBuffer(vector, str_buffer);
+    } else {
+      detail::make_duckdb_strings<false, int64_t>(
+        offset_accessor_64, allocation, vector, count, start_offset, end_offset, str_buffer_ptr);
+      duckdb::StringVector::AddBuffer(vector, str_buffer);
     }
-    detail::make_duckdb_strings<false>(
-      offset_accessor_64, allocation, vector, count, start_offset, end_offset, str_buffer_ptr);
-    duckdb::StringVector::AddBuffer(vector, str_buffer);
   } else {
     // INT32 offsets (from scan task)
     auto start_offset = static_cast<size_t>(offset_accessor_32.get_current(allocation));
@@ -197,10 +205,14 @@ void host_table_chunk_reader::column_reader::copy_string(
     if (null_count != 0) {
       auto& validity = duckdb::FlatVector::Validity(vector);
       copy_mask_to_validity(validity, row_offset, count, allocation);
+      detail::make_duckdb_strings<true, int32_t>(
+        offset_accessor_32, allocation, vector, count, start_offset, end_offset, str_buffer_ptr);
+      duckdb::StringVector::AddBuffer(vector, str_buffer);
+    } else {
+      detail::make_duckdb_strings<false, int32_t>(
+        offset_accessor_32, allocation, vector, count, start_offset, end_offset, str_buffer_ptr);
+      duckdb::StringVector::AddBuffer(vector, str_buffer);
     }
-    detail::make_duckdb_strings<false>(
-      offset_accessor_32, allocation, vector, count, start_offset, end_offset, str_buffer_ptr);
-    duckdb::StringVector::AddBuffer(vector, str_buffer);
   }
 }
 
@@ -224,7 +236,19 @@ host_table_chunk_reader::host_table_chunk_reader(
     throw std::runtime_error(
       "[host_table_chunk_reader] Metadata column count does not match expected column count.");
   }
+  if (_allocation->size_bytes() == 0) {
+    if (metadata_nodes[0].size == 0) {
+      // Empty result host table, return without any column readers (creating them would fail).
+      // Because _row_offset and _total_rows are 0 by default, get_next_chunk() will immediately
+      // return false.
+      return;
+    } else {
+      throw duckdb::InvalidInputException(
+        "[GPUPhysicalMaterializedCollector] host_table has rows but a zero-sized allocation");
+    }
+  }
   // Initialize column readers
+  _column_readers.reserve(metadata_nodes.size());
   for (size_t col_idx = 0; col_idx < metadata_nodes.size(); ++col_idx) {
     if (col_idx == 0) {
       _total_rows = static_cast<size_t>(metadata_nodes[col_idx].size);

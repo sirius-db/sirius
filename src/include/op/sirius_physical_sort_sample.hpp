@@ -16,7 +16,6 @@
 
 #pragma once
 
-#include "duckdb/planner/bound_query_node.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_order.hpp"
 
@@ -36,7 +35,6 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
   //! Maximum fraction of available GPU memory per partition (33%)
   static constexpr double MAX_PARTITION_MEMORY_FRACTION = 0.33;
 
- public:
   sirius_physical_sort_sample(sirius_physical_order* order_by);
 
   sirius_physical_sort_sample(duckdb::vector<duckdb::LogicalType> types,
@@ -51,20 +49,15 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
   duckdb::idx_t num_sample_batches;
 
  public:
-  // Source interface
   bool is_source() const override { return true; }
+  bool is_sink() const override { return true; }
+  bool sink_order_dependent() const override { return false; }
 
   duckdb::OrderPreservationType source_order() const override
   {
     return duckdb::OrderPreservationType::FIXED_ORDER;
   }
 
- public:
-  // Sink interface
-  bool is_sink() const override { return true; }
-  bool sink_order_dependent() const override { return false; }
-
- public:
   std::vector<std::shared_ptr<cucascade::data_batch>> execute(
     const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches,
     rmm::cuda_stream_view stream = cudf::get_default_stream()) override;
@@ -72,7 +65,6 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
   //! Override to wait for N batches before returning READY
   std::optional<task_creation_hint> get_next_task_hint() override;
 
- public:
   //! Get the computed partition boundaries (P-1 rows, sort key columns only)
   const cudf::table& get_partition_boundaries() const { return *_partition_boundaries; }
 
