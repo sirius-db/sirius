@@ -28,12 +28,12 @@
 #include "op/sirius_physical_cte.hpp"
 #include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_duckdb_scan.hpp"
-#include "op/sirius_physical_parquet_scan.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_grouped_aggregate_merge.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_merge_sort.hpp"
 #include "op/sirius_physical_order.hpp"
+#include "op/sirius_physical_parquet_scan.hpp"
 #include "op/sirius_physical_partition.hpp"
 #include "op/sirius_physical_result_collector.hpp"
 #include "op/sirius_physical_sort_partition.hpp"
@@ -189,7 +189,8 @@ duckdb::unique_ptr<op::sirius_physical_operator> sirius_engine::construct_sirius
 {
   if (op->type == op::SiriusPhysicalOperatorType::TABLE_SCAN) {
     auto& scan_physical_op = op->Cast<op::sirius_physical_table_scan>();
-    if (scan_physical_op.function.name == "parquet_scan" || scan_physical_op.function.name == "read_parquet") {
+    if (scan_physical_op.function.name == "parquet_scan" ||
+        scan_physical_op.function.name == "read_parquet") {
       return duckdb::make_uniq<op::sirius_physical_parquet_scan>(&scan_physical_op);
     } else {
       return duckdb::make_uniq<op::sirius_physical_duckdb_scan>(&scan_physical_op);
@@ -338,17 +339,17 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
       auto original_dependencies = current_pipeline->dependencies;
 
       if (current_pipeline->source->type == op::SiriusPhysicalOperatorType::TABLE_SCAN) {
-        auto& scan_op      = current_pipeline->get_source()->Cast<op::sirius_physical_table_scan>();
+        auto& scan_op = current_pipeline->get_source()->Cast<op::sirius_physical_table_scan>();
         if (scan_op.function.name == "parquet_scan" || scan_op.function.name == "read_parquet") {
-          auto new_scan_op = construct_sirius_specific_operator(&scan_op);
+          auto new_scan_op         = construct_sirius_specific_operator(&scan_op);
           current_pipeline->source = new_scan_op.get();
           current_pipeline->operators.insert(current_pipeline->operators.begin(), *new_scan_op);
           new_pipeline_breakers.push_back(std::move(new_scan_op));
 
         } else if (scan_op.function.name == "seq_scan") {
           auto new_pipeline = duckdb::make_shared_ptr<pipeline::sirius_pipeline>(*this);
-          
-          auto new_scan_op  = construct_sirius_specific_operator(&scan_op);
+
+          auto new_scan_op = construct_sirius_specific_operator(&scan_op);
           // todo(bobbi) currently this can be set to any operator since it's never used, and now we
           // set it to scan_op
           new_pipeline->source = &scan_op;
@@ -460,7 +461,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
           new_scheduled.push_back(new_pipeline);
 
           // new pipeline for concat_op
-          auto more_new_pipeline = duckdb::make_shared_ptr<pipeline::sirius_pipeline>(*this);
+          auto more_new_pipeline    = duckdb::make_shared_ptr<pipeline::sirius_pipeline>(*this);
           more_new_pipeline->source = partition_ptr;
           more_new_pipeline->sink   = concat_op.get();
           more_new_pipeline->dependencies.push_back(new_pipeline);
@@ -508,7 +509,9 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
         } else {
           concat_op = make_uniq<op::sirius_physical_concat>(
             current_pipeline->operators[current_pipeline->operators.size() - 1].get().types,
-            current_pipeline->operators[current_pipeline->operators.size() - 1].get().estimated_cardinality,
+            current_pipeline->operators[current_pipeline->operators.size() - 1]
+              .get()
+              .estimated_cardinality,
             hash_join_op.get(),
             true);
           partition_op = make_uniq<op::sirius_physical_partition>(
@@ -528,7 +531,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
         new_scheduled.push_back(current_pipeline);
 
         // create new pipeline for concat_op
-        auto new_pipeline = duckdb::make_shared_ptr<pipeline::sirius_pipeline>(*this);
+        auto new_pipeline    = duckdb::make_shared_ptr<pipeline::sirius_pipeline>(*this);
         new_pipeline->source = partition_ptr;
         new_pipeline->sink   = concat_op.get();
         new_pipeline->dependencies.push_back(current_pipeline);
@@ -606,8 +609,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
         new_scheduled.push_back(current_pipeline);
 
         // Create SORT_SAMPLE operator
-        auto sample_op = duckdb::make_uniq<op::sirius_physical_sort_sample>(
-          order_ptr);
+        auto sample_op   = duckdb::make_uniq<op::sirius_physical_sort_sample>(order_ptr);
         auto* sample_ptr = sample_op.get();
         if (duckdb::Config::MAX_SORT_PARTITION_BYTES > 0) {
           sample_ptr->set_max_partition_bytes(duckdb::Config::MAX_SORT_PARTITION_BYTES);
@@ -621,8 +623,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
         new_scheduled.push_back(sample_pipeline);
 
         // Create SORT_PARTITION operator
-        auto partition_op = duckdb::make_uniq<op::sirius_physical_sort_partition>(
-          order_ptr);
+        auto partition_op   = duckdb::make_uniq<op::sirius_physical_sort_partition>(order_ptr);
         auto* partition_ptr = partition_op.get();
 
         // Wire sort_partition to read boundaries from sort_sample
@@ -636,8 +637,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
         new_scheduled.push_back(partition_pipeline);
 
         // Create MERGE_SORT operator
-        auto merge_op = duckdb::make_uniq<op::sirius_physical_merge_sort>(
-          order_ptr);
+        auto merge_op   = duckdb::make_uniq<op::sirius_physical_merge_sort>(order_ptr);
         auto* merge_ptr = merge_op.get();
 
         // If ORDER had a non-identity projection, set it as MERGE_SORT's final projection
@@ -981,7 +981,8 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
           }
         } else if (first_op.type == op::SiriusPhysicalOperatorType::TABLE_SCAN) {
           if (first_op.Cast<op::sirius_physical_table_scan>().function.name != "seq_scan") {
-            throw std::runtime_error("Unsupported scan function: " + first_op.Cast<op::sirius_physical_table_scan>().function.name);
+            throw std::runtime_error("Unsupported scan function: " +
+                                     first_op.Cast<op::sirius_physical_table_scan>().function.name);
           }
           // Scans have "scan" port
           auto* scan_port = first_op.get_port("scan");
@@ -990,7 +991,8 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
                             static_cast<int>(scan_port->type),
                             static_cast<void*>(scan_port->repo));
           }
-        } else if (first_op.type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN || first_op.type == op::SiriusPhysicalOperatorType::PARQUET_SCAN) {
+        } else if (first_op.type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN ||
+                   first_op.type == op::SiriusPhysicalOperatorType::PARQUET_SCAN) {
           // ignore DUCKDB_SCAN since it doesn't have port
         } else {
           // Most operators have "default" port

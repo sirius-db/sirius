@@ -76,8 +76,7 @@ struct GPUTableFunctionData : public TableFunctionData {
     original_disabled_optimizers = DBConfig::GetConfig(context).options.disabled_optimizers;
 
     // The user might want to disable the optimizer of the new connection
-    context.config.enable_optimizer      = enable_optimizer;
-    context.config.use_replacement_scans = false;
+    context.config.enable_optimizer = enable_optimizer;
     // We want for sure to disable the internal compression optimizations.
     // These are DuckDB specific, no other system implements these. Also,
     // respect the user's settings if they chose to disable any specific optimizers.
@@ -159,8 +158,7 @@ struct SiriusTableFunctionData : public TableFunctionData {
     original_disabled_optimizers = DBConfig::GetConfig(context).options.disabled_optimizers;
 
     // The user might want to disable the optimizer of the new connection
-    context.config.enable_optimizer      = enable_optimizer;
-    context.config.use_replacement_scans = false;
+    context.config.enable_optimizer = enable_optimizer;
     // We want for sure to disable the internal compression optimizations.
     // These are DuckDB specific, no other system implements these. Also,
     // respect the user's settings if they chose to disable any specific optimizers.
