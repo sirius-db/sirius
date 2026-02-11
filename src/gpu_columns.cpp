@@ -472,11 +472,13 @@ void GPUColumn::setFromCudfScalar(cudf::scalar& cudf_scalar, GPUBufferManager* g
     callCudaMemcpyHostToDevice<uint64_t>(data_wrapper.offset, offsets, 2, 0);
     data_wrapper.is_string_data = true;
     data_wrapper.size           = 1;
-    data_wrapper.validity_mask  = createNullMask(1);
-    data_wrapper.mask_bytes     = getMaskBytesSize(1);
-    column_length               = 1;
-    row_ids                     = nullptr;
-    row_id_count                = 0;
+    // Check if scalar is valid (e.g., SUM/AVG of all-NULL column returns invalid scalar)
+    data_wrapper.validity_mask =
+      cudf_scalar.is_valid() ? createNullMask(1) : createNullMask(1, cudf::mask_state::ALL_NULL);
+    data_wrapper.mask_bytes = getMaskBytesSize(1);
+    column_length           = 1;
+    row_ids                 = nullptr;
+    row_id_count            = 0;
     return;
   } else {
     throw NotImplementedException("Unsupported scalar type: %d",
@@ -486,9 +488,11 @@ void GPUColumn::setFromCudfScalar(cudf::scalar& cudf_scalar, GPUBufferManager* g
   data_wrapper.data = gpuBufferManager->customCudaMalloc<uint8_t>(scalar_size, 0, 0);
   callCudaMemcpyDeviceToDevice<uint8_t>(
     data_wrapper.data, reinterpret_cast<uint8_t*>(scalar_ptr), scalar_size, 0);
-  data_wrapper.num_bytes      = scalar_size;
-  data_wrapper.size           = 1;
-  data_wrapper.validity_mask  = createNullMask(1);
+  data_wrapper.num_bytes = scalar_size;
+  data_wrapper.size      = 1;
+  // Check if scalar is valid (e.g., SUM/AVG of all-NULL column returns invalid scalar)
+  data_wrapper.validity_mask =
+    cudf_scalar.is_valid() ? createNullMask(1) : createNullMask(1, cudf::mask_state::ALL_NULL);
   data_wrapper.mask_bytes     = getMaskBytesSize(1);
   column_length               = 1;
   data_wrapper.offset         = nullptr;
