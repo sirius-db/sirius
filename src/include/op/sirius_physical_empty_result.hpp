@@ -23,19 +23,19 @@ namespace sirius {
 namespace op {
 
 class sirius_physical_empty_result : public sirius_physical_operator {
- public:
-  static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::EMPTY_RESULT;
+  public:
+    static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::EMPTY_RESULT;
 
- public:
-  explicit sirius_physical_empty_result(duckdb::vector<duckdb::LogicalType> types,
-                                        duckdb::idx_t estimated_cardinality)
-    : sirius_physical_operator(
-        SiriusPhysicalOperatorType::EMPTY_RESULT, std::move(types), estimated_cardinality)
-  {
-  }
+  public:
+    explicit sirius_physical_empty_result(duckdb::vector<duckdb::LogicalType> types,
+                                          duckdb::idx_t estimated_cardinality)
+      : sirius_physical_operator(
+          SiriusPhysicalOperatorType::EMPTY_RESULT, std::move(types), estimated_cardinality)
+    {
+    }
 
- public:
-  bool is_source() const override { return true; }
+  public:
+    bool is_source() const override { return true; }
 };
 
 }  // namespace op
