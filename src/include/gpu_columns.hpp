@@ -108,7 +108,8 @@ struct GPUColumnType {
 inline GPUColumnType convertLogicalTypeToColumnType(LogicalType type)
 {
   switch (type.id()) {
-    case LogicalTypeId::SMALLINT: return GPUColumnType(GPUColumnTypeId::INT16);
+    case LogicalTypeId::SMALLINT:  // [Reserved] SMALLINT -> INT16
+      return GPUColumnType(GPUColumnTypeId::INT16);
     case LogicalTypeId::INTEGER: return GPUColumnType(GPUColumnTypeId::INT32);
     case LogicalTypeId::BIGINT: return GPUColumnType(GPUColumnTypeId::INT64);
     case LogicalTypeId::HUGEINT: return GPUColumnType(GPUColumnTypeId::INT128);
@@ -136,7 +137,8 @@ inline GPUColumnType convertLogicalTypeToColumnType(LogicalType type)
 inline LogicalType convertColumnTypeToLogicalType(const GPUColumnType& type)
 {
   switch (type.id()) {
-    case GPUColumnTypeId::INT16: return LogicalType::SMALLINT;
+    case GPUColumnTypeId::INT16:  // [Reserved] INT16 -> SMALLINT
+      return LogicalType::SMALLINT;
     case GPUColumnTypeId::INT32: return LogicalType::INTEGER;
     case GPUColumnTypeId::INT64: return LogicalType::BIGINT;
     case GPUColumnTypeId::FLOAT32: return LogicalType::FLOAT;
@@ -166,7 +168,7 @@ inline LogicalType convertColumnTypeToLogicalType(const GPUColumnType& type)
 
 class DataWrapper {
  public:
-  DataWrapper() = default;  // Add default constructor
+  DataWrapper() = default;
   DataWrapper(GPUColumnType type, uint8_t* data, size_t size, cudf::bitmask_type* validity_mask);
   DataWrapper(GPUColumnType type,
               uint8_t* data,
@@ -208,6 +210,10 @@ class GPUColumn {
   double* GetDataFloat64();
   char* GetDataVarChar();
   uint8_t* GetDataBoolean();
+
+  // [Critical Fix] Must declare here for .cpp implementation
+  int16_t* GetDataInt16();
+
   uint64_t* GetRowIds();
   uint8_t* GetData();
 
@@ -217,35 +223,21 @@ class GPUColumn {
   size_t column_length;  // number of rows in the column (currently equals to column_length)
   bool is_unique;        // indicator whether the column has unique values
 
-  uint8_t* segment_start_ptr{nullptr};  // Pointer to the start of the segment where this column is
-                                        // stored, if this column is cached on CPU
-  int segment_id{
-    -1};  // Metadata used by the CPU cache to identify where in the CPU this column is cached
+  uint8_t* segment_start_ptr{nullptr};
+  int segment_id{-1};
 
   cudf::column_view convertToCudfColumn();
-  int32_t* convertSiriusOffsetToCudfOffset();  // convert the offset of GPUColumn to the offset of
-                                               // the cudf column
-  int32_t* convertSiriusRowIdsToCudfRowIds();  // convert the row_ids of the GPUColumn to the
-                                               // row_ids of the cudf column
-  void convertCudfRowIdsToSiriusRowIds(
-    int32_t*
-      cudf_row_ids);  // convert the row_ids of the cudf column to the row_ids of the GPUColumn
-  void convertCudfOffsetToSiriusOffset(
-    int32_t* cudf_offset);  // convert the offset of the cudf column to the offset of the GPUColumn
+  int32_t* convertSiriusOffsetToCudfOffset();
+  int32_t* convertSiriusRowIdsToCudfRowIds();
+  void convertCudfRowIdsToSiriusRowIds(int32_t* cudf_row_ids);
+  void convertCudfOffsetToSiriusOffset(int32_t* cudf_offset);
   void setFromCudfColumn(cudf::column& cudf_column,
                          bool _is_unique,
                          int32_t* _row_ids,
                          uint64_t _row_id_count,
                          GPUBufferManager* gpuBufferManager);
-  void setFromCudfScalar(
-    cudf::scalar& cudf_scalar,
-    GPUBufferManager* gpuBufferManager);  // set the GPUColumn from the cudf scalar
-  // cudf mask is int32_t type, but has the granularity of 64B
-  // duckdb mask is uint64_t type and the granularity of 8B
-  //  void convertCudfMaskToSiriusMask(std::unique_ptr<rmm::device_buffer> cudf_mask,
-  //  cudf::size_type col_size, GPUBufferManager* gpuBufferManager);
+  void setFromCudfScalar(cudf::scalar& cudf_scalar, GPUBufferManager* gpuBufferManager);
 
-  // Returns the total number of bytes to store all of the column details
   size_t getTotalColumnSize();
 };
 

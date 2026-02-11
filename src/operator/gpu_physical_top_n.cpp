@@ -112,7 +112,7 @@ SinkResultType GPUPhysicalTopN::Sink(GPUIntermediateRelation& input_relation) co
       "Order by with column length greater than INT32_MAX is not supported");
   }
 
-  HandleTopN(order_by_keys, projection_columns, orders, types.size(), limit);
+  HandleTopN(order_by_keys, projection_columns, orders, types.size(), limit + offset);
 
   for (int col = 0; col < types.size(); col++) {
     if (sort_result->columns[col] == nullptr || sort_result->columns[col]->column_length == 0 ||
