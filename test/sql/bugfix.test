@@ -103,7 +103,7 @@ call gpu_processing("SELECT rowID FROM issue_56 WHERE dataStringTwo IS NOT DISTI
 ----
 3
 
-# Test IS NOT DISTINCT with NULL compared to string [constant on right] 
+# Test IS NOT DISTINCT with NULL compared to string [constant on right]
 query I
 call gpu_processing("SELECT rowID FROM issue_56 WHERE dataStringTwo IS NOT DISTINCT FROM NULL;");
 ----
@@ -161,4 +161,4 @@ query I
 call gpu_processing("SELECT rowID FROM issue_56 WHERE dataDecTwo IS NOT DISTINCT FROM NULL;");
 ----
 1
-4   
+4
