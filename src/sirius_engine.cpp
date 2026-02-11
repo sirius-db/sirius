@@ -705,8 +705,11 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
               join_op.get(),
               delim_join->type == op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN);
           }
-          delim_join->Cast<op::sirius_physical_delim_join>().partition_join =
+          delim_join->Cast<op::sirius_physical_right_delim_join>().partition_join =
             static_cast<op::sirius_physical_partition*>(partition_join.get());
+        } else if (delim_join->type == op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN) {
+          delim_join->Cast<op::sirius_physical_left_delim_join>().column_data_scan =
+            static_cast<op::sirius_physical_column_data_scan*>(join_op->children[0].get());
         }
 
         auto partition_distinct = make_uniq<op::sirius_physical_partition>(
@@ -786,10 +789,11 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
           }
         }
       } else if (new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
-        auto delim_join     = new_scheduled[i]->get_sink();
-        auto partition_join = delim_join->Cast<op::sirius_physical_delim_join>().partition_join;
+        auto delim_join = new_scheduled[i]->get_sink();
+        auto partition_join =
+          delim_join->Cast<op::sirius_physical_right_delim_join>().partition_join;
         auto partition_distinct =
-          delim_join->Cast<op::sirius_physical_delim_join>().partition_distinct;
+          delim_join->Cast<op::sirius_physical_right_delim_join>().partition_distinct;
         // Find the pipeline containing the join as the first operator
         bool found = false;
         for (auto dependent_pipeline : source_to_pipelines[partition_join]) {
@@ -801,12 +805,12 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
       } else if (new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN) {
         auto delim_join = new_scheduled[i]->get_sink();
         auto partition_distinct =
-          delim_join->Cast<op::sirius_physical_delim_join>().partition_distinct;
+          delim_join->Cast<op::sirius_physical_left_delim_join>().partition_distinct;
         for (auto dependent_pipeline : source_to_pipelines[partition_distinct]) {
           insert_repository("default", partition_distinct, new_scheduled[i], dependent_pipeline);
         }
         auto column_data_scan =
-          delim_join->Cast<op::sirius_physical_delim_join>().join->children[0].get();
+          delim_join->Cast<op::sirius_physical_left_delim_join>().column_data_scan;
         for (auto dependent_pipeline : source_to_pipelines[column_data_scan]) {
           insert_repository("default", column_data_scan, new_scheduled[i], dependent_pipeline);
         }
@@ -1024,7 +1028,8 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
         auto delim_join = pipeline->get_sink();
 
         if (pipeline->sink->type == op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
-          auto partition_join = delim_join->Cast<op::sirius_physical_delim_join>().partition_join;
+          auto partition_join =
+            delim_join->Cast<op::sirius_physical_right_delim_join>().partition_join;
           SIRIUS_LOG_INFO("  Partition Join next operators:");
           for (auto& next_port : partition_join->get_next_port_after_sink()) {
             SIRIUS_LOG_INFO("    Next Op: {}, Port: '{}' Repo:'{}'",
@@ -1035,7 +1040,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
         }
 
         auto partition_distinct =
-          delim_join->Cast<op::sirius_physical_delim_join>().partition_distinct;
+          delim_join->Cast<op::sirius_physical_right_delim_join>().partition_distinct;
         SIRIUS_LOG_INFO("  Partition Distinct next operators:");
         for (auto& next_port : partition_distinct->get_next_port_after_sink()) {
           SIRIUS_LOG_INFO("    Next Op: {}, Port: '{}' Repo:'{}'",
@@ -1046,7 +1051,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
 
         if (pipeline->sink->type == op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN) {
           auto column_data_scan =
-            delim_join->Cast<op::sirius_physical_delim_join>().join->children[0].get();
+            delim_join->Cast<op::sirius_physical_left_delim_join>().column_data_scan;
           SIRIUS_LOG_INFO("  Column Data Scan next operators:");
           for (auto& next_port : column_data_scan->get_next_port_after_sink()) {
             SIRIUS_LOG_INFO("    Next Op: {}, Port: '{}' Repo:'{}'",

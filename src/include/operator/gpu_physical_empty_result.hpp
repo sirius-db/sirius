@@ -30,6 +30,7 @@ class GPUPhysicalEmptyResult : public GPUPhysicalOperator {
     : GPUPhysicalOperator(
         PhysicalOperatorType::EMPTY_RESULT, std::move(types), estimated_cardinality)
   {
+    printf("GPUPhysicalEmptyResult constructor\n");
   }
 
  public:

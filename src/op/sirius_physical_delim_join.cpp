@@ -152,5 +152,52 @@ void sirius_physical_right_delim_join::build_pipelines(
   sirius_physical_hash_join::build_join_pipelines(current, meta_pipeline, *join, false);
 }
 
+std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_right_delim_join::execute(
+  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches,
+  rmm::cuda_stream_view stream)
+{
+  return input_batches;
+}
+
+void sirius_physical_right_delim_join::sink(
+  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches,
+  rmm::cuda_stream_view stream)
+{
+  // call partition join execute
+  auto partition_join_output_batches = partition_join->execute(input_batches, stream);
+  // call distinct execute
+  auto distinct_output_batches = distinct->execute(input_batches, stream);
+  // call partition distinct execute
+  auto partition_distinct_output_batches =
+    partition_distinct->execute(distinct_output_batches, stream);
+  // call partition join sink
+  partition_join->sink(partition_join_output_batches, stream);
+  // call partition distinct sink
+  partition_distinct->sink(partition_distinct_output_batches, stream);
+}
+
+std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_left_delim_join::execute(
+  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches,
+  rmm::cuda_stream_view stream)
+{
+  return input_batches;
+}
+
+void sirius_physical_left_delim_join::sink(
+  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches,
+  rmm::cuda_stream_view stream)
+{
+  auto column_data_scan_output_batches = column_data_scan->execute(input_batches, stream);
+  // call distinct execute
+  auto distinct_output_batches = distinct->execute(input_batches, stream);
+  // call partition distinct execute
+  auto partition_distinct_output_batches =
+    partition_distinct->execute(distinct_output_batches, stream);
+  // call partition join sink
+  column_data_scan->sink(column_data_scan_output_batches, stream);
+  // call partition distinct sink
+  partition_distinct->sink(partition_distinct_output_batches, stream);
+}
+
 }  // namespace op
 }  // namespace sirius
