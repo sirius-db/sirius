@@ -31,7 +31,7 @@ namespace sirius {
 namespace op {
 
 // Helper function to deep copy ExtraOperatorInfo
-duckdb::ExtraOperatorInfo copy_extra_info(const duckdb::ExtraOperatorInfo& src)
+duckdb::ExtraOperatorInfo copy_extra_info_duckdb_scan(const duckdb::ExtraOperatorInfo& src)
 {
   duckdb::ExtraOperatorInfo copy;
   copy.file_filters = src.file_filters;
@@ -52,7 +52,7 @@ sirius_physical_duckdb_scan::sirius_physical_duckdb_scan(sirius_physical_table_s
       table_scan->names,
       table_scan->table_filters ? table_scan->table_filters->Copy() : nullptr,
       table_scan->estimated_cardinality,
-      copy_extra_info(table_scan->extra_info),
+      copy_extra_info_duckdb_scan(table_scan->extra_info),
       table_scan->parameters,
       table_scan->virtual_columns)
 {
