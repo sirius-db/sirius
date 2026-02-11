@@ -312,7 +312,7 @@ TEST_CASE("gpu_execution - limit with filter", "[integration][gpu_execution][lim
 //===----------------------------------------------------------------------===//
 
 TEST_CASE("gpu_execution - two group by key: min max, sum, count of doubles",
-          "[integration_disabled][gpu_execution][aggregate]")
+          "[.][integration_disabled][gpu_execution][aggregate]")
 {
   config_env_guard env;
   duckdb::DuckDB db(get_tpch_db_path().string());
