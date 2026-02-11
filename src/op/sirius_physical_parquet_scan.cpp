@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "op/sirius_physical_duckdb_scan.hpp"
+#include "op/sirius_physical_parquet_scan.hpp"
 
 #include "config.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
@@ -31,7 +31,7 @@ namespace sirius {
 namespace op {
 
 // Helper function to deep copy ExtraOperatorInfo
-duckdb::ExtraOperatorInfo copy_extra_info_duckdb_scan(const duckdb::ExtraOperatorInfo& src)
+duckdb::ExtraOperatorInfo copy_extra_info_parquet_scan(const duckdb::ExtraOperatorInfo& src)
 {
   duckdb::ExtraOperatorInfo copy;
   copy.file_filters = src.file_filters;
@@ -41,8 +41,8 @@ duckdb::ExtraOperatorInfo copy_extra_info_duckdb_scan(const duckdb::ExtraOperato
   return copy;
 }
 
-sirius_physical_duckdb_scan::sirius_physical_duckdb_scan(sirius_physical_table_scan* table_scan)
-  : sirius_physical_duckdb_scan(
+sirius_physical_parquet_scan::sirius_physical_parquet_scan(sirius_physical_table_scan* table_scan)
+  : sirius_physical_parquet_scan(
       table_scan->types,
       table_scan->function,
       table_scan->bind_data ? table_scan->bind_data->Copy() : nullptr,
@@ -52,13 +52,13 @@ sirius_physical_duckdb_scan::sirius_physical_duckdb_scan(sirius_physical_table_s
       table_scan->names,
       table_scan->table_filters ? table_scan->table_filters->Copy() : nullptr,
       table_scan->estimated_cardinality,
-      copy_extra_info_duckdb_scan(table_scan->extra_info),
+      copy_extra_info_parquet_scan(table_scan->extra_info),
       table_scan->parameters,
       table_scan->virtual_columns)
 {
 }
 
-sirius_physical_duckdb_scan::sirius_physical_duckdb_scan(
+sirius_physical_parquet_scan::sirius_physical_parquet_scan(
   duckdb::vector<duckdb::LogicalType> types,
   duckdb::TableFunction function_p,
   duckdb::unique_ptr<duckdb::FunctionData> bind_data_p,
