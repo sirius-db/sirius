@@ -17,9 +17,9 @@
 #pragma once
 
 #include "duckdb/execution/physical_operator.hpp"
+#include "op/sirius_physical_column_data_scan.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_partition.hpp"
-#include "op/sirius_physical_column_data_scan.hpp"
 
 namespace sirius {
 
@@ -78,7 +78,7 @@ class sirius_physical_right_delim_join : public sirius_physical_delim_join {
     duckdb::vector<duckdb::const_reference<sirius_physical_operator>> delim_scans,
     duckdb::idx_t estimated_cardinality,
     duckdb::optional_idx delim_idx);
-    sirius_physical_partition* partition_join;
+  sirius_physical_partition* partition_join;
 
  public:
   void build_pipelines(pipeline::sirius_pipeline& current,
@@ -89,7 +89,7 @@ class sirius_physical_right_delim_join : public sirius_physical_delim_join {
     rmm::cuda_stream_view stream) override;
 
   void sink(const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches,
-      rmm::cuda_stream_view stream) override;
+            rmm::cuda_stream_view stream) override;
 };
 
 class sirius_physical_left_delim_join : public sirius_physical_delim_join {
@@ -104,7 +104,7 @@ class sirius_physical_left_delim_join : public sirius_physical_delim_join {
     duckdb::vector<duckdb::const_reference<sirius_physical_operator>> delim_scans,
     duckdb::idx_t estimated_cardinality,
     duckdb::optional_idx delim_idx);
-    sirius_physical_column_data_scan* column_data_scan;
+  sirius_physical_column_data_scan* column_data_scan;
 
  public:
   void build_pipelines(pipeline::sirius_pipeline& current,
@@ -115,7 +115,7 @@ class sirius_physical_left_delim_join : public sirius_physical_delim_join {
     rmm::cuda_stream_view stream) override;
 
   void sink(const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches,
-      rmm::cuda_stream_view stream) override;
+            rmm::cuda_stream_view stream) override;
 };
 
 }  // namespace op

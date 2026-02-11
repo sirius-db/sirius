@@ -79,7 +79,8 @@ duckdb::vector<duckdb::const_reference<sirius_physical_operator>> sirius_physica
 
 std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_cte::execute(
   const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches,
-  rmm::cuda_stream_view stream) {
+  rmm::cuda_stream_view stream)
+{
   return input_batches;
 }
 

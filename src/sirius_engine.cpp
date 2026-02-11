@@ -789,8 +789,9 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
           }
         }
       } else if (new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
-        auto delim_join     = new_scheduled[i]->get_sink();
-        auto partition_join = delim_join->Cast<op::sirius_physical_right_delim_join>().partition_join;
+        auto delim_join = new_scheduled[i]->get_sink();
+        auto partition_join =
+          delim_join->Cast<op::sirius_physical_right_delim_join>().partition_join;
         auto partition_distinct =
           delim_join->Cast<op::sirius_physical_right_delim_join>().partition_distinct;
         // Find the pipeline containing the join as the first operator
@@ -1027,7 +1028,8 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
         auto delim_join = pipeline->get_sink();
 
         if (pipeline->sink->type == op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
-          auto partition_join = delim_join->Cast<op::sirius_physical_right_delim_join>().partition_join;
+          auto partition_join =
+            delim_join->Cast<op::sirius_physical_right_delim_join>().partition_join;
           SIRIUS_LOG_INFO("  Partition Join next operators:");
           for (auto& next_port : partition_join->get_next_port_after_sink()) {
             SIRIUS_LOG_INFO("    Next Op: {}, Port: '{}' Repo:'{}'",
