@@ -21,6 +21,7 @@
 #include <unistd.h>    // for close
 
 #include <cerrno>
+#include <csignal>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
@@ -29,6 +30,28 @@
 #include <utility>
 
 namespace sirius {
+
+namespace {
+
+// Stored globally so the signal handler can clean up the lock file on abnormal termination.
+std::string g_lock_path;
+
+void cleanup_lock_file(int signum)
+{
+  if (!g_lock_path.empty()) { std::filesystem::remove(g_lock_path); }
+  // Re-raise with default handler so the process terminates with the correct exit status / core.
+  std::signal(signum, SIG_DFL);
+  std::raise(signum);
+}
+
+void install_signal_handlers()
+{
+  std::signal(SIGTERM, cleanup_lock_file);
+  std::signal(SIGABRT, cleanup_lock_file);
+  std::signal(SIGSEGV, cleanup_lock_file);
+}
+
+}  // namespace
 
 extension_lock::extension_lock(const std::string& extension_name, const std::string& lock_prefix)
   : lock_path_(lock_prefix + "/" + extension_name + ".lock")
@@ -53,6 +76,9 @@ extension_lock::extension_lock(const std::string& extension_name, const std::str
       throw std::runtime_error("Failed to lock file: " + std::string(std::strerror(err)));
     }
   }
+
+  g_lock_path = lock_path_;
+  install_signal_handlers();
 }
 
 extension_lock::~extension_lock()
@@ -61,6 +87,7 @@ extension_lock::~extension_lock()
     flock(fd_, LOCK_UN);
     close(fd_);
     std::filesystem::remove(lock_path_);
+    g_lock_path.clear();
   }
 }
 
