@@ -24,8 +24,6 @@
 #include <cudf/binaryop.hpp>
 #include <cudf/unary.hpp>
 
-#include <iostream>
-
 namespace sirius {
 namespace op {
 

@@ -42,6 +42,7 @@ host_table_chunk_reader::column_reader::column_reader(
   }
   size       = static_cast<size_t>(node.size);
   null_count = static_cast<size_t>(node.null_count);
+  cudf_type  = node.type.id();
   if (node.null_mask_offset < 0) { null_count = 0; }
 
   data_accessor.initialize(static_cast<size_t>(node.data_offset), allocation);
@@ -97,8 +98,63 @@ void host_table_chunk_reader::column_reader::copy_fixed_width(
   // Do the data copy
   auto const type_size =
     static_cast<size_t>(duckdb::GetTypeIdSize(vector.GetType().InternalType()));
+
+  // Determine the element size of the source cudf column
+  size_t cudf_elem_size = 0;
+  switch (cudf_type) {
+    case cudf::type_id::INT8:
+    case cudf::type_id::UINT8: cudf_elem_size = 1; break;
+    case cudf::type_id::INT16:
+    case cudf::type_id::UINT16: cudf_elem_size = 2; break;
+    case cudf::type_id::INT32:
+    case cudf::type_id::UINT32:
+    case cudf::type_id::FLOAT32:
+    case cudf::type_id::DECIMAL32: cudf_elem_size = 4; break;
+    case cudf::type_id::INT64:
+    case cudf::type_id::UINT64:
+    case cudf::type_id::FLOAT64:
+    case cudf::type_id::DECIMAL64: cudf_elem_size = 8; break;
+    case cudf::type_id::DECIMAL128: cudf_elem_size = 16; break;
+    default: cudf_elem_size = type_size; break;
+  }
+
   auto* dest_ptr = duckdb::FlatVector::GetData(vector);
-  data_accessor.memcpy_to(allocation, dest_ptr, count * type_size);
+
+  if (cudf_elem_size == type_size) {
+    // Fast path: sizes match, bulk memcpy
+    data_accessor.memcpy_to(allocation, dest_ptr, count * type_size);
+  } else if (cudf_elem_size < type_size) {
+    // Widening path: cudf produced a narrower type than DuckDB expects
+    // (e.g. cudf COUNT → INT32, DuckDB COUNT → BIGINT/INT64,
+    //  or cudf SUM → DECIMAL64, DuckDB SUM → DECIMAL(38,x)/INT128)
+    // Read source data at native cudf size, then sign-extend each element.
+    // This works on little-endian: low bytes are first, high bytes are extended.
+    bool is_signed = (cudf_type != cudf::type_id::UINT8 && cudf_type != cudf::type_id::UINT16 &&
+                      cudf_type != cudf::type_id::UINT32 && cudf_type != cudf::type_id::UINT64);
+
+    std::vector<uint8_t> temp(count * cudf_elem_size);
+    data_accessor.memcpy_to(allocation, temp.data(), count * cudf_elem_size);
+
+    // Zero-fill destination, then copy each element with optional sign extension
+    std::memset(dest_ptr, 0, count * type_size);
+    for (size_t i = 0; i < count; ++i) {
+      auto* src_elem = temp.data() + i * cudf_elem_size;
+      auto* dst_elem = dest_ptr + i * type_size;
+      std::memcpy(dst_elem, src_elem, cudf_elem_size);
+      if (is_signed && (src_elem[cudf_elem_size - 1] & 0x80)) {
+        // Sign-extend: fill high bytes with 0xFF for negative values
+        std::memset(dst_elem + cudf_elem_size, 0xFF, type_size - cudf_elem_size);
+      }
+    }
+  } else {
+    // Narrowing: cudf type is wider than DuckDB type — should not normally happen.
+    // Truncate each element to the destination size (little-endian: keep low bytes).
+    std::vector<uint8_t> temp(count * cudf_elem_size);
+    data_accessor.memcpy_to(allocation, temp.data(), count * cudf_elem_size);
+    for (size_t i = 0; i < count; ++i) {
+      std::memcpy(dest_ptr + i * type_size, temp.data() + i * cudf_elem_size, type_size);
+    }
+  }
 
   // Do the validity mask copy, if necessary
   if (null_count != 0) {

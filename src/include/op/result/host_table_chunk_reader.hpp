@@ -60,8 +60,9 @@ class host_table_chunk_reader {
    * validity masks
    */
   struct column_reader {
-    size_t size{0};        ///< The number of rows in the column
-    size_t null_count{0};  ///< The number of null values in the column
+    size_t size{0};                                 ///< The number of rows in the column
+    size_t null_count{0};                           ///< The number of null values in the column
+    cudf::type_id cudf_type{cudf::type_id::EMPTY};  ///< Source cudf type for element size detection
     memory::multiple_blocks_allocation_accessor<uint8_t>
       data_accessor;  ///< Accessor to the column data in the multiple blocks allocation
     memory::multiple_blocks_allocation_accessor<uint8_t>
