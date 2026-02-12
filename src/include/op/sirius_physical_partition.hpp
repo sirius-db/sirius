@@ -68,7 +68,7 @@ class sirius_physical_partition : public sirius_physical_operator {
   std::unique_ptr<operator_data> execute(std::unique_ptr<operator_data> input_data,
                                          rmm::cuda_stream_view stream) override;
 
-  void sink(std::unique_ptr<operator_data> input_data, rmm::cuda_stream_view stream) override;
+  void sink(std::shared_ptr<operator_data> input_data, rmm::cuda_stream_view stream) override;
 
  private:
   void get_partition_keys_and_type(sirius_physical_operator* op, bool is_build = false);

@@ -213,7 +213,7 @@ class sirius_physical_operator {
   virtual duckdb::unique_ptr<duckdb::GlobalSinkState> get_global_sink_state(
     duckdb::ClientContext& context) const;
 
-  virtual void sink(std::unique_ptr<operator_data> input_data, rmm::cuda_stream_view stream);
+  virtual void sink(std::shared_ptr<operator_data> input_data, rmm::cuda_stream_view stream);
 
   virtual bool is_sink() const { return false; }
 

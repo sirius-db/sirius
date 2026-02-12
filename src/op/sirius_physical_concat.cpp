@@ -147,7 +147,7 @@ std::unique_ptr<operator_data> sirius_physical_concat::execute(
   return std::make_unique<partitioned_operator_data>(output_batches, partition_idx);
 }
 
-void sirius_physical_concat::sink(std::unique_ptr<operator_data> output_data,
+void sirius_physical_concat::sink(std::shared_ptr<operator_data> output_data,
                                   rmm::cuda_stream_view stream)
 {
   auto partitioned_output_data = dynamic_cast<const partitioned_operator_data*>(output_data.get());

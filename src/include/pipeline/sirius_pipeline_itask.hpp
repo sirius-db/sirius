@@ -70,7 +70,7 @@ class sirius_pipeline_itask : public parallel::itask {
    *
    * @param output_batches The data batches to publish (typically the result of compute_task())
    */
-  virtual void publish_output(std::unique_ptr<op::operator_data> output_data,
+  virtual void publish_output(std::shared_ptr<op::operator_data> output_data,
                               rmm::cuda_stream_view stream) = 0;
 
   /**

@@ -125,8 +125,18 @@ const sirius_pipeline* gpu_pipeline_task::get_pipeline() const
 
 std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_stream_view stream)
 {
-  auto& local_state               = _local_state->cast<gpu_pipeline_task_local_state>();
-  auto operator_input_output_data = std::move(local_state._input_data);
+  auto& local_state                       = _local_state->cast<gpu_pipeline_task_local_state>();
+  auto operator_input_output_data_batches = local_state._input_data->get_data_batches();
+  std::unique_ptr<op::operator_data> operator_input_output_data;
+  if (dynamic_cast<op::partitioned_operator_data*>(local_state._input_data.get())) {
+    auto partition_idx = dynamic_cast<op::partitioned_operator_data*>(local_state._input_data.get())
+                           ->get_partition_idx();
+    operator_input_output_data = std::make_unique<op::partitioned_operator_data>(
+      std::move(operator_input_output_data_batches), partition_idx);
+  } else {
+    operator_input_output_data =
+      std::make_unique<op::operator_data>(std::move(operator_input_output_data_batches));
+  }
 
   for (auto& op :
        _global_state->cast<gpu_pipeline_task_global_state>()._pipeline.get()->get_operators()) {
@@ -142,13 +152,13 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
   return std::move(operator_input_output_data);
 }
 
-void gpu_pipeline_task::publish_output(std::unique_ptr<op::operator_data> output_data,
+void gpu_pipeline_task::publish_output(std::shared_ptr<op::operator_data> output_data,
                                        rmm::cuda_stream_view stream)
 {
   auto sink_operators =
     _global_state->cast<gpu_pipeline_task_global_state>()._pipeline.get()->get_sink();
   if (sink_operators) {
-    sink_operators.get()->sink(std::move(output_data), stream);
+    sink_operators.get()->sink(output_data, stream);
   } else {
     throw std::runtime_error("Sink operator not found");
   }

@@ -323,7 +323,7 @@ class parquet_scan_task : public pipeline::sirius_pipeline_itask {
    * @param[in] output_batches The data batches produced by this task to be published.
    * @param[in] stream The CUDA stream on which to perform memory operations (ignored in this task).
    */
-  void publish_output(std::unique_ptr<op::operator_data> output_data,
+  void publish_output(std::shared_ptr<op::operator_data> output_data,
                       rmm::cuda_stream_view stream) override;
 
   /**

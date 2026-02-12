@@ -87,7 +87,7 @@ class sirius_physical_right_delim_join : public sirius_physical_delim_join {
   std::unique_ptr<operator_data> execute(std::unique_ptr<operator_data> input_data,
                                          rmm::cuda_stream_view stream) override;
 
-  void sink(std::unique_ptr<operator_data> input_data, rmm::cuda_stream_view stream) override;
+  void sink(std::shared_ptr<operator_data> input_data, rmm::cuda_stream_view stream) override;
 };
 
 class sirius_physical_left_delim_join : public sirius_physical_delim_join {
@@ -111,7 +111,7 @@ class sirius_physical_left_delim_join : public sirius_physical_delim_join {
   std::unique_ptr<operator_data> execute(std::unique_ptr<operator_data> input_data,
                                          rmm::cuda_stream_view stream) override;
 
-  void sink(std::unique_ptr<operator_data> input_data, rmm::cuda_stream_view stream) override;
+  void sink(std::shared_ptr<operator_data> input_data, rmm::cuda_stream_view stream) override;
 };
 
 }  // namespace op

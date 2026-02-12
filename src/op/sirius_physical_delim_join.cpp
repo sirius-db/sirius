@@ -158,20 +158,18 @@ std::unique_ptr<operator_data> sirius_physical_right_delim_join::execute(
   return input_data;
 }
 
-void sirius_physical_right_delim_join::sink(std::unique_ptr<operator_data> input_data,
+void sirius_physical_right_delim_join::sink(std::shared_ptr<operator_data> input_data,
                                             rmm::cuda_stream_view stream)
 {
-  // call partition join execute
+  // Copy data for each consumer (execute takes unique_ptr)
   auto partition_join_output = partition_join->execute(
     std::make_unique<operator_data>(input_data->get_data_batches()), stream);
-  // call distinct execute
-  auto distinct_output = distinct->execute(std::move(input_data), stream);
-  // call partition distinct execute
+  auto distinct_output =
+    distinct->execute(std::make_unique<operator_data>(input_data->get_data_batches()), stream);
   auto partition_distinct_output = partition_distinct->execute(std::move(distinct_output), stream);
-  // call partition join sink
-  partition_join->sink(std::move(partition_join_output), stream);
-  // call partition distinct sink
-  partition_distinct->sink(std::move(partition_distinct_output), stream);
+  partition_join->sink(std::shared_ptr<operator_data>(std::move(partition_join_output)), stream);
+  partition_distinct->sink(std::shared_ptr<operator_data>(std::move(partition_distinct_output)),
+                           stream);
 }
 
 std::unique_ptr<operator_data> sirius_physical_left_delim_join::execute(
@@ -180,19 +178,18 @@ std::unique_ptr<operator_data> sirius_physical_left_delim_join::execute(
   return input_data;
 }
 
-void sirius_physical_left_delim_join::sink(std::unique_ptr<operator_data> input_data,
+void sirius_physical_left_delim_join::sink(std::shared_ptr<operator_data> input_data,
                                            rmm::cuda_stream_view stream)
 {
-  // call distinct execute
-  auto distinct_output = distinct->execute(std::move(input_data), stream);
-  // call column data scan execute
-  auto column_data_scan_output = column_data_scan->execute(std::move(distinct_output), stream);
-  // call partition distinct execute
-  auto partition_distinct_output = partition_distinct->execute(std::move(distinct_output), stream);
-  // call partition join sink
-  column_data_scan->sink(std::move(column_data_scan_output), stream);
-  // call partition distinct sink
-  partition_distinct->sink(std::move(partition_distinct_output), stream);
+  auto distinct_output =
+    distinct->execute(std::make_unique<operator_data>(input_data->get_data_batches()), stream);
+  auto column_data_scan_output   = column_data_scan->execute(std::move(distinct_output), stream);
+  auto partition_distinct_output = partition_distinct->execute(
+    std::make_unique<operator_data>(input_data->get_data_batches()), stream);
+  column_data_scan->sink(std::shared_ptr<operator_data>(std::move(column_data_scan_output)),
+                         stream);
+  partition_distinct->sink(std::shared_ptr<operator_data>(std::move(partition_distinct_output)),
+                           stream);
 }
 
 }  // namespace op

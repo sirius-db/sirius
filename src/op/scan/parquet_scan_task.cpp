@@ -352,11 +352,11 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
     std::vector<std::shared_ptr<cucascade::data_batch>>{data_batch});
 }
 
-void parquet_scan_task::publish_output(std::unique_ptr<op::operator_data> output_data,
+void parquet_scan_task::publish_output(std::shared_ptr<op::operator_data> output_data,
                                        rmm::cuda_stream_view /* stream */)
 {
-  for (auto& batch : output_data->get_data_batches()) {
-    _data_repo->add_data_batch(std::move(batch));
+  for (const auto& batch : output_data->get_data_batches()) {
+    _data_repo->add_data_batch(batch);
   }
 }
 

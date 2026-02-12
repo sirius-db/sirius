@@ -179,7 +179,7 @@ sirius_physical_operator::port* sirius_physical_operator::get_port(std::string_v
   return it->second.get();
 }
 
-void sirius_physical_operator::sink(std::unique_ptr<operator_data> output_data,
+void sirius_physical_operator::sink(std::shared_ptr<operator_data> output_data,
                                     rmm::cuda_stream_view stream)
 {
   for (auto& batch : output_data->get_data_batches()) {

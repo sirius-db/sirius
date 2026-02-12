@@ -155,7 +155,7 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
    *
    * @param output_batches The data batches to publish
    */
-  void publish_output(std::unique_ptr<op::operator_data> output_data,
+  void publish_output(std::shared_ptr<op::operator_data> output_data,
                       rmm::cuda_stream_view stream) override;
 
   /**

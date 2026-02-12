@@ -149,7 +149,7 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(
   return std::make_unique<operator_data>(partitioned_results);
 }
 
-void sirius_physical_partition::sink(std::unique_ptr<operator_data> input_data,
+void sirius_physical_partition::sink(std::shared_ptr<operator_data> input_data,
                                      rmm::cuda_stream_view stream)
 {
   const auto& input_batches = input_data->get_data_batches();

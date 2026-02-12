@@ -563,12 +563,12 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
   return std::make_unique<op::operator_data>(std::vector<std::shared_ptr<cucascade::data_batch>>{});
 }
 
-void duckdb_scan_task::publish_output(std::unique_ptr<op::operator_data> output_data,
+void duckdb_scan_task::publish_output(std::shared_ptr<op::operator_data> output_data,
                                       rmm::cuda_stream_view stream)
 {
-  std::for_each(std::make_move_iterator(output_data->get_data_batches().begin()),
-                std::make_move_iterator(output_data->get_data_batches().end()),
-                [this](auto batch) { this->_data_repo->add_data_batch(std::move(batch)); });
+  for (const auto& batch : output_data->get_data_batches()) {
+    this->_data_repo->add_data_batch(batch);
+  }
 }
 
 }  // namespace sirius::op::scan

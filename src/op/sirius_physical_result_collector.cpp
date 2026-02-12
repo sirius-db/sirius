@@ -107,7 +107,7 @@ duckdb::unique_ptr<duckdb::QueryResult> sirius_physical_materialized_collector::
     statement_type, properties, names, std::move(result_collection), props);
 }
 
-void sirius_physical_materialized_collector::sink(std::unique_ptr<operator_data> input_data,
+void sirius_physical_materialized_collector::sink(std::shared_ptr<operator_data> input_data,
                                                   rmm::cuda_stream_view stream)
 {
   const auto& input_batches     = input_data->get_data_batches();
