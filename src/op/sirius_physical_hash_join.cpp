@@ -265,8 +265,7 @@ void sirius_physical_hash_join::build_pipelines(pipeline::sirius_pipeline& curre
   sirius_physical_hash_join::build_join_pipelines(current, meta_pipeline, *this);
 }
 
-std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>>
-sirius_physical_hash_join::get_next_task_input_batch()
+std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_data()
 {
   size_t batch_index = 0;
   {
@@ -290,11 +289,11 @@ sirius_physical_hash_join::get_next_task_input_batch()
       batch_index = current_partition_index;
       current_partition_index++;
     } else {
-      return std::nullopt;
+      return nullptr;
     }
   }
 
-  std::vector<std::shared_ptr<::cucascade::data_batch>> input_batch;
+  std::vector<std::shared_ptr<cucascade::data_batch>> input_batch;
   input_batch.reserve(2);
   size_t counter = 0;
   for (size_t partition_idx = 0; partition_idx < left_batch_ids.size(); partition_idx++) {
@@ -317,7 +316,7 @@ sirius_physical_hash_join::get_next_task_input_batch()
             input_batch.push_back(ports["build"]->repo->get_data_batch_by_id(
               right_batch_id, cucascade::batch_state::task_created, partition_idx));
           }
-          return input_batch;
+          return std::make_unique<operator_data>(input_batch);
         }
         right_counter++;
         counter++;
@@ -326,7 +325,7 @@ sirius_physical_hash_join::get_next_task_input_batch()
     }
   }
   if (input_batch.size() == 0) {
-    return std::nullopt;
+    return nullptr;
   } else {
     throw std::runtime_error("Expected to have returned already or received nothing, but got " +
                              std::to_string(input_batch.size()) + " input batches for hash join");
@@ -399,13 +398,14 @@ static join_keys_result prepare_join_keys(
   return result;
 }
 
-std::vector<std::shared_ptr<::cucascade::data_batch>> sirius_physical_hash_join::execute(
-  const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches,
+std::unique_ptr<operator_data> sirius_physical_hash_join::execute(
+  const operator_data& input_data,
   rmm::cuda_stream_view stream)
 {
+  const auto& input_batches = input_data.get_data_batches();
   if (input_batches.size() != 2) {
     throw std::runtime_error("Expected 2 input batches for hash join, got " +
-                             std::to_string(input_batches.size()));
+                             std::to_string(input_batches.size()) + " input batches");
   }
   if (!is_equality_join) {
     throw std::runtime_error("Unsupported non-equality join of type type: " +
@@ -495,8 +495,8 @@ std::vector<std::shared_ptr<::cucascade::data_batch>> sirius_physical_hash_join:
     }
 
     auto output_cudf_table = std::make_unique<cudf::table>(std::move(out_cols), stream);
-    return std::vector<std::shared_ptr<cucascade::data_batch>>{
-      make_data_batch(std::move(output_cudf_table), *input_batches[0]->get_memory_space())};
+    return std::make_unique<operator_data>(std::vector<std::shared_ptr<::cucascade::data_batch>>{
+      make_data_batch(std::move(output_cudf_table), *input_batches[0]->get_memory_space())});
 
     // } else if (join_type == duckdb::JoinType::ANTI) {
     //   return std::vector<std::shared_ptr<::cucascade::data_batch>>{};

@@ -117,15 +117,15 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
 
 bool sirius_physical_partition::is_build_partition() { return _is_build; }
 
-operator_data sirius_physical_partition::execute(const operator_data& input_data,
-                                                 rmm::cuda_stream_view stream)
+std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator_data& input_data,
+                                                                 rmm::cuda_stream_view stream)
 {
   const auto& input_batches = input_data.get_data_batches();
   if (input_batches.size() != 1) {
     throw std::runtime_error("We expect only one input batch for partition operator");
   }
 
-  if (_num_partitions < 2) { return input_data; }
+  if (_num_partitions < 2) { return std::make_unique<operator_data>(input_data); }
 
   auto input_batch = input_batches[0];
   std::vector<std::shared_ptr<cucascade::data_batch>> partitioned_results;
@@ -146,7 +146,7 @@ operator_data sirius_physical_partition::execute(const operator_data& input_data
       throw std::runtime_error("Unsupported partition type: " +
                                partition_type_to_string(_partition_type));
   }
-  return operator_data(partitioned_results);
+  return std::make_unique<operator_data>(partitioned_results);
 }
 
 void sirius_physical_partition::sink(const operator_data& input_data, rmm::cuda_stream_view stream)

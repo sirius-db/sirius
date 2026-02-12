@@ -59,7 +59,7 @@ class sirius_physical_merge_sort : public sirius_physical_operator {
   bool sink_order_dependent() const override { return false; }
 
  public:
-  operator_data execute(const operator_data& input_data,
+  std::unique_ptr<operator_data> execute(const operator_data& input_data,
                         rmm::cuda_stream_view stream = cudf::get_default_stream()) override;
 
   //! Set the final output projection (applied after merge, to remove sort-key-only columns)

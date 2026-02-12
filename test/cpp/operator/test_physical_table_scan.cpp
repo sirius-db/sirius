@@ -128,9 +128,9 @@ TEMPLATE_TEST_CASE(
 
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
   auto outputs = table_scan.execute(operator_data(inputs), cudf::get_default_stream());
-  REQUIRE(outputs.get_data_batches().size() == 1);
+  REQUIRE(outputs->get_data_batches().size() == 1);
   auto output_table =
-    outputs.get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
+    outputs->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
   auto out_view    = output_table.view();
   auto host_vals   = copy_column_to_host<typename Traits::type>(out_view.column(1));
   auto host_filter = copy_column_to_host<int64_t>(out_view.column(0));
@@ -199,9 +199,9 @@ TEST_CASE("sirius_physical_table_scan with no filters passes through data", "[ph
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
   auto outputs = table_scan.execute(operator_data(inputs), cudf::get_default_stream());
 
-  REQUIRE(outputs.get_data_batches().size() == 1);
+  REQUIRE(outputs->get_data_batches().size() == 1);
   auto output_table =
-    outputs.get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
+    outputs->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
   auto out_view = output_table.view();
 
   // Verify all data passes through unchanged
@@ -271,9 +271,9 @@ TEST_CASE("sirius_physical_table_scan with multiple filters", "[physical_table_s
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
   auto outputs = table_scan.execute(operator_data(inputs), cudf::get_default_stream());
 
-  REQUIRE(outputs.get_data_batches().size() == 1);
+  REQUIRE(outputs->get_data_batches().size() == 1);
   auto output_table =
-    outputs.get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
+    outputs->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
   auto out_view = output_table.view();
 
   auto host_col0 = copy_column_to_host<int64_t>(out_view.column(0));
@@ -341,9 +341,9 @@ TEST_CASE("sirius_physical_table_scan filters all rows", "[physical_table_scan]"
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
   auto outputs = table_scan.execute(operator_data(inputs), cudf::get_default_stream());
 
-  REQUIRE(outputs.get_data_batches().size() == 1);
+  REQUIRE(outputs->get_data_batches().size() == 1);
   auto table =
-    outputs.get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
+    outputs->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
   auto view = table.view();
   REQUIRE(view.num_columns() == 2);
   REQUIRE(view.num_rows() == 0);

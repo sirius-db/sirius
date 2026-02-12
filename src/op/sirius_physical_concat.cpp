@@ -66,7 +66,7 @@ sirius_physical_concat::sirius_physical_concat(duckdb::vector<duckdb::LogicalTyp
   }
 }
 
-std::optional<operator_data> sirius_physical_concat::get_next_task_input_data()
+std::unique_ptr<operator_data> sirius_physical_concat::get_next_task_input_data()
 {
   // iterate through all the partition and pull the
   std::lock_guard<std::mutex> lg(lock);
@@ -107,13 +107,16 @@ std::optional<operator_data> sirius_physical_concat::get_next_task_input_data()
         input_batch.push_back(std::move(popped_batch));
       }
     }
-    if (input_batch.size() != 0) { return partitioned_operator_data(std::move(input_batch), i); }
+    if (input_batch.size() != 0) { 
+      printf("sirius_physical_concat::get_next_task_input_data: returning partitioned_operator_data with %zu batches for partition %zu\n", input_batch.size(), i);
+      return std::make_unique<partitioned_operator_data>(std::move(input_batch), i); }
   }
-  return std::nullopt;
+  printf("sirius_physical_concat::get_next_task_input_data: returning nullptr\n");
+  return nullptr;
 }
 
-operator_data sirius_physical_concat::execute(const operator_data& input_data,
-                                              rmm::cuda_stream_view stream)
+std::unique_ptr<operator_data> sirius_physical_concat::execute(const operator_data& input_data,
+                                                              rmm::cuda_stream_view stream)
 {
   auto partitioned_input_data = dynamic_cast<const partitioned_operator_data*>(&input_data);
   if (partitioned_input_data == nullptr) {
@@ -128,7 +131,7 @@ operator_data sirius_physical_concat::execute(const operator_data& input_data,
     if (batch) { valid_batches.push_back(batch); }
   }
   if (valid_batches.empty()) {
-    return partitioned_operator_data(std::vector<std::shared_ptr<cucascade::data_batch>>{},
+    return std::make_unique<partitioned_operator_data>(std::vector<std::shared_ptr<cucascade::data_batch>>{},
                                      partition_idx);
   }
 
@@ -143,7 +146,7 @@ operator_data sirius_physical_concat::execute(const operator_data& input_data,
     auto merged_batch = gpu_merge_impl::concat(valid_batches, stream, *space);
     output_batches.push_back(std::move(merged_batch));
   }
-  return partitioned_operator_data(output_batches, partition_idx);
+  return std::make_unique<partitioned_operator_data>(output_batches, partition_idx);
 }
 
 void sirius_physical_concat::sink(const operator_data& output_data, rmm::cuda_stream_view stream)

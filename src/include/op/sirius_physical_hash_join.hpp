@@ -100,12 +100,9 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   void build_pipelines(pipeline::sirius_pipeline& current,
                        pipeline::sirius_meta_pipeline& meta_pipeline) override;
 
-  std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>> get_next_task_input_batch()
-    override;
+  std::unique_ptr<operator_data> get_next_task_input_data() override;
 
-  std::vector<std::shared_ptr<::cucascade::data_batch>> execute(
-    const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches,
-    rmm::cuda_stream_view stream = cudf::get_default_stream()) override;
+  std::unique_ptr<operator_data> execute(const operator_data& input_data, rmm::cuda_stream_view stream) override;
 
   //! Join Keys statistics (optional)
   duckdb::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> join_stats;

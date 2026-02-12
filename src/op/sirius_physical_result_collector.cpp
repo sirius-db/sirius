@@ -53,10 +53,10 @@ sirius_physical_result_collector::sirius_physical_result_collector(
   this->types = data.prepared->types;
 }
 
-operator_data sirius_physical_result_collector::execute(const operator_data& input_data,
-                                                        rmm::cuda_stream_view stream)
+std::unique_ptr<operator_data> sirius_physical_result_collector::execute(const operator_data& input_data,
+                                                                        rmm::cuda_stream_view stream)
 {
-  return input_data;
+  return std::make_unique<operator_data>(input_data);
 }
 
 duckdb::vector<duckdb::const_reference<sirius_physical_operator>>
