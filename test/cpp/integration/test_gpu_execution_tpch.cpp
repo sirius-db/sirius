@@ -475,6 +475,59 @@ TEST_CASE("gpu_execution - order by with varchar column",
   std::cerr << "VARCHAR order by: " << gpu_result->RowCount() << " rows OK" << std::endl;
 }
 
+//===----------------------------------------------------------------------===//
+// Cast to decimal tests
+//===----------------------------------------------------------------------===//
+
+TEST_CASE("gpu_execution - cast integer to decimal preserves scale",
+          "[integration][gpu_execution][cast][decimal]")
+{
+  config_env_guard env;
+  duckdb::DuckDB db(get_tpch_db_path().string());
+  duckdb::Connection con(db);
+  compare_gpu_vs_cpu(con,
+                     "select n_nationkey, cast(n_nationkey as Decimal(18,2)) as d from nation;");
+}
+
+TEST_CASE("gpu_execution - cast integer to decimal with aggregation",
+          "[integration][gpu_execution][cast][decimal]")
+{
+  config_env_guard env;
+  duckdb::DuckDB db(get_tpch_db_path().string());
+  duckdb::Connection con(db);
+  compare_gpu_vs_cpu(con,
+                     "select n_regionkey, max(cast(n_nationkey as Decimal(18,2))) as max_d "
+                     "from nation group by n_regionkey;");
+}
+
+TEST_CASE("gpu_execution - cast to decimal different scales",
+          "[integration][gpu_execution][cast][decimal]")
+{
+  config_env_guard env;
+  duckdb::DuckDB db(get_tpch_db_path().string());
+  duckdb::Connection con(db);
+  compare_gpu_vs_cpu(con,
+                     "select cast(n_nationkey as Decimal(9,0)) as d0, "
+                     "cast(n_nationkey as Decimal(9,4)) as d4 from nation;");
+}
+
+// Disabled: avg() in grouped aggregates not yet supported (separate PR)
+TEST_CASE("gpu_execution - issue 227 cast decimal with avg and group by",
+          "[.][integration_disabled][gpu_execution][cast][decimal]")
+{
+  config_env_guard env;
+  duckdb::DuckDB db(get_tpch_db_path().string());
+  duckdb::Connection con(db);
+  compare_gpu_vs_cpu(con,
+                     "select avg(n_regionkey), avg(n_nationkey), n_name, "
+                     "max(cast(n_nationkey as Decimal(18,2))) "
+                     "from nation group by n_regionkey, n_name;");
+}
+
+//===----------------------------------------------------------------------===//
+// Top N / Join tests (disabled)
+//===----------------------------------------------------------------------===//
+
 TEST_CASE("gpu_execution - top n", "[.][integration_disabled][gpu_execution][top_n]")
 {
   duckdb::Connection con(get_shared_db());
