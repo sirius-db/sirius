@@ -30,6 +30,7 @@
 
 using namespace duckdb;
 using namespace sirius::op;
+using sirius::op::operator_data;
 using namespace cucascade;
 using namespace cucascade::memory;
 
@@ -135,18 +136,18 @@ TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with single 
   sirius_physical_partition partitioner(
     std::move(partitioner_types), estimated_cardinality, &grouped_aggregator, false);
 
-  auto outputs = partitioner.execute({input_batch}, default_stream());
+  auto outputs = partitioner.execute(operator_data({input_batch}), default_stream());
 
   std::size_t partition_size = 10000000;  // from sirius_physical_partition.hpp
 
   std::size_t expected_num_partitions =
     (estimated_cardinality + partition_size - 1) / partition_size;
 
-  REQUIRE(outputs.size() == expected_num_partitions);
+  REQUIRE(outputs.get_data_batches().size() == expected_num_partitions);
 
   // count the number of rows in each output and make sure it's the same and the initial inputs
   std::size_t total_num_rows = 0;
-  for (auto& output : outputs) {
+  for (auto& output : outputs.get_data_batches()) {
     total_num_rows += output->get_data()->cast<gpu_table_representation>().get_table().num_rows();
   }
   REQUIRE(total_num_rows == num_values);
@@ -258,18 +259,18 @@ TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with two par
   sirius_physical_partition partitioner(
     std::move(partitioner_types), estimated_cardinality, &grouped_aggregator, false);
 
-  auto outputs = partitioner.execute({input_batch}, default_stream());
+  auto outputs = partitioner.execute(operator_data({input_batch}), default_stream());
 
   std::size_t partition_size = 10000000;  // from sirius_physical_partition.hpp
 
   std::size_t expected_num_partitions =
     (estimated_cardinality + partition_size - 1) / partition_size;
 
-  REQUIRE(outputs.size() == expected_num_partitions);
+  REQUIRE(outputs.get_data_batches().size() == expected_num_partitions);
 
   // count the number of rows in each output and make sure it's the same and the initial inputs
   std::size_t total_num_rows = 0;
-  for (auto& output : outputs) {
+  for (auto& output : outputs.get_data_batches()) {
     std::size_t num_rows_out =
       output->get_data()->cast<gpu_table_representation>().get_table().num_rows();
     REQUIRE(num_rows_out % prime_repeater ==
@@ -329,8 +330,11 @@ TEST_CASE(
   sirius_physical_partition partitioner(
     std::move(partitioner_types), estimated_cardinality, &grouped_aggregator, false);
 
-  auto outputs = partitioner.execute({input_batch}, default_stream());
-  REQUIRE(outputs.size() == 1);
-  REQUIRE(outputs[0]->get_data()->cast<gpu_table_representation>().get_table().num_rows() ==
-          num_values);
+  auto outputs = partitioner.execute(operator_data({input_batch}), default_stream());
+  REQUIRE(outputs.get_data_batches().size() == 1);
+  REQUIRE(outputs.get_data_batches()[0]
+            ->get_data()
+            ->cast<gpu_table_representation>()
+            .get_table()
+            .num_rows() == num_values);
 }

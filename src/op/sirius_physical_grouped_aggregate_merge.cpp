@@ -155,8 +155,7 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
   has_avg            = cudf_defs.has_avg;
 }
 
-std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>>
-sirius_physical_grouped_aggregate_merge::get_next_task_input_batch()
+std::optional<operator_data> sirius_physical_grouped_aggregate_merge::get_next_task_input_data()
 {
   // we need to lock, then pull all the batches from one partition and return them, and increment
   // the partition index
@@ -174,24 +173,23 @@ sirius_physical_grouped_aggregate_merge::get_next_task_input_batch()
       }
     }
     current_partition_index++;
-    return input_batch;
+    return operator_data(input_batch);
   } else {
     return std::nullopt;
   }
 }
 
-std::vector<std::shared_ptr<::cucascade::data_batch>>
-sirius_physical_grouped_aggregate_merge::execute(
-  const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches,
-  rmm::cuda_stream_view stream)
+operator_data sirius_physical_grouped_aggregate_merge::execute(const operator_data& input_data,
+                                                               rmm::cuda_stream_view stream)
 {
-  if (input_batches.empty()) {
+  const auto& input_batches = input_data.get_data_batches();
+  if (input_batches.size() == 0) {
     throw std::runtime_error(
       "We expect at least one input batch for grouped aggregate merge operator");
   }
 
   // Fast path: single batch with no AVG needs no processing
-  if (input_batches.size() == 1 && !has_avg) { return input_batches; }
+  if (input_batches.size() == 1 && !has_avg) { return input_data; }
 
   // Merge multiple batches, or use single batch directly if only one
   std::shared_ptr<::cucascade::data_batch> merged;
@@ -206,7 +204,7 @@ sirius_physical_grouped_aggregate_merge::execute(
   }
 
   // If no AVG, return merged result directly
-  if (!has_avg) { return {merged}; }
+  if (!has_avg) { return operator_data({merged}); }
 
   // Post-merge AVG projection: compute SUM/COUNT for each AVG aggregate.
   // Release ownership of the merged table's columns so we can move (not copy) them.
@@ -263,7 +261,7 @@ sirius_physical_grouped_aggregate_merge::execute(
 
   auto output_table = std::make_unique<cudf::table>(std::move(output_cols), stream, mr);
   auto result       = sirius::make_data_batch(std::move(output_table), *space);
-  return {result};
+  return operator_data({result});
 }
 }  // namespace op
 }  // namespace sirius

@@ -304,11 +304,13 @@ std::unique_ptr<cudf::column> make_avg_column(const cudf::column_view& sum_view,
 
 }  // namespace
 
-std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_ungrouped_aggregate::execute(
-  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches,
-  rmm::cuda_stream_view stream)
+operator_data sirius_physical_ungrouped_aggregate::execute(const operator_data& input_data,
+                                                           rmm::cuda_stream_view stream)
 {
-  if (aggregates.empty()) { return {}; }
+  const auto& input_batches = input_data.get_data_batches();
+  if (aggregates.empty()) {
+    return operator_data(std::vector<std::shared_ptr<cucascade::data_batch>>{});
+  }
 
   auto layout = build_aggregate_layout(aggregates);
   std::vector<std::shared_ptr<cucascade::data_batch>> outputs;
@@ -378,7 +380,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_ungrouped_ag
     outputs.push_back(std::make_shared<cucascade::data_batch>(batch_id, std::move(output_data)));
   }
 
-  return outputs;
+  return operator_data(outputs);
 }
 
 // Helper to deep copy Expression vector (same as in grouped_aggregate)
@@ -420,22 +422,27 @@ sirius_physical_ungrouped_aggregate_merge::sirius_physical_ungrouped_aggregate_m
     duckdb::make_uniq<duckdb::DistinctAggregateData>(*distinct_collection_info, distinct_validity);
 }
 
-std::vector<std::shared_ptr<cucascade::data_batch>>
-sirius_physical_ungrouped_aggregate_merge::execute(
-  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches,
-  rmm::cuda_stream_view stream)
+operator_data sirius_physical_ungrouped_aggregate_merge::execute(const operator_data& input_data,
+                                                                 rmm::cuda_stream_view stream)
 {
-  if (aggregates.empty()) { return {}; }
+  const auto& input_batches = input_data.get_data_batches();
+  if (aggregates.empty()) {
+    return operator_data(std::vector<std::shared_ptr<cucascade::data_batch>>{});
+  }
 
   std::vector<std::shared_ptr<cucascade::data_batch>> valid_batches;
   valid_batches.reserve(input_batches.size());
   for (auto const& batch : input_batches) {
     if (batch) { valid_batches.push_back(batch); }
   }
-  if (valid_batches.empty()) { return {}; }
+  if (valid_batches.empty()) {
+    return operator_data(std::vector<std::shared_ptr<cucascade::data_batch>>{});
+  }
 
   cucascade::memory::memory_space* space = valid_batches[0]->get_memory_space();
-  if (space == nullptr) { return {}; }
+  if (space == nullptr) {
+    return operator_data(std::vector<std::shared_ptr<cucascade::data_batch>>{});
+  }
 
   auto layout = build_aggregate_layout(aggregates);
   std::shared_ptr<cucascade::data_batch> merged_batch;
@@ -446,7 +453,10 @@ sirius_physical_ungrouped_aggregate_merge::execute(
       gpu_merge_impl::merge_ungrouped_aggregate(valid_batches, layout.merge_kinds, stream, *space);
   }
 
-  if (!layout.has_avg) { return {std::move(merged_batch)}; }
+  if (!layout.has_avg) {
+    return operator_data(
+      std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(merged_batch)});
+  }
 
   auto merged_table =
     merged_batch->get_data()->cast<cucascade::gpu_table_representation>().get_table();
@@ -473,7 +483,8 @@ sirius_physical_ungrouped_aggregate_merge::execute(
   auto const batch_id = ::sirius::get_next_batch_id();
   auto output_batch   = std::make_shared<cucascade::data_batch>(batch_id, std::move(output_data));
 
-  return {std::move(output_batch)};
+  return operator_data(
+    std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(output_batch)});
 }
 
 }  // namespace op

@@ -111,12 +111,9 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
 
   bool sink_order_dependent() const override { return false; }
 
-  std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>> get_next_task_input_batch()
-    override;
+  std::optional<operator_data> get_next_task_input_data() override;
 
-  std::vector<std::shared_ptr<::cucascade::data_batch>> execute(
-    const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches,
-    rmm::cuda_stream_view stream) override;
+  operator_data execute(const operator_data& input_data, rmm::cuda_stream_view stream) override;
 };
 
 }  // namespace op

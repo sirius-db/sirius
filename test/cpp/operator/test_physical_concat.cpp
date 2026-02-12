@@ -36,6 +36,7 @@ using namespace duckdb;
 using namespace sirius::op;
 using namespace cucascade;
 using namespace cucascade::memory;
+using sirius::op::operator_data;
 
 namespace {
 
@@ -194,11 +195,14 @@ TEMPLATE_TEST_CASE("sirius_physical_concat concatenates multiple data_batches",
   sirius_physical_concat concat_op({Traits::logical_type()}, 1000, fixture.hash_join.get(), false);
 
   // Execute
-  auto outputs = concat_op.execute(input_batches, default_stream());
+  auto outputs = concat_op.execute(partitioned_operator_data(input_batches, 0), default_stream());
 
   // Verify: single output batch with correct total rows
-  REQUIRE(outputs.size() == 1);
-  auto& out_table = outputs[0]->get_data()->cast<cucascade::gpu_table_representation>().get_table();
+  REQUIRE(outputs.get_data_batches().size() == 1);
+  auto& out_table = outputs.get_data_batches()[0]
+                      ->get_data()
+                      ->cast<cucascade::gpu_table_representation>()
+                      .get_table();
   REQUIRE(static_cast<std::size_t>(out_table.num_rows()) == total_rows);
   REQUIRE(out_table.num_columns() == 1);
 
@@ -224,11 +228,11 @@ TEST_CASE("sirius_physical_concat returns single batch as-is", "[physical_concat
   sirius_physical_concat concat_op(
     {duckdb::LogicalType::INTEGER}, 1000, fixture.hash_join.get(), false);
 
-  auto outputs = concat_op.execute({input_batch}, default_stream());
+  auto outputs = concat_op.execute(partitioned_operator_data({input_batch}, 0), default_stream());
 
-  REQUIRE(outputs.size() == 1);
+  REQUIRE(outputs.get_data_batches().size() == 1);
   // Single batch should be the same pointer (passthrough)
-  REQUIRE(outputs[0].get() == input_batch.get());
+  REQUIRE(outputs.get_data_batches()[0].get() == input_batch.get());
 }
 
 TEST_CASE("sirius_physical_concat handles empty input", "[physical_concat]")
@@ -237,9 +241,11 @@ TEST_CASE("sirius_physical_concat handles empty input", "[physical_concat]")
   sirius_physical_concat concat_op(
     {duckdb::LogicalType::INTEGER}, 1000, fixture.hash_join.get(), false);
 
-  auto outputs = concat_op.execute({}, default_stream());
+  auto outputs = concat_op.execute(
+    partitioned_operator_data(std::vector<std::shared_ptr<cucascade::data_batch>>{}, 0),
+    default_stream());
 
-  REQUIRE(outputs.empty());
+  REQUIRE(outputs.get_data_batches().empty());
 }
 
 TEST_CASE("sirius_physical_concat filters null batches", "[physical_concat]")
@@ -258,10 +264,13 @@ TEST_CASE("sirius_physical_concat filters null batches", "[physical_concat]")
 
   // Mix valid and null batches
   std::vector<std::shared_ptr<data_batch>> input = {batch1, nullptr, batch2, nullptr};
-  auto outputs                                   = concat_op.execute(input, default_stream());
+  auto outputs = concat_op.execute(partitioned_operator_data(input, 0), default_stream());
 
-  REQUIRE(outputs.size() == 1);
-  auto& out_table = outputs[0]->get_data()->cast<cucascade::gpu_table_representation>().get_table();
+  REQUIRE(outputs.get_data_batches().size() == 1);
+  auto& out_table = outputs.get_data_batches()[0]
+                      ->get_data()
+                      ->cast<cucascade::gpu_table_representation>()
+                      .get_table();
   REQUIRE(out_table.num_rows() == 6);
 
   auto host_data                = copy_column_to_host<int32_t>(out_table.view().column(0));
@@ -270,7 +279,115 @@ TEST_CASE("sirius_physical_concat filters null batches", "[physical_concat]")
 }
 
 //===----------------------------------------------------------------------===//
-// 2. get_next_task_input_batch threshold tests
+// 2. Sink tests
+//===----------------------------------------------------------------------===//
+
+TEST_CASE(
+  "sirius_physical_concat sink forwards batches to downstream operator with partition index",
+  "[physical_concat]")
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space != nullptr);
+
+  // Create two batches with known values
+  std::vector<int32_t> values1 = {10, 20, 30};
+  std::vector<int32_t> values2 = {40, 50, 60};
+  auto batch1                  = make_numeric_batch<int32_t>(*space, values1, cudf::type_id::INT32);
+  auto batch2                  = make_numeric_batch<int32_t>(*space, values2, cudf::type_id::INT32);
+  auto batch1_id               = batch1->get_batch_id();
+  auto batch2_id               = batch2->get_batch_id();
+
+  // Create the concat operator
+  auto fixture = create_test_hash_join(duckdb::JoinType::INNER, {duckdb::LogicalType::INTEGER});
+  sirius_physical_concat concat_op(
+    {duckdb::LogicalType::INTEGER}, 1000, fixture.hash_join.get(), false);
+
+  // Create a downstream partition consumer operator to receive the sink output
+  sirius_physical_concat downstream_op(
+    {duckdb::LogicalType::INTEGER}, 1000, fixture.hash_join.get(), false);
+
+  // Set up a data repository on the downstream operator's port
+  auto downstream_repo           = std::make_unique<cucascade::shared_data_repository>();
+  auto downstream_port           = std::make_unique<sirius_physical_operator::port>();
+  downstream_port->type          = MemoryBarrierType::FULL;
+  downstream_port->repo          = downstream_repo.get();
+  downstream_port->src_pipeline  = nullptr;
+  downstream_port->dest_pipeline = nullptr;
+  downstream_op.add_port("input", std::move(downstream_port));
+
+  // Register the downstream operator as the next sink target
+  concat_op.add_next_port_after_sink({&downstream_op, "input"});
+
+  // Sink partitioned data with partition_idx = 3
+  constexpr std::size_t partition_idx = 3;
+  partitioned_operator_data sink_data({batch1, batch2}, partition_idx);
+  concat_op.sink(sink_data, default_stream());
+
+  // Verify: downstream repo should have both batches in partition 3
+  auto batch_ids = downstream_repo->get_batch_ids(partition_idx);
+  REQUIRE(batch_ids.size() == 2);
+
+  // Verify the batch IDs match
+  std::set<uint64_t> expected_ids = {batch1_id, batch2_id};
+  std::set<uint64_t> actual_ids(batch_ids.begin(), batch_ids.end());
+  REQUIRE(actual_ids == expected_ids);
+}
+
+TEST_CASE("sirius_physical_concat sink forwards to multiple downstream operators",
+          "[physical_concat]")
+{
+  auto* space = get_shared_mem_space();
+  REQUIRE(space != nullptr);
+
+  std::vector<int32_t> values = {1, 2, 3};
+  auto batch                  = make_numeric_batch<int32_t>(*space, values, cudf::type_id::INT32);
+  auto batch_id               = batch->get_batch_id();
+
+  auto fixture = create_test_hash_join(duckdb::JoinType::INNER, {duckdb::LogicalType::INTEGER});
+  sirius_physical_concat concat_op(
+    {duckdb::LogicalType::INTEGER}, 1000, fixture.hash_join.get(), false);
+
+  // Create two downstream operators
+  sirius_physical_concat downstream1(
+    {duckdb::LogicalType::INTEGER}, 1000, fixture.hash_join.get(), false);
+  sirius_physical_concat downstream2(
+    {duckdb::LogicalType::INTEGER}, 1000, fixture.hash_join.get(), false);
+
+  auto repo1           = std::make_unique<cucascade::shared_data_repository>();
+  auto port1           = std::make_unique<sirius_physical_operator::port>();
+  port1->type          = MemoryBarrierType::FULL;
+  port1->repo          = repo1.get();
+  port1->src_pipeline  = nullptr;
+  port1->dest_pipeline = nullptr;
+  downstream1.add_port("input", std::move(port1));
+
+  auto repo2           = std::make_unique<cucascade::shared_data_repository>();
+  auto port2           = std::make_unique<sirius_physical_operator::port>();
+  port2->type          = MemoryBarrierType::FULL;
+  port2->repo          = repo2.get();
+  port2->src_pipeline  = nullptr;
+  port2->dest_pipeline = nullptr;
+  downstream2.add_port("input", std::move(port2));
+
+  concat_op.add_next_port_after_sink({&downstream1, "input"});
+  concat_op.add_next_port_after_sink({&downstream2, "input"});
+
+  constexpr std::size_t partition_idx = 1;
+  partitioned_operator_data sink_data({batch}, partition_idx);
+  concat_op.sink(sink_data, default_stream());
+
+  // Both downstream repos should have the batch in partition 1
+  auto ids1 = repo1->get_batch_ids(partition_idx);
+  REQUIRE(ids1.size() == 1);
+  REQUIRE(ids1[0] == batch_id);
+
+  auto ids2 = repo2->get_batch_ids(partition_idx);
+  REQUIRE(ids2.size() == 1);
+  REQUIRE(ids2[0] == batch_id);
+}
+
+//===----------------------------------------------------------------------===//
+// 3. get_next_task_input_batch threshold tests
 //===----------------------------------------------------------------------===//
 
 TEST_CASE("sirius_physical_concat stops concatenating at DEFAULT_SCAN_TASK_BATCH_SIZE threshold",
@@ -309,17 +426,17 @@ TEST_CASE("sirius_physical_concat stops concatenating at DEFAULT_SCAN_TASK_BATCH
   concat_op.add_port("input", std::move(port));
 
   // First call: should return some batches but not all (threshold exceeded)
-  auto result1 = concat_op.get_next_task_input_batch();
+  auto result1 = concat_op.get_next_task_input_data();
   REQUIRE(result1.has_value());
-  REQUIRE(result1->size() < static_cast<std::size_t>(num_batches));
-  REQUIRE(result1->size() >= 1);
+  REQUIRE(result1->get_data_batches().size() < static_cast<std::size_t>(num_batches));
+  REQUIRE(result1->get_data_batches().size() >= 1);
 
   // Collect total batches returned across multiple calls
-  std::size_t total_batches_returned = result1->size();
+  std::size_t total_batches_returned = result1->get_data_batches().size();
   while (true) {
-    auto result = concat_op.get_next_task_input_batch();
+    auto result = concat_op.get_next_task_input_data();
     if (!result.has_value()) { break; }
-    total_batches_returned += result->size();
+    total_batches_returned += result->get_data_batches().size();
   }
 
   // All batches should eventually be consumed
@@ -364,12 +481,12 @@ TEST_CASE("sirius_physical_concat with concat_all=true ignores threshold", "[phy
   concat_op.add_port("input", std::move(port));
 
   // With concat_all=true, all batches in the partition should be returned in one call
-  auto result = concat_op.get_next_task_input_batch();
+  auto result = concat_op.get_next_task_input_data();
   REQUIRE(result.has_value());
-  REQUIRE(result->size() == static_cast<std::size_t>(num_batches));
+  REQUIRE(result->get_data_batches().size() == static_cast<std::size_t>(num_batches));
 
   // No more batches remaining
-  auto result2 = concat_op.get_next_task_input_batch();
+  auto result2 = concat_op.get_next_task_input_data();
   REQUIRE_FALSE(result2.has_value());
 
   // Restore threshold
@@ -496,11 +613,11 @@ TEST_CASE("sirius_physical_concat get_next_task_input_batch is thread-safe", "[p
 
   auto worker = [&]() {
     while (true) {
-      auto result = concat_op.get_next_task_input_batch();
+      auto result = concat_op.get_next_task_input_data();
       if (!result.has_value()) { break; }
       total_calls.fetch_add(1, std::memory_order_relaxed);
       std::lock_guard<std::mutex> lg(collected_mutex);
-      for (auto& batch : *result) {
+      for (auto& batch : result->get_data_batches()) {
         if (batch) { collected_batch_ids.push_back(batch->get_batch_id()); }
       }
     }
@@ -569,12 +686,13 @@ TEST_CASE("sirius_physical_concat execute is thread-safe with independent stream
       cudaStreamCreate(&raw_stream);
       rmm::cuda_stream_view stream(raw_stream);
 
-      auto outputs = concat_op.execute(thread_inputs[thread_id], default_stream());
+      auto outputs =
+        concat_op.execute(partitioned_operator_data(thread_inputs[thread_id], 0), default_stream());
 
       // Synchronize the stream before accessing results
       cudaStreamSynchronize(raw_stream);
 
-      thread_outputs[thread_id] = std::move(outputs);
+      thread_outputs[thread_id] = std::move(outputs.get_data_batches());
 
       cudaStreamDestroy(raw_stream);
     } catch (const std::exception& e) {

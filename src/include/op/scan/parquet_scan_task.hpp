@@ -315,8 +315,7 @@ class parquet_scan_task : public pipeline::sirius_pipeline_itask {
    * @param[in] stream The CUDA stream on which to perform memory operations.
    * @return A vector of shared pointers to data batches produced by this task.
    */
-  std::vector<std::shared_ptr<cucascade::data_batch>> compute_task(
-    rmm::cuda_stream_view stream) override;
+  op::operator_data compute_task(rmm::cuda_stream_view stream) override;
 
   /**
    * @brief Publish the output data batches produced by this task to the shared data repository.
@@ -324,8 +323,7 @@ class parquet_scan_task : public pipeline::sirius_pipeline_itask {
    * @param[in] output_batches The data batches produced by this task to be published.
    * @param[in] stream The CUDA stream on which to perform memory operations (ignored in this task).
    */
-  void publish_output(std::vector<std::shared_ptr<cucascade::data_batch>> output_batches,
-                      rmm::cuda_stream_view stream) override;
+  void publish_output(op::operator_data& output_data, rmm::cuda_stream_view stream) override;
 
   /**
    * @brief Get the estimated reservation size for this task, which is the number of compressed

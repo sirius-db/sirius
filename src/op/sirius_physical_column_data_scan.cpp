@@ -99,11 +99,10 @@ void sirius_physical_column_data_scan::build_pipelines(
   state.set_pipeline_source(current, *this);
 }
 
-std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_column_data_scan::execute(
-  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches,
-  rmm::cuda_stream_view stream)
+operator_data sirius_physical_column_data_scan::execute(const operator_data& input_data,
+                                                        rmm::cuda_stream_view stream)
 {
-  return input_batches;
+  return input_data;
 }
 
 }  // namespace op

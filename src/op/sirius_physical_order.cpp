@@ -36,10 +36,10 @@ sirius_physical_order::sirius_physical_order(duckdb::vector<duckdb::LogicalType>
 {
 }
 
-std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_order::execute(
-  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches,
-  rmm::cuda_stream_view stream)
+operator_data sirius_physical_order::execute(const operator_data& input_data,
+                                             rmm::cuda_stream_view stream)
 {
+  const auto& input_batches = input_data.get_data_batches();
   SIRIUS_LOG_DEBUG("Executing order by");
   auto start = std::chrono::high_resolution_clock::now();
 
@@ -83,7 +83,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_order::execu
   auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
   SIRIUS_LOG_DEBUG("Order by time: {:.2f} ms", duration.count() / 1000.0);
 
-  return output_batches;
+  return operator_data(output_batches);
 }
 
 }  // namespace op

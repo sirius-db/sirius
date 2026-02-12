@@ -47,16 +47,17 @@ sirius_physical_sort_partition::sirius_physical_sort_partition(
 {
 }
 
-std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_sort_partition::execute(
-  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches,
-  rmm::cuda_stream_view stream)
+operator_data sirius_physical_sort_partition::execute(const operator_data& input_data,
+                                                      rmm::cuda_stream_view stream)
 {
+  const auto& input_batches = input_data.get_data_batches();
+
   // If no sample operator or only 1 partition, pass through
   if (!_sample_op || !_sample_op->boundaries_computed() || _sample_op->get_num_partitions() <= 1) {
     SIRIUS_LOG_DEBUG("Sort partition: passthrough ({} batches, {} partitions)",
                      input_batches.size(),
                      _sample_op ? _sample_op->get_num_partitions() : 1);
-    return input_batches;
+    return input_data;
   }
 
   auto start           = std::chrono::high_resolution_clock::now();
@@ -157,7 +158,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_sort_partiti
     num_parts,
     duration.count() / 1000.0);
 
-  return output_batches;
+  return operator_data(output_batches);
 }
 
 }  // namespace op

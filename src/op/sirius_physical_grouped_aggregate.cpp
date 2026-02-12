@@ -164,10 +164,10 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
   has_avg            = cudf_defs.has_avg;
 }
 
-std::vector<std::shared_ptr<::cucascade::data_batch>> sirius_physical_grouped_aggregate::execute(
-  const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches,
-  rmm::cuda_stream_view stream)
+operator_data sirius_physical_grouped_aggregate::execute(const operator_data& input_data,
+                                                         rmm::cuda_stream_view stream)
 {
+  const auto& input_batches = input_data.get_data_batches();
   std::vector<std::shared_ptr<::cucascade::data_batch>> results;
   for (auto& input_batch : input_batches) {
     auto result = gpu_aggregate_impl::local_grouped_aggregate(input_batch,
@@ -178,7 +178,7 @@ std::vector<std::shared_ptr<::cucascade::data_batch>> sirius_physical_grouped_ag
                                                               *input_batch->get_memory_space());
     results.push_back(std::move(result));
   }
-  return results;
+  return operator_data(results);
 }
 }  // namespace op
 }  // namespace sirius

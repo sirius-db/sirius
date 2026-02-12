@@ -65,8 +65,7 @@ sirius_physical_concat::sirius_physical_concat(duckdb::vector<duckdb::LogicalTyp
   }
 }
 
-std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>>
-sirius_physical_concat::get_next_task_input_batch()
+std::optional<operator_data> sirius_physical_concat::get_next_task_input_data()
 {
   // iterate through all the partition and pull the
   std::lock_guard<std::mutex> lg(lock);
@@ -107,21 +106,30 @@ sirius_physical_concat::get_next_task_input_batch()
         input_batch.push_back(std::move(popped_batch));
       }
     }
-    if (input_batch.size() != 0) { return std::move(input_batch); }
+    if (input_batch.size() != 0) { return partitioned_operator_data(std::move(input_batch), i); }
   }
   return std::nullopt;
 }
 
-std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_concat::execute(
-  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches,
-  rmm::cuda_stream_view stream)
+operator_data sirius_physical_concat::execute(const operator_data& input_data,
+                                              rmm::cuda_stream_view stream)
 {
+  auto partitioned_input_data = dynamic_cast<const partitioned_operator_data*>(&input_data);
+  if (partitioned_input_data == nullptr) {
+    throw std::runtime_error(
+      "sirius_physical_concat: input_data is not a partitioned_operator_data");
+  }
+  const auto& input_batches = partitioned_input_data->get_data_batches();
+  auto partition_idx        = partitioned_input_data->get_partition_idx();
   std::vector<std::shared_ptr<cucascade::data_batch>> valid_batches;
   valid_batches.reserve(input_batches.size());
   for (auto const& batch : input_batches) {
     if (batch) { valid_batches.push_back(batch); }
   }
-  if (valid_batches.empty()) { return {}; }
+  if (valid_batches.empty()) {
+    return partitioned_operator_data(std::vector<std::shared_ptr<cucascade::data_batch>>{},
+                                     partition_idx);
+  }
 
   cucascade::memory::memory_space* space = valid_batches[0]->get_memory_space();
   if (space == nullptr) { throw std::runtime_error("sirius_physical_concat: space is nullptr"); }
@@ -134,7 +142,20 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_concat::exec
     auto merged_batch = gpu_merge_impl::concat(valid_batches, stream, *space);
     output_batches.push_back(std::move(merged_batch));
   }
-  return output_batches;
+  return partitioned_operator_data(output_batches, partition_idx);
+}
+
+void sirius_physical_concat::sink(const operator_data& output_data, rmm::cuda_stream_view stream)
+{
+  auto partitioned_output_data = dynamic_cast<const partitioned_operator_data*>(&output_data);
+  auto partition_idx           = partitioned_output_data->get_partition_idx();
+  for (auto& batch : partitioned_output_data->get_data_batches()) {
+    for (auto& [next_op, port_id] : next_port_after_sink) {
+      auto partition_consumer_op =
+        dynamic_cast<sirius_physical_partition_consumer_operator*>(next_op);
+      partition_consumer_op->push_data_batch_partitioned(port_id, batch, partition_idx);
+    }
+  }
 }
 
 std::string sirius_physical_concat::get_name() const { return "CONCAT"; }

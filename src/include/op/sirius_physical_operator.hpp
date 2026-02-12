@@ -59,6 +59,59 @@ struct task_creation_hint {
   sirius_physical_operator* producer{nullptr};
 };
 
+/**
+ * @brief Container for operator data batches.
+ *
+ * Wraps a collection of data batches that can be passed between operators.
+ */
+class operator_data {
+ public:
+  operator_data() = default;
+  explicit operator_data(std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches)
+    : _data_batches(std::move(data_batches))
+  {
+  }
+
+  virtual ~operator_data() = default;
+
+  /**
+   * @brief Get mutable data batches.
+   * @return Mutable reference to vector of data batch pointers
+   */
+  [[nodiscard]] const std::vector<std::shared_ptr<::cucascade::data_batch>>& get_data_batches()
+    const
+  {
+    return _data_batches;
+  }
+
+ private:
+  std::vector<std::shared_ptr<::cucascade::data_batch>> _data_batches;
+};
+
+/**
+ * @brief Container for partitioned operator data.
+ *
+ * Extends operator_data to include partition index information.
+ */
+class partitioned_operator_data : public operator_data {
+ public:
+  partitioned_operator_data() = default;
+  partitioned_operator_data(std::vector<std::shared_ptr<::cucascade::data_batch>> data_batches,
+                            std::size_t partition_idx)
+    : operator_data(std::move(data_batches)), _partition_idx(partition_idx)
+  {
+  }
+
+  /**
+   * @brief Get the partition index.
+   * @return Partition index
+   */
+  [[nodiscard]] std::size_t get_partition_idx() const { return _partition_idx; }
+
+ private:
+  std::size_t _partition_idx = 0;
+};
+
 //! sirius_physical_operator is the base class of the physical operators present in the
 //! execution plan
 class sirius_physical_operator {
@@ -127,9 +180,7 @@ class sirius_physical_operator {
   virtual duckdb::unique_ptr<duckdb::GlobalOperatorState> get_global_operator_state(
     duckdb::ClientContext& context) const;
 
-  virtual std::vector<std::shared_ptr<::cucascade::data_batch>> execute(
-    const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches,
-    rmm::cuda_stream_view stream);
+  virtual operator_data execute(const operator_data& input_data, rmm::cuda_stream_view stream);
 
   //! The influence the operator has on order (insertion order means no influence)
   virtual duckdb::OrderPreservationType operator_order() const
@@ -161,8 +212,7 @@ class sirius_physical_operator {
   virtual duckdb::unique_ptr<duckdb::GlobalSinkState> get_global_sink_state(
     duckdb::ClientContext& context) const;
 
-  virtual void sink(const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches,
-                    rmm::cuda_stream_view stream);
+  virtual void sink(const operator_data& input_data, rmm::cuda_stream_view stream);
 
   virtual bool is_sink() const { return false; }
 
@@ -245,8 +295,7 @@ class sirius_physical_operator {
   }
 
   //! Get the input batch
-  virtual std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>>
-  get_next_task_input_batch();
+  virtual std::optional<operator_data> get_next_task_input_data();
   //! Check if all ports are empty
   bool all_ports_empty();
   //! Check if the pipeline is finished

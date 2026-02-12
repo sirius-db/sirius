@@ -16,6 +16,7 @@
 
 // sirius
 #include "cucascade/memory/memory_space.hpp"
+#include "op/sirius_physical_operator.hpp"
 
 #include <data/data_batch_utils.hpp>
 #include <helper/utils.hpp>
@@ -499,12 +500,11 @@ void duckdb_scan_task::process_chunk(duckdb_scan_task_local_state& l_state)
 
 void duckdb_scan_task::execute(rmm::cuda_stream_view stream)
 {
-  auto output_batches = compute_task(stream);
-  publish_output(output_batches, stream);
+  auto output_data = compute_task(stream);
+  publish_output(output_data, stream);
 }
 
-std::vector<std::shared_ptr<cucascade::data_batch>> duckdb_scan_task::compute_task(
-  rmm::cuda_stream_view stream)
+op::operator_data duckdb_scan_task::compute_task(rmm::cuda_stream_view stream)
 {
   // Cast base task states to DuckDB scan task states
   auto& l_state = this->_local_state->cast<duckdb_scan_task_local_state>();
@@ -556,17 +556,17 @@ std::vector<std::shared_ptr<cucascade::data_batch>> duckdb_scan_task::compute_ta
 
   // Make data batch and push to repository
   if (l_state._row_offset > 0) {
-    return std::vector<std::shared_ptr<cucascade::data_batch>>{l_state.make_data_batch()};
+    return op::operator_data(
+      std::vector<std::shared_ptr<cucascade::data_batch>>{l_state.make_data_batch()});
   }
 
-  return std::vector<std::shared_ptr<cucascade::data_batch>>{};
+  return op::operator_data(std::vector<std::shared_ptr<cucascade::data_batch>>{});
 }
 
-void duckdb_scan_task::publish_output(
-  std::vector<std::shared_ptr<cucascade::data_batch>> output_batches, rmm::cuda_stream_view stream)
+void duckdb_scan_task::publish_output(op::operator_data& output_data, rmm::cuda_stream_view stream)
 {
-  std::for_each(std::make_move_iterator(output_batches.begin()),
-                std::make_move_iterator(output_batches.end()),
+  std::for_each(std::make_move_iterator(output_data.get_data_batches().begin()),
+                std::make_move_iterator(output_data.get_data_batches().end()),
                 [this](auto batch) { this->_data_repo->add_data_batch(std::move(batch)); });
 }
 

@@ -51,10 +51,11 @@ sirius_physical_merge_sort::sirius_physical_merge_sort(
 {
 }
 
-std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_merge_sort::execute(
-  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches,
-  rmm::cuda_stream_view stream)
+operator_data sirius_physical_merge_sort::execute(const operator_data& input_data,
+                                                  rmm::cuda_stream_view stream)
 {
+  const auto& input_batches = input_data.get_data_batches();
+
   SIRIUS_LOG_DEBUG("Executing merge sort");
   auto start = std::chrono::high_resolution_clock::now();
 
@@ -67,7 +68,9 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_merge_sort::
     valid_batches.push_back(batch);
   }
 
-  if (valid_batches.empty() || !space) { return {}; }
+  if (valid_batches.empty() || !space) {
+    return operator_data(std::vector<std::shared_ptr<cucascade::data_batch>>{});
+  }
 
   // Helper lambda to apply final projection to a batch (removes sort-key-only columns)
   auto apply_final_projection =
@@ -88,7 +91,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_merge_sort::
   if (valid_batches.size() == 1) {
     std::vector<std::shared_ptr<cucascade::data_batch>> outputs;
     outputs.push_back(apply_final_projection(valid_batches[0]));
-    return outputs;
+    return operator_data(outputs);
   }
 
   // Build cudf order vectors from BoundOrderByNode
@@ -121,7 +124,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_merge_sort::
 
   std::vector<std::shared_ptr<cucascade::data_batch>> outputs;
   if (merged_batch) { outputs.push_back(apply_final_projection(std::move(merged_batch))); }
-  return outputs;
+  return operator_data(outputs);
 }
 
 }  // namespace op
