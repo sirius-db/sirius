@@ -16,7 +16,6 @@
 
 #include "op/sirius_physical_partition.hpp"
 
-#include "print.hpp"
 #include "creator/task_creator.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "expression_executor/gpu_expression_executor.hpp"
