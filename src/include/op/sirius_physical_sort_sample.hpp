@@ -58,9 +58,8 @@ class sirius_physical_sort_sample : public sirius_physical_operator {
     return duckdb::OrderPreservationType::FIXED_ORDER;
   }
 
-  std::vector<std::shared_ptr<cucascade::data_batch>> execute(
-    const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches,
-    rmm::cuda_stream_view stream = cudf::get_default_stream()) override;
+  operator_data execute(const operator_data& input_data,
+                        rmm::cuda_stream_view stream = cudf::get_default_stream()) override;
 
   //! Override to wait for N batches before returning READY
   std::optional<task_creation_hint> get_next_task_hint() override;

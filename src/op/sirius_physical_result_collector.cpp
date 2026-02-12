@@ -53,11 +53,10 @@ sirius_physical_result_collector::sirius_physical_result_collector(
   this->types = data.prepared->types;
 }
 
-std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_result_collector::execute(
-  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches,
-  rmm::cuda_stream_view stream)
+operator_data sirius_physical_result_collector::execute(const operator_data& input_data,
+                                                        rmm::cuda_stream_view stream)
 {
-  return input_batches;
+  return input_data;
 }
 
 duckdb::vector<duckdb::const_reference<sirius_physical_operator>>
@@ -108,10 +107,10 @@ duckdb::unique_ptr<duckdb::QueryResult> sirius_physical_materialized_collector::
     statement_type, properties, names, std::move(result_collection), props);
 }
 
-void sirius_physical_materialized_collector::sink(
-  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches,
-  rmm::cuda_stream_view stream)
+void sirius_physical_materialized_collector::sink(const operator_data& input_data,
+                                                  rmm::cuda_stream_view stream)
 {
+  const auto& input_batches     = input_data.get_data_batches();
   using host_table_chunk_reader = ::sirius::op::result::host_table_chunk_reader;
 
   if (input_batches.empty()) {

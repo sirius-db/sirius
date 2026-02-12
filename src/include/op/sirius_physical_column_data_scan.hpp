@@ -54,9 +54,7 @@ class sirius_physical_column_data_scan : public sirius_physical_operator {
 
   duckdb::optional_idx delim_index;
 
-  std::vector<std::shared_ptr<cucascade::data_batch>> execute(
-    const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches,
-    rmm::cuda_stream_view stream) override;
+  operator_data execute(const operator_data& input_data, rmm::cuda_stream_view stream) override;
 
  public:
   bool is_source() const override { return true; }

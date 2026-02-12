@@ -32,6 +32,10 @@
 #include <vector>
 
 namespace sirius {
+namespace op {
+class operator_data;
+}
+
 namespace pipeline {
 
 /**
@@ -71,14 +75,12 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_itask_local_state {
    * @param batch_views Vector of data batches serving as input to the pipeline
    * @param res Memory reservation for GPU resources
    */
-  explicit gpu_pipeline_task_local_state(
-    std::vector<std::shared_ptr<cucascade::data_batch>> batches)
-    : _batches(std::move(batches))
+  explicit gpu_pipeline_task_local_state(op::operator_data input_data)
+    : _input_data(std::move(input_data))
   {
   }
 
-  std::vector<std::shared_ptr<cucascade::data_batch>>
-    _batches;  ///< Input data batches for the pipeline
+  op::operator_data _input_data;  ///< Input data batches for the pipeline
 
   /**
    * @brief Get a const pointer to the reservation (non-owning).
@@ -145,8 +147,7 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
    * @param stream CUDA stream used for device memory operations and kernel launches
    * @return std::vector<std::shared_ptr<cucascade::data_batch>> The computed output batches
    */
-  std::vector<std::shared_ptr<cucascade::data_batch>> compute_task(
-    rmm::cuda_stream_view stream) override;
+  op::operator_data compute_task(rmm::cuda_stream_view stream) override;
 
   /**
    * @brief Publish the computed output batches to data repositories.
@@ -155,8 +156,7 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
    *
    * @param output_batches The data batches to publish
    */
-  void publish_output(std::vector<std::shared_ptr<cucascade::data_batch>> output_batches,
-                      rmm::cuda_stream_view stream) override;
+  void publish_output(op::operator_data& output_batches, rmm::cuda_stream_view stream) override;
 
   /**
    * @brief Get the input size for this task

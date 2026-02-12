@@ -42,10 +42,10 @@ sirius_physical_streaming_limit::sirius_physical_streaming_limit(
 {
 }
 
-std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_streaming_limit::execute(
-  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches,
-  rmm::cuda_stream_view stream)
+operator_data sirius_physical_streaming_limit::execute(const operator_data& input_data,
+                                                       rmm::cuda_stream_view stream)
 {
+  const auto& input_batches = input_data.get_data_batches();
   SIRIUS_LOG_DEBUG("Executing streaming limit");
 
   if (limit_val.Type() != duckdb::LimitNodeType::CONSTANT_VALUE) {
@@ -96,7 +96,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_streaming_li
     offset_const = 0;  // offset only applies to the first batch with rows
   }
 
-  return output_batches;
+  return operator_data(output_batches);
 }
 
 }  // namespace op

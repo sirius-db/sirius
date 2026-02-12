@@ -98,10 +98,11 @@ TEMPLATE_TEST_CASE("sirius_physical_streaming_limit limits rows in data_batch",
     std::move(types), std::move(limit_node), std::move(offset_node), values.size(), false);
 
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
-  auto outputs = limiter.execute(inputs, cudf::get_default_stream());
-  REQUIRE(outputs.size() == 1);
-  auto output_table = outputs[0]->get_data()->cast<gpu_table_representation>().get_table();
-  auto host_vals    = copy_column_to_host<typename Traits::type>(output_table.view().column(0));
+  auto outputs = limiter.execute(operator_data(inputs), cudf::get_default_stream());
+  REQUIRE(outputs.get_data_batches().size() == 1);
+  auto output_table =
+    outputs.get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
+  auto host_vals = copy_column_to_host<typename Traits::type>(output_table.view().column(0));
 
   std::vector<typename Traits::type> expected = {values[2], values[3], values[4]};
   REQUIRE(host_vals == expected);

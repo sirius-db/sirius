@@ -34,6 +34,7 @@
 using namespace sirius::pipeline;
 using namespace sirius::parallel;
 using namespace std::chrono_literals;
+using namespace sirius::op;
 
 /**
  * Mock GPU pipeline task for testing.
@@ -54,7 +55,8 @@ class mock_gpu_pipeline_task_global_state : public gpu_pipeline_task_global_stat
 class mock_gpu_pipeline_task_local_state : public gpu_pipeline_task_local_state {
  public:
   mock_gpu_pipeline_task_local_state(int task_id, int expected_gpu_id)
-    : gpu_pipeline_task_local_state(std::vector<std::shared_ptr<cucascade::data_batch>>{}),
+    : gpu_pipeline_task_local_state(
+        operator_data(std::vector<std::shared_ptr<cucascade::data_batch>>{})),
       _task_id(task_id),
       _expected_gpu_id(expected_gpu_id)
   {

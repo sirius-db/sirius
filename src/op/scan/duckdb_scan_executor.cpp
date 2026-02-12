@@ -133,8 +133,8 @@ void duckdb_scan_executor::submit_scan_request()
     _task_request_publisher.send(std::make_unique<sirius::pipeline::task_request>(0, true));
 }
 
-std::vector<std::shared_ptr<cucascade::data_batch>> duckdb_scan_executor::get_scan_output(
-  op::scan::duckdb_scan_task* task, rmm::cuda_stream_view stream)
+op::operator_data duckdb_scan_executor::get_scan_output(op::scan::duckdb_scan_task* task,
+                                                        rmm::cuda_stream_view stream)
 {
   if (!_caching_enabled) {
     return task->compute_task(stream);
@@ -148,11 +148,11 @@ std::vector<std::shared_ptr<cucascade::data_batch>> duckdb_scan_executor::get_sc
       if (entry->batch_index >= entry->batches.size()) {
         throw std::runtime_error("Scan results for query not cached");
       }
-      return entry->batches[entry->batch_index++];
+      return op::operator_data(entry->batches[entry->batch_index++]);
     } else {
-      auto batches = task->compute_task(stream);
-      entry->batches.push_back(batches);
-      return batches;
+      auto scan_output = task->compute_task(stream);
+      entry->batches.push_back(scan_output.get_data_batches());
+      return scan_output;
     }
   }
 }
@@ -207,9 +207,9 @@ void duckdb_scan_executor::manager_loop()
                             t         = std::move(task),
                             scan_task = std::move(scan_task)]() mutable {
       try {
-        auto consumers = scan_task->get_output_consumers();
-        auto batches   = get_scan_output(scan_task, stream);
-        scan_task->publish_output(std::move(batches), stream);
+        auto consumers   = scan_task->get_output_consumers();
+        auto output_data = get_scan_output(scan_task, stream);
+        scan_task->publish_output(output_data, stream);
         t.reset();
         if (_task_creator && !(_completion_handler && _completion_handler->is_completed())) {
           for (auto* consumer : consumers) {

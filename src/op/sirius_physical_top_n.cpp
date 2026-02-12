@@ -141,11 +141,11 @@ sirius_physical_top_n::sirius_physical_top_n(
 
 sirius_physical_top_n::~sirius_physical_top_n() {}
 
-std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_top_n::execute(
-  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches,
-  rmm::cuda_stream_view stream)
+operator_data sirius_physical_top_n::execute(const operator_data& input_data,
+                                             rmm::cuda_stream_view stream)
 {
-  if (limit == 0) { return {}; }
+  const auto& input_batches = input_data.get_data_batches();
+  if (limit == 0) { return operator_data(std::vector<std::shared_ptr<cucascade::data_batch>>{}); }
 
   std::shared_ptr<cucascade::data_batch> input_batch;
   for (auto const& batch : input_batches) {
@@ -156,10 +156,12 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_top_n::execu
       input_batch = batch;
     }
   }
-  if (!input_batch) { return {}; }
+  if (!input_batch) { return operator_data(std::vector<std::shared_ptr<cucascade::data_batch>>{}); }
 
   auto* space = input_batch->get_memory_space();
-  if (space == nullptr) { return {}; }
+  if (space == nullptr) {
+    return operator_data(std::vector<std::shared_ptr<cucascade::data_batch>>{});
+  }
 
   auto input_table =
     input_batch->get_data()->cast<cucascade::gpu_table_representation>().get_table();
@@ -171,7 +173,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_top_n::execu
     std::make_unique<cucascade::gpu_table_representation>(std::move(output_table), *space);
   outputs.push_back(
     std::make_shared<cucascade::data_batch>(::sirius::get_next_batch_id(), std::move(output_data)));
-  return outputs;
+  return operator_data(outputs);
 }
 
 sirius_physical_top_n_merge::sirius_physical_top_n_merge(sirius_physical_top_n* top_n)
@@ -202,11 +204,11 @@ sirius_physical_top_n_merge::sirius_physical_top_n_merge(
 {
 }
 
-std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_top_n_merge::execute(
-  const std::vector<std::shared_ptr<cucascade::data_batch>>& input_batches,
-  rmm::cuda_stream_view stream)
+operator_data sirius_physical_top_n_merge::execute(const operator_data& input_data,
+                                                   rmm::cuda_stream_view stream)
 {
-  if (limit == 0) { return {}; }
+  const auto& input_batches = input_data.get_data_batches();
+  if (limit == 0) { return operator_data(std::vector<std::shared_ptr<cucascade::data_batch>>{}); }
 
   // Use the memory space from the first valid batch (all batches are expected to share the same
   // space in practice).
@@ -217,7 +219,9 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_top_n_merge:
       break;
     }
   }
-  if (space == nullptr) { return {}; }
+  if (space == nullptr) {
+    return operator_data(std::vector<std::shared_ptr<cucascade::data_batch>>{});
+  }
 
   std::vector<std::unique_ptr<cudf::table>> owned_tables;
   std::vector<cudf::table_view> concat_views;
@@ -231,7 +235,9 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_top_n_merge:
     owned_tables.push_back(std::move(table));
   }
 
-  if (concat_views.empty()) { return {}; }
+  if (concat_views.empty()) {
+    return operator_data(std::vector<std::shared_ptr<cucascade::data_batch>>{});
+  }
 
   std::unique_ptr<cudf::table> combined;
   if (concat_views.size() == 1) {
@@ -258,7 +264,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_top_n_merge:
     std::make_unique<cucascade::gpu_table_representation>(std::move(output_table), *space);
   outputs.push_back(
     std::make_shared<cucascade::data_batch>(::sirius::get_next_batch_id(), std::move(output_data)));
-  return outputs;
+  return operator_data(outputs);
 }
 
 }  // namespace op

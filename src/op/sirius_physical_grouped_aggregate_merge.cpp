@@ -145,8 +145,7 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
   cudf_aggregate_idx = std::move(cudf_defs.cudf_aggregate_idx);
 }
 
-std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>>
-sirius_physical_grouped_aggregate_merge::get_next_task_input_batch()
+std::optional<operator_data> sirius_physical_grouped_aggregate_merge::get_next_task_input_data()
 {
   // we need to lock, then pull all the batches from one partition and return them, and increment
   // the partition index
@@ -164,30 +163,29 @@ sirius_physical_grouped_aggregate_merge::get_next_task_input_batch()
       }
     }
     current_partition_index++;
-    return input_batch;
+    return operator_data(input_batch);
   } else {
     return std::nullopt;
   }
 }
 
-std::vector<std::shared_ptr<::cucascade::data_batch>>
-sirius_physical_grouped_aggregate_merge::execute(
-  const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches,
-  rmm::cuda_stream_view stream)
+operator_data sirius_physical_grouped_aggregate_merge::execute(const operator_data& input_data,
+                                                               rmm::cuda_stream_view stream)
 {
+  const auto& input_batches = input_data.get_data_batches();
   if (input_batches.size() == 0) {
     throw std::runtime_error(
       "We expect at least one input batch for grouped aggregate merge operator");
   }
   // if there is only one batch, return it. We are assuming it was already aggregated.
-  if (input_batches.size() == 1) { return input_batches; }
+  if (input_batches.size() == 1) { return input_data; }
 
   auto result = gpu_merge_impl::merge_grouped_aggregate(input_batches,
                                                         group_idx.size(),
                                                         cudf_aggregates,
                                                         stream,
                                                         *input_batches[0]->get_memory_space());
-  return {result};
+  return operator_data({result});
 }
 }  // namespace op
 }  // namespace sirius
