@@ -482,9 +482,7 @@ TEST_CASE("gpu_execution - order by with varchar column",
 TEST_CASE("gpu_execution - cast integer to decimal preserves scale",
           "[integration][gpu_execution][cast][decimal]")
 {
-  config_env_guard env;
-  duckdb::DuckDB db(get_tpch_db_path().string());
-  duckdb::Connection con(db);
+  duckdb::Connection con(get_shared_db());
   compare_gpu_vs_cpu(con,
                      "select n_nationkey, cast(n_nationkey as Decimal(18,2)) as d from nation;");
 }
@@ -492,9 +490,7 @@ TEST_CASE("gpu_execution - cast integer to decimal preserves scale",
 TEST_CASE("gpu_execution - cast integer to decimal with aggregation",
           "[integration][gpu_execution][cast][decimal]")
 {
-  config_env_guard env;
-  duckdb::DuckDB db(get_tpch_db_path().string());
-  duckdb::Connection con(db);
+  duckdb::Connection con(get_shared_db());
   compare_gpu_vs_cpu(con,
                      "select n_regionkey, max(cast(n_nationkey as Decimal(18,2))) as max_d "
                      "from nation group by n_regionkey;");
@@ -503,9 +499,7 @@ TEST_CASE("gpu_execution - cast integer to decimal with aggregation",
 TEST_CASE("gpu_execution - cast to decimal different scales",
           "[integration][gpu_execution][cast][decimal]")
 {
-  config_env_guard env;
-  duckdb::DuckDB db(get_tpch_db_path().string());
-  duckdb::Connection con(db);
+  duckdb::Connection con(get_shared_db());
   compare_gpu_vs_cpu(con,
                      "select cast(n_nationkey as Decimal(9,0)) as d0, "
                      "cast(n_nationkey as Decimal(9,4)) as d4 from nation;");
@@ -515,9 +509,7 @@ TEST_CASE("gpu_execution - cast to decimal different scales",
 TEST_CASE("gpu_execution - issue 227 cast decimal with avg and group by",
           "[.][integration_disabled][gpu_execution][cast][decimal]")
 {
-  config_env_guard env;
-  duckdb::DuckDB db(get_tpch_db_path().string());
-  duckdb::Connection con(db);
+  duckdb::Connection con(get_shared_db());
   compare_gpu_vs_cpu(con,
                      "select avg(n_regionkey), avg(n_nationkey), n_name, "
                      "max(cast(n_nationkey as Decimal(18,2))) "
