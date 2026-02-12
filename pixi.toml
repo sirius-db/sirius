@@ -60,7 +60,105 @@ doris-check = { cmd = "cd doris && cargo check", description = "Check doris work
 doris-build = { cmd = "cd doris && cargo build --release", description = "Build doris workspace" }
 doris-test = { cmd = "cd doris && cargo test", description = "Test doris workspace" }
 
+# Doris FE feature: build & run Doris Frontend from source for testing
+[feature.doris-fe.dependencies]
+openjdk = "17.*"
+maven = ">=3.9"
+mysql = "*"
+cmake = ">=3.20"
+cxx-compiler = "*"
+make = "*"
+flex = "*"
+bison = "*"
+
+[feature.doris-fe.tasks]
+doris-fe-thrift = { cmd = """bash -c 'set -e
+  THRIFT_VER=0.16.0
+  THRIFT_BIN=doris/thirdparty/thrift-$THRIFT_VER/build/compiler/cpp/bin/thrift
+  if [ -x "$THRIFT_BIN" ]; then
+    echo "thrift $THRIFT_VER already built: $THRIFT_BIN"
+    exit 0
+  fi
+  echo "==> Downloading thrift $THRIFT_VER..."
+  mkdir -p doris/thirdparty
+  curl -sL http://archive.apache.org/dist/thrift/$THRIFT_VER/thrift-$THRIFT_VER.tar.gz | tar xz -C doris/thirdparty
+  echo "==> Building thrift compiler..."
+  cd doris/thirdparty/thrift-$THRIFT_VER
+  mkdir -p build && cd build
+  cmake .. -DBUILD_COMPILER=ON -DBUILD_TESTING=OFF -DBUILD_TUTORIALS=OFF \
+    -DBUILD_LIBRARIES=OFF -DBUILD_JAVA=OFF -DBUILD_PYTHON=OFF \
+    -DWITH_OPENSSL=OFF -DWITH_LIBEVENT=OFF \
+    -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+  make -j$(nproc)
+  echo "==> thrift compiler built: $(pwd)/compiler/cpp/thrift"
+'""", description = "Build thrift 0.16.0 compiler from source" }
+
+doris-fe-build = { cmd = """bash -c 'set -e
+  DORIS_SRC=doris/thirdparty/apache-doris
+  THRIFT=doris/thirdparty/thrift-0.16.0/build/compiler/cpp/bin/thrift
+  if [ ! -x "$THRIFT" ]; then
+    echo "ERROR: thrift 0.16.0 not built. Run: pixi run -e doris-fe doris-fe-thrift"
+    exit 1
+  fi
+
+  echo "==> Generating Java Thrift stubs with thrift 0.16.0..."
+  THRIFT_DIR=$DORIS_SRC/gensrc/thrift
+  BUILD_DIR=$DORIS_SRC/gensrc/build
+  mkdir -p $BUILD_DIR/gen_java
+  for f in $THRIFT_DIR/*.thrift; do
+    $THRIFT -I $THRIFT_DIR --gen java:fullcamel -out $BUILD_DIR/gen_java --allow-64bit-consts -strict "$f"
+  done
+
+  echo "==> Copying generated Thrift Java to fe-common..."
+  rm -rf $DORIS_SRC/fe/fe-common/src/main/java/org/apache/doris/thrift
+  rm -rf $DORIS_SRC/fe/fe-common/src/main/java/org/apache/parquet
+  cp -r $BUILD_DIR/gen_java/org/apache/doris/thrift $DORIS_SRC/fe/fe-common/src/main/java/org/apache/doris/
+  if [ -d $BUILD_DIR/gen_java/org/apache/parquet ]; then
+    cp -r $BUILD_DIR/gen_java/org/apache/parquet $DORIS_SRC/fe/fe-common/src/main/java/org/apache/
+  fi
+
+  echo "==> Creating stub directories..."
+  mkdir -p $DORIS_SRC/thirdparty/installed/webroot
+  mkdir -p $DORIS_SRC/thirdparty/installed/jindofs_libs
+
+  echo "==> Building FE with Maven..."
+  export DORIS_HOME=$(pwd)/$DORIS_SRC
+  cd $DORIS_SRC/fe
+  mvn install -pl fe-common -DskipTests -Dcheckstyle.skip=true -Dskip.plugin=true -T 1C
+  mvn package -pl fe-core -DskipTests -Dcheckstyle.skip=true -T 1C
+
+  echo "==> Assembling FE output..."
+  cd ..
+  mkdir -p output/fe/bin output/fe/conf output/fe/lib output/fe/log output/fe/doris-meta
+  mkdir -p output/fe/webroot/static output/fe/plugins/jdbc_drivers
+  cp bin/*_fe.sh output/fe/bin/
+  cp conf/fe.conf output/fe/conf/
+  rm -rf output/fe/lib/*
+  cp fe/fe-core/target/lib/* output/fe/lib/
+  cp fe/fe-core/target/doris-fe.jar output/fe/lib/
+  echo "==> Done"
+'""", description = "Build Doris FE from source (Maven)" }
+
+doris-fe-start = { cmd = """bash -c '
+  DORIS_FE=doris/thirdparty/apache-doris/output/fe
+  if [ ! -f $DORIS_FE/lib/doris-fe.jar ]; then
+    echo "FE not built yet. Run: pixi run -e doris-fe doris-fe-build"
+    exit 1
+  fi
+  cd $DORIS_FE && bin/start_fe.sh --console
+'""", description = "Start Doris FE in console mode" }
+
+doris-fe-stop = { cmd = """bash -c '
+  pkill -f DorisFE 2>/dev/null || true
+  echo "FE stopped"
+'""", description = "Stop Doris FE" }
+
+doris-fe-add-be = { cmd = "bash -c 'mysql -h 127.0.0.1 -P 9030 -u root -e \"ALTER SYSTEM ADD BACKEND \\\"127.0.0.1:9050\\\";\" && echo \"Backend added. Run: pixi run -e doris-fe doris-fe-show-be\"'", description = "Register Rust BE with Doris FE" }
+
+doris-fe-show-be = { cmd = "bash -c 'mysql -h 127.0.0.1 -P 9030 -u root -e \"SHOW BACKENDS\\G\"'", description = "Show registered backends" }
+
 [environments]
 default = ["cuda13"]
 cuda12 = ["cuda12"]
 doris = ["cuda13", "doris"]
+doris-fe = ["doris-fe"]

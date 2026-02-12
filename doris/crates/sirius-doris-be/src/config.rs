@@ -29,7 +29,7 @@ impl Default for BeConfig {
             be_port: 9060,
             brpc_port: 8060,
             http_port: 8040,
-            arrow_flight_port: 8070,
+            arrow_flight_port: 8071,
             gpu_ids: vec![0],
             version: format!("sirius-doris-be {}", env!("CARGO_PKG_VERSION")),
             start_time: Instant::now(),
