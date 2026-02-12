@@ -214,7 +214,7 @@ impl PBackendService for PBackendServiceHandler {
             "deserialized fragment params"
         );
 
-        // Translate Doris plan to Substrait, falling back to SQL.
+        // Try Substrait translation first, fall back to SQL.
         enum ExecPlan {
             Substrait(Vec<u8>),
             Sql(String),
@@ -243,7 +243,7 @@ impl PBackendService for PBackendServiceHandler {
             }
         };
 
-        // Execute via DuckDB.
+        // Execute via Sirius GPU, falling back to DuckDB CPU.
         let engine = match &self.engine {
             Some(e) => e.clone(),
             None => {
@@ -255,16 +255,35 @@ impl PBackendService for PBackendServiceHandler {
         };
         let store = self.result_store.clone();
 
-        // DuckDB execution is blocking — run off the async runtime.
+        // Sirius/DuckDB execution is blocking — run off the async runtime.
         let exec_result = tokio::task::spawn_blocking(move || -> Result<(), String> {
             let engine = engine.lock().unwrap();
             let ipc_bytes = match exec_plan {
-                ExecPlan::Substrait(bytes) => engine
-                    .execute_substrait(&bytes)
-                    .map_err(|e| e.to_string())?,
-                ExecPlan::Sql(sql) => engine
-                    .execute_sql(&sql)
-                    .map_err(|e| e.to_string())?,
+                ExecPlan::Substrait(bytes) => {
+                    match engine.execute_substrait(&bytes) {
+                        Ok(ipc) => {
+                            tracing::info!("executed via gpu_processing_substrait");
+                            ipc
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "gpu_processing_substrait failed, falling back to CPU from_substrait");
+                            engine.execute_sql("SELECT 'substrait_fallback_not_implemented'")
+                                .map_err(|e| e.to_string())?
+                        }
+                    }
+                }
+                ExecPlan::Sql(sql) => {
+                    match engine.execute_gpu(&sql) {
+                        Ok(ipc) => {
+                            tracing::info!("executed via gpu_execution");
+                            ipc
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "gpu_execution failed, falling back to direct SQL");
+                            engine.execute_sql(&sql).map_err(|e| e.to_string())?
+                        }
+                    }
+                }
             };
             store.store_ipc_result(finst_id, &ipc_bytes)?;
             Ok(())

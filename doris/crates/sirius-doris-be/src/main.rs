@@ -64,6 +64,11 @@ fn main() {
     let engine = match SiriusEngine::new() {
         Ok(e) => {
             info!("DuckDB engine initialized");
+            // Try to initialize GPU buffers for Sirius GPU execution.
+            match e.init_gpu_buffers("2GB", "2GB") {
+                Ok(()) => info!("GPU buffers initialized (2GB cache, 2GB processing)"),
+                Err(err) => warn!(error = %err, "GPU buffer init failed, gpu_execution will fall back to DuckDB CPU"),
+            }
             Some(Arc::new(Mutex::new(e)))
         }
         Err(e) => {

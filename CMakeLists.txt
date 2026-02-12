@@ -88,9 +88,9 @@ include(third_party/cucascade.cmake)
 # Include directories - cuCascade headers first for memory module
 include_directories(${CUCASCADE_INCLUDE_DIR})
 include_directories(src/include src/include/operator)
-# include_directories(substrait/src/include) include_directories(${TARGET_NAME}
-# substrait/third_party/substrait) include_directories(${TARGET_NAME}
-# substrait/third_party)
+include_directories(substrait/src/include)
+include_directories(${TARGET_NAME} substrait/third_party/substrait)
+include_directories(${TARGET_NAME} substrait/third_party)
 
 set(EXTENSION_SOURCES
     src/sirius_extension.cpp
@@ -168,8 +168,8 @@ set_target_properties(${LOADABLE_EXTENSION_NAME}
 # rmm::rmm ${NUMA_LIB}) target_link_libraries(${LOADABLE_EXTENSION_NAME}
 # substrait_extension cudf::cudf rmm::rmm)
 target_link_libraries(${EXTENSION_NAME} cudf::cudf rmm::rmm ${NUMA_LIB}
-                      ${LIBCONFIG++_LIBRARIES} absl::any_invocable)
-target_link_libraries(${LOADABLE_EXTENSION_NAME} cudf::cudf rmm::rmm)
+                      ${LIBCONFIG++_LIBRARIES} absl::any_invocable substrait_extension)
+target_link_libraries(${LOADABLE_EXTENSION_NAME} cudf::cudf rmm::rmm substrait_extension)
 
 # Link third-party libraries
 target_link_libraries(${EXTENSION_NAME} spdlog::spdlog cuCascade::cucascade)

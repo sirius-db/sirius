@@ -59,14 +59,20 @@ impl SiriusEngine {
             let conn = duckdb::Connection::open_in_memory_with_flags(config)
                 .map_err(|e| EngineError::InitFailed(e.to_string()))?;
 
-            // Load the locally-built substrait extension.
-            let ext_path = concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../thirdparty/duckdb-substrait-extension/build/release/extension/substrait/substrait.duckdb_extension"
+            // Load locally-built extensions from the Sirius build output.
+            let sirius_root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../..");
+            let substrait_ext = format!(
+                "{}/build/release/extension/substrait/substrait.duckdb_extension",
+                sirius_root
             );
-            let load_sql = format!("LOAD '{}'", ext_path);
-            conn.execute_batch(&load_sql)
+            let sirius_ext = format!(
+                "{}/build/release/extension/sirius/sirius.duckdb_extension",
+                sirius_root
+            );
+            conn.execute_batch(&format!("LOAD '{}'", substrait_ext))
                 .map_err(|e| EngineError::InitFailed(format!("load substrait extension: {e}")))?;
+            conn.execute_batch(&format!("LOAD '{}'", sirius_ext))
+                .map_err(|e| EngineError::InitFailed(format!("load sirius extension: {e}")))?;
 
             Ok(Self { conn })
         }
@@ -77,7 +83,7 @@ impl SiriusEngine {
         }
     }
 
-    /// Execute a SQL query and return Arrow IPC stream bytes.
+    /// Execute a SQL query directly via DuckDB (CPU fallback).
     pub fn execute_sql(&self, sql: &str) -> Result<Vec<u8>, EngineError> {
         #[cfg(feature = "duckdb-bundled")]
         {
@@ -101,7 +107,31 @@ impl SiriusEngine {
         }
     }
 
-    /// Execute a Substrait plan (protobuf bytes) and return Arrow IPC stream bytes.
+    /// Execute a SQL query via Sirius GPU (`gpu_processing` table function).
+    pub fn execute_gpu(&self, sql: &str) -> Result<Vec<u8>, EngineError> {
+        #[cfg(feature = "duckdb-bundled")]
+        {
+            use arrow::record_batch::RecordBatch;
+
+            let mut stmt = self
+                .conn
+                .prepare("SELECT * FROM gpu_processing(?)")
+                .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+            let batches: Vec<RecordBatch> = stmt
+                .query_arrow(duckdb::params![sql])
+                .map_err(|e| EngineError::ExecFailed(e.to_string()))?
+                .collect();
+            batches_to_ipc(batches)
+        }
+
+        #[cfg(not(feature = "duckdb-bundled"))]
+        {
+            let _ = sql;
+            Err(EngineError::NotCompiled)
+        }
+    }
+
+    /// Execute a Substrait plan via Sirius GPU (`gpu_processing_substrait`).
     pub fn execute_substrait(&self, plan_bytes: &[u8]) -> Result<Vec<u8>, EngineError> {
         #[cfg(feature = "duckdb-bundled")]
         {
@@ -109,7 +139,7 @@ impl SiriusEngine {
 
             let mut stmt = self
                 .conn
-                .prepare("SELECT * FROM from_substrait(?::blob)")
+                .prepare("SELECT * FROM gpu_processing_substrait(?::blob)")
                 .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
             let batches: Vec<RecordBatch> = stmt
                 .query_arrow(duckdb::params![plan_bytes])
@@ -121,6 +151,27 @@ impl SiriusEngine {
         #[cfg(not(feature = "duckdb-bundled"))]
         {
             let _ = plan_bytes;
+            Err(EngineError::NotCompiled)
+        }
+    }
+
+    /// Initialize GPU buffer manager. Must be called before `execute_gpu`.
+    pub fn init_gpu_buffers(&self, cache_size: &str, processing_size: &str) -> Result<(), EngineError> {
+        #[cfg(feature = "duckdb-bundled")]
+        {
+            let sql = format!(
+                "SELECT * FROM gpu_buffer_init('{}', '{}')",
+                cache_size, processing_size
+            );
+            self.conn
+                .execute_batch(&sql)
+                .map_err(|e| EngineError::InitFailed(format!("gpu_buffer_init: {e}")))?;
+            Ok(())
+        }
+
+        #[cfg(not(feature = "duckdb-bundled"))]
+        {
+            let _ = (cache_size, processing_size);
             Err(EngineError::NotCompiled)
         }
     }
