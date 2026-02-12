@@ -16,6 +16,8 @@
 
 cmake_minimum_required(VERSION 3.30.4)
 
+project(${TARGET_NAME} LANGUAGES CXX CUDA)
+
 # Enable compile_commands.json generation for clang lsp
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 

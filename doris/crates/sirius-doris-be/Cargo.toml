@@ -1,0 +1,19 @@
+[package]
+name = "sirius-doris-be"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "sirius-doris-be"
+path = "src/main.rs"
+
+[dependencies]
+doris-thrift = { path = "../doris-thrift" }
+doris-rpc = { path = "../doris-rpc" }
+plan-translator = { path = "../plan-translator" }
+result-formatter = { path = "../result-formatter" }
+sirius-ffi = { path = "../sirius-ffi" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true

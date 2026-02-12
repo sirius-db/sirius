@@ -1,0 +1,18 @@
+[package]
+name = "sirius-ffi"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+# Enable C++ bridge compilation (requires DuckDB + Sirius + Arrow C++ libs).
+# Without this feature, stub implementations are provided.
+sirius-engine = ["dep:cxx"]
+
+[dependencies]
+cxx = { workspace = true, optional = true }
+thiserror.workspace = true
+
+[build-dependencies]
+cxx-build = "1.0"
+cmake = "0.1"

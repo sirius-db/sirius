@@ -1,0 +1,12 @@
+[package]
+name = "plan-translator"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+doris-thrift = { path = "../doris-thrift" }
+substrait.workspace = true
+prost.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true

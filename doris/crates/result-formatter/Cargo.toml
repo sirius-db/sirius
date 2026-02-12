@@ -1,0 +1,18 @@
+[package]
+name = "result-formatter"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+arrow.workspace = true
+arrow-flight.workspace = true
+# arrow-flight 54 depends on tonic 0.12, so we must match that version here
+tonic = "0.12"
+tokio.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+bytes.workspace = true
+dashmap.workspace = true
+prost.workspace = true
+futures = "0.3"

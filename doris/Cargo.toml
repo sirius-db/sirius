@@ -1,0 +1,26 @@
+[workspace]
+members = [
+    "crates/sirius-doris-be",
+    "crates/doris-thrift",
+    "crates/doris-proto",
+    "crates/doris-rpc",
+    "crates/plan-translator",
+    "crates/result-formatter",
+    "crates/sirius-ffi",
+]
+resolver = "2"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+thiserror = "2"
+dashmap = "6"
+arrow = { version = "54", features = ["ipc"] }
+arrow-flight = "54"
+tonic = "0.13"
+cxx = "1.0"
+substrait = "0.52"
+prost = "0.13"
+bytes = "1"

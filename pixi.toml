@@ -49,6 +49,18 @@ cuda-version = "12.*"
 # GPU architectures: Turing through Hopper (75, 80, 86, 90a)
 CUDAARCHS = "75-real;80-real;86-real;90a-real"
 
+# Doris Rust BE feature: extra deps for building doris/ workspace
+[feature.doris.dependencies]
+rust = ">=1.85"
+libprotobuf = ">=5"
+thrift-compiler = ">=0.22"
+
+[feature.doris.tasks]
+doris-check = { cmd = "cd doris && cargo check", description = "Check doris workspace" }
+doris-build = { cmd = "cd doris && cargo build --release", description = "Build doris workspace" }
+doris-test = { cmd = "cd doris && cargo test", description = "Test doris workspace" }
+
 [environments]
 default = ["cuda13"]
 cuda12 = ["cuda12"]
+doris = ["cuda13", "doris"]

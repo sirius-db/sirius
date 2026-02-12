@@ -1,0 +1,8 @@
+[package]
+name = "doris-thrift"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+thrift = "0.17"
+ordered-float = "4"

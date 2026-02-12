@@ -17,3 +17,6 @@
 [submodule "duckdb-python"]
 	path = duckdb-python
 	url = https://github.com/duckdb/duckdb-python.git
+[submodule "doris/thirdparty/apache-doris"]
+	path = doris/thirdparty/apache-doris
+	url = https://github.com/apache/doris.git
