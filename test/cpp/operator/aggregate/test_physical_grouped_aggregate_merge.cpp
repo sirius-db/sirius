@@ -206,3 +206,80 @@ TEMPLATE_TEST_CASE(
     sirius::test::expect_data_batch_equivalent_to_table(outputs[0], expected_table->view(), true);
   REQUIRE(tables_match);
 }
+
+TEMPLATE_TEST_CASE("sirius_physical_grouped_aggregate_merge end-to-end with AVG",
+                   "[physical_grouped_aggregate_merge]",
+                   int32_t,
+                   int64_t,
+                   float,
+                   double,
+                   int16_t,
+                   decimal64_tag)
+{
+  using Traits = gpu_type_traits<TestType>;
+
+  auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space != nullptr);
+
+  auto mr                = get_resource_ref(*space);
+  auto stream            = default_stream();
+  std::size_t num_groups = 100;
+
+  // Create test data with AVG expected values
+  auto [input_table, expected_table] =
+    sirius::test::make_test_data_for_grouped_aggregate_with_avg<Traits>(num_groups, 1, stream, mr);
+
+  // Split input into 5 batches for distributed aggregation
+  auto input_tables =
+    sirius::test::make_random_striped_split(std::move(input_table), 5, stream, mr);
+
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  auto& context = *con.context;
+
+  // Create aggregate expressions for local operator
+  auto agg_result1 = sirius::test::create_aggregate_expressions<Traits>(
+    {0},                             // GROUP BY column 0
+    {"min", "max", "count", "avg"},  // aggregations including AVG
+    {1, 1, 1, 1}                     // all on column 1
+  );
+
+  // Create aggregate expressions for merge operator
+  auto agg_result2 = sirius::test::create_aggregate_expressions<Traits>(
+    {0}, {"min", "max", "count", "avg"}, {1, 1, 1, 1});
+
+  // Create local and merge operators
+  sirius_physical_grouped_aggregate grouped_aggregator(context,
+                                                       std::move(agg_result1.output_types),
+                                                       std::move(agg_result1.aggregates),
+                                                       std::move(agg_result1.groups),
+                                                       num_groups);
+
+  sirius_physical_grouped_aggregate_merge grouped_aggregate_merger(&grouped_aggregator);
+
+  // Run local aggregation on each split
+  std::vector<std::shared_ptr<data_batch>> agg_outputs;
+  for (auto& split_table : input_tables) {
+    auto input_batch = sirius::make_data_batch(std::move(split_table), *space);
+    auto outputs     = grouped_aggregator.execute({input_batch}, default_stream());
+    REQUIRE(outputs.size() == 1);
+    agg_outputs.push_back(outputs[0]);
+  }
+
+  // Run merge with AVG projection
+  auto outputs = grouped_aggregate_merger.execute(agg_outputs, default_stream());
+  REQUIRE(outputs.size() == 1);
+
+  // Cast expected count column from int32 to int64 (merge sums int32 counts -> int64)
+  auto expected_columns = expected_table->release();
+  auto count_col_idx    = 3;  // column 0=group, 1=min, 2=max, 3=count, 4=avg
+  REQUIRE(expected_columns[count_col_idx]->type().id() == cudf::type_id::INT32);
+  expected_columns[count_col_idx] = cudf::cast(
+    expected_columns[count_col_idx]->view(), cudf::data_type{cudf::type_id::INT64}, stream, mr);
+  expected_table = std::make_unique<cudf::table>(std::move(expected_columns));
+
+  bool tables_match =
+    sirius::test::expect_data_batch_equivalent_to_table(outputs[0], expected_table->view(), true);
+  REQUIRE(tables_match);
+}

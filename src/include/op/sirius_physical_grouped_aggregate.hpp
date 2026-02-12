@@ -25,6 +25,7 @@
 #include "duckdb/execution/radix_partitioned_hashtable.hpp"
 #include "duckdb/parser/group_by_node.hpp"
 #include "duckdb/storage/data_table.hpp"
+#include "op/aggregate/aggregate_op_util.hpp"
 #include "op/sirius_physical_operator.hpp"
 
 namespace sirius {
@@ -77,6 +78,10 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
   std::vector<int> group_idx;
   std::vector<cudf::aggregation::Kind> cudf_aggregates;
   std::vector<int> cudf_aggregate_idx;
+
+  // AVG decomposition metadata
+  std::vector<AggregateSlot> aggregate_slots;
+  bool has_avg = false;
 
  public:
   // Source interface

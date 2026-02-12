@@ -15,12 +15,14 @@
  */
 #include "op/sirius_physical_grouped_aggregate_merge.hpp"
 
+#include "data/data_batch_utils.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "log/logging.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
 
-#include <iostream>
+#include <cudf/binaryop.hpp>
+#include <cudf/unary.hpp>
 
 namespace sirius {
 namespace op {
@@ -76,10 +78,12 @@ static duckdb::vector<duckdb::unsafe_vector<duckdb::idx_t>> convert_grouping_fun
 
 sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge(
   sirius_physical_grouped_aggregate* grouped_aggregate)
-  : sirius_physical_grouped_aggregate_merge(grouped_aggregate->types,  // copied by value
+  : sirius_physical_grouped_aggregate_merge(grouped_aggregate->types,
                                             grouped_aggregate->group_idx,
                                             grouped_aggregate->cudf_aggregates,
                                             grouped_aggregate->cudf_aggregate_idx,
+                                            grouped_aggregate->aggregate_slots,
+                                            grouped_aggregate->has_avg,
                                             grouped_aggregate->estimated_cardinality)
 {
   child_op = grouped_aggregate;
@@ -90,12 +94,16 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
   std::vector<int> group_idx,
   std::vector<cudf::aggregation::Kind> cudf_aggregates,
   std::vector<int> cudf_aggregate_idx,
+  std::vector<AggregateSlot> aggregate_slots,
+  bool has_avg,
   duckdb::idx_t estimated_cardinality)
   : sirius_physical_partition_consumer_operator(
       SiriusPhysicalOperatorType::MERGE_GROUP_BY, std::move(types), estimated_cardinality),
     group_idx(std::move(group_idx)),
     cudf_aggregates(std::move(cudf_aggregates)),
-    cudf_aggregate_idx(std::move(cudf_aggregate_idx))
+    cudf_aggregate_idx(std::move(cudf_aggregate_idx)),
+    aggregate_slots(std::move(aggregate_slots)),
+    has_avg(has_avg)
 {
 }
 
@@ -143,6 +151,8 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
   group_idx          = std::move(cudf_defs.group_idx);
   cudf_aggregates    = std::move(cudf_defs.cudf_aggregates);
   cudf_aggregate_idx = std::move(cudf_defs.cudf_aggregate_idx);
+  aggregate_slots    = std::move(cudf_defs.aggregate_slots);
+  has_avg            = cudf_defs.has_avg;
 }
 
 std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>>
@@ -175,18 +185,84 @@ sirius_physical_grouped_aggregate_merge::execute(
   const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches,
   rmm::cuda_stream_view stream)
 {
-  if (input_batches.size() == 0) {
+  if (input_batches.empty()) {
     throw std::runtime_error(
       "We expect at least one input batch for grouped aggregate merge operator");
   }
-  // if there is only one batch, return it. We are assuming it was already aggregated.
-  if (input_batches.size() == 1) { return input_batches; }
 
-  auto result = gpu_merge_impl::merge_grouped_aggregate(input_batches,
-                                                        group_idx.size(),
-                                                        cudf_aggregates,
-                                                        stream,
-                                                        *input_batches[0]->get_memory_space());
+  // Fast path: single batch with no AVG needs no processing
+  if (input_batches.size() == 1 && !has_avg) { return input_batches; }
+
+  // Merge multiple batches, or use single batch directly if only one
+  std::shared_ptr<::cucascade::data_batch> merged;
+  if (input_batches.size() == 1) {
+    merged = input_batches[0];
+  } else {
+    merged = gpu_merge_impl::merge_grouped_aggregate(input_batches,
+                                                     group_idx.size(),
+                                                     cudf_aggregates,
+                                                     stream,
+                                                     *input_batches[0]->get_memory_space());
+  }
+
+  // If no AVG, return merged result directly
+  if (!has_avg) { return {merged}; }
+
+  // Post-merge AVG projection: compute SUM/COUNT for each AVG aggregate.
+  // Release ownership of the merged table's columns so we can move (not copy) them.
+  auto* space        = merged->get_memory_space();
+  auto mr            = space->get_default_allocator();
+  auto& gpu_rep      = merged->get_data()->cast<cucascade::gpu_table_representation>();
+  auto merged_cols   = gpu_rep.release_table()->release();
+  int num_group_cols = static_cast<int>(group_idx.size());
+
+  std::vector<std::unique_ptr<cudf::column>> output_cols;
+
+  // Move group key columns (zero-copy)
+  for (int i = 0; i < num_group_cols; ++i) {
+    output_cols.push_back(std::move(merged_cols[i]));
+  }
+
+  // Process each original aggregate
+  for (auto const& slot : aggregate_slots) {
+    if (slot.is_avg) {
+      int sum_col_idx   = num_group_cols + static_cast<int>(slot.cudf_idx);
+      int count_col_idx = num_group_cols + static_cast<int>(slot.cudf_idx) + 1;
+
+      auto sum_view   = merged_cols[sum_col_idx]->view();
+      auto count_view = merged_cols[count_col_idx]->view();
+
+      std::unique_ptr<cudf::column> avg_col;
+      bool is_decimal = (slot.output_type.id() == cudf::type_id::DECIMAL32 ||
+                         slot.output_type.id() == cudf::type_id::DECIMAL64 ||
+                         slot.output_type.id() == cudf::type_id::DECIMAL128);
+      if (is_decimal) {
+        // DECIMAL: divide directly in fixed-point to preserve precision
+        avg_col = cudf::binary_operation(
+          sum_view, count_view, cudf::binary_operator::DIV, slot.output_type, stream, mr);
+      } else {
+        // Non-DECIMAL: cast to FLOAT64 and divide
+        auto sum_f64 = cudf::cast(sum_view, cudf::data_type{cudf::type_id::FLOAT64}, stream, mr);
+        auto count_f64 =
+          cudf::cast(count_view, cudf::data_type{cudf::type_id::FLOAT64}, stream, mr);
+        avg_col = cudf::binary_operation(sum_f64->view(),
+                                         count_f64->view(),
+                                         cudf::binary_operator::DIV,
+                                         cudf::data_type{cudf::type_id::FLOAT64},
+                                         stream,
+                                         mr);
+      }
+
+      output_cols.push_back(std::move(avg_col));
+    } else {
+      // Move non-AVG aggregate columns directly (zero-copy)
+      int col_idx = num_group_cols + static_cast<int>(slot.cudf_idx);
+      output_cols.push_back(std::move(merged_cols[col_idx]));
+    }
+  }
+
+  auto output_table = std::make_unique<cudf::table>(std::move(output_cols), stream, mr);
+  auto result       = sirius::make_data_batch(std::move(output_table), *space);
   return {result};
 }
 }  // namespace op

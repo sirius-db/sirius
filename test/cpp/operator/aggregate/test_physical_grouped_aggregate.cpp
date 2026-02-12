@@ -102,6 +102,57 @@ TEMPLATE_TEST_CASE(
   REQUIRE(tables_match);
 }
 
+TEMPLATE_TEST_CASE("sirius_physical_grouped_aggregate grouped aggregates with AVG decomposition",
+                   "[physical_grouped_aggregate]",
+                   int32_t,
+                   int64_t,
+                   float,
+                   double,
+                   int16_t,
+                   decimal64_tag)
+{
+  using Traits = gpu_type_traits<TestType>;
+
+  auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space != nullptr);
+
+  auto mr                = get_resource_ref(*space);
+  auto stream            = default_stream();
+  std::size_t num_groups = 100;
+
+  auto [input_table, expected_table] =
+    sirius::test::make_test_data_for_grouped_aggregate_with_avg<Traits>(num_groups, 1, stream, mr);
+
+  std::shared_ptr<data_batch> input_batch = sirius::make_data_batch(std::move(input_table), *space);
+
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  auto& context = *con.context;
+
+  // AVG is decomposed into SUM + COUNT_VALID internally
+  auto agg_result = sirius::test::create_aggregate_expressions<Traits>(
+    {0},                             // GROUP BY column 0
+    {"min", "max", "count", "avg"},  // aggregations including AVG
+    {1, 1, 1, 1}                     // all on column 1
+  );
+
+  sirius_physical_grouped_aggregate grouped_aggregator(context,
+                                                       std::move(agg_result.output_types),
+                                                       std::move(agg_result.aggregates),
+                                                       std::move(agg_result.groups),
+                                                       num_groups);
+
+  auto outputs = grouped_aggregator.execute({input_batch}, default_stream());
+  REQUIRE(outputs.size() == 1);
+
+  // The local operator outputs expanded columns: group_key, min, max, count, sum, count_valid
+  // (AVG decomposed into SUM + COUNT_VALID). Verify column count = 1 group + 5 aggregates.
+  auto output_table =
+    outputs[0]->get_data()->cast<cucascade::gpu_table_representation>().get_table();
+  REQUIRE(output_table.view().num_columns() == 6);  // 1 group + 3 non-avg + 2 (sum+count for avg)
+}
+
 TEMPLATE_TEST_CASE(
   "sirius_physical_grouped_aggregate grouped aggregates data_batch with multiple partition key, "
   "multiple aggregations",
