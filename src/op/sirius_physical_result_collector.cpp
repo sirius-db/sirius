@@ -53,8 +53,8 @@ sirius_physical_result_collector::sirius_physical_result_collector(
   this->types = data.prepared->types;
 }
 
-std::unique_ptr<operator_data> sirius_physical_result_collector::execute(const operator_data& input_data,
-                                                                        rmm::cuda_stream_view stream)
+std::unique_ptr<operator_data> sirius_physical_result_collector::execute(
+  const operator_data& input_data, rmm::cuda_stream_view stream)
 {
   return std::make_unique<operator_data>(input_data);
 }

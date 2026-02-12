@@ -182,7 +182,7 @@ class sirius_physical_operator {
     duckdb::ClientContext& context) const;
 
   virtual std::unique_ptr<operator_data> execute(const operator_data& input_data,
-                                                  rmm::cuda_stream_view stream);
+                                                 rmm::cuda_stream_view stream);
 
   //! The influence the operator has on order (insertion order means no influence)
   virtual duckdb::OrderPreservationType operator_order() const

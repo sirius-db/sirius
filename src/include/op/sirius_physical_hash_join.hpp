@@ -102,7 +102,8 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
 
   std::unique_ptr<operator_data> get_next_task_input_data() override;
 
-  std::unique_ptr<operator_data> execute(const operator_data& input_data, rmm::cuda_stream_view stream) override;
+  std::unique_ptr<operator_data> execute(const operator_data& input_data,
+                                         rmm::cuda_stream_view stream) override;
 
   //! Join Keys statistics (optional)
   duckdb::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> join_stats;

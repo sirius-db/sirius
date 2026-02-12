@@ -195,8 +195,8 @@ TEST_CASE("sirius_physical_merge_sort merges 2 sorted 2-column batches by col0 a
   auto out = op.execute(operator_data({batch1, batch2}));
   REQUIRE(out->get_data_batches().size() == 1);
 
-  auto table  = out->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
-  auto view   = table.view();
+  auto table = out->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
+  auto view  = table.view();
   auto out_c0 = copy_column_to_host<int64_t>(view.column(0));
   auto out_c1 = copy_column_to_host<int64_t>(view.column(1));
 
@@ -239,8 +239,8 @@ TEST_CASE("sirius_physical_merge_sort merges 2-column batches sorted by 2 keys",
   auto out = op.execute(operator_data({sorted1, sorted2}));
   REQUIRE(out->get_data_batches().size() == 1);
 
-  auto table  = out->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
-  auto view   = table.view();
+  auto table = out->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
+  auto view  = table.view();
   auto out_c0 = copy_column_to_host<int64_t>(view.column(0));
   auto out_c1 = copy_column_to_host<int64_t>(view.column(1));
 
@@ -279,8 +279,8 @@ TEST_CASE("sirius_physical_merge_sort merges 3-column batches sorted by col0, re
   auto out = op.execute(operator_data({batch1, batch2}));
   REQUIRE(out->get_data_batches().size() == 1);
 
-  auto table  = out->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
-  auto view   = table.view();
+  auto table = out->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
+  auto view  = table.view();
   auto out_c0 = copy_column_to_host<int64_t>(view.column(0));
   auto out_c1 = copy_column_to_host<int64_t>(view.column(1));
   auto out_c2 = copy_column_to_host<int64_t>(view.column(2));
@@ -326,8 +326,8 @@ TEST_CASE("sirius_physical_merge_sort 3 columns sorted by col0 asc + col1 desc",
   auto out = op.execute(operator_data({sorted1, sorted2}));
   REQUIRE(out->get_data_batches().size() == 1);
 
-  auto table  = out->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
-  auto view   = table.view();
+  auto table = out->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
+  auto view  = table.view();
   auto out_c0 = copy_column_to_host<int64_t>(view.column(0));
   auto out_c1 = copy_column_to_host<int64_t>(view.column(1));
   auto out_c2 = copy_column_to_host<int64_t>(view.column(2));

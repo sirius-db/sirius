@@ -52,7 +52,7 @@ sirius_physical_merge_sort::sirius_physical_merge_sort(
 }
 
 std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(const operator_data& input_data,
-                                                                  rmm::cuda_stream_view stream)
+                                                                   rmm::cuda_stream_view stream)
 {
   const auto& input_batches = input_data.get_data_batches();
 

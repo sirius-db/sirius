@@ -152,8 +152,8 @@ void sirius_physical_right_delim_join::build_pipelines(
   sirius_physical_hash_join::build_join_pipelines(current, meta_pipeline, *join, false);
 }
 
-std::unique_ptr<operator_data> sirius_physical_right_delim_join::execute(const operator_data& input_data,
-                                                                        rmm::cuda_stream_view stream)
+std::unique_ptr<operator_data> sirius_physical_right_delim_join::execute(
+  const operator_data& input_data, rmm::cuda_stream_view stream)
 {
   return std::make_unique<operator_data>(input_data);
 }
@@ -173,8 +173,8 @@ void sirius_physical_right_delim_join::sink(const operator_data& input_data,
   partition_distinct->sink(*partition_distinct_output, stream);
 }
 
-std::unique_ptr<operator_data> sirius_physical_left_delim_join::execute(const operator_data& input_data,
-                                                                       rmm::cuda_stream_view stream)
+std::unique_ptr<operator_data> sirius_physical_left_delim_join::execute(
+  const operator_data& input_data, rmm::cuda_stream_view stream)
 {
   return std::make_unique<operator_data>(input_data);
 }

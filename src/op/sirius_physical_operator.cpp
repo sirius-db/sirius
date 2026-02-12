@@ -188,7 +188,7 @@ void sirius_physical_operator::sink(const operator_data& output_data, rmm::cuda_
 }
 
 std::unique_ptr<operator_data> sirius_physical_operator::execute(const operator_data& input_data,
-                                                                rmm::cuda_stream_view stream)
+                                                                 rmm::cuda_stream_view stream)
 {
   // not doing anything for now
   return std::make_unique<operator_data>(std::vector<std::shared_ptr<::cucascade::data_batch>>{});

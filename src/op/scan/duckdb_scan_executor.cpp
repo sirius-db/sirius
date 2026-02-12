@@ -133,8 +133,8 @@ void duckdb_scan_executor::submit_scan_request()
     _task_request_publisher.send(std::make_unique<sirius::pipeline::task_request>(0, true));
 }
 
-std::unique_ptr<op::operator_data> duckdb_scan_executor::get_scan_output(op::scan::duckdb_scan_task* task,
-                                                        rmm::cuda_stream_view stream)
+std::unique_ptr<op::operator_data> duckdb_scan_executor::get_scan_output(
+  op::scan::duckdb_scan_task* task, rmm::cuda_stream_view stream)
 {
   if (!_caching_enabled) {
     return task->compute_task(stream);

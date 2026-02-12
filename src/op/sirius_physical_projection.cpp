@@ -42,7 +42,7 @@ sirius_physical_projection::sirius_physical_projection(
 }
 
 std::unique_ptr<operator_data> sirius_physical_projection::execute(const operator_data& input_data,
-                                                                  rmm::cuda_stream_view stream)
+                                                                   rmm::cuda_stream_view stream)
 {
   const auto& input_batches = input_data.get_data_batches();
   SIRIUS_LOG_DEBUG("Executing projection");

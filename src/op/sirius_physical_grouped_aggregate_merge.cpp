@@ -179,8 +179,8 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::get_next
   }
 }
 
-std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(const operator_data& input_data,
-                                                                               rmm::cuda_stream_view stream)
+std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
+  const operator_data& input_data, rmm::cuda_stream_view stream)
 {
   const auto& input_batches = input_data.get_data_batches();
   if (input_batches.size() == 0) {
@@ -204,7 +204,10 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
   }
 
   // If no AVG, return merged result directly
-  if (!has_avg) { return std::make_unique<operator_data>(std::vector<std::shared_ptr<::cucascade::data_batch>>{merged}); }
+  if (!has_avg) {
+    return std::make_unique<operator_data>(
+      std::vector<std::shared_ptr<::cucascade::data_batch>>{merged});
+  }
 
   // Post-merge AVG projection: compute SUM/COUNT for each AVG aggregate.
   // Release ownership of the merged table's columns so we can move (not copy) them.
@@ -261,7 +264,8 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
 
   auto output_table = std::make_unique<cudf::table>(std::move(output_cols), stream, mr);
   auto result       = sirius::make_data_batch(std::move(output_table), *space);
-  return std::make_unique<operator_data>(std::vector<std::shared_ptr<::cucascade::data_batch>>{result});
+  return std::make_unique<operator_data>(
+    std::vector<std::shared_ptr<::cucascade::data_batch>>{result});
 }
 }  // namespace op
 }  // namespace sirius

@@ -304,8 +304,8 @@ std::unique_ptr<cudf::column> make_avg_column(const cudf::column_view& sum_view,
 
 }  // namespace
 
-std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(const operator_data& input_data,
-                                                                           rmm::cuda_stream_view stream)
+std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
+  const operator_data& input_data, rmm::cuda_stream_view stream)
 {
   const auto& input_batches = input_data.get_data_batches();
   if (aggregates.empty()) {
@@ -422,8 +422,8 @@ sirius_physical_ungrouped_aggregate_merge::sirius_physical_ungrouped_aggregate_m
     duckdb::make_uniq<duckdb::DistinctAggregateData>(*distinct_collection_info, distinct_validity);
 }
 
-std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execute(const operator_data& input_data,
-                                                                                 rmm::cuda_stream_view stream)
+std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execute(
+  const operator_data& input_data, rmm::cuda_stream_view stream)
 {
   const auto& input_batches = input_data.get_data_batches();
   if (aggregates.empty()) {

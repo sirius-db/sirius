@@ -56,7 +56,7 @@ sirius_physical_filter::sirius_physical_filter(
 }
 
 std::unique_ptr<operator_data> sirius_physical_filter::execute(const operator_data& input_data,
-                                                              rmm::cuda_stream_view stream)
+                                                               rmm::cuda_stream_view stream)
 {
   SIRIUS_LOG_DEBUG("Executing expression {}", expression->ToString());
   auto start = std::chrono::high_resolution_clock::now();

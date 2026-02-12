@@ -47,8 +47,8 @@ sirius_physical_sort_partition::sirius_physical_sort_partition(
 {
 }
 
-std::unique_ptr<operator_data> sirius_physical_sort_partition::execute(const operator_data& input_data,
-                                                                      rmm::cuda_stream_view stream)
+std::unique_ptr<operator_data> sirius_physical_sort_partition::execute(
+  const operator_data& input_data, rmm::cuda_stream_view stream)
 {
   const auto& input_batches = input_data.get_data_batches();
 

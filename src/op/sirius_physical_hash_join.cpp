@@ -398,9 +398,8 @@ static join_keys_result prepare_join_keys(
   return result;
 }
 
-std::unique_ptr<operator_data> sirius_physical_hash_join::execute(
-  const operator_data& input_data,
-  rmm::cuda_stream_view stream)
+std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator_data& input_data,
+                                                                  rmm::cuda_stream_view stream)
 {
   const auto& input_batches = input_data.get_data_batches();
   if (input_batches.size() != 2) {

@@ -78,7 +78,7 @@ duckdb::vector<duckdb::const_reference<sirius_physical_operator>> sirius_physica
 }
 
 std::unique_ptr<operator_data> sirius_physical_cte::execute(const operator_data& input_data,
-                                                           rmm::cuda_stream_view stream)
+                                                            rmm::cuda_stream_view stream)
 {
   return std::make_unique<operator_data>(input_data);
 }

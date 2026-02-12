@@ -83,8 +83,7 @@ std::unique_ptr<operator_data> sirius_physical_concat::get_next_task_input_data(
     auto batch_ids          = port_ptr->repo->get_batch_ids(i);
     size_t total_batch_size = 0;
     for (auto& batch_id : batch_ids) {
-      auto batch =
-        port_ptr->repo->get_data_batch_by_id(batch_id, std::nullopt, i);
+      auto batch      = port_ptr->repo->get_data_batch_by_id(batch_id, std::nullopt, i);
       auto batch_size = batch->get_data()->get_size_in_bytes();
       total_batch_size += batch_size;
       // Check if the batch size is already exceed the threshold
@@ -107,14 +106,15 @@ std::unique_ptr<operator_data> sirius_physical_concat::get_next_task_input_data(
         input_batch.push_back(std::move(popped_batch));
       }
     }
-    if (input_batch.size() != 0) { 
-      return std::make_unique<partitioned_operator_data>(std::move(input_batch), i); }
+    if (input_batch.size() != 0) {
+      return std::make_unique<partitioned_operator_data>(std::move(input_batch), i);
+    }
   }
   return nullptr;
 }
 
 std::unique_ptr<operator_data> sirius_physical_concat::execute(const operator_data& input_data,
-                                                              rmm::cuda_stream_view stream)
+                                                               rmm::cuda_stream_view stream)
 {
   auto partitioned_input_data = dynamic_cast<const partitioned_operator_data*>(&input_data);
   if (partitioned_input_data == nullptr) {
@@ -129,8 +129,8 @@ std::unique_ptr<operator_data> sirius_physical_concat::execute(const operator_da
     if (batch) { valid_batches.push_back(batch); }
   }
   if (valid_batches.empty()) {
-    return std::make_unique<partitioned_operator_data>(std::vector<std::shared_ptr<cucascade::data_batch>>{},
-                                     partition_idx);
+    return std::make_unique<partitioned_operator_data>(
+      std::vector<std::shared_ptr<cucascade::data_batch>>{}, partition_idx);
   }
 
   cucascade::memory::memory_space* space = valid_batches[0]->get_memory_space();

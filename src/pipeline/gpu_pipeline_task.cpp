@@ -123,8 +123,8 @@ const sirius_pipeline* gpu_pipeline_task::get_pipeline() const
 
 std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_stream_view stream)
 {
-  auto& local_state                = _local_state->cast<gpu_pipeline_task_local_state>();
-  auto operator_input_output_data  = std::move(local_state._input_data);
+  auto& local_state               = _local_state->cast<gpu_pipeline_task_local_state>();
+  auto operator_input_output_data = std::move(local_state._input_data);
 
   for (auto& op :
        _global_state->cast<gpu_pipeline_task_global_state>()._pipeline.get()->get_operators()) {
@@ -177,7 +177,6 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
 
   // At this point, all input batches are locked for processing.
   // They will remain locked until the processing_handles go out of scope.
-
 
   // 2. Set reservation_aware_memory_resource_ref as the default cudf allocator
   // 3. Execute cudf operators on the pipeline

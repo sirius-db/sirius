@@ -12,8 +12,10 @@
 	branch = main
 [submodule "cucascade"]
 	path = cucascade
-	url = https://github.com/NVIDIA/cuCascade.git
-	branch = main
+	# url = https://github.com/NVIDIA/cuCascade.git
+	# branch = main
+	url = https://github.com/wmalpica/cuCascade.git
+	branch = weak_ptr_data_b_handle
 [submodule "duckdb-python"]
 	path = duckdb-python
 	url = https://github.com/duckdb/duckdb-python.git

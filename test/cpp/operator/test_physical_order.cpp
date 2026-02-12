@@ -171,8 +171,8 @@ TEST_CASE("sirius_physical_order sorts by col0, returns both columns", "[physica
   auto out = op.execute(operator_data({batch}));
   REQUIRE(out->get_data_batches().size() == 1);
 
-  auto table  = out->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
-  auto view   = table.view();
+  auto table = out->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
+  auto view  = table.view();
   auto out_c0 = copy_column_to_host<int64_t>(view.column(0));
   auto out_c1 = copy_column_to_host<int64_t>(view.column(1));
 
@@ -207,8 +207,8 @@ TEST_CASE("sirius_physical_order sorts by 2 keys (asc, desc)", "[physical_order]
   auto out = op.execute(operator_data({batch}));
   REQUIRE(out->get_data_batches().size() == 1);
 
-  auto table  = out->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
-  auto view   = table.view();
+  auto table = out->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
+  auto view  = table.view();
   auto out_c0 = copy_column_to_host<int64_t>(view.column(0));
   auto out_c1 = copy_column_to_host<int64_t>(view.column(1));
 
@@ -277,8 +277,8 @@ TEST_CASE("sirius_physical_order 3 columns, sort by col0 asc, return all", "[phy
   auto out = op.execute(operator_data({batch}));
   REQUIRE(out->get_data_batches().size() == 1);
 
-  auto table  = out->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
-  auto view   = table.view();
+  auto table = out->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
+  auto view  = table.view();
   auto out_c0 = copy_column_to_host<int64_t>(view.column(0));
   auto out_c1 = copy_column_to_host<int64_t>(view.column(1));
   auto out_c2 = copy_column_to_host<int64_t>(view.column(2));
@@ -321,8 +321,8 @@ TEST_CASE("sirius_physical_order 3 columns, sort by col0 asc + col1 desc, return
   auto out = op.execute(operator_data({batch}));
   REQUIRE(out->get_data_batches().size() == 1);
 
-  auto table  = out->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
-  auto view   = table.view();
+  auto table = out->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
+  auto view  = table.view();
   auto out_c0 = copy_column_to_host<int64_t>(view.column(0));
   auto out_c1 = copy_column_to_host<int64_t>(view.column(1));
   auto out_c2 = copy_column_to_host<int64_t>(view.column(2));
