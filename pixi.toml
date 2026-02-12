@@ -56,9 +56,9 @@ libprotobuf = ">=5"
 thrift-compiler = ">=0.22"
 
 [feature.doris.tasks]
-doris-check = { cmd = "cd doris && cargo check", description = "Check doris workspace" }
-doris-build = { cmd = "cd doris && cargo build --release", description = "Build doris workspace" }
-doris-test = { cmd = "cd doris && cargo test", description = "Test doris workspace" }
+doris-check = { cmd = "cargo check", cwd = "doris", description = "Check doris workspace" }
+doris-build = { cmd = "cargo build --release", cwd = "doris", description = "Build doris workspace" }
+doris-test = { cmd = "cargo test", cwd = "doris", description = "Test doris workspace" }
 
 # Doris FE feature: build & run Doris Frontend from source for testing
 [feature.doris-fe.dependencies]
@@ -96,10 +96,6 @@ doris-fe-thrift = { cmd = """bash -c 'set -e
 doris-fe-build = { cmd = """bash -c 'set -e
   DORIS_SRC=doris/thirdparty/apache-doris
   THRIFT=doris/thirdparty/thrift-0.16.0/build/compiler/cpp/bin/thrift
-  if [ ! -x "$THRIFT" ]; then
-    echo "ERROR: thrift 0.16.0 not built. Run: pixi run -e doris-fe doris-fe-thrift"
-    exit 1
-  fi
 
   echo "==> Generating Java Thrift stubs with thrift 0.16.0..."
   THRIFT_DIR=$DORIS_SRC/gensrc/thrift
@@ -137,21 +133,9 @@ doris-fe-build = { cmd = """bash -c 'set -e
   cp fe/fe-core/target/lib/* output/fe/lib/
   cp fe/fe-core/target/doris-fe.jar output/fe/lib/
   echo "==> Done"
-'""", description = "Build Doris FE from source (Maven)" }
+'""", depends-on = ["doris-fe-thrift"], description = "Build Doris FE from source (Maven)" }
 
-doris-fe-start = { cmd = """bash -c '
-  DORIS_FE=doris/thirdparty/apache-doris/output/fe
-  if [ ! -f $DORIS_FE/lib/doris-fe.jar ]; then
-    echo "FE not built yet. Run: pixi run -e doris-fe doris-fe-build"
-    exit 1
-  fi
-  cd $DORIS_FE && bin/start_fe.sh --console
-'""", description = "Start Doris FE in console mode" }
-
-doris-fe-stop = { cmd = """bash -c '
-  pkill -f DorisFE 2>/dev/null || true
-  echo "FE stopped"
-'""", description = "Stop Doris FE" }
+doris-fe = { cmd = "bin/start_fe.sh --console", cwd = "doris/thirdparty/apache-doris/output/fe", depends-on = ["doris-fe-build"], description = "Build and run Doris FE in foreground" }
 
 doris-fe-add-be = { cmd = "bash -c 'mysql -h 127.0.0.1 -P 9030 -u root -e \"ALTER SYSTEM ADD BACKEND \\\"127.0.0.1:9050\\\";\" && echo \"Backend added. Run: pixi run -e doris-fe doris-fe-show-be\"'", description = "Register Rust BE with Doris FE" }
 
