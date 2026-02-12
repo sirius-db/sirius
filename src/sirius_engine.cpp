@@ -45,7 +45,6 @@
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
 
 #include <cucascade/data/data_repository_manager.hpp>
-#include <stdio.h>
 
 namespace sirius {
 
@@ -943,31 +942,6 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
         }
       }
     }
-
-    // printf: describe every pipeline in new_scheduled and its operators
-    printf("\n=== new_scheduled pipelines (%zu total) ===\n", new_scheduled.size());
-    for (size_t i = 0; i < new_scheduled.size(); i++) {
-      auto* p = new_scheduled[i].get();
-      printf("Pipeline[%zu] id=%zu\n", i, p->get_pipeline_id());
-      if (p->source) {
-        printf("  source: %s\n", p->source.get()->get_name().c_str());
-      } else {
-        printf("  source: (null)\n");
-      }
-      printf("  operators (%zu):", p->operators.size());
-      for (size_t j = 0; j < p->operators.size(); j++) {
-        printf(" %s%s", p->operators[j].get().get_name().c_str(),
-               j + 1 < p->operators.size() ? "," : "");
-      }
-      printf("\n");
-      if (p->sink) {
-        printf("  sink: %s\n", p->sink.get()->get_name().c_str());
-      } else {
-        printf("  sink: (null)\n");
-      }
-      printf("  parents: %zu\n", p->parents.size());
-    }
-    printf("=== end new_scheduled ===\n\n");
 
     // Detailed pipeline debugging information
     SIRIUS_LOG_INFO("\n=== DETAILED PIPELINE DEBUG INFO ===");

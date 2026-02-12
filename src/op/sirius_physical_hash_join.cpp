@@ -87,6 +87,10 @@ sirius_physical_hash_join::sirius_physical_hash_join(
     delim_types(std::move(delim_types))
 {
   
+  if (join_type == duckdb::JoinType::ANTI  ||
+    join_type == duckdb::JoinType::MARK) {
+      throw std::runtime_error("Unsupported join type: " + duckdb::JoinTypeToString(join_type)); 
+  }
 
   reorder_join_conditions(conditions);
 
@@ -94,16 +98,6 @@ sirius_physical_hash_join::sirius_physical_hash_join(
 
   children.push_back(std::move(left));
   children.push_back(std::move(right));
-
-  // duckdb::unordered_map<duckdb::idx_t, duckdb::idx_t> build_columns_in_conditions;
-  // for (duckdb::idx_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
-  //   auto& condition = conditions[cond_idx];
-  //   condition_types.push_back(condition.left->return_type);
-  //   if (condition.right->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
-  //     build_columns_in_conditions.emplace(
-  //       condition.right->Cast<duckdb::BoundReferenceExpression>().index, cond_idx);
-  //   }
-  // }
 
   auto& lhs_input_types = children[0]->get_types();
 
@@ -127,43 +121,9 @@ sirius_physical_hash_join::sirius_physical_hash_join(
     auto& lhs_col_type = lhs_input_types[lhs_col];
     lhs_output_columns.col_types.push_back(lhs_col_type);
   }
-
-  if (join_type == duckdb::JoinType::ANTI  ||
-      join_type == duckdb::JoinType::MARK) {
-        throw std::runtime_error("Unsupported join type: " + duckdb::JoinTypeToString(join_type));
-    // materialized_build_key =
-    //   duckdb::make_shared_ptr<GPUIntermediateRelation>(build_columns_in_conditions.size());
-    // hash_table_result =
-    //   duckdb::make_shared_ptr<GPUIntermediateRelation>(build_columns_in_conditions.size());
-    return;
-  }
+ 
 
   auto& rhs_input_types = children[1]->get_types();
-
-  // std::vector<cudf::size_type> right_projection_cudf(right_projection_map.begin(),
-  //                                                   right_projection_map.end());
-  // if (right_projection_cudf.empty()) {
-  //   right_projection_cudf.reserve(rhs_input_types.size());
-  //   for (duckdb::idx_t i = 0; i < rhs_input_types.size(); i++) {
-  //     right_projection_cudf.emplace_back(static_cast<cudf::size_type>(i));
-  //   }
-  // }
-
-  // for (auto rhs_col : right_projection_cudf) {
-  //   auto& rhs_col_type = rhs_input_types[rhs_col];
-
-  //   auto it = build_columns_in_conditions.find(static_cast<duckdb::idx_t>(rhs_col));
-  //   if (it == build_columns_in_conditions.end()) {
-  //     payload_columns.col_idxs.push_back(rhs_col);
-  //     payload_columns.col_types.push_back(rhs_col_type);
-  //     rhs_output_columns.col_idxs.push_back(static_cast<cudf::size_type>(
-  //       condition_types.size() + payload_columns.col_types.size() - 1));
-  //   } else {
-  //     rhs_output_columns.col_idxs.push_back(static_cast<cudf::size_type>(it->second));
-  //   }
-  //   rhs_output_columns.col_types.push_back(rhs_col_type);
-  // }
-
   if (right_projection_map.empty()) {
     rhs_output_columns.col_idxs.reserve(rhs_input_types.size());
     for (duckdb::idx_t i = 0; i < rhs_input_types.size(); i++) {
@@ -214,7 +174,6 @@ sirius_physical_hash_join::sirius_physical_hash_join(
       cast_info.left_target_type = duckdb::GetCudfType(condition.left->return_type);
       cast_necessary = true;
     } else {
-      printf("Unsupported left expression class: %s\n", condition.left->ToString().c_str());
       throw std::runtime_error("Unsupported join condition left expression");
     }
 
@@ -231,60 +190,12 @@ sirius_physical_hash_join::sirius_physical_hash_join(
       cast_info.right_target_type = duckdb::GetCudfType(condition.right->return_type);
       cast_necessary = true;
     } else {
-      printf("Unsupported right expression class: %s\n", condition.right->ToString().c_str());
       throw std::runtime_error("Unsupported join condition right expression");
     }
 
     key_casts.push_back(cast_info);
   }
-
-  printf("sirius_physical_hash_join::sirius_physical_hash_join\n");
-  printf("  class: sirius_physical_hash_join\n");
-  printf("  left: %s\n", left ? left->get_name().c_str() : "(null)");
-  printf("  right: %s\n", right ? right->get_name().c_str() : "(null)");
-  printf("  join_type: %d\n", static_cast<int>(join_type));
-  printf("  conditions.size(): %zu\n", conditions.size());
-  printf("  delim_types.size(): %zu\n", this->delim_types.size());
-  printf("  estimated_cardinality: %llu\n", static_cast<unsigned long long>(estimated_cardinality));
-  printf("  pushdown_info: %s\n", pushdown_info_p ? "non-null" : "null");
-  printf("  is_equality_join: %s\n", is_equality_join ? "true" : "false");
-  printf("  cast_necessary: %s\n", cast_necessary ? "true" : "false");
-  printf("  left_key_col_indices: [");
-  for (size_t i = 0; i < left_key_col_indices.size(); i++) {
-    printf("%s%zu", i ? ", " : "", static_cast<size_t>(left_key_col_indices[i]));
-  }
-  printf("] (size=%zu)\n", left_key_col_indices.size());
-  printf("  right_key_col_indices: [");
-  for (size_t i = 0; i < right_key_col_indices.size(); i++) {
-    printf("%s%zu", i ? ", " : "", static_cast<size_t>(right_key_col_indices[i]));
-  }
-  printf("] (size=%zu)\n", right_key_col_indices.size());
-  printf("  payload_columns: col_idxs=[");
-  for (size_t i = 0; i < payload_columns.col_idxs.size(); i++) {
-    printf("%s%zu", i ? ", " : "", static_cast<size_t>(payload_columns.col_idxs[i]));
-  }
-  printf("] (size=%zu), col_types.size()=%zu\n",
-         payload_columns.col_idxs.size(),
-         payload_columns.col_types.size());
-  printf("  lhs_output_columns: col_idxs=[");
-  for (size_t i = 0; i < lhs_output_columns.col_idxs.size(); i++) {
-    printf("%s%zu", i ? ", " : "", static_cast<size_t>(lhs_output_columns.col_idxs[i]));
-  }
-  printf("] (size=%zu), col_types.size()=%zu\n",
-         lhs_output_columns.col_idxs.size(),
-         lhs_output_columns.col_types.size());
-  printf("  rhs_output_columns: col_idxs=[");
-  for (size_t i = 0; i < rhs_output_columns.col_idxs.size(); i++) {
-    printf("%s%zu", i ? ", " : "", static_cast<size_t>(rhs_output_columns.col_idxs[i]));
-  }
-  printf("] (size=%zu), col_types.size()=%zu\n",
-         rhs_output_columns.col_idxs.size(),
-         rhs_output_columns.col_types.size());
-  // hash_table_result =
-  // duckdb::make_shared_ptr<GPUIntermediateRelation>(build_columns_in_conditions.size() +
-  //                                                              payload_columns.col_idxs.size());
-  // materialized_build_key =
-  //   duckdb::make_shared_ptr<GPUIntermediateRelation>(build_columns_in_conditions.size());
+  
 };
 
 //===--------------------------------------------------------------------===//
@@ -359,13 +270,6 @@ void sirius_physical_hash_join::build_pipelines(pipeline::sirius_pipeline& curre
 
 std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>> sirius_physical_hash_join::get_next_task_input_batch()
 {
-  printf("sirius_physical_hash_join::get_next_task_input_batch 0\n");
-  // print all the port names
-  // printf("  ports: ");
-  // for (auto& [port_name, port_ptr] : ports) {
-  //   printf("%s ", port_name.c_str());
-  // }
-  // printf("\n");
   size_t batch_index = 0;
   {
     std::lock_guard<std::mutex> lg(batches_to_processed_mutex);
@@ -376,25 +280,11 @@ std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>> sirius_phys
 
       left_batch_ids.reserve(ports["default"]->repo->num_partitions());
       right_batch_ids.reserve(ports["build"]->repo->num_partitions());
-      printf("ports[\"default\"]->repo->num_partitions(): %zu\n", ports["default"]->repo->num_partitions());
       for (size_t i = 0; i < ports["default"]->repo->num_partitions(); i++) {
         left_batch_ids.push_back(ports["default"]->repo->get_batch_ids(i));
         right_batch_ids.push_back(ports["build"]->repo->get_batch_ids(i));
         num_batches_to_process += left_batch_ids[i].size() * right_batch_ids[i].size();
-        printf("partition %zu: left_batch_ids.size(): %zu, right_batch_ids.size(): %zu\n", i, left_batch_ids[i].size(), right_batch_ids[i].size());
-        // the contents of left_batch_ids and right_batch_ids are the batch ids, print the contents of left_batch_ids and right_batch_ids
-        printf("left_batch_ids[%zu]: ", i);
-        for (auto& batch_id : left_batch_ids[i]) {
-          printf("%zu ", batch_id);
-        }
-        printf("\n");
-        printf("right_batch_ids[%zu]: ", i);
-        for (auto& batch_id : right_batch_ids[i]) {
-          printf("%zu ", batch_id);
-        }
-        printf("\n");
       }
-      printf("ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ  num_batches_to_process: %zu\n", num_batches_to_process);
     }
     if (current_partition_index < num_batches_to_process) {
       batch_index = current_partition_index;
@@ -403,7 +293,6 @@ std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>> sirius_phys
       return std::nullopt;
     }
   }
-  printf("sirius_physical_hash_join::get_next_task_input_batch batch_index: %zu\n", batch_index);
 
   std::vector<std::shared_ptr<::cucascade::data_batch>> input_batch;
   input_batch.reserve(2);
@@ -411,39 +300,28 @@ std::optional<std::vector<std::shared_ptr<::cucascade::data_batch>>> sirius_phys
   for (size_t partition_idx = 0; partition_idx < left_batch_ids.size(); partition_idx++) {
     size_t left_counter = 0;
     for (auto& left_batch_id : left_batch_ids[partition_idx]) {
-      printf("starting loop for left_batch_id: %zu\n", left_batch_id);
       size_t right_counter = 0;
       for (auto& right_batch_id : right_batch_ids[partition_idx]) {
         if (counter == batch_index) {  
           if (right_counter == right_batch_ids[partition_idx].size() - 1) {
-            printf("popping left batch %zu\n", left_batch_id);
             input_batch.push_back(ports["default"]->repo->pop_data_batch_by_id(left_batch_id, cucascade::batch_state::task_created, partition_idx));  
           } else {
-            printf("getting left batch %zu\n", left_batch_id);
             input_batch.push_back(ports["default"]->repo->get_data_batch_by_id(left_batch_id, cucascade::batch_state::task_created, partition_idx));
           }
           if (left_counter == left_batch_ids[partition_idx].size() - 1) {
-            printf("popping right batch %zu\n", right_batch_id);
             input_batch.push_back(ports["build"]->repo->pop_data_batch_by_id(right_batch_id, cucascade::batch_state::task_created, partition_idx));
           } else {
-            printf("getting right batch %zu\n", right_batch_id);
             input_batch.push_back(ports["build"]->repo->get_data_batch_by_id(right_batch_id, cucascade::batch_state::task_created, partition_idx));
           }
-          printf("returning left_counter: %zu, right_counter: %zu\n", left_counter, right_counter);
-          printf("input_batch[0]->get_data()->get_size_in_bytes(): %zu\n", input_batch[0]->get_data()->get_size_in_bytes());
-          printf("input_batch[1]->get_data()->get_size_in_bytes(): %zu\n", input_batch[1]->get_data()->get_size_in_bytes());
           return input_batch;
         }
         right_counter++;
         counter++;
       }      
       left_counter++;
-      printf("left_counter: %zu\n", left_counter);
     }
-    printf("counter: %zu\n", counter);    
   }  
   if (input_batch.size() == 0) {
-    printf("input_batch.size() == 0\n");
     return std::nullopt;
   } else {
     throw std::runtime_error("Expected to have returned already or received nothing, but got " + std::to_string(input_batch.size()) + " input batches for hash join");
@@ -492,10 +370,6 @@ static join_keys_result prepare_join_keys(
     // Left key column
     cudf::column_view left_col = left_table.column(left_key_col_indices[i]);
     if (cast_info.cast_left) {
-      printf("  casting left key column %zu from %s to %s\n",
-             i,
-             cudf::type_to_name(left_col.type()).c_str(),
-             cudf::type_to_name(cast_info.left_target_type).c_str());
       auto cast_col = cudf::cast(left_col, cast_info.left_target_type, stream);
       result.left_key_views.push_back(cast_col->view());
       result.owned_cast_columns.push_back(std::move(cast_col));
@@ -506,10 +380,6 @@ static join_keys_result prepare_join_keys(
     // Right key column
     cudf::column_view right_col = right_table.column(right_key_col_indices[i]);
     if (cast_info.cast_right) {
-      printf("  casting right key column %zu from %s to %s\n",
-             i,
-             cudf::type_to_name(right_col.type()).c_str(),
-             cudf::type_to_name(cast_info.right_target_type).c_str());
       auto cast_col = cudf::cast(right_col, cast_info.right_target_type, stream);
       result.right_key_views.push_back(cast_col->view());
       result.owned_cast_columns.push_back(std::move(cast_col));
@@ -528,9 +398,6 @@ std::vector<std::shared_ptr<::cucascade::data_batch>> sirius_physical_hash_join:
   const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches,
   rmm::cuda_stream_view stream)
 {
-  // printf("sirius_physical_hash_join::execute 0\n");
-  // printf("  input_batches.size(): %zu\n", input_batches.size());
-
   if (input_batches.size() != 2) {
     throw std::runtime_error("Expected 2 input batches for hash join, got " + std::to_string(input_batches.size()));
   }
@@ -544,10 +411,6 @@ std::vector<std::shared_ptr<::cucascade::data_batch>> sirius_physical_hash_join:
                                   cast_necessary, key_casts, stream);
     cudf::table_view left_keys = keys.left_keys;
     cudf::table_view right_keys = keys.right_keys;
-    // printf("left keys size: %zu\n", left_keys.num_rows());
-    // printf("right keys size: %zu\n", right_keys.num_rows());
-    // std::pair<std::unique_ptr<rmm::device_uvector<size_type>>,
-    //       std::unique_ptr<rmm::device_uvector<size_type>>> join_result;
     std::unique_ptr<rmm::device_uvector<cudf::size_type>> left_indices, right_indices;
     bool collect_left = true;
     bool collect_right = true;
@@ -585,13 +448,6 @@ std::vector<std::shared_ptr<::cucascade::data_batch>> sirius_physical_hash_join:
       
     std::vector<std::unique_ptr<cudf::column>> out_cols;
     if (collect_left) {
-      printf("collect left\n");
-      // print lhs_output_columns.col_idxs
-      printf("  lhs_output_columns.col_idxs: [");
-      for (size_t i = 0; i < lhs_output_columns.col_idxs.size(); i++) {
-        printf("%s%zu", i ? ", " : "", static_cast<size_t>(lhs_output_columns.col_idxs[i]));
-      }
-      printf("] (size=%zu)\n", lhs_output_columns.col_idxs.size());
       cudf::table_view left_cols_to_gather = get_cudf_table_view(*input_batches[0]).select(lhs_output_columns.col_idxs);
       cudf::column_view left_map_view(cudf::data_type(cudf::type_id::INT32),
                                     left_indices->size(),
@@ -600,19 +456,10 @@ std::vector<std::shared_ptr<::cucascade::data_batch>> sirius_physical_hash_join:
                                     0,
                                     0,
                                     {});
-      // printf("before left gather\n");
       auto left_result = cudf::gather(left_cols_to_gather, left_map_view, left_out_of_bounds_policy, stream);
-      // printf("after left gather\n");
       out_cols = left_result->release();
     }
     if (collect_right) {
-      printf("collect right\n");
-      // print rhs_output_columns.col_idxs
-      printf("  rhs_output_columns.col_idxs: [");
-      for (size_t i = 0; i < rhs_output_columns.col_idxs.size(); i++) {
-        printf("%s%zu", i ? ", " : "", static_cast<size_t>(rhs_output_columns.col_idxs[i]));
-      }
-      printf("] (size=%zu)\n", rhs_output_columns.col_idxs.size());
       cudf::table_view right_cols_to_gather = get_cudf_table_view(*input_batches[1]).select(rhs_output_columns.col_idxs);
       cudf::column_view right_map_view(cudf::data_type(cudf::type_id::INT32),
                                       right_indices->size(),
@@ -621,9 +468,7 @@ std::vector<std::shared_ptr<::cucascade::data_batch>> sirius_physical_hash_join:
                                       0,
                                       0,
                                       {});
-      // printf("before right gather\n");
       auto right_result = cudf::gather(right_cols_to_gather, right_map_view, right_out_of_bounds_policy, stream);
-      // printf("after right gather\n");
       auto right_out_cols = right_result->release();
       for (auto& col : right_out_cols) {
         out_cols.push_back(std::move(col));
@@ -631,7 +476,6 @@ std::vector<std::shared_ptr<::cucascade::data_batch>> sirius_physical_hash_join:
     }
     
     auto output_cudf_table = std::make_unique<cudf::table>(std::move(out_cols), stream);
-    // printf("output cudf table size: %zu\n", output_cudf_table->num_rows());
     return std::vector<std::shared_ptr<cucascade::data_batch>>{
         make_data_batch(std::move(output_cudf_table), *input_batches[0]->get_memory_space())};
     
@@ -642,10 +486,7 @@ std::vector<std::shared_ptr<::cucascade::data_batch>> sirius_physical_hash_join:
   //   return std::vector<std::shared_ptr<::cucascade::data_batch>>{};
   // } else if (join_type == duckdb::JoinType::SINGLE) {
   //   return std::vector<std::shared_ptr<::cucascade::data_batch>>{};
-  // } else if (join_type == duckdb::JoinType::RIGHT_SEMI) {
-  //   return std::vector<std::shared_ptr<::cucascade::data_batch>>{};
-  // } else if (join_type == duckdb::JoinType::RIGHT_ANTI) {
-  //   return std::vector<std::shared_ptr<::cucascade::data_batch>>{};
+  
   } else {
     throw std::runtime_error("Unsupported join type: " + duckdb::JoinTypeToString(join_type));
   }
