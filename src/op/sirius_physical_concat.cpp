@@ -84,7 +84,7 @@ std::unique_ptr<operator_data> sirius_physical_concat::get_next_task_input_data(
     size_t total_batch_size = 0;
     for (auto& batch_id : batch_ids) {
       auto batch =
-        port_ptr->repo->get_data_batch_by_id(batch_id, ::cucascade::batch_state::task_created, i);
+        port_ptr->repo->get_data_batch_by_id(batch_id, std::nullopt, i);
       auto batch_size = batch->get_data()->get_size_in_bytes();
       total_batch_size += batch_size;
       // Check if the batch size is already exceed the threshold
@@ -108,10 +108,8 @@ std::unique_ptr<operator_data> sirius_physical_concat::get_next_task_input_data(
       }
     }
     if (input_batch.size() != 0) { 
-      printf("sirius_physical_concat::get_next_task_input_data: returning partitioned_operator_data with %zu batches for partition %zu\n", input_batch.size(), i);
       return std::make_unique<partitioned_operator_data>(std::move(input_batch), i); }
   }
-  printf("sirius_physical_concat::get_next_task_input_data: returning nullptr\n");
   return nullptr;
 }
 
