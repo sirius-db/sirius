@@ -16,11 +16,13 @@
 
 #include "op/sirius_physical_partition.hpp"
 
+#include "print.hpp"
 #include "creator/task_creator.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "expression_executor/gpu_expression_executor.hpp"
 #include "log/logging.hpp"
 #include "op/partition/gpu_partition_impl.hpp"
+#include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_grouped_aggregate_merge.hpp"
 #include "op/sirius_physical_hash_join.hpp"
 #include "op/sirius_physical_order.hpp"
@@ -52,8 +54,6 @@ bool sirius_physical_partition::is_sink() const { return true; }
 void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_operator* op,
                                                             bool is_build)
 {
-  _partition_keys.clear();
-  _partition_type = PartitionType::NONE;
   if (op->type == SiriusPhysicalOperatorType::HASH_JOIN) {
     _partition_type    = PartitionType::HASH;
     auto& hash_join_op = op->Cast<sirius_physical_hash_join>();
@@ -73,6 +73,7 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
         }
       }
     }
+   
   } else if (op->type == SiriusPhysicalOperatorType::HASH_GROUP_BY) {
     _partition_type            = PartitionType::HASH;
     auto& grouped_aggregate_op = op->Cast<sirius_physical_grouped_aggregate>();
@@ -121,11 +122,8 @@ std::vector<std::shared_ptr<::cucascade::data_batch>> sirius_physical_partition:
   const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches,
   rmm::cuda_stream_view stream)
 {
-  if (input_batches.size() != 1) {
-    throw std::runtime_error("We expect only one input batch for partition operator");
-  }
-
-  if (_num_partitions < 2) { return input_batches; }
+  if (_num_partitions < 2) { 
+    return input_batches; }
 
   auto input_batch = input_batches[0];
   std::vector<std::shared_ptr<cucascade::data_batch>> partitioned_results;
@@ -146,6 +144,7 @@ std::vector<std::shared_ptr<::cucascade::data_batch>> sirius_physical_partition:
       throw std::runtime_error("Unsupported partition type: " +
                                partition_type_to_string(_partition_type));
   }
+
   return partitioned_results;
 }
 

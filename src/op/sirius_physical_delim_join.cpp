@@ -17,6 +17,7 @@
 #include "op/sirius_physical_delim_join.hpp"
 
 #include "duckdb/execution/operator/join/physical_left_delim_join.hpp"
+#include <cstdio>
 #include "duckdb/execution/operator/join/physical_right_delim_join.hpp"
 #include "log/logging.hpp"
 #include "op/sirius_physical_column_data_scan.hpp"
@@ -53,6 +54,19 @@ sirius_physical_delim_join::sirius_physical_delim_join(
     join(std::move(original_join)),
     delim_scans(std::move(delim_scans))
 {
+  printf("sirius_physical_delim_join::sirius_physical_delim_join (base)\n");
+  printf("  class: sirius_physical_delim_join\n");
+  printf("  type: %d (%s)\n",
+         static_cast<int>(type),
+         type == SiriusPhysicalOperatorType::LEFT_DELIM_JOIN  ? "LEFT_DELIM_JOIN"
+         : type == SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN ? "RIGHT_DELIM_JOIN"
+                                                               : "?");
+  printf("  types.size(): %zu\n", this->types.size());
+  printf("  original_join: %s\n", join ? join->get_name().c_str() : "(null)");
+  printf("  delim_scans.size(): %zu\n", this->delim_scans.size());
+  printf("  estimated_cardinality: %llu\n", static_cast<unsigned long long>(estimated_cardinality));
+  printf("  delim_idx: %s\n", delim_idx.IsValid() ? "valid" : "invalid");
+
   D_ASSERT(type == SiriusPhysicalOperatorType::LEFT_DELIM_JOIN ||
            type == SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN);
 }
@@ -70,6 +84,13 @@ sirius_physical_right_delim_join::sirius_physical_right_delim_join(
                                estimated_cardinality,
                                delim_idx)
 {
+  printf("sirius_physical_right_delim_join::sirius_physical_right_delim_join\n");
+  printf("  class: sirius_physical_right_delim_join\n");
+  printf("  types.size(): %zu\n", this->types.size());
+  printf("  delim_scans.size(): %zu\n", this->delim_scans.size());
+  printf("  estimated_cardinality: %llu\n", static_cast<unsigned long long>(estimated_cardinality));
+  printf("  delim_idx: %s\n", delim_idx.IsValid() ? "valid" : "invalid");
+
   D_ASSERT(join->children.size() == 2);
   children.push_back(std::move(join->children[1]));
 
@@ -90,6 +111,13 @@ sirius_physical_left_delim_join::sirius_physical_left_delim_join(
                                estimated_cardinality,
                                delim_idx)
 {
+  printf("sirius_physical_left_delim_join::sirius_physical_left_delim_join\n");
+  printf("  class: sirius_physical_left_delim_join\n");
+  printf("  types.size(): %zu\n", this->types.size());
+  printf("  delim_scans.size(): %zu\n", this->delim_scans.size());
+  printf("  estimated_cardinality: %llu\n", static_cast<unsigned long long>(estimated_cardinality));
+  printf("  delim_idx: %s\n", delim_idx.IsValid() ? "valid" : "invalid");
+
   D_ASSERT(join->children.size() == 2);
   children.push_back(std::move(join->children[0]));
 

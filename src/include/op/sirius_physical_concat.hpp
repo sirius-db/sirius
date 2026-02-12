@@ -56,8 +56,6 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
   sirius_physical_operator* get_parent_op() const { return _parent_op; }
 
  private:
-  duckdb::vector<duckdb::idx_t> _partition_keys;
-  duckdb::idx_t _num_partitions;
   sirius_physical_operator* _parent_op;
   bool _is_build;
   bool _concat_all;

@@ -26,6 +26,7 @@
 #include "expression_executor/gpu_expression_executor.hpp"
 #include "log/logging.hpp"
 
+#include <cstdio>
 #include <chrono>
 
 namespace sirius {
@@ -39,6 +40,19 @@ sirius_physical_projection::sirius_physical_projection(
       SiriusPhysicalOperatorType::PROJECTION, std::move(types), estimated_cardinality),
     select_list(std::move(select_list))
 {
+  printf("sirius_physical_projection::sirius_physical_projection select_list bound ref column indices: [");
+  bool first = true;
+  for (duckdb::idx_t i = 0; i < this->select_list.size(); i++) {
+    auto& expr = this->select_list[i];
+    if (expr && expr->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
+      duckdb::idx_t col_idx = expr->Cast<duckdb::BoundReferenceExpression>().index;
+      printf("%s%llu", first ? "" : ", ", static_cast<unsigned long long>(col_idx));
+      first = false;
+    } else {
+      printf("non bound ref column\n");
+    }
+  }
+  printf("]\n");
 }
 
 std::vector<std::shared_ptr<cucascade::data_batch>> sirius_physical_projection::execute(
