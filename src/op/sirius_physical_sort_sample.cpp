@@ -72,10 +72,10 @@ std::optional<task_creation_hint> sirius_physical_sort_sample::get_next_task_hin
   return std::nullopt;
 }
 
-operator_data sirius_physical_sort_sample::execute(const operator_data& input_data,
-                                                   rmm::cuda_stream_view stream)
+std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(
+  std::unique_ptr<operator_data> input_data, rmm::cuda_stream_view stream)
 {
-  const auto& input_batches = input_data.get_data_batches();
+  const auto& input_batches = input_data->get_data_batches();
 
   // After boundaries are computed, just pass through
   if (_boundaries_computed.load()) {

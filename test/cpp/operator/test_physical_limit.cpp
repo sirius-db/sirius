@@ -98,7 +98,8 @@ TEMPLATE_TEST_CASE("sirius_physical_streaming_limit limits rows in data_batch",
     std::move(types), std::move(limit_node), std::move(offset_node), values.size(), false);
 
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
-  auto outputs = limiter.execute(operator_data(inputs), cudf::get_default_stream());
+  auto outputs =
+    *limiter.execute(std::make_unique<operator_data>(inputs), cudf::get_default_stream());
   REQUIRE(outputs.get_data_batches().size() == 1);
   auto output_table =
     outputs.get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();

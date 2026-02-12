@@ -152,46 +152,47 @@ void sirius_physical_right_delim_join::build_pipelines(
   sirius_physical_hash_join::build_join_pipelines(current, meta_pipeline, *join, false);
 }
 
-operator_data sirius_physical_right_delim_join::execute(const operator_data& input_data,
-                                                        rmm::cuda_stream_view stream)
+std::unique_ptr<operator_data> sirius_physical_right_delim_join::execute(
+  std::unique_ptr<operator_data> input_data, rmm::cuda_stream_view stream)
 {
   return input_data;
 }
 
-void sirius_physical_right_delim_join::sink(const operator_data& input_data,
+void sirius_physical_right_delim_join::sink(std::unique_ptr<operator_data> input_data,
                                             rmm::cuda_stream_view stream)
 {
   // call partition join execute
-  auto partition_join_output = partition_join->execute(input_data, stream);
+  auto partition_join_output = partition_join->execute(
+    std::make_unique<operator_data>(input_data->get_data_batches()), stream);
   // call distinct execute
-  auto distinct_output = distinct->execute(input_data, stream);
+  auto distinct_output = distinct->execute(std::move(input_data), stream);
   // call partition distinct execute
-  auto partition_distinct_output = partition_distinct->execute(distinct_output, stream);
+  auto partition_distinct_output = partition_distinct->execute(std::move(distinct_output), stream);
   // call partition join sink
-  partition_join->sink(partition_join_output, stream);
+  partition_join->sink(std::move(partition_join_output), stream);
   // call partition distinct sink
-  partition_distinct->sink(partition_distinct_output, stream);
+  partition_distinct->sink(std::move(partition_distinct_output), stream);
 }
 
-operator_data sirius_physical_left_delim_join::execute(const operator_data& input_data,
-                                                       rmm::cuda_stream_view stream)
+std::unique_ptr<operator_data> sirius_physical_left_delim_join::execute(
+  std::unique_ptr<operator_data> input_data, rmm::cuda_stream_view stream)
 {
   return input_data;
 }
 
-void sirius_physical_left_delim_join::sink(const operator_data& input_data,
+void sirius_physical_left_delim_join::sink(std::unique_ptr<operator_data> input_data,
                                            rmm::cuda_stream_view stream)
 {
   // call distinct execute
-  auto distinct_output = distinct->execute(input_data, stream);
+  auto distinct_output = distinct->execute(std::move(input_data), stream);
   // call column data scan execute
-  auto column_data_scan_output = column_data_scan->execute(distinct_output, stream);
+  auto column_data_scan_output = column_data_scan->execute(std::move(distinct_output), stream);
   // call partition distinct execute
-  auto partition_distinct_output = partition_distinct->execute(distinct_output, stream);
+  auto partition_distinct_output = partition_distinct->execute(std::move(distinct_output), stream);
   // call partition join sink
-  column_data_scan->sink(column_data_scan_output, stream);
+  column_data_scan->sink(std::move(column_data_scan_output), stream);
   // call partition distinct sink
-  partition_distinct->sink(partition_distinct_output, stream);
+  partition_distinct->sink(std::move(partition_distinct_output), stream);
 }
 
 }  // namespace op

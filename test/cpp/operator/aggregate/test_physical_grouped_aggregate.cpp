@@ -90,15 +90,17 @@ TEMPLATE_TEST_CASE(
                                                        std::move(agg_result.groups),
                                                        num_groups);
 
-  auto outputs = grouped_aggregator.execute(operator_data({input_batch}), default_stream());
+  auto outputs = grouped_aggregator.execute(
+    std::make_unique<operator_data>(std::vector<std::shared_ptr<data_batch>>({input_batch})),
+    default_stream());
 
   // Verify we got one output batch
-  REQUIRE(outputs.get_data_batches().size() == 1);
+  REQUIRE(outputs->get_data_batches().size() == 1);
 
   // Compare output with expected using the validation utility
   // Sort both tables before comparison since aggregation order is not guaranteed
   bool tables_match = sirius::test::expect_data_batch_equivalent_to_table(
-    outputs.get_data_batches()[0], expected_table->view(), true);
+    outputs->get_data_batches()[0], expected_table->view(), true);
   REQUIRE(tables_match);
 }
 
@@ -143,12 +145,14 @@ TEMPLATE_TEST_CASE("sirius_physical_grouped_aggregate grouped aggregates with AV
                                                        std::move(agg_result.groups),
                                                        num_groups);
 
-  auto outputs = grouped_aggregator.execute(operator_data({input_batch}), default_stream());
-  REQUIRE(outputs.get_data_batches().size() == 1);
+  auto outputs = grouped_aggregator.execute(
+    std::make_unique<operator_data>(std::vector<std::shared_ptr<data_batch>>({input_batch})),
+    default_stream());
+  REQUIRE(outputs->get_data_batches().size() == 1);
 
   // The local operator outputs expanded columns: group_key, min, max, count, sum, count_valid
   // (AVG decomposed into SUM + COUNT_VALID). Verify column count = 1 group + 5 aggregates.
-  auto output_table = outputs.get_data_batches()[0]
+  auto output_table = outputs->get_data_batches()[0]
                         ->get_data()
                         ->cast<cucascade::gpu_table_representation>()
                         .get_table();
@@ -204,14 +208,16 @@ TEMPLATE_TEST_CASE(
                                                        std::move(agg_result.groups),
                                                        num_groups);
 
-  auto outputs = grouped_aggregator.execute(operator_data({input_batch}), default_stream());
+  auto outputs = grouped_aggregator.execute(
+    std::make_unique<operator_data>(std::vector<std::shared_ptr<data_batch>>({input_batch})),
+    default_stream());
 
   // Verify we got one output batch
-  REQUIRE(outputs.get_data_batches().size() == 1);
+  REQUIRE(outputs->get_data_batches().size() == 1);
 
   // Compare output with expected using the validation utility
   // Sort both tables before comparison since aggregation order is not guaranteed
   bool tables_match = sirius::test::expect_data_batch_equivalent_to_table(
-    outputs.get_data_batches()[0], expected_table->view(), true);
+    outputs->get_data_batches()[0], expected_table->view(), true);
   REQUIRE(tables_match);
 }

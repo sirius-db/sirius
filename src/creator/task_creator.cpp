@@ -221,8 +221,8 @@ void task_creator::manager_loop()
                 }
               }
 
-              auto local_state =
-                std::make_unique<pipeline::gpu_pipeline_task_local_state>(input_data.value());
+              auto local_state = std::make_unique<pipeline::gpu_pipeline_task_local_state>(
+                std::move(input_data.value()));
               auto task = std::make_unique<pipeline::gpu_pipeline_task>(
                 get_next_task_id(),
                 destination_data_repositories,

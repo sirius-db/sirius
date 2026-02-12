@@ -17,6 +17,7 @@
 #include "op/sirius_physical_operator.hpp"
 
 #include "gpu_executor.hpp"
+#include "log/logging.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 
@@ -178,20 +179,22 @@ sirius_physical_operator::port* sirius_physical_operator::get_port(std::string_v
   return it->second.get();
 }
 
-void sirius_physical_operator::sink(const operator_data& output_data, rmm::cuda_stream_view stream)
+void sirius_physical_operator::sink(std::unique_ptr<operator_data> output_data,
+                                    rmm::cuda_stream_view stream)
 {
-  for (auto& batch : output_data.get_data_batches()) {
+  for (auto& batch : output_data->get_data_batches()) {
     for (auto& [next_op, port_id] : next_port_after_sink) {
       next_op->push_data_batch(port_id, batch);
     }
   }
 }
 
-operator_data sirius_physical_operator::execute(const operator_data& input_data,
-                                                rmm::cuda_stream_view stream)
+std::unique_ptr<operator_data> sirius_physical_operator::execute(
+  std::unique_ptr<operator_data> input_data, rmm::cuda_stream_view stream)
 {
-  // not doing anything for now
-  return operator_data(std::vector<std::shared_ptr<::cucascade::data_batch>>{});
+  // Passthrough the input data. Creating a new (empty) operator_data object could lead to problems
+  // if the input was a partitioned_operator_data.
+  return input_data;
 }
 
 void sirius_physical_operator::push_data_batch(std::string_view port_id,
@@ -254,7 +257,7 @@ std::optional<task_creation_hint> sirius_physical_operator::get_next_task_hint()
   return std::nullopt;
 }
 
-std::optional<operator_data> sirius_physical_operator::get_next_task_input_data()
+std::optional<std::unique_ptr<operator_data>> sirius_physical_operator::get_next_task_input_data()
 {
   // take one data batch from each port and schedule a task (a task takes one data batch from each
   // port), do this repeatedly until all ports are empty
@@ -263,12 +266,17 @@ std::optional<operator_data> sirius_physical_operator::get_next_task_input_data(
     // For Pipeline barrier: need at least one data batch in the port's repository
     // TODO: later on we will adjust to the new data repository interface in cuCascade
     auto batch_and_handle = port_ptr->repo->pop_data_batch(::cucascade::batch_state::task_created);
-    if (batch_and_handle) { input_batch.push_back(std::move(batch_and_handle)); }
+    if (batch_and_handle) {
+      SIRIUS_LOG_DEBUG(
+        "sirius_physical_operator::get_next_task_input_data(): popping batch from port {}",
+        port_name);
+      input_batch.push_back(std::move(batch_and_handle));
+    }
   }
   if (input_batch.empty()) {
-    return operator_data(std::vector<std::shared_ptr<::cucascade::data_batch>>{});
+    return std::make_unique<operator_data>(std::vector<std::shared_ptr<::cucascade::data_batch>>{});
   }
-  return operator_data(input_batch);
+  return std::make_unique<operator_data>(input_batch);
 }
 
 bool sirius_physical_operator::all_ports_empty()

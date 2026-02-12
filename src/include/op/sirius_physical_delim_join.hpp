@@ -84,9 +84,10 @@ class sirius_physical_right_delim_join : public sirius_physical_delim_join {
   void build_pipelines(pipeline::sirius_pipeline& current,
                        pipeline::sirius_meta_pipeline& meta_pipeline) override;
 
-  operator_data execute(const operator_data& input_data, rmm::cuda_stream_view stream) override;
+  std::unique_ptr<operator_data> execute(std::unique_ptr<operator_data> input_data,
+                                         rmm::cuda_stream_view stream) override;
 
-  void sink(const operator_data& input_data, rmm::cuda_stream_view stream) override;
+  void sink(std::unique_ptr<operator_data> input_data, rmm::cuda_stream_view stream) override;
 };
 
 class sirius_physical_left_delim_join : public sirius_physical_delim_join {
@@ -107,9 +108,10 @@ class sirius_physical_left_delim_join : public sirius_physical_delim_join {
   void build_pipelines(pipeline::sirius_pipeline& current,
                        pipeline::sirius_meta_pipeline& meta_pipeline) override;
 
-  operator_data execute(const operator_data& input_data, rmm::cuda_stream_view stream) override;
+  std::unique_ptr<operator_data> execute(std::unique_ptr<operator_data> input_data,
+                                         rmm::cuda_stream_view stream) override;
 
-  void sink(const operator_data& input_data, rmm::cuda_stream_view stream) override;
+  void sink(std::unique_ptr<operator_data> input_data, rmm::cuda_stream_view stream) override;
 };
 
 }  // namespace op

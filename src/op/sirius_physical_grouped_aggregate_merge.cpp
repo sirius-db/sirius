@@ -155,7 +155,8 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
   has_avg            = cudf_defs.has_avg;
 }
 
-std::optional<operator_data> sirius_physical_grouped_aggregate_merge::get_next_task_input_data()
+std::optional<std::unique_ptr<operator_data>>
+sirius_physical_grouped_aggregate_merge::get_next_task_input_data()
 {
   // we need to lock, then pull all the batches from one partition and return them, and increment
   // the partition index
@@ -173,16 +174,16 @@ std::optional<operator_data> sirius_physical_grouped_aggregate_merge::get_next_t
       }
     }
     current_partition_index++;
-    return operator_data(input_batch);
+    return std::make_unique<operator_data>(input_batch);
   } else {
     return std::nullopt;
   }
 }
 
-operator_data sirius_physical_grouped_aggregate_merge::execute(const operator_data& input_data,
-                                                               rmm::cuda_stream_view stream)
+std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
+  std::unique_ptr<operator_data> input_data, rmm::cuda_stream_view stream)
 {
-  const auto& input_batches = input_data.get_data_batches();
+  const auto& input_batches = input_data->get_data_batches();
   if (input_batches.size() == 0) {
     throw std::runtime_error(
       "We expect at least one input batch for grouped aggregate merge operator");
@@ -204,7 +205,10 @@ operator_data sirius_physical_grouped_aggregate_merge::execute(const operator_da
   }
 
   // If no AVG, return merged result directly
-  if (!has_avg) { return operator_data({merged}); }
+  if (!has_avg) {
+    return std::make_unique<operator_data>(
+      std::vector<std::shared_ptr<cucascade::data_batch>>{merged});
+  }
 
   // Post-merge AVG projection: compute SUM/COUNT for each AVG aggregate.
   // Release ownership of the merged table's columns so we can move (not copy) them.
@@ -261,7 +265,8 @@ operator_data sirius_physical_grouped_aggregate_merge::execute(const operator_da
 
   auto output_table = std::make_unique<cudf::table>(std::move(output_cols), stream, mr);
   auto result       = sirius::make_data_batch(std::move(output_table), *space);
-  return operator_data({result});
+  return std::make_unique<operator_data>(
+    std::vector<std::shared_ptr<cucascade::data_batch>>{result});
 }
 }  // namespace op
 }  // namespace sirius

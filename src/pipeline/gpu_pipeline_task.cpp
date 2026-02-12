@@ -16,6 +16,8 @@
 
 #include "pipeline/gpu_pipeline_task.hpp"
 
+#include "log/logging.hpp"
+
 #include <cucascade/data/cpu_data_representation.hpp>
 #include <cucascade/data/data_repository.hpp>
 #include <cucascade/data/data_repository_manager.hpp>
@@ -121,23 +123,32 @@ const sirius_pipeline* gpu_pipeline_task::get_pipeline() const
   return _global_state->cast<gpu_pipeline_task_global_state>()._pipeline.get();
 }
 
-op::operator_data gpu_pipeline_task::compute_task(rmm::cuda_stream_view stream)
+std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_stream_view stream)
 {
   auto& local_state               = _local_state->cast<gpu_pipeline_task_local_state>();
-  auto operator_input_output_data = local_state._input_data;
+  auto operator_input_output_data = std::move(local_state._input_data);
+
   for (auto& op :
        _global_state->cast<gpu_pipeline_task_global_state>()._pipeline.get()->get_operators()) {
-    operator_input_output_data = op.get().execute(operator_input_output_data, stream);
+    SIRIUS_LOG_DEBUG(
+      "Pipeline {} executing operator {} on {} batches ({} input)",
+      _global_state->cast<gpu_pipeline_task_global_state>()._pipeline.get()->get_pipeline_id(),
+      op.get().get_name(),
+      operator_input_output_data->get_data_batches().size(),
+      dynamic_cast<op::partitioned_operator_data*>(operator_input_output_data.get()) ? "partitioned"
+                                                                                     : "regular");
+    operator_input_output_data = op.get().execute(std::move(operator_input_output_data), stream);
   }
-  return operator_input_output_data;
+  return std::move(operator_input_output_data);
 }
 
-void gpu_pipeline_task::publish_output(op::operator_data& output_data, rmm::cuda_stream_view stream)
+void gpu_pipeline_task::publish_output(std::unique_ptr<op::operator_data> output_data,
+                                       rmm::cuda_stream_view stream)
 {
   auto sink_operators =
     _global_state->cast<gpu_pipeline_task_global_state>()._pipeline.get()->get_sink();
   if (sink_operators) {
-    sink_operators.get()->sink(output_data, stream);
+    sink_operators.get()->sink(std::move(output_data), stream);
   } else {
     throw std::runtime_error("Sink operator not found");
   }
@@ -160,9 +171,9 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
   const auto* requested_memory_space =
     reservation != nullptr ? &reservation->get_memory_space() : nullptr;
   std::vector<cucascade::data_batch_processing_handle> processing_handles;
-  processing_handles.reserve(local_state._input_data.get_data_batches().size());
+  processing_handles.reserve(local_state._input_data->get_data_batches().size());
 
-  for (const auto& batch : local_state._input_data.get_data_batches()) {
+  for (const auto& batch : local_state._input_data->get_data_batches()) {
     auto handle = lock_or_prepare_batch(batch, requested_memory_space, stream);
     if (!handle) {
       // Failed to lock (or convert) one of the batches. Caller can retry later.
@@ -176,7 +187,7 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
 
   // TODO: Implement actual pipeline execution:
   // 1. Transfer data batch to GPU memory if not already there
-  for (auto& batch : local_state._input_data.get_data_batches()) {
+  for (auto& batch : local_state._input_data->get_data_batches()) {
     // 1. Transfer data batch to GPU memory if not already there
     // for now assuming that local_state._batches will continue to hold the data and now in GPU
     // memory
@@ -186,7 +197,7 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
   // 3. Execute cudf operators on the pipeline
   auto output_data = compute_task(stream);
   stream.synchronize();
-  publish_output(output_data, stream);
+  publish_output(std::move(output_data), stream);
   // 4. After each cudf operator, get peak total bytes to collect statistics
   // 5. Push output batches to the data repository
 
@@ -197,7 +208,7 @@ std::size_t gpu_pipeline_task::get_input_size() const
 {
   auto& local_state      = _local_state->cast<gpu_pipeline_task_local_state>();
   std::size_t input_size = 0;
-  for (const auto& batch : local_state._input_data.get_data_batches()) {
+  for (const auto& batch : local_state._input_data->get_data_batches()) {
     input_size += batch->get_data()->get_size_in_bytes();
   }
   return input_size;

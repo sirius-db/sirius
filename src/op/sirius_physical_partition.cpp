@@ -117,10 +117,10 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
 
 bool sirius_physical_partition::is_build_partition() { return _is_build; }
 
-operator_data sirius_physical_partition::execute(const operator_data& input_data,
-                                                 rmm::cuda_stream_view stream)
+std::unique_ptr<operator_data> sirius_physical_partition::execute(
+  std::unique_ptr<operator_data> input_data, rmm::cuda_stream_view stream)
 {
-  const auto& input_batches = input_data.get_data_batches();
+  const auto& input_batches = input_data->get_data_batches();
   if (input_batches.size() != 1) {
     throw std::runtime_error("We expect only one input batch for partition operator");
   }
@@ -146,12 +146,15 @@ operator_data sirius_physical_partition::execute(const operator_data& input_data
       throw std::runtime_error("Unsupported partition type: " +
                                partition_type_to_string(_partition_type));
   }
-  return operator_data(partitioned_results);
+  return std::make_unique<operator_data>(partitioned_results);
 }
 
-void sirius_physical_partition::sink(const operator_data& input_data, rmm::cuda_stream_view stream)
+void sirius_physical_partition::sink(std::unique_ptr<operator_data> input_data,
+                                     rmm::cuda_stream_view stream)
 {
-  const auto& input_batches = input_data.get_data_batches();
+  const auto& input_batches = input_data->get_data_batches();
+  SIRIUS_LOG_DEBUG("sirius_physical_partition::sink(): input_batches.size() = {}",
+                   input_batches.size());
   (void)stream;  // sink does not use stream for push_data_batch_partitioned
   int partition_id = 0;
   for (auto& batch : input_batches) {
@@ -161,6 +164,8 @@ void sirius_physical_partition::sink(const operator_data& input_data, rmm::cuda_
       auto partition_consumer_op =
         dynamic_cast<sirius_physical_partition_consumer_operator*>(next_op);
       if (partition_consumer_op) {
+        SIRIUS_LOG_DEBUG("sirius_physical_partition::sink(): pushing batch to partition {}",
+                         partition_id);
         partition_consumer_op->push_data_batch_partitioned(port_id, batch, partition_id);
       } else {
         throw std::runtime_error("Next operator is not a partition consumer operator");

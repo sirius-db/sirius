@@ -263,7 +263,8 @@ TEST_CASE("sirius_physical_materialized_collector sink with host input",
   sirius::op::sirius_physical_materialized_collector collector(*sirius_prepared,
                                                                get_test_client_context());
 
-  collector.sink(operator_data({batch}), cudf::get_default_stream());
+  collector.sink(std::make_unique<operator_data>(std::vector<std::shared_ptr<data_batch>>({batch})),
+                 cudf::get_default_stream());
   duckdb::GlobalSinkState sink_state;
   auto result = collector.get_result(sink_state);
   REQUIRE(result != nullptr);
@@ -331,7 +332,8 @@ TEST_CASE("sirius_physical_materialized_collector sink converts GPU input",
   sirius::op::sirius_physical_materialized_collector collector(*sirius_prepared,
                                                                get_test_client_context());
 
-  collector.sink(operator_data({batch}), cudf::get_default_stream());
+  collector.sink(std::make_unique<operator_data>(std::vector<std::shared_ptr<data_batch>>({batch})),
+                 cudf::get_default_stream());
   duckdb::GlobalSinkState sink_state;
   auto result = collector.get_result(sink_state);
   REQUIRE(result != nullptr);
@@ -438,7 +440,8 @@ TEST_CASE("sirius_physical_materialized_collector sink supports concurrent appen
         std::this_thread::yield();
       }
       try {
-        collector.sink(operator_data({batches[static_cast<size_t>(thread_idx)]}),
+        collector.sink(std::make_unique<operator_data>(std::vector<std::shared_ptr<data_batch>>(
+                         {batches[static_cast<size_t>(thread_idx)]})),
                        cudf::get_default_stream());
       } catch (...) {
         exceptions[static_cast<size_t>(thread_idx)] = std::current_exception();

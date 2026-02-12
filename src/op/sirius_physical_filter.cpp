@@ -55,13 +55,13 @@ sirius_physical_filter::sirius_physical_filter(
   }
 }
 
-operator_data sirius_physical_filter::execute(const operator_data& input_data,
-                                              rmm::cuda_stream_view stream)
+std::unique_ptr<operator_data> sirius_physical_filter::execute(
+  std::unique_ptr<operator_data> input_data, rmm::cuda_stream_view stream)
 {
   SIRIUS_LOG_DEBUG("Executing expression {}", expression->ToString());
   auto start = std::chrono::high_resolution_clock::now();
 
-  const auto& input_batches = input_data.get_data_batches();
+  const auto& input_batches = input_data->get_data_batches();
 
   // The executor uses the data_batch API to filter rows according to `expression`.
   duckdb::sirius::GpuExpressionExecutor gpu_expression_executor(*expression.get());
@@ -79,7 +79,7 @@ operator_data sirius_physical_filter::execute(const operator_data& input_data,
   auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
   SIRIUS_LOG_DEBUG("Filter time: {:.2f} ms", duration.count() / 1000.0);
 
-  return operator_data(output_batches);
+  return std::make_unique<operator_data>(output_batches);
 }
 
 }  // namespace op

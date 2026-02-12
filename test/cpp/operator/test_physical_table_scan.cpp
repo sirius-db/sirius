@@ -127,7 +127,8 @@ TEMPLATE_TEST_CASE(
                                         std::move(virtual_columns));
 
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
-  auto outputs = table_scan.execute(operator_data(inputs), cudf::get_default_stream());
+  auto outputs =
+    *table_scan.execute(std::make_unique<operator_data>(inputs), cudf::get_default_stream());
   REQUIRE(outputs.get_data_batches().size() == 1);
   auto output_table =
     outputs.get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
@@ -197,7 +198,8 @@ TEST_CASE("sirius_physical_table_scan with no filters passes through data", "[ph
                                         std::move(virtual_columns));
 
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
-  auto outputs = table_scan.execute(operator_data(inputs), cudf::get_default_stream());
+  auto outputs =
+    *table_scan.execute(std::make_unique<operator_data>(inputs), cudf::get_default_stream());
 
   REQUIRE(outputs.get_data_batches().size() == 1);
   auto output_table =
@@ -269,7 +271,8 @@ TEST_CASE("sirius_physical_table_scan with multiple filters", "[physical_table_s
                                         std::move(virtual_columns));
 
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
-  auto outputs = table_scan.execute(operator_data(inputs), cudf::get_default_stream());
+  auto outputs =
+    *table_scan.execute(std::make_unique<operator_data>(inputs), cudf::get_default_stream());
 
   REQUIRE(outputs.get_data_batches().size() == 1);
   auto output_table =
@@ -339,7 +342,8 @@ TEST_CASE("sirius_physical_table_scan filters all rows", "[physical_table_scan]"
                                         std::move(virtual_columns));
 
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
-  auto outputs = table_scan.execute(operator_data(inputs), cudf::get_default_stream());
+  auto outputs =
+    *table_scan.execute(std::make_unique<operator_data>(inputs), cudf::get_default_stream());
 
   REQUIRE(outputs.get_data_batches().size() == 1);
   auto table =

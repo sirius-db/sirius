@@ -45,11 +45,12 @@ class sirius_physical_concat : public sirius_physical_partition_consumer_operato
 
   bool is_build_concat();
 
-  std::optional<operator_data> get_next_task_input_data() override;
+  std::optional<std::unique_ptr<operator_data>> get_next_task_input_data() override;
 
-  operator_data execute(const operator_data& input_data, rmm::cuda_stream_view stream) override;
+  std::unique_ptr<operator_data> execute(std::unique_ptr<operator_data> input_data,
+                                         rmm::cuda_stream_view stream) override;
 
-  void sink(const operator_data& output_data, rmm::cuda_stream_view stream) override;
+  void sink(std::unique_ptr<operator_data> output_data, rmm::cuda_stream_view stream) override;
 
   //! Get the parent operator (e.g., HASH_JOIN for build concat)
   sirius_physical_operator* get_parent_op() const { return _parent_op; }

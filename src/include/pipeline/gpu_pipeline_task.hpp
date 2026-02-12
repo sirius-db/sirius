@@ -72,15 +72,14 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_itask_local_state {
   /**
    * @brief Construct a new gpu_pipeline_task_local_state object
    *
-   * @param batch_views Vector of data batches serving as input to the pipeline
-   * @param res Memory reservation for GPU resources
+   * @param input_data Input data (can be operator_data or partitioned_operator_data)
    */
-  explicit gpu_pipeline_task_local_state(op::operator_data input_data)
+  explicit gpu_pipeline_task_local_state(std::unique_ptr<op::operator_data> input_data)
     : _input_data(std::move(input_data))
   {
   }
 
-  op::operator_data _input_data;  ///< Input data batches for the pipeline
+  std::unique_ptr<op::operator_data> _input_data;  ///< Input data for the pipeline
 
   /**
    * @brief Get a const pointer to the reservation (non-owning).
@@ -147,7 +146,7 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
    * @param stream CUDA stream used for device memory operations and kernel launches
    * @return std::vector<std::shared_ptr<cucascade::data_batch>> The computed output batches
    */
-  op::operator_data compute_task(rmm::cuda_stream_view stream) override;
+  std::unique_ptr<op::operator_data> compute_task(rmm::cuda_stream_view stream) override;
 
   /**
    * @brief Publish the computed output batches to data repositories.
@@ -156,7 +155,8 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
    *
    * @param output_batches The data batches to publish
    */
-  void publish_output(op::operator_data& output_batches, rmm::cuda_stream_view stream) override;
+  void publish_output(std::unique_ptr<op::operator_data> output_data,
+                      rmm::cuda_stream_view stream) override;
 
   /**
    * @brief Get the input size for this task

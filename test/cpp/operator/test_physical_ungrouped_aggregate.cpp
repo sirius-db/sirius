@@ -168,10 +168,14 @@ TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate computes SUM/MIN/MAX/COU
     0,
     duckdb::TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
 
-  auto local_out1         = local_op.execute(operator_data({b1}), cudf::get_default_stream());
-  auto local_out2         = local_op.execute(operator_data({b2}), cudf::get_default_stream());
-  auto local_out1_batches = local_out1.get_data_batches();
-  auto local_out2_batches = local_out2.get_data_batches();
+  auto local_out1 = local_op.execute(
+    std::make_unique<operator_data>(std::vector<std::shared_ptr<data_batch>>({b1})),
+    cudf::get_default_stream());
+  auto local_out2 = local_op.execute(
+    std::make_unique<operator_data>(std::vector<std::shared_ptr<data_batch>>({b2})),
+    cudf::get_default_stream());
+  auto local_out1_batches = local_out1->get_data_batches();
+  auto local_out2_batches = local_out2->get_data_batches();
   std::vector<std::shared_ptr<data_batch>> merge_inputs;
   merge_inputs.insert(merge_inputs.end(),
                       std::make_move_iterator(local_out1_batches.begin()),
@@ -179,7 +183,8 @@ TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate computes SUM/MIN/MAX/COU
   merge_inputs.insert(merge_inputs.end(),
                       std::make_move_iterator(local_out2_batches.begin()),
                       std::make_move_iterator(local_out2_batches.end()));
-  auto out = merge_op.execute(operator_data(merge_inputs), cudf::get_default_stream());
+  auto out =
+    *merge_op.execute(std::make_unique<operator_data>(merge_inputs), cudf::get_default_stream());
   REQUIRE(out.get_data_batches().size() == 1);
 
   auto table =
@@ -279,10 +284,14 @@ TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate resolves AVG in merge",
     0,
     duckdb::TupleDataValidityType::CANNOT_HAVE_NULL_VALUES);
 
-  auto local_out1         = local_op.execute(operator_data({b1}), cudf::get_default_stream());
-  auto local_out2         = local_op.execute(operator_data({b2}), cudf::get_default_stream());
-  auto local_out1_batches = local_out1.get_data_batches();
-  auto local_out2_batches = local_out2.get_data_batches();
+  auto local_out1 = local_op.execute(
+    std::make_unique<operator_data>(std::vector<std::shared_ptr<data_batch>>({b1})),
+    cudf::get_default_stream());
+  auto local_out2 = local_op.execute(
+    std::make_unique<operator_data>(std::vector<std::shared_ptr<data_batch>>({b2})),
+    cudf::get_default_stream());
+  auto local_out1_batches = local_out1->get_data_batches();
+  auto local_out2_batches = local_out2->get_data_batches();
   std::vector<std::shared_ptr<data_batch>> merge_inputs;
   merge_inputs.insert(merge_inputs.end(),
                       std::make_move_iterator(local_out1_batches.begin()),
@@ -291,7 +300,8 @@ TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate resolves AVG in merge",
                       std::make_move_iterator(local_out2_batches.begin()),
                       std::make_move_iterator(local_out2_batches.end()));
 
-  auto out = merge_op.execute(operator_data(merge_inputs), cudf::get_default_stream());
+  auto out =
+    *merge_op.execute(std::make_unique<operator_data>(merge_inputs), cudf::get_default_stream());
   REQUIRE(out.get_data_batches().size() == 1);
 
   auto table =
