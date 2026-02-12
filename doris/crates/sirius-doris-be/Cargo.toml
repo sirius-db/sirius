@@ -17,3 +17,5 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
+clap.workspace = true
+mysql_async.workspace = true

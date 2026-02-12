@@ -74,11 +74,6 @@ bison = "*"
 [feature.doris-fe.tasks]
 doris-fe-thrift = { cmd = """bash -c 'set -e
   THRIFT_VER=0.16.0
-  THRIFT_BIN=doris/thirdparty/thrift-$THRIFT_VER/build/compiler/cpp/bin/thrift
-  if [ -x "$THRIFT_BIN" ]; then
-    echo "thrift $THRIFT_VER already built: $THRIFT_BIN"
-    exit 0
-  fi
   echo "==> Downloading thrift $THRIFT_VER..."
   mkdir -p doris/thirdparty
   curl -sL http://archive.apache.org/dist/thrift/$THRIFT_VER/thrift-$THRIFT_VER.tar.gz | tar xz -C doris/thirdparty
@@ -90,8 +85,8 @@ doris-fe-thrift = { cmd = """bash -c 'set -e
     -DWITH_OPENSSL=OFF -DWITH_LIBEVENT=OFF \
     -DCMAKE_POLICY_VERSION_MINIMUM=3.5
   make -j$(nproc)
-  echo "==> thrift compiler built: $(pwd)/compiler/cpp/thrift"
-'""", description = "Build thrift 0.16.0 compiler from source" }
+  echo "==> thrift compiler built: $(pwd)/compiler/cpp/bin/thrift"
+'""", outputs = ["doris/thirdparty/thrift-0.16.0/build/compiler/cpp/bin/thrift"], description = "Build thrift 0.16.0 compiler from source" }
 
 doris-fe-build = { cmd = """bash -c 'set -e
   DORIS_SRC=doris/thirdparty/apache-doris
@@ -136,9 +131,6 @@ doris-fe-build = { cmd = """bash -c 'set -e
 '""", depends-on = ["doris-fe-thrift"], description = "Build Doris FE from source (Maven)" }
 
 doris-fe = { cmd = "bin/start_fe.sh --console", cwd = "doris/thirdparty/apache-doris/output/fe", depends-on = ["doris-fe-build"], description = "Build and run Doris FE in foreground" }
-
-doris-fe-add-be = { cmd = "bash -c 'mysql -h 127.0.0.1 -P 9030 -u root -e \"ALTER SYSTEM ADD BACKEND \\\"127.0.0.1:9050\\\";\" && echo \"Backend added. Run: pixi run -e doris-fe doris-fe-show-be\"'", description = "Register Rust BE with Doris FE" }
-
 doris-fe-show-be = { cmd = "bash -c 'mysql -h 127.0.0.1 -P 9030 -u root -e \"SHOW BACKENDS\\G\"'", description = "Show registered backends" }
 
 [environments]

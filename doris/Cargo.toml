@@ -24,3 +24,5 @@ cxx = "1.0"
 substrait = "0.52"
 prost = "0.13"
 bytes = "1"
+clap = { version = "4", features = ["derive"] }
+mysql_async = { version = "0.34", default-features = false, features = ["default-rustls"] }

@@ -1,38 +1,35 @@
 //! Configuration for the Sirius Doris BE.
 
-use std::time::Instant;
+use clap::Parser;
 
-#[derive(Debug, Clone)]
+#[derive(Parser, Debug, Clone)]
+#[command(name = "sirius-doris-be", about = "Sirius GPU Backend for Apache Doris")]
 pub struct BeConfig {
     /// Heartbeat service port (FE connects here to register this BE).
+    #[arg(long, default_value_t = 9050)]
     pub heartbeat_port: u16,
-    /// Main Thrift port for BackendService.
-    pub be_port: u16,
-    /// gRPC/brpc port for PBackendService (fragment execution).
-    pub brpc_port: u16,
-    /// HTTP port (for status/metrics).
-    pub http_port: u16,
-    /// Arrow Flight SQL port for result delivery.
-    pub arrow_flight_port: u16,
-    /// GPU device IDs to use.
-    pub gpu_ids: Vec<i32>,
-    /// BE version string reported to FE.
-    pub version: String,
-    /// Timestamp when this BE process started.
-    pub start_time: Instant,
-}
 
-impl Default for BeConfig {
-    fn default() -> Self {
-        Self {
-            heartbeat_port: 9050,
-            be_port: 9060,
-            brpc_port: 8060,
-            http_port: 8040,
-            arrow_flight_port: 8071,
-            gpu_ids: vec![0],
-            version: format!("sirius-doris-be {}", env!("CARGO_PKG_VERSION")),
-            start_time: Instant::now(),
-        }
-    }
+    /// BackendService Thrift port.
+    #[arg(long, default_value_t = 9060)]
+    pub be_port: u16,
+
+    /// PBackendService gRPC port.
+    #[arg(long, default_value_t = 8060)]
+    pub brpc_port: u16,
+
+    /// HTTP status port.
+    #[arg(long, default_value_t = 8040)]
+    pub http_port: u16,
+
+    /// Arrow Flight result port.
+    #[arg(long, default_value_t = 8071)]
+    pub arrow_flight_port: u16,
+
+    /// GPU device IDs (comma-separated).
+    #[arg(long, value_delimiter = ',', default_values_t = vec![0])]
+    pub gpu_ids: Vec<i32>,
+
+    /// FE MySQL address for self-registration (e.g. 127.0.0.1:9030).
+    #[arg(long)]
+    pub fe: Option<String>,
 }
