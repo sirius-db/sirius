@@ -333,7 +333,7 @@ std::vector<std::shared_ptr<cucascade::data_batch>> parquet_scan_task::compute_t
     new_byte_ranges.emplace_back(new_offset, range.size());
     new_offset += range.size();
   }
-  std::for_each(read_futures.begin(), read_futures.end(), [](auto& future) { future.wait(); });
+  std::for_each(read_futures.begin(), read_futures.end(), [](auto& future) { future.get(); });
   assert(new_offset == l_state.get_reserved_compressed_bytes());
 
   // Create a data batch with the column chunks
