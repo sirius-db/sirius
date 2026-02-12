@@ -306,8 +306,7 @@ parquet_scan_task_local_state::make_allocation()
 //===----------------------------------------------------------------------===//
 // Parquet Scan Task
 //===----------------------------------------------------------------------===//
-std::vector<std::shared_ptr<cucascade::data_batch>> parquet_scan_task::compute_task(
-  rmm::cuda_stream_view /* stream */)
+op::operator_data parquet_scan_task::compute_task(rmm::cuda_stream_view /* stream */)
 {
   auto& l_state = this->_local_state->cast<parquet_scan_task_local_state>();
   auto& g_state = this->_global_state->cast<parquet_scan_task_global_state>();
@@ -348,14 +347,13 @@ std::vector<std::shared_ptr<cucascade::data_batch>> parquet_scan_task::compute_t
                                                   l_state.get_reserved_uncompressed_bytes());
   auto data_batch =
     std::make_shared<cucascade::data_batch>(get_next_batch_id(), std::move(parquet_representation));
-  return {data_batch};
+  return op::operator_data(std::vector<std::shared_ptr<cucascade::data_batch>>{data_batch});
 }
 
-void parquet_scan_task::publish_output(
-  std::vector<std::shared_ptr<cucascade::data_batch>> output_batches,
-  rmm::cuda_stream_view /* stream */)
+void parquet_scan_task::publish_output(op::operator_data& output_data,
+                                       rmm::cuda_stream_view /* stream */)
 {
-  for (auto& batch : output_batches) {
+  for (auto& batch : output_data.get_data_batches()) {
     _data_repo->add_data_batch(std::move(batch));
   }
 }
