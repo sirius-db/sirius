@@ -87,7 +87,24 @@ void SiriusContext::QueryBegin(ClientContext& context)
   task_creator_->set_client_context(context);
 }
 
-void SiriusContext::QueryEnd() { query_.reset(); }
+void SiriusContext::QueryEnd()
+{
+  query_.reset();
+
+  // Clear all data repositories between queries.
+  // Any batches still present are leaked — operators should have popped everything.
+  if (data_repository_manager_) {
+    auto leaked = data_repository_manager_->clear_all_repositories();
+    for (auto const& info : leaked) {
+      spdlog::warn(
+        "SiriusContext::QueryEnd: operator {} port '{}' still had {} un-consumed "
+        "data batch(es) (memory leak).",
+        info.operator_id,
+        info.port_id,
+        info.count);
+    }
+  }
+}
 
 void SiriusContext::QueryEnd(ClientContext& context) { QueryEnd(); }
 
