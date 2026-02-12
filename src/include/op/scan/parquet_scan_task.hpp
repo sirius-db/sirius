@@ -42,6 +42,7 @@
 // standard library
 #include <atomic>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace sirius::op::scan {
@@ -128,9 +129,27 @@ class parquet_scan_task_global_state : public parallel::itask_global_state {
    *
    * @return The next row group partition index.
    */
-  [[nodiscard]] size_t get_next_rg_partition_idx()
+  [[nodiscard]] std::optional<size_t> get_next_rg_partition_idx()
   {
-    return _next_rg_partition.fetch_add(1, std::memory_order_relaxed);
+    auto const total = _row_group_partitions.size();
+    size_t current   = _next_rg_partition.load(std::memory_order_relaxed);
+    while (true) {
+      if (current >= total) { return std::nullopt; }
+      if (_next_rg_partition.compare_exchange_weak(
+            current, current + 1, std::memory_order_relaxed, std::memory_order_relaxed)) {
+        return current;
+      }
+    }
+  }
+
+  /**
+   * @brief Check if there are remaining row group partitions.
+   *
+   * @return True if there are more partitions to process.
+   */
+  [[nodiscard]] bool has_more_partitions() const
+  {
+    return _next_rg_partition.load(std::memory_order_relaxed) < _row_group_partitions.size();
   }
 
   /**
@@ -209,8 +228,9 @@ class parquet_scan_task_local_state : public pipeline::sirius_pipeline_itask_loc
    * @brief Construct the local state for the parquet scan task.
    *
    * @param[in] g_state The global state for the parquet scan task
+   * @param[in] partition_idx The assigned row group partition index
    */
-  parquet_scan_task_local_state(parquet_scan_task_global_state& g_state);
+  parquet_scan_task_local_state(parquet_scan_task_global_state& g_state, size_t partition_idx);
 
   //===----------Methods----------===//
   /**

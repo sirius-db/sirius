@@ -272,15 +272,8 @@ void parquet_scan_task_global_state::partition_row_groups()
 // Parquet Scan Task Local State
 //===----------------------------------------------------------------------===//
 parquet_scan_task_local_state::parquet_scan_task_local_state(
-  parquet_scan_task_global_state& g_state)
+  parquet_scan_task_global_state& g_state, size_t partition_idx)
 {
-  // Get the next row-group partition
-  auto const partition_idx = g_state.get_next_rg_partition_idx();
-  if (partition_idx >= g_state.get_num_row_group_partitions()) {
-    // Too many tasks have been created for this table scan!
-    throw std::runtime_error(
-      "[parquet_scan_task_local_state] No more row group partitions available for reservation.");
-  }
   auto const& partition = g_state.get_row_group_partition(partition_idx);
 
   _rg_indices.resize(partition.row_group_count);

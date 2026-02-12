@@ -221,6 +221,7 @@ void SiriusContext::create_query(sirius::sirius_pipeline_hashmap pipeline_hashma
   throw_if_not_initialized();
   query_ = duckdb::make_shared_ptr<sirius::planner::query>(std::move(pipeline_hashmap));
   pipeline_executor_->prepare_for_query(query_);
+  task_creator_->prepare_for_query(*query_);
 }
 
 duckdb::shared_ptr<sirius::planner::query> SiriusContext::get_query()

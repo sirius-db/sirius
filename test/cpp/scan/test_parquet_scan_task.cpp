@@ -245,10 +245,13 @@ static void run_parquet_scan_test(std::string const& table_name,
 
   auto run_scan = [&]() -> std::vector<std::shared_ptr<cucascade::data_batch>> {
     executor.start();
-    uint64_t task_id          = 1;
-    auto const num_partitions = global_state->get_num_row_group_partitions();
-    for (size_t i = 0; i < num_partitions; ++i) {
-      auto local_state = std::make_unique<op::scan::parquet_scan_task_local_state>(*global_state);
+    uint64_t task_id = 1;
+    size_t scheduled = 0;
+    while (true) {
+      auto const partition_idx = global_state->get_next_rg_partition_idx();
+      if (!partition_idx.has_value()) { break; }
+      auto local_state = std::make_unique<op::scan::parquet_scan_task_local_state>(
+        *global_state, *partition_idx);
       auto reservation = mem_mgr.request_reservation(
         cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::HOST},
         local_state->get_reserved_compressed_bytes());
@@ -256,14 +259,15 @@ static void run_parquet_scan_test(std::string const& table_name,
       auto task = std::make_unique<op::scan::parquet_scan_task>(
         task_id++, &data_repo, std::move(local_state), global_state);
       executor.schedule(std::move(task));
+      ++scheduled;
     }
-    while (data_repo.total_size() < num_partitions) {
+    while (data_repo.total_size() < scheduled) {
       std::this_thread::yield();
     }
 
     executor.stop();
     auto batches = drain_data_repo(data_repo);
-    REQUIRE(batches.size() == num_partitions);
+    REQUIRE(batches.size() == scheduled);
     return batches;
   };
 
