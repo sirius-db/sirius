@@ -1091,9 +1091,33 @@ TEST_CASE_METHOD(GPUExecutionFixture,
   std::cerr << "VARCHAR order by: " << gpu_result->RowCount() << " rows OK" << std::endl;
 }
 
-//===----------------------------------------------------------------------===//
-// Cast to decimal tests
-//===----------------------------------------------------------------------===//
+
+TEST_CASE("gpu_execution - limit on large table",
+          "[integration][gpu_execution][limit][limit_multi_batch]")
+{
+  config_env_guard env;
+  duckdb::DuckDB db(get_tpch_db_path().string());
+  duckdb::Connection con(db);
+
+  // lineitem has ~6K rows at SF-0.01, ensuring multiple batches.
+  // A limit of 100 should produce exactly 100 rows regardless of batch count.
+  std::string query = "select l_orderkey from lineitem limit 100";
+
+  auto gpu_result = con.Query("CALL gpu_execution('" + query + "')");
+  REQUIRE(gpu_result);
+  if (gpu_result->HasError()) { UNSCOPED_INFO("gpu error: " << gpu_result->GetError()); }
+  REQUIRE_FALSE(gpu_result->HasError());
+  REQUIRE(gpu_result->RowCount() == 100);
+}
+
+TEST_CASE("gpu_execution - limit with offset on large table",
+          "[integration][gpu_execution][limit][limit_multi_batch]")
+{
+  config_env_guard env;
+  duckdb::DuckDB db(get_tpch_db_path().string());
+  duckdb::Connection con(db);
+  compare_gpu_vs_cpu(con, "select l_orderkey, l_partkey from lineitem limit 50 offset 200;");
+}
 
 TEST_CASE_METHOD(GPUExecutionFixture,
                  "gpu_execution - cast integer to decimal preserves scale",
