@@ -126,6 +126,9 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
       throw duckdb::InvalidInputException(
         "[GPUPhysicalMaterializedCollector] data_batch has no data representation");
     }
+    if (data->get_size_in_bytes() == 0) {
+      return;
+    }
 
     // If data is in GPU tier, convert to HOST tier first
     if (data->get_current_tier() == cucascade::memory::Tier::GPU) {

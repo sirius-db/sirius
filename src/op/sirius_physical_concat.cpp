@@ -36,27 +36,28 @@ sirius_physical_concat::sirius_physical_concat(duckdb::vector<duckdb::LogicalTyp
   : sirius_physical_partition_consumer_operator(
       SiriusPhysicalOperatorType::CONCAT, std::move(types), estimated_cardinality)
 {
-  _num_partitions = (estimated_cardinality + PARTITION_SIZE - 1) / PARTITION_SIZE;
   _parent_op      = parent_op;
   _is_build       = is_build;
   // check if parent_op is a hash join
   if (parent_op->type == SiriusPhysicalOperatorType::HASH_JOIN) {
     auto hash_join = dynamic_cast<sirius_physical_hash_join*>(parent_op);
     if (hash_join->join_type == duckdb::JoinType::LEFT ||
-        hash_join->join_type == duckdb::JoinType::ANTI) {
+        hash_join->join_type == duckdb::JoinType::ANTI ||
+        hash_join->join_type == duckdb::JoinType::SEMI ) {
       // if the join type is left or anti, then we need to concat all the batches into one batch for
       // the build side
       _concat_all = is_build;
     } else if (hash_join->join_type == duckdb::JoinType::RIGHT ||
-               hash_join->join_type == duckdb::JoinType::RIGHT_ANTI) {
+               hash_join->join_type == duckdb::JoinType::RIGHT_ANTI ||
+               hash_join->join_type == duckdb::JoinType::RIGHT_SEMI) {
       // if the join type is right or right anti, then we need to concat all the batches into one
       // batch for the probe side
       _concat_all = !is_build;
     } else if (hash_join->join_type == duckdb::JoinType::INNER ||
-               hash_join->join_type == duckdb::JoinType::SEMI ||
-               hash_join->join_type == duckdb::JoinType::RIGHT_SEMI ||
                hash_join->join_type == duckdb::JoinType::MARK) {
       _concat_all = false;
+    } else if( hash_join->join_type == duckdb::JoinType::OUTER) {
+      _concat_all = true;
     } else {
       throw std::runtime_error("sirius_physical_concat: unsupported join type");
     }
@@ -94,7 +95,7 @@ std::optional<operator_data> sirius_physical_concat::get_next_task_input_data()
           // this mean that there is a batch that is bigger than the threshold, then we just output
           // that batch right away
           auto popped_batch =
-            port_ptr->repo->pop_data_batch(::cucascade::batch_state::task_created, i);
+            port_ptr->repo->pop_data_batch_by_id(batch_id, ::cucascade::batch_state::task_created, i);
           input_batch.push_back(std::move(popped_batch));
         }
         break;
@@ -102,7 +103,7 @@ std::optional<operator_data> sirius_physical_concat::get_next_task_input_data()
         // if the batch size does not exceed the threshold, then we need to add the batch to the
         // input batch
         auto popped_batch =
-          port_ptr->repo->pop_data_batch(::cucascade::batch_state::task_created, i);
+          port_ptr->repo->pop_data_batch_by_id(batch_id, ::cucascade::batch_state::task_created, i);
         input_batch.push_back(std::move(popped_batch));
       }
     }
