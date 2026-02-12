@@ -101,7 +101,12 @@ pub fn map_scalar_type(scalar: &TScalarType, nullable: bool) -> Result<Type> {
             type_variation_reference: 0,
             nullability: n,
         })
-    } else if scalar.type_ == TPrimitiveType::DECIMALV2 {
+    } else if scalar.type_ == TPrimitiveType::DECIMALV2
+        || scalar.type_ == TPrimitiveType::DECIMAL32
+        || scalar.type_ == TPrimitiveType::DECIMAL64
+        || scalar.type_ == TPrimitiveType::DECIMAL128I
+        || scalar.type_ == TPrimitiveType::DECIMAL256
+    {
         let precision = scalar.precision.unwrap_or(27);
         let scale = scalar.scale.unwrap_or(9);
         r#type::Kind::Decimal(r#type::Decimal {

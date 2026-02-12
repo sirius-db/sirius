@@ -214,22 +214,36 @@ impl PBackendService for PBackendServiceHandler {
             "deserialized fragment params"
         );
 
-        // Translate Doris plan to SQL.
-        let sql = match plan_translator::translate_fragment_to_sql(&params) {
-            Ok(s) => {
-                info!(sql = %s, "translated to SQL");
-                s
+        // Translate Doris plan to Substrait, falling back to SQL.
+        enum ExecPlan {
+            Substrait(Vec<u8>),
+            Sql(String),
+        }
+
+        let exec_plan = match plan_translator::translate_fragment(&params) {
+            Ok(substrait_bytes) => {
+                info!(bytes = substrait_bytes.len(), "translated to Substrait");
+                ExecPlan::Substrait(substrait_bytes)
             }
             Err(e) => {
-                warn!(error = %e, "plan translation failed");
-                return Ok(Response::new(PExecPlanFragmentResult {
-                    status: err_status(&format!("plan translation: {e}")),
-                    ..Default::default()
-                }));
+                warn!(error = %e, "Substrait translation failed, trying SQL fallback");
+                match plan_translator::translate_fragment_to_sql(&params) {
+                    Ok(sql) => {
+                        info!(sql = %sql, "translated to SQL (fallback)");
+                        ExecPlan::Sql(sql)
+                    }
+                    Err(e2) => {
+                        warn!(error = %e2, "SQL translation also failed");
+                        return Ok(Response::new(PExecPlanFragmentResult {
+                            status: err_status(&format!("plan translation: {e}")),
+                            ..Default::default()
+                        }));
+                    }
+                }
             }
         };
 
-        // Execute the SQL via DuckDB.
+        // Execute via DuckDB.
         let engine = match &self.engine {
             Some(e) => e.clone(),
             None => {
@@ -244,7 +258,14 @@ impl PBackendService for PBackendServiceHandler {
         // DuckDB execution is blocking — run off the async runtime.
         let exec_result = tokio::task::spawn_blocking(move || -> Result<(), String> {
             let engine = engine.lock().unwrap();
-            let ipc_bytes = engine.execute_sql(&sql).map_err(|e| e.to_string())?;
+            let ipc_bytes = match exec_plan {
+                ExecPlan::Substrait(bytes) => engine
+                    .execute_substrait(&bytes)
+                    .map_err(|e| e.to_string())?,
+                ExecPlan::Sql(sql) => engine
+                    .execute_sql(&sql)
+                    .map_err(|e| e.to_string())?,
+            };
             store.store_ipc_result(finst_id, &ipc_bytes)?;
             Ok(())
         })
