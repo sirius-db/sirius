@@ -16,47 +16,23 @@
 
 #include "extension_lock.hpp"
 
-#include <fcntl.h>     // for open, O_CREAT, etc.
+#include <fcntl.h>     // for open, O_CREAT, O_CLOEXEC, etc.
 #include <sys/file.h>  // for flock
 #include <unistd.h>    // for close
 
 #include <cerrno>
-#include <csignal>
 #include <cstring>
 #include <filesystem>
-#include <iostream>
 #include <stdexcept>
 #include <string>
 #include <utility>
 
 namespace sirius {
 
-namespace {
-
-// Stored globally so the signal handler can clean up the lock file on abnormal termination.
-std::string g_lock_path;
-
-void cleanup_lock_file(int signum)
-{
-  if (!g_lock_path.empty()) { std::filesystem::remove(g_lock_path); }
-  // Re-raise with default handler so the process terminates with the correct exit status / core.
-  std::signal(signum, SIG_DFL);
-  std::raise(signum);
-}
-
-void install_signal_handlers()
-{
-  std::signal(SIGTERM, cleanup_lock_file);
-  std::signal(SIGABRT, cleanup_lock_file);
-  std::signal(SIGSEGV, cleanup_lock_file);
-}
-
-}  // namespace
-
 extension_lock::extension_lock(const std::string& extension_name, const std::string& lock_prefix)
   : lock_path_(lock_prefix + "/" + extension_name + ".lock")
 {
-  fd_ = open(lock_path_.c_str(), O_CREAT | O_RDWR, 0666);
+  fd_ = open(lock_path_.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0666);
   if (fd_ == -1) {
     throw std::runtime_error("Failed to open lock file '" + lock_path_ +
                              "': " + std::strerror(errno));
@@ -77,8 +53,6 @@ extension_lock::extension_lock(const std::string& extension_name, const std::str
     }
   }
 
-  g_lock_path = lock_path_;
-  install_signal_handlers();
 }
 
 extension_lock::~extension_lock()
@@ -87,7 +61,6 @@ extension_lock::~extension_lock()
     flock(fd_, LOCK_UN);
     close(fd_);
     std::filesystem::remove(lock_path_);
-    g_lock_path.clear();
   }
 }
 
