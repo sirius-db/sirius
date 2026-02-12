@@ -19,6 +19,7 @@ pub mod descriptor_table;
 pub mod expr_translator;
 pub mod node_translator;
 pub mod scan_translator;
+pub mod sql_generator;
 pub mod type_mapper;
 
 /// Substrait extension URIs for standard function sets.
@@ -98,6 +99,20 @@ impl ExtensionRegistry {
     pub fn into_extensions(self) -> (Vec<SimpleExtensionUri>, Vec<SimpleExtensionDeclaration>) {
         (self.uris, self.functions)
     }
+}
+
+/// Translate a Doris TPipelineFragmentParams into a SQL string for DuckDB execution.
+pub fn translate_fragment_to_sql(params: &TPipelineFragmentParams) -> Result<String> {
+    let fragment = params
+        .fragment
+        .as_ref()
+        .context("TPipelineFragmentParams has no fragment")?;
+    let plan = fragment
+        .plan
+        .as_ref()
+        .context("TPlanFragment has no plan")?;
+
+    sql_generator::plan_to_sql(plan)
 }
 
 /// Translate a Doris TPipelineFragmentParams into serialized Substrait Plan bytes.

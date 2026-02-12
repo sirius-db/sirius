@@ -6,15 +6,16 @@
 
 mod config;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::SystemTime;
 
 use clap::Parser;
-use tracing::{error, instrument, warn};
+use tracing::{error, info, instrument, warn};
 
 use doris_rpc::heartbeat_service::BeState;
 use result_formatter::result_store::ResultStore;
+use sirius_ffi::SiriusEngine;
 
 #[instrument(skip_all, fields(%fe_addr, heartbeat_port))]
 async fn register_with_fe(fe_addr: &str, heartbeat_port: u16) -> anyhow::Result<()> {
@@ -60,6 +61,17 @@ fn main() {
         start_time_ms,
     });
 
+    let engine = match SiriusEngine::new() {
+        Ok(e) => {
+            info!("DuckDB engine initialized");
+            Some(Arc::new(Mutex::new(e)))
+        }
+        Err(e) => {
+            warn!(error = %e, "engine init failed, queries will error");
+            None
+        }
+    };
+
     let result_store = ResultStore::new();
 
     let heartbeat_addr = format!("0.0.0.0:{}", config.heartbeat_port);
@@ -95,7 +107,7 @@ fn main() {
     let flight_store = result_store.clone();
 
     let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
-    rt.block_on(run(config, version, grpc_addr, flight_addr, grpc_state, grpc_store, flight_store));
+    rt.block_on(run(config, version, grpc_addr, flight_addr, grpc_state, grpc_store, flight_store, engine));
 }
 
 #[instrument(name = "sirius_doris_be", skip_all, fields(
@@ -114,6 +126,7 @@ async fn run(
     grpc_state: Arc<BeState>,
     grpc_store: ResultStore,
     flight_store: ResultStore,
+    engine: Option<Arc<Mutex<SiriusEngine>>>,
 ) {
     if let Some(fe_addr) = &config.fe {
         if let Err(e) = register_with_fe(fe_addr, config.heartbeat_port).await {
@@ -130,7 +143,7 @@ async fn run(
     });
 
     if let Err(e) =
-        doris_rpc::grpc_service::start_grpc_server(&grpc_addr, grpc_state, grpc_store).await
+        doris_rpc::grpc_service::start_grpc_server(&grpc_addr, grpc_state, grpc_store, engine).await
     {
         error!(error = %e, "PBackendService gRPC server exited with error");
     }

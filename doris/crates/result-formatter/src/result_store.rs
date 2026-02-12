@@ -7,6 +7,7 @@
 use std::io::Cursor;
 use std::sync::Arc;
 
+use arrow::array::Array;
 use arrow::datatypes::SchemaRef;
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::{IpcWriteOptions, StreamWriter};
@@ -69,6 +70,51 @@ impl ResultEntry {
     pub fn num_rows(&self) -> usize {
         self.batches.iter().map(|b| b.num_rows()).sum()
     }
+
+    /// Convert all batches to MySQL text protocol rows.
+    ///
+    /// Each returned `Vec<u8>` is one row: a concatenation of length-encoded
+    /// column value strings (or 0xFB for NULL).
+    pub fn to_mysql_rows(&self) -> Vec<Vec<u8>> {
+        let mut rows = Vec::with_capacity(self.num_rows());
+        for batch in &self.batches {
+            for row_idx in 0..batch.num_rows() {
+                let mut row_buf = Vec::new();
+                for col_idx in 0..batch.num_columns() {
+                    let col = batch.column(col_idx);
+                    if col.is_null(row_idx) {
+                        row_buf.push(0xFB); // MySQL NULL marker
+                    } else {
+                        let s = arrow::util::display::array_value_to_string(col, row_idx)
+                            .unwrap_or_default();
+                        mysql_encode_string(&s, &mut row_buf);
+                    }
+                }
+                rows.push(row_buf);
+            }
+        }
+        rows
+    }
+}
+
+/// Encode a string as a MySQL length-encoded string, appending to `buf`.
+fn mysql_encode_string(s: &str, buf: &mut Vec<u8>) {
+    let len = s.len();
+    if len < 251 {
+        buf.push(len as u8);
+    } else if len < 65536 {
+        buf.push(0xFC);
+        buf.extend_from_slice(&(len as u16).to_le_bytes());
+    } else if len < 16_777_216 {
+        buf.push(0xFD);
+        buf.push(len as u8);
+        buf.push((len >> 8) as u8);
+        buf.push((len >> 16) as u8);
+    } else {
+        buf.push(0xFE);
+        buf.extend_from_slice(&(len as u64).to_le_bytes());
+    }
+    buf.extend_from_slice(s.as_bytes());
 }
 
 /// Concurrent storage for fragment results.

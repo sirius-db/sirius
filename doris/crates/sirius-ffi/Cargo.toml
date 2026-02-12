@@ -5,14 +5,11 @@ edition = "2021"
 
 [features]
 default = []
-# Enable C++ bridge compilation (requires DuckDB + Sirius + Arrow C++ libs).
-# Without this feature, stub implementations are provided.
-sirius-engine = ["dep:cxx"]
+# Use bundled DuckDB for CPU-only execution (no GPU, no external C++ deps).
+duckdb-bundled = ["dep:duckdb", "dep:arrow"]
 
 [dependencies]
-cxx = { workspace = true, optional = true }
+duckdb = { workspace = true, optional = true }
+# Match duckdb's arrow version for IPC serialization (workspace uses 54).
+arrow = { version = "56", features = ["ipc"], optional = true }
 thiserror.workspace = true
-
-[build-dependencies]
-cxx-build = "1.0"
-cmake = "0.1"

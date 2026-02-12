@@ -4,15 +4,16 @@
 //! `exec_plan_fragment` requests containing Thrift-serialized `TPipelineFragmentParams`.
 
 use std::io::Cursor;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tonic::{Request, Response, Status};
-use tracing::{info, warn};
+use tracing::{info, instrument, warn};
 
 use doris_proto::doris::p_backend_service_server::PBackendService;
 use doris_proto::doris::*;
-use doris_thrift::palo_internal_service::TPipelineFragmentParams;
+use doris_thrift::palo_internal_service::{TPipelineFragmentParams, TPipelineFragmentParamsList};
 use result_formatter::result_store::{FinstId, ResultStore};
+use sirius_ffi::SiriusEngine;
 
 use super::heartbeat_service::BeState;
 
@@ -35,49 +36,146 @@ fn err_status(msg: &str) -> PStatus {
 }
 
 /// Deserialize Thrift TPipelineFragmentParams from raw bytes.
-fn deserialize_params(data: Vec<u8>, compact: bool) -> Result<TPipelineFragmentParams, String> {
+///
+/// `version` corresponds to `PFragmentRequestVersion`:
+///   1 = single TExecPlanFragmentParams (unsupported)
+///   2 = single TPipelineFragmentParams
+///   3 = TPipelineFragmentParamsList (shared fields at list level)
+fn deserialize_params(data: Vec<u8>, compact: bool, version: i32) -> Result<TPipelineFragmentParams, String> {
     use thrift::protocol::{TBinaryInputProtocol, TCompactInputProtocol, TSerializable};
     use thrift::transport::TBufferedReadTransport;
 
-    if compact {
-        let transport = TBufferedReadTransport::new(Box::new(Cursor::new(data)));
-        let mut protocol = TCompactInputProtocol::new(transport);
-        TPipelineFragmentParams::read_from_in_protocol(&mut protocol)
-            .map_err(|e| format!("compact thrift deserialize: {e}"))
+    if version == 3 {
+        // VERSION_3: bytes contain TPipelineFragmentParamsList.
+        // Shared fields (desc_tbl, query_globals, etc.) are at the list level.
+        let list = if compact {
+            let transport = TBufferedReadTransport::new(Box::new(Cursor::new(data)));
+            let mut protocol = TCompactInputProtocol::new(transport);
+            TPipelineFragmentParamsList::read_from_in_protocol(&mut protocol)
+                .map_err(|e| format!("compact thrift deserialize (v3 list): {e}"))?
+        } else {
+            let transport = TBufferedReadTransport::new(Box::new(Cursor::new(data)));
+            let mut protocol = TBinaryInputProtocol::new(transport, true);
+            TPipelineFragmentParamsList::read_from_in_protocol(&mut protocol)
+                .map_err(|e| format!("binary thrift deserialize (v3 list): {e}"))?
+        };
+
+        let mut params = list
+            .params_list
+            .and_then(|mut v| if v.is_empty() { None } else { Some(v.remove(0)) })
+            .ok_or_else(|| "VERSION_3: empty params_list".to_string())?;
+
+        // Merge shared fields from list level into the per-fragment params.
+        if params.desc_tbl.is_none() {
+            params.desc_tbl = list.desc_tbl;
+        }
+        if params.query_globals.is_none() {
+            params.query_globals = list.query_globals;
+        }
+        if params.query_options.is_none() {
+            params.query_options = list.query_options;
+        }
+        if params.coord.is_none() {
+            params.coord = list.coord;
+        }
+        if params.resource_info.is_none() {
+            params.resource_info = list.resource_info;
+        }
+        if params.fragment_num_on_host.is_none() {
+            params.fragment_num_on_host = list.fragment_num_on_host;
+        }
+        if params.file_scan_params.is_none() {
+            params.file_scan_params = list.file_scan_params;
+        }
+
+        Ok(params)
+    } else if version == 2 || version == 0 {
+        // VERSION_2 (or default): single TPipelineFragmentParams.
+        if compact {
+            let transport = TBufferedReadTransport::new(Box::new(Cursor::new(data)));
+            let mut protocol = TCompactInputProtocol::new(transport);
+            TPipelineFragmentParams::read_from_in_protocol(&mut protocol)
+                .map_err(|e| format!("compact thrift deserialize: {e}"))
+        } else {
+            let transport = TBufferedReadTransport::new(Box::new(Cursor::new(data)));
+            let mut protocol = TBinaryInputProtocol::new(transport, true);
+            TPipelineFragmentParams::read_from_in_protocol(&mut protocol)
+                .map_err(|e| format!("binary thrift deserialize: {e}"))
+        }
     } else {
-        let transport = TBufferedReadTransport::new(Box::new(Cursor::new(data)));
-        let mut protocol = TBinaryInputProtocol::new(transport, true);
-        TPipelineFragmentParams::read_from_in_protocol(&mut protocol)
-            .map_err(|e| format!("binary thrift deserialize: {e}"))
+        Err(format!("unsupported PFragmentRequestVersion: {version}"))
+    }
+}
+
+/// Serialize MySQL rows as a Thrift binary-encoded TResultBatch.
+///
+/// The Doris FE deserializes row_batch using TBinaryProtocol (see ResultReceiver.java),
+/// NOT TCompactProtocol.
+fn serialize_result_batch(rows: &[Vec<u8>], packet_seq: i64) -> Result<Vec<u8>, String> {
+    use thrift::protocol::{TBinaryOutputProtocol, TOutputProtocol, TSerializable};
+
+    let batch = doris_thrift::data::TResultBatch::new(
+        rows.to_vec(),
+        false, // is_compressed
+        packet_seq,
+        None::<std::collections::BTreeMap<String, String>>,
+    );
+
+    let mut buf = Vec::new();
+    {
+        let mut protocol = TBinaryOutputProtocol::new(Cursor::new(&mut buf), true);
+        batch
+            .write_to_out_protocol(&mut protocol)
+            .map_err(|e| format!("thrift serialize TResultBatch: {e}"))?;
+        protocol
+            .flush()
+            .map_err(|e| format!("thrift flush: {e}"))?;
+    }
+    Ok(buf)
+}
+
+/// Extract FinstId for result storage from fragment params.
+///
+/// With `enable_parallel_result_sink` (default: true), the FE uses the `query_id`
+/// to fetch results, not the fragment_instance_id. So we always use query_id.
+fn extract_finst_id(params: &TPipelineFragmentParams) -> FinstId {
+    FinstId {
+        hi: params.query_id.hi,
+        lo: params.query_id.lo,
     }
 }
 
 pub struct PBackendServiceHandler {
     state: Arc<BeState>,
     result_store: ResultStore,
+    engine: Option<Arc<Mutex<SiriusEngine>>>,
 }
 
 impl PBackendServiceHandler {
-    pub fn new(state: Arc<BeState>, result_store: ResultStore) -> Self {
-        Self { state, result_store }
+    pub fn new(
+        state: Arc<BeState>,
+        result_store: ResultStore,
+        engine: Option<Arc<Mutex<SiriusEngine>>>,
+    ) -> Self {
+        Self {
+            state,
+            result_store,
+            engine,
+        }
     }
 }
 
 #[tonic::async_trait]
 impl PBackendService for PBackendServiceHandler {
+    #[instrument(skip_all, fields(compact, query_id, fragment_id))]
     async fn exec_plan_fragment(
         &self,
         request: Request<PExecPlanFragmentRequest>,
     ) -> Result<Response<PExecPlanFragmentResult>, Status> {
         let req = request.into_inner();
         let compact = req.compact.unwrap_or(false);
-        info!(
-            version = ?req.version(),
-            has_request = req.request.is_some(),
-            compact,
-            "exec_plan_fragment"
-        );
 
+        let version = req.version.unwrap_or(2); // default = VERSION_2
         let thrift_bytes = match req.request {
             Some(bytes) => bytes,
             None => {
@@ -88,8 +186,16 @@ impl PBackendService for PBackendServiceHandler {
             }
         };
 
+        info!(
+            compact,
+            version,
+            len = thrift_bytes.len(),
+            first_bytes = ?&thrift_bytes[..thrift_bytes.len().min(32)],
+            "received exec_plan_fragment request"
+        );
+
         // Deserialize Thrift TPipelineFragmentParams.
-        let params = match deserialize_params(thrift_bytes, compact) {
+        let params = match deserialize_params(thrift_bytes, compact, version) {
             Ok(p) => p,
             Err(e) => {
                 warn!(error = %e, "failed to deserialize fragment params");
@@ -100,22 +206,65 @@ impl PBackendService for PBackendServiceHandler {
             }
         };
 
+        let finst_id = extract_finst_id(&params);
         info!(
             query_id = ?params.query_id,
             fragment_id = ?params.fragment_id,
+            %finst_id,
             "deserialized fragment params"
         );
 
-        // Translate Doris plan to Substrait.
-        match plan_translator::translate_fragment(&params) {
-            Ok(plan_bytes) => {
-                info!(plan_bytes = plan_bytes.len(), "translated to Substrait plan");
-                // TODO: Submit plan_bytes to Sirius engine via C++ bridge
+        // Translate Doris plan to SQL.
+        let sql = match plan_translator::translate_fragment_to_sql(&params) {
+            Ok(s) => {
+                info!(sql = %s, "translated to SQL");
+                s
             }
             Err(e) => {
                 warn!(error = %e, "plan translation failed");
                 return Ok(Response::new(PExecPlanFragmentResult {
                     status: err_status(&format!("plan translation: {e}")),
+                    ..Default::default()
+                }));
+            }
+        };
+
+        // Execute the SQL via DuckDB.
+        let engine = match &self.engine {
+            Some(e) => e.clone(),
+            None => {
+                return Ok(Response::new(PExecPlanFragmentResult {
+                    status: err_status("engine not initialized (built without duckdb-bundled?)"),
+                    ..Default::default()
+                }));
+            }
+        };
+        let store = self.result_store.clone();
+
+        // DuckDB execution is blocking — run off the async runtime.
+        let exec_result = tokio::task::spawn_blocking(move || -> Result<(), String> {
+            let engine = engine.lock().unwrap();
+            let ipc_bytes = engine.execute_sql(&sql).map_err(|e| e.to_string())?;
+            store.store_ipc_result(finst_id, &ipc_bytes)?;
+            Ok(())
+        })
+        .await;
+
+        match exec_result {
+            Ok(Ok(())) => {
+                info!(%finst_id, "execution complete, result stored");
+            }
+            Ok(Err(e)) => {
+                warn!(error = %e, %finst_id, "execution failed");
+                return Ok(Response::new(PExecPlanFragmentResult {
+                    status: err_status(&format!("execution: {e}")),
+                    ..Default::default()
+                }));
+            }
+            Err(e) => {
+                warn!(error = %e, "spawn_blocking panicked");
+                return Ok(Response::new(PExecPlanFragmentResult {
+                    status: err_status(&format!("internal: {e}")),
                     ..Default::default()
                 }));
             }
@@ -209,9 +358,55 @@ impl PBackendService for PBackendServiceHandler {
         }))
     }
 
+    async fn fetch_data(
+        &self,
+        request: Request<PFetchDataRequest>,
+    ) -> Result<Response<PFetchDataResult>, Status> {
+        let req = request.into_inner();
+        let finst_id = FinstId {
+            hi: req.finst_id.hi,
+            lo: req.finst_id.lo,
+        };
+        info!(%finst_id, "fetch_data");
+
+        let entry = match self.result_store.get(&finst_id) {
+            Some(e) => e,
+            None => {
+                warn!(%finst_id, "fetch_data: result not found");
+                return Ok(Response::new(PFetchDataResult {
+                    status: err_status("result not found"),
+                    eos: Some(true),
+                    ..Default::default()
+                }));
+            }
+        };
+
+        // Convert Arrow data to MySQL text protocol rows and wrap in TResultBatch.
+        let mysql_rows = entry.to_mysql_rows();
+        info!(%finst_id, num_rows = mysql_rows.len(), "converting to TResultBatch");
+        let row_batch_bytes = serialize_result_batch(&mysql_rows, 0)
+            .map_err(|e| Status::internal(format!("failed to serialize result batch: {e}")))?;
+        info!(
+            %finst_id,
+            batch_len = row_batch_bytes.len(),
+            first_bytes = ?&row_batch_bytes[..row_batch_bytes.len().min(32)],
+            "serialized TResultBatch"
+        );
+
+        // Remove result after serving it.
+        self.result_store.remove(&finst_id);
+
+        Ok(Response::new(PFetchDataResult {
+            status: ok_status(),
+            packet_seq: Some(0),
+            eos: Some(true),
+            row_batch: Some(row_batch_bytes),
+            ..Default::default()
+        }))
+    }
+
     // --- Stub implementations for unsupported methods ---
 
-    async fn fetch_data(&self, _: Request<PFetchDataRequest>) -> Result<Response<PFetchDataResult>, Status> { Err(unimpl()) }
     async fn fetch_arrow_data(&self, _: Request<PFetchArrowDataRequest>) -> Result<Response<PFetchArrowDataResult>, Status> { Err(unimpl()) }
     async fn tablet_writer_open(&self, _: Request<PTabletWriterOpenRequest>) -> Result<Response<PTabletWriterOpenResult>, Status> { Err(unimpl()) }
     async fn open_load_stream(&self, _: Request<POpenLoadStreamRequest>) -> Result<Response<POpenLoadStreamResponse>, Status> { Err(unimpl()) }
@@ -270,11 +465,12 @@ pub async fn start_grpc_server(
     listen_addr: &str,
     state: Arc<BeState>,
     result_store: ResultStore,
+    engine: Option<Arc<Mutex<SiriusEngine>>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use doris_proto::doris::p_backend_service_server::PBackendServiceServer;
 
     let addr = listen_addr.parse()?;
-    let handler = PBackendServiceHandler::new(state, result_store);
+    let handler = PBackendServiceHandler::new(state, result_store, engine);
 
     info!(addr = listen_addr, "starting PBackendService gRPC server");
 

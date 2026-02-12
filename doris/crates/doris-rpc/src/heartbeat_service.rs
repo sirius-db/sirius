@@ -53,7 +53,7 @@ impl HeartbeatServiceSyncHandler for HeartbeatHandler {
             Some(self.state.brpc_port),    // brpc_port
             Some(self.state.version.clone()), // version
             Some(self.state.start_time_ms),  // be_start_time
-            Some("computation".to_string()), // be_node_role
+            Some("mix".to_string()),       // be_node_role
             Some(false),                   // is_shutdown
             Some(self.state.arrow_flight_port), // arrow_flight_sql_port
             None::<i64>,                   // be_mem (let FE discover)

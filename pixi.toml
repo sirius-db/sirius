@@ -59,6 +59,7 @@ thrift-compiler = ">=0.22"
 doris-check = { cmd = "cargo check", cwd = "doris", description = "Check doris workspace" }
 doris-build = { cmd = "cargo build --release", cwd = "doris", description = "Build doris workspace" }
 doris-test = { cmd = "cargo test", cwd = "doris", description = "Test doris workspace" }
+doris-build-duckdb = { cmd = "cargo build --release --features sirius-ffi/duckdb-bundled", cwd = "doris", description = "Build doris workspace with bundled DuckDB engine" }
 
 # Doris FE feature: build & run Doris Frontend from source for testing
 [feature.doris-fe.dependencies]
