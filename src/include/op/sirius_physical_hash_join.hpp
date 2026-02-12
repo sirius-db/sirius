@@ -27,6 +27,7 @@
 #include "duckdb/planner/operator/logical_join.hpp"
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 #include "utils.hpp"
+
 #include <cstddef>
 #include <cstdint>
 
@@ -118,7 +119,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
 
   std::mutex batches_to_processed_mutex;
   std::size_t current_partition_index = 0;
-  std::size_t num_batches_to_process = 0;
+  std::size_t num_batches_to_process  = 0;
   std::vector<std::vector<uint64_t>> left_batch_ids;
   std::vector<std::vector<uint64_t>> right_batch_ids;
 
@@ -130,7 +131,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
  public:
   //! Per-key cast info: whether each join key needs a cast before comparison
   struct key_cast_info {
-    bool cast_left = false;
+    bool cast_left  = false;
     bool cast_right = false;
     cudf::data_type left_target_type{cudf::type_id::EMPTY};
     cudf::data_type right_target_type{cudf::type_id::EMPTY};

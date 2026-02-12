@@ -210,20 +210,20 @@ void host_table_chunk_reader::column_reader::copy_string(
       copy_mask_to_validity(validity, row_offset, count, allocation);
       detail::make_duckdb_strings<true, int32_t>(
         offset_accessor_32, allocation, vector, count, start_offset, end_offset, str_buffer_ptr);
-        duckdb::StringVector::AddBuffer(vector, str_buffer);
-      } else {
-        detail::make_duckdb_strings<false, int32_t>(
-          offset_accessor_32, allocation, vector, count, start_offset, end_offset, str_buffer_ptr);
-        duckdb::StringVector::AddBuffer(vector, str_buffer);
-      }
+      duckdb::StringVector::AddBuffer(vector, str_buffer);
+    } else {
+      detail::make_duckdb_strings<false, int32_t>(
+        offset_accessor_32, allocation, vector, count, start_offset, end_offset, str_buffer_ptr);
+      duckdb::StringVector::AddBuffer(vector, str_buffer);
     }
   }
-  
-  host_table_chunk_reader::host_table_chunk_reader(
-    duckdb::ClientContext& client_ctx,
-    cucascade::host_table_representation const& host_table,
-    duckdb::vector<duckdb::LogicalType> const& types_p)
-    : _client_ctx(client_ctx), _allocation(host_table.get_host_table()->allocation), _types(types_p)
+}
+
+host_table_chunk_reader::host_table_chunk_reader(
+  duckdb::ClientContext& client_ctx,
+  cucascade::host_table_representation const& host_table,
+  duckdb::vector<duckdb::LogicalType> const& types_p)
+  : _client_ctx(client_ctx), _allocation(host_table.get_host_table()->allocation), _types(types_p)
 {
   if (!host_table.get_host_table().get()) {
     throw std::runtime_error(

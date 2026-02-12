@@ -72,7 +72,7 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
         }
       }
     }
-   
+
   } else if (op->type == SiriusPhysicalOperatorType::HASH_GROUP_BY) {
     _partition_type            = PartitionType::HASH;
     auto& grouped_aggregate_op = op->Cast<sirius_physical_grouped_aggregate>();
@@ -121,8 +121,7 @@ std::vector<std::shared_ptr<::cucascade::data_batch>> sirius_physical_partition:
   const std::vector<std::shared_ptr<::cucascade::data_batch>>& input_batches,
   rmm::cuda_stream_view stream)
 {
-  if (_num_partitions < 2) { 
-    return input_batches; }
+  if (_num_partitions < 2) { return input_batches; }
 
   auto input_batch = input_batches[0];
   std::vector<std::shared_ptr<cucascade::data_batch>> partitioned_results;
