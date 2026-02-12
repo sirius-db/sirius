@@ -263,14 +263,14 @@ TEMPLATE_TEST_CASE("sirius_physical_grouped_aggregate_merge end-to-end with AVG"
   std::vector<std::shared_ptr<data_batch>> agg_outputs;
   for (auto& split_table : input_tables) {
     auto input_batch = sirius::make_data_batch(std::move(split_table), *space);
-    auto outputs     = grouped_aggregator.execute({input_batch}, default_stream());
-    REQUIRE(outputs.size() == 1);
-    agg_outputs.push_back(outputs[0]);
+    auto outputs     = grouped_aggregator.execute(operator_data({input_batch}), default_stream());
+    REQUIRE(outputs.get_data_batches().size() == 1);
+    agg_outputs.push_back(outputs.get_data_batches()[0]);
   }
 
   // Run merge with AVG projection
-  auto outputs = grouped_aggregate_merger.execute(agg_outputs, default_stream());
-  REQUIRE(outputs.size() == 1);
+  auto outputs = grouped_aggregate_merger.execute(operator_data(agg_outputs), default_stream());
+  REQUIRE(outputs.get_data_batches().size() == 1);
 
   // Cast expected count column from int32 to int64 (merge sums int32 counts -> int64)
   auto expected_columns = expected_table->release();
@@ -280,7 +280,7 @@ TEMPLATE_TEST_CASE("sirius_physical_grouped_aggregate_merge end-to-end with AVG"
     expected_columns[count_col_idx]->view(), cudf::data_type{cudf::type_id::INT64}, stream, mr);
   expected_table = std::make_unique<cudf::table>(std::move(expected_columns));
 
-  bool tables_match =
-    sirius::test::expect_data_batch_equivalent_to_table(outputs[0], expected_table->view(), true);
+  bool tables_match = sirius::test::expect_data_batch_equivalent_to_table(
+    outputs.get_data_batches()[0], expected_table->view(), true);
   REQUIRE(tables_match);
 }
