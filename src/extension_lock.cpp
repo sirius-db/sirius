@@ -52,7 +52,6 @@ extension_lock::extension_lock(const std::string& extension_name, const std::str
       throw std::runtime_error("Failed to lock file: " + std::string(std::strerror(err)));
     }
   }
-
 }
 
 extension_lock::~extension_lock()
