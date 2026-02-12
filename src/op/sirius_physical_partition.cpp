@@ -72,7 +72,7 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
         }
       }
     }
-   
+
   } else if (op->type == SiriusPhysicalOperatorType::HASH_GROUP_BY) {
     _partition_type            = PartitionType::HASH;
     auto& grouped_aggregate_op = op->Cast<sirius_physical_grouped_aggregate>();
