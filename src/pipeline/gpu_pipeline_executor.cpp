@@ -103,6 +103,7 @@ void gpu_pipeline_executor::manager_loop()
     if (!reservation) {
       SIRIUS_LOG_ERROR("GPU Pipeline Executor: Failed to acquire memory reservation for task {}",
                        gpu_task->get_task_id());
+      _completion_handler->report_error("GPU Pipeline Executor: Failed to acquire memory reservation for task " + std::to_string(gpu_task->get_task_id()));
       break;
     }
     if (auto* local_state = dynamic_cast<sirius::pipeline::sirius_pipeline_itask_local_state*>(
@@ -111,6 +112,7 @@ void gpu_pipeline_executor::manager_loop()
     } else {
       SIRIUS_LOG_ERROR("GPU Pipeline Executor: Failed to cast local state for task {}",
                        gpu_task->get_task_id());
+      _completion_handler->report_error("GPU Pipeline Executor: Failed to cast local state for task " + std::to_string(gpu_task->get_task_id()));
       break;
     }
     auto output_consumers = gpu_task->get_output_consumers();

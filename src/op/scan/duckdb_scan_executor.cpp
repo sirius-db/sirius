@@ -202,12 +202,14 @@ void duckdb_scan_executor::manager_loop()
         cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::HOST}, bytes_needed);
       if (!reservation) {
         SIRIUS_LOG_ERROR("DuckDB Scan Executor: Failed to acquire host memory reservation");
+        _completion_handler->report_error("DuckDB Scan Executor: Failed to acquire host memory reservation");
         break;
       }
       if (auto* local_state = dynamic_cast<sirius::pipeline::sirius_pipeline_itask_local_state*>(
             scan_task->local_state())) {
         local_state->set_reservation(std::move(reservation));
       } else {
+        _completion_handler->report_error("DuckDB Scan Executor: Failed to cast local state for task");
         SIRIUS_LOG_ERROR("DuckDB Scan Executor: Failed to cast local state for task");
         break;
       }
