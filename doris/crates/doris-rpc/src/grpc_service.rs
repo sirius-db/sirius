@@ -12,6 +12,7 @@ use tracing::{info, instrument, warn};
 use doris_proto::doris::p_backend_service_server::PBackendService;
 use doris_proto::doris::*;
 use doris_thrift::palo_internal_service::{TPipelineFragmentParams, TPipelineFragmentParamsList};
+use doris_thrift::plan_nodes::{TFileFormatType, TPlanNodeType};
 use result_formatter::result_store::{FinstId, ResultStore};
 use sirius_ffi::SiriusEngine;
 
@@ -41,13 +42,14 @@ fn err_status(msg: &str) -> PStatus {
 ///   1 = single TExecPlanFragmentParams (unsupported)
 ///   2 = single TPipelineFragmentParams
 ///   3 = TPipelineFragmentParamsList (shared fields at list level)
-fn deserialize_params(data: Vec<u8>, compact: bool, version: i32) -> Result<TPipelineFragmentParams, String> {
+fn deserialize_params(data: Vec<u8>, compact: bool, version: i32) -> Result<Vec<TPipelineFragmentParams>, String> {
     use thrift::protocol::{TBinaryInputProtocol, TCompactInputProtocol, TSerializable};
     use thrift::transport::TBufferedReadTransport;
 
     if version == 3 {
         // VERSION_3: bytes contain TPipelineFragmentParamsList.
         // Shared fields (desc_tbl, query_globals, etc.) are at the list level.
+        // The params_list may contain MULTIPLE fragments (scan + exchange, etc.).
         let list = if compact {
             let transport = TBufferedReadTransport::new(Box::new(Cursor::new(data)));
             let mut protocol = TCompactInputProtocol::new(transport);
@@ -60,48 +62,73 @@ fn deserialize_params(data: Vec<u8>, compact: bool, version: i32) -> Result<TPip
                 .map_err(|e| format!("binary thrift deserialize (v3 list): {e}"))?
         };
 
-        let mut params = list
+        let params_list = list
             .params_list
-            .and_then(|mut v| if v.is_empty() { None } else { Some(v.remove(0)) })
+            .filter(|v| !v.is_empty())
             .ok_or_else(|| "VERSION_3: empty params_list".to_string())?;
 
-        // Merge shared fields from list level into the per-fragment params.
-        if params.desc_tbl.is_none() {
-            params.desc_tbl = list.desc_tbl;
-        }
-        if params.query_globals.is_none() {
-            params.query_globals = list.query_globals;
-        }
-        if params.query_options.is_none() {
-            params.query_options = list.query_options;
-        }
-        if params.coord.is_none() {
-            params.coord = list.coord;
-        }
-        if params.resource_info.is_none() {
-            params.resource_info = list.resource_info;
-        }
-        if params.fragment_num_on_host.is_none() {
-            params.fragment_num_on_host = list.fragment_num_on_host;
-        }
-        if params.file_scan_params.is_none() {
-            params.file_scan_params = list.file_scan_params;
+        // Merge shared fields into each per-fragment params.
+        // Fields come from two sources (in priority order):
+        //   1. List-level fields (TPipelineFragmentParamsList top-level)
+        //   2. First fragment in the list (when is_simplified_param is used)
+        // The FE may put shared fields at the list level OR in the first fragment.
+        let mut all_params: Vec<TPipelineFragmentParams> = params_list;
+
+        // Extract shared fields: prefer list-level, fall back to first fragment.
+        let shared_desc_tbl = list.desc_tbl.clone()
+            .or_else(|| all_params.first().and_then(|p| p.desc_tbl.clone()));
+        let shared_query_globals = list.query_globals.clone()
+            .or_else(|| all_params.first().and_then(|p| p.query_globals.clone()));
+        let shared_query_options = list.query_options.clone()
+            .or_else(|| all_params.first().and_then(|p| p.query_options.clone()));
+        let shared_coord = list.coord.clone()
+            .or_else(|| all_params.first().and_then(|p| p.coord.clone()));
+        let shared_resource_info = list.resource_info.clone()
+            .or_else(|| all_params.first().and_then(|p| p.resource_info.clone()));
+        let shared_fragment_num = list.fragment_num_on_host
+            .or_else(|| all_params.first().and_then(|p| p.fragment_num_on_host));
+        let shared_file_scan_params = list.file_scan_params.clone()
+            .or_else(|| all_params.first().and_then(|p| p.file_scan_params.clone()));
+
+        for params in &mut all_params {
+            if params.desc_tbl.is_none() {
+                params.desc_tbl = shared_desc_tbl.clone();
+            }
+            if params.query_globals.is_none() {
+                params.query_globals = shared_query_globals.clone();
+            }
+            if params.query_options.is_none() {
+                params.query_options = shared_query_options.clone();
+            }
+            if params.coord.is_none() {
+                params.coord = shared_coord.clone();
+            }
+            if params.resource_info.is_none() {
+                params.resource_info = shared_resource_info.clone();
+            }
+            if params.fragment_num_on_host.is_none() {
+                params.fragment_num_on_host = shared_fragment_num;
+            }
+            if params.file_scan_params.is_none() {
+                params.file_scan_params = shared_file_scan_params.clone();
+            }
         }
 
-        Ok(params)
+        Ok(all_params)
     } else if version == 2 || version == 0 {
         // VERSION_2 (or default): single TPipelineFragmentParams.
-        if compact {
+        let params = if compact {
             let transport = TBufferedReadTransport::new(Box::new(Cursor::new(data)));
             let mut protocol = TCompactInputProtocol::new(transport);
             TPipelineFragmentParams::read_from_in_protocol(&mut protocol)
-                .map_err(|e| format!("compact thrift deserialize: {e}"))
+                .map_err(|e| format!("compact thrift deserialize: {e}"))?
         } else {
             let transport = TBufferedReadTransport::new(Box::new(Cursor::new(data)));
             let mut protocol = TBinaryInputProtocol::new(transport, true);
             TPipelineFragmentParams::read_from_in_protocol(&mut protocol)
-                .map_err(|e| format!("binary thrift deserialize: {e}"))
-        }
+                .map_err(|e| format!("binary thrift deserialize: {e}"))?
+        };
+        Ok(vec![params])
     } else {
         Err(format!("unsupported PFragmentRequestVersion: {version}"))
     }
@@ -143,6 +170,132 @@ fn extract_finst_id(params: &TPipelineFragmentParams) -> FinstId {
         hi: params.query_id.hi,
         lo: params.query_id.lo,
     }
+}
+
+/// Map an Arrow DataType to a Doris PTypeDesc.
+///
+/// TPrimitiveType values (from Doris thrift Types.thrift):
+///   BOOLEAN=2, TINYINT=3, SMALLINT=4, INT=5, BIGINT=6, FLOAT=7, DOUBLE=8,
+///   DATE=10, DATETIME=11, VARCHAR=16, DECIMALV2=12, LARGEINT=15,
+///   CHAR=17, DATEV2=28, DATETIMEV2=29, DECIMAL32=47, DECIMAL64=48, DECIMAL128I=49
+fn arrow_type_to_doris(dt: &arrow::datatypes::DataType) -> PTypeDesc {
+    use arrow::datatypes::DataType;
+    let scalar = match dt {
+        DataType::Boolean => PScalarType { r#type: 2, len: None, precision: None, scale: None },
+        DataType::Int8 => PScalarType { r#type: 3, len: None, precision: None, scale: None },
+        DataType::Int16 => PScalarType { r#type: 4, len: None, precision: None, scale: None },
+        DataType::Int32 => PScalarType { r#type: 5, len: None, precision: None, scale: None },
+        DataType::Int64 => PScalarType { r#type: 6, len: None, precision: None, scale: None },
+        DataType::UInt8 => PScalarType { r#type: 3, len: None, precision: None, scale: None },
+        DataType::UInt16 => PScalarType { r#type: 4, len: None, precision: None, scale: None },
+        DataType::UInt32 => PScalarType { r#type: 5, len: None, precision: None, scale: None },
+        DataType::UInt64 => PScalarType { r#type: 6, len: None, precision: None, scale: None },
+        DataType::Float16 | DataType::Float32 => PScalarType { r#type: 7, len: None, precision: None, scale: None },
+        DataType::Float64 => PScalarType { r#type: 8, len: None, precision: None, scale: None },
+        DataType::Date32 | DataType::Date64 => PScalarType { r#type: 28, len: None, precision: None, scale: None },
+        DataType::Timestamp(_, _) => PScalarType { r#type: 29, len: None, precision: None, scale: None },
+        DataType::Utf8 | DataType::LargeUtf8 => PScalarType { r#type: 16, len: Some(65533), precision: None, scale: None },
+        DataType::Decimal128(p, s) => {
+            let p = *p as i32;
+            let s = *s as i32;
+            if p <= 9 {
+                PScalarType { r#type: 47, len: None, precision: Some(p), scale: Some(s) }
+            } else if p <= 18 {
+                PScalarType { r#type: 48, len: None, precision: Some(p), scale: Some(s) }
+            } else {
+                PScalarType { r#type: 49, len: None, precision: Some(p), scale: Some(s) }
+            }
+        }
+        // Default to VARCHAR for any other type
+        _ => PScalarType { r#type: 16, len: Some(65533), precision: None, scale: None },
+    };
+    PTypeDesc {
+        types: vec![PTypeNode {
+            r#type: 0, // SCALAR
+            scalar_type: Some(scalar),
+            struct_fields: vec![],
+            contains_null: None,
+            contains_nulls: vec![],
+            variant_max_subcolumns_count: None,
+        }],
+    }
+}
+
+/// A file-backed table that needs to be loaded into DuckDB before plan execution.
+struct FileTable {
+    table_name: String,
+    file_path: String,
+    format: String,
+}
+
+/// Extract file tables from fragment params (FILE_SCAN_NODE → file path + format).
+///
+/// Walks the plan nodes looking for FILE_SCAN_NODE, then extracts the file path
+/// from `local_params[0].per_node_scan_ranges` and the format from `file_scan_params`.
+fn extract_file_tables(params: &TPipelineFragmentParams) -> Vec<FileTable> {
+    let mut tables = Vec::new();
+
+    let fragment = match &params.fragment {
+        Some(f) => f,
+        None => return tables,
+    };
+    let plan = match &fragment.plan {
+        Some(p) => p,
+        None => return tables,
+    };
+    for node in &plan.nodes {
+        if node.node_type != TPlanNodeType::FILE_SCAN_NODE {
+            continue;
+        }
+        let node_id = node.node_id;
+
+        // Table name from TFileScanNode.table_name or fallback.
+        let table_name = node
+            .file_scan_node
+            .as_ref()
+            .and_then(|fsn| fsn.table_name.clone())
+            .unwrap_or_else(|| format!("scan_{}", node_id));
+
+        // Format from file_scan_params[node_id].format_type.
+        let format = params
+            .file_scan_params
+            .as_ref()
+            .and_then(|m| m.get(&node_id))
+            .and_then(|p| p.format_type.as_ref())
+            .map(|ft| match *ft {
+                TFileFormatType::FORMAT_PARQUET => "parquet",
+                TFileFormatType::FORMAT_ORC => "orc",
+                TFileFormatType::FORMAT_JSON => "json",
+                TFileFormatType::FORMAT_CSV_PLAIN => "csv",
+                _ => "parquet", // default fallback
+            })
+            .unwrap_or("parquet")
+            .to_string();
+
+        // File path from local_params[0].per_node_scan_ranges[node_id][0].scan_range
+        //   .ext_scan_range.file_scan_range.ranges[0].path
+        let file_path = params
+            .local_params
+            .as_ref()
+            .and_then(|lp| lp.first())
+            .and_then(|inst| inst.per_node_scan_ranges.get(&node_id))
+            .and_then(|ranges| ranges.first())
+            .and_then(|srp| srp.scan_range.ext_scan_range.as_ref())
+            .and_then(|ext| ext.file_scan_range.as_ref())
+            .and_then(|fsr| fsr.ranges.as_ref())
+            .and_then(|ranges| ranges.first())
+            .and_then(|rd| rd.path.clone());
+
+        if let Some(path) = file_path {
+            tables.push(FileTable {
+                table_name,
+                file_path: path,
+                format,
+            });
+        }
+    }
+
+    tables
 }
 
 pub struct PBackendServiceHandler {
@@ -194,8 +347,8 @@ impl PBackendService for PBackendServiceHandler {
             "received exec_plan_fragment request"
         );
 
-        // Deserialize Thrift TPipelineFragmentParams.
-        let params = match deserialize_params(thrift_bytes, compact, version) {
+        // Deserialize Thrift fragment params (VERSION_3 may contain multiple fragments).
+        let all_params = match deserialize_params(thrift_bytes, compact, version) {
             Ok(p) => p,
             Err(e) => {
                 warn!(error = %e, "failed to deserialize fragment params");
@@ -206,107 +359,151 @@ impl PBackendService for PBackendServiceHandler {
             }
         };
 
-        let finst_id = extract_finst_id(&params);
-        info!(
-            query_id = ?params.query_id,
-            fragment_id = ?params.fragment_id,
-            %finst_id,
-            "deserialized fragment params"
-        );
+        info!(num_fragments = all_params.len(), "deserialized fragment params");
 
-        // Try Substrait translation first, fall back to SQL.
-        enum ExecPlan {
-            Substrait(Vec<u8>),
-            Sql(String),
-        }
+        // Process each fragment: skip exchange-only fragments, execute scan fragments.
+        for params in &all_params {
+            let finst_id = extract_finst_id(params);
+            info!(
+                query_id = ?params.query_id,
+                fragment_id = ?params.fragment_id,
+                %finst_id,
+                "processing fragment"
+            );
 
-        let exec_plan = match plan_translator::translate_fragment(&params) {
-            Ok(substrait_bytes) => {
-                info!(bytes = substrait_bytes.len(), "translated to Substrait");
-                ExecPlan::Substrait(substrait_bytes)
-            }
-            Err(e) => {
-                warn!(error = %e, "Substrait translation failed, trying SQL fallback");
-                match plan_translator::translate_fragment_to_sql(&params) {
-                    Ok(sql) => {
-                        info!(sql = %sql, "translated to SQL (fallback)");
-                        ExecPlan::Sql(sql)
-                    }
-                    Err(e2) => {
-                        warn!(error = %e2, "SQL translation also failed");
-                        return Ok(Response::new(PExecPlanFragmentResult {
-                            status: err_status(&format!("plan translation: {e}")),
-                            ..Default::default()
-                        }));
+            // Skip result-collecting fragments (EXCHANGE_NODE with 0 children at root).
+            // In a multi-fragment plan, the FE sends exchange + scan in one VERSION_3 request.
+            // We execute the full query in the scan fragment and skip the exchange fragment.
+            if let Some(plan) = params.fragment.as_ref().and_then(|f| f.plan.as_ref()) {
+                if let Some(root) = plan.nodes.first() {
+                    if root.node_type == TPlanNodeType::EXCHANGE_NODE && root.num_children == 0 {
+                        info!(%finst_id, "skipping exchange-only fragment (result collector)");
+                        continue;
                     }
                 }
             }
-        };
 
-        // Execute via Sirius GPU, falling back to DuckDB CPU.
-        let engine = match &self.engine {
-            Some(e) => e.clone(),
-            None => {
-                return Ok(Response::new(PExecPlanFragmentResult {
-                    status: err_status("engine not initialized (built without duckdb-bundled?)"),
-                    ..Default::default()
-                }));
-            }
-        };
-        let store = self.result_store.clone();
-
-        // Sirius/DuckDB execution is blocking — run off the async runtime.
-        let exec_result = tokio::task::spawn_blocking(move || -> Result<(), String> {
-            let engine = engine.lock().unwrap();
-            let ipc_bytes = match exec_plan {
-                ExecPlan::Substrait(bytes) => {
-                    match engine.execute_substrait(&bytes) {
-                        Ok(ipc) => {
-                            tracing::info!("executed via gpu_processing_substrait");
-                            ipc
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "gpu_processing_substrait failed, falling back to CPU from_substrait");
-                            engine.execute_sql("SELECT 'substrait_fallback_not_implemented'")
-                                .map_err(|e| e.to_string())?
+            // Register file-backed tables (e.g. Parquet) in DuckDB before plan execution.
+            let file_tables = extract_file_tables(params);
+            if !file_tables.is_empty() {
+                if let Some(engine) = &self.engine {
+                    let engine_guard = engine.lock().unwrap();
+                    for ft in &file_tables {
+                        info!(
+                            table = %ft.table_name,
+                            path = %ft.file_path,
+                            format = %ft.format,
+                            "registering file table"
+                        );
+                        if let Err(e) = engine_guard.register_file_table(&ft.table_name, &ft.file_path, &ft.format) {
+                            warn!(
+                                error = %e,
+                                table = %ft.table_name,
+                                "failed to register file table"
+                            );
+                            return Ok(Response::new(PExecPlanFragmentResult {
+                                status: err_status(&format!("register file table '{}': {e}", ft.table_name)),
+                                ..Default::default()
+                            }));
                         }
                     }
                 }
-                ExecPlan::Sql(sql) => {
-                    match engine.execute_gpu(&sql) {
-                        Ok(ipc) => {
-                            tracing::info!("executed via gpu_execution");
-                            ipc
+            }
+
+            // Try Substrait translation first, fall back to SQL.
+            enum ExecPlan {
+                Substrait(Vec<u8>),
+                Sql(String),
+            }
+
+            let exec_plan = match plan_translator::translate_fragment(params) {
+                Ok(substrait_bytes) => {
+                    info!(bytes = substrait_bytes.len(), "translated to Substrait");
+                    ExecPlan::Substrait(substrait_bytes)
+                }
+                Err(e) => {
+                    warn!(error = %e, "Substrait translation failed, trying SQL fallback");
+                    match plan_translator::translate_fragment_to_sql(params) {
+                        Ok(sql) => {
+                            info!(sql = %sql, "translated to SQL (fallback)");
+                            ExecPlan::Sql(sql)
                         }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "gpu_execution failed, falling back to direct SQL");
-                            engine.execute_sql(&sql).map_err(|e| e.to_string())?
+                        Err(e2) => {
+                            warn!(error = %e2, "SQL translation also failed");
+                            return Ok(Response::new(PExecPlanFragmentResult {
+                                status: err_status(&format!("plan translation: {e}")),
+                                ..Default::default()
+                            }));
                         }
                     }
                 }
             };
-            store.store_ipc_result(finst_id, &ipc_bytes)?;
-            Ok(())
-        })
-        .await;
 
-        match exec_result {
-            Ok(Ok(())) => {
-                info!(%finst_id, "execution complete, result stored");
-            }
-            Ok(Err(e)) => {
-                warn!(error = %e, %finst_id, "execution failed");
-                return Ok(Response::new(PExecPlanFragmentResult {
-                    status: err_status(&format!("execution: {e}")),
-                    ..Default::default()
-                }));
-            }
-            Err(e) => {
-                warn!(error = %e, "spawn_blocking panicked");
-                return Ok(Response::new(PExecPlanFragmentResult {
-                    status: err_status(&format!("internal: {e}")),
-                    ..Default::default()
-                }));
+            // Execute via Sirius GPU, falling back to DuckDB CPU.
+            let engine = match &self.engine {
+                Some(e) => e.clone(),
+                None => {
+                    return Ok(Response::new(PExecPlanFragmentResult {
+                        status: err_status("engine not initialized (built without duckdb-bundled?)"),
+                        ..Default::default()
+                    }));
+                }
+            };
+            let store = self.result_store.clone();
+
+            // Sirius/DuckDB execution is blocking — run off the async runtime.
+            let exec_result = tokio::task::spawn_blocking(move || -> Result<(), String> {
+                let engine = engine.lock().unwrap();
+                let ipc_bytes = match exec_plan {
+                    ExecPlan::Substrait(bytes) => {
+                        match engine.execute_substrait(&bytes) {
+                            Ok(ipc) => {
+                                tracing::info!("executed via gpu_processing_substrait");
+                                ipc
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "gpu_processing_substrait failed, falling back to CPU from_substrait");
+                                engine.execute_sql("SELECT 'substrait_fallback_not_implemented'")
+                                    .map_err(|e| e.to_string())?
+                            }
+                        }
+                    }
+                    ExecPlan::Sql(sql) => {
+                        match engine.execute_gpu(&sql) {
+                            Ok(ipc) => {
+                                tracing::info!("executed via gpu_execution");
+                                ipc
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "gpu_execution failed, falling back to direct SQL");
+                                engine.execute_sql(&sql).map_err(|e| e.to_string())?
+                            }
+                        }
+                    }
+                };
+                store.store_ipc_result(finst_id, &ipc_bytes)?;
+                Ok(())
+            })
+            .await;
+
+            match exec_result {
+                Ok(Ok(())) => {
+                    info!(%finst_id, "execution complete, result stored");
+                }
+                Ok(Err(e)) => {
+                    warn!(error = %e, %finst_id, "execution failed");
+                    return Ok(Response::new(PExecPlanFragmentResult {
+                        status: err_status(&format!("execution: {e}")),
+                        ..Default::default()
+                    }));
+                }
+                Err(e) => {
+                    warn!(error = %e, "spawn_blocking panicked");
+                    return Ok(Response::new(PExecPlanFragmentResult {
+                        status: err_status(&format!("internal: {e}")),
+                        ..Default::default()
+                    }));
+                }
             }
         }
 
@@ -475,7 +672,163 @@ impl PBackendService for PBackendServiceHandler {
     async fn request_slave_tablet_pull_rowset(&self, _: Request<PTabletWriteSlaveRequest>) -> Result<Response<PTabletWriteSlaveResult>, Status> { Err(unimpl()) }
     async fn response_slave_tablet_pull_rowset(&self, _: Request<PTabletWriteSlaveDoneRequest>) -> Result<Response<PTabletWriteSlaveDoneResult>, Status> { Err(unimpl()) }
     async fn outfile_write_success(&self, _: Request<POutfileWriteSuccessRequest>) -> Result<Response<POutfileWriteSuccessResult>, Status> { Err(unimpl()) }
-    async fn fetch_table_schema(&self, _: Request<PFetchTableSchemaRequest>) -> Result<Response<PFetchTableSchemaResult>, Status> { Err(unimpl()) }
+    async fn fetch_table_schema(
+        &self,
+        request: Request<PFetchTableSchemaRequest>,
+    ) -> Result<Response<PFetchTableSchemaResult>, Status> {
+        let req = request.into_inner();
+        info!("fetch_table_schema");
+
+        // Deserialize TFileScanRange from Thrift compact-encoded bytes.
+        let scan_range_bytes = match req.file_scan_range {
+            Some(b) => b,
+            None => {
+                warn!("fetch_table_schema: missing file_scan_range");
+                return Ok(Response::new(PFetchTableSchemaResult {
+                    status: Some(err_status("missing file_scan_range")),
+                    ..Default::default()
+                }));
+            }
+        };
+
+        let file_path = {
+            use thrift::protocol::{TCompactInputProtocol, TBinaryInputProtocol, TSerializable};
+            use thrift::transport::TBufferedReadTransport;
+
+            info!(
+                len = scan_range_bytes.len(),
+                first_bytes = ?&scan_range_bytes[..scan_range_bytes.len().min(64)],
+                "fetch_table_schema: raw scan_range bytes"
+            );
+
+            // Try compact first, then binary protocol.
+            let transport = TBufferedReadTransport::new(Box::new(Cursor::new(scan_range_bytes.clone())));
+            let mut protocol = TCompactInputProtocol::new(transport);
+            match doris_thrift::plan_nodes::TFileScanRange::read_from_in_protocol(&mut protocol) {
+                Ok(fsr) => {
+                    info!(
+                        has_ranges = fsr.ranges.is_some(),
+                        num_ranges = fsr.ranges.as_ref().map(|r| r.len()).unwrap_or(0),
+                        has_params = fsr.params.is_some(),
+                        "fetch_table_schema: deserialized TFileScanRange"
+                    );
+                    // Try to get path from ranges first, then from params.properties
+                    let path_from_ranges = fsr.ranges
+                        .as_ref()
+                        .and_then(|r| r.first())
+                        .and_then(|rd| {
+                            info!(path = ?rd.path, "fetch_table_schema: range desc");
+                            rd.path.clone()
+                        });
+
+                    // Also check params.properties for file_path
+                    let path_from_params = fsr.params
+                        .as_ref()
+                        .and_then(|p| {
+                            info!(props = ?p.properties, "fetch_table_schema: scan params");
+                            p.properties.as_ref()
+                        })
+                        .and_then(|props| props.get("file_path").cloned());
+
+                    path_from_ranges.or(path_from_params)
+                }
+                Err(e) => {
+                    warn!(error = %e, "fetch_table_schema: compact deser failed, trying binary");
+                    // Try binary protocol.
+                    let transport = TBufferedReadTransport::new(Box::new(Cursor::new(scan_range_bytes)));
+                    let mut protocol = TBinaryInputProtocol::new(transport, true);
+                    match doris_thrift::plan_nodes::TFileScanRange::read_from_in_protocol(&mut protocol) {
+                        Ok(fsr) => {
+                            info!(
+                                has_ranges = fsr.ranges.is_some(),
+                                num_ranges = fsr.ranges.as_ref().map(|r| r.len()).unwrap_or(0),
+                                "fetch_table_schema: deserialized TFileScanRange (binary)"
+                            );
+                            let path_from_ranges = fsr.ranges
+                                .as_ref()
+                                .and_then(|r| r.first())
+                                .and_then(|rd| rd.path.clone());
+                            let path_from_params = fsr.params
+                                .as_ref()
+                                .and_then(|p| p.properties.as_ref())
+                                .and_then(|props| props.get("file_path").cloned());
+                            path_from_ranges.or(path_from_params)
+                        }
+                        Err(e2) => {
+                            warn!(error = %e2, "fetch_table_schema: binary deser also failed");
+                            None
+                        }
+                    }
+                }
+            }
+        };
+
+        let file_path = match file_path {
+            Some(p) => p,
+            None => {
+                warn!("fetch_table_schema: no file path in TFileScanRange");
+                return Ok(Response::new(PFetchTableSchemaResult {
+                    status: Some(err_status("no file path in scan range")),
+                    ..Default::default()
+                }));
+            }
+        };
+
+        info!(path = %file_path, "fetch_table_schema: reading schema");
+
+        // Use DuckDB to read the file schema via a LIMIT 0 query (gets schema without data).
+        let engine = match &self.engine {
+            Some(e) => e.clone(),
+            None => {
+                return Ok(Response::new(PFetchTableSchemaResult {
+                    status: Some(err_status("engine not initialized")),
+                    ..Default::default()
+                }));
+            }
+        };
+
+        let result = tokio::task::spawn_blocking(move || -> Result<(Vec<String>, Vec<PTypeDesc>), String> {
+            let engine = engine.lock().unwrap();
+            // Get schema via prepared statement metadata (no data read needed).
+            let ipc_bytes = engine
+                .get_file_schema_ipc(&file_path, "parquet")
+                .map_err(|e| e.to_string())?;
+
+            if ipc_bytes.is_empty() {
+                return Err("empty schema IPC from get_file_schema_ipc".to_string());
+            }
+
+            // Parse Arrow IPC to get schema.
+            use arrow::ipc::reader::StreamReader;
+            let reader = StreamReader::try_new(std::io::Cursor::new(&ipc_bytes), None)
+                .map_err(|e| format!("parse Arrow IPC: {e}"))?;
+            let schema = reader.schema();
+
+            let mut names = Vec::new();
+            let mut types = Vec::new();
+            for field in schema.fields() {
+                names.push(field.name().clone());
+                types.push(arrow_type_to_doris(field.data_type()));
+            }
+            Ok((names, types))
+        }).await.map_err(|e| Status::internal(format!("spawn_blocking: {e}")))?
+            .map_err(|e| {
+                warn!(error = %e, "fetch_table_schema: failed");
+                Status::internal(format!("describe: {e}"))
+            })?;
+
+        let (column_names, column_types) = result;
+        let column_nums = column_names.len() as i32;
+
+        info!(columns = column_nums, names = ?column_names, "fetch_table_schema: got schema");
+
+        Ok(Response::new(PFetchTableSchemaResult {
+            status: Some(ok_status()),
+            column_nums: Some(column_nums),
+            column_names,
+            column_types,
+        }))
+    }
     async fn multiget_data(&self, _: Request<PMultiGetRequest>) -> Result<Response<PMultiGetResponse>, Status> { Err(unimpl()) }
     async fn multiget_data_v2(&self, _: Request<PMultiGetRequestV2>) -> Result<Response<PMultiGetResponseV2>, Status> { Err(unimpl()) }
     async fn get_file_cache_meta_by_tablet_id(&self, _: Request<PGetFileCacheMetaRequest>) -> Result<Response<PGetFileCacheMetaResponse>, Status> { Err(unimpl()) }
@@ -485,7 +838,30 @@ impl PBackendService for PBackendServiceHandler {
     async fn get_column_ids_by_tablet_ids(&self, _: Request<PFetchColIdsRequest>) -> Result<Response<PFetchColIdsResponse>, Status> { Err(unimpl()) }
     async fn get_tablet_rowset_versions(&self, _: Request<PGetTabletVersionsRequest>) -> Result<Response<PGetTabletVersionsResponse>, Status> { Err(unimpl()) }
     async fn report_stream_load_status(&self, _: Request<PReportStreamLoadStatusRequest>) -> Result<Response<PReportStreamLoadStatusResponse>, Status> { Err(unimpl()) }
-    async fn glob(&self, _: Request<PGlobRequest>) -> Result<Response<PGlobResponse>, Status> { Err(unimpl()) }
+    async fn glob(&self, request: Request<PGlobRequest>) -> Result<Response<PGlobResponse>, Status> {
+        let req = request.into_inner();
+        let pattern = req.pattern.unwrap_or_default();
+        info!(pattern = %pattern, "glob");
+
+        // For local files, just stat the path and return it.
+        let mut files = vec![];
+        match std::fs::metadata(&pattern) {
+            Ok(meta) => {
+                files.push(p_glob_response::PFileInfo {
+                    file: Some(pattern),
+                    size: Some(meta.len() as i64),
+                });
+            }
+            Err(e) => {
+                warn!(pattern = %pattern, error = %e, "glob: file not found");
+            }
+        }
+
+        Ok(Response::new(PGlobResponse {
+            status: ok_status(),
+            files,
+        }))
+    }
     async fn group_commit_insert(&self, _: Request<PGroupCommitInsertRequest>) -> Result<Response<PGroupCommitInsertResponse>, Status> { Err(unimpl()) }
     async fn get_wal_queue_size(&self, _: Request<PGetWalQueueSizeRequest>) -> Result<Response<PGetWalQueueSizeResponse>, Status> { Err(unimpl()) }
     async fn fetch_remote_tablet_schema(&self, _: Request<PFetchRemoteSchemaRequest>) -> Result<Response<PFetchRemoteSchemaResponse>, Status> { Err(unimpl()) }

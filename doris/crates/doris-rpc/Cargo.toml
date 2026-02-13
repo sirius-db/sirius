@@ -17,3 +17,4 @@ tracing.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 dashmap.workspace = true
+arrow.workspace = true

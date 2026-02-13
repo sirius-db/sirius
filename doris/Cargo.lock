@@ -1249,6 +1249,7 @@ name = "doris-rpc"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arrow 54.3.1",
  "dashmap",
  "doris-proto",
  "doris-thrift",

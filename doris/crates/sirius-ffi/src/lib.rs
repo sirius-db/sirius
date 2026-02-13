@@ -155,6 +155,82 @@ impl SiriusEngine {
         }
     }
 
+    /// Get the Arrow schema of a file as IPC stream bytes (schema only, no data).
+    ///
+    /// Uses `LIMIT 0` + `query_arrow().get_schema()` to extract the schema from
+    /// the prepared statement metadata, without reading any data rows.
+    pub fn get_file_schema_ipc(&self, file_path: &str, format: &str) -> Result<Vec<u8>, EngineError> {
+        #[cfg(feature = "duckdb-bundled")]
+        {
+            use arrow::ipc::writer::StreamWriter;
+
+            let reader_fn = match format {
+                "parquet" => "read_parquet",
+                "csv" => "read_csv_auto",
+                "json" => "read_json_auto",
+                "orc" => "read_parquet",
+                other => return Err(EngineError::ExecFailed(format!("unsupported file format: {other}"))),
+            };
+            let sql = format!("SELECT * FROM {}('{}') LIMIT 0", reader_fn, file_path);
+            let mut stmt = self
+                .conn
+                .prepare(&sql)
+                .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+            let arrow_result = stmt
+                .query_arrow([])
+                .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+            let schema = arrow_result.get_schema();
+
+            // Write schema-only IPC stream (header + EOS, no data batches).
+            let mut buf = Vec::new();
+            {
+                let mut writer = StreamWriter::try_new(&mut buf, &schema)
+                    .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+                writer
+                    .finish()
+                    .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+            }
+            Ok(buf)
+        }
+
+        #[cfg(not(feature = "duckdb-bundled"))]
+        {
+            let _ = (file_path, format);
+            Err(EngineError::NotCompiled)
+        }
+    }
+
+    /// Register a file as a DuckDB table (e.g. Parquet, CSV, JSON).
+    ///
+    /// Creates a table via `CREATE OR REPLACE TABLE "<name>" AS SELECT * FROM read_parquet(...)`.
+    /// This must be called before executing a plan that references the table.
+    pub fn register_file_table(&self, table_name: &str, file_path: &str, format: &str) -> Result<(), EngineError> {
+        #[cfg(feature = "duckdb-bundled")]
+        {
+            let reader_fn = match format {
+                "parquet" => "read_parquet",
+                "csv" => "read_csv_auto",
+                "json" => "read_json_auto",
+                "orc" => "read_parquet", // DuckDB doesn't have read_orc, parquet reader handles it
+                other => return Err(EngineError::ExecFailed(format!("unsupported file format: {other}"))),
+            };
+            let sql = format!(
+                "CREATE OR REPLACE TABLE \"{}\" AS SELECT * FROM {}('{}')",
+                table_name, reader_fn, file_path
+            );
+            self.conn
+                .execute_batch(&sql)
+                .map_err(|e| EngineError::ExecFailed(format!("register_file_table: {e}")))?;
+            Ok(())
+        }
+
+        #[cfg(not(feature = "duckdb-bundled"))]
+        {
+            let _ = (table_name, file_path, format);
+            Err(EngineError::NotCompiled)
+        }
+    }
+
     /// Initialize GPU buffer manager. Must be called before `execute_gpu`.
     pub fn init_gpu_buffers(&self, cache_size: &str, processing_size: &str) -> Result<(), EngineError> {
         #[cfg(feature = "duckdb-bundled")]
