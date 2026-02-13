@@ -18,6 +18,7 @@
 #include "operator/aggregate/aggregate_test_utils.hpp"
 #include "operator_test_utils.hpp"
 #include "operator_type_traits.hpp"
+#include "utils/data_utils.hpp"
 
 #include <catch.hpp>
 #include <duckdb.hpp>
@@ -72,7 +73,7 @@ TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with single 
     }
   } else if constexpr (Traits::is_ts) {
     for (int i = 0; i < num_values; ++i) {
-      values[i] = static_cast<typename Traits::type>(i * 1'000'000);
+      values[i] = static_cast<typename Traits::type>(i * 100'000);
     }
   } else if constexpr (std::is_same_v<typename Traits::type, int32_t> ||
                        std::is_same_v<typename Traits::type, int64_t> ||
@@ -88,24 +89,23 @@ TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with single 
       values[i] = (i % 2 == 0);
     }
   }
-  std::shared_ptr<data_batch> input_batch0;  // batch for the aggregation key
-  if constexpr (Traits::is_string) {
-    input_batch0 = make_string_batch(*space, values);
-  } else if constexpr (Traits::is_decimal) {
-    input_batch0 = make_decimal64_batch(*space, values, Traits::scale);
-  } else if constexpr (Traits::is_ts) {
-    input_batch0 = make_timestamp_batch(*space, values, Traits::cudf_type);
-  } else {
-    input_batch0 = make_numeric_batch<typename Traits::type>(*space, values, Traits::cudf_type);
-  }
+  auto stream = default_stream();
+  auto mr     = get_resource_ref(*space);
 
-  // create a batch for the aggregation value to just be a int32_t
-  std::shared_ptr<data_batch> input_batch1;
-  input_batch1 =
-    make_numeric_batch<int32_t>(*space, std::vector<int32_t>(num_values, 1), cudf::type_id::INT32);
+  // Column 0: aggregation key
+  auto col0 = sirius::test::vector_to_cudf_column<Traits>(values, stream, mr);
+  // Column 1: aggregation value (all ones)
+  auto col1 = sirius::test::vector_to_cudf_column<gpu_type_traits<int32_t>>(
+    std::vector<int32_t>(num_values, 1), stream, mr);
 
-  // Concatenate the two batches horizontally (side by side columns)
-  auto input_batch = concatenate_batches_horizontal({input_batch0, input_batch1}, *space);
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(std::move(col0));
+  columns.push_back(std::move(col1));
+  auto table = std::make_unique<cudf::table>(std::move(columns));
+
+  auto gpu_repr = std::make_unique<gpu_table_representation>(std::move(table), *space);
+  auto input_batch =
+    std::make_shared<data_batch>(::sirius::get_next_batch_id(), std::move(gpu_repr));
 
   // this cardinality is not real, we are setting here this large in order to force more partitions
   // to be made
@@ -209,26 +209,25 @@ TEMPLATE_TEST_CASE("sirius_physical_partition partitions data_batch with two par
       }
     }
   }
-  std::shared_ptr<data_batch> input_batch0;  // batch for the aggregation key0 and 1
-  if constexpr (Traits::is_string) {
-    input_batch0 = make_string_batch(*space, values0);
-  } else if constexpr (Traits::is_decimal) {
-    input_batch0 = make_decimal64_batch(*space, values0, Traits::scale);
-  } else if constexpr (Traits::is_ts) {
-    input_batch0 = make_timestamp_batch(*space, values0, Traits::cudf_type);
-  } else {
-    input_batch0 = make_numeric_batch<typename Traits::type>(*space, values0, Traits::cudf_type);
-  }
+  auto stream = default_stream();
+  auto mr     = get_resource_ref(*space);
 
-  std::shared_ptr<data_batch> input_batch1 =
-    make_numeric_batch<int32_t>(*space, values1, cudf::type_id::INT32);
+  // Column 0: aggregation key0
+  auto col0 = sirius::test::vector_to_cudf_column<Traits>(values0, stream, mr);
+  // Column 1: aggregation key1
+  auto col1 = sirius::test::vector_to_cudf_column<gpu_type_traits<int32_t>>(values1, stream, mr);
+  // Column 2: aggregation value (same as column 1; values won't matter)
+  auto col2 = sirius::test::vector_to_cudf_column<gpu_type_traits<int32_t>>(values1, stream, mr);
 
-  // we can make the third column which is for aggregation the same as the second column because the
-  // values won't matter
-  std::shared_ptr<data_batch> input_batch2 =
-    make_numeric_batch<int32_t>(*space, values1, cudf::type_id::INT32);
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(std::move(col0));
+  columns.push_back(std::move(col1));
+  columns.push_back(std::move(col2));
+  auto table = std::make_unique<cudf::table>(std::move(columns));
+
+  auto gpu_repr = std::make_unique<gpu_table_representation>(std::move(table), *space);
   auto input_batch =
-    concatenate_batches_horizontal({input_batch0, input_batch1, input_batch2}, *space);
+    std::make_shared<data_batch>(::sirius::get_next_batch_id(), std::move(gpu_repr));
 
   // this cardinality is not real, we are setting here this large in order to force more partitions
   // to be made
@@ -293,15 +292,24 @@ TEST_CASE(
 
   std::vector<int32_t> values(num_values);
   std::iota(values.begin(), values.end(), 0);
-  std::shared_ptr<data_batch> input_batch0 =
-    make_numeric_batch<int32_t>(*space, values, cudf::type_id::INT32);
 
-  // create a batch for the aggregation value to just be a int32_t
-  std::shared_ptr<data_batch> input_batch1 =
-    make_numeric_batch<int32_t>(*space, std::vector<int32_t>(num_values, 1), cudf::type_id::INT32);
+  auto stream = default_stream();
+  auto mr     = get_resource_ref(*space);
 
-  // Concatenate the two batches horizontally (side by side columns)
-  auto input_batch = concatenate_batches_horizontal({input_batch0, input_batch1}, *space);
+  // Column 0: partition key
+  auto col0 = sirius::test::vector_to_cudf_column<gpu_type_traits<int32_t>>(values, stream, mr);
+  // Column 1: aggregation value (all ones)
+  auto col1 = sirius::test::vector_to_cudf_column<gpu_type_traits<int32_t>>(
+    std::vector<int32_t>(num_values, 1), stream, mr);
+
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  columns.push_back(std::move(col0));
+  columns.push_back(std::move(col1));
+  auto table = std::make_unique<cudf::table>(std::move(columns));
+
+  auto gpu_repr = std::make_unique<gpu_table_representation>(std::move(table), *space);
+  auto input_batch =
+    std::make_shared<data_batch>(::sirius::get_next_batch_id(), std::move(gpu_repr));
 
   std::size_t estimated_cardinality = num_values;
 
