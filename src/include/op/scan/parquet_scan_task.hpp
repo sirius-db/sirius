@@ -325,6 +325,8 @@ class parquet_scan_task : public pipeline::sirius_pipeline_itask {
   {
   }
 
+  ~parquet_scan_task() override;
+
   //===----------Methods----------===//
   /**
    * @brief Compute the parquet scan task and produce a host_parquet_representation.

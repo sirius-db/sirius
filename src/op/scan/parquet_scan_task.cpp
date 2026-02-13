@@ -16,6 +16,7 @@
 
 // sirius
 #include "op/sirius_physical_parquet_scan.hpp"
+#include "pipeline/sirius_pipeline.hpp"
 
 #include <data/data_batch_utils.hpp>
 #include <data/host_parquet_representation.hpp>
@@ -294,6 +295,14 @@ parquet_scan_task_local_state::make_allocation()
       "for HOST memory space");
   }
   return allocator->allocate_multiple_blocks(_reserved_compressed_bytes, _reservation.get());
+}
+
+parquet_scan_task::~parquet_scan_task()
+{
+  if (_global_state != nullptr) {
+    auto& g_state = this->_global_state->cast<parquet_scan_task_global_state>();
+    g_state.get_operator().get_pipeline()->mark_task_completed();
+  }
 }
 
 //===----------------------------------------------------------------------===//

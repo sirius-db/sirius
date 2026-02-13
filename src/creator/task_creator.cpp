@@ -235,6 +235,7 @@ void task_creator::manager_loop()
 
           auto const partition_idx = parquet_task_global_state->get_next_rg_partition_idx();
           if (!partition_idx.has_value()) { return; }
+          pipeline->mark_task_created();
 
           auto parquet_task_local_state = std::make_unique<op::scan::parquet_scan_task_local_state>(
             *parquet_task_global_state, *partition_idx);
