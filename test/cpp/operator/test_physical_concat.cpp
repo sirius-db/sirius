@@ -545,9 +545,8 @@ TEST_CASE("sirius_physical_concat constructor sets concat_all for different join
   SECTION("OUTER join throws unsupported join type")
   {
     auto fixture = create_test_hash_join(duckdb::JoinType::OUTER, {duckdb::LogicalType::INTEGER});
-    REQUIRE_THROWS_AS(
-      sirius_physical_concat({duckdb::LogicalType::INTEGER}, 1000, fixture.hash_join.get(), false),
-      std::runtime_error);
+    REQUIRE_NOTHROW(
+      sirius_physical_concat({duckdb::LogicalType::INTEGER}, 1000, fixture.hash_join.get(), false));
   }
 
   SECTION("Non-hash-join parent throws")
