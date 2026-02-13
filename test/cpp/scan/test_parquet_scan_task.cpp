@@ -250,8 +250,8 @@ static void run_parquet_scan_test(std::string const& table_name,
     while (true) {
       auto const partition_idx = global_state->get_next_rg_partition_idx();
       if (!partition_idx.has_value()) { break; }
-      auto local_state = std::make_unique<op::scan::parquet_scan_task_local_state>(
-        *global_state, *partition_idx);
+      auto local_state =
+        std::make_unique<op::scan::parquet_scan_task_local_state>(*global_state, *partition_idx);
       auto reservation = mem_mgr.request_reservation(
         cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::HOST},
         local_state->get_reserved_compressed_bytes());

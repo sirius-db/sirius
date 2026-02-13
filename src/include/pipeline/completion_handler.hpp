@@ -60,7 +60,7 @@ class completion_handler {
     }
   }
 
-    /**
+  /**
    * @brief Report an error that occurred during query execution.
    *
    * Sets the exception on the promise. Only the first call has effect;

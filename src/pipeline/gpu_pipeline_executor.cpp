@@ -97,10 +97,11 @@ void gpu_pipeline_executor::manager_loop()
       SIRIUS_LOG_INFO("GPU Pipeline Executor: task queue interrupted, stopping manager loop");
       break;
     }
-    auto* gpu_task   = cast_to_gpu_pipeline_task(pipeline_task.get());
+    auto* gpu_task = cast_to_gpu_pipeline_task(pipeline_task.get());
     if (!gpu_task) {
       SIRIUS_LOG_ERROR("GPU Pipeline Executor: Failed to cast pipeline task to gpu_pipeline_task");
-      _completion_handler->report_error("GPU Pipeline Executor: Failed to cast pipeline task to gpu_pipeline_task");
+      _completion_handler->report_error(
+        "GPU Pipeline Executor: Failed to cast pipeline task to gpu_pipeline_task");
       break;
     }
     auto bytes_needs = gpu_task->get_estimated_reservation_size();
@@ -108,7 +109,9 @@ void gpu_pipeline_executor::manager_loop()
     if (!reservation) {
       SIRIUS_LOG_ERROR("GPU Pipeline Executor: Failed to acquire memory reservation for task {}",
                        gpu_task->get_task_id());
-      _completion_handler->report_error("GPU Pipeline Executor: Failed to acquire memory reservation for task " + std::to_string(gpu_task->get_task_id()));
+      _completion_handler->report_error(
+        "GPU Pipeline Executor: Failed to acquire memory reservation for task " +
+        std::to_string(gpu_task->get_task_id()));
       break;
     }
     if (auto* local_state = dynamic_cast<sirius::pipeline::sirius_pipeline_itask_local_state*>(
@@ -117,7 +120,9 @@ void gpu_pipeline_executor::manager_loop()
     } else {
       SIRIUS_LOG_ERROR("GPU Pipeline Executor: Failed to cast local state for task {}",
                        gpu_task->get_task_id());
-      _completion_handler->report_error("GPU Pipeline Executor: Failed to cast local state for task " + std::to_string(gpu_task->get_task_id()));
+      _completion_handler->report_error(
+        "GPU Pipeline Executor: Failed to cast local state for task " +
+        std::to_string(gpu_task->get_task_id()));
       break;
     }
     auto output_consumers = gpu_task->get_output_consumers();
