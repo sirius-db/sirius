@@ -94,7 +94,7 @@ class GPUPhysicalPlanGenerator {
   // unique_ptr<GPUPhysicalOperator> CreatePlan(LogicalInsert &op);
   // unique_ptr<GPUPhysicalOperator> CreatePlan(LogicalCopyToFile &op);
   // unique_ptr<GPUPhysicalOperator> CreatePlan(LogicalExplain &op);
-  unique_ptr<GPUPhysicalOperator> CreatePlan(LogicalSetOperation &op);
+  unique_ptr<GPUPhysicalOperator> CreatePlan(LogicalSetOperation& op);
   // unique_ptr<GPUPhysicalOperator> CreatePlan(LogicalUpdate &op);
   // unique_ptr<GPUPhysicalOperator> CreatePlan(LogicalPrepare &expr);
   // unique_ptr<GPUPhysicalOperator> CreatePlan(LogicalWindow &expr);

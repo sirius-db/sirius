@@ -20,6 +20,8 @@
 #include "log/logging.hpp"
 #include "operator/gpu_materialize.hpp"
 
+#include <cuda_runtime.h>
+
 namespace duckdb {
 using sirius::AggregationType;
 
@@ -208,28 +210,60 @@ SinkResultType GPUPhysicalUngroupedAggregate::Sink(GPUIntermediateRelation& inpu
   } else {
     HandleAggregateExpressionCuDF(aggregate_column, gpuBufferManager, aggregates);
   }
-
   for (int aggr_idx = 0; aggr_idx < aggregates.size(); aggr_idx++) {
-    // TODO: has to fix this for columns with partially NULL values
     if (aggregation_result->columns[aggr_idx] == nullptr) {
-      SIRIUS_LOG_DEBUG(
-        "Passing aggregate column {} to aggregation result column {}", aggr_idx, aggr_idx);
       aggregation_result->columns[aggr_idx]               = aggregate_column[aggr_idx];
       aggregation_result->columns[aggr_idx]->row_ids      = nullptr;
       aggregation_result->columns[aggr_idx]->row_id_count = 0;
     } else if (aggregation_result->columns[aggr_idx] != nullptr) {
       if (aggregate_column[aggr_idx]->data_wrapper.data != nullptr &&
           aggregation_result->columns[aggr_idx]->data_wrapper.data != nullptr) {
-        throw NotImplementedException("Combine not implemented yet for ungrouped aggregate");
+        auto& existing  = aggregation_result->columns[aggr_idx];
+        auto& incoming  = aggregate_column[aggr_idx];
+        auto& aggregate = aggregates[aggr_idx]->Cast<BoundAggregateExpression>();
+        AggregationType combine_mode;
+        if (aggregate.function.name == "sum" || aggregate.function.name == "sum_no_overflow") {
+          combine_mode = AggregationType::SUM;
+        } else if (aggregate.function.name == "count" || aggregate.function.name == "count_star") {
+          combine_mode = AggregationType::SUM;
+        } else if (aggregate.function.name == "min") {
+          combine_mode = AggregationType::MIN;
+        } else if (aggregate.function.name == "max") {
+          combine_mode = AggregationType::MAX;
+        } else {
+          throw NotImplementedException("Combine not supported for: " + aggregate.function.name);
+        }
+        size_t elem_size = 0;
+        switch (existing->data_wrapper.type.id()) {
+          case GPUColumnTypeId::INT16: elem_size = 2; break;
+          case GPUColumnTypeId::INT32: elem_size = 4; break;
+          case GPUColumnTypeId::INT64: elem_size = 8; break;
+          case GPUColumnTypeId::INT128: elem_size = 16; break;
+          case GPUColumnTypeId::FLOAT32: elem_size = 4; break;
+          case GPUColumnTypeId::FLOAT64: elem_size = 8; break;
+          default: throw NotImplementedException("Unsupported type for combine");
+        }
+        uint8_t* combined_data = reinterpret_cast<uint8_t*>(
+          gpuBufferManager->customCudaMalloc<uint8_t>(2 * elem_size, 0, 0));
+        cudaMemcpy(combined_data, existing->data_wrapper.data, elem_size, cudaMemcpyDeviceToDevice);
+        cudaMemcpy(combined_data + elem_size,
+                   incoming->data_wrapper.data,
+                   elem_size,
+                   cudaMemcpyDeviceToDevice);
+        auto combined_col =
+          make_shared_ptr<GPUColumn>(2, existing->data_wrapper.type, combined_data, nullptr);
+        vector<shared_ptr<GPUColumn>> combine_cols = {combined_col};
+        AggregationType* combine_agg = gpuBufferManager->customCudaHostAlloc<AggregationType>(1);
+        combine_agg[0]               = combine_mode;
+        cudf_aggregate(combine_cols, 1, combine_agg);
+        aggregation_result->columns[aggr_idx]               = combine_cols[0];
+        aggregation_result->columns[aggr_idx]->row_ids      = nullptr;
+        aggregation_result->columns[aggr_idx]->row_id_count = 0;
       } else if (aggregate_column[aggr_idx]->data_wrapper.data != nullptr &&
                  aggregation_result->columns[aggr_idx]->data_wrapper.data == nullptr) {
-        SIRIUS_LOG_DEBUG(
-          "Passing aggregate column {} to aggregation result column {}", aggr_idx, aggr_idx);
         aggregation_result->columns[aggr_idx]               = aggregate_column[aggr_idx];
         aggregation_result->columns[aggr_idx]->row_ids      = nullptr;
         aggregation_result->columns[aggr_idx]->row_id_count = 0;
-      } else {
-        SIRIUS_LOG_DEBUG("Aggregate column {} is null, skipping", aggr_idx);
       }
     }
   }
