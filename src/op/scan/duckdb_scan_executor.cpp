@@ -137,8 +137,8 @@ void duckdb_scan_executor::submit_scan_request()
     _task_request_publisher.send(std::make_unique<sirius::pipeline::task_request>(0, true));
 }
 
-std::unique_ptr<op::operator_data> duckdb_scan_executor::get_scan_output(pipeline::sirius_pipeline_itask* task,
-                                                        rmm::cuda_stream_view stream)
+std::unique_ptr<op::operator_data> duckdb_scan_executor::get_scan_output(
+  pipeline::sirius_pipeline_itask* task, rmm::cuda_stream_view stream)
 {
   if (!_caching_enabled) {
     return task->compute_task(stream);
@@ -150,6 +150,7 @@ std::unique_ptr<op::operator_data> duckdb_scan_executor::get_scan_output(pipelin
     auto& entry = _cache.at(pipe_id);
     if (!entry) { throw std::runtime_error("Scan results for query not cached"); }
     if (_preload_mode) {
+      std::cerr << "Preload mode is true" << std::endl;
       if (entry->batch_index >= entry->batches.size()) {
         throw std::runtime_error("Scan results for query not cached");
       }
@@ -161,6 +162,7 @@ std::unique_ptr<op::operator_data> duckdb_scan_executor::get_scan_output(pipelin
       }
       return std::make_unique<op::operator_data>(std::move(cloned_batches));
     } else {
+      std::cerr << "Preload mode is false" << std::endl;
       auto scan_output = task->compute_task(stream);
       std::vector<std::shared_ptr<cucascade::data_batch>> cloned_batches;
       cloned_batches.reserve(scan_output->get_data_batches().size());
@@ -228,7 +230,7 @@ void duckdb_scan_executor::manager_loop()
       try {
         auto consumers   = scan_task->get_output_consumers();
         auto output_data = get_scan_output(scan_task, stream);
-        scan_task->publish_output(output_data, stream);
+        scan_task->publish_output(*output_data, stream);
 
         t.reset();
         if (_task_creator && !(_completion_handler && _completion_handler->is_completed())) {

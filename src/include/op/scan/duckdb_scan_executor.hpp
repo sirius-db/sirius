@@ -179,7 +179,7 @@ class duckdb_scan_executor {
    */
   void submit_scan_request();
 
-  std::unique_ptr<op::operator_data> get_scan_output(op::scan::duckdb_scan_task* task,
+  std::unique_ptr<op::operator_data> get_scan_output(pipeline::sirius_pipeline_itask* task,
                                                      rmm::cuda_stream_view stream);
 
   struct cache_entry {
