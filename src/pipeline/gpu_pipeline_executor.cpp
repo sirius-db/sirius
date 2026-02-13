@@ -98,6 +98,11 @@ void gpu_pipeline_executor::manager_loop()
       break;
     }
     auto* gpu_task   = cast_to_gpu_pipeline_task(pipeline_task.get());
+    if (!gpu_task) {
+      SIRIUS_LOG_ERROR("GPU Pipeline Executor: Failed to cast pipeline task to gpu_pipeline_task");
+      _completion_handler->report_error("GPU Pipeline Executor: Failed to cast pipeline task to gpu_pipeline_task");
+      break;
+    }
     auto bytes_needs = gpu_task->get_estimated_reservation_size();
     auto reservation = _memory_space->make_reservation(bytes_needs);
     if (!reservation) {

@@ -29,6 +29,8 @@
 
 #include <cucascade/memory/common.hpp>
 
+#include <iostream>
+
 namespace sirius::op::scan {
 
 duckdb_scan_executor::duckdb_scan_executor(
@@ -157,12 +159,12 @@ std::unique_ptr<op::operator_data> duckdb_scan_executor::get_scan_output(pipelin
       for (auto& b : batches) {
         cloned_batches.push_back(b->clone(::sirius::get_next_batch_id(), stream));
       }
-      return op::operator_data(std::move(cloned_batches));
+      return std::make_unique<op::operator_data>(std::move(cloned_batches));
     } else {
       auto scan_output = task->compute_task(stream);
       std::vector<std::shared_ptr<cucascade::data_batch>> cloned_batches;
-      cloned_batches.reserve(scan_output.get_data_batches().size());
-      for (auto& b : scan_output.get_data_batches()) {
+      cloned_batches.reserve(scan_output->get_data_batches().size());
+      for (auto& b : scan_output->get_data_batches()) {
         cloned_batches.push_back(b->clone(::sirius::get_next_batch_id(), stream));
       }
       entry->batches.push_back(std::move(cloned_batches));
@@ -224,10 +226,12 @@ void duckdb_scan_executor::manager_loop()
       try {
         auto consumers   = scan_task->get_output_consumers();
         auto output_data = get_scan_output(scan_task, stream);
-        if (output_data) { scan_task->publish_output(*output_data, stream); }
+        scan_task->publish_output(output_data, stream);
+
         t.reset();
         if (_task_creator && !(_completion_handler && _completion_handler->is_completed())) {
           for (auto* consumer : consumers) {
+
             _task_creator->schedule(consumer);
           }
         }

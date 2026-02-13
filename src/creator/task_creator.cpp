@@ -76,25 +76,28 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
   const auto& pipelines = query.get_pipelines();
   for (const auto& pipeline : pipelines) {
     // Get the sink operator of the pipeline
-    auto sink_operator = pipeline->get_sink();
-    if (sink_operator == nullptr) { continue; }
+    auto source_operator = pipeline->get_source();
+    if (source_operator == nullptr) { continue; }
 
-    size_t operator_id = sink_operator->get_operator_id();
+    size_t operator_id = source_operator->get_operator_id();
 
-    if (sink_operator->type == ::sirius::op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
+    if (source_operator->type == ::sirius::op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
+
       _scan_operator_global_state_map.emplace(
         operator_id,
         std::make_shared<op::scan::duckdb_scan_task_global_state>(
           pipeline,
           *_pipeline_executor,
           *_client_context,
-          &sink_operator->Cast<op::sirius_physical_duckdb_scan>()));
-    } else if (sink_operator->type == ::sirius::op::SiriusPhysicalOperatorType::PARQUET_SCAN) {
+          &source_operator->Cast<op::sirius_physical_duckdb_scan>()));
+    } else if (source_operator->type == ::sirius::op::SiriusPhysicalOperatorType::PARQUET_SCAN) {
+
       _parquet_scan_operator_global_state_map.emplace(
         operator_id,
         std::make_shared<op::scan::parquet_scan_task_global_state>(
-          &sink_operator->Cast<op::sirius_physical_parquet_scan>()));
+          &source_operator->Cast<op::sirius_physical_parquet_scan>()));
     } else {
+
       _gpu_operator_global_state_map.emplace(
         operator_id, std::make_shared<pipeline::gpu_pipeline_task_global_state>(pipeline));
     }
@@ -188,17 +191,18 @@ void task_creator::manager_loop()
       break;
     }
 
+    auto node = request->node;
+    if (node == nullptr) { continue; }
+
+    node = get_operator_for_next_task(node);
+
+    if (node == nullptr) { continue; }
+
     // Schedule the task creation work on the thread pool
     _thread_pool->schedule([this,
-                            request = std::move(request),
+                            node,
                             ticket  = std::move(ticket)]() mutable {
       try {
-        auto node = request->node;
-        if (node == nullptr) { return; }
-
-        node = get_operator_for_next_task(node);
-        if (node == nullptr) { return; }
-
         // Get what we need to create the task
         auto pipeline = node->get_pipeline();
         std::vector<cucascade::shared_data_repository*> destination_data_repositories;
@@ -234,7 +238,10 @@ void task_creator::manager_loop()
           auto parquet_task_global_state = _parquet_scan_operator_global_state_map.at(operator_id);
 
           auto const partition_idx = parquet_task_global_state->get_next_rg_partition_idx();
-          if (!partition_idx.has_value()) { return; }
+          if (!partition_idx.has_value()) {
+
+            return;
+          }
           pipeline->mark_task_created();
 
           auto parquet_task_local_state = std::make_unique<op::scan::parquet_scan_task_local_state>(
@@ -249,7 +256,6 @@ void task_creator::manager_loop()
                                                           destination_data_repositories[0],
                                                           std::move(parquet_task_local_state),
                                                           parquet_task_global_state);
-          pipeline->mark_task_created();
           _pipeline_executor->schedule(std::move(parquet_task));
           // scheduling pipeline task
         } else {
@@ -261,7 +267,8 @@ void task_creator::manager_loop()
                                             // task creation
 
             // Check to see if you need to create a new global state for this operator
-            size_t operator_id                  = node->get_operator_id();
+            size_t operator_id                  = node->get_operator_id(); 
+            std::cout << "Operator ID: " << operator_id << " " << node->get_name() << std::endl;
             auto gpu_pipeline_task_global_state = _gpu_operator_global_state_map.at(operator_id);
 
             auto local_state =

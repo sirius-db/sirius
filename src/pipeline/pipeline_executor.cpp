@@ -23,6 +23,7 @@
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/scan/duckdb_scan_executor.hpp"
 #include "op/scan/duckdb_scan_task.hpp"
+#include "op/scan/parquet_scan_task.hpp"
 #include "pipeline/gpu_pipeline_executor.hpp"
 #include "pipeline/pipeline_queue.hpp"
 
@@ -72,7 +73,10 @@ void pipeline_executor::schedule(std::unique_ptr<sirius::parallel::itask> task)
 {
   if (task->is<sirius::op::scan::duckdb_scan_task>()) {
     _scan_executor->schedule(std::move(task));
+  } else if (task->is<sirius::op::scan::parquet_scan_task>()) {
+    _scan_executor->schedule(std::move(task));
   } else {
+    SIRIUS_LOG_ERROR("Unknown task type");
     _task_queue.push(std::move(task));
   }
 }
