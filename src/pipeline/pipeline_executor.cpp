@@ -144,12 +144,7 @@ void pipeline_executor::prepare_for_query(duckdb::shared_ptr<planner::query> que
     _priority_scans.pop();
   }
   for (auto* scan : scans) {
-    if (auto* tscan = dynamic_cast<op::sirius_physical_duckdb_scan*>(scan)) {
-      _priority_scans.push(tscan);
-    } else {
-      SIRIUS_LOG_ERROR("Failed to cast scan to sirius_physical_duckdb_scan");
-      continue;
-    }
+    _priority_scans.push(scan);
   }
 }
 
@@ -196,10 +191,10 @@ void pipeline_executor::schedule_next_scan_tasks()
   std::lock_guard<std::mutex> lock(_priority_scans_mutex);
   if (!_priority_scans.empty()) {
     auto* scan_op = _priority_scans.front();
-    _priority_scans.pop();
     for (auto i = 0; i != _scan_executor->get_num_threads(); ++i) {
       _task_creator->schedule(scan_op);
     }
+    _priority_scans.pop();
   }
 }
 

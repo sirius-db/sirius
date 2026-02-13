@@ -19,6 +19,7 @@
 #include "creator/task_creator.hpp"
 #include "log/logging.hpp"
 #include "op/scan/duckdb_scan_task.hpp"
+#include "op/scan/parquet_scan_task.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/completion_handler.hpp"
 #include "pipeline/sirius_pipeline_itask_local_state.hpp"
@@ -133,27 +134,27 @@ void duckdb_scan_executor::submit_scan_request()
     _task_request_publisher.send(std::make_unique<sirius::pipeline::task_request>(0, true));
 }
 
-std::unique_ptr<op::operator_data> duckdb_scan_executor::get_scan_output(
-  op::scan::duckdb_scan_task* task, rmm::cuda_stream_view stream)
+std::unique_ptr<op::operator_data> duckdb_scan_executor::get_scan_output(pipeline::sirius_pipeline_itask* task,
+                                                        rmm::cuda_stream_view stream)
 {
+  return task->compute_task(stream);
   if (!_caching_enabled) {
-    return task->compute_task(stream);
   } else {
-    auto pipe_id = task->get_pipeline_id();
-    std::lock_guard<std::mutex> lock(_cache_mutex);
-    // todo (amin) : we need to clone the batches to avoid modifying the original batches
-    auto& entry = _cache.at(pipe_id);
-    if (!entry) { throw std::runtime_error("Scan results for query not cached"); }
-    if (_preload_mode) {
-      if (entry->batch_index >= entry->batches.size()) {
-        throw std::runtime_error("Scan results for query not cached");
-      }
-      return std::make_unique<op::operator_data>(entry->batches[entry->batch_index++]);
-    } else {
-      auto scan_output = task->compute_task(stream);
-      entry->batches.push_back(scan_output->get_data_batches());
-      return scan_output;
-    }
+    // auto pipe_id = task->get_pipeline_id();
+    // std::lock_guard<std::mutex> lock(_cache_mutex);
+    // // todo (amin) : we need to clone the batches to avoid modifying the original batches
+    // auto& entry = _cache.at(pipe_id);
+    // if (!entry) { throw std::runtime_error("Scan results for query not cached"); }
+    // if (_preload_mode) {
+    //   if (entry->batch_index >= entry->batches.size()) {
+    //     throw std::runtime_error("Scan results for query not cached");
+    //   }
+    //   return op::operator_data(entry->batches[entry->batch_index++]);
+    // } else {
+    //   auto scan_output = task->compute_task(stream);
+    //   entry->batches.push_back(scan_output.get_data_batches());
+    //   return scan_output;
+    // }
   }
 }
 
@@ -181,9 +182,8 @@ void duckdb_scan_executor::manager_loop()
     }
 
     // Make host memory reservation and set it on the local state
-    auto* scan_task = dynamic_cast<sirius::op::scan::duckdb_scan_task*>(task.get());
-    // todo (amin): fix this later, and make the reservation in the executor.
-    if (scan_task and false) {
+    auto* scan_task = dynamic_cast<pipeline::sirius_pipeline_itask*>(task.get());
+    if (scan_task) {
       auto bytes_needed = scan_task->get_estimated_reservation_size();
       auto reservation  = _mem_mgr->request_reservation(
         cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::HOST}, bytes_needed);
@@ -217,7 +217,6 @@ void duckdb_scan_executor::manager_loop()
           }
         }
       } catch (...) {
-        /// this is fatal error
         if (_completion_handler) { _completion_handler->report_error(std::current_exception()); }
       }
     });

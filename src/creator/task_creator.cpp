@@ -209,7 +209,7 @@ void task_creator::manager_loop()
 
         // scheduling scan task
         if (node->type == ::sirius::op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
-          // Check to see if you need to create a new global state for this scan operator
+          // Check to see if you need to create a new global s for this scan operator
           size_t operator_id          = node->get_operator_id();
           auto scan_task_global_state = _scan_operator_global_state_map.at(operator_id);
 
