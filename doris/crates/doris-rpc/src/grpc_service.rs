@@ -250,10 +250,14 @@ fn extract_file_tables(params: &TPipelineFragmentParams) -> Vec<FileTable> {
         let node_id = node.node_id;
 
         // Table name from TFileScanNode.table_name or fallback.
+        // Append node_id to make each scan's table unique (needed for self-joins where
+        // multiple scans reference the same file — DuckDB can't handle duplicate column
+        // names in Substrait JoinRel output from same-named tables).
         let table_name = node
             .file_scan_node
             .as_ref()
             .and_then(|fsn| fsn.table_name.clone())
+            .map(|name| format!("{}_{}", name, node_id))
             .unwrap_or_else(|| format!("scan_{}", node_id));
 
         // Format from file_scan_params[node_id].format_type.
@@ -272,19 +276,29 @@ fn extract_file_tables(params: &TPipelineFragmentParams) -> Vec<FileTable> {
             .unwrap_or("parquet")
             .to_string();
 
-        // File path from local_params[0].per_node_scan_ranges[node_id][0].scan_range
+        // File path from local_params[*].per_node_scan_ranges[node_id][0].scan_range
         //   .ext_scan_range.file_scan_range.ranges[0].path
+        // Search ALL local_params entries (after merge, leaf's entries are appended).
         let file_path = params
             .local_params
             .as_ref()
-            .and_then(|lp| lp.first())
-            .and_then(|inst| inst.per_node_scan_ranges.get(&node_id))
-            .and_then(|ranges| ranges.first())
-            .and_then(|srp| srp.scan_range.ext_scan_range.as_ref())
-            .and_then(|ext| ext.file_scan_range.as_ref())
-            .and_then(|fsr| fsr.ranges.as_ref())
-            .and_then(|ranges| ranges.first())
-            .and_then(|rd| rd.path.clone());
+            .and_then(|lps| {
+                lps.iter().find_map(|inst| {
+                    inst.per_node_scan_ranges
+                        .get(&node_id)?
+                        .first()?
+                        .scan_range
+                        .ext_scan_range
+                        .as_ref()?
+                        .file_scan_range
+                        .as_ref()?
+                        .ranges
+                        .as_ref()?
+                        .first()?
+                        .path
+                        .clone()
+                })
+            });
 
         if let Some(path) = file_path {
             tables.push(FileTable {
@@ -292,10 +306,122 @@ fn extract_file_tables(params: &TPipelineFragmentParams) -> Vec<FileTable> {
                 file_path: path,
                 format,
             });
+        } else {
+            tracing::debug!(
+                node_id,
+                has_local_params = params.local_params.is_some(),
+                local_params_len = params.local_params.as_ref().map(|l| l.len()),
+                per_node_keys = ?params.local_params.as_ref().and_then(|lp| lp.first()).map(|inst| inst.per_node_scan_ranges.keys().collect::<Vec<_>>()),
+                "FILE_SCAN_NODE found but no file path extracted"
+            );
         }
     }
 
     tables
+}
+
+/// Merge multi-fragment plans for single-BE execution.
+///
+/// In a multi-fragment plan (e.g. ORDER BY + LIMIT), the FE sends:
+///   - Fragment A: EXCHANGE_NODE(0 children)  — result collector
+///   - Fragment B: SORT_NODE → EXCHANGE_NODE(0 children)  — intermediate processing
+///   - Fragment C: FILE_SCAN_NODE  — leaf scan
+///
+/// For single-BE execution, we merge by:
+///   1. Skipping result-collector fragments (EXCHANGE at root, 0 children)
+///   2. Finding leaf fragments (scans) and intermediate fragments (with EXCHANGE children)
+///   3. Replacing EXCHANGE_NODE(0 children) in intermediate plans with the leaf plan
+///
+/// This produces a single merged fragment that can be translated and executed atomically.
+fn merge_fragment_plans(
+    all_params: &[TPipelineFragmentParams],
+) -> Vec<TPipelineFragmentParams> {
+    // Classify fragments.
+    let mut leaf_fragments: Vec<&TPipelineFragmentParams> = Vec::new();
+    let mut intermediate_fragments: Vec<TPipelineFragmentParams> = Vec::new();
+
+    for params in all_params {
+        let plan = match params.fragment.as_ref().and_then(|f| f.plan.as_ref()) {
+            Some(p) => p,
+            None => continue,
+        };
+        let root = match plan.nodes.first() {
+            Some(r) => r,
+            None => continue,
+        };
+
+        // Skip result-collector fragments (EXCHANGE at root, 0 children).
+        if root.node_type == TPlanNodeType::EXCHANGE_NODE && root.num_children == 0 {
+            continue;
+        }
+
+        // Check if this fragment has any EXCHANGE_NODE(0 children) as a non-root node.
+        let has_exchange_child = plan.nodes.iter().skip(1).any(|n| {
+            n.node_type == TPlanNodeType::EXCHANGE_NODE && n.num_children == 0
+        });
+
+        if has_exchange_child {
+            intermediate_fragments.push(params.clone());
+        } else {
+            leaf_fragments.push(params);
+        }
+    }
+
+    // If no intermediate fragments, just return the leaf fragments.
+    if intermediate_fragments.is_empty() {
+        return leaf_fragments.into_iter().cloned().collect();
+    }
+
+    // Merge: for each intermediate fragment, replace EXCHANGE_NODE(0 children) with leaf plan.
+    // For simplicity, use the first leaf fragment's plan for all exchanges.
+    let leaf_nodes: Vec<_> = leaf_fragments
+        .first()
+        .and_then(|p| p.fragment.as_ref())
+        .and_then(|f| f.plan.as_ref())
+        .map(|p| p.nodes.clone())
+        .unwrap_or_default();
+
+    for params in &mut intermediate_fragments {
+        if let Some(plan) = params
+            .fragment
+            .as_mut()
+            .and_then(|f| f.plan.as_mut())
+        {
+            let mut merged_nodes = Vec::new();
+            for node in &plan.nodes {
+                if node.node_type == TPlanNodeType::EXCHANGE_NODE && node.num_children == 0 {
+                    // Replace exchange with the leaf plan nodes.
+                    merged_nodes.extend_from_slice(&leaf_nodes);
+                } else {
+                    merged_nodes.push(node.clone());
+                }
+            }
+            plan.nodes = merged_nodes;
+        }
+
+        // Merge file_scan_params and local_params from leaf fragments.
+        if let Some(leaf) = leaf_fragments.first() {
+            if let Some(leaf_scan_params) = &leaf.file_scan_params {
+                let merged_scan_params = params
+                    .file_scan_params
+                    .get_or_insert_with(Default::default);
+                for (k, v) in leaf_scan_params {
+                    merged_scan_params.entry(*k).or_insert_with(|| v.clone());
+                }
+            }
+            // Merge local_params (contains per_node_scan_ranges needed for file path extraction).
+            if params.local_params.is_none() {
+                params.local_params = leaf.local_params.clone();
+            } else if let Some(leaf_local) = &leaf.local_params {
+                let merged_local = params.local_params.get_or_insert_with(Vec::new);
+                for lp in leaf_local {
+                    merged_local.push(lp.clone());
+                }
+            }
+        }
+    }
+
+    intermediate_fragments
 }
 
 pub struct PBackendServiceHandler {
@@ -361,50 +487,54 @@ impl PBackendService for PBackendServiceHandler {
 
         info!(num_fragments = all_params.len(), "deserialized fragment params");
 
-        // Process each fragment: skip exchange-only fragments, execute scan fragments.
-        for params in &all_params {
+        // Merge multi-fragment plans for single-BE execution.
+        // This replaces EXCHANGE_NODE(0 children) in intermediate fragments with
+        // the leaf (scan) fragment's plan, producing a single executable plan.
+        let merged_params = merge_fragment_plans(&all_params);
+        info!(
+            merged_fragments = merged_params.len(),
+            "merged fragment plans for single-BE execution"
+        );
+
+        // Process each merged fragment.
+        for params in &merged_params {
             let finst_id = extract_finst_id(params);
-            info!(
-                query_id = ?params.query_id,
-                fragment_id = ?params.fragment_id,
-                %finst_id,
-                "processing fragment"
-            );
 
-            // Skip result-collecting fragments (EXCHANGE_NODE with 0 children at root).
-            // In a multi-fragment plan, the FE sends exchange + scan in one VERSION_3 request.
-            // We execute the full query in the scan fragment and skip the exchange fragment.
-            if let Some(plan) = params.fragment.as_ref().and_then(|f| f.plan.as_ref()) {
-                if let Some(root) = plan.nodes.first() {
-                    if root.node_type == TPlanNodeType::EXCHANGE_NODE && root.num_children == 0 {
-                        info!(%finst_id, "skipping exchange-only fragment (result collector)");
-                        continue;
-                    }
-                }
-            }
-
-            // Register file-backed tables (e.g. Parquet) in DuckDB before plan execution.
+            // Step 1: Register file-backed tables in DuckDB with SELECT * (all columns).
+            // Step 2: Get actual column names from DuckDB.
+            // Step 3: Pass those as table_schemas to the Substrait translator.
+            // This ensures the ReadRel schema and SLOT_REF field references match
+            // the DuckDB table, even with TVF late materialization.
             let file_tables = extract_file_tables(params);
+            let mut table_schemas = std::collections::HashMap::<String, Vec<String>>::new();
+
             if !file_tables.is_empty() {
                 if let Some(engine) = &self.engine {
                     let engine_guard = engine.lock().unwrap();
                     for ft in &file_tables {
-                        info!(
-                            table = %ft.table_name,
-                            path = %ft.file_path,
-                            format = %ft.format,
-                            "registering file table"
-                        );
-                        if let Err(e) = engine_guard.register_file_table(&ft.table_name, &ft.file_path, &ft.format) {
-                            warn!(
-                                error = %e,
-                                table = %ft.table_name,
-                                "failed to register file table"
-                            );
+                        // Register with SELECT * to get all file columns.
+                        let empty: Vec<String> = vec![];
+                        if let Err(e) = engine_guard.register_file_table(&ft.table_name, &ft.file_path, &ft.format, &empty) {
+                            warn!(error = %e, table = %ft.table_name, "failed to register file table");
                             return Ok(Response::new(PExecPlanFragmentResult {
                                 status: err_status(&format!("register file table '{}': {e}", ft.table_name)),
                                 ..Default::default()
                             }));
+                        }
+                        // Get actual column names from DuckDB.
+                        match engine_guard.get_table_columns(&ft.table_name) {
+                            Ok(columns) => {
+                                info!(
+                                    table = %ft.table_name,
+                                    path = %ft.file_path,
+                                    columns = ?columns,
+                                    "registered file table"
+                                );
+                                table_schemas.insert(ft.table_name.clone(), columns);
+                            }
+                            Err(e) => {
+                                warn!(error = %e, table = %ft.table_name, "failed to get table columns");
+                            }
                         }
                     }
                 }
@@ -416,7 +546,7 @@ impl PBackendService for PBackendServiceHandler {
                 Sql(String),
             }
 
-            let exec_plan = match plan_translator::translate_fragment(params) {
+            let exec_plan = match plan_translator::translate_fragment(params, &table_schemas) {
                 Ok(substrait_bytes) => {
                     info!(bytes = substrait_bytes.len(), "translated to Substrait");
                     ExecPlan::Substrait(substrait_bytes)
@@ -463,7 +593,7 @@ impl PBackendService for PBackendServiceHandler {
                             }
                             Err(e) => {
                                 tracing::warn!(error = %e, "gpu_processing_substrait failed, falling back to CPU from_substrait");
-                                engine.execute_sql("SELECT 'substrait_fallback_not_implemented'")
+                                engine.from_substrait(&bytes)
                                     .map_err(|e| e.to_string())?
                             }
                         }

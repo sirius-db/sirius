@@ -1257,6 +1257,7 @@ dependencies = [
  "prost",
  "result-formatter",
  "sirius-ffi",
+ "substrait",
  "thiserror 2.0.18",
  "thrift",
  "tokio",

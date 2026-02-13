@@ -155,6 +155,30 @@ impl SiriusEngine {
         }
     }
 
+    /// Execute a Substrait plan via DuckDB CPU (`from_substrait`).
+    pub fn from_substrait(&self, plan_bytes: &[u8]) -> Result<Vec<u8>, EngineError> {
+        #[cfg(feature = "duckdb-bundled")]
+        {
+            use arrow::record_batch::RecordBatch;
+
+            let mut stmt = self
+                .conn
+                .prepare("SELECT * FROM from_substrait(?::blob)")
+                .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+            let batches: Vec<RecordBatch> = stmt
+                .query_arrow(duckdb::params![plan_bytes])
+                .map_err(|e| EngineError::ExecFailed(e.to_string()))?
+                .collect();
+            batches_to_ipc(batches)
+        }
+
+        #[cfg(not(feature = "duckdb-bundled"))]
+        {
+            let _ = plan_bytes;
+            Err(EngineError::NotCompiled)
+        }
+    }
+
     /// Get the Arrow schema of a file as IPC stream bytes (schema only, no data).
     ///
     /// Uses `LIMIT 0` + `query_arrow().get_schema()` to extract the schema from
@@ -202,9 +226,10 @@ impl SiriusEngine {
 
     /// Register a file as a DuckDB table (e.g. Parquet, CSV, JSON).
     ///
-    /// Creates a table via `CREATE OR REPLACE TABLE "<name>" AS SELECT * FROM read_parquet(...)`.
+    /// When `columns` is non-empty, only those columns are loaded (in order),
+    /// ensuring DuckDB's table schema matches the Substrait ReadRel field references.
     /// This must be called before executing a plan that references the table.
-    pub fn register_file_table(&self, table_name: &str, file_path: &str, format: &str) -> Result<(), EngineError> {
+    pub fn register_file_table(&self, table_name: &str, file_path: &str, format: &str, columns: &[String]) -> Result<(), EngineError> {
         #[cfg(feature = "duckdb-bundled")]
         {
             let reader_fn = match format {
@@ -214,9 +239,14 @@ impl SiriusEngine {
                 "orc" => "read_parquet", // DuckDB doesn't have read_orc, parquet reader handles it
                 other => return Err(EngineError::ExecFailed(format!("unsupported file format: {other}"))),
             };
+            let select = if columns.is_empty() {
+                "*".to_string()
+            } else {
+                columns.iter().map(|c| format!("\"{}\"", c)).collect::<Vec<_>>().join(", ")
+            };
             let sql = format!(
-                "CREATE OR REPLACE TABLE \"{}\" AS SELECT * FROM {}('{}')",
-                table_name, reader_fn, file_path
+                "CREATE OR REPLACE TABLE \"{}\" AS SELECT {} FROM {}('{}')",
+                table_name, select, reader_fn, file_path
             );
             self.conn
                 .execute_batch(&sql)
@@ -226,7 +256,34 @@ impl SiriusEngine {
 
         #[cfg(not(feature = "duckdb-bundled"))]
         {
-            let _ = (table_name, file_path, format);
+            let _ = (table_name, file_path, format, columns);
+            Err(EngineError::NotCompiled)
+        }
+    }
+
+    /// Get column names of a registered DuckDB table, in ordinal order.
+    pub fn get_table_columns(&self, table_name: &str) -> Result<Vec<String>, EngineError> {
+        #[cfg(feature = "duckdb-bundled")]
+        {
+            let sql = format!("DESCRIBE \"{}\"", table_name);
+            let mut stmt = self
+                .conn
+                .prepare(&sql)
+                .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+            let mut rows = stmt
+                .query([])
+                .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+            let mut columns = Vec::new();
+            while let Some(row) = rows.next().map_err(|e| EngineError::ExecFailed(e.to_string()))? {
+                let name: String = row.get(0).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+                columns.push(name);
+            }
+            Ok(columns)
+        }
+
+        #[cfg(not(feature = "duckdb-bundled"))]
+        {
+            let _ = table_name;
             Err(EngineError::NotCompiled)
         }
     }

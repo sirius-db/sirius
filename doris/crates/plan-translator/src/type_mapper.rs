@@ -14,6 +14,14 @@ fn nullability(nullable: bool) -> i32 {
     }
 }
 
+/// Create a nullable I64 type kind (for fallback when type info is unavailable).
+pub fn nullable_i64() -> r#type::Kind {
+    r#type::Kind::I64(r#type::I64 {
+        type_variation_reference: 0,
+        nullability: r#type::Nullability::Nullable as i32,
+    })
+}
+
 /// Map a Doris TTypeDesc to a Substrait Type.
 pub fn map_type_desc(type_desc: &TTypeDesc) -> Result<Type> {
     let types = type_desc

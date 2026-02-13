@@ -25,14 +25,73 @@ pub fn translate_expr(
     registry: &mut ExtensionRegistry,
 ) -> Result<Expression> {
     let mut idx = 0;
-    translate_expr_node(&expr.nodes, &mut idx, desc, registry)
+    translate_expr_node(&expr.nodes, &mut idx, desc, registry, None)
 }
 
-fn translate_expr_node(
+/// Translate a Doris TExpr with explicit row_tuples context for global column indexing.
+///
+/// Used by join translators where SLOT_REFs must resolve to global indices across
+/// a combined schema (e.g. [left_cols | right_cols]).
+pub fn translate_expr_in_context(
+    expr: &TExpr,
+    desc: &DescriptorTable,
+    registry: &mut ExtensionRegistry,
+    row_tuples: &[i32],
+) -> Result<Expression> {
+    let mut idx = 0;
+    translate_expr_node(&expr.nodes, &mut idx, desc, registry, Some(row_tuples))
+}
+
+
+/// Parse an aggregate function TExpr and return (func_name, arguments, output_type, is_distinct).
+pub fn translate_agg_expr(
+    expr: &TExpr,
+    desc: &DescriptorTable,
+    registry: &mut ExtensionRegistry,
+    row_tuples: Option<&[i32]>,
+) -> Result<(String, Vec<FunctionArgument>, Type, bool)> {
+    if expr.nodes.is_empty() {
+        bail!("empty aggregate expression");
+    }
+    let root = &expr.nodes[0];
+
+    // Get function info from fn_ field (present on both AGG_EXPR and FUNCTION_CALL nodes).
+    let fn_ = root
+        .fn_
+        .as_ref()
+        .context("aggregate expression missing fn_ data")?;
+    let raw_name = fn_.name.function_name.clone();
+
+    // Get output type.
+    let output_type = type_mapper::map_type_desc(&root.type_)?;
+
+    // Translate child arguments (skip root node).
+    let num_children = root.num_children as usize;
+    let mut idx = 1;
+    let mut args = Vec::new();
+    for _ in 0..num_children {
+        let arg_expr = translate_expr_node(&expr.nodes, &mut idx, desc, registry, row_tuples)?;
+        args.push(FunctionArgument {
+            arg_type: Some(substrait::proto::function_argument::ArgType::Value(arg_expr)),
+        });
+    }
+
+    // Detect distinct invocation from function name prefix.
+    let (func_name, is_distinct) = if let Some(base) = raw_name.strip_prefix("multi_distinct_") {
+        (base.to_string(), true)
+    } else {
+        (raw_name, false)
+    };
+
+    Ok((func_name, args, output_type, is_distinct))
+}
+
+pub(crate) fn translate_expr_node(
     nodes: &[TExprNode],
     idx: &mut usize,
     desc: &DescriptorTable,
     registry: &mut ExtensionRegistry,
+    row_tuples: Option<&[i32]>,
 ) -> Result<Expression> {
     if *idx >= nodes.len() {
         bail!("unexpected end of expression nodes at index {}", *idx);
@@ -42,11 +101,11 @@ fn translate_expr_node(
 
     let num_children = node.num_children as usize;
     let children: Vec<Expression> = (0..num_children)
-        .map(|_| translate_expr_node(nodes, idx, desc, registry))
+        .map(|_| translate_expr_node(nodes, idx, desc, registry, row_tuples))
         .collect::<Result<_>>()?;
 
     if node.node_type == TExprNodeType::SLOT_REF {
-        translate_slot_ref(node, desc)
+        translate_slot_ref(node, desc, row_tuples)
     } else if node.node_type == TExprNodeType::INT_LITERAL {
         translate_int_literal(node)
     } else if node.node_type == TExprNodeType::FLOAT_LITERAL {
@@ -79,12 +138,30 @@ fn translate_expr_node(
     }
 }
 
-fn translate_slot_ref(node: &TExprNode, desc: &DescriptorTable) -> Result<Expression> {
+fn translate_slot_ref(
+    node: &TExprNode,
+    desc: &DescriptorTable,
+    row_tuples: Option<&[i32]>,
+) -> Result<Expression> {
     let slot_ref = node
         .slot_ref
         .as_ref()
         .context("SLOT_REF node missing slot_ref data")?;
-    let col_idx = desc.slot_column_index(slot_ref.slot_id)?;
+    let col_idx = if let Some(tuples) = row_tuples {
+        desc.slot_global_index(slot_ref.slot_id, tuples)?
+    } else {
+        desc.slot_table_index(slot_ref.slot_id)?
+    };
+    if let Ok(slot) = desc.get_slot(slot_ref.slot_id) {
+        tracing::debug!(
+            slot_id = slot_ref.slot_id,
+            col_name = %slot.col_name,
+            column_pos = slot.column_pos,
+            parent_tuple = slot.parent_tuple_id,
+            resolved_idx = col_idx,
+            "SLOT_REF resolved"
+        );
+    }
 
     Ok(Expression {
         rex_type: Some(expression::RexType::Selection(Box::new(FieldReference {
@@ -184,7 +261,7 @@ fn translate_literal_pred(node: &TExprNode) -> Result<Expression> {
     })
 }
 
-fn bool_type() -> Type {
+pub(crate) fn bool_type() -> Type {
     Type {
         kind: Some(r#type::Kind::Bool(r#type::Boolean {
             type_variation_reference: 0,
@@ -193,7 +270,7 @@ fn bool_type() -> Type {
     }
 }
 
-fn make_scalar_fn(
+pub(crate) fn make_scalar_fn(
     anchor: u32,
     children: Vec<Expression>,
     output_type: Type,
@@ -332,4 +409,50 @@ fn translate_in_pred(children: Vec<Expression>) -> Result<Expression> {
             },
         ))),
     })
+}
+
+/// Add a fixed offset to all field references in an expression.
+///
+/// Used for join right-side expressions where field indices need to be shifted
+/// by the left side's column count in the combined [left|right] schema.
+pub fn offset_field_refs(expr: &mut Expression, offset: usize) {
+    if offset == 0 {
+        return;
+    }
+    match &mut expr.rex_type {
+        Some(expression::RexType::Selection(ref mut field_ref)) => {
+            if let Some(field_reference::ReferenceType::DirectReference(ref mut seg)) =
+                field_ref.reference_type
+            {
+                if let Some(reference_segment::ReferenceType::StructField(ref mut sf)) =
+                    seg.reference_type
+                {
+                    sf.field += offset as i32;
+                }
+            }
+        }
+        Some(expression::RexType::ScalarFunction(ref mut func)) => {
+            for arg in &mut func.arguments {
+                if let Some(substrait::proto::function_argument::ArgType::Value(ref mut e)) =
+                    arg.arg_type
+                {
+                    offset_field_refs(e, offset);
+                }
+            }
+        }
+        Some(expression::RexType::Cast(ref mut cast)) => {
+            if let Some(ref mut input) = cast.input {
+                offset_field_refs(input, offset);
+            }
+        }
+        Some(expression::RexType::SingularOrList(ref mut list)) => {
+            if let Some(ref mut value) = list.value {
+                offset_field_refs(value, offset);
+            }
+            for opt in &mut list.options {
+                offset_field_refs(opt, offset);
+            }
+        }
+        _ => {} // Literals and other types don't contain field references
+    }
 }

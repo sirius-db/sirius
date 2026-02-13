@@ -31,6 +31,8 @@ pub const URI_ARITHMETIC: &str =
     "https://github.com/substrait-io/substrait/blob/main/extensions/functions_arithmetic.yaml";
 pub const URI_STRING: &str =
     "https://github.com/substrait-io/substrait/blob/main/extensions/functions_string.yaml";
+pub const URI_AGGREGATE: &str =
+    "https://github.com/substrait-io/substrait/blob/main/extensions/functions_aggregate_generic.yaml";
 
 /// Registry for Substrait extension functions.
 ///
@@ -116,7 +118,14 @@ pub fn translate_fragment_to_sql(params: &TPipelineFragmentParams) -> Result<Str
 }
 
 /// Translate a Doris TPipelineFragmentParams into serialized Substrait Plan bytes.
-pub fn translate_fragment(params: &TPipelineFragmentParams) -> Result<Vec<u8>> {
+///
+/// `table_schemas` maps NamedTable names to their actual column names (in order).
+/// For TVF file scans where the descriptor table lacks table_id, the scan translator
+/// uses these schemas to produce a correct ReadRel base_schema matching the DuckDB table.
+pub fn translate_fragment(
+    params: &TPipelineFragmentParams,
+    table_schemas: &HashMap<String, Vec<String>>,
+) -> Result<Vec<u8>> {
     let fragment = params
         .fragment
         .as_ref()
@@ -131,7 +140,12 @@ pub fn translate_fragment(params: &TPipelineFragmentParams) -> Result<Vec<u8>> {
         .desc_tbl
         .as_ref()
         .context("TPipelineFragmentParams has no desc_tbl")?;
-    let desc = descriptor_table::DescriptorTable::from_thrift(desc_tbl)?;
+    let mut desc = descriptor_table::DescriptorTable::from_thrift(desc_tbl)?;
+
+    // Set table column overrides from DuckDB table schemas (for TVF scans).
+    for (table_name, columns) in table_schemas {
+        desc.set_table_column_override(table_name.clone(), columns.clone());
+    }
 
     // Collect file scan params (node_id → params).
     let scan_params = params
@@ -143,7 +157,7 @@ pub fn translate_fragment(params: &TPipelineFragmentParams) -> Result<Vec<u8>> {
     let mut registry = ExtensionRegistry::new();
 
     // Translate the plan tree into a Substrait Rel tree.
-    let rel = node_translator::translate_plan(plan, &desc, &scan_params, &mut registry)?;
+    let rel = node_translator::translate_plan(plan, &desc, &scan_params, &mut registry, table_schemas)?;
 
     // Build output names from the root node's output tuples.
     let output_names = if !plan.nodes.is_empty() {
@@ -160,7 +174,20 @@ pub fn translate_fragment(params: &TPipelineFragmentParams) -> Result<Vec<u8>> {
                 }
             }
         }
-        names
+        // Deduplicate names (joins can produce duplicate column names like "id" from
+        // both sides, which DuckDB cannot handle in from_substrait output tables).
+        let mut name_counts: HashMap<String, usize> = HashMap::new();
+        let mut unique = Vec::new();
+        for name in names {
+            let count = name_counts.entry(name.clone()).or_insert(0);
+            if *count == 0 {
+                unique.push(name);
+            } else {
+                unique.push(format!("{}:{}", name, count));
+            }
+            *count += 1;
+        }
+        unique
     } else {
         Vec::new()
     };
@@ -194,3 +221,4 @@ pub fn translate_fragment(params: &TPipelineFragmentParams) -> Result<Vec<u8>> {
     );
     Ok(bytes)
 }
+
