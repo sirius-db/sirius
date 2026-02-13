@@ -68,7 +68,7 @@ sirius_physical_concat::sirius_physical_concat(duckdb::vector<duckdb::LogicalTyp
 
 std::unique_ptr<operator_data> sirius_physical_concat::get_next_task_input_data()
 {
-  // iterate through all the partition and pull the
+  // iterate through all the partition and pull
   std::lock_guard<std::mutex> lg(lock);
 
   // assert that there is only one port
