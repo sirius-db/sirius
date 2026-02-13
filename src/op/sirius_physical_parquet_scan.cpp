@@ -72,7 +72,7 @@ sirius_physical_parquet_scan::sirius_physical_parquet_scan(
   duckdb::vector<duckdb::Value> parameters_p,
   duckdb::virtual_column_map_t virtual_columns_p)
   : sirius_physical_operator(
-      SiriusPhysicalOperatorType::DUCKDB_SCAN, std::move(types), estimated_cardinality),
+      SiriusPhysicalOperatorType::PARQUET_SCAN, std::move(types), estimated_cardinality),
     function(std::move(function_p)),
     bind_data(std::move(bind_data_p)),
     returned_types(std::move(returned_types_p)),

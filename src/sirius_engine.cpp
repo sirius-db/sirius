@@ -191,9 +191,12 @@ duckdb::unique_ptr<op::sirius_physical_operator> sirius_engine::construct_sirius
     auto& scan_physical_op = op->Cast<op::sirius_physical_table_scan>();
     if (scan_physical_op.function.name == "parquet_scan" ||
         scan_physical_op.function.name == "read_parquet") {
+      printf("Creating parquet scan operator\n");
       return duckdb::make_uniq<op::sirius_physical_parquet_scan>(&scan_physical_op);
-    } else {
+    } else if (scan_physical_op.function.name == "seq_scan") {
       return duckdb::make_uniq<op::sirius_physical_duckdb_scan>(&scan_physical_op);
+    } else {
+      throw std::runtime_error("Unsupported scan function: " + scan_physical_op.function.name);
     }
   } else if (op->type == op::SiriusPhysicalOperatorType::HASH_GROUP_BY) {
     auto& group_by_physical_op = op->Cast<op::sirius_physical_grouped_aggregate>();
@@ -340,13 +343,8 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
 
       if (current_pipeline->source->type == op::SiriusPhysicalOperatorType::TABLE_SCAN) {
         auto& scan_op = current_pipeline->get_source()->Cast<op::sirius_physical_table_scan>();
-        if (scan_op.function.name == "parquet_scan" || scan_op.function.name == "read_parquet") {
-          auto new_scan_op         = construct_sirius_specific_operator(&scan_op);
-          current_pipeline->source = new_scan_op.get();
-          current_pipeline->operators.insert(current_pipeline->operators.begin(), *new_scan_op);
-          new_pipeline_breakers.push_back(std::move(new_scan_op));
-
-        } else if (scan_op.function.name == "seq_scan") {
+        if (scan_op.function.name == "seq_scan" || scan_op.function.name == "parquet_scan" ||
+            scan_op.function.name == "read_parquet") {
           auto new_pipeline = duckdb::make_shared_ptr<pipeline::sirius_pipeline>(*this);
 
           auto new_scan_op = construct_sirius_specific_operator(&scan_op);
@@ -902,7 +900,8 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
                               dependent_pipeline));
           new_scheduled[i]->get_sink()->add_next_port_after_sink(std::make_pair(next_op, port_id));
         }
-      } else if (new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
+      } else if (new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN ||
+                 new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::PARQUET_SCAN) {
         for (auto dependent_pipeline : source_to_pipelines[new_scheduled[i]->get_sink().get()]) {
           auto next_op             = dependent_pipeline->get_operators().size() == 0
                                        ? dependent_pipeline->get_sink().get()
@@ -980,9 +979,10 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
                             static_cast<void*>(build_port->repo));
           }
         } else if (first_op.type == op::SiriusPhysicalOperatorType::TABLE_SCAN) {
-          if (first_op.Cast<op::sirius_physical_table_scan>().function.name != "seq_scan") {
-            throw std::runtime_error("Unsupported scan function: " +
-                                     first_op.Cast<op::sirius_physical_table_scan>().function.name);
+          const auto& scan_name = first_op.Cast<op::sirius_physical_table_scan>().function.name;
+          if (scan_name != "seq_scan" && scan_name != "parquet_scan" &&
+              scan_name != "read_parquet") {
+            throw std::runtime_error("Unsupported scan function: " + scan_name);
           }
           // Scans have "scan" port
           auto* scan_port = first_op.get_port("scan");
@@ -993,7 +993,7 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
           }
         } else if (first_op.type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN ||
                    first_op.type == op::SiriusPhysicalOperatorType::PARQUET_SCAN) {
-          // ignore DUCKDB_SCAN since it doesn't have port
+          // ignore DUCKDB_SCAN and PARQUET_SCAN since it doesn't have port
         } else {
           // Most operators have "default" port
           auto* default_port = first_op.get_port("default");
@@ -1028,8 +1028,9 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
                             static_cast<int>(scan_port->type),
                             static_cast<void*>(scan_port->repo));
           }
-        } else if (sink->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
-          // ignore DUCKDB_SCAN since it doesn't have port
+        } else if (sink->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN ||
+                   sink->type == op::SiriusPhysicalOperatorType::PARQUET_SCAN) {
+          // ignore DUCKDB_SCAN  and PARQUET_SCAN since it doesn't have port
         } else {
           auto* default_port = sink->get_port("default");
           if (default_port) {
