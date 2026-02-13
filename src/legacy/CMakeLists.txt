@@ -42,6 +42,7 @@ set(SIRIUS_LEGACY_SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/operator/gpu_physical_filter.cpp
     ${CMAKE_CURRENT_LIST_DIR}/operator/gpu_physical_grouped_aggregate.cpp
     ${CMAKE_CURRENT_LIST_DIR}/operator/gpu_physical_hash_join.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/operator/gpu_physical_union.cpp
     ${CMAKE_CURRENT_LIST_DIR}/operator/gpu_physical_limit.cpp
     ${CMAKE_CURRENT_LIST_DIR}/operator/gpu_physical_nested_loop_join.cpp
     ${CMAKE_CURRENT_LIST_DIR}/operator/gpu_physical_order.cpp
@@ -95,6 +96,7 @@ set(SIRIUS_LEGACY_CONDITIONAL_SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/plan/gpu_plan_empty_result.cpp
     ${CMAKE_CURRENT_LIST_DIR}/plan/gpu_plan_expression_get.cpp
     ${CMAKE_CURRENT_LIST_DIR}/plan/gpu_plan_filter.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/plan/gpu_plan_set_operation.cpp
     ${CMAKE_CURRENT_LIST_DIR}/plan/gpu_plan_get.cpp
     ${CMAKE_CURRENT_LIST_DIR}/plan/gpu_plan_limit.cpp
     ${CMAKE_CURRENT_LIST_DIR}/plan/gpu_plan_order.cpp
