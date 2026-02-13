@@ -469,7 +469,8 @@ class duckdb_scan_task : public sirius::pipeline::sirius_pipeline_itask {
    * @param stream CUDA stream used for device memory operations and kernel launches
    * @return std::vector<std::shared_ptr<cucascade::data_batch>> The computed output batches
    */
-  op::operator_data compute_task([[maybe_unused]] rmm::cuda_stream_view stream) override;
+  std::unique_ptr<op::operator_data> compute_task(
+    [[maybe_unused]] rmm::cuda_stream_view stream) override;
 
   /**
    * @brief Publish the computed output batches to the data repository.

@@ -306,7 +306,8 @@ parquet_scan_task_local_state::make_allocation()
 //===----------------------------------------------------------------------===//
 // Parquet Scan Task
 //===----------------------------------------------------------------------===//
-op::operator_data parquet_scan_task::compute_task(rmm::cuda_stream_view /* stream */)
+std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
+  rmm::cuda_stream_view /* stream */)
 {
   auto& l_state = this->_local_state->cast<parquet_scan_task_local_state>();
   auto& g_state = this->_global_state->cast<parquet_scan_task_global_state>();
@@ -347,7 +348,8 @@ op::operator_data parquet_scan_task::compute_task(rmm::cuda_stream_view /* strea
                                                   l_state.get_reserved_uncompressed_bytes());
   auto data_batch =
     std::make_shared<cucascade::data_batch>(get_next_batch_id(), std::move(parquet_representation));
-  return op::operator_data(std::vector<std::shared_ptr<cucascade::data_batch>>{data_batch});
+  return std::make_unique<op::operator_data>(
+    std::vector<std::shared_ptr<cucascade::data_batch>>{data_batch});
 }
 
 void parquet_scan_task::publish_output(op::operator_data& output_data,

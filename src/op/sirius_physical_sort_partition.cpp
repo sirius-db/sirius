@@ -47,8 +47,8 @@ sirius_physical_sort_partition::sirius_physical_sort_partition(
 {
 }
 
-operator_data sirius_physical_sort_partition::execute(const operator_data& input_data,
-                                                      rmm::cuda_stream_view stream)
+std::unique_ptr<operator_data> sirius_physical_sort_partition::execute(
+  const operator_data& input_data, rmm::cuda_stream_view stream)
 {
   const auto& input_batches = input_data.get_data_batches();
 
@@ -57,7 +57,7 @@ operator_data sirius_physical_sort_partition::execute(const operator_data& input
     SIRIUS_LOG_DEBUG("Sort partition: passthrough ({} batches, {} partitions)",
                      input_batches.size(),
                      _sample_op ? _sample_op->get_num_partitions() : 1);
-    return input_data;
+    return std::make_unique<operator_data>(input_data);
   }
 
   auto start           = std::chrono::high_resolution_clock::now();
@@ -158,7 +158,7 @@ operator_data sirius_physical_sort_partition::execute(const operator_data& input
     num_parts,
     duration.count() / 1000.0);
 
-  return operator_data(output_batches);
+  return std::make_unique<operator_data>(output_batches);
 }
 
 }  // namespace op

@@ -25,8 +25,11 @@
 #include "duckdb/execution/operator/join/physical_join.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/planner/operator/logical_join.hpp"
-#include "op/sirius_physical_operator.hpp"
+#include "op/sirius_physical_partition_consumer_operator.hpp"
 #include "utils.hpp"
+
+#include <cstddef>
+#include <cstdint>
 
 namespace sirius {
 
@@ -37,12 +40,12 @@ class sirius_meta_pipeline;
 
 namespace op {
 
-class sirius_physical_hash_join : public sirius_physical_operator {
+class sirius_physical_hash_join : public sirius_physical_partition_consumer_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::HASH_JOIN;
 
   struct join_projection_columns {
-    duckdb::vector<duckdb::idx_t> col_idxs;
+    std::vector<cudf::size_type> col_idxs;
     duckdb::vector<duckdb::LogicalType> col_types;
   };
 
@@ -97,6 +100,11 @@ class sirius_physical_hash_join : public sirius_physical_operator {
   void build_pipelines(pipeline::sirius_pipeline& current,
                        pipeline::sirius_meta_pipeline& meta_pipeline) override;
 
+  std::unique_ptr<operator_data> get_next_task_input_data() override;
+
+  std::unique_ptr<operator_data> execute(const operator_data& input_data,
+                                         rmm::cuda_stream_view stream) override;
+
   //! Join Keys statistics (optional)
   duckdb::vector<duckdb::unique_ptr<duckdb::BaseStatistics>> join_stats;
 
@@ -106,6 +114,29 @@ class sirius_physical_hash_join : public sirius_physical_operator {
 
   //! Becomes a source when it is an external join
   bool is_source() const override { return true; }
+
+  std::mutex batches_to_processed_mutex;
+  std::size_t current_partition_index = 0;
+  std::size_t num_batches_to_process  = 0;
+  std::vector<std::vector<uint64_t>> left_batch_ids;
+  std::vector<std::vector<uint64_t>> right_batch_ids;
+
+  bool is_equality_join = true;
+  std::vector<cudf::size_type> left_key_col_indices;
+  std::vector<cudf::size_type> right_key_col_indices;
+  bool cast_necessary = false;
+
+ public:
+  //! Per-key cast info: whether each join key needs a cast before comparison
+  struct key_cast_info {
+    bool cast_left  = false;
+    bool cast_right = false;
+    cudf::data_type left_target_type{cudf::type_id::EMPTY};
+    cudf::data_type right_target_type{cudf::type_id::EMPTY};
+  };
+
+ protected:
+  std::vector<key_cast_info> key_casts;
 
  public:
   // Sink Interface

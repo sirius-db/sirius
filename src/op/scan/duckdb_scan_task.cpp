@@ -501,10 +501,10 @@ void duckdb_scan_task::process_chunk(duckdb_scan_task_local_state& l_state)
 void duckdb_scan_task::execute(rmm::cuda_stream_view stream)
 {
   auto output_data = compute_task(stream);
-  publish_output(output_data, stream);
+  if (output_data) { publish_output(*output_data, stream); }
 }
 
-op::operator_data duckdb_scan_task::compute_task(rmm::cuda_stream_view stream)
+std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stream_view stream)
 {
   // Cast base task states to DuckDB scan task states
   auto& l_state = this->_local_state->cast<duckdb_scan_task_local_state>();
@@ -556,11 +556,11 @@ op::operator_data duckdb_scan_task::compute_task(rmm::cuda_stream_view stream)
 
   // Make data batch and push to repository
   if (l_state._row_offset > 0) {
-    return op::operator_data(
+    return std::make_unique<op::operator_data>(
       std::vector<std::shared_ptr<cucascade::data_batch>>{l_state.make_data_batch()});
   }
 
-  return op::operator_data(std::vector<std::shared_ptr<cucascade::data_batch>>{});
+  return std::make_unique<op::operator_data>(std::vector<std::shared_ptr<cucascade::data_batch>>{});
 }
 
 void duckdb_scan_task::publish_output(op::operator_data& output_data, rmm::cuda_stream_view stream)

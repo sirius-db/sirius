@@ -315,7 +315,7 @@ class parquet_scan_task : public pipeline::sirius_pipeline_itask {
    * @param[in] stream The CUDA stream on which to perform memory operations.
    * @return A vector of shared pointers to data batches produced by this task.
    */
-  op::operator_data compute_task(rmm::cuda_stream_view stream) override;
+  std::unique_ptr<op::operator_data> compute_task(rmm::cuda_stream_view stream) override;
 
   /**
    * @brief Publish the output data batches produced by this task to the shared data repository.

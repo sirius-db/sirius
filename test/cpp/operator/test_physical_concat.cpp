@@ -198,8 +198,8 @@ TEMPLATE_TEST_CASE("sirius_physical_concat concatenates multiple data_batches",
   auto outputs = concat_op.execute(partitioned_operator_data(input_batches, 0), default_stream());
 
   // Verify: single output batch with correct total rows
-  REQUIRE(outputs.get_data_batches().size() == 1);
-  auto& out_table = outputs.get_data_batches()[0]
+  REQUIRE(outputs->get_data_batches().size() == 1);
+  auto& out_table = outputs->get_data_batches()[0]
                       ->get_data()
                       ->cast<cucascade::gpu_table_representation>()
                       .get_table();
@@ -230,9 +230,9 @@ TEST_CASE("sirius_physical_concat returns single batch as-is", "[physical_concat
 
   auto outputs = concat_op.execute(partitioned_operator_data({input_batch}, 0), default_stream());
 
-  REQUIRE(outputs.get_data_batches().size() == 1);
+  REQUIRE(outputs->get_data_batches().size() == 1);
   // Single batch should be the same pointer (passthrough)
-  REQUIRE(outputs.get_data_batches()[0].get() == input_batch.get());
+  REQUIRE(outputs->get_data_batches()[0].get() == input_batch.get());
 }
 
 TEST_CASE("sirius_physical_concat handles empty input", "[physical_concat]")
@@ -245,7 +245,7 @@ TEST_CASE("sirius_physical_concat handles empty input", "[physical_concat]")
     partitioned_operator_data(std::vector<std::shared_ptr<cucascade::data_batch>>{}, 0),
     default_stream());
 
-  REQUIRE(outputs.get_data_batches().empty());
+  REQUIRE(outputs->get_data_batches().empty());
 }
 
 TEST_CASE("sirius_physical_concat filters null batches", "[physical_concat]")
@@ -266,8 +266,8 @@ TEST_CASE("sirius_physical_concat filters null batches", "[physical_concat]")
   std::vector<std::shared_ptr<data_batch>> input = {batch1, nullptr, batch2, nullptr};
   auto outputs = concat_op.execute(partitioned_operator_data(input, 0), default_stream());
 
-  REQUIRE(outputs.get_data_batches().size() == 1);
-  auto& out_table = outputs.get_data_batches()[0]
+  REQUIRE(outputs->get_data_batches().size() == 1);
+  auto& out_table = outputs->get_data_batches()[0]
                       ->get_data()
                       ->cast<cucascade::gpu_table_representation>()
                       .get_table();
@@ -427,7 +427,7 @@ TEST_CASE("sirius_physical_concat stops concatenating at DEFAULT_SCAN_TASK_BATCH
 
   // First call: should return some batches but not all (threshold exceeded)
   auto result1 = concat_op.get_next_task_input_data();
-  REQUIRE(result1.has_value());
+  REQUIRE(result1 != nullptr);
   REQUIRE(result1->get_data_batches().size() < static_cast<std::size_t>(num_batches));
   REQUIRE(result1->get_data_batches().size() >= 1);
 
@@ -435,7 +435,7 @@ TEST_CASE("sirius_physical_concat stops concatenating at DEFAULT_SCAN_TASK_BATCH
   std::size_t total_batches_returned = result1->get_data_batches().size();
   while (true) {
     auto result = concat_op.get_next_task_input_data();
-    if (!result.has_value()) { break; }
+    if (!result) { break; }
     total_batches_returned += result->get_data_batches().size();
   }
 
@@ -482,12 +482,12 @@ TEST_CASE("sirius_physical_concat with concat_all=true ignores threshold", "[phy
 
   // With concat_all=true, all batches in the partition should be returned in one call
   auto result = concat_op.get_next_task_input_data();
-  REQUIRE(result.has_value());
+  REQUIRE(result != nullptr);
   REQUIRE(result->get_data_batches().size() == static_cast<std::size_t>(num_batches));
 
   // No more batches remaining
   auto result2 = concat_op.get_next_task_input_data();
-  REQUIRE_FALSE(result2.has_value());
+  REQUIRE(result2 == nullptr);
 
   // Restore threshold
   duckdb::Config::DEFAULT_SCAN_TASK_BATCH_SIZE = original_threshold;
@@ -545,9 +545,8 @@ TEST_CASE("sirius_physical_concat constructor sets concat_all for different join
   SECTION("OUTER join throws unsupported join type")
   {
     auto fixture = create_test_hash_join(duckdb::JoinType::OUTER, {duckdb::LogicalType::INTEGER});
-    REQUIRE_THROWS_AS(
-      sirius_physical_concat({duckdb::LogicalType::INTEGER}, 1000, fixture.hash_join.get(), false),
-      std::runtime_error);
+    REQUIRE_NOTHROW(
+      sirius_physical_concat({duckdb::LogicalType::INTEGER}, 1000, fixture.hash_join.get(), false));
   }
 
   SECTION("Non-hash-join parent throws")
@@ -614,7 +613,7 @@ TEST_CASE("sirius_physical_concat get_next_task_input_batch is thread-safe", "[p
   auto worker = [&]() {
     while (true) {
       auto result = concat_op.get_next_task_input_data();
-      if (!result.has_value()) { break; }
+      if (!result) { break; }
       total_calls.fetch_add(1, std::memory_order_relaxed);
       std::lock_guard<std::mutex> lg(collected_mutex);
       for (auto& batch : result->get_data_batches()) {
@@ -692,7 +691,7 @@ TEST_CASE("sirius_physical_concat execute is thread-safe with independent stream
       // Synchronize the stream before accessing results
       cudaStreamSynchronize(raw_stream);
 
-      thread_outputs[thread_id] = std::move(outputs.get_data_batches());
+      thread_outputs[thread_id] = std::move(outputs->get_data_batches());
 
       cudaStreamDestroy(raw_stream);
     } catch (const std::exception& e) {

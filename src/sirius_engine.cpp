@@ -45,7 +45,6 @@
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
 
 #include <cucascade/data/data_repository_manager.hpp>
-#include <stdio.h>
 
 namespace sirius {
 

@@ -133,8 +133,8 @@ void duckdb_scan_executor::submit_scan_request()
     _task_request_publisher.send(std::make_unique<sirius::pipeline::task_request>(0, true));
 }
 
-op::operator_data duckdb_scan_executor::get_scan_output(op::scan::duckdb_scan_task* task,
-                                                        rmm::cuda_stream_view stream)
+std::unique_ptr<op::operator_data> duckdb_scan_executor::get_scan_output(
+  op::scan::duckdb_scan_task* task, rmm::cuda_stream_view stream)
 {
   if (!_caching_enabled) {
     return task->compute_task(stream);
@@ -148,10 +148,10 @@ op::operator_data duckdb_scan_executor::get_scan_output(op::scan::duckdb_scan_ta
       if (entry->batch_index >= entry->batches.size()) {
         throw std::runtime_error("Scan results for query not cached");
       }
-      return op::operator_data(entry->batches[entry->batch_index++]);
+      return std::make_unique<op::operator_data>(entry->batches[entry->batch_index++]);
     } else {
       auto scan_output = task->compute_task(stream);
-      entry->batches.push_back(scan_output.get_data_batches());
+      entry->batches.push_back(scan_output->get_data_batches());
       return scan_output;
     }
   }
@@ -209,7 +209,7 @@ void duckdb_scan_executor::manager_loop()
       try {
         auto consumers   = scan_task->get_output_consumers();
         auto output_data = get_scan_output(scan_task, stream);
-        scan_task->publish_output(output_data, stream);
+        if (output_data) { scan_task->publish_output(*output_data, stream); }
         t.reset();
         if (_task_creator && !(_completion_handler && _completion_handler->is_completed())) {
           for (auto* consumer : consumers) {

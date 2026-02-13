@@ -204,7 +204,7 @@ void task_creator::manager_loop()
             // need to exhaust input batches until all ports are empty
             while (!node->all_ports_empty()) {
               auto input_data = node->get_next_task_input_data();
-              if (!input_data.has_value()) { break; }
+              if (!input_data) { break; }
               pipeline->mark_task_created();  // WSM TODO: this needs to be done atomically with the
                                               // task creation
 
@@ -222,7 +222,7 @@ void task_creator::manager_loop()
               }
 
               auto local_state =
-                std::make_unique<pipeline::gpu_pipeline_task_local_state>(input_data.value());
+                std::make_unique<pipeline::gpu_pipeline_task_local_state>(std::move(input_data));
               auto task = std::make_unique<pipeline::gpu_pipeline_task>(
                 get_next_task_id(),
                 destination_data_repositories,

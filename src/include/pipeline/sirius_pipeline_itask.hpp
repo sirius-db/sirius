@@ -59,7 +59,7 @@ class sirius_pipeline_itask : public parallel::itask {
    * @return std::vector<std::shared_ptr<cucascade::data_batch>> The computed output
    *         data batches, which may be empty if no output is produced.
    */
-  virtual op::operator_data compute_task(rmm::cuda_stream_view stream) = 0;
+  virtual std::unique_ptr<op::operator_data> compute_task(rmm::cuda_stream_view stream) = 0;
 
   /**
    * @brief Publish the computed output batches to appropriate destinations.
@@ -87,7 +87,7 @@ class sirius_pipeline_itask : public parallel::itask {
   void execute(rmm::cuda_stream_view stream) override
   {
     auto output_batches = compute_task(stream);
-    publish_output(output_batches, stream);
+    if (output_batches) { publish_output(*output_batches, stream); }
   }
 
  protected:

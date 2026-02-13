@@ -57,8 +57,9 @@ class sirius_physical_sort_partition : public sirius_physical_operator {
   bool sink_order_dependent() const override { return false; }
 
  public:
-  operator_data execute(const operator_data& input_data,
-                        rmm::cuda_stream_view stream = cudf::get_default_stream()) override;
+  std::unique_ptr<operator_data> execute(
+    const operator_data& input_data,
+    rmm::cuda_stream_view stream = cudf::get_default_stream()) override;
 
   //! Set the sample operator to read partition boundaries from
   void set_sample_op(sirius_physical_sort_sample* sample) { _sample_op = sample; }

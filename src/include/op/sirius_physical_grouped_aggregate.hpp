@@ -97,7 +97,8 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
 
   bool sink_order_dependent() const override { return false; }
 
-  operator_data execute(const operator_data& input_data, rmm::cuda_stream_view stream) override;
+  std::unique_ptr<operator_data> execute(const operator_data& input_data,
+                                         rmm::cuda_stream_view stream) override;
 };
 
 }  // namespace op

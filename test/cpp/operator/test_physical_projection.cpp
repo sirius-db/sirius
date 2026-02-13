@@ -87,9 +87,9 @@ TEMPLATE_TEST_CASE("sirius_physical_projection executes on data_batch for multip
 
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
   auto outputs = projection.execute(operator_data(inputs), cudf::get_default_stream());
-  REQUIRE(outputs.get_data_batches().size() == 1);
+  REQUIRE(outputs->get_data_batches().size() == 1);
   auto output_table =
-    outputs.get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
+    outputs->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
   auto out_view = output_table.view();
 
   auto host_data = copy_column_to_host<typename Traits::type>(out_view.column(0));
@@ -132,8 +132,8 @@ TEMPLATE_TEST_CASE("sirius_physical_projection can drop columns",
 
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
   auto outputs = projection.execute(operator_data(inputs), cudf::get_default_stream());
-  REQUIRE(outputs.get_data_batches().size() == 1);
-  auto output_table = outputs.get_data_batches()[0]
+  REQUIRE(outputs->get_data_batches().size() == 1);
+  auto output_table = outputs->get_data_batches()[0]
                         ->get_data()
                         ->template cast<gpu_table_representation>()
                         .get_table();
@@ -180,8 +180,8 @@ TEMPLATE_TEST_CASE("sirius_physical_projection can duplicate/reorder columns",
 
   std::vector<std::shared_ptr<cucascade::data_batch>> inputs{input_batch};
   auto outputs = projection.execute(operator_data(inputs), cudf::get_default_stream());
-  REQUIRE(outputs.get_data_batches().size() == 1);
-  auto output_table = outputs.get_data_batches()[0]
+  REQUIRE(outputs->get_data_batches().size() == 1);
+  auto output_table = outputs->get_data_batches()[0]
                         ->get_data()
                         ->template cast<gpu_table_representation>()
                         .get_table();

@@ -179,7 +179,8 @@ class duckdb_scan_executor {
    */
   void submit_scan_request();
 
-  op::operator_data get_scan_output(op::scan::duckdb_scan_task* task, rmm::cuda_stream_view stream);
+  std::unique_ptr<op::operator_data> get_scan_output(op::scan::duckdb_scan_task* task,
+                                                     rmm::cuda_stream_view stream);
 
   struct cache_entry {
     std::vector<std::vector<std::shared_ptr<cucascade::data_batch>>> batches;
