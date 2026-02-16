@@ -357,10 +357,13 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
           } else {
             agg_op = cudf::make_sum_aggregation<cudf::reduce_aggregation>();
           }
-          // For AVG, the SUM reduction must use the input column type (cudf requires
-          // output type == input type for fixed-point reductions). The final AVG return
-          // type is applied later in the merge step when dividing SUM / COUNT.
-          if (spec.kind == aggregate_kind::AVG) { out_type = col.type(); }
+          // cuDF requires output type == input type for fixed-point (decimal) reductions.
+          // For AVG we use input type and apply return type in the merge step (SUM/COUNT).
+          // For SUM/MIN/MAX on decimals we must also use input column type.
+          bool is_decimal = (col.type().id() == cudf::type_id::DECIMAL32 ||
+                             col.type().id() == cudf::type_id::DECIMAL64 ||
+                             col.type().id() == cudf::type_id::DECIMAL128);
+          if (spec.kind == aggregate_kind::AVG || is_decimal) { out_type = col.type(); }
           auto scalar = cudf::reduce(col, *agg_op, out_type, std::nullopt, stream);
           cols.push_back(cudf::make_column_from_scalar(*scalar, 1, stream));
           if (spec.kind == aggregate_kind::AVG) {
