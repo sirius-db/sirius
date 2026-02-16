@@ -60,6 +60,7 @@ int64_t sirius_physical_streaming_limit::claim(std::atomic<int64_t>& counter, in
     if (counter.compare_exchange_weak(current, current - to_claim, std::memory_order_acq_rel)) {
       return to_claim;
     }
+    current = counter.load(std::memory_order_acquire);
   }
   return 0;
 }
