@@ -24,6 +24,7 @@
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_grouped_aggregate_merge.hpp"
 #include "op/sirius_physical_hash_join.hpp"
+#include "op/sirius_physical_nested_loop_join.hpp"
 #include "op/sirius_physical_order.hpp"
 #include "op/sirius_physical_top_n.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -122,9 +123,18 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
       _is_build           = is_build;
       _num_partitions     = num_conditions;
       get_partition_keys_and_type(&grandparent_join_op, is_build);
+    } else if (parent_concat_op.get_parent_op()->type ==
+               SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
+      auto& grandparent_join_op =
+        parent_concat_op.get_parent_op()->Cast<sirius_physical_nested_loop_join>();
+      bool is_build       = parent_concat_op.is_build_concat();
+      auto num_conditions = grandparent_join_op.conditions.size();
+      _is_build           = is_build;
+      _num_partitions     = num_conditions;
+      get_partition_keys_and_type(&grandparent_join_op, is_build);
     } else {
       throw std::runtime_error("Unsupported operator following partition->concat: " +
-                               op->get_name());
+                               parent_concat_op.get_parent_op()->get_name());
     }
   } else {
     throw std::runtime_error("Unsupported operator type for partition: " + op->get_name());
