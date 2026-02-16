@@ -59,10 +59,14 @@ sirius_physical_concat::sirius_physical_concat(duckdb::vector<duckdb::LogicalTyp
     } else if (hash_join->join_type == duckdb::JoinType::OUTER) {
       _concat_all = true;
     } else {
-      throw std::runtime_error("sirius_physical_concat: unsupported join type");
+      throw std::runtime_error("sirius_physical_concat: unsupported join type: " +
+                               duckdb::JoinTypeToString(hash_join->join_type));
     }
+  } else if (parent_op->type == SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
+    _concat_all = false;
   } else {
-    throw std::runtime_error("sirius_physical_concat: parent_op is not a hash join");
+    throw std::runtime_error("sirius_physical_concat: parent_op is not a hash join: " +
+                             SiriusPhysicalOperatorToString(parent_op->type));
   }
 }
 
