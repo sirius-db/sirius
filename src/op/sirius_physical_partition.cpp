@@ -113,7 +113,19 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
       }
     }
   } else if (op->type == SiriusPhysicalOperatorType::CONCAT) {
-    _partition_type = PartitionType::EVENLY;
+    auto& parent_concat_op = op->Cast<sirius_physical_concat>();
+    if (parent_concat_op.get_parent_op()->type == SiriusPhysicalOperatorType::HASH_JOIN) {
+      auto& grandparent_join_op =
+        parent_concat_op.get_parent_op()->Cast<sirius_physical_hash_join>();
+      bool is_build       = parent_concat_op.is_build_concat();
+      auto num_conditions = grandparent_join_op.conditions.size();
+      _is_build           = is_build;
+      _num_partitions     = num_conditions;
+      get_partition_keys_and_type(&grandparent_join_op, is_build);
+    } else {
+      throw std::runtime_error("Unsupported operator following partition->concat: " +
+                               op->get_name());
+    }
   } else {
     throw std::runtime_error("Unsupported operator type for partition: " + op->get_name());
   }
