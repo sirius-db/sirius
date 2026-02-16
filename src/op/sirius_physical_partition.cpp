@@ -112,6 +112,10 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
         _partition_keys.push_back(expr->Cast<duckdb::BoundReferenceExpression>().index);
       }
     }
+  } else if (op->type == SiriusPhysicalOperatorType::CONCAT) {
+    _partition_type = PartitionType::EVENLY;
+  } else {
+    throw std::runtime_error("Unsupported operator type for partition: " + op->get_name());
   }
 }
 
@@ -140,6 +144,7 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
       partitioned_results = gpu_partition_impl::evenly_partition(
         input_batch, _num_partitions, stream, *input_batch->get_memory_space());
       break;
+    case PartitionType::NONE: partitioned_results = {input_batch}; break;
     case PartitionType::CUSTOM:
       throw std::runtime_error("Custom partitioning is not implemented yet");
     default:
