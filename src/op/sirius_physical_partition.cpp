@@ -73,7 +73,25 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
         }
       }
     }
-
+  } else if (op->type == SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
+    _partition_type      = PartitionType::NONE;
+    auto& nested_join_op = op->Cast<sirius_physical_nested_loop_join>();
+    if (is_build) {
+      for (duckdb::idx_t cond_idx = 0; cond_idx < nested_join_op.conditions.size(); cond_idx++) {
+        auto& condition = nested_join_op.conditions[cond_idx];
+        if (condition.right->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
+          _partition_keys.push_back(
+            condition.right->Cast<duckdb::BoundReferenceExpression>().index);
+        }
+      }
+    } else {
+      for (duckdb::idx_t cond_idx = 0; cond_idx < nested_join_op.conditions.size(); cond_idx++) {
+        auto& condition = nested_join_op.conditions[cond_idx];
+        if (condition.left->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
+          _partition_keys.push_back(condition.left->Cast<duckdb::BoundReferenceExpression>().index);
+        }
+      }
+    }
   } else if (op->type == SiriusPhysicalOperatorType::HASH_GROUP_BY) {
     _partition_type            = PartitionType::HASH;
     auto& grouped_aggregate_op = op->Cast<sirius_physical_grouped_aggregate>();
@@ -115,21 +133,19 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
     }
   } else if (op->type == SiriusPhysicalOperatorType::CONCAT) {
     auto& parent_concat_op = op->Cast<sirius_physical_concat>();
+    bool is_build          = parent_concat_op.is_build_concat();
+    _is_build              = is_build;
     if (parent_concat_op.get_parent_op()->type == SiriusPhysicalOperatorType::HASH_JOIN) {
       auto& grandparent_join_op =
         parent_concat_op.get_parent_op()->Cast<sirius_physical_hash_join>();
-      bool is_build       = parent_concat_op.is_build_concat();
       auto num_conditions = grandparent_join_op.conditions.size();
-      _is_build           = is_build;
       _num_partitions     = num_conditions;
       get_partition_keys_and_type(&grandparent_join_op, is_build);
     } else if (parent_concat_op.get_parent_op()->type ==
                SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
       auto& grandparent_join_op =
         parent_concat_op.get_parent_op()->Cast<sirius_physical_nested_loop_join>();
-      bool is_build       = parent_concat_op.is_build_concat();
       auto num_conditions = grandparent_join_op.conditions.size();
-      _is_build           = is_build;
       _num_partitions     = num_conditions;
       get_partition_keys_and_type(&grandparent_join_op, is_build);
     } else {
