@@ -233,8 +233,8 @@ static void run_parquet_scan_test(std::string const& table_name,
     make_parquet_scan(client_ctx, parquet_path.string(), std::move(projection_ids));
   REQUIRE(physical_scan);
 
-  auto global_state =
-    std::make_shared<op::scan::parquet_scan_task_global_state>(physical_scan.get(), batch_size);
+  auto global_state = std::make_shared<op::scan::parquet_scan_task_global_state>(
+    nullptr, physical_scan.get(), batch_size);
 
   cucascade::shared_data_repository data_repo;
 

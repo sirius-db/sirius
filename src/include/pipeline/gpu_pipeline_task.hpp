@@ -100,7 +100,7 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
   gpu_pipeline_task(uint64_t task_id,
                     std::vector<cucascade::shared_data_repository*> data_repos,
                     std::unique_ptr<sirius_pipeline_task_local_state> local_state,
-                    std::shared_ptr<sirius::parallel::itask_global_state> global_state);
+                    std::shared_ptr<sirius_pipeline_task_global_state> global_state);
 
   ~gpu_pipeline_task() override;
 

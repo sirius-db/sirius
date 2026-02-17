@@ -76,7 +76,6 @@ void pipeline_executor::schedule(std::unique_ptr<sirius::parallel::itask> task)
   } else if (task->is<sirius::op::scan::parquet_scan_task>()) {
     _scan_executor->schedule(std::move(task));
   } else {
-    SIRIUS_LOG_ERROR("Unknown task type");
     _task_queue.push(std::move(task));
   }
 }

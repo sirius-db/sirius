@@ -93,7 +93,7 @@ void task_creator::prepare_for_query(const sirius::planner::query& query)
       _parquet_scan_operator_global_state_map.emplace(
         operator_id,
         std::make_shared<op::scan::parquet_scan_task_global_state>(
-          &source_operator->Cast<op::sirius_physical_parquet_scan>()));
+          pipeline, &source_operator->Cast<op::sirius_physical_parquet_scan>()));
     } else {
       _gpu_operator_global_state_map.emplace(
         operator_id, std::make_shared<pipeline::gpu_pipeline_task_global_state>(pipeline));
@@ -259,8 +259,7 @@ void task_creator::manager_loop()
                                             // task creation
 
             // Check to see if you need to create a new global state for this operator
-            size_t operator_id = node->get_operator_id();
-            std::cout << "Operator ID: " << operator_id << " " << node->get_name() << std::endl;
+            size_t operator_id                  = node->get_operator_id();
             auto gpu_pipeline_task_global_state = _gpu_operator_global_state_map.at(operator_id);
 
             auto local_state =

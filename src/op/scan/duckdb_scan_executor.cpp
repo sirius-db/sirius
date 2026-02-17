@@ -123,9 +123,13 @@ void duckdb_scan_executor::prepare_cache_for_scan_operators(
     // In PRELOAD mode: verify all operator IDs are present in the cache
     for (auto* op : scan_operators) {
       auto operator_id = op->get_pipeline()->get_pipeline_id();
-      if (_cache.find(operator_id) == _cache.end()) {
+      auto iter        = _cache.find(operator_id);
+      if (iter == _cache.end()) {
         SIRIUS_LOG_ERROR("Cache entry not found for operator {} in PRELOAD mode", operator_id);
+        throw std::runtime_error("Cache entry not found for operator " +
+                                 std::to_string(operator_id) + " in PRELOAD mode");
       }
+      iter->second->batch_index = 0;  // Reset batch index for PRELOAD mode
     }
   }
 }
@@ -143,14 +147,11 @@ std::unique_ptr<op::operator_data> duckdb_scan_executor::get_scan_output(
   if (!_caching_enabled) {
     return task->compute_task(stream);
   } else {
-    // auto pipe_id = task->get_pipeline_id();
-    auto pipe_id = 0;
+    auto pipe_id = task->get_pipeline_id();
     std::lock_guard<std::mutex> lock(_cache_mutex);
-    // todo (amin) : we need to clone the batches to avoid modifying the original batches
     auto& entry = _cache.at(pipe_id);
     if (!entry) { throw std::runtime_error("Scan results for query not cached"); }
     if (_preload_mode) {
-      std::cerr << "Preload mode is true" << std::endl;
       if (entry->batch_index >= entry->batches.size()) {
         throw std::runtime_error("Scan results for query not cached");
       }
@@ -162,7 +163,6 @@ std::unique_ptr<op::operator_data> duckdb_scan_executor::get_scan_output(
       }
       return std::make_unique<op::operator_data>(std::move(cloned_batches));
     } else {
-      std::cerr << "Preload mode is false" << std::endl;
       auto scan_output = task->compute_task(stream);
       std::vector<std::shared_ptr<cucascade::data_batch>> cloned_batches;
       cloned_batches.reserve(scan_output->get_data_batches().size());

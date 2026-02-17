@@ -50,7 +50,7 @@ namespace sirius::op::scan {
 //===----------------------------------------------------------------------===//
 // Parquet Scan Task Global State
 //===----------------------------------------------------------------------===//
-class parquet_scan_task_global_state : public parallel::itask_global_state {
+class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_global_state {
   using hybrid_scan_reader = cudf::io::parquet::experimental::hybrid_scan_reader;
 
  public:
@@ -79,11 +79,12 @@ class parquet_scan_task_global_state : public parallel::itask_global_state {
   /**
    * @brief Construct the global state for the parquet scan task.
    *
+   * @param[in] pipeline The pipeline associated with this task
    * @param[in] scan_op The physical table scan operator
-   * @param[in] client_ctx The DuckDB client context
    * @param[in] approximate_batch_size The target approximate batch size for the scan tasks
    */
   parquet_scan_task_global_state(
+    duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
     sirius_physical_parquet_scan* scan_op,
     size_t approximate_batch_size = duckdb::Config::DEFAULT_SCAN_TASK_BATCH_SIZE);
 

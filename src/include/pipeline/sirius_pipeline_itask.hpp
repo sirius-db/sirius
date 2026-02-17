@@ -90,6 +90,11 @@ class sirius_pipeline_itask : public parallel::itask {
     if (output_batches) { publish_output(*output_batches, stream); }
   }
 
+  [[nodiscard]] size_t get_pipeline_id() const
+  {
+    return _global_state->cast<sirius_pipeline_task_global_state>().get_pipeline_id();
+  }
+
  protected:
   /**
    * @brief Protected constructor for derived classes.
@@ -98,7 +103,7 @@ class sirius_pipeline_itask : public parallel::itask {
    * @param global_state The global state shared across multiple tasks
    */
   sirius_pipeline_itask(std::unique_ptr<sirius_pipeline_task_local_state> local_state,
-                        std::shared_ptr<parallel::itask_global_state> global_state)
+                        std::shared_ptr<sirius_pipeline_task_global_state> global_state)
     : itask(std::move(local_state), std::move(global_state))
   {
   }

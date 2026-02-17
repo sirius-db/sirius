@@ -187,7 +187,7 @@ class duckdb_scan_executor {
     std::size_t batch_index{0};
   };
 
-  std::mutex _cache_mutex;
+  mutable std::mutex _cache_mutex;
   std::unordered_map<size_t, std::unique_ptr<cache_entry>> _cache;
   std::size_t _query_hash{0};
   bool _caching_enabled{false};

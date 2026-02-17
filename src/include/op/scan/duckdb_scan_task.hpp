@@ -58,7 +58,7 @@ namespace sirius::op::scan {
 /**
  * @brief The global state for a duckdb_scan_task.
  */
-class duckdb_scan_task_global_state : public sirius::parallel::itask_global_state,
+class duckdb_scan_task_global_state : public pipeline::sirius_pipeline_task_global_state,
                                       public duckdb::GlobalSourceState {
   friend class duckdb_scan_task;
   friend class duckdb_scan_task_local_state;
@@ -100,9 +100,9 @@ class duckdb_scan_task_global_state : public sirius::parallel::itask_global_stat
   void set_source_drained()
   {
     _source_drained.store(true, std::memory_order_release);
-    if (_pipeline) {
+    if (get_pipeline()) {
       auto* scan_op =
-        dynamic_cast<sirius_physical_duckdb_scan*>(&_pipeline->get_operators().at(0).get());
+        dynamic_cast<sirius_physical_duckdb_scan*>(&get_pipeline()->get_operators().at(0).get());
 
       if (scan_op) { scan_op->exhausted.store(true, std::memory_order_release); }
     }
@@ -138,12 +138,8 @@ class duckdb_scan_task_global_state : public sirius::parallel::itask_global_stat
     return output_consumers;
   }
 
-  [[nodiscard]] size_t get_pipeline_id() const { return _pipeline->get_pipeline_id(); }
-
  private:
   //===----------Fields----------===//
-  duckdb::shared_ptr<pipeline::sirius_pipeline>
-    _pipeline;                         ///< The pipeline to which this table scan belongs
   duckdb::SiriusContext* _sirius_ctx;  ///< The Sirius context
   std::unique_ptr<duckdb::GlobalTableFunctionState>
     _global_tf_state;  ///< Global state for the table function
