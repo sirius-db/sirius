@@ -399,8 +399,8 @@ struct variant_value_holder {
 // Helper function to create nested groups and return the parent setting
 // For path "server.network.port", creates "server" and "server.network" groups
 // and returns reference to "network" group along with final component "port"
-static std::pair<libconfig::Setting*, std::string> ensure_parent_path(libconfig::Setting& setting,
-                                                                      std::string_view path)
+static inline std::pair<libconfig::Setting*, std::string> ensure_parent_path(
+  libconfig::Setting& setting, std::string_view path)
 {
   libconfig::Setting* current = &setting;
   std::string path_str(path);

@@ -30,6 +30,7 @@
 #include <cucascade/memory/common.hpp>
 
 #include <iostream>
+#include <mutex>
 
 namespace sirius::op::scan {
 
@@ -44,7 +45,14 @@ duckdb_scan_executor::duckdb_scan_executor(
 {
 }
 
-duckdb_scan_executor::~duckdb_scan_executor() { stop(); }
+duckdb_scan_executor::~duckdb_scan_executor()
+{
+  {
+    std::lock_guard lock(_cache_mutex);
+    _cache.clear();
+  }
+  stop();
+}
 
 void duckdb_scan_executor::schedule(std::unique_ptr<sirius::parallel::itask> task)
 {
