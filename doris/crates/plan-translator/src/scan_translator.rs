@@ -71,6 +71,17 @@ pub fn translate_file_scan(
     })
 }
 
+/// Build a NamedStruct for an exchange table from column names.
+///
+/// Used by EXCHANGE_NODE(0 children) → ReadRel translation.
+/// Resolves types from the descriptor table, falling back to nullable I64.
+pub fn build_exchange_schema(
+    columns: &[String],
+    desc: &DescriptorTable,
+) -> Result<NamedStruct> {
+    build_schema_from_columns(columns, desc, 0)
+}
+
 /// Build a NamedStruct from DuckDB column names, resolving types from the descriptor table.
 ///
 /// Looks up each column name across all tuples to find its Substrait type.

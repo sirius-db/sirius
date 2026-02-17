@@ -60,6 +60,8 @@ doris-check = { cmd = "cargo check", cwd = "doris", description = "Check doris w
 doris-build = { cmd = "cargo build --release", cwd = "doris", description = "Build doris workspace" }
 doris-test = { cmd = "cargo test", cwd = "doris", description = "Test doris workspace" }
 doris-build-duckdb = { cmd = "cargo build --release --features sirius-ffi/duckdb-bundled", cwd = "doris", description = "Build doris workspace with bundled DuckDB engine" }
+# Start Sirius GPU BE with offset ports (for running alongside regular Doris BE)
+sirius-be = { cmd = "doris/target/release/sirius-doris-be --heartbeat-port 19050 --be-port 19060 --brpc-port 18060 --http-port 18040 --arrow-flight-port 18071 --fe 127.0.0.1:9030", description = "Run Sirius GPU BE with offset ports (coexists with regular BE)" }
 
 # Doris FE feature: build & run Doris Frontend from source for testing
 [feature.doris-fe.dependencies]
@@ -129,13 +131,123 @@ doris-fe-build = { cmd = """bash -c 'set -e
   cp fe/fe-core/target/lib/* output/fe/lib/
   cp fe/fe-core/target/doris-fe.jar output/fe/lib/
   echo "==> Done"
-'""", depends-on = ["doris-fe-thrift"], description = "Build Doris FE from source (Maven)" }
+'""", inputs = ["doris/thirdparty/apache-doris/gensrc/thrift/*.thrift", "doris/thirdparty/apache-doris/fe/fe-core/src/**/*.java", "doris/thirdparty/apache-doris/fe/fe-common/src/**/*.java", "doris/thirdparty/apache-doris/fe/pom.xml"], outputs = ["doris/thirdparty/apache-doris/fe/fe-core/target/doris-fe.jar"], depends-on = ["doris-fe-thrift"], description = "Build Doris FE from source (Maven)" }
 
-doris-fe = { cmd = "bin/start_fe.sh --console", cwd = "doris/thirdparty/apache-doris/output/fe", depends-on = ["doris-fe-build"], description = "Build and run Doris FE in foreground" }
+doris-fe-start = { cmd = "bin/start_fe.sh --console", cwd = "doris/thirdparty/apache-doris/output/fe", depends-on = ["doris-fe-build"], description = "Build (if needed) and run Doris FE in foreground" }
+doris-fe = { cmd = "bin/start_fe.sh --console", cwd = "doris/thirdparty/apache-doris/output/fe", description = "Run Doris FE in foreground (skip build)" }
 doris-fe-show-be = { cmd = "bash -c 'mysql -h 127.0.0.1 -P 9030 -u root -e \"SHOW BACKENDS\\G\"'", description = "Show registered backends" }
+
+# Doris C++ BE feature: build & run standard Doris Backend from source
+[feature.doris-be.dependencies]
+bash = "*"
+openjdk = "17.*"
+maven = ">=3.9"
+cmake = ">=3.20"
+cxx-compiler = "*"
+make = "*"
+ninja = "*"
+python = ">=3.8"
+flex = "*"
+bison = "*"
+ccache = "*"
+mysql = "*"
+automake = "*"
+autoconf = "*"
+libtool = "*"
+pkg-config = "*"
+binutils = "*"
+patch = "*"
+curl = "*"
+wget = "*"
+m4 = "*"
+gettext = "*"
+sed = "*"
+gawk = "*"
+tar = "*"
+xz = "*"
+gzip = "*"
+coreutils = "*"
+findutils = "*"
+diffutils = "*"
+grep = "*"
+
+[feature.doris-be.tasks]
+doris-be-byacc = { cmd = """bash -c 'set -e
+  BYACC_DIR=doris/thirdparty/byacc
+  if [ -x "$BYACC_DIR/byacc" ]; then echo "byacc already built"; exit 0; fi
+  echo "==> Building byacc from source..."
+  mkdir -p "$BYACC_DIR/src"
+  curl -sL https://invisible-island.net/datafiles/release/byacc.tar.gz | tar xz -C "$BYACC_DIR/src" --strip-components=1
+  cd "$BYACC_DIR/src"
+  ./configure --prefix="$(cd .. && pwd)/install"
+  make -j$(nproc)
+  cp yacc "$(cd .. && pwd)/byacc"
+  echo "==> byacc built: $(cd .. && pwd)/byacc"
+'""", description = "Build byacc from source" }
+
+doris-be-build = { cmd = """bash -c 'set -e
+  echo "==> Patching shebangs for NixOS compatibility..."
+  find doris/thirdparty/apache-doris -name "*.sh" -exec sed -i "s|^#!/bin/bash|#!/usr/bin/env bash|" {} +
+  echo "==> Fixing hardcoded /usr/bin paths in pixi libtool scripts..."
+  export SED="$(which sed)" GREP="$(which grep)" EGREP="$(which grep) -E" FGREP="$(which grep) -F"
+  echo "==> Fixing broken Cwd::cwd in pixi perl (use getcwd instead)..."
+  sed -i -e "s/use Cwd qw (cwd)/use Cwd qw (cwd getcwd)/" -e "s/= cwd;/= getcwd;/" .pixi/envs/doris-be/bin/autoreconf
+  echo "==> Patching thirdparty build for NixOS..."
+  sed -i "s/--with-cpp/--with-cpp --without-c_glib/" doris/thirdparty/apache-doris/thirdparty/build-thirdparty.sh
+  sed -i "s/DFLATBUFFERS_BUILD_TESTS=OFF/DFLATBUFFERS_BUILD_TESTS=OFF -DCMAKE_CXX_STANDARD=17/" doris/thirdparty/apache-doris/thirdparty/build-thirdparty.sh
+  HS_SRC=doris/thirdparty/apache-doris/thirdparty/src
+  if [ ! -d "$HS_SRC/hyperscan-5.4.2" ] && [ -f "$HS_SRC/hyperscan-5.4.2.tar.gz" ]; then
+    tar xzf "$HS_SRC/hyperscan-5.4.2.tar.gz" -C "$HS_SRC"
+  fi
+  if [ -f "$HS_SRC/hyperscan-5.4.2/cmake/build_wrapper.sh" ]; then
+    sed -i "s|-p /tmp ||g" "$HS_SRC/hyperscan-5.4.2/cmake/build_wrapper.sh"
+  fi
+  echo "==> Pre-downloading gRPC third_party deps (googleapis, opencensus-proto, xds)..."
+  GRPC_TP=doris/thirdparty/apache-doris/thirdparty/src/grpc-1.54.3/third_party
+  if [ ! -d "$GRPC_TP/googleapis" ]; then
+    mkdir -p "$GRPC_TP/googleapis"
+    curl -sL https://github.com/googleapis/googleapis/archive/2f9af297c84c55c8b871ba4495e01ade42476c92.tar.gz | tar xz -C "$GRPC_TP/googleapis" --strip-components=1
+  fi
+  if [ ! -d "$GRPC_TP/opencensus-proto/src" ]; then
+    mkdir -p "$GRPC_TP/opencensus-proto/src"
+    curl -sL https://github.com/census-instrumentation/opencensus-proto/archive/v0.3.0.tar.gz | tar xz -C "$GRPC_TP/opencensus-proto/src" --strip-components=2
+  fi
+  if [ ! -d "$GRPC_TP/xds" ]; then
+    mkdir -p "$GRPC_TP/xds"
+    curl -sL https://github.com/cncf/xds/archive/32f1caf87195bf3390061c29f18987e51ca56a88.tar.gz | tar xz -C "$GRPC_TP/xds" --strip-components=1
+  fi
+  export PATH="$(pwd)/doris/thirdparty/byacc:$PATH"
+  export CMAKE_POLICY_VERSION_MINIMUM=3.5
+  mkdir -p /tmp/claude/doris-be-home /tmp/claude/doris-be-tmp
+  export HOME=/tmp/claude/doris-be-home
+  export TMPDIR=/tmp/claude/doris-be-tmp
+  cd doris/thirdparty/apache-doris
+  export DORIS_TOOLCHAIN=gcc
+  export DISABLE_BE_JAVA_EXTENSIONS=ON
+  export DISABLE_BUILD_AZURE=ON
+  bash build.sh --be -j $(nproc)
+'""", depends-on = ["doris-be-byacc"], description = "Build Doris C++ BE from source (includes thirdparty)" }
+
+doris-be-start = { cmd = """bash -c 'set -e
+  BE_DIR=doris/thirdparty/apache-doris/output/be
+  mkdir -p $BE_DIR/storage $BE_DIR/log
+  cd $BE_DIR
+  bin/start_be.sh --console
+'""", depends-on = ["doris-be-build"], description = "Build (if needed) and run Doris BE in foreground" }
+
+doris-be = { cmd = """bash -c 'set -e
+  BE_DIR=doris/thirdparty/apache-doris/output/be
+  mkdir -p $BE_DIR/storage $BE_DIR/log
+  cd $BE_DIR
+  bin/start_be.sh --console
+'""", description = "Run Doris BE in foreground (skip build)" }
+
+doris-be-show-be = { cmd = "bash -c 'mysql -h 127.0.0.1 -P 9030 -u root -e \"SHOW BACKENDS\\G\"'", description = "Show registered backends" }
+doris-be-add-be = { cmd = "bash -c 'mysql -h 127.0.0.1 -P 9030 -u root -e \"ALTER SYSTEM ADD BACKEND \\\"127.0.0.1:9050\\\"\"'", description = "Register regular BE with FE" }
 
 [environments]
 default = ["cuda13"]
 cuda12 = ["cuda12"]
 doris = ["cuda13", "doris"]
 doris-fe = ["doris-fe"]
+doris-be = ["doris-be"]

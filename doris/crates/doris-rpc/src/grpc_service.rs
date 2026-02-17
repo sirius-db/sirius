@@ -16,7 +16,9 @@ use doris_thrift::plan_nodes::{TFileFormatType, TPlanNodeType};
 use result_formatter::result_store::{FinstId, ResultStore};
 use sirius_ffi::SiriusEngine;
 
+use super::exchange_buffer::{ExchangeBuffer, ExchangeKey};
 use super::heartbeat_service::BeState;
+use super::pblock_decoder;
 
 fn ok_status() -> PStatus {
     PStatus {
@@ -339,6 +341,7 @@ fn merge_fragment_plans(
     // Classify fragments.
     let mut leaf_fragments: Vec<&TPipelineFragmentParams> = Vec::new();
     let mut intermediate_fragments: Vec<TPipelineFragmentParams> = Vec::new();
+    let mut exchange_root_fragments: Vec<TPipelineFragmentParams> = Vec::new();
 
     for params in all_params {
         let plan = match params.fragment.as_ref().and_then(|f| f.plan.as_ref()) {
@@ -350,8 +353,9 @@ fn merge_fragment_plans(
             None => continue,
         };
 
-        // Skip result-collector fragments (EXCHANGE at root, 0 children).
+        // Result-collector fragments (EXCHANGE at root, 0 children).
         if root.node_type == TPlanNodeType::EXCHANGE_NODE && root.num_children == 0 {
+            exchange_root_fragments.push(params.clone());
             continue;
         }
 
@@ -365,6 +369,14 @@ fn merge_fragment_plans(
         } else {
             leaf_fragments.push(params);
         }
+    }
+
+    // If there are no leaf fragments to merge with, the exchange-root fragments
+    // are not simple result collectors — they depend on exchange data from
+    // remote BEs. Return them so exec_plan_fragment can handle them via
+    // the async exchange path.
+    if intermediate_fragments.is_empty() && leaf_fragments.is_empty() {
+        return exchange_root_fragments;
     }
 
     // If no intermediate fragments, just return the leaf fragments.
@@ -390,8 +402,14 @@ fn merge_fragment_plans(
             let mut merged_nodes = Vec::new();
             for node in &plan.nodes {
                 if node.node_type == TPlanNodeType::EXCHANGE_NODE && node.num_children == 0 {
-                    // Replace exchange with the leaf plan nodes.
-                    merged_nodes.extend_from_slice(&leaf_nodes);
+                    if !leaf_nodes.is_empty() {
+                        // Replace exchange with the leaf plan nodes.
+                        merged_nodes.extend_from_slice(&leaf_nodes);
+                    } else {
+                        // No leaf to merge: keep the exchange node as-is.
+                        // It will be handled as an unresolved exchange.
+                        merged_nodes.push(node.clone());
+                    }
                 } else {
                     merged_nodes.push(node.clone());
                 }
@@ -424,10 +442,77 @@ fn merge_fragment_plans(
     intermediate_fragments
 }
 
+/// Execution plan: either Substrait bytes or SQL string.
+enum ExecPlan {
+    /// Substrait plan eligible for GPU acceleration (has real data tables).
+    Substrait(Vec<u8>),
+    /// Substrait plan that should only run on CPU (e.g. VirtualTable-only plans).
+    SubstraitCpuOnly(Vec<u8>),
+    Sql(String),
+}
+
+/// Execute a plan via Sirius GPU, falling back to DuckDB CPU.
+fn execute_plan(engine: &SiriusEngine, plan: ExecPlan) -> Result<Vec<u8>, String> {
+    match plan {
+        ExecPlan::Substrait(bytes) => match engine.execute_substrait(&bytes) {
+            Ok(ipc) => {
+                tracing::info!("executed via gpu_processing_substrait");
+                Ok(ipc)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "gpu_processing_substrait failed, falling back to CPU from_substrait");
+                engine.from_substrait(&bytes).map_err(|e| e.to_string())
+            }
+        },
+        ExecPlan::SubstraitCpuOnly(bytes) => {
+            tracing::info!("executing via CPU from_substrait (no data tables, GPU skipped)");
+            engine.from_substrait(&bytes).map_err(|e| e.to_string())
+        }
+        ExecPlan::Sql(sql) => match engine.execute_gpu(&sql) {
+            Ok(ipc) => {
+                tracing::info!("executed via gpu_execution");
+                Ok(ipc)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "gpu_execution failed, falling back to direct SQL");
+                engine.execute_sql(&sql).map_err(|e| e.to_string())
+            }
+        },
+    }
+}
+
+/// Check if a fragment has unresolved EXCHANGE_NODE(0 children) that need
+/// exchange data from other BEs (i.e., not merged with a leaf fragment).
+fn has_unresolved_exchanges(params: &TPipelineFragmentParams) -> Vec<i32> {
+    let mut exchange_node_ids = Vec::new();
+    let plan = match params.fragment.as_ref().and_then(|f| f.plan.as_ref()) {
+        Some(p) => p,
+        None => return exchange_node_ids,
+    };
+    for node in &plan.nodes {
+        if node.node_type == TPlanNodeType::EXCHANGE_NODE && node.num_children == 0 {
+            exchange_node_ids.push(node.node_id);
+        }
+    }
+    exchange_node_ids
+}
+
+/// Get the number of senders for an exchange node from the fragment params.
+fn get_num_senders(params: &TPipelineFragmentParams, node_id: i32) -> u32 {
+    // per_exch_num_senders: map<TPlanNodeId, i32> — gives sender count per exchange node.
+    params
+        .per_exch_num_senders
+        .get(&node_id)
+        .map(|&n| n as u32)
+        .or_else(|| params.num_senders.map(|n| n as u32))
+        .unwrap_or(1)
+}
+
 pub struct PBackendServiceHandler {
     state: Arc<BeState>,
     result_store: ResultStore,
     engine: Option<Arc<Mutex<SiriusEngine>>>,
+    exchange_buffer: ExchangeBuffer,
 }
 
 impl PBackendServiceHandler {
@@ -435,11 +520,13 @@ impl PBackendServiceHandler {
         state: Arc<BeState>,
         result_store: ResultStore,
         engine: Option<Arc<Mutex<SiriusEngine>>>,
+        exchange_buffer: ExchangeBuffer,
     ) -> Self {
         Self {
             state,
             result_store,
             engine,
+            exchange_buffer,
         }
     }
 }
@@ -500,6 +587,173 @@ impl PBackendService for PBackendServiceHandler {
         for params in &merged_params {
             let finst_id = extract_finst_id(params);
 
+            // Check for unresolved exchange nodes (receive data from other BEs).
+            let exchange_node_ids = has_unresolved_exchanges(params);
+
+            if !exchange_node_ids.is_empty() {
+                // This fragment depends on exchange data from other BEs.
+                // Register exchange entries and spawn an async task to wait.
+                let query_id = (params.query_id.hi, params.query_id.lo);
+                let mut notifies = Vec::new();
+                for &node_id in &exchange_node_ids {
+                    let key = ExchangeKey { query_id, node_id };
+                    let num_senders = get_num_senders(params, node_id);
+                    info!(
+                        ?query_id, node_id, num_senders,
+                        "registering exchange for fragment"
+                    );
+                    let notify = self.exchange_buffer.register(key, num_senders);
+                    notifies.push(notify);
+                }
+
+                let params = params.clone();
+                let engine = match &self.engine {
+                    Some(e) => e.clone(),
+                    None => {
+                        return Ok(Response::new(PExecPlanFragmentResult {
+                            status: err_status("engine not initialized"),
+                            ..Default::default()
+                        }));
+                    }
+                };
+                let store = self.result_store.clone();
+                let buffer = self.exchange_buffer.clone();
+
+                // Spawn async task: wait for exchange data, decode, load, execute.
+                tokio::spawn(async move {
+                    // Wait for all exchange nodes to receive all their data.
+                    for notify in &notifies {
+                        notify.notified().await;
+                    }
+                    info!(%finst_id, "all exchange data received, proceeding with execution");
+
+                    // Decode PBlocks and register exchange tables.
+                    let mut table_schemas = std::collections::HashMap::<String, Vec<String>>::new();
+                    for &node_id in &exchange_node_ids {
+                        let key = ExchangeKey { query_id, node_id };
+                        let blocks = buffer.take(&key);
+                        let table_name = format!(
+                            "__EXCHANGE_TABLE_{}",
+                            node_id
+                        );
+
+                        if blocks.is_empty() {
+                            info!(table = %table_name, "exchange has no blocks, creating empty table");
+                            continue;
+                        }
+
+                        // Extract column metadata from the first block.
+                        let col_info = pblock_decoder::extract_column_info(
+                            &blocks[0].column_metas,
+                        );
+                        let column_names: Vec<String> =
+                            col_info.iter().map(|(n, _)| n.clone()).collect();
+                        let column_types_sql: Vec<String> =
+                            col_info.iter().map(|(_, t)| t.clone()).collect();
+
+                        // Decode all blocks.
+                        let decoded = match pblock_decoder::decode_pblocks(&blocks) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                warn!(error = %e, table = %table_name, "failed to decode PBlocks");
+                                return;
+                            }
+                        };
+
+                        info!(
+                            table = %table_name,
+                            num_rows = decoded.num_rows,
+                            num_cols = decoded.columns.len(),
+                            "decoded exchange PBlocks"
+                        );
+
+                        // Convert to SQL values for DuckDB insertion.
+                        let column_data_csv: Vec<Vec<String>> = decoded
+                            .columns
+                            .iter()
+                            .map(|col| pblock_decoder::column_to_sql_values(col, decoded.num_rows))
+                            .collect();
+
+                        // Register in DuckDB engine.
+                        let engine_guard = engine.lock().unwrap();
+                        if let Err(e) = engine_guard.register_exchange_table(
+                            &table_name,
+                            &column_names,
+                            &column_types_sql,
+                            decoded.num_rows,
+                            &column_data_csv,
+                        ) {
+                            warn!(error = %e, table = %table_name, "failed to register exchange table");
+                            return;
+                        }
+
+                        // Get actual columns from DuckDB for Substrait schema.
+                        match engine_guard.get_table_columns(&table_name) {
+                            Ok(cols) => {
+                                table_schemas.insert(table_name, cols);
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "failed to get exchange table columns");
+                            }
+                        }
+                        drop(engine_guard);
+                    }
+
+                    // Also register any file tables.
+                    let file_tables = extract_file_tables(&params);
+                    if !file_tables.is_empty() {
+                        let engine_guard = engine.lock().unwrap();
+                        for ft in &file_tables {
+                            let empty: Vec<String> = vec![];
+                            if let Err(e) = engine_guard.register_file_table(
+                                &ft.table_name, &ft.file_path, &ft.format, &empty,
+                            ) {
+                                warn!(error = %e, table = %ft.table_name, "failed to register file table");
+                                return;
+                            }
+                            if let Ok(columns) = engine_guard.get_table_columns(&ft.table_name) {
+                                table_schemas.insert(ft.table_name.clone(), columns);
+                            }
+                        }
+                        drop(engine_guard);
+                    }
+
+                    // Translate and execute.
+                    let exec_plan = match plan_translator::translate_fragment(&params, &table_schemas) {
+                        Ok(bytes) => ExecPlan::Substrait(bytes),
+                        Err(e) => {
+                            warn!(error = %e, "Substrait translation failed for exchange fragment");
+                            match plan_translator::translate_fragment_to_sql(&params) {
+                                Ok(sql) => ExecPlan::Sql(sql),
+                                Err(e2) => {
+                                    warn!(error = %e2, "SQL translation also failed");
+                                    return;
+                                }
+                            }
+                        }
+                    };
+
+                    let exec_result = tokio::task::spawn_blocking(move || -> Result<(), String> {
+                        let engine = engine.lock().unwrap();
+                        let ipc_bytes = execute_plan(&engine, exec_plan)?;
+                        store.store_ipc_result(finst_id, &ipc_bytes)?;
+                        Ok(())
+                    })
+                    .await;
+
+                    match exec_result {
+                        Ok(Ok(())) => info!(%finst_id, "exchange fragment execution complete"),
+                        Ok(Err(e)) => warn!(error = %e, %finst_id, "exchange fragment execution failed"),
+                        Err(e) => warn!(error = %e, "exchange fragment spawn_blocking panicked"),
+                    }
+                });
+
+                // Return immediately — execution happens asynchronously.
+                continue;
+            }
+
+            // Standard synchronous execution path (no unresolved exchanges).
+
             // Step 1: Register file-backed tables in DuckDB with SELECT * (all columns).
             // Step 2: Get actual column names from DuckDB.
             // Step 3: Pass those as table_schemas to the Substrait translator.
@@ -541,15 +795,17 @@ impl PBackendService for PBackendServiceHandler {
             }
 
             // Try Substrait translation first, fall back to SQL.
-            enum ExecPlan {
-                Substrait(Vec<u8>),
-                Sql(String),
-            }
-
+            // Constant-only queries (no data tables) use CPU-only Substrait to avoid
+            // GPU engine bugs with VirtualTable plans.
+            let has_data_tables = !file_tables.is_empty() || !table_schemas.is_empty();
             let exec_plan = match plan_translator::translate_fragment(params, &table_schemas) {
                 Ok(substrait_bytes) => {
-                    info!(bytes = substrait_bytes.len(), "translated to Substrait");
-                    ExecPlan::Substrait(substrait_bytes)
+                    info!(bytes = substrait_bytes.len(), has_data_tables, "translated to Substrait");
+                    if has_data_tables {
+                        ExecPlan::Substrait(substrait_bytes)
+                    } else {
+                        ExecPlan::SubstraitCpuOnly(substrait_bytes)
+                    }
                 }
                 Err(e) => {
                     warn!(error = %e, "Substrait translation failed, trying SQL fallback");
@@ -584,33 +840,7 @@ impl PBackendService for PBackendServiceHandler {
             // Sirius/DuckDB execution is blocking — run off the async runtime.
             let exec_result = tokio::task::spawn_blocking(move || -> Result<(), String> {
                 let engine = engine.lock().unwrap();
-                let ipc_bytes = match exec_plan {
-                    ExecPlan::Substrait(bytes) => {
-                        match engine.execute_substrait(&bytes) {
-                            Ok(ipc) => {
-                                tracing::info!("executed via gpu_processing_substrait");
-                                ipc
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, "gpu_processing_substrait failed, falling back to CPU from_substrait");
-                                engine.from_substrait(&bytes)
-                                    .map_err(|e| e.to_string())?
-                            }
-                        }
-                    }
-                    ExecPlan::Sql(sql) => {
-                        match engine.execute_gpu(&sql) {
-                            Ok(ipc) => {
-                                tracing::info!("executed via gpu_execution");
-                                ipc
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, "gpu_execution failed, falling back to direct SQL");
-                                engine.execute_sql(&sql).map_err(|e| e.to_string())?
-                            }
-                        }
-                    }
-                };
+                let ipc_bytes = execute_plan(&engine, exec_plan)?;
                 store.store_ipc_result(finst_id, &ipc_bytes)?;
                 Ok(())
             })
@@ -678,7 +908,51 @@ impl PBackendService for PBackendServiceHandler {
         request: Request<PTransmitDataParams>,
     ) -> Result<Response<PTransmitDataResult>, Status> {
         let req = request.into_inner();
-        info!(query_id = ?req.query_id, sender_id = req.sender_id, eos = req.eos, "transmit_block");
+        let query_id = req
+            .query_id
+            .as_ref()
+            .map(|id| (id.hi, id.lo))
+            .unwrap_or((0, 0));
+        let key = ExchangeKey {
+            query_id,
+            node_id: req.node_id,
+        };
+
+        // Count blocks being buffered.
+        let mut block_count = 0u32;
+
+        // Buffer single block (old style).
+        if let Some(block) = req.block {
+            block_count += 1;
+            self.exchange_buffer
+                .add_block(&key, req.sender_id, Some(block), false);
+        }
+
+        // Buffer multiple blocks (new style).
+        for block in req.blocks {
+            block_count += 1;
+            self.exchange_buffer
+                .add_block(&key, req.sender_id, Some(block), false);
+        }
+
+        // Signal EOS for this sender.
+        let all_done = if req.eos {
+            self.exchange_buffer
+                .add_block(&key, req.sender_id, None, true)
+        } else {
+            false
+        };
+
+        info!(
+            ?query_id,
+            node_id = req.node_id,
+            sender_id = req.sender_id,
+            block_count,
+            eos = req.eos,
+            all_done,
+            "transmit_block"
+        );
+
         Ok(Response::new(PTransmitDataResult {
             status: Some(ok_status()),
             ..Default::default()
@@ -1012,11 +1286,12 @@ pub async fn start_grpc_server(
     state: Arc<BeState>,
     result_store: ResultStore,
     engine: Option<Arc<Mutex<SiriusEngine>>>,
+    exchange_buffer: ExchangeBuffer,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use doris_proto::doris::p_backend_service_server::PBackendServiceServer;
 
     let addr = listen_addr.parse()?;
-    let handler = PBackendServiceHandler::new(state, result_store, engine);
+    let handler = PBackendServiceHandler::new(state, result_store, engine, exchange_buffer);
 
     info!(addr = listen_addr, "starting PBackendService gRPC server");
 

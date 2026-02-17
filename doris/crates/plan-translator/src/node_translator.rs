@@ -76,10 +76,42 @@ fn translate_node(
         let child = children.into_iter().next().unwrap();
         return apply_conjuncts(child, node, desc, registry);
     } else if node.node_type == TPlanNodeType::EXCHANGE_NODE {
-        // Exchange nodes receive data from other fragments. For single-fragment
-        // plans, just pass through the child.
+        // Exchange nodes receive data from other fragments.
         if children.len() == 1 {
+            // Single-fragment plan: pass through the child.
             return Ok(children.into_iter().next().unwrap());
+        }
+        if children.is_empty() {
+            // No children: this is an exchange receiver. The data will be
+            // loaded into a table named "__EXCHANGE_TABLE_{node_id}" by the
+            // exchange handling code in grpc_service.rs. The full table name
+            // (with query_id prefix) is set at execution time; the plan
+            // translator uses the table_schemas map to get the actual name.
+            let exchange_table_name = format!("__EXCHANGE_TABLE_{}", node.node_id);
+
+            // Build schema from the exchange node's output tuple.
+            let tuple_id = *node
+                .row_tuples
+                .first()
+                .context("EXCHANGE_NODE has no row_tuples")?;
+            let base_schema = if let Some(columns) = table_schemas.get(&exchange_table_name) {
+                scan_translator::build_exchange_schema(columns, desc)?
+            } else {
+                desc.table_named_struct(tuple_id)?
+            };
+
+            return Ok(Rel {
+                rel_type: Some(rel::RelType::Read(Box::new(substrait::proto::ReadRel {
+                    base_schema: Some(base_schema),
+                    read_type: Some(substrait::proto::read_rel::ReadType::NamedTable(
+                        substrait::proto::read_rel::NamedTable {
+                            names: vec![exchange_table_name],
+                            ..Default::default()
+                        },
+                    )),
+                    ..Default::default()
+                }))),
+            });
         }
         bail!("EXCHANGE_NODE with {} children not yet supported", children.len())
     } else if node.node_type == TPlanNodeType::EMPTY_SET_NODE {

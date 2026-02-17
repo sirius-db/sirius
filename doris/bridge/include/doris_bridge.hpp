@@ -30,4 +30,34 @@ rust::Vec<uint8_t> execute_substrait_plan(
 /// Get the number of rows in the last execution result (for diagnostics).
 int64_t last_result_rows(const BridgeContext& ctx);
 
+/// Descriptor for a column to be registered as an exchange table.
+struct ExchangeColumnDesc {
+    rust::String name;
+    int32_t type_id;       // PGenericType::TypeId value
+    bool is_nullable;
+    uint32_t precision;    // for decimals
+    uint32_t scale;        // for decimals
+};
+
+/// Register exchange data as a GPU table in GPUBufferManager.
+///
+/// Copies decoded PBlock column data to GPU memory and creates a
+/// GPUIntermediateRelation that the Substrait plan can reference.
+///
+/// @param ctx            Engine context (unused, but kept for API consistency)
+/// @param table_name     Table name for GPUBufferManager (will be uppercased)
+/// @param num_rows       Number of rows across all columns
+/// @param columns        Column descriptors (type, name, nullable)
+/// @param column_data    Raw column data per column (host memory)
+/// @param null_masks     Null mask per column (byte-per-row, 0=valid, 1=null)
+/// @param string_offsets String offset arrays per column (N+1 entries)
+void register_exchange_table(
+    const BridgeContext& ctx,
+    rust::Str table_name,
+    uint32_t num_rows,
+    rust::Slice<const ExchangeColumnDesc> columns,
+    rust::Slice<const rust::Vec<uint8_t>> column_data,
+    rust::Slice<const rust::Vec<uint8_t>> null_masks,
+    rust::Slice<const rust::Vec<uint64_t>> string_offsets);
+
 }  // namespace doris_bridge

@@ -288,6 +288,88 @@ impl SiriusEngine {
         }
     }
 
+    /// Register exchange data as a DuckDB table.
+    ///
+    /// Creates a table from decoded PBlock column data so that the Substrait plan
+    /// can reference it via a NamedTable ReadRel. On CPU builds, this creates a
+    /// real DuckDB table. With GPU, this would go through the C++ bridge to
+    /// `GPUBufferManager::tables`.
+    pub fn register_exchange_table(
+        &self,
+        table_name: &str,
+        column_names: &[String],
+        column_types_sql: &[String],
+        num_rows: u32,
+        column_data_csv: &[Vec<String>],
+    ) -> Result<(), EngineError> {
+        #[cfg(feature = "duckdb-bundled")]
+        {
+            if column_names.is_empty() || num_rows == 0 {
+                // Create an empty table.
+                let cols: Vec<String> = column_names
+                    .iter()
+                    .zip(column_types_sql.iter())
+                    .map(|(n, t)| format!("\"{}\" {}", n, t))
+                    .collect();
+                let sql = format!(
+                    "CREATE OR REPLACE TABLE \"{}\" ({})",
+                    table_name,
+                    cols.join(", ")
+                );
+                self.conn
+                    .execute_batch(&sql)
+                    .map_err(|e| EngineError::ExecFailed(format!("register_exchange_table: {e}")))?;
+                return Ok(());
+            }
+
+            // Build a VALUES-based INSERT to load the data.
+            let cols: Vec<String> = column_names
+                .iter()
+                .zip(column_types_sql.iter())
+                .map(|(n, t)| format!("\"{}\" {}", n, t))
+                .collect();
+            let create_sql = format!(
+                "CREATE OR REPLACE TABLE \"{}\" ({})",
+                table_name,
+                cols.join(", ")
+            );
+            self.conn
+                .execute_batch(&create_sql)
+                .map_err(|e| EngineError::ExecFailed(format!("register_exchange_table create: {e}")))?;
+
+            // Insert in batches to avoid overly large SQL statements.
+            let batch_size = 1000usize;
+            let num_cols = column_names.len();
+            for batch_start in (0..num_rows as usize).step_by(batch_size) {
+                let batch_end = (batch_start + batch_size).min(num_rows as usize);
+                let mut rows = Vec::new();
+                for row in batch_start..batch_end {
+                    let mut vals = Vec::new();
+                    for col in 0..num_cols {
+                        vals.push(column_data_csv[col][row].clone());
+                    }
+                    rows.push(format!("({})", vals.join(", ")));
+                }
+                let insert_sql = format!(
+                    "INSERT INTO \"{}\" VALUES {}",
+                    table_name,
+                    rows.join(", ")
+                );
+                self.conn
+                    .execute_batch(&insert_sql)
+                    .map_err(|e| EngineError::ExecFailed(format!("register_exchange_table insert: {e}")))?;
+            }
+
+            Ok(())
+        }
+
+        #[cfg(not(feature = "duckdb-bundled"))]
+        {
+            let _ = (table_name, column_names, column_types_sql, num_rows, column_data_csv);
+            Err(EngineError::NotCompiled)
+        }
+    }
+
     /// Initialize GPU buffer manager. Must be called before `execute_gpu`.
     pub fn init_gpu_buffers(&self, cache_size: &str, processing_size: &str) -> Result<(), EngineError> {
         #[cfg(feature = "duckdb-bundled")]

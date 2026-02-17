@@ -19,3 +19,6 @@ thiserror.workspace = true
 dashmap.workspace = true
 arrow.workspace = true
 substrait.workspace = true
+snap = "1"
+lz4_flex = "0.11"
+zstd = "0.13"

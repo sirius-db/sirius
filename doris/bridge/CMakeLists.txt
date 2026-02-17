@@ -6,7 +6,7 @@
 # =============================================================================
 
 cmake_minimum_required(VERSION 3.24)
-project(doris_bridge LANGUAGES CXX)
+project(doris_bridge LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -92,6 +92,10 @@ endif()
 if(ARROW_LIB)
     target_link_libraries(doris_bridge PRIVATE ${ARROW_LIB})
 endif()
+
+# CUDA runtime (for cudaMemcpy, cudaMalloc in register_exchange_table)
+find_package(CUDAToolkit REQUIRED)
+target_link_libraries(doris_bridge PRIVATE CUDA::cudart)
 
 # ---------------------------------------------------------------------------
 # Install

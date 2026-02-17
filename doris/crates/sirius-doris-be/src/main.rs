@@ -110,9 +110,10 @@ fn main() {
     let grpc_state = state.clone();
     let grpc_store = result_store.clone();
     let flight_store = result_store.clone();
+    let exchange_buffer = doris_rpc::exchange_buffer::ExchangeBuffer::new();
 
     let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
-    rt.block_on(run(config, version, grpc_addr, flight_addr, grpc_state, grpc_store, flight_store, engine));
+    rt.block_on(run(config, version, grpc_addr, flight_addr, grpc_state, grpc_store, flight_store, engine, exchange_buffer));
 }
 
 #[instrument(name = "sirius_doris_be", skip_all, fields(
@@ -132,6 +133,7 @@ async fn run(
     grpc_store: ResultStore,
     flight_store: ResultStore,
     engine: Option<Arc<Mutex<SiriusEngine>>>,
+    exchange_buffer: doris_rpc::exchange_buffer::ExchangeBuffer,
 ) {
     if let Some(fe_addr) = &config.fe {
         if let Err(e) = register_with_fe(fe_addr, config.heartbeat_port).await {
@@ -148,7 +150,7 @@ async fn run(
     });
 
     if let Err(e) =
-        doris_rpc::grpc_service::start_grpc_server(&grpc_addr, grpc_state, grpc_store, engine).await
+        doris_rpc::grpc_service::start_grpc_server(&grpc_addr, grpc_state, grpc_store, engine, exchange_buffer).await
     {
         error!(error = %e, "PBackendService gRPC server exited with error");
     }
