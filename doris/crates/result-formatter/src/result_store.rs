@@ -13,6 +13,7 @@ use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::{IpcWriteOptions, StreamWriter};
 use arrow::record_batch::RecordBatch;
 use dashmap::DashMap;
+use tokio::sync::Notify;
 use tracing::{debug, warn};
 
 /// Unique identifier for a fragment instance result, matching Doris PUniqueId.
@@ -125,12 +126,15 @@ fn mysql_encode_string(s: &str, buf: &mut Vec<u8>) {
 #[derive(Clone)]
 pub struct ResultStore {
     results: Arc<DashMap<FinstId, Arc<ResultEntry>>>,
+    /// Notifies waiters when any result is stored.
+    notify: Arc<Notify>,
 }
 
 impl ResultStore {
     pub fn new() -> Self {
         Self {
             results: Arc::new(DashMap::new()),
+            notify: Arc::new(Notify::new()),
         }
     }
 
@@ -153,6 +157,7 @@ impl ResultStore {
         debug!(%id, batches = batches.len(), "stored result");
         self.results
             .insert(id, Arc::new(ResultEntry { schema, batches }));
+        self.notify.notify_waiters();
         Ok(())
     }
 
@@ -161,11 +166,30 @@ impl ResultStore {
         debug!(%id, batch_count = batches.len(), "stored result");
         self.results
             .insert(id, Arc::new(ResultEntry { schema, batches }));
+        self.notify.notify_waiters();
     }
 
     /// Get a result entry by fragment instance ID.
     pub fn get(&self, id: &FinstId) -> Option<Arc<ResultEntry>> {
         self.results.get(id).map(|entry| entry.value().clone())
+    }
+
+    /// Wait for a result to become available, with timeout.
+    pub async fn wait_for(&self, id: &FinstId, timeout: std::time::Duration) -> Option<Arc<ResultEntry>> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Some(entry) = self.get(id) {
+                return Some(entry);
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            tokio::select! {
+                _ = self.notify.notified() => {}
+                _ = tokio::time::sleep(remaining) => { return self.get(id); }
+            }
+        }
     }
 
     /// Remove a result (after it has been consumed or cancelled).

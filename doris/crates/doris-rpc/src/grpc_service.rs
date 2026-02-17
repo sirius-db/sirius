@@ -165,12 +165,20 @@ fn serialize_result_batch(rows: &[Vec<u8>], packet_seq: i64) -> Result<Vec<u8>, 
 
 /// Extract FinstId for result storage from fragment params.
 ///
-/// With `enable_parallel_result_sink` (default: true), the FE uses the `query_id`
-/// to fetch results, not the fragment_instance_id. So we always use query_id.
+/// The FE uses the result-sink fragment's `fragment_instance_id` (from
+/// `local_params[0]`) to call `fetch_data`, not the query-level `query_id`.
+/// Fall back to `query_id` if `local_params` is empty.
 fn extract_finst_id(params: &TPipelineFragmentParams) -> FinstId {
-    FinstId {
-        hi: params.query_id.hi,
-        lo: params.query_id.lo,
+    if let Some(lp) = params.local_params.as_ref().and_then(|v| v.first()) {
+        FinstId {
+            hi: lp.fragment_instance_id.hi,
+            lo: lp.fragment_instance_id.lo,
+        }
+    } else {
+        FinstId {
+            hi: params.query_id.hi,
+            lo: params.query_id.lo,
+        }
     }
 }
 
@@ -1097,10 +1105,11 @@ impl PBackendService for PBackendServiceHandler {
         };
         info!(%finst_id, "fetch_data");
 
-        let entry = match self.result_store.get(&finst_id) {
+        // Wait for the result — execution may still be in progress when FE calls fetch_data.
+        let entry = match self.result_store.wait_for(&finst_id, std::time::Duration::from_secs(60)).await {
             Some(e) => e,
             None => {
-                warn!(%finst_id, "fetch_data: result not found");
+                warn!(%finst_id, "fetch_data: result not found after 60s timeout");
                 return Ok(Response::new(PFetchDataResult {
                     status: err_status("result not found"),
                     eos: Some(true),

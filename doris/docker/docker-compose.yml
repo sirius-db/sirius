@@ -56,13 +56,15 @@ services:
       doris-fe:
         condition: service_healthy
     environment:
-      - LD_LIBRARY_PATH=/opt/nix-glibc:/opt/pixi-lib:/opt/pixi-default/lib
+      - LD_LIBRARY_PATH=/opt/nix-glibc:/opt/pixi-lib:/opt/pixi-default/lib:/usr/local/nvidia/lib64
       - RUST_LOG=info
       - SIRIUS_EXTENSION_DIR=/opt/extensions
     volumes:
       - /nix/store/wb6rhpznjfczwlwx23zmdrrw74bayxw4-glibc-2.42-47/lib:/opt/nix-glibc:ro
       - ../../.pixi/envs/doris/lib:/opt/pixi-lib:ro
       - ../../.pixi/envs/default:/opt/pixi-default:ro
+      # Mount at the host path too — the sirius extension has a hardcoded RPATH.
+      - ../../.pixi/envs/default/lib:/home/matthijs/sirius/.pixi/envs/default/lib:ro
       - ../target/release/sirius-doris-be:/opt/sirius-doris-be:ro
       - ../../build/release/extension/sirius/sirius.duckdb_extension:/opt/extensions/sirius.duckdb_extension:ro
       - ../thirdparty/duckdb-substrait-extension/build/release/extension/substrait/substrait.duckdb_extension:/opt/extensions/substrait.duckdb_extension:ro
@@ -80,8 +82,9 @@ services:
       resources:
         reservations:
           devices:
-            - driver: nvidia
-              count: all
+            - driver: cdi
+              device_ids:
+                - nvidia.com/gpu=all
               capabilities: [gpu]
     networks:
       doris_net:
