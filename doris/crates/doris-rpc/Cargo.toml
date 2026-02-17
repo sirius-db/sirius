@@ -22,3 +22,4 @@ substrait.workspace = true
 snap = "1"
 lz4_flex = "0.11"
 zstd = "0.13"
+tokio-stream = "0.1"

@@ -1,11 +1,28 @@
 //! PBlock decoder: decode Doris PBlock binary format into per-column data.
 //!
-//! PBlock.column_values format (after decompression):
-//! 1. `uint32 num_rows` (first 4 bytes LE)
-//! 2. Per column (in column_metas order):
-//!    - If nullable: N bytes null map (0=not-null, 1=null)
-//!    - Fixed-width: N * sizeof(type) bytes LE
-//!    - STRING: `uint64 data_len` + `data[data_len]` + `uint64 offsets[N+1]`
+//! Doris column_values format (after block-level decompression):
+//!   No block-level header — columns are serialized consecutively.
+//!
+//! Per column (type->serialize):
+//!   Header: const_flag(1 byte bool) + row_num(8 bytes size_t) + real_saved_num(8 bytes size_t)
+//!     If const: real_saved_num = 1, data is one element (expanded on decode)
+//!     Else:     real_saved_num = row_num
+//!
+//!   Fixed-width (DataTypeNumberBase):
+//!     If mem_size <= 256: raw data (real_saved_num * sizeof(T))
+//!     Else: encode_size(8 bytes) + StreamVByte encoded data
+//!
+//!   STRING (DataTypeString):
+//!     Offsets: If N*4 <= 256: raw UInt32[N]; else encode_size(8) + StreamVByte
+//!     value_len(8 bytes size_t) + chars:
+//!       If value_len <= 256: raw chars
+//!       Else: encode_size(8) + LZ4 compressed chars
+//!     Doris ColumnString offsets are UInt32 cumulative end positions (including \0 after each string)
+//!
+//!   NULLABLE (DataTypeNullable):
+//!     Header (own const_flag + row_num + real_saved_num)
+//!     null_map: If N <= 256: raw bytes; else encode_size(8) + StreamVByte
+//!     Then: nested type serialize (with its OWN header + data)
 
 use doris_proto::doris::p_generic_type::TypeId;
 use doris_proto::doris::segment_v2::CompressionTypePb;
@@ -19,11 +36,11 @@ pub struct DecodedColumn {
     pub col_name: String,
     /// Whether this column is nullable.
     pub is_nullable: bool,
-    /// Raw column data bytes.
+    /// Raw column data bytes (fixed-width: N*width; string: concatenated without \0).
     pub data: Vec<u8>,
     /// Null mask (one byte per row: 0=not-null, 1=null). Only if nullable.
     pub null_mask: Option<Vec<u8>>,
-    /// String offsets (N+1 entries for N rows). Only for STRING/BYTES types.
+    /// String offsets (N+1 entries for N rows: [0, end_0, end_1, ...]). Only for STRING types.
     pub offsets: Option<Vec<u64>>,
     /// Decimal precision (if applicable).
     pub precision: u32,
@@ -35,6 +52,18 @@ pub struct DecodedColumn {
 pub struct DecodedColumns {
     pub columns: Vec<DecodedColumn>,
     pub num_rows: u32,
+}
+
+// Per-column header: const_flag(1) + row_num(8) + real_saved_num(8)
+const COL_HEADER_SIZE: usize = 1 + 8 + 8;
+
+// Doris SERIALIZED_MEM_SIZE_LIMIT: above this, per-column data is compressed
+const SERIALIZED_MEM_SIZE_LIMIT: usize = 256;
+
+struct ColHeader {
+    _is_const: bool,
+    row_num: u64,
+    real_saved_num: u64,
 }
 
 /// Return the byte width of a fixed-width PGenericType, or 0 for variable-width.
@@ -75,6 +104,10 @@ fn is_string_type(type_id: i32) -> bool {
         || type_id == TypeId::Variant as i32
 }
 
+fn is_fixed_length_object(type_id: i32) -> bool {
+    type_id == TypeId::Fixedlengthobject as i32
+}
+
 /// Decompress PBlock column_values based on compression_type.
 fn decompress(
     data: &[u8],
@@ -107,6 +140,382 @@ fn decompress(
     }
 }
 
+/// Read the per-column header: const_flag(1) + row_num(8) + real_saved_num(8).
+fn read_col_header(data: &[u8], offset: &mut usize) -> Result<ColHeader, String> {
+    if *offset + COL_HEADER_SIZE > data.len() {
+        return Err(format!(
+            "truncated column header at offset {}, need {} bytes, have {}",
+            *offset,
+            COL_HEADER_SIZE,
+            data.len() - *offset
+        ));
+    }
+    let is_const = data[*offset] != 0;
+    *offset += 1;
+    let row_num = u64::from_le_bytes(data[*offset..*offset + 8].try_into().unwrap());
+    *offset += 8;
+    let real_saved_num = u64::from_le_bytes(data[*offset..*offset + 8].try_into().unwrap());
+    *offset += 8;
+    Ok(ColHeader {
+        _is_const: is_const,
+        row_num,
+        real_saved_num,
+    })
+}
+
+/// Read raw bytes (for data ≤ SERIALIZED_MEM_SIZE_LIMIT).
+fn read_raw_or_fail(
+    data: &[u8],
+    offset: &mut usize,
+    mem_size: usize,
+    context: &str,
+) -> Result<Vec<u8>, String> {
+    if mem_size <= SERIALIZED_MEM_SIZE_LIMIT {
+        if *offset + mem_size > data.len() {
+            return Err(format!(
+                "truncated {context} at offset {}: need {mem_size}, have {}",
+                *offset,
+                data.len() - *offset
+            ));
+        }
+        let result = data[*offset..*offset + mem_size].to_vec();
+        *offset += mem_size;
+        Ok(result)
+    } else {
+        // StreamVByte encoded: read encode_size(8 bytes) + encoded data
+        if *offset + 8 > data.len() {
+            return Err(format!(
+                "truncated {context} encode_size at offset {}",
+                *offset
+            ));
+        }
+        let encode_size =
+            u64::from_le_bytes(data[*offset..*offset + 8].try_into().unwrap()) as usize;
+        *offset += 8;
+        if *offset + encode_size > data.len() {
+            return Err(format!(
+                "truncated {context} encoded data at offset {}: need {encode_size}, have {}",
+                *offset,
+                data.len() - *offset
+            ));
+        }
+        // StreamVByte decoding: treat as array of uint32 values
+        let num_u32 = (mem_size + 3) / 4; // upper_int32
+        let decoded = streamvbyte_decode(&data[*offset..*offset + encode_size], num_u32)?;
+        *offset += encode_size;
+        // Convert Vec<u32> back to raw bytes (LE)
+        let mut result = Vec::with_capacity(mem_size);
+        for val in &decoded {
+            result.extend_from_slice(&val.to_le_bytes());
+        }
+        result.truncate(mem_size);
+        Ok(result)
+    }
+}
+
+/// Read string chars: value_len(8) + raw or LZ4 compressed chars.
+fn read_string_chars(data: &[u8], offset: &mut usize) -> Result<Vec<u8>, String> {
+    if *offset + 8 > data.len() {
+        return Err(format!(
+            "truncated string value_len at offset {}",
+            *offset
+        ));
+    }
+    let value_len = u64::from_le_bytes(data[*offset..*offset + 8].try_into().unwrap()) as usize;
+    *offset += 8;
+
+    if value_len <= SERIALIZED_MEM_SIZE_LIMIT {
+        if *offset + value_len > data.len() {
+            return Err(format!(
+                "truncated string chars at offset {}: need {value_len}, have {}",
+                *offset,
+                data.len() - *offset
+            ));
+        }
+        let chars = data[*offset..*offset + value_len].to_vec();
+        *offset += value_len;
+        Ok(chars)
+    } else {
+        // LZ4 compressed: encode_size(8) + compressed data
+        if *offset + 8 > data.len() {
+            return Err(format!(
+                "truncated string LZ4 encode_size at offset {}",
+                *offset
+            ));
+        }
+        let encode_size =
+            u64::from_le_bytes(data[*offset..*offset + 8].try_into().unwrap()) as usize;
+        *offset += 8;
+        if *offset + encode_size > data.len() {
+            return Err(format!(
+                "truncated string LZ4 data at offset {}: need {encode_size}, have {}",
+                *offset,
+                data.len() - *offset
+            ));
+        }
+        let chars = lz4_flex::decompress(&data[*offset..*offset + encode_size], value_len)
+            .map_err(|e| format!("string LZ4 decompress: {e}"))?;
+        *offset += encode_size;
+        Ok(chars)
+    }
+}
+
+/// Decode a fixed-width column's data (after header).
+fn decode_fixed_data(
+    data: &[u8],
+    offset: &mut usize,
+    real_saved_num: u64,
+    row_num: u64,
+    width: usize,
+    col_name: &str,
+) -> Result<Vec<u8>, String> {
+    let n = real_saved_num as usize;
+    let mem_size = n * width;
+    let raw = read_raw_or_fail(data, offset, mem_size, &format!("fixed column '{col_name}'"))?;
+
+    // Expand const column: replicate single value to row_num
+    if real_saved_num == 1 && row_num > 1 {
+        let mut expanded = Vec::with_capacity(row_num as usize * width);
+        for _ in 0..row_num {
+            expanded.extend_from_slice(&raw[..width]);
+        }
+        Ok(expanded)
+    } else {
+        Ok(raw)
+    }
+}
+
+/// Decode a string column's data (after header).
+/// Returns (clean_data, clean_offsets) where offsets are N+1 start positions.
+fn decode_string_data(
+    data: &[u8],
+    offset: &mut usize,
+    real_saved_num: u64,
+    row_num: u64,
+    col_name: &str,
+) -> Result<(Vec<u8>, Vec<u64>), String> {
+    let n = real_saved_num as usize;
+
+    // Read offsets: N * sizeof(UInt32) = N * 4 bytes
+    let offsets_mem_size = n * 4;
+    let raw_offsets =
+        read_raw_or_fail(data, offset, offsets_mem_size, &format!("string offsets '{col_name}'"))?;
+
+    // Parse UInt32 offsets
+    let mut doris_offsets = Vec::with_capacity(n);
+    for i in 0..n {
+        let o = u32::from_le_bytes(raw_offsets[i * 4..i * 4 + 4].try_into().unwrap());
+        doris_offsets.push(o as usize);
+    }
+
+    // Read chars: value_len(8) + raw/LZ4 chars
+    let chars = read_string_chars(data, offset)?;
+
+    // Convert Doris offsets to clean format:
+    // Doris offsets[i] = end of string i in chars (AFTER \0 terminator)
+    // Our format: N+1 offsets [0, len0, len0+len1, ...] into clean_data (no \0)
+    let actual_n = if real_saved_num == 1 && row_num > 1 {
+        // Const: expand below
+        real_saved_num as usize
+    } else {
+        n
+    };
+
+    let mut clean_data = Vec::new();
+    let mut clean_offsets = vec![0u64];
+    for i in 0..actual_n {
+        let start = if i == 0 { 0 } else { doris_offsets[i - 1] };
+        let end_with_null = doris_offsets[i];
+        // String bytes are between start and end_with_null-1 (skip the \0)
+        let end = if end_with_null > start { end_with_null - 1 } else { start };
+        if end > start && end <= chars.len() {
+            clean_data.extend_from_slice(&chars[start..end]);
+        }
+        clean_offsets.push(clean_data.len() as u64);
+    }
+
+    // Expand const column: replicate single string row_num times
+    if real_saved_num == 1 && row_num > 1 {
+        let single_data = clean_data.clone();
+        // Already have [0, single_data.len()] for one row
+        for _ in 1..row_num {
+            clean_data.extend_from_slice(&single_data);
+            clean_offsets.push(clean_data.len() as u64);
+        }
+    }
+
+    Ok((clean_data, clean_offsets))
+}
+
+/// Decode a FIXEDLENGTHOBJECT column's data (after header).
+/// Format: item_size(8 bytes) + raw data (real_saved_num * item_size) or StreamVByte encoded.
+fn decode_fixed_length_object(
+    data: &[u8],
+    offset: &mut usize,
+    real_saved_num: u64,
+    row_num: u64,
+    col_name: &str,
+) -> Result<Vec<u8>, String> {
+    // Read item_size (8 bytes size_t)
+    if *offset + 8 > data.len() {
+        return Err(format!(
+            "truncated FIXEDLENGTHOBJECT item_size for column '{col_name}'"
+        ));
+    }
+    let item_size = u64::from_le_bytes(data[*offset..*offset + 8].try_into().unwrap()) as usize;
+    *offset += 8;
+
+    let n = real_saved_num as usize;
+    let mem_size = n * item_size;
+    let raw = read_raw_or_fail(
+        data,
+        offset,
+        mem_size,
+        &format!("FIXEDLENGTHOBJECT column '{col_name}'"),
+    )?;
+
+    // Expand const column
+    if real_saved_num == 1 && row_num > 1 {
+        let mut expanded = Vec::with_capacity(row_num as usize * item_size);
+        for _ in 0..row_num {
+            expanded.extend_from_slice(&raw[..item_size]);
+        }
+        Ok(expanded)
+    } else {
+        Ok(raw)
+    }
+}
+
+/// Decode one non-nullable column from the data buffer.
+fn decode_typed_column(
+    data: &[u8],
+    offset: &mut usize,
+    type_id: i32,
+    meta: &PColumnMeta,
+) -> Result<(DecodedColumn, u64), String> {
+    let col_name = meta.name.clone().unwrap_or_default();
+    let precision = meta
+        .decimal_param
+        .as_ref()
+        .and_then(|d| d.precision)
+        .unwrap_or(0);
+    let scale = meta
+        .decimal_param
+        .as_ref()
+        .and_then(|d| d.scale)
+        .unwrap_or(0);
+
+    let header = read_col_header(data, offset)?;
+
+    if is_string_type(type_id) {
+        let (col_data, col_offsets) = decode_string_data(
+            data,
+            offset,
+            header.real_saved_num,
+            header.row_num,
+            &col_name,
+        )?;
+        Ok((
+            DecodedColumn {
+                type_id,
+                col_name,
+                is_nullable: false,
+                data: col_data,
+                null_mask: None,
+                offsets: Some(col_offsets),
+                precision,
+                scale,
+            },
+            header.row_num,
+        ))
+    } else if is_fixed_length_object(type_id) {
+        // FIXEDLENGTHOBJECT: header → item_size(8 bytes) → raw data (N * item_size)
+        let col_data = decode_fixed_length_object(
+            data,
+            offset,
+            header.real_saved_num,
+            header.row_num,
+            &col_name,
+        )?;
+        Ok((
+            DecodedColumn {
+                type_id,
+                col_name,
+                is_nullable: false,
+                data: col_data,
+                null_mask: None,
+                offsets: None,
+                precision,
+                scale,
+            },
+            header.row_num,
+        ))
+    } else {
+        let width = type_byte_width(type_id);
+        if width == 0 {
+            return Err(format!(
+                "unknown fixed-width size for type_id={type_id} column '{col_name}'"
+            ));
+        }
+        let col_data = decode_fixed_data(
+            data,
+            offset,
+            header.real_saved_num,
+            header.row_num,
+            width,
+            &col_name,
+        )?;
+        Ok((
+            DecodedColumn {
+                type_id,
+                col_name,
+                is_nullable: false,
+                data: col_data,
+                null_mask: None,
+                offsets: None,
+                precision,
+                scale,
+            },
+            header.row_num,
+        ))
+    }
+}
+
+/// Decode one nullable column from the data buffer.
+/// Format: [nullable header] [null_map] [nested column with own header]
+fn decode_nullable_column(
+    data: &[u8],
+    offset: &mut usize,
+    type_id: i32,
+    meta: &PColumnMeta,
+) -> Result<(DecodedColumn, u64), String> {
+    let col_name = meta.name.clone().unwrap_or_default();
+
+    // Read nullable outer header
+    let null_header = read_col_header(data, offset)?;
+
+    // Read null map: real_saved_num * sizeof(bool) = real_saved_num bytes
+    let null_mem_size = null_header.real_saved_num as usize;
+    let raw_null_map =
+        read_raw_or_fail(data, offset, null_mem_size, &format!("null map '{col_name}'"))?;
+
+    // Expand const null map if needed
+    let null_map = if null_header.real_saved_num == 1 && null_header.row_num > 1 {
+        vec![raw_null_map[0]; null_header.row_num as usize]
+    } else {
+        raw_null_map
+    };
+
+    // Read nested column (has its own header)
+    let (mut inner_col, _inner_row_num) = decode_typed_column(data, offset, type_id, meta)?;
+
+    // Apply nullable info
+    inner_col.is_nullable = true;
+    inner_col.null_mask = Some(null_map);
+
+    Ok((inner_col, null_header.row_num))
+}
+
 /// Decode a single PBlock into column data.
 fn decode_single_block(block: &PBlock) -> Result<(Vec<DecodedColumn>, u32), String> {
     let raw_bytes = block
@@ -114,7 +523,7 @@ fn decode_single_block(block: &PBlock) -> Result<(Vec<DecodedColumn>, u32), Stri
         .as_ref()
         .ok_or("PBlock missing column_values")?;
 
-    // Decompress if needed.
+    // Decompress block-level compression if needed.
     let data = if block.compressed.unwrap_or(false) {
         let uncompressed_size = block.uncompressed_size.unwrap_or(0) as usize;
         let compression = block.compression_type.unwrap_or(CompressionTypePb::Snappy as i32);
@@ -123,119 +532,71 @@ fn decode_single_block(block: &PBlock) -> Result<(Vec<DecodedColumn>, u32), Stri
         raw_bytes.clone()
     };
 
-    if data.len() < 4 {
-        return Err("PBlock column_values too short for num_rows".to_string());
-    }
-
-    // First 4 bytes: num_rows (LE uint32).
-    let num_rows = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-    let mut offset = 4usize;
-
+    let mut offset = 0usize;
+    let mut block_num_rows = 0u32;
     let mut columns = Vec::with_capacity(block.column_metas.len());
 
-    for meta in &block.column_metas {
+    for (col_idx, meta) in block.column_metas.iter().enumerate() {
         let type_id = meta.r#type.unwrap_or(TypeId::Unknown as i32);
         let is_nullable = meta.is_nullable.unwrap_or(false);
-        let col_name = meta.name.clone().unwrap_or_default();
-        let precision = meta
-            .decimal_param
-            .as_ref()
-            .and_then(|d| d.precision)
-            .unwrap_or(0);
-        let scale = meta
-            .decimal_param
-            .as_ref()
-            .and_then(|d| d.scale)
-            .unwrap_or(0);
 
-        // Read null mask if nullable.
-        let null_mask = if is_nullable {
-            let mask_size = num_rows as usize;
-            if offset + mask_size > data.len() {
-                return Err(format!(
-                    "PBlock truncated reading null mask for column '{}': need {} bytes at offset {}, have {}",
-                    col_name, mask_size, offset, data.len()
-                ));
-            }
-            let mask = data[offset..offset + mask_size].to_vec();
-            offset += mask_size;
-            Some(mask)
+        let (col, row_num) = if is_nullable {
+            decode_nullable_column(&data, &mut offset, type_id, meta)?
         } else {
-            None
+            decode_typed_column(&data, &mut offset, type_id, meta)?
         };
 
-        // Read column data.
-        let (col_data, col_offsets) = if is_string_type(type_id) {
-            // STRING format: uint64 data_len + data[data_len] + uint64 offsets[N+1]
-            if offset + 8 > data.len() {
-                return Err(format!(
-                    "PBlock truncated reading string data_len for column '{col_name}'"
-                ));
-            }
-            let data_len =
-                u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap()) as usize;
-            offset += 8;
+        if col_idx == 0 {
+            block_num_rows = row_num as u32;
+        }
 
-            if offset + data_len > data.len() {
-                return Err(format!(
-                    "PBlock truncated reading string data for column '{col_name}': need {data_len} at offset {offset}, have {}",
-                    data.len()
-                ));
-            }
-            let string_data = data[offset..offset + data_len].to_vec();
-            offset += data_len;
-
-            // Read offsets array: (N+1) uint64 values.
-            let offsets_count = (num_rows + 1) as usize;
-            let offsets_bytes = offsets_count * 8;
-            if offset + offsets_bytes > data.len() {
-                return Err(format!(
-                    "PBlock truncated reading string offsets for column '{col_name}'"
-                ));
-            }
-            let mut offsets = Vec::with_capacity(offsets_count);
-            for i in 0..offsets_count {
-                let o = u64::from_le_bytes(
-                    data[offset + i * 8..offset + i * 8 + 8].try_into().unwrap(),
-                );
-                offsets.push(o);
-            }
-            offset += offsets_bytes;
-
-            (string_data, Some(offsets))
-        } else {
-            // Fixed-width column.
-            let width = type_byte_width(type_id);
-            if width == 0 {
-                return Err(format!(
-                    "unknown fixed-width size for type_id={type_id} column '{col_name}'"
-                ));
-            }
-            let col_size = num_rows as usize * width;
-            if offset + col_size > data.len() {
-                return Err(format!(
-                    "PBlock truncated reading column '{col_name}': need {col_size} at offset {offset}, have {}",
-                    data.len()
-                ));
-            }
-            let col_data = data[offset..offset + col_size].to_vec();
-            offset += col_size;
-            (col_data, None)
-        };
-
-        columns.push(DecodedColumn {
-            type_id,
-            col_name,
-            is_nullable,
-            data: col_data,
-            null_mask,
-            offsets: col_offsets,
-            precision,
-            scale,
-        });
+        columns.push(col);
     }
 
-    Ok((columns, num_rows))
+    Ok((columns, block_num_rows))
+}
+
+/// Minimal StreamVByte decoder.
+///
+/// StreamVByte encodes N uint32 values. The format is:
+///   control_bytes[(N+3)/4] + data_bytes[variable]
+/// Each control byte has 4 x 2-bit entries, each encoding the byte length (1-4) of a value.
+fn streamvbyte_decode(encoded: &[u8], count: usize) -> Result<Vec<u32>, String> {
+    if count == 0 {
+        return Ok(vec![]);
+    }
+
+    let control_len = (count + 3) / 4;
+    if encoded.len() < control_len {
+        return Err(format!(
+            "StreamVByte: need at least {control_len} control bytes, have {}",
+            encoded.len()
+        ));
+    }
+
+    let control = &encoded[..control_len];
+    let mut data_offset = control_len;
+    let mut result = Vec::with_capacity(count);
+
+    for i in 0..count {
+        let ctrl_byte = control[i / 4];
+        let shift = (i % 4) * 2;
+        let code = (ctrl_byte >> shift) & 0x03;
+        let byte_len = (code + 1) as usize; // 0→1, 1→2, 2→3, 3→4
+
+        if data_offset + byte_len > encoded.len() {
+            return Err(format!(
+                "StreamVByte: data truncated at element {i}, need {byte_len} bytes at offset {data_offset}"
+            ));
+        }
+
+        let mut buf = [0u8; 4];
+        buf[..byte_len].copy_from_slice(&encoded[data_offset..data_offset + byte_len]);
+        result.push(u32::from_le_bytes(buf));
+        data_offset += byte_len;
+    }
+
+    Ok(result)
 }
 
 /// Map a PGenericType::TypeId to a DuckDB SQL type name.
@@ -266,6 +627,7 @@ pub fn type_id_to_sql(type_id: i32, precision: u32, scale: u32) -> String {
             format!("DECIMAL({}, {})", precision, scale)
         }
         x if x == TypeId::Jsonb as i32 => "VARCHAR".to_string(),
+        x if x == TypeId::Fixedlengthobject as i32 => "BLOB".to_string(),
         _ => "VARCHAR".to_string(),
     }
 }
@@ -285,14 +647,29 @@ pub fn column_to_sql_values(col: &DecodedColumn, num_rows: u32) -> Vec<String> {
             }
         }
 
-        let val = if is_string_type(col.type_id) {
+        let val = if is_fixed_length_object(col.type_id) {
+            // FIXEDLENGTHOBJECT: format as hex blob literal
+            // We don't know item_size here, so just dump all data for this row
+            // This is a best-effort representation; DuckDB may not handle agg states
+            "NULL".to_string()
+        } else if is_string_type(col.type_id) {
             // String: use offsets to extract the substring.
             if let Some(offsets) = &col.offsets {
                 let start = offsets[row] as usize;
                 let end = offsets[row + 1] as usize;
-                let s = String::from_utf8_lossy(&col.data[start..end]);
-                // Escape single quotes for SQL.
-                format!("'{}'", s.replace('\'', "''"))
+                let bytes = &col.data[start..end];
+                // Check if the data is valid UTF-8 without \0 bytes.
+                // DuckDB C FFI uses null-terminated strings, so \0 in the
+                // middle would truncate the value. Use hex blob for binary data.
+                if bytes.contains(&0) || std::str::from_utf8(bytes).is_err() {
+                    // Binary data: encode as DuckDB hex blob literal.
+                    let hex: String = bytes.iter().map(|b| format!("{:02X}", b)).collect();
+                    format!("'\\x{}'::BLOB", hex)
+                } else {
+                    let s = std::str::from_utf8(bytes).unwrap();
+                    // Escape single quotes for SQL.
+                    format!("'{}'", s.replace('\'', "''"))
+                }
             } else {
                 "''".to_string()
             }
@@ -467,24 +844,24 @@ mod tests {
     use super::*;
     use doris_proto::doris::p_column_meta::Decimal;
 
-    /// Build a synthetic PBlock with the given column data.
-    fn make_pblock(
-        column_metas: Vec<PColumnMeta>,
-        num_rows: u32,
-        column_bytes: Vec<u8>,
-    ) -> PBlock {
-        // Prepend num_rows as LE u32.
-        let mut data = num_rows.to_le_bytes().to_vec();
-        data.extend_from_slice(&column_bytes);
-
+    /// Build a synthetic PBlock with the correct Doris serialization format.
+    /// Each column's data (with per-column header) is provided in column_bytes.
+    fn make_pblock(column_metas: Vec<PColumnMeta>, column_bytes: Vec<u8>) -> PBlock {
         PBlock {
             column_metas,
-            column_values: Some(data),
+            column_values: Some(column_bytes),
             compressed: Some(false),
             uncompressed_size: None,
             compression_type: None,
             be_exec_version: None,
         }
+    }
+
+    /// Write a per-column header: const_flag(1) + row_num(8) + real_saved_num(8).
+    fn write_col_header(buf: &mut Vec<u8>, is_const: bool, row_num: u64, real_saved_num: u64) {
+        buf.push(if is_const { 1 } else { 0 });
+        buf.extend_from_slice(&row_num.to_le_bytes());
+        buf.extend_from_slice(&real_saved_num.to_le_bytes());
     }
 
     fn int32_meta(name: &str) -> PColumnMeta {
@@ -532,15 +909,60 @@ mod tests {
         }
     }
 
+    /// Serialize a non-nullable INT32 column in Doris format.
+    fn serialize_int32_col(buf: &mut Vec<u8>, values: &[i32]) {
+        let n = values.len() as u64;
+        write_col_header(buf, false, n, n);
+        for v in values {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+
+    /// Serialize a non-nullable STRING column in Doris format.
+    /// Doris format: header + offsets(UInt32, cumulative with \0) + value_len(8) + chars(with \0)
+    fn serialize_string_col(buf: &mut Vec<u8>, strings: &[&str]) {
+        let n = strings.len() as u64;
+        write_col_header(buf, false, n, n);
+
+        // Build Doris-style chars (with \0 after each string) and offsets
+        let mut chars = Vec::new();
+        let mut offsets = Vec::new();
+        for s in strings {
+            chars.extend_from_slice(s.as_bytes());
+            chars.push(0); // null terminator
+            offsets.push(chars.len() as u32);
+        }
+
+        // Write offsets: N * UInt32
+        for o in &offsets {
+            buf.extend_from_slice(&o.to_le_bytes());
+        }
+
+        // Write value_len (size_t = 8 bytes) + chars
+        buf.extend_from_slice(&(chars.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&chars);
+    }
+
+    /// Serialize a nullable column wrapper in Doris format.
+    /// Format: [nullable header] [null_map] [inner column data with own header]
+    fn serialize_nullable_wrapper(
+        buf: &mut Vec<u8>,
+        null_map: &[u8],
+        inner_data: &[u8], // already serialized inner column (with its own header)
+    ) {
+        let n = null_map.len() as u64;
+        write_col_header(buf, false, n, n);
+        buf.extend_from_slice(null_map);
+        buf.extend_from_slice(inner_data);
+    }
+
     #[test]
     fn test_decode_single_int32_column() {
         // 3 rows of INT32: [10, 20, 30]
         let mut col_bytes = Vec::new();
-        col_bytes.extend_from_slice(&10i32.to_le_bytes());
-        col_bytes.extend_from_slice(&20i32.to_le_bytes());
-        col_bytes.extend_from_slice(&30i32.to_le_bytes());
+        serialize_int32_col(&mut col_bytes, &[10, 20, 30]);
 
-        let block = make_pblock(vec![int32_meta("id")], 3, col_bytes);
+        let block = make_pblock(vec![int32_meta("id")], col_bytes);
         let decoded = decode_pblocks(&[block]).unwrap();
 
         assert_eq!(decoded.num_rows, 3);
@@ -549,9 +971,8 @@ mod tests {
         assert_eq!(decoded.columns[0].type_id, TypeId::Int32 as i32);
         assert!(decoded.columns[0].null_mask.is_none());
 
-        // Verify raw data bytes.
         let data = &decoded.columns[0].data;
-        assert_eq!(data.len(), 12); // 3 * 4 bytes
+        assert_eq!(data.len(), 12);
         assert_eq!(i32::from_le_bytes(data[0..4].try_into().unwrap()), 10);
         assert_eq!(i32::from_le_bytes(data[4..8].try_into().unwrap()), 20);
         assert_eq!(i32::from_le_bytes(data[8..12].try_into().unwrap()), 30);
@@ -560,15 +981,19 @@ mod tests {
     #[test]
     fn test_decode_nullable_int64_column() {
         // 3 rows of nullable INT64: [100, NULL, 300]
-        let mut col_bytes = Vec::new();
-        // Null mask: [0, 1, 0] (row 1 is null)
-        col_bytes.extend_from_slice(&[0u8, 1, 0]);
-        // Data: 3 * 8 bytes (null rows still have placeholder data)
-        col_bytes.extend_from_slice(&100i64.to_le_bytes());
-        col_bytes.extend_from_slice(&0i64.to_le_bytes()); // placeholder for NULL
-        col_bytes.extend_from_slice(&300i64.to_le_bytes());
+        let null_map = [0u8, 1, 0];
 
-        let block = make_pblock(vec![nullable_int64_meta("value")], 3, col_bytes);
+        // Inner INT64 column (with its own header)
+        let mut inner = Vec::new();
+        write_col_header(&mut inner, false, 3, 3);
+        inner.extend_from_slice(&100i64.to_le_bytes());
+        inner.extend_from_slice(&0i64.to_le_bytes()); // placeholder for NULL
+        inner.extend_from_slice(&300i64.to_le_bytes());
+
+        let mut col_bytes = Vec::new();
+        serialize_nullable_wrapper(&mut col_bytes, &null_map, &inner);
+
+        let block = make_pblock(vec![nullable_int64_meta("value")], col_bytes);
         let decoded = decode_pblocks(&[block]).unwrap();
 
         assert_eq!(decoded.num_rows, 3);
@@ -586,20 +1011,10 @@ mod tests {
     #[test]
     fn test_decode_string_column() {
         // 2 rows of STRING: ["hello", "world"]
-        let string_data = b"helloworld";
-        let offsets: Vec<u64> = vec![0, 5, 10]; // 3 offsets for 2 rows
-
         let mut col_bytes = Vec::new();
-        // data_len as uint64
-        col_bytes.extend_from_slice(&(string_data.len() as u64).to_le_bytes());
-        // string data
-        col_bytes.extend_from_slice(string_data);
-        // offsets: 3 x uint64
-        for &o in &offsets {
-            col_bytes.extend_from_slice(&o.to_le_bytes());
-        }
+        serialize_string_col(&mut col_bytes, &["hello", "world"]);
 
-        let block = make_pblock(vec![string_meta("name")], 2, col_bytes);
+        let block = make_pblock(vec![string_meta("name")], col_bytes);
         let decoded = decode_pblocks(&[block]).unwrap();
 
         assert_eq!(decoded.num_rows, 2);
@@ -608,7 +1023,7 @@ mod tests {
         assert!(col.offsets.is_some());
 
         let offsets = col.offsets.as_ref().unwrap();
-        assert_eq!(offsets, &[0, 5, 10]);
+        assert_eq!(offsets, &[0, 5, 10]); // N+1 clean offsets
         assert_eq!(&col.data[0..5], b"hello");
         assert_eq!(&col.data[5..10], b"world");
     }
@@ -619,21 +1034,13 @@ mod tests {
         let mut col_bytes = Vec::new();
 
         // Column 0: INT32 [42, 99]
-        col_bytes.extend_from_slice(&42i32.to_le_bytes());
-        col_bytes.extend_from_slice(&99i32.to_le_bytes());
+        serialize_int32_col(&mut col_bytes, &[42, 99]);
 
         // Column 1: STRING ["foo", "bar"]
-        let string_data = b"foobar";
-        let offsets: Vec<u64> = vec![0, 3, 6];
-        col_bytes.extend_from_slice(&(string_data.len() as u64).to_le_bytes());
-        col_bytes.extend_from_slice(string_data);
-        for &o in &offsets {
-            col_bytes.extend_from_slice(&o.to_le_bytes());
-        }
+        serialize_string_col(&mut col_bytes, &["foo", "bar"]);
 
         let block = make_pblock(
             vec![int32_meta("id"), string_meta("name")],
-            2,
             col_bytes,
         );
         let decoded = decode_pblocks(&[block]).unwrap();
@@ -643,13 +1050,11 @@ mod tests {
         assert_eq!(decoded.columns[0].col_name, "id");
         assert_eq!(decoded.columns[1].col_name, "name");
 
-        // Verify int column.
         assert_eq!(
             i32::from_le_bytes(decoded.columns[0].data[0..4].try_into().unwrap()),
             42
         );
 
-        // Verify string column.
         let offsets = decoded.columns[1].offsets.as_ref().unwrap();
         let data = &decoded.columns[1].data;
         let s0 = std::str::from_utf8(&data[offsets[0] as usize..offsets[1] as usize]).unwrap();
@@ -662,22 +1067,18 @@ mod tests {
     fn test_decode_multiple_blocks_concatenation() {
         // Block 1: INT32 [1, 2]
         let mut bytes1 = Vec::new();
-        bytes1.extend_from_slice(&1i32.to_le_bytes());
-        bytes1.extend_from_slice(&2i32.to_le_bytes());
-        let block1 = make_pblock(vec![int32_meta("x")], 2, bytes1);
+        serialize_int32_col(&mut bytes1, &[1, 2]);
+        let block1 = make_pblock(vec![int32_meta("x")], bytes1);
 
         // Block 2: INT32 [3, 4, 5]
         let mut bytes2 = Vec::new();
-        bytes2.extend_from_slice(&3i32.to_le_bytes());
-        bytes2.extend_from_slice(&4i32.to_le_bytes());
-        bytes2.extend_from_slice(&5i32.to_le_bytes());
-        let block2 = make_pblock(vec![int32_meta("x")], 3, bytes2);
+        serialize_int32_col(&mut bytes2, &[3, 4, 5]);
+        let block2 = make_pblock(vec![int32_meta("x")], bytes2);
 
         let decoded = decode_pblocks(&[block1, block2]).unwrap();
         assert_eq!(decoded.num_rows, 5);
         assert_eq!(decoded.columns[0].data.len(), 20); // 5 * 4 bytes
 
-        // Verify all values.
         for (i, expected) in [1i32, 2, 3, 4, 5].iter().enumerate() {
             let offset = i * 4;
             let val = i32::from_le_bytes(
@@ -809,11 +1210,9 @@ mod tests {
 
     #[test]
     fn test_snappy_compressed_block() {
-        // Build uncompressed payload: num_rows(2) + 2 INT32 values.
+        // Build uncompressed payload: INT32 column with 2 values
         let mut uncompressed = Vec::new();
-        uncompressed.extend_from_slice(&2u32.to_le_bytes());
-        uncompressed.extend_from_slice(&42i32.to_le_bytes());
-        uncompressed.extend_from_slice(&99i32.to_le_bytes());
+        serialize_int32_col(&mut uncompressed, &[42, 99]);
 
         // Compress with snappy.
         let mut encoder = snap::raw::Encoder::new();
@@ -846,5 +1245,102 @@ mod tests {
         assert_eq!(format_decimal(-12345, 2), "-123.45");
         assert_eq!(format_decimal(100, 0), "100");
         assert_eq!(format_decimal(5, 3), "0.005");
+    }
+
+    #[test]
+    fn test_streamvbyte_decode_small() {
+        // Encode 4 small values: [1, 2, 3, 4] — all fit in 1 byte
+        // Control byte: each entry is 0b00 (1 byte), so control = 0b00_00_00_00 = 0x00
+        let encoded = [0x00u8, 1, 2, 3, 4];
+        let result = streamvbyte_decode(&encoded, 4).unwrap();
+        assert_eq!(result, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_streamvbyte_decode_mixed() {
+        // 2 values: [256, 1]
+        // 256 = 0x00000100, needs 2 bytes → code 0b01
+        // 1 = 0x01, needs 1 byte → code 0b00
+        // Control byte: val0=01, val1=00 → 0b00_00_00_01 = 0x01
+        let encoded = [0x01u8, 0x00, 0x01, 0x01];
+        let result = streamvbyte_decode(&encoded, 2).unwrap();
+        assert_eq!(result, vec![256, 1]);
+    }
+
+    #[test]
+    fn test_decode_nullable_string() {
+        // 2 rows of nullable STRING: ["abc", NULL]
+        let null_map = [0u8, 1];
+
+        // Inner STRING column (with its own header)
+        let mut inner = Vec::new();
+        serialize_string_col(&mut inner, &["abc", ""]);
+
+        let mut col_bytes = Vec::new();
+        serialize_nullable_wrapper(&mut col_bytes, &null_map, &inner);
+
+        let meta = PColumnMeta {
+            name: Some("s".to_string()),
+            r#type: Some(TypeId::String as i32),
+            is_nullable: Some(true),
+            decimal_param: None,
+            children: vec![],
+            result_is_nullable: None,
+            function_name: None,
+            be_exec_version: None,
+            column_path: None,
+            variant_max_subcolumns_count: None,
+        };
+
+        let block = make_pblock(vec![meta], col_bytes);
+        let decoded = decode_pblocks(&[block]).unwrap();
+
+        assert_eq!(decoded.num_rows, 2);
+        let col = &decoded.columns[0];
+        assert!(col.is_nullable);
+        let mask = col.null_mask.as_ref().unwrap();
+        assert_eq!(mask, &[0, 1]);
+
+        let vals = column_to_sql_values(col, 2);
+        assert_eq!(vals[0], "'abc'");
+        assert_eq!(vals[1], "NULL");
+    }
+
+    #[test]
+    fn test_col_header_parsing() {
+        let mut buf = Vec::new();
+        write_col_header(&mut buf, false, 42, 42);
+        let mut offset = 0;
+        let header = read_col_header(&buf, &mut offset).unwrap();
+        assert_eq!(header.row_num, 42);
+        assert_eq!(header.real_saved_num, 42);
+        assert_eq!(offset, COL_HEADER_SIZE);
+    }
+
+    #[test]
+    fn test_column_to_sql_values_binary_string() {
+        // String with embedded \0 bytes should produce a BLOB literal.
+        let col = DecodedColumn {
+            type_id: TypeId::String as i32,
+            col_name: "rowid".to_string(),
+            is_nullable: false,
+            data: {
+                let mut d = Vec::new();
+                d.extend_from_slice(b"abc\x00def");
+                d.extend_from_slice(b"clean");
+                d
+            },
+            null_mask: None,
+            offsets: Some(vec![0, 7, 12]),
+            precision: 0,
+            scale: 0,
+        };
+
+        let vals = column_to_sql_values(&col, 2);
+        // First row has \0: should be a blob literal
+        assert!(vals[0].starts_with("'\\x"), "expected blob literal, got: {}", vals[0]);
+        assert!(vals[0].ends_with("'::BLOB"));
+        // Second row is clean UTF-8: should be a normal string literal
+        assert_eq!(vals[1], "'clean'");
     }
 }

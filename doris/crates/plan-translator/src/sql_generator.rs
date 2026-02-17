@@ -35,12 +35,12 @@ fn node_to_sql(nodes: &[TPlanNode], idx: &mut usize) -> Result<String> {
         TPlanNodeType::UNION_NODE => union_to_sql(node),
         TPlanNodeType::EXCHANGE_NODE => {
             if children.len() == 1 {
+                // Pass-through: exchange sender wraps its child
                 Ok(children.into_iter().next().unwrap())
             } else {
-                bail!(
-                    "EXCHANGE_NODE with {} children not yet supported for SQL",
-                    children.len()
-                )
+                // EXCHANGE_NODE(0 children) = exchange receiver.
+                // Read from the exchange table registered by the PBlock decoder.
+                Ok(format!("SELECT * FROM __EXCHANGE_TABLE_{}", node.node_id))
             }
         }
         TPlanNodeType::EMPTY_SET_NODE => Ok("SELECT WHERE FALSE".to_string()),

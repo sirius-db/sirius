@@ -5,6 +5,7 @@
 //! - `fragment_manager`: Fragment lifecycle management
 
 pub mod backend_service;
+pub mod brpc_server;
 pub mod exchange_buffer;
 pub mod fragment_manager;
 pub mod grpc_service;

@@ -15,6 +15,9 @@ pub struct SiriusEngine {
     #[cfg(feature = "duckdb-bundled")]
     conn: duckdb::Connection,
 
+    #[cfg(feature = "duckdb-bundled")]
+    has_substrait: bool,
+
     #[cfg(not(feature = "duckdb-bundled"))]
     _phantom: (),
 }
@@ -59,28 +62,56 @@ impl SiriusEngine {
             let conn = duckdb::Connection::open_in_memory_with_flags(config)
                 .map_err(|e| EngineError::InitFailed(e.to_string()))?;
 
-            // Load locally-built extensions from the Sirius build output.
+            // Try to load locally-built extensions from the Sirius build output.
+            // These are optional: SQL path works without them; Substrait/GPU
+            // paths will fail at call time if the extensions are missing.
+            //
+            // Extension lookup order:
+            //   1. SIRIUS_EXTENSION_DIR env var (for Docker/deployment)
+            //   2. Compile-time paths relative to CARGO_MANIFEST_DIR
             let sirius_root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../..");
-            let substrait_ext = format!(
-                "{}/build/release/extension/substrait/substrait.duckdb_extension",
-                sirius_root
-            );
-            let sirius_ext = format!(
-                "{}/build/release/extension/sirius/sirius.duckdb_extension",
-                sirius_root
-            );
-            conn.execute_batch(&format!("LOAD '{}'", substrait_ext))
-                .map_err(|e| EngineError::InitFailed(format!("load substrait extension: {e}")))?;
-            conn.execute_batch(&format!("LOAD '{}'", sirius_ext))
-                .map_err(|e| EngineError::InitFailed(format!("load sirius extension: {e}")))?;
+            let (substrait_ext, sirius_ext) = if let Ok(dir) = std::env::var("SIRIUS_EXTENSION_DIR") {
+                (
+                    format!("{}/substrait.duckdb_extension", dir),
+                    format!("{}/sirius.duckdb_extension", dir),
+                )
+            } else {
+                (
+                    format!(
+                        "{}/doris/thirdparty/duckdb-substrait-extension/build/release/extension/substrait/substrait.duckdb_extension",
+                        sirius_root
+                    ),
+                    format!(
+                        "{}/build/release/extension/sirius/sirius.duckdb_extension",
+                        sirius_root
+                    ),
+                )
+            };
+            let mut has_substrait = false;
+            if let Err(e) = conn.execute_batch(&format!("LOAD '{}'", substrait_ext)) {
+                eprintln!("warning: substrait extension not loaded: {e}");
+            } else {
+                has_substrait = true;
+            }
+            if let Err(e) = conn.execute_batch(&format!("LOAD '{}'", sirius_ext)) {
+                eprintln!("warning: sirius extension not loaded: {e}");
+            }
 
-            Ok(Self { conn })
+            Ok(Self { conn, has_substrait })
         }
 
         #[cfg(not(feature = "duckdb-bundled"))]
         {
             Err(EngineError::NotCompiled)
         }
+    }
+
+    /// Whether the Substrait extension is loaded (needed for `from_substrait`).
+    pub fn has_substrait(&self) -> bool {
+        #[cfg(feature = "duckdb-bundled")]
+        { self.has_substrait }
+        #[cfg(not(feature = "duckdb-bundled"))]
+        { false }
     }
 
     /// Execute a SQL query directly via DuckDB (CPU fallback).

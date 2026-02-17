@@ -642,14 +642,46 @@ impl PBackendService for PBackendServiceHandler {
                             continue;
                         }
 
+                        // Log PBlock diagnostic info.
+                        let blk0 = &blocks[0];
+                        let be_ver = blk0.be_exec_version.unwrap_or(-1);
+                        let compressed = blk0.compressed.unwrap_or(false);
+                        let cv_len = blk0.column_values.as_ref().map(|v| v.len()).unwrap_or(0);
+                        let uncomp = blk0.uncompressed_size.unwrap_or(0);
+                        info!(
+                            table = %table_name,
+                            be_exec_version = be_ver,
+                            compressed = compressed,
+                            column_values_len = cv_len,
+                            uncompressed_size = uncomp,
+                            num_column_metas = blk0.column_metas.len(),
+                            "exchange PBlock info"
+                        );
+                        for (i, m) in blk0.column_metas.iter().enumerate() {
+                            info!(
+                                table = %table_name,
+                                col_idx = i,
+                                name = m.name.as_deref().unwrap_or(""),
+                                type_id = m.r#type.unwrap_or(-1),
+                                nullable = m.is_nullable.unwrap_or(false),
+                                "exchange PBlock column_meta"
+                            );
+                        }
+                        // Dump first 64 bytes of (decompressed) column_values for debugging.
+                        if let Some(cv) = blk0.column_values.as_ref() {
+                            let preview_len = cv.len().min(128);
+                            let hex: String = cv[..preview_len]
+                                .iter()
+                                .map(|b| format!("{:02x}", b))
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            info!(table = %table_name, hex = %hex, "column_values first bytes");
+                        }
+
                         // Extract column metadata from the first block.
                         let col_info = pblock_decoder::extract_column_info(
                             &blocks[0].column_metas,
                         );
-                        let column_names: Vec<String> =
-                            col_info.iter().map(|(n, _)| n.clone()).collect();
-                        let column_types_sql: Vec<String> =
-                            col_info.iter().map(|(_, t)| t.clone()).collect();
 
                         // Decode all blocks.
                         let decoded = match pblock_decoder::decode_pblocks(&blocks) {
@@ -667,11 +699,35 @@ impl PBackendService for PBackendServiceHandler {
                             "decoded exchange PBlocks"
                         );
 
-                        // Convert to SQL values for DuckDB insertion.
-                        let column_data_csv: Vec<Vec<String>> = decoded
-                            .columns
-                            .iter()
-                            .map(|col| pblock_decoder::column_to_sql_values(col, decoded.num_rows))
+                        // Filter out internal Doris columns and FIXEDLENGTHOBJECT (agg state).
+                        // __DORIS_ROWID_COL__ is an internal row ID not needed by DuckDB.
+                        // FIXEDLENGTHOBJECT columns are opaque aggregate intermediate state.
+                        let keep_indices: Vec<usize> = (0..col_info.len())
+                            .filter(|&i| {
+                                let (name, _) = &col_info[i];
+                                let type_id = blocks[0].column_metas.get(i)
+                                    .and_then(|m| m.r#type)
+                                    .unwrap_or(0);
+                                !name.starts_with("__DORIS_")
+                                    && type_id != doris_proto::doris::p_generic_type::TypeId::Fixedlengthobject as i32
+                            })
+                            .collect();
+
+                        let column_names: Vec<String> =
+                            keep_indices.iter().map(|&i| {
+                                let name = &col_info[i].0;
+                                if name.is_empty() {
+                                    format!("col{}", i)
+                                } else {
+                                    name.clone()
+                                }
+                            }).collect();
+                        let column_types_sql: Vec<String> =
+                            keep_indices.iter().map(|&i| col_info[i].1.clone()).collect();
+
+                        // Convert to SQL values for DuckDB insertion (filtered columns only).
+                        let column_data_csv: Vec<Vec<String>> = keep_indices.iter()
+                            .map(|&i| pblock_decoder::column_to_sql_values(&decoded.columns[i], decoded.num_rows))
                             .collect();
 
                         // Register in DuckDB engine.
@@ -719,16 +775,28 @@ impl PBackendService for PBackendServiceHandler {
                     }
 
                     // Translate and execute.
-                    let exec_plan = match plan_translator::translate_fragment(&params, &table_schemas) {
-                        Ok(bytes) => ExecPlan::Substrait(bytes),
-                        Err(e) => {
-                            warn!(error = %e, "Substrait translation failed for exchange fragment");
-                            match plan_translator::translate_fragment_to_sql(&params) {
-                                Ok(sql) => ExecPlan::Sql(sql),
-                                Err(e2) => {
-                                    warn!(error = %e2, "SQL translation also failed");
-                                    return;
+                    // If substrait extension isn't loaded, skip directly to SQL.
+                    let has_substrait = engine.lock().unwrap().has_substrait();
+                    let exec_plan = if has_substrait {
+                        match plan_translator::translate_fragment(&params, &table_schemas) {
+                            Ok(bytes) => ExecPlan::Substrait(bytes),
+                            Err(e) => {
+                                warn!(error = %e, "Substrait translation failed for exchange fragment");
+                                match plan_translator::translate_fragment_to_sql(&params) {
+                                    Ok(sql) => ExecPlan::Sql(sql),
+                                    Err(e2) => {
+                                        warn!(error = %e2, "SQL translation also failed");
+                                        return;
+                                    }
                                 }
+                            }
+                        }
+                    } else {
+                        match plan_translator::translate_fragment_to_sql(&params) {
+                            Ok(sql) => ExecPlan::Sql(sql),
+                            Err(e) => {
+                                warn!(error = %e, "SQL translation failed for exchange fragment");
+                                return;
                             }
                         }
                     };
@@ -797,30 +865,49 @@ impl PBackendService for PBackendServiceHandler {
             // Try Substrait translation first, fall back to SQL.
             // Constant-only queries (no data tables) use CPU-only Substrait to avoid
             // GPU engine bugs with VirtualTable plans.
+            // If substrait extension isn't loaded, skip directly to SQL.
             let has_data_tables = !file_tables.is_empty() || !table_schemas.is_empty();
-            let exec_plan = match plan_translator::translate_fragment(params, &table_schemas) {
-                Ok(substrait_bytes) => {
-                    info!(bytes = substrait_bytes.len(), has_data_tables, "translated to Substrait");
-                    if has_data_tables {
-                        ExecPlan::Substrait(substrait_bytes)
-                    } else {
-                        ExecPlan::SubstraitCpuOnly(substrait_bytes)
+            let has_substrait = self.engine.as_ref()
+                .map(|e| e.lock().unwrap().has_substrait()).unwrap_or(false);
+            let exec_plan = if has_substrait {
+                match plan_translator::translate_fragment(params, &table_schemas) {
+                    Ok(substrait_bytes) => {
+                        info!(bytes = substrait_bytes.len(), has_data_tables, "translated to Substrait");
+                        if has_data_tables {
+                            ExecPlan::Substrait(substrait_bytes)
+                        } else {
+                            ExecPlan::SubstraitCpuOnly(substrait_bytes)
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Substrait translation failed, trying SQL fallback");
+                        match plan_translator::translate_fragment_to_sql(params) {
+                            Ok(sql) => {
+                                info!(sql = %sql, "translated to SQL (fallback)");
+                                ExecPlan::Sql(sql)
+                            }
+                            Err(e2) => {
+                                warn!(error = %e2, "SQL translation also failed");
+                                return Ok(Response::new(PExecPlanFragmentResult {
+                                    status: err_status(&format!("plan translation: {e}")),
+                                    ..Default::default()
+                                }));
+                            }
+                        }
                     }
                 }
-                Err(e) => {
-                    warn!(error = %e, "Substrait translation failed, trying SQL fallback");
-                    match plan_translator::translate_fragment_to_sql(params) {
-                        Ok(sql) => {
-                            info!(sql = %sql, "translated to SQL (fallback)");
-                            ExecPlan::Sql(sql)
-                        }
-                        Err(e2) => {
-                            warn!(error = %e2, "SQL translation also failed");
-                            return Ok(Response::new(PExecPlanFragmentResult {
-                                status: err_status(&format!("plan translation: {e}")),
-                                ..Default::default()
-                            }));
-                        }
+            } else {
+                match plan_translator::translate_fragment_to_sql(params) {
+                    Ok(sql) => {
+                        info!(sql = %sql, "translated to SQL (no substrait extension)");
+                        ExecPlan::Sql(sql)
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "SQL translation failed");
+                        return Ok(Response::new(PExecPlanFragmentResult {
+                            status: err_status(&format!("plan translation: {e}")),
+                            ..Default::default()
+                        }));
                     }
                 }
             };
@@ -1280,7 +1367,11 @@ impl PBackendService for PBackendServiceHandler {
     async fn request_cdc_client(&self, _: Request<PRequestCdcClientRequest>) -> Result<Response<PRequestCdcClientResult>, Status> { Err(unimpl()) }
 }
 
-/// Start the PBackendService gRPC server.
+/// Start the PBackendService server with multi-protocol support.
+///
+/// Listens on a single TCP port and dispatches connections based on protocol:
+/// - bRPC "baidu_std" (magic "PRPC"): inter-BE exchange (transmit_block)
+/// - gRPC / HTTP/2 (magic "PRI "): FE→BE calls (exec_plan_fragment, etc.)
 pub async fn start_grpc_server(
     listen_addr: &str,
     state: Arc<BeState>,
@@ -1289,16 +1380,51 @@ pub async fn start_grpc_server(
     exchange_buffer: ExchangeBuffer,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use doris_proto::doris::p_backend_service_server::PBackendServiceServer;
+    use tokio_stream::wrappers::ReceiverStream;
+    use tokio_stream::StreamExt;
 
-    let addr = listen_addr.parse()?;
-    let handler = PBackendServiceHandler::new(state, result_store, engine, exchange_buffer);
+    let listener = tokio::net::TcpListener::bind(listen_addr).await?;
+    info!(addr = listen_addr, "starting PBackendService multi-protocol server (gRPC + bRPC)");
 
-    info!(addr = listen_addr, "starting PBackendService gRPC server");
+    let handler = PBackendServiceHandler::new(
+        state,
+        result_store,
+        engine,
+        exchange_buffer.clone(),
+    );
+    let svc = PBackendServiceServer::new(handler);
 
-    tonic::transport::Server::builder()
-        .add_service(PBackendServiceServer::new(handler))
-        .serve(addr)
-        .await?;
+    // Channel to feed gRPC connections to tonic's serve_with_incoming.
+    let (grpc_tx, grpc_rx) =
+        tokio::sync::mpsc::channel::<tokio::net::TcpStream>(64);
 
-    Ok(())
+    // Spawn tonic gRPC server consuming forwarded connections.
+    tokio::spawn(async move {
+        let incoming = ReceiverStream::new(grpc_rx).map(Ok::<_, std::io::Error>);
+        if let Err(e) = tonic::transport::Server::builder()
+            .add_service(svc)
+            .serve_with_incoming(incoming)
+            .await
+        {
+            tracing::error!(error = %e, "tonic gRPC server error");
+        }
+    });
+
+    // Accept loop: peek first 4 bytes to detect protocol.
+    loop {
+        let (socket, peer) = listener.accept().await?;
+        let mut peek_buf = [0u8; 4];
+        match socket.peek(&mut peek_buf).await {
+            Ok(n) if n >= 4 && &peek_buf == b"PRPC" => {
+                let buf = exchange_buffer.clone();
+                tokio::spawn(super::brpc_server::handle_brpc_connection(socket, buf));
+            }
+            _ => {
+                // Assume gRPC (HTTP/2 starts with "PRI * HTTP/2.0...")
+                if grpc_tx.send(socket).await.is_err() {
+                    warn!(%peer, "gRPC channel closed, dropping connection");
+                }
+            }
+        }
+    }
 }

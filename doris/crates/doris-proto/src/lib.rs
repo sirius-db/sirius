@@ -19,3 +19,10 @@ pub mod doris {
 }
 
 pub use doris::*;
+
+#[allow(clippy::all)]
+pub mod brpc {
+    pub mod policy {
+        include!(concat!(env!("OUT_DIR"), "/brpc.policy.rs"));
+    }
+}

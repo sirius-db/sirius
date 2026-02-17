@@ -42,4 +42,13 @@ fn main() {
             &[proto_dir.as_path()],
         )
         .expect("Failed to compile Doris proto files");
+
+    // bRPC baidu_std protocol metadata (for inter-BE exchange)
+    let brpc_proto_dir = manifest_dir.join("proto");
+    let brpc_proto = brpc_proto_dir.join("brpc_meta.proto");
+    println!("cargo:rerun-if-changed={}", brpc_proto.display());
+
+    prost_build::Config::new()
+        .compile_protos(&[brpc_proto.as_path()], &[brpc_proto_dir.as_path()])
+        .expect("Failed to compile bRPC meta proto");
 }

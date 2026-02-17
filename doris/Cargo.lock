@@ -1240,6 +1240,7 @@ name = "doris-proto"
 version = "0.1.0"
 dependencies = [
  "prost",
+ "prost-build",
  "tonic 0.13.1",
  "tonic-build",
 ]
@@ -1263,6 +1264,7 @@ dependencies = [
  "thiserror 2.0.18",
  "thrift",
  "tokio",
+ "tokio-stream",
  "tonic 0.13.1",
  "tracing",
  "zstd",
