@@ -156,20 +156,22 @@ sirius_physical_hash_join::sirius_physical_hash_join(
 
     // Extract left key index (may be BOUND_REF or BOUND_CAST wrapping a BOUND_REF)
     key_cast_info cast_info;
-    auto left_class  = condition.left->GetExpressionClass();
-    auto right_class = condition.right->GetExpressionClass();
+    auto left_class               = condition.left->GetExpressionClass();
+    auto right_class              = condition.right->GetExpressionClass();
+    cudf::size_type left_key_idx  = 0;
+    cudf::size_type right_key_idx = 0;
 
     if (left_class == duckdb::ExpressionClass::BOUND_REF) {
-      left_key_col_indices.push_back(
-        condition.left->Cast<duckdb::BoundReferenceExpression>().index);
+      left_key_idx = condition.left->Cast<duckdb::BoundReferenceExpression>().index;
+      left_key_col_indices.push_back(left_key_idx);
     } else if (left_class == duckdb::ExpressionClass::BOUND_CAST) {
       auto& bound_cast = condition.left->Cast<duckdb::BoundCastExpression>();
       if (bound_cast.child->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
         throw std::runtime_error(
           "Unsupported join condition: BOUND_CAST child is not BOUND_REF (left)");
       }
-      left_key_col_indices.push_back(
-        bound_cast.child->Cast<duckdb::BoundReferenceExpression>().index);
+      left_key_idx = bound_cast.child->Cast<duckdb::BoundReferenceExpression>().index;
+      left_key_col_indices.push_back(left_key_idx);
       cast_info.cast_left        = true;
       cast_info.left_target_type = duckdb::GetCudfType(condition.left->return_type);
       cast_necessary             = true;
@@ -179,21 +181,32 @@ sirius_physical_hash_join::sirius_physical_hash_join(
 
     // Extract right key index (may be BOUND_REF or BOUND_CAST wrapping a BOUND_REF)
     if (right_class == duckdb::ExpressionClass::BOUND_REF) {
-      right_key_col_indices.push_back(
-        condition.right->Cast<duckdb::BoundReferenceExpression>().index);
+      right_key_idx = condition.right->Cast<duckdb::BoundReferenceExpression>().index;
+      right_key_col_indices.push_back(right_key_idx);
     } else if (right_class == duckdb::ExpressionClass::BOUND_CAST) {
       auto& bound_cast = condition.right->Cast<duckdb::BoundCastExpression>();
       if (bound_cast.child->GetExpressionClass() != duckdb::ExpressionClass::BOUND_REF) {
         throw std::runtime_error(
           "Unsupported join condition: BOUND_CAST child is not BOUND_REF (right)");
       }
-      right_key_col_indices.push_back(
-        bound_cast.child->Cast<duckdb::BoundReferenceExpression>().index);
+      right_key_idx = bound_cast.child->Cast<duckdb::BoundReferenceExpression>().index;
+      right_key_col_indices.push_back(right_key_idx);
       cast_info.cast_right        = true;
       cast_info.right_target_type = duckdb::GetCudfType(condition.right->return_type);
       cast_necessary              = true;
     } else {
       throw std::runtime_error("Unsupported join condition right expression");
+    }
+
+    auto left_cudf_type  = duckdb::GetCudfType(lhs_input_types[left_key_idx]);
+    auto right_cudf_type = duckdb::GetCudfType(rhs_input_types[right_key_idx]);
+    if (left_cudf_type != right_cudf_type) {
+      auto target                 = duckdb::GetCudfType(condition.left->return_type);
+      cast_info.cast_left         = (left_cudf_type != target);
+      cast_info.cast_right        = (right_cudf_type != target);
+      cast_info.left_target_type  = target;
+      cast_info.right_target_type = target;
+      cast_necessary              = true;
     }
 
     key_casts.push_back(cast_info);
@@ -364,27 +377,35 @@ static join_keys_result prepare_join_keys(
     return result;
   }
 
-  // Slow path: iterate over key columns and cast where needed
+  // Slow path: iterate over key columns and cast where needed. Use a single target type per key
+  // so left and right always match (required by cudf join).
   cudf::table_view left_table  = get_cudf_table_view(*input_batches[0]);
   cudf::table_view right_table = get_cudf_table_view(*input_batches[1]);
 
   for (size_t i = 0; i < left_key_col_indices.size(); i++) {
-    const auto& cast_info = key_casts[i];
+    const auto& cast_info       = key_casts[i];
+    cudf::column_view left_col  = left_table.column(left_key_col_indices[i]);
+    cudf::column_view right_col = right_table.column(right_key_col_indices[i]);
 
-    // Left key column
-    cudf::column_view left_col = left_table.column(left_key_col_indices[i]);
-    if (cast_info.cast_left) {
-      auto cast_col = cudf::cast(left_col, cast_info.left_target_type, stream);
+    cudf::data_type target_type;
+    if (cast_info.cast_left && cast_info.left_target_type.id() != cudf::type_id::EMPTY) {
+      target_type = cast_info.left_target_type;
+    } else if (cast_info.cast_right && cast_info.right_target_type.id() != cudf::type_id::EMPTY) {
+      target_type = cast_info.right_target_type;
+    } else {
+      target_type = left_col.type();
+    }
+
+    if (left_col.type() != target_type) {
+      auto cast_col = cudf::cast(left_col, target_type, stream);
       result.left_key_views.push_back(cast_col->view());
       result.owned_cast_columns.push_back(std::move(cast_col));
     } else {
       result.left_key_views.push_back(left_col);
     }
 
-    // Right key column
-    cudf::column_view right_col = right_table.column(right_key_col_indices[i]);
-    if (cast_info.cast_right) {
-      auto cast_col = cudf::cast(right_col, cast_info.right_target_type, stream);
+    if (right_col.type() != target_type) {
+      auto cast_col = cudf::cast(right_col, target_type, stream);
       result.right_key_views.push_back(cast_col->view());
       result.owned_cast_columns.push_back(std::move(cast_col));
     } else {
