@@ -15,9 +15,6 @@
  */
 
 // sirius
-#include <cucascade/data/data_repository_manager.hpp>
-#include <cucascade/data/gpu_data_representation.hpp>
-#include <data/data_batch_utils.hpp>
 #include <expression_executor/gpu_dispatcher.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
 #include <expression_executor/gpu_expression_executor_state.hpp>
@@ -25,11 +22,18 @@
 #include <gpu_columns.hpp>
 #include <operator/gpu_materialize.hpp>
 
+// cucascade
+#include <cucascade/data/data_repository_manager.hpp>
+#include <cucascade/data/gpu_data_representation.hpp>
+#include <data/data_batch_utils.hpp>
+
 // duckdb
 #include <duckdb/common/exception.hpp>
 
 // cudf
 #include <cudf/stream_compaction.hpp>
+#include <cudf/types.hpp>
+#include <cudf/utilities/type_dispatcher.hpp>
 
 // rmm
 #include <rmm/cuda_stream_view.hpp>
@@ -37,6 +41,16 @@
 
 namespace duckdb {
 namespace sirius {
+
+namespace {
+/// Returns true if cudf::cast supports this type (fixed-width only; no STRING/LIST/STRUCT/etc.).
+bool IsFixedWidth(cudf::data_type const& type)
+{
+  auto const id = type.id();
+  return id != cudf::type_id::STRING && id != cudf::type_id::LIST && id != cudf::type_id::STRUCT &&
+         id != cudf::type_id::DICTIONARY32 && id != cudf::type_id::EMPTY;
+}
+}  // namespace
 
 GpuExpressionExecutor::GpuExpressionExecutor(const Expression& expr,
                                              rmm::device_async_resource_ref resource_ref)
@@ -204,9 +218,17 @@ void GpuExpressionExecutor::Execute(const GPUIntermediateRelation& input_relatio
 
     // Cast the `result` from libcudf to `return_type` if `result` has different types.
     // E.g., `extract(year from col)` from libcudf returns int16_t but duckdb requires int64_t
+    // Only use cudf::cast when both types are fixed-width (cast does not support
+    // STRING/LIST/STRUCT).
     auto cudf_return_type = GetCudfType(expressions[i]->return_type);
     if (result->type().id() != cudf_return_type.id()) {
-      result = cudf::cast(result->view(), cudf_return_type, execution_stream, resource_ref);
+      if (IsFixedWidth(result->type()) && IsFixedWidth(cudf_return_type)) {
+        result = cudf::cast(result->view(), cudf_return_type, execution_stream, resource_ref);
+      } else {
+        throw InternalException("GpuExpressionExecutor: Unsupported type conversion: " +
+                                cudf::type_to_name(result->type()) + " to " +
+                                cudf::type_to_name(cudf_return_type));
+      }
     }
 
     // Transfer to output relation (zero copy)
@@ -235,16 +257,23 @@ std::shared_ptr<cucascade::data_batch> GpuExpressionExecutor::execute(
 
   for (size_t i = 0; i < expressions.size(); ++i) {
     // Execute the expression
-    auto const& expr = *expressions[i];
-    auto result      = ExecuteExpression(i);
+    auto const& expr      = *expressions[i];
+    auto result           = ExecuteExpression(i);
+    auto cudf_return_type = GetCudfType(expressions[i]->return_type);
 
     // Cast the `result` from libcudf to `return_type` if `result` has a different type.
     // E.g., `extract(year from col)` from libcudf returns int16_t but duckdb requires int64_t
-    auto cudf_return_type = GetCudfType(expressions[i]->return_type);
+    // Only use cudf::cast when both types are fixed-width (cast does not support
+    // STRING/LIST/STRUCT).
     if (result->type().id() != cudf_return_type.id()) {
-      result = cudf::cast(result->view(), cudf_return_type, execution_stream, resource_ref);
+      if (IsFixedWidth(result->type()) && IsFixedWidth(cudf_return_type)) {
+        result = cudf::cast(result->view(), cudf_return_type, execution_stream, resource_ref);
+      } else {
+        throw InternalException("GpuExpressionExecutor: Unsupported type conversion: " +
+                                cudf::type_to_name(result->type()) + " to " +
+                                cudf::type_to_name(cudf_return_type));
+      }
     }
-
     output_columns[i] = std::move(result);
   }
 
