@@ -20,7 +20,7 @@
 #include "parallel/task_executor.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/sirius_pipeline_itask.hpp"
-#include "pipeline/sirius_pipeline_itask_local_state.hpp"
+#include "pipeline/sirius_pipeline_task_local_state.hpp"
 
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
@@ -67,7 +67,7 @@ class gpu_pipeline_task_global_state : public sirius::parallel::itask_global_sta
  * execution. It holds the task and pipeline identifiers, the GPU pipeline to
  * execute, and the data batch views that serve as input to the pipeline.
  */
-class gpu_pipeline_task_local_state : public sirius_pipeline_itask_local_state {
+class gpu_pipeline_task_local_state : public sirius_pipeline_task_local_state {
  public:
   /**
    * @brief Construct a new gpu_pipeline_task_local_state object
@@ -113,7 +113,7 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
    */
   gpu_pipeline_task(uint64_t task_id,
                     std::vector<cucascade::shared_data_repository*> data_repos,
-                    std::unique_ptr<sirius_pipeline_itask_local_state> local_state,
+                    std::unique_ptr<sirius_pipeline_task_local_state> local_state,
                     std::shared_ptr<sirius::parallel::itask_global_state> global_state);
 
   ~gpu_pipeline_task() override;

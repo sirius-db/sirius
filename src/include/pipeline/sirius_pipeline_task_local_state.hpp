@@ -33,12 +33,12 @@ namespace pipeline {
  * tasks and DuckDB scan tasks that need to manage memory reservations.
  */
 // WSM TODO: consider merging this with itask_local_state
-class sirius_pipeline_itask_local_state : public parallel::itask_local_state {
+class sirius_pipeline_task_local_state : public parallel::itask_local_state {
  public:
   /**
    * @brief Destructor for proper cleanup of derived classes.
    */
-  ~sirius_pipeline_itask_local_state() override = default;
+  ~sirius_pipeline_task_local_state() override = default;
 
   /**
    * @brief Release and return the memory reservation held by this task.
@@ -74,7 +74,7 @@ class sirius_pipeline_itask_local_state : public parallel::itask_local_state {
    * This constructor is protected to ensure the class can only be instantiated
    * through derived classes.
    */
-  sirius_pipeline_itask_local_state() = default;
+  sirius_pipeline_task_local_state() = default;
 
   std::unique_ptr<cucascade::memory::reservation>
     _reservation;  ///< Memory reservation for GPU resources

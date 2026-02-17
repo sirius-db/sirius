@@ -22,7 +22,7 @@
 #include <op/sirius_physical_parquet_scan.hpp>
 #include <op/sirius_physical_table_scan.hpp>
 #include <pipeline/sirius_pipeline_itask.hpp>
-#include <pipeline/sirius_pipeline_itask_local_state.hpp>
+#include <pipeline/sirius_pipeline_task_local_state.hpp>
 #include <sirius_context.hpp>
 
 // cucascade
@@ -217,7 +217,7 @@ class parquet_scan_task_global_state : public parallel::itask_global_state {
  * @brief Local state for parquet_scan_task, which manages the row group indices assigned to this
  * task and makes the memory allocation for the task.
  */
-class parquet_scan_task_local_state : public pipeline::sirius_pipeline_itask_local_state {
+class parquet_scan_task_local_state : public pipeline::sirius_pipeline_task_local_state {
   using multiple_blocks_allocation =
     cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation;
   using memory_space = cucascade::memory::memory_space;

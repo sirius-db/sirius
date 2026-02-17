@@ -23,7 +23,7 @@
 #include "op/scan/parquet_scan_task.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/completion_handler.hpp"
-#include "pipeline/sirius_pipeline_itask_local_state.hpp"
+#include "pipeline/sirius_pipeline_task_local_state.hpp"
 
 #include <cudf/utilities/default_stream.hpp>
 
@@ -210,7 +210,7 @@ void duckdb_scan_executor::manager_loop()
           "DuckDB Scan Executor: Failed to acquire host memory reservation");
         break;
       }
-      if (auto* local_state = dynamic_cast<sirius::pipeline::sirius_pipeline_itask_local_state*>(
+      if (auto* local_state = dynamic_cast<sirius::pipeline::sirius_pipeline_task_local_state*>(
             scan_task->local_state())) {
         local_state->set_reservation(std::move(reservation));
       } else {

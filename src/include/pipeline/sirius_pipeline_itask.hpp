@@ -18,7 +18,7 @@
 
 #include "op/sirius_physical_operator.hpp"
 #include "parallel/task.hpp"
-#include "pipeline/sirius_pipeline_itask_local_state.hpp"
+#include "pipeline/sirius_pipeline_task_local_state.hpp"
 
 #include <cudf/utilities/default_stream.hpp>
 
@@ -97,7 +97,7 @@ class sirius_pipeline_itask : public parallel::itask {
    * @param local_state The local state specific to this task
    * @param global_state The global state shared across multiple tasks
    */
-  sirius_pipeline_itask(std::unique_ptr<sirius_pipeline_itask_local_state> local_state,
+  sirius_pipeline_itask(std::unique_ptr<sirius_pipeline_task_local_state> local_state,
                         std::shared_ptr<parallel::itask_global_state> global_state)
     : itask(std::move(local_state), std::move(global_state))
   {

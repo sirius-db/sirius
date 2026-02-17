@@ -28,7 +28,7 @@
 #include <pipeline/pipeline_executor.hpp>
 #include <pipeline/sirius_pipeline.hpp>
 #include <pipeline/sirius_pipeline_itask.hpp>
-#include <pipeline/sirius_pipeline_itask_local_state.hpp>
+#include <pipeline/sirius_pipeline_task_local_state.hpp>
 #include <sirius_context.hpp>
 
 // cucascade
@@ -167,7 +167,7 @@ class duckdb_scan_task_global_state : public sirius::parallel::itask_global_stat
  * DuckDB data chunks into those buffers.
  *
  */
-class duckdb_scan_task_local_state : public sirius::pipeline::sirius_pipeline_itask_local_state {
+class duckdb_scan_task_local_state : public sirius::pipeline::sirius_pipeline_task_local_state {
   using data_batch = cucascade::data_batch;
 
  public:

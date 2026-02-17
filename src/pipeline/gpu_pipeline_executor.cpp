@@ -114,7 +114,7 @@ void gpu_pipeline_executor::manager_loop()
         std::to_string(gpu_task->get_task_id()));
       break;
     }
-    if (auto* local_state = dynamic_cast<sirius::pipeline::sirius_pipeline_itask_local_state*>(
+    if (auto* local_state = dynamic_cast<sirius::pipeline::sirius_pipeline_task_local_state*>(
           gpu_task->local_state())) {
       local_state->set_reservation(std::move(reservation));
     } else {
