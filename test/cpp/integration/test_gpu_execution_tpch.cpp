@@ -324,6 +324,344 @@ TEST_CASE_METHOD(GPUExecutionFixture,
                  "gpu_execution - basic inner join 0",
                  "[integration][gpu_execution][join]")
 {
+  duckdb::Connection con(get_shared_db());
+  compare_gpu_vs_cpu(con,
+                     "select n.n_nationkey, n.n_regionkey, c.c_nationkey, c.c_custkey, c.c_name  "
+                     "from nation n join customer c on n.n_nationkey = c.c_nationkey;");
+}
+
+TEST_CASE("gpu_execution - basic inner join 1", "[integration][gpu_execution][join]")
+{
+  duckdb::Connection con(get_shared_db());
+  compare_gpu_vs_cpu(con,
+                     "select n.n_nationkey, n.n_regionkey, c.c_custkey, c.c_name  from nation n "
+                     "join customer c on n.n_nationkey = c.c_nationkey;");
+}
+
+TEST_CASE("gpu_execution - basic inner join 2", "[integration][gpu_execution][join]")
+{
+  duckdb::Connection con(get_shared_db());
+  compare_gpu_vs_cpu(con,
+                     "select n.n_regionkey, c.c_nationkey, c.c_custkey, c.c_name  from nation n "
+                     "join customer c on n.n_nationkey = c.c_nationkey;");
+}
+
+TEST_CASE("gpu_execution - basic inner join 3", "[integration][gpu_execution][join]")
+{
+  duckdb::Connection con(get_shared_db());
+  compare_gpu_vs_cpu(con,
+                     "select n.n_name, c.c_custkey, c.c_name  from nation n join customer c on "
+                     "n.n_nationkey = c.c_nationkey;");
+}
+
+TEST_CASE("gpu_execution - basic left join 0", "[integration][gpu_execution][join]")
+{
+  duckdb::Connection con(get_shared_db());
+  compare_gpu_vs_cpu(con,
+                     "select n.n_nationkey, n.n_regionkey, c.c_nationkey, c.c_custkey, c.c_name  "
+                     "from nation n left join customer c on n.n_nationkey = c.c_nationkey;");
+}
+
+TEST_CASE("gpu_execution - basic left join 1", "[integration][gpu_execution][join]")
+{
+  duckdb::Connection con(get_shared_db());
+  compare_gpu_vs_cpu(con,
+                     "select n.n_nationkey, n.n_regionkey, c.c_custkey, c.c_name  from nation n "
+                     "left join customer c on n.n_nationkey = c.c_nationkey;");
+}
+
+TEST_CASE("gpu_execution - basic left join 2", "[integration][gpu_execution][join]")
+{
+  duckdb::Connection con(get_shared_db());
+  compare_gpu_vs_cpu(con,
+                     "select n.n_regionkey, c.c_nationkey, c.c_custkey, c.c_name  from nation n "
+                     "left join customer c on n.n_nationkey = c.c_nationkey;");
+}
+
+TEST_CASE("gpu_execution - basic left join 3", "[integration][gpu_execution][join]")
+{
+  duckdb::Connection con(get_shared_db());
+  compare_gpu_vs_cpu(con,
+                     "select n.n_name, c.c_custkey, c.c_name  from nation n left join customer c "
+                     "on n.n_nationkey = c.c_nationkey;");
+}
+
+TEST_CASE("gpu_execution - basic left join 0 making nulls", "[integration][gpu_execution][join]")
+{
+  duckdb::Connection con(get_shared_db());
+  compare_gpu_vs_cpu(con,
+                     "select n.n_nationkey, n.n_regionkey, c.c_nationkey, c.c_custkey, c.c_name  "
+                     "from nation n left join customer c on n.n_nationkey = c.c_custkey;");
+}
+
+TEST_CASE("gpu_execution - basic left join 1 making nulls", "[integration][gpu_execution][join]")
+{
+  duckdb::Connection con(get_shared_db());
+  compare_gpu_vs_cpu(con,
+                     "select n.n_nationkey, n.n_regionkey, c.c_custkey, c.c_name  from nation n "
+                     "left join customer c on n.n_nationkey = c.c_custkey;");
+}
+
+TEST_CASE("gpu_execution - basic left join 2 making nulls", "[integration][gpu_execution][join]")
+{
+  duckdb::Connection con(get_shared_db());
+  compare_gpu_vs_cpu(con,
+                     "select n.n_regionkey, c.c_nationkey, c.c_custkey, c.c_name  from nation n "
+                     "left join customer c on n.n_nationkey = c.c_custkey;");
+}
+
+TEST_CASE("gpu_execution - basic left join 3 making nulls", "[integration][gpu_execution][join]")
+{
+  duckdb::Connection con(get_shared_db());
+  compare_gpu_vs_cpu(con,
+                     "select n.n_name, c.c_custkey, c.c_name  from nation n left join customer c "
+                     "on n.n_nationkey = c.c_custkey;");
+}
+
+TEST_CASE("gpu_execution - basic right join 0", "[integration][gpu_execution][join]")
+{
+  duckdb::Connection con(get_shared_db());
+  compare_gpu_vs_cpu(con,
+                     "select n.n_nationkey, n.n_regionkey, c.c_nationkey, c.c_custkey, c.c_name  "
+                     "from nation n right join customer c on n.n_nationkey = c.c_nationkey;");
+}
+
+TEST_CASE("gpu_execution - basic right join 1", "[integration][gpu_execution][join]")
+{
+  duckdb::Connection con(get_shared_db());
+  compare_gpu_vs_cpu(con,
+                     "select n.n_nationkey, n.n_regionkey, c.c_custkey, c.c_name  from nation n "
+                     "right join customer c on n.n_nationkey = c.c_nationkey;");
+}
+
+TEST_CASE("gpu_execution - basic right join 2", "[integration][gpu_execution][join]")
+{
+  duckdb::Connection con(get_shared_db());
+  compare_gpu_vs_cpu(con,
+                     "select n.n_regionkey, c.c_nationkey, c.c_custkey, c.c_name  from nation n "
+                     "right join customer c on n.n_nationkey = c.c_nationkey;");
+}
+
+TEST_CASE("gpu_execution - basic right join 3", "[integration][gpu_execution][join]")
+{
+  duckdb::Connection con(get_shared_db());
+  compare_gpu_vs_cpu(con,
+                     "select n.n_name, c.c_custkey, c.c_name  from nation n right join customer c "
+                     "on n.n_nationkey = c.c_nationkey;");
+}
+
+TEST_CASE("gpu_execution - basic right join 0 making nulls", "[integration][gpu_execution][join]")
+{
+  duckdb::Connection con(get_shared_db());
+  compare_gpu_vs_cpu(con,
+                     "select n.n_nationkey, n.n_regionkey, c.c_nationkey, c.c_custkey, c.c_name  "
+                     "from nation n right join customer c on n.n_nationkey = c.c_custkey;");
+}
+
+TEST_CASE("gpu_execution - basic right join 1 making nulls", "[integration][gpu_execution][join]")
+{
+  duckdb::Connection con(get_shared_db());
+  compare_gpu_vs_cpu(con,
+                     "select n.n_nationkey, n.n_regionkey, c.c_custkey, c.c_name  from nation n "
+                     "right join customer c on n.n_nationkey = c.c_custkey;");
+}
+
+TEST_CASE("gpu_execution - basic right join 2 making nulls", "[integration][gpu_execution][join]")
+{
+  duckdb::Connection con(get_shared_db());
+  compare_gpu_vs_cpu(con,
+                     "select n.n_regionkey, c.c_nationkey, c.c_custkey, c.c_name  from nation n "
+                     "right join customer c on n.n_nationkey = c.c_custkey;");
+}
+
+TEST_CASE("gpu_execution - basic right join 3 making nulls", "[integration][gpu_execution][join]")
+{
+  duckdb::Connection con(get_shared_db());
+  compare_gpu_vs_cpu(con,
+                     "select n.n_name, c.c_custkey, c.c_name  from nation n right join customer c "
+                     "on n.n_nationkey = c.c_custkey;");
+}
+
+TEST_CASE("gpu_execution - swapped inner join 0", "[integration][gpu_execution][join]")
+{
+  duckdb::Connection con(get_shared_db());
+  compare_gpu_vs_cpu(con,
+                     "select n.n_nationkey, n.n_regionkey, c.c_nationkey, c.c_custkey, c.c_name  "
+                     "from customer c join nation n on n.n_nationkey = c.c_nationkey;");
+}
+
+TEST_CASE("gpu_execution - swapped inner join 1", "[integration][gpu_execution][join]")
+{
+  duckdb::Connection con(get_shared_db());
+  compare_gpu_vs_cpu(con,
+                     "select n.n_nationkey, n.n_regionkey, c.c_custkey, c.c_name  from customer c "
+                     "join nation n on n.n_nationkey = c.c_nationkey;");
+}
+
+TEST_CASE("gpu_execution - swapped inner join 2", "[integration][gpu_execution][join]")
+{
+  duckdb::Connection con(get_shared_db());
+  compare_gpu_vs_cpu(con,
+                     "select n.n_regionkey, c.c_nationkey, c.c_custkey, c.c_name  from customer c "
+                     "join nation n on n.n_nationkey = c.c_nationkey;");
+}
+
+TEST_CASE("gpu_execution - swapped inner join 3", "[integration][gpu_execution][join]")
+{
+  duckdb::Connection con(get_shared_db());
+  compare_gpu_vs_cpu(con,
+                     "select n.n_name, c.c_custkey, c.c_name  from customer c join nation n on "
+                     "n.n_nationkey = c.c_nationkey;");
+}
+
+TEST_CASE("gpu_execution - swapped left join 0", "[integration][gpu_execution][join]")
+{
+  duckdb::Connection con(get_shared_db());
+  compare_gpu_vs_cpu(con,
+                     "select n.n_nationkey, n.n_regionkey, c.c_nationkey, c.c_custkey, c.c_name  "
+                     "from customer c left join nation n on n.n_nationkey = c.c_nationkey;");
+}
+
+TEST_CASE("gpu_execution - swapped left join 1", "[integration][gpu_execution][join]")
+{
+  duckdb::Connection con(get_shared_db());
+  compare_gpu_vs_cpu(con,
+                     "select n.n_nationkey, n.n_regionkey, c.c_custkey, c.c_name  from customer c "
+                     "left join nation n on n.n_nationkey = c.c_nationkey;");
+}
+
+TEST_CASE("gpu_execution - swapped left join 2", "[integration][gpu_execution][join]")
+{
+  duckdb::Connection con(get_shared_db());
+  compare_gpu_vs_cpu(con,
+                     "select n.n_regionkey, c.c_nationkey, c.c_custkey, c.c_name  from customer c "
+                     "left join nation n on n.n_nationkey = c.c_nationkey;");
+}
+
+TEST_CASE("gpu_execution - swapped left join 3", "[integration][gpu_execution][join]")
+{
+  duckdb::Connection con(get_shared_db());
+  compare_gpu_vs_cpu(con,
+                     "select n.n_name, c.c_custkey, c.c_name  from customer c left join nation n "
+                     "on n.n_nationkey = c.c_nationkey;");
+}
+
+TEST_CASE("gpu_execution - swapped left join 0 making nulls", "[integration][gpu_execution][join]")
+{
+  duckdb::Connection con(get_shared_db());
+  compare_gpu_vs_cpu(con,
+                     "select n.n_nationkey, n.n_regionkey, c.c_nationkey, c.c_custkey, c.c_name  "
+                     "from customer c left join nation n on n.n_nationkey = c.c_custkey;");
+}
+
+TEST_CASE("gpu_execution - swapped left join 1 making nulls", "[integration][gpu_execution][join]")
+{
+  duckdb::Connection con(get_shared_db());
+  compare_gpu_vs_cpu(con,
+                     "select n.n_nationkey, n.n_regionkey, c.c_custkey, c.c_name  from customer c "
+                     "left join nation n on n.n_nationkey = c.c_custkey;");
+}
+
+TEST_CASE("gpu_execution - swapped left join 2 making nulls", "[integration][gpu_execution][join]")
+{
+  duckdb::Connection con(get_shared_db());
+  compare_gpu_vs_cpu(con,
+                     "select n.n_regionkey, c.c_nationkey, c.c_custkey, c.c_name  from customer c "
+                     "left join nation n on n.n_nationkey = c.c_custkey;");
+}
+
+TEST_CASE("gpu_execution - swapped left join 3 making nulls", "[integration][gpu_execution][join]")
+{
+  duckdb::Connection con(get_shared_db());
+  compare_gpu_vs_cpu(con,
+                     "select n.n_name, c.c_custkey, c.c_name  from customer c left join nation n "
+                     "on n.n_nationkey = c.c_custkey;");
+}
+
+TEST_CASE("gpu_execution - swapped right join 0", "[integration][gpu_execution][join]")
+{
+  duckdb::Connection con(get_shared_db());
+  compare_gpu_vs_cpu(con,
+                     "select n.n_nationkey, n.n_regionkey, c.c_nationkey, c.c_custkey, c.c_name  "
+                     "from customer c right join nation n on n.n_nationkey = c.c_nationkey;");
+}
+
+TEST_CASE("gpu_execution - swapped right join 1", "[integration][gpu_execution][join]")
+{
+  duckdb::Connection con(get_shared_db());
+  compare_gpu_vs_cpu(con,
+                     "select n.n_nationkey, n.n_regionkey, c.c_custkey, c.c_name  from customer c "
+                     "right join nation n on n.n_nationkey = c.c_nationkey;");
+}
+
+TEST_CASE("gpu_execution - swapped right join 2", "[integration][gpu_execution][join]")
+{
+  duckdb::Connection con(get_shared_db());
+  compare_gpu_vs_cpu(con,
+                     "select n.n_regionkey, c.c_nationkey, c.c_custkey, c.c_name  from customer c "
+                     "right join nation n on n.n_nationkey = c.c_nationkey;");
+}
+
+TEST_CASE("gpu_execution - swapped right join 3", "[integration][gpu_execution][join]")
+{
+  duckdb::Connection con(get_shared_db());
+  compare_gpu_vs_cpu(con,
+                     "select n.n_name, c.c_custkey, c.c_name  from customer c right join nation n "
+                     "on n.n_nationkey = c.c_nationkey;");
+}
+
+TEST_CASE("gpu_execution - swapped right join 0 making nulls", "[integration][gpu_execution][fjoin]")
+{
+  duckdb::Connection con(get_shared_db());
+  compare_gpu_vs_cpu(con,
+                     "select n.n_nationkey, n.n_regionkey, c.c_nationkey, c.c_custkey, c.c_name  "
+                     "from customer c right join nation n on n.n_nationkey = c.c_custkey;");
+}
+
+TEST_CASE("gpu_execution - swapped right join 1 making nulls", "[integration][gpu_execution][fjoin]")
+{
+  duckdb::Connection con(get_shared_db());
+  compare_gpu_vs_cpu(con,
+                     "select n.n_nationkey, n.n_regionkey, c.c_custkey, c.c_name  from customer c "
+                     "right join nation n on n.n_nationkey = c.c_custkey;");
+}
+
+TEST_CASE("gpu_execution - swapped right join 2 making nulls", "[integration][gpu_execution][join]")
+{
+  duckdb::Connection con(get_shared_db());
+  compare_gpu_vs_cpu(con,
+                     "select n.n_regionkey, c.c_nationkey, c.c_custkey, c.c_name  from customer c "
+                     "right join nation n on n.n_nationkey = c.c_custkey;");
+}
+
+TEST_CASE("gpu_execution - swapped right join 3 making nulls", "[integration][gpu_execution][join]")
+{
+  duckdb::Connection con(get_shared_db());
+  compare_gpu_vs_cpu(con,
+                     "select n.n_name, c.c_custkey, c.c_name  from customer c right join nation n "
+                     "on n.n_nationkey = c.c_custkey;");
+}
+
+TEST_CASE("gpu_execution - basic full outer join", "[integration][gpu_execution][join]")
+{
+  duckdb::Connection con(get_shared_db());
+  compare_gpu_vs_cpu(con,
+                     "select n.n_nationkey, r.r_regionkey from nation n full outer join region r "
+                     "on n.n_regionkey = r.r_regionkey;");
+}
+
+TEST_CASE("gpu_execution - basic full outer join making nulls",
+          "[integration][gpu_execution][join]")
+{
+  duckdb::Connection con(get_shared_db());
+  compare_gpu_vs_cpu(con,
+                     "select n.n_nationkey, r.r_regionkey from nation n full outer join region r "
+                     "on n.n_nationkey = r.r_regionkey;");
+}
+
+TEST_CASE("gpu_execution - basic left semi join", "[integration][gpu_execution][join]")
+{
+  duckdb::Connection con(get_shared_db());
   compare_gpu_vs_cpu(
     "select n.n_nationkey, n.n_regionkey, c.c_nationkey, c.c_custkey, c.c_name  "
     "from nation n join customer c on n.n_nationkey = c.c_nationkey;");
@@ -733,6 +1071,80 @@ TEST_CASE_METHOD(GPUExecutionFixture,
 TEST_CASE_METHOD(GPUExecutionFixture,
                  "gpu_execution - bigger inner join",
                  "[integration][gpu_execution][bigger_join]")
+
+TEST_CASE("gpu_execution - basic semi join 3", "[integration][gpu_execution][join]")
+{
+  duckdb::Connection con(get_shared_db());
+  compare_gpu_vs_cpu(con,
+                     "select n.n_nationkey, n.n_regionkey "
+                     "from nation n semi join customer c on n.n_nationkey = c.c_nationkey;");
+}
+
+TEST_CASE("gpu_execution - basic semi join 4", "[integration][gpu_execution][join]")
+{
+  duckdb::Connection con(get_shared_db());
+  compare_gpu_vs_cpu(con,
+                     "select n.n_regionkey  from nation n "
+                     "semi join customer c on n.n_nationkey = c.c_nationkey;");
+}
+
+TEST_CASE("gpu_execution - basic semi join 5", "[integration][gpu_execution][join]")
+{
+  duckdb::Connection con(get_shared_db());
+  compare_gpu_vs_cpu(con,
+                     "select n.n_name from nation n semi join customer c "
+                     "on n.n_nationkey = c.c_nationkey;");
+}
+
+TEST_CASE("gpu_execution - basic semi join misfit 0", "[integration][gpu_execution][fjoin]")
+{
+  duckdb::Connection con(get_shared_db());
+  compare_gpu_vs_cpu(con,
+                     "select n.n_nationkey, n.n_regionkey  "
+                     "from nation n semi join customer c on n.n_nationkey = c.c_custkey;");
+}
+
+TEST_CASE("gpu_execution - basic semi join mistit 1", "[integration][gpu_execution][join]")
+{
+  duckdb::Connection con(get_shared_db());
+  compare_gpu_vs_cpu(con,
+                     "select n.n_regionkey  from nation n "
+                     "semi join customer c on n.n_nationkey = c.c_custkey;");
+}
+
+TEST_CASE("gpu_execution - swapped semi join 0", "[integration][gpu_execution][join]")
+{
+  duckdb::Connection con(get_shared_db());
+  compare_gpu_vs_cpu(con,
+                     "select c.c_nationkey, c.c_custkey, c.c_name  "
+                     "from customer c semi join nation n on n.n_nationkey = c.c_nationkey;");
+}
+
+TEST_CASE("gpu_execution - swapped semi join 1", "[integration][gpu_execution][join]")
+{
+  duckdb::Connection con(get_shared_db());
+  compare_gpu_vs_cpu(con,
+                     "select c.c_custkey, c.c_name  from customer c "
+                     "left semi nation n on n.n_nationkey = c.c_nationkey;");
+}
+
+TEST_CASE("gpu_execution - swapped semi join misfit 0", "[integration][gpu_execution][join]")
+{
+  duckdb::Connection con(get_shared_db());
+  compare_gpu_vs_cpu(con,
+                     "select c.c_nationkey, c.c_custkey, c.c_name  "
+                     "from customer c semi join nation n on n.n_nationkey = c.c_custkey;");
+}
+
+TEST_CASE("gpu_execution - swapped semi join misfit 1", "[integration][gpu_execution][join]")
+{
+  duckdb::Connection con(get_shared_db());
+  compare_gpu_vs_cpu(con,
+                     "select c.c_custkey, c.c_name  from customer c "
+                     "semi join nation n on n.n_nationkey = c.c_custkey;");
+}
+
+TEST_CASE("gpu_execution - bigger inner join", "[integration][gpu_execution][bigger_join]")
 {
   compare_gpu_vs_cpu(
     "select l.l_orderkey, l.l_linenumber, l.l_quantity, l.l_partkey, o.o_orderkey, o.o_totalprice, "
@@ -1060,13 +1472,4 @@ TEST_CASE_METHOD(GPUExecutionFixture,
 {
   compare_gpu_vs_cpu(
     "select n_nationkey, n_regionkey from nation order by n_regionkey desc limit 5;");
-}
-
-TEST_CASE_METHOD(GPUExecutionFixture,
-                 "gpu_execution - join",
-                 "[.][integration_disabled][gpu_execution]")
-{
-  compare_gpu_vs_cpu(
-    "select n.n_nationkey, r.r_regionkey from nation n join region r on n.n_regionkey = "
-    "r.r_regionkey;");
 }
