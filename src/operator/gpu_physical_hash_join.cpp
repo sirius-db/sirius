@@ -445,21 +445,20 @@ GPUPhysicalHashJoin::GPUPhysicalHashJoin(LogicalOperator& op,
   materialized_build_key =
     make_shared_ptr<GPUIntermediateRelation>(build_columns_in_conditions.size());
 
-
-    printf("  lhs_output_columns: col_idxs=[");
-    for (size_t i = 0; i < lhs_output_columns.col_idxs.size(); i++) {
-      printf("%s%zu", i ? ", " : "", static_cast<size_t>(lhs_output_columns.col_idxs[i]));
-    }
-    printf("] (size=%zu), col_types.size()=%zu\n",
-           lhs_output_columns.col_idxs.size(),
-           lhs_output_columns.col_types.size());
-    printf("  rhs_output_columns: col_idxs=[");
-    for (size_t i = 0; i < rhs_output_columns.col_idxs.size(); i++) {
-      printf("%s%zu", i ? ", " : "", static_cast<size_t>(rhs_output_columns.col_idxs[i]));
-    }
-    printf("] (size=%zu), col_types.size()=%zu\n",
-           rhs_output_columns.col_idxs.size(),
-           rhs_output_columns.col_types.size());
+  printf("  lhs_output_columns: col_idxs=[");
+  for (size_t i = 0; i < lhs_output_columns.col_idxs.size(); i++) {
+    printf("%s%zu", i ? ", " : "", static_cast<size_t>(lhs_output_columns.col_idxs[i]));
+  }
+  printf("] (size=%zu), col_types.size()=%zu\n",
+         lhs_output_columns.col_idxs.size(),
+         lhs_output_columns.col_types.size());
+  printf("  rhs_output_columns: col_idxs=[");
+  for (size_t i = 0; i < rhs_output_columns.col_idxs.size(); i++) {
+    printf("%s%zu", i ? ", " : "", static_cast<size_t>(rhs_output_columns.col_idxs[i]));
+  }
+  printf("] (size=%zu), col_types.size()=%zu\n",
+         rhs_output_columns.col_idxs.size(),
+         rhs_output_columns.col_types.size());
 };
 
 SourceResultType GPUPhysicalHashJoin::GetData(GPUIntermediateRelation& output_relation) const
