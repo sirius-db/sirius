@@ -24,7 +24,7 @@
 #include "duckdb/execution/operator/join/physical_join.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/planner/operator/logical_join.hpp"
-#include "op/sirius_physical_operator.hpp"
+#include "op/sirius_physical_partition_consumer_operator.hpp"
 
 namespace sirius {
 
@@ -36,7 +36,7 @@ class sirius_meta_pipeline;
 namespace op {
 
 //! sirius_physical_nested_loop_join represents a nested loop join between two tables
-class sirius_physical_nested_loop_join : public sirius_physical_operator {
+class sirius_physical_nested_loop_join : public sirius_physical_partition_consumer_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE =
     SiriusPhysicalOperatorType::NESTED_LOOP_JOIN;

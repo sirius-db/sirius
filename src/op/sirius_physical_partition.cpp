@@ -24,6 +24,7 @@
 #include "op/sirius_physical_concat.hpp"
 #include "op/sirius_physical_grouped_aggregate_merge.hpp"
 #include "op/sirius_physical_hash_join.hpp"
+#include "op/sirius_physical_nested_loop_join.hpp"
 #include "op/sirius_physical_order.hpp"
 #include "op/sirius_physical_top_n.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -72,7 +73,25 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
         }
       }
     }
-
+  } else if (op->type == SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
+    _partition_type      = PartitionType::NONE;
+    auto& nested_join_op = op->Cast<sirius_physical_nested_loop_join>();
+    if (is_build) {
+      for (duckdb::idx_t cond_idx = 0; cond_idx < nested_join_op.conditions.size(); cond_idx++) {
+        auto& condition = nested_join_op.conditions[cond_idx];
+        if (condition.right->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
+          _partition_keys.push_back(
+            condition.right->Cast<duckdb::BoundReferenceExpression>().index);
+        }
+      }
+    } else {
+      for (duckdb::idx_t cond_idx = 0; cond_idx < nested_join_op.conditions.size(); cond_idx++) {
+        auto& condition = nested_join_op.conditions[cond_idx];
+        if (condition.left->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
+          _partition_keys.push_back(condition.left->Cast<duckdb::BoundReferenceExpression>().index);
+        }
+      }
+    }
   } else if (op->type == SiriusPhysicalOperatorType::HASH_GROUP_BY) {
     _partition_type            = PartitionType::HASH;
     auto& grouped_aggregate_op = op->Cast<sirius_physical_grouped_aggregate>();
@@ -112,6 +131,29 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
         _partition_keys.push_back(expr->Cast<duckdb::BoundReferenceExpression>().index);
       }
     }
+  } else if (op->type == SiriusPhysicalOperatorType::CONCAT) {
+    auto& parent_concat_op = op->Cast<sirius_physical_concat>();
+    bool is_build          = parent_concat_op.is_build_concat();
+    _is_build              = is_build;
+    if (parent_concat_op.get_parent_op()->type == SiriusPhysicalOperatorType::HASH_JOIN) {
+      auto& grandparent_join_op =
+        parent_concat_op.get_parent_op()->Cast<sirius_physical_hash_join>();
+      auto num_conditions = grandparent_join_op.conditions.size();
+      _num_partitions     = num_conditions;
+      get_partition_keys_and_type(&grandparent_join_op, is_build);
+    } else if (parent_concat_op.get_parent_op()->type ==
+               SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
+      auto& grandparent_join_op =
+        parent_concat_op.get_parent_op()->Cast<sirius_physical_nested_loop_join>();
+      auto num_conditions = grandparent_join_op.conditions.size();
+      _num_partitions     = num_conditions;
+      get_partition_keys_and_type(&grandparent_join_op, is_build);
+    } else {
+      throw std::runtime_error("Unsupported operator following partition->concat: " +
+                               parent_concat_op.get_parent_op()->get_name());
+    }
+  } else {
+    throw std::runtime_error("Unsupported operator type for partition: " + op->get_name());
   }
 }
 
@@ -140,6 +182,7 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
       partitioned_results = gpu_partition_impl::evenly_partition(
         input_batch, _num_partitions, stream, *input_batch->get_memory_space());
       break;
+    case PartitionType::NONE: partitioned_results = {input_batch}; break;
     case PartitionType::CUSTOM:
       throw std::runtime_error("Custom partitioning is not implemented yet");
     default:
