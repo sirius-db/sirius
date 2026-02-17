@@ -306,7 +306,7 @@ parquet_scan_task::~parquet_scan_task()
 {
   if (_global_state != nullptr) {
     auto& g_state = this->_global_state->cast<parquet_scan_task_global_state>();
-    g_state.get_operator().get_pipeline()->mark_task_completed();
+    if (auto pipeline = g_state.get_operator().get_pipeline()) { pipeline->mark_task_completed(); }
   }
 }
 

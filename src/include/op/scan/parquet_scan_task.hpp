@@ -383,6 +383,24 @@ class parquet_scan_task : public pipeline::sirius_pipeline_itask {
    */
   [[nodiscard]] uint64_t get_task_id() const { return _task_id; }
 
+  [[nodiscard]] size_t get_pipeline_id() const override
+  {
+    // todo(bobbi): only virtual because we cannot create a pipeline from a a list of operators, and
+    // test parquet needs this to work, this allows us to override it for parquet task and provide a
+    // different pipeline ID than the one in global state (which is not set for parquet tasks since
+    // they don't have a pipeline) if the global state is not set, we fall back to using the
+    // pipeline ID from the global state, which is
+
+    auto& g_state  = this->_global_state->cast<parquet_scan_task_global_state>();
+    auto* pipeline = g_state.get_pipeline();
+    if (!pipeline) {
+      // This can happen for parquet scan tasks since they don't have a pipeline, in that case we
+      // return a default pipeline ID of 0
+      g_state.get_operator().get_operator_id();
+    }
+    return g_state.get_pipeline_id();
+  }
+
  private:
   /**
    * @brief Read the given byte range from the parquet file into the memory allocation for this
