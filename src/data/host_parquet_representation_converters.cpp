@@ -72,21 +72,22 @@ std::unique_ptr<cucascade::idata_representation> convert_host_parquet_to_gpu(
 
   auto const& allocation = host_src.get_column_chunks();
 
-  // The following pattern follows the example here:
-  // https://github.com/rapidsai/cudf/blob/main/cpp/examples/hybrid_scan_io/common_utils.cpp#L160
+  // Allocate individual device buffers per column chunk byte range
+  std::vector<rmm::device_buffer> column_chunk_buffers;
+  column_chunk_buffers.reserve(byte_ranges.size());
+  for (auto const& byte_range : byte_ranges) {
+    column_chunk_buffers.emplace_back(byte_range.size(), stream, mr_ref);
+  }
 
-  // Allocate a single device buffer and partition it according to the byte ranges
-  std::vector<cudf::device_span<uint8_t const>> column_chunk_spans_d;
-  rmm::device_buffer device_buffer(host_src.get_size_in_bytes(), stream, mr_ref);
-  auto buffer_data = static_cast<uint8_t*>(device_buffer.data());
-  std::ignore =
-    std::accumulate(byte_ranges.begin(),
-                    byte_ranges.end(),
-                    size_t{0},
-                    [&column_chunk_spans_d, buffer_data](auto sum, auto const& byte_range) {
-                      column_chunk_spans_d.emplace_back(buffer_data + sum, byte_range.size());
-                      return sum + byte_range.size();
-                    });
+  // Build a mapping from global byte offset to (buffer_index, local_offset) for the copy.
+  // Each column_chunk_buffer corresponds to one byte_range, laid out contiguously in the host
+  // allocation. We iterate over host allocation blocks and map into the correct device buffer.
+  std::vector<size_t> range_offsets;  // cumulative start offset per byte range
+  range_offsets.reserve(byte_ranges.size() + 1);
+  range_offsets.push_back(0);
+  for (auto const& br : byte_ranges) {
+    range_offsets.push_back(range_offsets.back() + br.size());
+  }
 
   // Copy HOST data to GPU with a single async batch copy.
   size_t bytes_copied = 0;
@@ -98,7 +99,14 @@ std::unique_ptr<cucascade::idata_representation> convert_host_parquet_to_gpu(
     auto const block_offset  = bytes_copied % allocation->block_size();
     auto const bytes_to_copy = std::min(allocation->block_size() - block_offset,
                                         host_src.get_size_in_bytes() - bytes_copied);
-    dst_ptrs.push_back(static_cast<void*>(buffer_data + bytes_copied));
+
+    // Find which device buffer this global offset falls into
+    // Upper bound gives the first range whose start is > bytes_copied; subtract 1 for the range.
+    auto it        = std::upper_bound(range_offsets.begin(), range_offsets.end(), bytes_copied);
+    auto buf_idx   = static_cast<size_t>(std::distance(range_offsets.begin(), it) - 1);
+    auto local_off = bytes_copied - range_offsets[buf_idx];
+    dst_ptrs.push_back(
+      static_cast<void*>(static_cast<uint8_t*>(column_chunk_buffers[buf_idx].data()) + local_off));
     src_ptrs.push_back(const_cast<void*>(
       static_cast<void const*>(reinterpret_cast<uint8_t const*>(block.data() + block_offset))));
     counts.push_back(bytes_to_copy);
@@ -128,10 +136,8 @@ std::unique_ptr<cucascade::idata_representation> convert_host_parquet_to_gpu(
 #endif
 
   // Invoke the Parquet reader to materialize the table on GPU
-  auto column_chunk_spans_h = cudf::host_span<const cudf::device_span<uint8_t const>>(
-    column_chunk_spans_d.data(), column_chunk_spans_d.size());
   auto result = reader.materialize_all_columns(
-    host_src.get_rg_span(), column_chunk_spans_h, host_src.get_reader_options(), stream, mr_ref);
+    host_src.get_rg_span(), std::move(column_chunk_buffers), host_src.get_reader_options(), stream);
   auto new_table = std::move(result.tbl);  // Discard metadata
   stream.synchronize();
 

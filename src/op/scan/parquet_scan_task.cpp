@@ -202,7 +202,7 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
                     projected_columns.emplace_back(scan_op->names[col_idx]);
                   });
 
-    _reader_options.set_column_names(std::move(projected_columns));
+    _reader_options.set_columns(std::move(projected_columns));
   }
 
   // Compute the byte counts per row group for the selected columns for task partitioning

@@ -523,7 +523,7 @@ TEST_CASE("host_parquet_representation converts to GPU with projected columns",
   auto footer_buffer = read_parquet_footer(*datasource);
 
   auto reader_options = cudf::io::parquet_reader_options::builder().build();
-  reader_options.set_column_names({"id", "price"});
+  reader_options.set_columns({"id", "price"});
 
   auto reader = std::make_unique<hybrid_scan_reader>(
     cudf::host_span<uint8_t const>(footer_buffer->data(), footer_buffer->size()), reader_options);
