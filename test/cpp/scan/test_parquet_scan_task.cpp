@@ -24,7 +24,7 @@
 #include <op/scan/parquet_scan_task.hpp>
 #include <op/sirius_physical_parquet_scan.hpp>
 #include <parallel/task_executor.hpp>
-#include <pipeline/sirius_pipeline_task_local_state.hpp>
+#include <pipeline/sirius_pipeline_task_states.hpp>
 
 // cucascade
 #include <cucascade/memory/memory_reservation_manager.hpp>

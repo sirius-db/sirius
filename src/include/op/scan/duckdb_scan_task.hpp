@@ -28,7 +28,7 @@
 #include <pipeline/pipeline_executor.hpp>
 #include <pipeline/sirius_pipeline.hpp>
 #include <pipeline/sirius_pipeline_itask.hpp>
-#include <pipeline/sirius_pipeline_task_local_state.hpp>
+#include <pipeline/sirius_pipeline_task_states.hpp>
 #include <sirius_context.hpp>
 
 // cucascade

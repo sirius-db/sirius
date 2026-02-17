@@ -23,7 +23,7 @@
 #include "op/scan/parquet_scan_task.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/completion_handler.hpp"
-#include "pipeline/sirius_pipeline_task_local_state.hpp"
+#include "pipeline/sirius_pipeline_task_states.hpp"
 
 #include <cudf/utilities/default_stream.hpp>
 

@@ -20,7 +20,7 @@
 #include "parallel/task_executor.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/sirius_pipeline_itask.hpp"
-#include "pipeline/sirius_pipeline_task_local_state.hpp"
+#include "pipeline/sirius_pipeline_task_states.hpp"
 
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>

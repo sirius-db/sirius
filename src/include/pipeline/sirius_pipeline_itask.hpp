@@ -18,7 +18,7 @@
 
 #include "op/sirius_physical_operator.hpp"
 #include "parallel/task.hpp"
-#include "pipeline/sirius_pipeline_task_local_state.hpp"
+#include "pipeline/sirius_pipeline_task_states.hpp"
 
 #include <cudf/utilities/default_stream.hpp>
 
