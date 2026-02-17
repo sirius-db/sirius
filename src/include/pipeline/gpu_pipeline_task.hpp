@@ -41,24 +41,10 @@ namespace pipeline {
 /**
  * @brief Global state shared across all GPU pipeline tasks in an execution context.
  *
- * This class maintains resources and state that are shared among multiple tasks
- * within the same execution context. It provides access to the data repository
- * for retrieving input data and a message queue for notifying the TaskCreator
- * about task completion events.
+ * This is an alias to sirius_pipeline_task_global_state for backward compatibility
+ * and semantic clarity in GPU pipeline contexts.
  */
-class gpu_pipeline_task_global_state : public sirius::parallel::itask_global_state {
- public:
-  /**
-   * @brief Construct a new gpu_pipeline_task_global_state object
-   *
-   * @param pipeline Shared pointer to the GPU pipeline to execute
-   */
-  explicit gpu_pipeline_task_global_state(duckdb::shared_ptr<sirius_pipeline> pipeline)
-    : _pipeline(std::move(pipeline))
-  {
-  }
-  duckdb::shared_ptr<sirius_pipeline> _pipeline;  ///< Shared pointer to the GPU pipeline to execute
-};
+using gpu_pipeline_task_global_state = sirius_pipeline_task_global_state;
 
 /**
  * @brief Local state specific to an individual GPU pipeline task instance.

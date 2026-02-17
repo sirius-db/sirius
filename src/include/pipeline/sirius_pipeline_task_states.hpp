@@ -48,6 +48,8 @@ class sirius_pipeline_task_global_state : public sirius::parallel::itask_global_
 
   [[nodiscard]] const sirius_pipeline* get_pipeline() const { return _pipeline.get(); }
 
+  [[nodiscard]] sirius_pipeline* get_pipeline() { return _pipeline.get(); }
+
   [[nodiscard]] size_t get_pipeline_id() const { return _pipeline->get_pipeline_id(); }
 
  private:
