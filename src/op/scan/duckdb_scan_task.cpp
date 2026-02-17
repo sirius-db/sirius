@@ -43,7 +43,7 @@ duckdb_scan_task_global_state::duckdb_scan_task_global_state(
   pipeline::pipeline_executor& pipeline_exec,
   duckdb::ClientContext& client_ctx,
   sirius_physical_duckdb_scan* scan_op)
-  : _pipeline(std::move(pipeline)),
+  : sirius_pipeline_task_global_state(pipeline),
     _sirius_ctx(client_ctx.registered_state->Get<duckdb::SiriusContext>("sirius_state").get()),
     _max_threads(pipeline_exec.get_scan_executor().get_num_threads()),
     _pipeline_executor(pipeline_exec),
@@ -444,10 +444,10 @@ std::shared_ptr<cucascade::data_batch> duckdb_scan_task_local_state::make_data_b
 duckdb_scan_task::~duckdb_scan_task()
 {
   if (_global_state == nullptr ||
-      _global_state->cast<duckdb_scan_task_global_state>()._pipeline.get() == nullptr) {
+      _global_state->cast<duckdb_scan_task_global_state>().get_pipeline() == nullptr) {
     return;
   }
-  _global_state->cast<duckdb_scan_task_global_state>()._pipeline.get()->mark_task_completed();
+  _global_state->cast<duckdb_scan_task_global_state>().get_pipeline()->mark_task_completed();
 }
 
 bool duckdb_scan_task::get_next_chunk(duckdb_scan_task_local_state& l_state,

@@ -161,7 +161,7 @@ class pipeline_executor {
   void schedule_next_scan_tasks();
 
   std::mutex _priority_scans_mutex;
-  std::queue<op::sirius_physical_duckdb_scan*> _priority_scans;
+  std::queue<op::sirius_physical_operator*> _priority_scans;
 
   exec::interruptible_mpmc<std::unique_ptr<sirius::parallel::itask>>
     _task_queue;  ///< Queue for GPU pipeline tasks

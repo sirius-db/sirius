@@ -18,7 +18,7 @@
 
 #include "op/sirius_physical_operator.hpp"
 #include "parallel/task.hpp"
-#include "pipeline/sirius_pipeline_itask_local_state.hpp"
+#include "pipeline/sirius_pipeline_task_states.hpp"
 
 #include <cudf/utilities/default_stream.hpp>
 
@@ -90,6 +90,16 @@ class sirius_pipeline_itask : public parallel::itask {
     if (output_batches) { publish_output(*output_batches, stream); }
   }
 
+  // todo(bobbi): only virtual because we cannot create a pipeline from a a list of operators, and
+  // test parquet needs this to work, this allows us to override it for parquet task and provide a
+  // different pipeline ID than the one in global state (which is not set for parquet tasks since
+  // they don't have a pipeline) if the global state is not set, we fall back to using the pipeline
+  // ID from the global state, which is
+  [[nodiscard]] virtual size_t get_pipeline_id() const
+  {
+    return _global_state->cast<sirius_pipeline_task_global_state>().get_pipeline_id();
+  }
+
  protected:
   /**
    * @brief Protected constructor for derived classes.
@@ -97,8 +107,8 @@ class sirius_pipeline_itask : public parallel::itask {
    * @param local_state The local state specific to this task
    * @param global_state The global state shared across multiple tasks
    */
-  sirius_pipeline_itask(std::unique_ptr<sirius_pipeline_itask_local_state> local_state,
-                        std::shared_ptr<parallel::itask_global_state> global_state)
+  sirius_pipeline_itask(std::unique_ptr<sirius_pipeline_task_local_state> local_state,
+                        std::shared_ptr<sirius_pipeline_task_global_state> global_state)
     : itask(std::move(local_state), std::move(global_state))
   {
   }

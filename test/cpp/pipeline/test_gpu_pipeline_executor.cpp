@@ -19,6 +19,7 @@
 #include "exec/config.hpp"
 #include "pipeline/gpu_pipeline_executor.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
+#include "pipeline/sirius_pipeline_task_states.hpp"
 #include "pipeline/task_request.hpp"
 #include "scan/test_utils.hpp"
 
@@ -40,9 +41,9 @@ constexpr std::size_t kReservationBytes = 20 * 1024 * 1024;
 constexpr std::size_t kAllocationBytes  = 10 * 1024 * 1024;
 
 class test_gpu_pipeline_task_global_state
-  : public sirius::pipeline::gpu_pipeline_task_global_state {
+  : public sirius::pipeline::sirius_pipeline_task_global_state {
  public:
-  test_gpu_pipeline_task_global_state() : gpu_pipeline_task_global_state(nullptr) {}
+  test_gpu_pipeline_task_global_state() : sirius_pipeline_task_global_state(nullptr) {}
 
   void add_error(std::string message)
   {

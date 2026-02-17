@@ -22,7 +22,7 @@
 #include <op/sirius_physical_parquet_scan.hpp>
 #include <op/sirius_physical_table_scan.hpp>
 #include <pipeline/sirius_pipeline_itask.hpp>
-#include <pipeline/sirius_pipeline_itask_local_state.hpp>
+#include <pipeline/sirius_pipeline_task_states.hpp>
 #include <sirius_context.hpp>
 
 // cucascade
@@ -42,6 +42,7 @@
 // standard library
 #include <atomic>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace sirius::op::scan {
@@ -49,7 +50,7 @@ namespace sirius::op::scan {
 //===----------------------------------------------------------------------===//
 // Parquet Scan Task Global State
 //===----------------------------------------------------------------------===//
-class parquet_scan_task_global_state : public parallel::itask_global_state {
+class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_global_state {
   using hybrid_scan_reader = cudf::io::parquet::experimental::hybrid_scan_reader;
 
  public:
@@ -78,11 +79,12 @@ class parquet_scan_task_global_state : public parallel::itask_global_state {
   /**
    * @brief Construct the global state for the parquet scan task.
    *
+   * @param[in] pipeline The pipeline associated with this task
    * @param[in] scan_op The physical table scan operator
-   * @param[in] client_ctx The DuckDB client context
    * @param[in] approximate_batch_size The target approximate batch size for the scan tasks
    */
   parquet_scan_task_global_state(
+    duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
     sirius_physical_parquet_scan* scan_op,
     size_t approximate_batch_size = duckdb::Config::DEFAULT_SCAN_TASK_BATCH_SIZE);
 
@@ -128,9 +130,27 @@ class parquet_scan_task_global_state : public parallel::itask_global_state {
    *
    * @return The next row group partition index.
    */
-  [[nodiscard]] size_t get_next_rg_partition_idx()
+  [[nodiscard]] std::optional<size_t> get_next_rg_partition_idx()
   {
-    return _next_rg_partition.fetch_add(1, std::memory_order_relaxed);
+    auto const total = _row_group_partitions.size();
+    size_t current   = _next_rg_partition.load(std::memory_order_relaxed);
+    while (true) {
+      if (current >= total) { return std::nullopt; }
+      if (_next_rg_partition.compare_exchange_weak(
+            current, current + 1, std::memory_order_relaxed, std::memory_order_relaxed)) {
+        return current;
+      }
+    }
+  }
+
+  /**
+   * @brief Check if there are remaining row group partitions.
+   *
+   * @return True if there are more partitions to process.
+   */
+  [[nodiscard]] bool has_more_partitions() const
+  {
+    return _next_rg_partition.load(std::memory_order_relaxed) < _row_group_partitions.size();
   }
 
   /**
@@ -198,7 +218,7 @@ class parquet_scan_task_global_state : public parallel::itask_global_state {
  * @brief Local state for parquet_scan_task, which manages the row group indices assigned to this
  * task and makes the memory allocation for the task.
  */
-class parquet_scan_task_local_state : public pipeline::sirius_pipeline_itask_local_state {
+class parquet_scan_task_local_state : public pipeline::sirius_pipeline_task_local_state {
   using multiple_blocks_allocation =
     cucascade::memory::fixed_size_host_memory_resource::multiple_blocks_allocation;
   using memory_space = cucascade::memory::memory_space;
@@ -209,8 +229,9 @@ class parquet_scan_task_local_state : public pipeline::sirius_pipeline_itask_loc
    * @brief Construct the local state for the parquet scan task.
    *
    * @param[in] g_state The global state for the parquet scan task
+   * @param[in] partition_idx The assigned row group partition index
    */
-  parquet_scan_task_local_state(parquet_scan_task_global_state& g_state);
+  parquet_scan_task_local_state(parquet_scan_task_global_state& g_state, size_t partition_idx);
 
   //===----------Methods----------===//
   /**
@@ -305,6 +326,8 @@ class parquet_scan_task : public pipeline::sirius_pipeline_itask {
   {
   }
 
+  ~parquet_scan_task() override;
+
   //===----------Methods----------===//
   /**
    * @brief Compute the parquet scan task and produce a host_parquet_representation.
@@ -359,6 +382,24 @@ class parquet_scan_task : public pipeline::sirius_pipeline_itask {
    * @return The unique ID of this task.
    */
   [[nodiscard]] uint64_t get_task_id() const { return _task_id; }
+
+  [[nodiscard]] size_t get_pipeline_id() const override
+  {
+    // todo(bobbi): only virtual because we cannot create a pipeline from a a list of operators, and
+    // test parquet needs this to work, this allows us to override it for parquet task and provide a
+    // different pipeline ID than the one in global state (which is not set for parquet tasks since
+    // they don't have a pipeline) if the global state is not set, we fall back to using the
+    // pipeline ID from the global state, which is
+
+    auto& g_state  = this->_global_state->cast<parquet_scan_task_global_state>();
+    auto* pipeline = g_state.get_pipeline();
+    if (!pipeline) {
+      // This can happen for parquet scan tasks since they don't have a pipeline, in that case we
+      // return a default pipeline ID of 0
+      g_state.get_operator().get_operator_id();
+    }
+    return g_state.get_pipeline_id();
+  }
 
  private:
   /**

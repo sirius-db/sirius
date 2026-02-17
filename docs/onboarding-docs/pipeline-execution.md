@@ -163,9 +163,9 @@ The default `execute()` simply calls `compute_task()` then `publish_output()`.
 
 It also defines `get_estimated_reservation_size()` for memory budgeting and `get_output_consumers()` to identify downstream operators that should be scheduled next.
 
-### `sirius_pipeline_itask_local_state`
+### `sirius_pipeline_task_local_state`
 
-**File:** `src/include/pipeline/sirius_pipeline_itask_local_state.hpp`
+**File:** `src/include/pipeline/sirius_pipeline_task_states.hpp`
 
 Extends `itask_local_state` with memory reservation management. The executor sets a `cucascade::memory::reservation` on the task before execution via `set_reservation()`, and the task can later `release_reservation()` to use the reserved GPU memory.
 
@@ -177,7 +177,7 @@ This is the concrete task that executes a pipeline on the GPU.
 
 **State classes:**
 - `gpu_pipeline_task_global_state` — holds a `shared_ptr<sirius_pipeline>` (the pipeline to execute).
-- `gpu_pipeline_task_local_state` — holds the input `data_batch` vector and inherits the memory reservation from `sirius_pipeline_itask_local_state`.
+- `gpu_pipeline_task_local_state` — holds the input `data_batch` vector and inherits the memory reservation from `sirius_pipeline_task_local_state`.
 
 **`compute_task(stream)`** iterates through the pipeline's intermediate operators in order, threading output batches forward:
 

@@ -61,6 +61,26 @@ class completion_handler {
   }
 
   /**
+   * @brief Report an error that occurred during query execution.
+   *
+   * Sets the exception on the promise. Only the first call has effect;
+   * subsequent calls are ignored.
+   *
+   * @param error The exception pointer to report.
+   */
+  void report_error(std::string_view error) noexcept
+  {
+    bool expected = false;
+    if (_completed.compare_exchange_strong(expected, true)) {
+      try {
+        _promise.set_exception(std::make_exception_ptr(std::runtime_error(error.data())));
+      } catch (...) {
+        // Promise already satisfied or other error - ignore
+      }
+    }
+  }
+
+  /**
    * @brief Mark the query as successfully completed.
    *
    * Sets the promise value to signal completion. Only the first call has effect;

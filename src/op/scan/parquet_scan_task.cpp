@@ -16,6 +16,7 @@
 
 // sirius
 #include "op/sirius_physical_parquet_scan.hpp"
+#include "pipeline/sirius_pipeline.hpp"
 
 #include <data/data_batch_utils.hpp>
 #include <data/host_parquet_representation.hpp>
@@ -136,22 +137,27 @@ static std::unique_ptr<cudf::io::datasource::buffer> read_parquet_footer(cudf::i
 // Parquet Scan Task Global State
 //===----------------------------------------------------------------------===//
 parquet_scan_task_global_state::parquet_scan_task_global_state(
-  sirius_physical_parquet_scan* scan_op, size_t approximate_batch_size)
-  : _scan_op(scan_op),
+  duckdb::shared_ptr<pipeline::sirius_pipeline> pipeline,
+  sirius_physical_parquet_scan* scan_op,
+  size_t approximate_batch_size)
+  : pipeline::sirius_pipeline_task_global_state(pipeline),
+    _scan_op(scan_op),
     _approximate_batch_size(approximate_batch_size),
     _is_projected(!scan_op->projection_ids.empty()),
     _selected_column_indices(detail::make_selected_column_indices(*scan_op))
 {
   if (scan_op->function.in_out_function) {
     throw std::runtime_error(
-      "[parquet_scan_task_global_state] In-out table functions are not supported in sirius parquet "
+      "[parquet_scan_task_global_state] In-out table functions are not supported in sirius "
+      "parquet "
       "scans.");
   }
 
   // Filter pushdown is not supported
   if (scan_op->dynamic_filters) {
     throw std::runtime_error(
-      "[parquet_scan_task_global_state] Dynamic table filters are not supported in sirius parquet "
+      "[parquet_scan_task_global_state] Dynamic table filters are not supported in sirius "
+      "parquet "
       "scans.");
   }
 
@@ -272,15 +278,8 @@ void parquet_scan_task_global_state::partition_row_groups()
 // Parquet Scan Task Local State
 //===----------------------------------------------------------------------===//
 parquet_scan_task_local_state::parquet_scan_task_local_state(
-  parquet_scan_task_global_state& g_state)
+  parquet_scan_task_global_state& g_state, size_t partition_idx)
 {
-  // Get the next row-group partition
-  auto const partition_idx = g_state.get_next_rg_partition_idx();
-  if (partition_idx >= g_state.get_num_row_group_partitions()) {
-    // Too many tasks have been created for this table scan!
-    throw std::runtime_error(
-      "[parquet_scan_task_local_state] No more row group partitions available for reservation.");
-  }
   auto const& partition = g_state.get_row_group_partition(partition_idx);
 
   _rg_indices.resize(partition.row_group_count);
@@ -301,6 +300,14 @@ parquet_scan_task_local_state::make_allocation()
       "for HOST memory space");
   }
   return allocator->allocate_multiple_blocks(_reserved_compressed_bytes, _reservation.get());
+}
+
+parquet_scan_task::~parquet_scan_task()
+{
+  if (_global_state != nullptr) {
+    auto& g_state = this->_global_state->cast<parquet_scan_task_global_state>();
+    if (auto pipeline = g_state.get_operator().get_pipeline()) { pipeline->mark_task_completed(); }
+  }
 }
 
 //===----------------------------------------------------------------------===//

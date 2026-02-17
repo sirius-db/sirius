@@ -18,13 +18,16 @@
 
 #include "log/logging.hpp"
 #include "op/scan/duckdb_scan_task.hpp"
+#include "op/scan/parquet_scan_task.hpp"
 #include "op/sirius_physical_duckdb_scan.hpp"
+#include "op/sirius_physical_parquet_scan.hpp"
 #include "op/sirius_physical_top_n.hpp"
 #include "op/sirius_physical_top_n_merge.hpp"
 #include "op/sirius_physical_ungrouped_aggregate.hpp"
 #include "op/sirius_physical_ungrouped_aggregate_merge.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/pipeline_executor.hpp"
+#include "planner/query.hpp"
 
 #include <duckdb/execution/execution_context.hpp>
 #include <duckdb/parallel/thread_context.hpp>
@@ -60,6 +63,44 @@ void task_creator::set_pipeline_executor(sirius::pipeline::pipeline_executor& pi
   _pipeline_executor = &pipeline_executor;
 }
 
+void task_creator::prepare_for_query(const sirius::planner::query& query)
+{
+  std::lock_guard<std::mutex> lock(_global_state_mutex);
+
+  // Clear the global state maps for the new query
+  _scan_operator_global_state_map.clear();
+  _parquet_scan_operator_global_state_map.clear();
+  _gpu_operator_global_state_map.clear();
+
+  // Iterate through all pipelines in the query and create global states
+  const auto& pipelines = query.get_pipelines();
+  for (const auto& pipeline : pipelines) {
+    // Get the sink operator of the pipeline
+    auto source_operator = pipeline->get_source();
+    if (source_operator == nullptr) { continue; }
+
+    size_t operator_id = source_operator->get_operator_id();
+
+    if (source_operator->type == ::sirius::op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
+      _scan_operator_global_state_map.emplace(
+        operator_id,
+        std::make_shared<op::scan::duckdb_scan_task_global_state>(
+          pipeline,
+          *_pipeline_executor,
+          *_client_context,
+          &source_operator->Cast<op::sirius_physical_duckdb_scan>()));
+    } else if (source_operator->type == ::sirius::op::SiriusPhysicalOperatorType::PARQUET_SCAN) {
+      _parquet_scan_operator_global_state_map.emplace(
+        operator_id,
+        std::make_shared<op::scan::parquet_scan_task_global_state>(
+          pipeline, &source_operator->Cast<op::sirius_physical_parquet_scan>()));
+    } else {
+      _gpu_operator_global_state_map.emplace(
+        operator_id, std::make_shared<pipeline::gpu_pipeline_task_global_state>(pipeline));
+    }
+  }
+}
+
 void task_creator::drain_pending_tasks()
 {
   // Drain any queued task creation requests that haven't been picked up yet
@@ -73,6 +114,7 @@ void task_creator::reset()
   // Clear the scan operator global state map for the new query
   std::lock_guard<std::mutex> lock(_global_state_mutex);
   _scan_operator_global_state_map.clear();
+  _parquet_scan_operator_global_state_map.clear();
   _gpu_operator_global_state_map.clear();
   _thread_context.reset();
   _execution_context.reset();
@@ -146,96 +188,95 @@ void task_creator::manager_loop()
       break;
     }
 
+    auto node = request->node;
+    if (node == nullptr) { continue; }
+
+    node = get_operator_for_next_task(node);
+
+    if (node == nullptr) { continue; }
+
     // Schedule the task creation work on the thread pool
-    _thread_pool->schedule(
-      [this, request = std::move(request), ticket = std::move(ticket)]() mutable {
-        try {
-          auto node = request->node;
-          if (node == nullptr) { return; }
-
-          node = get_operator_for_next_task(node);
-          if (node == nullptr) { return; }
-
-          // Get what we need to create the task
-          auto pipeline = node->get_pipeline();
-          std::vector<cucascade::shared_data_repository*> destination_data_repositories;
-          auto next_port_after_sink = pipeline->get_sink()->get_next_port_after_sink();
-          for (auto& [next_op, port_id] : next_port_after_sink) {
-            destination_data_repositories.push_back(next_op->get_port(port_id)->repo);
-          }
-
-          // scheduling scan task
-          if (node->type == ::sirius::op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
-            // Check to see if you need to create a new global state for this scan operator
-            size_t operator_id = node->get_operator_id();
-            {
-              std::lock_guard<std::mutex> lock(_global_state_mutex);
-              auto it = _scan_operator_global_state_map.find(operator_id);
-              if (it == _scan_operator_global_state_map.end()) {
-                // If not found, create new global state and store it in the map
-                auto scan_task_global_state =
-                  std::make_shared<op::scan::duckdb_scan_task_global_state>(
-                    pipeline,
-                    *_pipeline_executor,
-                    *_client_context,
-                    &node->Cast<op::sirius_physical_duckdb_scan>());
-                _scan_operator_global_state_map[operator_id] = scan_task_global_state;
-              }
-            }
-
-            auto scan_task_local_state = std::make_unique<op::scan::duckdb_scan_task_local_state>(
-              *_scan_operator_global_state_map[operator_id], *_execution_context);
-            if (destination_data_repositories.empty()) {
-              throw std::runtime_error(
-                "No destination data repositories provided for scan task creation.");
-            }
-            auto scan_task = std::make_unique<op::scan::duckdb_scan_task>(
-              get_next_task_id(),
-              destination_data_repositories[0],  // WSM amin TODO: is this correct? there probably
-                                                 // needs to be multiple possible destination data
-                                                 // repositories
-              std::move(scan_task_local_state),
-              _scan_operator_global_state_map[operator_id]);
-            pipeline->mark_task_created();  // WSM TODO: this needs to be done atomically
-                                            // with the task creation
-            _pipeline_executor->schedule(std::move(scan_task));
-            // scheduling pipeline task
-          } else {
-            // need to exhaust input batches until all ports are empty
-            while (!node->all_ports_empty()) {
-              auto input_data = node->get_next_task_input_data();
-              if (!input_data) { break; }
-              pipeline->mark_task_created();  // WSM TODO: this needs to be done atomically with the
-                                              // task creation
-
-              // Check to see if you need to create a new global state for this operator
-              size_t operator_id = node->get_operator_id();
-              {
-                std::lock_guard<std::mutex> lock(_global_state_mutex);
-                auto it = _gpu_operator_global_state_map.find(operator_id);
-                if (it == _gpu_operator_global_state_map.end()) {
-                  // If not found, create new global state and store it in the map
-                  auto gpu_pipeline_task_global_state =
-                    std::make_shared<pipeline::gpu_pipeline_task_global_state>(pipeline);
-                  _gpu_operator_global_state_map[operator_id] = gpu_pipeline_task_global_state;
-                }
-              }
-
-              auto local_state =
-                std::make_unique<pipeline::gpu_pipeline_task_local_state>(std::move(input_data));
-              auto task = std::make_unique<pipeline::gpu_pipeline_task>(
-                get_next_task_id(),
-                destination_data_repositories,
-                std::move(local_state),
-                _gpu_operator_global_state_map[operator_id]);
-              _pipeline_executor->schedule(std::move(task));
-            }
-          }
-        } catch (const std::exception& e) {
-          SIRIUS_LOG_ERROR("Task Creator: Exception during task creation: {}", e.what());
-          stop();
+    _thread_pool->schedule([this, node, ticket = std::move(ticket)]() mutable {
+      try {
+        // Get what we need to create the task
+        auto pipeline = node->get_pipeline();
+        std::vector<cucascade::shared_data_repository*> destination_data_repositories;
+        auto next_port_after_sink = pipeline->get_sink()->get_next_port_after_sink();
+        for (auto& [next_op, port_id] : next_port_after_sink) {
+          destination_data_repositories.push_back(next_op->get_port(port_id)->repo);
         }
-      });
+
+        // scheduling scan task
+        if (node->type == ::sirius::op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
+          // Check to see if you need to create a new global s for this scan operator
+          size_t operator_id          = node->get_operator_id();
+          auto scan_task_global_state = _scan_operator_global_state_map.at(operator_id);
+
+          auto scan_task_local_state = std::make_unique<op::scan::duckdb_scan_task_local_state>(
+            *scan_task_global_state, *_execution_context);
+          if (destination_data_repositories.empty()) {
+            throw std::runtime_error(
+              "No destination data repositories provided for scan task creation.");
+          }
+          auto scan_task = std::make_unique<op::scan::duckdb_scan_task>(
+            get_next_task_id(),
+            destination_data_repositories[0],  // WSM amin TODO: is this correct? there probably
+                                               // needs to be multiple possible destination data
+                                               // repositories
+            std::move(scan_task_local_state),
+            scan_task_global_state);
+          pipeline->mark_task_created();  // WSM TODO: this needs to be done atomically
+                                          // with the task creation
+          _pipeline_executor->schedule(std::move(scan_task));
+        } else if (node->type == ::sirius::op::SiriusPhysicalOperatorType::PARQUET_SCAN) {
+          size_t operator_id             = node->get_operator_id();
+          auto parquet_task_global_state = _parquet_scan_operator_global_state_map.at(operator_id);
+
+          auto const partition_idx = parquet_task_global_state->get_next_rg_partition_idx();
+          if (!partition_idx.has_value()) { return; }
+          pipeline->mark_task_created();
+
+          auto parquet_task_local_state = std::make_unique<op::scan::parquet_scan_task_local_state>(
+            *parquet_task_global_state, *partition_idx);
+
+          if (destination_data_repositories.empty()) {
+            throw std::runtime_error(
+              "No destination data repositories provided for parquet scan task creation.");
+          }
+          auto parquet_task =
+            std::make_unique<op::scan::parquet_scan_task>(get_next_task_id(),
+                                                          destination_data_repositories[0],
+                                                          std::move(parquet_task_local_state),
+                                                          parquet_task_global_state);
+          _pipeline_executor->schedule(std::move(parquet_task));
+          // scheduling pipeline task
+        } else {
+          // need to exhaust input batches until all ports are empty
+          while (!node->all_ports_empty()) {
+            auto input_data = node->get_next_task_input_data();
+            if (!input_data) { break; }
+            pipeline->mark_task_created();  // WSM TODO: this needs to be done atomically with the
+                                            // task creation
+
+            // Check to see if you need to create a new global state for this operator
+            size_t operator_id                  = node->get_operator_id();
+            auto gpu_pipeline_task_global_state = _gpu_operator_global_state_map.at(operator_id);
+
+            auto local_state =
+              std::make_unique<pipeline::gpu_pipeline_task_local_state>(std::move(input_data));
+            auto task =
+              std::make_unique<pipeline::gpu_pipeline_task>(get_next_task_id(),
+                                                            destination_data_repositories,
+                                                            std::move(local_state),
+                                                            gpu_pipeline_task_global_state);
+            _pipeline_executor->schedule(std::move(task));
+          }
+        }
+      } catch (const std::exception& e) {
+        SIRIUS_LOG_ERROR("Task Creator: Exception during task creation: {}", e.what());
+        stop();
+      }
+    });
   }
 }
 
