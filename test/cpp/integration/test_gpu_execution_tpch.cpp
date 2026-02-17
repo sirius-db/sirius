@@ -610,7 +610,7 @@ TEST_CASE("gpu_execution - swapped right join 3", "[integration][gpu_execution][
                      "on n.n_nationkey = c.c_nationkey;");
 }
 
-TEST_CASE("gpu_execution - swapped right join 0 making nulls", "[integration][gpu_execution][fjoin]")
+TEST_CASE("gpu_execution - swapped right join 0 making nulls", "[integration][gpu_execution][join]")
 {
   duckdb::Connection con(get_shared_db());
   compare_gpu_vs_cpu(con,
@@ -618,7 +618,7 @@ TEST_CASE("gpu_execution - swapped right join 0 making nulls", "[integration][gp
                      "from customer c right join nation n on n.n_nationkey = c.c_custkey;");
 }
 
-TEST_CASE("gpu_execution - swapped right join 1 making nulls", "[integration][gpu_execution][fjoin]")
+TEST_CASE("gpu_execution - swapped right join 1 making nulls", "[integration][gpu_execution][join]")
 {
   duckdb::Connection con(get_shared_db());
   compare_gpu_vs_cpu(con,
@@ -659,7 +659,7 @@ TEST_CASE("gpu_execution - basic full outer join making nulls",
                      "on n.n_nationkey = r.r_regionkey;");
 }
 
-TEST_CASE("gpu_execution - basic left semi join", "[integration][gpu_execution][join]")
+TEST_CASE("gpu_execution - basic left semi join", "[integration][gpu_execution][semijoin]")
 {
   duckdb::Connection con(get_shared_db());
   compare_gpu_vs_cpu(
@@ -1072,7 +1072,7 @@ TEST_CASE_METHOD(GPUExecutionFixture,
                  "gpu_execution - bigger inner join",
                  "[integration][gpu_execution][bigger_join]")
 
-TEST_CASE("gpu_execution - basic semi join 3", "[integration][gpu_execution][join]")
+TEST_CASE("gpu_execution - basic semi join 3", "[integration][gpu_execution][semijoin]")
 {
   duckdb::Connection con(get_shared_db());
   compare_gpu_vs_cpu(con,
@@ -1080,7 +1080,7 @@ TEST_CASE("gpu_execution - basic semi join 3", "[integration][gpu_execution][joi
                      "from nation n semi join customer c on n.n_nationkey = c.c_nationkey;");
 }
 
-TEST_CASE("gpu_execution - basic semi join 4", "[integration][gpu_execution][join]")
+TEST_CASE("gpu_execution - basic semi join 4", "[integration][gpu_execution][semijoin]")
 {
   duckdb::Connection con(get_shared_db());
   compare_gpu_vs_cpu(con,
@@ -1088,7 +1088,7 @@ TEST_CASE("gpu_execution - basic semi join 4", "[integration][gpu_execution][joi
                      "semi join customer c on n.n_nationkey = c.c_nationkey;");
 }
 
-TEST_CASE("gpu_execution - basic semi join 5", "[integration][gpu_execution][join]")
+TEST_CASE("gpu_execution - basic semi join 5", "[integration][gpu_execution][semijoin]")
 {
   duckdb::Connection con(get_shared_db());
   compare_gpu_vs_cpu(con,
@@ -1096,7 +1096,7 @@ TEST_CASE("gpu_execution - basic semi join 5", "[integration][gpu_execution][joi
                      "on n.n_nationkey = c.c_nationkey;");
 }
 
-TEST_CASE("gpu_execution - basic semi join misfit 0", "[integration][gpu_execution][fjoin]")
+TEST_CASE("gpu_execution - basic semi join misfit 0", "[integration][gpu_execution][semijoin]")
 {
   duckdb::Connection con(get_shared_db());
   compare_gpu_vs_cpu(con,
@@ -1104,7 +1104,7 @@ TEST_CASE("gpu_execution - basic semi join misfit 0", "[integration][gpu_executi
                      "from nation n semi join customer c on n.n_nationkey = c.c_custkey;");
 }
 
-TEST_CASE("gpu_execution - basic semi join mistit 1", "[integration][gpu_execution][join]")
+TEST_CASE("gpu_execution - basic semi join mistit 1", "[integration][gpu_execution][semijoin]")
 {
   duckdb::Connection con(get_shared_db());
   compare_gpu_vs_cpu(con,
@@ -1112,7 +1112,7 @@ TEST_CASE("gpu_execution - basic semi join mistit 1", "[integration][gpu_executi
                      "semi join customer c on n.n_nationkey = c.c_custkey;");
 }
 
-TEST_CASE("gpu_execution - swapped semi join 0", "[integration][gpu_execution][join]")
+TEST_CASE("gpu_execution - swapped semi join 0", "[integration][gpu_execution][semijoin]")
 {
   duckdb::Connection con(get_shared_db());
   compare_gpu_vs_cpu(con,
@@ -1120,15 +1120,15 @@ TEST_CASE("gpu_execution - swapped semi join 0", "[integration][gpu_execution][j
                      "from customer c semi join nation n on n.n_nationkey = c.c_nationkey;");
 }
 
-TEST_CASE("gpu_execution - swapped semi join 1", "[integration][gpu_execution][join]")
+TEST_CASE("gpu_execution - swapped semi join 1", "[integration][gpu_execution][semijoin]")
 {
   duckdb::Connection con(get_shared_db());
   compare_gpu_vs_cpu(con,
                      "select c.c_custkey, c.c_name  from customer c "
-                     "left semi nation n on n.n_nationkey = c.c_nationkey;");
+                     "semi join nation n on n.n_nationkey = c.c_nationkey;");
 }
 
-TEST_CASE("gpu_execution - swapped semi join misfit 0", "[integration][gpu_execution][join]")
+TEST_CASE("gpu_execution - swapped semi join misfit 0", "[integration][gpu_execution][semijoin]")
 {
   duckdb::Connection con(get_shared_db());
   compare_gpu_vs_cpu(con,
@@ -1136,7 +1136,7 @@ TEST_CASE("gpu_execution - swapped semi join misfit 0", "[integration][gpu_execu
                      "from customer c semi join nation n on n.n_nationkey = c.c_custkey;");
 }
 
-TEST_CASE("gpu_execution - swapped semi join misfit 1", "[integration][gpu_execution][join]")
+TEST_CASE("gpu_execution - swapped semi join misfit 1", "[integration][gpu_execution][semijoin]")
 {
   duckdb::Connection con(get_shared_db());
   compare_gpu_vs_cpu(con,

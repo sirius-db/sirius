@@ -101,21 +101,6 @@ sirius_physical_hash_join::sirius_physical_hash_join(
   children.push_back(std::move(left));
   children.push_back(std::move(right));
 
-  /* new code */
-  // Collect condition types, and which conditions are just references (so we won't duplicate them
-  // in the payload)
-  std::unordered_map<idx_t, idx_t> build_columns_in_conditions;
-  for (idx_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
-    auto& condition = conditions[cond_idx];
-    condition_types.push_back(condition.left->return_type);
-    if (condition.right->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
-      build_columns_in_conditions.emplace(condition.right->Cast<duckdb::BoundReferenceExpression>().index,
-                                          cond_idx);
-    }
-  }
-  /* new code end*/
-
-
   auto& lhs_input_types = children[0]->get_types();
 
   if (left_projection_map.empty()) {
@@ -142,52 +127,26 @@ sirius_physical_hash_join::sirius_physical_hash_join(
    
   auto& rhs_input_types = children[1]->get_types();
 
-  auto right_projection_map_copy = right_projection_map;
-  if (right_projection_map_copy.empty()) {
-    right_projection_map_copy.reserve(rhs_input_types.size());
-    for (idx_t i = 0; i < rhs_input_types.size(); i++) {
-      right_projection_map_copy.emplace_back(i);
+  if (right_projection_map.empty()) {
+    rhs_output_columns.col_idxs.reserve(rhs_input_types.size());
+    for (duckdb::idx_t i = 0; i < rhs_input_types.size(); i++) {
+      rhs_output_columns.col_idxs.emplace_back(static_cast<cudf::size_type>(i));
+    }
+  } else {
+    rhs_output_columns.col_idxs.reserve(right_projection_map.size());
+    for (auto& col_idx : right_projection_map) {
+      if (col_idx < rhs_input_types.size()) {
+        rhs_output_columns.col_idxs.emplace_back(static_cast<cudf::size_type>(col_idx));
+      } else {
+        printf("WARNING:In sirius_physical_hash_join: right_projection_map index out of range");
+      }
     }
   }
 
-  // Now fill payload expressions/types and RHS columns/types
-  for (auto& rhs_col : right_projection_map_copy) {
+  for (auto& rhs_col : rhs_output_columns.col_idxs) {
     auto& rhs_col_type = rhs_input_types[rhs_col];
-
-    auto it = build_columns_in_conditions.find(rhs_col);
-    if (it == build_columns_in_conditions.end()) {
-      // This rhs column is not a join key
-      payload_columns.col_idxs.push_back(rhs_col);
-      payload_columns.col_types.push_back(rhs_col_type);
-      rhs_output_columns.col_idxs.push_back(condition_types.size() +
-                                            payload_columns.col_types.size() - 1);
-    } else {
-      // This rhs column is a join key
-      rhs_output_columns.col_idxs.push_back(it->second);
-    }
     rhs_output_columns.col_types.push_back(rhs_col_type);
   }
-
-  // if (right_projection_map.empty()) {
-  //   rhs_output_columns.col_idxs.reserve(rhs_input_types.size());
-  //   for (duckdb::idx_t i = 0; i < rhs_input_types.size(); i++) {
-  //     rhs_output_columns.col_idxs.emplace_back(static_cast<cudf::size_type>(i));
-  //   }
-  // } else {
-  //   rhs_output_columns.col_idxs.reserve(right_projection_map.size());
-  //   for (auto& col_idx : right_projection_map) {
-  //     if (col_idx < rhs_input_types.size()) {
-  //       rhs_output_columns.col_idxs.emplace_back(static_cast<cudf::size_type>(col_idx));
-  //     } else {
-  //       printf("WARNING:In sirius_physical_hash_join: right_projection_map index out of range");
-  //     }
-  //   }
-  // }
-
-  // for (auto& rhs_col : rhs_output_columns.col_idxs) {
-  //   auto& rhs_col_type = rhs_input_types[rhs_col];
-  //   rhs_output_columns.col_types.push_back(rhs_col_type);
-  // }
 
   for (duckdb::idx_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
     auto& condition = conditions[cond_idx];
