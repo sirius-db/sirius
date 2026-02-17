@@ -27,13 +27,36 @@ libconfig = "*"
 libabseil = ">=20260107.0"
 duckdb = ">=1.4.4,<2"
 
-[tasks]
-configure-debug = { cmd = "cmake -S duckdb -B build/debug -C CMake/debug.cmake", description = "Configure a debug build with no optimizations" }
-configure-release = { cmd = "cmake -S duckdb -B build/release -C CMake/release.cmake", description = "Configure an optimized release build" }
-configure-relwithdebinfo = { cmd = "cmake -S duckdb -B build/relwithdebinfo -C CMake/relwithdebinfo.cmake", description = "Configure a release build with debug symbols" }
-build-debug = { cmd = "cmake --build build/debug --parallel", depends-on = ["configure-debug"], description = "Build in debug mode" }
-build-release = { cmd = "cmake --build build/release --parallel", depends-on = ["configure-release"], description = "Build in release mode" }
-build-relwithdebinfo = { cmd = "cmake --build build/relwithdebinfo --parallel", depends-on = ["configure-relwithdebinfo"], description = "Build in release mode with debug symbols" }
+[tasks.configure-debug]
+cmd = "cmake -S duckdb -B build/debug -C CMake/debug.cmake"
+description = "Configure a debug build with no optimizations"
+
+[tasks.configure-release]
+cmd = "cmake -S duckdb -B build/release -C CMake/release.cmake"
+description = "Configure an optimized release build"
+
+[tasks.configure-relwithdebinfo]
+cmd = "cmake -S duckdb -B build/relwithdebinfo -C CMake/relwithdebinfo.cmake"
+description = "Configure a release build with debug symbols"
+
+[tasks.build-debug]
+cmd = "cmake --build build/debug --parallel"
+depends-on = ["configure-debug"]
+description = "Build in debug mode"
+
+[tasks.build-release]
+cmd = "cmake --build build/release --parallel"
+depends-on = ["configure-release"]
+description = "Build in release mode"
+
+[tasks.build-relwithdebinfo]
+cmd = "cmake --build build/relwithdebinfo --parallel"
+depends-on = ["configure-relwithdebinfo"]
+description = "Build in release mode with debug symbols"
+
+[tasks.sql-logic-tests-release]
+cmd = "$PIXI_PROJECT_ROOT/build/release/test/unittest \"$PIXI_PROJECT_ROOT/test/*\""
+description = "Run SQL logic tests for a release build"
 
 # CUDA version features: use `pixi run -e cuda12` for CUDA 12.x systems
 [feature.cuda13.system-requirements]
