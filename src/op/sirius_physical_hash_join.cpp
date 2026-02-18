@@ -17,6 +17,7 @@
 #include "op/sirius_physical_hash_join.hpp"
 
 #include "cudf/copying.hpp"
+#include "cudf/join/filtered_join.hpp"
 #include "cudf/join/join.hpp"
 #include "cudf/table/table_view.hpp"
 #include "cudf/types.hpp"
@@ -28,6 +29,7 @@
 #include "log/logging.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
+#include "print.hpp"
 
 #include <cstdio>
 
@@ -121,6 +123,7 @@ sirius_physical_hash_join::sirius_physical_hash_join(
   }
 
   auto& rhs_input_types = children[1]->get_types();
+
   if (right_projection_map.empty()) {
     rhs_output_columns.col_idxs.reserve(rhs_input_types.size());
     for (duckdb::idx_t i = 0; i < rhs_input_types.size(); i++) {
@@ -410,6 +413,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
     throw std::runtime_error("Unsupported non-equality join of type type: " +
                              duckdb::JoinTypeToString(join_type));
   }
+
   if (join_type == duckdb::JoinType::INNER || join_type == duckdb::JoinType::LEFT ||
       join_type == duckdb::JoinType::RIGHT || join_type == duckdb::JoinType::OUTER ||
       join_type == duckdb::JoinType::SEMI || join_type == duckdb::JoinType::RIGHT_SEMI) {
@@ -429,8 +433,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
         cudf::inner_join(left_keys, right_keys, cudf::null_equality::UNEQUAL, stream);
       left_indices  = std::move(join_result.first);
       right_indices = std::move(join_result.second);
-    } else if (join_type == duckdb::JoinType::LEFT || join_type == duckdb::JoinType::SEMI ||
-               join_type == duckdb::JoinType::RIGHT_SEMI) {
+    } else if (join_type == duckdb::JoinType::LEFT) {
       auto join_result =
         cudf::left_join(left_keys, right_keys, cudf::null_equality::UNEQUAL, stream);
       left_indices  = std::move(join_result.first);
@@ -440,23 +443,37 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
         cudf::left_join(right_keys, left_keys, cudf::null_equality::UNEQUAL, stream);
       right_indices = std::move(join_result.first);
       left_indices  = std::move(join_result.second);
+
+    } else if (join_type == duckdb::JoinType::SEMI) {
+      auto filtered_join_object = cudf::filtered_join(
+        right_keys, cudf::null_equality::UNEQUAL, cudf::set_as_build_table::RIGHT, stream);
+      left_indices = filtered_join_object.semi_join(left_keys, stream);
+
+    } else if (join_type == duckdb::JoinType::RIGHT_SEMI) {
+      auto filtered_join_object = cudf::filtered_join(
+        left_keys, cudf::null_equality::UNEQUAL, cudf::set_as_build_table::RIGHT, stream);
+      right_indices = filtered_join_object.semi_join(right_keys, stream);
+
     } else if (join_type == duckdb::JoinType::OUTER) {
       auto join_result =
         cudf::full_join(left_keys, right_keys, cudf::null_equality::UNEQUAL, stream);
       left_indices  = std::move(join_result.first);
       right_indices = std::move(join_result.second);
     }
-    if (join_type == duckdb::JoinType::SEMI || join_type == duckdb::JoinType::RIGHT_SEMI) {
+    if (join_type == duckdb::JoinType::SEMI) {
       collect_right = false;
+    } else if (join_type == duckdb::JoinType::RIGHT_SEMI) {
+      collect_left = false;
     }
 
     cudf::out_of_bounds_policy left_out_of_bounds_policy  = cudf::out_of_bounds_policy::DONT_CHECK;
     cudf::out_of_bounds_policy right_out_of_bounds_policy = cudf::out_of_bounds_policy::DONT_CHECK;
     if (join_type == duckdb::JoinType::LEFT || join_type == duckdb::JoinType::OUTER ||
-        join_type == duckdb::JoinType::SEMI || join_type == duckdb::JoinType::RIGHT_SEMI) {
+        join_type == duckdb::JoinType::SEMI) {
       right_out_of_bounds_policy = cudf::out_of_bounds_policy::NULLIFY;
     }
-    if (join_type == duckdb::JoinType::RIGHT || join_type == duckdb::JoinType::OUTER) {
+    if (join_type == duckdb::JoinType::RIGHT || join_type == duckdb::JoinType::OUTER ||
+        join_type == duckdb::JoinType::RIGHT_SEMI) {
       left_out_of_bounds_policy = cudf::out_of_bounds_policy::NULLIFY;
     }
 
