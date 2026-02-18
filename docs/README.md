@@ -50,7 +50,7 @@ The environment activation handles setting up everything needed to build and tes
 To build Sirius:
 ```
 CMAKE_BUILD_PARALLEL_LEVEL={nproc} make
-``
+```
 
 Note that if building the extension consumes too much memory, try reducing the `CMAKE_BUILD_PARALLEL_LEVEL` value used when invoking `make`.
 
