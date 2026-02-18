@@ -29,7 +29,6 @@ class GPUPhysicalDummyScan : public GPUPhysicalOperator {
   explicit GPUPhysicalDummyScan(vector<LogicalType> types, idx_t estimated_cardinality)
     : GPUPhysicalOperator(PhysicalOperatorType::DUMMY_SCAN, std::move(types), estimated_cardinality)
   {
-    printf("GPUPhysicalDummyScan constructor\n");
   }
 
  public:
