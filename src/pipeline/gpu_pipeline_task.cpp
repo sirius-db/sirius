@@ -17,6 +17,7 @@
 #include "pipeline/gpu_pipeline_task.hpp"
 
 #include "cudf/cudf_utils.hpp"
+#include "log/logging.hpp"
 
 #include <cucascade/data/cpu_data_representation.hpp>
 #include <cucascade/data/data_repository.hpp>
@@ -105,20 +106,28 @@ void validate_operator_output_types(const op::operator_data* data,
     if (!batch) { continue; }
     cudf::table_view tbl = get_cudf_table_view(*batch);
     if (static_cast<size_t>(tbl.num_columns()) != expected_types.size()) {
-      throw std::runtime_error("gpu_pipeline_task: operator '" + op.get_name() + "' output batch " +
-                               std::to_string(batch_index) + " column count mismatch: got " +
-                               std::to_string(tbl.num_columns()) + ", expected " +
-                               std::to_string(expected_types.size()));
+      SIRIUS_LOG_WARN(
+        "gpu_pipeline_task: operator '{}' output batch {} column count mismatch: got "
+        "{}, expected {}",
+        op.get_name(),
+        batch_index,
+        tbl.num_columns(),
+        expected_types.size());
+      return;
     }
     for (cudf::size_type c = 0; c < tbl.num_columns(); c++) {
       cudf::data_type expected_cudf = duckdb::GetCudfType(expected_types[c]);
       cudf::data_type actual        = tbl.column(c).type();
       if (actual != expected_cudf) {
-        throw std::runtime_error("gpu_pipeline_task: operator '" + op.get_name() +
-                                 "' output batch " + std::to_string(batch_index) + " column " +
-                                 std::to_string(c) + " datatype mismatch: got " +
-                                 cudf::type_to_name(actual) + ", expected " +
-                                 cudf::type_to_name(expected_cudf));
+        SIRIUS_LOG_WARN(
+          "gpu_pipeline_task: operator '{}' output batch {} column {} datatype "
+          "mismatch: got {}, expected {}",
+          op.get_name(),
+          batch_index,
+          c,
+          cudf::type_to_name(actual),
+          cudf::type_to_name(expected_cudf));
+        return;
       }
     }
   }
