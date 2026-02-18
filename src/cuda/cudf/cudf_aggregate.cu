@@ -179,7 +179,7 @@ void cudf_aggregate(vector<shared_ptr<GPUColumn>>& column,
 #if CUDF_VERSION_NUM > 2504
       auto nunique_agg = static_cast<cudf::detail::nunique_aggregation const&>(*aggregate);
       result =
-        cudf::make_fixed_width_scalar(cudf::detail::distinct_count(cudf_column,
+        cudf::make_fixed_width_scalar(cudf::distinct_count(cudf_column,
                                                                    nunique_agg._null_handling,
                                                                    cudf::nan_policy::NAN_IS_VALID,
                                                                    cudf::get_default_stream()));
