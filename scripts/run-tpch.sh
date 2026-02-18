@@ -19,5 +19,5 @@ cat tpch-queries-run.sql | while read -r query; do
       cli_params+=("call gpu_processing(\"${query}\");")
     done;
     echo "${cli_params[@]}"
-    ./build/release/duckdb tpch.duckdb "${cli_params[@]}"
+    ../build/release/duckdb tpch.duckdb "${cli_params[@]}"
 done;
