@@ -164,11 +164,24 @@ const sirius_pipeline* gpu_pipeline_task::get_pipeline() const
 
 std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_stream_view stream)
 {
-  auto& local_state               = _local_state->cast<gpu_pipeline_task_local_state>();
+  auto pipeline     = _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline();
+  auto& local_state = _local_state->cast<gpu_pipeline_task_local_state>();
   auto operator_input_output_data = std::move(local_state._input_data);
-  for (auto& op :
-       _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline()->get_operators()) {
+  for (auto& op : pipeline->get_operators()) {
+    SIRIUS_LOG_TRACE("Pipeline {}: operator {} executing on {} batches",
+                     pipeline->get_pipeline_id(),
+                     op.get().get_name(),
+                     operator_input_output_data->get_data_batches().size());
+    auto start                 = std::chrono::high_resolution_clock::now();
     operator_input_output_data = op.get().execute(*operator_input_output_data, stream);
+    auto end                   = std::chrono::high_resolution_clock::now();
+    auto duration              = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    SIRIUS_LOG_TRACE(
+      "Pipeline {}: operator {} produced {} batches, execution time: {:.2f} ms",
+      pipeline->get_pipeline_id(),
+      op.get().get_name(),
+      operator_input_output_data ? operator_input_output_data->get_data_batches().size() : 0u,
+      duration.count() / 1000.0);
     validate_operator_output_types(operator_input_output_data.get(), op.get());
   }
   return operator_input_output_data;

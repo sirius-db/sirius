@@ -40,8 +40,6 @@ std::unique_ptr<operator_data> sirius_physical_order::execute(const operator_dat
                                                               rmm::cuda_stream_view stream)
 {
   const auto& input_batches = input_data.get_data_batches();
-  SIRIUS_LOG_DEBUG("Executing order by");
-  auto start = std::chrono::high_resolution_clock::now();
 
   // Build cudf order vectors from BoundOrderByNode
   std::vector<int> order_key_idx;
@@ -78,10 +76,6 @@ std::unique_ptr<operator_data> sirius_physical_order::execute(const operator_dat
       batch, order_key_idx, column_order, null_precedence, proj_idx, stream, *space);
     if (sorted_batch) { output_batches.push_back(std::move(sorted_batch)); }
   }
-
-  auto end      = std::chrono::high_resolution_clock::now();
-  auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-  SIRIUS_LOG_DEBUG("Order by time: {:.2f} ms", duration.count() / 1000.0);
 
   return std::make_unique<operator_data>(output_batches);
 }
