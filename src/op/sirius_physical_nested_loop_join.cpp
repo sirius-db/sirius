@@ -16,6 +16,7 @@
 
 #include "op/sirius_physical_nested_loop_join.hpp"
 
+#include "cudf/cudf_utils.hpp"
 #include "data/data_batch_utils.hpp"
 #include "duckdb/common/enums/physical_operator_type.hpp"
 #include "duckdb/common/operator/comparison_operators.hpp"
@@ -41,6 +42,8 @@
 #include <cudf/table/table_view.hpp>
 
 #include <rmm/resource_ref.hpp>
+
+#include <unordered_map>
 
 namespace sirius {
 namespace op {
@@ -418,9 +421,13 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
   if (conditions.empty()) {
     result_table = cudf::cross_join(left, right, stream, mr);
   } else {
+    // Resolve column indices and target types so AST predicate operands match (cudf requires
+    // matching types). Columns used in conditions may be cast to the expression return type.
     std::vector<cudf::ast::column_reference> left_refs;
     std::vector<cudf::ast::column_reference> right_refs;
     std::vector<cudf::ast::operation> cond_ops;
+    std::unordered_map<cudf::size_type, cudf::data_type> left_target_type;
+    std::unordered_map<cudf::size_type, cudf::data_type> right_target_type;
     for (const auto& cond : conditions) {
       cudf::size_type left_idx  = 0;
       cudf::size_type right_idx = 0;
@@ -436,10 +443,40 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
           "CAST(column), or scalar SUBQUERY (got: " +
           cond.right->ToString() + ")");
       }
+      left_target_type[left_idx]   = duckdb::GetCudfType(cond.left->return_type);
+      right_target_type[right_idx] = duckdb::GetCudfType(cond.right->return_type);
       left_refs.emplace_back(left_idx, cudf::ast::table_reference::LEFT);
       right_refs.emplace_back(right_idx, cudf::ast::table_reference::RIGHT);
       cond_ops.emplace_back(to_ast_operator(cond.comparison), left_refs.back(), right_refs.back());
     }
+
+    // Build left/right table views with cast columns where type != target (so AST operands match).
+    std::vector<cudf::column_view> left_col_views;
+    std::vector<cudf::column_view> right_col_views;
+    std::vector<std::unique_ptr<cudf::column>> owned_left_casts;
+    std::vector<std::unique_ptr<cudf::column>> owned_right_casts;
+    left_col_views.reserve(left.num_columns());
+    right_col_views.reserve(right.num_columns());
+    for (cudf::size_type c = 0; c < left.num_columns(); c++) {
+      auto it = left_target_type.find(c);
+      if (it != left_target_type.end() && left.column(c).type() != it->second) {
+        owned_left_casts.push_back(cudf::cast(left.column(c), it->second, stream));
+        left_col_views.push_back(owned_left_casts.back()->view());
+      } else {
+        left_col_views.push_back(left.column(c));
+      }
+    }
+    for (cudf::size_type c = 0; c < right.num_columns(); c++) {
+      auto it = right_target_type.find(c);
+      if (it != right_target_type.end() && right.column(c).type() != it->second) {
+        owned_right_casts.push_back(cudf::cast(right.column(c), it->second, stream));
+        right_col_views.push_back(owned_right_casts.back()->view());
+      } else {
+        right_col_views.push_back(right.column(c));
+      }
+    }
+    cudf::table_view left_effective(left_col_views);
+    cudf::table_view right_effective(right_col_views);
 
     std::vector<cudf::ast::operation> and_chain;
     and_chain.push_back(std::move(cond_ops[0]));
@@ -454,19 +491,21 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
 
     switch (join_type) {
       case duckdb::JoinType::INNER:
-        join_result =
-          cudf::conditional_inner_join(left, right, predicate, std::nullopt, stream, mr);
+        join_result = cudf::conditional_inner_join(
+          left_effective, right_effective, predicate, std::nullopt, stream, mr);
         break;
       case duckdb::JoinType::LEFT:
-        join_result = cudf::conditional_left_join(left, right, predicate, std::nullopt, stream, mr);
+        join_result = cudf::conditional_left_join(
+          left_effective, right_effective, predicate, std::nullopt, stream, mr);
         break;
       case duckdb::JoinType::RIGHT:
-        join_result = cudf::conditional_left_join(right, left, predicate, std::nullopt, stream, mr);
+        join_result = cudf::conditional_left_join(
+          right_effective, left_effective, predicate, std::nullopt, stream, mr);
         std::swap(join_result.first, join_result.second);
         break;
       case duckdb::JoinType::SEMI: {
-        auto left_indices =
-          cudf::conditional_left_semi_join(left, right, predicate, std::nullopt, stream, mr);
+        auto left_indices = cudf::conditional_left_semi_join(
+          left_effective, right_effective, predicate, std::nullopt, stream, mr);
         auto left_map = cudf::column_view(cudf::data_type(cudf::type_id::INT32),
                                           left_indices->size(),
                                           left_indices->data(),
@@ -481,8 +520,8 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
           make_data_batch(std::move(gathered), *space)});
       }
       case duckdb::JoinType::ANTI: {
-        auto left_indices =
-          cudf::conditional_left_anti_join(left, right, predicate, std::nullopt, stream, mr);
+        auto left_indices = cudf::conditional_left_anti_join(
+          left_effective, right_effective, predicate, std::nullopt, stream, mr);
         auto left_map = cudf::column_view(cudf::data_type(cudf::type_id::INT32),
                                           left_indices->size(),
                                           left_indices->data(),
@@ -497,7 +536,8 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
           make_data_batch(std::move(gathered), *space)});
       }
       case duckdb::JoinType::OUTER:
-        join_result = cudf::conditional_full_join(left, right, predicate, stream, mr);
+        join_result =
+          cudf::conditional_full_join(left_effective, right_effective, predicate, stream, mr);
         break;
       default:
         throw std::runtime_error("sirius_physical_nested_loop_join: unsupported join type: " +
