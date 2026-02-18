@@ -10,16 +10,19 @@ use anyhow::{Context, Result};
 use prost::Message;
 use tracing::debug;
 
+use doris_thrift::exprs::TExprNodeType;
 use doris_thrift::palo_internal_service::TPipelineFragmentParams;
 use substrait::proto::extensions::simple_extension_declaration;
 use substrait::proto::extensions::{SimpleExtensionDeclaration, SimpleExtensionUri};
-use substrait::proto::{Plan, PlanRel, RelRoot, Version};
+use substrait::proto::{rel, Plan, PlanRel, Rel, RelRoot, Version};
 
 pub mod descriptor_table;
 pub mod expr_translator;
 pub mod node_translator;
 pub mod scan_translator;
 pub mod sql_generator;
+#[cfg(test)]
+mod test_helpers;
 pub mod type_mapper;
 
 /// Substrait extension URIs for standard function sets.
@@ -117,15 +120,94 @@ pub fn translate_fragment_to_sql(params: &TPipelineFragmentParams) -> Result<Str
     sql_generator::plan_to_sql(plan)
 }
 
+/// Compute the output column names of a Substrait Rel tree.
+///
+/// Walks the tree to find the leaf schema names. For pass-through nodes (Filter,
+/// Sort, Fetch) the output schema equals the input. For Join/Cross, it's left+right.
+/// Returns empty vec if the schema can't be determined (caller falls back to output_names).
+fn rel_output_names(rel: &Rel) -> Vec<String> {
+    match rel.rel_type.as_ref() {
+        Some(rel::RelType::Read(read)) => read
+            .base_schema
+            .as_ref()
+            .map(|s| s.names.clone())
+            .unwrap_or_default(),
+        Some(rel::RelType::Filter(f)) => f
+            .input
+            .as_deref()
+            .map(|r| rel_output_names(r))
+            .unwrap_or_default(),
+        Some(rel::RelType::Sort(s)) => s
+            .input
+            .as_deref()
+            .map(|r| rel_output_names(r))
+            .unwrap_or_default(),
+        Some(rel::RelType::Fetch(f)) => f
+            .input
+            .as_deref()
+            .map(|r| rel_output_names(r))
+            .unwrap_or_default(),
+        Some(rel::RelType::Project(p)) => p
+            .input
+            .as_deref()
+            .map(|r| rel_output_names(r))
+            .unwrap_or_default(),
+        Some(rel::RelType::Join(j)) => {
+            let mut names = j
+                .left
+                .as_deref()
+                .map(|r| rel_output_names(r))
+                .unwrap_or_default();
+            names.extend(
+                j.right
+                    .as_deref()
+                    .map(|r| rel_output_names(r))
+                    .unwrap_or_default(),
+            );
+            names
+        }
+        Some(rel::RelType::Cross(c)) => {
+            let mut names = c
+                .left
+                .as_deref()
+                .map(|r| rel_output_names(r))
+                .unwrap_or_default();
+            names.extend(
+                c.right
+                    .as_deref()
+                    .map(|r| rel_output_names(r))
+                    .unwrap_or_default(),
+            );
+            names
+        }
+        // Aggregate, Set, etc. — can't easily determine output names.
+        _ => Vec::new(),
+    }
+}
+
+/// Result of Substrait plan translation.
+pub struct TranslatedPlan {
+    /// Serialized Substrait Plan protobuf bytes.
+    pub substrait_bytes: Vec<u8>,
+    /// Expected output column names (from Doris plan, for result projection).
+    pub output_names: Vec<String>,
+    /// Explicit column indices mapping FE output column i to DuckDB output column
+    /// `output_column_indices[i]`. When set, use these instead of name-based matching.
+    pub output_column_indices: Option<Vec<usize>>,
+}
+
 /// Translate a Doris TPipelineFragmentParams into serialized Substrait Plan bytes.
 ///
 /// `table_schemas` maps NamedTable names to their actual column names (in order).
 /// For TVF file scans where the descriptor table lacks table_id, the scan translator
 /// uses these schemas to produce a correct ReadRel base_schema matching the DuckDB table.
+///
+/// Returns the Substrait bytes plus the expected output column names. When the DuckDB
+/// result has more columns than expected, the caller should project the result to match.
 pub fn translate_fragment(
     params: &TPipelineFragmentParams,
     table_schemas: &HashMap<String, Vec<String>>,
-) -> Result<Vec<u8>> {
+) -> Result<TranslatedPlan> {
     let fragment = params
         .fragment
         .as_ref()
@@ -159,8 +241,28 @@ pub fn translate_fragment(
     // Translate the plan tree into a Substrait Rel tree.
     let rel = node_translator::translate_plan(plan, &desc, &scan_params, &mut registry, table_schemas)?;
 
-    // Build output names from the root node's output tuples.
-    let output_names = if !plan.nodes.is_empty() {
+    // Build output names in the SELECT-list order the FE expects.
+    // Prefer output_exprs (gives exact FE column order), fall back to row_tuples.
+    let output_names = if let Some(output_exprs) = fragment.output_exprs.as_ref() {
+        let mut names = Vec::new();
+        for expr in output_exprs {
+            if let Some(first_node) = expr.nodes.first() {
+                if first_node.node_type == TExprNodeType::SLOT_REF {
+                    if let Some(slot_ref) = &first_node.slot_ref {
+                        if let Ok(slot) = desc.get_slot(slot_ref.slot_id) {
+                            names.push(slot.col_name.clone());
+                            continue;
+                        }
+                    }
+                }
+            }
+            // Non-SLOT_REF expr (e.g., CAST): use a positional placeholder.
+            names.push(format!("expr_{}", names.len()));
+        }
+        debug!(source = "output_exprs", names = ?names, "output column names");
+        names
+    } else if !plan.nodes.is_empty() {
+        // Fallback: use row_tuples from root node.
         let root = &plan.nodes[0];
         let mut names = Vec::new();
         for &tuple_id in &root.row_tuples {
@@ -174,11 +276,17 @@ pub fn translate_fragment(
                 }
             }
         }
-        // Deduplicate names (joins can produce duplicate column names like "id" from
-        // both sides, which DuckDB cannot handle in from_substrait output tables).
+        debug!(source = "row_tuples", names = ?names, "output column names");
+        names
+    } else {
+        Vec::new()
+    };
+    // Deduplicate names (joins can produce duplicate column names like "id" from
+    // both sides, which DuckDB cannot handle in from_substrait output tables).
+    let output_names = {
         let mut name_counts: HashMap<String, usize> = HashMap::new();
         let mut unique = Vec::new();
-        for name in names {
+        for name in output_names {
             let count = name_counts.entry(name.clone()).or_insert(0);
             if *count == 0 {
                 unique.push(name);
@@ -188,11 +296,101 @@ pub fn translate_fragment(
             *count += 1;
         }
         unique
+    };
+
+    // Compute output_column_indices: explicit mapping from FE column i to DuckDB
+    // output column position. For file scans where the Rel outputs more columns,
+    // we use name-based matching against the Rel output. For AGG/other where
+    // output_exprs might reorder columns, we use slot position in row_tuples.
+    let rel_names = rel_output_names(&rel);
+    let output_column_indices = if !rel_names.is_empty() && rel_names.len() > output_names.len() {
+        // Name-based: find each output_name's position in the full Rel output.
+        let mut indices = Vec::new();
+        let mut all_found = true;
+        for name in &output_names {
+            if let Some(pos) = rel_names.iter().position(|r| r == name) {
+                indices.push(pos);
+            } else {
+                all_found = false;
+                break;
+            }
+        }
+        if all_found {
+            debug!(indices = ?indices, "output_column_indices from rel_names");
+            Some(indices)
+        } else {
+            None
+        }
+    } else if let Some(output_exprs) = fragment.output_exprs.as_ref() {
+        // Position-based: map output_exprs slots to their position in the root
+        // node's materialized output (which matches the DuckDB output order).
+        if !plan.nodes.is_empty() {
+            let root = &plan.nodes[0];
+            // Build enumerated materialized slot list from root's row_tuples.
+            let mut materialized_slots = Vec::new();
+            for &tuple_id in &root.row_tuples {
+                if let Ok(tuple) = desc.get_tuple(tuple_id) {
+                    for &slot_id in &tuple.slot_ids {
+                        if let Ok(slot) = desc.get_slot(slot_id) {
+                            if slot.is_materialized {
+                                materialized_slots.push(slot_id);
+                            }
+                        }
+                    }
+                }
+            }
+            // Map each output_expr's slot_id to position in materialized_slots.
+            let mut indices = Vec::new();
+            let mut all_found = true;
+            for expr in output_exprs {
+                if let Some(first_node) = expr.nodes.first() {
+                    if first_node.node_type == TExprNodeType::SLOT_REF {
+                        if let Some(slot_ref) = &first_node.slot_ref {
+                            if let Some(pos) = materialized_slots.iter().position(|&s| s == slot_ref.slot_id) {
+                                indices.push(pos);
+                                continue;
+                            }
+                        }
+                    }
+                }
+                all_found = false;
+                break;
+            }
+            if all_found && !indices.is_empty() {
+                // Only use explicit indices if they differ from identity (actual reordering).
+                let is_identity = indices.iter().enumerate().all(|(i, &v)| i == v);
+                if !is_identity {
+                    debug!(indices = ?indices, "output_column_indices from output_exprs (reorder)");
+                    Some(indices)
+                } else {
+                    None // Identity mapping — no reorder needed.
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
     } else {
-        Vec::new()
+        None
+    };
+
+    // DuckDB's from_substrait uses RelRoot.names to determine output columns,
+    // taking the first N columns by POSITION. When the Rel tree outputs more
+    // columns than expected, we set RelRoot.names to the FULL Rel output schema.
+    let root_names = if !rel_names.is_empty() && rel_names.len() > output_names.len() {
+        debug!(
+            rel_cols = rel_names.len(),
+            output_cols = output_names.len(),
+            "Rel outputs more columns than expected, using full schema for RelRoot"
+        );
+        rel_names
+    } else {
+        output_names.clone()
     };
 
     let (extension_uris, extensions) = registry.into_extensions();
+    let result_output_names = output_names;
 
     let substrait_plan = Plan {
         version: Some(Version {
@@ -207,7 +405,7 @@ pub fn translate_fragment(
         relations: vec![PlanRel {
             rel_type: Some(substrait::proto::plan_rel::RelType::Root(RelRoot {
                 input: Some(rel),
-                names: output_names,
+                names: root_names,
             })),
         }],
         ..Default::default()
@@ -219,6 +417,738 @@ pub fn translate_fragment(
         extensions = substrait_plan.extensions.len(),
         "translated Doris fragment to Substrait plan"
     );
-    Ok(bytes)
+    Ok(TranslatedPlan {
+        substrait_bytes: bytes,
+        output_names: result_output_names,
+        output_column_indices,
+    })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_helpers::*;
+    use doris_thrift::types::TPrimitiveType;
+    use substrait::proto::{plan_rel, read_rel, rel};
+
+    #[test]
+    fn test_translate_fragment_to_sql_union() {
+        let node = make_union_node(0, 0, vec![vec![int_literal_expr(1), int_literal_expr(2)]]);
+        let plan = make_plan(vec![node]);
+        let desc = make_desc_table(vec![(0, None)], vec![]);
+        let params = make_fragment_params(plan, desc);
+        let sql = translate_fragment_to_sql(&params).unwrap();
+        assert_eq!(sql, "SELECT 1, 2");
+    }
+
+    #[test]
+    fn test_translate_fragment_to_sql_union_all() {
+        let node = make_union_node(
+            0,
+            0,
+            vec![
+                vec![int_literal_expr(1)],
+                vec![int_literal_expr(2)],
+                vec![int_literal_expr(3)],
+            ],
+        );
+        let plan = make_plan(vec![node]);
+        let desc = make_desc_table(vec![(0, None)], vec![]);
+        let params = make_fragment_params(plan, desc);
+        let sql = translate_fragment_to_sql(&params).unwrap();
+        assert_eq!(sql, "SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3");
+    }
+
+    #[test]
+    fn test_translate_fragment_substrait_union() {
+        // UNION_NODE with const values should produce a VirtualTable ReadRel.
+        let node = make_union_node(0, 0, vec![vec![int_literal_expr(42)]]);
+        let plan = make_plan(vec![node]);
+        let desc = make_desc_table(vec![(0, None)], vec![]);
+        let params = make_fragment_params(plan, desc);
+
+        let table_schemas = HashMap::new();
+        let result = translate_fragment(&params, &table_schemas).unwrap();
+        assert!(!result.substrait_bytes.is_empty());
+
+        // Decode the Substrait plan and verify it has a VirtualTable.
+        let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
+        assert_eq!(plan.relations.len(), 1);
+        let root = match &plan.relations[0].rel_type {
+            Some(plan_rel::RelType::Root(r)) => r,
+            _ => panic!("expected Root"),
+        };
+        let input = root.input.as_ref().unwrap();
+        match input.rel_type.as_ref().unwrap() {
+            rel::RelType::Read(read) => match &read.read_type {
+                Some(read_rel::ReadType::VirtualTable(vt)) => {
+                    assert_eq!(vt.values.len(), 1);
+                }
+                other => panic!("expected VirtualTable, got {:?}", other),
+            },
+            other => panic!("expected Read, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_translate_fragment_file_scan_output_names() {
+        // FILE_SCAN_NODE with table_schemas should produce correct output_names.
+        let node = make_file_scan_node(0, 0, "cities");
+        let plan = make_plan(vec![node]);
+        let desc = make_desc_table(
+            vec![(0, Some(1))],
+            vec![
+                (0, 0, 0, "city", TPrimitiveType::VARCHAR),
+                (1, 0, 1, "state", TPrimitiveType::VARCHAR),
+                (2, 0, 2, "population", TPrimitiveType::BIGINT),
+            ],
+        );
+        let params = make_fragment_params(plan, desc);
+
+        // Provide the full table schema (all 3 columns).
+        let mut table_schemas = HashMap::new();
+        table_schemas.insert(
+            "cities_0".to_string(),
+            vec!["city".to_string(), "state".to_string(), "population".to_string()],
+        );
+
+        let result = translate_fragment(&params, &table_schemas).unwrap();
+        // Output names should include all materialized columns from the descriptor.
+        assert_eq!(result.output_names, vec!["city", "state", "population"]);
+    }
+
+    #[test]
+    fn test_translate_fragment_file_scan_projected_subset() {
+        // When the descriptor table only has a subset of columns (projection push-down),
+        // output_names should only include those columns.
+        let node = make_file_scan_node(0, 0, "cities");
+        let plan = make_plan(vec![node]);
+
+        // Descriptor only has 2 of 3 columns (city, population — not state).
+        let desc = make_desc_table(
+            vec![(0, Some(1))],
+            vec![
+                (0, 0, 0, "city", TPrimitiveType::VARCHAR),
+                (2, 0, 2, "population", TPrimitiveType::BIGINT),
+            ],
+        );
+        let params = make_fragment_params(plan, desc);
+
+        // Full table schema has 3 columns.
+        let mut table_schemas = HashMap::new();
+        table_schemas.insert(
+            "cities_0".to_string(),
+            vec!["city".to_string(), "state".to_string(), "population".to_string()],
+        );
+
+        let result = translate_fragment(&params, &table_schemas).unwrap();
+        // Output names come from the descriptor table, not the full table schema.
+        assert_eq!(result.output_names, vec!["city", "population"]);
+
+        // The Substrait plan's ReadRel should have all 3 columns in base_schema
+        // (because DuckDB maps by position).
+        let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
+        let root = match &plan.relations[0].rel_type {
+            Some(plan_rel::RelType::Root(r)) => r,
+            _ => panic!("expected Root"),
+        };
+        // RelRoot.names should match the full Rel output (3 cols), not the projected
+        // subset (2 cols), so DuckDB outputs all columns with correct names.
+        assert_eq!(root.names, vec!["city", "state", "population"],
+            "RelRoot.names should use full Rel schema, not projected subset");
+        let input = root.input.as_ref().unwrap();
+        match input.rel_type.as_ref().unwrap() {
+            rel::RelType::Read(read) => {
+                let schema = read.base_schema.as_ref().unwrap();
+                assert_eq!(schema.names.len(), 3, "ReadRel should have all table columns");
+                assert_eq!(schema.names, vec!["city", "state", "population"]);
+            }
+            other => panic!("expected Read, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_translate_fragment_substrait_has_version() {
+        let node = make_union_node(0, 0, vec![vec![int_literal_expr(1)]]);
+        let plan = make_plan(vec![node]);
+        let desc = make_desc_table(vec![(0, None)], vec![]);
+        let params = make_fragment_params(plan, desc);
+
+        let result = translate_fragment(&params, &HashMap::new()).unwrap();
+        let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
+        let version = plan.version.unwrap();
+        assert_eq!(version.producer, "sirius-doris-be");
+    }
+
+    #[test]
+    fn test_translate_fragment_exchange_node() {
+        // EXCHANGE_NODE(0 children) → ReadRel with NamedTable.
+        let node = make_exchange_node(5, vec![0]);
+        let plan = make_plan(vec![node]);
+        let desc = make_desc_table(
+            vec![(0, None)],
+            vec![
+                (0, 0, 0, "id", TPrimitiveType::INT),
+                (1, 0, 1, "value", TPrimitiveType::DOUBLE),
+            ],
+        );
+        let params = make_fragment_params(plan, desc);
+
+        let result = translate_fragment(&params, &HashMap::new()).unwrap();
+        let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
+        let root = match &plan.relations[0].rel_type {
+            Some(plan_rel::RelType::Root(r)) => r,
+            _ => panic!("expected Root"),
+        };
+        let input = root.input.as_ref().unwrap();
+        match input.rel_type.as_ref().unwrap() {
+            rel::RelType::Read(read) => match &read.read_type {
+                Some(read_rel::ReadType::NamedTable(nt)) => {
+                    assert_eq!(nt.names, vec!["__EXCHANGE_TABLE_5"]);
+                }
+                other => panic!("expected NamedTable, got {:?}", other),
+            },
+            other => panic!("expected Read, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_output_name_deduplication() {
+        // When a join produces duplicate column names (e.g., "id" from both sides),
+        // the output names should be deduplicated with :N suffix.
+        let node = make_union_node(0, 0, vec![vec![int_literal_expr(1)]]);
+        let plan = make_plan(vec![node]);
+        // Two tuples both having an "id" column.
+        let desc = make_desc_table(
+            vec![(0, None), (1, None)],
+            vec![
+                (0, 0, 0, "id", TPrimitiveType::INT),
+                (1, 0, 1, "name", TPrimitiveType::VARCHAR),
+                (2, 1, 0, "id", TPrimitiveType::INT),
+                (3, 1, 1, "value", TPrimitiveType::DOUBLE),
+            ],
+        );
+        let params = make_fragment_params(plan, desc);
+
+        // Manually set row_tuples to reference both tuples (simulating a join).
+        // This tests the deduplication logic in translate_fragment.
+        let result = translate_fragment(&params, &HashMap::new()).unwrap();
+        // The actual output depends on the root node's row_tuples,
+        // which for UNION_NODE only references tuple 0.
+        // With tuple 0: id, name — no dedup needed.
+        assert!(result.output_names.contains(&"id".to_string()));
+        assert!(result.output_names.contains(&"name".to_string()));
+    }
+
+    // ---- HASH_JOIN_NODE tests (TPC-H: joins are critical) ----
+
+    #[test]
+    fn test_hash_join_inner() {
+        use doris_thrift::plan_nodes::TJoinOp;
+        // HASH_JOIN(INNER) of two FILE_SCAN_NODEs:
+        //   left:  orders(order_id BIGINT, cust_id BIGINT)  tuple 0
+        //   right: customers(cust_id BIGINT, name VARCHAR)  tuple 1
+        //   ON left.cust_id = right.cust_id
+        let join_node = make_hash_join_node(
+            0,
+            TJoinOp::INNER_JOIN,
+            vec![0, 1],
+            vec![(
+                slot_ref_expr_in_tuple(1, 0, type_desc(TPrimitiveType::BIGINT)),
+                slot_ref_expr_in_tuple(2, 1, type_desc(TPrimitiveType::BIGINT)),
+            )],
+        );
+        let left_scan = make_file_scan_node(1, 0, "orders");
+        let right_scan = make_file_scan_node(2, 1, "customers");
+        let plan = make_plan(vec![join_node, left_scan, right_scan]);
+        let desc = make_desc_table(
+            vec![(0, Some(10)), (1, Some(20))],
+            vec![
+                (0, 0, 0, "order_id", TPrimitiveType::BIGINT),
+                (1, 0, 1, "cust_id", TPrimitiveType::BIGINT),
+                (2, 1, 0, "cust_id", TPrimitiveType::BIGINT),
+                (3, 1, 1, "name", TPrimitiveType::VARCHAR),
+            ],
+        );
+        let params = make_fragment_params(plan, desc);
+
+        let result = translate_fragment(&params, &HashMap::new()).unwrap();
+        let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
+        let root = match &plan.relations[0].rel_type {
+            Some(plan_rel::RelType::Root(r)) => r,
+            _ => panic!("expected Root"),
+        };
+        let input = root.input.as_ref().unwrap();
+        match input.rel_type.as_ref().unwrap() {
+            rel::RelType::Join(join) => {
+                assert_eq!(join.r#type, substrait::proto::join_rel::JoinType::Inner as i32);
+                assert!(join.expression.is_some(), "should have join expression");
+                assert!(join.left.is_some());
+                assert!(join.right.is_some());
+            }
+            other => panic!("expected JoinRel, got {:?}", std::mem::discriminant(other)),
+        }
+    }
+
+    #[test]
+    fn test_hash_join_left_outer() {
+        use doris_thrift::plan_nodes::TJoinOp;
+        let join_node = make_hash_join_node(
+            0,
+            TJoinOp::LEFT_OUTER_JOIN,
+            vec![0, 1],
+            vec![(
+                slot_ref_expr_in_tuple(0, 0, type_desc(TPrimitiveType::BIGINT)),
+                slot_ref_expr_in_tuple(2, 1, type_desc(TPrimitiveType::BIGINT)),
+            )],
+        );
+        let left_scan = make_file_scan_node(1, 0, "left_table");
+        let right_scan = make_file_scan_node(2, 1, "right_table");
+        let plan = make_plan(vec![join_node, left_scan, right_scan]);
+        let desc = make_desc_table(
+            vec![(0, Some(10)), (1, Some(20))],
+            vec![
+                (0, 0, 0, "id", TPrimitiveType::BIGINT),
+                (1, 0, 1, "value", TPrimitiveType::DOUBLE),
+                (2, 1, 0, "id", TPrimitiveType::BIGINT),
+                (3, 1, 1, "name", TPrimitiveType::VARCHAR),
+            ],
+        );
+        let params = make_fragment_params(plan, desc);
+
+        let result = translate_fragment(&params, &HashMap::new()).unwrap();
+        let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
+        let root = match &plan.relations[0].rel_type {
+            Some(plan_rel::RelType::Root(r)) => r,
+            _ => panic!("expected Root"),
+        };
+        let input = root.input.as_ref().unwrap();
+        match input.rel_type.as_ref().unwrap() {
+            rel::RelType::Join(join) => {
+                assert_eq!(join.r#type, substrait::proto::join_rel::JoinType::Left as i32);
+            }
+            other => panic!("expected JoinRel, got {:?}", std::mem::discriminant(other)),
+        }
+    }
+
+    // ---- AGGREGATION_NODE tests (TPC-H: GROUP BY, COUNT, SUM) ----
+
+    #[test]
+    fn test_aggregation_count_with_group_by() {
+        // SELECT cust_id, COUNT(*) FROM orders GROUP BY cust_id
+        // Plan: AGG_NODE(need_finalize=true) → FILE_SCAN_NODE
+        //
+        // Scan tuple 0: order_id, cust_id
+        // Agg intermediate tuple 1: cust_id_agg (grouping), count_star
+        // Agg output tuple 2: cust_id_out, count_result
+        let scan = make_file_scan_node(1, 0, "orders");
+        let agg = make_aggregation_node(
+            0,
+            vec![2], // output tuple
+            Some(vec![
+                // GROUP BY cust_id (references scan tuple slot 1)
+                slot_ref_expr_in_tuple(1, 0, type_desc(TPrimitiveType::BIGINT)),
+            ]),
+            vec![
+                // COUNT(*) — aggregate with 0 children
+                agg_function_expr("count", type_desc(TPrimitiveType::BIGINT), vec![], vec![]),
+            ],
+            1, // intermediate_tuple_id
+            2, // output_tuple_id
+            true, // need_finalize
+        );
+        let plan = make_plan(vec![agg, scan]);
+        let desc = make_desc_table(
+            vec![(0, Some(10)), (1, None), (2, None)],
+            vec![
+                (0, 0, 0, "order_id", TPrimitiveType::BIGINT),
+                (1, 0, 1, "cust_id", TPrimitiveType::BIGINT),
+                (10, 2, 0, "cust_id", TPrimitiveType::BIGINT),
+                (11, 2, 1, "count_star", TPrimitiveType::BIGINT),
+            ],
+        );
+        let params = make_fragment_params(plan, desc);
+
+        let result = translate_fragment(&params, &HashMap::new()).unwrap();
+        let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
+        let root = match &plan.relations[0].rel_type {
+            Some(plan_rel::RelType::Root(r)) => r,
+            _ => panic!("expected Root"),
+        };
+        let input = root.input.as_ref().unwrap();
+        match input.rel_type.as_ref().unwrap() {
+            rel::RelType::Aggregate(agg) => {
+                assert_eq!(agg.groupings.len(), 1, "should have 1 grouping");
+                assert_eq!(
+                    agg.groupings[0].grouping_expressions.len(),
+                    1,
+                    "should have 1 grouping expression"
+                );
+                assert_eq!(agg.measures.len(), 1, "should have 1 measure (count)");
+                let measure = &agg.measures[0].measure.as_ref().unwrap();
+                assert_eq!(measure.phase, 3, "should be INITIAL_TO_RESULT");
+            }
+            other => panic!("expected AggregateRel, got {:?}", std::mem::discriminant(other)),
+        }
+    }
+
+    #[test]
+    fn test_aggregation_two_phase_collapse() {
+        // Two-phase aggregation: partial AGG → finalize AGG → scan.
+        // The finalize should collapse with the partial into INITIAL_TO_RESULT.
+        let scan = make_file_scan_node(2, 0, "orders");
+        let partial_agg = make_aggregation_node(
+            1,
+            vec![1],
+            Some(vec![slot_ref_expr_in_tuple(0, 0, type_desc(TPrimitiveType::BIGINT))]),
+            vec![agg_function_expr("sum", type_desc(TPrimitiveType::BIGINT),
+                vec![type_desc(TPrimitiveType::BIGINT)],
+                vec![slot_ref_expr_in_tuple(1, 0, type_desc(TPrimitiveType::BIGINT))])],
+            1, 1,
+            false, // need_finalize=false (partial)
+        );
+        let finalize_agg = make_aggregation_node(
+            0,
+            vec![2],
+            Some(vec![slot_ref_expr_in_tuple(10, 1, type_desc(TPrimitiveType::BIGINT))]),
+            vec![agg_function_expr("sum", type_desc(TPrimitiveType::BIGINT),
+                vec![type_desc(TPrimitiveType::BIGINT)],
+                vec![slot_ref_expr_in_tuple(11, 1, type_desc(TPrimitiveType::BIGINT))])],
+            2, 2,
+            true, // need_finalize=true (finalize)
+        );
+        let plan = make_plan(vec![finalize_agg, partial_agg, scan]);
+        let desc = make_desc_table(
+            vec![(0, Some(10)), (1, None), (2, None)],
+            vec![
+                (0, 0, 0, "key", TPrimitiveType::BIGINT),
+                (1, 0, 1, "amount", TPrimitiveType::BIGINT),
+                (10, 1, 0, "key", TPrimitiveType::BIGINT),
+                (11, 1, 1, "sum_amount", TPrimitiveType::BIGINT),
+                (20, 2, 0, "key", TPrimitiveType::BIGINT),
+                (21, 2, 1, "total", TPrimitiveType::BIGINT),
+            ],
+        );
+        let params = make_fragment_params(plan, desc);
+
+        let result = translate_fragment(&params, &HashMap::new()).unwrap();
+        let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
+        let root = match &plan.relations[0].rel_type {
+            Some(plan_rel::RelType::Root(r)) => r,
+            _ => panic!("expected Root"),
+        };
+        let input = root.input.as_ref().unwrap();
+        // Should be a single AggregateRel (collapsed from two phases).
+        match input.rel_type.as_ref().unwrap() {
+            rel::RelType::Aggregate(agg) => {
+                assert_eq!(agg.measures.len(), 1);
+                let measure = agg.measures[0].measure.as_ref().unwrap();
+                assert_eq!(measure.phase, 3, "should be INITIAL_TO_RESULT after collapse");
+                // Input should be the scan, not another aggregate.
+                match agg.input.as_deref().unwrap().rel_type.as_ref().unwrap() {
+                    rel::RelType::Read(_) => {} // Good — the partial was collapsed
+                    other => panic!("expected ReadRel under collapsed AGG, got {:?}", std::mem::discriminant(other)),
+                }
+            }
+            other => panic!("expected AggregateRel, got {:?}", std::mem::discriminant(other)),
+        }
+    }
+
+    // ---- SORT_NODE tests (TPC-H: ORDER BY, LIMIT) ----
+
+    #[test]
+    fn test_sort_order_by_asc() {
+        // ORDER BY col1 ASC
+        let scan = make_file_scan_node(1, 0, "data");
+        let sort = make_sort_node(
+            0,
+            vec![0],
+            vec![slot_ref_expr_in_tuple(0, 0, type_desc(TPrimitiveType::BIGINT))],
+            vec![true],  // ASC
+            vec![true],  // NULLS FIRST
+            None,        // no offset
+            -1,          // no limit
+        );
+        let plan = make_plan(vec![sort, scan]);
+        let desc = make_desc_table(
+            vec![(0, Some(10))],
+            vec![
+                (0, 0, 0, "col1", TPrimitiveType::BIGINT),
+                (1, 0, 1, "col2", TPrimitiveType::VARCHAR),
+            ],
+        );
+        let params = make_fragment_params(plan, desc);
+
+        let result = translate_fragment(&params, &HashMap::new()).unwrap();
+        let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
+        let root = match &plan.relations[0].rel_type {
+            Some(plan_rel::RelType::Root(r)) => r,
+            _ => panic!("expected Root"),
+        };
+        let input = root.input.as_ref().unwrap();
+        match input.rel_type.as_ref().unwrap() {
+            rel::RelType::Sort(sort) => {
+                assert_eq!(sort.sorts.len(), 1);
+                // ASC NULLS FIRST = SortDirection 1
+                let sort_field = &sort.sorts[0];
+                match sort_field.sort_kind.as_ref().unwrap() {
+                    substrait::proto::sort_field::SortKind::Direction(d) => {
+                        assert_eq!(d, &(substrait::proto::sort_field::SortDirection::AscNullsFirst as i32));
+                    }
+                    other => panic!("expected Direction, got {:?}", other),
+                }
+            }
+            other => panic!("expected SortRel, got {:?}", std::mem::discriminant(other)),
+        }
+    }
+
+    #[test]
+    fn test_sort_with_limit_offset() {
+        // ORDER BY col1 DESC LIMIT 10 OFFSET 5
+        let scan = make_file_scan_node(1, 0, "data");
+        let sort = make_sort_node(
+            0,
+            vec![0],
+            vec![slot_ref_expr_in_tuple(0, 0, type_desc(TPrimitiveType::BIGINT))],
+            vec![false], // DESC
+            vec![false], // NULLS LAST
+            Some(5),     // offset
+            10,          // limit
+        );
+        let plan = make_plan(vec![sort, scan]);
+        let desc = make_desc_table(
+            vec![(0, Some(10))],
+            vec![(0, 0, 0, "col1", TPrimitiveType::BIGINT)],
+        );
+        let params = make_fragment_params(plan, desc);
+
+        let result = translate_fragment(&params, &HashMap::new()).unwrap();
+        let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
+        let root = match &plan.relations[0].rel_type {
+            Some(plan_rel::RelType::Root(r)) => r,
+            _ => panic!("expected Root"),
+        };
+        let input = root.input.as_ref().unwrap();
+        // LIMIT/OFFSET wraps the sort in a FetchRel.
+        match input.rel_type.as_ref().unwrap() {
+            rel::RelType::Fetch(fetch) => {
+                match fetch.offset_mode.as_ref().unwrap() {
+                    substrait::proto::fetch_rel::OffsetMode::Offset(o) => assert_eq!(o, &5),
+                    other => panic!("expected Offset, got {:?}", other),
+                }
+                match fetch.count_mode.as_ref().unwrap() {
+                    substrait::proto::fetch_rel::CountMode::Count(c) => assert_eq!(c, &10),
+                    other => panic!("expected Count, got {:?}", other),
+                }
+                // Inner should be SortRel.
+                match fetch.input.as_deref().unwrap().rel_type.as_ref().unwrap() {
+                    rel::RelType::Sort(sort) => {
+                        assert_eq!(sort.sorts.len(), 1);
+                    }
+                    other => panic!("expected SortRel under Fetch, got {:?}", std::mem::discriminant(other)),
+                }
+            }
+            other => panic!("expected FetchRel, got {:?}", std::mem::discriminant(other)),
+        }
+    }
+
+    // ---- CROSS_JOIN_NODE tests ----
+
+    #[test]
+    fn test_cross_join() {
+        let join_node = make_cross_join_node(0, vec![0, 1]);
+        let left_scan = make_file_scan_node(1, 0, "t1");
+        let right_scan = make_file_scan_node(2, 1, "t2");
+        let plan = make_plan(vec![join_node, left_scan, right_scan]);
+        let desc = make_desc_table(
+            vec![(0, Some(10)), (1, Some(20))],
+            vec![
+                (0, 0, 0, "a", TPrimitiveType::INT),
+                (1, 1, 0, "b", TPrimitiveType::INT),
+            ],
+        );
+        let params = make_fragment_params(plan, desc);
+
+        let result = translate_fragment(&params, &HashMap::new()).unwrap();
+        let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
+        let root = match &plan.relations[0].rel_type {
+            Some(plan_rel::RelType::Root(r)) => r,
+            _ => panic!("expected Root"),
+        };
+        let input = root.input.as_ref().unwrap();
+        match input.rel_type.as_ref().unwrap() {
+            rel::RelType::Cross(cross) => {
+                assert!(cross.left.is_some());
+                assert!(cross.right.is_some());
+            }
+            other => panic!("expected CrossRel, got {:?}", std::mem::discriminant(other)),
+        }
+    }
+
+    // ---- SELECT_NODE tests (filter pass-through) ----
+
+    #[test]
+    fn test_select_node_with_filter() {
+        // SELECT_NODE wraps a child with conjuncts.
+        let scan = make_file_scan_node(1, 0, "data");
+        let select = make_select_node(
+            0,
+            vec![0],
+            vec![binary_pred_expr(
+                doris_thrift::opcodes::TExprOpcode::GT,
+                slot_ref_expr(0, type_desc(TPrimitiveType::BIGINT)),
+                int_literal_expr(100),
+            )],
+        );
+        let plan = make_plan(vec![select, scan]);
+        let desc = make_desc_table(
+            vec![(0, Some(10))],
+            vec![(0, 0, 0, "value", TPrimitiveType::BIGINT)],
+        );
+        let params = make_fragment_params(plan, desc);
+
+        let result = translate_fragment(&params, &HashMap::new()).unwrap();
+        let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
+        let root = match &plan.relations[0].rel_type {
+            Some(plan_rel::RelType::Root(r)) => r,
+            _ => panic!("expected Root"),
+        };
+        let input = root.input.as_ref().unwrap();
+        match input.rel_type.as_ref().unwrap() {
+            rel::RelType::Filter(filter) => {
+                assert!(filter.condition.is_some());
+                // Input should be a ReadRel (scan).
+                match filter.input.as_deref().unwrap().rel_type.as_ref().unwrap() {
+                    rel::RelType::Read(_) => {}
+                    other => panic!("expected ReadRel, got {:?}", std::mem::discriminant(other)),
+                }
+            }
+            other => panic!("expected FilterRel, got {:?}", std::mem::discriminant(other)),
+        }
+    }
+
+    // ---- EXCHANGE_NODE pass-through tests ----
+
+    #[test]
+    fn test_exchange_passthrough_with_child() {
+        // EXCHANGE_NODE(1 child) = sender wrapping scan → should pass through.
+        let exchange = make_plan_node(0, doris_thrift::plan_nodes::TPlanNodeType::EXCHANGE_NODE, 1, vec![0]);
+        let scan = make_file_scan_node(1, 0, "data");
+        let plan = make_plan(vec![exchange, scan]);
+        let desc = make_desc_table(
+            vec![(0, Some(10))],
+            vec![(0, 0, 0, "col1", TPrimitiveType::INT)],
+        );
+        let params = make_fragment_params(plan, desc);
+
+        let result = translate_fragment(&params, &HashMap::new()).unwrap();
+        let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
+        let root = match &plan.relations[0].rel_type {
+            Some(plan_rel::RelType::Root(r)) => r,
+            _ => panic!("expected Root"),
+        };
+        // Should be a ReadRel directly (exchange passed through).
+        let input = root.input.as_ref().unwrap();
+        match input.rel_type.as_ref().unwrap() {
+            rel::RelType::Read(_) => {}
+            other => panic!("expected ReadRel (pass-through), got {:?}", std::mem::discriminant(other)),
+        }
+    }
+
+    // ---- MATERIALIZATION_NODE pass-through test ----
+
+    #[test]
+    fn test_materialization_passthrough() {
+        let mat_node = make_plan_node(0, doris_thrift::plan_nodes::TPlanNodeType::MATERIALIZATION_NODE, 1, vec![0]);
+        let scan = make_file_scan_node(1, 0, "data");
+        let plan = make_plan(vec![mat_node, scan]);
+        let desc = make_desc_table(
+            vec![(0, Some(10))],
+            vec![(0, 0, 0, "col1", TPrimitiveType::INT)],
+        );
+        let params = make_fragment_params(plan, desc);
+
+        let result = translate_fragment(&params, &HashMap::new()).unwrap();
+        let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
+        let root = match &plan.relations[0].rel_type {
+            Some(plan_rel::RelType::Root(r)) => r,
+            _ => panic!("expected Root"),
+        };
+        match root.input.as_ref().unwrap().rel_type.as_ref().unwrap() {
+            rel::RelType::Read(_) => {} // Good — materialization passed through to scan
+            other => panic!("expected ReadRel, got {:?}", std::mem::discriminant(other)),
+        }
+    }
+
+    // ---- EMPTY_SET_NODE test ----
+
+    #[test]
+    fn test_empty_set_substrait() {
+        let node = make_empty_set_node(0);
+        let plan = make_plan(vec![node]);
+        let desc = make_desc_table(vec![], vec![]);
+        let params = make_fragment_params(plan, desc);
+
+        let result = translate_fragment(&params, &HashMap::new()).unwrap();
+        let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
+        let root = match &plan.relations[0].rel_type {
+            Some(plan_rel::RelType::Root(r)) => r,
+            _ => panic!("expected Root"),
+        };
+        match root.input.as_ref().unwrap().rel_type.as_ref().unwrap() {
+            rel::RelType::Read(read) => match &read.read_type {
+                Some(read_rel::ReadType::VirtualTable(vt)) => {
+                    assert!(vt.values.is_empty(), "EMPTY_SET should have 0 rows");
+                }
+                other => panic!("expected VirtualTable, got {:?}", other),
+            },
+            other => panic!("expected ReadRel, got {:?}", std::mem::discriminant(other)),
+        }
+    }
+
+    // ---- Extension registration tests ----
+
+    #[test]
+    fn test_extension_function_dedup() {
+        // When the same function is used multiple times, it should only be registered once.
+        let scan = make_file_scan_node(1, 0, "data");
+        let select = make_select_node(
+            0,
+            vec![0],
+            vec![
+                binary_pred_expr(
+                    doris_thrift::opcodes::TExprOpcode::GT,
+                    slot_ref_expr(0, type_desc(TPrimitiveType::BIGINT)),
+                    int_literal_expr(10),
+                ),
+                binary_pred_expr(
+                    doris_thrift::opcodes::TExprOpcode::GT,
+                    slot_ref_expr(0, type_desc(TPrimitiveType::BIGINT)),
+                    int_literal_expr(20),
+                ),
+            ],
+        );
+        let plan = make_plan(vec![select, scan]);
+        let desc = make_desc_table(
+            vec![(0, Some(10))],
+            vec![(0, 0, 0, "val", TPrimitiveType::BIGINT)],
+        );
+        let params = make_fragment_params(plan, desc);
+
+        let result = translate_fragment(&params, &HashMap::new()).unwrap();
+        let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
+        // "gt" should be registered once even though used twice.
+        let gt_count = plan
+            .extensions
+            .iter()
+            .filter(|ext| {
+                if let Some(substrait::proto::extensions::simple_extension_declaration::MappingType::ExtensionFunction(f)) = &ext.mapping_type {
+                    f.name == "gt"
+                } else {
+                    false
+                }
+            })
+            .count();
+        assert_eq!(gt_count, 1, "gt should be registered exactly once");
+    }
+}

@@ -53,10 +53,10 @@ impl HeartbeatServiceSyncHandler for HeartbeatHandler {
             Some(self.state.brpc_port),    // brpc_port
             Some(self.state.version.clone()), // version
             Some(self.state.start_time_ms),  // be_start_time
-            Some("mix".to_string()),       // be_node_role
+            Some("mix".to_string()), // be_node_role
             Some(false),                   // is_shutdown
             Some(self.state.arrow_flight_port), // arrow_flight_sql_port
-            None::<i64>,                   // be_mem (let FE discover)
+            Some(32 * 1024 * 1024 * 1024_i64), // be_mem: 32 GB
             None::<i64>,                   // fragment_executing_count
             None::<i64>,                   // fragment_last_active_time
         );

@@ -517,6 +517,80 @@ fn translate_aggregation_node(
             // Reuse the partial aggregation's input, groupings, measures, and expressions,
             // but upgrade all measure phases to INITIAL_TO_RESULT.
             let mut merged = *child_agg.clone();
+
+            // The partial's measure order may differ from the finalize's expected order.
+            // Detect this by matching each finalize aggregate_function's SLOT_REF child
+            // to the partial node's output tuple measure slots.
+            if let Some(partial_node) = child_node {
+                let num_grouping = merged
+                    .groupings
+                    .first()
+                    .map(|g| {
+                        #[allow(deprecated)]
+                        g.grouping_expressions.len()
+                    })
+                    .unwrap_or(0);
+
+                // Get the partial's output tuple's materialized slot IDs.
+                let mut partial_output_slots = Vec::new();
+                for &tuple_id in &partial_node.row_tuples {
+                    if let Ok(tuple) = desc.get_tuple(tuple_id) {
+                        for &slot_id in &tuple.slot_ids {
+                            if let Ok(slot) = desc.get_slot(slot_id) {
+                                if slot.is_materialized {
+                                    partial_output_slots.push(slot_id);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Skip grouping key slots to get measure slots only.
+                if partial_output_slots.len() > num_grouping {
+                    let measure_slots = &partial_output_slots[num_grouping..];
+
+                    // For each finalize aggregate function, find which partial
+                    // measure it references via its SLOT_REF child.
+                    let mut permutation = Vec::new();
+                    let mut all_found = true;
+                    for agg_fn in &agg_node.aggregate_functions {
+                        let slot_id = agg_fn
+                            .nodes
+                            .iter()
+                            .find(|n| n.node_type == TExprNodeType::SLOT_REF)
+                            .and_then(|n| n.slot_ref.as_ref())
+                            .map(|sr| sr.slot_id);
+
+                        if let Some(sid) = slot_id {
+                            if let Some(pos) = measure_slots.iter().position(|&s| s == sid) {
+                                permutation.push(pos);
+                            } else {
+                                all_found = false;
+                                break;
+                            }
+                        } else {
+                            all_found = false;
+                            break;
+                        }
+                    }
+
+                    if all_found
+                        && !permutation.is_empty()
+                        && !permutation.iter().enumerate().all(|(i, &v)| i == v)
+                    {
+                        tracing::info!(
+                            permutation = ?permutation,
+                            "reordering collapsed AGG measures to match finalize order"
+                        );
+                        let old_measures = merged.measures.clone();
+                        merged.measures.clear();
+                        for &old_pos in &permutation {
+                            merged.measures.push(old_measures[old_pos].clone());
+                        }
+                    }
+                }
+            }
+
             for measure in &mut merged.measures {
                 if let Some(func) = &mut measure.measure {
                     func.phase = 3; // INITIAL_TO_RESULT

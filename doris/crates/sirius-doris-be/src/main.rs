@@ -17,18 +17,30 @@ use doris_rpc::heartbeat_service::BeState;
 use result_formatter::result_store::ResultStore;
 use sirius_ffi::SiriusEngine;
 
-#[instrument(skip_all, fields(%fe_addr, heartbeat_port))]
-async fn register_with_fe(fe_addr: &str, heartbeat_port: u16) -> anyhow::Result<()> {
-    use mysql_async::prelude::*;
-    let url = format!("mysql://root@{}", fe_addr);
-    let pool = mysql_async::Pool::new(url.as_str());
-    let mut conn = pool.get_conn().await?;
-    let stmt = format!(
-        "ALTER SYSTEM ADD BACKEND '127.0.0.1:{}'",
-        heartbeat_port
-    );
-    conn.query_drop(&stmt).await?;
-    pool.disconnect().await?;
+#[instrument(skip_all, fields(%fe_addr, heartbeat_port, %advertise_host))]
+async fn register_with_fe(fe_addr: &str, heartbeat_port: u16, advertise_host: &str) -> anyhow::Result<()> {
+    use base64::Engine;
+    // Use Doris HTTP SQL API — avoids MySQL protocol incompatibilities.
+    let host = fe_addr.split(':').next().unwrap_or("127.0.0.1");
+    let mysql_port: u16 = fe_addr.split(':').nth(1).and_then(|p| p.parse().ok()).unwrap_or(9030);
+    // HTTP API is on port 8030 (mysql_port - 1000 by convention)
+    let http_port = mysql_port - 1000;
+    let stmt = format!("ALTER SYSTEM ADD BACKEND '{}:{}'", advertise_host, heartbeat_port);
+    let url = format!("http://{}:{}/api/query/default_cluster/information_schema", host, http_port);
+    let body = format!(r#"{{"stmt":"{}"}}"#, stmt);
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(b"root:")))
+        .body(body)
+        .send()
+        .await?;
+    let status = resp.status();
+    let text = resp.text().await?;
+    if !status.is_success() {
+        anyhow::bail!("HTTP {}: {}", status, text);
+    }
     Ok(())
 }
 
@@ -136,7 +148,26 @@ async fn run(
     exchange_buffer: doris_rpc::exchange_buffer::ExchangeBuffer,
 ) {
     if let Some(fe_addr) = &config.fe {
-        if let Err(e) = register_with_fe(fe_addr, config.heartbeat_port).await {
+        // Default advertise host: resolve system hostname to an IP.
+        let advertise_host = match &config.advertise_host {
+            Some(h) => h.clone(),
+            None => {
+                let hostname = std::process::Command::new("hostname")
+                    .output()
+                    .ok()
+                    .and_then(|o| String::from_utf8(o.stdout).ok())
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_else(|| "127.0.0.1".to_string());
+                // Try to resolve hostname to an IPv4 address
+                tokio::net::lookup_host(format!("{}:0", hostname))
+                    .await
+                    .ok()
+                    .and_then(|mut addrs| addrs.find(|a| a.is_ipv4()))
+                    .map(|a| a.ip().to_string())
+                    .unwrap_or(hostname)
+            }
+        };
+        if let Err(e) = register_with_fe(fe_addr, config.heartbeat_port, &advertise_host).await {
             warn!(error = %e, "FE registration failed (BE may already be registered)");
         }
     }

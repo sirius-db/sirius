@@ -1,4 +1,4 @@
-# Doris FE + regular BE + Sirius GPU BE for exchange testing.
+# Doris FE + Sirius GPU BE.
 # All on a Docker bridge network with fixed IPs.
 # Sirius BE binary is bind-mounted from the host build.
 #
@@ -8,7 +8,7 @@
 #   pixi run -e doris doris-docker-logs  # tail logs
 services:
   doris-fe:
-    image: apache/doris:fe-3.0.8
+    image: apache/doris:fe-4.0.3
     container_name: doris-fe
     hostname: doris-fe
     environment:
@@ -31,22 +31,22 @@ services:
       retries: 30
       start_period: 15s
 
-  doris-be:
-    image: apache/doris:be-3.0.8
-    container_name: doris-be
-    hostname: doris-be
-    depends_on:
-      doris-fe:
-        condition: service_healthy
-    environment:
-      - FE_SERVERS=fe1:172.20.80.2:9010
-      - BE_ADDR=172.20.80.3:9050
-    volumes:
-      - doris-be-storage:/opt/apache-doris/be/storage
-      - doris-be-log:/opt/apache-doris/be/log
-    networks:
-      doris_net:
-        ipv4_address: 172.20.80.3
+  # doris-be:
+  #   image: apache/doris:be-4.0.3
+  #   container_name: doris-be
+  #   hostname: doris-be
+  #   depends_on:
+  #     doris-fe:
+  #       condition: service_healthy
+  #   environment:
+  #     - FE_SERVERS=fe1:172.20.80.2:9010
+  #     - BE_ADDR=172.20.80.3:9050
+  #   volumes:
+  #     - doris-be-storage:/opt/apache-doris/be/storage
+  #     - doris-be-log:/opt/apache-doris/be/log
+  #   networks:
+  #     doris_net:
+  #       ipv4_address: 172.20.80.3
 
   sirius-be:
     image: ubuntu:22.04
@@ -68,6 +68,9 @@ services:
       - ../target/release/sirius-doris-be:/opt/sirius-doris-be:ro
       - ../../build/release/extension/sirius/sirius.duckdb_extension:/opt/extensions/sirius.duckdb_extension:ro
       - ../thirdparty/duckdb-substrait-extension/build/release/extension/substrait/substrait.duckdb_extension:/opt/extensions/substrait.duckdb_extension:ro
+      - /tmp/claude/cities.parquet:/data/cities.parquet:ro
+      - /tmp/claude/orders.parquet:/data/orders.parquet:ro
+      - /tmp/claude/customers.parquet:/data/customers.parquet:ro
     entrypoint:
       - /opt/nix-glibc/ld-linux-x86-64.so.2
       - /opt/sirius-doris-be
@@ -78,6 +81,7 @@ services:
       - --http-port=18040
       - --arrow-flight-port=18071
       - --fe=172.20.80.2:9030
+      - --advertise-host=172.20.80.4
     deploy:
       resources:
         reservations:

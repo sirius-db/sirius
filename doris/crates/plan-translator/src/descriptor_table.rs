@@ -445,3 +445,176 @@ impl DescriptorTable {
             })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_helpers::*;
+    use doris_thrift::types::TPrimitiveType;
+
+    #[test]
+    fn test_basic_slot_resolution() {
+        let desc_tbl = make_desc_table(
+            vec![(0, None)],
+            vec![
+                (0, 0, 0, "id", TPrimitiveType::INT),
+                (1, 0, 1, "name", TPrimitiveType::VARCHAR),
+                (2, 0, 2, "value", TPrimitiveType::DOUBLE),
+            ],
+        );
+        let desc = DescriptorTable::from_thrift(&desc_tbl).unwrap();
+
+        assert_eq!(desc.slot_column_index(0).unwrap(), 0);
+        assert_eq!(desc.slot_column_index(1).unwrap(), 1);
+        assert_eq!(desc.slot_column_index(2).unwrap(), 2);
+    }
+
+    #[test]
+    fn test_slot_not_found() {
+        let desc_tbl = make_desc_table(
+            vec![(0, None)],
+            vec![(0, 0, 0, "id", TPrimitiveType::INT)],
+        );
+        let desc = DescriptorTable::from_thrift(&desc_tbl).unwrap();
+        assert!(desc.get_slot(999).is_err());
+    }
+
+    #[test]
+    fn test_tuple_not_found() {
+        let desc_tbl = make_desc_table(vec![(0, None)], vec![]);
+        let desc = DescriptorTable::from_thrift(&desc_tbl).unwrap();
+        assert!(desc.get_tuple(999).is_err());
+    }
+
+    #[test]
+    fn test_global_index_single_tuple() {
+        let desc_tbl = make_desc_table(
+            vec![(0, None)],
+            vec![
+                (10, 0, 0, "a", TPrimitiveType::INT),
+                (11, 0, 1, "b", TPrimitiveType::INT),
+            ],
+        );
+        let desc = DescriptorTable::from_thrift(&desc_tbl).unwrap();
+        assert_eq!(desc.slot_global_index(10, &[0]).unwrap(), 0);
+        assert_eq!(desc.slot_global_index(11, &[0]).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_global_index_multi_tuple() {
+        // Simulates a join result with two tuples.
+        let desc_tbl = make_desc_table(
+            vec![(0, None), (1, None)],
+            vec![
+                (10, 0, 0, "a", TPrimitiveType::INT),
+                (11, 0, 1, "b", TPrimitiveType::INT),
+                (20, 1, 0, "c", TPrimitiveType::INT),
+                (21, 1, 1, "d", TPrimitiveType::INT),
+            ],
+        );
+        let desc = DescriptorTable::from_thrift(&desc_tbl).unwrap();
+        assert_eq!(desc.slot_global_index(10, &[0, 1]).unwrap(), 0);
+        assert_eq!(desc.slot_global_index(11, &[0, 1]).unwrap(), 1);
+        assert_eq!(desc.slot_global_index(20, &[0, 1]).unwrap(), 2);
+        assert_eq!(desc.slot_global_index(21, &[0, 1]).unwrap(), 3);
+    }
+
+    #[test]
+    fn test_table_named_struct_single_tuple() {
+        let desc_tbl = make_desc_table(
+            vec![(0, Some(100))],
+            vec![
+                (0, 0, 0, "id", TPrimitiveType::INT),
+                (1, 0, 1, "name", TPrimitiveType::VARCHAR),
+            ],
+        );
+        let desc = DescriptorTable::from_thrift(&desc_tbl).unwrap();
+        let schema = desc.table_named_struct(0).unwrap();
+        assert_eq!(schema.names, vec!["id", "name"]);
+    }
+
+    #[test]
+    fn test_table_named_struct_multi_tuple_same_table() {
+        // Two tuples referencing the same table_id — should merge columns.
+        let desc_tbl = make_desc_table(
+            vec![(0, Some(100)), (1, Some(100))],
+            vec![
+                (0, 0, 0, "id", TPrimitiveType::INT),
+                (1, 0, 1, "name", TPrimitiveType::VARCHAR),
+                (2, 1, 2, "age", TPrimitiveType::INT),
+            ],
+        );
+        let desc = DescriptorTable::from_thrift(&desc_tbl).unwrap();
+        let schema = desc.table_named_struct(0).unwrap();
+        assert_eq!(schema.names, vec!["id", "name", "age"]);
+    }
+
+    #[test]
+    fn test_table_column_override() {
+        let desc_tbl = make_desc_table(
+            vec![(0, None)],
+            vec![
+                (0, 0, 0, "city", TPrimitiveType::VARCHAR),
+                (1, 0, 1, "pop", TPrimitiveType::BIGINT),
+            ],
+        );
+        let mut desc = DescriptorTable::from_thrift(&desc_tbl).unwrap();
+        desc.set_table_column_override(
+            "mytable".to_string(),
+            vec!["city".to_string(), "state".to_string(), "pop".to_string()],
+        );
+
+        // slot_index_in_override should resolve by name against the override.
+        assert_eq!(desc.slot_index_in_override(0, "mytable").unwrap(), 0); // city → 0
+        assert_eq!(desc.slot_index_in_override(1, "mytable").unwrap(), 2); // pop → 2
+    }
+
+    #[test]
+    fn test_find_slot_by_name() {
+        let desc_tbl = make_desc_table(
+            vec![(0, None)],
+            vec![
+                (0, 0, 0, "id", TPrimitiveType::INT),
+                (1, 0, 1, "name", TPrimitiveType::VARCHAR),
+            ],
+        );
+        let desc = DescriptorTable::from_thrift(&desc_tbl).unwrap();
+        assert!(desc.find_slot_by_name("id").is_some());
+        assert!(desc.find_slot_by_name("name").is_some());
+        assert!(desc.find_slot_by_name("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_count_materialized_columns() {
+        let desc_tbl = make_desc_table(
+            vec![(0, None), (1, None)],
+            vec![
+                (0, 0, 0, "a", TPrimitiveType::INT),
+                (1, 0, 1, "b", TPrimitiveType::INT),
+                (2, 1, 0, "c", TPrimitiveType::INT),
+            ],
+        );
+        let desc = DescriptorTable::from_thrift(&desc_tbl).unwrap();
+        assert_eq!(desc.count_materialized_columns(&[0]), 2);
+        assert_eq!(desc.count_materialized_columns(&[1]), 1);
+        assert_eq!(desc.count_materialized_columns(&[0, 1]), 3);
+    }
+
+    #[test]
+    fn test_doris_internal_columns_skipped() {
+        // __DORIS_ prefixed columns should be skipped.
+        let desc_tbl = make_desc_table(
+            vec![(0, None)],
+            vec![
+                (0, 0, 0, "id", TPrimitiveType::INT),
+                (1, 0, 1, "__DORIS_DELETE_SIGN__", TPrimitiveType::INT),
+                (2, 0, 2, "name", TPrimitiveType::VARCHAR),
+            ],
+        );
+        let desc = DescriptorTable::from_thrift(&desc_tbl).unwrap();
+        // __DORIS_ column should not be in the descriptor table.
+        assert!(desc.get_slot(1).is_err());
+        // Other columns should be present.
+        assert_eq!(desc.count_materialized_columns(&[0]), 2);
+    }
+}

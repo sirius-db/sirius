@@ -148,3 +148,128 @@ fn expr_node_to_sql(nodes: &[TExprNode], idx: &mut usize) -> Result<String> {
         ),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_helpers::*;
+
+    #[test]
+    fn test_select_single_int() {
+        let node = make_union_node(0, 0, vec![vec![int_literal_expr(42)]]);
+        let plan = make_plan(vec![node]);
+        let sql = plan_to_sql(&plan).unwrap();
+        assert_eq!(sql, "SELECT 42");
+    }
+
+    #[test]
+    fn test_select_multiple_columns() {
+        let node = make_union_node(
+            0,
+            0,
+            vec![vec![int_literal_expr(1), int_literal_expr(2), int_literal_expr(3)]],
+        );
+        let plan = make_plan(vec![node]);
+        let sql = plan_to_sql(&plan).unwrap();
+        assert_eq!(sql, "SELECT 1, 2, 3");
+    }
+
+    #[test]
+    fn test_union_all() {
+        let node = make_union_node(
+            0,
+            0,
+            vec![
+                vec![int_literal_expr(1), string_literal_expr("hello")],
+                vec![int_literal_expr(2), string_literal_expr("world")],
+            ],
+        );
+        let plan = make_plan(vec![node]);
+        let sql = plan_to_sql(&plan).unwrap();
+        assert_eq!(sql, "SELECT 1, 'hello' UNION ALL SELECT 2, 'world'");
+    }
+
+    #[test]
+    fn test_float_literal() {
+        let node = make_union_node(0, 0, vec![vec![float_literal_expr(3.14)]]);
+        let plan = make_plan(vec![node]);
+        let sql = plan_to_sql(&plan).unwrap();
+        assert_eq!(sql, "SELECT 3.14");
+    }
+
+    #[test]
+    fn test_bool_literal() {
+        let node = make_union_node(
+            0,
+            0,
+            vec![vec![bool_literal_expr(true), bool_literal_expr(false)]],
+        );
+        let plan = make_plan(vec![node]);
+        let sql = plan_to_sql(&plan).unwrap();
+        assert_eq!(sql, "SELECT TRUE, FALSE");
+    }
+
+    #[test]
+    fn test_string_escape() {
+        let node = make_union_node(0, 0, vec![vec![string_literal_expr("it's")]]);
+        let plan = make_plan(vec![node]);
+        let sql = plan_to_sql(&plan).unwrap();
+        assert_eq!(sql, "SELECT 'it''s'");
+    }
+
+    #[test]
+    fn test_decimal_literal() {
+        let node = make_union_node(0, 0, vec![vec![decimal_literal_expr("99.99", 10, 2)]]);
+        let plan = make_plan(vec![node]);
+        let sql = plan_to_sql(&plan).unwrap();
+        assert_eq!(sql, "SELECT 99.99");
+    }
+
+    #[test]
+    fn test_cast_expr_passthrough() {
+        // CAST wraps a child expr but in SQL generation, it's a pass-through.
+        use doris_thrift::types::TPrimitiveType;
+        let inner = int_literal_expr(42);
+        let expr = cast_expr(type_desc(TPrimitiveType::DOUBLE), inner);
+        let node = make_union_node(0, 0, vec![vec![expr]]);
+        let plan = make_plan(vec![node]);
+        let sql = plan_to_sql(&plan).unwrap();
+        assert_eq!(sql, "SELECT 42");
+    }
+
+    #[test]
+    fn test_empty_union() {
+        let node = make_union_node(0, 0, vec![]);
+        let plan = make_plan(vec![node]);
+        let sql = plan_to_sql(&plan).unwrap();
+        assert_eq!(sql, "SELECT WHERE FALSE");
+    }
+
+    #[test]
+    fn test_empty_set_node() {
+        let node = make_empty_set_node(0);
+        let plan = make_plan(vec![node]);
+        let sql = plan_to_sql(&plan).unwrap();
+        assert_eq!(sql, "SELECT WHERE FALSE");
+    }
+
+    #[test]
+    fn test_exchange_node_no_children() {
+        // EXCHANGE_NODE(0 children) → SELECT from exchange table.
+        let node = make_exchange_node(5, vec![0]);
+        let plan = make_plan(vec![node]);
+        let sql = plan_to_sql(&plan).unwrap();
+        assert_eq!(sql, "SELECT * FROM __EXCHANGE_TABLE_5");
+    }
+
+    #[test]
+    fn test_exchange_node_with_child() {
+        // EXCHANGE_NODE(1 child) = pass-through sender wrapping a UNION_NODE.
+        use doris_thrift::plan_nodes::TPlanNodeType;
+        let exchange = make_plan_node(0, TPlanNodeType::EXCHANGE_NODE, 1, vec![0]);
+        let child = make_union_node(1, 0, vec![vec![int_literal_expr(99)]]);
+        let plan = make_plan(vec![exchange, child]);
+        let sql = plan_to_sql(&plan).unwrap();
+        assert_eq!(sql, "SELECT 99");
+    }
+}

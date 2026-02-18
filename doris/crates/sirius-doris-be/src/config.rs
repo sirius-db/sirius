@@ -32,4 +32,9 @@ pub struct BeConfig {
     /// FE MySQL address for self-registration (e.g. 127.0.0.1:9030).
     #[arg(long)]
     pub fe: Option<String>,
+
+    /// Advertised hostname/IP for this BE (used in FE registration).
+    /// Defaults to the system hostname.
+    #[arg(long)]
+    pub advertise_host: Option<String>,
 }

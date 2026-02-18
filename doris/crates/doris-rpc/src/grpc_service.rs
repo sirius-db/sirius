@@ -169,16 +169,11 @@ fn serialize_result_batch(rows: &[Vec<u8>], packet_seq: i64) -> Result<Vec<u8>, 
 /// `local_params[0]`) to call `fetch_data`, not the query-level `query_id`.
 /// Fall back to `query_id` if `local_params` is empty.
 fn extract_finst_id(params: &TPipelineFragmentParams) -> FinstId {
-    if let Some(lp) = params.local_params.as_ref().and_then(|v| v.first()) {
-        FinstId {
-            hi: lp.fragment_instance_id.hi,
-            lo: lp.fragment_instance_id.lo,
-        }
-    } else {
-        FinstId {
-            hi: params.query_id.hi,
-            lo: params.query_id.lo,
-        }
+    // Doris 4.0 (Nereids pipeline): FE uses query_id for fetch_data.
+    // Doris 3.0 used local_params[0].fragment_instance_id, but 4.0 uses query_id directly.
+    FinstId {
+        hi: params.query_id.hi,
+        lo: params.query_id.lo,
     }
 }
 
@@ -387,7 +382,15 @@ fn merge_fragment_plans(
         return exchange_root_fragments;
     }
 
-    // If no intermediate fragments, just return the leaf fragments.
+    // If no intermediate fragments but we have exchange_root + leaf, treat the
+    // exchange root as intermediate. The FE's fetch_data uses the exchange root's
+    // local_params[0].fragment_instance_id, so we must preserve it as the result key.
+    if intermediate_fragments.is_empty() && !exchange_root_fragments.is_empty() {
+        intermediate_fragments = exchange_root_fragments;
+        exchange_root_fragments = Vec::new();
+    }
+
+    // If no intermediate fragments (and no exchange root), just return the leaf fragments.
     if intermediate_fragments.is_empty() {
         return leaf_fragments.into_iter().cloned().collect();
     }
@@ -487,6 +490,89 @@ fn execute_plan(engine: &SiriusEngine, plan: ExecPlan) -> Result<Vec<u8>, String
             }
         },
     }
+}
+
+/// Project/reorder Arrow IPC result columns to match FE expectations.
+///
+/// When `explicit_indices` is Some, use those to reorder/project columns by position.
+/// Otherwise, use `output_names` to find columns by name in the DuckDB result.
+fn project_ipc_columns(
+    ipc_bytes: &[u8],
+    output_names: &[String],
+    explicit_indices: Option<&[usize]>,
+) -> Result<Vec<u8>, String> {
+    use arrow::ipc::reader::StreamReader;
+    use arrow::ipc::writer::StreamWriter;
+
+    let reader = StreamReader::try_new(Cursor::new(ipc_bytes), None)
+        .map_err(|e| format!("parse IPC for projection: {e}"))?;
+    let schema = reader.schema();
+    let schema_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+
+    // Determine column indices to project.
+    let indices = if let Some(explicit) = explicit_indices {
+        tracing::info!(
+            indices = ?explicit,
+            duckdb_schema = ?schema_names,
+            "using explicit column indices"
+        );
+        explicit.to_vec()
+    } else if schema.fields().len() == output_names.len() {
+        // Column count matches and no explicit reorder — no projection needed.
+        tracing::info!(
+            cols = schema.fields().len(),
+            duckdb_schema = ?schema_names,
+            output_names = ?output_names,
+            "IPC column count matches, no projection needed"
+        );
+        return Ok(ipc_bytes.to_vec());
+    } else {
+        // Find column indices by name.
+        let mut name_indices = Vec::new();
+        for name in output_names {
+            match schema.index_of(name) {
+                Ok(idx) => name_indices.push(idx),
+                Err(_) => {
+                    tracing::warn!(
+                        column = %name,
+                        duckdb_schema = ?schema_names,
+                        "projection column not found in result, skipping projection"
+                    );
+                    return Ok(ipc_bytes.to_vec());
+                }
+            }
+        }
+        name_indices
+    };
+
+    let projected_schema = Arc::new(
+        schema
+            .project(&indices)
+            .map_err(|e| format!("project schema: {e}"))?,
+    );
+    let mut buf = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut buf, &projected_schema)
+            .map_err(|e| format!("IPC writer: {e}"))?;
+        for batch_result in reader {
+            let batch = batch_result.map_err(|e| format!("read IPC batch: {e}"))?;
+            let projected = batch
+                .project(&indices)
+                .map_err(|e| format!("project batch: {e}"))?;
+            writer
+                .write(&projected)
+                .map_err(|e| format!("write projected batch: {e}"))?;
+        }
+        writer.finish().map_err(|e| format!("finish IPC: {e}"))?;
+    }
+    tracing::info!(
+        from_cols = schema.fields().len(),
+        to_cols = indices.len(),
+        indices = ?indices,
+        duckdb_schema = ?schema_names,
+        "projected IPC result columns"
+    );
+    Ok(buf)
 }
 
 /// Check if a fragment has unresolved EXCHANGE_NODE(0 children) that need
@@ -785,13 +871,13 @@ impl PBackendService for PBackendServiceHandler {
                     // Translate and execute.
                     // If substrait extension isn't loaded, skip directly to SQL.
                     let has_substrait = engine.lock().unwrap().has_substrait();
-                    let exec_plan = if has_substrait {
+                    let (exec_plan, output_names) = if has_substrait {
                         match plan_translator::translate_fragment(&params, &table_schemas) {
-                            Ok(bytes) => ExecPlan::Substrait(bytes),
+                            Ok(plan) => (ExecPlan::Substrait(plan.substrait_bytes), Some(plan.output_names)),
                             Err(e) => {
                                 warn!(error = %e, "Substrait translation failed for exchange fragment");
                                 match plan_translator::translate_fragment_to_sql(&params) {
-                                    Ok(sql) => ExecPlan::Sql(sql),
+                                    Ok(sql) => (ExecPlan::Sql(sql), None),
                                     Err(e2) => {
                                         warn!(error = %e2, "SQL translation also failed");
                                         return;
@@ -801,7 +887,7 @@ impl PBackendService for PBackendServiceHandler {
                         }
                     } else {
                         match plan_translator::translate_fragment_to_sql(&params) {
-                            Ok(sql) => ExecPlan::Sql(sql),
+                            Ok(sql) => (ExecPlan::Sql(sql), None),
                             Err(e) => {
                                 warn!(error = %e, "SQL translation failed for exchange fragment");
                                 return;
@@ -811,7 +897,10 @@ impl PBackendService for PBackendServiceHandler {
 
                     let exec_result = tokio::task::spawn_blocking(move || -> Result<(), String> {
                         let engine = engine.lock().unwrap();
-                        let ipc_bytes = execute_plan(&engine, exec_plan)?;
+                        let mut ipc_bytes = execute_plan(&engine, exec_plan)?;
+                        if let Some(names) = output_names {
+                            ipc_bytes = project_ipc_columns(&ipc_bytes, &names, None)?;
+                        }
                         store.store_ipc_result(finst_id, &ipc_bytes)?;
                         Ok(())
                     })
@@ -877,22 +966,23 @@ impl PBackendService for PBackendServiceHandler {
             let has_data_tables = !file_tables.is_empty() || !table_schemas.is_empty();
             let has_substrait = self.engine.as_ref()
                 .map(|e| e.lock().unwrap().has_substrait()).unwrap_or(false);
-            let exec_plan = if has_substrait {
+            let (exec_plan, output_names, output_indices) = if has_substrait {
                 match plan_translator::translate_fragment(params, &table_schemas) {
-                    Ok(substrait_bytes) => {
-                        info!(bytes = substrait_bytes.len(), has_data_tables, "translated to Substrait");
-                        if has_data_tables {
-                            ExecPlan::Substrait(substrait_bytes)
+                    Ok(plan) => {
+                        info!(bytes = plan.substrait_bytes.len(), has_data_tables, "translated to Substrait");
+                        let exec = if has_data_tables {
+                            ExecPlan::Substrait(plan.substrait_bytes)
                         } else {
-                            ExecPlan::SubstraitCpuOnly(substrait_bytes)
-                        }
+                            ExecPlan::SubstraitCpuOnly(plan.substrait_bytes)
+                        };
+                        (exec, Some(plan.output_names), plan.output_column_indices)
                     }
                     Err(e) => {
                         warn!(error = %e, "Substrait translation failed, trying SQL fallback");
                         match plan_translator::translate_fragment_to_sql(params) {
                             Ok(sql) => {
                                 info!(sql = %sql, "translated to SQL (fallback)");
-                                ExecPlan::Sql(sql)
+                                (ExecPlan::Sql(sql), None, None)
                             }
                             Err(e2) => {
                                 warn!(error = %e2, "SQL translation also failed");
@@ -908,7 +998,7 @@ impl PBackendService for PBackendServiceHandler {
                 match plan_translator::translate_fragment_to_sql(params) {
                     Ok(sql) => {
                         info!(sql = %sql, "translated to SQL (no substrait extension)");
-                        ExecPlan::Sql(sql)
+                        (ExecPlan::Sql(sql), None, None)
                     }
                     Err(e) => {
                         warn!(error = %e, "SQL translation failed");
@@ -935,7 +1025,10 @@ impl PBackendService for PBackendServiceHandler {
             // Sirius/DuckDB execution is blocking — run off the async runtime.
             let exec_result = tokio::task::spawn_blocking(move || -> Result<(), String> {
                 let engine = engine.lock().unwrap();
-                let ipc_bytes = execute_plan(&engine, exec_plan)?;
+                let mut ipc_bytes = execute_plan(&engine, exec_plan)?;
+                if let Some(names) = output_names {
+                    ipc_bytes = project_ipc_columns(&ipc_bytes, &names, output_indices.as_deref())?;
+                }
                 store.store_ipc_result(finst_id, &ipc_bytes)?;
                 Ok(())
             })
@@ -1162,9 +1255,6 @@ impl PBackendService for PBackendServiceHandler {
     async fn sync_filter_size(&self, _: Request<PSyncFilterSizeRequest>) -> Result<Response<PSyncFilterSizeResponse>, Status> { Err(unimpl()) }
     async fn apply_filterv2(&self, _: Request<PPublishFilterRequestV2>) -> Result<Response<PPublishFilterResponse>, Status> { Err(unimpl()) }
     async fn fold_constant_expr(&self, _: Request<PConstantExprRequest>) -> Result<Response<PConstantExprResult>, Status> { Err(unimpl()) }
-    async fn rerun_fragment(&self, _: Request<PRerunFragmentParams>) -> Result<Response<PRerunFragmentResult>, Status> { Err(unimpl()) }
-    async fn reset_global_rf(&self, _: Request<PResetGlobalRfParams>) -> Result<Response<PResetGlobalRfResult>, Status> { Err(unimpl()) }
-    async fn transmit_rec_cte_block(&self, _: Request<PTransmitRecCteBlockParams>) -> Result<Response<PTransmitRecCteBlockResult>, Status> { Err(unimpl()) }
     async fn transmit_block_by_http(&self, _: Request<PEmptyRequest>) -> Result<Response<PTransmitDataResult>, Status> { Err(unimpl()) }
     async fn check_rpc_channel(&self, _: Request<PCheckRpcChannelRequest>) -> Result<Response<PCheckRpcChannelResponse>, Status> { Err(unimpl()) }
     async fn reset_rpc_channel(&self, _: Request<PResetRpcChannelRequest>) -> Result<Response<PResetRpcChannelResponse>, Status> { Err(unimpl()) }

@@ -130,6 +130,14 @@ pub(crate) fn translate_expr_node(
         translate_in_pred(children)
     } else if node.node_type == TExprNodeType::LITERAL_PRED {
         translate_literal_pred(node)
+    } else if node.node_type == TExprNodeType::CASE_EXPR {
+        translate_case_expr(node, children, registry)
+    } else if node.node_type == TExprNodeType::LIKE_PRED {
+        translate_like_pred(children, registry)
+    } else if node.node_type == TExprNodeType::DATE_LITERAL {
+        translate_date_literal(node)
+    } else if node.node_type == TExprNodeType::DECIMAL_LITERAL {
+        translate_decimal_literal(node)
     } else {
         bail!(
             "unsupported expression node type: {}",
@@ -411,6 +419,159 @@ fn translate_in_pred(children: Vec<Expression>) -> Result<Expression> {
     })
 }
 
+fn translate_decimal_literal(node: &TExprNode) -> Result<Expression> {
+    let dec_lit = node
+        .decimal_literal
+        .as_ref()
+        .context("DECIMAL_LITERAL missing decimal_literal data")?;
+    // Represent decimal as string literal — DuckDB will infer the correct type.
+    Ok(Expression {
+        rex_type: Some(expression::RexType::Literal(expression::Literal {
+            literal_type: Some(expression::literal::LiteralType::String(
+                dec_lit.value.clone(),
+            )),
+            ..Default::default()
+        })),
+    })
+}
+
+fn translate_date_literal(node: &TExprNode) -> Result<Expression> {
+    let date_lit = node
+        .date_literal
+        .as_ref()
+        .context("DATE_LITERAL missing date_literal data")?;
+    // Date values are stored as strings (e.g., "2024-01-15").
+    // DuckDB can parse date strings with implicit or explicit CAST.
+    Ok(Expression {
+        rex_type: Some(expression::RexType::Literal(expression::Literal {
+            literal_type: Some(expression::literal::LiteralType::String(
+                date_lit.value.clone(),
+            )),
+            ..Default::default()
+        })),
+    })
+}
+
+/// Translate LIKE_PRED → Substrait "like" scalar function.
+fn translate_like_pred(
+    children: Vec<Expression>,
+    registry: &mut ExtensionRegistry,
+) -> Result<Expression> {
+    if children.len() != 2 {
+        bail!("LIKE_PRED expected 2 children, got {}", children.len());
+    }
+    let anchor = registry.register_function(URI_STRING, "like");
+    Ok(make_scalar_fn(anchor, children, bool_type()))
+}
+
+/// Translate CASE_EXPR → Substrait IfThen expression.
+///
+/// Doris CASE_EXPR structure:
+///   - has_case_expr=false: children = [when_cond1, then1, when_cond2, then2, ..., (else)]
+///   - has_case_expr=true:  children = [case_value, when_val1, then1, when_val2, then2, ..., (else)]
+///
+/// When has_case_expr=true, we convert "CASE x WHEN v THEN ..." into
+/// "IF x=v THEN ..." by generating equality comparisons.
+fn translate_case_expr(
+    node: &TExprNode,
+    children: Vec<Expression>,
+    registry: &mut ExtensionRegistry,
+) -> Result<Expression> {
+    let case_expr = node
+        .case_expr
+        .as_ref()
+        .context("CASE_EXPR missing case_expr data")?;
+
+    let has_case = case_expr.has_case_expr;
+    let has_else = case_expr.has_else_expr;
+
+    if has_case {
+        // CASE value WHEN v1 THEN r1 WHEN v2 THEN r2 ... [ELSE else_val] END
+        // children: [case_value, when_val1, then1, when_val2, then2, ..., (else)]
+        if children.is_empty() {
+            bail!("CASE_EXPR with case_value has no children");
+        }
+        let mut iter = children.into_iter();
+        let case_value = iter.next().unwrap();
+        let remaining: Vec<Expression> = iter.collect();
+
+        let (pairs_slice, else_expr) = if has_else {
+            if remaining.is_empty() {
+                bail!("CASE_EXPR has_else but no remaining children");
+            }
+            let (pairs, else_part) = remaining.split_at(remaining.len() - 1);
+            (pairs.to_vec(), Some(Box::new(else_part[0].clone())))
+        } else {
+            (remaining, None)
+        };
+
+        if pairs_slice.len() % 2 != 0 {
+            bail!(
+                "CASE_EXPR expected even number of when/then pairs, got {}",
+                pairs_slice.len()
+            );
+        }
+
+        let eq_anchor = registry.register_function(URI_COMPARISON, "equal");
+        let mut ifs = Vec::new();
+        for chunk in pairs_slice.chunks(2) {
+            let when_val = chunk[0].clone();
+            let then_val = chunk[1].clone();
+            // Generate: case_value = when_val
+            let condition = make_scalar_fn(
+                eq_anchor,
+                vec![case_value.clone(), when_val],
+                bool_type(),
+            );
+            ifs.push(expression::if_then::IfClause {
+                r#if: Some(condition),
+                then: Some(then_val),
+            });
+        }
+
+        Ok(Expression {
+            rex_type: Some(expression::RexType::IfThen(Box::new(expression::IfThen {
+                ifs,
+                r#else: else_expr,
+            }))),
+        })
+    } else {
+        // Searched CASE: CASE WHEN cond1 THEN r1 WHEN cond2 THEN r2 ... [ELSE else_val] END
+        // children: [when_cond1, then1, when_cond2, then2, ..., (else)]
+        let (pairs_slice, else_expr) = if has_else {
+            if children.is_empty() {
+                bail!("CASE_EXPR has_else but no children");
+            }
+            let (pairs, else_part) = children.split_at(children.len() - 1);
+            (pairs.to_vec(), Some(Box::new(else_part[0].clone())))
+        } else {
+            (children, None)
+        };
+
+        if pairs_slice.len() % 2 != 0 {
+            bail!(
+                "CASE_EXPR expected even number of when/then pairs, got {}",
+                pairs_slice.len()
+            );
+        }
+
+        let mut ifs = Vec::new();
+        for chunk in pairs_slice.chunks(2) {
+            ifs.push(expression::if_then::IfClause {
+                r#if: Some(chunk[0].clone()),
+                then: Some(chunk[1].clone()),
+            });
+        }
+
+        Ok(Expression {
+            rex_type: Some(expression::RexType::IfThen(Box::new(expression::IfThen {
+                ifs,
+                r#else: else_expr,
+            }))),
+        })
+    }
+}
+
 /// Add a fixed offset to all field references in an expression.
 ///
 /// Used for join right-side expressions where field indices need to be shifted
@@ -453,6 +614,673 @@ pub fn offset_field_refs(expr: &mut Expression, offset: usize) {
                 offset_field_refs(opt, offset);
             }
         }
+        Some(expression::RexType::IfThen(ref mut if_then)) => {
+            for clause in &mut if_then.ifs {
+                if let Some(ref mut cond) = clause.r#if {
+                    offset_field_refs(cond, offset);
+                }
+                if let Some(ref mut then) = clause.then {
+                    offset_field_refs(then, offset);
+                }
+            }
+            if let Some(ref mut else_expr) = if_then.r#else {
+                offset_field_refs(else_expr, offset);
+            }
+        }
         _ => {} // Literals and other types don't contain field references
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::descriptor_table::DescriptorTable;
+    use crate::test_helpers::*;
+    use doris_thrift::exprs::{TCaseExpr, TDateLiteral};
+    use doris_thrift::opcodes::TExprOpcode;
+    use doris_thrift::types::TPrimitiveType;
+
+    fn make_test_desc() -> DescriptorTable {
+        let desc_tbl = make_desc_table(
+            vec![(0, Some(1))],
+            vec![
+                (0, 0, 0, "col_a", TPrimitiveType::BIGINT),
+                (1, 0, 1, "col_b", TPrimitiveType::VARCHAR),
+                (2, 0, 2, "col_c", TPrimitiveType::DOUBLE),
+            ],
+        );
+        DescriptorTable::from_thrift(&desc_tbl).unwrap()
+    }
+
+    // ---- Literal tests ----
+
+    #[test]
+    fn test_int_literal() {
+        let expr = int_literal_expr(42);
+        let desc = make_test_desc();
+        let mut reg = ExtensionRegistry::new();
+        let result = translate_expr(&expr, &desc, &mut reg).unwrap();
+        match result.rex_type.unwrap() {
+            expression::RexType::Literal(lit) => match lit.literal_type.unwrap() {
+                expression::literal::LiteralType::I64(v) => assert_eq!(v, 42),
+                other => panic!("expected I64, got {:?}", other),
+            },
+            other => panic!("expected Literal, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_float_literal() {
+        let expr = float_literal_expr(3.14);
+        let desc = make_test_desc();
+        let mut reg = ExtensionRegistry::new();
+        let result = translate_expr(&expr, &desc, &mut reg).unwrap();
+        match result.rex_type.unwrap() {
+            expression::RexType::Literal(lit) => match lit.literal_type.unwrap() {
+                expression::literal::LiteralType::Fp64(v) => assert!((v - 3.14).abs() < 1e-10),
+                other => panic!("expected Fp64, got {:?}", other),
+            },
+            other => panic!("expected Literal, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_string_literal() {
+        let expr = string_literal_expr("hello");
+        let desc = make_test_desc();
+        let mut reg = ExtensionRegistry::new();
+        let result = translate_expr(&expr, &desc, &mut reg).unwrap();
+        match result.rex_type.unwrap() {
+            expression::RexType::Literal(lit) => match lit.literal_type.unwrap() {
+                expression::literal::LiteralType::String(s) => assert_eq!(s, "hello"),
+                other => panic!("expected String, got {:?}", other),
+            },
+            other => panic!("expected Literal, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_bool_literal() {
+        let expr = bool_literal_expr(true);
+        let desc = make_test_desc();
+        let mut reg = ExtensionRegistry::new();
+        let result = translate_expr(&expr, &desc, &mut reg).unwrap();
+        match result.rex_type.unwrap() {
+            expression::RexType::Literal(lit) => match lit.literal_type.unwrap() {
+                expression::literal::LiteralType::Boolean(v) => assert!(v),
+                other => panic!("expected Boolean, got {:?}", other),
+            },
+            other => panic!("expected Literal, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_null_literal() {
+        let expr = null_literal_expr(TPrimitiveType::INT);
+        let desc = make_test_desc();
+        let mut reg = ExtensionRegistry::new();
+        let result = translate_expr(&expr, &desc, &mut reg).unwrap();
+        match result.rex_type.unwrap() {
+            expression::RexType::Literal(lit) => match lit.literal_type.unwrap() {
+                expression::literal::LiteralType::Null(_) => {} // Good
+                other => panic!("expected Null, got {:?}", other),
+            },
+            other => panic!("expected Literal, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_decimal_literal() {
+        let expr = decimal_literal_expr("99.99", 10, 2);
+        let desc = make_test_desc();
+        let mut reg = ExtensionRegistry::new();
+        let result = translate_expr(&expr, &desc, &mut reg).unwrap();
+        match result.rex_type.unwrap() {
+            expression::RexType::Literal(lit) => match lit.literal_type.unwrap() {
+                expression::literal::LiteralType::String(s) => assert_eq!(s, "99.99"),
+                other => panic!("expected String (decimal), got {:?}", other),
+            },
+            other => panic!("expected Literal, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_date_literal() {
+        let nodes = vec![make_expr_node_pub(
+            doris_thrift::exprs::TExprNodeType::DATE_LITERAL,
+            type_desc(TPrimitiveType::DATEV2),
+            0,
+            |n| n.date_literal = Some(TDateLiteral { value: "2024-01-15".to_string() }),
+        )];
+        let expr = doris_thrift::exprs::TExpr { nodes };
+        let desc = make_test_desc();
+        let mut reg = ExtensionRegistry::new();
+        let result = translate_expr(&expr, &desc, &mut reg).unwrap();
+        match result.rex_type.unwrap() {
+            expression::RexType::Literal(lit) => match lit.literal_type.unwrap() {
+                expression::literal::LiteralType::String(s) => assert_eq!(s, "2024-01-15"),
+                other => panic!("expected String (date), got {:?}", other),
+            },
+            other => panic!("expected Literal, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_literal_pred_true() {
+        let expr = literal_pred_expr(true);
+        let desc = make_test_desc();
+        let mut reg = ExtensionRegistry::new();
+        let result = translate_expr(&expr, &desc, &mut reg).unwrap();
+        match result.rex_type.unwrap() {
+            expression::RexType::Literal(lit) => match lit.literal_type.unwrap() {
+                expression::literal::LiteralType::Boolean(v) => assert!(v),
+                other => panic!("expected Boolean, got {:?}", other),
+            },
+            other => panic!("expected Literal, got {:?}", other),
+        }
+    }
+
+    // ---- SLOT_REF tests ----
+
+    #[test]
+    fn test_slot_ref() {
+        let expr = slot_ref_expr(0, type_desc(TPrimitiveType::BIGINT));
+        let desc = make_test_desc();
+        let mut reg = ExtensionRegistry::new();
+        let result = translate_expr(&expr, &desc, &mut reg).unwrap();
+        match result.rex_type.unwrap() {
+            expression::RexType::Selection(field_ref) => {
+                match field_ref.reference_type.unwrap() {
+                    field_reference::ReferenceType::DirectReference(seg) => {
+                        match seg.reference_type.unwrap() {
+                            reference_segment::ReferenceType::StructField(sf) => {
+                                assert_eq!(sf.field, 0);
+                            }
+                            other => panic!("expected StructField, got {:?}", other),
+                        }
+                    }
+                    other => panic!("expected DirectReference, got {:?}", other),
+                }
+            }
+            other => panic!("expected Selection, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_slot_ref_second_column() {
+        let expr = slot_ref_expr(1, type_desc(TPrimitiveType::VARCHAR));
+        let desc = make_test_desc();
+        let mut reg = ExtensionRegistry::new();
+        let result = translate_expr(&expr, &desc, &mut reg).unwrap();
+        match result.rex_type.unwrap() {
+            expression::RexType::Selection(field_ref) => {
+                match field_ref.reference_type.unwrap() {
+                    field_reference::ReferenceType::DirectReference(seg) => {
+                        match seg.reference_type.unwrap() {
+                            reference_segment::ReferenceType::StructField(sf) => {
+                                assert_eq!(sf.field, 1);
+                            }
+                            other => panic!("expected StructField, got {:?}", other),
+                        }
+                    }
+                    other => panic!("expected DirectReference, got {:?}", other),
+                }
+            }
+            other => panic!("expected Selection, got {:?}", other),
+        }
+    }
+
+    // ---- BINARY_PRED tests ----
+
+    #[test]
+    fn test_binary_pred_all_opcodes() {
+        let desc = make_test_desc();
+        let opcodes = [
+            (TExprOpcode::EQ, "equal"),
+            (TExprOpcode::NE, "not_equal"),
+            (TExprOpcode::LT, "lt"),
+            (TExprOpcode::LE, "lte"),
+            (TExprOpcode::GT, "gt"),
+            (TExprOpcode::GE, "gte"),
+        ];
+        for (opcode, expected_name) in opcodes {
+            let expr = binary_pred_expr(
+                opcode,
+                slot_ref_expr(0, type_desc(TPrimitiveType::BIGINT)),
+                int_literal_expr(10),
+            );
+            let mut reg = ExtensionRegistry::new();
+            let result = translate_expr(&expr, &desc, &mut reg).unwrap();
+            match result.rex_type.unwrap() {
+                expression::RexType::ScalarFunction(f) => {
+                    assert_eq!(f.arguments.len(), 2);
+                    // Verify function was registered.
+                    let (_, extensions) = reg.into_extensions();
+                    let func = extensions.iter().find(|e| {
+                        if let Some(substrait::proto::extensions::simple_extension_declaration::MappingType::ExtensionFunction(ef)) = &e.mapping_type {
+                            ef.name == expected_name
+                        } else {
+                            false
+                        }
+                    });
+                    assert!(func.is_some(), "expected function '{}' registered", expected_name);
+                }
+                other => panic!("expected ScalarFunction for {:?}, got {:?}", opcode, other),
+            }
+        }
+    }
+
+    // ---- COMPOUND_PRED tests ----
+
+    #[test]
+    fn test_compound_and() {
+        let expr = compound_pred_expr(
+            TExprOpcode::COMPOUND_AND,
+            vec![
+                binary_pred_expr(TExprOpcode::GT, slot_ref_expr(0, type_desc(TPrimitiveType::BIGINT)), int_literal_expr(5)),
+                binary_pred_expr(TExprOpcode::LT, slot_ref_expr(0, type_desc(TPrimitiveType::BIGINT)), int_literal_expr(100)),
+            ],
+        );
+        let desc = make_test_desc();
+        let mut reg = ExtensionRegistry::new();
+        let result = translate_expr(&expr, &desc, &mut reg).unwrap();
+        match result.rex_type.unwrap() {
+            expression::RexType::ScalarFunction(f) => {
+                assert_eq!(f.arguments.len(), 2, "AND should have 2 args");
+            }
+            other => panic!("expected ScalarFunction (and), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_compound_or() {
+        let expr = compound_pred_expr(
+            TExprOpcode::COMPOUND_OR,
+            vec![
+                binary_pred_expr(TExprOpcode::EQ, slot_ref_expr(0, type_desc(TPrimitiveType::BIGINT)), int_literal_expr(1)),
+                binary_pred_expr(TExprOpcode::EQ, slot_ref_expr(0, type_desc(TPrimitiveType::BIGINT)), int_literal_expr(2)),
+            ],
+        );
+        let desc = make_test_desc();
+        let mut reg = ExtensionRegistry::new();
+        let result = translate_expr(&expr, &desc, &mut reg).unwrap();
+        match result.rex_type.unwrap() {
+            expression::RexType::ScalarFunction(f) => {
+                assert_eq!(f.arguments.len(), 2);
+            }
+            other => panic!("expected ScalarFunction (or), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_compound_not() {
+        let expr = compound_pred_expr(
+            TExprOpcode::COMPOUND_NOT,
+            vec![binary_pred_expr(
+                TExprOpcode::EQ,
+                slot_ref_expr(0, type_desc(TPrimitiveType::BIGINT)),
+                int_literal_expr(0),
+            )],
+        );
+        let desc = make_test_desc();
+        let mut reg = ExtensionRegistry::new();
+        let result = translate_expr(&expr, &desc, &mut reg).unwrap();
+        match result.rex_type.unwrap() {
+            expression::RexType::ScalarFunction(f) => {
+                assert_eq!(f.arguments.len(), 1, "NOT should have 1 arg");
+            }
+            other => panic!("expected ScalarFunction (not), got {:?}", other),
+        }
+    }
+
+    // ---- CAST_EXPR tests ----
+
+    #[test]
+    fn test_cast_expr() {
+        let expr = cast_expr(
+            type_desc(TPrimitiveType::DOUBLE),
+            int_literal_expr(42),
+        );
+        let desc = make_test_desc();
+        let mut reg = ExtensionRegistry::new();
+        let result = translate_expr(&expr, &desc, &mut reg).unwrap();
+        match result.rex_type.unwrap() {
+            expression::RexType::Cast(cast) => {
+                assert!(cast.input.is_some());
+                assert!(cast.r#type.is_some());
+            }
+            other => panic!("expected Cast, got {:?}", other),
+        }
+    }
+
+    // ---- IS_NULL_PRED tests ----
+
+    #[test]
+    fn test_is_null() {
+        let expr = is_null_expr(slot_ref_expr(0, type_desc(TPrimitiveType::BIGINT)));
+        let desc = make_test_desc();
+        let mut reg = ExtensionRegistry::new();
+        let result = translate_expr(&expr, &desc, &mut reg).unwrap();
+        match result.rex_type.unwrap() {
+            expression::RexType::ScalarFunction(f) => {
+                assert_eq!(f.arguments.len(), 1);
+            }
+            other => panic!("expected ScalarFunction (is_null), got {:?}", other),
+        }
+    }
+
+    // ---- IN_PRED tests ----
+
+    #[test]
+    fn test_in_pred() {
+        let expr = in_pred_expr(
+            slot_ref_expr(0, type_desc(TPrimitiveType::BIGINT)),
+            vec![int_literal_expr(1), int_literal_expr(2), int_literal_expr(3)],
+        );
+        let desc = make_test_desc();
+        let mut reg = ExtensionRegistry::new();
+        let result = translate_expr(&expr, &desc, &mut reg).unwrap();
+        match result.rex_type.unwrap() {
+            expression::RexType::SingularOrList(list) => {
+                assert!(list.value.is_some());
+                assert_eq!(list.options.len(), 3);
+            }
+            other => panic!("expected SingularOrList, got {:?}", other),
+        }
+    }
+
+    // ---- FUNCTION_CALL tests ----
+
+    #[test]
+    fn test_function_call_add() {
+        let expr = function_call_expr(
+            "add",
+            type_desc(TPrimitiveType::BIGINT),
+            vec![type_desc(TPrimitiveType::BIGINT), type_desc(TPrimitiveType::BIGINT)],
+            vec![
+                slot_ref_expr(0, type_desc(TPrimitiveType::BIGINT)),
+                int_literal_expr(1),
+            ],
+        );
+        let desc = make_test_desc();
+        let mut reg = ExtensionRegistry::new();
+        let result = translate_expr(&expr, &desc, &mut reg).unwrap();
+        match result.rex_type.unwrap() {
+            expression::RexType::ScalarFunction(f) => {
+                assert_eq!(f.arguments.len(), 2);
+            }
+            other => panic!("expected ScalarFunction (add), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_function_call_substring() {
+        let expr = function_call_expr(
+            "substring",
+            type_desc(TPrimitiveType::VARCHAR),
+            vec![type_desc(TPrimitiveType::VARCHAR), type_desc(TPrimitiveType::INT), type_desc(TPrimitiveType::INT)],
+            vec![
+                slot_ref_expr(1, type_desc(TPrimitiveType::VARCHAR)),
+                int_literal_expr(1),
+                int_literal_expr(5),
+            ],
+        );
+        let desc = make_test_desc();
+        let mut reg = ExtensionRegistry::new();
+        let result = translate_expr(&expr, &desc, &mut reg).unwrap();
+        match result.rex_type.unwrap() {
+            expression::RexType::ScalarFunction(f) => {
+                assert_eq!(f.arguments.len(), 3);
+            }
+            other => panic!("expected ScalarFunction (substring), got {:?}", other),
+        }
+    }
+
+    // ---- LIKE_PRED tests ----
+
+    #[test]
+    fn test_like_pred() {
+        // col_b LIKE '%pattern%'
+        // LIKE_PRED has 2 children: the value and the pattern.
+        let mut nodes = vec![make_expr_node_pub(
+            TExprNodeType::LIKE_PRED,
+            type_desc(TPrimitiveType::BOOLEAN),
+            2,
+            |n| {
+                n.like_pred = Some(doris_thrift::exprs::TLikePredicate {
+                    escape_char: "\\".to_string(),
+                })
+            },
+        )];
+        // child 1: slot ref to col_b
+        nodes.extend(slot_ref_expr(1, type_desc(TPrimitiveType::VARCHAR)).nodes);
+        // child 2: pattern string
+        nodes.extend(string_literal_expr("%pattern%").nodes);
+        let expr = doris_thrift::exprs::TExpr { nodes };
+
+        let desc = make_test_desc();
+        let mut reg = ExtensionRegistry::new();
+        let result = translate_expr(&expr, &desc, &mut reg).unwrap();
+        match result.rex_type.unwrap() {
+            expression::RexType::ScalarFunction(f) => {
+                assert_eq!(f.arguments.len(), 2);
+            }
+            other => panic!("expected ScalarFunction (like), got {:?}", other),
+        }
+    }
+
+    // ---- CASE_EXPR tests ----
+
+    #[test]
+    fn test_searched_case_with_else() {
+        // CASE WHEN col_a > 10 THEN 'big' WHEN col_a > 5 THEN 'medium' ELSE 'small' END
+        let mut nodes = vec![make_expr_node_pub(
+            TExprNodeType::CASE_EXPR,
+            type_desc(TPrimitiveType::VARCHAR),
+            5, // 2 when/then pairs + 1 else = 5 children
+            |n| n.case_expr = Some(TCaseExpr { has_case_expr: false, has_else_expr: true }),
+        )];
+        // WHEN col_a > 10
+        nodes.extend(binary_pred_expr(
+            TExprOpcode::GT,
+            slot_ref_expr(0, type_desc(TPrimitiveType::BIGINT)),
+            int_literal_expr(10),
+        ).nodes);
+        // THEN 'big'
+        nodes.extend(string_literal_expr("big").nodes);
+        // WHEN col_a > 5
+        nodes.extend(binary_pred_expr(
+            TExprOpcode::GT,
+            slot_ref_expr(0, type_desc(TPrimitiveType::BIGINT)),
+            int_literal_expr(5),
+        ).nodes);
+        // THEN 'medium'
+        nodes.extend(string_literal_expr("medium").nodes);
+        // ELSE 'small'
+        nodes.extend(string_literal_expr("small").nodes);
+        let expr = doris_thrift::exprs::TExpr { nodes };
+
+        let desc = make_test_desc();
+        let mut reg = ExtensionRegistry::new();
+        let result = translate_expr(&expr, &desc, &mut reg).unwrap();
+        match result.rex_type.unwrap() {
+            expression::RexType::IfThen(if_then) => {
+                assert_eq!(if_then.ifs.len(), 2, "should have 2 WHEN clauses");
+                assert!(if_then.r#else.is_some(), "should have ELSE");
+            }
+            other => panic!("expected IfThen, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_searched_case_without_else() {
+        // CASE WHEN col_a = 1 THEN 'one' END
+        let mut nodes = vec![make_expr_node_pub(
+            TExprNodeType::CASE_EXPR,
+            type_desc(TPrimitiveType::VARCHAR),
+            2, // 1 when/then pair
+            |n| n.case_expr = Some(TCaseExpr { has_case_expr: false, has_else_expr: false }),
+        )];
+        nodes.extend(binary_pred_expr(
+            TExprOpcode::EQ,
+            slot_ref_expr(0, type_desc(TPrimitiveType::BIGINT)),
+            int_literal_expr(1),
+        ).nodes);
+        nodes.extend(string_literal_expr("one").nodes);
+        let expr = doris_thrift::exprs::TExpr { nodes };
+
+        let desc = make_test_desc();
+        let mut reg = ExtensionRegistry::new();
+        let result = translate_expr(&expr, &desc, &mut reg).unwrap();
+        match result.rex_type.unwrap() {
+            expression::RexType::IfThen(if_then) => {
+                assert_eq!(if_then.ifs.len(), 1);
+                assert!(if_then.r#else.is_none(), "should have no ELSE");
+            }
+            other => panic!("expected IfThen, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_simple_case_with_value() {
+        // CASE col_a WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END
+        let mut nodes = vec![make_expr_node_pub(
+            TExprNodeType::CASE_EXPR,
+            type_desc(TPrimitiveType::VARCHAR),
+            6, // case_value + 2*(when+then) + else = 6
+            |n| n.case_expr = Some(TCaseExpr { has_case_expr: true, has_else_expr: true }),
+        )];
+        // case value: col_a
+        nodes.extend(slot_ref_expr(0, type_desc(TPrimitiveType::BIGINT)).nodes);
+        // WHEN 1
+        nodes.extend(int_literal_expr(1).nodes);
+        // THEN 'one'
+        nodes.extend(string_literal_expr("one").nodes);
+        // WHEN 2
+        nodes.extend(int_literal_expr(2).nodes);
+        // THEN 'two'
+        nodes.extend(string_literal_expr("two").nodes);
+        // ELSE 'other'
+        nodes.extend(string_literal_expr("other").nodes);
+        let expr = doris_thrift::exprs::TExpr { nodes };
+
+        let desc = make_test_desc();
+        let mut reg = ExtensionRegistry::new();
+        let result = translate_expr(&expr, &desc, &mut reg).unwrap();
+        match result.rex_type.unwrap() {
+            expression::RexType::IfThen(if_then) => {
+                assert_eq!(if_then.ifs.len(), 2, "should have 2 WHEN clauses");
+                assert!(if_then.r#else.is_some(), "should have ELSE");
+                // Each WHEN condition should be an equality function (col_a = value).
+                for clause in &if_then.ifs {
+                    match clause.r#if.as_ref().unwrap().rex_type.as_ref().unwrap() {
+                        expression::RexType::ScalarFunction(f) => {
+                            assert_eq!(f.arguments.len(), 2, "equal() should have 2 args");
+                        }
+                        other => panic!("expected ScalarFunction (equal), got {:?}", other),
+                    }
+                }
+            }
+            other => panic!("expected IfThen, got {:?}", other),
+        }
+    }
+
+    // ---- offset_field_refs tests ----
+
+    #[test]
+    fn test_offset_field_refs_basic() {
+        let mut expr = Expression {
+            rex_type: Some(expression::RexType::Selection(Box::new(FieldReference {
+                reference_type: Some(field_reference::ReferenceType::DirectReference(
+                    ReferenceSegment {
+                        reference_type: Some(reference_segment::ReferenceType::StructField(
+                            Box::new(reference_segment::StructField {
+                                field: 0,
+                                child: None,
+                            }),
+                        )),
+                    },
+                )),
+                root_type: Some(field_reference::RootType::RootReference(
+                    field_reference::RootReference {},
+                )),
+            }))),
+        };
+        offset_field_refs(&mut expr, 3);
+        match expr.rex_type.unwrap() {
+            expression::RexType::Selection(field_ref) => {
+                match field_ref.reference_type.unwrap() {
+                    field_reference::ReferenceType::DirectReference(seg) => {
+                        match seg.reference_type.unwrap() {
+                            reference_segment::ReferenceType::StructField(sf) => {
+                                assert_eq!(sf.field, 3, "field should be offset by 3");
+                            }
+                            other => panic!("expected StructField, got {:?}", other),
+                        }
+                    }
+                    other => panic!("expected DirectReference, got {:?}", other),
+                }
+            }
+            other => panic!("expected Selection, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_offset_zero_is_noop() {
+        let original = Expression {
+            rex_type: Some(expression::RexType::Selection(Box::new(FieldReference {
+                reference_type: Some(field_reference::ReferenceType::DirectReference(
+                    ReferenceSegment {
+                        reference_type: Some(reference_segment::ReferenceType::StructField(
+                            Box::new(reference_segment::StructField {
+                                field: 5,
+                                child: None,
+                            }),
+                        )),
+                    },
+                )),
+                root_type: Some(field_reference::RootType::RootReference(
+                    field_reference::RootReference {},
+                )),
+            }))),
+        };
+        let mut expr = original.clone();
+        offset_field_refs(&mut expr, 0);
+        // Should be unchanged.
+        match expr.rex_type.unwrap() {
+            expression::RexType::Selection(field_ref) => {
+                match field_ref.reference_type.unwrap() {
+                    field_reference::ReferenceType::DirectReference(seg) => {
+                        match seg.reference_type.unwrap() {
+                            reference_segment::ReferenceType::StructField(sf) => {
+                                assert_eq!(sf.field, 5);
+                            }
+                            _ => panic!("unexpected"),
+                        }
+                    }
+                    _ => panic!("unexpected"),
+                }
+            }
+            _ => panic!("unexpected"),
+        }
+    }
+
+    #[test]
+    fn test_offset_literal_unchanged() {
+        let mut expr = Expression {
+            rex_type: Some(expression::RexType::Literal(expression::Literal {
+                literal_type: Some(expression::literal::LiteralType::I64(42)),
+                ..Default::default()
+            })),
+        };
+        offset_field_refs(&mut expr, 5);
+        // Literal should be unchanged.
+        match expr.rex_type.unwrap() {
+            expression::RexType::Literal(lit) => match lit.literal_type.unwrap() {
+                expression::literal::LiteralType::I64(v) => assert_eq!(v, 42),
+                other => panic!("expected I64, got {:?}", other),
+            },
+            other => panic!("expected Literal, got {:?}", other),
+        }
     }
 }

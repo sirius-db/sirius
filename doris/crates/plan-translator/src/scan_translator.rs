@@ -45,18 +45,18 @@ pub fn translate_file_scan(
         .unwrap_or_else(|| format!("scan_{}", node.node_id));
 
     // Build the ReadRel base_schema.
-    // Prefer the DuckDB table's actual column list (from table_schemas) when available,
-    // as it reflects the full file schema. The descriptor table may only have a subset
-    // of columns due to late materialization.
+    // DuckDB's from_substrait maps ReadRel columns to table columns by POSITION,
+    // so the base_schema MUST include ALL table columns in the correct order.
+    // Projection to the output subset happens via ProjectRel added by translate_fragment.
     let base_schema = if let Some(columns) = table_schemas.get(&table_name) {
         build_schema_from_columns(columns, desc, tuple_id)?
     } else {
         desc.table_named_struct(tuple_id)?
     };
-    tracing::debug!(
+    tracing::info!(
         tuple_id,
         schema_names = ?base_schema.names,
-        "FILE_SCAN_NODE schema"
+        "FILE_SCAN_NODE ReadRel base_schema"
     );
 
     Ok(Rel {
