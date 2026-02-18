@@ -32,3 +32,6 @@ compile_commands.json
 
 # clangd cache
 .cache
+
+# Zed browser settings
+.zed
