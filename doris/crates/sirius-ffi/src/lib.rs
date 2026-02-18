@@ -401,6 +401,78 @@ impl SiriusEngine {
         }
     }
 
+    /// Register GPU memory directly as a DuckDB table without CPU copy.
+    ///
+    /// Used by the nixl exchange path to make GPU-resident data available to
+    /// DuckDB's Substrait executor. The GPU pointers and schema describe Arrow
+    /// columnar buffers already in VRAM.
+    ///
+    /// On CPU builds (duckdb-bundled without GPU), this falls back to creating
+    /// an empty table with the given schema — the actual data must be provided
+    /// separately via `register_exchange_table`.
+    pub fn register_gpu_exchange_table(
+        &self,
+        table_name: &str,
+        column_names: &[String],
+        column_types_sql: &[String],
+        num_rows: u32,
+        gpu_ptrs: &[(usize, usize)], // (addr, len) pairs per column
+    ) -> Result<(), EngineError> {
+        #[cfg(feature = "duckdb-bundled")]
+        {
+            // GPU table registration via the Sirius DuckDB extension's
+            // gpu_register_exchange_table function.
+            // If the extension isn't loaded, fall back to creating an empty table.
+            let cols: Vec<String> = column_names
+                .iter()
+                .zip(column_types_sql.iter())
+                .map(|(n, t)| format!("\"{}\" {}", n, t))
+                .collect();
+            let create_sql = format!(
+                "CREATE OR REPLACE TABLE \"{}\" ({})",
+                table_name,
+                cols.join(", ")
+            );
+            self.conn
+                .execute_batch(&create_sql)
+                .map_err(|e| EngineError::ExecFailed(format!("register_gpu_exchange_table create: {e}")))?;
+
+            // Try to use gpu_register_table to point DuckDB at GPU memory directly.
+            // Format: gpu_register_table('table_name', [ptr1, ptr2, ...], [len1, len2, ...], num_rows)
+            let ptrs_str: Vec<String> = gpu_ptrs.iter().map(|(addr, _)| format!("{}", addr)).collect();
+            let lens_str: Vec<String> = gpu_ptrs.iter().map(|(_, len)| format!("{}", len)).collect();
+            let sql = format!(
+                "SELECT * FROM gpu_register_table('{}', [{}], [{}], {})",
+                table_name,
+                ptrs_str.join(", "),
+                lens_str.join(", "),
+                num_rows
+            );
+            match self.conn.execute_batch(&sql) {
+                Ok(()) => {
+                    tracing::info!(table = table_name, "registered GPU exchange table via gpu_register_table");
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        table = table_name,
+                        "gpu_register_table not available, table created as empty schema"
+                    );
+                    // Table already created with schema above — caller can populate via
+                    // register_exchange_table CPU path as fallback.
+                }
+            }
+
+            Ok(())
+        }
+
+        #[cfg(not(feature = "duckdb-bundled"))]
+        {
+            let _ = (table_name, column_names, column_types_sql, num_rows, gpu_ptrs);
+            Err(EngineError::NotCompiled)
+        }
+    }
+
     /// Initialize GPU buffer manager. Must be called before `execute_gpu`.
     pub fn init_gpu_buffers(&self, cache_size: &str, processing_size: &str) -> Result<(), EngineError> {
         #[cfg(feature = "duckdb-bundled")]

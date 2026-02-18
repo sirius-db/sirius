@@ -11,12 +11,14 @@ use tracing::{info, instrument, warn};
 
 use doris_proto::doris::p_backend_service_server::PBackendService;
 use doris_proto::doris::*;
+use doris_thrift::data_sinks::TDataSinkType;
 use doris_thrift::palo_internal_service::{TPipelineFragmentParams, TPipelineFragmentParamsList};
 use doris_thrift::plan_nodes::{TFileFormatType, TPlanNodeType};
 use result_formatter::result_store::{FinstId, ResultStore};
 use sirius_ffi::SiriusEngine;
 
 use super::exchange_buffer::{ExchangeBuffer, ExchangeKey};
+use super::exchange_sender::{self, ExchangeDest};
 use super::heartbeat_service::BeState;
 use super::pblock_decoder;
 
@@ -382,6 +384,53 @@ fn merge_fragment_plans(
         return exchange_root_fragments;
     }
 
+    // Check if any fragment has more exchange nodes than we have leaf fragments
+    // to fill them. Each EXCHANGE_NODE(0 children) needs one sender; if there are
+    // more exchange nodes than leaves, some exchanges receive from remote BEs and
+    // we must NOT merge (the exchange-root must wait for remote senders).
+    let has_remote_exchanges = |params: &TPipelineFragmentParams| -> bool {
+        let plan = match params.fragment.as_ref().and_then(|f| f.plan.as_ref()) {
+            Some(p) => p,
+            None => return false,
+        };
+        let exchange_count = plan.nodes.iter().filter(|n| {
+            n.node_type == TPlanNodeType::EXCHANGE_NODE && n.num_children == 0
+        }).count();
+
+        // Also check per-exchange sender counts: if any single exchange expects
+        // more senders than available leaves, it has remote senders.
+        let any_excess = plan.nodes.iter().any(|n| {
+            n.node_type == TPlanNodeType::EXCHANGE_NODE
+                && n.num_children == 0
+                && get_num_senders(params, n.node_id) as usize > leaf_fragments.len()
+        });
+
+        if exchange_count > leaf_fragments.len() || any_excess {
+            info!(
+                exchange_count,
+                num_leaves = leaf_fragments.len(),
+                per_exch = ?params.per_exch_num_senders,
+                "fragment has remote exchanges, skipping merge"
+            );
+            return true;
+        }
+        false
+    };
+
+    let any_remote = exchange_root_fragments.iter().any(|p| has_remote_exchanges(p))
+        || intermediate_fragments.iter().any(|p| has_remote_exchanges(p));
+
+    if any_remote {
+        // Return all fragments separately:
+        // - Exchange-root/intermediate: async exchange path (wait for senders)
+        // - Leaf fragments: execute scan, send results via bRPC to exchange destinations
+        let mut result = Vec::new();
+        result.extend(exchange_root_fragments);
+        result.extend(intermediate_fragments);
+        result.extend(leaf_fragments.into_iter().cloned());
+        return result;
+    }
+
     // If no intermediate fragments but we have exchange_root + leaf, treat the
     // exchange root as intermediate. The FE's fetch_data uses the exchange root's
     // local_params[0].fragment_instance_id, so we must preserve it as the result key.
@@ -600,6 +649,53 @@ fn get_num_senders(params: &TPipelineFragmentParams, node_id: i32) -> u32 {
         .map(|&n| n as u32)
         .or_else(|| params.num_senders.map(|n| n as u32))
         .unwrap_or(1)
+}
+
+/// Extract exchange send destinations from fragment params.
+///
+/// Returns `(dest_node_id, destinations)` if this fragment's output should be
+/// sent to remote BEs via transmit_block. Returns `None` for result sinks
+/// (where FE fetches data directly) or when destinations are empty.
+fn extract_exchange_destinations(
+    params: &TPipelineFragmentParams,
+) -> Option<(i32, Vec<ExchangeDest>)> {
+    // Check if fragment has a DATA_STREAM_SINK output
+    let fragment = params.fragment.as_ref()?;
+    let output_sink = fragment.output_sink.as_ref()?;
+
+    if output_sink.type_ != TDataSinkType::DATA_STREAM_SINK {
+        return None;
+    }
+
+    let stream_sink = output_sink.stream_sink.as_ref()?;
+    let dest_node_id = stream_sink.dest_node_id;
+
+    let destinations = params.destinations.as_ref()?;
+    if destinations.is_empty() {
+        return None;
+    }
+
+    let dests: Vec<ExchangeDest> = destinations
+        .iter()
+        .filter_map(|d| {
+            // Prefer brpc_server address, fall back to server address
+            let addr = d
+                .brpc_server
+                .as_ref()
+                .map(|a| format!("{}:{}", a.hostname, a.port))
+                .or_else(|| Some(format!("{}:{}", d.server.hostname, d.server.port)))?;
+            Some(ExchangeDest {
+                brpc_addr: addr,
+                finst_id: (d.fragment_instance_id.hi, d.fragment_instance_id.lo),
+            })
+        })
+        .collect();
+
+    if dests.is_empty() {
+        return None;
+    }
+
+    Some((dest_node_id, dests))
 }
 
 pub struct PBackendServiceHandler {
@@ -869,8 +965,12 @@ impl PBackendService for PBackendServiceHandler {
                     }
 
                     // Translate and execute.
-                    // If substrait extension isn't loaded, skip directly to SQL.
-                    let has_substrait = engine.lock().unwrap().has_substrait();
+                    // Exchange-receiving fragments use SQL path: SetRel(UNION_ALL)
+                    // is not reliably supported by DuckDB's Substrait extension or
+                    // the GPU engine, and these fragments just combine pre-computed
+                    // exchange data — no GPU acceleration benefit.
+                    let use_sql = !exchange_node_ids.is_empty();
+                    let has_substrait = !use_sql && engine.lock().unwrap().has_substrait();
                     let (exec_plan, output_names) = if has_substrait {
                         match plan_translator::translate_fragment(&params, &table_schemas) {
                             Ok(plan) => (ExecPlan::Substrait(plan.substrait_bytes), Some(plan.output_names)),
@@ -887,7 +987,12 @@ impl PBackendService for PBackendServiceHandler {
                         }
                     } else {
                         match plan_translator::translate_fragment_to_sql(&params) {
-                            Ok(sql) => (ExecPlan::Sql(sql), None),
+                            Ok(sql) => {
+                                if use_sql {
+                                    info!(sql = %sql, "exchange fragment using SQL path");
+                                }
+                                (ExecPlan::Sql(sql), None)
+                            }
                             Err(e) => {
                                 warn!(error = %e, "SQL translation failed for exchange fragment");
                                 return;
@@ -895,19 +1000,37 @@ impl PBackendService for PBackendServiceHandler {
                         }
                     };
 
-                    let exec_result = tokio::task::spawn_blocking(move || -> Result<(), String> {
+                    // Check if this exchange fragment also needs to forward results.
+                    let exchange_dests = extract_exchange_destinations(&params);
+
+                    let exec_result = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
                         let engine = engine.lock().unwrap();
                         let mut ipc_bytes = execute_plan(&engine, exec_plan)?;
                         if let Some(names) = output_names {
                             ipc_bytes = project_ipc_columns(&ipc_bytes, &names, None)?;
                         }
-                        store.store_ipc_result(finst_id, &ipc_bytes)?;
-                        Ok(())
+                        Ok(ipc_bytes)
                     })
                     .await;
 
                     match exec_result {
-                        Ok(Ok(())) => info!(%finst_id, "exchange fragment execution complete"),
+                        Ok(Ok(ipc_bytes)) => {
+                            if let Some((dest_node_id, dests)) = exchange_dests {
+                                let query_id = (params.query_id.hi, params.query_id.lo);
+                                if let Err(e) = exchange_sender::send_exchange_result(
+                                    &ipc_bytes, &dests, query_id, dest_node_id, 0,
+                                ).await {
+                                    warn!(error = %e, %finst_id, "exchange forward failed");
+                                }
+                                info!(%finst_id, "exchange fragment forward complete");
+                            } else {
+                                if let Err(e) = store.store_ipc_result(finst_id, &ipc_bytes) {
+                                    warn!(error = %e, %finst_id, "failed to store exchange result");
+                                } else {
+                                    info!(%finst_id, "exchange fragment execution complete");
+                                }
+                            }
+                        }
                         Ok(Err(e)) => warn!(error = %e, %finst_id, "exchange fragment execution failed"),
                         Err(e) => warn!(error = %e, "exchange fragment spawn_blocking panicked"),
                     }
@@ -1022,21 +1145,64 @@ impl PBackendService for PBackendServiceHandler {
             };
             let store = self.result_store.clone();
 
+            // Check if this fragment's output should be sent to remote BEs.
+            let exchange_dests = extract_exchange_destinations(params);
+
             // Sirius/DuckDB execution is blocking — run off the async runtime.
-            let exec_result = tokio::task::spawn_blocking(move || -> Result<(), String> {
+            let exec_result = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
                 let engine = engine.lock().unwrap();
                 let mut ipc_bytes = execute_plan(&engine, exec_plan)?;
                 if let Some(names) = output_names {
                     ipc_bytes = project_ipc_columns(&ipc_bytes, &names, output_indices.as_deref())?;
                 }
-                store.store_ipc_result(finst_id, &ipc_bytes)?;
-                Ok(())
+                Ok(ipc_bytes)
             })
             .await;
 
             match exec_result {
-                Ok(Ok(())) => {
-                    info!(%finst_id, "execution complete, result stored");
+                Ok(Ok(ipc_bytes)) => {
+                    if let Some((dest_node_id, dests)) = exchange_dests {
+                        // Send result to remote BEs via bRPC transmit_block.
+                        let query_id = (params.query_id.hi, params.query_id.lo);
+                        let sender_id = params
+                            .local_params
+                            .as_ref()
+                            .and_then(|lp| lp.first())
+                            .map(|p| p.sender_id.unwrap_or(0))
+                            .unwrap_or(0);
+                        info!(
+                            %finst_id,
+                            dest_node_id,
+                            num_dests = dests.len(),
+                            "sending execution result to exchange destinations"
+                        );
+                        if let Err(e) = exchange_sender::send_exchange_result(
+                            &ipc_bytes,
+                            &dests,
+                            query_id,
+                            dest_node_id,
+                            sender_id,
+                        )
+                        .await
+                        {
+                            warn!(error = %e, %finst_id, "exchange send failed");
+                            return Ok(Response::new(PExecPlanFragmentResult {
+                                status: err_status(&format!("exchange send: {e}")),
+                                ..Default::default()
+                            }));
+                        }
+                        info!(%finst_id, "exchange send complete");
+                    } else {
+                        // No exchange destinations — store result locally for fetch_data.
+                        if let Err(e) = store.store_ipc_result(finst_id, &ipc_bytes) {
+                            warn!(error = %e, %finst_id, "failed to store result");
+                            return Ok(Response::new(PExecPlanFragmentResult {
+                                status: err_status(&format!("store result: {e}")),
+                                ..Default::default()
+                            }));
+                        }
+                        info!(%finst_id, "execution complete, result stored");
+                    }
                 }
                 Ok(Err(e)) => {
                     warn!(error = %e, %finst_id, "execution failed");
@@ -1525,5 +1691,493 @@ pub async fn start_grpc_server(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use doris_thrift::data_sinks::{TDataSink, TDataSinkType, TDataStreamSink};
+    use doris_thrift::partitions::{TDataPartition, TPartitionType};
+    use doris_thrift::plan_nodes::{TPlan, TPlanNode, TPlanNodeType};
+    use doris_thrift::types::{TNetworkAddress, TUniqueId};
+    use std::collections::BTreeMap;
+
+    /// Create a minimal TPipelineFragmentParams with the given plan nodes.
+    fn make_params(nodes: Vec<TPlanNode>) -> TPipelineFragmentParams {
+        TPipelineFragmentParams {
+            protocol_version:
+                doris_thrift::palo_internal_service::PaloInternalServiceVersion::V1,
+            query_id: TUniqueId { hi: 1, lo: 2 },
+            fragment_id: Some(0),
+            per_exch_num_senders: BTreeMap::new(),
+            desc_tbl: None,
+            resource_info: None,
+            destinations: None,
+            num_senders: None,
+            send_query_statistics_with_every_batch: None,
+            coord: None,
+            query_globals: None,
+            query_options: None,
+            import_label: None,
+            db_name: None,
+            load_job_id: None,
+            load_error_hub_info: None,
+            fragment_num_on_host: None,
+            backend_id: None,
+            need_wait_execution_trigger: None,
+            instances_sharing_hash_table: None,
+            is_simplified_param: None,
+            global_dict: None,
+            fragment: Some(doris_thrift::planner::TPlanFragment {
+                plan: Some(TPlan { nodes }),
+                output_exprs: None,
+                output_sink: None,
+                partition: TDataPartition {
+                    type_: TPartitionType::UNPARTITIONED,
+                    partition_exprs: None,
+                    partition_infos: None,
+                },
+                min_reservation_bytes: None,
+                initial_reservation_total_claims: None,
+                query_cache_param: None,
+            }),
+            local_params: None,
+            workload_groups: None,
+            txn_conf: None,
+            table_name: None,
+            file_scan_params: None,
+            group_commit: None,
+            load_stream_per_node: None,
+            total_load_streams: None,
+            num_local_sink: None,
+            num_buckets: None,
+            bucket_seq_to_instance_idx: None,
+            per_node_shared_scans: None,
+            parallel_instances: None,
+            total_instances: None,
+            shuffle_idx_to_instance_idx: None,
+            is_nereids: None,
+            wal_id: None,
+            content_length: None,
+            current_connect_fe: None,
+            topn_filter_source_node_ids: None,
+            ai_resources: None,
+            is_mow_table: None,
+        }
+    }
+
+    fn make_node(node_id: i32, node_type: TPlanNodeType, num_children: i32) -> TPlanNode {
+        TPlanNode {
+            node_id,
+            node_type,
+            num_children,
+            limit: -1,
+            row_tuples: vec![0],
+            nullable_tuples: vec![],
+            conjuncts: None,
+            compact_data: false,
+            hash_join_node: None,
+            agg_node: None,
+            sort_node: None,
+            merge_node: None,
+            exchange_node: None,
+            mysql_scan_node: None,
+            olap_scan_node: None,
+            csv_scan_node: None,
+            broker_scan_node: None,
+            pre_agg_node: None,
+            schema_scan_node: None,
+            merge_join_node: None,
+            meta_scan_node: None,
+            analytic_node: None,
+            olap_rewrite_node: None,
+            union_node: None,
+            resource_profile: None,
+            es_scan_node: None,
+            repeat_node: None,
+            assert_num_rows_node: None,
+            intersect_node: None,
+            except_node: None,
+            odbc_scan_node: None,
+            runtime_filters: None,
+            group_commit_scan_node: None,
+            materialization_node: None,
+            vconjunct: None,
+            table_function_node: None,
+            output_slot_ids: None,
+            data_gen_scan_node: None,
+            file_scan_node: None,
+            jdbc_scan_node: None,
+            nested_loop_join_node: None,
+            test_external_scan_node: None,
+            push_down_agg_type_opt: None,
+            push_down_count: None,
+            distribute_expr_lists: None,
+            is_serial_operator: None,
+            projections: None,
+            output_tuple_id: None,
+            partition_sort_node: None,
+            intermediate_projections_list: None,
+            intermediate_output_tuple_id_list: None,
+            topn_filter_source_node_ids: None,
+            nereids_id: None,
+        }
+    }
+
+    fn make_data_stream_sink(dest_node_id: i32) -> TDataSink {
+        TDataSink {
+            type_: TDataSinkType::DATA_STREAM_SINK,
+            stream_sink: Some(TDataStreamSink {
+                dest_node_id,
+                output_partition: TDataPartition {
+                    type_: TPartitionType::UNPARTITIONED,
+                    partition_exprs: None,
+                    partition_infos: None,
+                },
+                ignore_not_found: None,
+                output_exprs: None,
+                output_tuple_id: None,
+                conjuncts: None,
+                runtime_filters: None,
+                tablet_sink_schema: None,
+                tablet_sink_partition: None,
+                tablet_sink_location: None,
+                tablet_sink_txn_id: None,
+                tablet_sink_tuple_id: None,
+                tablet_sink_exprs: None,
+                is_merge: None,
+            }),
+            result_sink: None,
+            mysql_table_sink: None,
+            export_sink: None,
+            olap_table_sink: None,
+            memory_scratch_sink: None,
+            odbc_table_sink: None,
+            result_file_sink: None,
+            jdbc_table_sink: None,
+            multi_cast_stream_sink: None,
+            hive_table_sink: None,
+            iceberg_table_sink: None,
+            dictionary_sink: None,
+            blackhole_sink: None,
+        }
+    }
+
+    // --- has_unresolved_exchanges ---
+
+    #[test]
+    fn test_has_unresolved_exchanges_empty_plan() {
+        let params = make_params(vec![]);
+        assert!(has_unresolved_exchanges(&params).is_empty());
+    }
+
+    #[test]
+    fn test_has_unresolved_exchanges_no_exchanges() {
+        let params = make_params(vec![
+            make_node(0, TPlanNodeType::FILE_SCAN_NODE, 0),
+        ]);
+        assert!(has_unresolved_exchanges(&params).is_empty());
+    }
+
+    #[test]
+    fn test_has_unresolved_exchanges_sender_not_detected() {
+        // EXCHANGE_NODE(1 child) = sender, not unresolved.
+        let params = make_params(vec![
+            make_node(0, TPlanNodeType::EXCHANGE_NODE, 1),
+            make_node(1, TPlanNodeType::FILE_SCAN_NODE, 0),
+        ]);
+        assert!(has_unresolved_exchanges(&params).is_empty());
+    }
+
+    #[test]
+    fn test_has_unresolved_exchanges_receiver_detected() {
+        let params = make_params(vec![
+            make_node(5, TPlanNodeType::EXCHANGE_NODE, 0),
+        ]);
+        assert_eq!(has_unresolved_exchanges(&params), vec![5]);
+    }
+
+    #[test]
+    fn test_has_unresolved_exchanges_multiple_receivers() {
+        // UNION ALL: two EXCHANGE_NODE(0 children) under a UNION_NODE.
+        let params = make_params(vec![
+            make_node(0, TPlanNodeType::UNION_NODE, 2),
+            make_node(1, TPlanNodeType::EXCHANGE_NODE, 0),
+            make_node(3, TPlanNodeType::EXCHANGE_NODE, 0),
+        ]);
+        assert_eq!(has_unresolved_exchanges(&params), vec![1, 3]);
+    }
+
+    #[test]
+    fn test_has_unresolved_exchanges_no_fragment() {
+        let mut params = make_params(vec![]);
+        params.fragment = None;
+        assert!(has_unresolved_exchanges(&params).is_empty());
+    }
+
+    // --- get_num_senders ---
+
+    #[test]
+    fn test_get_num_senders_from_per_exch_map() {
+        let mut params = make_params(vec![]);
+        params.per_exch_num_senders.insert(5, 3);
+        assert_eq!(get_num_senders(&params, 5), 3);
+    }
+
+    #[test]
+    fn test_get_num_senders_fallback_to_num_senders() {
+        let mut params = make_params(vec![]);
+        params.num_senders = Some(7);
+        assert_eq!(get_num_senders(&params, 99), 7);
+    }
+
+    #[test]
+    fn test_get_num_senders_default_one() {
+        let params = make_params(vec![]);
+        assert_eq!(get_num_senders(&params, 99), 1);
+    }
+
+    #[test]
+    fn test_get_num_senders_per_exch_takes_priority() {
+        let mut params = make_params(vec![]);
+        params.per_exch_num_senders.insert(5, 2);
+        params.num_senders = Some(10);
+        // per_exch_num_senders should be preferred over num_senders.
+        assert_eq!(get_num_senders(&params, 5), 2);
+        // Fallback for unknown node_id.
+        assert_eq!(get_num_senders(&params, 99), 10);
+    }
+
+    // --- extract_exchange_destinations ---
+
+    #[test]
+    fn test_extract_exchange_destinations_none_without_sink() {
+        let params = make_params(vec![make_node(0, TPlanNodeType::FILE_SCAN_NODE, 0)]);
+        assert!(extract_exchange_destinations(&params).is_none());
+    }
+
+    #[test]
+    fn test_extract_exchange_destinations_none_for_result_sink() {
+        let mut params = make_params(vec![make_node(0, TPlanNodeType::FILE_SCAN_NODE, 0)]);
+        params.fragment.as_mut().unwrap().output_sink = Some(TDataSink {
+            type_: TDataSinkType::RESULT_SINK,
+            stream_sink: None,
+            result_sink: None,
+            mysql_table_sink: None,
+            export_sink: None,
+            olap_table_sink: None,
+            memory_scratch_sink: None,
+            odbc_table_sink: None,
+            result_file_sink: None,
+            jdbc_table_sink: None,
+            multi_cast_stream_sink: None,
+            hive_table_sink: None,
+            iceberg_table_sink: None,
+            dictionary_sink: None,
+            blackhole_sink: None,
+        });
+        assert!(extract_exchange_destinations(&params).is_none());
+    }
+
+    #[test]
+    fn test_extract_exchange_destinations_with_brpc_server() {
+        let mut params = make_params(vec![make_node(0, TPlanNodeType::FILE_SCAN_NODE, 0)]);
+        params.fragment.as_mut().unwrap().output_sink = Some(make_data_stream_sink(7));
+        params.destinations = Some(vec![
+            doris_thrift::data_sinks::TPlanFragmentDestination {
+                fragment_instance_id: TUniqueId { hi: 10, lo: 20 },
+                server: TNetworkAddress {
+                    hostname: "192.168.1.1".to_string(),
+                    port: 9060,
+                },
+                brpc_server: Some(TNetworkAddress {
+                    hostname: "192.168.1.1".to_string(),
+                    port: 8060,
+                }),
+            },
+        ]);
+
+        let (dest_node_id, dests) = extract_exchange_destinations(&params).unwrap();
+        assert_eq!(dest_node_id, 7);
+        assert_eq!(dests.len(), 1);
+        assert_eq!(dests[0].brpc_addr, "192.168.1.1:8060");
+        assert_eq!(dests[0].finst_id, (10, 20));
+    }
+
+    #[test]
+    fn test_extract_exchange_destinations_fallback_to_server_addr() {
+        let mut params = make_params(vec![make_node(0, TPlanNodeType::FILE_SCAN_NODE, 0)]);
+        params.fragment.as_mut().unwrap().output_sink = Some(make_data_stream_sink(1));
+        params.destinations = Some(vec![
+            doris_thrift::data_sinks::TPlanFragmentDestination {
+                fragment_instance_id: TUniqueId { hi: 30, lo: 40 },
+                server: TNetworkAddress {
+                    hostname: "10.0.0.1".to_string(),
+                    port: 9060,
+                },
+                brpc_server: None,
+            },
+        ]);
+
+        let (_, dests) = extract_exchange_destinations(&params).unwrap();
+        assert_eq!(dests[0].brpc_addr, "10.0.0.1:9060");
+    }
+
+    #[test]
+    fn test_extract_exchange_destinations_empty_destinations() {
+        let mut params = make_params(vec![make_node(0, TPlanNodeType::FILE_SCAN_NODE, 0)]);
+        params.fragment.as_mut().unwrap().output_sink = Some(make_data_stream_sink(1));
+        params.destinations = Some(vec![]);
+        assert!(extract_exchange_destinations(&params).is_none());
+    }
+
+    #[test]
+    fn test_extract_exchange_destinations_multiple_dests() {
+        let mut params = make_params(vec![make_node(0, TPlanNodeType::FILE_SCAN_NODE, 0)]);
+        params.fragment.as_mut().unwrap().output_sink = Some(make_data_stream_sink(5));
+        params.destinations = Some(vec![
+            doris_thrift::data_sinks::TPlanFragmentDestination {
+                fragment_instance_id: TUniqueId { hi: 1, lo: 2 },
+                server: TNetworkAddress { hostname: "be1".to_string(), port: 8060 },
+                brpc_server: None,
+            },
+            doris_thrift::data_sinks::TPlanFragmentDestination {
+                fragment_instance_id: TUniqueId { hi: 3, lo: 4 },
+                server: TNetworkAddress { hostname: "be2".to_string(), port: 8060 },
+                brpc_server: None,
+            },
+        ]);
+
+        let (node_id, dests) = extract_exchange_destinations(&params).unwrap();
+        assert_eq!(node_id, 5);
+        assert_eq!(dests.len(), 2);
+        assert_eq!(dests[0].brpc_addr, "be1:8060");
+        assert_eq!(dests[1].brpc_addr, "be2:8060");
+    }
+
+    // --- merge_fragment_plans ---
+
+    #[test]
+    fn test_merge_single_leaf_fragment() {
+        let params = make_params(vec![
+            make_node(0, TPlanNodeType::FILE_SCAN_NODE, 0),
+        ]);
+        let merged = merge_fragment_plans(&[params]);
+        assert_eq!(merged.len(), 1);
+    }
+
+    #[test]
+    fn test_merge_exchange_root_with_leaf() {
+        // Fragment 0: EXCHANGE_NODE(0 children) — result collector
+        // Fragment 1: FILE_SCAN_NODE — leaf scan
+        let root = make_params(vec![
+            make_node(0, TPlanNodeType::EXCHANGE_NODE, 0),
+        ]);
+        let leaf = make_params(vec![
+            make_node(1, TPlanNodeType::FILE_SCAN_NODE, 0),
+        ]);
+        let merged = merge_fragment_plans(&[root, leaf]);
+        assert_eq!(merged.len(), 1);
+        let plan = merged[0].fragment.as_ref().unwrap().plan.as_ref().unwrap();
+        assert!(plan.nodes.iter().any(|n| n.node_type == TPlanNodeType::FILE_SCAN_NODE));
+        assert!(!plan.nodes.iter().any(|n| n.node_type == TPlanNodeType::EXCHANGE_NODE));
+    }
+
+    #[test]
+    fn test_merge_intermediate_with_leaf() {
+        // Fragment 0: SORT_NODE → EXCHANGE_NODE(0) — intermediate
+        // Fragment 1: FILE_SCAN_NODE — leaf
+        let intermediate = make_params(vec![
+            make_node(0, TPlanNodeType::SORT_NODE, 1),
+            make_node(1, TPlanNodeType::EXCHANGE_NODE, 0),
+        ]);
+        let leaf = make_params(vec![
+            make_node(2, TPlanNodeType::FILE_SCAN_NODE, 0),
+        ]);
+        let merged = merge_fragment_plans(&[intermediate, leaf]);
+        assert_eq!(merged.len(), 1);
+        let plan = merged[0].fragment.as_ref().unwrap().plan.as_ref().unwrap();
+        assert_eq!(plan.nodes[0].node_type, TPlanNodeType::SORT_NODE);
+        assert_eq!(plan.nodes[1].node_type, TPlanNodeType::FILE_SCAN_NODE);
+    }
+
+    #[test]
+    fn test_merge_skipped_for_remote_exchanges() {
+        // UNION ALL: exchange-root has 2 EXCHANGE_NODE(0) but only 1 leaf.
+        let mut exchange_root = make_params(vec![
+            make_node(0, TPlanNodeType::UNION_NODE, 2),
+            make_node(1, TPlanNodeType::EXCHANGE_NODE, 0),
+            make_node(3, TPlanNodeType::EXCHANGE_NODE, 0),
+        ]);
+        exchange_root.per_exch_num_senders.insert(1, 1);
+        exchange_root.per_exch_num_senders.insert(3, 1);
+
+        let leaf = make_params(vec![
+            make_node(2, TPlanNodeType::FILE_SCAN_NODE, 0),
+        ]);
+
+        let merged = merge_fragment_plans(&[exchange_root, leaf]);
+        // exchange_count (2) > leaf_count (1) → skip merge.
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn test_merge_empty_input() {
+        let merged = merge_fragment_plans(&[]);
+        assert!(merged.is_empty());
+    }
+
+    #[test]
+    fn test_merge_only_exchange_root_no_leaf() {
+        // Exchange-root with no leaf = depends on remote data.
+        let root = make_params(vec![
+            make_node(0, TPlanNodeType::EXCHANGE_NODE, 0),
+        ]);
+        let merged = merge_fragment_plans(&[root]);
+        assert_eq!(merged.len(), 1);
+        let plan = merged[0].fragment.as_ref().unwrap().plan.as_ref().unwrap();
+        assert_eq!(plan.nodes[0].node_type, TPlanNodeType::EXCHANGE_NODE);
+    }
+
+    #[test]
+    fn test_merge_three_fragment_pipeline() {
+        // Typical ORDER BY + LIMIT pipeline:
+        // Fragment 0: EXCHANGE_NODE(0) — result collector
+        // Fragment 1: SORT_NODE → EXCHANGE_NODE(0) — intermediate
+        // Fragment 2: FILE_SCAN_NODE — leaf
+        let root = make_params(vec![
+            make_node(0, TPlanNodeType::EXCHANGE_NODE, 0),
+        ]);
+        let intermediate = make_params(vec![
+            make_node(1, TPlanNodeType::SORT_NODE, 1),
+            make_node(2, TPlanNodeType::EXCHANGE_NODE, 0),
+        ]);
+        let leaf = make_params(vec![
+            make_node(3, TPlanNodeType::FILE_SCAN_NODE, 0),
+        ]);
+        let merged = merge_fragment_plans(&[root, intermediate, leaf]);
+        // Result: single merged fragment (SORT_NODE → FILE_SCAN_NODE).
+        assert_eq!(merged.len(), 1);
+        let plan = merged[0].fragment.as_ref().unwrap().plan.as_ref().unwrap();
+        assert_eq!(plan.nodes[0].node_type, TPlanNodeType::SORT_NODE);
+        assert_eq!(plan.nodes[1].node_type, TPlanNodeType::FILE_SCAN_NODE);
+    }
+
+    #[test]
+    fn test_merge_skipped_when_per_exch_senders_exceed_leaves() {
+        // Single exchange node with 2 senders but only 1 leaf → remote.
+        let mut root = make_params(vec![
+            make_node(0, TPlanNodeType::EXCHANGE_NODE, 0),
+        ]);
+        root.per_exch_num_senders.insert(0, 2);
+
+        let leaf = make_params(vec![
+            make_node(1, TPlanNodeType::FILE_SCAN_NODE, 0),
+        ]);
+
+        let merged = merge_fragment_plans(&[root, leaf]);
+        // per_exch_num_senders[0] = 2 > 1 leaf → skip merge.
+        assert_eq!(merged.len(), 2);
     }
 }

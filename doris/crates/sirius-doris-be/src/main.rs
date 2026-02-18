@@ -124,6 +124,23 @@ fn main() {
     let flight_store = result_store.clone();
     let exchange_buffer = doris_rpc::exchange_buffer::ExchangeBuffer::new();
 
+    // Initialize nixl agent for GPU-direct exchange (optional, graceful fallback).
+    #[cfg(feature = "nixl")]
+    let nixl_agent = {
+        let agent_name = format!(
+            "sirius-be-{}",
+            config.advertise_host.as_deref().unwrap_or("localhost")
+        );
+        doris_rpc::nixl_exchange::NixlExchange::try_new(&agent_name)
+            .map(|a| std::sync::Arc::new(a))
+    };
+    #[cfg(feature = "nixl")]
+    if nixl_agent.is_some() {
+        info!("nixl GPU-direct exchange enabled");
+    } else {
+        info!("nixl not available, using bRPC exchange fallback");
+    }
+
     let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
     rt.block_on(run(config, version, grpc_addr, flight_addr, grpc_state, grpc_store, flight_store, engine, exchange_buffer));
 }

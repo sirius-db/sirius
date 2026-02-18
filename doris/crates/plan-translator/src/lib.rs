@@ -180,7 +180,11 @@ fn rel_output_names(rel: &Rel) -> Vec<String> {
             );
             names
         }
-        // Aggregate, Set, etc. — can't easily determine output names.
+        Some(rel::RelType::Set(set)) => {
+            // UNION ALL: output columns = first input's columns.
+            set.inputs.first().map(rel_output_names).unwrap_or_default()
+        }
+        // Aggregate, etc. — can't easily determine output names.
         _ => Vec::new(),
     }
 }
@@ -1150,5 +1154,173 @@ mod tests {
             })
             .count();
         assert_eq!(gt_count, 1, "gt should be registered exactly once");
+    }
+
+    // ---- UNION_NODE with children (scan-based union / SetRel) ----
+
+    #[test]
+    fn test_union_node_with_scan_children_produces_set_rel() {
+        // UNION_NODE(2 children) → SetRel(UNION_ALL) with two ReadRels.
+        let mut union_node = make_union_node(0, 0, vec![]); // no const_expr_lists
+        union_node.num_children = 2;
+
+        let left_scan = make_file_scan_node(1, 0, "table_a");
+        let right_scan = make_file_scan_node(2, 1, "table_b");
+        let plan = make_plan(vec![union_node, left_scan, right_scan]);
+        let desc = make_desc_table(
+            vec![(0, Some(10)), (1, Some(20))],
+            vec![
+                (0, 0, 0, "city", TPrimitiveType::VARCHAR),
+                (1, 0, 1, "pop", TPrimitiveType::INT),
+                (2, 1, 0, "city", TPrimitiveType::VARCHAR),
+                (3, 1, 1, "pop", TPrimitiveType::INT),
+            ],
+        );
+        let mut params = make_fragment_params(plan, desc);
+
+        // Provide table schemas for both scans.
+        let table_schemas: HashMap<String, Vec<String>> = [
+            ("table_a_1".to_string(), vec!["city".to_string(), "pop".to_string()]),
+            ("table_b_2".to_string(), vec!["city".to_string(), "pop".to_string()]),
+        ]
+        .into_iter()
+        .collect();
+
+        let result = translate_fragment(&params, &table_schemas).unwrap();
+        let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
+        let root = match &plan.relations[0].rel_type {
+            Some(plan_rel::RelType::Root(r)) => r,
+            _ => panic!("expected Root"),
+        };
+        let input = root.input.as_ref().unwrap();
+        match input.rel_type.as_ref().unwrap() {
+            rel::RelType::Set(set) => {
+                assert_eq!(set.op, substrait::proto::set_rel::SetOp::UnionAll as i32);
+                assert_eq!(set.inputs.len(), 2, "SetRel should have 2 inputs");
+            }
+            other => panic!("expected Set, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_union_node_sql_with_scan_children() {
+        // UNION_NODE(2 children) → SQL: child1 UNION ALL child2
+        let mut union_node = make_union_node(0, 0, vec![]);
+        union_node.num_children = 2;
+
+        // Children are EXCHANGE_NODE(0 children) = exchange receivers.
+        let exch1 = make_exchange_node(1, vec![0]);
+        let exch2 = make_exchange_node(3, vec![0]);
+        let plan = make_plan(vec![union_node, exch1, exch2]);
+        let desc = make_desc_table(vec![(0, None)], vec![]);
+        let params = make_fragment_params(plan, desc);
+
+        let sql = translate_fragment_to_sql(&params).unwrap();
+        assert_eq!(
+            sql,
+            "SELECT * FROM __EXCHANGE_TABLE_1 UNION ALL SELECT * FROM __EXCHANGE_TABLE_3"
+        );
+    }
+
+    #[test]
+    fn test_union_node_sql_three_children() {
+        let mut union_node = make_union_node(0, 0, vec![]);
+        union_node.num_children = 3;
+        let e1 = make_exchange_node(1, vec![0]);
+        let e2 = make_exchange_node(2, vec![0]);
+        let e3 = make_exchange_node(3, vec![0]);
+        let plan = make_plan(vec![union_node, e1, e2, e3]);
+        let desc = make_desc_table(vec![(0, None)], vec![]);
+        let params = make_fragment_params(plan, desc);
+
+        let sql = translate_fragment_to_sql(&params).unwrap();
+        assert_eq!(
+            sql,
+            "SELECT * FROM __EXCHANGE_TABLE_1 UNION ALL SELECT * FROM __EXCHANGE_TABLE_2 UNION ALL SELECT * FROM __EXCHANGE_TABLE_3"
+        );
+    }
+
+    #[test]
+    fn test_count_rel_columns_for_set_rel() {
+        use crate::node_translator::count_rel_columns;
+        use substrait::proto::{set_rel, Rel, SetRel};
+        use substrait::proto::rel::RelType;
+
+        // SetRel with first input having 3 columns (ReadRel with 3-field named_struct).
+        let read_rel = Rel {
+            rel_type: Some(RelType::Read(Box::new(substrait::proto::ReadRel {
+                base_schema: Some(substrait::proto::NamedStruct {
+                    names: vec!["a".into(), "b".into(), "c".into()],
+                    r#struct: None,
+                }),
+                read_type: Some(substrait::proto::read_rel::ReadType::NamedTable(
+                    substrait::proto::read_rel::NamedTable {
+                        names: vec!["test".into()],
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            }))),
+        };
+
+        let set_rel = Rel {
+            rel_type: Some(RelType::Set(SetRel {
+                inputs: vec![read_rel],
+                op: set_rel::SetOp::UnionAll as i32,
+                ..Default::default()
+            })),
+        };
+
+        assert_eq!(count_rel_columns(&set_rel), 3);
+    }
+
+    #[test]
+    fn test_count_rel_columns_for_empty_set() {
+        use crate::node_translator::count_rel_columns;
+        use substrait::proto::{Rel, SetRel};
+        use substrait::proto::rel::RelType;
+
+        let set_rel = Rel {
+            rel_type: Some(RelType::Set(SetRel {
+                inputs: vec![],
+                op: 0,
+                ..Default::default()
+            })),
+        };
+
+        assert_eq!(count_rel_columns(&set_rel), 0);
+    }
+
+    #[test]
+    fn test_rel_output_names_for_set() {
+        use substrait::proto::{set_rel, Rel, SetRel};
+        use substrait::proto::rel::RelType;
+
+        let read = Rel {
+            rel_type: Some(RelType::Read(Box::new(substrait::proto::ReadRel {
+                base_schema: Some(substrait::proto::NamedStruct {
+                    names: vec!["x".into(), "y".into()],
+                    r#struct: None,
+                }),
+                read_type: Some(substrait::proto::read_rel::ReadType::NamedTable(
+                    substrait::proto::read_rel::NamedTable {
+                        names: vec!["t".into()],
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            }))),
+        };
+
+        let set = Rel {
+            rel_type: Some(RelType::Set(SetRel {
+                inputs: vec![read],
+                op: set_rel::SetOp::UnionAll as i32,
+                ..Default::default()
+            })),
+        };
+
+        let names = rel_output_names(&set);
+        assert_eq!(names, vec!["x", "y"]);
     }
 }

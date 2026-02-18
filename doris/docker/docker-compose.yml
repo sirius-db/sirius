@@ -48,7 +48,7 @@ services:
   #     doris_net:
   #       ipv4_address: 172.20.80.3
 
-  sirius-be:
+  sirius-be: &sirius-be
     image: ubuntu:22.04
     container_name: sirius-be
     hostname: sirius-be
@@ -93,6 +93,22 @@ services:
     networks:
       doris_net:
         ipv4_address: 172.20.80.4
+
+  sirius-be-2:
+    <<: *sirius-be
+    container_name: sirius-be-2
+    hostname: sirius-be-2
+    command:
+      - --heartbeat-port=19050
+      - --be-port=19060
+      - --brpc-port=18060
+      - --http-port=18040
+      - --arrow-flight-port=18071
+      - --fe=172.20.80.2:9030
+      - --advertise-host=172.20.80.5
+    networks:
+      doris_net:
+        ipv4_address: 172.20.80.5
 
 networks:
   doris_net:

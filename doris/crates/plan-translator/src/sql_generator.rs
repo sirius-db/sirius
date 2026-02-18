@@ -32,7 +32,7 @@ fn node_to_sql(nodes: &[TPlanNode], idx: &mut usize) -> Result<String> {
         .collect::<Result<_>>()?;
 
     match node.node_type {
-        TPlanNodeType::UNION_NODE => union_to_sql(node),
+        TPlanNodeType::UNION_NODE => union_to_sql(node, &children),
         TPlanNodeType::EXCHANGE_NODE => {
             if children.len() == 1 {
                 // Pass-through: exchange sender wraps its child
@@ -51,11 +51,18 @@ fn node_to_sql(nodes: &[TPlanNode], idx: &mut usize) -> Result<String> {
     }
 }
 
-/// Generate SQL from a UNION_NODE's const_expr_lists.
+/// Generate SQL from a UNION_NODE.
 ///
-/// For `SELECT 1`, this produces: `SELECT 1`
-/// For `SELECT 1 UNION ALL SELECT 2`: `SELECT 1 UNION ALL SELECT 2`
-fn union_to_sql(node: &TPlanNode) -> Result<String> {
+/// Two cases:
+/// - **Constant union** (`SELECT 1 UNION ALL SELECT 2`): `const_expr_lists` → `SELECT 1 UNION ALL SELECT 2`
+/// - **Scan union** (`SELECT * FROM t1 UNION ALL SELECT * FROM t2`): children are translated
+///   child SQL strings → `child1 UNION ALL child2`
+fn union_to_sql(node: &TPlanNode, children: &[String]) -> Result<String> {
+    // Scan-based union: children produce SQL from scan nodes.
+    if !children.is_empty() {
+        return Ok(children.join(" UNION ALL "));
+    }
+
     let union_node = node
         .union_node
         .as_ref()

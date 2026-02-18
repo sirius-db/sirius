@@ -95,7 +95,7 @@ impl ExchangeBuffer {
             if entry.expected_senders > 0
                 && entry.eos_senders.len() >= entry.expected_senders as usize
             {
-                entry.notify.notify_waiters();
+                entry.notify.notify_one();
                 return true;
             }
         }
@@ -110,7 +110,7 @@ impl ExchangeBuffer {
         if let Some(mut entry) = self.entries.get_mut(key) {
             entry.expected_senders = expected_senders;
             if entry.eos_senders.len() >= expected_senders as usize {
-                entry.notify.notify_waiters();
+                entry.notify.notify_one();
             }
         }
     }
@@ -226,6 +226,75 @@ mod tests {
         buf.add_block(&k, 0, None, true);
 
         let blocks = handle.await.unwrap();
+        assert_eq!(blocks.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_notify_one_fires_even_when_data_arrives_before_await() {
+        // Regression: notify_waiters() lost notifications when no task was waiting.
+        // notify_one() stores a permit so the next notified().await resolves immediately.
+        let buf = ExchangeBuffer::new();
+        let k = key(42, 43, 1);
+        let notify = buf.register(k.clone(), 1);
+
+        // Data + EOS arrive BEFORE anyone calls notified().await.
+        buf.add_block(&k, 0, Some(empty_block()), false);
+        let done = buf.add_block(&k, 0, None, true);
+        assert!(done, "should signal all_done");
+
+        // Now await — should resolve immediately because notify_one stored a permit.
+        tokio::time::timeout(std::time::Duration::from_millis(100), notify.notified())
+            .await
+            .expect("notified() should resolve immediately from stored permit");
+
+        let blocks = buf.take(&k);
+        assert_eq!(blocks.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_two_exchange_nodes_both_notify() {
+        // Simulate two exchange nodes for the same query (UNION ALL pattern).
+        let buf = ExchangeBuffer::new();
+        let k1 = key(10, 20, 1);
+        let k2 = key(10, 20, 3);
+        let notify1 = buf.register(k1.clone(), 1);
+        let notify2 = buf.register(k2.clone(), 1);
+
+        // Data arrives for both nodes.
+        buf.add_block(&k1, 0, Some(empty_block()), false);
+        buf.add_block(&k1, 0, None, true);
+        buf.add_block(&k2, 0, Some(empty_block()), false);
+        buf.add_block(&k2, 0, None, true);
+
+        // Both should resolve.
+        tokio::time::timeout(std::time::Duration::from_millis(100), notify1.notified())
+            .await
+            .expect("notify1 should resolve");
+        tokio::time::timeout(std::time::Duration::from_millis(100), notify2.notified())
+            .await
+            .expect("notify2 should resolve");
+
+        assert_eq!(buf.take(&k1).len(), 1);
+        assert_eq!(buf.take(&k2).len(), 1);
+    }
+
+    #[test]
+    fn test_set_expected_senders_triggers_notify_when_already_done() {
+        let buf = ExchangeBuffer::new();
+        let k = key(1, 2, 3);
+
+        // Data arrives before register (expected_senders = 0).
+        buf.add_block(&k, 0, Some(empty_block()), false);
+        buf.add_block(&k, 0, None, true); // all_done = false (expected_senders = 0)
+
+        // Now register with expected_senders = 1.
+        let _notify = buf.register(k.clone(), 1);
+
+        // set_expected_senders should trigger notify since sender already EOS'd.
+        buf.set_expected_senders(&k, 1);
+
+        // Data should be available.
+        let blocks = buf.take(&k);
         assert_eq!(blocks.len(), 1);
     }
 }

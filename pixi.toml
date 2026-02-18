@@ -60,6 +60,7 @@ doris-check = { cmd = "cargo check", cwd = "doris", description = "Check doris w
 doris-build = { cmd = "cargo build --release", cwd = "doris", description = "Build doris workspace" }
 doris-test = { cmd = "cargo test", cwd = "doris", description = "Test doris workspace" }
 doris-build-duckdb = { cmd = "cargo build --release --features sirius-ffi/duckdb-bundled", cwd = "doris", description = "Build doris workspace with bundled DuckDB engine" }
+doris-build-nixl = { cmd = "cargo build --release --features sirius-ffi/duckdb-bundled,sirius-doris-be/nixl", cwd = "doris", description = "Build doris workspace with DuckDB + nixl GPU exchange" }
 # Start Sirius GPU BE with offset ports (for running alongside regular Doris BE)
 sirius-be = { cmd = "doris/target/release/sirius-doris-be --heartbeat-port 19050 --be-port 19060 --brpc-port 18060 --http-port 18040 --arrow-flight-port 18071 --fe 127.0.0.1:9030", description = "Run Sirius GPU BE with offset ports (coexists with regular BE)" }
 

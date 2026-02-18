@@ -130,7 +130,7 @@ fn translate_node(
             ))),
         }
     } else if node.node_type == TPlanNodeType::UNION_NODE {
-        translate_union_node(node)?
+        translate_union_node(node, children)?
     } else if node.node_type == TPlanNodeType::MATERIALIZATION_NODE {
         // Materialization is a pass-through that materializes intermediate results.
         if children.len() != 1 {
@@ -164,13 +164,31 @@ fn translate_node(
     apply_conjuncts(rel, node, desc, registry)
 }
 
-/// Translate a UNION_NODE with const_expr_lists into a VirtualTable ReadRel.
-fn translate_union_node(node: &TPlanNode) -> Result<Rel> {
+/// Translate a UNION_NODE.
+///
+/// Two cases:
+/// - **Constant union** (`SELECT 1 UNION ALL SELECT 2`): `const_expr_lists` is populated,
+///   children are empty → VirtualTable ReadRel with literal rows.
+/// - **Scan union** (`SELECT * FROM t1 UNION ALL SELECT * FROM t2`): children are populated
+///   (scan nodes) → Substrait SetRel(UNION_ALL) combining child Rels.
+fn translate_union_node(node: &TPlanNode, children: Vec<Rel>) -> Result<Rel> {
     let union_node = node
         .union_node
         .as_ref()
         .context("UNION_NODE missing union_node data")?;
 
+    // Scan-based union: children were recursively translated from FILE_SCAN_NODE etc.
+    if !children.is_empty() {
+        return Ok(Rel {
+            rel_type: Some(rel::RelType::Set(substrait::proto::SetRel {
+                inputs: children,
+                op: substrait::proto::set_rel::SetOp::UnionAll as i32,
+                ..Default::default()
+            })),
+        });
+    }
+
+    // Constant union: literal values from const_expr_lists.
     let mut rows = Vec::new();
     for expr_list in &union_node.const_expr_lists {
         let fields: Vec<expression::Literal> = expr_list
@@ -328,7 +346,7 @@ fn apply_conjuncts(
 ///
 /// Used by join translators to determine the left side's column count,
 /// so right-side field references can be offset correctly.
-fn count_rel_columns(rel: &Rel) -> usize {
+pub(crate) fn count_rel_columns(rel: &Rel) -> usize {
     match rel.rel_type.as_ref() {
         Some(rel::RelType::Read(read)) => read
             .base_schema
@@ -369,6 +387,10 @@ fn count_rel_columns(rel: &Rel) -> usize {
                 .map(|g| g.grouping_expressions.len())
                 .unwrap_or(0);
             groups + agg.measures.len()
+        }
+        Some(rel::RelType::Set(set)) => {
+            // UNION ALL: output columns = first input's columns.
+            set.inputs.first().map(count_rel_columns).unwrap_or(0)
         }
         _ => 0,
     }

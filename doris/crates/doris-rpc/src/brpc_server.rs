@@ -192,3 +192,168 @@ fn handle_transmit_block(
         ..Default::default()
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use doris_proto::doris::{PBlock, PUniqueId};
+    use prost::Message;
+
+    fn empty_block() -> PBlock {
+        PBlock {
+            column_metas: vec![],
+            column_values: None,
+            compressed: None,
+            uncompressed_size: None,
+            compression_type: None,
+            be_exec_version: None,
+        }
+    }
+
+    #[test]
+    fn test_handle_transmit_block_single_block() {
+        let buf = ExchangeBuffer::new();
+        let k = ExchangeKey {
+            query_id: (100, 200),
+            node_id: 5,
+        };
+        buf.register(k.clone(), 1);
+
+        let req = PTransmitDataParams {
+            finst_id: PUniqueId { hi: 0, lo: 0 },
+            node_id: 5,
+            sender_id: 0,
+            be_number: 0,
+            eos: false,
+            row_batch: None,
+            packet_seq: 0,
+            query_statistics: None,
+            block: Some(empty_block()),
+            transfer_by_attachment: None,
+            query_id: Some(PUniqueId { hi: 100, lo: 200 }),
+            exec_status: None,
+            blocks: vec![],
+        };
+
+        let payload = req.encode_to_vec();
+        let result = handle_transmit_block(&payload, &buf).unwrap();
+        assert_eq!(result.status.unwrap().status_code, 0);
+
+        // Block should be buffered but not done yet (no EOS).
+        let blocks = buf.take(&k);
+        assert_eq!(blocks.len(), 1);
+    }
+
+    #[test]
+    fn test_handle_transmit_block_eos() {
+        let buf = ExchangeBuffer::new();
+        let k = ExchangeKey {
+            query_id: (10, 20),
+            node_id: 3,
+        };
+        buf.register(k.clone(), 1);
+
+        // Send data block.
+        let data_req = PTransmitDataParams {
+            finst_id: PUniqueId { hi: 0, lo: 0 },
+            node_id: 3,
+            sender_id: 0,
+            be_number: 0,
+            eos: false,
+            row_batch: None,
+            packet_seq: 0,
+            query_statistics: None,
+            block: Some(empty_block()),
+            transfer_by_attachment: None,
+            query_id: Some(PUniqueId { hi: 10, lo: 20 }),
+            exec_status: None,
+            blocks: vec![],
+        };
+        handle_transmit_block(&data_req.encode_to_vec(), &buf).unwrap();
+
+        // Send EOS.
+        let eos_req = PTransmitDataParams {
+            finst_id: PUniqueId { hi: 0, lo: 0 },
+            node_id: 3,
+            sender_id: 0,
+            be_number: 0,
+            eos: true,
+            row_batch: None,
+            packet_seq: 1,
+            query_statistics: None,
+            block: None,
+            transfer_by_attachment: None,
+            query_id: Some(PUniqueId { hi: 10, lo: 20 }),
+            exec_status: None,
+            blocks: vec![],
+        };
+        handle_transmit_block(&eos_req.encode_to_vec(), &buf).unwrap();
+
+        let blocks = buf.take(&k);
+        assert_eq!(blocks.len(), 1);
+    }
+
+    #[test]
+    fn test_handle_transmit_block_multiple_blocks_new_style() {
+        let buf = ExchangeBuffer::new();
+        let k = ExchangeKey {
+            query_id: (1, 2),
+            node_id: 1,
+        };
+        buf.register(k.clone(), 1);
+
+        // Send multiple blocks in `blocks` field (new style).
+        let req = PTransmitDataParams {
+            finst_id: PUniqueId { hi: 0, lo: 0 },
+            node_id: 1,
+            sender_id: 0,
+            be_number: 0,
+            eos: true,
+            row_batch: None,
+            packet_seq: 0,
+            query_statistics: None,
+            block: None,
+            transfer_by_attachment: None,
+            query_id: Some(PUniqueId { hi: 1, lo: 2 }),
+            exec_status: None,
+            blocks: vec![empty_block(), empty_block(), empty_block()],
+        };
+
+        handle_transmit_block(&req.encode_to_vec(), &buf).unwrap();
+
+        let blocks = buf.take(&k);
+        assert_eq!(blocks.len(), 3);
+    }
+
+    #[test]
+    fn test_handle_transmit_block_no_query_id() {
+        // When query_id is None, should default to (0, 0).
+        let buf = ExchangeBuffer::new();
+        let k = ExchangeKey {
+            query_id: (0, 0),
+            node_id: 1,
+        };
+        buf.register(k.clone(), 1);
+
+        let req = PTransmitDataParams {
+            finst_id: PUniqueId { hi: 0, lo: 0 },
+            node_id: 1,
+            sender_id: 0,
+            be_number: 0,
+            eos: true,
+            row_batch: None,
+            packet_seq: 0,
+            query_statistics: None,
+            block: Some(empty_block()),
+            transfer_by_attachment: None,
+            query_id: None, // no query_id
+            exec_status: None,
+            blocks: vec![],
+        };
+
+        handle_transmit_block(&req.encode_to_vec(), &buf).unwrap();
+
+        let blocks = buf.take(&k);
+        assert_eq!(blocks.len(), 1);
+    }
+}

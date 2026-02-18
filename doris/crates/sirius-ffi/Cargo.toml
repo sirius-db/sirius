@@ -13,3 +13,4 @@ duckdb = { workspace = true, optional = true }
 # Match duckdb's arrow version for IPC serialization (workspace uses 54).
 arrow = { version = "56", features = ["ipc"], optional = true }
 thiserror.workspace = true
+tracing.workspace = true
