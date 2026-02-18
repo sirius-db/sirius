@@ -16,6 +16,7 @@
 
 #include "op/sirius_physical_nested_loop_join.hpp"
 
+#include "data/data_batch_utils.hpp"
 #include "duckdb/common/enums/physical_operator_type.hpp"
 #include "duckdb/common/operator/comparison_operators.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
@@ -32,6 +33,14 @@
 #include "op/sirius_physical_hash_join.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
+
+#include <cudf/ast/expressions.hpp>
+#include <cudf/copying.hpp>
+#include <cudf/join/conditional_join.hpp>
+#include <cudf/join/join.hpp>
+#include <cudf/table/table_view.hpp>
+
+#include <rmm/resource_ref.hpp>
 
 namespace sirius {
 namespace op {
@@ -224,6 +233,278 @@ void sirius_physical_nested_loop_join::build_pipelines(
   pipeline::sirius_pipeline& current, pipeline::sirius_meta_pipeline& meta_pipeline)
 {
   sirius_physical_nested_loop_join::build_join_pipelines(current, meta_pipeline, *this);
+}
+
+std::unique_ptr<operator_data> sirius_physical_nested_loop_join::get_next_task_input_data()
+{
+  size_t batch_index = 0;
+  {
+    std::lock_guard<std::mutex> lg(batches_to_processed_mutex);
+    if (left_batch_ids.empty() && right_batch_ids.empty()) {
+      auto* default_port = get_port("default");
+      auto* build_port   = get_port("build");
+      if (!default_port || !default_port->repo || !build_port || !build_port->repo) {
+        return nullptr;
+      }
+      if (default_port->repo->num_partitions() != build_port->repo->num_partitions()) {
+        throw std::runtime_error(
+          "sirius_physical_nested_loop_join: number of partitions for default and build ports must "
+          "match");
+      }
+      left_batch_ids.reserve(default_port->repo->num_partitions());
+      right_batch_ids.reserve(build_port->repo->num_partitions());
+      for (size_t i = 0; i < default_port->repo->num_partitions(); i++) {
+        left_batch_ids.push_back(default_port->repo->get_batch_ids(i));
+        right_batch_ids.push_back(build_port->repo->get_batch_ids(i));
+        num_batches_to_process += left_batch_ids[i].size() * right_batch_ids[i].size();
+      }
+    }
+    if (current_partition_index < num_batches_to_process) {
+      batch_index = current_partition_index;
+      current_partition_index++;
+    } else {
+      return nullptr;
+    }
+  }
+
+  std::vector<std::shared_ptr<cucascade::data_batch>> input_batch;
+  input_batch.reserve(2);
+  size_t counter     = 0;
+  auto* default_port = get_port("default");
+  auto* build_port   = get_port("build");
+  for (size_t partition_idx = 0; partition_idx < left_batch_ids.size(); partition_idx++) {
+    size_t left_counter = 0;
+    for (auto& left_batch_id : left_batch_ids[partition_idx]) {
+      size_t right_counter = 0;
+      for (auto& right_batch_id : right_batch_ids[partition_idx]) {
+        if (counter == batch_index) {
+          if (right_counter == right_batch_ids[partition_idx].size() - 1) {
+            input_batch.push_back(default_port->repo->pop_data_batch_by_id(
+              left_batch_id, cucascade::batch_state::task_created, partition_idx));
+          } else {
+            input_batch.push_back(default_port->repo->get_data_batch_by_id(
+              left_batch_id, cucascade::batch_state::task_created, partition_idx));
+          }
+          if (left_counter == left_batch_ids[partition_idx].size() - 1) {
+            input_batch.push_back(build_port->repo->pop_data_batch_by_id(
+              right_batch_id, cucascade::batch_state::task_created, partition_idx));
+          } else {
+            input_batch.push_back(build_port->repo->get_data_batch_by_id(
+              right_batch_id, cucascade::batch_state::task_created, partition_idx));
+          }
+          return std::make_unique<operator_data>(input_batch);
+        }
+        right_counter++;
+        counter++;
+      }
+      left_counter++;
+    }
+  }
+  return nullptr;
+}
+
+namespace {
+
+cudf::ast::ast_operator to_ast_operator(duckdb::ExpressionType comparison)
+{
+  switch (comparison) {
+    case duckdb::ExpressionType::COMPARE_EQUAL: return cudf::ast::ast_operator::EQUAL;
+    case duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM:
+      return cudf::ast::ast_operator::NULL_EQUAL;
+    case duckdb::ExpressionType::COMPARE_NOTEQUAL:
+    case duckdb::ExpressionType::COMPARE_DISTINCT_FROM: return cudf::ast::ast_operator::NOT_EQUAL;
+    case duckdb::ExpressionType::COMPARE_LESSTHAN: return cudf::ast::ast_operator::LESS;
+    case duckdb::ExpressionType::COMPARE_GREATERTHAN: return cudf::ast::ast_operator::GREATER;
+    case duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO:
+      return cudf::ast::ast_operator::LESS_EQUAL;
+    case duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+      return cudf::ast::ast_operator::GREATER_EQUAL;
+    default:
+      throw std::runtime_error("sirius_physical_nested_loop_join: unsupported comparison type");
+  }
+}
+
+}  // namespace
+
+std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
+  const operator_data& input_data, rmm::cuda_stream_view stream)
+{
+  const auto& input_batches = input_data.get_data_batches();
+  size_t pipeline_id = (this->get_pipeline() != nullptr) ? this->get_pipeline()->get_pipeline_id()
+                                                         : static_cast<size_t>(-1);
+  SIRIUS_LOG_DEBUG(
+    "Pipeline {}: nested loop join, {} input batches", pipeline_id, input_batches.size());
+
+  if (input_batches.size() != 2) {
+    throw std::runtime_error(
+      "sirius_physical_nested_loop_join expects 2 input batches (left, right), got " +
+      std::to_string(input_batches.size()));
+  }
+
+  auto left_batch  = input_batches[0];
+  auto right_batch = input_batches[1];
+  if (!left_batch || !right_batch) {
+    SIRIUS_LOG_DEBUG("Pipeline {}: nested loop join, 0 output batches", pipeline_id);
+    return std::make_unique<operator_data>(std::vector<std::shared_ptr<cucascade::data_batch>>{});
+  }
+
+  cudf::table_view left                  = get_cudf_table_view(*left_batch);
+  cudf::table_view right                 = get_cudf_table_view(*right_batch);
+  cucascade::memory::memory_space* space = left_batch->get_memory_space();
+  if (!space) {
+    SIRIUS_LOG_DEBUG("Pipeline {}: nested loop join, 0 output batches", pipeline_id);
+    return std::make_unique<operator_data>(std::vector<std::shared_ptr<cucascade::data_batch>>{});
+  }
+
+  auto mr = space->get_default_allocator();
+
+  if (left.num_rows() == 0 || right.num_rows() == 0) {
+    std::vector<std::unique_ptr<cudf::column>> empty_cols;
+    for (cudf::size_type c = 0; c < left.num_columns(); c++) {
+      empty_cols.push_back(cudf::make_empty_column(left.column(c).type()));
+    }
+    for (cudf::size_type c = 0; c < right.num_columns(); c++) {
+      empty_cols.push_back(cudf::make_empty_column(right.column(c).type()));
+    }
+    auto empty_table = std::make_unique<cudf::table>(std::move(empty_cols), stream, mr);
+    SIRIUS_LOG_DEBUG("Pipeline {}: nested loop join, 1 output batches", pipeline_id);
+    return std::make_unique<operator_data>(std::vector<std::shared_ptr<cucascade::data_batch>>{
+      make_data_batch(std::move(empty_table), *space)});
+  }
+
+  std::unique_ptr<cudf::table> result_table;
+
+  if (conditions.empty()) {
+    result_table = cudf::cross_join(left, right, stream, mr);
+  } else {
+    std::vector<cudf::ast::column_reference> left_refs;
+    std::vector<cudf::ast::column_reference> right_refs;
+    std::vector<cudf::ast::operation> cond_ops;
+    for (const auto& cond : conditions) {
+      if (cond.left->expression_class != duckdb::ExpressionClass::BOUND_REF ||
+          cond.right->expression_class != duckdb::ExpressionClass::BOUND_REF) {
+        throw std::runtime_error(
+          "sirius_physical_nested_loop_join: only simple column comparisons (BOUND_REF op "
+          "BOUND_REF) "
+          "are supported (expression: " +
+          cond.left->ToString() + " op " + cond.right->ToString() + ")");
+      }
+      auto left_idx =
+        static_cast<cudf::size_type>(cond.left->Cast<duckdb::BoundReferenceExpression>().index);
+      auto right_idx =
+        static_cast<cudf::size_type>(cond.right->Cast<duckdb::BoundReferenceExpression>().index);
+      left_refs.emplace_back(left_idx, cudf::ast::table_reference::LEFT);
+      right_refs.emplace_back(right_idx, cudf::ast::table_reference::RIGHT);
+      cond_ops.emplace_back(to_ast_operator(cond.comparison), left_refs.back(), right_refs.back());
+    }
+
+    std::vector<cudf::ast::operation> and_chain;
+    and_chain.push_back(std::move(cond_ops[0]));
+    for (size_t i = 1; i < cond_ops.size(); i++) {
+      and_chain.emplace_back(cudf::ast::ast_operator::BITWISE_AND, and_chain.back(), cond_ops[i]);
+    }
+    const cudf::ast::expression& predicate = and_chain.back();
+
+    std::pair<std::unique_ptr<rmm::device_uvector<cudf::size_type>>,
+              std::unique_ptr<rmm::device_uvector<cudf::size_type>>>
+      join_result;
+
+    switch (join_type) {
+      case duckdb::JoinType::INNER:
+        join_result =
+          cudf::conditional_inner_join(left, right, predicate, std::nullopt, stream, mr);
+        break;
+      case duckdb::JoinType::LEFT:
+        join_result = cudf::conditional_left_join(left, right, predicate, std::nullopt, stream, mr);
+        break;
+      case duckdb::JoinType::RIGHT:
+        join_result = cudf::conditional_left_join(right, left, predicate, std::nullopt, stream, mr);
+        std::swap(join_result.first, join_result.second);
+        break;
+      case duckdb::JoinType::SEMI: {
+        auto left_indices =
+          cudf::conditional_left_semi_join(left, right, predicate, std::nullopt, stream, mr);
+        auto left_map = cudf::column_view(cudf::data_type(cudf::type_id::INT32),
+                                          left_indices->size(),
+                                          left_indices->data(),
+                                          nullptr,
+                                          0,
+                                          0,
+                                          {});
+        auto gathered =
+          cudf::gather(left, left_map, cudf::out_of_bounds_policy::NULLIFY, stream, mr);
+        SIRIUS_LOG_DEBUG("Pipeline {}: nested loop join, 1 output batches", pipeline_id);
+        return std::make_unique<operator_data>(std::vector<std::shared_ptr<cucascade::data_batch>>{
+          make_data_batch(std::move(gathered), *space)});
+      }
+      case duckdb::JoinType::ANTI: {
+        auto left_indices =
+          cudf::conditional_left_anti_join(left, right, predicate, std::nullopt, stream, mr);
+        auto left_map = cudf::column_view(cudf::data_type(cudf::type_id::INT32),
+                                          left_indices->size(),
+                                          left_indices->data(),
+                                          nullptr,
+                                          0,
+                                          0,
+                                          {});
+        auto gathered =
+          cudf::gather(left, left_map, cudf::out_of_bounds_policy::NULLIFY, stream, mr);
+        SIRIUS_LOG_DEBUG("Pipeline {}: nested loop join, 1 output batches", pipeline_id);
+        return std::make_unique<operator_data>(std::vector<std::shared_ptr<cucascade::data_batch>>{
+          make_data_batch(std::move(gathered), *space)});
+      }
+      case duckdb::JoinType::OUTER:
+        join_result = cudf::conditional_full_join(left, right, predicate, stream, mr);
+        break;
+      default:
+        throw std::runtime_error("sirius_physical_nested_loop_join: unsupported join type: " +
+                                 duckdb::JoinTypeToString(join_type));
+    }
+
+    std::unique_ptr<rmm::device_uvector<cudf::size_type>> left_indices =
+      std::move(join_result.first);
+    std::unique_ptr<rmm::device_uvector<cudf::size_type>> right_indices =
+      std::move(join_result.second);
+    cudf::column_view left_map_view(cudf::data_type(cudf::type_id::INT32),
+                                    left_indices->size(),
+                                    left_indices->data(),
+                                    nullptr,
+                                    0,
+                                    0,
+                                    {});
+    cudf::column_view right_map_view(cudf::data_type(cudf::type_id::INT32),
+                                     right_indices->size(),
+                                     right_indices->data(),
+                                     nullptr,
+                                     0,
+                                     0,
+                                     {});
+    auto left_out_of_bounds =
+      (join_type == duckdb::JoinType::RIGHT || join_type == duckdb::JoinType::OUTER)
+        ? cudf::out_of_bounds_policy::NULLIFY
+        : cudf::out_of_bounds_policy::DONT_CHECK;
+    auto right_out_of_bounds =
+      (join_type == duckdb::JoinType::LEFT || join_type == duckdb::JoinType::OUTER)
+        ? cudf::out_of_bounds_policy::NULLIFY
+        : cudf::out_of_bounds_policy::DONT_CHECK;
+
+    auto left_gathered  = cudf::gather(left, left_map_view, left_out_of_bounds, stream, mr);
+    auto right_gathered = cudf::gather(right, right_map_view, right_out_of_bounds, stream, mr);
+    std::vector<std::unique_ptr<cudf::column>> out_cols;
+    auto left_released  = left_gathered->release();
+    auto right_released = right_gathered->release();
+    for (auto& col : left_released) {
+      out_cols.push_back(std::move(col));
+    }
+    for (auto& col : right_released) {
+      out_cols.push_back(std::move(col));
+    }
+    result_table = std::make_unique<cudf::table>(std::move(out_cols), stream, mr);
+  }
+
+  SIRIUS_LOG_DEBUG("Pipeline {}: nested loop join, 1 output batches", pipeline_id);
+  return std::make_unique<operator_data>(std::vector<std::shared_ptr<cucascade::data_batch>>{
+    make_data_batch(std::move(result_table), *space)});
 }
 
 }  // namespace op

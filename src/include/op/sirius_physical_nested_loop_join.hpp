@@ -103,6 +103,18 @@ class sirius_physical_nested_loop_join : public sirius_physical_partition_consum
  public:
   //! Returns a list of the types of the join conditions
   duckdb::vector<duckdb::LogicalType> get_join_types() const;
+
+  std::unique_ptr<operator_data> get_next_task_input_data() override;
+
+  std::unique_ptr<operator_data> execute(const operator_data& input_data,
+                                         rmm::cuda_stream_view stream) override;
+
+ protected:
+  std::mutex batches_to_processed_mutex;
+  std::size_t current_partition_index = 0;
+  std::size_t num_batches_to_process  = 0;
+  std::vector<std::vector<uint64_t>> left_batch_ids;
+  std::vector<std::vector<uint64_t>> right_batch_ids;
 };
 
 }  // namespace op
