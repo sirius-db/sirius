@@ -23,6 +23,7 @@
 #include "memory/sirius_memory_reservation_manager.hpp"
 #include "op/scan/duckdb_scan_executor.hpp"
 #include "op/scan/duckdb_scan_task.hpp"
+#include "op/scan/parquet_scan_task.hpp"
 #include "pipeline/gpu_pipeline_executor.hpp"
 #include "pipeline/pipeline_queue.hpp"
 
@@ -71,6 +72,8 @@ pipeline_executor::~pipeline_executor() { stop(); }
 void pipeline_executor::schedule(std::unique_ptr<sirius::parallel::itask> task)
 {
   if (task->is<sirius::op::scan::duckdb_scan_task>()) {
+    _scan_executor->schedule(std::move(task));
+  } else if (task->is<sirius::op::scan::parquet_scan_task>()) {
     _scan_executor->schedule(std::move(task));
   } else {
     _task_queue.push(std::move(task));
@@ -144,12 +147,7 @@ void pipeline_executor::prepare_for_query(duckdb::shared_ptr<planner::query> que
     _priority_scans.pop();
   }
   for (auto* scan : scans) {
-    if (auto* tscan = dynamic_cast<op::sirius_physical_duckdb_scan*>(scan)) {
-      _priority_scans.push(tscan);
-    } else {
-      SIRIUS_LOG_ERROR("Failed to cast scan to sirius_physical_duckdb_scan");
-      continue;
-    }
+    _priority_scans.push(scan);
   }
 }
 
@@ -196,10 +194,10 @@ void pipeline_executor::schedule_next_scan_tasks()
   std::lock_guard<std::mutex> lock(_priority_scans_mutex);
   if (!_priority_scans.empty()) {
     auto* scan_op = _priority_scans.front();
-    _priority_scans.pop();
     for (auto i = 0; i != _scan_executor->get_num_threads(); ++i) {
       _task_creator->schedule(scan_op);
     }
+    _priority_scans.pop();
   }
 }
 

@@ -34,6 +34,7 @@
 #include <cucascade/data/data_repository.hpp>
 
 #include <atomic>
+#include <memory>
 #include <optional>
 #include <string_view>
 
@@ -180,7 +181,8 @@ class sirius_physical_operator {
   virtual duckdb::unique_ptr<duckdb::GlobalOperatorState> get_global_operator_state(
     duckdb::ClientContext& context) const;
 
-  virtual operator_data execute(const operator_data& input_data, rmm::cuda_stream_view stream);
+  virtual std::unique_ptr<operator_data> execute(const operator_data& input_data,
+                                                 rmm::cuda_stream_view stream);
 
   //! The influence the operator has on order (insertion order means no influence)
   virtual duckdb::OrderPreservationType operator_order() const
@@ -295,7 +297,7 @@ class sirius_physical_operator {
   }
 
   //! Get the input batch
-  virtual std::optional<operator_data> get_next_task_input_data();
+  virtual std::unique_ptr<operator_data> get_next_task_input_data();
   //! Check if all ports are empty
   bool all_ports_empty();
   //! Check if the pipeline is finished

@@ -36,7 +36,8 @@ class sirius_physical_filter : public sirius_physical_operator {
   //! The filter expression
   duckdb::unique_ptr<duckdb::Expression> expression;
 
-  operator_data execute(const operator_data& input_data, rmm::cuda_stream_view stream) override;
+  std::unique_ptr<operator_data> execute(const operator_data& input_data,
+                                         rmm::cuda_stream_view stream) override;
 
   // sirius_expression_executor* sirius_expression_executor;
 

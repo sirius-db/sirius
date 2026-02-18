@@ -89,9 +89,9 @@ TEST_CASE("sirius_physical_top_n single-key uses top_k per batch", "[physical_to
                              0);
 
   auto out = topn.execute(operator_data({batches[0]}), cudf::get_default_stream());
-  REQUIRE(out.get_data_batches().size() == 1);
+  REQUIRE(out->get_data_batches().size() == 1);
 
-  auto table = out.get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
+  auto table = out->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
   auto view  = table.view();
   auto orders_out  = copy_column_to_host<int64_t>(view.column(0));
   auto payload_out = copy_column_to_host<int64_t>(view.column(1));
@@ -129,9 +129,9 @@ TEST_CASE("sirius_physical_top_n multi-key falls back to sort_by_key", "[physica
                              0);
 
   auto out = topn.execute(operator_data({batches[0]}), cudf::get_default_stream());
-  REQUIRE(out.get_data_batches().size() == 1);
+  REQUIRE(out->get_data_batches().size() == 1);
 
-  auto table = out.get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
+  auto table = out->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
   auto view  = table.view();
   auto orders_out  = copy_column_to_host<int64_t>(view.column(0));
   auto payload_out = copy_column_to_host<int64_t>(view.column(1));
@@ -169,9 +169,9 @@ TEST_CASE("sirius_physical_top_n_merge applies offset and limit", "[physical_top
                                          0);
 
   auto out = topn_merge.execute(operator_data(batches), cudf::get_default_stream());
-  REQUIRE(out.get_data_batches().size() == 1);
+  REQUIRE(out->get_data_batches().size() == 1);
 
-  auto table = out.get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
+  auto table = out->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
   auto view  = table.view();
   auto orders_out  = copy_column_to_host<int64_t>(view.column(0));
   auto payload_out = copy_column_to_host<int64_t>(view.column(1));
@@ -207,7 +207,7 @@ TEST_CASE("sirius_physical_top_n_merge returns empty for limit 0", "[physical_to
                                          0);
 
   auto out = topn_merge.execute(operator_data(batches), cudf::get_default_stream());
-  REQUIRE(out.get_data_batches().empty());
+  REQUIRE(out->get_data_batches().empty());
 }
 
 TEST_CASE("sirius_physical_top_n_merge handles empty batches", "[physical_top_n_merge]")
@@ -234,8 +234,8 @@ TEST_CASE("sirius_physical_top_n_merge handles empty batches", "[physical_top_n_
                                          0);
 
   auto out = topn_merge.execute(operator_data(batches), cudf::get_default_stream());
-  REQUIRE(out.get_data_batches().size() == 1);
+  REQUIRE(out->get_data_batches().size() == 1);
 
-  auto table = out.get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
+  auto table = out->get_data_batches()[0]->get_data()->cast<gpu_table_representation>().get_table();
   REQUIRE(table.num_rows() == 0);
 }

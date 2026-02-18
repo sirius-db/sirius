@@ -72,15 +72,15 @@ std::optional<task_creation_hint> sirius_physical_sort_sample::get_next_task_hin
   return std::nullopt;
 }
 
-operator_data sirius_physical_sort_sample::execute(const operator_data& input_data,
-                                                   rmm::cuda_stream_view stream)
+std::unique_ptr<operator_data> sirius_physical_sort_sample::execute(const operator_data& input_data,
+                                                                    rmm::cuda_stream_view stream)
 {
   const auto& input_batches = input_data.get_data_batches();
 
   // After boundaries are computed, just pass through
   if (_boundaries_computed.load()) {
     SIRIUS_LOG_DEBUG("Sort sample: passthrough ({} batches)", input_batches.size());
-    return input_data;
+    return std::make_unique<operator_data>(input_data);
   }
 
   SIRIUS_LOG_DEBUG("Sort sample: computing partition boundaries from {} batches",
@@ -98,7 +98,7 @@ operator_data sirius_physical_sort_sample::execute(const operator_data& input_da
 
   if (valid_batches.empty() || !space) {
     _boundaries_computed.store(true);
-    return input_data;
+    return std::make_unique<operator_data>(input_data);
   }
 
   // 2. Concatenate all sample batches into one table
@@ -245,7 +245,7 @@ operator_data sirius_physical_sort_sample::execute(const operator_data& input_da
                    _partition_boundaries ? _partition_boundaries->num_rows() : 0,
                    duration.count() / 1000.0);
 
-  return input_data;
+  return std::make_unique<operator_data>(input_data);
 }
 
 }  // namespace op

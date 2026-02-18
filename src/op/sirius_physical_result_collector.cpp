@@ -53,10 +53,10 @@ sirius_physical_result_collector::sirius_physical_result_collector(
   this->types = data.prepared->types;
 }
 
-operator_data sirius_physical_result_collector::execute(const operator_data& input_data,
-                                                        rmm::cuda_stream_view stream)
+std::unique_ptr<operator_data> sirius_physical_result_collector::execute(
+  const operator_data& input_data, rmm::cuda_stream_view stream)
 {
-  return input_data;
+  return std::make_unique<operator_data>(input_data);
 }
 
 duckdb::vector<duckdb::const_reference<sirius_physical_operator>>
@@ -126,6 +126,7 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
       throw duckdb::InvalidInputException(
         "[GPUPhysicalMaterializedCollector] data_batch has no data representation");
     }
+    if (data->get_size_in_bytes() == 0) { return; }
 
     // If data is in GPU tier, convert to HOST tier first
     if (data->get_current_tier() == cucascade::memory::Tier::GPU) {

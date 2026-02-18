@@ -77,10 +77,10 @@ duckdb::vector<duckdb::const_reference<sirius_physical_operator>> sirius_physica
   return children[1]->get_sources();
 }
 
-operator_data sirius_physical_cte::execute(const operator_data& input_data,
-                                           rmm::cuda_stream_view stream)
+std::unique_ptr<operator_data> sirius_physical_cte::execute(const operator_data& input_data,
+                                                            rmm::cuda_stream_view stream)
 {
-  return input_data;
+  return std::make_unique<operator_data>(input_data);
 }
 
 }  // namespace op

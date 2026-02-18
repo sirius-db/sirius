@@ -19,6 +19,7 @@
 #include "exec/config.hpp"
 #include "pipeline/gpu_pipeline_executor.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
+#include "pipeline/sirius_pipeline_task_states.hpp"
 #include "pipeline/task_request.hpp"
 #include "scan/test_utils.hpp"
 
@@ -40,9 +41,9 @@ constexpr std::size_t kReservationBytes = 20 * 1024 * 1024;
 constexpr std::size_t kAllocationBytes  = 10 * 1024 * 1024;
 
 class test_gpu_pipeline_task_global_state
-  : public sirius::pipeline::gpu_pipeline_task_global_state {
+  : public sirius::pipeline::sirius_pipeline_task_global_state {
  public:
-  test_gpu_pipeline_task_global_state() : gpu_pipeline_task_global_state(nullptr) {}
+  test_gpu_pipeline_task_global_state() : sirius_pipeline_task_global_state(nullptr) {}
 
   void add_error(std::string message)
   {
@@ -182,7 +183,8 @@ TEST_CASE("GPU pipeline executor uses task requests to schedule GPU tasks",
       if (!request) { break; }
 
       auto local_state = std::make_unique<test_gpu_pipeline_task_local_state>(
-        sirius::op::operator_data(std::vector<std::shared_ptr<cucascade::data_batch>>{}));
+        std::make_unique<sirius::op::operator_data>(
+          std::vector<std::shared_ptr<cucascade::data_batch>>{}));
       auto task = std::make_unique<sirius_pipeline_task>(
         static_cast<uint64_t>(dispatched.load(std::memory_order_relaxed)),
         std::move(local_state),

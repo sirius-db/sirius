@@ -304,12 +304,12 @@ std::unique_ptr<cudf::column> make_avg_column(const cudf::column_view& sum_view,
 
 }  // namespace
 
-operator_data sirius_physical_ungrouped_aggregate::execute(const operator_data& input_data,
-                                                           rmm::cuda_stream_view stream)
+std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
+  const operator_data& input_data, rmm::cuda_stream_view stream)
 {
   const auto& input_batches = input_data.get_data_batches();
   if (aggregates.empty()) {
-    return operator_data(std::vector<std::shared_ptr<cucascade::data_batch>>{});
+    return std::make_unique<operator_data>(std::vector<std::shared_ptr<cucascade::data_batch>>{});
   }
 
   auto layout = build_aggregate_layout(aggregates);
@@ -357,10 +357,13 @@ operator_data sirius_physical_ungrouped_aggregate::execute(const operator_data& 
           } else {
             agg_op = cudf::make_sum_aggregation<cudf::reduce_aggregation>();
           }
-          // For AVG, the SUM reduction must use the input column type (cudf requires
-          // output type == input type for fixed-point reductions). The final AVG return
-          // type is applied later in the merge step when dividing SUM / COUNT.
-          if (spec.kind == aggregate_kind::AVG) { out_type = col.type(); }
+          // cuDF requires output type == input type for fixed-point (decimal) reductions.
+          // For AVG we use input type and apply return type in the merge step (SUM/COUNT).
+          // For SUM/MIN/MAX on decimals we must also use input column type.
+          bool is_decimal = (col.type().id() == cudf::type_id::DECIMAL32 ||
+                             col.type().id() == cudf::type_id::DECIMAL64 ||
+                             col.type().id() == cudf::type_id::DECIMAL128);
+          if (spec.kind == aggregate_kind::AVG || is_decimal) { out_type = col.type(); }
           auto scalar = cudf::reduce(col, *agg_op, out_type, std::nullopt, stream);
           cols.push_back(cudf::make_column_from_scalar(*scalar, 1, stream));
           if (spec.kind == aggregate_kind::AVG) {
@@ -380,7 +383,7 @@ operator_data sirius_physical_ungrouped_aggregate::execute(const operator_data& 
     outputs.push_back(std::make_shared<cucascade::data_batch>(batch_id, std::move(output_data)));
   }
 
-  return operator_data(outputs);
+  return std::make_unique<operator_data>(outputs);
 }
 
 // Helper to deep copy Expression vector (same as in grouped_aggregate)
@@ -422,12 +425,12 @@ sirius_physical_ungrouped_aggregate_merge::sirius_physical_ungrouped_aggregate_m
     duckdb::make_uniq<duckdb::DistinctAggregateData>(*distinct_collection_info, distinct_validity);
 }
 
-operator_data sirius_physical_ungrouped_aggregate_merge::execute(const operator_data& input_data,
-                                                                 rmm::cuda_stream_view stream)
+std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execute(
+  const operator_data& input_data, rmm::cuda_stream_view stream)
 {
   const auto& input_batches = input_data.get_data_batches();
   if (aggregates.empty()) {
-    return operator_data(std::vector<std::shared_ptr<cucascade::data_batch>>{});
+    return std::make_unique<operator_data>(std::vector<std::shared_ptr<cucascade::data_batch>>{});
   }
 
   std::vector<std::shared_ptr<cucascade::data_batch>> valid_batches;
@@ -436,12 +439,12 @@ operator_data sirius_physical_ungrouped_aggregate_merge::execute(const operator_
     if (batch) { valid_batches.push_back(batch); }
   }
   if (valid_batches.empty()) {
-    return operator_data(std::vector<std::shared_ptr<cucascade::data_batch>>{});
+    return std::make_unique<operator_data>(std::vector<std::shared_ptr<cucascade::data_batch>>{});
   }
 
   cucascade::memory::memory_space* space = valid_batches[0]->get_memory_space();
   if (space == nullptr) {
-    return operator_data(std::vector<std::shared_ptr<cucascade::data_batch>>{});
+    return std::make_unique<operator_data>(std::vector<std::shared_ptr<cucascade::data_batch>>{});
   }
 
   auto layout = build_aggregate_layout(aggregates);
@@ -454,7 +457,7 @@ operator_data sirius_physical_ungrouped_aggregate_merge::execute(const operator_
   }
 
   if (!layout.has_avg) {
-    return operator_data(
+    return std::make_unique<operator_data>(
       std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(merged_batch)});
   }
 
@@ -483,7 +486,7 @@ operator_data sirius_physical_ungrouped_aggregate_merge::execute(const operator_
   auto const batch_id = ::sirius::get_next_batch_id();
   auto output_batch   = std::make_shared<cucascade::data_batch>(batch_id, std::move(output_data));
 
-  return operator_data(
+  return std::make_unique<operator_data>(
     std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(output_batch)});
 }
 

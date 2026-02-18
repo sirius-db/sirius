@@ -164,8 +164,8 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
   has_avg            = cudf_defs.has_avg;
 }
 
-operator_data sirius_physical_grouped_aggregate::execute(const operator_data& input_data,
-                                                         rmm::cuda_stream_view stream)
+std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
+  const operator_data& input_data, rmm::cuda_stream_view stream)
 {
   const auto& input_batches = input_data.get_data_batches();
   std::vector<std::shared_ptr<::cucascade::data_batch>> results;
@@ -178,7 +178,7 @@ operator_data sirius_physical_grouped_aggregate::execute(const operator_data& in
                                                               *input_batch->get_memory_space());
     results.push_back(std::move(result));
   }
-  return operator_data(results);
+  return std::make_unique<operator_data>(results);
 }
 }  // namespace op
 }  // namespace sirius

@@ -179,14 +179,15 @@ class duckdb_scan_executor {
    */
   void submit_scan_request();
 
-  op::operator_data get_scan_output(op::scan::duckdb_scan_task* task, rmm::cuda_stream_view stream);
+  std::unique_ptr<op::operator_data> get_scan_output(pipeline::sirius_pipeline_itask* task,
+                                                     rmm::cuda_stream_view stream);
 
   struct cache_entry {
     std::vector<std::vector<std::shared_ptr<cucascade::data_batch>>> batches;
     std::size_t batch_index{0};
   };
 
-  std::mutex _cache_mutex;
+  mutable std::mutex _cache_mutex;
   std::unordered_map<size_t, std::unique_ptr<cache_entry>> _cache;
   std::size_t _query_hash{0};
   bool _caching_enabled{false};

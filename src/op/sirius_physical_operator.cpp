@@ -187,11 +187,11 @@ void sirius_physical_operator::sink(const operator_data& output_data, rmm::cuda_
   }
 }
 
-operator_data sirius_physical_operator::execute(const operator_data& input_data,
-                                                rmm::cuda_stream_view stream)
+std::unique_ptr<operator_data> sirius_physical_operator::execute(const operator_data& input_data,
+                                                                 rmm::cuda_stream_view stream)
 {
   // not doing anything for now
-  return operator_data(std::vector<std::shared_ptr<::cucascade::data_batch>>{});
+  return std::make_unique<operator_data>(std::vector<std::shared_ptr<::cucascade::data_batch>>{});
 }
 
 void sirius_physical_operator::push_data_batch(std::string_view port_id,
@@ -254,7 +254,7 @@ std::optional<task_creation_hint> sirius_physical_operator::get_next_task_hint()
   return std::nullopt;
 }
 
-std::optional<operator_data> sirius_physical_operator::get_next_task_input_data()
+std::unique_ptr<operator_data> sirius_physical_operator::get_next_task_input_data()
 {
   // take one data batch from each port and schedule a task (a task takes one data batch from each
   // port), do this repeatedly until all ports are empty
@@ -266,9 +266,9 @@ std::optional<operator_data> sirius_physical_operator::get_next_task_input_data(
     if (batch_and_handle) { input_batch.push_back(std::move(batch_and_handle)); }
   }
   if (input_batch.empty()) {
-    return operator_data(std::vector<std::shared_ptr<::cucascade::data_batch>>{});
+    return std::make_unique<operator_data>(std::vector<std::shared_ptr<::cucascade::data_batch>>{});
   }
-  return operator_data(input_batch);
+  return std::make_unique<operator_data>(input_batch);
 }
 
 bool sirius_physical_operator::all_ports_empty()

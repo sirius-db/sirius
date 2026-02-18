@@ -18,7 +18,6 @@
 
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "expression_executor/gpu_expression_executor.hpp"
-#include "log/logging.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_hash_join.hpp"
@@ -36,38 +35,43 @@ sirius_physical_concat::sirius_physical_concat(duckdb::vector<duckdb::LogicalTyp
   : sirius_physical_partition_consumer_operator(
       SiriusPhysicalOperatorType::CONCAT, std::move(types), estimated_cardinality)
 {
-  _num_partitions = (estimated_cardinality + PARTITION_SIZE - 1) / PARTITION_SIZE;
-  _parent_op      = parent_op;
-  _is_build       = is_build;
+  _parent_op = parent_op;
+  _is_build  = is_build;
   // check if parent_op is a hash join
   if (parent_op->type == SiriusPhysicalOperatorType::HASH_JOIN) {
     auto hash_join = dynamic_cast<sirius_physical_hash_join*>(parent_op);
     if (hash_join->join_type == duckdb::JoinType::LEFT ||
-        hash_join->join_type == duckdb::JoinType::ANTI) {
+        hash_join->join_type == duckdb::JoinType::ANTI ||
+        hash_join->join_type == duckdb::JoinType::SEMI) {
       // if the join type is left or anti, then we need to concat all the batches into one batch for
       // the build side
       _concat_all = is_build;
     } else if (hash_join->join_type == duckdb::JoinType::RIGHT ||
-               hash_join->join_type == duckdb::JoinType::RIGHT_ANTI) {
+               hash_join->join_type == duckdb::JoinType::RIGHT_ANTI ||
+               hash_join->join_type == duckdb::JoinType::RIGHT_SEMI) {
       // if the join type is right or right anti, then we need to concat all the batches into one
       // batch for the probe side
       _concat_all = !is_build;
     } else if (hash_join->join_type == duckdb::JoinType::INNER ||
-               hash_join->join_type == duckdb::JoinType::SEMI ||
-               hash_join->join_type == duckdb::JoinType::RIGHT_SEMI ||
                hash_join->join_type == duckdb::JoinType::MARK) {
       _concat_all = false;
+    } else if (hash_join->join_type == duckdb::JoinType::OUTER) {
+      _concat_all = true;
     } else {
-      throw std::runtime_error("sirius_physical_concat: unsupported join type");
+      throw std::runtime_error("sirius_physical_concat: unsupported join type: " +
+                               duckdb::JoinTypeToString(hash_join->join_type));
     }
+  } else if (parent_op->type == SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
+    _concat_all = false;
   } else {
-    throw std::runtime_error("sirius_physical_concat: parent_op is not a hash join");
+    throw std::runtime_error("sirius_physical_concat: parent_op is not a hash join: " +
+                             SiriusPhysicalOperatorToString(parent_op->type));
   }
 }
 
-std::optional<operator_data> sirius_physical_concat::get_next_task_input_data()
+std::unique_ptr<operator_data> sirius_physical_concat::get_next_task_input_data()
 {
-  // iterate through all the partition and pull the
+  // iterate through all the partition and pull
   std::lock_guard<std::mutex> lg(lock);
 
   // assert that there is only one port
@@ -82,8 +86,7 @@ std::optional<operator_data> sirius_physical_concat::get_next_task_input_data()
     auto batch_ids          = port_ptr->repo->get_batch_ids(i);
     size_t total_batch_size = 0;
     for (auto& batch_id : batch_ids) {
-      auto batch =
-        port_ptr->repo->get_data_batch_by_id(batch_id, ::cucascade::batch_state::task_created, i);
+      auto batch      = port_ptr->repo->get_data_batch_by_id(batch_id, std::nullopt, i);
       auto batch_size = batch->get_data()->get_size_in_bytes();
       total_batch_size += batch_size;
       // Check if the batch size is already exceed the threshold
@@ -93,8 +96,8 @@ std::optional<operator_data> sirius_physical_concat::get_next_task_input_data()
         if (input_batch.size() == 0) {
           // this mean that there is a batch that is bigger than the threshold, then we just output
           // that batch right away
-          auto popped_batch =
-            port_ptr->repo->pop_data_batch(::cucascade::batch_state::task_created, i);
+          auto popped_batch = port_ptr->repo->pop_data_batch_by_id(
+            batch_id, ::cucascade::batch_state::task_created, i);
           input_batch.push_back(std::move(popped_batch));
         }
         break;
@@ -102,17 +105,19 @@ std::optional<operator_data> sirius_physical_concat::get_next_task_input_data()
         // if the batch size does not exceed the threshold, then we need to add the batch to the
         // input batch
         auto popped_batch =
-          port_ptr->repo->pop_data_batch(::cucascade::batch_state::task_created, i);
+          port_ptr->repo->pop_data_batch_by_id(batch_id, ::cucascade::batch_state::task_created, i);
         input_batch.push_back(std::move(popped_batch));
       }
     }
-    if (input_batch.size() != 0) { return partitioned_operator_data(std::move(input_batch), i); }
+    if (input_batch.size() != 0) {
+      return std::make_unique<partitioned_operator_data>(std::move(input_batch), i);
+    }
   }
-  return std::nullopt;
+  return nullptr;
 }
 
-operator_data sirius_physical_concat::execute(const operator_data& input_data,
-                                              rmm::cuda_stream_view stream)
+std::unique_ptr<operator_data> sirius_physical_concat::execute(const operator_data& input_data,
+                                                               rmm::cuda_stream_view stream)
 {
   auto partitioned_input_data = dynamic_cast<const partitioned_operator_data*>(&input_data);
   if (partitioned_input_data == nullptr) {
@@ -127,8 +132,8 @@ operator_data sirius_physical_concat::execute(const operator_data& input_data,
     if (batch) { valid_batches.push_back(batch); }
   }
   if (valid_batches.empty()) {
-    return partitioned_operator_data(std::vector<std::shared_ptr<cucascade::data_batch>>{},
-                                     partition_idx);
+    return std::make_unique<partitioned_operator_data>(
+      std::vector<std::shared_ptr<cucascade::data_batch>>{}, partition_idx);
   }
 
   cucascade::memory::memory_space* space = valid_batches[0]->get_memory_space();
@@ -142,7 +147,7 @@ operator_data sirius_physical_concat::execute(const operator_data& input_data,
     auto merged_batch = gpu_merge_impl::concat(valid_batches, stream, *space);
     output_batches.push_back(std::move(merged_batch));
   }
-  return partitioned_operator_data(output_batches, partition_idx);
+  return std::make_unique<partitioned_operator_data>(output_batches, partition_idx);
 }
 
 void sirius_physical_concat::sink(const operator_data& output_data, rmm::cuda_stream_view stream)
@@ -153,7 +158,13 @@ void sirius_physical_concat::sink(const operator_data& output_data, rmm::cuda_st
     for (auto& [next_op, port_id] : next_port_after_sink) {
       auto partition_consumer_op =
         dynamic_cast<sirius_physical_partition_consumer_operator*>(next_op);
-      partition_consumer_op->push_data_batch_partitioned(port_id, batch, partition_idx);
+      if (partition_consumer_op) {
+        partition_consumer_op->push_data_batch_partitioned(port_id, batch, partition_idx);
+      } else {
+        throw std::runtime_error(
+          "sirius_physical_concat::sink(): Next operator is not a partition consumer operator: " +
+          SiriusPhysicalOperatorToString(next_op->type));
+      }
     }
   }
 }

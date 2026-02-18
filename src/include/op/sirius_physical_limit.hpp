@@ -40,7 +40,8 @@ class sirius_physical_streaming_limit : public sirius_physical_operator {
   duckdb::BoundLimitNode offset_val;
   bool parallel;
 
-  operator_data execute(const operator_data& input_data, rmm::cuda_stream_view stream) override;
+  std::unique_ptr<operator_data> execute(const operator_data& input_data,
+                                         rmm::cuda_stream_view stream) override;
 };
 
 }  // namespace op

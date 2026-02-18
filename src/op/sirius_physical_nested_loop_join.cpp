@@ -78,7 +78,7 @@ sirius_physical_nested_loop_join::sirius_physical_nested_loop_join(
   duckdb::vector<duckdb::JoinCondition> cond,
   duckdb::JoinType join_type,
   duckdb::idx_t estimated_cardinality)
-  : sirius_physical_operator(
+  : sirius_physical_partition_consumer_operator(
       SiriusPhysicalOperatorType::NESTED_LOOP_JOIN, op.types, estimated_cardinality),
     join_type(join_type),
     conditions(std::move(cond))
@@ -110,7 +110,7 @@ sirius_physical_nested_loop_join::sirius_physical_nested_loop_join(
   duckdb::JoinType join_type,
   duckdb::idx_t estimated_cardinality,
   duckdb::unique_ptr<duckdb::JoinFilterPushdownInfo> pushdown_info_p)
-  : sirius_physical_operator(
+  : sirius_physical_partition_consumer_operator(
       SiriusPhysicalOperatorType::NESTED_LOOP_JOIN, op.types, estimated_cardinality),
     join_type(join_type),
     conditions(std::move(cond))
