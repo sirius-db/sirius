@@ -42,19 +42,19 @@ description = "Configure a release build with debug symbols"
 
 [tasks.build-debug]
 cmd = "cmake --build build/debug --parallel {{jobs}}"
-args = [{arg="jobs", default="4"}]
+args = [{arg="jobs", default=""}]
 depends-on = ["configure-debug"]
 description = "Build in debug mode"
 
 [tasks.build-release]
 cmd = "cmake --build build/release --parallel {{jobs}}"
-args = [{arg="jobs", default="4"}]
+args = [{arg="jobs", default=""}]
 depends-on = ["configure-release"]
 description = "Build in release mode"
 
 [tasks.build-relwithdebinfo]
 cmd = "cmake --build build/relwithdebinfo --parallel {{jobs}}"
-args = [{arg="jobs", default="4"}]
+args = [{arg="jobs", default=""}]
 depends-on = ["configure-relwithdebinfo"]
 description = "Build in release mode with debug symbols"
 
