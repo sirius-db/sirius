@@ -414,8 +414,9 @@ TEST_CASE("Ungrouped merge aggregate of min/max/count/sum", "[operator][merge_un
 
   auto input = create_batches_with_local_ungrouped_agg_result(
     num_batches, num_base_input_rows, column_types, aggregates, *mem_space);
+  std::vector<std::optional<cudf::size_type>> merge_nth_index(aggregates.size(), std::nullopt);
   auto output_batch = gpu_merge_impl::merge_ungrouped_aggregate(
-    input.batches, aggregates, cudf::get_default_stream(), *mem_space);
+    input.batches, aggregates, merge_nth_index, cudf::get_default_stream(), *mem_space);
   validate_ungrouped_aggregate(input.batches, *output_batch, aggregates);
 }
 
@@ -431,9 +432,11 @@ TEST_CASE("Ungrouped merge aggregate with invalid input", "[operator][merge_ungr
   // Invalid input: less than two input batches
   auto input = create_batches_with_local_ungrouped_agg_result(
     num_batches, num_base_input_rows, column_types, aggregates, *mem_space);
-  REQUIRE_THROWS_AS(gpu_merge_impl::merge_ungrouped_aggregate(
-                      input.batches, aggregates, cudf::get_default_stream(), *mem_space),
-                    std::runtime_error);
+  std::vector<std::optional<cudf::size_type>> merge_nth_index(aggregates.size(), std::nullopt);
+  REQUIRE_THROWS_AS(
+    gpu_merge_impl::merge_ungrouped_aggregate(
+      input.batches, aggregates, merge_nth_index, cudf::get_default_stream(), *mem_space),
+    std::runtime_error);
 
   // Invalid input: mismatch between num columns and num aggregations
   num_batches         = 10;
@@ -441,9 +444,11 @@ TEST_CASE("Ungrouped merge aggregate with invalid input", "[operator][merge_ungr
   auto input2         = create_batches_with_local_ungrouped_agg_result(
     num_batches, num_base_input_rows, column_types, aggregates, *mem_space);
   aggregates.push_back(cudf::aggregation::Kind::SUM);
-  REQUIRE_THROWS_AS(gpu_merge_impl::merge_ungrouped_aggregate(
-                      input2.batches, aggregates, cudf::get_default_stream(), *mem_space),
-                    std::runtime_error);
+  merge_nth_index.push_back(std::nullopt);
+  REQUIRE_THROWS_AS(
+    gpu_merge_impl::merge_ungrouped_aggregate(
+      input2.batches, aggregates, merge_nth_index, cudf::get_default_stream(), *mem_space),
+    std::runtime_error);
 }
 
 TEST_CASE("Ungrouped merge aggregate with empty local aggregate results",
@@ -464,8 +469,9 @@ TEST_CASE("Ungrouped merge aggregate with empty local aggregate results",
 
   auto input = create_batches_with_local_ungrouped_agg_result(
     num_batches, num_base_input_rows, column_types, aggregates, *mem_space);
+  std::vector<std::optional<cudf::size_type>> merge_nth_index(aggregates.size(), std::nullopt);
   auto output_batch = gpu_merge_impl::merge_ungrouped_aggregate(
-    input.batches, aggregates, cudf::get_default_stream(), *mem_space);
+    input.batches, aggregates, merge_nth_index, cudf::get_default_stream(), *mem_space);
   validate_ungrouped_aggregate(input.batches, *output_batch, aggregates);
 }
 
@@ -489,8 +495,9 @@ TEST_CASE("Ungrouped merge aggregate with mixed empty and non-empty local aggreg
 
   auto input = create_batches_with_local_ungrouped_agg_result(
     num_batches, num_base_input_rows, column_types, aggregates, *mem_space);
+  std::vector<std::optional<cudf::size_type>> merge_nth_index(aggregates.size(), std::nullopt);
   auto output_batch = gpu_merge_impl::merge_ungrouped_aggregate(
-    input.batches, aggregates, cudf::get_default_stream(), *mem_space);
+    input.batches, aggregates, merge_nth_index, cudf::get_default_stream(), *mem_space);
   validate_ungrouped_aggregate(input.batches, *output_batch, aggregates);
 }
 

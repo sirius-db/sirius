@@ -17,11 +17,13 @@
 #pragma once
 
 #include <cudf/cudf_utils.hpp>
+#include <cudf/types.hpp>
 
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/memory/memory_space.hpp>
 
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace sirius {
@@ -59,6 +61,8 @@ class gpu_merge_impl {
    *
    * @param input The input batches to be merged.
    * @param aggregates The aggregate functions, should have the same size as num input columns.
+   * @param merge_nth_index When aggregates[i] == NTH_ELEMENT, the nth index to use (e.g. 0 for
+   * first).
    * @param stream CUDA stream used for device memory operations and kernel launches.
    * @param memory_space The memory space used to allocate memory for the output data batch.
    *
@@ -67,6 +71,7 @@ class gpu_merge_impl {
   static std::shared_ptr<cucascade::data_batch> merge_ungrouped_aggregate(
     const std::vector<std::shared_ptr<cucascade::data_batch>>& input,
     const std::vector<cudf::aggregation::Kind>& aggregates,
+    const std::vector<std::optional<cudf::size_type>>& merge_nth_index,
     rmm::cuda_stream_view stream,
     cucascade::memory::memory_space& memory_space);
 
