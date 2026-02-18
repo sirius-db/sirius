@@ -324,6 +324,47 @@ cudf::ast::ast_operator to_ast_operator(duckdb::ExpressionType comparison)
   }
 }
 
+// Resolve left-table column index: BOUND_REF or BOUND_CAST(BOUND_REF).
+bool get_left_column_index(const duckdb::Expression& expr, cudf::size_type& out_idx)
+{
+  if (expr.expression_class == duckdb::ExpressionClass::BOUND_REF) {
+    out_idx = static_cast<cudf::size_type>(expr.Cast<duckdb::BoundReferenceExpression>().index);
+    return true;
+  }
+  if (expr.expression_class == duckdb::ExpressionClass::BOUND_CAST) {
+    const auto& cast_expr = expr.Cast<duckdb::BoundCastExpression>();
+    if (cast_expr.child->expression_class == duckdb::ExpressionClass::BOUND_REF) {
+      out_idx = static_cast<cudf::size_type>(
+        cast_expr.child->Cast<duckdb::BoundReferenceExpression>().index);
+      return true;
+    }
+  }
+  return false;
+}
+
+// Resolve right-table column index: BOUND_REF, BOUND_CAST(BOUND_REF), or BOUND_SUBQUERY (scalar
+// subquery result = single column, index 0).
+bool get_right_column_index(const duckdb::Expression& expr, cudf::size_type& out_idx)
+{
+  if (expr.expression_class == duckdb::ExpressionClass::BOUND_REF) {
+    out_idx = static_cast<cudf::size_type>(expr.Cast<duckdb::BoundReferenceExpression>().index);
+    return true;
+  }
+  if (expr.expression_class == duckdb::ExpressionClass::BOUND_CAST) {
+    const auto& cast_expr = expr.Cast<duckdb::BoundCastExpression>();
+    if (cast_expr.child->expression_class == duckdb::ExpressionClass::BOUND_REF) {
+      out_idx = static_cast<cudf::size_type>(
+        cast_expr.child->Cast<duckdb::BoundReferenceExpression>().index);
+      return true;
+    }
+  }
+  if (expr.expression_class == duckdb::ExpressionClass::BOUND_SUBQUERY) {
+    out_idx = 0;
+    return true;
+  }
+  return false;
+}
+
 }  // namespace
 
 std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
@@ -381,18 +422,20 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
     std::vector<cudf::ast::column_reference> right_refs;
     std::vector<cudf::ast::operation> cond_ops;
     for (const auto& cond : conditions) {
-      if (cond.left->expression_class != duckdb::ExpressionClass::BOUND_REF ||
-          cond.right->expression_class != duckdb::ExpressionClass::BOUND_REF) {
+      cudf::size_type left_idx  = 0;
+      cudf::size_type right_idx = 0;
+      if (!get_left_column_index(*cond.left, left_idx)) {
         throw std::runtime_error(
-          "sirius_physical_nested_loop_join: only simple column comparisons (BOUND_REF op "
-          "BOUND_REF) "
-          "are supported (expression: " +
-          cond.left->ToString() + " op " + cond.right->ToString() + ")");
+          "sirius_physical_nested_loop_join: left side of condition must be a column reference or "
+          "CAST(column) (got: " +
+          cond.left->ToString() + ")");
       }
-      auto left_idx =
-        static_cast<cudf::size_type>(cond.left->Cast<duckdb::BoundReferenceExpression>().index);
-      auto right_idx =
-        static_cast<cudf::size_type>(cond.right->Cast<duckdb::BoundReferenceExpression>().index);
+      if (!get_right_column_index(*cond.right, right_idx)) {
+        throw std::runtime_error(
+          "sirius_physical_nested_loop_join: right side of condition must be a column reference, "
+          "CAST(column), or scalar SUBQUERY (got: " +
+          cond.right->ToString() + ")");
+      }
       left_refs.emplace_back(left_idx, cudf::ast::table_reference::LEFT);
       right_refs.emplace_back(right_idx, cudf::ast::table_reference::RIGHT);
       cond_ops.emplace_back(to_ast_operator(cond.comparison), left_refs.back(), right_refs.back());
