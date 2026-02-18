@@ -27,95 +27,30 @@ Experiment Setup:
 - libcudf >= 26.04
 - We recommend building Sirius with at least **16 vCPUs** to ensure faster compilation.
 
-## Dependencies (Option 1): Install Manually
-
-### Install duckdb dependencies
-```
-sudo apt-get update && sudo apt-get install -y git g++ cmake ninja-build libssl-dev
-```
-
-### Install CUDA
-If CUDA is not installed, download [here](https://developer.nvidia.com/cuda-downloads). Follow the instructions for the deb(local) installer and complete the [post-installation steps](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/#mandatory-actions).
-
-Verify installation:
-```
-nvcc --version
-nvidia-smi
-```
-
-### Install libcudf dependencies
-
-This approach requires cloning the repo following the instructions specified in [Building Sirius](#building-sirius).
-
-libcudf will be installed via conda/miniconda. Miniconda can be downloaded [here](https://www.anaconda.com/docs/getting-started/miniconda/install). After downloading miniconda, install libcudf by running these commands:
-```
-conda create --name libcudf-env
-conda activate libcudf-env
-conda install -c rapidsai -c conda-forge -c nvidia rapidsai::libcudf=26.04
-```
-Set the environment variables `LIBCUDF_ENV_PREFIX` to the conda environment's path. For example, if we installed miniconda in `~/miniconda3` and installed libcudf in the conda environment `libcudf-env`, then we would set the `LIBCUDF_ENV_PREFIX` to `~/miniconda3/envs/libcudf-env`.
-```
-export LIBCUDF_ENV_PREFIX={PATH to libcudf-env}
-```
-It is recommended to add the environment variables to your `bashrc` to avoid repetition.
-
-## Dependencies (Option 2): Use Pixi
-
-There is a [Pixi](https://pixi.sh/) manifest available to set up an environment with all required dependencies installed.
-
 ### Requirements
-
-#### Build
 
 - Git (to clone the repo)
 - Pixi (install instructions [here](https://pixi.sh/latest/installation/))
 
-#### Test
-
-- A supported NVIDIA GPU
-- NVIDIA GPU driver installed
-
-### Setup
-
-The environment activation handles setting up everything needed to build and test.
-
-Start a shell in the environment with:
-```
-pixi shell
-```
-
-Then build and test as described in the sections below.
-```
-make
-make test
-```
-
 ## Building Sirius
+
 To clone the Sirius repository:
 ```
 git clone --recurse-submodules https://github.com/sirius-db/sirius.git
 cd sirius
-source setup_sirius.sh
 ```
 The `--recurse-submodules` will ensure DuckDB is pulled which is required to build the extension.
+
+There is a [Pixi](https://pixi.sh/) manifest available to set up an environment with all required dependencies installed. Start a shell in the environment with:
+```
+pixi shell
+```
+The environment activation handles setting up everything needed to build and test.
 
 To build Sirius:
 ```
 CMAKE_BUILD_PARALLEL_LEVEL={nproc} make
-```
-
-Common issues:
-If you encounter an error such as:
-```
-/usr/bin/ld: /home/ubuntu/miniconda3/envs/libcudf-env/lib/libcudf.so: undefined reference to `std::ios_base_library_init()@GLIBCXX_3.4.32'
-/usr/bin/ld: /home/ubuntu/miniconda3/envs/libcudf-env/lib/libcudf.so: undefined reference to `__cxa_call_terminate@CXXABI_1.3.15'
-```
-Solve this issue by running the following command, then delete the build directory and install Sirius once again:
-```
-export LDFLAGS="-Wl,-rpath,$CONDA_PREFIX/lib -L$CONDA_PREFIX/lib $LDFLAGS"
-rm -rf build
-CMAKE_BUILD_PARALLEL_LEVEL={nproc} make
-```
+``
 
 Note that if building the extension consumes too much memory, try reducing the `CMAKE_BUILD_PARALLEL_LEVEL` value used when invoking `make`.
 
@@ -285,13 +220,6 @@ build/release/extension/sirius/test/cpp/log
 ```
 
 Just like duckdb, we are using [Catch2](https://github.com/catchorg/Catch2) as our testing framework so more details about writing and running tests can be found there.
-
-## Performance Testing
-Make sure to build the duckdb-python package before running this test using the method described [here](https://github.com/sirius-db/sirius?tab=readme-ov-file#building-sirius). To test Sirius performance against DuckDB across all 22 TPC-H queries, run the following command (replace {SF} with the desired scale factor):
-```
-python3 test/tpch_performance/generate_test_data.py {SF}
-python3 test/tpch_performance/performance_test.py {SF}
-```
 
 ## Logging
 Sirius uses [spdlog](https://github.com/gabime/spdlog) for logging messages during query execution. Default log directory is `${CMAKE_BINARY_DIR}/log` and default log level is `info`, which can be configured by environment variables `SIRIUS_LOG_DIR` and `SIRIUS_LOG_LEVEL`. For example:
