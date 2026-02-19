@@ -19,6 +19,7 @@
 #include "cudf/cudf_utils.hpp"
 #include "duckdb/common/assert.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 
 #include <stdexcept>
@@ -54,24 +55,45 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
       size_t sum_position = result.cudf_aggregates.size();
       result.cudf_aggregates.push_back(cudf::aggregation::Kind::SUM);
       result.cudf_aggregate_idx.push_back(col_idx);
+      result.cudf_aggregate_struct_col_indices.push_back({});
       result.cudf_aggregates.push_back(cudf::aggregation::Kind::COUNT_VALID);
       result.cudf_aggregate_idx.push_back(col_idx);
+      result.cudf_aggregate_struct_col_indices.push_back({});
       result.aggregate_slots.push_back(
         AggregateSlot{true, false, sum_position, duckdb::GetCudfType(aggr.return_type)});
       result.has_avg = true;
       continue;
     }
 
-    // Handle COUNT(DISTINCT col): use COLLECT_SET locally; merge via MERGE_SETS; then count list
-    // elements to produce the final distinct count.
+    // Handle COUNT(DISTINCT col) and COUNT(DISTINCT (col1, col2, ...)):
+    // Use COLLECT_SET locally; merge via MERGE_SETS; then count list elements.
+    // For multi-column, a struct column is synthesized from the component columns.
     if (aggr.IsDistinct() && aggr.function.name == "count") {
       D_ASSERT(aggr.children.size() == 1);
-      D_ASSERT(aggr.children[0]->type == duckdb::ExpressionType::BOUND_REF);
-      auto& bound_ref = aggr.children[0]->Cast<duckdb::BoundReferenceExpression>();
-      auto col_idx    = static_cast<int>(bound_ref.index);
+      auto& child     = *aggr.children[0];
       size_t position = result.cudf_aggregates.size();
       result.cudf_aggregates.push_back(cudf::aggregation::Kind::COLLECT_SET);
-      result.cudf_aggregate_idx.push_back(col_idx);
+
+      if (child.type == duckdb::ExpressionType::BOUND_REF) {
+        // Single-column case: COUNT(DISTINCT col)
+        auto& bound_ref = child.Cast<duckdb::BoundReferenceExpression>();
+        result.cudf_aggregate_idx.push_back(static_cast<int>(bound_ref.index));
+        result.cudf_aggregate_struct_col_indices.push_back({});
+      } else {
+        // Multi-column case: COUNT(DISTINCT (col1, col2, ...)) — child is a struct_pack expression
+        D_ASSERT(child.type == duckdb::ExpressionType::BOUND_FUNCTION);
+        auto& func_expr = child.Cast<duckdb::BoundFunctionExpression>();
+        std::vector<int> struct_indices;
+        for (auto& arg : func_expr.children) {
+          D_ASSERT(arg->type == duckdb::ExpressionType::BOUND_REF);
+          auto& br = arg->Cast<duckdb::BoundReferenceExpression>();
+          struct_indices.push_back(static_cast<int>(br.index));
+        }
+        D_ASSERT(!struct_indices.empty());
+        result.cudf_aggregate_idx.push_back(-1);  // sentinel: struct column, see gpu_aggregate_impl
+        result.cudf_aggregate_struct_col_indices.push_back(std::move(struct_indices));
+      }
+
       result.aggregate_slots.push_back(AggregateSlot{false, true, position});
       result.has_count_distinct = true;
       continue;
@@ -115,6 +137,7 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
                                  " with " + std::to_string(aggr.children.size()) + " children");
       }
     }
+    result.cudf_aggregate_struct_col_indices.push_back({});
     result.aggregate_slots.push_back(AggregateSlot{false, false, current_position});
   }
 

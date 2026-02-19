@@ -1223,6 +1223,30 @@ TEST_CASE_METHOD(GPUExecutionFixture,
     "from customer group by c_nationkey;");
 }
 
+// ---------------------------------------------------------------------------
+// Multi-column COUNT(DISTINCT) integration tests
+// count(distinct (col1, col2)) counts distinct combinations, not individual values.
+// ---------------------------------------------------------------------------
+
+// nation: 25 rows, 5 unique (n_nationkey, n_name) combos per region.
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - count distinct: multi-column struct",
+                 "[integration][gpu_execution][group_by][count_distinct]")
+{
+  compare_gpu_vs_cpu(
+    "select n_regionkey, count(distinct (n_nationkey, n_name)) from nation group by n_regionkey;");
+}
+
+// Multi-column count distinct with a forced multi-partition execution.
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - count distinct: multi-column struct, multi-partition forced",
+                 "[integration][gpu_execution][group_by][count_distinct][multi_partition]")
+{
+  PartitionSizeGuard guard(5);
+  compare_gpu_vs_cpu(
+    "select n_regionkey, count(distinct (n_nationkey, n_name)) from nation group by n_regionkey;");
+}
+
 //===----------------------------------------------------------------------===//
 // Top N / Join tests (disabled)
 //===----------------------------------------------------------------------===//

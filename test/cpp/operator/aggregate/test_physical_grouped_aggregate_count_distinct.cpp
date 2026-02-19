@@ -529,3 +529,79 @@ TEST_CASE("count distinct: multiple partitions with multiple batches per partiti
   REQUIRE(sirius::test::expect_data_batch_equivalent_to_table(
     result_p1->get_data_batches()[0], expected_p1->view(), true /*sort*/));
 }
+
+// ===========================================================================
+// TEST 6: Multi-column COUNT(DISTINCT (col_a, col_b))
+//
+// Distinct counts are over COMBINATIONS of (col_a, col_b), not individual cols.
+//
+// Input (col0=key, col1=val_a, col2=val_b):
+//   key=0: (10,1),(10,2),(10,1),(20,1)  → {(10,1),(10,2),(20,1)} → 3
+//   key=1: (30,3),(30,3),(40,3)          → {(30,3),(40,3)}         → 2
+//
+// Exercises:
+//   - (10,1) appearing twice counts once (intra-batch dedup).
+//   - (10,1) and (10,2) are different combos and both counted.
+//   - Multiple batches per partition: same combo in different batches counts once.
+// ===========================================================================
+TEST_CASE("count distinct: multi-column struct expression",
+          "[physical_grouped_aggregate_count_distinct]")
+{
+  using KeyTraits = gpu_type_traits<int32_t>;
+  using ValTraits = gpu_type_traits<int32_t>;
+
+  auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(Tier::GPU, 0);
+  REQUIRE(space != nullptr);
+  auto mr     = get_resource_ref(*space);
+  auto stream = default_stream();
+
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  auto& context = *con.context;
+
+  // Input table: 3 columns — key (col0), val_a (col1), val_b (col2)
+  auto make_3col_input = [&](const std::vector<int32_t>& keys,
+                             const std::vector<int32_t>& val_a,
+                             const std::vector<int32_t>& val_b) {
+    std::vector<std::unique_ptr<cudf::column>> cols;
+    cols.push_back(vector_to_cudf_column<KeyTraits>(keys, stream, mr));
+    cols.push_back(vector_to_cudf_column<ValTraits>(val_a, stream, mr));
+    cols.push_back(vector_to_cudf_column<ValTraits>(val_b, stream, mr));
+    return std::make_unique<cudf::table>(std::move(cols));
+  };
+
+  // Batch 1
+  auto batch1 =
+    sirius::make_data_batch(make_3col_input({0, 0, 1, 1}, {10, 10, 30, 30}, {1, 1, 3, 3}), *space);
+
+  // Batch 2 — introduces new combos and cross-batch dups
+  auto batch2 =
+    sirius::make_data_batch(make_3col_input({0, 0, 0, 1}, {10, 10, 20, 40}, {2, 1, 1, 3}), *space);
+
+  // Expected: key=0 → 3 (combos: (10,1),(10,2),(20,1)), key=1 → 2 (combos: (30,3),(40,3))
+  auto expected_table = make_count_distinct_expected({0, 1}, {3, 2}, stream, mr);
+
+  // Build COUNT(DISTINCT (col1, col2)) grouped by col0
+  auto agg_spec = sirius::test::create_count_distinct_struct_col_expressions(
+    {{duckdb::LogicalType::INTEGER, 0}},  // GROUP BY col0
+    {{duckdb::LogicalType::INTEGER, 1},   // struct_pack(col1, col2)
+     {duckdb::LogicalType::INTEGER, 2}});
+
+  sirius_physical_grouped_aggregate local_op(context,
+                                             std::move(agg_spec.output_types),
+                                             std::move(agg_spec.aggregates),
+                                             std::move(agg_spec.groups),
+                                             2 /*estimated_cardinality*/);
+  sirius_physical_grouped_aggregate_merge merge_op(&local_op);
+
+  auto local1 = run_local(local_op, batch1);
+  auto local2 = run_local(local_op, batch2);
+
+  auto final_out = merge_op.execute(
+    operator_data(std::vector<std::shared_ptr<data_batch>>{local1, local2}), default_stream());
+  REQUIRE(final_out->get_data_batches().size() == 1);
+
+  REQUIRE(sirius::test::expect_data_batch_equivalent_to_table(
+    final_out->get_data_batches()[0], expected_table->view(), true /*sort*/));
+}

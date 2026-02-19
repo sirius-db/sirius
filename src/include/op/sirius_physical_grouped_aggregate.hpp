@@ -78,6 +78,7 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
   std::vector<int> group_idx;
   std::vector<cudf::aggregation::Kind> cudf_aggregates;
   std::vector<int> cudf_aggregate_idx;
+  std::vector<std::vector<int>> cudf_aggregate_struct_col_indices;
 
   // AVG decomposition metadata
   std::vector<AggregateSlot> aggregate_slots;

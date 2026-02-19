@@ -49,6 +49,11 @@ struct CudfAggregateDefinitions {
                                                          ///< entries per AVG)
   std::vector<int> cudf_aggregate_idx;  ///< Column indices for aggregation inputs (expanded)
 
+  /// For COLLECT_SET aggregates only: when non-empty, the aggregate input is a struct column
+  /// synthesized from these column indices (multi-column COUNT DISTINCT). Parallel to
+  /// cudf_aggregates; empty entries mean single-column (use cudf_aggregate_idx directly).
+  std::vector<std::vector<int>> cudf_aggregate_struct_col_indices;
+
   /// One entry per original DuckDB aggregate expression, mapping to cudf_aggregates positions.
   std::vector<AggregateSlot> aggregate_slots;
   bool has_avg            = false;  ///< True if any aggregate is AVG

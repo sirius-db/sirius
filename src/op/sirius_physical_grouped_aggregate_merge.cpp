@@ -83,6 +83,7 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
                                             grouped_aggregate->group_idx,
                                             grouped_aggregate->cudf_aggregates,
                                             grouped_aggregate->cudf_aggregate_idx,
+                                            grouped_aggregate->cudf_aggregate_struct_col_indices,
                                             grouped_aggregate->aggregate_slots,
                                             grouped_aggregate->has_avg,
                                             grouped_aggregate->has_count_distinct,
@@ -96,6 +97,7 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
   std::vector<int> group_idx,
   std::vector<cudf::aggregation::Kind> cudf_aggregates,
   std::vector<int> cudf_aggregate_idx,
+  std::vector<std::vector<int>> cudf_aggregate_struct_col_indices,
   std::vector<AggregateSlot> aggregate_slots,
   bool has_avg,
   bool has_count_distinct,
@@ -105,6 +107,7 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
     group_idx(std::move(group_idx)),
     cudf_aggregates(std::move(cudf_aggregates)),
     cudf_aggregate_idx(std::move(cudf_aggregate_idx)),
+    cudf_aggregate_struct_col_indices(std::move(cudf_aggregate_struct_col_indices)),
     aggregate_slots(std::move(aggregate_slots)),
     has_avg(has_avg),
     has_count_distinct(has_count_distinct)
@@ -151,13 +154,14 @@ sirius_physical_grouped_aggregate_merge::sirius_physical_grouped_aggregate_merge
     grouping_sets(std::move(grouping_sets_p))
 {
   // Convert input parameters to cudf compute definitions BEFORE moving them
-  auto cudf_defs     = convert_duckdb_aggregates_to_cudf(groups_p, expressions);
-  group_idx          = std::move(cudf_defs.group_idx);
-  cudf_aggregates    = std::move(cudf_defs.cudf_aggregates);
-  cudf_aggregate_idx = std::move(cudf_defs.cudf_aggregate_idx);
-  aggregate_slots    = std::move(cudf_defs.aggregate_slots);
-  has_avg            = cudf_defs.has_avg;
-  has_count_distinct = cudf_defs.has_count_distinct;
+  auto cudf_defs                    = convert_duckdb_aggregates_to_cudf(groups_p, expressions);
+  group_idx                         = std::move(cudf_defs.group_idx);
+  cudf_aggregates                   = std::move(cudf_defs.cudf_aggregates);
+  cudf_aggregate_idx                = std::move(cudf_defs.cudf_aggregate_idx);
+  cudf_aggregate_struct_col_indices = std::move(cudf_defs.cudf_aggregate_struct_col_indices);
+  aggregate_slots                   = std::move(cudf_defs.aggregate_slots);
+  has_avg                           = cudf_defs.has_avg;
+  has_count_distinct                = cudf_defs.has_count_distinct;
 }
 
 std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::get_next_task_input_data()
