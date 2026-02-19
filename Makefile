@@ -65,13 +65,13 @@ clang-relwithdebinfo:
 test: test_release
 
 test_release: release
-	./$(TEST_PATH) "test/*"
+	./$(TEST_PATH) "$(CURDIR)/test/*"
 
 test_debug: debug
-	./$(TEST_PATH_DEBUG) "test/*"
+	./$(TEST_PATH_DEBUG) "$(CURDIR)/test/*"
 
 test_reldebug: relwithdebinfo
-	./$(TEST_PATH_RELWITHDEBINFO) "test/*"
+	./$(TEST_PATH_RELWITHDEBINFO) "$(CURDIR)/test/*"
 
 clean:
 	rm -rf build
