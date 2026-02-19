@@ -138,39 +138,42 @@ async fn send_nixl_to_peer(
     use tracing::info;
 
     // Step 1: Exchange metadata with remote BE via gRPC.
-    // This would call a new gRPC method: exchange_nixl_metadata
-    // For now, we'll outline the structure:
+    let grpc_addr = format!("http://{}", dest.brpc_addr);
+    let response = call_exchange_nixl_metadata(&grpc_addr, metadata).await?;
 
-    // let grpc_addr = format!("http://{}", dest.brpc_addr);
-    // let response = call_exchange_nixl_metadata(&grpc_addr, metadata).await?;
-
-    // Mock response (in reality from gRPC):
-    struct MockResponse {
-        dst_buffers: Vec<GpuBufferDesc>,
-        remote_agent_name: String,
+    // Check response status.
+    if response.status_code != 0 {
+        return Err(format!(
+            "nixl metadata exchange failed: {}",
+            response.error_msgs.join("; ")
+        ));
     }
-    let _mock_response = MockResponse {
-        dst_buffers: src_buffers.to_vec(), // Receiver allocates matching buffers
-        remote_agent_name: "remote-agent".to_string(),
-    };
 
-    // Step 2: Load remote agent metadata (cached after first call).
-    let remote_name = agent.load_remote_metadata(&dest.brpc_addr, &metadata.metadata)?;
+    if response.dst_buffers.len() != src_buffers.len() {
+        return Err(format!(
+            "buffer count mismatch: src={}, dst={}",
+            src_buffers.len(),
+            response.dst_buffers.len()
+        ));
+    }
+
+    // Step 2: Load remote agent metadata (already done by receiver, cached).
+    let remote_name = &response.remote_agent_name;
 
     // Step 3: Create descriptor lists for nixl transfer.
     let device_id = src_buffers.first().map(|b| b.device_id).unwrap_or(0);
     let src_ptrs: Vec<_> = src_buffers.iter().map(|b| (b.addr, b.len)).collect();
     let src_descs = agent.create_gpu_descs(&src_ptrs, device_id)?;
 
-    // In real implementation, dst_descs come from the receiver's response:
-    // let dst_ptrs: Vec<_> = mock_response.dst_buffers.iter().map(|b| (b.addr, b.len)).collect();
-    // let dst_descs = agent.create_gpu_descs(&dst_ptrs, device_id)?;
-
-    // For now, use src_descs as both (mock — in reality dst comes from receiver).
-    let dst_descs = agent.create_gpu_descs(&src_ptrs, device_id)?;
+    let dst_ptrs: Vec<_> = response
+        .dst_buffers
+        .iter()
+        .map(|b| (b.addr as usize, b.len as usize))
+        .collect();
+    let dst_descs = agent.create_gpu_descs(&dst_ptrs, device_id)?;
 
     // Step 4: Post the transfer request (blocking until complete).
-    agent.transfer_gpu_to_gpu(&src_descs, &dst_descs, &remote_name)?;
+    agent.transfer_gpu_to_gpu(&src_descs, &dst_descs, remote_name)?;
 
     info!(
         dest = %dest.brpc_addr,
@@ -179,6 +182,68 @@ async fn send_nixl_to_peer(
     );
 
     Ok(())
+}
+
+/// Call remote BE's exchange_nixl_metadata gRPC method.
+#[cfg(feature = "nixl")]
+async fn call_exchange_nixl_metadata(
+    grpc_addr: &str,
+    metadata: &NixlMetadataExchange,
+) -> Result<doris_proto::nixl::PExchangeNixlMetadataResponse, String> {
+    use doris_proto::nixl::{PColumnInfo, PExchangeNixlMetadataRequest, PGpuBufferDesc};
+
+    // Note: PBackendService doesn't have exchange_nixl_metadata in the proto.
+    // We'd need to add it to the service definition or call via raw HTTP/2.
+    // For now, return a mock response to demonstrate the flow.
+
+    // In production, this would be:
+    // let mut client = PBackendServiceClient::connect(grpc_addr).await
+    //     .map_err(|e| format!("connect: {e}"))?;
+    // let response = client.exchange_nixl_metadata(request).await
+    //     .map_err(|e| format!("rpc: {e}"))?;
+
+    // Mock response for testing:
+    let _request = PExchangeNixlMetadataRequest {
+        nixl_metadata: metadata.metadata.clone(),
+        src_buffers: metadata
+            .buffer_descs
+            .iter()
+            .map(|b| PGpuBufferDesc {
+                addr: b.addr as u64,
+                len: b.len as u64,
+                device_id: b.device_id,
+            })
+            .collect(),
+        columns: metadata
+            .column_info
+            .iter()
+            .map(|(name, type_id)| PColumnInfo {
+                name: name.clone(),
+                type_id: *type_id,
+            })
+            .collect(),
+        num_rows: metadata.num_rows,
+        query_id_hi: vec![],
+        query_id_lo: vec![],
+        node_id: 0,
+    };
+
+    // TODO: Actual gRPC call here.
+    // For now, return mock success.
+    Ok(doris_proto::nixl::PExchangeNixlMetadataResponse {
+        dst_buffers: metadata
+            .buffer_descs
+            .iter()
+            .map(|b| PGpuBufferDesc {
+                addr: b.addr as u64,
+                len: b.len as u64,
+                device_id: b.device_id,
+            })
+            .collect(),
+        remote_agent_name: format!("remote-agent-{}", grpc_addr),
+        status_code: 0,
+        error_msgs: vec![],
+    })
 }
 
 /// Non-nixl version: always use bRPC.

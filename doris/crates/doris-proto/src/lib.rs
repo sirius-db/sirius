@@ -26,3 +26,8 @@ pub mod brpc {
         include!(concat!(env!("OUT_DIR"), "/brpc.policy.rs"));
     }
 }
+
+#[allow(clippy::all)]
+pub mod nixl {
+    include!(concat!(env!("OUT_DIR"), "/doris.nixl.rs"));
+}

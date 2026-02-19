@@ -51,4 +51,12 @@ fn main() {
     prost_build::Config::new()
         .compile_protos(&[brpc_proto.as_path()], &[brpc_proto_dir.as_path()])
         .expect("Failed to compile bRPC meta proto");
+
+    // NIXL GPU-direct exchange protocol (custom proto for Sirius)
+    let nixl_proto = brpc_proto_dir.join("nixl_exchange.proto");
+    println!("cargo:rerun-if-changed={}", nixl_proto.display());
+
+    prost_build::Config::new()
+        .compile_protos(&[nixl_proto.as_path()], &[brpc_proto_dir.as_path()])
+        .expect("Failed to compile NIXL exchange proto");
 }

@@ -1,0 +1,41 @@
+// NIXL GPU-direct exchange metadata protocol.
+//
+// Used for BE-to-BE GPU-direct memory transfers via NIXL.
+// Sender offers GPU buffer descriptors, receiver allocates matching
+// destination buffers and returns their addresses for RDMA transfer.
+
+syntax = "proto3";
+
+package doris.nixl;
+
+// GPU buffer descriptor (address, length, device ID).
+message PGpuBufferDesc {
+  uint64 addr = 1;        // GPU pointer address
+  uint64 len = 2;         // Buffer size in bytes
+  uint64 device_id = 3;   // CUDA device ID
+}
+
+// Column metadata for schema reconstruction.
+message PColumnInfo {
+  string name = 1;        // Column name
+  int32 type_id = 2;      // Doris PGenericType::TypeId
+}
+
+// Request: sender offers GPU buffers for transfer.
+message PExchangeNixlMetadataRequest {
+  bytes nixl_metadata = 1;                    // Sender's nixl agent metadata
+  repeated PGpuBufferDesc src_buffers = 2;    // Source GPU buffer descriptors
+  repeated PColumnInfo columns = 3;           // Column schema
+  uint32 num_rows = 4;                        // Row count
+  bytes query_id_hi = 5;                      // Query ID (high 64 bits)
+  bytes query_id_lo = 6;                      // Query ID (low 64 bits)
+  int32 node_id = 7;                          // Exchange node ID
+}
+
+// Response: receiver provides destination GPU buffer addresses.
+message PExchangeNixlMetadataResponse {
+  repeated PGpuBufferDesc dst_buffers = 1;    // Destination GPU buffer descriptors
+  string remote_agent_name = 2;               // Receiver's nixl agent name
+  int32 status_code = 3;                      // 0 = success, non-zero = error
+  repeated string error_msgs = 4;             // Error messages (if any)
+}
