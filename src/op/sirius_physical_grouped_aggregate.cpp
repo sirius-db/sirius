@@ -16,8 +16,7 @@
 
 #include "op/sirius_physical_grouped_aggregate.hpp"
 
-#include "duckdb/planner/expression/bound_reference_expression.hpp"
-#include "log/logging.hpp"
+#include "data/data_batch_utils.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/aggregate/gpu_aggregate_impl.hpp"
 
@@ -176,7 +175,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
                                                               cudf_aggregate_idx,
                                                               stream,
                                                               *input_batch->get_memory_space());
-    results.push_back(std::move(result));
+    results.push_back(sirius::cast_batch_to_expected_types(result, get_types(), stream));
   }
   return std::make_unique<operator_data>(results);
 }

@@ -17,7 +17,6 @@
 
 #include "data/data_batch_utils.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
-#include "log/logging.hpp"
 #include "op/aggregate/aggregate_op_util.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
 
@@ -189,7 +188,11 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
   }
 
   // Fast path: single batch with no AVG needs no processing
-  if (input_batches.size() == 1 && !has_avg) { return std::make_unique<operator_data>(input_data); }
+  if (input_batches.size() == 1 && !has_avg) {
+    auto cast_batch = sirius::cast_batch_to_expected_types(input_batches[0], get_types(), stream);
+    return std::make_unique<operator_data>(
+      std::vector<std::shared_ptr<::cucascade::data_batch>>{cast_batch});
+  }
 
   // Merge multiple batches, or use single batch directly if only one
   std::shared_ptr<::cucascade::data_batch> merged;
@@ -203,10 +206,11 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
                                                      *input_batches[0]->get_memory_space());
   }
 
-  // If no AVG, return merged result directly
+  // If no AVG, return merged result directly (cast to expected types if needed)
   if (!has_avg) {
+    auto cast_batch = sirius::cast_batch_to_expected_types(merged, get_types(), stream);
     return std::make_unique<operator_data>(
-      std::vector<std::shared_ptr<::cucascade::data_batch>>{merged});
+      std::vector<std::shared_ptr<::cucascade::data_batch>>{cast_batch});
   }
 
   // Post-merge AVG projection: compute SUM/COUNT for each AVG aggregate.
@@ -264,8 +268,9 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
 
   auto output_table = std::make_unique<cudf::table>(std::move(output_cols), stream, mr);
   auto result       = sirius::make_data_batch(std::move(output_table), *space);
+  auto cast_batch   = sirius::cast_batch_to_expected_types(result, get_types(), stream);
   return std::make_unique<operator_data>(
-    std::vector<std::shared_ptr<::cucascade::data_batch>>{result});
+    std::vector<std::shared_ptr<::cucascade::data_batch>>{cast_batch});
 }
 }  // namespace op
 }  // namespace sirius
