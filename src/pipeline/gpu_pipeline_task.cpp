@@ -107,9 +107,10 @@ void validate_operator_output_types(const op::operator_data* data,
     cudf::table_view tbl = get_cudf_table_view(*batch);
     if (static_cast<size_t>(tbl.num_columns()) != expected_types.size()) {
       SIRIUS_LOG_WARN(
-        "gpu_pipeline_task: operator '{}' output batch {} column count mismatch: got "
+        "gpu_pipeline_task: operator '{}' (id={}) output batch {} column count mismatch: got "
         "{}, expected {}",
         op.get_name(),
+        op.get_operator_id(),
         batch_index,
         tbl.num_columns(),
         expected_types.size());
@@ -120,9 +121,10 @@ void validate_operator_output_types(const op::operator_data* data,
       cudf::data_type actual        = tbl.column(c).type();
       if (actual != expected_cudf) {
         SIRIUS_LOG_WARN(
-          "gpu_pipeline_task: operator '{}' output batch {} column {} datatype "
+          "gpu_pipeline_task: operator '{}' (id={}) output batch {} column {} datatype "
           "mismatch: got {}, expected {}",
           op.get_name(),
+          op.get_operator_id(),
           batch_index,
           c,
           cudf::type_to_name(actual),
@@ -168,18 +170,20 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
   auto& local_state = _local_state->cast<gpu_pipeline_task_local_state>();
   auto operator_input_output_data = std::move(local_state._input_data);
   for (auto& op : pipeline->get_operators()) {
-    SIRIUS_LOG_TRACE("Pipeline {}: operator {} executing on {} batches",
+    SIRIUS_LOG_TRACE("Pipeline {}: operator {} (id={}) executing on {} batches",
                      pipeline->get_pipeline_id(),
                      op.get().get_name(),
+                     op.get().get_operator_id(),
                      operator_input_output_data->get_data_batches().size());
     auto start                 = std::chrono::high_resolution_clock::now();
     operator_input_output_data = op.get().execute(*operator_input_output_data, stream);
     auto end                   = std::chrono::high_resolution_clock::now();
     auto duration              = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
     SIRIUS_LOG_TRACE(
-      "Pipeline {}: operator {} produced {} batches, execution time: {:.2f} ms",
+      "Pipeline {}: operator {} (id={}) produced {} batches, execution time: {:.2f} ms",
       pipeline->get_pipeline_id(),
       op.get().get_name(),
+      op.get().get_operator_id(),
       operator_input_output_data ? operator_input_output_data->get_data_batches().size() : 0u,
       duration.count() / 1000.0);
     validate_operator_output_types(operator_input_output_data.get(), op.get());
