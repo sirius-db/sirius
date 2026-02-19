@@ -30,18 +30,53 @@
 //! ```
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
-use nixl_sys::{Agent, AgentConfig, Backend, MemType, XferDescList, XferOp, XferStatus};
+use nixl_sys::{
+    Agent, AgentConfig, Backend, MemType, MemoryRegion, NixlDescriptor, OptArgs,
+    RegistrationHandle, XferDescList, XferOp, XferStatus,
+};
 use tracing::{info, warn};
+
+/// Wrapper for a GPU memory region that implements nixl registration traits.
+#[derive(Debug)]
+struct GpuBufferWrapper {
+    addr: usize,
+    len: usize,
+    device_id: u64,
+}
+
+// SAFETY: GPU pointer addresses can be sent across threads.
+unsafe impl Send for GpuBufferWrapper {}
+unsafe impl Sync for GpuBufferWrapper {}
+
+impl MemoryRegion for GpuBufferWrapper {
+    fn size(&self) -> usize {
+        self.len
+    }
+
+    unsafe fn as_ptr(&self) -> *const u8 {
+        self.addr as *const u8
+    }
+}
+
+impl NixlDescriptor for GpuBufferWrapper {
+    fn mem_type(&self) -> MemType {
+        MemType::Vram
+    }
+    fn device_id(&self) -> u64 {
+        self.device_id
+    }
+}
 
 /// Wraps a nixl Agent with cached peer metadata.
 pub struct NixlExchange {
     agent: Agent,
-    _backend: Backend,
-    local_metadata: Vec<u8>,
+    backend: Backend,
     /// Cache of loaded remote agent metadata: peer_addr → agent_name
     remote_agents: Mutex<HashMap<String, String>>,
+    /// Active registration handles (dropped = deregistered).
+    _registrations: Mutex<Vec<RegistrationHandle>>,
 }
 
 impl NixlExchange {
@@ -77,31 +112,89 @@ impl NixlExchange {
             }
         };
 
-        let local_metadata = match agent.get_local_md() {
-            Ok(md) => md,
-            Err(e) => {
-                warn!(error = %e, "nixl get_local_md failed");
-                return None;
-            }
-        };
-
         info!(
             agent = agent_name,
-            metadata_size = local_metadata.len(),
             "nixl agent initialized with UCX backend"
         );
 
         Some(Self {
             agent,
-            _backend: backend,
-            local_metadata,
+            backend,
             remote_agents: Mutex::new(HashMap::new()),
+            _registrations: Mutex::new(Vec::new()),
         })
     }
 
-    /// Get the local metadata bytes for exchange with peers.
-    pub fn local_metadata(&self) -> &[u8] {
-        &self.local_metadata
+    /// Register GPU memory buffers with the nixl agent.
+    ///
+    /// Must be called before `get_fresh_metadata()` so that metadata
+    /// includes the registered regions. Returns registration handles
+    /// that deregister on drop.
+    pub fn register_gpu_buffers(
+        &self,
+        buffers: &[(usize, usize, u64)], // (addr, len, device_id)
+    ) -> Result<(), String> {
+        let mut opt = OptArgs::new().map_err(|e| format!("OptArgs::new: {e}"))?;
+        opt.add_backend(&self.backend)
+            .map_err(|e| format!("add_backend: {e}"))?;
+
+        let mut regs = self._registrations.lock().unwrap();
+        for &(addr, len, device_id) in buffers {
+            let wrapper = GpuBufferWrapper {
+                addr,
+                len,
+                device_id,
+            };
+            let handle = self
+                .agent
+                .register_memory(&wrapper, Some(&opt))
+                .map_err(|e| format!("register_memory(addr=0x{addr:x}, len={len}): {e}"))?;
+            regs.push(handle);
+        }
+
+        info!(
+            num_buffers = buffers.len(),
+            "registered GPU buffers with nixl agent"
+        );
+        Ok(())
+    }
+
+    /// Get fresh metadata that includes any newly registered memory.
+    pub fn get_fresh_metadata(&self) -> Result<Vec<u8>, String> {
+        self.agent
+            .get_local_md()
+            .map_err(|e| format!("get_local_md: {e}"))
+    }
+
+    /// Load remote metadata, invalidating any cached entry for this peer first.
+    ///
+    /// Use this instead of `load_remote_metadata` when the peer may have
+    /// registered new memory since the last exchange.
+    pub fn force_load_remote_metadata(
+        &self,
+        peer_addr: &str,
+        remote_metadata: &[u8],
+    ) -> Result<String, String> {
+        let mut cache = self.remote_agents.lock().unwrap();
+
+        // Invalidate old entry if present.
+        if let Some(old_name) = cache.remove(peer_addr) {
+            let _ = self.agent.invalidate_remote_md(&old_name);
+        }
+
+        let remote_name = self
+            .agent
+            .load_remote_md(remote_metadata)
+            .map_err(|e| format!("load_remote_md: {e}"))?;
+
+        info!(
+            peer = peer_addr,
+            remote_agent = %remote_name,
+            "loaded remote nixl metadata (forced)"
+        );
+
+        cache.insert(peer_addr.to_string(), remote_name.clone());
+        Ok(remote_name)
     }
 
     /// Load a remote peer's metadata. Returns the remote agent name.
@@ -192,7 +285,7 @@ impl NixlExchange {
         &self,
         gpu_ptrs: &[(usize, usize)], // (addr, len) pairs
         device_id: u64,
-    ) -> Result<XferDescList, String> {
+    ) -> Result<XferDescList<'_>, String> {
         let mut descs =
             XferDescList::new(MemType::Vram).map_err(|e| format!("XferDescList::new: {e}"))?;
         for &(addr, len) in gpu_ptrs {
@@ -232,15 +325,12 @@ mod tests {
 
     #[test]
     fn test_nixl_exchange_initialization() {
-        // Test that NixlExchange can be created with a valid agent name.
         let agent_name = "test-agent";
         let result = NixlExchange::try_new(agent_name);
-
-        // Should succeed (or return None if nixl library not available).
-        // We don't assert success because nixl may not be available in test environment.
         match result {
             Some(exchange) => {
-                assert!(!exchange.local_metadata().is_empty());
+                let md = exchange.get_fresh_metadata().unwrap();
+                assert!(!md.is_empty());
             }
             None => {
                 // Expected when nixl is not available
@@ -249,10 +339,10 @@ mod tests {
     }
 
     #[test]
-    fn test_local_metadata_retrieval() {
+    fn test_fresh_metadata_retrieval() {
         if let Some(exchange) = NixlExchange::try_new("metadata-test") {
-            let metadata = exchange.local_metadata();
-            assert!(!metadata.is_empty(), "local metadata should not be empty");
+            let md = exchange.get_fresh_metadata().unwrap();
+            assert!(!md.is_empty(), "fresh metadata should not be empty");
         }
     }
 

@@ -38,4 +38,22 @@ message PExchangeNixlMetadataResponse {
   string remote_agent_name = 2;               // Receiver's nixl agent name
   int32 status_code = 3;                      // 0 = success, non-zero = error
   repeated string error_msgs = 4;             // Error messages (if any)
+  bytes nixl_metadata = 5;                    // Receiver's nixl agent metadata
+}
+
+// Notification: sender tells receiver that nixl transfer is complete.
+message PNixlTransferCompleteRequest {
+  bytes query_id_hi = 1;                      // Query ID (high 8 bytes LE)
+  bytes query_id_lo = 2;                      // Query ID (low 8 bytes LE)
+  int32 node_id = 3;                          // Exchange node ID
+  repeated PGpuBufferDesc dst_buffers = 4;    // Buffers that now have data
+  repeated PColumnInfo columns = 5;           // Column schema
+  uint32 num_rows = 6;                        // Row count
+  int32 sender_id = 7;                        // Sender's ID
+  bytes arrow_ipc_data = 8;                   // Arrow IPC bytes for PBlock construction
+}
+
+message PNixlTransferCompleteResponse {
+  int32 status_code = 1;                      // 0 = success
+  repeated string error_msgs = 2;
 }

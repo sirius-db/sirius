@@ -28,3 +28,4 @@ lz4_flex = "0.11"
 zstd = "0.13"
 tokio-stream = "0.1"
 nixl-sys = { version = "0.10", optional = true }
+libc = "0.2"

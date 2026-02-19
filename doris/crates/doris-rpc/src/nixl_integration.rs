@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 #[cfg(feature = "nixl")]
-use crate::nixl_exchange::{GpuBufferDesc, NixlExchange, NixlMetadataExchange};
+use crate::nixl_exchange::{GpuBufferDesc, NixlExchange};
 use crate::exchange_sender::ExchangeDest;
 
 /// Result of attempting to extract GPU buffer information from execution result.
@@ -62,6 +62,15 @@ pub fn detect_execution_location(
         // the engine can provide the raw GPU addresses.
         match _engine.get_last_gpu_result_buffers() {
             Ok(Some(gpu_info)) => {
+                for (i, &(addr, len, dev)) in gpu_info.buffer_addrs.iter().enumerate() {
+                    tracing::info!(
+                        buf_idx = i,
+                        addr = format_args!("0x{:x}", addr),
+                        len,
+                        device_id = dev,
+                        "detect_execution_location: GPU buffer"
+                    );
+                }
                 tracing::info!(
                     num_buffers = gpu_info.buffer_addrs.len(),
                     num_rows = gpu_info.num_rows,
@@ -107,13 +116,8 @@ pub async fn send_exchange_with_nixl(
 ) -> Result<(), String> {
     match location {
         ExecutionLocation::Cpu(ipc_bytes) => {
-            // Use standard bRPC path.
             crate::exchange_sender::send_exchange_result(
-                &ipc_bytes,
-                destinations,
-                query_id,
-                node_id,
-                sender_id,
+                &ipc_bytes, destinations, query_id, node_id, sender_id,
             )
             .await
         }
@@ -124,7 +128,6 @@ pub async fn send_exchange_with_nixl(
             schema_ipc: _,
             ipc_bytes,
         } => {
-            // GPU-direct path: send metadata + initiate nixl transfers.
             let Some(agent) = nixl_agent else {
                 tracing::warn!("GPU result but no nixl agent, falling back to bRPC");
                 return crate::exchange_sender::send_exchange_result(
@@ -132,17 +135,12 @@ pub async fn send_exchange_with_nixl(
                 ).await;
             };
 
-            let local_md = agent.local_metadata().to_vec();
-            let exchange_msg = NixlMetadataExchange {
-                metadata: local_md,
-                buffer_descs: buffers.clone(),
-                column_info: column_info.clone(),
-                num_rows,
-            };
-
             // Try nixl GPU-direct for each destination, fall back to bRPC on failure.
             for dest in destinations {
-                if let Err(e) = send_nixl_to_peer(agent, &exchange_msg, dest, &buffers).await {
+                if let Err(e) = send_nixl_to_peer(
+                    agent, &buffers, &column_info, num_rows,
+                    &ipc_bytes, dest, query_id, node_id, sender_id,
+                ).await {
                     tracing::warn!(
                         error = %e,
                         dest = %dest.brpc_addr,
@@ -161,20 +159,70 @@ pub async fn send_exchange_with_nixl(
 }
 
 /// Send GPU data to a single peer via nixl.
+///
+/// Full flow: register buffers → exchange metadata → load peer metadata →
+/// transfer → notify receiver of completion.
 #[cfg(feature = "nixl")]
 async fn send_nixl_to_peer(
     agent: &NixlExchange,
-    metadata: &NixlMetadataExchange,
-    dest: &ExchangeDest,
     src_buffers: &[GpuBufferDesc],
+    column_info: &[(String, i32)],
+    num_rows: u32,
+    ipc_bytes: &[u8],
+    dest: &ExchangeDest,
+    query_id: (i64, i64),
+    node_id: i32,
+    sender_id: i32,
 ) -> Result<(), String> {
+    use doris_proto::nixl::{
+        NixlMetadataServiceClient, PColumnInfo, PExchangeNixlMetadataRequest,
+        PGpuBufferDesc, PNixlTransferCompleteRequest,
+    };
     use tracing::info;
 
-    // Step 1: Exchange metadata with remote BE via gRPC.
     let grpc_addr = format!("http://{}", dest.brpc_addr);
-    let response = call_exchange_nixl_metadata(&grpc_addr, metadata).await?;
 
-    // Check response status.
+    // Step 1: Register sender's GPU result buffers with nixl agent.
+    let buf_tuples: Vec<_> = src_buffers.iter().map(|b| (b.addr, b.len, b.device_id)).collect();
+    agent.register_gpu_buffers(&buf_tuples)?;
+
+    // Step 2: Get fresh metadata (includes newly registered buffers).
+    let fresh_md = agent.get_fresh_metadata()?;
+
+    // Step 3: Call exchange_metadata RPC on receiver.
+    let request = PExchangeNixlMetadataRequest {
+        nixl_metadata: fresh_md,
+        src_buffers: src_buffers
+            .iter()
+            .map(|b| PGpuBufferDesc {
+                addr: b.addr as u64,
+                len: b.len as u64,
+                device_id: b.device_id,
+            })
+            .collect(),
+        columns: column_info
+            .iter()
+            .map(|(name, type_id)| PColumnInfo {
+                name: name.clone(),
+                type_id: *type_id,
+            })
+            .collect(),
+        num_rows,
+        query_id_hi: query_id.0.to_le_bytes().to_vec(),
+        query_id_lo: query_id.1.to_le_bytes().to_vec(),
+        node_id,
+    };
+
+    let mut client = NixlMetadataServiceClient::connect(grpc_addr.clone())
+        .await
+        .map_err(|e| format!("connect to {grpc_addr}: {e}"))?;
+
+    let response = client
+        .exchange_metadata(request)
+        .await
+        .map_err(|e| format!("exchange_metadata RPC: {e}"))?
+        .into_inner();
+
     if response.status_code != 0 {
         return Err(format!(
             "nixl metadata exchange failed: {}",
@@ -190,23 +238,29 @@ async fn send_nixl_to_peer(
         ));
     }
 
-    // Step 2: Load remote agent metadata (already done by receiver, cached).
-    let remote_name = &response.remote_agent_name;
+    // Step 4: Load receiver's metadata (includes their registered dst buffers).
+    let remote_name = agent.force_load_remote_metadata(
+        &dest.brpc_addr,
+        &response.nixl_metadata,
+    )?;
 
-    // Step 3: Create descriptor lists for nixl transfer.
-    let device_id = src_buffers.first().map(|b| b.device_id).unwrap_or(0);
-    let src_ptrs: Vec<_> = src_buffers.iter().map(|b| (b.addr, b.len)).collect();
-    let src_descs = agent.create_gpu_descs(&src_ptrs, device_id)?;
+    // Step 5: Create descriptor lists and execute transfer.
+    // Scope the XferDescList values to drop them before the async .await below
+    // (they contain raw pointers that are !Send).
+    {
+        let device_id = src_buffers.first().map(|b| b.device_id).unwrap_or(0);
+        let src_ptrs: Vec<_> = src_buffers.iter().map(|b| (b.addr, b.len)).collect();
+        let src_descs = agent.create_gpu_descs(&src_ptrs, device_id)?;
 
-    let dst_ptrs: Vec<_> = response
-        .dst_buffers
-        .iter()
-        .map(|b| (b.addr as usize, b.len as usize))
-        .collect();
-    let dst_descs = agent.create_gpu_descs(&dst_ptrs, device_id)?;
+        let dst_ptrs: Vec<_> = response
+            .dst_buffers
+            .iter()
+            .map(|b| (b.addr as usize, b.len as usize))
+            .collect();
+        let dst_descs = agent.create_gpu_descs(&dst_ptrs, device_id)?;
 
-    // Step 4: Post the transfer request (blocking until complete).
-    agent.transfer_gpu_to_gpu(&src_descs, &dst_descs, remote_name)?;
+        agent.transfer_gpu_to_gpu(&src_descs, &dst_descs, &remote_name)?;
+    }
 
     info!(
         dest = %dest.brpc_addr,
@@ -214,55 +268,46 @@ async fn send_nixl_to_peer(
         "nixl GPU-direct transfer complete"
     );
 
-    Ok(())
-}
-
-/// Call remote BE's ExchangeMetadata gRPC method.
-#[cfg(feature = "nixl")]
-async fn call_exchange_nixl_metadata(
-    grpc_addr: &str,
-    metadata: &NixlMetadataExchange,
-) -> Result<doris_proto::nixl::PExchangeNixlMetadataResponse, String> {
-    use doris_proto::nixl::{
-        NixlMetadataServiceClient, PColumnInfo, PExchangeNixlMetadataRequest, PGpuBufferDesc,
-    };
-
-    let request = PExchangeNixlMetadataRequest {
-        nixl_metadata: metadata.metadata.clone(),
-        src_buffers: metadata
-            .buffer_descs
-            .iter()
-            .map(|b| PGpuBufferDesc {
-                addr: b.addr as u64,
-                len: b.len as u64,
-                device_id: b.device_id,
-            })
-            .collect(),
-        columns: metadata
-            .column_info
+    // Step 6: Notify receiver that transfer is complete.
+    // Include Arrow IPC bytes so receiver can construct a proper PBlock
+    // using the same arrow_ipc_to_pblock path as bRPC (avoiding type ID mismatches
+    // between DuckDB LogicalTypeId and Doris PGenericType::TypeId).
+    let complete_req = PNixlTransferCompleteRequest {
+        query_id_hi: query_id.0.to_le_bytes().to_vec(),
+        query_id_lo: query_id.1.to_le_bytes().to_vec(),
+        node_id,
+        dst_buffers: response.dst_buffers,
+        columns: column_info
             .iter()
             .map(|(name, type_id)| PColumnInfo {
                 name: name.clone(),
                 type_id: *type_id,
             })
             .collect(),
-        num_rows: metadata.num_rows,
-        query_id_hi: vec![],
-        query_id_lo: vec![],
-        node_id: 0,
+        num_rows,
+        sender_id,
+        arrow_ipc_data: ipc_bytes.to_vec(),
     };
 
-    let mut client = NixlMetadataServiceClient::connect(grpc_addr.to_string())
+    let mut client2 = NixlMetadataServiceClient::connect(grpc_addr.clone())
         .await
-        .map_err(|e| format!("connect to {}: {e}", grpc_addr))?;
+        .map_err(|e| format!("connect for transfer_complete: {e}"))?;
 
-    let response = client
-        .exchange_metadata(request)
+    let tc_response = client2
+        .transfer_complete(complete_req)
         .await
-        .map_err(|e| format!("exchange_metadata RPC: {e}"))?
+        .map_err(|e| format!("transfer_complete RPC: {e}"))?
         .into_inner();
 
-    Ok(response)
+    if tc_response.status_code != 0 {
+        return Err(format!(
+            "transfer_complete failed: {}",
+            tc_response.error_msgs.join("; ")
+        ));
+    }
+
+    info!(dest = %dest.brpc_addr, "nixl transfer_complete acknowledged by receiver");
+    Ok(())
 }
 
 /// Non-nixl version: always use bRPC.

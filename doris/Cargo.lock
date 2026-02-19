@@ -1093,6 +1093,7 @@ dependencies = [
  "dashmap",
  "doris-proto",
  "doris-thrift",
+ "libc",
  "lz4_flex",
  "nixl-sys",
  "plan-translator",

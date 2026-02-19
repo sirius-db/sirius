@@ -52,6 +52,7 @@ services:
     image: ubuntu:22.04
     container_name: sirius-be
     hostname: sirius-be
+    ipc: host
     depends_on:
       doris-fe:
         condition: service_healthy

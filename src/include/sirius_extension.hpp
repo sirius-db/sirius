@@ -67,6 +67,13 @@ class SiriusExtension : public Extension {
                                                          TableFunctionBindInput& input,
                                                          vector<LogicalType>& return_types,
                                                          vector<string>& names);
+  static void GPUAllocateBuffersFunction(ClientContext& context,
+                                          TableFunctionInput& data_p,
+                                          DataChunk& output);
+  static unique_ptr<FunctionData> GPUAllocateBuffersBind(ClientContext& context,
+                                                          TableFunctionBindInput& input,
+                                                          vector<LogicalType>& return_types,
+                                                          vector<string>& names);
 
   static bool buffer_is_initialized;
 };

@@ -171,8 +171,16 @@ fn serialize_result_batch(rows: &[Vec<u8>], packet_seq: i64) -> Result<Vec<u8>, 
 /// `local_params[0]`) to call `fetch_data`, not the query-level `query_id`.
 /// Fall back to `query_id` if `local_params` is empty.
 fn extract_finst_id(params: &TPipelineFragmentParams) -> FinstId {
-    // Doris 4.0 (Nereids pipeline): FE uses query_id for fetch_data.
-    // Doris 3.0 used local_params[0].fragment_instance_id, but 4.0 uses query_id directly.
+    // FE calls fetch_data with local_params[0].fragment_instance_id, not query_id.
+    // For single-fragment queries these are often the same, but for multi-fragment
+    // plans the fragment_instance_id differs from query_id by an offset.
+    if let Some(lp) = params.local_params.as_ref().and_then(|lp| lp.first()) {
+        return FinstId {
+            hi: lp.fragment_instance_id.hi,
+            lo: lp.fragment_instance_id.lo,
+        };
+    }
+    // Fallback to query_id if no local_params available.
     FinstId {
         hi: params.query_id.hi,
         lo: params.query_id.lo,
@@ -1764,7 +1772,11 @@ pub async fn start_grpc_server(
     #[cfg(feature = "nixl")]
     {
         use doris_proto::nixl::NixlMetadataServiceServer;
-        let nixl_handler = super::nixl_service::NixlMetadataServiceHandler::new(nixl_agent_for_service, engine_for_service);
+        let nixl_handler = super::nixl_service::NixlMetadataServiceHandler::new(
+            nixl_agent_for_service,
+            engine_for_service,
+            exchange_buffer.clone(),
+        );
         server_builder = server_builder.add_service(NixlMetadataServiceServer::new(nixl_handler));
         info!("registered NixlMetadataService on gRPC server");
     }

@@ -687,6 +687,75 @@ void SiriusExtension::GPUBufferInitFunction(ClientContext& context,
   data.finished = true;
 }
 
+// --- gpu_allocate_buffers(sizes BIGINT[], device_id INT) table function ---
+// Allocates GPU memory via GPUBufferManager for nixl destination buffers.
+
+struct GPUAllocateBuffersData : public TableFunctionData {
+  bool finished = false;
+  vector<int64_t> sizes;
+  int device_id = 0;
+};
+
+unique_ptr<FunctionData> SiriusExtension::GPUAllocateBuffersBind(
+  ClientContext& context,
+  TableFunctionBindInput& input,
+  vector<LogicalType>& return_types,
+  vector<string>& names)
+{
+  auto result = make_uniq<GPUAllocateBuffersData>();
+
+  // First arg: LIST of sizes (BIGINT[]).
+  auto& sizes_value = input.inputs[0];
+  auto& list_children = ListValue::GetChildren(sizes_value);
+  for (auto& child : list_children) {
+    result->sizes.push_back(BigIntValue::Get(child));
+  }
+
+  // Second arg: device_id (INT).
+  result->device_id = IntegerValue::Get(input.inputs[1]);
+
+  return_types = {
+    LogicalType::INTEGER,  // buffer_id
+    LogicalType::BIGINT,   // addr
+    LogicalType::BIGINT,   // len
+  };
+  names = {"buffer_id", "addr", "len"};
+  return std::move(result);
+}
+
+void SiriusExtension::GPUAllocateBuffersFunction(
+  ClientContext& context,
+  TableFunctionInput& data_p,
+  DataChunk& output)
+{
+  auto& data = data_p.bind_data->CastNoConst<GPUAllocateBuffersData>();
+  if (data.finished) {
+    output.SetCardinality(0);
+    return;
+  }
+
+  if (!buffer_is_initialized) {
+    throw InvalidInputException("GPU buffer manager not initialized. Call gpu_buffer_init first.");
+  }
+
+  auto& bm = GPUBufferManager::GetInstance();
+  idx_t count = MinValue<idx_t>(data.sizes.size(), STANDARD_VECTOR_SIZE);
+  output.SetCardinality(count);
+
+  for (idx_t i = 0; i < count; i++) {
+    size_t alloc_size = static_cast<size_t>(data.sizes[i]);
+    // Non-caching allocation (tracked in allocation_table, can be freed).
+    auto* ptr = bm.customCudaMalloc<uint8_t>(alloc_size, data.device_id, false);
+    auto addr = reinterpret_cast<uintptr_t>(ptr);
+
+    output.SetValue(0, i, Value::INTEGER(static_cast<int32_t>(i)));
+    output.SetValue(1, i, Value::BIGINT(static_cast<int64_t>(addr)));
+    output.SetValue(2, i, Value::BIGINT(static_cast<int64_t>(alloc_size)));
+  }
+
+  data.finished = true;
+}
+
 // --- sirius_get_last_gpu_buffers() table function ---
 
 struct GetLastGPUBuffersData : public TableFunctionData {
@@ -780,6 +849,13 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
                                      GetLastGPUBuffersBind);
   CreateTableFunctionInfo get_last_gpu_buffers_info(get_last_gpu_buffers);
   catalog.CreateTableFunction(transaction, get_last_gpu_buffers_info);
+
+  TableFunction gpu_allocate_buffers("gpu_allocate_buffers",
+                                     {LogicalType::LIST(LogicalType::BIGINT), LogicalType::INTEGER},
+                                     GPUAllocateBuffersFunction,
+                                     GPUAllocateBuffersBind);
+  CreateTableFunctionInfo gpu_allocate_buffers_info(gpu_allocate_buffers);
+  catalog.CreateTableFunction(transaction, gpu_allocate_buffers_info);
 }
 
 static void SetUsePinMemory(ClientContext& context, SetScope scope, Value& parameter)
