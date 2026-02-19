@@ -32,7 +32,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use nixl_sys::{Agent, AgentConfig, Backend, MemType, Params, XferDescList, XferOp, XferStatus};
+use nixl_sys::{Agent, AgentConfig, Backend, MemType, XferDescList, XferOp, XferStatus};
 use tracing::{info, warn};
 
 /// Wraps a nixl Agent with cached peer metadata.
@@ -50,7 +50,10 @@ impl NixlExchange {
     /// Initializes the UCX backend for GPU-direct transfers.
     /// Returns `None` if nixl initialization fails (fallback to bRPC).
     pub fn try_new(agent_name: &str) -> Option<Self> {
-        let agent = match Agent::new(agent_name) {
+        let mut cfg = AgentConfig::default();
+        // Default pthr_delay_us=0 causes 100% CPU spin. Use 100µs polling interval.
+        cfg.pthr_delay_us = 100;
+        let agent = match Agent::new_configured(agent_name, &cfg) {
             Ok(a) => a,
             Err(e) => {
                 warn!(error = %e, "nixl Agent::new failed, GPU-direct exchange disabled");
@@ -59,7 +62,13 @@ impl NixlExchange {
         };
 
         // Create UCX backend for GPU transfers
-        let params = Params::new();
+        let (_, params) = match agent.get_plugin_params("UCX") {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(error = %e, "nixl get_plugin_params(UCX) failed");
+                return None;
+            }
+        };
         let backend = match agent.create_backend("UCX", &params) {
             Ok(b) => b,
             Err(e) => {
@@ -167,15 +176,11 @@ impl NixlExchange {
                 .get_xfer_status(&req)
                 .map_err(|e| format!("get_xfer_status: {e}"))?
             {
-                XferStatus::Done => {
+                XferStatus::Success => {
                     info!("nixl transfer complete");
                     return Ok(());
                 }
-                XferStatus::Error => {
-                    return Err("nixl transfer failed".to_string());
-                }
-                _ => {
-                    // Still in progress — yield briefly
+                XferStatus::InProgress => {
                     std::thread::yield_now();
                 }
             }
@@ -191,9 +196,7 @@ impl NixlExchange {
         let mut descs =
             XferDescList::new(MemType::Vram).map_err(|e| format!("XferDescList::new: {e}"))?;
         for &(addr, len) in gpu_ptrs {
-            descs
-                .add_desc(addr, len, device_id)
-                .map_err(|e| format!("add_desc: {e}"))?;
+            descs.add_desc(addr, len, device_id);
         }
         Ok(descs)
     }

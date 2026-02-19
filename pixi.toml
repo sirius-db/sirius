@@ -54,13 +54,14 @@ CUDAARCHS = "75-real;80-real;86-real;90a-real"
 rust = ">=1.85"
 libprotobuf = ">=5"
 thrift-compiler = ">=0.22"
+clangdev = "*"
 
 [feature.doris.tasks]
 doris-check = { cmd = "cargo check", cwd = "doris", description = "Check doris workspace" }
 doris-build = { cmd = "cargo build --release", cwd = "doris", description = "Build doris workspace" }
 doris-test = { cmd = "cargo test", cwd = "doris", description = "Test doris workspace" }
 doris-build-duckdb = { cmd = "cargo build --release --features sirius-ffi/duckdb-bundled", cwd = "doris", description = "Build doris workspace with bundled DuckDB engine" }
-doris-build-nixl = { cmd = "cargo build --release --features sirius-ffi/duckdb-bundled,sirius-doris-be/nixl", cwd = "doris", description = "Build doris workspace with DuckDB + nixl GPU exchange" }
+doris-build-nixl = { cmd = "NIXL_PREFIX=$PIXI_PROJECT_ROOT/doris/thirdparty/nixl-install NIXL_NO_STUBS_FALLBACK=1 cargo build --release --features sirius-ffi/duckdb-bundled,sirius-doris-be/nixl", cwd = "doris", description = "Build doris workspace with DuckDB + nixl GPU exchange" }
 # Start Sirius GPU BE with offset ports (for running alongside regular Doris BE)
 sirius-be = { cmd = "doris/target/release/sirius-doris-be --heartbeat-port 19050 --be-port 19060 --brpc-port 18060 --http-port 18040 --arrow-flight-port 18071 --fe 127.0.0.1:9030", description = "Run Sirius GPU BE with offset ports (coexists with regular BE)" }
 
@@ -252,9 +253,77 @@ doris-be = { cmd = """bash -c 'set -e
 doris-be-show-be = { cmd = "bash -c 'mysql -h 127.0.0.1 -P 9030 -u root -e \"SHOW BACKENDS\\G\"'", description = "Show registered backends" }
 doris-be-add-be = { cmd = "bash -c 'mysql -h 127.0.0.1 -P 9030 -u root -e \"ALTER SYSTEM ADD BACKEND \\\"127.0.0.1:9050\\\"\"'", description = "Register regular BE with FE" }
 
+# NIXL GPU-direct exchange: build deps for building the nixl C++ library
+[feature.nixl.dependencies]
+ucx = ">=1.20"
+meson = ">=1.0"
+pkg-config = "*"
+clangdev = "*"
+
+[feature.nixl.tasks]
+nixl-build = { cmd = """bash -c 'set -e
+  NIXL_SRC=doris/thirdparty/nixl
+
+  if [ -f "$CONDA_PREFIX/lib/libnixl.so" ]; then
+    echo "nixl already installed in conda prefix"
+    exit 0
+  fi
+
+  echo "==> Cloning nixl..."
+  if [ ! -d "$NIXL_SRC" ]; then
+    git clone --depth 1 https://github.com/ai-dynamo/nixl.git "$NIXL_SRC"
+  fi
+
+  cd "$NIXL_SRC"
+
+  echo "==> Patching out Python bindings (no pybind11 needed)..."
+  sed -i "/subdir..python/s/^/# /" src/bindings/meson.build
+
+  echo "==> Patching UCX GPU Device API version check (1.21 -> 1.20)..."
+  sed -i "s/UCP_VERSION(1, 21)/UCP_VERSION(1, 20)/" meson.build
+
+  echo "==> Creating stub gdaki.cuh (UCX conda package missing IB CUDA header)..."
+  mkdir -p "$CONDA_PREFIX/include/uct/ib/mlx5/gdaki"
+  cat > "$CONDA_PREFIX/include/uct/ib/mlx5/gdaki/gdaki.cuh" << STUB
+#ifndef UCT_IB_MLX5_GDAKI_CUH
+#define UCT_IB_MLX5_GDAKI_CUH
+#include <uct/api/uct_def.h>
+#include <uct/api/device/uct_device_types.h>
+#include <ucs/sys/device_code.h>
+#include <ucs/type/status.h>
+typedef struct { char _pad; } uct_rc_gda_completion_t;
+template<ucs_device_level_t level> UCS_F_DEVICE ucs_status_t uct_rc_mlx5_gda_ep_put_single(uct_device_ep_h, const uct_device_mem_element_t *, const void *, uint64_t, size_t, uint64_t, uct_device_completion_t *) { return UCS_ERR_UNSUPPORTED; }
+template<ucs_device_level_t level> UCS_F_DEVICE ucs_status_t uct_rc_mlx5_gda_ep_put_multi(uct_device_ep_h, const uct_device_mem_element_t *, unsigned, void *const *, const uint64_t *, const size_t *, uint64_t, uint64_t, uint64_t, uct_device_completion_t *) { return UCS_ERR_UNSUPPORTED; }
+template<ucs_device_level_t level> UCS_F_DEVICE ucs_status_t uct_rc_mlx5_gda_ep_put_multi_partial(uct_device_ep_h, const uct_device_mem_element_t *, const unsigned *, unsigned, void *const *, const uint64_t *, const size_t *, const size_t *, const size_t *, unsigned, uint64_t, uint64_t, uint64_t, uct_device_completion_t *) { return UCS_ERR_UNSUPPORTED; }
+template<ucs_device_level_t level> UCS_F_DEVICE ucs_status_t uct_rc_mlx5_gda_ep_atomic_add(uct_device_ep_h, const uct_device_mem_element_t *, uint64_t, uint64_t, uint64_t, uct_device_completion_t *) { return UCS_ERR_UNSUPPORTED; }
+template<ucs_device_level_t level> UCS_F_DEVICE void uct_rc_mlx5_gda_ep_progress(uct_device_ep_h) {}
+template<ucs_device_level_t level> UCS_F_DEVICE ucs_status_t uct_rc_mlx5_gda_ep_check_completion(uct_device_ep_h, uct_device_completion_t *) { return UCS_ERR_UNSUPPORTED; }
+#endif
+STUB
+
+  echo "==> Building nixl with meson (GPU Device API enabled)..."
+  rm -rf builddir
+  meson setup builddir --prefix="$CONDA_PREFIX" --buildtype=release \
+    -Ducx_path=$CONDA_PREFIX \
+    -Dcudapath_inc=$CONDA_PREFIX/targets/x86_64-linux/include \
+    -Dcudapath_lib=$CONDA_PREFIX/targets/x86_64-linux/lib \
+    -Dcudapath_stub=$CONDA_PREFIX/targets/x86_64-linux/lib/stubs \
+    -Drust=false \
+    -Denable_plugins=UCX \
+    -Dbuild_tests=false \
+    -Dbuild_examples=false
+  cd builddir
+  ninja -j$(nproc)
+  ninja install
+
+  echo "==> nixl installed to $CONDA_PREFIX"
+  ls -la "$CONDA_PREFIX/lib/libnixl*"
+'""", description = "Build nixl C++ library from source into conda prefix" }
+
 [environments]
 default = ["cuda13"]
 cuda12 = ["cuda12"]
 doris = ["cuda13", "doris"]
+doris-nixl = ["cuda13", "doris", "nixl"]
 doris-fe = ["doris-fe"]
 doris-be = ["doris-be"]

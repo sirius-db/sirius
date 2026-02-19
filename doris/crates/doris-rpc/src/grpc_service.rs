@@ -18,7 +18,7 @@ use result_formatter::result_store::{FinstId, ResultStore};
 use sirius_ffi::SiriusEngine;
 
 use super::exchange_buffer::{ExchangeBuffer, ExchangeKey};
-use super::exchange_sender::{self, ExchangeDest};
+use super::exchange_sender::ExchangeDest;
 use super::heartbeat_service::BeState;
 use super::pblock_decoder;
 
@@ -499,6 +499,60 @@ fn merge_fragment_plans(
         }
     }
 
+    // Second pass: if there are exchange_root fragments remaining, merge them with
+    // the now-merged intermediates. The exchange_root is a pure EXCHANGE_NODE(0 children)
+    // that collects results. Replace its plan with the merged intermediate's plan.
+    // Preserve the exchange_root's local_params (FE uses its fragment_instance_id for fetch_data).
+    if !exchange_root_fragments.is_empty() && !intermediate_fragments.is_empty() {
+        let intermediate_nodes: Vec<_> = intermediate_fragments
+            .first()
+            .and_then(|p| p.fragment.as_ref())
+            .and_then(|f| f.plan.as_ref())
+            .map(|p| p.nodes.clone())
+            .unwrap_or_default();
+
+        for params in &mut exchange_root_fragments {
+            if let Some(plan) = params
+                .fragment
+                .as_mut()
+                .and_then(|f| f.plan.as_mut())
+            {
+                // Replace the root EXCHANGE_NODE with the merged intermediate's plan.
+                let mut merged_nodes = Vec::new();
+                for node in &plan.nodes {
+                    if node.node_type == TPlanNodeType::EXCHANGE_NODE && node.num_children == 0 {
+                        merged_nodes.extend_from_slice(&intermediate_nodes);
+                    } else {
+                        merged_nodes.push(node.clone());
+                    }
+                }
+                plan.nodes = merged_nodes;
+            }
+
+            // Copy file_scan_params and additional local_params from intermediate.
+            if let Some(inter) = intermediate_fragments.first() {
+                if let Some(inter_scan) = &inter.file_scan_params {
+                    let merged_scan = params
+                        .file_scan_params
+                        .get_or_insert_with(Default::default);
+                    for (k, v) in inter_scan {
+                        merged_scan.entry(*k).or_insert_with(|| v.clone());
+                    }
+                }
+                // Append intermediate's local_params (scan ranges) but keep
+                // exchange_root's local_params[0] first (has the result instance_id).
+                if let Some(inter_local) = &inter.local_params {
+                    let merged_local = params.local_params.get_or_insert_with(Vec::new);
+                    for lp in inter_local {
+                        merged_local.push(lp.clone());
+                    }
+                }
+            }
+        }
+
+        return exchange_root_fragments;
+    }
+
     intermediate_fragments
 }
 
@@ -818,6 +872,8 @@ impl PBackendService for PBackendServiceHandler {
                 };
                 let store = self.result_store.clone();
                 let buffer = self.exchange_buffer.clone();
+                #[cfg(feature = "nixl")]
+                let nixl_agent = self.nixl_agent.clone();
 
                 // Spawn async task: wait for exchange data, decode, load, execute.
                 tokio::spawn(async move {
@@ -1013,27 +1069,32 @@ impl PBackendService for PBackendServiceHandler {
                     // Check if this exchange fragment also needs to forward results.
                     let exchange_dests = extract_exchange_destinations(&params);
 
-                    let exec_result = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
+                    let exec_result = tokio::task::spawn_blocking(move || -> Result<crate::nixl_integration::ExecutionLocation, String> {
                         let engine = engine.lock().unwrap();
                         let mut ipc_bytes = execute_plan(&engine, exec_plan)?;
                         if let Some(names) = output_names {
                             ipc_bytes = project_ipc_columns(&ipc_bytes, &names, None)?;
                         }
-                        Ok(ipc_bytes)
+                        Ok(crate::nixl_integration::detect_execution_location(ipc_bytes, &engine))
                     })
                     .await;
 
                     match exec_result {
-                        Ok(Ok(ipc_bytes)) => {
+                        Ok(Ok(location)) => {
                             if let Some((dest_node_id, dests)) = exchange_dests {
                                 let query_id = (params.query_id.hi, params.query_id.lo);
-                                if let Err(e) = exchange_sender::send_exchange_result(
-                                    &ipc_bytes, &dests, query_id, dest_node_id, 0,
+                                if let Err(e) = crate::nixl_integration::send_exchange_with_nixl(
+                                    #[cfg(feature = "nixl")]
+                                    nixl_agent.as_ref(),
+                                    #[cfg(not(feature = "nixl"))]
+                                    None,
+                                    location, &dests, query_id, dest_node_id, 0,
                                 ).await {
                                     warn!(error = %e, %finst_id, "exchange forward failed");
                                 }
                                 info!(%finst_id, "exchange fragment forward complete");
                             } else {
+                                let ipc_bytes = location.into_ipc_bytes();
                                 if let Err(e) = store.store_ipc_result(finst_id, &ipc_bytes) {
                                     warn!(error = %e, %finst_id, "failed to store exchange result");
                                 } else {
@@ -1159,20 +1220,20 @@ impl PBackendService for PBackendServiceHandler {
             let exchange_dests = extract_exchange_destinations(params);
 
             // Sirius/DuckDB execution is blocking — run off the async runtime.
-            let exec_result = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
+            let exec_result = tokio::task::spawn_blocking(move || -> Result<crate::nixl_integration::ExecutionLocation, String> {
                 let engine = engine.lock().unwrap();
                 let mut ipc_bytes = execute_plan(&engine, exec_plan)?;
                 if let Some(names) = output_names {
                     ipc_bytes = project_ipc_columns(&ipc_bytes, &names, output_indices.as_deref())?;
                 }
-                Ok(ipc_bytes)
+                Ok(crate::nixl_integration::detect_execution_location(ipc_bytes, &engine))
             })
             .await;
 
             match exec_result {
-                Ok(Ok(ipc_bytes)) => {
+                Ok(Ok(location)) => {
                     if let Some((dest_node_id, dests)) = exchange_dests {
-                        // Send result to remote BEs via bRPC transmit_block.
+                        // Send result to remote BEs via nixl GPU-direct or bRPC fallback.
                         let query_id = (params.query_id.hi, params.query_id.lo);
                         let sender_id = params
                             .local_params
@@ -1186,8 +1247,12 @@ impl PBackendService for PBackendServiceHandler {
                             num_dests = dests.len(),
                             "sending execution result to exchange destinations"
                         );
-                        if let Err(e) = exchange_sender::send_exchange_result(
-                            &ipc_bytes,
+                        if let Err(e) = crate::nixl_integration::send_exchange_with_nixl(
+                            #[cfg(feature = "nixl")]
+                            self.nixl_agent.as_ref(),
+                            #[cfg(not(feature = "nixl"))]
+                            None,
+                            location,
                             &dests,
                             query_id,
                             dest_node_id,
@@ -1204,6 +1269,7 @@ impl PBackendService for PBackendServiceHandler {
                         info!(%finst_id, "exchange send complete");
                     } else {
                         // No exchange destinations — store result locally for fetch_data.
+                        let ipc_bytes = location.into_ipc_bytes();
                         if let Err(e) = store.store_ipc_result(finst_id, &ipc_bytes) {
                             warn!(error = %e, %finst_id, "failed to store result");
                             return Ok(Response::new(PExecPlanFragmentResult {
@@ -1665,6 +1731,12 @@ pub async fn start_grpc_server(
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
     info!(addr = listen_addr, "starting PBackendService multi-protocol server (gRPC + bRPC)");
 
+    // Clone before moving into handler (nixl service also needs these).
+    #[cfg(feature = "nixl")]
+    let nixl_agent_for_service = nixl_agent.clone();
+    #[cfg(feature = "nixl")]
+    let engine_for_service = engine.clone();
+
     #[allow(unused_mut)]
     let mut handler = PBackendServiceHandler::new(
         state,
@@ -1684,11 +1756,23 @@ pub async fn start_grpc_server(
     let (grpc_tx, grpc_rx) =
         tokio::sync::mpsc::channel::<tokio::net::TcpStream>(64);
 
+    // Build gRPC server with PBackendService + optional NixlMetadataService.
+    #[allow(unused_mut)]
+    let mut server_builder = tonic::transport::Server::builder()
+        .add_service(svc);
+
+    #[cfg(feature = "nixl")]
+    {
+        use doris_proto::nixl::NixlMetadataServiceServer;
+        let nixl_handler = super::nixl_service::NixlMetadataServiceHandler::new(nixl_agent_for_service, engine_for_service);
+        server_builder = server_builder.add_service(NixlMetadataServiceServer::new(nixl_handler));
+        info!("registered NixlMetadataService on gRPC server");
+    }
+
     // Spawn tonic gRPC server consuming forwarded connections.
     tokio::spawn(async move {
         let incoming = ReceiverStream::new(grpc_rx).map(Ok::<_, std::io::Error>);
-        if let Err(e) = tonic::transport::Server::builder()
-            .add_service(svc)
+        if let Err(e) = server_builder
             .serve_with_incoming(incoming)
             .await
         {

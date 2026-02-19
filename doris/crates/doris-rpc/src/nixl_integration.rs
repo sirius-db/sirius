@@ -19,6 +19,7 @@ pub enum ExecutionLocation {
     /// Result is in CPU memory (Arrow IPC bytes).
     Cpu(Vec<u8>),
     /// Result is in GPU memory (buffer descriptors + schema).
+    /// Also carries IPC bytes as fallback for non-exchange paths.
     #[cfg(feature = "nixl")]
     Gpu {
         /// GPU buffer descriptors (addr, len, device_id).
@@ -29,7 +30,20 @@ pub enum ExecutionLocation {
         num_rows: u32,
         /// Arrow IPC schema bytes (for receiver reconstruction).
         schema_ipc: Vec<u8>,
+        /// Arrow IPC bytes (fallback for store/fetch_data path).
+        ipc_bytes: Vec<u8>,
     },
+}
+
+impl ExecutionLocation {
+    /// Extract IPC bytes, consuming self.
+    pub fn into_ipc_bytes(self) -> Vec<u8> {
+        match self {
+            Self::Cpu(bytes) => bytes,
+            #[cfg(feature = "nixl")]
+            Self::Gpu { ipc_bytes, .. } => ipc_bytes,
+        }
+    }
 }
 
 /// Detect whether execution result is in GPU or CPU memory.
@@ -48,6 +62,11 @@ pub fn detect_execution_location(
         // the engine can provide the raw GPU addresses.
         match _engine.get_last_gpu_result_buffers() {
             Ok(Some(gpu_info)) => {
+                tracing::info!(
+                    num_buffers = gpu_info.buffer_addrs.len(),
+                    num_rows = gpu_info.num_rows,
+                    "detect_execution_location: GPU buffers found"
+                );
                 return ExecutionLocation::Gpu {
                     buffers: gpu_info
                         .buffer_addrs
@@ -61,10 +80,14 @@ pub fn detect_execution_location(
                     column_info: gpu_info.column_info,
                     num_rows: gpu_info.num_rows,
                     schema_ipc: gpu_info.schema_ipc,
+                    ipc_bytes,
                 };
             }
-            Ok(None) | Err(_) => {
-                // Fall through to CPU path
+            Ok(None) => {
+                tracing::debug!("detect_execution_location: no GPU buffers (CPU execution)");
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "detect_execution_location: get_last_gpu_result_buffers failed");
             }
         }
     }
@@ -99,10 +122,14 @@ pub async fn send_exchange_with_nixl(
             column_info,
             num_rows,
             schema_ipc: _,
+            ipc_bytes,
         } => {
             // GPU-direct path: send metadata + initiate nixl transfers.
             let Some(agent) = nixl_agent else {
-                return Err("GPU result but no nixl agent available".to_string());
+                tracing::warn!("GPU result but no nixl agent, falling back to bRPC");
+                return crate::exchange_sender::send_exchange_result(
+                    &ipc_bytes, destinations, query_id, node_id, sender_id,
+                ).await;
             };
 
             let local_md = agent.local_metadata().to_vec();
@@ -113,13 +140,19 @@ pub async fn send_exchange_with_nixl(
                 num_rows,
             };
 
-            // For each destination:
-            // 1. Send metadata via gRPC (custom exchange_nixl_metadata method)
-            // 2. Receiver allocates GPU buffers and returns their addresses
-            // 3. Sender initiates nixl transfer
-
+            // Try nixl GPU-direct for each destination, fall back to bRPC on failure.
             for dest in destinations {
-                send_nixl_to_peer(agent, &exchange_msg, dest, &buffers).await?;
+                if let Err(e) = send_nixl_to_peer(agent, &exchange_msg, dest, &buffers).await {
+                    tracing::warn!(
+                        error = %e,
+                        dest = %dest.brpc_addr,
+                        "nixl transfer failed, falling back to bRPC"
+                    );
+                    crate::exchange_sender::send_exchange_result(
+                        &ipc_bytes, destinations, query_id, node_id, sender_id,
+                    ).await?;
+                    return Ok(());
+                }
             }
 
             Ok(())
@@ -184,26 +217,17 @@ async fn send_nixl_to_peer(
     Ok(())
 }
 
-/// Call remote BE's exchange_nixl_metadata gRPC method.
+/// Call remote BE's ExchangeMetadata gRPC method.
 #[cfg(feature = "nixl")]
 async fn call_exchange_nixl_metadata(
     grpc_addr: &str,
     metadata: &NixlMetadataExchange,
 ) -> Result<doris_proto::nixl::PExchangeNixlMetadataResponse, String> {
-    use doris_proto::nixl::{PColumnInfo, PExchangeNixlMetadataRequest, PGpuBufferDesc};
+    use doris_proto::nixl::{
+        NixlMetadataServiceClient, PColumnInfo, PExchangeNixlMetadataRequest, PGpuBufferDesc,
+    };
 
-    // Note: PBackendService doesn't have exchange_nixl_metadata in the proto.
-    // We'd need to add it to the service definition or call via raw HTTP/2.
-    // For now, return a mock response to demonstrate the flow.
-
-    // In production, this would be:
-    // let mut client = PBackendServiceClient::connect(grpc_addr).await
-    //     .map_err(|e| format!("connect: {e}"))?;
-    // let response = client.exchange_nixl_metadata(request).await
-    //     .map_err(|e| format!("rpc: {e}"))?;
-
-    // Mock response for testing:
-    let _request = PExchangeNixlMetadataRequest {
+    let request = PExchangeNixlMetadataRequest {
         nixl_metadata: metadata.metadata.clone(),
         src_buffers: metadata
             .buffer_descs
@@ -228,22 +252,17 @@ async fn call_exchange_nixl_metadata(
         node_id: 0,
     };
 
-    // TODO: Actual gRPC call here.
-    // For now, return mock success.
-    Ok(doris_proto::nixl::PExchangeNixlMetadataResponse {
-        dst_buffers: metadata
-            .buffer_descs
-            .iter()
-            .map(|b| PGpuBufferDesc {
-                addr: b.addr as u64,
-                len: b.len as u64,
-                device_id: b.device_id,
-            })
-            .collect(),
-        remote_agent_name: format!("remote-agent-{}", grpc_addr),
-        status_code: 0,
-        error_msgs: vec![],
-    })
+    let mut client = NixlMetadataServiceClient::connect(grpc_addr.to_string())
+        .await
+        .map_err(|e| format!("connect to {}: {e}", grpc_addr))?;
+
+    let response = client
+        .exchange_metadata(request)
+        .await
+        .map_err(|e| format!("exchange_metadata RPC: {e}"))?
+        .into_inner();
+
+    Ok(response)
 }
 
 /// Non-nixl version: always use bRPC.
@@ -316,5 +335,42 @@ mod tests {
 
         assert_eq!(dest.brpc_addr, "10.0.0.1:8060");
         assert_eq!(dest.finst_id, (100, 200));
+    }
+
+    #[test]
+    fn test_execution_location_cpu_roundtrip() {
+        let data = vec![0x41, 0x52, 0x52, 0x4f, 0x57]; // "ARROW" bytes
+        let location = ExecutionLocation::Cpu(data.clone());
+        match location {
+            ExecutionLocation::Cpu(bytes) => assert_eq!(bytes, data),
+            #[cfg(feature = "nixl")]
+            ExecutionLocation::Gpu { .. } => panic!("expected Cpu variant"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_send_exchange_cpu_location_wraps_brpc() {
+        // Verify that Cpu location delegates to bRPC sender.
+        // We can't easily test the actual send (needs TCP), but we can verify
+        // the wrapping logic: Cpu variant extracts ipc_bytes for send_exchange_result.
+        let ipc = vec![0xAA, 0xBB, 0xCC];
+        let location = ExecutionLocation::Cpu(ipc);
+
+        // With invalid IPC bytes and no destinations, the bRPC sender will still
+        // try to parse. We just verify the function is callable and the type system works.
+        let result = send_exchange_with_nixl(
+            #[cfg(feature = "nixl")]
+            None,
+            #[cfg(not(feature = "nixl"))]
+            None,
+            location,
+            &[], // no destinations — but arrow_ipc_to_pblock still runs
+            (1, 2),
+            0,
+            0,
+        )
+        .await;
+        // Will fail because IPC bytes are invalid, which is expected.
+        assert!(result.is_err());
     }
 }

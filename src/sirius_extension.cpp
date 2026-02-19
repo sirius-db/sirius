@@ -19,6 +19,7 @@
 
 #include "config.hpp"
 #include "data/sirius_converter_registry.hpp"
+#include "last_gpu_buffers.hpp"
 #include "duckdb.hpp"
 #include "duckdb/catalog/catalog_entry/duck_schema_entry.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
@@ -686,6 +687,60 @@ void SiriusExtension::GPUBufferInitFunction(ClientContext& context,
   data.finished = true;
 }
 
+// --- sirius_get_last_gpu_buffers() table function ---
+
+struct GetLastGPUBuffersData : public TableFunctionData {
+  bool finished = false;
+};
+
+unique_ptr<FunctionData> SiriusExtension::GetLastGPUBuffersBind(
+  ClientContext& context,
+  TableFunctionBindInput& input,
+  vector<LogicalType>& return_types,
+  vector<string>& names)
+{
+  return_types = {
+    LogicalType::INTEGER,  // buffer_id
+    LogicalType::BIGINT,   // addr
+    LogicalType::BIGINT,   // len
+    LogicalType::INTEGER,  // device_id
+    LogicalType::VARCHAR,  // column_name
+    LogicalType::INTEGER,  // type_id
+    LogicalType::BIGINT,   // num_rows
+  };
+  names = {"buffer_id", "addr", "len", "device_id", "column_name", "type_id", "num_rows"};
+  return make_uniq<GetLastGPUBuffersData>();
+}
+
+void SiriusExtension::GetLastGPUBuffersFunction(
+  ClientContext& context,
+  TableFunctionInput& data_p,
+  DataChunk& output)
+{
+  auto& data = data_p.bind_data->CastNoConst<GetLastGPUBuffersData>();
+  if (data.finished) {
+    output.SetCardinality(0);
+    return;
+  }
+
+  auto buffers = LastGPUBuffers::GetInstance().Get();
+  idx_t count  = MinValue<idx_t>(buffers.size(), STANDARD_VECTOR_SIZE);
+  output.SetCardinality(count);
+
+  for (idx_t i = 0; i < count; i++) {
+    auto& buf = buffers[i];
+    output.SetValue(0, i, Value::INTEGER(static_cast<int32_t>(i)));
+    output.SetValue(1, i, Value::BIGINT(static_cast<int64_t>(buf.addr)));
+    output.SetValue(2, i, Value::BIGINT(static_cast<int64_t>(buf.len)));
+    output.SetValue(3, i, Value::INTEGER(buf.device_id));
+    output.SetValue(4, i, Value(buf.column_name));
+    output.SetValue(5, i, Value::INTEGER(buf.type_id));
+    output.SetValue(6, i, Value::BIGINT(static_cast<int64_t>(buf.num_rows)));
+  }
+
+  data.finished = true;
+}
+
 void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
 {
   auto transaction = CatalogTransaction::GetSystemTransaction(instance);
@@ -718,6 +773,13 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
                                          GPUProcessingSubstraitBind);
   CreateTableFunctionInfo gpu_processing_substrait_info(gpu_processing_substrait);
   catalog.CreateTableFunction(transaction, gpu_processing_substrait_info);
+
+  TableFunction get_last_gpu_buffers("sirius_get_last_gpu_buffers",
+                                     {},
+                                     GetLastGPUBuffersFunction,
+                                     GetLastGPUBuffersBind);
+  CreateTableFunctionInfo get_last_gpu_buffers_info(get_last_gpu_buffers);
+  catalog.CreateTableFunction(transaction, get_last_gpu_buffers_info);
 }
 
 static void SetUsePinMemory(ClientContext& context, SetScope scope, Value& parameter)

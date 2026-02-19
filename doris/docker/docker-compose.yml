@@ -56,12 +56,14 @@ services:
       doris-fe:
         condition: service_healthy
     environment:
-      - LD_LIBRARY_PATH=/opt/nix-glibc:/opt/pixi-lib:/opt/pixi-default/lib:/usr/local/nvidia/lib64
+      - LD_LIBRARY_PATH=/opt/nix-glibc:/opt/pixi-lib:/opt/pixi-nixl-lib:/opt/pixi-default/lib:/usr/local/nvidia/lib64
       - RUST_LOG=info
       - SIRIUS_EXTENSION_DIR=/opt/extensions
+      - NIXL_PLUGIN_DIR=/opt/pixi-nixl-lib/plugins
     volumes:
       - /nix/store/wb6rhpznjfczwlwx23zmdrrw74bayxw4-glibc-2.42-47/lib:/opt/nix-glibc:ro
       - ../../.pixi/envs/doris/lib:/opt/pixi-lib:ro
+      - ../../.pixi/envs/doris-nixl/lib:/opt/pixi-nixl-lib:ro
       - ../../.pixi/envs/default:/opt/pixi-default:ro
       # Mount at the host path too — the sirius extension has a hardcoded RPATH.
       - ../../.pixi/envs/default/lib:/home/matthijs/sirius/.pixi/envs/default/lib:ro

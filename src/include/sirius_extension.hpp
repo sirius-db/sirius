@@ -60,6 +60,13 @@ class SiriusExtension : public Extension {
                                                    TableFunctionBindInput& input,
                                                    vector<LogicalType>& return_types,
                                                    vector<string>& names);
+  static void GetLastGPUBuffersFunction(ClientContext& context,
+                                        TableFunctionInput& data_p,
+                                        DataChunk& output);
+  static unique_ptr<FunctionData> GetLastGPUBuffersBind(ClientContext& context,
+                                                         TableFunctionBindInput& input,
+                                                         vector<LogicalType>& return_types,
+                                                         vector<string>& names);
 
   static bool buffer_is_initialized;
 };

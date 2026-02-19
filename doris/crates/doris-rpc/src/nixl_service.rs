@@ -3,32 +3,36 @@
 //! Provides GPU-direct exchange coordination via gRPC method:
 //! - exchange_metadata: sender offers buffers, receiver allocates and returns addresses
 
-#[cfg(feature = "nixl")]
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tonic::{Request, Response, Status};
+#[cfg(feature = "nixl")]
 use tracing::{info, instrument, warn};
 
 #[cfg(feature = "nixl")]
 use crate::nixl_exchange::NixlExchange;
+use sirius_ffi::SiriusEngine;
 
 /// NIXL metadata exchange service handler.
+#[allow(dead_code)] // engine only read with nixl feature
 pub struct NixlMetadataServiceHandler {
     #[cfg(feature = "nixl")]
     nixl_agent: Option<Arc<NixlExchange>>,
+    engine: Option<Arc<Mutex<SiriusEngine>>>,
 }
 
 impl NixlMetadataServiceHandler {
     pub fn new(
         #[cfg(feature = "nixl")]
         nixl_agent: Option<Arc<NixlExchange>>,
+        engine: Option<Arc<Mutex<SiriusEngine>>>,
     ) -> Self {
         Self {
             #[cfg(feature = "nixl")]
             nixl_agent,
+            engine,
         }
     }
-
 }
 
 // Implement the tonic-generated trait
@@ -84,19 +88,44 @@ impl doris_proto::nixl::NixlMetadataService for NixlMetadataServiceHandler {
         };
 
         // Allocate destination GPU buffers matching source sizes.
-        // For now, we'll use a simplified approach: return src_buffers as dst_buffers
-        // (mock allocation). In production, this would call:
-        //   engine.allocate_gpu_buffers(src_buffers) -> dst_buffers
-
-        let dst_buffers: Vec<PGpuBufferDesc> = req
-            .src_buffers
-            .iter()
-            .map(|src| PGpuBufferDesc {
-                addr: src.addr, // Mock: same address (in reality, allocate new)
-                len: src.len,
-                device_id: src.device_id,
-            })
-            .collect();
+        let dst_buffers: Vec<PGpuBufferDesc> = if let Some(engine) = &self.engine {
+            let sizes: Vec<(usize, u64)> = req
+                .src_buffers
+                .iter()
+                .map(|b| (b.len as usize, b.device_id))
+                .collect();
+            match engine.lock().unwrap().allocate_gpu_buffers(&sizes) {
+                Ok(allocs) => allocs
+                    .into_iter()
+                    .map(|(addr, len, device_id)| PGpuBufferDesc {
+                        addr: addr as u64,
+                        len: len as u64,
+                        device_id,
+                    })
+                    .collect(),
+                Err(e) => {
+                    warn!(error = %e, "GPU buffer allocation failed, mirroring src addresses");
+                    req.src_buffers
+                        .iter()
+                        .map(|src| PGpuBufferDesc {
+                            addr: src.addr,
+                            len: src.len,
+                            device_id: src.device_id,
+                        })
+                        .collect()
+                }
+            }
+        } else {
+            // No engine — mirror src buffers (test/stub mode).
+            req.src_buffers
+                .iter()
+                .map(|src| PGpuBufferDesc {
+                    addr: src.addr,
+                    len: src.len,
+                    device_id: src.device_id,
+                })
+                .collect()
+        };
 
         info!(
             peer = %peer,
@@ -129,13 +158,24 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_service_creation() {
+    async fn test_service_creation_no_engine() {
         #[cfg(feature = "nixl")]
-        let service = NixlMetadataServiceHandler::new(None);
+        let service = NixlMetadataServiceHandler::new(None, None);
         #[cfg(not(feature = "nixl"))]
-        let service = NixlMetadataServiceHandler::new();
+        let service = NixlMetadataServiceHandler::new(None);
 
-        // Service should be created successfully
+        let _ = service;
+    }
+
+    #[tokio::test]
+    async fn test_service_creation_with_engine() {
+        let engine = sirius_ffi::SiriusEngine::new().ok().map(|e| Arc::new(Mutex::new(e)));
+
+        #[cfg(feature = "nixl")]
+        let service = NixlMetadataServiceHandler::new(None, engine);
+        #[cfg(not(feature = "nixl"))]
+        let service = NixlMetadataServiceHandler::new(engine);
+
         let _ = service;
     }
 
@@ -144,7 +184,7 @@ mod tests {
     async fn test_exchange_metadata_without_nixl() {
         use doris_proto::nixl::NixlMetadataService;
 
-        let service = NixlMetadataServiceHandler::new();
+        let service = NixlMetadataServiceHandler::new(None);
         let request = Request::new(doris_proto::nixl::PExchangeNixlMetadataRequest {
             nixl_metadata: vec![],
             src_buffers: vec![],
@@ -155,6 +195,29 @@ mod tests {
             node_id: 0,
         });
 
+        let result = service.exchange_metadata(request).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), tonic::Code::Unimplemented);
+    }
+
+    #[tokio::test]
+    #[cfg(not(feature = "nixl"))]
+    async fn test_exchange_metadata_with_engine_still_unimplemented() {
+        use doris_proto::nixl::NixlMetadataService;
+
+        let engine = sirius_ffi::SiriusEngine::new().ok().map(|e| Arc::new(Mutex::new(e)));
+        let service = NixlMetadataServiceHandler::new(engine);
+        let request = Request::new(doris_proto::nixl::PExchangeNixlMetadataRequest {
+            nixl_metadata: vec![],
+            src_buffers: vec![],
+            columns: vec![],
+            num_rows: 0,
+            query_id_hi: vec![],
+            query_id_lo: vec![],
+            node_id: 0,
+        });
+
+        // Even with engine, non-nixl build returns unimplemented.
         let result = service.exchange_metadata(request).await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code(), tonic::Code::Unimplemented);

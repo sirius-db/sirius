@@ -494,6 +494,53 @@ impl SiriusEngine {
         }
     }
 
+    /// Allocate GPU buffers for receiving nixl transfer data.
+    ///
+    /// Asks the Sirius GPU buffer manager to allocate `num_buffers` buffers of
+    /// the given sizes. Returns (addr, len, device_id) for each allocated buffer.
+    /// Used by the nixl metadata exchange receiver to prepare destination buffers.
+    pub fn allocate_gpu_buffers(
+        &self,
+        sizes: &[(usize, u64)], // (len, device_id) per buffer
+    ) -> Result<Vec<(usize, usize, u64)>, EngineError> {
+        #[cfg(feature = "duckdb-bundled")]
+        {
+            // Call the Sirius extension's gpu_allocate_buffers function.
+            // It takes a list of sizes and returns allocated GPU addresses.
+            let sizes_str: Vec<String> = sizes.iter().map(|(len, _)| format!("{}", len)).collect();
+            let device_id = sizes.first().map(|(_, d)| *d).unwrap_or(0);
+            let sql = format!(
+                "SELECT buffer_id, addr, len FROM gpu_allocate_buffers([{}], {})",
+                sizes_str.join(", "),
+                device_id
+            );
+
+            let mut stmt = self
+                .conn
+                .prepare(&sql)
+                .map_err(|e| EngineError::ExecFailed(format!("gpu_allocate_buffers: {e}")))?;
+
+            let mut rows = stmt
+                .query([])
+                .map_err(|e| EngineError::ExecFailed(format!("query allocated buffers: {e}")))?;
+
+            let mut result = Vec::new();
+            while let Some(row) = rows.next().map_err(|e| EngineError::ExecFailed(e.to_string()))? {
+                let addr: i64 = row.get(1).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+                let len: i64 = row.get(2).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+                result.push((addr as usize, len as usize, device_id));
+            }
+
+            Ok(result)
+        }
+
+        #[cfg(not(feature = "duckdb-bundled"))]
+        {
+            let _ = sizes;
+            Err(EngineError::NotCompiled)
+        }
+    }
+
     /// Get GPU buffer pointers from the last execution (for nixl GPU-direct exchange).
     ///
     /// Returns `Ok(Some(...))` if the last query was GPU-accelerated and buffers are
