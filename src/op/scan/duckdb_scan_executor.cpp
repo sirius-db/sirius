@@ -153,12 +153,23 @@ std::unique_ptr<op::operator_data> duckdb_scan_executor::get_scan_output(
   pipeline::sirius_pipeline_itask* task, rmm::cuda_stream_view stream)
 {
   if (!_caching_enabled) {
-    return task->compute_task(stream);
+    SIRIUS_LOG_TRACE("Pipeline {}: cache disabled, scanning...", task->get_pipeline_id());
+    auto start    = std::chrono::high_resolution_clock::now();
+    auto data     = task->compute_task(stream);
+    auto end      = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    SIRIUS_LOG_TRACE("Pipeline {}: scan finished in {:.2f} ms",
+                     task->get_pipeline_id(),
+                     duration.count() / 1000.0);
+    return data;
   } else {
     auto pipe_id = task->get_pipeline_id();
     std::lock_guard<std::mutex> lock(_cache_mutex);
     auto& entry = _cache.at(pipe_id);
-    if (!entry) { throw std::runtime_error("Scan results for query not cached"); }
+    if (!entry) {
+      throw std::runtime_error("Could not find cache entry for pipeline " +
+                               std::to_string(pipe_id));
+    }
     if (_preload_mode) {
       if (entry->batch_index >= entry->batches.size()) {
         throw std::runtime_error("Scan results for query not cached");
@@ -171,7 +182,15 @@ std::unique_ptr<op::operator_data> duckdb_scan_executor::get_scan_output(
       }
       return std::make_unique<op::operator_data>(std::move(cloned_batches));
     } else {
+      SIRIUS_LOG_TRACE("Pipeline {}: data not found in cache, scanning...",
+                       task->get_pipeline_id());
+      auto start       = std::chrono::high_resolution_clock::now();
       auto scan_output = task->compute_task(stream);
+      auto end         = std::chrono::high_resolution_clock::now();
+      auto duration    = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+      SIRIUS_LOG_TRACE("Pipeline {}: scan finished in {:.2f} ms",
+                       task->get_pipeline_id(),
+                       duration.count() / 1000.0);
       std::vector<std::shared_ptr<cucascade::data_batch>> cloned_batches;
       cloned_batches.reserve(scan_output->get_data_batches().size());
       for (auto& b : scan_output->get_data_batches()) {
