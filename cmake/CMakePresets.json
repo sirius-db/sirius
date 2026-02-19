@@ -1,0 +1,118 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 26,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "cacheVariables": {
+        "DUCKDB_EXTENSION_CONFIGS": "${sourceDir}/../extension_config.cmake",
+        "BUILD_TESTS": "ON",
+        "CMAKE_C_COMPILER_LAUNCHER": "sccache",
+        "CMAKE_CXX_COMPILER_LAUNCHER": "sccache",
+        "CMAKE_CUDA_COMPILER_LAUNCHER": "sccache"
+      }
+    },
+    {
+      "name": "base-clang",
+      "hidden": true,
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "$env{CONDA_PREFIX}/bin/clang",
+        "CMAKE_CXX_COMPILER": "$env{CONDA_PREFIX}/bin/clang++",
+        "CMAKE_CXX_SCAN_FOR_MODULES": "OFF"
+      }
+    },
+    {
+      "name": "debug",
+      "displayName": "GCC Debug",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/../build/debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_C_FLAGS_DEBUG": "-g -O0",
+        "CMAKE_CXX_FLAGS_DEBUG": "-g -O0",
+        "CMAKE_CUDA_FLAGS_DEBUG": "-g -G -O0"
+      }
+    },
+    {
+      "name": "release",
+      "displayName": "GCC Release",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/../build/release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "relwithdebinfo",
+      "displayName": "GCC RelWithDebInfo",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/../build/relwithdebinfo",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      }
+    },
+    {
+      "name": "clang-debug",
+      "displayName": "Clang Debug",
+      "inherits": "base-clang",
+      "binaryDir": "${sourceDir}/../build/clang-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_C_FLAGS_DEBUG": "-g -O0",
+        "CMAKE_CXX_FLAGS_DEBUG": "-g -O0",
+        "CMAKE_CUDA_FLAGS_DEBUG": "-g -G -O0"
+      }
+    },
+    {
+      "name": "clang-release",
+      "displayName": "Clang Release",
+      "inherits": "base-clang",
+      "binaryDir": "${sourceDir}/../build/clang-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "clang-relwithdebinfo",
+      "displayName": "Clang RelWithDebInfo",
+      "inherits": "base-clang",
+      "binaryDir": "${sourceDir}/../build/clang-relwithdebinfo",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "debug",
+      "configurePreset": "debug"
+    },
+    {
+      "name": "release",
+      "configurePreset": "release"
+    },
+    {
+      "name": "relwithdebinfo",
+      "configurePreset": "relwithdebinfo"
+    },
+    {
+      "name": "clang-debug",
+      "configurePreset": "clang-debug"
+    },
+    {
+      "name": "clang-release",
+      "configurePreset": "clang-release"
+    },
+    {
+      "name": "clang-relwithdebinfo",
+      "configurePreset": "clang-relwithdebinfo"
+    }
+  ]
+}
