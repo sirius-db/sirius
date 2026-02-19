@@ -78,7 +78,7 @@ class GPUExecutionFixture {
    */
   static bool is_floating_point(duckdb::LogicalTypeId id)
   {
-    return id == duckdb::LogicalTypeId::FLOAT || id == duckdb::LogicalTypeId::DOUBLE ;
+    return id == duckdb::LogicalTypeId::FLOAT || id == duckdb::LogicalTypeId::DOUBLE;
   }
 
   void compare_gpu_vs_cpu(const std::string& query,
