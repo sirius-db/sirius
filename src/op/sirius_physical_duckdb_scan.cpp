@@ -92,7 +92,7 @@ sirius_physical_duckdb_scan::sirius_physical_duckdb_scan(
   }
 
   if (num_cols == 0) {  // Ensure that scanned_types and ids are properly initialized
-    scanned_types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::UBIGINT));
+    scanned_types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));
   }
 
   fake_table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();

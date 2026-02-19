@@ -291,7 +291,7 @@ duckdb_scan_task_local_state::duckdb_scan_task_local_state(
     _exec_ctx(exec_ctx)
 {
   auto const& op = g_state._op;
-  _num_columns   = op.projection_ids.size();
+  _num_columns   = op.scanned_types.size();
 
   if (existing_local_tf_state) {
     _local_tf_state = std::move(existing_local_tf_state);
@@ -338,12 +338,12 @@ size_t duckdb_scan_task_local_state::get_tail_byte_offset() const
 
 void duckdb_scan_task_local_state::estimate_rows_per_batch(sirius_physical_duckdb_scan const& op)
 {
-  assert(_num_columns <= op.column_ids.size());
+  assert(_num_columns <= op.scanned_types.size());
 
   size_t estimated_row_bytes = 0;
   _column_builders.reserve(_num_columns);
   for (size_t i = 0; i < _num_columns; ++i) {
-    auto const col_type = op.returned_types[op.column_ids[i].GetPrimaryIndex()];
+    auto const col_type = op.scanned_types[i];
     _column_builders.emplace_back(col_type, _default_varchar_size);
     if (col_type.InternalType() == duckdb::PhysicalType::VARCHAR) {
       _varchar_indices.push_back(i);

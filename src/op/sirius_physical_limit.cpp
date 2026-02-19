@@ -120,6 +120,10 @@ std::unique_ptr<operator_data> sirius_physical_streaming_limit::execute(
     output_batches.push_back(std::move(output_batch));
   }
 
+  if (_remaining_limit.load(std::memory_order_acquire) <= 0) {
+    _limit_exhausted.store(true, std::memory_order_release);
+  }
+
   return std::make_unique<operator_data>(output_batches);
 }
 
