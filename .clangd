@@ -2,65 +2,74 @@
 
 # Apply a config conditionally to all C files
 If:
-  PathMatch: .*\.(c|h)$
+    PathMatch: .*\.(c|h)$
+CompileFlags:
+    Compiler: clang
 
 ---
-
 # Apply a config conditionally to all C++ files
 If:
-  PathMatch: .*\.(c|h)pp
+    PathMatch: .*\.(c|h)pp
+CompileFlags:
+    Compiler: clang++
 
 ---
-
-# Apply a config conditionally to all CUDA files
+# CUDA files: parse as C++ since clang's CUDA frontend causes std type
+# corruption from libcudacxx chrono ODR conflicts with libstdc++.
+# nvcc handles actual CUDA compilation.
+# Note: nvcc puts includes in --options-file (response files) which clangd
+# cannot expand. .cu files may have unresolved includes as a result.
 If:
-  PathMatch: .*\.cuh?
+    PathMatch: .*\.cuh?
 CompileFlags:
-  Add:
-    # Allow variadic CUDA functions
-    - "-Xclang=-fcuda-allow-variadic-functions"
+    Compiler: clang++
+    Add:
+        - -x
+        - c++
+        - "-D__host__="
+        - "-D__device__="
+        - "-D__global__="
+        - "-D__shared__="
+        - "-D__constant__="
+        - "-D__forceinline__=inline"
+        - "-D__launch_bounds__(...)="
+    Remove:
+        - -x
+        - cu
 
 ---
-
-# Tweak the clangd parse settings for all files
+# Shared settings for all files
 CompileFlags:
-  Compiler: clang++-18
-  CompilationDatabase: ./build/release
-  Add:
-    - -x
-    - cuda
-    - -Wno-unknown-cuda-version
-    - --no-cuda-version-check
-    # report all errors
-    - "-ferror-limit=0"
-    - "-ftemplate-backtrace-limit=0"
-  Remove:
-    - -stdpar
-    # strip CUDA fatbin args
-    - "-Xfatbin*"
-    - "-Xcompiler*"
-    - "-Xcudafe*"
-    - "-rdc=*"
-    - "-gpu=*"
-    - "--diag_suppress*"
-    # strip CUDA arch flags
-    - "-gencode*"
-    - "--generate-code*"
-    # strip gcc's -fcoroutines
-    - -fcoroutines
-    # strip CUDA flags unknown to clang
-    - "-ccbin*"
-    - "--compiler-options*"
-    - "--extended-lambda"
-    - "--expt-extended-lambda"
-    - "--expt-relaxed-constexpr"
-    - "-forward-unknown-to-host-compiler"
-    - "-Werror=cross-execution-space-call"
-    - --options-file
+    CompilationDatabase: build/release
+    Add:
+        - "-ferror-limit=0"
+        - "-ftemplate-backtrace-limit=0"
+    Remove:
+        - -stdpar
+        # strip CUDA fatbin args
+        - "-Xfatbin*"
+        - "-Xcompiler*"
+        - "-Xcudafe*"
+        - "-rdc=*"
+        - "-gpu=*"
+        - "--diag_suppress*"
+        # strip CUDA arch flags
+        - "-gencode*"
+        - "--generate-code*"
+        # strip gcc's -fcoroutines
+        - -fcoroutines
+        # strip CUDA flags unknown to clang
+        - "-ccbin*"
+        - "--compiler-options*"
+        - "--extended-lambda"
+        - "--expt-extended-lambda"
+        - "--expt-relaxed-constexpr"
+        - "-forward-unknown-to-host-compiler"
+        - "-Werror=cross-execution-space-call"
+        # nvcc -arch flag (not understood by clang)
+        - "-arch*"
 Diagnostics:
-  Suppress:
-    - "variadic_device_fn"
-    - "attributes_not_allowed"
-    # The NVHPC version of _NVCXX_EXPAND_PACK macro triggers this clang error.
-    # Temporarily suppressing it, but should probably fix
-    - "template_param_shadow"
+    Suppress:
+        - "variadic_device_fn"
+        - "attributes_not_allowed"
+        - "template_param_shadow"
