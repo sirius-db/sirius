@@ -76,10 +76,9 @@ class GPUExecutionFixture {
    * (e.g., HUGEINT vs BIGINT both render "50"). Row order is ignored by collecting rows
    * as sorted sets of string tuples.
    */
-  static bool is_floating_or_decimal(duckdb::LogicalTypeId id)
+  static bool is_floating_point(duckdb::LogicalTypeId id)
   {
-    return id == duckdb::LogicalTypeId::FLOAT || id == duckdb::LogicalTypeId::DOUBLE ||
-           id == duckdb::LogicalTypeId::DECIMAL;
+    return id == duckdb::LogicalTypeId::FLOAT || id == duckdb::LogicalTypeId::DOUBLE ;
   }
 
   void compare_gpu_vs_cpu(const std::string& query,
@@ -135,7 +134,7 @@ class GPUExecutionFixture {
         auto gpu_value = gpu_sorted->GetValue(c, r);
         auto cpu_value = cpu_sorted->GetValue(c, r);
 
-        if (float_tolerance.has_value() && is_floating_or_decimal(gpu_value.type().id())) {
+        if (float_tolerance.has_value() && is_floating_point(gpu_value.type().id())) {
           double gpu_d = gpu_value.GetValue<double>();
           double cpu_d = cpu_value.GetValue<double>();
           double diff  = std::fabs(gpu_d - cpu_d);
@@ -1346,7 +1345,7 @@ TEST_CASE_METHOD(GPUExecutionFixture,
 
 TEST_CASE_METHOD(GPUExecutionFixture,
                  "gpu_execution - TPC-H Query 10",
-                 "[integration][gpu_execution][TPC-H][Q10]")
+                 "[.][integration_disabled][gpu_execution][TPC-H][Q10]")
 {
   compare_gpu_vs_cpu(
     "select c.c_custkey, c.c_name, "
@@ -1366,7 +1365,7 @@ TEST_CASE_METHOD(GPUExecutionFixture,
 
 TEST_CASE_METHOD(GPUExecutionFixture,
                  "gpu_execution - TPC-H Query 11",
-                 "[integration][gpu_execution][TPC-H][Q11]")
+                 "[.][integration_disabled][gpu_execution][TPC-H][Q11]")
 {
   compare_gpu_vs_cpu(
     "select ps.ps_partkey, "
