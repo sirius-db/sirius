@@ -78,6 +78,9 @@ cuda = "12"
 
 [feature.cuda12.dependencies]
 cuda-version = "12.*"
+clang = "<20"
+clangxx = "<20"
+clang-tools = "<20"
 
 [feature.cuda12.activation.env]
 # GPU architectures: Turing through Hopper (75, 80, 86, 90a)
