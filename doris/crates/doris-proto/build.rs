@@ -59,4 +59,17 @@ fn main() {
     prost_build::Config::new()
         .compile_protos(&[nixl_proto.as_path()], &[brpc_proto_dir.as_path()])
         .expect("Failed to compile NIXL exchange proto");
+
+    // NIXL metadata exchange service (gRPC service definition)
+    let nixl_service_proto = brpc_proto_dir.join("nixl_service.proto");
+    println!("cargo:rerun-if-changed={}", nixl_service_proto.display());
+
+    tonic_build::configure()
+        .build_server(true)
+        .build_client(true)
+        .compile_protos(
+            &[nixl_service_proto.as_path()],
+            &[brpc_proto_dir.as_path()],
+        )
+        .expect("Failed to compile NIXL service proto");
 }

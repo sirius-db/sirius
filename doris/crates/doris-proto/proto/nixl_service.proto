@@ -1,0 +1,26 @@
+// NIXL metadata exchange gRPC service definition.
+//
+// Defines the gRPC service interface for GPU-direct exchange coordination.
+// This service runs alongside PBackendService on each Sirius BE.
+
+syntax = "proto3";
+
+package doris.nixl;
+
+import "nixl_exchange.proto";
+
+// NIXL metadata exchange service for GPU-direct transfers.
+//
+// Protocol flow:
+// 1. Sender calls ExchangeMetadata with src buffer descriptors
+// 2. Receiver loads nixl agent metadata
+// 3. Receiver allocates matching GPU buffers
+// 4. Receiver returns dst buffer descriptors
+// 5. Sender initiates RDMA transfer via nixl
+service NixlMetadataService {
+  // Exchange metadata for GPU-direct transfer.
+  //
+  // Sender offers GPU buffer descriptors, receiver allocates destination
+  // buffers and returns their addresses for RDMA transfer.
+  rpc ExchangeMetadata(PExchangeNixlMetadataRequest) returns (PExchangeNixlMetadataResponse);
+}

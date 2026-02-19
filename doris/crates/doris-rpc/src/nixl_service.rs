@@ -13,12 +13,12 @@ use tracing::{info, instrument, warn};
 use crate::nixl_exchange::NixlExchange;
 
 /// NIXL metadata exchange service handler.
-pub struct NixlMetadataService {
+pub struct NixlMetadataServiceHandler {
     #[cfg(feature = "nixl")]
     nixl_agent: Option<Arc<NixlExchange>>,
 }
 
-impl NixlMetadataService {
+impl NixlMetadataServiceHandler {
     pub fn new(
         #[cfg(feature = "nixl")]
         nixl_agent: Option<Arc<NixlExchange>>,
@@ -29,13 +29,14 @@ impl NixlMetadataService {
         }
     }
 
-    /// Exchange NIXL metadata for GPU-direct transfer.
-    ///
-    /// Sender offers GPU buffer descriptors, receiver allocates destination
-    /// buffers and returns their addresses for RDMA transfer.
+}
+
+// Implement the tonic-generated trait
+#[tonic::async_trait]
+impl doris_proto::nixl::NixlMetadataService for NixlMetadataServiceHandler {
     #[cfg(feature = "nixl")]
     #[instrument(skip_all, fields(peer, num_buffers))]
-    pub async fn exchange_metadata(
+    async fn exchange_metadata(
         &self,
         request: Request<doris_proto::nixl::PExchangeNixlMetadataRequest>,
     ) -> Result<Response<doris_proto::nixl::PExchangeNixlMetadataResponse>, Status> {
@@ -113,7 +114,7 @@ impl NixlMetadataService {
     }
 
     #[cfg(not(feature = "nixl"))]
-    pub async fn exchange_metadata(
+    async fn exchange_metadata(
         &self,
         _: Request<doris_proto::nixl::PExchangeNixlMetadataRequest>,
     ) -> Result<Response<doris_proto::nixl::PExchangeNixlMetadataResponse>, Status> {
@@ -130,9 +131,9 @@ mod tests {
     #[tokio::test]
     async fn test_service_creation() {
         #[cfg(feature = "nixl")]
-        let service = NixlMetadataService::new(None);
+        let service = NixlMetadataServiceHandler::new(None);
         #[cfg(not(feature = "nixl"))]
-        let service = NixlMetadataService::new();
+        let service = NixlMetadataServiceHandler::new();
 
         // Service should be created successfully
         let _ = service;
@@ -141,7 +142,9 @@ mod tests {
     #[tokio::test]
     #[cfg(not(feature = "nixl"))]
     async fn test_exchange_metadata_without_nixl() {
-        let service = NixlMetadataService::new();
+        use doris_proto::nixl::NixlMetadataService;
+
+        let service = NixlMetadataServiceHandler::new();
         let request = Request::new(doris_proto::nixl::PExchangeNixlMetadataRequest {
             nixl_metadata: vec![],
             src_buffers: vec![],
