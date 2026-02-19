@@ -9,6 +9,7 @@ concurrency:
 jobs:
   test:
     runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 60
     steps:
       - name: Cleanup
         run: rm -rf -- * .[^.]* ..?*
