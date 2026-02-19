@@ -52,6 +52,23 @@ std::optional<duckdb::idx_t> extract_bound_ref_index(const duckdb::Expression& e
 }  // namespace
 duckdb::idx_t sirius_physical_partition::s_partition_size =
   sirius_physical_partition::DEFAULT_PARTITION_SIZE;
+namespace {
+
+std::optional<duckdb::idx_t> extract_bound_ref_index(const duckdb::Expression& expr)
+{
+  if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
+    return expr.Cast<duckdb::BoundReferenceExpression>().index;
+  }
+  if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_CAST) {
+    auto& cast_expr = expr.Cast<duckdb::BoundCastExpression>();
+    if (cast_expr.child->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
+      return cast_expr.child->Cast<duckdb::BoundReferenceExpression>().index;
+    }    
+  }
+  return std::nullopt;
+}
+
+}  // namespace
 
 sirius_physical_partition::sirius_physical_partition(duckdb::vector<duckdb::LogicalType> types,
                                                      duckdb::idx_t estimated_cardinality,

@@ -99,6 +99,7 @@ sirius_physical_nested_loop_join::sirius_physical_nested_loop_join(
     conditions(std::move(cond))
 {
   reorder_conditions(conditions);
+
   children.push_back(std::move(left));
   children.push_back(std::move(right));
   auto& lhs_types = children[0]->get_types();
