@@ -1,0 +1,11 @@
+[package]
+name = "nixl-test"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "nixl-test"
+path = "src/main.rs"
+
+[dependencies]
+nixl-sys = "0.10"
