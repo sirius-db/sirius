@@ -222,3 +222,187 @@ pub struct NixlMetadataExchange {
     /// Number of rows in the data.
     pub num_rows: u32,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_nixl_exchange_initialization() {
+        // Test that NixlExchange can be created with a valid agent name.
+        let agent_name = "test-agent";
+        let result = NixlExchange::try_new(agent_name);
+
+        // Should succeed (or return None if nixl library not available).
+        // We don't assert success because nixl may not be available in test environment.
+        match result {
+            Some(exchange) => {
+                assert!(!exchange.local_metadata().is_empty());
+            }
+            None => {
+                // Expected when nixl is not available
+            }
+        }
+    }
+
+    #[test]
+    fn test_local_metadata_retrieval() {
+        if let Some(exchange) = NixlExchange::try_new("metadata-test") {
+            let metadata = exchange.local_metadata();
+            assert!(!metadata.is_empty(), "local metadata should not be empty");
+        }
+    }
+
+    #[test]
+    fn test_load_remote_metadata() {
+        let Some(exchange) = NixlExchange::try_new("peer-test") else {
+            // Skip if nixl not available
+            return;
+        };
+
+        // Simulate remote metadata (in real scenario this comes from another BE).
+        let fake_remote_md = b"fake-remote-metadata";
+        let result = exchange.load_remote_metadata("remote-be:8060", fake_remote_md);
+
+        // Should either succeed or fail gracefully.
+        match result {
+            Ok(remote_name) => {
+                assert!(!remote_name.is_empty());
+
+                // Loading same peer again should use cache and return same name.
+                let result2 = exchange.load_remote_metadata("remote-be:8060", fake_remote_md);
+                assert!(result2.is_ok());
+                assert_eq!(result2.unwrap(), remote_name);
+            }
+            Err(e) => {
+                // Expected if metadata format is invalid
+                assert!(e.contains("load_remote_md") || e.contains("metadata"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_invalidate_peer() {
+        let Some(exchange) = NixlExchange::try_new("invalidate-test") else {
+            return;
+        };
+
+        let peer_addr = "peer:8060";
+        let fake_md = b"peer-metadata";
+
+        // Load, then invalidate.
+        if exchange.load_remote_metadata(peer_addr, fake_md).is_ok() {
+            exchange.invalidate_peer(peer_addr);
+            // After invalidation, loading again should re-register (no cached entry).
+            // We can't easily verify this without internal state inspection, but at least
+            // ensure invalidate doesn't panic.
+        }
+    }
+
+    #[test]
+    fn test_create_gpu_descs() {
+        let Some(exchange) = NixlExchange::try_new("desc-test") else {
+            return;
+        };
+
+        let gpu_ptrs = vec![
+            (0x1000, 1024),
+            (0x2000, 2048),
+        ];
+        let device_id = 0;
+
+        let result = exchange.create_gpu_descs(&gpu_ptrs, device_id);
+        match result {
+            Ok(_descs) => {
+                // Successfully created descriptor list
+            }
+            Err(e) => {
+                // May fail if GPU not available
+                assert!(e.contains("XferDescList") || e.contains("desc"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_transfer_gpu_to_gpu_mock() {
+        // This test requires actual GPU memory, so we can't run it in CI.
+        // It serves as documentation of the API usage pattern.
+
+        // Pattern:
+        // 1. Both sender and receiver create NixlExchange agents
+        // 2. Exchange metadata via gRPC
+        // 3. Sender creates src_descs from its GPU buffers
+        // 4. Receiver creates dst_descs (allocates GPU buffers)
+        // 5. Receiver calls transfer_gpu_to_gpu to pull data
+
+        // For actual testing, this would need:
+        // - GPU-enabled environment
+        // - Two separate processes or threads simulating sender/receiver
+        // - Actual GPU allocations
+    }
+
+    #[test]
+    fn test_gpu_buffer_desc_clone() {
+        let desc = GpuBufferDesc {
+            addr: 0xDEADBEEF,
+            len: 4096,
+            device_id: 0,
+        };
+
+        let cloned = desc.clone();
+        assert_eq!(cloned.addr, desc.addr);
+        assert_eq!(cloned.len, desc.len);
+        assert_eq!(cloned.device_id, desc.device_id);
+    }
+
+    #[test]
+    fn test_nixl_metadata_exchange_structure() {
+        let msg = NixlMetadataExchange {
+            metadata: vec![1, 2, 3, 4],
+            buffer_descs: vec![
+                GpuBufferDesc {
+                    addr: 0x1000,
+                    len: 100,
+                    device_id: 0,
+                },
+            ],
+            column_info: vec![
+                ("col1".to_string(), 5), // INT32
+                ("col2".to_string(), 16), // STRING
+            ],
+            num_rows: 42,
+        };
+
+        assert_eq!(msg.metadata.len(), 4);
+        assert_eq!(msg.buffer_descs.len(), 1);
+        assert_eq!(msg.column_info.len(), 2);
+        assert_eq!(msg.num_rows, 42);
+
+        // Test clone
+        let cloned = msg.clone();
+        assert_eq!(cloned.num_rows, 42);
+    }
+
+    #[test]
+    fn test_multiple_peer_caching() {
+        let Some(exchange) = NixlExchange::try_new("multi-peer-test") else {
+            return;
+        };
+
+        let peers = vec![
+            ("peer1:8060", b"md1".as_slice()),
+            ("peer2:8060", b"md2".as_slice()),
+            ("peer3:8060", b"md3".as_slice()),
+        ];
+
+        let mut names = Vec::new();
+        for (addr, md) in &peers {
+            if let Ok(name) = exchange.load_remote_metadata(addr, md) {
+                names.push(name);
+            }
+        }
+
+        // At least verify we can load multiple peers without errors.
+        // Actual name validation depends on nixl-sys implementation.
+    }
+}

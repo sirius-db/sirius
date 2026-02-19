@@ -14,4 +14,7 @@ pub mod grpc_service;
 pub mod heartbeat_service;
 #[cfg(feature = "nixl")]
 pub mod nixl_exchange;
+pub mod nixl_integration;
+#[cfg(all(test, feature = "nixl"))]
+mod nixl_exchange_mock;
 pub mod pblock_decoder;

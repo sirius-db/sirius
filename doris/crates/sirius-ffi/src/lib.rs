@@ -493,6 +493,87 @@ impl SiriusEngine {
             Err(EngineError::NotCompiled)
         }
     }
+
+    /// Get GPU buffer pointers from the last execution (for nixl GPU-direct exchange).
+    ///
+    /// Returns `Ok(Some(...))` if the last query was GPU-accelerated and buffers are
+    /// still resident in GPU memory. Returns `Ok(None)` if executed on CPU or buffers
+    /// have been freed. Returns `Err` on query failure.
+    ///
+    /// The returned structure contains:
+    /// - `buffer_addrs`: Vec of (addr, len, device_id) for each Arrow buffer
+    /// - `column_info`: Vec of (column_name, type_id) pairs
+    /// - `num_rows`: Total row count
+    /// - `schema_ipc`: Arrow IPC schema bytes (for receiver reconstruction)
+    pub fn get_last_gpu_result_buffers(&self) -> Result<Option<GpuResultInfo>, EngineError> {
+        #[cfg(feature = "duckdb-bundled")]
+        {
+            // Query the Sirius extension for GPU buffer information.
+            // This uses a special function: `sirius_get_last_gpu_buffers()` that
+            // returns a table with columns: buffer_id, addr, len, device_id, column_name, type_id, num_rows.
+            //
+            // If the last query was CPU-only or buffers have been freed, returns empty set.
+
+            let sql = "SELECT buffer_id, addr, len, device_id, column_name, type_id, num_rows FROM sirius_get_last_gpu_buffers()";
+            let mut stmt = self
+                .conn
+                .prepare(sql)
+                .map_err(|e| EngineError::ExecFailed(format!("sirius_get_last_gpu_buffers: {e}")))?;
+
+            let mut rows = stmt
+                .query([])
+                .map_err(|e| EngineError::ExecFailed(format!("query gpu buffers: {e}")))?;
+
+            let mut buffer_addrs = Vec::new();
+            let mut column_info = Vec::new();
+            let mut num_rows_opt = None;
+
+            while let Some(row) = rows.next().map_err(|e| EngineError::ExecFailed(e.to_string()))? {
+                let addr: i64 = row.get(1).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+                let len: i64 = row.get(2).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+                let device_id: i64 = row.get(3).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+                let column_name: String = row.get(4).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+                let type_id: i32 = row.get(5).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+                let num_rows: i64 = row.get(6).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+
+                buffer_addrs.push((addr as usize, len as usize, device_id as u64));
+                column_info.push((column_name, type_id));
+                num_rows_opt = Some(num_rows as u32);
+            }
+
+            if buffer_addrs.is_empty() {
+                return Ok(None);
+            }
+
+            // Get schema IPC bytes (query the schema without data).
+            let schema_ipc = Vec::new(); // TODO: extract schema from last query
+
+            Ok(Some(GpuResultInfo {
+                buffer_addrs,
+                column_info,
+                num_rows: num_rows_opt.unwrap_or(0),
+                schema_ipc,
+            }))
+        }
+
+        #[cfg(not(feature = "duckdb-bundled"))]
+        {
+            Err(EngineError::NotCompiled)
+        }
+    }
+}
+
+/// GPU result buffer information for nixl transfers.
+#[derive(Debug, Clone)]
+pub struct GpuResultInfo {
+    /// GPU buffer addresses: (addr, len, device_id).
+    pub buffer_addrs: Vec<(usize, usize, u64)>,
+    /// Column metadata: (name, type_id).
+    pub column_info: Vec<(String, i32)>,
+    /// Number of rows.
+    pub num_rows: u32,
+    /// Arrow IPC schema bytes.
+    pub schema_ipc: Vec<u8>,
 }
 
 /// Errors from the Sirius engine.
