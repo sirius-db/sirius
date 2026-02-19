@@ -222,29 +222,29 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
       auto result_view = aggregation_result.results[j]->view();
       // Widen decimal result for SUM (expected by duckdb)
       if (requests[i].aggregations[j]->kind == cudf::aggregation::Kind::SUM) {
-        if (requests[i].values.type().id() == cudf::type_id::DECIMAL64 &&
-        aggregation_result.results[j] =
-        cudf::cast(result_view,
-          cudf::data_type(cudf::type_id::DECIMAL128, result_view.type().scale());,
-                   stream,
-                   memory_space.get_default_allocator());
-        } else if (requests[i].values.type().id() == cudf::type_id::DECIMAL32 &&
-        aggregation_result.results[j] =
-        cudf::cast(result_view,
-          cudf::data_type(cudf::type_id::DECIMAL64, result_view.type().scale());,
-                   stream,
-                   memory_space.get_default_allocator());
+        if (requests[i].values.type().id() == cudf::type_id::DECIMAL64) {
+          aggregation_result.results[j] =
+            cudf::cast(result_view,
+                       cudf::data_type(cudf::type_id::DECIMAL128, result_view.type().scale()),
+                       stream,
+                       memory_space.get_default_allocator());
+        } else if (requests[i].values.type().id() == cudf::type_id::DECIMAL32) {
+          aggregation_result.results[j] =
+            cudf::cast(result_view,
+                       cudf::data_type(cudf::type_id::DECIMAL64, result_view.type().scale()),
+                       stream,
+                       memory_space.get_default_allocator());
+        }
+      }
+      size_t output_col_id       = group_idx.size() + output_idx[j];
+      output_cols[output_col_id] = std::move(aggregation_result.results[j]);
     }
   }
-  size_t output_col_id       = group_idx.size() + output_idx[j];
-  output_cols[output_col_id] = std::move(aggregation_result.results[j]);
-}
-}
 
-// Create the output data batch
-auto output_table = std::make_unique<cudf::table>(
-  std::move(output_cols), stream, memory_space.get_default_allocator());
-return make_data_batch(std::move(output_table), memory_space);
+  // Create the output data batch
+  auto output_table = std::make_unique<cudf::table>(
+    std::move(output_cols), stream, memory_space.get_default_allocator());
+  return make_data_batch(std::move(output_table), memory_space);
 }
 
 }  // namespace op
