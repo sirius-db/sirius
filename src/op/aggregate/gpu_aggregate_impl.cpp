@@ -74,6 +74,16 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_ungrouped_aggre
             break;
           }
           default: break;
+          case cudf::type_id::DECIMAL64:
+            if (input_col.type().id() == cudf::type_id::DECIMAL64) {
+              output_type = cudf::data_type(cudf::type_id::DECIMAL128, output_type.scale());
+            }
+            break;
+          case cudf::type_id::DECIMAL32:
+            if (input_col.type().id() == cudf::type_id::DECIMAL32) {
+              output_type = cudf::data_type(cudf::type_id::DECIMAL64, output_type.scale());
+            }
+            break;
         }
         break;
       }
@@ -210,25 +220,31 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
     const auto& output_idx = input_col_to_output_idx[aggregate_col_id];
     for (size_t j = 0; j < output_idx.size(); ++j) {
       auto result_view = aggregation_result.results[j]->view();
-      // Cast result to DECIMAL128 when input and output are DECIMAL64 (expected by duckdb)
-      if (requests[i].aggregations[j]->kind == cudf::aggregation::Kind::SUM &&
-          requests[i].values.type().id() == cudf::type_id::DECIMAL64 &&
-          result_view.type().id() == cudf::type_id::DECIMAL64) {
+      // Widen decimal result for SUM (expected by duckdb)
+      if (requests[i].aggregations[j]->kind == cudf::aggregation::Kind::SUM) {
+        if (requests[i].values.type().id() == cudf::type_id::DECIMAL64 &&
         aggregation_result.results[j] =
-          cudf::cast(result_view,
-                     cudf::data_type(cudf::type_id::DECIMAL128, result_view.type().scale()),
-                     stream,
-                     memory_space.get_default_allocator());
-      }
-      size_t output_col_id       = group_idx.size() + output_idx[j];
-      output_cols[output_col_id] = std::move(aggregation_result.results[j]);
+        cudf::cast(result_view,
+          cudf::data_type(cudf::type_id::DECIMAL128, result_view.type().scale());,
+                   stream,
+                   memory_space.get_default_allocator());
+        } else if (requests[i].values.type().id() == cudf::type_id::DECIMAL32 &&
+        aggregation_result.results[j] =
+        cudf::cast(result_view,
+          cudf::data_type(cudf::type_id::DECIMAL64, result_view.type().scale());,
+                   stream,
+                   memory_space.get_default_allocator());
     }
   }
+  size_t output_col_id       = group_idx.size() + output_idx[j];
+  output_cols[output_col_id] = std::move(aggregation_result.results[j]);
+}
+}
 
-  // Create the output data batch
-  auto output_table = std::make_unique<cudf::table>(
-    std::move(output_cols), stream, memory_space.get_default_allocator());
-  return make_data_batch(std::move(output_table), memory_space);
+// Create the output data batch
+auto output_table = std::make_unique<cudf::table>(
+  std::move(output_cols), stream, memory_space.get_default_allocator());
+return make_data_batch(std::move(output_table), memory_space);
 }
 
 }  // namespace op
