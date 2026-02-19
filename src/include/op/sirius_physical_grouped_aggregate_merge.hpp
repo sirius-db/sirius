@@ -47,6 +47,7 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
                                           std::vector<int> cudf_aggregate_idx,
                                           std::vector<AggregateSlot> aggregate_slots,
                                           bool has_avg,
+                                          bool has_count_distinct,
                                           duckdb::idx_t estimated_cardinality);
 
   sirius_physical_grouped_aggregate_merge(
@@ -91,9 +92,10 @@ class sirius_physical_grouped_aggregate_merge : public sirius_physical_partition
   std::vector<cudf::aggregation::Kind> cudf_aggregates;
   std::vector<int> cudf_aggregate_idx;
 
-  // AVG decomposition metadata
+  // AVG and COUNT DISTINCT decomposition metadata
   std::vector<AggregateSlot> aggregate_slots;
-  bool has_avg = false;
+  bool has_avg            = false;
+  bool has_count_distinct = false;
 
   std::size_t current_partition_index = 0;
 

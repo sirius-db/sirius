@@ -162,6 +162,7 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
   cudf_aggregate_idx = std::move(cudf_defs.cudf_aggregate_idx);
   aggregate_slots    = std::move(cudf_defs.aggregate_slots);
   has_avg            = cudf_defs.has_avg;
+  has_count_distinct = cudf_defs.has_count_distinct;
 }
 
 std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(

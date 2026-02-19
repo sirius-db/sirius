@@ -81,7 +81,8 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
 
   // AVG decomposition metadata
   std::vector<AggregateSlot> aggregate_slots;
-  bool has_avg = false;
+  bool has_avg            = false;
+  bool has_count_distinct = false;
 
  public:
   // Source interface

@@ -405,5 +405,54 @@ make_test_data_for_grouped_aggregate_with_avg(std::size_t num_groups,
   return {std::move(input_table), std::move(expected_table)};
 }
 
+/**
+ * @brief Create DuckDB aggregate expressions for COUNT(DISTINCT col) testing.
+ *
+ * Produces a single DISTINCT count aggregate expression referencing `agg_col_idx`,
+ * grouped by the columns at `group_indexes`. The count result type is BIGINT.
+ *
+ * @tparam KeyTraits Type traits for the GROUP BY key column(s)
+ * @tparam ValTraits Type traits for the column whose distinct values are counted
+ * @param group_indexes Column indices for GROUP BY expressions
+ * @param agg_col_idx Column index of the value column for COUNT(DISTINCT ...)
+ * @return AggregateExpressionResult containing output types, group, and aggregate expressions
+ */
+template <typename KeyTraits, typename ValTraits = KeyTraits>
+AggregateExpressionResult create_count_distinct_expressions(
+  const std::vector<std::size_t>& group_indexes, std::size_t agg_col_idx)
+{
+  AggregateExpressionResult result;
+
+  // Output types: one per group key column, then BIGINT for the distinct count
+  for (std::size_t i = 0; i < group_indexes.size(); ++i) {
+    result.output_types.push_back(KeyTraits::logical_type());
+  }
+  result.output_types.push_back(duckdb::LogicalType::BIGINT);
+
+  // Group expressions
+  for (std::size_t group_idx : group_indexes) {
+    result.groups.push_back(
+      duckdb::make_uniq<duckdb::BoundReferenceExpression>(KeyTraits::logical_type(), group_idx));
+  }
+
+  // COUNT(DISTINCT agg_col_idx) aggregate expression
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> agg_children;
+  agg_children.push_back(
+    duckdb::make_uniq<duckdb::BoundReferenceExpression>(ValTraits::logical_type(), agg_col_idx));
+
+  duckdb::AggregateFunction agg_function =
+    MakeDummyAggregate("count", {ValTraits::logical_type()}, duckdb::LogicalType::BIGINT);
+
+  auto agg_expr =
+    duckdb::make_uniq<duckdb::BoundAggregateExpression>(agg_function,
+                                                        std::move(agg_children),
+                                                        nullptr,  // filter
+                                                        nullptr,  // bind_info
+                                                        duckdb::AggregateType::DISTINCT);
+
+  result.aggregates.push_back(std::move(agg_expr));
+  return result;
+}
+
 }  // namespace test
 }  // namespace sirius

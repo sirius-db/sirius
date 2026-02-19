@@ -126,7 +126,13 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
     if (!input_col_to_agg.contains(aggregate_col_id)) {
       input_col_order.push_back(aggregate_col_id);
     }
-    auto groupby_aggregation = get_local_aggregation<cudf::groupby_aggregation>(aggregate_kind);
+    std::unique_ptr<cudf::groupby_aggregation> groupby_aggregation;
+    if (aggregate_kind == cudf::aggregation::Kind::COLLECT_SET) {
+      groupby_aggregation =
+        cudf::make_collect_set_aggregation<cudf::groupby_aggregation>(cudf::null_policy::EXCLUDE);
+    } else {
+      groupby_aggregation = get_local_aggregation<cudf::groupby_aggregation>(aggregate_kind);
+    }
     input_col_to_agg[aggregate_col_id].push_back(std::move(groupby_aggregation));
     input_col_to_output_idx[aggregate_col_id].push_back(i);
   }
@@ -147,8 +153,9 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
     int aggregate_col_id     = input_col_order[i];
     auto& aggregation_result = groupby_result.second[i];
 
-    // need to cast count aggregation result to int64
+    // need to cast count aggregation result to int64 (not applicable for COLLECT_SET)
     if (requests[i].aggregations.size() == 1 &&
+        requests[i].aggregations[0]->kind != cudf::aggregation::Kind::COLLECT_SET &&
         (requests[i].aggregations[0]->kind == cudf::aggregation::Kind::COUNT_VALID ||
          requests[i].aggregations[0]->kind == cudf::aggregation::Kind::COUNT_ALL)) {
       if (aggregation_result.results.size() != 1) {
