@@ -141,8 +141,11 @@ fn main() {
         info!("nixl not available, using bRPC exchange fallback");
     }
 
+    #[cfg(not(feature = "nixl"))]
+    let nixl_agent = None;
+
     let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
-    rt.block_on(run(config, version, grpc_addr, flight_addr, grpc_state, grpc_store, flight_store, engine, exchange_buffer));
+    rt.block_on(run(config, version, grpc_addr, flight_addr, grpc_state, grpc_store, flight_store, engine, exchange_buffer, nixl_agent));
 }
 
 #[instrument(name = "sirius_doris_be", skip_all, fields(
@@ -163,6 +166,10 @@ async fn run(
     flight_store: ResultStore,
     engine: Option<Arc<Mutex<SiriusEngine>>>,
     exchange_buffer: doris_rpc::exchange_buffer::ExchangeBuffer,
+    #[cfg(feature = "nixl")]
+    nixl_agent: Option<std::sync::Arc<doris_rpc::nixl_exchange::NixlExchange>>,
+    #[cfg(not(feature = "nixl"))]
+    _nixl_agent: Option<()>,
 ) {
     if let Some(fe_addr) = &config.fe {
         // Default advertise host: resolve system hostname to an IP.
@@ -197,8 +204,13 @@ async fn run(
         }
     });
 
+    #[cfg(feature = "nixl")]
+    let nixl_for_grpc = nixl_agent;
+    #[cfg(not(feature = "nixl"))]
+    let nixl_for_grpc = None;
+
     if let Err(e) =
-        doris_rpc::grpc_service::start_grpc_server(&grpc_addr, grpc_state, grpc_store, engine, exchange_buffer).await
+        doris_rpc::grpc_service::start_grpc_server(&grpc_addr, grpc_state, grpc_store, engine, exchange_buffer, nixl_for_grpc).await
     {
         error!(error = %e, "PBackendService gRPC server exited with error");
     }

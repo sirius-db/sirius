@@ -703,6 +703,8 @@ pub struct PBackendServiceHandler {
     result_store: ResultStore,
     engine: Option<Arc<Mutex<SiriusEngine>>>,
     exchange_buffer: ExchangeBuffer,
+    #[cfg(feature = "nixl")]
+    nixl_agent: Option<Arc<super::nixl_exchange::NixlExchange>>,
 }
 
 impl PBackendServiceHandler {
@@ -717,7 +719,15 @@ impl PBackendServiceHandler {
             result_store,
             engine,
             exchange_buffer,
+            #[cfg(feature = "nixl")]
+            nixl_agent: None,
         }
+    }
+
+    #[cfg(feature = "nixl")]
+    pub fn with_nixl_agent(mut self, agent: Option<Arc<super::nixl_exchange::NixlExchange>>) -> Self {
+        self.nixl_agent = agent;
+        self
     }
 }
 
@@ -1643,6 +1653,10 @@ pub async fn start_grpc_server(
     result_store: ResultStore,
     engine: Option<Arc<Mutex<SiriusEngine>>>,
     exchange_buffer: ExchangeBuffer,
+    #[cfg(feature = "nixl")]
+    nixl_agent: Option<Arc<super::nixl_exchange::NixlExchange>>,
+    #[cfg(not(feature = "nixl"))]
+    _nixl_agent: Option<()>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use doris_proto::doris::p_backend_service_server::PBackendServiceServer;
     use tokio_stream::wrappers::ReceiverStream;
@@ -1651,12 +1665,19 @@ pub async fn start_grpc_server(
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
     info!(addr = listen_addr, "starting PBackendService multi-protocol server (gRPC + bRPC)");
 
-    let handler = PBackendServiceHandler::new(
+    #[allow(unused_mut)]
+    let mut handler = PBackendServiceHandler::new(
         state,
         result_store,
         engine,
         exchange_buffer.clone(),
     );
+
+    #[cfg(feature = "nixl")]
+    {
+        handler = handler.with_nixl_agent(nixl_agent);
+    }
+
     let svc = PBackendServiceServer::new(handler);
 
     // Channel to feed gRPC connections to tonic's serve_with_incoming.
