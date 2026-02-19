@@ -97,8 +97,8 @@ std::optional<cucascade::data_batch_processing_handle> lock_or_prepare_batch(
 gpu_pipeline_task::gpu_pipeline_task(
   uint64_t task_id,
   std::vector<cucascade::shared_data_repository*> data_repos,
-  std::unique_ptr<sirius_pipeline_itask_local_state> local_state,
-  std::shared_ptr<sirius::parallel::itask_global_state> global_state)
+  std::unique_ptr<sirius_pipeline_task_local_state> local_state,
+  std::shared_ptr<sirius_pipeline_task_global_state> global_state)
   : sirius_pipeline_itask(std::move(local_state), std::move(global_state)),
     _task_id(task_id),
     _data_repos(std::move(data_repos))
@@ -108,17 +108,17 @@ gpu_pipeline_task::gpu_pipeline_task(
 gpu_pipeline_task::~gpu_pipeline_task()
 {
   if (_global_state == nullptr ||
-      _global_state->cast<gpu_pipeline_task_global_state>()._pipeline.get() == nullptr) {
+      _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline() == nullptr) {
     return;
   }
-  _global_state->cast<gpu_pipeline_task_global_state>()._pipeline.get()->mark_task_completed();
+  _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline()->mark_task_completed();
 }
 
 uint64_t gpu_pipeline_task::get_task_id() const { return _task_id; }
 
 const sirius_pipeline* gpu_pipeline_task::get_pipeline() const
 {
-  return _global_state->cast<gpu_pipeline_task_global_state>()._pipeline.get();
+  return _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline();
 }
 
 std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_stream_view stream)
@@ -127,7 +127,7 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
   auto operator_input_output_data = std::move(local_state._input_data);
 
   for (auto& op :
-       _global_state->cast<gpu_pipeline_task_global_state>()._pipeline.get()->get_operators()) {
+       _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline()->get_operators()) {
     operator_input_output_data = op.get().execute(*operator_input_output_data, stream);
   }
   return operator_input_output_data;
@@ -136,7 +136,7 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
 void gpu_pipeline_task::publish_output(op::operator_data& output_data, rmm::cuda_stream_view stream)
 {
   auto sink_operators =
-    _global_state->cast<gpu_pipeline_task_global_state>()._pipeline.get()->get_sink();
+    _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline()->get_sink();
   if (sink_operators) {
     sink_operators.get()->sink(output_data, stream);
   } else {
@@ -210,11 +210,11 @@ std::vector<op::sirius_physical_operator*> gpu_pipeline_task::get_output_consume
 {
   std::vector<op::sirius_physical_operator*> output_consumers;
   if (_global_state == nullptr ||
-      _global_state->cast<gpu_pipeline_task_global_state>()._pipeline.get() == nullptr) {
+      _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline() == nullptr) {
     return output_consumers;
   }
   auto parents =
-    _global_state->cast<gpu_pipeline_task_global_state>()._pipeline.get()->get_parents();
+    _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline()->get_parents();
   for (auto& parent : parents) {
     output_consumers.push_back(&parent->get_operators()[0].get());
   }

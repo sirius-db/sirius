@@ -150,6 +150,12 @@ void SiriusContext::terminate()
 {
   throw_if_not_initialized();
 
+  pipeline_executor_->stop();
+  pipeline_executor_.reset();
+  task_creator_->stop_thread_pool();
+  task_creator_.reset();
+  downgrade_executor_.reset();
+
   memory_manager_->shutdown();
   memory_manager_.reset();
 
@@ -221,6 +227,7 @@ void SiriusContext::create_query(sirius::sirius_pipeline_hashmap pipeline_hashma
   throw_if_not_initialized();
   query_ = duckdb::make_shared_ptr<sirius::planner::query>(std::move(pipeline_hashmap));
   pipeline_executor_->prepare_for_query(query_);
+  task_creator_->prepare_for_query(*query_);
 }
 
 duckdb::shared_ptr<sirius::planner::query> SiriusContext::get_query()
@@ -257,6 +264,8 @@ void SiriusContextExtensionCallback::OnConnectionOpened(ClientContext& context)
 void SiriusContextExtensionCallback::OnConnectionClosed(ClientContext& context)
 {
   spdlog::info("Connection closed.");
+  // remove the context from the registered state
+  context.registered_state->Remove("sirius_state");
 }
 
 void SiriusContextExtensionCallback::OnExtensionLoaded(DatabaseInstance& db, const string& name)

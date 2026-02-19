@@ -17,6 +17,7 @@
 #pragma once
 
 #include "parallel/task.hpp"
+#include "pipeline/sirius_pipeline.hpp"
 
 #include <cucascade/memory/memory_reservation.hpp>
 
@@ -26,6 +27,36 @@ namespace sirius {
 namespace pipeline {
 
 /**
+ * @brief Global state shared across all GPU pipeline tasks in an execution context.
+ *
+ * This class maintains resources and state that are shared among multiple tasks
+ * within the same execution context. It provides access to the data repository
+ * for retrieving input data and a message queue for notifying the TaskCreator
+ * about task completion events.
+ */
+class sirius_pipeline_task_global_state : public sirius::parallel::itask_global_state {
+ public:
+  /**
+   * @brief Construct a new sirius_pipeline_task_global_state object
+   *
+   * @param pipeline Shared pointer to the GPU pipeline to execute
+   */
+  explicit sirius_pipeline_task_global_state(duckdb::shared_ptr<sirius_pipeline> pipeline)
+    : _pipeline(std::move(pipeline))
+  {
+  }
+
+  [[nodiscard]] const sirius_pipeline* get_pipeline() const { return _pipeline.get(); }
+
+  [[nodiscard]] sirius_pipeline* get_pipeline() { return _pipeline.get(); }
+
+  [[nodiscard]] size_t get_pipeline_id() const { return _pipeline->get_pipeline_id(); }
+
+ private:
+  duckdb::shared_ptr<sirius_pipeline> _pipeline;  ///< Shared pointer to the GPU pipeline to execute
+};
+
+/**
  * @brief Interface for pipeline task local states that manage memory reservations.
  *
  * This class extends itask_local_state to provide memory reservation management
@@ -33,12 +64,12 @@ namespace pipeline {
  * tasks and DuckDB scan tasks that need to manage memory reservations.
  */
 // WSM TODO: consider merging this with itask_local_state
-class sirius_pipeline_itask_local_state : public parallel::itask_local_state {
+class sirius_pipeline_task_local_state : public parallel::itask_local_state {
  public:
   /**
    * @brief Destructor for proper cleanup of derived classes.
    */
-  ~sirius_pipeline_itask_local_state() override = default;
+  ~sirius_pipeline_task_local_state() override = default;
 
   /**
    * @brief Release and return the memory reservation held by this task.
@@ -74,7 +105,7 @@ class sirius_pipeline_itask_local_state : public parallel::itask_local_state {
    * This constructor is protected to ensure the class can only be instantiated
    * through derived classes.
    */
-  sirius_pipeline_itask_local_state() = default;
+  sirius_pipeline_task_local_state() = default;
 
   std::unique_ptr<cucascade::memory::reservation>
     _reservation;  ///< Memory reservation for GPU resources
