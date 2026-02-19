@@ -308,7 +308,7 @@ from
 where
   ps.ps_suppkey = s.s_suppkey
   and s.s_nationkey = n.n_nationkey
-  and n.n_name = 'JAPAN'
+  and n.n_name = 'GERMANY'
 group by
   ps.ps_partkey having
     sum(ps.ps_supplycost * ps.ps_availqty) > (
@@ -321,7 +321,7 @@ group by
       where
         ps.ps_suppkey = s.s_suppkey
         and s.s_nationkey = n.n_nationkey
-        and n.n_name = 'JAPAN'
+        and n.n_name = 'GERMANY'
     )
 order by
   value desc""",

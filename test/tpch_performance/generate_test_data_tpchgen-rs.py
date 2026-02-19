@@ -16,6 +16,50 @@ import duckdb
 import os
 import sys
 
+# Import queries from same directory
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+if _script_dir not in sys.path:
+    sys.path.insert(0, _script_dir)
+import queries as _queries_module
+
+QUERIES = _queries_module.QUERIES
+
+
+def _q11_ratio_for_sf(sf):
+    """Q11 ratio: 0.0001 for sf=1; inversely proportional to sf."""
+    return 0.0001 / float(sf)
+
+
+def _generate_tpch_queries(sf, out_root):
+    """Write orig/ and gpu/ query files under out_root using QUERIES and scale-dependent Q11 ratio."""
+    orig_dir = os.path.join(out_root, "orig")
+    gpu_dir = os.path.join(out_root, "gpu")
+    os.makedirs(orig_dir, exist_ok=True)
+    os.makedirs(gpu_dir, exist_ok=True)
+
+    q11_ratio = _q11_ratio_for_sf(sf)
+
+    for name, sql in QUERIES.items():
+        # Q11: substitute ratio with scale-factor-dependent value
+        if name == "q11":
+            sql = sql.replace(
+                "0.0001000000", f"{q11_ratio:.10f}".rstrip("0").rstrip(".")
+            )
+
+        # Orig: unmodified query
+        orig_path = os.path.join(orig_dir, f"{name}.sql")
+        with open(orig_path, "w") as f:
+            f.write(sql.strip())
+            f.write("\n")
+
+        # GPU: wrap in call gpu_execution('...'); (escape single quotes by doubling)
+        escaped = sql.strip().replace("'", "''")
+        gpu_sql = f"call gpu_execution('{escaped}');\n"
+        gpu_path = os.path.join(gpu_dir, f"{name}.sql")
+        with open(gpu_path, "w") as f:
+            f.write(gpu_sql)
+
+
 if __name__ == "__main__":
     con = duckdb.connect(
         "performance_test.duckdb", config={"allow_unsigned_extensions": "true"}
@@ -235,5 +279,10 @@ if __name__ == "__main__":
     COPY region FROM '{region_file}' {format_options}
     """
     )
+
+    # Generate TPC-H query files: orig (unmodified) and gpu (wrapped in call gpu_execution(...))
+    tpch_queries_dir = os.path.join(_script_dir, "tpch_queries")
+    _generate_tpch_queries(SF, tpch_queries_dir)
+    print(f"Wrote TPC-H queries to {tpch_queries_dir}/orig and {tpch_queries_dir}/gpu")
 
     con.close()
