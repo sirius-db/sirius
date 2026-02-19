@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use anyhow::Result;
 
 use doris_thrift::descriptors::TDescriptorTable;
+use doris_thrift::exprs::TExpr;
 use substrait::proto::r#type;
 use substrait::proto::{NamedStruct, Type};
 
@@ -39,6 +40,11 @@ pub struct DescriptorTable {
     /// Override column lists for tables (table_name → column names in order).
     /// Set by the gRPC handler from DuckDB's actual table columns.
     table_column_overrides: HashMap<String, Vec<String>>,
+    /// Slot expression map for scan node projections.
+    /// Maps slot_id → TExpr that produces this slot's value.
+    /// Used to inline computed expressions (e.g., `l_extendedprice * (1 - l_discount)`)
+    /// from scan node intermediate/final projections into downstream nodes (AGG, SORT).
+    slot_expressions: HashMap<i32, TExpr>,
 }
 
 impl DescriptorTable {
@@ -93,7 +99,7 @@ impl DescriptorTable {
                 .sort_by_key(|&sid| slots.get(&sid).map(|s| s.column_pos).unwrap_or(0));
         }
 
-        Ok(Self { slots, tuples, table_column_overrides: HashMap::new() })
+        Ok(Self { slots, tuples, table_column_overrides: HashMap::new(), slot_expressions: HashMap::new() })
     }
 
     pub fn get_slot(&self, slot_id: i32) -> Result<&SlotInfo> {
@@ -278,6 +284,22 @@ impl DescriptorTable {
                     columns
                 )
             })
+    }
+
+    /// Set the slot expression map for scan node projections.
+    ///
+    /// Maps slot_id → TExpr (the expression producing that slot's value).
+    /// When a SLOT_REF references a slot in this map, the expression translator
+    /// will recursively translate the mapped TExpr instead of looking up a column
+    /// position. This handles computed expression slots from scan node projections
+    /// (e.g., `l_extendedprice * (1 - l_discount)` in TPC-H Q1).
+    pub fn set_slot_expressions(&mut self, map: HashMap<i32, TExpr>) {
+        self.slot_expressions = map;
+    }
+
+    /// Get the expression that produces a slot's value (if it's a projection slot).
+    pub fn get_slot_expression(&self, slot_id: i32) -> Option<&TExpr> {
+        self.slot_expressions.get(&slot_id)
     }
 
     /// Build a Substrait NamedStruct from a tuple's materialized columns.

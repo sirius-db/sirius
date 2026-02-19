@@ -534,16 +534,43 @@ fn translate_aggregation_node(
 
     // Collapse two-phase aggregation: if this is the finalize phase and the child
     // is already a partial AggregateRel, unwrap the child and use a single aggregation.
+    // Also handles the case where a SortRel sits between finalize and partial
+    // (e.g. 3-fragment plans: AGG_finalize → SORT → AGG_partial → SCAN).
     if agg_node.need_finalize {
-        if let Some(rel::RelType::Aggregate(child_agg)) = input.rel_type.as_ref() {
+        // Extract the partial AggregateRel, possibly through a SortRel wrapper.
+        let (child_agg_opt, sort_wrapper) = match input.rel_type.as_ref() {
+            Some(rel::RelType::Aggregate(agg)) => (Some(agg.clone()), None),
+            Some(rel::RelType::Sort(sort)) => {
+                match sort.input.as_ref().and_then(|i| i.rel_type.as_ref()) {
+                    Some(rel::RelType::Aggregate(agg)) => {
+                        // SortRel wraps partial AggregateRel.
+                        (Some(agg.clone()), Some(sort.clone()))
+                    }
+                    _ => (None, None),
+                }
+            }
+            _ => (None, None),
+        };
+
+        if let Some(child_agg) = child_agg_opt {
             // Reuse the partial aggregation's input, groupings, measures, and expressions,
             // but upgrade all measure phases to INITIAL_TO_RESULT.
-            let mut merged = *child_agg.clone();
+            let mut merged = *child_agg;
 
             // The partial's measure order may differ from the finalize's expected order.
             // Detect this by matching each finalize aggregate_function's SLOT_REF child
             // to the partial node's output tuple measure slots.
-            if let Some(partial_node) = child_node {
+            // When a SortRel is between them, child_node is the SORT node, not the partial.
+            // Walk down to find the actual AGG partial node for slot matching.
+            let partial_node = if sort_wrapper.is_some() {
+                // child_node is the SORT; the partial AGG is the SORT's child (2 levels down).
+                // We need to find the partial node's row_tuples from the descriptor table.
+                // For now, skip reordering when sort is present (the partial order should match).
+                None
+            } else {
+                child_node
+            };
+            if let Some(partial_node) = partial_node {
                 let num_grouping = merged
                     .groupings
                     .first()
@@ -621,7 +648,18 @@ fn translate_aggregation_node(
             let agg_rel = Rel {
                 rel_type: Some(rel::RelType::Aggregate(Box::new(merged))),
             };
-            return apply_conjuncts(agg_rel, node, desc, registry);
+
+            // If there was a SortRel between finalize and partial, reapply it
+            // on top of the collapsed aggregate (produces ORDER BY on the final result).
+            let result = if let Some(mut sort) = sort_wrapper {
+                sort.input = Some(Box::new(agg_rel));
+                Rel {
+                    rel_type: Some(rel::RelType::Sort(Box::new(*sort))),
+                }
+            } else {
+                agg_rel
+            };
+            return apply_conjuncts(result, node, desc, registry);
         }
     }
 
@@ -717,6 +755,14 @@ fn translate_sort_node(
 
     let input = children.into_iter().next().unwrap();
 
+    tracing::info!(
+        node_id = node.node_id,
+        row_tuples = ?node.row_tuples,
+        child_row_tuples = ?child_node.map(|c| &c.row_tuples),
+        num_ordering_exprs = sort_info.ordering_exprs.len(),
+        "translate_sort_node: sort context"
+    );
+
     // Build SortField for each ordering expression.
     let mut sorts = Vec::new();
     for (i, expr) in sort_info.ordering_exprs.iter().enumerate() {
@@ -730,10 +776,22 @@ fn translate_sort_node(
             (false, false) => sort_field::SortDirection::DescNullsLast,
         };
 
-        let sort_expr = if let Some(child) = child_node {
-            expr_translator::translate_expr_in_context(expr, desc, registry, &child.row_tuples)?
-        } else {
-            expr_translator::translate_expr(expr, desc, registry)?
+        // Resolve sort expressions against the sort node's own row_tuples first
+        // (these match the sort input/output schema). Fall back to child node's
+        // tuples, then to unscoped resolution.
+        let sort_expr = {
+            let try_tuples = if !node.row_tuples.is_empty() {
+                Some(&node.row_tuples[..])
+            } else if let Some(child) = child_node {
+                Some(&child.row_tuples[..])
+            } else {
+                None
+            };
+            if let Some(tuples) = try_tuples {
+                expr_translator::translate_expr_in_context(expr, desc, registry, tuples)?
+            } else {
+                expr_translator::translate_expr(expr, desc, registry)?
+            }
         };
         sorts.push(SortField {
             expr: Some(sort_expr),

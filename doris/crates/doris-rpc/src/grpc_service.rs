@@ -170,6 +170,45 @@ fn serialize_result_batch(rows: &[Vec<u8>], packet_seq: i64) -> Result<Vec<u8>, 
 /// The FE uses the result-sink fragment's `fragment_instance_id` (from
 /// `local_params[0]`) to call `fetch_data`, not the query-level `query_id`.
 /// Fall back to `query_id` if `local_params` is empty.
+/// Find the finst_id for the result-sink fragment (fragment_id=0).
+///
+/// Before merging, we need to identify which fragment's finst_id the FE will
+/// use for fetch_data. This is always the result-sink fragment (fragment_id=0),
+/// which has an EXCHANGE_NODE at the root with 0 children. After merge, the
+/// merged fragment may have a different local_params[0] so we must capture
+/// the correct finst_id before merge.
+fn find_result_finst_id(all_params: &[TPipelineFragmentParams]) -> Option<FinstId> {
+    // Strategy 1: find fragment with fragment_id == 0.
+    for params in all_params {
+        if params.fragment_id == Some(0) {
+            if let Some(lp) = params.local_params.as_ref().and_then(|lp| lp.first()) {
+                return Some(FinstId {
+                    hi: lp.fragment_instance_id.hi,
+                    lo: lp.fragment_instance_id.lo,
+                });
+            }
+        }
+    }
+    // Strategy 2: find the exchange_root fragment (EXCHANGE_NODE at root, 0 children).
+    for params in all_params {
+        let is_exchange_root = params
+            .fragment.as_ref()
+            .and_then(|f| f.plan.as_ref())
+            .and_then(|p| p.nodes.first())
+            .map(|n| n.node_type == TPlanNodeType::EXCHANGE_NODE && n.num_children == 0)
+            .unwrap_or(false);
+        if is_exchange_root {
+            if let Some(lp) = params.local_params.as_ref().and_then(|lp| lp.first()) {
+                return Some(FinstId {
+                    hi: lp.fragment_instance_id.hi,
+                    lo: lp.fragment_instance_id.lo,
+                });
+            }
+        }
+    }
+    None
+}
+
 fn extract_finst_id(params: &TPipelineFragmentParams) -> FinstId {
     // FE calls fetch_data with local_params[0].fragment_instance_id, not query_id.
     // For single-fragment queries these are often the same, but for multi-fragment
@@ -194,6 +233,10 @@ fn extract_finst_id(params: &TPipelineFragmentParams) -> FinstId {
 ///   DATE=10, DATETIME=11, VARCHAR=16, DECIMALV2=12, LARGEINT=15,
 ///   CHAR=17, DATEV2=28, DATETIMEV2=29, DECIMAL32=47, DECIMAL64=48, DECIMAL128I=49
 fn arrow_type_to_doris(dt: &arrow::datatypes::DataType) -> PTypeDesc {
+    // TPrimitiveType values from Types.thrift:
+    // BOOLEAN=2, TINYINT=3, SMALLINT=4, INT=5, BIGINT=6, FLOAT=7, DOUBLE=8,
+    // DATE=9, DATETIME=10, CHAR=13, VARCHAR=15, STRING=23,
+    // DATEV2=26, DATETIMEV2=27, DECIMAL32=29, DECIMAL64=30, DECIMAL128I=31
     use arrow::datatypes::DataType;
     let scalar = match dt {
         DataType::Boolean => PScalarType { r#type: 2, len: None, precision: None, scale: None },
@@ -207,22 +250,22 @@ fn arrow_type_to_doris(dt: &arrow::datatypes::DataType) -> PTypeDesc {
         DataType::UInt64 => PScalarType { r#type: 6, len: None, precision: None, scale: None },
         DataType::Float16 | DataType::Float32 => PScalarType { r#type: 7, len: None, precision: None, scale: None },
         DataType::Float64 => PScalarType { r#type: 8, len: None, precision: None, scale: None },
-        DataType::Date32 | DataType::Date64 => PScalarType { r#type: 28, len: None, precision: None, scale: None },
-        DataType::Timestamp(_, _) => PScalarType { r#type: 29, len: None, precision: None, scale: None },
-        DataType::Utf8 | DataType::LargeUtf8 => PScalarType { r#type: 16, len: Some(65533), precision: None, scale: None },
+        DataType::Date32 | DataType::Date64 => PScalarType { r#type: 26, len: None, precision: None, scale: None }, // DATEV2
+        DataType::Timestamp(_, _) => PScalarType { r#type: 27, len: None, precision: None, scale: None }, // DATETIMEV2
+        DataType::Utf8 | DataType::LargeUtf8 => PScalarType { r#type: 23, len: Some(65533), precision: None, scale: None }, // STRING
         DataType::Decimal128(p, s) => {
             let p = *p as i32;
             let s = *s as i32;
             if p <= 9 {
-                PScalarType { r#type: 47, len: None, precision: Some(p), scale: Some(s) }
+                PScalarType { r#type: 29, len: None, precision: Some(p), scale: Some(s) } // DECIMAL32
             } else if p <= 18 {
-                PScalarType { r#type: 48, len: None, precision: Some(p), scale: Some(s) }
+                PScalarType { r#type: 30, len: None, precision: Some(p), scale: Some(s) } // DECIMAL64
             } else {
-                PScalarType { r#type: 49, len: None, precision: Some(p), scale: Some(s) }
+                PScalarType { r#type: 31, len: None, precision: Some(p), scale: Some(s) } // DECIMAL128I
             }
         }
-        // Default to VARCHAR for any other type
-        _ => PScalarType { r#type: 16, len: Some(65533), precision: None, scale: None },
+        // Default to STRING for any other type
+        _ => PScalarType { r#type: 23, len: Some(65533), precision: None, scale: None },
     };
     PTypeDesc {
         types: vec![PTypeNode {
@@ -384,6 +427,13 @@ fn merge_fragment_plans(
         }
     }
 
+    info!(
+        num_exchange_root = exchange_root_fragments.len(),
+        num_intermediate = intermediate_fragments.len(),
+        num_leaf = leaf_fragments.len(),
+        "merge_fragment_plans: classified fragments"
+    );
+
     // If there are no leaf fragments to merge with, the exchange-root fragments
     // are not simple result collectors — they depend on exchange data from
     // remote BEs. Return them so exec_plan_fragment can handle them via
@@ -429,6 +479,7 @@ fn merge_fragment_plans(
         || intermediate_fragments.iter().any(|p| has_remote_exchanges(p));
 
     if any_remote {
+        info!("merge_fragment_plans: remote exchanges detected, returning all fragments separately");
         // Return all fragments separately:
         // - Exchange-root/intermediate: async exchange path (wait for senders)
         // - Leaf fragments: execute scan, send results via bRPC to exchange destinations
@@ -452,16 +503,30 @@ fn merge_fragment_plans(
         return leaf_fragments.into_iter().cloned().collect();
     }
 
-    // Merge: for each intermediate fragment, replace EXCHANGE_NODE(0 children) with leaf plan.
-    // For simplicity, use the first leaf fragment's plan for all exchanges.
-    let leaf_nodes: Vec<_> = leaf_fragments
+    // Cascading merge: sort intermediates by fragment_id descending (innermost first),
+    // then merge leaf → inner intermediate → outer intermediate, producing a single
+    // fully-merged fragment. This handles 3+ fragment plans (e.g. SORT → AGG → SCAN).
+    intermediate_fragments.sort_by(|a, b| {
+        let id_a = a.fragment_id.unwrap_or(0);
+        let id_b = b.fragment_id.unwrap_or(0);
+        id_b.cmp(&id_a) // descending: highest fragment_id (innermost) first
+    });
+
+    let mut current_nodes: Vec<_> = leaf_fragments
         .first()
         .and_then(|p| p.fragment.as_ref())
         .and_then(|f| f.plan.as_ref())
         .map(|p| p.nodes.clone())
         .unwrap_or_default();
+    let mut current_scan_params = leaf_fragments
+        .first()
+        .and_then(|p| p.file_scan_params.clone());
+    let mut current_local_params = leaf_fragments
+        .first()
+        .and_then(|p| p.local_params.clone());
 
     for params in &mut intermediate_fragments {
+        // Replace EXCHANGE_NODE(0 children) with current merged plan nodes.
         if let Some(plan) = params
             .fragment
             .as_mut()
@@ -470,12 +535,9 @@ fn merge_fragment_plans(
             let mut merged_nodes = Vec::new();
             for node in &plan.nodes {
                 if node.node_type == TPlanNodeType::EXCHANGE_NODE && node.num_children == 0 {
-                    if !leaf_nodes.is_empty() {
-                        // Replace exchange with the leaf plan nodes.
-                        merged_nodes.extend_from_slice(&leaf_nodes);
+                    if !current_nodes.is_empty() {
+                        merged_nodes.extend_from_slice(&current_nodes);
                     } else {
-                        // No leaf to merge: keep the exchange node as-is.
-                        // It will be handled as an unresolved exchange.
                         merged_nodes.push(node.clone());
                     }
                 } else {
@@ -483,26 +545,50 @@ fn merge_fragment_plans(
                 }
             }
             plan.nodes = merged_nodes;
+            // Update current_nodes to this fragment's merged plan for the next cascade level.
+            current_nodes = plan.nodes.clone();
         }
 
-        // Merge file_scan_params and local_params from leaf fragments.
-        if let Some(leaf) = leaf_fragments.first() {
-            if let Some(leaf_scan_params) = &leaf.file_scan_params {
-                let merged_scan_params = params
-                    .file_scan_params
-                    .get_or_insert_with(Default::default);
-                for (k, v) in leaf_scan_params {
-                    merged_scan_params.entry(*k).or_insert_with(|| v.clone());
-                }
+        // Merge file_scan_params from inner level.
+        if let Some(inner_scan) = &current_scan_params {
+            let merged_scan = params
+                .file_scan_params
+                .get_or_insert_with(Default::default);
+            for (k, v) in inner_scan {
+                merged_scan.entry(*k).or_insert_with(|| v.clone());
             }
-            // Merge local_params (contains per_node_scan_ranges needed for file path extraction).
+        }
+        current_scan_params = params.file_scan_params.clone();
+
+        // Merge local_params from inner level.
+        if let Some(inner_local) = &current_local_params {
             if params.local_params.is_none() {
-                params.local_params = leaf.local_params.clone();
-            } else if let Some(leaf_local) = &leaf.local_params {
+                params.local_params = Some(inner_local.clone());
+            } else {
                 let merged_local = params.local_params.get_or_insert_with(Vec::new);
-                for lp in leaf_local {
+                for lp in inner_local {
                     merged_local.push(lp.clone());
                 }
+            }
+        }
+        current_local_params = params.local_params.clone();
+    }
+
+    // After cascading, keep only the outermost intermediate (lowest fragment_id = last).
+    if intermediate_fragments.len() > 1 {
+        let outermost = intermediate_fragments.pop().unwrap();
+        intermediate_fragments = vec![outermost];
+    }
+
+    // If the cascade produced a single fragment with no exchange_root to consume it,
+    // clear the output_sink so the result is stored locally (not sent via exchange).
+    if exchange_root_fragments.is_empty() && intermediate_fragments.len() == 1 {
+        if let Some(fragment) = intermediate_fragments[0].fragment.as_mut() {
+            if fragment.output_sink.as_ref()
+                .map(|s| s.type_ == TDataSinkType::DATA_STREAM_SINK)
+                .unwrap_or(false)
+            {
+                fragment.output_sink = None;
             }
         }
     }
@@ -836,6 +922,10 @@ impl PBackendService for PBackendServiceHandler {
 
         info!(num_fragments = all_params.len(), "deserialized fragment params");
 
+        // Before merge: find the result-sink fragment's finst_id (fragment_id=0).
+        // FE always calls fetch_data with this finst_id regardless of merge.
+        let result_finst_id = find_result_finst_id(&all_params);
+
         // Merge multi-fragment plans for single-BE execution.
         // This replaces EXCHANGE_NODE(0 children) in intermediate fragments with
         // the leaf (scan) fragment's plan, producing a single executable plan.
@@ -847,7 +937,21 @@ impl PBackendService for PBackendServiceHandler {
 
         // Process each merged fragment.
         for params in &merged_params {
-            let finst_id = extract_finst_id(params);
+            // Determine the finst_id to store the result under.
+            // - Single-BE merged plan (1 fragment): FE calls fetch_data with query_id.
+            // - Multi-BE exchange (>1 fragment): FE calls fetch_data with the
+            //   exchange-root fragment's local_params[0].fragment_instance_id.
+            let finst_id = if merged_params.len() == 1 {
+                // Single-BE merged: FE uses query_id for fetch_data.
+                FinstId {
+                    hi: params.query_id.hi,
+                    lo: params.query_id.lo,
+                }
+            } else {
+                // Multi-BE exchange: FE uses fragment_instance_id.
+                // Prefer the result fragment's finst_id when available.
+                result_finst_id.unwrap_or_else(|| extract_finst_id(params))
+            };
 
             // Check for unresolved exchange nodes (receive data from other BEs).
             let exchange_node_ids = has_unresolved_exchanges(params);
@@ -2279,6 +2383,40 @@ mod tests {
         let plan = merged[0].fragment.as_ref().unwrap().plan.as_ref().unwrap();
         assert_eq!(plan.nodes[0].node_type, TPlanNodeType::SORT_NODE);
         assert_eq!(plan.nodes[1].node_type, TPlanNodeType::FILE_SCAN_NODE);
+    }
+
+    #[test]
+    fn test_merge_three_fragment_all_intermediate() {
+        // GROUP BY + ORDER BY pipeline (no pure exchange_root):
+        // Fragment 0: SORT_NODE → EXCHANGE_NODE(0) — outermost intermediate
+        // Fragment 1: AGG_NODE → EXCHANGE_NODE(0) — innermost intermediate
+        // Fragment 2: FILE_SCAN_NODE — leaf
+        let mut outer = make_params(vec![
+            make_node(0, TPlanNodeType::SORT_NODE, 1),
+            make_node(1, TPlanNodeType::EXCHANGE_NODE, 0),
+        ]);
+        outer.fragment_id = Some(0);
+
+        let mut inner = make_params(vec![
+            make_node(2, TPlanNodeType::AGGREGATION_NODE, 1),
+            make_node(3, TPlanNodeType::EXCHANGE_NODE, 0),
+        ]);
+        inner.fragment_id = Some(1);
+
+        let mut leaf = make_params(vec![
+            make_node(4, TPlanNodeType::FILE_SCAN_NODE, 0),
+        ]);
+        leaf.fragment_id = Some(2);
+
+        let merged = merge_fragment_plans(&[outer, inner, leaf]);
+        // Should cascade: leaf → inner → outer, producing 1 merged fragment.
+        assert_eq!(merged.len(), 1);
+        let plan = merged[0].fragment.as_ref().unwrap().plan.as_ref().unwrap();
+        // SORT → AGG → FILE_SCAN (3 nodes, exchanges replaced).
+        assert_eq!(plan.nodes.len(), 3);
+        assert_eq!(plan.nodes[0].node_type, TPlanNodeType::SORT_NODE);
+        assert_eq!(plan.nodes[1].node_type, TPlanNodeType::AGGREGATION_NODE);
+        assert_eq!(plan.nodes[2].node_type, TPlanNodeType::FILE_SCAN_NODE);
     }
 
     #[test]

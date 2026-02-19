@@ -105,7 +105,7 @@ pub(crate) fn translate_expr_node(
         .collect::<Result<_>>()?;
 
     if node.node_type == TExprNodeType::SLOT_REF {
-        translate_slot_ref(node, desc, row_tuples)
+        translate_slot_ref(node, desc, registry, row_tuples)
     } else if node.node_type == TExprNodeType::INT_LITERAL {
         translate_int_literal(node)
     } else if node.node_type == TExprNodeType::FLOAT_LITERAL {
@@ -120,7 +120,9 @@ pub(crate) fn translate_expr_node(
         translate_binary_pred(node, children, registry)
     } else if node.node_type == TExprNodeType::COMPOUND_PRED {
         translate_compound_pred(node, children, registry)
-    } else if node.node_type == TExprNodeType::FUNCTION_CALL {
+    } else if node.node_type == TExprNodeType::FUNCTION_CALL
+        || node.node_type == TExprNodeType::ARITHMETIC_EXPR
+    {
         translate_function_call(node, children, registry)
     } else if node.node_type == TExprNodeType::CAST_EXPR {
         translate_cast(node, children)
@@ -149,12 +151,27 @@ pub(crate) fn translate_expr_node(
 fn translate_slot_ref(
     node: &TExprNode,
     desc: &DescriptorTable,
+    registry: &mut ExtensionRegistry,
     row_tuples: Option<&[i32]>,
 ) -> Result<Expression> {
     let slot_ref = node
         .slot_ref
         .as_ref()
         .context("SLOT_REF node missing slot_ref data")?;
+
+    // Check for projection expansion first — handles computed expression slots
+    // from scan node intermediate/final projections (e.g., `l_extendedprice * (1 - l_discount)`).
+    // These slots can't be resolved by column position since they don't exist in the base table.
+    if let Some(expr) = desc.get_slot_expression(slot_ref.slot_id) {
+        tracing::debug!(
+            slot_id = slot_ref.slot_id,
+            "SLOT_REF expanding via projection expression"
+        );
+        let expr = expr.clone();
+        let mut idx = 0;
+        return translate_expr_node(&expr.nodes, &mut idx, desc, registry, None);
+    }
+
     let col_idx = if let Some(tuples) = row_tuples {
         desc.slot_global_index(slot_ref.slot_id, tuples)?
     } else {

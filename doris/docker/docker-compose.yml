@@ -74,6 +74,7 @@ services:
       - /tmp/claude/cities.parquet:/data/cities.parquet:ro
       - /tmp/claude/orders.parquet:/data/orders.parquet:ro
       - /tmp/claude/customers.parquet:/data/customers.parquet:ro
+      - /data/tpch:/data/tpch:ro
     entrypoint:
       - /opt/nix-glibc/ld-linux-x86-64.so.2
       - /opt/sirius-doris-be

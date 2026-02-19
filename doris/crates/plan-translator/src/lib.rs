@@ -10,7 +10,8 @@ use anyhow::{Context, Result};
 use prost::Message;
 use tracing::debug;
 
-use doris_thrift::exprs::TExprNodeType;
+use doris_thrift::exprs::{TExpr, TExprNodeType};
+use doris_thrift::plan_nodes::{TPlan, TPlanNodeType};
 use doris_thrift::palo_internal_service::TPipelineFragmentParams;
 use substrait::proto::extensions::simple_extension_declaration;
 use substrait::proto::extensions::{SimpleExtensionDeclaration, SimpleExtensionUri};
@@ -200,6 +201,78 @@ pub struct TranslatedPlan {
     pub output_column_indices: Option<Vec<usize>>,
 }
 
+/// Build a slot expression map from FILE_SCAN_NODE intermediate/final projections.
+///
+/// For each projection layer, maps output tuple slot IDs to the TExpr that produces them.
+/// This allows the expression translator to inline computed expressions from scan projections
+/// when downstream nodes (AGG, SORT) reference these computed slots.
+fn build_projection_slot_map(plan: &TPlan, desc: &mut descriptor_table::DescriptorTable) {
+    let mut slot_expressions: HashMap<i32, TExpr> = HashMap::new();
+
+    for node in &plan.nodes {
+        if node.node_type != TPlanNodeType::FILE_SCAN_NODE {
+            continue;
+        }
+
+        // Process intermediate projection layers.
+        if let (Some(proj_list), Some(tuple_ids)) = (
+            &node.intermediate_projections_list,
+            &node.intermediate_output_tuple_id_list,
+        ) {
+            for (layer_exprs, &tuple_id) in proj_list.iter().zip(tuple_ids.iter()) {
+                if let Ok(tuple) = desc.get_tuple(tuple_id) {
+                    let materialized: Vec<i32> = tuple
+                        .slot_ids
+                        .iter()
+                        .copied()
+                        .filter(|&sid| {
+                            desc.get_slot(sid)
+                                .map(|s| s.is_materialized)
+                                .unwrap_or(false)
+                        })
+                        .collect();
+                    for (i, expr) in layer_exprs.iter().enumerate() {
+                        if i < materialized.len() {
+                            slot_expressions.insert(materialized[i], expr.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Process final projections.
+        if let (Some(projections), Some(output_tuple_id)) =
+            (&node.projections, &node.output_tuple_id)
+        {
+            if let Ok(tuple) = desc.get_tuple(*output_tuple_id) {
+                let materialized: Vec<i32> = tuple
+                    .slot_ids
+                    .iter()
+                    .copied()
+                    .filter(|&sid| {
+                        desc.get_slot(sid)
+                            .map(|s| s.is_materialized)
+                            .unwrap_or(false)
+                    })
+                    .collect();
+                for (i, expr) in projections.iter().enumerate() {
+                    if i < materialized.len() {
+                        slot_expressions.insert(materialized[i], expr.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    if !slot_expressions.is_empty() {
+        debug!(
+            num_entries = slot_expressions.len(),
+            "built projection slot expression map"
+        );
+        desc.set_slot_expressions(slot_expressions);
+    }
+}
+
 /// Translate a Doris TPipelineFragmentParams into serialized Substrait Plan bytes.
 ///
 /// `table_schemas` maps NamedTable names to their actual column names (in order).
@@ -239,6 +312,11 @@ pub fn translate_fragment(
         .as_ref()
         .cloned()
         .unwrap_or_default();
+
+    // Build slot expression map from scan node projections.
+    // This enables downstream nodes (AGG, SORT) to resolve computed expression slots
+    // (e.g., `l_extendedprice * (1 - l_discount)`) by inlining the projection expressions.
+    build_projection_slot_map(plan, &mut desc);
 
     let mut registry = ExtensionRegistry::new();
 
