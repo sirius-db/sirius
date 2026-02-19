@@ -131,7 +131,6 @@ sirius_physical_operator::get_sources() const
 {
   duckdb::vector<duckdb::const_reference<sirius_physical_operator>> result;
   if (is_sink()) {
-    D_ASSERT(children.size() == 1);
     result.push_back(*this);
     return result;
   } else {
