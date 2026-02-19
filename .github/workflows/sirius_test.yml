@@ -16,7 +16,7 @@ jobs:
             build-cmd: "make -j$(nproc)"
             test-cmd: "make test"
           - name: clang
-            pixi-env: default
+            pixi-env: cuda12
             build-cmd: "pixi run build-release $(($(nproc) - 2))"
             test-cmd: "pixi run sql-logic-tests-release"
       fail-fast: false
