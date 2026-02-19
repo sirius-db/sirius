@@ -25,7 +25,7 @@ jobs:
           - ubuntu-24.04-arm
         build-cmd:
           - "make -j$(nproc)"
-          - "pixi run build-debug"
+          - "pixi run build-debug $(($(nproc) - 2))"
       fail-fast: false
     runs-on: ${{ matrix.runs-on }}
     steps:
