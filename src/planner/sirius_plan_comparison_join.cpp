@@ -97,38 +97,38 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     return join;
   }
 
-  D_ASSERT(op.left_projection_map.empty());
-  duckdb::idx_t nested_loop_join_threshold =
-    duckdb::DBConfig::GetSetting<duckdb::NestedLoopJoinThresholdSetting>(context);
-  if (left->estimated_cardinality < nested_loop_join_threshold ||
-      right->estimated_cardinality < nested_loop_join_threshold) {
-    can_iejoin = false;
-    can_merge  = false;
-  }
+  // D_ASSERT(op.left_projection_map.empty());
+  // duckdb::idx_t nested_loop_join_threshold =
+  //   duckdb::DBConfig::GetSetting<duckdb::NestedLoopJoinThresholdSetting>(context);
+  // if (left->estimated_cardinality < nested_loop_join_threshold ||
+  //     right->estimated_cardinality < nested_loop_join_threshold) {
+  //   can_iejoin = false;
+  //   can_merge  = false;
+  // }
 
-  if (can_merge && can_iejoin) {
-    duckdb::idx_t merge_join_threshold =
-      duckdb::DBConfig::GetSetting<duckdb::MergeJoinThresholdSetting>(context);
-    if (left->estimated_cardinality < merge_join_threshold ||
-        right->estimated_cardinality < merge_join_threshold) {
-      can_iejoin = false;
-    }
-  }
+  // if (can_merge && can_iejoin) {
+  //   duckdb::idx_t merge_join_threshold =
+  //     duckdb::DBConfig::GetSetting<duckdb::MergeJoinThresholdSetting>(context);
+  //   if (left->estimated_cardinality < merge_join_threshold ||
+  //       right->estimated_cardinality < merge_join_threshold) {
+  //     can_iejoin = false;
+  //   }
+  // }
 
-  if (can_iejoin) {
-    throw duckdb::NotImplementedException("InequalityJoin not supported in GPU");
-    // return Make<PhysicalIEJoin>(op, left, right, std::move(op.conditions), op.join_type,
-    // op.estimated_cardinality,
-    //                             std::move(op.filter_pushdown));
-  }
-  if (can_merge) {
-    throw duckdb::NotImplementedException("Piecewise merge join not supported in GPU");
-    // range join: use piecewise merge join
-    // return Make<PhysicalPiecewiseMergeJoin>(op, left, right, std::move(op.conditions),
-    // op.join_type,
-    //                                         op.estimated_cardinality,
-    //                                         std::move(op.filter_pushdown));
-  }
+  // if (can_iejoin) {
+  //   throw duckdb::NotImplementedException("InequalityJoin not supported in GPU");
+  //   // return Make<PhysicalIEJoin>(op, left, right, std::move(op.conditions), op.join_type,
+  //   // op.estimated_cardinality,
+  //   //                             std::move(op.filter_pushdown));
+  // }
+  // if (can_merge) {
+  //   throw duckdb::NotImplementedException("Piecewise merge join not supported in GPU");
+  //   // range join: use piecewise merge join
+  //   // return Make<PhysicalPiecewiseMergeJoin>(op, left, right, std::move(op.conditions),
+  //   // op.join_type,
+  //   //                                         op.estimated_cardinality,
+  //   //                                         std::move(op.filter_pushdown));
+  // }
   if (duckdb::PhysicalNestedLoopJoin::IsSupported(op.conditions, op.join_type)) {
     // inequality join: use nested loop
     // return Make<PhysicalNestedLoopJoin>(op, left, right, std::move(op.conditions), op.join_type,
