@@ -527,6 +527,7 @@ batches_with_handles create_batches_with_local_grouped_agg_result(
                                                              group_idx,
                                                              aggregates,
                                                              aggregate_idx,
+                                                             {},
                                                              cudf::get_default_stream(),
                                                              mem_space);
     REQUIRE(batch->try_to_create_task());

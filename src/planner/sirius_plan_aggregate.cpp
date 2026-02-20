@@ -59,13 +59,6 @@ static bool can_use_partitioned_aggregate(duckdb::ClientContext& context,
                                           duckdb::vector<duckdb::column_t>& partition_columns)
 {
   if (op.grouping_sets.size() > 1 || !op.grouping_functions.empty()) { return false; }
-  for (auto& expression : op.expressions) {
-    auto& aggregate = expression->Cast<duckdb::BoundAggregateExpression>();
-    if (aggregate.IsDistinct()) {
-      // distinct aggregates are not supported in partitioned hash aggregates
-      return false;
-    }
-  }
   // check if the source is partitioned by the aggregate columns
   // figure out the columns we are grouping by
   for (auto& group_expr : op.groups) {

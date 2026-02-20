@@ -100,6 +100,7 @@ inline cudf::data_type GetCudfType(const LogicalType& logical_type)
     case LogicalTypeId::TIMESTAMP: return cudf::data_type(cudf::type_id::TIMESTAMP_MICROSECONDS);
     case LogicalTypeId::TIMESTAMP_NS: return cudf::data_type(cudf::type_id::TIMESTAMP_NANOSECONDS);
     case LogicalTypeId::VARCHAR: return cudf::data_type(cudf::type_id::STRING);
+    case LogicalTypeId::STRUCT: return cudf::data_type(cudf::type_id::STRUCT);
     case LogicalTypeId::DECIMAL: {
       switch (logical_type.InternalType()) {
         case PhysicalType::INT32:

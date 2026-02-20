@@ -25,8 +25,6 @@
 #include "op/sirius_physical_partition_consumer_operator.hpp"
 #include "op/sirius_physical_top_n.hpp"
 
-#define PARTITION_SIZE 10000000
-
 namespace sirius {
 namespace op {
 
@@ -48,6 +46,11 @@ inline std::string partition_type_to_string(PartitionType type)
 class sirius_physical_partition : public sirius_physical_operator {
  public:
   static constexpr const SiriusPhysicalOperatorType TYPE = SiriusPhysicalOperatorType::PARTITION;
+  static constexpr duckdb::idx_t DEFAULT_PARTITION_SIZE  = 10000000;
+
+  // Override the rows-per-partition threshold. Intended for tests only.
+  static void set_partition_size(duckdb::idx_t size) { s_partition_size = size; }
+  static void reset_partition_size() { s_partition_size = DEFAULT_PARTITION_SIZE; }
 
   explicit sirius_physical_partition(duckdb::vector<duckdb::LogicalType> types,
                                      duckdb::idx_t estimated_cardinality,
@@ -77,6 +80,8 @@ class sirius_physical_partition : public sirius_physical_operator {
   int _num_partitions;
   bool _is_build;
   PartitionType _partition_type;
+
+  static duckdb::idx_t s_partition_size;
 };
 
 }  // namespace op

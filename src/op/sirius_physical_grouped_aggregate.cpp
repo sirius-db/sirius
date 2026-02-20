@@ -156,12 +156,14 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
   // }
   // total_output_columns += grouped_aggregate_data.GroupCount();
 
-  auto cudf_defs     = convert_duckdb_aggregates_to_cudf(groups_p, expressions);
-  group_idx          = std::move(cudf_defs.group_idx);
-  cudf_aggregates    = std::move(cudf_defs.cudf_aggregates);
-  cudf_aggregate_idx = std::move(cudf_defs.cudf_aggregate_idx);
-  aggregate_slots    = std::move(cudf_defs.aggregate_slots);
-  has_avg            = cudf_defs.has_avg;
+  auto cudf_defs                    = convert_duckdb_aggregates_to_cudf(groups_p, expressions);
+  group_idx                         = std::move(cudf_defs.group_idx);
+  cudf_aggregates                   = std::move(cudf_defs.cudf_aggregates);
+  cudf_aggregate_idx                = std::move(cudf_defs.cudf_aggregate_idx);
+  cudf_aggregate_struct_col_indices = std::move(cudf_defs.cudf_aggregate_struct_col_indices);
+  aggregate_slots                   = std::move(cudf_defs.aggregate_slots);
+  has_avg                           = cudf_defs.has_avg;
+  has_count_distinct                = cudf_defs.has_count_distinct;
 }
 
 std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
@@ -174,6 +176,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
                                                               group_idx,
                                                               cudf_aggregates,
                                                               cudf_aggregate_idx,
+                                                              cudf_aggregate_struct_col_indices,
                                                               stream,
                                                               *input_batch->get_memory_space());
     results.push_back(std::move(result));

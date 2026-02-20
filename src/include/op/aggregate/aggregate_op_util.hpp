@@ -29,9 +29,11 @@ namespace op {
 /**
  * @brief Mapping from one original DuckDB aggregate expression to its position(s) in the expanded
  * cudf_aggregates vector. AVG is decomposed into SUM + COUNT_VALID (two slots), all others use one.
+ * COUNT DISTINCT uses COLLECT_SET locally and MERGE_SETS during merge, then counts list elements.
  */
 struct AggregateSlot {
-  bool is_avg = false;
+  bool is_avg            = false;
+  bool is_count_distinct = false;  ///< True if this is a COUNT(DISTINCT col) aggregate
   size_t cudf_idx;  ///< Index in cudf_aggregates. For AVG, this is the SUM slot; cudf_idx+1 is
                     ///< COUNT_VALID.
   cudf::data_type output_type{cudf::type_id::EMPTY};  ///< For AVG: the desired output cudf type
@@ -47,9 +49,15 @@ struct CudfAggregateDefinitions {
                                                          ///< entries per AVG)
   std::vector<int> cudf_aggregate_idx;  ///< Column indices for aggregation inputs (expanded)
 
+  /// For COLLECT_SET aggregates only: when non-empty, the aggregate input is a struct column
+  /// synthesized from these column indices (multi-column COUNT DISTINCT). Parallel to
+  /// cudf_aggregates; empty entries mean single-column (use cudf_aggregate_idx directly).
+  std::vector<std::vector<int>> cudf_aggregate_struct_col_indices;
+
   /// One entry per original DuckDB aggregate expression, mapping to cudf_aggregates positions.
   std::vector<AggregateSlot> aggregate_slots;
-  bool has_avg = false;  ///< True if any aggregate is AVG
+  bool has_avg            = false;  ///< True if any aggregate is AVG
+  bool has_count_distinct = false;  ///< True if any aggregate is COUNT(DISTINCT col)
 };
 
 /**

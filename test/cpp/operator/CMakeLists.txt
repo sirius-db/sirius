@@ -32,4 +32,5 @@ set(TEST_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/test_physical_concat.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/aggregate/test_physical_grouped_aggregate.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/aggregate/test_physical_grouped_aggregate_merge.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/aggregate/test_physical_grouped_aggregate_count_distinct.cpp
     PARENT_SCOPE)

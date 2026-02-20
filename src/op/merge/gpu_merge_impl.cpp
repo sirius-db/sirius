@@ -201,6 +201,13 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
         request.aggregations.push_back(cudf::make_sum_aggregation<cudf::groupby_aggregation>());
         break;
       }
+      case cudf::aggregation::Kind::COLLECT_SET: {
+        // Intermediate column is a LIST produced by local COLLECT_SET. MERGE_SETS unions the
+        // per-partition lists and drops duplicates, producing a deduplicated LIST per group.
+        request.aggregations.push_back(
+          cudf::make_merge_sets_aggregation<cudf::groupby_aggregation>());
+        break;
+      }
       default:
         throw std::runtime_error(
           "Unsupported cudf aggregate kind in `merge_grouped_aggregate()`: " +

@@ -22,7 +22,9 @@
 #include <cudf/table/table.hpp>
 
 #include <duckdb.hpp>
+#include <duckdb/function/scalar_function.hpp>
 #include <duckdb/planner/expression/bound_aggregate_expression.hpp>
+#include <duckdb/planner/expression/bound_function_expression.hpp>
 #include <duckdb/planner/expression/bound_reference_expression.hpp>
 
 #include <algorithm>
@@ -403,6 +405,113 @@ make_test_data_for_grouped_aggregate_with_avg(std::size_t num_groups,
   auto expected_table = std::make_unique<cudf::table>(std::move(expected_cols));
 
   return {std::move(input_table), std::move(expected_table)};
+}
+
+/**
+ * @brief Create DuckDB aggregate expressions for COUNT(DISTINCT col) testing.
+ *
+ * Produces a single DISTINCT count aggregate expression referencing `agg_col_idx`,
+ * grouped by the columns at `group_indexes`. The count result type is BIGINT.
+ *
+ * @tparam KeyTraits Type traits for the GROUP BY key column(s)
+ * @tparam ValTraits Type traits for the column whose distinct values are counted
+ * @param group_indexes Column indices for GROUP BY expressions
+ * @param agg_col_idx Column index of the value column for COUNT(DISTINCT ...)
+ * @return AggregateExpressionResult containing output types, group, and aggregate expressions
+ */
+template <typename KeyTraits, typename ValTraits = KeyTraits>
+AggregateExpressionResult create_count_distinct_expressions(
+  const std::vector<std::size_t>& group_indexes, std::size_t agg_col_idx)
+{
+  AggregateExpressionResult result;
+
+  // Output types: one per group key column, then BIGINT for the distinct count
+  for (std::size_t i = 0; i < group_indexes.size(); ++i) {
+    result.output_types.push_back(KeyTraits::logical_type());
+  }
+  result.output_types.push_back(duckdb::LogicalType::BIGINT);
+
+  // Group expressions
+  for (std::size_t group_idx : group_indexes) {
+    result.groups.push_back(
+      duckdb::make_uniq<duckdb::BoundReferenceExpression>(KeyTraits::logical_type(), group_idx));
+  }
+
+  // COUNT(DISTINCT agg_col_idx) aggregate expression
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> agg_children;
+  agg_children.push_back(
+    duckdb::make_uniq<duckdb::BoundReferenceExpression>(ValTraits::logical_type(), agg_col_idx));
+
+  duckdb::AggregateFunction agg_function =
+    MakeDummyAggregate("count", {ValTraits::logical_type()}, duckdb::LogicalType::BIGINT);
+
+  auto agg_expr =
+    duckdb::make_uniq<duckdb::BoundAggregateExpression>(agg_function,
+                                                        std::move(agg_children),
+                                                        nullptr,  // filter
+                                                        nullptr,  // bind_info
+                                                        duckdb::AggregateType::DISTINCT);
+
+  result.aggregates.push_back(std::move(agg_expr));
+  return result;
+}
+
+/**
+ * @brief Create DuckDB aggregate expressions for COUNT(DISTINCT (col1, col2, ...)) testing.
+ *
+ * Builds a COUNT DISTINCT aggregate where the child is a struct_pack BoundFunctionExpression
+ * wrapping the specified columns. This mirrors the expression tree produced by DuckDB for
+ * `count(distinct (col_a, col_b))`.
+ *
+ * @param key_col_infos  {LogicalType, col_idx} pairs for GROUP BY key columns
+ * @param struct_col_infos  {LogicalType, col_idx} pairs for the struct_pack children
+ * @return AggregateExpressionResult with output types, groups, and aggregate expressions
+ */
+inline AggregateExpressionResult create_count_distinct_struct_col_expressions(
+  const std::vector<std::pair<duckdb::LogicalType, std::size_t>>& key_col_infos,
+  const std::vector<std::pair<duckdb::LogicalType, std::size_t>>& struct_col_infos)
+{
+  AggregateExpressionResult result;
+
+  // Output types: one BIGINT count distinct result per group key
+  for (const auto& [type, idx] : key_col_infos) {
+    result.output_types.push_back(type);
+  }
+  result.output_types.push_back(duckdb::LogicalType::BIGINT);
+
+  // Group expressions
+  for (const auto& [type, idx] : key_col_infos) {
+    result.groups.push_back(duckdb::make_uniq<duckdb::BoundReferenceExpression>(type, idx));
+  }
+
+  // Build struct_pack(col1, col2, ...) as a BoundFunctionExpression
+  duckdb::vector<duckdb::LogicalType> struct_arg_types;
+  duckdb::child_list_t<duckdb::LogicalType> struct_fields;
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> struct_children;
+  for (std::size_t i = 0; i < struct_col_infos.size(); ++i) {
+    const auto& [type, col_idx] = struct_col_infos[i];
+    struct_arg_types.push_back(type);
+    struct_fields.emplace_back("v" + std::to_string(i), type);
+    struct_children.push_back(duckdb::make_uniq<duckdb::BoundReferenceExpression>(type, col_idx));
+  }
+  auto struct_return_type = duckdb::LogicalType::STRUCT(struct_fields);
+
+  duckdb::ScalarFunction struct_fn("struct_pack", struct_arg_types, struct_return_type, nullptr);
+  auto struct_expr = duckdb::make_uniq<duckdb::BoundFunctionExpression>(
+    struct_return_type, std::move(struct_fn), std::move(struct_children), nullptr);
+
+  // COUNT(DISTINCT struct_expr) aggregate expression
+  duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> agg_children;
+  agg_children.push_back(std::move(struct_expr));
+
+  auto agg_fn = MakeDummyAggregate("count", {struct_return_type}, duckdb::LogicalType::BIGINT);
+  result.aggregates.push_back(
+    duckdb::make_uniq<duckdb::BoundAggregateExpression>(agg_fn,
+                                                        std::move(agg_children),
+                                                        nullptr,  // filter
+                                                        nullptr,  // bind_info
+                                                        duckdb::AggregateType::DISTINCT));
+  return result;
 }
 
 }  // namespace test
