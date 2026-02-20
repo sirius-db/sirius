@@ -63,6 +63,11 @@ class gpu_aggregate_impl {
    * @param group_idx The group columns.
    * @param aggregates The aggregate functions.
    * @param aggregate_idx The aggregate columns, should have the same size as `aggregates`.
+   *        For multi-column COUNT DISTINCT (COLLECT_SET), the entry is -1 (sentinel) and
+   *        the actual column indices are provided in `aggregate_struct_col_indices`.
+   * @param aggregate_struct_col_indices Parallel to `aggregates`. Non-empty entries indicate
+   *        a multi-column COLLECT_SET where a struct column is synthesized from those column
+   *        indices. Empty entries (or an empty outer vector) use `aggregate_idx` directly.
    * @param stream CUDA stream used for device memory operations and kernel launches.
    * @param memory_space The memory space used to allocate memory for the output data batch.
    *
@@ -73,6 +78,7 @@ class gpu_aggregate_impl {
     const std::vector<int>& group_idx,
     const std::vector<cudf::aggregation::Kind>& aggregates,
     const std::vector<int>& aggregate_idx,
+    const std::vector<std::vector<int>>& aggregate_struct_col_indices,
     rmm::cuda_stream_view stream,
     cucascade::memory::memory_space& memory_space);
 };

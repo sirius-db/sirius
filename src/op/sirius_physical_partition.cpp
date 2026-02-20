@@ -44,12 +44,14 @@ std::optional<duckdb::idx_t> extract_bound_ref_index(const duckdb::Expression& e
     auto& cast_expr = expr.Cast<duckdb::BoundCastExpression>();
     if (cast_expr.child->GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
       return cast_expr.child->Cast<duckdb::BoundReferenceExpression>().index;
-    }    
+    }
   }
   return std::nullopt;
 }
 
 }  // namespace
+duckdb::idx_t sirius_physical_partition::s_partition_size =
+  sirius_physical_partition::DEFAULT_PARTITION_SIZE;
 
 sirius_physical_partition::sirius_physical_partition(duckdb::vector<duckdb::LogicalType> types,
                                                      duckdb::idx_t estimated_cardinality,
@@ -58,9 +60,10 @@ sirius_physical_partition::sirius_physical_partition(duckdb::vector<duckdb::Logi
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::PARTITION, std::move(types), estimated_cardinality)
 {
-  _num_partitions = (estimated_cardinality + PARTITION_SIZE - 1) / PARTITION_SIZE;
-  _parent_op      = parent_op;
-  _is_build       = is_build;
+  _num_partitions =
+    static_cast<int>((estimated_cardinality + s_partition_size - 1) / s_partition_size);
+  _parent_op = parent_op;
+  _is_build  = is_build;
   get_partition_keys_and_type(parent_op, is_build);
 }
 
@@ -77,8 +80,10 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
     _partition_type    = PartitionType::HASH;
     auto& hash_join_op = op->Cast<sirius_physical_hash_join>();
     for (duckdb::idx_t cond_idx = 0; cond_idx < hash_join_op.conditions.size(); cond_idx++) {
-      std::optional<duckdb::idx_t> left_index = extract_bound_ref_index(*hash_join_op.conditions[cond_idx].left);
-      std::optional<duckdb::idx_t> right_index = extract_bound_ref_index(*hash_join_op.conditions[cond_idx].right);
+      std::optional<duckdb::idx_t> left_index =
+        extract_bound_ref_index(*hash_join_op.conditions[cond_idx].left);
+      std::optional<duckdb::idx_t> right_index =
+        extract_bound_ref_index(*hash_join_op.conditions[cond_idx].right);
       if (left_index.has_value() && right_index.has_value()) {
         if (is_build) {
           _partition_keys.push_back(left_index.value());
@@ -86,17 +91,17 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
           _partition_keys.push_back(right_index.value());
         }
       }
-    }    
+    }
   } else if (op->type == SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
     _partition_type      = PartitionType::NONE;
     auto& nested_join_op = op->Cast<sirius_physical_nested_loop_join>();
     for (duckdb::idx_t cond_idx = 0; cond_idx < nested_join_op.conditions.size(); cond_idx++) {
       auto& condition = nested_join_op.conditions[cond_idx];
-        if (condition.comparison != duckdb::ExpressionType::COMPARE_EQUAL &&
-            condition.comparison != duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
-          continue;
-        }
-      std::optional<duckdb::idx_t> left_index = extract_bound_ref_index(*condition.left);
+      if (condition.comparison != duckdb::ExpressionType::COMPARE_EQUAL &&
+          condition.comparison != duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+        continue;
+      }
+      std::optional<duckdb::idx_t> left_index  = extract_bound_ref_index(*condition.left);
       std::optional<duckdb::idx_t> right_index = extract_bound_ref_index(*condition.right);
       if (left_index.has_value() && right_index.has_value()) {
         if (is_build) {
@@ -105,7 +110,7 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
           _partition_keys.push_back(right_index.value());
         }
       }
-    }    
+    }
   } else if (op->type == SiriusPhysicalOperatorType::HASH_GROUP_BY) {
     _partition_type            = PartitionType::HASH;
     auto& grouped_aggregate_op = op->Cast<sirius_physical_grouped_aggregate>();
@@ -127,7 +132,7 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
     auto& grouped_aggregate_merge_op = op->Cast<sirius_physical_grouped_aggregate_merge>();
     _partition_keys                  = grouped_aggregate_merge_op.group_idx;
 
- } else if (op->type == SiriusPhysicalOperatorType::CONCAT) {
+  } else if (op->type == SiriusPhysicalOperatorType::CONCAT) {
     auto& parent_concat_op = op->Cast<sirius_physical_concat>();
     bool is_build          = parent_concat_op.is_build_concat();
     _is_build              = is_build;
@@ -161,7 +166,9 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
     throw std::runtime_error("We expect only one input batch for partition operator");
   }
 
-  if (_num_partitions < 2 || _partition_keys.empty()) { return std::make_unique<operator_data>(input_data); }
+  if (_num_partitions < 2 || _partition_keys.empty()) {
+    return std::make_unique<operator_data>(input_data);
+  }
 
   auto input_batch = input_batches[0];
   std::vector<std::shared_ptr<cucascade::data_batch>> partitioned_results;
