@@ -197,11 +197,6 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
       "We expect at least one input batch for grouped aggregate merge operator");
   }
 
-  // Fast path: single batch with no post-processing needed
-  if (input_batches.size() == 1 && !has_avg && !has_count_distinct) {
-    return std::make_unique<operator_data>(input_data);
-  }
-
   // Merge multiple batches, or use single batch directly if only one
   std::shared_ptr<::cucascade::data_batch> merged;
   if (input_batches.size() == 1) {
@@ -212,12 +207,6 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
                                                      cudf_aggregates,
                                                      stream,
                                                      *input_batches[0]->get_memory_space());
-  }
-
-  // If no post-processing needed, return merged result directly
-  if (!has_avg && !has_count_distinct) {
-    return std::make_unique<operator_data>(
-      std::vector<std::shared_ptr<::cucascade::data_batch>>{merged});
   }
 
   // Post-merge projection: handle AVG (SUM/COUNT) and COUNT DISTINCT (list element count).
@@ -276,8 +265,20 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
         cudf::cast(count_int32->view(), cudf::data_type{cudf::type_id::INT64}, stream, mr);
       output_cols.push_back(std::move(count_int64));
     } else {
-      // Move non-AVG, non-count-distinct aggregate columns directly (zero-copy)
+      // Move non-AVG aggregate columns, upcasting DECIMAL SUM columns if needed.
+      // In the single-batch fast path, merge_grouped_aggregate is skipped, so the upcast
+      // (DECIMAL32→DECIMAL64, DECIMAL64→DECIMAL128) that normally happens there must be applied
+      // here instead.
       int col_idx = num_group_cols + static_cast<int>(slot.cudf_idx);
+      if (cudf_aggregates[slot.cudf_idx] == cudf::aggregation::Kind::SUM) {
+        auto col_view = merged_cols[col_idx]->view();
+        if (col_view.type() != slot.output_type) {
+          merged_cols[col_idx] =
+            cudf::cast(col_view,                       slot.output_type,
+                       stream,
+                       mr);
+        } 
+      }
       output_cols.push_back(std::move(merged_cols[col_idx]));
     }
   }
