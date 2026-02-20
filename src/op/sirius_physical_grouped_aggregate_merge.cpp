@@ -273,11 +273,8 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
       if (cudf_aggregates[slot.cudf_idx] == cudf::aggregation::Kind::SUM) {
         auto col_view = merged_cols[col_idx]->view();
         if (col_view.type() != slot.output_type) {
-          merged_cols[col_idx] =
-            cudf::cast(col_view,                       slot.output_type,
-                       stream,
-                       mr);
-        } 
+          merged_cols[col_idx] = cudf::cast(col_view, slot.output_type, stream, mr);
+        }
       }
       output_cols.push_back(std::move(merged_cols[col_idx]));
     }
