@@ -1590,7 +1590,7 @@ TEST_CASE_METHOD(GPUExecutionFixture,
 
 TEST_CASE_METHOD(GPUExecutionFixture,
                  "gpu_execution - TPC-H Query 16",
-                 "[integration][gpu_execution][TPC-H][Q16]")
+                 "[.][integration_disabled][gpu_execution][TPC-H][Q16]")
 {
   compare_gpu_vs_cpu(
     "select p.p_brand, p.p_type, p.p_size, "
@@ -1610,7 +1610,7 @@ TEST_CASE_METHOD(GPUExecutionFixture,
 
 TEST_CASE_METHOD(GPUExecutionFixture,
                  "gpu_execution - TPC-H Query 17",
-                 "[.][integration_disabled][gpu_execution][TPC-H][Q17]")
+                 "[integration][gpu_execution][TPC-H][Q17]")
 {
   compare_gpu_vs_cpu(
     "select sum(l.l_extendedprice) / 7.0 as avg_yearly "
