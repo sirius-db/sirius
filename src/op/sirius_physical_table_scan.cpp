@@ -100,8 +100,8 @@ duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
     auto primary_idx = column_ids[column_index].GetPrimaryIndex();
     auto col_type    = returned_types[primary_idx];
 
-    // The batch columns are produced by DuckDB scan in the same order as column_ids.
-    // So the batch column index is just the column_index itself.
+    // The batch columns are produced by DUCKDB_SCAN in column_ids order.
+    // So the batch column index is just the column_index itself (an index into column_ids).
     duckdb::idx_t batch_column_index = column_index;
 
     // Create column reference for this filter - uses the batch column index
@@ -172,9 +172,9 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
   }
 
   if (needs_projection) {
-    // The batch columns are in the same order as column_ids.
-    // projection_ids tells us which column_ids indices to select for output.
-    // We want the first expected_output_columns elements from projection_ids.
+    // The batch columns are in column_ids order (as produced by DUCKDB_SCAN).
+    // projection_ids are indices into column_ids that specify which columns to keep.
+    // We select the first expected_output_columns entries from projection_ids.
     std::vector<std::shared_ptr<cucascade::data_batch>> projected_batches;
     projected_batches.reserve(output_batches.size());
 
@@ -186,7 +186,7 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
       auto table    = gpu_rep.release_table();
       auto columns  = table->release();
 
-      // Select only the output columns by moving ownership
+      // Select only the output columns by using projection_ids as indices
       std::vector<std::unique_ptr<cudf::column>> selected;
       selected.reserve(expected_output_columns);
       for (duckdb::idx_t i = 0; i < expected_output_columns; i++) {
