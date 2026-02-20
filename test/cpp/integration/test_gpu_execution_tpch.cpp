@@ -967,6 +967,27 @@ TEST_CASE_METHOD(GPUExecutionFixture,
     "from lineitem group by l_returnflag, l_linestatus;");
 }
 
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - group by min, max, avg on decimal on lineitem",
+                 "[integration][gpu_execution][group_by][avg]")
+{
+  compare_gpu_vs_cpu(
+    "select l_tax, min(l_extendedprice), max(l_extendedprice), avg(l_extendedprice)"
+    "from lineitem group by l_tax;",
+    0.0001);
+}
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - group by min, max, avg, sum on decimal on lineitem",
+                 "[integration][gpu_execution][group_by][avg]")
+{
+  compare_gpu_vs_cpu(
+    "select l_discount, min(l_extendedprice), sum(l_extendedprice), max(l_extendedprice), "
+    "avg(l_extendedprice), sum(l_tax)"
+    "from lineitem group by l_discount;",
+    0.0001);
+}
+
 //===----------------------------------------------------------------------===//
 // Order by tests
 //===----------------------------------------------------------------------===//

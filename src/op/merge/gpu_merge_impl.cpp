@@ -175,6 +175,28 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
   auto concatenated =
     cudf::concatenate(input_cudf_table_views, stream, memory_space.get_default_allocator());
 
+  // Upcast decimal aggregate columns for SUM (DECIMAL32 -> DECIMAL64, DECIMAL64 -> DECIMAL128).
+  std::vector<std::unique_ptr<cudf::column>> upcasted_agg_cols(aggregates.size());
+  for (size_t i = 0; i < aggregates.size(); ++i) {
+    if (aggregates[i] == cudf::aggregation::Kind::SUM) {
+      int aggregate_col_id = num_group_cols + static_cast<int>(i);
+      auto col_view        = concatenated->get_column(aggregate_col_id).view();
+      if (col_view.type().id() == cudf::type_id::DECIMAL64) {
+        upcasted_agg_cols[i] =
+          cudf::cast(col_view,
+                     cudf::data_type(cudf::type_id::DECIMAL128, col_view.type().scale()),
+                     stream,
+                     memory_space.get_default_allocator());
+      } else if (col_view.type().id() == cudf::type_id::DECIMAL32) {
+        upcasted_agg_cols[i] =
+          cudf::cast(col_view,
+                     cudf::data_type(cudf::type_id::DECIMAL64, col_view.type().scale()),
+                     stream,
+                     memory_space.get_default_allocator());
+      }
+    }
+  }
+
   // Create cudf groupby and make aggregation requests.
   std::vector<cudf::column_view> group_cols;
   for (int c = 0; c < num_group_cols; ++c) {
@@ -185,7 +207,8 @@ std::shared_ptr<cucascade::data_batch> gpu_merge_impl::merge_grouped_aggregate(
   for (size_t i = 0; i < aggregates.size(); ++i) {
     int aggregate_col_id = num_group_cols + static_cast<int>(i);
     cudf::groupby::aggregation_request request;
-    request.values = concatenated->get_column(aggregate_col_id).view();
+    request.values = upcasted_agg_cols[i] ? upcasted_agg_cols[i]->view()
+                                          : concatenated->get_column(aggregate_col_id).view();
     switch (aggregates[i]) {
       case cudf::aggregation::Kind::MIN: {
         request.aggregations.push_back(cudf::make_min_aggregation<cudf::groupby_aggregation>());
