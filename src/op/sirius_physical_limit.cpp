@@ -69,7 +69,6 @@ std::unique_ptr<operator_data> sirius_physical_streaming_limit::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
   const auto& input_batches = input_data.get_data_batches();
-  SIRIUS_LOG_DEBUG("Executing streaming limit");
 
   if (limit_val.Type() != duckdb::LimitNodeType::CONSTANT_VALUE) {
     throw duckdb::NotImplementedException("Streaming limit with non-constant limit value");

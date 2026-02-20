@@ -132,7 +132,6 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
                                                                    rmm::cuda_stream_view stream)
 {
   const auto& input_batches = input_data.get_data_batches();
-  auto start                = std::chrono::high_resolution_clock::now();
 
   duckdb::unique_ptr<duckdb::Expression> filter_expr;
   if (table_filters) {
@@ -206,9 +205,6 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
     output_batches = std::move(projected_batches);
   }
 
-  auto end      = std::chrono::high_resolution_clock::now();
-  auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-  SIRIUS_LOG_DEBUG("Filter time: {:.2f} ms", duration.count() / 1000.0);
   return std::make_unique<operator_data>(output_batches);
 }
 
