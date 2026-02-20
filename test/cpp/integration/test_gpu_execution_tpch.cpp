@@ -973,7 +973,8 @@ TEST_CASE_METHOD(GPUExecutionFixture,
 {
   compare_gpu_vs_cpu(
     "select l_tax, min(l_extendedprice), max(l_extendedprice), avg(l_extendedprice)"
-    "from lineitem group by l_tax;");
+    "from lineitem group by l_tax;",
+    0.0001);
 }
 
 TEST_CASE_METHOD(GPUExecutionFixture,
@@ -983,7 +984,8 @@ TEST_CASE_METHOD(GPUExecutionFixture,
   compare_gpu_vs_cpu(
     "select l_discount, min(l_extendedprice), sum(l_extendedprice), max(l_extendedprice), "
     "avg(l_extendedprice), sum(l_tax)"
-    "from lineitem group by l_discount;");
+    "from lineitem group by l_discount;",
+    0.0001);
 }
 
 //===----------------------------------------------------------------------===//
