@@ -365,13 +365,41 @@ fn extract_sort_limit_from_plan(
         }
     }
 
-    // Extract LIMIT/OFFSET as SQL string (for backward compatibility).
-    let mut sql = String::new();
+    // Build sort_limit_sql with ORDER BY + LIMIT. The from_substrait_with_sort function
+    // strips SortRel/FetchRel from the Substrait plan before execution, so DuckDB returns
+    // all columns without pruning. The SQL wrapper then applies the correct ORDER BY + LIMIT.
+    // Positions are from rel_column_names (pre-strip Rel), which match the stripped output.
+    let mut order_parts = Vec::new();
+    let mut measure_idx_counter = 0usize;
+    for sc in &sort_columns {
+        if !sc.name.is_empty() {
+            if let Some(pos) = rel_column_names.iter().position(|n| n == &sc.name) {
+                let dir = if sc.ascending { "ASC" } else { "DESC" };
+                order_parts.push(format!("{} {}", pos + 1, dir));
+            }
+        } else {
+            // Empty-name measure: find nth empty entry in rel_column_names.
+            if let Some((pos, _)) = rel_column_names.iter().enumerate()
+                .filter(|(_, n)| n.is_empty())
+                .nth(measure_idx_counter) {
+                let dir = if sc.ascending { "ASC" } else { "DESC" };
+                order_parts.push(format!("{} {}", pos + 1, dir));
+            }
+            measure_idx_counter += 1;
+        }
+    }
+
+    let mut sql = if order_parts.is_empty() {
+        String::new()
+    } else {
+        format!("ORDER BY {}", order_parts.join(", "))
+    };
+
     let limit = sort_plan_node.limit;
     let offset = sort_node.offset.unwrap_or(0);
     let sort_limit = if limit >= 0 { Some(limit) } else { None };
     if limit >= 0 {
-        sql.push_str(&format!("LIMIT {}", limit));
+        sql.push_str(&format!(" LIMIT {}", limit));
     }
     if offset > 0 {
         sql.push_str(&format!(" OFFSET {}", offset));
