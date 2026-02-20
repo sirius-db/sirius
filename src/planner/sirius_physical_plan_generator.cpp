@@ -113,8 +113,24 @@ sirius_physical_plan_generator::create_plan(duckdb::unique_ptr<duckdb::LogicalOp
 duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan(duckdb::LogicalOperator& op)
 {
-  SIRIUS_LOG_DEBUG("Creating sirius physical plan for logical operator type: {}",
-                   duckdb::LogicalOperatorToString(op.type));
+  SIRIUS_LOG_DEBUG(
+    "Creating sirius physical plan for logical operator type: {}, "
+    "num_children={}, types.size()={}",
+    duckdb::LogicalOperatorToString(op.type),
+    op.children.size(),
+    op.types.size());
+  for (size_t i = 0; i < op.types.size(); i++) {
+    SIRIUS_LOG_DEBUG("  Logical op {} types[{}] = {}",
+                     duckdb::LogicalOperatorToString(op.type),
+                     i,
+                     op.types[i].ToString());
+  }
+  if (op.type == duckdb::LogicalOperatorType::LOGICAL_PROJECTION) {
+    auto& proj = op.Cast<duckdb::LogicalProjection>();
+    for (size_t i = 0; i < proj.expressions.size(); i++) {
+      SIRIUS_LOG_DEBUG("  LOGICAL_PROJECTION expr[{}] = {}", i, proj.expressions[i]->ToString());
+    }
+  }
   op.estimated_cardinality                                      = op.EstimateCardinality(context);
   duckdb::unique_ptr<sirius::op::sirius_physical_operator> plan = nullptr;
 
