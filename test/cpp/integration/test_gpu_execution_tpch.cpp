@@ -1107,7 +1107,6 @@ TEST_CASE_METHOD(GPUExecutionFixture,
   std::cerr << "VARCHAR order by: " << gpu_result->RowCount() << " rows OK" << std::endl;
 }
 
-
 TEST_CASE_METHOD(GPUExecutionFixture,
                  "gpu_execution - cast integer to decimal preserves scale",
                  "[integration][gpu_execution][cast][decimal]")
