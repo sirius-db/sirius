@@ -939,12 +939,6 @@ fn translate_aggregation_node(
         }))),
     };
 
-    // Apply node projections as a ProjectRel if present (like the C++ reference impl).
-    // The Substrait AggregateRel outputs [grouping_0..n, measure_0..m], but the FE's
-    // output_tuple may interleave them. The node's `projections` field describes the
-    // desired output mapping.
-    let agg_rel = apply_node_projections(agg_rel, node, desc, num_grouping, num_measures);
-
     apply_conjuncts(agg_rel, node, desc, registry)
 }
 

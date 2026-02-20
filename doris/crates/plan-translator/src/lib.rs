@@ -202,6 +202,22 @@ pub struct TranslatedPlan {
     /// SQL ORDER BY / LIMIT / OFFSET suffix extracted from outermost SortRel/FetchRel.
     /// Used to wrap `from_substrait()` when the DuckDB CPU path doesn't preserve sort order.
     pub sort_limit_sql: Option<String>,
+    /// Structured sort specification for Rust-side sorting of Arrow results.
+    /// Sort column names + directions, applied after DuckDB returns results.
+    pub sort_columns: Vec<SortColumn>,
+    /// LIMIT from the sort node, applied after sorting.
+    pub sort_limit: Option<i64>,
+}
+
+/// A single sort column specification.
+#[derive(Debug, Clone)]
+pub struct SortColumn {
+    /// Column name to sort by (from the Substrait Rel's output).
+    pub name: String,
+    /// True for ascending order.
+    pub ascending: bool,
+    /// True for nulls first.
+    pub nulls_first: bool,
 }
 
 /// Build a slot expression map from FILE_SCAN_NODE intermediate/final projections.
@@ -302,61 +318,37 @@ fn extract_sort_limit_from_plan(
     plan: &TPlan,
     desc: &descriptor_table::DescriptorTable,
     rel_column_names: &[String],
-) -> Option<String> {
-    // Find the SORT_NODE.
-    let sort_plan_node = plan.nodes.iter().find(|n| n.node_type == TPlanNodeType::SORT_NODE)?;
-    let sort_node = sort_plan_node.sort_node.as_ref()?;
+) -> (Option<String>, Vec<SortColumn>, Option<i64>) {
+    let sort_plan_node = match plan.nodes.iter().find(|n| n.node_type == TPlanNodeType::SORT_NODE) {
+        Some(n) => n,
+        None => return (None, vec![], None),
+    };
+    let sort_node = match sort_plan_node.sort_node.as_ref() {
+        Some(n) => n,
+        None => return (None, vec![], None),
+    };
     let sort_info = &sort_node.sort_info;
 
-    // Resolve sort expressions to positions in the compiled Substrait Rel's output.
-    // This matches the DuckDB from_substrait() result column order, which may differ
-    // from the FE's SORT_NODE tuple order (e.g., AGG grouping-first vs interleaved).
-    let mut order_parts = Vec::new();
+    // Build structured sort columns using Substrait Rel column names.
+    let mut sort_columns = Vec::new();
     for (i, expr) in sort_info.ordering_exprs.iter().enumerate() {
         let is_asc = sort_info.is_asc_order.get(i).copied().unwrap_or(true);
         let nulls_first = sort_info.nulls_first.get(i).copied().unwrap_or(true);
 
-        let position = expr.nodes.first().and_then(|node| {
+        let col_name = expr.nodes.first().and_then(|node| {
             if node.node_type == TExprNodeType::SLOT_REF {
                 node.slot_ref.as_ref().and_then(|sr| {
                     let slot = desc.get_slot(sr.slot_id).ok()?;
                     if !slot.col_name.is_empty() {
-                        // Find column by name in the Substrait output.
-                        rel_column_names.iter().position(|n| n == &slot.col_name)
+                        // Named column: find in Rel column names.
+                        if rel_column_names.iter().any(|n| n == &slot.col_name) {
+                            Some(slot.col_name.clone())
+                        } else {
+                            None
+                        }
                     } else {
-                        // Empty-name slot (aggregate measure): find its position
-                        // among the empty-name entries in the Rel column names.
-                        // In the Substrait output, measures follow all grouping cols.
-                        let sort_tuple_slots: Vec<(i32, bool)> = sort_plan_node
-                            .row_tuples
-                            .iter()
-                            .flat_map(|&tid| {
-                                desc.get_tuple(tid)
-                                    .map(|t| {
-                                        t.slot_ids
-                                            .iter()
-                                            .filter_map(|&sid| {
-                                                desc.get_slot(sid).ok().filter(|s| s.is_materialized).map(|s| (sid, s.col_name.is_empty()))
-                                            })
-                                            .collect::<Vec<_>>()
-                                    })
-                                    .unwrap_or_default()
-                            })
-                            .collect();
-                        // Count which measure this is (0-based among empty-name slots).
-                        let measure_idx = sort_tuple_slots
-                            .iter()
-                            .filter(|(_, is_empty)| *is_empty)
-                            .position(|(sid, _)| *sid == sr.slot_id);
-                        // Position in Rel output: after all named columns.
-                        measure_idx.and_then(|mi| {
-                            rel_column_names
-                                .iter()
-                                .enumerate()
-                                .filter(|(_, n)| n.is_empty())
-                                .nth(mi)
-                                .map(|(pos, _)| pos)
-                        })
+                        // Empty-name measure: use empty string (will match by position).
+                        Some(String::new())
                     }
                 })
             } else {
@@ -364,30 +356,33 @@ fn extract_sort_limit_from_plan(
             }
         });
 
-        let Some(pos) = position else { continue };
-        let dir = if is_asc { "ASC" } else { "DESC" };
-        let nulls = if nulls_first { "NULLS FIRST" } else { "NULLS LAST" };
-        order_parts.push(format!("{} {} {}", pos + 1, dir, nulls));
+        if let Some(name) = col_name {
+            sort_columns.push(SortColumn {
+                name,
+                ascending: is_asc,
+                nulls_first,
+            });
+        }
     }
 
-    let mut sql = if order_parts.is_empty() {
-        String::new()
-    } else {
-        format!("ORDER BY {}", order_parts.join(", "))
-    };
-
-    // Add LIMIT/OFFSET from the sort node.
+    // Extract LIMIT/OFFSET as SQL string (for backward compatibility).
+    let mut sql = String::new();
     let limit = sort_plan_node.limit;
     let offset = sort_node.offset.unwrap_or(0);
+    let sort_limit = if limit >= 0 { Some(limit) } else { None };
     if limit >= 0 {
-        sql.push_str(&format!(" LIMIT {}", limit));
+        sql.push_str(&format!("LIMIT {}", limit));
     }
     if offset > 0 {
         sql.push_str(&format!(" OFFSET {}", offset));
     }
 
     let sql = sql.trim().to_string();
-    if sql.is_empty() { None } else { Some(sql) }
+    (
+        if sql.is_empty() { None } else { Some(sql) },
+        sort_columns,
+        sort_limit,
+    )
 }
 
 /// Translate a Doris TPipelineFragmentParams into serialized Substrait Plan bytes.
@@ -438,15 +433,14 @@ pub fn translate_fragment(
     let mut registry = ExtensionRegistry::new();
 
     // Translate the plan tree into a Substrait Rel tree.
-    let rel = node_translator::translate_plan(plan, &desc, &scan_params, &mut registry, table_schemas)?;
+    let mut rel = node_translator::translate_plan(plan, &desc, &scan_params, &mut registry, table_schemas)?;
 
     // Extract sort/limit specification from the Doris plan's root SORT_NODE.
-    // DuckDB's from_substrait() doesn't reliably preserve sort order, so we
-    // capture it here for use as a SQL wrapper on the CPU fallback path.
-    // Uses the compiled Rel's column names for position computation (not FE tuple order),
-    // because the Substrait AGG output order (grouping-first) may differ from FE order.
+    // Returns structured sort info (column names + directions) for Rust-side sorting,
+    // plus a LIMIT-only SQL string for the from_substrait wrapper.
     let rel_column_names = node_translator::collect_rel_column_names(&rel);
-    let sort_limit_sql = extract_sort_limit_from_plan(plan, &desc, &rel_column_names);
+    let (sort_limit_sql, sort_columns, sort_limit) =
+        extract_sort_limit_from_plan(plan, &desc, &rel_column_names);
     if let Some(ref sql) = sort_limit_sql {
         debug!(sort_limit_sql = %sql, "extracted sort/limit from Doris plan");
     }
@@ -632,6 +626,8 @@ pub fn translate_fragment(
         output_names: result_output_names,
         output_column_indices,
         sort_limit_sql,
+        sort_columns,
+        sort_limit,
     })
 }
 
@@ -1096,11 +1092,15 @@ mod tests {
             Some(plan_rel::RelType::Root(r)) => r,
             _ => panic!("expected Root"),
         };
+        // Root ProjectRel wraps the SortRel (prevents DuckDB column pruning).
         let input = root.input.as_ref().unwrap();
-        match input.rel_type.as_ref().unwrap() {
+        let sort_input = match input.rel_type.as_ref().unwrap() {
+            rel::RelType::Project(proj) => proj.input.as_ref().unwrap(),
+            _ => input,
+        };
+        match sort_input.rel_type.as_ref().unwrap() {
             rel::RelType::Sort(sort) => {
                 assert_eq!(sort.sorts.len(), 1);
-                // ASC NULLS FIRST = SortDirection 1
                 let sort_field = &sort.sorts[0];
                 match sort_field.sort_kind.as_ref().unwrap() {
                     substrait::proto::sort_field::SortKind::Direction(d) => {
@@ -1139,9 +1139,13 @@ mod tests {
             Some(plan_rel::RelType::Root(r)) => r,
             _ => panic!("expected Root"),
         };
+        // Root ProjectRel wraps the FetchRel (prevents DuckDB column pruning).
         let input = root.input.as_ref().unwrap();
-        // LIMIT/OFFSET wraps the sort in a FetchRel.
-        match input.rel_type.as_ref().unwrap() {
+        let fetch_input = match input.rel_type.as_ref().unwrap() {
+            rel::RelType::Project(proj) => proj.input.as_ref().unwrap(),
+            _ => input,
+        };
+        match fetch_input.rel_type.as_ref().unwrap() {
             rel::RelType::Fetch(fetch) => {
                 match fetch.offset_mode.as_ref().unwrap() {
                     substrait::proto::fetch_rel::OffsetMode::Offset(o) => assert_eq!(o, &5),
