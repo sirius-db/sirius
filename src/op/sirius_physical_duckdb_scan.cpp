@@ -85,14 +85,31 @@ sirius_physical_duckdb_scan::sirius_physical_duckdb_scan(
     virtual_columns(std::move(virtual_columns_p)),
     gen_row_id_column(column_ids.back().GetPrimaryIndex() == duckdb::DConstants::INVALID_INDEX)
 {
-  auto num_cols = column_ids.size() - gen_row_id_column;
-  for (int col = 0; col < num_cols; col++) {
-    scanned_types.push_back(returned_types[column_ids[col].GetPrimaryIndex()]);
-    scanned_ids.push_back(col);
+  // Build scanned_types: the types DuckDB will output after applying projection_ids.
+  // This includes virtual ROW_ID columns (typed as BIGINT) when the plan requires them.
+  auto get_projected_columns = [&]() {
+    if (!projection_ids.empty()) { return projection_ids; }
+    // When projection_ids is empty, DuckDB projects all column_ids
+    duckdb::vector<duckdb::idx_t> all;
+    for (duckdb::idx_t i = 0; i < column_ids.size(); i++) {
+      all.push_back(i);
+    }
+    return all;
+  };
+
+  auto effective_projection = get_projected_columns();
+  for (auto proj_id : effective_projection) {
+    auto col_idx = column_ids[proj_id].GetPrimaryIndex();
+    if (col_idx == duckdb::DConstants::INVALID_INDEX) {
+      // ROW_ID virtual column
+      scanned_types.push_back(duckdb::LogicalType::BIGINT);
+    } else {
+      scanned_types.push_back(returned_types[col_idx]);
+    }
   }
 
-  if (num_cols == 0) {  // Ensure that scanned_types and ids are properly initialized
-    scanned_types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::UBIGINT));
+  if (scanned_types.empty()) {
+    scanned_types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));
   }
 
   fake_table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();

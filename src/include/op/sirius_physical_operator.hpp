@@ -296,6 +296,9 @@ class sirius_physical_operator {
     return true;
   }
 
+  /// \brief check if this operator has exhausted its limit, allowing the pipeline to finish early
+  virtual bool is_limit_exhausted() const { return false; }
+
   //! Get the input batch
   virtual std::unique_ptr<operator_data> get_next_task_input_data();
   //! Check if all ports are empty

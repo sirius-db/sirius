@@ -107,3 +107,149 @@ TEMPLATE_TEST_CASE("sirius_physical_streaming_limit limits rows in data_batch",
   std::vector<typename Traits::type> expected = {values[2], values[3], values[4]};
   REQUIRE(host_vals == expected);
 }
+
+// Helper to build a single-column int64 batch with sequential values [start, start+count)
+static std::shared_ptr<data_batch> make_range_batch(memory_space& space,
+                                                    int64_t start,
+                                                    int64_t count)
+{
+  std::vector<int64_t> values(count);
+  std::iota(values.begin(), values.end(), start);
+  return sirius::test::operator_utils::make_numeric_batch<int64_t>(
+    space, values, cudf::type_id::INT64);
+}
+
+// Collect all int64 values from multiple output batches into a single host vector
+static std::vector<int64_t> collect_all_rows(
+  const std::vector<std::shared_ptr<data_batch>>& batches)
+{
+  std::vector<int64_t> all_rows;
+  for (auto const& b : batches) {
+    auto table = b->get_data()->cast<gpu_table_representation>().get_table();
+    auto col   = sirius::test::operator_utils::copy_column_to_host<int64_t>(table.view().column(0));
+    all_rows.insert(all_rows.end(), col.begin(), col.end());
+  }
+  return all_rows;
+}
+
+TEST_CASE("streaming_limit caps total rows across multiple batches",
+          "[physical_limit][multi_batch]")
+{
+  auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space);
+
+  // 3 batches of 10 rows each: [0..9], [10..19], [20..29]
+  std::vector<std::shared_ptr<data_batch>> batches;
+  batches.push_back(make_range_batch(*space, 0, 10));
+  batches.push_back(make_range_batch(*space, 10, 10));
+  batches.push_back(make_range_batch(*space, 20, 10));
+
+  duckdb::vector<duckdb::LogicalType> types;
+  types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));
+
+  sirius_physical_streaming_limit limiter(
+    std::move(types), duckdb::BoundLimitNode::ConstantValue(5), duckdb::BoundLimitNode(), 30, true);
+
+  auto outputs = limiter.execute(operator_data(batches), cudf::get_default_stream());
+  auto rows    = collect_all_rows(outputs->get_data_batches());
+
+  // Should return exactly 5 rows: [0, 1, 2, 3, 4]
+  std::vector<int64_t> expected{0, 1, 2, 3, 4};
+  REQUIRE(rows == expected);
+}
+
+TEST_CASE("streaming_limit spans across two batches returning correct data",
+          "[physical_limit][multi_batch]")
+{
+  auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space);
+
+  // 2 batches of 150 rows each: [0..149], [150..299]
+  std::vector<std::shared_ptr<data_batch>> batches;
+  batches.push_back(make_range_batch(*space, 0, 150));
+  batches.push_back(make_range_batch(*space, 150, 150));
+
+  duckdb::vector<duckdb::LogicalType> types;
+  types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));
+
+  sirius_physical_streaming_limit limiter(std::move(types),
+                                          duckdb::BoundLimitNode::ConstantValue(200),
+                                          duckdb::BoundLimitNode(),
+                                          300,
+                                          true);
+
+  auto outputs = limiter.execute(operator_data(batches), cudf::get_default_stream());
+  auto rows    = collect_all_rows(outputs->get_data_batches());
+
+  // Should return exactly 200 rows: all 150 from batch 1, plus first 50 from batch 2
+  REQUIRE(rows.size() == 200);
+
+  std::vector<int64_t> expected(200);
+  std::iota(expected.begin(), expected.end(), 0);  // [0, 1, ..., 199]
+  REQUIRE(rows == expected);
+}
+
+TEST_CASE("streaming_limit offset spans across multiple batches", "[physical_limit][multi_batch]")
+{
+  auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space);
+
+  // 3 batches of 10 rows each: [0..9], [10..19], [20..29]
+  std::vector<std::shared_ptr<data_batch>> batches;
+  batches.push_back(make_range_batch(*space, 0, 10));
+  batches.push_back(make_range_batch(*space, 10, 10));
+  batches.push_back(make_range_batch(*space, 20, 10));
+
+  duckdb::vector<duckdb::LogicalType> types;
+  types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));
+
+  // offset=15 skips all of batch 1 (10 rows) + 5 rows of batch 2, limit=5
+  sirius_physical_streaming_limit limiter(std::move(types),
+                                          duckdb::BoundLimitNode::ConstantValue(5),
+                                          duckdb::BoundLimitNode::ConstantValue(15),
+                                          30,
+                                          true);
+
+  auto outputs = limiter.execute(operator_data(batches), cudf::get_default_stream());
+  auto rows    = collect_all_rows(outputs->get_data_batches());
+
+  // Should return [15, 16, 17, 18, 19]
+  std::vector<int64_t> expected{15, 16, 17, 18, 19};
+  REQUIRE(rows == expected);
+}
+
+TEST_CASE("streaming_limit with separate execute calls enforces global limit",
+          "[physical_limit][multi_batch]")
+{
+  auto memory_manager = sirius::test::operator_utils::initialize_memory_manager();
+  auto* space         = memory_manager->get_memory_space(cucascade::memory::Tier::GPU, 0);
+  REQUIRE(space);
+
+  duckdb::vector<duckdb::LogicalType> types;
+  types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT));
+
+  // limit=5 shared across multiple execute() calls (simulating concurrent tasks)
+  sirius_physical_streaming_limit limiter(
+    std::move(types), duckdb::BoundLimitNode::ConstantValue(5), duckdb::BoundLimitNode(), 30, true);
+
+  // First call with batch [0..9]
+  std::vector<std::shared_ptr<data_batch>> batch1{make_range_batch(*space, 0, 10)};
+  auto out1  = limiter.execute(operator_data(batch1), cudf::get_default_stream());
+  auto rows1 = collect_all_rows(out1->get_data_batches());
+
+  // Second call with batch [10..19] — limit should already be exhausted
+  std::vector<std::shared_ptr<data_batch>> batch2{make_range_batch(*space, 10, 10)};
+  auto out2  = limiter.execute(operator_data(batch2), cudf::get_default_stream());
+  auto rows2 = collect_all_rows(out2->get_data_batches());
+
+  // Total across both calls should be exactly 5
+  REQUIRE(rows1.size() + rows2.size() == 5);
+
+  // First call should have taken all 5
+  std::vector<int64_t> expected{0, 1, 2, 3, 4};
+  REQUIRE(rows1 == expected);
+  REQUIRE(rows2.empty());
+}

@@ -89,6 +89,9 @@ struct GPUTableFunctionData : public TableFunctionData {
       DBConfig::GetConfig(context).options.disabled_optimizers;
     disabled_optimizers.insert(OptimizerType::IN_CLAUSE);
     disabled_optimizers.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
+#ifdef DEBUG
+    disabled_optimizers.insert(OptimizerType::COLUMN_LIFETIME);
+#endif
     // disabled_optimizers.insert(OptimizerType::MATERIALIZED_CTE);
     // If error(varchar) gets implemented in substrait this can be removed
     // context.config.scalar_subquery_error_on_multiple_rows = false;
@@ -171,6 +174,9 @@ struct SiriusTableFunctionData : public TableFunctionData {
       DBConfig::GetConfig(context).options.disabled_optimizers;
     disabled_optimizers.insert(OptimizerType::IN_CLAUSE);
     disabled_optimizers.insert(OptimizerType::COMPRESSED_MATERIALIZATION);
+#ifdef DEBUG
+    disabled_optimizers.insert(OptimizerType::COLUMN_LIFETIME);
+#endif
     // disabled_optimizers.insert(OptimizerType::MATERIALIZED_CTE);
     // If error(varchar) gets implemented in substrait this can be removed
     // context.config.scalar_subquery_error_on_multiple_rows = false;

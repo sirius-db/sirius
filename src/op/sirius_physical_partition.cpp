@@ -32,6 +32,9 @@
 namespace sirius {
 namespace op {
 
+duckdb::idx_t sirius_physical_partition::s_partition_size =
+  sirius_physical_partition::DEFAULT_PARTITION_SIZE;
+
 sirius_physical_partition::sirius_physical_partition(duckdb::vector<duckdb::LogicalType> types,
                                                      duckdb::idx_t estimated_cardinality,
                                                      sirius_physical_operator* parent_op,
@@ -39,9 +42,10 @@ sirius_physical_partition::sirius_physical_partition(duckdb::vector<duckdb::Logi
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::PARTITION, std::move(types), estimated_cardinality)
 {
-  _num_partitions = (estimated_cardinality + PARTITION_SIZE - 1) / PARTITION_SIZE;
-  _parent_op      = parent_op;
-  _is_build       = is_build;
+  _num_partitions =
+    static_cast<int>((estimated_cardinality + s_partition_size - 1) / s_partition_size);
+  _parent_op = parent_op;
+  _is_build  = is_build;
   get_partition_keys_and_type(parent_op, is_build);
 }
 
