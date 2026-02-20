@@ -51,7 +51,8 @@ class sirius_physical_duckdb_scan : public sirius_physical_operator {
 
   std::optional<task_creation_hint> get_next_task_hint() override
   {
-    if (exhausted.load()) { return std::nullopt; }
+    if (exhausted.load() || scan_initiated.load()) { return std::nullopt; }
+    scan_initiated.store(true, std::memory_order_release);
     return task_creation_hint{TaskCreationHint::READY, this};
   }
 
@@ -100,6 +101,7 @@ class sirius_physical_duckdb_scan : public sirius_physical_operator {
   bool gen_row_id_column;
 
   std::atomic<bool> exhausted{false};
+  std::atomic<bool> scan_initiated{false};
 
  public:
   bool is_source() const override { return true; }
