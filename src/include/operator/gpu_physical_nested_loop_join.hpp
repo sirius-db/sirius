@@ -124,4 +124,6 @@ class GPUPhysicalNestedLoopJoin : public GPUPhysicalOperator {
                                         GPUIntermediateRelation& output_relation) const;
 };
 
+void ReorderConditions(vector<JoinCondition>& conditions);
+
 }  // namespace duckdb

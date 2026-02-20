@@ -16,6 +16,7 @@
 
 set(EXTENSION_SOURCES
     ${EXTENSION_SOURCES}
+    ${CMAKE_CURRENT_SOURCE_DIR}/gpu_physical_as_of_join.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/gpu_physical_column_data_scan.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/gpu_physical_dummy_scan.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/gpu_physical_partition.cpp

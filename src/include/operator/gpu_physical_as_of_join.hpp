@@ -43,10 +43,10 @@ void asOfJoin(T** left_data,
                     int* condition_mode,
                     int num_keys);
 
-//! PhysicalNestedLoopJoin represents a nested loop join between two tables
+//! PhysicalAsOfJoin represents an as of join between two tables
 class GPUPhysicalAsOfJoin : public GPUPhysicalOperator {
  public:
-  static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::NESTED_LOOP_JOIN;
+  static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::ASOF_JOIN;
 
  public:
   GPUPhysicalAsOfJoin(LogicalOperator& op,

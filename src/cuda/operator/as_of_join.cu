@@ -16,7 +16,7 @@
 
 #include "cuda_helper.cuh"
 #include "gpu_buffer_manager.hpp"
-#include "gpu_physical_asof_join.hpp"
+#include "gpu_physical_as_of_join.hpp"
 #include "log/logging.hpp"
 
 namespace duckdb {
@@ -73,10 +73,13 @@ __global__ void as_of_join_count(T* left_keys,
         } else if (condition_mode == 3 &&
                    left_keys[tile_offset + threadIdx.x + ITEM * B] <= right_keys[i]) {
           local_found = 0;
+        } else if (condition_mode == 4 &&
+                   left_keys[tile_offset + threadIdx.x + ITEM * B] < right_keys[i]) {
+          local_found = 0;
         }
 
         // There can only be one right element for each left in the end result of the as of join
-        if (local_found) { items_count[ITEM]=1; }
+        if (local_found) { items_count[ITEM] = 1; }
       }
 
       t_count += items_count[ITEM];
@@ -131,7 +134,7 @@ __global__ void as_of_join(T* left_keys,
 
 #pragma unroll
   for (int ITEM = 0; ITEM < I; ITEM++) {
-    uint64_t mostRecentTimestampIndex=-1;
+    int64_t mostRecentTimestampIndex = -1;
 
     if (threadIdx.x + (ITEM * B) < num_tile_items) {
       for (int i = 0; i < right_size; i++) {
@@ -148,23 +151,28 @@ __global__ void as_of_join(T* left_keys,
         } else if (condition_mode == 3 &&
                    left_keys[tile_offset + threadIdx.x + ITEM * B] <= right_keys[i]) {
           local_found = 0;
+        } else if (condition_mode == 4 &&
+                   left_keys[tile_offset + threadIdx.x + ITEM * B] < right_keys[i]) {
+          local_found = 0;
         }
-        if(local_found){
-          mostRecentTimestampIndex=i;
+
+        if (local_found && ((condition_mode == 3 || condition_mode == 4) ||
+                            right_keys[i] > right_keys[mostRecentTimestampIndex])) {
+          mostRecentTimestampIndex = i;
         }
-        
       }
-      if (mostRecentTimestampIndex>=0) {
-          row_ids_right[output_offset] = i;
-          row_ids_left[output_offset]  = tile_offset + threadIdx.x + ITEM * B;
-          output_offset++;
-        }
+      if (mostRecentTimestampIndex >= 0) {
+        // TODO: test to make sure only the most recent match is stored
+        row_ids_right[output_offset] = mostRecentTimestampIndex;
+        row_ids_left[output_offset]  = tile_offset + threadIdx.x + ITEM * B;
+        output_offset++;
+      }
     }
   }
 }
 
-template __global__ void as_of_join_count<double, BLOCK_THREADS, 1>(double* left_keys,
-                                                                    double* right_keys,
+template __global__ void as_of_join_count<int32_t, BLOCK_THREADS, 1>(int32_t* left_keys,
+                                                                    int32_t* right_keys,
                                                                     uint64_t* offset_each_thread,
                                                                     unsigned long long* total_count,
                                                                     uint64_t left_size,
@@ -199,7 +207,7 @@ template __global__ void as_of_join<uint64_t, BLOCK_THREADS, 1>(uint64_t* left_k
                                                                 int condition_mode);
 
 template <typename T>
-void AsOfJoin(T** left_data,
+void asOfJoin(T** left_data,
               T** right_data,
               uint64_t*& row_ids_left,
               uint64_t*& row_ids_right,
@@ -265,17 +273,17 @@ void AsOfJoin(T** left_data,
   STOP_TIMER();
 }
 
-template void AsOfJoin<double>(double** left_data,
-                               double** right_data,
-                               uint64_t*& row_ids_left,
-                               uint64_t*& row_ids_right,
-                               uint64_t*& count,
-                               uint64_t left_size,
-                               uint64_t right_size,
-                               int* condition_mode,
-                               int num_keys);
+template void asOfJoin<int32_t>(int32_t** left_data,
+                                int32_t** right_data,
+                                uint64_t*& row_ids_left,
+                                uint64_t*& row_ids_right,
+                                uint64_t*& count,
+                                uint64_t left_size,
+                                uint64_t right_size,
+                                int* condition_mode,
+                                int num_keys);
 
-template void AsOfJoin<uint64_t>(uint64_t** left_data,
+template void asOfJoin<uint64_t>(uint64_t** left_data,
                                  uint64_t** right_data,
                                  uint64_t*& row_ids_left,
                                  uint64_t*& row_ids_right,

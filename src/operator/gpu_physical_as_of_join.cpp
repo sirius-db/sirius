@@ -34,18 +34,19 @@
 #include "gpu_physical_hash_join.hpp"
 #include "gpu_pipeline.hpp"
 #include "log/logging.hpp"
+#include "operator/gpu_physical_nested_loop_join.hpp"
 
 namespace duckdb {
 
 template <typename T>
 void ResolveTypeAsOfJoin(vector<shared_ptr<GPUColumn>>& left_keys,
-                               vector<shared_ptr<GPUColumn>>& right_keys,
-                               uint64_t*& count,
-                               uint64_t*& row_ids_left,
-                               uint64_t*& row_ids_right,
-                               const vector<JoinCondition>& conditions,
-                               JoinType join_type,
-                               GPUBufferManager* gpuBufferManager)
+                         vector<shared_ptr<GPUColumn>>& right_keys,
+                         uint64_t*& count,
+                         uint64_t*& row_ids_left,
+                         uint64_t*& row_ids_right,
+                         const vector<JoinCondition>& conditions,
+                         JoinType join_type,
+                         GPUBufferManager* gpuBufferManager)
 {
   int num_keys   = conditions.size();
   T** left_data  = gpuBufferManager->customCudaHostAlloc<T*>(num_keys);
@@ -70,57 +71,53 @@ void ResolveTypeAsOfJoin(vector<shared_ptr<GPUColumn>>& left_keys,
       condition_mode[key] = 2;
     } else if (conditions[key].comparison == ExpressionType::COMPARE_GREATERTHAN) {
       condition_mode[key] = 3;
-    } else {
-      throw NotImplementedException("Unsupported comparison type");
+    } else if(conditions[key].comparison == ExpressionType::COMPARE_GREATERTHANOREQUALTO) {
+      condition_mode[key] = 4;
+    }
+    else {
+      throw NotImplementedException("Unsupported comparison type: "+(ExpressionTypeToString(conditions[key].comparison)));
     }
   }
 
   // TODO: Need to handle special case for unique keys for better performance
   if (join_type == JoinType::INNER) {
     // printGPUColumn<T>(left_data, 100, 0);
-    AsOfJoin<T>(left_data,
-                      right_data,
-                      row_ids_left,
-                      row_ids_right,
-                      count,
-                      left_size,
-                      right_size,
-                      condition_mode,
-                      num_keys);
+    asOfJoin<T>(left_data,
+                right_data,
+                row_ids_left,
+                row_ids_right,
+                count,
+                left_size,
+                right_size,
+                condition_mode,
+                num_keys);
   } else {
     throw NotImplementedException("Unsupported join type");
   }
 }
 
 void HandleAsOfJoin(vector<shared_ptr<GPUColumn>>& left_keys,
-                          vector<shared_ptr<GPUColumn>>& right_keys,
-                          uint64_t*& count,
-                          uint64_t*& row_ids_left,
-                          uint64_t*& row_ids_right,
-                          const vector<JoinCondition>& conditions,
-                          JoinType join_type,
-                          GPUBufferManager* gpuBufferManager)
+                    vector<shared_ptr<GPUColumn>>& right_keys,
+                    uint64_t*& count,
+                    uint64_t*& row_ids_left,
+                    uint64_t*& row_ids_right,
+                    const vector<JoinCondition>& conditions,
+                    JoinType join_type,
+                    GPUBufferManager* gpuBufferManager)
 {
   switch (left_keys[0]->data_wrapper.type.id()) {
-    case GPUColumnTypeId::INT64:
-      ResolveTypeAsOfJoin<uint64_t>(left_keys,
-                                          right_keys,
-                                          count,
-                                          row_ids_left,
-                                          row_ids_right,
-                                          conditions,
-                                          join_type,
-                                          gpuBufferManager);
-      break;
-    case GPUColumnTypeId::FLOAT64:
-      ResolveTypeAsOfJoin<double>(left_keys,
-                                        right_keys,
-                                        count,
-                                        row_ids_left,
-                                        row_ids_right,
-                                        conditions,
-                                        join_type,
-                                        gpuBufferManager);
+    case GPUColumnTypeId::TIMESTAMP_SEC:
+    case GPUColumnTypeId::TIMESTAMP_MS:
+    case GPUColumnTypeId::TIMESTAMP_US:
+    case GPUColumnTypeId::TIMESTAMP_NS:
+      ResolveTypeAsOfJoin<int32_t>(left_keys,
+                                    right_keys,
+                                    count,
+                                    row_ids_left,
+                                    row_ids_right,
+                                    conditions,
+                                    join_type,
+                                    gpuBufferManager);
       break;
     default:
       throw NotImplementedException("Unsupported sirius column type in `HandleAsOfJoin`: %d",
@@ -128,57 +125,14 @@ void HandleAsOfJoin(vector<shared_ptr<GPUColumn>>& left_keys,
   }
 }
 
-void ReorderConditions(vector<JoinCondition>& conditions)
-{
-  // we reorder conditions so the ones with COMPARE_EQUAL occur first
-  // check if this is already the case
-  bool is_ordered     = true;
-  bool seen_non_equal = false;
-  for (auto& cond : conditions) {
-    if (cond.comparison == ExpressionType::COMPARE_EQUAL ||
-        cond.comparison == ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
-      if (seen_non_equal) {
-        is_ordered = false;
-        break;
-      }
-    } else {
-      seen_non_equal = true;
-    }
-  }
-  if (is_ordered) {
-    // no need to re-order
-    return;
-  }
-  // gather lists of equal/other conditions
-  vector<JoinCondition> equal_conditions;
-  vector<JoinCondition> other_conditions;
-  for (auto& cond : conditions) {
-    if (cond.comparison == ExpressionType::COMPARE_EQUAL ||
-        cond.comparison == ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
-      equal_conditions.push_back(std::move(cond));
-    } else {
-      other_conditions.push_back(std::move(cond));
-    }
-  }
-  conditions.clear();
-  // reconstruct the sorted conditions
-  for (auto& cond : equal_conditions) {
-    conditions.push_back(std::move(cond));
-  }
-  for (auto& cond : other_conditions) {
-    conditions.push_back(std::move(cond));
-  }
-}
-
-GPUPhysicalAsOfJoin::GPUPhysicalAsOfJoin(
-  LogicalOperator& op,
-  unique_ptr<GPUPhysicalOperator> left,
-  unique_ptr<GPUPhysicalOperator> right,
-  vector<JoinCondition> cond,
-  JoinType join_type,
-  idx_t estimated_cardinality,
-  unique_ptr<JoinFilterPushdownInfo> pushdown_info_p)
-  : GPUPhysicalOperator(PhysicalOperatorType::NESTED_LOOP_JOIN, op.types, estimated_cardinality),
+GPUPhysicalAsOfJoin::GPUPhysicalAsOfJoin(LogicalOperator& op,
+                                         unique_ptr<GPUPhysicalOperator> left,
+                                         unique_ptr<GPUPhysicalOperator> right,
+                                         vector<JoinCondition> cond,
+                                         JoinType join_type,
+                                         idx_t estimated_cardinality,
+                                         unique_ptr<JoinFilterPushdownInfo> pushdown_info_p)
+  : GPUPhysicalOperator(PhysicalOperatorType::ASOF_JOIN, op.types, estimated_cardinality),
     join_type(join_type),
     conditions(std::move(cond))
 {
@@ -210,12 +164,12 @@ GPUPhysicalAsOfJoin::GPUPhysicalAsOfJoin(
 }
 
 GPUPhysicalAsOfJoin::GPUPhysicalAsOfJoin(LogicalOperator& op,
-                                                     unique_ptr<GPUPhysicalOperator> left,
-                                                     unique_ptr<GPUPhysicalOperator> right,
-                                                     vector<JoinCondition> cond,
-                                                     JoinType join_type,
-                                                     idx_t estimated_cardinality)
-  : GPUPhysicalOperator(PhysicalOperatorType::NESTED_LOOP_JOIN, op.types, estimated_cardinality),
+                                         unique_ptr<GPUPhysicalOperator> left,
+                                         unique_ptr<GPUPhysicalOperator> right,
+                                         vector<JoinCondition> cond,
+                                         JoinType join_type,
+                                         idx_t estimated_cardinality)
+  : GPUPhysicalOperator(PhysicalOperatorType::ASOF_JOIN, op.types, estimated_cardinality),
     join_type(join_type),
     conditions(std::move(cond))
 {
@@ -245,8 +199,7 @@ GPUPhysicalAsOfJoin::GPUPhysicalAsOfJoin(LogicalOperator& op,
   right_temp_data = make_shared_ptr<GPUIntermediateRelation>(children[1]->GetTypes().size());
 }
 
-bool GPUPhysicalAsOfJoin::IsSupported(const vector<JoinCondition>& conditions,
-                                            JoinType join_type)
+bool GPUPhysicalAsOfJoin::IsSupported(const vector<JoinCondition>& conditions, JoinType join_type)
 {
   if (join_type == JoinType::MARK) { return true; }
   for (auto& cond : conditions) {
@@ -299,13 +252,13 @@ SinkResultType GPUPhysicalAsOfJoin::Sink(GPUIntermediateRelation& input_relation
   // measure time
   auto end      = std::chrono::high_resolution_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-  SIRIUS_LOG_DEBUG("Nested loop join Sink time: {:.2f} ms", duration.count() / 1000.0);
+  SIRIUS_LOG_DEBUG("As of join Sink time: {:.2f} ms", duration.count() / 1000.0);
 
   return SinkResultType::FINISHED;
 }
 
-OperatorResultType GPUPhysicalAsOfJoin::Execute(
-  GPUIntermediateRelation& input_relation, GPUIntermediateRelation& output_relation) const
+OperatorResultType GPUPhysicalAsOfJoin::Execute(GPUIntermediateRelation& input_relation,
+                                                GPUIntermediateRelation& output_relation) const
 {
   switch (join_type) {
     case JoinType::SEMI:
@@ -313,24 +266,24 @@ OperatorResultType GPUPhysicalAsOfJoin::Execute(
     case JoinType::MARK:
       // simple joins can have max STANDARD_VECTOR_SIZE matches per chunk
       throw NotImplementedException("Unimplemented type " + JoinTypeToString(join_type) +
-                                    " for nested loop join!");
+                                    " for as of join!");
       ResolveSimpleJoin(input_relation, output_relation);
       return OperatorResultType::FINISHED;
     case JoinType::LEFT:
     case JoinType::OUTER:
     case JoinType::RIGHT:
       throw NotImplementedException("Unimplemented type " + JoinTypeToString(join_type) +
-                                    " for nested loop join!");
+                                    " for as of join!");
       return OperatorResultType::FINISHED;
     case JoinType::INNER: return ResolveComplexJoin(input_relation, output_relation);
     default:
       throw NotImplementedException("Unimplemented type " + JoinTypeToString(join_type) +
-                                    " for nested loop join!");
+                                    " for as of join!");
   }
 }
 
 void GPUPhysicalAsOfJoin::ResolveSimpleJoin(GPUIntermediateRelation& input_relation,
-                                                  GPUIntermediateRelation& output_relation) const
+                                            GPUIntermediateRelation& output_relation) const
 {
   for (idx_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
     auto& condition     = conditions[cond_idx];
@@ -350,7 +303,7 @@ void GPUPhysicalAsOfJoin::ResolveSimpleJoin(GPUIntermediateRelation& input_relat
       output_relation.columns[i]->row_ids = left_row_ids;
     }
   } else {
-    throw NotImplementedException("Unimplemented type for simple nested loop join!");
+    throw NotImplementedException("Unimplemented type for simple as of join!");
   }
 }
 
@@ -381,7 +334,7 @@ OperatorResultType GPUPhysicalAsOfJoin::ResolveComplexJoin(
       auto& child = condition.left->Cast<BoundCastExpression>().child;
       if (child->GetExpressionClass() != ExpressionClass::BOUND_REF) {
         throw NotImplementedException(
-          "Unsupported expression type of left join condition in nested loop join: %d",
+          "Unsupported expression type of left join condition in as of join: %d",
           static_cast<int>(child->GetExpressionClass()));
       }
       auto join_key_index = child->Cast<BoundReferenceExpression>().index;
@@ -398,7 +351,7 @@ OperatorResultType GPUPhysicalAsOfJoin::ResolveComplexJoin(
       left_keys[cond_idx]->setFromCudfColumn(*to_cudf_column, false, nullptr, 0, gpuBufferManager);
     } else {
       throw NotImplementedException(
-        "Unsupported expression type of left join condition in nested loop join: %d",
+        "Unsupported expression type of left join condition in as of join: %d",
         static_cast<int>(condition.left->GetExpressionClass()));
     }
   }
@@ -414,7 +367,7 @@ OperatorResultType GPUPhysicalAsOfJoin::ResolveComplexJoin(
       auto& child = condition.right->Cast<BoundCastExpression>().child;
       if (child->GetExpressionClass() != ExpressionClass::BOUND_REF) {
         throw NotImplementedException(
-          "Unsupported expression type of right join condition in nested loop join: %d",
+          "Unsupported expression type of right join condition in as of join: %d",
           static_cast<int>(child->GetExpressionClass()));
       }
       auto join_key_index = child->Cast<BoundReferenceExpression>().index;
@@ -431,47 +384,25 @@ OperatorResultType GPUPhysicalAsOfJoin::ResolveComplexJoin(
       right_keys[cond_idx]->setFromCudfColumn(*to_cudf_column, false, nullptr, 0, gpuBufferManager);
     } else {
       throw NotImplementedException(
-        "Unsupported expression type of right join condition in nested loop join: %d",
+        "Unsupported expression type of right join condition in as of join: %d",
         static_cast<int>(condition.right->GetExpressionClass()));
     }
   }
 
-  // check if all probe keys are int64 or all the probe keys are float64
-  bool all_int64   = true;
-  bool all_float64 = true;
-  for (idx_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
-    if (left_keys[cond_idx]->data_wrapper.type.id() != GPUColumnTypeId::INT64) {
-      all_int64 = false;
-    }
-    if (left_keys[cond_idx]->data_wrapper.type.id() != GPUColumnTypeId::FLOAT64) {
-      all_float64 = false;
-    }
-  }
-  SIRIUS_LOG_DEBUG("Nested loop join");
-  if (!all_int64 && !all_float64) {
-    // Not supported by Sirius implementation, use cudf instead
-    if (join_type == JoinType::INNER) {
-      cudf_mixed_or_conditional_inner_join(
-        left_keys, right_keys, conditions, join_type, row_ids_left, row_ids_right, count);
-    } else {
-      throw NotImplementedException("Unimplemented type for complex nested loop join using cudf!");
-    }
+  // TODO: check if keys are timestamps
+  if (join_type == JoinType::INNER) {
+    HandleAsOfJoin(left_keys,
+                   right_keys,
+                   count,
+                   row_ids_left,
+                   row_ids_right,
+                   conditions,
+                   join_type,
+                   gpuBufferManager);
   } else {
-    // Supported by Sirius implementation
-    if (join_type == JoinType::INNER) {
-      HandleAsOfJoin(left_keys,
-                           right_keys,
-                           count,
-                           row_ids_left,
-                           row_ids_right,
-                           conditions,
-                           join_type,
-                           gpuBufferManager);
-    } else {
-      throw NotImplementedException(
-        "Unimplemented type for complex nested loop join not using cudf!");
-    }
+    throw NotImplementedException("Unimplemented type for complex as of join not using cudf!");
   }
+
   vector<column_t> rhs_output_columns;
   for (idx_t i = 0; i < right_temp_data->columns.size(); i++)
     rhs_output_columns.push_back(i);
@@ -492,7 +423,7 @@ OperatorResultType GPUPhysicalAsOfJoin::ResolveComplexJoin(
 
   auto end      = std::chrono::high_resolution_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-  SIRIUS_LOG_DEBUG("Nested loop join Execute time: {:.2f} ms", duration.count() / 1000.0);
+  SIRIUS_LOG_DEBUG("As of join Execute time: {:.2f} ms", duration.count() / 1000.0);
 
   return OperatorResultType::FINISHED;
 }
@@ -522,7 +453,7 @@ SourceResultType GPUPhysicalAsOfJoin::GetData(GPUIntermediateRelation& output_re
 
   auto end      = std::chrono::high_resolution_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-  SIRIUS_LOG_DEBUG("Nested loop join GetData time: {:.2f} ms", duration.count() / 1000.0);
+  SIRIUS_LOG_DEBUG("As of join GetData time: {:.2f} ms", duration.count() / 1000.0);
   return SourceResultType::FINISHED;
 }
 
@@ -530,9 +461,9 @@ SourceResultType GPUPhysicalAsOfJoin::GetData(GPUIntermediateRelation& output_re
 // Pipeline Construction
 //===--------------------------------------------------------------------===//
 void GPUPhysicalAsOfJoin::BuildJoinPipelines(GPUPipeline& current,
-                                                   GPUMetaPipeline& meta_pipeline,
-                                                   GPUPhysicalOperator& op,
-                                                   bool build_rhs)
+                                             GPUMetaPipeline& meta_pipeline,
+                                             GPUPhysicalOperator& op,
+                                             bool build_rhs)
 {
   op.op_state.reset();
   op.sink_state.reset();
