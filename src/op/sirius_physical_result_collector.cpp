@@ -149,7 +149,7 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
       auto next_batch_id  = data_repo_mgr.get_next_data_batch_id();
       clone_batch         = input_batch->clone(next_batch_id, stream);
       // todo (bobbi) pass stream to sink
-      clone_batch->convert_to<cucascade::host_data_packed_representation>(
+      clone_batch->convert_to<cucascade::host_data_representation>(
         registry, &mem_space, stream);
       data = clone_batch->get_data();
     } else if (data->get_current_tier() != cucascade::memory::Tier::HOST) {
@@ -158,11 +158,11 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
         "[GPUPhysicalMaterializedCollector] Expected host_data_representation in HOST tier");
     }
 
-    // Only accepting host_table_representations for now
-    assert(dynamic_cast<cucascade::host_data_packed_representation*>(data) != nullptr);
+    // Only accepting host_data_representations for now
+    assert(dynamic_cast<cucascade::host_data_representation*>(data) != nullptr);
 
     // Push chunks to result collection
-    auto const& host_table = data->cast<cucascade::host_data_packed_representation>();
+    auto const& host_table = data->cast<cucascade::host_data_representation>();
     // host_table_chunk_reader expects get_host_table() and ->allocation to be non-null;
     // otherwise it will dereference a null unique_ptr (e.g. in column_reader::initialize).
     auto const* ht = host_table.get_host_table().get();

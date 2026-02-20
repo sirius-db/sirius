@@ -224,7 +224,7 @@ size_t estimate_packed_data_bytes(cudf::table_view const& view)
   return total_bytes;
 }
 
-host_data_packed_representation const& convert_to_host_table(
+host_data_representation const& convert_to_host_table(
   std::shared_ptr<data_batch> const& batch)
 {
   auto* data = batch->get_data();
@@ -244,12 +244,12 @@ host_data_packed_representation const& convert_to_host_table(
   if (!host_space) { throw std::runtime_error("Invalid host memory space in test"); }
 
   auto& registry = sirius::converter_registry::get();
-  batch->convert_to<host_data_packed_representation>(
+  batch->convert_to<host_data_representation>(
     registry, host_space, rmm::cuda_stream_default);
 
   data = batch->get_data();
   if (!data) { throw std::runtime_error("data_batch has no data after conversion"); }
-  return data->cast<host_data_packed_representation>();
+  return data->cast<host_data_representation>();
 }
 
 }  // namespace

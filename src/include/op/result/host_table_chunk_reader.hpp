@@ -46,7 +46,7 @@ namespace sirius::op::result {
 //===----------------------------------------------------------------------===//
 
 /**
- * @brief Reads chunks of data from a cucascade::host_data_packed_representation into duckdb data
+ * @brief Reads chunks of data from a cucascade::host_data_representation into duckdb data
  * chunkss
  */
 class host_table_chunk_reader {
@@ -82,7 +82,7 @@ class host_table_chunk_reader {
      * @param[in] node The metadata node for the column (via unpack proxy)
      * @param[in] allocation The multiple blocks allocation containing the column data
      */
-    column_reader(metadata_node const& node,
+    column_reader(column_metadata const& node,
                   std::unique_ptr<multiple_blocks_allocation> const& allocation);
 
     /**
@@ -130,14 +130,14 @@ class host_table_chunk_reader {
    * @brief Construct a new host table chunk reader object
    *
    * @param[in] client_ctx The duckdb client context (for allocation)
-   * @param[in] host_table The cucascade::host_data_packed_representation to read from
+   * @param[in] host_table The cucascade::host_data_representation to read from
    * @param[in] types The duckdb logical types for the chunk columns
    * @throw std::runtime_error If there is a mismatch in metadata and types, if the row count is
-   * negative or inconsistent across metadata_nodes, or if the duckdb output logical type for any
+   * negative or inconsistent across column_metadata entries, or if the duckdb output logical type for any
    * column is HUGEINT.
    */
   host_table_chunk_reader(duckdb::ClientContext& client_ctx,
-                          cucascade::host_data_packed_representation const& host_table,
+                          cucascade::host_data_representation const& host_table,
                           duckdb::vector<duckdb::LogicalType> const& types);
   ~host_table_chunk_reader() = default;
 

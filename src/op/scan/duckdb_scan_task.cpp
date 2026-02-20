@@ -410,8 +410,7 @@ void duckdb_scan_task_local_state::initialize_local_table_function_state(
 std::shared_ptr<cucascade::data_batch> duckdb_scan_task_local_state::make_data_batch()
 {
   using data_batch                = cucascade::data_batch;
-  using host_table_allocation     = cucascade::memory::host_table_packed_allocation;
-  using host_table_representation = cucascade::host_data_packed_representation;
+  using host_table_allocation     = cucascade::memory::host_table_allocation;
 
   // Create column metadata for each column
   std::vector<column_metadata> cols;
@@ -426,7 +425,7 @@ std::shared_ptr<cucascade::data_batch> duckdb_scan_task_local_state::make_data_b
     std::make_unique<host_table_allocation>(std::move(_allocation), std::move(cols), sz);
 
   // Make the host table representation
-  auto table = std::make_unique<host_data_representation>(std::move(table_allocation), _host_space);
+  auto table = std::make_unique<cucascade::host_data_representation>(std::move(table_allocation), _host_space);
 
   // Create the data batch and return
   return std::make_shared<data_batch>(get_next_batch_id(), std::move(table));
