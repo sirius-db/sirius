@@ -42,7 +42,6 @@ class sirius_physical_streaming_limit : public sirius_physical_operator {
   duckdb::BoundLimitNode offset_val;
   bool parallel;
 
-
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
 
@@ -60,7 +59,6 @@ class sirius_physical_streaming_limit : public sirius_physical_operator {
 
   // Atomically claim up to max_claim from counter, returns the amount actually claimed.
   static int64_t claim(std::atomic<int64_t>& counter, int64_t max_claim);
-
 };
 
 }  // namespace op
