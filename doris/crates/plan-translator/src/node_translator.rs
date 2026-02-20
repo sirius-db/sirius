@@ -13,9 +13,9 @@ use substrait::proto::r#type;
 use substrait::proto::expression::field_reference;
 use substrait::proto::expression::reference_segment;
 use substrait::proto::{
-    aggregate_rel, expression, fetch_rel, join_rel, rel, sort_field, AggregateFunction,
-    AggregateRel, CrossRel, Expression, FetchRel, FilterRel, FunctionArgument, JoinRel,
-    ProjectRel, Rel, SortField, SortRel, Type,
+    aggregate_rel, expression, fetch_rel, join_rel, rel, rel_common, sort_field,
+    AggregateFunction, AggregateRel, CrossRel, Expression, FetchRel, FilterRel, FunctionArgument,
+    JoinRel, ProjectRel, Rel, RelCommon, SortField, SortRel, Type,
 };
 
 use crate::descriptor_table::DescriptorTable;
@@ -918,148 +918,156 @@ fn translate_aggregation_node(
         }))),
     };
 
-    // Substrait AggregateRel outputs [grouping_0..n, measure_0..m]. But the FE expects
-    // columns in the AGG output tuple's slot order, which may interleave grouping and
-    // measure columns. Add a ProjectRel to reorder if needed.
-    let agg_rel = reorder_agg_output(agg_rel, node, desc, num_grouping, num_measures);
+    // Apply node projections as a ProjectRel if present (like the C++ reference impl).
+    // The Substrait AggregateRel outputs [grouping_0..n, measure_0..m], but the FE's
+    // output_tuple may interleave them. The node's `projections` field describes the
+    // desired output mapping.
+    let agg_rel = apply_node_projections(agg_rel, node, desc, num_grouping, num_measures);
 
     apply_conjuncts(agg_rel, node, desc, registry)
 }
 
-/// Add a ProjectRel on top of an AggregateRel to reorder its output columns
-/// from Substrait's grouping-first order to the FE's AGG output tuple slot order.
+/// Apply a node's projections as a ProjectRel if present.
 ///
-/// Substrait AggregateRel always outputs: [grouping_0, ..., grouping_n, measure_0, ..., measure_m]
-/// But the FE expects columns in the AGG node's output tuple slot order, which may
-/// interleave grouping and measure columns (e.g., [key, key, measure, key, key, ...]).
-///
-/// Returns the original Rel unchanged if no reordering is needed.
-fn reorder_agg_output(
-    agg_rel: Rel,
+/// Doris TPlanNodes can have `projections` that define the output column mapping.
+/// For AggregateRel, this reorders from Substrait's grouping-first output to the
+/// FE's expected interleaved order. Each projection TExpr is a SLOT_REF that
+/// references the AGG output tuple; we map these to Substrait AGG positions.
+fn apply_node_projections(
+    rel: Rel,
     node: &TPlanNode,
     desc: &DescriptorTable,
     num_grouping: usize,
     num_measures: usize,
 ) -> Rel {
+    let projections = match &node.projections {
+        Some(p) if !p.is_empty() => p,
+        _ => return rel,
+    };
+
     let total = num_grouping + num_measures;
     if total == 0 {
-        return agg_rel;
+        return rel;
     }
 
-    // Get the AGG node's output tuple slot names.
-    let agg_output_slots: Vec<(i32, String)> = node
-        .row_tuples
-        .first()
-        .and_then(|&tid| desc.get_tuple(tid).ok())
-        .map(|tuple| {
-            tuple
-                .slot_ids
+    // Get grouping expression column names (in Substrait output order).
+    let grouping_names: Vec<String> = node
+        .agg_node
+        .as_ref()
+        .and_then(|a| a.grouping_exprs.as_ref())
+        .map(|exprs| {
+            exprs
                 .iter()
-                .filter_map(|&sid| {
-                    desc.get_slot(sid)
-                        .ok()
-                        .filter(|s| s.is_materialized)
-                        .map(|s| (sid, s.col_name.clone()))
+                .filter_map(|expr| {
+                    expr.nodes.first().and_then(|n| {
+                        if n.node_type == TExprNodeType::SLOT_REF {
+                            n.slot_ref.as_ref().and_then(|sr| {
+                                desc.get_slot(sr.slot_id).ok().map(|s| s.col_name.clone())
+                            })
+                        } else {
+                            None
+                        }
+                    })
                 })
                 .collect()
         })
         .unwrap_or_default();
 
-    if agg_output_slots.len() != total {
-        return agg_rel;
-    }
-
-    // Get grouping expression column names (in Substrait output order).
-    let grouping_names: Vec<String> = if let Some(agg_node) = &node.agg_node {
-        agg_node
-            .grouping_exprs
-            .as_ref()
-            .map(|exprs| {
-                exprs
-                    .iter()
-                    .filter_map(|expr| {
-                        expr.nodes.first().and_then(|n| {
-                            if n.node_type == TExprNodeType::SLOT_REF {
-                                n.slot_ref.as_ref().and_then(|sr| {
-                                    desc.get_slot(sr.slot_id).ok().map(|s| s.col_name.clone())
-                                })
-                            } else {
-                                None
-                            }
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    } else {
-        return agg_rel;
-    };
-
-    // Build permutation: for each AGG output tuple slot, find its Substrait position.
-    // Grouping slots match by name; measure slots match by order (empty names).
+    // Map each projection SLOT_REF to its Substrait AGG output position.
     let mut permutation = Vec::new();
     let mut measure_idx = 0;
-    for (_sid, name) in &agg_output_slots {
-        if name.is_empty() {
-            // Measure slot → Substrait position: num_grouping + measure_idx
+    for proj in projections {
+        let slot_ref = proj
+            .nodes
+            .first()
+            .filter(|n| n.node_type == TExprNodeType::SLOT_REF)
+            .and_then(|n| n.slot_ref.as_ref());
+        let Some(sr) = slot_ref else {
+            return rel; // Non-SLOT_REF projection — can't handle
+        };
+        let slot = match desc.get_slot(sr.slot_id) {
+            Ok(s) => s,
+            Err(_) => return rel,
+        };
+
+        if !slot.col_name.is_empty() {
+            // Grouping slot: find its position in grouping_names.
+            if let Some(pos) = grouping_names.iter().position(|g| g == &slot.col_name) {
+                permutation.push(pos);
+            } else {
+                return rel; // Can't map
+            }
+        } else {
+            // Measure slot: in Substrait order after all grouping.
             if measure_idx < num_measures {
                 permutation.push(num_grouping + measure_idx);
                 measure_idx += 1;
             } else {
-                return agg_rel; // mismatch
+                return rel; // Too many measures
             }
-        } else if let Some(pos) = grouping_names.iter().position(|g| g == name) {
-            permutation.push(pos);
-        } else {
-            // Name not found in grouping — might be an alias or renamed slot.
-            // Try matching by checking the slot expression's target column.
-            return agg_rel; // can't determine mapping
         }
     }
 
-    // Check if reordering is needed (permutation is not identity).
+    // Check if reordering is needed.
     if permutation.iter().enumerate().all(|(i, &v)| i == v) {
-        return agg_rel;
+        return rel;
     }
 
     tracing::info!(
         permutation = ?permutation,
-        agg_output = ?agg_output_slots.iter().map(|(_, n)| n.as_str()).collect::<Vec<_>>(),
-        "adding ProjectRel to reorder AGG output to match FE tuple order"
+        num_grouping,
+        num_measures,
+        "adding ProjectRel to reorder AGG output"
     );
 
     // Build ProjectRel with field references in the permutation order.
+    // Substrait ProjectRel APPENDS expressions to the input (input_cols + projected_cols).
+    // Use emit to select only the projected columns (skip the pass-through input).
+    let num_input = total; // AGG output column count (grouping + measures)
     let expressions: Vec<Expression> = permutation
         .iter()
-        .map(|&src_idx| Expression {
-            rex_type: Some(expression::RexType::Selection(Box::new(
-                expression::FieldReference {
-                    reference_type: Some(field_reference::ReferenceType::DirectReference(
-                        expression::ReferenceSegment {
-                            reference_type: Some(
-                                reference_segment::ReferenceType::StructField(Box::new(
-                                    reference_segment::StructField {
-                                        field: src_idx as i32,
-                                        child: None,
-                                    },
-                                )),
-                            ),
-                        },
-                    )),
-                    root_type: Some(field_reference::RootType::RootReference(
-                        field_reference::RootReference {},
-                    )),
-                },
-            ))),
-        })
+        .map(|&src_idx| make_field_ref(src_idx))
+        .collect();
+
+    // Emit: select the projected columns (indices num_input..num_input+num_proj-1)
+    let output_mapping: Vec<i32> = (num_input as i32..num_input as i32 + expressions.len() as i32)
         .collect();
 
     Rel {
         rel_type: Some(rel::RelType::Project(Box::new(ProjectRel {
-            input: Some(Box::new(agg_rel)),
+            common: Some(RelCommon {
+                emit_kind: Some(rel_common::EmitKind::Emit(rel_common::Emit {
+                    output_mapping,
+                })),
+                ..Default::default()
+            }),
+            input: Some(Box::new(rel)),
             expressions,
             ..Default::default()
         }))),
+    }
+}
+
+/// Create a simple FieldReference expression for a column index.
+fn make_field_ref(idx: usize) -> Expression {
+    Expression {
+        rex_type: Some(expression::RexType::Selection(Box::new(
+            expression::FieldReference {
+                reference_type: Some(field_reference::ReferenceType::DirectReference(
+                    expression::ReferenceSegment {
+                        reference_type: Some(reference_segment::ReferenceType::StructField(
+                            Box::new(reference_segment::StructField {
+                                field: idx as i32,
+                                child: None,
+                            }),
+                        )),
+                    },
+                )),
+                root_type: Some(field_reference::RootType::RootReference(
+                    field_reference::RootReference {},
+                )),
+            },
+        ))),
     }
 }
 
