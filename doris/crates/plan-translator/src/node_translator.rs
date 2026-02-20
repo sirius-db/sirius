@@ -407,6 +407,66 @@ pub(crate) fn count_rel_columns(rel: &Rel) -> usize {
     }
 }
 
+/// Collect the flattened output column names from a Substrait Rel tree.
+///
+/// Returns column names in output order. For JoinRel, this is left columns
+/// followed by right columns. Used by AGG expression resolution to map
+/// slot names to global column indices in the child Rel's output.
+pub(crate) fn collect_rel_column_names(rel: &Rel) -> Vec<String> {
+    match rel.rel_type.as_ref() {
+        Some(rel::RelType::Read(read)) => read
+            .base_schema
+            .as_ref()
+            .map(|s| s.names.clone())
+            .unwrap_or_default(),
+        Some(rel::RelType::Filter(filter)) => filter
+            .input
+            .as_deref()
+            .map(collect_rel_column_names)
+            .unwrap_or_default(),
+        Some(rel::RelType::Sort(sort)) => sort
+            .input
+            .as_deref()
+            .map(collect_rel_column_names)
+            .unwrap_or_default(),
+        Some(rel::RelType::Fetch(fetch)) => fetch
+            .input
+            .as_deref()
+            .map(collect_rel_column_names)
+            .unwrap_or_default(),
+        Some(rel::RelType::Join(join)) => {
+            let mut names = join
+                .left
+                .as_deref()
+                .map(collect_rel_column_names)
+                .unwrap_or_default();
+            names.extend(
+                join.right
+                    .as_deref()
+                    .map(collect_rel_column_names)
+                    .unwrap_or_default(),
+            );
+            names
+        }
+        Some(rel::RelType::Cross(cross)) => {
+            let mut names = cross
+                .left
+                .as_deref()
+                .map(collect_rel_column_names)
+                .unwrap_or_default();
+            names.extend(
+                cross
+                    .right
+                    .as_deref()
+                    .map(collect_rel_column_names)
+                    .unwrap_or_default(),
+            );
+            names
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// Map Doris TJoinOp to Substrait JoinType i32 value.
 fn map_join_type(op: &TJoinOp) -> i32 {
     if *op == TJoinOp::INNER_JOIN || *op == TJoinOp::CROSS_JOIN {
@@ -711,6 +771,15 @@ fn translate_aggregation_node(
     // Use the child node's row_tuples to resolve SLOT_REFs against the child's output.
     let child_row_tuples = child_node.map(|n| n.row_tuples.as_slice());
 
+    // Set the compiled child Rel's column names on the descriptor table for accurate
+    // global index resolution. This is critical for nested JoinRels (3+ table JOINs)
+    // where the descriptor table's intermediate tuples can't reconstruct the full
+    // flattened column ordering.
+    let child_col_names = collect_rel_column_names(&input);
+    if !child_col_names.is_empty() {
+        desc.set_child_rel_column_names(child_col_names);
+    }
+
     // Translate grouping expressions.
     let mut grouping_expressions = Vec::new();
     if let Some(group_exprs) = &agg_node.grouping_exprs {
@@ -767,6 +836,9 @@ fn translate_aggregation_node(
             filter: None,
         });
     }
+
+    // Clear child Rel column names now that expressions are translated.
+    desc.clear_child_rel_column_names();
 
     let agg_rel = Rel {
         rel_type: Some(rel::RelType::Aggregate(Box::new(AggregateRel {

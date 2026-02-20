@@ -3,6 +3,7 @@
 //! Parses TDescriptorTable to build mappings from slot_id → (tuple_id, column_index, column_type).
 //! Used by expression and scan translators to resolve column references.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use anyhow::Result;
@@ -45,6 +46,10 @@ pub struct DescriptorTable {
     /// Used to inline computed expressions (e.g., `l_extendedprice * (1 - l_discount)`)
     /// from scan node intermediate/final projections into downstream nodes (AGG, SORT).
     slot_expressions: HashMap<i32, TExpr>,
+    /// Flattened column names from the compiled child Rel, set temporarily during
+    /// AGG expression translation. Uses RefCell for interior mutability (the
+    /// translate_node chain takes &DescriptorTable but AGG needs to set this).
+    child_rel_column_names: RefCell<Option<Vec<String>>>,
 }
 
 impl DescriptorTable {
@@ -99,7 +104,7 @@ impl DescriptorTable {
                 .sort_by_key(|&sid| slots.get(&sid).map(|s| s.column_pos).unwrap_or(0));
         }
 
-        Ok(Self { slots, tuples, table_column_overrides: HashMap::new(), slot_expressions: HashMap::new() })
+        Ok(Self { slots, tuples, table_column_overrides: HashMap::new(), slot_expressions: HashMap::new(), child_rel_column_names: RefCell::new(None) })
     }
 
     pub fn get_slot(&self, slot_id: i32) -> Result<&SlotInfo> {
@@ -174,6 +179,23 @@ impl DescriptorTable {
             }
             global_idx += materialized.len();
         }
+        // If compiled child Rel column names are available, use them for resolution.
+        // This is the most reliable method for nested JoinRels where descriptor table
+        // tuples can't reconstruct the correct flattened column ordering.
+        if let Some(ref col_names) = *self.child_rel_column_names.borrow() {
+            if !slot.col_name.is_empty() {
+                if let Some(idx) = col_names.iter().position(|n| n == &slot.col_name) {
+                    tracing::debug!(
+                        slot_id,
+                        col_name = %slot.col_name,
+                        resolved_idx = idx,
+                        "slot_global_index: resolved via child Rel column names"
+                    );
+                    return Ok(idx);
+                }
+            }
+        }
+
         // Slot's parent tuple not in row_tuples — fall back to name-based resolution.
         //
         // For regular tables (with table_id), use the full table schema for counting.
@@ -191,7 +213,11 @@ impl DescriptorTable {
                     }
                     fallback_offset += self.count_table_columns(tuple_id);
                 } else {
-                    // TVF scan or intermediate tuple: try matching to an override.
+                    // TVF scan or intermediate tuple: match to override(s).
+                    // For a simple scan tuple, all slots come from one table.
+                    // For a nested JOIN output tuple, slots span multiple tables.
+                    // We collect ALL overrides that cover the tuple's slots,
+                    // ordered by first slot appearance (preserves join order).
                     let slot_names: Vec<&str> = tuple
                         .slot_ids
                         .iter()
@@ -202,25 +228,36 @@ impl DescriptorTable {
                                 .map(|s| s.col_name.as_str())
                         })
                         .collect();
-                    // Find the override where ALL of this tuple's slot names appear.
-                    let matched_override = if !slot_names.is_empty() {
-                        self.table_column_overrides.values().find(|cols| {
-                            slot_names
-                                .iter()
-                                .all(|name| cols.iter().any(|c| c == name))
-                        })
-                    } else {
-                        None
-                    };
-                    if let Some(override_cols) = matched_override {
-                        // Check if target column is in this override.
-                        if let Some(pos) =
-                            override_cols.iter().position(|c| c == &slot.col_name)
-                        {
-                            return Ok(fallback_offset + pos);
+
+                    // Collect overrides in join order (left side slots first).
+                    let mut matched_overrides: Vec<&Vec<String>> = Vec::new();
+                    let mut seen_tables: std::collections::HashSet<*const Vec<String>> =
+                        std::collections::HashSet::new();
+                    for sname in &slot_names {
+                        for cols in self.table_column_overrides.values() {
+                            let ptr = cols as *const Vec<String>;
+                            if !seen_tables.contains(&ptr)
+                                && cols.iter().any(|c| c == sname)
+                            {
+                                matched_overrides.push(cols);
+                                seen_tables.insert(ptr);
+                                break; // Each slot belongs to one override
+                            }
                         }
-                        // Not found here — use full override column count for offset.
-                        fallback_offset += override_cols.len();
+                    }
+
+                    if !matched_overrides.is_empty() {
+                        // Search for target column across all matched overrides.
+                        let mut tuple_offset = 0;
+                        for cols in &matched_overrides {
+                            if let Some(pos) =
+                                cols.iter().position(|c| c == &slot.col_name)
+                            {
+                                return Ok(fallback_offset + tuple_offset + pos);
+                            }
+                            tuple_offset += cols.len();
+                        }
+                        fallback_offset += tuple_offset;
                     } else {
                         // No override match: count materialized slots for offset.
                         fallback_offset += slot_names.len();
@@ -231,6 +268,15 @@ impl DescriptorTable {
         // Last resort: name-based matching in the given tuples (no overrides).
         self.slot_index_by_name_in_tuples(slot_id, row_tuples)
     }
+
+    /// Resolve a slot to its column index in a compiled Substrait Rel's output.
+    ///
+    /// `child_column_names` is the flattened list of column names from the compiled
+    /// child Rel (e.g., from `collect_rel_column_names()`). This is the source of
+    /// truth for column ordering in nested JoinRels.
+    ///
+    /// Falls back to `slot_global_index` if the slot's name isn't found.
+
 
     /// Count total materialized columns across the given tuple IDs.
     pub fn count_materialized_columns(&self, row_tuples: &[i32]) -> usize {
@@ -343,6 +389,17 @@ impl DescriptorTable {
     /// Get the expression that produces a slot's value (if it's a projection slot).
     pub fn get_slot_expression(&self, slot_id: i32) -> Option<&TExpr> {
         self.slot_expressions.get(&slot_id)
+    }
+
+    /// Set the flattened column names from the compiled child Rel.
+    /// Uses interior mutability (RefCell) since translate_node takes &self.
+    pub fn set_child_rel_column_names(&self, names: Vec<String>) {
+        *self.child_rel_column_names.borrow_mut() = Some(names);
+    }
+
+    /// Clear the child Rel column names (after AGG expression translation).
+    pub fn clear_child_rel_column_names(&self) {
+        *self.child_rel_column_names.borrow_mut() = None;
     }
 
     /// Build a Substrait NamedStruct from a tuple's materialized columns.
@@ -753,6 +810,103 @@ mod tests {
         // Slot 25 (c_name) has parent_tuple=5, NOT in row_tuples.
         // c_name is at position 1 in customer override, with offset 0.
         assert_eq!(desc.slot_global_index(25, row_tuples).unwrap(), 1);
+    }
+
+    /// Test slot_global_index for 3-way JOIN where an intermediate tuple spans
+    /// two source tables (multi-override matching).
+    #[test]
+    fn test_global_index_3way_join_multi_override() {
+        // 3-way JOIN: inner_join(orders, customer) ⋈ lineitem
+        // After merge, outer JOIN has row_tuples = [7, 1]:
+        //   Tuple 7: intermediate from inner join — slots from BOTH orders AND customer
+        //   Tuple 1: lineitem slots
+        // AGG tuple 9: NOT in row_tuples — slots from AGG intermediate
+        //
+        // Substrait output: orders(9) + customer(8) + lineitem(16) = 33 columns
+        let desc_tbl = make_desc_table(
+            vec![(7, None), (1, None), (9, None)],
+            vec![
+                // Tuple 7: inner join output — slots from orders + customer
+                (40, 7, 0, "o_orderkey", TPrimitiveType::BIGINT),
+                (41, 7, 1, "o_custkey", TPrimitiveType::BIGINT),
+                (42, 7, 2, "o_orderdate", TPrimitiveType::BIGINT),
+                (43, 7, 3, "o_shippriority", TPrimitiveType::INT),
+                (44, 7, 4, "c_custkey", TPrimitiveType::BIGINT),
+                (45, 7, 5, "c_mktsegment", TPrimitiveType::VARCHAR),
+                // Tuple 1: lineitem
+                (50, 1, 0, "l_orderkey", TPrimitiveType::BIGINT),
+                (51, 1, 1, "l_extendedprice", TPrimitiveType::DOUBLE),
+                (52, 1, 2, "l_discount", TPrimitiveType::DOUBLE),
+                (53, 1, 3, "l_shipdate", TPrimitiveType::BIGINT),
+                // Tuple 9: AGG intermediate (NOT in row_tuples)
+                (60, 9, 0, "l_orderkey", TPrimitiveType::BIGINT),
+                (61, 9, 1, "o_orderdate", TPrimitiveType::BIGINT),
+                (62, 9, 2, "o_shippriority", TPrimitiveType::INT),
+                (63, 9, 3, "l_extendedprice", TPrimitiveType::DOUBLE),
+                (64, 9, 4, "l_discount", TPrimitiveType::DOUBLE),
+            ],
+        );
+        let mut desc = DescriptorTable::from_thrift(&desc_tbl).unwrap();
+        // Full file schemas as overrides.
+        desc.set_table_column_override(
+            "orders_4".to_string(),
+            vec![
+                "o_orderkey".into(), "o_custkey".into(), "o_orderstatus".into(),
+                "o_totalprice".into(), "o_orderdate".into(), "o_orderpriority".into(),
+                "o_clerk".into(), "o_shippriority".into(), "o_comment".into(),
+            ],
+        );
+        desc.set_table_column_override(
+            "customer_2".to_string(),
+            vec![
+                "c_custkey".into(), "c_name".into(), "c_address".into(),
+                "c_nationkey".into(), "c_phone".into(), "c_acctbal".into(),
+                "c_mktsegment".into(), "c_comment".into(),
+            ],
+        );
+        desc.set_table_column_override(
+            "lineitem_0".to_string(),
+            vec![
+                "l_orderkey".into(), "l_partkey".into(), "l_suppkey".into(),
+                "l_linenumber".into(), "l_quantity".into(), "l_extendedprice".into(),
+                "l_discount".into(), "l_tax".into(), "l_returnflag".into(),
+                "l_linestatus".into(), "l_shipdate".into(), "l_commitdate".into(),
+                "l_receiptdate".into(), "l_shipinstruct".into(), "l_shipmode".into(),
+                "l_comment".into(),
+            ],
+        );
+
+        let row_tuples = &[7, 1];
+
+        // Tuple 7 slots come from orders + customer → matches BOTH overrides.
+        // orders_4 has slots o_orderkey, o_custkey, o_orderdate, o_shippriority → 9 cols
+        // customer_2 has slots c_custkey, c_mktsegment → 8 cols
+        // Tuple 7 total: 9 + 8 = 17 cols
+        // Tuple 1 matches lineitem_0 → 16 cols
+
+        // Slot 60 (l_orderkey, parent=9): l_orderkey found in lineitem at pos 0.
+        // Tuple 7 offset = 9 + 8 = 17, lineitem pos 0 → global 17.
+        assert_eq!(desc.slot_global_index(60, row_tuples).unwrap(), 17);
+
+        // Slot 61 (o_orderdate, parent=9): o_orderdate found in orders at pos 4.
+        // Tuple 7 → orders comes first (o_orderkey is first slot), so orders offset = 0.
+        // o_orderdate at pos 4 in orders → global 4.
+        assert_eq!(desc.slot_global_index(61, row_tuples).unwrap(), 4);
+
+        // Slot 62 (o_shippriority, parent=9): found in orders at pos 7.
+        assert_eq!(desc.slot_global_index(62, row_tuples).unwrap(), 7);
+
+        // Slot 63 (l_extendedprice, parent=9): found in lineitem at pos 5.
+        // Offset = 17 (tuple 7) + 5 = 22.
+        assert_eq!(desc.slot_global_index(63, row_tuples).unwrap(), 22);
+
+        // Slot 64 (l_discount, parent=9): found in lineitem at pos 6.
+        // Offset = 17 (tuple 7) + 6 = 23.
+        assert_eq!(desc.slot_global_index(64, row_tuples).unwrap(), 23);
+
+        // Slot 45 (c_mktsegment, parent=7): parent IS in row_tuples.
+        // Direct match: tuple 7 materialized pos 5 → global 5.
+        assert_eq!(desc.slot_global_index(45, row_tuples).unwrap(), 5);
     }
 
     /// Test slot_global_index without overrides — simple name-based matching.
