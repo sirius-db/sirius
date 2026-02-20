@@ -291,27 +291,51 @@ fn extract_sort_limit_from_plan(
     let sort_node = sort_plan_node.sort_node.as_ref()?;
     let sort_info = &sort_node.sort_info;
 
-    // Resolve sort expressions to column names via the sort node's row_tuples.
+    // Resolve sort expressions to 1-based positional references in the sort node's output.
+    // We use positional refs because aggregate aliases often have empty col_name.
+    let row_tuples = &sort_plan_node.row_tuples;
+    let materialized_slots: Vec<i32> = row_tuples
+        .iter()
+        .flat_map(|&tid| {
+            desc.get_tuple(tid)
+                .map(|t| {
+                    t.slot_ids
+                        .iter()
+                        .copied()
+                        .filter(|&sid| {
+                            desc.get_slot(sid)
+                                .map(|s| s.is_materialized)
+                                .unwrap_or(false)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        })
+        .collect();
+
     let mut order_parts = Vec::new();
     for (i, expr) in sort_info.ordering_exprs.iter().enumerate() {
         let is_asc = sort_info.is_asc_order.get(i).copied().unwrap_or(true);
         let nulls_first = sort_info.nulls_first.get(i).copied().unwrap_or(true);
 
-        // Extract column name from SLOT_REF expression.
-        let col_name = expr.nodes.first().and_then(|node| {
+        // Find the slot_id from the SLOT_REF expression, then its position in the
+        // sort node's materialized output.
+        let position = expr.nodes.first().and_then(|node| {
             if node.node_type == TExprNodeType::SLOT_REF {
                 node.slot_ref.as_ref().and_then(|sr| {
-                    desc.get_slot(sr.slot_id).ok().map(|s| s.col_name.clone())
+                    materialized_slots
+                        .iter()
+                        .position(|&sid| sid == sr.slot_id)
                 })
             } else {
                 None
             }
         });
 
-        let Some(name) = col_name.filter(|n| !n.is_empty()) else { continue };
+        let Some(pos) = position else { continue };
         let dir = if is_asc { "ASC" } else { "DESC" };
         let nulls = if nulls_first { "NULLS FIRST" } else { "NULLS LAST" };
-        order_parts.push(format!("\"{}\" {} {}", name, dir, nulls));
+        order_parts.push(format!("{} {} {}", pos + 1, dir, nulls));
     }
 
     let mut sql = if order_parts.is_empty() {
@@ -387,8 +411,7 @@ pub fn translate_fragment(
     // Extract sort/limit specification from the Doris plan's root SORT_NODE.
     // DuckDB's from_substrait() doesn't reliably preserve sort order, so we
     // capture it here for use as a SQL wrapper on the CPU fallback path.
-    // Uses column names (not Substrait field indices) because the SortRel's field
-    // references are relative to the sort node's tuple, not the full scan output.
+    // Uses 1-based positional references from the sort node's materialized slots.
     let sort_limit_sql = extract_sort_limit_from_plan(plan, &desc);
     if let Some(ref sql) = sort_limit_sql {
         debug!(sort_limit_sql = %sql, "extracted sort/limit from Doris plan");
@@ -1472,5 +1495,278 @@ mod tests {
 
         let names = rel_output_names(&set);
         assert_eq!(names, vec!["x", "y"]);
+    }
+
+    // ---- JOIN + AGG field reference tests ----
+
+    /// Test that a JOIN→AGG plan produces correct field reference indices for the
+    /// aggregate function's input expression.
+    ///
+    /// This is the TPC-H customer-orders pattern:
+    ///   AGG(need_finalize=true, GROUP BY c_name, sum(o_totalprice))
+    ///     → JOIN(ON c_custkey = o_custkey)
+    ///       → SCAN(customer: c_custkey, c_name, c_address)
+    ///       → SCAN(orders: o_orderkey, o_custkey, o_totalprice)
+    ///
+    /// The AGG's sum(o_totalprice) SLOT_REF has parent_tuple=3 (AGG intermediate),
+    /// which is NOT one of the JOIN's row_tuples [0, 1]. The resolution must use
+    /// name-based matching against [0, 1] to get the correct global index:
+    ///   o_totalprice is at position 2 in the orders tuple (tuple 1),
+    ///   with global offset 3 (from customer tuple 0's 3 columns) → index 5.
+    #[test]
+    fn test_join_agg_field_reference_offset() {
+        use substrait::proto::expression::field_reference;
+        use substrait::proto::expression::reference_segment;
+
+        // Customer scan tuple 0: c_custkey(0), c_name(1), c_address(2)
+        // Orders scan tuple 1: o_orderkey(0), o_custkey(1), o_totalprice(2)
+        // AGG intermediate tuple 3: c_name_agg(0), total_spent(1)
+        //   (parent of AGG function SLOT_REFs)
+        let left_scan = make_file_scan_node(3, 0, "customer");
+        let right_scan = make_file_scan_node(4, 1, "orders");
+        let join_node = make_hash_join_node(
+            2,
+            doris_thrift::plan_nodes::TJoinOp::INNER_JOIN,
+            vec![0, 1], // JOIN output: customer tuple + orders tuple
+            vec![(
+                // ON c_custkey = o_custkey
+                slot_ref_expr_in_tuple(10, 0, type_desc(TPrimitiveType::BIGINT)),
+                slot_ref_expr_in_tuple(20, 1, type_desc(TPrimitiveType::BIGINT)),
+            )],
+        );
+        let agg = make_aggregation_node(
+            1,
+            vec![3], // AGG output tuple
+            Some(vec![
+                // GROUP BY c_name — slot 31 in AGG intermediate tuple 3,
+                // but resolves by name to position 1 in JOIN output (tuple 0's 2nd col).
+                slot_ref_expr_in_tuple(31, 3, type_desc(TPrimitiveType::VARCHAR)),
+            ]),
+            vec![
+                // sum(o_totalprice) — slot 32 in AGG intermediate tuple 3,
+                // must resolve by name to position 5 in JOIN output
+                // (3 customer cols + 2 = index 5).
+                agg_function_expr(
+                    "sum",
+                    type_desc(TPrimitiveType::DOUBLE),
+                    vec![type_desc(TPrimitiveType::DOUBLE)],
+                    vec![slot_ref_expr_in_tuple(32, 3, type_desc(TPrimitiveType::DOUBLE))],
+                ),
+            ],
+            3, 3,
+            true, // need_finalize (single-phase)
+        );
+        let plan = make_plan(vec![agg, join_node, left_scan, right_scan]);
+        let desc = make_desc_table(
+            vec![(0, Some(100)), (1, Some(200)), (3, None)],
+            vec![
+                // Customer (tuple 0, table 100)
+                (10, 0, 0, "c_custkey", TPrimitiveType::BIGINT),
+                (11, 0, 1, "c_name", TPrimitiveType::VARCHAR),
+                (12, 0, 2, "c_address", TPrimitiveType::VARCHAR),
+                // Orders (tuple 1, table 200)
+                (20, 1, 0, "o_orderkey", TPrimitiveType::BIGINT),
+                (21, 1, 1, "o_custkey", TPrimitiveType::BIGINT),
+                (22, 1, 2, "o_totalprice", TPrimitiveType::DOUBLE),
+                // AGG intermediate (tuple 3, no table)
+                (31, 3, 0, "c_name", TPrimitiveType::VARCHAR),
+                (32, 3, 1, "o_totalprice", TPrimitiveType::DOUBLE),
+            ],
+        );
+        let params = make_fragment_params(plan, desc);
+
+        let result = translate_fragment(&params, &HashMap::new()).unwrap();
+        let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
+        let root = match &plan.relations[0].rel_type {
+            Some(plan_rel::RelType::Root(r)) => r,
+            _ => panic!("expected Root"),
+        };
+        let input = root.input.as_ref().unwrap();
+        let agg = match input.rel_type.as_ref().unwrap() {
+            rel::RelType::Aggregate(agg) => agg,
+            other => panic!("expected AggregateRel, got {:?}", std::mem::discriminant(other)),
+        };
+
+        // Verify the measure's argument is a field reference.
+        let measure = agg.measures[0].measure.as_ref().unwrap();
+        assert_eq!(measure.arguments.len(), 1, "sum should have 1 argument");
+        let arg_expr = match &measure.arguments[0].arg_type {
+            Some(substrait::proto::function_argument::ArgType::Value(e)) => e,
+            other => panic!("expected Value argument, got {:?}", other),
+        };
+        // Extract the field index from the argument expression.
+        let field_idx = match arg_expr.rex_type.as_ref().unwrap() {
+            substrait::proto::expression::RexType::Selection(sel) => {
+                match sel.reference_type.as_ref().unwrap() {
+                    field_reference::ReferenceType::DirectReference(seg) => {
+                        match seg.reference_type.as_ref().unwrap() {
+                            reference_segment::ReferenceType::StructField(sf) => sf.field,
+                            other => panic!("expected StructField, got {:?}", other),
+                        }
+                    }
+                    other => panic!("expected DirectReference, got {:?}", other),
+                }
+            }
+            other => panic!("expected Selection (field ref), got {:?}", other),
+        };
+
+        // o_totalprice should be at global index 5 (3 customer + 2 in orders).
+        assert_eq!(
+            field_idx, 5,
+            "sum(o_totalprice) field reference should be at index 5 (3 customer cols + 2), got {}",
+            field_idx
+        );
+
+        // Also verify the GROUP BY c_name field reference.
+        let grouping_expr = &agg.groupings[0].grouping_expressions[0];
+        let group_field_idx = match grouping_expr.rex_type.as_ref().unwrap() {
+            substrait::proto::expression::RexType::Selection(sel) => {
+                match sel.reference_type.as_ref().unwrap() {
+                    field_reference::ReferenceType::DirectReference(seg) => {
+                        match seg.reference_type.as_ref().unwrap() {
+                            reference_segment::ReferenceType::StructField(sf) => sf.field,
+                            other => panic!("expected StructField, got {:?}", other),
+                        }
+                    }
+                    other => panic!("expected DirectReference, got {:?}", other),
+                }
+            }
+            other => panic!("expected Selection, got {:?}", other),
+        };
+
+        // c_name should be at global index 1 (position 1 in customer tuple).
+        assert_eq!(
+            group_field_idx, 1,
+            "GROUP BY c_name field reference should be at index 1, got {}",
+            group_field_idx
+        );
+    }
+
+    /// Test two-phase AGG collapse over a JOIN — verifies that after merge,
+    /// the collapsed aggregation correctly references JOIN output indices.
+    #[test]
+    fn test_two_phase_agg_collapse_over_join() {
+        use substrait::proto::expression::field_reference;
+        use substrait::proto::expression::reference_segment;
+
+        // Plan: finalize_AGG → partial_AGG → JOIN → SCAN, SCAN
+        // This simulates the merged plan after fragment cascade merge.
+        let left_scan = make_file_scan_node(5, 0, "customer");
+        let right_scan = make_file_scan_node(6, 1, "orders");
+        let join_node = make_hash_join_node(
+            4,
+            doris_thrift::plan_nodes::TJoinOp::INNER_JOIN,
+            vec![0, 1],
+            vec![(
+                slot_ref_expr_in_tuple(10, 0, type_desc(TPrimitiveType::BIGINT)),
+                slot_ref_expr_in_tuple(20, 1, type_desc(TPrimitiveType::BIGINT)),
+            )],
+        );
+        // Partial AGG: GROUP BY c_name, sum(o_totalprice)
+        // child_node = JOIN, so child_row_tuples = [0, 1]
+        let partial_agg = make_aggregation_node(
+            3,
+            vec![2], // partial output tuple
+            Some(vec![
+                slot_ref_expr_in_tuple(30, 2, type_desc(TPrimitiveType::VARCHAR)),
+            ]),
+            vec![
+                agg_function_expr(
+                    "sum",
+                    type_desc(TPrimitiveType::DOUBLE),
+                    vec![type_desc(TPrimitiveType::DOUBLE)],
+                    vec![slot_ref_expr_in_tuple(31, 2, type_desc(TPrimitiveType::DOUBLE))],
+                ),
+            ],
+            2, 2,
+            false, // partial
+        );
+        // Finalize AGG: references partial output tuple 2
+        let finalize_agg = make_aggregation_node(
+            2,
+            vec![3], // finalize output tuple
+            Some(vec![
+                slot_ref_expr_in_tuple(40, 2, type_desc(TPrimitiveType::VARCHAR)),
+            ]),
+            vec![
+                agg_function_expr(
+                    "sum",
+                    type_desc(TPrimitiveType::DOUBLE),
+                    vec![type_desc(TPrimitiveType::DOUBLE)],
+                    vec![slot_ref_expr_in_tuple(41, 2, type_desc(TPrimitiveType::DOUBLE))],
+                ),
+            ],
+            3, 3,
+            true, // finalize
+        );
+        let plan = make_plan(vec![finalize_agg, partial_agg, join_node, left_scan, right_scan]);
+        let desc = make_desc_table(
+            vec![(0, Some(100)), (1, Some(200)), (2, None), (3, None)],
+            vec![
+                (10, 0, 0, "c_custkey", TPrimitiveType::BIGINT),
+                (11, 0, 1, "c_name", TPrimitiveType::VARCHAR),
+                (20, 1, 0, "o_orderkey", TPrimitiveType::BIGINT),
+                (21, 1, 1, "o_custkey", TPrimitiveType::BIGINT),
+                (22, 1, 2, "o_totalprice", TPrimitiveType::DOUBLE),
+                // Partial output tuple 2
+                (30, 2, 0, "c_name", TPrimitiveType::VARCHAR),
+                (31, 2, 1, "o_totalprice", TPrimitiveType::DOUBLE),
+                // Finalize output tuple 3
+                (40, 3, 0, "c_name", TPrimitiveType::VARCHAR),
+                (41, 3, 1, "total", TPrimitiveType::DOUBLE),
+            ],
+        );
+        let params = make_fragment_params(plan, desc);
+
+        let result = translate_fragment(&params, &HashMap::new()).unwrap();
+        let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
+        let root = match &plan.relations[0].rel_type {
+            Some(plan_rel::RelType::Root(r)) => r,
+            _ => panic!("expected Root"),
+        };
+
+        // After collapse, should be a single AggregateRel with INITIAL_TO_RESULT.
+        let agg = match root.input.as_ref().unwrap().rel_type.as_ref().unwrap() {
+            rel::RelType::Aggregate(agg) => agg,
+            other => panic!("expected AggregateRel, got {:?}", std::mem::discriminant(other)),
+        };
+
+        assert_eq!(agg.measures.len(), 1);
+        let measure = agg.measures[0].measure.as_ref().unwrap();
+        assert_eq!(measure.phase, 3, "should be INITIAL_TO_RESULT after collapse");
+
+        // The collapsed measure should use the partial's expression (which references
+        // the JOIN's output schema). Verify the field ref is correct.
+        let arg = match &measure.arguments[0].arg_type {
+            Some(substrait::proto::function_argument::ArgType::Value(e)) => e,
+            other => panic!("expected Value, got {:?}", other),
+        };
+        let field_idx = match arg.rex_type.as_ref().unwrap() {
+            substrait::proto::expression::RexType::Selection(sel) => {
+                match sel.reference_type.as_ref().unwrap() {
+                    field_reference::ReferenceType::DirectReference(seg) => {
+                        match seg.reference_type.as_ref().unwrap() {
+                            reference_segment::ReferenceType::StructField(sf) => sf.field,
+                            other => panic!("expected StructField, got {:?}", other),
+                        }
+                    }
+                    other => panic!("expected DirectReference, got {:?}", other),
+                }
+            }
+            other => panic!("expected Selection, got {:?}", other),
+        };
+
+        // o_totalprice should be at index 4 (2 customer cols + 2 in orders).
+        assert_eq!(
+            field_idx, 4,
+            "sum(o_totalprice) in collapsed AGG should reference index 4 (2 customer + 2 orders), got {}",
+            field_idx
+        );
+
+        // The input to the collapsed AGG should be the JoinRel (not another AGG).
+        match agg.input.as_deref().unwrap().rel_type.as_ref().unwrap() {
+            rel::RelType::Join(_) => {}
+            other => panic!("expected JoinRel under collapsed AGG, got {:?}", std::mem::discriminant(other)),
+        }
     }
 }

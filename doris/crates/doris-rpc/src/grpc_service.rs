@@ -13,7 +13,7 @@ use doris_proto::doris::p_backend_service_server::PBackendService;
 use doris_proto::doris::*;
 use doris_thrift::data_sinks::TDataSinkType;
 use doris_thrift::palo_internal_service::{TPipelineFragmentParams, TPipelineFragmentParamsList};
-use doris_thrift::plan_nodes::{TFileFormatType, TPlanNodeType};
+use doris_thrift::plan_nodes::{TFileFormatType, TPlanNode, TPlanNodeType};
 use result_formatter::result_store::{FinstId, ResultStore};
 use sirius_ffi::SiriusEngine;
 
@@ -359,17 +359,28 @@ fn extract_file_tables(params: &TPipelineFragmentParams) -> Vec<FileTable> {
             });
 
         if let Some(path) = file_path {
+            // Strip file:// scheme if present (FE sends file:// URLs for local paths).
+            let clean_path = path.strip_prefix("file://").unwrap_or(&path).to_string();
             tables.push(FileTable {
                 table_name,
-                file_path: path,
+                file_path: clean_path,
                 format,
             });
         } else {
+            let all_keys: Vec<Vec<i32>> = params
+                .local_params
+                .as_ref()
+                .map(|lps| {
+                    lps.iter()
+                        .map(|inst| inst.per_node_scan_ranges.keys().copied().collect())
+                        .collect()
+                })
+                .unwrap_or_default();
             tracing::debug!(
                 node_id,
                 has_local_params = params.local_params.is_some(),
                 local_params_len = params.local_params.as_ref().map(|l| l.len()),
-                per_node_keys = ?params.local_params.as_ref().and_then(|lp| lp.first()).map(|inst| inst.per_node_scan_ranges.keys().collect::<Vec<_>>()),
+                all_per_node_keys = ?all_keys,
                 "FILE_SCAN_NODE found but no file path extracted"
             );
         }
@@ -503,78 +514,206 @@ fn merge_fragment_plans(
         return leaf_fragments.into_iter().cloned().collect();
     }
 
-    // Cascading merge: sort intermediates by fragment_id descending (innermost first),
-    // then merge leaf → inner intermediate → outer intermediate, producing a single
-    // fully-merged fragment. This handles 3+ fragment plans (e.g. SORT → AGG → SCAN).
-    intermediate_fragments.sort_by(|a, b| {
-        let id_a = a.fragment_id.unwrap_or(0);
-        let id_b = b.fragment_id.unwrap_or(0);
-        id_b.cmp(&id_a) // descending: highest fragment_id (innermost) first
-    });
-
-    let mut current_nodes: Vec<_> = leaf_fragments
-        .first()
-        .and_then(|p| p.fragment.as_ref())
-        .and_then(|f| f.plan.as_ref())
-        .map(|p| p.nodes.clone())
-        .unwrap_or_default();
-    let mut current_scan_params = leaf_fragments
-        .first()
-        .and_then(|p| p.file_scan_params.clone());
-    let mut current_local_params = leaf_fragments
-        .first()
-        .and_then(|p| p.local_params.clone());
-
-    for params in &mut intermediate_fragments {
-        // Replace EXCHANGE_NODE(0 children) with current merged plan nodes.
-        if let Some(plan) = params
+    // Build a map from dest_node_id → leaf fragment, so each EXCHANGE_NODE in the
+    // intermediate fragment gets replaced with its specific leaf's plan (not just the first).
+    // This is critical for JOIN queries where each side scans a different table.
+    let mut leaf_by_dest: std::collections::HashMap<i32, &TPipelineFragmentParams> =
+        std::collections::HashMap::new();
+    for leaf in &leaf_fragments {
+        if let Some(dest_node_id) = leaf
             .fragment
-            .as_mut()
-            .and_then(|f| f.plan.as_mut())
+            .as_ref()
+            .and_then(|f| f.output_sink.as_ref())
+            .filter(|s| s.type_ == TDataSinkType::DATA_STREAM_SINK)
+            .and_then(|s| s.stream_sink.as_ref())
+            .map(|ss| ss.dest_node_id)
         {
-            let mut merged_nodes = Vec::new();
-            for node in &plan.nodes {
-                if node.node_type == TPlanNodeType::EXCHANGE_NODE && node.num_children == 0 {
-                    if !current_nodes.is_empty() {
-                        merged_nodes.extend_from_slice(&current_nodes);
-                    } else {
-                        merged_nodes.push(node.clone());
-                    }
-                } else {
-                    merged_nodes.push(node.clone());
-                }
-            }
-            plan.nodes = merged_nodes;
-            // Update current_nodes to this fragment's merged plan for the next cascade level.
-            current_nodes = plan.nodes.clone();
+            leaf_by_dest.insert(dest_node_id, leaf);
         }
-
-        // Merge file_scan_params from inner level.
-        if let Some(inner_scan) = &current_scan_params {
-            let merged_scan = params
-                .file_scan_params
-                .get_or_insert_with(Default::default);
-            for (k, v) in inner_scan {
-                merged_scan.entry(*k).or_insert_with(|| v.clone());
-            }
-        }
-        current_scan_params = params.file_scan_params.clone();
-
-        // Merge local_params from inner level.
-        if let Some(inner_local) = &current_local_params {
-            if params.local_params.is_none() {
-                params.local_params = Some(inner_local.clone());
-            } else {
-                let merged_local = params.local_params.get_or_insert_with(Vec::new);
-                for lp in inner_local {
-                    merged_local.push(lp.clone());
-                }
-            }
-        }
-        current_local_params = params.local_params.clone();
     }
 
-    // After cascading, keep only the outermost intermediate (lowest fragment_id = last).
+    // Fallback: if no dest_node_id mapping (single leaf, no output sink), use first leaf for all.
+    let single_leaf = leaf_fragments.first().copied();
+
+    // Collect all leaf scan params and local params for merging into intermediates.
+    let mut merged_leaf_scan_params = leaf_fragments
+        .first()
+        .and_then(|p| p.file_scan_params.clone());
+    for leaf in leaf_fragments.iter().skip(1) {
+        if let Some(scan) = &leaf.file_scan_params {
+            let merged = merged_leaf_scan_params.get_or_insert_with(Default::default);
+            for (k, v) in scan {
+                merged.entry(*k).or_insert_with(|| v.clone());
+            }
+        }
+    }
+    let mut merged_leaf_local_params = leaf_fragments
+        .first()
+        .and_then(|p| p.local_params.clone());
+    for leaf in leaf_fragments.iter().skip(1) {
+        if let Some(local) = &leaf.local_params {
+            let merged = merged_leaf_local_params.get_or_insert_with(Vec::new);
+            merged.extend(local.iter().cloned());
+        }
+    }
+
+    let mut current_scan_params = merged_leaf_scan_params;
+    let mut current_local_params = merged_leaf_local_params;
+
+    // Topological cascade merge: process intermediates from innermost (depends on
+    // leaves) to outermost (depends on other intermediates), building up merged plan
+    // nodes at each level.
+    //
+    // Each fragment's output_sink.stream_sink.dest_node_id tells us which EXCHANGE_NODE
+    // in a parent fragment it feeds. We use this to determine dependencies:
+    // - An intermediate whose EXCHANGE_NODE IDs are all in leaf_by_dest is innermost.
+    // - After merging an intermediate, its dest_node_id becomes a resolved source
+    //   for the next level.
+    //
+    // resolved_sources maps EXCHANGE_NODE node_id → merged plan nodes for that source.
+    let mut resolved_sources: std::collections::HashMap<i32, Vec<TPlanNode>> =
+        std::collections::HashMap::new();
+
+    // Seed resolved sources from leaves.
+    for leaf in &leaf_fragments {
+        if let Some(dest_node_id) = leaf
+            .fragment
+            .as_ref()
+            .and_then(|f| f.output_sink.as_ref())
+            .filter(|s| s.type_ == TDataSinkType::DATA_STREAM_SINK)
+            .and_then(|s| s.stream_sink.as_ref())
+            .map(|ss| ss.dest_node_id)
+        {
+            if let Some(nodes) = leaf
+                .fragment
+                .as_ref()
+                .and_then(|f| f.plan.as_ref())
+                .map(|p| p.nodes.clone())
+            {
+                resolved_sources.insert(dest_node_id, nodes);
+            }
+        }
+    }
+
+    // Process intermediates in topological order: each pass resolves intermediates
+    // whose EXCHANGE_NODE IDs are all in resolved_sources. Continue until all are
+    // processed or no more can be resolved (cycle or missing dependency).
+    let mut remaining = intermediate_fragments;
+    let mut ordered: Vec<TPipelineFragmentParams> = Vec::new();
+
+    loop {
+        let before = remaining.len();
+        let mut still_remaining = Vec::new();
+        for mut params in remaining {
+            // Check if all EXCHANGE_NODE IDs in this fragment can be resolved.
+            let exchange_ids: Vec<i32> = params
+                .fragment
+                .as_ref()
+                .and_then(|f| f.plan.as_ref())
+                .map(|p| {
+                    p.nodes
+                        .iter()
+                        .filter(|n| {
+                            n.node_type == TPlanNodeType::EXCHANGE_NODE && n.num_children == 0
+                        })
+                        .map(|n| n.node_id)
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let all_resolved = exchange_ids
+                .iter()
+                .all(|id| resolved_sources.contains_key(id));
+
+            if all_resolved || exchange_ids.is_empty() {
+                // Merge: replace EXCHANGE_NODE(0 children) with resolved source nodes.
+                if let Some(plan) = params
+                    .fragment
+                    .as_mut()
+                    .and_then(|f| f.plan.as_mut())
+                {
+                    let mut merged_nodes = Vec::new();
+                    for node in &plan.nodes {
+                        if node.node_type == TPlanNodeType::EXCHANGE_NODE
+                            && node.num_children == 0
+                        {
+                            if let Some(source) = resolved_sources.get(&node.node_id) {
+                                merged_nodes.extend_from_slice(source);
+                            } else if let Some(leaf_nodes) = single_leaf
+                                .and_then(|l| l.fragment.as_ref())
+                                .and_then(|f| f.plan.as_ref())
+                                .map(|p| &p.nodes)
+                            {
+                                merged_nodes.extend_from_slice(leaf_nodes);
+                            } else {
+                                merged_nodes.push(node.clone());
+                            }
+                        } else {
+                            merged_nodes.push(node.clone());
+                        }
+                    }
+                    plan.nodes = merged_nodes;
+                }
+
+                // Register this fragment's merged output as a resolved source.
+                if let Some(dest_node_id) = params
+                    .fragment
+                    .as_ref()
+                    .and_then(|f| f.output_sink.as_ref())
+                    .filter(|s| s.type_ == TDataSinkType::DATA_STREAM_SINK)
+                    .and_then(|s| s.stream_sink.as_ref())
+                    .map(|ss| ss.dest_node_id)
+                {
+                    if let Some(nodes) = params
+                        .fragment
+                        .as_ref()
+                        .and_then(|f| f.plan.as_ref())
+                        .map(|p| p.nodes.clone())
+                    {
+                        resolved_sources.insert(dest_node_id, nodes);
+                    }
+                }
+
+                // Merge scan params and local params from inner levels.
+                if let Some(inner_scan) = &current_scan_params {
+                    let merged_scan = params
+                        .file_scan_params
+                        .get_or_insert_with(Default::default);
+                    for (k, v) in inner_scan {
+                        merged_scan.entry(*k).or_insert_with(|| v.clone());
+                    }
+                }
+                current_scan_params = params.file_scan_params.clone();
+
+                if let Some(inner_local) = &current_local_params {
+                    if params.local_params.is_none() {
+                        params.local_params = Some(inner_local.clone());
+                    } else {
+                        let merged_local = params.local_params.get_or_insert_with(Vec::new);
+                        for lp in inner_local {
+                            merged_local.push(lp.clone());
+                        }
+                    }
+                }
+                current_local_params = params.local_params.clone();
+
+                ordered.push(params);
+            } else {
+                still_remaining.push(params);
+            }
+        }
+        remaining = still_remaining;
+        if remaining.is_empty() || remaining.len() == before {
+            // All resolved, or stuck (no progress) — break.
+            break;
+        }
+    }
+    // Append any unresolved intermediates at the end (shouldn't happen in valid plans).
+    ordered.extend(remaining);
+    intermediate_fragments = ordered;
+
+    // Keep only the outermost intermediate (last in topological order).
+    // All inner intermediates have been merged into it via the cascade.
     if intermediate_fragments.len() > 1 {
         let outermost = intermediate_fragments.pop().unwrap();
         intermediate_fragments = vec![outermost];
@@ -598,9 +737,10 @@ fn merge_fragment_plans(
     // that collects results. Replace its plan with the merged intermediate's plan.
     // Preserve the exchange_root's local_params (FE uses its fragment_instance_id for fetch_data).
     if !exchange_root_fragments.is_empty() && !intermediate_fragments.is_empty() {
-        let intermediate_nodes: Vec<_> = intermediate_fragments
-            .first()
-            .and_then(|p| p.fragment.as_ref())
+        let outermost = intermediate_fragments.last().unwrap();
+        let intermediate_nodes: Vec<_> = outermost
+            .fragment
+            .as_ref()
             .and_then(|f| f.plan.as_ref())
             .map(|p| p.nodes.clone())
             .unwrap_or_default();
@@ -623,23 +763,21 @@ fn merge_fragment_plans(
                 plan.nodes = merged_nodes;
             }
 
-            // Copy file_scan_params and additional local_params from intermediate.
-            if let Some(inter) = intermediate_fragments.first() {
-                if let Some(inter_scan) = &inter.file_scan_params {
-                    let merged_scan = params
-                        .file_scan_params
-                        .get_or_insert_with(Default::default);
-                    for (k, v) in inter_scan {
-                        merged_scan.entry(*k).or_insert_with(|| v.clone());
-                    }
+            // Copy file_scan_params and additional local_params from outermost intermediate.
+            if let Some(inter_scan) = &outermost.file_scan_params {
+                let merged_scan = params
+                    .file_scan_params
+                    .get_or_insert_with(Default::default);
+                for (k, v) in inter_scan {
+                    merged_scan.entry(*k).or_insert_with(|| v.clone());
                 }
-                // Append intermediate's local_params (scan ranges) but keep
-                // exchange_root's local_params[0] first (has the result instance_id).
-                if let Some(inter_local) = &inter.local_params {
-                    let merged_local = params.local_params.get_or_insert_with(Vec::new);
-                    for lp in inter_local {
-                        merged_local.push(lp.clone());
-                    }
+            }
+            // Append intermediate's local_params (scan ranges) but keep
+            // exchange_root's local_params[0] first (has the result instance_id).
+            if let Some(inter_local) = &outermost.local_params {
+                let merged_local = params.local_params.get_or_insert_with(Vec::new);
+                for lp in inter_local {
+                    merged_local.push(lp.clone());
                 }
             }
         }
@@ -1777,7 +1915,10 @@ impl PBackendService for PBackendServiceHandler {
         };
 
         let file_path = match file_path {
-            Some(p) => p,
+            Some(p) => {
+                // Strip file:// scheme if present (FE sends file:// URLs for local paths).
+                p.strip_prefix("file://").unwrap_or(&p).to_string()
+            }
             None => {
                 warn!("fetch_table_schema: no file path in TFileScanRange");
                 return Ok(Response::new(PFetchTableSchemaResult {
@@ -1856,10 +1997,14 @@ impl PBackendService for PBackendServiceHandler {
         let pattern = req.pattern.unwrap_or_default();
         info!(pattern = %pattern, "glob");
 
+        // Strip file:// scheme if present (FE sends file:// URLs for local paths).
+        let path = pattern.strip_prefix("file://").unwrap_or(&pattern);
+
         // For local files, just stat the path and return it.
         let mut files = vec![];
-        match std::fs::metadata(&pattern) {
+        match std::fs::metadata(path) {
             Ok(meta) => {
+                // Return the original pattern (with file:// prefix) — FE expects it back.
                 files.push(p_glob_response::PFileInfo {
                     file: Some(pattern),
                     size: Some(meta.len() as i64),

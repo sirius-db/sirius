@@ -58,7 +58,7 @@ services:
         condition: service_healthy
     environment:
       - LD_LIBRARY_PATH=/opt/nix-glibc:/opt/pixi-lib:/opt/pixi-nixl-lib:/opt/pixi-default/lib:/usr/local/nvidia/lib64
-      - RUST_LOG=info
+      - RUST_LOG=doris_rpc=debug,plan_translator=debug,sirius_ffi=debug,info
       - SIRIUS_EXTENSION_DIR=/opt/extensions
       - NIXL_PLUGIN_DIR=/opt/pixi-nixl-lib/plugins
     volumes:

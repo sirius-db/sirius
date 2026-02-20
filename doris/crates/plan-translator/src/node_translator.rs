@@ -48,6 +48,17 @@ fn translate_node(
     let node = &nodes[*idx];
     *idx += 1;
 
+    // Debug: log each node being translated
+    tracing::debug!(
+        node_idx = *idx - 1,
+        node_id = node.node_id,
+        node_type = ?node.node_type,
+        num_children = node.num_children,
+        has_agg_node = node.agg_node.is_some(),
+        need_finalize = node.agg_node.as_ref().map(|a| a.need_finalize),
+        "translate_node: processing plan node"
+    );
+
     // Save the first child's TPlanNode reference before advancing through children.
     // Needed for:
     //   - Joins: count left-side columns for field offsets
@@ -538,6 +549,24 @@ fn translate_aggregation_node(
     // (e.g. 3-fragment plans: AGG_finalize → SORT → AGG_partial → SCAN).
     if agg_node.need_finalize {
         // Extract the partial AggregateRel, possibly through a SortRel wrapper.
+        let child_rel_type_name = match input.rel_type.as_ref() {
+            Some(rel::RelType::Aggregate(_)) => "Aggregate",
+            Some(rel::RelType::Sort(_)) => "Sort",
+            Some(rel::RelType::Filter(_)) => "Filter",
+            Some(rel::RelType::Read(_)) => "Read",
+            Some(rel::RelType::Join(_)) => "Join",
+            Some(rel::RelType::Cross(_)) => "Cross",
+            Some(rel::RelType::Fetch(_)) => "Fetch",
+            Some(rel::RelType::Project(_)) => "Project",
+            Some(rel::RelType::Set(_)) => "Set",
+            None => "None",
+            _ => "Other",
+        };
+        tracing::debug!(
+            child_rel_type = child_rel_type_name,
+            need_finalize = agg_node.need_finalize,
+            "AGG_finalize: inspecting child for two-phase collapse"
+        );
         let (child_agg_opt, sort_wrapper) = match input.rel_type.as_ref() {
             Some(rel::RelType::Aggregate(agg)) => (Some(agg.clone()), None),
             Some(rel::RelType::Sort(sort)) => {
@@ -561,45 +590,54 @@ fn translate_aggregation_node(
             // Detect this by matching each finalize aggregate_function's SLOT_REF child
             // to the partial node's output tuple measure slots.
             // When a SortRel is between them, child_node is the SORT node, not the partial.
-            // Walk down to find the actual AGG partial node for slot matching.
-            let partial_node = if sort_wrapper.is_some() {
-                // child_node is the SORT; the partial AGG is the SORT's child (2 levels down).
-                // We need to find the partial node's row_tuples from the descriptor table.
-                // For now, skip reordering when sort is present (the partial order should match).
-                None
-            } else {
-                child_node
-            };
-            if let Some(partial_node) = partial_node {
-                let num_grouping = merged
-                    .groupings
-                    .first()
-                    .map(|g| {
-                        #[allow(deprecated)]
-                        g.grouping_expressions.len()
-                    })
-                    .unwrap_or(0);
+            // The SORT node passes through the same output tuple as its child (the partial AGG),
+            // so its row_tuples contain the partial's output slots and can be used directly.
+            // The partial's measure order may differ from the finalize's expected order.
+            // The finalize's aggregate_functions have SLOT_REFs pointing to the finalize's
+            // INPUT tuple (which was the EXCHANGE node's output in the original plan).
+            // After fragment merging, the EXCHANGE is replaced by the partial, but slot IDs
+            // don't change. We resolve through the descriptor table: find the finalize's
+            // input tuple by looking up the first SLOT_REF, then compute positions.
+            let num_grouping = merged
+                .groupings
+                .first()
+                .map(|g| {
+                    #[allow(deprecated)]
+                    g.grouping_expressions.len()
+                })
+                .unwrap_or(0);
 
-                // Get the partial's output tuple's materialized slot IDs.
-                let mut partial_output_slots = Vec::new();
-                for &tuple_id in &partial_node.row_tuples {
-                    if let Ok(tuple) = desc.get_tuple(tuple_id) {
-                        for &slot_id in &tuple.slot_ids {
-                            if let Ok(slot) = desc.get_slot(slot_id) {
-                                if slot.is_materialized {
-                                    partial_output_slots.push(slot_id);
-                                }
+            // Find the finalize's input tuple from the first aggregate function's SLOT_REF.
+            let input_tuple_slots = agg_node
+                .aggregate_functions
+                .first()
+                .and_then(|agg_fn| {
+                    let slot_id = agg_fn
+                        .nodes
+                        .iter()
+                        .find(|n| n.node_type == TExprNodeType::SLOT_REF)
+                        .and_then(|n| n.slot_ref.as_ref())
+                        .map(|sr| sr.slot_id)?;
+                    // Look up this slot to find its parent tuple.
+                    let slot = desc.get_slot(slot_id).ok()?;
+                    let tuple = desc.get_tuple(slot.parent_tuple_id).ok()?;
+                    // Get all materialized slots in the tuple (in order).
+                    let mut slots = Vec::new();
+                    for &sid in &tuple.slot_ids {
+                        if let Ok(s) = desc.get_slot(sid) {
+                            if s.is_materialized {
+                                slots.push(sid);
                             }
                         }
                     }
-                }
+                    Some(slots)
+                });
 
+            if let Some(input_slots) = input_tuple_slots {
                 // Skip grouping key slots to get measure slots only.
-                if partial_output_slots.len() > num_grouping {
-                    let measure_slots = &partial_output_slots[num_grouping..];
+                if input_slots.len() > num_grouping {
+                    let measure_slots = &input_slots[num_grouping..];
 
-                    // For each finalize aggregate function, find which partial
-                    // measure it references via its SLOT_REF child.
                     let mut permutation = Vec::new();
                     let mut all_found = true;
                     for agg_fn in &agg_node.aggregate_functions {
@@ -640,8 +678,15 @@ fn translate_aggregation_node(
                 }
             }
 
-            for measure in &mut merged.measures {
+            for (i, measure) in merged.measures.iter_mut().enumerate() {
                 if let Some(func) = &mut measure.measure {
+                    tracing::debug!(
+                        measure_idx = i,
+                        func_ref = func.function_reference,
+                        num_args = func.arguments.len(),
+                        args = ?func.arguments.iter().map(|a| format!("{:?}", a)).collect::<Vec<_>>(),
+                        "collapsed AGG measure before phase promotion"
+                    );
                     func.phase = 3; // INITIAL_TO_RESULT
                 }
             }
