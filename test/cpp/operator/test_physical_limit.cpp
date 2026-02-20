@@ -151,8 +151,8 @@ TEST_CASE("streaming_limit caps total rows across multiple batches",
   sirius_physical_streaming_limit limiter(
     std::move(types), duckdb::BoundLimitNode::ConstantValue(5), duckdb::BoundLimitNode(), 30, true);
 
-  auto outputs = limiter.execute(batches, cudf::get_default_stream());
-  auto rows    = collect_all_rows(outputs);
+  auto outputs = limiter.execute(operator_data(batches), cudf::get_default_stream());
+  auto rows    = collect_all_rows(outputs->get_data_batches());
 
   // Should return exactly 5 rows: [0, 1, 2, 3, 4]
   std::vector<int64_t> expected{0, 1, 2, 3, 4};
@@ -180,8 +180,8 @@ TEST_CASE("streaming_limit spans across two batches returning correct data",
                                           300,
                                           true);
 
-  auto outputs = limiter.execute(batches, cudf::get_default_stream());
-  auto rows    = collect_all_rows(outputs);
+  auto outputs = limiter.execute(operator_data(batches), cudf::get_default_stream());
+  auto rows    = collect_all_rows(outputs->get_data_batches());
 
   // Should return exactly 200 rows: all 150 from batch 1, plus first 50 from batch 2
   REQUIRE(rows.size() == 200);
@@ -213,8 +213,8 @@ TEST_CASE("streaming_limit offset spans across multiple batches", "[physical_lim
                                           30,
                                           true);
 
-  auto outputs = limiter.execute(batches, cudf::get_default_stream());
-  auto rows    = collect_all_rows(outputs);
+  auto outputs = limiter.execute(operator_data(batches), cudf::get_default_stream());
+  auto rows    = collect_all_rows(outputs->get_data_batches());
 
   // Should return [15, 16, 17, 18, 19]
   std::vector<int64_t> expected{15, 16, 17, 18, 19};
@@ -237,13 +237,13 @@ TEST_CASE("streaming_limit with separate execute calls enforces global limit",
 
   // First call with batch [0..9]
   std::vector<std::shared_ptr<data_batch>> batch1{make_range_batch(*space, 0, 10)};
-  auto out1  = limiter.execute(batch1, cudf::get_default_stream());
-  auto rows1 = collect_all_rows(out1);
+  auto out1  = limiter.execute(operator_data(batch1), cudf::get_default_stream());
+  auto rows1 = collect_all_rows(out1->get_data_batches());
 
   // Second call with batch [10..19] — limit should already be exhausted
   std::vector<std::shared_ptr<data_batch>> batch2{make_range_batch(*space, 10, 10)};
-  auto out2  = limiter.execute(batch2, cudf::get_default_stream());
-  auto rows2 = collect_all_rows(out2);
+  auto out2  = limiter.execute(operator_data(batch2), cudf::get_default_stream());
+  auto rows2 = collect_all_rows(out2->get_data_batches());
 
   // Total across both calls should be exactly 5
   REQUIRE(rows1.size() + rows2.size() == 5);
