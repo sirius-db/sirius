@@ -921,13 +921,18 @@ fn project_ipc_columns(
             "using explicit column indices"
         );
         explicit.to_vec()
-    } else if schema.fields().len() == output_names.len() {
-        // Column count matches and no explicit reorder — no projection needed.
+    } else if schema.fields().len() == output_names.len()
+        && schema_names
+            .iter()
+            .zip(output_names.iter())
+            .all(|(a, b)| a == b || b.is_empty())
+    {
+        // Column count AND order matches — no projection needed.
         tracing::info!(
             cols = schema.fields().len(),
             duckdb_schema = ?schema_names,
             output_names = ?output_names,
-            "IPC column count matches, no projection needed"
+            "IPC column count and order match, no projection needed"
         );
         return Ok(ipc_bytes.to_vec());
     } else {

@@ -243,7 +243,7 @@ fn build_projection_slot_map(plan: &TPlan, desc: &mut descriptor_table::Descript
             }
         }
 
-        // Process final projections.
+        // Process final projections (present on all node types).
         if let (Some(projections), Some(output_tuple_id)) =
             (&node.projections, &node.output_tuple_id)
         {
