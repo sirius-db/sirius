@@ -256,23 +256,22 @@ void duckdb_scan_task_local_state::column_builder::process_column(
   process_mask_for_column(validity, num_rows, row_offset, allocation);
 }
 
-metadata_node duckdb_scan_task_local_state::column_builder::make_metadata_node(
+column_metadata duckdb_scan_task_local_state::column_builder::make_column_metadata(
   size_t num_rows) const
 {
   if (type.InternalType() == duckdb::PhysicalType::VARCHAR) {
-    // VARCHAR column
-    return make_string_metadata_node(
+    return make_string_column_metadata(
       static_cast<cudf::size_type>(num_rows),
       static_cast<cudf::size_type>(null_count),
-      static_cast<int64_t>(data_blocks_accessor.initial_byte_offset),
-      static_cast<int64_t>(mask_blocks_accessor.initial_byte_offset),
-      static_cast<int64_t>(offset_blocks_accessor.initial_byte_offset));
+      data_blocks_accessor.initial_byte_offset,
+      mask_blocks_accessor.initial_byte_offset,
+      offset_blocks_accessor.initial_byte_offset);
   } else {
-    return make_flat_metadata_node(type,
-                                   static_cast<cudf::size_type>(num_rows),
-                                   static_cast<cudf::size_type>(null_count),
-                                   static_cast<int64_t>(data_blocks_accessor.initial_byte_offset),
-                                   static_cast<int64_t>(mask_blocks_accessor.initial_byte_offset));
+    return make_flat_column_metadata(type,
+                                     static_cast<cudf::size_type>(num_rows),
+                                     static_cast<cudf::size_type>(null_count),
+                                     data_blocks_accessor.initial_byte_offset,
+                                     mask_blocks_accessor.initial_byte_offset);
   }
 }
 
@@ -413,26 +412,23 @@ std::shared_ptr<cucascade::data_batch> duckdb_scan_task_local_state::make_data_b
 {
   using data_batch                = cucascade::data_batch;
   using host_table_allocation     = cucascade::memory::host_table_allocation;
-  using host_table_representation = cucascade::host_table_representation;
+  using host_data_representation = cucascade::host_data_representation;
 
-  // Create metadata nodes for each column and assemble metadata buffer
-  std::vector<metadata_node> column_metadata;
-  column_metadata.reserve(_num_columns);
+  // Create column metadata for each column
+  std::vector<column_metadata> cols;
+  cols.reserve(_num_columns);
   for (size_t ci = 0; ci < _column_builders.size(); ci++) {
-    auto& builder = _column_builders[ci];
-    column_metadata.push_back(builder.make_metadata_node(_row_offset));
+    cols.push_back(_column_builders[ci].make_column_metadata(_row_offset));
   }
-  auto metadata = std::make_unique<std::vector<uint8_t>>(pack_metadata_from_nodes(column_metadata));
 
   // Make the host table allocation
   auto const sz = get_tail_byte_offset();
-  // auto const sz = allocation->size_bytes();
   auto table_allocation =
-    std::make_unique<host_table_allocation>(std::move(_allocation), std::move(metadata), sz);
+    std::make_unique<host_table_allocation>(std::move(_allocation), std::move(cols), sz);
 
   // Make the host table representation
   auto table =
-    std::make_unique<host_table_representation>(std::move(table_allocation), _host_space);
+    std::make_unique<host_data_representation>(std::move(table_allocation), _host_space);
 
   // Create the data batch and return
   return std::make_shared<data_batch>(get_next_batch_id(), std::move(table));

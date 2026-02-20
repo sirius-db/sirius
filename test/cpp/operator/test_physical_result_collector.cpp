@@ -209,7 +209,7 @@ void convert_batch_to_host(std::shared_ptr<data_batch> const& batch)
   if (!host_space) { throw std::runtime_error("Invalid host memory space for test"); }
 
   auto& registry = sirius::converter_registry::get();
-  batch->convert_to<host_table_representation>(registry, host_space, rmm::cuda_stream_default);
+  batch->convert_to<host_data_representation>(registry, host_space, rmm::cuda_stream_default);
 }
 
 }  // namespace

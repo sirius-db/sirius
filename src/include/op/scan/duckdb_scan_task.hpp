@@ -271,12 +271,12 @@ class duckdb_scan_task_local_state : public sirius::pipeline::sirius_pipeline_ta
                         std::unique_ptr<multiple_blocks_allocation>& allocation);
 
     /**
-     * @brief Create a metadata node for this column for building a host_table_allocation.
+     * @brief Create column metadata for this column for building a host_table_allocation.
      *
      * @param[in] num_rows The number of rows in the column.
-     * @return metadata_node The constructed metadata node.
+     * @return column_metadata The constructed column metadata.
      */
-    [[nodiscard]] metadata_node make_metadata_node(size_t num_rows) const;
+    [[nodiscard]] column_metadata make_column_metadata(size_t num_rows) const;
   };
 
   //===----------Constructor & Destructor----------===//
