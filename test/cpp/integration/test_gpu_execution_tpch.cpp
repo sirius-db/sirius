@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include "op/sirius_physical_partition.hpp"
+
 #include <cudf/utilities/default_stream.hpp>
 
 #include <catch.hpp>
@@ -1164,6 +1166,120 @@ TEST_CASE_METHOD(GPUExecutionFixture,
     "select avg(n_regionkey), avg(n_nationkey), n_name, "
     "max(cast(n_nationkey as Decimal(18,2))) "
     "from nation group by n_regionkey, n_name;");
+}
+
+//===----------------------------------------------------------------------===//
+// Count distinct tests
+//===----------------------------------------------------------------------===//
+
+// nation: 25 rows, n_regionkey in {0..4} with exactly 5 nations per region.
+// count(distinct n_nationkey) per region must equal 5.
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - count distinct: single group key",
+                 "[integration][gpu_execution][group_by][count_distinct]")
+{
+  compare_gpu_vs_cpu(
+    "select n_regionkey, count(distinct n_nationkey) from nation group by n_regionkey;");
+}
+
+// count(distinct n_name): n_name is unique per nation, so same result as above.
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - count distinct: string column",
+                 "[integration][gpu_execution][group_by][count_distinct]")
+{
+  compare_gpu_vs_cpu(
+    "select n_regionkey, count(distinct n_name) from nation group by n_regionkey;");
+}
+
+// count(distinct) mixed with other aggregations in the same grouped aggregate.
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - count distinct: mixed with min and count",
+                 "[integration][gpu_execution][group_by][count_distinct]")
+{
+  compare_gpu_vs_cpu(
+    "select n_regionkey, count(distinct n_nationkey), min(n_nationkey), count(*) "
+    "from nation group by n_regionkey;");
+}
+
+// Larger table: customer (15000 rows), two group-by keys.
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - count distinct: larger table two group keys",
+                 "[integration][gpu_execution][group_by][count_distinct]")
+{
+  compare_gpu_vs_cpu(
+    "select c_nationkey, count(distinct c_mktsegment) from customer group by c_nationkey;");
+}
+
+// ---------------------------------------------------------------------------
+// Multi-partition count distinct tests
+//
+// PARTITION_SIZE is temporarily lowered so the engine creates multiple
+// partitions even with the small TPC-H test tables.  A RAII guard restores
+// the original value after each test regardless of pass/fail.
+// ---------------------------------------------------------------------------
+
+struct PartitionSizeGuard {
+  explicit PartitionSizeGuard(duckdb::idx_t override_size)
+  {
+    sirius::op::sirius_physical_partition::set_partition_size(override_size);
+  }
+  ~PartitionSizeGuard() { sirius::op::sirius_physical_partition::reset_partition_size(); }
+};
+
+// nation (25 rows) with partition_size=5 → ceil(25/5) = 5 partitions.
+// count(distinct n_nationkey) per region must still equal 5.
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - count distinct: multi-partition forced, single group key",
+                 "[integration][gpu_execution][group_by][count_distinct][multi_partition]")
+{
+  PartitionSizeGuard guard(5);
+  compare_gpu_vs_cpu(
+    "select n_regionkey, count(distinct n_nationkey) from nation group by n_regionkey;");
+}
+
+// customer (15000 rows) with partition_size=1000 → 15 partitions.
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - count distinct: multi-partition forced, customer table",
+                 "[integration][gpu_execution][group_by][count_distinct][multi_partition]")
+{
+  PartitionSizeGuard guard(1000);
+  compare_gpu_vs_cpu(
+    "select c_nationkey, count(distinct c_mktsegment) from customer group by c_nationkey;");
+}
+
+// Mixed aggregations across multiple forced partitions.
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - count distinct: multi-partition forced, mixed aggregations",
+                 "[integration][gpu_execution][group_by][count_distinct][multi_partition]")
+{
+  PartitionSizeGuard guard(1000);
+  compare_gpu_vs_cpu(
+    "select c_nationkey, count(distinct c_mktsegment), min(c_custkey), count(*) "
+    "from customer group by c_nationkey;");
+}
+
+// ---------------------------------------------------------------------------
+// Multi-column COUNT(DISTINCT) integration tests
+// count(distinct (col1, col2)) counts distinct combinations, not individual values.
+// ---------------------------------------------------------------------------
+
+// nation: 25 rows, 5 unique (n_nationkey, n_name) combos per region.
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - count distinct: multi-column struct",
+                 "[integration][gpu_execution][group_by][count_distinct]")
+{
+  compare_gpu_vs_cpu(
+    "select n_regionkey, count(distinct (n_nationkey, n_name)) from nation group by n_regionkey;");
+}
+
+// Multi-column count distinct with a forced multi-partition execution.
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - count distinct: multi-column struct, multi-partition forced",
+                 "[integration][gpu_execution][group_by][count_distinct][multi_partition]")
+{
+  PartitionSizeGuard guard(5);
+  compare_gpu_vs_cpu(
+    "select n_regionkey, count(distinct (n_nationkey, n_name)) from nation group by n_regionkey;");
 }
 
 //===----------------------------------------------------------------------===//

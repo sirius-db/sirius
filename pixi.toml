@@ -17,6 +17,7 @@ ninja = "*"
 sccache = "*"
 unzip = "*"
 clang = ">=21"
+wget = "*"
 
 libcudf = "26.02.*"
 librmm = "*"

@@ -27,6 +27,7 @@
 #include "log/logging.hpp"
 
 #include <cudf/binaryop.hpp>
+#include <cudf/column/column_factories.hpp>
 #include <cudf/datetime.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/strings/attributes.hpp>
@@ -747,6 +748,20 @@ std::unique_ptr<cudf::column> GpuExpressionExecutor::Execute(const BoundFunction
   else if (func_str == REGEXP_REPLACE_FUNC_STR) {
     RegexFunctionDispatcher dispatcher(*this);
     return dispatcher(expr, state);
+  }
+
+  //----------Struct Functions----------//
+  // row() and struct_pack() both construct a struct column from their child expressions.
+  // row() is used by DuckDB for tuple constructors like (col1, col2).
+  if (func_str == "row" || func_str == "struct_pack") {
+    D_ASSERT(!expr.children.empty());
+    std::vector<std::unique_ptr<cudf::column>> child_cols;
+    for (size_t i = 0; i < expr.children.size(); ++i) {
+      child_cols.push_back(Execute(*expr.children[i], state->child_states[i].get()));
+    }
+    cudf::size_type num_rows = child_cols[0]->size();
+    return cudf::make_structs_column(
+      num_rows, std::move(child_cols), 0, rmm::device_buffer{}, execution_stream, resource_ref);
   }
 
   // If we've gotten this far, we've encountered a unimplemented function type

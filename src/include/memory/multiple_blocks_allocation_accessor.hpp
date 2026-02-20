@@ -17,6 +17,8 @@
 #pragma once
 
 // cucascade
+#include "duckdb/common/assert.hpp"
+
 #include <cucascade/memory/fixed_size_host_memory_resource.hpp>
 
 // standard library
@@ -118,9 +120,12 @@ struct multiple_blocks_allocation_accessor {
     assert(block_index < num_blocks);
     assert(allocation != nullptr);
     assert(offset_in_block + sizeof(T) <= block_size);
+    static_assert(
+      std::is_trivially_copyable_v<T>,
+      "[multiple_blocks_allocation_accessor] The underlying type must be trivially copyable "
+      "for memcpy operations.");
 
-    *reinterpret_cast<T*>(reinterpret_cast<uint8_t*>(allocation->get_blocks()[block_index]) +
-                          offset_in_block) = value;
+    std::memcpy(&allocation->at(block_index)[offset_in_block], &value, sizeof(T));
   }
 
   /**
@@ -133,12 +138,16 @@ struct multiple_blocks_allocation_accessor {
   [[nodiscard]] S get_current_as(
     std::unique_ptr<multiple_blocks_allocation> const& allocation) const
   {
-    assert(block_index < num_blocks);
-    assert(allocation != nullptr);
-    assert(offset_in_block + sizeof(S) <= block_size);
-
-    return *reinterpret_cast<S*>(reinterpret_cast<uint8_t*>(allocation->get_blocks()[block_index]) +
-                                 offset_in_block);
+    D_ASSERT(block_index < num_blocks);
+    D_ASSERT(allocation != nullptr);
+    D_ASSERT(offset_in_block + sizeof(S) <= block_size);
+    static_assert(
+      std::is_trivially_copyable_v<S>,
+      "[multiple_blocks_allocation_accessor] The underlying type must be trivially copyable "
+      "for memcpy operations.");
+    S s;
+    std::memcpy(&s, &allocation->at(block_index)[offset_in_block], sizeof(S));
+    return s;
   }
 
   /**
@@ -164,10 +173,13 @@ struct multiple_blocks_allocation_accessor {
     assert(temp_block_index < num_blocks);
     assert(allocation != nullptr);
     assert(temp_offset_in_block + sizeof(T) <= block_size);
-
-    return *reinterpret_cast<T*>(
-      reinterpret_cast<uint8_t*>(allocation->get_blocks()[temp_block_index]) +
-      temp_offset_in_block);
+    static_assert(
+      std::is_trivially_copyable_v<T>,
+      "[multiple_blocks_allocation_accessor] The underlying type must be trivially copyable "
+      "for memcpy operations.");
+    T value;
+    std::memcpy(&value, &allocation->at(temp_block_index)[temp_offset_in_block], sizeof(T));
+    return value;
   }
 
   /**
@@ -205,10 +217,7 @@ struct multiple_blocks_allocation_accessor {
       // Do as much of a bulk set as possible in the current block
       auto const bytes_to_set =
         std::min(bytes - bytes_set, allocation->block_size() - offset_in_block);
-      std::memset(
-        reinterpret_cast<uint8_t*>(allocation->get_blocks()[block_index]) + offset_in_block,
-        val,
-        bytes_to_set);
+      std::memset(&allocation->at(block_index)[offset_in_block], val, bytes_to_set);
       bytes_set += bytes_to_set;
       offset_in_block += bytes_to_set;
       // Check if we need to advance to the next block
@@ -237,10 +246,9 @@ struct multiple_blocks_allocation_accessor {
       // Do as much of a bulk copy as possible in the current block
       auto const bytes_to_copy =
         std::min(bytes - bytes_copied, allocation->block_size() - offset_in_block);
-      std::memcpy(
-        reinterpret_cast<uint8_t*>(allocation->get_blocks()[block_index]) + offset_in_block,
-        static_cast<uint8_t const*>(src) + bytes_copied,
-        bytes_to_copy);
+      std::memcpy(&allocation->at(block_index)[offset_in_block],
+                  static_cast<uint8_t const*>(src) + bytes_copied,
+                  bytes_to_copy);
       bytes_copied += bytes_to_copy;
       offset_in_block += bytes_to_copy;
       // Check if we need to advance to the next block
@@ -269,10 +277,9 @@ struct multiple_blocks_allocation_accessor {
       // Do as much of a bulk copy as possible in the current block
       auto const bytes_to_copy =
         std::min(bytes - bytes_copied, allocation->block_size() - offset_in_block);
-      std::memcpy(
-        static_cast<uint8_t*>(dest) + bytes_copied,
-        reinterpret_cast<uint8_t*>(allocation->get_blocks()[block_index]) + offset_in_block,
-        bytes_to_copy);
+      std::memcpy(static_cast<uint8_t*>(dest) + bytes_copied,
+                  &allocation->at(block_index)[offset_in_block],
+                  bytes_to_copy);
       bytes_copied += bytes_to_copy;
       offset_in_block += bytes_to_copy;
       // Check if we need to advance to the next block
