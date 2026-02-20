@@ -8,6 +8,15 @@ concurrency:
 
 jobs:
   test:
+    strategy:
+      matrix:
+        include:
+          - compiler: gcc-cuda
+            build-cmd: "make release -j$(nproc)"
+          - compiler: clang
+            build-cmd: "make clang-release -j$(($(nproc) - 2))"
+      fail-fast: false
+    name: test (${{ matrix.compiler }})
     runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 60
     steps:
@@ -27,7 +36,7 @@ jobs:
       - name: Build
         env:
           CUDAARCHS: native
-        run: make -j$(nproc)
+        run: ${{ matrix.build-cmd }}
       - name: Run C++ unit tests
         run: ./build/release/extension/sirius/test/cpp/sirius_unittest --abort
       - name: Prepare SQL test datasets
