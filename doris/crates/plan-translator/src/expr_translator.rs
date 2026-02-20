@@ -162,7 +162,8 @@ fn translate_slot_ref(
     // Check for projection expansion first — handles computed expression slots
     // from scan node intermediate/final projections (e.g., `l_extendedprice * (1 - l_discount)`).
     // These slots can't be resolved by column position since they don't exist in the base table.
-    // Pass row_tuples through so inner SLOT_REFs resolve in the correct JOIN context.
+    // Use None for row_tuples: scan projections resolve against their own table, not
+    // the JOIN context. The expanded expression's SLOT_REFs use slot_table_index.
     if let Some(expr) = desc.get_slot_expression(slot_ref.slot_id) {
         tracing::debug!(
             slot_id = slot_ref.slot_id,
@@ -170,7 +171,7 @@ fn translate_slot_ref(
         );
         let expr = expr.clone();
         let mut idx = 0;
-        return translate_expr_node(&expr.nodes, &mut idx, desc, registry, row_tuples);
+        return translate_expr_node(&expr.nodes, &mut idx, desc, registry, None);
     }
 
     let col_idx = if let Some(tuples) = row_tuples {
