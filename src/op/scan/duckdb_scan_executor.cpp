@@ -206,10 +206,27 @@ void duckdb_scan_executor::manager_loop()
       }
     }
 
-    // Scan tasks manage their own host memory reservations and allocations in
-    // duckdb_scan_task_local_state's constructor — do NOT replace them here.
-    // (Unlike GPU pipeline tasks, whose constructors do not make reservations.)
     auto* scan_task = dynamic_cast<pipeline::sirius_pipeline_itask*>(task.get());
+    if (scan_task->is<parquet_scan_task>()) {
+      auto bytes_needed = scan_task->get_estimated_reservation_size();
+      auto reservation  = _mem_mgr->request_reservation(
+        cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::HOST}, bytes_needed);
+      if (!reservation) {
+        SIRIUS_LOG_ERROR("DuckDB Scan Executor: Failed to acquire host memory reservation");
+        _completion_handler->report_error(
+          "DuckDB Scan Executor: Failed to acquire host memory reservation");
+        break;
+      }
+      if (auto* local_state = dynamic_cast<sirius::pipeline::sirius_pipeline_task_local_state*>(
+            scan_task->local_state())) {
+        local_state->set_reservation(std::move(reservation));
+      } else {
+        _completion_handler->report_error(
+          "DuckDB Scan Executor: Failed to cast local state for task");
+        SIRIUS_LOG_ERROR("DuckDB Scan Executor: Failed to cast local state for task");
+        break;
+      }
+    }
 
     auto stream = cudf::get_default_stream();
     _thread_pool->schedule([this,
