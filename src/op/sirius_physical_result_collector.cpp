@@ -176,8 +176,14 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
     host_table_chunk_reader chunk_reader(_client_ctx, host_table, types);
 
     // Push chunks to result collection
-    duckdb::DataChunk chunk;
-    while (chunk_reader.get_next_chunk(chunk)) {
+    while (true) {
+      // TODO(amin): it is fishy that append take a mutable reference to the chunk reader and we are
+      // passing local variable chunk reader by reference. We should investigate if this can cause
+      // any issues (e.g., if duckdb does not consume all data from the chunk reader in append and
+      // we move to the next chunk reader, then the previous chunk reader's state will be lost).
+      duckdb::DataChunk chunk;
+      if (!chunk_reader.get_next_chunk(chunk)) { break; }
+
       std::lock_guard<std::mutex> guard(lock);
       // Initialize result collection if it is null (from a move)
       if (!result_collection) {
