@@ -468,8 +468,8 @@ TEST_CASE("host_table_utils - pack metadata with gaps across multiple blocks",
   auto const sz         = allocation->size_bytes();
   auto table_allocation = std::make_unique<cucascade::memory::host_table_allocation>(
     std::move(allocation), std::move(cols), sz);
-  auto host_table = std::make_unique<cucascade::host_data_representation>(
-    std::move(table_allocation), host_space);
+  auto host_table =
+    std::make_unique<cucascade::host_data_representation>(std::move(table_allocation), host_space);
   auto batch =
     std::make_shared<cucascade::data_batch>(sirius::get_next_batch_id(), std::move(host_table));
 
@@ -592,8 +592,8 @@ TEST_CASE("host_table_utils - underfilled varchar column truncates rows",
   auto const sz         = allocation->size_bytes();
   auto table_allocation = std::make_unique<cucascade::memory::host_table_allocation>(
     std::move(allocation), std::move(cols), sz);
-  auto host_table = std::make_unique<cucascade::host_data_representation>(
-    std::move(table_allocation), host_space);
+  auto host_table =
+    std::make_unique<cucascade::host_data_representation>(std::move(table_allocation), host_space);
   auto batch =
     std::make_shared<cucascade::data_batch>(sirius::get_next_batch_id(), std::move(host_table));
 

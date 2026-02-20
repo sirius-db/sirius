@@ -133,8 +133,8 @@ class host_table_chunk_reader {
    * @param[in] host_table The cucascade::host_data_representation to read from
    * @param[in] types The duckdb logical types for the chunk columns
    * @throw std::runtime_error If there is a mismatch in metadata and types, if the row count is
-   * negative or inconsistent across column_metadata entries, or if the duckdb output logical type for any
-   * column is HUGEINT.
+   * negative or inconsistent across column_metadata entries, or if the duckdb output logical type
+   * for any column is HUGEINT.
    */
   host_table_chunk_reader(duckdb::ClientContext& client_ctx,
                           cucascade::host_data_representation const& host_table,
