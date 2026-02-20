@@ -106,22 +106,7 @@ sirius_physical_duckdb_scan::sirius_physical_duckdb_scan(
   }
 
   fake_table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
-
-  // Log column mapping for debugging scan-related issues
-  SIRIUS_LOG_DEBUG(
-    "DUCKDB_SCAN column_ids.size()={}, projection_ids.size()={}, "
-    "scanned_types.size()={}, types.size()={}, gen_row_id={}",
-    column_ids.size(),
-    projection_ids.size(),
-    scanned_types.size(),
-    types.size(),
-    gen_row_id_column);
-  for (size_t i = 0; i < scanned_types.size(); i++) {
-    SIRIUS_LOG_DEBUG("  DUCKDB_SCAN scanned_types[{}] = {}", i, scanned_types[i].ToString());
-  }
-  for (size_t i = 0; i < types.size(); i++) {
-    SIRIUS_LOG_DEBUG("  DUCKDB_SCAN types[{}] = {}", i, types[i].ToString());
-  }
+  SIRIUS_LOG_DEBUG("Table scan column ids: {}", column_ids.size());
 }
 
 }  // namespace op

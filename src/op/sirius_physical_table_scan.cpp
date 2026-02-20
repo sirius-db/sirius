@@ -168,12 +168,6 @@ std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operato
     auto& first_batch_rep =
       output_batches[0]->get_data()->cast<cucascade::gpu_table_representation>();
     auto& first_table = first_batch_rep.get_table();
-    SIRIUS_LOG_DEBUG(
-      "TABLE_SCAN: batch has {} columns, expected output {} columns, "
-      "projection_ids.size()={}",
-      first_table.num_columns(),
-      expected_output_columns,
-      projection_ids.size());
     if (first_table.num_columns() > expected_output_columns) { needs_projection = true; }
   }
 

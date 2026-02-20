@@ -18,7 +18,6 @@
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
-#include "log/logging.hpp"
 #include "op/sirius_physical_filter.hpp"
 #include "op/sirius_physical_projection.hpp"
 #include "op/sirius_physical_table_scan.hpp"
@@ -53,26 +52,6 @@ duckdb::unique_ptr<sirius::op::sirius_physical_operator>
 sirius_physical_plan_generator::create_plan(duckdb::LogicalGet& op)
 {
   auto column_ids = op.GetColumnIds();
-
-  SIRIUS_LOG_DEBUG(
-    "LogicalGet: column_ids.size()={}, projection_ids.size()={}, "
-    "returned_types.size()={}, types.size()={}, "
-    "table_filters.size()={}, projection_pushdown={}",
-    column_ids.size(),
-    op.projection_ids.size(),
-    op.returned_types.size(),
-    op.types.size(),
-    op.table_filters.filters.size(),
-    op.function.projection_pushdown);
-  for (size_t i = 0; i < column_ids.size(); i++) {
-    SIRIUS_LOG_DEBUG("  LogicalGet column_ids[{}] = {}", i, column_ids[i].GetPrimaryIndex());
-  }
-  for (size_t i = 0; i < op.projection_ids.size(); i++) {
-    SIRIUS_LOG_DEBUG("  LogicalGet projection_ids[{}] = {}", i, op.projection_ids[i]);
-  }
-  for (size_t i = 0; i < op.types.size(); i++) {
-    SIRIUS_LOG_DEBUG("  LogicalGet types[{}] = {}", i, op.types[i].ToString());
-  }
 
   if (!op.children.empty()) {
     throw duckdb::NotImplementedException("Table Input Output functions are not supported yet");
