@@ -149,7 +149,8 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
       auto next_batch_id  = data_repo_mgr.get_next_data_batch_id();
       clone_batch         = input_batch->clone(next_batch_id, stream);
       // todo (bobbi) pass stream to sink
-      clone_batch->convert_to<cucascade::host_table_representation>(registry, &mem_space, stream);
+      clone_batch->convert_to<cucascade::host_data_packed_representation>(
+        registry, &mem_space, stream);
       data = clone_batch->get_data();
     } else if (data->get_current_tier() != cucascade::memory::Tier::HOST) {
       // Data must be in HOST tier (i.e., cannot currently reside in DISK tier)
@@ -158,10 +159,10 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
     }
 
     // Only accepting host_table_representations for now
-    assert(dynamic_cast<cucascade::host_table_representation*>(data) != nullptr);
+    assert(dynamic_cast<cucascade::host_data_packed_representation*>(data) != nullptr);
 
     // Push chunks to result collection
-    auto const& host_table = data->cast<cucascade::host_table_representation>();
+    auto const& host_table = data->cast<cucascade::host_data_packed_representation>();
     // host_table_chunk_reader expects get_host_table() and ->allocation to be non-null;
     // otherwise it will dereference a null unique_ptr (e.g. in column_reader::initialize).
     auto const* ht = host_table.get_host_table().get();
@@ -176,8 +177,14 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
     host_table_chunk_reader chunk_reader(_client_ctx, host_table, types);
 
     // Push chunks to result collection
-    duckdb::DataChunk chunk;
-    while (chunk_reader.get_next_chunk(chunk)) {
+    while (true) {
+      // TODO(amin): it is fishy that append take a mutable reference to the chunk reader and we are
+      // passing local variable chunk reader by reference. We should investigate if this can cause
+      // any issues (e.g., if duckdb does not consume all data from the chunk reader in append and
+      // we move to the next chunk reader, then the previous chunk reader's state will be lost).
+      duckdb::DataChunk chunk;
+      if (!chunk_reader.get_next_chunk(chunk)) { break; }
+
       std::lock_guard<std::mutex> guard(lock);
       // Initialize result collection if it is null (from a move)
       if (!result_collection) {

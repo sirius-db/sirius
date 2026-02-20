@@ -85,21 +85,14 @@ sirius_physical_duckdb_scan::sirius_physical_duckdb_scan(
     virtual_columns(std::move(virtual_columns_p)),
     gen_row_id_column(column_ids.back().GetPrimaryIndex() == duckdb::DConstants::INVALID_INDEX)
 {
-  // Build scanned_types: the types DuckDB will output after applying projection_ids.
-  // This includes virtual ROW_ID columns (typed as BIGINT) when the plan requires them.
-  auto get_projected_columns = [&]() {
-    if (!projection_ids.empty()) { return projection_ids; }
-    // When projection_ids is empty, DuckDB projects all column_ids
-    duckdb::vector<duckdb::idx_t> all;
-    for (duckdb::idx_t i = 0; i < column_ids.size(); i++) {
-      all.push_back(i);
-    }
-    return all;
-  };
-
-  auto effective_projection = get_projected_columns();
-  for (auto proj_id : effective_projection) {
-    auto col_idx = column_ids[proj_id].GetPrimaryIndex();
+  // Build scanned_types: the types of ALL columns DuckDB will output, in column_ids order.
+  // DuckDB's table function fills the DataChunk with columns in column_ids order, regardless
+  // of projection_ids. projection_ids only control which columns the PhysicalTableScan keeps
+  // after the scan function returns. Since Sirius handles projection at the TABLE_SCAN level,
+  // we must initialize the DataChunk with ALL column_ids types in their original order.
+  auto num_cols = column_ids.size();
+  for (duckdb::idx_t i = 0; i < num_cols; i++) {
+    auto col_idx = column_ids[i].GetPrimaryIndex();
     if (col_idx == duckdb::DConstants::INVALID_INDEX) {
       // ROW_ID virtual column
       scanned_types.push_back(duckdb::LogicalType::BIGINT);
