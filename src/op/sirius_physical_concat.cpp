@@ -18,7 +18,6 @@
 
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "expression_executor/gpu_expression_executor.hpp"
-#include "log/logging.hpp"
 #include "op/merge/gpu_merge_impl.hpp"
 #include "op/sirius_physical_grouped_aggregate.hpp"
 #include "op/sirius_physical_hash_join.hpp"
@@ -59,10 +58,14 @@ sirius_physical_concat::sirius_physical_concat(duckdb::vector<duckdb::LogicalTyp
     } else if (hash_join->join_type == duckdb::JoinType::OUTER) {
       _concat_all = true;
     } else {
-      throw std::runtime_error("sirius_physical_concat: unsupported join type");
+      throw std::runtime_error("sirius_physical_concat: unsupported join type: " +
+                               duckdb::JoinTypeToString(hash_join->join_type));
     }
+  } else if (parent_op->type == SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
+    _concat_all = false;
   } else {
-    throw std::runtime_error("sirius_physical_concat: parent_op is not a hash join");
+    throw std::runtime_error("sirius_physical_concat: parent_op is not a hash join: " +
+                             SiriusPhysicalOperatorToString(parent_op->type));
   }
 }
 
@@ -155,7 +158,13 @@ void sirius_physical_concat::sink(const operator_data& output_data, rmm::cuda_st
     for (auto& [next_op, port_id] : next_port_after_sink) {
       auto partition_consumer_op =
         dynamic_cast<sirius_physical_partition_consumer_operator*>(next_op);
-      partition_consumer_op->push_data_batch_partitioned(port_id, batch, partition_idx);
+      if (partition_consumer_op) {
+        partition_consumer_op->push_data_batch_partitioned(port_id, batch, partition_idx);
+      } else {
+        throw std::runtime_error(
+          "sirius_physical_concat::sink(): Next operator is not a partition consumer operator: " +
+          SiriusPhysicalOperatorToString(next_op->type));
+      }
     }
   }
 }

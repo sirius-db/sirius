@@ -12,13 +12,69 @@
 # the License.
 # =============================================================================
 
-PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
+CMAKE ?= cmake
+DUCKDB_DIR ?= duckdb
+TEST_PATH ?= build/release/test/unittest
+TEST_PATH_DEBUG ?= build/debug/test/unittest
+TEST_PATH_RELWITHDEBINFO ?= build/relwithdebinfo/test/unittest
+TEST_BUILD_TARGET ?= unittest
 
-# Configuration of extension
-EXT_NAME=sirius
-EXT_CONFIG=${PROJ_DIR}extension_config.cmake
-# EXT_FLAGS=-DBUILD_PYTHON=1
-GEN=ninja
+.PHONY: all release debug reldebug relwithdebinfo debug-release \
+	clang-release clang-debug clang-relwithdebinfo \
+	test test_release test_debug test_reldebug clean list-presets
 
-# Include the Makefile from extension-ci-tools
-include extension-ci-tools/makefiles/duckdb_extension.Makefile
+all: release
+
+release:
+	cd $(DUCKDB_DIR) && $(CMAKE) --preset release
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset release
+ifneq ($(TEST_BUILD_TARGET),)
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset release --target $(TEST_BUILD_TARGET)
+endif
+
+debug:
+	cd $(DUCKDB_DIR) && $(CMAKE) --preset debug
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset debug
+ifneq ($(TEST_BUILD_TARGET),)
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset debug --target $(TEST_BUILD_TARGET)
+endif
+
+reldebug: relwithdebinfo
+
+debug-release: relwithdebinfo
+
+relwithdebinfo:
+	cd $(DUCKDB_DIR) && $(CMAKE) --preset relwithdebinfo
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset relwithdebinfo
+ifneq ($(TEST_BUILD_TARGET),)
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset relwithdebinfo --target $(TEST_BUILD_TARGET)
+endif
+
+clang-release:
+	cd $(DUCKDB_DIR) && $(CMAKE) --preset clang-release
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-release
+
+clang-debug:
+	cd $(DUCKDB_DIR) && $(CMAKE) --preset clang-debug
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-debug
+
+clang-relwithdebinfo:
+	cd $(DUCKDB_DIR) && $(CMAKE) --preset clang-relwithdebinfo
+	cd $(DUCKDB_DIR) && $(CMAKE) --build --preset clang-relwithdebinfo
+
+test: test_release
+
+test_release: release
+	./$(TEST_PATH) "$(CURDIR)/test/*"
+
+test_debug: debug
+	./$(TEST_PATH_DEBUG) "$(CURDIR)/test/*"
+
+test_reldebug: relwithdebinfo
+	./$(TEST_PATH_RELWITHDEBINFO) "$(CURDIR)/test/*"
+
+clean:
+	rm -rf build
+
+list-presets:
+	cd $(DUCKDB_DIR) && $(CMAKE) --list-presets

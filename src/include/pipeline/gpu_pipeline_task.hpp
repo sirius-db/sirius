@@ -20,7 +20,7 @@
 #include "parallel/task_executor.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/sirius_pipeline_itask.hpp"
-#include "pipeline/sirius_pipeline_itask_local_state.hpp"
+#include "pipeline/sirius_pipeline_task_states.hpp"
 
 #include <cucascade/data/data_batch.hpp>
 #include <cucascade/data/data_repository.hpp>
@@ -41,24 +41,10 @@ namespace pipeline {
 /**
  * @brief Global state shared across all GPU pipeline tasks in an execution context.
  *
- * This class maintains resources and state that are shared among multiple tasks
- * within the same execution context. It provides access to the data repository
- * for retrieving input data and a message queue for notifying the TaskCreator
- * about task completion events.
+ * This is an alias to sirius_pipeline_task_global_state for backward compatibility
+ * and semantic clarity in GPU pipeline contexts.
  */
-class gpu_pipeline_task_global_state : public sirius::parallel::itask_global_state {
- public:
-  /**
-   * @brief Construct a new gpu_pipeline_task_global_state object
-   *
-   * @param pipeline Shared pointer to the GPU pipeline to execute
-   */
-  explicit gpu_pipeline_task_global_state(duckdb::shared_ptr<sirius_pipeline> pipeline)
-    : _pipeline(std::move(pipeline))
-  {
-  }
-  duckdb::shared_ptr<sirius_pipeline> _pipeline;  ///< Shared pointer to the GPU pipeline to execute
-};
+using gpu_pipeline_task_global_state = sirius_pipeline_task_global_state;
 
 /**
  * @brief Local state specific to an individual GPU pipeline task instance.
@@ -67,7 +53,7 @@ class gpu_pipeline_task_global_state : public sirius::parallel::itask_global_sta
  * execution. It holds the task and pipeline identifiers, the GPU pipeline to
  * execute, and the data batch views that serve as input to the pipeline.
  */
-class gpu_pipeline_task_local_state : public sirius_pipeline_itask_local_state {
+class gpu_pipeline_task_local_state : public sirius_pipeline_task_local_state {
  public:
   /**
    * @brief Construct a new gpu_pipeline_task_local_state object
@@ -113,8 +99,8 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
    */
   gpu_pipeline_task(uint64_t task_id,
                     std::vector<cucascade::shared_data_repository*> data_repos,
-                    std::unique_ptr<sirius_pipeline_itask_local_state> local_state,
-                    std::shared_ptr<sirius::parallel::itask_global_state> global_state);
+                    std::unique_ptr<sirius_pipeline_task_local_state> local_state,
+                    std::shared_ptr<sirius_pipeline_task_global_state> global_state);
 
   ~gpu_pipeline_task() override;
 

@@ -43,7 +43,7 @@ duckdb_scan_task_global_state::duckdb_scan_task_global_state(
   pipeline::pipeline_executor& pipeline_exec,
   duckdb::ClientContext& client_ctx,
   sirius_physical_duckdb_scan* scan_op)
-  : _pipeline(std::move(pipeline)),
+  : sirius_pipeline_task_global_state(pipeline),
     _sirius_ctx(client_ctx.registered_state->Get<duckdb::SiriusContext>("sirius_state").get()),
     _max_threads(pipeline_exec.get_scan_executor().get_num_threads()),
     _pipeline_executor(pipeline_exec),
@@ -56,7 +56,7 @@ duckdb_scan_task_global_state::duckdb_scan_task_global_state(
   if (_op.function.init_global) {
     duckdb::TableFunctionInitInput tf_input(_op.bind_data.get(),
                                             _op.column_ids,
-                                            _op.scanned_ids,
+                                            _op.projection_ids,
                                             nullptr,  // Don't pass filters to DuckDB
                                             _op.extra_info.sample_options);
     _global_tf_state = _op.function.init_global(client_ctx, tf_input);
@@ -291,7 +291,7 @@ duckdb_scan_task_local_state::duckdb_scan_task_local_state(
     _exec_ctx(exec_ctx)
 {
   auto const& op = g_state._op;
-  _num_columns   = op.projection_ids.size();
+  _num_columns   = op.scanned_types.size();
 
   if (existing_local_tf_state) {
     _local_tf_state = std::move(existing_local_tf_state);
@@ -338,12 +338,12 @@ size_t duckdb_scan_task_local_state::get_tail_byte_offset() const
 
 void duckdb_scan_task_local_state::estimate_rows_per_batch(sirius_physical_duckdb_scan const& op)
 {
-  assert(_num_columns <= op.column_ids.size());
+  assert(_num_columns <= op.scanned_types.size());
 
   size_t estimated_row_bytes = 0;
   _column_builders.reserve(_num_columns);
   for (size_t i = 0; i < _num_columns; ++i) {
-    auto const col_type = op.returned_types[op.column_ids[i].GetPrimaryIndex()];
+    auto const col_type = op.scanned_types[i];
     _column_builders.emplace_back(col_type, _default_varchar_size);
     if (col_type.InternalType() == duckdb::PhysicalType::VARCHAR) {
       _varchar_indices.push_back(i);
@@ -444,10 +444,10 @@ std::shared_ptr<cucascade::data_batch> duckdb_scan_task_local_state::make_data_b
 duckdb_scan_task::~duckdb_scan_task()
 {
   if (_global_state == nullptr ||
-      _global_state->cast<duckdb_scan_task_global_state>()._pipeline.get() == nullptr) {
+      _global_state->cast<duckdb_scan_task_global_state>().get_pipeline() == nullptr) {
     return;
   }
-  _global_state->cast<duckdb_scan_task_global_state>()._pipeline.get()->mark_task_completed();
+  _global_state->cast<duckdb_scan_task_global_state>().get_pipeline()->mark_task_completed();
 }
 
 bool duckdb_scan_task::get_next_chunk(duckdb_scan_task_local_state& l_state,
@@ -510,8 +510,8 @@ std::unique_ptr<op::operator_data> duckdb_scan_task::compute_task(rmm::cuda_stre
   auto& l_state = this->_local_state->cast<duckdb_scan_task_local_state>();
   auto& g_state = this->_global_state->cast<duckdb_scan_task_global_state>();
 
-  // Initialize the data chunk with the SCANNED types (not all returned_types)
-  // The scanned_types correspond to the actual columns being projected
+  // Initialize the data chunk with scanned_types (all projected columns, including ROW_ID).
+  // This matches the column_ids and projection_ids passed to DuckDB's init functions.
   l_state._chunk.Initialize(duckdb::Allocator::Get(l_state._exec_ctx.client),
                             g_state._op.scanned_types);
 
