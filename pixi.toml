@@ -16,6 +16,7 @@ make = "*"
 ninja = "*"
 sccache = "*"
 unzip = "*"
+clang = ">=21"
 
 libcudf = "26.04.*"
 librmm = "26.04.*"
@@ -33,7 +34,6 @@ cuda = "13"
 
 [feature.cuda13.dependencies]
 cuda-version = "13.*"
-clang = ">=21"
 
 [feature.cuda13.activation.env]
 # GPU architectures: Turing through Blackwell (75, 80, 86, 90a, 100f, 120a, 120)
@@ -44,7 +44,6 @@ cuda = "12"
 
 [feature.cuda12.dependencies]
 cuda-version = "12.*"
-clang = "<20"
 
 [feature.cuda12.activation.env]
 # GPU architectures: Turing through Hopper (75, 80, 86, 90a)
