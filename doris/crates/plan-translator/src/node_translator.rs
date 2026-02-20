@@ -10,10 +10,12 @@ use anyhow::{bail, Context, Result};
 use doris_thrift::exprs::{TExpr, TExprNode, TExprNodeType};
 use doris_thrift::plan_nodes::{TFileScanRangeParams, TJoinOp, TPlan, TPlanNode, TPlanNodeType};
 use substrait::proto::r#type;
+use substrait::proto::expression::field_reference;
+use substrait::proto::expression::reference_segment;
 use substrait::proto::{
     aggregate_rel, expression, fetch_rel, join_rel, rel, sort_field, AggregateFunction,
-    AggregateRel, CrossRel, Expression, FetchRel, FilterRel, FunctionArgument, JoinRel, Rel,
-    SortField, SortRel, Type,
+    AggregateRel, CrossRel, Expression, FetchRel, FilterRel, FunctionArgument, JoinRel,
+    ProjectRel, Rel, SortField, SortRel, Type,
 };
 
 use crate::descriptor_table::DescriptorTable;
@@ -463,8 +465,71 @@ pub(crate) fn collect_rel_column_names(rel: &Rel) -> Vec<String> {
             );
             names
         }
+        Some(rel::RelType::Aggregate(agg)) => {
+            // AGG output: grouping column names + empty names for measures.
+            // Get grouping column names from the input Rel at the field reference positions.
+            let input_names = agg
+                .input
+                .as_deref()
+                .map(collect_rel_column_names)
+                .unwrap_or_default();
+            let mut names = Vec::new();
+            if let Some(grouping) = agg.groupings.first() {
+                #[allow(deprecated)]
+                for expr in &grouping.grouping_expressions {
+                    // Extract field reference index from grouping expression.
+                    let name = extract_field_ref_name(expr, &input_names);
+                    names.push(name);
+                }
+            }
+            // Measures: use empty names (aggregate results don't have column names).
+            for _ in &agg.measures {
+                names.push(String::new());
+            }
+            names
+        }
+        Some(rel::RelType::Project(proj)) => {
+            // Project: the output is the input columns + projection expressions.
+            // DuckDB's Substrait consumer appends projection results to the input.
+            // For reordering ProjectRels, just collect input names and use them
+            // at the referenced positions.
+            let input_names = proj
+                .input
+                .as_deref()
+                .map(collect_rel_column_names)
+                .unwrap_or_default();
+            let mut names = Vec::new();
+            for expr in &proj.expressions {
+                let name = extract_field_ref_name(expr, &input_names);
+                names.push(name);
+            }
+            if names.is_empty() {
+                input_names
+            } else {
+                names
+            }
+        }
         _ => Vec::new(),
     }
+}
+
+/// Extract a column name from a FieldReference expression.
+fn extract_field_ref_name(expr: &Expression, input_names: &[String]) -> String {
+    if let Some(expression::RexType::Selection(sel)) = expr.rex_type.as_ref() {
+        if let Some(field_reference::ReferenceType::DirectReference(seg)) =
+            sel.reference_type.as_ref()
+        {
+            if let Some(reference_segment::ReferenceType::StructField(sf)) =
+                seg.reference_type.as_ref()
+            {
+                let idx = sf.field as usize;
+                if idx < input_names.len() {
+                    return input_names[idx].clone();
+                }
+            }
+        }
+    }
+    String::new()
 }
 
 /// Map Doris TJoinOp to Substrait JoinType i32 value.
@@ -840,6 +905,9 @@ fn translate_aggregation_node(
     // Clear child Rel column names now that expressions are translated.
     desc.clear_child_rel_column_names();
 
+    let num_grouping = grouping_expressions.len();
+    let num_measures = measures.len();
+
     let agg_rel = Rel {
         rel_type: Some(rel::RelType::Aggregate(Box::new(AggregateRel {
             input: Some(Box::new(input)),
@@ -850,7 +918,149 @@ fn translate_aggregation_node(
         }))),
     };
 
+    // Substrait AggregateRel outputs [grouping_0..n, measure_0..m]. But the FE expects
+    // columns in the AGG output tuple's slot order, which may interleave grouping and
+    // measure columns. Add a ProjectRel to reorder if needed.
+    let agg_rel = reorder_agg_output(agg_rel, node, desc, num_grouping, num_measures);
+
     apply_conjuncts(agg_rel, node, desc, registry)
+}
+
+/// Add a ProjectRel on top of an AggregateRel to reorder its output columns
+/// from Substrait's grouping-first order to the FE's AGG output tuple slot order.
+///
+/// Substrait AggregateRel always outputs: [grouping_0, ..., grouping_n, measure_0, ..., measure_m]
+/// But the FE expects columns in the AGG node's output tuple slot order, which may
+/// interleave grouping and measure columns (e.g., [key, key, measure, key, key, ...]).
+///
+/// Returns the original Rel unchanged if no reordering is needed.
+fn reorder_agg_output(
+    agg_rel: Rel,
+    node: &TPlanNode,
+    desc: &DescriptorTable,
+    num_grouping: usize,
+    num_measures: usize,
+) -> Rel {
+    let total = num_grouping + num_measures;
+    if total == 0 {
+        return agg_rel;
+    }
+
+    // Get the AGG node's output tuple slot names.
+    let agg_output_slots: Vec<(i32, String)> = node
+        .row_tuples
+        .first()
+        .and_then(|&tid| desc.get_tuple(tid).ok())
+        .map(|tuple| {
+            tuple
+                .slot_ids
+                .iter()
+                .filter_map(|&sid| {
+                    desc.get_slot(sid)
+                        .ok()
+                        .filter(|s| s.is_materialized)
+                        .map(|s| (sid, s.col_name.clone()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if agg_output_slots.len() != total {
+        return agg_rel;
+    }
+
+    // Get grouping expression column names (in Substrait output order).
+    let grouping_names: Vec<String> = if let Some(agg_node) = &node.agg_node {
+        agg_node
+            .grouping_exprs
+            .as_ref()
+            .map(|exprs| {
+                exprs
+                    .iter()
+                    .filter_map(|expr| {
+                        expr.nodes.first().and_then(|n| {
+                            if n.node_type == TExprNodeType::SLOT_REF {
+                                n.slot_ref.as_ref().and_then(|sr| {
+                                    desc.get_slot(sr.slot_id).ok().map(|s| s.col_name.clone())
+                                })
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        return agg_rel;
+    };
+
+    // Build permutation: for each AGG output tuple slot, find its Substrait position.
+    // Grouping slots match by name; measure slots match by order (empty names).
+    let mut permutation = Vec::new();
+    let mut measure_idx = 0;
+    for (_sid, name) in &agg_output_slots {
+        if name.is_empty() {
+            // Measure slot → Substrait position: num_grouping + measure_idx
+            if measure_idx < num_measures {
+                permutation.push(num_grouping + measure_idx);
+                measure_idx += 1;
+            } else {
+                return agg_rel; // mismatch
+            }
+        } else if let Some(pos) = grouping_names.iter().position(|g| g == name) {
+            permutation.push(pos);
+        } else {
+            // Name not found in grouping — might be an alias or renamed slot.
+            // Try matching by checking the slot expression's target column.
+            return agg_rel; // can't determine mapping
+        }
+    }
+
+    // Check if reordering is needed (permutation is not identity).
+    if permutation.iter().enumerate().all(|(i, &v)| i == v) {
+        return agg_rel;
+    }
+
+    tracing::info!(
+        permutation = ?permutation,
+        agg_output = ?agg_output_slots.iter().map(|(_, n)| n.as_str()).collect::<Vec<_>>(),
+        "adding ProjectRel to reorder AGG output to match FE tuple order"
+    );
+
+    // Build ProjectRel with field references in the permutation order.
+    let expressions: Vec<Expression> = permutation
+        .iter()
+        .map(|&src_idx| Expression {
+            rex_type: Some(expression::RexType::Selection(Box::new(
+                expression::FieldReference {
+                    reference_type: Some(field_reference::ReferenceType::DirectReference(
+                        expression::ReferenceSegment {
+                            reference_type: Some(
+                                reference_segment::ReferenceType::StructField(Box::new(
+                                    reference_segment::StructField {
+                                        field: src_idx as i32,
+                                        child: None,
+                                    },
+                                )),
+                            ),
+                        },
+                    )),
+                    root_type: Some(field_reference::RootType::RootReference(
+                        field_reference::RootReference {},
+                    )),
+                },
+            ))),
+        })
+        .collect();
+
+    Rel {
+        rel_type: Some(rel::RelType::Project(Box::new(ProjectRel {
+            input: Some(Box::new(agg_rel)),
+            expressions,
+            ..Default::default()
+        }))),
+    }
 }
 
 /// Translate SORT_NODE → Substrait SortRel, optionally wrapped in FetchRel for LIMIT/OFFSET.

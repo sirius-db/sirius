@@ -284,48 +284,63 @@ fn build_projection_slot_map(plan: &TPlan, desc: &mut descriptor_table::Descript
 fn extract_sort_limit_from_plan(
     plan: &TPlan,
     desc: &descriptor_table::DescriptorTable,
+    rel_column_names: &[String],
 ) -> Option<String> {
-    // Find the SORT_NODE: it may be the root, or wrapped in a MATERIALIZATION_NODE.
-    // Walk from the root through pass-through nodes to find it.
+    // Find the SORT_NODE.
     let sort_plan_node = plan.nodes.iter().find(|n| n.node_type == TPlanNodeType::SORT_NODE)?;
     let sort_node = sort_plan_node.sort_node.as_ref()?;
     let sort_info = &sort_node.sort_info;
 
-    // Resolve sort expressions to 1-based positional references in the sort node's output.
-    // We use positional refs because aggregate aliases often have empty col_name.
-    let row_tuples = &sort_plan_node.row_tuples;
-    let materialized_slots: Vec<i32> = row_tuples
-        .iter()
-        .flat_map(|&tid| {
-            desc.get_tuple(tid)
-                .map(|t| {
-                    t.slot_ids
-                        .iter()
-                        .copied()
-                        .filter(|&sid| {
-                            desc.get_slot(sid)
-                                .map(|s| s.is_materialized)
-                                .unwrap_or(false)
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default()
-        })
-        .collect();
-
+    // Resolve sort expressions to positions in the compiled Substrait Rel's output.
+    // This matches the DuckDB from_substrait() result column order, which may differ
+    // from the FE's SORT_NODE tuple order (e.g., AGG grouping-first vs interleaved).
     let mut order_parts = Vec::new();
     for (i, expr) in sort_info.ordering_exprs.iter().enumerate() {
         let is_asc = sort_info.is_asc_order.get(i).copied().unwrap_or(true);
         let nulls_first = sort_info.nulls_first.get(i).copied().unwrap_or(true);
 
-        // Find the slot_id from the SLOT_REF expression, then its position in the
-        // sort node's materialized output.
         let position = expr.nodes.first().and_then(|node| {
             if node.node_type == TExprNodeType::SLOT_REF {
                 node.slot_ref.as_ref().and_then(|sr| {
-                    materialized_slots
-                        .iter()
-                        .position(|&sid| sid == sr.slot_id)
+                    let slot = desc.get_slot(sr.slot_id).ok()?;
+                    if !slot.col_name.is_empty() {
+                        // Find column by name in the Substrait output.
+                        rel_column_names.iter().position(|n| n == &slot.col_name)
+                    } else {
+                        // Empty-name slot (aggregate measure): find its position
+                        // among the empty-name entries in the Rel column names.
+                        // In the Substrait output, measures follow all grouping cols.
+                        let sort_tuple_slots: Vec<(i32, bool)> = sort_plan_node
+                            .row_tuples
+                            .iter()
+                            .flat_map(|&tid| {
+                                desc.get_tuple(tid)
+                                    .map(|t| {
+                                        t.slot_ids
+                                            .iter()
+                                            .filter_map(|&sid| {
+                                                desc.get_slot(sid).ok().filter(|s| s.is_materialized).map(|s| (sid, s.col_name.is_empty()))
+                                            })
+                                            .collect::<Vec<_>>()
+                                    })
+                                    .unwrap_or_default()
+                            })
+                            .collect();
+                        // Count which measure this is (0-based among empty-name slots).
+                        let measure_idx = sort_tuple_slots
+                            .iter()
+                            .filter(|(_, is_empty)| *is_empty)
+                            .position(|(sid, _)| *sid == sr.slot_id);
+                        // Position in Rel output: after all named columns.
+                        measure_idx.and_then(|mi| {
+                            rel_column_names
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, n)| n.is_empty())
+                                .nth(mi)
+                                .map(|(pos, _)| pos)
+                        })
+                    }
                 })
             } else {
                 None
@@ -411,8 +426,10 @@ pub fn translate_fragment(
     // Extract sort/limit specification from the Doris plan's root SORT_NODE.
     // DuckDB's from_substrait() doesn't reliably preserve sort order, so we
     // capture it here for use as a SQL wrapper on the CPU fallback path.
-    // Uses 1-based positional references from the sort node's materialized slots.
-    let sort_limit_sql = extract_sort_limit_from_plan(plan, &desc);
+    // Uses the compiled Rel's column names for position computation (not FE tuple order),
+    // because the Substrait AGG output order (grouping-first) may differ from FE order.
+    let rel_column_names = node_translator::collect_rel_column_names(&rel);
+    let sort_limit_sql = extract_sort_limit_from_plan(plan, &desc, &rel_column_names);
     if let Some(ref sql) = sort_limit_sql {
         debug!(sort_limit_sql = %sql, "extracted sort/limit from Doris plan");
     }
