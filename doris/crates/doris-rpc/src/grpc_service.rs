@@ -653,28 +653,45 @@ fn merge_fragment_plans(
 /// Execution plan: either Substrait bytes or SQL string.
 enum ExecPlan {
     /// Substrait plan eligible for GPU acceleration (has real data tables).
-    Substrait(Vec<u8>),
+    Substrait {
+        bytes: Vec<u8>,
+        sort_limit_sql: Option<String>,
+    },
     /// Substrait plan that should only run on CPU (e.g. VirtualTable-only plans).
-    SubstraitCpuOnly(Vec<u8>),
+    SubstraitCpuOnly {
+        bytes: Vec<u8>,
+        sort_limit_sql: Option<String>,
+    },
     Sql(String),
 }
 
 /// Execute a plan via Sirius GPU, falling back to DuckDB CPU.
 fn execute_plan(engine: &SiriusEngine, plan: ExecPlan) -> Result<Vec<u8>, String> {
     match plan {
-        ExecPlan::Substrait(bytes) => match engine.execute_substrait(&bytes) {
-            Ok(ipc) => {
-                tracing::info!("executed via gpu_processing_substrait");
-                Ok(ipc)
+        ExecPlan::Substrait { bytes, sort_limit_sql } => {
+            // Strip SortRel/FetchRel from Substrait before GPU execution — the Sirius
+            // GPU planner doesn't handle ORDER BY/LIMIT operators. The sort/limit SQL
+            // wrapper is applied outside via `execute_substrait`.
+            let gpu_bytes = if sort_limit_sql.is_some() {
+                strip_sort_limit_from_substrait(&bytes)
+            } else {
+                None
+            };
+            let plan_bytes = gpu_bytes.as_deref().unwrap_or(&bytes);
+            match engine.execute_substrait(plan_bytes, sort_limit_sql.as_deref()) {
+                Ok(ipc) => {
+                    tracing::info!("executed via gpu_processing_substrait");
+                    Ok(ipc)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "gpu_processing_substrait failed, falling back to CPU from_substrait");
+                    from_substrait_with_sort(engine, &bytes, sort_limit_sql.as_deref())
+                }
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "gpu_processing_substrait failed, falling back to CPU from_substrait");
-                engine.from_substrait(&bytes).map_err(|e| e.to_string())
-            }
-        },
-        ExecPlan::SubstraitCpuOnly(bytes) => {
+        }
+        ExecPlan::SubstraitCpuOnly { bytes, sort_limit_sql } => {
             tracing::info!("executing via CPU from_substrait (no data tables, GPU skipped)");
-            engine.from_substrait(&bytes).map_err(|e| e.to_string())
+            from_substrait_with_sort(engine, &bytes, sort_limit_sql.as_deref())
         }
         ExecPlan::Sql(sql) => match engine.execute_gpu(&sql) {
             Ok(ipc) => {
@@ -687,6 +704,58 @@ fn execute_plan(engine: &SiriusEngine, plan: ExecPlan) -> Result<Vec<u8>, String
             }
         },
     }
+}
+
+/// Execute from_substrait with optional sort/limit SQL suffix.
+///
+/// When sort_limit_sql is provided, strips the SortRel/FetchRel from the Substrait plan
+/// first — otherwise from_substrait applies the LIMIT to unsorted data, yielding wrong rows.
+/// The SQL wrapper then applies the correct ORDER BY + LIMIT on the full result.
+fn from_substrait_with_sort(
+    engine: &SiriusEngine,
+    bytes: &[u8],
+    sort_limit_sql: Option<&str>,
+) -> Result<Vec<u8>, String> {
+    if let Some(sql) = sort_limit_sql {
+        tracing::info!(sort_limit = %sql, "applying sort/limit wrapper to from_substrait");
+        let stripped = strip_sort_limit_from_substrait(bytes);
+        let plan_bytes = stripped.as_deref().unwrap_or(bytes);
+        engine.from_substrait_sorted(plan_bytes, sql).map_err(|e| e.to_string())
+    } else {
+        engine.from_substrait(bytes).map_err(|e| e.to_string())
+    }
+}
+
+/// Strip SortRel and FetchRel from the outermost relation in a Substrait plan.
+///
+/// Returns Some(new_bytes) if stripping succeeded, None if the plan doesn't have
+/// a sort/fetch at the root (or deserialization failed).
+fn strip_sort_limit_from_substrait(bytes: &[u8]) -> Option<Vec<u8>> {
+    use prost::Message;
+    use substrait::proto::{plan_rel, rel, Plan};
+
+    let mut plan = Plan::decode(bytes).ok()?;
+    let relation = plan.relations.first_mut()?;
+    let plan_rel::RelType::Root(root) = relation.rel_type.as_mut()? else {
+        return None;
+    };
+    let rel = root.input.as_mut()?;
+
+    // Unwrap FetchRel → SortRel → inner, or SortRel → inner.
+    let inner = match rel.rel_type.as_ref()? {
+        rel::RelType::Fetch(fetch) => {
+            let input = fetch.input.as_ref()?;
+            match input.rel_type.as_ref()? {
+                rel::RelType::Sort(sort) => sort.input.as_ref()?.as_ref().clone(),
+                _ => input.as_ref().clone(),
+            }
+        }
+        rel::RelType::Sort(sort) => sort.input.as_ref()?.as_ref().clone(),
+        _ => return None,
+    };
+
+    root.input = Some(inner);
+    Some(plan.encode_to_vec())
 }
 
 /// Project/reorder Arrow IPC result columns to match FE expectations.
@@ -1151,7 +1220,7 @@ impl PBackendService for PBackendServiceHandler {
                     let has_substrait = !use_sql && engine.lock().unwrap().has_substrait();
                     let (exec_plan, output_names) = if has_substrait {
                         match plan_translator::translate_fragment(&params, &table_schemas) {
-                            Ok(plan) => (ExecPlan::Substrait(plan.substrait_bytes), Some(plan.output_names)),
+                            Ok(plan) => (ExecPlan::Substrait { bytes: plan.substrait_bytes, sort_limit_sql: plan.sort_limit_sql }, Some(plan.output_names)),
                             Err(e) => {
                                 warn!(error = %e, "Substrait translation failed for exchange fragment");
                                 match plan_translator::translate_fragment_to_sql(&params) {
@@ -1277,9 +1346,9 @@ impl PBackendService for PBackendServiceHandler {
                     Ok(plan) => {
                         info!(bytes = plan.substrait_bytes.len(), has_data_tables, "translated to Substrait");
                         let exec = if has_data_tables {
-                            ExecPlan::Substrait(plan.substrait_bytes)
+                            ExecPlan::Substrait { bytes: plan.substrait_bytes, sort_limit_sql: plan.sort_limit_sql }
                         } else {
-                            ExecPlan::SubstraitCpuOnly(plan.substrait_bytes)
+                            ExecPlan::SubstraitCpuOnly { bytes: plan.substrait_bytes, sort_limit_sql: plan.sort_limit_sql }
                         };
                         (exec, Some(plan.output_names), plan.output_column_indices)
                     }

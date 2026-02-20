@@ -199,6 +199,9 @@ pub struct TranslatedPlan {
     /// Explicit column indices mapping FE output column i to DuckDB output column
     /// `output_column_indices[i]`. When set, use these instead of name-based matching.
     pub output_column_indices: Option<Vec<usize>>,
+    /// SQL ORDER BY / LIMIT / OFFSET suffix extracted from outermost SortRel/FetchRel.
+    /// Used to wrap `from_substrait()` when the DuckDB CPU path doesn't preserve sort order.
+    pub sort_limit_sql: Option<String>,
 }
 
 /// Build a slot expression map from FILE_SCAN_NODE intermediate/final projections.
@@ -273,6 +276,64 @@ fn build_projection_slot_map(plan: &TPlan, desc: &mut descriptor_table::Descript
     }
 }
 
+/// Extract a SQL ORDER BY / LIMIT / OFFSET suffix from the Doris plan's root SORT_NODE.
+///
+/// DuckDB's `from_substrait()` doesn't reliably preserve sort order, so we extract
+/// the sort specification here and apply it as a SQL wrapper around the from_substrait call.
+/// Uses column names from the descriptor table (which match the DuckDB table columns).
+fn extract_sort_limit_from_plan(
+    plan: &TPlan,
+    desc: &descriptor_table::DescriptorTable,
+) -> Option<String> {
+    // Find the SORT_NODE: it may be the root, or wrapped in a MATERIALIZATION_NODE.
+    // Walk from the root through pass-through nodes to find it.
+    let sort_plan_node = plan.nodes.iter().find(|n| n.node_type == TPlanNodeType::SORT_NODE)?;
+    let sort_node = sort_plan_node.sort_node.as_ref()?;
+    let sort_info = &sort_node.sort_info;
+
+    // Resolve sort expressions to column names via the sort node's row_tuples.
+    let mut order_parts = Vec::new();
+    for (i, expr) in sort_info.ordering_exprs.iter().enumerate() {
+        let is_asc = sort_info.is_asc_order.get(i).copied().unwrap_or(true);
+        let nulls_first = sort_info.nulls_first.get(i).copied().unwrap_or(true);
+
+        // Extract column name from SLOT_REF expression.
+        let col_name = expr.nodes.first().and_then(|node| {
+            if node.node_type == TExprNodeType::SLOT_REF {
+                node.slot_ref.as_ref().and_then(|sr| {
+                    desc.get_slot(sr.slot_id).ok().map(|s| s.col_name.clone())
+                })
+            } else {
+                None
+            }
+        });
+
+        let Some(name) = col_name.filter(|n| !n.is_empty()) else { continue };
+        let dir = if is_asc { "ASC" } else { "DESC" };
+        let nulls = if nulls_first { "NULLS FIRST" } else { "NULLS LAST" };
+        order_parts.push(format!("\"{}\" {} {}", name, dir, nulls));
+    }
+
+    let mut sql = if order_parts.is_empty() {
+        String::new()
+    } else {
+        format!("ORDER BY {}", order_parts.join(", "))
+    };
+
+    // Add LIMIT/OFFSET from the sort node.
+    let limit = sort_plan_node.limit;
+    let offset = sort_node.offset.unwrap_or(0);
+    if limit >= 0 {
+        sql.push_str(&format!(" LIMIT {}", limit));
+    }
+    if offset > 0 {
+        sql.push_str(&format!(" OFFSET {}", offset));
+    }
+
+    let sql = sql.trim().to_string();
+    if sql.is_empty() { None } else { Some(sql) }
+}
+
 /// Translate a Doris TPipelineFragmentParams into serialized Substrait Plan bytes.
 ///
 /// `table_schemas` maps NamedTable names to their actual column names (in order).
@@ -322,6 +383,16 @@ pub fn translate_fragment(
 
     // Translate the plan tree into a Substrait Rel tree.
     let rel = node_translator::translate_plan(plan, &desc, &scan_params, &mut registry, table_schemas)?;
+
+    // Extract sort/limit specification from the Doris plan's root SORT_NODE.
+    // DuckDB's from_substrait() doesn't reliably preserve sort order, so we
+    // capture it here for use as a SQL wrapper on the CPU fallback path.
+    // Uses column names (not Substrait field indices) because the SortRel's field
+    // references are relative to the sort node's tuple, not the full scan output.
+    let sort_limit_sql = extract_sort_limit_from_plan(plan, &desc);
+    if let Some(ref sql) = sort_limit_sql {
+        debug!(sort_limit_sql = %sql, "extracted sort/limit from Doris plan");
+    }
 
     // Build output names in the SELECT-list order the FE expects.
     // Prefer output_exprs (gives exact FE column order), fall back to row_tuples.
@@ -503,6 +574,7 @@ pub fn translate_fragment(
         substrait_bytes: bytes,
         output_names: result_output_names,
         output_column_indices,
+        sort_limit_sql,
     })
 }
 

@@ -555,6 +555,88 @@ void SiriusExtension::GPUExecutionFunction(ClientContext& context,
   return;
 }
 
+// gpu_execution_substrait: Substrait input + new Sirius execution framework.
+// Combines the Substrait → DuckDB plan conversion from gpu_processing_substrait
+// with the new sirius_physical_plan_generator execution from gpu_execution.
+unique_ptr<FunctionData> SiriusExtension::GPUExecutionSubstraitBind(ClientContext& context,
+                                                                     TableFunctionBindInput& input,
+                                                                     vector<LogicalType>& return_types,
+                                                                     vector<string>& names)
+{
+  auto result              = make_uniq<SiriusTableFunctionData>();
+  result->conn             = make_uniq<Connection>(*context.db);
+  result->enable_optimizer = true;
+  result->sirius_iface     = make_uniq<::sirius::sirius_interface>(context);
+  if (input.inputs[0].IsNull()) {
+    throw BinderException("gpu_execution_substrait cannot be called with a NULL parameter");
+  }
+
+  // Convert Substrait → DuckDB logical plan.
+  string serialized = input.inputs[0].GetValueUnsafe<string>();
+  bool is_json = false;
+  SubstraitToDuckDB transformer_s2d(result->conn->context, serialized, is_json, false);
+  auto relation = transformer_s2d.TransformPlan();
+
+  auto relation_stmt                  = make_uniq<RelationStatement>(relation);
+  unique_ptr<SQLStatement> statements = std::move(relation_stmt);
+  auto statement_type                 = statements->type;
+
+  result->PrepareConnection(context);
+
+  Planner planner(context);
+  planner.CreatePlan(std::move(statements));
+  D_ASSERT(planner.plan);
+
+  // cuDF does not support HUGEINT. Downcast to BIGINT.
+  for (auto& type : planner.types) {
+    if (type == LogicalType::HUGEINT) { type = LogicalType::BIGINT; }
+  }
+
+  auto prepared       = make_shared_ptr<PreparedStatementData>(statement_type);
+  prepared->names     = planner.names;
+  prepared->types     = planner.types;
+  prepared->value_map = std::move(planner.value_map);
+
+  // Optimize and resolve the logical plan.
+  auto plan = std::move(planner.plan);
+  if (context.config.enable_optimizer) {
+    Optimizer optimizer(*planner.binder, context);
+    plan = optimizer.Optimize(std::move(plan));
+  }
+  plan->ResolveOperatorTypes();
+  ColumnBindingResolver resolver;
+  ColumnBindingResolver::Verify(*plan);
+  resolver.VisitOperator(*plan);
+
+  result->CleanupConnection(context);
+
+  // Generate Sirius physical plan using the new execution framework.
+  SIRIUS_LOG_DEBUG("Substrait query plan:\n{}", plan->ToString());
+  try {
+    auto sirius_physical_plan = SiriusGeneratePhysicalPlan(context, plan);
+    SIRIUS_LOG_DEBUG("Done generating sirius physical plan (substrait)");
+    auto gpu_prepared = make_shared_ptr<::sirius::sirius_prepared_statement_data>(
+      std::move(prepared), std::move(sirius_physical_plan));
+    result->gpu_prepared = gpu_prepared;
+  } catch (std::exception& e) {
+    ErrorData error(e);
+    SIRIUS_LOG_ERROR("Error in SiriusGeneratePhysicalPlan (substrait): {}", error.RawMessage());
+    result->plan_error = true;
+  }
+
+  // Store the query string for DuckDB fallback (use a placeholder since we have Substrait, not SQL).
+  result->query = "-- substrait plan (no SQL fallback available)";
+
+  for (auto& column : planner.names) {
+    names.emplace_back(column);
+  }
+  for (auto& type : planner.types) {
+    return_types.emplace_back(type);
+  }
+
+  return std::move(result);
+}
+
 static unique_ptr<LogicalOperator> OptimizePlan(ClientContext& context,
                                                 Planner& planner,
                                                 Connection& new_conn)
@@ -842,6 +924,13 @@ void SiriusExtension::RegisterGPUFunctions(DatabaseInstance& instance)
                                          GPUProcessingSubstraitBind);
   CreateTableFunctionInfo gpu_processing_substrait_info(gpu_processing_substrait);
   catalog.CreateTableFunction(transaction, gpu_processing_substrait_info);
+
+  TableFunction gpu_execution_substrait("gpu_execution_substrait",
+                                        {LogicalType::BLOB},
+                                        GPUExecutionFunction,
+                                        SiriusExtension::GPUExecutionSubstraitBind);
+  CreateTableFunctionInfo gpu_execution_substrait_info(gpu_execution_substrait);
+  catalog.CreateTableFunction(transaction, gpu_execution_substrait_info);
 
   TableFunction get_last_gpu_buffers("sirius_get_last_gpu_buffers",
                                      {},

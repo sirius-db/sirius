@@ -97,6 +97,13 @@ impl SiriusEngine {
                 eprintln!("warning: sirius extension not loaded: {e}");
             }
 
+            // Register an "if" macro so DuckDB can handle Substrait IfThen expressions.
+            // The DuckDB Substrait extension maps IfThen to a scalar function named "if",
+            // which doesn't exist as a built-in. Multi-clause CASE generates nested if() calls.
+            conn.execute_batch(
+                "CREATE MACRO \"if\"(cond, then_val, else_val) AS CASE WHEN cond THEN then_val ELSE else_val END"
+            ).ok(); // Non-fatal if it fails
+
             Ok(Self { conn, has_substrait })
         }
 
@@ -146,7 +153,7 @@ impl SiriusEngine {
 
             let mut stmt = self
                 .conn
-                .prepare("SELECT * FROM gpu_processing(?)")
+                .prepare("SELECT * FROM gpu_execution(?)")
                 .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
             let batches: Vec<RecordBatch> = stmt
                 .query_arrow(duckdb::params![sql])
@@ -162,15 +169,21 @@ impl SiriusEngine {
         }
     }
 
-    /// Execute a Substrait plan via Sirius GPU (`gpu_processing_substrait`).
-    pub fn execute_substrait(&self, plan_bytes: &[u8]) -> Result<Vec<u8>, EngineError> {
+    /// Execute a Substrait plan via Sirius GPU (`gpu_processing_substrait`),
+    /// optionally with a SQL ORDER BY / LIMIT suffix.
+    pub fn execute_substrait(&self, plan_bytes: &[u8], order_sql: Option<&str>) -> Result<Vec<u8>, EngineError> {
         #[cfg(feature = "duckdb-bundled")]
         {
             use arrow::record_batch::RecordBatch;
 
+            let sql = if let Some(suffix) = order_sql {
+                format!("SELECT * FROM gpu_processing_substrait(?::blob) {}", suffix)
+            } else {
+                "SELECT * FROM gpu_processing_substrait(?::blob)".to_string()
+            };
             let mut stmt = self
                 .conn
-                .prepare("SELECT * FROM gpu_processing_substrait(?::blob)")
+                .prepare(&sql)
                 .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
             let batches: Vec<RecordBatch> = stmt
                 .query_arrow(duckdb::params![plan_bytes])
@@ -181,7 +194,7 @@ impl SiriusEngine {
 
         #[cfg(not(feature = "duckdb-bundled"))]
         {
-            let _ = plan_bytes;
+            let _ = (plan_bytes, order_sql);
             Err(EngineError::NotCompiled)
         }
     }
@@ -206,6 +219,34 @@ impl SiriusEngine {
         #[cfg(not(feature = "duckdb-bundled"))]
         {
             let _ = plan_bytes;
+            Err(EngineError::NotCompiled)
+        }
+    }
+
+    /// Execute a Substrait plan via DuckDB CPU with an ORDER BY / LIMIT SQL suffix.
+    ///
+    /// DuckDB's `from_substrait()` doesn't reliably preserve sort order, so this
+    /// wraps the call: `SELECT * FROM from_substrait(?::blob) ORDER BY 1 DESC LIMIT 10`.
+    pub fn from_substrait_sorted(&self, plan_bytes: &[u8], order_sql: &str) -> Result<Vec<u8>, EngineError> {
+        #[cfg(feature = "duckdb-bundled")]
+        {
+            use arrow::record_batch::RecordBatch;
+
+            let sql = format!("SELECT * FROM from_substrait(?::blob) {}", order_sql);
+            let mut stmt = self
+                .conn
+                .prepare(&sql)
+                .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+            let batches: Vec<RecordBatch> = stmt
+                .query_arrow(duckdb::params![plan_bytes])
+                .map_err(|e| EngineError::ExecFailed(e.to_string()))?
+                .collect();
+            batches_to_ipc(batches)
+        }
+
+        #[cfg(not(feature = "duckdb-bundled"))]
+        {
+            let _ = (plan_bytes, order_sql);
             Err(EngineError::NotCompiled)
         }
     }

@@ -60,6 +60,10 @@ class SiriusExtension : public Extension {
                                                    TableFunctionBindInput& input,
                                                    vector<LogicalType>& return_types,
                                                    vector<string>& names);
+  static unique_ptr<FunctionData> GPUExecutionSubstraitBind(ClientContext& context,
+                                                             TableFunctionBindInput& input,
+                                                             vector<LogicalType>& return_types,
+                                                             vector<string>& names);
   static void GetLastGPUBuffersFunction(ClientContext& context,
                                         TableFunctionInput& data_p,
                                         DataChunk& output);
