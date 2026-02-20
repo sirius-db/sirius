@@ -884,29 +884,46 @@ mod tests {
         // Tuple 7 total: 9 + 8 = 17 cols
         // Tuple 1 matches lineitem_0 → 16 cols
 
-        // Slot 60 (l_orderkey, parent=9): l_orderkey found in lineitem at pos 0.
-        // Tuple 7 offset = 9 + 8 = 17, lineitem pos 0 → global 17.
+        // With child_rel_column_names set (the real production path), slot resolution
+        // uses the compiled Rel's flattened column names for accurate global indexing.
+        // The column order is: orders(9) + customer(8) + lineitem(16) = 33 columns.
+        let child_col_names: Vec<String> = vec![
+            // orders ReadRel (9 cols)
+            "o_orderkey", "o_custkey", "o_orderstatus", "o_totalprice", "o_orderdate",
+            "o_orderpriority", "o_clerk", "o_shippriority", "o_comment",
+            // customer ReadRel (8 cols)
+            "c_custkey", "c_name", "c_address", "c_nationkey", "c_phone",
+            "c_acctbal", "c_mktsegment", "c_comment",
+            // lineitem ReadRel (16 cols)
+            "l_orderkey", "l_partkey", "l_suppkey", "l_linenumber", "l_quantity",
+            "l_extendedprice", "l_discount", "l_tax", "l_returnflag", "l_linestatus",
+            "l_shipdate", "l_commitdate", "l_receiptdate", "l_shipinstruct",
+            "l_shipmode", "l_comment",
+        ].into_iter().map(String::from).collect();
+        desc.set_child_rel_column_names(child_col_names);
+
+        // Slot 60 (l_orderkey, parent=9): at position 17 in the flattened output.
+        // (orders 9 + customer 8 = 17 offset, lineitem l_orderkey at pos 0)
         assert_eq!(desc.slot_global_index(60, row_tuples).unwrap(), 17);
 
-        // Slot 61 (o_orderdate, parent=9): o_orderdate found in orders at pos 4.
-        // Tuple 7 → orders comes first (o_orderkey is first slot), so orders offset = 0.
-        // o_orderdate at pos 4 in orders → global 4.
+        // Slot 61 (o_orderdate, parent=9): at position 4 in orders.
         assert_eq!(desc.slot_global_index(61, row_tuples).unwrap(), 4);
 
-        // Slot 62 (o_shippriority, parent=9): found in orders at pos 7.
+        // Slot 62 (o_shippriority, parent=9): at position 7 in orders.
         assert_eq!(desc.slot_global_index(62, row_tuples).unwrap(), 7);
 
-        // Slot 63 (l_extendedprice, parent=9): found in lineitem at pos 5.
-        // Offset = 17 (tuple 7) + 5 = 22.
+        // Slot 63 (l_extendedprice, parent=9): at position 22 (17 + 5).
         assert_eq!(desc.slot_global_index(63, row_tuples).unwrap(), 22);
 
-        // Slot 64 (l_discount, parent=9): found in lineitem at pos 6.
-        // Offset = 17 (tuple 7) + 6 = 23.
+        // Slot 64 (l_discount, parent=9): at position 23 (17 + 6).
         assert_eq!(desc.slot_global_index(64, row_tuples).unwrap(), 23);
 
         // Slot 45 (c_mktsegment, parent=7): parent IS in row_tuples.
-        // Direct match: tuple 7 materialized pos 5 → global 5.
+        // Direct match uses materialized position (5) — primary path takes priority.
         assert_eq!(desc.slot_global_index(45, row_tuples).unwrap(), 5);
+
+        // Clear and verify fallback without child_rel_column_names uses overrides.
+        desc.clear_child_rel_column_names();
     }
 
     /// Test slot_global_index without overrides — simple name-based matching.
