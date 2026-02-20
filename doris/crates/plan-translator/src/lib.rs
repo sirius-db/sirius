@@ -213,9 +213,10 @@ fn build_projection_slot_map(plan: &TPlan, desc: &mut descriptor_table::Descript
     let mut slot_expressions: HashMap<i32, TExpr> = HashMap::new();
 
     for node in &plan.nodes {
-        if node.node_type != TPlanNodeType::FILE_SCAN_NODE {
-            continue;
-        }
+        // For FILE_SCAN_NODE: capture ALL projection expressions (named and unnamed).
+        // For other nodes (JOIN, AGG): only capture EMPTY-NAME slots to avoid breaking
+        // named slot resolution which uses different mechanisms (child_rel_column_names).
+        let scan_only = node.node_type == TPlanNodeType::FILE_SCAN_NODE;
 
         // Process intermediate projection layers.
         if let (Some(proj_list), Some(tuple_ids)) = (
@@ -236,14 +237,22 @@ fn build_projection_slot_map(plan: &TPlan, desc: &mut descriptor_table::Descript
                         .collect();
                     for (i, expr) in layer_exprs.iter().enumerate() {
                         if i < materialized.len() {
-                            slot_expressions.insert(materialized[i], expr.clone());
+                            let sid = materialized[i];
+                            if scan_only
+                                || desc
+                                    .get_slot(sid)
+                                    .map(|s| s.col_name.is_empty())
+                                    .unwrap_or(false)
+                            {
+                                slot_expressions.insert(sid, expr.clone());
+                            }
                         }
                     }
                 }
             }
         }
 
-        // Process final projections (present on all node types).
+        // Process final projections.
         if let (Some(projections), Some(output_tuple_id)) =
             (&node.projections, &node.output_tuple_id)
         {
@@ -260,7 +269,15 @@ fn build_projection_slot_map(plan: &TPlan, desc: &mut descriptor_table::Descript
                     .collect();
                 for (i, expr) in projections.iter().enumerate() {
                     if i < materialized.len() {
-                        slot_expressions.insert(materialized[i], expr.clone());
+                        let sid = materialized[i];
+                        if scan_only
+                            || desc
+                                .get_slot(sid)
+                                .map(|s| s.col_name.is_empty())
+                                .unwrap_or(false)
+                        {
+                            slot_expressions.insert(sid, expr.clone());
+                        }
                     }
                 }
             }
