@@ -21,6 +21,8 @@
 #include "duckdb/planner/expression.hpp"
 #include "op/sirius_physical_operator.hpp"
 
+#include <atomic>
+
 namespace sirius {
 namespace op {
 
@@ -42,6 +44,21 @@ class sirius_physical_streaming_limit : public sirius_physical_operator {
 
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
+
+  bool is_limit_exhausted() const override
+  {
+    return _limit_exhausted.load(std::memory_order_acquire);
+  }
+
+ private:
+  // Shared atomic state for coordinating limit/offset across concurrent tasks.
+  // Each task atomically claims rows to skip (offset) or produce (limit).
+  std::atomic<int64_t> _remaining_offset;
+  std::atomic<int64_t> _remaining_limit;
+  std::atomic<bool> _limit_exhausted{false};
+
+  // Atomically claim up to max_claim from counter, returns the amount actually claimed.
+  static int64_t claim(std::atomic<int64_t>& counter, int64_t max_claim);
 };
 
 }  // namespace op

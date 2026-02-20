@@ -90,9 +90,9 @@ class sirius_physical_duckdb_scan : public sirius_physical_operator {
 
   bool* already_cached;
 
+  //! Types of the columns that DuckDB will output after projection.
+  //! Includes ROW_ID (as BIGINT) when the plan requires it.
   duckdb::vector<duckdb::LogicalType> scanned_types;
-
-  duckdb::vector<duckdb::idx_t> scanned_ids;
 
   duckdb::unique_ptr<duckdb::TableFilterSet> fake_table_filters;
 

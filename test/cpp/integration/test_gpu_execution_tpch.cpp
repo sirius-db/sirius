@@ -316,6 +316,22 @@ TEST_CASE_METHOD(GPUExecutionFixture,
   compare_gpu_vs_cpu("select n_nationkey, n_regionkey from nation where n_regionkey = 1 limit 3;");
 }
 
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - limit on large table",
+                 "[integration][gpu_execution][limit][limit_multi_batch]")
+{
+  // lineitem has ~6K rows at SF-0.01, ensuring multiple batches.
+  // A limit of 100 should produce exactly 100 rows regardless of batch count.
+  compare_gpu_vs_cpu("select l_orderkey from lineitem limit 100");
+}
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - limit with offset on large table",
+                 "[integration][gpu_execution][limit][limit_multi_batch]")
+{
+  compare_gpu_vs_cpu("select l_orderkey, l_partkey from lineitem limit 50 offset 200;");
+}
+
 //===----------------------------------------------------------------------===//
 // Join tests
 //===----------------------------------------------------------------------===//
@@ -1090,10 +1106,6 @@ TEST_CASE_METHOD(GPUExecutionFixture,
   REQUIRE(gpu_result->RowCount() > 0);
   std::cerr << "VARCHAR order by: " << gpu_result->RowCount() << " rows OK" << std::endl;
 }
-
-//===----------------------------------------------------------------------===//
-// Cast to decimal tests
-//===----------------------------------------------------------------------===//
 
 TEST_CASE_METHOD(GPUExecutionFixture,
                  "gpu_execution - cast integer to decimal preserves scale",
