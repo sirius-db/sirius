@@ -872,14 +872,14 @@ void sirius_engine::initialize_internal(op::sirius_physical_operator& plan)
                  new_scheduled[i]->sink->type ==
                    op::SiriusPhysicalOperatorType::UNGROUPED_AGGREGATE ||
                  new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::TOP_N ||
-                 new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::MERGE_SORT) {
+                 new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::MERGE_SORT ||
+                 new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::SORT_PARTITION) {
         // Full barrier operators — wait for upstream to finish before processing
         for (auto dependent_pipeline : source_to_pipelines[new_scheduled[i]->get_sink().get()]) {
           insert_repository("default", new_scheduled[i], dependent_pipeline);
         }
       } else if (new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::ORDER_BY ||
-                 new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::SORT_SAMPLE ||
-                 new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::SORT_PARTITION) {
+                 new_scheduled[i]->sink->type == op::SiriusPhysicalOperatorType::SORT_SAMPLE) {
         // Pipeline barrier — sort operators process batches as they arrive
         // (sort_sample overrides get_next_task_hint to wait for N batches)
         for (auto dependent_pipeline : source_to_pipelines[new_scheduled[i]->get_sink().get()]) {

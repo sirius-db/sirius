@@ -51,12 +51,36 @@ sirius_physical_merge_sort::sirius_physical_merge_sort(
 {
 }
 
+std::unique_ptr<operator_data> sirius_physical_merge_sort::get_next_task_input_data()
+{
+  // Drain all batches from one partition per call (one merge task per partition).
+  // Follows the same pattern as sirius_physical_grouped_aggregate_merge.
+  std::lock_guard<std::mutex> lg(_drain_mutex);
+
+  auto* repo = ports.begin()->second->repo;
+  if (_current_partition_index < repo->num_partitions()) {
+    std::vector<std::shared_ptr<cucascade::data_batch>> all_batches;
+    while (true) {
+      auto batch =
+        repo->pop_data_batch(cucascade::batch_state::task_created, _current_partition_index);
+      if (!batch) { break; }
+      all_batches.push_back(std::move(batch));
+    }
+    _current_partition_index++;
+    SIRIUS_LOG_DEBUG("merge_sort: drained {} batches for partition {}",
+                     all_batches.size(),
+                     _current_partition_index - 1);
+    return std::make_unique<operator_data>(all_batches);
+  }
+  return nullptr;
+}
+
 std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(const operator_data& input_data,
                                                                    rmm::cuda_stream_view stream)
 {
   const auto& input_batches = input_data.get_data_batches();
 
-  SIRIUS_LOG_DEBUG("Executing merge sort");
+  SIRIUS_LOG_DEBUG("Executing merge sort with {} input batches", input_batches.size());
   auto start = std::chrono::high_resolution_clock::now();
 
   // Collect valid batches and find memory space
@@ -120,7 +144,9 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(const operato
 
   auto end      = std::chrono::high_resolution_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-  SIRIUS_LOG_DEBUG("Merge sort time: {:.2f} ms", duration.count() / 1000.0);
+  SIRIUS_LOG_DEBUG("Merge sort time: {:.2f} ms ({} batches merged)",
+                   duration.count() / 1000.0,
+                   valid_batches.size());
 
   std::vector<std::shared_ptr<cucascade::data_batch>> outputs;
   if (merged_batch) { outputs.push_back(apply_final_projection(std::move(merged_batch))); }
