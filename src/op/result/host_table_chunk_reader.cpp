@@ -47,9 +47,7 @@ host_table_chunk_reader::column_reader::column_reader(
 
   data_accessor.initialize(cm.data_offset, allocation);
 
-  if (null_count > 0) {
-    mask_accessor.initialize(cm.null_mask_offset, allocation);
-  }
+  if (null_count > 0) { mask_accessor.initialize(cm.null_mask_offset, allocation); }
 
   if (cm.type_id == cudf::type_id::STRING) {
     if (cm.children.size() != 1) {

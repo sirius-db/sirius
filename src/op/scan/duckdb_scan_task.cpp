@@ -260,12 +260,11 @@ column_metadata duckdb_scan_task_local_state::column_builder::make_column_metada
   size_t num_rows) const
 {
   if (type.InternalType() == duckdb::PhysicalType::VARCHAR) {
-    return make_string_column_metadata(
-      static_cast<cudf::size_type>(num_rows),
-      static_cast<cudf::size_type>(null_count),
-      data_blocks_accessor.initial_byte_offset,
-      mask_blocks_accessor.initial_byte_offset,
-      offset_blocks_accessor.initial_byte_offset);
+    return make_string_column_metadata(static_cast<cudf::size_type>(num_rows),
+                                       static_cast<cudf::size_type>(null_count),
+                                       data_blocks_accessor.initial_byte_offset,
+                                       mask_blocks_accessor.initial_byte_offset,
+                                       offset_blocks_accessor.initial_byte_offset);
   } else {
     return make_flat_column_metadata(type,
                                      static_cast<cudf::size_type>(num_rows),
@@ -410,8 +409,8 @@ void duckdb_scan_task_local_state::initialize_local_table_function_state(
 
 std::shared_ptr<cucascade::data_batch> duckdb_scan_task_local_state::make_data_batch()
 {
-  using data_batch                = cucascade::data_batch;
-  using host_table_allocation     = cucascade::memory::host_table_allocation;
+  using data_batch               = cucascade::data_batch;
+  using host_table_allocation    = cucascade::memory::host_table_allocation;
   using host_data_representation = cucascade::host_data_representation;
 
   // Create column metadata for each column
@@ -427,8 +426,7 @@ std::shared_ptr<cucascade::data_batch> duckdb_scan_task_local_state::make_data_b
     std::make_unique<host_table_allocation>(std::move(_allocation), std::move(cols), sz);
 
   // Make the host table representation
-  auto table =
-    std::make_unique<host_data_representation>(std::move(table_allocation), _host_space);
+  auto table = std::make_unique<host_data_representation>(std::move(table_allocation), _host_space);
 
   // Create the data batch and return
   return std::make_shared<data_batch>(get_next_batch_id(), std::move(table));

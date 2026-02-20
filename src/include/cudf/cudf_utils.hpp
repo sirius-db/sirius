@@ -38,11 +38,11 @@
 #include <cudf/copying.hpp>
 #include <cudf/groupby.hpp>
 #include <cudf/reduction.hpp>
-#include <cudf/stream_compaction.hpp>
 #include <cudf/round.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/sorting.hpp>
+#include <cudf/stream_compaction.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/unary.hpp>

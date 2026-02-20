@@ -60,16 +60,16 @@ inline column_metadata make_flat_column_metadata(duckdb::LogicalType type,
 {
   auto cudf_type = duckdb::GetCudfType(type);
   column_metadata cm;
-  cm.type_id         = cudf_type.id();
-  cm.num_rows        = num_rows;
-  cm.null_count      = null_count;
-  cm.scale           = cudf_type.scale();
-  cm.has_data        = true;
-  cm.data_offset     = data_offset;
-  cm.data_size       = 0;
-  cm.has_null_mask   = (null_count > 0);
+  cm.type_id          = cudf_type.id();
+  cm.num_rows         = num_rows;
+  cm.null_count       = null_count;
+  cm.scale            = cudf_type.scale();
+  cm.has_data         = true;
+  cm.data_offset      = data_offset;
+  cm.data_size        = 0;
+  cm.has_null_mask    = (null_count > 0);
   cm.null_mask_offset = cm.has_null_mask ? null_mask_offset : 0;
-  cm.null_mask_size  = cm.has_null_mask ? static_cast<std::size_t>((num_rows + 7) / 8) : 0;
+  cm.null_mask_size   = cm.has_null_mask ? static_cast<std::size_t>((num_rows + 7) / 8) : 0;
   return cm;
 }
 
