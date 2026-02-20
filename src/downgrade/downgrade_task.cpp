@@ -64,7 +64,8 @@ void downgrade_task::execute(rmm::cuda_stream_view stream)
 
     // Use the centralized converter registry to convert GPU representation to HOST
     auto& converter_registry = sirius::converter_registry::get();
-    batch->convert_to<cucascade::host_table_representation>(converter_registry, mem_space, stream);
+    batch->convert_to<cucascade::host_data_packed_representation>(
+      converter_registry, mem_space, stream);
 
     // Release the in-transit lock once conversion finishes
     batch->try_to_release_in_transit();

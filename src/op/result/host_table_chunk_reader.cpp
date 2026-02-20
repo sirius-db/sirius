@@ -221,7 +221,7 @@ void host_table_chunk_reader::column_reader::copy_string(
 
 host_table_chunk_reader::host_table_chunk_reader(
   duckdb::ClientContext& client_ctx,
-  cucascade::host_table_representation const& host_table,
+  cucascade::host_data_packed_representation const& host_table,
   duckdb::vector<duckdb::LogicalType> const& types_p)
   : _client_ctx(client_ctx), _allocation(host_table.get_host_table()->allocation), _types(types_p)
 {

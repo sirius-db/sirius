@@ -85,12 +85,18 @@ inline int GetCudfDecimalTypeSize(const cudf::data_type& type)
 inline cudf::data_type GetCudfType(const LogicalType& logical_type)
 {
   switch (logical_type.id()) {
+    case LogicalTypeId::TINYINT: return cudf::data_type(cudf::type_id::INT8);
     case LogicalTypeId::SMALLINT: return cudf::data_type(cudf::type_id::INT16);
     case LogicalTypeId::INTEGER: return cudf::data_type(cudf::type_id::INT32);
     case LogicalTypeId::BIGINT:
     case LogicalTypeId::HUGEINT:  // FIXME: unsafe conversion from duckdb HugeInt to cudf Int64,
                                   // since cudf does not support Int128.
       return cudf::data_type(cudf::type_id::INT64);
+    case LogicalTypeId::UTINYINT: return cudf::data_type(cudf::type_id::UINT8);
+    case LogicalTypeId::USMALLINT: return cudf::data_type(cudf::type_id::UINT16);
+    case LogicalTypeId::UINTEGER: return cudf::data_type(cudf::type_id::UINT32);
+    case LogicalTypeId::UBIGINT:
+    case LogicalTypeId::UHUGEINT: return cudf::data_type(cudf::type_id::UINT64); ;
     case LogicalTypeId::FLOAT: return cudf::data_type(cudf::type_id::FLOAT32);
     case LogicalTypeId::DOUBLE: return cudf::data_type(cudf::type_id::FLOAT64);
     case LogicalTypeId::BOOLEAN: return cudf::data_type(cudf::type_id::BOOL8);

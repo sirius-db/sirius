@@ -326,7 +326,7 @@ size_t estimate_packed_data_bytes(cudf::table_view const& view)
   return total_bytes;
 }
 
-cucascade::host_table_representation const& convert_to_host_table(
+cucascade::host_data_packed_representation const& convert_to_host_table(
   std::shared_ptr<cucascade::data_batch> const& batch)
 {
   auto* data = batch->get_data();
@@ -346,12 +346,12 @@ cucascade::host_table_representation const& convert_to_host_table(
   if (!host_space) { throw std::runtime_error("Invalid host memory space in test"); }
 
   auto& registry = sirius::converter_registry::get();
-  batch->convert_to<cucascade::host_table_representation>(
+  batch->convert_to<cucascade::host_data_packed_representation>(
     registry, host_space, rmm::cuda_stream_default);
 
   data = batch->get_data();
   if (!data) { throw std::runtime_error("data_batch has no data after conversion"); }
-  return data->cast<cucascade::host_table_representation>();
+  return data->cast<cucascade::host_data_packed_representation>();
 }
 
 }  // namespace
@@ -467,10 +467,10 @@ TEST_CASE("host_table_utils - pack metadata with gaps across multiple blocks",
   auto metadata = std::make_unique<std::vector<uint8_t>>(pack_metadata_from_nodes(column_metadata));
 
   auto const sz         = allocation->size_bytes();
-  auto table_allocation = std::make_unique<cucascade::memory::host_table_allocation>(
+  auto table_allocation = std::make_unique<cucascade::memory::host_table_packed_allocation>(
     std::move(allocation), std::move(metadata), sz);
-  auto host_table =
-    std::make_unique<cucascade::host_table_representation>(std::move(table_allocation), host_space);
+  auto host_table = std::make_unique<cucascade::host_data_packed_representation>(
+    std::move(table_allocation), host_space);
   auto batch =
     std::make_shared<cucascade::data_batch>(sirius::get_next_batch_id(), std::move(host_table));
 
@@ -592,10 +592,10 @@ TEST_CASE("host_table_utils - underfilled varchar column truncates rows",
   auto metadata = std::make_unique<std::vector<uint8_t>>(pack_metadata_from_nodes(column_metadata));
 
   auto const sz         = allocation->size_bytes();
-  auto table_allocation = std::make_unique<cucascade::memory::host_table_allocation>(
+  auto table_allocation = std::make_unique<cucascade::memory::host_table_packed_allocation>(
     std::move(allocation), std::move(metadata), sz);
-  auto host_table =
-    std::make_unique<cucascade::host_table_representation>(std::move(table_allocation), host_space);
+  auto host_table = std::make_unique<cucascade::host_data_packed_representation>(
+    std::move(table_allocation), host_space);
   auto batch =
     std::make_shared<cucascade::data_batch>(sirius::get_next_batch_id(), std::move(host_table));
 
