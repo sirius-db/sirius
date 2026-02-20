@@ -489,7 +489,16 @@ impl DescriptorTable {
         let table_id = match parent.table_id {
             Some(id) => id,
             None => {
-                // Try override columns first (handles TVF scans).
+                // If child_rel_column_names is set (e.g., for nested JOIN condition
+                // resolution), use it for accurate name-based resolution.
+                if let Some(ref col_names) = *self.child_rel_column_names.borrow() {
+                    if !slot.col_name.is_empty() {
+                        if let Some(idx) = col_names.iter().position(|n| n == &slot.col_name) {
+                            return Ok(idx);
+                        }
+                    }
+                }
+                // Try override columns (handles TVF scans).
                 for (_, columns) in &self.table_column_overrides {
                     if let Some(pos) = columns.iter().position(|c| c == &slot.col_name) {
                         return Ok(pos);

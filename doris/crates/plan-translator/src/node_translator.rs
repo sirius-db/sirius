@@ -599,15 +599,29 @@ fn translate_hash_join_node(
     // In a Substrait JoinRel, the combined schema is [left_cols | right_cols].
     let left_col_count = count_rel_columns(&left);
 
+    // For nested JOINs, the eq_join_conjunct SLOT_REFs may reference intermediate
+    // tuples. Use child_rel_column_names from each side's compiled Rel for accurate
+    // name-based resolution (slot_table_index fails for intermediate tuple slots).
+    let left_col_names = collect_rel_column_names(&left);
+    let right_col_names = collect_rel_column_names(&right);
+
     // Build equality conditions from eq_join_conjuncts.
     let eq_anchor = registry.register_function(crate::URI_COMPARISON, "equal");
     let mut conditions: Vec<Expression> = Vec::new();
 
     for eq_cond in &hash_join.eq_join_conjuncts {
-        // Left side: field refs are 0-based within left schema.
+        // Left side: resolve using the left Rel's column names.
+        if !left_col_names.is_empty() {
+            desc.set_child_rel_column_names(left_col_names.clone());
+        }
         let left_expr = expr_translator::translate_expr(&eq_cond.left, desc, registry)?;
-        // Right side: field refs are 0-based within right schema, offset by left_col_count.
+        desc.clear_child_rel_column_names();
+        // Right side: resolve using the right Rel's column names, then offset.
+        if !right_col_names.is_empty() {
+            desc.set_child_rel_column_names(right_col_names.clone());
+        }
         let mut right_expr = expr_translator::translate_expr(&eq_cond.right, desc, registry)?;
+        desc.clear_child_rel_column_names();
         expr_translator::offset_field_refs(&mut right_expr, left_col_count);
         conditions.push(expr_translator::make_scalar_fn(
             eq_anchor,
@@ -618,8 +632,15 @@ fn translate_hash_join_node(
 
     // Add vother_join_conjunct if present.
     let post_join_filter = if let Some(other) = &hash_join.vother_join_conjunct {
-        // TODO: properly offset right-side field references in mixed expressions.
-        Some(expr_translator::translate_expr(other, desc, registry)?)
+        // Set combined column names for cross-table expressions.
+        let mut combined = left_col_names;
+        combined.extend(right_col_names);
+        if !combined.is_empty() {
+            desc.set_child_rel_column_names(combined);
+        }
+        let expr = expr_translator::translate_expr(other, desc, registry)?;
+        desc.clear_child_rel_column_names();
+        Some(expr)
     } else {
         None
     };
