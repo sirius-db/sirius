@@ -219,23 +219,6 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
 
     const auto& output_idx = input_col_to_output_idx[aggregate_col_id];
     for (size_t j = 0; j < output_idx.size(); ++j) {
-      auto result_view = aggregation_result.results[j]->view();
-      // Widen decimal result for SUM (expected by duckdb)
-      if (requests[i].aggregations[j]->kind == cudf::aggregation::Kind::SUM) {
-        if (requests[i].values.type().id() == cudf::type_id::DECIMAL64) {
-          aggregation_result.results[j] =
-            cudf::cast(result_view,
-                       cudf::data_type(cudf::type_id::DECIMAL128, result_view.type().scale()),
-                       stream,
-                       memory_space.get_default_allocator());
-        } else if (requests[i].values.type().id() == cudf::type_id::DECIMAL32) {
-          aggregation_result.results[j] =
-            cudf::cast(result_view,
-                       cudf::data_type(cudf::type_id::DECIMAL64, result_view.type().scale()),
-                       stream,
-                       memory_space.get_default_allocator());
-        }
-      }
       size_t output_col_id       = group_idx.size() + output_idx[j];
       output_cols[output_col_id] = std::move(aggregation_result.results[j]);
     }
