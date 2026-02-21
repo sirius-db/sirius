@@ -1338,7 +1338,7 @@ TEST_CASE_METHOD(GPUExecutionFixture,
 
 TEST_CASE_METHOD(GPUExecutionFixture,
                  "gpu_execution - TPC-H Query 2",
-                 "[.][integration_disabled][gpu_execution][TPC-H][Q2]")
+                 "[integration][gpu_execution][TPC-H][Q2]")
 {
   compare_gpu_vs_cpu(
     "select s.s_acctbal, s.s_name, n.n_name, p.p_partkey, p.p_mfgr, "
@@ -1494,7 +1494,7 @@ TEST_CASE_METHOD(GPUExecutionFixture,
 
 TEST_CASE_METHOD(GPUExecutionFixture,
                  "gpu_execution - TPC-H Query 10",
-                 "[.][integration_disabled][gpu_execution][TPC-H][Q10]")
+                 "[integration][gpu_execution][TPC-H][Q10]")
 {
   compare_gpu_vs_cpu(
     "select c.c_custkey, c.c_name, "
@@ -1701,7 +1701,7 @@ TEST_CASE_METHOD(GPUExecutionFixture,
 
 TEST_CASE_METHOD(GPUExecutionFixture,
                  "gpu_execution - TPC-H Query 20",
-                 "[.][integration_disabled][gpu_execution][TPC-H][Q20]")
+                 "[integration][gpu_execution][TPC-H][Q20]")
 {
   compare_gpu_vs_cpu(
     "select s.s_name, s.s_address "
