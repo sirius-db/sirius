@@ -96,25 +96,6 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
     }
   } else if (op->type == SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
     _partition_type = PartitionType::NONE;
-    _num_partitions =
-      static_cast<int>((op->estimated_cardinality + s_partition_size - 1) / s_partition_size);
-    auto& nested_join_op = op->Cast<sirius_physical_nested_loop_join>();
-    for (duckdb::idx_t cond_idx = 0; cond_idx < nested_join_op.conditions.size(); cond_idx++) {
-      auto& condition = nested_join_op.conditions[cond_idx];
-      if (condition.comparison != duckdb::ExpressionType::COMPARE_EQUAL &&
-          condition.comparison != duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
-        continue;
-      }
-      std::optional<duckdb::idx_t> left_index  = extract_bound_ref_index(*condition.left);
-      std::optional<duckdb::idx_t> right_index = extract_bound_ref_index(*condition.right);
-      if (left_index.has_value() && right_index.has_value()) {
-        if (is_build) {
-          _partition_keys.push_back(left_index.value());
-        } else {
-          _partition_keys.push_back(right_index.value());
-        }
-      }
-    }
   } else if (op->type == SiriusPhysicalOperatorType::HASH_GROUP_BY) {
     _partition_type            = PartitionType::HASH;
     auto& grouped_aggregate_op = op->Cast<sirius_physical_grouped_aggregate>();
