@@ -1001,6 +1001,27 @@ TEST_CASE_METHOD(GPUExecutionFixture,
     "from lineitem group by l_returnflag, l_linestatus;");
 }
 
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - group by min, max, avg on decimal on lineitem",
+                 "[integration][gpu_execution][group_by][avg]")
+{
+  compare_gpu_vs_cpu(
+    "select l_tax, min(l_extendedprice), max(l_extendedprice), avg(l_extendedprice)"
+    "from lineitem group by l_tax;",
+    0.0001);
+}
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - group by min, max, avg, sum on decimal on lineitem",
+                 "[integration][gpu_execution][group_by][avg]")
+{
+  compare_gpu_vs_cpu(
+    "select l_discount, min(l_extendedprice), sum(l_extendedprice), max(l_extendedprice), "
+    "avg(l_extendedprice), sum(l_tax)"
+    "from lineitem group by l_discount;",
+    0.0001);
+}
+
 //===----------------------------------------------------------------------===//
 // Order by tests
 //===----------------------------------------------------------------------===//
@@ -1351,7 +1372,7 @@ TEST_CASE_METHOD(GPUExecutionFixture,
 
 TEST_CASE_METHOD(GPUExecutionFixture,
                  "gpu_execution - TPC-H Query 2",
-                 "[.][integration_disabled][gpu_execution][TPC-H][Q2]")
+                 "[integration][gpu_execution][TPC-H][Q2]")
 {
   compare_gpu_vs_cpu(
     "select s.s_acctbal, s.s_name, n.n_name, p.p_partkey, p.p_mfgr, "
@@ -1507,7 +1528,7 @@ TEST_CASE_METHOD(GPUExecutionFixture,
 
 TEST_CASE_METHOD(GPUExecutionFixture,
                  "gpu_execution - TPC-H Query 10",
-                 "[.][integration_disabled][gpu_execution][TPC-H][Q10]")
+                 "[integration][gpu_execution][TPC-H][Q10]")
 {
   compare_gpu_vs_cpu(
     "select c.c_custkey, c.c_name, "
@@ -1624,7 +1645,7 @@ TEST_CASE_METHOD(GPUExecutionFixture,
 
 TEST_CASE_METHOD(GPUExecutionFixture,
                  "gpu_execution - TPC-H Query 16",
-                 "[integration][gpu_execution][TPC-H][Q16]")
+                 "[.][integration_disabled][gpu_execution][TPC-H][Q16]")
 {
   compare_gpu_vs_cpu(
     "select p.p_brand, p.p_type, p.p_size, "
@@ -1644,7 +1665,7 @@ TEST_CASE_METHOD(GPUExecutionFixture,
 
 TEST_CASE_METHOD(GPUExecutionFixture,
                  "gpu_execution - TPC-H Query 17",
-                 "[.][integration_disabled][gpu_execution][TPC-H][Q17]")
+                 "[integration][gpu_execution][TPC-H][Q17]")
 {
   compare_gpu_vs_cpu(
     "select sum(l.l_extendedprice) / 7.0 as avg_yearly "
@@ -1714,7 +1735,7 @@ TEST_CASE_METHOD(GPUExecutionFixture,
 
 TEST_CASE_METHOD(GPUExecutionFixture,
                  "gpu_execution - TPC-H Query 20",
-                 "[.][integration_disabled][gpu_execution][TPC-H][Q20]")
+                 "[integration][gpu_execution][TPC-H][Q20]")
 {
   compare_gpu_vs_cpu(
     "select s.s_name, s.s_address "

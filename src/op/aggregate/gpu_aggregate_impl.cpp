@@ -74,6 +74,16 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_ungrouped_aggre
             break;
           }
           default: break;
+          case cudf::type_id::DECIMAL64:
+            if (input_col.type().id() == cudf::type_id::DECIMAL64) {
+              output_type = cudf::data_type(cudf::type_id::DECIMAL128, output_type.scale());
+            }
+            break;
+          case cudf::type_id::DECIMAL32:
+            if (input_col.type().id() == cudf::type_id::DECIMAL32) {
+              output_type = cudf::data_type(cudf::type_id::DECIMAL64, output_type.scale());
+            }
+            break;
         }
         break;
       }
