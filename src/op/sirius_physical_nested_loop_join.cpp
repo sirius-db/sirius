@@ -464,17 +464,6 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
     }
     result_table = std::make_unique<cudf::table>(std::move(out_cols), stream, mr);
   } else {
-    // Build extended right table: original columns + one materialized column per condition whose
-    // right side is an expression (e.g. CAST((n_regionkey * 1000) AS BIGINT)).
-    std::vector<cudf::column_view> right_col_views;
-    right_col_views.reserve(right.num_columns() + conditions.size());
-    for (cudf::size_type c = 0; c < right.num_columns(); c++) {
-      right_col_views.push_back(right.column(c));
-    }
-    // Own expression result columns so table_views passed to cudf conditional_join have stable
-    // backing memory (avoids segfault in may_evaluate_null when using views into batch-owned data).
-    std::vector<std::unique_ptr<cudf::column>> owned_right_expression_columns;
-
     // Resolve column indices and target types so AST predicate operands match (cudf requires
     // matching types). Columns used in conditions may be cast to the expression return type.
     // Reserve to the exact number of conditions to prevent reallocation.
@@ -491,7 +480,7 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
     right_refs.reserve(conditions.size());
     cond_ops.reserve(conditions.size());
     and_chain.reserve(conditions.size() > 1 ? conditions.size() - 1 : 0);
-    std::vector<cudf::column_view> left_col_views;
+    std::vector<cudf::column_view> left_col_views, right_col_views;
     std::vector<std::unique_ptr<cudf::column>> owned_left_casts;
     std::vector<std::unique_ptr<cudf::column>> owned_right_casts;
     left_col_views.reserve(left.num_columns());
@@ -569,7 +558,7 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
     }
 
     cudf::table_view left_effective(left_col_views);
-    cudf::table_view right_effective(right_effective_views);
+    cudf::table_view right_effective(right_col_views);
 
     // Build a left-associative AND chain referencing cond_ops elements directly — never copying
     // operations, matching the cuDF test pattern. and_chain holds exactly (N-1) LOGICAL_AND nodes
