@@ -1,7 +1,8 @@
 #!/bin/bash
 # Run TPC-H GPU queries against Parquet files
 #
-# Replaces table names inside gpu_execution() with read_parquet() calls.
+# Creates views from parquet files found in the dataset directory,
+# then runs the standard GPU query files unchanged.
 #
 # Usage:
 #   export SIRIUS_CONFIG_FILE=/home/felipe/sirius/test/cpp/integration/integration.cfg
@@ -36,8 +37,16 @@ if [ ! -d "$PARQUET_DIR" ]; then
     exit 1
 fi
 
+# Build CREATE VIEW statements for each parquet file found
+VIEW_SQL=""
+for pf in "$PARQUET_DIR"/*.parquet; do
+    TABLE_NAME="$(basename "$pf" .parquet)"
+    VIEW_SQL+="CREATE VIEW ${TABLE_NAME} AS SELECT * FROM read_parquet('${pf}');"$'\n'
+done
+
 echo "Running TPC-H queries against SF${SF} parquet data"
 echo "Parquet dir: $PARQUET_DIR"
+echo "Views: ${VIEW_SQL}"
 echo "Queries: ${QUERIES[*]}"
 echo "=========================================="
 
@@ -53,23 +62,9 @@ for q in "${QUERIES[@]}"; do
     echo ""
     echo "========== Q${q} =========="
 
-    # Use python to replace table names with read_parquet() calls
     TEMP_SQL=$(mktemp /tmp/tpch_q${q}_XXXXXX.sql)
-    python3 -c "
-import re, sys
-
-sql = open('$QUERY_FILE').read()
-parquet_dir = '$PARQUET_DIR'
-
-# Replace table names with read_parquet() - longest names first to avoid partial matches
-tables = ['partsupp', 'lineitem', 'customer', 'supplier', 'orders', 'nation', 'region', 'part']
-
-for table in tables:
-    # Word-boundary replacement, but skip 'as orders' pattern (Q13 derived table alias)
-    sql = re.sub(r'(?<!as )(?<!\w)' + table + r'(?!\w)', f'read_parquet(\"{parquet_dir}/{table}.parquet\")', sql)
-
-sys.stdout.write(sql)
-" > "$TEMP_SQL"
+    printf '%s\n' "$VIEW_SQL" > "$TEMP_SQL"
+    cat "$QUERY_FILE" >> "$TEMP_SQL"
 
     "$DUCKDB" -f "$TEMP_SQL" 2>&1 | tee "$RESULT_FILE"
 
