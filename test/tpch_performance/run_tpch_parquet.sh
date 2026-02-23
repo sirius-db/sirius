@@ -37,11 +37,11 @@ if [ ! -d "$PARQUET_DIR" ]; then
     exit 1
 fi
 
-# Build CREATE VIEW statements for each parquet file found
+# Build CREATE VIEW statements for the TPC-H tables using glob patterns
+TPCH_TABLES=(customer lineitem nation orders part partsupp region supplier)
 VIEW_SQL=""
-for pf in "$PARQUET_DIR"/*.parquet; do
-    TABLE_NAME="$(basename "$pf" .parquet)"
-    VIEW_SQL+="CREATE VIEW ${TABLE_NAME} AS SELECT * FROM read_parquet('${pf}');"$'\n'
+for TABLE_NAME in "${TPCH_TABLES[@]}"; do
+    VIEW_SQL+="CREATE VIEW ${TABLE_NAME} AS SELECT * FROM read_parquet('${PARQUET_DIR}/${TABLE_NAME}*.parquet');"$'\n'
 done
 
 echo "Running TPC-H queries against SF${SF} parquet data"
