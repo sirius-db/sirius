@@ -480,6 +480,9 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
     // Reserve to the exact number of conditions to prevent reallocation.
     // cudf::ast::operation stores operands as reference_wrapper<expression const> — any
     // reallocation of these vectors invalidates the stored references and causes UB/segfault.
+
+    std::map<uint64_t, cudf::size_type> left_expressions_to_idx;
+    std::map<uint64_t, cudf::size_type> right_expressions_to_idx;
     std::vector<cudf::ast::column_reference> left_refs;
     std::vector<cudf::ast::column_reference> right_refs;
     std::vector<cudf::ast::operation> cond_ops;
@@ -487,80 +490,100 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
     left_refs.reserve(conditions.size());
     right_refs.reserve(conditions.size());
     cond_ops.reserve(conditions.size());
-    and_chain.reserve(conditions.size());
-    std::unordered_map<cudf::size_type, cudf::data_type> left_target_type;
-    std::unordered_map<cudf::size_type, cudf::data_type> right_target_type;
-
-    for (const auto& cond : conditions) {
-      cudf::size_type left_idx  = 0;
-      cudf::size_type right_idx = 0;
-      if (!get_column_index(*cond.left, left_idx)) {
-        throw std::runtime_error(
-          "sirius_physical_nested_loop_join: left side of condition must be a column reference or "
-          "CAST(column) (got: " +
-          cond.left->ToString() + ")");
-      }
-      if (!get_column_index(*cond.right, right_idx)) {
-        // Right side is an expression (e.g. CAST(expr AS type)); materialize it over the right
-        // table and copy into an owned column so cudf conditional_join has stable memory.
-        duckdb::sirius::GpuExpressionExecutor executor(*cond.right, mr);
-        auto expr_result_batch = executor.execute(right_batch, stream);
-        auto& expr_table =
-          expr_result_batch->get_data()->cast<cucascade::gpu_table_representation>().get_table();
-        auto expr_view = expr_table.view();
-        if (expr_view.num_columns() != 1) {
-          throw std::runtime_error(
-            "sirius_physical_nested_loop_join: expression on right should produce one column");
-        }
-        if (expr_view.num_rows() != right.num_rows()) {
-          throw std::runtime_error(
-            "sirius_physical_nested_loop_join: expression result row count must match right table");
-        }
-        owned_right_expression_columns.push_back(
-          std::make_unique<cudf::column>(expr_view.column(0), stream, mr));
-        right_idx = static_cast<cudf::size_type>(right_col_views.size());
-        right_col_views.push_back(owned_right_expression_columns.back()->view());
-      }
-      left_target_type[left_idx]   = duckdb::GetCudfType(cond.left->return_type);
-      right_target_type[right_idx] = duckdb::GetCudfType(cond.right->return_type);
-      left_refs.emplace_back(left_idx, cudf::ast::table_reference::LEFT);
-      right_refs.emplace_back(right_idx, cudf::ast::table_reference::RIGHT);
-      cond_ops.emplace_back(to_ast_operator(cond.comparison), left_refs.back(), right_refs.back());
-    }
-
-    // Build left/right table views with cast columns where type != target (so AST operands match).
+    and_chain.reserve(conditions.size() > 1 ? conditions.size() - 1 : 0);
     std::vector<cudf::column_view> left_col_views;
     std::vector<std::unique_ptr<cudf::column>> owned_left_casts;
     std::vector<std::unique_ptr<cudf::column>> owned_right_casts;
     left_col_views.reserve(left.num_columns());
-    for (cudf::size_type c = 0; c < left.num_columns(); c++) {
-      auto it = left_target_type.find(c);
-      if (it != left_target_type.end() && left.column(c).type() != it->second) {
-        owned_left_casts.push_back(cudf::cast(left.column(c), it->second, stream));
-        left_col_views.push_back(owned_left_casts.back()->view());
+    right_col_views.reserve(right.num_columns());
+
+    for (const auto& cond : conditions) {
+      cudf::size_type left_join_input_index, right_join_input_index;
+
+      auto left_cond_hash = cond.left->Hash();
+      auto it             = left_expressions_to_idx.find(left_cond_hash);
+      if (it == left_expressions_to_idx.end()) {
+        left_join_input_index                   = left_refs.size();
+        left_expressions_to_idx[left_cond_hash] = left_join_input_index;
+        cudf::size_type left_source_idx         = 0;
+        if (!get_column_index(*cond.left, left_source_idx)) {
+          throw std::runtime_error(
+            "sirius_physical_nested_loop_join: left side of condition must be a column reference "
+            "or "
+            "CAST(column) (got: " +
+            cond.left->ToString() + ")");
+        }
+        auto target_type = duckdb::GetCudfType(cond.left->return_type);
+
+        // now lets see if we have to cast
+        if (left.column(left_source_idx).type() != target_type) {
+          if (cond.left->expression_class != duckdb::ExpressionClass::BOUND_CAST) {
+            // We might want to just change this to an ASSERT
+            throw std::runtime_error(
+              "sirius_physical_nested_loop_join: unexpected, column type does not match, yet there "
+              "is no BOUND_CAST");
+          }
+          owned_left_casts.push_back(cudf::cast(left.column(left_source_idx), target_type, stream));
+          left_col_views.push_back(owned_left_casts.back()->view());
+        }
+        left_col_views.push_back(left.column(left_source_idx));
       } else {
-        left_col_views.push_back(left.column(c));
+        left_join_input_index = it->second;
       }
-    }
-    std::vector<cudf::column_view> right_effective_views;
-    right_effective_views.reserve(right_col_views.size());
-    for (size_t c = 0; c < right_col_views.size(); c++) {
-      auto it = right_target_type.find(static_cast<cudf::size_type>(c));
-      if (it != right_target_type.end() && right_col_views[c].type() != it->second) {
-        owned_right_casts.push_back(cudf::cast(right_col_views[c], it->second, stream));
-        right_effective_views.push_back(owned_right_casts.back()->view());
+
+      auto right_cond_hash = cond.right->Hash();
+      it                   = right_expressions_to_idx.find(right_cond_hash);
+      if (it == right_expressions_to_idx.end()) {
+        right_join_input_index                    = right_refs.size();
+        right_expressions_to_idx[right_cond_hash] = right_join_input_index;
+        cudf::size_type right_source_idx          = 0;
+        if (!get_column_index(*cond.right, right_source_idx)) {
+          throw std::runtime_error(
+            "sirius_physical_nested_loop_join: right side of condition must be a column reference "
+            "or "
+            "CAST(column) (got: " +
+            cond.right->ToString() + ")");
+        }
+        auto target_type = duckdb::GetCudfType(cond.right->return_type);
+
+        // now lets see if we have to cast
+        if (right.column(right_source_idx).type() != target_type) {
+          if (cond.right->expression_class != duckdb::ExpressionClass::BOUND_CAST) {
+            // We might want to just change this to an ASSERT
+            throw std::runtime_error(
+              "sirius_physical_nested_loop_join: unexpected, column type does not match, yet there "
+              "is no BOUND_CAST");
+          }
+          owned_right_casts.push_back(
+            cudf::cast(right.column(right_source_idx), target_type, stream));
+          right_col_views.push_back(owned_right_casts.back()->view());
+        }
+        right_col_views.push_back(right.column(right_source_idx));
       } else {
-        right_effective_views.push_back(right_col_views[c]);
+        right_join_input_index = it->second;
       }
+
+      left_refs.emplace_back(left_join_input_index, cudf::ast::table_reference::LEFT);
+      right_refs.emplace_back(right_join_input_index, cudf::ast::table_reference::RIGHT);
+      cond_ops.emplace_back(to_ast_operator(cond.comparison), left_refs.back(), right_refs.back());
     }
+
     cudf::table_view left_effective(left_col_views);
     cudf::table_view right_effective(right_effective_views);
 
-    and_chain.push_back(cond_ops[0]);
+    // Build a left-associative AND chain referencing cond_ops elements directly — never copying
+    // operations, matching the cuDF test pattern. and_chain holds exactly (N-1) LOGICAL_AND nodes
+    // for N conditions; cond_ops[0] is the left leaf of the first AND node, not copied into
+    // and_chain.
     for (size_t i = 1; i < cond_ops.size(); i++) {
-      and_chain.emplace_back(cudf::ast::ast_operator::LOGICAL_AND, and_chain.back(), cond_ops[i]);
+      const cudf::ast::expression& lhs =
+        (i == 1) ? static_cast<const cudf::ast::expression&>(cond_ops[0]) : and_chain.back();
+      and_chain.emplace_back(cudf::ast::ast_operator::LOGICAL_AND,
+                             lhs,
+                             static_cast<const cudf::ast::expression&>(cond_ops[i]));
     }
-    const cudf::ast::expression& predicate = and_chain.back();
+    const cudf::ast::expression& predicate =
+      and_chain.empty() ? static_cast<const cudf::ast::expression&>(cond_ops[0]) : and_chain.back();
 
     std::pair<std::unique_ptr<rmm::device_uvector<cudf::size_type>>,
               std::unique_ptr<rmm::device_uvector<cudf::size_type>>>

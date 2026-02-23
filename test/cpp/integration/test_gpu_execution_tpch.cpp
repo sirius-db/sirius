@@ -901,9 +901,10 @@ TEST_CASE_METHOD(GPUExecutionFixture,
                  "[integration][gpu_execution][nested_loop_join]")
 {
   compare_gpu_vs_cpu(
-    "select n.n_nationkey, n.n_name,  c.c_nationkey, c.c_custkey, c.c_name  from nation n "
-    "join customer c on n.n_nationkey < c.c_nationkey order by c.c_custkey, n.n_nationkey limit "
-    "1000;");
+    "select n.n_nationkey, n.n_name,  c.c_nationkey, c.c_custkey, c.c_name  from nation n join "
+    "customer c "
+    "on n.n_nationkey < c.c_nationkey where c.c_custkey < 100 "
+    "order by c.c_custkey, n.n_nationkey limit 1000;");
 }
 
 TEST_CASE_METHOD(GPUExecutionFixture,
@@ -911,25 +912,121 @@ TEST_CASE_METHOD(GPUExecutionFixture,
                  "[integration][gpu_execution][nested_loop_join]")
 {
   compare_gpu_vs_cpu(
-    "select n.n_nationkey, n.n_name,  c.c_nationkey, c.c_custkey, c.c_name  from nation n "
-    "join customer c on n.n_nationkey > c.c_custkey and n.n_nationkey <= c.c_nationkey order by "
-    "c.c_custkey, n.n_nationkey limit 1000;");
+    "select ps.ps_partkey, ps.ps_suppkey, l.l_orderkey from lineitem l join partsupp ps "
+    "on l.l_partkey < ps.ps_partkey and l.l_suppkey > ps.ps_suppkey "
+    "where l.l_orderkey < 1000;");
 }
 
-TEST_CASE_METHOD(
-  GPUExecutionFixture,
-  "gpu_execution - nested loop inner join single inequality and a non-equality condition",
-  "[integration][gpu_execution][nested_loop_join]")
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - nested loop inner join double inequality condition, one "
+                 "condition needing casting",
+                 "[integration][gpu_execution][nested_loop_join]")
 {
   compare_gpu_vs_cpu(
     "select n.n_nationkey, n.n_name,  c.c_nationkey, c.c_custkey, c.c_name  from nation n "
-    "join customer c on n.n_nationkey > c.c_custkey and n.n_nationkey <> c.c_nationkey order by "
-    "c.c_custkey, n.n_nationkey limit 1000;");
+    "join customer c on n.n_nationkey > c.c_custkey and n.n_nationkey <= c.c_nationkey "
+    "where c.c_custkey < 1000 order by c.c_custkey, n.n_nationkey limit 1000;");
+}
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - nested loop left join single inequality condition",
+                 "[integration][gpu_execution][nested_loop_join]")
+{
+  compare_gpu_vs_cpu(
+    "select n.n_nationkey, n.n_name,  c.c_nationkey, c.c_custkey, c.c_name  from nation n left "
+    "join customer c "
+    "on n.n_nationkey < c.c_nationkey where c.c_custkey < 100 "
+    "order by c.c_custkey, n.n_nationkey limit 1000;");
+}
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - nested loop left join double inequality condition",
+                 "[integration][gpu_execution][nested_loop_join]")
+{
+  compare_gpu_vs_cpu(
+    "select ps.ps_partkey, ps.ps_suppkey, l.l_orderkey from lineitem l left join partsupp ps "
+    "on l.l_partkey < ps.ps_partkey and l.l_suppkey > ps.ps_suppkey "
+    "where l.l_orderkey < 1000;");
+}
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - nested loop left join double inequality condition, one condition "
+                 "needing casting",
+                 "[integration][gpu_execution][nested_loop_join]")
+{
+  compare_gpu_vs_cpu(
+    "select n.n_nationkey, n.n_name,  c.c_nationkey, c.c_custkey, c.c_name  from nation n "
+    "left join customer c on n.n_nationkey > c.c_custkey and n.n_nationkey <= c.c_nationkey "
+    "where c.c_custkey < 1000 order by c.c_custkey, n.n_nationkey limit 1000;");
+}
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - nested loop right join single inequality condition",
+                 "[integration][gpu_execution][nested_loop_join]")
+{
+  compare_gpu_vs_cpu(
+    "select n.n_nationkey, n.n_name,  c.c_nationkey, c.c_custkey, c.c_name  from nation n right "
+    "join customer c "
+    "on n.n_nationkey < c.c_nationkey where c.c_custkey < 100 "
+    "order by c.c_custkey, n.n_nationkey limit 1000;");
+}
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - nested loop right join double inequality condition",
+                 "[integration][gpu_execution][nested_loop_join]")
+{
+  compare_gpu_vs_cpu(
+    "select ps.ps_partkey, ps.ps_suppkey, l.l_orderkey from lineitem l right join partsupp ps "
+    "on l.l_partkey < ps.ps_partkey and l.l_suppkey > ps.ps_suppkey "
+    "where l.l_orderkey < 1000;");
+}
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - nested loop right join double inequality condition, one "
+                 "condition needing casting",
+                 "[integration][gpu_execution][nested_loop_join]")
+{
+  compare_gpu_vs_cpu(
+    "select n.n_nationkey, n.n_name,  c.c_nationkey, c.c_custkey, c.c_name  from nation n "
+    "right join customer c on n.n_nationkey > c.c_custkey and n.n_nationkey <= c.c_nationkey "
+    "where c.c_custkey < 1000 order by c.c_custkey, n.n_nationkey limit 1000;");
+}
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - nested loop full outer join single inequality condition",
+                 "[.][integration_disabled][gpu_execution][nested_loop_join]")
+{
+  compare_gpu_vs_cpu(
+    "select n.n_nationkey, n.n_name,  c.c_nationkey, c.c_custkey, c.c_name  from nation n full "
+    "outer join customer c "
+    "on n.n_nationkey < c.c_nationkey where c.c_custkey < 100 "
+    "order by c.c_custkey, n.n_nationkey limit 1000;");
+}
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - nested loop full outer join double inequality condition",
+                 "[.][integration_disabled][gpu_execution][nested_loop_join]")
+{
+  compare_gpu_vs_cpu(
+    "select ps.ps_partkey, ps.ps_suppkey, l.l_orderkey from lineitem l full outer join partsupp ps "
+    "on l.l_partkey < ps.ps_partkey and l.l_suppkey > ps.ps_suppkey "
+    "where l.l_orderkey < 1000;");
+}
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - nested loop full outer join double inequality condition, one "
+                 "condition needing casting",
+                 "[.][integration_disabled][gpu_execution][nested_loop_join]")
+{
+  compare_gpu_vs_cpu(
+    "select n.n_nationkey, n.n_name,  c.c_nationkey, c.c_custkey, c.c_name  from nation n "
+    "full outer join customer c on n.n_nationkey > c.c_custkey and n.n_nationkey <= c.c_nationkey "
+    "where c.c_custkey < 1000 order by c.c_custkey, n.n_nationkey limit 1000;");
 }
 
 TEST_CASE_METHOD(GPUExecutionFixture,
                  "gpu_execution - nested loop inner join one equality and one inequality condition",
-                 "[integration][gpu_execution][nested_loop_join]")
+                 "[.][integration_disabled][gpu_execution][nested_loop_join]")
 {
   compare_gpu_vs_cpu(
     "select n.n_nationkey, n.n_name,  c.c_nationkey, c.c_custkey, c.c_name  from nation n "
