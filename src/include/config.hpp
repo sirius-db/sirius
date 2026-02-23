@@ -51,6 +51,9 @@ struct Config {
   // Whether to use modified pipeline for the new execution model
   static bool MODIFIED_PIPELINE;
 
+  // Whether to fall back to duckdb execution after an error is detected
+  static bool ENABLE_DUCKDB_FALLBACK;
+
   // For duckdb scan task:
   //  - the default batch size
   //  - the default varchar size for estimating rows per batch

@@ -87,7 +87,7 @@ class GPUExecutionFixture {
                           std::optional<float> float_tolerance = std::nullopt)
   {
     // Disable fallback so GPU errors are not silently hidden
-    con->Query("SET enable_fallback_check = true;");
+    con->Query("SET enable_duckdb_fallback = false;");
 
     // Run on GPU
     auto gpu_sql    = "CALL gpu_execution(\"" + query + "\")";
