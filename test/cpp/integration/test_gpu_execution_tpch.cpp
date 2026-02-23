@@ -49,6 +49,15 @@ static fs::path get_tpch_db_path()
   return db_path;
 }
 
+struct sirius_config_env_guard {
+  sirius_config_env_guard(const std::string& config_path)
+  {
+    setenv("SIRIUS_CONFIG_FILE", config_path.c_str(), 1);
+  }
+
+  ~sirius_config_env_guard() { unsetenv("SIRIUS_CONFIG_FILE"); }
+};
+
 /**
  * @brief Catch2 test fixture for GPU execution tests.
  *
@@ -62,7 +71,7 @@ class GPUExecutionFixture {
     // Set up environment variable for config file
     auto cfg_path = fs::path(__FILE__).parent_path() / "integration.cfg";
     REQUIRE(fs::exists(cfg_path));
-    setenv("SIRIUS_CONFIG_FILE", cfg_path.string().c_str(), 1);
+    config_guard = std::make_unique<sirius_config_env_guard>(cfg_path.string());
 
     // Initialize DuckDB with integration database
     db  = std::make_unique<duckdb::DuckDB>(get_tpch_db_path().string());
@@ -161,6 +170,7 @@ class GPUExecutionFixture {
 
   std::unique_ptr<duckdb::DuckDB> db;
   std::unique_ptr<duckdb::Connection> con;
+  std::unique_ptr<sirius_config_env_guard> config_guard;
 };
 
 //===----------------------------------------------------------------------===//

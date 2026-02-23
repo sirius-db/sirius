@@ -20,6 +20,7 @@
 #include "log/logging.hpp"
 
 #include <absl/cleanup/cleanup.h>
+#include <absl/functional/any_invocable.h>
 #include <cucascade/data/cpu_data_representation.hpp>
 #include <cucascade/data/data_repository.hpp>
 #include <cucascade/data/data_repository_manager.hpp>
@@ -29,6 +30,7 @@
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
 
+#include <iostream>
 #include <optional>
 
 namespace sirius {
@@ -213,8 +215,10 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
   const auto* requested_memory_space =
     reservation != nullptr ? &reservation->get_memory_space() : nullptr;
   auto* allocator = reservation->get_memory_resource_of<cucascade::memory::Tier::GPU>();
+  std::cerr << "released memory reservation for the stream " << stream.value() << std::endl;
   allocator->attach_reservation_to_tracker(stream, std::move(reservation), nullptr, nullptr);
-  absl::Cleanup source_closer = [allocator, stream] {
+  absl::Cleanup source_closer = [allocator, stream]() {
+    std::cerr << "Stream " << stream.value() << ": releasing memory reservation\n";
     allocator->reset_stream_reservation(stream);
   };
   std::vector<cucascade::data_batch_processing_handle> processing_handles;
