@@ -405,16 +405,20 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
 
   auto left_batch  = input_batches[0];
   auto right_batch = input_batches[1];
+
   if (!left_batch || !right_batch) {
     SIRIUS_LOG_DEBUG("Pipeline {}: nested loop join, 0 output batches", pipeline_id);
     return std::make_unique<operator_data>(std::vector<std::shared_ptr<cucascade::data_batch>>{});
   }
 
-  cudf::table_view left                  = get_cudf_table_view(*left_batch);
-  cudf::table_view right                 = get_cudf_table_view(*right_batch);
+  cudf::table_view left  = get_cudf_table_view(*left_batch);
+  cudf::table_view right = get_cudf_table_view(*right_batch);
+
   cucascade::memory::memory_space* space = left_batch->get_memory_space();
   if (!space) {
-    SIRIUS_LOG_DEBUG("Pipeline {}: nested loop join, 0 output batches", pipeline_id);
+    SIRIUS_LOG_DEBUG(
+      "Pipeline {}: nested loop join, 0 output batches because left batch had no memory space",
+      pipeline_id);
     return std::make_unique<operator_data>(std::vector<std::shared_ptr<cucascade::data_batch>>{});
   }
 
@@ -434,7 +438,7 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
       }
     }
     auto empty_table = std::make_unique<cudf::table>(std::move(empty_cols), stream, mr);
-    SIRIUS_LOG_DEBUG("Pipeline {}: nested loop join, 1 output batches", pipeline_id);
+    SIRIUS_LOG_DEBUG("Pipeline {}: nested loop join, 1 empty output batches", pipeline_id);
     return std::make_unique<operator_data>(std::vector<std::shared_ptr<cucascade::data_batch>>{
       make_data_batch(std::move(empty_table), *space)});
   }
@@ -473,15 +477,20 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
 
     // Resolve column indices and target types so AST predicate operands match (cudf requires
     // matching types). Columns used in conditions may be cast to the expression return type.
-    // Reserve so that .back() passed into cond_ops.emplace_back() never dangles when vectors grow.
+    // Reserve to the exact number of conditions to prevent reallocation.
+    // cudf::ast::operation stores operands as reference_wrapper<expression const> — any
+    // reallocation of these vectors invalidates the stored references and causes UB/segfault.
     std::vector<cudf::ast::column_reference> left_refs;
     std::vector<cudf::ast::column_reference> right_refs;
     std::vector<cudf::ast::operation> cond_ops;
+    std::vector<cudf::ast::operation> and_chain;
     left_refs.reserve(conditions.size());
     right_refs.reserve(conditions.size());
     cond_ops.reserve(conditions.size());
+    and_chain.reserve(conditions.size());
     std::unordered_map<cudf::size_type, cudf::data_type> left_target_type;
     std::unordered_map<cudf::size_type, cudf::data_type> right_target_type;
+
     for (const auto& cond : conditions) {
       cudf::size_type left_idx  = 0;
       cudf::size_type right_idx = 0;
@@ -547,14 +556,7 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
     cudf::table_view left_effective(left_col_views);
     cudf::table_view right_effective(right_effective_views);
 
-    // Ensure all expression and cast work is complete before cudf conditional_join reads the data
-    stream.synchronize();
-
-    // Reserve to avoid reallocation: we pass and_chain.back() into emplace_back; if the vector
-    // reallocates that reference would be dangling and may_evaluate_null would segfault.
-    std::vector<cudf::ast::operation> and_chain;
-    and_chain.reserve(conditions.size());
-    and_chain.push_back(std::move(cond_ops[0]));
+    and_chain.push_back(cond_ops[0]);
     for (size_t i = 1; i < cond_ops.size(); i++) {
       and_chain.emplace_back(cudf::ast::ast_operator::LOGICAL_AND, and_chain.back(), cond_ops[i]);
     }
