@@ -207,7 +207,7 @@ void duckdb_scan_executor::manager_loop()
     }
 
     auto* scan_task = dynamic_cast<pipeline::sirius_pipeline_itask*>(task.get());
-    if (scan_task->is<parquet_scan_task>()) {
+    if (scan_task && scan_task->is<parquet_scan_task>()) {
       auto bytes_needed = scan_task->get_estimated_reservation_size();
       auto reservation  = _mem_mgr->request_reservation(
         cucascade::memory::any_memory_space_in_tier{cucascade::memory::Tier::HOST}, bytes_needed);
