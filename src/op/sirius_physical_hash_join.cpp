@@ -27,9 +27,9 @@
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "log/logging.hpp"
+#include "op/sirius_physical_hash_join.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
-#include "print.hpp"
 
 #include <cstdio>
 
@@ -88,7 +88,7 @@ sirius_physical_hash_join::sirius_physical_hash_join(
     conditions(std::move(cond)),
     delim_types(std::move(delim_types))
 {
-  if (join_type == duckdb::JoinType::ANTI || join_type == duckdb::JoinType::MARK) {
+  if (join_type == duckdb::JoinType::MARK) {
     throw std::runtime_error("Unsupported join type: " + duckdb::JoinTypeToString(join_type));
   }
 
@@ -443,17 +443,18 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
         cudf::left_join(right_keys, left_keys, cudf::null_equality::UNEQUAL, stream);
       right_indices = std::move(join_result.first);
       left_indices  = std::move(join_result.second);
-
     } else if (join_type == duckdb::JoinType::SEMI) {
       auto filtered_join_object = cudf::filtered_join(
         right_keys, cudf::null_equality::UNEQUAL, cudf::set_as_build_table::RIGHT, stream);
       left_indices = filtered_join_object.semi_join(left_keys, stream);
-
     } else if (join_type == duckdb::JoinType::RIGHT_SEMI) {
       auto filtered_join_object = cudf::filtered_join(
         left_keys, cudf::null_equality::UNEQUAL, cudf::set_as_build_table::RIGHT, stream);
       right_indices = filtered_join_object.semi_join(right_keys, stream);
-
+    } else if (join_type == duckdb::JoinType::ANTI) {
+      auto filtered_join_object = cudf::filtered_join(
+        right_keys, cudf::null_equality::UNEQUAL, cudf::set_as_build_table::RIGHT, stream);
+      left_indices = filtered_join_object.anti_join(left_keys, stream);
     } else if (join_type == duckdb::JoinType::OUTER) {
       auto join_result =
         cudf::full_join(left_keys, right_keys, cudf::null_equality::UNEQUAL, stream);
@@ -514,8 +515,6 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
     return std::make_unique<operator_data>(std::vector<std::shared_ptr<::cucascade::data_batch>>{
       make_data_batch(std::move(output_cudf_table), *input_batches[0]->get_memory_space())});
 
-    // } else if (join_type == duckdb::JoinType::ANTI) {
-    //   return std::vector<std::shared_ptr<::cucascade::data_batch>>{};
     // } else if (join_type == duckdb::JoinType::MARK) {
     //   return std::vector<std::shared_ptr<::cucascade::data_batch>>{};
     // } else if (join_type == duckdb::JoinType::SINGLE) {
