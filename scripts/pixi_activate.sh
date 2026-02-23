@@ -14,7 +14,7 @@ fi
 
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cmake_presets_src="$project_root/cmake/CMakePresets.json"
-cmake_presets_dst="$project_root/duckdb/CMakePresets.json"
+cmake_presets_dst="$project_root/duckdb/CMakeUserPresets.json"
 
 if [[ ! -e "$cmake_presets_dst" ]]; then
   ln -s "$cmake_presets_src" "$cmake_presets_dst"
