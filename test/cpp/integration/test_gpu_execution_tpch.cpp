@@ -852,21 +852,33 @@ TEST_CASE_METHOD(GPUExecutionFixture,
     "semi join nation n on n.n_nationkey = c.c_custkey;");
 }
 
-// Anti Join Tests
-// ===============
-// Each test mirrors its semi join counterpart, replacing `semi join` with `anti join`.
-// All tests use `compare_gpu_vs_cpu` to validate GPU results against CPU execution.
-//
-// | Test                          | Description                                                          |
-// |-------------------------------|----------------------------------------------------------------------|
-// | basic left anti join          | nation ANTI JOIN region on matching keys (n_regionkey = r_regionkey)  |
-// | basic left anti join 2        | nation ANTI JOIN region on mismatched keys (n_nationkey = r_regionkey)|
-// | basic anti join 3-5           | nation ANTI JOIN customer on n_nationkey = c_nationkey,              |
-// |                               | varying selected columns (both keys, non-key only, string column)    |
-// | basic anti join misfit 0-1    | nation ANTI JOIN customer on n_nationkey = c_custkey,                |
-// |                               | keys that don't naturally align, producing different filtering        |
-// | swapped anti join 0-1         | customer ANTI JOIN nation, reversed table order with matching keys    |
-// | swapped anti join misfit 0-1  | customer ANTI JOIN nation, reversed table order with mismatched keys  |
+/*
+Anti Join Tests
+===============
+Each test mirrors its semi join counterpart, replacing `semi join` with `anti join`.
+All tests use `compare_gpu_vs_cpu` to validate GPU results against CPU execution.
+
+basic left anti join
+-  nation ANTI JOIN region on matching keys (n_regionkey = r_regionkey)
+
+basic left anti join 2
+- nation ANTI JOIN region on mismatched keys (n_nationkey = r_regionkey)
+
+basic anti join 3-5
+- nation ANTI JOIN customer on n_nationkey = c_nationkey, varying selected columns (both keys,
+non-key only, string column)
+
+basic anti join misfit 0-1
+- nation ANTI JOIN customer on n_nationkey = c_custkey, keys that don't naturally align, producing
+different filtering
+
+swapped anti join 0-1
+- customer ANTI JOIN nation, reversed table order with matching keys
+
+swapped anti join misfit 0-1
+- customer ANTI JOIN nation, reversed table order with mismatched keys
+
+ */
 
 TEST_CASE_METHOD(GPUExecutionFixture,
                  "gpu_execution - basic left anti join",
