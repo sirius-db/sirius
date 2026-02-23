@@ -29,6 +29,8 @@
 
 #include <util/stream_check_wrapper.hpp>
 
+#include <iostream>
+
 namespace sirius {
 namespace pipeline {
 

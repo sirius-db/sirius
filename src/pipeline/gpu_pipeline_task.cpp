@@ -19,14 +19,18 @@
 #include "cudf/cudf_utils.hpp"
 #include "log/logging.hpp"
 
+#include <absl/cleanup/cleanup.h>
+#include <absl/functional/any_invocable.h>
 #include <cucascade/data/cpu_data_representation.hpp>
 #include <cucascade/data/data_repository.hpp>
 #include <cucascade/data/data_repository_manager.hpp>
 #include <cucascade/data/gpu_data_representation.hpp>
 #include <cucascade/memory/memory_space.hpp>
+#include <cucascade/memory/reservation_aware_resource_adaptor.hpp>
 #include <data/data_batch_utils.hpp>
 #include <data/sirius_converter_registry.hpp>
 
+#include <iostream>
 #include <optional>
 
 namespace sirius {
@@ -206,18 +210,15 @@ void gpu_pipeline_task::execute(rmm::cuda_stream_view stream)
 {
   auto& local_state = _local_state->cast<gpu_pipeline_task_local_state>();
 
-  // todo (amin)
-  // auto reservation = local_state.release_reservation();
-  // if (!reservation) {
-  //   throw std::runtime_error("GPU pipeline task requires a memory reservation");
-  // }
-  // auto allocator = reservation->get_memory_resource_of<cucascade::memory::Tier::GPU>();
-  // allocator->attach_reservation_to_tracker(stream, std::move(reservation), nullptr, nullptr);
-  // absl::Cleanup source_closer = [allocator, stream] {
-  // allocator->detach_reservation_from_tracker(); };
-  const auto* reservation = local_state.get_reservation();
+  auto reservation = local_state.release_reservation();
+  if (!reservation) { throw std::runtime_error("GPU pipeline task requires a memory reservation"); }
   const auto* requested_memory_space =
     reservation != nullptr ? &reservation->get_memory_space() : nullptr;
+  auto* allocator = reservation->get_memory_resource_of<cucascade::memory::Tier::GPU>();
+  allocator->attach_reservation_to_tracker(stream, std::move(reservation), nullptr, nullptr);
+  absl::Cleanup source_closer = [allocator, stream]() {
+    allocator->reset_stream_reservation(stream);
+  };
   std::vector<cucascade::data_batch_processing_handle> processing_handles;
   if (!local_state._input_data) {
     throw std::runtime_error("gpu_pipeline_task::execute: input_data is null");
