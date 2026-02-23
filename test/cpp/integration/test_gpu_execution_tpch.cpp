@@ -977,6 +977,133 @@ TEST_CASE_METHOD(GPUExecutionFixture,
     "anti join nation n on n.n_nationkey = c.c_custkey;");
 }
 
+/*
+Right Anti Join Tests
+=====================
+DuckDB's optimizer promotes an anti join to RIGHT_ANTI when the smaller table
+is on the left. These tests place the smaller table (region/nation) on the left
+so the planner chooses RIGHT_ANTI, exercising the RIGHT_ANTI code path.
+All tests use `compare_gpu_vs_cpu` to validate GPU results against CPU execution.
+
+basic right anti join
+- region ANTI JOIN nation on matching keys (r_regionkey = n_regionkey)
+
+basic right anti join 2
+- region ANTI JOIN nation on mismatched keys (r_regionkey = n_nationkey)
+
+basic right anti join 3-5
+- nation ANTI JOIN customer on n_nationkey = c_nationkey, varying selected columns (both keys,
+non-key only, string column)
+
+basic right anti join misfit 0-1
+- nation ANTI JOIN customer on n_nationkey = c_custkey, keys that don't naturally align, producing
+different filtering
+
+swapped right anti join 0-1
+- customer ANTI JOIN nation, reversed table order with matching keys
+
+swapped right anti join misfit 0-1
+- customer ANTI JOIN nation, reversed table order with mismatched keys
+
+ */
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - basic right anti join",
+                 "[integration][gpu_execution][antijoin]")
+{
+  compare_gpu_vs_cpu(
+    "select r.r_regionkey from region r anti join nation n on r.r_regionkey = n.n_regionkey;");
+}
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - basic right anti join 2",
+                 "[integration][gpu_execution][antijoin]")
+{
+  compare_gpu_vs_cpu(
+    "select r.r_regionkey from region r anti join nation n on r.r_regionkey = n.n_nationkey;");
+}
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - basic right anti join 3",
+                 "[integration][gpu_execution][antijoin]")
+{
+  compare_gpu_vs_cpu(
+    "select c.c_nationkey, c.c_custkey "
+    "from nation n anti join customer c on n.n_nationkey = c.c_nationkey;");
+}
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - basic right anti join 4",
+                 "[integration][gpu_execution][antijoin]")
+{
+  compare_gpu_vs_cpu(
+    "select c.c_custkey from nation n "
+    "anti join customer c on n.n_nationkey = c.c_nationkey;");
+}
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - basic right anti join 5",
+                 "[integration][gpu_execution][antijoin]")
+{
+  compare_gpu_vs_cpu(
+    "select c.c_name from nation n anti join customer c "
+    "on n.n_nationkey = c.c_nationkey;");
+}
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - basic right anti join misfit 0",
+                 "[integration][gpu_execution][antijoin]")
+{
+  compare_gpu_vs_cpu(
+    "select c.c_nationkey, c.c_custkey "
+    "from nation n anti join customer c on n.n_nationkey = c.c_custkey;");
+}
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - basic right anti join misfit 1",
+                 "[integration][gpu_execution][antijoin]")
+{
+  compare_gpu_vs_cpu(
+    "select c.c_custkey from nation n "
+    "anti join customer c on n.n_nationkey = c.c_custkey;");
+}
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - swapped right anti join 0",
+                 "[integration][gpu_execution][antijoin]")
+{
+  compare_gpu_vs_cpu(
+    "select n.n_nationkey, n.n_regionkey, n.n_name "
+    "from customer c anti join nation n on c.c_nationkey = n.n_nationkey;");
+}
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - swapped right anti join 1",
+                 "[integration][gpu_execution][antijoin]")
+{
+  compare_gpu_vs_cpu(
+    "select n.n_name from customer c "
+    "anti join nation n on c.c_nationkey = n.n_nationkey;");
+}
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - swapped right anti join misfit 0",
+                 "[integration][gpu_execution][antijoin]")
+{
+  compare_gpu_vs_cpu(
+    "select n.n_nationkey, n.n_regionkey, n.n_name "
+    "from customer c anti join nation n on c.c_custkey = n.n_nationkey;");
+}
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - swapped right anti join misfit 1",
+                 "[integration][gpu_execution][antijoin]")
+{
+  compare_gpu_vs_cpu(
+    "select n.n_name from customer c "
+    "anti join nation n on c.c_custkey = n.n_nationkey;");
+}
+
 TEST_CASE_METHOD(GPUExecutionFixture,
                  "gpu_execution - bigger inner join",
                  "[integration][gpu_execution][bigger_join]")
