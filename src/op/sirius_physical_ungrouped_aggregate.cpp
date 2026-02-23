@@ -530,8 +530,8 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::get_ne
   std::vector<::std::shared_ptr<::cucascade::data_batch>> input_batch;
   bool found_batch = true;
   while (found_batch) {
-    auto batch = ports.begin()->second->repo->pop_data_batch(
-      ::cucascade::batch_state::task_created);
+    auto batch =
+      ports.begin()->second->repo->pop_data_batch(::cucascade::batch_state::task_created);
     if (batch) {
       input_batch.push_back(std::move(batch));
     } else {
