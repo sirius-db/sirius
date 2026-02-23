@@ -185,7 +185,7 @@ void sirius_physical_left_delim_join::sink(const operator_data& input_data,
   // call distinct execute
   auto distinct_output = distinct->execute(input_data, stream);
   // call column data scan execute
-  auto column_data_scan_output = column_data_scan->execute(*distinct_output, stream);
+  auto column_data_scan_output = column_data_scan->execute(input_data, stream);
   // call partition distinct execute
   auto partition_distinct_output = partition_distinct->execute(*distinct_output, stream);
   // call partition join sink
