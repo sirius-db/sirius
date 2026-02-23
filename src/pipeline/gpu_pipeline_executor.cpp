@@ -107,11 +107,7 @@ void gpu_pipeline_executor::manager_loop()
       break;
     }
     auto bytes_needs = gpu_task->get_estimated_reservation_size();
-    std::cerr << "Task " << gpu_task->get_task_id() << ": requesting memory reservation of "
-              << bytes_needs << " bytes\n";
-    auto reservation = _memory_space->make_reservation_upto(bytes_needs);
-    std::cerr << "Task " << gpu_task->get_task_id() << ": acquired memory reservation of "
-              << bytes_needs << " bytes\n";
+    auto reservation = _memory_space->make_reservation(bytes_needs);
     if (!reservation) {
       SIRIUS_LOG_ERROR("GPU Pipeline Executor: Failed to acquire memory reservation for task {}",
                        gpu_task->get_task_id());
