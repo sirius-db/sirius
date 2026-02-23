@@ -486,100 +486,65 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
     left_col_views.reserve(left.num_columns());
     right_col_views.reserve(right.num_columns());
 
+    // Resolves one side of a join condition to a column index in col_views, evaluating or casting
+    // as needed. Returns the index to use as the cudf::ast::column_reference offset.
+    auto resolve_join_col = [&](const duckdb::Expression& expr,
+                                std::map<uint64_t, cudf::size_type>& expr_to_idx,
+                                const std::shared_ptr<cucascade::data_batch>& batch,
+                                const cudf::table_view& table,
+                                std::vector<cudf::column_view>& col_views,
+                                const char* side) -> cudf::size_type {
+      auto cond_hash = expr.Hash();
+      auto it        = expr_to_idx.find(cond_hash);
+      if (it != expr_to_idx.end()) { return it->second; }
+      cudf::size_type join_input_index = static_cast<cudf::size_type>(col_views.size());
+      expr_to_idx[cond_hash]           = join_input_index;
+      cudf::size_type source_idx       = 0;
+      if (!get_column_index(expr, source_idx)) {
+        duckdb::sirius::GpuExpressionExecutor executor(expr, mr);
+        auto expr_result_batch = executor.execute(batch, stream);
+        auto& expr_table =
+          expr_result_batch->get_data()->cast<cucascade::gpu_table_representation>().get_table();
+        auto expr_view = expr_table.view();
+        if (expr_view.num_columns() != 1) {
+          throw std::runtime_error(std::string("sirius_physical_nested_loop_join: expression on ") +
+                                   side + " should produce one column");
+        }
+        if (expr_view.num_rows() != table.num_rows()) {
+          throw std::runtime_error(
+            std::string(
+              "sirius_physical_nested_loop_join: expression result row count must match ") +
+            side + " table");
+        }
+        col_views.push_back(expr_view.column(0));
+        expression_res_scope_hodler.push_back(std::move(expr_result_batch));
+      } else {
+        auto target_type = duckdb::GetCudfType(expr.return_type);
+
+        // now lets see if we have to cast
+        if (table.column(source_idx).type() != target_type) {
+          if (expr.expression_class != duckdb::ExpressionClass::BOUND_CAST) {
+            // We might want to just change this to an ASSERT
+            throw std::runtime_error(
+              "sirius_physical_nested_loop_join: unexpected, column type does not match, yet "
+              "there "
+              "is no BOUND_CAST");
+          }
+          intermediates_scope_holder.push_back(
+            cudf::cast(table.column(source_idx), target_type, stream));
+          col_views.push_back(intermediates_scope_holder.back()->view());
+        } else {
+          col_views.push_back(table.column(source_idx));
+        }
+      }
+      return join_input_index;
+    };
+
     for (const auto& cond : conditions) {
-      cudf::size_type left_join_input_index, right_join_input_index;
-
-      auto left_cond_hash = cond.left->Hash();
-      auto it             = left_expressions_to_idx.find(left_cond_hash);
-      if (it == left_expressions_to_idx.end()) {
-        left_join_input_index                   = left_refs.size();
-        left_expressions_to_idx[left_cond_hash] = left_join_input_index;
-        cudf::size_type left_source_idx         = 0;
-        if (!get_column_index(*cond.left, left_source_idx)) {
-          duckdb::sirius::GpuExpressionExecutor executor(*cond.left, mr);
-          auto expr_result_batch = executor.execute(left_batch, stream);
-          auto& expr_table =
-            expr_result_batch->get_data()->cast<cucascade::gpu_table_representation>().get_table();
-          auto expr_view = expr_table.view();
-          if (expr_view.num_columns() != 1) {
-            throw std::runtime_error(
-              "sirius_physical_nested_loop_join: expression on left should produce one column");
-          }
-          if (expr_view.num_rows() != left.num_rows()) {
-            throw std::runtime_error(
-              "sirius_physical_nested_loop_join: expression result row count must match left "
-              "table");
-          }
-          left_col_views.push_back(expr_view.column(0));
-          expression_res_scope_hodler.push_back(std::move(expr_result_batch));
-        } else {
-          auto target_type = duckdb::GetCudfType(cond.left->return_type);
-
-          // now lets see if we have to cast
-          if (left.column(left_source_idx).type() != target_type) {
-            if (cond.left->expression_class != duckdb::ExpressionClass::BOUND_CAST) {
-              // We might want to just change this to an ASSERT
-              throw std::runtime_error(
-                "sirius_physical_nested_loop_join: unexpected, column type does not match, yet "
-                "there "
-                "is no BOUND_CAST");
-            }
-            intermediates_scope_holder.push_back(
-              cudf::cast(left.column(left_source_idx), target_type, stream));
-            left_col_views.push_back(intermediates_scope_holder.back()->view());
-          } else {
-            left_col_views.push_back(left.column(left_source_idx));
-          }
-        }
-      } else {
-        left_join_input_index = it->second;
-      }
-
-      auto right_cond_hash = cond.right->Hash();
-      it                   = right_expressions_to_idx.find(right_cond_hash);
-      if (it == right_expressions_to_idx.end()) {
-        right_join_input_index                    = right_refs.size();
-        right_expressions_to_idx[right_cond_hash] = right_join_input_index;
-        cudf::size_type right_source_idx          = 0;
-        if (!get_column_index(*cond.right, right_source_idx)) {
-          duckdb::sirius::GpuExpressionExecutor executor(*cond.right, mr);
-          auto expr_result_batch = executor.execute(right_batch, stream);
-          auto& expr_table =
-            expr_result_batch->get_data()->cast<cucascade::gpu_table_representation>().get_table();
-          auto expr_view = expr_table.view();
-          if (expr_view.num_columns() != 1) {
-            throw std::runtime_error(
-              "sirius_physical_nested_loop_join: expression on right should produce one column");
-          }
-          if (expr_view.num_rows() != right.num_rows()) {
-            throw std::runtime_error(
-              "sirius_physical_nested_loop_join: expression result row count must match right "
-              "table");
-          }
-          right_col_views.push_back(expr_view.column(0));
-          expression_res_scope_hodler.push_back(std::move(expr_result_batch));
-        } else {
-          auto target_type = duckdb::GetCudfType(cond.right->return_type);
-
-          // now lets see if we have to cast
-          if (right.column(right_source_idx).type() != target_type) {
-            if (cond.right->expression_class != duckdb::ExpressionClass::BOUND_CAST) {
-              // We might want to just change this to an ASSERT
-              throw std::runtime_error(
-                "sirius_physical_nested_loop_join: unexpected, column type does not match, yet "
-                "there "
-                "is no BOUND_CAST");
-            }
-            intermediates_scope_holder.push_back(
-              cudf::cast(right.column(right_source_idx), target_type, stream));
-            right_col_views.push_back(intermediates_scope_holder.back()->view());
-          } else {
-            right_col_views.push_back(right.column(right_source_idx));
-          }
-        }
-      } else {
-        right_join_input_index = it->second;
-      }
+      cudf::size_type left_join_input_index = resolve_join_col(
+        *cond.left, left_expressions_to_idx, left_batch, left, left_col_views, "left");
+      cudf::size_type right_join_input_index = resolve_join_col(
+        *cond.right, right_expressions_to_idx, right_batch, right, right_col_views, "right");
 
       left_refs.emplace_back(left_join_input_index, cudf::ast::table_reference::LEFT);
       right_refs.emplace_back(right_join_input_index, cudf::ast::table_reference::RIGHT);
