@@ -82,7 +82,7 @@ cd ../../
 To load the TPC-H dataset to duckdb:
 ```
 ./build/release/duckdb {DATABASE_NAME}.duckdb
-.read tpch_load.sql
+.read scripts/tpch_load.sql
 ```
 
 ### ClickBench Dataset
@@ -98,7 +98,7 @@ cd ..
 To load the dataset to duckdb:
 ```
 ./build/release/duckdb {DATABASE_NAME}.duckdb
-.read clickbench_load_duckdb.sql
+.read scripts/clickbench_load_duckdb.sql
 ```
 
 ## Running Sirius: CLI
