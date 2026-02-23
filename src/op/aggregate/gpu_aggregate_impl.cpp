@@ -18,6 +18,8 @@
 
 #include "data/data_batch_utils.hpp"
 
+#include <cudf/column/column_factories.hpp>
+
 namespace sirius {
 namespace op {
 
@@ -72,6 +74,16 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_ungrouped_aggre
             break;
           }
           default: break;
+          case cudf::type_id::DECIMAL64:
+            if (input_col.type().id() == cudf::type_id::DECIMAL64) {
+              output_type = cudf::data_type(cudf::type_id::DECIMAL128, output_type.scale());
+            }
+            break;
+          case cudf::type_id::DECIMAL32:
+            if (input_col.type().id() == cudf::type_id::DECIMAL32) {
+              output_type = cudf::data_type(cudf::type_id::DECIMAL64, output_type.scale());
+            }
+            break;
         }
         break;
       }
@@ -98,6 +110,7 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
   const std::vector<int>& group_idx,
   const std::vector<cudf::aggregation::Kind>& aggregates,
   const std::vector<int>& aggregate_idx,
+  const std::vector<std::vector<int>>& aggregate_struct_col_indices,
   rmm::cuda_stream_view stream,
   cucascade::memory::memory_space& memory_space)
 {
@@ -108,6 +121,8 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
       "`local_grouped_aggregate()`");
   }
 
+  const bool has_struct_col_indices = !aggregate_struct_col_indices.empty();
+
   // Create cudf groupby
   auto input_table = get_cudf_table_view(*input);
   std::vector<cudf::column_view> group_cols;
@@ -117,24 +132,61 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
   cudf::groupby::groupby grpby_obj(cudf::table_view(group_cols), cudf::null_policy::INCLUDE);
 
   // Make aggregation requests, group aggregations on the same column in the single request.
+  // For multi-column COLLECT_SET, a synthetic negative key -(i+1) is used so that each such
+  // aggregate gets its own request with a freshly synthesized struct column.
   std::unordered_map<int, std::vector<std::unique_ptr<cudf::groupby_aggregation>>> input_col_to_agg;
   std::unordered_map<int, std::vector<size_t>> input_col_to_output_idx;
   std::vector<int> input_col_order;
   for (size_t i = 0; i < aggregates.size(); ++i) {
     const auto& aggregate_kind = aggregates[i];
-    int aggregate_col_id       = aggregate_idx[i];
+    int aggregate_col_id;
+    if (has_struct_col_indices && !aggregate_struct_col_indices[i].empty()) {
+      // Multi-column COLLECT_SET: use a unique synthetic negative key for this slot.
+      aggregate_col_id = -(static_cast<int>(i) + 1);
+    } else {
+      aggregate_col_id = aggregate_idx[i];
+    }
     if (!input_col_to_agg.contains(aggregate_col_id)) {
       input_col_order.push_back(aggregate_col_id);
     }
-    auto groupby_aggregation = get_local_aggregation<cudf::groupby_aggregation>(aggregate_kind);
+    std::unique_ptr<cudf::groupby_aggregation> groupby_aggregation;
+    if (aggregate_kind == cudf::aggregation::Kind::COLLECT_SET) {
+      groupby_aggregation =
+        cudf::make_collect_set_aggregation<cudf::groupby_aggregation>(cudf::null_policy::EXCLUDE);
+    } else {
+      groupby_aggregation = get_local_aggregation<cudf::groupby_aggregation>(aggregate_kind);
+    }
     input_col_to_agg[aggregate_col_id].push_back(std::move(groupby_aggregation));
     input_col_to_output_idx[aggregate_col_id].push_back(i);
   }
 
+  // Temp struct columns for multi-col COLLECT_SET; must outlive the groupby call.
+  std::vector<std::unique_ptr<cudf::column>> temp_struct_cols;
+
   std::vector<cudf::groupby::aggregation_request> requests;
   for (int aggregate_col_id : input_col_order) {
     cudf::groupby::aggregation_request request;
-    request.values       = input_table.column(aggregate_col_id);
+    if (aggregate_col_id < 0) {
+      // Multi-col COLLECT_SET: synthesize a struct column from the component columns.
+      // The synthetic key is -(slot_index + 1), so slot_index = -aggregate_col_id - 1.
+      size_t slot_idx            = static_cast<size_t>(-aggregate_col_id - 1);
+      const auto& struct_indices = aggregate_struct_col_indices[slot_idx];
+      std::vector<std::unique_ptr<cudf::column>> struct_children;
+      for (int col_idx : struct_indices) {
+        struct_children.push_back(std::make_unique<cudf::column>(
+          input_table.column(col_idx), stream, memory_space.get_default_allocator()));
+      }
+      auto struct_col = cudf::make_structs_column(input_table.num_rows(),
+                                                  std::move(struct_children),
+                                                  0,
+                                                  rmm::device_buffer{},
+                                                  stream,
+                                                  memory_space.get_default_allocator());
+      request.values  = struct_col->view();
+      temp_struct_cols.push_back(std::move(struct_col));
+    } else {
+      request.values = input_table.column(aggregate_col_id);
+    }
     request.aggregations = std::move(input_col_to_agg[aggregate_col_id]);
     requests.push_back(std::move(request));
   }
@@ -147,8 +199,9 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
     int aggregate_col_id     = input_col_order[i];
     auto& aggregation_result = groupby_result.second[i];
 
-    // need to cast count aggregation result to int64
+    // need to cast count aggregation result to int64 (not applicable for COLLECT_SET)
     if (requests[i].aggregations.size() == 1 &&
+        requests[i].aggregations[0]->kind != cudf::aggregation::Kind::COLLECT_SET &&
         (requests[i].aggregations[0]->kind == cudf::aggregation::Kind::COUNT_VALID ||
          requests[i].aggregations[0]->kind == cudf::aggregation::Kind::COUNT_ALL)) {
       if (aggregation_result.results.size() != 1) {

@@ -32,6 +32,9 @@
 namespace sirius {
 namespace op {
 
+duckdb::idx_t sirius_physical_partition::s_partition_size =
+  sirius_physical_partition::DEFAULT_PARTITION_SIZE;
+
 sirius_physical_partition::sirius_physical_partition(duckdb::vector<duckdb::LogicalType> types,
                                                      duckdb::idx_t estimated_cardinality,
                                                      sirius_physical_operator* parent_op,
@@ -39,9 +42,10 @@ sirius_physical_partition::sirius_physical_partition(duckdb::vector<duckdb::Logi
   : sirius_physical_operator(
       SiriusPhysicalOperatorType::PARTITION, std::move(types), estimated_cardinality)
 {
-  _num_partitions = (estimated_cardinality + PARTITION_SIZE - 1) / PARTITION_SIZE;
-  _parent_op      = parent_op;
-  _is_build       = is_build;
+  _num_partitions =
+    static_cast<int>((estimated_cardinality + s_partition_size - 1) / s_partition_size);
+  _parent_op = parent_op;
+  _is_build  = is_build;
   get_partition_keys_and_type(parent_op, is_build);
 }
 
@@ -55,7 +59,9 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
                                                             bool is_build)
 {
   if (op->type == SiriusPhysicalOperatorType::HASH_JOIN) {
-    _partition_type    = PartitionType::HASH;
+    _partition_type = PartitionType::HASH;
+    _num_partitions =
+      static_cast<int>((op->estimated_cardinality + s_partition_size - 1) / s_partition_size);
     auto& hash_join_op = op->Cast<sirius_physical_hash_join>();
     if (is_build) {
       for (duckdb::idx_t cond_idx = 0; cond_idx < hash_join_op.conditions.size(); cond_idx++) {
@@ -74,7 +80,9 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
       }
     }
   } else if (op->type == SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
-    _partition_type      = PartitionType::NONE;
+    _partition_type = PartitionType::NONE;
+    _num_partitions =
+      static_cast<int>((op->estimated_cardinality + s_partition_size - 1) / s_partition_size);
     auto& nested_join_op = op->Cast<sirius_physical_nested_loop_join>();
     if (is_build) {
       for (duckdb::idx_t cond_idx = 0; cond_idx < nested_join_op.conditions.size(); cond_idx++) {
@@ -135,19 +143,9 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
     auto& parent_concat_op = op->Cast<sirius_physical_concat>();
     bool is_build          = parent_concat_op.is_build_concat();
     _is_build              = is_build;
-    if (parent_concat_op.get_parent_op()->type == SiriusPhysicalOperatorType::HASH_JOIN) {
-      auto& grandparent_join_op =
-        parent_concat_op.get_parent_op()->Cast<sirius_physical_hash_join>();
-      auto num_conditions = grandparent_join_op.conditions.size();
-      _num_partitions     = num_conditions;
-      get_partition_keys_and_type(&grandparent_join_op, is_build);
-    } else if (parent_concat_op.get_parent_op()->type ==
-               SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
-      auto& grandparent_join_op =
-        parent_concat_op.get_parent_op()->Cast<sirius_physical_nested_loop_join>();
-      auto num_conditions = grandparent_join_op.conditions.size();
-      _num_partitions     = num_conditions;
-      get_partition_keys_and_type(&grandparent_join_op, is_build);
+    if (parent_concat_op.get_parent_op()->type == SiriusPhysicalOperatorType::HASH_JOIN ||
+        parent_concat_op.get_parent_op()->type == SiriusPhysicalOperatorType::NESTED_LOOP_JOIN) {
+      get_partition_keys_and_type(parent_concat_op.get_parent_op(), is_build);
     } else {
       throw std::runtime_error("Unsupported operator following partition->concat: " +
                                parent_concat_op.get_parent_op()->get_name());

@@ -16,6 +16,9 @@
 
 #include "pipeline/gpu_pipeline_task.hpp"
 
+#include "cudf/cudf_utils.hpp"
+#include "log/logging.hpp"
+
 #include <cucascade/data/cpu_data_representation.hpp>
 #include <cucascade/data/data_repository.hpp>
 #include <cucascade/data/data_repository_manager.hpp>
@@ -69,7 +72,7 @@ std::optional<cucascade::data_batch_processing_handle> lock_or_prepare_batch(
             cancel_task_if_needed();
             return std::nullopt;
           }
-          batch->convert_to<cucascade::host_table_representation>(
+          batch->convert_to<cucascade::host_data_packed_representation>(
             registry, requested_memory_space, stream);
           batch->try_to_release_in_transit(std::optional<cucascade::batch_state>{prev_state});
           break;
@@ -90,6 +93,46 @@ std::optional<cucascade::data_batch_processing_handle> lock_or_prepare_batch(
   }
 
   return std::move(lock_result.handle);
+}
+
+void validate_operator_output_types(const op::operator_data* data,
+                                    const op::sirius_physical_operator& op)
+{
+  if (data == nullptr) { return; }
+  const auto& expected_types = op.get_types();
+  const auto& batches        = data->get_data_batches();
+  for (size_t batch_index = 0; batch_index < batches.size(); batch_index++) {
+    const auto& batch = batches[batch_index];
+    if (!batch) { continue; }
+    cudf::table_view tbl = get_cudf_table_view(*batch);
+    if (static_cast<size_t>(tbl.num_columns()) != expected_types.size()) {
+      SIRIUS_LOG_WARN(
+        "gpu_pipeline_task: operator '{}' (id={}) output batch {} column count mismatch: got "
+        "{}, expected {}",
+        op.get_name(),
+        op.get_operator_id(),
+        batch_index,
+        tbl.num_columns(),
+        expected_types.size());
+      return;
+    }
+    for (cudf::size_type c = 0; c < tbl.num_columns(); c++) {
+      cudf::data_type expected_cudf = duckdb::GetCudfType(expected_types[c]);
+      cudf::data_type actual        = tbl.column(c).type();
+      if (actual != expected_cudf) {
+        SIRIUS_LOG_WARN(
+          "gpu_pipeline_task: operator '{}' (id={}) output batch {} column {} datatype "
+          "mismatch: got {}, expected {}",
+          op.get_name(),
+          op.get_operator_id(),
+          batch_index,
+          c,
+          cudf::type_to_name(actual),
+          cudf::type_to_name(expected_cudf));
+        return;
+      }
+    }
+  }
 }
 
 }  // namespace
@@ -123,12 +166,27 @@ const sirius_pipeline* gpu_pipeline_task::get_pipeline() const
 
 std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_stream_view stream)
 {
-  auto& local_state               = _local_state->cast<gpu_pipeline_task_local_state>();
+  auto pipeline     = _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline();
+  auto& local_state = _local_state->cast<gpu_pipeline_task_local_state>();
   auto operator_input_output_data = std::move(local_state._input_data);
-
-  for (auto& op :
-       _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline()->get_operators()) {
+  for (auto& op : pipeline->get_operators()) {
+    SIRIUS_LOG_TRACE("Pipeline {}: operator {} (id={}) executing on {} batches",
+                     pipeline->get_pipeline_id(),
+                     op.get().get_name(),
+                     op.get().get_operator_id(),
+                     operator_input_output_data->get_data_batches().size());
+    auto start                 = std::chrono::high_resolution_clock::now();
     operator_input_output_data = op.get().execute(*operator_input_output_data, stream);
+    auto end                   = std::chrono::high_resolution_clock::now();
+    auto duration              = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    SIRIUS_LOG_TRACE(
+      "Pipeline {}: operator {} (id={}) produced {} batches, execution time: {:.2f} ms",
+      pipeline->get_pipeline_id(),
+      op.get().get_name(),
+      op.get().get_operator_id(),
+      operator_input_output_data ? operator_input_output_data->get_data_batches().size() : 0u,
+      duration.count() / 1000.0);
+    validate_operator_output_types(operator_input_output_data.get(), op.get());
   }
   return operator_input_output_data;
 }

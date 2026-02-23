@@ -214,8 +214,10 @@ TEMPLATE_TEST_CASE("sirius_physical_grouped_aggregate_merge end-to-end with AVG"
                    int64_t,
                    float,
                    double,
-                   int16_t,
-                   decimal64_tag)
+                   int16_t)
+//  decimal64_tag)  TODO: the unit test with decimal64_tag is failing with a cuda memory alignment
+//  error due to https://github.com/rapidsai/cudf/issues/21512
+
 {
   using Traits = gpu_type_traits<TestType>;
 

@@ -80,9 +80,6 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(const operato
 {
   const auto& input_batches = input_data.get_data_batches();
 
-  SIRIUS_LOG_DEBUG("Executing merge sort with {} input batches", input_batches.size());
-  auto start = std::chrono::high_resolution_clock::now();
-
   // Collect valid batches and find memory space
   std::vector<std::shared_ptr<cucascade::data_batch>> valid_batches;
   cucascade::memory::memory_space* space = nullptr;
@@ -141,12 +138,6 @@ std::unique_ptr<operator_data> sirius_physical_merge_sort::execute(const operato
 
   auto merged_batch = gpu_merge_impl::merge_order_by(
     valid_batches, order_key_idx, column_order, null_precedence, stream, *space);
-
-  auto end      = std::chrono::high_resolution_clock::now();
-  auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-  SIRIUS_LOG_DEBUG("Merge sort time: {:.2f} ms ({} batches merged)",
-                   duration.count() / 1000.0,
-                   valid_batches.size());
 
   std::vector<std::shared_ptr<cucascade::data_batch>> outputs;
   if (merged_batch) { outputs.push_back(apply_final_projection(std::move(merged_batch))); }

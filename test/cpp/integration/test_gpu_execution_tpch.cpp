@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include "op/sirius_physical_partition.hpp"
+
 #include <cudf/utilities/default_stream.hpp>
 
 #include <catch.hpp>
@@ -965,6 +967,27 @@ TEST_CASE_METHOD(GPUExecutionFixture,
     "from lineitem group by l_returnflag, l_linestatus;");
 }
 
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - group by min, max, avg on decimal on lineitem",
+                 "[integration][gpu_execution][group_by][avg]")
+{
+  compare_gpu_vs_cpu(
+    "select l_tax, min(l_extendedprice), max(l_extendedprice), avg(l_extendedprice)"
+    "from lineitem group by l_tax;",
+    0.0001);
+}
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - group by min, max, avg, sum on decimal on lineitem",
+                 "[integration][gpu_execution][group_by][avg]")
+{
+  compare_gpu_vs_cpu(
+    "select l_discount, min(l_extendedprice), sum(l_extendedprice), max(l_extendedprice), "
+    "avg(l_extendedprice), sum(l_tax)"
+    "from lineitem group by l_discount;",
+    0.0001);
+}
+
 //===----------------------------------------------------------------------===//
 // Order by tests
 //===----------------------------------------------------------------------===//
@@ -1167,6 +1190,120 @@ TEST_CASE_METHOD(GPUExecutionFixture,
 }
 
 //===----------------------------------------------------------------------===//
+// Count distinct tests
+//===----------------------------------------------------------------------===//
+
+// nation: 25 rows, n_regionkey in {0..4} with exactly 5 nations per region.
+// count(distinct n_nationkey) per region must equal 5.
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - count distinct: single group key",
+                 "[integration][gpu_execution][group_by][count_distinct]")
+{
+  compare_gpu_vs_cpu(
+    "select n_regionkey, count(distinct n_nationkey) from nation group by n_regionkey;");
+}
+
+// count(distinct n_name): n_name is unique per nation, so same result as above.
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - count distinct: string column",
+                 "[integration][gpu_execution][group_by][count_distinct]")
+{
+  compare_gpu_vs_cpu(
+    "select n_regionkey, count(distinct n_name) from nation group by n_regionkey;");
+}
+
+// count(distinct) mixed with other aggregations in the same grouped aggregate.
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - count distinct: mixed with min and count",
+                 "[integration][gpu_execution][group_by][count_distinct]")
+{
+  compare_gpu_vs_cpu(
+    "select n_regionkey, count(distinct n_nationkey), min(n_nationkey), count(*) "
+    "from nation group by n_regionkey;");
+}
+
+// Larger table: customer (15000 rows), two group-by keys.
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - count distinct: larger table two group keys",
+                 "[integration][gpu_execution][group_by][count_distinct]")
+{
+  compare_gpu_vs_cpu(
+    "select c_nationkey, count(distinct c_mktsegment) from customer group by c_nationkey;");
+}
+
+// ---------------------------------------------------------------------------
+// Multi-partition count distinct tests
+//
+// PARTITION_SIZE is temporarily lowered so the engine creates multiple
+// partitions even with the small TPC-H test tables.  A RAII guard restores
+// the original value after each test regardless of pass/fail.
+// ---------------------------------------------------------------------------
+
+struct PartitionSizeGuard {
+  explicit PartitionSizeGuard(duckdb::idx_t override_size)
+  {
+    sirius::op::sirius_physical_partition::set_partition_size(override_size);
+  }
+  ~PartitionSizeGuard() { sirius::op::sirius_physical_partition::reset_partition_size(); }
+};
+
+// nation (25 rows) with partition_size=5 → ceil(25/5) = 5 partitions.
+// count(distinct n_nationkey) per region must still equal 5.
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - count distinct: multi-partition forced, single group key",
+                 "[integration][gpu_execution][group_by][count_distinct][multi_partition]")
+{
+  PartitionSizeGuard guard(5);
+  compare_gpu_vs_cpu(
+    "select n_regionkey, count(distinct n_nationkey) from nation group by n_regionkey;");
+}
+
+// customer (15000 rows) with partition_size=1000 → 15 partitions.
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - count distinct: multi-partition forced, customer table",
+                 "[integration][gpu_execution][group_by][count_distinct][multi_partition]")
+{
+  PartitionSizeGuard guard(1000);
+  compare_gpu_vs_cpu(
+    "select c_nationkey, count(distinct c_mktsegment) from customer group by c_nationkey;");
+}
+
+// Mixed aggregations across multiple forced partitions.
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - count distinct: multi-partition forced, mixed aggregations",
+                 "[integration][gpu_execution][group_by][count_distinct][multi_partition]")
+{
+  PartitionSizeGuard guard(1000);
+  compare_gpu_vs_cpu(
+    "select c_nationkey, count(distinct c_mktsegment), min(c_custkey), count(*) "
+    "from customer group by c_nationkey;");
+}
+
+// ---------------------------------------------------------------------------
+// Multi-column COUNT(DISTINCT) integration tests
+// count(distinct (col1, col2)) counts distinct combinations, not individual values.
+// ---------------------------------------------------------------------------
+
+// nation: 25 rows, 5 unique (n_nationkey, n_name) combos per region.
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - count distinct: multi-column struct",
+                 "[integration][gpu_execution][group_by][count_distinct]")
+{
+  compare_gpu_vs_cpu(
+    "select n_regionkey, count(distinct (n_nationkey, n_name)) from nation group by n_regionkey;");
+}
+
+// Multi-column count distinct with a forced multi-partition execution.
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - count distinct: multi-column struct, multi-partition forced",
+                 "[integration][gpu_execution][group_by][count_distinct][multi_partition]")
+{
+  PartitionSizeGuard guard(5);
+  compare_gpu_vs_cpu(
+    "select n_regionkey, count(distinct (n_nationkey, n_name)) from nation group by n_regionkey;");
+}
+
+//===----------------------------------------------------------------------===//
 // Top N / Join tests (disabled)
 //===----------------------------------------------------------------------===//
 
@@ -1201,7 +1338,7 @@ TEST_CASE_METHOD(GPUExecutionFixture,
 
 TEST_CASE_METHOD(GPUExecutionFixture,
                  "gpu_execution - TPC-H Query 2",
-                 "[.][integration_disabled][gpu_execution][TPC-H][Q2]")
+                 "[integration][gpu_execution][TPC-H][Q2]")
 {
   compare_gpu_vs_cpu(
     "select s.s_acctbal, s.s_name, n.n_name, p.p_partkey, p.p_mfgr, "
@@ -1357,7 +1494,7 @@ TEST_CASE_METHOD(GPUExecutionFixture,
 
 TEST_CASE_METHOD(GPUExecutionFixture,
                  "gpu_execution - TPC-H Query 10",
-                 "[.][integration_disabled][gpu_execution][TPC-H][Q10]")
+                 "[integration][gpu_execution][TPC-H][Q10]")
 {
   compare_gpu_vs_cpu(
     "select c.c_custkey, c.c_name, "
@@ -1474,7 +1611,7 @@ TEST_CASE_METHOD(GPUExecutionFixture,
 
 TEST_CASE_METHOD(GPUExecutionFixture,
                  "gpu_execution - TPC-H Query 16",
-                 "[integration][gpu_execution][TPC-H][Q16]")
+                 "[.][integration_disabled][gpu_execution][TPC-H][Q16]")
 {
   compare_gpu_vs_cpu(
     "select p.p_brand, p.p_type, p.p_size, "
@@ -1494,7 +1631,7 @@ TEST_CASE_METHOD(GPUExecutionFixture,
 
 TEST_CASE_METHOD(GPUExecutionFixture,
                  "gpu_execution - TPC-H Query 17",
-                 "[.][integration_disabled][gpu_execution][TPC-H][Q17]")
+                 "[integration][gpu_execution][TPC-H][Q17]")
 {
   compare_gpu_vs_cpu(
     "select sum(l.l_extendedprice) / 7.0 as avg_yearly "
@@ -1564,7 +1701,7 @@ TEST_CASE_METHOD(GPUExecutionFixture,
 
 TEST_CASE_METHOD(GPUExecutionFixture,
                  "gpu_execution - TPC-H Query 20",
-                 "[.][integration_disabled][gpu_execution][TPC-H][Q20]")
+                 "[integration][gpu_execution][TPC-H][Q20]")
 {
   compare_gpu_vs_cpu(
     "select s.s_name, s.s_address "

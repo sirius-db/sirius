@@ -45,8 +45,6 @@ std::unique_ptr<operator_data> sirius_physical_projection::execute(const operato
                                                                    rmm::cuda_stream_view stream)
 {
   const auto& input_batches = input_data.get_data_batches();
-  SIRIUS_LOG_DEBUG("Executing projection");
-  auto start = std::chrono::high_resolution_clock::now();
 
   duckdb::sirius::GpuExpressionExecutor gpu_expression_executor(select_list);
 
@@ -58,11 +56,6 @@ std::unique_ptr<operator_data> sirius_physical_projection::execute(const operato
     auto projected_batch = gpu_expression_executor.execute(batch, stream);
     if (projected_batch) { output_batches.push_back(std::move(projected_batch)); }
   }
-
-  auto end      = std::chrono::high_resolution_clock::now();
-  auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-  SIRIUS_LOG_DEBUG("Projection time: {:.2f} ms", duration.count() / 1000.0);
-
   return std::make_unique<operator_data>(output_batches);
 }
 
