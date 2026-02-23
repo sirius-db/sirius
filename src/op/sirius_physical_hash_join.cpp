@@ -416,7 +416,8 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
 
   if (join_type == duckdb::JoinType::INNER || join_type == duckdb::JoinType::LEFT ||
       join_type == duckdb::JoinType::RIGHT || join_type == duckdb::JoinType::OUTER ||
-      join_type == duckdb::JoinType::SEMI || join_type == duckdb::JoinType::RIGHT_SEMI) {
+      join_type == duckdb::JoinType::SEMI || join_type == duckdb::JoinType::RIGHT_SEMI ||
+      join_type == duckdb::JoinType::ANTI || join_type == duckdb::JoinType::RIGHT_ANTI) {
     auto keys                   = prepare_join_keys(input_batches,
                                   left_key_col_indices,
                                   right_key_col_indices,
@@ -455,15 +456,20 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
       auto filtered_join_object = cudf::filtered_join(
         right_keys, cudf::null_equality::UNEQUAL, cudf::set_as_build_table::RIGHT, stream);
       left_indices = filtered_join_object.anti_join(left_keys, stream);
+    } else if (join_type == duckdb::JoinType::RIGHT_ANTI) {
+      auto filtered_join_object = cudf::filtered_join(
+        left_keys, cudf::null_equality::UNEQUAL, cudf::set_as_build_table::RIGHT, stream);
+      right_indices = filtered_join_object.anti_join(right_keys, stream);
     } else if (join_type == duckdb::JoinType::OUTER) {
       auto join_result =
         cudf::full_join(left_keys, right_keys, cudf::null_equality::UNEQUAL, stream);
       left_indices  = std::move(join_result.first);
       right_indices = std::move(join_result.second);
     }
-    if (join_type == duckdb::JoinType::SEMI) {
+    if (join_type == duckdb::JoinType::SEMI || join_type == duckdb::JoinType::ANTI) {
       collect_right = false;
-    } else if (join_type == duckdb::JoinType::RIGHT_SEMI) {
+    } else if (join_type == duckdb::JoinType::RIGHT_SEMI ||
+               join_type == duckdb::JoinType::RIGHT_ANTI) {
       collect_left = false;
     }
 
