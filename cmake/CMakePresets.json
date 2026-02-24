@@ -33,6 +33,9 @@
   "configurePresets": [
     {
       "cacheVariables": {
+        "CMAKE_CUDA_COMPILER_LAUNCHER": "sccache",
+        "CMAKE_CXX_COMPILER_LAUNCHER": "sccache",
+        "CMAKE_C_COMPILER_LAUNCHER": "sccache",
         "DUCKDB_EXTENSION_CONFIGS": "${sourceDir}/../extension_config.cmake"
       },
       "generator": "Ninja",
@@ -41,6 +44,7 @@
     },
     {
       "cacheVariables": {
+        "CMAKE_CUDA_HOST_COMPILER": "$env{CONDA_PREFIX}/bin/clang++",
         "CMAKE_CXX_COMPILER": "$env{CONDA_PREFIX}/bin/clang++",
         "CMAKE_CXX_SCAN_FOR_MODULES": "OFF",
         "CMAKE_C_COMPILER": "$env{CONDA_PREFIX}/bin/clang"

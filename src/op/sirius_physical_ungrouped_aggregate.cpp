@@ -395,6 +395,17 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
           bool is_decimal = (col.type().id() == cudf::type_id::DECIMAL32 ||
                              col.type().id() == cudf::type_id::DECIMAL64 ||
                              col.type().id() == cudf::type_id::DECIMAL128);
+          std::unique_ptr<cudf::column> casted_col;
+          if (col.type().id() == cudf::type_id::DECIMAL32) {
+            casted_col = cudf::cast(
+              col, cudf::data_type(cudf::type_id::DECIMAL64, col.type().scale()), stream);
+            col = casted_col->view();
+          }
+          if (col.type().id() == cudf::type_id::DECIMAL64) {
+            casted_col = cudf::cast(
+              col, cudf::data_type(cudf::type_id::DECIMAL128, col.type().scale()), stream);
+            col = casted_col->view();
+          }
           if (spec.kind == aggregate_kind::AVG || is_decimal) { out_type = col.type(); }
           auto scalar = cudf::reduce(col, *agg_op, out_type, std::nullopt, stream);
           cols.push_back(cudf::make_column_from_scalar(*scalar, 1, stream));
@@ -520,6 +531,25 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::execut
 
   return std::make_unique<operator_data>(
     std::vector<std::shared_ptr<cucascade::data_batch>>{std::move(output_batch)});
+}
+
+std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::get_next_task_input_data()
+{
+  // we need to lock, then pull all the batches from one partition and return them, and increment
+  // the partition index
+  std::lock_guard<std::mutex> lg(lock);
+  std::vector<::std::shared_ptr<::cucascade::data_batch>> input_batch;
+  bool found_batch = true;
+  while (found_batch) {
+    auto batch =
+      ports.begin()->second->repo->pop_data_batch(::cucascade::batch_state::task_created);
+    if (batch) {
+      input_batch.push_back(std::move(batch));
+    } else {
+      found_batch = false;
+    }
+  }
+  return std::make_unique<operator_data>(input_batch);
 }
 
 }  // namespace op

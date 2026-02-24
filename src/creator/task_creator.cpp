@@ -19,6 +19,7 @@
 #include "log/logging.hpp"
 #include "op/scan/duckdb_scan_task.hpp"
 #include "op/scan/parquet_scan_task.hpp"
+#include "op/sirius_physical_delim_join.hpp"
 #include "op/sirius_physical_duckdb_scan.hpp"
 #include "op/sirius_physical_parquet_scan.hpp"
 #include "op/sirius_physical_top_n.hpp"
@@ -124,6 +125,16 @@ op::sirius_physical_operator* task_creator::get_operator_for_next_task(
   op::sirius_physical_operator* node)
 {
   if (node == nullptr) { return nullptr; }
+
+  if (node->type == ::sirius::op::SiriusPhysicalOperatorType::PARQUET_SCAN) {
+    size_t operator_id             = node->get_operator_id();
+    auto parquet_task_global_state = _parquet_scan_operator_global_state_map.at(operator_id);
+    if (parquet_task_global_state->has_more_partitions()) {
+      return node;
+    } else {
+      return nullptr;
+    }
+  }
   auto hint = node->get_next_task_hint();
 
   if (hint.has_value() && hint.value().hint == op::TaskCreationHint::READY) {
@@ -135,7 +146,14 @@ op::sirius_physical_operator* task_creator::get_operator_for_next_task(
     return hint.value().producer;
   } else if (hint.has_value() &&
              hint.value().hint == op::TaskCreationHint::WAITING_FOR_INPUT_DATA) {
-    return get_operator_for_next_task(hint.value().producer);
+    auto* producer = hint.value().producer;
+    // DuckDB scan tasks create their own continuations internally, so the
+    // task creator should never schedule additional scans from downstream.
+    // (Parquet scans are fine — they use partition indices that self-limit.)
+    if (producer != nullptr && producer->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
+      return nullptr;
+    }
+    return get_operator_for_next_task(producer);
   }
   return nullptr;
 }
@@ -201,11 +219,35 @@ void task_creator::manager_loop()
         // Get what we need to create the task
         auto pipeline = node->get_pipeline();
         std::vector<cucascade::shared_data_repository*> destination_data_repositories;
-        auto next_port_after_sink = pipeline->get_sink()->get_next_port_after_sink();
-        for (auto& [next_op, port_id] : next_port_after_sink) {
-          destination_data_repositories.push_back(next_op->get_port(port_id)->repo);
+        // special handling for delim joins
+        if (pipeline->get_sink()->type ==
+            ::sirius::op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN) {
+          auto& delim_join    = pipeline->get_sink()->Cast<op::sirius_physical_right_delim_join>();
+          auto partition_join = delim_join.partition_join;
+          auto partition_distinct = delim_join.partition_distinct;
+          for (auto& [next_op, port_id] : partition_join->get_next_port_after_sink()) {
+            destination_data_repositories.push_back(next_op->get_port(port_id)->repo);
+          }
+          for (auto& [next_op, port_id] : partition_distinct->get_next_port_after_sink()) {
+            destination_data_repositories.push_back(next_op->get_port(port_id)->repo);
+          }
+        } else if (pipeline->get_sink()->type ==
+                   ::sirius::op::SiriusPhysicalOperatorType::LEFT_DELIM_JOIN) {
+          auto& delim_join = pipeline->get_sink()->Cast<op::sirius_physical_left_delim_join>();
+          auto partition_distinct = delim_join.partition_distinct;
+          auto column_data_scan   = delim_join.column_data_scan;
+          for (auto& [next_op, port_id] : column_data_scan->get_next_port_after_sink()) {
+            destination_data_repositories.push_back(next_op->get_port(port_id)->repo);
+          }
+          for (auto& [next_op, port_id] : partition_distinct->get_next_port_after_sink()) {
+            destination_data_repositories.push_back(next_op->get_port(port_id)->repo);
+          }
+        } else {
+          auto next_port_after_sink = pipeline->get_sink()->get_next_port_after_sink();
+          for (auto& [next_op, port_id] : next_port_after_sink) {
+            destination_data_repositories.push_back(next_op->get_port(port_id)->repo);
+          }
         }
-
         // scheduling scan task
         if (node->type == ::sirius::op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
           // Check to see if you need to create a new global s for this scan operator

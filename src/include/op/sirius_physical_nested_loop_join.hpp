@@ -58,6 +58,15 @@ class sirius_physical_nested_loop_join : public sirius_physical_partition_consum
                                    duckdb::JoinType join_type,
                                    duckdb::idx_t estimated_cardinality);
 
+  sirius_physical_nested_loop_join(duckdb::LogicalOperator& op,
+                                   duckdb::unique_ptr<sirius_physical_operator> left,
+                                   duckdb::unique_ptr<sirius_physical_operator> right,
+                                   duckdb::vector<duckdb::JoinCondition> cond,
+                                   duckdb::JoinType join_type,
+                                   duckdb::idx_t estimated_cardinality,
+                                   duckdb::vector<duckdb::idx_t> left_projection_map,
+                                   duckdb::vector<duckdb::idx_t> right_projection_map);
+
   duckdb::vector<duckdb::JoinCondition> conditions;
   //! The types of the join keys
   duckdb::vector<duckdb::LogicalType> condition_types;
@@ -73,6 +82,11 @@ class sirius_physical_nested_loop_join : public sirius_physical_partition_consum
   duckdb::vector<duckdb::idx_t> rhs_output_columns;
   //! The types of the output
   duckdb::vector<duckdb::LogicalType> rhs_output_types;
+
+  //! Output column order: indices into left table columns (empty = identity 0,1,...,left_cols-1)
+  duckdb::vector<duckdb::idx_t> left_output_col_idxs;
+  //! Output column order: indices into right table columns (empty = identity 0,1,...,right_cols-1)
+  duckdb::vector<duckdb::idx_t> right_output_col_idxs;
 
   //! Duplicate eliminated types; only used for delim_joins (i.e. correlated subqueries)
   duckdb::vector<duckdb::LogicalType> delim_types;
@@ -103,6 +117,18 @@ class sirius_physical_nested_loop_join : public sirius_physical_partition_consum
  public:
   //! Returns a list of the types of the join conditions
   duckdb::vector<duckdb::LogicalType> get_join_types() const;
+
+  std::unique_ptr<operator_data> get_next_task_input_data() override;
+
+  std::unique_ptr<operator_data> execute(const operator_data& input_data,
+                                         rmm::cuda_stream_view stream) override;
+
+ protected:
+  std::mutex batches_to_processed_mutex;
+  std::size_t current_partition_index = 0;
+  std::size_t num_batches_to_process  = 0;
+  std::vector<std::vector<uint64_t>> left_batch_ids;
+  std::vector<std::vector<uint64_t>> right_batch_ids;
 };
 
 }  // namespace op
