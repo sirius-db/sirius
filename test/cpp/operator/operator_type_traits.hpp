@@ -30,7 +30,8 @@ struct gpu_type_traits;
 
 template <>
 struct gpu_type_traits<int32_t> {
-  using type = int32_t;
+  using type            = int32_t;
+  using agg_output_type = type;
   static duckdb::LogicalType logical_type()
   {
     return duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER);
@@ -45,7 +46,8 @@ struct gpu_type_traits<int32_t> {
 
 template <>
 struct gpu_type_traits<int64_t> {
-  using type = int64_t;
+  using type            = int64_t;
+  using agg_output_type = type;
   static duckdb::LogicalType logical_type()
   {
     return duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT);
@@ -60,7 +62,8 @@ struct gpu_type_traits<int64_t> {
 
 template <>
 struct gpu_type_traits<float> {
-  using type = float;
+  using type            = float;
+  using agg_output_type = type;
   static duckdb::LogicalType logical_type()
   {
     return duckdb::LogicalType(duckdb::LogicalTypeId::FLOAT);
@@ -75,7 +78,8 @@ struct gpu_type_traits<float> {
 
 template <>
 struct gpu_type_traits<double> {
-  using type = double;
+  using type            = double;
+  using agg_output_type = type;
   static duckdb::LogicalType logical_type()
   {
     return duckdb::LogicalType(duckdb::LogicalTypeId::DOUBLE);
@@ -90,7 +94,8 @@ struct gpu_type_traits<double> {
 
 template <>
 struct gpu_type_traits<int16_t> {
-  using type = int16_t;
+  using type            = int16_t;
+  using agg_output_type = type;
   static duckdb::LogicalType logical_type()
   {
     return duckdb::LogicalType(duckdb::LogicalTypeId::SMALLINT);
@@ -105,7 +110,8 @@ struct gpu_type_traits<int16_t> {
 
 template <>
 struct gpu_type_traits<bool> {
-  using type = bool;
+  using type            = bool;
+  using agg_output_type = type;
   static duckdb::LogicalType logical_type()
   {
     return duckdb::LogicalType(duckdb::LogicalTypeId::BOOLEAN);
@@ -121,7 +127,8 @@ struct gpu_type_traits<bool> {
 struct decimal64_tag {};
 template <>
 struct gpu_type_traits<decimal64_tag> {
-  using type = int64_t;  // underlying storage
+  using type            = int64_t;     // underlying storage
+  using agg_output_type = __int128_t;  // SUM/MIN/MAX upcast to DECIMAL128
   static duckdb::LogicalType logical_type() { return duckdb::LogicalType::DECIMAL(18, 2); }
   static constexpr cudf::type_id cudf_type = cudf::type_id::DECIMAL64;
   static constexpr int32_t scale           = -2;
@@ -135,7 +142,8 @@ struct gpu_type_traits<decimal64_tag> {
 struct string_tag {};
 template <>
 struct gpu_type_traits<string_tag> {
-  using type = std::string;
+  using type            = std::string;
+  using agg_output_type = type;
   static duckdb::LogicalType logical_type()
   {
     return duckdb::LogicalType(duckdb::LogicalTypeId::VARCHAR);
@@ -151,7 +159,8 @@ struct gpu_type_traits<string_tag> {
 struct timestamp_us_tag {};
 template <>
 struct gpu_type_traits<timestamp_us_tag> {
-  using type = int64_t;  // microseconds since epoch
+  using type            = int64_t;  // microseconds since epoch
+  using agg_output_type = type;
   static duckdb::LogicalType logical_type()
   {
     return duckdb::LogicalType(duckdb::LogicalTypeId::TIMESTAMP);
@@ -167,7 +176,8 @@ struct gpu_type_traits<timestamp_us_tag> {
 struct date32_tag {};
 template <>
 struct gpu_type_traits<date32_tag> {
-  using type = int32_t;  // days since epoch
+  using type            = int32_t;  // days since epoch
+  using agg_output_type = type;
   static duckdb::LogicalType logical_type()
   {
     return duckdb::LogicalType(duckdb::LogicalTypeId::DATE);

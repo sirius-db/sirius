@@ -395,6 +395,17 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
           bool is_decimal = (col.type().id() == cudf::type_id::DECIMAL32 ||
                              col.type().id() == cudf::type_id::DECIMAL64 ||
                              col.type().id() == cudf::type_id::DECIMAL128);
+          std::unique_ptr<cudf::column> casted_col;
+          if (col.type().id() == cudf::type_id::DECIMAL32) {
+            casted_col = cudf::cast(
+              col, cudf::data_type(cudf::type_id::DECIMAL64, col.type().scale()), stream);
+            col = casted_col->view();
+          }
+          if (col.type().id() == cudf::type_id::DECIMAL64) {
+            casted_col = cudf::cast(
+              col, cudf::data_type(cudf::type_id::DECIMAL128, col.type().scale()), stream);
+            col = casted_col->view();
+          }
           if (spec.kind == aggregate_kind::AVG || is_decimal) { out_type = col.type(); }
           auto scalar = cudf::reduce(col, *agg_op, out_type, std::nullopt, stream);
           cols.push_back(cudf::make_column_from_scalar(*scalar, 1, stream));

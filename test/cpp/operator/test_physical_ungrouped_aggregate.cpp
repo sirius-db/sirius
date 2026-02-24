@@ -23,6 +23,7 @@
 #include <op/sirius_physical_ungrouped_aggregate.hpp>
 #include <op/sirius_physical_ungrouped_aggregate_merge.hpp>
 
+#include <cstdint>
 #include <iterator>
 
 using namespace duckdb;
@@ -30,6 +31,18 @@ using namespace sirius::op;
 using namespace cucascade;
 using namespace cucascade::memory;
 using namespace sirius::test::operator_utils;
+
+namespace {
+inline uint64_t int128_low64(__int128_t value)
+{
+  return static_cast<uint64_t>(static_cast<unsigned __int128>(value));
+}
+
+inline int64_t int128_high64(__int128_t value)
+{
+  return static_cast<int64_t>(static_cast<unsigned __int128>(value) >> 64);
+}
+}  // namespace
 
 // Helper to create a dummy AggregateFunction since we only need the name and types for the GPU
 // operator
@@ -190,27 +203,38 @@ TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate computes SUM/MIN/MAX/COU
   REQUIRE(view.num_rows() == 1);
 
   // Verify
-  auto sum_out        = copy_column_to_host<typename Traits::type>(view.column(0));
-  auto min_out        = copy_column_to_host<typename Traits::type>(view.column(1));
-  auto max_out        = copy_column_to_host<typename Traits::type>(view.column(2));
+  auto sum_out        = copy_column_to_host<typename Traits::agg_output_type>(view.column(0));
+  auto min_out        = copy_column_to_host<typename Traits::agg_output_type>(view.column(1));
+  auto max_out        = copy_column_to_host<typename Traits::agg_output_type>(view.column(2));
   auto count_out      = copy_column_to_host<int64_t>(view.column(3));
   auto count_star_out = copy_column_to_host<int64_t>(view.column(4));
 
-  typename Traits::type expected_sum = 0;
-  typename Traits::type expected_min = vals[0];
-  typename Traits::type expected_max = vals[0];
+  // Compute expected values in agg_output_type (upcasted for decimals: DECIMAL64 -> DECIMAL128)
+  typename Traits::agg_output_type expected_sum = 0;
+  typename Traits::agg_output_type expected_min =
+    static_cast<typename Traits::agg_output_type>(vals[0]);
+  typename Traits::agg_output_type expected_max =
+    static_cast<typename Traits::agg_output_type>(vals[0]);
 
   for (auto v : vals) {
-    expected_sum += v;
-    if (v < expected_min) expected_min = v;
-    if (v > expected_max) expected_max = v;
+    auto v_upcast = static_cast<typename Traits::agg_output_type>(v);
+    expected_sum += v_upcast;
+    if (v_upcast < expected_min) expected_min = v_upcast;
+    if (v_upcast > expected_max) expected_max = v_upcast;
   }
 
   // Approximate check for floats
   if constexpr (std::is_floating_point_v<typename Traits::type>) {
-    REQUIRE(sum_out[0] == Approx(expected_sum));
-    REQUIRE(min_out[0] == Approx(expected_min));
-    REQUIRE(max_out[0] == Approx(expected_max));
+    REQUIRE(sum_out[0] == Approx(static_cast<typename Traits::type>(expected_sum)));
+    REQUIRE(min_out[0] == Approx(static_cast<typename Traits::type>(expected_min)));
+    REQUIRE(max_out[0] == Approx(static_cast<typename Traits::type>(expected_max)));
+  } else if constexpr (std::is_same_v<typename Traits::agg_output_type, __int128_t>) {
+    REQUIRE(int128_high64(sum_out[0]) == int128_high64(expected_sum));
+    REQUIRE(int128_low64(sum_out[0]) == int128_low64(expected_sum));
+    REQUIRE(int128_high64(min_out[0]) == int128_high64(expected_min));
+    REQUIRE(int128_low64(min_out[0]) == int128_low64(expected_min));
+    REQUIRE(int128_high64(max_out[0]) == int128_high64(expected_max));
+    REQUIRE(int128_low64(max_out[0]) == int128_low64(expected_max));
   } else {
     REQUIRE(sum_out[0] == expected_sum);
     REQUIRE(min_out[0] == expected_min);
