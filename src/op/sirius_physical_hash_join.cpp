@@ -406,6 +406,55 @@ static join_keys_result prepare_join_keys(
   return result;
 }
 
+/// Build the MARK join output from the semi_join matching row indices.
+/// Copies all left output columns (all rows pass through, no gather), then creates a BOOL8 mark
+/// column initialized to false and scatters true at every position in semi_indices.
+static std::unique_ptr<operator_data> resolve_mark_join_result(
+  rmm::device_uvector<cudf::size_type> const& semi_indices,
+  cudf::table_view const& left_full,
+  std::vector<cudf::size_type> const& lhs_output_col_idxs,
+  std::shared_ptr<::cucascade::data_batch> const& left_batch,
+  rmm::cuda_stream_view stream)
+{
+  cudf::table_view left_cols_to_output = left_full.select(lhs_output_col_idxs);
+  auto num_left_rows                   = left_cols_to_output.num_rows();
+
+  std::vector<std::unique_ptr<cudf::column>> mark_out_cols;
+  for (cudf::size_type i = 0; i < left_cols_to_output.num_columns(); i++) {
+    mark_out_cols.push_back(std::make_unique<cudf::column>(left_cols_to_output.column(i), stream));
+  }
+
+  // Create BOOL8 mark column: start all-false, scatter true at matching positions
+  cudf::numeric_scalar<bool> false_scalar(false, true, stream);
+  auto mark_column = cudf::make_column_from_scalar(false_scalar, num_left_rows, stream);
+
+  if (semi_indices.size() > 0) {
+    cudf::numeric_scalar<bool> true_scalar(true, true, stream);
+    cudf::column_view scatter_map(cudf::data_type(cudf::type_id::INT32),
+                                  static_cast<cudf::size_type>(semi_indices.size()),
+                                  semi_indices.data(),
+                                  nullptr,
+                                  0,
+                                  0,
+                                  {});
+    // The scatter API is a bit confusing when it says: the number of elements in first arg i.e.
+    // the vector should have same number of columns in the target table. It is essentially a
+    // row-scatter operation. For our use case, we have only column i.e. target mark column;
+    // therefore we are good. The scalar is broadcasted to respective positions provided by the
+    // scatter map.
+    auto scattered = cudf::scatter({std::ref(static_cast<cudf::scalar const&>(true_scalar))},
+                                   scatter_map,
+                                   cudf::table_view({mark_column->view()}),
+                                   stream);
+    mark_column    = std::move(scattered->release()[0]);
+  }
+
+  mark_out_cols.push_back(std::move(mark_column));
+  auto output_cudf_table = std::make_unique<cudf::table>(std::move(mark_out_cols), stream);
+  return std::make_unique<operator_data>(std::vector<std::shared_ptr<::cucascade::data_batch>>{
+    make_data_batch(std::move(output_cudf_table), *left_batch->get_memory_space())});
+}
+
 std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator_data& input_data,
                                                                   rmm::cuda_stream_view stream)
 {
@@ -420,10 +469,16 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
       duckdb::JoinTypeToString(join_type));
   }
 
+  // Full input table views used as both gather sources and (for mixed joins) conditional views.
+  // Hoisted here so both join paths and the shared gather tail can reference them.
+  cudf::table_view left_full  = get_cudf_table_view(*input_batches[0]);
+  cudf::table_view right_full = get_cudf_table_view(*input_batches[1]);
+
+  std::unique_ptr<rmm::device_uvector<cudf::size_type>> left_indices, right_indices;
+
   if (is_mixed_join) {
     // Mixed join: equality conditions drive the hash table; inequality conditions are evaluated
     // via a cuDF AST binary predicate on the full input tables.
-
     auto keys                 = prepare_join_keys(input_batches,
                                   left_key_col_indices,
                                   right_key_col_indices,
@@ -432,11 +487,6 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                                   stream);
     cudf::table_view left_eq  = keys.left_keys;
     cudf::table_view right_eq = keys.right_keys;
-
-    // Pass the full tables as conditional views so that AST column_reference indices, which are
-    // relative to the original input tables, resolve correctly without any remapping.
-    cudf::table_view left_full  = get_cudf_table_view(*input_batches[0]);
-    cudf::table_view right_full = get_cudf_table_view(*input_batches[1]);
 
     sirius::gpu_expression_translator translator(stream, cudf::get_current_device_resource_ref());
     auto pred =
@@ -447,12 +497,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
         "cuDF AST predicate");
     }
 
-    std::unique_ptr<rmm::device_uvector<cudf::size_type>> left_indices, right_indices;
-    bool collect_left  = true;
-    bool collect_right = true;
-
     if (join_type == duckdb::JoinType::MARK) {
-      // MARK mixed join: find matching left rows via semi join, then build the mark column.
       auto semi_indices = cudf::mixed_left_semi_join(left_eq,
                                                      right_eq,
                                                      left_full,
@@ -460,39 +505,8 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                                                      pred->back(),
                                                      cudf::null_equality::UNEQUAL,
                                                      stream);
-
-      cudf::table_view left_cols_to_output = left_full.select(lhs_output_columns.col_idxs);
-      auto num_left_rows                   = left_cols_to_output.num_rows();
-
-      std::vector<std::unique_ptr<cudf::column>> mark_out_cols;
-      for (cudf::size_type i = 0; i < left_cols_to_output.num_columns(); i++) {
-        mark_out_cols.push_back(
-          std::make_unique<cudf::column>(left_cols_to_output.column(i), stream));
-      }
-
-      cudf::numeric_scalar<bool> false_scalar(false, true, stream);
-      auto mark_column = cudf::make_column_from_scalar(false_scalar, num_left_rows, stream);
-
-      if (semi_indices->size() > 0) {
-        cudf::numeric_scalar<bool> true_scalar(true, true, stream);
-        cudf::column_view scatter_map(cudf::data_type(cudf::type_id::INT32),
-                                      static_cast<cudf::size_type>(semi_indices->size()),
-                                      semi_indices->data(),
-                                      nullptr,
-                                      0,
-                                      0,
-                                      {});
-        auto scattered = cudf::scatter({std::ref(static_cast<cudf::scalar const&>(true_scalar))},
-                                       scatter_map,
-                                       cudf::table_view({mark_column->view()}),
-                                       stream);
-        mark_column    = std::move(scattered->release()[0]);
-      }
-
-      mark_out_cols.push_back(std::move(mark_column));
-      auto output_cudf_table = std::make_unique<cudf::table>(std::move(mark_out_cols), stream);
-      return std::make_unique<operator_data>(std::vector<std::shared_ptr<::cucascade::data_batch>>{
-        make_data_batch(std::move(output_cudf_table), *input_batches[0]->get_memory_space())});
+      return resolve_mark_join_result(
+        *semi_indices, left_full, lhs_output_columns.col_idxs, input_batches[0], stream);
     } else if (join_type == duckdb::JoinType::INNER) {
       auto result   = cudf::mixed_inner_join(left_eq,
                                            right_eq,
@@ -547,23 +561,21 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
       left_indices  = std::move(result.first);
       right_indices = std::move(result.second);
     } else if (join_type == duckdb::JoinType::SEMI) {
-      left_indices  = cudf::mixed_left_semi_join(left_eq,
+      left_indices = cudf::mixed_left_semi_join(left_eq,
                                                 right_eq,
                                                 left_full,
                                                 right_full,
                                                 pred->back(),
                                                 cudf::null_equality::UNEQUAL,
                                                 stream);
-      collect_right = false;
     } else if (join_type == duckdb::JoinType::ANTI) {
-      left_indices  = cudf::mixed_left_anti_join(left_eq,
+      left_indices = cudf::mixed_left_anti_join(left_eq,
                                                 right_eq,
                                                 left_full,
                                                 right_full,
                                                 pred->back(),
                                                 cudf::null_equality::UNEQUAL,
                                                 stream);
-      collect_right = false;
     } else if (join_type == duckdb::JoinType::RIGHT_SEMI) {
       auto swapped_pred = translator.translate_join_conditions(
         conditions, num_equality_conditions, conditions.size(), /*swap_sides=*/true);
@@ -579,7 +591,6 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                                                  swapped_pred->back(),
                                                  cudf::null_equality::UNEQUAL,
                                                  stream);
-      collect_left  = false;
     } else if (join_type == duckdb::JoinType::RIGHT_ANTI) {
       auto swapped_pred = translator.translate_join_conditions(
         conditions, num_equality_conditions, conditions.size(), /*swap_sides=*/true);
@@ -595,62 +606,11 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                                                  swapped_pred->back(),
                                                  cudf::null_equality::UNEQUAL,
                                                  stream);
-      collect_left  = false;
     } else {
       throw std::runtime_error("Unsupported join type for mixed join: " +
                                duckdb::JoinTypeToString(join_type));
     }
-
-    cudf::out_of_bounds_policy left_oob  = cudf::out_of_bounds_policy::DONT_CHECK;
-    cudf::out_of_bounds_policy right_oob = cudf::out_of_bounds_policy::DONT_CHECK;
-    if (join_type == duckdb::JoinType::LEFT || join_type == duckdb::JoinType::OUTER ||
-        join_type == duckdb::JoinType::SEMI) {
-      right_oob = cudf::out_of_bounds_policy::NULLIFY;
-    }
-    if (join_type == duckdb::JoinType::RIGHT || join_type == duckdb::JoinType::OUTER ||
-        join_type == duckdb::JoinType::RIGHT_SEMI) {
-      left_oob = cudf::out_of_bounds_policy::NULLIFY;
-    }
-
-    std::vector<std::unique_ptr<cudf::column>> out_cols;
-    if (collect_left) {
-      cudf::table_view left_cols_to_gather = left_full.select(lhs_output_columns.col_idxs);
-      cudf::column_view left_map_view(cudf::data_type(cudf::type_id::INT32),
-                                      left_indices->size(),
-                                      left_indices->data(),
-                                      nullptr,
-                                      0,
-                                      0,
-                                      {});
-      auto left_result = cudf::gather(left_cols_to_gather, left_map_view, left_oob, stream);
-      out_cols         = left_result->release();
-    }
-    if (collect_right) {
-      cudf::table_view right_cols_to_gather = right_full.select(rhs_output_columns.col_idxs);
-      cudf::column_view right_map_view(cudf::data_type(cudf::type_id::INT32),
-                                       right_indices->size(),
-                                       right_indices->data(),
-                                       nullptr,
-                                       0,
-                                       0,
-                                       {});
-      auto right_result   = cudf::gather(right_cols_to_gather, right_map_view, right_oob, stream);
-      auto right_out_cols = right_result->release();
-      for (auto& col : right_out_cols) {
-        out_cols.push_back(std::move(col));
-      }
-    }
-
-    auto output_cudf_table = std::make_unique<cudf::table>(std::move(out_cols), stream);
-    return std::make_unique<operator_data>(std::vector<std::shared_ptr<::cucascade::data_batch>>{
-      make_data_batch(std::move(output_cudf_table), *input_batches[0]->get_memory_space())});
-  }
-
-  if (join_type == duckdb::JoinType::INNER || join_type == duckdb::JoinType::LEFT ||
-      join_type == duckdb::JoinType::RIGHT || join_type == duckdb::JoinType::OUTER ||
-      join_type == duckdb::JoinType::SEMI || join_type == duckdb::JoinType::RIGHT_SEMI ||
-      join_type == duckdb::JoinType::ANTI || join_type == duckdb::JoinType::RIGHT_ANTI ||
-      join_type == duckdb::JoinType::MARK) {
+  } else {
     auto keys                   = prepare_join_keys(input_batches,
                                   left_key_col_indices,
                                   right_key_col_indices,
@@ -659,9 +619,7 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
                                   stream);
     cudf::table_view left_keys  = keys.left_keys;
     cudf::table_view right_keys = keys.right_keys;
-    std::unique_ptr<rmm::device_uvector<cudf::size_type>> left_indices, right_indices;
-    bool collect_left  = true;
-    bool collect_right = true;
+
     if (join_type == duckdb::JoinType::INNER) {
       auto join_result =
         cudf::inner_join(left_keys, right_keys, cudf::null_equality::UNEQUAL, stream);
@@ -699,117 +657,67 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
       auto filtered_join_object = cudf::filtered_join(
         right_keys, cudf::null_equality::UNEQUAL, cudf::set_as_build_table::RIGHT, stream);
       auto semi_indices = filtered_join_object.semi_join(left_keys, stream);
-
-      // All left output columns pass through directly (no gather -- all rows kept)
-      cudf::table_view left_cols_to_output =
-        get_cudf_table_view(*input_batches[0]).select(lhs_output_columns.col_idxs);
-      auto num_left_rows = left_cols_to_output.num_rows();
-
-      std::vector<std::unique_ptr<cudf::column>> mark_out_cols;
-      for (cudf::size_type i = 0; i < left_cols_to_output.num_columns(); i++) {
-        mark_out_cols.push_back(
-          std::make_unique<cudf::column>(left_cols_to_output.column(i), stream));
-      }
-
-      // Create BOOL8 mark column: start all-false, scatter true at matching positions
-      cudf::numeric_scalar<bool> false_scalar(false, true, stream);
-      auto mark_column = cudf::make_column_from_scalar(false_scalar, num_left_rows, stream);
-
-      if (semi_indices->size() > 0) {
-        cudf::numeric_scalar<bool> true_scalar(true, true, stream);
-
-        cudf::column_view scatter_map(cudf::data_type(cudf::type_id::INT32),
-                                      static_cast<cudf::size_type>(semi_indices->size()),
-                                      semi_indices->data(),
-                                      nullptr,
-                                      0,
-                                      0,
-                                      {});
-
-        // The scatter API is a bit confusing when it says: the number of elements in first arg i.e.
-        // the vector should have same number of columns in the target table. It is essentially a
-        // row-scatter operation. For our use case, we have only column i.e. target mark column;
-        // therefore we are good. The scalar is broadcasted to respective positions provided by the
-        // scatter map.
-        auto scattered = cudf::scatter({std::ref(static_cast<cudf::scalar const&>(true_scalar))},
-                                       scatter_map,
-                                       cudf::table_view({mark_column->view()}),
-                                       stream);
-        mark_column    = std::move(scattered->release()[0]);
-      }
-
-      mark_out_cols.push_back(std::move(mark_column));
-
-      // Return early -- skip the normal gather path (MARK outputs all rows, not a subset)
-      auto output_cudf_table = std::make_unique<cudf::table>(std::move(mark_out_cols), stream);
-      return std::make_unique<operator_data>(std::vector<std::shared_ptr<::cucascade::data_batch>>{
-        make_data_batch(std::move(output_cudf_table), *input_batches[0]->get_memory_space())});
+      return resolve_mark_join_result(
+        *semi_indices, left_full, lhs_output_columns.col_idxs, input_batches[0], stream);
     } else if (join_type == duckdb::JoinType::OUTER) {
       auto join_result =
         cudf::full_join(left_keys, right_keys, cudf::null_equality::UNEQUAL, stream);
       left_indices  = std::move(join_result.first);
       right_indices = std::move(join_result.second);
+    } else {
+      throw std::runtime_error("Unsupported join type: " + duckdb::JoinTypeToString(join_type));
     }
-    if (join_type == duckdb::JoinType::SEMI || join_type == duckdb::JoinType::ANTI) {
-      collect_right = false;
-    } else if (join_type == duckdb::JoinType::RIGHT_SEMI ||
-               join_type == duckdb::JoinType::RIGHT_ANTI) {
-      collect_left = false;
-    }
-
-    cudf::out_of_bounds_policy left_out_of_bounds_policy  = cudf::out_of_bounds_policy::DONT_CHECK;
-    cudf::out_of_bounds_policy right_out_of_bounds_policy = cudf::out_of_bounds_policy::DONT_CHECK;
-    if (join_type == duckdb::JoinType::LEFT || join_type == duckdb::JoinType::OUTER ||
-        join_type == duckdb::JoinType::SEMI) {
-      right_out_of_bounds_policy = cudf::out_of_bounds_policy::NULLIFY;
-    }
-    if (join_type == duckdb::JoinType::RIGHT || join_type == duckdb::JoinType::OUTER ||
-        join_type == duckdb::JoinType::RIGHT_SEMI) {
-      left_out_of_bounds_policy = cudf::out_of_bounds_policy::NULLIFY;
-    }
-
-    std::vector<std::unique_ptr<cudf::column>> out_cols;
-    if (collect_left) {
-      cudf::table_view left_cols_to_gather =
-        get_cudf_table_view(*input_batches[0]).select(lhs_output_columns.col_idxs);
-      cudf::column_view left_map_view(cudf::data_type(cudf::type_id::INT32),
-                                      left_indices->size(),
-                                      left_indices->data(),
-                                      nullptr,
-                                      0,
-                                      0,
-                                      {});
-      auto left_result =
-        cudf::gather(left_cols_to_gather, left_map_view, left_out_of_bounds_policy, stream);
-      out_cols = left_result->release();
-    }
-    if (collect_right) {
-      cudf::table_view right_cols_to_gather =
-        get_cudf_table_view(*input_batches[1]).select(rhs_output_columns.col_idxs);
-      cudf::column_view right_map_view(cudf::data_type(cudf::type_id::INT32),
-                                       right_indices->size(),
-                                       right_indices->data(),
-                                       nullptr,
-                                       0,
-                                       0,
-                                       {});
-      auto right_result =
-        cudf::gather(right_cols_to_gather, right_map_view, right_out_of_bounds_policy, stream);
-      auto right_out_cols = right_result->release();
-      for (auto& col : right_out_cols) {
-        out_cols.push_back(std::move(col));
-      }
-    }
-
-    auto output_cudf_table = std::make_unique<cudf::table>(std::move(out_cols), stream);
-    return std::make_unique<operator_data>(std::vector<std::shared_ptr<::cucascade::data_batch>>{
-      make_data_batch(std::move(output_cudf_table), *input_batches[0]->get_memory_space())});
-
-    // } else if (join_type == duckdb::JoinType::SINGLE) {
-    //   return std::vector<std::shared_ptr<::cucascade::data_batch>>{};
-  } else {
-    throw std::runtime_error("Unsupported join type: " + duckdb::JoinTypeToString(join_type));
   }
+
+  // Shared tail: which sides to collect, out-of-bounds nullification policy, and gather.
+  // collect_left/right are purely a function of join type and apply to both mixed and non-mixed.
+  bool collect_left =
+    (join_type != duckdb::JoinType::RIGHT_SEMI && join_type != duckdb::JoinType::RIGHT_ANTI);
+  bool collect_right = (join_type != duckdb::JoinType::SEMI && join_type != duckdb::JoinType::ANTI);
+
+  cudf::out_of_bounds_policy left_oob  = cudf::out_of_bounds_policy::DONT_CHECK;
+  cudf::out_of_bounds_policy right_oob = cudf::out_of_bounds_policy::DONT_CHECK;
+  if (join_type == duckdb::JoinType::LEFT || join_type == duckdb::JoinType::OUTER ||
+      join_type == duckdb::JoinType::SEMI) {
+    right_oob = cudf::out_of_bounds_policy::NULLIFY;
+  }
+  if (join_type == duckdb::JoinType::RIGHT || join_type == duckdb::JoinType::OUTER ||
+      join_type == duckdb::JoinType::RIGHT_SEMI) {
+    left_oob = cudf::out_of_bounds_policy::NULLIFY;
+  }
+
+  std::vector<std::unique_ptr<cudf::column>> out_cols;
+  if (collect_left) {
+    cudf::table_view left_cols_to_gather = left_full.select(lhs_output_columns.col_idxs);
+    cudf::column_view left_map_view(cudf::data_type(cudf::type_id::INT32),
+                                    left_indices->size(),
+                                    left_indices->data(),
+                                    nullptr,
+                                    0,
+                                    0,
+                                    {});
+    auto left_result = cudf::gather(left_cols_to_gather, left_map_view, left_oob, stream);
+    out_cols         = left_result->release();
+  }
+  if (collect_right) {
+    cudf::table_view right_cols_to_gather = right_full.select(rhs_output_columns.col_idxs);
+    cudf::column_view right_map_view(cudf::data_type(cudf::type_id::INT32),
+                                     right_indices->size(),
+                                     right_indices->data(),
+                                     nullptr,
+                                     0,
+                                     0,
+                                     {});
+    auto right_result   = cudf::gather(right_cols_to_gather, right_map_view, right_oob, stream);
+    auto right_out_cols = right_result->release();
+    for (auto& col : right_out_cols) {
+      out_cols.push_back(std::move(col));
+    }
+  }
+
+  auto output_cudf_table = std::make_unique<cudf::table>(std::move(out_cols), stream);
+  return std::make_unique<operator_data>(std::vector<std::shared_ptr<::cucascade::data_batch>>{
+    make_data_batch(std::move(output_cudf_table), *input_batches[0]->get_memory_space())});
 }
 
 }  // namespace op
