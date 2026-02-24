@@ -88,9 +88,9 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
         extract_bound_ref_index(*hash_join_op.conditions[cond_idx].right);
       if (left_index.has_value() && right_index.has_value()) {
         if (is_build) {
-          _partition_keys.push_back(left_index.value());
-        } else {
           _partition_keys.push_back(right_index.value());
+        } else {
+          _partition_keys.push_back(left_index.value());
         }
       }
     }
