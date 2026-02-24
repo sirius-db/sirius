@@ -30,8 +30,6 @@
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 
-#include <cstdio>
-
 namespace sirius {
 namespace op {
 
@@ -322,7 +320,8 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::get_next_task_input_da
       left_counter++;
     }
   }
-  if (input_batch.size() == 0) {
+
+  if (input_batch.empty()) {
     return nullptr;
   } else {
     throw std::runtime_error("Expected to have returned already or received nothing, but got " +
