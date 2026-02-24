@@ -25,6 +25,7 @@ pre-commit = "*"
 libconfig = "*"
 libabseil = ">=20260107.0"
 duckdb = ">=1.4.4,<2"
+clang-tools = ">=21.1.8,<22"
 
 [tasks]
 
