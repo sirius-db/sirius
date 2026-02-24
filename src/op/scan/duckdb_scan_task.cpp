@@ -103,7 +103,7 @@ void duckdb_scan_task_local_state::column_builder::initialize_accessors(
     offset_blocks_accessor.set_current(0, allocation);
     // Initialize data accessor
     total_data_bytes_allocated = estimated_num_rows * type_size;
-    size_t data_byte_offset    = byte_offset + (estimated_num_rows + 1) * sizeof(int32_t);
+    size_t data_byte_offset    = byte_offset + (estimated_num_rows + 1) * sizeof(int64_t);
     data_blocks_accessor.initialize(data_byte_offset, allocation);
     // Initialize mask accessor
     size_t mask_byte_offset = data_byte_offset + total_data_bytes_allocated;
@@ -263,6 +263,7 @@ column_metadata duckdb_scan_task_local_state::column_builder::make_column_metada
     return make_string_column_metadata(static_cast<cudf::size_type>(num_rows),
                                        static_cast<cudf::size_type>(null_count),
                                        data_blocks_accessor.initial_byte_offset,
+                                       total_data_bytes,
                                        mask_blocks_accessor.initial_byte_offset,
                                        offset_blocks_accessor.initial_byte_offset);
   } else {
@@ -345,7 +346,7 @@ void duckdb_scan_task_local_state::estimate_rows_per_batch(sirius_physical_duckd
     _column_builders.emplace_back(col_type, _default_varchar_size);
     if (col_type.InternalType() == duckdb::PhysicalType::VARCHAR) {
       _varchar_indices.push_back(i);
-      estimated_row_bytes += (sizeof(int32_t) + _default_varchar_size);  // offset + data + mask
+      estimated_row_bytes += (sizeof(int64_t) + _default_varchar_size);  // offset + data + mask
     } else {
       estimated_row_bytes += duckdb::GetTypeIdSize(col_type.InternalType());  // data + mask
     }
@@ -357,7 +358,7 @@ void duckdb_scan_task_local_state::estimate_rows_per_batch(sirius_physical_duckd
   estimated_row_bytes += mask_bytes_per_row;
 
   // For VARCHAR columns, add space for the extra offset at the end
-  size_t extra_varchar_offset_bytes = _varchar_indices.size() * sizeof(int32_t);
+  size_t extra_varchar_offset_bytes = _varchar_indices.size() * sizeof(int64_t);
 
   // Calculate rows that fit in the batch
   _estimated_rows_per_batch =
@@ -378,7 +379,7 @@ void duckdb_scan_task_local_state::initialize_builders()
     // Update byte_offset for next column
     if (_column_builders[i].type.InternalType() == duckdb::PhysicalType::VARCHAR) {
       // VARCHAR column (offsets + data + mask)
-      byte_offset += (_estimated_rows_per_batch + 1) * sizeof(int32_t) +
+      byte_offset += (_estimated_rows_per_batch + 1) * sizeof(int64_t) +
                      _estimated_rows_per_batch * _default_varchar_size +
                      utils::ceil_div_8(_estimated_rows_per_batch);
     } else {

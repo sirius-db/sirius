@@ -79,6 +79,7 @@ inline column_metadata make_flat_column_metadata(duckdb::LogicalType type,
  * @param num_rows The number of rows in the column.
  * @param null_count The number of NULL values in the column.
  * @param data_offset The byte offset of the string char data within the allocation.
+ * @param data_size The total number of string char data bytes.
  * @param null_mask_offset The byte offset of the null mask within the allocation.
  * @param offsets_offset The byte offset of the offsets array within the allocation.
  * @return column_metadata The constructed column metadata.
@@ -86,6 +87,7 @@ inline column_metadata make_flat_column_metadata(duckdb::LogicalType type,
 inline column_metadata make_string_column_metadata(cudf::size_type num_rows,
                                                    cudf::size_type null_count,
                                                    std::size_t data_offset,
+                                                   std::size_t data_size,
                                                    std::size_t null_mask_offset,
                                                    std::size_t offsets_offset)
 {
@@ -96,20 +98,20 @@ inline column_metadata make_string_column_metadata(cudf::size_type num_rows,
   cm.scale            = 0;
   cm.has_data         = true;
   cm.data_offset      = data_offset;
-  cm.data_size        = 0;
+  cm.data_size        = data_size;
   cm.has_null_mask    = (null_count > 0);
   cm.null_mask_offset = cm.has_null_mask ? null_mask_offset : 0;
   cm.null_mask_size   = cm.has_null_mask ? static_cast<std::size_t>((num_rows + 7) / 8) : 0;
 
-  // Offsets child column (INT32 offsets, num_rows + 1 entries, no nulls)
+  // Offsets child column (INT64 offsets, num_rows + 1 entries, no nulls)
   column_metadata offsets_child;
-  offsets_child.type_id          = cudf::type_id::INT32;
+  offsets_child.type_id          = cudf::type_id::INT64;
   offsets_child.num_rows         = num_rows + 1;
   offsets_child.null_count       = 0;
   offsets_child.scale            = 0;
   offsets_child.has_data         = true;
   offsets_child.data_offset      = offsets_offset;
-  offsets_child.data_size        = 0;
+  offsets_child.data_size        = static_cast<std::size_t>(num_rows + 1) * sizeof(int64_t);
   offsets_child.has_null_mask    = false;
   offsets_child.null_mask_offset = 0;
   offsets_child.null_mask_size   = 0;
