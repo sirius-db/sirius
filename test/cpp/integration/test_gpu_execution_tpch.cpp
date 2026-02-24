@@ -1000,6 +1000,54 @@ TEST_CASE_METHOD(GPUExecutionFixture,
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
+// Partitioned join tests
+// ======================
+// Force _num_partitions >= 2 by setting the partition size to 1 row, so that hash partitioning
+// actually runs for all joins even with small TPC-H tables. Without this, all existing anti/semi
+// join tests use tables small enough that _num_partitions = ceil(n / 10M) = 1, which skips
+// partitioning entirely.
+///////////////////////////////////////////////////////////////////////////////////////////////////
+
+// RAII guard to reset partition size after each test, even on failure.
+struct partition_size_guard {
+  explicit partition_size_guard(duckdb::idx_t size)
+  {
+    sirius::op::sirius_physical_partition::set_partition_size(size);
+  }
+  ~partition_size_guard() { sirius::op::sirius_physical_partition::reset_partition_size(); }
+};
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - partitioned anti join (probe key not at col 0)",
+                 "[integration][gpu_execution][antijoin][partitioned_join]")
+{
+  // n.n_regionkey is not column 0 in nation — this is the index mismatch that triggered the bug.
+  partition_size_guard guard(1);
+  compare_gpu_vs_cpu(
+    "select n.n_nationkey from nation n anti join region r on n.n_regionkey = r.r_regionkey;");
+}
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - partitioned semi join (probe key not at col 0)",
+                 "[integration][gpu_execution][semijoin][partitioned_join]")
+{
+  // Same shape as the anti join above — verifies the fix didn't break semi join partitioning.
+  partition_size_guard guard(1);
+  compare_gpu_vs_cpu(
+    "select n.n_nationkey from nation n semi join region r on n.n_regionkey = r.r_regionkey;");
+}
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - partitioned inner join (key not at col 0)",
+                 "[integration][gpu_execution][partitioned_join]")
+{
+  partition_size_guard guard(1);
+  compare_gpu_vs_cpu(
+    "select n.n_nationkey, n.n_regionkey, r.r_name "
+    "from nation n join region r on n.n_regionkey = r.r_regionkey;");
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
 
 TEST_CASE_METHOD(GPUExecutionFixture,
                  "gpu_execution - bigger inner join",
