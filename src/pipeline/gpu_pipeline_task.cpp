@@ -173,22 +173,35 @@ std::unique_ptr<op::operator_data> gpu_pipeline_task::compute_task(rmm::cuda_str
   auto pipeline     = _global_state->cast<gpu_pipeline_task_global_state>().get_pipeline();
   auto& local_state = _local_state->cast<gpu_pipeline_task_local_state>();
   auto operator_input_output_data = std::move(local_state._input_data);
+  std::string batch_sizes         = "";
+  for (auto& batch : operator_input_output_data->get_data_batches()) {
+    auto view = get_cudf_table_view(*batch);
+    batch_sizes += std::to_string(view.num_rows()) + "  ";
+  }
   for (auto& op : pipeline->get_operators()) {
-    SIRIUS_LOG_TRACE("Pipeline {}: operator {} (id={}) executing on {} batches",
+    SIRIUS_LOG_TRACE("Pipeline {}: operator {} (id={}) executing on {} batches with num row: {}",
                      pipeline->get_pipeline_id(),
                      op.get().get_name(),
                      op.get().get_operator_id(),
-                     operator_input_output_data->get_data_batches().size());
+                     operator_input_output_data->get_data_batches().size(),
+                     batch_sizes);
     auto start                 = std::chrono::high_resolution_clock::now();
     operator_input_output_data = op.get().execute(*operator_input_output_data, stream);
     auto end                   = std::chrono::high_resolution_clock::now();
     auto duration              = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    batch_sizes                = "";
+    for (auto& batch : operator_input_output_data->get_data_batches()) {
+      auto view = get_cudf_table_view(*batch);
+      batch_sizes += std::to_string(view.num_rows()) + "  ";
+    }
     SIRIUS_LOG_TRACE(
-      "Pipeline {}: operator {} (id={}) produced {} batches, execution time: {:.2f} ms",
+      "Pipeline {}: operator {} (id={}) produced {} batches with num rows: {}, execution time: "
+      "{:.2f} ms",
       pipeline->get_pipeline_id(),
       op.get().get_name(),
       op.get().get_operator_id(),
       operator_input_output_data ? operator_input_output_data->get_data_batches().size() : 0u,
+      batch_sizes,
       duration.count() / 1000.0);
     validate_operator_output_types(operator_input_output_data.get(), op.get());
   }

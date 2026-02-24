@@ -312,19 +312,28 @@ bool host_table_chunk_reader::get_next_chunk(duckdb::DataChunk& chunk)
   auto const count     = std::min(remaining, static_cast<size_t>(STANDARD_VECTOR_SIZE));
   chunk.Initialize(_client_ctx, _types, count);
 
-  // Copy each column into the chunk
+  // Copy each column into the chunk. Dispatch on actual stored type (metadata), not expected
+  // type (_types), so that we never call copy_string on non-string data (e.g. when projection
+  // output column order doesn't match the plan and we have int where plan expects string).
   for (size_t col_idx = 0; col_idx < _column_readers.size(); ++col_idx) {
-    auto& vec = chunk.data[col_idx];
-    if (vec.GetType().InternalType() == duckdb::PhysicalType::VARCHAR) {
-      _column_readers[col_idx].copy_string(vec, _row_offset, count, _allocation);
+    auto& vec            = chunk.data[col_idx];
+    auto const actual_id = _column_readers[col_idx].cudf_col_type.id();
+    if (actual_id == cudf::type_id::STRING) {
+      // Stored data is string: read with copy_string into a VARCHAR vector, then cast if needed.
+      if (vec.GetType().InternalType() == duckdb::PhysicalType::VARCHAR) {
+        _column_readers[col_idx].copy_string(vec, _row_offset, count, _allocation);
+      } else {
+        duckdb::Vector temp_vec(duckdb::LogicalType::VARCHAR);
+        _column_readers[col_idx].copy_string(temp_vec, _row_offset, count, _allocation);
+        duckdb::VectorOperations::Cast(_client_ctx, temp_vec, vec, count);
+      }
     } else {
+      // Stored data is fixed-width: read with copy_fixed_width, then cast if needed.
       auto src_duckdb_type = cudf_type_to_duckdb(_column_readers[col_idx].cudf_col_type);
       if (src_duckdb_type.id() == duckdb::LogicalTypeId::SQLNULL ||
           src_duckdb_type.InternalType() == vec.GetType().InternalType()) {
-        // Physical sizes match (or unknown source type): direct copy
         _column_readers[col_idx].copy_fixed_width(vec, _row_offset, count, _allocation);
       } else {
-        // Type size mismatch: copy into a temp vector at the cudf native size, then cast
         duckdb::Vector temp_vec(src_duckdb_type);
         _column_readers[col_idx].copy_fixed_width(temp_vec, _row_offset, count, _allocation);
         duckdb::VectorOperations::Cast(_client_ctx, temp_vec, vec, count);
