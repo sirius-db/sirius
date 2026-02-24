@@ -209,7 +209,7 @@ size_t estimate_packed_data_bytes(cudf::table_view const& view)
   return total_bytes;
 }
 
-host_table_representation const& convert_to_host_table(
+host_data_packed_representation const& convert_to_host_table(
   duckdb::shared_ptr<duckdb::SiriusContext> sirius_ctx, std::shared_ptr<data_batch> const& batch)
 {
   auto* data = batch->get_data();
