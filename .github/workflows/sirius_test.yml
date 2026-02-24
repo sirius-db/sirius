@@ -23,7 +23,6 @@ jobs:
         with:
           pixi-version: v0.59.0
           activate-environment: true
-          environments: cuda12
       - name: Build
         env:
           CUDAARCHS: native
