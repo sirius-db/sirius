@@ -77,6 +77,10 @@ class sirius_physical_partition : public sirius_physical_operator {
   void get_partition_keys_and_type(sirius_physical_operator* op, bool is_build = false);
   sirius_physical_operator* _parent_op;
   std::vector<int> _partition_keys;
+  /// One entry per partition key. type_id::EMPTY means "hash as-is"; any other id means
+  /// cast the key column to this type before hashing.  Used to align hash values when the
+  /// two join sides have different physical column types for the same logical key.
+  std::vector<cudf::data_type> _partition_key_cast_types;
   int _num_partitions;
   bool _is_build;
   PartitionType _partition_type;

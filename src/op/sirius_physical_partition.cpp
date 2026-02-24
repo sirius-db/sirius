@@ -94,10 +94,23 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
       std::optional<duckdb::idx_t> right_index =
         extract_bound_ref_index(*hash_join_op.conditions[cond_idx].right);
       if (left_index.has_value() && right_index.has_value()) {
+        // Determine if a type cast is needed for hash alignment.
+        // When the join condition has a BOUND_CAST on one side, the two sides have different
+        // physical column types (e.g. INT32 vs INT64). cuDF's murmur3 produces different hash
+        // values for the same integer in different representations, so without a cast, matching
+        // keys would land in different partitions. We apply the same cast used by the join
+        // condition so both sides hash identically.
+        const auto& key_expr = is_build ? *hash_join_op.conditions[cond_idx].right
+                                        : *hash_join_op.conditions[cond_idx].left;
         if (is_build) {
           _partition_keys.push_back(right_index.value());
         } else {
           _partition_keys.push_back(left_index.value());
+        }
+        if (key_expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_CAST) {
+          _partition_key_cast_types.push_back(duckdb::GetCudfType(key_expr.return_type));
+        } else {
+          _partition_key_cast_types.push_back(cudf::data_type{cudf::type_id::EMPTY});
         }
       }
     }
@@ -159,8 +172,12 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
   std::vector<std::shared_ptr<cucascade::data_batch>> partitioned_results;
   switch (_partition_type) {
     case PartitionType::HASH:
-      partitioned_results = gpu_partition_impl::hash_partition(
-        input_batch, _partition_keys, _num_partitions, stream, *input_batch->get_memory_space());
+      partitioned_results = gpu_partition_impl::hash_partition(input_batch,
+                                                               _partition_keys,
+                                                               _partition_key_cast_types,
+                                                               _num_partitions,
+                                                               stream,
+                                                               *input_batch->get_memory_space());
       break;
     case PartitionType::RANGE:
       throw std::runtime_error("Range partitioning is not implemented yet");
