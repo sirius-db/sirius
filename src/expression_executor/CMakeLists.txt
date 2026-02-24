@@ -18,6 +18,7 @@ set(EXTENSION_SOURCES
     ${EXTENSION_SOURCES}
     ${CMAKE_CURRENT_SOURCE_DIR}/gpu_expression_executor_state.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/gpu_expression_executor.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/gpu_expression_translator.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/specializations/gpu_execute_between.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/specializations/gpu_execute_case.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/specializations/gpu_execute_cast.cpp
