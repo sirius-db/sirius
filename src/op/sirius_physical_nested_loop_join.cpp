@@ -41,6 +41,7 @@
 #include <cudf/copying.hpp>
 #include <cudf/join/conditional_join.hpp>
 #include <cudf/join/join.hpp>
+#include <cudf/join/mixed_join.hpp>
 #include <cudf/table/table_view.hpp>
 
 #include <rmm/resource_ref.hpp>
@@ -470,6 +471,20 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
     // cudf::ast::operation stores operands as reference_wrapper<expression const> — any
     // reallocation of these vectors invalidates the stored references and causes UB/segfault.
 
+    // Count leading equality conditions (reorder_conditions() sorts them first).
+    // When there are both equality and non-equality conditions, cudf::mixed_*_join can build
+    // a hash table on the equality part and only evaluate the predicate on hash candidates —
+    // O(n) rather than the O(n²) conditional join.
+    size_t num_equality_conds = 0;
+    for (const auto& cond : conditions) {
+      if (cond.comparison == duckdb::ExpressionType::COMPARE_EQUAL ||
+          cond.comparison == duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+        num_equality_conds++;
+      } else {
+        break;
+      }
+    }
+
     std::map<uint64_t, cudf::size_type> left_expressions_to_idx;
     std::map<uint64_t, cudf::size_type> right_expressions_to_idx;
     std::vector<cudf::ast::column_reference> left_refs;
@@ -485,6 +500,11 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
     std::vector<std::shared_ptr<cucascade::data_batch>> expression_res_scope_hodler;
     left_col_views.reserve(left.num_columns());
     right_col_views.reserve(right.num_columns());
+    // Per-condition column index into left_col_views / right_col_views, recorded as each
+    // condition is resolved. Used to construct the mixed join equality and conditional tables.
+    std::vector<cudf::size_type> left_cond_col_idx, right_cond_col_idx;
+    left_cond_col_idx.reserve(conditions.size());
+    right_cond_col_idx.reserve(conditions.size());
 
     // Resolves one side of a join condition to a column index in col_views, evaluating or casting
     // as needed. Returns the index to use as the cudf::ast::column_reference offset.
@@ -546,6 +566,8 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
       cudf::size_type right_join_input_index = resolve_join_col(
         *cond.right, right_expressions_to_idx, right_batch, right, right_col_views, "right");
 
+      left_cond_col_idx.push_back(left_join_input_index);
+      right_cond_col_idx.push_back(right_join_input_index);
       left_refs.emplace_back(left_join_input_index, cudf::ast::table_reference::LEFT);
       right_refs.emplace_back(right_join_input_index, cudf::ast::table_reference::RIGHT);
       cond_ops.emplace_back(to_ast_operator(cond.comparison), left_refs.back(), right_refs.back());
@@ -568,27 +590,142 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
     const cudf::ast::expression& predicate =
       and_chain.empty() ? static_cast<const cudf::ast::expression&>(cond_ops[0]) : and_chain.back();
 
+    // Determine whether to use a mixed (hash + conditional) join. This is possible when there
+    // are leading equality conditions AND trailing non-equality conditions, AND none of the
+    // non-equality conditions reuse a column that first appeared in an equality condition
+    // (which would break the clean equality/conditional table split).
+    bool can_use_mixed_join = (num_equality_conds > 0) && (num_equality_conds < conditions.size());
+    if (can_use_mixed_join) {
+      for (size_t i = num_equality_conds; i < conditions.size(); i++) {
+        if (left_cond_col_idx[i] < static_cast<cudf::size_type>(num_equality_conds) ||
+            right_cond_col_idx[i] < static_cast<cudf::size_type>(num_equality_conds)) {
+          can_use_mixed_join = false;
+          break;
+        }
+      }
+    }
+
+    // Mixed join resources: built only when can_use_mixed_join is true.
+    // Must outlive the join call (cudf AST stores references into these vectors).
+    std::vector<cudf::ast::column_reference> mix_left_refs, mix_right_refs;
+    std::vector<cudf::ast::operation> mix_cond_ops, mix_and_chain;
+    std::vector<cudf::column_view> mix_left_cond_views, mix_right_cond_views;
+
+    if (can_use_mixed_join) {
+      const size_t n_cond_only = conditions.size() - num_equality_conds;
+      mix_left_refs.reserve(n_cond_only);
+      mix_right_refs.reserve(n_cond_only);
+      mix_cond_ops.reserve(n_cond_only);
+      mix_and_chain.reserve(n_cond_only > 1 ? n_cond_only - 1 : 0);
+
+      // Build conditional col views with fresh 0-based indices (remapping original indices).
+      std::map<cudf::size_type, cudf::size_type> left_remap, right_remap;
+      for (size_t k = 0; k < n_cond_only; k++) {
+        cudf::size_type orig_left = left_cond_col_idx[num_equality_conds + k];
+        if (left_remap.find(orig_left) == left_remap.end()) {
+          left_remap[orig_left] = static_cast<cudf::size_type>(mix_left_cond_views.size());
+          mix_left_cond_views.push_back(left_col_views[orig_left]);
+        }
+        cudf::size_type orig_right = right_cond_col_idx[num_equality_conds + k];
+        if (right_remap.find(orig_right) == right_remap.end()) {
+          right_remap[orig_right] = static_cast<cudf::size_type>(mix_right_cond_views.size());
+          mix_right_cond_views.push_back(right_col_views[orig_right]);
+        }
+        mix_left_refs.emplace_back(left_remap[orig_left], cudf::ast::table_reference::LEFT);
+        mix_right_refs.emplace_back(right_remap[orig_right], cudf::ast::table_reference::RIGHT);
+        mix_cond_ops.emplace_back(to_ast_operator(conditions[num_equality_conds + k].comparison),
+                                  mix_left_refs.back(),
+                                  mix_right_refs.back());
+      }
+      for (size_t i = 1; i < mix_cond_ops.size(); i++) {
+        const cudf::ast::expression& lhs =
+          (i == 1) ? static_cast<const cudf::ast::expression&>(mix_cond_ops[0])
+                   : mix_and_chain.back();
+        mix_and_chain.emplace_back(cudf::ast::ast_operator::LOGICAL_AND,
+                                   lhs,
+                                   static_cast<const cudf::ast::expression&>(mix_cond_ops[i]));
+      }
+    }
+
+    // Helper: build equality table views from the first num_equality_conds conditions.
+    auto make_eq_views =
+      [&]() -> std::pair<std::vector<cudf::column_view>, std::vector<cudf::column_view>> {
+      std::vector<cudf::column_view> leq, req;
+      leq.reserve(num_equality_conds);
+      req.reserve(num_equality_conds);
+      for (size_t i = 0; i < num_equality_conds; i++) {
+        leq.push_back(left_col_views[left_cond_col_idx[i]]);
+        req.push_back(right_col_views[right_cond_col_idx[i]]);
+      }
+      return {std::move(leq), std::move(req)};
+    };
+
+    const cudf::ast::expression& mix_predicate =
+      mix_and_chain.empty() ? static_cast<const cudf::ast::expression&>(
+                                mix_cond_ops.empty() ? cond_ops[0] : mix_cond_ops[0])
+                            : mix_and_chain.back();
+
     std::pair<std::unique_ptr<rmm::device_uvector<cudf::size_type>>,
               std::unique_ptr<rmm::device_uvector<cudf::size_type>>>
       join_result;
 
     switch (join_type) {
       case duckdb::JoinType::INNER:
-        join_result = cudf::conditional_inner_join(
-          left_effective, right_effective, predicate, std::nullopt, stream, mr);
+        if (can_use_mixed_join) {
+          auto [leq, req] = make_eq_views();
+          join_result     = cudf::mixed_inner_join(cudf::table_view(leq),
+                                               cudf::table_view(req),
+                                               cudf::table_view(mix_left_cond_views),
+                                               cudf::table_view(mix_right_cond_views),
+                                               mix_predicate,
+                                               cudf::null_equality::UNEQUAL,
+                                                   {},
+                                               stream,
+                                               mr);
+        } else {
+          join_result = cudf::conditional_inner_join(
+            left_effective, right_effective, predicate, std::nullopt, stream, mr);
+        }
         break;
       case duckdb::JoinType::LEFT:
-        join_result = cudf::conditional_left_join(
-          left_effective, right_effective, predicate, std::nullopt, stream, mr);
+        if (can_use_mixed_join) {
+          auto [leq, req] = make_eq_views();
+          join_result     = cudf::mixed_left_join(cudf::table_view(leq),
+                                              cudf::table_view(req),
+                                              cudf::table_view(mix_left_cond_views),
+                                              cudf::table_view(mix_right_cond_views),
+                                              mix_predicate,
+                                              cudf::null_equality::UNEQUAL,
+                                                  {},
+                                              stream,
+                                              mr);
+        } else {
+          join_result = cudf::conditional_left_join(
+            left_effective, right_effective, predicate, std::nullopt, stream, mr);
+        }
         break;
       case duckdb::JoinType::RIGHT:
+        // RIGHT is implemented as flipped LEFT; mixed join optimisation not applied here.
         join_result = cudf::conditional_left_join(
           right_effective, left_effective, predicate, std::nullopt, stream, mr);
         std::swap(join_result.first, join_result.second);
         break;
       case duckdb::JoinType::SEMI: {
-        auto left_indices = cudf::conditional_left_semi_join(
-          left_effective, right_effective, predicate, std::nullopt, stream, mr);
+        std::unique_ptr<rmm::device_uvector<cudf::size_type>> left_indices;
+        if (can_use_mixed_join) {
+          auto [leq, req] = make_eq_views();
+          left_indices    = cudf::mixed_left_semi_join(cudf::table_view(leq),
+                                                    cudf::table_view(req),
+                                                    cudf::table_view(mix_left_cond_views),
+                                                    cudf::table_view(mix_right_cond_views),
+                                                    mix_predicate,
+                                                    cudf::null_equality::UNEQUAL,
+                                                    stream,
+                                                    mr);
+        } else {
+          left_indices = cudf::conditional_left_semi_join(
+            left_effective, right_effective, predicate, std::nullopt, stream, mr);
+        }
         auto left_map = cudf::column_view(cudf::data_type(cudf::type_id::INT32),
                                           left_indices->size(),
                                           left_indices->data(),
@@ -603,8 +740,21 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
           make_data_batch(std::move(gathered), *space)});
       }
       case duckdb::JoinType::ANTI: {
-        auto left_indices = cudf::conditional_left_anti_join(
-          left_effective, right_effective, predicate, std::nullopt, stream, mr);
+        std::unique_ptr<rmm::device_uvector<cudf::size_type>> left_indices;
+        if (can_use_mixed_join) {
+          auto [leq, req] = make_eq_views();
+          left_indices    = cudf::mixed_left_anti_join(cudf::table_view(leq),
+                                                    cudf::table_view(req),
+                                                    cudf::table_view(mix_left_cond_views),
+                                                    cudf::table_view(mix_right_cond_views),
+                                                    mix_predicate,
+                                                    cudf::null_equality::UNEQUAL,
+                                                    stream,
+                                                    mr);
+        } else {
+          left_indices = cudf::conditional_left_anti_join(
+            left_effective, right_effective, predicate, std::nullopt, stream, mr);
+        }
         auto left_map = cudf::column_view(cudf::data_type(cudf::type_id::INT32),
                                           left_indices->size(),
                                           left_indices->data(),
@@ -619,8 +769,21 @@ std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
           make_data_batch(std::move(gathered), *space)});
       }
       case duckdb::JoinType::OUTER:
-        join_result =
-          cudf::conditional_full_join(left_effective, right_effective, predicate, stream, mr);
+        if (can_use_mixed_join) {
+          auto [leq, req] = make_eq_views();
+          join_result     = cudf::mixed_full_join(cudf::table_view(leq),
+                                              cudf::table_view(req),
+                                              cudf::table_view(mix_left_cond_views),
+                                              cudf::table_view(mix_right_cond_views),
+                                              mix_predicate,
+                                              cudf::null_equality::UNEQUAL,
+                                                  {},
+                                              stream,
+                                              mr);
+        } else {
+          join_result =
+            cudf::conditional_full_join(left_effective, right_effective, predicate, stream, mr);
+        }
         break;
       default:
         throw std::runtime_error("sirius_physical_nested_loop_join: unsupported join type: " +
