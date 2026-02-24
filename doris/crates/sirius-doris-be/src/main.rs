@@ -128,8 +128,9 @@ fn main() {
     #[cfg(feature = "nixl")]
     let nixl_agent = {
         let agent_name = format!(
-            "sirius-be-{}",
-            config.advertise_host.as_deref().unwrap_or("localhost")
+            "sirius-be-{}:{}",
+            config.advertise_host.as_deref().unwrap_or("localhost"),
+            config.brpc_port
         );
         doris_rpc::nixl_exchange::NixlExchange::try_new(&agent_name)
             .map(|a| std::sync::Arc::new(a))

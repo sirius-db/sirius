@@ -4,17 +4,71 @@
 //! This is the inverse of `pblock_decoder.rs`. The encoding follows the Doris
 //! column_values wire format:
 //!   - Per column: header (const_flag + row_num + real_saved_num) + data
-//!   - Fixed-width: raw bytes (no StreamVByte, below SERIALIZED_MEM_SIZE_LIMIT)
-//!   - STRING: raw offsets + value_len + raw chars (below limit)
-//!   - NULLABLE: null_map + inner column data
-//!
-//! We use the uncompressed path (no StreamVByte/LZ4) since Doris accepts raw data
-//! for small columns and all our exchange data goes through snappy/lz4 at the PBlock level.
+//!   - Fixed-width: raw bytes if mem_size <= 256, else StreamVByte encoded
+//!   - STRING: offsets (raw/StreamVByte) + value_len + chars (raw/LZ4)
+//!   - NULLABLE: null_map (raw/StreamVByte) + inner column data
 
 use std::io::Cursor;
 
 use arrow::ipc::reader::StreamReader;
 use doris_proto::doris::{p_column_meta, PBlock, PColumnMeta};
+
+/// Doris SERIALIZED_MEM_SIZE_LIMIT: above this, per-column data uses StreamVByte/LZ4.
+const SERIALIZED_MEM_SIZE_LIMIT: usize = 256;
+
+/// StreamVByte encoder: inverse of `pblock_decoder::streamvbyte_decode()`.
+///
+/// Encodes N u32 values into: `control_bytes[(N+3)/4] + data_bytes[variable]`.
+/// Each control byte has 4 x 2-bit entries encoding the byte length minus 1.
+fn streamvbyte_encode(values: &[u32]) -> Vec<u8> {
+    let n = values.len();
+    if n == 0 {
+        return vec![];
+    }
+    let control_len = (n + 3) / 4;
+    let mut control = vec![0u8; control_len];
+    let mut data = Vec::with_capacity(n * 4);
+
+    for (i, &val) in values.iter().enumerate() {
+        let byte_len = match val {
+            0..=0xFF => 1,
+            0..=0xFFFF => 2,
+            0..=0xFFFFFF => 3,
+            _ => 4,
+        };
+        let code = (byte_len - 1) as u8;
+        let ctrl_idx = i / 4;
+        let shift = (i % 4) * 2;
+        control[ctrl_idx] |= code << shift;
+        data.extend_from_slice(&val.to_le_bytes()[..byte_len]);
+    }
+
+    let mut result = Vec::with_capacity(control_len + data.len());
+    result.extend_from_slice(&control);
+    result.extend_from_slice(&data);
+    result
+}
+
+/// Write raw bytes (when `mem_size <= 256`) or StreamVByte-encoded bytes (otherwise).
+///
+/// Mirror of `pblock_decoder::read_raw_or_fail()`.
+fn write_raw_or_encoded(buf: &mut Vec<u8>, raw_bytes: &[u8]) {
+    if raw_bytes.len() <= SERIALIZED_MEM_SIZE_LIMIT {
+        buf.extend_from_slice(raw_bytes);
+    } else {
+        // Pad to multiple of 4 bytes, interpret as u32 LE, StreamVByte encode
+        let num_u32 = (raw_bytes.len() + 3) / 4;
+        let mut padded = raw_bytes.to_vec();
+        padded.resize(num_u32 * 4, 0);
+        let values: Vec<u32> = padded
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        let encoded = streamvbyte_encode(&values);
+        buf.extend_from_slice(&(encoded.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&encoded);
+    }
+}
 
 /// Encode Arrow IPC bytes into a single PBlock for transmit_block.
 ///
@@ -128,16 +182,18 @@ fn encode_column(
         // STRING encoding: offsets + chars
         encode_string_data(batches, col_idx, num_rows, buf)?;
     } else {
-        // Fixed-width encoding
+        // Fixed-width encoding: collect into temp buffer, then write raw or StreamVByte
         let width = type_byte_width(type_id);
         if width == 0 {
             return Err(format!("unsupported type_id {} for encoding", type_id));
         }
 
+        let mut tmp = Vec::with_capacity(num_rows as usize * width);
         for batch in batches {
             let col = batch.column(col_idx);
-            append_fixed_width_data(col, type_id, width, buf)?;
+            append_fixed_width_data(col, type_id, width, &mut tmp)?;
         }
+        write_raw_or_encoded(buf, &tmp);
     }
 
     Ok(())
@@ -164,8 +220,8 @@ fn encode_nullable_column(
             null_map.push(if is_null { 1u8 } else { 0u8 });
         }
     }
-    // Raw null_map (no StreamVByte since we keep data small or handle at PBlock level)
-    buf.extend_from_slice(&null_map);
+    // null_map: raw if <= 256 bytes, StreamVByte encoded otherwise
+    write_raw_or_encoded(buf, &null_map);
 
     // Inner column data (with its own header)
     encode_column(batches, col_idx, num_rows, type_id, buf)?;
@@ -242,14 +298,20 @@ fn encode_string_data(
         }
     }
 
-    // Write offsets as raw UInt32 LE array
+    // Write offsets: raw if N*4 <= 256, StreamVByte encoded otherwise
     let offsets_bytes: Vec<u8> = offsets.iter().flat_map(|o| o.to_le_bytes()).collect();
-    buf.extend_from_slice(&offsets_bytes);
+    write_raw_or_encoded(buf, &offsets_bytes);
 
-    // Write value_len (8 bytes) + char data
+    // Write value_len (8 bytes) + chars (raw if <= 256, LZ4 compressed otherwise)
     let value_len = all_chars.len() as u64;
     buf.extend_from_slice(&value_len.to_le_bytes());
-    buf.extend_from_slice(&all_chars);
+    if all_chars.len() <= SERIALIZED_MEM_SIZE_LIMIT {
+        buf.extend_from_slice(&all_chars);
+    } else {
+        let compressed = lz4_flex::compress(&all_chars);
+        buf.extend_from_slice(&(compressed.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&compressed);
+    }
 
     Ok(())
 }
@@ -519,8 +581,150 @@ mod tests {
             RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![] as Vec<i32>))]).unwrap();
 
         let ipc = make_ipc(&batch);
-        let (pblock, num_rows) = arrow_ipc_to_pblock(&ipc).unwrap();
+        let (_pblock, num_rows) = arrow_ipc_to_pblock(&ipc).unwrap();
 
         assert_eq!(num_rows, 0);
+    }
+
+    #[test]
+    fn test_streamvbyte_roundtrip() {
+        use crate::pblock_decoder::streamvbyte_decode;
+
+        // Mix of 1/2/3/4 byte values
+        let values: Vec<u32> = vec![0, 1, 127, 255, 256, 0xFFFF, 0x10000, 0xFFFFFFFF, 42];
+        let encoded = streamvbyte_encode(&values);
+        let decoded = streamvbyte_decode(&encoded, values.len()).unwrap();
+        assert_eq!(decoded, values);
+    }
+
+    #[test]
+    fn test_streamvbyte_encode_empty() {
+        let encoded = streamvbyte_encode(&[]);
+        assert!(encoded.is_empty());
+    }
+
+    /// Roundtrip: encode 100 INT64 rows (800 bytes > 256) → PBlock → decode → verify.
+    #[test]
+    fn test_roundtrip_large_fixed_column() {
+        use crate::pblock_decoder::decode_pblocks;
+
+        let n = 100;
+        let values: Vec<i64> = (0..n).map(|i| i * 1000 + 7).collect();
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(values.clone()))],
+        )
+        .unwrap();
+
+        let ipc = make_ipc(&batch);
+        let (pblock, num_rows) = arrow_ipc_to_pblock(&ipc).unwrap();
+        assert_eq!(num_rows, n as u32);
+
+        // Decode and verify
+        let decoded = decode_pblocks(&[pblock]).unwrap();
+        assert_eq!(decoded.num_rows, n as u32);
+        assert_eq!(decoded.columns.len(), 1);
+        let col = &decoded.columns[0];
+        assert_eq!(col.data.len(), n as usize * 8);
+        for (i, expected) in values.iter().enumerate() {
+            let got = i64::from_le_bytes(col.data[i * 8..(i + 1) * 8].try_into().unwrap());
+            assert_eq!(got, *expected, "mismatch at row {i}");
+        }
+    }
+
+    /// Roundtrip: 100 nullable INT32 rows (data 400 bytes > 256, triggers StreamVByte).
+    #[test]
+    fn test_roundtrip_large_nullable_column() {
+        use crate::pblock_decoder::decode_pblocks;
+
+        let n = 100;
+        let values: Vec<Option<i32>> = (0..n)
+            .map(|i| if i % 5 == 0 { None } else { Some(i * 3) })
+            .collect();
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, true)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(values.clone()))],
+        )
+        .unwrap();
+
+        let ipc = make_ipc(&batch);
+        let (pblock, num_rows) = arrow_ipc_to_pblock(&ipc).unwrap();
+        assert_eq!(num_rows, n as u32);
+
+        let decoded = decode_pblocks(&[pblock]).unwrap();
+        assert_eq!(decoded.num_rows, n as u32);
+        let col = &decoded.columns[0];
+        assert!(col.is_nullable);
+        let mask = col.null_mask.as_ref().unwrap();
+        for (i, expected) in values.iter().enumerate() {
+            if expected.is_none() {
+                assert_eq!(mask[i], 1, "expected null at row {i}");
+            } else {
+                assert_eq!(mask[i], 0, "expected non-null at row {i}");
+                let got = i32::from_le_bytes(col.data[i * 4..(i + 1) * 4].try_into().unwrap());
+                assert_eq!(got, expected.unwrap(), "value mismatch at row {i}");
+            }
+        }
+    }
+
+    /// Roundtrip: 100 strings (offsets > 256 bytes, chars > 256 bytes → LZ4).
+    #[test]
+    fn test_roundtrip_large_string_column() {
+        use crate::pblock_decoder::decode_pblocks;
+
+        let n = 100;
+        let strings: Vec<String> = (0..n).map(|i| format!("value_{:04}", i)).collect();
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(
+                strings.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            ))],
+        )
+        .unwrap();
+
+        let ipc = make_ipc(&batch);
+        let (pblock, num_rows) = arrow_ipc_to_pblock(&ipc).unwrap();
+        assert_eq!(num_rows, n as u32);
+
+        let decoded = decode_pblocks(&[pblock]).unwrap();
+        assert_eq!(decoded.num_rows, n as u32);
+        let col = &decoded.columns[0];
+        let offsets = col.offsets.as_ref().unwrap();
+        assert_eq!(offsets.len(), n as usize + 1);
+        for (i, expected) in strings.iter().enumerate() {
+            let start = offsets[i] as usize;
+            let end = offsets[i + 1] as usize;
+            let got = std::str::from_utf8(&col.data[start..end]).unwrap();
+            assert_eq!(got, expected, "string mismatch at row {i}");
+        }
+    }
+
+    /// Roundtrip: small column (< 256 bytes) uses raw path — regression test.
+    #[test]
+    fn test_roundtrip_small_column_raw() {
+        use crate::pblock_decoder::decode_pblocks;
+
+        let values = vec![1i32, 2, 3]; // 12 bytes, well under 256
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(values.clone()))],
+        )
+        .unwrap();
+
+        let ipc = make_ipc(&batch);
+        let (pblock, num_rows) = arrow_ipc_to_pblock(&ipc).unwrap();
+        assert_eq!(num_rows, 3);
+
+        let decoded = decode_pblocks(&[pblock]).unwrap();
+        assert_eq!(decoded.num_rows, 3);
+        let col = &decoded.columns[0];
+        for (i, expected) in values.iter().enumerate() {
+            let got = i32::from_le_bytes(col.data[i * 4..(i + 1) * 4].try_into().unwrap());
+            assert_eq!(got, *expected);
+        }
     }
 }

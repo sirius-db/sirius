@@ -135,6 +135,15 @@ pub async fn send_exchange_with_nixl(
                 ).await;
             };
 
+            // Fast-path: skip nixl if a previous registration already detected
+            // that UCX treats GPU memory as host memory (would SIGSEGV).
+            if !agent.gpu_transfer_enabled() {
+                tracing::info!("UCX lacks CUDA support for GPU memory, using bRPC for exchange");
+                return crate::exchange_sender::send_exchange_result(
+                    &ipc_bytes, destinations, query_id, node_id, sender_id,
+                ).await;
+            }
+
             // Try nixl GPU-direct for each destination, fall back to bRPC on failure.
             for dest in destinations {
                 if let Err(e) = send_nixl_to_peer(
@@ -164,7 +173,7 @@ pub async fn send_exchange_with_nixl(
 /// transfer → notify receiver of completion.
 #[cfg(feature = "nixl")]
 async fn send_nixl_to_peer(
-    agent: &NixlExchange,
+    agent: &Arc<NixlExchange>,
     src_buffers: &[GpuBufferDesc],
     column_info: &[(String, i32)],
     num_rows: u32,
@@ -183,8 +192,14 @@ async fn send_nixl_to_peer(
     let grpc_addr = format!("http://{}", dest.brpc_addr);
 
     // Step 1: Register sender's GPU result buffers with nixl agent.
+    // This also checks if UCX can identify the memory as GPU (VRAM).
+    // If UCX treats it as host memory, gpu_transfer_enabled is set to false.
     let buf_tuples: Vec<_> = src_buffers.iter().map(|b| (b.addr, b.len, b.device_id)).collect();
     agent.register_gpu_buffers(&buf_tuples)?;
+
+    if !agent.gpu_transfer_enabled() {
+        return Err("UCX cannot handle GPU memory (detected as host) — use bRPC".to_string());
+    }
 
     // Step 2: Get fresh metadata (includes newly registered buffers).
     let fresh_md = agent.get_fresh_metadata()?;
@@ -245,21 +260,27 @@ async fn send_nixl_to_peer(
     )?;
 
     // Step 5: Create descriptor lists and execute transfer.
-    // Scope the XferDescList values to drop them before the async .await below
-    // (they contain raw pointers that are !Send).
+    // The transfer uses a blocking poll loop, so run it on a blocking thread
+    // to avoid stalling the tokio runtime (which needs to handle concurrent
+    // exchange data, heartbeats, etc.).
     {
-        let device_id = src_buffers.first().map(|b| b.device_id).unwrap_or(0);
+        let agent = agent.clone();
         let src_ptrs: Vec<_> = src_buffers.iter().map(|b| (b.addr, b.len)).collect();
-        let src_descs = agent.create_gpu_descs(&src_ptrs, device_id)?;
-
         let dst_ptrs: Vec<_> = response
             .dst_buffers
             .iter()
             .map(|b| (b.addr as usize, b.len as usize))
             .collect();
-        let dst_descs = agent.create_gpu_descs(&dst_ptrs, device_id)?;
+        let device_id = src_buffers.first().map(|b| b.device_id).unwrap_or(0);
+        let remote = remote_name.clone();
 
-        agent.transfer_gpu_to_gpu(&src_descs, &dst_descs, &remote_name)?;
+        tokio::task::spawn_blocking(move || {
+            let src_descs = agent.create_gpu_descs(&src_ptrs, device_id)?;
+            let dst_descs = agent.create_gpu_descs(&dst_ptrs, device_id)?;
+            agent.transfer_gpu_to_gpu(&src_descs, &dst_descs, &remote)
+        })
+        .await
+        .map_err(|e| format!("transfer spawn_blocking panicked: {e}"))??;
     }
 
     info!(

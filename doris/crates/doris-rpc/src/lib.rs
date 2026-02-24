@@ -7,6 +7,8 @@
 pub mod arrow_to_pblock;
 pub mod backend_service;
 pub mod brpc_server;
+#[cfg(feature = "nixl")]
+pub mod cuda_driver;
 pub mod exchange_buffer;
 pub mod exchange_sender;
 pub mod fragment_manager;

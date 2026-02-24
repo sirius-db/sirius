@@ -177,55 +177,6 @@ fn serialize_result_batch(rows: &[Vec<u8>], packet_seq: i64) -> Result<Vec<u8>, 
 /// which has an EXCHANGE_NODE at the root with 0 children. After merge, the
 /// merged fragment may have a different local_params[0] so we must capture
 /// the correct finst_id before merge.
-fn find_result_finst_id(all_params: &[TPipelineFragmentParams]) -> Option<FinstId> {
-    // Strategy 1: find fragment with fragment_id == 0.
-    for params in all_params {
-        if params.fragment_id == Some(0) {
-            if let Some(lp) = params.local_params.as_ref().and_then(|lp| lp.first()) {
-                return Some(FinstId {
-                    hi: lp.fragment_instance_id.hi,
-                    lo: lp.fragment_instance_id.lo,
-                });
-            }
-        }
-    }
-    // Strategy 2: find the exchange_root fragment (EXCHANGE_NODE at root, 0 children).
-    for params in all_params {
-        let is_exchange_root = params
-            .fragment.as_ref()
-            .and_then(|f| f.plan.as_ref())
-            .and_then(|p| p.nodes.first())
-            .map(|n| n.node_type == TPlanNodeType::EXCHANGE_NODE && n.num_children == 0)
-            .unwrap_or(false);
-        if is_exchange_root {
-            if let Some(lp) = params.local_params.as_ref().and_then(|lp| lp.first()) {
-                return Some(FinstId {
-                    hi: lp.fragment_instance_id.hi,
-                    lo: lp.fragment_instance_id.lo,
-                });
-            }
-        }
-    }
-    None
-}
-
-fn extract_finst_id(params: &TPipelineFragmentParams) -> FinstId {
-    // FE calls fetch_data with local_params[0].fragment_instance_id, not query_id.
-    // For single-fragment queries these are often the same, but for multi-fragment
-    // plans the fragment_instance_id differs from query_id by an offset.
-    if let Some(lp) = params.local_params.as_ref().and_then(|lp| lp.first()) {
-        return FinstId {
-            hi: lp.fragment_instance_id.hi,
-            lo: lp.fragment_instance_id.lo,
-        };
-    }
-    // Fallback to query_id if no local_params available.
-    FinstId {
-        hi: params.query_id.hi,
-        lo: params.query_id.lo,
-    }
-}
-
 /// Map an Arrow DataType to a Doris PTypeDesc.
 ///
 /// TPrimitiveType values (from Doris thrift Types.thrift):
@@ -438,6 +389,35 @@ fn merge_fragment_plans(
         }
     }
 
+    // Log classification details for each fragment.
+    for (i, params) in all_params.iter().enumerate() {
+        let plan = params.fragment.as_ref().and_then(|f| f.plan.as_ref());
+        let node_types: Vec<_> = plan
+            .map(|p| p.nodes.iter().map(|n| (n.node_id, n.node_type, n.num_children)).collect())
+            .unwrap_or_default();
+        let dest_node_id = params
+            .fragment
+            .as_ref()
+            .and_then(|f| f.output_sink.as_ref())
+            .filter(|s| s.type_ == TDataSinkType::DATA_STREAM_SINK)
+            .and_then(|s| s.stream_sink.as_ref())
+            .map(|ss| ss.dest_node_id);
+        let sink_type = params
+            .fragment
+            .as_ref()
+            .and_then(|f| f.output_sink.as_ref())
+            .map(|s| format!("{:?}", s.type_));
+        info!(
+            fragment_idx = i,
+            fragment_id = ?params.fragment_id,
+            ?node_types,
+            ?dest_node_id,
+            ?sink_type,
+            per_exch = ?params.per_exch_num_senders,
+            "merge_fragment_plans: fragment detail"
+        );
+    }
+
     info!(
         num_exchange_root = exchange_root_fragments.len(),
         num_intermediate = intermediate_fragments.len(),
@@ -453,10 +433,24 @@ fn merge_fragment_plans(
         return exchange_root_fragments;
     }
 
-    // Check if any fragment has more exchange nodes than we have leaf fragments
-    // to fill them. Each EXCHANGE_NODE(0 children) needs one sender; if there are
-    // more exchange nodes than leaves, some exchanges receive from remote BEs and
-    // we must NOT merge (the exchange-root must wait for remote senders).
+    // Build set of exchange node IDs that local leaves can provide data for.
+    // A leaf's output_sink.stream_sink.dest_node_id tells us which EXCHANGE_NODE
+    // it feeds. EXCHANGE nodes not in this set depend on remote BEs.
+    let leaf_dest_ids: std::collections::HashSet<i32> = leaf_fragments
+        .iter()
+        .filter_map(|p| {
+            p.fragment
+                .as_ref()
+                .and_then(|f| f.output_sink.as_ref())
+                .filter(|s| s.type_ == TDataSinkType::DATA_STREAM_SINK)
+                .and_then(|s| s.stream_sink.as_ref())
+                .map(|ss| ss.dest_node_id)
+        })
+        .collect();
+
+    // Check if any fragment has EXCHANGE nodes that can't be satisfied by local
+    // leaves. This catches the case where an intermediate fragment depends on
+    // data from a remote BE (its EXCHANGE node ID not in leaf_dest_ids).
     let has_remote_exchanges = |params: &TPipelineFragmentParams| -> bool {
         let plan = match params.fragment.as_ref().and_then(|f| f.plan.as_ref()) {
             Some(p) => p,
@@ -466,16 +460,32 @@ fn merge_fragment_plans(
             n.node_type == TPlanNodeType::EXCHANGE_NODE && n.num_children == 0
         }).count();
 
-        // Also check per-exchange sender counts: if any single exchange expects
-        // more senders than available leaves, it has remote senders.
-        let any_excess = plan.nodes.iter().any(|n| {
+        // When leaves have proper dest_node_ids, check if every EXCHANGE node
+        // has a matching leaf. An EXCHANGE without a matching leaf depends on
+        // remote data. When leaves lack dest_node_ids (e.g. single leaf, no
+        // output sink), fall back to count-based check.
+        let has_unmatched = if !leaf_dest_ids.is_empty() {
+            plan.nodes.iter().any(|n| {
+                n.node_type == TPlanNodeType::EXCHANGE_NODE
+                    && n.num_children == 0
+                    && !leaf_dest_ids.contains(&n.node_id)
+            })
+        } else {
+            exchange_count > leaf_fragments.len()
+        };
+
+        // Also check per-exchange sender counts: if any exchange expects more
+        // than 1 sender, it receives from multiple BEs and can't be merged
+        // (we can only provide one local leaf's data).
+        let any_multi_sender = plan.nodes.iter().any(|n| {
             n.node_type == TPlanNodeType::EXCHANGE_NODE
                 && n.num_children == 0
-                && get_num_senders(params, n.node_id) as usize > leaf_fragments.len()
+                && get_num_senders(params, n.node_id) > 1
         });
 
-        if exchange_count > leaf_fragments.len() || any_excess {
+        if has_unmatched || any_multi_sender {
             info!(
+                ?leaf_dest_ids,
                 exchange_count,
                 num_leaves = leaf_fragments.len(),
                 per_exch = ?params.per_exch_num_senders,
@@ -801,6 +811,9 @@ enum ExecPlan {
         sort_limit_sql: Option<String>,
     },
     Sql(String),
+    /// SQL that should only run on CPU (e.g. exchange fragments reading pre-computed data).
+    /// Skips gpu_execution() which can cause INTERNAL errors on non-GPU tables.
+    SqlCpuOnly(String),
 }
 
 /// Execute a plan via Sirius GPU, falling back to DuckDB CPU.
@@ -841,6 +854,10 @@ fn execute_plan(engine: &SiriusEngine, plan: ExecPlan) -> Result<Vec<u8>, String
                 engine.execute_sql(&sql).map_err(|e| e.to_string())
             }
         },
+        ExecPlan::SqlCpuOnly(sql) => {
+            tracing::info!(sql = %sql, "executing via CPU SQL (GPU skipped)");
+            engine.execute_sql(&sql).map_err(|e| e.to_string())
+        }
     }
 }
 
@@ -1011,6 +1028,104 @@ fn get_num_senders(params: &TPipelineFragmentParams, node_id: i32) -> u32 {
         .unwrap_or(1)
 }
 
+/// Generate SQL for AGG(finalize) over exchange table.
+///
+/// When an intermediate fragment has AGG(need_finalize=true) → EXCHANGE, the partial
+/// aggregation results are in the exchange table. The finalize needs to apply the
+/// merge function (SUM for count/sum, MIN for min, MAX for max) rather than
+/// re-running the original aggregate.
+///
+/// Returns `Some(sql)` if the pattern matches, `None` otherwise.
+fn generate_exchange_agg_merge_sql(
+    params: &TPipelineFragmentParams,
+    table_schemas: &std::collections::HashMap<String, Vec<String>>,
+) -> Option<String> {
+    let plan = params.fragment.as_ref()?.plan.as_ref()?;
+    let nodes = &plan.nodes;
+
+    // Pattern: AGG_NODE(1 child) → EXCHANGE_NODE(0 children)
+    if nodes.len() != 2 {
+        return None;
+    }
+    let agg = &nodes[0];
+    let exch = &nodes[1];
+    if agg.node_type != TPlanNodeType::AGGREGATION_NODE || agg.num_children != 1 {
+        return None;
+    }
+    if exch.node_type != TPlanNodeType::EXCHANGE_NODE || exch.num_children != 0 {
+        return None;
+    }
+    let agg_node = agg.agg_node.as_ref()?;
+    if !agg_node.need_finalize {
+        return None;
+    }
+
+    let table_name = format!("__EXCHANGE_TABLE_{}", exch.node_id);
+    let columns = table_schemas.get(&table_name)?;
+
+    // Determine grouping columns: first N columns are GROUP BY keys.
+    let num_grouping = agg_node.grouping_exprs.as_ref().map(|g| g.len()).unwrap_or(0);
+    let num_agg_fns = agg_node.aggregate_functions.len();
+
+    if columns.len() < num_grouping + num_agg_fns {
+        tracing::warn!(
+            columns = columns.len(), num_grouping, num_agg_fns,
+            "exchange table column count mismatch for AGG merge"
+        );
+        return None;
+    }
+
+    // Build SELECT list.
+    let mut select_parts = Vec::new();
+
+    // Grouping columns pass through.
+    for col in &columns[..num_grouping] {
+        select_parts.push(format!("\"{}\"", col));
+    }
+
+    // Aggregate columns: apply merge function.
+    for (i, agg_fn_expr) in agg_node.aggregate_functions.iter().enumerate() {
+        let col_idx = num_grouping + i;
+        let col = &columns[col_idx];
+
+        // Extract function name from the aggregate expression root node.
+        let func_name = agg_fn_expr.nodes.first().and_then(|n| {
+            n.fn_.as_ref().map(|f| f.name.function_name.as_str())
+        });
+
+        // Map original aggregate → merge function.
+        let merge_fn = match func_name {
+            Some("count") => "SUM",
+            Some("sum") | Some("multi_distinct_sum") => "SUM",
+            Some("min") => "MIN",
+            Some("max") => "MAX",
+            Some("any_value") => "ANY_VALUE",
+            Some(other) => {
+                tracing::warn!(func = other, "unknown aggregate merge function, defaulting to SUM");
+                "SUM"
+            }
+            None => "SUM",
+        };
+
+        select_parts.push(format!("{}(\"{}\") AS \"{}\"", merge_fn, col, col));
+    }
+
+    let select = select_parts.join(", ");
+
+    let sql = if num_grouping > 0 {
+        let group_cols: Vec<String> = (1..=num_grouping).map(|i| i.to_string()).collect();
+        format!(
+            "SELECT {} FROM \"{}\" GROUP BY {}",
+            select, table_name, group_cols.join(", ")
+        )
+    } else {
+        format!("SELECT {} FROM \"{}\"", select, table_name)
+    };
+
+    info!(sql = %sql, "generated exchange AGG merge SQL");
+    Some(sql)
+}
+
 /// Extract exchange send destinations from fragment params.
 ///
 /// Returns `(dest_node_id, destinations)` if this fragment's output should be
@@ -1134,10 +1249,6 @@ impl PBackendService for PBackendServiceHandler {
 
         info!(num_fragments = all_params.len(), "deserialized fragment params");
 
-        // Before merge: find the result-sink fragment's finst_id (fragment_id=0).
-        // FE always calls fetch_data with this finst_id regardless of merge.
-        let result_finst_id = find_result_finst_id(&all_params);
-
         // Merge multi-fragment plans for single-BE execution.
         // This replaces EXCHANGE_NODE(0 children) in intermediate fragments with
         // the leaf (scan) fragment's plan, producing a single executable plan.
@@ -1150,19 +1261,13 @@ impl PBackendService for PBackendServiceHandler {
         // Process each merged fragment.
         for params in &merged_params {
             // Determine the finst_id to store the result under.
-            // - Single-BE merged plan (1 fragment): FE calls fetch_data with query_id.
-            // - Multi-BE exchange (>1 fragment): FE calls fetch_data with the
-            //   exchange-root fragment's local_params[0].fragment_instance_id.
-            let finst_id = if merged_params.len() == 1 {
-                // Single-BE merged: FE uses query_id for fetch_data.
-                FinstId {
-                    hi: params.query_id.hi,
-                    lo: params.query_id.lo,
-                }
-            } else {
-                // Multi-BE exchange: FE uses fragment_instance_id.
-                // Prefer the result fragment's finst_id when available.
-                result_finst_id.unwrap_or_else(|| extract_finst_id(params))
+            // FE always calls fetch_data with the query_id, regardless of how
+            // many BEs or fragments are involved. Fragment instance IDs differ
+            // from query_id (e.g., query_id=...e81, fragment instance=...e82),
+            // so we must always use query_id for the result key.
+            let finst_id = FinstId {
+                hi: params.query_id.hi,
+                lo: params.query_id.lo,
             };
 
             // Check for unresolved exchange nodes (receive data from other BEs).
@@ -1355,43 +1460,66 @@ impl PBackendService for PBackendServiceHandler {
                     }
 
                     // Translate and execute.
-                    // Exchange-receiving fragments use SQL path: SetRel(UNION_ALL)
-                    // is not reliably supported by DuckDB's Substrait extension or
-                    // the GPU engine, and these fragments just combine pre-computed
-                    // exchange data — no GPU acceleration benefit.
-                    let use_sql = !exchange_node_ids.is_empty();
-                    let has_substrait = !use_sql && engine.lock().unwrap().has_substrait();
-                    let (exec_plan, output_names) = if has_substrait {
-                        match plan_translator::translate_fragment(&params, &table_schemas) {
-                            Ok(plan) => (ExecPlan::Substrait { bytes: plan.substrait_bytes, sort_limit_sql: plan.sort_limit_sql }, Some(plan.output_names)),
-                            Err(e) => {
-                                warn!(error = %e, "Substrait translation failed for exchange fragment");
+                    // Priority order:
+                    // 1. AGG(finalize) over exchange: generate merge SQL (SUM/MIN/MAX)
+                    // 2. UNION_NODE / pure EXCHANGE root: SQL path (DuckDB SetRel broken)
+                    // 3. Other (SORT/JOIN over exchange): Substrait path
+                    let (exec_plan, output_names) =
+                        if let Some(merge_sql) = generate_exchange_agg_merge_sql(&params, &table_schemas) {
+                            (ExecPlan::SqlCpuOnly(merge_sql), None)
+                        } else {
+                            let root_is_union = params.fragment.as_ref()
+                                .and_then(|f| f.plan.as_ref())
+                                .and_then(|p| p.nodes.first())
+                                .map(|n| n.node_type == TPlanNodeType::UNION_NODE
+                                    || (n.node_type == TPlanNodeType::EXCHANGE_NODE && n.num_children == 0))
+                                .unwrap_or(false);
+                            let use_sql = root_is_union;
+                            let has_substrait = !use_sql && engine.lock().unwrap().has_substrait();
+                            if has_substrait {
+                                match plan_translator::translate_fragment(&params, &table_schemas) {
+                                    Ok(plan) => (ExecPlan::Substrait { bytes: plan.substrait_bytes, sort_limit_sql: plan.sort_limit_sql }, Some(plan.output_names)),
+                                    Err(e) => {
+                                        warn!(error = %e, "Substrait translation failed for exchange fragment");
+                                        match plan_translator::translate_fragment_to_sql(&params) {
+                                            Ok(sql) => (ExecPlan::Sql(sql), None),
+                                            Err(e2) => {
+                                                warn!(error = %e2, "SQL translation also failed");
+                                                return;
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
                                 match plan_translator::translate_fragment_to_sql(&params) {
-                                    Ok(sql) => (ExecPlan::Sql(sql), None),
-                                    Err(e2) => {
-                                        warn!(error = %e2, "SQL translation also failed");
+                                    Ok(sql) => {
+                                        if use_sql {
+                                            info!(sql = %sql, "exchange fragment using CPU-only SQL path");
+                                        }
+                                        (ExecPlan::SqlCpuOnly(sql), None)
+                                    }
+                                    Err(e) => {
+                                        warn!(error = %e, "SQL translation failed for exchange fragment");
                                         return;
                                     }
                                 }
                             }
-                        }
-                    } else {
-                        match plan_translator::translate_fragment_to_sql(&params) {
-                            Ok(sql) => {
-                                if use_sql {
-                                    info!(sql = %sql, "exchange fragment using SQL path");
-                                }
-                                (ExecPlan::Sql(sql), None)
-                            }
-                            Err(e) => {
-                                warn!(error = %e, "SQL translation failed for exchange fragment");
-                                return;
-                            }
-                        }
-                    };
+                        };
 
                     // Check if this exchange fragment also needs to forward results.
                     let exchange_dests = extract_exchange_destinations(&params);
+
+                    // Extract sender_id from local_params (each BE gets a unique sender_id
+                    // for the same fragment, so the receiver's ExchangeBuffer can distinguish senders).
+                    let sender_id = params.local_params.as_ref()
+                        .and_then(|lp| lp.first())
+                        .map(|p| p.sender_id.unwrap_or(0))
+                        .unwrap_or(0);
+
+                    // For CPU-only plans (e.g. AGG merge SQL), skip GPU buffer detection
+                    // to avoid stale GPU buffers from a previous leaf execution being
+                    // mistakenly detected as the current result's location.
+                    let is_cpu_only = matches!(&exec_plan, ExecPlan::SqlCpuOnly(_));
 
                     let exec_result = tokio::task::spawn_blocking(move || -> Result<crate::nixl_integration::ExecutionLocation, String> {
                         let engine = engine.lock().unwrap();
@@ -1399,7 +1527,11 @@ impl PBackendService for PBackendServiceHandler {
                         if let Some(names) = output_names {
                             ipc_bytes = project_ipc_columns(&ipc_bytes, &names, None)?;
                         }
-                        Ok(crate::nixl_integration::detect_execution_location(ipc_bytes, &engine))
+                        if is_cpu_only {
+                            Ok(crate::nixl_integration::ExecutionLocation::Cpu(ipc_bytes))
+                        } else {
+                            Ok(crate::nixl_integration::detect_execution_location(ipc_bytes, &engine))
+                        }
                     })
                     .await;
 
@@ -1412,11 +1544,11 @@ impl PBackendService for PBackendServiceHandler {
                                     nixl_agent.as_ref(),
                                     #[cfg(not(feature = "nixl"))]
                                     None,
-                                    location, &dests, query_id, dest_node_id, 0,
+                                    location, &dests, query_id, dest_node_id, sender_id,
                                 ).await {
                                     warn!(error = %e, %finst_id, "exchange forward failed");
                                 }
-                                info!(%finst_id, "exchange fragment forward complete");
+                                info!(%finst_id, sender_id, "exchange fragment forward complete");
                             } else {
                                 let ipc_bytes = location.into_ipc_bytes();
                                 if let Err(e) = store.store_ipc_result(finst_id, &ipc_bytes) {

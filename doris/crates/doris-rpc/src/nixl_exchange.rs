@@ -77,6 +77,10 @@ pub struct NixlExchange {
     remote_agents: Mutex<HashMap<String, String>>,
     /// Active registration handles (dropped = deregistered).
     _registrations: Mutex<Vec<RegistrationHandle>>,
+    /// Whether GPU-direct transfers are available (UCX has CUDA support).
+    /// Starts `true`, set to `false` if `register_gpu_buffers` detects that
+    /// UCX treats GPU memory as host memory (avoids SIGSEGV during transfer).
+    gpu_transfer_enabled: std::sync::atomic::AtomicBool,
 }
 
 impl NixlExchange {
@@ -95,6 +99,14 @@ impl NixlExchange {
                 return None;
             }
         };
+
+        // Initialize CUDA context before UCX backend creation so that UCX
+        // can detect GPU memory types. Without this, UCX treats GPU pointers
+        // as host memory ("memory is detected as host"), causing SIGSEGV.
+        match crate::cuda_driver::ensure_cuda_context() {
+            Ok(()) => info!("CUDA context initialized for UCX GPU support"),
+            Err(e) => warn!(error = %e, "CUDA init failed, UCX will not support GPU-direct transfers"),
+        }
 
         // Create UCX backend for GPU transfers
         let (_, params) = match agent.get_plugin_params("UCX") {
@@ -122,7 +134,18 @@ impl NixlExchange {
             backend,
             remote_agents: Mutex::new(HashMap::new()),
             _registrations: Mutex::new(Vec::new()),
+            // Assume GPU-direct is available until register_gpu_buffers detects otherwise.
+            gpu_transfer_enabled: std::sync::atomic::AtomicBool::new(true),
         })
+    }
+
+    /// Whether GPU-direct transfers (RDMA/UCX) are available.
+    ///
+    /// Starts `true`, set to `false` when `register_gpu_buffers` detects that
+    /// UCX treats GPU memory as host memory. Callers should check this before
+    /// attempting `transfer_gpu_to_gpu` to avoid SIGSEGV.
+    pub fn gpu_transfer_enabled(&self) -> bool {
+        self.gpu_transfer_enabled.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Register GPU memory buffers with the nixl agent.
@@ -130,13 +153,34 @@ impl NixlExchange {
     /// Must be called before `get_fresh_metadata()` so that metadata
     /// includes the registered regions. Returns registration handles
     /// that deregister on drop.
+    ///
+    /// Also captures stderr during registration to detect if UCX treats GPU
+    /// memory as host memory. If detected, sets `gpu_transfer_enabled` to
+    /// `false` to prevent SIGSEGV during subsequent transfers.
     pub fn register_gpu_buffers(
         &self,
         buffers: &[(usize, usize, u64)], // (addr, len, device_id)
     ) -> Result<(), String> {
+        // Ensure the current thread has a CUDA context. The context created
+        // in try_new() is per-thread, so tokio worker threads need their own.
+        // Without this, UCX's cuPointerGetAttribute calls fail and GPU memory
+        // is misidentified as host memory.
+        if let Err(e) = crate::cuda_driver::ensure_cuda_context() {
+            warn!(error = %e, "CUDA context init failed in register_gpu_buffers");
+        }
+
         let mut opt = OptArgs::new().map_err(|e| format!("OptArgs::new: {e}"))?;
         opt.add_backend(&self.backend)
             .map_err(|e| format!("add_backend: {e}"))?;
+
+        // Capture stderr during registration to detect UCX "memory is detected
+        // as host" warning, which indicates GPU-direct transfers will SIGSEGV.
+        let old_stderr = unsafe { libc::dup(2) };
+        let mut pipe_fds = [0i32; 2];
+        let capturing = old_stderr >= 0 && unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } == 0;
+        if capturing {
+            unsafe { libc::dup2(pipe_fds[1], 2) };
+        }
 
         let mut regs = self._registrations.lock().unwrap();
         for &(addr, len, device_id) in buffers {
@@ -152,8 +196,39 @@ impl NixlExchange {
             regs.push(handle);
         }
 
+        // Restore stderr and check captured output.
+        if capturing {
+            unsafe { libc::dup2(old_stderr, 2) };
+            unsafe { libc::close(old_stderr) };
+            unsafe { libc::close(pipe_fds[1]) };
+
+            unsafe { libc::fcntl(pipe_fds[0], libc::F_SETFL, libc::O_NONBLOCK) };
+            let mut captured = vec![0u8; 4096];
+            let n = unsafe {
+                libc::read(pipe_fds[0], captured.as_mut_ptr() as _, captured.len())
+            };
+            unsafe { libc::close(pipe_fds[0]) };
+
+            if n > 0 {
+                let output = String::from_utf8_lossy(&captured[..n as usize]);
+                // Re-emit captured stderr so it's still visible in logs.
+                eprint!("{output}");
+                if output.contains("memory is detected as host") {
+                    warn!(
+                        "UCX treats GPU memory as host memory — disabling GPU-direct transfers \
+                         (will use bRPC fallback). Check UCX CUDA support configuration."
+                    );
+                    self.gpu_transfer_enabled
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        } else if old_stderr >= 0 {
+            unsafe { libc::close(old_stderr) };
+        }
+
         info!(
             num_buffers = buffers.len(),
+            gpu_transfer = self.gpu_transfer_enabled(),
             "registered GPU buffers with nixl agent"
         );
         Ok(())
@@ -239,7 +314,9 @@ impl NixlExchange {
     /// `dst_descs`: remote GPU memory descriptors (destination)
     /// `remote_agent`: name returned by `load_remote_metadata`
     ///
-    /// Returns when the transfer is complete.
+    /// Returns when the transfer is complete. Times out after 10 seconds
+    /// to avoid hanging when UCX can't handle GPU memory (returns error
+    /// so the caller can fall back to bRPC).
     pub fn transfer_gpu_to_gpu(
         &self,
         src_descs: &XferDescList,
@@ -262,7 +339,9 @@ impl NixlExchange {
             return Ok(());
         }
 
-        // Poll until complete
+        // Poll until complete, with a timeout to avoid hanging when UCX
+        // can't handle GPU memory (e.g. "memory is detected as host").
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             match self
                 .agent
@@ -274,6 +353,9 @@ impl NixlExchange {
                     return Ok(());
                 }
                 XferStatus::InProgress => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err("nixl transfer timed out after 10s (UCX may not support GPU memory on this system)".to_string());
+                    }
                     std::thread::yield_now();
                 }
             }

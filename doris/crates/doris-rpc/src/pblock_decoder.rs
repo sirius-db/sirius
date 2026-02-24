@@ -561,7 +561,7 @@ fn decode_single_block(block: &PBlock) -> Result<(Vec<DecodedColumn>, u32), Stri
 /// StreamVByte encodes N uint32 values. The format is:
 ///   control_bytes[(N+3)/4] + data_bytes[variable]
 /// Each control byte has 4 x 2-bit entries, each encoding the byte length (1-4) of a value.
-fn streamvbyte_decode(encoded: &[u8], count: usize) -> Result<Vec<u32>, String> {
+pub fn streamvbyte_decode(encoded: &[u8], count: usize) -> Result<Vec<u32>, String> {
     if count == 0 {
         return Ok(vec![]);
     }
