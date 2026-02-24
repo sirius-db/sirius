@@ -331,14 +331,13 @@ static void run_parquet_scan_test(std::string const& table_name,
   std::filesystem::remove(parquet_path);
 }
 
-static void run_multi_file_parquet_scan_test(
-  std::string const& table_prefix,
-  std::vector<size_t> const& file_row_counts,
-  int num_threads,
-  size_t batch_size,
-  size_t row_group_size                        = 0,
-  duckdb::vector<duckdb::idx_t> projection_ids = {},
-  batch_validator_t validator                  = validate_scanned_batches)
+static void run_multi_file_parquet_scan_test(std::string const& table_prefix,
+                                             std::vector<size_t> const& file_row_counts,
+                                             int num_threads,
+                                             size_t batch_size,
+                                             size_t row_group_size                        = 0,
+                                             duckdb::vector<duckdb::idx_t> projection_ids = {},
+                                             batch_validator_t validator = validate_scanned_batches)
 {
   REQUIRE(!file_row_counts.empty());
 
