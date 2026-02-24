@@ -294,7 +294,13 @@ class parquet_scan_task_local_state : public pipeline::sirius_pipeline_task_loca
    */
   [[nodiscard]] size_t get_reserved_compressed_bytes() const { return _reserved_compressed_bytes; }
 
-  [[nodiscard]] std::vector<cudf::size_type> move_rg_indices() { return std::move(_rg_indices); }
+  /**
+   * @brief Get the vector of row group indices assigned to this local state.
+   *
+   * @return A (const) reference to the vector of row group indices.
+   */
+  [[nodiscard]] std::vector<cudf::size_type> const& get_rg_indices() const { return _rg_indices; }
+  [[nodiscard]] std::vector<cudf::size_type>& get_rg_indices() { return _rg_indices; }
 
  private:
   size_t _file_idx;  ///< The file index of the parquet file to read

@@ -119,16 +119,14 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
   if (scan_op->function.in_out_function) {
     throw std::runtime_error(
       "[parquet_scan_task_global_state] In-out table functions are not supported in sirius "
-      "parquet "
-      "scans.");
+      "parquet scans.");
   }
 
   // Filter pushdown is not supported
   if (scan_op->dynamic_filters) {
     throw std::runtime_error(
       "[parquet_scan_task_global_state] Dynamic table filters are not supported in sirius "
-      "parquet "
-      "scans.");
+      "parquet scans.");
   }
 
   // Expect parquet_scan to be bound through the multi-file reader
@@ -348,7 +346,7 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
                                                   std::move(allocation),
                                                   std::move(reader),
                                                   g_state.get_options(),
-                                                  std::move(l_state.move_rg_indices()),
+                                                  std::move(l_state.get_rg_indices()),
                                                   std::move(new_byte_ranges),
                                                   l_state.get_reserved_compressed_bytes(),
                                                   l_state.get_reserved_uncompressed_bytes());
