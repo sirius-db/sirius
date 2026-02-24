@@ -82,6 +82,11 @@ void sirius_physical_partition::get_partition_keys_and_type(sirius_physical_oper
       static_cast<int>((op->estimated_cardinality + s_partition_size - 1) / s_partition_size);
     auto& hash_join_op = op->Cast<sirius_physical_hash_join>();
     for (duckdb::idx_t cond_idx = 0; cond_idx < hash_join_op.conditions.size(); cond_idx++) {
+      auto& condition = hash_join_op.conditions[cond_idx];
+      if (condition.comparison != duckdb::ExpressionType::COMPARE_EQUAL &&
+          condition.comparison != duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+        continue;
+      }
       std::optional<duckdb::idx_t> left_index =
         extract_bound_ref_index(*hash_join_op.conditions[cond_idx].left);
       std::optional<duckdb::idx_t> right_index =

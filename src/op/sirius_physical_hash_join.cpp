@@ -142,14 +142,9 @@ sirius_physical_hash_join::sirius_physical_hash_join(
 
   for (duckdb::idx_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
     auto& condition = conditions[cond_idx];
-    if (condition.comparison != duckdb::ExpressionType::COMPARE_EQUAL &&
-        condition.comparison != duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
-      printf("Unsupported non-equality condition comparison: %d\n",
-             static_cast<int>(condition.comparison));
-      printf("    left: %s\n", condition.left->ToString().c_str());
-      printf("    right: %s\n", condition.right->ToString().c_str());
-      is_equality_join = false;
-      break;
+    if (condition.comparison == duckdb::ExpressionType::COMPARE_EQUAL ||
+        condition.comparison == duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+      is_all_inequality_join = false;
     }
 
     // Extract left key index (may be BOUND_REF or BOUND_CAST wrapping a BOUND_REF)
@@ -404,9 +399,10 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
     throw std::runtime_error("Expected 2 input batches for hash join, got " +
                              std::to_string(input_batches.size()) + " input batches");
   }
-  if (!is_equality_join) {
-    throw std::runtime_error("Unsupported non-equality join of type type: " +
-                             duckdb::JoinTypeToString(join_type));
+  if (is_all_inequality_join) {
+    throw std::runtime_error(
+      "Error sirius_physical_hash_join being asked to do all inequality join of type: " +
+      duckdb::JoinTypeToString(join_type));
   }
 
   if (join_type == duckdb::JoinType::INNER || join_type == duckdb::JoinType::LEFT ||

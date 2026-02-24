@@ -121,7 +121,7 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
   std::vector<std::vector<uint64_t>> left_batch_ids;
   std::vector<std::vector<uint64_t>> right_batch_ids;
 
-  bool is_equality_join = true;
+  bool is_all_inequality_join = true;
   std::vector<cudf::size_type> left_key_col_indices;
   std::vector<cudf::size_type> right_key_col_indices;
   bool cast_necessary = false;
