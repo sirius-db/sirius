@@ -19,13 +19,16 @@
 #include "cudf/copying.hpp"
 #include "cudf/join/filtered_join.hpp"
 #include "cudf/join/join.hpp"
+#include "cudf/join/mixed_join.hpp"
 #include "cudf/table/table_view.hpp"
 #include "cudf/types.hpp"
 #include "cudf/unary.hpp"
+#include "cudf/utilities/memory_resource.hpp"
 #include "data/data_batch_utils.hpp"
 #include "duckdb/common/enums/physical_operator_type.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "expression_executor/gpu_expression_translator.hpp"
 #include "log/logging.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
@@ -142,10 +145,18 @@ sirius_physical_hash_join::sirius_physical_hash_join(
 
   for (duckdb::idx_t cond_idx = 0; cond_idx < conditions.size(); cond_idx++) {
     auto& condition = conditions[cond_idx];
-    if (condition.comparison == duckdb::ExpressionType::COMPARE_EQUAL ||
-        condition.comparison == duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
-      is_all_inequality_join = false;
+    const bool is_equality =
+      (condition.comparison == duckdb::ExpressionType::COMPARE_EQUAL ||
+       condition.comparison == duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM);
+
+    if (!is_equality) {
+      // Inequality conditions are handled at execute time via the cuDF mixed_join binary predicate.
+      // No key index extraction is needed here.
+      continue;
     }
+
+    is_all_inequality_join = false;
+    num_equality_conditions++;
 
     // Extract left key index (may be BOUND_REF or BOUND_CAST wrapping a BOUND_REF)
     key_cast_info cast_info;
@@ -191,6 +202,10 @@ sirius_physical_hash_join::sirius_physical_hash_join(
 
     key_casts.push_back(cast_info);
   }
+
+  // Mixed join: has at least one equality condition (for hashing) and at least one inequality
+  // condition (for the binary predicate).
+  is_mixed_join = !is_all_inequality_join && (num_equality_conditions < conditions.size());
 };
 
 //===--------------------------------------------------------------------===//
@@ -403,6 +418,232 @@ std::unique_ptr<operator_data> sirius_physical_hash_join::execute(const operator
     throw std::runtime_error(
       "Error sirius_physical_hash_join being asked to do all inequality join of type: " +
       duckdb::JoinTypeToString(join_type));
+  }
+
+  if (is_mixed_join) {
+    // Mixed join: equality conditions drive the hash table; inequality conditions are evaluated
+    // via a cuDF AST binary predicate on the full input tables.
+
+    auto keys                 = prepare_join_keys(input_batches,
+                                  left_key_col_indices,
+                                  right_key_col_indices,
+                                  cast_necessary,
+                                  key_casts,
+                                  stream);
+    cudf::table_view left_eq  = keys.left_keys;
+    cudf::table_view right_eq = keys.right_keys;
+
+    // Pass the full tables as conditional views so that AST column_reference indices, which are
+    // relative to the original input tables, resolve correctly without any remapping.
+    cudf::table_view left_full  = get_cudf_table_view(*input_batches[0]);
+    cudf::table_view right_full = get_cudf_table_view(*input_batches[1]);
+
+    sirius::gpu_expression_translator translator(stream, cudf::get_current_device_resource_ref());
+    auto pred =
+      translator.translate_join_conditions(conditions, num_equality_conditions, conditions.size());
+    if (!pred) {
+      throw std::runtime_error(
+        "In sirius_physical_hash_join: failed to translate mixed join inequality conditions to "
+        "cuDF AST predicate");
+    }
+
+    std::unique_ptr<rmm::device_uvector<cudf::size_type>> left_indices, right_indices;
+    bool collect_left  = true;
+    bool collect_right = true;
+
+    if (join_type == duckdb::JoinType::MARK) {
+      // MARK mixed join: find matching left rows via semi join, then build the mark column.
+      auto semi_indices = cudf::mixed_left_semi_join(left_eq,
+                                                     right_eq,
+                                                     left_full,
+                                                     right_full,
+                                                     pred->back(),
+                                                     cudf::null_equality::UNEQUAL,
+                                                     stream);
+
+      cudf::table_view left_cols_to_output = left_full.select(lhs_output_columns.col_idxs);
+      auto num_left_rows                   = left_cols_to_output.num_rows();
+
+      std::vector<std::unique_ptr<cudf::column>> mark_out_cols;
+      for (cudf::size_type i = 0; i < left_cols_to_output.num_columns(); i++) {
+        mark_out_cols.push_back(
+          std::make_unique<cudf::column>(left_cols_to_output.column(i), stream));
+      }
+
+      cudf::numeric_scalar<bool> false_scalar(false, true, stream);
+      auto mark_column = cudf::make_column_from_scalar(false_scalar, num_left_rows, stream);
+
+      if (semi_indices->size() > 0) {
+        cudf::numeric_scalar<bool> true_scalar(true, true, stream);
+        cudf::column_view scatter_map(cudf::data_type(cudf::type_id::INT32),
+                                      static_cast<cudf::size_type>(semi_indices->size()),
+                                      semi_indices->data(),
+                                      nullptr,
+                                      0,
+                                      0,
+                                      {});
+        auto scattered = cudf::scatter({std::ref(static_cast<cudf::scalar const&>(true_scalar))},
+                                       scatter_map,
+                                       cudf::table_view({mark_column->view()}),
+                                       stream);
+        mark_column    = std::move(scattered->release()[0]);
+      }
+
+      mark_out_cols.push_back(std::move(mark_column));
+      auto output_cudf_table = std::make_unique<cudf::table>(std::move(mark_out_cols), stream);
+      return std::make_unique<operator_data>(std::vector<std::shared_ptr<::cucascade::data_batch>>{
+        make_data_batch(std::move(output_cudf_table), *input_batches[0]->get_memory_space())});
+    } else if (join_type == duckdb::JoinType::INNER) {
+      auto result   = cudf::mixed_inner_join(left_eq,
+                                           right_eq,
+                                           left_full,
+                                           right_full,
+                                           pred->back(),
+                                           cudf::null_equality::UNEQUAL,
+                                             {},
+                                           stream);
+      left_indices  = std::move(result.first);
+      right_indices = std::move(result.second);
+    } else if (join_type == duckdb::JoinType::LEFT) {
+      auto result   = cudf::mixed_left_join(left_eq,
+                                          right_eq,
+                                          left_full,
+                                          right_full,
+                                          pred->back(),
+                                          cudf::null_equality::UNEQUAL,
+                                            {},
+                                          stream);
+      left_indices  = std::move(result.first);
+      right_indices = std::move(result.second);
+    } else if (join_type == duckdb::JoinType::RIGHT) {
+      // Implement as a swapped left join: right becomes the probe side, left becomes the build
+      // side. The predicate is rebuilt with LEFT/RIGHT table references flipped to match.
+      auto swapped_pred = translator.translate_join_conditions(
+        conditions, num_equality_conditions, conditions.size(), /*swap_sides=*/true);
+      if (!swapped_pred) {
+        throw std::runtime_error(
+          "In sirius_physical_hash_join: failed to translate swapped predicate for RIGHT mixed "
+          "join");
+      }
+      auto result   = cudf::mixed_left_join(right_eq,
+                                          left_eq,
+                                          right_full,
+                                          left_full,
+                                          swapped_pred->back(),
+                                          cudf::null_equality::UNEQUAL,
+                                            {},
+                                          stream);
+      right_indices = std::move(result.first);
+      left_indices  = std::move(result.second);
+    } else if (join_type == duckdb::JoinType::OUTER) {
+      auto result   = cudf::mixed_full_join(left_eq,
+                                          right_eq,
+                                          left_full,
+                                          right_full,
+                                          pred->back(),
+                                          cudf::null_equality::UNEQUAL,
+                                            {},
+                                          stream);
+      left_indices  = std::move(result.first);
+      right_indices = std::move(result.second);
+    } else if (join_type == duckdb::JoinType::SEMI) {
+      left_indices  = cudf::mixed_left_semi_join(left_eq,
+                                                right_eq,
+                                                left_full,
+                                                right_full,
+                                                pred->back(),
+                                                cudf::null_equality::UNEQUAL,
+                                                stream);
+      collect_right = false;
+    } else if (join_type == duckdb::JoinType::ANTI) {
+      left_indices  = cudf::mixed_left_anti_join(left_eq,
+                                                right_eq,
+                                                left_full,
+                                                right_full,
+                                                pred->back(),
+                                                cudf::null_equality::UNEQUAL,
+                                                stream);
+      collect_right = false;
+    } else if (join_type == duckdb::JoinType::RIGHT_SEMI) {
+      auto swapped_pred = translator.translate_join_conditions(
+        conditions, num_equality_conditions, conditions.size(), /*swap_sides=*/true);
+      if (!swapped_pred) {
+        throw std::runtime_error(
+          "In sirius_physical_hash_join: failed to translate swapped predicate for RIGHT_SEMI "
+          "mixed join");
+      }
+      right_indices = cudf::mixed_left_semi_join(right_eq,
+                                                 left_eq,
+                                                 right_full,
+                                                 left_full,
+                                                 swapped_pred->back(),
+                                                 cudf::null_equality::UNEQUAL,
+                                                 stream);
+      collect_left  = false;
+    } else if (join_type == duckdb::JoinType::RIGHT_ANTI) {
+      auto swapped_pred = translator.translate_join_conditions(
+        conditions, num_equality_conditions, conditions.size(), /*swap_sides=*/true);
+      if (!swapped_pred) {
+        throw std::runtime_error(
+          "In sirius_physical_hash_join: failed to translate swapped predicate for RIGHT_ANTI "
+          "mixed join");
+      }
+      right_indices = cudf::mixed_left_anti_join(right_eq,
+                                                 left_eq,
+                                                 right_full,
+                                                 left_full,
+                                                 swapped_pred->back(),
+                                                 cudf::null_equality::UNEQUAL,
+                                                 stream);
+      collect_left  = false;
+    } else {
+      throw std::runtime_error("Unsupported join type for mixed join: " +
+                               duckdb::JoinTypeToString(join_type));
+    }
+
+    cudf::out_of_bounds_policy left_oob  = cudf::out_of_bounds_policy::DONT_CHECK;
+    cudf::out_of_bounds_policy right_oob = cudf::out_of_bounds_policy::DONT_CHECK;
+    if (join_type == duckdb::JoinType::LEFT || join_type == duckdb::JoinType::OUTER ||
+        join_type == duckdb::JoinType::SEMI) {
+      right_oob = cudf::out_of_bounds_policy::NULLIFY;
+    }
+    if (join_type == duckdb::JoinType::RIGHT || join_type == duckdb::JoinType::OUTER ||
+        join_type == duckdb::JoinType::RIGHT_SEMI) {
+      left_oob = cudf::out_of_bounds_policy::NULLIFY;
+    }
+
+    std::vector<std::unique_ptr<cudf::column>> out_cols;
+    if (collect_left) {
+      cudf::table_view left_cols_to_gather = left_full.select(lhs_output_columns.col_idxs);
+      cudf::column_view left_map_view(cudf::data_type(cudf::type_id::INT32),
+                                      left_indices->size(),
+                                      left_indices->data(),
+                                      nullptr,
+                                      0,
+                                      0,
+                                      {});
+      auto left_result = cudf::gather(left_cols_to_gather, left_map_view, left_oob, stream);
+      out_cols         = left_result->release();
+    }
+    if (collect_right) {
+      cudf::table_view right_cols_to_gather = right_full.select(rhs_output_columns.col_idxs);
+      cudf::column_view right_map_view(cudf::data_type(cudf::type_id::INT32),
+                                       right_indices->size(),
+                                       right_indices->data(),
+                                       nullptr,
+                                       0,
+                                       0,
+                                       {});
+      auto right_result   = cudf::gather(right_cols_to_gather, right_map_view, right_oob, stream);
+      auto right_out_cols = right_result->release();
+      for (auto& col : right_out_cols) {
+        out_cols.push_back(std::move(col));
+      }
+    }
+
+    auto output_cudf_table = std::make_unique<cudf::table>(std::move(out_cols), stream);
+    return std::make_unique<operator_data>(std::vector<std::shared_ptr<::cucascade::data_batch>>{
+      make_data_batch(std::move(output_cudf_table), *input_batches[0]->get_memory_space())});
   }
 
   if (join_type == duckdb::JoinType::INNER || join_type == duckdb::JoinType::LEFT ||
