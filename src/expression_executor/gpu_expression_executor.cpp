@@ -256,22 +256,24 @@ std::shared_ptr<cucascade::data_batch> GpuExpressionExecutor::execute(
   input_count          = static_cast<cudf::size_type>(input_table.num_rows());
 
   for (size_t i = 0; i < expressions.size(); ++i) {
-    // Execute the expression
-    auto const& expr      = *expressions[i];
-    auto result           = ExecuteExpression(i);
-    auto cudf_return_type = GetCudfType(expressions[i]->return_type);
-
-    // Cast the `result` from libcudf to `return_type` if `result` has a different type.
-    // E.g., `extract(year from col)` from libcudf returns int16_t but duckdb requires int64_t
-    // Only use cudf::cast when both types are fixed-width (cast does not support
-    // STRING/LIST/STRUCT).
-    if (result->type().id() != cudf_return_type.id()) {
-      if (IsFixedWidth(result->type()) && IsFixedWidth(cudf_return_type)) {
-        result = cudf::cast(result->view(), cudf_return_type, execution_stream, resource_ref);
-      } else {
-        throw InternalException("GpuExpressionExecutor: Unsupported type conversion: " +
-                                cudf::type_to_name(result->type()) + " to " +
-                                cudf::type_to_name(cudf_return_type));
+    auto const& expr = *expressions[i];
+    auto result      = ExecuteExpression(i);
+    // BOUND_REF: pass column through without type check (same as Execute(GPUIntermediateRelation)).
+    // The column is the actual input column; no cast is valid for string/non-fixed-width.
+    if (expr.expression_class != ExpressionClass::BOUND_REF) {
+      auto cudf_return_type = GetCudfType(expressions[i]->return_type);
+      // Cast the `result` from libcudf to `return_type` if `result` has a different type.
+      // E.g., `extract(year from col)` from libcudf returns int16_t but duckdb requires int64_t
+      // Only use cudf::cast when both types are fixed-width (cast does not support
+      // STRING/LIST/STRUCT).
+      if (result->type().id() != cudf_return_type.id()) {
+        if (IsFixedWidth(result->type()) && IsFixedWidth(cudf_return_type)) {
+          result = cudf::cast(result->view(), cudf_return_type, execution_stream, resource_ref);
+        } else {
+          throw InternalException("GpuExpressionExecutor: Unsupported type conversion: " +
+                                  cudf::type_to_name(result->type()) + " to " +
+                                  cudf::type_to_name(cudf_return_type));
+        }
       }
     }
     output_columns[i] = std::move(result);

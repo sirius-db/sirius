@@ -49,6 +49,15 @@ static fs::path get_tpch_db_path()
   return db_path;
 }
 
+struct sirius_config_env_guard {
+  sirius_config_env_guard(const std::string& config_path)
+  {
+    setenv("SIRIUS_CONFIG_FILE", config_path.c_str(), 1);
+  }
+
+  ~sirius_config_env_guard() { unsetenv("SIRIUS_CONFIG_FILE"); }
+};
+
 /**
  * @brief Catch2 test fixture for GPU execution tests.
  *
@@ -62,7 +71,7 @@ class GPUExecutionFixture {
     // Set up environment variable for config file
     auto cfg_path = fs::path(__FILE__).parent_path() / "integration.cfg";
     REQUIRE(fs::exists(cfg_path));
-    setenv("SIRIUS_CONFIG_FILE", cfg_path.string().c_str(), 1);
+    config_guard = std::make_unique<sirius_config_env_guard>(cfg_path.string());
 
     // Initialize DuckDB with integration database
     db  = std::make_unique<duckdb::DuckDB>(get_tpch_db_path().string());
@@ -87,7 +96,7 @@ class GPUExecutionFixture {
                           std::optional<float> float_tolerance = std::nullopt)
   {
     // Disable fallback so GPU errors are not silently hidden
-    con->Query("SET enable_fallback_check = true;");
+    con->Query("SET enable_duckdb_fallback = false;");
 
     // Run on GPU
     auto gpu_sql    = "CALL gpu_execution(\"" + query + "\")";
@@ -106,6 +115,12 @@ class GPUExecutionFixture {
     // Compare dimensions
     REQUIRE(gpu_result->ColumnCount() == cpu_result->ColumnCount());
     REQUIRE(gpu_result->RowCount() == cpu_result->RowCount());
+
+    if (gpu_result->RowCount() > 50000) {
+      std::cout << "WARNING: Integration result num rows is: " << gpu_result->RowCount()
+                << ". Please consider modifying test to make it smaller and run faster."
+                << std::endl;
+    }
 
     // Use DuckDB to sort both result sets by all columns for deterministic comparison.
     // This avoids lexicographic vs numeric sort issues.
@@ -161,6 +176,7 @@ class GPUExecutionFixture {
 
   std::unique_ptr<duckdb::DuckDB> db;
   std::unique_ptr<duckdb::Connection> con;
+  std::unique_ptr<sirius_config_env_guard> config_guard;
 };
 
 //===----------------------------------------------------------------------===//
@@ -852,6 +868,187 @@ TEST_CASE_METHOD(GPUExecutionFixture,
     "semi join nation n on n.n_nationkey = c.c_custkey;");
 }
 
+/*
+Anti Join Tests
+===============
+Each test mirrors its semi join counterpart, replacing `semi join` with `anti join`.
+All tests use `compare_gpu_vs_cpu` to validate GPU results against CPU execution.
+
+left anti join
+-  nation ANTI JOIN region on matching keys (n_regionkey = r_regionkey)
+
+left anti join 2
+- nation ANTI JOIN region on mismatched keys (n_nationkey = r_regionkey)
+
+left anti join 3-4
+- nation ANTI JOIN customer on n_nationkey = c_nationkey, varying selected columns (both keys,
+non-key only, string column)
+
+left anti join misfit 0-1
+- customer ANTI JOIN nation, reversed table order with mismatched keys
+
+ */
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - left anti join",
+                 "[integration][gpu_execution][antijoin]")
+{
+  compare_gpu_vs_cpu(
+    "select n.n_nationkey from nation n anti join region r on n.n_regionkey = r.r_regionkey;");
+}
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - left anti join 2",
+                 "[integration][gpu_execution][antijoin]")
+{
+  compare_gpu_vs_cpu(
+    "select n.n_nationkey from nation n anti join region r on n.n_nationkey = r.r_regionkey;");
+}
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - left anti join 3",
+                 "[integration][gpu_execution][antijoin]")
+{
+  compare_gpu_vs_cpu(
+    "select c.c_nationkey, c.c_name "
+    "from customer c anti join nation n on c.c_nationkey = n.n_nationkey;");
+}
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - left anti join 4",
+                 "[integration][gpu_execution][antijoin]")
+{
+  compare_gpu_vs_cpu(
+    "select c.c_nationkey, c.c_custkey, c.c_name  "
+    "from customer c anti join nation n on n.n_nationkey = c.c_nationkey;");
+}
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - left anti join misfit 0",
+                 "[integration][gpu_execution][antijoin]")
+{
+  compare_gpu_vs_cpu(
+    "select c.c_nationkey, c.c_custkey, c.c_name  "
+    "from customer c anti join nation n on n.n_nationkey = c.c_custkey;");
+}
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - left anti join misfit 1",
+                 "[integration][gpu_execution][antijoin]")
+{
+  compare_gpu_vs_cpu(
+    "select c.c_custkey, c.c_name  from customer c "
+    "anti join nation n on n.n_nationkey = c.c_custkey;");
+}
+
+/*
+Right Anti Join Tests
+=====================
+DuckDB's optimizer promotes an anti join to RIGHT_ANTI when the smaller table
+is on the left. These tests place the smaller table (region/nation) on the left
+so the planner chooses RIGHT_ANTI, exercising the RIGHT_ANTI code path.
+All tests use `compare_gpu_vs_cpu` to validate GPU results against CPU execution.
+
+right anti join
+- region ANTI JOIN nation on matching keys (r_regionkey = n_regionkey)
+
+right anti join 2
+- region ANTI JOIN nation on mismatched keys (r_regionkey = n_nationkey)
+
+right anti join 3
+- nation ANTI JOIN customer on n_nationkey = c_nationkey, varying selected columns (both keys,
+non-key only, string column)
+
+right anti join misfit
+- nation ANTI JOIN customer on n_nationkey = c_custkey, keys that don't naturally align, producing
+different filtering
+
+ */
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - right anti join",
+                 "[integration][gpu_execution][antijoin]")
+{
+  compare_gpu_vs_cpu(
+    "select r.r_regionkey from region r anti join nation n on r.r_regionkey = n.n_regionkey;");
+}
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - right anti join 2",
+                 "[integration][gpu_execution][antijoin]")
+{
+  compare_gpu_vs_cpu(
+    "select r.r_regionkey from region r anti join nation n on r.r_regionkey = n.n_nationkey;");
+}
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - right anti join 3",
+                 "[integration][gpu_execution][antijoin]")
+{
+  compare_gpu_vs_cpu(
+    "select n.n_nationkey, n.n_regionkey "
+    "from nation n anti join customer c on n.n_nationkey = c.c_nationkey;");
+}
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - right anti join misfit",
+                 "[integration][gpu_execution][antijoin]")
+{
+  compare_gpu_vs_cpu(
+    "select n.n_nationkey, n.n_regionkey  "
+    "from nation n anti join customer c on n.n_nationkey = c.c_custkey;");
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+// Partitioned join tests
+// ======================
+// Force _num_partitions >= 2 by setting the partition size to 1 row, so that hash partitioning
+// actually runs for all joins even with small TPC-H tables. Without this, all existing anti/semi
+// join tests use tables small enough that _num_partitions = ceil(n / 10M) = 1, which skips
+// partitioning entirely.
+///////////////////////////////////////////////////////////////////////////////////////////////////
+
+// RAII guard to reset partition size after each test, even on failure.
+struct partition_size_guard {
+  explicit partition_size_guard(duckdb::idx_t size)
+  {
+    sirius::op::sirius_physical_partition::set_partition_size(size);
+  }
+  ~partition_size_guard() { sirius::op::sirius_physical_partition::reset_partition_size(); }
+};
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - partitioned anti join (probe key not at col 0)",
+                 "[integration][gpu_execution][antijoin][partitioned_join]")
+{
+  // n.n_regionkey is not column 0 in nation — this is the index mismatch that triggered the bug.
+  partition_size_guard guard(1);
+  compare_gpu_vs_cpu(
+    "select n.n_nationkey from nation n anti join region r on n.n_regionkey = r.r_regionkey;");
+}
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - partitioned semi join (probe key not at col 0)",
+                 "[integration][gpu_execution][semijoin][partitioned_join]")
+{
+  // Same shape as the anti join above — verifies the fix didn't break semi join partitioning.
+  partition_size_guard guard(1);
+  compare_gpu_vs_cpu(
+    "select n.n_nationkey from nation n semi join region r on n.n_regionkey = r.r_regionkey;");
+}
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - partitioned inner join (key not at col 0)",
+                 "[integration][gpu_execution][partitioned_join]")
+{
+  partition_size_guard guard(1);
+  compare_gpu_vs_cpu(
+    "select n.n_nationkey, n.n_regionkey, r.r_name "
+    "from nation n join region r on n.n_regionkey = r.r_regionkey;");
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+
 TEST_CASE_METHOD(GPUExecutionFixture,
                  "gpu_execution - bigger inner join",
                  "[integration][gpu_execution][bigger_join]")
@@ -890,6 +1087,163 @@ TEST_CASE_METHOD(GPUExecutionFixture,
     "select l.l_orderkey, l.l_linenumber, l.l_quantity, l.l_partkey, o.o_orderkey, o.o_totalprice, "
     "o.o_custkey, o_comment from lineitem l full outer join orders o on l.l_orderkey = "
     "o.o_orderkey order by l.l_orderkey, l.l_linenumber;");
+}
+
+//===----------------------------------------------------------------------===//
+// Nested loop join tests
+//===----------------------------------------------------------------------===//
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - nested loop inner join single inequality condition",
+                 "[integration][gpu_execution][nested_loop_join]")
+{
+  compare_gpu_vs_cpu(
+    "select n.n_nationkey, n.n_name,  c.c_nationkey, c.c_custkey, c.c_name  from nation n join "
+    "customer c "
+    "on n.n_nationkey < c.c_nationkey where c.c_custkey < 100 "
+    "order by c.c_custkey, n.n_nationkey limit 1000;");
+}
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - nested loop inner join double inequality condition",
+                 "[integration][gpu_execution][nested_loop_join]")
+{
+  compare_gpu_vs_cpu(
+    "select ps.ps_partkey, ps.ps_suppkey, l.l_orderkey from lineitem l join partsupp ps "
+    "on l.l_partkey < ps.ps_partkey and l.l_suppkey > ps.ps_suppkey "
+    "where l.l_orderkey < 1000 and ps.ps_partkey < 1000"
+    "order by ps.ps_partkey, ps.ps_suppkey, l.l_orderkey limit 1000;");
+}
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - nested loop inner join double inequality condition, one "
+                 "condition needing casting",
+                 "[integration][gpu_execution][nested_loop_join]")
+{
+  compare_gpu_vs_cpu(
+    "select n.n_nationkey, n.n_name,  c.c_nationkey, c.c_custkey, c.c_name  from nation n "
+    "join customer c on n.n_nationkey > c.c_custkey and n.n_nationkey <= c.c_nationkey "
+    "where c.c_custkey < 1000 order by c.c_custkey, n.n_nationkey limit 1000;");
+}
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - nested loop left join single inequality condition",
+                 "[integration][gpu_execution][nested_loop_join]")
+{
+  compare_gpu_vs_cpu(
+    "select n.n_nationkey, n.n_name,  c.c_nationkey, c.c_custkey, c.c_name  from nation n left "
+    "join customer c "
+    "on n.n_nationkey < c.c_nationkey where c.c_custkey < 100 "
+    "order by c.c_custkey, n.n_nationkey limit 1000;");
+}
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - nested loop left join double inequality condition",
+                 "[integration][gpu_execution][nested_loop_join]")
+{
+  compare_gpu_vs_cpu(
+    "select ps.ps_partkey, ps.ps_suppkey, l.l_orderkey from lineitem l left join partsupp ps "
+    "on l.l_partkey < ps.ps_partkey and l.l_suppkey > ps.ps_suppkey "
+    "where l.l_orderkey < 1000 and ps.ps_partkey < 1000"
+    "order by ps.ps_partkey, ps.ps_suppkey, l.l_orderkey limit 1000;");
+}
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - nested loop left join double inequality condition, one condition "
+                 "needing casting",
+                 "[integration][gpu_execution][nested_loop_join]")
+{
+  compare_gpu_vs_cpu(
+    "select n.n_nationkey, n.n_name,  c.c_nationkey, c.c_custkey, c.c_name  from nation n "
+    "left join customer c on n.n_nationkey > c.c_custkey and n.n_nationkey <= c.c_nationkey "
+    "where c.c_custkey < 1000 order by c.c_custkey, n.n_nationkey limit 1000;");
+}
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - nested loop right join single inequality condition",
+                 "[integration][gpu_execution][nested_loop_join]")
+{
+  compare_gpu_vs_cpu(
+    "select n.n_nationkey, n.n_name,  c.c_nationkey, c.c_custkey, c.c_name  from nation n right "
+    "join customer c "
+    "on n.n_nationkey < c.c_nationkey where c.c_custkey < 100 "
+    "order by c.c_custkey, n.n_nationkey limit 1000;");
+}
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - nested loop right join double inequality condition",
+                 "[integration][gpu_execution][nested_loop_join]")
+{
+  compare_gpu_vs_cpu(
+    "select ps.ps_partkey, ps.ps_suppkey, l.l_orderkey from lineitem l right join partsupp ps "
+    "on l.l_partkey < ps.ps_partkey and l.l_suppkey > ps.ps_suppkey "
+    "where l.l_orderkey < 1000 and ps.ps_partkey < 1000"
+    "order by ps.ps_partkey, ps.ps_suppkey, l.l_orderkey limit 1000;");
+}
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - nested loop right join double inequality condition, one "
+                 "condition needing casting",
+                 "[integration][gpu_execution][nested_loop_join]")
+{
+  compare_gpu_vs_cpu(
+    "select n.n_nationkey, n.n_name,  c.c_nationkey, c.c_custkey, c.c_name  from nation n "
+    "right join customer c on n.n_nationkey > c.c_custkey and n.n_nationkey <= c.c_nationkey "
+    "where c.c_custkey < 1000 order by c.c_custkey, n.n_nationkey limit 1000;");
+}
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - nested loop full outer join single inequality condition",
+                 "[.][integration_disabled][gpu_execution][nested_loop_join]")
+{
+  compare_gpu_vs_cpu(
+    "select n.n_nationkey, n.n_name,  c.c_nationkey, c.c_custkey, c.c_name  from nation n full "
+    "outer join customer c "
+    "on n.n_nationkey < c.c_nationkey where c.c_custkey < 100 "
+    "order by c.c_custkey, n.n_nationkey limit 1000;");
+}
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - nested loop full outer join double inequality condition",
+                 "[.][integration_disabled][gpu_execution][nested_loop_join]")
+{
+  compare_gpu_vs_cpu(
+    "select ps.ps_partkey, ps.ps_suppkey, l.l_orderkey from lineitem l full outer join partsupp ps "
+    "on l.l_partkey < ps.ps_partkey and l.l_suppkey > ps.ps_suppkey "
+    "where l.l_orderkey < 1000 and ps.ps_partkey < 1000"
+    "order by ps.ps_partkey, ps.ps_suppkey, l.l_orderkey limit 1000;");
+}
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - nested loop full outer join double inequality condition, one "
+                 "condition needing casting",
+                 "[.][integration_disabled][gpu_execution][nested_loop_join]")
+{
+  compare_gpu_vs_cpu(
+    "select n.n_nationkey, n.n_name,  c.c_nationkey, c.c_custkey, c.c_name  from nation n "
+    "full outer join customer c on n.n_nationkey > c.c_custkey and n.n_nationkey <= c.c_nationkey "
+    "where c.c_custkey < 1000 order by c.c_custkey, n.n_nationkey limit 1000;");
+}
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - nested loop inner join one equality and one inequality condition",
+                 "[integration][gpu_execution][nested_loop_join]")
+{
+  compare_gpu_vs_cpu(
+    "select n.n_nationkey, n.n_name,  c.c_nationkey, c.c_custkey, c.c_name  from nation n "
+    "join customer c on n.n_nationkey = c.c_nationkey and n.n_regionkey * 1000 < c.c_custkey order "
+    "by c.c_custkey, n.n_nationkey limit 1000;");
+}
+
+TEST_CASE_METHOD(GPUExecutionFixture,
+                 "gpu_execution - nested loop inner join two inequality condition",
+                 "[integration][gpu_execution][nested_loop_join]")
+{
+  compare_gpu_vs_cpu(
+    "select n.n_nationkey, n.n_name,  c.c_nationkey, c.c_custkey, c.c_name  from nation n "
+    "join customer c on n.n_nationkey < c.c_nationkey * 2 and n.n_regionkey * 1000 > c.c_custkey "
+    "order "
+    "by c.c_custkey, n.n_nationkey limit 1000;");
 }
 
 //===----------------------------------------------------------------------===//
@@ -1611,7 +1965,7 @@ TEST_CASE_METHOD(GPUExecutionFixture,
 
 TEST_CASE_METHOD(GPUExecutionFixture,
                  "gpu_execution - TPC-H Query 16",
-                 "[.][integration_disabled][gpu_execution][TPC-H][Q16]")
+                 "[integration][gpu_execution][TPC-H][Q16]")
 {
   compare_gpu_vs_cpu(
     "select p.p_brand, p.p_type, p.p_size, "

@@ -125,6 +125,16 @@ op::sirius_physical_operator* task_creator::get_operator_for_next_task(
   op::sirius_physical_operator* node)
 {
   if (node == nullptr) { return nullptr; }
+
+  if (node->type == ::sirius::op::SiriusPhysicalOperatorType::PARQUET_SCAN) {
+    size_t operator_id             = node->get_operator_id();
+    auto parquet_task_global_state = _parquet_scan_operator_global_state_map.at(operator_id);
+    if (parquet_task_global_state->has_more_partitions()) {
+      return node;
+    } else {
+      return nullptr;
+    }
+  }
   auto hint = node->get_next_task_hint();
 
   if (hint.has_value() && hint.value().hint == op::TaskCreationHint::READY) {
@@ -136,7 +146,14 @@ op::sirius_physical_operator* task_creator::get_operator_for_next_task(
     return hint.value().producer;
   } else if (hint.has_value() &&
              hint.value().hint == op::TaskCreationHint::WAITING_FOR_INPUT_DATA) {
-    return get_operator_for_next_task(hint.value().producer);
+    auto* producer = hint.value().producer;
+    // DuckDB scan tasks create their own continuations internally, so the
+    // task creator should never schedule additional scans from downstream.
+    // (Parquet scans are fine — they use partition indices that self-limit.)
+    if (producer != nullptr && producer->type == op::SiriusPhysicalOperatorType::DUCKDB_SCAN) {
+      return nullptr;
+    }
+    return get_operator_for_next_task(producer);
   }
   return nullptr;
 }

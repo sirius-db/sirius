@@ -5,7 +5,7 @@ platforms = ["linux-64", "linux-aarch64"]
 requires-pixi = ">=0.59"
 
 [activation]
-scripts = ["scripts/pixi_activate.sh", "setup_test_datasets.sh"]
+scripts = ["scripts/pixi_activate.sh"]
 
 [dependencies]
 cmake = "4.1.*"
@@ -27,6 +27,7 @@ libconfig = "*"
 libabseil = ">=20260107.0"
 duckdb = ">=1.4.4,<2"
 spdlog = "1.8.*"
+clang-tools = ">=21.1.8,<22"
 
 [tasks]
 

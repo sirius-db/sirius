@@ -74,7 +74,17 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
   //	TODO: Extend PWMJ to handle all comparisons and projection maps
   bool prefer_range_joins = duckdb::DBConfig::GetSetting<duckdb::PreferRangeJoinsSetting>(context);
   prefer_range_joins      = prefer_range_joins && can_iejoin;
-  if (has_equality && !prefer_range_joins) {
+  // Hash join only supports equality and NOT_DISTINCT_FROM; use nested loop join if any condition
+  // is non-equality (e.g. COMPARE_GREATERTHAN).
+  bool all_equality = true;
+  for (const auto& c : op.conditions) {
+    if (c.comparison != duckdb::ExpressionType::COMPARE_EQUAL &&
+        c.comparison != duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+      all_equality = false;
+      break;
+    }
+  }
+  if (has_equality && all_equality && !prefer_range_joins) {
     // Equality join with small number of keys : possible perfect join optimization
     // auto &join = Make<PhysicalHashJoin>(op, left, right, std::move(op.conditions), op.join_type,
     //                                     op.left_projection_map, op.right_projection_map,
@@ -97,49 +107,49 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
     return join;
   }
 
-  D_ASSERT(op.left_projection_map.empty());
-  duckdb::idx_t nested_loop_join_threshold =
-    duckdb::DBConfig::GetSetting<duckdb::NestedLoopJoinThresholdSetting>(context);
-  if (left->estimated_cardinality < nested_loop_join_threshold ||
-      right->estimated_cardinality < nested_loop_join_threshold) {
-    can_iejoin = false;
-    can_merge  = false;
-  }
+  // D_ASSERT(op.left_projection_map.empty());
+  // duckdb::idx_t nested_loop_join_threshold =
+  //   duckdb::DBConfig::GetSetting<duckdb::NestedLoopJoinThresholdSetting>(context);
+  // if (left->estimated_cardinality < nested_loop_join_threshold ||
+  //     right->estimated_cardinality < nested_loop_join_threshold) {
+  //   can_iejoin = false;
+  //   can_merge  = false;
+  // }
 
-  if (can_merge && can_iejoin) {
-    duckdb::idx_t merge_join_threshold =
-      duckdb::DBConfig::GetSetting<duckdb::MergeJoinThresholdSetting>(context);
-    if (left->estimated_cardinality < merge_join_threshold ||
-        right->estimated_cardinality < merge_join_threshold) {
-      can_iejoin = false;
-    }
-  }
+  // if (can_merge && can_iejoin) {
+  //   duckdb::idx_t merge_join_threshold =
+  //     duckdb::DBConfig::GetSetting<duckdb::MergeJoinThresholdSetting>(context);
+  //   if (left->estimated_cardinality < merge_join_threshold ||
+  //       right->estimated_cardinality < merge_join_threshold) {
+  //     can_iejoin = false;
+  //   }
+  // }
 
-  if (can_iejoin) {
-    throw duckdb::NotImplementedException("InequalityJoin not supported in GPU");
-    // return Make<PhysicalIEJoin>(op, left, right, std::move(op.conditions), op.join_type,
-    // op.estimated_cardinality,
-    //                             std::move(op.filter_pushdown));
-  }
-  if (can_merge) {
-    throw duckdb::NotImplementedException("Piecewise merge join not supported in GPU");
-    // range join: use piecewise merge join
-    // return Make<PhysicalPiecewiseMergeJoin>(op, left, right, std::move(op.conditions),
-    // op.join_type,
-    //                                         op.estimated_cardinality,
-    //                                         std::move(op.filter_pushdown));
-  }
+  // if (can_iejoin) {
+  //   throw duckdb::NotImplementedException("InequalityJoin not supported in GPU");
+  //   // return Make<PhysicalIEJoin>(op, left, right, std::move(op.conditions), op.join_type,
+  //   // op.estimated_cardinality,
+  //   //                             std::move(op.filter_pushdown));
+  // }
+  // if (can_merge) {
+  //   throw duckdb::NotImplementedException("Piecewise merge join not supported in GPU");
+  //   // range join: use piecewise merge join
+  //   // return Make<PhysicalPiecewiseMergeJoin>(op, left, right, std::move(op.conditions),
+  //   // op.join_type,
+  //   //                                         op.estimated_cardinality,
+  //   //                                         std::move(op.filter_pushdown));
+  // }
   if (duckdb::PhysicalNestedLoopJoin::IsSupported(op.conditions, op.join_type)) {
-    // inequality join: use nested loop
-    // return Make<PhysicalNestedLoopJoin>(op, left, right, std::move(op.conditions), op.join_type,
-    //                                     op.estimated_cardinality, std::move(op.filter_pushdown));
+    // inequality join: use nested loop; pass projection maps so output column order matches plan
     auto join =
       duckdb::make_uniq<sirius::op::sirius_physical_nested_loop_join>(op,
                                                                       std::move(left),
                                                                       std::move(right),
                                                                       std::move(op.conditions),
                                                                       op.join_type,
-                                                                      op.estimated_cardinality);
+                                                                      op.estimated_cardinality,
+                                                                      op.left_projection_map,
+                                                                      op.right_projection_map);
     return join;
   }
 
