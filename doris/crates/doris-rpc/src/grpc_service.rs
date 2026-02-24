@@ -817,7 +817,7 @@ enum ExecPlan {
 }
 
 /// Execute a plan via Sirius GPU, falling back to DuckDB CPU.
-fn execute_plan(engine: &SiriusEngine, plan: ExecPlan) -> Result<Vec<u8>, String> {
+fn execute_plan(engine: &SiriusEngine, plan: ExecPlan, no_cpu_fallback: bool) -> Result<Vec<u8>, String> {
     match plan {
         ExecPlan::Substrait { bytes, sort_limit_sql } => {
             // Strip SortRel/FetchRel from Substrait before GPU execution — the Sirius
@@ -834,6 +834,10 @@ fn execute_plan(engine: &SiriusEngine, plan: ExecPlan) -> Result<Vec<u8>, String
                     tracing::info!("executed via gpu_processing_substrait");
                     Ok(ipc)
                 }
+                Err(e) if no_cpu_fallback => {
+                    tracing::error!(error = %e, "gpu_processing_substrait failed (no CPU fallback)");
+                    Err(format!("GPU execution failed: {e}"))
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, "gpu_processing_substrait failed, falling back to CPU from_substrait");
                     from_substrait_with_sort(engine, &bytes, sort_limit_sql.as_deref())
@@ -848,6 +852,10 @@ fn execute_plan(engine: &SiriusEngine, plan: ExecPlan) -> Result<Vec<u8>, String
             Ok(ipc) => {
                 tracing::info!("executed via gpu_execution");
                 Ok(ipc)
+            }
+            Err(e) if no_cpu_fallback => {
+                tracing::error!(error = %e, "gpu_execution failed (no CPU fallback)");
+                Err(format!("GPU execution failed: {e}"))
             }
             Err(e) => {
                 tracing::warn!(error = %e, "gpu_execution failed, falling back to direct SQL");
@@ -1178,6 +1186,7 @@ pub struct PBackendServiceHandler {
     result_store: ResultStore,
     engine: Option<Arc<Mutex<SiriusEngine>>>,
     exchange_buffer: ExchangeBuffer,
+    no_cpu_fallback: bool,
     #[cfg(feature = "nixl")]
     nixl_agent: Option<Arc<super::nixl_exchange::NixlExchange>>,
 }
@@ -1188,12 +1197,14 @@ impl PBackendServiceHandler {
         result_store: ResultStore,
         engine: Option<Arc<Mutex<SiriusEngine>>>,
         exchange_buffer: ExchangeBuffer,
+        no_cpu_fallback: bool,
     ) -> Self {
         Self {
             state,
             result_store,
             engine,
             exchange_buffer,
+            no_cpu_fallback,
             #[cfg(feature = "nixl")]
             nixl_agent: None,
         }
@@ -1301,6 +1312,7 @@ impl PBackendService for PBackendServiceHandler {
                 };
                 let store = self.result_store.clone();
                 let buffer = self.exchange_buffer.clone();
+                let no_cpu_fallback = self.no_cpu_fallback;
                 #[cfg(feature = "nixl")]
                 let nixl_agent = self.nixl_agent.clone();
 
@@ -1523,7 +1535,7 @@ impl PBackendService for PBackendServiceHandler {
 
                     let exec_result = tokio::task::spawn_blocking(move || -> Result<crate::nixl_integration::ExecutionLocation, String> {
                         let engine = engine.lock().unwrap();
-                        let mut ipc_bytes = execute_plan(&engine, exec_plan)?;
+                        let mut ipc_bytes = execute_plan(&engine, exec_plan, no_cpu_fallback)?;
                         if let Some(names) = output_names {
                             ipc_bytes = project_ipc_columns(&ipc_bytes, &names, None)?;
                         }
@@ -1671,6 +1683,7 @@ impl PBackendService for PBackendServiceHandler {
                 }
             };
             let store = self.result_store.clone();
+            let no_cpu_fallback = self.no_cpu_fallback;
 
             // Check if this fragment's output should be sent to remote BEs.
             let exchange_dests = extract_exchange_destinations(params);
@@ -1678,7 +1691,7 @@ impl PBackendService for PBackendServiceHandler {
             // Sirius/DuckDB execution is blocking — run off the async runtime.
             let exec_result = tokio::task::spawn_blocking(move || -> Result<crate::nixl_integration::ExecutionLocation, String> {
                 let engine = engine.lock().unwrap();
-                let mut ipc_bytes = execute_plan(&engine, exec_plan)?;
+                let mut ipc_bytes = execute_plan(&engine, exec_plan, no_cpu_fallback)?;
                 if let Some(names) = output_names {
                     ipc_bytes = project_ipc_columns(&ipc_bytes, &names, output_indices.as_deref())?;
                 }
@@ -2182,6 +2195,7 @@ pub async fn start_grpc_server(
     result_store: ResultStore,
     engine: Option<Arc<Mutex<SiriusEngine>>>,
     exchange_buffer: ExchangeBuffer,
+    no_cpu_fallback: bool,
     #[cfg(feature = "nixl")]
     nixl_agent: Option<Arc<super::nixl_exchange::NixlExchange>>,
     #[cfg(not(feature = "nixl"))]
@@ -2206,6 +2220,7 @@ pub async fn start_grpc_server(
         result_store,
         engine,
         exchange_buffer.clone(),
+        no_cpu_fallback,
     );
 
     #[cfg(feature = "nixl")]

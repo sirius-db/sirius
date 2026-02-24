@@ -37,4 +37,10 @@ pub struct BeConfig {
     /// Defaults to the system hostname.
     #[arg(long)]
     pub advertise_host: Option<String>,
+
+    /// Disable CPU fallback: GPU execution errors are returned as-is instead
+    /// of silently falling back to DuckDB CPU execution. Useful for evaluating
+    /// Sirius GPU coverage (e.g. TPC-H queries).
+    #[arg(long, default_value_t = false)]
+    pub no_cpu_fallback: bool,
 }

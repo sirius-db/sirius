@@ -1,0 +1,89 @@
+# FE + 2 Sirius BEs, all with host networking (rootless Docker).
+# All services share the rootless Docker network namespace and
+# communicate via 127.0.0.1. BEs use different ports to avoid conflicts.
+#
+# Usage:
+#   docker compose -f doris/docker/docker-compose.host.yml up -d
+#   docker compose -f doris/docker/docker-compose.host.yml down
+services:
+  doris-fe:
+    image: apache/doris:fe-4.0.3
+    container_name: doris-fe
+    network_mode: host
+    environment:
+      - FE_SERVERS=fe1:127.0.0.1:9010
+      - FE_ID=1
+    volumes:
+      - doris-fe-meta:/opt/apache-doris/fe/doris-meta
+      - doris-fe-log:/opt/apache-doris/fe/log
+      - ./fe-host.conf:/opt/apache-doris/fe/conf/fe.conf
+    healthcheck:
+      test: ["CMD", "bash", "-c", "curl -s http://127.0.0.1:8030/api/health | grep -q success"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 15s
+
+  sirius-be: &sirius-be
+    image: ubuntu:22.04
+    container_name: sirius-be
+    network_mode: host
+    ipc: host
+    depends_on:
+      doris-fe:
+        condition: service_healthy
+    environment:
+      - LD_LIBRARY_PATH=/opt/nix-glibc:/opt/pixi-lib:/opt/pixi-nixl-lib:/opt/pixi-default/lib:/usr/local/nvidia/lib64
+      - RUST_LOG=doris_rpc=debug,plan_translator=debug,sirius_ffi=debug,info
+      - SIRIUS_EXTENSION_DIR=/opt/extensions
+      - NIXL_PLUGIN_DIR=/opt/pixi-nixl-lib/plugins
+      - UCX_COMPONENT_DIR=/opt/pixi-nixl-lib/ucx
+      - UCX_LOG_LEVEL=info
+      - UCX_MEMTYPE_CACHE=n
+    volumes:
+      - /nix/store/wb6rhpznjfczwlwx23zmdrrw74bayxw4-glibc-2.42-47/lib:/opt/nix-glibc:ro
+      - ../../.pixi/envs/doris/lib:/opt/pixi-lib:ro
+      - ../../.pixi/envs/doris-nixl/lib:/opt/pixi-nixl-lib:ro
+      - ../../.pixi/envs/default:/opt/pixi-default:ro
+      # Mount at the host path too — the sirius extension has a hardcoded RPATH.
+      - ../../.pixi/envs/default/lib:/home/matthijs/sirius/.pixi/envs/default/lib:ro
+      - ../target/release/sirius-doris-be:/opt/sirius-doris-be:ro
+      - ../../build/release/extension/sirius/sirius.duckdb_extension:/opt/extensions/sirius.duckdb_extension:ro
+      - ../thirdparty/duckdb-substrait-extension/build/release/extension/substrait/substrait.duckdb_extension:/opt/extensions/substrait.duckdb_extension:ro
+      - /data/tpch:/data/tpch:ro
+    entrypoint:
+      - /opt/nix-glibc/ld-linux-x86-64.so.2
+      - /opt/sirius-doris-be
+    command:
+      - --heartbeat-port=19050
+      - --be-port=19060
+      - --brpc-port=18060
+      - --http-port=18040
+      - --arrow-flight-port=18071
+      - --fe=127.0.0.1:9030
+      - --advertise-host=127.0.0.1
+      - --no-cpu-fallback
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: cdi
+              device_ids:
+                - nvidia.com/gpu=all
+              capabilities: [gpu]
+
+  sirius-be-2:
+    <<: *sirius-be
+    container_name: sirius-be-2
+    command:
+      - --heartbeat-port=19051
+      - --be-port=19061
+      - --brpc-port=18061
+      - --http-port=18041
+      - --arrow-flight-port=18072
+      - --fe=127.0.0.1:9030
+      - --advertise-host=127.0.0.1
+
+volumes:
+  doris-fe-meta:
+  doris-fe-log:

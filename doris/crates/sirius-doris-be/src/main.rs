@@ -81,6 +81,12 @@ fn main() {
                 Ok(()) => info!("GPU buffers initialized (2GB cache, 2GB processing)"),
                 Err(err) => warn!(error = %err, "GPU buffer init failed, gpu_execution will fall back to DuckDB CPU"),
             }
+            if config.no_cpu_fallback {
+                match e.set_no_cpu_fallback() {
+                    Ok(()) => info!("CPU fallback disabled (enable_fallback_check = true)"),
+                    Err(err) => warn!(error = %err, "failed to set enable_fallback_check"),
+                }
+            }
             Some(Arc::new(Mutex::new(e)))
         }
         Err(e) => {
@@ -211,7 +217,7 @@ async fn run(
     let nixl_for_grpc = None;
 
     if let Err(e) =
-        doris_rpc::grpc_service::start_grpc_server(&grpc_addr, grpc_state, grpc_store, engine, exchange_buffer, nixl_for_grpc).await
+        doris_rpc::grpc_service::start_grpc_server(&grpc_addr, grpc_state, grpc_store, engine, exchange_buffer, config.no_cpu_fallback, nixl_for_grpc).await
     {
         error!(error = %e, "PBackendService gRPC server exited with error");
     }

@@ -113,6 +113,21 @@ impl SiriusEngine {
         }
     }
 
+    /// Enable Sirius `enable_fallback_check` — throws for unsupported GPU ops.
+    pub fn set_no_cpu_fallback(&self) -> Result<(), EngineError> {
+        #[cfg(feature = "duckdb-bundled")]
+        {
+            self.conn
+                .execute_batch("SET enable_fallback_check = true")
+                .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+            Ok(())
+        }
+        #[cfg(not(feature = "duckdb-bundled"))]
+        {
+            Ok(())
+        }
+    }
+
     /// Whether the Substrait extension is loaded (needed for `from_substrait`).
     pub fn has_substrait(&self) -> bool {
         #[cfg(feature = "duckdb-bundled")]

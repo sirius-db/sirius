@@ -316,6 +316,42 @@ fn encode_string_data(
     Ok(())
 }
 
+/// Convert days since 1970-01-01 (Arrow Date32) to Doris DATEv2 packed uint32.
+/// DATEv2 = (year << 9) | (month << 5) | day
+fn days_to_datev2(days: i32) -> u32 {
+    // Civil date from days since epoch (algorithm from Howard Hinnant).
+    let z = days + 719468; // shift epoch to 0000-03-01
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i32 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    ((y as u32) << 9) | (m << 5) | d
+}
+
+/// Convert microseconds since 1970-01-01 (Arrow Timestamp) to Doris DATETIMEV2 packed uint64.
+/// DATETIMEV2 = (year<<46 | month<<42 | day<<37 | hour<<32 | minute<<26 | second<<20 | microseconds)
+fn micros_to_datetimev2(micros: i64) -> u64 {
+    let total_secs = micros.div_euclid(1_000_000);
+    let us = micros.rem_euclid(1_000_000) as u64;
+    let days = total_secs.div_euclid(86400) as i32;
+    let day_secs = total_secs.rem_euclid(86400) as u64;
+    let hour = day_secs / 3600;
+    let minute = (day_secs % 3600) / 60;
+    let second = day_secs % 60;
+
+    let datev2 = days_to_datev2(days);
+    let year = (datev2 >> 9) as u64;
+    let month = ((datev2 >> 5) & 0xF) as u64;
+    let day = (datev2 & 0x1F) as u64;
+
+    (year << 46) | (month << 42) | (day << 37) | (hour << 32) | (minute << 26) | (second << 20) | us
+}
+
 /// Append fixed-width column data from an Arrow array to the buffer.
 fn append_fixed_width_data(
     col: &dyn arrow::array::Array,
@@ -348,36 +384,47 @@ fn append_fixed_width_data(
         DataType::Float32 => append_primitive_buffer::<Float32Type>(col, buf),
         DataType::Float64 => append_primitive_buffer::<Float64Type>(col, buf),
         DataType::Date32 => {
-            // Doris DATEv2 is uint32
+            // Arrow Date32 = days since 1970-01-01.
+            // Doris DATEv2 = packed uint32: (year<<9 | month<<5 | day).
             let arr = col.as_any().downcast_ref::<Date32Array>().unwrap();
             for i in 0..arr.len() {
-                buf.extend_from_slice(&(arr.value(i) as u32).to_le_bytes());
+                let days = arr.value(i);
+                let packed = days_to_datev2(days);
+                buf.extend_from_slice(&packed.to_le_bytes());
             }
         }
         DataType::Date64 => {
+            // Arrow Date64 = milliseconds since 1970-01-01.
+            // Doris DATEv2 = packed uint32: (year<<9 | month<<5 | day).
             let arr = col.as_any().downcast_ref::<Date64Array>().unwrap();
             for i in 0..arr.len() {
-                buf.extend_from_slice(&arr.value(i).to_le_bytes());
+                let millis = arr.value(i);
+                let days = (millis / 86_400_000) as i32;
+                let packed = days_to_datev2(days);
+                // Date64 maps to DATEv2 (4 bytes), not Date (8 bytes)
+                buf.extend_from_slice(&packed.to_le_bytes());
             }
         }
         DataType::Timestamp(_, _) => {
-            // Doris DATETIMEV2 is uint64
+            // Doris DATETIMEV2 = packed uint64:
+            //   (year<<46 | month<<42 | day<<37 | hour<<32 | minute<<26 | second<<20 | microseconds)
             let arr = col
                 .as_any()
                 .downcast_ref::<TimestampMicrosecondArray>()
                 .or_else(|| None);
             if let Some(arr) = arr {
                 for i in 0..arr.len() {
-                    buf.extend_from_slice(&(arr.value(i) as u64).to_le_bytes());
+                    let packed = micros_to_datetimev2(arr.value(i));
+                    buf.extend_from_slice(&packed.to_le_bytes());
                 }
             } else {
-                // Try other timestamp types — fall back to raw i64
                 let arr = col
                     .as_any()
                     .downcast_ref::<TimestampMillisecondArray>()
                     .unwrap();
                 for i in 0..arr.len() {
-                    buf.extend_from_slice(&(arr.value(i) as u64).to_le_bytes());
+                    let packed = micros_to_datetimev2(arr.value(i) * 1000);
+                    buf.extend_from_slice(&packed.to_le_bytes());
                 }
             }
         }
@@ -444,8 +491,7 @@ fn arrow_type_to_doris_type_id(dt: &arrow::datatypes::DataType) -> (i32, i32, i3
         DataType::UInt64 => (TypeId::Uint64 as i32, 0, 0),
         DataType::Float32 => (TypeId::Float as i32, 0, 0),
         DataType::Float64 => (TypeId::Double as i32, 0, 0),
-        DataType::Date32 => (TypeId::Datev2 as i32, 0, 0),
-        DataType::Date64 => (TypeId::Date as i32, 0, 0),
+        DataType::Date32 | DataType::Date64 => (TypeId::Datev2 as i32, 0, 0),
         DataType::Timestamp(_, _) => (TypeId::Datetimev2 as i32, 0, 0),
         DataType::Utf8 | DataType::LargeUtf8 => (TypeId::String as i32, 0, 0),
         DataType::Decimal128(p, s) => {
@@ -726,5 +772,49 @@ mod tests {
             let got = i32::from_le_bytes(col.data[i * 4..(i + 1) * 4].try_into().unwrap());
             assert_eq!(got, *expected);
         }
+    }
+
+    #[test]
+    fn test_days_to_datev2() {
+        // 1970-01-01 = day 0
+        assert_eq!(days_to_datev2(0), (1970 << 9) | (1 << 5) | 1);
+        // 1998-12-01 = day 10561
+        let packed = days_to_datev2(10561);
+        let y = packed >> 9;
+        let m = (packed >> 5) & 0xF;
+        let d = packed & 0x1F;
+        assert_eq!((y, m, d), (1998, 12, 1));
+        // 2024-02-29 (leap year)
+        let days_20240229 = 19782; // 2024-02-29
+        let packed = days_to_datev2(days_20240229);
+        let y = packed >> 9;
+        let m = (packed >> 5) & 0xF;
+        let d = packed & 0x1F;
+        assert_eq!((y, m, d), (2024, 2, 29));
+    }
+
+    /// Roundtrip: Date32 columns encode as packed DATEv2 and decode back correctly.
+    #[test]
+    fn test_roundtrip_date32_column() {
+        use crate::pblock_decoder::{column_to_sql_values, decode_pblocks};
+
+        // TPC-H-like dates: 1992-01-02, 1998-12-01
+        let days = vec![8036i32, 10561]; // days since epoch for those dates
+        let schema = Arc::new(Schema::new(vec![Field::new("d", DataType::Date32, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Date32Array::from(days.clone()))],
+        )
+        .unwrap();
+
+        let ipc = make_ipc(&batch);
+        let (pblock, num_rows) = arrow_ipc_to_pblock(&ipc).unwrap();
+        assert_eq!(num_rows, 2);
+
+        let decoded = decode_pblocks(&[pblock]).unwrap();
+        assert_eq!(decoded.num_rows, 2);
+        let sql_vals = column_to_sql_values(&decoded.columns[0], 2);
+        assert_eq!(sql_vals[0], "'1992-01-02'");
+        assert_eq!(sql_vals[1], "'1998-12-01'");
     }
 }
