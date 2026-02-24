@@ -75,7 +75,9 @@ sirius_physical_plan_generator::plan_comparison_join(duckdb::LogicalComparisonJo
   bool prefer_range_joins = duckdb::DBConfig::GetSetting<duckdb::PreferRangeJoinsSetting>(context);
   prefer_range_joins      = prefer_range_joins && can_iejoin;
 
-  if (has_equality && !prefer_range_joins) {
+  bool is_supported_by_hash_join =
+    sirius::op::sirius_physical_hash_join::are_conditions_supported(op.conditions);
+  if (is_supported_by_hash_join && !prefer_range_joins) {
     // Equality join with small number of keys : possible perfect join optimization
     // auto &join = Make<PhysicalHashJoin>(op, left, right, std::move(op.conditions), op.join_type,
     //                                     op.left_projection_map, op.right_projection_map,

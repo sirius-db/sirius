@@ -28,15 +28,87 @@
 #include "duckdb/common/enums/physical_operator_type.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
 #include "expression_executor/gpu_expression_translator.hpp"
 #include "log/logging.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 
 #include <cstdio>
+#include <unordered_set>
 
 namespace sirius {
 namespace op {
+
+/// Recursively collect all BoundReferenceExpression indices from an expression tree.
+static void collect_bound_ref_indices(duckdb::Expression& expr,
+                                      std::unordered_set<duckdb::idx_t>& indices)
+{
+  if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
+    indices.insert(expr.Cast<duckdb::BoundReferenceExpression>().index);
+    return;
+  }
+  duckdb::ExpressionIterator::EnumerateChildren(
+    expr, [&](duckdb::Expression& child) { collect_bound_ref_indices(child, indices); });
+}
+
+bool sirius_physical_hash_join::are_conditions_supported(
+  duckdb::vector<duckdb::JoinCondition>& conditions)
+{
+  // Must have at least one equality condition for a hash-based join.
+  bool has_equality = false;
+  for (auto const& cond : conditions) {
+    if (cond.comparison == duckdb::ExpressionType::COMPARE_EQUAL ||
+        cond.comparison == duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+      has_equality = true;
+      break;
+    }
+  }
+  if (!has_equality) { return false; }
+
+  // Pure equality join: always supported.
+  bool has_inequality = false;
+  for (auto const& cond : conditions) {
+    if (cond.comparison != duckdb::ExpressionType::COMPARE_EQUAL &&
+        cond.comparison != duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+      has_inequality = true;
+      break;
+    }
+  }
+  if (!has_inequality) { return true; }
+
+  // Mixed join: collect the column indices used on each side of the equality conditions.
+  std::unordered_set<duckdb::idx_t> equality_left_cols, equality_right_cols;
+  for (auto const& cond : conditions) {
+    if (cond.comparison != duckdb::ExpressionType::COMPARE_EQUAL &&
+        cond.comparison != duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+      continue;
+    }
+    collect_bound_ref_indices(*cond.left, equality_left_cols);
+    collect_bound_ref_indices(*cond.right, equality_right_cols);
+  }
+
+  // For each inequality condition, verify that its left/right column references don't overlap
+  // with the equality key columns on the same side. cuDF's mixed_join API requires the equality
+  // and conditional table columns to be disjoint.
+  for (auto const& cond : conditions) {
+    if (cond.comparison == duckdb::ExpressionType::COMPARE_EQUAL ||
+        cond.comparison == duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+      continue;
+    }
+    std::unordered_set<duckdb::idx_t> ineq_left_cols, ineq_right_cols;
+    collect_bound_ref_indices(*cond.left, ineq_left_cols);
+    collect_bound_ref_indices(*cond.right, ineq_right_cols);
+    for (auto const idx : ineq_left_cols) {
+      if (equality_left_cols.count(idx) > 0) { return false; }
+    }
+    for (auto const idx : ineq_right_cols) {
+      if (equality_right_cols.count(idx) > 0) { return false; }
+    }
+  }
+
+  return true;
+}
 
 void reorder_join_conditions(duckdb::vector<duckdb::JoinCondition>& conditions)
 {

@@ -97,6 +97,16 @@ class sirius_physical_hash_join : public sirius_physical_partition_consumer_oper
                                    pipeline::sirius_meta_pipeline& meta_pipeline,
                                    sirius_physical_operator& op,
                                    bool build_rhs = true);
+
+  /**
+   * @brief Returns true if the given join conditions can be handled by this operator.
+   *
+   * Requires at least one equality condition. For mixed joins (equality + inequality), also
+   * requires that no column referenced by an equality condition appears in any inequality
+   * condition on the same side — cuDF's mixed_join API requires disjoint equality and
+   * conditional table columns.
+   */
+  static bool are_conditions_supported(duckdb::vector<duckdb::JoinCondition>& conditions);
   void build_pipelines(pipeline::sirius_pipeline& current,
                        pipeline::sirius_meta_pipeline& meta_pipeline) override;
 
