@@ -37,11 +37,19 @@ if [ ! -d "$PARQUET_DIR" ]; then
     exit 1
 fi
 
-# Build CREATE VIEW statements for the TPC-H tables using glob patterns
+# Build CREATE VIEW statements for the TPC-H tables.
+# Match both single files (table.parquet) and partitioned files (table_0.parquet, table_1.parquet, ...).
+# A plain glob like part*.parquet would also match partsupp.parquet, so we collect
+# matching files with bash globs and pass an explicit list to read_parquet().
 TPCH_TABLES=(customer lineitem nation orders part partsupp region supplier)
 VIEW_SQL=""
 for TABLE_NAME in "${TPCH_TABLES[@]}"; do
-    VIEW_SQL+="CREATE VIEW ${TABLE_NAME} AS SELECT * FROM read_parquet('${PARQUET_DIR}/${TABLE_NAME}*.parquet');"$'\n'
+    FILES=()
+    for f in "$PARQUET_DIR/${TABLE_NAME}.parquet" "$PARQUET_DIR/${TABLE_NAME}_"*.parquet; do
+        [ -f "$f" ] && FILES+=("'$f'")
+    done
+    FILE_LIST=$(IFS=,; echo "${FILES[*]}")
+    VIEW_SQL+="CREATE VIEW ${TABLE_NAME} AS SELECT * FROM read_parquet([${FILE_LIST}]);"$'\n'
 done
 
 echo "Running TPC-H queries against SF${SF} parquet data"
