@@ -66,7 +66,7 @@ inline column_metadata make_flat_column_metadata(duckdb::LogicalType type,
   cm.scale            = cudf_type.scale();
   cm.has_data         = true;
   cm.data_offset      = data_offset;
-  cm.data_size        = 0;
+  cm.data_size        = static_cast<std::size_t>(num_rows) * cudf::size_of(cudf_type);
   cm.has_null_mask    = (null_count > 0);
   cm.null_mask_offset = cm.has_null_mask ? null_mask_offset : 0;
   cm.null_mask_size   = cm.has_null_mask ? static_cast<std::size_t>((num_rows + 7) / 8) : 0;
