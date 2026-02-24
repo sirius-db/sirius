@@ -391,12 +391,11 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
           }
           // cuDF requires output type == input type for fixed-point (decimal) reductions.
           // For AVG we use input type and apply return type in the merge step (SUM/COUNT).
-          // For decimals we must also use input column type.
+          // For SUM we widen (expected by duckdb) before the aggregation to avoid overflow.
           bool is_decimal = (col.type().id() == cudf::type_id::DECIMAL32 ||
                              col.type().id() == cudf::type_id::DECIMAL64 ||
                              col.type().id() == cudf::type_id::DECIMAL128);
-          // Widen decimal input for SUM to avoid overflow (DECIMAL32->DECIMAL64->DECIMAL128).
-          // MIN/MAX preserve the original type.
+
           std::unique_ptr<cudf::column> casted_col;
           if (spec.kind == aggregate_kind::SUM) {
             if (col.type().id() == cudf::type_id::DECIMAL32) {
