@@ -1884,7 +1884,17 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
     "from nation n join region r on n.n_regionkey = r.r_regionkey;");
 }
 
-TEST_CASE_METHOD(GPUExecutionFixture,
+TEST_CASE_METHOD(GPUExecutionParquetFixture,
+                 "gpu_execution - partitioned inner join (key not at col 0) parquet",
+                 "[integration][gpu_execution][parquet][partitioned_join]")
+{
+  partition_size_guard guard(1);
+  compare_gpu_vs_cpu(
+    "select n.n_nationkey, n.n_regionkey, r.r_name "
+    "from nation n join region r on n.n_regionkey = r.r_regionkey;");
+}
+
+TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - partitioned anti join (misfit key)",
                  "[integration][gpu_execution][antijoin][partitioned_join]")
 {
@@ -1899,13 +1909,13 @@ TEST_CASE_METHOD(GPUExecutionFixture,
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
-                 "gpu_execution - partitioned inner join (key not at col 0) parquet",
-                 "[integration][gpu_execution][parquet][partitioned_join]")
+                 "gpu_execution - partitioned anti join (misfit key)",
+                 "[integration][gpu_execution][antijoin][partitioned_join]")
 {
   partition_size_guard guard(1);
   compare_gpu_vs_cpu(
-    "select n.n_nationkey, n.n_regionkey, r.r_name "
-    "from nation n join region r on n.n_regionkey = r.r_regionkey;");
+    "select n.n_nationkey, n.n_regionkey from nation n "
+    "anti join customer c on n.n_nationkey = c.c_custkey;");
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
