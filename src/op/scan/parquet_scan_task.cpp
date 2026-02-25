@@ -338,7 +338,13 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
     new_offset += range.size();
   }
   std::for_each(read_futures.begin(), read_futures.end(), [](auto& future) { future.get(); });
-  assert(new_offset == l_state.get_reserved_compressed_bytes());
+
+  if (new_offset != l_state.get_reserved_compressed_bytes()) {
+    // Metadata / file data mismatch
+    throw std::runtime_error(
+      "[parquet_scan_task] Error in reading byte ranges: total bytes read does not match reserved "
+      "compressed bytes");
+  }
 
   // Create a data batch with the column chunks
   auto parquet_representation =
