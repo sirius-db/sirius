@@ -569,6 +569,7 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate_merge::get_ne
       found_batch = false;
     }
   }
+  if (input_batch.empty()) { return nullptr; }
   return std::make_unique<operator_data>(input_batch);
 }
 
