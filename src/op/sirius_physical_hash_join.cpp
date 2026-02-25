@@ -478,9 +478,20 @@ static join_keys_result prepare_join_keys(
   return result;
 }
 
-/// Build the MARK join output from the semi_join matching row indices.
+/// @brief the MARK join output from the semi_join matching row indices.
+///
 /// Copies all left output columns (all rows pass through, no gather), then creates a BOOL8 mark
 /// column initialized to false and scatters true at every position in semi_indices.
+///
+/// @param semi_indices  Device vector of left-side row indices that matched the join condition,
+///                      as returned by cuDF's semi-join. Used as the scatter map for the mark
+///                      column.
+/// @param left_full     Full left-side table view (all columns, all rows) before output projection.
+/// @param lhs_output_col_idxs  Column indices within @p left_full to include in the output.
+///                             Drives the projection of the left side.
+/// @param left_batch    The original left-side data batch; used to propagate memory space metadata
+///                      to the returned operator_data.
+/// @param stream        CUDA stream on which all device operations are launched.
 static std::unique_ptr<operator_data> resolve_mark_join_result(
   rmm::device_uvector<cudf::size_type> const& semi_indices,
   cudf::table_view const& left_full,
