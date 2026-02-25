@@ -53,21 +53,28 @@ else
 fi
 
 if [ ! -d "$PARQUET_DIR" ]; then
-    echo "ERROR: Parquet directory not found: $PARQUET_DIR"
-    echo "Generate it first with:"
-    echo "  ./build/release/duckdb -c \"INSTALL tpch; LOAD tpch; CALL dbgen(sf=${SF}); EXPORT DATABASE '${PARQUET_DIR}' (FORMAT PARQUET);\""
-    exit 1
+    echo "Parquet directory not found: $PARQUET_DIR"
+    echo "Generating TPC-H SF${SF} dataset with tpchgen-cli..."
+
+    VENV_DIR="$PROJECT_DIR/.venv"
+    if [ ! -f "$VENV_DIR/bin/activate" ]; then
+        python3 -m venv "$VENV_DIR"
+    fi
+    # shellcheck disable=SC1091
+    source "$VENV_DIR/bin/activate"
+    pip install --quiet tpchgen-cli
+    tpchgen-cli -s "$SF" --format=parquet --parts 1 --output-dir "$PARQUET_DIR"
 fi
 
 # Build CREATE VIEW statements for the TPC-H tables.
 # Match both single files (table.parquet) and partitioned files (table_0.parquet, table_1.parquet, ...).
-# A plain glob like part*.parquet would also match partsupp.parquet, so we collect
-# matching files with bash globs and pass an explicit list to read_parquet().
 TPCH_TABLES=(customer lineitem nation orders part partsupp region supplier)
 VIEW_SQL=""
 for TABLE_NAME in "${TPCH_TABLES[@]}"; do
     FILES=()
-    for f in "$PARQUET_DIR/${TABLE_NAME}.parquet" "$PARQUET_DIR/${TABLE_NAME}_"*.parquet; do
+    for f in "$PARQUET_DIR/${TABLE_NAME}.parquet" \
+             "$PARQUET_DIR/${TABLE_NAME}_"*.parquet \
+             "$PARQUET_DIR/${TABLE_NAME}/"*.parquet; do
         [ -f "$f" ] && FILES+=("'$f'")
     done
     FILE_LIST=$(IFS=,; echo "${FILES[*]}")
