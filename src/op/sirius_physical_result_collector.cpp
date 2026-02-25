@@ -155,10 +155,10 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
     } else if (data->get_current_tier() != cucascade::memory::Tier::HOST) {
       // Data must be in HOST tier (i.e., cannot currently reside in DISK tier)
       throw duckdb::InvalidInputException(
-        "[GPUPhysicalMaterializedCollector] Expected host_table_representation in HOST tier");
+        "[GPUPhysicalMaterializedCollector] Expected host_data_packed_representation in HOST tier");
     }
 
-    // Only accepting host_table_representations for now
+    // Only accepting host_data_packed_representation for now
     assert(dynamic_cast<cucascade::host_data_packed_representation*>(data) != nullptr);
 
     // Push chunks to result collection
@@ -168,7 +168,8 @@ void sirius_physical_materialized_collector::sink(const operator_data& input_dat
     auto const* ht = host_table.get_host_table().get();
     if (!ht) {
       throw duckdb::InvalidInputException(
-        "[GPUPhysicalMaterializedCollector] host_table_representation has null get_host_table()");
+        "[GPUPhysicalMaterializedCollector] host_data_packed_representation has null "
+        "get_host_table()");
     }
     if (!ht->allocation) {
       throw duckdb::InvalidInputException(

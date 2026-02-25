@@ -72,25 +72,10 @@ std::filesystem::path get_test_config_path()
   return std::filesystem::path(__FILE__).parent_path() / "result.cfg";
 }
 
-duckdb::Connection& get_test_connection()
+memory_space* get_default_gpu_space(duckdb::shared_ptr<duckdb::SiriusContext>& sirius_ctx)
 {
-  static duckdb::DuckDB db(nullptr);
-  static duckdb::Connection con(db);
-  return con;
-}
-
-duckdb::ClientContext& get_test_client_context() { return *get_test_connection().context; }
-
-duckdb::shared_ptr<duckdb::SiriusContext> get_test_sirius_context()
-{
-  return sirius::get_sirius_context(get_test_connection(), get_test_config_path());
-}
-
-memory_space* get_default_gpu_space()
-{
-  auto sirius_ctx = get_test_sirius_context();
-  auto& manager   = sirius_ctx->get_memory_manager();
-  auto* space     = manager.get_memory_space(Tier::GPU, 0);
+  auto& manager = sirius_ctx->get_memory_manager();
+  auto* space   = manager.get_memory_space(Tier::GPU, 0);
   if (space) { return space; }
   auto spaces = manager.get_memory_spaces_for_tier(Tier::GPU);
   if (!spaces.empty()) { return const_cast<memory_space*>(spaces.front()); }
@@ -191,7 +176,8 @@ size_t estimate_packed_data_bytes(cudf::table_view const& view)
   return total_bytes;
 }
 
-void convert_batch_to_host(std::shared_ptr<data_batch> const& batch)
+void convert_batch_to_host(duckdb::shared_ptr<duckdb::SiriusContext> sirius_ctx,
+                           std::shared_ptr<data_batch> const& batch)
 {
   auto* data = batch->get_data();
   if (!data) { throw std::runtime_error("data_batch has no data representation"); }
@@ -199,8 +185,7 @@ void convert_batch_to_host(std::shared_ptr<data_batch> const& batch)
   auto const view       = sirius::get_cudf_table_view(*batch);
   auto const data_bytes = estimate_packed_data_bytes(view);
 
-  auto sirius_ctx = get_test_sirius_context();
-  auto& manager   = sirius_ctx->get_memory_manager();
+  auto& manager = sirius_ctx->get_memory_manager();
 
   auto reservation = manager.request_reservation(any_memory_space_in_tier{Tier::HOST}, data_bytes);
   if (!reservation) { throw std::runtime_error("Failed to reserve host memory for test"); }
@@ -219,7 +204,10 @@ TEST_CASE("sirius_physical_materialized_collector sink with host input",
           "[operator][physical_result_collector]")
 {
   constexpr size_t num_rows = STANDARD_VECTOR_SIZE + 7;
-  auto* gpu_space           = get_default_gpu_space();
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  auto sirius_ctx = sirius::get_sirius_context(con, get_test_config_path());
+  auto* gpu_space = get_default_gpu_space(sirius_ctx);
   REQUIRE(gpu_space != nullptr);
 
   std::vector<cudf::data_type> column_types{cudf::data_type{cudf::type_id::INT32},
@@ -249,7 +237,7 @@ TEST_CASE("sirius_physical_materialized_collector sink with host input",
     expected_strings    = build_expected_strings(expected);
   }
 
-  convert_batch_to_host(batch);
+  convert_batch_to_host(sirius_ctx, batch);
 
   duckdb::vector<duckdb::LogicalType> types{duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER),
                                             duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT),
@@ -261,8 +249,7 @@ TEST_CASE("sirius_physical_materialized_collector sink with host input",
   auto plan       = duckdb::make_uniq<sirius::op::sirius_physical_dummy_scan>(types, 0);
   auto sirius_prepared =
     duckdb::make_shared_ptr<sirius_prepared_statement_data>(prepared, std::move(plan));
-  sirius::op::sirius_physical_materialized_collector collector(*sirius_prepared,
-                                                               get_test_client_context());
+  sirius::op::sirius_physical_materialized_collector collector(*sirius_prepared, *con.context);
 
   collector.sink(operator_data({batch}), cudf::get_default_stream());
   duckdb::GlobalSinkState sink_state;
@@ -293,7 +280,10 @@ TEST_CASE("sirius_physical_materialized_collector sink converts GPU input",
           "[operator][physical_result_collector]")
 {
   constexpr size_t num_rows = STANDARD_VECTOR_SIZE * 2 + 3;
-  auto* gpu_space           = get_default_gpu_space();
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  auto sirius_ctx = sirius::get_sirius_context(con, get_test_config_path());
+  auto* gpu_space = get_default_gpu_space(sirius_ctx);
   REQUIRE(gpu_space != nullptr);
 
   std::vector<cudf::data_type> column_types{cudf::data_type{cudf::type_id::INT32},
@@ -329,8 +319,7 @@ TEST_CASE("sirius_physical_materialized_collector sink converts GPU input",
   auto plan       = duckdb::make_uniq<sirius::op::sirius_physical_dummy_scan>(types, 0);
   auto sirius_prepared =
     duckdb::make_shared_ptr<sirius_prepared_statement_data>(prepared, std::move(plan));
-  sirius::op::sirius_physical_materialized_collector collector(*sirius_prepared,
-                                                               get_test_client_context());
+  sirius::op::sirius_physical_materialized_collector collector(*sirius_prepared, *con.context);
 
   collector.sink(operator_data({batch}), cudf::get_default_stream());
   duckdb::GlobalSinkState sink_state;
@@ -359,8 +348,10 @@ TEST_CASE("sirius_physical_materialized_collector sink supports concurrent appen
 {
   constexpr int num_threads       = 4;
   constexpr size_t rows_per_batch = STANDARD_VECTOR_SIZE * 3 + 13;
-
-  auto* gpu_space = get_default_gpu_space();
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  auto sirius_ctx = sirius::get_sirius_context(con, get_test_config_path());
+  auto* gpu_space = get_default_gpu_space(sirius_ctx);
   REQUIRE(gpu_space != nullptr);
 
   using row_t = std::pair<int32_t, int64_t>;
@@ -410,7 +401,7 @@ TEST_CASE("sirius_physical_materialized_collector sink supports concurrent appen
 
     auto table = std::make_unique<cudf::table>(std::move(cols));
     auto batch = sirius::make_data_batch(std::move(table), *gpu_space);
-    convert_batch_to_host(batch);
+    convert_batch_to_host(sirius_ctx, batch);
     batches.emplace_back(std::move(batch));
   }
 
@@ -423,8 +414,7 @@ TEST_CASE("sirius_physical_materialized_collector sink supports concurrent appen
   auto plan       = duckdb::make_uniq<sirius::op::sirius_physical_dummy_scan>(types, 0);
   auto sirius_prepared =
     duckdb::make_shared_ptr<sirius_prepared_statement_data>(prepared, std::move(plan));
-  sirius::op::sirius_physical_materialized_collector collector(*sirius_prepared,
-                                                               get_test_client_context());
+  sirius::op::sirius_physical_materialized_collector collector(*sirius_prepared, *con.context);
 
   std::atomic<int> ready{0};
   std::atomic<bool> go{false};
