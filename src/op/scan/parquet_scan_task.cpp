@@ -15,12 +15,11 @@
  */
 
 // sirius
-#include "op/sirius_physical_parquet_scan.hpp"
-#include "pipeline/sirius_pipeline.hpp"
-
 #include <data/data_batch_utils.hpp>
 #include <data/host_parquet_representation.hpp>
 #include <op/scan/parquet_scan_task.hpp>
+#include <op/sirius_physical_parquet_scan.hpp>
+#include <pipeline/sirius_pipeline.hpp>
 
 // cucascade
 #include <cucascade/data/data_batch.hpp>
@@ -39,6 +38,7 @@
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/parquet.hpp>
+#include <cudf/io/parquet_io_utils.hpp>
 #include <cudf/io/parquet_schema.hpp>
 
 // standard library
@@ -106,36 +106,6 @@ std::vector<size_t> make_selected_column_indices(sirius_physical_parquet_scan co
   return selected_column_indices;
 }
 
-static std::unique_ptr<cudf::io::datasource::buffer> read_parquet_footer(cudf::io::datasource& src)
-{
-  auto constexpr file_tail_size    = sizeof(cudf::io::parquet::file_ender_s);
-  auto constexpr footer_magic_size = sizeof(cudf::io::parquet::file_header_s);
-  auto constexpr footer_size_size  = sizeof(uint32_t);
-  std::string_view magic           = "PAR1";
-
-  auto const file_size = src.size();
-  if (file_size < file_tail_size) {
-    throw std::runtime_error(
-      "[parquet_scan_task] Parquet file is too small to contain valid footer");
-  }
-
-  // Read the file tail
-  auto tail = src.host_read(file_size - file_tail_size, file_tail_size);
-
-  // Verify the magic bytes
-  if (std::memcmp(tail->data() + footer_size_size, magic.data(), footer_magic_size) != 0) {
-    throw std::runtime_error(
-      "[parquet_scan_task] Parquet file footer magic does not match expected value");
-  }
-
-  // Extract the footer size (little endian)
-  uint32_t footer_size;
-  std::memcpy(&footer_size, tail->data(), sizeof(footer_size));
-
-  // Return the footer buffer
-  return src.host_read(file_size - file_tail_size - footer_size, footer_size);
-}
-
 }  // namespace detail
 
 //===----------------------------------------------------------------------===//
@@ -154,16 +124,14 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
   if (scan_op->function.in_out_function) {
     throw std::runtime_error(
       "[parquet_scan_task_global_state] In-out table functions are not supported in sirius "
-      "parquet "
-      "scans.");
+      "parquet scans.");
   }
 
   // Filter pushdown is not supported
   if (scan_op->dynamic_filters) {
     throw std::runtime_error(
       "[parquet_scan_task_global_state] Dynamic table filters are not supported in sirius "
-      "parquet "
-      "scans.");
+      "parquet scans.");
   }
 
   // Expect parquet_scan to be bound through the multi-file reader
@@ -171,25 +139,39 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
   if (!bind_data.file_list || bind_data.file_list->IsEmpty()) {
     throw std::runtime_error("[parquet_scan_task_global_state] No input files to scan");
   }
-  if (bind_data.file_list->GetTotalFileCount() != 1) {
-    throw std::runtime_error(
-      "[parquet_scan_task_global_state] parquet_scan_task currently supports a single parquet "
-      "file per scan");
-  }
 
-  // Construct the io_source and read the footer
-  auto file          = bind_data.file_list->GetFirstFile();
-  _file_path         = file.path;
-  auto datasource    = cudf::io::datasource::create(_file_path);
-  auto footer_buffer = detail::read_parquet_footer(*datasource);
+  auto files = bind_data.file_list->GetAllFiles();
+  _file_paths.reserve(files.size());
+  std::for_each(
+    files.begin(), files.end(), [this](auto const& file) { _file_paths.push_back(file.path); });
+
+  // Construct the io_sources and read the footers
+  std::vector<std::unique_ptr<cudf::io::datasource>> datasources;
+  std::vector<std::unique_ptr<cudf::io::datasource::buffer>> footer_buffers;
+  datasources.reserve(files.size());
+  footer_buffers.reserve(files.size());
+  std::for_each(
+    _file_paths.begin(), _file_paths.end(), [&datasources, &footer_buffers](auto const& file_path) {
+      auto datasource = cudf::io::datasource::create(file_path);
+      datasources.push_back(std::move(datasource));
+      footer_buffers.push_back(cudf::io::parquet::fetch_footer_to_host(*datasources.back()));
+    });
 
   // Initialize reader options for applying projections (FUTURE: filters)
   _reader_options = cudf::io::parquet_reader_options::builder().build();
 
-  // Construct the file reader and read the metadata
-  auto reader = hybrid_scan_reader(
-    cudf::host_span<uint8_t const>(footer_buffer->data(), footer_buffer->size()), _reader_options);
-  _file_metadata = reader.parquet_metadata();
+  // Construct the file readers and parse the metadata
+  std::vector<std::unique_ptr<cudf::io::parquet::experimental::hybrid_scan_reader>> readers;
+  _file_metadatas.reserve(files.size());
+  readers.reserve(files.size());
+  std::for_each(
+    footer_buffers.begin(), footer_buffers.end(), [&readers, this](auto& footer_buffer) {
+      auto reader = std::make_unique<cudf::io::parquet::experimental::hybrid_scan_reader>(
+        cudf::host_span<uint8_t const>(footer_buffer->data(), footer_buffer->size()),
+        _reader_options);
+      _file_metadatas.push_back(reader->parquet_metadata());
+      readers.push_back(std::move(reader));
+    });
 
   // Apply projections by column name using DuckDB's bound column names.
   if (_is_projected) {
@@ -199,10 +181,13 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
     }
 
     // We currently only support flat schemas for parquet scans with projections
-    if (!detail::projected_columns_are_flat(_file_metadata, _selected_column_indices)) {
-      throw std::runtime_error(
-        "[parquet_scan_task_global_state] Parquet scans with projections currently only support "
-        "flat projected columns");
+    /// TODO: Support nested schemas for projected scans
+    for (auto const& meta : _file_metadatas) {
+      if (!detail::projected_columns_are_flat(meta, _selected_column_indices)) {
+        throw std::runtime_error(
+          "[parquet_scan_task_global_state] Parquet scans with projections currently only support "
+          "flat projected columns");
+      }
     }
 
     std::vector<std::string> projected_columns;
@@ -225,57 +210,68 @@ parquet_scan_task_global_state::parquet_scan_task_global_state(
 
 void parquet_scan_task_global_state::accumulate_row_group_byte_sizes()
 {
-  auto const total_rg = _file_metadata.row_groups.size();
-  _row_group_uncompressed_bytes.reserve(total_rg);
-  _row_group_compressed_bytes.reserve(total_rg);
+  _row_group_compressed_bytes.resize(_file_metadatas.size());
+  _row_group_uncompressed_bytes.resize(_file_metadatas.size());
+  for (size_t file_idx = 0; file_idx < _file_metadatas.size(); ++file_idx) {
+    auto const& meta    = _file_metadatas[file_idx];
+    auto const total_rg = meta.row_groups.size();
+    _row_group_uncompressed_bytes[file_idx].reserve(total_rg);
+    _row_group_compressed_bytes[file_idx].reserve(total_rg);
 
-  auto add_rg_bytes = [this](cudf::io::parquet::RowGroup const& rg) {
-    size_t uncompressed_bytes = 0;
-    size_t compressed_bytes   = 0;
+    auto add_rg_bytes = [this, file_idx](cudf::io::parquet::RowGroup const& rg) {
+      size_t uncompressed_bytes = 0;
+      size_t compressed_bytes   = 0;
 
-    std::for_each(_selected_column_indices.begin(),
-                  _selected_column_indices.end(),
-                  [&uncompressed_bytes, &compressed_bytes, &rg](size_t col_idx) {
-                    auto const& column_metadata = rg.columns[col_idx].meta_data;
-                    if (column_metadata.total_uncompressed_size > 0) {
-                      uncompressed_bytes += column_metadata.total_uncompressed_size;
-                    }
-                    if (column_metadata.total_compressed_size > 0) {
-                      compressed_bytes += column_metadata.total_compressed_size;
-                    }
-                  });
+      std::for_each(_selected_column_indices.begin(),
+                    _selected_column_indices.end(),
+                    [&uncompressed_bytes, &compressed_bytes, &rg](size_t col_idx) {
+                      auto const& column_metadata = rg.columns[col_idx].meta_data;
+                      if (column_metadata.total_uncompressed_size > 0) {
+                        uncompressed_bytes += column_metadata.total_uncompressed_size;
+                      }
+                      if (column_metadata.total_compressed_size > 0) {
+                        compressed_bytes += column_metadata.total_compressed_size;
+                      }
+                    });
 
-    _row_group_uncompressed_bytes.push_back(uncompressed_bytes);
-    _row_group_compressed_bytes.push_back(compressed_bytes);
-  };
+      _row_group_uncompressed_bytes[file_idx].push_back(uncompressed_bytes);
+      _row_group_compressed_bytes[file_idx].push_back(compressed_bytes);
+    };
 
-  std::for_each(_file_metadata.row_groups.begin(), _file_metadata.row_groups.end(), add_rg_bytes);
+    std::for_each(meta.row_groups.begin(), meta.row_groups.end(), add_rg_bytes);
+  }
 }
 
 void parquet_scan_task_global_state::partition_row_groups()
 {
-  size_t partition_uncompressed_bytes = 0;
-  size_t partition_compressed_bytes   = 0;
-  size_t rg_start                     = 0;
-  size_t rg_count                     = 0;
-  for (size_t rg_idx = 0; rg_idx < _file_metadata.row_groups.size(); ++rg_idx) {
-    partition_uncompressed_bytes += static_cast<size_t>(_row_group_uncompressed_bytes[rg_idx]);
-    partition_compressed_bytes += static_cast<size_t>(_row_group_compressed_bytes[rg_idx]);
-    ++rg_count;
+  for (size_t file_idx = 0; file_idx < _file_metadatas.size(); ++file_idx) {
+    auto const& meta = _file_metadatas[file_idx];
 
-    if (partition_uncompressed_bytes >= _approximate_batch_size) {
-      _row_group_partitions.emplace_back(
-        rg_start, rg_count, partition_uncompressed_bytes, partition_compressed_bytes);
-      partition_uncompressed_bytes = 0;
-      partition_compressed_bytes   = 0;
-      rg_start                     = rg_idx + 1;
-      rg_count                     = 0;
+    size_t partition_uncompressed_bytes = 0;
+    size_t partition_compressed_bytes   = 0;
+    size_t rg_start                     = 0;
+    size_t rg_count                     = 0;
+    for (size_t rg_idx = 0; rg_idx < meta.row_groups.size(); ++rg_idx) {
+      partition_uncompressed_bytes +=
+        static_cast<size_t>(_row_group_uncompressed_bytes[file_idx][rg_idx]);
+      partition_compressed_bytes +=
+        static_cast<size_t>(_row_group_compressed_bytes[file_idx][rg_idx]);
+      ++rg_count;
+
+      if (partition_uncompressed_bytes >= _approximate_batch_size) {
+        _row_group_partitions.emplace_back(
+          file_idx, rg_start, rg_count, partition_uncompressed_bytes, partition_compressed_bytes);
+        partition_uncompressed_bytes = 0;
+        partition_compressed_bytes   = 0;
+        rg_start                     = rg_idx + 1;
+        rg_count                     = 0;
+      }
     }
-  }
-  // We may have a final partition that doesn't amount to the target batch size
-  if (rg_count > 0) {
-    _row_group_partitions.emplace_back(
-      rg_start, rg_count, partition_uncompressed_bytes, partition_compressed_bytes);
+    // We may have a final partition that doesn't amount to the target batch size
+    if (rg_count > 0) {
+      _row_group_partitions.emplace_back(
+        file_idx, rg_start, rg_count, partition_uncompressed_bytes, partition_compressed_bytes);
+    }
   }
 }
 
@@ -287,6 +283,7 @@ parquet_scan_task_local_state::parquet_scan_task_local_state(
 {
   auto const& partition = g_state.get_row_group_partition(partition_idx);
 
+  _file_idx = partition.file_idx;
   _rg_indices.resize(partition.row_group_count);
   std::iota(_rg_indices.begin(), _rg_indices.end(), partition.start_row_group);
   _reserved_uncompressed_bytes = partition.reserved_uncompressed_bytes;
@@ -323,7 +320,7 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
 {
   auto& l_state = this->_local_state->cast<parquet_scan_task_local_state>();
   auto& g_state = this->_global_state->cast<parquet_scan_task_global_state>();
-  auto reader   = g_state.make_reader();
+  auto reader   = g_state.make_reader(l_state.get_file_idx());
 
   // Make the allocation and accessor
   auto allocation = l_state.make_allocation();
@@ -346,7 +343,13 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
     new_offset += range.size();
   }
   std::for_each(read_futures.begin(), read_futures.end(), [](auto& future) { future.get(); });
-  assert(new_offset == l_state.get_reserved_compressed_bytes());
+
+  if (new_offset != l_state.get_reserved_compressed_bytes()) {
+    // Metadata / file data mismatch
+    throw std::runtime_error(
+      "[parquet_scan_task] Error in reading byte ranges: total bytes read does not match reserved "
+      "compressed bytes");
+  }
 
   // Create a data batch with the column chunks
   auto parquet_representation =
@@ -354,7 +357,7 @@ std::unique_ptr<op::operator_data> parquet_scan_task::compute_task(
                                                   std::move(allocation),
                                                   std::move(reader),
                                                   g_state.get_options(),
-                                                  std::move(l_state.move_rg_indices()),
+                                                  std::move(l_state.get_rg_indices()),
                                                   std::move(new_byte_ranges),
                                                   l_state.get_reserved_compressed_bytes(),
                                                   l_state.get_reserved_uncompressed_bytes());
