@@ -4020,7 +4020,7 @@ TEST_CASE_METHOD(GPUExecutionParquetFixture,
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
                  "gpu_execution - TPC-H Query 21",
-                 "[.][integration_disabled][gpu_execution][TPC-H][Q21]")
+                 "[integration][gpu_execution][TPC-H][Q21]")
 {
   compare_gpu_vs_cpu(
     "select s.s_name, count(*) as numwait "
@@ -4049,7 +4049,7 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
                  "gpu_execution - TPC-H Query 21 parquet",
-                 "[.][integration_disabled][gpu_execution][parquet][TPC-H][Q21]")
+                 "[integration][gpu_execution][parquet][TPC-H][Q21]")
 {
   compare_gpu_vs_cpu(
     "select s.s_name, count(*) as numwait "
