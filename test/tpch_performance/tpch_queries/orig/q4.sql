@@ -19,4 +19,4 @@ where
 group by
   o.o_orderpriority
 order by
-  o.o_orderpriority
+  o.o_orderpriority;

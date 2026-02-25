@@ -20,4 +20,4 @@ group by
 order by
   revenue desc,
   o.o_orderdate
-limit 10
+limit 10;

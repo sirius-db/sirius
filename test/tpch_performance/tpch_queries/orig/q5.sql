@@ -21,4 +21,4 @@ where
 group by
   n.n_name
 order by
-  revenue desc
+  revenue desc;

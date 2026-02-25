@@ -34,4 +34,4 @@ where
   and s.s_nationkey = n.n_nationkey
   and n.n_name = 'KENYA'
 order by
-  s.s_name
+  s.s_name;
