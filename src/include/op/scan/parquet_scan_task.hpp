@@ -58,17 +58,20 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
    * @brief Struct representing a range of row groups assigned to a scan task.
    */
   struct row_group_range {
-    row_group_range(size_t start_row_group_p,
+    row_group_range(size_t file_idx,
+                    size_t start_row_group_p,
                     size_t row_group_count_p,
                     size_t reserved_uncompressed_bytes_p,
                     size_t reserved_compressed_bytes_p)
-      : start_row_group(start_row_group_p),
+      : file_idx(file_idx),
+        start_row_group(start_row_group_p),
         row_group_count(row_group_count_p),
         reserved_uncompressed_bytes(reserved_uncompressed_bytes_p),
         reserved_compressed_bytes(reserved_compressed_bytes_p)
     {
     }
 
+    size_t file_idx;
     size_t start_row_group;
     size_t row_group_count;
     size_t reserved_uncompressed_bytes;
@@ -99,9 +102,13 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
   /**
    * @brief Get the file path of the Parquet file to scan.
    *
+   * @param[in] file_idx The index of the file path to retrieve.
    * @return A const reference to the file path string.
    */
-  [[nodiscard]] std::string const& get_file_path() const { return _file_path; }
+  [[nodiscard]] std::string const& get_file_path(size_t file_idx) const
+  {
+    return _file_paths[file_idx];
+  }
 
   /**
    * @brief Get the Parquet reader options, e.g., projections, filters, etc.
@@ -169,11 +176,12 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
    *
    * Each task/data batch will need its own reader for concurrency reasons.
    *
+   * @param[in] file_idx The file index of the parquet file to read.
    * @return A unique pointer to the hybrid scan Parquet reader.
    */
-  [[nodiscard]] std::unique_ptr<hybrid_scan_reader> make_reader() const
+  [[nodiscard]] std::unique_ptr<hybrid_scan_reader> make_reader(size_t file_idx) const
   {
-    return std::make_unique<hybrid_scan_reader>(_file_metadata, _reader_options);
+    return std::make_unique<hybrid_scan_reader>(_file_metadatas[file_idx], _reader_options);
   }
 
  private:
@@ -199,12 +207,14 @@ class parquet_scan_task_global_state : public pipeline::sirius_pipeline_task_glo
   sirius_physical_parquet_scan* _scan_op;  ///< The physical parquet scan operator being executed
   bool _is_projected;                      ///< Whether projection is applied
 
-  std::string _file_path;                            ///< The parquet file path
-  cudf::io::parquet::FileMetaData _file_metadata;    ///< The parquet file metadata
-  cudf::io::parquet_reader_options _reader_options;  ///< Parquet reader options
+  std::vector<std::string> _file_paths;                          ///< The parquet file paths
+  std::vector<cudf::io::parquet::FileMetaData> _file_metadatas;  ///< The parquet file metadata
+  cudf::io::parquet_reader_options _reader_options;              ///< Parquet reader options
 
-  std::vector<size_t> _row_group_uncompressed_bytes;   ///< Per-row-group uncompressed bytes
-  std::vector<size_t> _row_group_compressed_bytes;     ///< Per-row-group compressed bytes
+  std::vector<std::vector<size_t>>
+    _row_group_uncompressed_bytes;  ///< Per-(file,row-group) uncompressed bytes
+  std::vector<std::vector<size_t>>
+    _row_group_compressed_bytes;                       ///< Per-(file,row-group) compressed bytes
   std::vector<row_group_range> _row_group_partitions;  ///< Row-group partitions for tasks
   std::vector<size_t> _selected_column_indices;        ///< Column indices to read (projection)
 
@@ -253,6 +263,13 @@ class parquet_scan_task_local_state : public pipeline::sirius_pipeline_task_loca
   }
 
   /**
+   * @brief Get the file index of the parquet file to read for this local state.
+   *
+   * @return The file index.
+   */
+  [[nodiscard]] size_t get_file_idx() const { return _file_idx; }
+
+  /**
    * @brief Get the host span corresponding to the row group indices assigned to this local state.
    */
   [[nodiscard]] cudf::host_span<cudf::size_type const> get_rg_span() const
@@ -277,9 +294,16 @@ class parquet_scan_task_local_state : public pipeline::sirius_pipeline_task_loca
    */
   [[nodiscard]] size_t get_reserved_compressed_bytes() const { return _reserved_compressed_bytes; }
 
-  [[nodiscard]] std::vector<cudf::size_type> move_rg_indices() { return std::move(_rg_indices); }
+  /**
+   * @brief Get the vector of row group indices assigned to this local state.
+   *
+   * @return A (const) reference to the vector of row group indices.
+   */
+  [[nodiscard]] std::vector<cudf::size_type> const& get_rg_indices() const { return _rg_indices; }
+  [[nodiscard]] std::vector<cudf::size_type>& get_rg_indices() { return _rg_indices; }
 
  private:
+  size_t _file_idx;  ///< The file index of the parquet file to read
   size_t _reserved_uncompressed_bytes =
     0;  ///< Number of uncompressed bytes reserved by the row group range
   size_t _reserved_compressed_bytes =
@@ -321,9 +345,10 @@ class parquet_scan_task : public pipeline::sirius_pipeline_itask {
                     std::shared_ptr<parquet_scan_task_global_state> g_state)
     : pipeline::sirius_pipeline_itask(std::move(l_state), g_state),
       _task_id(task_id),
-      _data_repo(data_repo),
-      _datasource(cudf::io::datasource::create(g_state->get_file_path()))
+      _data_repo(data_repo)
   {
+    auto& l_state_cast = this->_local_state->cast<parquet_scan_task_local_state>();
+    _datasource = cudf::io::datasource::create(g_state->get_file_path(l_state_cast.get_file_idx()));
   }
 
   ~parquet_scan_task() override;
@@ -382,24 +407,6 @@ class parquet_scan_task : public pipeline::sirius_pipeline_itask {
    * @return The unique ID of this task.
    */
   [[nodiscard]] uint64_t get_task_id() const { return _task_id; }
-
-  [[nodiscard]] size_t get_pipeline_id() const override
-  {
-    // todo(bobbi): only virtual because we cannot create a pipeline from a a list of operators, and
-    // test parquet needs this to work, this allows us to override it for parquet task and provide a
-    // different pipeline ID than the one in global state (which is not set for parquet tasks since
-    // they don't have a pipeline) if the global state is not set, we fall back to using the
-    // pipeline ID from the global state, which is
-
-    auto& g_state  = this->_global_state->cast<parquet_scan_task_global_state>();
-    auto* pipeline = g_state.get_pipeline();
-    if (!pipeline) {
-      // This can happen for parquet scan tasks since they don't have a pipeline, in that case we
-      // return a default pipeline ID of 0
-      g_state.get_operator().get_operator_id();
-    }
-    return g_state.get_pipeline_id();
-  }
 
  private:
   /**

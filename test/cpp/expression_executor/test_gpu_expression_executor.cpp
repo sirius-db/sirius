@@ -20,9 +20,11 @@
 
 // sirius
 #include <cucascade/data/gpu_data_representation.hpp>
+#include <cucascade/memory/reservation_manager_configurator.hpp>
 #include <data/data_batch_utils.hpp>
+#include <data/sirius_converter_registry.hpp>
 #include <expression_executor/gpu_expression_executor.hpp>
-#include <memory/sirius_memory_manager.hpp>
+#include <memory/sirius_memory_reservation_manager.hpp>
 
 // duckdb
 #include <duckdb/common/helper.hpp>
@@ -36,28 +38,39 @@
 
 // standard library
 #include <cstdint>
+#include <memory>
 
 using namespace duckdb;
 using namespace duckdb::sirius;
 using namespace cucascade;
 using namespace cucascade::memory;
-using memory_mgr = ::sirius::memory_manager;
+using memory_mgr = ::sirius::memory::sirius_memory_reservation_manager;
 
 namespace {
 
-void initialize_memory_manager()
+std::unique_ptr<memory_mgr> initialize_memory_manager()
 {
-  memory_mgr::reset_for_testing();
-  std::vector<memory_reservation_manager::memory_space_config> configs;
-  configs.emplace_back(Tier::GPU, 0, 256 * 1024 * 1024);
-  memory_mgr::initialize(std::move(configs));
+  ::sirius::converter_registry::reset_for_testing();
+  reservation_manager_configurator builder;
+  auto constexpr gpu_capacity  = 256ull << 20;  // 256MB
+  auto constexpr host_capacity = 512ull << 20;  // 512MB
+  auto constexpr limit_ratio   = 0.75;
+  builder.set_number_of_gpus(1)
+    .set_gpu_usage_limit(gpu_capacity)
+    .set_reservation_fraction_per_gpu(limit_ratio)
+    .set_per_host_capacity(host_capacity)
+    .use_host_per_gpu()
+    .set_reservation_fraction_per_host(limit_ratio);
+  auto configs = builder.build();
+  auto manager = std::make_unique<memory_mgr>(std::move(configs));
+  ::sirius::converter_registry::initialize();
+  return manager;
 }
 
 memory_space* get_default_gpu_space()
 {
-  initialize_memory_manager();
-  auto& manager = memory_mgr::get();
-  return const_cast<memory_space*>(manager.get_memory_space(Tier::GPU, 0));
+  static auto manager = initialize_memory_manager();
+  return const_cast<memory_space*>(manager->get_memory_space(Tier::GPU, 0));
 }
 
 rmm::device_async_resource_ref get_resource_ref(memory_space& space)

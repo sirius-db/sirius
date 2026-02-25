@@ -29,6 +29,7 @@
 #include "duckdb/parallel/pipeline_executor.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "log/logging.hpp"
+#include "op/sirius_physical_parquet_scan.hpp"
 #include "op/sirius_physical_table_scan.hpp"
 #include "pipeline/sirius_meta_pipeline.hpp"
 #include "sirius_engine.hpp"
@@ -289,6 +290,12 @@ void sirius_pipeline::update_pipeline_status()
     if (table_scan.exhausted) {  // WSM amin TODO: can we use exhausted? how about we use
                                  // get_next_task_hint() to check if the source is ready?
       pipeline_finished.store(true);
+      return;
+    }
+  } else if (get_source()->type == op::SiriusPhysicalOperatorType::PARQUET_SCAN) {
+    auto& parquet_scan = get_source()->Cast<op::sirius_physical_parquet_scan>();
+    if (!parquet_scan.has_more_partitions) {
+      if (tasks_created.load() == tasks_completed.load()) { pipeline_finished = true; }
       return;
     }
   } else {
