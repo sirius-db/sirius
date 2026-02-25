@@ -82,21 +82,8 @@ sirius_physical_parquet_scan::sirius_physical_parquet_scan(
     table_filters(std::move(table_filters_p)),
     extra_info(std::move(extra_info)),
     parameters(std::move(parameters_p)),
-    virtual_columns(std::move(virtual_columns_p)),
-    gen_row_id_column(column_ids.back().GetPrimaryIndex() == duckdb::DConstants::INVALID_INDEX)
+    virtual_columns(std::move(virtual_columns_p))
 {
-  auto num_cols = column_ids.size() - gen_row_id_column;
-  for (int col = 0; col < num_cols; col++) {
-    scanned_types.push_back(returned_types[column_ids[col].GetPrimaryIndex()]);
-    scanned_ids.push_back(col);
-  }
-
-  if (num_cols == 0) {  // Ensure that scanned_types and ids are properly initialized
-    scanned_types.push_back(duckdb::LogicalType(duckdb::LogicalTypeId::UBIGINT));
-  }
-
-  fake_table_filters = duckdb::make_uniq<duckdb::TableFilterSet>();
-  SIRIUS_LOG_DEBUG("Table scan column ids: {}", column_ids.size());
 }
 
 }  // namespace op
