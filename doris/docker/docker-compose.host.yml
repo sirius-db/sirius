@@ -29,6 +29,8 @@ services:
     container_name: sirius-be
     network_mode: host
     ipc: host
+    cap_add:
+      - SYS_PTRACE
     depends_on:
       doris-fe:
         condition: service_healthy
@@ -40,6 +42,11 @@ services:
       - UCX_COMPONENT_DIR=/opt/pixi-nixl-lib/ucx
       - UCX_LOG_LEVEL=info
       - UCX_MEMTYPE_CACHE=n
+      # GPU memory: register entire RMM pool so UCX recognizes sub-allocations as CUDA memory
+      - UCX_MEMTYPE_REG_WHOLE_ALLOC_TYPES=cuda
+      # Use CUDA staging buffers for rendezvous protocol (GPU-direct transfers)
+      - UCX_RNDV_FRAG_MEM_TYPE=cuda
+      - UCX_MAX_RNDV_RAILS=1
     volumes:
       - /nix/store/wb6rhpznjfczwlwx23zmdrrw74bayxw4-glibc-2.42-47/lib:/opt/nix-glibc:ro
       - ../../.pixi/envs/doris/lib:/opt/pixi-lib:ro
