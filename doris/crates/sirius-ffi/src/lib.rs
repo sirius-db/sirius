@@ -348,6 +348,36 @@ impl SiriusEngine {
         }
     }
 
+    /// Get column names of a parquet file without materializing it as a DuckDB table.
+    ///
+    /// Runs `DESCRIBE SELECT * FROM read_parquet('...')` to extract column names.
+    /// Used for LocalFiles scan path where we don't need to CREATE TABLE.
+    pub fn get_parquet_columns(&self, file_path: &str) -> Result<Vec<String>, EngineError> {
+        #[cfg(feature = "duckdb-bundled")]
+        {
+            let sql = format!("DESCRIBE SELECT * FROM read_parquet('{}')", file_path);
+            let mut stmt = self
+                .conn
+                .prepare(&sql)
+                .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+            let mut rows = stmt
+                .query([])
+                .map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+            let mut columns = Vec::new();
+            while let Some(row) = rows.next().map_err(|e| EngineError::ExecFailed(e.to_string()))? {
+                let name: String = row.get(0).map_err(|e| EngineError::ExecFailed(e.to_string()))?;
+                columns.push(name);
+            }
+            Ok(columns)
+        }
+
+        #[cfg(not(feature = "duckdb-bundled"))]
+        {
+            let _ = file_path;
+            Err(EngineError::NotCompiled)
+        }
+    }
+
     /// Get column names of a registered DuckDB table, in ordinal order.
     pub fn get_table_columns(&self, table_name: &str) -> Result<Vec<String>, EngineError> {
         #[cfg(feature = "duckdb-bundled")]

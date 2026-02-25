@@ -401,7 +401,7 @@ fn test_translate_scan_with_filter() {
     let table_schemas = HashMap::new();
 
     let result =
-        plan_translator::translate_fragment(&params, &table_schemas).expect("translation failed");
+        plan_translator::translate_fragment(&params, &table_schemas, &HashMap::new()).expect("translation failed");
     assert!(
         !result.substrait_bytes.is_empty(),
         "plan bytes should not be empty"
@@ -470,7 +470,7 @@ fn test_translate_scan_without_filter() {
     let table_schemas = HashMap::new();
 
     let result =
-        plan_translator::translate_fragment(&params, &table_schemas).expect("translation failed");
+        plan_translator::translate_fragment(&params, &table_schemas, &HashMap::new()).expect("translation failed");
     let plan = Plan::decode(result.substrait_bytes.as_slice()).expect("failed to decode");
 
     let root = match plan.relations[0].rel_type.as_ref().unwrap() {
@@ -500,7 +500,7 @@ fn test_output_names_match_descriptor() {
     let params = make_fragment_params(vec![scan_node], desc_tbl);
     let table_schemas = HashMap::new();
 
-    let result = plan_translator::translate_fragment(&params, &table_schemas).unwrap();
+    let result = plan_translator::translate_fragment(&params, &table_schemas, &HashMap::new()).unwrap();
     assert_eq!(result.output_names, vec!["col1", "col2"]);
 }
 
@@ -527,7 +527,7 @@ fn test_multiple_filter_predicates() {
     let params = make_fragment_params(vec![scan_node], desc_tbl);
     let table_schemas = HashMap::new();
 
-    let result = plan_translator::translate_fragment(&params, &table_schemas).unwrap();
+    let result = plan_translator::translate_fragment(&params, &table_schemas, &HashMap::new()).unwrap();
     let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
 
     let root = match &plan.relations[0].rel_type {

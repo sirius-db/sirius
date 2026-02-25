@@ -230,28 +230,24 @@ fn arrow_type_to_doris(dt: &arrow::datatypes::DataType) -> PTypeDesc {
     }
 }
 
-/// A file-backed table that needs to be loaded into DuckDB before plan execution.
-struct FileTable {
-    table_name: String,
-    file_path: String,
-    format: String,
-}
-
-/// Extract file tables from fragment params (FILE_SCAN_NODE → file path + format).
+/// Extract file scan info from fragment params (FILE_SCAN_NODE → all file paths + format).
 ///
-/// Walks the plan nodes looking for FILE_SCAN_NODE, then extracts the file path
-/// from `local_params[0].per_node_scan_ranges` and the format from `file_scan_params`.
-fn extract_file_tables(params: &TPipelineFragmentParams) -> Vec<FileTable> {
-    let mut tables = Vec::new();
+/// Walks the plan nodes looking for FILE_SCAN_NODE, then extracts ALL file paths
+/// from `local_params[*].per_node_scan_ranges[node_id][*].scan_range...ranges[*]`
+/// and the format from `file_scan_params`. Returns one `FileScanInfo` per scan node,
+/// containing all files assigned to this BE.
+fn extract_file_scan_info(params: &TPipelineFragmentParams) -> Vec<plan_translator::FileScanInfo> {
+    let mut result = Vec::new();
 
     let fragment = match &params.fragment {
         Some(f) => f,
-        None => return tables,
+        None => return result,
     };
     let plan = match &fragment.plan {
         Some(p) => p,
-        None => return tables,
+        None => return result,
     };
+
     for node in &plan.nodes {
         if node.node_type != TPlanNodeType::FILE_SCAN_NODE {
             continue;
@@ -285,37 +281,58 @@ fn extract_file_tables(params: &TPipelineFragmentParams) -> Vec<FileTable> {
             .unwrap_or("parquet")
             .to_string();
 
-        // File path from local_params[*].per_node_scan_ranges[node_id][0].scan_range
-        //   .ext_scan_range.file_scan_range.ranges[0].path
-        // Search ALL local_params entries (after merge, leaf's entries are appended).
-        let file_path = params
-            .local_params
-            .as_ref()
-            .and_then(|lps| {
-                lps.iter().find_map(|inst| {
-                    inst.per_node_scan_ranges
-                        .get(&node_id)?
-                        .first()?
-                        .scan_range
-                        .ext_scan_range
-                        .as_ref()?
-                        .file_scan_range
-                        .as_ref()?
-                        .ranges
-                        .as_ref()?
-                        .first()?
-                        .path
-                        .clone()
-                })
-            });
+        // Extract ALL file paths from all local_params and all scan ranges.
+        // With shared_storage=true, FE distributes multiple partition files per BE.
+        let mut files = Vec::new();
+        if let Some(local_params) = &params.local_params {
+            for inst in local_params {
+                if let Some(scan_range_list) = inst.per_node_scan_ranges.get(&node_id) {
+                    for scan_range_params in scan_range_list {
+                        if let Some(file_scan_range) = scan_range_params
+                            .scan_range
+                            .ext_scan_range
+                            .as_ref()
+                            .and_then(|esr| esr.file_scan_range.as_ref())
+                        {
+                            if let Some(ranges) = &file_scan_range.ranges {
+                                for range in ranges {
+                                    if let Some(path) = &range.path {
+                                        let clean_path = path
+                                            .strip_prefix("file://")
+                                            .unwrap_or(path)
+                                            .to_string();
+                                        files.push(plan_translator::FileScanFile {
+                                            path: clean_path,
+                                            start_offset: range.start_offset.unwrap_or(0),
+                                            length: range.size.unwrap_or(-1),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
-        if let Some(path) = file_path {
-            // Strip file:// scheme if present (FE sends file:// URLs for local paths).
-            let clean_path = path.strip_prefix("file://").unwrap_or(&path).to_string();
-            tables.push(FileTable {
+        // Deduplicate files by path. FE may send multiple scan ranges for the
+        // same file (intra-file parallelism). We only need each file once for
+        // DuckDB's parquet_scan which reads entire files.
+        let mut seen_paths = std::collections::HashSet::new();
+        files.retain(|f| seen_paths.insert(f.path.clone()));
+
+        if !files.is_empty() {
+            info!(
+                table = %table_name,
+                format = %format,
+                num_files = files.len(),
+                first_file = %files[0].path,
+                "extracted file scan info"
+            );
+            result.push(plan_translator::FileScanInfo {
                 table_name,
-                file_path: clean_path,
                 format,
+                files,
             });
         } else {
             let all_keys: Vec<Vec<i32>> = params
@@ -337,7 +354,7 @@ fn extract_file_tables(params: &TPipelineFragmentParams) -> Vec<FileTable> {
         }
     }
 
-    tables
+    result
 }
 
 /// Merge multi-fragment plans for single-BE execution.
@@ -1704,19 +1721,44 @@ impl PBackendService for PBackendServiceHandler {
                     }
 
                     // Also register any file tables.
-                    let file_tables = extract_file_tables(&params);
-                    if !file_tables.is_empty() {
+                    let file_scan_infos = extract_file_scan_info(&params);
+                    let mut file_scan_map = std::collections::HashMap::<String, plan_translator::FileScanInfo>::new();
+                    if !file_scan_infos.is_empty() {
                         let engine_guard = engine.lock().unwrap();
-                        for ft in &file_tables {
-                            let empty: Vec<String> = vec![];
-                            if let Err(e) = engine_guard.register_file_table(
-                                &ft.table_name, &ft.file_path, &ft.format, &empty,
-                            ) {
-                                warn!(error = %e, table = %ft.table_name, "failed to register file table");
-                                return;
-                            }
-                            if let Ok(columns) = engine_guard.get_table_columns(&ft.table_name) {
-                                table_schemas.insert(ft.table_name.clone(), columns);
+                        for fsi in &file_scan_infos {
+                            // Multi-file parquet: use LocalFiles (no table materialization).
+                            // Single-file parquet + non-parquet: register as DuckDB table.
+                            if fsi.format == "parquet" && fsi.files.len() > 1 {
+                                match engine_guard.get_parquet_columns(&fsi.files[0].path) {
+                                    Ok(columns) => {
+                                        table_schemas.insert(fsi.table_name.clone(), columns);
+                                        file_scan_map.insert(fsi.table_name.clone(), fsi.clone());
+                                    }
+                                    Err(e) => {
+                                        warn!(error = %e, table = %fsi.table_name, "failed to get parquet columns, falling back to table registration");
+                                        let empty: Vec<String> = vec![];
+                                        if let Err(e) = engine_guard.register_file_table(
+                                            &fsi.table_name, &fsi.files[0].path, &fsi.format, &empty,
+                                        ) {
+                                            warn!(error = %e, table = %fsi.table_name, "failed to register file table");
+                                            return;
+                                        }
+                                        if let Ok(columns) = engine_guard.get_table_columns(&fsi.table_name) {
+                                            table_schemas.insert(fsi.table_name.clone(), columns);
+                                        }
+                                    }
+                                }
+                            } else {
+                                let empty: Vec<String> = vec![];
+                                if let Err(e) = engine_guard.register_file_table(
+                                    &fsi.table_name, &fsi.files[0].path, &fsi.format, &empty,
+                                ) {
+                                    warn!(error = %e, table = %fsi.table_name, "failed to register file table");
+                                    return;
+                                }
+                                if let Ok(columns) = engine_guard.get_table_columns(&fsi.table_name) {
+                                    table_schemas.insert(fsi.table_name.clone(), columns);
+                                }
                             }
                         }
                         drop(engine_guard);
@@ -1740,7 +1782,7 @@ impl PBackendService for PBackendServiceHandler {
                             let use_sql = root_is_union;
                             let has_substrait = !use_sql && engine.lock().unwrap().has_substrait();
                             if has_substrait {
-                                match plan_translator::translate_fragment(&params, &table_schemas) {
+                                match plan_translator::translate_fragment(&params, &table_schemas, &file_scan_map) {
                                     Ok(plan) => {
                                         let exec = if plan.force_cpu_substrait {
                                             ExecPlan::SubstraitCpuOnly { bytes: plan.substrait_bytes, sort_limit_sql: plan.sort_limit_sql }
@@ -1854,40 +1896,79 @@ impl PBackendService for PBackendServiceHandler {
 
             // Standard synchronous execution path (no unresolved exchanges).
 
-            // Step 1: Register file-backed tables in DuckDB with SELECT * (all columns).
-            // Step 2: Get actual column names from DuckDB.
-            // Step 3: Pass those as table_schemas to the Substrait translator.
-            // This ensures the ReadRel schema and SLOT_REF field references match
-            // the DuckDB table, even with TVF late materialization.
-            let file_tables = extract_file_tables(params);
+            // Step 1: Extract file scan info (all file paths per scan node).
+            // Step 2: For parquet: get column names via DESCRIBE (no table materialization).
+            //         For non-parquet: register as DuckDB table and get columns.
+            // Step 3: Build file_scan_map for parquet LocalFiles path.
+            // Step 4: Pass table_schemas + file_scan_map to the Substrait translator.
+            let file_scan_infos = extract_file_scan_info(params);
             let mut table_schemas = std::collections::HashMap::<String, Vec<String>>::new();
+            let mut file_scan_map = std::collections::HashMap::<String, plan_translator::FileScanInfo>::new();
 
-            if !file_tables.is_empty() {
+            if !file_scan_infos.is_empty() {
                 if let Some(engine) = &self.engine {
                     let engine_guard = engine.lock().unwrap();
-                    for ft in &file_tables {
-                        // Register with SELECT * to get all file columns.
-                        let empty: Vec<String> = vec![];
-                        if let Err(e) = engine_guard.register_file_table(&ft.table_name, &ft.file_path, &ft.format, &empty) {
-                            warn!(error = %e, table = %ft.table_name, "failed to register file table");
-                            return Ok(Response::new(PExecPlanFragmentResult {
-                                status: err_status(&format!("register file table '{}': {e}", ft.table_name)),
-                                ..Default::default()
-                            }));
-                        }
-                        // Get actual column names from DuckDB.
-                        match engine_guard.get_table_columns(&ft.table_name) {
-                            Ok(columns) => {
-                                info!(
-                                    table = %ft.table_name,
-                                    path = %ft.file_path,
-                                    columns = ?columns,
-                                    "registered file table"
-                                );
-                                table_schemas.insert(ft.table_name.clone(), columns);
+                    for fsi in &file_scan_infos {
+                        if fsi.format == "parquet" && fsi.files.len() > 1 {
+                            // Multi-file parquet: get column names without table materialization.
+                            // The Substrait plan will use LocalFiles → parquet_scan([files]).
+                            // Note: single-file parquet uses NamedTable (old path) because
+                            // sirius_physical_parquet_scan has issues with GROUP BY/complex ops.
+                            match engine_guard.get_parquet_columns(&fsi.files[0].path) {
+                                Ok(columns) => {
+                                    info!(
+                                        table = %fsi.table_name,
+                                        num_files = fsi.files.len(),
+                                        columns = ?columns,
+                                        "parquet columns (LocalFiles path)"
+                                    );
+                                    table_schemas.insert(fsi.table_name.clone(), columns);
+                                    file_scan_map.insert(fsi.table_name.clone(), fsi.clone());
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, table = %fsi.table_name, "failed to get parquet columns, falling back to table registration");
+                                    // Fallback: register as DuckDB table (old path).
+                                    let empty: Vec<String> = vec![];
+                                    if let Err(e) = engine_guard.register_file_table(&fsi.table_name, &fsi.files[0].path, &fsi.format, &empty) {
+                                        warn!(error = %e, table = %fsi.table_name, "failed to register file table");
+                                        return Ok(Response::new(PExecPlanFragmentResult {
+                                            status: err_status(&format!("register file table '{}': {e}", fsi.table_name)),
+                                            ..Default::default()
+                                        }));
+                                    }
+                                    match engine_guard.get_table_columns(&fsi.table_name) {
+                                        Ok(columns) => {
+                                            table_schemas.insert(fsi.table_name.clone(), columns);
+                                        }
+                                        Err(e) => {
+                                            warn!(error = %e, table = %fsi.table_name, "failed to get table columns");
+                                        }
+                                    }
+                                }
                             }
-                            Err(e) => {
-                                warn!(error = %e, table = %ft.table_name, "failed to get table columns");
+                        } else {
+                            // Non-parquet: register as DuckDB table (old path).
+                            let empty: Vec<String> = vec![];
+                            if let Err(e) = engine_guard.register_file_table(&fsi.table_name, &fsi.files[0].path, &fsi.format, &empty) {
+                                warn!(error = %e, table = %fsi.table_name, "failed to register file table");
+                                return Ok(Response::new(PExecPlanFragmentResult {
+                                    status: err_status(&format!("register file table '{}': {e}", fsi.table_name)),
+                                    ..Default::default()
+                                }));
+                            }
+                            match engine_guard.get_table_columns(&fsi.table_name) {
+                                Ok(columns) => {
+                                    info!(
+                                        table = %fsi.table_name,
+                                        path = %fsi.files[0].path,
+                                        columns = ?columns,
+                                        "registered file table"
+                                    );
+                                    table_schemas.insert(fsi.table_name.clone(), columns);
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, table = %fsi.table_name, "failed to get table columns");
+                                }
                             }
                         }
                     }
@@ -1898,11 +1979,11 @@ impl PBackendService for PBackendServiceHandler {
             // Constant-only queries (no data tables) use CPU-only Substrait to avoid
             // GPU engine bugs with VirtualTable plans.
             // If substrait extension isn't loaded, skip directly to SQL.
-            let has_data_tables = !file_tables.is_empty() || !table_schemas.is_empty();
+            let has_data_tables = !file_scan_infos.is_empty() || !table_schemas.is_empty();
             let has_substrait = self.engine.as_ref()
                 .map(|e| e.lock().unwrap().has_substrait()).unwrap_or(false);
             let (exec_plan, output_names, output_indices) = if has_substrait {
-                match plan_translator::translate_fragment(params, &table_schemas) {
+                match plan_translator::translate_fragment(params, &table_schemas, &file_scan_map) {
                     Ok(plan) => {
                         info!(bytes = plan.substrait_bytes.len(), has_data_tables, force_cpu = plan.force_cpu_substrait, "translated to Substrait");
                         let exec = if plan.force_cpu_substrait || !has_data_tables {
@@ -2434,22 +2515,51 @@ impl PBackendService for PBackendServiceHandler {
         info!(pattern = %pattern, "glob");
 
         // Strip file:// scheme if present (FE sends file:// URLs for local paths).
+        let had_scheme = pattern.starts_with("file://");
         let path = pattern.strip_prefix("file://").unwrap_or(&pattern);
 
-        // For local files, just stat the path and return it.
         let mut files = vec![];
-        match std::fs::metadata(path) {
-            Ok(meta) => {
-                // Return the original pattern (with file:// prefix) — FE expects it back.
-                files.push(p_glob_response::PFileInfo {
-                    file: Some(pattern),
-                    size: Some(meta.len() as i64),
-                });
+
+        // Check if the pattern contains glob wildcards.
+        if path.contains('*') || path.contains('?') || path.contains('[') {
+            match glob::glob(path) {
+                Ok(entries) => {
+                    for entry in entries.flatten() {
+                        if let Ok(meta) = std::fs::metadata(&entry) {
+                            if meta.is_file() {
+                                let file_path = if had_scheme {
+                                    format!("file://{}", entry.display())
+                                } else {
+                                    entry.display().to_string()
+                                };
+                                files.push(p_glob_response::PFileInfo {
+                                    file: Some(file_path),
+                                    size: Some(meta.len() as i64),
+                                });
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(pattern = %pattern, error = %e, "glob: pattern error");
+                }
             }
-            Err(e) => {
-                warn!(pattern = %pattern, error = %e, "glob: file not found");
+        } else {
+            // No wildcards — just stat the single path.
+            match std::fs::metadata(path) {
+                Ok(meta) => {
+                    files.push(p_glob_response::PFileInfo {
+                        file: Some(pattern.clone()),
+                        size: Some(meta.len() as i64),
+                    });
+                }
+                Err(e) => {
+                    warn!(pattern = %pattern, error = %e, "glob: file not found");
+                }
             }
         }
+
+        info!(pattern = %pattern, count = files.len(), "glob result");
 
         Ok(Response::new(PGlobResponse {
             status: ok_status(),

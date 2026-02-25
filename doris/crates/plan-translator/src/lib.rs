@@ -190,6 +190,24 @@ fn rel_output_names(rel: &Rel) -> Vec<String> {
     }
 }
 
+/// A single file in a file scan range (path + byte offset/length).
+#[derive(Debug, Clone)]
+pub struct FileScanFile {
+    pub path: String,
+    pub start_offset: i64,
+    pub length: i64,
+}
+
+/// File scan info extracted from per_node_scan_ranges.
+///
+/// Contains all files assigned to this BE for a given scan node.
+#[derive(Debug, Clone)]
+pub struct FileScanInfo {
+    pub table_name: String,
+    pub format: String,
+    pub files: Vec<FileScanFile>,
+}
+
 /// Result of Substrait plan translation.
 pub struct TranslatedPlan {
     /// Serialized Substrait Plan protobuf bytes.
@@ -409,11 +427,16 @@ fn extract_sort_limit_from_plan(
 /// For TVF file scans where the descriptor table lacks table_id, the scan translator
 /// uses these schemas to produce a correct ReadRel base_schema matching the DuckDB table.
 ///
+/// `file_scan_map` maps table names to `FileScanInfo` (multi-file scan ranges).
+/// When a table has an entry here AND format is parquet, the scan translator generates
+/// `ReadRel::LocalFiles` (→ `parquet_scan([files])`) instead of `ReadRel::NamedTable`.
+///
 /// Returns the Substrait bytes plus the expected output column names. When the DuckDB
 /// result has more columns than expected, the caller should project the result to match.
 pub fn translate_fragment(
     params: &TPipelineFragmentParams,
     table_schemas: &HashMap<String, Vec<String>>,
+    file_scan_map: &HashMap<String, FileScanInfo>,
 ) -> Result<TranslatedPlan> {
     let fragment = params
         .fragment
@@ -451,7 +474,7 @@ pub fn translate_fragment(
     let mut registry = ExtensionRegistry::new();
 
     // Translate the plan tree into a Substrait Rel tree.
-    let mut rel = node_translator::translate_plan(plan, &desc, &scan_params, &mut registry, table_schemas)?;
+    let mut rel = node_translator::translate_plan(plan, &desc, &scan_params, &mut registry, table_schemas, file_scan_map)?;
 
     // Extract sort/limit specification from the Doris plan's root SORT_NODE.
     // Returns structured sort info (column names + directions) for Rust-side sorting,
@@ -650,7 +673,7 @@ mod tests {
         let params = make_fragment_params(plan, desc);
 
         let table_schemas = HashMap::new();
-        let result = translate_fragment(&params, &table_schemas).unwrap();
+        let result = translate_fragment(&params, &table_schemas, &HashMap::new()).unwrap();
         assert!(!result.substrait_bytes.is_empty());
 
         // Decode the Substrait plan and verify it has a VirtualTable.
@@ -694,7 +717,7 @@ mod tests {
             vec!["city".to_string(), "state".to_string(), "population".to_string()],
         );
 
-        let result = translate_fragment(&params, &table_schemas).unwrap();
+        let result = translate_fragment(&params, &table_schemas, &HashMap::new()).unwrap();
         // Output names should include all materialized columns from the descriptor.
         assert_eq!(result.output_names, vec!["city", "state", "population"]);
     }
@@ -723,7 +746,7 @@ mod tests {
             vec!["city".to_string(), "state".to_string(), "population".to_string()],
         );
 
-        let result = translate_fragment(&params, &table_schemas).unwrap();
+        let result = translate_fragment(&params, &table_schemas, &HashMap::new()).unwrap();
         // Output names come from the descriptor table, not the full table schema.
         // project_ipc_columns uses these to select the subset post-execution.
         assert_eq!(result.output_names, vec!["city", "population"]);
@@ -756,7 +779,7 @@ mod tests {
         let desc = make_desc_table(vec![(0, None)], vec![]);
         let params = make_fragment_params(plan, desc);
 
-        let result = translate_fragment(&params, &HashMap::new()).unwrap();
+        let result = translate_fragment(&params, &HashMap::new(), &HashMap::new()).unwrap();
         let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
         let version = plan.version.unwrap();
         assert_eq!(version.producer, "sirius-doris-be");
@@ -776,7 +799,7 @@ mod tests {
         );
         let params = make_fragment_params(plan, desc);
 
-        let result = translate_fragment(&params, &HashMap::new()).unwrap();
+        let result = translate_fragment(&params, &HashMap::new(), &HashMap::new()).unwrap();
         let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
         let root = match &plan.relations[0].rel_type {
             Some(plan_rel::RelType::Root(r)) => r,
@@ -814,7 +837,7 @@ mod tests {
 
         // Manually set row_tuples to reference both tuples (simulating a join).
         // This tests the deduplication logic in translate_fragment.
-        let result = translate_fragment(&params, &HashMap::new()).unwrap();
+        let result = translate_fragment(&params, &HashMap::new(), &HashMap::new()).unwrap();
         // The actual output depends on the root node's row_tuples,
         // which for UNION_NODE only references tuple 0.
         // With tuple 0: id, name — no dedup needed.
@@ -854,7 +877,7 @@ mod tests {
         );
         let params = make_fragment_params(plan, desc);
 
-        let result = translate_fragment(&params, &HashMap::new()).unwrap();
+        let result = translate_fragment(&params, &HashMap::new(), &HashMap::new()).unwrap();
         let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
         let root = match &plan.relations[0].rel_type {
             Some(plan_rel::RelType::Root(r)) => r,
@@ -898,7 +921,7 @@ mod tests {
         );
         let params = make_fragment_params(plan, desc);
 
-        let result = translate_fragment(&params, &HashMap::new()).unwrap();
+        let result = translate_fragment(&params, &HashMap::new(), &HashMap::new()).unwrap();
         let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
         let root = match &plan.relations[0].rel_type {
             Some(plan_rel::RelType::Root(r)) => r,
@@ -951,7 +974,7 @@ mod tests {
         );
         let params = make_fragment_params(plan, desc);
 
-        let result = translate_fragment(&params, &HashMap::new()).unwrap();
+        let result = translate_fragment(&params, &HashMap::new(), &HashMap::new()).unwrap();
         let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
         let root = match &plan.relations[0].rel_type {
             Some(plan_rel::RelType::Root(r)) => r,
@@ -1013,7 +1036,7 @@ mod tests {
         );
         let params = make_fragment_params(plan, desc);
 
-        let result = translate_fragment(&params, &HashMap::new()).unwrap();
+        let result = translate_fragment(&params, &HashMap::new(), &HashMap::new()).unwrap();
         let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
         let root = match &plan.relations[0].rel_type {
             Some(plan_rel::RelType::Root(r)) => r,
@@ -1061,7 +1084,7 @@ mod tests {
         );
         let params = make_fragment_params(plan, desc);
 
-        let result = translate_fragment(&params, &HashMap::new()).unwrap();
+        let result = translate_fragment(&params, &HashMap::new(), &HashMap::new()).unwrap();
         let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
         let root = match &plan.relations[0].rel_type {
             Some(plan_rel::RelType::Root(r)) => r,
@@ -1108,7 +1131,7 @@ mod tests {
         );
         let params = make_fragment_params(plan, desc);
 
-        let result = translate_fragment(&params, &HashMap::new()).unwrap();
+        let result = translate_fragment(&params, &HashMap::new(), &HashMap::new()).unwrap();
         let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
         let root = match &plan.relations[0].rel_type {
             Some(plan_rel::RelType::Root(r)) => r,
@@ -1159,7 +1182,7 @@ mod tests {
         );
         let params = make_fragment_params(plan, desc);
 
-        let result = translate_fragment(&params, &HashMap::new()).unwrap();
+        let result = translate_fragment(&params, &HashMap::new(), &HashMap::new()).unwrap();
         let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
         let root = match &plan.relations[0].rel_type {
             Some(plan_rel::RelType::Root(r)) => r,
@@ -1197,7 +1220,7 @@ mod tests {
         );
         let params = make_fragment_params(plan, desc);
 
-        let result = translate_fragment(&params, &HashMap::new()).unwrap();
+        let result = translate_fragment(&params, &HashMap::new(), &HashMap::new()).unwrap();
         let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
         let root = match &plan.relations[0].rel_type {
             Some(plan_rel::RelType::Root(r)) => r,
@@ -1231,7 +1254,7 @@ mod tests {
         );
         let params = make_fragment_params(plan, desc);
 
-        let result = translate_fragment(&params, &HashMap::new()).unwrap();
+        let result = translate_fragment(&params, &HashMap::new(), &HashMap::new()).unwrap();
         let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
         let root = match &plan.relations[0].rel_type {
             Some(plan_rel::RelType::Root(r)) => r,
@@ -1258,7 +1281,7 @@ mod tests {
         );
         let params = make_fragment_params(plan, desc);
 
-        let result = translate_fragment(&params, &HashMap::new()).unwrap();
+        let result = translate_fragment(&params, &HashMap::new(), &HashMap::new()).unwrap();
         let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
         let root = match &plan.relations[0].rel_type {
             Some(plan_rel::RelType::Root(r)) => r,
@@ -1315,7 +1338,7 @@ mod tests {
             ],
         );
 
-        let result = translate_fragment(&params, &table_schemas).unwrap();
+        let result = translate_fragment(&params, &table_schemas, &HashMap::new()).unwrap();
 
         // Output names should be truncated to 4 (matching the exchange table).
         assert_eq!(result.output_names.len(), 4);
@@ -1376,7 +1399,7 @@ mod tests {
             ],
         );
 
-        let result = translate_fragment(&params, &table_schemas).unwrap();
+        let result = translate_fragment(&params, &table_schemas, &HashMap::new()).unwrap();
 
         // Output names should be in FE SELECT list order (s_name before n_name).
         // project_ipc_columns uses these to reorder from DuckDB output to FE order.
@@ -1406,7 +1429,7 @@ mod tests {
         let desc = make_desc_table(vec![], vec![]);
         let params = make_fragment_params(plan, desc);
 
-        let result = translate_fragment(&params, &HashMap::new()).unwrap();
+        let result = translate_fragment(&params, &HashMap::new(), &HashMap::new()).unwrap();
         let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
         let root = match &plan.relations[0].rel_type {
             Some(plan_rel::RelType::Root(r)) => r,
@@ -1452,7 +1475,7 @@ mod tests {
         );
         let params = make_fragment_params(plan, desc);
 
-        let result = translate_fragment(&params, &HashMap::new()).unwrap();
+        let result = translate_fragment(&params, &HashMap::new(), &HashMap::new()).unwrap();
         let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
         // "gt" should be registered once even though used twice.
         let gt_count = plan
@@ -1499,7 +1522,7 @@ mod tests {
         .into_iter()
         .collect();
 
-        let result = translate_fragment(&params, &table_schemas).unwrap();
+        let result = translate_fragment(&params, &table_schemas, &HashMap::new()).unwrap();
         let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
         let root = match &plan.relations[0].rel_type {
             Some(plan_rel::RelType::Root(r)) => r,
@@ -1715,7 +1738,7 @@ mod tests {
         );
         let params = make_fragment_params(plan, desc);
 
-        let result = translate_fragment(&params, &HashMap::new()).unwrap();
+        let result = translate_fragment(&params, &HashMap::new(), &HashMap::new()).unwrap();
         let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
         let root = match &plan.relations[0].rel_type {
             Some(plan_rel::RelType::Root(r)) => r,
@@ -1858,7 +1881,7 @@ mod tests {
         );
         let params = make_fragment_params(plan, desc);
 
-        let result = translate_fragment(&params, &HashMap::new()).unwrap();
+        let result = translate_fragment(&params, &HashMap::new(), &HashMap::new()).unwrap();
         let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
         let root = match &plan.relations[0].rel_type {
             Some(plan_rel::RelType::Root(r)) => r,
@@ -1907,6 +1930,218 @@ mod tests {
         match agg.input.as_deref().unwrap().rel_type.as_ref().unwrap() {
             rel::RelType::Join(_) => {}
             other => panic!("expected JoinRel under collapsed AGG, got {:?}", std::mem::discriminant(other)),
+        }
+    }
+
+    // ---- LocalFiles tests (multi-file parquet scan) ----
+
+    #[test]
+    fn test_file_scan_single_file_local_files() {
+        // FILE_SCAN_NODE with file_scan_map entry → ReadRel::LocalFiles (1 file).
+        let node = make_file_scan_node(0, 0, "lineitem");
+        let plan = make_plan(vec![node]);
+        let desc = make_desc_table(
+            vec![(0, Some(1))],
+            vec![
+                (0, 0, 0, "l_orderkey", TPrimitiveType::BIGINT),
+                (1, 0, 1, "l_partkey", TPrimitiveType::BIGINT),
+            ],
+        );
+        let params = make_fragment_params(plan, desc);
+
+        let mut table_schemas = HashMap::new();
+        table_schemas.insert(
+            "lineitem_0".to_string(),
+            vec!["l_orderkey".to_string(), "l_partkey".to_string()],
+        );
+
+        let mut file_scan_map = HashMap::new();
+        file_scan_map.insert(
+            "lineitem_0".to_string(),
+            FileScanInfo {
+                table_name: "lineitem_0".to_string(),
+                format: "parquet".to_string(),
+                files: vec![FileScanFile {
+                    path: "/data/tpch/lineitem/part-0.parquet".to_string(),
+                    start_offset: 0,
+                    length: -1,
+                }],
+            },
+        );
+
+        let result = translate_fragment(&params, &table_schemas, &file_scan_map).unwrap();
+        let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
+        let root = match &plan.relations[0].rel_type {
+            Some(plan_rel::RelType::Root(r)) => r,
+            _ => panic!("expected Root"),
+        };
+        let input = root.input.as_ref().unwrap();
+        match input.rel_type.as_ref().unwrap() {
+            rel::RelType::Read(read) => match &read.read_type {
+                Some(read_rel::ReadType::LocalFiles(lf)) => {
+                    assert_eq!(lf.items.len(), 1, "should have 1 file");
+                    let item = &lf.items[0];
+                    match &item.path_type {
+                        Some(substrait::proto::read_rel::local_files::file_or_files::PathType::UriFile(path)) => {
+                            assert_eq!(path, "/data/tpch/lineitem/part-0.parquet");
+                        }
+                        other => panic!("expected UriFile, got {:?}", other),
+                    }
+                    assert!(item.file_format.is_some(), "should have parquet file format");
+                }
+                other => panic!("expected LocalFiles, got {:?}", other),
+            },
+            other => panic!("expected Read, got {:?}", other),
+        }
+        // Schema should still be correct.
+        assert_eq!(result.output_names, vec!["l_orderkey", "l_partkey"]);
+    }
+
+    #[test]
+    fn test_file_scan_multi_file_local_files() {
+        // FILE_SCAN_NODE with 8 parquet files → ReadRel::LocalFiles (8 items).
+        let node = make_file_scan_node(0, 0, "lineitem");
+        let plan = make_plan(vec![node]);
+        let desc = make_desc_table(
+            vec![(0, Some(1))],
+            vec![
+                (0, 0, 0, "l_orderkey", TPrimitiveType::BIGINT),
+                (1, 0, 1, "l_partkey", TPrimitiveType::BIGINT),
+            ],
+        );
+        let params = make_fragment_params(plan, desc);
+
+        let mut table_schemas = HashMap::new();
+        table_schemas.insert(
+            "lineitem_0".to_string(),
+            vec!["l_orderkey".to_string(), "l_partkey".to_string()],
+        );
+
+        let files: Vec<FileScanFile> = (0..8)
+            .map(|i| FileScanFile {
+                path: format!("/data/tpch/lineitem/part-{}.parquet", i),
+                start_offset: 0,
+                length: -1,
+            })
+            .collect();
+        let mut file_scan_map = HashMap::new();
+        file_scan_map.insert(
+            "lineitem_0".to_string(),
+            FileScanInfo {
+                table_name: "lineitem_0".to_string(),
+                format: "parquet".to_string(),
+                files,
+            },
+        );
+
+        let result = translate_fragment(&params, &table_schemas, &file_scan_map).unwrap();
+        let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
+        let root = match &plan.relations[0].rel_type {
+            Some(plan_rel::RelType::Root(r)) => r,
+            _ => panic!("expected Root"),
+        };
+        let input = root.input.as_ref().unwrap();
+        match input.rel_type.as_ref().unwrap() {
+            rel::RelType::Read(read) => match &read.read_type {
+                Some(read_rel::ReadType::LocalFiles(lf)) => {
+                    assert_eq!(lf.items.len(), 8, "should have 8 files");
+                    for (i, item) in lf.items.iter().enumerate() {
+                        match &item.path_type {
+                            Some(substrait::proto::read_rel::local_files::file_or_files::PathType::UriFile(path)) => {
+                                assert_eq!(path, &format!("/data/tpch/lineitem/part-{}.parquet", i));
+                            }
+                            other => panic!("file {} expected UriFile, got {:?}", i, other),
+                        }
+                    }
+                }
+                other => panic!("expected LocalFiles, got {:?}", other),
+            },
+            other => panic!("expected Read, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_file_scan_empty_map_falls_back_to_named_table() {
+        // FILE_SCAN_NODE with empty file_scan_map → ReadRel::NamedTable (backward compat).
+        let node = make_file_scan_node(0, 0, "cities");
+        let plan = make_plan(vec![node]);
+        let desc = make_desc_table(
+            vec![(0, Some(1))],
+            vec![
+                (0, 0, 0, "city", TPrimitiveType::VARCHAR),
+                (1, 0, 1, "pop", TPrimitiveType::INT),
+            ],
+        );
+        let params = make_fragment_params(plan, desc);
+
+        let mut table_schemas = HashMap::new();
+        table_schemas.insert(
+            "cities_0".to_string(),
+            vec!["city".to_string(), "pop".to_string()],
+        );
+
+        // Empty file_scan_map → should produce NamedTable, not LocalFiles.
+        let result = translate_fragment(&params, &table_schemas, &HashMap::new()).unwrap();
+        let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
+        let root = match &plan.relations[0].rel_type {
+            Some(plan_rel::RelType::Root(r)) => r,
+            _ => panic!("expected Root"),
+        };
+        let input = root.input.as_ref().unwrap();
+        match input.rel_type.as_ref().unwrap() {
+            rel::RelType::Read(read) => match &read.read_type {
+                Some(read_rel::ReadType::NamedTable(nt)) => {
+                    assert_eq!(nt.names, vec!["cities_0"]);
+                }
+                other => panic!("expected NamedTable, got {:?}", other),
+            },
+            other => panic!("expected Read, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_file_scan_non_parquet_falls_back_to_named_table() {
+        // FILE_SCAN_NODE with CSV format in file_scan_map → NamedTable (not LocalFiles).
+        let node = make_file_scan_node(0, 0, "data");
+        let plan = make_plan(vec![node]);
+        let desc = make_desc_table(
+            vec![(0, Some(1))],
+            vec![(0, 0, 0, "col1", TPrimitiveType::VARCHAR)],
+        );
+        let params = make_fragment_params(plan, desc);
+
+        let mut table_schemas = HashMap::new();
+        table_schemas.insert("data_0".to_string(), vec!["col1".to_string()]);
+
+        let mut file_scan_map = HashMap::new();
+        file_scan_map.insert(
+            "data_0".to_string(),
+            FileScanInfo {
+                table_name: "data_0".to_string(),
+                format: "csv".to_string(), // Not parquet!
+                files: vec![FileScanFile {
+                    path: "/data/test.csv".to_string(),
+                    start_offset: 0,
+                    length: -1,
+                }],
+            },
+        );
+
+        let result = translate_fragment(&params, &table_schemas, &file_scan_map).unwrap();
+        let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
+        let root = match &plan.relations[0].rel_type {
+            Some(plan_rel::RelType::Root(r)) => r,
+            _ => panic!("expected Root"),
+        };
+        let input = root.input.as_ref().unwrap();
+        match input.rel_type.as_ref().unwrap() {
+            rel::RelType::Read(read) => match &read.read_type {
+                Some(read_rel::ReadType::NamedTable(nt)) => {
+                    assert_eq!(nt.names, vec!["data_0"]);
+                }
+                other => panic!("expected NamedTable for CSV, got {:?}", other),
+            },
+            other => panic!("expected Read, got {:?}", other),
         }
     }
 }

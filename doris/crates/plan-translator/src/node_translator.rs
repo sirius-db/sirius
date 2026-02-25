@@ -19,7 +19,7 @@ use substrait::proto::{
 };
 
 use crate::descriptor_table::DescriptorTable;
-use crate::{expr_translator, scan_translator, ExtensionRegistry};
+use crate::{expr_translator, scan_translator, ExtensionRegistry, FileScanInfo};
 
 /// Translate a Doris TPlan (flat pre-order node list) into a Substrait Rel tree.
 pub fn translate_plan(
@@ -28,12 +28,13 @@ pub fn translate_plan(
     scan_params: &BTreeMap<i32, TFileScanRangeParams>,
     registry: &mut ExtensionRegistry,
     table_schemas: &HashMap<String, Vec<String>>,
+    file_scan_map: &HashMap<String, FileScanInfo>,
 ) -> Result<Rel> {
     if plan.nodes.is_empty() {
         bail!("TPlan has no nodes");
     }
     let mut idx = 0;
-    translate_node(&plan.nodes, &mut idx, desc, scan_params, registry, table_schemas)
+    translate_node(&plan.nodes, &mut idx, desc, scan_params, registry, table_schemas, file_scan_map)
 }
 
 fn translate_node(
@@ -43,6 +44,7 @@ fn translate_node(
     scan_params: &BTreeMap<i32, TFileScanRangeParams>,
     registry: &mut ExtensionRegistry,
     table_schemas: &HashMap<String, Vec<String>>,
+    file_scan_map: &HashMap<String, FileScanInfo>,
 ) -> Result<Rel> {
     if *idx >= nodes.len() {
         bail!("unexpected end of plan nodes at index {}", *idx);
@@ -74,13 +76,13 @@ fn translate_node(
 
     // Recursively translate children first (pre-order: children follow this node).
     let children: Vec<Rel> = (0..num_children)
-        .map(|_| translate_node(nodes, idx, desc, scan_params, registry, table_schemas))
+        .map(|_| translate_node(nodes, idx, desc, scan_params, registry, table_schemas, file_scan_map))
         .collect::<Result<_>>()?;
 
     // Translate this node based on type.
     let rel = if node.node_type == TPlanNodeType::FILE_SCAN_NODE {
         let params = scan_params.get(&node.node_id);
-        scan_translator::translate_file_scan(node, desc, params, table_schemas)?
+        scan_translator::translate_file_scan(node, desc, params, table_schemas, file_scan_map)?
     } else if node.node_type == TPlanNodeType::SELECT_NODE {
         // SELECT_NODE passes through its single child, with conjuncts applied as a filter.
         if children.len() != 1 {

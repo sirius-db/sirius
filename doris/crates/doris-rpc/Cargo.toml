@@ -29,3 +29,4 @@ zstd = "0.13"
 tokio-stream = "0.1"
 nixl-sys = { version = "0.10", optional = true }
 cudarc = { workspace = true, optional = true }
+glob = "0.3"
