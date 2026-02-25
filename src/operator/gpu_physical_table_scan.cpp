@@ -438,9 +438,38 @@ void HandleArbitraryConstantExpression(vector<shared_ptr<GPUColumn>>& column,
       continue;
     }
 
-    switch (column[expr]->data_wrapper.type.id()) {
+    // DuckDB 1.4+ may store filter constants as VARCHAR even for typed columns
+    // (e.g., date string '1994-01-01' instead of DATE int32). Cast to the target
+    // column's logical type before extracting the raw value.
+    auto& constant_val = filter_constant[expr]->constant;
+    auto col_type_id   = column[expr]->data_wrapper.type.id();
+    Value casted_val   = constant_val;
+    switch (col_type_id) {
+      case GPUColumnTypeId::INT16:
+        casted_val = constant_val.DefaultCastAs(LogicalType::SMALLINT);
+        break;
+      case GPUColumnTypeId::INT32:
+        casted_val = constant_val.DefaultCastAs(LogicalType::INTEGER);
+        break;
+      case GPUColumnTypeId::INT64:
+        casted_val = constant_val.DefaultCastAs(LogicalType::BIGINT);
+        break;
+      case GPUColumnTypeId::FLOAT32:
+        casted_val = constant_val.DefaultCastAs(LogicalType::FLOAT);
+        break;
+      case GPUColumnTypeId::FLOAT64:
+        casted_val = constant_val.DefaultCastAs(LogicalType::DOUBLE);
+        break;
+      case GPUColumnTypeId::DATE: casted_val = constant_val.DefaultCastAs(LogicalType::DATE); break;
+      case GPUColumnTypeId::VARCHAR:
+        casted_val = constant_val.DefaultCastAs(LogicalType::VARCHAR);
+        break;
+      default: break;
+    }
+
+    switch (col_type_id) {
       case GPUColumnTypeId::INT16: {
-        int temp = filter_constant[expr]->constant.GetValue<int16_t>();
+        int16_t temp = casted_val.GetValue<int16_t>();
         memcpy(constant_compare + init_offset, &temp, sizeof(int16_t));
         constant_offset[expr] = init_offset;
         init_offset += sizeof(int16_t);
@@ -448,35 +477,35 @@ void HandleArbitraryConstantExpression(vector<shared_ptr<GPUColumn>>& column,
       }
       case GPUColumnTypeId::INT32:
       case GPUColumnTypeId::DATE: {
-        int temp = filter_constant[expr]->constant.GetValue<int>();
+        int temp = casted_val.GetValue<int>();
         memcpy(constant_compare + init_offset, &temp, sizeof(int));
         constant_offset[expr] = init_offset;
         init_offset += sizeof(int);
         break;
       }
       case GPUColumnTypeId::INT64: {
-        int64_t temp = filter_constant[expr]->constant.GetValue<int64_t>();
+        int64_t temp = casted_val.GetValue<int64_t>();
         memcpy(constant_compare + init_offset, &temp, sizeof(int64_t));
         constant_offset[expr] = init_offset;
         init_offset += sizeof(int64_t);
         break;
       }
       case GPUColumnTypeId::FLOAT32: {
-        float temp = filter_constant[expr]->constant.GetValue<float>();
+        float temp = casted_val.GetValue<float>();
         memcpy(constant_compare + init_offset, &temp, sizeof(float));
         constant_offset[expr] = init_offset;
         init_offset += sizeof(float);
         break;
       }
       case GPUColumnTypeId::FLOAT64: {
-        double temp = filter_constant[expr]->constant.GetValue<double>();
+        double temp = casted_val.GetValue<double>();
         memcpy(constant_compare + init_offset, &temp, sizeof(double));
         constant_offset[expr] = init_offset;
         init_offset += sizeof(double);
         break;
       }
       case GPUColumnTypeId::VARCHAR: {
-        std::string lower_string = filter_constant[expr]->constant.ToString();
+        std::string lower_string = casted_val.ToString();
         memcpy(constant_compare + init_offset, lower_string.data(), lower_string.size());
         constant_offset[expr] = init_offset;
         init_offset += lower_string.size();
@@ -1753,39 +1782,103 @@ SourceResultType GPUPhysicalTableScan::GetData(GPUIntermediateRelation& output_r
       table->columns[column_ids[column_index].GetPrimaryIndex()]->row_id_count = 0;
     }
 
-    // Convert TableFilters to Expression
-    auto filter_expr = ConvertTableFiltersToExpression(*table_filters, column_ids, returned_types);
+    // Check if all filters are simple CONSTANT_COMPARISON (possibly inside CONJUNCTION_AND).
+    // If so, use the fused CUDA kernel path (HandleArbitraryConstantExpression) which is
+    // significantly faster than the general GpuExpressionExecutor for simple predicates.
+    bool all_constant_comparison = true;
+    int num_expr                 = 0;
+    for (auto& [column_index, filter] : table_filters->filters) {
+      if (filter->filter_type == TableFilterType::OPTIONAL_FILTER ||
+          filter->filter_type == TableFilterType::IS_NOT_NULL) {
+        continue;
+      }
+      if (filter->filter_type == TableFilterType::CONSTANT_COMPARISON) {
+        num_expr++;
+      } else if (filter->filter_type == TableFilterType::CONJUNCTION_AND) {
+        auto& conjunction = filter->Cast<ConjunctionAndFilter>();
+        for (auto& child : conjunction.child_filters) {
+          if (child->filter_type == TableFilterType::CONSTANT_COMPARISON) {
+            num_expr++;
+          } else if (child->filter_type != TableFilterType::IS_NOT_NULL &&
+                     child->filter_type != TableFilterType::OPTIONAL_FILTER) {
+            all_constant_comparison = false;
+            break;
+          }
+        }
+      } else {
+        all_constant_comparison = false;
+      }
+      if (!all_constant_comparison) break;
+    }
 
-    if (filter_expr) {
-      SIRIUS_LOG_DEBUG("Converted table filters to expression: {}", filter_expr->ToString());
+    if (all_constant_comparison && num_expr > 0) {
+      // Fast path: fused CUDA kernel for constant comparisons
+      SIRIUS_LOG_DEBUG("Using fused kernel path for {} constant comparison filters", num_expr);
+      ConstantFilter** filter_constants =
+        gpuBufferManager->customCudaHostAlloc<ConstantFilter*>(num_expr);
+      vector<shared_ptr<GPUColumn>> expression_columns(num_expr);
 
-      // Set up input columns for GpuExpressionExecutor
-      // The BoundReferenceExpression uses column_index as index into input_columns
-      GPUIntermediateRelation filter_input_relation(column_ids.size());
+      int expr_idx = 0;
       for (auto& [column_index, filter] : table_filters->filters) {
-        filter_input_relation.columns[column_index] =
-          table->columns[column_ids[column_index].GetPrimaryIndex()];
+        if (filter->filter_type == TableFilterType::OPTIONAL_FILTER ||
+            filter->filter_type == TableFilterType::IS_NOT_NULL) {
+          continue;
+        }
+        if (filter->filter_type == TableFilterType::CONJUNCTION_AND) {
+          auto& conjunction = filter->Cast<ConjunctionAndFilter>();
+          for (auto& child : conjunction.child_filters) {
+            if (child->filter_type == TableFilterType::CONSTANT_COMPARISON) {
+              filter_constants[expr_idx] = &(child->Cast<ConstantFilter>());
+              expression_columns[expr_idx] =
+                table->columns[column_ids[column_index].GetPrimaryIndex()];
+              expr_idx++;
+            }
+          }
+        } else if (filter->filter_type == TableFilterType::CONSTANT_COMPARISON) {
+          filter_constants[expr_idx]   = &(filter->Cast<ConstantFilter>());
+          expression_columns[expr_idx] = table->columns[column_ids[column_index].GetPrimaryIndex()];
+          expr_idx++;
+        }
       }
 
-      // Create and execute the expression
-      sirius::GpuExpressionExecutor executor(*filter_expr, gpuBufferManager->mr);
-      executor.SetInputColumns(filter_input_relation);
+      HandleArbitraryConstantExpression(
+        expression_columns, count, row_ids, filter_constants, num_expr);
+    } else {
+      // General path: GpuExpressionExecutor for complex filters (contains, LIKE, etc.)
+      auto filter_expr =
+        ConvertTableFiltersToExpression(*table_filters, column_ids, returned_types);
 
-      // Execute the boolean filter expression
-      auto bitmap = executor.ExecuteExpression(0);
+      if (filter_expr) {
+        SIRIUS_LOG_DEBUG("Converted table filters to expression: {}", filter_expr->ToString());
 
-      // Handle null values in bitmap - convert to false for SQL WHERE semantics
-      if (bitmap->null_count() > 0) {
-        cudf::numeric_scalar<bool> false_scalar(false);
-        bitmap = cudf::replace_nulls(bitmap->view(), false_scalar);
+        // Set up input columns for GpuExpressionExecutor
+        // The BoundReferenceExpression uses column_index as index into input_columns
+        GPUIntermediateRelation filter_input_relation(column_ids.size());
+        for (auto& [column_index, filter] : table_filters->filters) {
+          filter_input_relation.columns[column_index] =
+            table->columns[column_ids[column_index].GetPrimaryIndex()];
+        }
+
+        // Create and execute the expression
+        sirius::GpuExpressionExecutor executor(*filter_expr, gpuBufferManager->mr);
+        executor.SetInputColumns(filter_input_relation);
+
+        // Execute the boolean filter expression
+        auto bitmap = executor.ExecuteExpression(0);
+
+        // Handle null values in bitmap - convert to false for SQL WHERE semantics
+        if (bitmap->null_count() > 0) {
+          cudf::numeric_scalar<bool> false_scalar(false);
+          bitmap = cudf::replace_nulls(bitmap->view(), false_scalar);
+        }
+
+        // Convert boolean bitmap to row_ids using DispatchSelect
+        auto [selected_row_ids, selected_count] =
+          sirius::GpuDispatcher::DispatchSelect(bitmap->view(), gpuBufferManager->mr);
+        row_ids  = selected_row_ids;
+        count    = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
+        count[0] = selected_count;
       }
-
-      // Convert boolean bitmap to row_ids using DispatchSelect
-      auto [selected_row_ids, selected_count] =
-        sirius::GpuDispatcher::DispatchSelect(bitmap->view(), gpuBufferManager->mr);
-      row_ids  = selected_row_ids;
-      count    = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
-      count[0] = selected_count;
     }
   }
   SIRIUS_LOG_DEBUG("Finished processing table filters");
