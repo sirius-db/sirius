@@ -1,19 +1,12 @@
 #!/bin/bash
-# Run TPC-H GPU queries against Parquet files
-#
-# Creates views from parquet files found in the dataset directory,
-# then runs the standard GPU query files unchanged.
+# Run TPC-H queries against Parquet files using plain DuckDB (no Sirius)
+# Used as a baseline for validating Sirius results.
 #
 # Usage:
-#   export SIRIUS_CONFIG_FILE=/home/felipe/sirius/test/cpp/integration/integration.cfg
-#   ./test/tpch_performance/run_tpch_parquet.sh <scale_factor> <query_numbers...>
-#
-# Example:
-#   ./test/tpch_performance/run_tpch_parquet.sh 100 1 3 4 5 6 7 8 9 10 12 13 14 18 19
+#   ./test/tpch_performance/run_tpch_parquet_duckdb.sh <scale_factor> <query_numbers...>
 #
 # Environment variables:
-#   SIRIUS_CONFIG_FILE - path to Sirius config file (required)
-#   TIMING_CSV         - path to write per-query timing CSV (optional)
+#   TIMING_CSV  - path to write per-query timing CSV (optional)
 
 set -uo pipefail
 
@@ -24,7 +17,6 @@ QUERY_DIR="$PROJECT_DIR/test/tpch_performance/tpch_queries/gpu"
 
 if [ $# -lt 2 ]; then
     echo "Usage: $0 <scale_factor> <query_numbers...>"
-    echo "Example: $0 100 1 3 4 5 6 7 8 9 10 12 13 14 18 19"
     exit 1
 fi
 
@@ -36,15 +28,10 @@ PARQUET_DIR="$PROJECT_DIR/test_datasets/tpch_parquet_sf${SF}"
 
 if [ ! -d "$PARQUET_DIR" ]; then
     echo "ERROR: Parquet directory not found: $PARQUET_DIR"
-    echo "Generate it first with:"
-    echo "  ./build/release/duckdb -c \"INSTALL tpch; LOAD tpch; CALL dbgen(sf=${SF}); EXPORT DATABASE '${PARQUET_DIR}' (FORMAT PARQUET);\""
     exit 1
 fi
 
-# Build CREATE VIEW statements for the TPC-H tables.
-# Match both single files (table.parquet) and partitioned files (table_0.parquet, table_1.parquet, ...).
-# A plain glob like part*.parquet would also match partsupp.parquet, so we collect
-# matching files with bash globs and pass an explicit list to read_parquet().
+# Build CREATE VIEW statements
 TPCH_TABLES=(customer lineitem nation orders part partsupp region supplier)
 VIEW_SQL=""
 for TABLE_NAME in "${TPCH_TABLES[@]}"; do
@@ -61,14 +48,12 @@ if [ -n "${TIMING_CSV:-}" ]; then
     echo "query,seconds" > "$TIMING_CSV"
 fi
 
-echo "Running TPC-H queries against SF${SF} parquet data"
-echo "Parquet dir: $PARQUET_DIR"
-echo "Queries: ${QUERIES[*]}"
+echo "Running TPC-H DuckDB baseline queries against SF${SF} parquet data"
 echo "=========================================="
 
 for q in "${QUERIES[@]}"; do
     QUERY_FILE="$QUERY_DIR/q${q}.sql"
-    RESULT_FILE="$PROJECT_DIR/result_sirius_sf${SF}_q${q}.txt"
+    RESULT_FILE="$PROJECT_DIR/result_duckdb_sf${SF}_q${q}.txt"
 
     if [ ! -f "$QUERY_FILE" ]; then
         echo "WARNING: Query file not found: $QUERY_FILE, skipping Q${q}"
@@ -78,9 +63,12 @@ for q in "${QUERIES[@]}"; do
     echo ""
     echo "========== Q${q} =========="
 
-    TEMP_SQL=$(mktemp /tmp/tpch_q${q}_XXXXXX.sql)
+    # Extract SQL from inside gpu_execution('...')
+    INNER_SQL=$(sed -n "s/call gpu_execution('//; s/');//; p" "$QUERY_FILE" | sed "s/''/'/g")
+
+    TEMP_SQL=$(mktemp /tmp/tpch_duckdb_q${q}_XXXXXX.sql)
     printf '%s\n' "$VIEW_SQL" > "$TEMP_SQL"
-    cat "$QUERY_FILE" >> "$TEMP_SQL"
+    printf '%s\n' "$INNER_SQL" >> "$TEMP_SQL"
 
     START_TIME=$(date +%s.%N)
     "$DUCKDB" -f "$TEMP_SQL" 2>&1 | tee "$RESULT_FILE"
@@ -98,4 +86,4 @@ done
 
 echo ""
 echo "=========================================="
-echo "All queries complete. Results saved as result_sirius_sf${SF}_q*.txt"
+echo "All DuckDB baseline queries complete."

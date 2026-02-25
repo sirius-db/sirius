@@ -85,6 +85,61 @@ struct ComparisonDispatcher {
                                       executor.execution_stream,
                                       executor.resource_ref);
       }
+    } else if constexpr (std::is_same_v<T, int64_t>) {
+      // For int64_t, check at runtime if this is a timestamp comparison
+      switch (left.type().id()) {
+        case cudf::type_id::TIMESTAMP_SECONDS: {
+          auto ts_scalar = cudf::timestamp_scalar<cudf::timestamp_s>(
+            cudf::duration_s{right_value}, true, executor.execution_stream, executor.resource_ref);
+          return cudf::binary_operation(left,
+                                        ts_scalar,
+                                        ComparisonOp,
+                                        return_type,
+                                        executor.execution_stream,
+                                        executor.resource_ref);
+        }
+        case cudf::type_id::TIMESTAMP_MILLISECONDS: {
+          auto ts_scalar = cudf::timestamp_scalar<cudf::timestamp_ms>(
+            cudf::duration_ms{right_value}, true, executor.execution_stream, executor.resource_ref);
+          return cudf::binary_operation(left,
+                                        ts_scalar,
+                                        ComparisonOp,
+                                        return_type,
+                                        executor.execution_stream,
+                                        executor.resource_ref);
+        }
+        case cudf::type_id::TIMESTAMP_MICROSECONDS: {
+          auto ts_scalar = cudf::timestamp_scalar<cudf::timestamp_us>(
+            cudf::duration_us{right_value}, true, executor.execution_stream, executor.resource_ref);
+          return cudf::binary_operation(left,
+                                        ts_scalar,
+                                        ComparisonOp,
+                                        return_type,
+                                        executor.execution_stream,
+                                        executor.resource_ref);
+        }
+        case cudf::type_id::TIMESTAMP_NANOSECONDS: {
+          auto ts_scalar = cudf::timestamp_scalar<cudf::timestamp_ns>(
+            cudf::duration_ns{right_value}, true, executor.execution_stream, executor.resource_ref);
+          return cudf::binary_operation(left,
+                                        ts_scalar,
+                                        ComparisonOp,
+                                        return_type,
+                                        executor.execution_stream,
+                                        executor.resource_ref);
+        }
+        default: {
+          // Regular int64_t comparison
+          auto numeric_scalar = cudf::numeric_scalar(
+            right_value, true, executor.execution_stream, executor.resource_ref);
+          return cudf::binary_operation(left,
+                                        numeric_scalar,
+                                        ComparisonOp,
+                                        return_type,
+                                        executor.execution_stream,
+                                        executor.resource_ref);
+        }
+      }
     } else {
       // Create a numeric scalar from the constant value
       auto numeric_scalar =
@@ -197,9 +252,15 @@ struct ComparisonDispatcher {
             left->view(), right_value.GetValue<std::string>(), return_type);
         case cudf::type_id::TIMESTAMP_DAYS:
           // DuckDB DATE is int32_t (days since epoch), same as cuDF TIMESTAMP_DAYS
-          // Use numeric_scalar<int32_t> for the comparison
           return DoScalarComparison<int32_t>(
             left->view(), right_value.GetValue<int32_t>(), return_type);
+        case cudf::type_id::TIMESTAMP_SECONDS:
+        case cudf::type_id::TIMESTAMP_MILLISECONDS:
+        case cudf::type_id::TIMESTAMP_MICROSECONDS:
+        case cudf::type_id::TIMESTAMP_NANOSECONDS:
+          // DuckDB timestamps are int64_t internally
+          return DoScalarComparison<int64_t>(
+            left->view(), right_value.GetValue<int64_t>(), return_type);
         case cudf::type_id::DECIMAL32:
           // cudf decimal type uses negative scale, same for below
           return DoScalarComparison<numeric::decimal32>(

@@ -1,0 +1,12 @@
+[workspace]
+name = "tpch-parquet-tools"
+channels = ["rapidsai-nightly", "conda-forge", "nvidia"]
+platforms = ["linux-64"]
+
+[dependencies]
+cudf = "26.04.*"
+python = ">=3.11"
+cuda-version = "13.*"
+
+[system-requirements]
+cuda = "13"
