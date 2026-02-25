@@ -157,14 +157,14 @@ void sirius_physical_right_delim_join::build_pipelines(
 std::unique_ptr<operator_data> sirius_physical_right_delim_join::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
-  NVTX3_FUNC_RANGE();
+  nvtx3::scoped_range nvtx_range{"sirius_physical_right_delim_join::execute"};
   return std::make_unique<operator_data>(input_data);
 }
 
 void sirius_physical_right_delim_join::sink(const operator_data& input_data,
                                             rmm::cuda_stream_view stream)
 {
-  NVTX3_FUNC_RANGE();
+  nvtx3::scoped_range nvtx_range{"sirius_physical_right_delim_join::sink"};
   // call partition join execute
   auto partition_join_output = partition_join->execute(input_data, stream);
   // call distinct execute
@@ -180,14 +180,14 @@ void sirius_physical_right_delim_join::sink(const operator_data& input_data,
 std::unique_ptr<operator_data> sirius_physical_left_delim_join::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
-  NVTX3_FUNC_RANGE();
+  nvtx3::scoped_range nvtx_range{"sirius_physical_left_delim_join::execute"};
   return std::make_unique<operator_data>(input_data);
 }
 
 void sirius_physical_left_delim_join::sink(const operator_data& input_data,
                                            rmm::cuda_stream_view stream)
 {
-  NVTX3_FUNC_RANGE();
+  nvtx3::scoped_range nvtx_range{"sirius_physical_left_delim_join::sink"};
   // call distinct execute
   auto distinct_output = distinct->execute(input_data, stream);
   // call column data scan execute

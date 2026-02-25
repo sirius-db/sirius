@@ -120,7 +120,7 @@ duckdb::unique_ptr<duckdb::Expression> convert_table_filters_to_expression(
 std::unique_ptr<operator_data> sirius_physical_table_scan::execute(const operator_data& input_data,
                                                                    rmm::cuda_stream_view stream)
 {
-  NVTX3_FUNC_RANGE();
+  nvtx3::scoped_range nvtx_range{"sirius_physical_table_scan::execute"};
   const auto& input_batches = input_data.get_data_batches();
 
   duckdb::unique_ptr<duckdb::Expression> filter_expr;

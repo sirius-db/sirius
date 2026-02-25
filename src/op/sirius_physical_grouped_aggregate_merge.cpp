@@ -193,7 +193,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::get_next
 std::unique_ptr<operator_data> sirius_physical_grouped_aggregate_merge::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
-  NVTX3_FUNC_RANGE();
+  nvtx3::scoped_range nvtx_range{"sirius_physical_grouped_aggregate_merge::execute"};
   const auto& input_batches = input_data.get_data_batches();
   if (input_batches.size() == 0) {
     throw std::runtime_error(

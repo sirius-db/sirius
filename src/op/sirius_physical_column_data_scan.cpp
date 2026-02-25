@@ -104,7 +104,7 @@ void sirius_physical_column_data_scan::build_pipelines(
 std::unique_ptr<operator_data> sirius_physical_column_data_scan::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
-  NVTX3_FUNC_RANGE();
+  nvtx3::scoped_range nvtx_range{"sirius_physical_column_data_scan::execute"};
   return std::make_unique<operator_data>(input_data);
 }
 

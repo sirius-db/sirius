@@ -145,7 +145,7 @@ bool sirius_physical_partition::is_build_partition() { return _is_build; }
 std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator_data& input_data,
                                                                   rmm::cuda_stream_view stream)
 {
-  NVTX3_FUNC_RANGE();
+  nvtx3::scoped_range nvtx_range{"sirius_physical_partition::execute"};
   const auto& input_batches = input_data.get_data_batches();
   if (input_batches.size() != 1) {
     throw std::runtime_error("We expect only one input batch for partition operator");
@@ -180,7 +180,7 @@ std::unique_ptr<operator_data> sirius_physical_partition::execute(const operator
 
 void sirius_physical_partition::sink(const operator_data& input_data, rmm::cuda_stream_view stream)
 {
-  NVTX3_FUNC_RANGE();
+  nvtx3::scoped_range nvtx_range{"sirius_physical_partition::sink"};
   const auto& input_batches = input_data.get_data_batches();
   (void)stream;  // sink does not use stream for push_data_batch_partitioned
   int partition_id = 0;

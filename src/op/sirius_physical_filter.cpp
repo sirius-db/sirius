@@ -60,7 +60,7 @@ sirius_physical_filter::sirius_physical_filter(
 std::unique_ptr<operator_data> sirius_physical_filter::execute(const operator_data& input_data,
                                                                rmm::cuda_stream_view stream)
 {
-  NVTX3_FUNC_RANGE();
+  nvtx3::scoped_range nvtx_range{"sirius_physical_filter::execute"};
   const auto& input_batches = input_data.get_data_batches();
 
   // The executor uses the data_batch API to filter rows according to `expression`.

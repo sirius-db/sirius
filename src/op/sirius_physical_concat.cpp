@@ -121,7 +121,7 @@ std::unique_ptr<operator_data> sirius_physical_concat::get_next_task_input_data(
 std::unique_ptr<operator_data> sirius_physical_concat::execute(const operator_data& input_data,
                                                                rmm::cuda_stream_view stream)
 {
-  NVTX3_FUNC_RANGE();
+  nvtx3::scoped_range nvtx_range{"sirius_physical_concat::execute"};
   auto partitioned_input_data = dynamic_cast<const partitioned_operator_data*>(&input_data);
   if (partitioned_input_data == nullptr) {
     throw std::runtime_error(
@@ -155,7 +155,7 @@ std::unique_ptr<operator_data> sirius_physical_concat::execute(const operator_da
 
 void sirius_physical_concat::sink(const operator_data& output_data, rmm::cuda_stream_view stream)
 {
-  NVTX3_FUNC_RANGE();
+  nvtx3::scoped_range nvtx_range{"sirius_physical_concat::sink"};
   auto partitioned_output_data = dynamic_cast<const partitioned_operator_data*>(&output_data);
   auto partition_idx           = partitioned_output_data->get_partition_idx();
   for (auto& batch : partitioned_output_data->get_data_batches()) {

@@ -393,7 +393,7 @@ bool get_column_index(const duckdb::Expression& expr, cudf::size_type& out_idx)
 std::unique_ptr<operator_data> sirius_physical_nested_loop_join::execute(
   const operator_data& input_data, rmm::cuda_stream_view stream)
 {
-  NVTX3_FUNC_RANGE();
+  nvtx3::scoped_range nvtx_range{"sirius_physical_nested_loop_join::execute"};
   const auto& input_batches = input_data.get_data_batches();
   size_t pipeline_id = (this->get_pipeline() != nullptr) ? this->get_pipeline()->get_pipeline_id()
                                                          : static_cast<size_t>(-1);
