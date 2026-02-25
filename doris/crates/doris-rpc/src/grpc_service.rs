@@ -433,24 +433,29 @@ fn merge_fragment_plans(
         return exchange_root_fragments;
     }
 
-    // Build set of exchange node IDs that local leaves can provide data for.
-    // A leaf's output_sink.stream_sink.dest_node_id tells us which EXCHANGE_NODE
-    // it feeds. EXCHANGE nodes not in this set depend on remote BEs.
+    // Build set of exchange node IDs that ANY local fragment can provide data for.
+    // Each fragment's output_sink.stream_sink.dest_node_id tells us which EXCHANGE_NODE
+    // it feeds. We include leaves AND intermediates because intermediate-to-intermediate
+    // connections are also local (e.g. subquery fragment → main join fragment).
+    // EXCHANGE nodes not in this set depend on remote BEs.
+    let extract_dest_id = |p: &TPipelineFragmentParams| {
+        p.fragment
+            .as_ref()
+            .and_then(|f| f.output_sink.as_ref())
+            .filter(|s| s.type_ == TDataSinkType::DATA_STREAM_SINK)
+            .and_then(|s| s.stream_sink.as_ref())
+            .map(|ss| ss.dest_node_id)
+    };
     let leaf_dest_ids: std::collections::HashSet<i32> = leaf_fragments
         .iter()
-        .filter_map(|p| {
-            p.fragment
-                .as_ref()
-                .and_then(|f| f.output_sink.as_ref())
-                .filter(|s| s.type_ == TDataSinkType::DATA_STREAM_SINK)
-                .and_then(|s| s.stream_sink.as_ref())
-                .map(|ss| ss.dest_node_id)
-        })
+        .filter_map(|p| extract_dest_id(p))
+        .chain(intermediate_fragments.iter().filter_map(|p| extract_dest_id(p)))
+        .chain(exchange_root_fragments.iter().filter_map(|p| extract_dest_id(p)))
         .collect();
 
     // Check if any fragment has EXCHANGE nodes that can't be satisfied by local
-    // leaves. This catches the case where an intermediate fragment depends on
-    // data from a remote BE (its EXCHANGE node ID not in leaf_dest_ids).
+    // fragments. This catches the case where a fragment depends on data from a
+    // remote BE (its EXCHANGE node ID not in any local fragment's dest_node_id).
     let has_remote_exchanges = |params: &TPipelineFragmentParams| -> bool {
         let plan = match params.fragment.as_ref().and_then(|f| f.plan.as_ref()) {
             Some(p) => p,
@@ -635,7 +640,13 @@ fn merge_fragment_plans(
                 .iter()
                 .all(|id| resolved_sources.contains_key(id));
 
-            if all_resolved || exchange_ids.is_empty() {
+            // Allow merge when:
+            // - All exchange IDs resolved via resolved_sources, OR
+            // - No exchange IDs to resolve, OR
+            // - No dest_node_id mapping exists (leaf_dest_ids empty) but we have
+            //   a single_leaf fallback (legacy: simple pipelines without output_sink)
+            if all_resolved || exchange_ids.is_empty()
+                || (leaf_dest_ids.is_empty() && single_leaf.is_some()) {
                 // Merge: replace EXCHANGE_NODE(0 children) with resolved source nodes.
                 if let Some(plan) = params
                     .fragment
@@ -801,9 +812,13 @@ fn merge_fragment_plans(
 /// Execution plan: either Substrait bytes or SQL string.
 enum ExecPlan {
     /// Substrait plan eligible for GPU acceleration (has real data tables).
+    /// `sql_fallback`: when GPU Substrait fails, use this SQL instead of from_substrait.
+    /// DuckDB's from_substrait has a column ordering bug for complex joins (optimizer
+    /// reorders join sides but Root.names are applied positionally, causing mismatches).
     Substrait {
         bytes: Vec<u8>,
         sort_limit_sql: Option<String>,
+        sql_fallback: Option<String>,
     },
     /// Substrait plan that should only run on CPU (e.g. VirtualTable-only plans).
     SubstraitCpuOnly {
@@ -819,7 +834,7 @@ enum ExecPlan {
 /// Execute a plan via Sirius GPU, falling back to DuckDB CPU.
 fn execute_plan(engine: &SiriusEngine, plan: ExecPlan, no_cpu_fallback: bool) -> Result<Vec<u8>, String> {
     match plan {
-        ExecPlan::Substrait { bytes, sort_limit_sql } => {
+        ExecPlan::Substrait { bytes, sort_limit_sql, sql_fallback } => {
             // Strip SortRel/FetchRel from Substrait before GPU execution — the Sirius
             // GPU planner doesn't handle ORDER BY/LIMIT operators. The sort/limit SQL
             // wrapper is applied outside via `execute_substrait`.
@@ -839,8 +854,25 @@ fn execute_plan(engine: &SiriusEngine, plan: ExecPlan, no_cpu_fallback: bool) ->
                     Err(format!("GPU execution failed: {e}"))
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "gpu_processing_substrait failed, falling back to CPU from_substrait");
-                    from_substrait_with_sort(engine, &bytes, sort_limit_sql.as_deref())
+                    // Prefer SQL fallback over from_substrait: DuckDB's from_substrait
+                    // has a column ordering bug where Root.names are applied positionally
+                    // but the optimizer reorders join columns, causing data-name mismatches.
+                    if let Some(sql) = sql_fallback {
+                        tracing::warn!(error = %e, "gpu_processing_substrait failed, falling back to SQL");
+                        match engine.execute_gpu(&sql) {
+                            Ok(ipc) => {
+                                tracing::info!("executed via gpu_execution (SQL fallback)");
+                                Ok(ipc)
+                            }
+                            Err(gpu_e) => {
+                                tracing::warn!(error = %gpu_e, "gpu_execution also failed, falling back to direct SQL");
+                                engine.execute_sql(&sql).map_err(|e| e.to_string())
+                            }
+                        }
+                    } else {
+                        tracing::warn!(error = %e, "gpu_processing_substrait failed, falling back to CPU from_substrait");
+                        from_substrait_with_sort(engine, &bytes, sort_limit_sql.as_deref())
+                    }
                 }
             }
         }
@@ -902,23 +934,39 @@ fn strip_sort_limit_from_substrait(bytes: &[u8]) -> Option<Vec<u8>> {
     let plan_rel::RelType::Root(root) = relation.rel_type.as_mut()? else {
         return None;
     };
-    let rel = root.input.as_mut()?;
 
-    // Unwrap FetchRel → SortRel → inner, or SortRel → inner.
-    let inner = match rel.rel_type.as_ref()? {
+    // Strip SortRel/FetchRel from the top of the Rel tree.
+    // The tree may have a ProjectRel wrapper (for column selection/reorder),
+    // so we look both at root.input directly and inside a ProjectRel.
+    strip_sort_from_rel(root.input.as_mut()?)?;
+    Some(plan.encode_to_vec())
+}
+
+/// Strip SortRel/FetchRel from a Rel, handling ProjectRel wrappers.
+fn strip_sort_from_rel(rel: &mut substrait::proto::Rel) -> Option<()> {
+    use substrait::proto::rel;
+
+    match rel.rel_type.as_mut()? {
         rel::RelType::Fetch(fetch) => {
             let input = fetch.input.as_ref()?;
-            match input.rel_type.as_ref()? {
+            let inner = match input.rel_type.as_ref()? {
                 rel::RelType::Sort(sort) => sort.input.as_ref()?.as_ref().clone(),
                 _ => input.as_ref().clone(),
-            }
+            };
+            rel.rel_type = Some(inner.rel_type?);
+            Some(())
         }
-        rel::RelType::Sort(sort) => sort.input.as_ref()?.as_ref().clone(),
-        _ => return None,
-    };
-
-    root.input = Some(inner);
-    Some(plan.encode_to_vec())
+        rel::RelType::Sort(sort) => {
+            let inner = sort.input.as_ref()?.as_ref().clone();
+            rel.rel_type = Some(inner.rel_type?);
+            Some(())
+        }
+        rel::RelType::Project(project) => {
+            // ProjectRel wraps a SortRel — strip the sort from the ProjectRel's input.
+            strip_sort_from_rel(project.input.as_mut()?)
+        }
+        _ => None,
+    }
 }
 
 /// Project/reorder Arrow IPC result columns to match FE expectations.
@@ -938,14 +986,68 @@ fn project_ipc_columns(
     let schema = reader.schema();
     let schema_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
 
+    // Diagnostic: dump first row values to verify column-name-to-data correspondence.
+    if schema.fields().len() > 4 {
+        if let Ok(diag_reader) = StreamReader::try_new(Cursor::new(ipc_bytes), None) {
+            for batch in diag_reader {
+                if let Ok(batch) = batch {
+                    if batch.num_rows() > 0 {
+                        let mut first_row: Vec<String> = Vec::new();
+                        for col_idx in 0..batch.num_columns().min(15) {
+                            let col = batch.column(col_idx);
+                            let val = arrow::util::display::array_value_to_string(col, 0)
+                                .unwrap_or_else(|_| "?".to_string());
+                            first_row.push(format!("{}={}", schema_names[col_idx], val));
+                        }
+                        tracing::info!(first_row = ?first_row, "DIAG: first row from DuckDB IPC");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     // Determine column indices to project.
+    // Prefer name-based matching over explicit indices because DuckDB's Substrait
+    // execution can produce output where column names and types don't correspond
+    // to positional indices (e.g., JoinRel output may scramble types vs names).
     let indices = if let Some(explicit) = explicit_indices {
-        tracing::info!(
-            indices = ?explicit,
-            duckdb_schema = ?schema_names,
-            "using explicit column indices"
-        );
-        explicit.to_vec()
+        // Validate: check that schema names at explicit indices match output_names.
+        let names_match = explicit.len() == output_names.len()
+            && explicit.iter().zip(output_names.iter()).all(|(&idx, name)| {
+                idx < schema_names.len() && (schema_names[idx] == name || name.is_empty())
+            });
+        if names_match {
+            tracing::info!(
+                indices = ?explicit,
+                duckdb_schema = ?schema_names,
+                "using explicit column indices (validated)"
+            );
+            explicit.to_vec()
+        } else {
+            // Names don't match at explicit positions — fall back to name-based.
+            tracing::warn!(
+                explicit_indices = ?explicit,
+                output_names = ?output_names,
+                duckdb_schema = ?schema_names,
+                "explicit indices don't match schema names, falling back to name-based projection"
+            );
+            let mut name_indices = Vec::new();
+            for name in output_names {
+                match schema.index_of(name) {
+                    Ok(idx) => name_indices.push(idx),
+                    Err(_) => {
+                        tracing::warn!(
+                            column = %name,
+                            duckdb_schema = ?schema_names,
+                            "projection column not found in result, skipping projection"
+                        );
+                        return Ok(ipc_bytes.to_vec());
+                    }
+                }
+            }
+            name_indices
+        }
     } else if schema.fields().len() == output_names.len()
         && schema_names
             .iter()
@@ -984,6 +1086,13 @@ fn project_ipc_columns(
             .project(&indices)
             .map_err(|e| format!("project schema: {e}"))?,
     );
+    // Log projected schema types for diagnostics.
+    let projected_types: Vec<String> = projected_schema
+        .fields()
+        .iter()
+        .map(|f| format!("{}:{:?}", f.name(), f.data_type()))
+        .collect();
+    tracing::debug!(projected_types = ?projected_types, "projected schema types");
     let mut buf = Vec::new();
     {
         let mut writer = StreamWriter::try_new(&mut buf, &projected_schema)
@@ -1006,6 +1115,148 @@ fn project_ipc_columns(
         duckdb_schema = ?schema_names,
         "projected IPC result columns"
     );
+    Ok(buf)
+}
+
+/// Extract FE output column names from fragment output_exprs + desc_tbl.
+///
+/// Returns the column names in the order the FE's SELECT list expects them.
+fn extract_fe_output_names(params: &TPipelineFragmentParams) -> Vec<String> {
+    use doris_thrift::exprs::TExprNodeType;
+
+    let output_exprs = match params.fragment.as_ref().and_then(|f| f.output_exprs.as_ref()) {
+        Some(exprs) => exprs,
+        None => return Vec::new(),
+    };
+    let desc_tbl = match params.desc_tbl.as_ref() {
+        Some(d) => d,
+        None => return Vec::new(),
+    };
+
+    // Build slot_id → col_name map from descriptor table.
+    let slot_map: std::collections::HashMap<i32, &str> = desc_tbl
+        .slot_descriptors
+        .as_ref()
+        .map(|slots| {
+            slots
+                .iter()
+                .map(|s| (s.id, s.col_name.as_str()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    output_exprs
+        .iter()
+        .enumerate()
+        .map(|(i, expr)| {
+            expr.nodes
+                .first()
+                .and_then(|n| {
+                    if n.node_type == TExprNodeType::SLOT_REF {
+                        n.slot_ref.as_ref()
+                    } else {
+                        None
+                    }
+                })
+                .and_then(|sr| slot_map.get(&sr.slot_id))
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("expr_{}", i))
+        })
+        .collect()
+}
+
+/// Reorder IPC columns to match FE output order and pad with NULLs for missing columns.
+///
+/// When Doris uses late materialization (VMaterializeNode), the exchange data has
+/// fewer columns than the FE expects, and may be in a different order (e.g., sort key
+/// order vs. SELECT list order). This function:
+/// 1. Matches IPC columns to FE output positions by name
+/// 2. Reorders columns to match FE's expected order
+/// 3. Inserts NullArray columns for late-materialized columns not in the exchange
+fn reorder_and_pad_ipc(
+    ipc_bytes: &[u8],
+    fe_output_names: &[String],
+) -> Result<Vec<u8>, String> {
+    use arrow::ipc::reader::StreamReader;
+    use arrow::ipc::writer::StreamWriter;
+
+    let reader = StreamReader::try_new(Cursor::new(ipc_bytes), None)
+        .map_err(|e| format!("parse IPC for reorder+pad: {e}"))?;
+    let schema = reader.schema();
+
+    if schema.fields().len() >= fe_output_names.len() {
+        return Ok(ipc_bytes.to_vec());
+    }
+
+    // Build name → IPC column index map.
+    let ipc_name_to_idx: std::collections::HashMap<&str, usize> = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (f.name().as_str(), i))
+        .collect();
+
+    // For each FE output position, find the source IPC column index (or None for NULL).
+    let mapping: Vec<Option<usize>> = fe_output_names
+        .iter()
+        .map(|name| ipc_name_to_idx.get(name.as_str()).copied())
+        .collect();
+
+    let matched = mapping.iter().filter(|m| m.is_some()).count();
+    let null_count = mapping.iter().filter(|m| m.is_none()).count();
+    info!(
+        ipc_cols = schema.fields().len(),
+        fe_cols = fe_output_names.len(),
+        matched,
+        null_count,
+        fe_names = ?fe_output_names,
+        ipc_names = ?schema.fields().iter().map(|f| f.name().as_str()).collect::<Vec<_>>(),
+        "reordering and padding IPC for late materialization"
+    );
+
+    // Build padded schema in FE output order.
+    let mut fields: Vec<arrow::datatypes::FieldRef> = Vec::with_capacity(fe_output_names.len());
+    for (i, maybe_idx) in mapping.iter().enumerate() {
+        match maybe_idx {
+            Some(idx) => fields.push(schema.field(*idx).clone().into()),
+            None => fields.push(Arc::new(arrow::datatypes::Field::new(
+                &fe_output_names[i],
+                arrow::datatypes::DataType::Utf8,
+                true,
+            ))),
+        }
+    }
+    let padded_schema = Arc::new(arrow::datatypes::Schema::new(fields));
+
+    let mut buf = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut buf, &padded_schema)
+            .map_err(|e| format!("IPC writer: {e}"))?;
+        for batch_result in reader {
+            let batch = batch_result.map_err(|e| format!("read IPC batch: {e}"))?;
+            let num_rows = batch.num_rows();
+            let mut columns: Vec<Arc<dyn arrow::array::Array>> =
+                Vec::with_capacity(fe_output_names.len());
+            for maybe_idx in &mapping {
+                match maybe_idx {
+                    Some(idx) => columns.push(batch.column(*idx).clone()),
+                    None => columns.push(arrow::array::new_null_array(
+                        &arrow::datatypes::DataType::Utf8,
+                        num_rows,
+                    )),
+                }
+            }
+            let padded_batch = arrow::record_batch::RecordBatch::try_new(
+                padded_schema.clone(),
+                columns,
+            )
+            .map_err(|e| format!("create padded batch: {e}"))?;
+            writer
+                .write(&padded_batch)
+                .map_err(|e| format!("write padded batch: {e}"))?;
+        }
+        writer.finish().map_err(|e| format!("finish IPC: {e}"))?;
+    }
     Ok(buf)
 }
 
@@ -1490,7 +1741,15 @@ impl PBackendService for PBackendServiceHandler {
                             let has_substrait = !use_sql && engine.lock().unwrap().has_substrait();
                             if has_substrait {
                                 match plan_translator::translate_fragment(&params, &table_schemas) {
-                                    Ok(plan) => (ExecPlan::Substrait { bytes: plan.substrait_bytes, sort_limit_sql: plan.sort_limit_sql }, Some(plan.output_names)),
+                                    Ok(plan) => {
+                                        let exec = if plan.force_cpu_substrait {
+                                            ExecPlan::SubstraitCpuOnly { bytes: plan.substrait_bytes, sort_limit_sql: plan.sort_limit_sql }
+                                        } else {
+                                            let sql_fb = plan_translator::translate_fragment_to_sql(&params).ok();
+                                            ExecPlan::Substrait { bytes: plan.substrait_bytes, sort_limit_sql: plan.sort_limit_sql, sql_fallback: sql_fb }
+                                        };
+                                        (exec, Some(plan.output_names))
+                                    }
                                     Err(e) => {
                                         warn!(error = %e, "Substrait translation failed for exchange fragment");
                                         match plan_translator::translate_fragment_to_sql(&params) {
@@ -1562,7 +1821,21 @@ impl PBackendService for PBackendServiceHandler {
                                 }
                                 info!(%finst_id, sender_id, "exchange fragment forward complete");
                             } else {
-                                let ipc_bytes = location.into_ipc_bytes();
+                                let mut ipc_bytes = location.into_ipc_bytes();
+
+                                // Reorder and pad for late materialization:
+                                // VMaterializeNode expects more columns than the exchange
+                                // provides, and possibly in a different order. Match IPC
+                                // columns to FE output positions by name, inserting NULLs
+                                // for late-materialized columns.
+                                let fe_names = extract_fe_output_names(&params);
+                                if !fe_names.is_empty() {
+                                    match reorder_and_pad_ipc(&ipc_bytes, &fe_names) {
+                                        Ok(padded) => ipc_bytes = padded,
+                                        Err(e) => warn!(error = %e, "IPC reorder+pad failed, storing as-is"),
+                                    }
+                                }
+
                                 if let Err(e) = store.store_ipc_result(finst_id, &ipc_bytes) {
                                     warn!(error = %e, %finst_id, "failed to store exchange result");
                                 } else {
@@ -1631,11 +1904,24 @@ impl PBackendService for PBackendServiceHandler {
             let (exec_plan, output_names, output_indices) = if has_substrait {
                 match plan_translator::translate_fragment(params, &table_schemas) {
                     Ok(plan) => {
-                        info!(bytes = plan.substrait_bytes.len(), has_data_tables, "translated to Substrait");
-                        let exec = if has_data_tables {
-                            ExecPlan::Substrait { bytes: plan.substrait_bytes, sort_limit_sql: plan.sort_limit_sql }
-                        } else {
+                        info!(bytes = plan.substrait_bytes.len(), has_data_tables, force_cpu = plan.force_cpu_substrait, "translated to Substrait");
+                        let exec = if plan.force_cpu_substrait || !has_data_tables {
                             ExecPlan::SubstraitCpuOnly { bytes: plan.substrait_bytes, sort_limit_sql: plan.sort_limit_sql }
+                        } else {
+                            // Generate SQL fallback for CPU execution.
+                            // DuckDB's from_substrait has a column ordering bug for complex joins
+                            // (optimizer reorders join sides but Root.names are applied positionally).
+                            let sql_fallback = match plan_translator::translate_fragment_to_sql(params) {
+                                Ok(sql) => {
+                                    info!(sql_len = sql.len(), "generated SQL fallback for CPU path");
+                                    Some(sql)
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "SQL fallback generation failed, will use from_substrait");
+                                    None
+                                }
+                            };
+                            ExecPlan::Substrait { bytes: plan.substrait_bytes, sort_limit_sql: plan.sort_limit_sql, sql_fallback }
                         };
                         (exec, Some(plan.output_names), plan.output_column_indices)
                     }
@@ -2754,9 +3040,9 @@ mod tests {
     #[test]
     fn test_merge_three_fragment_all_intermediate() {
         // GROUP BY + ORDER BY pipeline (no pure exchange_root):
-        // Fragment 0: SORT_NODE → EXCHANGE_NODE(0) — outermost intermediate
-        // Fragment 1: AGG_NODE → EXCHANGE_NODE(0) — innermost intermediate
-        // Fragment 2: FILE_SCAN_NODE — leaf
+        // Fragment 0: SORT_NODE → EXCHANGE_NODE(1) — outermost intermediate
+        // Fragment 1: AGG_NODE → EXCHANGE_NODE(3) — innermost intermediate, sends to node 1
+        // Fragment 2: FILE_SCAN_NODE — leaf, sends to node 3
         let mut outer = make_params(vec![
             make_node(0, TPlanNodeType::SORT_NODE, 1),
             make_node(1, TPlanNodeType::EXCHANGE_NODE, 0),
@@ -2768,11 +3054,15 @@ mod tests {
             make_node(3, TPlanNodeType::EXCHANGE_NODE, 0),
         ]);
         inner.fragment_id = Some(1);
+        // inner sends its output to exchange node 1 in outer
+        inner.fragment.as_mut().unwrap().output_sink = Some(make_data_stream_sink(1));
 
         let mut leaf = make_params(vec![
             make_node(4, TPlanNodeType::FILE_SCAN_NODE, 0),
         ]);
         leaf.fragment_id = Some(2);
+        // leaf sends its output to exchange node 3 in inner
+        leaf.fragment.as_mut().unwrap().output_sink = Some(make_data_stream_sink(3));
 
         let merged = merge_fragment_plans(&[outer, inner, leaf]);
         // Should cascade: leaf → inner → outer, producing 1 merged fragment.

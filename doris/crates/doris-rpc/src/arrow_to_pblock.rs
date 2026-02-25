@@ -102,6 +102,17 @@ pub fn arrow_ipc_to_pblock(ipc_bytes: &[u8]) -> Result<(PBlock, u32), String> {
     let num_rows: u32 = batches.iter().map(|b| b.num_rows() as u32).sum();
     let num_cols = schema.fields().len();
 
+    // Log Arrow schema types for PBlock encoding diagnostics.
+    for (i, field) in schema.fields().iter().enumerate() {
+        tracing::debug!(
+            col_idx = i,
+            name = %field.name(),
+            arrow_type = ?field.data_type(),
+            nullable = field.is_nullable(),
+            "arrow_to_pblock: encoding column"
+        );
+    }
+
     let mut column_metas = Vec::with_capacity(num_cols);
     let mut column_values = Vec::new();
 

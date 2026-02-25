@@ -43,6 +43,14 @@ fn node_to_sql(nodes: &[TPlanNode], idx: &mut usize) -> Result<String> {
                 Ok(format!("SELECT * FROM __EXCHANGE_TABLE_{}", node.node_id))
             }
         }
+        TPlanNodeType::MATERIALIZATION_NODE => {
+            // Late materialization pass-through: just forward the child's SQL.
+            if children.len() == 1 {
+                Ok(children.into_iter().next().unwrap())
+            } else {
+                bail!("MATERIALIZATION_NODE expected 1 child, got {}", children.len())
+            }
+        }
         TPlanNodeType::EMPTY_SET_NODE => Ok("SELECT WHERE FALSE".to_string()),
         _ => bail!(
             "SQL generation not supported for node type: {:?}",
@@ -278,5 +286,16 @@ mod tests {
         let plan = make_plan(vec![exchange, child]);
         let sql = plan_to_sql(&plan).unwrap();
         assert_eq!(sql, "SELECT 99");
+    }
+
+    #[test]
+    fn test_materialization_node_passthrough() {
+        // MATERIALIZATION_NODE wrapping EXCHANGE_NODE(0 children) → pass-through.
+        use doris_thrift::plan_nodes::TPlanNodeType;
+        let mat = make_plan_node(0, TPlanNodeType::MATERIALIZATION_NODE, 1, vec![0]);
+        let exchange = make_exchange_node(1, vec![0]);
+        let plan = make_plan(vec![mat, exchange]);
+        let sql = plan_to_sql(&plan).unwrap();
+        assert_eq!(sql, "SELECT * FROM __EXCHANGE_TABLE_1");
     }
 }

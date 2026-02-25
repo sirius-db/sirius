@@ -207,6 +207,8 @@ pub struct TranslatedPlan {
     pub sort_columns: Vec<SortColumn>,
     /// LIMIT from the sort node, applied after sorting.
     pub sort_limit: Option<i64>,
+    /// Reserved for future use (always false currently).
+    pub force_cpu_substrait: bool,
 }
 
 /// A single sort column specification.
@@ -365,27 +367,15 @@ fn extract_sort_limit_from_plan(
         }
     }
 
-    // Build sort_limit_sql with ORDER BY + LIMIT. The from_substrait_with_sort function
-    // strips SortRel/FetchRel from the Substrait plan before execution, so DuckDB returns
-    // all columns without pruning. The SQL wrapper then applies the correct ORDER BY + LIMIT.
-    // Positions are from rel_column_names (pre-strip Rel), which match the stripped output.
+    // Build sort_limit_sql with ORDER BY + LIMIT using column names (not positions).
+    // Column names are quoted to handle special characters and avoid ambiguity.
+    // This is more robust than positional references because collect_rel_column_names
+    // may include columns that DuckDB optimizes away (e.g., AGG columns in semi-joins).
     let mut order_parts = Vec::new();
-    let mut measure_idx_counter = 0usize;
     for sc in &sort_columns {
         if !sc.name.is_empty() {
-            if let Some(pos) = rel_column_names.iter().position(|n| n == &sc.name) {
-                let dir = if sc.ascending { "ASC" } else { "DESC" };
-                order_parts.push(format!("{} {}", pos + 1, dir));
-            }
-        } else {
-            // Empty-name measure: find nth empty entry in rel_column_names.
-            if let Some((pos, _)) = rel_column_names.iter().enumerate()
-                .filter(|(_, n)| n.is_empty())
-                .nth(measure_idx_counter) {
-                let dir = if sc.ascending { "ASC" } else { "DESC" };
-                order_parts.push(format!("{} {}", pos + 1, dir));
-            }
-            measure_idx_counter += 1;
+            let dir = if sc.ascending { "ASC" } else { "DESC" };
+            order_parts.push(format!("\"{}\" {}", sc.name, dir));
         }
     }
 
@@ -535,94 +525,50 @@ pub fn translate_fragment(
     // we use name-based matching against the Rel output. For AGG/other where
     // output_exprs might reorder columns, we use slot position in row_tuples.
     let rel_names = rel_output_names(&rel);
-    let output_column_indices = if !rel_names.is_empty() && rel_names.len() > output_names.len() {
-        // Name-based: find each output_name's position in the full Rel output.
-        let mut indices = Vec::new();
-        let mut all_found = true;
-        for name in &output_names {
-            if let Some(pos) = rel_names.iter().position(|r| r == name) {
-                indices.push(pos);
-            } else {
-                all_found = false;
-                break;
-            }
-        }
-        if all_found {
-            debug!(indices = ?indices, "output_column_indices from rel_names");
-            Some(indices)
+
+    // If the Rel produces fewer columns than the FE expects, truncate output_names
+    // to only those available in the Rel, preserving the FE's SELECT list order.
+    // This happens with VMaterializeNode (late materialization): the FE plans to
+    // fetch extra columns via row IDs from storage, but Sirius doesn't support that.
+    let output_names = if !rel_names.is_empty() && output_names.len() > rel_names.len() {
+        let rel_name_set: std::collections::HashSet<&str> =
+            rel_names.iter().map(|s| s.as_str()).collect();
+        let filtered: Vec<String> = output_names
+            .into_iter()
+            .filter(|n| rel_name_set.contains(n.as_str()))
+            .collect();
+        tracing::warn!(
+            rel_cols = rel_names.len(),
+            filtered_cols = filtered.len(),
+            rel_names = ?rel_names,
+            filtered_names = ?filtered,
+            "Rel produces fewer columns than expected (late materialization), preserving FE order"
+        );
+        // If name-based filtering matched all rel columns, use it (FE order preserved).
+        // Otherwise fall back to rel_names order (names may differ between descriptors).
+        if filtered.len() == rel_names.len() {
+            filtered
         } else {
-            None
-        }
-    } else if let Some(output_exprs) = fragment.output_exprs.as_ref() {
-        // Position-based: map output_exprs slots to their position in the root
-        // node's materialized output (which matches the DuckDB output order).
-        if !plan.nodes.is_empty() {
-            let root = &plan.nodes[0];
-            // Build enumerated materialized slot list from root's row_tuples.
-            let mut materialized_slots = Vec::new();
-            for &tuple_id in &root.row_tuples {
-                if let Ok(tuple) = desc.get_tuple(tuple_id) {
-                    for &slot_id in &tuple.slot_ids {
-                        if let Ok(slot) = desc.get_slot(slot_id) {
-                            if slot.is_materialized {
-                                materialized_slots.push(slot_id);
-                            }
-                        }
-                    }
-                }
-            }
-            // Map each output_expr's slot_id to position in materialized_slots.
-            let mut indices = Vec::new();
-            let mut all_found = true;
-            for expr in output_exprs {
-                if let Some(first_node) = expr.nodes.first() {
-                    if first_node.node_type == TExprNodeType::SLOT_REF {
-                        if let Some(slot_ref) = &first_node.slot_ref {
-                            if let Some(pos) = materialized_slots.iter().position(|&s| s == slot_ref.slot_id) {
-                                indices.push(pos);
-                                continue;
-                            }
-                        }
-                    }
-                }
-                all_found = false;
-                break;
-            }
-            if all_found && !indices.is_empty() {
-                // Only use explicit indices if they differ from identity (actual reordering).
-                let is_identity = indices.iter().enumerate().all(|(i, &v)| i == v);
-                if !is_identity {
-                    debug!(indices = ?indices, "output_column_indices from output_exprs (reorder)");
-                    Some(indices)
-                } else {
-                    None // Identity mapping — no reorder needed.
-                }
-            } else {
-                None
-            }
-        } else {
-            None
+            rel_names.clone()
         }
     } else {
-        None
+        output_names
     };
-
-    // DuckDB's from_substrait uses RelRoot.names to determine output columns,
-    // taking the first N columns by POSITION. When the Rel tree outputs more
-    // columns than expected, we set RelRoot.names to the FULL Rel output schema.
-    let root_names = if !rel_names.is_empty() && rel_names.len() > output_names.len() {
-        debug!(
-            rel_cols = rel_names.len(),
-            output_cols = output_names.len(),
-            "Rel outputs more columns than expected, using full schema for RelRoot"
-        );
-        rel_names
+    // Use rel_names (all columns from the Rel tree) as Root.names.
+    // DuckDB's from_substrait returns the Relation's natural column names
+    // (potentially in optimizer-reordered order). The Rust-side project_ipc_columns
+    // function handles name-based reordering to match FE's output_names.
+    // We don't wrap in a ProjectRel because DuckDB's TransformProjectOp uses
+    // mock aliases ("expr_0", "expr_1"...) that break name-based matching.
+    let output_column_indices: Option<Vec<usize>> = None;
+    let root_names = if !rel_names.is_empty() {
+        rel_names.clone()
     } else {
         output_names.clone()
     };
+    let result_output_names = output_names;
 
     let (extension_uris, extensions) = registry.into_extensions();
-    let result_output_names = output_names;
 
     let substrait_plan = Plan {
         version: Some(Version {
@@ -656,6 +602,7 @@ pub fn translate_fragment(
         sort_limit_sql,
         sort_columns,
         sort_limit,
+        force_cpu_substrait: false,
     })
 }
 
@@ -664,7 +611,7 @@ mod tests {
     use super::*;
     use crate::test_helpers::*;
     use doris_thrift::types::TPrimitiveType;
-    use substrait::proto::{plan_rel, read_rel, rel};
+    use substrait::proto::{plan_rel, read_rel, rel, rel_common};
 
     #[test]
     fn test_translate_fragment_to_sql_union() {
@@ -778,19 +725,19 @@ mod tests {
 
         let result = translate_fragment(&params, &table_schemas).unwrap();
         // Output names come from the descriptor table, not the full table schema.
+        // project_ipc_columns uses these to select the subset post-execution.
         assert_eq!(result.output_names, vec!["city", "population"]);
 
-        // The Substrait plan's ReadRel should have all 3 columns in base_schema
-        // (because DuckDB maps by position).
+        // Root.names = rel_names (all columns from the ReadRel, not just the projected subset).
+        // No ProjectRel wrapping — DuckDB returns all columns, project_ipc_columns selects subset.
         let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
         let root = match &plan.relations[0].rel_type {
             Some(plan_rel::RelType::Root(r)) => r,
             _ => panic!("expected Root"),
         };
-        // RelRoot.names should match the full Rel output (3 cols), not the projected
-        // subset (2 cols), so DuckDB outputs all columns with correct names.
         assert_eq!(root.names, vec!["city", "state", "population"],
-            "RelRoot.names should use full Rel schema, not projected subset");
+            "RelRoot.names should be all rel columns (no ProjectRel subset selection)");
+        // Root input is the ReadRel directly (no ProjectRel wrapping).
         let input = root.input.as_ref().unwrap();
         match input.rel_type.as_ref().unwrap() {
             rel::RelType::Read(read) => {
@@ -1321,6 +1268,133 @@ mod tests {
             rel::RelType::Read(_) => {} // Good — materialization passed through to scan
             other => panic!("expected ReadRel, got {:?}", std::mem::discriminant(other)),
         }
+    }
+
+    #[test]
+    fn test_materialization_truncates_output_names() {
+        // Simulate Q2 fragment 0: MATERIALIZATION_NODE (8 output cols) → EXCHANGE_NODE (4 cols).
+        // The exchange table only has 4 columns, but the root's row_tuples references 8.
+        // translate_fragment should truncate output_names to 4 (the Rel's actual columns).
+        use doris_thrift::plan_nodes::TPlanNodeType;
+
+        // Tuple 0: MATERIALIZATION_NODE output — 8 columns (includes late-materialized ones)
+        // Tuple 1: EXCHANGE_NODE output — 4 columns (actually available in exchange data)
+        let mat = make_plan_node(0, TPlanNodeType::MATERIALIZATION_NODE, 1, vec![0]);
+        let exchange = make_exchange_node(1, vec![1]);
+        let plan = make_plan(vec![mat, exchange]);
+        let desc = make_desc_table(
+            vec![(0, None), (1, None)],
+            vec![
+                // Tuple 0 slots (8 columns — what FE expects)
+                (10, 0, 0, "s_acctbal", TPrimitiveType::DOUBLE),
+                (11, 0, 1, "s_name", TPrimitiveType::VARCHAR),
+                (12, 0, 2, "n_name", TPrimitiveType::VARCHAR),
+                (13, 0, 3, "p_partkey", TPrimitiveType::INT),
+                (14, 0, 4, "p_mfgr", TPrimitiveType::VARCHAR),
+                (15, 0, 5, "s_address", TPrimitiveType::VARCHAR),
+                (16, 0, 6, "s_phone", TPrimitiveType::VARCHAR),
+                (17, 0, 7, "s_comment", TPrimitiveType::VARCHAR),
+                // Tuple 1 slots (4 columns — what exchange actually has)
+                (20, 1, 0, "s_acctbal", TPrimitiveType::DOUBLE),
+                (21, 1, 1, "s_name", TPrimitiveType::VARCHAR),
+                (22, 1, 2, "n_name", TPrimitiveType::VARCHAR),
+                (23, 1, 3, "p_partkey", TPrimitiveType::INT),
+            ],
+        );
+        let params = make_fragment_params(plan, desc);
+
+        // Provide table_schemas so the exchange ReadRel uses 4 columns.
+        let mut table_schemas = HashMap::new();
+        table_schemas.insert(
+            "__EXCHANGE_TABLE_1".to_string(),
+            vec![
+                "s_acctbal".to_string(),
+                "s_name".to_string(),
+                "n_name".to_string(),
+                "p_partkey".to_string(),
+            ],
+        );
+
+        let result = translate_fragment(&params, &table_schemas).unwrap();
+
+        // Output names should be truncated to 4 (matching the exchange table).
+        assert_eq!(result.output_names.len(), 4);
+        assert_eq!(
+            result.output_names,
+            vec!["s_acctbal", "s_name", "n_name", "p_partkey"]
+        );
+
+        // The Substrait plan should have 4 root names (not 8).
+        let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
+        let root = match &plan.relations[0].rel_type {
+            Some(plan_rel::RelType::Root(r)) => r,
+            _ => panic!("expected Root"),
+        };
+        assert_eq!(root.names.len(), 4);
+    }
+
+    #[test]
+    fn test_materialization_preserves_fe_order() {
+        // Exchange table has columns in sort-key order (s_acctbal, n_name, s_name, p_partkey),
+        // but FE output_exprs expects SELECT-list order (s_acctbal, s_name, n_name, p_partkey).
+        // translate_fragment should preserve the FE order.
+        use doris_thrift::plan_nodes::TPlanNodeType;
+
+        let mat = make_plan_node(0, TPlanNodeType::MATERIALIZATION_NODE, 1, vec![0]);
+        let exchange = make_exchange_node(1, vec![1]);
+        let plan = make_plan(vec![mat, exchange]);
+        let desc = make_desc_table(
+            vec![(0, None), (1, None)],
+            vec![
+                // Tuple 0 slots (8 columns — FE SELECT list order)
+                (10, 0, 0, "s_acctbal", TPrimitiveType::DOUBLE),
+                (11, 0, 1, "s_name", TPrimitiveType::VARCHAR),
+                (12, 0, 2, "n_name", TPrimitiveType::VARCHAR),
+                (13, 0, 3, "p_partkey", TPrimitiveType::INT),
+                (14, 0, 4, "p_mfgr", TPrimitiveType::VARCHAR),
+                (15, 0, 5, "s_address", TPrimitiveType::VARCHAR),
+                (16, 0, 6, "s_phone", TPrimitiveType::VARCHAR),
+                (17, 0, 7, "s_comment", TPrimitiveType::VARCHAR),
+                // Tuple 1 slots (exchange order — different from FE order)
+                (20, 1, 0, "s_acctbal", TPrimitiveType::DOUBLE),
+                (21, 1, 1, "n_name", TPrimitiveType::VARCHAR),  // n_name before s_name
+                (22, 1, 2, "s_name", TPrimitiveType::VARCHAR),  // s_name after n_name
+                (23, 1, 3, "p_partkey", TPrimitiveType::INT),
+            ],
+        );
+        let params = make_fragment_params(plan, desc);
+
+        // Exchange table in DuckDB sort-key order (n_name before s_name).
+        let mut table_schemas = HashMap::new();
+        table_schemas.insert(
+            "__EXCHANGE_TABLE_1".to_string(),
+            vec![
+                "s_acctbal".to_string(),
+                "n_name".to_string(),  // sort-key order
+                "s_name".to_string(),
+                "p_partkey".to_string(),
+            ],
+        );
+
+        let result = translate_fragment(&params, &table_schemas).unwrap();
+
+        // Output names should be in FE SELECT list order (s_name before n_name).
+        // project_ipc_columns uses these to reorder from DuckDB output to FE order.
+        assert_eq!(result.output_names.len(), 4);
+        assert_eq!(
+            result.output_names,
+            vec!["s_acctbal", "s_name", "n_name", "p_partkey"]
+        );
+
+        // Root.names = rel_names (exchange table order, not FE order).
+        // No ProjectRel wrapping — reordering happens post-execution via project_ipc_columns.
+        let plan = Plan::decode(result.substrait_bytes.as_slice()).unwrap();
+        let root = match &plan.relations[0].rel_type {
+            Some(plan_rel::RelType::Root(r)) => r,
+            _ => panic!("expected Root"),
+        };
+        assert_eq!(root.names, vec!["s_acctbal", "n_name", "s_name", "p_partkey"],
+            "Root.names should be in rel_names order (exchange table order)");
     }
 
     // ---- EMPTY_SET_NODE test ----

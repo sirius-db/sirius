@@ -1,6 +1,6 @@
 #!/bin/bash
 
-cd test_datasets
+cd "${PIXI_PROJECT_ROOT:-$(dirname "$0")}/test_datasets" 2>/dev/null || return 0
 
 if [ ! -f tpch-dbgen/s1/customer.tbl ]; then
     unzip -n tpch-dbgen.zip
