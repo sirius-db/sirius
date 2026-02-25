@@ -273,10 +273,16 @@ void task_creator::manager_loop()
         } else if (node->type == ::sirius::op::SiriusPhysicalOperatorType::PARQUET_SCAN) {
           size_t operator_id             = node->get_operator_id();
           auto parquet_task_global_state = _parquet_scan_operator_global_state_map.at(operator_id);
-
-          auto const partition_idx = parquet_task_global_state->get_next_rg_partition_idx();
-          if (!partition_idx.has_value()) { return; }
+          auto* parquet_scan             = &node->Cast<op::sirius_physical_parquet_scan>();
           pipeline->mark_task_created();
+          auto const partition_idx = parquet_task_global_state->get_next_rg_partition_idx();
+          if (!partition_idx.has_value()) {
+            pipeline->mark_task_completed();
+            return;
+          }
+          if (!parquet_task_global_state->has_more_partitions()) {
+            parquet_scan->has_more_partitions = false;
+          }
 
           auto parquet_task_local_state = std::make_unique<op::scan::parquet_scan_task_local_state>(
             *parquet_task_global_state, *partition_idx);
