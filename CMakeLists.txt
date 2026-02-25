@@ -37,8 +37,13 @@ option(ENABLE_STREAM_CHECK
        "Enable stream check library for debugging default stream usage" OFF)
 
 find_package(cudf REQUIRED CONFIG)
+find_package(spdlog REQUIRED CONFIG)
 find_package(libconfig++ REQUIRED)
 find_package(absl REQUIRED)
+
+# Default log directory
+set(SIRIUS_DEFAULT_LOG_DIR "${CMAKE_BINARY_DIR}/log")
+add_compile_definitions(SIRIUS_DEFAULT_LOG_DIR="${SIRIUS_DEFAULT_LOG_DIR}")
 
 # Derive the environment prefix from where cudf was found cudf_DIR is typically:
 # <prefix>/lib/cmake/cudf
@@ -76,7 +81,6 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 # Third-party dependencies (must be before include_directories for cuCascade
 # headers)
 set(DEPS_PREFIX "_deps")
-include(third_party/spdlog.cmake)
 include(third_party/cucascade.cmake)
 
 # Include directories - cuCascade headers first for memory module
@@ -169,11 +173,6 @@ target_link_libraries(${LOADABLE_EXTENSION_NAME} cudf::cudf rmm::rmm)
 target_link_libraries(${EXTENSION_NAME} spdlog::spdlog cuCascade::cucascade)
 target_link_libraries(${LOADABLE_EXTENSION_NAME} spdlog::spdlog
                       cuCascade::cucascade)
-
-# Ensure third-party libraries are built before extensions Note: cucascade is
-# added via add_subdirectory, so dependencies are automatic
-add_dependencies(${EXTENSION_NAME} spdlog_ep)
-add_dependencies(${LOADABLE_EXTENSION_NAME} spdlog_ep)
 
 # Install cucascade_static to the DuckDB export set (required for
 # sirius_extension export)
