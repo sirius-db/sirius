@@ -192,14 +192,9 @@ async fn send_nixl_to_peer(
     let grpc_addr = format!("http://{}", dest.brpc_addr);
 
     // Step 1: Register sender's GPU result buffers with nixl agent.
-    // This also checks if UCX can identify the memory as GPU (VRAM).
-    // If UCX treats it as host memory, gpu_transfer_enabled is set to false.
+    // Held for the duration of the transfer; dropped at function return.
     let buf_tuples: Vec<_> = src_buffers.iter().map(|b| (b.addr, b.len, b.device_id)).collect();
-    agent.register_gpu_buffers(&buf_tuples)?;
-
-    if !agent.gpu_transfer_enabled() {
-        return Err("UCX cannot handle GPU memory (detected as host) — use bRPC".to_string());
-    }
+    let _src_registrations = agent.register_gpu_buffers(&buf_tuples)?;
 
     // Step 2: Get fresh metadata (includes newly registered buffers).
     let fresh_md = agent.get_fresh_metadata()?;

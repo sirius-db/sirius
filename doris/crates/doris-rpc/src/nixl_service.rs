@@ -4,6 +4,8 @@
 //! - exchange_metadata: sender offers buffers, receiver allocates and returns addresses
 //! - transfer_complete: sender notifies receiver that nixl transfer is done
 
+#[cfg(feature = "nixl")]
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use tonic::{Request, Response, Status};
@@ -11,7 +13,7 @@ use tonic::{Request, Response, Status};
 use tracing::{info, instrument, warn};
 
 #[cfg(feature = "nixl")]
-use crate::nixl_exchange::NixlExchange;
+use crate::nixl_exchange::{NixlExchange, NixlRegisteredBuffer};
 use crate::exchange_buffer::ExchangeBuffer;
 use sirius_ffi::SiriusEngine;
 
@@ -22,6 +24,10 @@ pub struct NixlMetadataServiceHandler {
     nixl_agent: Option<Arc<NixlExchange>>,
     engine: Option<Arc<Mutex<SiriusEngine>>>,
     exchange_buffer: ExchangeBuffer,
+    /// Pending GPU buffers awaiting transfer_complete. RAII cleanup on removal:
+    /// deregisters from nixl + frees GPU memory in correct order.
+    #[cfg(feature = "nixl")]
+    pending_buffers: Mutex<HashMap<(i64, i64, i32), Vec<NixlRegisteredBuffer>>>,
 }
 
 impl NixlMetadataServiceHandler {
@@ -36,6 +42,8 @@ impl NixlMetadataServiceHandler {
             nixl_agent,
             engine,
             exchange_buffer,
+            #[cfg(feature = "nixl")]
+            pending_buffers: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -79,67 +87,57 @@ impl doris_proto::nixl::NixlMetadataService for NixlMetadataServiceHandler {
             }));
         };
 
-        // Step 1: Allocate destination GPU buffers using raw CUDA driver API.
-        // We use cuMemAlloc directly (not the RMM pool) because the RMM processing
-        // pool may be at capacity after GPU query execution.
-        let mut dst_buffers: Vec<PGpuBufferDesc> = Vec::with_capacity(req.src_buffers.len());
-        for b in &req.src_buffers {
-            info!(
-                addr = format_args!("0x{:x}", b.addr),
-                len = b.len,
-                device_id = b.device_id,
-                "exchange_metadata: received src_buffer"
-            );
-            match cuda_alloc(b.len as usize) {
-                Ok(dst_addr) => {
-                    info!(
-                        dst_addr = format_args!("0x{:x}", dst_addr),
-                        len = b.len,
-                        "exchange_metadata: allocated dst GPU buffer"
-                    );
-                    dst_buffers.push(PGpuBufferDesc {
-                        addr: dst_addr as u64,
-                        len: b.len,
-                        device_id: b.device_id,
-                    });
-                }
-                Err(e) => {
-                    // Free any already-allocated buffers.
-                    for alloc in &dst_buffers {
-                        let _ = cuda_free(alloc.addr as usize);
-                    }
-                    warn!(error = %e, "GPU buffer allocation failed");
-                    return Ok(Response::new(PExchangeNixlMetadataResponse {
-                        dst_buffers: vec![],
-                        remote_agent_name: String::new(),
-                        status_code: 1,
-                        error_msgs: vec![format!("cuda_alloc: {e}")],
-                        nixl_metadata: vec![],
-                    }));
-                }
+        // Step 1+2: Allocate and register destination GPU buffers in one operation.
+        // Uses cuMemAlloc directly (not the RMM pool) because the RMM processing
+        // pool may be at capacity after GPU query execution. RAII handles cleanup.
+        let sizes: Vec<_> = req.src_buffers.iter().map(|b| (b.len, b.device_id)).collect();
+        let registered = match agent.allocate_and_register_gpu_buffers(&sizes) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, "failed to allocate/register dst GPU buffers");
+                return Ok(Response::new(PExchangeNixlMetadataResponse {
+                    dst_buffers: vec![],
+                    remote_agent_name: String::new(),
+                    status_code: 1,
+                    error_msgs: vec![format!("allocate_and_register: {e}")],
+                    nixl_metadata: vec![],
+                }));
             }
-        }
+        };
 
-        // Step 2: Register allocated dst buffers with receiver's nixl agent.
-        let buf_tuples: Vec<_> = dst_buffers
+        let dst_buffers: Vec<PGpuBufferDesc> = registered
             .iter()
-            .map(|b| (b.addr as usize, b.len as usize, b.device_id))
+            .map(|b| PGpuBufferDesc {
+                addr: b.addr() as u64,
+                len: b.len() as u64,
+                device_id: b.device_id(),
+            })
             .collect();
-        if let Err(e) = agent.register_gpu_buffers(&buf_tuples) {
-            warn!(error = %e, "failed to register dst GPU buffers with nixl");
-            return Ok(Response::new(PExchangeNixlMetadataResponse {
-                dst_buffers: vec![],
-                remote_agent_name: String::new(),
-                status_code: 1,
-                error_msgs: vec![format!("register_gpu_buffers: {e}")],
-                nixl_metadata: vec![],
-            }));
-        }
+
+        // Store pending buffers for RAII cleanup in transfer_complete.
+        let query_id_hi = i64::from_le_bytes(
+            req.query_id_hi
+                .get(..8)
+                .and_then(|s| s.try_into().ok())
+                .unwrap_or([0u8; 8]),
+        );
+        let query_id_lo = i64::from_le_bytes(
+            req.query_id_lo
+                .get(..8)
+                .and_then(|s| s.try_into().ok())
+                .unwrap_or([0u8; 8]),
+        );
+        let pending_key = (query_id_hi, query_id_lo, req.node_id);
+        self.pending_buffers
+            .lock()
+            .unwrap()
+            .insert(pending_key, registered);
 
         // Step 3: Load sender's metadata (force-load since sender registered new buffers).
         let remote_name = match agent.force_load_remote_metadata(&peer, &req.nixl_metadata) {
             Ok(name) => name,
             Err(e) => {
+                self.pending_buffers.lock().unwrap().remove(&pending_key);
                 warn!(error = %e, "failed to load remote nixl metadata");
                 return Ok(Response::new(PExchangeNixlMetadataResponse {
                     dst_buffers: vec![],
@@ -155,6 +153,7 @@ impl doris_proto::nixl::NixlMetadataService for NixlMetadataServiceHandler {
         let receiver_metadata = match agent.get_fresh_metadata() {
             Ok(md) => md,
             Err(e) => {
+                self.pending_buffers.lock().unwrap().remove(&pending_key);
                 warn!(error = %e, "failed to get fresh receiver metadata");
                 return Ok(Response::new(PExchangeNixlMetadataResponse {
                     dst_buffers: vec![],
@@ -226,13 +225,6 @@ impl doris_proto::nixl::NixlMetadataService for NixlMetadataServiceHandler {
             "transfer_complete: nixl transfer done, building PBlock from IPC"
         );
 
-        // Free destination GPU buffers (data was transferred but we use IPC for exchange).
-        for buf in &req.dst_buffers {
-            if let Err(e) = cuda_free(buf.addr as usize) {
-                warn!(error = %e, addr = buf.addr, "failed to free dst GPU buffer");
-            }
-        }
-
         // Parse query_id from LE bytes.
         let query_id_hi = i64::from_le_bytes(
             req.query_id_hi.get(..8)
@@ -244,6 +236,15 @@ impl doris_proto::nixl::NixlMetadataService for NixlMetadataServiceHandler {
                 .and_then(|s| s.try_into().ok())
                 .unwrap_or([0u8; 8]),
         );
+
+        // Free destination GPU buffers via RAII: deregister from nixl + cuda_free.
+        let pending_key = (query_id_hi, query_id_lo, req.node_id);
+        let removed = self.pending_buffers.lock().unwrap().remove(&pending_key);
+        info!(
+            freed = removed.as_ref().map_or(0, |v| v.len()),
+            "transfer_complete: released pending GPU buffers (RAII)"
+        );
+        drop(removed);
 
         // Convert Arrow IPC to PBlock using the same path as bRPC exchange.
         let (pblock, _num_rows) = match crate::arrow_to_pblock::arrow_ipc_to_pblock(&req.arrow_ipc_data) {
@@ -291,9 +292,6 @@ impl doris_proto::nixl::NixlMetadataService for NixlMetadataServiceHandler {
     }
 }
 
-// CUDA driver API: use shared cuda_driver module.
-#[cfg(feature = "nixl")]
-use crate::cuda_driver::{cuda_alloc, cuda_free};
 
 #[cfg(test)]
 mod tests {

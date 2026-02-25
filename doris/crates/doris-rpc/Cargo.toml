@@ -5,7 +5,7 @@ edition = "2021"
 
 [features]
 default = []
-nixl = ["dep:nixl-sys"]
+nixl = ["dep:nixl-sys", "dep:cudarc"]
 
 [dependencies]
 doris-thrift = { path = "../doris-thrift" }
@@ -28,4 +28,4 @@ lz4_flex = "0.11"
 zstd = "0.13"
 tokio-stream = "0.1"
 nixl-sys = { version = "0.10", optional = true }
-libc = "0.2"
+cudarc = { workspace = true, optional = true }
