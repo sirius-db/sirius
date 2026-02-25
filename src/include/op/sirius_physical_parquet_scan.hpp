@@ -101,6 +101,8 @@ class sirius_physical_parquet_scan : public sirius_physical_operator {
 
   std::atomic<bool> exhausted{false};
 
+  std::atomic<bool> has_more_partitions{true};
+
  public:
   bool is_source() const override { return true; }
 };

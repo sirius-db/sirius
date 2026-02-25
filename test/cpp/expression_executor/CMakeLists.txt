@@ -16,4 +16,5 @@
 
 set(TEST_SOURCES
     ${TEST_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/test_gpu_expression_executor.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_gpu_expression_translator.cpp
     PARENT_SCOPE)

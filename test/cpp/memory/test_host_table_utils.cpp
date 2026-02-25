@@ -70,11 +70,12 @@ std::filesystem::path get_test_config_path()
   return std::filesystem::path(__FILE__).parent_path() / "memory.cfg";
 }
 
-memory_space* get_memory_space(cucascade::memory::Tier tier, int device_id)
+memory_space* get_memory_space(duckdb::shared_ptr<duckdb::SiriusContext> sirius_ctx,
+                               cucascade::memory::Tier tier,
+                               int device_id)
 {
-  auto sirius_ctx = sirius::get_sirius_context(get_test_config_path());
-  auto& manager   = sirius_ctx->get_memory_manager();
-  auto* space     = manager.get_memory_space(tier, device_id);
+  auto& manager = sirius_ctx->get_memory_manager();
+  auto* space   = manager.get_memory_space(tier, device_id);
   if (space) { return space; }
   auto spaces = manager.get_memory_spaces_for_tier(tier);
   if (!spaces.empty()) { return const_cast<memory_space*>(spaces.front()); }
@@ -327,13 +328,13 @@ size_t estimate_packed_data_bytes(cudf::table_view const& view)
 }
 
 cucascade::host_data_packed_representation const& convert_to_host_table(
+  duckdb::shared_ptr<duckdb::SiriusContext> sirius_ctx,
   std::shared_ptr<cucascade::data_batch> const& batch)
 {
   auto* data = batch->get_data();
   if (!data) { throw std::runtime_error("data_batch has no data representation"); }
 
-  auto sirius_ctx = sirius::get_sirius_context(get_test_config_path());
-  auto& manager   = sirius_ctx->get_memory_manager();
+  auto& manager = sirius_ctx->get_memory_manager();
 
   auto reservation =
     manager.request_reservation(any_memory_space_in_tier{Tier::HOST},
@@ -361,9 +362,13 @@ TEST_CASE("host_table_utils - pack metadata with gaps across multiple blocks",
 {
   using metadata_node = sirius::metadata_node;
 
-  auto* host_space = get_memory_space(Tier::HOST, 0);
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  auto sirius_ctx = sirius::get_sirius_context(con, get_test_config_path());
+
+  auto* host_space = get_memory_space(sirius_ctx, Tier::HOST, 0);
   REQUIRE(host_space != nullptr);
-  auto* gpu_space = get_memory_space(Tier::GPU, 0);
+  auto* gpu_space = get_memory_space(sirius_ctx, Tier::GPU, 0);
   REQUIRE(gpu_space != nullptr);
 
   auto* allocator = host_space->get_memory_resource_as<fixed_size_host_memory_resource>();
@@ -495,9 +500,13 @@ TEST_CASE("host_table_utils - underfilled varchar column truncates rows",
 {
   using metadata_node = sirius::metadata_node;
 
-  auto* host_space = get_memory_space(Tier::HOST, 0);
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  auto sirius_ctx = sirius::get_sirius_context(con, get_test_config_path());
+
+  auto* host_space = get_memory_space(sirius_ctx, Tier::HOST, 0);
   REQUIRE(host_space != nullptr);
-  auto* gpu_space = get_memory_space(Tier::GPU, 0);
+  auto* gpu_space = get_memory_space(sirius_ctx, Tier::GPU, 0);
   REQUIRE(gpu_space != nullptr);
 
   auto* allocator = host_space->get_memory_resource_as<fixed_size_host_memory_resource>();
@@ -616,7 +625,11 @@ TEST_CASE("host_table_utils - underfilled varchar column truncates rows",
 TEST_CASE("host_table_utils - metadata offsets match packed data", "[memory][host_table_utils]")
 {
   constexpr size_t num_rows = 257;
-  auto* gpu_space           = get_memory_space(Tier::GPU, 0);
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  auto sirius_ctx = sirius::get_sirius_context(con, get_test_config_path());
+
+  auto* gpu_space = get_memory_space(sirius_ctx, Tier::GPU, 0);
   REQUIRE(gpu_space != nullptr);
   auto stream = cudf::get_default_stream();
   auto mr     = gpu_space->get_default_allocator();
@@ -650,7 +663,7 @@ TEST_CASE("host_table_utils - metadata offsets match packed data", "[memory][hos
     expected_string_mask = extract_mask_bytes(gpu_view.column(2));
   }
 
-  auto const& host_table = convert_to_host_table(batch);
+  auto const& host_table = convert_to_host_table(sirius_ctx, batch);
   auto const& host_alloc = host_table.get_host_table();
   auto const& allocation = host_alloc->allocation;
 

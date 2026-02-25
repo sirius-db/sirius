@@ -391,22 +391,38 @@ std::unique_ptr<operator_data> sirius_physical_ungrouped_aggregate::execute(
           }
           // cuDF requires output type == input type for fixed-point (decimal) reductions.
           // For AVG we use input type and apply return type in the merge step (SUM/COUNT).
-          // For SUM/MIN/MAX on decimals we must also use input column type.
+          // For SUM we widen (expected by duckdb) before the aggregation to avoid overflow.
           bool is_decimal = (col.type().id() == cudf::type_id::DECIMAL32 ||
                              col.type().id() == cudf::type_id::DECIMAL64 ||
                              col.type().id() == cudf::type_id::DECIMAL128);
+
           std::unique_ptr<cudf::column> casted_col;
-          if (col.type().id() == cudf::type_id::DECIMAL32) {
-            casted_col = cudf::cast(
-              col, cudf::data_type(cudf::type_id::DECIMAL64, col.type().scale()), stream);
-            col = casted_col->view();
+          if (spec.kind == aggregate_kind::SUM) {
+            if (col.type().id() == cudf::type_id::DECIMAL32) {
+              casted_col = cudf::cast(
+                col, cudf::data_type(cudf::type_id::DECIMAL64, col.type().scale()), stream);
+              col = casted_col->view();
+            }
+            if (col.type().id() == cudf::type_id::DECIMAL64) {
+              casted_col = cudf::cast(
+                col, cudf::data_type(cudf::type_id::DECIMAL128, col.type().scale()), stream);
+              col = casted_col->view();
+            }
           }
-          if (col.type().id() == cudf::type_id::DECIMAL64) {
-            casted_col = cudf::cast(
-              col, cudf::data_type(cudf::type_id::DECIMAL128, col.type().scale()), stream);
-            col = casted_col->view();
+          if (is_decimal) {
+            // cuDF requires output type == input type for fixed-point reductions.
+            out_type = col.type();
+          } else if (spec.kind == aggregate_kind::AVG) {
+            // Widen small integer types to INT64 so the partial sum is stored as INT64.
+            // merge_ungrouped_aggregate sums INT64 partial sums without cross-type reduction,
+            // which avoids cuDF cross-type reduce issues that produce wrong results.
+            if (col.type().id() == cudf::type_id::INT8 || col.type().id() == cudf::type_id::INT16 ||
+                col.type().id() == cudf::type_id::INT32) {
+              casted_col = cudf::cast(col, cudf::data_type(cudf::type_id::INT64), stream);
+              col        = casted_col->view();
+            }
+            out_type = col.type();
           }
-          if (spec.kind == aggregate_kind::AVG || is_decimal) { out_type = col.type(); }
           auto scalar = cudf::reduce(col, *agg_op, out_type, std::nullopt, stream);
           cols.push_back(cudf::make_column_from_scalar(*scalar, 1, stream));
           if (spec.kind == aggregate_kind::AVG) {

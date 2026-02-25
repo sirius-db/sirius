@@ -203,24 +203,27 @@ TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate computes SUM/MIN/MAX/COU
   REQUIRE(view.num_rows() == 1);
 
   // Verify
+  // SUM may widen the output type (e.g. DECIMAL64 -> DECIMAL128), so read with agg_output_type.
+  // MIN/MAX are not widened for decimals, so read with min_max_output_type (= type for decimals).
   auto sum_out        = copy_column_to_host<typename Traits::agg_output_type>(view.column(0));
-  auto min_out        = copy_column_to_host<typename Traits::agg_output_type>(view.column(1));
-  auto max_out        = copy_column_to_host<typename Traits::agg_output_type>(view.column(2));
+  auto min_out        = copy_column_to_host<typename Traits::min_max_output_type>(view.column(1));
+  auto max_out        = copy_column_to_host<typename Traits::min_max_output_type>(view.column(2));
   auto count_out      = copy_column_to_host<int64_t>(view.column(3));
   auto count_star_out = copy_column_to_host<int64_t>(view.column(4));
 
-  // Compute expected values in agg_output_type (upcasted for decimals: DECIMAL64 -> DECIMAL128)
+  // Compute expected SUM in agg_output_type (DECIMAL64 SUM upcasts to DECIMAL128).
+  // Compute expected MIN/MAX in min_max_output_type (DECIMAL64 stays DECIMAL64).
   typename Traits::agg_output_type expected_sum = 0;
-  typename Traits::agg_output_type expected_min =
-    static_cast<typename Traits::agg_output_type>(vals[0]);
-  typename Traits::agg_output_type expected_max =
-    static_cast<typename Traits::agg_output_type>(vals[0]);
+  typename Traits::min_max_output_type expected_min =
+    static_cast<typename Traits::min_max_output_type>(vals[0]);
+  typename Traits::min_max_output_type expected_max =
+    static_cast<typename Traits::min_max_output_type>(vals[0]);
 
   for (auto v : vals) {
-    auto v_upcast = static_cast<typename Traits::agg_output_type>(v);
-    expected_sum += v_upcast;
-    if (v_upcast < expected_min) expected_min = v_upcast;
-    if (v_upcast > expected_max) expected_max = v_upcast;
+    expected_sum += static_cast<typename Traits::agg_output_type>(v);
+    auto v_mm = static_cast<typename Traits::min_max_output_type>(v);
+    if (v_mm < expected_min) expected_min = v_mm;
+    if (v_mm > expected_max) expected_max = v_mm;
   }
 
   // Approximate check for floats
@@ -229,12 +232,12 @@ TEMPLATE_TEST_CASE("sirius_physical_ungrouped_aggregate computes SUM/MIN/MAX/COU
     REQUIRE(min_out[0] == Approx(static_cast<typename Traits::type>(expected_min)));
     REQUIRE(max_out[0] == Approx(static_cast<typename Traits::type>(expected_max)));
   } else if constexpr (std::is_same_v<typename Traits::agg_output_type, __int128_t>) {
+    // SUM output is DECIMAL128 (__int128_t).
     REQUIRE(int128_high64(sum_out[0]) == int128_high64(expected_sum));
     REQUIRE(int128_low64(sum_out[0]) == int128_low64(expected_sum));
-    REQUIRE(int128_high64(min_out[0]) == int128_high64(expected_min));
-    REQUIRE(int128_low64(min_out[0]) == int128_low64(expected_min));
-    REQUIRE(int128_high64(max_out[0]) == int128_high64(expected_max));
-    REQUIRE(int128_low64(max_out[0]) == int128_low64(expected_max));
+    // MIN/MAX output is DECIMAL64 (int64_t) — not widened.
+    REQUIRE(min_out[0] == expected_min);
+    REQUIRE(max_out[0] == expected_max);
   } else {
     REQUIRE(sum_out[0] == expected_sum);
     REQUIRE(min_out[0] == expected_min);

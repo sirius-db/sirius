@@ -59,25 +59,10 @@ std::filesystem::path get_test_config_path()
   return std::filesystem::path(__FILE__).parent_path() / "result.cfg";
 }
 
-duckdb::Connection& get_test_connection()
+memory_space* get_default_gpu_space(duckdb::shared_ptr<duckdb::SiriusContext>& sirius_ctx)
 {
-  static duckdb::DuckDB db(nullptr);
-  static duckdb::Connection con(db);
-  return con;
-}
-
-duckdb::ClientContext& get_test_client_context() { return *get_test_connection().context; }
-
-duckdb::shared_ptr<duckdb::SiriusContext> get_test_sirius_context()
-{
-  return sirius::get_sirius_context(get_test_connection(), get_test_config_path());
-}
-
-memory_space* get_default_gpu_space()
-{
-  auto sirius_ctx = get_test_sirius_context();
-  auto& manager   = sirius_ctx->get_memory_manager();
-  auto* space     = manager.get_memory_space(Tier::GPU, 0);
+  auto& manager = sirius_ctx->get_memory_manager();
+  auto* space   = manager.get_memory_space(Tier::GPU, 0);
   if (space) { return space; }
   auto spaces = manager.get_memory_spaces_for_tier(Tier::GPU);
   if (!spaces.empty()) { return const_cast<memory_space*>(spaces.front()); }
@@ -225,13 +210,12 @@ size_t estimate_packed_data_bytes(cudf::table_view const& view)
 }
 
 host_data_packed_representation const& convert_to_host_table(
-  std::shared_ptr<data_batch> const& batch)
+  duckdb::shared_ptr<duckdb::SiriusContext> sirius_ctx, std::shared_ptr<data_batch> const& batch)
 {
   auto* data = batch->get_data();
   if (!data) { throw std::runtime_error("data_batch has no data representation"); }
 
-  auto sirius_ctx = get_test_sirius_context();
-  auto& manager   = sirius_ctx->get_memory_manager();
+  auto& manager = sirius_ctx->get_memory_manager();
 
   auto reservation =
     manager.request_reservation(any_memory_space_in_tier{Tier::HOST},
@@ -258,7 +242,10 @@ TEST_CASE("host_table_chunk_reader produces correct DataChunks",
           "[operator][result_collector][host_table_chunk_reader]")
 {
   constexpr size_t num_rows = STANDARD_VECTOR_SIZE + 5;
-  auto* gpu_space           = get_default_gpu_space();
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  auto sirius_ctx = sirius::get_sirius_context(con, get_test_config_path());
+  auto* gpu_space = get_default_gpu_space(sirius_ctx);
   REQUIRE(gpu_space != nullptr);
 
   std::vector<cudf::data_type> column_types{cudf::data_type{cudf::type_id::INT32},
@@ -288,12 +275,12 @@ TEST_CASE("host_table_chunk_reader produces correct DataChunks",
     expected_strings    = build_expected_strings(expected);
   }
 
-  auto const& host_table = convert_to_host_table(batch);
+  auto const& host_table = convert_to_host_table(sirius_ctx, batch);
 
   duckdb::vector<duckdb::LogicalType> types{duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER),
                                             duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT),
                                             duckdb::LogicalType(duckdb::LogicalTypeId::VARCHAR)};
-  sirius::op::result::host_table_chunk_reader reader(get_test_client_context(), host_table, types);
+  sirius::op::result::host_table_chunk_reader reader(*con.context, host_table, types);
 
   size_t row_base       = 0;
   auto const num_chunks = reader.calculate_num_chunks();
@@ -333,7 +320,10 @@ TEST_CASE("host_table_chunk_reader handles null masks",
           "[operator][result_collector][host_table_chunk_reader]")
 {
   constexpr size_t num_rows = STANDARD_VECTOR_SIZE * 2 + 3;
-  auto* gpu_space           = get_default_gpu_space();
+  duckdb::DuckDB db(nullptr);
+  duckdb::Connection con(db);
+  auto sirius_ctx = sirius::get_sirius_context(con, get_test_config_path());
+  auto* gpu_space = get_default_gpu_space(sirius_ctx);
   REQUIRE(gpu_space != nullptr);
   auto stream = cudf::get_default_stream();
   auto mr     = gpu_space->get_default_allocator();
@@ -373,12 +363,12 @@ TEST_CASE("host_table_chunk_reader handles null masks",
     expected_string_valid = extract_validity(gpu_view.column(2));
   }
 
-  auto const& host_table = convert_to_host_table(batch);
+  auto const& host_table = convert_to_host_table(sirius_ctx, batch);
 
   duckdb::vector<duckdb::LogicalType> types{duckdb::LogicalType(duckdb::LogicalTypeId::INTEGER),
                                             duckdb::LogicalType(duckdb::LogicalTypeId::BIGINT),
                                             duckdb::LogicalType(duckdb::LogicalTypeId::VARCHAR)};
-  sirius::op::result::host_table_chunk_reader reader(get_test_client_context(), host_table, types);
+  sirius::op::result::host_table_chunk_reader reader(*con.context, host_table, types);
 
   size_t row_base       = 0;
   auto const num_chunks = reader.calculate_num_chunks();
