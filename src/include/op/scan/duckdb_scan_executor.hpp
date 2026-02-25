@@ -183,6 +183,7 @@ class duckdb_scan_executor {
                                                      rmm::cuda_stream_view stream);
 
   struct cache_entry {
+    std::mutex entry_mutex;  ///< Serializes tasks within the same pipeline
     std::vector<std::vector<std::shared_ptr<cucascade::data_batch>>> batches;
     std::size_t batch_index{0};
   };

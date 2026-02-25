@@ -105,7 +105,10 @@ void duckdb_scan_executor::cache_scan_results_for_query(const std::string& query
   }
   SIRIUS_LOG_INFO("Caching scan results for query: {}", query);
   _query_hash = new_query_hash;
-  _cache.clear();
+  {
+    std::lock_guard<std::mutex> lock(_cache_mutex);
+    _cache.clear();
+  }
 }
 
 void duckdb_scan_executor::set_scan_caching_enabled(bool enabled)
@@ -152,34 +155,55 @@ void duckdb_scan_executor::submit_scan_request()
 std::unique_ptr<op::operator_data> duckdb_scan_executor::get_scan_output(
   pipeline::sirius_pipeline_itask* task, rmm::cuda_stream_view stream)
 {
-  if (!_caching_enabled) {
-    return task->compute_task(stream);
-  } else {
-    auto pipe_id = task->get_pipeline_id();
-    std::lock_guard<std::mutex> lock(_cache_mutex);
-    auto& entry = _cache.at(pipe_id);
-    if (!entry) { throw std::runtime_error("Scan results for query not cached"); }
-    if (_preload_mode) {
+  if (!_caching_enabled) { return task->compute_task(stream); }
+
+  auto pipe_id = task->get_pipeline_id();
+
+  if (_preload_mode) {
+    std::vector<std::shared_ptr<cucascade::data_batch>> batches;
+    {
+      std::lock_guard<std::mutex> lock(_cache_mutex);
+      auto& entry = _cache.at(pipe_id);
+      if (!entry) {
+        throw std::runtime_error("Could not find cache entry for pipeline id: " +
+                                 std::to_string(pipe_id));
+      }
       if (entry->batch_index >= entry->batches.size()) {
-        throw std::runtime_error("Scan results for query not cached");
+        throw std::runtime_error("Requested batch not cached while in preload mode");
       }
-      auto batches = entry->batches[entry->batch_index++];
-      std::vector<std::shared_ptr<cucascade::data_batch>> cloned_batches;
-      cloned_batches.reserve(batches.size());
-      for (auto& b : batches) {
-        cloned_batches.push_back(b->clone(::sirius::get_next_batch_id(), stream));
+      batches = entry->batches[entry->batch_index++];
+    }
+    std::vector<std::shared_ptr<cucascade::data_batch>> cloned_batches;
+    cloned_batches.reserve(batches.size());
+    for (auto& b : batches) {
+      cloned_batches.push_back(b->clone(::sirius::get_next_batch_id(), stream));
+    }
+    return std::make_unique<op::operator_data>(std::move(cloned_batches));
+  } else {
+    cache_entry* entry_ptr = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(_cache_mutex);
+      auto& entry = _cache.at(pipe_id);
+      if (!entry) {
+        throw std::runtime_error("Could not find cache entry for pipeline id: " +
+                                 std::to_string(pipe_id));
       }
-      return std::make_unique<op::operator_data>(std::move(cloned_batches));
-    } else {
-      auto scan_output = task->compute_task(stream);
+      entry_ptr = entry.get();
+    }
+    // Hold a per-entry mutex to allow concurrent scan tasks from different pipelines,
+    // but ensure batches are pushed in order within the same pipeline.
+    std::unique_ptr<op::operator_data> scan_output;
+    {
+      std::lock_guard<std::mutex> entry_lock(entry_ptr->entry_mutex);
+      scan_output = task->compute_task(stream);
       std::vector<std::shared_ptr<cucascade::data_batch>> cloned_batches;
       cloned_batches.reserve(scan_output->get_data_batches().size());
       for (auto& b : scan_output->get_data_batches()) {
         cloned_batches.push_back(b->clone(::sirius::get_next_batch_id(), stream));
       }
-      entry->batches.push_back(std::move(cloned_batches));
-      return scan_output;
+      entry_ptr->batches.push_back(std::move(cloned_batches));
     }
+    return scan_output;
   }
 }
 
