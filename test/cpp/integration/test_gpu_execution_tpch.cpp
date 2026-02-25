@@ -44,7 +44,8 @@ static fs::path get_project_root()
 static fs::path get_tpch_db_path()
 {
   const char* env = std::getenv("SIRIUS_INTEGRATION_TEST_DB_PATH");
-  auto db_path    = env ? fs::path(env) : fs::path(__FILE__).parent_path() / "data/duckdb/integration.duckdb";
+  auto db_path =
+    env ? fs::path(env) : fs::path(__FILE__).parent_path() / "data/duckdb/integration.duckdb";
   REQUIRE(fs::exists(db_path));
   return db_path;
 }
@@ -59,120 +60,119 @@ struct sirius_config_env_guard {
 };
 
 class GPUExecutionFixtureBase {
-  public:
+ public:
   GPUExecutionFixtureBase()
-   {
-     // Set up environment variable for config file
-     auto cfg_path = fs::path(__FILE__).parent_path() / "integration.cfg";
-     REQUIRE(fs::exists(cfg_path));
-     config_guard = std::make_unique<sirius_config_env_guard>(cfg_path.string());
- 
-     // Initialize DuckDB in-memory, then attach the TPC-H database
-     db  = std::make_unique<duckdb::DuckDB>(nullptr);
-     con = std::make_unique<duckdb::Connection>(*db);
-   }
- 
-   ~GPUExecutionFixtureBase() = default;
- 
-   /**
-    * @brief Run a query through gpu_execution and through DuckDB CPU, then compare results.
-    *
-    * Values are compared as strings via Value::ToString() which normalizes type differences
-    * (e.g., HUGEINT vs BIGINT both render "50"). Row order is ignored by collecting rows
-    * as sorted sets of string tuples.
-    */
-   static bool is_floating_point(duckdb::LogicalTypeId id)
-   {
-     return id == duckdb::LogicalTypeId::FLOAT || id == duckdb::LogicalTypeId::DOUBLE;
-   }
- 
-   void compare_gpu_vs_cpu(const std::string& query,
-                           std::optional<float> float_tolerance = std::nullopt)
-   {
-     // Disable fallback so GPU errors are not silently hidden
-     con->Query("SET enable_duckdb_fallback = false;");
- 
-     // Run on GPU
-     auto gpu_sql    = "CALL gpu_execution(\"" + query + "\")";
-     auto gpu_result = con->Query(gpu_sql);
-     REQUIRE(gpu_result);
-     if (gpu_result->HasError()) {
-       UNSCOPED_INFO("gpu_execution error: " << gpu_result->GetError());
-     }
-     REQUIRE_FALSE(gpu_result->HasError());
- 
-     // Run on CPU (plain DuckDB)
-     auto cpu_result = con->Query(query);
-     REQUIRE(cpu_result);
-     REQUIRE_FALSE(cpu_result->HasError());
- 
-     // Compare dimensions
-     REQUIRE(gpu_result->ColumnCount() == cpu_result->ColumnCount());
-     REQUIRE(gpu_result->RowCount() == cpu_result->RowCount());
- 
-     if (gpu_result->RowCount() > 50000) {
-       std::cout << "WARNING: Integration result num rows is: " << gpu_result->RowCount()
-                 << ". Please consider modifying test to make it smaller and run faster."
-                 << std::endl;
-     }
- 
-     // Use DuckDB to sort both result sets by all columns for deterministic comparison.
-     // This avoids lexicographic vs numeric sort issues.
-     auto ncols               = gpu_result->ColumnCount();
-     std::string order_clause = " ORDER BY ";
-     for (duckdb::idx_t c = 0; c < ncols; c++) {
-       if (c > 0) order_clause += ", ";
-       order_clause += std::to_string(c + 1);
-     }
- 
-     // Strip trailing semicolons from query for subquery wrapping
-     auto clean_query = query;
-     while (!clean_query.empty() && (clean_query.back() == ';' || clean_query.back() == ' '))
-       clean_query.pop_back();
- 
-     auto gpu_sorted =
-       con->Query("SELECT * FROM gpu_execution(\"" + clean_query + "\")" + order_clause);
-     auto cpu_sorted = con->Query("SELECT * FROM (" + clean_query + ") t" + order_clause);
-     REQUIRE(gpu_sorted);
-     if (gpu_sorted->HasError()) { UNSCOPED_INFO("gpu sorted error: " << gpu_sorted->GetError()); }
-     REQUIRE_FALSE(gpu_sorted->HasError());
-     REQUIRE(cpu_sorted);
-     if (cpu_sorted->HasError()) { UNSCOPED_INFO("cpu sorted error: " << cpu_sorted->GetError()); }
-     REQUIRE_FALSE(cpu_sorted->HasError());
- 
-     for (duckdb::idx_t r = 0; r < gpu_sorted->RowCount(); r++) {
-       for (duckdb::idx_t c = 0; c < gpu_sorted->ColumnCount(); c++) {
-         auto gpu_value = gpu_sorted->GetValue(c, r);
-         auto cpu_value = cpu_sorted->GetValue(c, r);
- 
-         if (float_tolerance.has_value() && is_floating_point(gpu_value.type().id())) {
-           double gpu_d = gpu_value.GetValue<double>();
-           double cpu_d = cpu_value.GetValue<double>();
-           double diff  = std::fabs(gpu_d - cpu_d);
-           if (diff > static_cast<double>(float_tolerance.value())) {
-             UNSCOPED_INFO("Row " << r << " Col " << c << " float mismatch: GPU=[" << gpu_d
-                                  << "] CPU=[" << cpu_d << "] diff=" << diff
-                                  << " tolerance=" << float_tolerance.value());
-           }
-           REQUIRE(diff <= static_cast<double>(float_tolerance.value()));
-         } else {
-           auto gpu_str = gpu_value.ToString();
-           auto cpu_str = cpu_value.ToString();
-           if (gpu_str != cpu_str) {
-             UNSCOPED_INFO("Row " << r << " Col " << c << " mismatch: GPU=[" << gpu_str << "] CPU=["
-                                  << cpu_str << "]");
-           }
-           REQUIRE(gpu_str == cpu_str);
-         }
-       }
-     }
-   }
- 
-   std::unique_ptr<duckdb::DuckDB> db;
-   std::unique_ptr<duckdb::Connection> con;
-   std::unique_ptr<sirius_config_env_guard> config_guard;
- };
+  {
+    // Set up environment variable for config file
+    auto cfg_path = fs::path(__FILE__).parent_path() / "integration.cfg";
+    REQUIRE(fs::exists(cfg_path));
+    config_guard = std::make_unique<sirius_config_env_guard>(cfg_path.string());
 
+    // Initialize DuckDB in-memory, then attach the TPC-H database
+    db  = std::make_unique<duckdb::DuckDB>(nullptr);
+    con = std::make_unique<duckdb::Connection>(*db);
+  }
+
+  ~GPUExecutionFixtureBase() = default;
+
+  /**
+   * @brief Run a query through gpu_execution and through DuckDB CPU, then compare results.
+   *
+   * Values are compared as strings via Value::ToString() which normalizes type differences
+   * (e.g., HUGEINT vs BIGINT both render "50"). Row order is ignored by collecting rows
+   * as sorted sets of string tuples.
+   */
+  static bool is_floating_point(duckdb::LogicalTypeId id)
+  {
+    return id == duckdb::LogicalTypeId::FLOAT || id == duckdb::LogicalTypeId::DOUBLE;
+  }
+
+  void compare_gpu_vs_cpu(const std::string& query,
+                          std::optional<float> float_tolerance = std::nullopt)
+  {
+    // Disable fallback so GPU errors are not silently hidden
+    con->Query("SET enable_duckdb_fallback = false;");
+
+    // Run on GPU
+    auto gpu_sql    = "CALL gpu_execution(\"" + query + "\")";
+    auto gpu_result = con->Query(gpu_sql);
+    REQUIRE(gpu_result);
+    if (gpu_result->HasError()) {
+      UNSCOPED_INFO("gpu_execution error: " << gpu_result->GetError());
+    }
+    REQUIRE_FALSE(gpu_result->HasError());
+
+    // Run on CPU (plain DuckDB)
+    auto cpu_result = con->Query(query);
+    REQUIRE(cpu_result);
+    REQUIRE_FALSE(cpu_result->HasError());
+
+    // Compare dimensions
+    REQUIRE(gpu_result->ColumnCount() == cpu_result->ColumnCount());
+    REQUIRE(gpu_result->RowCount() == cpu_result->RowCount());
+
+    if (gpu_result->RowCount() > 50000) {
+      std::cout << "WARNING: Integration result num rows is: " << gpu_result->RowCount()
+                << ". Please consider modifying test to make it smaller and run faster."
+                << std::endl;
+    }
+
+    // Use DuckDB to sort both result sets by all columns for deterministic comparison.
+    // This avoids lexicographic vs numeric sort issues.
+    auto ncols               = gpu_result->ColumnCount();
+    std::string order_clause = " ORDER BY ";
+    for (duckdb::idx_t c = 0; c < ncols; c++) {
+      if (c > 0) order_clause += ", ";
+      order_clause += std::to_string(c + 1);
+    }
+
+    // Strip trailing semicolons from query for subquery wrapping
+    auto clean_query = query;
+    while (!clean_query.empty() && (clean_query.back() == ';' || clean_query.back() == ' '))
+      clean_query.pop_back();
+
+    auto gpu_sorted =
+      con->Query("SELECT * FROM gpu_execution(\"" + clean_query + "\")" + order_clause);
+    auto cpu_sorted = con->Query("SELECT * FROM (" + clean_query + ") t" + order_clause);
+    REQUIRE(gpu_sorted);
+    if (gpu_sorted->HasError()) { UNSCOPED_INFO("gpu sorted error: " << gpu_sorted->GetError()); }
+    REQUIRE_FALSE(gpu_sorted->HasError());
+    REQUIRE(cpu_sorted);
+    if (cpu_sorted->HasError()) { UNSCOPED_INFO("cpu sorted error: " << cpu_sorted->GetError()); }
+    REQUIRE_FALSE(cpu_sorted->HasError());
+
+    for (duckdb::idx_t r = 0; r < gpu_sorted->RowCount(); r++) {
+      for (duckdb::idx_t c = 0; c < gpu_sorted->ColumnCount(); c++) {
+        auto gpu_value = gpu_sorted->GetValue(c, r);
+        auto cpu_value = cpu_sorted->GetValue(c, r);
+
+        if (float_tolerance.has_value() && is_floating_point(gpu_value.type().id())) {
+          double gpu_d = gpu_value.GetValue<double>();
+          double cpu_d = cpu_value.GetValue<double>();
+          double diff  = std::fabs(gpu_d - cpu_d);
+          if (diff > static_cast<double>(float_tolerance.value())) {
+            UNSCOPED_INFO("Row " << r << " Col " << c << " float mismatch: GPU=[" << gpu_d
+                                 << "] CPU=[" << cpu_d << "] diff=" << diff
+                                 << " tolerance=" << float_tolerance.value());
+          }
+          REQUIRE(diff <= static_cast<double>(float_tolerance.value()));
+        } else {
+          auto gpu_str = gpu_value.ToString();
+          auto cpu_str = cpu_value.ToString();
+          if (gpu_str != cpu_str) {
+            UNSCOPED_INFO("Row " << r << " Col " << c << " mismatch: GPU=[" << gpu_str << "] CPU=["
+                                 << cpu_str << "]");
+          }
+          REQUIRE(gpu_str == cpu_str);
+        }
+      }
+    }
+  }
+
+  std::unique_ptr<duckdb::DuckDB> db;
+  std::unique_ptr<duckdb::Connection> con;
+  std::unique_ptr<sirius_config_env_guard> config_guard;
+};
 
 /**
  * @brief Catch2 test fixture for GPU execution tests.
@@ -182,7 +182,7 @@ class GPUExecutionFixtureBase {
  */
 class GPUExecutionDuckDBFixture : public GPUExecutionFixtureBase {
  public:
- GPUExecutionDuckDBFixture()
+  GPUExecutionDuckDBFixture()
   {
     auto db_path = get_tpch_db_path().string();
     auto result  = con->Query("ATTACH '" + db_path + "' AS tpch (READ_ONLY);");
@@ -202,46 +202,53 @@ class GPUExecutionDuckDBFixture : public GPUExecutionFixtureBase {
  * a compare_gpu_vs_cpu method for validating GPU execution against CPU results.
  */
 class GPUExecutionParquetFixture : public GPUExecutionFixtureBase {
-  public:
+ public:
   GPUExecutionParquetFixture()
-   {
-     auto parquet_dir = fs::path(__FILE__).parent_path() / "data/parquet";
-     auto result = con->Query("CREATE VIEW nation AS SELECT * FROM read_parquet('" + parquet_dir.string() + "/nation.parquet');");
-     REQUIRE(result);
-     REQUIRE_FALSE(result->HasError());
+  {
+    auto parquet_dir = fs::path(__FILE__).parent_path() / "data/parquet";
+    auto result      = con->Query("CREATE VIEW nation AS SELECT * FROM read_parquet('" +
+                             parquet_dir.string() + "/nation.parquet');");
+    REQUIRE(result);
+    REQUIRE_FALSE(result->HasError());
 
-     result = con->Query("CREATE VIEW region AS SELECT * FROM read_parquet('" + parquet_dir.string() + "/region.parquet');");
-     REQUIRE(result);
-     REQUIRE_FALSE(result->HasError());
+    result = con->Query("CREATE VIEW region AS SELECT * FROM read_parquet('" +
+                        parquet_dir.string() + "/region.parquet');");
+    REQUIRE(result);
+    REQUIRE_FALSE(result->HasError());
 
-     result = con->Query("CREATE VIEW customer AS SELECT * FROM read_parquet('" + parquet_dir.string() + "/customer.parquet');");
-     REQUIRE(result);
-     REQUIRE_FALSE(result->HasError());
+    result = con->Query("CREATE VIEW customer AS SELECT * FROM read_parquet('" +
+                        parquet_dir.string() + "/customer.parquet');");
+    REQUIRE(result);
+    REQUIRE_FALSE(result->HasError());
 
-     result = con->Query("CREATE VIEW orders AS SELECT * FROM read_parquet('" + parquet_dir.string() + "/orders.parquet');");
-     REQUIRE(result);
-     REQUIRE_FALSE(result->HasError());
+    result = con->Query("CREATE VIEW orders AS SELECT * FROM read_parquet('" +
+                        parquet_dir.string() + "/orders.parquet');");
+    REQUIRE(result);
+    REQUIRE_FALSE(result->HasError());
 
-     result = con->Query("CREATE VIEW part AS SELECT * FROM read_parquet('" + parquet_dir.string() + "/part.parquet');");
-     REQUIRE(result);
-     REQUIRE_FALSE(result->HasError());
+    result = con->Query("CREATE VIEW part AS SELECT * FROM read_parquet('" + parquet_dir.string() +
+                        "/part.parquet');");
+    REQUIRE(result);
+    REQUIRE_FALSE(result->HasError());
 
-     result = con->Query("CREATE VIEW partsupp AS SELECT * FROM read_parquet('" + parquet_dir.string() + "/partsupp.parquet');");
-     REQUIRE(result);
-     REQUIRE_FALSE(result->HasError());
+    result = con->Query("CREATE VIEW partsupp AS SELECT * FROM read_parquet('" +
+                        parquet_dir.string() + "/partsupp.parquet');");
+    REQUIRE(result);
+    REQUIRE_FALSE(result->HasError());
 
-     result = con->Query("CREATE VIEW supplier AS SELECT * FROM read_parquet('" + parquet_dir.string() + "/supplier.parquet');");
-     REQUIRE(result);
-     REQUIRE_FALSE(result->HasError());
+    result = con->Query("CREATE VIEW supplier AS SELECT * FROM read_parquet('" +
+                        parquet_dir.string() + "/supplier.parquet');");
+    REQUIRE(result);
+    REQUIRE_FALSE(result->HasError());
 
-     result = con->Query("CREATE VIEW lineitem AS SELECT * FROM read_parquet('" + parquet_dir.string() + "/lineitem.parquet');");
-     REQUIRE(result);
-     REQUIRE_FALSE(result->HasError());
-   }
- };
+    result = con->Query("CREATE VIEW lineitem AS SELECT * FROM read_parquet('" +
+                        parquet_dir.string() + "/lineitem.parquet');");
+    REQUIRE(result);
+    REQUIRE_FALSE(result->HasError());
+  }
+};
 
-
- //===----------------------------------------------------------------------===//
+//===----------------------------------------------------------------------===//
 // Scan tests
 //===----------------------------------------------------------------------===//
 
@@ -253,10 +260,10 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
 }
 
 TEST_CASE_METHOD(GPUExecutionParquetFixture,
-  "gpu_execution - scan single column parquet",
-  "[integration][gpu_execution][parquet][scan]")
+                 "gpu_execution - scan single column parquet",
+                 "[integration][gpu_execution][parquet][scan]")
 {
-compare_gpu_vs_cpu("select n_nationkey from nation;");
+  compare_gpu_vs_cpu("select n_nationkey from nation;");
 }
 
 TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
@@ -517,9 +524,10 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
     "select min(c_custkey), max(c_custkey) from customer group by c_nationkey, c_mktsegment;");
 }
 
-TEST_CASE_METHOD(GPUExecutionParquetFixture,
-                 "gpu_execution - two group by key: min max, but not showing the group by keys parquet",
-                 "[integration][gpu_execution][parquet][grouped_aggregate]")
+TEST_CASE_METHOD(
+  GPUExecutionParquetFixture,
+  "gpu_execution - two group by key: min max, but not showing the group by keys parquet",
+  "[integration][gpu_execution][parquet][grouped_aggregate]")
 {
   compare_gpu_vs_cpu(
     "select min(c_custkey), max(c_custkey) from customer group by c_nationkey, c_mktsegment;");
@@ -2093,10 +2101,11 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
     "where c.c_custkey < 1000 order by c.c_custkey, n.n_nationkey limit 1000;");
 }
 
-TEST_CASE_METHOD(GPUExecutionParquetFixture,
-                 "gpu_execution - nested loop left join double inequality condition, one condition  parquet"
-                 "needing casting",
-                 "[integration][gpu_execution][parquet][nested_loop_join]")
+TEST_CASE_METHOD(
+  GPUExecutionParquetFixture,
+  "gpu_execution - nested loop left join double inequality condition, one condition  parquet"
+  "needing casting",
+  "[integration][gpu_execution][parquet][nested_loop_join]")
 {
   compare_gpu_vs_cpu(
     "select n.n_nationkey, n.n_name,  c.c_nationkey, c.c_custkey, c.c_name  from nation n "
@@ -2225,10 +2234,11 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
     "where c.c_custkey < 1000 order by c.c_custkey, n.n_nationkey limit 1000;");
 }
 
-TEST_CASE_METHOD(GPUExecutionParquetFixture,
-                 "gpu_execution - nested loop full outer join double inequality condition, one  parquet"
-                 "condition needing casting",
-                 "[.][integration_disabled][gpu_execution][parquet][nested_loop_join]")
+TEST_CASE_METHOD(
+  GPUExecutionParquetFixture,
+  "gpu_execution - nested loop full outer join double inequality condition, one  parquet"
+  "condition needing casting",
+  "[.][integration_disabled][gpu_execution][parquet][nested_loop_join]")
 {
   compare_gpu_vs_cpu(
     "select n.n_nationkey, n.n_name,  c.c_nationkey, c.c_custkey, c.c_name  from nation n "
@@ -2246,9 +2256,10 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
     "by c.c_custkey, n.n_nationkey limit 1000;");
 }
 
-TEST_CASE_METHOD(GPUExecutionParquetFixture,
-                 "gpu_execution - nested loop inner join one equality and one inequality condition parquet",
-                 "[integration][gpu_execution][parquet][nested_loop_join]")
+TEST_CASE_METHOD(
+  GPUExecutionParquetFixture,
+  "gpu_execution - nested loop inner join one equality and one inequality condition parquet",
+  "[integration][gpu_execution][parquet][nested_loop_join]")
 {
   compare_gpu_vs_cpu(
     "select n.n_nationkey, n.n_name,  c.c_nationkey, c.c_custkey, c.c_name  from nation n "
@@ -2999,9 +3010,10 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
     "from customer group by c_nationkey;");
 }
 
-TEST_CASE_METHOD(GPUExecutionParquetFixture,
-                 "gpu_execution - count distinct: multi-partition forced, mixed aggregations parquet",
-                 "[integration][gpu_execution][parquet][group_by][count_distinct][multi_partition]")
+TEST_CASE_METHOD(
+  GPUExecutionParquetFixture,
+  "gpu_execution - count distinct: multi-partition forced, mixed aggregations parquet",
+  "[integration][gpu_execution][parquet][group_by][count_distinct][multi_partition]")
 {
   PartitionSizeGuard guard(1000);
   compare_gpu_vs_cpu(
@@ -3041,9 +3053,10 @@ TEST_CASE_METHOD(GPUExecutionDuckDBFixture,
     "select n_regionkey, count(distinct (n_nationkey, n_name)) from nation group by n_regionkey;");
 }
 
-TEST_CASE_METHOD(GPUExecutionParquetFixture,
-                 "gpu_execution - count distinct: multi-column struct, multi-partition forced parquet",
-                 "[integration][gpu_execution][parquet][group_by][count_distinct][multi_partition]")
+TEST_CASE_METHOD(
+  GPUExecutionParquetFixture,
+  "gpu_execution - count distinct: multi-column struct, multi-partition forced parquet",
+  "[integration][gpu_execution][parquet][group_by][count_distinct][multi_partition]")
 {
   PartitionSizeGuard guard(5);
   compare_gpu_vs_cpu(
